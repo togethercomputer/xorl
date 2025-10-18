@@ -1,0 +1,111 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project.urls]
+"Homepage" = "https://github.com/xorl-org/xorl"
+"Source Code" = "https://github.com/xorl-org/xorl"
+
+[project]
+name = "xorl"
+dynamic = ["version"]
+description = "Xorl: Simple and high-performance distributed training framework for large language models"
+requires-python = "==3.12.*"
+
+dependencies = [
+  "boto3>=1.35.0",
+  "datasets>=4.4.0",
+  "packaging>=23.0,<26.0",
+  "tenacity>=8.0.0",
+  "torchdata>=0.8.0,<1.0",
+  "transformers[torch]>=5.0",
+  "psutil",
+  "wandb",
+  "safetensors",
+  "numpy<2.4",
+  "numba",
+  "pydantic",
+  "uvicorn",
+  "pyzmq",
+  "msgpack",
+  "fastapi",
+  # PyTorch 2.10.0 with CUDA 12.9
+  "torch @ https://download.pytorch.org/whl/cu129/torch-2.10.0%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl",
+  "torchvision @ https://download.pytorch.org/whl/cu129/torchvision-0.25.0%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl",
+  "triton @ https://download.pytorch.org/whl/triton-3.6.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+  # Flash Attention
+  "flash-attn-3 @ https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.02.17-06dc5e7/flash_attn_3-3.0.0%2B20260217.cu129torch2100cxx11abitrue.fec3a6-cp39-abi3-linux_x86_64.whl",
+  "flash-attn-cute @ git+https://github.com/Dao-AILab/flash-attention.git@5678dd909aca97f925957dab716022046fb1e44f#subdirectory=flash_attn/cute",
+]
+
+
+[dependency-groups]
+# Follow the best practice in https://docs.astral.sh/uv/concepts/projects/dependencies/#development-dependencies
+# to manage dev dependencies (i.e., dependencies that are only used in development) like
+# test, lint and doc tools.
+dev = [
+  {include-group = "lint"},
+  {include-group = "test"},
+]
+lint = [
+  "pre-commit",
+  "ruff",
+]
+test = [
+  "pytest",
+  "expecttest"
+]
+
+
+[tool.uv]
+# This locks the uv version so that we have a consistent uv behavior across the board.
+# Inconsistent uv versions might generate different uv lock files which creates chaos.
+#
+# NOTE 1: Update this at least once per month as uv releases new version every week.
+# NOTE 2: When updating this line, make sure to update Dockerfile under docker/ to the same
+#         version and release new docker images.
+required-version = ">=0.8.14"
+
+
+[tool.setuptools.dynamic]
+version = {attr = "xorl.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+ignore = ["C901", "E501", "E741", "W605", "C408"]
+select = ["C", "E", "F", "I", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402", "F401", "F403", "F811"]
+
+[tool.ruff.lint.isort]
+lines-after-imports = 2
+known-first-party = ["xorl"]
+known-third-party = ["torch", "transformers", "wandb"]
+
+
+[tool.pytest.ini_options]
+addopts = "-v"
+markers = [
+    "cpu: CPU-only tests (no GPU required)",
+    "gpu: Tests that require GPU",
+    "e2e: End-to-end tests (full system, require GPU and torchrun)",
+    "server: Tests for the training server (API, orchestrator, runner)",
+    "distributed: Tests that require distributed setup (torchrun)",
+    "slow: Tests that take a long time to run",
+    "benchmark: Performance benchmark tests",
+    "collator: Tests for data collators",
+    "dataloader: Tests for data loaders",
+]
+testpaths = ["tests"]
+norecursedirs = ["submodules"]
+filterwarnings = [
+    "ignore::DeprecationWarning:multiprocessing.popen_fork",
+    "ignore:The argument 'device' of Tensor:DeprecationWarning",
+]
