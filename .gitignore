@@ -1,0 +1,74 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.DS_Store
+
+# local data
+data/*
+local/*
+dev/*
+deepspeed_configs/*.json
+.env.example
+.coverage
+
+# notebooks and files to keep locally
+notebooks/*
+.ipynb_checkpoints
+local/*
+*.ipynb
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+checkpoints/
+outputs/
+uv.lock
+# ides
+.idea/
+.vscode/
+
+# distribution
+*.egg-info/
+dist/
+build/
+
+# log files
+logs/
+*.log
+*.out
+
+# don't track files created by wandb
+wandb
+examples/wandb
+
+last_prepared_dataset/
+
+
+private/
+htmlcov/
+
+.claude/
+.pytest_cache/
+CLAUDE.md
+
+# slurm files
+sbatch.sh
+multi-train.sh
+
+# RL training outputs
+checkpoints/
+outputs/
+
+# slurm
+multi-train.sh
+sbatch.sh
+
+# trace
+trace/
