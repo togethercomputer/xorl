@@ -14,10 +14,9 @@
 """Qwen3Moe model configuration"""
 
 from transformers.configuration_utils import PretrainedConfig
-from xorl.models.layers import rope_config_validation
+from transformers.modeling_rope_utils import rope_config_validation
 
 from ....utils import logging
-from .parallelize import TP_PLAN
 
 
 logger = logging.get_logger(__name__)
@@ -60,7 +59,7 @@ class Qwen3MoeConfig(PretrainedConfig):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
         rms_norm_eps (`float`, *optional*, defaults to 1e-06):
             The epsilon used by the rms normalization layers.
-        use_cache (`bool`, *optional*, defaults to `False`):
+        use_cache (`bool`, *optional*, defaults to `True`):
             Whether or not the model should return the last key/values attentions (not used by all models). Only
             relevant if `config.is_decoder=True`.
         tie_word_embeddings (`bool`, *optional*, defaults to `False`):
@@ -148,9 +147,18 @@ class Qwen3MoeConfig(PretrainedConfig):
     ```"""
 
     model_type = "xorl_qwen3_moe"
+    keys_to_ignore_at_inference = ["past_key_values"]
 
     # Default tensor parallel plan for base model `Qwen3Moe`
-    base_model_tp_plan = TP_PLAN
+    base_model_tp_plan = {
+        "layers.*.self_attn.q_proj": "colwise",
+        "layers.*.self_attn.k_proj": "colwise",
+        "layers.*.self_attn.v_proj": "colwise",
+        "layers.*.self_attn.o_proj": "rowwise",
+        "layers.*.mlp.gate_proj": "colwise",
+        "layers.*.mlp.up_proj": "colwise",
+        "layers.*.mlp.down_proj": "rowwise",
+    }
     base_model_pp_plan = {
         "embed_tokens": (["input_ids"], ["inputs_embeds"]),
         "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
@@ -169,7 +177,7 @@ class Qwen3MoeConfig(PretrainedConfig):
         max_position_embeddings=32768,
         initializer_range=0.02,
         rms_norm_eps=1e-6,
-        use_cache=False,
+        use_cache=True,
         tie_word_embeddings=False,
         rope_theta=10000.0,
         rope_scaling=None,
@@ -205,13 +213,13 @@ class Qwen3MoeConfig(PretrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
         self.rope_theta = rope_theta
-        self._rope_scaling = rope_scaling
+        self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, move it to 'rope_type'.
-        if self._rope_scaling is not None and "type" in self._rope_scaling:
-            self._rope_scaling["rope_type"] = self._rope_scaling["type"]
+        if self.rope_scaling is not None and "type" in self.rope_scaling:
+            self.rope_scaling["rope_type"] = self.rope_scaling["type"]
         rope_config_validation(self)
 
         # MoE arguments
@@ -229,27 +237,6 @@ class Qwen3MoeConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
-
-    @property
-    def rope_parameters(self):
-        """Return rope parameters in the format expected by HF transformers 5.0+."""
-        rope_params = {
-            "rope_type": "default",
-            "rope_theta": self.rope_theta,
-        }
-        if self._rope_scaling is not None:
-            rope_params.update(self._rope_scaling)
-            if "type" in rope_params and "rope_type" not in rope_params:
-                rope_params["rope_type"] = rope_params.pop("type")
-        return rope_params
-
-    @rope_parameters.setter
-    def rope_parameters(self, value):
-        """Setter for rope_parameters to satisfy HF transformers 5.0+ configuration."""
-        if value is not None and isinstance(value, dict):
-            if "rope_theta" in value:
-                self.rope_theta = value["rope_theta"]
-        self._rope_scaling = value
 
 
 __all__ = ["Qwen3MoeConfig"]

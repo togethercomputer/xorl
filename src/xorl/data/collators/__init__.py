@@ -6,7 +6,7 @@ from .packing_concat_collator import (
     add_flash_attention_kwargs_from_position_ids,
 )
 from .sequence_shard_collator import TextSequenceShardCollator
-from .shift_tokens_collator import ShiftTokensCollator
+from .stream_distill_collator import StreamDistillDataCollator
 from .tensor_collator import ToTensorCollator
 
 __all__ = [
@@ -15,8 +15,8 @@ __all__ = [
     "FlattenCollator",
     "PackingConcatCollator",
     "add_flash_attention_kwargs_from_position_ids",
-    "ShiftTokensCollator",
     "TextSequenceShardCollator",
+    "StreamDistillDataCollator",
     "ToTensorCollator",
 ]
 

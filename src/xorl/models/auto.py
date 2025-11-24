@@ -1,18 +1,18 @@
+import os
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union
 
 import torch
-import torch.nn as nn
 from transformers import (
     AutoConfig,
     AutoProcessor,
     AutoTokenizer,
     PretrainedConfig,
+    PreTrainedModel,
 )
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
-from .layers.attention import ATTENTION_FUNCTIONS
-from .loader import ModelLoader, get_loader
+from .loader import BaseModelLoader, get_loader
 
 
 if TYPE_CHECKING:
@@ -25,42 +25,14 @@ def build_tokenizer(tokenizer_path: str) -> "PreTrainedTokenizer":
     """
     Builds the tokenizer.
     """
-    return AutoTokenizer.from_pretrained(tokenizer_path, padding_side="right")
+    return AutoTokenizer.from_pretrained(tokenizer_path, padding_side="right", trust_remote_code=True)
 
 
 def build_processor(processor_path: str) -> "ProcessorMixin":
     """
     Builds the processor.
     """
-    return AutoProcessor.from_pretrained(processor_path, padding_side="right")
-
-
-def _load_config_with_rank0_priority(
-    config_path: str,
-    config_kwargs: Dict[str, Any],
-) -> "PretrainedConfig":
-    """
-    Load model config with rank 0 going first to avoid HF Hub race conditions.
-
-    When multiple ranks call AutoConfig.from_pretrained simultaneously on a
-    HuggingFace Hub model ID, some may get incomplete downloads, causing
-    'Unrecognized model' errors. This function lets rank 0 download first
-    (populating the cache), then other ranks load from the cache.
-    """
-    import torch.distributed as dist
-
-    rank = get_parallel_state().global_rank if get_parallel_state().is_initialized else 0
-    is_distributed = dist.is_initialized() and dist.get_world_size() > 1
-
-    if is_distributed and rank != 0:
-        dist.barrier()
-
-    config = AutoConfig.from_pretrained(config_path, **config_kwargs)
-
-    if is_distributed and rank == 0:
-        dist.barrier()
-
-    return config
+    return AutoProcessor.from_pretrained(processor_path, padding_side="right", trust_remote_code=True)
 
 
 def build_foundation_model(
@@ -68,16 +40,13 @@ def build_foundation_model(
     weights_path: Optional[str] = None,
     torch_dtype: Literal["float16", "bfloat16", "float32"] = "bfloat16",
     attn_implementation: Optional[
-        Literal["eager", "sdpa", "native", "flash_attention_3", "flash_attention_4"]
-    ] = "flash_attention_3",
-    moe_implementation: Optional[Literal["eager", "triton", "native", "quack"]] = None,
-    ep_dispatch: str = "alltoall",
-    deepep_buffer_size_gb: float = 2.0,
-    deepep_num_sms: int = 20,
-    deepep_async_combine: bool = False,
+        Literal["eager", "sdpa", "flash_attention_2", "native-sparse"]
+    ] = "flash_attention_2",
+    moe_implementation: Optional[Literal["eager", "fused"]] = None,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
-) -> nn.Module:
+    force_use_huggingface: Optional[bool] = False,
+) -> "PreTrainedModel":
     """
     Builds the foundation model.
 
@@ -89,52 +58,36 @@ def build_foundation_model(
     if isinstance(config_path, PretrainedConfig):
         config = config_path
     else:
-        config = _load_config_with_rank0_priority(config_path, config_kwargs)
+        config = AutoConfig.from_pretrained(config_path, trust_remote_code=True, **config_kwargs)
 
     if moe_implementation is not None:
-        if moe_implementation not in ["eager", "triton", "native", "quack"]:
+        if moe_implementation not in ["eager", "fused"]:
             raise ValueError(f"Invalid moe_implementation: {moe_implementation}")
         config._moe_implementation = moe_implementation
         logger.info_rank0(f"Moe implementation: {moe_implementation}")
 
-    config._ep_dispatch = ep_dispatch
-    config._deepep_buffer_size_gb = deepep_buffer_size_gb
-    config._deepep_num_sms = deepep_num_sms
-    config._deepep_async_combine = deepep_async_combine
-    if ep_dispatch == "deepep":
-        logger.info_rank0(
-            f"DeepEP dispatch enabled (buffer={deepep_buffer_size_gb} GB, "
-            f"num_sms={deepep_num_sms}, async_combine={deepep_async_combine})"
-        )
+    loader: Optional[BaseModelLoader] = get_loader(config, force_use_huggingface)
 
-    # Validate attention implementation for packed sequences with FlashAttention kwargs
-    if attn_implementation == "sdpa":
-        raise ValueError(
-            "attn_implementation='sdpa' is not supported for packed sequences with sequence parallelism. "
-            "Please use 'flash_attention_3' for correct cu_seqlens handling."
-        )
+    if not force_use_huggingface:
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-    loader: ModelLoader = get_loader(config)
+        from ..ops.attention import flash_attention_forward
 
-    # Validate FA4 availability early
-    if attn_implementation == "flash_attention_4":
-        if "flash_attention_4" not in ATTENTION_FUNCTIONS:
-            raise ImportError(
-                "flash_attention_4 requested but flash_attn.cute is not installed. "
-                "Please install FA4 dependencies or use flash_attention_3."
+        # Check if custom attention implementation was requested (now deprecated)
+        custom_attn_impl = os.getenv("SEED_KERNEL_ATTN_IMPLEMENTATION")
+        if custom_attn_impl is not None:
+            logger.warning(
+                f"SEED_KERNEL_ATTN_IMPLEMENTATION={custom_attn_impl} is no longer supported as seed_kernels "
+                f"has been removed. Using standard flash_attention_2 implementation."
             )
-        logger.info_rank0("Using Flash Attention 4 (CUTE) for attention computation")
 
-    # For HF model init: map all flash variants to "flash_attention_2" (HF's known key).
-    # Our own ATTENTION_FUNCTIONS registry handles the real dispatch.
-    hf_attn_implementation = attn_implementation
-    if attn_implementation in ("flash_attention_3", "flash_attention_4"):
-        hf_attn_implementation = "flash_attention_2"
+        ALL_ATTENTION_FUNCTIONS.register("flash_attention_2", flash_attention_forward)
 
     init_kwargs = {
         "config": config,
         "torch_dtype": getattr(torch, torch_dtype),
-        "attn_implementation": hf_attn_implementation,
+        "attn_implementation": attn_implementation,
+        "trust_remote_code": True,
     }
 
     if (init_device == "cpu" and get_parallel_state().global_rank != 0) or init_device == "meta":
@@ -148,9 +101,5 @@ def build_foundation_model(
         empty_init=empty_init,
         init_device=init_device,
     )
-
-    # Set the real implementation name so our model code dispatches correctly
-    # via ATTENTION_FUNCTIONS (not HF's ALL_ATTENTION_FUNCTIONS).
-    model.config._attn_implementation = attn_implementation
 
     return model

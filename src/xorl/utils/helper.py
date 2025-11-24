@@ -4,6 +4,7 @@ import datetime
 import gc
 import logging as builtin_logging
 import os
+import subprocess
 import sys
 import warnings
 from collections import defaultdict
@@ -25,14 +26,58 @@ from xorl.utils import logging
 from xorl.utils.count_flops import XorlFlopsCounter
 from xorl.utils.device import (
     IS_CUDA_AVAILABLE,
+    IS_NPU_AVAILABLE,
     get_device_type,
     get_torch_device,
 )
 from xorl.utils.dist_utils import all_reduce
 from xorl.utils.seqlen_pos_transform_utils import culen2len, pos2culen
 
+from .import_utils import is_xorl_patch_available
 from .multisource_utils import parse_multisource_config
 
+
+try:
+    import hdfs_io
+    from hdfs_io import copy
+except (ImportError, ModuleNotFoundError):
+    from xorl.utils import hdfs_io
+    from xorl.utils.hdfs_io import copy
+
+if IS_NPU_AVAILABLE:
+    import torch_npu
+
+
+if is_xorl_patch_available():
+    from xorl_patch.utils.helper import (
+        VALID_CONFIG_TYPE,
+        XORL_UPLOAD_CMD,
+        FlopsCounter,
+        convert_hdfs_fuse_path,
+        is_remote_path,
+        load_step2token,
+        save_step2token,
+    )
+else:
+
+    def load_step2token(*args, **kwargs):
+        raise ImportError("xorl_patch is not available, please install it first")
+
+    def save_step2token(*args, **kwargs):
+        raise ImportError("xorl_patch is not available, please install it first")
+
+    def is_remote_path(*args, **kwargs):
+        raise ImportError("xorl_patch is not available, please install it first")
+
+    def convert_hdfs_fuse_path(*args, **kwargs):
+        raise ImportError("xorl_patch is not available, please install it first")
+
+    VALID_CONFIG_TYPE = None
+    XORL_UPLOAD_CMD = None
+
+    class FlopsCounter:
+        def __init__(self):
+            raise ImportError("xorl_patch is not available, please install it first")
 
 
 if TYPE_CHECKING:
@@ -87,7 +132,11 @@ class EnvironMeter:
         self.batch_seqlens = []
         self.image_seqlens = []
 
-        self.estimate_flops = XorlFlopsCounter(config).estimate_flops
+        # for internal use
+        if VALID_CONFIG_TYPE is not None and isinstance(config, VALID_CONFIG_TYPE):
+            self.estimate_flops = FlopsCounter(config).estimate_flops
+        else:
+            self.estimate_flops = XorlFlopsCounter(config).estimate_flops
 
         if self.gc_steps > 0:
             gc.disable()
@@ -423,11 +472,11 @@ def print_example(example: Dict[str, "torch.Tensor"], rank: int, print_tensor: b
     for key, value in example.items():
         if isinstance(value, torch.Tensor):
             if print_tensor:
-                logger.debug(f"[rank {rank}]: {key}'s shape: {value.shape}, device: {value.device}, {value}")
+                logger.info(f"[rank {rank}]: {key}'s shape: {value.shape}, device: {value.device}, {value}")
             else:
-                logger.debug(f"[rank {rank}]: {key}'s shape: {value.shape}, device: {value.device}")
+                logger.info(f"[rank {rank}]: {key}'s shape: {value.shape}, device: {value.device}")
         else:
-            logger.debug(f"[rank {rank}]: {key}'s value: {value}")
+            logger.info(f"[rank {rank}]: {key}'s value: {value}")
 
 
 def dict2device(input_dict: dict):
@@ -494,6 +543,8 @@ def create_profiler(
     Creates a profiler to record the CPU and CUDA activities. Default export to trace.json.
     Profile steps in [start_step, end_step).
 
+    When is_npu_available = True, the profiler will be created as torch_npu.profiler.
+
     Args:
         start_step (int): The step to start recording.
         end_step (int): The step to end recording.
@@ -506,32 +557,60 @@ def create_profiler(
     def handler_fn(p):
         time = int(datetime.datetime.now().timestamp())
 
-        trace_file_extention = "pt.trace.json.gz"
+        # torch_npu does not support export gzip trace json directly
+        trace_file_extention = "pt.trace.json" if IS_NPU_AVAILABLE else "pt.trace.json.gz"
         gpu_memory_file_extension = "pkl"
 
-        os.makedirs(trace_dir, exist_ok=True)
-        trace_file = os.path.join(trace_dir, f"xorl_rank{global_rank}_{time}.{trace_file_extention}")
-        gpu_memory_file = os.path.join(trace_dir, f"xorl_rank{global_rank}_{time}.{gpu_memory_file_extension}")
+        if trace_dir.startswith("hdfs://"):
+            hdfs_io.makedirs(trace_dir, exist_ok=True)
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            trace_file = os.path.join(CACHE_DIR, f"xorl_rank{global_rank}_{time}.{trace_file_extention}")
+            gpu_memory_file = os.path.join(CACHE_DIR, f"xorl_rank{global_rank}_{time}.{gpu_memory_file_extension}")
+        else:
+            os.makedirs(trace_dir, exist_ok=True)
+            trace_file = os.path.join(trace_dir, f"xorl_rank{global_rank}_{time}.{trace_file_extention}")
+            gpu_memory_file = os.path.join(trace_dir, f"xorl_rank{global_rank}_{time}.{gpu_memory_file_extension}")
 
         p.export_chrome_trace(trace_file)
         logger.info(f"Profiling result saved at {trace_file}.")
 
-        if IS_CUDA_AVAILABLE:
+        if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE:
             get_torch_device().memory._dump_snapshot(gpu_memory_file)
             logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
 
-    profiler_module = torch.profiler
-    activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.CUDA]
+        # In NPU, compress the trace file to .gz format ourselves.
+        if IS_NPU_AVAILABLE:
+            gz_path = trace_file + ".gz"
+            import gzip
+
+            with open(trace_file, "rb") as f_in, gzip.open(gz_path, "wb") as f_out:
+                f_out.write(f_in.read())
+            os.remove(trace_file)
+            trace_file = gz_path
+            logger.info(f"Profiling result compressed to {trace_file}.")
+
+        if trace_dir.startswith("hdfs://"):
+            copy(trace_file, trace_dir)
+            logger.info(f"Profiling result uploaded to {trace_dir}.")
+
+        if XORL_UPLOAD_CMD:
+            try:
+                logger.info_rank0(f"upload trace file {trace_file}")
+                command2 = f"{XORL_UPLOAD_CMD} {trace_file}"
+                subprocess.run(command2, shell=True, check=True, executable="/bin/bash")
+            except Exception as e:
+                logger.warning(f"failed to upload trace file {trace_file}, error: {e}")
+
+    if IS_NPU_AVAILABLE:
+        profiler_module = torch_npu.profiler
+        activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.NPU]
+    else:
+        profiler_module = torch.profiler
+        activities = [profiler_module.ProfilerActivity.CPU, profiler_module.ProfilerActivity.CUDA]
 
     warmup = 0 if start_step == 1 else 1
     wait = start_step - warmup - 1
     active = end_step - start_step
-    
-    # Ensure active >= 1 (PyTorch profiler requirement)
-    if active <= 0:
-        logger.warning(f"Profiler active steps is {active}, adjusting to 1 for valid profiling.")
-        active = 1
-        
     logger.info(f"build profiler schedule - wait: {wait}, warmup: {warmup}, active: {active}.")
 
     schedule = profiler_module.schedule(
