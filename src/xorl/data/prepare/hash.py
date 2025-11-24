@@ -43,7 +43,7 @@ def generate_dataset_hash_from_config(
         MD5 hash string representing the configuration.
     """
     config_str = (
-        f"{'|'.join(sorted([f'{d.path}:{d.type}:{d.shards}:{d.shards_idx}:{d.preprocess_shards}:{d.name}:{d.split}:{d.revision}:{d.trust_remote_code}:{d.max_seq_len}:{d.activations_path}' for d in args_datasets]))}"
+        f"{'|'.join(sorted([f'{d.path}:{d.type}:{d.shards}:{d.shards_idx}:{d.preprocess_shards}:{d.name}:{d.split}:{d.revision}:{d.trust_remote_code}:{d.sequence_len}:{d.activations_path}' for d in args_datasets]))}"
         f"|{tokenizer_name}"
         f"|{args.data.select_columns}"
     )

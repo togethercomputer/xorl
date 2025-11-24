@@ -13,7 +13,7 @@ from ..utils import logging
 
 logger = logging.get_logger(__name__)
 
-MODELING_PATH = ["xorl.models.transformers"]
+MODELING_PATH = ["xorl.models.transformers", "xorl.models.seed_omni", "xorl.models.custom"]
 
 
 @dataclass

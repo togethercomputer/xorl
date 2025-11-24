@@ -62,12 +62,47 @@ class XorlFlopsCounter:
             # qwen3 has additional RMSNorm layers for q and k.
             # RMSNorm layers have minimal impact at the MFU and can be ignored.
             "qwen3": self._estimate_qwen2_flops,
+            "seed_oss": self._estimate_seed_flops,
         }
 
         self.config = config
 
     def _estimate_unknown_flops(self, tokens_sum, batch_seqlens, delta_time, **kwargs):
         return 0
+
+    def _estimate_seed_flops(self, tokens_sum, batch_seqlens, delta_time):
+        hidden_size = self.config.hidden_size
+        vocab_size = self.config.vocab_size
+        num_hidden_layers = self.config.num_hidden_layers
+        num_key_value_heads = self.config.num_key_value_heads
+        num_attention_heads = self.config.num_attention_heads
+        intermediate_size = self.config.intermediate_size
+
+        head_dim = hidden_size // num_attention_heads
+        q_size = num_attention_heads * head_dim
+        k_size = num_key_value_heads * head_dim
+        v_size = num_key_value_heads * head_dim
+
+        # non-attn per layer parm
+        # llama use SwiGelu, gate, having up and down linear layer in mlp
+        mlp_N = hidden_size * intermediate_size * 3
+        attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
+        emd_and_lm_head_N = vocab_size * hidden_size * 2
+        # non-attn all_layer parm
+        dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
+        # non-attn all_layer & all_token fwd & bwd flops
+        dense_N_flops = 6 * dense_N * tokens_sum
+
+        # attn all_layer & all_token fwd & bwd flops
+        seqlen_square_sum = 0
+        for seqlen in batch_seqlens:
+            seqlen_square_sum += seqlen * seqlen
+        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+
+        # all_layer & all_token fwd & bwd flops
+        flops_all_token = dense_N_flops + attn_qkv_flops
+        flops_achieved = flops_all_token * (1.0 / delta_time) / 1e12
+        return flops_achieved
 
     def _estimate_deepseek_v3_flops(self, tokens_sum, batch_seqlens, delta_time):
         hidden_size = self.config.hidden_size
@@ -81,7 +116,7 @@ class XorlFlopsCounter:
         share_expert_num = self.config.n_shared_experts
         # non-attn per layer parm
         moe_gata_N = hidden_size * moe_num_expert
-        # moe has gate_proj, up_proj and down_proj using SwiGLU in ExpertMlp layer & shared experts
+        # moe has fc1_1, fc1_2 and fc2 using SwiGLU in ExpertMlp layer & shared experts
         moe_expertmlp_N = hidden_size * moe_intermediate_size * (moe_topk + share_expert_num) * 3
         # MLA attn
         attn_linear_N = 0

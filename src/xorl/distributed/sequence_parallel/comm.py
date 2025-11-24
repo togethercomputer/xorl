@@ -11,7 +11,7 @@ _ULYSSES_SEQUENCE_PARALLEL_GROUP = {"default": None}
 _ULYSSES_SEQUENCE_PARALLEL_CPU_GROUP = {"default": None}
 _ULYSSES_GROUP_KEY = "default"
 
-_RINGATTN_GROUP = None
+_CONTEXT_PARALLEL_GROUP = None
 
 _UNIFIED_SEQUENCE_PARALLEL_GROUP = None
 _UNIFIED_SEQUENCE_PARALLEL_CPU_GROUP = None
@@ -141,38 +141,38 @@ def get_ulysses_sequence_parallel_world_size(group: ProcessGroup = None) -> int:
     return dist.get_world_size(group) if group else 1
 
 
-# ----------------------------- Ring Parallel ------------------------------ #
+# ----------------------------- Context Parallel ---------------------------- #
 
 
-def set_ringattn_group(ringattn_group: dist.ProcessGroup):
+def set_context_parallel_group(cp_group: dist.ProcessGroup):
     """
-    Set ring attention process group.
+    Set context parallel process group.
     """
-    global _RINGATTN_GROUP
-    _RINGATTN_GROUP = ringattn_group
+    global _CONTEXT_PARALLEL_GROUP
+    _CONTEXT_PARALLEL_GROUP = cp_group
 
 
-def get_ringattn_group(check_initialized=True):
-    """Get the ring attention group the caller rank belongs to."""
-    global _RINGATTN_GROUP
+def get_context_parallel_group(check_initialized=True):
+    """Get the context parallel group the caller rank belongs to."""
+    global _CONTEXT_PARALLEL_GROUP
     if check_initialized:
-        assert _RINGATTN_GROUP is not None, "ring attention group is not initialized"
-    return _RINGATTN_GROUP
+        assert _CONTEXT_PARALLEL_GROUP is not None, "context parallel group is not initialized"
+    return _CONTEXT_PARALLEL_GROUP
 
 
-def get_ringattn_rank():
-    """Return my rank for the ring attention group."""
+def get_context_parallel_rank():
+    """Return my rank for the context parallel group."""
 
     if dist.is_available() and dist.is_initialized():
-        return dist.get_rank(group=get_ringattn_group())
+        return dist.get_rank(group=get_context_parallel_group())
     else:
         return 0
 
 
-def get_ringattn_world_size():
-    """Return world size for the ring attention group."""
+def get_context_parallel_world_size():
+    """Return world size for the context parallel group."""
     if dist.is_available() and dist.is_initialized():
-        return dist.get_world_size(group=get_ringattn_group())
+        return dist.get_world_size(group=get_context_parallel_group())
     else:
         return 0
 
@@ -228,30 +228,30 @@ def get_unified_sequence_parallel_world_size() -> int:
 
 # ------------------------------- Initialize ------------------------------- #
 def init_sequence_parallel(
-    ulysses_size: int = 1, sep_dp: bool = False, ulysses_group_key: str = "default", ringattn_size: int = 1
+    ulysses_size: int = 1, sep_dp: bool = False, ulysses_group_key: str = "default", cp_size: int = 1
 ):
     """
     Initialize unified sequence parallel.
     """
-    global _RINGATTN_GROUP
+    global _CONTEXT_PARALLEL_GROUP
     global _ULYSSES_SEQUENCE_PARALLEL_GROUP
     global _ULYSSES_SEQUENCE_PARALLEL_CPU_GROUP
 
     set_ulysses_sequence_parallel_group(group=None, group_key="default")
     set_ulysses_sequence_parallel_cpu_group(group=None, group_key="default")
 
-    if ulysses_size == 1 and ringattn_size == 1:
+    if ulysses_size == 1 and cp_size == 1:
         return
 
     assert dist.is_initialized()
     world_size = dist.get_world_size()
     rank = dist.get_rank()
-    unified_sp_size = ulysses_size * ringattn_size
+    unified_sp_size = ulysses_size * cp_size
     assert world_size % unified_sp_size == 0
     data_parallel_size = world_size // unified_sp_size
 
-    if ringattn_size > 1:
-        assert _RINGATTN_GROUP is None, "Ring attention group has already been initialized!"
+    if cp_size > 1:
+        assert _CONTEXT_PARALLEL_GROUP is None, "Context parallel group has already been initialized!"
     if ulysses_size:
         assert (ulysses_group_key == "default" and _ULYSSES_SEQUENCE_PARALLEL_GROUP[ulysses_group_key] is None) or (
             ulysses_group_key != "default" and ulysses_group_key not in _ULYSSES_SEQUENCE_PARALLEL_GROUP
@@ -265,7 +265,7 @@ def init_sequence_parallel(
     for i in range(data_parallel_size):
         # build ulysses group
         if ulysses_size > 1:
-            for j in range(ringattn_size):
+            for j in range(cp_size):
                 start_rank = i * unified_sp_size + j * ulysses_size
                 end_rank = start_rank + ulysses_size
                 ulysses_ranks = range(start_rank, end_rank)
@@ -275,15 +275,15 @@ def init_sequence_parallel(
                     set_ulysses_sequence_parallel_group(group=ulysses_group, group_key=ulysses_group_key)
                     set_ulysses_sequence_parallel_cpu_group(group=ulysses_cpu_group, group_key=ulysses_group_key)
 
-        # build ring group
-        if ringattn_size > 1:
+        # build cp group
+        if cp_size > 1:
             for j in range(ulysses_size):
-                ring_global_ranks = range(i * unified_sp_size + j, (i + 1) * unified_sp_size, ulysses_size)
-                ringattn_group = dist.new_group(ring_global_ranks)
-                if rank in ring_global_ranks:
-                    set_ringattn_group(ringattn_group=ringattn_group)
+                cp_global_ranks = range(i * unified_sp_size + j, (i + 1) * unified_sp_size, ulysses_size)
+                cp_group = dist.new_group(cp_global_ranks)
+                if rank in cp_global_ranks:
+                    set_context_parallel_group(cp_group=cp_group)
 
-        # build unified sequence parallel group
+        # build unified sp group
         unified_sp_ranks = range(i * unified_sp_size, (i + 1) * unified_sp_size)
         sp_group = dist.new_group(unified_sp_ranks)
         sp_cpu_group = dist.new_group(unified_sp_ranks, backend="gloo")
@@ -317,11 +317,11 @@ def is_ulysses_sequence_parallel_initialized() -> bool:
     return get_ulysses_sequence_parallel_group() is not None
 
 
-def is_ringattn_parallel_initialized() -> bool:
+def is_context_parallel_initialized() -> bool:
     """
-    Check if ring attention parallel is initialized.
+    Check if ulysses sequence parallel is initialized.
     """
-    return get_ringattn_group() is not None
+    return get_context_parallel_group() is not None
 
 
 def get_ulysses_group_key_context(group_key: str = "default"):

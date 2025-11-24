@@ -25,6 +25,7 @@ from typing import (
 import yaml
 
 
+from .utils.hdfs_io import copy, exists, makedirs
 from .utils import helper, logging
 
 T = TypeVar("T")
@@ -118,10 +119,10 @@ class DatasetConfig:
             "help": "Process dataset in N sequential chunks for memory efficiency (exclusive with `shards`)"
         },
     )
-    max_seq_len: Optional[int | None] = field(
+    sequence_len: Optional[int | None] = field(
         default=None,
         metadata={
-            "help": "Max sequence length. Samples with input_ids longer than this are filtered out."
+            "help": "The length of the sequence to use"
         },
     )
 
@@ -148,11 +149,6 @@ class DatasetConfig:
     def _validate_loading_method(self):
         """Validate the dataset loading configuration based on path and other fields"""
         path = self.path
-
-        if path == "dummy":
-            if self.type != "tokenized":
-                raise ValueError("Dummy dataset only supports type='tokenized'.")
-            return
 
         # Remote filesystem validation
         if any(
@@ -478,32 +474,37 @@ class ModelArguments:
         default_factory=dict,
         metadata={"help": "Multimodal encoder config and weights."},
     )
-    attn_implementation: Optional[
-        Literal["eager", "sdpa", "native", "flash_attention_3", "flash_attention_4"]
-    ] = field(
-        default="flash_attention_3",
-        metadata={"help": "Attention implementation. 'native': PyTorch SDPA+cuDNN (no deps, Hopper+Blackwell). "
-                          "'flash_attention_3': FA3 (Hopper). 'flash_attention_4': FA4 CUTE (Hopper+Blackwell)."},
+    decoders: Dict[Literal["image"], Dict[str, str]] = field(
+        default_factory=dict,
+        metadata={"help": "Multimodal decoder config and weights."},
     )
-    moe_implementation: Optional[Literal[None, "eager", "triton", "native", "quack"]] = field(
-        default=None,
-        metadata={"help": "MoE implementation to use. 'triton' uses Triton group GEMM kernels, 'native' uses torch._grouped_mm, 'quack' uses quack kernels."},
+    input_encoder: Literal["encoder", "decoder"] = field(
+        default="encoder",
+        metadata={
+            "help": "Use encoder to encode input images or use decoder.encoder to encode input images."
+        },
     )
-    ep_dispatch: str = field(
-        default="alltoall",
-        metadata={"help": "EP dispatch strategy: 'alltoall' (default) or 'deepep' (NVLink-optimized)."},
+    output_encoder: Literal["encoder", "decoder"] = field(
+        default="decoder",
+        metadata={
+            "help": "Use encoder to encode output images or use decoder.encoder to encode output images."
+        },
     )
-    deepep_buffer_size_gb: float = field(
-        default=2.0,
-        metadata={"help": "DeepEP buffer size in GB (effective when ep_dispatch='deepep')."},
-    )
-    deepep_num_sms: int = field(
-        default=20,
-        metadata={"help": "Number of SMs for DeepEP communication kernels (must be even, default 20). Lower values leave more SMs for overlapped compute."},
-    )
-    deepep_async_combine: bool = field(
+    encode_target: bool = field(
         default=False,
-        metadata={"help": "Enable async combine for DeepEP (overlap combine with next layer's compute)."},
+        metadata={
+            "help": "Whether to encode target with decoder. Only supports stable diffusion as decoder."
+        },
+    )
+    attn_implementation: Optional[
+        Literal["eager", "sdpa", "flash_attention_2", "native-sparse"]
+    ] = field(
+        default="flash_attention_2",
+        metadata={"help": "Attention implementation to use."},
+    )
+    moe_implementation: Optional[Literal[None, "eager", "fused"]] = field(
+        default=None,
+        metadata={"help": "MoE implementation to use."},
     )
     basic_modules: Optional[List[str]] = field(
         default_factory=list,
@@ -511,12 +512,11 @@ class ModelArguments:
             "help": "Basic modules beyond model._no_split_modules to be sharded in FSDP."
         },
     )
-    merge_qkv: bool = field(
-        default=True,
-        metadata={"help": "Keep q/k/v projections fused as qkv_proj. "
-                  "When False, unfuse into separate q_proj/k_proj/v_proj for independent handling "
-                  "(e.g., tensor parallelism, independent LoRA per projection)."},
+    force_use_huggingface: bool = field(
+        default=False,
+        metadata={"help": "Force loading model from huggingface."},
     )
+
     def __post_init__(self):
         if self.config_path is None and self.model_path is None:
             raise ValueError(
@@ -544,6 +544,22 @@ class ModelArguments:
 
             if encoder_args.get("config_path") is None:
                 encoder_args["config_path"] = encoder_args["model_path"]
+
+        supported_decoder_types = ["image"]
+        for decoder_type, decoder_args in self.decoders.items():
+            if decoder_type not in supported_decoder_types:
+                raise ValueError(
+                    f"Unsupported decoder type: {decoder_type}. Should be one of {supported_decoder_types}."
+                )
+
+            if (
+                decoder_args.get("config_path") is None
+                and decoder_args.get("model_path") is None
+            ):
+                raise ValueError("`config_path` and `model_path` cannot be both empty.")
+
+            if decoder_args.get("config_path") is None:
+                decoder_args["config_path"] = decoder_args["model_path"]
 
 
 @dataclass
@@ -578,50 +594,10 @@ class TrainingArguments:
         metadata={"help": "Parameters without weight decay, for example, bias."},
     )
 
-    optimizer: Literal["adamw", "anyprecision_adamw", "sgd", "muon"] = field(
+    optimizer: Literal["adamw", "anyprecision_adamw"] = field(
         default="adamw",
-        metadata={"help": "Optimizer type. 'muon' uses Newton-Schulz orthogonalization for 2D+ weight matrices."},
+        metadata={"help": "Optimizer. Default to adamw."},
     )
-    optimizer_dtype: Literal["fp32", "bf16"] = field(
-        default="bf16",
-        metadata={"help": "Dtype for optimizer states (momentum/variance) in anyprecision_adamw/muon."},
-    )
-    muon_lr: float = field(
-        default=0.02,
-        metadata={"help": "Learning rate for Muon parameter groups (2D+ weight matrices). Only used when optimizer='muon'."},
-    )
-    muon_momentum: float = field(
-        default=0.95,
-        metadata={"help": "Momentum coefficient for Muon parameter groups."},
-    )
-    muon_nesterov: bool = field(
-        default=True,
-        metadata={"help": "Use Nesterov momentum for Muon parameter groups."},
-    )
-    muon_ns_steps: int = field(
-        default=5,
-        metadata={"help": "Number of Newton-Schulz iterations for Muon optimizer."},
-    )
-    muon_adjust_lr_fn: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "LR adjustment for Muon. 'original': scale by sqrt(max(1,A/B)). "
-            "'match_rms_adamw': scale by 0.2*sqrt(max(A,B)) so Muon can reuse AdamW LR/WD. "
-            "None defaults to 'original'."
-        },
-    )
-
-    @property
-    def optimizer_kwargs(self) -> Dict[str, Any]:
-        """Collect optimizer-specific kwargs from flat fields into a dict for build_optimizer."""
-        kwargs: Dict[str, Any] = {}
-        if self.optimizer == "muon":
-            kwargs["muon_lr"] = self.muon_lr
-            kwargs["muon_momentum"] = self.muon_momentum
-            kwargs["muon_nesterov"] = self.muon_nesterov
-            kwargs["muon_ns_steps"] = self.muon_ns_steps
-            kwargs["muon_adjust_lr_fn"] = self.muon_adjust_lr_fn
-        return kwargs
     max_grad_norm: float = field(
         default=1.0,
         metadata={"help": "Clip value for gradient norm."},
@@ -672,7 +648,11 @@ class TrainingArguments:
     )
     enable_forward_prefetch: bool = field(
         default=True,
-        metadata={"help": "Enable forward prefetch in FSDP."},
+        metadata={"help": "Enable forward prefetch for FSDP1."},
+    )
+    enable_fsdp_offload: bool = field(
+        default=False,
+        metadata={"help": "Enable CPU offload for FSDP1."},
     )
     enable_activation_offload: bool = field(
         default=False,
@@ -684,10 +664,14 @@ class TrainingArguments:
             "help": "When enabling activation offload, `activation_gpu_limit` GB activations are allowed to reserve on GPU."
         },
     )
+    use_liger: bool = field(
+        default=True,
+        metadata={"help": "Use Liger kernels for optimized operations. Requires liger-kernel to be installed."},
+    )
     enable_rank0_init: bool = field(
         default=False,
         metadata={
-            "help": "Deprecated: Use `init_device=cpu` instead."
+            "help": "Enable rank0-only initialization for FSDP1 training. Note: this argument will be deprecated in the future, please use `init_device=cpu` instead."
         },
     )
     init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
@@ -696,10 +680,10 @@ class TrainingArguments:
             "help": "Device to initialize model weights. 1. `cpu`: Init parameters on CPU in rank0 only. 2. `cuda`: Init parameters on GPU. 3. `meta`: Init parameters on meta. 4. `npu`: Init parameters on Ascend NPU."
         },
     )
-    load_weights_mode: Literal["broadcast", "all_ranks"] = field(
-        default="broadcast",
+    broadcast_model_weights_from_rank0: bool = field(
+        default=True,
         metadata={
-            "help": "Weight loading mode. 'broadcast': rank0 reads weights and broadcasts to other ranks (default, avoids disk I/O bottleneck). 'all_ranks': every rank reads weights from disk independently."
+            "help": "When enabled, only rank0 reads model weights from HuggingFace safetensor from disk. Other ranks would receive weights through broadcast. This helps to avoid disk I/O bottleneck."
         },
     )
     enable_full_determinism: bool = field(
@@ -722,8 +706,8 @@ class TrainingArguments:
             "help": "Number of steps between two gc.collect. GC is disabled if it is positive."
         },
     )
-    data_parallel_mode: Literal["none", "ddp", "fsdp2"] = field(
-        default="fsdp2",
+    data_parallel_mode: Literal["ddp", "fsdp1", "fsdp2"] = field(
+        default="ddp",
         metadata={"help": "Data parallel mode."},
     )
     data_parallel_replicate_size: int = field(
@@ -734,6 +718,10 @@ class TrainingArguments:
         default=-1,
         metadata={"help": "Data parallel shard degree."},
     )
+    tensor_parallel_size: int = field(
+        default=1,
+        metadata={"help": "Tensor parallel size."},
+    )
     expert_parallel_size: int = field(
         default=1,
         metadata={"help": "Expert parallel size."},
@@ -742,42 +730,19 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Enable expert parallelism outside in ep-fsdp."},
     )
+    pipeline_parallel_size: int = field(
+        default=1,
+        metadata={"help": "Pipeline parallel size."},
+    )
     ulysses_parallel_size: int = field(
         default=1,
         metadata={"help": "Ulysses sequence parallel size."},
     )
-    tensor_parallel_size: int = field(
+    context_parallel_size: int = field(
         default=1,
-        metadata={"help": "Tensor parallel size. Shards model weights across GPUs within a node."},
+        metadata={"help": "Ring-attn context parallel size."},
     )
-    ringattn_parallel_size: int = field(
-        default=1,
-        metadata={"help": "Ring attention parallel size."},
-    )
-    pipeline_parallel_size: int = field(
-        default=1,
-        metadata={"help": "Pipeline parallel size. Splits model layers across GPUs."},
-    )
-    pipeline_parallel_schedule: str = field(
-        default="1F1B",
-        metadata={"help": "Pipeline parallel schedule (e.g., '1F1B', 'GPipe', 'Interleaved1F1B')."},
-    )
-    reshard_after_forward: Optional[bool] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Whether FSDP2 reshards parameters after forward. "
-                "True: reshard after forward, re-gather in backward (saves memory). "
-                "False: keep params unsharded (saves communication, uses more memory). "
-                "Default (None): True for standard training, False for pipeline parallelism."
-            )
-        },
-    )
-    cp_fsdp_mode: str = field(
-        default="all",
-        metadata={"help": "How to fold SP into FSDP: 'all' (ulysses+ring), 'ulysses_only', 'ring_only', or 'none'."},
-    )
-    ckpt_manager: Literal["omnistore", "dcp"] = field(
+    ckpt_manager: Literal["omnistore", "dcp", "bytecheckpoint"] = field(
         default="omnistore",
         metadata={"help": "Checkpoint manager."},
     )
@@ -793,9 +758,9 @@ class TrainingArguments:
         default=0,
         metadata={"help": "Number of steps between two checkpoint saves."},
     )
-    save_epochs: float = field(
+    save_epochs: int = field(
         default=1,
-        metadata={"help": "Fraction or number of epochs between two checkpoint saves. E.g., 0.25 saves 4 times per epoch."},
+        metadata={"help": "Number of epochs between two checkpoint saves."},
     )
     save_hf_weights: bool = field(
         default=True,
@@ -810,10 +775,6 @@ class TrainingArguments:
     enable_compile: bool = field(
         default=False,
         metadata={"help": "Enable torch compile."},
-    )
-    log_format: Literal["progress_bar", "structured"] = field(
-        default="progress_bar",
-        metadata={"help": "Logging format. 'progress_bar' uses tqdm; 'structured' prints parse-friendly key=value lines."},
     )
     use_wandb: bool = field(
         default=True,
@@ -863,26 +824,36 @@ class TrainingArguments:
     )
     max_steps: Optional[int] = field(
         default=None,
-        metadata={"help": "Max total training steps. Training stops after this many global steps. Also caps LR scheduler length."},
+        metadata={"help": "Max training steps per epoch. (for debug)"},
     )
 
     def __post_init__(self):
         self.local_rank = int(os.getenv("LOCAL_RANK", "0"))
         self.global_rank = int(os.getenv("RANK", "0"))
         self.world_size = int(os.getenv("WORLD_SIZE", "1"))
-        non_dp_size = (
-            self.ulysses_parallel_size * self.tensor_parallel_size
-            * self.ringattn_parallel_size * self.pipeline_parallel_size
-        )
-        if self.world_size % non_dp_size != 0:
-            raise ValueError(
-                f"World size ({self.world_size}) should be a multiple of "
-                f"ulysses_parallel_size ({self.ulysses_parallel_size}) * "
-                f"tensor_parallel_size ({self.tensor_parallel_size}) * "
-                f"ringattn_parallel_size ({self.ringattn_parallel_size}) * "
-                f"pipeline_parallel_size ({self.pipeline_parallel_size}) = {non_dp_size}."
+        if (
+            self.world_size
+            % (
+                self.pipeline_parallel_size
+                * self.ulysses_parallel_size
+                * self.context_parallel_size
+                * self.tensor_parallel_size
             )
-        self.data_parallel_size = self.world_size // non_dp_size
+            != 0
+        ):
+            raise ValueError(
+                f"World size should be a multiple of pipeline_parallel_size: {self.pipeline_parallel_size}, ulysses_parallel_size: {self.ulysses_parallel_size}, context_parallel_size: {self.context_parallel_size}, tensor_parallel_size: {self.tensor_parallel_size}."
+            )
+        assert self.tensor_parallel_size == 1, "Tensor parallel size not supported yet."
+        assert (
+            self.pipeline_parallel_size == 1
+        ), "Pipeline parallel size not supported yet."
+        self.data_parallel_size = self.world_size // (
+            self.pipeline_parallel_size
+            * self.ulysses_parallel_size
+            * self.context_parallel_size
+            * self.tensor_parallel_size
+        )
 
         # configure data parallel size
         if self.data_parallel_replicate_size > 0 and self.data_parallel_shard_size > 0:
@@ -954,6 +925,21 @@ class TrainingArguments:
                 self.init_device == "meta"
             ), "Please use init_device: meta for FSDP2 training"
 
+        # Validate gradient accumulation with FSDP offload
+        if self.gradient_accumulation_steps > 1 and self.enable_fsdp_offload:
+            raise ValueError(
+                "Gradient accumulation is not supported with FSDP offload."
+            )
+
+        # Validate liger availability
+        if self.use_liger:
+            try:
+                import liger_kernel
+            except ImportError:
+                raise ImportError(
+                    "use_liger is set to True, but liger-kernel is not installed. "
+                    "Please install it with: pip install liger-kernel"
+                )
 
         if self.load_checkpoint_path == "auto":
             from .checkpoint_utils import get_checkpoint_path
@@ -1018,73 +1004,6 @@ class DistillationArguments:
     stream_num_workers: int = field(
         default=32,
         metadata={"help": "Number of workers for loading activations from S3/local"},
-    )
-
-
-@dataclass
-class LoRAArguments:
-    """Arguments for LoRA and QLoRA fine-tuning."""
-
-    enable_lora: bool = field(
-        default=False,
-        metadata={"help": "Enable LoRA fine-tuning"},
-    )
-    lora_rank: int = field(
-        default=16,
-        metadata={"help": "LoRA rank"},
-    )
-    lora_alpha: int = field(
-        default=16,
-        metadata={"help": "LoRA alpha for scaling"},
-    )
-    lora_target_modules: Optional[List[str]] = field(
-        default=None,
-        metadata={"help": "Modules to apply LoRA to. If None, uses default linear projections."},
-    )
-    save_lora_only: bool = field(
-        default=False,
-        metadata={"help": "Only save LoRA weights (not full model) in HF checkpoints"},
-    )
-    # QLoRA: quantize base weights for memory savings
-    enable_qlora: bool = field(
-        default=False,
-        metadata={"help": "Enable QLoRA (quantized base weights + trainable LoRA). Implies enable_lora=True."},
-    )
-    quant_format: str = field(
-        default="nvfp4",
-        metadata={"help": "Quantization format for QLoRA. Supported: 'nvfp4', 'block_fp8', 'nf4'"},
-    )
-    quant_group_size: int = field(
-        default=16,
-        metadata={"help": "Group/block size for quantization (16 for nvfp4, 128 for block_fp8, 64 for nf4)"},
-    )
-    merge_lora_interval: int = field(
-        default=0,
-        metadata={"help": "Merge LoRA delta into base weights every N training steps. "
-                  "For QLoRA: merge + re-quantize. For LoRA: merge into bf16 weight. "
-                  "0 = disabled."},
-    )
-    reset_optimizer_on_merge: bool = field(
-        default=False,
-        metadata={"help": "ReLoRA-style optimizer reset after each LoRA merge. "
-                  "Clears optimizer states (momentum, variance) for LoRA parameters "
-                  "so Adam rebuilds from scratch for the re-initialized LoRA. "
-                  "Requires merge_lora_interval > 0."},
-    )
-    exclude_modules: Optional[List[str]] = field(
-        default=None,
-        metadata={"help": "Modules to exclude from QLoRA injection (kept as bf16). "
-                  "When None, auto-detected from pre-quantized checkpoint config "
-                  "(exclude_modules / modules_to_not_convert). "
-                  "Example: ['lm_head', 'gate']"},
-    )
-    enable_aqn: bool = field(
-        default=False,
-        metadata={"help": "Enable Adaptive Quantization Noise during training forward passes."},
-    )
-    aqn_alpha: float = field(
-        default=1.0,
-        metadata={"help": "Scale factor for AQN noise magnitude."},
     )
 
 
@@ -1400,9 +1319,8 @@ def parse_args(rootclass: T) -> T:
                     cmd_args.append(json.dumps(arg_value))
     args, remaining_args = parser.parse_known_args(cmd_args)
     if remaining_args:
-        raise ValueError(
-            f"Unrecognized arguments: {remaining_args}. "
-            f"Check your config file or CLI arguments for typos or removed fields."
+        logger.warning(
+            f"Some specified arguments are not used by the ArgumentParser: {remaining_args}"
         )
 
     parse_result = defaultdict(dict)
@@ -1451,10 +1369,27 @@ def save_args(args: T, output_path: str) -> None:
         args (dataclass): Arguments.
         output_path (str): Output path.
     """
-    os.makedirs(output_path, exist_ok=True)
-    local_path = os.path.join(output_path, "xorl_cli.yaml")
+    if output_path.startswith("hdfs://"):
+        local_dir = helper.get_cache_dir()
+        remote_dir = output_path
+    else:
+        logger.warning_once(
+            "Recommend to use hdfs path or hdfs_fuse path as the output path."
+        )
+        local_dir = output_path
+        remote_dir = None
+
+    os.makedirs(local_dir, exist_ok=True)
+    local_path = os.path.join(local_dir, "xorl_cli.yaml")
     with open(local_path, "w") as f:
         f.write(yaml.safe_dump(asdict(args), default_flow_style=False))
+
+    if remote_dir is not None:
+        if not exists(remote_dir):
+            makedirs(remote_dir)
+
+        remote_path = os.path.join(remote_dir, "xorl_cli.yaml")
+        copy(local_path, helper.convert_hdfs_fuse_path(remote_path))
 
 
 @dataclass
@@ -1464,4 +1399,3 @@ class Arguments:
     data: "DataArguments" = field(default_factory=DataArguments)
     train: "TrainingArguments" = field(default_factory=TrainingArguments)
     distill: "DistillationArguments" = field(default_factory=DistillationArguments)
-    lora: "LoRAArguments" = field(default_factory=LoRAArguments)

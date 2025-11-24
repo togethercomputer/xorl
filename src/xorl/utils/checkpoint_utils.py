@@ -1,7 +1,12 @@
 import os
-import shutil
 
 import torch.distributed as dist
+
+
+try:
+    from hdfs_io import copy, exists, isdir, listdir
+except ImportError:
+    from .hdfs_io import copy, exists, isdir, listdir
 
 from .logging import get_logger
 
@@ -23,11 +28,11 @@ def _validate_dcp_checkpoint_entry(checkpoints_dir: str, entry: str):
         return None
 
     checkpoint_path = os.path.join(checkpoints_dir, entry)
-    if not os.path.isdir(checkpoint_path):
+    if not isdir(checkpoint_path):
         return None
 
     metadata_path = os.path.join(checkpoint_path, ".metadata")
-    if not os.path.exists(metadata_path):
+    if not exists(metadata_path):
         return None
 
     return step
@@ -37,8 +42,8 @@ def get_last_iteration(output_dir, is_rank0: bool):
     meta_file = "latest_checkpointed_iteration.txt"
     if is_rank0:
         latest_file = os.path.join(output_dir, "checkpoints", meta_file)
-        if os.path.exists(latest_file):
-            shutil.copy(latest_file, meta_file)
+        if exists(latest_file):
+            copy(latest_file, meta_file)
 
     dist.barrier()
     if os.path.exists(meta_file):
@@ -57,11 +62,11 @@ def get_last_iteration(output_dir, is_rank0: bool):
 
 def dcp_get_last_iteration(output_dir):
     checkpoints_dir = os.path.join(output_dir, "checkpoints")
-    if not os.path.exists(checkpoints_dir):
+    if not exists(checkpoints_dir):
         logger.warning_rank0("Provided checkpoint path does not exist!")
         return None
 
-    entries = os.listdir(checkpoints_dir)
+    entries = listdir(checkpoints_dir)
     valid_steps = []
     for entry in entries:
         step = _validate_dcp_checkpoint_entry(checkpoints_dir, entry)

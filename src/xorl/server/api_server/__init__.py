@@ -1,14 +1,13 @@
 """
 API Server package for xorl training system.
 
-Provides unified FastAPI server with integrated OrchestratorClient for
+Provides unified FastAPI server with integrated EngineClient for
 communicating with the training engine backend.
 """
 
-from xorl.server.api_server.orchestrator_client import OrchestratorClient
-from xorl.server.api_server.server import APIServer
+from xorl.server.api_server.engine_client import EngineClient
+from xorl.server.api_server.api_server import APIServer
 from xorl.server.api_server.api_types import (
-    TensorData,
     Datum,
     DatumInput,
     ForwardRequest,
@@ -25,15 +24,16 @@ from xorl.server.api_server.api_types import (
     LoadWeightsResponse,
     SaveWeightsForSamplerRequest,
     SaveWeightsForSamplerResponse,
+    SaveLoRAOnlyRequest,
+    SaveLoRAOnlyResponse,
     HealthCheckResponse,
     ErrorResponse,
 )
 
 __all__ = [
-    "OrchestratorClient",
+    "EngineClient",
     "APIServer",
     # Request/Response models
-    "TensorData",
     "Datum",
     "DatumInput",
     "ForwardRequest",
@@ -50,6 +50,8 @@ __all__ = [
     "LoadWeightsResponse",
     "SaveWeightsForSamplerRequest",
     "SaveWeightsForSamplerResponse",
+    "SaveLoRAOnlyRequest",
+    "SaveLoRAOnlyResponse",
     "HealthCheckResponse",
     "ErrorResponse",
 ]
