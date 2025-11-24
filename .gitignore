@@ -10,8 +10,6 @@ data/*
 local/*
 dev/*
 deepspeed_configs/*.json
-.env.example
-.coverage
 
 # notebooks and files to keep locally
 notebooks/*
@@ -27,9 +25,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
-checkpoints/
-outputs/
-uv.lock
+
 # ides
 .idea/
 .vscode/
@@ -40,7 +36,6 @@ dist/
 build/
 
 # log files
-logs/
 *.log
 *.out
 
@@ -56,19 +51,3 @@ htmlcov/
 
 .claude/
 .pytest_cache/
-CLAUDE.md
-
-# slurm files
-sbatch.sh
-multi-train.sh
-
-# RL training outputs
-checkpoints/
-outputs/
-
-# slurm
-multi-train.sh
-sbatch.sh
-
-# trace
-trace/

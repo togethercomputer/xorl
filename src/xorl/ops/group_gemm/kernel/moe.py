@@ -1,9 +1,23 @@
-"""MoE operations: scatter, gather, histogram, and index computation."""
+# Copyright 2025 xorl contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 
 import torch
 import triton
 import triton.language as tl
 
+from ....utils.device import get_torch_device
 from .triton_utils.memory import (
     load_with_pred_1d,
     store_with_pred_1d,
@@ -55,14 +69,15 @@ def expert_histogram(input: torch.Tensor, num_bins: int) -> torch.Tensor:
     BLOCK_SIZE = 1024
     num_elts = flattened.numel()
     grid = (triton.cdiv(num_elts, BLOCK_SIZE),)
-    _expert_histogram_kernel[grid](
-        out_ptr=out,
-        x_ptr=flattened,
-        num_elts=num_elts,
-        num_bins=num_bins,
-        NUM_BINS_LAST_UNUSED=NUM_BINS_LAST_UNUSED,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
+    with get_torch_device().device(input.device):
+        _expert_histogram_kernel[grid](
+            out_ptr=out,
+            x_ptr=flattened,
+            num_elts=num_elts,
+            num_bins=num_bins,
+            NUM_BINS_LAST_UNUSED=NUM_BINS_LAST_UNUSED,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
 
     return out[:num_bins]
 
@@ -123,22 +138,23 @@ def moe_gather(x: torch.Tensor, index: torch.Tensor, out_dtype=None):
     out = torch.empty(M, N, dtype=out_dtype, device=x.device)
 
     grid = lambda meta: (M, triton.cdiv(N, meta["BLOCK_N"]))  # noqa
-    _moe_gather_kernel[grid](
-        x,
-        out,
-        index,
-        num_elts_in=M * topk,
-        num_elts_out=M,
-        N=N,
-        TOPK=topk,
-        STRIDE_XM=x.stride(0),
-        STRIDE_XN=x.stride(1),
-        STRIDE_OM=out.stride(0),
-        STRIDE_ON=out.stride(1),
-        STRIDE_IM=index.stride(0),
-        STRIDE_IN=index.stride(1),
-        BLOCK_N=1024,
-    )
+    with get_torch_device().device(x.device):
+        _moe_gather_kernel[grid](
+            x,
+            out,
+            index,
+            num_elts_in=M * topk,
+            num_elts_out=M,
+            N=N,
+            TOPK=topk,
+            STRIDE_XM=x.stride(0),
+            STRIDE_XN=x.stride(1),
+            STRIDE_OM=out.stride(0),
+            STRIDE_ON=out.stride(1),
+            STRIDE_IM=index.stride(0),
+            STRIDE_IN=index.stride(1),
+            BLOCK_N=1024,
+        )
 
     return out
 
@@ -208,25 +224,26 @@ def moe_add_gather(x: torch.Tensor, y: torch.Tensor, index: torch.Tensor, out_dt
     out = torch.empty(M, N, dtype=out_dtype, device=x.device)
 
     grid = lambda meta: (M, triton.cdiv(N, meta["BLOCK_N"]))  # noqa
-    _moe_add_gather_kernel[grid](
-        x,
-        y,
-        out,
-        index,
-        num_elts_in=M * topk,
-        num_elts_out=M,
-        N=N,
-        TOPK=topk,
-        STRIDE_XM=x.stride(0),
-        STRIDE_XN=x.stride(1),
-        STRIDE_YM=y.stride(0),
-        STRIDE_YN=y.stride(1),
-        STRIDE_OM=out.stride(0),
-        STRIDE_ON=out.stride(1),
-        STRIDE_IM=index.stride(0),
-        STRIDE_IN=index.stride(1),
-        BLOCK_N=1024,
-    )
+    with get_torch_device().device(x.device):
+        _moe_add_gather_kernel[grid](
+            x,
+            y,
+            out,
+            index,
+            num_elts_in=M * topk,
+            num_elts_out=M,
+            N=N,
+            TOPK=topk,
+            STRIDE_XM=x.stride(0),
+            STRIDE_XN=x.stride(1),
+            STRIDE_YM=y.stride(0),
+            STRIDE_YN=y.stride(1),
+            STRIDE_OM=out.stride(0),
+            STRIDE_ON=out.stride(1),
+            STRIDE_IM=index.stride(0),
+            STRIDE_IN=index.stride(1),
+            BLOCK_N=1024,
+        )
 
     return out
 
@@ -292,26 +309,26 @@ def moe_scatter(x: torch.Tensor, index: torch.Tensor, out_dtype=None):
     topk = index.shape[1]
     out_dtype = out_dtype or x.dtype
     out = torch.empty(M * topk, N, dtype=out_dtype, device=x.device)
-    # Debug validation (expensive — enable explicitly if needed):
-    # assert index.unique().numel() == M * topk, "Holes in output?"
+    assert lambda: index.unique().numel() == M * topk, "Holes in output?"
 
     grid = lambda meta: (M, triton.cdiv(N, meta["BLOCK_N"]))  # noqa
-    _moe_scatter_kernel[grid](
-        x,
-        out,
-        index,
-        num_elts_in=M,
-        num_elts_out=M * topk,
-        N=N,
-        TOPK=topk,
-        STRIDE_XM=x.stride(0),
-        STRIDE_XN=x.stride(1),
-        STRIDE_OM=out.stride(0),
-        STRIDE_ON=out.stride(1),
-        STRIDE_IM=index.stride(0),
-        STRIDE_IN=index.stride(1),
-        BLOCK_N=1024,
-    )
+    with get_torch_device().device(x.device):
+        _moe_scatter_kernel[grid](
+            x,
+            out,
+            index,
+            num_elts_in=M,
+            num_elts_out=M * topk,
+            N=N,
+            TOPK=topk,
+            STRIDE_XM=x.stride(0),
+            STRIDE_XN=x.stride(1),
+            STRIDE_OM=out.stride(0),
+            STRIDE_ON=out.stride(1),
+            STRIDE_IM=index.stride(0),
+            STRIDE_IN=index.stride(1),
+            BLOCK_N=1024,
+        )
 
     return out
 
@@ -388,13 +405,14 @@ def moe_index_compute(experts_for_tokens: torch.Tensor, expert_histogram_cumsum:
     histogram_cumsum_copy = expert_histogram_cumsum.clone().detach()  # Temporary workspace.
     indices = torch.empty_like(experts_for_tokens, dtype=int)
 
-    _moe_index_compute_kernel[(triton.cdiv(experts_for_tokens.numel(), BLOCK_SIZE),)](
-        indices_ptr=indices,
-        experts_for_tokens_ptr=experts_for_tokens,
-        temp_histogram_cumsum_ptr=histogram_cumsum_copy,
-        num_elts=experts_for_tokens.numel(),
-        NUM_EXPERTS=histogram_cumsum_copy.numel(),
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
+    with get_torch_device().device(experts_for_tokens.device):
+        _moe_index_compute_kernel[(triton.cdiv(experts_for_tokens.numel(), BLOCK_SIZE),)](
+            indices_ptr=indices,
+            experts_for_tokens_ptr=experts_for_tokens,
+            temp_histogram_cumsum_ptr=histogram_cumsum_copy,
+            num_elts=experts_for_tokens.numel(),
+            NUM_EXPERTS=histogram_cumsum_copy.numel(),
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
 
     return indices

@@ -383,21 +383,10 @@ class PackingDataset(Dataset):
         # Get sequence lengths from the dataset
         assert "length" in self.dataset.features, "Length column not found in dataset"
         self.sequence_lengths: np.ndarray = np.array(dataset["length"])
-
+        
         # Determine bin capacity from args
         self.bin_capacity: int = args.data.sample_packing_sequence_len
-
-        # Validate: all samples must fit within bin_capacity.
-        # Truncation is a data processing concern and should be handled upstream.
-        max_len = int(self.sequence_lengths.max())
-        if max_len > self.bin_capacity:
-            num_oversized = int(np.sum(self.sequence_lengths > self.bin_capacity))
-            raise ValueError(
-                f"{num_oversized}/{len(self.sequence_lengths)} samples exceed "
-                f"sample_packing_sequence_len ({self.bin_capacity}), max is {max_len}. "
-                f"Truncate your data before packing."
-            )
-
+        
         # Try to load cached bins, otherwise compute them
         self.bins: List[List[int]] = self._load_or_compute_bins()
         
@@ -582,11 +571,11 @@ class PackingDataset(Dataset):
         """Return a packed sample containing multiple sequences concatenated together."""
         if index >= len(self.bins):
             raise IndexError(f"Index {index} out of range for {len(self.bins)} bins")
-
+        
         bin_indices: List[int] = self.bins[index]
-
+        
         # Get the individual samples for this bin
         samples: List[Dict[str, Any]] = [self.dataset[idx] for idx in bin_indices]
-
+        
         return samples
     

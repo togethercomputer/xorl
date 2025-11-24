@@ -2,7 +2,7 @@
 
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import wraps
 from typing import TYPE_CHECKING, Callable, Literal, Optional
 
@@ -68,24 +68,22 @@ class ParallelState:
     tp_size: int = 1
     ep_size: int = 1
     pp_size: int = 1
-    ringattn_size: int = 1
+    cp_size: int = 1
     ulysses_size: int = 1
-    dp_mode: Literal["none", "ddp", "fsdp2"] = "fsdp2"
+    dp_mode: Literal["ddp", "fsdp1", "fsdp2"] = "fsdp1"
     device_type: str = get_device_type()
-    cp_fsdp_mode: Literal["all", "ulysses_only", "ring_only", "none"] = "all"
+    include_sp_in_fsdp: bool = True
     device_mesh: Optional["DeviceMesh"] = None
     ep_fsdp_device_mesh: Optional["DeviceMesh"] = None
-    _mesh_aliases: dict = field(default_factory=dict, repr=False)
-
-    def _resolve_mesh_name(self, name: str) -> str:
-        """Resolve a flattened mesh alias to the original dim name when flatten was skipped."""
-        return self._mesh_aliases.get(name, name)
 
     def __post_init__(self):
-        if self.cp_fsdp_mode not in ("all", "ulysses_only", "ring_only", "none"):
-            raise ValueError(f"Invalid cp_fsdp_mode: {self.cp_fsdp_mode}. Must be 'all', 'ulysses_only', 'ring_only', or 'none'.")
+        if not self.include_sp_in_fsdp:
+            raise NotImplementedError("Decoupled sequence parallel has not been implemented.")
 
-        if self.pp_size * self.dp_size * self.ringattn_size * self.ulysses_size * self.tp_size != self.world_size:
+        if self.cp_size > 1:
+            raise NotImplementedError("Ring attention is not supported yet.")
+
+        if self.pp_size * self.dp_size * self.cp_size * self.ulysses_size * self.tp_size != self.world_size:
             raise ValueError("The product of parallel sizes should be equal to the world size.")
 
         if self.dp_replicate_size * self.dp_shard_size != self.dp_size:
@@ -93,29 +91,29 @@ class ParallelState:
                 f"The product of dp_replicate_size: {self.dp_replicate_size} and dp_shard_size: {self.dp_shard_size} should be equal to dp_size: {self.dp_size}."
             )
 
-        if self.cp_enabled:
+        if self.sp_enabled:
             from ..distributed.sequence_parallel import (
                 init_sequence_parallel,
-                set_ringattn_group,
+                set_context_parallel_group,
                 set_data_parallel_group,
                 set_ulysses_sequence_parallel_group,
                 set_unified_sequence_parallel_group,
             )
 
             if self.device_mesh is not None:
-                set_data_parallel_group(self.device_mesh.get_group(self._resolve_mesh_name("dp")))
+                set_data_parallel_group(self.device_mesh.get_group("dp"))
                 if self.ulysses_size > 1:
                     set_ulysses_sequence_parallel_group(self.device_mesh.get_group("ulysses"))
-                if self.ringattn_size > 1:
-                    set_ringattn_group(self.device_mesh.get_group("ringattn"))
+                if self.cp_size > 1:
+                    set_context_parallel_group(self.device_mesh.get_group("cp"))
                 # set unified sequence parallel group
-                set_unified_sequence_parallel_group(self.device_mesh.get_group(self._resolve_mesh_name("sp")))
+                set_unified_sequence_parallel_group(self.device_mesh.get_group("sp"))
             else:
                 init_sequence_parallel(
                     ulysses_size=self.ulysses_size,
                     sep_dp=True,
                     ulysses_group_key="default",
-                    ringattn_size=self.ringattn_size,
+                    cp_size=self.cp_size,
                 )
 
     @property
@@ -142,9 +140,9 @@ class ParallelState:
     @property
     def dp_group(self) -> Optional["ProcessGroup"]:
         if self.device_mesh is not None:
-            return self.device_mesh.get_group(self._resolve_mesh_name("dp"))
+            return self.device_mesh.get_group("dp")
 
-        if self.cp_enabled:
+        if self.sp_enabled:
             from ..distributed.sequence_parallel import get_data_parallel_group
 
             return get_data_parallel_group()
@@ -154,9 +152,9 @@ class ParallelState:
     @property
     def dp_rank(self) -> int:
         if self.device_mesh is not None:
-            return self.device_mesh.get_local_rank(self._resolve_mesh_name("dp"))
+            return self.device_mesh.get_local_rank("dp")
 
-        if self.cp_enabled:
+        if self.sp_enabled:
             from ..distributed.sequence_parallel import get_data_parallel_rank
 
             return get_data_parallel_rank()
@@ -174,54 +172,6 @@ class ParallelState:
     @property
     def dp_enabled(self) -> bool:
         return self.dp_size > 1
-
-    # ------------------------------ Batch ------------------------------ #
-    @property
-    def batch_group(self) -> Optional["ProcessGroup"]:
-        """Process group for data loading (dp_replicate x dp_shard).
-
-        Ranks in the same batch group receive distinct batch items.
-        Excludes Ulysses and ring since those ranks share the same data.
-        """
-        return self.dp_group
-
-    @property
-    @requires_mesh
-    def batch_mesh(self) -> "DeviceMesh":
-        """Device mesh for data loading (dp_replicate x dp_shard)."""
-        return self.device_mesh["dp"]
-
-    @property
-    def batch_size(self) -> int:
-        """Number of ranks that receive distinct batch items."""
-        return self.dp_replicate_size * self.dp_shard_size
-
-    # ------------------------------ Loss ------------------------------ #
-    @property
-    def loss_group(self) -> Optional["ProcessGroup"]:
-        """Process group for loss reduction (dp_replicate x dp_shard x ulysses x ring).
-
-        All ranks that compute partial losses on different data/sequence shards.
-        """
-        if self.device_mesh is not None:
-            return self.device_mesh.get_group("dp_sp")
-        return self.fsdp_group
-
-    @property
-    @requires_mesh
-    def loss_mesh(self) -> "DeviceMesh":
-        """Device mesh for loss reduction (dp_replicate x dp_shard x ulysses x ring)."""
-        return self.device_mesh["dp_sp"]
-
-    @property
-    def loss_size(self) -> int:
-        """Number of ranks that participate in loss reduction."""
-        return self.dp_replicate_size * self.dp_shard_size * self.ulysses_size * self.ringattn_size
-
-    @property
-    def loss_parallel_enabled(self) -> bool:
-        """Whether loss reduction across multiple ranks is needed."""
-        return self.dp_enabled or self.cp_enabled
 
     # ------------------------------ DP replicate ------------------------------ #
     @property
@@ -269,64 +219,48 @@ class ParallelState:
     @property
     def fsdp_group(self) -> Optional["ProcessGroup"]:
         if self.device_mesh is not None:
-            return self.device_mesh.get_group(self._resolve_mesh_name("dp_sp"))
+            return self.device_mesh.get_group("dp_sp")
 
     @property
     def fsdp_rank(self) -> int:
         if self.device_mesh is not None:
-            return self.device_mesh.get_local_rank(self._resolve_mesh_name("dp_sp"))
+            return self.device_mesh.get_local_rank("dp_sp")
 
         return self.global_rank
 
     @property
-    def dp_shard_cp_enabled(self) -> bool:
-        return self.dp_shard_enabled and self.cp_enabled
+    def dp_shard_sp_enabled(self) -> bool:
+        return self.dp_shard_enabled and self.sp_enabled
 
     @property
     @requires_mesh
     def fsdp_mesh(self) -> "DeviceMesh":
-        dp_shard_sp_name = self._resolve_mesh_name("dp_shard_sp")
         if self.dp_replicate_enabled:
             # HSDP
-            if self.dp_shard_cp_enabled:
-                return self.device_mesh["dp_replicate", dp_shard_sp_name]
+            if self.dp_shard_sp_enabled:
+                return self.device_mesh["dp_replicate", "dp_shard_sp"]
             elif self.dp_shard_enabled:
                 return self.device_mesh["dp_replicate", "dp_shard"]
             else:
                 # DDP
                 return self.device_mesh["dp_replicate"]
         # FSDP
-        elif self.dp_shard_cp_enabled:
-            return self.device_mesh[dp_shard_sp_name]
+        elif self.dp_shard_sp_enabled:
+            return self.device_mesh["dp_shard_sp"]
         elif self.dp_shard_enabled:
             return self.device_mesh["dp_shard"]
         else:
-            return self.device_mesh[self._resolve_mesh_name("dp")]
+            return self.device_mesh["dp"]
 
     @property
     def fsdp_enabled(self) -> bool:
-        # FSDP is enabled if dp_mode is fsdp2, even with world_size=1
+        # FSDP is enabled if dp_mode is fsdp1/fsdp2, even with world_size=1
         # This allows using FSDP features like meta device initialization on single GPU
-        return self.dp_mode == "fsdp2"
+        return self.dp_mode in ["fsdp1", "fsdp2"]
 
     @property
     def fsdp_size(self) -> int:
-        """Number of ranks in the FSDP mesh (the averaging factor for reduce-scatter).
-
-        Depends on cp_fsdp_mode:
-          "all":           dp_size * ringattn_size * ulysses_size
-          "ulysses_only":  dp_size * ulysses_size
-          "ring_only":     dp_size * ringattn_size
-          "none":          dp_size
-        """
-        size = self.dp_size
-        if self.cp_fsdp_mode == "all":
-            size *= self.ringattn_size * self.ulysses_size
-        elif self.cp_fsdp_mode == "ulysses_only":
-            size *= self.ulysses_size
-        elif self.cp_fsdp_mode == "ring_only":
-            size *= self.ringattn_size
-        return size
+        return self.world_size // (self.pp_size * self.tp_size)
 
     # ------------------------------ TP ------------------------------ #
     @property
@@ -342,11 +276,6 @@ class ParallelState:
     @property
     def tp_enabled(self) -> bool:
         return self.tp_size > 1
-
-    @property
-    @requires_mesh
-    def tp_group(self):
-        return self.device_mesh.get_group("tp")
 
     # ------------------------------ PP ------------------------------ #
     @property
@@ -373,11 +302,6 @@ class ParallelState:
     def is_last_pp_stage(self) -> bool:
         return self.pp_rank == (self.pp_size - 1)
 
-    @property
-    @requires_mesh
-    def pp_group(self) -> "ProcessGroup":
-        return self.pp_mesh.get_group()
-
     # ------------------------------ EP ------------------------------ #
     @property
     @requires_mesh
@@ -402,14 +326,13 @@ class ParallelState:
     def ep_rank(self) -> int:
         return self.ep_fsdp_device_mesh.get_local_rank("ep")
 
-    # ------------------------------ SP (sequence parallel) ------------------------------ #
+    # ------------------------------ SP ------------------------------ #
     @property
     def sp_group(self) -> Optional["ProcessGroup"]:
-        """Unified sequence-parallel group (ring + Ulysses combined)."""
-        if self.cp_enabled:
-            if self.device_mesh is not None:
-                return self.device_mesh.get_group(self._resolve_mesh_name("sp"))
+        if self.device_mesh is not None:
+            return self.device_mesh.get_group("sp")
 
+        if self.sp_enabled:
             from .sequence_parallel import get_unified_sequence_parallel_group
 
             return get_unified_sequence_parallel_group()
@@ -417,11 +340,11 @@ class ParallelState:
         return None
 
     @property
-    def cp_rank(self) -> int:
-        if self.cp_enabled:
-            if self.device_mesh is not None:
-                return self.device_mesh.get_local_rank(self._resolve_mesh_name("sp"))
+    def sp_rank(self) -> int:
+        if self.device_mesh is not None:
+            return self.device_mesh.get_local_rank("sp")
 
+        if self.sp_enabled:
             from .sequence_parallel import get_unified_sequence_parallel_rank
 
             return get_unified_sequence_parallel_rank()
@@ -429,19 +352,19 @@ class ParallelState:
         return -1
 
     @property
-    def cp_enabled(self) -> bool:
-        return self.ringattn_size > 1 or self.ulysses_size > 1
+    def sp_enabled(self) -> bool:
+        return self.cp_size > 1 or self.ulysses_size > 1
 
     @property
-    def cp_size(self) -> int:
-        return self.ulysses_size * self.ringattn_size
+    def sp_size(self) -> int:
+        return self.ulysses_size * self.cp_size
 
     @property
     def ulysses_group(self) -> Optional["ProcessGroup"]:
-        if self.ulysses_enabled:
-            if self.device_mesh is not None:
-                return self.device_mesh.get_group("ulysses")
+        if self.device_mesh is not None:
+            return self.device_mesh.get_group("ulysses")
 
+        if self.sp_enabled:
             from .sequence_parallel import get_ulysses_sequence_parallel_group
 
             return get_ulysses_sequence_parallel_group()
@@ -450,10 +373,10 @@ class ParallelState:
 
     @property
     def ulysses_rank(self) -> int:
-        if self.ulysses_enabled:
-            if self.device_mesh is not None:
-                return self.device_mesh.get_local_rank("ulysses")
+        if self.device_mesh is not None:
+            return self.device_mesh.get_local_rank("ulysses")
 
+        if self.sp_enabled:
             from .sequence_parallel import get_ulysses_sequence_parallel_rank
 
             return get_ulysses_sequence_parallel_rank()
@@ -465,58 +388,32 @@ class ParallelState:
         return self.ulysses_size > 1
 
     @property
-    def ringattn_group(self) -> Optional["ProcessGroup"]:
-        if self.ringattn_enabled:
-            if self.device_mesh is not None:
-                return self.device_mesh.get_group("ringattn")
+    def cp_group(self) -> Optional["ProcessGroup"]:
+        if self.device_mesh is not None:
+            return self.device_mesh.get_group("cp")
 
-            from .sequence_parallel import get_ringattn_group
+        if self.sp_enabled:
+            from .sequence_parallel import get_context_parallel_group
 
-            return get_ringattn_group()
+            return get_context_parallel_group()
 
         return None
 
     @property
-    def ringattn_rank(self) -> int:
-        if self.ringattn_enabled:
-            if self.device_mesh is not None:
-                return self.device_mesh.get_local_rank("ringattn")
+    def cp_rank(self) -> int:
+        if self.device_mesh is not None:
+            return self.device_mesh.get_local_rank("cp")
 
-            from .sequence_parallel import get_ringattn_rank
+        if self.sp_enabled:
+            from .sequence_parallel import get_context_parallel_rank
 
-            return get_ringattn_rank()
+            return get_context_parallel_rank()
 
         return -1
 
     @property
-    def ringattn_enabled(self) -> bool:
-        return self.ringattn_size > 1
-
-    @property
-    def ringattn_grad_sync_group(self) -> Optional["ProcessGroup"]:
-        """Returns ring group for gradient sync when ring is not folded into FSDP."""
-        if self.cp_fsdp_mode == "ulysses_only" and self.ringattn_size > 1 and self.device_mesh is not None:
-            return self.device_mesh.get_group("ringattn")
-        return None
-
-    @property
-    def sp_grad_sync_group(self) -> Optional["ProcessGroup"]:
-        """Returns group for gradient sync for SP dims not folded into FSDP.
-
-        cp_fsdp_mode="all":           nothing needs sync (both in FSDP)
-        cp_fsdp_mode="ulysses_only":  ring needs sync
-        cp_fsdp_mode="ring_only":     ulysses needs sync
-        cp_fsdp_mode="none":          both ring and ulysses need sync
-        """
-        if self.device_mesh is None or self.cp_fsdp_mode == "all":
-            return None
-        if self.cp_fsdp_mode == "ulysses_only" and self.ringattn_size > 1:
-            return self.device_mesh.get_group("ringattn")
-        if self.cp_fsdp_mode == "ring_only" and self.ulysses_size > 1:
-            return self.device_mesh.get_group("ulysses")
-        if self.cp_fsdp_mode == "none" and self.cp_enabled:
-            return self.sp_group
-        return None
+    def cp_enabled(self) -> bool:
+        return self.cp_size > 1
 
 
 def init_parallel_state(
@@ -526,11 +423,11 @@ def init_parallel_state(
     tp_size: int = 1,
     ep_size: int = 1,
     pp_size: int = 1,
-    ringattn_size: int = 1,
+    cp_size: int = 1,
     ulysses_size: int = 1,
-    dp_mode: Literal["none", "ddp", "fsdp2"] = "fsdp2",
+    dp_mode: Literal["ddp", "fsdp1", "fsdp2"] = "fsdp1",
     device_type: str = None,
-    cp_fsdp_mode: Literal["all", "ulysses_only", "ring_only", "none"] = "all",
+    include_sp_in_fsdp: bool = True,
     ep_outside: bool = False,
 ) -> None:
     """
@@ -549,17 +446,16 @@ def init_parallel_state(
         dp_shard_size = dp_size
 
     logger.info_rank0(
-        f"Initializing parallel state... dp_size {dp_size}, dp_replicate_size {dp_replicate_size}, dp_shard_size {dp_shard_size},tp_size {tp_size}, pp_size {pp_size}, ringattn_size {ringattn_size}, ulysses_size {ulysses_size}"
+        f"Initializing parallel state... dp_size {dp_size}, dp_replicate_size {dp_replicate_size}, dp_shard_size {dp_shard_size},tp_size {tp_size}, pp_size {pp_size}, cp_size {cp_size}, ulysses_size {ulysses_size}"
     )
 
     device_mesh, ep_fsdp_device_mesh = None, None
-    _mesh_aliases = {}
     if is_torch_version_greater_than("2.4"):
         mesh_shape = []
         mesh_dim_names = []
         for d, name in zip(
-            [pp_size, dp_replicate_size, dp_shard_size, ringattn_size, ulysses_size, tp_size],
-            ["pp", "dp_replicate", "dp_shard", "ringattn", "ulysses", "tp"],
+            [pp_size, dp_replicate_size, dp_shard_size, ulysses_size, cp_size, tp_size],
+            ["pp", "dp_replicate", "dp_shard", "ulysses", "cp", "tp"],
         ):
             if d > 1 or name in ["dp_shard"]:
                 mesh_shape.append(d)
@@ -587,77 +483,38 @@ def init_parallel_state(
             dp_mesh_dim_names.append("dp_shard")
             dp_shard_sp_mesh_dim_names.append("dp_shard")
             dp_sp_mesh_dim_names.append("dp_shard")
-        # NOTE: append in mesh dimension order (dp_shard, ring, ulysses) to keep
-        # indices ascending for DeviceMesh._flatten().
-        if ringattn_size > 1:
-            if cp_fsdp_mode in ("all", "ring_only"):
-                dp_shard_sp_mesh_dim_names.append("ringattn")
-            sp_mesh_dim_names.append("ringattn")
-            dp_sp_mesh_dim_names.append("ringattn")
         if ulysses_size > 1:
-            if cp_fsdp_mode in ("all", "ulysses_only"):
-                dp_shard_sp_mesh_dim_names.append("ulysses")
+            dp_shard_sp_mesh_dim_names.append("ulysses")
             sp_mesh_dim_names.append("ulysses")
             dp_sp_mesh_dim_names.append("ulysses")
+        if cp_size > 1:
+            dp_shard_sp_mesh_dim_names.append("cp")
+            sp_mesh_dim_names.append("cp")
+            dp_sp_mesh_dim_names.append("cp")
 
-        def _safe_flatten(mesh, dim_names, flat_name):
-            """Flatten mesh dims into a single alias. Skip when only 1 dim
-            (already addressable by its original name) to avoid a PyTorch bug
-            with size-1 flatten."""
-            if len(dim_names) >= 2:
-                mesh[tuple(dim_names)]._flatten(mesh_dim_name=flat_name)
+        if dp_mesh_dim_names != []:
+            device_mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
 
-        # Build alias -> original dim name(s) mapping for single-dim fallback
-        _mesh_aliases = {}
-        for flat_name, dim_names in [
-            ("dp", dp_mesh_dim_names),
-            ("dp_shard_sp", dp_shard_sp_mesh_dim_names),
-            ("dp_sp", dp_sp_mesh_dim_names),
-            ("sp", sp_mesh_dim_names),
-        ]:
-            if len(dim_names) >= 2:
-                device_mesh[tuple(dim_names)]._flatten(mesh_dim_name=flat_name)
-            elif len(dim_names) == 1:
-                # Single dim: no flatten needed, record alias -> original name
-                _mesh_aliases[flat_name] = dim_names[0]
+        if dp_shard_sp_mesh_dim_names != []:
+            device_mesh[tuple(dp_shard_sp_mesh_dim_names)]._flatten(mesh_dim_name="dp_shard_sp")
+
+        if dp_sp_mesh_dim_names != []:
+            device_mesh[tuple(dp_sp_mesh_dim_names)]._flatten(mesh_dim_name="dp_sp")
+
+        if sp_mesh_dim_names != []:
+            device_mesh[tuple(sp_mesh_dim_names)]._flatten(mesh_dim_name="sp")
 
         if ep_size > 1:
             world_size = dist.get_world_size()
-            # EP mesh must be per-PP-stage to avoid cross-stage collectives
-            # that deadlock during async pipeline execution.
-            ranks_per_stage = world_size // pp_size
-            assert ranks_per_stage % ep_size == 0, (
-                f"ep_size ({ep_size}) must be a factor of ranks_per_pp_stage "
-                f"({ranks_per_stage} = world_size {world_size} / pp_size {pp_size})"
+            assert world_size % ep_size == 0, "ep_size must be a factor of world_size"
+            ep_fsdp_size = world_size // ep_size
+
+            mesh = init_ep_mesh_matrix(ep_size=ep_size, ep_fsdp_size=ep_fsdp_size, ep_outside=ep_outside)
+            ep_fsdp_device_mesh = DeviceMesh(
+                device_type=device_type,
+                mesh=mesh,
+                mesh_dim_names=("ep", "ep_fsdp"),
             )
-            ep_fsdp_size = ranks_per_stage // ep_size
-
-            if pp_size > 1:
-                # Create 3D mesh (_pp_ep, ep, ep_fsdp) so each PP stage gets
-                # its own EP groups. Slicing by ["ep"] or ["ep", "ep_fsdp"]
-                # automatically returns the per-stage submesh for each rank.
-                with torch.device("cpu"):
-                    pp_ep_mesh = torch.zeros(pp_size, ep_size, ep_fsdp_size, dtype=torch.int)
-                    for pp_stage in range(pp_size):
-                        stage_start = pp_stage * ranks_per_stage
-                        stage_ranks = torch.arange(stage_start, stage_start + ranks_per_stage, dtype=torch.int)
-                        if ep_outside:
-                            pp_ep_mesh[pp_stage] = stage_ranks.view(ep_size, ep_fsdp_size)
-                        else:
-                            pp_ep_mesh[pp_stage] = stage_ranks.view(ep_fsdp_size, ep_size).transpose(0, 1)
-
-                ep_fsdp_device_mesh = DeviceMesh(
-                    device_type=device_type,
-                    mesh=pp_ep_mesh,
-                    mesh_dim_names=("_pp_ep", "ep", "ep_fsdp"),
-                )
-            else:
-                mesh = init_ep_mesh_matrix(ep_size=ep_size, ep_fsdp_size=ep_fsdp_size, ep_outside=ep_outside)
-                ep_fsdp_device_mesh = DeviceMesh(
-                    device_type=device_type,
-                    mesh=mesh,
-                    mesh_dim_names=("ep", "ep_fsdp"),
-                )
 
         logger.info_rank0(f"Device mesh: {device_mesh}")
         logger.info_rank0(f"EP FSDP device mesh: {ep_fsdp_device_mesh}")
@@ -669,14 +526,13 @@ def init_parallel_state(
         tp_size=tp_size,
         ep_size=ep_size,
         pp_size=pp_size,
-        ringattn_size=ringattn_size,
+        cp_size=cp_size,
         ulysses_size=ulysses_size,
         dp_mode=dp_mode,
         device_type=device_type,
-        cp_fsdp_mode=cp_fsdp_mode,
+        include_sp_in_fsdp=include_sp_in_fsdp,
         device_mesh=device_mesh,
         ep_fsdp_device_mesh=ep_fsdp_device_mesh,
-        _mesh_aliases=_mesh_aliases if device_mesh is not None else {},
     )
 
 

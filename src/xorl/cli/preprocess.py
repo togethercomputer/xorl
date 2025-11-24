@@ -43,6 +43,9 @@ def load_config_without_validation(config_path: str) -> Arguments:
     # Set all parallel sizes to 1 for preprocessing
     train_config_override = {
         **train_config,
+        'tensor_parallel_size': 1,
+        'pipeline_parallel_size': 1,
+        'context_parallel_size': 1,
         'ulysses_parallel_size': 1,
         'expert_parallel_size': 1,
         'data_parallel_replicate_size': 1,

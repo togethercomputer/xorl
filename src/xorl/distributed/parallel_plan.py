@@ -32,16 +32,9 @@ class ParallelPlan:
         self.ep_param_suffix = {k.split(".")[-1] for k in ep_plan.keys()}
         self.fsdp_no_shard_module = {".".join(list(ep_plan.keys())[0].split(".")[:-1])}
 
-    def apply(self, model: nn.Module, ep_fsdp_mesh: DeviceMesh, already_local: bool = False):
-        """Apply EP sharding to model parameters.
-
-        Args:
-            model: The model whose expert parameters will be sharded.
-            ep_fsdp_mesh: DeviceMesh with ``["ep", "ep_fsdp"]`` dimensions.
-            already_local: When ``True``, expert parameters are already at
-                EP-local shapes (e.g. loaded with EP-aware weight loading
-                before FSDP wrapping).  Skip the DTensor redistribute but
-                still annotate every parameter with ``spec_info``.
+    def apply(self, model: nn.Module, ep_fsdp_mesh: DeviceMesh):
+        """
+        ep_fsdp_mesh: [replicate, replicate, ... , shard]
         """
         ep_mesh = ep_fsdp_mesh["ep"]
         # ep_plan
@@ -52,29 +45,8 @@ class ParallelPlan:
             for fqn, param in model.named_parameters():
                 for fqn_pattern, shard in self.ep_plan.items():
                     if check_fqn_match(fqn_pattern, fqn):
-                        # Shared LoRA weights have size=1 on shard dim - replicate instead of shard
-                        if param.size(shard.dim) == 1:
-                            param.spec_info = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=Replicate(), fqn=fqn)
-                            fqn2spec_info[fqn] = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=Replicate(), fqn=fqn)
-                            logger.debug_rank0(f"EP replicated (shared): {fqn} {list(param.shape)}")
-                            break
-
-                        if already_local:
-                            # Params already EP-local — just annotate with spec_info
-                            param.spec_info = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=shard, fqn=fqn)
-                            fqn2spec_info[fqn] = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=shard, fqn=fqn)
-                            logger.debug_rank0(
-                                f"EP annotated (already local): {fqn} {list(param.shape)} "
-                                f"(dim={shard.dim}, ep_size={ep_size})"
-                            )
-                            break
-
-                        assert param.size(shard.dim) % ep_size == 0, (
-                            f"EP sharding failed for {fqn}: dim {shard.dim} size {param.size(shard.dim)} "
-                            f"not divisible by ep_size {ep_size}"
-                        )
+                        assert param.size(shard.dim) % ep_size == 0
                         ep_placement = ep_replicate[:-1] + [shard]
-                        original_shape = param.shape
                         dtensor = DTensor.from_local(
                             local_tensor=param.data, device_mesh=ep_mesh, placements=ep_replicate
                         )
@@ -83,15 +55,10 @@ class ParallelPlan:
                         local_chunk.spec_info = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=shard, fqn=fqn)
                         set_module_from_path(model, fqn, local_chunk)
                         fqn2spec_info[fqn] = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=shard, fqn=fqn)
-                        logger.debug_rank0(
-                            f"EP sharded: {fqn} {list(original_shape)} -> {list(local_chunk.shape)} "
-                            f"(dim={shard.dim}, ep_size={ep_size})"
-                        )
                         break
                 if fqn not in fqn2spec_info:  # not sharded
                     param.spec_info = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=Replicate(), fqn=fqn)
                     fqn2spec_info[fqn] = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=Replicate(), fqn=fqn)
-
         for param in model.parameters():
             assert hasattr(param, "spec_info"), f"Internal Error: {param} is omitted"
 

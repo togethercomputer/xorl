@@ -1,8 +1,16 @@
-"""Group GEMM kernels for efficient batched matrix multiplication.
-
-These triton kernels support grouped GEMM operations where multiple matrix
-multiplications with the same N,K or M,N dimensions are batched together.
-"""
+# Copyright 2025 xorl contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from typing import Optional
 
@@ -10,6 +18,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ....utils.device import get_torch_device
+from ..utils.pretuned import algo_key_scaled, pretuned
 from .triton_utils.activation import (
     ActivationType,
     activation_fwd,
@@ -25,7 +35,6 @@ from .triton_utils.utils import (
     get_pid_mn,
     make_blocked,
 )
-from ..utils.pretuned import algo_key_scaled, pretuned
 
 
 def _get_cuda_autotune_config():
@@ -35,26 +44,17 @@ def _get_cuda_autotune_config():
             num_stages=3,
             num_warps=8,
         ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP": 8},
-            num_stages=3,
-            num_warps=8,
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP": 8},
-            num_stages=4,
-            num_warps=4,
-        ),
     ]
 
-@triton.autotune(
-    configs=_get_cuda_autotune_config(),
-    key=["N", "K"],
-)
-# @pretuned(
-#     algo_key=algo_key_scaled(["total_M", "N", "K"], [5000, 1, 1], ["TRANSPOSE_A", "TRANSPOSE_B"]),
-#     fallback={"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP": 8},
+
+# @triton.autotune(
+#     configs=_get_cuda_autotune_config(),
+#     key=["total_M", "N", "K"],
 # )
+@pretuned(
+    algo_key=algo_key_scaled(["total_M", "N", "K"], [5000, 1, 1], ["TRANSPOSE_A", "TRANSPOSE_B"]),
+    fallback={"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP": 8},
+)
 @triton.heuristics(
     values={
         "N_ALIGNED": lambda args: args["N"] % args["BLOCK_N"] == 0,
@@ -190,7 +190,7 @@ def group_gemm_same_nk(
 
     assert a.device == b.device, f"a.device = {a.device}, b.device = {b.device}"
 
-    assert len(cumsum_M) == b.shape[0], f"cumsum_M len={len(cumsum_M)}, b.shape={b.shape}, a.shape={a.shape}"
+    assert len(cumsum_M) == b.shape[0]
 
     assert activation is None or activation in list(ActivationType), f"Not implemented: activation is {activation}."
     assert activation or not save_activation, "Can't save activation since activation type is None"
@@ -204,28 +204,29 @@ def group_gemm_same_nk(
     if save_activation:
         act = torch.empty_like(c)
 
-    group_gemm_same_nk_kernel[
-        lambda x: (
-            triton.cdiv(max_M, x["BLOCK_M"]) * triton.cdiv(N, x["BLOCK_N"]),
-            x["G"],
+    with get_torch_device().device(a.device):
+        group_gemm_same_nk_kernel[
+            lambda x: (
+                triton.cdiv(max_M, x["BLOCK_M"]) * triton.cdiv(N, x["BLOCK_N"]),
+                x["G"],
+            )
+        ](
+            a_ptr=a,
+            b_ptr=b,
+            c_ptr=c,
+            act_ptr=act if save_activation else None,
+            cumsum_M=cumsum_M,
+            max_M=max_M,
+            total_M=a.shape[0],
+            G=G,
+            K=K,
+            N=N,
+            TRANSPOSE_A=transpose_a,
+            TRANSPOSE_B=transpose_b,
+            ACCUMULATE_TO_C=not c_is_none,
+            ACTIVATION=activation,
+            SAVE_ACTIVATION=save_activation,
         )
-    ](
-        a_ptr=a,
-        b_ptr=b,
-        c_ptr=c,
-        act_ptr=act if save_activation else None,
-        cumsum_M=cumsum_M,
-        max_M=max_M,
-        total_M=a.shape[0],
-        G=G,
-        K=K,
-        N=N,
-        TRANSPOSE_A=transpose_a,
-        TRANSPOSE_B=transpose_b,
-        ACCUMULATE_TO_C=not c_is_none,
-        ACTIVATION=activation,
-        SAVE_ACTIVATION=save_activation,
-    )
 
     if save_activation:
         return c, act
@@ -233,14 +234,14 @@ def group_gemm_same_nk(
     return c
 
 
-@triton.autotune(
-    configs=_get_cuda_autotune_config(),
-    key=["M", "N"],
-)
-# @pretuned(
-#     algo_key=algo_key_scaled(["M", "N", "total_K"], [1, 1, 5000], ["TRANSPOSE_A", "TRANSPOSE_B"]),
-#     fallback={"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP": 8},
+# @triton.autotune(
+#     configs=_get_cuda_autotune_config(),
+#     key=["total_K", "M", "N"],
 # )
+@pretuned(
+    algo_key=algo_key_scaled(["M", "N", "total_K"], [1, 1, 5000], ["TRANSPOSE_A", "TRANSPOSE_B"]),
+    fallback={"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP": 8},
+)
 @triton.heuristics(
     values={
         "M_ALIGNED": lambda args: args["M"] % args["BLOCK_M"] == 0,
@@ -253,7 +254,7 @@ def group_gemm_same_mn_kernel(
     b_ptr,
     c_ptr,
     cumsum_K,
-    total_K,  # Used for generating algo. key only.
+    total_K: tl.constexpr,  # Total K dimension (sum of all group Ks), used for stride calculations
     G: tl.constexpr,
     M: tl.constexpr,
     N: tl.constexpr,
@@ -274,33 +275,41 @@ def group_gemm_same_mn_kernel(
     k = (gtid_end - gtid_start).to(tl.uint64)
 
     if TRANSPOSE_A:
+        # a is (M, total_K), we want a[:, gtid_start:gtid_end] -> (M, k)
         a_block_ptr = tl.make_block_ptr(
-            base=a_ptr + gtid_start * M,
+            base=a_ptr + gtid_start,
             shape=(M, k),
-            strides=(1, M),
-            offsets=(m * BLOCK_M, 0),
-            block_shape=(BLOCK_M, BLOCK_K),
-            order=(0, 1),
-        )
-    else:
-        a_block_ptr = tl.make_block_ptr(
-            base=a_ptr + gtid_start * M,
-            shape=(M, k),
-            strides=(k, 1),
+            strides=(total_K, 1),
             offsets=(m * BLOCK_M, 0),
             block_shape=(BLOCK_M, BLOCK_K),
             order=(1, 0),
         )
+    else:
+        # a is (total_K, M), we want a[gtid_start:gtid_end, :].T -> (M, k)
+        # Physical memory: (k, M) starting at gtid_start * M
+        # Logical view for matmul: (M, k)
+        a_block_ptr = tl.make_block_ptr(
+            base=a_ptr + gtid_start * M,
+            shape=(k, M),
+            strides=(M, 1),
+            offsets=(0, m * BLOCK_M),
+            block_shape=(BLOCK_K, BLOCK_M),
+            order=(0, 1),
+        )
     if TRANSPOSE_B:
+        # b is (N, total_K), we want b[:, gtid_start:gtid_end] -> (N, k), then transpose -> (k, N)
+        # Physical memory: (N, total_K), accessing columns [gtid_start:gtid_end]
         b_block_ptr = tl.make_block_ptr(
-            base=b_ptr + gtid_start * N,
-            shape=(k, N),
-            strides=(1, k),
-            offsets=(0, n * BLOCK_N),
-            block_shape=(BLOCK_K, BLOCK_N),
+            base=b_ptr + gtid_start,
+            shape=(N, k),
+            strides=(total_K, 1),
+            offsets=(n * BLOCK_N, 0),
+            block_shape=(BLOCK_N, BLOCK_K),
             order=(0, 1),
         )
     else:
+        # b is (total_K, N), we want b[gtid_start:gtid_end, :] -> (k, N)
+        # Physical memory: (k, N) starting at gtid_start * N
         b_block_ptr = tl.make_block_ptr(
             base=b_ptr + gtid_start * N,
             shape=(k, N),
@@ -345,10 +354,29 @@ def group_gemm_same_mn_kernel(
         a = load_block_with_pred_2d(a_block_ptr, M_ALIGNED, False)
         b = load_block_with_pred_2d(b_block_ptr, False, N_ALIGNED)
 
+        # For non-TRANSPOSE_A, we load (BLOCK_K, BLOCK_M) and need to transpose to (BLOCK_M, BLOCK_K)
+        if not TRANSPOSE_A:
+            a = tl.trans(a)
+
+        # For TRANSPOSE_B, we load (BLOCK_N, BLOCK_K) and need to transpose to (BLOCK_K, BLOCK_N)
+        if TRANSPOSE_B:
+            b = tl.trans(b)
+
         out += tl.dot(a, b)
 
-        a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
-        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))
+        if TRANSPOSE_A:
+            # a_block_ptr shape (M, k), advance in k dimension (dim 1)
+            a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
+        else:
+            # a_block_ptr shape (k, M), advance in k dimension (dim 0)
+            a_block_ptr = tl.advance(a_block_ptr, (BLOCK_K, 0))
+
+        if TRANSPOSE_B:
+            # b_block_ptr shape (N, k), advance in k dimension (dim 1)
+            b_block_ptr = tl.advance(b_block_ptr, (0, BLOCK_K))
+        else:
+            # b_block_ptr shape (k, N), advance in k dimension (dim 0)
+            b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))
 
     store_block_with_pred_2d(c_block_ptr, out.to(c_block_ptr.dtype.element_ty), M_ALIGNED, N_ALIGNED)
 
@@ -375,21 +403,57 @@ def group_gemm_same_mn(
     assert len(cumsum_K) == c.shape[0], f"{len(cumsum_K), c.shape}"
     assert a.is_contiguous() and b.is_contiguous() and c.is_contiguous(), "Not implemented: Noncontiguous input."
 
-    group_gemm_same_mn_kernel[
-        lambda x: (
-            triton.cdiv(M, x["BLOCK_M"]) * triton.cdiv(N, x["BLOCK_N"]),
-            x["G"],
+    # Calculate total_K from the correct dimension
+    if transpose_a:
+        total_K = a.shape[1]
+    else:
+        total_K = a.shape[0]
+
+    if transpose_b:
+        assert b.shape[1] == total_K, f"Shape mismatch: a total_K={total_K}, b.shape[1]={b.shape[1]}"
+
+        # Check for known transpose_b precision bug with specific M dimensions
+        # See GROUP_GEMM_TRANSPOSE_B_BUG_ANALYSIS.md for details
+        problematic_M_values = {127, 128, 129, 256}
+        if M in problematic_M_values:
+            # Calculate individual K values from cumsum_K
+            cumsum_K_cpu = cumsum_K.cpu() if cumsum_K.is_cuda else cumsum_K
+            prev = 0
+            has_non_aligned_k = False
+            for i in range(len(cumsum_K_cpu)):
+                k = cumsum_K_cpu[i].item() - prev
+                if k % 32 != 0:
+                    has_non_aligned_k = True
+                    break
+                prev = cumsum_K_cpu[i].item()
+
+            if has_non_aligned_k:
+                raise ValueError(
+                    f"transpose_b=True with M={M} and K dimensions not divisible by 32 "
+                    f"has known precision bugs that produce incorrect results. "
+                    f"Workarounds: (1) Use transpose_b=False, (2) Pad M to 130+, or "
+                    f"(3) Ensure all group K values are multiples of 32. "
+                    f"See GROUP_GEMM_TRANSPOSE_B_BUG_ANALYSIS.md for details."
+                )
+    else:
+        assert b.shape[0] == total_K, f"Shape mismatch: a total_K={total_K}, b.shape[0]={b.shape[0]}"
+
+    with get_torch_device().device(a.device):
+        group_gemm_same_mn_kernel[
+            lambda x: (
+                triton.cdiv(M, x["BLOCK_M"]) * triton.cdiv(N, x["BLOCK_N"]),
+                x["G"],
+            )
+        ](
+            a_ptr=a,
+            b_ptr=b,
+            c_ptr=c,
+            cumsum_K=cumsum_K,
+            total_K=total_K,
+            G=G,
+            M=M,
+            N=N,
+            TRANSPOSE_A=transpose_a,
+            TRANSPOSE_B=transpose_b,
+            ACCUMULATE_TO_C=False,
         )
-    ](
-        a_ptr=a,
-        b_ptr=b,
-        c_ptr=c,
-        cumsum_K=cumsum_K,
-        total_K=b.shape[0],
-        G=G,
-        M=M,
-        N=N,
-        TRANSPOSE_A=transpose_a,
-        TRANSPOSE_B=transpose_b,
-        ACCUMULATE_TO_C=False,
-    )

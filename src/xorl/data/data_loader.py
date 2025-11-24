@@ -10,7 +10,6 @@ from .collators import (
     DataCollator,
     FlattenCollator,
     PackingConcatCollator,
-    ShiftTokensCollator,
     TextSequenceShardCollator,
 )
 
@@ -184,13 +183,12 @@ class DataLoaderBuilder:
         collators = [
             ToTensorCollator(),                                 # 1. Convert to tensors
             FlattenCollator(),                                  # 2. Flatten list of lists to flat list
-            ShiftTokensCollator(auto_detect=True),              # 3. Shift tokens for causal LM (auto-detects if needed)
-            PackingConcatCollator(pad_to_multiple_of=self.pad_to_multiple_of)  # 4. Concatenate sequences for packing
+            PackingConcatCollator(pad_to_multiple_of=self.pad_to_multiple_of)  # 3. Concatenate sequences for packing
         ]
 
-        if self.parallel_state.cp_enabled:
-            collators.append(TextSequenceShardCollator())  # 5. Shard sequences (if SP enabled)
-
+        if self.parallel_state.sp_enabled:
+            collators.append(TextSequenceShardCollator())  # 4. Shard sequences (if SP enabled)
+        
         return collators
     
     def add_collator(self, collator: DataCollator, position: str = "end") -> "DataLoaderBuilder":
@@ -337,7 +335,7 @@ class DataLoaderBuilder:
         
         logger.info_rank0(
             f"Building DataLoader with dp_size={self.parallel_state.dp_size}, "
-            f"cp_size={self.parallel_state.cp_size}"
+            f"sp_size={self.parallel_state.sp_size}"
         )
 
         # Validate dataset structure - each item can be either:

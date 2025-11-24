@@ -50,14 +50,14 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
         head_dim: int,
         group: ProcessGroup,
     ):
-        ulysses_group = get_ulysses_sequence_parallel_group() if group is None else group
+        sp_group = get_ulysses_sequence_parallel_group() if group is None else group
 
         # q projection
         q = F.linear(hidden_states, q_weight, q_bias)
 
         # q communication launch
         q_res = all_to_all_tensor(
-            q, scatter_dim=head_dimension, gather_dim=seq_dimension, group=ulysses_group, async_op=True
+            q, scatter_dim=head_dimension, gather_dim=seq_dimension, group=sp_group, async_op=True
         )
 
         # k projection
@@ -65,7 +65,7 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
 
         # k communication launch
         k_res = all_to_all_tensor(
-            k, scatter_dim=head_dimension, gather_dim=seq_dimension, group=ulysses_group, async_op=True
+            k, scatter_dim=head_dimension, gather_dim=seq_dimension, group=sp_group, async_op=True
         )
 
         # v projection
@@ -73,19 +73,17 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
 
         # v communication launch
         v_res = all_to_all_tensor(
-            v, scatter_dim=head_dimension, gather_dim=seq_dimension, group=ulysses_group, async_op=True
+            v, scatter_dim=head_dimension, gather_dim=seq_dimension, group=sp_group, async_op=True
         )
 
         # q communication collect
         q = q_res()
-        if unpadded_dim_size is not None and unpadded_dim_size > 0:
-            q = unpadding_tensor_for_seqeunce_parallel(q, seq_dimension, unpadded_dim_size)
+        q = unpadding_tensor_for_seqeunce_parallel(q, seq_dimension, unpadded_dim_size)
         q = q.reshape(list(q.shape[:-1]) + [-1, head_dim]).contiguous()
 
         # k communication collect
         k = k_res()
-        if unpadded_dim_size is not None and unpadded_dim_size > 0:
-            k = unpadding_tensor_for_seqeunce_parallel(k, seq_dimension, unpadded_dim_size)
+        k = unpadding_tensor_for_seqeunce_parallel(k, seq_dimension, unpadded_dim_size)
         k = k.reshape(list(k.shape[:-1]) + [-1, head_dim]).contiguous()
 
         # qk normalization (if needed)
@@ -122,12 +120,11 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
 
         # v communication collect
         v = v_res()
-        if unpadded_dim_size is not None and unpadded_dim_size > 0:
-            v = unpadding_tensor_for_seqeunce_parallel(v, seq_dimension, unpadded_dim_size)
+        v = unpadding_tensor_for_seqeunce_parallel(v, seq_dimension, unpadded_dim_size)
         v = v.reshape(list(v.shape[:-1]) + [-1, head_dim]).contiguous()
 
         # save ctx for backward
-        ctx.ulysses_group = ulysses_group
+        ctx.sp_group = sp_group
         ctx.head_dimension = head_dimension
         ctx.seq_dimension = seq_dimension
         ctx.norm_type = norm_type
@@ -158,7 +155,7 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
     @staticmethod
     def backward(ctx: Any, *grad_output: Tensor):
         # get ctx for backward
-        ulysses_group = ctx.ulysses_group
+        sp_group = ctx.sp_group
         seq_dimension = ctx.seq_dimension
         head_dimension = ctx.head_dimension
         norm_type = ctx.norm_type
@@ -205,7 +202,7 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
             grad_v,
             scatter_dim=seq_dimension,
             gather_dim=head_dimension,
-            group=ulysses_group,
+            group=sp_group,
             async_op=True,
         )
 
@@ -271,7 +268,7 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
             grad_k,
             scatter_dim=seq_dimension,
             gather_dim=head_dimension,
-            group=ulysses_group,
+            group=sp_group,
             async_op=True,
         )
 
@@ -291,7 +288,7 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
             grad_q,
             scatter_dim=seq_dimension,
             gather_dim=head_dimension,
-            group=ulysses_group,
+            group=sp_group,
             async_op=True,
         )
 
@@ -348,17 +345,17 @@ class AsyncUlyssesOutputProjection(torch.autograd.Function):
         unpadded_dim_size: int,
         group: ProcessGroup,
     ):
-        ulysses_group = get_ulysses_sequence_parallel_group() if group is None else group
+        sp_group = get_ulysses_sequence_parallel_group() if group is None else group
 
         # out projection
         hidden_states = padding_tensor_for_seqeunce_parallel(hidden_states, seq_dimension)
         hidden_states = all_to_all_tensor(
-            hidden_states, scatter_dim=seq_dimension, gather_dim=head_dimension, group=ulysses_group
+            hidden_states, scatter_dim=seq_dimension, gather_dim=head_dimension, group=sp_group
         )
         o = F.linear(hidden_states, proj_weight, proj_bias)
 
         # save ctx for backward
-        ctx.ulysses_group = ulysses_group
+        ctx.sp_group = sp_group
         ctx.head_dimension = head_dimension
         ctx.seq_dimension = seq_dimension
         ctx.unpadded_dim_size = unpadded_dim_size
@@ -374,7 +371,7 @@ class AsyncUlyssesOutputProjection(torch.autograd.Function):
     @staticmethod
     def backward(ctx: Any, *grad_output: Tensor):
         # get ctx for backward
-        ulysses_group = ctx.ulysses_group
+        sp_group = ctx.sp_group
         head_dimension = ctx.head_dimension
         seq_dimension = ctx.seq_dimension
         unpadded_dim_size = ctx.unpadded_dim_size
@@ -394,7 +391,7 @@ class AsyncUlyssesOutputProjection(torch.autograd.Function):
 
         # output grad communication launch
         grad_out_res = all_to_all_tensor(
-            grad_o, scatter_dim=head_dimension, gather_dim=seq_dimension, group=ulysses_group, async_op=True
+            grad_o, scatter_dim=head_dimension, gather_dim=seq_dimension, group=sp_group, async_op=True
         )
 
         grad_proj_weight = grad_output[0].transpose(-1, -2) @ (hidden_states)
@@ -403,8 +400,7 @@ class AsyncUlyssesOutputProjection(torch.autograd.Function):
 
         # output grad communication collect
         grad_o = grad_out_res()
-        if unpadded_dim_size is not None and unpadded_dim_size > 0:
-            grad_o = unpadding_tensor_for_seqeunce_parallel(grad_o, seq_dimension, unpadded_dim_size)
+        grad_o = unpadding_tensor_for_seqeunce_parallel(grad_o, seq_dimension, unpadded_dim_size)
 
         return (
             grad_o,
