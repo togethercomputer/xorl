@@ -50,4 +50,4 @@ private/
 htmlcov/
 
 .claude/
-.pytest_cache/
+.pytest_cache/CLAUDE.md
