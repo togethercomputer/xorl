@@ -48,6 +48,11 @@ gpu =[
   "liger-kernel",
   "flash-attn",
 ]
+# Dedicated endpoint integration (for Together AI dedicated endpoints)
+dedicated-endpoint = [
+  "together>=1.0.0",
+  "huggingface_hub>=0.20.0",
+]
 
 
 [dependency-groups]
