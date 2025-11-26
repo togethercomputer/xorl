@@ -164,7 +164,7 @@ def run_engine_core(
             output_addr=output_addr,
             rank0_worker_address=rank0_worker_address,
             inference_worker_urls=inference_worker_urls,
-            connection_timeout=60.0,  # Give worker time to load model (default: 10s)
+            connection_timeout=300.0,  # Give worker time to load large models + compile Triton kernels
         )
         logger.info("EngineCore initialized successfully")
 

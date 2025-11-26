@@ -276,3 +276,39 @@ class UpdateDedicatedEndpointResponse(BaseModel):
     together_upload_time: float = Field(..., description="Time for Together API upload (seconds)")
     probe_time: float = Field(..., description="Time to probe endpoint (seconds)")
     error: Optional[str] = Field(default=None, description="Error message if failed")
+
+
+# ============================================================================
+# Serverless Inference Operations
+# ============================================================================
+
+class UpdateServerlessWeightsRequest(BaseModel):
+    """API request for updating weights on Together AI serverless inference."""
+    model_id: str = Field(default="default", description="Model identifier")
+    name: str = Field(..., description="Checkpoint name (e.g., 'step-001')")
+    together_api_key: str = Field(..., description="Together AI API key")
+    hf_token: str = Field(..., description="HuggingFace token with write access")
+    together_base_model: str = Field(
+        ...,
+        description="Together AI base model name (e.g., 'meta-llama/Meta-Llama-3.1-8B-Instruct-Reference')"
+    )
+    hf_repo_prefix: str = Field(
+        default="xorl-adapter",
+        description="Prefix for HuggingFace repository names"
+    )
+    private_repo: bool = Field(
+        default=True,
+        description="Whether to create private HuggingFace repository"
+    )
+    wait_for_completion: bool = Field(
+        default=True,
+        description="Whether to wait for Together AI upload to complete"
+    )
+
+
+class UpdateServerlessWeightsResponse(BaseModel):
+    """API response for updating weights on Together AI."""
+    together_model_id: str = Field(..., description="Together AI model name for inference")
+    hf_repo_url: str = Field(..., description="HuggingFace repository URL")
+    checkpoint_path: str = Field(..., description="Local checkpoint path")
+    status: str = Field(..., description="Upload status ('Complete', 'submitted', etc.)")

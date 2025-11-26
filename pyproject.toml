@@ -53,6 +53,10 @@ dedicated-endpoint = [
   "together>=1.0.0",
   "huggingface_hub>=0.20.0",
 ]
+# Serverless inference (for Together AI serverless LoRA inference)
+serverless = [
+  "huggingface_hub>=0.20.0",
+]
 
 
 [dependency-groups]
