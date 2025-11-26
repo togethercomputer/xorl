@@ -234,3 +234,45 @@ class ErrorResponse(BaseModel):
     """Error response model."""
     error: str = Field(..., description="Error message")
     detail: Optional[str] = Field(default=None, description="Detailed error information")
+
+
+# ============================================================================
+# Dedicated Endpoint Operations
+# ============================================================================
+
+class UpdateDedicatedEndpointRequest(BaseModel):
+    """
+    API request for saving checkpoint and updating a Together dedicated endpoint.
+
+    This endpoint handles the full workflow:
+    1. Save LoRA checkpoint locally
+    2. Upload to HuggingFace
+    3. Upload to Together via models.upload API
+    4. Wait for model to be ready
+    5. Probe endpoint to verify adapter is loaded
+    """
+    model_id: str = Field(default="default", description="Model identifier")
+    name: str = Field(..., description="Checkpoint name (e.g., 'step-000001')")
+    endpoint_id: str = Field(..., description="Together dedicated endpoint ID")
+    together_api_key: str = Field(..., description="Together API key")
+    hf_token: str = Field(..., description="HuggingFace token for uploading")
+    hf_org: str = Field(default="xorl-org", description="HuggingFace organization")
+    together_model_id: Optional[str] = Field(
+        default=None,
+        description="Optional Together model ID (auto-generated with timestamp if not provided)"
+    )
+
+
+class UpdateDedicatedEndpointResponse(BaseModel):
+    """API response for updating dedicated endpoint."""
+    success: bool = Field(..., description="Whether the update was successful")
+    checkpoint_path: str = Field(..., description="Local checkpoint path")
+    hf_path: str = Field(..., description="HuggingFace repository path")
+    together_model_id: str = Field(
+        ...,
+        description="Together model ID (use this for sampling from the dedicated endpoint)"
+    )
+    upload_time: float = Field(..., description="Time to upload to HuggingFace (seconds)")
+    together_upload_time: float = Field(..., description="Time for Together API upload (seconds)")
+    probe_time: float = Field(..., description="Time to probe endpoint (seconds)")
+    error: Optional[str] = Field(default=None, description="Error message if failed")
