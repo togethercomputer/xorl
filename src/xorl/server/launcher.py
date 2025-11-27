@@ -36,9 +36,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import uvicorn
+import yaml
 
 from xorl.server.api_server.api_server import APIServer
 from xorl.server.engine.engine_core import EngineCore
+from xorl.server.server_arguments import ServerArguments
 
 
 # Setup logging
@@ -270,6 +272,134 @@ def run_api_server(
 
 
 # ============================================================================
+# Configuration Parsing
+# ============================================================================
+
+def load_server_arguments(config_path: str) -> ServerArguments:
+    """
+    Load ServerArguments from a YAML configuration file.
+
+    Supports both flat config (ServerArguments style) and nested config
+    (Arguments style with model/train/worker sections).
+
+    Args:
+        config_path: Path to server config YAML
+
+    Returns:
+        ServerArguments instance with all fields populated
+    """
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+
+    if not config:
+        raise ValueError(f"Empty config file: {config_path}")
+
+    from dataclasses import fields
+    valid_fields = {f.name for f in fields(ServerArguments)}
+
+    # Check if this is a nested config (has model/train/worker sections)
+    if 'model' in config and isinstance(config['model'], dict):
+        # Nested config - flatten it
+        flat_config = {}
+
+        # Model section
+        model_config = config.get('model', {})
+        flat_config['model_path'] = model_config.get('model_path')
+        flat_config['config_path'] = model_config.get('config_path')
+        flat_config['tokenizer_path'] = model_config.get('tokenizer_path')
+        flat_config['attn_implementation'] = model_config.get('attn_implementation', 'flash_attention_2')
+        flat_config['moe_implementation'] = model_config.get('moe_implementation')
+        flat_config['force_use_huggingface'] = model_config.get('force_use_huggingface', False)
+        flat_config['use_liger'] = model_config.get('use_liger', True)
+
+        # Train section
+        train_config = config.get('train', {})
+        flat_config['data_parallel_mode'] = train_config.get('data_parallel_mode', 'fsdp2')
+        flat_config['ulysses_parallel_size'] = train_config.get('ulysses_parallel_size', 1)
+        flat_config['expert_parallel_size'] = train_config.get('expert_parallel_size', 1)
+        flat_config['enable_mixed_precision'] = train_config.get('enable_mixed_precision', True)
+        flat_config['enable_gradient_checkpointing'] = train_config.get('enable_gradient_checkpointing', True)
+        flat_config['enable_full_shard'] = train_config.get('enable_full_shard', True)
+        flat_config['enable_fsdp_offload'] = train_config.get('enable_fsdp_offload', False)
+        flat_config['enable_activation_offload'] = train_config.get('enable_activation_offload', False)
+        flat_config['init_device'] = train_config.get('init_device', 'meta')
+        flat_config['load_checkpoint_path'] = train_config.get('load_checkpoint_path', '')
+        flat_config['ckpt_manager'] = train_config.get('ckpt_manager', 'dcp')
+        flat_config['log_level'] = train_config.get('log_level', 'INFO')
+
+        # Worker section
+        worker_config = config.get('worker', {})
+        flat_config['worker_bind_address'] = worker_config.get('bind_address', 'tcp://127.0.0.1:5556')
+        flat_config['worker_connection_timeout'] = worker_config.get('connection_timeout', 60.0)
+        flat_config['worker_max_retries'] = worker_config.get('max_retries', 3)
+
+        filtered_config = {k: v for k, v in flat_config.items() if k in valid_fields and v is not None}
+    else:
+        # Flat config (ServerArguments style)
+        filtered_config = {k: v for k, v in config.items() if k in valid_fields}
+
+        # Handle None values for Optional fields
+        for key, value in list(filtered_config.items()):
+            if value is None:
+                if key in ['config_path', 'tokenizer_path']:
+                    del filtered_config[key]
+
+    logger.info(f"Loaded ServerArguments from: {config_path}")
+    logger.info(f"  model_path: {filtered_config.get('model_path', 'N/A')}")
+
+    return ServerArguments(**filtered_config)
+
+
+def calculate_world_size_from_config(config_path: str) -> int:
+    """
+    Calculate the required world size from parallelism configuration.
+
+    Args:
+        config_path: Path to server config YAML
+
+    Returns:
+        Required world size (nproc_per_node)
+    """
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+
+    # Support both flat config (ServerArguments style) and nested config (train: section)
+    # Check if this is a nested config with 'train' section
+    if 'train' in config:
+        train_config = config.get('train', {})
+    else:
+        # Flat config (ServerArguments style)
+        train_config = config
+
+    # Get parallelism sizes (with defaults matching model_runner.py)
+    pp_size = train_config.get('pipeline_parallel_size', 1)
+    tp_size = train_config.get('tensor_parallel_size', 1)
+    ep_size = train_config.get('expert_parallel_size', 1)
+    cp_size = train_config.get('context_parallel_size', 1)
+    ulysses_size = train_config.get('ulysses_parallel_size', 1)
+
+    # Data parallel sizes
+    dp_replicate_size = train_config.get('data_parallel_replicate_size', 1)
+    dp_shard_size = train_config.get('data_parallel_shard_size', 1)
+
+    # Calculate world size
+    # Formula: world_size = pp_size * dp_replicate_size * dp_shard_size * ulysses_size * cp_size * tp_size
+    world_size = pp_size * dp_replicate_size * dp_shard_size * ulysses_size * cp_size * tp_size * ep_size
+
+    logger.info(f"Calculated world size from config:")
+    logger.info(f"  pipeline_parallel_size:      {pp_size}")
+    logger.info(f"  tensor_parallel_size:         {tp_size}")
+    logger.info(f"  expert_parallel_size:         {ep_size}")
+    logger.info(f"  context_parallel_size:        {cp_size}")
+    logger.info(f"  ulysses_parallel_size:        {ulysses_size}")
+    logger.info(f"  data_parallel_replicate_size: {dp_replicate_size}")
+    logger.info(f"  data_parallel_shard_size:     {dp_shard_size}")
+    logger.info(f"  => Total world size:          {world_size}")
+
+    return world_size
+
+
+# ============================================================================
 # Main Launcher
 # ============================================================================
 
@@ -289,7 +419,6 @@ class Launcher:
         inference_worker_urls: Optional[List[str]] = None,
         # Auto-launch mode parameters
         nnodes: int = 1,
-        nproc_per_node: int = 1,
         master_addr: str = "127.0.0.1",
         master_port: int = 29500,
     ):
@@ -307,7 +436,6 @@ class Launcher:
             log_level: Logging level
             inference_worker_urls: URLs of inference workers for automatic weight updates
             nnodes: Number of nodes for distributed training (auto mode)
-            nproc_per_node: Number of processes per node (auto mode)
             master_addr: Master address for torch distributed (auto mode)
             master_port: Master port for torch distributed (auto mode)
         """
@@ -319,12 +447,6 @@ class Launcher:
         self.max_pending_requests = max_pending_requests
         self.inference_worker_urls = inference_worker_urls or []
 
-        # Distributed training parameters
-        self.nnodes = nnodes
-        self.nproc_per_node = nproc_per_node
-        self.master_addr = master_addr
-        self.master_port = master_port
-
         # Validate mode
         if mode not in ["auto", "connect"]:
             raise ValueError(f"Invalid mode: {mode}. Must be 'auto' or 'connect'")
@@ -332,6 +454,35 @@ class Launcher:
         # Validate config for auto mode
         if mode == "auto" and not config_path:
             raise ValueError("--config is required for auto-launch mode")
+
+        # Load ServerArguments from config if provided
+        self.server_args: Optional[ServerArguments] = None
+        if config_path:
+            try:
+                self.server_args = load_server_arguments(config_path)
+                logger.info("Successfully loaded ServerArguments from config")
+                logger.info(f"  model_path: {self.server_args.model_path}")
+                logger.info(f"  data_parallel_mode: {self.server_args.data_parallel_mode}")
+                logger.info(f"  ulysses_parallel_size: {self.server_args.ulysses_parallel_size}")
+            except Exception as e:
+                logger.warning(f"Could not load ServerArguments: {e}")
+                logger.warning("Falling back to raw YAML parsing")
+
+        # Distributed training parameters
+        self.nnodes = nnodes
+        self.master_addr = master_addr
+        self.master_port = master_port
+
+        # Calculate nproc_per_node from config in auto mode
+        if mode == "auto":
+            logger.info("Calculating world size from config parallelism settings...")
+            if self.server_args:
+                self.nproc_per_node = self.server_args.get_world_size()
+            else:
+                self.nproc_per_node = calculate_world_size_from_config(config_path)
+            logger.info(f"World size (nproc_per_node) = {self.nproc_per_node}")
+        else:
+            self.nproc_per_node = 1  # Not used in connect mode
 
         # Find free ports
         logger.info("Finding free ports...")
@@ -356,9 +507,12 @@ class Launcher:
         self.engine_input_addr = f"tcp://127.0.0.1:{self.engine_input_port}"
         self.engine_output_addr = f"tcp://127.0.0.1:{self.engine_output_port}"
 
-        # Worker address
+        # Worker address - prefer from ServerArguments if available
         if worker_address:
             self.worker_address = worker_address
+        elif self.server_args:
+            self.worker_address = self.server_args.worker_bind_address
+            logger.info(f"Using worker address from config: {self.worker_address}")
         else:
             self.worker_address = f"tcp://127.0.0.1:{self.worker_port}"
 
@@ -638,16 +792,28 @@ def main():
         epilog="""
 Examples:
 
-  # Auto-launch mode (single node, 2 GPUs)
-  python -m xorl.server.launcher --mode auto --config examples/qwen3/sft.yaml --nproc-per-node 2
+  # Auto-launch mode (world size automatically calculated from config)
+  python -m xorl.server.launcher --mode auto --config examples/qwen3/sft.yaml
 
   # Connect mode (workers launched separately)
   # Terminal 1: Launch workers manually
-  torchrun --nnodes=1 --nproc-per-node=2 -m xorl.server.worker.distributed_model_worker \\
+  torchrun --nnodes=1 --nproc-per-node=8 -m xorl.server.worker.distributed_model_worker \\
     examples/qwen3/sft.yaml --worker.bind_address tcp://127.0.0.1:5556
 
   # Terminal 2: Launch API server and engine
   python -m xorl.server.launcher --mode connect --worker-address tcp://127.0.0.1:5556
+
+Note:
+  World size is ALWAYS calculated from the config file parallelism settings:
+    world_size = pp_size * dp_replicate_size * dp_shard_size * ulysses_size * cp_size * tp_size * ep_size
+
+  Example config:
+    train:
+      data_parallel_shard_size: 2
+      ulysses_parallel_size: 4
+      # => world_size = 2 * 4 = 8 GPUs
+
+  Set these values in your config file under the 'train' section to control world size.
         """
     )
 
@@ -725,12 +891,6 @@ Examples:
         help="Number of nodes (auto mode, default: 1)"
     )
     parser.add_argument(
-        "--nproc-per-node",
-        type=int,
-        default=1,
-        help="Number of processes per node (auto mode, default: 1)"
-    )
-    parser.add_argument(
         "--master-addr",
         type=str,
         default="127.0.0.1",
@@ -757,7 +917,6 @@ Examples:
         log_level=args.log_level,
         inference_worker_urls=args.inference_worker_urls,
         nnodes=args.nnodes,
-        nproc_per_node=args.nproc_per_node,
         master_addr=args.master_addr,
         master_port=args.master_port,
     )
