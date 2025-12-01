@@ -46,7 +46,7 @@ from xorl.server.server_arguments import ServerArguments
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
-    format="[%(levelname)-8s][%(name)-30s] %(asctime)s >> %(message)s",
+    format="[%(levelname)s][%(name)s] %(asctime)s >> %(message)s",
     datefmt="%H:%M:%S"
 )
 logger = logging.getLogger(__name__)
