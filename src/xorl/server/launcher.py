@@ -315,6 +315,8 @@ def load_server_arguments(config_path: str) -> ServerArguments:
         # Train section
         train_config = config.get('train', {})
         flat_config['data_parallel_mode'] = train_config.get('data_parallel_mode', 'fsdp2')
+        flat_config['data_parallel_shard_size'] = train_config.get('data_parallel_shard_size', 1)
+        flat_config['data_parallel_replicate_size'] = train_config.get('data_parallel_replicate_size', 1)
         flat_config['ulysses_parallel_size'] = train_config.get('ulysses_parallel_size', 1)
         flat_config['expert_parallel_size'] = train_config.get('expert_parallel_size', 1)
         flat_config['enable_mixed_precision'] = train_config.get('enable_mixed_precision', True)
