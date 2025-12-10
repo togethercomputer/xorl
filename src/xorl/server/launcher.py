@@ -115,6 +115,8 @@ def run_engine_core(
     max_pending_requests: int = 100,
     log_level: str = "INFO",
     inference_worker_urls: Optional[List[str]] = None,
+    packing_seq_len: int = 32000,
+    enable_packing: bool = True,
 ):
     """
     Run the EngineCore in a separate process.
@@ -167,6 +169,8 @@ def run_engine_core(
             rank0_worker_address=rank0_worker_address,
             inference_worker_urls=inference_worker_urls,
             connection_timeout=300.0,  # Give worker time to load large models + compile Triton kernels
+            packing_seq_len=packing_seq_len,
+            enable_packing=enable_packing,
         )
         logger.info("EngineCore initialized successfully")
 
@@ -329,6 +333,11 @@ def load_server_arguments(config_path: str) -> ServerArguments:
         flat_config['ckpt_manager'] = train_config.get('ckpt_manager', 'dcp')
         flat_config['log_level'] = train_config.get('log_level', 'INFO')
 
+        # Data processing section (can be in train or data section)
+        data_config = config.get('data', {})
+        flat_config['packing_seq_len'] = train_config.get('packing_seq_len') or data_config.get('packing_seq_len', 32000)
+        flat_config['enable_packing'] = train_config.get('enable_packing', data_config.get('enable_packing', True))
+
         # Worker section
         worker_config = config.get('worker', {})
         flat_config['worker_bind_address'] = worker_config.get('bind_address', 'tcp://127.0.0.1:5556')
@@ -423,6 +432,9 @@ class Launcher:
         nnodes: int = 1,
         master_addr: str = "127.0.0.1",
         master_port: int = 29500,
+        # Data processing parameters
+        packing_seq_len: int = 32000,
+        enable_packing: bool = True,
     ):
         """
         Initialize the launcher.
@@ -448,6 +460,8 @@ class Launcher:
         self.max_running_requests = max_running_requests
         self.max_pending_requests = max_pending_requests
         self.inference_worker_urls = inference_worker_urls or []
+        self.packing_seq_len = packing_seq_len
+        self.enable_packing = enable_packing
 
         # Validate mode
         if mode not in ["auto", "connect"]:
@@ -517,6 +531,12 @@ class Launcher:
             logger.info(f"Using worker address from config: {self.worker_address}")
         else:
             self.worker_address = f"tcp://127.0.0.1:{self.worker_port}"
+
+        # Packing parameters - prefer from ServerArguments if available
+        if self.server_args:
+            self.packing_seq_len = self.server_args.packing_seq_len
+            self.enable_packing = self.server_args.enable_packing
+            logger.info(f"Using packing config: seq_len={self.packing_seq_len}, enabled={self.enable_packing}")
 
         # Processes and subprocesses
         self.worker_process: Optional[subprocess.Popen] = None  # torchrun subprocess
@@ -640,6 +660,8 @@ class Launcher:
                         self.max_pending_requests,
                         self.log_level,
                         self.inference_worker_urls,
+                        self.packing_seq_len,
+                        self.enable_packing,
                     ),
                     name="EngineCore",
                 )
