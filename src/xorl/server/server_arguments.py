@@ -229,6 +229,20 @@ class ServerArguments:
         metadata={"help": "Maximum number of retries for failed operations"}
     )
 
+    # ========================================================================
+    # Data Processing Configuration
+    # ========================================================================
+
+    packing_seq_len: int = field(
+        default=32000,
+        metadata={"help": "Maximum sequence length for sample packing (default: 32000)"}
+    )
+
+    enable_packing: bool = field(
+        default=True,
+        metadata={"help": "Enable sample packing to combine multiple samples into one sequence"}
+    )
+
     def __post_init__(self):
         """Validate and set defaults."""
         # Set default paths
