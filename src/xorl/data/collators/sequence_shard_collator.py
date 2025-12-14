@@ -108,9 +108,13 @@ class TextSequenceShardCollator(DataCollator):
 
         input_ids = self.sp_padding(input_ids, dim=-1, pad_value=self.pad_token_id, pad_length=pad_length)
         labels = self.sp_padding(labels, dim=-1, pad_value=IGNORE_INDEX, pad_length=pad_length)
-        batch["attention_mask"] = self.sp_padding(
-            batch["attention_mask"], dim=-1, pad_value=1, pad_length=pad_length
-        )
+        
+        if "attention_mask" in batch:
+            batch["attention_mask"] = self.sp_padding(
+                batch["attention_mask"], dim=-1, pad_value=1, pad_length=pad_length
+            )
+        
+        
         # For position_ids to create one single sequence for all padded tokens by pass sequential=True
         batch["position_ids"] = self.sp_padding(
             batch["position_ids"], dim=-1, pad_value=0, pad_length=pad_length, sequential=True
