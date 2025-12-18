@@ -36,6 +36,7 @@ dist/
 build/
 
 # log files
+logs/
 *.log
 *.out
 
