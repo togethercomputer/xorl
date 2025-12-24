@@ -863,11 +863,12 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         logits = None
         loss, logits = self.loss_function(hidden_states, self.lm_head.weight, labels)
 
+        # hidden_states=[hidden_states], # Only return the last layer hidden states
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
-            hidden_states=[hidden_states], # Only return the last layer hidden states
+            hidden_states=outputs.hidden_states if output_hidden_states else None,
             attentions=outputs.attentions,
         )
 

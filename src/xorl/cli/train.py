@@ -232,8 +232,7 @@ def main():
 
             dist.all_reduce(global_valid_tokens, op=dist.ReduceOp.SUM)
 
-            step_batch_history = []
-
+            
             # Handle gradient accumulation here
             for micro_batch in micro_batches:
                 environ_meter.add(micro_batch)
@@ -243,24 +242,13 @@ def main():
                     for k, v in micro_batch.items()
                 }
 
-                labels = micro_batch.pop("labels")
-
                 with model_fwd_context:
-                    outputs = model(**micro_batch, use_cache=False)
-
-                    labels = labels[..., 1:].contiguous()
-                    hidden_states = outputs.hidden_states[-1][..., :-1, :].contiguous()
-
-                    # Flatten the labels and hidden_states
-                    labels = labels.view(-1)
-                    hidden_states = hidden_states.view(-1, hidden_states.size(-1))
-
-                    # Calculate loss
-                    per_token_losses = LigerFusedLinearCrossEntropyLoss(reduction='none', ignore_index=IGNORE_INDEX)(model.lm_head.weight, hidden_states, labels)
-
-                    local_valid_tokens = (labels != IGNORE_INDEX).sum()
-                    loss = per_token_losses.sum() / local_valid_tokens
-                    ga_loss, ga_loss_sum = gradient_accumulate_loss(loss, local_valid_tokens, global_valid_tokens)
+                    # Explicitly disable output_hidden_states to save memory (~20GB)
+                    outputs = model(**micro_batch, use_cache=False, output_hidden_states=False)
+                    loss = outputs.loss
+                    
+                    local_valid_tokens = (micro_batch["labels"] != IGNORE_INDEX).sum()
+                    ga_loss, _ = gradient_accumulate_loss(loss, local_valid_tokens, global_valid_tokens)
                 
                 with model_bwd_context:
                     ga_loss.backward()
@@ -268,32 +256,35 @@ def main():
                 loss_item = ga_loss.item()
                 total_loss += loss_item
 
-                # Gather debugging info from all ranks
-                local_debug_info = {
-                    "rank": args.train.global_rank,
-                    "ga_loss": loss_item,
-                    "ga_loss_sum": ga_loss_sum.item(),
-                    "loss": loss.item(),
-                    "local_valid_tokens": local_valid_tokens.item(),
-                    "global_valid_tokens": global_valid_tokens.item(),
-                    "input_ids": micro_batch["input_ids"].tolist(),
-                    "labels": labels.tolist(),
-                    "per_token_losses": per_token_losses.tolist(),
-                }
+                '''
+                memory pressure is too high and need to be optimized
+                '''
+                # # Gather debugging info from all ranks
+                # local_debug_info = {
+                #     "rank": args.train.global_rank,
+                #     "ga_loss": loss_item,
+                #     "ga_loss_sum": ga_loss_sum.item(),
+                #     "loss": loss.item(),
+                #     "local_valid_tokens": local_valid_tokens.item(),
+                #     "global_valid_tokens": global_valid_tokens.item(),
+                #     "input_ids": micro_batch["input_ids"].tolist(),
+                #     "labels": labels.tolist(),
+                #     "per_token_losses": per_token_losses.tolist(),
+                # }
                 
-                # Gather from all ranks to rank 0
-                all_ranks_debug_info = [None] * args.train.world_size
-                dist.all_gather_object(all_ranks_debug_info, local_debug_info)
+                # # Gather from all ranks to rank 0
+                # all_ranks_debug_info = [None] * args.train.world_size
+                # dist.all_gather_object(all_ranks_debug_info, local_debug_info)
                 
-                step_batch_history.append(
-                    {
-                        "all_ranks_info": all_ranks_debug_info if args.train.global_rank == 0 else None,
-                    }
-                )
+                # step_batch_history.append(
+                #     {
+                #         "all_ranks_info": all_ranks_debug_info if args.train.global_rank == 0 else None,
+                #     }
+                # )
 
-                del micro_batch
+                # Clean up tensors to free memory
+                del micro_batch, loss, outputs, ga_loss
             
-
             # Prefer model-provided clip_grad_norm_ (now both FSDP1 and FSDP2 registers custom grad norm clipping)
             if hasattr(model, "clip_grad_norm_"):
                 _gn = model.clip_grad_norm_(args.train.max_grad_norm)
@@ -316,16 +307,6 @@ def main():
             delta_time = time.time() - start_time
             lr = max(lr_scheduler.get_last_lr())
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
-
-            # if total_loss > 1.0:
-
-
-            #     if os.environ.get("RANK") == "0":
-
-            #         with open("step_batch_history.json", "w") as f:
-            #             json.dump(step_batch_history, f)
-            #         import pdb; pdb.set_trace()
-            #     torch.distributed.barrier()
 
             data_loader_tqdm.set_postfix_str(f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}")
             data_loader_tqdm.update()
