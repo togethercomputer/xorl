@@ -10,6 +10,8 @@ data/*
 local/*
 dev/*
 deepspeed_configs/*.json
+.env.example
+.converage
 
 # notebooks and files to keep locally
 notebooks/*
@@ -52,3 +54,7 @@ htmlcov/
 
 .claude/
 .pytest_cache/CLAUDE.md
+
+# slurm files
+sbatch.sh
+multi-train.sh
