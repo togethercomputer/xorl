@@ -52,6 +52,7 @@ gpu =[
   "torchaudio",
   "liger-kernel",
   "flash-attn",
+  "nvidia-nccl-cu12==2.27.5",
 ]
 # Dedicated endpoint integration (for Together AI dedicated endpoints)
 dedicated-endpoint = [
