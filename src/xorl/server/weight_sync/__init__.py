@@ -1,5 +1,5 @@
 """Weight synchronization package for training-to-inference weight transfer."""
 
-from .backends.nccl_broadcast import NCCLBroadcastBackend
+from .nccl_weight_sync import EndpointInfo, SyncResult, WeightSynchronizer
 
-__all__ = ["NCCLBroadcastBackend"]
+__all__ = ["WeightSynchronizer", "EndpointInfo", "SyncResult"]
