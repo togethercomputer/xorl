@@ -312,3 +312,116 @@ class UpdateServerlessWeightsResponse(BaseModel):
     hf_repo_url: str = Field(..., description="HuggingFace repository URL")
     checkpoint_path: str = Field(..., description="Local checkpoint path")
     status: str = Field(..., description="Upload status ('Complete', 'submitted', etc.)")
+
+
+# ============================================================================
+# Inference Endpoint Management
+# ============================================================================
+
+class InferenceEndpoint(BaseModel):
+    """Represents a single inference endpoint."""
+    host: str = Field(..., description="Hostname or IP address of the inference endpoint")
+    port: int = Field(..., description="Port number of the inference endpoint")
+    world_size: int = Field(default=1, description="Number of workers at this endpoint")
+    healthy: bool = Field(default=True, description="Whether the endpoint is healthy")
+
+
+class AddInferenceEndpointRequest(BaseModel):
+    """API request for adding an inference endpoint."""
+    host: str = Field(..., description="Hostname or IP address of the inference endpoint")
+    port: int = Field(..., description="Port number of the inference endpoint")
+    world_size: int = Field(default=1, description="Number of workers at this endpoint")
+    # Auto-sync configuration
+    sync_weights: bool = Field(
+        default=False,
+        description="Whether to automatically sync weights to this endpoint after adding"
+    )
+    master_address: Optional[str] = Field(
+        default=None,
+        description="Master address for NCCL rendezvous (auto-detected if not provided)"
+    )
+    master_port: int = Field(
+        default=29600,
+        description="Master port for NCCL rendezvous"
+    )
+    group_name: str = Field(
+        default="weight_sync_group",
+        description="Name of the NCCL process group"
+    )
+    buffer_size_mb: int = Field(
+        default=1024,
+        description="Size of each transfer bucket in MB (to avoid OOM)"
+    )
+
+
+class AddInferenceEndpointResponse(BaseModel):
+    """API response for adding an inference endpoint."""
+    success: bool = Field(..., description="Whether the endpoint was added successfully")
+    message: str = Field(..., description="Status message")
+    endpoint: Optional[InferenceEndpoint] = Field(default=None, description="The added endpoint info")
+    weights_synced: bool = Field(default=False, description="Whether weights were synced to this endpoint")
+    sync_message: Optional[str] = Field(default=None, description="Weight sync status message")
+
+
+class ListInferenceEndpointsResponse(BaseModel):
+    """API response for listing inference endpoints."""
+    endpoints: List[InferenceEndpoint] = Field(..., description="List of registered inference endpoints")
+    count: int = Field(..., description="Number of registered endpoints")
+
+
+class RemoveInferenceEndpointRequest(BaseModel):
+    """API request for removing an inference endpoint."""
+    host: str = Field(..., description="Hostname or IP address of the inference endpoint")
+    port: int = Field(..., description="Port number of the inference endpoint")
+
+
+class RemoveInferenceEndpointResponse(BaseModel):
+    """API response for removing an inference endpoint."""
+    success: bool = Field(..., description="Whether the endpoint was removed successfully")
+    message: str = Field(..., description="Status message")
+
+
+# ============================================================================
+# Weight Synchronization
+# ============================================================================
+
+class SyncInferenceWeightsRequest(BaseModel):
+    """API request for synchronizing weights to inference endpoints via NCCL."""
+    master_address: str = Field(
+        default="localhost",
+        description="Master address for NCCL rendezvous (training server address)"
+    )
+    master_port: int = Field(
+        default=29600,
+        description="Master port for NCCL rendezvous"
+    )
+    group_name: str = Field(
+        default="weight_sync_group",
+        description="Name of the NCCL process group"
+    )
+    buffer_size_mb: int = Field(
+        default=1024,
+        description="Size of each transfer bucket in MB (to avoid OOM)"
+    )
+
+
+class EndpointSyncResult(BaseModel):
+    """Result of syncing weights to a single endpoint."""
+    host: str = Field(..., description="Endpoint host")
+    port: int = Field(..., description="Endpoint port")
+    success: bool = Field(..., description="Whether sync succeeded")
+    message: str = Field(default="", description="Status or error message")
+
+
+class SyncInferenceWeightsResponse(BaseModel):
+    """API response for weight synchronization."""
+    success: bool = Field(..., description="Whether all endpoints synced successfully")
+    message: str = Field(..., description="Overall status message")
+    transfer_time: float = Field(default=0.0, description="Total transfer time in seconds")
+    total_bytes: int = Field(default=0, description="Total bytes transferred")
+    num_parameters: int = Field(default=0, description="Number of parameters transferred")
+    num_buckets: int = Field(default=0, description="Number of transfer buckets used")
+    endpoints_synced: List[EndpointSyncResult] = Field(
+        default_factory=list,
+        description="Sync results for each endpoint"
+    )
