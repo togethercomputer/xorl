@@ -277,39 +277,7 @@ def _init_parameter(
 ) -> None:
     """
     Initializes parameter in model.
-
-    For LoRA parameters (lora_A, lora_B), uses PEFT's default initialization:
-    - lora_A: kaiming uniform initialization
-    - lora_B: zeros (so LoRA has no effect at start)
     """
-    import torch.nn as nn
-    import math
-
-    # Check if this is a LoRA parameter and handle specially
-    if "lora_A" in name or "lora_B" in name:
-        # Navigate to the parameter
-        pieces = name.split(".")
-        param_module = module
-        for piece in pieces[:-1]:
-            if not hasattr(param_module, piece):
-                raise ValueError(f"Cannot find {piece} in {param_module}.")
-            param_module = getattr(param_module, piece)
-
-        param_name = pieces[-1]
-        if hasattr(param_module, param_name):
-            param = getattr(param_module, param_name)
-            if isinstance(param, (torch.Tensor, nn.Parameter)):
-                if "lora_A" in name:
-                    # Kaiming uniform initialization for lora_A
-                    nn.init.kaiming_uniform_(param, a=math.sqrt(5))
-                    logger.info_rank0(f"Initialized LoRA param {name} with kaiming_uniform_")
-                elif "lora_B" in name:
-                    # Zeros for lora_B (no effect at start)
-                    nn.init.zeros_(param)
-                    logger.info_rank0(f"Initialized LoRA param {name} with zeros")
-                return
-
-    # Standard initialization for non-LoRA params
     pieces = name.split(".")
     init_func = None
     for piece in pieces[:-1]:
