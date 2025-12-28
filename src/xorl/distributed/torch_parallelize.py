@@ -459,7 +459,7 @@ def build_parallelize_model(
             )
         elif parallel_state.dp_mode == "ddp":
             ddp_kwargs = {"device_ids": [parallel_state.local_rank]}
-			if enable_mixed_precision:
+            if enable_mixed_precision:
                 logger.info_rank0("Enable mixed precision training.")
                 mixed_precision = MixedPrecision(
                     param_dtype=torch.bfloat16,
