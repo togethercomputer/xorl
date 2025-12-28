@@ -58,7 +58,7 @@ class ServerArguments:
         metadata={"help": "Path to tokenizer. Defaults to config_path"}
     )
 
-    attn_implementation: Optional[Literal["eager", "sdpa", "flash_attention_2", "native-sparse"]] = field(
+    attn_implementation: Optional[Literal["eager", "sdpa", "flash_attention_2", "flash_attention_3", "native-sparse"]] = field(
         default="flash_attention_2",
         metadata={"help": "Attention implementation"}
     )
@@ -93,9 +93,9 @@ class ServerArguments:
     # Parallelism Configuration
     # ========================================================================
 
-    data_parallel_mode: Optional[Literal["ddp", "fsdp1", "fsdp2"]] = field(
+    data_parallel_mode: Optional[Literal["none", "ddp", "fsdp1", "fsdp2"]] = field(
         default="fsdp2",
-        metadata={"help": "Data parallelism mode"}
+        metadata={"help": "Data parallelism mode. Use 'none' for single GPU without any parallelization."}
     )
 
     pipeline_parallel_size: int = field(
@@ -188,7 +188,7 @@ class ServerArguments:
 
     output_dir: str = field(
         default="outputs",
-        metadata={"help": "Output directory for checkpoints and logs"}
+        metadata={"help": "Output directory for checkpoints, sampler weights, and logs (must be on shared filesystem for multi-node)"}
     )
 
     load_checkpoint_path: str = field(

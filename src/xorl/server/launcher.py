@@ -113,6 +113,7 @@ def run_engine_core(
     rank0_worker_address: str,
     max_running_requests: int = 2,
     max_pending_requests: int = 100,
+    operation_timeout: float = 600.0,
     log_level: str = "INFO",
     inference_worker_urls: Optional[List[str]] = None,
     packing_seq_len: int = 32000,
@@ -168,11 +169,12 @@ def run_engine_core(
             output_addr=output_addr,
             rank0_worker_address=rank0_worker_address,
             inference_worker_urls=inference_worker_urls,
+            operation_timeout=operation_timeout,
             connection_timeout=300.0,  # Give worker time to load large models + compile Triton kernels
             packing_seq_len=packing_seq_len,
             enable_packing=enable_packing,
         )
-        logger.info("EngineCore initialized successfully")
+        logger.info(f"EngineCore initialized successfully (operation_timeout={operation_timeout}s)")
 
         logger.info("Starting EngineCore...")
         engine.start()
@@ -202,6 +204,8 @@ def run_api_server(
     engine_input_addr: str,
     engine_output_addr: str,
     log_level: str = "INFO",
+    default_timeout: float = 120.0,
+    output_dir: str = "outputs",
 ):
     """
     Run the API Server in a separate process.
@@ -212,6 +216,8 @@ def run_api_server(
         engine_input_addr: Address to send requests to engine
         engine_output_addr: Address to receive outputs from engine
         log_level: Logging level
+        default_timeout: Default timeout for engine operations
+        output_dir: Output directory for checkpoints and sampler weights (must be on shared filesystem)
     """
     from contextlib import asynccontextmanager
 
@@ -243,9 +249,12 @@ def run_api_server(
         async def custom_lifespan(app):
             """Custom lifecycle with configurable addresses."""
             logger.info("Starting APIServer with custom addresses...")
+            logger.info(f"  output_dir: {output_dir}")
             api_module.api_server = APIServer(
                 engine_input_addr=engine_input_addr,
                 engine_output_addr=engine_output_addr,
+                default_timeout=default_timeout,
+                output_dir=output_dir,
             )
             await api_module.api_server.start()
             yield
@@ -338,6 +347,9 @@ def load_server_arguments(config_path: str) -> ServerArguments:
         flat_config['packing_seq_len'] = train_config.get('packing_seq_len') or data_config.get('packing_seq_len', 32000)
         flat_config['enable_packing'] = train_config.get('enable_packing', data_config.get('enable_packing', True))
 
+        # Output directory (can be in train section or top-level)
+        flat_config['output_dir'] = train_config.get('output_dir') or config.get('output_dir', 'outputs')
+
         # Worker section
         worker_config = config.get('worker', {})
         flat_config['worker_bind_address'] = worker_config.get('bind_address', 'tcp://127.0.0.1:5556')
@@ -426,6 +438,7 @@ class Launcher:
         api_port: Optional[int] = None,
         max_running_requests: int = 2,
         max_pending_requests: int = 100,
+        operation_timeout: float = 600.0,
         log_level: str = "INFO",
         inference_worker_urls: Optional[List[str]] = None,
         # Auto-launch mode parameters
@@ -459,6 +472,7 @@ class Launcher:
         self.log_level = log_level
         self.max_running_requests = max_running_requests
         self.max_pending_requests = max_pending_requests
+        self.operation_timeout = operation_timeout
         self.inference_worker_urls = inference_worker_urls or []
         self.packing_seq_len = packing_seq_len
         self.enable_packing = enable_packing
@@ -537,6 +551,14 @@ class Launcher:
             self.packing_seq_len = self.server_args.packing_seq_len
             self.enable_packing = self.server_args.enable_packing
             logger.info(f"Using packing config: seq_len={self.packing_seq_len}, enabled={self.enable_packing}")
+
+        # Output directory - prefer from ServerArguments if available
+        if self.server_args:
+            self.output_dir = self.server_args.output_dir
+            logger.info(f"Using output_dir from config: {self.output_dir}")
+        else:
+            self.output_dir = "outputs"
+            logger.info(f"Using default output_dir: {self.output_dir}")
 
         # Processes and subprocesses
         self.worker_process: Optional[subprocess.Popen] = None  # torchrun subprocess
@@ -658,6 +680,7 @@ class Launcher:
                         self.worker_address,
                         self.max_running_requests,
                         self.max_pending_requests,
+                        self.operation_timeout,
                         self.log_level,
                         self.inference_worker_urls,
                         self.packing_seq_len,
@@ -703,6 +726,7 @@ class Launcher:
 
             # Start API Server (connects to engine)
             logger.info("Starting API Server...")
+            logger.info(f"  output_dir: {self.output_dir}")
             self.api_process = mp.Process(
                 target=run_api_server,
                 args=(
@@ -711,6 +735,8 @@ class Launcher:
                     self.engine_input_addr,
                     self.engine_output_addr,
                     self.log_level,
+                    self.operation_timeout,
+                    self.output_dir,
                 ),
                 name="APIServer",
             )
@@ -891,6 +917,12 @@ Note:
         help="Maximum pending requests in queue (default: 100)"
     )
     parser.add_argument(
+        "--operation-timeout",
+        type=float,
+        default=600.0,
+        help="Timeout for engine operations in seconds (default: 600.0)"
+    )
+    parser.add_argument(
         "--inference-worker-urls",
         type=str,
         nargs="+",
@@ -938,6 +970,7 @@ Note:
         api_port=args.api_port,
         max_running_requests=args.max_running_requests,
         max_pending_requests=args.max_pending_requests,
+        operation_timeout=args.operation_timeout,
         log_level=args.log_level,
         inference_worker_urls=args.inference_worker_urls,
         nnodes=args.nnodes,
