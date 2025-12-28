@@ -40,7 +40,7 @@ def build_foundation_model(
     weights_path: Optional[str] = None,
     torch_dtype: Literal["float16", "bfloat16", "float32"] = "bfloat16",
     attn_implementation: Optional[
-        Literal["eager", "sdpa", "flash_attention_2", "flash_attention_3", "native-sparse"]
+        Literal["eager", "sdpa", "flash_attention_2", "native-sparse"]
     ] = "flash_attention_2",
     moe_implementation: Optional[Literal["eager", "fused"]] = None,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
@@ -83,21 +83,10 @@ def build_foundation_model(
 
         ALL_ATTENTION_FUNCTIONS.register("flash_attention_2", flash_attention_forward)
 
-    # For HuggingFace model initialization, we always use "flash_attention_2" as the attn_implementation
-    # because most HF models don't have flash_attention_3 in their supported list yet.
-    # Our registered flash_attention_forward function will automatically use FA3 when available
-    # (it checks FLASH_ATTN_3_AVAILABLE and uses FA3 if the implementation param is None or "fa3").
-    hf_attn_implementation = attn_implementation
-    if attn_implementation == "flash_attention_3":
-        hf_attn_implementation = "flash_attention_2"
-        logger.info_rank0(
-            "Using flash_attention_2 for HF model init, but FA3 will be used internally when available"
-        )
-
     init_kwargs = {
         "config": config,
         "torch_dtype": getattr(torch, torch_dtype),
-        "attn_implementation": hf_attn_implementation,
+        "attn_implementation": attn_implementation,
         "trust_remote_code": True,
     }
 
