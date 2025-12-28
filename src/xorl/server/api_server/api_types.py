@@ -39,6 +39,10 @@ class DatumInput(BaseModel):
         description="List of training/inference examples"
     )
     loss_fn: str = Field(default="causallm_loss", description="Loss function type")
+    loss_fn_params: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Global loss function parameters (e.g., eps_clip, use_tis for PPO)"
+    )
 
 
 class LossFnOutput(BaseModel):

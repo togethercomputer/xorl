@@ -59,3 +59,7 @@ htmlcov/
 # slurm files
 sbatch.sh
 multi-train.sh
+
+# RL training outputs
+checkpoints/
+outputs/
