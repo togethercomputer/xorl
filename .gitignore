@@ -28,6 +28,7 @@ ENV/
 env.bak/
 venv.bak/
 checkpoints/
+outputs/
 # ides
 .idea/
 .vscode/
