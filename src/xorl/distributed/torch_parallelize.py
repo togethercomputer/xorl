@@ -365,7 +365,11 @@ def parallelize_model_fsdp2(
     # Handle meta initialization for FSDP2 (fallback if pre-load not done)
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
 
-    if weights_path is None:
+    # skip_weight_loading: Used when caller will handle weight loading separately
+    # (e.g., FSDP2+LoRA where we broadcast from rank 0 after this function returns)
+    if kwargs.get("skip_weight_loading"):
+        logger.info_rank0("Skipping weight loading in parallelize_model_fsdp2 (caller will handle)")
+    elif weights_path is None:
         model.to_empty(device="cuda")
         model.init_weights()
     else:
@@ -408,9 +412,9 @@ def build_parallelize_model(
             raise ValueError("Only FSDP training supports `init_device=cpu` or `init_device=meta`.")
         if kwargs.pop("enable_fsdp_offload", False):
             raise ValueError("Only FSDP training supports `enable_fsdp_offload`.")
-
-    if enable_mixed_precision:  # upcast to float32 before feed it to optimizer
+    if enable_mixed_precision:
         model = model.float()
+
 
     if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         logger.info_rank0("Enable gradient checkpointing.")
@@ -453,9 +457,9 @@ def build_parallelize_model(
                 fsdp_no_shard_states=fsdp_no_shard_states,
                 **kwargs,
             )
-        else:
+        elif parallel_state.dp_mode == "ddp":
             ddp_kwargs = {"device_ids": [parallel_state.local_rank]}
-            if enable_mixed_precision:
+			if enable_mixed_precision:
                 logger.info_rank0("Enable mixed precision training.")
                 mixed_precision = MixedPrecision(
                     param_dtype=torch.bfloat16,
@@ -463,7 +467,9 @@ def build_parallelize_model(
                     buffer_dtype=torch.bfloat16,
                 )
                 ddp_kwargs["mixed_precision"] = mixed_precision
-
             model = DDP(model, **ddp_kwargs)
+        else:
+            # dp_mode == "none": no parallelization, just use model directly
+            logger.info_rank0("No data parallelism (dp_mode=none), using model directly.")
 
     return model
