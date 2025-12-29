@@ -243,6 +243,35 @@ class ServerArguments:
         metadata={"help": "Enable sample packing to combine multiple samples into one sequence"}
     )
 
+    # ========================================================================
+    # LoRA Configuration
+    # ========================================================================
+
+    enable_lora: bool = field(
+        default=False,
+        metadata={"help": "Enable LoRA adapters for training"}
+    )
+
+    lora_rank: int = field(
+        default=32,
+        metadata={"help": "LoRA rank (r parameter)"}
+    )
+
+    lora_alpha: int = field(
+        default=16,
+        metadata={"help": "LoRA alpha scaling parameter"}
+    )
+
+    init_lora_weights: str = field(
+        default="kaiming",
+        metadata={"help": "LoRA weight initialization method ('kaiming', 'gaussian', True, False)"}
+    )
+
+    lora_target_modules: Optional[List[str]] = field(
+        default=None,
+        metadata={"help": "List of module names to apply LoRA to (e.g., ['q_proj', 'k_proj', 'v_proj', 'o_proj']). If None, uses default based on model architecture."}
+    )
+
     def __post_init__(self):
         """Validate and set defaults."""
         # Set default paths
@@ -265,9 +294,9 @@ class ServerArguments:
         Convert ServerArguments to the config dict format expected by ModelRunner.
 
         Returns:
-            Dict with 'model', 'train', and 'data' sections
+            Dict with 'model', 'train', 'data', and 'lora' sections
         """
-        return {
+        config = {
             "model": {
                 "model_path": self.model_path,
                 "config_path": self.config_path,
@@ -304,7 +333,15 @@ class ServerArguments:
             "data": {
                 # Empty data section - data comes from client at runtime
             },
+            "lora": {
+                "enabled": self.enable_lora,
+                "rank": self.lora_rank,
+                "alpha": self.lora_alpha,
+                "init_lora_weights": self.init_lora_weights,
+                "target_modules": self.lora_target_modules,
+            },
         }
+        return config
 
     def get_world_size(self) -> int:
         """
