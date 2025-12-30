@@ -406,8 +406,10 @@ def calculate_world_size_from_config(config_path: str) -> int:
     dp_shard_size = train_config.get('data_parallel_shard_size', 1)
 
     # Calculate world size
-    # Formula: world_size = pp_size * dp_replicate_size * dp_shard_size * ulysses_size * cp_size * tp_size
-    world_size = pp_size * dp_replicate_size * dp_shard_size * ulysses_size * cp_size * tp_size * ep_size
+    # EP creates a separate 2D mesh where: world_size = ep_size * ep_fsdp_size
+    # ep_fsdp_size contains all other parallelism dimensions
+    world_size = pp_size * dp_replicate_size * dp_shard_size * ulysses_size * cp_size * tp_size
+    ep_fsdp_size = world_size // ep_size
 
     logger.info(f"Calculated world size from config:")
     logger.info(f"  pipeline_parallel_size:      {pp_size}")
@@ -417,6 +419,7 @@ def calculate_world_size_from_config(config_path: str) -> int:
     logger.info(f"  ulysses_parallel_size:        {ulysses_size}")
     logger.info(f"  data_parallel_replicate_size: {dp_replicate_size}")
     logger.info(f"  data_parallel_shard_size:     {dp_shard_size}")
+    logger.info(f"  ep_fsdp_size:              {ep_fsdp_size} (pp×dp_rep×dp_shard×ulysses×cp×tp / ep_size)")
     logger.info(f"  => Total world size:          {world_size}")
 
     return world_size
@@ -855,8 +858,9 @@ Examples:
 
 Note:
   World size is ALWAYS calculated from the config file parallelism settings:
-    world_size = pp_size * dp_replicate_size * dp_shard_size * ulysses_size * cp_size * tp_size * ep_size
-
+    world_size = pp_size * dp_replicate_size * dp_shard_size * ulysses_size * cp_size * tp_size
+  And EP creates a separate 2D mesh where: world_size = ep_size * ep_fsdp_size; 
+  ep_fsdp_size will be automatically calculated through world_size / ep_size;
   Example config:
     train:
       data_parallel_shard_size: 2
