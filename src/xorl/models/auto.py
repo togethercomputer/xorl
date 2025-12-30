@@ -83,15 +83,16 @@ def build_foundation_model(
 
         ALL_ATTENTION_FUNCTIONS.register("flash_attention_2", flash_attention_forward)
 
-    # For HuggingFace model initialization, we always use "flash_attention_2" as the attn_implementation
-    # because most HF models don't have flash_attention_3 in their supported list yet.
+    # For HuggingFace model initialization, we use "sdpa" when flash_attention_3 is requested
+    # because HF models don't have flash_attention_3 in their supported list yet, and flash_attention_2
+    # requires the flash_attn package which flash-attn-3 doesn't provide.
     # Our registered flash_attention_forward function will automatically use FA3 when available
     # (it checks FLASH_ATTN_3_AVAILABLE and uses FA3 if the implementation param is None or "fa3").
     hf_attn_implementation = attn_implementation
     if attn_implementation == "flash_attention_3":
-        hf_attn_implementation = "flash_attention_2"
+        hf_attn_implementation = "sdpa"
         logger.info_rank0(
-            "Using flash_attention_2 for HF model init, but FA3 will be used internally when available"
+            "Using sdpa for HF model init, but FA3 will be used internally when available"
         )
 
     init_kwargs = {
