@@ -346,6 +346,10 @@ class ServerArguments:
     def get_world_size(self) -> int:
         """
         Calculate world size from parallelism configuration.
+        
+        Note: EP (Expert Parallel) is NOT included in world_size calculation.
+        EP creates a separate 2D mesh: world_size = ep_size * ep_fsdp_size
+        where ep_fsdp_size contains all other parallelism dimensions.
 
         Returns:
             Required world size (number of GPUs)
@@ -355,10 +359,57 @@ class ServerArguments:
             self.tensor_parallel_size *
             self.ulysses_parallel_size *
             self.context_parallel_size *
-            self.expert_parallel_size *
             self.data_parallel_replicate_size *
             self.data_parallel_shard_size
         )
+    
+    def get_ep_fsdp_size(self) -> int:
+        """
+        Calculate ep_fsdp_size (the size of each expert parallel group).
+        
+        For non-EP models (ep_size=1), this equals world_size.
+        For EP models, ep_fsdp_size = world_size / ep_size.
+
+        Returns:
+            Size of the ep_fsdp dimension
+        """
+        world_size = self.get_world_size()
+        if self.expert_parallel_size > 1:
+            assert world_size % self.expert_parallel_size == 0, \
+                f"world_size ({world_size}) must be divisible by expert_parallel_size ({self.expert_parallel_size})"
+            return world_size // self.expert_parallel_size
+        return world_size
+    
+    def get_dp_size(self) -> int:
+        """
+        Calculate data parallel size (auto-calculated from other dimensions).
+        
+        IMPORTANT: EP (Expert Parallel) is NOT included in this calculation!
+        EP creates a separate 2D mesh and doesn't participate in the main mesh.
+        
+        dp_size is the remaining parallelism after accounting for pp/tp/ulysses/cp.
+        It's then split into dp_replicate_size and dp_shard_size.
+
+        Returns:
+            Data parallel size
+        """
+        world_size = self.get_world_size()
+        other_parallel = (
+            self.pipeline_parallel_size *
+            self.tensor_parallel_size *
+            self.ulysses_parallel_size *
+            self.context_parallel_size
+            # NOTE: expert_parallel_size is NOT included here!
+        )
+        if world_size % other_parallel != 0:
+            raise ValueError(
+                f"world_size ({world_size}) must be divisible by "
+                f"pp({self.pipeline_parallel_size}) × "
+                f"tp({self.tensor_parallel_size}) × "
+                f"ulysses({self.ulysses_parallel_size}) × "
+                f"cp({self.context_parallel_size}) = {other_parallel}"
+            )
+        return world_size // other_parallel
 
 
 def parse_server_args() -> ServerArguments:
