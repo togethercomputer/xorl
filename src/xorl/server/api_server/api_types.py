@@ -47,7 +47,7 @@ class DatumInput(BaseModel):
 
 class LossFnOutput(BaseModel):
     """Single loss function output."""
-    loss: float = Field(..., description="Loss value")
+    loss: Optional[float] = Field(..., description="Loss value (None if NaN/Inf)")
 
 
 class AdamParams(BaseModel):
