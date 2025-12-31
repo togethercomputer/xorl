@@ -160,6 +160,31 @@ class TextSequenceShardCollator(DataCollator):
         batch["labels"] = self.sp_slice(labels, dim=-1)
         batch["position_ids"] = position_ids  # Keep full, not sliced
 
+        # Handle RL fields (target_tokens, logprobs, advantages) for importance_sampling
+        # These need to be padded and sliced the same way as labels
+        rl_fields = ["target_tokens", "logprobs", "advantages", "rollout_logprobs"]
+        for field in rl_fields:
+            if field in batch:
+                field_tensor = batch[field]
+                if not isinstance(field_tensor, torch.Tensor):
+                    # Determine dtype: logprobs/advantages are float, target_tokens is long
+                    dtype = torch.float if field in ("logprobs", "advantages", "rollout_logprobs") else torch.long
+                    if isinstance(field_tensor, list):
+                        if field_tensor and isinstance(field_tensor[0], list):
+                            # Nested list
+                            field_tensor = torch.tensor(field_tensor[0], dtype=dtype).unsqueeze(0)
+                        else:
+                            field_tensor = torch.tensor(field_tensor, dtype=dtype).unsqueeze(0)
+                    else:
+                        field_tensor = torch.tensor(field_tensor, dtype=dtype).unsqueeze(0)
+                elif field_tensor.ndim == 1:
+                    field_tensor = field_tensor.unsqueeze(0)
+
+                # Determine pad value: IGNORE_INDEX for target_tokens, 0 for others
+                pad_value = IGNORE_INDEX if field == "target_tokens" else 0.0
+                field_tensor = self.sp_padding(field_tensor, dim=-1, pad_value=pad_value, pad_length=pad_length)
+                batch[field] = self.sp_slice(field_tensor, dim=-1)
+
         # Calculate Flash Attention kwargs from FULL padded position_ids
         add_flash_attention_kwargs_from_position_ids(batch)
 
