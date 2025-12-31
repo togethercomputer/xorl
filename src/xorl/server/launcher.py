@@ -653,6 +653,10 @@ class Launcher:
                     result = response.json()
                     logger.info(f"✓ Initial checkpoint saved: {result.get('path', '000000')}")
                     return True
+                elif response.status_code == 409:
+                    # Checkpoint already exists - no need to retry
+                    logger.info("✓ Initial checkpoint already exists (000000), skipping save")
+                    return True
                 else:
                     logger.warning(
                         f"Failed to save initial checkpoint (attempt {attempt + 1}/{max_retries}): "

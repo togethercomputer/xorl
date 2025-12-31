@@ -449,12 +449,25 @@ class UpdateServerlessWeightsResponse(BaseModel):
 # Inference Endpoint Management
 # ============================================================================
 
+class InferenceEndpointServerInfo(BaseModel):
+    """Server info from SGLang inference endpoint (/server_info)."""
+    model_path: Optional[str] = Field(default=None, description="Model path loaded on the server")
+    served_model_name: Optional[str] = Field(default=None, description="Served model name")
+    tp_size: Optional[int] = Field(default=None, description="Tensor parallelism size")
+    enable_lora: Optional[bool] = Field(default=None, description="Whether LoRA is enabled")
+    max_lora_rank: Optional[int] = Field(default=None, description="Maximum LoRA rank supported")
+    version: Optional[str] = Field(default=None, description="SGLang version")
+
+
 class InferenceEndpoint(BaseModel):
     """Represents a single inference endpoint."""
     host: str = Field(..., description="Hostname or IP address of the inference endpoint")
     port: int = Field(..., description="Port number of the inference endpoint")
     world_size: int = Field(default=1, description="Number of workers at this endpoint")
     healthy: bool = Field(default=True, description="Whether the endpoint is healthy")
+    server_info: Optional[InferenceEndpointServerInfo] = Field(
+        default=None, description="Server info from the inference endpoint"
+    )
 
 
 class AddInferenceEndpointRequest(BaseModel):
@@ -556,6 +569,33 @@ class SyncInferenceWeightsResponse(BaseModel):
         default_factory=list,
         description="Sync results for each endpoint"
     )
+
+
+# ============================================================================
+# Sampling Session Management
+# ============================================================================
+
+class CreateSamplingSessionRequest(BaseModel):
+    """API request for creating a sampling session.
+
+    This loads the specified LoRA adapter on all inference workers.
+    The model_path must start with 'sampler_weights/' or 'xorl://'.
+    """
+    model_path: str = Field(
+        ...,
+        description="Path to the LoRA adapter (e.g., 'xorl://default/sampler_weights/step-100' or 'sampler_weights/step-100')"
+    )
+
+
+class CreateSamplingSessionResponse(BaseModel):
+    """API response for creating a sampling session.
+
+    Returns information about the loaded LoRA adapter.
+    """
+    success: bool = Field(..., description="Whether the session was created successfully")
+    model_path: str = Field(..., description="The model path that was loaded")
+    lora_name: str = Field(..., description="The name of the LoRA adapter that was loaded")
+    message: Optional[str] = Field(default=None, description="Status or error message")
 
 
 # ============================================================================
