@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Callable, Optional, Tuple, Union
 import os
 import time
@@ -11,6 +12,7 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
+    ModelOutput,
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
@@ -47,6 +49,28 @@ logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "Qwen/Qwen3-8B"
 _CONFIG_FOR_DOC = "Qwen3Config"
+
+
+@dataclass
+class CausalLMOutputWithPastAndLastHiddenState(ModelOutput):
+    """
+    Extended CausalLMOutputWithPast that also includes last_hidden_state.
+
+    This avoids storing all layer hidden states when only the last layer is needed,
+    significantly reducing memory usage for large models.
+
+    Args:
+        loss: Language modeling loss (optional)
+        logits: Prediction scores of the language modeling head
+        past_key_values: Pre-computed key/value pairs for efficient generation
+        attentions: Attention weights of all layers (only if output_attentions=True)
+        last_hidden_state: Hidden state of the last layer (always available)
+    """
+    loss: Optional[torch.FloatTensor] = None
+    logits: Optional[torch.FloatTensor] = None
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
+    last_hidden_state: Optional[torch.FloatTensor] = None
 
 
 def rms_norm(hidden_states, weight, variance_epsilon):
@@ -835,10 +859,10 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
+        # Force these to None/False to save memory - we don't need them for training
+        use_cache = None
+        output_attentions = None
+        output_hidden_states = False
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs: BaseModelOutputWithPast = self.model(
@@ -854,22 +878,27 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             **kwargs,
         )
 
-        hidden_states = outputs.last_hidden_state
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        hidden_states = hidden_states[:, slice_indices, :]
+        # Get last hidden state from base model (always available, no need for output_hidden_states=True)
+        last_hidden_state = outputs.last_hidden_state
 
+        # Only compute loss/logits if labels are provided
+        # This saves computation when only hidden states are needed (e.g., for custom loss functions)
         loss = None
         logits = None
-        loss, logits = self.loss_function(hidden_states, self.lm_head.weight, labels)
+        if labels is not None:
+            # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            hidden_states = last_hidden_state[:, slice_indices, :]
+            loss, logits = self.loss_function(hidden_states, self.lm_head.weight, labels)
 
-        # hidden_states=[hidden_states], # Only return the last layer hidden states
-        return CausalLMOutputWithPast(
+        # Return extended output that includes last_hidden_state
+        # This allows callers to access last layer hidden states without output_hidden_states=True
+        return CausalLMOutputWithPastAndLastHiddenState(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states if output_hidden_states else None,
             attentions=outputs.attentions,
+            last_hidden_state=last_hidden_state,
         )
 
 

@@ -188,6 +188,14 @@ class OptimizerState(Stateful):
         return sd
 
     def load_state_dict(self, state_dict):
+        # If optimizer is None (when load_optimizer=False), skip loading
+        if self.optimizer is None:
+            return
+
+        # If state_dict is empty (checkpoint saved with save_optimizer=False or step 0), skip loading
+        if not state_dict:
+            return
+
         optim_state = state_dict
 
         # Delegate to MultiOptimizer (it will split/filter correctly)

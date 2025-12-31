@@ -191,6 +191,11 @@ class ServerArguments:
         metadata={"help": "Output directory for checkpoints, sampler weights, and logs (must be on shared filesystem for multi-node)"}
     )
 
+    storage_limit: str = field(
+        default="10TB",
+        metadata={"help": "Maximum disk usage for output_dir (e.g., '1GB', '500MB', '10GB'). Save operations will fail with StorageLimitError when limit is exceeded. Default: 10TB."}
+    )
+
     load_checkpoint_path: str = field(
         default="",
         metadata={"help": "Path to checkpoint to load"}
@@ -260,11 +265,6 @@ class ServerArguments:
     lora_alpha: int = field(
         default=16,
         metadata={"help": "LoRA alpha scaling parameter"}
-    )
-
-    init_lora_weights: str = field(
-        default="kaiming",
-        metadata={"help": "LoRA weight initialization method ('kaiming', 'gaussian', True, False)"}
     )
 
     lora_target_modules: Optional[List[str]] = field(
@@ -337,7 +337,6 @@ class ServerArguments:
                 "enabled": self.enable_lora,
                 "rank": self.lora_rank,
                 "alpha": self.lora_alpha,
-                "init_lora_weights": self.init_lora_weights,
                 "target_modules": self.lora_target_modules,
             },
         }
