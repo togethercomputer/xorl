@@ -94,37 +94,73 @@ class TextSequenceShardCollator(DataCollator):
                     batch[key] = batch[key].unsqueeze(0)
 
         input_ids = batch.pop("input_ids")
-        labels = batch.pop("labels")[..., 1:].contiguous()  # shift labels
-        labels = F.pad(labels, (0, 1), "constant", IGNORE_INDEX)
+        labels = batch.pop("labels")
+        position_ids = batch.pop("position_ids")
 
-        # Mask the last token of each sequence to prevent cross-sequence prediction
-        cu_seqlens = pos2culen(batch["position_ids"])
-        labels[:, cu_seqlens[1:-1] - 1] = IGNORE_INDEX
+        # Data should already be shifted by data_processor:
+        # input_ids = tokens[:-1], labels = tokens[1:] (or target_tokens from xorl_client API)
+        # So input_ids, labels, and position_ids should all have the same shape
+        assert input_ids.shape == labels.shape, (
+            f"input_ids and labels must have same shape (data should be pre-shifted). "
+            f"Got input_ids: {input_ids.shape}, labels: {labels.shape}"
+        )
+        assert input_ids.shape == position_ids.shape, (
+            f"input_ids and position_ids must have same shape. "
+            f"Got input_ids: {input_ids.shape}, position_ids: {position_ids.shape}"
+        )
 
-        # sp padding
+        # Sanity check: verify the first non-ignore label matches shifted input_ids
+        # This ensures data is properly shifted without being too strict about all positions
+        # (chat data may have labels[i] != input_ids[i+1] at turn boundaries)
+        valid_mask = labels != IGNORE_INDEX
+        if valid_mask.any():
+            # Find first non-ignore position
+            first_valid_idx = valid_mask.nonzero(as_tuple=True)[1][0].item()
+            if first_valid_idx < labels.shape[1] - 1:  # Ensure we can check i+1
+                first_label = labels[0, first_valid_idx].item()
+                next_input = input_ids[0, first_valid_idx + 1].item()
+                assert first_label == next_input, (
+                    f"Data shift check failed: first non-ignore label should equal next input_id. "
+                    f"labels[{first_valid_idx}]={first_label}, input_ids[{first_valid_idx + 1}]={next_input}. "
+                    f"This suggests data is not properly shifted."
+                )
+
+        # Store original position_ids before padding for unpacking per-token outputs later
+        if "_original_position_ids" not in batch:
+            batch["_original_position_ids"] = position_ids.clone()
+
+        # Compute cu_seqlens from FULL position_ids BEFORE any padding/slicing
+        # This gives correct sequence boundaries for flash attention
+        cu_seqlens = pos2culen(position_ids)
+
+        # sp padding - pad to be divisible by sp_size
         seq_length = input_ids.size(-1)
         sp_chunk_size = (seq_length + self.sp_size - 1) // self.sp_size
         pad_length = sp_chunk_size * self.sp_size - seq_length
 
         input_ids = self.sp_padding(input_ids, dim=-1, pad_value=self.pad_token_id, pad_length=pad_length)
         labels = self.sp_padding(labels, dim=-1, pad_value=IGNORE_INDEX, pad_length=pad_length)
-        
+
         if "attention_mask" in batch:
             batch["attention_mask"] = self.sp_padding(
                 batch["attention_mask"], dim=-1, pad_value=1, pad_length=pad_length
             )
-        
-        
-        # For position_ids to create one single sequence for all padded tokens by pass sequential=True
-        batch["position_ids"] = self.sp_padding(
-            batch["position_ids"], dim=-1, pad_value=0, pad_length=pad_length, sequential=True
+
+        # Pad position_ids with sequential values for padding tokens (creates one sequence for padding)
+        # NOTE: position_ids is NOT sliced - it stays full length because:
+        # 1. cu_seqlens is computed from FULL position_ids (done above, before padding)
+        # 2. For Ulysses, all SP ranks use the SAME cu_seqlens for flash attention
+        # 3. Each SP rank only processes a slice of the sequence but needs full cu_seqlens
+        position_ids = self.sp_padding(
+            position_ids, dim=-1, pad_value=0, pad_length=pad_length, sequential=True
         )
 
-        # sp slice
+        # sp slice - only slice input_ids and labels, NOT position_ids
         batch["input_ids"] = self.sp_slice(input_ids, dim=-1)
         batch["labels"] = self.sp_slice(labels, dim=-1)
+        batch["position_ids"] = position_ids  # Keep full, not sliced
 
-        # Calculate Flash Attention kwargs from position_ids here when SP is enabled to use padded position_ids
+        # Calculate Flash Attention kwargs from FULL padded position_ids
         add_flash_attention_kwargs_from_position_ids(batch)
 
         return batch

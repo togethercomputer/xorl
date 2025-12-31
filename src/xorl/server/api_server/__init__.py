@@ -8,6 +8,7 @@ communicating with the training engine backend.
 from xorl.server.api_server.engine_client import EngineClient
 from xorl.server.api_server.api_server import APIServer
 from xorl.server.api_server.api_types import (
+    TensorData,
     Datum,
     DatumInput,
     ForwardRequest,
@@ -34,6 +35,7 @@ __all__ = [
     "EngineClient",
     "APIServer",
     # Request/Response models
+    "TensorData",
     "Datum",
     "DatumInput",
     "ForwardRequest",

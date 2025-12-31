@@ -108,21 +108,64 @@ Train ML models from your laptop using GPU cluster compute. All compute happens 
    cd xorl
    ```
 
-2. Install Python Client (Lightweight)
+2. Install Python Client (xorl_client)
+
+   The recommended client library for interacting with the Xorl training server is **[xorl_client](https://github.com/xorl-org/xorl_client)** - a lightweight Python client.
 
    ```bash
-   # Install the lightweight client package (no PyTorch, no CUDA)
-   cd python-client
-   pip install -e .
+   # Install xorl_client client package (no PyTorch, no CUDA required)
+   pip install xorl_client
 
-   # Go back to main directory
-   cd ..
+   # Or install from source
+   git clone https://github.com/xorl-org/xorl_client.git
+   cd xorl_client
+   pip install -e .
 
    # Install dependencies for examples (optional)
    pip install transformers wandb
    ```
 
    Note: This installs only the lightweight client (~10 MB, installs in seconds). You do NOT need to install the full `xorl` package with PyTorch on your laptop - that stays on the GPU cluster.
+
+   **Quick Example using xorl_client:**
+
+   ```python
+   import xorl_client
+   from xorl_client import types
+
+   # Connect to the Xorl training server
+   training_client = xorl_client.ServiceClient(
+       base_url="http://localhost:6000"
+   ).create_lora_training_client(base_model="Qwen/Qwen3-4B-Instruct-2507")
+
+   # Get the tokenizer
+   tokenizer = training_client.get_tokenizer()
+
+   # Create training data
+   prompt = "English: hello world\nPig Latin:"
+   prompt_tokens = tokenizer.encode(prompt, add_special_tokens=True)
+   completion_tokens = tokenizer.encode(" ello-hay orld-way\n\n", add_special_tokens=False)
+
+   tokens = prompt_tokens + completion_tokens
+   weights = [0] * len(prompt_tokens) + [1] * len(completion_tokens)
+
+   input_tokens = tokens[:-1]
+   target_tokens = tokens[1:]
+   weights = weights[1:]
+
+   datum = types.Datum(
+       model_input=types.ModelInput.from_ints(tokens=input_tokens),
+       loss_fn_inputs=dict(weights=weights, target_tokens=target_tokens)
+   )
+
+   # Run forward-backward pass
+   fwdbwd_result = training_client.forward_backward([datum], "cross_entropy").result()
+   print(f"Loss: {fwdbwd_result.metrics['loss:mean']:.4f}")
+
+   # Run optimizer step
+   optim_result = training_client.optim_step(types.AdamParams(learning_rate=1e-4)).result()
+   print(f"Grad Norm: {optim_result.metrics['grad_norm']:.4f}")
+   ```
 
 3. Set SSH Key & Verify Access
 
@@ -231,7 +274,7 @@ docker-compose ps  # Check all are "healthy"
 ```
 
 ### Advanced Tips
-- more detailed：[python-client/README.md](./python-client/README.md)
+- For detailed client API documentation, see the [xorl_client repository](https://github.com/xorl-org/xorl_client)
 - Keep tunnels running in background with tmux:
   ```bash
   tmux new -s xorl-tunnels
