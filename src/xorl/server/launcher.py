@@ -35,6 +35,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import requests
 import uvicorn
 import yaml
 
@@ -118,6 +119,8 @@ def run_engine_core(
     inference_worker_urls: Optional[List[str]] = None,
     packing_seq_len: int = 32000,
     enable_packing: bool = True,
+    ready_event: Optional[mp.Event] = None,
+    output_dir: str = "outputs",
 ):
     """
     Run the EngineCore in a separate process.
@@ -130,19 +133,22 @@ def run_engine_core(
         max_pending_requests: Maximum pending requests in queue
         log_level: Logging level
         inference_worker_urls: URLs of inference workers for automatic weight updates
+        ready_event: Optional multiprocessing Event to signal when engine is ready
+        output_dir: Output directory for logs and checkpoints
     """
     # Setup logging first, outside try block
     import sys
     import os
 
-    # Create logs directory if it doesn't exist
-    os.makedirs("logs", exist_ok=True)
-    log_file = "logs/engine_core.log"
+    # Create logs directory under output_dir if it doesn't exist
+    logs_dir = os.path.join(output_dir, "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    log_file = os.path.join(logs_dir, "engine_core.log")
 
     # Setup logging to both file and stdout
     logging.basicConfig(
         level=getattr(logging, log_level),
-        format="[%(levelname)-8s][ENGINE] %(asctime)s >> %(message)s",
+        format="[%(levelname)s][ENGINE] %(asctime)s >> %(message)s",
         datefmt="%H:%M:%S",
         handlers=[
             logging.FileHandler(log_file, mode='w'),
@@ -180,6 +186,11 @@ def run_engine_core(
         engine.start()
         logger.info("Engine Core started successfully")
 
+        # Signal that engine is ready
+        if ready_event is not None:
+            ready_event.set()
+            logger.info("Signaled ready event to launcher")
+
         # Keep running
         while True:
             time.sleep(1)
@@ -206,6 +217,8 @@ def run_api_server(
     log_level: str = "INFO",
     default_timeout: float = 120.0,
     output_dir: str = "outputs",
+    base_model: Optional[str] = None,
+    storage_limit: str = "10TB",
 ):
     """
     Run the API Server in a separate process.
@@ -218,13 +231,15 @@ def run_api_server(
         log_level: Logging level
         default_timeout: Default timeout for engine operations
         output_dir: Output directory for checkpoints and sampler weights (must be on shared filesystem)
+        base_model: Base model name that this server is configured for (e.g., 'Qwen/Qwen2.5-3B-Instruct')
+        storage_limit: Maximum disk usage for output_dir (e.g., '1GB'). Default: 10TB.
     """
     from contextlib import asynccontextmanager
 
     # Setup logging for this process
     logging.basicConfig(
         level=getattr(logging, log_level),
-        format="[%(levelname)-8s][API] %(asctime)s >> %(message)s",
+        format="[%(levelname)s][API] %(asctime)s >> %(message)s",
         datefmt="%H:%M:%S"
     )
 
@@ -250,11 +265,15 @@ def run_api_server(
             """Custom lifecycle with configurable addresses."""
             logger.info("Starting APIServer with custom addresses...")
             logger.info(f"  output_dir: {output_dir}")
+            logger.info(f"  base_model: {base_model}")
+            logger.info(f"  storage_limit: {storage_limit}")
             api_module.api_server = APIServer(
                 engine_input_addr=engine_input_addr,
                 engine_output_addr=engine_output_addr,
                 default_timeout=default_timeout,
                 output_dir=output_dir,
+                base_model=base_model,
+                storage_limit=storage_limit,
             )
             await api_module.api_server.start()
             yield
@@ -349,6 +368,10 @@ def load_server_arguments(config_path: str) -> ServerArguments:
 
         # Output directory (can be in train section or top-level) - used for checkpoints, sampler weights, logs
         # Note: This uses output_dir from config, which should be on shared filesystem for multi-node
+        flat_config['output_dir'] = train_config.get('output_dir', config.get('output_dir', 'outputs'))
+
+        # Storage limit (can be in train section or top-level) - limits disk usage for output_dir
+        flat_config['storage_limit'] = train_config.get('storage_limit', config.get('storage_limit'))
 
         # Worker section
         worker_config = config.get('worker', {})
@@ -563,10 +586,29 @@ class Launcher:
             self.output_dir = "outputs"
             logger.info(f"Using default output_dir: {self.output_dir}")
 
+        # Base model - prefer from ServerArguments if available
+        if self.server_args:
+            self.base_model = self.server_args.model_path
+            logger.info(f"Using base_model from config: {self.base_model}")
+        else:
+            self.base_model = None
+            logger.info("No base_model configured (will not validate create_model requests)")
+
+        # Storage limit - prefer from ServerArguments if available
+        if self.server_args:
+            self.storage_limit = self.server_args.storage_limit
+            logger.info(f"Using storage_limit from config: {self.storage_limit}")
+        else:
+            self.storage_limit = "10TB"
+            logger.info(f"Using default storage_limit: {self.storage_limit}")
+
         # Processes and subprocesses
         self.worker_process: Optional[subprocess.Popen] = None  # torchrun subprocess
         self.engine_process: Optional[mp.Process] = None
         self.api_process: Optional[mp.Process] = None
+
+        # Event to signal when engine is ready
+        self.engine_ready_event: Optional[mp.Event] = None
 
         # Setup signal handling
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -577,6 +619,58 @@ class Launcher:
         logger.info(f"Received signal {signum}, shutting down...")
         self.stop()
         sys.exit(0)
+
+    def _save_initial_checkpoint(self, max_retries: int = 3, retry_delay: float = 5.0):
+        """
+        Save the initial checkpoint (000000) after all components are ready.
+
+        This captures the initial model state before any training operations,
+        allowing users to restore to the original state if needed.
+
+        Args:
+            max_retries: Maximum number of retry attempts
+            retry_delay: Delay in seconds between retries
+        """
+        logger.info("")
+        logger.info("=" * 70)
+        logger.info("Saving initial checkpoint (000000)...")
+        logger.info("=" * 70)
+
+        api_url = f"http://{self.api_host}:{self.api_port}/api/v1/save_weights"
+
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(
+                    api_url,
+                    json={
+                        "model_id": "default",
+                        "path": "000000",
+                    },
+                    timeout=self.operation_timeout,
+                )
+
+                if response.status_code == 200:
+                    result = response.json()
+                    logger.info(f"✓ Initial checkpoint saved: {result.get('path', '000000')}")
+                    return True
+                else:
+                    logger.warning(
+                        f"Failed to save initial checkpoint (attempt {attempt + 1}/{max_retries}): "
+                        f"HTTP {response.status_code} - {response.text}"
+                    )
+
+            except requests.exceptions.RequestException as e:
+                logger.warning(
+                    f"Failed to save initial checkpoint (attempt {attempt + 1}/{max_retries}): {e}"
+                )
+
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+
+        logger.error("✗ Failed to save initial checkpoint after all retries")
+        logger.warning("You can manually save the initial state by calling /api/v1/save_weights with path='000000'")
+        return False
 
     def _launch_workers_with_torchrun(self):
         """Launch distributed workers using torchrun."""
@@ -675,6 +769,9 @@ class Launcher:
             logger.info(f"  Log level:     {self.log_level}")
 
             try:
+                # Create event to signal when engine is ready
+                self.engine_ready_event = mp.Event()
+
                 self.engine_process = mp.Process(
                     target=run_engine_core,
                     args=(
@@ -688,6 +785,8 @@ class Launcher:
                         self.inference_worker_urls,
                         self.packing_seq_len,
                         self.enable_packing,
+                        self.engine_ready_event,
+                        self.output_dir,
                     ),
                     name="EngineCore",
                 )
@@ -725,11 +824,13 @@ class Launcher:
                 logger.error("  - Network/firewall issue")
                 raise RuntimeError(f"Engine Core failed to connect to worker (exit code: {exit_code})")
 
-            logger.info("✓ Engine Core started and connected to worker")
+            logger.info("✓ Engine Core process started, waiting for full initialization...")
 
             # Start API Server (connects to engine)
             logger.info("Starting API Server...")
             logger.info(f"  output_dir: {self.output_dir}")
+            logger.info(f"  base_model: {self.base_model}")
+            logger.info(f"  storage_limit: {self.storage_limit}")
             self.api_process = mp.Process(
                 target=run_api_server,
                 args=(
@@ -740,12 +841,33 @@ class Launcher:
                     self.log_level,
                     self.operation_timeout,
                     self.output_dir,
+                    self.base_model,
+                    self.storage_limit,
                 ),
                 name="APIServer",
             )
             self.api_process.start()
             time.sleep(2)  # Give API server time to start
             logger.info("✓ API Server started")
+
+            # Wait for engine to signal it's fully ready (after worker connection and startup tests)
+            logger.info("")
+            logger.info("Waiting for Engine Core to complete initialization...")
+            engine_ready_timeout = 300.0  # 5 minutes timeout for engine initialization
+            if self.engine_ready_event.wait(timeout=engine_ready_timeout):
+                logger.info("✓ Engine Core fully initialized")
+            else:
+                logger.error(f"✗ Engine Core did not signal ready within {engine_ready_timeout}s")
+                raise RuntimeError("Engine Core initialization timeout")
+
+            # Check if engine process is still alive
+            if not self.engine_process.is_alive():
+                exit_code = self.engine_process.exitcode
+                logger.error(f"✗ Engine Core process died during initialization (exit code: {exit_code})")
+                raise RuntimeError(f"Engine Core failed during initialization (exit code: {exit_code})")
+
+            # Save initial checkpoint (000) to capture the model state before any training
+            self._save_initial_checkpoint()
 
             logger.info("")
             logger.info("=" * 70)

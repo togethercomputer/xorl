@@ -394,6 +394,7 @@ def load_model_weights(
         # This should not be reached, but just in case
         if last_error:
             raise last_error
+
     for state_dict_iterator in tqdm(
         state_dict_iterators, desc="Loading checkpoint shards", disable=int(os.getenv("LOCAL_RANK", "-1")) > 0
     ):

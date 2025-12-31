@@ -13,7 +13,23 @@ from pydantic import BaseModel, Field
 # Type Aliases
 # ============================================================================
 
-InputType = Union[List[int], List[float], List[str]]
+
+class TensorData(BaseModel):
+    """Tensor data with dtype and shape metadata.
+
+    This format is used by xorl_client/tinker to pass tensor data with type information.
+    Example: {"data": [0, 0, 1, 1], "dtype": "float32", "shape": [4]}
+    """
+    data: List[Union[int, float, str]] = Field(..., description="Flattened tensor data")
+    dtype: str = Field(default="float32", description="Data type (e.g., 'float32', 'int64')")
+    shape: List[int] = Field(..., description="Tensor shape")
+
+    def tolist(self) -> List[Union[int, float, str]]:
+        """Return the data as a list (tinker API compatibility)."""
+        return self.data
+
+
+InputType = Union[List[int], List[float], List[str], TensorData]
 
 
 # ============================================================================
@@ -31,6 +47,21 @@ class Datum(BaseModel):
         description="Loss function input tensors (e.g., labels)"
     )
 
+    def to_plain_dict(self) -> Dict[str, Any]:
+        """Convert to plain dictionary with TensorData objects converted to lists.
+
+        This is used by the data processor which expects plain lists, not TensorData objects.
+        """
+        def convert_value(v: InputType) -> List[Union[int, float, str]]:
+            if isinstance(v, TensorData):
+                return v.data
+            return v
+
+        return {
+            "model_input": {k: convert_value(v) for k, v in self.model_input.items()},
+            "loss_fn_inputs": {k: convert_value(v) for k, v in self.loss_fn_inputs.items()},
+        }
+
 
 class DatumInput(BaseModel):
     """Input containing list of data examples and loss function."""
@@ -46,8 +77,28 @@ class DatumInput(BaseModel):
 
 
 class LossFnOutput(BaseModel):
-    """Single loss function output."""
-    loss: Optional[float] = Field(..., description="Loss value (None if NaN/Inf)")
+    """Single loss function output.
+
+    For standard loss functions, only 'loss' is populated.
+    For cross_entropy with return_per_token=True (tinker API compatibility),
+    'logprobs' and 'elementwise_loss' contain per-token TensorData.
+
+    Note: This model excludes None values from serialization to match tinker's
+    Dict[str, TensorData] format which only contains populated fields.
+    """
+    loss: Optional[float] = Field(default=None, description="Loss value (for backward compatibility)")
+    logprobs: Optional[TensorData] = Field(default=None, description="Per-token log probabilities")
+    elementwise_loss: Optional[TensorData] = Field(default=None, description="Per-token cross entropy loss")
+
+    def model_dump(self, **kwargs):
+        """Override to always exclude None values for tinker compatibility."""
+        kwargs.setdefault("exclude_none", True)
+        return super().model_dump(**kwargs)
+
+    def model_dump_json(self, **kwargs):
+        """Override to always exclude None values for JSON serialization."""
+        kwargs.setdefault("exclude_none", True)
+        return super().model_dump_json(**kwargs)
 
 
 class AdamParams(BaseModel):
@@ -64,7 +115,7 @@ class AdamParams(BaseModel):
 
 class ForwardRequest(BaseModel):
     """API request for forward operation."""
-    model_id: str = Field(default="default", description="Model identifier")
+    model_id: str = Field(default="default", description="Model identifier (must be created via /api/v1/create_model first)")
     forward_input: DatumInput = Field(
         ...,
         description="Forward input data"
@@ -85,7 +136,8 @@ class ForwardResponse(BaseModel):
 
 class ForwardBackwardRequest(BaseModel):
     """API request for forward-backward operation."""
-    model_id: str = Field(default="default", description="Model identifier")
+    model_id: str = Field(default="default", description="Model identifier (must be created via /api/v1/create_model first)")
+    seq_id: Optional[int] = Field(default=None, description="Sequence ID for request ordering (ensures forward_backward executes before optim_step)")
     forward_backward_input: DatumInput = Field(
         ...,
         description="Forward-backward input data"
@@ -102,7 +154,8 @@ class ForwardBackwardResponse(BaseModel):
 
 class OptimStepRequest(BaseModel):
     """API request for optimizer step."""
-    model_id: str = Field(default="default", description="Model identifier")
+    model_id: str = Field(default="default", description="Model identifier (must be created via /api/v1/create_model first)")
+    seq_id: Optional[int] = Field(default=None, description="Sequence ID for request ordering (ensures forward_backward executes before optim_step)")
     adam_params: AdamParams = Field(default_factory=AdamParams, description="AdamW optimizer parameters")
     gradient_clip: Optional[float] = Field(default=None, description="Gradient clipping value")
 
@@ -124,7 +177,7 @@ class Prompt(BaseModel):
 
 class SampleRequest(BaseModel):
     """API request for sampling/generation."""
-    model_id: str = Field(default="default", description="Model identifier")
+    model_id: str = Field(default="default", description="Model identifier (must be created via /api/v1/create_model first)")
     prompts: List[Prompt] = Field(..., description="List of prompts to generate from")
     max_new_tokens: int = Field(default=256, description="Maximum number of tokens to generate")
     temperature: float = Field(default=1.0, description="Sampling temperature (higher = more random)")
@@ -151,32 +204,64 @@ class SampleResponse(BaseModel):
 # ============================================================================
 
 class SaveWeightsRequest(BaseModel):
-    """API request for saving weights."""
+    """API request for saving weights (checkpoint).
+
+    Endpoint: POST /api/v1/save_weights
+    """
     model_id: str = Field(default="default", description="Model identifier")
-    path: Optional[str] = Field(default=None, description="Checkpoint name/path (auto-generated if not specified)")
-    save_optimizer: bool = Field(default=True, description="Whether to save optimizer state")
+    path: Optional[str] = Field(default=None, description="Checkpoint name (e.g., 'checkpoint-001'). Auto-generated if not specified.")
+    seq_id: Optional[int] = Field(default=None, description="Sequence ID for request ordering")
+    # Note: save_optimizer is always True - we always save full state for checkpointing
 
 
 class SaveWeightsResponse(BaseModel):
-    """API response for saving weights."""
-    path: str = Field(..., description="Checkpoint path (local path, TODO: s3/r2 path)")
+    """API response for saving weights.
+
+    Returns a xorl:// URI pointing to the saved checkpoint.
+    """
+    path: str = Field(..., description="Xorl URI (e.g., xorl://default/weights/checkpoint-001)")
 
 
 class LoadWeightsRequest(BaseModel):
-    """API request for loading weights."""
+    """API request for loading weights.
+
+    Endpoint: POST /api/v1/load_weights
+    """
     model_id: str = Field(default="default", description="Model identifier")
-    path: str = Field(..., description="Checkpoint path (local path, TODO: s3/r2 path)")
-    load_optimizer: bool = Field(default=True, description="Whether to load optimizer state")
+    path: str = Field(..., description="Xorl URI to load from (e.g., xorl://default/weights/checkpoint-001)")
+    optimizer: bool = Field(default=False, description="Whether to load optimizer state")
+    seq_id: Optional[int] = Field(default=None, description="Sequence ID for request ordering")
 
 
 class LoadWeightsResponse(BaseModel):
     """API response for loading weights."""
-    success: bool = Field(..., description="Whether the load was successful")
+    path: str = Field(..., description="Xorl URI that was loaded")
+
+
+class WeightsInfoRequest(BaseModel):
+    """API request for getting checkpoint metadata.
+
+    Endpoint: POST /api/v1/weights_info
+
+    This mirrors tinker's weights_info endpoint for compatibility.
+    The xorl_path is the checkpoint URI (e.g., "xorl://default/weights/checkpoint-001").
+    """
+    xorl_path: str = Field(..., description="Xorl URI to the checkpoint")
+
+
+class WeightsInfoResponse(BaseModel):
+    """API response for checkpoint metadata.
+
+    Returns minimal information needed to resume training from a checkpoint.
+    """
+    base_model: str = Field(..., description="Base model name (e.g., 'Qwen/Qwen2.5-3B-Instruct')")
+    is_lora: bool = Field(default=True, description="Whether this is a LoRA checkpoint")
+    lora_rank: Optional[int] = Field(default=None, description="LoRA rank (if is_lora=True)")
 
 
 class CreateModelRequest(BaseModel):
     """API request for creating a new model."""
-    model_id: str = Field(..., description="Model identifier")
+    model_id: str = Field(default="default", description="Model identifier")
     base_model: str = Field(..., description="Base model name (e.g., 'Qwen/Qwen2.5-3B-Instruct')")
     lora_config: Dict[str, Any] = Field(..., description="LoRA configuration (rank, alpha, etc.)")
 
@@ -201,7 +286,7 @@ class RegisterWorkersResponse(BaseModel):
 
 class SaveWeightsForSamplerRequest(BaseModel):
     """API request for saving weights in inference-compatible format."""
-    model_id: str = Field(default="default", description="Model identifier")
+    model_id: str = Field(default="default", description="Model identifier (must be created via /api/v1/create_model first)")
     name: str = Field(..., description="Checkpoint name (e.g., 'step-100')")
 
 
@@ -213,13 +298,55 @@ class SaveWeightsForSamplerResponse(BaseModel):
 
 class SaveLoRAOnlyRequest(BaseModel):
     """API request for saving only LoRA adapter weights."""
-    model_id: str = Field(default="default", description="Model identifier")
+    model_id: str = Field(default="default", description="Model identifier (must be created via /api/v1/create_model first)")
     lora_path: Optional[str] = Field(default=None, description="LoRA save path (auto-generated if not specified)")
 
 
 class SaveLoRAOnlyResponse(BaseModel):
     """API response for saving LoRA weights."""
     lora_path: str = Field(..., description="LoRA adapter path")
+
+
+# ============================================================================
+# Checkpoint Management Operations
+# ============================================================================
+
+class CheckpointInfo(BaseModel):
+    """Information about a single checkpoint."""
+    checkpoint_id: str = Field(..., description="The checkpoint ID (e.g., 'weights/000' or 'sampler_weights/step-100')")
+    checkpoint_type: Literal["training", "sampler"] = Field(..., description="The type of checkpoint")
+    time: str = Field(..., description="ISO format timestamp when the checkpoint was created")
+    path: str = Field(..., description="The xorl:// path to the checkpoint")
+    size_bytes: Optional[int] = Field(default=None, description="The size of the checkpoint in bytes")
+
+
+class ListCheckpointsRequest(BaseModel):
+    """API request for listing checkpoints."""
+    model_id: str = Field(default="default", description="Model identifier")
+
+
+class ListCheckpointsResponse(BaseModel):
+    """API response for listing checkpoints.
+
+    Returns all available checkpoints for the specified model.
+    """
+    checkpoints: List[CheckpointInfo] = Field(default_factory=list, description="List of available checkpoints")
+
+
+class DeleteCheckpointRequest(BaseModel):
+    """API request for deleting a checkpoint.
+
+    The checkpoint_id should be in the format 'weights/{name}' or 'sampler_weights/{name}'.
+    """
+    model_id: str = Field(default="default", description="Model identifier")
+    checkpoint_id: str = Field(..., description="Checkpoint ID to delete (e.g., 'weights/000' or 'sampler_weights/step-100')")
+
+
+class DeleteCheckpointResponse(BaseModel):
+    """API response for deleting a checkpoint."""
+    success: bool = Field(..., description="Whether the deletion was successful")
+    deleted_path: Optional[str] = Field(default=None, description="The xorl:// path that was deleted")
+    error: Optional[str] = Field(default=None, description="Error message if deletion failed")
 
 
 # ============================================================================
@@ -255,7 +382,7 @@ class UpdateDedicatedEndpointRequest(BaseModel):
     4. Wait for model to be ready
     5. Probe endpoint to verify adapter is loaded
     """
-    model_id: str = Field(default="default", description="Model identifier")
+    model_id: str = Field(default="default", description="Model identifier (must be created via /api/v1/create_model first)")
     name: str = Field(..., description="Checkpoint name (e.g., 'step-000001')")
     endpoint_id: str = Field(..., description="Together dedicated endpoint ID")
     together_api_key: str = Field(..., description="Together API key")
@@ -288,7 +415,7 @@ class UpdateDedicatedEndpointResponse(BaseModel):
 
 class UpdateServerlessWeightsRequest(BaseModel):
     """API request for updating weights on Together AI serverless inference."""
-    model_id: str = Field(default="default", description="Model identifier")
+    model_id: str = Field(default="default", description="Model identifier (must be created via /api/v1/create_model first)")
     name: str = Field(..., description="Checkpoint name (e.g., 'step-001')")
     together_api_key: str = Field(..., description="Together AI API key")
     hf_token: str = Field(..., description="HuggingFace token with write access")
@@ -429,3 +556,37 @@ class SyncInferenceWeightsResponse(BaseModel):
         default_factory=list,
         description="Sync results for each endpoint"
     )
+
+
+# ============================================================================
+# Training Runs
+# ============================================================================
+
+class Cursor(BaseModel):
+    """Pagination cursor information."""
+    offset: int = Field(..., description="The offset used for pagination")
+    limit: int = Field(..., description="The maximum number of items requested")
+    total_count: int = Field(..., description="The total number of items available")
+
+
+class TrainingRun(BaseModel):
+    """Information about a training run.
+
+    Note: In xorl_client, there is only a single training run with model_id="default".
+    """
+    training_run_id: str = Field(..., description="The unique identifier for the training run")
+    base_model: str = Field(..., description="The base model name this model is derived from")
+    model_owner: str = Field(default="local", description="The owner/creator of this model")
+    is_lora: bool = Field(default=True, description="Whether this model uses LoRA")
+    corrupted: bool = Field(default=False, description="Whether the model is in a corrupted state")
+    lora_rank: Optional[int] = Field(default=None, description="The LoRA rank if this is a LoRA model")
+    last_request_time: str = Field(..., description="ISO timestamp of the last request made to this model")
+    last_checkpoint: Optional[CheckpointInfo] = Field(default=None, description="The most recent training checkpoint")
+    last_sampler_checkpoint: Optional[CheckpointInfo] = Field(default=None, description="The most recent sampler checkpoint")
+    user_metadata: Optional[Dict[str, str]] = Field(default=None, description="Optional metadata about this training run")
+
+
+class TrainingRunsResponse(BaseModel):
+    """Response from list_training_runs operation."""
+    training_runs: List[TrainingRun] = Field(..., description="List of training runs")
+    cursor: Cursor = Field(..., description="Pagination cursor information")
