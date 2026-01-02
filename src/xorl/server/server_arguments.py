@@ -48,6 +48,11 @@ class ServerArguments:
         metadata={"help": "Path to pre-trained model (HF Hub or local path)"}
     )
 
+    model_name: Optional[str] = field(
+        default=None,
+        metadata={"help": "Model identifier for validation (e.g., 'Qwen/Qwen3-32B'). Defaults to model_path if not specified."}
+    )
+
     config_path: Optional[str] = field(
         default=None,
         metadata={"help": "Path to model config. Defaults to model_path"}
