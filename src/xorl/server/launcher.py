@@ -339,6 +339,7 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
         # Model section
         model_config = config.get('model', {})
         flat_config['model_path'] = model_config.get('model_path')
+        flat_config['model_name'] = model_config.get('model_name')
         flat_config['config_path'] = model_config.get('config_path')
         flat_config['tokenizer_path'] = model_config.get('tokenizer_path')
         flat_config['attn_implementation'] = model_config.get('attn_implementation', 'flash_attention_2')
@@ -601,9 +602,10 @@ class Launcher:
             self.output_dir = "outputs"
             logger.info(f"Using default output_dir: {self.output_dir}")
 
-        # Base model - prefer from ServerArguments if available
+        # Base model - prefer model_name from ServerArguments if available, otherwise use model_path
         if self.server_args:
-            self.base_model = self.server_args.model_path
+            # Use model_name for validation if specified, otherwise fall back to model_path
+            self.base_model = self.server_args.model_name or self.server_args.model_path
             logger.info(f"Using base_model from config: {self.base_model}")
         else:
             self.base_model = None

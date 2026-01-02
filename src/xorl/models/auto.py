@@ -66,6 +66,13 @@ def build_foundation_model(
         config._moe_implementation = moe_implementation
         logger.info_rank0(f"Moe implementation: {moe_implementation}")
 
+    # Validate attention implementation for packed sequences with FlashAttention kwargs
+    if attn_implementation == "sdpa":
+        raise ValueError(
+            "attn_implementation='sdpa' is not supported for packed sequences with sequence parallelism. "
+            "Please use 'flash_attention_2' or 'flash_attention_3' for correct cu_seqlens handling."
+        )
+
     loader: Optional[BaseModelLoader] = get_loader(config, force_use_huggingface)
 
     if not force_use_huggingface:

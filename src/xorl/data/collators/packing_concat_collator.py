@@ -1,11 +1,14 @@
 from dataclasses import dataclass
 from typing import Dict, Sequence, Tuple
+import logging
 
 import torch
 from torch.utils.data._utils.collate import default_collate
 from ...distributed.parallel_state import get_parallel_state
 from ...utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 from .base_collator import DataCollator
+
+logger = logging.getLogger(__name__)
 
 
 
@@ -70,6 +73,9 @@ class PackingConcatCollator(DataCollator):
         if not features:
             raise ValueError("PackingConcatCollator received empty features list")
 
+        import logging
+        logger = logging.getLogger(__name__)
+
         # Input should be a flat list of dicts from FlattenCollator
         assert isinstance(features[0], dict), (
             f"Expected dict from FlattenCollator, but got {type(features[0]).__name__}"
@@ -78,7 +84,8 @@ class PackingConcatCollator(DataCollator):
         batch = {}
         for input_name in features[0].keys():
             # Handle 1D tensors (input_ids, labels, etc.) and 2D tensors (hidden_states, hidden_states_scale)
-            if input_name in ("input_ids", "attention_mask", "labels", "position_ids"):
+            # IMPORTANT: loss_fn_inputs fields (target_tokens, logprobs, advantages) must be concatenated, not batched!
+            if input_name in ("input_ids", "attention_mask", "labels", "position_ids", "target_tokens", "logprobs", "advantages"):
                 # 1D tensors: concatenate along sequence dimension
                 tensors = [feature[input_name] for feature in features]
 
@@ -170,6 +177,7 @@ class PackingConcatCollator(DataCollator):
 
         # cu_seq_lens_q should equal to cu_seq_lens_k and max_length_q should equal to max_length_k
         if "position_ids" in batch:
+
             if not get_parallel_state().sp_enabled:
                 # We only enter here to pass down cu_seqlens and max_length when sequence parallelism is not enabled.
                 # When sp_enabled is True, position_ids will be padded later, so we calculate them after padding
@@ -178,8 +186,32 @@ class PackingConcatCollator(DataCollator):
                 # Still need cu_seq_lens_q for label masking even when sp_enabled
                 (cu_seq_lens_q, _), (_, _) = prepare_fa_kwargs_from_position_ids(batch["position_ids"])
 
-        # if "labels" in batch:
-        #     batch["labels"][:, cu_seq_lens_q[1:-1]] = IGNORE_INDEX
+            # CRITICAL BUGFIX: Mask advantages at packed sequence boundaries
+            # The last token of each packed sequence should NOT predict the first token of the next sequence
+            # because they belong to different contexts. This prevents cross-sequence attention leakage.
+            #
+            # IMPORTANT: pos2culen returns boundaries in FLATTENED coordinates (0...B*T-1),
+            # so we must mask in flattened space, not as column indices.
+            #
+            # For importance_sampling loss, we mask ADVANTAGES (not labels), because that's what
+            # controls which tokens contribute to the loss.
+            if "advantages" in batch and cu_seq_lens_q.numel() > 2:
+                # cu_seq_lens_q[1:-1] gives the start indices of sequences 2, 3, ..., N in flattened coordinates
+                # We want to mask the LAST token of sequences 1, 2, ..., N-1
+                advantages = batch["advantages"].clone()
+                advantages_flat = advantages.view(-1)  # flatten to match cu_seqlens coordinate system
+                boundary_last_token_idx = cu_seq_lens_q[1:-1] - 1  # last token of each segment except the final segment
+                advantages_flat[boundary_last_token_idx] = 0.0  # Set advantage to 0 to exclude from loss
+                batch["advantages"] = advantages_flat.view_as(advantages)  # reshape back to original shape
+
+            # Also mask labels for compatibility with other loss functions
+            IGNORE_INDEX = -100
+            if "labels" in batch and cu_seq_lens_q.numel() > 2:
+                labels = batch["labels"].clone()
+                labels_flat = labels.view(-1)
+                boundary_last_token_idx = cu_seq_lens_q[1:-1] - 1
+                labels_flat[boundary_last_token_idx] = IGNORE_INDEX
+                batch["labels"] = labels_flat.view_as(labels)
 
         return batch
 

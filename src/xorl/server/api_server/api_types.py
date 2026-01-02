@@ -107,6 +107,8 @@ class AdamParams(BaseModel):
     beta1: float = Field(default=0.9, description="First moment coefficient")
     beta2: float = Field(default=0.95, description="Second moment coefficient")
     eps: float = Field(default=1e-12, description="Numerical stability term")
+    weight_decay: float = Field(default=0.0, description="Weight decay (decoupled)")
+    grad_clip_norm: float = Field(default=0.0, description="Gradient clipping norm (0.0 = no clipping)")
 
 
 # ============================================================================
@@ -220,6 +222,7 @@ class SaveWeightsResponse(BaseModel):
     Returns a xorl:// URI pointing to the saved checkpoint.
     """
     path: str = Field(..., description="Xorl URI (e.g., xorl://default/weights/checkpoint-001)")
+    warning: Optional[str] = Field(default=None, description="Warning message if checkpoint already existed")
 
 
 class LoadWeightsRequest(BaseModel):
@@ -462,18 +465,25 @@ class InferenceEndpointServerInfo(BaseModel):
 class InferenceEndpoint(BaseModel):
     """Represents a single inference endpoint."""
     host: str = Field(..., description="Hostname or IP address of the inference endpoint")
-    port: int = Field(..., description="Port number of the inference endpoint")
+    port: int = Field(..., description="Port number of the SGLang server")
+    worker_port: int = Field(..., description="Port number of the inference worker (HTTP API wrapper)")
     world_size: int = Field(default=1, description="Number of workers at this endpoint")
     healthy: bool = Field(default=True, description="Whether the endpoint is healthy")
     server_info: Optional[InferenceEndpointServerInfo] = Field(
         default=None, description="Server info from the inference endpoint"
     )
 
+    @property
+    def worker_url(self) -> str:
+        """Compute the inference worker URL for /api/update_weights calls."""
+        return f"http://{self.host}:{self.worker_port}"
+
 
 class AddInferenceEndpointRequest(BaseModel):
     """API request for adding an inference endpoint."""
     host: str = Field(..., description="Hostname or IP address of the inference endpoint")
-    port: int = Field(..., description="Port number of the inference endpoint")
+    port: int = Field(..., description="Port number of the SGLang server")
+    worker_port: Optional[int] = Field(default=None, description="Port number of the inference worker (if None, defaults to port - 1 for backwards compatibility)")
     world_size: int = Field(default=1, description="Number of workers at this endpoint")
     # Auto-sync configuration
     sync_weights: bool = Field(

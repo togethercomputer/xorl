@@ -185,7 +185,6 @@ class TextSequenceShardCollator(DataCollator):
                 field_tensor = self.sp_padding(field_tensor, dim=-1, pad_value=pad_value, pad_length=pad_length)
                 batch[field] = self.sp_slice(field_tensor, dim=-1)
 
-        # Calculate Flash Attention kwargs from FULL padded position_ids
         add_flash_attention_kwargs_from_position_ids(batch)
 
         return batch
