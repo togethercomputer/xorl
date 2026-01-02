@@ -21,7 +21,7 @@ dependencies = [
   "torchdata>=0.8.0,<1.0",
   "tiktoken>=0.9.0",
   "diffusers>=0.30.0,<=0.31.0",
-  "transformers[torch]>=4.51.3,<4.57.0",
+  "transformers[torch]>=4.51.3",
   "psutil",
   "timm",
   "wandb",
@@ -36,6 +36,15 @@ dependencies = [
   "msgpack",
   "fastapi",
   "peft",
+  "sglang>=0.5.7",
+  "flashinfer-python>=0.5.3",
+  "torch==2.9.1+cu128",
+  "torchvision",
+  "torchaudio",
+  "liger-kernel",
+  "flash-attn",
+  "nvidia-nccl-cu12==2.27.5",
+  "ninja>=1.13.0",
 ]
 
 [project.optional-dependencies]
@@ -43,25 +52,17 @@ dependencies = [
 dev = [
   "pre-commit>=4.0.0,<5.0",
   "ruff>=0.7.0,<1.0",
-  "pytest>=6.0.0,<8.0",
+  "pytest>=9.0.2",
   "expecttest>=0.3.0,<0.4"
-]
-gpu =[
-  "torch==2.9.1+cu128",
-  "torchvision",
-  "torchaudio",
-  "liger-kernel",
-  "flash-attn-3",
-  "nvidia-nccl-cu12==2.27.5",
 ]
 # Dedicated endpoint integration (for Together AI dedicated endpoints)
 dedicated-endpoint = [
-  "together>=1.0.0",
-  "huggingface_hub>=0.20.0",
+#  "together>=1.0.0",
+#  "huggingface_hub>=0.20.0",
 ]
 # Serverless inference (for Together AI serverless LoRA inference)
 serverless = [
-  "huggingface_hub>=0.20.0",
+#  "huggingface_hub>=0.20.0",
 ]
 
 
@@ -92,10 +93,6 @@ test = [
 #         version and release new docker images.
 required-version = ">=0.8.14"
 
-find-links = [
-  "https://windreamer.github.io/flash-attention3-wheels/cu128_torch291",
-]
-
 [[tool.uv.index]]
 name = "pytorch"
 url = "https://download.pytorch.org/whl/cu128"
@@ -105,6 +102,11 @@ explicit = true
 torch = { index = "pytorch" }
 torchvision = { index = "pytorch" }
 torchaudio = { index = "pytorch" }
+flash-attn = [
+  { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.0/flash_attn-2.8.3+cu128torch2.9-cp310-cp310-linux_x86_64.whl", marker = "python_version == '3.10'" },
+  { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.0/flash_attn-2.8.3+cu128torch2.9-cp311-cp311-linux_x86_64.whl", marker = "python_version == '3.11'" },
+  { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.0/flash_attn-2.8.3+cu128torch2.9-cp312-cp312-linux_x86_64.whl", marker = "python_version == '3.12'" },
+]
 
 
 [tool.setuptools.dynamic]
