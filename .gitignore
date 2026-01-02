@@ -29,6 +29,7 @@ env.bak/
 venv.bak/
 checkpoints/
 outputs/
+uv.lock
 # ides
 .idea/
 .vscode/
