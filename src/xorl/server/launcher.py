@@ -307,7 +307,7 @@ def run_api_server(
 # Configuration Parsing
 # ============================================================================
 
-def load_server_arguments(config_path: str) -> ServerArguments:
+def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] = None) -> ServerArguments:
     """
     Load ServerArguments from a YAML configuration file.
 
@@ -316,6 +316,8 @@ def load_server_arguments(config_path: str) -> ServerArguments:
 
     Args:
         config_path: Path to server config YAML
+        overrides: Optional dict of CLI overrides to apply on top of YAML config.
+                   Keys should be ServerArguments field names (e.g., 'output_dir', 'lora_rank').
 
     Returns:
         ServerArguments instance with all fields populated
@@ -389,6 +391,15 @@ def load_server_arguments(config_path: str) -> ServerArguments:
             if value is None:
                 if key in ['config_path', 'tokenizer_path']:
                     del filtered_config[key]
+
+    # Apply CLI overrides on top of YAML config
+    if overrides:
+        for key, value in overrides.items():
+            if key in valid_fields:
+                filtered_config[key] = value
+                logger.info(f"  CLI override: {key} = {value}")
+            else:
+                logger.warning(f"  Unknown override key ignored: {key}")
 
     logger.info(f"Loaded ServerArguments from: {config_path}")
     logger.info(f"  model_path: {filtered_config.get('model_path', 'N/A')}")
@@ -474,6 +485,8 @@ class Launcher:
         # Data processing parameters
         packing_seq_len: int = 32000,
         enable_packing: bool = True,
+        # Server config overrides (from --server.* CLI args)
+        server_overrides: Optional[Dict[str, any]] = None,
     ):
         """
         Initialize the launcher.
@@ -491,6 +504,7 @@ class Launcher:
             nnodes: Number of nodes for distributed training (auto mode)
             master_addr: Master address for torch distributed (auto mode)
             master_port: Master port for torch distributed (auto mode)
+            server_overrides: Dict of ServerArguments field overrides from CLI (e.g., {'output_dir': '/tmp/out'})
         """
         self.mode = mode
         self.config_path = config_path
@@ -502,6 +516,7 @@ class Launcher:
         self.inference_worker_urls = inference_worker_urls or []
         self.packing_seq_len = packing_seq_len
         self.enable_packing = enable_packing
+        self.server_overrides = server_overrides or {}
 
         # Validate mode
         if mode not in ["auto", "connect"]:
@@ -515,7 +530,7 @@ class Launcher:
         self.server_args: Optional[ServerArguments] = None
         if config_path:
             try:
-                self.server_args = load_server_arguments(config_path)
+                self.server_args = load_server_arguments(config_path, overrides=self.server_overrides)
                 logger.info("Successfully loaded ServerArguments from config")
                 logger.info(f"  model_path: {self.server_args.model_path}")
                 logger.info(f"  data_parallel_mode: {self.server_args.data_parallel_mode}")
@@ -699,6 +714,14 @@ class Launcher:
             self.config_path,
             f"--worker.bind_address={self.worker_address}",
         ]
+
+        # Pass server overrides to worker as CLI arguments
+        # The worker's parse_server_args() will apply these on top of YAML config
+        for key, value in self.server_overrides.items():
+            if isinstance(value, bool):
+                cmd.append(f"--{key}={str(value).lower()}")
+            else:
+                cmd.append(f"--{key}={value}")
 
         logger.info(f"Running: {' '.join(cmd)}")
         logger.info("")
@@ -963,8 +986,66 @@ class Launcher:
 # CLI
 # ============================================================================
 
+def parse_server_overrides(argv: List[str]) -> Tuple[List[str], Dict[str, any]]:
+    """
+    Parse --server.* arguments from command line.
+
+    Extracts arguments like --server.output_dir=/tmp/out or --server.lora_rank 64
+    and returns them as a dict of overrides.
+
+    Args:
+        argv: Command line arguments (typically sys.argv[1:])
+
+    Returns:
+        Tuple of (remaining_args, server_overrides_dict)
+    """
+    remaining_args = []
+    server_overrides = {}
+    i = 0
+
+    while i < len(argv):
+        arg = argv[i]
+        if arg.startswith("--server."):
+            # Extract key and value
+            key_part = arg[9:]  # Remove "--server."
+
+            if "=" in key_part:
+                # Format: --server.key=value
+                key, value = key_part.split("=", 1)
+            elif i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                # Format: --server.key value
+                key = key_part
+                value = argv[i + 1]
+                i += 1
+            else:
+                # Boolean flag: --server.enable_lora (implies True)
+                key = key_part
+                value = "true"
+
+            # Convert value to appropriate type
+            if value.lower() in ("true", "false"):
+                value = value.lower() == "true"
+            elif value.replace(".", "", 1).replace("-", "", 1).isdigit():
+                value = float(value) if "." in value else int(value)
+
+            server_overrides[key] = value
+        else:
+            remaining_args.append(arg)
+        i += 1
+
+    return remaining_args, server_overrides
+
+
 def main():
     """Main entry point."""
+    # First, extract --server.* overrides before argparse
+    remaining_args, server_overrides = parse_server_overrides(sys.argv[1:])
+
+    if server_overrides:
+        logger.info("Server config overrides from CLI:")
+        for key, value in server_overrides.items():
+            logger.info(f"  --server.{key} = {value}")
+
     parser = argparse.ArgumentParser(
         description="Launch XORL Training Server",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -974,6 +1055,12 @@ Examples:
   # Auto-launch mode (world size automatically calculated from config)
   python -m xorl.server.launcher --mode auto --config examples/qwen3/sft.yaml
 
+  # Override config values via CLI
+  python -m xorl.server.launcher --mode auto --config server.yaml \\
+    --server.output_dir /custom/output \\
+    --server.lora_rank 64 \\
+    --server.enable_lora true
+
   # Connect mode (workers launched separately)
   # Terminal 1: Launch workers manually
   torchrun --nnodes=1 --nproc-per-node=8 -m xorl.server.worker.distributed_model_worker \\
@@ -982,10 +1069,19 @@ Examples:
   # Terminal 2: Launch API server and engine
   python -m xorl.server.launcher --mode connect --worker-address tcp://127.0.0.1:5556
 
+Server Config Overrides (--server.*):
+  Any ServerArguments field can be overridden via --server.<field_name> <value>
+  Examples:
+    --server.output_dir /tmp/outputs
+    --server.lora_rank 64
+    --server.enable_lora true
+    --server.ulysses_parallel_size 4
+    --server.packing_seq_len 64000
+
 Note:
   World size is ALWAYS calculated from the config file parallelism settings:
     world_size = pp_size * dp_replicate_size * dp_shard_size * ulysses_size * cp_size * tp_size
-  And EP creates a separate 2D mesh where: world_size = ep_size * ep_fsdp_size; 
+  And EP creates a separate 2D mesh where: world_size = ep_size * ep_fsdp_size;
   ep_fsdp_size will be automatically calculated through world_size / ep_size;
   Example config:
     train:
@@ -1089,7 +1185,8 @@ Note:
         help="Master port for torch distributed (auto mode, default: 29500)"
     )
 
-    args = parser.parse_args()
+    # Parse only the remaining args (after extracting --server.* overrides)
+    args = parser.parse_args(remaining_args)
 
     # Create and start launcher
     launcher = Launcher(
@@ -1106,6 +1203,7 @@ Note:
         nnodes=args.nnodes,
         master_addr=args.master_addr,
         master_port=args.master_port,
+        server_overrides=server_overrides,
     )
 
     launcher.start()
