@@ -449,14 +449,27 @@ def parse_server_args() -> ServerArguments:
         raise ValueError(f"Empty config file: {config_path}")
 
     # Process CLI overrides (--bind_address, --connection_timeout, etc.)
+    # Supports both --key=value and --key value formats
     cli_overrides = {}
     i = 1
     while i < len(sys.argv):
         arg = sys.argv[i]
         if arg.startswith('--') and not arg.startswith('---'):
-            key = arg[2:]  # Remove '--'
-            if i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith('--'):
-                # Convert string values to appropriate types
+            key_part = arg[2:]  # Remove '--'
+
+            # Check for --key=value format
+            if '=' in key_part:
+                key, value = key_part.split('=', 1)
+                # Try to parse as number or boolean
+                if value.lower() in ('true', 'false'):
+                    value = value.lower() == 'true'
+                elif value.replace('.', '', 1).replace('-', '', 1).isdigit():
+                    value = float(value) if '.' in value else int(value)
+                cli_overrides[key] = value
+                i += 1
+            elif i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith('--'):
+                # --key value format
+                key = key_part
                 value = sys.argv[i + 1]
                 # Try to parse as number or boolean
                 if value.lower() in ('true', 'false'):
