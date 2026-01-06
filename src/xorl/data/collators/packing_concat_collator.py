@@ -195,23 +195,23 @@ class PackingConcatCollator(DataCollator):
             #
             # For importance_sampling loss, we mask ADVANTAGES (not labels), because that's what
             # controls which tokens contribute to the loss.
-            if "advantages" in batch and cu_seq_lens_q.numel() > 2:
-                # cu_seq_lens_q[1:-1] gives the start indices of sequences 2, 3, ..., N in flattened coordinates
-                # We want to mask the LAST token of sequences 1, 2, ..., N-1
-                advantages = batch["advantages"].clone()
-                advantages_flat = advantages.view(-1)  # flatten to match cu_seqlens coordinate system
-                boundary_last_token_idx = cu_seq_lens_q[1:-1] - 1  # last token of each segment except the final segment
-                advantages_flat[boundary_last_token_idx] = 0.0  # Set advantage to 0 to exclude from loss
-                batch["advantages"] = advantages_flat.view_as(advantages)  # reshape back to original shape
+            # if "advantages" in batch and cu_seq_lens_q.numel() > 2:
+            #     # cu_seq_lens_q[1:-1] gives the start indices of sequences 2, 3, ..., N in flattened coordinates
+            #     # We want to mask the LAST token of sequences 1, 2, ..., N-1
+            #     advantages = batch["advantages"].clone()
+            #     advantages_flat = advantages.view(-1)  # flatten to match cu_seqlens coordinate system
+            #     boundary_last_token_idx = cu_seq_lens_q[1:-1] - 1  # last token of each segment except the final segment
+            #     advantages_flat[boundary_last_token_idx] = 0.0  # Set advantage to 0 to exclude from loss
+            #     batch["advantages"] = advantages_flat.view_as(advantages)  # reshape back to original shape
 
             # Also mask labels for compatibility with other loss functions
-            IGNORE_INDEX = -100
-            if "labels" in batch and cu_seq_lens_q.numel() > 2:
-                labels = batch["labels"].clone()
-                labels_flat = labels.view(-1)
-                boundary_last_token_idx = cu_seq_lens_q[1:-1] - 1
-                labels_flat[boundary_last_token_idx] = IGNORE_INDEX
-                batch["labels"] = labels_flat.view_as(labels)
+            # IGNORE_INDEX = -100
+            # if "labels" in batch and cu_seq_lens_q.numel() > 2:
+            #     labels = batch["labels"].clone()
+            #     labels_flat = labels.view(-1)
+            #     boundary_last_token_idx = cu_seq_lens_q[1:-1] - 1
+            #     labels_flat[boundary_last_token_idx] = IGNORE_INDEX
+            #     batch["labels"] = labels_flat.view_as(labels)
 
         return batch
 
