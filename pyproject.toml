@@ -36,15 +36,12 @@ dependencies = [
   "msgpack",
   "fastapi",
   "peft",
-  "sglang>=0.5.7",
-  "flashinfer-python>=0.5.3",
   "torch==2.9.1+cu128",
   "torchvision",
   "torchaudio",
   "liger-kernel",
   "flash-attn",
   "nvidia-nccl-cu12==2.27.5",
-  "ninja>=1.13.0",
 ]
 
 [project.optional-dependencies]
