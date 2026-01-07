@@ -55,7 +55,8 @@ private/
 htmlcov/
 
 .claude/
-.pytest_cache/CLAUDE.md
+.pytest_cache/
+CLAUDE.md
 
 # slurm files
 sbatch.sh
