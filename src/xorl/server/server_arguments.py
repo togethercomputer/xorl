@@ -187,6 +187,11 @@ class ServerArguments:
         metadata={"help": "Use Liger kernel optimizations"}
     )
 
+    ce_mode: Literal["eager", "compiled"] = field(
+        default="eager",
+        metadata={"help": "Cross-entropy implementation: 'eager' (vanilla F.cross_entropy, stable PyTorch) or 'compiled' (torch.compile with auto_chunker, requires PyTorch nightly)"}
+    )
+
     # ========================================================================
     # Checkpointing & Output
     # ========================================================================
@@ -332,6 +337,7 @@ class ServerArguments:
                 "init_device": self.init_device,
                 "enable_rank0_init": self.enable_rank0_init,
                 "use_liger": self.use_liger,
+                "ce_mode": self.ce_mode,
                 "load_checkpoint_path": self.load_checkpoint_path,
                 "ckpt_manager": self.ckpt_manager,
             },
