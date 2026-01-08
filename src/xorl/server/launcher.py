@@ -116,7 +116,6 @@ def run_engine_core(
     max_pending_requests: int = 100,
     operation_timeout: float = 600.0,
     log_level: str = "INFO",
-    inference_worker_urls: Optional[List[str]] = None,
     packing_seq_len: int = 32000,
     enable_packing: bool = True,
     ready_event: Optional[mp.Event] = None,
@@ -132,7 +131,6 @@ def run_engine_core(
         max_running_requests: Maximum concurrent running requests
         max_pending_requests: Maximum pending requests in queue
         log_level: Logging level
-        inference_worker_urls: URLs of inference workers for automatic weight updates
         ready_event: Optional multiprocessing Event to signal when engine is ready
         output_dir: Output directory for logs and checkpoints
     """
@@ -174,7 +172,6 @@ def run_engine_core(
             input_addr=input_addr,
             output_addr=output_addr,
             rank0_worker_address=rank0_worker_address,
-            inference_worker_urls=inference_worker_urls,
             operation_timeout=operation_timeout,
             connection_timeout=300.0,  # Give worker time to load large models + compile Triton kernels
             packing_seq_len=packing_seq_len,
@@ -478,7 +475,6 @@ class Launcher:
         max_pending_requests: int = 100,
         operation_timeout: float = 600.0,
         log_level: str = "INFO",
-        inference_worker_urls: Optional[List[str]] = None,
         # Auto-launch mode parameters
         nnodes: int = 1,
         master_addr: str = "127.0.0.1",
@@ -501,7 +497,6 @@ class Launcher:
             max_running_requests: Maximum concurrent requests
             max_pending_requests: Maximum pending requests
             log_level: Logging level
-            inference_worker_urls: URLs of inference workers for automatic weight updates
             nnodes: Number of nodes for distributed training (auto mode)
             master_addr: Master address for torch distributed (auto mode)
             master_port: Master port for torch distributed (auto mode)
@@ -514,7 +509,6 @@ class Launcher:
         self.max_running_requests = max_running_requests
         self.max_pending_requests = max_pending_requests
         self.operation_timeout = operation_timeout
-        self.inference_worker_urls = inference_worker_urls or []
         self.packing_seq_len = packing_seq_len
         self.enable_packing = enable_packing
         self.server_overrides = server_overrides or {}
@@ -811,7 +805,6 @@ class Launcher:
                         self.max_pending_requests,
                         self.operation_timeout,
                         self.log_level,
-                        self.inference_worker_urls,
                         self.packing_seq_len,
                         self.enable_packing,
                         self.engine_ready_event,
@@ -1150,14 +1143,6 @@ Note:
         default=600.0,
         help="Timeout for engine operations in seconds (default: 600.0)"
     )
-    parser.add_argument(
-        "--inference-worker-urls",
-        type=str,
-        nargs="+",
-        default=None,
-        help="URLs of inference workers for automatic weight updates (e.g., http://host1:8000 http://host2:8000)"
-    )
-
     # Logging
     parser.add_argument(
         "--log-level",
@@ -1201,7 +1186,6 @@ Note:
         max_pending_requests=args.max_pending_requests,
         operation_timeout=args.operation_timeout,
         log_level=args.log_level,
-        inference_worker_urls=args.inference_worker_urls,
         nnodes=args.nnodes,
         master_addr=args.master_addr,
         master_port=args.master_port,
