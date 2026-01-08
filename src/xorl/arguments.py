@@ -497,10 +497,10 @@ class ModelArguments:
         },
     )
     attn_implementation: Optional[
-        Literal["eager", "sdpa", "flash_attention_2", "flash_attention_3", "native-sparse"]
+        Literal["eager", "sdpa", "flash_attention_2", "flash_attention_3", "flash_attention_4", "native-sparse"]
     ] = field(
         default="flash_attention_2",
-        metadata={"help": "Attention implementation to use."},
+        metadata={"help": "Attention implementation to use. flash_attention_4 requires Blackwell GPU (SM100+)."},
     )
     moe_implementation: Optional[Literal[None, "eager", "fused"]] = field(
         default=None,
