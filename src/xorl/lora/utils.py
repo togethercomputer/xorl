@@ -279,7 +279,24 @@ def save_lora_checkpoint(
     # Get LoRA state dict and convert to PEFT format
     lora_state_dict = get_lora_state_dict(model)
 
-    # Convert keys to PEFT format: base_model.model.{original_key}
+    def _convert_to_peft_key(name: str) -> str:
+        """
+        Convert xorl LoRA key to PEFT-compatible format.
+
+        For Linear layers: lora_A -> lora_A.weight, lora_B -> lora_B.weight
+        For lm_head: lora_A -> lora_embedding_A, lora_B -> lora_embedding_B
+        """
+        if "lm_head.lora_A" in name:
+            return name.replace("lm_head.lora_A", "lm_head.lora_embedding_A")
+        elif "lm_head.lora_B" in name:
+            return name.replace("lm_head.lora_B", "lm_head.lora_embedding_B")
+        elif name.endswith(".lora_A"):
+            return name + ".weight"
+        elif name.endswith(".lora_B"):
+            return name + ".weight"
+        return name
+
+    # Convert keys to PEFT format: base_model.model.{converted_key}
     peft_state_dict = {}
     detected_modules = set()
     detected_r = None
@@ -298,7 +315,7 @@ def save_lora_checkpoint(
                 break
 
         # Convert to PEFT key format
-        peft_key = f"base_model.model.{key}"
+        peft_key = f"base_model.model.{_convert_to_peft_key(key)}"
         peft_state_dict[peft_key] = value
 
     # Auto-detect parameters if not provided
@@ -374,6 +391,25 @@ def load_lora_checkpoint(
     else:
         state_dict = torch.load(weights_file, map_location="cpu", weights_only=True)
 
+    def _convert_from_peft_key(name: str) -> str:
+        """
+        Convert PEFT key format back to xorl format.
+
+        For Linear layers: lora_A.weight -> lora_A, lora_B.weight -> lora_B
+        For lm_head: lora_embedding_A -> lora_A, lora_embedding_B -> lora_B
+        """
+        # Handle lm_head embedding-style naming
+        if "lm_head.lora_embedding_A" in name:
+            return name.replace("lm_head.lora_embedding_A", "lm_head.lora_A")
+        elif "lm_head.lora_embedding_B" in name:
+            return name.replace("lm_head.lora_embedding_B", "lm_head.lora_B")
+        # Handle .weight suffix for Linear layers
+        elif name.endswith(".lora_A.weight"):
+            return name[:-len(".weight")]
+        elif name.endswith(".lora_B.weight"):
+            return name[:-len(".weight")]
+        return name
+
     # Convert PEFT format keys to xorl format if needed
     converted_state_dict = {}
     for key, value in state_dict.items():
@@ -382,6 +418,8 @@ def load_lora_checkpoint(
             new_key = key[len("base_model.model."):]
         else:
             new_key = key
+        # Convert from PEFT naming to xorl naming
+        new_key = _convert_from_peft_key(new_key)
         converted_state_dict[new_key] = value
 
     # Load into model
