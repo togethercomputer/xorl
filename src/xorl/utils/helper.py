@@ -611,6 +611,12 @@ def create_profiler(
     warmup = 0 if start_step == 1 else 1
     wait = start_step - warmup - 1
     active = end_step - start_step
+    
+    # Ensure active >= 1 (PyTorch profiler requirement)
+    if active <= 0:
+        logger.warning(f"Profiler active steps is {active}, adjusting to 1 for valid profiling.")
+        active = 1
+        
     logger.info(f"build profiler schedule - wait: {wait}, warmup: {warmup}, active: {active}.")
 
     schedule = profiler_module.schedule(

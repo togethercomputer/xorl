@@ -42,7 +42,7 @@ def load_with_pred_2d(
     other=0,
 ):
     if not skip_boundary_check_0 and not skip_boundary_check_1:
-        return tl.load(ptr, mask_0 and mask_1, other=other)
+        return tl.load(ptr, mask_0 & mask_1, other=other)
     elif not skip_boundary_check_0 and skip_boundary_check_1:
         return tl.load(ptr, mask_0, other=other)
     elif skip_boundary_check_0 and not skip_boundary_check_1:
@@ -61,7 +61,7 @@ def store_with_pred_2d(
     mask_1: tl.tensor,
 ):
     if not skip_boundary_check_0 and not skip_boundary_check_1:
-        tl.store(ptr, value, mask_0 and mask_1)
+        tl.store(ptr, value, mask_0 & mask_1)
     elif not skip_boundary_check_0 and skip_boundary_check_1:
         tl.store(ptr, value, mask_0)
     elif skip_boundary_check_0 and not skip_boundary_check_1:
