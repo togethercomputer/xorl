@@ -65,3 +65,10 @@ multi-train.sh
 # RL training outputs
 checkpoints/
 outputs/
+
+# slurm
+multi-train.sh
+sbatch.sh
+
+# trace
+trace/

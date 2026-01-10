@@ -454,3 +454,193 @@ def count_lora_parameters(model: nn.Module) -> Tuple[int, int, float]:
     percentage = 100 * trainable_params / total_params if total_params > 0 else 0
 
     return trainable_params, total_params, percentage
+
+
+def inject_lora_into_moe_blocks(
+    model: nn.Module,
+    r: int = 16,
+    lora_alpha: int = 16,
+    shared_lora: bool = False,
+    target_modules: Optional[List[str]] = None,
+) -> int:
+    """
+    Inject LoRA adapters into fused MoE blocks.
+
+    This function finds all MoE block instances in the model that support
+    LoRA injection (Qwen3MoeSparseFusedMoeBlock, Qwen3MoeSparseFusedSgemmBlock)
+    and injects LoRA adapters into their expert weights.
+
+    Supported MoE implementations:
+    - moe_implementation='fused': Uses Qwen3MoeSparseFusedMoeBlock with group GEMM LoRA
+    - moe_implementation='fused_sgemm': Uses Qwen3MoeSparseFusedSgemmBlock with slime LoRA
+
+    Args:
+        model: Model containing MoE blocks
+        r: LoRA rank
+        lora_alpha: LoRA alpha for scaling
+        shared_lora: If True, share LoRA across all experts (more parameter efficient)
+        target_modules: Which expert projections to apply LoRA to.
+                       Options: ["gate_proj", "up_proj", "down_proj"]
+                       Default: all three projections
+
+    Returns:
+        Number of MoE blocks that received LoRA adapters
+
+    Example:
+        >>> model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-30B-A3B")
+        >>> num_blocks = inject_lora_into_moe_blocks(
+        ...     model,
+        ...     r=16,
+        ...     lora_alpha=32,
+        ...     target_modules=["gate_proj", "up_proj", "down_proj"]
+        ... )
+        >>> print(f"Injected LoRA into {num_blocks} MoE blocks")
+    """
+    if target_modules is None:
+        target_modules = ["gate_proj", "up_proj", "down_proj"]
+
+    injected_count = 0
+
+    for name, module in model.named_modules():
+        # Check if this is a MoE block that supports LoRA injection
+        if hasattr(module, 'inject_lora') and hasattr(module, 'lora_adapter'):
+            # This is a Qwen3MoeSparseFusedMoeBlock, Qwen3MoeSparseFusedSgemmBlock, or similar
+            module.inject_lora(
+                r=r,
+                lora_alpha=lora_alpha,
+                shared_lora=shared_lora,
+                target_modules=target_modules,
+            )
+            injected_count += 1
+            logger.debug(f"Injected MoE LoRA into {name}")
+
+    if injected_count > 0:
+        logger.info(
+            f"Injected LoRA into {injected_count} MoE blocks with r={r}, "
+            f"alpha={lora_alpha}, shared={shared_lora}"
+        )
+    else:
+        logger.warning(
+            "No LoRA-compatible MoE blocks found. Make sure model uses "
+            "moe_implementation='fused' or 'fused_sgemm'"
+        )
+
+    return injected_count
+
+
+def inject_lora_into_model_with_moe(
+    model: nn.Module,
+    r: int = 16,
+    lora_alpha: int = 16,
+    target_modules: Optional[List[str]] = None,
+    moe_shared_lora: bool = False,
+) -> nn.Module:
+    """
+    Inject LoRA adapters into both dense layers and MoE expert blocks.
+
+    This is a comprehensive LoRA injection function that handles:
+    1. Standard nn.Linear layers (attention projections, dense MLP layers)
+    2. Fused MoE expert blocks (Qwen3MoeSparseFusedMoeBlock, Qwen3MoeSparseFusedSgemmBlock)
+
+    For MoE models like Qwen3 MoE, some layers have dense MLP (nn.Linear modules)
+    and others have MoE blocks. This function handles both cases:
+    - Dense MLP layers get LoRA via inject_lora_into_model (replaces nn.Linear with LoraLinear)
+    - MoE blocks get LoRA via inject_lora_into_moe_blocks (uses fused GEMM with LoRA)
+
+    Args:
+        model: Model to inject LoRA into
+        r: LoRA rank
+        lora_alpha: LoRA alpha for scaling
+        target_modules: List of module names to target.
+                       For attention: ["q_proj", "k_proj", "v_proj", "o_proj"]
+                       For MLP/experts: ["gate_proj", "up_proj", "down_proj"]
+        moe_shared_lora: If True, MoE experts share LoRA adapters
+
+    Returns:
+        The model with LoRA layers injected (modified in-place)
+
+    Example:
+        >>> model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-30B-A3B")
+        >>> inject_lora_into_model_with_moe(
+        ...     model,
+        ...     r=16,
+        ...     lora_alpha=32,
+        ...     target_modules=["q_proj", "v_proj", "gate_proj", "up_proj", "down_proj"]
+        ... )
+    """
+    if target_modules is None:
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+    # Separate attention modules from MLP/expert modules
+    attention_modules = [m for m in target_modules if m in ["q_proj", "k_proj", "v_proj", "o_proj", "lm_head"]]
+    expert_modules = [m for m in target_modules if m in ["gate_proj", "up_proj", "down_proj"]]
+
+    # Step 1: Inject LoRA into standard nn.Linear layers
+    # This includes attention projections AND dense MLP layers (for layers without MoE)
+    # Note: inject_lora_into_model only affects nn.Linear modules, so it won't
+    # affect MoE expert blocks which have stacked weight tensors
+    all_linear_targets = attention_modules + expert_modules
+    if all_linear_targets:
+        inject_lora_into_model(
+            model,
+            r=r,
+            lora_alpha=lora_alpha,
+            target_modules=all_linear_targets,
+        )
+
+    # Step 2: Inject LoRA into MoE expert blocks
+    # This handles MoE layers that have fused expert weights (not nn.Linear)
+    if expert_modules:
+        inject_lora_into_moe_blocks(
+            model,
+            r=r,
+            lora_alpha=lora_alpha,
+            shared_lora=moe_shared_lora,
+            target_modules=expert_modules,
+        )
+
+    return model
+
+
+def get_moe_lora_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
+    """
+    Extract LoRA weights from MoE blocks.
+
+    Args:
+        model: Model with MoE LoRA adapters
+
+    Returns:
+        State dict containing MoE LoRA parameters
+    """
+    moe_lora_state_dict = {}
+
+    for name, module in model.named_modules():
+        if hasattr(module, 'lora_adapter') and module.lora_adapter is not None:
+            adapter_state = module.lora_adapter.get_lora_state_dict()
+            for key, value in adapter_state.items():
+                full_key = f"{name}.lora_adapter.{key}"
+                moe_lora_state_dict[full_key] = value.detach().cpu()
+
+    return moe_lora_state_dict
+
+
+def get_all_lora_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
+    """
+    Extract all LoRA weights (both dense and MoE) from model.
+
+    Args:
+        model: Model with LoRA layers
+
+    Returns:
+        Combined state dict with all LoRA parameters
+    """
+    # Get standard LoRA weights
+    lora_state = get_lora_state_dict(model)
+
+    # Get MoE LoRA weights
+    moe_lora_state = get_moe_lora_state_dict(model)
+
+    # Combine
+    lora_state.update(moe_lora_state)
+
+    return lora_state
