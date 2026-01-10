@@ -68,9 +68,9 @@ class ServerArguments:
         metadata={"help": "Attention implementation. flash_attention_4 requires Blackwell GPU (SM100+)."}
     )
 
-    moe_implementation: Optional[Literal[None, "eager", "fused", "fused_sgemm"]] = field(
+    moe_implementation: Optional[Literal[None, "eager", "fused"]] = field(
         default=None,
-        metadata={"help": "MoE implementation. 'fused_sgemm' uses slime fused MoE kernels."}
+        metadata={"help": "MoE implementation. 'fused' uses fused MoE kernels."}
     )
 
     force_use_huggingface: bool = field(

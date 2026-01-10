@@ -42,7 +42,7 @@ def build_foundation_model(
     attn_implementation: Optional[
         Literal["eager", "sdpa", "flash_attention_2", "flash_attention_3", "flash_attention_4", "native-sparse"]
     ] = "flash_attention_2",
-    moe_implementation: Optional[Literal["eager", "fused", "fused_sgemm"]] = None,
+    moe_implementation: Optional[Literal["eager", "fused"]] = None,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
     force_use_huggingface: Optional[bool] = False,
@@ -61,7 +61,7 @@ def build_foundation_model(
         config = AutoConfig.from_pretrained(config_path, trust_remote_code=True, **config_kwargs)
 
     if moe_implementation is not None:
-        if moe_implementation not in ["eager", "fused", "fused_sgemm"]:
+        if moe_implementation not in ["eager", "fused"]:
             raise ValueError(f"Invalid moe_implementation: {moe_implementation}")
         config._moe_implementation = moe_implementation
         logger.info_rank0(f"Moe implementation: {moe_implementation}")

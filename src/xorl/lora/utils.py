@@ -467,12 +467,11 @@ def inject_lora_into_moe_blocks(
     Inject LoRA adapters into fused MoE blocks.
 
     This function finds all MoE block instances in the model that support
-    LoRA injection (Qwen3MoeSparseFusedMoeBlock, Qwen3MoeSparseFusedSgemmBlock)
-    and injects LoRA adapters into their expert weights.
+    LoRA injection (Qwen3MoeSparseFusedMoeBlock) and injects LoRA adapters
+    into their expert weights.
 
     Supported MoE implementations:
     - moe_implementation='fused': Uses Qwen3MoeSparseFusedMoeBlock with group GEMM LoRA
-    - moe_implementation='fused_sgemm': Uses Qwen3MoeSparseFusedSgemmBlock with slime LoRA
 
     Args:
         model: Model containing MoE blocks
@@ -504,7 +503,7 @@ def inject_lora_into_moe_blocks(
     for name, module in model.named_modules():
         # Check if this is a MoE block that supports LoRA injection
         if hasattr(module, 'inject_lora') and hasattr(module, 'lora_adapter'):
-            # This is a Qwen3MoeSparseFusedMoeBlock, Qwen3MoeSparseFusedSgemmBlock, or similar
+            # This is a Qwen3MoeSparseFusedMoeBlock or similar
             module.inject_lora(
                 r=r,
                 lora_alpha=lora_alpha,
@@ -522,7 +521,7 @@ def inject_lora_into_moe_blocks(
     else:
         logger.warning(
             "No LoRA-compatible MoE blocks found. Make sure model uses "
-            "moe_implementation='fused' or 'fused_sgemm'"
+            "moe_implementation='fused'"
         )
 
     return injected_count
