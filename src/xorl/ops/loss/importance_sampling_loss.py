@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -56,7 +56,7 @@ def importance_sampling_loss_function(
     num_chunks: int = 8,
     ce_mode: str = "compiled",
     return_per_token: bool = False,
-) -> Tuple[torch.Tensor, None, Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> Tuple[torch.Tensor, None, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
     """
     Compute importance sampling loss for GRPO/RL training.
 
@@ -82,13 +82,12 @@ def importance_sampling_loss_function(
                          Useful for custom loss computations.
 
     Returns:
-        Tuple of (loss, None, per_token_logprobs, per_token_loss)
+        Tuple of (loss, None, per_token_logprobs, per_token_loss, metrics)
         - loss: Scalar importance sampling loss = -(ratio * advantages).mean()
         - None: Placeholder for compatibility
-        - per_token_logprobs: Per-token log probabilities if return_per_token=True, else None
-                              Shape (batch, seq_len)
-        - per_token_loss: Per-token policy gradient loss (-(ratio * advantages)) if return_per_token=True, else None
-                          Shape (batch, seq_len)
+        - per_token_logprobs: Per-token log probabilities, shape (batch, seq_len)
+        - per_token_loss: Per-token policy gradient loss (-(ratio * advantages)), shape (batch, seq_len)
+        - metrics: Dictionary with ratio statistics (ratio_mean, ratio_min, ratio_max)
     """
     original_shape = labels.shape
     H = hidden_states.size(-1)
@@ -129,10 +128,16 @@ def importance_sampling_loss_function(
 
     loss = true_pg.detach() + surrogate - surrogate.detach()
 
-    # If return_per_token, return per-token logprobs and per-token PG loss
-    if return_per_token:
-        per_token_logprobs = new_logprobs_flat.view(original_shape)
-        per_token_loss = per_token_pg.view(original_shape)
-        return loss, None, per_token_logprobs, per_token_loss
+    # Compute metrics for logging (convert to Python floats for JSON serialization)
+    valid_ratio = ratio[valid_mask] if valid_mask.any() else ratio
+    metrics = {
+        "ratio_mean": valid_ratio.mean().detach().item(),
+        "ratio_min": valid_ratio.min().detach().item(),
+        "ratio_max": valid_ratio.max().detach().item(),
+    }
 
-    return loss, None, None, None
+    # Reshape per-token outputs
+    per_token_logprobs = new_logprobs_flat.view(original_shape)
+    per_token_loss = per_token_pg.view(original_shape)
+
+    return loss, None, per_token_logprobs, per_token_loss, metrics
