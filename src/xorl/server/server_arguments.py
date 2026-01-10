@@ -68,9 +68,9 @@ class ServerArguments:
         metadata={"help": "Attention implementation. flash_attention_4 requires Blackwell GPU (SM100+)."}
     )
 
-    moe_implementation: Optional[Literal[None, "eager", "fused"]] = field(
+    moe_implementation: Optional[Literal[None, "eager", "fused", "fused_sgemm"]] = field(
         default=None,
-        metadata={"help": "MoE implementation"}
+        metadata={"help": "MoE implementation. 'fused_sgemm' uses slime fused MoE kernels."}
     )
 
     force_use_huggingface: bool = field(
@@ -225,6 +225,11 @@ class ServerArguments:
         metadata={"help": "Logging level (DEBUG, INFO, WARNING, ERROR)"}
     )
 
+    enable_self_test: bool = field(
+        default=False,
+        metadata={"help": "Enable self-test after model initialization"}
+    )
+
     # ========================================================================
     # Worker Configuration
     # ========================================================================
@@ -340,6 +345,7 @@ class ServerArguments:
                 "ce_mode": self.ce_mode,
                 "load_checkpoint_path": self.load_checkpoint_path,
                 "ckpt_manager": self.ckpt_manager,
+                "enable_self_test": self.enable_self_test,
             },
             "data": {
                 # Empty data section - data comes from client at runtime

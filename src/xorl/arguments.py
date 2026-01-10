@@ -502,9 +502,9 @@ class ModelArguments:
         default="flash_attention_2",
         metadata={"help": "Attention implementation to use. flash_attention_4 requires Blackwell GPU (SM100+)."},
     )
-    moe_implementation: Optional[Literal[None, "eager", "fused"]] = field(
+    moe_implementation: Optional[Literal[None, "eager", "fused", "fused_sgemm"]] = field(
         default=None,
-        metadata={"help": "MoE implementation to use."},
+        metadata={"help": "MoE implementation to use. 'fused_sgemm' uses slime fused MoE kernels."},
     )
     basic_modules: Optional[List[str]] = field(
         default_factory=list,

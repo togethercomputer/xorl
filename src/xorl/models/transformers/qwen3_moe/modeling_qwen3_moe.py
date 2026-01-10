@@ -47,6 +47,12 @@ from transformers.utils.deprecation import deprecate_kwarg
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import slice_position_embedding
 from ....ops import causallm_loss_function, fused_moe_forward
+from ....ops.sgemm import (
+    DownProjFunction,
+    GateUpProjFunction,
+    MoeSumReduceFunction,
+    SiluAndMulFunction,
+)
 from ....utils import logging
 from ....utils.import_utils import is_liger_kernel_available
 from .configuration_qwen3_moe import Qwen3MoeConfig
@@ -434,14 +440,82 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 class Qwen3MoeSparseFusedMoeBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.config = config
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.moe_intermediate_size
 
         # gating
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
 
         self.experts = Qwen3MoeExperts(config)
+
+        # LoRA adapter tracking (None until inject_lora is called)
+        self.lora_adapter = None
+
+    def inject_lora(
+        self,
+        r: int = 16,
+        lora_alpha: int = 16,
+        shared_lora: bool = False,
+        target_modules: list = None,
+    ) -> None:
+        """
+        Inject LoRA adapters into this MoE block.
+
+        After calling this method, the experts module will be replaced with
+        a LoRA-enabled version that computes LoRA deltas during forward pass.
+
+        Args:
+            r: LoRA rank
+            lora_alpha: LoRA alpha for scaling
+            shared_lora: If True, share LoRA across all experts (currently ignored,
+                        per-expert LoRA is always used for correctness)
+            target_modules: Which projections to apply LoRA to.
+                          Options: ["gate_proj", "up_proj", "down_proj"]
+                          Default: all three projections
+        """
+        from .qwen3_moe_lora import LoRAConfig, Qwen3MoeFusedExpertsWithLoRA
+
+        if target_modules is None:
+            target_modules = ["gate_proj", "up_proj", "down_proj"]
+
+        # Create LoRA config
+        lora_config = LoRAConfig(
+            r=r,
+            lora_alpha=lora_alpha,
+            target_modules=target_modules,
+            use_rslora=False,
+        )
+
+        # Create LoRA-enabled experts
+        lora_experts = Qwen3MoeFusedExpertsWithLoRA(self.config, lora_config)
+
+        # Move to same device and dtype as original experts
+        lora_experts = lora_experts.to(
+            device=self.experts.gate_proj.device,
+            dtype=self.experts.gate_proj.dtype,
+        )
+
+        # Copy base weights from original experts
+        with torch.no_grad():
+            lora_experts.gate_proj.copy_(self.experts.gate_proj)
+            lora_experts.up_proj.copy_(self.experts.up_proj)
+            lora_experts.down_proj.copy_(self.experts.down_proj)
+
+        # Replace experts module
+        self.experts = lora_experts
+
+        # Mark that LoRA has been injected (for state dict extraction)
+        self.lora_adapter = "injected"  # Marker for inject_lora_into_moe_blocks detection
+
+        # Freeze base expert weights (already done in Qwen3MoeFusedExpertsWithLoRA)
+        logger.debug(
+            f"Injected MoE LoRA with r={r}, alpha={lora_alpha}, "
+            f"target_modules={target_modules}"
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """ """
@@ -468,9 +542,183 @@ class Qwen3MoeSparseFusedMoeBlock(nn.Module):
         return final_hidden_states, router_logits
 
 
+def fused_sgemm_experts_impl(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+):
+    """
+    Fused MoE expert forward using slime kernels.
+
+    Args:
+        hidden_states: Input tensor of shape (num_tokens, hidden_size)
+        w1: Stacked gate+up projection weights of shape (num_experts, 2*intermediate_size, hidden_size)
+        w2: Down projection weights of shape (num_experts, hidden_size, intermediate_size)
+        topk_weights: Routing weights of shape (num_tokens, top_k)
+        topk_ids: Selected expert IDs of shape (num_tokens, top_k)
+
+    Returns:
+        Output tensor of shape (num_tokens, hidden_size)
+    """
+    assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
+    assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
+    assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
+    assert w1.is_contiguous(), "Expert weights1 must be contiguous"
+    assert w2.is_contiguous(), "Expert weights2 must be contiguous"
+
+    # Stage 1: Gate + Up projection
+    intermediate_cache1 = GateUpProjFunction.apply(
+        hidden_states,
+        w1,
+        topk_weights,
+        topk_ids,
+    )
+    # Stage 2: SiLU activation and element-wise multiplication
+    intermediate_cache2 = SiluAndMulFunction.apply(intermediate_cache1)
+    # Stage 3: Down projection with routing weights
+    intermediate_cache3 = DownProjFunction.apply(
+        intermediate_cache2,
+        w2,
+        topk_weights,
+        topk_ids,
+    )
+    # Stage 4: Sum reduction across experts
+    output_hidden_states = MoeSumReduceFunction.apply(
+        intermediate_cache3,
+        hidden_states.shape,
+    )
+    return output_hidden_states
+
+
+class Qwen3MoeSparseFusedSgemmBlock(nn.Module):
+    """
+    MoE block using slime fused SGEMM kernels for efficient training.
+
+    This implementation uses 4-stage fused MoE kernels from slime:
+    1. GateUpProjFunction: Fused gate + up projection
+    2. SiluAndMulFunction: SiLU activation + element-wise multiplication
+    3. DownProjFunction: Down projection with routing weights
+    4. MoeSumReduceFunction: Sum reduction across experts
+
+    Supports LoRA adaptation via inject_lora() method for parameter-efficient
+    fine-tuning of expert weights.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        self.norm_topk_prob = config.norm_topk_prob
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.moe_intermediate_size
+
+        # gating
+        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+
+        # Expert weights stored as stacked tensors for efficient kernel execution
+        # w1 combines gate_proj and up_proj: (num_experts, 2*intermediate_size, hidden_size)
+        self.w1 = nn.Parameter(
+            torch.empty(self.num_experts, 2 * self.intermediate_size, self.hidden_size)
+        )
+        # w2 is down_proj: (num_experts, hidden_size, intermediate_size)
+        self.w2 = nn.Parameter(
+            torch.empty(self.num_experts, self.hidden_size, self.intermediate_size)
+        )
+
+        # LoRA adapter (None until inject_lora is called)
+        self.lora_adapter = None
+
+    def inject_lora(
+        self,
+        r: int = 16,
+        lora_alpha: int = 16,
+        shared_lora: bool = False,
+        target_modules: list = None,
+    ) -> None:
+        """
+        Inject LoRA adapters into this MoE block.
+
+        After calling this method, the forward pass will apply LoRA deltas
+        to the expert weights before kernel execution.
+
+        Args:
+            r: LoRA rank
+            lora_alpha: LoRA alpha for scaling
+            shared_lora: If True, share LoRA across all experts (more efficient)
+            target_modules: Which projections to apply LoRA to.
+                          Options: ["gate_proj", "up_proj", "down_proj"]
+                          Default: all three projections
+        """
+        from ....lora.moe_layers import Qwen3MoELoraAdapter
+
+        if target_modules is None:
+            target_modules = ["gate_proj", "up_proj", "down_proj"]
+
+        self.lora_adapter = Qwen3MoELoraAdapter(
+            num_experts=self.num_experts,
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size,
+            r=r,
+            lora_alpha=lora_alpha,
+            shared_lora=shared_lora,
+            target_modules=target_modules,
+            device=self.w1.device,
+            dtype=torch.float32,  # LoRA weights in float32 for stability
+        )
+
+        # Freeze base expert weights
+        self.w1.requires_grad = False
+        self.w2.requires_grad = False
+
+    def get_effective_weights(self):
+        """
+        Get effective expert weights with LoRA applied.
+
+        Returns:
+            Tuple of (w1_effective, w2_effective) with LoRA deltas applied
+        """
+        if self.lora_adapter is not None:
+            w1_eff = self.lora_adapter.apply_w1_lora(self.w1)
+            w2_eff = self.lora_adapter.apply_w2_lora(self.w2)
+            return w1_eff, w2_eff
+        return self.w1, self.w2
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        # router_logits: (batch * sequence_length, n_experts)
+        router_logits = self.gate(hidden_states)
+
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        if self.norm_topk_prob:
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        # Cast back to the input dtype
+        routing_weights = routing_weights.to(hidden_states.dtype)
+
+        # Get effective weights (with LoRA if adapter exists)
+        w1_eff, w2_eff = self.get_effective_weights()
+
+        # Use fused sgemm implementation
+        final_hidden_states = fused_sgemm_experts_impl(
+            hidden_states.to(torch.bfloat16).contiguous(),
+            w1_eff.contiguous(),
+            w2_eff.contiguous(),
+            routing_weights.contiguous(),
+            selected_experts.contiguous(),
+        )
+
+        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        return final_hidden_states, router_logits
+
+
 QWEN3_MOE_CLASSES = {
     "eager": Qwen3MoeSparseMoeBlock,
     "fused": Qwen3MoeSparseFusedMoeBlock,
+    "fused_sgemm": Qwen3MoeSparseFusedSgemmBlock,
 }
 
 
@@ -555,6 +803,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
 
         hidden_states = self.mlp(hidden_states)
+        
         if isinstance(hidden_states, tuple):
             hidden_states, router_logits = hidden_states
         else:
@@ -807,7 +1056,6 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         for decoder_layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,

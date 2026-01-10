@@ -173,7 +173,7 @@ def run_engine_core(
             output_addr=output_addr,
             rank0_worker_address=rank0_worker_address,
             operation_timeout=operation_timeout,
-            connection_timeout=300.0,  # Give worker time to load large models + compile Triton kernels
+            connection_timeout=3600.0,  # 1 hour for loading large models (235B) + EP sharding + LoRA + Triton compilation
             packing_seq_len=packing_seq_len,
             enable_packing=enable_packing,
         )
@@ -687,6 +687,65 @@ class Launcher:
         logger.warning("You can manually save the initial state by calling /api/v1/save_weights with path='000000'")
         return False
 
+    def _test_save_lora_only(self, max_retries: int = 3, retry_delay: float = 5.0):
+        """
+        Test saving LoRA adapter only (PEFT format) after all components are ready.
+
+        This is a dry-run test to verify that LoRA saving works correctly.
+        Only runs if LoRA is enabled in the configuration.
+
+        Args:
+            max_retries: Maximum number of retry attempts
+            retry_delay: Delay in seconds between retries
+        """
+        # Check if LoRA is enabled
+        if not self.server_args or not self.server_args.enable_lora:
+            logger.info("LoRA not enabled, skipping LoRA-only save test")
+            return False
+
+        logger.info("")
+        logger.info("=" * 70)
+        logger.info("Testing LoRA-only save (PEFT format)...")
+        logger.info("=" * 70)
+
+        api_url = f"http://{self.api_host}:{self.api_port}/api/v1/save_weights_for_sampler"
+
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(
+                    api_url,
+                    json={
+                        "model_id": "default",
+                        "name": "test_lora_000000",  # Test LoRA adapter
+                    },
+                    timeout=self.operation_timeout,
+                )
+
+                if response.status_code == 200:
+                    result = response.json()
+                    saved_path = result.get('path', 'N/A')
+                    logger.info(f"✓ LoRA adapter test save successful: {saved_path}")
+                    logger.info(f"  Files: adapter_model.safetensors + adapter_config.json")
+                    return True
+                else:
+                    logger.warning(
+                        f"Failed to save test LoRA adapter (attempt {attempt + 1}/{max_retries}): "
+                        f"HTTP {response.status_code} - {response.text}"
+                    )
+
+            except requests.exceptions.RequestException as e:
+                logger.warning(
+                    f"Failed to save test LoRA adapter (attempt {attempt + 1}/{max_retries}): {e}"
+                )
+
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+
+        logger.error("✗ Failed to save test LoRA adapter after all retries")
+        logger.warning("LoRA saving may not work properly")
+        return False
+
     def _launch_workers_with_torchrun(self):
         """Launch distributed workers using torchrun."""
         logger.info("=" * 70)
@@ -875,7 +934,7 @@ class Launcher:
             # Wait for engine to signal it's fully ready (after worker connection and startup tests)
             logger.info("")
             logger.info("Waiting for Engine Core to complete initialization...")
-            engine_ready_timeout = 300.0  # 5 minutes timeout for engine initialization
+            engine_ready_timeout = 1800.0  # 30 minutes timeout for engine initialization (large models need time)
             if self.engine_ready_event.wait(timeout=engine_ready_timeout):
                 logger.info("✓ Engine Core fully initialized")
             else:
@@ -890,6 +949,9 @@ class Launcher:
 
             # Save initial checkpoint (000) to capture the model state before any training
             self._save_initial_checkpoint()
+
+            # Test LoRA-only save if LoRA is enabled
+            self._test_save_lora_only()
 
             logger.info("")
             logger.info("=" * 70)

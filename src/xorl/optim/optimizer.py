@@ -150,6 +150,22 @@ class MultiOptimizer(Optimizer, Stateful):
         self._is_multi_optimizer: bool = True
         self.key_names = key_names
 
+    @property
+    def param_groups(self) -> List[Dict[str, Any]]:
+        """Return all param_groups from all internal optimizers."""
+        all_groups = []
+        for opt in self.optimizers_dict.values():
+            all_groups.extend(opt.param_groups)
+        return all_groups
+
+    @property
+    def state(self) -> Dict[torch.nn.Parameter, Any]:
+        """Return merged state dict from all internal optimizers."""
+        merged_state: Dict[torch.nn.Parameter, Any] = {}
+        for opt in self.optimizers_dict.values():
+            merged_state.update(opt.state)
+        return merged_state
+
     def step(self) -> None:
         for opt in self.optimizers_dict.values():
             opt.step()
