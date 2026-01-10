@@ -305,6 +305,113 @@ class CreateModelResponse(BaseModel):
     status: str = Field(..., description="Creation status")
 
 
+class RegisterAdapterRequest(BaseModel):
+    """API request for registering a new LoRA adapter for parallel training."""
+    model_id: str = Field(..., description="Unique model identifier for this training run")
+    lr: float = Field(default=1e-5, description="Learning rate for this adapter")
+
+
+class RegisterAdapterResponse(BaseModel):
+    """API response for registering an adapter."""
+    model_id: str = Field(..., description="Model identifier")
+    lr: float = Field(..., description="Learning rate for this adapter")
+    registered: bool = Field(..., description="Whether registration was successful")
+    total_adapters: int = Field(..., description="Total number of registered adapters")
+
+
+class EndSessionRequest(BaseModel):
+    """API request for ending a training session."""
+    model_id: str = Field(..., description="Model identifier to end session for")
+
+
+class EndSessionResponse(BaseModel):
+    """API response for ending a session."""
+    success: bool = Field(..., description="Whether the session was successfully ended")
+    model_id: str = Field(..., description="Model identifier that was cleaned up")
+
+
+class SessionInfoResponse(BaseModel):
+    """API response with session information for monitoring."""
+    registered_models: List[str] = Field(..., description="List of registered model IDs (all ever registered)")
+    active_sessions: int = Field(..., description="Number of active sessions")
+    session_activity: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Map of model_id to last activity timestamp"
+    )
+    idle_timeout_seconds: float = Field(..., description="Idle session timeout in seconds")
+    loaded_sampling_adapters: Dict[str, int] = Field(
+        default_factory=dict,
+        description="Map of model_id to number of loaded sampling adapters"
+    )
+    # Training adapter info (from worker's adapter manager)
+    loaded_training_adapters: List[str] = Field(
+        default_factory=list,
+        description="List of training adapters currently loaded in GPU memory"
+    )
+    max_training_adapters: int = Field(
+        default=0,
+        description="Maximum number of training adapters that can be loaded (LRU eviction threshold)"
+    )
+    current_training_adapter: Optional[str] = Field(
+        default=None,
+        description="Currently active training adapter (if any)"
+    )
+
+
+# ============================================================================
+# Adapter State Save/Load
+# ============================================================================
+
+
+class SaveAdapterStateRequest(BaseModel):
+    """API request for saving adapter state (weights + optimizer)."""
+
+    model_id: str = Field(..., description="Adapter/session identifier to save")
+    path: Optional[str] = Field(
+        default=None,
+        description="Directory to save adapter state to. Auto-generated if not specified."
+    )
+    save_optimizer: bool = Field(
+        default=True,
+        description="Whether to save optimizer state for resuming training"
+    )
+    seq_id: Optional[int] = Field(default=None, description="Sequence ID for request ordering")
+
+
+class SaveAdapterStateResponse(BaseModel):
+    """API response for saving adapter state."""
+
+    success: bool = Field(..., description="Whether save was successful")
+    path: str = Field(..., description="Directory where adapter state was saved")
+    model_id: str = Field(..., description="Model identifier that was saved")
+    step: int = Field(..., description="Global step at save time")
+
+
+class LoadAdapterStateRequest(BaseModel):
+    """API request for loading adapter state (weights + optimizer)."""
+
+    model_id: str = Field(..., description="Target adapter/session identifier to load into")
+    path: str = Field(..., description="Directory to load adapter state from")
+    load_optimizer: bool = Field(
+        default=True,
+        description="Whether to load optimizer state for resuming training"
+    )
+    lr: Optional[float] = Field(
+        default=None,
+        description="Learning rate for the adapter (uses saved value if not specified)"
+    )
+    seq_id: Optional[int] = Field(default=None, description="Sequence ID for request ordering")
+
+
+class LoadAdapterStateResponse(BaseModel):
+    """API response for loading adapter state."""
+
+    success: bool = Field(..., description="Whether load was successful")
+    path: str = Field(..., description="Directory where adapter state was loaded from")
+    model_id: str = Field(..., description="Model identifier that was loaded into")
+    step: int = Field(..., description="Global step restored from checkpoint")
+
+
 class RegisterWorkersRequest(BaseModel):
     """API request for registering inference workers for a model."""
 
