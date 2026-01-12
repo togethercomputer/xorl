@@ -1,6 +1,7 @@
+import json
 import os
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import torch
 import torch.distributed as dist
@@ -32,6 +33,119 @@ logger = get_logger(__name__)
 
 _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 _EXTRA_STATE_DIR = "extra_state"
+_CHECKPOINT_METADATA_FILE = "checkpoint_metadata.json"
+
+
+def _get_model_param_keys(model: torch.nn.Module) -> List[str]:
+    """Get sorted list of parameter keys from a model."""
+    return sorted([name for name, _ in model.named_parameters()])
+
+
+def _save_checkpoint_metadata(checkpoint_dir: str, model: torch.nn.Module, has_lora: bool = False) -> None:
+    """
+    Save checkpoint metadata to a JSON file.
+    Only rank 0 writes the metadata file.
+    """
+    if dist.get_rank() != 0:
+        return
+
+    param_keys = _get_model_param_keys(model)
+    lora_keys = [k for k in param_keys if "lora" in k.lower()]
+
+    metadata = {
+        "num_parameters": len(param_keys),
+        "has_lora": has_lora or len(lora_keys) > 0,
+        "num_lora_parameters": len(lora_keys),
+        "parameter_keys": param_keys,
+    }
+
+    metadata_path = os.path.join(checkpoint_dir, _CHECKPOINT_METADATA_FILE)
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    logger.info(f"Saved checkpoint metadata: {len(param_keys)} params, {len(lora_keys)} LoRA params")
+
+
+def _validate_checkpoint_compatibility(
+    checkpoint_dir: str,
+    model: torch.nn.Module,
+    strict: bool = True,
+) -> Dict[str, Any]:
+    """
+    Validate that a checkpoint is compatible with the current model.
+
+    Args:
+        checkpoint_dir: Path to checkpoint directory
+        model: Current model to validate against
+        strict: If True, raise error on mismatch. If False, return info about mismatches.
+
+    Returns:
+        Dictionary with validation results including missing/unexpected keys
+
+    Raises:
+        RuntimeError: If strict=True and checkpoint is incompatible
+    """
+    metadata_path = os.path.join(checkpoint_dir, _CHECKPOINT_METADATA_FILE)
+
+    # If no metadata file exists (old checkpoint), skip validation
+    if not os.path.exists(metadata_path):
+        logger.warning(
+            f"No checkpoint metadata found at {metadata_path}. "
+            "Skipping compatibility check (old checkpoint format)."
+        )
+        return {"validated": False, "reason": "no_metadata"}
+
+    with open(metadata_path, "r") as f:
+        ckpt_metadata = json.load(f)
+
+    ckpt_keys = set(ckpt_metadata.get("parameter_keys", []))
+    model_keys = set(_get_model_param_keys(model))
+
+    # Keys in model but not in checkpoint (e.g., LoRA params added after checkpoint was saved)
+    missing_in_ckpt = model_keys - ckpt_keys
+    # Keys in checkpoint but not in model (e.g., removed params)
+    unexpected_in_ckpt = ckpt_keys - model_keys
+
+    # Check if mismatch is LoRA-related
+    missing_lora_keys = [k for k in missing_in_ckpt if "lora" in k.lower()]
+    missing_non_lora_keys = [k for k in missing_in_ckpt if "lora" not in k.lower()]
+
+    result = {
+        "validated": True,
+        "checkpoint_has_lora": ckpt_metadata.get("has_lora", False),
+        "model_has_lora": any("lora" in k.lower() for k in model_keys),
+        "missing_in_checkpoint": list(missing_in_ckpt),
+        "unexpected_in_checkpoint": list(unexpected_in_ckpt),
+        "missing_lora_keys": missing_lora_keys,
+        "missing_non_lora_keys": missing_non_lora_keys,
+        "compatible": len(missing_non_lora_keys) == 0 and len(unexpected_in_ckpt) == 0,
+    }
+
+    # Log validation results
+    if missing_in_ckpt or unexpected_in_ckpt:
+        logger.warning(
+            f"Checkpoint compatibility check:\n"
+            f"  - Missing in checkpoint: {len(missing_in_ckpt)} keys "
+            f"({len(missing_lora_keys)} LoRA, {len(missing_non_lora_keys)} non-LoRA)\n"
+            f"  - Unexpected in checkpoint: {len(unexpected_in_ckpt)} keys"
+        )
+
+        # If only LoRA keys are missing, this is expected when loading base checkpoint into LoRA model
+        if len(missing_lora_keys) > 0 and len(missing_non_lora_keys) == 0 and len(unexpected_in_ckpt) == 0:
+            logger.info(
+                "Loading base model checkpoint into LoRA-enabled model. "
+                f"LoRA parameters ({len(missing_lora_keys)} keys) will keep their initialized values."
+            )
+            result["load_mode"] = "base_to_lora"
+        elif strict and (len(missing_non_lora_keys) > 0 or len(unexpected_in_ckpt) > 0):
+            error_msg = (
+                f"Checkpoint incompatible with model:\n"
+                f"  Missing non-LoRA keys: {missing_non_lora_keys[:5]}{'...' if len(missing_non_lora_keys) > 5 else ''}\n"
+                f"  Unexpected keys: {list(unexpected_in_ckpt)[:5]}{'...' if len(unexpected_in_ckpt) > 5 else ''}"
+            )
+            raise RuntimeError(error_msg)
+
+    return result
 
 
 class ModelState(Stateful):
@@ -39,10 +153,13 @@ class ModelState(Stateful):
     A wrapper around a model to make it stateful.
     Args:
         model (Model): model to wrap.
+        exclude_keys (Set[str]): Optional set of parameter keys to exclude from state_dict.
+                                 Used when loading base checkpoint into LoRA model.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, exclude_keys: Optional[Set[str]] = None):
         self.model = model
+        self.exclude_keys = exclude_keys or set()
 
         # Determine whether this is EP+FSDP2 case
         # If so, we need to restore EP-dim before saving to DCP
@@ -61,6 +178,10 @@ class ModelState(Stateful):
             )
             model_state_dict = self.get_state_dict_with_ep_dim(model_state_dict)
 
+        # Filter out excluded keys (e.g., LoRA params when loading base checkpoint)
+        if self.exclude_keys:
+            model_state_dict = {k: v for k, v in model_state_dict.items() if k not in self.exclude_keys}
+
         return model_state_dict
 
     @torch.no_grad()
@@ -69,12 +190,40 @@ class ModelState(Stateful):
         perform the reverse operation for state_dict()
         need to drop EP-dim when loading from DCP checkpoints
         so that EP-FSDP would not be confused
+
+        Uses strict=False to allow loading checkpoints that don't have LoRA
+        parameters (e.g., loading from a base model checkpoint into a LoRA-enabled model).
+        Missing parameters (like lora_A, lora_B) will retain their initialized values.
         """
+        from torch.distributed.checkpoint.state_dict import StateDictOptions
+
         model_state_dict = state_dict
         if self.should_ep_aware:
             model_state_dict = self.get_state_dict_without_ep_dim(model_state_dict)
 
-        set_model_state_dict(model=self.model, model_state_dict=model_state_dict)
+        # Use strict=False to allow missing LoRA parameters when loading from
+        # a checkpoint that was saved before LoRA was injected
+        options = StateDictOptions(strict=False)
+        incompatible = set_model_state_dict(
+            model=self.model, model_state_dict=model_state_dict, options=options
+        )
+
+        # Log missing/unexpected keys for debugging
+        if incompatible.missing_keys:
+            # Filter to show only non-LoRA missing keys as warnings
+            non_lora_missing = [k for k in incompatible.missing_keys if "lora_" not in k]
+            lora_missing = [k for k in incompatible.missing_keys if "lora_" in k]
+            if lora_missing:
+                logger.info_rank0(
+                    f"LoRA parameters not in checkpoint (will use initialized values): "
+                    f"{len(lora_missing)} params"
+                )
+            if non_lora_missing:
+                logger.warning(
+                    f"Missing non-LoRA keys in checkpoint: {non_lora_missing}"
+                )
+        if incompatible.unexpected_keys:
+            logger.warning(f"Unexpected keys in checkpoint: {incompatible.unexpected_keys}")
 
     def get_state_dict_with_ep_dim(self, state_dict):
         ep_fqn2spec_info = self.ep_fqn2spec_info
@@ -368,6 +517,9 @@ class DistributedCheckpointer(CheckpointerBase):
                 ),
             )
 
+        # Save checkpoint metadata for compatibility validation
+        _save_checkpoint_metadata(checkpoint_dir, state["model"])
+
         logger.info_rank0(f"Saved checkpoint to {checkpoint_dir}")
 
     @classmethod
@@ -376,12 +528,14 @@ class DistributedCheckpointer(CheckpointerBase):
         path: str,
         state: Dict[str, Any],
         process_group=None,
+        strict: bool = True,
     ) -> Dict[str, Any]:
         """
         load training state from distributed checkpoint
         args:
             path: path to load checkpoint
             state: state to load, "model" are required,  "optimizer" and "extra_state" are optional
+            strict: if True, raise error on checkpoint/model mismatch (except LoRA params)
 
         return:
             state: state loaded
@@ -394,8 +548,19 @@ class DistributedCheckpointer(CheckpointerBase):
         if "model" not in state:
             raise ValueError("Model must be provided to load a distributed checkpoint.")
 
-        load_state = {"model": ModelState(state["model"])}
-        if "optimizer" in state:
+        # Validate checkpoint compatibility before loading
+        validation_result = _validate_checkpoint_compatibility(checkpoint_dir, state["model"], strict=strict)
+
+        # Determine keys to exclude from loading (e.g., LoRA params not in checkpoint)
+        exclude_keys: Set[str] = set()
+        if validation_result.get("validated") and validation_result.get("load_mode") == "base_to_lora":
+            # Loading base checkpoint into LoRA model - exclude LoRA params from model state
+            # so DCP doesn't try to load them from checkpoint
+            exclude_keys = set(validation_result.get("missing_lora_keys", []))
+            logger.info_rank0(f"Excluding {len(exclude_keys)} LoRA parameters from checkpoint load")
+
+        load_state = {"model": ModelState(state["model"], exclude_keys=exclude_keys)}
+        if "optimizer" in state and state["optimizer"] is not None:
             load_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])  # type: ignore[index]
 
         dcp.load(

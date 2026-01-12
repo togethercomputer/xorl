@@ -10,26 +10,23 @@ import torch.nn as nn
 
 from .modules.base import LoraModule
 from .modules.linear import LoraLinear
+from xorl.models.transformers.qwen3_moe.modeling_qwen3_moe import (
+    Qwen3MoeSparseExperts,
+    Qwen3MoeFusedExperts,
+)
+from xorl.models.transformers.qwen3_moe.qwen3_moe_lora import (
+    Qwen3MoeSparseExpertsWithLoRA,
+    Qwen3MoeFusedExpertsWithLoRA,
+)
 
 
 # Mapping from source module type to LoRA class
 # To add support for new module types, add entries here
-# MoEExperts catches all subclasses (Qwen3MoeSparseExperts, Qwen3MoeTritonExperts, etc.)
 LORA_MAPPING: Dict[Type[nn.Module], Type[Union[LoraModule, nn.Module]]] = {
     nn.Linear: LoraLinear,
+    Qwen3MoeSparseExperts: Qwen3MoeSparseExpertsWithLoRA,
+    Qwen3MoeFusedExperts: Qwen3MoeFusedExpertsWithLoRA,
 }
-
-# MoE mapping is registered lazily to avoid circular import:
-# moe/lora.py → xorl.lora.modules.base → xorl.lora.__init__ → mapping → moe (cycle)
-_moe_registered = False
-
-
-def _ensure_moe_mapping():
-    global _moe_registered
-    if not _moe_registered:
-        _moe_registered = True
-        from xorl.models.layers.moe import MoEExperts, MoEExpertsLoRA
-        LORA_MAPPING[MoEExperts] = MoEExpertsLoRA
 
 
 def get_lora_class_for_module(module: nn.Module) -> Optional[Type[Union[LoraModule, nn.Module]]]:
@@ -48,8 +45,6 @@ def get_lora_class_for_module(module: nn.Module) -> Optional[Type[Union[LoraModu
         >>> lora_cls
         <class 'xorl.lora.modules.linear.LoraLinear'>
     """
-    _ensure_moe_mapping()
-
     # Don't wrap modules that are already LoRA modules
     if isinstance(module, LoraModule):
         return None

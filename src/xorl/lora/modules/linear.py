@@ -191,19 +191,19 @@ class LoraLinear(LoraModule, nn.Linear):
 
     def merge_weights(self) -> None:
         """
-        Merge LoRA weights into base weight and reset LoRA parameters.
+        Merge LoRA weights into base weight for inference.
 
         After merging: weight = weight + lora_B @ lora_A * scaling
-        Then resets LoRA (kaiming for A, zeros for B) so training can continue
-        with the delta absorbed into the base weight.
 
-        Used both for periodic merge during training (merge_lora_interval)
-        and one-shot merge for inference.
+        This is useful for inference when you want to eliminate the
+        LoRA computation overhead.
+
+        Warning: This modifies the weight in-place and is not reversible.
         """
         with torch.no_grad():
+            # delta_weight = lora_B @ lora_A * scaling
             delta_weight = self.get_delta_weight()
             self.weight.add_(delta_weight.to(self.weight.dtype))
-            self.reset_lora_parameters()
 
     def extra_repr(self) -> str:
         # Extend nn.Linear's extra_repr with LoRA-specific info

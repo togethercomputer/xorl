@@ -4,7 +4,7 @@ LoRA module base class.
 Defines the abstract interface that all LoRA module implementations must follow.
 """
 
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from typing import Iterator, TypeVar
 
 import torch
@@ -15,7 +15,7 @@ import torch.nn as nn
 T = TypeVar("T", bound="LoraModule")
 
 
-class LoraModule:
+class LoraModule(ABC):
     """
     Abstract base class for LoRA (Low-Rank Adaptation) modules.
 
@@ -90,6 +90,7 @@ class LoraModule:
         """
         pass
 
+    @abstractmethod
     def get_delta_weight(self) -> torch.Tensor:
         """
         Compute the delta weight from LoRA matrices.
@@ -99,15 +100,8 @@ class LoraModule:
 
         Returns:
             Delta weight tensor with same shape as base weight
-
-        Note:
-            Not all LoRA modules implement this (e.g. MoE modules with multiple
-            projections). Use merge_weights() directly for those cases.
         """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not implement get_delta_weight(). "
-            "For MoE modules, use merge_weights() directly."
-        )
+        pass
 
     @abstractmethod
     def merge_weights(self) -> None:
