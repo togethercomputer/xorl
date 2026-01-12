@@ -8,16 +8,20 @@ Supports both dense layers (nn.Linear) and MoE expert blocks
 with Xorl group GEMM kernels for efficient forward/backward passes.
 """
 
-from xorl.lora.layers import LoraLinear
-from xorl.lora.moe_layers import (
-    MoELoraLayer,
-    MoEFusedLoraLayer,
-    Qwen3MoELoraAdapter,
+# Base class and implementations
+from xorl.lora.modules import LoraModule, LoraLinear
+
+# Mapping
+from xorl.lora.mapping import (
+    LORA_MAPPING,
+    can_apply_lora,
+    get_lora_class_for_module,
+    register_lora_mapping,
 )
+
+# Utility functions
 from xorl.lora.utils import (
     inject_lora_into_model,
-    inject_lora_into_moe_blocks,
-    inject_lora_into_model_with_moe,
     get_lora_state_dict,
     get_moe_lora_state_dict,
     get_all_lora_state_dict,
@@ -34,8 +38,10 @@ from xorl.models.transformers.qwen3_moe.qwen3_moe_lora import (
     LoRAConfig,
     Qwen3MoeFusedExpertsWithLoRA,
     Qwen3MoeSparseMoeBlockWithLoRA,
+    Qwen3MoeSparseFusedMoeBlockWithLoRA,
     copy_weights_to_lora_experts,
-    create_lora_experts_from_base,
+    create_sparse_lora_experts_from_base,
+    create_fused_lora_experts_from_base,
     mark_only_lora_as_trainable,
     lora_state_dict,
 )
@@ -50,30 +56,37 @@ from xorl.ops.group_gemm.kernel import (
 )
 
 __all__ = [
+    # Base class
+    "LoraModule",
     # Dense LoRA
     "LoraLinear",
+    # Mapping
+    "LORA_MAPPING",
+    "can_apply_lora",
+    "get_lora_class_for_module",
+    "register_lora_mapping",
+    # Injection utilities
     "inject_lora_into_model",
+    # State dict utilities
     "get_lora_state_dict",
-    "load_lora_state_dict",
-    "freeze_base_parameters",
-    "get_lora_parameters",
-    "save_lora_checkpoint",
-    "load_lora_checkpoint",
-    "count_lora_parameters",
-    # MoE LoRA (weight-merging approach)
-    "MoELoraLayer",
-    "MoEFusedLoraLayer",
-    "Qwen3MoELoraAdapter",
-    "inject_lora_into_moe_blocks",
-    "inject_lora_into_model_with_moe",
     "get_moe_lora_state_dict",
     "get_all_lora_state_dict",
+    "load_lora_state_dict",
+    # Parameter utilities
+    "freeze_base_parameters",
+    "get_lora_parameters",
+    "count_lora_parameters",
+    # Checkpoint utilities
+    "save_lora_checkpoint",
+    "load_lora_checkpoint",
     # Xorl MoE LoRA (inline computation - recommended)
     "LoRAConfig",
     "Qwen3MoeFusedExpertsWithLoRA",
     "Qwen3MoeSparseMoeBlockWithLoRA",
+    "Qwen3MoeSparseFusedMoeBlockWithLoRA",
     "copy_weights_to_lora_experts",
-    "create_lora_experts_from_base",
+    "create_sparse_lora_experts_from_base",
+    "create_fused_lora_experts_from_base",
     "mark_only_lora_as_trainable",
     "lora_state_dict",
     # Xorl ops
