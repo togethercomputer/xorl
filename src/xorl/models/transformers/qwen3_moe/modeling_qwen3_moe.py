@@ -29,15 +29,11 @@ from transformers.modeling_outputs import (
     MoeCausalLMOutputWithPast,
     MoeModelOutputWithPast,
     ModelOutput,
-    QuestionAnsweringModelOutput,
-    SequenceClassifierOutputWithPast,
-    TokenClassifierOutput,
 )
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import (
-    add_code_sample_docstrings,
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
     replace_return_docstrings,
@@ -188,7 +184,9 @@ class Qwen3MoeMLP(nn.Module):
             return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
-class Qwen3MoeExperts(nn.Module):
+class Qwen3MoeSparseExperts(nn.Module):
+    """Expert module for eager/sparse MoE computation (loops over experts one by one)."""
+
     def __init__(self, config):
         super().__init__()
         self.num_experts = config.num_experts
@@ -208,29 +206,68 @@ class Qwen3MoeExperts(nn.Module):
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, hidden_states, expert_idx=None, routing_weights=None, selected_experts=None):
-        if expert_idx is not None:
-            assert not get_parallel_state().ep_enabled, "_moe_implementation=`eager` does not support EP"
-            gate_proj_out = torch.matmul(hidden_states, self.gate_proj[expert_idx].transpose(0, 1))
-            up_proj_out = torch.matmul(hidden_states, self.up_proj[expert_idx].transpose(0, 1))
+    def forward(self, hidden_states, expert_idx):
+        """Forward pass for a single expert.
 
-            out = self.act_fn(gate_proj_out) * up_proj_out
-            out = torch.matmul(out, self.down_proj[expert_idx].transpose(0, 1))
-        else:
-            assert routing_weights is not None and selected_experts is not None, (
-                "routing_weights and selected_experts must be provided when expert_idx is None"
-            )
+        Args:
+            hidden_states: Input tensor of shape (num_tokens, hidden_dim)
+            expert_idx: Index of the expert to use
 
-            out = fused_moe_forward(
-                module=self,
-                num_experts=self.num_experts,
-                routing_weights=routing_weights,
-                selected_experts=selected_experts,
-                hidden_states=hidden_states,
-                fc1_1_weight=self.gate_proj,
-                fc1_2_weight=self.up_proj,
-                fc2_weight=self.down_proj,
-            )
+        Returns:
+            Output tensor of shape (num_tokens, hidden_dim)
+        """
+        assert not get_parallel_state().ep_enabled, "_moe_implementation=`eager` does not support EP"
+        gate_proj_out = torch.matmul(hidden_states, self.gate_proj[expert_idx].transpose(0, 1))
+        up_proj_out = torch.matmul(hidden_states, self.up_proj[expert_idx].transpose(0, 1))
+
+        out = self.act_fn(gate_proj_out) * up_proj_out
+        out = torch.matmul(out, self.down_proj[expert_idx].transpose(0, 1))
+        return out
+
+
+class Qwen3MoeFusedExperts(nn.Module):
+    """Expert module for fused MoE computation (uses optimized fused kernels)."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.hidden_dim = config.hidden_size
+        self.intermediate_size = config.moe_intermediate_size
+        self.gate_proj = torch.nn.Parameter(
+            torch.empty(self.num_experts, self.intermediate_size, self.hidden_dim),
+            requires_grad=True,
+        )
+        self.up_proj = torch.nn.Parameter(
+            torch.empty(self.num_experts, self.intermediate_size, self.hidden_dim),
+            requires_grad=True,
+        )
+        self.down_proj = torch.nn.Parameter(
+            torch.empty(self.num_experts, self.hidden_dim, self.intermediate_size),
+            requires_grad=True,
+        )
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, hidden_states, routing_weights, selected_experts):
+        """Forward pass using fused MoE kernels.
+
+        Args:
+            hidden_states: Input tensor of shape (num_tokens, hidden_dim)
+            routing_weights: Routing weights of shape (num_tokens, top_k)
+            selected_experts: Selected expert indices of shape (num_tokens, top_k)
+
+        Returns:
+            Output tensor of shape (num_tokens, hidden_dim)
+        """
+        out = fused_moe_forward(
+            module=self,
+            num_experts=self.num_experts,
+            routing_weights=routing_weights,
+            selected_experts=selected_experts,
+            hidden_states=hidden_states,
+            fc1_1_weight=self.gate_proj,
+            fc1_2_weight=self.up_proj,
+            fc2_weight=self.down_proj,
+        )
         return out
 
 
@@ -383,6 +420,7 @@ class Qwen3MoeAttention(nn.Module):
 class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.config = config
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
@@ -390,7 +428,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         # gating
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
 
-        self.experts = Qwen3MoeExperts(config)
+        self.experts = Qwen3MoeSparseExperts(config)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """ """
@@ -444,72 +482,7 @@ class Qwen3MoeSparseFusedMoeBlock(nn.Module):
         # gating
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
 
-        self.experts = Qwen3MoeExperts(config)
-
-        # LoRA adapter tracking (None until inject_lora is called)
-        self.lora_adapter = None
-
-    def inject_lora(
-        self,
-        r: int = 16,
-        lora_alpha: int = 16,
-        shared_lora: bool = False,
-        target_modules: list = None,
-    ) -> None:
-        """
-        Inject LoRA adapters into this MoE block.
-
-        After calling this method, the experts module will be replaced with
-        a LoRA-enabled version that computes LoRA deltas during forward pass.
-
-        Args:
-            r: LoRA rank
-            lora_alpha: LoRA alpha for scaling
-            shared_lora: If True, share LoRA across all experts (currently ignored,
-                        per-expert LoRA is always used for correctness)
-            target_modules: Which projections to apply LoRA to.
-                          Options: ["gate_proj", "up_proj", "down_proj"]
-                          Default: all three projections
-        """
-        from .qwen3_moe_lora import LoRAConfig, Qwen3MoeFusedExpertsWithLoRA
-
-        if target_modules is None:
-            target_modules = ["gate_proj", "up_proj", "down_proj"]
-
-        # Create LoRA config
-        lora_config = LoRAConfig(
-            r=r,
-            lora_alpha=lora_alpha,
-            target_modules=target_modules,
-            use_rslora=False,
-        )
-
-        # Create LoRA-enabled experts
-        lora_experts = Qwen3MoeFusedExpertsWithLoRA(self.config, lora_config)
-
-        # Move to same device and dtype as original experts
-        lora_experts = lora_experts.to(
-            device=self.experts.gate_proj.device,
-            dtype=self.experts.gate_proj.dtype,
-        )
-
-        # Copy base weights from original experts
-        with torch.no_grad():
-            lora_experts.gate_proj.copy_(self.experts.gate_proj)
-            lora_experts.up_proj.copy_(self.experts.up_proj)
-            lora_experts.down_proj.copy_(self.experts.down_proj)
-
-        # Replace experts module
-        self.experts = lora_experts
-
-        # Mark that LoRA has been injected (for state dict extraction)
-        self.lora_adapter = "injected"  # Marker for inject_lora_into_moe_blocks detection
-
-        # Freeze base expert weights (already done in Qwen3MoeFusedExpertsWithLoRA)
-        logger.debug(
-            f"Injected MoE LoRA with r={r}, alpha={lora_alpha}, "
-            f"target_modules={target_modules}"
-        )
+        self.experts = Qwen3MoeFusedExperts(config)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """ """
@@ -525,13 +498,7 @@ class Qwen3MoeSparseFusedMoeBlock(nn.Module):
         # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
 
-        final_hidden_states = torch.zeros(
-            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
-        )
-
-        final_hidden_states = self.experts(
-            hidden_states, routing_weights=routing_weights, selected_experts=selected_experts
-        )
+        final_hidden_states = self.experts(hidden_states, routing_weights, selected_experts)
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states, router_logits
 
@@ -557,7 +524,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         if (layer_idx not in config.mlp_only_layers) and (
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
-            moe_implementation = getattr(config, "_moe_implementation", "eager")
+            moe_implementation = getattr(config, "_moe_implementation", "fused")
             self.mlp = QWEN3_MOE_CLASSES[moe_implementation](config)
         else:
             self.mlp = Qwen3MoeMLP(config, intermediate_size=config.intermediate_size)
@@ -1321,287 +1288,6 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
         )
 
 
-@add_start_docstrings(
-    """
-    The Qwen3Moe Model transformer with a sequence classification head on top (linear layer).
-
-    [`Qwen3MoeForSequenceClassification`] uses the last token in order to do the classification, as other causal models
-    (e.g. GPT-2) do.
-
-    Since it does classification on the last token, it requires to know the position of the last token. If a
-    `pad_token_id` is defined in the configuration, it finds the last token that is not a padding token in each row. If
-    no `pad_token_id` is defined, it simply takes the last value in each row of the batch. Since it cannot guess the
-    padding tokens when `inputs_embeds` are passed instead of `input_ids`, it does the same (take the last value in
-    each row of the batch).
-    """,
-    QWEN3_MOE_START_DOCSTRING,
-)
-class Qwen3MoeForSequenceClassification(Qwen3MoePreTrainedModel):
-    def __init__(self, config):
-        super().__init__(config)
-        self.num_labels = config.num_labels
-        self.model = Qwen3MoeModel(config)
-        self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    def get_input_embeddings(self):
-        return self.model.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.model.embed_tokens = value
-
-    @add_start_docstrings_to_model_forward(QWEN3_MOE_INPUTS_DOCSTRING)
-    def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, SequenceClassifierOutputWithPast]:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
-            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
-            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
-        """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        transformer_outputs = self.model(
-            input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-        hidden_states = transformer_outputs[0]
-        logits = self.score(hidden_states)
-
-        if input_ids is not None:
-            batch_size = input_ids.shape[0]
-        else:
-            batch_size = inputs_embeds.shape[0]
-
-        if self.config.pad_token_id is None and batch_size != 1:
-            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-        if self.config.pad_token_id is None:
-            last_non_pad_token = -1
-        elif input_ids is not None:
-            # To handle both left- and right- padding, we take the rightmost token that is not equal to pad_token_id
-            non_pad_mask = (input_ids != self.config.pad_token_id).to(logits.device, torch.int32)
-            token_indices = torch.arange(input_ids.shape[-1], device=logits.device, dtype=torch.int32)
-            last_non_pad_token = (token_indices * non_pad_mask).argmax(-1)
-        else:
-            last_non_pad_token = -1
-            logger.warning_once(
-                f"{self.__class__.__name__} will not detect padding tokens in `inputs_embeds`. Results may be "
-                "unexpected if using padding tokens in conjunction with `inputs_embeds.`"
-            )
-
-        pooled_logits = logits[torch.arange(batch_size, device=logits.device), last_non_pad_token]
-
-        loss = None
-        if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, pooled_logits=pooled_logits, config=self.config)
-
-        if not return_dict:
-            output = (pooled_logits,) + transformer_outputs[1:]
-            return ((loss,) + output) if loss is not None else output
-
-        return SequenceClassifierOutputWithPast(
-            loss=loss,
-            logits=pooled_logits,
-            past_key_values=transformer_outputs.past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
-        )
-
-
-@add_start_docstrings(
-    """
-    The Qwen3Moe Model transformer with a token classification head on top (a linear layer on top of the hidden-states
-    output) e.g. for Named-Entity-Recognition (NER) tasks.
-    """,
-    QWEN3_MOE_START_DOCSTRING,
-)
-class Qwen3MoeForTokenClassification(Qwen3MoePreTrainedModel):
-    def __init__(self, config):
-        super().__init__(config)
-        self.num_labels = config.num_labels
-        self.model = Qwen3MoeModel(config)
-        if getattr(config, "classifier_dropout", None) is not None:
-            classifier_dropout = config.classifier_dropout
-        elif getattr(config, "hidden_dropout", None) is not None:
-            classifier_dropout = config.hidden_dropout
-        else:
-            classifier_dropout = 0.1
-        self.dropout = nn.Dropout(classifier_dropout)
-        self.score = nn.Linear(config.hidden_size, config.num_labels)
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    def get_input_embeddings(self):
-        return self.model.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.model.embed_tokens = value
-
-    @add_start_docstrings_to_model_forward(QWEN3_MOE_INPUTS_DOCSTRING)
-    @add_code_sample_docstrings(
-        checkpoint=_CHECKPOINT_FOR_DOC,
-        output_type=TokenClassifierOutput,
-        config_class=_CONFIG_FOR_DOC,
-    )
-    def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, TokenClassifierOutput]:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
-            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
-            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
-        """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        outputs = self.model(
-            input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-        sequence_output = outputs[0]
-        sequence_output = self.dropout(sequence_output)
-        logits = self.score(sequence_output)
-
-        loss = None
-        if labels is not None:
-            loss = self.loss_function(logits, labels, self.config)
-
-        if not return_dict:
-            output = (logits,) + outputs[2:]
-            return ((loss,) + output) if loss is not None else output
-
-        return TokenClassifierOutput(
-            loss=loss,
-            logits=logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
-
-
-@add_start_docstrings(
-    """
-The Qwen3Moe Model transformer with a span classification head on top for extractive question-answering tasks like
-SQuAD (a linear layer on top of the hidden-states output to compute `span start logits` and `span end logits`).
-    """,
-    QWEN3_MOE_START_DOCSTRING,
-)
-class Qwen3MoeForQuestionAnswering(Qwen3MoePreTrainedModel):
-    base_model_prefix = "transformer"
-
-    def __init__(self, config):
-        super().__init__(config)
-        self.transformer = Qwen3MoeModel(config)
-        self.qa_outputs = nn.Linear(config.hidden_size, 2)
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    def get_input_embeddings(self):
-        return self.transformer.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.transformer.embed_tokens = value
-
-    @add_start_docstrings_to_model_forward(QWEN3_MOE_INPUTS_DOCSTRING)
-    def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        start_positions: Optional[torch.LongTensor] = None,
-        end_positions: Optional[torch.LongTensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        **kwargs,
-    ) -> Union[Tuple, QuestionAnsweringModelOutput]:
-        r"""
-        start_positions (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for position (index) of the start of the labelled span for computing the token classification loss.
-            Positions are clamped to the length of the sequence (`sequence_length`). Position outside of the sequence
-            are not taken into account for computing the loss.
-        end_positions (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for position (index) of the end of the labelled span for computing the token classification loss.
-            Positions are clamped to the length of the sequence (`sequence_length`). Position outside of the sequence
-            are not taken into account for computing the loss.
-        """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        outputs = self.transformer(
-            input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
-        sequence_output = outputs[0]
-
-        logits = self.qa_outputs(sequence_output)
-        start_logits, end_logits = logits.split(1, dim=-1)
-        start_logits = start_logits.squeeze(-1).contiguous()
-        end_logits = end_logits.squeeze(-1).contiguous()
-
-        loss = None
-        if start_positions is not None and end_positions is not None:
-            loss = self.loss_function(start_logits, end_logits, start_positions, end_positions, **kwargs)
-
-        if not return_dict:
-            output = (start_logits, end_logits) + outputs[2:]
-            return ((loss,) + output) if loss is not None else output
-
-        return QuestionAnsweringModelOutput(
-            loss=loss,
-            start_logits=start_logits,
-            end_logits=end_logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
-
-
 if is_liger_kernel_available():
     apply_rotary_pos_emb = liger_rotary_pos_emb
     Qwen3MoeRMSNorm = LigerRMSNorm
@@ -1612,9 +1298,10 @@ ModelClass = Qwen3MoeForCausalLM
 
 __all__ = [
     "Qwen3MoeForCausalLM",
-    "Qwen3MoeForQuestionAnswering",
     "Qwen3MoeModel",
     "Qwen3MoePreTrainedModel",
-    "Qwen3MoeForSequenceClassification",
-    "Qwen3MoeForTokenClassification",
+    "Qwen3MoeSparseExperts",
+    "Qwen3MoeFusedExperts",
+    "Qwen3MoeSparseMoeBlock",
+    "Qwen3MoeSparseFusedMoeBlock",
 ]

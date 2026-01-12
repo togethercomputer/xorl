@@ -17,11 +17,11 @@ import json
 import os
 import re
 import time
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, List, Literal, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, List, Literal, Optional, Sequence, Set, Tuple, Union
 
 import torch
 
@@ -59,6 +59,257 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
+
+
+# =============================================================================
+# MoE Expert Weight Auto-Merge Utilities
+# =============================================================================
+
+# Pattern to match per-expert HuggingFace weight keys
+# Qwen format: model.layers.{layer}.mlp.experts.{expert}.{gate|up|down}_proj.weight
+# DeepSeek format: model.layers.{layer}.mlp.experts.{expert}.{gate|up|down}_proj.weight
+_EXPERT_KEY_PATTERN = re.compile(
+    r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.weight$"
+)
+
+# Pattern to check if model expects fused expert format
+_FUSED_EXPERT_PATTERN = re.compile(
+    r"^model\.layers\.\d+\.mlp\.experts\.(gate|up|down)_proj$"
+)
+
+
+def _get_checkpoint_keys(weights_path: str) -> Optional[Set[str]]:
+    """
+    Get checkpoint weight keys from the index file without loading tensors.
+
+    For sharded checkpoints, reads the index JSON file to get all keys.
+    For single-file checkpoints, reads keys from the safetensors metadata.
+
+    Args:
+        weights_path: Path to the checkpoint directory or file.
+
+    Returns:
+        Set of weight keys, or None if keys cannot be retrieved.
+    """
+    cache_kwargs = {"_raise_exceptions_for_missing_entries": False}
+
+    # Try sharded safetensors index
+    resolved_index = cached_file(weights_path, SAFE_WEIGHTS_INDEX_NAME, **cache_kwargs)
+    if resolved_index:
+        try:
+            with open(resolved_index, "r") as f:
+                index_data = json.load(f)
+            return set(index_data.get("weight_map", {}).keys())
+        except Exception:
+            return None
+
+    # Try single safetensors file
+    resolved_weight_file = cached_file(weights_path, SAFE_WEIGHTS_NAME, **cache_kwargs)
+    if resolved_weight_file:
+        try:
+            with safe_open(resolved_weight_file, framework="pt", device="cpu") as f:
+                return set(f.keys())
+        except Exception:
+            return None
+
+    # Try sharded pytorch index
+    resolved_index = cached_file(weights_path, WEIGHTS_INDEX_NAME, **cache_kwargs)
+    if resolved_index:
+        try:
+            with open(resolved_index, "r") as f:
+                index_data = json.load(f)
+            return set(index_data.get("weight_map", {}).keys())
+        except Exception:
+            return None
+
+    return None
+
+
+def _checkpoint_has_per_expert_weights(checkpoint_keys: Set[str]) -> bool:
+    """
+    Check if checkpoint has per-expert weight format (needs merging).
+
+    Per-expert format: model.layers.{layer}.mlp.experts.{expert}.{gate|up|down}_proj.weight
+
+    Args:
+        checkpoint_keys: Set of weight keys from checkpoint.
+
+    Returns:
+        True if checkpoint has per-expert format, False if already fused or no MoE.
+    """
+    for key in checkpoint_keys:
+        if _EXPERT_KEY_PATTERN.match(key):
+            return True
+    return False
+
+
+def parse_expert_key(key: str) -> Optional[Tuple[int, int, str]]:
+    """
+    Parse a per-expert weight key to extract layer index, expert index, and projection name.
+
+    Args:
+        key: Weight key like "model.layers.0.mlp.experts.5.gate_proj.weight"
+
+    Returns:
+        Tuple of (layer_idx, expert_idx, proj_name) or None if not a per-expert key.
+        proj_name is one of "gate", "up", "down".
+    """
+    match = _EXPERT_KEY_PATTERN.match(key)
+    if match:
+        return int(match.group(1)), int(match.group(2)), match.group(3)
+    return None
+
+
+def _model_needs_expert_merging(parameter_names: Set[str]) -> bool:
+    """
+    Check if the model expects fused expert format.
+
+    Returns True if the model has parameters like "model.layers.*.mlp.experts.gate_proj"
+    (stacked format) rather than per-expert format.
+    """
+    for name in parameter_names:
+        if _FUSED_EXPERT_PATTERN.match(name):
+            return True
+    return False
+
+
+class ExpertWeightBuffer:
+    """
+    Buffer for collecting per-expert weights and merging them into stacked tensors.
+
+    This class handles the accumulation of individual expert weights from HuggingFace
+    checkpoints and stacks them into the fused format expected by xorl's MoE implementation.
+
+    Optimized for performance:
+    - Pre-allocates stacked tensor on first expert arrival
+    - Copies each expert directly into slice as it arrives (streaming)
+    - Avoids intermediate buffering and torch.stack overhead
+
+    Usage:
+        buffer = ExpertWeightBuffer(num_experts=128)
+        for key, tensor in checkpoint:
+            parsed = parse_expert_key(key)
+            if parsed:
+                layer_idx, expert_idx, proj = parsed
+                buffer.add(layer_idx, expert_idx, proj, tensor)
+                if buffer.is_complete(layer_idx, proj):
+                    stacked = buffer.pop_stacked(layer_idx, proj)
+                    # dispatch stacked tensor to model
+    """
+
+    def __init__(self, num_experts: int):
+        """
+        Initialize the expert weight buffer.
+
+        Args:
+            num_experts: Total number of experts expected per layer.
+        """
+        self.num_experts = num_experts
+        # {(layer_idx, proj_name): pre-allocated stacked tensor}
+        self._stacked_buffers: Dict[Tuple[int, str], torch.Tensor] = {}
+        # {(layer_idx, proj_name): set of expert indices that have been filled}
+        self._filled_experts: Dict[Tuple[int, str], Set[int]] = defaultdict(set)
+
+    def add(self, layer_idx: int, expert_idx: int, proj: str, tensor: torch.Tensor) -> None:
+        """
+        Add a per-expert tensor to the buffer.
+
+        On first expert for a (layer, proj), pre-allocates the full stacked tensor.
+        Each expert tensor is copied directly into its slice as it arrives.
+
+        Args:
+            layer_idx: Layer index (0-indexed)
+            expert_idx: Expert index within the layer (0-indexed)
+            proj: Projection name ("gate", "up", or "down")
+            tensor: The weight tensor for this expert's projection
+        """
+        key = (layer_idx, proj)
+
+        # Pre-allocate stacked tensor on first expert
+        if key not in self._stacked_buffers:
+            # Allocate on CPU with same dtype, shape = [num_experts, *tensor.shape]
+            stacked_shape = (self.num_experts,) + tensor.shape
+            self._stacked_buffers[key] = torch.empty(
+                stacked_shape, dtype=tensor.dtype, device="cpu"
+            )
+
+        # Copy directly into the pre-allocated slice
+        self._stacked_buffers[key][expert_idx].copy_(tensor)
+        self._filled_experts[key].add(expert_idx)
+
+    def is_complete(self, layer_idx: int, proj: str) -> bool:
+        """
+        Check if all experts for a given (layer, projection) have been collected.
+
+        Args:
+            layer_idx: Layer index
+            proj: Projection name
+
+        Returns:
+            True if all num_experts tensors have been collected.
+        """
+        key = (layer_idx, proj)
+        return len(self._filled_experts.get(key, set())) == self.num_experts
+
+    def pop_stacked(self, layer_idx: int, proj: str) -> torch.Tensor:
+        """
+        Return the completed stacked tensor. Removes from buffer.
+
+        Args:
+            layer_idx: Layer index
+            proj: Projection name
+
+        Returns:
+            Stacked tensor of shape [num_experts, ...] where ... is the per-expert shape.
+
+        Raises:
+            KeyError: If the (layer, proj) combination doesn't exist in buffer.
+            ValueError: If not all experts have been collected.
+        """
+        key = (layer_idx, proj)
+        if key not in self._stacked_buffers:
+            raise KeyError(f"No buffered experts for layer {layer_idx}, projection {proj}")
+
+        filled = self._filled_experts.pop(key)
+        if len(filled) != self.num_experts:
+            raise ValueError(
+                f"Incomplete experts for layer {layer_idx}, {proj}_proj: "
+                f"got {len(filled)}, expected {self.num_experts}"
+            )
+
+        # Return pre-allocated tensor directly (all copies already done in add())
+        return self._stacked_buffers.pop(key)
+
+    @staticmethod
+    def get_fused_name(layer_idx: int, proj: str) -> str:
+        """
+        Get the fused parameter name for a (layer, projection) combination.
+
+        Args:
+            layer_idx: Layer index
+            proj: Projection name ("gate", "up", or "down")
+
+        Returns:
+            Parameter name like "model.layers.0.mlp.experts.gate_proj"
+        """
+        return f"model.layers.{layer_idx}.mlp.experts.{proj}_proj"
+
+    def get_pending_keys(self) -> List[Tuple[int, str]]:
+        """
+        Get list of (layer_idx, proj) combinations that have partial data.
+
+        Useful for debugging and error reporting.
+        """
+        return list(self._stacked_buffers.keys())
+
+    def get_pending_counts(self) -> Dict[Tuple[int, str], int]:
+        """
+        Get counts of collected experts for each pending (layer, proj).
+
+        Returns:
+            Dict mapping (layer_idx, proj) to number of experts collected.
+        """
+        return {key: len(experts) for key, experts in self._filled_experts.items()}
 
 
 @contextmanager
@@ -350,6 +601,24 @@ def _convert_weight_key(key: str, model: "PreTrainedModel") -> str:
     return key
 
 
+def _get_num_experts_from_config(model: Union["nn.Module", "PreTrainedModel"]) -> Optional[int]:
+    """
+    Get the number of experts from model config.
+
+    Supports both Qwen (num_experts) and DeepSeek (n_routed_experts) naming conventions.
+    """
+    if not hasattr(model, "config"):
+        return None
+    config = model.config
+    # Qwen format
+    if hasattr(config, "num_experts"):
+        return config.num_experts
+    # DeepSeek format
+    if hasattr(config, "n_routed_experts"):
+        return config.n_routed_experts
+    return None
+
+
 @torch.no_grad()
 def load_model_weights(
     model: Union["nn.Module", "PreTrainedModel"],
@@ -359,6 +628,12 @@ def load_model_weights(
 ) -> None:
     """
     Loads pre-trained model states in transformers' format.
+
+    Supports automatic merging of per-expert MoE weights into stacked format.
+    If the model expects fused expert format (e.g., moe_implementation='fused')
+    but the checkpoint has per-expert weights, they will be automatically merged.
+
+    Also supports loading already-fused checkpoints directly (no merging needed).
     """
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
     parameter_names_to_load = {name for name, _ in model.named_parameters()}
@@ -368,6 +643,35 @@ def load_model_weights(
     parallel_plan = None
     if hasattr(model, "get_parallel_plan"):
         parallel_plan = model.get_parallel_plan()
+
+    # Detect checkpoint format and initialize expert buffer only if needed
+    expert_buffer = None
+    model_needs_fused = _model_needs_expert_merging(parameter_names_to_load)
+
+    if model_needs_fused:
+        # Check checkpoint format to decide if merging is needed
+        checkpoint_keys = _get_checkpoint_keys(weights_path)
+        if checkpoint_keys is not None:
+            checkpoint_has_per_expert = _checkpoint_has_per_expert_weights(checkpoint_keys)
+            if checkpoint_has_per_expert:
+                num_experts = _get_num_experts_from_config(model)
+                if num_experts is not None:
+                    expert_buffer = ExpertWeightBuffer(num_experts)
+                    logger.info_rank0(
+                        f"MoE checkpoint format: per-expert (will merge {num_experts} experts into fused format)"
+                    )
+            else:
+                logger.info_rank0(
+                    "MoE checkpoint format: already fused (direct loading, no merge needed)"
+                )
+        else:
+            # Fallback: couldn't read checkpoint keys, enable merging to be safe
+            num_experts = _get_num_experts_from_config(model)
+            if num_experts is not None:
+                expert_buffer = ExpertWeightBuffer(num_experts)
+                logger.info_rank0(
+                    f"MoE auto-merge enabled: will merge {num_experts} per-expert weights if needed"
+                )
 
     # Retry loading state dict on OSError (e.g., HuggingFace download issues)
     max_retries = 3
@@ -403,6 +707,31 @@ def load_model_weights(
             # on model structure. See the comment for details.
             name = _convert_weight_key(name, model)
 
+            # Check if this is a per-expert key that needs merging
+            if expert_buffer is not None:
+                parsed = parse_expert_key(name)
+                if parsed is not None:
+                    layer_idx, expert_idx, proj = parsed
+                    expert_buffer.add(layer_idx, expert_idx, proj, tensor)
+
+                    # If all experts collected, stack and dispatch
+                    if expert_buffer.is_complete(layer_idx, proj):
+                        fused_name = ExpertWeightBuffer.get_fused_name(layer_idx, proj)
+                        stacked = expert_buffer.pop_stacked(layer_idx, proj)
+
+                        if fused_name in parameter_names_to_load:
+                            parameter_names_to_load.remove(fused_name)
+                            _dispatch_parameter(model, fused_name, stacked, dtensor_factory, parallel_plan)
+                            logger.info_rank0(
+                                f"Auto-merged experts for {fused_name}: {stacked.shape}"
+                            )
+                        else:
+                            logger.warning(
+                                f"Auto-merged expert key {fused_name} not found in model parameters"
+                            )
+                    continue  # Don't process as normal key
+
+            # Normal processing for non-expert keys
             if name in buffer_dict.keys():  # persistent buffers
                 buffer_dict[name] = tensor.clone()
             elif name in parameter_names_to_load:
@@ -413,6 +742,15 @@ def load_model_weights(
 
         del state_dict_iterator
         empty_cache()
+
+    # Check for incomplete expert buffers (shouldn't happen with valid checkpoints)
+    if expert_buffer is not None:
+        pending = expert_buffer.get_pending_counts()
+        if pending:
+            logger.warning(
+                f"Incomplete expert weights after loading all shards: {pending}. "
+                f"Some experts may be missing from the checkpoint."
+            )
 
     post_process_after_weight_loading(model, buffer_dict, parameter_names_to_load, dtensor_factory)
 
@@ -428,6 +766,13 @@ def rank0_load_and_broadcast_weights(
     This functions serves as the same purpose as `load_model_weights`
     but reduces disk I/O by broadcasting weights from rank0.
     In comparison, `load_model_weights` would require every GPU to go through the entire model weights on disk.
+
+    Supports automatic merging of per-expert MoE weights into stacked format.
+    If the model expects fused expert format (e.g., moe_implementation='fused')
+    but the checkpoint has per-expert weights, they will be automatically merged on rank0
+    before broadcasting.
+
+    Also supports loading already-fused checkpoints directly (no merging needed).
     """
     if not dist.is_available() or not dist.is_initialized():
         logger.warning_once("Distributed environment not initialized, falling back to load_model_weights.")
@@ -444,6 +789,35 @@ def rank0_load_and_broadcast_weights(
 
     global_rank = get_parallel_state().global_rank
     torch_device = torch.device(init_device)
+
+    # Detect checkpoint format and initialize expert buffer only if needed
+    expert_buffer = None
+    model_needs_fused = _model_needs_expert_merging(parameter_names_to_load)
+
+    if model_needs_fused:
+        # Check checkpoint format to decide if merging is needed
+        checkpoint_keys = _get_checkpoint_keys(weights_path)
+        if checkpoint_keys is not None:
+            checkpoint_has_per_expert = _checkpoint_has_per_expert_weights(checkpoint_keys)
+            if checkpoint_has_per_expert:
+                num_experts = _get_num_experts_from_config(model)
+                if num_experts is not None:
+                    expert_buffer = ExpertWeightBuffer(num_experts)
+                    logger.info_rank0(
+                        f"MoE checkpoint format: per-expert (will merge {num_experts} experts into fused format)"
+                    )
+            else:
+                logger.info_rank0(
+                    "MoE checkpoint format: already fused (direct loading, no merge needed)"
+                )
+        else:
+            # Fallback: couldn't read checkpoint keys, enable merging to be safe
+            num_experts = _get_num_experts_from_config(model)
+            if num_experts is not None:
+                expert_buffer = ExpertWeightBuffer(num_experts)
+                logger.info_rank0(
+                    f"MoE auto-merge enabled: will merge {num_experts} per-expert weights if needed"
+                )
 
     # get the safetensor file iterator
     state_dict_iterators = _load_state_dict(weights_path) if global_rank == 0 else None
@@ -470,6 +844,10 @@ def rank0_load_and_broadcast_weights(
     else:
         shard_iterable = enumerate(range(shard_count))
 
+    # Queue for merged tensors ready to broadcast (used when auto-merge is enabled)
+    # This allows rank0 to buffer per-expert weights and broadcast merged results
+    merged_queue: List[Tuple[str, torch.Tensor]] = []
+
     # iterate safetensor files; each file would have a iterator to read weight keys and tensors
     for shard_idx, shard_payload in shard_iterable:
         state_dict_iterator = shard_payload if global_rank == 0 else None
@@ -478,17 +856,60 @@ def rank0_load_and_broadcast_weights(
         while True:
             # read tensors from safetensor
             tensor: Optional["torch.Tensor"] = None
+            broadcast_name: Optional[str] = None
+            broadcast_tensor: Optional[torch.Tensor] = None
 
             if global_rank == 0:
-                try:
-                    key, tensor = next(iterator)  # type: ignore[arg-type]
-                    key = _convert_weight_key(key, model)
-                    logger.info_rank0(f"loading {key=}")
-                    if torch.count_nonzero(tensor) == 0:
-                        logger.warning_rank0(f"Detected tensor with all-zero values when reading safetensor: {key=}")
-                    metadata = BroadcastMetadata(False, key, tensor.shape, tensor.dtype)
-                except StopIteration:
-                    metadata = BroadcastMetadata(True, None, None, None)
+                # First, check if we have merged tensors ready to broadcast
+                if merged_queue:
+                    broadcast_name, broadcast_tensor = merged_queue.pop(0)
+                    metadata = BroadcastMetadata(False, broadcast_name, broadcast_tensor.shape, broadcast_tensor.dtype)
+                else:
+                    # Read next tensor from checkpoint
+                    try:
+                        key, tensor = next(iterator)  # type: ignore[arg-type]
+                        key = _convert_weight_key(key, model)
+                        logger.info_rank0(f"loading {key=}")
+                        if torch.count_nonzero(tensor) == 0:
+                            logger.warning_rank0(f"Detected tensor with all-zero values when reading safetensor: {key=}")
+
+                        # Check if this is a per-expert key that needs merging
+                        if expert_buffer is not None:
+                            parsed = parse_expert_key(key)
+                            if parsed is not None:
+                                layer_idx, expert_idx, proj = parsed
+                                expert_buffer.add(layer_idx, expert_idx, proj, tensor)
+
+                                # If all experts collected, queue merged tensor for broadcast
+                                if expert_buffer.is_complete(layer_idx, proj):
+                                    fused_name = ExpertWeightBuffer.get_fused_name(layer_idx, proj)
+                                    stacked = expert_buffer.pop_stacked(layer_idx, proj)
+                                    merged_queue.append((fused_name, stacked))
+                                    logger.info_rank0(
+                                        f"Auto-merged experts for {fused_name}: {stacked.shape}"
+                                    )
+
+                                # Continue reading - don't broadcast per-expert tensors
+                                # Signal to skip this iteration with a special metadata
+                                metadata = BroadcastMetadata(False, "__SKIP__", None, None)
+                            else:
+                                # Normal key - broadcast directly
+                                broadcast_name = key
+                                broadcast_tensor = tensor
+                                metadata = BroadcastMetadata(False, key, tensor.shape, tensor.dtype)
+                        else:
+                            # No auto-merge - broadcast directly
+                            broadcast_name = key
+                            broadcast_tensor = tensor
+                            metadata = BroadcastMetadata(False, key, tensor.shape, tensor.dtype)
+
+                    except StopIteration:
+                        # Check if we have remaining merged tensors to broadcast
+                        if merged_queue:
+                            broadcast_name, broadcast_tensor = merged_queue.pop(0)
+                            metadata = BroadcastMetadata(False, broadcast_name, broadcast_tensor.shape, broadcast_tensor.dtype)
+                        else:
+                            metadata = BroadcastMetadata(True, None, None, None)
             else:
                 metadata = BroadcastMetadata(False, None, None, None)
 
@@ -499,16 +920,21 @@ def rank0_load_and_broadcast_weights(
             if metadata.done:
                 break
 
+            # Handle skip signal (rank0 is still buffering per-expert weights)
+            if metadata.name == "__SKIP__":
+                continue
+
             name = metadata.name
             shape = metadata.shape
             dtype = metadata.dtype
             if name is None or shape is None or dtype is None:
                 raise RuntimeError("Received incomplete broadcast metadata.")
             logger.info_rank0(f"rank0_load_and_broadcast_weights: broadcasting {name=}")
+
             if global_rank != 0:
                 tensor = torch.empty(shape, dtype=dtype, device=torch_device)
             else:
-                tensor = tensor.to(torch_device, non_blocking=True)  # type: ignore[assignment]
+                tensor = broadcast_tensor.to(torch_device, non_blocking=True)  # type: ignore[assignment]
 
             start_time = time.perf_counter()
             dist.broadcast(tensor, src=0)
@@ -531,6 +957,15 @@ def rank0_load_and_broadcast_weights(
             del state_dict_iterator
 
         empty_cache()
+
+    # Check for incomplete expert buffers (shouldn't happen with valid checkpoints)
+    if expert_buffer is not None and global_rank == 0:
+        pending = expert_buffer.get_pending_counts()
+        if pending:
+            logger.warning(
+                f"Incomplete expert weights after loading all shards: {pending}. "
+                f"Some experts may be missing from the checkpoint."
+            )
 
     post_process_after_weight_loading(model, buffer_dict, parameter_names_to_load, dtensor_factory)
 
