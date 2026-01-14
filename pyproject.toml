@@ -36,11 +36,16 @@ dependencies = [
   "msgpack",
   "fastapi",
   "peft",
-  "torch==2.9.1+cu128",
+  # PyTorch nightly (2.11+) with CUDA 12.8 for FA4 support
+  "torch>=2.11.0.dev",
   "torchvision",
   "torchaudio",
-  "flash-attn",
-  "nvidia-nccl-cu12==2.27.5",
+  "triton",
+  "nvidia-nccl-cu12",
+  "nvidia-nvshmem-cu12",
+  # FA4 (Flash Attention 4) dependencies
+  "flash-attn-cute",
+  "apache-tvm-ffi==0.1.6"
 ]
 
 [project.optional-dependencies]
@@ -90,19 +95,18 @@ test = [
 required-version = ">=0.8.14"
 
 [[tool.uv.index]]
-name = "pytorch"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-nightly"
+url = "https://download.pytorch.org/whl/nightly/cu128"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch" }
-torchvision = { index = "pytorch" }
-torchaudio = { index = "pytorch" }
-flash-attn = [
-  { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.0/flash_attn-2.8.3+cu128torch2.9-cp310-cp310-linux_x86_64.whl", marker = "python_version == '3.10'" },
-  { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.0/flash_attn-2.8.3+cu128torch2.9-cp311-cp311-linux_x86_64.whl", marker = "python_version == '3.11'" },
-  { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.0/flash_attn-2.8.3+cu128torch2.9-cp312-cp312-linux_x86_64.whl", marker = "python_version == '3.12'" },
-]
+torch = { index = "pytorch-nightly" }
+torchvision = { index = "pytorch-nightly" }
+torchaudio = { index = "pytorch-nightly" }
+triton = { index = "pytorch-nightly" }
+nvidia-nccl-cu12 = { index = "pytorch-nightly" }
+nvidia-nvshmem-cu12 = { index = "pytorch-nightly" }
+flash-attn-cute = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "flash_attn/cute" }
 
 
 [tool.setuptools.dynamic]
