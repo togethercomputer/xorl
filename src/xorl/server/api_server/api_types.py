@@ -465,7 +465,7 @@ class SaveLoRAOnlyResponse(BaseModel):
 class CheckpointInfo(BaseModel):
     """Information about a single checkpoint."""
 
-    checkpoint_id: str = Field(..., description="The checkpoint ID (e.g., 'weights/000' or 'sampler_weights/step-100')")
+    checkpoint_id: str = Field(..., description="The checkpoint ID (e.g., 'weights/model_id/name' or 'sampler_weights/name')")
     checkpoint_type: Literal["training", "sampler"] = Field(..., description="The type of checkpoint")
     time: str = Field(..., description="ISO format timestamp when the checkpoint was created")
     path: str = Field(..., description="The xorl:// path to the checkpoint")
@@ -490,12 +490,14 @@ class ListCheckpointsResponse(BaseModel):
 class DeleteCheckpointRequest(BaseModel):
     """API request for deleting a checkpoint.
 
-    The checkpoint_id should be in the format 'weights/{name}' or 'sampler_weights/{name}'.
+    The checkpoint_id should be in the format:
+    - 'weights/{model_id}/{name}' for training checkpoints
+    - 'sampler_weights/{name}' for sampler checkpoints (flat, no model_id)
     """
 
-    model_id: str = Field(default="default", description="Model identifier")
+    model_id: str = Field(default="default", description="Model identifier (used for training checkpoints)")
     checkpoint_id: str = Field(
-        ..., description="Checkpoint ID to delete (e.g., 'weights/000' or 'sampler_weights/step-100')"
+        ..., description="Checkpoint ID to delete (e.g., 'weights/model_id/ckpt-001' or 'sampler_weights/adapter-001')"
     )
 
 
@@ -739,12 +741,14 @@ class CreateSamplingSessionRequest(BaseModel):
     """API request for creating a sampling session.
 
     This loads the specified LoRA adapter on all inference workers.
-    The model_path must start with 'sampler_weights/' or 'xorl://'.
+    The model_path can be:
+    - 'sampler_weights/adapter_name'
+    - 'adapter_name' (just the name)
     """
 
     model_path: str = Field(
         ...,
-        description="Path to the LoRA adapter (e.g., 'xorl://default/sampler_weights/step-100' or 'sampler_weights/step-100')",
+        description="Path to the LoRA adapter (e.g., 'sampler_weights/adapter-001' or just 'adapter-001')",
     )
 
 
