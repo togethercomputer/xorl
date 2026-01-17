@@ -323,6 +323,7 @@ def save_lora_checkpoint(
     target_modules: Optional[List[str]] = None,
     r: Optional[int] = None,
     lora_alpha: Optional[int] = None,
+    moe_hybrid_shared_lora: bool = False,
 ) -> str:
     """
     Save LoRA weights in PEFT-compatible format.
@@ -383,6 +384,9 @@ def save_lora_checkpoint(
 
         vLLM expects per-expert format:
             model.layers.0.mlp.experts.0.gate_proj.lora_A.weight  # shape: [r, hidden_dim]
+
+        For hybrid shared LoRA, shared weights (shape[0] == 1) are named with
+        ".shared." instead of expert index to indicate they're shared across experts.
         """
         match = moe_lora_pattern.match(name)
         if not match:
@@ -395,12 +399,22 @@ def save_lora_checkpoint(
         num_experts = stacked_tensor.shape[0]
         result = {}
 
-        for expert_idx in range(num_experts):
-            expert_tensor = stacked_tensor[expert_idx]
-            # Build vLLM-compatible key:
-            # base_model.model.{prefix}.mlp.experts.{idx}.{proj}.lora_{A|B}.weight
-            peft_key = f"base_model.model.{prefix}.mlp.experts.{expert_idx}.{proj_name}.lora_{lora_type}.weight"
-            result[peft_key] = expert_tensor
+        # Check if this is a shared weight (hybrid shared LoRA)
+        is_shared = (num_experts == 1)
+
+        if is_shared:
+            # Shared weight: use ".shared." in the key name
+            expert_tensor = stacked_tensor[0]
+            peft_key = f"base_model.model.{prefix}.mlp.experts.shared.{proj_name}.lora_{lora_type}.weight"
+            result[peft_key] = expert_tensor.to(torch.bfloat16)
+        else:
+            # Per-expert weights: use expert index in the key name
+            for expert_idx in range(num_experts):
+                expert_tensor = stacked_tensor[expert_idx]
+                # Build vLLM-compatible key:
+                # base_model.model.{prefix}.mlp.experts.{idx}.{proj}.lora_{A|B}.weight
+                peft_key = f"base_model.model.{prefix}.mlp.experts.{expert_idx}.{proj_name}.lora_{lora_type}.weight"
+                result[peft_key] = expert_tensor.to(torch.bfloat16)
 
         return result
 
@@ -437,7 +451,7 @@ def save_lora_checkpoint(
 
             # Convert to PEFT key format
             peft_key = f"base_model.model.{_convert_to_peft_key(key)}"
-            peft_state_dict[peft_key] = value
+            peft_state_dict[peft_key] = value.to(torch.bfloat16)
 
     # Auto-detect parameters if not provided
     if target_modules is None:
@@ -470,6 +484,7 @@ def save_lora_checkpoint(
         "peft_type": "LORA",
         "inference_mode": True,
         "fan_in_fan_out": False,
+        "moe_hybrid_shared_lora": moe_hybrid_shared_lora,
     }
 
     config_path = os.path.join(save_path, "adapter_config.json")
@@ -575,6 +590,157 @@ def count_lora_parameters(model: nn.Module) -> Tuple[int, int, float]:
     percentage = 100 * trainable_params / total_params if total_params > 0 else 0
 
     return trainable_params, total_params, percentage
+
+
+def inject_lora_into_moe_blocks(
+    model: nn.Module,
+    r: int = 16,
+    lora_alpha: int = 16,
+    shared_lora: bool = False,
+    target_modules: Optional[List[str]] = None,
+    hybrid_shared: bool = False,
+) -> int:
+    """
+    Inject LoRA adapters into fused MoE blocks.
+
+    This function finds all MoE block instances in the model that support
+    LoRA injection (Qwen3MoeSparseFusedMoeBlock) and injects LoRA adapters
+    into their expert weights.
+
+    Supported MoE implementations:
+    - moe_implementation='fused': Uses Qwen3MoeSparseFusedMoeBlock with group GEMM LoRA
+
+    Args:
+        model: Model containing MoE blocks
+        r: LoRA rank
+        lora_alpha: LoRA alpha for scaling
+        shared_lora: If True, share LoRA across all experts (more parameter efficient)
+        target_modules: Which expert projections to apply LoRA to.
+                       Options: ["gate_proj", "up_proj", "down_proj"]
+                       Default: all three projections
+        hybrid_shared: If True, use hybrid sharing (lora_A shared for gate/up, lora_B shared for down)
+
+    Returns:
+        Number of MoE blocks that received LoRA adapters
+
+    Example:
+        >>> model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-30B-A3B")
+        >>> num_blocks = inject_lora_into_moe_blocks(
+        ...     model,
+        ...     r=16,
+        ...     lora_alpha=32,
+        ...     target_modules=["gate_proj", "up_proj", "down_proj"]
+        ... )
+        >>> print(f"Injected LoRA into {num_blocks} MoE blocks")
+    """
+    if target_modules is None:
+        target_modules = ["gate_proj", "up_proj", "down_proj"]
+
+    injected_count = 0
+
+    for name, module in model.named_modules():
+        # Check if this is a MoE block that supports LoRA injection
+        if hasattr(module, 'inject_lora') and hasattr(module, 'lora_adapter'):
+            # This is a Qwen3MoeSparseFusedMoeBlock or similar
+            module.inject_lora(
+                r=r,
+                lora_alpha=lora_alpha,
+                shared_lora=shared_lora,
+                target_modules=target_modules,
+                hybrid_shared=hybrid_shared,
+            )
+            injected_count += 1
+            logger.debug(f"Injected MoE LoRA into {name}")
+
+    if injected_count > 0:
+        logger.info(
+            f"Injected LoRA into {injected_count} MoE blocks with r={r}, "
+            f"alpha={lora_alpha}, shared={shared_lora}, hybrid_shared={hybrid_shared}"
+        )
+    else:
+        logger.warning(
+            "No LoRA-compatible MoE blocks found. Make sure model uses "
+            "moe_implementation='fused'"
+        )
+
+    return injected_count
+
+
+def inject_lora_into_model_with_moe(
+    model: nn.Module,
+    r: int = 16,
+    lora_alpha: int = 16,
+    target_modules: Optional[List[str]] = None,
+    moe_shared_lora: bool = False,
+    moe_hybrid_shared_lora: bool = False,
+) -> nn.Module:
+    """
+    Inject LoRA adapters into both dense layers and MoE expert blocks.
+
+    This is a comprehensive LoRA injection function that handles:
+    1. Standard nn.Linear layers (attention projections, dense MLP layers)
+    2. Fused MoE expert blocks (Qwen3MoeSparseFusedMoeBlock, Qwen3MoeSparseFusedSgemmBlock)
+
+    For MoE models like Qwen3 MoE, some layers have dense MLP (nn.Linear modules)
+    and others have MoE blocks. This function handles both cases:
+    - Dense MLP layers get LoRA via inject_lora_into_model (replaces nn.Linear with LoraLinear)
+    - MoE blocks get LoRA via inject_lora_into_moe_blocks (uses fused GEMM with LoRA)
+
+    Args:
+        model: Model to inject LoRA into
+        r: LoRA rank
+        lora_alpha: LoRA alpha for scaling
+        target_modules: List of module names to target.
+                       For attention: ["q_proj", "k_proj", "v_proj", "o_proj"]
+                       For MLP/experts: ["gate_proj", "up_proj", "down_proj"]
+        moe_shared_lora: If True, MoE experts share LoRA adapters (all shared)
+        moe_hybrid_shared_lora: If True, use hybrid sharing (lora_A shared for gate/up, lora_B shared for down)
+
+    Returns:
+        The model with LoRA layers injected (modified in-place)
+
+    Example:
+        >>> model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-30B-A3B")
+        >>> inject_lora_into_model_with_moe(
+        ...     model,
+        ...     r=16,
+        ...     lora_alpha=32,
+        ...     target_modules=["q_proj", "v_proj", "gate_proj", "up_proj", "down_proj"]
+        ... )
+    """
+    if target_modules is None:
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+    # Separate attention modules from MLP/expert modules
+    attention_modules = [m for m in target_modules if m in ["q_proj", "k_proj", "v_proj", "o_proj", "lm_head"]]
+    expert_modules = [m for m in target_modules if m in ["gate_proj", "up_proj", "down_proj"]]
+
+    # Step 1: Inject LoRA into standard nn.Linear layers
+    # This includes attention projections AND dense MLP layers (for layers without MoE)
+    # Note: inject_lora_into_model only affects nn.Linear modules, so it won't
+    # affect MoE expert blocks which have stacked weight tensors
+    all_linear_targets = attention_modules + expert_modules
+    if all_linear_targets:
+        inject_lora_into_model(
+            model,
+            r=r,
+            lora_alpha=lora_alpha,
+            target_modules=all_linear_targets,
+        )
+
+    # Step 2: Inject LoRA into MoE expert blocks
+    # This handles MoE layers that have fused expert weights (not nn.Linear)
+    if expert_modules:
+        inject_lora_into_moe_blocks(
+            model,
+            r=r,
+            lora_alpha=lora_alpha,
+            shared_lora=moe_shared_lora,
+            target_modules=expert_modules,
+            hybrid_shared=moe_hybrid_shared_lora,
+        )
+
+    return model
 
 
 def get_moe_lora_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
