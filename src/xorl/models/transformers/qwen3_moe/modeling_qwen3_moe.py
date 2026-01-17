@@ -484,6 +484,83 @@ class Qwen3MoeSparseFusedMoeBlock(nn.Module):
 
         self.experts = Qwen3MoeFusedExperts(config)
 
+        # LoRA adapter tracking (None until inject_lora is called)
+        self.lora_adapter = None
+
+    def inject_lora(
+        self,
+        r: int = 16,
+        lora_alpha: int = 16,
+        shared_lora: bool = False,
+        target_modules: list = None,
+        hybrid_shared: bool = False,
+    ) -> None:
+        """
+        Inject LoRA adapters into this MoE block.
+
+        After calling this method, the experts module will be replaced with
+        a LoRA-enabled version that computes LoRA deltas during forward pass.
+
+        Args:
+            r: LoRA rank
+            lora_alpha: LoRA alpha for scaling
+            shared_lora: If True, share LoRA across all experts (currently ignored,
+                        per-expert LoRA is always used for correctness)
+            target_modules: Which projections to apply LoRA to.
+                          Options: ["gate_proj", "up_proj", "down_proj"]
+                          Default: all three projections
+            hybrid_shared: If True, use hybrid sharing (lora_A shared for gate/up,
+                          lora_B shared for down)
+        """
+        from .qwen3_moe_lora import LoRAConfig, Qwen3MoeFusedExpertsWithLoRA
+
+        if target_modules is None:
+            target_modules = ["gate_proj", "up_proj", "down_proj"]
+
+        # Get num_local_experts from current (potentially EP-sharded) base weights
+        # Shape[0] is the expert dimension - if EP is enabled, this is the local count
+        num_local_experts = self.experts.gate_proj.shape[0]
+
+        # Create LoRA config
+        lora_config = LoRAConfig(
+            r=r,
+            lora_alpha=lora_alpha,
+            target_modules=target_modules,
+            use_rslora=False,
+            hybrid_shared=hybrid_shared,
+        )
+
+        # Create LoRA-enabled experts at LOCAL shape (matching EP-sharded base weights)
+        lora_experts = Qwen3MoeFusedExpertsWithLoRA(
+            self.config,
+            lora_config,
+            num_local_experts=num_local_experts,
+        )
+
+        # Move to same device and dtype as original experts
+        lora_experts = lora_experts.to(
+            device=self.experts.gate_proj.device,
+            dtype=self.experts.gate_proj.dtype,
+        )
+
+        # Copy base weights from original experts
+        with torch.no_grad():
+            lora_experts.gate_proj.copy_(self.experts.gate_proj)
+            lora_experts.up_proj.copy_(self.experts.up_proj)
+            lora_experts.down_proj.copy_(self.experts.down_proj)
+
+        # Replace experts module
+        self.experts = lora_experts
+
+        # Mark that LoRA has been injected (for state dict extraction)
+        self.lora_adapter = "injected"  # Marker for inject_lora_into_moe_blocks detection
+
+        # Freeze base expert weights (already done in Qwen3MoeFusedExpertsWithLoRA)
+        logger.debug(
+            f"Injected MoE LoRA with r={r}, alpha={lora_alpha}, "
+            f"target_modules={target_modules}"
+        )
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """ """
         batch_size, sequence_length, hidden_dim = hidden_states.shape

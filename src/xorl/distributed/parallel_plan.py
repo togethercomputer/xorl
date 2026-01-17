@@ -45,6 +45,12 @@ class ParallelPlan:
             for fqn, param in model.named_parameters():
                 for fqn_pattern, shard in self.ep_plan.items():
                     if check_fqn_match(fqn_pattern, fqn):
+                        # Shared LoRA weights have size=1 on shard dim - replicate instead of shard
+                        if param.size(shard.dim) == 1:
+                            param.spec_info = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=Replicate(), fqn=fqn)
+                            fqn2spec_info[fqn] = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=Replicate(), fqn=fqn)
+                            logger.info_rank0(f"EP replicated (shared): {fqn} {list(param.shape)}")
+                            break
                         assert param.size(shard.dim) % ep_size == 0, (
                             f"EP sharding failed for {fqn}: dim {shard.dim} size {param.size(shard.dim)} "
                             f"not divisible by ep_size {ep_size}"

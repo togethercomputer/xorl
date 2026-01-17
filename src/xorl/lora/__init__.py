@@ -22,6 +22,8 @@ from xorl.lora.mapping import (
 # Utility functions
 from xorl.lora.utils import (
     inject_lora_into_model,
+    inject_lora_into_model_with_moe,
+    inject_lora_into_moe_blocks,
     get_lora_state_dict,
     get_moe_lora_state_dict,
     get_all_lora_state_dict,
@@ -67,6 +69,8 @@ __all__ = [
     "register_lora_mapping",
     # Injection utilities
     "inject_lora_into_model",
+    "inject_lora_into_model_with_moe",
+    "inject_lora_into_moe_blocks",
     # State dict utilities
     "get_lora_state_dict",
     "get_moe_lora_state_dict",
