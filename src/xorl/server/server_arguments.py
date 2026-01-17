@@ -287,6 +287,11 @@ class ServerArguments:
         metadata={"help": "List of module names to apply LoRA to (e.g., ['q_proj', 'k_proj', 'v_proj', 'o_proj']). If None, uses default based on model architecture."}
     )
 
+    moe_hybrid_shared_lora: bool = field(
+        default=False,
+        metadata={"help": "Enable hybrid shared LoRA for MoE: share lora_A for gate/up_proj, lora_B for down_proj across experts"}
+    )
+
     def __post_init__(self):
         """Validate and set defaults."""
         # Set default paths
@@ -355,6 +360,7 @@ class ServerArguments:
                 "rank": self.lora_rank,
                 "alpha": self.lora_alpha,
                 "target_modules": self.lora_target_modules,
+                "moe_hybrid_shared": self.moe_hybrid_shared_lora,
             },
         }
         return config
