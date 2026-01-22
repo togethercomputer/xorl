@@ -206,6 +206,11 @@ class ServerArguments:
         metadata={"help": "Maximum disk usage for output_dir (e.g., '1GB', '500MB', '10GB'). Save operations will fail with StorageLimitError when limit is exceeded. Default: 10TB."}
     )
 
+    idle_session_timeout: float = field(
+        default=7200.0,
+        metadata={"help": "Idle session timeout in seconds. Sessions inactive for this duration will be automatically cleaned up. Default: 7200 (2 hours)."}
+    )
+
     load_checkpoint_path: str = field(
         default="",
         metadata={"help": "Path to checkpoint to load"}
