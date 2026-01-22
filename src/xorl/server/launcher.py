@@ -216,6 +216,7 @@ def run_api_server(
     output_dir: str = "outputs",
     base_model: Optional[str] = None,
     storage_limit: str = "10TB",
+    idle_session_timeout: float = 7200.0,
 ):
     """
     Run the API Server in a separate process.
@@ -230,6 +231,7 @@ def run_api_server(
         output_dir: Output directory for checkpoints and sampler weights (must be on shared filesystem)
         base_model: Base model name that this server is configured for (e.g., 'Qwen/Qwen2.5-3B-Instruct')
         storage_limit: Maximum disk usage for output_dir (e.g., '1GB'). Default: 10TB.
+        idle_session_timeout: Idle session timeout in seconds. Default: 7200.0 (2 hours).
     """
     from contextlib import asynccontextmanager
 
@@ -264,6 +266,7 @@ def run_api_server(
             logger.info(f"  output_dir: {output_dir}")
             logger.info(f"  base_model: {base_model}")
             logger.info(f"  storage_limit: {storage_limit}")
+            logger.info(f"  idle_session_timeout: {idle_session_timeout}s")
             api_module.api_server = APIServer(
                 engine_input_addr=engine_input_addr,
                 engine_output_addr=engine_output_addr,
@@ -271,6 +274,7 @@ def run_api_server(
                 output_dir=output_dir,
                 base_model=base_model,
                 storage_limit=storage_limit,
+                idle_session_timeout=idle_session_timeout,
             )
             await api_module.api_server.start()
             yield
@@ -372,6 +376,9 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
 
         # Storage limit (can be in train section or top-level) - limits disk usage for output_dir
         flat_config['storage_limit'] = train_config.get('storage_limit', config.get('storage_limit'))
+
+        # Idle session timeout (can be in train section or top-level) - sessions inactive for this duration are cleaned up
+        flat_config['idle_session_timeout'] = train_config.get('idle_session_timeout', config.get('idle_session_timeout', 7200.0))
 
         # Worker section
         worker_config = config.get('worker', {})
@@ -612,6 +619,14 @@ class Launcher:
         else:
             self.storage_limit = "10TB"
             logger.info(f"Using default storage_limit: {self.storage_limit}")
+
+        # Idle session timeout - prefer from ServerArguments if available
+        if self.server_args:
+            self.idle_session_timeout = self.server_args.idle_session_timeout
+            logger.info(f"Using idle_session_timeout from config: {self.idle_session_timeout}s")
+        else:
+            self.idle_session_timeout = 7200.0
+            logger.info(f"Using default idle_session_timeout: {self.idle_session_timeout}s")
 
         # Processes and subprocesses
         self.worker_process: Optional[subprocess.Popen] = None  # torchrun subprocess
@@ -912,6 +927,7 @@ class Launcher:
             logger.info(f"  output_dir: {self.output_dir}")
             logger.info(f"  base_model: {self.base_model}")
             logger.info(f"  storage_limit: {self.storage_limit}")
+            logger.info(f"  idle_session_timeout: {self.idle_session_timeout}s")
             self.api_process = mp.Process(
                 target=run_api_server,
                 args=(
@@ -924,6 +940,7 @@ class Launcher:
                     self.output_dir,
                     self.base_model,
                     self.storage_limit,
+                    self.idle_session_timeout,
                 ),
                 name="APIServer",
             )
