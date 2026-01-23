@@ -299,10 +299,10 @@ class CreateModelRequest(BaseModel):
 
 
 class CreateModelResponse(BaseModel):
-    """API response for creating a model."""
+    """API response for creating a model (Tinker-compatible)."""
 
     model_id: str = Field(..., description="Model identifier")
-    status: str = Field(..., description="Creation status")
+    type: Literal["create_model"] = Field(default="create_model", description="Response type identifier")
 
 
 class RegisterAdapterRequest(BaseModel):
@@ -319,15 +319,16 @@ class RegisterAdapterResponse(BaseModel):
     total_adapters: int = Field(..., description="Total number of registered adapters")
 
 
-class EndSessionRequest(BaseModel):
-    """API request for ending a training session."""
-    model_id: str = Field(..., description="Model identifier to end session for")
+class UnloadModelRequest(BaseModel):
+    """API request for unloading a model (Tinker-compatible)."""
+    model_id: str = Field(..., description="Model identifier to unload")
+    type: Literal["unload_model"] = Field(default="unload_model", description="Request type identifier")
 
 
-class EndSessionResponse(BaseModel):
-    """API response for ending a session."""
-    success: bool = Field(..., description="Whether the session was successfully ended")
-    model_id: str = Field(..., description="Model identifier that was cleaned up")
+class UnloadModelResponse(BaseModel):
+    """API response for unloading a model (Tinker-compatible)."""
+    model_id: str = Field(..., description="Model identifier that was unloaded")
+    type: Optional[Literal["unload_model"]] = Field(default=None, description="Response type identifier")
 
 
 class SessionInfoResponse(BaseModel):
@@ -438,8 +439,7 @@ class SaveWeightsForSamplerRequest(BaseModel):
 class SaveWeightsForSamplerResponse(BaseModel):
     """API response for saving weights for sampler."""
 
-    path: str = Field(..., description="Checkpoint path (local path)")
-    model_path: str = Field(..., description="Model path for routing (e.g., 'xorl://model-123/step-100')")
+    path: str = Field(..., description="Xorl URI for the saved checkpoint (e.g., 'xorl://model-0/sampler_weights/step-100')")
 
 
 class SaveLoRAOnlyRequest(BaseModel):
@@ -804,3 +804,87 @@ class TrainingRunsResponse(BaseModel):
 
     training_runs: List[TrainingRun] = Field(..., description="List of training runs")
     cursor: Cursor = Field(..., description="Pagination cursor information")
+
+
+# ============================================================================
+# Two-Phase Request Pattern Types
+# ============================================================================
+
+
+class UntypedAPIFuture(BaseModel):
+    """Server response containing a request_id for async result retrieval.
+
+    This is returned by endpoints like /api/v1/forward_backward in Phase 1
+    of the two-phase request pattern.
+    """
+
+    request_id: str = Field(..., description="Unique identifier for this async request")
+    model_id: Optional[str] = Field(default=None, description="Model identifier associated with this request")
+
+
+class TryAgainResponse(BaseModel):
+    """Response indicating the request is still being processed.
+
+    The client should continue polling /api/v1/retrieve_future until
+    a different response type is received.
+    """
+
+    type: Literal["try_again"] = Field(default="try_again", description="Response type identifier")
+    request_id: str = Field(..., description="The request ID being polled")
+    queue_state: Literal["active", "paused_capacity", "paused_rate_limit"] = Field(
+        default="active", description="Current state of the request in the queue"
+    )
+    queue_state_reason: Optional[str] = Field(default=None, description="Reason for the current queue state")
+
+
+class RequestErrorCategory(str):
+    """Category of error that caused a request to fail.
+
+    Values align with Tinker's RequestErrorCategory:
+    - Unknown: Error category could not be determined
+    - Server: Server-side error (may be retryable)
+    - User: User/client error (not retryable)
+
+    Note: Using str base class for JSON serialization compatibility.
+    Values are lowercase strings: "unknown", "server", "user"
+    """
+
+    Unknown = "unknown"
+    Server = "server"
+    User = "user"
+
+
+class RequestFailedResponse(BaseModel):
+    """Response indicating the request failed.
+
+    Contains the error message and category to help the client decide
+    whether to retry or report the error to the user.
+    """
+
+    error: str = Field(..., description="Human-readable error message")
+    category: str = Field(default="unknown", description="Error category (unknown, server, user)")
+
+
+class FutureRetrieveRequest(BaseModel):
+    """Request to retrieve the result of an async operation.
+
+    Sent to /api/v1/retrieve_future endpoint with the request_id obtained
+    from the initial request (UntypedAPIFuture).
+    """
+
+    request_id: str = Field(..., description="The ID of the request to retrieve results for")
+
+
+# Union of all possible responses from /api/v1/retrieve_future
+FutureRetrieveResponse = Union[
+    TryAgainResponse,
+    ForwardBackwardResponse,
+    ForwardResponse,
+    OptimStepResponse,
+    SaveWeightsResponse,
+    LoadWeightsResponse,
+    SaveWeightsForSamplerResponse,
+    CreateModelResponse,
+    UnloadModelResponse,
+    RequestFailedResponse,
+]
