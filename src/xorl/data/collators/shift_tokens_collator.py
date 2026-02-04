@@ -145,14 +145,6 @@ class ShiftTokensCollator(DataCollator):
                     shifted[key] = value[1:]
                 else:
                     shifted[key] = value
-            elif key == "attention_mask":
-                # Truncate to match shifted input_ids (drop last token)
-                if isinstance(value, torch.Tensor):
-                    shifted[key] = value[:-1]
-                elif isinstance(value, list):
-                    shifted[key] = value[:-1]
-                else:
-                    shifted[key] = value
             elif key == "position_ids":
                 # Regenerate position_ids based on new input_ids length
                 input_ids = sample.get("input_ids")
