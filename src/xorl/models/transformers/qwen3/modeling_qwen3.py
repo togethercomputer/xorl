@@ -889,7 +889,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
             slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
             hidden_states = last_hidden_state[:, slice_indices, :]
-            loss, logits = self.loss_function(hidden_states, self.lm_head.weight, labels)
+            loss, logits, _, _ = self.loss_function(hidden_states, self.lm_head.weight, labels)
 
         # Return extended output that includes last_hidden_state
         # This allows callers to access last layer hidden states without output_hidden_states=True
