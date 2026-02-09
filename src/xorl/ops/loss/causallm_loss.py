@@ -2,7 +2,6 @@ import torch
 import torch.nn.functional as F
 
 from .compiled_cross_entropy import compiled_cross_entropy_function
-from .fused_linear import fast_fused_linear_cross_entropy
 
 
 def causallm_loss_function(
@@ -19,7 +18,6 @@ def causallm_loss_function(
 
     Supports multiple computation modes:
     - "compiled": RECOMMENDED. torch.compile (1.6x speed, 16% memory)
-    - "fast_fused": Best memory (1.1x speed, 8% memory)
     - "eager": Simple F.cross_entropy baseline (may OOM at 32K)
 
     Args:
@@ -29,7 +27,7 @@ def causallm_loss_function(
                 already next-token aligned (labels[i] is the target for hidden_states[i]).
         ignore_index: Index to ignore in loss computation (default: -100)
         return_per_token: If True, return per-token logprobs and losses (default: False)
-        ce_mode: Cross-entropy mode - "compiled" (default), "fast_fused", or "eager"
+        ce_mode: Cross-entropy mode - "compiled" (default) or "eager"
         num_chunks: Number of chunks for compiled mode (default: 8).
 
     Returns:
@@ -48,9 +46,7 @@ def causallm_loss_function(
         # Compute cross-entropy based on mode
         if ce_mode == "compiled":
             per_token_ce = compiled_cross_entropy_function(hidden_states_flat, weight, labels_flat, ignore_index, num_chunks)
-        elif ce_mode == "fast_fused":
-            per_token_ce = fast_fused_linear_cross_entropy(hidden_states_flat, weight, labels_flat, ignore_index=ignore_index, reduction="none")
-        else:  # eager mode (default)
+        else:  # eager mode
             logits_flat = (hidden_states_flat @ weight.t()).float()
             per_token_ce = F.cross_entropy(logits_flat, labels_flat, reduction="none", ignore_index=ignore_index)
 
@@ -64,14 +60,10 @@ def causallm_loss_function(
 
         loss = per_token_ce.sum() / valid_mask.sum().clamp(min=1)
         return loss, None, per_token_logprobs, per_token_loss
-    # we don't need to explicitly per token ce here
     else:
         if ce_mode == "compiled":
-            per_token_ce = compiled_cross_entropy_function(hidden_states_flat, weight, labels_flat, ignore_index, num_chunks)
-            loss = per_token_ce.sum() / valid_mask.sum().clamp(min=1)
-        elif ce_mode == "fast_fused":
-            loss = fast_fused_linear_cross_entropy(hidden_states_flat, weight, labels_flat, ignore_index=ignore_index, reduction="mean")
-        else:  # eager mode (default)
+            loss = compiled_cross_entropy_function(hidden_states_flat, weight, labels_flat, ignore_index, num_chunks, reduction="mean")
+        else:  # eager mode
             loss = F.cross_entropy(hidden_states_flat @ weight.t(), labels_flat, reduction="mean", ignore_index=ignore_index)
 
         return loss, None, None, None

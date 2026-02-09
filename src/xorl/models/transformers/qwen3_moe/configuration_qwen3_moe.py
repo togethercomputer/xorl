@@ -14,7 +14,7 @@
 """Qwen3Moe model configuration"""
 
 from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_rope_utils import rope_config_validation
+from xorl.models.layers import rope_config_validation
 
 from ....utils import logging
 

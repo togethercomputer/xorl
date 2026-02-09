@@ -70,7 +70,7 @@ class ParallelState:
     pp_size: int = 1
     cp_size: int = 1
     ulysses_size: int = 1
-    dp_mode: Literal["none", "ddp", "fsdp1", "fsdp2"] = "fsdp1"
+    dp_mode: Literal["none", "ddp", "fsdp2"] = "fsdp2"
     device_type: str = get_device_type()
     include_sp_in_fsdp: bool = True
     device_mesh: Optional["DeviceMesh"] = None
@@ -254,9 +254,9 @@ class ParallelState:
 
     @property
     def fsdp_enabled(self) -> bool:
-        # FSDP is enabled if dp_mode is fsdp1/fsdp2, even with world_size=1
+        # FSDP is enabled if dp_mode is fsdp2, even with world_size=1
         # This allows using FSDP features like meta device initialization on single GPU
-        return self.dp_mode in ["fsdp1", "fsdp2"]
+        return self.dp_mode == "fsdp2"
 
     @property
     def fsdp_size(self) -> int:
@@ -425,7 +425,7 @@ def init_parallel_state(
     pp_size: int = 1,
     cp_size: int = 1,
     ulysses_size: int = 1,
-    dp_mode: Literal["none", "ddp", "fsdp1", "fsdp2"] = "fsdp1",
+    dp_mode: Literal["none", "ddp", "fsdp2"] = "fsdp2",
     device_type: str = None,
     include_sp_in_fsdp: bool = True,
     ep_outside: bool = False,

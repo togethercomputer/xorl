@@ -41,9 +41,10 @@ def compiled_cross_entropy_function(
     labels: torch.Tensor,
     ignore_index: int = -100,
     num_chunks: int = 64,
+    reduction: str = "none",
 ) -> torch.Tensor:
     """
-    Compute memory-efficient per-token cross-entropy using torch.compile.
+    Compute memory-efficient cross-entropy using torch.compile.
 
     Uses torch.compile (with auto_chunker if available) to avoid materializing
     the full [batch_size, vocab_size] logits tensor, reducing memory usage.
@@ -55,18 +56,18 @@ def compiled_cross_entropy_function(
         ignore_index: Index to ignore in loss computation (default: -100)
         num_chunks: Number of chunks for auto_chunker (default: 64). Higher values use
                    less memory but may have more overhead.
+        reduction: Loss reduction mode - "none", "mean", or "sum" (default: "none")
 
     Returns:
-        Per-token cross-entropy loss, shape (batch * seq_len,)
+        If reduction="none": per-token cross-entropy loss, shape (batch * seq_len,)
+        If reduction="mean": scalar mean loss
+        If reduction="sum": scalar sum loss
     """
-    # Get compiled cross-entropy function
-    compute_ce_fn = _get_compiled_ce_fn(num_chunks)
-    per_token_ce = compute_ce_fn(hidden_states, weight, labels, ignore_index)
-
-    return per_token_ce
+    compute_ce_fn = _get_compiled_ce_fn(num_chunks, reduction)
+    return compute_ce_fn(hidden_states, weight, labels, ignore_index)
 
 
-def _get_compiled_ce_fn(num_chunks: int) -> Callable:
+def _get_compiled_ce_fn(num_chunks: int, reduction: str = "none") -> Callable:
     """
     Get or create a compiled cross-entropy function.
 
@@ -79,22 +80,22 @@ def _get_compiled_ce_fn(num_chunks: int) -> Callable:
     Args:
         num_chunks: Number of chunks for auto_chunker. Higher values use less
                    memory but may have more overhead. 0 disables chunking.
+        reduction: Loss reduction mode - "none", "mean", or "sum".
 
     Returns:
-        Compiled function that computes per-token cross-entropy.
+        Compiled function that computes cross-entropy.
     """
-    if num_chunks not in _compiled_ce_cache:
+    cache_key = (num_chunks, reduction)
+    if cache_key not in _compiled_ce_cache:
         def _compute_ce(hidden_states, weight, labels, ignore_index):
             logits = (hidden_states @ weight.t()).float()
-            return F.cross_entropy(logits, labels, reduction="none", ignore_index=ignore_index)
+            return F.cross_entropy(logits, labels, reduction=reduction, ignore_index=ignore_index)
 
         if num_chunks > 0 and _check_auto_chunker_available():
-            # Use auto_chunker for memory-efficient chunked computation
-            _compiled_ce_cache[num_chunks] = torch.compile(
+            _compiled_ce_cache[cache_key] = torch.compile(
                 _compute_ce,
                 options={"auto_chunker.enable": True, "auto_chunker.num_chunk": num_chunks},
             )
         else:
-            # Fallback: standard torch.compile without auto_chunker
-            _compiled_ce_cache[num_chunks] = torch.compile(_compute_ce)
-    return _compiled_ce_cache[num_chunks]
+            _compiled_ce_cache[cache_key] = torch.compile(_compute_ce)
+    return _compiled_ce_cache[cache_key]

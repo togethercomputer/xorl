@@ -155,12 +155,17 @@ class PackingConcatCollator(DataCollator):
                         batch["attention_mask"], (0, pad_length), value=0
                     )
                 if "position_ids" in batch:
-                    # Pad position_ids with sequential values
+                    # Pad position_ids with sequential values chunked at 1024
+                    # so each padding "sequence" is at most 1024 tokens.
+                    # position==0 marks a new sequence boundary in cu_seq_lens,
+                    # so the modulo resets create multiple short sequences
+                    # instead of one large fake sequence that would inflate
+                    # max_length_q and waste flash attention compute.
                     pad_positions = torch.arange(
-                        0, pad_length, 
+                        pad_length,
                         dtype=batch["position_ids"].dtype,
-                        device=batch["position_ids"].device
-                    )
+                        device=batch["position_ids"].device,
+                    ) % 1024
                     batch["position_ids"] = torch.cat(
                         [batch["position_ids"], pad_positions.unsqueeze(0)], dim=1
                     )

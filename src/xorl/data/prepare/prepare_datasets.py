@@ -35,6 +35,40 @@ from .packing import PackingDataset, process_datasets_for_packing
 logger = logging.get_logger(__name__)
 
 
+def _create_dummy_dataset(seq_len: int, num_samples: int = 4096, seed: int = 42) -> HFDataset:
+    """Create a dummy tokenized dataset for benchmarking.
+
+    All ranks call this independently with the same fixed seed, producing
+    identical data without any disk I/O or rank synchronization.  Builds
+    the Arrow table directly from numpy and includes ``position_ids`` /
+    ``length`` so we can skip the slow ``process_datasets_for_packing``
+    step entirely.
+    """
+    import numpy as np
+    import pyarrow as pa
+
+    rng = np.random.RandomState(seed)
+    one_sample = rng.randint(0, 32000, size=seq_len, dtype=np.int32)
+    flat_tokens = np.tile(one_sample, num_samples)
+    offsets = np.arange(0, (num_samples + 1) * seq_len, seq_len, dtype=np.int64)
+
+    tokens = pa.ListArray.from_arrays(offsets, flat_tokens)
+
+    # position_ids: [0, 1, ..., seq_len-1] repeated for every sample
+    pos_tile = np.tile(np.arange(seq_len, dtype=np.int32), num_samples)
+    position_ids = pa.ListArray.from_arrays(offsets, pos_tile)
+
+    lengths = pa.array([seq_len] * num_samples, type=pa.int64())
+
+    table = pa.table({
+        "input_ids": tokens,
+        "labels": tokens,
+        "position_ids": position_ids,
+        "length": lengths,
+    })
+    return HFDataset(table)
+
+
 @retry_on_request_exceptions(max_retries=3, delay=5)
 def prepare_datasets(
     args: Arguments,
@@ -42,6 +76,20 @@ def prepare_datasets(
     processor: ProcessorMixin | None = None,
 ) -> tuple[Dataset, Dataset]:
     """Prepare training and evaluation datasets based on configuration. Note that this dataset is Torch Dataset, not Hugging Face Dataset."""
+
+    # Fast path: dummy dataset for benchmarking
+    datasets_configs = args.data.datasets
+    if datasets_configs and all(dc.path == "dummy" for dc in datasets_configs):
+        seq_len = datasets_configs[0].max_seq_len or args.data.sample_packing_sequence_len
+        logger.info_rank0(f"Creating dummy dataset: {4096} samples x {seq_len} tokens")
+        dataset = _create_dummy_dataset(seq_len=seq_len, seed=args.train.seed)
+
+        if args.data.sample_packing_method and args.data.sample_packing_method != "none":
+            train_dataset = PackingDataset(args, tokenizer, dataset, split="train")
+        else:
+            train_dataset = dataset
+
+        return train_dataset, None
 
     def _load_datasets():
         # Load training dataset
@@ -250,6 +298,22 @@ def _load_and_process_single_dataset(
 
     if not ("input_ids" in dataset.features and "labels" in dataset.features):
         raise ValueError("Dataset is not tokenized. Please use a tokenized dataset.")
+
+    # Filter out samples that exceed max_seq_len
+    if dataset_config.max_seq_len is not None:
+        max_len = dataset_config.max_seq_len
+        prior_len = len(dataset)
+        dataset = dataset.filter(
+            lambda example: len(example["input_ids"]) <= max_len,
+            num_proc=args.data.dataset_num_proc,
+            desc=f"Filtering samples > {max_len} tokens",
+        )
+        dropped = prior_len - len(dataset)
+        if dropped > 0:
+            logger.info_rank0(
+                f"Filtered {dropped}/{prior_len} samples exceeding max_seq_len={max_len} "
+                f"from {dataset_config.name or dataset_config.path}"
+            )
 
     # Add activations_path field if configured (for distillation training)
     if dataset_config.activations_path:

@@ -163,8 +163,6 @@ class ModelState(Stateful):
 
         # Determine whether this is EP+FSDP2 case
         # If so, we need to restore EP-dim before saving to DCP
-        # For FSDP1, it is implemented by FSDPExtension and state_dict hooks
-        # which is aumatically triggered by get_model_state_dict
         self.parallel_state = get_parallel_state()
         self.ep_fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
         self.should_ep_aware = self.ep_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
@@ -361,21 +359,19 @@ class OptimizerState(Stateful):
 
 
 def build_checkpointer(
-    dist_backend: str = "fsdp1",
+    dist_backend: str = "fsdp2",
     ckpt_manager: str = "omnistore",
 ):
     """
     create a checkpointer manager with given mode.
     Args:
-        dist_backend (str, optional): checkpoint mode. Defaults to "fsdp1".
-            fsdp1: FSDP1 checkpointer
+        dist_backend (str, optional): checkpoint mode. Defaults to "fsdp2".
             fsdp2: FSDP2 checkpointer
             ddp: DDP checkpointer
             dcp: DCP checkpoint from torch.distributed.checkpoint
             native: native checkpoint from torch.save
-        ckpt_manager (str, optional): checkpoint manager. Defaults to "bytecheckpoint".
+        ckpt_manager (str, optional): checkpoint manager.
             omnistore: omnistore checkpoint manager
-            bytecheckpoint: byted checkpoint manager
             dcp: torch dcp checkpoint manager
     Raises:
         ValueError: if ckpt_manager is not supported
@@ -387,23 +383,14 @@ def build_checkpointer(
     if ckpt_manager == "omnistore":
         if dist_backend == "ddp":
             from omnistore import DDPCheckpointer as Checkpointer
-        elif dist_backend == "fsdp1":
-            from omnistore import FSDPCheckpointer as Checkpointer
         elif dist_backend == "fsdp2":
             from omnistore import FSDP2Checkpointer as Checkpointer
-    elif ckpt_manager == "bytecheckpoint":
-        if dist_backend == "ddp":
-            from bytecheckpoint import DDPCheckpointer as Checkpointer
-        elif dist_backend == "fsdp1":
-            from bytecheckpoint import FSDPCheckpointer as Checkpointer
-        elif dist_backend == "fsdp2":
-            from bytecheckpoint import FSDP2Checkpointer as Checkpointer
     elif ckpt_manager == "dcp":
         if not is_torch_version_greater_than("2.4"):
             raise ValueError("DCP checkpoint manager requires torch version >= 2.4")
-        if dist_backend not in ["none", "ddp", "fsdp1", "fsdp2"]:
+        if dist_backend not in ["none", "ddp", "fsdp2"]:
             raise ValueError(
-                f"Unsupported distributed backend: {dist_backend} for DCP checkpoint manager, supported modes are: none, ddp, fsdp1, fsdp2"
+                f"Unsupported distributed backend: {dist_backend} for DCP checkpoint manager, supported modes are: none, ddp, fsdp2"
             )
         Checkpointer = DistributedCheckpointer
     else:

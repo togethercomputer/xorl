@@ -345,9 +345,6 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
         flat_config['tokenizer_path'] = model_config.get('tokenizer_path')
         flat_config['attn_implementation'] = model_config.get('attn_implementation', 'flash_attention_2')
         flat_config['moe_implementation'] = model_config.get('moe_implementation')
-        flat_config['force_use_huggingface'] = model_config.get('force_use_huggingface', False)
-        flat_config['use_liger'] = model_config.get('use_liger', True)
-
         # Train section
         train_config = config.get('train', {})
         flat_config['data_parallel_mode'] = train_config.get('data_parallel_mode', 'fsdp2')
@@ -382,7 +379,7 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
 
         # Worker section
         worker_config = config.get('worker', {})
-        flat_config['worker_bind_address'] = worker_config.get('bind_address', 'tcp://127.0.0.1:5556')
+        flat_config['worker_bind_address'] = worker_config.get('bind_address', 'auto')
         flat_config['worker_connection_timeout'] = worker_config.get('connection_timeout', 60.0)
         flat_config['worker_max_retries'] = worker_config.get('max_retries', 3)
 
@@ -434,10 +431,7 @@ def calculate_world_size_from_config(config_path: str) -> int:
         train_config = config
 
     # Get parallelism sizes (with defaults matching model_runner.py)
-    pp_size = train_config.get('pipeline_parallel_size', 1)
-    tp_size = train_config.get('tensor_parallel_size', 1)
     ep_size = train_config.get('expert_parallel_size', 1)
-    cp_size = train_config.get('context_parallel_size', 1)
     ulysses_size = train_config.get('ulysses_parallel_size', 1)
 
     # Data parallel sizes
@@ -447,18 +441,15 @@ def calculate_world_size_from_config(config_path: str) -> int:
     # Calculate world size
     # EP creates a separate 2D mesh where: world_size = ep_size * ep_fsdp_size
     # ep_fsdp_size contains all other parallelism dimensions
-    world_size = pp_size * dp_replicate_size * dp_shard_size * ulysses_size * cp_size * tp_size
+    world_size = dp_replicate_size * dp_shard_size * ulysses_size
     ep_fsdp_size = world_size // ep_size
 
     logger.info(f"Calculated world size from config:")
-    logger.info(f"  pipeline_parallel_size:      {pp_size}")
-    logger.info(f"  tensor_parallel_size:         {tp_size}")
     logger.info(f"  expert_parallel_size:         {ep_size}")
-    logger.info(f"  context_parallel_size:        {cp_size}")
     logger.info(f"  ulysses_parallel_size:        {ulysses_size}")
     logger.info(f"  data_parallel_replicate_size: {dp_replicate_size}")
     logger.info(f"  data_parallel_shard_size:     {dp_shard_size}")
-    logger.info(f"  ep_fsdp_size:              {ep_fsdp_size} (pp×dp_rep×dp_shard×ulysses×cp×tp / ep_size)")
+    logger.info(f"  ep_fsdp_size:              {ep_fsdp_size} (dp_rep×dp_shard×ulysses / ep_size)")
     logger.info(f"  => Total world size:          {world_size}")
 
     return world_size
@@ -583,11 +574,12 @@ class Launcher:
         # Worker address - prefer from ServerArguments if available
         if worker_address:
             self.worker_address = worker_address
-        elif self.server_args:
+        elif self.server_args and self.server_args.worker_bind_address != "auto":
             self.worker_address = self.server_args.worker_bind_address
             logger.info(f"Using worker address from config: {self.worker_address}")
         else:
-            self.worker_address = f"tcp://127.0.0.1:{self.worker_port}"
+            self.worker_address = f"tcp://127.0.0.1:{self._find_free_port()}"
+            logger.info(f"Auto-assigned worker address: {self.worker_address}")
 
         # Packing parameters - prefer from ServerArguments if available
         if self.server_args:
@@ -646,6 +638,41 @@ class Launcher:
         self.stop()
         sys.exit(0)
 
+    def _poll_future(self, request_id: str, timeout: float = 300.0, poll_interval: float = 2.0):
+        """Poll /api/v1/retrieve_future until the async operation completes.
+
+        Returns the result dict on success, raises RuntimeError on failure.
+        """
+        retrieve_url = f"http://{self.api_host}:{self.api_port}/api/v1/retrieve_future"
+        deadline = time.time() + timeout
+
+        while time.time() < deadline:
+            try:
+                resp = requests.post(
+                    retrieve_url,
+                    json={"request_id": request_id},
+                    timeout=60,
+                )
+                if resp.status_code != 200:
+                    raise RuntimeError(f"retrieve_future returned HTTP {resp.status_code}: {resp.text}")
+
+                result = resp.json()
+                # TryAgainResponse has a "type" field set to "try_again"
+                if result.get("type") == "try_again":
+                    time.sleep(poll_interval)
+                    continue
+                # RequestFailedResponse has an "error" field
+                if "error" in result:
+                    raise RuntimeError(f"Async operation failed: {result['error']}")
+                # Success
+                return result
+
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"retrieve_future request failed: {e}")
+                time.sleep(poll_interval)
+
+        raise RuntimeError(f"Timed out waiting for request {request_id} after {timeout}s")
+
     def _save_initial_checkpoint(self, max_retries: int = 3, retry_delay: float = 5.0):
         """
         Save the initial checkpoint (000000) after all components are ready.
@@ -677,7 +704,11 @@ class Launcher:
 
                 if response.status_code == 200:
                     result = response.json()
-                    logger.info(f"✓ Initial checkpoint saved: {result.get('path', '000000')}")
+                    request_id = result.get("request_id")
+                    if request_id:
+                        # Two-phase: poll until save actually completes
+                        self._poll_future(request_id)
+                    logger.info("✓ Initial checkpoint saved (000000)")
                     return True
                 elif response.status_code == 409:
                     # Checkpoint already exists - no need to retry
@@ -702,64 +733,13 @@ class Launcher:
         logger.warning("You can manually save the initial state by calling /api/v1/save_weights with path='000000'")
         return False
 
-    def _test_save_lora_only(self, max_retries: int = 3, retry_delay: float = 5.0):
-        """
-        Test saving LoRA adapter only (PEFT format) after all components are ready.
-
-        This is a dry-run test to verify that LoRA saving works correctly.
-        Only runs if LoRA is enabled in the configuration.
-
-        Args:
-            max_retries: Maximum number of retry attempts
-            retry_delay: Delay in seconds between retries
-        """
-        # Check if LoRA is enabled
-        if not self.server_args or not self.server_args.enable_lora:
-            logger.info("LoRA not enabled, skipping LoRA-only save test")
-            return False
-
-        logger.info("")
-        logger.info("=" * 70)
-        logger.info("Testing LoRA-only save (PEFT format)...")
-        logger.info("=" * 70)
-
-        api_url = f"http://{self.api_host}:{self.api_port}/api/v1/save_weights_for_sampler"
-
-        for attempt in range(max_retries):
-            try:
-                response = requests.post(
-                    api_url,
-                    json={
-                        "model_id": "default",
-                        "name": "test_lora_000000",  # Test LoRA adapter
-                    },
-                    timeout=self.operation_timeout,
-                )
-
-                if response.status_code == 200:
-                    result = response.json()
-                    saved_path = result.get('path', 'N/A')
-                    logger.info(f"✓ LoRA adapter test save successful: {saved_path}")
-                    logger.info(f"  Files: adapter_model.safetensors + adapter_config.json")
-                    return True
-                else:
-                    logger.warning(
-                        f"Failed to save test LoRA adapter (attempt {attempt + 1}/{max_retries}): "
-                        f"HTTP {response.status_code} - {response.text}"
-                    )
-
-            except requests.exceptions.RequestException as e:
-                logger.warning(
-                    f"Failed to save test LoRA adapter (attempt {attempt + 1}/{max_retries}): {e}"
-                )
-
-            if attempt < max_retries - 1:
-                logger.info(f"Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
-
-        logger.error("✗ Failed to save test LoRA adapter after all retries")
-        logger.warning("LoRA saving may not work properly")
-        return False
+    @staticmethod
+    def _find_free_port() -> int:
+        """Find and return a free TCP port."""
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(('', 0))
+            return s.getsockname()[1]
 
     def _launch_workers_with_torchrun(self):
         """Launch distributed workers using torchrun."""
@@ -967,9 +947,6 @@ class Launcher:
             # Save initial checkpoint (000) to capture the model state before any training
             self._save_initial_checkpoint()
 
-            # Test LoRA-only save if LoRA is enabled
-            self._test_save_lora_only()
-
             logger.info("")
             logger.info("=" * 70)
             logger.info("✅ All components started successfully!")
@@ -1154,7 +1131,7 @@ Server Config Overrides (--server.*):
 
 Note:
   World size is ALWAYS calculated from the config file parallelism settings:
-    world_size = pp_size * dp_replicate_size * dp_shard_size * ulysses_size * cp_size * tp_size
+    world_size = dp_replicate_size * dp_shard_size * ulysses_size
   And EP creates a separate 2D mesh where: world_size = ep_size * ep_fsdp_size;
   ep_fsdp_size will be automatically calculated through world_size / ep_size;
   Example config:
