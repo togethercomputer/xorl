@@ -1,5 +1,10 @@
-import json
 import os
+
+# Must be set before importing torch / initializing CUDA so the
+# allocator picks up the setting on first use.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import json
 import time
 from dataclasses import asdict, dataclass, field
 from functools import partial
@@ -17,12 +22,11 @@ from xorl.data.prepare.prepare_datasets import prepare_datasets
 from xorl.distributed.gradient_accumulate_loss import gradient_accumulate_loss
 from xorl.distributed.offloading import build_activation_offloading_context
 from xorl.distributed.parallel_state import get_parallel_state, init_parallel_state
+from xorl.distributed.sync_padding import synchronize_micro_batch_padding
 from xorl.distributed.torch_parallelize import build_parallelize_model
 from xorl.models import build_foundation_model, build_tokenizer, save_model_assets, save_model_weights
 from xorl.optim import build_lr_scheduler, build_optimizer
 from xorl.utils import helper
-
-from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
 
 from xorl.utils.device import (
     get_device_type,
@@ -60,10 +64,7 @@ def main():
         dp_size=args.train.data_parallel_size,
         dp_replicate_size=args.train.data_parallel_replicate_size,
         dp_shard_size=args.train.data_parallel_shard_size,
-        tp_size=args.train.tensor_parallel_size,
         ep_size=args.train.expert_parallel_size,
-        pp_size=args.train.pipeline_parallel_size,
-        cp_size=args.train.context_parallel_size,
         ulysses_size=args.train.ulysses_parallel_size,
         dp_mode=args.train.data_parallel_mode,
     )
@@ -100,7 +101,6 @@ def main():
         attn_implementation=args.model.attn_implementation,
         moe_implementation=args.model.moe_implementation,
         init_device=args.train.init_device,
-        force_use_huggingface=args.model.force_use_huggingface,
     )
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")
@@ -117,6 +117,7 @@ def main():
         basic_modules=model._no_split_modules + args.model.basic_modules,
         enable_reentrant=args.train.enable_reentrant,
         enable_forward_prefetch=args.train.enable_forward_prefetch,
+        load_weights_mode=args.train.load_weights_mode,
     )
 
     optimizer = build_optimizer(
@@ -125,6 +126,7 @@ def main():
         weight_decay=args.train.weight_decay,
         fused=True,
         optimizer_type=args.train.optimizer,
+        optimizer_dtype=args.train.optimizer_dtype,
     )
     if get_optimizer_pre_hook is not None:
         optimizer_pre_hook = get_optimizer_pre_hook(model, model_config, args.train.data_parallel_mode)
@@ -218,6 +220,9 @@ def main():
                 logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.drop_last}")
                 break
 
+            # Synchronize padding across DP ranks to prevent load imbalance
+            synchronize_micro_batch_padding(micro_batches)
+
             if global_step == 1:
                 helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
 
@@ -285,7 +290,7 @@ def main():
                 # Clean up tensors to free memory
                 del micro_batch, loss, outputs, ga_loss
             
-            # Prefer model-provided clip_grad_norm_ (now both FSDP1 and FSDP2 registers custom grad norm clipping)
+            # Prefer model-provided clip_grad_norm_ (FSDP2 registers custom grad norm clipping)
             if hasattr(model, "clip_grad_norm_"):
                 _gn = model.clip_grad_norm_(args.train.max_grad_norm)
                 grad_norm = _gn.item() if hasattr(_gn, "item") else float(_gn)
@@ -375,7 +380,8 @@ def main():
             output_dir=args.train.output_dir,
             ckpt_manager=args.train.ckpt_manager,
         )
-        save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets)
+        checkpoint_handler = model.get_checkpoint_handler() if hasattr(model, "get_checkpoint_handler") else None
+        save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets, checkpoint_handler=checkpoint_handler)
         logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
 
     dist.barrier()

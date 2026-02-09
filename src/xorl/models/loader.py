@@ -1,122 +1,56 @@
-# Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_loader/loader.py
-
-from abc import ABC
+from typing import Callable
 
 import torch
+import torch.nn as nn
 from transformers import (
     AutoModel,
     AutoModelForCausalLM,
-    AutoModelForImageTextToText,
-    AutoModelForVision2Seq,
-    PreTrainedModel,
 )
-from transformers.modeling_utils import no_init_weights
 
 from ..utils import logging
-from .module_utils import init_empty_weights, load_model_weights
+from .module_utils import init_empty_weights, all_ranks_load_weights
 from .registry import ModelRegistry
 
 
 logger = logging.get_logger(__name__)
 
 
-class BaseModelLoader(ABC):
-    def __init__(self):
-        pass
+class ModelLoader:
+    """Unified model loader for both HuggingFace and custom xorl models.
 
-    def load_model(self, model_config, **kwargs):
-        raise NotImplementedError
+    Takes a model factory callable (e.g., ``AutoModelForCausalLM.from_config``
+    or ``model_cls._from_config``) and handles meta-init, device placement,
+    and weight loading.
+    """
 
+    def __init__(self, model_factory: Callable[..., nn.Module], description: str = ""):
+        self.model_factory = model_factory
+        self.description = description
 
-class HuggingfaceLoader(BaseModelLoader):
-    def __init__(self):
-        super().__init__()
-
-    def load_model(self, init_kwargs: dict, **kwargs):
-        model_config = init_kwargs["config"]
-        architecture = _get_model_arch_from_config(model_config)
-
-        if type(model_config) in AutoModelForImageTextToText._model_mapping.keys():  # assume built-in models
-            load_class = AutoModelForImageTextToText
-        elif type(model_config) in AutoModelForVision2Seq._model_mapping.keys():  # assume built-in models
-            load_class = AutoModelForVision2Seq
-        elif "ForCausalLM" in architecture and type(model_config) in AutoModelForCausalLM._model_mapping.keys():
-            load_class = AutoModelForCausalLM
-        else:
-            load_class = AutoModel
-
-        init_device = kwargs.pop("init_device", "cuda")
-        weights_path = kwargs.pop("weights_path", None)
-        empty_init = kwargs.pop("empty_init", False)
-
+    def load_model(
+        self,
+        init_kwargs: dict,
+        weights_path: str | None = None,
+        empty_init: bool = False,
+        init_device: str = "cuda",
+    ) -> nn.Module:
         logger.info_rank0(
-            f"Loading model from Huggingface modeling.\n"
-            f"init_device: {init_device}\n"
-            f"empty_init: {empty_init}\n"
-            f"weights_path: {weights_path}"
+            f"Loading model ({self.description})\n"
+            f"init_device: {init_device}, empty_init: {empty_init}, weights_path: {weights_path}"
         )
 
-        if weights_path is None:  # init empty model from config
+        if weights_path is None:
             if init_device == "meta":
                 with init_empty_weights():
-                    logger.info_rank0("Init empty model on meta device from config without init_weights.")
-                    model = load_class.from_config(**init_kwargs)
+                    model = self.model_factory(**init_kwargs)
             else:
                 with torch.device(init_device):
-                    logger.info_rank0("Init empty model from config.")
-                    model = load_class.from_config(**init_kwargs)
+                    model = self.model_factory(**init_kwargs)
         else:
             with init_empty_weights():
-                model = load_class.from_config(**init_kwargs)
+                model = self.model_factory(**init_kwargs)
             if not empty_init:
-                load_model_weights(model, weights_path, init_device)
-
-        return model
-
-
-class CustomizedModelingLoader(BaseModelLoader):
-    def __init__(self, model_cls: PreTrainedModel):
-        super().__init__()
-        self.model_cls = model_cls
-
-    def load_model(self, init_kwargs: dict, **kwargs):
-        init_kwargs.pop("trust_remote_code", True)
-
-        init_device = kwargs.pop("init_device", "cuda")
-        weights_path = kwargs.pop("weights_path", None)
-        empty_init = kwargs.pop("empty_init", False)
-
-        logger.info_rank0(
-            f"Loading model from customized modeling.\n"
-            f"init_device: {init_device}\n"
-            f"empty_init: {empty_init}\n"
-            f"weights_path: {weights_path}"
-        )
-
-        if weights_path is None:  # init empty model from config
-            if init_device == "meta":
-                with init_empty_weights():
-                    logger.info_rank0("Init empty model on meta device from config without init_weights.")
-                    model = self.model_cls._from_config(**init_kwargs)
-            else:
-                with torch.device(init_device):
-                    logger.info_rank0("Init empty model from config.")
-                    model = self.model_cls._from_config(**init_kwargs)
-        else:
-            with init_empty_weights(), no_init_weights():
-                model = self.model_cls._from_config(**init_kwargs)
-
-            if not empty_init:
-                load_model_weights(model, weights_path, init_device)
-
-            # we should tie embeddings after loading weights because init_empty_weights() leads to untied weights,
-            if getattr(model.config, "tie_word_embeddings", True):
-                try:
-                    input_embeddings = model.get_input_embeddings()
-                    output_embeddings = model.get_output_embeddings()
-                    output_embeddings._parameters["weight"] = input_embeddings._parameters["weight"]
-                except Exception as e:
-                    logger.info_rank0(f"Failed to tie embeddings: {e}")
+                all_ranks_load_weights(model, weights_path, init_device)
 
         return model
 
@@ -128,15 +62,14 @@ def _get_model_arch_from_config(model_config):
     return arch_name
 
 
-def get_loader(model_config, force_use_huggingface):
+def get_loader(model_config) -> ModelLoader:
     model_arch = _get_model_arch_from_config(model_config)
-    loader = HuggingfaceLoader()
-    logger.info_rank0(
-        f"Loading model from customized modeling: {model_arch} ModelRegistry.supported_models {ModelRegistry.supported_models}"
-    )
-    if not force_use_huggingface:
-        if model_arch in ModelRegistry.supported_models:
-            model_cls = ModelRegistry.get_model_cls_from_model_arch(model_arch)
-            loader = CustomizedModelingLoader(model_cls=model_cls)
 
-    return loader
+    if model_arch in ModelRegistry.supported_models:
+        model_cls = ModelRegistry.get_model_cls_from_model_arch(model_arch)
+        return ModelLoader(model_cls._from_config, description=f"xorl/{model_arch}")
+
+    if "ForCausalLM" in model_arch and type(model_config) in AutoModelForCausalLM._model_mapping.keys():
+        return ModelLoader(AutoModelForCausalLM.from_config, description=f"huggingface/{model_arch}")
+
+    return ModelLoader(AutoModel.from_config, description=f"huggingface/{model_arch}")

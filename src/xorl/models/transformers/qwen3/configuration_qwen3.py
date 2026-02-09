@@ -3,7 +3,6 @@
 from transformers.configuration_utils import PretrainedConfig
 
 from ....utils import logging
-from .parallelize import TP_PLAN
 
 
 logger = logging.get_logger(__name__)
@@ -17,8 +16,17 @@ class Qwen3Config(PretrainedConfig):
     """
 
     model_type = "xorl_qwen3"
+    keys_to_ignore_at_inference = ["past_key_values"]
 
-    base_model_tp_plan = TP_PLAN
+    base_model_tp_plan = {
+        "layers.*.self_attn.q_proj": "colwise",
+        "layers.*.self_attn.k_proj": "colwise",
+        "layers.*.self_attn.v_proj": "colwise",
+        "layers.*.self_attn.o_proj": "rowwise",
+        "layers.*.mlp.gate_proj": "colwise",
+        "layers.*.mlp.up_proj": "colwise",
+        "layers.*.mlp.down_proj": "rowwise",
+    }
     base_model_pp_plan = {
         "embed_tokens": (["input_ids"], ["inputs_embeds"]),
         "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),

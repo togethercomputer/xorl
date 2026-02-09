@@ -8,8 +8,6 @@ from .base_collator import DataCollator
 from .packing_concat_collator import add_flash_attention_kwargs_from_position_ids
 from ...data.constants import IGNORE_INDEX
 from ...distributed.parallel_state import get_parallel_state
-from ...utils.seqlen_pos_transform_utils import pos2culen
-
 
 @dataclass
 class TextSequenceShardCollator(DataCollator):
@@ -40,25 +38,19 @@ class TextSequenceShardCollator(DataCollator):
         self, tensor: "torch.Tensor", dim: int = -1, pad_value: int = 0, pad_length: int = 0, sequential: bool = False
     ) -> "torch.Tensor":
         """
-        Pads a tensor with pad_length to aligns tensor with sp size.
+        Pads a tensor with pad_length to align tensor with sp size.
         """
         if pad_length == 0:
             return tensor
 
         pad_shape = list(tensor.shape)
         pad_shape[dim] = pad_length
-        # For position_ids to create one single sequence for all padded tokens
         if sequential:
-            # seq: [pad_length]
-            seq = torch.arange(pad_length, device=tensor.device, dtype=tensor.dtype)
-
-            # We want to broadcast seq along every dimension except `dim`.
-            # view_shape: [1, 1, ..., pad_length(at dim), ..., 1]  (ndim entries)
+            # Chunked arange: each 1024-token chunk is its own sequence
+            # so padding doesn't create one huge fake sequence in cu_seq_lens.
+            seq = torch.arange(pad_length, device=tensor.device, dtype=tensor.dtype) % 1024
             view_shape = [1] * tensor.ndim
             view_shape[dim] = pad_length
-
-            # seq.view(view_shape): [1, 1, ..., pad_length, ..., 1]
-            # expand to pad_shape:   [s0, s1, ..., pad_length, ..., s{n-1}]
             pad = seq.view(view_shape).expand(pad_shape)
         else:
             pad = torch.full(pad_shape, fill_value=pad_value, dtype=tensor.dtype, device=tensor.device)
@@ -129,10 +121,6 @@ class TextSequenceShardCollator(DataCollator):
         if "_original_position_ids" not in batch:
             batch["_original_position_ids"] = position_ids.clone()
 
-        # Compute cu_seqlens from FULL position_ids BEFORE any padding/slicing
-        # This gives correct sequence boundaries for flash attention
-        cu_seqlens = pos2culen(position_ids)
-
         # sp padding - pad to be divisible by sp_size
         seq_length = input_ids.size(-1)
         sp_chunk_size = (seq_length + self.sp_size - 1) // self.sp_size
@@ -146,9 +134,9 @@ class TextSequenceShardCollator(DataCollator):
                 batch["attention_mask"], dim=-1, pad_value=1, pad_length=pad_length
             )
 
-        # Pad position_ids with sequential values for padding tokens (creates one sequence for padding)
+        # Pad position_ids with chunked sequential values (1024-token chunks)
         # NOTE: position_ids is NOT sliced - it stays full length because:
-        # 1. cu_seqlens is computed from FULL position_ids (done above, before padding)
+        # 1. cu_seqlens is computed from FULL padded position_ids
         # 2. For Ulysses, all SP ranks use the SAME cu_seqlens for flash attention
         # 3. Each SP rank only processes a slice of the sequence but needs full cu_seqlens
         position_ids = self.sp_padding(
@@ -185,6 +173,10 @@ class TextSequenceShardCollator(DataCollator):
                 field_tensor = self.sp_padding(field_tensor, dim=-1, pad_value=pad_value, pad_length=pad_length)
                 batch[field] = self.sp_slice(field_tensor, dim=-1)
 
+        # Always (re)compute cu_seq_lens from the PADDED position_ids.
+        # cu_seq_lens may already exist in the batch (e.g. pre-computed by
+        # data_processor._finalize_packed_batch), but those values are stale
+        # because they were computed BEFORE SP padding was applied.
         add_flash_attention_kwargs_from_position_ids(batch)
 
         return batch
