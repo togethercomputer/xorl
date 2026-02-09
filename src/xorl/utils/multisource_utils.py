@@ -1,12 +1,6 @@
 import yaml
 
 
-try:
-    from hdfs_io import open
-except ImportError:
-    from .hdfs_io import open
-
-
 def parse_multisource_config(multisource_config_path: str):
     multisource_config = None
     with open(multisource_config_path) as f:

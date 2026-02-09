@@ -25,7 +25,6 @@ from typing import (
 import yaml
 
 
-from .utils.hdfs_io import copy, exists, makedirs
 from .utils import helper, logging
 
 T = TypeVar("T")
@@ -119,10 +118,10 @@ class DatasetConfig:
             "help": "Process dataset in N sequential chunks for memory efficiency (exclusive with `shards`)"
         },
     )
-    sequence_len: Optional[int | None] = field(
+    max_seq_len: Optional[int | None] = field(
         default=None,
         metadata={
-            "help": "The length of the sequence to use"
+            "help": "Max sequence length. Samples with input_ids longer than this are filtered out."
         },
     )
 
@@ -149,6 +148,11 @@ class DatasetConfig:
     def _validate_loading_method(self):
         """Validate the dataset loading configuration based on path and other fields"""
         path = self.path
+
+        if path == "dummy":
+            if self.type != "tokenized":
+                raise ValueError("Dummy dataset only supports type='tokenized'.")
+            return
 
         # Remote filesystem validation
         if any(
@@ -474,28 +478,6 @@ class ModelArguments:
         default_factory=dict,
         metadata={"help": "Multimodal encoder config and weights."},
     )
-    decoders: Dict[Literal["image"], Dict[str, str]] = field(
-        default_factory=dict,
-        metadata={"help": "Multimodal decoder config and weights."},
-    )
-    input_encoder: Literal["encoder", "decoder"] = field(
-        default="encoder",
-        metadata={
-            "help": "Use encoder to encode input images or use decoder.encoder to encode input images."
-        },
-    )
-    output_encoder: Literal["encoder", "decoder"] = field(
-        default="decoder",
-        metadata={
-            "help": "Use encoder to encode output images or use decoder.encoder to encode output images."
-        },
-    )
-    encode_target: bool = field(
-        default=False,
-        metadata={
-            "help": "Whether to encode target with decoder. Only supports stable diffusion as decoder."
-        },
-    )
     attn_implementation: Optional[
         Literal["eager", "sdpa", "flash_attention_2", "flash_attention_3", "flash_attention_4", "native-sparse"]
     ] = field(
@@ -512,11 +494,6 @@ class ModelArguments:
             "help": "Basic modules beyond model._no_split_modules to be sharded in FSDP."
         },
     )
-    force_use_huggingface: bool = field(
-        default=False,
-        metadata={"help": "Force loading model from huggingface."},
-    )
-
     def __post_init__(self):
         if self.config_path is None and self.model_path is None:
             raise ValueError(
@@ -544,22 +521,6 @@ class ModelArguments:
 
             if encoder_args.get("config_path") is None:
                 encoder_args["config_path"] = encoder_args["model_path"]
-
-        supported_decoder_types = ["image"]
-        for decoder_type, decoder_args in self.decoders.items():
-            if decoder_type not in supported_decoder_types:
-                raise ValueError(
-                    f"Unsupported decoder type: {decoder_type}. Should be one of {supported_decoder_types}."
-                )
-
-            if (
-                decoder_args.get("config_path") is None
-                and decoder_args.get("model_path") is None
-            ):
-                raise ValueError("`config_path` and `model_path` cannot be both empty.")
-
-            if decoder_args.get("config_path") is None:
-                decoder_args["config_path"] = decoder_args["model_path"]
 
 
 @dataclass
@@ -597,6 +558,10 @@ class TrainingArguments:
     optimizer: Literal["adamw", "anyprecision_adamw"] = field(
         default="adamw",
         metadata={"help": "Optimizer. Default to adamw."},
+    )
+    optimizer_dtype: Literal["fp32", "bf16"] = field(
+        default="bf16",
+        metadata={"help": "Dtype for optimizer states (momentum/variance) in anyprecision_adamw. Ignored for adamw."},
     )
     max_grad_norm: float = field(
         default=1.0,
@@ -646,13 +611,13 @@ class TrainingArguments:
         default=True,
         metadata={"help": "Enable fully shard for FSDP training (ZeRO-3)."},
     )
-    enable_forward_prefetch: bool = field(
-        default=True,
-        metadata={"help": "Enable forward prefetch for FSDP1."},
-    )
     enable_fsdp_offload: bool = field(
         default=False,
-        metadata={"help": "Enable CPU offload for FSDP1."},
+        metadata={"help": "Enable CPU offload for FSDP."},
+    )
+    enable_forward_prefetch: bool = field(
+        default=True,
+        metadata={"help": "Enable forward prefetch in FSDP."},
     )
     enable_activation_offload: bool = field(
         default=False,
@@ -664,14 +629,10 @@ class TrainingArguments:
             "help": "When enabling activation offload, `activation_gpu_limit` GB activations are allowed to reserve on GPU."
         },
     )
-    use_liger: bool = field(
-        default=True,
-        metadata={"help": "Use Liger kernels for optimized operations. Requires liger-kernel to be installed."},
-    )
     enable_rank0_init: bool = field(
         default=False,
         metadata={
-            "help": "Enable rank0-only initialization for FSDP1 training. Note: this argument will be deprecated in the future, please use `init_device=cpu` instead."
+            "help": "Deprecated: Use `init_device=cpu` instead."
         },
     )
     init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
@@ -680,10 +641,10 @@ class TrainingArguments:
             "help": "Device to initialize model weights. 1. `cpu`: Init parameters on CPU in rank0 only. 2. `cuda`: Init parameters on GPU. 3. `meta`: Init parameters on meta. 4. `npu`: Init parameters on Ascend NPU."
         },
     )
-    broadcast_model_weights_from_rank0: bool = field(
-        default=True,
+    load_weights_mode: Literal["broadcast", "all_ranks"] = field(
+        default="broadcast",
         metadata={
-            "help": "When enabled, only rank0 reads model weights from HuggingFace safetensor from disk. Other ranks would receive weights through broadcast. This helps to avoid disk I/O bottleneck."
+            "help": "Weight loading mode. 'broadcast': rank0 reads weights and broadcasts to other ranks (default, avoids disk I/O bottleneck). 'all_ranks': every rank reads weights from disk independently."
         },
     )
     enable_full_determinism: bool = field(
@@ -706,8 +667,8 @@ class TrainingArguments:
             "help": "Number of steps between two gc.collect. GC is disabled if it is positive."
         },
     )
-    data_parallel_mode: Literal["ddp", "fsdp1", "fsdp2"] = field(
-        default="ddp",
+    data_parallel_mode: Literal["none", "ddp", "fsdp2"] = field(
+        default="fsdp2",
         metadata={"help": "Data parallel mode."},
     )
     data_parallel_replicate_size: int = field(
@@ -718,10 +679,6 @@ class TrainingArguments:
         default=-1,
         metadata={"help": "Data parallel shard degree."},
     )
-    tensor_parallel_size: int = field(
-        default=1,
-        metadata={"help": "Tensor parallel size."},
-    )
     expert_parallel_size: int = field(
         default=1,
         metadata={"help": "Expert parallel size."},
@@ -730,19 +687,11 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Enable expert parallelism outside in ep-fsdp."},
     )
-    pipeline_parallel_size: int = field(
-        default=1,
-        metadata={"help": "Pipeline parallel size."},
-    )
     ulysses_parallel_size: int = field(
         default=1,
         metadata={"help": "Ulysses sequence parallel size."},
     )
-    context_parallel_size: int = field(
-        default=1,
-        metadata={"help": "Ring-attn context parallel size."},
-    )
-    ckpt_manager: Literal["omnistore", "dcp", "bytecheckpoint"] = field(
+    ckpt_manager: Literal["omnistore", "dcp"] = field(
         default="omnistore",
         metadata={"help": "Checkpoint manager."},
     )
@@ -833,27 +782,13 @@ class TrainingArguments:
         self.world_size = int(os.getenv("WORLD_SIZE", "1"))
         if (
             self.world_size
-            % (
-                self.pipeline_parallel_size
-                * self.ulysses_parallel_size
-                * self.context_parallel_size
-                * self.tensor_parallel_size
-            )
+            % self.ulysses_parallel_size
             != 0
         ):
             raise ValueError(
-                f"World size should be a multiple of pipeline_parallel_size: {self.pipeline_parallel_size}, ulysses_parallel_size: {self.ulysses_parallel_size}, context_parallel_size: {self.context_parallel_size}, tensor_parallel_size: {self.tensor_parallel_size}."
+                f"World size should be a multiple of ulysses_parallel_size: {self.ulysses_parallel_size}."
             )
-        assert self.tensor_parallel_size == 1, "Tensor parallel size not supported yet."
-        assert (
-            self.pipeline_parallel_size == 1
-        ), "Pipeline parallel size not supported yet."
-        self.data_parallel_size = self.world_size // (
-            self.pipeline_parallel_size
-            * self.ulysses_parallel_size
-            * self.context_parallel_size
-            * self.tensor_parallel_size
-        )
+        self.data_parallel_size = self.world_size // self.ulysses_parallel_size
 
         # configure data parallel size
         if self.data_parallel_replicate_size > 0 and self.data_parallel_shard_size > 0:
@@ -930,16 +865,6 @@ class TrainingArguments:
             raise ValueError(
                 "Gradient accumulation is not supported with FSDP offload."
             )
-
-        # Validate liger availability
-        if self.use_liger:
-            try:
-                import liger_kernel
-            except ImportError:
-                raise ImportError(
-                    "use_liger is set to True, but liger-kernel is not installed. "
-                    "Please install it with: pip install liger-kernel"
-                )
 
         if self.load_checkpoint_path == "auto":
             from .checkpoint_utils import get_checkpoint_path
@@ -1319,8 +1244,9 @@ def parse_args(rootclass: T) -> T:
                     cmd_args.append(json.dumps(arg_value))
     args, remaining_args = parser.parse_known_args(cmd_args)
     if remaining_args:
-        logger.warning(
-            f"Some specified arguments are not used by the ArgumentParser: {remaining_args}"
+        raise ValueError(
+            f"Unrecognized arguments: {remaining_args}. "
+            f"Check your config file or CLI arguments for typos or removed fields."
         )
 
     parse_result = defaultdict(dict)
@@ -1369,27 +1295,10 @@ def save_args(args: T, output_path: str) -> None:
         args (dataclass): Arguments.
         output_path (str): Output path.
     """
-    if output_path.startswith("hdfs://"):
-        local_dir = helper.get_cache_dir()
-        remote_dir = output_path
-    else:
-        logger.warning_once(
-            "Recommend to use hdfs path or hdfs_fuse path as the output path."
-        )
-        local_dir = output_path
-        remote_dir = None
-
-    os.makedirs(local_dir, exist_ok=True)
-    local_path = os.path.join(local_dir, "xorl_cli.yaml")
+    os.makedirs(output_path, exist_ok=True)
+    local_path = os.path.join(output_path, "xorl_cli.yaml")
     with open(local_path, "w") as f:
         f.write(yaml.safe_dump(asdict(args), default_flow_style=False))
-
-    if remote_dir is not None:
-        if not exists(remote_dir):
-            makedirs(remote_dir)
-
-        remote_path = os.path.join(remote_dir, "xorl_cli.yaml")
-        copy(local_path, helper.convert_hdfs_fuse_path(remote_path))
 
 
 @dataclass

@@ -64,7 +64,7 @@ def synchronize_micro_batch_padding(
     # attention.  Skip sync padding entirely in this case — the load
     # imbalance fix only applies to the pure DP setting.
     ps = get_parallel_state()
-    if ps.cp_enabled:
+    if ps.sp_enabled:
         return
 
     # Identify which paddable keys are present

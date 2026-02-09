@@ -73,11 +73,6 @@ class ServerArguments:
         metadata={"help": "MoE implementation. 'fused' uses fused MoE kernels."}
     )
 
-    force_use_huggingface: bool = field(
-        default=False,
-        metadata={"help": "Force loading model from HuggingFace"}
-    )
-
     # Multimodal model configuration
     foundation: Dict[str, str] = field(
         default_factory=dict,
@@ -89,38 +84,18 @@ class ServerArguments:
         metadata={"help": "Multimodal encoder config"}
     )
 
-    decoders: Dict[Literal["image"], Dict[str, str]] = field(
-        default_factory=dict,
-        metadata={"help": "Multimodal decoder config"}
-    )
-
     # ========================================================================
     # Parallelism Configuration
     # ========================================================================
 
-    data_parallel_mode: Optional[Literal["none", "ddp", "fsdp1", "fsdp2"]] = field(
+    data_parallel_mode: Optional[Literal["none", "ddp", "fsdp2"]] = field(
         default="fsdp2",
         metadata={"help": "Data parallelism mode. Use 'none' for single GPU without any parallelization."}
-    )
-
-    pipeline_parallel_size: int = field(
-        default=1,
-        metadata={"help": "Pipeline parallelism size"}
-    )
-
-    tensor_parallel_size: int = field(
-        default=1,
-        metadata={"help": "Tensor parallelism size"}
     )
 
     ulysses_parallel_size: int = field(
         default=1,
         metadata={"help": "Ulysses sequence parallelism size"}
-    )
-
-    context_parallel_size: int = field(
-        default=1,
-        metadata={"help": "Context parallelism size"}
     )
 
     expert_parallel_size: int = field(
@@ -182,14 +157,9 @@ class ServerArguments:
         metadata={"help": "Deprecated: Use init_device='cpu' instead"}
     )
 
-    use_liger: bool = field(
-        default=True,
-        metadata={"help": "Use Liger kernel optimizations"}
-    )
-
-    ce_mode: Literal["eager", "compiled", "fast_fused"] = field(
+    ce_mode: Literal["eager", "compiled"] = field(
         default="compiled",
-        metadata={"help": "Cross-entropy implementation: 'compiled' (RECOMMENDED, torch.compile, 1.6x speed, 16% memory), 'fast_fused' (best memory, 1.1x speed, 8% memory), or 'eager' (baseline, may OOM at 32K)"}
+        metadata={"help": "Cross-entropy implementation: 'compiled' (RECOMMENDED, torch.compile) or 'eager' (baseline, may OOM at 32K)"}
     )
 
     # ========================================================================
@@ -216,7 +186,7 @@ class ServerArguments:
         metadata={"help": "Path to checkpoint to load"}
     )
 
-    ckpt_manager: Optional[Literal["torch", "dcp", "omnistore", "bytecheckpoint"]] = field(
+    ckpt_manager: Optional[Literal["torch", "dcp", "omnistore"]] = field(
         default="dcp",
         metadata={"help": "Checkpoint manager type"}
     )
@@ -240,8 +210,8 @@ class ServerArguments:
     # ========================================================================
 
     worker_bind_address: str = field(
-        default="tcp://127.0.0.1:5556",
-        metadata={"help": "ZMQ ROUTER socket address to bind (rank 0 worker)"}
+        default="auto",
+        metadata={"help": "ZMQ ROUTER socket address to bind (rank 0 worker). 'auto' picks a free port."}
     )
 
     worker_connection_timeout: float = field(
@@ -311,8 +281,8 @@ class ServerArguments:
             raise ValueError("model_path is required for server configuration")
 
         # Validate worker address
-        if not self.worker_bind_address.startswith("tcp://"):
-            raise ValueError("worker_bind_address must be a valid ZMQ TCP address (tcp://host:port)")
+        if self.worker_bind_address != "auto" and not self.worker_bind_address.startswith("tcp://"):
+            raise ValueError("worker_bind_address must be 'auto' or a valid ZMQ TCP address (tcp://host:port)")
 
     def to_config_dict(self) -> Dict[str, Any]:
         """
@@ -328,19 +298,14 @@ class ServerArguments:
                 "tokenizer_path": self.tokenizer_path,
                 "attn_implementation": self.attn_implementation,
                 "moe_implementation": self.moe_implementation,
-                "force_use_huggingface": self.force_use_huggingface,
                 "foundation": self.foundation,
                 "encoders": self.encoders,
-                "decoders": self.decoders,
                 "basic_modules": self.basic_modules,
             },
             "train": {
                 "output_dir": self.output_dir,
                 "data_parallel_mode": self.data_parallel_mode,
-                "pipeline_parallel_size": self.pipeline_parallel_size,
-                "tensor_parallel_size": self.tensor_parallel_size,
                 "ulysses_parallel_size": self.ulysses_parallel_size,
-                "context_parallel_size": self.context_parallel_size,
                 "expert_parallel_size": self.expert_parallel_size,
                 "data_parallel_replicate_size": self.data_parallel_replicate_size,
                 "data_parallel_shard_size": self.data_parallel_shard_size,
@@ -351,7 +316,6 @@ class ServerArguments:
                 "enable_activation_offload": self.enable_activation_offload,
                 "init_device": self.init_device,
                 "enable_rank0_init": self.enable_rank0_init,
-                "use_liger": self.use_liger,
                 "ce_mode": self.ce_mode,
                 "load_checkpoint_path": self.load_checkpoint_path,
                 "ckpt_manager": self.ckpt_manager,
@@ -382,10 +346,7 @@ class ServerArguments:
             Required world size (number of GPUs)
         """
         return (
-            self.pipeline_parallel_size *
-            self.tensor_parallel_size *
             self.ulysses_parallel_size *
-            self.context_parallel_size *
             self.data_parallel_replicate_size *
             self.data_parallel_shard_size
         )
@@ -414,29 +375,19 @@ class ServerArguments:
         IMPORTANT: EP (Expert Parallel) is NOT included in this calculation!
         EP creates a separate 2D mesh and doesn't participate in the main mesh.
         
-        dp_size is the remaining parallelism after accounting for pp/tp/ulysses/cp.
+        dp_size is the remaining parallelism after accounting for ulysses.
         It's then split into dp_replicate_size and dp_shard_size.
 
         Returns:
             Data parallel size
         """
         world_size = self.get_world_size()
-        other_parallel = (
-            self.pipeline_parallel_size *
-            self.tensor_parallel_size *
-            self.ulysses_parallel_size *
-            self.context_parallel_size
-            # NOTE: expert_parallel_size is NOT included here!
-        )
-        if world_size % other_parallel != 0:
+        if world_size % self.ulysses_parallel_size != 0:
             raise ValueError(
                 f"world_size ({world_size}) must be divisible by "
-                f"pp({self.pipeline_parallel_size}) × "
-                f"tp({self.tensor_parallel_size}) × "
-                f"ulysses({self.ulysses_parallel_size}) × "
-                f"cp({self.context_parallel_size}) = {other_parallel}"
+                f"ulysses_parallel_size ({self.ulysses_parallel_size})"
             )
-        return world_size // other_parallel
+        return world_size // self.ulysses_parallel_size
 
 
 def parse_server_args() -> ServerArguments:
@@ -483,6 +434,8 @@ def parse_server_args() -> ServerArguments:
             # Check for --key=value format
             if '=' in key_part:
                 key, value = key_part.split('=', 1)
+                # Convert dotted notation (worker.bind_address) to flat (worker_bind_address)
+                key = key.replace('.', '_')
                 # Try to parse as number or boolean
                 if value.lower() in ('true', 'false'):
                     value = value.lower() == 'true'
@@ -492,7 +445,8 @@ def parse_server_args() -> ServerArguments:
                 i += 1
             elif i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith('--'):
                 # --key value format
-                key = key_part
+                # Convert dotted notation (worker.bind_address) to flat (worker_bind_address)
+                key = key_part.replace('.', '_')
                 value = sys.argv[i + 1]
                 # Try to parse as number or boolean
                 if value.lower() in ('true', 'false'):
@@ -509,12 +463,16 @@ def parse_server_args() -> ServerArguments:
     # Apply CLI overrides
     config_data.update(cli_overrides)
 
-    # Create ServerArguments from flat config
-    # Filter out fields that don't belong to ServerArguments
+    # Validate config keys against ServerArguments fields
     valid_fields = {f.name for f in __import__('dataclasses').fields(ServerArguments)}
-    filtered_config = {k: v for k, v in config_data.items() if k in valid_fields}
+    unknown_fields = set(config_data.keys()) - valid_fields
+    if unknown_fields:
+        raise ValueError(
+            f"Unrecognized config fields: {sorted(unknown_fields)}. "
+            f"Check your config file for typos or removed fields."
+        )
 
     # Create ServerArguments
-    server_args = ServerArguments(**filtered_config)
+    server_args = ServerArguments(**config_data)
 
     return server_args

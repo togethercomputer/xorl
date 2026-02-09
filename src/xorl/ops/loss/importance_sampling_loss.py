@@ -4,7 +4,6 @@ import torch
 import torch.nn.functional as F
 
 from .compiled_cross_entropy import compiled_cross_entropy_function
-from .fused_linear import fast_fused_linear_cross_entropy
 
 
 def _compute_per_token_ce(
@@ -23,7 +22,7 @@ def _compute_per_token_ce(
         weight: LM head weight matrix, shape (V, H)
         labels_flat: Flattened labels, shape (BT,)
         ignore_index: Index to ignore in loss computation
-        ce_mode: Cross-entropy computation mode
+        ce_mode: Cross-entropy computation mode ("compiled" or "eager")
         num_chunks: Number of chunks for compiled mode
 
     Returns:
@@ -32,14 +31,8 @@ def _compute_per_token_ce(
     if ce_mode == "compiled":
         # Uses torch.compile to avoid materializing full [BT, V] logits
         per_token_ce = compiled_cross_entropy_function(hidden_states_flat, weight, labels_flat, ignore_index, num_chunks)
-    elif ce_mode == "fast_fused":
-        # Fast fused - most memory efficient (recomputes in backward)
-        per_token_ce = fast_fused_linear_cross_entropy(
-            hidden_states_flat, weight, labels_flat,
-            ignore_index=ignore_index, reduction="none"
-        )
     else:
-        # eager mode (default)
+        # eager mode
         logits_flat = (hidden_states_flat @ weight.t()).float()
         per_token_ce = F.cross_entropy(logits_flat, labels_flat, reduction="none", ignore_index=ignore_index)
 
@@ -66,7 +59,6 @@ def importance_sampling_loss_function(
 
     Supports multiple computation modes:
     - "compiled": RECOMMENDED. torch.compile (1.6x speed, 16% memory)
-    - "fast_fused": Best memory (1.1x speed, 8% memory)
     - "eager": Simple F.cross_entropy baseline (may OOM at 32K)
 
     Args:
@@ -77,7 +69,7 @@ def importance_sampling_loss_function(
         advantages: Per-token advantages, shape (batch, seq_len)
         ignore_index: Index to ignore in loss computation (default: -100)
         num_chunks: Number of chunks for compiled mode (default: 8).
-        ce_mode: Cross-entropy mode - "compiled" (default), "fast_fused", or "eager"
+        ce_mode: Cross-entropy mode - "compiled" (default) or "eager"
         return_per_token: If True, returns per-token logprobs and per-token CE loss.
                          Useful for custom loss computations.
 

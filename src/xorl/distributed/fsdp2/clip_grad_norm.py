@@ -16,7 +16,7 @@ logger = get_logger(__name__)
 def clip_grad_norm(
     model, max_norm: float, norm_type: float = 2.0, error_if_nonfinite: bool = False, foreach: bool | None = None
 ) -> torch.Tensor:
-    # EP-aware path (FSDP2 + EP): maintain mathematical parity with FSDP1 clipper
+    # EP-aware path (FSDP2 + EP)
     if hasattr(model, "_ep_param_groups"):
         return ep_fsdp2_clip_grad_norm(
             model,
@@ -59,7 +59,7 @@ def ep_fsdp2_clip_grad_norm(
     model, max_norm: float, norm_type: float = 2.0, error_if_nonfinite: bool = False, foreach: bool | None = None
 ) -> torch.Tensor:
     """
-    EP-aware gradient clipping for composable FSDP2 with reductions mirroring FSDP1:
+    EP-aware gradient clipping for composable FSDP2:
 
     - Compute local norms for non-EP and EP parameter groups separately.
     - For finite p: sum p-th powers across the appropriate groups, then take 1/p.
@@ -83,7 +83,7 @@ def ep_fsdp2_clip_grad_norm(
         p for p in model._ep_param_groups.get("non_ep", []) if p.grad is not None
     ]
 
-    # Match FSDP1 gradient averaging for EP params by dividing grads by ep_size
+    # Average EP gradients across EP ranks by dividing grads by ep_size
     if ps.ep_enabled and ps.ep_size > 1 and ep_params:
         scale = 1.0 / float(ps.ep_size)
         for q in ep_params:

@@ -17,7 +17,6 @@ from torch.optim.optimizer import Optimizer
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
-from ..utils.import_utils import is_torch_npu_available
 
 
 logger = logging.get_logger(__name__)
@@ -32,7 +31,7 @@ class AnyPrecisionAdamW(Optimizer):
         betas=(0.9, 0.95),
         eps=1e-8,
         weight_decay=0.0,
-        use_kahan_summation=True,
+        use_kahan_summation=False,
         momentum_dtype=torch.bfloat16,
         variance_dtype=torch.bfloat16,
         compensation_buffer_dtype=torch.bfloat16,
@@ -135,8 +134,7 @@ class MultiOptimizer(Optimizer, Stateful):
     Mapping of name -> torch.optim.Optimizer with convenience methods.
     Compatible with torch.distributed.checkpoint optimizer APIs that accept a Mapping.
 
-    This class is needed for EP+FSDP2 case because EP and non-EP param have different FSDP sharding dimension (dim-0 vs. dim-1)
-    For comparison, EP+FSDP1 also shards EP parameters along dim-0 for FSDP, so it can use the default optimizer class.
+    This class is needed for EP+FSDP2 case because EP and non-EP param have different FSDP sharding dimension (dim-0 vs. dim-1).
     """
 
     def __init__(
@@ -272,6 +270,12 @@ def get_parameter_names(model, forbidden_layer_types, forbidden_param_names):
     return result
 
 
+_ANYPRECISION_STATE_DTYPES = {
+    "fp32": torch.float32,
+    "bf16": torch.bfloat16,
+}
+
+
 def build_optimizer(
     model: "nn.Module",
     lr: float = 1e-3,
@@ -280,6 +284,7 @@ def build_optimizer(
     weight_decay: float = 1e-2,
     fused: bool = False,
     optimizer_type: str = "adamw",
+    optimizer_dtype: str = "bf16",
     param_groups: Optional[Sequence[Dict[str, Any]]] = None,
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
@@ -287,7 +292,8 @@ def build_optimizer(
     # EP-aware routing: for FSDP2+EP, split params into EP and non-EP groups and build two optimizers.
     if _should_build_ep_aware(model, param_groups):
         return build_ep_fsdp2_optimizer(
-            model, lr, betas, eps, weight_decay, fused, optimizer_type, param_groups, no_decay_modules, no_decay_params
+            model, lr, betas, eps, weight_decay, fused, optimizer_type, optimizer_dtype,
+            param_groups, no_decay_modules, no_decay_params,
         )
     # Other cases remain the same
     if param_groups is None:
@@ -313,7 +319,12 @@ def build_optimizer(
         fused = fused
         optim = AdamW(param_groups, lr, betas, eps, weight_decay, fused=fused, foreach=foreach)
     elif optimizer_type == "anyprecision_adamw":
-        optim = AnyPrecisionAdamW(param_groups, lr, betas, eps, weight_decay)
+        state_dtype = _ANYPRECISION_STATE_DTYPES[optimizer_dtype]
+        optim = AnyPrecisionAdamW(
+            param_groups, lr, betas, eps, weight_decay,
+            momentum_dtype=state_dtype, variance_dtype=state_dtype,
+            compensation_buffer_dtype=state_dtype,
+        )
     else:
         raise ValueError("Only adamw and anyprecision_adamw are supported as optimizers.")
 
@@ -328,6 +339,7 @@ def build_ep_fsdp2_optimizer(
     weight_decay: float = 1e-2,
     fused: bool = False,
     optimizer_type: str = "adamw",
+    optimizer_dtype: str = "bf16",
     param_groups: Optional[Sequence[Dict[str, Any]]] = None,
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
@@ -356,12 +368,17 @@ def build_ep_fsdp2_optimizer(
     )
 
     def _build(groups: Sequence[Dict[str, Any]]) -> Optimizer:
-        foreach = False if is_torch_npu_available() else (not fused)
-        fused_ = False if is_torch_npu_available() else fused
+        foreach = not fused
+        fused_ = fused
         if optimizer_type == "adamw":
             return AdamW(groups, lr, betas, eps, weight_decay, fused=fused_, foreach=foreach)
         elif optimizer_type == "anyprecision_adamw":
-            return AnyPrecisionAdamW(groups, lr, betas, eps, weight_decay)
+            state_dtype = _ANYPRECISION_STATE_DTYPES[optimizer_dtype]
+            return AnyPrecisionAdamW(
+                groups, lr, betas, eps, weight_decay,
+                momentum_dtype=state_dtype, variance_dtype=state_dtype,
+                compensation_buffer_dtype=state_dtype,
+            )
         else:
             raise ValueError("Only adamw and anyprecision_adamw are supported as optimizers.")
 
