@@ -1,9 +1,12 @@
+import logging
 from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
 from .compiled_cross_entropy import compiled_cross_entropy_function
+
+logger = logging.getLogger(__name__)
 
 
 def _compute_per_token_ce(
@@ -49,6 +52,7 @@ def importance_sampling_loss_function(
     num_chunks: int = 8,
     ce_mode: str = "compiled",
     return_per_token: bool = False,
+    compute_kl_stats: bool = False,
 ) -> Tuple[torch.Tensor, None, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
     """
     Compute importance sampling loss for GRPO/RL training.
@@ -72,6 +76,12 @@ def importance_sampling_loss_function(
         ce_mode: Cross-entropy mode - "compiled" (default) or "eager"
         return_per_token: If True, returns per-token logprobs and per-token CE loss.
                          Useful for custom loss computations.
+        compute_kl_stats: If True, compute and return KL statistics in metrics dict:
+                         - kl_sample_train_k3: Schulman's K3 estimator: mean(exp(log_ratio) - log_ratio - 1)
+                           where log_ratio = new_logprobs - old_logprobs. Non-negative, unbiased, lower variance.
+                         - entropy_sample: -mean(old_logprobs) over valid tokens
+                         - valid_tokens: Count of valid tokens
+                         Note: When used via model_runner, these get prefixed with "is_".
 
     Returns:
         Tuple of (loss, None, per_token_logprobs, per_token_loss, metrics)
@@ -127,6 +137,30 @@ def importance_sampling_loss_function(
         "ratio_min": valid_ratio.min().detach().item(),
         "ratio_max": valid_ratio.max().detach().item(),
     }
+
+    # Optionally compute KL statistics
+    # Note: Do NOT use "is_" prefix here - model_runner.py adds the "is_" prefix
+    # when accumulating metrics. Using "is_" here would cause double prefix.
+    if compute_kl_stats:
+        with torch.no_grad():
+            _n_valid_kl = valid_mask.sum().item()  # TRUE count, no clamp
+            if valid_mask.any():
+                valid_old = old_logprobs_flat[valid_mask]
+                valid_new = new_logprobs_flat[valid_mask]
+                log_ratio = valid_new - valid_old
+
+                # K3 estimator (Schulman): exp(log_ratio) - log_ratio - 1
+                # Non-negative, unbiased, lower variance than K1/K2
+                k3 = (torch.exp(log_ratio) - log_ratio - 1.0).mean().item()
+                metrics["kl_sample_train_k3"] = k3
+                metrics["entropy_sample"] = -valid_old.mean().item()
+                metrics["valid_tokens"] = _n_valid_kl
+                metrics["_n_valid_kl"] = _n_valid_kl
+            else:
+                metrics["kl_sample_train_k3"] = 0.0
+                metrics["entropy_sample"] = 0.0
+                metrics["valid_tokens"] = 0
+                metrics["_n_valid_kl"] = 0
 
     # Reshape per-token outputs
     per_token_logprobs = new_logprobs_flat.view(original_shape)

@@ -475,7 +475,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 cls._async_process_group = dist.new_group(backend="gloo")
 
             if cls.dcp_save_future is not None:
-                logger.info(f"[RANK {dist.get_rank()}] waiting for previous DCP saving session to end...")
+                logger.debug(f"[RANK {dist.get_rank()}] waiting for previous DCP saving session to end...")
                 cls.dcp_save_future.result()
                 cls.dcp_save_future = None
                 # block until all the ranks resolve their previous dcp async saving
@@ -503,6 +503,23 @@ class DistributedCheckpointer(CheckpointerBase):
                     overwrite=True,
                 ),
             )
+
+        # Aggressive cleanup after DCP save to release all intermediate memory
+        # This is critical for large EP models where DCP creates full state dicts
+        if "model" in save_state and hasattr(save_state["model"], "model"):
+            # Clear any cached state in ModelState wrapper
+            save_state["model"].model = None
+            save_state["model"].ep_fqn2spec_info = None
+        if "optimizer" in save_state and hasattr(save_state["optimizer"], "model"):
+            save_state["optimizer"].model = None
+            save_state["optimizer"].optimizer = None
+        del save_state
+
+        import gc
+        gc.collect()
+        gc.collect()  # Second pass for cyclic references
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
         # Save checkpoint metadata for compatibility validation
         _save_checkpoint_metadata(checkpoint_dir, state["model"])

@@ -1,12 +1,11 @@
-from typing import Callable, Optional, Tuple, Union, Unpack
+from typing import Optional, Tuple, Union, Unpack
 
 import torch
 from torch import nn
-from ...layers import ACT2FN, RMSNorm, RotaryEmbedding, apply_rotary_pos_emb, rotate_half
+from ...layers import ACT2FN, RMSNorm, RotaryEmbedding
 from ...layers.attention import (
-    ATTENTION_FUNCTIONS,
-    FlashAttentionKwargs,
-    eager_attention_forward,
+    AttentionKwargs,
+    MultiHeadAttention,
     is_flash_attention,
     update_causal_mask,
 )
@@ -15,7 +14,7 @@ from ...outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, CausalLM
 from .configuration_qwen3 import Qwen3Config
 
 from ....distributed.parallel_state import get_parallel_state
-from ....distributed.sequence_parallel import slice_position_embedding
+from ....distributed.sequence_parallel.strategy import get_sp_strategy
 from ....ops.fused_silu_and_mul import fused_silu_and_mul
 from ....ops.loss import causallm_loss_function
 from ....utils import logging
@@ -44,76 +43,18 @@ class Qwen3MLP(nn.Module):
         return self.down_proj(x)
 
 
-class Qwen3Attention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
+class Qwen3Attention(MultiHeadAttention):
+    """Qwen3 attention with per-layer sliding window control."""
 
-    def __init__(self, config: Qwen3Config, layer_idx: int):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.scaling = self.head_dim**-0.5
-        self.attention_dropout = config.attention_dropout
-        self.is_causal = True
-
-        self.q_dim = config.num_attention_heads * self.head_dim
-        self.kv_dim = config.num_key_value_heads * self.head_dim
-        self.qkv_proj = nn.Linear(
-            config.hidden_size, self.q_dim + 2 * self.kv_dim, bias=config.attention_bias
-        )
-        self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
-        )
-        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
-        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
-        self.sliding_window = config.sliding_window
+    def _init_sliding_window(self, config):
+        sliding_window = config.sliding_window
         if not (
-            self.config.use_sliding_window
-            and getattr(self.config, "sliding_window", None) is not None
-            and self.layer_idx >= self.config.max_window_layers
+            config.use_sliding_window
+            and getattr(config, "sliding_window", None) is not None
+            and self.layer_idx >= config.max_window_layers
         ):
-            self.sliding_window = None
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-
-        qkv = self.qkv_proj(hidden_states)
-        query_states, key_states, value_states = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
-        query_states = self.q_norm(query_states.view(hidden_shape))
-        key_states = self.k_norm(key_states.view(hidden_shape))
-        value_states = value_states.view(hidden_shape)
-
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        attention_interface: Callable = ATTENTION_FUNCTIONS.get(
-            self.config._attn_implementation, eager_attention_forward
-        )
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,  # diff with Llama
-            **kwargs,
-        )
-
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
+            sliding_window = None
+        return sliding_window
 
 
 class Qwen3DecoderLayer(GradientCheckpointingLayer):
@@ -140,7 +81,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         output_attentions: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
-        **kwargs: Unpack[FlashAttentionKwargs],
+        **kwargs: Unpack[AttentionKwargs],
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
 
@@ -240,7 +181,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
+        **flash_attn_kwargs: Unpack[AttentionKwargs],
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -276,10 +217,12 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        # --- slice position embedding if using sp ---
-        sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
-        position_embeddings = slice_position_embedding(position_embeddings, dim=1, sp_group=sp_group)
-        # --- slice position embedding if using sp ---
+        # SP strategy handles slicing (sync: slice, async: keep full-length)
+        ps = get_parallel_state()
+        position_embeddings = get_sp_strategy(num_kv_heads=self.config.num_key_value_heads).prepare_position_embeddings(
+            position_embeddings, dim=1, sp_group=ps.sp_group,
+            num_kv_heads=self.config.num_key_value_heads,
+        )
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -318,7 +261,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         return output if return_dict else output.to_tuple()
 
 
-class KwargsForCausalLM(FlashAttentionKwargs): ...
+class KwargsForCausalLM(AttentionKwargs): ...
 
 
 class Qwen3ForCausalLM(Qwen3PreTrainedModel):

@@ -53,6 +53,29 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class RetrieveFutureFilter(logging.Filter):
+    """Filter out noisy retrieve_future polling requests from access logs.
+
+    The two-phase async pattern causes clients to poll /api/v1/retrieve_future
+    every second until results are ready. This filter suppresses those logs
+    to avoid cluttering the output.
+    """
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Filter out retrieve_future access log entries
+        if hasattr(record, 'getMessage'):
+            msg = record.getMessage()
+            if '/api/v1/retrieve_future' in msg:
+                return False
+        return True
+
+
+def configure_uvicorn_logging():
+    """Configure uvicorn access logging to filter out polling requests."""
+    # Add filter to uvicorn access logger
+    uvicorn_access_logger = logging.getLogger("uvicorn.access")
+    uvicorn_access_logger.addFilter(RetrieveFutureFilter())
+
+
 # ============================================================================
 # Port Finding Utilities
 # ============================================================================
@@ -114,7 +137,7 @@ def run_engine_core(
     rank0_worker_address: str,
     max_running_requests: int = 2,
     max_pending_requests: int = 100,
-    operation_timeout: float = 600.0,
+    operation_timeout: float = 1800.0,
     log_level: str = "INFO",
     packing_seq_len: int = 32000,
     enable_packing: bool = True,
@@ -217,6 +240,7 @@ def run_api_server(
     base_model: Optional[str] = None,
     storage_limit: str = "10TB",
     idle_session_timeout: float = 7200.0,
+    skip_initial_checkpoint: bool = False,
 ):
     """
     Run the API Server in a separate process.
@@ -232,6 +256,7 @@ def run_api_server(
         base_model: Base model name that this server is configured for (e.g., 'Qwen/Qwen2.5-3B-Instruct')
         storage_limit: Maximum disk usage for output_dir (e.g., '1GB'). Default: 10TB.
         idle_session_timeout: Idle session timeout in seconds. Default: 7200.0 (2 hours).
+        skip_initial_checkpoint: Skip auto-saving initial checkpoint on first create_model.
     """
     from contextlib import asynccontextmanager
 
@@ -243,6 +268,9 @@ def run_api_server(
     )
 
     logger = logging.getLogger("APIServer")
+
+    # Apply filter to suppress noisy retrieve_future polling logs
+    configure_uvicorn_logging()
 
     logger.info("=" * 70)
     logger.info("Starting API Server")
@@ -275,6 +303,7 @@ def run_api_server(
                 base_model=base_model,
                 storage_limit=storage_limit,
                 idle_session_timeout=idle_session_timeout,
+                skip_initial_checkpoint=skip_initial_checkpoint,
             )
             await api_module.api_server.start()
             yield
@@ -411,23 +440,27 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
 
 def calculate_world_size_from_config(config_path: str) -> int:
     """
-    Calculate the required world size from parallelism configuration.
+    Calculate the total number of GPUs required from parallelism configuration.
+
+    EP and the main parallelism mesh share the same GPUs but organize them differently:
+    - Main mesh: DP × Ulysses × CP × TP × PP
+    - EP mesh: EP × ep_fsdp_size (where ep_fsdp_size = world_size / ep_size)
+
+    The total GPUs needed is MAX(EP, main_mesh_size), rounded up to be divisible by EP.
 
     Args:
         config_path: Path to server config YAML
 
     Returns:
-        Required world size (nproc_per_node)
+        Total number of GPUs needed
     """
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
     # Support both flat config (ServerArguments style) and nested config (train: section)
-    # Check if this is a nested config with 'train' section
     if 'train' in config:
         train_config = config.get('train', {})
     else:
-        # Flat config (ServerArguments style)
         train_config = config
 
     # Get parallelism sizes (with defaults matching model_runner.py)
@@ -471,7 +504,7 @@ class Launcher:
         api_port: Optional[int] = None,
         max_running_requests: int = 2,
         max_pending_requests: int = 100,
-        operation_timeout: float = 600.0,
+        operation_timeout: float = 1800.0,
         log_level: str = "INFO",
         # Auto-launch mode parameters
         nnodes: int = 1,
@@ -541,10 +574,13 @@ class Launcher:
         if mode == "auto":
             logger.info("Calculating world size from config parallelism settings...")
             if self.server_args:
-                self.nproc_per_node = self.server_args.get_world_size()
+                # Use get_total_gpus() which includes EP (Expert Parallel)
+                total_world_size = self.server_args.get_total_gpus()
             else:
-                self.nproc_per_node = calculate_world_size_from_config(config_path)
-            logger.info(f"World size (nproc_per_node) = {self.nproc_per_node}")
+                total_world_size = calculate_world_size_from_config(config_path)
+            # For multi-node, nproc_per_node is total world size divided by number of nodes
+            self.nproc_per_node = total_world_size // self.nnodes
+            logger.info(f"Total world size = {total_world_size}, nnodes = {self.nnodes}, nproc_per_node = {self.nproc_per_node}")
         else:
             self.nproc_per_node = 1  # Not used in connect mode
 
@@ -637,6 +673,64 @@ class Launcher:
         logger.info(f"Received signal {signum}, shutting down...")
         self.stop()
         sys.exit(0)
+
+    def _get_rank0_worker_address(self) -> str:
+        """
+        Resolve the address to connect to rank 0 worker.
+
+        Priority:
+        1. Explicit engine_connect_host from config (for manual multi-node setup)
+        2. File-based discovery (for multi-node with shared filesystem)
+        3. Localhost fallback (for single-node)
+
+        For multi-node (nnodes > 1), waits for the address file to be created
+        by the rank 0 worker.
+
+        Returns:
+            ZMQ address string (e.g., "tcp://192.168.1.100:5556")
+        """
+        # Priority 1: Explicit engine_connect_host from config
+        if self.server_args and self.server_args.engine_connect_host:
+            port = self.server_args.worker_bind_port
+            address = f"tcp://{self.server_args.engine_connect_host}:{port}"
+            logger.info(f"Using explicit engine_connect_host: {address}")
+            return address
+
+        # Priority 2: File-based discovery (for multi-node)
+        if self.nnodes > 1:
+            from xorl.server.utils.network import read_address_file
+
+            logger.info(f"Multi-node setup (nnodes={self.nnodes}), waiting for rank 0 address file...")
+
+            # Wait for address file with extended timeout for multi-node
+            address = read_address_file(
+                output_dir=self.output_dir,
+                timeout=self.server_args.worker_connection_timeout if self.server_args else 120.0,
+                poll_interval=2.0,
+            )
+
+            if address:
+                logger.info(f"Discovered rank 0 address from file: {address}")
+                return address
+            else:
+                logger.warning("Could not discover rank 0 address from file, falling back to config")
+
+        # Priority 3: Use bind address from config (single-node or fallback)
+        # For single-node, the bind address of 0.0.0.0 should be converted to localhost
+        if self.server_args:
+            bind_address = self.server_args.worker_bind_address
+            if bind_address and bind_address != "auto":
+                # Parse and convert 0.0.0.0 to 127.0.0.1 for localhost connections
+                if "0.0.0.0" in bind_address:
+                    address = bind_address.replace("0.0.0.0", "127.0.0.1")
+                else:
+                    address = bind_address
+                logger.info(f"Using worker address (single-node): {address}")
+                return address
+
+        # Final fallback: use already-resolved worker_address
+        logger.info(f"Using pre-resolved worker address: {self.worker_address}")
+        return self.worker_address
 
     def _poll_future(self, request_id: str, timeout: float = 300.0, poll_interval: float = 2.0):
         """Poll /api/v1/retrieve_future until the async operation completes.
@@ -786,8 +880,8 @@ class Launcher:
             stderr=None,
         )
 
-        # Give workers time to initialize
-        logger.info("Waiting for workers to initialize (5 seconds)...")
+        # Give workers time to spawn (brief wait for process initialization)
+        logger.info("Waiting for workers to spawn (5 seconds)...")
         time.sleep(5)
 
         # Check if workers are still running
@@ -798,12 +892,10 @@ class Launcher:
             raise RuntimeError("Failed to start distributed workers")
 
         logger.info("-" * 70)
-        logger.info("✓ Distributed Workers started")
+        logger.info("✓ Distributed Workers spawned successfully")
         logger.info("")
-        logger.info("Waiting for workers to initialize (model loading takes ~30 seconds)...")
-        logger.info("This is normal - the worker needs to load the model before accepting connections")
-        time.sleep(30)  # Give workers time to load model and start listening
-        logger.info("✓ Worker initialization wait complete")
+        logger.info("Note: Workers will load the model in the background.")
+        logger.info("The Engine will wait for workers to be ready (up to 15 minutes).")
 
     def start(self):
         """Start all components."""
@@ -835,6 +927,12 @@ class Launcher:
                 logger.info("Connect mode: assuming workers are already running")
                 logger.info(f"Expecting rank 0 worker at: {self.worker_address}")
                 logger.info("")
+
+            # Resolve rank 0 worker address (important for multi-node)
+            # For multi-node, this waits for the address file to be created by rank 0
+            logger.info("Resolving rank 0 worker address...")
+            self.worker_address = self._get_rank0_worker_address()
+            logger.info(f"Resolved worker address: {self.worker_address}")
 
             # Start Engine Core (connects to worker)
             logger.info("=" * 70)
@@ -921,6 +1019,7 @@ class Launcher:
                     self.base_model,
                     self.storage_limit,
                     self.idle_session_timeout,
+                    self.server_args.skip_initial_checkpoint,
                 ),
                 name="APIServer",
             )
@@ -945,7 +1044,10 @@ class Launcher:
                 raise RuntimeError(f"Engine Core failed during initialization (exit code: {exit_code})")
 
             # Save initial checkpoint (000) to capture the model state before any training
-            self._save_initial_checkpoint()
+            if not self.server_args.skip_initial_checkpoint:
+                self._save_initial_checkpoint()
+            else:
+                logger.info("Skipping initial checkpoint save (skip_initial_checkpoint=true)")
 
             logger.info("")
             logger.info("=" * 70)
@@ -1196,8 +1298,8 @@ Note:
     parser.add_argument(
         "--operation-timeout",
         type=float,
-        default=600.0,
-        help="Timeout for engine operations in seconds (default: 600.0)"
+        default=1800.0,
+        help="Timeout for engine operations in seconds (default: 1800.0)"
     )
     # Logging
     parser.add_argument(

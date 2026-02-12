@@ -7,62 +7,26 @@ can inject SP communication at the appropriate phase:
 - **Noop**: No communication — delegates to module's own methods.
 - **Ulysses sync**: All-to-all around attention (project_qkv / project_output).
 - **Ulysses async**: Overlapped linear+a2a in project_qkv / project_output.
-- **Ring**: Ring attention via all-gather KV + per-step flash attn.
-- **Hybrid Ulysses+Ring**: Ulysses a2a (phases 1,3) + ring attention (phase 2).
+- **Ring** (future): P2P KV transfer inside compute_attention.
 
-Adding a new SP method only requires implementing a new CPStrategy subclass.
+Adding a new SP method only requires implementing a new SPStrategy subclass.
 """
 
 from abc import ABC, abstractmethod
 from typing import Optional, Tuple
 
 import torch
-import torch.distributed as dist
 
 from .async_ulysses import async_ulysses_output_projection, async_ulysses_qkv_projection
 from .data import slice_position_embedding
 from .ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
 
 
-def _scale_cu_seqlens_for_ringattn(kwargs, ringattn_group):
-    """Scale full cu_seqlens to local values for ring attention.
-
-    The data pipeline produces cu_seqlens covering the full packed sequence.
-    For ring attention, each ring rank only has S/ringattn_size tokens, so cu_seqlens
-    boundaries must be scaled down.  Assumes each document is split uniformly
-    across ring ranks (i.e. doc lengths are divisible by ringattn_size).
-
-    Returns:
-        (cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k) — all None
-        if cu_seqlens were not provided in kwargs.
-    """
-    cu_seqlens_q = kwargs.get("cu_seq_lens_q")
-    cu_seqlens_k = kwargs.get("cu_seq_lens_k")
-    max_seqlen_q = kwargs.get("max_length_q")
-    max_seqlen_k = kwargs.get("max_length_k")
-
-    if cu_seqlens_q is None:
-        return None, None, None, None
-
-    ringattn_size = dist.get_world_size(ringattn_group)
-
-    # Scale cumulative lengths: each document contributes L/ringattn_size tokens
-    cu_seqlens_q = (cu_seqlens_q // ringattn_size).to(torch.int32)
-    cu_seqlens_k = (cu_seqlens_k // ringattn_size).to(torch.int32)
-
-    if max_seqlen_q is not None:
-        max_seqlen_q = max_seqlen_q // ringattn_size
-    if max_seqlen_k is not None:
-        max_seqlen_k = max_seqlen_k // ringattn_size
-
-    return cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k
-
-
 # ------------------------------------------------------------------ #
 # Base class
 # ------------------------------------------------------------------ #
 
-class CPStrategy(ABC):
+class SPStrategy(ABC):
     """Base class for sequence parallel strategies.
 
     Each strategy implements three phases that map onto
@@ -110,7 +74,7 @@ class CPStrategy(ABC):
 # NoopStrategy — no sequence parallelism
 # ------------------------------------------------------------------ #
 
-class NoopStrategy(CPStrategy):
+class NoopStrategy(SPStrategy):
     """No sequence parallelism — delegates to module's own methods."""
 
     def project_qkv(self, module, hidden_states, position_embeddings):
@@ -134,7 +98,7 @@ class NoopStrategy(CPStrategy):
 # Ulysses sync — all-to-all around attention
 # ------------------------------------------------------------------ #
 
-class UlyssesSyncStrategy(CPStrategy):
+class UlyssesSyncStrategy(SPStrategy):
     """Ulysses SP (sync): fused KV all-to-all with GQA head expansion.
 
     Used when ulysses_size > num_kv_heads.  Communication happens in
@@ -232,7 +196,7 @@ class UlyssesSyncStrategy(CPStrategy):
 # Ulysses async — overlapped linear + a2a communication
 # ------------------------------------------------------------------ #
 
-class UlyssesAsyncStrategy(CPStrategy):
+class UlyssesAsyncStrategy(SPStrategy):
     """Ulysses SP (async): overlaps QKV linear projections with a2a.
 
     Used when ulysses_size <= num_kv_heads.  The linear projection and
@@ -246,32 +210,6 @@ class UlyssesAsyncStrategy(CPStrategy):
 
     def project_qkv(self, module, hidden_states, position_embeddings):
         from ...models.layers.rope import apply_rotary_pos_emb
-
-        # QLoRA fallback: weight is None (packed in quantized buffers).
-        # Fall back to sync-style: module._project_qkv() + synchronous a2a.
-        if module.qkv_proj.weight is None:
-            q, k, v = module._project_qkv(hidden_states, position_embeddings)
-            if q.ndim == 4 and q.size(0) == 1:
-                q = q.squeeze(0)
-                k = k.squeeze(0)
-                v = v.squeeze(0)
-                q = gather_seq_scatter_heads(q, seq_dim=0, head_dim=1, group=self.group)
-                kv = torch.stack([k, v], dim=2).reshape(k.size(0), 2 * k.size(1), k.size(2))
-                kv = gather_seq_scatter_heads(kv, seq_dim=0, head_dim=1, group=self.group)
-                kv = kv.reshape(kv.size(0), kv.size(1) // 2, 2, kv.size(2))
-                k = kv[:, :, 0, :].contiguous()
-                v = kv[:, :, 1, :].contiguous()
-                q = q.unsqueeze(0)
-                k = k.unsqueeze(0)
-                v = v.unsqueeze(0)
-            else:
-                q = gather_seq_scatter_heads(q, seq_dim=1, head_dim=2, group=self.group)
-                kv = torch.stack([k, v], dim=3).reshape(k.size(0), k.size(1), 2 * k.size(2), k.size(3))
-                kv = gather_seq_scatter_heads(kv, seq_dim=1, head_dim=2, group=self.group)
-                kv = kv.reshape(kv.size(0), kv.size(1), kv.size(2) // 2, 2, kv.size(3))
-                k = kv[:, :, :, 0, :].contiguous()
-                v = kv[:, :, :, 1, :].contiguous()
-            return q, k, v
 
         # Squeeze to 2D [S, H] — async autograd Function requires 2D (manual matmul in backward)
         hs_2d = hidden_states.squeeze(0)
@@ -329,21 +267,6 @@ class UlyssesAsyncStrategy(CPStrategy):
         return attn_output
 
     def project_output(self, module, attn_output):
-        # QLoRA fallback: weight is None (packed in quantized buffers).
-        # Fall back to sync-style: a2a + module.o_proj() forward.
-        if module.o_proj.weight is None:
-            if attn_output.ndim == 4 and attn_output.size(0) == 1:
-                attn_output = attn_output.squeeze(0)
-                attn_output = gather_heads_scatter_seq(
-                    attn_output, seq_dim=0, head_dim=1, group=self.group
-                )
-                attn_output = attn_output.unsqueeze(0)
-            else:
-                attn_output = gather_heads_scatter_seq(
-                    attn_output, seq_dim=1, head_dim=2, group=self.group
-                )
-            return module._project_output(attn_output)
-
         # Async output projection: a2a + o_proj (backward overlaps a2a with weight grad)
         attn_output = attn_output.squeeze(0)  # [S_full, Hq/SP, D]
         attn_output = attn_output.reshape(attn_output.size(0), -1)  # [S_full, Hq/SP * D]
@@ -364,126 +287,18 @@ class UlyssesAsyncStrategy(CPStrategy):
 
 
 # ------------------------------------------------------------------ #
-# Ring attention
-# ------------------------------------------------------------------ #
-
-class RingAttentionStrategy(CPStrategy):
-    """Ring attention without Ulysses.
-
-    Each ring rank holds a shard of the sequence.  KV is all-gathered across
-    the ring group, and flash attention is computed per-step with online LSE
-    merging.  No communication in phases 1 or 3.
-    """
-
-    def __init__(self, ringattn_group):
-        self.ringattn_group = ringattn_group
-
-    def project_qkv(self, module, hidden_states, position_embeddings):
-        return module._project_qkv(hidden_states, position_embeddings)
-
-    def compute_attention(self, module, q, k, v, attention_mask, **kwargs):
-        from .ring_attention import ring_flash_attention_forward
-
-        attn_kwargs = module._attention_kwargs()
-        cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k = (
-            _scale_cu_seqlens_for_ringattn(kwargs, self.ringattn_group)
-        )
-
-        return ring_flash_attention_forward(
-            q,
-            k,
-            v,
-            ringattn_group=self.ringattn_group,
-            softmax_scale=attn_kwargs.get("scaling"),
-            dropout_p=attn_kwargs.get("dropout", 0.0),
-            causal=getattr(module, "is_causal", True),
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-        )
-
-    def project_output(self, module, attn_output):
-        return module._project_output(attn_output)
-
-    def prepare_position_embeddings(self, position_embeddings, dim, sp_group, **kwargs):
-        return slice_position_embedding(position_embeddings, dim=dim, sp_group=sp_group)
-
-
-# ------------------------------------------------------------------ #
-# Hybrid Ulysses + Ring
-# ------------------------------------------------------------------ #
-
-class HybridUlyssesRingStrategy(CPStrategy):
-    """Hybrid Ulysses + Ring attention.
-
-    Data flow with ``cp_size = ulysses_size * ringattn_size``:
-
-    1. Input arrives sharded by ``cp_size``.
-    2. **project_qkv** (Ulysses a2a): gather seq within Ulysses group,
-       scatter heads.  After this each rank has ``S/ringattn_size`` tokens with
-       ``H/ulysses_size`` heads.
-    3. **compute_attention** (Ring): ring flash attention across ring group
-       rotates KV across ``ringattn_size`` ranks to attend to all ``S`` tokens.
-    4. **project_output** (Ulysses a2a reverse): gather heads, scatter seq.
-    """
-
-    def __init__(self, ulysses_group, ringattn_group, ulysses_size: int):
-        self.ulysses_group = ulysses_group
-        self.ringattn_group = ringattn_group
-        self.ulysses_size = ulysses_size
-        self._ulysses = UlyssesSyncStrategy(group=ulysses_group, ulysses_size=ulysses_size)
-
-    def project_qkv(self, module, hidden_states, position_embeddings):
-        return self._ulysses.project_qkv(module, hidden_states, position_embeddings)
-
-    def compute_attention(self, module, q, k, v, attention_mask, **kwargs):
-        from .ring_attention import ring_flash_attention_forward
-
-        attn_kwargs = module._attention_kwargs()
-        cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k = (
-            _scale_cu_seqlens_for_ringattn(kwargs, self.ringattn_group)
-        )
-
-        return ring_flash_attention_forward(
-            q,
-            k,
-            v,
-            ringattn_group=self.ringattn_group,
-            softmax_scale=attn_kwargs.get("scaling"),
-            dropout_p=attn_kwargs.get("dropout", 0.0),
-            causal=getattr(module, "is_causal", True),
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-        )
-
-    def project_output(self, module, attn_output):
-        return self._ulysses.project_output(module, attn_output)
-
-    def prepare_position_embeddings(self, position_embeddings, dim, sp_group, **kwargs):
-        return slice_position_embedding(position_embeddings, dim=dim, sp_group=sp_group)
-
-
-# ------------------------------------------------------------------ #
 # Strategy resolver
 # ------------------------------------------------------------------ #
 
 _NOOP = NoopStrategy()
 
 
-def get_cp_strategy(num_kv_heads: Optional[int] = None) -> CPStrategy:
+def get_sp_strategy(num_kv_heads: Optional[int] = None) -> SPStrategy:
     """Resolve the SP strategy from the current ParallelState.
 
     Returns a singleton NoopStrategy when SP is disabled, or the
-    appropriate strategy based on the model's ``num_kv_heads`` and the
-    configured parallelism dimensions.
-
-    Priority:
-    1. Hybrid Ulysses+Ring (both ulysses_size > 1 and ringattn_size > 1)
-    2. Ulysses only (ulysses_size > 1)
-    3. Ring only (ringattn_size > 1)
+    appropriate Ulysses variant (sync/async) based on the model's
+    ``num_kv_heads`` relative to ``ulysses_size``.
 
     Args:
         num_kv_heads: Number of key-value heads in the model.  Required when
@@ -492,24 +307,13 @@ def get_cp_strategy(num_kv_heads: Optional[int] = None) -> CPStrategy:
     from ...distributed.parallel_state import get_parallel_state
 
     ps = get_parallel_state()
-    if not ps.cp_enabled:
+    if not ps.sp_enabled:
         return _NOOP
-
-    if ps.ulysses_enabled and ps.ringattn_enabled:
-        # Hybrid Ulysses + Ring
-        return HybridUlyssesRingStrategy(
-            ulysses_group=ps.ulysses_group,
-            ringattn_group=ps.ringattn_group,
-            ulysses_size=ps.ulysses_size,
-        )
-
     if ps.ulysses_enabled:
         if num_kv_heads is not None and ps.ulysses_size <= num_kv_heads:
             return UlyssesAsyncStrategy(group=ps.ulysses_group, ulysses_size=ps.ulysses_size)
         else:
             return UlyssesSyncStrategy(group=ps.ulysses_group, ulysses_size=ps.ulysses_size)
-
-    if ps.ringattn_enabled:
-        return RingAttentionStrategy(ringattn_group=ps.ringattn_group)
-
+    if ps.cp_enabled:
+        raise NotImplementedError("Ring attention strategy not yet implemented")
     return _NOOP

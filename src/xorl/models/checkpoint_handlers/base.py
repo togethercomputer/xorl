@@ -1,6 +1,6 @@
 """Base checkpoint handler for per-model load/save transforms."""
 
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import torch
 
@@ -40,6 +40,22 @@ class CheckpointHandler:
         """
         return [(key, tensor)]
 
+    def on_skip_weight(
+        self, key: str
+    ) -> List[Tuple[str, torch.Tensor]]:
+        """Notify the handler that a checkpoint key was skipped (not loaded from disk).
+
+        Used by EP-aware filtered loading: out-of-range expert weight tensors
+        are not read from disk, but the handler still needs to count them so
+        internal buffers know when a merge group is complete.
+
+        Returns:
+            List of (param_name, tensor) pairs if the skip triggers a completed
+            buffer (e.g., the last out-of-range expert completes a layer/proj group).
+            Empty list otherwise.
+        """
+        return []
+
     def on_load_complete(self) -> List[Tuple[str, torch.Tensor]]:
         """Flush remaining buffers after all checkpoint shards are read.
 
@@ -48,6 +64,18 @@ class CheckpointHandler:
             Should also validate/warn about incomplete buffers.
         """
         return []
+
+    def get_skip_key_fn(self) -> Optional[Callable[[str], bool]]:
+        """Return a predicate that identifies checkpoint keys whose tensor data
+        can be skipped during loading (i.e., not read from disk).
+
+        Used by EP-aware filtered loading: when ``ep_size > 1``, out-of-range
+        expert weight keys return True so the loader avoids reading their
+        tensor data from NFS, dramatically reducing I/O.
+
+        Returns None when no filtering is possible (default).
+        """
+        return None
 
     def on_save_weight(
         self, param_name: str, tensor: torch.Tensor

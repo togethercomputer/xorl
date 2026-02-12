@@ -49,7 +49,7 @@ class ParallelPlan:
                         if param.size(shard.dim) == 1:
                             param.spec_info = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=Replicate(), fqn=fqn)
                             fqn2spec_info[fqn] = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=Replicate(), fqn=fqn)
-                            logger.info_rank0(f"EP replicated (shared): {fqn} {list(param.shape)}")
+                            logger.debug_rank0(f"EP replicated (shared): {fqn} {list(param.shape)}")
                             break
                         assert param.size(shard.dim) % ep_size == 0, (
                             f"EP sharding failed for {fqn}: dim {shard.dim} size {param.size(shard.dim)} "
@@ -65,7 +65,7 @@ class ParallelPlan:
                         local_chunk.spec_info = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=shard, fqn=fqn)
                         set_module_from_path(model, fqn, local_chunk)
                         fqn2spec_info[fqn] = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=shard, fqn=fqn)
-                        logger.info_rank0(
+                        logger.debug_rank0(
                             f"EP sharded: {fqn} {list(original_shape)} -> {list(local_chunk.shape)} "
                             f"(dim={shard.dim}, ep_size={ep_size})"
                         )

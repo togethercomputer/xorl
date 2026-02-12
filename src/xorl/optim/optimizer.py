@@ -187,7 +187,7 @@ class MultiOptimizer(Optimizer, Stateful):
                     f"Key clash detected while merging state dict for optimizer '{name}': {', '.join(sorted(overlap))}"
                 )
             else:
-                logger.info_rank0("No clashes when merging MultiOptimizer state dicts")
+                logger.info_rank0(f"MultiOptimizer merged '{name}' state dict ({len(sd)} keys, total {len(merged) + len(sd)})")
             merged.update(sd)
 
         return merged

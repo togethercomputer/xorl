@@ -773,7 +773,7 @@ class TrainingArguments:
     )
     max_steps: Optional[int] = field(
         default=None,
-        metadata={"help": "Max training steps per epoch. (for debug)"},
+        metadata={"help": "Max total training steps. Training stops after this many global steps. Also caps LR scheduler length."},
     )
 
     def __post_init__(self):
