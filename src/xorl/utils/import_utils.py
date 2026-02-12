@@ -30,6 +30,11 @@ _PACKAGE_FLAGS: Dict[str, bool] = {
 
 
 def is_flash_attn_2_available() -> bool:
+    """Check if flash_attn is available (works for both FA2 and FA3).
+
+    FA2 and FA3 use the same import path (from flash_attn import ...).
+    FA3 is simply a newer version of the flash-attn package.
+    """
     return _PACKAGE_FLAGS["flash_attn"]
 
 

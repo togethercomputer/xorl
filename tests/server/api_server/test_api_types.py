@@ -317,12 +317,10 @@ class TestSaveWeightsRequest:
         request = SaveWeightsRequest(
             model_id="test-model",
             path="/tmp/checkpoint",
-            save_optimizer=True,
         )
 
         assert request.model_id == "test-model"
         assert request.path == "/tmp/checkpoint"
-        assert request.save_optimizer is True
 
     def test_save_weights_request_defaults(self):
         """Test save weights request with defaults."""
@@ -330,16 +328,6 @@ class TestSaveWeightsRequest:
 
         assert request.model_id == "default"
         assert request.path is None
-        assert request.save_optimizer is True
-
-    def test_save_weights_request_no_optimizer(self):
-        """Test save weights without optimizer."""
-        request = SaveWeightsRequest(
-            path="/tmp/checkpoint",
-            save_optimizer=False,
-        )
-
-        assert request.save_optimizer is False
 
 
 class TestSaveWeightsResponse:
@@ -367,19 +355,19 @@ class TestLoadWeightsRequest:
         request = LoadWeightsRequest(
             model_id="test-model",
             path="/tmp/checkpoint",
-            load_optimizer=True,
+            optimizer=True,
         )
 
         assert request.model_id == "test-model"
         assert request.path == "/tmp/checkpoint"
-        assert request.load_optimizer is True
+        assert request.optimizer is True
 
     def test_load_weights_request_defaults(self):
         """Test load weights request with defaults."""
         request = LoadWeightsRequest(path="/tmp/checkpoint")
 
         assert request.model_id == "default"
-        assert request.load_optimizer is True
+        assert request.optimizer is False
 
     def test_load_weights_request_missing_path(self):
         """Test load weights request without path."""
@@ -392,15 +380,14 @@ class TestLoadWeightsResponse:
 
     def test_valid_load_weights_response(self):
         """Test creating valid load weights response."""
-        response = LoadWeightsResponse(success=True)
+        response = LoadWeightsResponse(path="xorl://default/weights/checkpoint-001")
 
-        assert response.success is True
+        assert response.path == "xorl://default/weights/checkpoint-001"
 
-    def test_load_weights_response_failure(self):
-        """Test load weights failure response."""
-        response = LoadWeightsResponse(success=False)
-
-        assert response.success is False
+    def test_load_weights_response_missing_path(self):
+        """Test load weights response requires path."""
+        with pytest.raises(ValidationError):
+            LoadWeightsResponse()
 
 
 class TestSaveWeightsForSamplerRequest:
@@ -410,18 +397,23 @@ class TestSaveWeightsForSamplerRequest:
         """Test creating valid save weights for sampler request."""
         request = SaveWeightsForSamplerRequest(
             model_id="test-model",
-            path="/tmp/sampler_checkpoint",
+            name="step-100",
         )
 
         assert request.model_id == "test-model"
-        assert request.path == "/tmp/sampler_checkpoint"
+        assert request.name == "step-100"
 
     def test_save_weights_for_sampler_request_defaults(self):
         """Test save weights for sampler request with defaults."""
-        request = SaveWeightsForSamplerRequest()
+        request = SaveWeightsForSamplerRequest(name="step-0")
 
         assert request.model_id == "default"
-        assert request.path is None
+        assert request.name == "step-0"
+
+    def test_save_weights_for_sampler_request_missing_name(self):
+        """Test save weights for sampler request without name."""
+        with pytest.raises(ValidationError):
+            SaveWeightsForSamplerRequest()  # name is required
 
 
 class TestSaveWeightsForSamplerResponse:

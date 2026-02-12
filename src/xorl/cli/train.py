@@ -15,7 +15,7 @@ import torch.distributed as dist
 import wandb
 from tqdm import trange
 
-from xorl.checkpoint import build_checkpointer, ckpt_to_state_dict
+from xorl.checkpoint import build_checkpointer
 from xorl.data.constants import IGNORE_INDEX
 from xorl.data.data_loader import DataLoaderBuilder
 from xorl.data.prepare.prepare_datasets import prepare_datasets
@@ -90,6 +90,8 @@ def main():
     # Calculate train steps from dataloader length
     train_steps_per_epoch = len(train_dataloader)
     total_train_steps = train_steps_per_epoch * args.train.num_train_epochs
+    if args.train.max_steps is not None:
+        total_train_steps = min(total_train_steps, args.train.max_steps)
     logger.info_rank0(f"Train steps per epoch: {train_steps_per_epoch}, Total train steps: {total_train_steps}")
 
 
@@ -197,21 +199,32 @@ def main():
     )
     model.train()
     logger.info(
-        f"rank{args.train.local_rank} Start training, train_steps_per_epoch: {train_steps_per_epoch}, epochs: {args.train.num_train_epochs}"
+        f"rank{args.train.local_rank} Start training, train_steps_per_epoch: {train_steps_per_epoch}, "
+        f"total_train_steps: {total_train_steps}, epochs: {args.train.num_train_epochs}"
     )
     for epoch in range(start_epoch, args.train.num_train_epochs):
         if hasattr(train_dataloader, "set_epoch"):
             train_dataloader.set_epoch(epoch)
 
+        # Compute actual steps this epoch, capped by max_steps
+        steps_this_epoch = train_steps_per_epoch - start_step
+        if args.train.max_steps is not None:
+            steps_this_epoch = min(steps_this_epoch, args.train.max_steps - global_step)
+        if steps_this_epoch <= 0:
+            break
+
         data_loader_tqdm = trange(
-            train_steps_per_epoch,
+            steps_this_epoch,
             desc=f"Epoch {epoch + 1}/{args.train.num_train_epochs}",
-            total=train_steps_per_epoch,
+            total=start_step + steps_this_epoch,
             initial=start_step,
             disable=args.train.local_rank != 0,
         )
         data_iterator = iter(train_dataloader)
         for _ in range(start_step, train_steps_per_epoch):
+            if args.train.max_steps is not None and global_step >= args.train.max_steps:
+                logger.info_rank0(f"Reached max_steps={args.train.max_steps}, stopping training.")
+                break
             global_step += 1
 
             try:
@@ -313,7 +326,8 @@ def main():
             lr = max(lr_scheduler.get_last_lr())
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
 
-            data_loader_tqdm.set_postfix_str(f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}")
+            tflops_per_gpu = train_metrics.get("flops_achieved(T)", 0) / args.train.world_size
+            data_loader_tqdm.set_postfix_str(f"loss={total_loss:.2f} gn={grad_norm:.2f} lr={lr:.1e} tflops={tflops_per_gpu:.1f}")
             data_loader_tqdm.update()
 
             if args.train.global_rank == 0:
@@ -350,6 +364,8 @@ def main():
         data_loader_tqdm.close()
         start_step = 0
         helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+        if args.train.max_steps is not None and global_step >= args.train.max_steps:
+            break
         if args.train.save_epochs and (epoch + 1) % args.train.save_epochs == 0:
             helper.empty_cache()
             save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
@@ -369,19 +385,28 @@ def main():
             logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
     synchronize()
+
+    # Gather full model state via NCCL for HF save (all ranks must participate).
+    # This is much faster than the DCP round-trip (write to disk → read back)
+    # because NCCL AllGather is ~10-50 GB/s vs ~0.65 GB/s NFS.
+    hf_model_state_dict = None
+    if args.train.save_hf_weights:
+        from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+        logger.info_rank0("Gathering full model state dict for HF checkpoint via NCCL...")
+        hf_model_state_dict = get_model_state_dict(
+            model, options=StateDictOptions(full_state_dict=True)
+        )
+
     # release memory
     del optimizer, lr_scheduler
     helper.empty_cache()
-    # save model in huggingface's format
-    if args.train.global_rank == 0 and args.train.save_hf_weights and save_checkpoint_path is not None:
-        hf_weights_path = os.path.join(save_checkpoint_path, "hf_ckpt")
-        model_state_dict = ckpt_to_state_dict(
-            save_checkpoint_path=save_checkpoint_path,
-            output_dir=args.train.output_dir,
-            ckpt_manager=args.train.ckpt_manager,
-        )
+
+    # save model in huggingface's format (rank 0 only)
+    if args.train.global_rank == 0 and hf_model_state_dict is not None:
+        hf_weights_path = os.path.join(args.train.output_dir, f"global_step_{global_step}", "hf_ckpt")
         checkpoint_handler = model.get_checkpoint_handler() if hasattr(model, "get_checkpoint_handler") else None
-        save_model_weights(hf_weights_path, model_state_dict, model_assets=model_assets, checkpoint_handler=checkpoint_handler)
+        save_model_weights(hf_weights_path, hf_model_state_dict, model_assets=model_assets, checkpoint_handler=checkpoint_handler)
+        del hf_model_state_dict
         logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
 
     dist.barrier()
