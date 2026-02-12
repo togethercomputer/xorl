@@ -18,7 +18,7 @@ from tqdm import tqdm
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGHTS_INDEX_NAME, WEIGHTS_NAME
 from transformers.utils.hub import cached_file, get_checkpoint_shard_files
 from safetensors import safe_open
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
@@ -132,6 +132,53 @@ def init_empty_weights():
 class StateDictIterator:
     filepath: str
 
+    def load_all(self) -> Dict[str, "torch.Tensor"]:
+        """Bulk-load all tensors from the shard file into CPU memory.
+
+        Faster than lazy per-tensor reading because the OS can optimize
+        the I/O pattern (one sequential read instead of many small reads
+        interleaved with compute/network).
+        """
+        if self.filepath.endswith(".safetensors"):
+            return load_file(self.filepath, device="cpu")
+        else:
+            return torch.load(self.filepath, map_location="cpu", weights_only=True)
+
+    def load_filtered(
+        self,
+        skip_key_fn: Callable[[str], bool],
+    ) -> Tuple[Dict[str, "torch.Tensor"], List[str]]:
+        """Load tensors from the shard, skipping keys where *skip_key_fn* returns True.
+
+        Unlike ``load_all()`` which bulk-reads everything, this uses lazy
+        iteration (``safe_open``) so tensor data for skipped keys is never
+        read from disk — a significant I/O saving when most keys are skipped
+        (e.g., EP-aware loading where each rank only needs its own experts).
+
+        Returns:
+            (state_dict, skipped_keys) — loaded tensors and the list of keys
+            whose tensor data was *not* read.
+        """
+        skipped: List[str] = []
+        if self.filepath.endswith(".safetensors"):
+            result: Dict[str, torch.Tensor] = {}
+            with safe_open(self.filepath, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    if skip_key_fn(key):
+                        skipped.append(key)
+                    else:
+                        result[key] = f.get_tensor(key)
+            return result, skipped
+        else:
+            state_dict = torch.load(self.filepath, map_location="cpu", weights_only=True)
+            result = {}
+            for k, v in state_dict.items():
+                if skip_key_fn(k):
+                    skipped.append(k)
+                else:
+                    result[k] = v
+            return result, skipped
+
     def __iter__(self) -> Generator[Tuple[str, "torch.Tensor"], None, None]:
         if self.filepath.endswith(".safetensors"):
             with safe_open(self.filepath, framework="pt", device="cpu") as f:
@@ -142,6 +189,85 @@ class StateDictIterator:
             state_dict = torch.load(self.filepath, map_location="cpu", weights_only=True, mmap=True)
             for key in state_dict.keys():
                 yield key, state_dict[key]
+
+
+def _prefetch_shards(
+    state_dict_iterators: List["StateDictIterator"],
+    prefetch_count: int = 1,
+) -> Generator[Dict[str, "torch.Tensor"], None, None]:
+    """Yield bulk-loaded shard dicts with N-shard lookahead.
+
+    Background threads pre-load upcoming shards from disk while the caller
+    processes (dispatches / broadcasts) the current one, overlapping disk I/O
+    with compute and network traffic.
+
+    Args:
+        state_dict_iterators: Shard iterators to load.
+        prefetch_count: Number of shards to pre-load ahead. Higher values use
+            more CPU memory but can increase NFS throughput via concurrent reads.
+            Default 1 (single background thread, same as before).
+    """
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+
+    if not state_dict_iterators:
+        return
+
+    n = len(state_dict_iterators)
+    # Submit up to (prefetch_count + 1) tasks: 1 for immediate use + lookahead
+    initial_submit = min(prefetch_count + 1, n)
+
+    with ThreadPoolExecutor(max_workers=max(prefetch_count, 1)) as pool:
+        pending: deque = deque()
+        for i in range(initial_submit):
+            pending.append(pool.submit(state_dict_iterators[i].load_all))
+
+        next_idx = initial_submit
+
+        for _ in range(n):
+            state_dict = pending.popleft().result()
+
+            if next_idx < n:
+                pending.append(pool.submit(state_dict_iterators[next_idx].load_all))
+                next_idx += 1
+
+            yield state_dict
+
+
+def _prefetch_shards_filtered(
+    state_dict_iterators: List["StateDictIterator"],
+    skip_key_fn: Callable[[str], bool],
+    prefetch_count: int = 1,
+) -> Generator[Tuple[Dict[str, "torch.Tensor"], List[str]], None, None]:
+    """Like ``_prefetch_shards`` but uses ``load_filtered`` to skip reading
+    tensor data for keys where *skip_key_fn* returns True.
+
+    Yields (state_dict, skipped_keys) tuples.
+    """
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+
+    if not state_dict_iterators:
+        return
+
+    n = len(state_dict_iterators)
+    initial_submit = min(prefetch_count + 1, n)
+
+    with ThreadPoolExecutor(max_workers=max(prefetch_count, 1)) as pool:
+        pending: deque = deque()
+        for i in range(initial_submit):
+            pending.append(pool.submit(state_dict_iterators[i].load_filtered, skip_key_fn))
+
+        next_idx = initial_submit
+
+        for _ in range(n):
+            state_dict, skipped_keys = pending.popleft().result()
+
+            if next_idx < n:
+                pending.append(pool.submit(state_dict_iterators[next_idx].load_filtered, skip_key_fn))
+                next_idx += 1
+
+            yield state_dict, skipped_keys
 
 
 @dataclass
@@ -420,30 +546,64 @@ def all_ranks_load_weights(
         if last_error:
             raise last_error
 
-    for state_dict_iterator in tqdm(
-        state_dict_iterators, desc="Loading checkpoint shards", disable=int(os.getenv("LOCAL_RANK", "-1")) > 0
-    ):
-        for name, tensor in state_dict_iterator:
-            # Adapt to transformers 4.52 breaking change on model structure
-            name = _convert_weight_key(name, model)
+    # Check if the handler provides an EP-aware skip function to avoid reading
+    # out-of-range expert tensor data from disk (can reduce I/O by ~60-70%).
+    skip_key_fn = handler.get_skip_key_fn() if handler is not None else None
 
-            # Apply handler transforms (expert merge, gate/up merge, etc.)
-            if handler is not None:
-                results = handler.on_load_weight(name, tensor)
+    def _dispatch_results(results):
+        for param_name, param_tensor in results:
+            if param_name in buffer_dict:
+                buffer_dict[param_name] = param_tensor.clone()
+            elif param_name in parameter_names_to_load:
+                parameter_names_to_load.remove(param_name)
+                _dispatch_parameter(model, param_name, param_tensor, dtensor_factory, parallel_plan)
             else:
-                results = [(name, tensor)]
+                logger.info_rank0(f"Unexpected key in state dict: {param_name}.")
 
-            for param_name, param_tensor in results:
-                if param_name in buffer_dict:
-                    buffer_dict[param_name] = param_tensor.clone()
-                elif param_name in parameter_names_to_load:
-                    parameter_names_to_load.remove(param_name)
-                    _dispatch_parameter(model, param_name, param_tensor, dtensor_factory, parallel_plan)
+    if skip_key_fn is not None:
+        # EP-aware filtered loading: skip reading tensor data for out-of-range experts
+        logger.info_rank0(
+            f"EP-aware filtered loading enabled (ep_rank={ep_rank}, ep_size={ep_size}): "
+            "skipping disk reads for out-of-range expert weights"
+        )
+        for state_dict, skipped_keys in tqdm(
+            _prefetch_shards_filtered(state_dict_iterators, skip_key_fn),
+            total=len(state_dict_iterators),
+            desc="Loading checkpoint shards",
+            disable=int(os.getenv("LOCAL_RANK", "-1")) > 0,
+        ):
+            # Notify handler about skipped keys (updates completion counters)
+            for skipped_key in skipped_keys:
+                _dispatch_results(handler.on_skip_weight(skipped_key))
+
+            # Process loaded tensors normally
+            for name, tensor in state_dict.items():
+                name = _convert_weight_key(name, model)
+                results = handler.on_load_weight(name, tensor)
+                _dispatch_results(results)
+
+            del state_dict
+            empty_cache()
+    else:
+        # Standard bulk loading (no EP filtering)
+        for state_dict in tqdm(
+            _prefetch_shards(state_dict_iterators),
+            total=len(state_dict_iterators),
+            desc="Loading checkpoint shards",
+            disable=int(os.getenv("LOCAL_RANK", "-1")) > 0,
+        ):
+            for name, tensor in state_dict.items():
+                name = _convert_weight_key(name, model)
+
+                if handler is not None:
+                    results = handler.on_load_weight(name, tensor)
                 else:
-                    logger.info_rank0(f"Unexpected key in state dict: {param_name}.")
+                    results = [(name, tensor)]
 
-        del state_dict_iterator
-        empty_cache()
+                _dispatch_results(results)
+
+            del state_dict
+            empty_cache()
 
     # Flush handler buffers (warn on incomplete merges)
     if handler is not None:
@@ -511,87 +671,60 @@ def rank0_load_and_broadcast_weights(
     dist.broadcast(shard_count_tensor, src=0)
     shard_count = int(shard_count_tensor.item())
 
+    # Rank 0: create prefetching generator that bulk-loads upcoming shards in
+    # background threads while the current shard is being broadcast.
+    # prefetch_count=2 allows 2 concurrent NFS reads for higher aggregate throughput.
     if global_rank == 0:
-        shard_iterable = enumerate(
-            tqdm(
-                state_dict_iterators,
-                desc="Loading checkpoint shards",
-                disable=int(os.getenv("LOCAL_RANK", "-1")) > 0,
-            )
+        prefetched = _prefetch_shards(state_dict_iterators, prefetch_count=2)
+
+    if global_rank == 0:
+        shard_range = tqdm(
+            range(shard_count),
+            desc="Loading checkpoint shards",
+            disable=int(os.getenv("LOCAL_RANK", "-1")) > 0,
         )
     else:
-        shard_iterable = enumerate(range(shard_count))
+        shard_range = range(shard_count)
 
     # Queue for transformed tensors ready to broadcast (used when handler buffers/merges)
     merged_queue: List[Tuple[str, torch.Tensor]] = []
 
-    for shard_idx, shard_payload in shard_iterable:
-        state_dict_iterator = shard_payload if global_rank == 0 else None
-        iterator = iter(state_dict_iterator) if global_rank == 0 else None
-
-        while True:
-            tensor: Optional["torch.Tensor"] = None
-            broadcast_name: Optional[str] = None
-            broadcast_tensor: Optional[torch.Tensor] = None
-            if global_rank == 0:
-                if merged_queue:
-                    broadcast_name, broadcast_tensor = merged_queue.pop(0)
-                    metadata = BroadcastMetadata(False, broadcast_name, broadcast_tensor.shape, broadcast_tensor.dtype)
+    for shard_idx in shard_range:
+        # Phase 1 (rank 0 only): bulk-load shard from prefetch cache and feed
+        # all tensors through the checkpoint handler. While this runs, the
+        # background thread is already loading the *next* shard from disk.
+        if global_rank == 0:
+            state_dict = next(prefetched)
+            for key, tensor in state_dict.items():
+                key = _convert_weight_key(key, model)
+                if handler is not None:
+                    results = handler.on_load_weight(key, tensor)
                 else:
-                    # Read keys on rank 0, applying handler transforms.
-                    # Keys that produce no results (buffered) are read silently.
-                    # Break out when we have something to broadcast or reach end of shard.
-                    while True:
-                        try:
-                            key, tensor = next(iterator)  # type: ignore[arg-type]
-                            key = _convert_weight_key(key, model)
+                    results = [(key, tensor)]
+                merged_queue.extend(results)
+            del state_dict
 
-                            if handler is not None:
-                                results = handler.on_load_weight(key, tensor)
-                            else:
-                                results = [(key, tensor)]
+        # Phase 2 (all ranks): broadcast all queued items for this shard.
+        # Batch all metadata into a single broadcast_object_list call, then
+        # broadcast tensors one by one.  This replaces N metadata broadcasts
+        # with 1, eliminating per-tensor pickle + NCCL launch overhead.
+        if global_rank == 0:
+            batch_meta = [(n, t.shape, t.dtype) for n, t in merged_queue]
+        else:
+            batch_meta = None
 
-                            merged_queue.extend(results)
+        batch_meta = [batch_meta]
+        dist.broadcast_object_list(batch_meta, src=0)
+        batch_meta = batch_meta[0]
 
-                            if merged_queue:
-                                broadcast_name, broadcast_tensor = merged_queue.pop(0)
-                                metadata = BroadcastMetadata(
-                                    False, broadcast_name, broadcast_tensor.shape, broadcast_tensor.dtype
-                                )
-                                break
-                            # Handler buffered this key (e.g., waiting for merge partner); keep reading
-
-                        except StopIteration:
-                            if merged_queue:
-                                broadcast_name, broadcast_tensor = merged_queue.pop(0)
-                                metadata = BroadcastMetadata(
-                                    False, broadcast_name, broadcast_tensor.shape, broadcast_tensor.dtype
-                                )
-                            else:
-                                metadata = BroadcastMetadata(True, None, None, None)
-                            break
-            else:
-                metadata = BroadcastMetadata(False, None, None, None)
-
-            metadata_list = [metadata]
-            dist.broadcast_object_list(metadata_list, src=0)
-            metadata = metadata_list[0]
-
-            if metadata.done:
-                break
-
-            name = metadata.name
-            shape = metadata.shape
-            dtype = metadata.dtype
-            if name is None or shape is None or dtype is None:
-                raise RuntimeError("Received incomplete broadcast metadata.")
-
+        for name, shape, dtype in batch_meta:
             # Broadcast tensor from rank 0 to all ranks.
             # For expert tensors, this broadcasts the full [num_experts, ...] tensor;
             # _dispatch_parameter -> shard_tensor handles EP slicing locally per rank.
             if global_rank != 0:
                 tensor = torch.empty(shape, dtype=dtype, device=torch_device)
             else:
+                _, broadcast_tensor = merged_queue.pop(0)
                 tensor = broadcast_tensor.to(torch_device, non_blocking=True)
 
             start_time = time.perf_counter()
@@ -611,11 +744,8 @@ def rank0_load_and_broadcast_weights(
                     logger.info_rank0(f"Unexpected key in state dict: {name}.")
 
             del tensor
-            if global_rank == 0 and broadcast_tensor is not None:
+            if global_rank == 0:
                 del broadcast_tensor
-
-        if global_rank == 0:
-            del state_dict_iterator
 
         empty_cache()
 
@@ -623,35 +753,21 @@ def rank0_load_and_broadcast_weights(
     if handler is not None and global_rank == 0:
         merged_queue.extend(handler.on_load_complete())
 
-    # Broadcast any remaining items from handler flush
-    while merged_queue or (handler is not None):
-        broadcast_name = None
-        broadcast_tensor = None
-        if global_rank == 0:
-            if merged_queue:
-                broadcast_name, broadcast_tensor = merged_queue.pop(0)
-                metadata = BroadcastMetadata(False, broadcast_name, broadcast_tensor.shape, broadcast_tensor.dtype)
-            else:
-                metadata = BroadcastMetadata(True, None, None, None)
-        else:
-            metadata = BroadcastMetadata(False, None, None, None)
+    # Broadcast remaining items from handler flush (same batched pattern)
+    if global_rank == 0:
+        flush_meta = [(n, t.shape, t.dtype) for n, t in merged_queue]
+    else:
+        flush_meta = None
 
-        metadata_list = [metadata]
-        dist.broadcast_object_list(metadata_list, src=0)
-        metadata = metadata_list[0]
+    flush_meta = [flush_meta]
+    dist.broadcast_object_list(flush_meta, src=0)
+    flush_meta = flush_meta[0]
 
-        if metadata.done:
-            break
-
-        name = metadata.name
-        shape = metadata.shape
-        dtype = metadata.dtype
-        if name is None or shape is None or dtype is None:
-            raise RuntimeError("Received incomplete broadcast metadata.")
-
+    for name, shape, dtype in flush_meta:
         if global_rank != 0:
             tensor = torch.empty(shape, dtype=dtype, device=torch_device)
         else:
+            _, broadcast_tensor = merged_queue.pop(0)
             tensor = broadcast_tensor.to(torch_device, non_blocking=True)
 
         dist.broadcast(tensor, src=0)
@@ -661,7 +777,7 @@ def rank0_load_and_broadcast_weights(
             _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan)
 
         del tensor
-        if global_rank == 0 and broadcast_tensor is not None:
+        if global_rank == 0:
             del broadcast_tensor
 
     post_process_after_weight_loading(model, buffer_dict, parameter_names_to_load, dtensor_factory)

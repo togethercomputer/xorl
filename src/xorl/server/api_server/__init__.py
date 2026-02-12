@@ -25,8 +25,6 @@ from xorl.server.api_server.api_types import (
     LoadWeightsResponse,
     SaveWeightsForSamplerRequest,
     SaveWeightsForSamplerResponse,
-    SaveLoRAOnlyRequest,
-    SaveLoRAOnlyResponse,
     HealthCheckResponse,
     ErrorResponse,
 )
@@ -52,8 +50,6 @@ __all__ = [
     "LoadWeightsResponse",
     "SaveWeightsForSamplerRequest",
     "SaveWeightsForSamplerResponse",
-    "SaveLoRAOnlyRequest",
-    "SaveLoRAOnlyResponse",
     "HealthCheckResponse",
     "ErrorResponse",
 ]

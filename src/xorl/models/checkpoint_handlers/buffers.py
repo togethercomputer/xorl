@@ -160,6 +160,16 @@ class ExpertWeightBuffer:
         """Get the fused parameter name, e.g., 'model.layers.0.mlp.experts.gate_proj'."""
         return f"model.layers.{layer_idx}.mlp.experts.{proj}_proj"
 
+    def count_skipped(self, layer_idx: int, proj: str) -> None:
+        """Count an expert key as seen without buffering tensor data.
+
+        Used by EP-aware filtered loading: out-of-range expert tensors are not
+        read from disk, but the handler still needs to know how many expert keys
+        have been seen so ``is_complete`` triggers correctly.
+        """
+        key = (layer_idx, proj)
+        self._total_seen[key] += 1
+
     def get_pending_keys(self) -> List[Tuple[int, str]]:
         """Get list of (layer_idx, proj) combinations that have partial data."""
         return list(self._stacked_buffers.keys())

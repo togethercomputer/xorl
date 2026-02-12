@@ -205,9 +205,39 @@ class ServerArguments:
         metadata={"help": "Enable self-test after model initialization"}
     )
 
+    skip_initial_checkpoint: bool = field(
+        default=False,
+        metadata={"help": "Skip saving initial checkpoint (000000) on startup"}
+    )
+
+    log_gradient_norms: bool = field(
+        default=True,
+        metadata={"help": "Log gradient norms by layer type after backward pass"}
+    )
+
+    log_router_stats: bool = field(
+        default=True,
+        metadata={"help": "Log MoE router token distribution statistics"}
+    )
+
     # ========================================================================
     # Worker Configuration
     # ========================================================================
+
+    worker_bind_host: str = field(
+        default="0.0.0.0",
+        metadata={"help": "Host for worker ZMQ ROUTER socket to bind. Use '0.0.0.0' for multi-node (accepts connections from any interface)."}
+    )
+
+    worker_bind_port: int = field(
+        default=5556,
+        metadata={"help": "Port for worker ZMQ ROUTER socket to bind (rank 0 worker)"}
+    )
+
+    engine_connect_host: Optional[str] = field(
+        default=None,
+        metadata={"help": "Host for Engine to connect to rank 0 worker. If None, auto-discovered (localhost for single-node, file-based for multi-node)."}
+    )
 
     worker_bind_address: str = field(
         default="auto",
@@ -215,8 +245,8 @@ class ServerArguments:
     )
 
     worker_connection_timeout: float = field(
-        default=60.0,
-        metadata={"help": "Timeout in seconds for worker-executor connection"}
+        default=120.0,
+        metadata={"help": "Timeout in seconds for worker-executor connection. Increased for multi-node scenarios."}
     )
 
     worker_max_retries: int = field(
@@ -267,6 +297,15 @@ class ServerArguments:
         metadata={"help": "Enable hybrid shared LoRA for MoE: share lora_A for gate/up_proj, lora_B for down_proj across experts"}
     )
 
+    # ========================================================================
+    # MoE Training Configuration
+    # ========================================================================
+
+    freeze_router: bool = field(
+        default=False,
+        metadata={"help": "Freeze MoE router weights during training"}
+    )
+
     def __post_init__(self):
         """Validate and set defaults."""
         # Set default paths
@@ -279,6 +318,16 @@ class ServerArguments:
         # Validate model_path
         if self.model_path is None:
             raise ValueError("model_path is required for server configuration")
+
+        # Build worker_bind_address from host and port
+        # This allows users to configure host/port separately while maintaining
+        # backward compatibility with existing worker_bind_address configs
+        if self.worker_bind_address == "tcp://0.0.0.0:5556":
+            # Default value - build from host/port fields
+            self.worker_bind_address = f"tcp://{self.worker_bind_host}:{self.worker_bind_port}"
+        elif self.worker_bind_address == "tcp://127.0.0.1:5556":
+            # Legacy default - update to match new default
+            self.worker_bind_address = f"tcp://{self.worker_bind_host}:{self.worker_bind_port}"
 
         # Validate worker address
         if self.worker_bind_address != "auto" and not self.worker_bind_address.startswith("tcp://"):
@@ -320,6 +369,13 @@ class ServerArguments:
                 "load_checkpoint_path": self.load_checkpoint_path,
                 "ckpt_manager": self.ckpt_manager,
                 "enable_self_test": self.enable_self_test,
+                "freeze_router": self.freeze_router,
+                "skip_initial_checkpoint": self.skip_initial_checkpoint,
+                "log_gradient_norms": self.log_gradient_norms,
+                "log_router_stats": self.log_router_stats,
+                "packing_seq_len": self.packing_seq_len,
+                "enable_packing": self.enable_packing,
+                "storage_limit": self.storage_limit,
             },
             "data": {
                 # Empty data section - data comes from client at runtime
@@ -337,7 +393,7 @@ class ServerArguments:
     def get_world_size(self) -> int:
         """
         Calculate world size from parallelism configuration.
-        
+
         Note: EP (Expert Parallel) is NOT included in world_size calculation.
         EP creates a separate 2D mesh: world_size = ep_size * ep_fsdp_size
         where ep_fsdp_size contains all other parallelism dimensions.
@@ -350,6 +406,37 @@ class ServerArguments:
             self.data_parallel_replicate_size *
             self.data_parallel_shard_size
         )
+
+    def get_total_gpus(self) -> int:
+        """
+        Calculate total number of GPUs required for the parallelism configuration.
+
+        EP and the main parallelism mesh (DP/Ulysses/etc.) share the same GPUs but
+        organize them differently:
+        - Main mesh: DP × Ulysses × CP × TP × PP
+        - EP mesh: EP × ep_fsdp_size (where ep_fsdp_size = world_size / ep_size)
+
+        The total GPUs needed is the MAX of EP and the main mesh dimensions,
+        rounded up to be divisible by EP (if EP > 1).
+
+        Returns:
+            Total number of GPUs needed
+        """
+        main_mesh_size = self.get_world_size()
+        ep_size = self.expert_parallel_size
+
+        if ep_size <= 1:
+            return main_mesh_size
+
+        # Need at least ep_size GPUs, and world_size must be divisible by ep_size
+        # Also need to accommodate the main mesh dimensions
+        total = max(ep_size, main_mesh_size)
+
+        # Round up to nearest multiple of ep_size
+        if total % ep_size != 0:
+            total = ((total // ep_size) + 1) * ep_size
+
+        return total
     
     def get_ep_fsdp_size(self) -> int:
         """

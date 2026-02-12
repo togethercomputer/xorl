@@ -1,6 +1,7 @@
 from .activations import ACT2FN
 from .attention import (
     ATTENTION_FUNCTIONS,
+    AttentionKwargs,
     FLASH_ATTENTION_IMPLEMENTATIONS,
     FlashAttentionKwargs,
     eager_attention_forward,
@@ -21,6 +22,7 @@ from .rope import (
 __all__ = [
     "ACT2FN",
     "ATTENTION_FUNCTIONS",
+    "AttentionKwargs",
     "FLASH_ATTENTION_IMPLEMENTATIONS",
     "FlashAttentionKwargs",
     "RMSNorm",

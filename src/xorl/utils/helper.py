@@ -423,11 +423,11 @@ def print_example(example: Dict[str, "torch.Tensor"], rank: int, print_tensor: b
     for key, value in example.items():
         if isinstance(value, torch.Tensor):
             if print_tensor:
-                logger.info(f"[rank {rank}]: {key}'s shape: {value.shape}, device: {value.device}, {value}")
+                logger.debug(f"[rank {rank}]: {key}'s shape: {value.shape}, device: {value.device}, {value}")
             else:
-                logger.info(f"[rank {rank}]: {key}'s shape: {value.shape}, device: {value.device}")
+                logger.debug(f"[rank {rank}]: {key}'s shape: {value.shape}, device: {value.device}")
         else:
-            logger.info(f"[rank {rank}]: {key}'s value: {value}")
+            logger.debug(f"[rank {rank}]: {key}'s value: {value}")
 
 
 def dict2device(input_dict: dict):

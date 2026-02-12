@@ -2,14 +2,14 @@
 
 Pure attention computation -- no sequence parallelism logic.
 SP communication (Ulysses all-to-all, etc.) is handled externally by
-CPStrategy classes in ``xorl.distributed.sequence_parallel.strategy``.
+SPStrategy classes in ``xorl.distributed.sequence_parallel.strategy``.
 """
 
 import os
 from typing import Optional, Tuple
 
 import torch
-from flash_attn_interface import flash_attn_func, flash_attn_varlen_func
+from flash_attn import flash_attn_func, flash_attn_varlen_func
 
 from .....utils import logging
 
@@ -55,11 +55,11 @@ def flash_attention_forward(
 ) -> Tuple[torch.Tensor, None]:
     if kwargs.get("output_attentions", False) or kwargs.get("head_mask", None) is not None:
         logger.warning_once(
-            "Flash attention does not support `output_attentions=True` or `head_mask`."
+            "`flash_attention_2` does not support `output_attentions=True` or `head_mask`."
             " Please set your attention to `eager` if you want any of these features."
         )
 
-    # Flash attention always relies on the value set in the module, so remove it if present in kwargs to avoid passing it twice
+    # FA2 always relies on the value set in the module, so remove it if present in kwargs to avoid passing it twice
     kwargs.pop("is_causal", None)
 
     # This is for Qwen2VL's mrope
@@ -124,14 +124,14 @@ def flash_attention_forward(
                 softcap=softcap if softcap is not None else 0.0,
             )
     else:
-        # FA3 path (default) — call flash_attn_interface directly
+        # FA2 path (default) — call flash_attn directly
         causal = getattr(module, "is_causal", True)
 
         # Convert sliding_window (int) to window_size (tuple) for flash_attn
         if sliding_window is not None:
-            window_size_fa3 = (sliding_window, 0 if causal else sliding_window)
+            window_size_fa2 = (sliding_window, 0 if causal else sliding_window)
         else:
-            window_size_fa3 = (-1, -1)
+            window_size_fa2 = (-1, -1)
 
         cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)
         cu_seq_lens_k = kwargs.get("cu_seq_lens_k", None)
@@ -156,9 +156,10 @@ def flash_attention_forward(
                 cu_seqlens_k=cu_seq_lens_k,
                 max_seqlen_q=max_length_q,
                 max_seqlen_k=max_length_k,
+                dropout_p=dropout,
                 softmax_scale=scaling,
                 causal=causal,
-                window_size=window_size_fa3,
+                window_size=window_size_fa2,
                 softcap=softcap if softcap is not None else 0.0,
             )
             # Restore batch dimension
@@ -170,9 +171,10 @@ def flash_attention_forward(
                 query,
                 key,
                 value,
+                dropout_p=dropout,
                 softmax_scale=scaling,
                 causal=causal,
-                window_size=window_size_fa3,
+                window_size=window_size_fa2,
                 softcap=softcap if softcap is not None else 0.0,
             )
 

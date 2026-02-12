@@ -78,12 +78,14 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
 
         # q communication collect
         q = q_res()
-        q = unpadding_tensor_for_seqeunce_parallel(q, seq_dimension, unpadded_dim_size)
+        if unpadded_dim_size is not None and unpadded_dim_size > 0:
+            q = unpadding_tensor_for_seqeunce_parallel(q, seq_dimension, unpadded_dim_size)
         q = q.reshape(list(q.shape[:-1]) + [-1, head_dim]).contiguous()
 
         # k communication collect
         k = k_res()
-        k = unpadding_tensor_for_seqeunce_parallel(k, seq_dimension, unpadded_dim_size)
+        if unpadded_dim_size is not None and unpadded_dim_size > 0:
+            k = unpadding_tensor_for_seqeunce_parallel(k, seq_dimension, unpadded_dim_size)
         k = k.reshape(list(k.shape[:-1]) + [-1, head_dim]).contiguous()
 
         # qk normalization (if needed)
@@ -120,7 +122,8 @@ class AsyncUlyssesQKVProjection(torch.autograd.Function):
 
         # v communication collect
         v = v_res()
-        v = unpadding_tensor_for_seqeunce_parallel(v, seq_dimension, unpadded_dim_size)
+        if unpadded_dim_size is not None and unpadded_dim_size > 0:
+            v = unpadding_tensor_for_seqeunce_parallel(v, seq_dimension, unpadded_dim_size)
         v = v.reshape(list(v.shape[:-1]) + [-1, head_dim]).contiguous()
 
         # save ctx for backward
@@ -400,7 +403,8 @@ class AsyncUlyssesOutputProjection(torch.autograd.Function):
 
         # output grad communication collect
         grad_o = grad_out_res()
-        grad_o = unpadding_tensor_for_seqeunce_parallel(grad_o, seq_dimension, unpadded_dim_size)
+        if unpadded_dim_size is not None and unpadded_dim_size > 0:
+            grad_o = unpadding_tensor_for_seqeunce_parallel(grad_o, seq_dimension, unpadded_dim_size)
 
         return (
             grad_o,

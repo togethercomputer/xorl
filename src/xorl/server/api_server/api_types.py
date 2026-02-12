@@ -4,9 +4,26 @@ API Request/Response Types for REST API.
 Pydantic type definitions for FastAPI endpoints in the unified API server.
 """
 
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
+
+
+# ============================================================================
+# Two-Phase Async Response Types
+# ============================================================================
+
+
+class UntypedAPIFutureResponse(BaseModel):
+    """Phase 1 response - returned immediately after request submission.
+
+    The client receives this response with a request_id, then polls
+    /api/v1/retrieve_future to get the actual result.
+    """
+
+    request_id: str = Field(..., description="Unique identifier for retrieving the result")
+    model_id: Optional[str] = Field(default=None, description="Model identifier for the request")
+
 
 
 # ============================================================================
@@ -68,6 +85,17 @@ class DatumInput(BaseModel):
     loss_fn: str = Field(default="causallm_loss", description="Loss function type")
     loss_fn_params: Optional[Dict[str, Any]] = Field(
         default=None, description="Global loss function parameters (e.g., eps_clip, use_tis for PPO)"
+    )
+    routed_experts: Optional[List[Any]] = Field(
+        default=None,
+        description=(
+            "Per-datum MOE routing data for R3 (Rollout Routing Replay). "
+            "Each element can be either:\n"
+            "  - Nested list with shape [num_tokens, num_layers, topk]\n"
+            "  - Base64-encoded int32 numpy array (from SGLang) with shape info in meta_info\n"
+            "When provided, training will replay these expert selections instead of recomputing "
+            "top-k routing, ensuring consistency with inference routing decisions."
+        ),
     )
 
 
@@ -305,19 +333,6 @@ class CreateModelResponse(BaseModel):
     type: Literal["create_model"] = Field(default="create_model", description="Response type identifier")
 
 
-class RegisterAdapterRequest(BaseModel):
-    """API request for registering a new LoRA adapter for parallel training."""
-    model_id: str = Field(..., description="Unique model identifier for this training run")
-    lr: float = Field(default=1e-5, description="Learning rate for this adapter")
-
-
-class RegisterAdapterResponse(BaseModel):
-    """API response for registering an adapter."""
-    model_id: str = Field(..., description="Model identifier")
-    lr: float = Field(..., description="Learning rate for this adapter")
-    registered: bool = Field(..., description="Whether registration was successful")
-    total_adapters: int = Field(..., description="Total number of registered adapters")
-
 
 class UnloadModelRequest(BaseModel):
     """API request for unloading a model (Tinker-compatible)."""
@@ -388,30 +403,6 @@ class SaveAdapterStateResponse(BaseModel):
     step: int = Field(..., description="Global step at save time")
 
 
-class LoadAdapterStateRequest(BaseModel):
-    """API request for loading adapter state (weights + optimizer)."""
-
-    model_id: str = Field(..., description="Target adapter/session identifier to load into")
-    path: str = Field(..., description="Directory to load adapter state from")
-    load_optimizer: bool = Field(
-        default=True,
-        description="Whether to load optimizer state for resuming training"
-    )
-    lr: Optional[float] = Field(
-        default=None,
-        description="Learning rate for the adapter (uses saved value if not specified)"
-    )
-    seq_id: Optional[int] = Field(default=None, description="Sequence ID for request ordering")
-
-
-class LoadAdapterStateResponse(BaseModel):
-    """API response for loading adapter state."""
-
-    success: bool = Field(..., description="Whether load was successful")
-    path: str = Field(..., description="Directory where adapter state was loaded from")
-    model_id: str = Field(..., description="Model identifier that was loaded into")
-    step: int = Field(..., description="Global step restored from checkpoint")
-
 
 class RegisterWorkersRequest(BaseModel):
     """API request for registering inference workers for a model."""
@@ -442,19 +433,34 @@ class SaveWeightsForSamplerResponse(BaseModel):
     path: str = Field(..., description="Xorl URI for the saved checkpoint (e.g., 'xorl://model-0/sampler_weights/step-100')")
 
 
-class SaveLoRAOnlyRequest(BaseModel):
-    """API request for saving only LoRA adapter weights."""
 
-    model_id: str = Field(
-        default="default", description="Model identifier (must be created via /api/v1/create_model first)"
+class SaveFullWeightsSafetensorsRequest(BaseModel):
+    """API request for saving full model weights as safetensors (SGLang-compatible).
+
+    This saves the complete model weights (not just LoRA) in safetensors format
+    with config files, allowing direct loading by SGLang or other inference engines.
+
+    Endpoint: POST /api/v1/save_full_weights_safetensors
+    """
+
+    model_id: str = Field(default="default", description="Model identifier")
+    name: str = Field(..., description="Checkpoint name (e.g., 'checkpoint-001')")
+    dtype: str = Field(
+        default="bfloat16",
+        description="Target dtype for weights (bfloat16, float16, float32)",
     )
-    lora_path: Optional[str] = Field(default=None, description="LoRA save path (auto-generated if not specified)")
+    base_model_path: Optional[str] = Field(
+        default=None,
+        description="Path to base model for config files. If None, uses server's configured model_path.",
+    )
 
 
-class SaveLoRAOnlyResponse(BaseModel):
-    """API response for saving LoRA weights."""
+class SaveFullWeightsSafetensorsResponse(BaseModel):
+    """API response for saving full weights as safetensors."""
 
-    lora_path: str = Field(..., description="LoRA adapter path")
+    path: str = Field(..., description="Filesystem path to saved safetensors directory")
+    dtype: str = Field(..., description="Dtype used for saving")
+    num_shards: int = Field(..., description="Number of safetensor shards created")
 
 
 # ============================================================================
@@ -507,6 +513,31 @@ class DeleteCheckpointResponse(BaseModel):
     success: bool = Field(..., description="Whether the deletion was successful")
     deleted_path: Optional[str] = Field(default=None, description="The xorl:// path that was deleted")
     error: Optional[str] = Field(default=None, description="Error message if deletion failed")
+
+
+# ============================================================================
+# Full-Weights Training Session Management
+# ============================================================================
+
+
+class KillSessionRequest(BaseModel):
+    """API request for killing a full-weights training session.
+
+    In full-weights training mode (enable_lora=False), the server operates in
+    single-tenant mode. This endpoint allows killing the active session to
+    start a new one.
+    """
+
+    model_id: str = Field(..., description="Session to kill (must match active session)")
+    save_checkpoint: bool = Field(default=True, description="Save checkpoint before killing")
+
+
+class KillSessionResponse(BaseModel):
+    """API response for killing a full-weights training session."""
+
+    success: bool = Field(..., description="Whether the session was killed successfully")
+    message: str = Field(..., description="Status message")
+    checkpoint_path: Optional[str] = Field(default=None, description="Path to saved checkpoint (if save_checkpoint=True)")
 
 
 # ============================================================================
@@ -623,14 +654,45 @@ class RemoveInferenceEndpointResponse(BaseModel):
 
 
 class SyncInferenceWeightsRequest(BaseModel):
-    """API request for synchronizing weights to inference endpoints via NCCL."""
+    """API request for synchronizing weights to inference endpoints.
 
+    Supports three sync methods:
+    - "nccl_ep_scatter" (default): Multi-rank EP scatter for MoE models, 5-7x faster.
+      Falls back to "nccl" if EP scatter conditions aren't met.
+    - "nccl": Uses NCCL broadcast with pause/resume protocol.
+      Requires CUDA graph recapture after sync (~30-60s overhead).
+    - "ps": Uses checkpoint-engine ParameterServer protocol.
+      Avoids CUDA graph recapture via in-place weight updates (~0s overhead).
+      Requires checkpoint-engine package and SGLang with IPC support.
+    - "rdma_direct": Uses RDMA direct writes from training to inference GPU memory.
+      PUSH model where training writes directly to SGLang's registered GPU addresses.
+      Avoids CUDA graph recapture. Requires mooncake and SGLang with --enable-rdma-weight-updates.
+    """
+
+    sync_method: Literal["nccl", "nccl_ep_scatter", "ps", "rdma_direct"] = Field(
+        default="nccl_ep_scatter",
+        description=(
+            "Weight sync method: 'nccl' (uses pause/resume protocol with pipelined broadcast), "
+            "'nccl_ep_scatter' (multi-rank EP scatter for MoE models, 5-7x faster), "
+            "'ps' (ParameterServer protocol, avoids CUDA graph recapture), or "
+            "'rdma_direct' (RDMA PUSH model, writes directly to inference GPU memory)"
+        ),
+    )
     master_address: str = Field(
-        default="localhost", description="Master address for NCCL rendezvous (training server address)"
+        default="", description="Master address for NCCL rendezvous (training server address). Auto-detected if empty."
     )
     master_port: int = Field(default=29600, description="Master port for NCCL rendezvous")
     group_name: str = Field(default="weight_sync_group", description="Name of the NCCL process group")
     buffer_size_mb: int = Field(default=1024, description="Size of each transfer bucket in MB (to avoid OOM)")
+    # ParameterServer-specific options
+    checkpoint_name: str = Field(
+        default="xorl-training",
+        description="Checkpoint name for ParameterServer registration (only used with sync_method='ps')",
+    )
+    weight_version: Optional[str] = Field(
+        default=None,
+        description="Version string for weight tracking (only used with sync_method='ps')",
+    )
 
 
 class EndpointSyncResult(BaseModel):
@@ -654,6 +716,62 @@ class SyncInferenceWeightsResponse(BaseModel):
     endpoints_synced: List[EndpointSyncResult] = Field(
         default_factory=list, description="Sync results for each endpoint"
     )
+
+
+# ============================================================================
+# Persistent Connection Management
+# ============================================================================
+
+
+class ConnectInferenceEndpointRequest(BaseModel):
+    """API request for establishing a persistent NCCL connection to inference endpoints.
+
+    This should be called once at the start of an RL training loop to avoid
+    connection overhead during frequent weight syncs.
+    """
+
+    master_address: str = Field(
+        default="", description="Master address for NCCL rendezvous (training server address). Auto-detected if empty."
+    )
+    master_port: int = Field(default=29600, description="Master port for NCCL rendezvous")
+    group_name: str = Field(default="weight_sync_group", description="Name of the NCCL process group")
+    buffer_size_mb: int = Field(default=256, description="Size of transfer buffer in MB")
+
+
+class ConnectedEndpoint(BaseModel):
+    """Information about a successfully connected endpoint."""
+
+    host: str = Field(..., description="Hostname or IP address of the endpoint")
+    port: int = Field(..., description="Port number of the endpoint")
+    world_size: int = Field(default=1, description="Number of workers at this endpoint")
+
+
+class ConnectInferenceEndpointResponse(BaseModel):
+    """API response for connection establishment."""
+
+    success: bool = Field(..., description="Whether connection was established successfully")
+    message: str = Field(..., description="Status message")
+    connected_endpoints: List[ConnectedEndpoint] = Field(
+        default_factory=list, description="List of successfully connected endpoints"
+    )
+
+
+class DisconnectInferenceEndpointRequest(BaseModel):
+    """API request for disconnecting from inference endpoints.
+
+    This cleans up NCCL process groups. Call at the end of an RL training
+    loop or when changing inference endpoints.
+    """
+
+    pass  # No parameters needed
+
+
+class DisconnectInferenceEndpointResponse(BaseModel):
+    """API response for disconnection."""
+
+    success: bool = Field(..., description="Whether disconnection was successful")
+    message: str = Field(..., description="Status message")
+
 
 
 # ============================================================================

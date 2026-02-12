@@ -88,7 +88,7 @@ def parallelize_model_fsdp2(
             # this is often the case for models like deepseek in which some decoder layers are dense instead of MoE
             layer_pairs.append((layer_fqn, layer_mod, None))
 
-    logger.info_rank0(f"layer pairs: {layer_pairs}")
+    logger.debug_rank0(f"layer pairs: {layer_pairs}")
 
     # Step 2: Update fsdp2 kwargs
     fsdp_kwargs = {"mesh": parallel_state.fsdp_mesh}
@@ -160,7 +160,7 @@ def parallelize_model_fsdp2(
         # shard everything else in the decoder layer
         fully_shard(layer_mod, **fsdp_kwargs)
         layer_mod._fsdp_modules.append(layer_mod)
-        logger.info_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
+        logger.debug_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
     # shard root model
     fully_shard(model, **fsdp_kwargs)
 
