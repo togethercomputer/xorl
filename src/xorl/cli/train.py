@@ -38,6 +38,7 @@ from xorl.utils.device import (
 from xorl.arguments import Arguments, DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 
 from xorl.utils.dist_utils import all_reduce
+from xorl.ops.loss.causallm_loss import causallm_loss_function
 
 
 logger = helper.create_logger(__name__)
@@ -93,6 +94,11 @@ def main():
     if args.train.max_steps is not None:
         total_train_steps = min(total_train_steps, args.train.max_steps)
     logger.info_rank0(f"Train steps per epoch: {train_steps_per_epoch}, Total train steps: {total_train_steps}")
+
+    # Convert save_epochs (fractional) to a step interval
+    save_epoch_steps = int(args.train.save_epochs * train_steps_per_epoch) if args.train.save_epochs else 0
+    if save_epoch_steps:
+        logger.info_rank0(f"Save every {args.train.save_epochs} epoch(s) = every {save_epoch_steps} steps")
 
 
     logger.info_rank0("Prepare model")
@@ -261,7 +267,6 @@ def main():
                 }
 
                 with model_fwd_context:
-                    # Explicitly disable output_hidden_states to save memory (~20GB)
                     outputs = model(**micro_batch, use_cache=False, output_hidden_states=False)
                     loss = outputs.loss
                     
@@ -342,7 +347,9 @@ def main():
                 if global_step == args.train.profile_end_step:
                     profiler.stop()
 
-            if args.train.save_steps and global_step % args.train.save_steps == 0:
+            should_save = (args.train.save_steps and global_step % args.train.save_steps == 0) or \
+                          (save_epoch_steps and global_step % save_epoch_steps == 0)
+            if should_save:
                 helper.empty_cache()
                 save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
                 state = {
@@ -364,25 +371,6 @@ def main():
         data_loader_tqdm.close()
         start_step = 0
         helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
-        if args.train.max_steps is not None and global_step >= args.train.max_steps:
-            break
-        if args.train.save_epochs and (epoch + 1) % args.train.save_epochs == 0:
-            helper.empty_cache()
-            save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
-            state = {
-                "model": model,
-                "optimizer": optimizer,
-                "extra_state": {
-                    "global_step": global_step,
-                    "lr_scheduler": lr_scheduler.state_dict(),
-                    "train_dataloader": train_dataloader.state_dict(),
-                    "environ_meter": environ_meter.state_dict(),
-                    "torch_rng_state": torch.get_rng_state(),
-                },
-            }
-            Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
-            dist.barrier()
-            logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 
     synchronize()
 
