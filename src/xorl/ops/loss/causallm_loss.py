@@ -28,7 +28,10 @@ def causallm_loss_function(
         ignore_index: Index to ignore in loss computation (default: -100)
         return_per_token: If True, return per-token logprobs and losses (default: False)
         ce_mode: Cross-entropy mode - "compiled" (default) or "eager"
-        num_chunks: Number of chunks for compiled mode (default: 8).
+        num_chunks: Number of chunks for compiled mode (default: 64).
+                   Higher values use less memory. At MBS=8 with 128K seq and vocab=151K,
+                   num_chunks=8 creates 9.1 GiB FP32 logits per chunk (18 GiB peak during
+                   backward), while num_chunks=64 reduces this to 1.1 GiB (2.3 GiB peak).
 
     Returns:
         If return_per_token=False: (loss, None, None, None)
