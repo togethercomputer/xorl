@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 name = "xorl"
 dynamic = ["version"]
 description = "Xorl: Simple and high-performance distributed training framework for large language models"
-requires-python = "==3.12"
+requires-python = "==3.12.*"
 
 dependencies = [
   "boto3>=1.35.0",
@@ -32,6 +32,8 @@ dependencies = [
   "torch @ https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl",
   "torchvision @ https://download.pytorch.org/whl/cu129/torchvision-0.24.1%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl",
   "triton @ https://download.pytorch.org/whl/triton-3.5.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+  # Quack: CuTe-based kernels (group GEMM, etc.) for SM90+ (H100/B200)
+  "quack-kernels",
   # Flash Attention
   "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.11/flash_attn-2.8.3%2Bcu129torch2.9-cp312-cp312-linux_x86_64.whl",
   "flash-attn-3 @ https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.01.26-f6c4937/flash_attn_3-3.0.0b1%2B20260126.cu129torch2100cxx11abitrue.438325-cp39-abi3-linux_x86_64.whl",

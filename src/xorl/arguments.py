@@ -707,9 +707,9 @@ class TrainingArguments:
         default=0,
         metadata={"help": "Number of steps between two checkpoint saves."},
     )
-    save_epochs: int = field(
+    save_epochs: float = field(
         default=1,
-        metadata={"help": "Number of epochs between two checkpoint saves."},
+        metadata={"help": "Fraction or number of epochs between two checkpoint saves. E.g., 0.25 saves 4 times per epoch."},
     )
     save_hf_weights: bool = field(
         default=True,
