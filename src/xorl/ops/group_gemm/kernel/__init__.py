@@ -1,5 +1,6 @@
 # Group GEMM kernels
 from .group_gemm import group_gemm_same_mn, group_gemm_same_nk
+from .quack import quack_group_gemm_same_mn, quack_group_gemm_same_nk
 
 # MoE operations
 from .moe import (
@@ -23,6 +24,8 @@ __all__ = [
     # Group GEMM
     "group_gemm_same_mn",
     "group_gemm_same_nk",
+    "quack_group_gemm_same_mn",
+    "quack_group_gemm_same_nk",
     # MoE operations
     "expert_histogram",
     "moe_add_gather",

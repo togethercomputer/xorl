@@ -5,7 +5,14 @@ import torch
 from unittest.mock import Mock, patch
 
 from xorl.models.layers.attention.utils import repeat_kv
-from xorl.models.layers.attention.backend.flash_attention import flash_attention_forward
+from xorl.models.layers.attention.backend.eager import eager_attention_forward
+
+try:
+    from xorl.models.layers.attention.backend.flash_attention import flash_attention_forward
+    _FLASH_ATTN_IMPORT_ERROR = None
+except ImportError as exc:
+    flash_attention_forward = None
+    _FLASH_ATTN_IMPORT_ERROR = exc
 
 
 pytestmark = pytest.mark.cpu
@@ -81,6 +88,11 @@ class TestFlashAttentionForward:
     The new flash_attention_forward is a pure attention function (no SP logic).
     It calls flash_attn_func/flash_attn_varlen_func directly.
     """
+
+    @pytest.fixture(autouse=True)
+    def _skip_when_flash_attention_unavailable(self):
+        if _FLASH_ATTN_IMPORT_ERROR is not None:
+            pytest.skip(f"flash attention backend unavailable: {_FLASH_ATTN_IMPORT_ERROR}")
 
     def test_output_attentions_warning(self):
         """Test that output_attentions=True triggers a warning."""
@@ -269,3 +281,55 @@ class TestFlashAttentionForward:
 
         assert result.device.type == "cuda"
         assert result.shape == (batch, seqlen, num_heads, head_dim)
+
+
+class TestEagerAttentionForward:
+    """Regression tests for eager attention head handling."""
+
+    def test_runtime_kv_repeat_handles_ulysses_head_layout(self):
+        # Simulate Ulysses-sync local tensors:
+        # local Q heads = 4, local KV heads = 1.
+        # Global config can still carry num_key_value_groups=8.
+        # Eager attention should derive repeat=4 from tensor shapes (not 8).
+        module = Mock()
+        module.num_key_value_groups = 8
+        module.training = False
+
+        batch, seq, q_heads, kv_heads, head_dim = 1, 8, 4, 1, 16
+        query = torch.randn(batch, seq, q_heads, head_dim)
+        key = torch.randn(batch, seq, kv_heads, head_dim)
+        value = torch.randn(batch, seq, kv_heads, head_dim)
+
+        attn_output, attn_weights = eager_attention_forward(
+            module=module,
+            query=query,
+            key=key,
+            value=value,
+            attention_mask=None,
+            scaling=head_dim**-0.5,
+            dropout=0.0,
+        )
+
+        assert attn_output.shape == (batch, seq, q_heads, head_dim)
+        assert attn_weights.shape == (batch, q_heads, seq, seq)
+
+    def test_runtime_kv_repeat_raises_on_invalid_head_layout(self):
+        module = Mock()
+        module.num_key_value_groups = 8
+        module.training = False
+
+        # q_heads is not divisible by kv_heads -> invalid GQA layout
+        query = torch.randn(1, 4, 3, 8)
+        key = torch.randn(1, 4, 2, 8)
+        value = torch.randn(1, 4, 2, 8)
+
+        with pytest.raises(RuntimeError, match="query_heads=3 is not divisible by kv_heads=2"):
+            eager_attention_forward(
+                module=module,
+                query=query,
+                key=key,
+                value=value,
+                attention_mask=None,
+                scaling=8**-0.5,
+                dropout=0.0,
+            )

@@ -33,6 +33,27 @@ def __getattr__(name):
             }
         )
         return globals()[name]
+    if name in ("DeepEPBuffer", "DEEPEP_AVAILABLE", "token_pre_dispatch", "tokens_post_combine", "get_default_buffer", "destroy_default_buffer"):
+        from .deepep import (
+            DeepEPBuffer,
+            DEEPEP_AVAILABLE,
+            token_pre_dispatch,
+            tokens_post_combine,
+            get_default_buffer,
+            destroy_default_buffer,
+        )
+
+        globals().update(
+            {
+                "DeepEPBuffer": DeepEPBuffer,
+                "DEEPEP_AVAILABLE": DEEPEP_AVAILABLE,
+                "token_pre_dispatch": token_pre_dispatch,
+                "tokens_post_combine": tokens_post_combine,
+                "get_default_buffer": get_default_buffer,
+                "destroy_default_buffer": destroy_default_buffer,
+            }
+        )
+        return globals()[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -42,6 +63,12 @@ __all__ = [
     "tokens_post_all2all",
     "EPGroupGemm",
     "EPGroupGemmWithLoRA",
+    "DeepEPBuffer",
+    "DEEPEP_AVAILABLE",
+    "token_pre_dispatch",
+    "tokens_post_combine",
+    "get_default_buffer",
+    "destroy_default_buffer",
     # Routing replay for R3
     "RoutingReplay",
     "get_current_routing_replay",

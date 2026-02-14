@@ -36,7 +36,7 @@ from ...outputs import (
 
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel.strategy import get_sp_strategy
-from ....ops import causallm_loss_function, fused_moe_forward
+from ....ops import causallm_loss_function, fused_moe_forward, quack_moe_forward
 from ....ops.fused_silu_and_mul import fused_silu_and_mul
 from ....utils import logging
 from .configuration_qwen3_moe import Qwen3MoeConfig
@@ -52,6 +52,8 @@ class Qwen3MoeMLP(nn.Module):
         self.gate_up_proj = nn.Linear(self.hidden_size, 2 * self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
+        self.use_deepep = getattr(config, "_use_deepep", False)
+        self.deepep_buffer_size_gb = getattr(config, "_deepep_buffer_size_gb", 2.0)
         self._use_fused_silu = config.hidden_act == "silu"
 
     def forward(self, x):
@@ -138,6 +140,44 @@ class Qwen3MoeFusedExperts(nn.Module):
             Output tensor of shape (num_tokens, hidden_dim)
         """
         out = fused_moe_forward(
+            module=self,
+            num_experts=self.num_experts,
+            routing_weights=routing_weights,
+            selected_experts=selected_experts,
+            hidden_states=hidden_states,
+            fc1_1_weight=self.gate_proj,
+            fc1_2_weight=self.up_proj,
+            fc2_weight=self.down_proj,
+            use_deepep=self.use_deepep,
+            deepep_buffer_size_gb=self.deepep_buffer_size_gb,
+        )
+        return out
+
+
+class Qwen3MoeQuackExperts(nn.Module):
+    """Expert module for quack MoE computation (uses quack group GEMM kernels)."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.hidden_dim = config.hidden_size
+        self.intermediate_size = config.moe_intermediate_size
+        self.gate_proj = torch.nn.Parameter(
+            torch.empty(self.num_experts, self.intermediate_size, self.hidden_dim),
+            requires_grad=True,
+        )
+        self.up_proj = torch.nn.Parameter(
+            torch.empty(self.num_experts, self.intermediate_size, self.hidden_dim),
+            requires_grad=True,
+        )
+        self.down_proj = torch.nn.Parameter(
+            torch.empty(self.num_experts, self.hidden_dim, self.intermediate_size),
+            requires_grad=True,
+        )
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, hidden_states, routing_weights, selected_experts):
+        out = quack_moe_forward(
             module=self,
             num_experts=self.num_experts,
             routing_weights=routing_weights,
@@ -318,9 +358,16 @@ class Qwen3MoeSparseFusedMoeBlock(nn.Module):
         return final_hidden_states, router_logits
 
 
+class Qwen3MoeSparseQuackMoeBlock(Qwen3MoeSparseFusedMoeBlock):
+    def __init__(self, config):
+        super().__init__(config)
+        self.experts = Qwen3MoeQuackExperts(config)
+
+
 QWEN3_MOE_CLASSES = {
     "eager": Qwen3MoeSparseMoeBlock,
     "fused": Qwen3MoeSparseFusedMoeBlock,
+    "quack": Qwen3MoeSparseQuackMoeBlock,
 }
 
 
@@ -847,6 +894,8 @@ __all__ = [
     "Qwen3MoePreTrainedModel",
     "Qwen3MoeSparseExperts",
     "Qwen3MoeFusedExperts",
+    "Qwen3MoeQuackExperts",
     "Qwen3MoeSparseMoeBlock",
     "Qwen3MoeSparseFusedMoeBlock",
+    "Qwen3MoeSparseQuackMoeBlock",
 ]
