@@ -70,7 +70,9 @@ def build_foundation_model(
     attn_implementation: Optional[
         Literal["eager", "sdpa", "flash_attention_2", "flash_attention_3", "flash_attention_4", "native-sparse"]
     ] = "flash_attention_2",
-    moe_implementation: Optional[Literal["eager", "fused"]] = None,
+    moe_implementation: Optional[Literal["eager", "fused", "quack"]] = None,
+    use_deepep: bool = False,
+    deepep_buffer_size_gb: float = 2.0,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
 ) -> nn.Module:
@@ -88,10 +90,15 @@ def build_foundation_model(
         config = _load_config_with_rank0_priority(config_path, config_kwargs)
 
     if moe_implementation is not None:
-        if moe_implementation not in ["eager", "fused"]:
+        if moe_implementation not in ["eager", "fused", "quack"]:
             raise ValueError(f"Invalid moe_implementation: {moe_implementation}")
         config._moe_implementation = moe_implementation
         logger.info_rank0(f"Moe implementation: {moe_implementation}")
+
+    config._use_deepep = use_deepep
+    config._deepep_buffer_size_gb = deepep_buffer_size_gb
+    if use_deepep:
+        logger.info_rank0(f"DeepEP enabled for quack MoE (buffer={deepep_buffer_size_gb} GB)")
 
     # Validate attention implementation for packed sequences with FlashAttention kwargs
     if attn_implementation == "sdpa":

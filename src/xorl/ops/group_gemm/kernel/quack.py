@@ -22,24 +22,12 @@ from typing import Optional
 
 import os
 import torch
-from xorl.ops.quack.gemm_interface import gemm as quack_gemm
+from quack.gemm_interface import gemm as quack_gemm
 
 
 def _quack_tuned_enabled() -> bool:
     v = os.getenv("XORL_QUACK_TUNED", "0").strip().lower()
     return v not in {"0", "false", "no", "off"}
-
-
-_TUNED = _quack_tuned_enabled()
-
-
-def cumsum_to_cu_seqlens(cumsum: torch.Tensor) -> torch.Tensor:
-    """Convert cumsum to cu_seqlens by prepending a zero.
-
-    Computes ``cu_seqlens = cat([0, cumsum])`` as a single int32 tensor.
-    Call this ONCE per forward/backward and reuse across multiple GEMM calls.
-    """
-    return torch.cat([torch.zeros(1, device=cumsum.device, dtype=torch.int32), cumsum.to(torch.int32)])
 
 
 def quack_group_gemm_same_nk(
@@ -50,7 +38,6 @@ def quack_group_gemm_same_nk(
     transpose_a: bool = False,
     transpose_b: bool = False,
     out: Optional[torch.Tensor] = None,
-    cu_seqlens_m: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Grouped GEMM with same N, K dimensions using quack-kernels."""
     del max_M  # Kept for API compatibility with Triton backend.
@@ -63,8 +50,7 @@ def quack_group_gemm_same_nk(
 
     total_M = a.shape[0]
 
-    if cu_seqlens_m is None:
-        cu_seqlens_m = cumsum_to_cu_seqlens(cumsum_M)
+    cu_seqlens_m = torch.cat([torch.zeros(1, device=cumsum_M.device, dtype=torch.int32), cumsum_M.to(torch.int32)])
 
     if transpose_b:
         # b: (G, N, K) -> (G, K, N) expected by quack input.
@@ -75,17 +61,12 @@ def quack_group_gemm_same_nk(
     if out is None:
         out = torch.empty(total_M, N, dtype=a.dtype, device=a.device)
 
-    # tuned=False by default: MoE group GEMMs have variable total_M (token counts
-    # change every step due to routing).  The quack autotuner keys on tensor shapes,
-    # so each new total_M triggers a full ~60-config benchmark — making training
-    # orders of magnitude slower.  Set XORL_QUACK_TUNED=1 to enable autotuning
-    # (useful if shapes are stable or disk cache is warm).
     quack_gemm(
         A=a,
         B=b_quack,
         out=out,
         cu_seqlens_m=cu_seqlens_m,
-        tuned=_TUNED,
+        tuned=_quack_tuned_enabled(),
     )
 
     return out
@@ -99,14 +80,12 @@ def quack_group_gemm_same_mn(
     max_K: int,
     transpose_a: bool = False,
     transpose_b: bool = False,
-    cu_seqlens_k: Optional[torch.Tensor] = None,
 ) -> None:
     """Grouped GEMM with same M, N dimensions using quack-kernels."""
     del max_K  # Kept for API compatibility with Triton backend.
     assert not transpose_b, "transpose_b not supported in quack_group_gemm_same_mn"
 
-    if cu_seqlens_k is None:
-        cu_seqlens_k = cumsum_to_cu_seqlens(cumsum_K)
+    cu_seqlens_k = torch.cat([torch.zeros(1, device=cumsum_K.device, dtype=torch.int32), cumsum_K.to(torch.int32)])
 
     if transpose_a:
         # a is (total_K, M), transpose to (M, total_K) with m-major layout.
@@ -117,11 +96,10 @@ def quack_group_gemm_same_mn(
         else:
             a_quack = a
 
-    # tuned: same rationale as quack_group_gemm_same_nk.
     quack_gemm(
         A=a_quack,
         B=b,
         out=c,
         cu_seqlens_k=cu_seqlens_k,
-        tuned=_TUNED,
+        tuned=_quack_tuned_enabled(),
     )

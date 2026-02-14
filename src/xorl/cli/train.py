@@ -108,6 +108,8 @@ def main():
         torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
         attn_implementation=args.model.attn_implementation,
         moe_implementation=args.model.moe_implementation,
+        use_deepep=args.model.use_deepep,
+        deepep_buffer_size_gb=args.model.deepep_buffer_size_gb,
         init_device=args.train.init_device,
     )
     model_config = model.config
