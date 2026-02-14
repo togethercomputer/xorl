@@ -484,9 +484,17 @@ class ModelArguments:
         default="flash_attention_2",
         metadata={"help": "Attention implementation to use. flash_attention_4 requires Blackwell GPU (SM100+)."},
     )
-    moe_implementation: Optional[Literal[None, "eager", "fused"]] = field(
+    moe_implementation: Optional[Literal[None, "eager", "fused", "quack"]] = field(
         default=None,
-        metadata={"help": "MoE implementation to use. 'fused' uses fused MoE kernels."},
+        metadata={"help": "MoE implementation to use. 'fused' uses fused MoE kernels, 'quack' uses quack kernels."},
+    )
+    use_deepep: bool = field(
+        default=False,
+        metadata={"help": "Enable DeepEP communication backend for quack MoE Expert Parallel path."},
+    )
+    deepep_buffer_size_gb: float = field(
+        default=2.0,
+        metadata={"help": "DeepEP buffer size in GB (effective when use_deepep=true)."},
     )
     basic_modules: Optional[List[str]] = field(
         default_factory=list,
