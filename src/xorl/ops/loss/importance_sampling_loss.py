@@ -1,12 +1,9 @@
-import logging
 from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
 from .compiled_cross_entropy import compiled_cross_entropy_function
-
-logger = logging.getLogger(__name__)
 
 
 def _compute_per_token_ce(
@@ -81,7 +78,6 @@ def importance_sampling_loss_function(
                            where log_ratio = new_logprobs - old_logprobs. Non-negative, unbiased, lower variance.
                          - entropy_sample: -mean(old_logprobs) over valid tokens
                          - valid_tokens: Count of valid tokens
-                         Note: When used via model_runner, these get prefixed with "is_".
 
     Returns:
         Tuple of (loss, None, per_token_logprobs, per_token_loss, metrics)
@@ -139,8 +135,6 @@ def importance_sampling_loss_function(
     }
 
     # Optionally compute KL statistics
-    # Note: Do NOT use "is_" prefix here - model_runner.py adds the "is_" prefix
-    # when accumulating metrics. Using "is_" here would cause double prefix.
     if compute_kl_stats:
         with torch.no_grad():
             _n_valid_kl = valid_mask.sum().item()  # TRUE count, no clamp

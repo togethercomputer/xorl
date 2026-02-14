@@ -406,10 +406,19 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
         # Idle session timeout (can be in train section or top-level) - sessions inactive for this duration are cleaned up
         flat_config['idle_session_timeout'] = train_config.get('idle_session_timeout', config.get('idle_session_timeout', 7200.0))
 
+        # Training flags
+        flat_config['skip_initial_checkpoint'] = train_config.get('skip_initial_checkpoint', False)
+        flat_config['log_gradient_norms'] = train_config.get('log_gradient_norms', True)
+        flat_config['log_router_stats'] = train_config.get('log_router_stats', True)
+        flat_config['freeze_router'] = train_config.get('freeze_router', True)
+
         # Worker section
         worker_config = config.get('worker', {})
         flat_config['worker_bind_address'] = worker_config.get('bind_address', 'auto')
-        flat_config['worker_connection_timeout'] = worker_config.get('connection_timeout', 60.0)
+        flat_config['worker_bind_host'] = worker_config.get('bind_host', '0.0.0.0')
+        flat_config['worker_bind_port'] = worker_config.get('bind_port', 5556)
+        flat_config['engine_connect_host'] = worker_config.get('engine_connect_host')
+        flat_config['worker_connection_timeout'] = worker_config.get('connection_timeout', 120.0)
         flat_config['worker_max_retries'] = worker_config.get('max_retries', 3)
 
         filtered_config = {k: v for k, v in flat_config.items() if k in valid_fields and v is not None}
@@ -613,6 +622,12 @@ class Launcher:
         elif self.server_args and self.server_args.worker_bind_address != "auto":
             self.worker_address = self.server_args.worker_bind_address
             logger.info(f"Using worker address from config: {self.worker_address}")
+        elif self.server_args:
+            # Auto mode: construct from configured host:port
+            host = self.server_args.worker_bind_host
+            port = self.server_args.worker_bind_port
+            self.worker_address = f"tcp://{host}:{port}"
+            logger.info(f"Using worker address from host:port config: {self.worker_address}")
         else:
             self.worker_address = f"tcp://127.0.0.1:{self._find_free_port()}"
             logger.info(f"Auto-assigned worker address: {self.worker_address}")
@@ -726,6 +741,14 @@ class Launcher:
                 else:
                     address = bind_address
                 logger.info(f"Using worker address (single-node): {address}")
+                return address
+            else:
+                # Auto mode: construct from host:port
+                host = self.server_args.worker_bind_host
+                port = self.server_args.worker_bind_port
+                connect_host = "127.0.0.1" if host == "0.0.0.0" else host
+                address = f"tcp://{connect_host}:{port}"
+                logger.info(f"Using worker address from host:port (single-node): {address}")
                 return address
 
         # Final fallback: use already-resolved worker_address
@@ -846,6 +869,12 @@ class Launcher:
         logger.info(f"  Master:      {self.master_addr}:{self.master_port}")
         logger.info(f"  Worker Addr: {self.worker_address}")
         logger.info("")
+
+        # Clean up stale address file from previous runs
+        stale_address_file = Path(self.output_dir) / ".rank0_address"
+        if stale_address_file.exists():
+            stale_address_file.unlink()
+            logger.info(f"Removed stale address file: {stale_address_file}")
 
         # Build torchrun command
         cmd = [
