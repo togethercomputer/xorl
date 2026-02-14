@@ -10,6 +10,7 @@ This module provides various loss functions for language model training:
 from .causallm_loss import causallm_loss_function
 from .distillation_loss import distillation_loss_function
 from .importance_sampling_loss import importance_sampling_loss_function
+from .policy_loss import policy_loss_function
 
 __all__ = [
     # Causal LM loss
@@ -18,4 +19,6 @@ __all__ = [
     "importance_sampling_loss_function",
     # Distillation loss
     "distillation_loss_function",
+    # Policy loss (PPO + TIS)
+    "policy_loss_function",
 ]

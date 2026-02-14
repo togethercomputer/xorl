@@ -302,7 +302,7 @@ class ServerArguments:
     # ========================================================================
 
     freeze_router: bool = field(
-        default=False,
+        default=True,
         metadata={"help": "Freeze MoE router weights during training"}
     )
 
@@ -319,19 +319,15 @@ class ServerArguments:
         if self.model_path is None:
             raise ValueError("model_path is required for server configuration")
 
-        # Build worker_bind_address from host and port
-        # This allows users to configure host/port separately while maintaining
-        # backward compatibility with existing worker_bind_address configs
-        if self.worker_bind_address == "tcp://0.0.0.0:5556":
-            # Default value - build from host/port fields
-            self.worker_bind_address = f"tcp://{self.worker_bind_host}:{self.worker_bind_port}"
-        elif self.worker_bind_address == "tcp://127.0.0.1:5556":
-            # Legacy default - update to match new default
-            self.worker_bind_address = f"tcp://{self.worker_bind_host}:{self.worker_bind_port}"
-
-        # Validate worker address
-        if self.worker_bind_address != "auto" and not self.worker_bind_address.startswith("tcp://"):
-            raise ValueError("worker_bind_address must be 'auto' or a valid ZMQ TCP address (tcp://host:port)")
+        # Build worker_bind_address from host and port if explicitly set (not "auto")
+        if self.worker_bind_address != "auto":
+            if not self.worker_bind_address.startswith("tcp://"):
+                raise ValueError("worker_bind_address must be 'auto' or a valid ZMQ TCP address (tcp://host:port)")
+        else:
+            # "auto" mode: launcher will auto-find a free port
+            # If worker_bind_host/port are explicitly configured via YAML,
+            # the launcher can still use them via engine_connect_host + worker_bind_port
+            pass
 
     def to_config_dict(self) -> Dict[str, Any]:
         """
@@ -369,13 +365,10 @@ class ServerArguments:
                 "load_checkpoint_path": self.load_checkpoint_path,
                 "ckpt_manager": self.ckpt_manager,
                 "enable_self_test": self.enable_self_test,
-                "freeze_router": self.freeze_router,
                 "skip_initial_checkpoint": self.skip_initial_checkpoint,
                 "log_gradient_norms": self.log_gradient_norms,
                 "log_router_stats": self.log_router_stats,
-                "packing_seq_len": self.packing_seq_len,
-                "enable_packing": self.enable_packing,
-                "storage_limit": self.storage_limit,
+                "freeze_router": self.freeze_router,
             },
             "data": {
                 # Empty data section - data comes from client at runtime
@@ -393,7 +386,7 @@ class ServerArguments:
     def get_world_size(self) -> int:
         """
         Calculate world size from parallelism configuration.
-
+        
         Note: EP (Expert Parallel) is NOT included in world_size calculation.
         EP creates a separate 2D mesh: world_size = ep_size * ep_fsdp_size
         where ep_fsdp_size contains all other parallelism dimensions.
@@ -406,15 +399,15 @@ class ServerArguments:
             self.data_parallel_replicate_size *
             self.data_parallel_shard_size
         )
-
+    
     def get_total_gpus(self) -> int:
         """
         Calculate total number of GPUs required for the parallelism configuration.
 
         EP and the main parallelism mesh (DP/Ulysses/etc.) share the same GPUs but
         organize them differently:
-        - Main mesh: DP × Ulysses × CP × TP × PP
-        - EP mesh: EP × ep_fsdp_size (where ep_fsdp_size = world_size / ep_size)
+        - Main mesh: DP x Ulysses
+        - EP mesh: EP x ep_fsdp_size (where ep_fsdp_size = world_size / ep_size)
 
         The total GPUs needed is the MAX of EP and the main mesh dimensions,
         rounded up to be divisible by EP (if EP > 1).
@@ -437,7 +430,7 @@ class ServerArguments:
             total = ((total // ep_size) + 1) * ep_size
 
         return total
-    
+
     def get_ep_fsdp_size(self) -> int:
         """
         Calculate ep_fsdp_size (the size of each expert parallel group).
