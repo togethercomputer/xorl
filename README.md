@@ -13,20 +13,44 @@ A distributed training framework for large language models, built on top of [Xor
 ```bash
 git clone --recurse-submodules git@github.com:xorl-org/xorl.git
 cd xorl
-
-# Option 1: Install into an existing conda or venv environment
-pip install -e .
-# or
-uv pip install -e .
-
-# Option 2: Create a new .venv environment with uv
-uv sync
 ```
 
-> If you already cloned without `--recurse-submodules`, run:
-> ```bash
-> git submodule update --init --recursive
-> ```
+> Already cloned without `--recurse-submodules`? Run `git submodule update --init --recursive`
+
+### Option A: pip
+
+```bash
+pip install -e .
+```
+
+### Option B: uv
+
+```bash
+uv pip install setuptools wheel
+uv sync --no-build-isolation
+```
+
+### DeepEP (Mandatory)
+
+The `deep_ep` wheel is hosted in a private GitHub release. Install it separately:
+
+```bash
+# Authenticate gh if you haven't already
+gh auth login
+
+# Download the wheel
+mkdir -p ~/wheels
+gh release download deepep_1.2.1 \
+  -R xorl-org/xorl-wheels \
+  -p "*.whl" \
+  -D ~/wheels \
+  --clobber
+
+# Install into your environment (uv pip rejects the non-PEP 440 version string)
+uv run python -m installer ~/wheels/deep_ep-*.whl
+```
+
+Verify: `python -c "import deep_ep; print('deep_ep OK')"`
 
 ## Training Modes
 
