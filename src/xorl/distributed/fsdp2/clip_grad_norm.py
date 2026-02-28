@@ -26,31 +26,31 @@ def clip_grad_norm(
             foreach=foreach,
         )
 
-    # FSDP2 without EP: still need distributed reductions across the FSDP group
+    # FSDP2 without EP: need distributed reductions across FSDP and TP groups
     ps = get_parallel_state()
     fsdp_group = ps.fsdp_group
-    try:
-        world_size = dist.get_world_size(fsdp_group) if fsdp_group is not None else 1
-    except Exception:
-        world_size = 1
 
-    if world_size == 1:
-        # Default path (single-rank)
-        return torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            max_norm,
-            norm_type=norm_type,
-            error_if_nonfinite=error_if_nonfinite,
-            foreach=foreach,
-        )
+    reduce_groups = []
+    if fsdp_group is not None:
+        try:
+            fsdp_world = dist.get_world_size(fsdp_group)
+        except Exception:
+            fsdp_world = 1
+        if fsdp_world > 1:
+            reduce_groups.append(("fsdp", fsdp_group))
 
+    # TP RowwiseParallel produces partial grads that need all-reduce across TP
+    if ps.tp_enabled:
+        reduce_groups.append(("tp", ps.tp_group))
+
+    # Use custom reduce path to handle DTensor grads from TP
     return _fsdp2_reduce_and_clip(
         params=[p for p in model.parameters() if p.grad is not None],
         max_norm=max_norm,
         norm_type=norm_type,
         foreach=foreach,
         error_if_nonfinite=error_if_nonfinite,
-        reduce_groups=[("fsdp", fsdp_group)],
+        reduce_groups=reduce_groups,
     )
 
 
@@ -77,41 +77,64 @@ def ep_fsdp2_clip_grad_norm(
     if ps.ep_enabled and ps.ep_fsdp_device_mesh is not None:
         ep_fsdp_group = ps.ep_fsdp_device_mesh["ep_fsdp"].get_group()
 
-    # Build param groups (filter out params without grads)
-    ep_params: List[torch.nn.Parameter] = [p for p in model._ep_param_groups.get("ep", []) if p.grad is not None]
+    # Build param groups (filter out params without grads).
+    # Split EP params into FSDP-sharded (DTensor) vs skip-FSDP (plain tensor).
+    ep_fsdp_params: List[torch.nn.Parameter] = []
+    ep_local_params: List[torch.nn.Parameter] = []  # _skip_fsdp params (not sharded, not reduced)
+    for p in model._ep_param_groups.get("ep", []):
+        if p.grad is None:
+            continue
+        if isinstance(p, DTensor):
+            ep_fsdp_params.append(p)
+        else:
+            ep_local_params.append(p)
     non_ep_params: List[torch.nn.Parameter] = [
         p for p in model._ep_param_groups.get("non_ep", []) if p.grad is not None
     ]
 
-    # Average EP gradients across EP ranks by dividing grads by ep_size
-    if ps.ep_enabled and ps.ep_size > 1 and ep_params:
+    # Average FSDP-sharded EP gradients across EP ranks
+    if ps.ep_enabled and ps.ep_size > 1 and ep_fsdp_params:
         scale = 1.0 / float(ps.ep_size)
-        for q in ep_params:
+        for q in ep_fsdp_params:
             if q.grad is not None:
                 q.grad.detach().mul_(scale)
+    # Note: ep_local_params (e.g., QLoRAMoeExperts LoRA) are NOT scaled —
+    # each rank trains its own unique local experts independently.
 
-    # Compute and reduce non-EP
+    # Compute and reduce non-EP norms across FSDP group
+    non_ep_reduce_groups = [("fsdp", fsdp_group)]
+    # TP RowwiseParallel produces partial grads that need all-reduce across TP
+    if ps.tp_enabled:
+        non_ep_reduce_groups.append(("tp", ps.tp_group))
     non_ep_total = _fsdp2_reduce_group(
         params=non_ep_params,
         norm_type=norm_type,
-        reduce_groups=[("fsdp", fsdp_group)],
+        reduce_groups=non_ep_reduce_groups,
     )
 
-    # Compute and reduce EP: first across ep_fsdp, then across ep
-    ep_total = _fsdp2_reduce_group(
-        params=ep_params,
+    # Compute and reduce FSDP-sharded EP norms across ep_fsdp, then ep
+    ep_fsdp_total = _fsdp2_reduce_group(
+        params=ep_fsdp_params,
         norm_type=norm_type,
         reduce_groups=[("ep_fsdp", ep_fsdp_group), ("ep", ep_group)],
     )
 
-    if math.isinf(norm_type):
-        total_norm = torch.maximum(non_ep_total, ep_total)
-    else:
-        total_norm = (non_ep_total + ep_total) ** (1.0 / float(norm_type))
+    # Local EP params: compute local norm only (no reduction — each rank has unique experts)
+    ep_local_total = _fsdp2_reduce_group(
+        params=ep_local_params,
+        norm_type=norm_type,
+        reduce_groups=[],  # no reduction needed
+    )
 
-    # Apply the same clip coefficient to both groups
-    torch.nn.utils.clip_grads_with_norm_(ep_params, max_norm, total_norm, foreach=foreach)
-    torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_norm, total_norm, foreach=foreach)
+    if math.isinf(norm_type):
+        total_norm = torch.maximum(non_ep_total, torch.maximum(ep_fsdp_total, ep_local_total))
+    else:
+        total_norm = (non_ep_total + ep_fsdp_total + ep_local_total) ** (1.0 / float(norm_type))
+
+    # Apply the same clip coefficient to all groups
+    all_params = ep_fsdp_params + ep_local_params + non_ep_params
+    # Disable foreach to avoid DTensor/plain tensor mixing
+    torch.nn.utils.clip_grads_with_norm_(all_params, max_norm, total_norm, foreach=False)
 
     return total_norm
 
@@ -201,5 +224,13 @@ def _fsdp2_reduce_and_clip(
         total_p = _fsdp2_reduce_group(params, norm_type, reduce_groups)
         total_norm = total_p ** (1.0 / float(norm_type))
 
+    # Disable foreach when mixing DTensor and plain tensor grads (e.g., TP meshes,
+    # or QLoRA MoE experts excluded from FSDP via _skip_fsdp).
+    ps = get_parallel_state()
+    if foreach is None:
+        has_dtensor = any(isinstance(p.grad, DTensor) for p in params if p.grad is not None)
+        has_plain = any(not isinstance(p.grad, DTensor) for p in params if p.grad is not None)
+        if (ps.tp_enabled) or (has_dtensor and has_plain):
+            foreach = False
     torch.nn.utils.clip_grads_with_norm_(params, max_norm, total_norm, foreach=foreach)
     return total_norm

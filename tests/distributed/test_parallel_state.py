@@ -109,8 +109,8 @@ class TestParallelStateBasic:
         assert state.pp_size == 1
         assert state.cp_size == 1
         assert state.ulysses_size == 1
-        assert state.dp_mode == "fsdp1"
-        assert state.include_sp_in_fsdp == True
+        assert state.dp_mode == "fsdp2"
+        assert state.sp_fsdp_mode == "all"
         assert state.device_mesh is None
         assert state.ep_fsdp_device_mesh is None
 
@@ -149,16 +149,10 @@ class TestParallelStateBasic:
             ParallelState(dp_size=8, dp_replicate_size=2, dp_shard_size=2)
 
     @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=False)
-    def test_validation_cp_size_not_supported(self, mock_is_init):
-        """Test that cp_size > 1 raises NotImplementedError."""
-        with pytest.raises(NotImplementedError, match="Ring attention is not supported yet"):
-            ParallelState(cp_size=2)
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=False)
-    def test_validation_decoupled_sp_not_supported(self, mock_is_init):
-        """Test that include_sp_in_fsdp=False raises NotImplementedError."""
-        with pytest.raises(NotImplementedError, match="Decoupled sequence parallel"):
-            ParallelState(include_sp_in_fsdp=False)
+    def test_validation_invalid_sp_fsdp_mode(self, mock_is_init):
+        """Test that invalid sp_fsdp_mode raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid sp_fsdp_mode"):
+            ParallelState(sp_fsdp_mode="invalid")
 
 
 class TestParallelStateProperties:
@@ -296,12 +290,6 @@ class TestParallelStateEnabledFlags:
         """Test sp_size is product of ulysses_size and cp_size."""
         state = ParallelState(ulysses_size=2)
         assert state.sp_size == 2
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=False)
-    def test_fsdp_enabled_with_fsdp1(self, mock_is_init):
-        """Test fsdp_enabled is True with fsdp1 mode."""
-        state = ParallelState(dp_mode="fsdp1")
-        assert state.fsdp_enabled == True
 
     @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=False)
     def test_fsdp_enabled_with_fsdp2(self, mock_is_init):

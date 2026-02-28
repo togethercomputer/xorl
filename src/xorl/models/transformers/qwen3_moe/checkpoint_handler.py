@@ -3,14 +3,11 @@
 from typing import Callable, List, Optional, Set, Tuple
 
 import torch
-import torch.nn as nn
 
 from ...checkpoint_handlers.base import CheckpointHandler
 from ...checkpoint_handlers.buffers import (
     ExpertWeightBuffer, GateUpMergeBuffer, QKVMergeBuffer,
-    QLoRAWeightBuffer, QLoRAExpertBuffer,
-    parse_expert_key, parse_expert_full_key,
-    EXPERT_QUANT_AUX_PATTERN, QUANT_AUX_SUFFIX_PATTERN,
+    parse_expert_key, EXPERT_QUANT_AUX_PATTERN, QUANT_AUX_SUFFIX_PATTERN,
     FP8_AUX_SUFFIX_PATTERN,
     QKV_PROJ_PATTERN, DENSE_GATE_UP_PATTERN,
     OPROJ_WEIGHT_PATTERN, DENSE_DOWN_PROJ_PATTERN,
@@ -56,14 +53,13 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
         skip_gate_up_merge: bool = False,
         is_prequantized: bool = False,
         exclude_modules: Optional[Set[str]] = None,
-        device: Optional["torch.device"] = None,
-        model: Optional[nn.Module] = None,
     ):
         self._expert_buffer: Optional[ExpertWeightBuffer] = None
-        # Non-QLoRA expert stacking (disabled when pre-quantized — use QLoRAExpertBuffer instead)
+        # Disable expert buffer when pre-quantized: expert weights are loaded
+        # directly by QLoRAMoeExperts, not merged through the checkpoint handler.
         if checkpoint_has_per_expert and not is_prequantized:
             self._expert_buffer = ExpertWeightBuffer(
-                num_experts, ep_rank=ep_rank, ep_size=ep_size, device=device,
+                num_experts, ep_rank=ep_rank, ep_size=ep_size
             )
         self._qkv_buffer: Optional[QKVMergeBuffer] = None
         if not skip_qkv_merge:
@@ -75,50 +71,28 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
         self._kv_dim = num_key_value_heads * head_dim
         self._is_prequantized = is_prequantized
         self._exclude_modules = exclude_modules or set()
-        # Inline QLoRA weight loading for dense modules (attention, shared expert)
-        self._qlora_buffer: Optional[QLoRAWeightBuffer] = None
-        if is_prequantized and model is not None:
-            self._qlora_buffer = QLoRAWeightBuffer(model)
-        # Inline QLoRA expert weight loading (MoE experts)
-        self._qlora_expert_buffer = None
-        if is_prequantized and model is not None:
-            self._qlora_expert_buffer = QLoRAExpertBuffer(
-                model, ep_rank=ep_rank, ep_size=ep_size, num_experts=num_experts,
-            )
 
     def get_skip_key_fn(self) -> Optional[Callable[[str], bool]]:
         """Return predicate to skip keys during loading.
 
         Skips:
-        - Out-of-range expert keys (EP loading — both prequantized and normal)
-        - All expert keys when prequantized WITHOUT inline expert buffer (deferred path)
-        - Dense quantized keys only when dense buffer is NOT active (deferred path)
-
-        When inline buffers are active, in-range keys flow through on_load_weight.
+        - Out-of-range expert keys (EP loading)
+        - All quantized auxiliary keys when is_prequantized=True (weight_scale,
+          weight_scale_2, input_scale) — these are loaded directly by QLoRA modules
         """
         has_ep_filter = (
             self._expert_buffer is not None
             and not (self._expert_buffer.expert_start == 0
                      and self._expert_buffer.expert_end == self._expert_buffer.num_experts)
         )
-        has_expert_ep_filter = (
-            self._qlora_expert_buffer is not None
-            and not (self._qlora_expert_buffer.expert_start == 0
-                     and self._qlora_expert_buffer.expert_end == self._qlora_expert_buffer._num_experts)
-        )
 
-        if not has_ep_filter and not has_expert_ep_filter and not self._is_prequantized:
+        if not has_ep_filter and not self._is_prequantized:
             return None
 
         ep_start = self._expert_buffer.expert_start if has_ep_filter else 0
         ep_end = self._expert_buffer.expert_end if has_ep_filter else 0
         is_prequantized = self._is_prequantized
         exclude_modules = self._exclude_modules
-        has_qlora_buffer = self._qlora_buffer is not None
-        has_qlora_expert_buffer = self._qlora_expert_buffer is not None
-        if has_qlora_expert_buffer:
-            qe_start = self._qlora_expert_buffer.expert_start
-            qe_end = self._qlora_expert_buffer.expert_end
 
         def _should_skip(key: str) -> bool:
             if is_prequantized:
@@ -129,33 +103,24 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
                     if module_short_name in exclude_modules:
                         return False
 
-                # Expert keys
-                if has_qlora_expert_buffer:
-                    # Inline path: EP-filter expert keys (skip out-of-range, load in-range)
-                    parsed = parse_expert_full_key(key)
-                    if parsed is not None:
-                        _, expert_idx, _, suffix = parsed
-                        if suffix == "input_scale":
-                            return True
-                        return expert_idx < qe_start or expert_idx >= qe_end
-                else:
-                    # Deferred path: skip ALL expert keys
-                    if parse_expert_key(key) is not None:
+                # Skip all quantized auxiliary keys — loaded by QLoRA modules directly
+                if QUANT_AUX_SUFFIX_PATTERN.search(key):
+                    return True
+                # Skip block FP8 scale keys
+                if FP8_AUX_SUFFIX_PATTERN.search(key):
+                    return True
+                # Skip all expert weight keys — loaded by QLoRAMoeExperts directly
+                if parse_expert_key(key) is not None:
+                    return True
+                # Skip expert quantized auxiliary keys
+                if EXPERT_QUANT_AUX_PATTERN.match(key) is not None:
+                    return True
+                # Skip all linear projection weight keys that are loaded by QLoRALinear
+                # directly. Bias keys (.bias) are NOT skipped (merged normally).
+                if key.endswith(".weight"):
+                    if (QKV_PROJ_PATTERN.match(key) or DENSE_GATE_UP_PATTERN.match(key)
+                            or OPROJ_WEIGHT_PATTERN.match(key) or DENSE_DOWN_PROJ_PATTERN.match(key)):
                         return True
-                    if EXPERT_QUANT_AUX_PATTERN.match(key) is not None:
-                        return True
-
-                # Dense quantized keys: skip only when buffer is NOT active (deferred path)
-                if not has_qlora_buffer:
-                    if QUANT_AUX_SUFFIX_PATTERN.search(key):
-                        return True
-                    if FP8_AUX_SUFFIX_PATTERN.search(key):
-                        return True
-                    if key.endswith(".weight"):
-                        if (QKV_PROJ_PATTERN.match(key) or DENSE_GATE_UP_PATTERN.match(key)
-                                or OPROJ_WEIGHT_PATTERN.match(key) or DENSE_DOWN_PROJ_PATTERN.match(key)):
-                            return True
-
             # Skip out-of-range expert keys for EP (non-prequantized path)
             if has_ep_filter:
                 parsed = parse_expert_key(key)
@@ -177,23 +142,9 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
     def on_load_weight(
         self, key: str, tensor: torch.Tensor
     ) -> List[Tuple[str, torch.Tensor]]:
-        # Drop input_scale (unused by our quantization)
-        if key.endswith(".input_scale"):
-            return []
-
-        # 0a. QLoRA expert buffer: route expert quantized keys for inline loading
-        if self._qlora_expert_buffer is not None and not self._is_excluded_module(key):
-            result = self._qlora_expert_buffer.try_consume(key, tensor)
-            if result is not None:
-                return result  # [] always (writes directly to module)
-
-        # 0b. QLoRA buffer: route dense quantized keys for inline loading
-        if self._qlora_buffer is not None and not self._is_excluded_module(key):
-            result = self._qlora_buffer.try_consume(key, tensor)
-            if result is not None:
-                return result  # [] = buffered, or list of dispatch pairs
-
-        # Pre-quantized safety net: drop quantized keys not consumed by buffers
+        # 0. Pre-quantized: skip quantized auxiliary keys and quantized weight keys
+        #    that weren't caught by get_skip_key_fn (e.g., when skip_key_fn wasn't used)
+        #    Excluded modules pass through as bf16 — don't drop them.
         if self._is_prequantized and not self._is_excluded_module(key):
             if QUANT_AUX_SUFFIX_PATTERN.search(key):
                 return []
@@ -255,10 +206,6 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
         self, key: str
     ) -> List[Tuple[str, torch.Tensor]]:
         """Count a skipped expert key so completion tracking stays correct."""
-        # QLoRA expert buffer: count skipped out-of-range expert keys
-        if self._qlora_expert_buffer is not None:
-            self._qlora_expert_buffer.count_skipped(key)
-
         if self._expert_buffer is not None:
             parsed = parse_expert_key(key)
             if parsed is not None:
@@ -284,17 +231,6 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
             pending_qkv = self._qkv_buffer.get_pending()
             if pending_qkv:
                 warnings.warn(f"Incomplete QKV merge groups after loading: {pending_qkv}")
-        # Finalize inline-loaded QLoRA modules
-        if self._qlora_buffer is not None:
-            self._qlora_buffer.set_inline_metadata()
-        if self._qlora_expert_buffer is not None:
-            pending_exp = self._qlora_expert_buffer.get_pending()
-            if pending_exp:
-                warnings.warn(
-                    f"Incomplete QLoRA expert weights after loading "
-                    f"(will fall back to deferred loading): {pending_exp}"
-                )
-            self._qlora_expert_buffer.set_inline_metadata()
         return []
 
     def on_save_weight(

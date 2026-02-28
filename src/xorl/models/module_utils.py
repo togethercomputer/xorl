@@ -485,6 +485,54 @@ def _convert_weight_key(key: str, model: "PreTrainedModel") -> str:
 
 
 
+def _shrink_expert_params_for_ep(model: "nn.Module") -> None:
+    """Shrink expert parameters to EP-local shapes before materialization.
+
+    When both TP and EP are enabled, weights are loaded before EP slicing
+    (TP requires loading before FSDP).  Calling ``model.to_empty(device=cuda)``
+    would allocate *all* expert parameters at full size, causing OOM.
+
+    This function replaces full-size meta expert parameters with EP-local-sized
+    meta parameters.  Since meta tensors use no device memory, this is free.
+    The subsequent ``to_empty`` then allocates only the local expert slice.
+    """
+    _ps = get_parallel_state()
+    if not _ps.ep_enabled:
+        return
+
+    parallel_plan = model.get_parallel_plan() if hasattr(model, "get_parallel_plan") else None
+    if parallel_plan is None:
+        return
+
+    ep_size = _ps.ep_size
+    shrunk = 0
+    for name, param in list(model.named_parameters()):
+        # Only shrink non-DTensor meta expert params that haven't been EP-sharded yet.
+        # Params with spec_info were already sharded by parallel_plan.apply().
+        if (
+            parallel_plan._is_expert_parameter(name)
+            and not hasattr(param, "device_mesh")
+            and not hasattr(param, "spec_info")
+            and param.device.type == "meta"
+            and param.shape[0] % ep_size == 0
+            and param.shape[0] // ep_size < param.shape[0]
+        ):
+            local_experts = param.shape[0] // ep_size
+            local_shape = (local_experts,) + param.shape[1:]
+            new_param = nn.Parameter(
+                torch.empty(local_shape, dtype=param.dtype, device="meta"),
+                requires_grad=param.requires_grad,
+            )
+            sub_mod, local_name = _find_submodule(model, name)
+            sub_mod._parameters[local_name] = new_param
+            shrunk += 1
+    if shrunk > 0:
+        logger.info_rank0(
+            f"EP pre-shrink: resized {shrunk} expert params to EP-local shapes "
+            f"(ep_size={ep_size}) before materialization"
+        )
+
+
 @torch.no_grad()
 def all_ranks_load_weights(
     model: Union["nn.Module", "PreTrainedModel"],
@@ -500,6 +548,7 @@ def all_ranks_load_weights(
     """
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
     parameter_names_to_load = {name for name, _ in model.named_parameters()}
+    _shrink_expert_params_for_ep(model)
     model.to_empty(device=init_device)
 
     # Get parallel plan if available
@@ -507,10 +556,12 @@ def all_ranks_load_weights(
     if hasattr(model, "get_parallel_plan"):
         parallel_plan = model.get_parallel_plan()
 
+    # Get parallel state for PP-aware logging and EP-aware loading
+    _ps = get_parallel_state()
+
     # Get checkpoint handler from model (delegates weight transforms to model-specific logic)
     handler = None
     if hasattr(model, "get_checkpoint_handler"):
-        _ps = get_parallel_state()
         ep_rank = _ps.ep_rank if _ps.ep_enabled else 0
         ep_size = _ps.ep_size if _ps.ep_enabled else 1
         checkpoint_keys = _get_checkpoint_keys(weights_path)
@@ -519,6 +570,7 @@ def all_ranks_load_weights(
             ep_rank=ep_rank,
             ep_size=ep_size,
             is_broadcast=False,
+            weights_path=weights_path,
         )
 
     # Retry loading state dict on OSError (e.g., HuggingFace download issues)
@@ -546,19 +598,46 @@ def all_ranks_load_weights(
         if last_error:
             raise last_error
 
+    # When PP is enabled, gather expected keys from all ranks so we can distinguish
+    # "key belongs to another PP stage" (expected) from "truly unexpected key" (warning).
+    if _ps.pp_enabled:
+        local_expected = parameter_names_to_load | set(buffer_dict.keys())
+        all_expected = [None] * dist.get_world_size()
+        dist.all_gather_object(all_expected, local_expected)
+        global_expected_keys = set().union(*all_expected)
+    else:
+        global_expected_keys = None
+
     # Check if the handler provides an EP-aware skip function to avoid reading
     # out-of-range expert tensor data from disk (can reduce I/O by ~60-70%).
     skip_key_fn = handler.get_skip_key_fn() if handler is not None else None
 
+    # Collect keys that are expected to be absent from the model (e.g., QLoRA replaces
+    # expert weight params with quantized buffers — base weights loaded separately).
+    _expected_skip_keys = set()
+    for fqn, mod in model.named_modules():
+        if getattr(mod, "_qlora_expected_skip_keys", None):
+            for suffix in mod._qlora_expected_skip_keys:
+                _expected_skip_keys.add(f"{fqn}.{suffix}" if fqn else suffix)
+
+    # Remove expected skip keys from parameter_names_to_load: FSDP2 may materialize
+    # None parameters on some layers (e.g., QLoRALinear.weight), which would cause
+    # them to appear in named_parameters(). These weights are loaded separately by
+    # QLoRA's load_prequantized_weights(), not through the standard dispatch path.
+    parameter_names_to_load -= _expected_skip_keys
+
     def _dispatch_results(results):
         for param_name, param_tensor in results:
-            if param_name in buffer_dict:
+            if param_name in _expected_skip_keys:
+                pass  # silently skip — weights loaded separately (e.g., QLoRA)
+            elif param_name in buffer_dict:
                 buffer_dict[param_name] = param_tensor.clone()
             elif param_name in parameter_names_to_load:
                 parameter_names_to_load.remove(param_name)
                 _dispatch_parameter(model, param_name, param_tensor, dtensor_factory, parallel_plan)
             else:
-                logger.info_rank0(f"Unexpected key in state dict: {param_name}.")
+                if global_expected_keys is None or param_name not in global_expected_keys:
+                    logger.warning_rank0(f"Unexpected key in state dict: {param_name}.")
 
     if skip_key_fn is not None:
         # EP-aware filtered loading: skip reading tensor data for out-of-range experts
@@ -635,6 +714,7 @@ def rank0_load_and_broadcast_weights(
 
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
     parameter_names_to_load = {name for name, _ in model.named_parameters()}
+    _shrink_expert_params_for_ep(model)
     model.to_empty(device=init_device)
 
     # Get parallel plan if available
@@ -657,7 +737,18 @@ def rank0_load_and_broadcast_weights(
             ep_rank=0,
             ep_size=1,
             is_broadcast=True,
+            weights_path=weights_path,
         )
+
+    # When PP is enabled, gather expected keys from all ranks so we can distinguish
+    # "key belongs to another PP stage" (expected) from "truly unexpected key" (warning).
+    if _ps.pp_enabled:
+        local_expected = parameter_names_to_load | set(buffer_dict.keys())
+        all_expected = [None] * dist.get_world_size()
+        dist.all_gather_object(all_expected, local_expected)
+        global_expected_keys = set().union(*all_expected)
+    else:
+        global_expected_keys = None
 
     # Get the safetensor file iterators
     state_dict_iterators = _load_state_dict(weights_path) if global_rank == 0 else None
@@ -740,8 +831,8 @@ def rank0_load_and_broadcast_weights(
                 parameter_names_to_load.discard(name)
                 _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan)
             else:
-                if global_rank == 0:
-                    logger.info_rank0(f"Unexpected key in state dict: {name}.")
+                if global_expected_keys is None or name not in global_expected_keys:
+                    logger.warning_rank0(f"Unexpected key in state dict: {name}.")
 
             del tensor
             if global_rank == 0:
@@ -805,13 +896,17 @@ def post_process_after_weight_loading(
     # we should tie embeddings after loading weights because to_empty() leads to untied weights,
     # except for fsdp2 (swap tensor) contexts.
     if getattr(model.config, "tie_word_embeddings", True):
-        try:
-            input_embeddings = model.get_input_embeddings()
-            output_embeddings = model.get_output_embeddings()
-            output_embeddings._parameters["weight"] = input_embeddings._parameters["weight"]
-        except Exception as e:
-            logger.info_rank0(f"Failed to tie embeddings: {e}")
-            raise RuntimeError("Failed to tie input/output embeddings") from e
+        input_embeddings = model.get_input_embeddings()
+        output_embeddings = model.get_output_embeddings()
+        if input_embeddings is None or output_embeddings is None:
+            # PP split: one stage has embed_tokens, the other has lm_head — skip tying
+            logger.info_rank0("Skipping embedding tying (input or output embeddings not present on this model part)")
+        else:
+            try:
+                output_embeddings._parameters["weight"] = input_embeddings._parameters["weight"]
+            except Exception as e:
+                logger.info_rank0(f"Failed to tie embeddings: {e}")
+                raise RuntimeError("Failed to tie input/output embeddings") from e
 
 
 def _get_shard_info(

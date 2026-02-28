@@ -2,7 +2,7 @@
 
 import torch
 
-from xorl.ops.moe.quack import quack_moe_forward
+from xorl.ops import quack_moe_forward
 
 
 def quack_expert_forward(

@@ -75,7 +75,7 @@ class TestPackingConcatCollator:
         mock_ps.sp_enabled = False
         mock_parallel_state.return_value = mock_ps
 
-        collator = PackingConcatCollator()
+        collator = PackingConcatCollator(pad_to_multiple_of=1)
         batch = collator(sample_packed_features)
 
         # Check shapes
@@ -91,7 +91,7 @@ class TestPackingConcatCollator:
         mock_ps.sp_enabled = False
         mock_parallel_state.return_value = mock_ps
 
-        collator = PackingConcatCollator()
+        collator = PackingConcatCollator(pad_to_multiple_of=1)
         batch = collator(sample_packed_features)
 
         expected_input_ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
@@ -107,7 +107,7 @@ class TestPackingConcatCollator:
         mock_ps.sp_enabled = False
         mock_parallel_state.return_value = mock_ps
 
-        collator = PackingConcatCollator()
+        collator = PackingConcatCollator(pad_to_multiple_of=1)
         batch = collator(sample_features)
 
         # Position IDs should be generated as sequential indices per feature
@@ -123,7 +123,7 @@ class TestPackingConcatCollator:
         mock_ps.sp_enabled = False
         mock_parallel_state.return_value = mock_ps
 
-        collator = PackingConcatCollator()
+        collator = PackingConcatCollator(pad_to_multiple_of=1)
         batch = collator(sample_packed_features)
 
         assert "cu_seq_lens_q" in batch
@@ -138,7 +138,7 @@ class TestPackingConcatCollator:
         mock_ps.sp_enabled = True
         mock_parallel_state.return_value = mock_ps
 
-        collator = PackingConcatCollator()
+        collator = PackingConcatCollator(pad_to_multiple_of=1)
         batch = collator(sample_packed_features)
 
         # These should NOT be in the batch when SP is enabled
@@ -163,7 +163,7 @@ class TestPackingConcatCollator:
             }
         ]
 
-        collator = PackingConcatCollator()
+        collator = PackingConcatCollator(pad_to_multiple_of=1)
         batch = collator(features)
 
         assert batch["input_ids"].shape == (1, 3)
@@ -193,7 +193,7 @@ class TestPackingConcatCollator:
             }
         ]
 
-        collator = PackingConcatCollator()
+        collator = PackingConcatCollator(pad_to_multiple_of=1)
         batch = collator(features)
 
         # Extra field should be collated as a batch
@@ -222,7 +222,7 @@ class TestPackingConcatCollator:
             }
         ]
 
-        collator = PackingConcatCollator()
+        collator = PackingConcatCollator(pad_to_multiple_of=1)
         batch = collator(features)
 
         # Total length should be 5 + 4 = 9

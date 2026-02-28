@@ -9,6 +9,14 @@ from .attention import (
     repeat_kv,
     update_causal_mask,
 )
+from .moe import (
+    MOE_EXPERT_BACKENDS,
+    MoEBlock,
+    MoEExperts,
+    MoEExpertsLoRA,
+    MoELoRAConfig,
+    TopKRouter,
+)
 from .normalization import RMSNorm
 from .rope import (
     ROPE_INIT_FUNCTIONS,
@@ -25,6 +33,12 @@ __all__ = [
     "AttentionKwargs",
     "FLASH_ATTENTION_IMPLEMENTATIONS",
     "FlashAttentionKwargs",
+    "MOE_EXPERT_BACKENDS",
+    "MoEBlock",
+    "MoEExperts",
+    "MoEExpertsLoRA",
+    "MoELoRAConfig",
+    "TopKRouter",
     "RMSNorm",
     "ROPE_INIT_FUNCTIONS",
     "RotaryEmbedding",

@@ -14,6 +14,8 @@ import torch.nn as nn
 from unittest.mock import MagicMock, patch
 from torch.distributed._tensor import Shard
 
+from xorl.models.layers.moe import MoEExpertsLoRA, MoELoRAConfig
+
 
 class MockConfig:
     """Mock config for testing."""
@@ -38,15 +40,16 @@ class TestLoRAWeightShapesBeforeSharding:
     def config(self):
         return MockConfig(num_experts=8)
 
-    def test_fused_lora_initial_weight_shapes(self, config):
-        """Test that FusedExpertsWithLoRA initializes weights at GLOBAL shape."""
-        from xorl.models.transformers.qwen3_moe.qwen3_moe_lora import (
-            LoRAConfig,
-            Qwen3MoeFusedExpertsWithLoRA,
+    def test_lora_initial_weight_shapes(self, config):
+        """Test that MoEExpertsLoRA initializes weights at GLOBAL shape."""
+        lora_config = MoELoRAConfig(r=4, lora_alpha=8)
+        experts = MoEExpertsLoRA(
+            num_experts=config.num_experts,
+            hidden_dim=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            moe_implementation="triton",
+            lora_config=lora_config,
         )
-
-        lora_config = LoRAConfig(r=4, lora_alpha=8)
-        experts = Qwen3MoeFusedExpertsWithLoRA(config, lora_config)
 
         # Verify GLOBAL shapes before any sharding
         assert experts.num_experts == config.num_experts, "num_experts should be global"
@@ -66,13 +69,14 @@ class TestLoRAWeightShapesBeforeSharding:
 
     def test_lora_b_initialized_to_zeros(self, config):
         """Test that LoRA B weights are initialized to zeros."""
-        from xorl.models.transformers.qwen3_moe.qwen3_moe_lora import (
-            LoRAConfig,
-            Qwen3MoeFusedExpertsWithLoRA,
+        lora_config = MoELoRAConfig(r=4, lora_alpha=8)
+        experts = MoEExpertsLoRA(
+            num_experts=config.num_experts,
+            hidden_dim=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            moe_implementation="triton",
+            lora_config=lora_config,
         )
-
-        lora_config = LoRAConfig(r=4, lora_alpha=8)
-        experts = Qwen3MoeFusedExpertsWithLoRA(config, lora_config)
 
         # All B matrices should be zeros (ensures delta_W = 0 at init)
         assert torch.allclose(experts.gate_proj_lora_B, torch.zeros_like(experts.gate_proj_lora_B))
@@ -89,9 +93,9 @@ class TestParallelPlanLoRASlicing:
 
     def test_ep_plan_includes_lora_weights(self):
         """Test that EP plan includes LoRA weight patterns."""
-        from xorl.models.transformers.qwen3_moe.parallel_plan import get_paralle_plan
+        from xorl.models.transformers.qwen3_moe.parallelize import get_ep_plan
 
-        plan = get_paralle_plan()
+        plan = get_ep_plan()
 
         # Verify LoRA weight patterns are in the plan
         lora_patterns = [
@@ -110,19 +114,17 @@ class TestParallelPlanLoRASlicing:
 
     def test_shard_tensor_slices_lora_weights(self, config):
         """Test that shard_tensor correctly slices LoRA weights."""
-        from xorl.models.transformers.qwen3_moe.parallel_plan import get_paralle_plan
+        from xorl.models.transformers.qwen3_moe.parallelize import get_ep_plan
 
-        plan = get_paralle_plan()
+        plan = get_ep_plan()
 
-        # Create a mock LoRA tensor at global shape
-        global_shape = (8, 4, 32)  # [num_experts=8, r=4, hidden_dim=32]
+        # Create a mock LoRA tensor at global shape (GKN: [E, hidden_dim, r])
+        global_shape = (8, 32, 4)  # [num_experts=8, hidden_dim=32, r=4]
         lora_tensor = torch.randn(global_shape)
 
         # Target shape after EP sharding with ep_size=2 -> num_local_experts=4
-        local_shape = (4, 4, 32)  # [num_local_experts=4, r=4, hidden_dim=32]
+        local_shape = (4, 32, 4)  # [num_local_experts=4, hidden_dim=32, r=4]
 
-        # Mock parallel state for ep_rank=0
-        # The import happens inside _slice_expert_tensor_for_ep, so we mock at module level
         with patch("xorl.distributed.parallel_state.get_parallel_state") as mock_ps:
             mock_state = MagicMock()
             mock_state.ep_enabled = True
@@ -135,21 +137,20 @@ class TestParallelPlanLoRASlicing:
                 local_shape,
             )
 
-            # Should slice first half (experts 0-3)
             assert sliced.shape == local_shape
             assert torch.allclose(sliced, lora_tensor[:4])
 
     def test_shard_tensor_ep_rank_1(self, config):
         """Test slicing for ep_rank=1."""
-        from xorl.models.transformers.qwen3_moe.parallel_plan import get_paralle_plan
+        from xorl.models.transformers.qwen3_moe.parallelize import get_ep_plan
 
-        plan = get_paralle_plan()
+        plan = get_ep_plan()
 
-        global_shape = (8, 4, 32)
+        # GKN: [E, hidden_dim, r]
+        global_shape = (8, 32, 4)
         lora_tensor = torch.randn(global_shape)
-        local_shape = (4, 4, 32)
+        local_shape = (4, 32, 4)
 
-        # Mock parallel state for ep_rank=1
         with patch("xorl.distributed.parallel_state.get_parallel_state") as mock_ps:
             mock_state = MagicMock()
             mock_state.ep_enabled = True
@@ -162,7 +163,6 @@ class TestParallelPlanLoRASlicing:
                 local_shape,
             )
 
-            # Should slice second half (experts 4-7)
             assert sliced.shape == local_shape
             assert torch.allclose(sliced, lora_tensor[4:8])
 
@@ -176,8 +176,7 @@ class TestEPLoRAForwardShapes:
 
     @pytest.fixture
     def lora_config(self):
-        from xorl.models.transformers.qwen3_moe.qwen3_moe_lora import LoRAConfig
-        return LoRAConfig(r=4, lora_alpha=8)
+        return MoELoRAConfig(r=4, lora_alpha=8)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_epgroup_gemm_with_lora_weight_shapes(self, config, lora_config):
@@ -192,47 +191,41 @@ class TestEPLoRAForwardShapes:
         intermediate = config.moe_intermediate_size
         r = lora_config.r
 
-        # Create local (sliced) weights
-        fc1_1_weight = torch.randn(num_local_experts, intermediate, hidden_dim, device=device, dtype=dtype)
-        fc1_2_weight = torch.randn(num_local_experts, intermediate, hidden_dim, device=device, dtype=dtype)
-        fc2_weight = torch.randn(num_local_experts, hidden_dim, intermediate, device=device, dtype=dtype)
+        # Create local (sliced) weights in GKN format [E, in_features, out_features]
+        gate_proj = torch.randn(num_local_experts, hidden_dim, intermediate, device=device, dtype=dtype)
+        up_proj = torch.randn(num_local_experts, hidden_dim, intermediate, device=device, dtype=dtype)
+        down_proj = torch.randn(num_local_experts, intermediate, hidden_dim, device=device, dtype=dtype)
 
-        # Local LoRA weights (sliced shape)
-        fc1_1_lora_A = torch.randn(num_local_experts, r, hidden_dim, device=device, dtype=dtype)
-        fc1_1_lora_B = torch.zeros(num_local_experts, intermediate, r, device=device, dtype=dtype)
-        fc1_2_lora_A = torch.randn(num_local_experts, r, hidden_dim, device=device, dtype=dtype)
-        fc1_2_lora_B = torch.zeros(num_local_experts, intermediate, r, device=device, dtype=dtype)
-        fc2_lora_A = torch.randn(num_local_experts, r, intermediate, device=device, dtype=dtype)
-        fc2_lora_B = torch.zeros(num_local_experts, hidden_dim, r, device=device, dtype=dtype)
+        # Local LoRA weights in GKN format
+        gate_proj_lora_A = torch.randn(num_local_experts, hidden_dim, r, device=device, dtype=dtype)
+        gate_proj_lora_B = torch.zeros(num_local_experts, r, intermediate, device=device, dtype=dtype)
+        up_proj_lora_A = torch.randn(num_local_experts, hidden_dim, r, device=device, dtype=dtype)
+        up_proj_lora_B = torch.zeros(num_local_experts, r, intermediate, device=device, dtype=dtype)
+        down_proj_lora_A = torch.randn(num_local_experts, intermediate, r, device=device, dtype=dtype)
+        down_proj_lora_B = torch.zeros(num_local_experts, r, hidden_dim, device=device, dtype=dtype)
 
         # Simulate tokens dispatched to this rank
         permute_tokens = torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
-
-        # Cumsum for each local expert (tokens distributed across 4 experts)
         tokens_per_expert = torch.tensor([4, 4, 4, 4], device=device)
         cumsum = torch.cumsum(tokens_per_expert, dim=0)
-
         scaling = lora_config.lora_alpha / lora_config.r
 
-        # Forward should work with local shapes
         output = EPGroupGemmWithLoRA.apply(
-            permute_tokens,
-            cumsum,
-            fc1_1_weight,
-            fc1_2_weight,
-            fc2_weight,
-            fc1_1_lora_A,
-            fc1_1_lora_B,
-            fc1_2_lora_A,
-            fc1_2_lora_B,
-            fc2_lora_A,
-            fc2_lora_B,
+            permute_tokens, cumsum,
+            gate_proj, up_proj, down_proj,
+            gate_proj_lora_A, gate_proj_lora_B,
+            up_proj_lora_A, up_proj_lora_B,
+            down_proj_lora_A, down_proj_lora_B,
             scaling,
         )
 
         assert output.shape == (num_tokens, hidden_dim)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    @pytest.mark.skipif(
+        not (torch.distributed.is_available() and torch.distributed.is_initialized()),
+        reason="Backward requires distributed ep_group (all_reduce for LoRA grads)",
+    )
     def test_epgroup_gemm_with_lora_backward(self, config, lora_config):
         """Test EPGroupGemmWithLoRA backward pass produces gradients."""
         from xorl.distributed.moe.moe_layer import EPGroupGemmWithLoRA
@@ -245,18 +238,17 @@ class TestEPLoRAForwardShapes:
         intermediate = config.moe_intermediate_size
         r = lora_config.r
 
-        # Create local weights (base frozen, LoRA trainable)
-        fc1_1_weight = torch.randn(num_local_experts, intermediate, hidden_dim, device=device, dtype=dtype)
-        fc1_2_weight = torch.randn(num_local_experts, intermediate, hidden_dim, device=device, dtype=dtype)
-        fc2_weight = torch.randn(num_local_experts, hidden_dim, intermediate, device=device, dtype=dtype)
+        # GKN format [E, in_features, out_features]
+        gate_proj = torch.randn(num_local_experts, hidden_dim, intermediate, device=device, dtype=dtype)
+        up_proj = torch.randn(num_local_experts, hidden_dim, intermediate, device=device, dtype=dtype)
+        down_proj = torch.randn(num_local_experts, intermediate, hidden_dim, device=device, dtype=dtype)
 
-        # LoRA weights need gradients
-        fc1_1_lora_A = torch.randn(num_local_experts, r, hidden_dim, device=device, dtype=dtype, requires_grad=True)
-        fc1_1_lora_B = torch.zeros(num_local_experts, intermediate, r, device=device, dtype=dtype, requires_grad=True)
-        fc1_2_lora_A = torch.randn(num_local_experts, r, hidden_dim, device=device, dtype=dtype, requires_grad=True)
-        fc1_2_lora_B = torch.zeros(num_local_experts, intermediate, r, device=device, dtype=dtype, requires_grad=True)
-        fc2_lora_A = torch.randn(num_local_experts, r, intermediate, device=device, dtype=dtype, requires_grad=True)
-        fc2_lora_B = torch.zeros(num_local_experts, hidden_dim, r, device=device, dtype=dtype, requires_grad=True)
+        gate_proj_lora_A = torch.randn(num_local_experts, hidden_dim, r, device=device, dtype=dtype, requires_grad=True)
+        gate_proj_lora_B = torch.zeros(num_local_experts, r, intermediate, device=device, dtype=dtype, requires_grad=True)
+        up_proj_lora_A = torch.randn(num_local_experts, hidden_dim, r, device=device, dtype=dtype, requires_grad=True)
+        up_proj_lora_B = torch.zeros(num_local_experts, r, intermediate, device=device, dtype=dtype, requires_grad=True)
+        down_proj_lora_A = torch.randn(num_local_experts, intermediate, r, device=device, dtype=dtype, requires_grad=True)
+        down_proj_lora_B = torch.zeros(num_local_experts, r, hidden_dim, device=device, dtype=dtype, requires_grad=True)
 
         permute_tokens = torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype, requires_grad=True)
         tokens_per_expert = torch.tensor([4, 4, 4, 4], device=device)
@@ -264,32 +256,21 @@ class TestEPLoRAForwardShapes:
         scaling = lora_config.lora_alpha / lora_config.r
 
         output = EPGroupGemmWithLoRA.apply(
-            permute_tokens,
-            cumsum,
-            fc1_1_weight,
-            fc1_2_weight,
-            fc2_weight,
-            fc1_1_lora_A,
-            fc1_1_lora_B,
-            fc1_2_lora_A,
-            fc1_2_lora_B,
-            fc2_lora_A,
-            fc2_lora_B,
+            permute_tokens, cumsum,
+            gate_proj, up_proj, down_proj,
+            gate_proj_lora_A, gate_proj_lora_B,
+            up_proj_lora_A, up_proj_lora_B,
+            down_proj_lora_A, down_proj_lora_B,
             scaling,
         )
 
         loss = output.sum()
         loss.backward()
 
-        # LoRA weights should have gradients
-        assert fc1_1_lora_A.grad is not None
-        assert fc1_1_lora_B.grad is not None
-        assert fc1_2_lora_A.grad is not None
-        assert fc1_2_lora_B.grad is not None
-        assert fc2_lora_A.grad is not None
-        assert fc2_lora_B.grad is not None
-
-        # Input should also have gradient
+        assert gate_proj_lora_A.grad is not None
+        assert gate_proj_lora_B.grad is not None
+        assert down_proj_lora_A.grad is not None
+        assert down_proj_lora_B.grad is not None
         assert permute_tokens.grad is not None
 
 
@@ -301,26 +282,17 @@ class TestNumExpertsConsistency:
         return MockConfig(num_experts=8)
 
     def test_moe_experts_lora_forward_uses_global_num_experts(self, config):
-        """Test that moe_experts_lora_forward correctly handles global num_experts."""
-        from xorl.models.transformers.qwen3_moe.qwen3_moe_lora import (
-            LoRAConfig,
-            Qwen3MoeFusedExpertsWithLoRA,
+        """Test that MoEExpertsLoRA correctly handles global num_experts."""
+        lora_config = MoELoRAConfig(r=4, lora_alpha=8)
+        experts = MoEExpertsLoRA(
+            num_experts=config.num_experts,
+            hidden_dim=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            moe_implementation="triton",
+            lora_config=lora_config,
         )
 
-        lora_config = LoRAConfig(r=4, lora_alpha=8)
-        experts = Qwen3MoeFusedExpertsWithLoRA(config, lora_config)
-
-        # num_experts should remain at global value
         assert experts.num_experts == 8, "num_experts should be global (8)"
-
-        # Simulate EP sharding by manually slicing weights
-        # In real use, parallel_plan.apply() would do this
-        ep_size = 2
-        num_local_experts = config.num_experts // ep_size  # 4
-
-        # The forward function should still pass num_experts=8 to moe_experts_lora_forward
-        # This is correct because routing/masking uses global expert IDs
-        # The preprocess function then computes num_local_experts internally
 
 
 class TestLoRAShapeValidation:
@@ -331,34 +303,40 @@ class TestLoRAShapeValidation:
         return MockConfig(num_experts=8, hidden_size=32, moe_intermediate_size=64)
 
     def test_lora_weight_shapes_match_base(self, config):
-        """Test that LoRA weight shapes are compatible with base weights."""
-        from xorl.models.transformers.qwen3_moe.qwen3_moe_lora import (
-            LoRAConfig,
-            Qwen3MoeFusedExpertsWithLoRA,
+        """Test that LoRA weight shapes are compatible with base weights.
+
+        All weights in GKN format [num_experts, in_features, out_features]:
+          gate_proj:        [E, hidden, inter]
+          gate_proj_lora_A: [E, hidden, r]    — input dim (dim 1) matches gate_proj
+          gate_proj_lora_B: [E, r, inter]     — output dim (dim 2) matches gate_proj
+          down_proj:        [E, inter, hidden]
+          down_proj_lora_A: [E, inter, r]     — input dim (dim 1) matches down_proj
+          down_proj_lora_B: [E, r, hidden]    — output dim (dim 2) matches down_proj
+        """
+        lora_config = MoELoRAConfig(r=4, lora_alpha=8)
+        experts = MoEExpertsLoRA(
+            num_experts=config.num_experts,
+            hidden_dim=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            moe_implementation="triton",
+            lora_config=lora_config,
         )
 
-        lora_config = LoRAConfig(r=4, lora_alpha=8)
-        experts = Qwen3MoeFusedExpertsWithLoRA(config, lora_config)
+        # gate_proj_lora_A: [E, hidden, r] — dim 0 and dim 1 match gate_proj
+        assert experts.gate_proj_lora_A.shape[0] == experts.gate_proj.shape[0]
+        assert experts.gate_proj_lora_A.shape[1] == experts.gate_proj.shape[1]
 
-        # gate_proj: [num_experts, intermediate, hidden] -> lora_A: [num_experts, r, hidden]
-        assert experts.gate_proj_lora_A.shape[0] == experts.gate_proj.shape[0]  # num_experts match
-        assert experts.gate_proj_lora_A.shape[2] == experts.gate_proj.shape[2]  # hidden_dim match
+        # gate_proj_lora_B: [E, r, inter] — dim 0 and dim 2 match gate_proj
+        assert experts.gate_proj_lora_B.shape[0] == experts.gate_proj.shape[0]
+        assert experts.gate_proj_lora_B.shape[2] == experts.gate_proj.shape[2]
 
-        # gate_proj_lora_B: [num_experts, intermediate, r]
-        assert experts.gate_proj_lora_B.shape[0] == experts.gate_proj.shape[0]  # num_experts match
-        assert experts.gate_proj_lora_B.shape[1] == experts.gate_proj.shape[1]  # intermediate match
+        # down_proj_lora_A: [E, inter, r] — dim 0 and dim 1 match down_proj
+        assert experts.down_proj_lora_A.shape[0] == experts.down_proj.shape[0]
+        assert experts.down_proj_lora_A.shape[1] == experts.down_proj.shape[1]
 
-        # Same validation for up_proj
-        assert experts.up_proj_lora_A.shape[0] == experts.up_proj.shape[0]
-        assert experts.up_proj_lora_A.shape[2] == experts.up_proj.shape[2]
-        assert experts.up_proj_lora_B.shape[0] == experts.up_proj.shape[0]
-        assert experts.up_proj_lora_B.shape[1] == experts.up_proj.shape[1]
-
-        # down_proj: [num_experts, hidden, intermediate] -> lora_A: [num_experts, r, intermediate]
-        assert experts.down_proj_lora_A.shape[0] == experts.down_proj.shape[0]  # num_experts match
-        assert experts.down_proj_lora_A.shape[2] == experts.down_proj.shape[2]  # intermediate match
-        assert experts.down_proj_lora_B.shape[0] == experts.down_proj.shape[0]  # num_experts match
-        assert experts.down_proj_lora_B.shape[1] == experts.down_proj.shape[1]  # hidden match
+        # down_proj_lora_B: [E, r, hidden] — dim 0 and dim 2 match down_proj
+        assert experts.down_proj_lora_B.shape[0] == experts.down_proj.shape[0]
+        assert experts.down_proj_lora_B.shape[2] == experts.down_proj.shape[2]
 
 
 class TestCumsumMatchesLocalExperts:
@@ -366,21 +344,6 @@ class TestCumsumMatchesLocalExperts:
 
     def test_preprocess_returns_local_expert_cumsum(self):
         """Test that preprocess returns cumsum for local experts only."""
-        # This tests the contract: cumsum.shape[0] == num_local_experts
-
-        # Given:
-        # - num_experts = 8 (global)
-        # - ep_size = 2
-        # - Each rank handles num_local_experts = 4
-
-        # The returned num_global_sum_tokens_per_local_expert should have shape [4]
-        # (one entry per local expert)
-
-        # This is critical because EPGroupGemmWithLoRA uses:
-        # - weights shape: [num_local_experts, ...]
-        # - cumsum shape: [num_local_experts]
-
-        # The shapes MUST match for group_gemm to work correctly
         pass  # Tested implicitly in integration tests
 
 
@@ -394,7 +357,7 @@ class TestMoEExpertsLoRAFunctionShapes:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_moe_experts_lora_function_forward(self, config):
         """Test forward pass with MoeExpertsLoRAFunction (no EP)."""
-        from xorl.ops.fused_moe_experts_lora import MoeExpertsLoRAFunction
+        from xorl.ops.moe_experts_lora import MoeExpertsLoRAFunction
 
         device = "cuda"
         dtype = torch.bfloat16
@@ -405,17 +368,17 @@ class TestMoEExpertsLoRAFunctionShapes:
         intermediate = config.moe_intermediate_size
         r = 4
 
-        # Create weights at full (non-EP) shape
-        fc1_1_weight = torch.randn(num_experts, intermediate, hidden_dim, device=device, dtype=dtype)
-        fc1_2_weight = torch.randn(num_experts, intermediate, hidden_dim, device=device, dtype=dtype)
-        fc2_weight = torch.randn(num_experts, hidden_dim, intermediate, device=device, dtype=dtype)
+        # GKN format [E, in_features, out_features]
+        gate_proj = torch.randn(num_experts, hidden_dim, intermediate, device=device, dtype=dtype)
+        up_proj = torch.randn(num_experts, hidden_dim, intermediate, device=device, dtype=dtype)
+        down_proj = torch.randn(num_experts, intermediate, hidden_dim, device=device, dtype=dtype)
 
-        fc1_1_lora_A = torch.randn(num_experts, r, hidden_dim, device=device, dtype=dtype, requires_grad=True)
-        fc1_1_lora_B = torch.zeros(num_experts, intermediate, r, device=device, dtype=dtype, requires_grad=True)
-        fc1_2_lora_A = torch.randn(num_experts, r, hidden_dim, device=device, dtype=dtype, requires_grad=True)
-        fc1_2_lora_B = torch.zeros(num_experts, intermediate, r, device=device, dtype=dtype, requires_grad=True)
-        fc2_lora_A = torch.randn(num_experts, r, intermediate, device=device, dtype=dtype, requires_grad=True)
-        fc2_lora_B = torch.zeros(num_experts, hidden_dim, r, device=device, dtype=dtype, requires_grad=True)
+        gate_proj_lora_A = torch.randn(num_experts, hidden_dim, r, device=device, dtype=dtype, requires_grad=True)
+        gate_proj_lora_B = torch.zeros(num_experts, r, intermediate, device=device, dtype=dtype, requires_grad=True)
+        up_proj_lora_A = torch.randn(num_experts, hidden_dim, r, device=device, dtype=dtype, requires_grad=True)
+        up_proj_lora_B = torch.zeros(num_experts, r, intermediate, device=device, dtype=dtype, requires_grad=True)
+        down_proj_lora_A = torch.randn(num_experts, intermediate, r, device=device, dtype=dtype, requires_grad=True)
+        down_proj_lora_B = torch.zeros(num_experts, r, hidden_dim, device=device, dtype=dtype, requires_grad=True)
 
         hidden_states = torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype, requires_grad=True)
         gate_weights = torch.softmax(torch.randn(num_tokens, top_k, device=device, dtype=dtype), dim=-1)
@@ -423,29 +386,20 @@ class TestMoEExpertsLoRAFunctionShapes:
         scaling = 2.0
 
         output = MoeExpertsLoRAFunction.apply(
-            num_experts,
-            gate_weights,
-            expert_index,
-            hidden_states,
-            fc1_1_weight,
-            fc1_2_weight,
-            fc2_weight,
-            fc1_1_lora_A,
-            fc1_1_lora_B,
-            fc1_2_lora_A,
-            fc1_2_lora_B,
-            fc2_lora_A,
-            fc2_lora_B,
+            num_experts, gate_weights, expert_index, hidden_states,
+            gate_proj, up_proj, down_proj,
+            gate_proj_lora_A, gate_proj_lora_B,
+            up_proj_lora_A, up_proj_lora_B,
+            down_proj_lora_A, down_proj_lora_B,
             scaling,
         )
 
         assert output.shape == (num_tokens, hidden_dim)
 
-        # Test backward
         loss = output.sum()
         loss.backward()
 
-        assert fc1_1_lora_A.grad is not None
+        assert gate_proj_lora_A.grad is not None
         assert hidden_states.grad is not None
 
 

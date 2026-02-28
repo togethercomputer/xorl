@@ -70,9 +70,11 @@ def build_foundation_model(
     attn_implementation: Optional[
         Literal["eager", "sdpa", "flash_attention_2", "flash_attention_3", "flash_attention_4", "native-sparse"]
     ] = "flash_attention_2",
-    moe_implementation: Optional[Literal["eager", "fused", "quack"]] = None,
-    use_deepep: bool = False,
+    moe_implementation: Optional[Literal["eager", "triton", "native", "quack"]] = None,
+    ep_dispatch: str = "alltoall",
     deepep_buffer_size_gb: float = 2.0,
+    deepep_num_sms: int = 20,
+    deepep_async_combine: bool = False,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
 ) -> nn.Module:
@@ -90,15 +92,20 @@ def build_foundation_model(
         config = _load_config_with_rank0_priority(config_path, config_kwargs)
 
     if moe_implementation is not None:
-        if moe_implementation not in ["eager", "fused", "quack"]:
+        if moe_implementation not in ["eager", "triton", "native", "quack"]:
             raise ValueError(f"Invalid moe_implementation: {moe_implementation}")
         config._moe_implementation = moe_implementation
         logger.info_rank0(f"Moe implementation: {moe_implementation}")
 
-    config._use_deepep = use_deepep
+    config._ep_dispatch = ep_dispatch
     config._deepep_buffer_size_gb = deepep_buffer_size_gb
-    if use_deepep:
-        logger.info_rank0(f"DeepEP enabled for quack MoE (buffer={deepep_buffer_size_gb} GB)")
+    config._deepep_num_sms = deepep_num_sms
+    config._deepep_async_combine = deepep_async_combine
+    if ep_dispatch == "deepep":
+        logger.info_rank0(
+            f"DeepEP dispatch enabled (buffer={deepep_buffer_size_gb} GB, "
+            f"num_sms={deepep_num_sms}, async_combine={deepep_async_combine})"
+        )
 
     # Validate attention implementation for packed sequences with FlashAttention kwargs
     if attn_implementation == "sdpa":

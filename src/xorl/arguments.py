@@ -484,23 +484,37 @@ class ModelArguments:
         default="flash_attention_2",
         metadata={"help": "Attention implementation to use. flash_attention_4 requires Blackwell GPU (SM100+)."},
     )
-    moe_implementation: Optional[Literal[None, "eager", "fused", "quack"]] = field(
+    moe_implementation: Optional[Literal[None, "eager", "triton", "native", "quack"]] = field(
         default=None,
-        metadata={"help": "MoE implementation to use. 'fused' uses fused MoE kernels, 'quack' uses quack kernels."},
+        metadata={"help": "MoE implementation to use. 'triton' uses Triton group GEMM kernels, 'native' uses torch._grouped_mm, 'quack' uses quack kernels."},
     )
-    use_deepep: bool = field(
-        default=False,
-        metadata={"help": "Enable DeepEP communication backend for quack MoE Expert Parallel path."},
+    ep_dispatch: str = field(
+        default="alltoall",
+        metadata={"help": "EP dispatch strategy: 'alltoall' (default) or 'deepep' (NVLink-optimized)."},
     )
     deepep_buffer_size_gb: float = field(
         default=2.0,
-        metadata={"help": "DeepEP buffer size in GB (effective when use_deepep=true)."},
+        metadata={"help": "DeepEP buffer size in GB (effective when ep_dispatch='deepep')."},
+    )
+    deepep_num_sms: int = field(
+        default=20,
+        metadata={"help": "Number of SMs for DeepEP communication kernels (must be even, default 20). Lower values leave more SMs for overlapped compute."},
+    )
+    deepep_async_combine: bool = field(
+        default=False,
+        metadata={"help": "Enable async combine for DeepEP (overlap combine with next layer's compute)."},
     )
     basic_modules: Optional[List[str]] = field(
         default_factory=list,
         metadata={
             "help": "Basic modules beyond model._no_split_modules to be sharded in FSDP."
         },
+    )
+    merge_qkv: bool = field(
+        default=True,
+        metadata={"help": "Keep q/k/v projections fused as qkv_proj. "
+                  "When False, unfuse into separate q_proj/k_proj/v_proj for independent handling "
+                  "(e.g., tensor parallelism, independent LoRA per projection)."},
     )
     def __post_init__(self):
         if self.config_path is None and self.model_path is None:
@@ -563,13 +577,37 @@ class TrainingArguments:
         metadata={"help": "Parameters without weight decay, for example, bias."},
     )
 
-    optimizer: Literal["adamw", "anyprecision_adamw"] = field(
+    optimizer: Literal["adamw", "anyprecision_adamw", "muon"] = field(
         default="adamw",
-        metadata={"help": "Optimizer. Default to adamw."},
+        metadata={"help": "Optimizer. Default to adamw. 'muon' uses Newton-Schulz orthogonalization for 2D+ weight matrices."},
     )
     optimizer_dtype: Literal["fp32", "bf16"] = field(
         default="bf16",
         metadata={"help": "Dtype for optimizer states (momentum/variance) in anyprecision_adamw. Ignored for adamw."},
+    )
+    muon_lr: float = field(
+        default=0.02,
+        metadata={"help": "Learning rate for Muon parameter groups (2D+ weight matrices). Only used when optimizer='muon'."},
+    )
+    muon_momentum: float = field(
+        default=0.95,
+        metadata={"help": "Momentum coefficient for Muon parameter groups."},
+    )
+    muon_nesterov: bool = field(
+        default=True,
+        metadata={"help": "Use Nesterov momentum for Muon parameter groups."},
+    )
+    muon_ns_steps: int = field(
+        default=5,
+        metadata={"help": "Number of Newton-Schulz iterations for Muon optimizer."},
+    )
+    muon_adjust_lr_fn: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "LR adjustment for Muon. 'original': scale by sqrt(max(1,A/B)). "
+            "'match_rms_adamw': scale by 0.2*sqrt(max(A,B)) so Muon can reuse AdamW LR/WD. "
+            "None defaults to 'original'."
+        },
     )
     max_grad_norm: float = field(
         default=1.0,
@@ -699,6 +737,37 @@ class TrainingArguments:
         default=1,
         metadata={"help": "Ulysses sequence parallel size."},
     )
+    tensor_parallel_size: int = field(
+        default=1,
+        metadata={"help": "Tensor parallel size. Shards model weights across GPUs within a node."},
+    )
+    context_parallel_size: int = field(
+        default=1,
+        metadata={"help": "Context (ring attention) parallel size."},
+    )
+    pipeline_parallel_size: int = field(
+        default=1,
+        metadata={"help": "Pipeline parallel size. Splits model layers across GPUs."},
+    )
+    pipeline_parallel_schedule: str = field(
+        default="1F1B",
+        metadata={"help": "Pipeline parallel schedule (e.g., '1F1B', 'GPipe', 'Interleaved1F1B')."},
+    )
+    reshard_after_forward: Optional[bool] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Whether FSDP2 reshards parameters after forward. "
+                "True: reshard after forward, re-gather in backward (saves memory). "
+                "False: keep params unsharded (saves communication, uses more memory). "
+                "Default (None): True for standard training, False for pipeline parallelism."
+            )
+        },
+    )
+    sp_fsdp_mode: str = field(
+        default="all",
+        metadata={"help": "How to fold SP into FSDP: 'all' (ulysses+cp), 'ulysses_only', or 'none'."},
+    )
     ckpt_manager: Literal["omnistore", "dcp"] = field(
         default="omnistore",
         metadata={"help": "Checkpoint manager."},
@@ -788,15 +857,19 @@ class TrainingArguments:
         self.local_rank = int(os.getenv("LOCAL_RANK", "0"))
         self.global_rank = int(os.getenv("RANK", "0"))
         self.world_size = int(os.getenv("WORLD_SIZE", "1"))
-        if (
-            self.world_size
-            % self.ulysses_parallel_size
-            != 0
-        ):
+        non_dp_size = (
+            self.ulysses_parallel_size * self.tensor_parallel_size
+            * self.context_parallel_size * self.pipeline_parallel_size
+        )
+        if self.world_size % non_dp_size != 0:
             raise ValueError(
-                f"World size should be a multiple of ulysses_parallel_size: {self.ulysses_parallel_size}."
+                f"World size ({self.world_size}) should be a multiple of "
+                f"ulysses_parallel_size ({self.ulysses_parallel_size}) * "
+                f"tensor_parallel_size ({self.tensor_parallel_size}) * "
+                f"context_parallel_size ({self.context_parallel_size}) * "
+                f"pipeline_parallel_size ({self.pipeline_parallel_size}) = {non_dp_size}."
             )
-        self.data_parallel_size = self.world_size // self.ulysses_parallel_size
+        self.data_parallel_size = self.world_size // non_dp_size
 
         # configure data parallel size
         if self.data_parallel_replicate_size > 0 and self.data_parallel_shard_size > 0:
@@ -937,6 +1010,58 @@ class DistillationArguments:
     stream_num_workers: int = field(
         default=32,
         metadata={"help": "Number of workers for loading activations from S3/local"},
+    )
+
+
+@dataclass
+class LoRAArguments:
+    """Arguments for LoRA and QLoRA fine-tuning."""
+
+    enable_lora: bool = field(
+        default=False,
+        metadata={"help": "Enable LoRA fine-tuning"},
+    )
+    lora_rank: int = field(
+        default=16,
+        metadata={"help": "LoRA rank"},
+    )
+    lora_alpha: int = field(
+        default=16,
+        metadata={"help": "LoRA alpha for scaling"},
+    )
+    lora_target_modules: Optional[List[str]] = field(
+        default=None,
+        metadata={"help": "Modules to apply LoRA to. If None, uses default linear projections."},
+    )
+    save_lora_only: bool = field(
+        default=False,
+        metadata={"help": "Only save LoRA weights (not full model) in HF checkpoints"},
+    )
+    # QLoRA: quantize base weights for memory savings
+    enable_qlora: bool = field(
+        default=False,
+        metadata={"help": "Enable QLoRA (quantized base weights + trainable LoRA). Implies enable_lora=True."},
+    )
+    quant_format: str = field(
+        default="nvfp4",
+        metadata={"help": "Quantization format for QLoRA. Supported: 'nvfp4', 'block_fp8'"},
+    )
+    quant_group_size: int = field(
+        default=16,
+        metadata={"help": "Group/block size for quantization (16 for nvfp4, 128 for block_fp8)"},
+    )
+    merge_lora_interval: int = field(
+        default=0,
+        metadata={"help": "Merge LoRA delta into base weights every N training steps. "
+                  "For QLoRA: merge + re-quantize. For LoRA: merge into bf16 weight. "
+                  "0 = disabled."},
+    )
+    exclude_modules: Optional[List[str]] = field(
+        default=None,
+        metadata={"help": "Modules to exclude from QLoRA injection (kept as bf16). "
+                  "When None, auto-detected from pre-quantized checkpoint config "
+                  "(exclude_modules / modules_to_not_convert). "
+                  "Example: ['lm_head', 'gate']"},
     )
 
 
@@ -1316,3 +1441,4 @@ class Arguments:
     data: "DataArguments" = field(default_factory=DataArguments)
     train: "TrainingArguments" = field(default_factory=TrainingArguments)
     distill: "DistillationArguments" = field(default_factory=DistillationArguments)
+    lora: "LoRAArguments" = field(default_factory=LoRAArguments)

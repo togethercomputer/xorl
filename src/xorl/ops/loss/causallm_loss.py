@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 
 from .compiled_cross_entropy import compiled_cross_entropy_function
+from .vocab_parallel_cross_entropy import vocab_parallel_cross_entropy
 
 
 def causallm_loss_function(
@@ -12,6 +13,8 @@ def causallm_loss_function(
     return_per_token: bool = False,
     ce_mode: str = "compiled",
     num_chunks: int = 8,
+    tp_group=None,
+    use_compile: bool = False,
 ) -> torch.Tensor:
     """
     Compute causal language modeling loss.
@@ -22,16 +25,20 @@ def causallm_loss_function(
 
     Args:
         hidden_states: Model hidden states, shape (batch, seq_len, hidden_dim)
-        weight: LM head weight matrix, shape (vocab_size, hidden_dim)
+        weight: LM head weight matrix, shape (vocab_size, hidden_dim).
+                With TP, this is the local shard [vocab_size/tp, hidden_dim].
         labels: Target labels, shape (batch, seq_len). Labels are assumed to be
                 already next-token aligned (labels[i] is the target for hidden_states[i]).
         ignore_index: Index to ignore in loss computation (default: -100)
         return_per_token: If True, return per-token logprobs and losses (default: False)
         ce_mode: Cross-entropy mode - "compiled" (default) or "eager"
-        num_chunks: Number of chunks for compiled mode (default: 64).
+        num_chunks: Number of chunks for compiled mode (default: 8).
                    Higher values use less memory. At MBS=8 with 128K seq and vocab=151K,
                    num_chunks=8 creates 9.1 GiB FP32 logits per chunk (18 GiB peak during
                    backward), while num_chunks=64 reduces this to 1.1 GiB (2.3 GiB peak).
+        tp_group: TP process group for vocab-parallel cross-entropy (default: None).
+                  When provided, weight is treated as a local shard and cross-entropy
+                  is computed without gathering full logits.
 
     Returns:
         If return_per_token=False: (loss, None, None, None)
@@ -44,6 +51,26 @@ def causallm_loss_function(
     labels_flat = labels.view(-1)
     hidden_states_flat = hidden_states.view(-1, hidden_states.size(-1))
     valid_mask = (labels_flat != ignore_index)
+
+    # Vocab-parallel cross-entropy for tensor parallelism
+    if tp_group is not None:
+        # Extract local weight from DTensor if needed
+        local_weight = weight.to_local() if hasattr(weight, "to_local") else weight
+
+        per_token_ce = vocab_parallel_cross_entropy(
+            hidden_states_flat, local_weight, labels_flat, tp_group,
+            ignore_index=ignore_index,
+            use_compile=use_compile,
+        )
+
+        if return_per_token:
+            per_token_logprobs = -per_token_ce.detach().clone().view(original_shape)
+            per_token_loss = per_token_ce.view(original_shape)
+            loss = per_token_ce.sum() / valid_mask.sum().clamp(min=1)
+            return loss, None, per_token_logprobs, per_token_loss
+        else:
+            loss = per_token_ce.sum() / valid_mask.sum().clamp(min=1)
+            return loss, None, None, None
 
     if return_per_token:
         # Compute cross-entropy based on mode

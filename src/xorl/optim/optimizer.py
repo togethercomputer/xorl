@@ -17,9 +17,15 @@ from torch.optim.optimizer import Optimizer
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
+from .muon import Muon
 
 
 logger = logging.get_logger(__name__)
+
+# Module class names and parameter name patterns that should NOT use Muon
+# (i.e., they should always use AdamW even when optimizer_type="muon").
+_MUON_EXCLUDE_MODULE_TYPES = {"Embedding"}
+_MUON_EXCLUDE_PARAM_PATTERNS = {"embed_tokens", "lm_head", "norm", "gate.weight"}
 
 
 # https://github.com/meta-llama/llama-recipes/blob/v0.0.4/src/llama_recipes/policies/anyprecision_optimizer.py
@@ -219,6 +225,11 @@ def _should_build_ep_aware(model: "nn.Module", param_groups: Optional[Sequence[D
     if ps.dp_mode != "fsdp2" or not ps.ep_enabled:
         return False
 
+    for m in model.modules():
+        # Detect EP modules that skipped FSDP (e.g., QLoRAMoeExperts)
+        if getattr(m, "_skip_fsdp", False):
+            if any(p.requires_grad for p in m.parameters()):
+                return True
     for p in model.parameters():
         if not p.requires_grad:
             continue
@@ -276,6 +287,86 @@ _ANYPRECISION_STATE_DTYPES = {
 }
 
 
+def _classify_muon_params(
+    model: "nn.Module",
+) -> Tuple[List[torch.nn.Parameter], List[str], List[torch.nn.Parameter], List[str]]:
+    """
+    Split trainable parameters into Muon-eligible (2D+ weight matrices) and
+    AdamW-eligible (embeddings, norms, biases, router gates, 1D params).
+
+    Returns:
+        (muon_params, muon_names, adamw_params, adamw_names)
+    """
+    muon_params: List[torch.nn.Parameter] = []
+    muon_names: List[str] = []
+    adamw_params: List[torch.nn.Parameter] = []
+    adamw_names: List[str] = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        # 1D or scalar params always go to AdamW
+        if param.ndim < 2:
+            adamw_params.append(param)
+            adamw_names.append(name)
+            continue
+
+        # Check exclusion patterns in the parameter name
+        name_lower = name.lower()
+        excluded = any(pat in name_lower for pat in _MUON_EXCLUDE_PARAM_PATTERNS)
+
+        if excluded:
+            adamw_params.append(param)
+            adamw_names.append(name)
+        else:
+            muon_params.append(param)
+            muon_names.append(name)
+
+    return muon_params, muon_names, adamw_params, adamw_names
+
+
+def _make_muon_param_groups(
+    model: "nn.Module",
+    muon_params: List[torch.nn.Parameter],
+    adamw_params: List[torch.nn.Parameter],
+    muon_lr: float,
+    adamw_lr: float,
+    weight_decay: float,
+    no_decay_modules: Optional[List[str]] = None,
+    no_decay_params: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Build param groups for the Muon optimizer with proper weight decay splitting.
+
+    Creates up to 4 groups:
+      - muon + decay, muon + no_decay
+      - adamw + decay, adamw + no_decay
+    """
+    decay_param_names = set(get_parameter_names(model, no_decay_modules, no_decay_params))
+    name_by_param = {p: n for n, p in model.named_parameters()}
+
+    groups: List[Dict[str, Any]] = []
+
+    # Muon groups
+    muon_decay = [p for p in muon_params if name_by_param.get(p) in decay_param_names]
+    muon_no_decay = [p for p in muon_params if name_by_param.get(p) not in decay_param_names]
+    if muon_decay:
+        groups.append({"params": muon_decay, "lr": muon_lr, "weight_decay": weight_decay, "use_muon": True})
+    if muon_no_decay:
+        groups.append({"params": muon_no_decay, "lr": muon_lr, "weight_decay": 0.0, "use_muon": True})
+
+    # AdamW groups
+    adamw_decay = [p for p in adamw_params if name_by_param.get(p) in decay_param_names]
+    adamw_no_decay = [p for p in adamw_params if name_by_param.get(p) not in decay_param_names]
+    if adamw_decay:
+        groups.append({"params": adamw_decay, "lr": adamw_lr, "weight_decay": weight_decay, "use_muon": False})
+    if adamw_no_decay:
+        groups.append({"params": adamw_no_decay, "lr": adamw_lr, "weight_decay": 0.0, "use_muon": False})
+
+    return groups
+
+
 def build_optimizer(
     model: "nn.Module",
     lr: float = 1e-3,
@@ -288,13 +379,54 @@ def build_optimizer(
     param_groups: Optional[Sequence[Dict[str, Any]]] = None,
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
+    # Muon-specific arguments
+    muon_lr: float = 0.02,
+    muon_momentum: float = 0.95,
+    muon_nesterov: bool = True,
+    muon_ns_steps: int = 5,
+    muon_adjust_lr_fn: Optional[str] = None,
+    muon_momentum_dtype: Optional[torch.dtype] = None,
 ) -> "torch.optim.Optimizer":
     # EP-aware routing: for FSDP2+EP, split params into EP and non-EP groups and build two optimizers.
     if _should_build_ep_aware(model, param_groups):
         return build_ep_fsdp2_optimizer(
             model, lr, betas, eps, weight_decay, fused, optimizer_type, optimizer_dtype,
             param_groups, no_decay_modules, no_decay_params,
+            muon_lr=muon_lr, muon_momentum=muon_momentum,
+            muon_nesterov=muon_nesterov, muon_ns_steps=muon_ns_steps,
+            muon_adjust_lr_fn=muon_adjust_lr_fn,
+            muon_momentum_dtype=muon_momentum_dtype,
         )
+
+    # Muon optimizer: split params into Muon (2D+ matrices) and AdamW (rest)
+    if optimizer_type == "muon":
+        muon_params, muon_names, adamw_params, adamw_names = _classify_muon_params(model)
+        logger.info_rank0(
+            f"Muon optimizer: {len(muon_params)} Muon params, {len(adamw_params)} AdamW params"
+        )
+        logger.info_rank0(f"Muon params: {muon_names}")
+        logger.info_rank0(f"AdamW params: {adamw_names}")
+
+        param_groups = _make_muon_param_groups(
+            model, muon_params, adamw_params,
+            muon_lr=muon_lr, adamw_lr=lr, weight_decay=weight_decay,
+            no_decay_modules=no_decay_modules, no_decay_params=no_decay_params,
+        )
+        adamw_state_dtype = _ANYPRECISION_STATE_DTYPES.get(optimizer_dtype)
+        return Muon(
+            param_groups,
+            lr=muon_lr,
+            momentum=muon_momentum,
+            nesterov=muon_nesterov,
+            ns_steps=muon_ns_steps,
+            weight_decay=weight_decay,
+            adjust_lr_fn=muon_adjust_lr_fn,
+            adamw_betas=betas,
+            adamw_eps=eps,
+            momentum_dtype=muon_momentum_dtype,
+            adamw_state_dtype=adamw_state_dtype,
+        )
+
     # Other cases remain the same
     if param_groups is None:
         decay_param_names = get_parameter_names(model, no_decay_modules, no_decay_params)
@@ -326,7 +458,7 @@ def build_optimizer(
             compensation_buffer_dtype=state_dtype,
         )
     else:
-        raise ValueError("Only adamw and anyprecision_adamw are supported as optimizers.")
+        raise ValueError("Only adamw, anyprecision_adamw, and muon are supported as optimizers.")
 
     return optim
 
@@ -343,14 +475,31 @@ def build_ep_fsdp2_optimizer(
     param_groups: Optional[Sequence[Dict[str, Any]]] = None,
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
+    # Muon-specific arguments
+    muon_lr: float = 0.02,
+    muon_momentum: float = 0.95,
+    muon_nesterov: bool = True,
+    muon_ns_steps: int = 5,
+    muon_adjust_lr_fn: Optional[str] = None,
+    muon_momentum_dtype: Optional[torch.dtype] = None,
 ):
     """
     Build a MultiOptimizer instance when model is parallelized with EP+FSDP2
     """
+    # Collect param IDs from _skip_fsdp modules (e.g., QLoRAMoeExperts)
+    skip_fsdp_param_ids = set()
+    for m in model.modules():
+        if getattr(m, "_skip_fsdp", False):
+            for p in m.parameters():
+                skip_fsdp_param_ids.add(id(p))
+
     ep_params: List[torch.nn.Parameter] = []
     non_ep_params: List[torch.nn.Parameter] = []
     for p in model.parameters():
         if not p.requires_grad:
+            continue
+        if id(p) in skip_fsdp_param_ids:
+            ep_params.append(p)
             continue
         if DTensor is not None and isinstance(p, DTensor):
             mesh = getattr(p, "device_mesh", None)
@@ -362,10 +511,35 @@ def build_ep_fsdp2_optimizer(
 
     logger.info_rank0(f"EP-aware optimizer: {len(ep_params)} EP params, {len(non_ep_params)} non-EP params")
 
-    ep_groups = _make_param_groups_for_subset(model, ep_params, weight_decay, no_decay_modules, no_decay_params)
-    non_ep_groups = _make_param_groups_for_subset(
-        model, non_ep_params, weight_decay, no_decay_modules, no_decay_params
-    )
+    if optimizer_type == "muon":
+        # For Muon + EP: classify within each EP/non-EP subset, then build Muon optimizers
+        ep_param_set = set(id(p) for p in ep_params)
+        non_ep_param_set = set(id(p) for p in non_ep_params)
+
+        # Classify all model params into Muon vs AdamW
+        all_muon, _, all_adamw, _ = _classify_muon_params(model)
+
+        # Split Muon/AdamW params into EP and non-EP subsets
+        ep_muon = [p for p in all_muon if id(p) in ep_param_set]
+        ep_adamw = [p for p in all_adamw if id(p) in ep_param_set]
+        non_ep_muon = [p for p in all_muon if id(p) in non_ep_param_set]
+        non_ep_adamw = [p for p in all_adamw if id(p) in non_ep_param_set]
+
+        ep_groups = _make_muon_param_groups(
+            model, ep_muon, ep_adamw,
+            muon_lr=muon_lr, adamw_lr=lr, weight_decay=weight_decay,
+            no_decay_modules=no_decay_modules, no_decay_params=no_decay_params,
+        )
+        non_ep_groups = _make_muon_param_groups(
+            model, non_ep_muon, non_ep_adamw,
+            muon_lr=muon_lr, adamw_lr=lr, weight_decay=weight_decay,
+            no_decay_modules=no_decay_modules, no_decay_params=no_decay_params,
+        )
+    else:
+        ep_groups = _make_param_groups_for_subset(model, ep_params, weight_decay, no_decay_modules, no_decay_params)
+        non_ep_groups = _make_param_groups_for_subset(
+            model, non_ep_params, weight_decay, no_decay_modules, no_decay_params
+        )
 
     def _build(groups: Sequence[Dict[str, Any]]) -> Optimizer:
         foreach = not fused
@@ -379,8 +553,18 @@ def build_ep_fsdp2_optimizer(
                 momentum_dtype=state_dtype, variance_dtype=state_dtype,
                 compensation_buffer_dtype=state_dtype,
             )
+        elif optimizer_type == "muon":
+            adamw_state_dtype = _ANYPRECISION_STATE_DTYPES.get(optimizer_dtype)
+            return Muon(
+                groups, lr=muon_lr, momentum=muon_momentum,
+                nesterov=muon_nesterov, ns_steps=muon_ns_steps,
+                weight_decay=weight_decay, adjust_lr_fn=muon_adjust_lr_fn,
+                adamw_betas=betas, adamw_eps=eps,
+                momentum_dtype=muon_momentum_dtype,
+                adamw_state_dtype=adamw_state_dtype,
+            )
         else:
-            raise ValueError("Only adamw and anyprecision_adamw are supported as optimizers.")
+            raise ValueError("Only adamw, anyprecision_adamw, and muon are supported as optimizers.")
 
     optimizer_dict: Dict[str, Optimizer] = {}
     if ep_groups:
@@ -389,9 +573,11 @@ def build_ep_fsdp2_optimizer(
         optimizer_dict["non_ep"] = _build(non_ep_groups)
 
     # cache for EP-aware grad clipping helpers
+    all_ep_params = [p for g in ep_groups for p in g.get("params", [])] if ep_groups else []
+    all_non_ep_params = [p for g in non_ep_groups for p in g.get("params", [])] if non_ep_groups else []
     model._ep_param_groups = {
-        "ep": [p for g in ep_groups for p in g.get("params", [])] if ep_groups else [],
-        "non_ep": [p for g in non_ep_groups for p in g.get("params", [])] if non_ep_groups else [],
+        "ep": all_ep_params,
+        "non_ep": all_non_ep_params,
     }
     # Build MultiOptimizer and attach a pre-step hook to sanitize DTensor states
     multi_opt = MultiOptimizer(model, optimizer_dict, key_names=["ep", "non_ep"])

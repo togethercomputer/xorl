@@ -52,6 +52,15 @@ class MultiHeadAttention(nn.Module):
         """Override in subclasses for model-specific sliding window logic."""
         return getattr(config, "sliding_window", None)
 
+    def unfuse_for_tp(self):
+        """Replace fused qkv_proj with separate q_proj, k_proj, v_proj for tensor parallelism."""
+        device = self.qkv_proj.weight.device
+        dtype = self.qkv_proj.weight.dtype
+        self.q_proj = nn.Linear(self.config.hidden_size, self.q_dim, bias=self.config.attention_bias, device=device, dtype=dtype)
+        self.k_proj = nn.Linear(self.config.hidden_size, self.kv_dim, bias=self.config.attention_bias, device=device, dtype=dtype)
+        self.v_proj = nn.Linear(self.config.hidden_size, self.kv_dim, bias=self.config.attention_bias, device=device, dtype=dtype)
+        del self.qkv_proj
+
     def _project_qkv(
         self,
         hidden_states: torch.Tensor,
@@ -67,8 +76,13 @@ class MultiHeadAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
+        if hasattr(self, "qkv_proj"):
+            qkv = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
+        else:
+            q = self.q_proj(hidden_states)
+            k = self.k_proj(hidden_states)
+            v = self.v_proj(hidden_states)
         q = self.q_norm(q.view(hidden_shape))
         k = self.k_norm(k.view(hidden_shape))
         v = v.view(hidden_shape)

@@ -312,7 +312,7 @@ class TestDataLoaderBuilder:
         # (Flatten + ToTensor + PackingConcat + TextSequenceShard)
         from xorl.data.collators import CollatePipeline
         assert isinstance(collate_fn.internal_collator, CollatePipeline)
-        assert len(collate_fn.internal_collator.data_collators) == 4
+        assert len(collate_fn.internal_collator.data_collators) == 5
 
     @patch('xorl.data.data_loader.get_parallel_state')
     @patch('xorl.data.data_loader.StatefulDistributedSampler')
@@ -433,7 +433,7 @@ class TestDataLoaderBuilderPipeline:
         builder.add_collator(custom_collator, position="end")
 
         pipeline = builder.get_collator_pipeline()
-        assert len(pipeline) == 4  # 3 default (Flatten + ToTensor + PackingConcat) + 1 custom
+        assert len(pipeline) == 5  # 4 default (ToTensor + Flatten + ShiftTokens + PackingConcat) + 1 custom
         assert pipeline[-1] is custom_collator
 
     @patch('xorl.data.data_loader.get_parallel_state')
@@ -456,7 +456,7 @@ class TestDataLoaderBuilderPipeline:
         builder.add_collator(custom_collator, position="start")
 
         pipeline = builder.get_collator_pipeline()
-        assert len(pipeline) == 4  # 3 default (Flatten + ToTensor + PackingConcat) + 1 custom
+        assert len(pipeline) == 5  # 4 default (ToTensor + Flatten + ShiftTokens + PackingConcat) + 1 custom
         assert pipeline[0] is custom_collator
 
     @patch('xorl.data.data_loader.get_parallel_state')
@@ -484,7 +484,7 @@ class TestDataLoaderBuilderPipeline:
         builder.insert_collator(custom_collator, index=1)
 
         pipeline = builder.get_collator_pipeline()
-        assert len(pipeline) == 6  # 3 default + 2 added + 1 inserted
+        assert len(pipeline) == 7  # 4 default + 2 added + 1 inserted
         assert pipeline[1] is custom_collator
 
     @patch('xorl.data.data_loader.get_parallel_state')
@@ -503,13 +503,13 @@ class TestDataLoaderBuilderPipeline:
             gradient_accumulation_steps=2,
         )
         
-        # Add a collator (now 4 total: 3 default + 1 added)
+        # Add a collator (now 5 total: 4 default + 1 added)
         builder.add_collator(SimpleCollator())
-        assert len(builder.get_collator_pipeline()) == 4
+        assert len(builder.get_collator_pipeline()) == 5
 
-        # Remove the first collator (now 3 remaining)
+        # Remove the first collator (now 4 remaining)
         builder.remove_collator(0)
-        assert len(builder.get_collator_pipeline()) == 3
+        assert len(builder.get_collator_pipeline()) == 4
 
     @patch('xorl.data.data_loader.get_parallel_state')
     def test_method_chaining(self, mock_parallel_state, fake_text_dataset):
@@ -531,7 +531,7 @@ class TestDataLoaderBuilderPipeline:
         .insert_collator(SimpleCollator(), index=1))
 
         pipeline = builder.get_collator_pipeline()
-        assert len(pipeline) == 6  # 3 default + 3 added
+        assert len(pipeline) == 7  # 4 default + 3 added
 
     @patch('xorl.data.data_loader.get_parallel_state')
     def test_get_collator_pipeline_returns_copy(self, mock_parallel_state, fake_text_dataset):
@@ -555,9 +555,9 @@ class TestDataLoaderBuilderPipeline:
         # Modify one copy
         pipeline1.append(SimpleCollator())
 
-        # Should not affect the other copy or the builder (default is 3 collators)
-        assert len(pipeline2) == 3
-        assert len(builder.get_collator_pipeline()) == 3
+        # Should not affect the other copy or the builder (default is 4 collators)
+        assert len(pipeline2) == 4
+        assert len(builder.get_collator_pipeline()) == 4
 
     @patch('xorl.data.data_loader.get_parallel_state')
     @patch('xorl.data.data_loader.StatefulDistributedSampler')
