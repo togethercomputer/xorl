@@ -190,7 +190,7 @@ def group_gemm_same_nk(
 
     assert a.device == b.device, f"a.device = {a.device}, b.device = {b.device}"
 
-    assert len(cumsum_M) == b.shape[0]
+    assert len(cumsum_M) == b.shape[0], f"cumsum_M len={len(cumsum_M)}, b.shape={b.shape}, a.shape={a.shape}"
 
     assert activation is None or activation in list(ActivationType), f"Not implemented: activation is {activation}."
     assert activation or not save_activation, "Can't save activation since activation type is None"

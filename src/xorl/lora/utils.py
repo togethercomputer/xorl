@@ -15,6 +15,7 @@ import torch.nn as nn
 from safetensors.torch import save_file, load_file
 
 from xorl.lora.modules import LoraLinear
+from xorl.lora.modules.base import LoraModule
 from xorl.lora.mapping import can_apply_lora, get_lora_class_for_module
 
 logger = logging.getLogger(__name__)
@@ -119,8 +120,7 @@ def inject_lora_into_model(
 
     Supports:
     - nn.Linear -> LoraLinear
-    - Qwen3MoeSparseExperts -> Qwen3MoeSparseExpertsWithLoRA
-    - Qwen3MoeFusedExperts -> Qwen3MoeFusedExpertsWithLoRA
+    - MoEExperts (and subclasses) -> MoEExpertsLoRA
 
     Args:
         model: Model to inject LoRA into
@@ -200,7 +200,7 @@ def inject_lora_into_model(
             f"No modules could be replaced with LoRA. "
             f"Found {len(target_paths)} matching modules but none have LoRA support. "
             f"Skipped modules: {skipped_info}. "
-            f"Supported module types: nn.Linear, Qwen3MoeSparseExperts, Qwen3MoeFusedExperts"
+            f"Supported module types: nn.Linear, MoEExperts (and subclasses)"
         )
 
     if skipped_modules:
@@ -262,7 +262,11 @@ def get_lora_state_dict(
     for name, param in model.named_parameters():
         if "lora_A" in name or "lora_B" in name:
             key = f"{prefix}{name}" if prefix else name
-            lora_state_dict[key] = param.detach().cpu()
+            tensor = param.detach()
+            # Handle FSDP2 DTensors: all-gather before moving to CPU
+            if hasattr(tensor, "full_tensor"):
+                tensor = tensor.full_tensor()
+            lora_state_dict[key] = tensor.cpu()
     return lora_state_dict
 
 
@@ -601,14 +605,16 @@ def inject_lora_into_moe_blocks(
     hybrid_shared: bool = False,
 ) -> int:
     """
-    Inject LoRA adapters into fused MoE blocks.
+    Inject LoRA adapters into MoE blocks.
 
     This function finds all MoE block instances in the model that support
-    LoRA injection (Qwen3MoeSparseFusedMoeBlock) and injects LoRA adapters
-    into their expert weights.
+    LoRA injection (MoEBlock) and injects LoRA adapters into their expert
+    weights.
 
     Supported MoE implementations:
-    - moe_implementation='fused': Uses Qwen3MoeSparseFusedMoeBlock with group GEMM LoRA
+    - moe_implementation='triton': Uses Triton group GEMM kernels with LoRA
+    - moe_implementation='native': Uses torch._grouped_mm with LoRA
+    - moe_implementation='eager': Uses per-expert loop with LoRA
 
     Args:
         model: Model containing MoE blocks
@@ -641,7 +647,7 @@ def inject_lora_into_moe_blocks(
     for name, module in model.named_modules():
         # Check if this is a MoE block that supports LoRA injection
         if hasattr(module, 'inject_lora') and hasattr(module, 'lora_adapter'):
-            # This is a Qwen3MoeSparseFusedMoeBlock or similar
+            # This is a MoEBlock or similar
             module.inject_lora(
                 r=r,
                 lora_alpha=lora_alpha,
@@ -660,7 +666,7 @@ def inject_lora_into_moe_blocks(
     else:
         logger.warning(
             "No LoRA-compatible MoE blocks found. Make sure model uses "
-            "moe_implementation='fused'"
+            "moe_implementation='triton' or 'native'"
         )
 
     return injected_count
@@ -679,12 +685,12 @@ def inject_lora_into_model_with_moe(
 
     This is a comprehensive LoRA injection function that handles:
     1. Standard nn.Linear layers (attention projections, dense MLP layers)
-    2. Fused MoE expert blocks (Qwen3MoeSparseFusedMoeBlock, Qwen3MoeSparseFusedSgemmBlock)
+    2. MoE expert blocks (MoEBlock with triton/native/quack backends)
 
     For MoE models like Qwen3 MoE, some layers have dense MLP (nn.Linear modules)
     and others have MoE blocks. This function handles both cases:
     - Dense MLP layers get LoRA via inject_lora_into_model (replaces nn.Linear with LoraLinear)
-    - MoE blocks get LoRA via inject_lora_into_moe_blocks (uses fused GEMM with LoRA)
+    - MoE blocks get LoRA via inject_lora_into_moe_blocks (uses group GEMM with LoRA)
 
     Args:
         model: Model to inject LoRA into
@@ -729,7 +735,7 @@ def inject_lora_into_model_with_moe(
         )
 
     # Step 2: Inject LoRA into MoE expert blocks
-    # This handles MoE layers that have fused expert weights (not nn.Linear)
+    # This handles MoE layers that have stacked expert weights (not nn.Linear)
     if expert_modules:
         inject_lora_into_moe_blocks(
             model,
@@ -787,3 +793,26 @@ def get_all_lora_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
     lora_state.update(moe_lora_state)
 
     return lora_state
+
+
+def maybe_merge_lora(model: nn.Module) -> int:
+    """Merge LoRA deltas into base weights and reset LoRA params for all LoRA modules.
+
+    Call this between optimizer.step() and the next forward pass.
+    For normal LoRA (bf16 base weights), this merges delta into weight directly
+    and resets LoRA parameters (kaiming for A, zeros for B) so training continues.
+
+    Args:
+        model: Model with LoRA modules (LoraLinear, MoEExpertsLoRA, etc.).
+
+    Returns:
+        Number of modules merged.
+    """
+    count = 0
+    for module in model.modules():
+        if isinstance(module, LoraModule):
+            module.merge_weights()
+            count += 1
+    if count > 0:
+        logger.info(f"Merged LoRA into {count} modules (delta absorbed into base weights)")
+    return count

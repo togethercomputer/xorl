@@ -282,9 +282,14 @@ class TestSequenceShardingAlignment:
     def test_sequence_sharding_across_sp_ranks(self, mock_parallel_state):
         """Test that sequences are correctly sharded across SP ranks."""
         from xorl.data.collators import TextSequenceShardCollator
+        from xorl.data.constants import IGNORE_INDEX
 
         sp_size = 4
         sequence_length = 128
+
+        # Pre-shifted data: labels[i] = input_ids[i+1], last label = IGNORE_INDEX
+        input_ids = torch.arange(sequence_length).unsqueeze(0)
+        labels = torch.cat([torch.arange(1, sequence_length), torch.tensor([IGNORE_INDEX])]).unsqueeze(0)
 
         # Simulate sharding for each SP rank
         sharded_sequences = []
@@ -293,15 +298,15 @@ class TestSequenceShardingAlignment:
             mock_ps = Mock()
             mock_ps.sp_size = sp_size
             mock_ps.sp_rank = sp_rank
+            mock_ps.cp_size = 1
             mock_parallel_state.return_value = mock_ps
 
             collator = TextSequenceShardCollator(pad_token_id=0)
 
-            # Create a batch with a known sequence
             batch = {
-                "input_ids": torch.arange(sequence_length).unsqueeze(0),
+                "input_ids": input_ids.clone(),
                 "attention_mask": torch.ones(1, sequence_length, dtype=torch.long),
-                "labels": torch.arange(sequence_length).unsqueeze(0),
+                "labels": labels.clone(),
                 "position_ids": torch.arange(sequence_length).unsqueeze(0),
             }
 
@@ -313,13 +318,11 @@ class TestSequenceShardingAlignment:
         for rank, sharded_seq in enumerate(sharded_sequences):
             assert sharded_seq.shape[1] == expected_chunk_size, f"Rank {rank} has incorrect chunk size"
 
-        # Verify that concatenating all chunks gives the original sequence (for input_ids part before padding)
-        # Note: We need to account for padding and label shifting
-
     @patch('xorl.data.collators.sequence_shard_collator.get_parallel_state')
     def test_padding_alignment_for_sp(self, mock_parallel_state):
         """Test that padding is correctly applied to align with SP size."""
         from xorl.data.collators import TextSequenceShardCollator
+        from xorl.data.constants import IGNORE_INDEX
 
         sp_size = 4
         # Use a sequence length that's not divisible by sp_size
@@ -328,14 +331,19 @@ class TestSequenceShardingAlignment:
         mock_ps = Mock()
         mock_ps.sp_size = sp_size
         mock_ps.sp_rank = 0
+        mock_ps.cp_size = 1
         mock_parallel_state.return_value = mock_ps
 
         collator = TextSequenceShardCollator(pad_token_id=0)
 
+        # Pre-shifted data
+        input_ids = torch.arange(sequence_length).unsqueeze(0)
+        labels = torch.cat([torch.arange(1, sequence_length), torch.tensor([IGNORE_INDEX])]).unsqueeze(0)
+
         batch = {
-            "input_ids": torch.arange(sequence_length).unsqueeze(0),
+            "input_ids": input_ids,
             "attention_mask": torch.ones(1, sequence_length, dtype=torch.long),
-            "labels": torch.arange(sequence_length).unsqueeze(0),
+            "labels": labels,
             "position_ids": torch.arange(sequence_length).unsqueeze(0),
         }
 
@@ -566,6 +574,7 @@ class TestPackedSequencesDistributed:
             gradient_accumulation_steps=1,
             num_workers=0,
             prefetch_factor=None,
+            pad_to_multiple_of=1,
         )
 
         dataloader = builder.build(verbose=False)
@@ -578,12 +587,13 @@ class TestPackedSequencesDistributed:
         # Batch size should be 1 (all sequences flattened)
         assert micro_batch["input_ids"].shape[0] == 1
 
-        # Total sequence length should be 2 samples * (3 + 2) tokens = 10 tokens
-        assert micro_batch["input_ids"].shape[1] == 10
+        # After ShiftTokensCollator: each sub-sequence loses 1 token
+        # 2 samples * (2 + 1) shifted tokens = 6 tokens total
+        assert micro_batch["input_ids"].shape[1] == 6
 
         # Verify attention_mask is present
         assert "attention_mask" in micro_batch
-        assert micro_batch["attention_mask"].shape == (1, 10)
+        assert micro_batch["attention_mask"].shape == (1, 6)
 
     @patch('xorl.data.data_loader.get_parallel_state')
     @patch('xorl.data.collators.packing_concat_collator.get_parallel_state')
@@ -622,6 +632,7 @@ class TestPackedSequencesDistributed:
                 gradient_accumulation_steps=1,
                 num_workers=0,
                 prefetch_factor=None,
+                pad_to_multiple_of=1,
             )
 
             dataloader = builder.build(verbose=False)
@@ -630,8 +641,9 @@ class TestPackedSequencesDistributed:
             # Each rank should get data
             assert len(micro_batches) == 1
             assert micro_batches[0]["input_ids"].shape[0] == 1  # Batch size = 1
-            # Each micro-batch has 2 samples, each with 1 seq of 2 tokens = 4 tokens
-            assert micro_batches[0]["input_ids"].shape[1] == 4
+            # Each micro-batch has 2 samples, each with 1 seq of 2 tokens
+            # After ShiftTokensCollator: each seq becomes 1 token → 2 total
+            assert micro_batches[0]["input_ids"].shape[1] == 2
 
     @patch('xorl.data.data_loader.get_parallel_state')
     @patch('xorl.data.collators.packing_concat_collator.get_parallel_state')
@@ -664,6 +676,7 @@ class TestPackedSequencesDistributed:
         mock_ps.sp_size = sp_size
         mock_ps.sp_rank = sp_rank
         mock_ps.sp_enabled = True
+        mock_ps.cp_size = 1
         mock_ps_collator.return_value = mock_ps
         mock_ps_loader.return_value = mock_ps
         mock_ps_shard.return_value = mock_ps
@@ -749,6 +762,7 @@ class TestPackedSequencesDistributed:
             gradient_accumulation_steps=1,
             num_workers=0,
             prefetch_factor=None,
+            pad_to_multiple_of=1,
         )
 
         dataloader = builder.build(verbose=False)
@@ -757,7 +771,8 @@ class TestPackedSequencesDistributed:
         assert len(micro_batches) == 1
         micro_batch = micro_batches[0]
 
-        # First 2 samples: sample 0 (2 tokens) + sample 1 (1+2+1=4 tokens) = 6 tokens
-        assert micro_batch["input_ids"].shape == (1, 6)
+        # After ShiftTokensCollator: sample 0 (2→1 token) + sample 1 (1+2+1→1+1+1=3 tokens) = 4 tokens
+        # Note: 1-token sequences are not shifted (no valid label pair to detect)
+        assert micro_batch["input_ids"].shape == (1, 4)
         assert "attention_mask" in micro_batch
-        assert micro_batch["attention_mask"].shape == (1, 6)
+        assert micro_batch["attention_mask"].shape == (1, 4)

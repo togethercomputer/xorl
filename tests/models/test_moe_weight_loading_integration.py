@@ -56,6 +56,8 @@ class ExpertWeightBuffer:
 
     def add(self, layer_idx: int, expert_idx: int, proj: str, tensor: torch.Tensor) -> None:
         key = (layer_idx, proj)
+        # Transpose from HF nn.Linear [out, in] to (K, N) = [in, out] format
+        tensor = tensor.t().contiguous()
         if key not in self._stacked_buffers:
             stacked_shape = (self.num_experts,) + tensor.shape
             self._stacked_buffers[key] = torch.empty(
@@ -100,15 +102,15 @@ class MockFusedMoeExperts(nn.Module):
     def __init__(self, num_experts: int, hidden_size: int, intermediate_size: int):
         super().__init__()
         self.num_experts = num_experts
-        # Fused format: [num_experts, out_features, in_features]
+        # Fused format (G, K, N): [num_experts, in_features, out_features]
         self.gate_proj = nn.Parameter(
-            torch.empty(num_experts, intermediate_size, hidden_size)
+            torch.empty(num_experts, hidden_size, intermediate_size)
         )
         self.up_proj = nn.Parameter(
-            torch.empty(num_experts, intermediate_size, hidden_size)
+            torch.empty(num_experts, hidden_size, intermediate_size)
         )
         self.down_proj = nn.Parameter(
-            torch.empty(num_experts, hidden_size, intermediate_size)
+            torch.empty(num_experts, intermediate_size, hidden_size)
         )
 
 
@@ -275,9 +277,9 @@ class TestMoeWeightLoadingIntegration:
             up = loaded_weights[f"model.layers.{layer_idx}.mlp.experts.up_proj"]
             down = loaded_weights[f"model.layers.{layer_idx}.mlp.experts.down_proj"]
 
-            assert gate.shape == (num_experts, intermediate_size, hidden_size)
-            assert up.shape == (num_experts, intermediate_size, hidden_size)
-            assert down.shape == (num_experts, hidden_size, intermediate_size)
+            assert gate.shape == (num_experts, hidden_size, intermediate_size)
+            assert up.shape == (num_experts, hidden_size, intermediate_size)
+            assert down.shape == (num_experts, intermediate_size, hidden_size)
 
     def test_expert_order_preserved(self):
         """Test that expert order is preserved after merging."""
@@ -307,7 +309,7 @@ class TestMoeWeightLoadingIntegration:
 
         loaded_weights = simulate_load_model_weights(model, iter(items), num_experts)
 
-        # Verify expert order
+        # Verify expert order (values are transposed but constant, so all elements still equal)
         gate_proj = loaded_weights["model.layers.0.mlp.experts.gate_proj"]
         for expert_idx in range(num_experts):
             assert torch.all(gate_proj[expert_idx] == float(expert_idx)), \
@@ -333,7 +335,7 @@ class TestMoeWeightLoadingIntegration:
 
         # Verify shape
         gate_proj = loaded_weights["model.layers.0.mlp.experts.gate_proj"]
-        assert gate_proj.shape == (num_experts, intermediate_size, hidden_size)
+        assert gate_proj.shape == (num_experts, hidden_size, intermediate_size)
 
     def test_streaming_load_across_shards(self):
         """Test that streaming load works when experts are spread across multiple 'shards'."""
@@ -363,7 +365,7 @@ class TestMoeWeightLoadingIntegration:
         # Should still produce correct results
         for layer_idx in range(num_layers):
             gate = loaded_weights[f"model.layers.{layer_idx}.mlp.experts.gate_proj"]
-            assert gate.shape == (num_experts, intermediate_size, hidden_size)
+            assert gate.shape == (num_experts, hidden_size, intermediate_size)
 
     def test_incomplete_experts_raises_error(self):
         """Test that incomplete expert set raises an error."""
@@ -398,7 +400,7 @@ class TestMoeWeightLoadingEdgeCases:
 
         loaded_weights = simulate_load_model_weights(model, iter(state_dict.items()), 1)
 
-        assert loaded_weights["model.layers.0.mlp.experts.gate_proj"].shape == (1, 16, 8)
+        assert loaded_weights["model.layers.0.mlp.experts.gate_proj"].shape == (1, 8, 16)
 
     def test_mixed_order_loading(self):
         """Test loading when per-expert weights arrive in random order."""
@@ -440,11 +442,11 @@ class TestMoeWeightLoadingEdgeCases:
 
         loaded_weights = simulate_load_model_weights(model, iter(state_dict.items()), num_experts)
 
-        # gate and up: [num_experts, intermediate_size, hidden_size]
+        # gate and up: [num_experts, hidden_size, intermediate_size] (G, K, N)
         assert loaded_weights["model.layers.0.mlp.experts.gate_proj"].shape == \
-            (num_experts, intermediate_size, hidden_size)
-        assert loaded_weights["model.layers.0.mlp.experts.up_proj"].shape == \
-            (num_experts, intermediate_size, hidden_size)
-        # down: [num_experts, hidden_size, intermediate_size]
-        assert loaded_weights["model.layers.0.mlp.experts.down_proj"].shape == \
             (num_experts, hidden_size, intermediate_size)
+        assert loaded_weights["model.layers.0.mlp.experts.up_proj"].shape == \
+            (num_experts, hidden_size, intermediate_size)
+        # down: [num_experts, intermediate_size, hidden_size] (G, K, N)
+        assert loaded_weights["model.layers.0.mlp.experts.down_proj"].shape == \
+            (num_experts, intermediate_size, hidden_size)

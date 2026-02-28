@@ -68,9 +68,9 @@ class ServerArguments:
         metadata={"help": "Attention implementation. flash_attention_4 requires Blackwell GPU (SM100+)."}
     )
 
-    moe_implementation: Optional[Literal[None, "eager", "fused", "quack"]] = field(
+    moe_implementation: Optional[Literal[None, "eager", "triton", "native", "quack"]] = field(
         default=None,
-        metadata={"help": "MoE implementation. 'fused' uses fused MoE kernels, 'quack' uses quack kernels."}
+        metadata={"help": "MoE implementation. 'triton' uses Triton group GEMM kernels, 'native' uses torch._grouped_mm, 'quack' uses quack kernels."}
     )
 
     # Multimodal model configuration

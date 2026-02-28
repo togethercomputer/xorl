@@ -475,6 +475,7 @@ def calculate_world_size_from_config(config_path: str) -> int:
     # Get parallelism sizes (with defaults matching model_runner.py)
     ep_size = train_config.get('expert_parallel_size', 1)
     ulysses_size = train_config.get('ulysses_parallel_size', 1)
+    cp_size = train_config.get('context_parallel_size', 1)
 
     # Data parallel sizes
     dp_replicate_size = train_config.get('data_parallel_replicate_size', 1)
@@ -483,12 +484,14 @@ def calculate_world_size_from_config(config_path: str) -> int:
     # Calculate world size
     # EP creates a separate 2D mesh where: world_size = ep_size * ep_fsdp_size
     # ep_fsdp_size contains all other parallelism dimensions
-    world_size = dp_replicate_size * dp_shard_size * ulysses_size
+    world_size = dp_replicate_size * dp_shard_size * ulysses_size * cp_size
     ep_fsdp_size = world_size // ep_size
 
     logger.info(f"Calculated world size from config:")
     logger.info(f"  expert_parallel_size:         {ep_size}")
     logger.info(f"  ulysses_parallel_size:        {ulysses_size}")
+    logger.info(f"  context_parallel_size:        {cp_size}")
+    logger.info(f"  sp_fsdp_mode:                 {train_config.get('sp_fsdp_mode', 'all')}")
     logger.info(f"  data_parallel_replicate_size: {dp_replicate_size}")
     logger.info(f"  data_parallel_shard_size:     {dp_shard_size}")
     logger.info(f"  ep_fsdp_size:              {ep_fsdp_size} (dp_rep×dp_shard×ulysses / ep_size)")
@@ -1262,7 +1265,7 @@ Server Config Overrides (--server.*):
 
 Note:
   World size is ALWAYS calculated from the config file parallelism settings:
-    world_size = dp_replicate_size * dp_shard_size * ulysses_size
+    world_size = dp_replicate_size * dp_shard_size * ulysses_size * cp_size
   And EP creates a separate 2D mesh where: world_size = ep_size * ep_fsdp_size;
   ep_fsdp_size will be automatically calculated through world_size / ep_size;
   Example config:

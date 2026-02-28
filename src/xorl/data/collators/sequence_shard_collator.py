@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, Sequence
+from typing import Dict, List, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -8,6 +8,77 @@ from .base_collator import DataCollator
 from .packing_concat_collator import add_flash_attention_kwargs_from_position_ids
 from ...data.constants import IGNORE_INDEX
 from ...distributed.parallel_state import get_parallel_state
+
+
+def zigzag_reorder_packed_sequence(
+    tensor: torch.Tensor,
+    position_ids: torch.Tensor,
+    cp_size: int,
+    dim: int = -1,
+) -> torch.Tensor:
+    """Zigzag-reorder a packed sequence for context parallelism.
+
+    After reorder, a contiguous sp_slice of size total/cp_size gives each
+    CP rank balanced [early, late] sub-chunks from ALL documents.
+
+    The output is arranged as: [rank0_doc0_early, rank0_doc0_late,
+    rank0_doc1_early, rank0_doc1_late, ..., rank1_doc0_early, ...].
+    This ensures contiguous slicing assigns each rank the correct
+    sub-chunks from every document.
+
+    Args:
+        tensor: packed tensor [1, S_total] or [1, S_total, ...]
+        position_ids: position IDs [1, S_total] — used to find doc boundaries
+        cp_size: context parallel size (must be >= 2)
+        dim: sequence dimension
+
+    Returns:
+        Zigzag-reordered tensor with same shape.
+    """
+    if cp_size <= 1:
+        return tensor
+
+    if dim < 0:
+        dim = tensor.ndim + dim
+
+    seq_len = position_ids.size(dim)
+    pos_flat = position_ids.view(-1)
+
+    # Find document boundaries (where position_id == 0)
+    boundaries = (pos_flat == 0).nonzero(as_tuple=False).view(-1).tolist()
+    boundaries.append(seq_len)
+
+    n = 2 * cp_size
+
+    # Collect sub-chunk pairs per rank across all documents
+    # rank_parts[r] = [doc0_s_r, doc0_s_{2N-1-r}, doc1_s_r, doc1_s_{2N-1-r}, ...]
+    rank_parts = [[] for _ in range(cp_size)]
+
+    for i in range(len(boundaries) - 1):
+        start = boundaries[i]
+        end = boundaries[i + 1]
+        length = end - start
+
+        if length % n != 0:
+            raise ValueError(
+                f"Document at position {start} has length {length} which is not "
+                f"divisible by 2*cp_size={n}. Ensure padding aligns documents."
+            )
+
+        doc = tensor.narrow(dim, start, length)
+        chunks = list(doc.chunk(n, dim=dim))
+
+        for r in range(cp_size):
+            rank_parts[r].append(chunks[r])           # early sub-chunk
+            rank_parts[r].append(chunks[n - 1 - r])   # late sub-chunk
+
+    # Concatenate: rank 0's data first, then rank 1's, etc.
+    all_parts = []
+    for r in range(cp_size):
+        all_parts.extend(rank_parts[r])
+
+    return torch.cat(all_parts, dim=dim)
+
 
 @dataclass
 class TextSequenceShardCollator(DataCollator):
@@ -25,6 +96,7 @@ class TextSequenceShardCollator(DataCollator):
     def __post_init__(self):
         self.sp_size = get_parallel_state().sp_size
         self.sp_rank = get_parallel_state().sp_rank
+        self.cp_size = get_parallel_state().cp_size
 
     def sp_slice(self, tensor: "torch.Tensor", dim: int = -1) -> "torch.Tensor":
         """
@@ -121,9 +193,13 @@ class TextSequenceShardCollator(DataCollator):
         if "_original_position_ids" not in batch:
             batch["_original_position_ids"] = position_ids.clone()
 
-        # sp padding - pad to be divisible by sp_size
+        # sp padding - pad to be divisible by sp_size (or 2*sp_size for zigzag)
+        # With zigzag, each doc must be divisible by 2*cp_size sub-chunks,
+        # and each sub-chunk must be divisible by ulysses_size. So total
+        # sequence must be divisible by 2*cp_size*ulysses_size = 2*sp_size.
+        pad_multiple = 2 * self.sp_size if self.cp_size > 1 else self.sp_size
         seq_length = input_ids.size(-1)
-        sp_chunk_size = (seq_length + self.sp_size - 1) // self.sp_size
+        sp_chunk_size = (seq_length + pad_multiple - 1) // pad_multiple * pad_multiple // self.sp_size
         pad_length = sp_chunk_size * self.sp_size - seq_length
 
         input_ids = self.sp_padding(input_ids, dim=-1, pad_value=self.pad_token_id, pad_length=pad_length)
@@ -142,6 +218,21 @@ class TextSequenceShardCollator(DataCollator):
         position_ids = self.sp_padding(
             position_ids, dim=-1, pad_value=0, pad_length=pad_length, sequential=True
         )
+
+        # Zigzag reorder: rearrange each document's tokens so that contiguous
+        # sp_slice gives each CP rank balanced [early, late] sub-chunks.
+        # This must happen BEFORE sp_slice but AFTER padding.
+        # Save original position_ids for boundary detection (used by RL fields below).
+        original_position_ids = position_ids
+        if self.cp_size > 1:
+            input_ids = zigzag_reorder_packed_sequence(input_ids, original_position_ids, self.cp_size, dim=-1)
+            labels = zigzag_reorder_packed_sequence(labels, original_position_ids, self.cp_size, dim=-1)
+            if "attention_mask" in batch:
+                batch["attention_mask"] = zigzag_reorder_packed_sequence(
+                    batch["attention_mask"], original_position_ids, self.cp_size, dim=-1
+                )
+            # Reorder position_ids last (uses its own original values for boundaries)
+            position_ids = zigzag_reorder_packed_sequence(position_ids, original_position_ids, self.cp_size, dim=-1)
 
         # sp slice - only slice input_ids and labels, NOT position_ids
         batch["input_ids"] = self.sp_slice(input_ids, dim=-1)
@@ -171,6 +262,10 @@ class TextSequenceShardCollator(DataCollator):
                 # Determine pad value: IGNORE_INDEX for target_tokens, 0 for others
                 pad_value = IGNORE_INDEX if field == "target_tokens" else 0.0
                 field_tensor = self.sp_padding(field_tensor, dim=-1, pad_value=pad_value, pad_length=pad_length)
+                if self.cp_size > 1:
+                    field_tensor = zigzag_reorder_packed_sequence(
+                        field_tensor, original_position_ids, self.cp_size, dim=-1
+                    )
                 batch[field] = self.sp_slice(field_tensor, dim=-1)
 
         # Always (re)compute cu_seq_lens from the PADDED position_ids.

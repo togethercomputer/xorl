@@ -41,7 +41,12 @@ def _get_model_param_keys(model: torch.nn.Module) -> List[str]:
     return sorted([name for name, _ in model.named_parameters()])
 
 
-def _save_checkpoint_metadata(checkpoint_dir: str, model: torch.nn.Module, has_lora: bool = False) -> None:
+def _save_checkpoint_metadata(
+    checkpoint_dir: str,
+    model: torch.nn.Module,
+    has_lora: bool = False,
+    save_lora_only: bool = False,
+) -> None:
     """
     Save checkpoint metadata to a JSON file.
     Only rank 0 writes the metadata file.
@@ -52,10 +57,15 @@ def _save_checkpoint_metadata(checkpoint_dir: str, model: torch.nn.Module, has_l
     param_keys = _get_model_param_keys(model)
     lora_keys = [k for k in param_keys if "lora" in k.lower()]
 
+    if save_lora_only:
+        # Only LoRA keys are actually saved
+        param_keys = lora_keys
+
     metadata = {
         "num_parameters": len(param_keys),
         "has_lora": has_lora or len(lora_keys) > 0,
         "num_lora_parameters": len(lora_keys),
+        "save_lora_only": save_lora_only,
         "parameter_keys": param_keys,
     }
 
@@ -106,6 +116,9 @@ def _validate_checkpoint_compatibility(
     # Keys in checkpoint but not in model (e.g., removed params)
     unexpected_in_ckpt = ckpt_keys - model_keys
 
+    # Check if checkpoint was saved with save_lora_only
+    ckpt_lora_only = ckpt_metadata.get("save_lora_only", False)
+
     # Check if mismatch is LoRA-related
     missing_lora_keys = [k for k in missing_in_ckpt if "lora" in k.lower()]
     missing_non_lora_keys = [k for k in missing_in_ckpt if "lora" not in k.lower()]
@@ -113,6 +126,7 @@ def _validate_checkpoint_compatibility(
     result = {
         "validated": True,
         "checkpoint_has_lora": ckpt_metadata.get("has_lora", False),
+        "checkpoint_lora_only": ckpt_lora_only,
         "model_has_lora": any("lora" in k.lower() for k in model_keys),
         "missing_in_checkpoint": list(missing_in_ckpt),
         "unexpected_in_checkpoint": list(unexpected_in_ckpt),
@@ -123,6 +137,16 @@ def _validate_checkpoint_compatibility(
 
     # Log validation results
     if missing_in_ckpt or unexpected_in_ckpt:
+        # LoRA-only checkpoint: missing non-LoRA keys are expected
+        if ckpt_lora_only and len(missing_non_lora_keys) > 0 and len(unexpected_in_ckpt) == 0:
+            logger.info(
+                f"Loading LoRA-only checkpoint (save_lora_only=True). "
+                f"Non-LoRA parameters ({len(missing_non_lora_keys)} keys) will keep their current values."
+            )
+            result["load_mode"] = "lora_only"
+            result["compatible"] = True
+            return result
+
         logger.warning(
             f"Checkpoint compatibility check:\n"
             f"  - Missing in checkpoint: {len(missing_in_ckpt)} keys "
@@ -155,11 +179,14 @@ class ModelState(Stateful):
         model (Model): model to wrap.
         exclude_keys (Set[str]): Optional set of parameter keys to exclude from state_dict.
                                  Used when loading base checkpoint into LoRA model.
+        save_lora_only (bool): If True, only save LoRA parameters (lora_A, lora_B).
+                               Used when merge_lora_interval == 0 (base weights unchanged).
     """
 
-    def __init__(self, model, exclude_keys: Optional[Set[str]] = None):
+    def __init__(self, model, exclude_keys: Optional[Set[str]] = None, save_lora_only: bool = False):
         self.model = model
         self.exclude_keys = exclude_keys or set()
+        self.save_lora_only = save_lora_only
 
         # Determine whether this is EP+FSDP2 case
         # If so, we need to restore EP-dim before saving to DCP
@@ -179,6 +206,11 @@ class ModelState(Stateful):
         # Filter out excluded keys (e.g., LoRA params when loading base checkpoint)
         if self.exclude_keys:
             model_state_dict = {k: v for k, v in model_state_dict.items() if k not in self.exclude_keys}
+
+        # LoRA-only save: keep only lora_A/lora_B parameters
+        if self.save_lora_only:
+            model_state_dict = {k: v for k, v in model_state_dict.items() if "lora_" in k}
+            logger.info_rank0(f"LoRA-only save: keeping {len(model_state_dict)} LoRA parameters")
 
         return model_state_dict
 
@@ -437,6 +469,7 @@ class DistributedCheckpointer(CheckpointerBase):
         state: Dict[str, Any],
         save_async: bool = False,
         global_steps: int = None,
+        save_lora_only: bool = False,
     ) -> None:
         """
         save training state to distributed checkpoint
@@ -445,6 +478,7 @@ class DistributedCheckpointer(CheckpointerBase):
             path: path to save checkpoint
             state: state to save
             global_steps: global steps
+            save_lora_only: if True, only save LoRA parameters (for merge_lora_interval==0)
         return:
             None
         """
@@ -465,7 +499,7 @@ class DistributedCheckpointer(CheckpointerBase):
         if "model" not in state:
             raise ValueError("Model must be provided to save a distributed checkpoint.")
 
-        save_state = {"model": ModelState(state["model"])}
+        save_state = {"model": ModelState(state["model"], save_lora_only=save_lora_only)}
         if "optimizer" in state:
             save_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])  # type: ignore[index]
 
@@ -522,7 +556,7 @@ class DistributedCheckpointer(CheckpointerBase):
         torch.cuda.synchronize()
 
         # Save checkpoint metadata for compatibility validation
-        _save_checkpoint_metadata(checkpoint_dir, state["model"])
+        _save_checkpoint_metadata(checkpoint_dir, state["model"], save_lora_only=save_lora_only)
 
         logger.info_rank0(f"Saved checkpoint to {checkpoint_dir}")
 
@@ -557,11 +591,20 @@ class DistributedCheckpointer(CheckpointerBase):
 
         # Determine keys to exclude from loading (e.g., LoRA params not in checkpoint)
         exclude_keys: Set[str] = set()
-        if validation_result.get("validated") and validation_result.get("load_mode") == "base_to_lora":
+        load_mode = validation_result.get("load_mode")
+        if validation_result.get("validated") and load_mode == "base_to_lora":
             # Loading base checkpoint into LoRA model - exclude LoRA params from model state
             # so DCP doesn't try to load them from checkpoint
             exclude_keys = set(validation_result.get("missing_lora_keys", []))
             logger.info_rank0(f"Excluding {len(exclude_keys)} LoRA parameters from checkpoint load")
+        elif validation_result.get("validated") and load_mode == "lora_only":
+            # Loading LoRA-only checkpoint — exclude all non-LoRA keys from model state
+            # so DCP only loads the LoRA parameters.
+            # Must use get_model_state_dict() to capture both params AND buffers
+            # (e.g., weight_block_scales, weight_global_scale from QLoRA).
+            all_model_keys = set(get_model_state_dict(model=state["model"]).keys())
+            exclude_keys = {k for k in all_model_keys if "lora_" not in k}
+            logger.info_rank0(f"LoRA-only checkpoint: excluding {len(exclude_keys)} non-LoRA keys from load")
 
         load_state = {"model": ModelState(state["model"], exclude_keys=exclude_keys)}
         if "optimizer" in state and state["optimizer"] is not None:

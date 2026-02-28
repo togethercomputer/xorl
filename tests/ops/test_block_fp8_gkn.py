@@ -14,11 +14,10 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 
 class TestBlockFP8QuantizeGKN:
-    """Correctness tests for block_fp8_quantize_gkn: shapes, accuracy, edge cases."""
+    """Correctness tests for block_fp8_quantize_gkn."""
 
-    def test_quantize_shapes_accuracy_and_edge_cases(self):
-        """Output shapes, roundtrip accuracy (f32/bf16), non-divisible shapes, zeros, scale ranges, large matrix."""
-        # Basic output shapes
+    def test_output_shapes(self):
+        """Quantized weight and scales should have correct shapes."""
         K, N = 512, 256
         x = torch.randn(K, N, device="cuda", dtype=torch.float32)
         y, s = block_fp8_quantize_gkn(x, block_size=128)
@@ -27,61 +26,81 @@ class TestBlockFP8QuantizeGKN:
         assert s.shape == (triton.cdiv(K, 128), triton.cdiv(N, 128))
         assert s.dtype == torch.float32
 
-        # Roundtrip accuracy (f32)
+    def test_roundtrip_accuracy(self):
+        """Quant -> dequant roundtrip should have low relative error."""
+        K, N = 512, 256
+        x = torch.randn(K, N, device="cuda", dtype=torch.float32)
+        y, s = block_fp8_quantize_gkn(x, block_size=128)
+        x_deq = block_fp8_dequantize_gkn(y, s, block_size=128)
+
+        rel_err = (x - x_deq).abs().mean() / x.abs().mean()
+        assert rel_err < 0.03, f"Roundtrip relative error {rel_err:.4f} too high (expected < 0.03)"
+
+    def test_roundtrip_bf16_input(self):
+        """Should work with bf16 input (internally casts to float32)."""
+        K, N = 256, 256
+        x = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
+        y, s = block_fp8_quantize_gkn(x.float(), block_size=128)
+        x_deq = block_fp8_dequantize_gkn(y, s, block_size=128)
+
+        rel_err = (x.float() - x_deq).abs().mean() / x.float().abs().mean()
+        assert rel_err < 0.03, f"Roundtrip relative error {rel_err:.4f} too high"
+
+    def test_non_divisible_shapes(self):
+        """Should handle shapes not perfectly divisible by block_size via masking."""
+        K, N = 384, 256
+        x = torch.randn(K, N, device="cuda", dtype=torch.float32)
+        y, s = block_fp8_quantize_gkn(x, block_size=128)
+        x_deq = block_fp8_dequantize_gkn(y, s, block_size=128)
+
+        rel_err = (x - x_deq).abs().mean() / x.abs().mean()
+        assert rel_err < 0.03
+
+    def test_non_divisible_both_dims(self):
+        """Both K and N not multiples of 128."""
+        K, N = 300, 200
+        x = torch.randn(K, N, device="cuda", dtype=torch.float32)
+        y, s = block_fp8_quantize_gkn(x, block_size=128)
+        assert y.shape == (K, N)
+        assert s.shape == (triton.cdiv(K, 128), triton.cdiv(N, 128))
+
         x_deq = block_fp8_dequantize_gkn(y, s, block_size=128)
         rel_err = (x - x_deq).abs().mean() / x.abs().mean()
-        assert rel_err < 0.03, f"f32 roundtrip rel error {rel_err:.4f} too high"
+        assert rel_err < 0.03
 
-        # Roundtrip accuracy (bf16 input)
-        K2, N2 = 256, 256
-        x_bf = torch.randn(K2, N2, device="cuda", dtype=torch.bfloat16)
-        y_bf, s_bf = block_fp8_quantize_gkn(x_bf.float(), block_size=128)
-        x_deq_bf = block_fp8_dequantize_gkn(y_bf, s_bf, block_size=128)
-        rel_err_bf = (x_bf.float() - x_deq_bf).abs().mean() / x_bf.float().abs().mean()
-        assert rel_err_bf < 0.03
+    def test_zero_block(self):
+        """A block of all zeros should produce zero quantized values."""
+        K, N = 128, 128
+        x = torch.zeros(K, N, device="cuda", dtype=torch.float32)
+        y, s = block_fp8_quantize_gkn(x, block_size=128)
+        x_deq = block_fp8_dequantize_gkn(y, s, block_size=128)
+        assert (x_deq == 0).all()
 
-        # Non-divisible shapes (one dim)
-        K3, N3 = 384, 256
-        x3 = torch.randn(K3, N3, device="cuda", dtype=torch.float32)
-        y3, s3 = block_fp8_quantize_gkn(x3, block_size=128)
-        x3_deq = block_fp8_dequantize_gkn(y3, s3, block_size=128)
-        assert (x3 - x3_deq).abs().mean() / x3.abs().mean() < 0.03
+    def test_scale_values_reasonable(self):
+        """Per-block scales should be positive and reasonable."""
+        K, N = 256, 256
+        x = torch.randn(K, N, device="cuda", dtype=torch.float32) * 3.0
+        _, s = block_fp8_quantize_gkn(x, block_size=128)
+        assert (s > 0).all(), "All scales should be positive"
+        assert s.max().item() < 1.0, f"Scale too large: {s.max().item()}"
+        assert s.min().item() > 1e-12, f"Scale too small: {s.min().item()}"
 
-        # Non-divisible both dims
-        K4, N4 = 300, 200
-        x4 = torch.randn(K4, N4, device="cuda", dtype=torch.float32)
-        y4, s4 = block_fp8_quantize_gkn(x4, block_size=128)
-        assert y4.shape == (K4, N4)
-        assert s4.shape == (triton.cdiv(K4, 128), triton.cdiv(N4, 128))
-        x4_deq = block_fp8_dequantize_gkn(y4, s4, block_size=128)
-        assert (x4 - x4_deq).abs().mean() / x4.abs().mean() < 0.03
+    def test_large_matrix(self):
+        """Test with a large realistic weight shape."""
+        K, N = 4096, 4096
+        x = torch.randn(K, N, device="cuda", dtype=torch.float32)
+        y, s = block_fp8_quantize_gkn(x, block_size=128)
+        x_deq = block_fp8_dequantize_gkn(y, s, block_size=128)
 
-        # Zero block
-        x_z = torch.zeros(128, 128, device="cuda", dtype=torch.float32)
-        y_z, s_z = block_fp8_quantize_gkn(x_z, block_size=128)
-        x_z_deq = block_fp8_dequantize_gkn(y_z, s_z, block_size=128)
-        assert (x_z_deq == 0).all()
-
-        # Scale value ranges
-        x5 = torch.randn(256, 256, device="cuda", dtype=torch.float32) * 3.0
-        _, s5 = block_fp8_quantize_gkn(x5, block_size=128)
-        assert (s5 > 0).all()
-        assert s5.max().item() < 1.0
-        assert s5.min().item() > 1e-12
-
-        # Large matrix
-        K6, N6 = 4096, 4096
-        x6 = torch.randn(K6, N6, device="cuda", dtype=torch.float32)
-        y6, s6 = block_fp8_quantize_gkn(x6, block_size=128)
-        x6_deq = block_fp8_dequantize_gkn(y6, s6, block_size=128)
-        assert (x6 - x6_deq).abs().mean() / x6.abs().mean() < 0.03
+        rel_err = (x - x_deq).abs().mean() / x.abs().mean()
+        assert rel_err < 0.03
 
 
 class TestBlockFP8DequantizeGKN:
-    """Correctness tests for block_fp8_dequantize_gkn: shape, dtype, input requirements."""
+    """Correctness tests for block_fp8_dequantize_gkn."""
 
-    def test_dequantize_output_and_requirements(self):
-        """Output shape/dtype, contiguity requirement, 2D requirement."""
+    def test_output_shape_and_dtype(self):
+        """Dequantized output should have correct shape and default dtype."""
         K, N = 256, 512
         x = torch.randn(K, N, device="cuda", dtype=torch.float32)
         y, s = block_fp8_quantize_gkn(x, block_size=128)
@@ -89,14 +108,16 @@ class TestBlockFP8DequantizeGKN:
         assert x_deq.shape == (K, N)
         assert x_deq.dtype == torch.get_default_dtype()
 
-        # Non-contiguous input should fail
-        K2, N2 = 256, 256
-        x2 = torch.randn(K2, N2, device="cuda", dtype=torch.float32)
-        y2, s2 = block_fp8_quantize_gkn(x2, block_size=128)
+    def test_requires_contiguous(self):
+        """Should assert on non-contiguous input."""
+        K, N = 256, 256
+        x = torch.randn(K, N, device="cuda", dtype=torch.float32)
+        y, s = block_fp8_quantize_gkn(x, block_size=128)
         with pytest.raises(AssertionError):
-            block_fp8_dequantize_gkn(y2.t(), s2, block_size=128)
+            block_fp8_dequantize_gkn(y.t(), s, block_size=128)
 
-        # Non-2D input should fail
+    def test_requires_2d(self):
+        """Should assert on non-2D input."""
         with pytest.raises(AssertionError):
             block_fp8_dequantize_gkn(
                 torch.zeros(8, 128, 128, device="cuda", dtype=torch.float8_e4m3fn),
@@ -113,15 +134,14 @@ class TestBlockFP8DequantizeGKN:
 class TestBlockFP8GKNBandwidth:
     """Bandwidth tests targeting >2000 GB/s on H100."""
 
-    def test_quantize_dequantize_gkn_bandwidth(self):
-        """Measure quantize and dequantize bandwidth."""
+    def test_quantize_gkn_bandwidth(self):
         K, N = 4096, 4096
         x = torch.randn(K, N, device="cuda", dtype=torch.float32)
-
-        # --- Quantize bandwidth ---
+        # Warmup (also triggers autotuning)
         for _ in range(10):
             block_fp8_quantize_gkn(x)
         torch.cuda.synchronize()
+        # Measure
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
@@ -130,25 +150,29 @@ class TestBlockFP8GKNBandwidth:
         end.record()
         torch.cuda.synchronize()
         elapsed_ms = start.elapsed_time(end) / 100
-        total_bytes = K * N * (4 + 1)
-        bw_quant = total_bytes / (elapsed_ms * 1e-3) / 1e9
-        print(f"\nblock_fp8_quantize_gkn: {bw_quant:.0f} GB/s ({elapsed_ms*1000:.1f} us)")
-        assert bw_quant > 2000, f"Quant bandwidth {bw_quant:.0f} GB/s < 2000 GB/s"
+        total_bytes = K * N * (4 + 1)  # read f32 + write fp8
+        bandwidth_gbs = total_bytes / (elapsed_ms * 1e-3) / 1e9
+        print(f"\nblock_fp8_quantize_gkn: {bandwidth_gbs:.0f} GB/s ({elapsed_ms*1000:.1f} us)")
+        assert bandwidth_gbs > 2000, f"Bandwidth {bandwidth_gbs:.0f} GB/s < 2000 GB/s"
 
-        # --- Dequantize bandwidth ---
+    def test_dequantize_gkn_bandwidth(self):
+        K, N = 4096, 4096
+        x = torch.randn(K, N, device="cuda", dtype=torch.float32)
         y, s = block_fp8_quantize_gkn(x)
+        # Warmup
         for _ in range(10):
             block_fp8_dequantize_gkn(y, s)
         torch.cuda.synchronize()
-        start2 = torch.cuda.Event(enable_timing=True)
-        end2 = torch.cuda.Event(enable_timing=True)
-        start2.record()
+        # Measure
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
         for _ in range(100):
             block_fp8_dequantize_gkn(y, s)
-        end2.record()
+        end.record()
         torch.cuda.synchronize()
-        elapsed_ms2 = start2.elapsed_time(end2) / 100
-        total_bytes2 = K * N * (1 + 4)
-        bw_dequant = total_bytes2 / (elapsed_ms2 * 1e-3) / 1e9
-        print(f"\nblock_fp8_dequantize_gkn: {bw_dequant:.0f} GB/s ({elapsed_ms2*1000:.1f} us)")
-        assert bw_dequant > 2000, f"Dequant bandwidth {bw_dequant:.0f} GB/s < 2000 GB/s"
+        elapsed_ms = start.elapsed_time(end) / 100
+        total_bytes = K * N * (1 + 4)  # read fp8 + write f32
+        bandwidth_gbs = total_bytes / (elapsed_ms * 1e-3) / 1e9
+        print(f"\nblock_fp8_dequantize_gkn: {bandwidth_gbs:.0f} GB/s ({elapsed_ms*1000:.1f} us)")
+        assert bandwidth_gbs > 2000, f"Bandwidth {bandwidth_gbs:.0f} GB/s < 2000 GB/s"

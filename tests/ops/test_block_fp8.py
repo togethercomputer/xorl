@@ -10,10 +10,10 @@ import numpy as np
 
 # Try to import the block_fp8 module
 try:
-    from xorl.ops.block_fp8.kernel import (
-        block_fp8_quant,
-        block_fp8_dequant,
-        block_fp8_weight_dequant,
+    from xorl.ops.quantize import (
+        block_fp8_quantize as block_fp8_quant,
+        block_fp8_dequantize as block_fp8_dequant,
+        block_fp8_dequantize_gkn as block_fp8_weight_dequant,
         block_fp8_gemm,
     )
     HAS_BLOCK_FP8 = True
@@ -87,16 +87,6 @@ class TestBlockFP8Quant:
         # Scale should be 1.0 (448 / 448)
         assert torch.allclose(s, torch.ones_like(s), atol=1e-5)
 
-    def test_quantization_zero_input(self):
-        """Test quantization with zero input."""
-        x = torch.zeros(2, 256, device="cuda", dtype=torch.float32)
-        y, s = block_fp8_quant(x, block_size=128)
-
-        # With zero input, scale will be 0 which causes NaN during quantization
-        # This is expected behavior - skip this test or mark as known issue
-        # In practice, zeros are handled by adding epsilon or checking for zero blocks
-        pytest.skip("Zero input causes NaN due to division by zero - known limitation")
-
     def test_quantization_requires_contiguous(self):
         """Test that quantization requires contiguous tensors."""
         x = torch.randn(4, 256, device="cuda", dtype=torch.float32)
@@ -147,15 +137,6 @@ class TestBlockFP8Dequant:
 
         assert mean_error < 0.05  # Less than 5% mean relative error
 
-    def test_dequantization_preserves_zeros(self):
-        """Test that zero values are preserved."""
-        x_orig = torch.zeros(2, 128, device="cuda", dtype=torch.float32)
-        y, s = block_fp8_quant(x_orig, block_size=128)
-        x_dequant = block_fp8_dequant(y, s, block_size=128)
-
-        # Zero input causes NaN - skip this test
-        pytest.skip("Zero input causes NaN due to division by zero - known limitation")
-
     def test_dequantization_roundtrip_different_shapes(self):
         """Test roundtrip with different tensor shapes."""
         shapes = [
@@ -185,71 +166,8 @@ class TestBlockFP8Dequant:
             block_fp8_dequant(y_transposed, s, block_size=128)
 
 
-class TestBlockFP8WeightDequant:
-    """Test suite for block_fp8_weight_dequant function (2D dequantization)."""
-
-    @pytest.mark.skip(reason="2D weight dequant expects specific format - needs more investigation")
-    def test_basic_2d_dequantization(self):
-        """Test basic 2D weight dequantization."""
-        # This API expects 2D block quantized weights which require special setup
-        # Skip for now until we understand the exact quantization format
-        pass
-
-    @pytest.mark.skip(reason="2D weight dequant expects specific format - needs more investigation")
-    def test_2d_dequant_requires_2d_tensors(self):
-        """Test that weight dequant requires 2D tensors."""
-        pass
-
-    @pytest.mark.skip(reason="2D weight dequant expects specific format - needs more investigation")
-    def test_2d_dequant_scale_shape_validation(self):
-        """Test that scale tensor has correct shape."""
-        pass
-
-    @pytest.mark.skip(reason="2D weight dequant expects specific format - needs more investigation")
-    def test_2d_dequant_non_square_matrices(self):
-        """Test 2D dequantization with non-square matrices."""
-        pass
-
-
-class TestBlockFP8GEMM:
-    """Test suite for block_fp8_gemm function."""
-
-    @pytest.mark.skip(reason="GEMM requires specific 2D block quantization format incompatible with block_fp8_quant")
-    def test_basic_gemm(self):
-        """Test basic FP8 GEMM operation."""
-        # block_fp8_quant produces scales with shape (M, K//block_size)
-        # but block_fp8_gemm expects scales with shape (M//block_size, K//block_size)
-        # These are different quantization schemes - need custom quant function for GEMM
-        pass
-
-    @pytest.mark.skip(reason="GEMM requires specific 2D block quantization format")
-    def test_gemm_with_batched_input(self):
-        """Test GEMM with batched activation tensor."""
-        pass
-
-    @pytest.mark.skip(reason="GEMM requires specific 2D block quantization format")
-    def test_gemm_accuracy_vs_fp32(self):
-        """Test that FP8 GEMM is reasonably accurate compared to FP32."""
-        pass
-
-    @pytest.mark.skip(reason="GEMM requires specific 2D block quantization format")
-    def test_gemm_requires_contiguous(self):
-        """Test that GEMM requires contiguous tensors."""
-        pass
-
-    @pytest.mark.skip(reason="GEMM requires specific 2D block quantization format")
-    def test_gemm_different_sizes(self):
-        """Test GEMM with various matrix sizes."""
-        pass
-
-
 class TestBlockFP8Integration:
     """Integration tests for full quantization workflow."""
-
-    @pytest.mark.skip(reason="Depends on GEMM which requires different quantization format")
-    def test_full_quantization_workflow(self):
-        """Test complete workflow: quantize -> compute -> dequantize."""
-        pass
 
     def test_quantization_determinism(self):
         """Test that quantization is deterministic."""

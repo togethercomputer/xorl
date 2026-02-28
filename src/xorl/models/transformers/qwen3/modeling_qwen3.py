@@ -10,7 +10,7 @@ from ...layers.attention import (
     update_causal_mask,
 )
 from ...base import XorlPreTrainedModel
-from ...outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, CausalLMOutputWithPastAndLastHiddenState, ModelOutput
+from ...outputs import BaseModelOutput, CausalLMOutput, ModelOutput
 from .configuration_qwen3 import Qwen3Config
 
 from ....distributed.parallel_state import get_parallel_state
@@ -34,12 +34,23 @@ class Qwen3MLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
         self._use_fused_silu = config.hidden_act == "silu"
 
+    def unfuse_for_tp(self):
+        """Replace fused gate_up_proj with separate gate_proj and up_proj for tensor parallelism."""
+        device = self.gate_up_proj.weight.device
+        dtype = self.gate_up_proj.weight.dtype
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False, device=device, dtype=dtype)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False, device=device, dtype=dtype)
+        del self.gate_up_proj
+
     def forward(self, x):
-        if self._use_fused_silu:
-            x = fused_silu_and_mul(self.gate_up_proj(x))
+        if hasattr(self, "gate_up_proj"):
+            if self._use_fused_silu:
+                x = fused_silu_and_mul(self.gate_up_proj(x))
+            else:
+                gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+                x = self.act_fn(gate) * up
         else:
-            gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
-            x = self.act_fn(gate) * up
+            x = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
         return self.down_proj(x)
 
 
@@ -129,14 +140,42 @@ class Qwen3PreTrainedModel(XorlPreTrainedModel):
                 module.weight.data[module.padding_idx].zero_()
         elif isinstance(module, RMSNorm):
             module.weight.data.fill_(1.0)
+        elif isinstance(module, RotaryEmbedding):
+            # Recompute inv_freq buffer from config (RotaryEmbedding has no reset_parameters)
+            inv_freq, module.attention_scaling = module.rope_init_fn(module.config, module.inv_freq.device)
+            module.inv_freq.copy_(inv_freq)
+            module.original_inv_freq = module.inv_freq
 
     def get_checkpoint_handler(self, **kwargs):
-        from ...checkpoint_handlers import Qwen3CheckpointHandler
+        # When unfused for TP, checkpoint keys (q_proj, k_proj, v_proj, gate_proj,
+        # up_proj) already match the model's parameter names — no merging needed.
+        if getattr(self, "_unfused_for_tp", False):
+            return None
+        from .checkpoint_handler import Qwen3CheckpointHandler
+        from ...checkpoint_handlers.buffers import (
+            detect_prequantized_checkpoint,
+            detect_prequantized_block_fp8_checkpoint,
+            get_prequantized_exclude_modules,
+        )
+
+        weights_path = kwargs.get("weights_path", None)
+        is_prequantized = detect_prequantized_checkpoint(weights_path)
+        if not is_prequantized:
+            is_prequantized = detect_prequantized_block_fp8_checkpoint(weights_path)
+
+        # Use user-specified exclude_modules (stored by train.py) if available,
+        # otherwise auto-detect from checkpoint config.
+        exclude_modules = getattr(self, "_qlora_exclude_modules", None)
+        if exclude_modules is None:
+            exclude_modules = get_prequantized_exclude_modules(weights_path) if is_prequantized else set()
+
         head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
         return Qwen3CheckpointHandler(
             num_attention_heads=self.config.num_attention_heads,
             num_key_value_heads=self.config.num_key_value_heads,
             head_dim=head_dim,
+            is_prequantized=is_prequantized,
+            exclude_modules=exclude_modules,
         )
 
 
@@ -161,6 +200,10 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self.rotary_emb = RotaryEmbedding(config=config)
 
         self.gradient_checkpointing = False
+        # Whether this attention impl handles causal masking internally (flash/sdpa)
+        self._skip_causal_mask = is_flash_attention(config._attn_implementation)
+        # Cached position tensor to avoid torch.arange every forward
+        self._cached_position = None
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -182,38 +225,45 @@ class Qwen3Model(Qwen3PreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **flash_attn_kwargs: Unpack[AttentionKwargs],
-    ) -> Union[Tuple, BaseModelOutputWithPast]:
+    ) -> Union[Tuple, BaseModelOutput]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+        # PP support: when embed_tokens is None, input is already hidden_states
+        if self.embed_tokens is not None:
+            if (input_ids is None) ^ (inputs_embeds is not None):
+                raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+            if inputs_embeds is None:
+                inputs_embeds = self.embed_tokens(input_ids)
+            hidden_states = inputs_embeds
+        else:
+            # Middle/last PP stage: input_ids is actually hidden_states from previous stage
+            hidden_states = input_ids if inputs_embeds is None else inputs_embeds
 
         if cache_position is None:
-            cache_position = torch.arange(
-                0, inputs_embeds.shape[1], device=inputs_embeds.device
-            )
+            seq_len = hidden_states.shape[1]
+            if self._cached_position is None or self._cached_position.shape[0] != seq_len or self._cached_position.device != hidden_states.device:
+                self._cached_position = torch.arange(seq_len, device=hidden_states.device)
+            cache_position = self._cached_position
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = update_causal_mask(
-            self.config._attn_implementation,
-            attention_mask,
-            inputs_embeds,
-            cache_position,
-            sliding_window=self.config.sliding_window,
-            is_training=self.training,
-            output_attentions=output_attentions,
-        )
-
-        hidden_states = inputs_embeds
+        if self._skip_causal_mask:
+            causal_mask = None
+        else:
+            causal_mask = update_causal_mask(
+                self.config._attn_implementation,
+                attention_mask,
+                hidden_states,
+                cache_position,
+                sliding_window=self.config.sliding_window,
+                is_training=self.training,
+                output_attentions=output_attentions,
+            )
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -225,13 +275,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
         )
 
         # decoder layers
-        all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
+        for decoder_layer in self.layers:
             layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
@@ -247,15 +293,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
-        hidden_states = self.norm(hidden_states)
+        # PP support: norm may be None on non-last stages
+        hidden_states = self.norm(hidden_states) if self.norm is not None else hidden_states
 
-        # add hidden states from the last decoder layer
-        if output_hidden_states:
-            all_hidden_states += (hidden_states,)
-
-        output = BaseModelOutputWithPast(
+        output = BaseModelOutput(
             last_hidden_state=hidden_states,
-            hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
         return output if return_dict else output.to_tuple()
@@ -266,8 +308,9 @@ class KwargsForCausalLM(AttentionKwargs): ...
 
 class Qwen3ForCausalLM(Qwen3PreTrainedModel):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-    _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+
+    from .parallelize import MODEL_TP_PLAN as _tp_plan
 
     def __init__(self, config):
         super().__init__(config)
@@ -278,6 +321,11 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def unfuse_for_tp(self):
+        """Unfuse all fused projections for tensor parallelism compatibility."""
+        from .parallelize import unfuse_for_tp
+        unfuse_for_tp(self)
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -297,6 +345,16 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel):
     def get_decoder(self):
         return self.model
 
+    def get_pp_module_config(self):
+        """Return PP module config for pipeline_module_split."""
+        return {
+            "input_fqns": ["model.embed_tokens"],
+            "layer_prefix": "model.layers",
+            "output_fqns": ["model.norm", "lm_head"],
+            "always_keep_fqns": ["model.rotary_emb"],
+            "num_layers": self.config.num_hidden_layers,
+        }
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -310,7 +368,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: Unpack[KwargsForCausalLM],
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+    ) -> Union[Tuple, CausalLMOutput]:
         r"""
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
                 Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
@@ -348,7 +406,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs: BaseModelOutputWithPast = self.model(
+        outputs: BaseModelOutput = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -363,6 +421,17 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel):
         # Get last hidden state from base model (always available, no need for output_hidden_states=True)
         last_hidden_state = outputs.last_hidden_state
 
+        # PP support: lm_head may be None on non-last stages
+        if self.lm_head is None:
+            # Non-last PP stage: return hidden_states directly
+            output = CausalLMOutput(
+                loss=None,
+                logits=None,
+                attentions=outputs.attentions,
+                last_hidden_state=last_hidden_state,
+            )
+            return output if return_dict else output.to_tuple()
+
         # Only compute loss/logits if labels are provided
         # This saves computation when only hidden states are needed (e.g., for custom loss functions)
         loss = None
@@ -371,11 +440,15 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel):
             # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
             slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
             hidden_states = last_hidden_state[:, slice_indices, :]
-            loss, logits, _, _ = self.loss_function(hidden_states, self.lm_head.weight, labels)
+            ps = get_parallel_state()
+            loss, logits, _, _ = self.loss_function(
+                hidden_states, self.lm_head.weight, labels,
+                tp_group=ps.tp_group if ps.tp_enabled else None,
+            )
 
         # Return extended output that includes last_hidden_state
         # This allows callers to access last layer hidden states without output_hidden_states=True
-        output = CausalLMOutputWithPastAndLastHiddenState(
+        output = CausalLMOutput(
             loss=loss,
             logits=logits,
             attentions=outputs.attentions,

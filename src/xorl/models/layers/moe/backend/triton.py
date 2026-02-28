@@ -2,7 +2,7 @@
 
 import torch
 
-from xorl.ops.moe.triton import triton_moe_forward
+from xorl.ops import moe_experts_forward
 
 
 def triton_expert_forward(
@@ -33,7 +33,7 @@ def triton_expert_forward(
     Returns:
         Output tensor ``(num_tokens, hidden_dim)``.
     """
-    return triton_moe_forward(
+    return moe_experts_forward(
         module=None,
         num_experts=num_experts,
         routing_weights=routing_weights,

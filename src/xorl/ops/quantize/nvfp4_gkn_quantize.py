@@ -60,9 +60,8 @@ def _nvfp4_quantize_gkn_kernel(
     inv_amax = 6.0 / amax_val[None, :]  # [1, TN]
     scaled_even = x_even * inv_amax  # [BS//2, TN]
     scaled_odd = x_odd * inv_amax  # [BS//2, TN]
-    scaled_even = tl.minimum(tl.maximum(scaled_even, -6.0), 6.0)
-    scaled_odd = tl.minimum(tl.maximum(scaled_odd, -6.0), 6.0)
 
+    # FP4 encode (element-wise, works directly on 2D)
     codes_even = _fp4_encode(scaled_even)
     codes_odd = _fp4_encode(scaled_odd)
 

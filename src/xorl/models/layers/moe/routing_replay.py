@@ -43,25 +43,18 @@ class RoutingReplay:
         self.top_indices_list: List[torch.Tensor] = []  # CPU pinned
         RoutingReplay._instances.append(self)
 
-    @torch.compiler.disable
     def record(self, selected_experts: torch.Tensor):
-        """Append routing decision (CPU pinned copy).
-
-        Disabled for torch.compile — pin_memory and list-append side
-        effects are not supported by Inductor/Dynamo.
-        """
+        """Append routing decision (CPU pinned copy)."""
         buf = torch.empty_like(selected_experts, device="cpu", pin_memory=True)
         buf.copy_(selected_experts)
         self.top_indices_list.append(buf)
 
-    @torch.compiler.disable
     def pop_forward(self) -> torch.Tensor:
         """Read routing for forward replay, advance forward_index."""
         idx = self.top_indices_list[self.forward_index]
         self.forward_index += 1
         return idx.to(torch.cuda.current_device(), non_blocking=True)
 
-    @torch.compiler.disable
     def pop_backward(self) -> torch.Tensor:
         """Read routing for checkpoint recompute, advance backward_index."""
         idx = self.top_indices_list[self.backward_index]
@@ -108,24 +101,3 @@ def get_replay_stage() -> Optional[str]:
 def set_replay_stage(stage: Optional[str]) -> None:
     global _replay_stage
     _replay_stage = stage
-
-
-# ---------------------------------------------------------------------------
-# R3 (Rollout Routing Replay) mode
-# ---------------------------------------------------------------------------
-# When R3 is active, routing decisions are pre-populated from inference data
-# instead of recorded during forward.  _pp_forward uses this to switch to
-# "replay_forward" instead of "record" so MoE blocks pop pre-populated
-# routing rather than computing fresh routing from the gate.
-_r3_pre_populated: bool = False
-
-
-def set_r3_mode(enabled: bool) -> None:
-    """Enable/disable R3 pre-populated routing mode."""
-    global _r3_pre_populated
-    _r3_pre_populated = enabled
-
-
-def is_r3_mode() -> bool:
-    """Check if R3 pre-populated routing mode is active."""
-    return _r3_pre_populated

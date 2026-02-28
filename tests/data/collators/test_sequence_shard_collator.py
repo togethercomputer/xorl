@@ -16,6 +16,7 @@ class TestTextSequenceShardCollator:
         mock_ps = Mock()
         mock_ps.sp_size = 2
         mock_ps.sp_rank = 0
+        mock_ps.cp_size = 1
         mock_parallel_state.return_value = mock_ps
 
         collator = TextSequenceShardCollator()
@@ -28,6 +29,7 @@ class TestTextSequenceShardCollator:
         mock_ps = Mock()
         mock_ps.sp_size = 2
         mock_ps.sp_rank = 0
+        mock_ps.cp_size = 1
         mock_parallel_state.return_value = mock_ps
 
         collator = TextSequenceShardCollator()
@@ -47,6 +49,7 @@ class TestTextSequenceShardCollator:
         mock_ps = Mock()
         mock_ps.sp_size = 2
         mock_ps.sp_rank = 1
+        mock_ps.cp_size = 1
         mock_parallel_state.return_value = mock_ps
 
         collator = TextSequenceShardCollator()
@@ -65,6 +68,7 @@ class TestTextSequenceShardCollator:
         mock_ps = Mock()
         mock_ps.sp_size = 2
         mock_ps.sp_rank = 0
+        mock_ps.cp_size = 1
         mock_parallel_state.return_value = mock_ps
 
         collator = TextSequenceShardCollator()
@@ -84,6 +88,7 @@ class TestTextSequenceShardCollator:
         mock_ps = Mock()
         mock_ps.sp_size = 2
         mock_ps.sp_rank = 0
+        mock_ps.cp_size = 1
         mock_parallel_state.return_value = mock_ps
 
         collator = TextSequenceShardCollator()
@@ -100,6 +105,7 @@ class TestTextSequenceShardCollator:
         mock_ps = Mock()
         mock_ps.sp_size = 2
         mock_ps.sp_rank = 0
+        mock_ps.cp_size = 1
         mock_parallel_state.return_value = mock_ps
 
         collator = TextSequenceShardCollator()
@@ -117,6 +123,7 @@ class TestTextSequenceShardCollator:
         mock_ps = Mock()
         mock_ps.sp_size = 2
         mock_ps.sp_rank = 0
+        mock_ps.cp_size = 1
         mock_parallel_state.return_value = mock_ps
 
         collator = TextSequenceShardCollator()
@@ -127,51 +134,53 @@ class TestTextSequenceShardCollator:
         assert torch.equal(padded, tensor)
 
     @patch('xorl.data.collators.sequence_shard_collator.get_parallel_state')
-    def test_labels_shifted_and_padded(self, mock_parallel_state):
-        """Test that labels are shifted by 1 position and last token padded with IGNORE_INDEX."""
+    def test_preshifted_labels_pass_through(self, mock_parallel_state):
+        """Test that pre-shifted labels pass through correctly with sp_size=1."""
         mock_ps = Mock()
         mock_ps.sp_size = 1
         mock_ps.sp_rank = 0
+        mock_ps.cp_size = 1
         mock_parallel_state.return_value = mock_ps
 
         collator = TextSequenceShardCollator(pad_token_id=0)
 
+        # Pre-shifted data: labels[i] = input_ids[i+1], last label = IGNORE_INDEX
         batch = {
             "input_ids": torch.tensor([[1, 2, 3, 4, 5]]),
             "attention_mask": torch.tensor([[1, 1, 1, 1, 1]]),
-            "labels": torch.tensor([[1, 2, 3, 4, 5]]),
+            "labels": torch.tensor([[2, 3, 4, 5, IGNORE_INDEX]]),
             "position_ids": torch.tensor([[0, 1, 2, 3, 4]]),
         }
 
         result = collator(batch)
 
-        # Labels should be shifted: [2, 3, 4, 5, IGNORE_INDEX]
-        expected_labels_start = torch.tensor([2, 3, 4, 5])
-        assert torch.equal(result["labels"][0, :4], expected_labels_start)
-        assert result["labels"][0, -1] == IGNORE_INDEX
+        # Pre-shifted labels should pass through unchanged
+        expected_labels = torch.tensor([[2, 3, 4, 5, IGNORE_INDEX]])
+        assert torch.equal(result["labels"], expected_labels)
 
     @patch('xorl.data.collators.sequence_shard_collator.get_parallel_state')
     def test_masks_last_token_of_sequences(self, mock_parallel_state):
-        """Test that last token of each sequence is masked with IGNORE_INDEX."""
+        """Test that last token of each packed sequence has IGNORE_INDEX in pre-shifted labels."""
         mock_ps = Mock()
         mock_ps.sp_size = 1
         mock_ps.sp_rank = 0
+        mock_ps.cp_size = 1
         mock_parallel_state.return_value = mock_ps
 
         collator = TextSequenceShardCollator(pad_token_id=0)
 
-        # Two sequences: [0,1,2] and [0,1]
+        # Two packed sequences: [0,1,2] and [0,1]
+        # Pre-shifted: last token of each sequence has IGNORE_INDEX
         batch = {
             "input_ids": torch.tensor([[1, 2, 3, 4, 5]]),
             "attention_mask": torch.tensor([[1, 1, 1, 1, 1]]),
-            "labels": torch.tensor([[1, 2, 3, 4, 5]]),
+            "labels": torch.tensor([[2, 3, IGNORE_INDEX, 5, IGNORE_INDEX]]),
             "position_ids": torch.tensor([[0, 1, 2, 0, 1]]),
         }
 
         result = collator(batch)
 
-        # Last token of first sequence (index 2) and second sequence (index 4) should be IGNORE_INDEX
-        # After shift: positions 1 and 3 should be IGNORE_INDEX
+        # IGNORE_INDEX at boundary positions should be preserved
         assert result["labels"][0, 2] == IGNORE_INDEX  # Last of first seq
         assert result["labels"][0, 4] == IGNORE_INDEX  # Last of second seq
 
@@ -181,15 +190,17 @@ class TestTextSequenceShardCollator:
         mock_ps = Mock()
         mock_ps.sp_size = 2
         mock_ps.sp_rank = 0
+        mock_ps.cp_size = 1
         mock_parallel_state.return_value = mock_ps
 
         collator = TextSequenceShardCollator(pad_token_id=0)
 
         # Length 5, should pad to 6 (next multiple of sp_size=2, chunk_size=3)
+        # Pre-shifted data
         batch = {
             "input_ids": torch.tensor([[1, 2, 3, 4, 5]]),
             "attention_mask": torch.tensor([[1, 1, 1, 1, 1]]),
-            "labels": torch.tensor([[1, 2, 3, 4, 5]]),
+            "labels": torch.tensor([[2, 3, 4, 5, IGNORE_INDEX]]),
             "position_ids": torch.tensor([[0, 1, 2, 3, 4]]),
         }
 
@@ -205,14 +216,16 @@ class TestTextSequenceShardCollator:
         mock_ps = Mock()
         mock_ps.sp_size = 2
         mock_ps.sp_rank = 0
+        mock_ps.cp_size = 1
         mock_parallel_state.return_value = mock_ps
 
         collator_rank0 = TextSequenceShardCollator(pad_token_id=0)
 
+        # Pre-shifted data
         batch_rank0 = {
             "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6]]),
             "attention_mask": torch.tensor([[1, 1, 1, 1, 1, 1]]),
-            "labels": torch.tensor([[1, 2, 3, 4, 5, 6]]),
+            "labels": torch.tensor([[2, 3, 4, 5, 6, IGNORE_INDEX]]),
             "position_ids": torch.tensor([[0, 1, 2, 3, 4, 5]]),
         }
 
@@ -225,7 +238,7 @@ class TestTextSequenceShardCollator:
         batch_rank1 = {
             "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6]]),
             "attention_mask": torch.tensor([[1, 1, 1, 1, 1, 1]]),
-            "labels": torch.tensor([[1, 2, 3, 4, 5, 6]]),
+            "labels": torch.tensor([[2, 3, 4, 5, 6, IGNORE_INDEX]]),
             "position_ids": torch.tensor([[0, 1, 2, 3, 4, 5]]),
         }
 
@@ -245,14 +258,16 @@ class TestTextSequenceShardCollator:
         mock_ps = Mock()
         mock_ps.sp_size = 1
         mock_ps.sp_rank = 0
+        mock_ps.cp_size = 1
         mock_parallel_state.return_value = mock_ps
 
         collator = TextSequenceShardCollator(pad_token_id=0)
 
+        # Pre-shifted data
         batch = {
             "input_ids": torch.tensor([[1, 2, 3, 4, 5]]),
             "attention_mask": torch.tensor([[1, 1, 1, 1, 1]]),
-            "labels": torch.tensor([[1, 2, 3, 4, 5]]),
+            "labels": torch.tensor([[2, 3, 4, 5, IGNORE_INDEX]]),
             "position_ids": torch.tensor([[0, 1, 2, 3, 4]]),
         }
 
@@ -270,14 +285,16 @@ class TestTextSequenceShardCollator:
         mock_ps = Mock()
         mock_ps.sp_size = 1
         mock_ps.sp_rank = 0
+        mock_ps.cp_size = 1
         mock_parallel_state.return_value = mock_ps
 
         collator = TextSequenceShardCollator(pad_token_id=0)
 
+        # Pre-shifted data
         batch = {
             "input_ids": torch.tensor([[1, 2, 3]]),
             "attention_mask": torch.tensor([[1, 1, 1]]),
-            "labels": torch.tensor([[1, 2, 3]]),
+            "labels": torch.tensor([[2, 3, IGNORE_INDEX]]),
             "position_ids": torch.tensor([[0, 1, 2]]),
         }
 
@@ -293,14 +310,16 @@ class TestTextSequenceShardCollator:
         mock_ps = Mock()
         mock_ps.sp_size = 1
         mock_ps.sp_rank = 0
+        mock_ps.cp_size = 1
         mock_parallel_state.return_value = mock_ps
 
         collator = TextSequenceShardCollator(pad_token_id=0)
 
+        # Pre-shifted data
         batch = {
             "input_ids": torch.tensor([[1, 2, 3]]),
             "attention_mask": torch.tensor([[1, 1, 1]]),
-            "labels": torch.tensor([[1, 2, 3]]),
+            "labels": torch.tensor([[2, 3, IGNORE_INDEX]]),
             "position_ids": torch.tensor([[0, 1, 2]]),
         }
 
@@ -317,15 +336,17 @@ class TestTextSequenceShardCollator:
         mock_ps = Mock()
         mock_ps.sp_size = 2
         mock_ps.sp_rank = 1
+        mock_ps.cp_size = 1
         mock_parallel_state.return_value = mock_ps
 
         collator = TextSequenceShardCollator(pad_token_id=99)
 
         # Length 3 -> padded to 4 (sp_size=2, chunk_size=2)
+        # Pre-shifted data
         batch = {
             "input_ids": torch.tensor([[1, 2, 3]]),
             "attention_mask": torch.tensor([[1, 1, 1]]),
-            "labels": torch.tensor([[1, 2, 3]]),
+            "labels": torch.tensor([[2, 3, IGNORE_INDEX]]),
             "position_ids": torch.tensor([[0, 1, 2]]),
         }
 
@@ -334,8 +355,7 @@ class TestTextSequenceShardCollator:
         # Rank 1 gets second half (indices 2:4) after padding
         # input_ids padded with 99, so should see 99 if padding is in the slice
         # Since we're rank 1 with length 3->4, chunk_size=2, we get indices 2:4 = [3, 99]
-        # After shift, position 2 becomes position 0 in the slice
-        # But after label processing, the padding should be IGNORE_INDEX
+        # Labels padding should be IGNORE_INDEX
 
     @patch('xorl.data.collators.sequence_shard_collator.get_parallel_state')
     def test_handles_single_sequence(self, mock_parallel_state):
@@ -343,14 +363,16 @@ class TestTextSequenceShardCollator:
         mock_ps = Mock()
         mock_ps.sp_size = 1
         mock_ps.sp_rank = 0
+        mock_ps.cp_size = 1
         mock_parallel_state.return_value = mock_ps
 
         collator = TextSequenceShardCollator(pad_token_id=0)
 
+        # Pre-shifted data
         batch = {
             "input_ids": torch.tensor([[1, 2, 3, 4, 5]]),
             "attention_mask": torch.tensor([[1, 1, 1, 1, 1]]),
-            "labels": torch.tensor([[1, 2, 3, 4, 5]]),
+            "labels": torch.tensor([[2, 3, 4, 5, IGNORE_INDEX]]),
             "position_ids": torch.tensor([[0, 1, 2, 3, 4]]),
         }
 

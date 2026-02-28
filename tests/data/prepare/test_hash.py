@@ -179,7 +179,7 @@ class TestGenerateDatasetHashFromConfig:
             split="train",
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         hash1 = generate_dataset_hash_from_config(args, [dataset_config], "gpt2")
@@ -202,7 +202,7 @@ class TestGenerateDatasetHashFromConfig:
             split="train",
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         result = generate_dataset_hash_from_config(args, [dataset_config], "gpt2")
@@ -225,7 +225,7 @@ class TestGenerateDatasetHashFromConfig:
             split="train",
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         hash1 = generate_dataset_hash_from_config(args, [dataset_config], "gpt2")
@@ -248,7 +248,7 @@ class TestGenerateDatasetHashFromConfig:
             split="train",
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         config2 = DatasetConfig(
@@ -261,7 +261,7 @@ class TestGenerateDatasetHashFromConfig:
             split="train",
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         hash1 = generate_dataset_hash_from_config(args, [config1], "gpt2")
@@ -287,7 +287,7 @@ class TestGenerateDatasetHashFromConfig:
             split="train",
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         hash1 = generate_dataset_hash_from_config(args1, [dataset_config], "gpt2")
@@ -310,7 +310,7 @@ class TestGenerateDatasetHashFromConfig:
             split="train",
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         config2 = DatasetConfig(
@@ -323,7 +323,7 @@ class TestGenerateDatasetHashFromConfig:
             split="train",
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         hash1 = generate_dataset_hash_from_config(args, [config1], "gpt2")
@@ -346,7 +346,7 @@ class TestGenerateDatasetHashFromConfig:
             split="train",
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         config2 = DatasetConfig(
@@ -359,7 +359,7 @@ class TestGenerateDatasetHashFromConfig:
             split="train",
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         hash1 = generate_dataset_hash_from_config(args, [config1, config2], "gpt2")

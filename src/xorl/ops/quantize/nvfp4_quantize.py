@@ -42,7 +42,6 @@ def _nvfp4_quantize_kernel(
     # Compute codes before stores to overlap compute with memory
     inv_amax_2d = (6.0 / tl.expand_dims(amax, axis=1))
     scaled_2d = x_2d * inv_amax_2d
-    scaled_2d = tl.minimum(tl.maximum(scaled_2d, -6.0), 6.0)
     scaled = tl.reshape(scaled_2d, (TILE_ELEMS,))
     codes = _fp4_encode(scaled)
     scale_offs = tl.arange(0, blocks_per_tile)
@@ -124,8 +123,7 @@ def nvfp4_quantize(x: Tensor, block_size: int = 16,
     te = min(te, n)
     grid = (n + te - 1) // te
     _nvfp4_quantize_kernel[(grid,)](
-        x_flat, packed, amax, global_amax_buf, n,
-        block_size, te, num_warps=nw,
+        x_flat, packed, amax, global_amax_buf, n, block_size, te, num_warps=nw,
     )
     # Override global amax with EMA-tracked value if provided
     if global_amax is not None:
