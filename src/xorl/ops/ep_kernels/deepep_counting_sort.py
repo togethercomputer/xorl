@@ -55,6 +55,7 @@ def group_tokens_by_expert_v2(
     expert_ids: torch.Tensor,
     topk: int,
     num_experts: int,
+    num_valid: int = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     del num_experts
     device = expert_ids.device
@@ -67,8 +68,10 @@ def group_tokens_by_expert_v2(
         torch.iinfo(torch.int64).max,
     )
     _, sorted_indices = torch.sort(composite_keys, stable=False)
-    valid_mask = flat_expert_ids >= 0
-    num_valid = valid_mask.sum().item()
+    if num_valid is None:
+        # Fallback: requires CPU-GPU sync via .item()
+        valid_mask = flat_expert_ids >= 0
+        num_valid = valid_mask.sum().item()
     if num_valid == 0:
         return (
             torch.empty(0, dtype=torch.int64, device=device),
@@ -84,11 +87,14 @@ def group_tokens_by_expert_v2(
 def group_tokens_by_expert(
     expert_ids: torch.Tensor,
     topk: int,
+    num_valid: int = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     device = expert_ids.device
     flat_expert_ids = expert_ids.view(-1).long()
     valid_mask = flat_expert_ids >= 0
-    num_valid = valid_mask.sum().item()
+    if num_valid is None:
+        # Fallback: requires CPU-GPU sync via .item()
+        num_valid = valid_mask.sum().item()
     if num_valid == 0:
         return (
             torch.empty(0, dtype=torch.int64, device=device),

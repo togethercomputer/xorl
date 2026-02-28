@@ -87,8 +87,11 @@ class TestRetryOnRequestExceptions:
 
     def test_retries_on_hf_hub_http_error(self):
         """Should retry on HfHubHTTPError."""
+        mock_response = Mock()
+        mock_response.status_code = 500
+        mock_response.headers = {}
         mock_func = Mock(side_effect=[
-            huggingface_hub.errors.HfHubHTTPError("HF error"),
+            huggingface_hub.errors.HfHubHTTPError("HF error", response=mock_response),
             "success"
         ])
 

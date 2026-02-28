@@ -83,26 +83,6 @@ class TestToTensorCollator:
         assert result[0]["input_ids"].shape == (3,)
         assert result[0]["labels"].shape == (3,)
     
-    @pytest.mark.skip(reason="Edge case not supported by simple implementation")
-    def test_string_lists_kept_as_is(self):
-        """Test that string lists are NOT converted to tensors."""
-        collator = ToTensorCollator()
-        
-        features = [
-            {"input_ids": [1, 2, 3], "text": ["hello", "world"]},
-            {"input_ids": [4, 5, 6], "text": ["foo", "bar", "baz"]},
-        ]
-        
-        result = collator(features)
-        
-        # input_ids should be batched tensor
-        assert isinstance(result[0]["input_ids"], torch.Tensor)
-        assert result[0]["input_ids"].shape == (3,)
-        
-        # text should be list of lists (batched but not tensorized)
-        assert isinstance(result[0]["text"], list)
-        assert result[0]["text"] == ["hello", "world"]  # First sample
-    
     def test_scalar_fields(self):
         """Test handling of scalar numeric fields."""
         collator = ToTensorCollator()
@@ -130,21 +110,6 @@ class TestToTensorCollator:
         result = collator([])
         
         assert result == {}
-    
-    @pytest.mark.skip(reason="Edge case not supported by simple implementation")
-    def test_empty_lists_kept_as_is(self):
-        """Test that empty lists are kept as-is."""
-        collator = ToTensorCollator()
-        
-        features = [
-            {"input_ids": [], "labels": []},
-        ]
-        
-        result = collator(features)
-        
-        # Empty lists should remain as lists (not converted)
-        assert result[0]["input_ids"] == []
-        assert result[0]["labels"] == []
     
     def test_dtype_inference(self):
         """Test that appropriate dtypes are used."""
@@ -184,28 +149,6 @@ class TestToTensorCollator:
         assert result[0]["input_ids"].shape == (3,)
         assert result[0]["labels"].shape == (3,)
     
-    @pytest.mark.skip(reason="Edge case not supported by simple implementation")
-    def test_non_numeric_fields_kept_as_is(self):
-        """Test that non-numeric fields are kept as-is."""
-        collator = ToTensorCollator()
-        
-        features = [
-            {"input_ids": [1, 2, 3], "metadata": {"id": "sample1", "source": "A"}},
-            {"input_ids": [4, 5, 6], "metadata": {"id": "sample2", "source": "B"}},
-        ]
-        
-        result = collator(features)
-        
-        # input_ids should be batched tensor
-        assert isinstance(result[0]["input_ids"], torch.Tensor)
-        assert result[0]["input_ids"].shape == (3,)
-        
-        # metadata should be batched as list of dicts
-        assert isinstance(result[0]["metadata"], list)
-        assert isinstance(result[0]["metadata"], dict)
-        assert result[0]["metadata"]["id"] == "sample1"
-        # Second sample has different metadata
-    
     def test_2d_numeric_lists(self):
         """Test handling of 2D numeric lists."""
         collator = ToTensorCollator()
@@ -235,25 +178,6 @@ class TestToTensorCollator:
         # Should remain as nested lists
         assert isinstance(result[0]["text"], list)
         assert isinstance(result[0]["text"], list)
-    
-    @pytest.mark.skip(reason="Edge case not supported by simple implementation")
-    def test_list_of_dicts_kept_as_is(self):
-        """Test that list of dicts is kept as-is."""
-        collator = ToTensorCollator()
-        
-        features = [
-            {"input_ids": [1, 2, 3], "items": [{"a": 1}, {"b": 2}]},
-            {"input_ids": [4, 5, 6], "items": [{"c": 3}, {"d": 4}]},
-        ]
-        
-        result = collator(features)
-        
-        assert isinstance(result[0]["input_ids"], torch.Tensor)
-        assert result[0]["input_ids"].shape == (3,)
-        
-        # items should be batched as list of lists of dicts
-        assert isinstance(result[0]["items"], list)
-        assert isinstance(result[0]["items"], list)
     
     def test_boolean_list_conversion(self):
         """Test that boolean lists are converted to tensors."""
@@ -327,21 +251,6 @@ class TestToTensorCollatorEdgeCases:
         assert isinstance(result[0]["text"], str)
         assert result[0]["text"] == "hello world"  # Kept as string
         assert result[1]["text"] == "foo bar"
-    
-    @pytest.mark.skip(reason="Edge case not supported by simple implementation")
-    def test_none_values_kept_as_is(self):
-        """Test that None values are kept as-is."""
-        collator = ToTensorCollator()
-        
-        features = [
-            {"input_ids": [1, 2, 3], "optional_field": None},
-            {"input_ids": [4, 5, 6], "optional_field": None},
-        ]
-        
-        result = collator(features)
-        
-        assert isinstance(result[0]["input_ids"], torch.Tensor)
-        assert result[0]["optional_field"] == [None, None]
     
     def test_different_lengths_default_collate_fails_gracefully(self):
         """Test that different length sequences cause graceful fallback."""

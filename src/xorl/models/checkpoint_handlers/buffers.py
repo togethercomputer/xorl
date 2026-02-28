@@ -5,6 +5,8 @@ These utility classes handle common weight transformation patterns:
 - GateUpMergeBuffer: merges gate_proj + up_proj into gate_up_proj
 """
 
+import json
+import os
 import re
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple
@@ -22,6 +24,15 @@ EXPERT_KEY_PATTERN = re.compile(
     r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.weight$"
 )
 
+# Per-expert quantized auxiliary keys (NVFP4 / modelopt format)
+# e.g., model.layers.0.mlp.experts.5.gate_proj.weight_scale
+#       model.layers.0.mlp.experts.5.gate_proj.weight_scale_2
+#       model.layers.0.mlp.experts.5.gate_proj.input_scale
+EXPERT_QUANT_AUX_PATTERN = re.compile(
+    r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\."
+    r"(weight_scale|weight_scale_2|input_scale)$"
+)
+
 # Model parameter names in fused expert format
 # e.g., model.layers.0.mlp.experts.gate_proj
 FUSED_EXPERT_PATTERN = re.compile(
@@ -34,11 +45,33 @@ DENSE_GATE_UP_PATTERN = re.compile(
     r"^(.*)\.(gate|up)_proj\.weight$"
 )
 
+# Attention o_proj weight key
+# e.g., model.layers.0.self_attn.o_proj.weight
+OPROJ_WEIGHT_PATTERN = re.compile(
+    r"^.*\.self_attn\.o_proj\.weight$"
+)
+
+# Dense/shared-expert down_proj weight key (non-expert)
+# e.g., model.layers.0.mlp.down_proj.weight or model.layers.0.mlp.shared_expert.down_proj.weight
+DENSE_DOWN_PROJ_PATTERN = re.compile(
+    r"^.*\.mlp\.(?:shared_expert\.)?down_proj\.weight$"
+)
+
 # Attention QKV projection weight/bias keys
 # e.g., model.layers.0.self_attn.q_proj.weight
 QKV_PROJ_PATTERN = re.compile(
     r"^(.*\.self_attn)\.(q|k|v)_proj\.(weight|bias)$"
 )
+
+# Quantized auxiliary suffixes used by modelopt NVFP4 checkpoints.
+# Matches any key ending in .weight_scale, .weight_scale_2, or .input_scale
+QUANT_AUX_SUFFIX_PATTERN = re.compile(
+    r"\.(weight_scale|weight_scale_2|input_scale)$"
+)
+
+# Block FP8 auxiliary suffix (HuggingFace FP8 checkpoint format)
+# Matches any key ending in .weight_scale_inv
+FP8_AUX_SUFFIX_PATTERN = re.compile(r"\.weight_scale_inv$")
 
 
 # =============================================================================
@@ -69,6 +102,199 @@ def checkpoint_has_per_expert_weights(checkpoint_keys: Set[str]) -> bool:
     return False
 
 
+def _resolve_weights_path(weights_path: Optional[str]) -> Optional[str]:
+    """Resolve a HF hub model ID or local path to a local directory.
+
+    If ``weights_path`` is already a local directory, returns it as-is.
+    Otherwise, tries to resolve it as a HF hub model ID via the local cache
+    (using ``cached_file`` to locate ``config.json``).
+
+    Returns:
+        Local directory path, or None if resolution fails.
+    """
+    if not weights_path:
+        return None
+    if os.path.isdir(weights_path):
+        return weights_path
+    # Try resolving as a HF hub model ID
+    try:
+        from transformers.utils import cached_file
+        config_path = cached_file(weights_path, "config.json", _raise_exceptions_for_missing_entries=False)
+        if config_path and os.path.isfile(config_path):
+            return os.path.dirname(config_path)
+    except Exception:
+        pass
+    return None
+
+
+def detect_prequantized_checkpoint(weights_path: Optional[str]) -> bool:
+    """Detect whether a checkpoint contains pre-quantized weights (NVFP4 modelopt format).
+
+    Checks multiple signals in order:
+    1. ``hf_quant_config.json`` with ``quant_algo == "NVFP4"``
+    2. ``quantization_config.quant_algo == "NVFP4"`` in ``config.json``
+    3. Presence of ``weight_scale`` keys in safetensors index (some NVFP4
+       checkpoints, e.g. ``nvidia/Qwen3-235B-A22B-NVFP4``, omit the config
+       metadata but still store weights in NVFP4 packed format)
+
+    Args:
+        weights_path: Path to HF model directory or HF hub model ID.
+            Returns False if None or unresolvable.
+    """
+    weights_path = _resolve_weights_path(weights_path)
+    if weights_path is None:
+        return False
+
+    # Check hf_quant_config.json
+    # nvidia/modelopt format nests under "quantization": {"quant_algo": "NVFP4", ...}
+    quant_config_path = os.path.join(weights_path, "hf_quant_config.json")
+    if os.path.isfile(quant_config_path):
+        try:
+            with open(quant_config_path) as f:
+                quant_config = json.load(f)
+            algo = (
+                quant_config.get("quantization", {}).get("quant_algo")
+                or quant_config.get("quant_algo")
+            )
+            if algo == "NVFP4":
+                return True
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Check config.json quantization_config
+    config_path = os.path.join(weights_path, "config.json")
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path) as f:
+                config = json.load(f)
+            if config.get("quantization_config", {}).get("quant_algo") == "NVFP4":
+                return True
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Fallback: check safetensors index for weight_scale keys (NVFP4 indicator)
+    index_path = os.path.join(weights_path, "model.safetensors.index.json")
+    if os.path.isfile(index_path):
+        try:
+            with open(index_path) as f:
+                index = json.load(f)
+            weight_map = index.get("weight_map", {})
+            has_weight_scale = any(k.endswith(".weight_scale") for k in weight_map)
+            has_weight_scale_2 = any(k.endswith(".weight_scale_2") for k in weight_map)
+            if has_weight_scale and has_weight_scale_2:
+                return True
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return False
+
+
+def detect_prequantized_block_fp8_checkpoint(weights_path: Optional[str]) -> bool:
+    """Detect whether a checkpoint contains pre-quantized block FP8 weights.
+
+    Checks multiple signals:
+    1. ``quantization_config`` in ``config.json`` with ``quant_method == "fp8"``
+       and ``weight_block_size == [128, 128]``
+    2. Presence of ``weight_scale_inv`` keys in safetensors index (and NO
+       ``weight_scale`` keys to distinguish from NVFP4)
+
+    Args:
+        weights_path: Path to HF model directory or HF hub model ID.
+            Returns False if None or unresolvable.
+    """
+    weights_path = _resolve_weights_path(weights_path)
+    if weights_path is None:
+        return False
+
+    # Check config.json quantization_config
+    config_path = os.path.join(weights_path, "config.json")
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path) as f:
+                config = json.load(f)
+            qc = config.get("quantization_config", {})
+            if (qc.get("quant_method") == "fp8"
+                    and qc.get("weight_block_size") == [128, 128]):
+                return True
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Fallback: check safetensors index for weight_scale_inv keys
+    index_path = os.path.join(weights_path, "model.safetensors.index.json")
+    if os.path.isfile(index_path):
+        try:
+            with open(index_path) as f:
+                index = json.load(f)
+            weight_map = index.get("weight_map", {})
+            has_weight_scale_inv = any(k.endswith(".weight_scale_inv") for k in weight_map)
+            # Distinguish from NVFP4: NVFP4 has .weight_scale, FP8 has .weight_scale_inv
+            has_weight_scale = any(k.endswith(".weight_scale") for k in weight_map)
+            if has_weight_scale_inv and not has_weight_scale:
+                return True
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return False
+
+
+def get_prequantized_exclude_modules(weights_path: Optional[str]) -> Set[str]:
+    """Read exclude_modules from pre-quantized checkpoint quantization config.
+
+    Pre-quantized checkpoints (e.g., nvidia/modelopt NVFP4) may list modules
+    that were NOT quantized — their weights remain in bf16/fp16. This function
+    reads that list so callers can skip QLoRA injection and checkpoint key
+    skipping for those modules.
+
+    Checks (in order):
+    1. ``hf_quant_config.json`` — modelopt nested format
+       ``{"quantization": {"exclude_modules": [...]}}`` or flat
+       ``{"exclude_modules": [...]}``
+    2. ``config.json`` — HuggingFace format
+       ``{"quantization_config": {"exclude_modules": [...]}}``
+       Also checks ``modules_to_not_convert`` (used by some HF FP8 checkpoints).
+
+    Args:
+        weights_path: Path to HF model directory or HF hub model ID.
+
+    Returns:
+        Set of module name suffixes (e.g., ``{"lm_head", "gate"}``).
+        Empty set if none found.
+    """
+    weights_path = _resolve_weights_path(weights_path)
+    if weights_path is None:
+        return set()
+
+    # 1. hf_quant_config.json (modelopt nested or flat format)
+    quant_config_path = os.path.join(weights_path, "hf_quant_config.json")
+    if os.path.isfile(quant_config_path):
+        try:
+            with open(quant_config_path) as f:
+                qc = json.load(f)
+            exclude = (
+                qc.get("quantization", {}).get("exclude_modules")
+                or qc.get("exclude_modules")
+            )
+            if exclude:
+                return set(exclude)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # 2. config.json quantization_config
+    config_path = os.path.join(weights_path, "config.json")
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path) as f:
+                config = json.load(f)
+            qc = config.get("quantization_config", {})
+            exclude = qc.get("exclude_modules") or qc.get("modules_to_not_convert")
+            if exclude:
+                return set(exclude)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return set()
+
+
 def model_needs_expert_merging(parameter_names: Set[str]) -> bool:
     """Check if the model expects fused expert format (stacked [num_experts, ...] tensors)."""
     for name in parameter_names:
@@ -95,7 +321,11 @@ def checkpoint_has_separate_gate_up(checkpoint_keys: Set[str]) -> bool:
 # =============================================================================
 
 class ExpertWeightBuffer:
-    """Buffer for collecting per-expert weights and merging them into stacked tensors.
+    """Buffer for collecting per-expert weights and merging them into stacked (G,K,N) tensors.
+
+    HuggingFace checkpoints store nn.Linear weights as [out_features, in_features].
+    This buffer transposes each expert weight to [in_features, out_features] during
+    stacking, producing the (G, K, N) format expected by the MoE expert kernels.
 
     Optimized for performance:
     - Pre-allocates stacked tensor on first expert arrival
@@ -117,12 +347,19 @@ class ExpertWeightBuffer:
         self._total_seen: Dict[Tuple[int, str], int] = defaultdict(int)
 
     def add(self, layer_idx: int, expert_idx: int, proj: str, tensor: torch.Tensor) -> None:
-        """Add a per-expert tensor. Experts outside this EP rank's range are counted but not buffered."""
+        """Add a per-expert tensor. Experts outside this EP rank's range are counted but not buffered.
+
+        Each expert weight is transposed from HF [out_features, in_features] to
+        [in_features, out_features] for (G, K, N) format.
+        """
         key = (layer_idx, proj)
         self._total_seen[key] += 1
 
         if expert_idx < self.expert_start or expert_idx >= self.expert_end:
             return
+
+        # Transpose from HF nn.Linear [out, in] to (K, N) = [in, out] format
+        tensor = tensor.t().contiguous()
 
         if key not in self._stacked_buffers:
             stacked_shape = (self.local_num_experts,) + tensor.shape

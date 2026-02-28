@@ -6,6 +6,8 @@ import torch
 from torch import nn
 
 from ..utils import logging
+from .layers.moe.moe_block import MoEBlock
+from .layers.moe.routing_replay import RoutingReplay
 
 
 logger = logging.get_logger(__name__)
@@ -41,6 +43,18 @@ class XorlPreTrainedModel(nn.Module):
 
     def post_init(self):
         """Initialize weights and apply weight tying."""
+        self.apply(self._init_weights)
+
+
+    def init_weights(self, buffer_device=None):
+        """Initialize weights, matching torchtitan's ModelProtocol.
+
+        Used by PP to initialize weights after model is materialized
+        from meta device on each stage.
+
+        Args:
+            buffer_device: Device for buffers (default: None, uses param device).
+        """
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -86,6 +100,26 @@ class XorlPreTrainedModel(nn.Module):
             if hasattr(module, "gradient_checkpointing"):
                 module.gradient_checkpointing = True
                 module._gradient_checkpointing_func = gc_func
+
+        # Create routing replay instances for MoE blocks
+        self.enable_routing_replay()
+
+    def enable_routing_replay(self):
+        """Create RoutingReplay instances for each MoE block."""
+        # Clear stale instances from previous calls (e.g. model rebuild).
+        RoutingReplay._instances.clear()
+
+        moe_layers = []
+        for name, module in self.named_modules():
+            mlp = getattr(module, "mlp", None)
+            if isinstance(mlp, MoEBlock):
+                replay = RoutingReplay()
+                mlp._routing_replay = replay
+                moe_layers.append((name, replay))
+
+        if moe_layers:
+            logger.info(f"Routing replay enabled for {len(moe_layers)} MoE layers")
+        return moe_layers
 
     def gradient_checkpointing_disable(self):
         for module in self.modules():

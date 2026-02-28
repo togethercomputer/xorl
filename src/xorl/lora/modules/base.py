@@ -90,7 +90,6 @@ class LoraModule(ABC):
         """
         pass
 
-    @abstractmethod
     def get_delta_weight(self) -> torch.Tensor:
         """
         Compute the delta weight from LoRA matrices.
@@ -100,8 +99,15 @@ class LoraModule(ABC):
 
         Returns:
             Delta weight tensor with same shape as base weight
+
+        Note:
+            Not all LoRA modules implement this (e.g. MoE modules with multiple
+            projections). Use merge_weights() directly for those cases.
         """
-        pass
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement get_delta_weight(). "
+            "For MoE modules, use merge_weights() directly."
+        )
 
     @abstractmethod
     def merge_weights(self) -> None:

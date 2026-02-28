@@ -81,7 +81,7 @@ class XorlFlopsCounter:
         share_expert_num = self.config.n_shared_experts
         # non-attn per layer parm
         moe_gata_N = hidden_size * moe_num_expert
-        # moe has fc1_1, fc1_2 and fc2 using SwiGLU in ExpertMlp layer & shared experts
+        # moe has gate_proj, up_proj and down_proj using SwiGLU in ExpertMlp layer & shared experts
         moe_expertmlp_N = hidden_size * moe_intermediate_size * (moe_topk + share_expert_num) * 3
         # MLA attn
         attn_linear_N = 0

@@ -50,7 +50,7 @@ class TestGetDatasetType:
             split=None,
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         result = get_dataset_type(config)
@@ -69,7 +69,7 @@ class TestGetDatasetType:
             split=None,
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         result = get_dataset_type(config)
@@ -88,7 +88,7 @@ class TestGetDatasetType:
             split=None,
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         result = get_dataset_type(config)
@@ -107,7 +107,7 @@ class TestGetDatasetType:
             split=None,
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         result = get_dataset_type(config)
@@ -129,7 +129,7 @@ class TestDatasetsWithNameGenerator:
             split="train",
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         result = list(datasets_with_name_generator([config]))
@@ -149,7 +149,7 @@ class TestDatasetsWithNameGenerator:
             split="train",
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         result = list(datasets_with_name_generator([config]))
@@ -170,7 +170,7 @@ class TestDatasetsWithNameGenerator:
             split="train",
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         result = list(datasets_with_name_generator([config]))
@@ -192,7 +192,7 @@ class TestDatasetsWithNameGenerator:
             split="train",
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         result = list(datasets_with_name_generator([config]))
@@ -211,7 +211,7 @@ class TestDatasetsWithNameGenerator:
             split="train",
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         config2 = DatasetConfig(
@@ -224,7 +224,7 @@ class TestDatasetsWithNameGenerator:
             split="train",
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         result = list(datasets_with_name_generator([config1, config2]))
@@ -250,7 +250,7 @@ class TestCheckIfHubDataset:
             split="train",
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         result = _check_if_hub_dataset(config, use_auth_token=False)
@@ -262,7 +262,10 @@ class TestCheckIfHubDataset:
         """Should return False if dataset not found on Hub."""
         from huggingface_hub.errors import RepositoryNotFoundError
 
-        mock_snapshot_download.side_effect = RepositoryNotFoundError("not found")
+        mock_response = Mock()
+        mock_response.status_code = 404
+        mock_response.headers = {}
+        mock_snapshot_download.side_effect = RepositoryNotFoundError("not found", response=mock_response)
 
         config = DatasetConfig(
             path="invalid/dataset",
@@ -274,7 +277,7 @@ class TestCheckIfHubDataset:
             split="train",
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         result = _check_if_hub_dataset(config, use_auth_token=False)
@@ -490,7 +493,7 @@ class TestLoadDatasetWithConfig:
             split=None,
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         dataset = load_dataset_with_config(config, use_auth_token=False, streaming=False)
@@ -520,7 +523,7 @@ class TestLoadDatasetWithConfig:
             split=None,
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         dataset = load_dataset_with_config(config, use_auth_token=False, streaming=False)
@@ -545,7 +548,7 @@ class TestLoadDatasetWithConfig:
             split=None,
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         dataset = load_dataset_with_config(config, use_auth_token=False, streaming=False)
@@ -565,7 +568,7 @@ class TestLoadDatasetWithConfig:
             split=None,
             revision=None,
             trust_remote_code=False,
-            sequence_len=None,
+            max_seq_len=None,
             data_files=None
         )
 
@@ -590,7 +593,7 @@ class TestLoadDatasetWithConfig:
             split=None,
             revision=None,
             trust_remote_code=False,
-            sequence_len=None
+            max_seq_len=None
         )
 
         dataset = load_dataset_with_config(config, use_auth_token=False, streaming=False)
@@ -617,7 +620,7 @@ class TestLoadDatasetWithConfig:
             split=None,
             revision=None,
             trust_remote_code=False,
-            sequence_len=None,
+            max_seq_len=None,
             data_files="data.json",
             ds_type="json"
         )
@@ -646,7 +649,7 @@ class TestLoadDatasetWithConfig:
             split=None,
             revision=None,
             trust_remote_code=False,
-            sequence_len=None,
+            max_seq_len=None,
             data_files=["data1.json", "data2.json"],
             ds_type="json"
         )
@@ -672,7 +675,7 @@ class TestGetDatasetType:
             split="train",
             revision=None,
             trust_remote_code=False,
-            sequence_len=None,
+            max_seq_len=None,
             ds_type="arrow"
         )
 
@@ -701,7 +704,7 @@ class TestGetDatasetType:
                 split="train",
                 revision=None,
                 trust_remote_code=False,
-                sequence_len=None
+                max_seq_len=None
             )
             result = get_dataset_type(config)
             assert result == expected_type

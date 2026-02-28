@@ -11,7 +11,7 @@ local/*
 dev/*
 deepspeed_configs/*.json
 .env.example
-.converage
+.coverage
 
 # notebooks and files to keep locally
 notebooks/*

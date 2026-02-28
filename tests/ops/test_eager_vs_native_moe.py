@@ -50,10 +50,10 @@ def _make_pair(num_experts, hidden_dim, intermediate, top_k, seed=42):
 
 
 # ---------------------------------------------------------------------------
-# Test 1: Forward + backward agreement across all configs
+# Test 1: Forward output agreement
 # ---------------------------------------------------------------------------
 
-ALL_CONFIGS = [
+FORWARD_CONFIGS = [
     # (num_experts, hidden_dim, intermediate, top_k, batch, seq)
     (4, 64, 128, 2, 2, 8),
     (8, 128, 256, 2, 4, 16),
@@ -65,142 +65,223 @@ ALL_CONFIGS = [
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("ne,hd,inter,topk,bs,seq", ALL_CONFIGS)
-def test_forward_and_backward_agreement(ne, hd, inter, topk, bs, seq):
-    """Eager and native forward outputs and backward gradients should match."""
+@pytest.mark.parametrize("ne,hd,inter,topk,bs,seq", FORWARD_CONFIGS)
+def test_forward_agreement(ne, hd, inter, topk, bs, seq):
+    """Eager and native forward outputs should match (same weights, same routing)."""
     eager_block, native_block = _make_pair(ne, hd, inter, topk)
-
-    # --- Forward agreement ---
     torch.manual_seed(999)
     x = torch.randn(bs, seq, hd, device=DEVICE, dtype=DTYPE)
+
     with torch.no_grad():
         eager_out, eager_logits = eager_block(x)
         native_out, native_logits = native_block(x)
 
+    # Router logits must be identical (same gate weights)
     torch.testing.assert_close(eager_logits, native_logits, atol=0, rtol=0)
+
+    # Expert outputs
     max_diff = (eager_out - native_out).abs().max().item()
+    mean_diff = (eager_out - native_out).abs().mean().item()
+    rel_diff = ((eager_out - native_out).abs() / (eager_out.abs() + 1e-8)).mean().item()
+
+    print(f"\n  E={ne} H={hd} K={topk} B={bs} S={seq}: "
+          f"max={max_diff:.6f} mean={mean_diff:.6f} rel={rel_diff:.6f}")
+
     torch.testing.assert_close(
         native_out, eager_out, atol=0.05, rtol=0.02,
         msg=f"Forward mismatch: max_diff={max_diff:.6f}",
     )
 
-    # --- Backward agreement (for larger configs) ---
-    if ne <= 8 and hd >= 64:
-        torch.manual_seed(999)
-        x_eager = torch.randn(bs, seq, hd, device=DEVICE, dtype=DTYPE, requires_grad=True)
-        x_native = x_eager.detach().clone().requires_grad_(True)
 
-        eager_out2, _ = eager_block(x_eager)
-        eager_out2.sum().backward()
-        native_out2, _ = native_block(x_native)
-        native_out2.sum().backward()
+# ---------------------------------------------------------------------------
+# Test 2: Backward gradient agreement
+# ---------------------------------------------------------------------------
 
-        atol, rtol = 0.05, 0.05
-        torch.testing.assert_close(x_native.grad, x_eager.grad, atol=atol, rtol=rtol, msg="Input gradient mismatch")
-        for name in ["gate_proj", "up_proj", "down_proj"]:
-            eager_grad = getattr(eager_block.experts, name).grad
-            native_grad = getattr(native_block.experts, name).grad
-            assert eager_grad is not None, f"eager {name} grad is None"
-            assert native_grad is not None, f"native {name} grad is None"
-            torch.testing.assert_close(native_grad, eager_grad, atol=atol, rtol=rtol, msg=f"{name} gradient mismatch")
+BACKWARD_CONFIGS = [
+    (4, 64, 128, 2, 2, 8),
+    (8, 128, 256, 2, 4, 16),
+]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("ne,hd,inter,topk,bs,seq", BACKWARD_CONFIGS)
+def test_backward_agreement(ne, hd, inter, topk, bs, seq):
+    """Eager and native backward gradients should match."""
+    eager_block, native_block = _make_pair(ne, hd, inter, topk)
+
+    torch.manual_seed(999)
+    x_eager = torch.randn(bs, seq, hd, device=DEVICE, dtype=DTYPE, requires_grad=True)
+    x_native = x_eager.detach().clone().requires_grad_(True)
+
+    eager_out, _ = eager_block(x_eager)
+    eager_out.sum().backward()
+
+    native_out, _ = native_block(x_native)
+    native_out.sum().backward()
+
+    atol, rtol = 0.05, 0.05
+
+    # Input gradient
+    torch.testing.assert_close(
+        x_native.grad, x_eager.grad, atol=atol, rtol=rtol,
+        msg="Input gradient mismatch",
+    )
+
+    # Weight gradients
+    for name in ["gate_proj", "up_proj", "down_proj"]:
+        eager_grad = getattr(eager_block.experts, name).grad
+        native_grad = getattr(native_block.experts, name).grad
+        assert eager_grad is not None, f"eager {name} grad is None"
+        assert native_grad is not None, f"native {name} grad is None"
+        diff = (eager_grad - native_grad).abs().max().item()
+        print(f"\n  {name} grad max_diff: {diff:.6f}")
         torch.testing.assert_close(
-            native_block.gate.weight.grad, eager_block.gate.weight.grad,
-            atol=atol, rtol=rtol, msg="Gate weight gradient mismatch",
+            native_grad, eager_grad, atol=atol, rtol=rtol,
+            msg=f"{name} gradient mismatch (max_diff={diff:.6f})",
+        )
+
+    # Gate gradient
+    gate_diff = (eager_block.gate.weight.grad - native_block.gate.weight.grad).abs().max().item()
+    print(f"\n  gate.weight grad max_diff: {gate_diff:.6f}")
+    torch.testing.assert_close(
+        native_block.gate.weight.grad, eager_block.gate.weight.grad,
+        atol=atol, rtol=rtol,
+        msg=f"Gate weight gradient mismatch (max_diff={gate_diff:.6f})",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 3: Determinism
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("backend", ["eager", "native"])
+def test_determinism(backend):
+    """Same input should produce identical output across two calls."""
+    MoEBlock, _ = _import_moe()
+
+    torch.manual_seed(42)
+    block = MoEBlock(64, 4, 2, 128, moe_implementation=backend)
+    nn.init.xavier_normal_(block.experts.gate_proj.data)
+    nn.init.xavier_normal_(block.experts.up_proj.data)
+    nn.init.xavier_normal_(block.experts.down_proj.data)
+    nn.init.xavier_normal_(block.gate.weight.data)
+    block = block.to(DEVICE, DTYPE)
+
+    torch.manual_seed(999)
+    x = torch.randn(2, 8, 64, device=DEVICE, dtype=DTYPE)
+
+    with torch.no_grad():
+        out1, _ = block(x)
+        out2, _ = block(x)
+
+    assert torch.equal(out1, out2), f"{backend} is not deterministic"
+
+
+# ---------------------------------------------------------------------------
+# Test 4: Larger scale (closer to real model dims)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_large_scale_forward():
+    """Forward agreement at larger dimensions (E=64, H=512, I=1024, K=8)."""
+    ne, hd, inter, topk = 64, 512, 1024, 8
+    eager_block, native_block = _make_pair(ne, hd, inter, topk)
+
+    torch.manual_seed(42)
+    x = torch.randn(1, 128, hd, device=DEVICE, dtype=DTYPE)
+
+    with torch.no_grad():
+        eager_out, _ = eager_block(x)
+        native_out, _ = native_block(x)
+
+    max_diff = (eager_out - native_out).abs().max().item()
+    mean_diff = (eager_out - native_out).abs().mean().item()
+    rel_diff = ((eager_out - native_out).abs() / (eager_out.abs() + 1e-8)).mean().item()
+    print(f"\n  Large scale: max={max_diff:.6f} mean={mean_diff:.6f} rel={rel_diff:.6f}")
+
+    torch.testing.assert_close(
+        native_out, eager_out, atol=0.1, rtol=0.05,
+        msg=f"Large scale forward mismatch: max_diff={max_diff:.6f}",
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_large_scale_backward():
+    """Backward agreement at larger dimensions."""
+    ne, hd, inter, topk = 64, 512, 1024, 8
+    eager_block, native_block = _make_pair(ne, hd, inter, topk)
+
+    torch.manual_seed(42)
+    x_eager = torch.randn(1, 128, hd, device=DEVICE, dtype=DTYPE, requires_grad=True)
+    x_native = x_eager.detach().clone().requires_grad_(True)
+
+    eager_out, _ = eager_block(x_eager)
+    eager_out.sum().backward()
+    native_out, _ = native_block(x_native)
+    native_out.sum().backward()
+
+    atol, rtol = 0.1, 0.1
+
+    input_diff = (x_eager.grad - x_native.grad).abs().max().item()
+    print(f"\n  input_grad max_diff: {input_diff:.6f}")
+    torch.testing.assert_close(
+        x_native.grad, x_eager.grad, atol=atol, rtol=rtol,
+        msg=f"Large scale input gradient mismatch: {input_diff:.6f}",
+    )
+
+    for name in ["gate_proj", "up_proj", "down_proj"]:
+        eg = getattr(eager_block.experts, name).grad
+        ng = getattr(native_block.experts, name).grad
+        diff = (eg - ng).abs().max().item()
+        print(f"  {name} grad max_diff: {diff:.6f}")
+        torch.testing.assert_close(
+            ng, eg, atol=atol, rtol=rtol,
+            msg=f"Large scale {name} gradient mismatch: {diff:.6f}",
         )
 
 
 # ---------------------------------------------------------------------------
-# Test 2: Determinism + edge case (all tokens same expert)
+# Test 5: Edge case — all tokens routed to same expert
 # ---------------------------------------------------------------------------
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_determinism_and_edge_cases():
-    """Determinism: same input produces identical output. Edge case: all tokens to same expert."""
-    MoEBlock, MoEExperts = _import_moe()
-
-    for backend in ["eager", "native"]:
-        # --- Determinism ---
-        torch.manual_seed(42)
-        block = MoEBlock(64, 4, 2, 128, moe_implementation=backend)
-        nn.init.xavier_normal_(block.experts.gate_proj.data)
-        nn.init.xavier_normal_(block.experts.up_proj.data)
-        nn.init.xavier_normal_(block.experts.down_proj.data)
-        nn.init.xavier_normal_(block.gate.weight.data)
-        block = block.to(DEVICE, DTYPE)
-
-        torch.manual_seed(999)
-        x = torch.randn(2, 8, 64, device=DEVICE, dtype=DTYPE)
-        with torch.no_grad():
-            out1, _ = block(x)
-            out2, _ = block(x)
-        assert torch.equal(out1, out2), f"{backend} is not deterministic"
-
-    # --- All tokens to same expert ---
+def test_all_tokens_same_expert():
+    """When all tokens route to the same expert, outputs should still match."""
+    _, MoEExperts = _import_moe()
     from xorl.models.layers.moe.backend.native import native_expert_forward
 
     ne, hd, inter = 4, 64, 128
     torch.manual_seed(42)
+
     experts = MoEExperts(ne, hd, inter, moe_implementation="eager").to(DEVICE, DTYPE)
     nn.init.xavier_normal_(experts.gate_proj.data)
     nn.init.xavier_normal_(experts.up_proj.data)
     nn.init.xavier_normal_(experts.down_proj.data)
 
     num_tokens, top_k = 16, 2
-    x_edge = torch.randn(num_tokens, hd, device=DEVICE, dtype=DTYPE)
+    x = torch.randn(num_tokens, hd, device=DEVICE, dtype=DTYPE)
+
+    # Force all tokens to expert 0
     routing_weights = torch.ones(num_tokens, top_k, device=DEVICE, dtype=DTYPE) / top_k
     selected_experts = torch.zeros(num_tokens, top_k, device=DEVICE, dtype=torch.long)
 
     with torch.no_grad():
         native_out = native_expert_forward(
-            x_edge, routing_weights, selected_experts,
-            experts.gate_proj, experts.up_proj, experts.down_proj, num_experts=ne,
+            x, routing_weights, selected_experts,
+            experts.gate_proj, experts.up_proj, experts.down_proj,
+            num_experts=ne,
         )
-        eager_out = experts(x_edge, expert_idx=0)
 
+        # Eager: all tokens → expert 0, weight per slot = 1/topk, top_k slots → sums to 1.0
+        eager_out = experts(x, expert_idx=0)
+
+    max_diff = (eager_out - native_out).abs().max().item()
+    print(f"\n  Same-expert max_diff: {max_diff:.6f}")
     torch.testing.assert_close(
         native_out, eager_out, atol=0.01, rtol=0.01,
-        msg="Same-expert output mismatch",
+        msg=f"Same-expert output mismatch: {max_diff:.6f}",
     )
-
-
-# ---------------------------------------------------------------------------
-# Test 3: Large scale forward + backward
-# ---------------------------------------------------------------------------
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_large_scale():
-    """Forward + backward agreement at larger dimensions (E=64, H=512, I=1024, K=8)."""
-    ne, hd, inter, topk = 64, 512, 1024, 8
-    eager_block, native_block = _make_pair(ne, hd, inter, topk)
-
-    # --- Forward ---
-    torch.manual_seed(42)
-    x = torch.randn(1, 128, hd, device=DEVICE, dtype=DTYPE)
-    with torch.no_grad():
-        eager_out, _ = eager_block(x)
-        native_out, _ = native_block(x)
-    torch.testing.assert_close(
-        native_out, eager_out, atol=0.1, rtol=0.05,
-        msg="Large scale forward mismatch",
-    )
-
-    # --- Backward ---
-    torch.manual_seed(42)
-    x_eager = torch.randn(1, 128, hd, device=DEVICE, dtype=DTYPE, requires_grad=True)
-    x_native = x_eager.detach().clone().requires_grad_(True)
-
-    eager_out2, _ = eager_block(x_eager)
-    eager_out2.sum().backward()
-    native_out2, _ = native_block(x_native)
-    native_out2.sum().backward()
-
-    atol, rtol = 0.1, 0.1
-    torch.testing.assert_close(x_native.grad, x_eager.grad, atol=atol, rtol=rtol, msg="Large scale input grad mismatch")
-
-    for name in ["gate_proj", "up_proj", "down_proj"]:
-        eg = getattr(eager_block.experts, name).grad
-        ng = getattr(native_block.experts, name).grad
-        torch.testing.assert_close(ng, eg, atol=atol, rtol=rtol, msg=f"Large scale {name} gradient mismatch")
 
 
 if __name__ == "__main__":

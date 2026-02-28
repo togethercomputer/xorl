@@ -119,7 +119,6 @@ class MoEExperts(nn.Module):
             num_experts=self.num_experts,
         )
 
-    @torch.compiler.disable
     def _ep_forward(
         self,
         hidden_states: torch.Tensor,

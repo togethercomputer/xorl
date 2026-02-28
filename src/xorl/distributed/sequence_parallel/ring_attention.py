@@ -1,6 +1,6 @@
-"""Ring attention using flash_attn lower-level API.
+"""Ring attention (context parallelism) using flash_attn lower-level API.
 
-Implements distributed attention across ring-parallel ranks via P2P ring
+Implements distributed attention across context-parallel ranks via P2P ring
 communication with double-buffered CUDA streams for compute-comm overlap.
 
 Optimizations over naive all-gather approach:
@@ -18,7 +18,12 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor
 
-from flash_attn_interface import _flash_attn_backward, _flash_attn_forward
+from flash_attn.flash_attn_interface import (
+    _flash_attn_backward,
+    _flash_attn_forward,
+    _flash_attn_varlen_backward,
+    _flash_attn_varlen_forward,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -82,35 +87,35 @@ def _merge_attn_outputs(
 def _all_gather_kv(
     k: Tensor,
     v: Tensor,
-    ringattn_group: dist.ProcessGroup,
+    cp_group: dist.ProcessGroup,
 ) -> Tuple[List[Tensor], List[Tensor]]:
-    """All-gather KV from all ring ranks.
+    """All-gather KV from all CP ranks.
 
     Stacks K and V into a single buffer, performs one all_gather, then splits.
 
     Args:
         k: local key tensor [B, S_local, H_kv, D] or [total_local, H_kv, D]
         v: local value tensor, same shape as k
-        ringattn_group: ring attention process group
+        cp_group: context parallel process group
 
     Returns:
-        (k_list, v_list): lists of ringattn_size tensors, each same shape as k/v.
+        (k_list, v_list): lists of cp_size tensors, each same shape as k/v.
     """
-    ringattn_size = dist.get_world_size(ringattn_group)
+    cp_size = dist.get_world_size(cp_group)
 
     # Pack K,V into single buffer: [2, *k.shape]
     kv_local = torch.stack([k, v], dim=0).contiguous()
 
-    # All-gather: [2 * ringattn_size, *k.shape]
+    # All-gather: [2 * cp_size, *k.shape]
     kv_gathered = torch.empty(
-        (ringattn_size * kv_local.shape[0], *kv_local.shape[1:]),
+        (cp_size * kv_local.shape[0], *kv_local.shape[1:]),
         dtype=kv_local.dtype,
         device=kv_local.device,
     )
-    dist.all_gather_into_tensor(kv_gathered, kv_local, group=ringattn_group)
+    dist.all_gather_into_tensor(kv_gathered, kv_local, group=cp_group)
 
     # Split into per-rank [2, *k.shape] chunks
-    kv_chunks = kv_gathered.chunk(ringattn_size, dim=0)
+    kv_chunks = kv_gathered.chunk(cp_size, dim=0)
     k_list = [chunk[0].contiguous() for chunk in kv_chunks]
     v_list = [chunk[1].contiguous() for chunk in kv_chunks]
     return k_list, v_list
@@ -118,23 +123,23 @@ def _all_gather_kv(
 
 def _reduce_scatter_grads(
     grad_list: List[Tensor],
-    ringattn_group: dist.ProcessGroup,
+    cp_group: dist.ProcessGroup,
 ) -> Tensor:
-    """Reduce-scatter gradients back to owning ring ranks.
+    """Reduce-scatter gradients back to owning CP ranks.
 
     Args:
-        grad_list: list of ringattn_size tensors (one per rank), each same shape.
-        ringattn_group: ring attention process group.
+        grad_list: list of cp_size tensors (one per rank), each same shape.
+        cp_group: context parallel process group.
 
     Returns:
         Local gradient tensor (reduced sum of contributions from all ranks).
     """
-    # Stack into [ringattn_size, *shape] for reduce_scatter
+    # Stack into [cp_size, *shape] for reduce_scatter
     stacked = torch.stack(grad_list, dim=0).contiguous()
 
     # Output: single chunk [*shape]
     output = torch.empty_like(grad_list[0])
-    dist.reduce_scatter_tensor(output, stacked, op=dist.ReduceOp.SUM, group=ringattn_group)
+    dist.reduce_scatter_tensor(output, stacked, op=dist.ReduceOp.SUM, group=cp_group)
     return output
 
 
@@ -149,7 +154,7 @@ def _p2p_communicate(
     send_dst: int,
     recv_buf: Tensor,
     recv_src: int,
-    ringattn_group: dist.ProcessGroup,
+    cp_group: dist.ProcessGroup,
 ) -> List:
     """Async P2P send/recv with deadlock avoidance.
 
@@ -161,33 +166,33 @@ def _p2p_communicate(
     """
     ops = []
     if rank % 2 == 0:
-        ops.append(dist.P2POp(dist.isend, send_buf, send_dst, ringattn_group))
-        ops.append(dist.P2POp(dist.irecv, recv_buf, recv_src, ringattn_group))
+        ops.append(dist.P2POp(dist.isend, send_buf, send_dst, cp_group))
+        ops.append(dist.P2POp(dist.irecv, recv_buf, recv_src, cp_group))
     else:
-        ops.append(dist.P2POp(dist.irecv, recv_buf, recv_src, ringattn_group))
-        ops.append(dist.P2POp(dist.isend, send_buf, send_dst, ringattn_group))
+        ops.append(dist.P2POp(dist.irecv, recv_buf, recv_src, cp_group))
+        ops.append(dist.P2POp(dist.isend, send_buf, send_dst, cp_group))
     return dist.batch_isend_irecv(ops)
 
 
 # ---------------------------------------------------------------------------
 # Zigzag Load Balancing
 # ---------------------------------------------------------------------------
-# Data arrives pre-zigzagged from the collator: each ring rank holds
+# Data arrives pre-zigzagged from the collator: each CP rank holds
 # [early_chunk, late_chunk] per document. The section logic below determines
 # which sub-tensors to use at each ring step.
 
 
-def _zigzag_min_chunk_id(rank: int, ringattn_size: int) -> int:
+def _zigzag_min_chunk_id(rank: int, cp_size: int) -> int:
     """Get the minimum global chunk position for a rank after zigzag.
 
-    After zigzag reorder, rank r holds sub-chunks [r, 2*ringattn_size-1-r].
-    The minimum is simply min(r, 2*ringattn_size-1-r).
+    After zigzag reorder, rank r holds sub-chunks [r, 2*cp_size-1-r].
+    The minimum is simply min(r, 2*cp_size-1-r).
     """
-    return min(rank, 2 * ringattn_size - 1 - rank)
+    return min(rank, 2 * cp_size - 1 - rank)
 
 
 def _get_zigzag_step_section(
-    ringattn_rank: int, ringattn_size: int, step: int
+    cp_rank: int, cp_size: int, step: int
 ) -> str:
     """Determine the section type for a load-balanced ring step.
 
@@ -199,9 +204,9 @@ def _get_zigzag_step_section(
     """
     if step == 0:
         return "diagonal"
-    source = (ringattn_rank - step) % ringattn_size
-    min_q = _zigzag_min_chunk_id(ringattn_rank, ringattn_size)
-    min_kv = _zigzag_min_chunk_id(source, ringattn_size)
+    source = (cp_rank - step) % cp_size
+    min_q = _zigzag_min_chunk_id(cp_rank, cp_size)
+    min_kv = _zigzag_min_chunk_id(source, cp_size)
     if min_q > min_kv:
         return "lower"   # Q's early chunk is later → all Q attends to KV first half
     else:
@@ -240,24 +245,38 @@ def _compute_half_indices(cu_seqlens: Tensor) -> Tuple[Tensor, Tensor]:
 
 def _flash_fwd(q, k, v, softmax_scale, dropout_p, causal, is_varlen,
                cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=None, max_seqlen_k=None):
-    """Flash attention forward (FA3). Handles both batched and varlen via cu_seqlens kwargs."""
-    kwargs = dict(softmax_scale=softmax_scale, causal=causal)
+    """Unified flash attention forward for batched or varlen."""
     if is_varlen:
-        kwargs.update(cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
-                      max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k)
-    out, lse, _, _ = _flash_attn_forward(q, k, v, **kwargs)
+        out, lse, _, _ = _flash_attn_varlen_forward(
+            q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+            dropout_p, softmax_scale, causal,
+            -1, -1, 0.0, None, False,
+        )
+    else:
+        out, lse, _, _ = _flash_attn_forward(
+            q, k, v, dropout_p, softmax_scale, causal,
+            -1, -1, 0.0, None, False,
+        )
     return out, lse
 
 
 def _flash_bwd(grad_out, q, k, v, out, lse, dq, dk, dv, softmax_scale, dropout_p,
                causal, is_varlen, cu_seqlens_q=None, cu_seqlens_k=None,
                max_seqlen_q=None, max_seqlen_k=None):
-    """Flash attention backward (FA3). Handles both batched and varlen via cu_seqlens kwargs."""
-    kwargs = dict(softmax_scale=softmax_scale, is_causal=causal, dq=dq, dk=dk, dv=dv)
+    """Unified flash attention backward for batched or varlen."""
     if is_varlen:
-        kwargs.update(cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
-                      max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k)
-    _flash_attn_backward(grad_out, q, k, v, out, lse, **kwargs)
+        _flash_attn_varlen_backward(
+            grad_out, q, k, v, out, lse, dq, dk, dv,
+            cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+            dropout_p, softmax_scale, causal,
+            -1, -1, 0.0, None, False, None,
+        )
+    else:
+        _flash_attn_backward(
+            grad_out, q, k, v, out, lse, dq, dk, dv,
+            dropout_p, softmax_scale, causal,
+            -1, -1, 0.0, None, False, None,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -288,25 +307,25 @@ class RingAttentionP2PFunc(torch.autograd.Function):
         softmax_scale: float,
         dropout_p: float,
         causal: bool,
-        ringattn_group: dist.ProcessGroup,
+        cp_group: dist.ProcessGroup,
         cu_seqlens_q: Optional[Tensor] = None,
         cu_seqlens_k: Optional[Tensor] = None,
         max_seqlen_q: Optional[int] = None,
         max_seqlen_k: Optional[int] = None,
     ) -> Tensor:
-        ringattn_rank = dist.get_rank(ringattn_group)
-        ringattn_size = dist.get_world_size(ringattn_group)
+        cp_rank = dist.get_rank(cp_group)
+        cp_size = dist.get_world_size(cp_group)
         is_varlen = cu_seqlens_q is not None
 
         # Zigzag load balancing: data arrives pre-zigzagged from the collator.
         # Each rank holds [early_chunk, late_chunk] per document.
-        zigzag = causal and ringattn_size > 1
+        zigzag = causal and cp_size > 1
         seq_dim = 0 if is_varlen else 1  # varlen: [total, H, D], batched: [B, S, H, D]
 
         # P2P ring destinations (convert group-local to global ranks)
-        global_ranks = dist.get_process_group_ranks(ringattn_group)
-        send_dst = global_ranks[(ringattn_rank + 1) % ringattn_size]
-        recv_src = global_ranks[(ringattn_rank - 1) % ringattn_size]
+        global_ranks = dist.get_process_group_ranks(cp_group)
+        send_dst = global_ranks[(cp_rank + 1) % cp_size]
+        recv_src = global_ranks[(cp_rank - 1) % cp_size]
 
         # Pack KV into contiguous buffer for P2P
         k_numel = k.numel()
@@ -337,24 +356,24 @@ class RingAttentionP2PFunc(torch.autograd.Function):
             max_half_q = max_seqlen_q // 2 if max_seqlen_q else None
             max_half_k = max_seqlen_k // 2 if max_seqlen_k else None
 
-        for i in range(ringattn_size):
+        for i in range(cp_size):
             # Wait for P2P recv of kv_bufs[i%2] to complete
             for req in send_recv_reqs:
                 req.wait()  # syncs compute_stream with NCCL completion
             send_recv_reqs = []
 
             # Post P2P for NEXT step on comm_stream (overlaps with compute below)
-            if i < ringattn_size - 1:
+            if i < cp_size - 1:
                 with torch.cuda.stream(comm_stream):
                     # Wait for compute to finish reading kv_bufs[(i+1)%2]
                     comm_stream.wait_stream(compute_stream)
                     send_recv_reqs = _p2p_communicate(
-                        ringattn_rank,
+                        cp_rank,
                         kv_bufs[i % 2],
                         send_dst,
                         kv_bufs[(i + 1) % 2],
                         recv_src,
-                        ringattn_group,
+                        cp_group,
                     )
 
             # Extract K,V from current buffer (on compute_stream)
@@ -363,7 +382,7 @@ class RingAttentionP2PFunc(torch.autograd.Function):
 
             # Determine section and compute attention
             if zigzag:
-                section = _get_zigzag_step_section(ringattn_rank, ringattn_size, i)
+                section = _get_zigzag_step_section(cp_rank, cp_size, i)
 
                 if section == "lower":
                     # All Q attends to early half of each doc in KV (no mask)
@@ -409,7 +428,7 @@ class RingAttentionP2PFunc(torch.autograd.Function):
 
                 computed_steps.append((i, section))
             else:
-                # Non-causal or ringattn_size==1: no zigzag needed
+                # Non-causal or cp_size==1: no zigzag needed
                 step_causal = False
                 out_step, lse_step = _flash_fwd(
                     q, k_step, v_step, softmax_scale, dropout_p,
@@ -488,9 +507,9 @@ class RingAttentionP2PFunc(torch.autograd.Function):
             save_tensors.extend([cu_seqlens_q, cu_seqlens_k])
 
         ctx.save_for_backward(*save_tensors)
-        ctx.ringattn_group = ringattn_group
-        ctx.ringattn_rank = ringattn_rank
-        ctx.ringattn_size = ringattn_size
+        ctx.cp_group = cp_group
+        ctx.cp_rank = cp_rank
+        ctx.cp_size = cp_size
         ctx.softmax_scale = softmax_scale
         ctx.dropout_p = dropout_p
         ctx.causal = causal
@@ -506,9 +525,9 @@ class RingAttentionP2PFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
-        ringattn_group = ctx.ringattn_group
-        ringattn_rank = ctx.ringattn_rank
-        ringattn_size = ctx.ringattn_size
+        cp_group = ctx.cp_group
+        cp_rank = ctx.cp_rank
+        cp_size = ctx.cp_size
         is_varlen = ctx.is_varlen
         zigzag = ctx.zigzag
 
@@ -529,8 +548,8 @@ class RingAttentionP2PFunc(torch.autograd.Function):
         early_idx = ctx.early_idx
         late_idx = ctx.late_idx
 
-        # Re-gather KV from all ring ranks
-        k_all, v_all = _all_gather_kv(k_saved, v_saved, ringattn_group)
+        # Re-gather KV from all CP ranks
+        k_all, v_all = _all_gather_kv(k_saved, v_saved, cp_group)
 
         # Precompute half cu_seqlens for varlen zigzag
         cu_half_q = cu_half_k = None
@@ -543,12 +562,12 @@ class RingAttentionP2PFunc(torch.autograd.Function):
 
         # Initialize gradient accumulators
         dq = torch.zeros_like(q)
-        dk_all = [torch.zeros_like(k_all[i]) for i in range(ringattn_size)]
-        dv_all = [torch.zeros_like(v_all[i]) for i in range(ringattn_size)]
+        dk_all = [torch.zeros_like(k_all[i]) for i in range(cp_size)]
+        dv_all = [torch.zeros_like(v_all[i]) for i in range(cp_size)]
 
         # Backward ring loop
         for step_i, section in ctx.computed_steps:
-            kv_source = (ringattn_rank - step_i) % ringattn_size
+            kv_source = (cp_rank - step_i) % cp_size
             k_step = k_all[kv_source]
             v_step = v_all[kv_source]
 
@@ -654,8 +673,8 @@ class RingAttentionP2PFunc(torch.autograd.Function):
                 dv_all[kv_source].add_(dv_step)
 
         # Reduce-scatter dk, dv back to owning ranks
-        dk = _reduce_scatter_grads(dk_all, ringattn_group)
-        dv = _reduce_scatter_grads(dv_all, ringattn_group)
+        dk = _reduce_scatter_grads(dk_all, cp_group)
+        dv = _reduce_scatter_grads(dv_all, cp_group)
 
         return dq, dk, dv, None, None, None, None, None, None, None, None
 
@@ -669,7 +688,7 @@ def ring_flash_attention_forward(
     q: Tensor,
     k: Tensor,
     v: Tensor,
-    ringattn_group: dist.ProcessGroup,
+    cp_group: dist.ProcessGroup,
     softmax_scale: Optional[float] = None,
     dropout_p: float = 0.0,
     causal: bool = True,
@@ -680,8 +699,8 @@ def ring_flash_attention_forward(
 ) -> Tensor:
     """Ring flash attention forward pass.
 
-    Each ring rank holds a shard of the sequence. KV is rotated across the
-    ring group via P2P, and flash attention is computed per-step with online
+    Each CP rank holds a shard of the sequence. KV is rotated across the
+    CP group via P2P, and flash attention is computed per-step with online
     LSE merging. Uses double-buffered CUDA streams for compute-comm overlap.
 
     For causal batched attention, zigzag redistribution ensures all
@@ -691,7 +710,7 @@ def ring_flash_attention_forward(
         q: query tensor [B, S_local, H_q, D] or [total_local, H_q, D] for varlen
         k: key tensor [B, S_local, H_kv, D] or [total_local, H_kv, D]
         v: value tensor, same shape as k
-        ringattn_group: ring attention process group
+        cp_group: context parallel process group
         softmax_scale: attention scale (defaults to 1/sqrt(head_dim))
         dropout_p: dropout probability
         causal: whether to use causal attention
@@ -722,7 +741,7 @@ def ring_flash_attention_forward(
         softmax_scale,
         dropout_p,
         causal,
-        ringattn_group,
+        cp_group,
         cu_seqlens_q,
         cu_seqlens_k,
         max_seqlen_q,

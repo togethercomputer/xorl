@@ -1,8 +1,9 @@
 """Test vocab-parallel cross-entropy with funcol.
 
-Can be run two ways:
-    1. pytest tests/distributed/test_vocab_parallel_ce.py -v   (launches torchrun internally)
-    2. torchrun --nproc_per_node=2 tests/distributed/test_vocab_parallel_ce.py  (direct)
+Run with:
+    torchrun --nproc_per_node=2 tests/distributed/test_vocab_parallel_ce.py
+    torchrun --nproc_per_node=4 tests/distributed/test_vocab_parallel_ce.py
+    torchrun --nproc_per_node=8 tests/distributed/test_vocab_parallel_ce.py
 """
 
 import os
@@ -15,11 +16,6 @@ import torch.nn.functional as F
 from xorl.ops.loss.vocab_parallel_cross_entropy import vocab_parallel_cross_entropy
 
 
-# ============================================================================
-# Distributed test functions (run inside torchrun)
-# ============================================================================
-
-
 def setup():
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
@@ -27,7 +23,7 @@ def setup():
     return rank, dist.get_world_size()
 
 
-def check_correctness(rank, world_size, tp_group):
+def test_correctness(rank, world_size, tp_group):
     """Compare vocab-parallel CE against full-gather reference."""
     torch.manual_seed(42)
     BT = 128
@@ -60,7 +56,7 @@ def check_correctness(rank, world_size, tp_group):
         assert err < 1e-3, f"Error too large ({mode}): {err}"
 
 
-def check_backward(rank, world_size, tp_group):
+def test_backward(rank, world_size, tp_group):
     """Test gradients against full-gather reference."""
     torch.manual_seed(42)
     BT = 64
@@ -137,7 +133,7 @@ def _bench_one(hidden_states, local_weight, labels, tp_group, use_compile,
     return ms, peak_activation_mb, peak_mem / 1024 / 1024
 
 
-def bench_perf(rank, world_size, tp_group):
+def test_perf(rank, world_size, tp_group):
     """Benchmark eager vs compiled vocab-parallel CE with memory tracking."""
     torch.manual_seed(42)
     BT = 4096
@@ -197,59 +193,23 @@ def main():
     if rank == 0:
         print(f"=== test_vocab_parallel_ce (tp={world_size}) ===\n")
 
-    check_correctness(rank, world_size, tp_group)
+    test_correctness(rank, world_size, tp_group)
     dist.barrier()
     if rank == 0:
         print()
 
-    check_backward(rank, world_size, tp_group)
+    test_backward(rank, world_size, tp_group)
     dist.barrier()
     if rank == 0:
         print()
 
-    bench_perf(rank, world_size, tp_group)
+    test_perf(rank, world_size, tp_group)
     dist.barrier()
 
     if rank == 0:
         print("\nAll tests passed!")
 
     dist.destroy_process_group()
-
-
-# ============================================================================
-# Pytest wrappers (launch torchrun internally)
-# ============================================================================
-
-if __name__ != "__main__":
-    # Only define pytest tests when imported by pytest (not when run via torchrun)
-    import pytest
-    from tests.distributed.distributed_utils import run_distributed_script, skip_if_gpu_count_less_than
-
-    SCRIPT_PATH = os.path.abspath(__file__)
-
-    @pytest.mark.gpu
-    @pytest.mark.distributed
-    @skip_if_gpu_count_less_than(2)
-    def test_vocab_parallel_ce_2gpu():
-        """Vocab-parallel cross-entropy correctness + backward with 2 GPUs."""
-        result = run_distributed_script(SCRIPT_PATH, num_gpus=2, timeout=180)
-        result.assert_success()
-
-    @pytest.mark.gpu
-    @pytest.mark.distributed
-    @skip_if_gpu_count_less_than(4)
-    def test_vocab_parallel_ce_4gpu():
-        """Vocab-parallel cross-entropy correctness + backward with 4 GPUs."""
-        result = run_distributed_script(SCRIPT_PATH, num_gpus=4, timeout=180)
-        result.assert_success()
-
-    @pytest.mark.gpu
-    @pytest.mark.distributed
-    @skip_if_gpu_count_less_than(8)
-    def test_vocab_parallel_ce_8gpu():
-        """Vocab-parallel cross-entropy correctness + backward with 8 GPUs."""
-        result = run_distributed_script(SCRIPT_PATH, num_gpus=8, timeout=180)
-        result.assert_success()
 
 
 if __name__ == "__main__":

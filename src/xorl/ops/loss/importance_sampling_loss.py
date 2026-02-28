@@ -1,9 +1,11 @@
 from typing import Dict, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from .compiled_cross_entropy import compiled_cross_entropy_function
+from .vocab_parallel_cross_entropy import vocab_parallel_cross_entropy
 
 
 def _compute_per_token_ce(
@@ -13,21 +15,30 @@ def _compute_per_token_ce(
     ignore_index: int,
     ce_mode: str,
     num_chunks: int = 8,
+    tp_group: Optional[dist.ProcessGroup] = None,
 ) -> torch.Tensor:
     """
     Compute per-token cross-entropy loss based on the specified mode.
 
     Args:
         hidden_states_flat: Flattened hidden states, shape (BT, H)
-        weight: LM head weight matrix, shape (V, H)
+        weight: LM head weight matrix, shape (V, H) or (V/tp, H) with TP
         labels_flat: Flattened labels, shape (BT,)
         ignore_index: Index to ignore in loss computation
         ce_mode: Cross-entropy computation mode ("compiled" or "eager")
         num_chunks: Number of chunks for compiled mode
+        tp_group: TP process group for vocab-parallel cross-entropy (default: None)
 
     Returns:
         per_token_ce: Per-token cross-entropy loss, shape (BT,)
     """
+    if tp_group is not None:
+        local_weight = weight.to_local() if hasattr(weight, "to_local") else weight
+        return vocab_parallel_cross_entropy(
+            hidden_states_flat, local_weight, labels_flat, tp_group,
+            ignore_index=ignore_index,
+        )
+
     if ce_mode == "compiled":
         # Uses torch.compile to avoid materializing full [BT, V] logits
         per_token_ce = compiled_cross_entropy_function(hidden_states_flat, weight, labels_flat, ignore_index, num_chunks)
@@ -49,6 +60,7 @@ def importance_sampling_loss_function(
     num_chunks: int = 8,
     ce_mode: str = "compiled",
     return_per_token: bool = False,
+    tp_group: Optional[dist.ProcessGroup] = None,
     compute_kl_stats: bool = False,
 ) -> Tuple[torch.Tensor, None, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
     """
@@ -102,7 +114,8 @@ def importance_sampling_loss_function(
 
     # ---- Cross-entropy computation ----
     per_token_ce = _compute_per_token_ce(
-        hidden_states_flat, weight, labels_flat, ignore_index, ce_mode, num_chunks
+        hidden_states_flat, weight, labels_flat, ignore_index, ce_mode, num_chunks,
+        tp_group=tp_group,
     )
 
     # new logprobs = log p(target) = -CE

@@ -35,18 +35,8 @@ from xorl.lora.utils import (
     count_lora_parameters,
 )
 
-# Xorl-based MoE LoRA (efficient group GEMM kernels)
-from xorl.models.transformers.qwen3_moe.qwen3_moe_lora import (
-    LoRAConfig,
-    Qwen3MoeFusedExpertsWithLoRA,
-    Qwen3MoeSparseMoeBlockWithLoRA,
-    Qwen3MoeSparseFusedMoeBlockWithLoRA,
-    copy_weights_to_lora_experts,
-    create_sparse_lora_experts_from_base,
-    create_fused_lora_experts_from_base,
-    mark_only_lora_as_trainable,
-    lora_state_dict,
-)
+# MoE LoRA — deferred to avoid circular import with xorl.models.layers.moe.
+# Access via xorl.lora.MoEExpertsLoRA etc. triggers __getattr__ below.
 
 # Xorl ops for direct access
 from xorl.ops.group_gemm.kernel import (
@@ -83,14 +73,10 @@ __all__ = [
     # Checkpoint utilities
     "save_lora_checkpoint",
     "load_lora_checkpoint",
-    # Xorl MoE LoRA (inline computation - recommended)
-    "LoRAConfig",
-    "Qwen3MoeFusedExpertsWithLoRA",
-    "Qwen3MoeSparseMoeBlockWithLoRA",
-    "Qwen3MoeSparseFusedMoeBlockWithLoRA",
+    # MoE LoRA (lazy)
+    "MoELoRAConfig",
+    "MoEExpertsLoRA",
     "copy_weights_to_lora_experts",
-    "create_sparse_lora_experts_from_base",
-    "create_fused_lora_experts_from_base",
     "mark_only_lora_as_trainable",
     "lora_state_dict",
     # Xorl ops
@@ -100,3 +86,31 @@ __all__ = [
     "unmerge_lora_weights_stacked",
     "get_lora_delta_weight_stacked",
 ]
+
+
+# Lazy imports for MoE LoRA to break circular import:
+# moe/lora.py → xorl.lora.modules.base → xorl.lora → xorl.models.layers.moe (cycle)
+_MOE_LAZY_ATTRS = {
+    "MoELoRAConfig", "MoEExpertsLoRA",
+    "copy_weights_to_lora_experts", "mark_only_lora_as_trainable", "lora_state_dict",
+}
+
+
+def __getattr__(name):
+    if name in _MOE_LAZY_ATTRS:
+        from xorl.models.layers.moe.lora import (
+            MoELoRAConfig,
+            MoEExpertsLoRA,
+            copy_weights_to_lora_experts,
+            mark_only_lora_as_trainable,
+            lora_state_dict,
+        )
+        # Cache all at once to avoid repeated imports
+        g = globals()
+        g["MoELoRAConfig"] = MoELoRAConfig
+        g["MoEExpertsLoRA"] = MoEExpertsLoRA
+        g["copy_weights_to_lora_experts"] = copy_weights_to_lora_experts
+        g["mark_only_lora_as_trainable"] = mark_only_lora_as_trainable
+        g["lora_state_dict"] = lora_state_dict
+        return g[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

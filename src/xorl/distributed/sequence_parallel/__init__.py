@@ -29,13 +29,29 @@ from .data import (
     slice_input_tensor_scale_grad,
     slice_position_embedding,
 )
-from .loss import reduce_sequence_parallel_loss
 from .ulysses import (
     all_to_all_images,
     gather_heads_scatter_seq,
     gather_seq_scatter_heads,
 )
+from .strategy import (
+    HybridUlyssesRingStrategy,
+    NoopStrategy,
+    RingAttentionStrategy,
+    SPStrategy,
+    UlyssesAsyncStrategy,
+    UlyssesSyncStrategy,
+    get_sp_strategy,
+)
 from .utils import pad_tensor, unpad_tensor, vlm_images_a2a_meta
+
+
+def __getattr__(name):
+    if name == "ring_flash_attention_forward":
+        from .ring_attention import ring_flash_attention_forward
+
+        return ring_flash_attention_forward
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [
@@ -66,9 +82,16 @@ __all__ = [
     "vlm_images_a2a_meta",
     "pad_tensor",
     "unpad_tensor",
-    "reduce_sequence_parallel_loss",
     "async_ulysses_qkv_projection",
     "async_ulysses_output_projection",
     "divide_qkv_linear_weight",
     "divide_qkv_linear_bias",
+    "SPStrategy",
+    "NoopStrategy",
+    "UlyssesSyncStrategy",
+    "UlyssesAsyncStrategy",
+    "RingAttentionStrategy",
+    "HybridUlyssesRingStrategy",
+    "ring_flash_attention_forward",
+    "get_sp_strategy",
 ]

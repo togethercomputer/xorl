@@ -299,142 +299,66 @@ class TestGroupGemmSameMN:
         b = torch.randn(total_K, N, dtype=torch.bfloat16).cuda()
         c = torch.empty(G, M, N, dtype=torch.bfloat16).cuda()
         
-        # Compute with kernel
-        group_gemm_same_mn(a, b, c, cumsum_K, max_K)
-        
-        # Compute with naive implementation
+        # Compute with kernel — transpose_a=True because a is (total_K, M) layout
+        group_gemm_same_mn(a, b, c, cumsum_K, max_K, transpose_a=True)
+
+        # Compute with naive implementation (handles transpose explicitly)
         output_naive = naive_group_gemm_same_mn(a, b, cumsum_K, M, N)
-        
+
         # Compare results
         assert c.shape == output_naive.shape
         assert torch.allclose(c.float(), output_naive.float(), rtol=1e-2, atol=1e-2)
-    
+
     def test_unequal_group_sizes(self):
         """Test with very unequal K dimensions."""
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
-        
+
         try:
             from xorl.ops.group_gemm.kernel.group_gemm import group_gemm_same_mn
         except ImportError:
             pytest.skip("group_gemm not available")
-        
+
         G, M, N = 8, 64, 128
         group_Ks = [10, 200, 5, 100, 50, 15, 90, 30]  # Very unequal
         total_K = sum(group_Ks)
         cumsum_K = torch.tensor([sum(group_Ks[:i+1]) for i in range(G)], dtype=torch.int32).cuda()
         max_K = max(group_Ks)
-        
+
         a = torch.randn(total_K, M, dtype=torch.float16).cuda()
         b = torch.randn(total_K, N, dtype=torch.float16).cuda()
         c = torch.empty(G, M, N, dtype=torch.float16).cuda()
-        
-        group_gemm_same_mn(a, b, c, cumsum_K, max_K)
+
+        group_gemm_same_mn(a, b, c, cumsum_K, max_K, transpose_a=True)
         output_naive = naive_group_gemm_same_mn(a, b, cumsum_K, M, N)
-        
+
         assert torch.allclose(c.float(), output_naive.float(), rtol=1e-2, atol=1e-2)
-    
+
     def test_zero_k_dimension(self):
         """Test handling of zero K dimension for some groups."""
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
-        
+
         try:
             from xorl.ops.group_gemm.kernel.group_gemm import group_gemm_same_mn
         except ImportError:
             pytest.skip("group_gemm not available")
-        
+
         G, M, N = 4, 64, 128
         group_Ks = [64, 0, 96, 32]  # Second group has K=0
         total_K = sum(group_Ks)
         cumsum_K = torch.tensor([sum(group_Ks[:i+1]) for i in range(G)], dtype=torch.int32).cuda()
         max_K = max(group_Ks)
-        
+
         a = torch.randn(total_K, M, dtype=torch.bfloat16).cuda()
         b = torch.randn(total_K, N, dtype=torch.bfloat16).cuda()
         c = torch.empty(G, M, N, dtype=torch.bfloat16).cuda()
-        
-        group_gemm_same_mn(a, b, c, cumsum_K, max_K)
+
+        group_gemm_same_mn(a, b, c, cumsum_K, max_K, transpose_a=True)
         output_naive = naive_group_gemm_same_mn(a, b, cumsum_K, M, N)
-        
+
         # Check that second group is zero
         assert torch.all(c[1] == 0)
-        assert torch.allclose(c.float(), output_naive.float(), rtol=1e-2, atol=1e-2)
-    
-    def test_with_transpose_b_raises_error(self):
-        """Test that transpose_b with problematic dimensions raises ValueError."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
-        try:
-            from xorl.ops.group_gemm.kernel.group_gemm import group_gemm_same_mn
-        except ImportError:
-            pytest.skip("group_gemm not available")
-
-        # This should raise ValueError due to M=128 and non-aligned K
-        G, M, N = 4, 128, 256
-        group_Ks = [64, 128, 96, 112]  # 112 is not divisible by 32
-        total_K = sum(group_Ks)
-        cumsum_K = torch.tensor([sum(group_Ks[:i+1]) for i in range(G)], dtype=torch.int32).cuda()
-        max_K = max(group_Ks)
-
-        a = torch.randn(total_K, M, dtype=torch.bfloat16).cuda()
-        b = torch.randn(N, total_K, dtype=torch.bfloat16).cuda()  # Transposed
-        c = torch.empty(G, M, N, dtype=torch.bfloat16).cuda()
-
-        with pytest.raises(ValueError, match="transpose_b=True with M=128 and K dimensions not divisible by 32"):
-            group_gemm_same_mn(a, b, c, cumsum_K, max_K, transpose_b=True)
-
-    def test_with_transpose_b_safe_dimensions(self):
-        """Test that transpose_b works with safe dimensions (M=130, aligned K)."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
-        try:
-            from xorl.ops.group_gemm.kernel.group_gemm import group_gemm_same_mn
-        except ImportError:
-            pytest.skip("group_gemm not available")
-
-        # Safe: M=130 (not in problematic range) and all K divisible by 32
-        G, M, N = 4, 130, 256
-        group_Ks = [64, 128, 96, 32]  # All divisible by 32
-        total_K = sum(group_Ks)
-        cumsum_K = torch.tensor([sum(group_Ks[:i+1]) for i in range(G)], dtype=torch.int32).cuda()
-        max_K = max(group_Ks)
-
-        a = torch.randn(total_K, M, dtype=torch.bfloat16).cuda()
-        b = torch.randn(N, total_K, dtype=torch.bfloat16).cuda()  # Transposed
-        c = torch.empty(G, M, N, dtype=torch.bfloat16).cuda()
-
-        group_gemm_same_mn(a, b, c, cumsum_K, max_K, transpose_b=True)
-        output_naive = naive_group_gemm_same_mn(a, b, cumsum_K, M, N, transpose_b=True)
-
-        assert torch.allclose(c.float(), output_naive.float(), rtol=1e-2, atol=1e-2)
-
-    def test_with_transpose_b_aligned_k(self):
-        """Test that transpose_b works when all K values are divisible by 32, even with M=128."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-
-        try:
-            from xorl.ops.group_gemm.kernel.group_gemm import group_gemm_same_mn
-        except ImportError:
-            pytest.skip("group_gemm not available")
-
-        # Should work: M=128 but all K divisible by 32
-        G, M, N = 4, 128, 256
-        group_Ks = [64, 128, 96, 128]  # All divisible by 32
-        total_K = sum(group_Ks)
-        cumsum_K = torch.tensor([sum(group_Ks[:i+1]) for i in range(G)], dtype=torch.int32).cuda()
-        max_K = max(group_Ks)
-
-        a = torch.randn(total_K, M, dtype=torch.bfloat16).cuda()
-        b = torch.randn(N, total_K, dtype=torch.bfloat16).cuda()  # Transposed
-        c = torch.empty(G, M, N, dtype=torch.bfloat16).cuda()
-
-        group_gemm_same_mn(a, b, c, cumsum_K, max_K, transpose_b=True)
-        output_naive = naive_group_gemm_same_mn(a, b, cumsum_K, M, N, transpose_b=True)
-
         assert torch.allclose(c.float(), output_naive.float(), rtol=1e-2, atol=1e-2)
     
     def test_single_group(self):
@@ -455,9 +379,9 @@ class TestGroupGemmSameMN:
         b = torch.randn(K, N, dtype=torch.float16).cuda()
         c = torch.empty(G, M, N, dtype=torch.float16).cuda()
         
-        group_gemm_same_mn(a, b, c, cumsum_K, max_K)
-        
-        # Expected result: (M, K) @ (K, N) = (M, N)
+        group_gemm_same_mn(a, b, c, cumsum_K, max_K, transpose_a=True)
+
+        # Expected result: a^T @ b = (M, K) @ (K, N) = (M, N)
         output_expected = torch.matmul(a.t(), b).unsqueeze(0)
         
         assert torch.allclose(c.float(), output_expected.float(), rtol=1e-2, atol=1e-2)

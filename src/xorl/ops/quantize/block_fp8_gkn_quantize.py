@@ -71,7 +71,7 @@ def _block_fp8_quantize_gkn_kernel(
 
 
 def block_fp8_quantize_gkn(
-    x: torch.Tensor, block_size: int = 128,
+    x: torch.Tensor, block_size: int = 128
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize a 2D weight matrix to FP8 using 2D block-based quantization.
 
@@ -98,10 +98,7 @@ def block_fp8_quantize_gkn(
         triton.cdiv(M, block_size),
         triton.cdiv(N, block_size),
     )
-    _block_fp8_quantize_gkn_kernel[grid](
-        x, y, s, M, N,
-        BLOCK_SIZE=block_size,
-    )
+    _block_fp8_quantize_gkn_kernel[grid](x, y, s, M, N, BLOCK_SIZE=block_size)
     return y, s
 
 

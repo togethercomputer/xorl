@@ -9,8 +9,6 @@ from .buffers import (
     model_has_gate_up_merged,
     checkpoint_has_separate_gate_up,
 )
-from .qwen3 import Qwen3CheckpointHandler
-from .qwen3_moe import Qwen3MoeCheckpointHandler
 
 __all__ = [
     "CheckpointHandler",
@@ -22,6 +20,4 @@ __all__ = [
     "model_needs_expert_merging",
     "model_has_gate_up_merged",
     "checkpoint_has_separate_gate_up",
-    "Qwen3CheckpointHandler",
-    "Qwen3MoeCheckpointHandler",
 ]
