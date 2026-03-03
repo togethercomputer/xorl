@@ -1063,6 +1063,31 @@ class LoRAArguments:
                   "(exclude_modules / modules_to_not_convert). "
                   "Example: ['lm_head', 'gate']"},
     )
+    # QLoRA error reduction techniques (all opt-in, disabled by default)
+    enable_hadamard: bool = field(
+        default=False,
+        metadata={"help": "Enable Hadamard rotation before quantizing to spread outliers."},
+    )
+    hadamard_block_size: int = field(
+        default=256,
+        metadata={"help": "Block size for Hadamard rotation (must be power of 2)."},
+    )
+    stochastic_rounding: bool = field(
+        default=False,
+        metadata={"help": "Use stochastic rounding in FP4/FP8 encoding."},
+    )
+    clip_ratio: Optional[float] = field(
+        default=1.0,
+        metadata={"help": "Scale clipping ratio (0.0-1.0). None = auto-search MSE-optimal. 1.0 = disabled."},
+    )
+    enable_aqn: bool = field(
+        default=False,
+        metadata={"help": "Enable Adaptive Quantization Noise during training forward passes."},
+    )
+    aqn_alpha: float = field(
+        default=1.0,
+        metadata={"help": "Scale factor for AQN noise magnitude."},
+    )
 
 
 @dataclass

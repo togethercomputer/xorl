@@ -18,6 +18,27 @@ def _fp4_encode(val):
 
 
 @triton.jit
+def _fp4_encode_stochastic(val, noise):
+    """FP4 E2M1 encode with stochastic rounding.
+
+    Instead of deterministic round-to-nearest, adds uniform noise before
+    rounding so E[quant(x)] = x (unbiased). noise should be ~ Uniform(0,1).
+
+    The perturbation is applied to the absolute value before encoding,
+    effectively randomizing which of the two nearest FP4 codes is chosen.
+    """
+    sign = (val < 0.0).to(tl.int32) * 8
+    a = tl.abs(val)
+    # Add stochastic perturbation: shift by (noise-0.5)*step where step~0.5
+    # for the linear region. This makes rounding probabilistic.
+    a = a + (noise - 0.5) * 0.5
+    a = tl.maximum(a, 0.0)
+    lo = tl.minimum((a * 2.0 + 0.5).to(tl.int32), 3)
+    hi = 4 + (a >= 2.5).to(tl.int32) + (a >= 3.5).to(tl.int32) + (a >= 5.0).to(tl.int32)
+    return tl.where(a >= 1.75, hi, lo) + sign
+
+
+@triton.jit
 def _fp4_decode(code):
     """FP4 E2M1 decode via IEEE754 bit construction (avoids exp2)."""
     c = (code & 0x7).to(tl.int32)

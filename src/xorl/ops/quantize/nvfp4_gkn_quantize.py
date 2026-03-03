@@ -16,15 +16,16 @@ from torch import Tensor
 import triton
 import triton.language as tl
 
-from .fp4_codec import FP4_E2M1_MAX, FP8_E4M3_MAX, _fp4_encode, _fp4_decode
+from .fp4_codec import FP4_E2M1_MAX, FP8_E4M3_MAX, _fp4_encode, _fp4_encode_stochastic, _fp4_decode
 
 
 @triton.jit
 def _nvfp4_quantize_gkn_kernel(
     X, Out, Amax, GlobalAmax,
-    K, N,
+    K, N, clip_ratio, seed,
     BLOCK_SIZE: tl.constexpr,
     TILE_N: tl.constexpr,
+    STOCHASTIC: tl.constexpr,
 ):
     """Single-pass NVFP4 quant for [K, N] with groups along K.
 
@@ -56,14 +57,30 @@ def _nvfp4_quantize_gkn_kernel(
     amax_val = tl.maximum(tl.max(tl.abs(x_even), axis=0), tl.max(tl.abs(x_odd), axis=0))  # [TN]
     amax_val = tl.maximum(amax_val, 1e-12)
 
+    # Apply clip_ratio: reduce effective range to clip outliers
+    clipped_amax = amax_val * clip_ratio
+    clipped_amax = tl.maximum(clipped_amax, 1e-12)
+
     # Encode FP4 (codes don't depend on global scale)
-    inv_amax = 6.0 / amax_val[None, :]  # [1, TN]
+    inv_amax = 6.0 / clipped_amax[None, :]  # [1, TN]
     scaled_even = x_even * inv_amax  # [BS//2, TN]
     scaled_odd = x_odd * inv_amax  # [BS//2, TN]
+    # Clamp for clipped outliers
+    scaled_even = tl.minimum(tl.maximum(scaled_even, -6.0), 6.0)
+    scaled_odd = tl.minimum(tl.maximum(scaled_odd, -6.0), 6.0)
 
     # FP4 encode (element-wise, works directly on 2D)
-    codes_even = _fp4_encode(scaled_even)
-    codes_odd = _fp4_encode(scaled_odd)
+    if STOCHASTIC:
+        # Generate 2D noise for even and odd rows
+        even_seed_offs = (base_k + 2 * k_pair[:, None]) * N + (base_n + n_offs[None, :])
+        odd_seed_offs = (base_k + 2 * k_pair[:, None] + 1) * N + (base_n + n_offs[None, :])
+        noise_even = tl.rand(seed, even_seed_offs)
+        noise_odd = tl.rand(seed, odd_seed_offs)
+        codes_even = _fp4_encode_stochastic(scaled_even, noise_even)
+        codes_odd = _fp4_encode_stochastic(scaled_odd, noise_odd)
+    else:
+        codes_even = _fp4_encode(scaled_even)
+        codes_odd = _fp4_encode(scaled_odd)
 
     # Store per-column amax: Amax[pid_group, base_n + n]
     amax_addrs = Amax + pid_group * N + (base_n + n_offs)
@@ -161,7 +178,9 @@ def _next_pow2(n):
 
 
 def nvfp4_quantize_gkn(x: Tensor, block_size: int = 16,
-                       global_amax: Optional[Tensor] = None) -> Tuple[Tensor, Tensor, Tensor]:
+                       global_amax: Optional[Tensor] = None,
+                       clip_ratio: float = 1.0,
+                       stochastic_rounding: bool = False) -> Tuple[Tensor, Tensor, Tensor]:
     """Quantize a [K, N] weight tensor in G,K,N format to NVFP4.
 
     Groups are formed along the K (first) dimension.
@@ -170,6 +189,8 @@ def nvfp4_quantize_gkn(x: Tensor, block_size: int = 16,
         x: Weight tensor of shape [K, N]
         block_size: Number of K-elements per block.
         global_amax: Optional EMA-tracked amax to override computed global amax.
+        clip_ratio: Scale clipping ratio (0.0-1.0). Lower = more clipping.
+        stochastic_rounding: If True, use stochastic rounding in FP4 encode.
 
     Returns:
         packed: [K//2, N] uint8
@@ -188,10 +209,11 @@ def nvfp4_quantize_gkn(x: Tensor, block_size: int = 16,
     TILE_N = min(128, _next_pow2(N))
     grid = (num_blocks, (N + TILE_N - 1) // TILE_N)
 
+    seed = 0 if not stochastic_rounding else torch.randint(0, 2**31, (1,)).item()
     _nvfp4_quantize_gkn_kernel[grid](
         x.contiguous(), packed, amax, global_amax_buf,
-        K, N,
-        block_size, TILE_N,
+        K, N, clip_ratio, seed,
+        block_size, TILE_N, stochastic_rounding,
         num_warps=4,
     )
 

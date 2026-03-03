@@ -28,6 +28,7 @@ from xorl.ops.quantize import (
     nvfp4_dequantize,
 )
 from xorl.ops.quantize import block_fp8_quantize_gkn, block_fp8_dequantize_gkn
+from xorl.ops.quantize.hadamard import generate_hadamard_signs, hadamard_rotate
 from xorl.lora.modules.base import LoraModule
 
 
@@ -69,12 +70,41 @@ class QLoRALinear(LoraModule, nn.Module):
         quant_group_size: int = 16,
         bias: bool = False,
         device: Optional[torch.device] = None,
+        enable_hadamard: bool = False,
+        hadamard_block_size: int = 256,
+        stochastic_rounding: bool = False,
+        clip_ratio: Optional[float] = 1.0,
+        enable_aqn: bool = False,
+        aqn_alpha: float = 1.0,
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.quant_format = quant_format
         self.quant_group_size = quant_group_size
+
+        # Error reduction flags
+        self.enable_hadamard = enable_hadamard
+        self.hadamard_block_size = hadamard_block_size
+        self.stochastic_rounding = stochastic_rounding
+        # clip_ratio=None means auto-search on first quantize; 1.0 means no clipping
+        self._clip_ratio = clip_ratio
+        # AQN: Adaptive Quantization Noise (training-time regularization).
+        # Noise is pre-generated via prefetch_aqn_noise() before forward;
+        # falls back to inline generation if not prefetched.
+        self.enable_aqn = enable_aqn
+        self.aqn_alpha = aqn_alpha
+        self._aqn_step_cache: Optional[Tensor] = None
+        self._aqn_stream: Optional[torch.cuda.Stream] = None
+        self._aqn_noise_buf: Optional[Tensor] = None
+        self._aqn_noise_ready: bool = False
+
+        # Hadamard rotation signs (persistent buffer for checkpoint save/load)
+        if enable_hadamard:
+            signs = generate_hadamard_signs(in_features, hadamard_block_size, device=device)
+            self.register_buffer("_hadamard_signs", signs)
+        else:
+            self.register_buffer("_hadamard_signs", None)
 
         # LoRA parameters (trainable, fp32)
         self.r = r
@@ -131,6 +161,12 @@ class QLoRALinear(LoraModule, nn.Module):
         lora_alpha: int = 16,
         quant_format: str = "nvfp4",
         quant_group_size: int = 16,
+        enable_hadamard: bool = False,
+        hadamard_block_size: int = 256,
+        stochastic_rounding: bool = False,
+        clip_ratio: Optional[float] = 1.0,
+        enable_aqn: bool = False,
+        aqn_alpha: float = 1.0,
         **kwargs,
     ) -> "QLoRALinear":
         """
@@ -149,6 +185,12 @@ class QLoRALinear(LoraModule, nn.Module):
             quant_group_size=quant_group_size,
             bias=module.bias is not None,
             device=module.weight.device,
+            enable_hadamard=enable_hadamard,
+            hadamard_block_size=hadamard_block_size,
+            stochastic_rounding=stochastic_rounding,
+            clip_ratio=clip_ratio,
+            enable_aqn=enable_aqn,
+            aqn_alpha=aqn_alpha,
         )
 
         w = module.weight.detach()
@@ -281,6 +323,13 @@ class QLoRALinear(LoraModule, nn.Module):
         if source_format != self.quant_format:
             self._convert_prequantized_format(source_format)
 
+        # Re-quantize with error reduction if hadamard or auto-clip is enabled.
+        # Pre-quantized weights were quantized WITHOUT rotation — we must
+        # dequant → rotate → re-quantize so forward(Rx) @ (RW)^T = x @ W^T.
+        needs_requant = self.enable_hadamard or self._clip_ratio is None
+        if needs_requant:
+            self._apply_error_reduction_requant()
+
     def _load_prequantized_block_fp8(self, _load_tensor) -> None:
         """Load pre-quantized block FP8 weights (HF format).
 
@@ -314,6 +363,7 @@ class QLoRALinear(LoraModule, nn.Module):
         self.weight_global_scale = None
         # block_fp8: no EMA amax needed
         self._ema_amax = None
+        self._aqn_step_cache = None
 
     def _load_prequantized_nvfp4(self, _load_tensor) -> None:
         """Load pre-quantized NVFP4 weights from a modelopt checkpoint."""
@@ -358,6 +408,7 @@ class QLoRALinear(LoraModule, nn.Module):
         self.weight_block_scales = self._to_uint8(merged_block_scales).to(device)
         self.weight_global_scale = self._to_uint8(merged_global_scale).to(device)
         self._ema_amax = torch.tensor([max_amax], dtype=torch.float32, device=device)
+        self._aqn_step_cache = None
 
     def _convert_prequantized_format(self, source_format: str) -> None:
         """Convert loaded prequantized weights from source to target format.
@@ -380,6 +431,19 @@ class QLoRALinear(LoraModule, nn.Module):
             self._ema_amax = w.float().abs().max().reshape(1).to(w.device)
         else:
             self._ema_amax = None
+        self._quantize_and_store(w)
+
+    def _apply_error_reduction_requant(self) -> None:
+        """Re-quantize pre-quantized weights with error reduction techniques.
+
+        Pre-quantized checkpoints store weights in unrotated space.  When
+        hadamard rotation or auto-clip is enabled, we must dequant → rotate →
+        re-quantize so that forward(Rx) @ (RW)^T = x @ W^T.
+        """
+        w = self._dequantize_weight()  # unrotated bf16
+        if self.quant_format != "block_fp8":
+            self._ema_amax = w.float().abs().max().reshape(1).to(w.device)
+        # _quantize_and_store applies hadamard rotation + clip search + stochastic rounding
         self._quantize_and_store(w)
 
     # ------------------------------------------------------------------
@@ -406,10 +470,37 @@ class QLoRALinear(LoraModule, nn.Module):
             return buf
         return buf.contiguous().view(original_dtype)
 
-    def _quantize_and_store(self, w: Tensor, global_amax: Optional[Tensor] = None) -> None:
-        """Quantize a full-precision weight tensor and store as float32 parameter + uint8 scale buffers."""
+    def _quantize_and_store(self, w: Tensor, global_amax: Optional[Tensor] = None,
+                            already_rotated: bool = False) -> None:
+        """Quantize a full-precision weight tensor and store as float32 parameter + uint8 scale buffers.
+
+        Applies error reduction techniques if enabled:
+        - Hadamard rotation: rotates weight before quantizing to spread outliers
+        - MSE-optimal clipping: auto-searches clip_ratio on first call
+        - Stochastic rounding: unbiased rounding in FP4/FP8 encoding
+
+        Args:
+            w: Weight tensor (unrotated or already rotated if already_rotated=True).
+            global_amax: Optional EMA-tracked amax for nvfp4.
+            already_rotated: If True, skip hadamard rotation (weight already in rotated space,
+                e.g. from merge_weights where dequant returns rotated weight).
+        """
+        # Hadamard rotation: rotate weight before quantizing (skip if already rotated)
+        if self.enable_hadamard and self._hadamard_signs is not None and not already_rotated:
+            w = hadamard_rotate(w, self._hadamard_signs.to(w.device), self.hadamard_block_size)
+
+        # MSE-optimal clip_ratio: auto-search on first quantize call
+        clip_ratio = self._clip_ratio
+        if clip_ratio is None:
+            clip_ratio = self._search_optimal_clip_ratio(w)
+            self._clip_ratio = clip_ratio
+
         if self.quant_format == "block_fp8":
-            fp8_w, scales = block_fp8_quantize_gkn(w.float(), self.quant_group_size)
+            fp8_w, scales = block_fp8_quantize_gkn(
+                w.float(), self.quant_group_size,
+                clip_ratio=clip_ratio,
+                stochastic_rounding=self.stochastic_rounding,
+            )
             uint8_data = self._to_uint8(fp8_w)
             self._write_packed_weight(uint8_data)
             self._scale_dtypes = {
@@ -419,7 +510,9 @@ class QLoRALinear(LoraModule, nn.Module):
             self.weight_global_scale = None
         else:
             packed, block_scales, global_scale = nvfp4_quantize(
-                w, self.quant_group_size, global_amax=global_amax
+                w, self.quant_group_size, global_amax=global_amax,
+                clip_ratio=clip_ratio,
+                stochastic_rounding=self.stochastic_rounding,
             )
             uint8_data = self._to_uint8(packed)
             self._write_packed_weight(uint8_data)
@@ -429,6 +522,46 @@ class QLoRALinear(LoraModule, nn.Module):
             }
             self.weight_block_scales = self._to_uint8(block_scales)
             self.weight_global_scale = self._to_uint8(global_scale)
+
+        # Invalidate AQN step cache (scales changed)
+        self._aqn_step_cache = None
+
+    def _search_optimal_clip_ratio(self, w: Tensor) -> float:
+        """Grid-search clip_ratio that minimizes quantize-dequantize MSE.
+
+        Tries a range of clip ratios and returns the one with lowest reconstruction
+        error. This is a lightweight GPTQ-style calibration using existing amax.
+
+        Args:
+            w: Weight tensor to calibrate against.
+
+        Returns:
+            Optimal clip_ratio (float between 0.7 and 1.0).
+        """
+        best_ratio = 1.0
+        best_mse = float('inf')
+        w_f32 = w.float()
+
+        for alpha in [0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.0]:
+            if self.quant_format == "block_fp8":
+                fp8_w, scales = block_fp8_quantize_gkn(
+                    w_f32, self.quant_group_size, clip_ratio=alpha,
+                )
+                w_recon = block_fp8_dequantize_gkn(fp8_w, scales, self.quant_group_size)
+            else:
+                packed, block_scales, global_scale = nvfp4_quantize(
+                    w_f32, self.quant_group_size, clip_ratio=alpha,
+                )
+                M, K = w.shape
+                w_recon = nvfp4_dequantize(
+                    packed, block_scales, global_scale, M * K, self.quant_group_size,
+                ).reshape(M, K)
+            mse = (w_f32 - w_recon.float()).pow(2).mean().item()
+            if mse < best_mse:
+                best_mse = mse
+                best_ratio = alpha
+
+        return best_ratio
 
     def _write_packed_weight(self, uint8_data: Tensor) -> None:
         """Write uint8 quantized data into the float32 parameter.
@@ -491,8 +624,21 @@ class QLoRALinear(LoraModule, nn.Module):
         """Read the packed weight as uint8 data (unpack float32 → uint8)."""
         f32 = self.packed_weight_f32.data
         if hasattr(f32, '_local_tensor'):
-            # DTensor: use local shard (during forward, FSDP2 has all-gathered)
-            f32 = f32._local_tensor
+            # DTensor (FSDP2 sharded, deregistered from param group to avoid
+            # mixed-precision bf16 cast that corrupts packed bytes).
+            # All-gather in original float32 dtype.
+            f32 = f32.full_tensor()
+        elif f32.dtype != torch.float32:
+            # FSDP2 already unsharded and cast to param_dtype (e.g., bfloat16).
+            # The float32→bf16 conversion is lossy and corrupts the packed
+            # uint8 byte patterns.  This indicates packed_weight_f32 was not
+            # deregistered from FSDP before forward — raise early so the
+            # corruption doesn't silently produce wrong results.
+            raise RuntimeError(
+                f"QLoRA packed_weight_f32 has dtype {f32.dtype} (expected float32). "
+                f"FSDP2 mixed precision likely cast it, corrupting packed weight data. "
+                f"Ensure packed_weight_f32 is deregistered from FSDP param groups."
+            )
         return f32.contiguous().view(torch.uint8)
 
     def _dequantize_weight(self) -> Tensor:
@@ -553,16 +699,83 @@ class QLoRALinear(LoraModule, nn.Module):
                 self.weight.data.untyped_storage().resize_(0)
 
     # ------------------------------------------------------------------
+    # AQN: Adaptive Quantization Noise
+    # ------------------------------------------------------------------
+
+    def _compute_aqn_step(self) -> Tensor:
+        """Compute per-element quantization step size from block scales.
+
+        nvfp4:     0.5 * block_scale * global_scale  (FP4 min linear step)
+        block_fp8: 0.125 * block_scale               (FP8 E4M3 ULP at unit)
+        """
+        M, K = self.out_features, self.in_features
+        bs = self.quant_group_size
+
+        if self.quant_format == "block_fp8":
+            scales = self._recover_tensor(
+                self.weight_block_scales, self._scale_dtypes["weight_block_scales"]
+            ).float()
+            step = scales.repeat_interleave(bs, dim=0).repeat_interleave(bs, dim=1)[:M, :K]
+            return (0.125 * step).contiguous()
+        else:
+            block_scales = self._recover_tensor(
+                self.weight_block_scales, self._scale_dtypes["weight_block_scales"]
+            ).float()
+            global_scale = self._recover_tensor(
+                self.weight_global_scale, self._scale_dtypes["weight_global_scale"]
+            ).float()
+            effective = block_scales * global_scale
+            step = effective.reshape(M, K // bs).repeat_interleave(bs, dim=1)
+            return (0.5 * step).contiguous()
+
+    def _aqn_start_noise(self, device: torch.device, dtype: torch.dtype) -> None:
+        """Generate noise on a side CUDA stream (async, returns immediately)."""
+        M, K = self.out_features, self.in_features
+        if self._aqn_stream is None:
+            self._aqn_stream = torch.cuda.Stream(device=device)
+        if (self._aqn_noise_buf is None
+                or self._aqn_noise_buf.shape != (M, K)
+                or self._aqn_noise_buf.dtype != dtype
+                or self._aqn_noise_buf.device != device):
+            self._aqn_noise_buf = torch.empty(M, K, device=device, dtype=dtype)
+        self._aqn_stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(self._aqn_stream):
+            self._aqn_noise_buf.normal_()
+        self._aqn_noise_ready = True
+
+    def _aqn_apply_noise(self, w_deq: Tensor) -> Tensor:
+        """Sync noise stream and apply: w + alpha * noise * step (fused addcmul)."""
+        torch.cuda.current_stream(w_deq.device).wait_stream(self._aqn_stream)
+        if self._aqn_step_cache is None:
+            self._aqn_step_cache = self._compute_aqn_step()
+        step = self._aqn_step_cache.to(dtype=w_deq.dtype, device=w_deq.device)
+        self._aqn_noise_ready = False
+        return torch.addcmul(w_deq, self._aqn_noise_buf, step, value=self.aqn_alpha)
+
+    # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
     def forward(self, x: Tensor) -> Tensor:
-        # Dequantize base weight
+        # AQN: fallback if prefetch_aqn_noise() was not called before forward
+        if self.enable_aqn and self.training and not self._aqn_noise_ready:
+            self._aqn_start_noise(x.device, x.dtype)
+
+        # Dequantize base weight (stays in rotated space if hadamard enabled)
         w = self._dequantize_weight().to(x.dtype)
+
+        # Hadamard rotation: rotate input to match rotated weight space
+        if self.enable_hadamard and self._hadamard_signs is not None:
+            x = hadamard_rotate(x, self._hadamard_signs, self.hadamard_block_size)
+
+        # AQN: apply pre-generated noise
+        if self.enable_aqn and self.training:
+            w = self._aqn_apply_noise(w)
 
         result = F.linear(x, w, self.bias)
 
         # LoRA path (fp32 for numerical stability)
+        # LoRA learns in rotated space (correct by design: delta is in same basis)
         x_lora = x.to(self.lora_A.dtype)
         lora_out = F.linear(F.linear(x_lora, self.lora_A), self.lora_B)
         lora_out = lora_out * self.scaling
@@ -597,21 +810,29 @@ class QLoRALinear(LoraModule, nn.Module):
         Resets LoRA parameters after merge.
 
         For block_fp8: skip EMA amax (per-block scales are independent, no global scale).
+
+        Note: dequantized weight is already in rotated space (if hadamard enabled),
+        and LoRA delta was learned in rotated space, so w_merged is already rotated.
+        Pass already_rotated=True to skip double-rotation.
         """
         with torch.no_grad():
             w = self._dequantize_weight()
             delta = self.get_delta_weight().to(w.dtype)
             w_merged = w + delta
+            # Weight is already in rotated space (dequant returns rotated weight,
+            # LoRA delta learned in rotated space)
+            already_rotated = self.enable_hadamard
             if self.quant_format == "block_fp8":
                 # block_fp8: re-quantize with fresh per-block scales, no global amax
-                self._quantize_and_store(w_merged)
+                self._quantize_and_store(w_merged, already_rotated=already_rotated)
             else:
                 fresh_amax = w_merged.float().abs().max().reshape(1)
                 if self._ema_amax is not None:
                     self._ema_amax.lerp_(fresh_amax.to(self._ema_amax.device), ema_decay)
                 else:
                     self._ema_amax = fresh_amax
-                self._quantize_and_store(w_merged, global_amax=self._ema_amax)
+                self._quantize_and_store(w_merged, global_amax=self._ema_amax,
+                                         already_rotated=already_rotated)
             # Reset LoRA: kaiming for A, zeros for B.
             # delta = B @ A = 0 (since B=0), but A≠0 so B receives gradients.
             nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
@@ -631,8 +852,46 @@ class QLoRALinear(LoraModule, nn.Module):
         return state
 
     def extra_repr(self) -> str:
-        return (
-            f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"bias={self.bias is not None}, r={self.r}, lora_alpha={self.lora_alpha}, "
-            f"quant_format={self.quant_format}, quant_group_size={self.quant_group_size}"
-        )
+        parts = [
+            f"in_features={self.in_features}, out_features={self.out_features}",
+            f"bias={self.bias is not None}, r={self.r}, lora_alpha={self.lora_alpha}",
+            f"quant_format={self.quant_format}, quant_group_size={self.quant_group_size}",
+        ]
+        if self.enable_hadamard:
+            parts.append(f"hadamard=True(bs={self.hadamard_block_size})")
+        if self.stochastic_rounding:
+            parts.append("stochastic_rounding=True")
+        if self._clip_ratio is not None and self._clip_ratio != 1.0:
+            parts.append(f"clip_ratio={self._clip_ratio:.2f}")
+        if self.enable_aqn:
+            parts.append(f"aqn=True(alpha={self.aqn_alpha})")
+        return ", ".join(parts)
+
+
+def prefetch_aqn_noise(
+    model: nn.Module,
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.bfloat16,
+) -> int:
+    """Pre-generate AQN noise for all QLoRALinear layers on side CUDA streams.
+
+    Call before ``model.forward()`` each training step.  Noise generation
+    runs asynchronously; during forward each layer only pays the cost of a
+    single fused ``addcmul`` (~0.09 ms/layer vs ~0.47 ms/layer without
+    prefetch on H100).
+
+    If not called, forward falls back to inline generation (still correct,
+    just slower).
+
+    Returns:
+        Number of layers prefetched.
+    """
+    count = 0
+    for module in model.modules():
+        if isinstance(module, QLoRALinear) and module.enable_aqn and module.training:
+            dev = device or module.lora_A.device
+            if dev.type == "meta":
+                dev = torch.device("cuda")
+            module._aqn_start_noise(dev, dtype)
+            count += 1
+    return count
