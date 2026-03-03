@@ -185,6 +185,12 @@ def main():
             checkpoint_quant_format=checkpoint_quant_format,
             merge_qkv=args.model.merge_qkv,
             exclude_modules=exclude_modules,
+            enable_hadamard=args.lora.enable_hadamard,
+            hadamard_block_size=args.lora.hadamard_block_size,
+            stochastic_rounding=args.lora.stochastic_rounding,
+            clip_ratio=args.lora.clip_ratio,
+            enable_aqn=args.lora.enable_aqn,
+            aqn_alpha=args.lora.aqn_alpha,
         )
         # Store exclude_modules on model so checkpoint handler can use the
         # same set (user-specified or auto-detected) instead of re-detecting.
@@ -430,6 +436,13 @@ def main():
             )
 
             optimizer.zero_grad()
+
+            # AQN: pre-generate noise for all QLoRA layers on side streams.
+            # Runs async — overlaps with data prep below, so forward only
+            # pays the cheap addcmul cost per layer.
+            if args.lora.enable_aqn:
+                from xorl.qlora.modules.linear import prefetch_aqn_noise
+                prefetch_aqn_noise(model)
 
             # Routing replay stage switching for MoE checkpoint determinism.
             # Only needed with EP — without EP, expert compute has fixed output
