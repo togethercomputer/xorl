@@ -1,4 +1,5 @@
 from .fp4_codec import FP4_E2M1_MAX, FP8_E4M3_MAX
+from .hadamard import hadamard_transform, generate_hadamard_signs, hadamard_rotate, hadamard_unrotate
 from .int4_quantize import int4_quantize, int4_dequantize
 from .mxfp4_quantize import mxfp4_quantize, mxfp4_dequantize
 from .nvfp4_quantize import nvfp4_quantize, nvfp4_dequantize
@@ -11,6 +12,10 @@ from .block_fp8_gkn_quantize import block_fp8_quantize_gkn, block_fp8_dequantize
 __all__ = [
     "FP4_E2M1_MAX",
     "FP8_E4M3_MAX",
+    "hadamard_transform",
+    "generate_hadamard_signs",
+    "hadamard_rotate",
+    "hadamard_unrotate",
     "int4_quantize",
     "int4_dequantize",
     "mxfp4_quantize",

@@ -65,6 +65,12 @@ def inject_qlora_into_model(
     checkpoint_quant_format: Optional[str] = None,
     merge_qkv: bool = True,
     exclude_modules: Optional[Collection[str]] = None,
+    enable_hadamard: bool = False,
+    hadamard_block_size: int = 256,
+    stochastic_rounding: bool = False,
+    clip_ratio: Optional[float] = 1.0,
+    enable_aqn: bool = False,
+    aqn_alpha: float = 1.0,
 ) -> nn.Module:
     """
     Inject QLoRA into a model: quantize base weights + add trainable LoRA.
@@ -95,6 +101,13 @@ def inject_qlora_into_model(
         merge_qkv: If True (default), merge q/k/v into fused qkv_proj. If False,
             each projection gets its own QLoRALinear with independent LoRA parameters.
             Requires the model's QKV projections to be unfused before calling this.
+        enable_hadamard: If True, apply Hadamard rotation before quantizing to spread outliers.
+        hadamard_block_size: Block size for Hadamard rotation (must be power of 2, default 256).
+        stochastic_rounding: If True, use stochastic rounding in FP4/FP8 encoding.
+        clip_ratio: Scale clipping ratio (0.0-1.0). None = auto-search MSE-optimal ratio.
+            Default 1.0 (disabled).
+        enable_aqn: If True, add Adaptive Quantization Noise during training forward passes.
+        aqn_alpha: Scale factor for AQN noise magnitude (default 1.0).
     """
     if quant_format not in ("nvfp4", "block_fp8"):
         raise ValueError(
@@ -170,6 +183,12 @@ def inject_qlora_into_model(
                 quant_group_size=quant_group_size,
                 bias=original_module.bias is not None,
                 device=original_module.weight.device,
+                enable_hadamard=enable_hadamard,
+                hadamard_block_size=hadamard_block_size,
+                stochastic_rounding=stochastic_rounding,
+                clip_ratio=clip_ratio,
+                enable_aqn=enable_aqn,
+                aqn_alpha=aqn_alpha,
             )
             qlora_module._is_prequantized = True
             qlora_module._source_quant_format = checkpoint_quant_format
@@ -193,6 +212,12 @@ def inject_qlora_into_model(
                 lora_alpha=lora_alpha,
                 quant_format=quant_format,
                 quant_group_size=quant_group_size,
+                enable_hadamard=enable_hadamard,
+                hadamard_block_size=hadamard_block_size,
+                stochastic_rounding=stochastic_rounding,
+                clip_ratio=clip_ratio,
+                enable_aqn=enable_aqn,
+                aqn_alpha=aqn_alpha,
             )
 
         setattr(parent, attr_name, qlora_module)
@@ -298,15 +323,30 @@ def save_qlora_checkpoint(
     return save_path
 
 
-def _deregister_qlora_weights_from_fsdp(model: nn.Module) -> int:
-    """Remove QLoRALinear `weight` parameters from all FSDP2 param groups.
+def _deregister_qlora_weights_from_fsdp(
+    model: nn.Module,
+    param_names: tuple = ("weight",),
+) -> int:
+    """Remove QLoRALinear parameters from all FSDP2 param groups.
 
-    After quantization, the `weight` parameter storage is freed. We must remove it
-    from FSDP2's tracking to prevent all-gather on empty storage.
+    After quantization, the ``weight`` parameter storage is freed — we must remove
+    it from FSDP2's tracking to prevent all-gather on empty storage.
 
-    Note: `packed_weight_f32` is intentionally KEPT in FSDP2 — it's the new
-    float32 parameter that FSDP2 shards for memory savings and saves via DCP.
+    ``packed_weight_f32`` must ALSO be deregistered because FSDP2's mixed-precision
+    policy casts it from float32 to ``param_dtype`` (e.g. bfloat16) during forward.
+    This lossy cast corrupts the packed uint8 byte patterns.  After deregistration
+    the parameter stays as a sharded DTensor; forward code calls ``full_tensor()``
+    to all-gather in the original float32 dtype without the mixed-precision cast.
+
+    DCP checkpoint save/load still works because the parameter remains a DTensor
+    with mesh placement metadata — DCP reads that directly, not FSDP param groups.
+
+    Args:
+        model: Model containing QLoRALinear modules.
+        param_names: Parameter names to deregister (default: just ``"weight"``).
     """
+    param_name_set = set(param_names)
+
     # Collect all QLoRALinear modules for matching
     qlora_modules = set()
     for module in model.modules():
@@ -323,11 +363,10 @@ def _deregister_qlora_weights_from_fsdp(model: nn.Module) -> int:
             pg = fsdp_state._fsdp_param_group
             if pg is None:
                 continue
-            # Only deregister "weight" param, NOT "packed_weight_f32"
             to_remove = [
                 fp for fp in pg.fsdp_params
                 if hasattr(fp, "_module_info")
-                and fp._module_info.param_name == "weight"
+                and fp._module_info.param_name in param_name_set
                 and id(fp._module_info.module) in qlora_modules
             ]
             for fp in to_remove:
@@ -344,8 +383,14 @@ def maybe_quantize_qlora(model: nn.Module) -> int:
 
     Call this after build_parallelize_model() when using meta init.
     Each module's weight parameter (loaded by FSDP) is quantized into packed_weight_f32
-    (float32 parameter for FSDP2 sharding). The original weight parameter is then freed
-    and deregistered from FSDP2. packed_weight_f32 stays in FSDP2 for sharding and DCP save.
+    (float32 parameter for FSDP2 sharding). Both ``weight`` and ``packed_weight_f32``
+    are then deregistered from FSDP2 param groups:
+
+    * ``weight``: storage is freed — must not be all-gathered.
+    * ``packed_weight_f32``: must not be cast to ``param_dtype`` (e.g. bf16) by
+      FSDP2 mixed precision, as this corrupts packed uint8 byte patterns.
+      Stays as a sharded DTensor; forward code uses ``full_tensor()`` to
+      all-gather in the original float32 dtype.
 
     Returns:
         Number of modules quantized.
@@ -357,7 +402,9 @@ def maybe_quantize_qlora(model: nn.Module) -> int:
             count += 1
 
     if count > 0:
-        removed = _deregister_qlora_weights_from_fsdp(model)
+        removed = _deregister_qlora_weights_from_fsdp(
+            model, param_names=("weight", "packed_weight_f32"),
+        )
         # Now safe to fully delete weight params (deregistered from FSDP2)
         for module in model.modules():
             if isinstance(module, QLoRALinear) and module.weight is not None:
@@ -365,7 +412,7 @@ def maybe_quantize_qlora(model: nn.Module) -> int:
         torch.cuda.empty_cache()
         logger.info(
             f"Quantized {count} QLoRALinear modules (deferred quantization), "
-            f"deregistered {removed} weight params from FSDP2"
+            f"deregistered {removed} params from FSDP2"
         )
     return count
 
@@ -534,10 +581,16 @@ def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str) -> int:
 
     total = linear_count + moe_count
     if total > 0:
+        # Deregister packed_weight_f32 from FSDP2 to prevent mixed-precision
+        # bf16 cast that corrupts packed uint8 byte patterns.
+        removed = _deregister_qlora_weights_from_fsdp(
+            model, param_names=("packed_weight_f32",),
+        )
         torch.cuda.empty_cache()
         logger.info(
             f"Loaded pre-quantized weights: {linear_count} QLoRALinear + "
-            f"{moe_count} QLoRAMoeExperts modules (direct from checkpoint)"
+            f"{moe_count} QLoRAMoeExperts modules (direct from checkpoint), "
+            f"deregistered {removed} packed_weight_f32 params from FSDP2"
         )
     return total
 
