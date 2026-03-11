@@ -3,10 +3,11 @@
 from typing import Callable, List, Optional, Set, Tuple
 
 import torch
+import torch.nn as nn
 
 from ...checkpoint_handlers.base import CheckpointHandler
 from ...checkpoint_handlers.buffers import (
-    GateUpMergeBuffer, QKVMergeBuffer,
+    GateUpMergeBuffer, QKVMergeBuffer, QLoRAWeightBuffer,
     QUANT_AUX_SUFFIX_PATTERN, FP8_AUX_SUFFIX_PATTERN,
     QKV_PROJ_PATTERN, DENSE_GATE_UP_PATTERN,
     OPROJ_WEIGHT_PATTERN, DENSE_DOWN_PROJ_PATTERN,
@@ -21,10 +22,12 @@ class Qwen3CheckpointHandler(CheckpointHandler):
     Save: split gate_up_proj -> gate_proj + up_proj
           split qkv_proj -> q_proj + k_proj + v_proj
 
-    When ``is_prequantized=True``, quantized auxiliary keys (weight_scale,
-    weight_scale_2, input_scale, weight_scale_inv) and linear projection
-    ``.weight`` keys are skipped — they are loaded directly by QLoRA modules.
-    Bias keys still flow through the normal merge buffers.
+    When ``is_prequantized=True`` and a model is provided, quantized weights are
+    loaded inline via QLoRAWeightBuffer (single-pass I/O). When model is not
+    provided, falls back to the old behavior of skipping quantized keys (deferred
+    loading via _deferred_qlora_quantize).
+
+    Bias keys always flow through the normal merge buffers.
     """
 
     def __init__(
@@ -34,6 +37,7 @@ class Qwen3CheckpointHandler(CheckpointHandler):
         head_dim: int,
         is_prequantized: bool = False,
         exclude_modules: Optional[Set[str]] = None,
+        model: Optional[nn.Module] = None,
     ):
         self._gate_up_buffer = GateUpMergeBuffer()
         self._qkv_buffer = QKVMergeBuffer()
@@ -41,16 +45,26 @@ class Qwen3CheckpointHandler(CheckpointHandler):
         self._kv_dim = num_key_value_heads * head_dim
         self._is_prequantized = is_prequantized
         self._exclude_modules = exclude_modules or set()
+        # Inline QLoRA weight loading (single-pass I/O)
+        self._qlora_buffer: Optional[QLoRAWeightBuffer] = None
+        if is_prequantized and model is not None:
+            self._qlora_buffer = QLoRAWeightBuffer(model)
 
     def get_skip_key_fn(self) -> Optional[Callable[[str], bool]]:
         """Return predicate to skip keys during loading.
 
-        When prequantized, skips all quantized auxiliary keys and linear
-        projection ``.weight`` keys — these are loaded by QLoRA modules.
+        When QLoRA buffer is active (inline loading), quantized keys are NOT
+        skipped — they flow through on_load_weight → buffer for single-pass I/O.
+        When buffer is not active (deferred path), skips all quantized keys.
         """
         if not self._is_prequantized:
             return None
 
+        # Inline loading: don't skip quantized keys — buffer consumes them
+        if self._qlora_buffer is not None:
+            return None
+
+        # Deferred path: skip quantized keys (loaded later by _deferred_qlora_quantize)
         exclude_modules = self._exclude_modules
 
         def _should_skip(key: str) -> bool:
@@ -90,10 +104,18 @@ class Qwen3CheckpointHandler(CheckpointHandler):
     def on_load_weight(
         self, key: str, tensor: torch.Tensor
     ) -> List[Tuple[str, torch.Tensor]]:
-        # Pre-quantized: drop any quant auxiliary or weight keys that weren't
-        # caught by get_skip_key_fn (safety net).
-        # Excluded modules pass through as bf16 — don't drop them.
-        if self._is_prequantized and not self._is_excluded_module(key):
+        # Drop input_scale (unused by our quantization)
+        if key.endswith(".input_scale"):
+            return []
+
+        # QLoRA buffer: route quantized keys for inline loading
+        if self._qlora_buffer is not None and not self._is_excluded_module(key):
+            result = self._qlora_buffer.try_consume(key, tensor)
+            if result is not None:
+                return result  # [] = buffered, or list of dispatch pairs
+
+        # Pre-quantized without buffer (deferred path): drop quantized keys
+        if self._is_prequantized and self._qlora_buffer is None and not self._is_excluded_module(key):
             if QUANT_AUX_SUFFIX_PATTERN.search(key):
                 return []
             if FP8_AUX_SUFFIX_PATTERN.search(key):
@@ -136,6 +158,9 @@ class Qwen3CheckpointHandler(CheckpointHandler):
         pending_qkv = self._qkv_buffer.get_pending()
         if pending_qkv:
             warnings.warn(f"Incomplete QKV merge groups after loading: {pending_qkv}")
+        # Finalize inline-loaded QLoRA modules
+        if self._qlora_buffer is not None:
+            self._qlora_buffer.set_inline_metadata()
         return []
 
     def on_save_weight(

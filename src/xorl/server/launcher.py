@@ -22,7 +22,6 @@ Features:
 """
 
 import argparse
-import asyncio
 import logging
 import multiprocessing as mp
 import os
@@ -39,8 +38,8 @@ import requests
 import uvicorn
 import yaml
 
-from xorl.server.api_server.api_server import APIServer
-from xorl.server.engine.engine_core import EngineCore
+from xorl.server.api_server.server import APIServer
+from xorl.server.orchestrator.orchestrator import Orchestrator
 from xorl.server.server_arguments import ServerArguments
 
 
@@ -51,6 +50,10 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 logger = logging.getLogger(__name__)
+
+# Suppress noisy HTTP cache-validation logs from transformers/httpx
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 class RetrieveFutureFilter(logging.Filter):
@@ -80,12 +83,12 @@ def configure_uvicorn_logging():
 # Port Finding Utilities
 # ============================================================================
 
-def find_free_port(start_port: int = 5000, max_attempts: int = 100) -> int:
+def find_free_port(start_port: int = 50000, max_attempts: int = 10000) -> int:
     """
-    Find a free port starting from start_port.
+    Find a free port by randomly picking from a range.
 
     Args:
-        start_port: Port to start searching from
+        start_port: Start of port range to search
         max_attempts: Maximum number of ports to try
 
     Returns:
@@ -94,7 +97,11 @@ def find_free_port(start_port: int = 5000, max_attempts: int = 100) -> int:
     Raises:
         RuntimeError: If no free port found
     """
-    for port in range(start_port, start_port + max_attempts):
+    import random
+    end_port = min(start_port + max_attempts, 60000)
+    ports = list(range(start_port, end_port))
+    random.shuffle(ports)
+    for port in ports:
         with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
             try:
                 sock.bind(('', port))
@@ -102,10 +109,10 @@ def find_free_port(start_port: int = 5000, max_attempts: int = 100) -> int:
                 return port
             except OSError:
                 continue
-    raise RuntimeError(f"Could not find free port in range {start_port}-{start_port + max_attempts}")
+    raise RuntimeError(f"Could not find free port in range {start_port}-{end_port}")
 
 
-def find_free_ports(count: int, start_port: int = 5000) -> List[int]:
+def find_free_ports(count: int, start_port: int = 50000) -> List[int]:
     """
     Find multiple free ports.
 
@@ -131,7 +138,7 @@ def find_free_ports(count: int, start_port: int = 5000) -> List[int]:
 # Engine Core Process
 # ============================================================================
 
-def run_engine_core(
+def run_orchestrator(
     input_addr: str,
     output_addr: str,
     rank0_worker_address: str,
@@ -139,13 +146,13 @@ def run_engine_core(
     max_pending_requests: int = 100,
     operation_timeout: float = 1800.0,
     log_level: str = "INFO",
-    packing_seq_len: int = 32000,
+    sample_packing_sequence_len: int = 32000,
     enable_packing: bool = True,
     ready_event: Optional[mp.Event] = None,
     output_dir: str = "outputs",
 ):
     """
-    Run the EngineCore in a separate process.
+    Run the Orchestrator in a separate process.
 
     Args:
         input_addr: Address for receiving requests from API server
@@ -158,13 +165,10 @@ def run_engine_core(
         output_dir: Output directory for logs and checkpoints
     """
     # Setup logging first, outside try block
-    import sys
-    import os
-
     # Create logs directory under output_dir if it doesn't exist
     logs_dir = os.path.join(output_dir, "logs")
     os.makedirs(logs_dir, exist_ok=True)
-    log_file = os.path.join(logs_dir, "engine_core.log")
+    log_file = os.path.join(logs_dir, "orchestrator.log")
 
     # Setup logging to both file and stdout
     logging.basicConfig(
@@ -177,7 +181,7 @@ def run_engine_core(
         ],
         force=True
     )
-    logger = logging.getLogger("EngineCore")
+    logger = logging.getLogger("Orchestrator")
     logger.info(f"Engine Core logging to: {os.path.abspath(log_file)}")
 
     logger.info("=" * 70)
@@ -190,19 +194,19 @@ def run_engine_core(
     logger.info(f"Max pending:    {max_pending_requests}")
 
     try:
-        logger.info("Initializing EngineCore...")
-        engine = EngineCore(
+        logger.info("Initializing Orchestrator...")
+        engine = Orchestrator(
             input_addr=input_addr,
             output_addr=output_addr,
             rank0_worker_address=rank0_worker_address,
             operation_timeout=operation_timeout,
             connection_timeout=3600.0,  # 1 hour for loading large models (235B) + EP sharding + LoRA + Triton compilation
-            packing_seq_len=packing_seq_len,
+            sample_packing_sequence_len=sample_packing_sequence_len,
             enable_packing=enable_packing,
         )
-        logger.info(f"EngineCore initialized successfully (operation_timeout={operation_timeout}s)")
+        logger.info(f"Orchestrator initialized successfully (operation_timeout={operation_timeout}s)")
 
-        logger.info("Starting EngineCore...")
+        logger.info("Starting Orchestrator...")
         engine.start()
         logger.info("Engine Core started successfully")
 
@@ -241,6 +245,7 @@ def run_api_server(
     storage_limit: str = "10TB",
     idle_session_timeout: float = 7200.0,
     skip_initial_checkpoint: bool = False,
+    sync_inference_method: str = "nccl_broadcast",
 ):
     """
     Run the API Server in a separate process.
@@ -257,6 +262,7 @@ def run_api_server(
         storage_limit: Maximum disk usage for output_dir (e.g., '1GB'). Default: 10TB.
         idle_session_timeout: Idle session timeout in seconds. Default: 7200.0 (2 hours).
         skip_initial_checkpoint: Skip auto-saving initial checkpoint on first create_model.
+        sync_inference_method: Method for syncing weights to inference endpoints. Default: 'nccl_broadcast'.
     """
     from contextlib import asynccontextmanager
 
@@ -281,10 +287,10 @@ def run_api_server(
 
     try:
         # Import the FastAPI app from api_server module
-        from xorl.server.api_server.api_server import app
+        from xorl.server.api_server.server import app
 
-        # Update the global addresses before running
-        import xorl.server.api_server.api_server as api_module
+        # Update the global state shared between api_server.py and endpoints.py
+        import xorl.server.api_server._state as _state_module
 
         # Override the lifespan to use our addresses
         @asynccontextmanager
@@ -295,7 +301,7 @@ def run_api_server(
             logger.info(f"  base_model: {base_model}")
             logger.info(f"  storage_limit: {storage_limit}")
             logger.info(f"  idle_session_timeout: {idle_session_timeout}s")
-            api_module.api_server = APIServer(
+            _state_module.api_server = APIServer(
                 engine_input_addr=engine_input_addr,
                 engine_output_addr=engine_output_addr,
                 default_timeout=default_timeout,
@@ -304,12 +310,14 @@ def run_api_server(
                 storage_limit=storage_limit,
                 idle_session_timeout=idle_session_timeout,
                 skip_initial_checkpoint=skip_initial_checkpoint,
+                sync_inference_method=sync_inference_method,
             )
-            await api_module.api_server.start()
+            await _state_module.api_server.start()
             yield
             logger.info("Shutting down APIServer...")
-            if api_module.api_server:
-                await api_module.api_server.stop()
+            if _state_module.api_server:
+                await _state_module.api_server.stop()
+                _state_module.api_server = None
 
         # Replace the lifespan
         app.router.lifespan_context = custom_lifespan
@@ -372,7 +380,7 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
         flat_config['model_name'] = model_config.get('model_name')
         flat_config['config_path'] = model_config.get('config_path')
         flat_config['tokenizer_path'] = model_config.get('tokenizer_path')
-        flat_config['attn_implementation'] = model_config.get('attn_implementation', 'flash_attention_2')
+        flat_config['attn_implementation'] = model_config.get('attn_implementation', 'flash_attention_3')
         flat_config['moe_implementation'] = model_config.get('moe_implementation')
         # Train section
         train_config = config.get('train', {})
@@ -384,7 +392,6 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
         flat_config['enable_mixed_precision'] = train_config.get('enable_mixed_precision', True)
         flat_config['enable_gradient_checkpointing'] = train_config.get('enable_gradient_checkpointing', True)
         flat_config['enable_full_shard'] = train_config.get('enable_full_shard', True)
-        flat_config['enable_fsdp_offload'] = train_config.get('enable_fsdp_offload', False)
         flat_config['enable_activation_offload'] = train_config.get('enable_activation_offload', False)
         flat_config['init_device'] = train_config.get('init_device', 'meta')
         flat_config['load_checkpoint_path'] = train_config.get('load_checkpoint_path', '')
@@ -393,7 +400,7 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
 
         # Data processing section (can be in train or data section)
         data_config = config.get('data', {})
-        flat_config['packing_seq_len'] = train_config.get('packing_seq_len') or data_config.get('packing_seq_len', 32000)
+        flat_config['sample_packing_sequence_len'] = train_config.get('sample_packing_sequence_len') or data_config.get('sample_packing_sequence_len', 32000)
         flat_config['enable_packing'] = train_config.get('enable_packing', data_config.get('enable_packing', True))
 
         # Output directory (can be in train section or top-level) - used for checkpoints, sampler weights, logs
@@ -475,7 +482,7 @@ def calculate_world_size_from_config(config_path: str) -> int:
     # Get parallelism sizes (with defaults matching model_runner.py)
     ep_size = train_config.get('expert_parallel_size', 1)
     ulysses_size = train_config.get('ulysses_parallel_size', 1)
-    cp_size = train_config.get('context_parallel_size', 1)
+    ringattn_size = train_config.get('ringattn_parallel_size', 1)
 
     # Data parallel sizes
     dp_replicate_size = train_config.get('data_parallel_replicate_size', 1)
@@ -484,14 +491,14 @@ def calculate_world_size_from_config(config_path: str) -> int:
     # Calculate world size
     # EP creates a separate 2D mesh where: world_size = ep_size * ep_fsdp_size
     # ep_fsdp_size contains all other parallelism dimensions
-    world_size = dp_replicate_size * dp_shard_size * ulysses_size * cp_size
+    world_size = dp_replicate_size * dp_shard_size * ulysses_size * ringattn_size
     ep_fsdp_size = world_size // ep_size
 
     logger.info(f"Calculated world size from config:")
     logger.info(f"  expert_parallel_size:         {ep_size}")
     logger.info(f"  ulysses_parallel_size:        {ulysses_size}")
-    logger.info(f"  context_parallel_size:        {cp_size}")
-    logger.info(f"  sp_fsdp_mode:                 {train_config.get('sp_fsdp_mode', 'all')}")
+    logger.info(f"  ringattn_parallel_size:           {ringattn_size}")
+    logger.info(f"  cp_fsdp_mode:                 {train_config.get('cp_fsdp_mode', 'all')}")
     logger.info(f"  data_parallel_replicate_size: {dp_replicate_size}")
     logger.info(f"  data_parallel_shard_size:     {dp_shard_size}")
     logger.info(f"  ep_fsdp_size:              {ep_fsdp_size} (dp_rep×dp_shard×ulysses / ep_size)")
@@ -523,7 +530,7 @@ class Launcher:
         master_addr: str = "127.0.0.1",
         master_port: int = 29500,
         # Data processing parameters
-        packing_seq_len: int = 32000,
+        sample_packing_sequence_len: int = 32000,
         enable_packing: bool = True,
         # Server config overrides (from --server.* CLI args)
         server_overrides: Optional[Dict[str, any]] = None,
@@ -552,7 +559,7 @@ class Launcher:
         self.max_running_requests = max_running_requests
         self.max_pending_requests = max_pending_requests
         self.operation_timeout = operation_timeout
-        self.packing_seq_len = packing_seq_len
+        self.sample_packing_sequence_len = sample_packing_sequence_len
         self.enable_packing = enable_packing
         self.server_overrides = server_overrides or {}
 
@@ -603,13 +610,13 @@ class Launcher:
         if api_port:
             self.api_port = api_port
             # Find 3 more ports for engine and worker
-            ports = find_free_ports(3, start_port=5000)
+            ports = find_free_ports(3)
             self.engine_input_port = ports[0]
             self.engine_output_port = ports[1]
             self.worker_port = ports[2] if not worker_address else None
         else:
             # Find all 4 ports
-            ports = find_free_ports(4, start_port=5000)
+            ports = find_free_ports(4)
             self.api_port = ports[0]
             self.engine_input_port = ports[1]
             self.engine_output_port = ports[2]
@@ -637,9 +644,9 @@ class Launcher:
 
         # Packing parameters - prefer from ServerArguments if available
         if self.server_args:
-            self.packing_seq_len = self.server_args.packing_seq_len
+            self.sample_packing_sequence_len = self.server_args.sample_packing_sequence_len
             self.enable_packing = self.server_args.enable_packing
-            logger.info(f"Using packing config: seq_len={self.packing_seq_len}, enabled={self.enable_packing}")
+            logger.info(f"Using packing config: seq_len={self.sample_packing_sequence_len}, enabled={self.enable_packing}")
 
         # Output directory - prefer from ServerArguments if available
         if self.server_args:
@@ -689,7 +696,10 @@ class Launcher:
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals."""
         logger.info(f"Received signal {signum}, shutting down...")
-        self.stop()
+        try:
+            self.stop()
+        except Exception:
+            pass  # Best-effort cleanup in signal handler
         sys.exit(0)
 
     def _get_rank0_worker_address(self) -> str:
@@ -879,14 +889,15 @@ class Launcher:
             stale_address_file.unlink()
             logger.info(f"Removed stale address file: {stale_address_file}")
 
-        # Build torchrun command
+        # Build torchrun command — use the same Python environment as the launcher
+        torchrun_bin = os.path.join(os.path.dirname(sys.executable), "torchrun")
         cmd = [
-            "torchrun",
+            torchrun_bin,
             f"--nnodes={self.nnodes}",
             f"--nproc-per-node={self.nproc_per_node}",
             f"--master-addr={self.master_addr}",
             f"--master-port={self.master_port}",
-            "-m", "xorl.server.worker.distributed_model_worker",
+            "-m", "xorl.server.runner.runner_dispatcher",
             self.config_path,
             f"--worker.bind_address={self.worker_address}",
         ]
@@ -980,7 +991,7 @@ class Launcher:
                 self.engine_ready_event = mp.Event()
 
                 self.engine_process = mp.Process(
-                    target=run_engine_core,
+                    target=run_orchestrator,
                     args=(
                         self.engine_input_addr,
                         self.engine_output_addr,
@@ -989,12 +1000,12 @@ class Launcher:
                         self.max_pending_requests,
                         self.operation_timeout,
                         self.log_level,
-                        self.packing_seq_len,
+                        self.sample_packing_sequence_len,
                         self.enable_packing,
                         self.engine_ready_event,
                         self.output_dir,
                     ),
-                    name="EngineCore",
+                    name="Orchestrator",
                 )
                 logger.info("  Process object created successfully")
 
@@ -1052,6 +1063,7 @@ class Launcher:
                     self.storage_limit,
                     self.idle_session_timeout,
                     self.server_args.skip_initial_checkpoint,
+                    self.server_args.sync_inference_method,
                 ),
                 name="APIServer",
             )
@@ -1106,15 +1118,34 @@ class Launcher:
             raise
 
     def wait(self):
-        """Wait for all processes to finish."""
+        """Wait for all processes to finish. Exit cleanly if any process dies."""
+        import select
+
         try:
-            # Wait for all processes
-            if self.api_process:
-                self.api_process.join()
-            if self.engine_process:
-                self.engine_process.join()
-            if self.worker_process:
-                self.worker_process.wait()
+            while True:
+                # Check if worker process (torchrun) died
+                if self.worker_process:
+                    ret = self.worker_process.poll()
+                    if ret is not None:
+                        logger.error(f"Worker process exited with code {ret}")
+                        self.stop()
+                        sys.exit(ret or 1)
+
+                # Check if engine process died
+                if self.engine_process and not self.engine_process.is_alive():
+                    code = self.engine_process.exitcode
+                    logger.error(f"Engine process exited with code {code}")
+                    self.stop()
+                    sys.exit(code or 1)
+
+                # Check if API process died
+                if self.api_process and not self.api_process.is_alive():
+                    code = self.api_process.exitcode
+                    logger.error(f"API process exited with code {code}")
+                    self.stop()
+                    sys.exit(code or 1)
+
+                time.sleep(1)
         except KeyboardInterrupt:
             logger.info("Keyboard interrupt received")
             self.stop()
@@ -1130,35 +1161,52 @@ class Launcher:
         # 1. API Server
         if self.api_process and self.api_process.is_alive():
             logger.info("Stopping API Server...")
-            self.api_process.terminate()
-            self.api_process.join(timeout=5)
-            if self.api_process.is_alive():
-                logger.warning("API Server did not stop gracefully, killing...")
-                self.api_process.kill()
-                self.api_process.join()
+            try:
+                self.api_process.terminate()
+                self.api_process.join(timeout=5)
+                if self.api_process.is_alive():
+                    logger.warning("API Server did not stop gracefully, killing...")
+                    self.api_process.kill()
+                    self.api_process.join()
+            except (AttributeError, OSError):
+                pass  # Process already exited
             logger.info("✓ API Server stopped")
 
         # 2. Engine Core
-        if self.engine_process and self.engine_process.is_alive():
-            logger.info("Stopping Engine Core...")
-            self.engine_process.terminate()
-            self.engine_process.join(timeout=5)
-            if self.engine_process.is_alive():
-                logger.warning("Engine Core did not stop gracefully, killing...")
-                self.engine_process.kill()
-                self.engine_process.join()
+        if self.engine_process:
+            try:
+                alive = self.engine_process.is_alive()
+            except (AssertionError, OSError):
+                alive = False
+            if alive:
+                logger.info("Stopping Engine Core...")
+                try:
+                    self.engine_process.terminate()
+                    self.engine_process.join(timeout=5)
+                    try:
+                        if self.engine_process.is_alive():
+                            logger.warning("Engine Core did not stop gracefully, killing...")
+                            self.engine_process.kill()
+                            self.engine_process.join()
+                    except (AssertionError, OSError):
+                        pass
+                except (AttributeError, OSError):
+                    pass  # Process already exited
             logger.info("✓ Engine Core stopped")
 
         # 3. Workers (only in auto mode)
-        if self.mode == "auto" and self.worker_process:
+        if self.mode == "auto" and self.worker_process is not None:
             logger.info("Stopping Distributed Workers...")
-            self.worker_process.terminate()
             try:
+                self.worker_process.terminate()
                 self.worker_process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
+            except (subprocess.TimeoutExpired, OSError):
                 logger.warning("Workers did not stop gracefully, killing...")
-                self.worker_process.kill()
-                self.worker_process.wait()
+                try:
+                    self.worker_process.kill()
+                    self.worker_process.wait()
+                except OSError:
+                    pass
             logger.info("✓ Distributed Workers stopped")
 
         logger.info("")
@@ -1248,7 +1296,7 @@ Examples:
 
   # Connect mode (workers launched separately)
   # Terminal 1: Launch workers manually
-  torchrun --nnodes=1 --nproc-per-node=8 -m xorl.server.worker.distributed_model_worker \\
+  torchrun --nnodes=1 --nproc-per-node=8 -m xorl.server.runner.runner_dispatcher \\
     examples/qwen3/sft.yaml --worker.bind_address tcp://127.0.0.1:5556
 
   # Terminal 2: Launch API server and engine
@@ -1261,11 +1309,11 @@ Server Config Overrides (--server.*):
     --server.lora_rank 64
     --server.enable_lora true
     --server.ulysses_parallel_size 4
-    --server.packing_seq_len 64000
+    --server.sample_packing_sequence_len 64000
 
 Note:
   World size is ALWAYS calculated from the config file parallelism settings:
-    world_size = dp_replicate_size * dp_shard_size * ulysses_size * cp_size
+    world_size = dp_replicate_size * dp_shard_size * ulysses_size * ringattn_size
   And EP creates a separate 2D mesh where: world_size = ep_size * ep_fsdp_size;
   ep_fsdp_size will be automatically calculated through world_size / ep_size;
   Example config:

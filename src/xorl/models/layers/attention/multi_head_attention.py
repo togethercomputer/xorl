@@ -9,7 +9,7 @@ from xorl.models.layers.normalization import RMSNorm
 from xorl.models.layers.rope import apply_rotary_pos_emb
 from xorl.models.layers.attention.backend import ATTENTION_FUNCTIONS, AttentionKwargs
 from xorl.models.layers.attention.backend.eager import eager_attention_forward
-from xorl.distributed.sequence_parallel.strategy import get_sp_strategy
+from xorl.distributed.sequence_parallel.strategy import get_cp_strategy
 
 class MultiHeadAttention(nn.Module):
     """Base multi-head attention shared across all decoder model variants.
@@ -19,7 +19,7 @@ class MultiHeadAttention(nn.Module):
     ``_init_sliding_window()`` for model-specific sliding window logic.
 
     SP strategy is resolved at forward time from ParallelState via
-    ``get_sp_strategy()``.
+    ``get_cp_strategy()``.
     """
 
     def __init__(self, config, layer_idx: int):
@@ -128,7 +128,7 @@ class MultiHeadAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         
 
-        attn_strategy = get_sp_strategy(num_kv_heads=self.config.num_key_value_heads)
+        attn_strategy = get_cp_strategy(num_kv_heads=self.config.num_key_value_heads)
 
         # Phase 1: QKV projection + norm + RoPE (+ pre-attention SP communication)
         q, k, v = attn_strategy.project_qkv(self, hidden_states, position_embeddings)

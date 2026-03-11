@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import torch
 import torch.nn.functional as F
 
-from .compiled_cross_entropy import compiled_cross_entropy_function
-from .vocab_parallel_cross_entropy import vocab_parallel_cross_entropy
+from xorl.ops.loss.compiled_cross_entropy import compiled_cross_entropy_function
+from xorl.ops.loss.loss_output import LossOutput
+from xorl.ops.loss.vocab_parallel_cross_entropy import vocab_parallel_cross_entropy
 
 
 def causallm_loss_function(
@@ -15,7 +18,7 @@ def causallm_loss_function(
     num_chunks: int = 8,
     tp_group=None,
     use_compile: bool = False,
-) -> torch.Tensor:
+) -> "LossOutput":
     """
     Compute causal language modeling loss.
 
@@ -33,16 +36,10 @@ def causallm_loss_function(
         return_per_token: If True, return per-token logprobs and losses (default: False)
         ce_mode: Cross-entropy mode - "compiled" (default) or "eager"
         num_chunks: Number of chunks for compiled mode (default: 8).
-                   Higher values use less memory. At MBS=8 with 128K seq and vocab=151K,
-                   num_chunks=8 creates 9.1 GiB FP32 logits per chunk (18 GiB peak during
-                   backward), while num_chunks=64 reduces this to 1.1 GiB (2.3 GiB peak).
         tp_group: TP process group for vocab-parallel cross-entropy (default: None).
-                  When provided, weight is treated as a local shard and cross-entropy
-                  is computed without gathering full logits.
 
     Returns:
-        If return_per_token=False: (loss, None, None, None)
-        If return_per_token=True: (loss, None, per_token_logprobs, per_token_loss)
+        LossOutput with loss, and optionally per_token_logprobs/per_token_loss.
     """
     # Store original shape before flattening for per-token outputs
     original_shape = labels.shape
@@ -63,14 +60,14 @@ def causallm_loss_function(
             use_compile=use_compile,
         )
 
+        loss = per_token_ce.sum() / valid_mask.sum().clamp(min=1)
         if return_per_token:
-            per_token_logprobs = -per_token_ce.detach().clone().view(original_shape)
-            per_token_loss = per_token_ce.view(original_shape)
-            loss = per_token_ce.sum() / valid_mask.sum().clamp(min=1)
-            return loss, None, per_token_logprobs, per_token_loss
-        else:
-            loss = per_token_ce.sum() / valid_mask.sum().clamp(min=1)
-            return loss, None, None, None
+            return LossOutput(
+                loss=loss,
+                per_token_logprobs=-per_token_ce.detach().view(original_shape),
+                per_token_loss=per_token_ce.view(original_shape),
+            )
+        return LossOutput(loss=loss)
 
     if return_per_token:
         # Compute cross-entropy based on mode
@@ -80,20 +77,22 @@ def causallm_loss_function(
             logits_flat = (hidden_states_flat @ weight.t()).float()
             per_token_ce = F.cross_entropy(logits_flat, labels_flat, reduction="none", ignore_index=ignore_index)
 
-        # logprobs = -nll loss, also detach to prevent gradient flow
-        # clone to avoid in-place operation
-        per_token_logprobs = -per_token_ce.detach().clone()
-
-        # reshape back to original shape
-        per_token_logprobs = per_token_logprobs.view(original_shape)
-        per_token_loss = per_token_ce.view(original_shape)
+        loss = per_token_ce.sum() / valid_mask.sum().clamp(min=1)
+        return LossOutput(
+            loss=loss,
+            per_token_logprobs=-per_token_ce.detach().view(original_shape),
+            per_token_loss=per_token_ce.view(original_shape),
+        )
+    else:
+        # Always use reduction="none" + manual mean to avoid NaN when all labels
+        # are ignore_index (reduction="mean" returns NaN for 0 valid elements).
+        # Keeping the autograd graph intact is critical for FSDP2: all ranks must
+        # trigger reduce-scatter for every parameter, including lm_head weight.
+        if ce_mode == "compiled":
+            per_token_ce = compiled_cross_entropy_function(hidden_states_flat, weight, labels_flat, ignore_index, num_chunks)
+        else:  # eager mode
+            logits_flat = (hidden_states_flat @ weight.t()).float()
+            per_token_ce = F.cross_entropy(logits_flat, labels_flat, reduction="none", ignore_index=ignore_index)
 
         loss = per_token_ce.sum() / valid_mask.sum().clamp(min=1)
-        return loss, None, per_token_logprobs, per_token_loss
-    else:
-        if ce_mode == "compiled":
-            loss = compiled_cross_entropy_function(hidden_states_flat, weight, labels_flat, ignore_index, num_chunks, reduction="mean")
-        else:  # eager mode
-            loss = F.cross_entropy(hidden_states_flat @ weight.t(), labels_flat, reduction="mean", ignore_index=ignore_index)
-
-        return loss, None, None, None
+        return LossOutput(loss=loss)

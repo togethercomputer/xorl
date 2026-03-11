@@ -28,237 +28,147 @@ pytestmark = [
 ]
 
 
-class TestBlockFP8Quant:
-    """Test suite for block_fp8_quant function."""
+class TestBlockFP8Quantization:
+    """Comprehensive tests for block_fp8 quantization and dequantization."""
 
-    def test_basic_quantization(self):
-        """Test basic quantization with simple input."""
+    def test_quantization_shapes_dtypes_and_scales(self):
+        """Quantization output shapes, dtypes, scale ranges, block sizes, and max value handling."""
+        # Basic quantization shape and dtype
         x = torch.randn(4, 128, device="cuda", dtype=torch.float32)
         y, s = block_fp8_quant(x, block_size=128)
-
         assert y.shape == x.shape
         assert y.dtype == torch.float8_e4m3fn
-        assert s.shape == (4, 1)  # 4 batches, 1 block per batch
+        assert s.shape == (4, 1)
         assert s.dtype == torch.float32
 
-    def test_quantization_multiple_blocks(self):
-        """Test quantization with multiple blocks."""
-        x = torch.randn(2, 512, device="cuda", dtype=torch.float32)
-        y, s = block_fp8_quant(x, block_size=128)
+        # Multiple blocks
+        x2 = torch.randn(2, 512, device="cuda", dtype=torch.float32)
+        y2, s2 = block_fp8_quant(x2, block_size=128)
+        assert y2.shape == x2.shape
+        assert s2.shape == (2, 4)
 
-        assert y.shape == x.shape
-        assert s.shape == (2, 4)  # 2 batches, 4 blocks per batch
-
-    def test_quantization_preserves_shape(self):
-        """Test that quantization preserves tensor shape."""
-        shapes = [
-            (128,),
-            (4, 256),
-            (2, 3, 384),
-        ]
-
-        for shape in shapes:
-            x = torch.randn(*shape, device="cuda", dtype=torch.float32)
-            y, s = block_fp8_quant(x, block_size=128)
-
-            assert y.shape == x.shape
+        # Shape preservation across various dimensions
+        for shape in [(128,), (4, 256), (2, 3, 384)]:
+            x_s = torch.randn(*shape, device="cuda", dtype=torch.float32)
+            y_s, s_s = block_fp8_quant(x_s, block_size=128)
+            assert y_s.shape == x_s.shape
             expected_s_shape = (*shape[:-1], shape[-1] // 128)
-            assert s.shape == expected_s_shape
+            assert s_s.shape == expected_s_shape
 
-    def test_quantization_scale_range(self):
-        """Test that scale factors are reasonable."""
+        # Scale range for random normal data
+        x3 = torch.randn(4, 256, device="cuda", dtype=torch.float32)
+        _, s3 = block_fp8_quant(x3, block_size=128)
+        assert torch.all(s3 > 0)
+        assert torch.all(s3 < 1.0)
+        assert torch.all(s3 > 1e-6)
+
+        # Max FP8 value (448.0) -> scale should be 1.0
+        x_max = torch.full((2, 128), 448.0, device="cuda", dtype=torch.float32)
+        _, s_max = block_fp8_quant(x_max, block_size=128)
+        assert torch.allclose(s_max, torch.ones_like(s_max), atol=1e-5)
+
+        # Different block sizes
+        x4 = torch.randn(2, 512, device="cuda", dtype=torch.float32)
+        for bs in [64, 128, 256]:
+            y4, s4 = block_fp8_quant(x4, block_size=bs)
+            assert y4.shape == x4.shape
+            assert s4.shape == (2, 512 // bs)
+
+    def test_quantization_input_requirements(self):
+        """Contiguity and divisibility requirements."""
+        # Non-contiguous tensor should fail
         x = torch.randn(4, 256, device="cuda", dtype=torch.float32)
-        y, s = block_fp8_quant(x, block_size=128)
-
-        # Scale should be positive
-        assert torch.all(s > 0)
-
-        # For random normal data, scales should be in reasonable range
-        # (typically between 0.001 and 1.0 for standard normal)
-        assert torch.all(s < 1.0)
-        assert torch.all(s > 1e-6)
-
-    def test_quantization_max_value(self):
-        """Test quantization with maximum FP8 representable values."""
-        # FP8 E4M3 max value is 448.0
-        x = torch.full((2, 128), 448.0, device="cuda", dtype=torch.float32)
-        y, s = block_fp8_quant(x, block_size=128)
-
-        # Scale should be 1.0 (448 / 448)
-        assert torch.allclose(s, torch.ones_like(s), atol=1e-5)
-
-    def test_quantization_requires_contiguous(self):
-        """Test that quantization requires contiguous tensors."""
-        x = torch.randn(4, 256, device="cuda", dtype=torch.float32)
-        x_transposed = x.t()  # Non-contiguous
-
         with pytest.raises(AssertionError):
-            block_fp8_quant(x_transposed, block_size=128)
+            block_fp8_quant(x.t(), block_size=128)
 
-    def test_quantization_requires_divisible_size(self):
-        """Test that last dimension must be divisible by block_size."""
-        x = torch.randn(4, 130, device="cuda", dtype=torch.float32)
-
+        # Non-divisible size should fail
+        x2 = torch.randn(4, 130, device="cuda", dtype=torch.float32)
         with pytest.raises(AssertionError):
-            block_fp8_quant(x, block_size=128)
-
-    def test_quantization_different_block_sizes(self):
-        """Test quantization with different block sizes."""
-        x = torch.randn(2, 512, device="cuda", dtype=torch.float32)
-
-        for block_size in [64, 128, 256]:
-            y, s = block_fp8_quant(x, block_size=block_size)
-            assert y.shape == x.shape
-            assert s.shape == (2, 512 // block_size)
+            block_fp8_quant(x2, block_size=128)
 
 
-class TestBlockFP8Dequant:
-    """Test suite for block_fp8_dequant function."""
+class TestBlockFP8Dequantization:
+    """Comprehensive tests for dequantization accuracy and roundtrip."""
 
-    def test_basic_dequantization(self):
-        """Test basic dequantization."""
-        x_orig = torch.randn(4, 128, device="cuda", dtype=torch.float32)
+    def test_dequantization_accuracy_and_roundtrip(self):
+        """Dequantization accuracy, shape preservation, and roundtrip across shapes."""
+        # Basic accuracy
+        x_orig = torch.randn(4, 256, device="cuda", dtype=torch.float32)
         y, s = block_fp8_quant(x_orig, block_size=128)
         x_dequant = block_fp8_dequant(y, s, block_size=128)
-
         assert x_dequant.shape == x_orig.shape
         assert x_dequant.dtype == torch.float32
-
-    def test_dequantization_accuracy(self):
-        """Test that quantization + dequantization is reasonably accurate."""
-        x_orig = torch.randn(4, 256, device="cuda", dtype=torch.float32)
-        y, s = block_fp8_quant(x_orig, block_size=128)
-        x_dequant = block_fp8_dequant(y, s, block_size=128)
-
-        # FP8 has limited precision, so we expect some error
-        # Relative error should be within ~1% for most values
         relative_error = torch.abs(x_dequant - x_orig) / (torch.abs(x_orig) + 1e-6)
-        mean_error = relative_error.mean().item()
+        assert relative_error.mean().item() < 0.05
 
-        assert mean_error < 0.05  # Less than 5% mean relative error
+        # Roundtrip across shapes
+        for shape in [(128,), (4, 256), (2, 3, 384)]:
+            x_s = torch.randn(*shape, device="cuda", dtype=torch.float32)
+            y_s, s_s = block_fp8_quant(x_s, block_size=128)
+            x_d = block_fp8_dequant(y_s, s_s, block_size=128)
+            assert x_d.shape == x_s.shape
+            assert torch.allclose(x_d, x_s, rtol=0.1, atol=0.05)
 
-    def test_dequantization_roundtrip_different_shapes(self):
-        """Test roundtrip with different tensor shapes."""
-        shapes = [
-            (128,),
-            (4, 256),
-            (2, 3, 384),
-        ]
-
-        for shape in shapes:
-            x_orig = torch.randn(*shape, device="cuda", dtype=torch.float32)
-            y, s = block_fp8_quant(x_orig, block_size=128)
-            x_dequant = block_fp8_dequant(y, s, block_size=128)
-
-            assert x_dequant.shape == x_orig.shape
-            # Check that values are close
-            assert torch.allclose(x_dequant, x_orig, rtol=0.1, atol=0.05)
-
-    def test_dequantization_requires_contiguous(self):
-        """Test that dequantization requires contiguous tensors."""
-        x_orig = torch.randn(4, 256, device="cuda", dtype=torch.float32)
-        y, s = block_fp8_quant(x_orig, block_size=128)
-
-        # Make y non-contiguous
-        y_transposed = y.t()
-
+        # Non-contiguous dequant should fail
+        y2, s2 = block_fp8_quant(torch.randn(4, 256, device="cuda", dtype=torch.float32), block_size=128)
         with pytest.raises(AssertionError):
-            block_fp8_dequant(y_transposed, s, block_size=128)
+            block_fp8_dequant(y2.t(), s2, block_size=128)
 
 
 class TestBlockFP8Integration:
-    """Integration tests for full quantization workflow."""
+    """Integration tests: determinism, memory efficiency, edge cases."""
 
-    def test_quantization_determinism(self):
-        """Test that quantization is deterministic."""
+    def test_determinism_memory_and_edge_cases(self):
+        """Determinism, memory efficiency, edge cases (small/large/mixed values, single block)."""
+        # Determinism
         x = torch.randn(4, 256, device="cuda", dtype=torch.float32)
-
         y1, s1 = block_fp8_quant(x, block_size=128)
         y2, s2 = block_fp8_quant(x, block_size=128)
-
         assert torch.equal(y1, y2)
         assert torch.equal(s1, s2)
 
-    def test_memory_efficiency(self):
-        """Test that FP8 reduces memory usage."""
+        # Memory efficiency
         M, K = 1024, 2048
-        block_size = 128
-
         x_fp32 = torch.randn(M, K, device="cuda", dtype=torch.float32)
-        y_fp8, s = block_fp8_quant(x_fp32, block_size=block_size)
-
-        # FP8 should use approximately 1/4 the memory of FP32
-        # (FP8 is 1 byte vs FP32 is 4 bytes)
+        y_fp8, s = block_fp8_quant(x_fp32, block_size=128)
         fp32_bytes = x_fp32.element_size() * x_fp32.numel()
         fp8_bytes = y_fp8.element_size() * y_fp8.numel() + s.element_size() * s.numel()
-
-        # FP8 + scales should be less than FP32
         assert fp8_bytes < fp32_bytes
 
-    def test_2d_vs_1d_dequant_consistency(self):
-        """Test that 1D and 2D dequant produce similar results for compatible shapes."""
-        M, N = 256, 512
-        block_size = 128
+        # Very small values
+        x_small = torch.full((2, 128), 1e-6, device="cuda", dtype=torch.float32)
+        y_sm, s_sm = block_fp8_quant(x_small, block_size=128)
+        x_d_sm = block_fp8_dequant(y_sm, s_sm, block_size=128)
+        assert torch.allclose(x_d_sm, x_small, rtol=0.5, atol=1e-7)
 
-        # Create test data
-        x_fp32 = torch.randn(M, N, device="cuda", dtype=torch.float32)
+        # Very large values
+        x_large = torch.full((2, 128), 400.0, device="cuda", dtype=torch.float32)
+        y_lg, s_lg = block_fp8_quant(x_large, block_size=128)
+        x_d_lg = block_fp8_dequant(y_lg, s_lg, block_size=128)
+        assert torch.allclose(x_d_lg, x_large, rtol=0.05, atol=1.0)
 
-        # 1D quantization
-        y_1d, s_1d = block_fp8_quant(x_fp32, block_size=block_size)
-        x_dequant_1d = block_fp8_dequant(y_1d, s_1d, block_size=block_size)
+        # Mixed positive/negative - signs preserved
+        x_mixed = torch.randn(4, 256, device="cuda", dtype=torch.float32)
+        x_mixed[0] = torch.abs(x_mixed[0])
+        x_mixed[1] = -torch.abs(x_mixed[1])
+        y_m, s_m = block_fp8_quant(x_mixed, block_size=128)
+        x_d_m = block_fp8_dequant(y_m, s_m, block_size=128)
+        assert torch.all((x_mixed >= 0) == (x_d_m >= 0))
 
-        # For 2D dequant, we need to reshape scales appropriately
-        # Note: This test shows the difference between 1D and 2D approaches
-        # They won't be identical because they use different blocking strategies
+        # Single block (minimum size)
+        x_single = torch.randn(1, 128, device="cuda", dtype=torch.float32)
+        y_sg, s_sg = block_fp8_quant(x_single, block_size=128)
+        assert y_sg.shape == (1, 128)
+        assert s_sg.shape == (1, 1)
+        x_d_sg = block_fp8_dequant(y_sg, s_sg, block_size=128)
+        assert torch.allclose(x_d_sg, x_single, rtol=0.1, atol=0.05)
 
-        # Just verify both produce valid outputs
-        assert x_dequant_1d.shape == x_fp32.shape
-        assert torch.allclose(x_dequant_1d, x_fp32, rtol=0.1, atol=0.05)
-
-
-class TestBlockFP8EdgeCases:
-    """Test edge cases and error handling."""
-
-    def test_very_small_values(self):
-        """Test quantization with very small values."""
-        x = torch.full((2, 128), 1e-6, device="cuda", dtype=torch.float32)
-        y, s = block_fp8_quant(x, block_size=128)
-        x_dequant = block_fp8_dequant(y, s, block_size=128)
-
-        # Small values should be preserved reasonably well
-        assert torch.allclose(x_dequant, x, rtol=0.5, atol=1e-7)
-
-    def test_very_large_values(self):
-        """Test quantization with large values near FP8 limits."""
-        x = torch.full((2, 128), 400.0, device="cuda", dtype=torch.float32)
-        y, s = block_fp8_quant(x, block_size=128)
-        x_dequant = block_fp8_dequant(y, s, block_size=128)
-
-        # Large values should be preserved
-        assert torch.allclose(x_dequant, x, rtol=0.05, atol=1.0)
-
-    def test_mixed_positive_negative(self):
-        """Test quantization with mixed positive and negative values."""
-        x = torch.randn(4, 256, device="cuda", dtype=torch.float32)
-        x[0] = torch.abs(x[0])  # All positive
-        x[1] = -torch.abs(x[1])  # All negative
-
-        y, s = block_fp8_quant(x, block_size=128)
-        x_dequant = block_fp8_dequant(y, s, block_size=128)
-
-        # Signs should be preserved
-        assert torch.all((x >= 0) == (x_dequant >= 0))
-
-    def test_single_block(self):
-        """Test with single block (minimum size)."""
-        x = torch.randn(1, 128, device="cuda", dtype=torch.float32)
-        y, s = block_fp8_quant(x, block_size=128)
-
-        assert y.shape == (1, 128)
-        assert s.shape == (1, 1)
-
-        x_dequant = block_fp8_dequant(y, s, block_size=128)
-        assert torch.allclose(x_dequant, x, rtol=0.1, atol=0.05)
+        # 1D/2D consistency
+        x_2d = torch.randn(256, 512, device="cuda", dtype=torch.float32)
+        y_1d, s_1d = block_fp8_quant(x_2d, block_size=128)
+        x_d_1d = block_fp8_dequant(y_1d, s_1d, block_size=128)
+        assert x_d_1d.shape == x_2d.shape
+        assert torch.allclose(x_d_1d, x_2d, rtol=0.1, atol=0.05)
 
 
 if __name__ == "__main__":

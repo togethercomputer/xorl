@@ -48,15 +48,15 @@ EP_EXPERT_COMPUTE: Dict[str, Callable] = {}
 
 # Triton EP compute (custom Triton group GEMM with autograd)
 try:
-    from xorl.ops.moe_experts import EPGroupGemm
+    from xorl.ops.moe.triton import TritonEPGroupGemm
 
-    EP_EXPERT_COMPUTE["triton"] = EPGroupGemm.apply
+    EP_EXPERT_COMPUTE["triton"] = TritonEPGroupGemm.apply
 except ImportError:
     pass
 
 # Quack EP compute (quack group GEMM with autograd)
 try:
-    from xorl.ops.quack_moe import QuackEPGroupGemm
+    from xorl.ops.moe.quack import QuackEPGroupGemm
 
     EP_EXPERT_COMPUTE["quack"] = QuackEPGroupGemm.apply
 except ImportError:
@@ -114,15 +114,15 @@ EP_EXPERT_COMPUTE_LORA: Dict[str, Callable] = {}
 
 # Triton EP LoRA compute (custom Triton group GEMM with autograd)
 try:
-    from xorl.ops.moe_experts_lora import EPGroupGemmWithLoRA
+    from xorl.ops.moe.triton_lora import TritonEPGroupGemmWithLoRA
 
-    EP_EXPERT_COMPUTE_LORA["triton"] = EPGroupGemmWithLoRA.apply
+    EP_EXPERT_COMPUTE_LORA["triton"] = TritonEPGroupGemmWithLoRA.apply
 except ImportError:
     pass
 
 # Quack EP LoRA compute (quack group GEMM with autograd)
 try:
-    from xorl.ops.quack_moe_lora import QuackEPGroupGemmWithLoRA
+    from xorl.ops.moe.quack_lora import QuackEPGroupGemmWithLoRA
 
     EP_EXPERT_COMPUTE_LORA["quack"] = QuackEPGroupGemmWithLoRA.apply
 except ImportError:
@@ -149,15 +149,15 @@ MOE_EXPERT_BACKENDS_LORA: Dict[str, Callable] = {}
 
 # Triton local LoRA compute
 try:
-    from xorl.ops.moe_experts_lora import moe_experts_lora_forward
+    from xorl.ops.moe.triton_lora import triton_moe_lora_forward
 
-    MOE_EXPERT_BACKENDS_LORA["triton"] = moe_experts_lora_forward
+    MOE_EXPERT_BACKENDS_LORA["triton"] = triton_moe_lora_forward
 except ImportError:
     pass
 
 # Quack local LoRA compute
 try:
-    from xorl.ops.quack_moe_lora import quack_moe_lora_forward
+    from xorl.ops.moe.quack_lora import quack_moe_lora_forward
 
     MOE_EXPERT_BACKENDS_LORA["quack"] = quack_moe_lora_forward
 except ImportError:

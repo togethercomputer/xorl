@@ -26,8 +26,9 @@ from pathlib import Path
 repo_root = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(repo_root))
 
-from xorl.server.api_server.api_server import APIServer, app
-from xorl.server.engine.engine_core_proc_dummy import EngineCoreProc
+from xorl.server.api_server.server import APIServer, app
+from xorl.server.backend import DummyBackend
+from xorl.server.orchestrator.orchestrator import Orchestrator
 
 
 logging.basicConfig(
@@ -85,22 +86,22 @@ async def main():
     # Start mock engine if requested
     mock_engine = None
     if args.mock:
-        logger.info("🚀 Starting mock engine for testing...")
-        mock_engine = EngineCoreProc(
+        logger.info("Starting mock engine for testing...")
+        mock_engine = Orchestrator(
             input_addr=args.engine_input,
             output_addr=args.engine_output,
+            backend=DummyBackend(),
         )
         mock_engine.start()
         await asyncio.sleep(1.0)  # Wait for engine to bind sockets
-        logger.info(f"✅ Mock engine started on {args.engine_input} -> {args.engine_output}")
+        logger.info(f"Mock engine started on {args.engine_input} -> {args.engine_output}")
 
     try:
-        logger.info(f"✅ Mock engine ready" if args.mock else "✅ Connecting to engine...")
-        logger.info(f"📡 Engine input: {args.engine_input}")
-        logger.info(f"📡 Engine output: {args.engine_output}")
-        logger.info(f"🌐 API will be available at http://{args.host}:{args.port}")
-        logger.info(f"📚 API docs at http://{args.host}:{args.port}/docs")
-        logger.info(f"🧪 Run 'python tests/server/api_server/test_api_client.py' to test the API")
+        logger.info("Mock engine ready" if args.mock else "Connecting to engine...")
+        logger.info(f"Engine input: {args.engine_input}")
+        logger.info(f"Engine output: {args.engine_output}")
+        logger.info(f"API will be available at http://{args.host}:{args.port}")
+        logger.info(f"API docs at http://{args.host}:{args.port}/docs")
 
         # Run uvicorn server (lifespan will handle APIServer start/stop)
         config = uvicorn.Config(
@@ -113,18 +114,18 @@ async def main():
         await server_instance.serve()
 
     except KeyboardInterrupt:
-        logger.info("🛑 Shutting down...")
+        logger.info("Shutting down...")
     finally:
         # Lifespan will stop API server automatically
 
         # Stop mock engine if running
         if mock_engine:
             mock_engine.stop()
-            logger.info("✅ Mock engine stopped")
+            logger.info("Mock engine stopped")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("👋 Goodbye!")
+        logger.info("Goodbye!")

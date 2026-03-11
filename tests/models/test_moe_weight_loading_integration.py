@@ -13,6 +13,8 @@ import pytest
 import torch
 import torch.nn as nn
 
+pytestmark = [pytest.mark.cpu]
+
 # Re-implement the core logic to test without full xorl dependencies
 import re
 from collections import defaultdict
@@ -240,105 +242,63 @@ def simulate_load_model_weights(
 class TestMoeWeightLoadingIntegration:
     """Integration tests for MoE weight loading with auto-merge."""
 
-    def test_load_per_expert_weights_into_fused_model(self):
-        """Test loading per-expert weights into a model expecting fused format."""
+    def test_load_and_verify_shapes_and_order(self):
+        """Test loading per-expert weights, verifying fused shapes, expert order, and projection sizes."""
         num_layers = 2
         num_experts = 4
         hidden_size = 32
-        intermediate_size = 64
+        intermediate_size = 128
 
-        # Create model with fused expert format
         model = MockMoeModel(num_layers, num_experts, hidden_size, intermediate_size)
-
-        # Create per-expert state dict (HuggingFace format)
         per_expert_state_dict = create_per_expert_state_dict(
             num_layers, num_experts, hidden_size, intermediate_size
         )
 
-        # Simulate loading
         loaded_weights = simulate_load_model_weights(
-            model,
-            iter(per_expert_state_dict.items()),
-            num_experts,
+            model, iter(per_expert_state_dict.items()), num_experts
         )
 
-        # Verify all fused parameters were created
-        expected_params = []
+        # All fused parameters created with correct shapes
         for layer_idx in range(num_layers):
             for proj in ["gate", "up", "down"]:
-                expected_params.append(f"model.layers.{layer_idx}.mlp.experts.{proj}_proj")
+                param_name = f"model.layers.{layer_idx}.mlp.experts.{proj}_proj"
+                assert param_name in loaded_weights, f"Missing {param_name}"
 
-        for param_name in expected_params:
-            assert param_name in loaded_weights, f"Missing {param_name}"
-
-        # Verify shapes
-        for layer_idx in range(num_layers):
             gate = loaded_weights[f"model.layers.{layer_idx}.mlp.experts.gate_proj"]
             up = loaded_weights[f"model.layers.{layer_idx}.mlp.experts.up_proj"]
             down = loaded_weights[f"model.layers.{layer_idx}.mlp.experts.down_proj"]
 
+            # gate and up: [num_experts, hidden_size, intermediate_size]
             assert gate.shape == (num_experts, hidden_size, intermediate_size)
             assert up.shape == (num_experts, hidden_size, intermediate_size)
+            # down: [num_experts, intermediate_size, hidden_size]
             assert down.shape == (num_experts, intermediate_size, hidden_size)
 
-    def test_expert_order_preserved(self):
-        """Test that expert order is preserved after merging."""
-        num_layers = 1
-        num_experts = 4
-        hidden_size = 8
-        intermediate_size = 16
-
-        model = MockMoeModel(num_layers, num_experts, hidden_size, intermediate_size)
-
-        # Create per-expert weights with identifiable values
-        state_dict = {}
+        # Expert order preserved with identifiable values
+        model2 = MockMoeModel(1, num_experts, 8, 16)
+        state_dict2 = {}
         for expert_idx in range(num_experts):
-            # Fill each expert's gate_proj with a unique value
-            state_dict[f"model.layers.0.mlp.experts.{expert_idx}.gate_proj.weight"] = \
-                torch.full((intermediate_size, hidden_size), float(expert_idx))
-            state_dict[f"model.layers.0.mlp.experts.{expert_idx}.up_proj.weight"] = \
-                torch.randn(intermediate_size, hidden_size)
-            state_dict[f"model.layers.0.mlp.experts.{expert_idx}.down_proj.weight"] = \
-                torch.randn(hidden_size, intermediate_size)
+            state_dict2[f"model.layers.0.mlp.experts.{expert_idx}.gate_proj.weight"] = \
+                torch.full((16, 8), float(expert_idx))
+            state_dict2[f"model.layers.0.mlp.experts.{expert_idx}.up_proj.weight"] = \
+                torch.randn(16, 8)
+            state_dict2[f"model.layers.0.mlp.experts.{expert_idx}.down_proj.weight"] = \
+                torch.randn(8, 16)
 
-        # Load in random order
-        items = list(state_dict.items())
         import random
+        items = list(state_dict2.items())
         random.seed(42)
         random.shuffle(items)
 
-        loaded_weights = simulate_load_model_weights(model, iter(items), num_experts)
-
-        # Verify expert order (values are transposed but constant, so all elements still equal)
-        gate_proj = loaded_weights["model.layers.0.mlp.experts.gate_proj"]
+        loaded2 = simulate_load_model_weights(model2, iter(items), num_experts)
+        gate_proj = loaded2["model.layers.0.mlp.experts.gate_proj"]
         for expert_idx in range(num_experts):
             assert torch.all(gate_proj[expert_idx] == float(expert_idx)), \
                 f"Expert {expert_idx} not in correct position"
 
-    def test_load_with_many_experts(self):
-        """Test loading with large number of experts (like Qwen3-30B with 128 experts)."""
-        num_layers = 1
-        num_experts = 128
-        hidden_size = 16
-        intermediate_size = 32
-
-        model = MockMoeModel(num_layers, num_experts, hidden_size, intermediate_size)
-        state_dict = create_per_expert_state_dict(
-            num_layers, num_experts, hidden_size, intermediate_size
-        )
-
-        loaded_weights = simulate_load_model_weights(
-            model,
-            iter(state_dict.items()),
-            num_experts,
-        )
-
-        # Verify shape
-        gate_proj = loaded_weights["model.layers.0.mlp.experts.gate_proj"]
-        assert gate_proj.shape == (num_experts, hidden_size, intermediate_size)
-
-    def test_streaming_load_across_shards(self):
-        """Test that streaming load works when experts are spread across multiple 'shards'."""
+    def test_streaming_and_edge_cases(self):
+        """Test sharded streaming load, large expert count, single expert, and random order."""
+        # Streaming across shards
         num_layers = 2
         num_experts = 8
         hidden_size = 16
@@ -348,105 +308,56 @@ class TestMoeWeightLoadingIntegration:
         state_dict = create_per_expert_state_dict(
             num_layers, num_experts, hidden_size, intermediate_size
         )
-
-        # Simulate sharded loading by splitting state dict into chunks
         items = list(state_dict.items())
-
-        # Shard 1: first half of experts from each layer
         shard1 = [(k, v) for k, v in items if any(f".experts.{i}." in k for i in range(4))]
-        # Shard 2: second half of experts from each layer
         shard2 = [(k, v) for k, v in items if any(f".experts.{i}." in k for i in range(4, 8))]
-
-        # Combine shards (simulating sequential loading)
         combined_iterator = iter(shard1 + shard2)
 
         loaded_weights = simulate_load_model_weights(model, combined_iterator, num_experts)
-
-        # Should still produce correct results
         for layer_idx in range(num_layers):
             gate = loaded_weights[f"model.layers.{layer_idx}.mlp.experts.gate_proj"]
             assert gate.shape == (num_experts, hidden_size, intermediate_size)
 
+        # Large expert count (128)
+        model_large = MockMoeModel(1, 128, 16, 32)
+        state_dict_large = create_per_expert_state_dict(1, 128, 16, 32)
+        loaded_large = simulate_load_model_weights(
+            model_large, iter(state_dict_large.items()), 128
+        )
+        assert loaded_large["model.layers.0.mlp.experts.gate_proj"].shape == (128, 16, 32)
+
+        # Single expert
+        model_single = MockMoeModel(1, 1, 8, 16)
+        state_dict_single = create_per_expert_state_dict(1, 1, 8, 16)
+        loaded_single = simulate_load_model_weights(
+            model_single, iter(state_dict_single.items()), 1
+        )
+        assert loaded_single["model.layers.0.mlp.experts.gate_proj"].shape == (1, 8, 16)
+
+        # Random order loading
+        import random
+        model_rand = MockMoeModel(2, 4, 8, 16)
+        state_dict_rand = create_per_expert_state_dict(2, 4, 8, 16)
+        items_rand = list(state_dict_rand.items())
+        random.seed(123)
+        random.shuffle(items_rand)
+        loaded_rand = simulate_load_model_weights(model_rand, iter(items_rand), 4)
+        for layer_idx in range(2):
+            for proj in ["gate", "up", "down"]:
+                assert f"model.layers.{layer_idx}.mlp.experts.{proj}_proj" in loaded_rand
+
     def test_incomplete_experts_raises_error(self):
         """Test that incomplete expert set raises an error."""
-        num_layers = 1
-        num_experts = 4
-        hidden_size = 8
-        intermediate_size = 16
+        model = MockMoeModel(1, 4, 8, 16)
 
-        model = MockMoeModel(num_layers, num_experts, hidden_size, intermediate_size)
-
-        # Create state dict with missing expert
         state_dict = {}
-        for expert_idx in range(num_experts - 1):  # Missing expert 3
+        for expert_idx in range(3):  # Missing expert 3
             state_dict[f"model.layers.0.mlp.experts.{expert_idx}.gate_proj.weight"] = \
-                torch.randn(intermediate_size, hidden_size)
+                torch.randn(16, 8)
             state_dict[f"model.layers.0.mlp.experts.{expert_idx}.up_proj.weight"] = \
-                torch.randn(intermediate_size, hidden_size)
+                torch.randn(16, 8)
             state_dict[f"model.layers.0.mlp.experts.{expert_idx}.down_proj.weight"] = \
-                torch.randn(hidden_size, intermediate_size)
+                torch.randn(8, 16)
 
         with pytest.raises(RuntimeError, match="Incomplete expert weights"):
-            simulate_load_model_weights(model, iter(state_dict.items()), num_experts)
-
-
-class TestMoeWeightLoadingEdgeCases:
-    """Edge case tests for MoE weight loading."""
-
-    def test_single_layer_single_expert(self):
-        """Test edge case with single layer and single expert."""
-        model = MockMoeModel(1, 1, 8, 16)
-        state_dict = create_per_expert_state_dict(1, 1, 8, 16)
-
-        loaded_weights = simulate_load_model_weights(model, iter(state_dict.items()), 1)
-
-        assert loaded_weights["model.layers.0.mlp.experts.gate_proj"].shape == (1, 8, 16)
-
-    def test_mixed_order_loading(self):
-        """Test loading when per-expert weights arrive in random order."""
-        num_layers = 2
-        num_experts = 4
-        hidden_size = 8
-        intermediate_size = 16
-
-        model = MockMoeModel(num_layers, num_experts, hidden_size, intermediate_size)
-        state_dict = create_per_expert_state_dict(
-            num_layers, num_experts, hidden_size, intermediate_size
-        )
-
-        # Shuffle to simulate random order from sharded files
-        import random
-        items = list(state_dict.items())
-        random.seed(123)
-        random.shuffle(items)
-
-        loaded_weights = simulate_load_model_weights(model, iter(items), num_experts)
-
-        # All should be loaded correctly regardless of order
-        for layer_idx in range(num_layers):
-            for proj in ["gate", "up", "down"]:
-                param_name = f"model.layers.{layer_idx}.mlp.experts.{proj}_proj"
-                assert param_name in loaded_weights
-
-    def test_different_projection_sizes(self):
-        """Test that gate/up and down projections have correct transposed shapes."""
-        num_layers = 1
-        num_experts = 2
-        hidden_size = 32
-        intermediate_size = 128
-
-        model = MockMoeModel(num_layers, num_experts, hidden_size, intermediate_size)
-        state_dict = create_per_expert_state_dict(
-            num_layers, num_experts, hidden_size, intermediate_size
-        )
-
-        loaded_weights = simulate_load_model_weights(model, iter(state_dict.items()), num_experts)
-
-        # gate and up: [num_experts, hidden_size, intermediate_size] (G, K, N)
-        assert loaded_weights["model.layers.0.mlp.experts.gate_proj"].shape == \
-            (num_experts, hidden_size, intermediate_size)
-        assert loaded_weights["model.layers.0.mlp.experts.up_proj"].shape == \
-            (num_experts, hidden_size, intermediate_size)
-        # down: [num_experts, intermediate_size, hidden_size] (G, K, N)
-        assert loaded_weights["model.layers.0.mlp.experts.down_proj"].shape == \
-            (num_experts, intermediate_size, hidden_size)
+            simulate_load_model_weights(model, iter(state_dict.items()), 4)

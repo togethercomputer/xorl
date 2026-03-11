@@ -1,16 +1,7 @@
-# Legacy R3 routing replay (server path) — kept for backward compat
-from .routing_replay import (
-    RoutingReplay as R3RoutingReplay,
-    get_current_routing_replay,
-    set_current_routing_replay,
-)
-
-# Lazy-load moe_layer to break circular import:
-#   moe/__init__ → moe_layer → ops.group_gemm → ops/__init__ → ops.moe_experts → moe/__init__
+# Lazy-load alltoall to break circular import:
+#   moe/__init__ → alltoall → ops.group_gemm → ops/__init__ → ops.moe → moe/__init__
 def __getattr__(name):
     if name in (
-        "EPGroupGemm",
-        "EPGroupGemmWithLoRA",
         "preprocess",
         "token_pre_all2all",
         "tokens_post_all2all",
@@ -18,9 +9,7 @@ def __getattr__(name):
         "alltoall_pre_dispatch",
         "alltoall_post_combine",
     ):
-        from .moe_layer import (
-            EPGroupGemm,
-            EPGroupGemmWithLoRA,
+        from .alltoall import (
             preprocess,
             token_pre_all2all,
             tokens_post_all2all,
@@ -31,8 +20,6 @@ def __getattr__(name):
 
         globals().update(
             {
-                "EPGroupGemm": EPGroupGemm,
-                "EPGroupGemmWithLoRA": EPGroupGemmWithLoRA,
                 "preprocess": preprocess,
                 "token_pre_all2all": token_pre_all2all,
                 "tokens_post_all2all": tokens_post_all2all,
@@ -70,8 +57,6 @@ __all__ = [
     "preprocess",
     "token_pre_all2all",
     "tokens_post_all2all",
-    "EPGroupGemm",
-    "EPGroupGemmWithLoRA",
     # Unified alltoall dispatch/combine
     "AllToAllDispatchContext",
     "alltoall_pre_dispatch",
@@ -83,8 +68,4 @@ __all__ = [
     "tokens_post_combine",
     "get_default_buffer",
     "destroy_default_buffer",
-    # Legacy R3 routing replay (server path)
-    "R3RoutingReplay",
-    "get_current_routing_replay",
-    "set_current_routing_replay",
 ]

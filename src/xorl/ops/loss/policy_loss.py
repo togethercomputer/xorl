@@ -7,13 +7,15 @@ This module provides the policy loss functions including:
 - Combined policy_loss_function
 """
 
+from __future__ import annotations
+
 import logging
 from typing import Dict, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
-
-from .compiled_cross_entropy import compiled_cross_entropy_function
+import torch.distributed as dist
+from xorl.ops.loss.loss_output import LossOutput
+from xorl.ops.loss.per_token_ce import compute_per_token_ce
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +123,8 @@ def policy_loss_function(
     num_chunks: int = 8,
     ce_mode: str = "compiled",
     compute_kl_stats: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+    tp_group: Optional[dist.ProcessGroup] = None,
+) -> "LossOutput":
     """
     Policy loss with PPO clipping and optional TIS correction.
 
@@ -150,12 +153,13 @@ def policy_loss_function(
         use_liger: Kept for API compatibility (ignored)
         num_chunks: Number of chunks for auto_chunker (default: 8). Only used when ce_mode="compiled".
         ce_mode: Cross-entropy mode - "compiled" (recommended) or "eager"
+        tp_group: TP process group for vocab-parallel cross-entropy (default: None)
         compute_kl_stats: If True, compute and return full KL statistics in metrics dict
                          (kl_sample_train_k3, entropy_sample, ratio stats).
                          If False (default), only return valid_tokens and pg_clipfrac.
 
     Returns:
-        Tuple of (loss, new_logprobs, metrics_dict)
+        LossOutput with loss, per_token_logprobs (new logprobs), and metrics.
     """
 
     # Store original shape
@@ -171,12 +175,11 @@ def policy_loss_function(
     valid_mask = (labels_flat != ignore_index)
     n_valid = valid_mask.sum().clamp(min=1)
 
-    # Compute cross-entropy based on mode
-    if ce_mode == "compiled":
-        per_token_ce = compiled_cross_entropy_function(hidden_states_flat, weight, labels_flat, ignore_index, num_chunks)
-    else:  # eager mode - casts to FP32
-        logits_flat = (hidden_states_flat @ weight.t()).float()
-        per_token_ce = F.cross_entropy(logits_flat, labels_flat, reduction="none", ignore_index=ignore_index)
+    # Compute cross-entropy (supports vocab-parallel TP via tp_group)
+    per_token_ce = compute_per_token_ce(
+        hidden_states_flat, weight, labels_flat, ignore_index, ce_mode, num_chunks,
+        tp_group=tp_group,
+    )
 
     new_logprobs_flat = -per_token_ce.detach()
 
@@ -198,7 +201,7 @@ def policy_loss_function(
                 _log_ratio = _valid_new - _valid_old
                 _ratio_valid = torch.exp(_log_ratio)
                 _kl_stats = {
-                    "kl_sample_train_k3": (torch.exp(_log_ratio) - _log_ratio - 1.0).mean().item(),
+                    "kl_sample_train_k3": (_ratio_valid - _log_ratio - 1.0).mean().item(),
                     "entropy_sample": -_valid_old.mean().item(),
                     "ratio_mean": _ratio_valid.mean().item(),
                     "ratio_min": _ratio_valid.min().item(),
@@ -295,4 +298,8 @@ def policy_loss_function(
         for k, v in tis_metrics.items():
             metrics[k] = v.item() if torch.is_tensor(v) else v
 
-    return loss_with_grad, new_logprobs, metrics
+    return LossOutput(
+        loss=loss_with_grad,
+        per_token_logprobs=new_logprobs,
+        metrics=metrics,
+    )

@@ -25,14 +25,14 @@ def build_tokenizer(tokenizer_path: str) -> "PreTrainedTokenizer":
     """
     Builds the tokenizer.
     """
-    return AutoTokenizer.from_pretrained(tokenizer_path, padding_side="right", trust_remote_code=True)
+    return AutoTokenizer.from_pretrained(tokenizer_path, padding_side="right")
 
 
 def build_processor(processor_path: str) -> "ProcessorMixin":
     """
     Builds the processor.
     """
-    return AutoProcessor.from_pretrained(processor_path, padding_side="right", trust_remote_code=True)
+    return AutoProcessor.from_pretrained(processor_path, padding_side="right")
 
 
 def _load_config_with_rank0_priority(
@@ -55,7 +55,7 @@ def _load_config_with_rank0_priority(
     if is_distributed and rank != 0:
         dist.barrier()
 
-    config = AutoConfig.from_pretrained(config_path, trust_remote_code=True, **config_kwargs)
+    config = AutoConfig.from_pretrained(config_path, **config_kwargs)
 
     if is_distributed and rank == 0:
         dist.barrier()
@@ -68,8 +68,8 @@ def build_foundation_model(
     weights_path: Optional[str] = None,
     torch_dtype: Literal["float16", "bfloat16", "float32"] = "bfloat16",
     attn_implementation: Optional[
-        Literal["eager", "sdpa", "flash_attention_2", "flash_attention_3", "flash_attention_4", "native-sparse"]
-    ] = "flash_attention_2",
+        Literal["eager", "sdpa", "native", "flash_attention_3", "flash_attention_4"]
+    ] = "flash_attention_3",
     moe_implementation: Optional[Literal["eager", "triton", "native", "quack"]] = None,
     ep_dispatch: str = "alltoall",
     deepep_buffer_size_gb: float = 2.0,
@@ -111,7 +111,7 @@ def build_foundation_model(
     if attn_implementation == "sdpa":
         raise ValueError(
             "attn_implementation='sdpa' is not supported for packed sequences with sequence parallelism. "
-            "Please use 'flash_attention_2' or 'flash_attention_3' for correct cu_seqlens handling."
+            "Please use 'flash_attention_3' for correct cu_seqlens handling."
         )
 
     loader: ModelLoader = get_loader(config)
@@ -121,7 +121,7 @@ def build_foundation_model(
         if "flash_attention_4" not in ATTENTION_FUNCTIONS:
             raise ImportError(
                 "flash_attention_4 requested but flash_attn.cute is not installed. "
-                "Please install FA4 dependencies or use flash_attention_2."
+                "Please install FA4 dependencies or use flash_attention_3."
             )
         logger.info_rank0("Using Flash Attention 4 (CUTE) for attention computation")
 
@@ -135,7 +135,6 @@ def build_foundation_model(
         "config": config,
         "torch_dtype": getattr(torch, torch_dtype),
         "attn_implementation": hf_attn_implementation,
-        "trust_remote_code": True,
     }
 
     if (init_device == "cpu" and get_parallel_state().global_rank != 0) or init_device == "meta":

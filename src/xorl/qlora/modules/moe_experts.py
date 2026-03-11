@@ -1,10 +1,13 @@
 """
-QLoRA wrapper for MoE expert modules (e.g., Qwen3MoeSparseExperts).
+QLoRA wrapper for MoE expert modules with format-specific subclasses.
 
-Quantizes 3D expert weights (gate_proj, up_proj, down_proj) into nvfp4
-and adds hybrid shared LoRA. Dequantizes on-the-fly during forward.
+Base class QLoRAMoeExperts holds shared logic (LoRA, forward, EP, weight loading).
+Subclasses define format-specific scale buffers, quantization, and dequantization:
 
-All weights are stored in (G, K, N) format — [num_experts, in_features, out_features].
+- NvFP4QLoRAMoeExperts: 4-bit (nvfp4) — 9 buffers (packed + block_scales + global_scale per proj)
+- BlockFP8QLoRAMoeExperts: 8-bit (block_fp8) — 6 buffers (packed + block_scales per proj, no global_scale)
+
+All weights are stored in (G, K, N) format -- [num_experts, in_features, out_features].
 
 LoRA weight parameter names match MoEExpertsLoRA for checkpoint compatibility::
 
@@ -12,14 +15,10 @@ LoRA weight parameter names match MoEExpertsLoRA for checkpoint compatibility::
     up_proj_lora_A:   [1, hidden, r]     up_proj_lora_B:   [E, r, inter]   (hybrid shared)
     down_proj_lora_A: [E, inter, r]      down_proj_lora_B: [1, r, hidden]  (hybrid shared)
 
-For large MoE models (e.g., 235B), base weights are NOT registered as nn.Parameter
-to avoid FSDP allocating them on GPU (which would OOM). Instead, weights are loaded
-directly from the checkpoint and quantized on-the-fly via load_and_quantize_weights().
-
 Supports Expert Parallelism (EP) via the backend registry: dispatch (alltoall/deepep)
-→ compute (triton/quack/native) → combine.
+-> compute (triton/quack/native) -> combine.
 
-Drop-in replacement for MoEExperts/MoEExpertsLoRA — just replace module.experts in
+Drop-in replacement for MoEExperts/MoEExpertsLoRA -- just replace module.experts in
 the original MoeBlock.
 """
 
@@ -37,31 +36,19 @@ from xorl.ops.quantize import (
 )
 from xorl.ops.quantize.fp4_codec import FP4_E2M1_MAX, FP8_E4M3_MAX
 from xorl.ops.quantize import block_fp8_quantize_gkn, block_fp8_dequantize_gkn
+from xorl.ops.quantize import nf4_quantize_gkn, nf4_dequantize_gkn
 from xorl.ops.group_gemm.kernel.lora_utils import compute_lora_scaling
 from xorl.lora.modules.base import LoraModule
 
 
 class QLoRAMoeExperts(LoraModule, nn.Module):
     """
-    QLoRA wrapper for MoE experts with separate gate/up/down projections.
+    Base QLoRA wrapper for MoE experts with separate gate/up/down projections.
+
+    Do not instantiate directly -- use NvFP4QLoRAMoeExperts or BlockFP8QLoRAMoeExperts.
 
     Stores only LOCAL experts (num_local_experts = num_experts // ep_size).
     Uses (G, K, N) weight format and backend registry for compute.
-
-    Args:
-        num_local_experts: Number of local experts on this EP rank
-        num_experts: Total number of experts (global)
-        intermediate_size: MoE intermediate size (gate/up output dim)
-        hidden_size: Model hidden size (gate/up input dim, down output dim)
-        r: LoRA rank per expert
-        lora_alpha: LoRA scaling factor
-        quant_format: Only "nvfp4" is supported
-        quant_group_size: Block size for quantization (default: 16)
-        expert_offset: Starting global expert index for this rank
-        moe_implementation: Backend for compute ("triton", "quack", "native", "eager")
-        hybrid_shared: Use hybrid shared LoRA design
-        use_rslora: Use rank-stabilized LoRA scaling
-        ep_dispatch: EP dispatch strategy ("alltoall" or "deepep")
     """
 
     def __init__(
@@ -108,30 +95,19 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         self.deepep_num_sms = deepep_num_sms
         self.deepep_async_combine = deepep_async_combine
 
-        # Base weights are NOT nn.Parameters — loaded separately via
+        # Base weights are NOT nn.Parameters -- loaded separately via
         # load_and_quantize_weights() to avoid FSDP GPU allocation OOM.
         self._source_fqn: Optional[str] = None  # set by inject_qlora_into_model
-        self._source_quant_format: Optional[str] = None  # checkpoint format (for cross-format conversion)
+        self._source_quant_format: Optional[str] = None  # checkpoint format (set by inject_qlora_into_model)
         self._weights_loaded = False
 
         # EMA-tracked amax for re-quantization (per projection, per-expert)
         self._ema_amax: dict = {"gate": None, "up": None, "down": None}
 
-        # Quantized weight storage — nvfp4 (populated after quantization)
-        self.register_buffer("gate_packed", None)
-        self.register_buffer("gate_block_scales", None)
-        self.register_buffer("gate_global_scale", None)
-        self.register_buffer("up_packed", None)
-        self.register_buffer("up_block_scales", None)
-        self.register_buffer("up_global_scale", None)
-        self.register_buffer("down_packed", None)
-        self.register_buffer("down_block_scales", None)
-        self.register_buffer("down_global_scale", None)
-
         # LoRA parameters in (G, K, N) format with hybrid shared design:
         #   gate/up: lora_A shared [1, hidden, r], lora_B per-expert [E, r, inter]
         #   down: lora_A per-expert [E, inter, r], lora_B shared [1, r, hidden]
-        # Created at GLOBAL shape (num_experts) — the EP parallel plan will
+        # Created at GLOBAL shape (num_experts) -- the EP parallel plan will
         # Shard(0) them to local shape.  Shared params (size=1 on dim-0) are
         # automatically replicated by the EP plan.
         shared_exp = 1 if hybrid_shared else num_experts
@@ -162,7 +138,8 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         # are loaded separately via load_and_quantize_weights, not through FSDP).
         self._qlora_expected_skip_keys = {"gate_proj", "up_proj", "down_proj"}
 
-        self.reset_lora_parameters()
+        # NOTE: Subclasses MUST register quantized weight buffers,
+        # then call self.reset_lora_parameters()
 
     def _create_lora_params(
         self, name: str, A_experts: int, B_experts: int, r: int,
@@ -198,39 +175,25 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         B = lora_B.expand(E, -1, -1)  # [E, r, out]
         return torch.bmm(A, B) * self.scaling  # [E, in, out] = [E, K, N]
 
+    # ------------------------------------------------------------------
+    # Abstract methods (subclasses must implement)
+    # ------------------------------------------------------------------
+
+    def _quantize_2d(self, w: Tensor, global_amax=None):
+        """Quantize a 2D [K, N] weight. Returns (packed_uint8, scales_dict)."""
+        raise NotImplementedError
+
+    def _dequantize_2d(self, packed: Tensor, scales_dict: dict, K: int, N: int) -> Tensor:
+        """Dequantize to [K, N] G,K,N format."""
+        raise NotImplementedError
+
     def merge_weights(self, ema_decay: float = 0.1) -> None:
-        """Merge LoRA into base weights and re-quantize.
+        """Merge LoRA into base weights and re-quantize."""
+        raise NotImplementedError
 
-        Dequantize -> add LoRA delta -> EMA-update _ema_amax -> re-quantize -> store.
-        Resets LoRA parameters after merge.
-
-        For block_fp8: skip EMA amax (per-block scales are independent, no global scale).
-        """
-        with torch.no_grad():
-            for proj_name, K, N in [
-                ("gate", self.hidden_size, self.intermediate_size),
-                ("up", self.hidden_size, self.intermediate_size),
-                ("down", self.intermediate_size, self.hidden_size),
-            ]:
-                w = self.dequantize_all_experts(proj_name, K, N)  # [E, K, N] bf16
-                delta = self._compute_proj_delta(f"{proj_name}_proj").to(w.dtype)
-                w_merged = w + delta
-                if self.quant_format == "block_fp8":
-                    # block_fp8: re-quantize with fresh per-block scales, no global amax
-                    self._quantize_proj(proj_name, w_merged)
-                else:
-                    fresh_amax = w_merged.float().abs().amax(dim=(1, 2))  # [E]
-                    if self._ema_amax[proj_name] is not None:
-                        self._ema_amax[proj_name].lerp_(
-                            fresh_amax.to(self._ema_amax[proj_name].device), ema_decay
-                        )
-                    else:
-                        self._ema_amax[proj_name] = fresh_amax
-                    self._quantize_proj(
-                        proj_name, w_merged,
-                        global_amax_per_expert=self._ema_amax[proj_name],
-                    )
-        self.reset_lora_parameters()
+    def _load_experts(self, _load_tensor, _shard_cache) -> None:
+        """Load pre-quantized expert weights from checkpoint. Subclass must implement."""
+        raise NotImplementedError
 
     # ------------------------------------------------------------------
     # Construction from existing module
@@ -267,15 +230,24 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         moe_implementation = getattr(module, "moe_implementation", "triton")
         ep_dispatch = getattr(module, "ep_dispatch", "alltoall")
 
-        qlora = cls(
+        # Pick the right subclass if called on base
+        if cls is QLoRAMoeExperts:
+            if quant_format == "block_fp8":
+                subcls = BlockFP8QLoRAMoeExperts
+            elif quant_format == "nf4":
+                subcls = NF4QLoRAMoeExperts
+            else:
+                subcls = NvFP4QLoRAMoeExperts
+        else:
+            subcls = cls
+
+        qlora = subcls(
             num_local_experts=num_local_experts,
             num_experts=total_experts,
             intermediate_size=intermediate_size,
             hidden_size=hidden_size,
             r=r,
             lora_alpha=lora_alpha,
-            quant_format=quant_format,
-            quant_group_size=quant_group_size,
             act_fn=act_fn,
             expert_offset=expert_offset,
             device=gate.device,
@@ -288,26 +260,11 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
             deepep_async_combine=getattr(module, "deepep_async_combine", False),
         )
 
-        if gate.device.type != "meta":
-            # Non-meta: quantize local experts immediately (already in G,K,N)
-            local_gate = gate[expert_offset:expert_offset + num_local_experts].detach()
-            local_up = module.up_proj[expert_offset:expert_offset + num_local_experts].detach()
-            local_down = module.down_proj[expert_offset:expert_offset + num_local_experts].detach()
-            qlora._quantize_proj("gate", local_gate)
-            qlora._quantize_proj("up", local_up)
-            qlora._quantize_proj("down", local_down)
-            # Initialize EMA amax per-expert for each projection (not needed for block_fp8)
-            if quant_format != "block_fp8":
-                qlora._ema_amax["gate"] = local_gate.float().abs().amax(dim=(1, 2))
-                qlora._ema_amax["up"] = local_up.float().abs().amax(dim=(1, 2))
-                qlora._ema_amax["down"] = local_down.float().abs().amax(dim=(1, 2))
-            qlora._weights_loaded = True
-        # For meta init: weights will be loaded via load_and_quantize_weights()
-
+        # Weights will be loaded via load_and_quantize_weights()
         return qlora
 
     # ------------------------------------------------------------------
-    # Quantize / Dequantize helpers
+    # Shared quantize / dequantize helpers
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -320,33 +277,6 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         if original_dtype == torch.uint8:
             return buf
         return buf.contiguous().view(original_dtype)
-
-    def _quantize_2d(self, w: Tensor, global_amax=None):
-        """Quantize a 2D [K, N] weight in G,K,N format. Groups along K (contraction dim)."""
-        if self.quant_format == "block_fp8":
-            fp8_w, scales = block_fp8_quantize_gkn(w.float(), self.quant_group_size)
-            return self._to_uint8(fp8_w), {
-                "weight_block_scales": (self._to_uint8(scales), scales.dtype),
-            }
-        else:
-            packed, block_scales, global_scale = nvfp4_quantize_gkn(
-                w, self.quant_group_size, global_amax=global_amax
-            )
-            return self._to_uint8(packed), {
-                "weight_block_scales": (self._to_uint8(block_scales), block_scales.dtype),
-                "weight_global_scale": (self._to_uint8(global_scale), global_scale.dtype),
-            }
-
-    def _dequantize_2d(self, packed: Tensor, scales_dict: dict, K: int, N: int) -> Tensor:
-        """Dequantize to [K, N] G,K,N format."""
-        if self.quant_format == "block_fp8":
-            fp8_w = packed.view(torch.float8_e4m3fn).reshape(K, N)
-            scales = self._recover_tensor(*scales_dict["weight_block_scales"])
-            return block_fp8_dequantize_gkn(fp8_w, scales, self.quant_group_size)
-        else:
-            block_scales = self._recover_tensor(*scales_dict["weight_block_scales"])
-            global_scale = self._recover_tensor(*scales_dict["weight_global_scale"])
-            return nvfp4_dequantize_gkn(packed, block_scales, global_scale, K, N, self.quant_group_size)
 
     def _quantize_proj(self, proj_name: str, w3d: Tensor,
                         global_amax_per_expert: Optional[Tensor] = None) -> None:
@@ -371,10 +301,8 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
                 setattr(self, f"{proj_name}_block_scales", stacked)
             elif key == "weight_global_scale":
                 setattr(self, f"{proj_name}_global_scale", stacked)
-
-        # For block_fp8: no global_scale buffer needed
-        if self.quant_format == "block_fp8":
-            setattr(self, f"{proj_name}_global_scale", None)
+            elif key == "weight_scales":
+                setattr(self, f"{proj_name}_scales", stacked)
 
     def _build_scales_dict(self, proj_name: str, expert_idx: int) -> dict:
         """Build scales dict for a single expert from stacked buffers."""
@@ -383,14 +311,17 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
             if key == "weight_block_scales":
                 buf = getattr(self, f"{proj_name}_block_scales")
             elif key == "weight_global_scale":
-                buf = getattr(self, f"{proj_name}_global_scale")
+                buf = getattr(self, f"{proj_name}_global_scale", None)
                 if buf is None:
-                    continue  # block_fp8: no global_scale
+                    continue
+            elif key == "weight_scales":
+                buf = getattr(self, f"{proj_name}_scales")
             else:
                 continue
             scales_dict[key] = (buf[expert_idx], dtype)
         return scales_dict
 
+    @torch.compiler.disable
     def dequantize_all_experts(self, proj_name: str, K: int, N: int) -> Tensor:
         """Dequantize all local experts for a projection into a 3D tensor.
 
@@ -418,22 +349,16 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
     # Weight loading from checkpoint (only local experts)
     # ------------------------------------------------------------------
 
-    def load_and_quantize_weights(self, weights_path: str, weight_map: Optional[dict] = None) -> None:
+    def load_and_quantize_weights(self, weights_path: str, weight_map: Optional[dict] = None, shard_cache: Optional[dict] = None) -> None:
         """Load LOCAL expert weights from checkpoint and quantize directly.
 
-        HF checkpoints store per-expert weights as individual keys:
-        `model.layers.X.mlp.experts.{i}.gate_proj.weight`  — shape [out, in]
-        We load only local experts, stack into 3D, transpose to (G,K,N), quantize, then free.
-
-        Pre-quantized checkpoints (NVFP4 modelopt format) have:
-        `{fqn}.{i}.{proj}.weight` — uint8 packed [out, in//2]
-        `{fqn}.{i}.{proj}.weight_scale` — fp8 block_scales [out, in//block_size]
-        `{fqn}.{i}.{proj}.weight_scale_2` — fp32 global_scale [1]
-        These are loaded directly, transposed to GKN, with global_scale absorbed.
+        Each subclass loads its own format via _load_experts().
+        Cross-format loading is not supported.
 
         Args:
             weights_path: Path to HF model (local dir or hub ID)
             weight_map: Optional pre-loaded weight_map from index.json
+            shard_cache: Optional shared dict of loaded shard files
         """
         if self._weights_loaded or self._source_fqn is None:
             return
@@ -441,8 +366,7 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         import safetensors.torch
         from transformers.utils import cached_file
 
-        # Cache of loaded shard files to avoid re-reading
-        _shard_cache = {}
+        _shard_cache = shard_cache if shard_cache is not None else {}
 
         def _load_tensor(ckpt_key: str) -> Tensor:
             if weight_map is not None:
@@ -457,172 +381,11 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
                 _shard_cache[shard_file] = safetensors.torch.load_file(shard_path, device="cpu")
             return _shard_cache[shard_file][ckpt_key]
 
-        # Detect checkpoint format: use _source_quant_format if set, otherwise probe keys
-        first_expert = self.expert_offset
-        probe_nvfp4 = f"{self._source_fqn}.{first_expert}.gate_proj.weight_scale"
-        probe_fp8 = f"{self._source_fqn}.{first_expert}.gate_proj.weight_scale_inv"
-
-        source_format = self._source_quant_format
-        if source_format is None:
-            # Auto-detect from weight_map probing
-            if weight_map is not None and probe_fp8 in weight_map:
-                source_format = "block_fp8"
-            elif weight_map is not None and probe_nvfp4 in weight_map:
-                source_format = "nvfp4"
-
-        if source_format == "block_fp8":
-            self._load_prequantized_block_fp8_experts(_load_tensor, _shard_cache)
-        elif source_format == "nvfp4":
-            self._load_prequantized_experts(_load_tensor, _shard_cache)
-        else:
-            self._load_and_quantize_bf16_experts(_load_tensor, _shard_cache)
-
-        # Cross-format conversion: checkpoint format differs from target
-        if source_format is not None and source_format != self.quant_format:
-            self._convert_prequantized_format()
-
+        self._load_experts(_load_tensor, _shard_cache)
         self._weights_loaded = True
 
-    def _load_and_quantize_bf16_experts(self, _load_tensor, _shard_cache) -> None:
-        """Standard path: load bf16 expert weights, transpose, quantize."""
-        for proj_name, hf_name in [("gate", "gate_proj"), ("up", "up_proj"), ("down", "down_proj")]:
-            expert_weights = []
-            for i in range(self.expert_offset, self.expert_offset + self.num_local_experts):
-                ckpt_key = f"{self._source_fqn}.{i}.{hf_name}.weight"
-                w = _load_tensor(ckpt_key)
-                expert_weights.append(w)
-
-            # Stack: [num_local_experts, out_features, in_features] (HF format)
-            # Transpose to (G,K,N): [num_local_experts, in_features, out_features]
-            w3d = torch.stack(expert_weights).cuda()
-            w3d = w3d.transpose(1, 2).contiguous()
-            del expert_weights
-            if self.quant_format != "block_fp8":
-                self._ema_amax[proj_name] = w3d.float().abs().amax(dim=(1, 2))
-            self._quantize_proj(proj_name, w3d)
-            del w3d
-            torch.cuda.empty_cache()
-            _shard_cache.clear()
-
-    def _load_prequantized_experts(self, _load_tensor, _shard_cache) -> None:
-        """Pre-quantized path: load packed/scales per expert, transpose to GKN, store directly."""
-        for proj_name, hf_name in [("gate", "gate_proj"), ("up", "up_proj"), ("down", "down_proj")]:
-            packed_list = []
-            block_scales_list = []
-            amax_list = []
-
-            for i in range(self.expert_offset, self.expert_offset + self.num_local_experts):
-                fqn_prefix = f"{self._source_fqn}.{i}.{hf_name}"
-                packed = _load_tensor(f"{fqn_prefix}.weight")           # [N, K//2] uint8
-                block_scales = _load_tensor(f"{fqn_prefix}.weight_scale")  # [N, K//bs] fp8
-                global_scale = _load_tensor(f"{fqn_prefix}.weight_scale_2")  # [1] fp32
-
-                # Recover calibrated amax from global_scale
-                calibrated_amax = global_scale.float().item() * FP4_E2M1_MAX * FP8_E4M3_MAX
-                amax_list.append(calibrated_amax)
-
-                # Transpose from HF [N, K//2] to GKN [K//2, N]
-                packed_gkn = packed.T.contiguous()
-                # Absorb global_scale into block_scales, transpose to GKN [K//bs, N]
-                block_scales_gkn = (block_scales.float() * global_scale.float()).T.contiguous()
-
-                packed_list.append(self._to_uint8(packed_gkn))
-                block_scales_list.append(self._to_uint8(block_scales_gkn))
-
-            # Stack per-expert: [num_local_experts, K//2, N] and [num_local_experts, K//bs, N]
-            # Move to CUDA — buffers are loaded from CPU checkpoint but Triton kernels need GPU tensors
-            device = torch.device("cuda")
-            setattr(self, f"{proj_name}_packed", torch.stack(packed_list).to(device))
-            setattr(self, f"{proj_name}_block_scales", torch.stack(block_scales_list).to(device))
-
-            # Global scale is absorbed — set to 1.0 per expert
-            global_scale_ones = self._to_uint8(
-                torch.ones(self.num_local_experts, 1, dtype=torch.float32)
-            )
-            setattr(self, f"{proj_name}_global_scale", global_scale_ones.to(device))
-
-            # Record scale dtypes
-            self._scale_dtypes[proj_name] = {
-                "weight_block_scales": torch.float32,  # absorbed, stored as fp32
-                "weight_global_scale": torch.float32,
-            }
-
-            # Store per-expert EMA amax recovered from calibrated global_scale
-            self._ema_amax[proj_name] = torch.tensor(amax_list, dtype=torch.float32, device=device)
-
-            _shard_cache.clear()
-
-    def _load_prequantized_block_fp8_experts(self, _load_tensor, _shard_cache) -> None:
-        """Pre-quantized block FP8 path: load fp8 weights + scale_inv per expert.
-
-        HF FP8 format: {fqn}.{i}.{proj}.weight (float8_e4m3fn [N, K])
-                        {fqn}.{i}.{proj}.weight_scale_inv (float32 [N//128, K//128])
-        Transpose from HF [N, K] to GKN [K, N] format.
-        """
-        for proj_name, hf_name in [("gate", "gate_proj"), ("up", "up_proj"), ("down", "down_proj")]:
-            packed_list = []
-            block_scales_list = []
-
-            for i in range(self.expert_offset, self.expert_offset + self.num_local_experts):
-                fqn_prefix = f"{self._source_fqn}.{i}.{hf_name}"
-                fp8_w = _load_tensor(f"{fqn_prefix}.weight")              # [N, K] fp8
-                scales = _load_tensor(f"{fqn_prefix}.weight_scale_inv")   # [N//128, K//128] f32
-
-                # Transpose from HF [N, K] to GKN [K, N]
-                fp8_w_gkn = fp8_w.T.contiguous()
-                scales_gkn = scales.float().T.contiguous()
-
-                packed_list.append(self._to_uint8(fp8_w_gkn))
-                block_scales_list.append(self._to_uint8(scales_gkn))
-
-            device = torch.device("cuda")
-            setattr(self, f"{proj_name}_packed", torch.stack(packed_list).to(device))
-            setattr(self, f"{proj_name}_block_scales", torch.stack(block_scales_list).to(device))
-            setattr(self, f"{proj_name}_global_scale", None)
-
-            self._scale_dtypes[proj_name] = {
-                "weight_block_scales": torch.float32,
-            }
-            # block_fp8: no EMA amax needed
-            _shard_cache.clear()
-
-    def _convert_prequantized_format(self) -> None:
-        """Convert loaded prequantized weights from source to target format.
-
-        Dequantizes all experts per-projection from source format, then
-        re-quantizes in the target format. Used when the checkpoint format
-        differs from the desired training format.
-        """
-        source_format = self._source_quant_format
-        source_gs = 128 if source_format == "block_fp8" else 16
-        target_format = self.quant_format
-        target_gs = self.quant_group_size
-
-        for proj_name, K, N in [
-            ("gate", self.hidden_size, self.intermediate_size),
-            ("up", self.hidden_size, self.intermediate_size),
-            ("down", self.intermediate_size, self.hidden_size),
-        ]:
-            # Dequantize in source format
-            self.quant_format = source_format
-            self.quant_group_size = source_gs
-            w3d = self.dequantize_all_experts(proj_name, K, N)
-
-            # Re-quantize in target format
-            self.quant_format = target_format
-            self.quant_group_size = target_gs
-            if target_format != "block_fp8":
-                self._ema_amax[proj_name] = w3d.float().abs().amax(dim=(1, 2))
-            else:
-                self._ema_amax[proj_name] = None
-            self._quantize_proj(proj_name, w3d)
-
-        # Ensure target format is set
-        self.quant_format = target_format
-        self.quant_group_size = target_gs
-
     # ------------------------------------------------------------------
-    # Properties — expose dequantized base weights in (G,K,N) format
+    # Properties -- expose dequantized base weights in (G,K,N) format
     # ------------------------------------------------------------------
 
     @property
@@ -641,7 +404,7 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         return self.dequantize_all_experts("down", self.intermediate_size, self.hidden_size)
 
     # ------------------------------------------------------------------
-    # Forward — unified with backend registry
+    # Forward -- unified with backend registry
     # ------------------------------------------------------------------
 
     def forward(
@@ -660,7 +423,7 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
             assert expert_idx is not None
             return self._eager_lora_forward(hidden_states, expert_idx)
 
-        # Check EP — use unified dispatch/compute/combine path
+        # Check EP -- use unified dispatch/compute/combine path
         from xorl.distributed.parallel_state import get_parallel_state
         parallel_state = get_parallel_state()
 
@@ -669,7 +432,7 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
                 hidden_states, routing_weights, selected_experts, parallel_state
             )
 
-        # Local path — registry-based
+        # Local path -- registry-based
         from xorl.models.layers.moe.backend import MOE_EXPERT_BACKENDS_LORA
 
         compute_dtype = hidden_states.dtype
@@ -691,6 +454,7 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
             scaling=self.scaling,
         )
 
+    @torch.compiler.disable
     def _ep_forward(
         self,
         hidden_states: Tensor,
@@ -780,7 +544,7 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
     def _eager_lora_forward(self, hidden_states: Tensor, expert_idx: int) -> Tensor:
         """Per-expert LoRA forward (eager mode).
 
-        All weights in (G, K, N) format — direct matmul, no transpose.
+        All weights in (G, K, N) format -- direct matmul, no transpose.
         expert_idx is a GLOBAL index. Converted to local index via expert_offset.
         Returns zeros for non-local experts (EP case).
         """
@@ -795,7 +559,7 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         gate_w = self.dequantize_expert("gate", local_idx, self.hidden_size, self.intermediate_size)
         gate_out = torch.matmul(hidden_states, gate_w.to(compute_dtype))
 
-        # gate LoRA: (x @ A) @ B * scaling — hybrid shared via min()
+        # gate LoRA: (x @ A) @ B * scaling -- hybrid shared via min()
         A = self.gate_proj_lora_A[min(local_idx, self.gate_proj_lora_A.shape[0] - 1)].to(compute_dtype)
         B = self.gate_proj_lora_B[local_idx].to(compute_dtype)
         gate_out = gate_out + torch.matmul(torch.matmul(hidden_states, A), B) * self.scaling
@@ -835,3 +599,422 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
             f"hybrid_shared={self.hybrid_shared}, "
             f"ep_dispatch={self.ep_dispatch}"
         )
+
+
+class NvFP4QLoRAMoeExperts(QLoRAMoeExperts):
+    """
+    NVFP4 QLoRA MoE experts: 4-bit quantized base weights + trainable LoRA.
+
+    Registers 9 buffers per instance: {gate,up,down}_{packed,block_scales,global_scale}.
+    EMA-tracked _ema_amax informs global_scale for re-quantization.
+    """
+
+    def __init__(
+        self,
+        num_local_experts: int,
+        num_experts: int,
+        intermediate_size: int,
+        hidden_size: int,
+        r: int = 16,
+        lora_alpha: int = 16,
+        act_fn: Optional[nn.Module] = None,
+        expert_offset: int = 0,
+        device: Optional[torch.device] = None,
+        moe_implementation: str = "triton",
+        hybrid_shared: bool = True,
+        use_rslora: bool = False,
+        ep_dispatch: str = "alltoall",
+        deepep_buffer_size_gb: float = 2.0,
+        deepep_num_sms: int = 20,
+        deepep_async_combine: bool = False,
+    ):
+        super().__init__(
+            num_local_experts, num_experts, intermediate_size, hidden_size,
+            r=r, lora_alpha=lora_alpha,
+            quant_format="nvfp4", quant_group_size=16,
+            act_fn=act_fn, expert_offset=expert_offset, device=device,
+            moe_implementation=moe_implementation, hybrid_shared=hybrid_shared,
+            use_rslora=use_rslora, ep_dispatch=ep_dispatch,
+            deepep_buffer_size_gb=deepep_buffer_size_gb,
+            deepep_num_sms=deepep_num_sms,
+            deepep_async_combine=deepep_async_combine,
+        )
+        # Quantized weight storage: 9 buffers (packed + block_scales + global_scale per projection)
+        self.register_buffer("gate_packed", None)
+        self.register_buffer("gate_block_scales", None)
+        self.register_buffer("gate_global_scale", None)
+        self.register_buffer("up_packed", None)
+        self.register_buffer("up_block_scales", None)
+        self.register_buffer("up_global_scale", None)
+        self.register_buffer("down_packed", None)
+        self.register_buffer("down_block_scales", None)
+        self.register_buffer("down_global_scale", None)
+
+        self.reset_lora_parameters()
+
+    def _load_experts(self, _load_tensor, _shard_cache) -> None:
+        """Load expert weights from checkpoint, quantizing bf16 to NVFP4 if needed.
+
+        Supports two checkpoint formats:
+        - Pre-quantized NVFP4 (modelopt): weight [N, K//2] uint8 + weight_scale [N, K//BS] fp8
+          + weight_scale_2 scalar f32. GPU-batch strategy avoids per-expert CPU transpose.
+        - BF16 (standard HF): weight [N, K] bf16. Quantized to NVFP4 on GPU per expert.
+
+        HF format  : weight [N, K//2] uint8, weight_scale [N, K//BS] fp8
+        GKN format : weight [E, K//2, N] uint8, block_scales [E, K//BS, N] f32
+        """
+        device = torch.device("cuda")
+        E = self.num_local_experts
+        expert_range = range(self.expert_offset, self.expert_offset + E)
+
+        # Detect checkpoint format: try loading weight_scale for the first expert.
+        # If not found in weight_map, it's a plain bf16 checkpoint.
+        first_scale_key = f"{self._source_fqn}.{self.expert_offset}.gate_proj.weight_scale"
+        try:
+            _load_tensor(first_scale_key)
+            is_prequantized = True
+        except RuntimeError:
+            is_prequantized = False
+
+        for proj_name, hf_name in [("gate", "gate_proj"), ("up", "up_proj"), ("down", "down_proj")]:
+            amax_list: list = []
+
+            if is_prequantized:
+                packed_hf_list: list = []   # [N, K//2] uint8 per expert
+                bs_u8_list: list = []       # [N, K//BS] uint8 (fp8 bits reinterpreted) per expert
+                gs_list: list = []          # scalar f32 per expert
+
+                for i in expert_range:
+                    fqn_prefix = f"{self._source_fqn}.{i}.{hf_name}"
+                    packed = _load_tensor(f"{fqn_prefix}.weight")          # [N, K//2] uint8
+                    bs     = _load_tensor(f"{fqn_prefix}.weight_scale")    # [N, K//BS] fp8
+                    gs     = _load_tensor(f"{fqn_prefix}.weight_scale_2")  # scalar f32
+
+                    gs_val = gs.float().item()
+                    packed_hf_list.append(packed)
+                    # Reinterpret fp8 bits as uint8 (both 1-byte, zero-copy on CPU)
+                    bs_u8_list.append(bs.view(torch.uint8))
+                    gs_list.append(gs_val)
+                    amax_list.append(gs_val * FP4_E2M1_MAX * FP8_E4M3_MAX)
+
+                # Stack in HF layout — no per-expert transpose on CPU
+                packed_hf = torch.stack(packed_hf_list)  # [E, N, K//2] uint8
+                bs_u8_hf  = torch.stack(bs_u8_list)      # [E, N, K//BS] uint8 (fp8 bits)
+                gs_cpu    = torch.tensor(gs_list, dtype=torch.float32)  # [E]
+
+                # Bulk H2D copy
+                packed_gpu = packed_hf.to(device)   # [E, N, K//2] uint8
+                bs_u8_gpu  = bs_u8_hf.to(device)    # [E, N, K//BS] uint8
+                gs_gpu     = gs_cpu.to(device)       # [E] f32
+
+                # GPU: reinterpret uint8 → fp8, upcast to f32, absorb global scale
+                bs_f32 = bs_u8_gpu.view(torch.float8_e4m3fn).float()  # [E, N, K//BS] f32
+                bs_absorbed = bs_f32 * gs_gpu[:, None, None]           # [E, N, K//BS] f32
+
+                # GPU permute HF [E, N, *] → GKN [E, *, N]
+                packed_gkn = packed_gpu.permute(0, 2, 1).contiguous()   # [E, K//2, N] uint8
+                bs_gkn     = bs_absorbed.permute(0, 2, 1).contiguous()  # [E, K//BS, N] f32
+
+            else:
+                # BF16 checkpoint: load weight, move to GPU, quantize per expert.
+                packed_gkn_list: list = []
+                bs_gkn_list: list = []
+
+                for i in expert_range:
+                    fqn_prefix = f"{self._source_fqn}.{i}.{hf_name}"
+                    w_cpu = _load_tensor(f"{fqn_prefix}.weight")  # [N, K] bf16/f32 on CPU
+                    w_gkn = w_cpu.to(device=device, dtype=torch.bfloat16).T.contiguous()  # [K, N]
+                    del w_cpu
+
+                    amax = w_gkn.float().abs().max().reshape(1)
+                    amax_list.append(amax.item())
+
+                    packed, block_scales, global_scale = nvfp4_quantize_gkn(
+                        w_gkn, self.quant_group_size, global_amax=amax
+                    )
+                    del w_gkn
+                    # Absorb global_scale into block_scales so global_scale = 1.0
+                    bs_absorbed = (block_scales.float() * global_scale.float()).contiguous()
+                    packed_gkn_list.append(self._to_uint8(packed))
+                    bs_gkn_list.append(self._to_uint8(bs_absorbed))
+                    _shard_cache.clear()
+
+                packed_gkn = torch.stack(packed_gkn_list)  # [E, K//2, N] uint8
+                bs_gkn     = torch.stack(bs_gkn_list)      # [E, K//BS, N] f32 (in uint8)
+
+            setattr(self, f"{proj_name}_packed",       self._to_uint8(packed_gkn))
+            setattr(self, f"{proj_name}_block_scales", self._to_uint8(bs_gkn))
+            setattr(self, f"{proj_name}_global_scale", self._to_uint8(
+                torch.ones(E, 1, dtype=torch.float32, device=device)
+            ))
+            self._scale_dtypes[proj_name] = {
+                "weight_block_scales": torch.float32,
+                "weight_global_scale": torch.float32,
+            }
+            self._ema_amax[proj_name] = torch.tensor(amax_list, dtype=torch.float32, device=device)
+
+            if is_prequantized:
+                _shard_cache.clear()
+
+    def _quantize_2d(self, w: Tensor, global_amax=None):
+        """Quantize a 2D [K, N] weight using NVFP4. Groups along K (contraction dim)."""
+        packed, block_scales, global_scale = nvfp4_quantize_gkn(
+            w, self.quant_group_size, global_amax=global_amax
+        )
+        return self._to_uint8(packed), {
+            "weight_block_scales": (self._to_uint8(block_scales), block_scales.dtype),
+            "weight_global_scale": (self._to_uint8(global_scale), global_scale.dtype),
+        }
+
+    def _dequantize_2d(self, packed: Tensor, scales_dict: dict, K: int, N: int) -> Tensor:
+        """Dequantize to [K, N] G,K,N format using NVFP4."""
+        block_scales = self._recover_tensor(*scales_dict["weight_block_scales"])
+        global_scale = self._recover_tensor(*scales_dict["weight_global_scale"])
+        return nvfp4_dequantize_gkn(packed, block_scales, global_scale, K, N, self.quant_group_size)
+
+    def merge_weights(self, ema_decay: float = 0.1) -> None:
+        """Merge LoRA into base weights, EMA-update _ema_amax, re-quantize."""
+        with torch.no_grad():
+            for proj_name, K, N in [
+                ("gate", self.hidden_size, self.intermediate_size),
+                ("up", self.hidden_size, self.intermediate_size),
+                ("down", self.intermediate_size, self.hidden_size),
+            ]:
+                w = self.dequantize_all_experts(proj_name, K, N)  # [E, K, N] bf16
+                delta = self._compute_proj_delta(f"{proj_name}_proj").to(w.dtype)
+                w_merged = w + delta
+                fresh_amax = w_merged.float().abs().amax(dim=(1, 2))  # [E]
+                if self._ema_amax[proj_name] is not None:
+                    self._ema_amax[proj_name].lerp_(
+                        fresh_amax.to(self._ema_amax[proj_name].device), ema_decay
+                    )
+                else:
+                    self._ema_amax[proj_name] = fresh_amax
+                self._quantize_proj(
+                    proj_name, w_merged,
+                    global_amax_per_expert=self._ema_amax[proj_name],
+                )
+        self.reset_lora_parameters()
+
+
+class BlockFP8QLoRAMoeExperts(QLoRAMoeExperts):
+    """
+    Block FP8 QLoRA MoE experts: float8_e4m3fn quantized base weights + trainable LoRA.
+
+    Registers 6 buffers per instance: {gate,up,down}_{packed,block_scales}.
+    No global_scale, no EMA amax.
+    """
+
+    def __init__(
+        self,
+        num_local_experts: int,
+        num_experts: int,
+        intermediate_size: int,
+        hidden_size: int,
+        r: int = 16,
+        lora_alpha: int = 16,
+        act_fn: Optional[nn.Module] = None,
+        expert_offset: int = 0,
+        device: Optional[torch.device] = None,
+        moe_implementation: str = "triton",
+        hybrid_shared: bool = True,
+        use_rslora: bool = False,
+        ep_dispatch: str = "alltoall",
+        deepep_buffer_size_gb: float = 2.0,
+        deepep_num_sms: int = 20,
+        deepep_async_combine: bool = False,
+    ):
+        super().__init__(
+            num_local_experts, num_experts, intermediate_size, hidden_size,
+            r=r, lora_alpha=lora_alpha,
+            quant_format="block_fp8", quant_group_size=128,
+            act_fn=act_fn, expert_offset=expert_offset, device=device,
+            moe_implementation=moe_implementation, hybrid_shared=hybrid_shared,
+            use_rslora=use_rslora, ep_dispatch=ep_dispatch,
+            deepep_buffer_size_gb=deepep_buffer_size_gb,
+            deepep_num_sms=deepep_num_sms,
+            deepep_async_combine=deepep_async_combine,
+        )
+        # Quantized weight storage: 6 buffers (packed + block_scales per projection, no global_scale)
+        self.register_buffer("gate_packed", None)
+        self.register_buffer("gate_block_scales", None)
+        self.register_buffer("up_packed", None)
+        self.register_buffer("up_block_scales", None)
+        self.register_buffer("down_packed", None)
+        self.register_buffer("down_block_scales", None)
+
+        self.reset_lora_parameters()
+
+    def _load_experts(self, _load_tensor, _shard_cache) -> None:
+        """Load pre-quantized block FP8 expert weights from checkpoint.
+
+        GPU-transpose strategy: collect raw HF tensors without per-expert CPU
+        transposition, stack into batches, bulk H2D copy, then permute on GPU
+        (~3× faster for large expert banks).
+
+        HF format  : weight [N, K] fp8, weight_scale_inv [N//BS, K//BS] bf16/f32
+        GKN format : weight [E, K, N] uint8, block_scales [E, K//BS, N//BS] f32
+        """
+        device = torch.device("cuda")
+        E = self.num_local_experts
+        expert_range = range(self.expert_offset, self.expert_offset + E)
+
+        for proj_name, hf_name in [("gate", "gate_proj"), ("up", "up_proj"), ("down", "down_proj")]:
+            fp8_u8_list: list = []   # [N, K] uint8 (fp8 bits reinterpreted) per expert
+            scales_list: list = []   # [N//BS, K//BS] f32 per expert
+
+            for i in expert_range:
+                fqn_prefix = f"{self._source_fqn}.{i}.{hf_name}"
+                fp8_w  = _load_tensor(f"{fqn_prefix}.weight")            # [N, K] fp8
+                scales = _load_tensor(f"{fqn_prefix}.weight_scale_inv")  # [N//BS, K//BS] bf16/f32
+
+                # Reinterpret fp8 bits as uint8 (both 1-byte, zero-copy on CPU)
+                fp8_u8_list.append(fp8_w.view(torch.uint8))
+                scales_list.append(scales.float())
+
+            # Stack in HF layout — no per-expert transpose on CPU
+            fp8_u8_hf  = torch.stack(fp8_u8_list)  # [E, N, K] uint8
+            scales_hf  = torch.stack(scales_list)   # [E, N//BS, K//BS] f32
+
+            # Bulk H2D copy
+            fp8_u8_gpu = fp8_u8_hf.to(device)   # [E, N, K] uint8
+            scales_gpu = scales_hf.to(device)    # [E, N//BS, K//BS] f32
+
+            # GPU permute HF [E, N, *] → GKN [E, *, N]
+            fp8_gkn    = fp8_u8_gpu.permute(0, 2, 1).contiguous()   # [E, K, N] uint8
+            scales_gkn = scales_gpu.permute(0, 2, 1).contiguous()   # [E, K//BS, N//BS] f32
+
+            setattr(self, f"{proj_name}_packed",       self._to_uint8(fp8_gkn))
+            setattr(self, f"{proj_name}_block_scales", self._to_uint8(scales_gkn))
+            self._scale_dtypes[proj_name] = {
+                "weight_block_scales": torch.float32,
+            }
+
+            _shard_cache.clear()
+
+    def _quantize_2d(self, w: Tensor, global_amax=None):
+        """Quantize a 2D [K, N] weight using block FP8. Groups along K (contraction dim)."""
+        fp8_w, scales = block_fp8_quantize_gkn(w.float(), self.quant_group_size)
+        return self._to_uint8(fp8_w), {
+            "weight_block_scales": (self._to_uint8(scales), scales.dtype),
+        }
+
+    def _dequantize_2d(self, packed: Tensor, scales_dict: dict, K: int, N: int) -> Tensor:
+        """Dequantize to [K, N] G,K,N format using block FP8."""
+        fp8_w = packed.view(torch.float8_e4m3fn).reshape(K, N)
+        scales = self._recover_tensor(*scales_dict["weight_block_scales"])
+        return block_fp8_dequantize_gkn(fp8_w, scales, self.quant_group_size)
+
+    def merge_weights(self, ema_decay: float = 0.1) -> None:
+        """Merge LoRA into base weights, re-quantize with fresh per-block scales."""
+        with torch.no_grad():
+            for proj_name, K, N in [
+                ("gate", self.hidden_size, self.intermediate_size),
+                ("up", self.hidden_size, self.intermediate_size),
+                ("down", self.intermediate_size, self.hidden_size),
+            ]:
+                w = self.dequantize_all_experts(proj_name, K, N)
+                delta = self._compute_proj_delta(f"{proj_name}_proj").to(w.dtype)
+                w_merged = w + delta
+                self._quantize_proj(proj_name, w_merged)
+        self.reset_lora_parameters()
+
+
+class NF4QLoRAMoeExperts(QLoRAMoeExperts):
+    """
+    NF4 QLoRA MoE experts: 4-bit quantized base weights + trainable LoRA.
+
+    NF4 uses a non-uniform 16-level codebook optimized for normally distributed
+    weights. Simpler scale structure: one float32 absmax per group (no global_scale).
+    Registers 6 buffers: {gate,up,down}_{packed,scales}.
+    """
+
+    def __init__(
+        self,
+        num_local_experts: int,
+        num_experts: int,
+        intermediate_size: int,
+        hidden_size: int,
+        r: int = 16,
+        lora_alpha: int = 16,
+        act_fn: Optional[nn.Module] = None,
+        expert_offset: int = 0,
+        device: Optional[torch.device] = None,
+        moe_implementation: str = "triton",
+        hybrid_shared: bool = True,
+        use_rslora: bool = False,
+        ep_dispatch: str = "alltoall",
+        deepep_buffer_size_gb: float = 2.0,
+        deepep_num_sms: int = 20,
+        deepep_async_combine: bool = False,
+    ):
+        super().__init__(
+            num_local_experts, num_experts, intermediate_size, hidden_size,
+            r=r, lora_alpha=lora_alpha,
+            quant_format="nf4", quant_group_size=64,
+            act_fn=act_fn, expert_offset=expert_offset, device=device,
+            moe_implementation=moe_implementation, hybrid_shared=hybrid_shared,
+            use_rslora=use_rslora, ep_dispatch=ep_dispatch,
+            deepep_buffer_size_gb=deepep_buffer_size_gb,
+            deepep_num_sms=deepep_num_sms,
+            deepep_async_combine=deepep_async_combine,
+        )
+        # Quantized weight storage: 6 buffers (packed + scales per projection)
+        self.register_buffer("gate_packed", None)
+        self.register_buffer("gate_scales", None)
+        self.register_buffer("up_packed", None)
+        self.register_buffer("up_scales", None)
+        self.register_buffer("down_packed", None)
+        self.register_buffer("down_scales", None)
+
+        self.reset_lora_parameters()
+
+    def _load_experts(self, _load_tensor, _shard_cache) -> None:
+        """Load bf16 expert weights from checkpoint and quantize to NF4.
+
+        Loads per-expert 2D bf16 weights, transposes from HF [out, in] to GKN
+        [in, out] format, then quantizes with nf4_quantize_gkn.
+        """
+        for proj_name, hf_name, K, N in [
+            ("gate", "gate_proj", self.hidden_size, self.intermediate_size),
+            ("up", "up_proj", self.hidden_size, self.intermediate_size),
+            ("down", "down_proj", self.intermediate_size, self.hidden_size),
+        ]:
+            expert_weights = []
+            for i in range(self.expert_offset, self.expert_offset + self.num_local_experts):
+                ckpt_key = f"{self._source_fqn}.{i}.{hf_name}.weight"
+                w_hf = _load_tensor(ckpt_key)  # [out_features, in_features]
+                w_gkn = w_hf.T.contiguous().float()  # [K, N] = [in_features, out_features]
+                expert_weights.append(w_gkn)
+
+            # Stack and move to GPU before quantization (Triton kernels require CUDA tensors)
+            w3d = torch.stack(expert_weights).cuda()  # [num_local_experts, K, N]
+            self._quantize_proj(proj_name, w3d)
+
+            _shard_cache.clear()
+
+    def _quantize_2d(self, w: Tensor, global_amax=None):
+        """Quantize a 2D [K, N] weight using NF4. Groups along K (contraction dim)."""
+        packed, scales = nf4_quantize_gkn(w, self.quant_group_size)
+        return self._to_uint8(packed), {
+            "weight_scales": (self._to_uint8(scales), scales.dtype),
+        }
+
+    def _dequantize_2d(self, packed: Tensor, scales_dict: dict, K: int, N: int) -> Tensor:
+        """Dequantize to [K, N] G,K,N format using NF4."""
+        scales = self._recover_tensor(*scales_dict["weight_scales"])
+        return nf4_dequantize_gkn(packed, scales, K, N, self.quant_group_size)
+
+    def merge_weights(self, ema_decay: float = 0.1) -> None:
+        """Merge LoRA into base weights, re-quantize with fresh per-group scales."""
+        with torch.no_grad():
+            for proj_name, K, N in [
+                ("gate", self.hidden_size, self.intermediate_size),
+                ("up", self.hidden_size, self.intermediate_size),
+                ("down", self.intermediate_size, self.hidden_size),
+            ]:
+                w = self.dequantize_all_experts(proj_name, K, N)
+                delta = self._compute_proj_delta(f"{proj_name}_proj").to(w.dtype)
+                w_merged = w + delta
+                self._quantize_proj(proj_name, w_merged)
+        self.reset_lora_parameters()

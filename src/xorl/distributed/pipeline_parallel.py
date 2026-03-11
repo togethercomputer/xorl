@@ -190,10 +190,10 @@ def _pp_forward(self, x):
     entry so the schedule's internal microbatch iteration stays in sync.
 
     When the queue is not set (e.g. unit tests), falls back to generating
-    sequential position_ids scaled by sp_size for RoPE cache correctness.
+    sequential position_ids scaled by cp_size for RoPE cache correctness.
     """
     from .parallel_state import get_parallel_state
-    from xorl.models.layers.moe.routing_replay import get_replay_stage, set_replay_stage
+    from xorl.models.layers.moe.routing_replay import get_replay_stage, set_replay_stage, is_r3_mode
 
     ps = get_parallel_state()
 
@@ -215,7 +215,10 @@ def _pp_forward(self, x):
         # Shape inference or eval — don't record/replay
         set_replay_stage(None)
     elif old_stage == "replay_backward":
-        set_replay_stage("record")
+        if is_r3_mode():
+            set_replay_stage("replay_forward")
+        else:
+            set_replay_stage("record")
 
     # --- Pop per-microbatch metadata (set by training loop) ---
     position_ids = None
@@ -231,9 +234,9 @@ def _pp_forward(self, x):
 
     # Fallback: generate sequential position_ids covering the full SP range
     # so that RoPE embeddings have a large enough cache.
-    if position_ids is None and ps.sp_size > 1:
+    if position_ids is None and ps.cp_size > 1:
         seq_len = x.shape[1]
-        full_seq_len = seq_len * ps.sp_size
+        full_seq_len = seq_len * ps.cp_size
         position_ids = torch.arange(full_seq_len, device=x.device).unsqueeze(0).expand(x.shape[0], -1)
 
     if self._pp_is_first:
@@ -290,14 +293,11 @@ def _recursive_prune(module: nn.Module, prefix: str, fqns_to_keep: set):
                     indices_to_keep = {
                         int(idx) for idx in layers_to_keep if idx.isdigit()
                     }
-                    new_layers = nn.ModuleList(
-                        [
-                            layer
-                            for i, layer in enumerate(child)
-                            if i in indices_to_keep
-                        ]
-                    )
-                    setattr(module, name, new_layers)
+                    # Preserve original indices so checkpoint keys match.
+                    # Set unwanted entries to None (named_parameters/modules skip None).
+                    for i in range(len(child)):
+                        if i not in indices_to_keep:
+                            child._modules[str(i)] = None
             else:
                 # No children needed
                 if isinstance(child, nn.ModuleDict):

@@ -4,7 +4,7 @@ LoRA module base class.
 Defines the abstract interface that all LoRA module implementations must follow.
 """
 
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from typing import Iterator, TypeVar
 
 import torch
@@ -15,7 +15,7 @@ import torch.nn as nn
 T = TypeVar("T", bound="LoraModule")
 
 
-class LoraModule(ABC):
+class LoraModule:
     """
     Abstract base class for LoRA (Low-Rank Adaptation) modules.
 
