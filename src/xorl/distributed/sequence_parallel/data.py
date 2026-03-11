@@ -25,7 +25,7 @@ def slice_input_tensor(
     group = get_unified_sequence_parallel_group() if group is None else group
     if not group:
         return x
-    sp_rank = dist.get_rank(group)
+    local_rank = dist.get_rank(group)
     sp_world = dist.get_world_size(group)
     dim_size = x.shape[dim]
     unit = (dim_size + sp_world - 1) // sp_world
@@ -33,7 +33,7 @@ def slice_input_tensor(
         padding_size = sp_world - (dim_size % sp_world)
         x = pad_tensor(x, dim, padding_size, padding_value)
     slc = [slice(None)] * len(x.shape)
-    slc[dim] = slice(unit * sp_rank, unit * (sp_rank + 1))
+    slc[dim] = slice(unit * local_rank, unit * (local_rank + 1))
     return x[tuple(slc)].contiguous()
 
 
@@ -114,8 +114,8 @@ def sequence_parallel_preprocess(
         Preprocessed input_ids, labels, position_ids, attention_mask, cu_seqlens
     """
     if sp_group is not None:
-        sp_size = dist.get_world_size(sp_group)
-        padding_size = (sp_size - (input_ids.shape[-1] % sp_size)) % sp_size
+        group_size = dist.get_world_size(sp_group)
+        padding_size = (group_size - (input_ids.shape[-1] % group_size)) % group_size
 
         # Slice input_ids among sequence parallel group
         input_ids = slice_input_tensor(input_ids, dim=-1, padding=True, padding_value=0, group=sp_group)

@@ -93,13 +93,18 @@ known-third-party = ["torch", "transformers", "wandb"]
 [tool.pytest.ini_options]
 addopts = "-v"
 markers = [
-    "cpu: marks tests as CPU-only tests (deselect with '-m \"not cpu\"')",
-    "gpu: marks tests as GPU-required tests (deselect with '-m \"not gpu\"')",
+    "cpu: CPU-only tests (no GPU required)",
+    "gpu: Tests that require GPU",
+    "e2e: End-to-end tests (full system, require GPU and torchrun)",
+    "server: Tests for the training server (API, orchestrator, runner)",
+    "distributed: Tests that require distributed setup (torchrun)",
     "slow: Tests that take a long time to run",
+    "benchmark: Performance benchmark tests",
     "collator: Tests for data collators",
     "dataloader: Tests for data loaders",
-    "distributed: Tests that require distributed setup (torchrun)",
 ]
+testpaths = ["tests"]
+norecursedirs = ["submodules"]
 filterwarnings = [
     "ignore::DeprecationWarning:multiprocessing.popen_fork",
     "ignore:The argument 'device' of Tensor:DeprecationWarning",

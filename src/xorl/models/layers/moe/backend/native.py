@@ -36,6 +36,7 @@ torch._dynamo.config.cache_size_limit = max(
 # Padding helpers (vectorized — no Python for-loops, no .tolist())
 # ---------------------------------------------------------------------------
 
+@torch.compiler.disable
 def _compute_pad_indices(
     counts: torch.Tensor,
     padded_counts: torch.Tensor,
@@ -73,6 +74,7 @@ def _compute_pad_indices(
     return (padded_offsets[expert_of_pos] + local_pos).to(torch.int64)
 
 
+@torch.compiler.disable
 def _pad_to_alignment(
     x_sorted: torch.Tensor,
     counts: torch.Tensor,
@@ -105,6 +107,7 @@ def _pad_to_alignment(
     return x_padded, padded_counts
 
 
+@torch.compiler.disable
 def _unpad(
     out_padded: torch.Tensor,
     counts: torch.Tensor,
@@ -292,6 +295,7 @@ def align_lora_rank_for_grouped_mm(
     return lora_A, lora_B
 
 
+@torch.compiler.disable
 def _cumsum_to_counts(cumsum: torch.Tensor, num_experts: int) -> torch.Tensor:
     """Convert cumulative sum to per-expert counts."""
     counts = torch.zeros(num_experts, device=cumsum.device, dtype=torch.int32)
@@ -442,7 +446,7 @@ def native_expert_lora_forward(
 
 
 # ---------------------------------------------------------------------------
-# EP compute function (same interface as EPGroupGemm.apply / QuackEPGroupGemm.apply)
+# EP compute function (same interface as TritonEPGroupGemm.apply / QuackEPGroupGemm.apply)
 # ---------------------------------------------------------------------------
 
 def native_ep_compute(
@@ -454,7 +458,7 @@ def native_ep_compute(
 ) -> torch.Tensor:
     """EP expert compute using ``torch._grouped_mm``.
 
-    Same interface as ``EPGroupGemm.apply()`` and ``QuackEPGroupGemm.apply()``.
+    Same interface as ``TritonEPGroupGemm.apply()`` and ``QuackEPGroupGemm.apply()``.
     Tokens have already been dispatched via all-to-all; this only handles
     the expert MLP computation.
 
@@ -483,7 +487,7 @@ def native_ep_compute(
 
 
 # ---------------------------------------------------------------------------
-# EP compute with LoRA (same interface as EPGroupGemmWithLoRA.apply)
+# EP compute with LoRA (same interface as TritonEPGroupGemmWithLoRA.apply)
 # ---------------------------------------------------------------------------
 
 def native_ep_compute_lora(
@@ -502,7 +506,7 @@ def native_ep_compute_lora(
 ) -> torch.Tensor:
     """EP expert compute with LoRA using ``torch._grouped_mm``.
 
-    Same interface as ``EPGroupGemmWithLoRA.apply()``.
+    Same interface as ``TritonEPGroupGemmWithLoRA.apply()``.
     """
     if permute_tokens.shape[0] == 0:
         return permute_tokens

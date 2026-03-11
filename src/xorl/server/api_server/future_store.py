@@ -324,7 +324,7 @@ class FutureStore:
             return None
 
         # Check expiration
-        if entry.is_expired() and entry.status not in (FutureStatus.EXPIRED,):
+        if entry.is_expired() and entry.status != FutureStatus.EXPIRED:
             entry.status = FutureStatus.EXPIRED
             logger.debug(f"Entry {request_id} marked as expired on access")
 
@@ -498,18 +498,17 @@ class FutureStore:
 
     async def _cleanup_expired(self):
         """Remove expired entries from the store."""
-        now = time.time()
-        to_delete = []
-
         async with self._lock:
-            for request_id, entry in list(self._entries.items()):
-                # Only clean up terminal states that are expired
-                if entry.is_terminal() and entry.is_expired():
-                    to_delete.append(request_id)
-
-        # Delete outside lock to minimize lock time
-        for request_id in to_delete:
-            await self.delete(request_id)
+            to_delete = [
+                request_id for request_id, entry in list(self._entries.items())
+                if entry.is_terminal() and entry.is_expired()
+            ]
+            for request_id in to_delete:
+                entry = self._entries.pop(request_id, None)
+                if entry and entry.model_id in self._by_model:
+                    self._by_model[entry.model_id].discard(request_id)
+                    if not self._by_model[entry.model_id]:
+                        del self._by_model[entry.model_id]
 
         if to_delete:
             logger.debug(f"Cleaned up {len(to_delete)} expired entries")
@@ -541,48 +540,3 @@ class FutureStore:
                 stats["by_status"][status_key] += 1
 
         return stats
-
-
-# Convenience function for creating TryAgainResponse-compatible dict
-def make_try_again_response(
-    request_id: str,
-    queue_state: str = "active",
-    queue_state_reason: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Create a TryAgainResponse dict.
-
-    Args:
-        request_id: The request ID being polled
-        queue_state: Current queue state
-        queue_state_reason: Optional reason
-
-    Returns:
-        Dict matching TryAgainResponse format
-    """
-    response = {
-        "type": "try_again",
-        "request_id": request_id,
-        "queue_state": queue_state,
-    }
-    if queue_state_reason:
-        response["queue_state_reason"] = queue_state_reason
-    return response
-
-
-def make_failed_response(
-    error: str,
-    category: str = "unknown",
-) -> Dict[str, Any]:
-    """Create a RequestFailedResponse dict.
-
-    Args:
-        error: Error message
-        category: Error category
-
-    Returns:
-        Dict matching RequestFailedResponse format
-    """
-    return {
-        "error": error,
-        "category": category,
-    }

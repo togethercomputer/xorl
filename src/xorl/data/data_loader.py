@@ -188,7 +188,7 @@ class DataLoaderBuilder:
             PackingConcatCollator(pad_to_multiple_of=self.pad_to_multiple_of)  # 4. Concatenate sequences for packing
         ]
 
-        if self.parallel_state.sp_enabled:
+        if self.parallel_state.cp_enabled:
             collators.append(TextSequenceShardCollator())  # 5. Shard sequences (if SP enabled)
 
         return collators
@@ -337,7 +337,7 @@ class DataLoaderBuilder:
         
         logger.info_rank0(
             f"Building DataLoader with dp_size={self.parallel_state.dp_size}, "
-            f"sp_size={self.parallel_state.sp_size}"
+            f"cp_size={self.parallel_state.cp_size}"
         )
 
         # Validate dataset structure - each item can be either:

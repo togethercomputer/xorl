@@ -15,31 +15,32 @@
 from typing import Optional, Tuple, Union, Unpack
 
 import torch
-import torch.nn.functional as F
 from torch import nn
-from ...layers import ACT2FN, RMSNorm, RotaryEmbedding
-from ...layers.attention import (
+
+from xorl.distributed.parallel_state import get_parallel_state
+from xorl.distributed.sequence_parallel.strategy import get_cp_strategy
+from xorl.models.base import XorlPreTrainedModel
+from xorl.models.layers import ACT2FN, RMSNorm, RotaryEmbedding
+from xorl.models.layers.attention import (
     AttentionKwargs,
     MultiHeadAttention,
     is_flash_attention,
     update_causal_mask,
 )
-from ...base import XorlPreTrainedModel
-from ...outputs import (
-    BaseModelOutput,
-    CausalLMOutput,
-    MoeCausalLMOutput,
-    MoeModelOutput,
-    ModelOutput,
+from xorl.models.layers.moe import MoEExperts, MoEBlock
+from xorl.models.outputs import MoeCausalLMOutput, MoeModelOutput
+from xorl.models.checkpoint_handlers.buffers import (
+    checkpoint_has_per_expert_weights,
+    detect_prequantized_checkpoint,
+    detect_prequantized_block_fp8_checkpoint,
+    get_prequantized_exclude_modules,
 )
-
-from ....distributed.parallel_state import get_parallel_state
-from ....distributed.sequence_parallel.strategy import get_sp_strategy
-from ....ops import causallm_loss_function
-from ....ops.fused_silu_and_mul import fused_silu_and_mul
-from ....utils import logging
-from ...layers.moe import MoEExperts, MoEBlock
-from .configuration_qwen3_moe import Qwen3MoeConfig
+from xorl.models.transformers.qwen3_moe.checkpoint_handler import Qwen3MoeCheckpointHandler
+from xorl.models.transformers.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+from xorl.models.transformers.qwen3_moe import parallelize
+from xorl.distributed.moe.deepep import sync_pending_combine
+from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
+from xorl.utils import logging
 
 logger = logging.get_logger(__name__)
 
@@ -236,31 +237,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         output_attentions: Optional[bool] = False,
         output_router_logits: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs: Unpack[AttentionKwargs],
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        """
-        Args:
-            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
-            attention_mask (`torch.FloatTensor`, *optional*): attention mask of size
-                `(batch, sequence_length)` where padding elements are indicated by 0.
-            output_attentions (`bool`, *optional*):
-                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
-                returned tensors for more detail.
-            output_router_logits (`bool`, *optional*):
-                Whether or not to return the logits of all the routers. They are useful for computing the router loss,
-                and should not be returned during inference.
-            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
-                Indices depicting the position of the input sequence tokens in the sequence.
-            position_embeddings (`Tuple[torch.FloatTensor, torch.FloatTensor]`, *optional*):
-                Tuple containing the cosine and sine positional embeddings of shape `(batch_size, seq_len, head_dim)`,
-                with `head_dim` being the embedding dimension of each attention head.
-            kwargs (`dict`, *optional*):
-                Arbitrary kwargs to be ignored, used for FSDP and other methods that injects code
-                into the model
-        """
-
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
@@ -269,9 +248,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states, self_attn_weights = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
-            position_ids=position_ids,
-            output_attentions=output_attentions,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
             **kwargs,
         )
@@ -290,7 +266,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         # Sync any pending async DeepEP combine before reading MoE output.
         # No-op when async combine is disabled or non-DeepEP dispatch.
-        from xorl.distributed.moe.deepep import sync_pending_combine
         sync_pending_combine()
 
         hidden_states = residual + hidden_states
@@ -330,18 +305,9 @@ class Qwen3MoePreTrainedModel(XorlPreTrainedModel):
             module.original_inv_freq = module.inv_freq
 
     def get_parallel_plan(self):
-        from .parallelize import get_ep_plan
-
-        return get_ep_plan()
+        return parallelize.get_ep_plan()
 
     def get_checkpoint_handler(self, **kwargs):
-        from .checkpoint_handler import Qwen3MoeCheckpointHandler
-        from ...checkpoint_handlers.buffers import (
-            checkpoint_has_per_expert_weights,
-            detect_prequantized_checkpoint,
-            get_prequantized_exclude_modules,
-        )
-
         checkpoint_keys = kwargs.get("checkpoint_keys", set())
         weights_path = kwargs.get("weights_path", None)
         ep_rank = kwargs.get("ep_rank", 0)
@@ -349,7 +315,10 @@ class Qwen3MoePreTrainedModel(XorlPreTrainedModel):
         is_broadcast = kwargs.get("is_broadcast", False)
 
         has_per_expert = checkpoint_has_per_expert_weights(checkpoint_keys) if checkpoint_keys else True
-        is_prequantized = detect_prequantized_checkpoint(weights_path)
+        is_prequantized = (
+            detect_prequantized_checkpoint(weights_path)
+            or detect_prequantized_block_fp8_checkpoint(weights_path)
+        )
 
         # Use user-specified exclude_modules (stored by train.py) if available,
         # otherwise auto-detect from checkpoint config.
@@ -377,6 +346,8 @@ class Qwen3MoePreTrainedModel(XorlPreTrainedModel):
             skip_gate_up_merge=unfused,
             is_prequantized=is_prequantized,
             exclude_modules=exclude_modules,
+            device=kwargs.get("device"),
+            model=self if is_prequantized else None,
         )
 
 
@@ -403,8 +374,6 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         self.gradient_checkpointing = False
         # Whether this attention impl handles causal masking internally (flash/sdpa)
         self._skip_causal_mask = is_flash_attention(config._attn_implementation)
-        # Cached position tensor to avoid torch.arange every forward
-        self._cached_position: torch.Tensor | None = None
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -424,10 +393,8 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[AttentionKwargs],
-    ) -> Union[Tuple, BaseModelOutput]:
+    ) -> MoeModelOutput:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_router_logits = (
             output_router_logits if output_router_logits is not None else self.config.output_router_logits
@@ -435,8 +402,6 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # PP support: when embed_tokens is None, input is already hidden_states
         if self.embed_tokens is not None:
@@ -449,17 +414,13 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
             # Middle/last PP stage: input_ids is actually hidden_states from previous stage
             hidden_states = input_ids if inputs_embeds is None else inputs_embeds
 
-        if cache_position is None:
-            seq_len = hidden_states.shape[1]
-            if self._cached_position is None or self._cached_position.shape[0] != seq_len or self._cached_position.device != hidden_states.device:
-                self._cached_position = torch.arange(seq_len, device=hidden_states.device)
-            cache_position = self._cached_position
         if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
+            position_ids = torch.arange(hidden_states.shape[1], device=hidden_states.device).unsqueeze(0)
 
         if self._skip_causal_mask:
             causal_mask = None
         else:
+            cache_position = torch.arange(hidden_states.shape[1], device=hidden_states.device)
             causal_mask = update_causal_mask(
                 self.config._attn_implementation,
                 attention_mask,
@@ -474,7 +435,7 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         # SP strategy handles slicing (sync: slice, async: keep full-length)
         ps = get_parallel_state()
-        position_embeddings = get_sp_strategy(num_kv_heads=self.config.num_key_value_heads).prepare_position_embeddings(
+        position_embeddings = get_cp_strategy(num_kv_heads=self.config.num_key_value_heads).prepare_position_embeddings(
             position_embeddings, dim=1, sp_group=ps.sp_group,
             num_kv_heads=self.config.num_key_value_heads,
         )
@@ -484,6 +445,8 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         all_router_logits = () if output_router_logits else None
 
         for decoder_layer in self.layers:
+            if decoder_layer is None:  # PP: pruned layer
+                continue
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
@@ -492,7 +455,6 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
                     position_ids,
                     output_attentions,
                     output_router_logits,
-                    cache_position,
                     position_embeddings,
                     **kwargs,
                 )
@@ -503,7 +465,6 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
                     position_ids=position_ids,
                     output_attentions=output_attentions,
                     output_router_logits=output_router_logits,
-                    cache_position=cache_position,
                     position_embeddings=position_embeddings,
                     **kwargs,
                 )
@@ -519,12 +480,11 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         # PP support: norm may be None on non-last stages
         hidden_states = self.norm(hidden_states) if self.norm is not None else hidden_states
 
-        output = MoeModelOutput(
+        return MoeModelOutput(
             last_hidden_state=hidden_states,
             attentions=all_self_attns,
             router_logits=all_router_logits,
         )
-        return output if return_dict else output.to_tuple()
 
 class KwargsForCausalLM(AttentionKwargs): ...
 
@@ -615,14 +575,13 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
-    from .parallelize import MODEL_TP_PLAN as _tp_plan
+    _tp_plan = parallelize.MODEL_TP_PLAN
 
     def __init__(self, config):
         super().__init__(config)
         self.model = Qwen3MoeModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.loss_function = causallm_loss_function
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
@@ -632,8 +591,7 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel):
 
     def unfuse_for_tp(self):
         """Unfuse fused projections for tensor parallelism compatibility."""
-        from .parallelize import unfuse_for_tp
-        unfuse_for_tp(self)
+        parallelize.unfuse_for_tp(self)
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -669,124 +627,22 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        output_router_logits: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
-        **kwargs: Unpack[KwargsForCausalLM],
-    ) -> Union[Tuple, MoeCausalLMOutput]:
-        r"""
-        Args:
-            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+        **kwargs,
+    ) -> MoeCausalLMOutput:
+        output_router_logits = self.config.output_router_logits
 
-            logits_to_keep (`int` or `torch.Tensor`, *optional*):
-                If an `int`, compute logits for the last `logits_to_keep` tokens. If `0`, calculate logits for all
-                `input_ids` (special case). Only last token logits are needed for generation, and calculating them only for that
-                token can save memory, which becomes pretty significant for long sequences or large vocabulary size.
-                If a `torch.Tensor`, must be 1D corresponding to the indices to keep in the sequence length dimension.
-                This is useful when using packed tensor format (single dimension for batch and sequence length).
-
-        Returns:
-
-        Example:
-
-        ```python
-        >>> from transformers import AutoTokenizer, Qwen3MoeForCausalLM
-
-        >>> model = Qwen3MoeForCausalLM.from_pretrained(PATH_TO_CONVERTED_WEIGHTS)
-        >>> tokenizer = AutoTokenizer.from_pretrained(PATH_TO_CONVERTED_TOKENIZER)
-
-        >>> prompt = "Hey, are you conscious? Can you talk to me?"
-        >>> inputs = tokenizer(prompt, return_tensors="pt")
-
-        >>> # Generate
-        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
-        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
-        ```"""
-
-        # Force these to None/False to save memory - we don't need them for training
-        output_attentions = None
-        output_hidden_states = False
-        output_router_logits = (
-            output_router_logits if output_router_logits is not None else self.config.output_router_logits
-        )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
-            return_dict=return_dict,
-            cache_position=cache_position,
             **kwargs,
         )
 
-        # Get last hidden state from base model (always available, no need for output_hidden_states=True)
-        last_hidden_state = outputs[0]
-
-        # PP support: lm_head may be None on non-last stages
-        if self.lm_head is None:
-            # Non-last PP stage: return hidden_states directly
-            return MoeCausalLMOutput(
-                loss=None,
-                aux_loss=None,
-                logits=None,
-                attentions=outputs.attentions if return_dict else None,
-                router_logits=outputs.router_logits if return_dict else None,
-                last_hidden_state=last_hidden_state,
-            )
-
-        # Only compute loss/logits if labels are provided
-        # This saves computation when only hidden states are needed (e.g., for custom loss functions)
-        loss = None
-        logits = None
-        aux_loss = None
-        if labels is not None:
-            # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            hidden_states = last_hidden_state[:, slice_indices, :]
-            ps = get_parallel_state()
-            loss, logits, _, _ = self.loss_function(
-                hidden_states, self.lm_head.weight, labels,
-                tp_group=ps.tp_group if ps.tp_enabled else None,
-            )
-
-            if output_router_logits:
-                aux_loss = load_balancing_loss_func(
-                    outputs.router_logits if return_dict else outputs[-1],
-                    self.num_experts,
-                    self.num_experts_per_tok,
-                    attention_mask,
-                )
-                loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
-
-        if not return_dict:
-            output = (logits,) + outputs[1:]
-            if output_router_logits:
-                output = (aux_loss,) + output
-            return (loss,) + output if loss is not None else output
-
-        # Return extended output that includes last_hidden_state
-        # This allows callers to access last layer hidden states without output_hidden_states=True
         return MoeCausalLMOutput(
-            loss=loss,
-            aux_loss=aux_loss,
-            logits=logits,
-            attentions=outputs.attentions,
+            last_hidden_state=outputs.last_hidden_state,
             router_logits=outputs.router_logits,
-            last_hidden_state=last_hidden_state,
         )
 
 

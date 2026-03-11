@@ -292,7 +292,8 @@ def moe_scatter(x: torch.Tensor, index: torch.Tensor, out_dtype=None):
     topk = index.shape[1]
     out_dtype = out_dtype or x.dtype
     out = torch.empty(M * topk, N, dtype=out_dtype, device=x.device)
-    assert lambda: index.unique().numel() == M * topk, "Holes in output?"
+    # Debug validation (expensive — enable explicitly if needed):
+    # assert index.unique().numel() == M * topk, "Holes in output?"
 
     grid = lambda meta: (M, triton.cdiv(N, meta["BLOCK_N"]))  # noqa
     _moe_scatter_kernel[grid](

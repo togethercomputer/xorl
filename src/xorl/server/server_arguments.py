@@ -63,14 +63,35 @@ class ServerArguments:
         metadata={"help": "Path to tokenizer. Defaults to config_path"}
     )
 
-    attn_implementation: Optional[Literal["eager", "sdpa", "flash_attention_2", "flash_attention_3", "flash_attention_4", "native-sparse"]] = field(
-        default="flash_attention_2",
-        metadata={"help": "Attention implementation. flash_attention_4 requires Blackwell GPU (SM100+)."}
+    attn_implementation: Optional[Literal["eager", "sdpa", "native", "flash_attention_3", "flash_attention_4"]] = field(
+        default="flash_attention_3",
+        metadata={"help": "Attention implementation. 'native': PyTorch SDPA+cuDNN (no deps, Hopper+Blackwell). "
+                          "'flash_attention_3': FA3 (Hopper). 'flash_attention_4': FA4 CUTE (Hopper+Blackwell)."}
     )
 
     moe_implementation: Optional[Literal[None, "eager", "triton", "native", "quack"]] = field(
         default=None,
         metadata={"help": "MoE implementation. 'triton' uses Triton group GEMM kernels, 'native' uses torch._grouped_mm, 'quack' uses quack kernels."}
+    )
+
+    ep_dispatch: str = field(
+        default="alltoall",
+        metadata={"help": "EP dispatch strategy: 'alltoall' (default) or 'deepep' (NVLink-optimized)."}
+    )
+
+    deepep_buffer_size_gb: float = field(
+        default=2.0,
+        metadata={"help": "DeepEP buffer size in GB (effective when ep_dispatch='deepep')."}
+    )
+
+    deepep_num_sms: int = field(
+        default=20,
+        metadata={"help": "Number of SMs for DeepEP communication kernels (must be even, default 20)."}
+    )
+
+    deepep_async_combine: bool = field(
+        default=False,
+        metadata={"help": "Enable async combine for DeepEP (overlap combine with next layer's compute)."}
     )
 
     # Multimodal model configuration
@@ -113,14 +134,49 @@ class ServerArguments:
         metadata={"help": "Data parallel shard size (FSDP)"}
     )
 
+    pipeline_parallel_size: int = field(
+        default=1,
+        metadata={"help": "Pipeline parallelism size. 1 = disabled."}
+    )
+
+    pipeline_parallel_schedule: str = field(
+        default="1F1B",
+        metadata={"help": "Pipeline parallelism schedule: 1F1B, GPipe, Interleaved1F1B, LoopedBFS, InterleavedZeroBubble, ZBVZeroBubble"}
+    )
+
+    tensor_parallel_size: int = field(
+        default=1,
+        metadata={"help": "Tensor parallelism size"}
+    )
+
+    ringattn_parallel_size: int = field(
+        default=1,
+        metadata={"help": "Ring attention parallel size"}
+    )
+
+    cp_fsdp_mode: str = field(
+        default="all",
+        metadata={"help": "Sequence parallel FSDP mode: 'all', 'ulysses_only', 'ring_only', 'none'"}
+    )
+
     basic_modules: Optional[List[str]] = field(
         default_factory=list,
         metadata={"help": "Basic modules to shard in FSDP"}
     )
 
+    merge_qkv: bool = field(
+        default=True,
+        metadata={"help": "Whether to merge QKV projections. Set False for tensor parallelism."}
+    )
+
     # ========================================================================
     # Memory & Performance
     # ========================================================================
+
+    seed: int = field(
+        default=42,
+        metadata={"help": "Random seed for reproducibility"}
+    )
 
     enable_mixed_precision: bool = field(
         default=True,
@@ -137,14 +193,34 @@ class ServerArguments:
         metadata={"help": "Enable full parameter sharding (FSDP)"}
     )
 
-    enable_fsdp_offload: bool = field(
-        default=False,
-        metadata={"help": "Enable FSDP CPU offloading"}
-    )
-
     enable_activation_offload: bool = field(
         default=False,
         metadata={"help": "Enable activation CPU offloading"}
+    )
+
+    enable_compile: bool = field(
+        default=False,
+        metadata={"help": "Enable torch.compile for model forward pass"}
+    )
+
+    enable_reentrant: bool = field(
+        default=False,
+        metadata={"help": "Use reentrant gradient checkpointing (default: non-reentrant)"}
+    )
+
+    enable_forward_prefetch: bool = field(
+        default=False,
+        metadata={"help": "Enable FSDP forward prefetch for overlapping compute and communication"}
+    )
+
+    reshard_after_forward: bool = field(
+        default=True,
+        metadata={"help": "Reshard parameters after forward pass in FSDP2"}
+    )
+
+    load_weights_mode: str = field(
+        default="auto",
+        metadata={"help": "Weight loading mode: 'auto', 'safetensors', 'dcp'"}
     )
 
     init_device: Optional[Literal["cpu", "meta", "cuda"]] = field(
@@ -160,6 +236,46 @@ class ServerArguments:
     ce_mode: Literal["eager", "compiled"] = field(
         default="compiled",
         metadata={"help": "Cross-entropy implementation: 'compiled' (RECOMMENDED, torch.compile) or 'eager' (baseline, may OOM at 32K)"}
+    )
+
+    # ========================================================================
+    # Optimizer
+    # ========================================================================
+
+    optimizer: Literal["adamw", "anyprecision_adamw", "sgd", "muon"] = field(
+        default="adamw",
+        metadata={"help": "Optimizer type. 'muon' uses Newton-Schulz orthogonalization for 2D+ weight matrices."},
+    )
+
+    optimizer_dtype: Literal["fp32", "bf16"] = field(
+        default="bf16",
+        metadata={"help": "Dtype for optimizer states (momentum/variance). 'bf16' halves optimizer memory."},
+    )
+
+    muon_lr: float = field(
+        default=0.02,
+        metadata={"help": "Learning rate for Muon parameter groups (2D+ weight matrices). Only used when optimizer='muon'."},
+    )
+
+    muon_momentum: float = field(
+        default=0.95,
+        metadata={"help": "Momentum coefficient for Muon parameter groups."},
+    )
+
+    muon_nesterov: bool = field(
+        default=True,
+        metadata={"help": "Use Nesterov momentum for Muon parameter groups."},
+    )
+
+    muon_ns_steps: int = field(
+        default=5,
+        metadata={"help": "Number of Newton-Schulz iterations for Muon optimizer."},
+    )
+
+    muon_adjust_lr_fn: Optional[str] = field(
+        default=None,
+        metadata={"help": "LR adjustment for Muon. 'original': scale by sqrt(max(1,A/B)). "
+                  "'match_rms_adamw': scale by 0.2*sqrt(max(A,B)) so Muon can reuse AdamW LR/WD."},
     )
 
     # ========================================================================
@@ -258,7 +374,7 @@ class ServerArguments:
     # Data Processing Configuration
     # ========================================================================
 
-    packing_seq_len: int = field(
+    sample_packing_sequence_len: int = field(
         default=32000,
         metadata={"help": "Maximum sequence length for sample packing (default: 32000)"}
     )
@@ -292,9 +408,47 @@ class ServerArguments:
         metadata={"help": "List of module names to apply LoRA to (e.g., ['q_proj', 'k_proj', 'v_proj', 'o_proj']). If None, uses default based on model architecture."}
     )
 
+    moe_shared_lora: bool = field(
+        default=False,
+        metadata={"help": "Enable shared LoRA for MoE: share LoRA weights across experts"}
+    )
+
     moe_hybrid_shared_lora: bool = field(
         default=False,
         metadata={"help": "Enable hybrid shared LoRA for MoE: share lora_A for gate/up_proj, lora_B for down_proj across experts"}
+    )
+
+    # ========================================================================
+    # QLoRA Configuration
+    # ========================================================================
+
+    enable_qlora: bool = field(
+        default=False,
+        metadata={"help": "Enable QLoRA (quantized LoRA) for memory-efficient training"}
+    )
+
+    quant_format: str = field(
+        default="nvfp4",
+        metadata={"help": "Quantization format for QLoRA: 'nvfp4' or 'block_fp8'"}
+    )
+
+    quant_group_size: int = field(
+        default=16,
+        metadata={"help": "Quantization group size for QLoRA"}
+    )
+
+    qlora_exclude_modules: Optional[List[str]] = field(
+        default=None,
+        metadata={"help": "Modules to exclude from QLoRA quantization (e.g., ['lm_head'])"}
+    )
+
+    merge_lora_interval: int = field(
+        default=0,
+        metadata={"help": "Merge LoRA weights every N steps (0 = never merge)"}
+    )
+    reset_optimizer_on_merge: bool = field(
+        default=False,
+        metadata={"help": "ReLoRA-style partial optimizer reset after each LoRA merge"}
     )
 
     # ========================================================================
@@ -304,6 +458,16 @@ class ServerArguments:
     freeze_router: bool = field(
         default=True,
         metadata={"help": "Freeze MoE router weights during training"}
+    )
+
+    # ========================================================================
+    # Inference Weight Sync Configuration
+    # ========================================================================
+
+    sync_inference_method: Literal["nccl_broadcast"] = field(
+        default="nccl_broadcast",
+        metadata={"help": "Method for syncing weights to inference endpoints: "
+                  "'nccl_broadcast' (rank-0 broadcast via SGLang update_weights_from_distributed)"}
     )
 
     def __post_init__(self):
@@ -343,25 +507,45 @@ class ServerArguments:
                 "tokenizer_path": self.tokenizer_path,
                 "attn_implementation": self.attn_implementation,
                 "moe_implementation": self.moe_implementation,
+                "ep_dispatch": self.ep_dispatch,
+                "deepep_buffer_size_gb": self.deepep_buffer_size_gb,
+                "deepep_num_sms": self.deepep_num_sms,
+                "deepep_async_combine": self.deepep_async_combine,
                 "foundation": self.foundation,
                 "encoders": self.encoders,
                 "basic_modules": self.basic_modules,
+                "merge_qkv": self.merge_qkv,
             },
             "train": {
                 "output_dir": self.output_dir,
+                "seed": self.seed,
                 "data_parallel_mode": self.data_parallel_mode,
                 "ulysses_parallel_size": self.ulysses_parallel_size,
                 "expert_parallel_size": self.expert_parallel_size,
                 "data_parallel_replicate_size": self.data_parallel_replicate_size,
                 "data_parallel_shard_size": self.data_parallel_shard_size,
+                "tensor_parallel_size": self.tensor_parallel_size,
+                "ringattn_parallel_size": self.ringattn_parallel_size,
+                "cp_fsdp_mode": self.cp_fsdp_mode,
                 "enable_mixed_precision": self.enable_mixed_precision,
                 "enable_gradient_checkpointing": self.enable_gradient_checkpointing,
                 "enable_full_shard": self.enable_full_shard,
-                "enable_fsdp_offload": self.enable_fsdp_offload,
                 "enable_activation_offload": self.enable_activation_offload,
+                "enable_compile": self.enable_compile,
+                "enable_reentrant": self.enable_reentrant,
+                "enable_forward_prefetch": self.enable_forward_prefetch,
+                "reshard_after_forward": self.reshard_after_forward,
+                "load_weights_mode": self.load_weights_mode,
                 "init_device": self.init_device,
                 "enable_rank0_init": self.enable_rank0_init,
                 "ce_mode": self.ce_mode,
+                "optimizer": self.optimizer,
+                "optimizer_dtype": self.optimizer_dtype,
+                "muon_lr": self.muon_lr,
+                "muon_momentum": self.muon_momentum,
+                "muon_nesterov": self.muon_nesterov,
+                "muon_ns_steps": self.muon_ns_steps,
+                "muon_adjust_lr_fn": self.muon_adjust_lr_fn,
                 "load_checkpoint_path": self.load_checkpoint_path,
                 "ckpt_manager": self.ckpt_manager,
                 "enable_self_test": self.enable_self_test,
@@ -369,16 +553,25 @@ class ServerArguments:
                 "log_gradient_norms": self.log_gradient_norms,
                 "log_router_stats": self.log_router_stats,
                 "freeze_router": self.freeze_router,
+                "pipeline_parallel_size": self.pipeline_parallel_size,
+                "pipeline_parallel_schedule": self.pipeline_parallel_schedule,
             },
             "data": {
                 # Empty data section - data comes from client at runtime
             },
             "lora": {
-                "enabled": self.enable_lora,
-                "rank": self.lora_rank,
-                "alpha": self.lora_alpha,
-                "target_modules": self.lora_target_modules,
-                "moe_hybrid_shared": self.moe_hybrid_shared_lora,
+                "enable_lora": self.enable_lora,
+                "lora_rank": self.lora_rank,
+                "lora_alpha": self.lora_alpha,
+                "lora_target_modules": self.lora_target_modules,
+                "moe_shared_lora": self.moe_shared_lora,
+                "moe_hybrid_shared_lora": self.moe_hybrid_shared_lora,
+                "enable_qlora": self.enable_qlora,
+                "quant_format": self.quant_format,
+                "quant_group_size": self.quant_group_size,
+                "exclude_modules": self.qlora_exclude_modules,
+                "merge_lora_interval": self.merge_lora_interval,
+                "reset_optimizer_on_merge": self.reset_optimizer_on_merge,
             },
         }
         return config
@@ -395,6 +588,9 @@ class ServerArguments:
             Required world size (number of GPUs)
         """
         return (
+            self.pipeline_parallel_size *
+            self.tensor_parallel_size *
+            self.ringattn_parallel_size *
             self.ulysses_parallel_size *
             self.data_parallel_replicate_size *
             self.data_parallel_shard_size

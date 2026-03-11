@@ -1,53 +1,12 @@
+from __future__ import annotations
+
 from typing import Dict, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 
-from .compiled_cross_entropy import compiled_cross_entropy_function
-from .vocab_parallel_cross_entropy import vocab_parallel_cross_entropy
-
-
-def _compute_per_token_ce(
-    hidden_states_flat: torch.Tensor,
-    weight: torch.Tensor,
-    labels_flat: torch.Tensor,
-    ignore_index: int,
-    ce_mode: str,
-    num_chunks: int = 8,
-    tp_group: Optional[dist.ProcessGroup] = None,
-) -> torch.Tensor:
-    """
-    Compute per-token cross-entropy loss based on the specified mode.
-
-    Args:
-        hidden_states_flat: Flattened hidden states, shape (BT, H)
-        weight: LM head weight matrix, shape (V, H) or (V/tp, H) with TP
-        labels_flat: Flattened labels, shape (BT,)
-        ignore_index: Index to ignore in loss computation
-        ce_mode: Cross-entropy computation mode ("compiled" or "eager")
-        num_chunks: Number of chunks for compiled mode
-        tp_group: TP process group for vocab-parallel cross-entropy (default: None)
-
-    Returns:
-        per_token_ce: Per-token cross-entropy loss, shape (BT,)
-    """
-    if tp_group is not None:
-        local_weight = weight.to_local() if hasattr(weight, "to_local") else weight
-        return vocab_parallel_cross_entropy(
-            hidden_states_flat, local_weight, labels_flat, tp_group,
-            ignore_index=ignore_index,
-        )
-
-    if ce_mode == "compiled":
-        # Uses torch.compile to avoid materializing full [BT, V] logits
-        per_token_ce = compiled_cross_entropy_function(hidden_states_flat, weight, labels_flat, ignore_index, num_chunks)
-    else:
-        # eager mode
-        logits_flat = (hidden_states_flat @ weight.t()).float()
-        per_token_ce = F.cross_entropy(logits_flat, labels_flat, reduction="none", ignore_index=ignore_index)
-
-    return per_token_ce
+from xorl.ops.loss.loss_output import LossOutput
+from xorl.ops.loss.per_token_ce import compute_per_token_ce
 
 
 def importance_sampling_loss_function(
@@ -62,7 +21,7 @@ def importance_sampling_loss_function(
     return_per_token: bool = False,
     tp_group: Optional[dist.ProcessGroup] = None,
     compute_kl_stats: bool = False,
-) -> Tuple[torch.Tensor, None, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+) -> "LossOutput":
     """
     Compute importance sampling loss for GRPO/RL training.
 
@@ -92,12 +51,7 @@ def importance_sampling_loss_function(
                          - valid_tokens: Count of valid tokens
 
     Returns:
-        Tuple of (loss, None, per_token_logprobs, per_token_loss, metrics)
-        - loss: Scalar importance sampling loss = -(ratio * advantages).mean()
-        - None: Placeholder for compatibility
-        - per_token_logprobs: Per-token log probabilities, shape (batch, seq_len)
-        - per_token_loss: Per-token policy gradient loss (-(ratio * advantages)), shape (batch, seq_len)
-        - metrics: Dictionary with ratio statistics (ratio_mean, ratio_min, ratio_max)
+        LossOutput with loss, per_token_logprobs, per_token_loss, and metrics.
     """
     original_shape = labels.shape
     H = hidden_states.size(-1)
@@ -113,7 +67,7 @@ def importance_sampling_loss_function(
     n_valid = valid_mask.sum().clamp(min=1).float()
 
     # ---- Cross-entropy computation ----
-    per_token_ce = _compute_per_token_ce(
+    per_token_ce = compute_per_token_ce(
         hidden_states_flat, weight, labels_flat, ignore_index, ce_mode, num_chunks,
         tp_group=tp_group,
     )
@@ -173,4 +127,9 @@ def importance_sampling_loss_function(
     per_token_logprobs = new_logprobs_flat.view(original_shape)
     per_token_loss = per_token_pg.view(original_shape)
 
-    return loss, None, per_token_logprobs, per_token_loss, metrics
+    return LossOutput(
+        loss=loss,
+        per_token_logprobs=per_token_logprobs,
+        per_token_loss=per_token_loss,
+        metrics=metrics,
+    )

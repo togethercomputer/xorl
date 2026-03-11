@@ -479,10 +479,11 @@ class ModelArguments:
         metadata={"help": "Multimodal encoder config and weights."},
     )
     attn_implementation: Optional[
-        Literal["eager", "sdpa", "flash_attention_2", "flash_attention_3", "flash_attention_4", "native-sparse"]
+        Literal["eager", "sdpa", "native", "flash_attention_3", "flash_attention_4"]
     ] = field(
-        default="flash_attention_2",
-        metadata={"help": "Attention implementation to use. flash_attention_4 requires Blackwell GPU (SM100+)."},
+        default="flash_attention_3",
+        metadata={"help": "Attention implementation. 'native': PyTorch SDPA+cuDNN (no deps, Hopper+Blackwell). "
+                          "'flash_attention_3': FA3 (Hopper). 'flash_attention_4': FA4 CUTE (Hopper+Blackwell)."},
     )
     moe_implementation: Optional[Literal[None, "eager", "triton", "native", "quack"]] = field(
         default=None,
@@ -577,13 +578,13 @@ class TrainingArguments:
         metadata={"help": "Parameters without weight decay, for example, bias."},
     )
 
-    optimizer: Literal["adamw", "anyprecision_adamw", "muon"] = field(
+    optimizer: Literal["adamw", "anyprecision_adamw", "sgd", "muon"] = field(
         default="adamw",
-        metadata={"help": "Optimizer. Default to adamw. 'muon' uses Newton-Schulz orthogonalization for 2D+ weight matrices."},
+        metadata={"help": "Optimizer type. 'muon' uses Newton-Schulz orthogonalization for 2D+ weight matrices."},
     )
     optimizer_dtype: Literal["fp32", "bf16"] = field(
         default="bf16",
-        metadata={"help": "Dtype for optimizer states (momentum/variance) in anyprecision_adamw. Ignored for adamw."},
+        metadata={"help": "Dtype for optimizer states (momentum/variance) in anyprecision_adamw/muon."},
     )
     muon_lr: float = field(
         default=0.02,
@@ -609,6 +610,18 @@ class TrainingArguments:
             "None defaults to 'original'."
         },
     )
+
+    @property
+    def optimizer_kwargs(self) -> Dict[str, Any]:
+        """Collect optimizer-specific kwargs from flat fields into a dict for build_optimizer."""
+        kwargs: Dict[str, Any] = {}
+        if self.optimizer == "muon":
+            kwargs["muon_lr"] = self.muon_lr
+            kwargs["muon_momentum"] = self.muon_momentum
+            kwargs["muon_nesterov"] = self.muon_nesterov
+            kwargs["muon_ns_steps"] = self.muon_ns_steps
+            kwargs["muon_adjust_lr_fn"] = self.muon_adjust_lr_fn
+        return kwargs
     max_grad_norm: float = field(
         default=1.0,
         metadata={"help": "Clip value for gradient norm."},
@@ -656,10 +669,6 @@ class TrainingArguments:
     enable_full_shard: bool = field(
         default=True,
         metadata={"help": "Enable fully shard for FSDP training (ZeRO-3)."},
-    )
-    enable_fsdp_offload: bool = field(
-        default=False,
-        metadata={"help": "Enable CPU offload for FSDP."},
     )
     enable_forward_prefetch: bool = field(
         default=True,
@@ -741,9 +750,9 @@ class TrainingArguments:
         default=1,
         metadata={"help": "Tensor parallel size. Shards model weights across GPUs within a node."},
     )
-    context_parallel_size: int = field(
+    ringattn_parallel_size: int = field(
         default=1,
-        metadata={"help": "Context (ring attention) parallel size."},
+        metadata={"help": "Ring attention parallel size."},
     )
     pipeline_parallel_size: int = field(
         default=1,
@@ -764,9 +773,9 @@ class TrainingArguments:
             )
         },
     )
-    sp_fsdp_mode: str = field(
+    cp_fsdp_mode: str = field(
         default="all",
-        metadata={"help": "How to fold SP into FSDP: 'all' (ulysses+cp), 'ulysses_only', or 'none'."},
+        metadata={"help": "How to fold SP into FSDP: 'all' (ulysses+ring), 'ulysses_only', 'ring_only', or 'none'."},
     )
     ckpt_manager: Literal["omnistore", "dcp"] = field(
         default="omnistore",
@@ -801,6 +810,10 @@ class TrainingArguments:
     enable_compile: bool = field(
         default=False,
         metadata={"help": "Enable torch compile."},
+    )
+    log_format: Literal["progress_bar", "structured"] = field(
+        default="progress_bar",
+        metadata={"help": "Logging format. 'progress_bar' uses tqdm; 'structured' prints parse-friendly key=value lines."},
     )
     use_wandb: bool = field(
         default=True,
@@ -859,14 +872,14 @@ class TrainingArguments:
         self.world_size = int(os.getenv("WORLD_SIZE", "1"))
         non_dp_size = (
             self.ulysses_parallel_size * self.tensor_parallel_size
-            * self.context_parallel_size * self.pipeline_parallel_size
+            * self.ringattn_parallel_size * self.pipeline_parallel_size
         )
         if self.world_size % non_dp_size != 0:
             raise ValueError(
                 f"World size ({self.world_size}) should be a multiple of "
                 f"ulysses_parallel_size ({self.ulysses_parallel_size}) * "
                 f"tensor_parallel_size ({self.tensor_parallel_size}) * "
-                f"context_parallel_size ({self.context_parallel_size}) * "
+                f"ringattn_parallel_size ({self.ringattn_parallel_size}) * "
                 f"pipeline_parallel_size ({self.pipeline_parallel_size}) = {non_dp_size}."
             )
         self.data_parallel_size = self.world_size // non_dp_size
@@ -941,11 +954,6 @@ class TrainingArguments:
                 self.init_device == "meta"
             ), "Please use init_device: meta for FSDP2 training"
 
-        # Validate gradient accumulation with FSDP offload
-        if self.gradient_accumulation_steps > 1 and self.enable_fsdp_offload:
-            raise ValueError(
-                "Gradient accumulation is not supported with FSDP offload."
-            )
 
         if self.load_checkpoint_path == "auto":
             from .checkpoint_utils import get_checkpoint_path
@@ -1044,11 +1052,11 @@ class LoRAArguments:
     )
     quant_format: str = field(
         default="nvfp4",
-        metadata={"help": "Quantization format for QLoRA. Supported: 'nvfp4', 'block_fp8'"},
+        metadata={"help": "Quantization format for QLoRA. Supported: 'nvfp4', 'block_fp8', 'nf4'"},
     )
     quant_group_size: int = field(
         default=16,
-        metadata={"help": "Group/block size for quantization (16 for nvfp4, 128 for block_fp8)"},
+        metadata={"help": "Group/block size for quantization (16 for nvfp4, 128 for block_fp8, 64 for nf4)"},
     )
     merge_lora_interval: int = field(
         default=0,
@@ -1056,29 +1064,19 @@ class LoRAArguments:
                   "For QLoRA: merge + re-quantize. For LoRA: merge into bf16 weight. "
                   "0 = disabled."},
     )
+    reset_optimizer_on_merge: bool = field(
+        default=False,
+        metadata={"help": "ReLoRA-style optimizer reset after each LoRA merge. "
+                  "Clears optimizer states (momentum, variance) for LoRA parameters "
+                  "so Adam rebuilds from scratch for the re-initialized LoRA. "
+                  "Requires merge_lora_interval > 0."},
+    )
     exclude_modules: Optional[List[str]] = field(
         default=None,
         metadata={"help": "Modules to exclude from QLoRA injection (kept as bf16). "
                   "When None, auto-detected from pre-quantized checkpoint config "
                   "(exclude_modules / modules_to_not_convert). "
                   "Example: ['lm_head', 'gate']"},
-    )
-    # QLoRA error reduction techniques (all opt-in, disabled by default)
-    enable_hadamard: bool = field(
-        default=False,
-        metadata={"help": "Enable Hadamard rotation before quantizing to spread outliers."},
-    )
-    hadamard_block_size: int = field(
-        default=256,
-        metadata={"help": "Block size for Hadamard rotation (must be power of 2)."},
-    )
-    stochastic_rounding: bool = field(
-        default=False,
-        metadata={"help": "Use stochastic rounding in FP4/FP8 encoding."},
-    )
-    clip_ratio: Optional[float] = field(
-        default=1.0,
-        metadata={"help": "Scale clipping ratio (0.0-1.0). None = auto-search MSE-optimal. 1.0 = disabled."},
     )
     enable_aqn: bool = field(
         default=False,

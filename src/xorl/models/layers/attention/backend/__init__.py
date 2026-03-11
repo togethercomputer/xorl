@@ -16,6 +16,7 @@ import torch
 from typing_extensions import TypedDict
 
 from .eager import eager_attention_forward, prepare_causal_mask as eager_prepare_causal_mask
+from .native import native_attention_forward, prepare_causal_mask as native_prepare_causal_mask
 
 
 # ------------------------------------------------------------------ #
@@ -25,7 +26,7 @@ from .eager import eager_attention_forward, prepare_causal_mask as eager_prepare
 class AttentionKwargs(TypedDict, total=False):
     """Kwargs for attention functions (packed/varlen sequences).
 
-    Generic across backends — flash_attention_2/3/4 uses cu_seq_lens, eager ignores them, etc.
+    Generic across backends — flash_attention_3/4 uses cu_seq_lens, eager ignores them, etc.
     """
 
     cu_seq_lens_q: torch.LongTensor | None
@@ -43,7 +44,7 @@ FlashAttentionKwargs = AttentionKwargs
 # ------------------------------------------------------------------ #
 
 FLASH_ATTENTION_IMPLEMENTATIONS: Set[str] = {
-    "flash_attention_2",
+    "native",
     "flash_attention_3",
     "flash_attention_4",
 }
@@ -60,13 +61,13 @@ def is_flash_attention(attn_implementation: str) -> bool:
 
 ATTENTION_FUNCTIONS: Dict[str, Callable] = {
     "eager": eager_attention_forward,
+    "native": native_attention_forward,
 }
 
 # Register flash attention implementations at import time.
 try:
     from .flash_attention import FA4_AVAILABLE, flash_attention_forward
 
-    ATTENTION_FUNCTIONS["flash_attention_2"] = flash_attention_forward
     ATTENTION_FUNCTIONS["flash_attention_3"] = flash_attention_forward
 
     if FA4_AVAILABLE:
@@ -82,6 +83,7 @@ except ImportError:
 CAUSAL_MASK_FUNCTIONS: Dict[str, Callable] = {
     "eager": eager_prepare_causal_mask,
     "sdpa": eager_prepare_causal_mask,
+    "native": native_prepare_causal_mask,
 }
 
 # Register flash mask functions

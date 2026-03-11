@@ -183,12 +183,12 @@ class PackingConcatCollator(DataCollator):
         # cu_seq_lens_q should equal to cu_seq_lens_k and max_length_q should equal to max_length_k
         if "position_ids" in batch:
 
-            if not get_parallel_state().sp_enabled:
+            if not get_parallel_state().cp_enabled:
                 # We only enter here to pass down cu_seqlens and max_length when sequence parallelism is not enabled.
-                # When sp_enabled is True, position_ids will be padded later, so we calculate them after padding
+                # When cp_enabled is True, position_ids will be padded later, so we calculate them after padding
                 cu_seq_lens_q, _, _, _ = add_flash_attention_kwargs_from_position_ids(batch)
             else:
-                # Still need cu_seq_lens_q for label masking even when sp_enabled
+                # Still need cu_seq_lens_q for label masking even when cp_enabled
                 (cu_seq_lens_q, _), (_, _) = prepare_fa_kwargs_from_position_ids(batch["position_ids"])
 
             # CRITICAL BUGFIX: Mask advantages at packed sequence boundaries

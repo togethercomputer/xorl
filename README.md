@@ -1,6 +1,6 @@
 # Xorl
 
-A distributed training framework for large language models, built on top of [Xorl](https://github.com/xorl-org/Xorl).
+A distributed training framework for large language models.
 
 ## Requirements
 
@@ -117,7 +117,7 @@ Server configs are flat YAML files parsed by `ServerArguments`. Key sections:
 ```yaml
 # Model
 model_path: Qwen/Qwen3-4B-Instruct-2507
-attn_implementation: flash_attention_2   # eager, sdpa, flash_attention_2, flash_attention_3
+attn_implementation: flash_attention_3   # eager, sdpa, flash_attention_3, flash_attention_4
 
 # Parallelism
 data_parallel_mode: fsdp2
@@ -157,11 +157,29 @@ Options:
   --server.<field> VALUE    Override any ServerArguments field
 ```
 
-### Cross-Entropy Modes
+## Features
 
-The `ce_mode` config controls how cross-entropy loss is computed:
+### Models
+- **Qwen3** (dense) and **Qwen3-MoE** (mixture-of-experts)
 
-| Mode | Description |
-|------|-------------|
-| `compiled` | **Default.** `torch.compile` with `auto_chunker` -- avoids materializing `[BT, V]` logits |
-| `eager` | `F.cross_entropy` baseline (may OOM at long sequences) |
+### Parallelism
+- **FSDP2** -- fully sharded data parallelism (PyTorch native)
+- **Tensor Parallelism** -- column/row sharding across GPUs
+- **Pipeline Parallelism** -- interleaved 1F1B schedule across stages
+- **Context Parallelism** -- ring attention and/or Ulysses (all-to-all) with hybrid composition
+- **Expert Parallelism** -- MoE expert sharding via DeepEP
+
+### Training Methods
+- **Full fine-tuning** -- all parameters trainable
+- **LoRA** -- low-rank adaptation for dense and MoE layers
+- **QLoRA** -- quantized base weights (int4/nvfp4/block_fp8) with LoRA, FSDP2-compatible
+
+### Data
+- **Sequence packing** -- pack multiple samples into fixed-length sequences
+- **Zigzag reordering** -- load-balanced sequence distribution for ring attention
+
+### Performance
+- **Mixed precision** -- bf16 compute with f32 gradient reduction
+- **Gradient checkpointing** -- recompute activations to reduce memory
+- **Compiled cross-entropy** -- `torch.compile` avoids materializing full `[BT, V]` logits
+- **Fused kernels** -- Triton SiLU-and-mul, group GEMM for MoE LoRA

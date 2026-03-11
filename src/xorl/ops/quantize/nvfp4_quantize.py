@@ -6,7 +6,7 @@ from torch import Tensor
 import triton
 import triton.language as tl
 
-from .fp4_codec import FP4_E2M1_MAX, FP8_E4M3_MAX, _fp4_encode, _fp4_encode_stochastic, _fp4_decode
+from .fp4_codec import FP4_E2M1_MAX, FP8_E4M3_MAX, _fp4_encode, _fp4_decode
 
 
 _QUANT_CONFIGS = {
@@ -23,10 +23,9 @@ _DEQUANT_CONFIGS = {
 @triton.jit
 def _nvfp4_quantize_kernel(
     X, Out, Amax, GlobalAmax,
-    total_elems, clip_ratio, seed,
+    total_elems,
     BLOCK_SIZE: tl.constexpr,
     TILE_ELEMS: tl.constexpr,
-    STOCHASTIC: tl.constexpr,
 ):
     """Single-pass NVFP4 quant: codes depend only on per-block amax, not global scale."""
     pid = tl.program_id(0)
@@ -40,20 +39,12 @@ def _nvfp4_quantize_kernel(
     x_2d = tl.reshape(x, (blocks_per_tile, BLOCK_SIZE))
     amax = tl.max(tl.abs(x_2d), axis=1)
     amax = tl.maximum(amax, 1e-12)
-    # Apply clip_ratio: reduce effective range to clip outliers
-    clipped_amax = amax * clip_ratio
-    clipped_amax = tl.maximum(clipped_amax, 1e-12)
     # Compute codes before stores to overlap compute with memory
-    inv_amax_2d = (6.0 / tl.expand_dims(clipped_amax, axis=1))
+    inv_amax_2d = (6.0 / tl.expand_dims(amax, axis=1))
     scaled_2d = x_2d * inv_amax_2d
-    # Clamp for clipped outliers (values beyond clip_ratio * amax)
     scaled_2d = tl.minimum(tl.maximum(scaled_2d, -6.0), 6.0)
     scaled = tl.reshape(scaled_2d, (TILE_ELEMS,))
-    if STOCHASTIC:
-        noise = tl.rand(seed, base + offs)
-        codes = _fp4_encode_stochastic(scaled, noise)
-    else:
-        codes = _fp4_encode(scaled)
+    codes = _fp4_encode(scaled)
     scale_offs = tl.arange(0, blocks_per_tile)
     tl.store(Amax + base_block + scale_offs, amax,
              mask=(base_block + scale_offs) < (total_elems // BLOCK_SIZE))
@@ -119,9 +110,7 @@ def _nvfp4_scale_convert_kernel(Amax, ScaleOut, GlobalAmaxInOut, n_blocks,
 
 
 def nvfp4_quantize(x: Tensor, block_size: int = 16,
-                   global_amax: Optional[Tensor] = None,
-                   clip_ratio: float = 1.0,
-                   stochastic_rounding: bool = False) -> Tuple[Tensor, Tensor, Tensor]:
+                   global_amax: Optional[Tensor] = None) -> Tuple[Tensor, Tensor, Tensor]:
     assert x.dim() == 2
     M, K = x.shape
     n = M * K
@@ -134,10 +123,9 @@ def nvfp4_quantize(x: Tensor, block_size: int = 16,
     te, nw = _QUANT_CONFIGS.get(block_size, (2048, 1))
     te = min(te, n)
     grid = (n + te - 1) // te
-    seed = 0 if not stochastic_rounding else torch.randint(0, 2**31, (1,)).item()
     _nvfp4_quantize_kernel[(grid,)](
-        x_flat, packed, amax, global_amax_buf, n, clip_ratio, seed,
-        block_size, te, stochastic_rounding, num_warps=nw,
+        x_flat, packed, amax, global_amax_buf, n,
+        block_size, te, num_warps=nw,
     )
     # Override global amax with EMA-tracked value if provided
     if global_amax is not None:

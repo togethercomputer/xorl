@@ -1,7 +1,7 @@
-"""LoRA utilities for Xorl MoE implementation.
+"""LoRA utilities for MoE implementation.
 
 This module provides utilities for initializing and managing LoRA weights
-in the stacked tensor format used by Xorl's group GEMM kernels.
+in the stacked tensor format used by group GEMM kernels.
 """
 
 import math

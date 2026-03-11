@@ -9,12 +9,18 @@ from torch.distributed.fsdp import MixedPrecision
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import noop_context_fn
 
-from ..models import all_ranks_load_weights, rank0_load_and_broadcast_weights
-from ..utils import logging
-from ..utils.device import get_device_type
-from ..utils.import_utils import is_torch_version_greater_than
-from .checkpoint import CheckpointFunction
-from .parallel_state import get_parallel_state
+from xorl.distributed.checkpoint import CheckpointFunction
+from xorl.distributed.fsdp2 import clip_grad_norm
+from xorl.distributed.parallel_state import get_parallel_state
+from xorl.distributed.pipeline_parallel import (
+    generate_llm_fqn_per_model_part,
+    pipeline_module_split,
+)
+from xorl.lora import LoraLinear
+from xorl.models import all_ranks_load_weights, rank0_load_and_broadcast_weights
+from xorl.utils import logging
+from xorl.utils.device import get_device_type
+from xorl.utils.import_utils import is_torch_version_greater_than
 
 
 if is_torch_version_greater_than("2.4"):
@@ -238,6 +244,21 @@ def parallelize_model_fsdp2(
         fully_shard(layer_mod, **layer_fsdp_kwargs)
         layer_mod._fsdp_modules.append(layer_mod)
         logger.debug_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
+    # Torchtitan optimization: group norm + lm_head into a single FSDP unit
+    # with reshard_after_forward=False. When norm.forward() runs inside
+    # the base model, FSDP all-gathers both norm and lm_head weights.
+    # They stay gathered so external compute_loss() can access lm_head.weight
+    # without a redundant all-gather.
+    if not pp_enabled and fsdp_kwargs.get("reshard_after_forward", True) is not False:
+        base_model = getattr(model, "model", None)
+        norm_mod = getattr(base_model, "norm", None) if base_model else None
+        lm_head_mod = getattr(model, "lm_head", None)
+        last_modules = [m for m in [norm_mod, lm_head_mod] if m is not None]
+        if last_modules:
+            last_fsdp_kwargs = dict(fsdp_kwargs)
+            last_fsdp_kwargs["reshard_after_forward"] = False
+            fully_shard(last_modules, **last_fsdp_kwargs)
+
     # shard root model
     # Collect all _skip_fsdp experts params so they're also ignored by the
     # root-level fully_shard (layer-level already ignores them above, but the
@@ -282,14 +303,21 @@ def parallelize_model_fsdp2(
     # Handle meta initialization for FSDP2 (fallback if pre-load not done)
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
 
+    weight_device = get_device_type()
+
     # skip_weight_loading: Used when caller will handle weight loading separately
     # (e.g., FSDP2+LoRA where we broadcast from rank 0 after this function returns)
     if kwargs.get("skip_weight_loading"):
         logger.info_rank0("Skipping weight loading in parallelize_model_fsdp2 (caller will handle)")
     elif weights_path is None:
-        model.to_empty(device="cuda")
+        model.to_empty(device=weight_device)
         with torch.no_grad():
             model.init_weights()
+            # Re-initialize LoRA params — init_weights() only handles nn.Linear,
+            # and reset_lora_parameters() was a no-op on meta tensors during __init__
+            for m in model.modules():
+                if hasattr(m, "reset_lora_parameters"):
+                    m.reset_lora_parameters()
     else:
         from torch.distributed.tensor import distribute_tensor
 
@@ -297,15 +325,13 @@ def parallelize_model_fsdp2(
         load_weights_mode = kwargs.get("load_weights_mode", "broadcast")
         if load_weights_mode == "broadcast":
             logger.info_rank0("Loading model weights from disk on rank0 then broadcasting to other ranks...")
-            rank0_load_and_broadcast_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
+            rank0_load_and_broadcast_weights(model, weights_path, weight_device, dtensor_factory=distribute_tensor)
         else:
             logger.info_rank0("Every rank reading weights from disk independently...")
-            all_ranks_load_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
+            all_ranks_load_weights(model, weights_path, weight_device, dtensor_factory=distribute_tensor)
 
     # Register grad norm clipping method for FSDP2
-    from .fsdp2 import clip_grad_norm as clip_grad_norm_fn
-
-    model.clip_grad_norm_ = types.MethodType(clip_grad_norm_fn, model)
+    model.clip_grad_norm_ = types.MethodType(clip_grad_norm, model)
 
     return model
 
@@ -338,18 +364,11 @@ def build_parallelize_model(
     if not parallel_state.fsdp_enabled:
         if kwargs.get("init_device") not in ["cuda", "npu"]:
             raise ValueError("Only FSDP training supports `init_device=cpu` or `init_device=meta`.")
-        if kwargs.pop("enable_fsdp_offload", False):
-            raise ValueError("Only FSDP training supports `enable_fsdp_offload`.")
     if enable_mixed_precision and not kwargs.pop("skip_param_upcast", False):
         model = model.float()
 
     if pp_schedule is not None:
         # ---- Pipeline Parallelism path ----
-        from .pipeline_parallel import (
-            generate_llm_fqn_per_model_part,
-            pipeline_module_split,
-        )
-
         ps = get_parallel_state()
         pp_mesh = ps.pp_mesh
         pp_degree = ps.pp_size
@@ -409,8 +428,6 @@ def build_parallelize_model(
             if ps.tp_enabled:
                 # TP + LoRA is not currently supported
                 if i == 0:
-                    from ..lora import LoraLinear
-
                     if any(isinstance(m, LoraLinear) for m in model_part.modules()):
                         raise NotImplementedError("Tensor parallelism + LoRA is not currently supported.")
 
@@ -434,7 +451,6 @@ def build_parallelize_model(
                 # With TP + meta init, we must load weights BEFORE FSDP wrapping.
                 if kwargs.get("init_device") == "meta" and weights_path is not None:
                     from torch.distributed.tensor import distribute_tensor
-                    from ..models import rank0_load_and_broadcast_weights, all_ranks_load_weights
 
                     if i == 0:
                         logger.info_rank0("TP enabled: loading weights before FSDP wrapping...")
@@ -447,8 +463,6 @@ def build_parallelize_model(
 
             # torch.compile (if enabled)
             if enable_compile:
-                from functools import partial as _partial
-
                 target_classes = set((getattr(model_part, "_no_split_modules", []) or []) + (basic_modules or []))
                 compiled_count = 0
                 for fqn, mod in model_part.named_modules():
@@ -463,7 +477,7 @@ def build_parallelize_model(
 
                 # Enable compiled vocab-parallel cross-entropy kernels
                 if hasattr(model_part, "loss_function"):
-                    model_part.loss_function = _partial(model_part.loss_function, use_compile=True)
+                    model_part.loss_function = functools.partial(model_part.loss_function, use_compile=True)
                     if i == 0:
                         logger.info_rank0("Enabled compiled vocab-parallel cross-entropy")
 
@@ -523,13 +537,13 @@ def build_parallelize_model(
             torch.utils.checkpoint.CheckpointFunction = CheckpointFunction
 
         gc_kwargs = {"use_reentrant": use_reentrant}
-        # Skip context_fn when torch.compile is enabled — dynamo can't trace
-        # through the SkipFunctionVariable (noop_context_fn). Without context_fn,
-        # checkpoint uses the same default behavior and dynamo can trace natively.
-        if not enable_compile:
-            gc_kwargs["context_fn"] = kwargs.pop("recompute_context_fn", noop_context_fn)
-        else:
-            kwargs.pop("recompute_context_fn", None)  # consume the kwarg
+        # Only pass context_fn when torch.compile is NOT enabled AND a custom
+        # recompute_context_fn is explicitly provided. Passing context_fn
+        # (even noop_context_fn) triggers SAC which uses torch.compile internally,
+        # causing unexpected Inductor compilation when compile is disabled.
+        recompute_fn = kwargs.pop("recompute_context_fn", None)
+        if recompute_fn is not None and not enable_compile:
+            gc_kwargs["context_fn"] = recompute_fn
 
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gc_kwargs)
 
@@ -551,8 +565,6 @@ def build_parallelize_model(
 
     if parallel_state.tp_enabled:
         # TP + LoRA is not currently supported
-        from ..lora import LoraLinear
-
         if any(isinstance(m, LoraLinear) for m in model.modules()):
             raise NotImplementedError("Tensor parallelism + LoRA is not currently supported.")
 
@@ -576,7 +588,6 @@ def build_parallelize_model(
         # Load weights now so FSDP wraps materialized TP DTensors.
         if kwargs.get("init_device") == "meta" and weights_path is not None:
             from torch.distributed.tensor import distribute_tensor
-            from ..models import rank0_load_and_broadcast_weights, all_ranks_load_weights
 
             logger.info_rank0("TP enabled: loading weights before FSDP wrapping...")
             load_weights_mode = kwargs.get("load_weights_mode", "broadcast")
@@ -588,8 +599,6 @@ def build_parallelize_model(
             kwargs["skip_weight_loading"] = True
 
     if enable_compile:
-        from functools import partial as _partial
-
         # Compile each decoder layer for torch.compile + FSDP2 compatibility.
         # Must happen BEFORE fully_shard so FSDP wraps the compiled modules.
         target_classes = set((getattr(model, "_no_split_modules", []) or []) + (basic_modules or []))
@@ -605,7 +614,7 @@ def build_parallelize_model(
 
         # Enable compiled vocab-parallel cross-entropy kernels
         if hasattr(model, "loss_function"):
-            model.loss_function = _partial(model.loss_function, use_compile=True)
+            model.loss_function = functools.partial(model.loss_function, use_compile=True)
             logger.info_rank0("Enabled compiled vocab-parallel cross-entropy")
 
     if parallel_state.fsdp_enabled:

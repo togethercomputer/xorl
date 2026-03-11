@@ -1,12 +1,12 @@
 """
 API Server package for xorl training system.
 
-Provides unified FastAPI server with integrated EngineClient for
+Provides unified FastAPI server with integrated OrchestratorClient for
 communicating with the training engine backend.
 """
 
-from xorl.server.api_server.engine_client import EngineClient
-from xorl.server.api_server.api_server import APIServer
+from xorl.server.api_server.orchestrator_client import OrchestratorClient
+from xorl.server.api_server.server import APIServer
 from xorl.server.api_server.api_types import (
     TensorData,
     Datum,
@@ -30,7 +30,7 @@ from xorl.server.api_server.api_types import (
 )
 
 __all__ = [
-    "EngineClient",
+    "OrchestratorClient",
     "APIServer",
     # Request/Response models
     "TensorData",

@@ -25,17 +25,37 @@ def _get_package_version(name: str) -> "Version":
 
 _PACKAGE_FLAGS: Dict[str, bool] = {
     "flash_attn": _is_package_available("flash_attn"),
+    "flash_attn_interface": _is_package_available("flash_attn_interface"),
     "triton": _is_package_available("triton"),
 }
 
 
-def is_flash_attn_2_available() -> bool:
-    """Check if flash_attn is available (works for both FA2 and FA3).
+def _detect_flash_attn_version() -> int:
+    """Detect installed Flash Attention version.
 
-    FA2 and FA3 use the same import path (from flash_attn import ...).
-    FA3 is simply a newer version of the flash-attn package.
+    Returns:
+        3 if flash_attn_interface (FA3/Hopper) is available (preferred),
+        2 if flash_attn with v2 API is available,
+        0 if neither is installed.
     """
-    return _PACKAGE_FLAGS["flash_attn"]
+    if _PACKAGE_FLAGS["flash_attn_interface"]:
+        return 3
+    if _PACKAGE_FLAGS["flash_attn"]:
+        return 2
+    return 0
+
+
+FLASH_ATTN_VERSION: int = _detect_flash_attn_version()
+"""Installed Flash Attention version: 3 (Hopper), 2 (legacy), or 0 (none)."""
+
+
+def is_flash_attn_available() -> bool:
+    """Check if any version of Flash Attention is installed."""
+    return FLASH_ATTN_VERSION > 0
+
+
+# Keep for backward compat
+is_flash_attn_2_available = is_flash_attn_available
 
 
 def is_fused_moe_available() -> bool:
