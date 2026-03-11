@@ -2,7 +2,7 @@
 
 Pure attention computation -- no sequence parallelism logic.
 SP communication (Ulysses all-to-all, etc.) is handled externally by
-SPStrategy classes in ``xorl.distributed.sequence_parallel.strategy``.
+CPStrategy classes in ``xorl.distributed.sequence_parallel.strategy``.
 """
 
 import os
@@ -55,11 +55,11 @@ def flash_attention_forward(
 ) -> Tuple[torch.Tensor, None]:
     if kwargs.get("output_attentions", False) or kwargs.get("head_mask", None) is not None:
         logger.warning_once(
-            "`flash_attention_2` does not support `output_attentions=True` or `head_mask`."
+            "Flash attention does not support `output_attentions=True` or `head_mask`."
             " Please set your attention to `eager` if you want any of these features."
         )
 
-    # FA2 always relies on the value set in the module, so remove it if present in kwargs to avoid passing it twice
+    # Flash attention always relies on the value set in the module, so remove it if present in kwargs to avoid passing it twice
     kwargs.pop("is_causal", None)
 
     # This is for Qwen2VL's mrope

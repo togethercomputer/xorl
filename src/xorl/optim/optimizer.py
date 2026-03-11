@@ -287,6 +287,90 @@ _ANYPRECISION_STATE_DTYPES = {
 }
 
 
+def _get_optimizer_cls_and_kwargs(
+    optimizer_type: str,
+    *,
+    lr: float = 1e-3,
+    betas: Tuple[float, float] = (0.9, 0.95),
+    eps: float = 1e-8,
+    weight_decay: float = 1e-2,
+    fused: bool = False,
+    optimizer_dtype: str = "bf16",
+    optimizer_kwargs: Optional[Dict[str, Any]] = None,
+) -> Tuple[type, Dict[str, Any]]:
+    """Return (optimizer_class, constructor_kwargs) without instantiating."""
+    kwargs = optimizer_kwargs or {}
+
+    if optimizer_type == "adamw":
+        foreach = not fused
+        ctor_kwargs = dict(
+            lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
+            fused=fused, foreach=foreach, **kwargs,
+        )
+        return AdamW, ctor_kwargs
+    elif optimizer_type == "anyprecision_adamw":
+        state_dtype = _ANYPRECISION_STATE_DTYPES[optimizer_dtype]
+        ctor_kwargs = dict(
+            lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
+            momentum_dtype=state_dtype, variance_dtype=state_dtype,
+            compensation_buffer_dtype=state_dtype, **kwargs,
+        )
+        return AnyPrecisionAdamW, ctor_kwargs
+    elif optimizer_type == "sgd":
+        sgd_defaults = {"momentum": 0.0, "nesterov": False}
+        sgd_defaults.update(kwargs)
+        ctor_kwargs = dict(lr=lr, weight_decay=weight_decay, **sgd_defaults)
+        return torch.optim.SGD, ctor_kwargs
+    elif optimizer_type == "muon":
+        adamw_state_dtype = _ANYPRECISION_STATE_DTYPES.get(optimizer_dtype)
+        ctor_kwargs = dict(
+            lr=kwargs.get("muon_lr", 0.02),
+            momentum=kwargs.get("muon_momentum", 0.95),
+            nesterov=kwargs.get("muon_nesterov", True),
+            ns_steps=kwargs.get("muon_ns_steps", 5),
+            weight_decay=weight_decay,
+            adjust_lr_fn=kwargs.get("muon_adjust_lr_fn"),
+            adamw_betas=betas,
+            adamw_eps=eps,
+            momentum_dtype=kwargs.get("muon_momentum_dtype"),
+            adamw_state_dtype=adamw_state_dtype,
+        )
+        return Muon, ctor_kwargs
+    else:
+        raise ValueError(
+            f"Unsupported optimizer type: '{optimizer_type}'. "
+            f"Supported: adamw, anyprecision_adamw, sgd, muon."
+        )
+
+
+def _create_optimizer(
+    optimizer_type: str,
+    param_groups: Sequence[Dict[str, Any]],
+    *,
+    lr: float = 1e-3,
+    betas: Tuple[float, float] = (0.9, 0.95),
+    eps: float = 1e-8,
+    weight_decay: float = 1e-2,
+    fused: bool = False,
+    optimizer_dtype: str = "bf16",
+    optimizer_kwargs: Optional[Dict[str, Any]] = None,
+) -> Optimizer:
+    """
+    Single factory for all optimizer types.
+
+    Common args (lr, betas, eps, weight_decay) are passed directly.
+    Optimizer-specific args are passed via optimizer_kwargs:
+      - sgd: {"momentum": 0.9, "nesterov": True}
+      - muon: {"muon_lr": 0.02, "muon_momentum": 0.95, ...}
+      - adamw/anyprecision_adamw: any extra kwargs forwarded to constructor
+    """
+    cls, ctor_kwargs = _get_optimizer_cls_and_kwargs(
+        optimizer_type, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
+        fused=fused, optimizer_dtype=optimizer_dtype, optimizer_kwargs=optimizer_kwargs,
+    )
+    return cls(param_groups, **ctor_kwargs)
+
+
 def _classify_muon_params(
     model: "nn.Module",
 ) -> Tuple[List[torch.nn.Parameter], List[str], List[torch.nn.Parameter], List[str]]:
@@ -379,24 +463,38 @@ def build_optimizer(
     param_groups: Optional[Sequence[Dict[str, Any]]] = None,
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
-    # Muon-specific arguments
-    muon_lr: float = 0.02,
-    muon_momentum: float = 0.95,
-    muon_nesterov: bool = True,
-    muon_ns_steps: int = 5,
-    muon_adjust_lr_fn: Optional[str] = None,
-    muon_momentum_dtype: Optional[torch.dtype] = None,
+    optimizer_kwargs: Optional[Dict[str, Any]] = None,
 ) -> "torch.optim.Optimizer":
+    """
+    Build an optimizer for the given model.
+
+    Args:
+        model: The model whose parameters to optimize.
+        lr: Learning rate (used as AdamW lr for Muon's non-Muon param groups).
+        betas: AdamW beta coefficients.
+        eps: AdamW epsilon.
+        weight_decay: Weight decay coefficient.
+        fused: Use fused AdamW kernel (mutually exclusive with foreach).
+        optimizer_type: One of "adamw", "anyprecision_adamw", "sgd", "muon".
+        optimizer_dtype: State dtype for anyprecision_adamw / muon ("fp32" or "bf16").
+        param_groups: Custom param groups. If None, auto-built with weight decay splitting.
+        no_decay_modules: Module class names to exclude from weight decay.
+        no_decay_params: Parameter name patterns to exclude from weight decay.
+        optimizer_kwargs: Optimizer-specific keyword arguments passed to the constructor.
+            - sgd: {"momentum": 0.9, "nesterov": True}
+            - muon: {"muon_lr": 0.02, "muon_momentum": 0.95, "muon_nesterov": True,
+                      "muon_ns_steps": 5, "muon_adjust_lr_fn": None, "muon_momentum_dtype": None}
+            - adamw/anyprecision_adamw: any extra kwargs forwarded to constructor
+    """
     # EP-aware routing: for FSDP2+EP, split params into EP and non-EP groups and build two optimizers.
     if _should_build_ep_aware(model, param_groups):
         return build_ep_fsdp2_optimizer(
             model, lr, betas, eps, weight_decay, fused, optimizer_type, optimizer_dtype,
             param_groups, no_decay_modules, no_decay_params,
-            muon_lr=muon_lr, muon_momentum=muon_momentum,
-            muon_nesterov=muon_nesterov, muon_ns_steps=muon_ns_steps,
-            muon_adjust_lr_fn=muon_adjust_lr_fn,
-            muon_momentum_dtype=muon_momentum_dtype,
+            optimizer_kwargs=optimizer_kwargs,
         )
+
+    kwargs = optimizer_kwargs or {}
 
     # Muon optimizer: split params into Muon (2D+ matrices) and AdamW (rest)
     if optimizer_type == "muon":
@@ -407,28 +505,14 @@ def build_optimizer(
         logger.info_rank0(f"Muon params: {muon_names}")
         logger.info_rank0(f"AdamW params: {adamw_names}")
 
+        muon_lr = kwargs.get("muon_lr", 0.02)
         param_groups = _make_muon_param_groups(
             model, muon_params, adamw_params,
             muon_lr=muon_lr, adamw_lr=lr, weight_decay=weight_decay,
             no_decay_modules=no_decay_modules, no_decay_params=no_decay_params,
         )
-        adamw_state_dtype = _ANYPRECISION_STATE_DTYPES.get(optimizer_dtype)
-        return Muon(
-            param_groups,
-            lr=muon_lr,
-            momentum=muon_momentum,
-            nesterov=muon_nesterov,
-            ns_steps=muon_ns_steps,
-            weight_decay=weight_decay,
-            adjust_lr_fn=muon_adjust_lr_fn,
-            adamw_betas=betas,
-            adamw_eps=eps,
-            momentum_dtype=muon_momentum_dtype,
-            adamw_state_dtype=adamw_state_dtype,
-        )
-
-    # Other cases remain the same
-    if param_groups is None:
+    elif param_groups is None:
+        # Build param groups with weight decay splitting
         decay_param_names = get_parameter_names(model, no_decay_modules, no_decay_params)
         param_groups = [
             {
@@ -446,21 +530,12 @@ def build_optimizer(
             logger.info_rank0(f"Parameters without weight decay: {no_decay_parameter_names}")
             param_groups.append({"params": no_decay_parameters, "weight_decay": 0.0})
 
-    if optimizer_type == "adamw":
-        foreach = not fused
-        fused = fused
-        optim = AdamW(param_groups, lr, betas, eps, weight_decay, fused=fused, foreach=foreach)
-    elif optimizer_type == "anyprecision_adamw":
-        state_dtype = _ANYPRECISION_STATE_DTYPES[optimizer_dtype]
-        optim = AnyPrecisionAdamW(
-            param_groups, lr, betas, eps, weight_decay,
-            momentum_dtype=state_dtype, variance_dtype=state_dtype,
-            compensation_buffer_dtype=state_dtype,
-        )
-    else:
-        raise ValueError("Only adamw, anyprecision_adamw, and muon are supported as optimizers.")
-
-    return optim
+    return _create_optimizer(
+        optimizer_type, param_groups,
+        lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
+        fused=fused, optimizer_dtype=optimizer_dtype,
+        optimizer_kwargs=optimizer_kwargs,
+    )
 
 
 def build_ep_fsdp2_optimizer(
@@ -475,17 +550,13 @@ def build_ep_fsdp2_optimizer(
     param_groups: Optional[Sequence[Dict[str, Any]]] = None,
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
-    # Muon-specific arguments
-    muon_lr: float = 0.02,
-    muon_momentum: float = 0.95,
-    muon_nesterov: bool = True,
-    muon_ns_steps: int = 5,
-    muon_adjust_lr_fn: Optional[str] = None,
-    muon_momentum_dtype: Optional[torch.dtype] = None,
+    optimizer_kwargs: Optional[Dict[str, Any]] = None,
 ):
     """
     Build a MultiOptimizer instance when model is parallelized with EP+FSDP2
     """
+    kwargs = optimizer_kwargs or {}
+
     # Collect param IDs from _skip_fsdp modules (e.g., QLoRAMoeExperts)
     skip_fsdp_param_ids = set()
     for m in model.modules():
@@ -525,6 +596,7 @@ def build_ep_fsdp2_optimizer(
         non_ep_muon = [p for p in all_muon if id(p) in non_ep_param_set]
         non_ep_adamw = [p for p in all_adamw if id(p) in non_ep_param_set]
 
+        muon_lr = kwargs.get("muon_lr", 0.02)
         ep_groups = _make_muon_param_groups(
             model, ep_muon, ep_adamw,
             muon_lr=muon_lr, adamw_lr=lr, weight_decay=weight_decay,
@@ -542,29 +614,12 @@ def build_ep_fsdp2_optimizer(
         )
 
     def _build(groups: Sequence[Dict[str, Any]]) -> Optimizer:
-        foreach = not fused
-        fused_ = fused
-        if optimizer_type == "adamw":
-            return AdamW(groups, lr, betas, eps, weight_decay, fused=fused_, foreach=foreach)
-        elif optimizer_type == "anyprecision_adamw":
-            state_dtype = _ANYPRECISION_STATE_DTYPES[optimizer_dtype]
-            return AnyPrecisionAdamW(
-                groups, lr, betas, eps, weight_decay,
-                momentum_dtype=state_dtype, variance_dtype=state_dtype,
-                compensation_buffer_dtype=state_dtype,
-            )
-        elif optimizer_type == "muon":
-            adamw_state_dtype = _ANYPRECISION_STATE_DTYPES.get(optimizer_dtype)
-            return Muon(
-                groups, lr=muon_lr, momentum=muon_momentum,
-                nesterov=muon_nesterov, ns_steps=muon_ns_steps,
-                weight_decay=weight_decay, adjust_lr_fn=muon_adjust_lr_fn,
-                adamw_betas=betas, adamw_eps=eps,
-                momentum_dtype=muon_momentum_dtype,
-                adamw_state_dtype=adamw_state_dtype,
-            )
-        else:
-            raise ValueError("Only adamw, anyprecision_adamw, and muon are supported as optimizers.")
+        return _create_optimizer(
+            optimizer_type, groups,
+            lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
+            fused=fused, optimizer_dtype=optimizer_dtype,
+            optimizer_kwargs=optimizer_kwargs,
+        )
 
     optimizer_dict: Dict[str, Optimizer] = {}
     if ep_groups:

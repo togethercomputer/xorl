@@ -5,7 +5,7 @@ This module provides a simple, FSDP-compatible LoRA implementation
 with flat parameter structure for easy checkpoint management.
 
 Supports both dense layers (nn.Linear) and MoE expert blocks
-with Xorl group GEMM kernels for efficient forward/backward passes.
+with group GEMM kernels for efficient forward/backward passes.
 """
 
 # Base class and implementations
@@ -38,7 +38,7 @@ from xorl.lora.utils import (
 # MoE LoRA — deferred to avoid circular import with xorl.models.layers.moe.
 # Access via xorl.lora.MoEExpertsLoRA etc. triggers __getattr__ below.
 
-# Xorl ops for direct access
+# Group GEMM ops for direct access
 from xorl.ops.group_gemm.kernel import (
     init_lora_weights_stacked,
     compute_lora_scaling,
@@ -79,7 +79,7 @@ __all__ = [
     "copy_weights_to_lora_experts",
     "mark_only_lora_as_trainable",
     "lora_state_dict",
-    # Xorl ops
+    # Group GEMM ops
     "init_lora_weights_stacked",
     "compute_lora_scaling",
     "merge_lora_weights_stacked",

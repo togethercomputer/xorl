@@ -20,17 +20,19 @@ from transformers.utils.hub import cached_file, get_checkpoint_shard_files
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
-from ..distributed.parallel_state import get_parallel_state
-from ..utils import logging
-from ..utils.device import synchronize
-from ..utils.helper import empty_cache, get_dtype_size
+from xorl.distributed.parallel_state import get_parallel_state
+from xorl.lora.modules.linear import LoraLinear
+from xorl.ops.loss import get_loss_function
+from xorl.utils import logging
+from xorl.utils.device import synchronize
+from xorl.utils.helper import empty_cache, get_dtype_size
 
 
 if TYPE_CHECKING:
     from transformers import GenerationConfig, PretrainedConfig, PreTrainedModel, PreTrainedTokenizer, ProcessorMixin
 
-    from ..distributed.parallel_plan import ParallelPlan
-    from .checkpoint_handlers.base import CheckpointHandler
+    from xorl.distributed.parallel_plan import ParallelPlan
+    from xorl.models.checkpoint_handlers.base import CheckpointHandler
 
     ModelAssets = Union[GenerationConfig, PretrainedConfig, PreTrainedTokenizer, ProcessorMixin]
 
@@ -39,10 +41,10 @@ logger = logging.get_logger(__name__)
 
 
 # Re-export checkpoint handler utilities for backward compatibility (used by tests)
-from .checkpoint_handlers.buffers import (  # noqa: F401
+from xorl.models.checkpoint_handlers.buffers import (  # noqa: F401
     ExpertWeightBuffer,
     parse_expert_key,
-    checkpoint_has_per_expert_weights as _checkpoint_has_per_expert_weights,
+    checkpoint_has_per_expert_weights,
 )
 
 
@@ -350,6 +352,84 @@ def _find_submodule(module: "nn.Module", name: str) -> Tuple["nn.Module", str]:
     return module, pieces[-1]
 
 
+def _build_compiled_key_map(
+    parameter_names: set,
+    buffer_dict: dict,
+) -> Dict[str, str]:
+    """Build mapping from checkpoint-style keys to model keys with ``_orig_mod`` prefix.
+
+    When ``torch.compile`` wraps decoder layers, parameter names gain an ``_orig_mod.``
+    segment (e.g. ``layers.0._orig_mod.mlp.gate.weight``).  Checkpoint keys lack this
+    prefix.  This mapping bridges the gap so weight loading finds the correct parameters.
+
+    Returns an empty dict if no ``_orig_mod`` segments are present (no-compile case).
+    """
+    mapping: Dict[str, str] = {}
+    for name in parameter_names:
+        stripped = name.replace("._orig_mod.", ".")
+        if stripped != name:
+            mapping[stripped] = name
+    for name in buffer_dict:
+        stripped = name.replace("._orig_mod.", ".")
+        if stripped != name:
+            mapping[stripped] = name
+    return mapping
+
+
+class _MultiStreamDMA:
+    """Manages multi-stream H2D DMA transfers for overlapping copy engine usage.
+
+    GPU has multiple DMA copy engines that can run in parallel on different CUDA
+    streams.  By round-robining pin+DMA across *num_streams* streams, we overlap
+    H2D transfers and achieve ~2x throughput vs single-stream sequential dispatch.
+
+    Deferred copies (GPU temp → model param) are flushed per shard to bound the
+    extra VRAM to ~1 shard worth of temporary GPU tensors.
+    """
+
+    def __init__(self, num_streams: int = 2):
+        self._streams = [torch.cuda.Stream() for _ in range(num_streams)]
+        self._counter = 0
+        self._pending: list[tuple] = []  # (gpu_temp, module, local_name, stream, dtensor_factory)
+
+    def dispatch(
+        self,
+        module: "nn.Module",
+        local_name: str,
+        tensor: "torch.Tensor",
+        orig_tensor: "torch.Tensor",
+        dtensor_factory: Optional[Callable] = None,
+    ) -> None:
+        """Pin, DMA on a round-robin stream, and defer the copy to flush()."""
+        if tensor.dtype != orig_tensor.dtype:
+            tensor = tensor.to(dtype=orig_tensor.dtype)
+        pinned = tensor.pin_memory()
+        stream = self._streams[self._counter % len(self._streams)]
+        self._counter += 1
+        with torch.cuda.stream(stream):
+            gpu_temp = pinned.to(device=orig_tensor.device, non_blocking=True)
+        self._pending.append((gpu_temp, module, local_name, stream, dtensor_factory))
+
+    def flush(self) -> None:
+        """Sync all streams and copy GPU temps into model parameters."""
+        for gpu_temp, module, local_name, stream, dtensor_factory in self._pending:
+            stream.synchronize()
+            orig_tensor = module._parameters[local_name].data
+            if dtensor_factory is not None and hasattr(orig_tensor, "device_mesh"):
+                device_mesh = getattr(orig_tensor, "device_mesh")
+                placements = getattr(orig_tensor, "placements")
+                module._parameters[local_name].data.copy_(
+                    dtensor_factory(gpu_temp, device_mesh, placements)
+                )
+            else:
+                module._parameters[local_name].data.copy_(gpu_temp)
+        self._pending.clear()
+
+
+# Module-level scheduler, set during bulk loading to enable multi-stream DMA.
+_active_dma_scheduler: Optional[_MultiStreamDMA] = None
+
+
 def _dispatch_parameter(
     module: "nn.Module",
     name: str,
@@ -362,6 +442,8 @@ def _dispatch_parameter(
 
     NOTE: FSDP module must use in-place operators.
     """
+    global _active_dma_scheduler
+
     full_param_name = name
     module, local_name = _find_submodule(module, name)
     orig_tensor = module._parameters[local_name].data
@@ -370,14 +452,49 @@ def _dispatch_parameter(
     if parallel_plan is not None:
         tensor = parallel_plan.shard_tensor(tensor, full_param_name, orig_tensor.shape)
 
-    tensor = tensor.to(orig_tensor)
-    if hasattr(orig_tensor, "device_mesh"):  # dtensor
-        if orig_tensor.device.type == "cpu":
-            raise ValueError("Cannot load dtensor on CPU.")
+    # Multi-stream fast path: defer copy to overlap DMA across GPU copy engines.
+    # Uses ~1 shard of extra VRAM for temporary GPU tensors, freed on flush().
+    if (
+        _active_dma_scheduler is not None
+        and tensor.device.type == "cpu"
+        and orig_tensor.device.type == "cuda"
+    ):
+        _active_dma_scheduler.dispatch(module, local_name, tensor, orig_tensor, dtensor_factory)
+        return
 
+    # Fallback: single-stream pinned DMA (used outside bulk loading loops
+    # and for non-CPU→CUDA transfers).
+    if tensor.device.type == "cpu" and orig_tensor.device.type == "cuda":
+        if tensor.dtype != orig_tensor.dtype:
+            tensor = tensor.to(dtype=orig_tensor.dtype)
+        tensor = tensor.pin_memory().to(device=orig_tensor.device, non_blocking=True)
+    else:
+        tensor = tensor.to(orig_tensor)
+
+    if hasattr(orig_tensor, "device_mesh"):  # dtensor
         device_mesh = getattr(orig_tensor, "device_mesh")
         placements = getattr(orig_tensor, "placements")
-        module._parameters[local_name].data.copy_(dtensor_factory(tensor, device_mesh, placements))
+        if orig_tensor.device.type == "cpu":
+            # CPU DTensor: copy shard directly into local tensor.
+            # distribute_tensor doesn't support CPU mesh, so we manually shard and copy.
+            from torch.distributed._tensor import Shard as DTShard
+            shard_dim = None
+            for p in placements:
+                if isinstance(p, DTShard):
+                    shard_dim = p.dim
+                    break
+            if shard_dim is not None:
+                # Shard the source tensor to match the local shard
+                mesh_size = device_mesh.size()
+                local_rank = device_mesh.get_local_rank()
+                chunk_size = tensor.shape[shard_dim] // mesh_size
+                shard = tensor.narrow(shard_dim, local_rank * chunk_size, chunk_size).contiguous()
+                orig_tensor._local_tensor.copy_(shard.to(orig_tensor._local_tensor.dtype))
+            else:
+                # Replicated placement: copy full tensor
+                orig_tensor._local_tensor.copy_(tensor.to(orig_tensor._local_tensor.dtype))
+        else:
+            module._parameters[local_name].data.copy_(dtensor_factory(tensor, device_mesh, placements))
     else:  # not dtensor
         module._parameters[local_name].data.copy_(tensor)
 
@@ -402,7 +519,11 @@ def _dispatch_buffer(
         placements = getattr(orig_tensor, "placements")
         module._buffers[name] = dtensor_factory(buffer.to(dtype=orig_tensor.dtype), device_mesh, placements)
     else:
-        module._buffers[name].copy_(buffer.to(device=orig_tensor.device, dtype=orig_tensor.dtype))
+        try:
+            module._buffers[name].copy_(buffer.to(device=orig_tensor.device, dtype=orig_tensor.dtype))
+        except NotImplementedError:
+            # Meta tensor or uninitialized buffer — skip, will be loaded by QLoRA later
+            logger.warning(f"Skipping buffer dispatch (meta/uninitialized): {name}")
 
 
 def _init_parameter(
@@ -548,6 +669,11 @@ def all_ranks_load_weights(
     """
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
     parameter_names_to_load = {name for name, _ in model.named_parameters()}
+
+    # torch.compile wraps modules with '_orig_mod.' prefix in parameter names.
+    # Checkpoint keys don't have this prefix. Build a mapping to bridge the gap.
+    _compiled_key_map = _build_compiled_key_map(parameter_names_to_load, buffer_dict)
+
     _shrink_expert_params_for_ep(model)
     model.to_empty(device=init_device)
 
@@ -560,6 +686,8 @@ def all_ranks_load_weights(
     _ps = get_parallel_state()
 
     # Get checkpoint handler from model (delegates weight transforms to model-specific logic)
+    # Pass the model's device so MoE expert stacking can happen on GPU (13x faster).
+    model_device = next(model.parameters()).device if any(True for _ in model.parameters()) else None
     handler = None
     if hasattr(model, "get_checkpoint_handler"):
         ep_rank = _ps.ep_rank if _ps.ep_enabled else 0
@@ -571,6 +699,7 @@ def all_ranks_load_weights(
             ep_size=ep_size,
             is_broadcast=False,
             weights_path=weights_path,
+            device=model_device,
         )
 
     # Retry loading state dict on OSError (e.g., HuggingFace download issues)
@@ -608,6 +737,24 @@ def all_ranks_load_weights(
     else:
         global_expected_keys = None
 
+    def _should_skip_qlora_expert_key(key: str, prefixes: set) -> bool:
+        """Check if a checkpoint key matches a QLoRA MoE skip prefix.
+
+        Skip prefixes are like "model.layers.0.mlp.experts.gate_proj".
+        Checkpoint keys are like "model.layers.0.mlp.experts.0.gate_proj.weight".
+        Match by checking if removing the expert index gives a prefix match.
+        """
+        for prefix in prefixes:
+            # Split prefix: "model.layers.0.mlp.experts" + "gate_proj"
+            parts = prefix.rsplit(".", 1)
+            if len(parts) != 2:
+                continue
+            base, proj = parts  # "model.layers.0.mlp.experts", "gate_proj"
+            # Key should match: base.{digit}.proj.{suffix}
+            if key.startswith(base + ".") and f".{proj}." in key:
+                return True
+        return False
+
     # Check if the handler provides an EP-aware skip function to avoid reading
     # out-of-range expert tensor data from disk (can reduce I/O by ~60-70%).
     skip_key_fn = handler.get_skip_key_fn() if handler is not None else None
@@ -615,10 +762,18 @@ def all_ranks_load_weights(
     # Collect keys that are expected to be absent from the model (e.g., QLoRA replaces
     # expert weight params with quantized buffers — base weights loaded separately).
     _expected_skip_keys = set()
+    # Prefix-based skip: for MoE expert modules, checkpoint has per-expert keys
+    # like "experts.0.gate_proj.weight" that should match skip prefix "experts.gate_proj"
+    _expected_skip_prefixes = set()
     for fqn, mod in model.named_modules():
         if getattr(mod, "_qlora_expected_skip_keys", None):
             for suffix in mod._qlora_expected_skip_keys:
-                _expected_skip_keys.add(f"{fqn}.{suffix}" if fqn else suffix)
+                key = f"{fqn}.{suffix}" if fqn else suffix
+                _expected_skip_keys.add(key)
+                # Also add as prefix for per-expert matching:
+                # "model.layers.0.mlp.experts.gate_proj" matches
+                # "model.layers.0.mlp.experts.0.gate_proj.weight"
+                _expected_skip_prefixes.add(key)
 
     # Remove expected skip keys from parameter_names_to_load: FSDP2 may materialize
     # None parameters on some layers (e.g., QLoRALinear.weight), which would cause
@@ -628,70 +783,96 @@ def all_ranks_load_weights(
 
     def _dispatch_results(results):
         for param_name, param_tensor in results:
-            if param_name in _expected_skip_keys:
+            # Resolve _orig_mod prefix from torch.compile (checkpoint keys lack it)
+            model_name = _compiled_key_map.get(param_name, param_name)
+            if param_name in _expected_skip_keys or model_name in _expected_skip_keys:
                 pass  # silently skip — weights loaded separately (e.g., QLoRA)
-            elif param_name in buffer_dict:
-                buffer_dict[param_name] = param_tensor.clone()
-            elif param_name in parameter_names_to_load:
-                parameter_names_to_load.remove(param_name)
-                _dispatch_parameter(model, param_name, param_tensor, dtensor_factory, parallel_plan)
+            elif _expected_skip_prefixes and _should_skip_qlora_expert_key(model_name, _expected_skip_prefixes):
+                pass  # per-expert key matches a QLoRA skip prefix
+            elif model_name in buffer_dict:
+                buffer_dict[model_name] = param_tensor.clone()
+            elif model_name in parameter_names_to_load:
+                parameter_names_to_load.remove(model_name)
+                _dispatch_parameter(model, model_name, param_tensor, dtensor_factory, parallel_plan)
             else:
                 if global_expected_keys is None or param_name not in global_expected_keys:
                     logger.warning_rank0(f"Unexpected key in state dict: {param_name}.")
 
-    if skip_key_fn is not None:
-        # EP-aware filtered loading: skip reading tensor data for out-of-range experts
-        logger.info_rank0(
-            f"EP-aware filtered loading enabled (ep_rank={ep_rank}, ep_size={ep_size}): "
-            "skipping disk reads for out-of-range expert weights"
-        )
-        for state_dict, skipped_keys in tqdm(
-            _prefetch_shards_filtered(state_dict_iterators, skip_key_fn),
-            total=len(state_dict_iterators),
-            desc="Loading checkpoint shards",
-            disable=int(os.getenv("LOCAL_RANK", "-1")) > 0,
-        ):
-            # Notify handler about skipped keys (updates completion counters)
-            for skipped_key in skipped_keys:
-                _dispatch_results(handler.on_skip_weight(skipped_key))
+    # Enable multi-stream DMA: overlaps H2D transfers across GPU copy engines
+    # for ~2x throughput.  Uses ~1 shard of extra VRAM for temp GPU tensors,
+    # freed per shard via flush().
+    global _active_dma_scheduler
+    dma_scheduler = _MultiStreamDMA(num_streams=2)
+    _active_dma_scheduler = dma_scheduler
 
-            # Process loaded tensors normally
-            for name, tensor in state_dict.items():
-                name = _convert_weight_key(name, model)
-                results = handler.on_load_weight(name, tensor)
-                _dispatch_results(results)
+    try:
+        if skip_key_fn is not None:
+            # EP-aware filtered loading: skip reading tensor data for out-of-range experts
+            logger.info_rank0(
+                f"EP-aware filtered loading enabled (ep_rank={ep_rank}, ep_size={ep_size}): "
+                "skipping disk reads for out-of-range expert weights"
+            )
+            for state_dict, skipped_keys in tqdm(
+                _prefetch_shards_filtered(state_dict_iterators, skip_key_fn, prefetch_count=len(state_dict_iterators)),
+                total=len(state_dict_iterators),
+                desc="Loading checkpoint shards",
+                disable=int(os.getenv("LOCAL_RANK", "-1")) > 0,
+            ):
+                # Notify handler about skipped keys (updates completion counters)
+                for skipped_key in skipped_keys:
+                    _dispatch_results(handler.on_skip_weight(skipped_key))
 
-            del state_dict
-            empty_cache()
-    else:
-        # Standard bulk loading (no EP filtering)
-        for state_dict in tqdm(
-            _prefetch_shards(state_dict_iterators),
-            total=len(state_dict_iterators),
-            desc="Loading checkpoint shards",
-            disable=int(os.getenv("LOCAL_RANK", "-1")) > 0,
-        ):
-            for name, tensor in state_dict.items():
-                name = _convert_weight_key(name, model)
-
-                if handler is not None:
+                # Process loaded tensors normally
+                for name, tensor in state_dict.items():
+                    name = _convert_weight_key(name, model)
                     results = handler.on_load_weight(name, tensor)
-                else:
-                    results = [(name, tensor)]
+                    _dispatch_results(results)
 
-                _dispatch_results(results)
+                # Flush deferred DMA copies before freeing shard memory
+                dma_scheduler.flush()
+                del state_dict
+                empty_cache()
+        else:
+            # Standard bulk loading (no EP filtering)
+            # prefetch_count = num_shards loads all shards concurrently, overlapping
+            # disk I/O with pin_memory + DMA dispatch for maximum throughput.
+            for state_dict in tqdm(
+                _prefetch_shards(state_dict_iterators, prefetch_count=len(state_dict_iterators)),
+                total=len(state_dict_iterators),
+                desc="Loading checkpoint shards",
+                disable=int(os.getenv("LOCAL_RANK", "-1")) > 0,
+            ):
+                for name, tensor in state_dict.items():
+                    name = _convert_weight_key(name, model)
 
-            del state_dict
-            empty_cache()
+                    if handler is not None:
+                        results = handler.on_load_weight(name, tensor)
+                    else:
+                        results = [(name, tensor)]
 
-    # Flush handler buffers (warn on incomplete merges)
-    if handler is not None:
-        for param_name, param_tensor in handler.on_load_complete():
-            if param_name in parameter_names_to_load:
-                parameter_names_to_load.remove(param_name)
-                _dispatch_parameter(model, param_name, param_tensor, dtensor_factory, parallel_plan)
+                    _dispatch_results(results)
 
-    post_process_after_weight_loading(model, buffer_dict, parameter_names_to_load, dtensor_factory)
+                # Flush deferred DMA copies before freeing shard memory
+                dma_scheduler.flush()
+                del state_dict
+                empty_cache()
+
+        # Flush handler buffers (warn on incomplete merges)
+        if handler is not None:
+            for param_name, param_tensor in handler.on_load_complete():
+                if param_name in parameter_names_to_load:
+                    parameter_names_to_load.remove(param_name)
+                    _dispatch_parameter(model, param_name, param_tensor, dtensor_factory, parallel_plan)
+            # Final flush for any handler-emitted tensors
+            dma_scheduler.flush()
+    finally:
+        _active_dma_scheduler = None
+
+    post_process_after_weight_loading(
+        model, buffer_dict, parameter_names_to_load, dtensor_factory,
+        qlora_skip_prefixes=_expected_skip_prefixes,
+        qlora_skip_fn=_should_skip_qlora_expert_key,
+    )
 
 
 @torch.no_grad()
@@ -714,6 +895,11 @@ def rank0_load_and_broadcast_weights(
 
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
     parameter_names_to_load = {name for name, _ in model.named_parameters()}
+
+    # torch.compile wraps modules with '_orig_mod.' prefix in parameter names.
+    # Checkpoint keys don't have this prefix. Build a mapping to bridge the gap.
+    _compiled_key_map = _build_compiled_key_map(parameter_names_to_load, buffer_dict)
+
     _shrink_expert_params_for_ep(model)
     model.to_empty(device=init_device)
 
@@ -816,7 +1002,10 @@ def rank0_load_and_broadcast_weights(
                 tensor = torch.empty(shape, dtype=dtype, device=torch_device)
             else:
                 _, broadcast_tensor = merged_queue.pop(0)
-                tensor = broadcast_tensor.to(torch_device, non_blocking=True)
+                if broadcast_tensor.device.type == "cpu" and torch_device.type == "cuda":
+                    tensor = broadcast_tensor.pin_memory().to(torch_device, non_blocking=True)
+                else:
+                    tensor = broadcast_tensor.to(torch_device, non_blocking=True)
 
             start_time = time.perf_counter()
             dist.broadcast(tensor, src=0)
@@ -825,11 +1014,13 @@ def rank0_load_and_broadcast_weights(
                 f"{1000 * (time.perf_counter() - start_time)}"
             )
 
-            if name in buffer_dict:
-                buffer_dict[name] = tensor.detach().clone()
-            elif name in parameter_names_to_load:
-                parameter_names_to_load.discard(name)
-                _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan)
+            # Resolve _orig_mod prefix from torch.compile
+            model_name = _compiled_key_map.get(name, name)
+            if model_name in buffer_dict:
+                buffer_dict[model_name] = tensor.detach().clone()
+            elif model_name in parameter_names_to_load:
+                parameter_names_to_load.discard(model_name)
+                _dispatch_parameter(model, model_name, tensor, dtensor_factory, parallel_plan)
             else:
                 if global_expected_keys is None or name not in global_expected_keys:
                     logger.warning_rank0(f"Unexpected key in state dict: {name}.")
@@ -859,13 +1050,18 @@ def rank0_load_and_broadcast_weights(
             tensor = torch.empty(shape, dtype=dtype, device=torch_device)
         else:
             _, broadcast_tensor = merged_queue.pop(0)
-            tensor = broadcast_tensor.to(torch_device, non_blocking=True)
+            if broadcast_tensor.device.type == "cpu" and torch_device.type == "cuda":
+                tensor = broadcast_tensor.pin_memory().to(torch_device, non_blocking=True)
+            else:
+                tensor = broadcast_tensor.to(torch_device, non_blocking=True)
 
         dist.broadcast(tensor, src=0)
 
-        if name in parameter_names_to_load:
-            parameter_names_to_load.discard(name)
-            _dispatch_parameter(model, name, tensor, dtensor_factory, parallel_plan)
+        # Resolve _orig_mod prefix from torch.compile
+        model_name = _compiled_key_map.get(name, name)
+        if model_name in parameter_names_to_load:
+            parameter_names_to_load.discard(model_name)
+            _dispatch_parameter(model, model_name, tensor, dtensor_factory, parallel_plan)
 
         del tensor
         if global_rank == 0:
@@ -879,13 +1075,36 @@ def post_process_after_weight_loading(
     buffer_dict,
     parameter_names_left: Optional[set[str]] = None,
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
+    qlora_skip_prefixes: Optional[set] = None,
+    qlora_skip_fn: Optional[Callable] = None,
 ):
     """
     shared logic after weight loading that handles buffer, missing weight keys and tied embedding weights.
     """
     parameter_names_left = parameter_names_left or set()
 
+    # Build QLoRA skip prefixes if not provided (for call sites that don't pass them)
+    if qlora_skip_prefixes is None:
+        qlora_skip_prefixes = set()
+        for fqn, mod in model.named_modules():
+            if getattr(mod, "_qlora_expected_skip_keys", None):
+                for suffix in mod._qlora_expected_skip_keys:
+                    qlora_skip_prefixes.add(f"{fqn}.{suffix}" if fqn else suffix)
+
+    def _is_qlora_expert_key(key: str) -> bool:
+        for prefix in qlora_skip_prefixes:
+            parts = prefix.rsplit(".", 1)
+            if len(parts) != 2:
+                continue
+            base, proj = parts
+            if key.startswith(base + ".") and f".{proj}." in key:
+                return True
+        return False
+
     for name, buffer in buffer_dict.items():
+        # Skip QLoRA MoE expert buffers (loaded separately via load_and_quantize_weights)
+        if qlora_skip_prefixes and _is_qlora_expert_key(name):
+            continue
         _dispatch_buffer(model, name, buffer, dtensor_factory)
 
     if parameter_names_left:
@@ -1064,6 +1283,55 @@ def save_model_assets(output_dir: Union[str, "os.PathLike"], model_assets: Seque
             model_asset.save_pretrained(output_dir)
         else:
             logger.warning(f"Model asset {model_asset} should implement `save_pretrained`.")
+
+
+def get_lm_head_weight(lm_head: nn.Module) -> torch.Tensor:
+    """Get lm_head weight, merging LoRA delta if applicable."""
+    if isinstance(lm_head, LoraLinear):
+        return lm_head.weight + lm_head.get_delta_weight().to(lm_head.weight.dtype)
+    return lm_head.weight
+
+
+def compute_loss(
+    lm_head: nn.Module,
+    last_hidden_state: torch.Tensor,
+    loss_fn_name: Optional[str],
+    loss_fn_inputs: Optional[Dict[str, Any]],
+    loss_fn_params: Optional[Dict[str, Any]],
+    logits_to_keep: Union[int, torch.Tensor] = 0,
+):
+    """Compute loss given lm_head module and hidden states.
+
+    Called externally (e.g. from the training loop). FSDP2 keeps lm_head.weight
+    all-gathered via reshard_after_forward=False on the norm + lm_head unit.
+
+    All tensor inputs (labels, old_logprobs, advantages, etc.) should be passed
+    via ``loss_fn_inputs``.  Scalar hyper-parameters (eps_clip, compute_kl_stats,
+    etc.) go in ``loss_fn_params``.
+
+    Returns:
+        LossOutput from the selected loss function.
+    """
+    fn_name = loss_fn_name or "causallm_loss"
+    loss_fn = get_loss_function(fn_name)
+    weight = get_lm_head_weight(lm_head)
+
+    slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+    hidden_states = last_hidden_state[:, slice_indices, :]
+
+    loss_kwargs = {
+        "hidden_states": hidden_states,
+        "weight": weight,
+    }
+    ps = get_parallel_state()
+    if ps.tp_enabled:
+        loss_kwargs["tp_group"] = ps.tp_group
+    if loss_fn_inputs:
+        loss_kwargs.update(loss_fn_inputs)
+    if loss_fn_params:
+        loss_kwargs.update(loss_fn_params)
+
+    return loss_fn(**loss_kwargs)
 
 
 class GradientCheckpointingLayer(nn.Module):

@@ -18,11 +18,11 @@ def unpadding_tensor_for_seqeunce_parallel(x: Tensor, dim: int, unpadded_dim_siz
     group = get_ulysses_sequence_parallel_group() if group is None else group
     if not group:
         return x
-    sp_world = get_ulysses_sequence_parallel_world_size(group)
-    if unpadded_dim_size % sp_world == 0:
+    ulysses_world = get_ulysses_sequence_parallel_world_size(group)
+    if unpadded_dim_size % ulysses_world == 0:
         return x
-    padding_size = sp_world - (unpadded_dim_size % sp_world)
-    assert (padding_size + unpadded_dim_size) % sp_world == 0
+    padding_size = ulysses_world - (unpadded_dim_size % ulysses_world)
+    assert (padding_size + unpadded_dim_size) % ulysses_world == 0
     return unpad_tensor(x, dim=dim, padding_size=padding_size)
 
 
@@ -33,10 +33,10 @@ def padding_tensor_for_seqeunce_parallel(x: Tensor, dim: int, group: ProcessGrou
     group = get_ulysses_sequence_parallel_group() if group is None else group
     if not group:
         return x
-    sp_world = get_ulysses_sequence_parallel_world_size(group)
+    ulysses_world = get_ulysses_sequence_parallel_world_size(group)
     dim_size = x.shape[dim]
-    if dim_size % sp_world:
-        padding_size = sp_world - (dim_size % sp_world)
+    if dim_size % ulysses_world:
+        padding_size = ulysses_world - (dim_size % ulysses_world)
         x = pad_tensor(x, dim, padding_size)
     return x
 
@@ -58,12 +58,12 @@ def remove_last_rank_padding(x: Tensor, dim: int, unpad_dim_size: int, group: Pr
     group = get_ulysses_sequence_parallel_group() if group is None else group
     if not group:
         return x
-    sp_rank = get_ulysses_sequence_parallel_rank(group)
-    sp_world = get_ulysses_sequence_parallel_world_size(group)
-    if unpad_dim_size % sp_world == 0 and sp_rank + 1 != sp_world:
+    ulysses_rank = get_ulysses_sequence_parallel_rank(group)
+    ulysses_world = get_ulysses_sequence_parallel_world_size(group)
+    if unpad_dim_size % ulysses_world == 0 and ulysses_rank + 1 != ulysses_world:
         return x
-    pad = sp_world - (unpad_dim_size % sp_world)
-    assert (pad + x.shape[dim]) % sp_world == 0
+    pad = ulysses_world - (unpad_dim_size % ulysses_world)
+    assert (pad + x.shape[dim]) % ulysses_world == 0
     slc = [slice(None)] * len(x.shape)
     slc[dim] = slice(0, -pad)
     return x[tuple(slc)]
@@ -78,29 +78,29 @@ def has_overlap(x1, x2, y1, y2) -> Tuple[bool, int]:
     return max_value < min_value, min_value - max_value
 
 
-def all2all_splits(image_lens: List, image_lens_per_rank: List, sp_size: int, sp_rank: int) -> Tuple[List, List]:
+def all2all_splits(image_lens: List, image_lens_per_rank: List, ulysses_size: int, ulysses_rank: int) -> Tuple[List, List]:
     """
     A func to generate splits for all2all communication
     """
     assert sum(image_lens) == sum(image_lens_per_rank)
     num_images = len(image_lens)
-    sp_step = (num_images + sp_size - 1) // sp_size
-    in_splits, out_splits = [0 for _ in range(sp_size)], [0 for _ in range(sp_size)]
-    cu_seqlens = [0] + [sum(image_lens_per_rank[: i + 1]) for i in range(sp_size)]
+    ulysses_step = (num_images + ulysses_size - 1) // ulysses_size
+    in_splits, out_splits = [0 for _ in range(ulysses_size)], [0 for _ in range(ulysses_size)]
+    cu_seqlens = [0] + [sum(image_lens_per_rank[: i + 1]) for i in range(ulysses_size)]
     rank = 0
     num_tokens = 0
     for image_idx, image_lens in enumerate(image_lens):
-        src_rank = image_idx // sp_step
+        src_rank = image_idx // ulysses_step
         tokens_split = []
-        for rank in range(sp_size):
+        for rank in range(ulysses_size):
             overlap, overlap_len = has_overlap(
                 num_tokens, num_tokens + image_lens, cu_seqlens[rank], cu_seqlens[rank + 1]
             )
             if overlap:
                 tokens_split.append(overlap_len)
-                if rank == sp_rank:
+                if rank == ulysses_rank:
                     out_splits[src_rank] += overlap_len
-                if src_rank == sp_rank:
+                if src_rank == ulysses_rank:
                     in_splits[rank] += overlap_len
         assert sum(tokens_split) == image_lens
 
@@ -110,7 +110,7 @@ def all2all_splits(image_lens: List, image_lens_per_rank: List, sp_size: int, sp
 
 
 def vlm_images_a2a_meta(
-    sp_rank: int, sp_size: int, image_lens: List, image_masks: torch.Tensor
+    ulysses_rank: int, ulysses_size: int, image_lens: List, image_masks: torch.Tensor
 ) -> Tuple[List, List, torch.Tensor]:
     """
     A func to generate metadata for all2all communication after we balance the computaion in vision encoder
@@ -121,10 +121,10 @@ def vlm_images_a2a_meta(
         f"The sum of image_lens must be equal to the number of tokens, {image_lens} vs {image_masks.sum().item()}"
     )
     seq_len = image_masks.shape[1]
-    step = (seq_len + sp_size - 1) // sp_size
-    sequence_per_rank = [min(step * (i + 1), seq_len) - min(step * i, seq_len) for i in range(sp_size)]
+    step = (seq_len + ulysses_size - 1) // ulysses_size
+    sequence_per_rank = [min(step * (i + 1), seq_len) - min(step * i, seq_len) for i in range(ulysses_size)]
     mask_per_rank = image_masks.split(sequence_per_rank, dim=1)
-    image_lens_per_rank = [mask_per_rank[i].sum().item() for i in range(sp_size)]
-    in_splits, out_splits = all2all_splits(image_lens, image_lens_per_rank, sp_size, sp_rank)
-    local_image_masks = mask_per_rank[sp_rank]
+    image_lens_per_rank = [mask_per_rank[i].sum().item() for i in range(ulysses_size)]
+    in_splits, out_splits = all2all_splits(image_lens, image_lens_per_rank, ulysses_size, ulysses_rank)
+    local_image_masks = mask_per_rank[ulysses_rank]
     return in_splits, out_splits, local_image_masks

@@ -2,7 +2,7 @@
 
 import pytest
 import torch
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock, patch
 
 from xorl.distributed.parallel_state import (
     ParallelState,
@@ -15,445 +15,106 @@ from xorl.distributed.parallel_state import (
 pytestmark = [pytest.mark.cpu, pytest.mark.distributed]
 
 
-class TestInitEPMeshMatrix:
-    """Test suite for init_ep_mesh_matrix function."""
+class TestEPMeshMatrixAndRequiresMesh:
+    """Test init_ep_mesh_matrix layouts and requires_mesh decorator."""
 
-    def test_ep_outside_true(self):
-        """Test EP mesh matrix creation with ep_outside=True."""
-        ep_size = 2
-        ep_fsdp_size = 4
+    def test_ep_mesh_matrix_and_requires_mesh(self):
+        """EP mesh matrix: row-major, transposed, edge cases; requires_mesh raises/allows correctly."""
+        # ep_outside=True: row-major
+        mesh = init_ep_mesh_matrix(ep_size=2, ep_fsdp_size=4, ep_outside=True)
+        assert mesh.shape == (2, 4) and mesh.dtype == torch.int
+        assert torch.equal(mesh, torch.arange(8).view(2, 4))
 
-        mesh = init_ep_mesh_matrix(ep_size=ep_size, ep_fsdp_size=ep_fsdp_size, ep_outside=True)
+        # ep_outside=False: transposed
+        mesh = init_ep_mesh_matrix(ep_size=2, ep_fsdp_size=4, ep_outside=False)
+        assert torch.equal(mesh, torch.arange(8).view(4, 2).transpose(0, 1))
 
-        assert mesh.shape == (ep_size, ep_fsdp_size)
-        assert mesh.dtype == torch.int
-        # Should be row-major: [[0, 1, 2, 3], [4, 5, 6, 7]]
-        expected = torch.arange(8).view(2, 4)
-        assert torch.equal(mesh, expected)
+        # Edge: single ep_size / ep_fsdp_size
+        assert torch.equal(init_ep_mesh_matrix(1, 4, True), torch.arange(4).unsqueeze(0))
+        assert torch.equal(init_ep_mesh_matrix(4, 1, True), torch.arange(4).unsqueeze(1))
 
-    def test_ep_outside_false(self):
-        """Test EP mesh matrix creation with ep_outside=False."""
-        ep_size = 2
-        ep_fsdp_size = 4
-
-        mesh = init_ep_mesh_matrix(ep_size=ep_size, ep_fsdp_size=ep_fsdp_size, ep_outside=False)
-
-        assert mesh.shape == (ep_size, ep_fsdp_size)
-        assert mesh.dtype == torch.int
-        # Should be transposed: [[0, 2, 4, 6], [1, 3, 5, 7]]
-        expected = torch.arange(8).view(4, 2).transpose(0, 1)
-        assert torch.equal(mesh, expected)
-
-    def test_single_ep_size(self):
-        """Test with ep_size=1."""
-        mesh = init_ep_mesh_matrix(ep_size=1, ep_fsdp_size=4, ep_outside=True)
-
-        assert mesh.shape == (1, 4)
-        assert torch.equal(mesh, torch.arange(4).unsqueeze(0))
-
-    def test_single_ep_fsdp_size(self):
-        """Test with ep_fsdp_size=1."""
-        mesh = init_ep_mesh_matrix(ep_size=4, ep_fsdp_size=1, ep_outside=True)
-
-        assert mesh.shape == (4, 1)
-        assert torch.equal(mesh, torch.arange(4).unsqueeze(1))
-
-
-class TestRequiresMeshDecorator:
-    """Test suite for requires_mesh decorator."""
-
-    def test_raises_error_when_mesh_none(self):
-        """Test that decorated method raises error when device_mesh is None."""
-
-        class MockClass:
-            def __init__(self):
-                self.device_mesh = None
-
+        # requires_mesh decorator
+        class MC:
+            def __init__(self, m):
+                self.device_mesh = m
             @requires_mesh
-            def test_method(self):
-                return "success"
+            def go(self):
+                return "ok"
 
-        obj = MockClass()
+        assert MC(Mock()).go() == "ok"
         with pytest.raises(ValueError, match="Device mesh is not initialized"):
-            obj.test_method()
-
-    def test_allows_execution_when_mesh_exists(self):
-        """Test that decorated method executes when device_mesh exists."""
-
-        class MockClass:
-            def __init__(self):
-                self.device_mesh = Mock()
-
-            @requires_mesh
-            def test_method(self):
-                return "success"
-
-        obj = MockClass()
-        result = obj.test_method()
-        assert result == "success"
+            MC(None).go()
 
 
-class TestParallelStateBasic:
-    """Test suite for basic ParallelState functionality."""
+class TestParallelStateConstruction:
+    """Test ParallelState construction, validation, properties, and enabled flags."""
 
     @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=False)
-    def test_default_initialization(self, mock_is_init):
-        """Test ParallelState with default values."""
+    def test_defaults_and_uninitialized_properties(self, mock_is_init):
+        """Default ParallelState: all sizes 1, not initialized, rank/world_size defaults; invalid cp_fsdp_mode raises."""
         state = ParallelState()
+        assert state.dp_size == 1 and state.dp_replicate_size == 1 and state.dp_shard_size == 1
+        assert state.tp_size == 1 and state.ep_size == 1 and state.pp_size == 1
+        assert state.ringattn_size == 1 and state.ulysses_size == 1
+        assert state.dp_mode == "fsdp2" and state.cp_fsdp_mode == "all"
+        assert state.device_mesh is None and state.ep_fsdp_device_mesh is None
+        assert state.is_initialized is False and state.global_rank == -1 and state.world_size == 1
 
-        assert state.dp_size == 1
-        assert state.dp_replicate_size == 1
-        assert state.dp_shard_size == 1
-        assert state.tp_size == 1
-        assert state.ep_size == 1
-        assert state.pp_size == 1
-        assert state.cp_size == 1
-        assert state.ulysses_size == 1
-        assert state.dp_mode == "fsdp2"
-        assert state.sp_fsdp_mode == "all"
-        assert state.device_mesh is None
-        assert state.ep_fsdp_device_mesh is None
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=True)
-    @patch('xorl.distributed.parallel_state.dist.get_world_size', return_value=8)
-    def test_custom_initialization(self, mock_ws, mock_is_init):
-        """Test ParallelState with custom values."""
-        state = ParallelState(
-            dp_size=4,
-            dp_replicate_size=2,
-            dp_shard_size=2,
-            tp_size=2,
-            dp_mode="fsdp2"
-        )
-
-        assert state.dp_size == 4
-        assert state.dp_replicate_size == 2
-        assert state.dp_shard_size == 2
-        assert state.tp_size == 2
-        assert state.dp_mode == "fsdp2"
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=True)
-    @patch('xorl.distributed.parallel_state.dist.get_world_size', return_value=8)
-    def test_validation_world_size_mismatch(self, mock_ws, mock_is_init):
-        """Test that validation fails when parallel sizes don't match world size."""
-        # world_size=8, but we specify sizes that multiply to 4
-        with pytest.raises(ValueError, match="product of parallel sizes should be equal to the world size"):
-            ParallelState(dp_size=2, dp_shard_size=2, tp_size=2)
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=True)
-    @patch('xorl.distributed.parallel_state.dist.get_world_size', return_value=8)
-    def test_validation_dp_sizes_mismatch(self, mock_ws, mock_is_init):
-        """Test that validation fails when dp_replicate_size * dp_shard_size != dp_size."""
-        # world_size=8, dp_size=8, but dp_replicate_size * dp_shard_size = 4 != 8
-        with pytest.raises(ValueError, match="product of dp_replicate_size"):
-            ParallelState(dp_size=8, dp_replicate_size=2, dp_shard_size=2)
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=False)
-    def test_validation_invalid_sp_fsdp_mode(self, mock_is_init):
-        """Test that invalid sp_fsdp_mode raises ValueError."""
-        with pytest.raises(ValueError, match="Invalid sp_fsdp_mode"):
-            ParallelState(sp_fsdp_mode="invalid")
-
-
-class TestParallelStateProperties:
-    """Test suite for ParallelState properties."""
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=False)
-    def test_is_initialized_false(self, mock_is_init):
-        """Test is_initialized property when distributed not initialized."""
-        state = ParallelState()
-        assert state.is_initialized == False
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=True)
-    @patch('xorl.distributed.parallel_state.dist.get_world_size', return_value=1)
-    def test_is_initialized_true(self, mock_ws, mock_is_init):
-        """Test is_initialized property when distributed is initialized."""
-        state = ParallelState()
-        assert state.is_initialized == True
-
-    @patch.dict('os.environ', {'LOCAL_RANK': '3'})
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=False)
-    def test_local_rank_from_env(self, mock_is_init):
-        """Test local_rank reads from environment variable."""
-        state = ParallelState()
-        assert state.local_rank == 3
-
-    @patch.dict('os.environ', {}, clear=True)
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=False)
-    def test_local_rank_default(self, mock_is_init):
-        """Test local_rank returns -1 when not set."""
-        state = ParallelState()
-        assert state.local_rank == -1
+        with pytest.raises(ValueError, match="Invalid cp_fsdp_mode"):
+            ParallelState(cp_fsdp_mode="invalid")
 
     @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=True)
     @patch('xorl.distributed.parallel_state.dist.get_rank', return_value=5)
-    @patch('xorl.distributed.parallel_state.dist.get_world_size', return_value=1)
-    def test_global_rank_when_initialized(self, mock_ws, mock_get_rank, mock_is_init):
-        """Test global_rank when distributed is initialized."""
-        state = ParallelState()
-        assert state.global_rank == 5
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=False)
-    def test_global_rank_when_not_initialized(self, mock_is_init):
-        """Test global_rank returns -1 when not initialized."""
-        state = ParallelState()
-        assert state.global_rank == -1
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=True)
-    @patch('xorl.distributed.parallel_state.dist.get_world_size', return_value=1)
-    def test_world_size_when_initialized(self, mock_get_ws, mock_is_init):
-        """Test world_size when distributed is initialized."""
-        state = ParallelState()
-        assert state.world_size == 1
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=False)
-    def test_world_size_when_not_initialized(self, mock_is_init):
-        """Test world_size returns 1 when not initialized."""
-        state = ParallelState()
-        assert state.world_size == 1
-
-
-class TestParallelStateEnabledFlags:
-    """Test suite for enabled flag properties."""
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=True)
-    @patch('xorl.distributed.parallel_state.dist.get_world_size', return_value=4)
-    def test_dp_enabled_true(self, mock_ws, mock_is_init):
-        """Test dp_enabled returns True when dp_size > 1."""
-        state = ParallelState(dp_size=4, dp_shard_size=4)
-        assert state.dp_enabled == True
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=False)
-    def test_dp_enabled_false(self, mock_is_init):
-        """Test dp_enabled returns False when dp_size == 1."""
-        state = ParallelState(dp_size=1)
-        assert state.dp_enabled == False
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=True)
-    @patch('xorl.distributed.parallel_state.dist.get_world_size', return_value=2)
-    def test_tp_enabled_true(self, mock_ws, mock_is_init):
-        """Test tp_enabled returns True when tp_size > 1."""
-        state = ParallelState(tp_size=2)
-        assert state.tp_enabled == True
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=False)
-    def test_tp_enabled_false(self, mock_is_init):
-        """Test tp_enabled returns False when tp_size == 1."""
-        state = ParallelState(tp_size=1)
-        assert state.tp_enabled == False
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=True)
-    @patch('xorl.distributed.parallel_state.dist.get_world_size', return_value=2)
-    def test_pp_enabled_true(self, mock_ws, mock_is_init):
-        """Test pp_enabled returns True when pp_size > 1."""
-        state = ParallelState(pp_size=2)
-        assert state.pp_enabled == True
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=False)
-    def test_pp_enabled_false(self, mock_is_init):
-        """Test pp_enabled returns False when pp_size == 1."""
-        state = ParallelState(pp_size=1)
-        assert state.pp_enabled == False
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=False)
-    def test_ep_enabled_true(self, mock_is_init):
-        """Test ep_enabled returns True when ep_size > 1."""
-        state = ParallelState(ep_size=2)
-        assert state.ep_enabled == True
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=False)
-    def test_ep_enabled_false(self, mock_is_init):
-        """Test ep_enabled returns False when ep_size == 1."""
-        state = ParallelState(ep_size=1)
-        assert state.ep_enabled == False
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=True)
-    @patch('xorl.distributed.parallel_state.dist.get_world_size', return_value=2)
+    @patch('xorl.distributed.parallel_state.dist.get_world_size', return_value=8)
     @patch('xorl.distributed.sequence_parallel.init_sequence_parallel')
-    def test_sp_enabled_with_ulysses(self, mock_init_sp, mock_ws, mock_is_init):
-        """Test sp_enabled returns True when ulysses_size > 1."""
-        state = ParallelState(ulysses_size=2)
-        assert state.sp_enabled == True
-        # Verify that init_sequence_parallel was called since device_mesh is None
-        mock_init_sp.assert_called_once()
+    def test_custom_init_validation_and_enabled_flags(self, mock_sp, mock_ws, mock_rank, mock_init):
+        """Custom init; validation errors; initialized properties; sp/fsdp enabled flags."""
+        state = ParallelState(dp_size=4, dp_replicate_size=2, dp_shard_size=2, tp_size=2)
+        assert state.dp_size == 4 and state.tp_size == 2
+        assert state.is_initialized is True and state.global_rank == 5
 
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=False)
-    def test_sp_enabled_false(self, mock_is_init):
-        """Test sp_enabled returns False when both cp and ulysses are 1."""
-        state = ParallelState(cp_size=1, ulysses_size=1)
-        assert state.sp_enabled == False
+        with pytest.raises(ValueError, match="product of parallel sizes should be equal to the world size"):
+            ParallelState(dp_size=2, dp_shard_size=2, tp_size=2)
+        with pytest.raises(ValueError, match="product of dp_replicate_size"):
+            ParallelState(dp_size=8, dp_replicate_size=2, dp_shard_size=2)
 
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=True)
-    @patch('xorl.distributed.parallel_state.dist.get_world_size', return_value=2)
-    @patch('xorl.distributed.sequence_parallel.init_sequence_parallel')
-    def test_sp_size_calculation(self, mock_init_sp, mock_ws, mock_is_init):
-        """Test sp_size is product of ulysses_size and cp_size."""
-        state = ParallelState(ulysses_size=2)
-        assert state.sp_size == 2
+        state2 = ParallelState(dp_size=4, dp_shard_size=4, ulysses_size=2)
+        assert state2.cp_enabled is True and state2.cp_size == 2 and state2.dp_shard_cp_enabled is True
 
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=False)
-    def test_fsdp_enabled_with_fsdp2(self, mock_is_init):
-        """Test fsdp_enabled is True with fsdp2 mode."""
-        state = ParallelState(dp_mode="fsdp2")
-        assert state.fsdp_enabled == True
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=False)
-    def test_fsdp_enabled_with_ddp(self, mock_is_init):
-        """Test fsdp_enabled is False with ddp mode."""
-        state = ParallelState(dp_mode="ddp")
-        assert state.fsdp_enabled == False
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=True)
-    @patch('xorl.distributed.parallel_state.dist.get_world_size', return_value=4)
-    def test_fsdp_size_calculation(self, mock_ws, mock_is_init):
-        """Test fsdp_size calculation."""
-        state = ParallelState(pp_size=2, tp_size=2)
-        # world_size=4, pp_size=2, tp_size=2 -> fsdp_size = 4 / (2 * 2) = 1
-        assert state.fsdp_size == 1
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=True)
-    @patch('xorl.distributed.parallel_state.dist.get_world_size', return_value=2)
-    @patch('xorl.distributed.sequence_parallel.init_sequence_parallel')
-    def test_ulysses_enabled_true(self, mock_init_sp, mock_ws, mock_is_init):
-        """Test ulysses_enabled returns True when ulysses_size > 1."""
-        state = ParallelState(ulysses_size=2)
-        assert state.ulysses_enabled == True
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=False)
-    def test_ulysses_enabled_false(self, mock_is_init):
-        """Test ulysses_enabled returns False when ulysses_size == 1."""
-        state = ParallelState(ulysses_size=1)
-        assert state.ulysses_enabled == False
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=True)
-    @patch('xorl.distributed.parallel_state.dist.get_world_size', return_value=4)
-    def test_dp_replicate_enabled_true(self, mock_ws, mock_is_init):
-        """Test dp_replicate_enabled returns True when dp_replicate_size > 1."""
-        state = ParallelState(dp_size=4, dp_replicate_size=2, dp_shard_size=2)
-        assert state.dp_replicate_enabled == True
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=False)
-    def test_dp_replicate_enabled_false(self, mock_is_init):
-        """Test dp_replicate_enabled returns False when dp_replicate_size == 1."""
-        state = ParallelState(dp_replicate_size=1)
-        assert state.dp_replicate_enabled == False
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=True)
-    @patch('xorl.distributed.parallel_state.dist.get_world_size', return_value=2)
-    def test_dp_shard_enabled_true(self, mock_ws, mock_is_init):
-        """Test dp_shard_enabled returns True when dp_shard_size >= 1."""
-        state = ParallelState(dp_size=2, dp_shard_size=2)
-        assert state.dp_shard_enabled == True
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=True)
-    @patch('xorl.distributed.parallel_state.dist.get_world_size', return_value=4)
-    @patch('xorl.distributed.sequence_parallel.init_sequence_parallel')
-    def test_dp_shard_sp_enabled(self, mock_init_sp, mock_ws, mock_is_init):
-        """Test dp_shard_sp_enabled is True when both dp_shard and sp are enabled."""
-        state = ParallelState(dp_size=2, dp_shard_size=2, ulysses_size=2)
-        assert state.dp_shard_sp_enabled == True
+        state3 = ParallelState(pp_size=2, tp_size=2, dp_size=2, dp_shard_size=2)
+        assert state3.fsdp_size == 2  # 8 / (2 * 2)
 
 
-class TestGetParallelState:
-    """Test suite for get_parallel_state function."""
+class TestGetAndInitParallelState:
+    """Test get_parallel_state and init_parallel_state functions."""
 
     def setup_method(self):
-        """Clear the global parallel state before each test."""
         import xorl.distributed.parallel_state as ps_module
         ps_module._PARALLEL_STATE = None
 
     def teardown_method(self):
-        """Clear the global parallel state after each test."""
         import xorl.distributed.parallel_state as ps_module
         ps_module._PARALLEL_STATE = None
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=False)
-    def test_returns_default_when_not_initialized(self, mock_is_init):
-        """Test get_parallel_state returns default state when not initialized."""
-        state = get_parallel_state()
-
-        assert isinstance(state, ParallelState)
-        assert state.dp_size == 1
-        assert state.tp_size == 1
-
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=True)
-    @patch('xorl.distributed.parallel_state.dist.get_world_size', return_value=4)
-    def test_returns_initialized_state(self, mock_ws, mock_is_init):
-        """Test get_parallel_state returns initialized state."""
-        import xorl.distributed.parallel_state as ps_module
-
-        # Manually set the global state
-        ps_module._PARALLEL_STATE = ParallelState(dp_size=4, dp_shard_size=4)
-
-        state = get_parallel_state()
-        assert state.dp_size == 4
-
-
-class TestInitParallelState:
-    """Test suite for init_parallel_state function."""
-
-    def setup_method(self):
-        """Clear the global parallel state before each test."""
-        import xorl.distributed.parallel_state as ps_module
-        ps_module._PARALLEL_STATE = None
-
-    def teardown_method(self):
-        """Clear the global parallel state after each test."""
-        import xorl.distributed.parallel_state as ps_module
-        ps_module._PARALLEL_STATE = None
-
-    @patch('xorl.distributed.parallel_state.is_torch_version_greater_than', return_value=False)
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=False)
-    def test_initializes_default_state(self, mock_is_init, mock_version):
-        """Test init_parallel_state with default parameters."""
-        init_parallel_state()
-
-        state = get_parallel_state()
-        assert state.dp_size == 1
-        assert state.tp_size == 1
 
     @patch('xorl.distributed.parallel_state.is_torch_version_greater_than', return_value=False)
     @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=True)
     @patch('xorl.distributed.parallel_state.dist.get_world_size', return_value=8)
-    def test_initializes_custom_state(self, mock_ws, mock_is_init, mock_version):
-        """Test init_parallel_state with custom parameters."""
+    def test_init_get_reinit_auto_dp_shard_default(self, mock_ws, mock_is_init, mock_version):
+        """init sets state, get retrieves, re-init warns, auto dp_shard_size, get default when unset."""
         init_parallel_state(dp_size=4, tp_size=2, dp_mode="fsdp2")
-
         state = get_parallel_state()
-        assert state.dp_size == 4
-        assert state.tp_size == 2
-        assert state.dp_mode == "fsdp2"
+        assert state.dp_size == 4 and state.tp_size == 2 and state.dp_mode == "fsdp2"
+
+        with patch('xorl.distributed.parallel_state.logger.warning') as mock_warn:
+            init_parallel_state(dp_size=8)
+            mock_warn.assert_called_once_with("Parallel state has already been initialized.")
+        assert get_parallel_state().dp_size == 4
 
     @patch('xorl.distributed.parallel_state.is_torch_version_greater_than', return_value=False)
     @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=True)
     @patch('xorl.distributed.parallel_state.dist.get_world_size', return_value=4)
-    def test_auto_sets_dp_shard_size(self, mock_ws, mock_is_init, mock_version):
-        """Test that dp_shard_size is automatically set to dp_size when needed."""
+    def test_auto_dp_shard_and_default_uninitialized(self, mock_ws, mock_is_init, mock_version):
+        """Auto dp_shard_size; device_type defaults; get_parallel_state returns default when unset."""
         init_parallel_state(dp_size=4)
-
-        state = get_parallel_state()
-        assert state.dp_shard_size == 4
-
-    @patch('xorl.distributed.parallel_state.is_torch_version_greater_than', return_value=False)
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=True)
-    @patch('xorl.distributed.parallel_state.dist.get_world_size', return_value=2)
-    def test_warns_when_already_initialized(self, mock_ws, mock_is_init, mock_version):
-        """Test that initializing twice produces a warning."""
-        init_parallel_state(dp_size=2, dp_shard_size=2)
-
-        with patch('xorl.distributed.parallel_state.logger.warning') as mock_warn:
-            init_parallel_state(dp_size=4)
-            mock_warn.assert_called_once_with("Parallel state has already been initialized.")
-
-        # State should not change
-        state = get_parallel_state()
-        assert state.dp_size == 2
-
-    @patch('xorl.distributed.parallel_state.is_torch_version_greater_than', return_value=False)
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=False)
-    def test_device_type_default(self, mock_is_init, mock_version):
-        """Test that device_type defaults to cuda/cpu based on availability."""
-        init_parallel_state()
-
-        state = get_parallel_state()
-        assert state.device_type in ["cuda", "cpu"]
+        assert get_parallel_state().dp_shard_size == 4
+        assert get_parallel_state().device_type in ["cuda", "cpu"]

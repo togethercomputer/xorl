@@ -6,24 +6,12 @@ Pydantic type definitions for FastAPI endpoints in the unified API server.
 
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
 
 # ============================================================================
 # Two-Phase Async Response Types
 # ============================================================================
-
-
-class UntypedAPIFutureResponse(BaseModel):
-    """Phase 1 response - returned immediately after request submission.
-
-    The client receives this response with a request_id, then polls
-    /api/v1/retrieve_future to get the actual result.
-    """
-
-    request_id: str = Field(..., description="Unique identifier for retrieving the result")
-    model_id: Optional[str] = Field(default=None, description="Model identifier for the request")
-
 
 
 # ============================================================================
@@ -61,6 +49,20 @@ class Datum(BaseModel):
     model_input: Dict[str, InputType] = Field(..., description="Model input tensors (input_ids, position_ids, etc.)")
     loss_fn_inputs: Dict[str, InputType] = Field(..., description="Loss function input tensors (e.g., labels)")
 
+    @model_validator(mode="before")
+    @classmethod
+    def _convert_tinker_format(cls, data):
+        """Accept tinker's {chunks: [{tokens: [...]}]} and convert to {input_ids: [...]}."""
+        if isinstance(data, dict):
+            mi = data.get("model_input")
+            if isinstance(mi, dict) and "chunks" in mi:
+                tokens = []
+                for chunk in mi["chunks"]:
+                    if isinstance(chunk, dict) and "tokens" in chunk:
+                        tokens.extend(chunk["tokens"])
+                data["model_input"] = {"input_ids": tokens}
+        return data
+
     def to_plain_dict(self) -> Dict[str, Any]:
         """Convert to plain dictionary with TensorData objects converted to lists.
 
@@ -81,6 +83,8 @@ class Datum(BaseModel):
 class DatumInput(BaseModel):
     """Input containing list of data examples and loss function."""
 
+    model_config = ConfigDict(extra="ignore")
+
     data: List[Datum] = Field(..., description="List of training/inference examples")
     loss_fn: str = Field(default="causallm_loss", description="Loss function type")
     loss_fn_params: Optional[Dict[str, Any]] = Field(
@@ -98,6 +102,14 @@ class DatumInput(BaseModel):
         ),
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _map_tinker_fields(cls, data):
+        """Map tinker's loss_fn_config to loss_fn_params."""
+        if isinstance(data, dict) and "loss_fn_config" in data and "loss_fn_params" not in data:
+            data["loss_fn_params"] = data.pop("loss_fn_config")
+        return data
+
 
 class LossFnOutput(BaseModel):
     """Single loss function output.
@@ -113,6 +125,17 @@ class LossFnOutput(BaseModel):
     loss: Optional[float] = Field(default=None, description="Loss value (for backward compatibility)")
     logprobs: Optional[TensorData] = Field(default=None, description="Per-token log probabilities")
     elementwise_loss: Optional[TensorData] = Field(default=None, description="Per-token cross entropy loss")
+
+    @field_serializer("loss")
+    def _serialize_loss_as_tensor_data(self, v, _info):
+        """Wrap scalar loss as TensorData dict for tinker SDK compatibility.
+
+        Tinker SDK expects LossFnOutput = Dict[str, TensorData], so scalar
+        loss values must be serialized as TensorData on the wire.
+        """
+        if v is not None:
+            return {"data": [v], "dtype": "float32", "shape": [1]}
+        return v
 
     def model_dump(self, **kwargs):
         """Override to always exclude None values for tinker compatibility."""
@@ -144,6 +167,8 @@ class AdamParams(BaseModel):
 class ForwardRequest(BaseModel):
     """API request for forward operation."""
 
+    model_config = ConfigDict(extra="ignore")
+
     model_id: str = Field(
         default="default", description="Model identifier (must be created via /api/v1/create_model first)"
     )
@@ -168,6 +193,8 @@ class ForwardResponse(BaseModel):
 class ForwardBackwardRequest(BaseModel):
     """API request for forward-backward operation."""
 
+    model_config = ConfigDict(extra="ignore")
+
     model_id: str = Field(
         default="default", description="Model identifier (must be created via /api/v1/create_model first)"
     )
@@ -190,6 +217,8 @@ class ForwardBackwardResponse(BaseModel):
 class OptimStepRequest(BaseModel):
     """API request for optimizer step."""
 
+    model_config = ConfigDict(extra="ignore")
+
     model_id: str = Field(
         default="default", description="Model identifier (must be created via /api/v1/create_model first)"
     )
@@ -211,41 +240,6 @@ class OptimStepResponse(BaseModel):
 # ============================================================================
 # Generation Operations
 # ============================================================================
-
-
-class Prompt(BaseModel):
-    """Single prompt for generation."""
-
-    input_ids: List[int] = Field(..., description="Input token IDs")
-
-
-class SampleRequest(BaseModel):
-    """API request for sampling/generation."""
-
-    model_id: str = Field(
-        default="default", description="Model identifier (must be created via /api/v1/create_model first)"
-    )
-    prompts: List[Prompt] = Field(..., description="List of prompts to generate from")
-    max_new_tokens: int = Field(default=256, description="Maximum number of tokens to generate")
-    temperature: float = Field(default=1.0, description="Sampling temperature (higher = more random)")
-    top_p: float = Field(default=1.0, description="Nucleus sampling threshold")
-    top_k: Optional[int] = Field(default=None, description="Top-k sampling threshold (None = disabled)")
-    do_sample: bool = Field(default=True, description="Whether to use sampling vs greedy decoding")
-
-
-class GeneratedOutput(BaseModel):
-    """Single generated output."""
-
-    prompt_length: int = Field(..., description="Length of input prompt in tokens")
-    generated_tokens: List[int] = Field(..., description="Generated token IDs")
-    generated_length: int = Field(..., description="Number of tokens generated")
-
-
-class SampleResponse(BaseModel):
-    """API response for sampling/generation."""
-
-    outputs: List[GeneratedOutput] = Field(..., description="Generated outputs for each prompt")
-    info: Dict[str, Any] = Field(..., description="Additional information (sample_time, etc.)")
 
 
 # ============================================================================
@@ -285,7 +279,7 @@ class LoadWeightsRequest(BaseModel):
 
     model_id: str = Field(default="default", description="Model identifier")
     path: str = Field(..., description="Xorl URI to load from (e.g., xorl://default/weights/checkpoint-001)")
-    optimizer: bool = Field(default=False, description="Whether to load optimizer state")
+    optimizer: bool = Field(default=True, description="Whether to load optimizer state")
     seq_id: Optional[int] = Field(default=None, description="Sequence ID for request ordering")
 
 
@@ -321,9 +315,24 @@ class WeightsInfoResponse(BaseModel):
 class CreateModelRequest(BaseModel):
     """API request for creating a new model."""
 
+    model_config = ConfigDict(extra="ignore")
+
     model_id: str = Field(default="default", description="Model identifier")
     base_model: str = Field(..., description="Base model name (e.g., 'Qwen/Qwen2.5-3B-Instruct')")
-    lora_config: Dict[str, Any] = Field(..., description="LoRA configuration (rank, alpha, etc.)")
+    lora_config: Dict[str, Any] = Field(default_factory=dict, description="LoRA configuration (rank, alpha, etc.)")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_tinker_fields(cls, data):
+        """Map tinker's session_id to model_id if model_id not provided."""
+        if isinstance(data, dict):
+            if "session_id" in data and "model_id" not in data:
+                data["model_id"] = data["session_id"]
+            # Tinker sends lora_config with "rank" key; normalize to also include lora_rank
+            lora_cfg = data.get("lora_config")
+            if isinstance(lora_cfg, dict) and "rank" in lora_cfg and "lora_rank" not in lora_cfg:
+                lora_cfg["lora_rank"] = lora_cfg["rank"]
+        return data
 
 
 class CreateModelResponse(BaseModel):
@@ -432,35 +441,6 @@ class SaveWeightsForSamplerResponse(BaseModel):
 
     path: str = Field(..., description="Xorl URI for the saved checkpoint (e.g., 'xorl://model-0/sampler_weights/step-100')")
 
-
-
-class SaveFullWeightsSafetensorsRequest(BaseModel):
-    """API request for saving full model weights as safetensors (SGLang-compatible).
-
-    This saves the complete model weights (not just LoRA) in safetensors format
-    with config files, allowing direct loading by SGLang or other inference engines.
-
-    Endpoint: POST /api/v1/save_full_weights_safetensors
-    """
-
-    model_id: str = Field(default="default", description="Model identifier")
-    name: str = Field(..., description="Checkpoint name (e.g., 'checkpoint-001')")
-    dtype: str = Field(
-        default="bfloat16",
-        description="Target dtype for weights (bfloat16, float16, float32)",
-    )
-    base_model_path: Optional[str] = Field(
-        default=None,
-        description="Path to base model for config files. If None, uses server's configured model_path.",
-    )
-
-
-class SaveFullWeightsSafetensorsResponse(BaseModel):
-    """API response for saving full weights as safetensors."""
-
-    path: str = Field(..., description="Filesystem path to saved safetensors directory")
-    dtype: str = Field(..., description="Dtype used for saving")
-    num_shards: int = Field(..., description="Number of safetensor shards created")
 
 
 # ============================================================================
@@ -572,6 +552,12 @@ class InferenceEndpointServerInfo(BaseModel):
     model_path: Optional[str] = Field(default=None, description="Model path loaded on the server")
     served_model_name: Optional[str] = Field(default=None, description="Served model name")
     tp_size: Optional[int] = Field(default=None, description="Tensor parallelism size")
+    quantization: Optional[str] = Field(default=None, description="Quantization method reported by SGLang (e.g., 'fp8')")
+    quantization_config: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Full HF quantization_config dict auto-detected from model's config.json",
+    )
+    dtype: Optional[str] = Field(default=None, description="Model dtype (e.g., 'auto', 'bfloat16')")
     enable_lora: Optional[bool] = Field(default=None, description="Whether LoRA is enabled")
     max_lora_rank: Optional[int] = Field(default=None, description="Maximum LoRA rank supported")
     version: Optional[str] = Field(default=None, description="SGLang version")
@@ -654,44 +640,34 @@ class RemoveInferenceEndpointResponse(BaseModel):
 
 
 class SyncInferenceWeightsRequest(BaseModel):
-    """API request for synchronizing weights to inference endpoints.
+    """API request for synchronizing full model weights to inference endpoints."""
 
-    Supports three sync methods:
-    - "nccl_ep_scatter" (default): Multi-rank EP scatter for MoE models, 5-7x faster.
-      Falls back to "nccl" if EP scatter conditions aren't met.
-    - "nccl": Uses NCCL broadcast with pause/resume protocol.
-      Requires CUDA graph recapture after sync (~30-60s overhead).
-    - "ps": Uses checkpoint-engine ParameterServer protocol.
-      Avoids CUDA graph recapture via in-place weight updates (~0s overhead).
-      Requires checkpoint-engine package and SGLang with IPC support.
-    - "rdma_direct": Uses RDMA direct writes from training to inference GPU memory.
-      PUSH model where training writes directly to SGLang's registered GPU addresses.
-      Avoids CUDA graph recapture. Requires mooncake and SGLang with --enable-rdma-weight-updates.
-    """
-
-    sync_method: Literal["nccl", "nccl_ep_scatter", "ps", "rdma_direct"] = Field(
-        default="nccl_ep_scatter",
-        description=(
-            "Weight sync method: 'nccl' (uses pause/resume protocol with pipelined broadcast), "
-            "'nccl_ep_scatter' (multi-rank EP scatter for MoE models, 5-7x faster), "
-            "'ps' (ParameterServer protocol, avoids CUDA graph recapture), or "
-            "'rdma_direct' (RDMA PUSH model, writes directly to inference GPU memory)"
-        ),
-    )
     master_address: str = Field(
         default="", description="Master address for NCCL rendezvous (training server address). Auto-detected if empty."
     )
     master_port: int = Field(default=29600, description="Master port for NCCL rendezvous")
     group_name: str = Field(default="weight_sync_group", description="Name of the NCCL process group")
     buffer_size_mb: int = Field(default=1024, description="Size of each transfer bucket in MB (to avoid OOM)")
-    # ParameterServer-specific options
-    checkpoint_name: str = Field(
-        default="xorl-training",
-        description="Checkpoint name for ParameterServer registration (only used with sync_method='ps')",
+    flush_cache: bool = Field(
+        default=True,
+        description="Whether to flush inference KV cache after weight sync. "
+        "Set to False to keep cached KV when weights haven't changed significantly.",
+    )
+    pause_mode: Literal["retract", "abort", "in_place"] = Field(
+        default="retract",
+        description="How to pause inference during weight sync. "
+        "'retract' (default): retract running requests to waiting queue, re-execute after resume. "
+        "'abort': abort and return all in-flight requests. "
+        "'in_place': keep requests in place with KV cache (flush_cache must be False).",
     )
     weight_version: Optional[str] = Field(
         default=None,
-        description="Version string for weight tracking (only used with sync_method='ps')",
+        description="Version string for weight tracking",
+    )
+    quantization: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="HF quantization_config dict for weight sync. "
+        "If None, uses the default set via set_sync_quantization or auto-detected from endpoint.",
     )
 
 
@@ -718,60 +694,33 @@ class SyncInferenceWeightsResponse(BaseModel):
     )
 
 
-# ============================================================================
-# Persistent Connection Management
-# ============================================================================
+class SetSyncQuantizationRequest(BaseModel):
+    """API request to set the default quantization format for weight sync.
 
+    Accepts HF quantization_config format, e.g.:
+        {"quant_method": "fp8", "weight_block_size": [128, 128]}
+    or with modules_to_not_convert:
+        {"quant_method": "fp8", "weight_block_size": [128, 128],
+         "modules_to_not_convert": ["lm_head", "model.layers.0.input_layernorm", ...]}
 
-class ConnectInferenceEndpointRequest(BaseModel):
-    """API request for establishing a persistent NCCL connection to inference endpoints.
-
-    This should be called once at the start of an RL training loop to avoid
-    connection overhead during frequent weight syncs.
+    Set to null to disable quantization (bf16).
     """
 
-    master_address: str = Field(
-        default="", description="Master address for NCCL rendezvous (training server address). Auto-detected if empty."
-    )
-    master_port: int = Field(default=29600, description="Master port for NCCL rendezvous")
-    group_name: str = Field(default="weight_sync_group", description="Name of the NCCL process group")
-    buffer_size_mb: int = Field(default=256, description="Size of transfer buffer in MB")
-
-
-class ConnectedEndpoint(BaseModel):
-    """Information about a successfully connected endpoint."""
-
-    host: str = Field(..., description="Hostname or IP address of the endpoint")
-    port: int = Field(..., description="Port number of the endpoint")
-    world_size: int = Field(default=1, description="Number of workers at this endpoint")
-
-
-class ConnectInferenceEndpointResponse(BaseModel):
-    """API response for connection establishment."""
-
-    success: bool = Field(..., description="Whether connection was established successfully")
-    message: str = Field(..., description="Status message")
-    connected_endpoints: List[ConnectedEndpoint] = Field(
-        default_factory=list, description="List of successfully connected endpoints"
+    quantization: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="HF quantization_config dict. Must contain 'quant_method' (e.g. 'fp8'). "
+        "Optional fields: 'weight_block_size' (default [128, 128]), "
+        "'modules_to_not_convert' (list of module name prefixes to skip), "
+        "'fmt' (e.g. 'e4m3'), 'activation_scheme'. "
+        "Set to null for bf16 (no quantization).",
     )
 
 
-class DisconnectInferenceEndpointRequest(BaseModel):
-    """API request for disconnecting from inference endpoints.
+class SetSyncQuantizationResponse(BaseModel):
+    """API response for setting sync quantization format."""
 
-    This cleans up NCCL process groups. Call at the end of an RL training
-    loop or when changing inference endpoints.
-    """
-
-    pass  # No parameters needed
-
-
-class DisconnectInferenceEndpointResponse(BaseModel):
-    """API response for disconnection."""
-
-    success: bool = Field(..., description="Whether disconnection was successful")
+    quantization: Optional[Dict[str, Any]] = Field(..., description="Current quantization config after update")
     message: str = Field(..., description="Status message")
-
 
 
 # ============================================================================
@@ -877,23 +826,6 @@ class TryAgainResponse(BaseModel):
         default="active", description="Current state of the request in the queue"
     )
     queue_state_reason: Optional[str] = Field(default=None, description="Reason for the current queue state")
-
-
-class RequestErrorCategory(str):
-    """Category of error that caused a request to fail.
-
-    Values align with Tinker's RequestErrorCategory:
-    - Unknown: Error category could not be determined
-    - Server: Server-side error (may be retryable)
-    - User: User/client error (not retryable)
-
-    Note: Using str base class for JSON serialization compatibility.
-    Values are lowercase strings: "unknown", "server", "user"
-    """
-
-    Unknown = "unknown"
-    Server = "server"
-    User = "user"
 
 
 class RequestFailedResponse(BaseModel):

@@ -233,26 +233,6 @@ def group_gemm_same_nk(
     return c
 
 
-def _get_cuda_autotune_config_mn():
-    return [
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP": 8},
-            num_stages=3,
-            num_warps=8,
-        ),
-        triton.Config(
-            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP": 8},
-            num_stages=3,
-            num_warps=8,
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP": 8},
-            num_stages=4,
-            num_warps=4,
-        ),
-    ]
-
-
 @triton.autotune(
     configs=_get_cuda_autotune_config(),
     key=["M", "N"],

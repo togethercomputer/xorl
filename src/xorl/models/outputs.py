@@ -29,7 +29,6 @@ class MoeModelOutput(ModelOutput):
 class CausalLMOutput(ModelOutput):
     loss: Optional[torch.FloatTensor] = None
     logits: Optional[torch.FloatTensor] = None
-    attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
     last_hidden_state: Optional[torch.FloatTensor] = None
 
 
@@ -39,7 +38,6 @@ class MoeCausalLMOutput(ModelOutput):
     logits: Optional[torch.FloatTensor] = None
     aux_loss: Optional[torch.FloatTensor] = None
     router_logits: Optional[Tuple[torch.FloatTensor]] = None
-    attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
     last_hidden_state: Optional[torch.FloatTensor] = None
 
 

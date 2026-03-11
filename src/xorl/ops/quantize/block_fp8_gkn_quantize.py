@@ -44,16 +44,15 @@ _dequant_configs = [
 @triton.jit
 def _block_fp8_quantize_gkn_kernel(
     x_ptr, y_ptr, s_ptr,
-    M, N, clip_ratio, seed,
+    M, N,
     BLOCK_SIZE: tl.constexpr,
-    STOCHASTIC: tl.constexpr,
 ):
     """2D block-based quantization kernel for weight matrices.
 
     Each program processes a BLOCK_SIZE x BLOCK_SIZE tile:
-      - Compute per-tile scale: max(abs(tile)) / 448.0 * clip_ratio
+      - Compute per-tile scale: max(abs(tile)) / 448.0
       - Guard: s = max(s, 1e-12)
-      - Quantize to FP8 E4M3 (with optional stochastic rounding)
+      - Quantize to FP8 E4M3
     """
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -64,17 +63,8 @@ def _block_fp8_quantize_gkn_kernel(
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     s = tl.max(tl.abs(x)) / 448.0
-    # Apply clip_ratio: reduce scale to clip outliers (values > clip_ratio * max get saturated)
-    s = s * clip_ratio
     s = tl.maximum(s, 1e-12)
     y = x / s
-    if STOCHASTIC:
-        # Add noise proportional to ULP before rounding to fp8.
-        # ULP of fp8 e4m3 at |y| is approximately |y| * 2^-3 = |y| * 0.125
-        # Noise ~ Uniform(-0.5, 0.5) * ulp makes rounding unbiased.
-        noise = tl.rand(seed, offs) - 0.5
-        ulp = tl.abs(y) * 0.125 + 1e-6  # guard for zero
-        y = y + noise * ulp
     y = y.to(y_ptr.dtype.element_ty)
     tl.store(y_ptr + offs, y, mask=mask)
     tl.store(s_ptr + pid_m * n_blocks + pid_n, s)
@@ -82,19 +72,15 @@ def _block_fp8_quantize_gkn_kernel(
 
 def block_fp8_quantize_gkn(
     x: torch.Tensor, block_size: int = 128,
-    clip_ratio: float = 1.0,
-    stochastic_rounding: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize a 2D weight matrix to FP8 using 2D block-based quantization.
 
     Each block_size x block_size tile gets its own scale factor computed as
-    max(abs(tile)) / 448.0 * clip_ratio.
+    max(abs(tile)) / 448.0.
 
     Args:
         x: Weight matrix of shape (K, N), any float dtype. Must be contiguous.
         block_size: Tile size for both dimensions (default: 128).
-        clip_ratio: Scale clipping ratio (0.0-1.0). Lower = more clipping.
-        stochastic_rounding: If True, add noise before FP8 cast for unbiased rounding.
 
     Returns:
         Tuple of (y, s):
@@ -112,10 +98,9 @@ def block_fp8_quantize_gkn(
         triton.cdiv(M, block_size),
         triton.cdiv(N, block_size),
     )
-    seed = 0 if not stochastic_rounding else torch.randint(0, 2**31, (1,)).item()
     _block_fp8_quantize_gkn_kernel[grid](
-        x, y, s, M, N, clip_ratio, seed,
-        BLOCK_SIZE=block_size, STOCHASTIC=stochastic_rounding,
+        x, y, s, M, N,
+        BLOCK_SIZE=block_size,
     )
     return y, s
 

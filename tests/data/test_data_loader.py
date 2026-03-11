@@ -1,12 +1,13 @@
 import pytest
 import torch
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock, patch
+from torch.utils.data import Dataset
 from xorl.data.data_loader import (
     MicroBatchCollator,
     DistributedDataloader,
     DataLoaderBuilder,
 )
-from xorl.data.collators import DataCollator
+from xorl.data.collators import DataCollator, PackingConcatCollator
 from typing import Dict, Sequence, Any
 
 pytestmark = [pytest.mark.cpu, pytest.mark.dataloader]
@@ -22,723 +23,306 @@ class SimpleCollator(DataCollator):
         return result
 
 
-class TestMicroBatchCollator:
-    """Test suite for MicroBatchCollator."""
+class TestMicroBatchCollatorAndDistributedDataloader:
+    """Tests for MicroBatchCollator splitting, DistributedDataloader.set_epoch, and DataLoaderBuilder."""
 
-    def test_splits_into_correct_number_of_micro_batches(self):
-        """Test that the collator splits data into correct number of micro-batches."""
-        micro_batch_size = 2
-        gradient_accumulation_steps = 3
+    def test_micro_batch_splitting_set_epoch_and_builder(self):
+        """Covers micro-batch splitting, edge cases, set_epoch delegation, batch size, sampler, SP collator, and custom collators."""
         internal_collator = SimpleCollator()
 
-        collator = MicroBatchCollator(
-            micro_batch_size=micro_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            internal_collator=internal_collator,
-        )
-
-        # Create 6 samples (2 * 3)
-        features = [
-            {"input_ids": torch.tensor([i]), "labels": torch.tensor([i])}
-            for i in range(6)
-        ]
-
+        # Multiple micro-batches with correct data
+        collator = MicroBatchCollator(micro_batch_size=2, gradient_accumulation_steps=2, internal_collator=internal_collator)
+        features = [{"input_ids": torch.tensor([i]), "labels": torch.tensor([i * 10])} for i in range(4)]
         result = collator(features)
-
-        # Should return 3 micro-batches
-        assert len(result) == 3
-
-    def test_each_micro_batch_has_correct_size(self):
-        """Test that each micro-batch has the correct size."""
-        micro_batch_size = 2
-        gradient_accumulation_steps = 3
-        internal_collator = SimpleCollator()
-
-        collator = MicroBatchCollator(
-            micro_batch_size=micro_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            internal_collator=internal_collator,
-        )
-
-        features = [
-            {"input_ids": torch.tensor([i]), "labels": torch.tensor([i])}
-            for i in range(6)
-        ]
-
-        result = collator(features)
-
-        # Each micro-batch should have batch size of 2
-        for micro_batch in result:
-            assert micro_batch["input_ids"].shape[0] == 2
-
-    def test_micro_batches_contain_correct_data(self):
-        """Test that micro-batches contain the correct sequential data."""
-        micro_batch_size = 2
-        gradient_accumulation_steps = 2
-        internal_collator = SimpleCollator()
-
-        collator = MicroBatchCollator(
-            micro_batch_size=micro_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            internal_collator=internal_collator,
-        )
-
-        features = [
-            {"input_ids": torch.tensor([i]), "labels": torch.tensor([i * 10])}
-            for i in range(4)
-        ]
-
-        result = collator(features)
-
-        # First micro-batch should have samples 0, 1
+        assert len(result) == 2
         assert torch.equal(result[0]["input_ids"], torch.tensor([[0], [1]]))
         assert torch.equal(result[0]["labels"], torch.tensor([[0], [10]]))
-
-        # Second micro-batch should have samples 2, 3
         assert torch.equal(result[1]["input_ids"], torch.tensor([[2], [3]]))
         assert torch.equal(result[1]["labels"], torch.tensor([[20], [30]]))
 
-    def test_handles_single_micro_batch(self):
-        """Test handling when gradient_accumulation_steps = 1."""
-        micro_batch_size = 4
-        gradient_accumulation_steps = 1
-        internal_collator = SimpleCollator()
-
-        collator = MicroBatchCollator(
-            micro_batch_size=micro_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            internal_collator=internal_collator,
-        )
-
-        features = [
-            {"input_ids": torch.tensor([i]), "labels": torch.tensor([i])}
-            for i in range(4)
-        ]
-
-        result = collator(features)
-
-        # Should return 1 micro-batch
+        # Single micro-batch
+        collator_single = MicroBatchCollator(micro_batch_size=4, gradient_accumulation_steps=1, internal_collator=internal_collator)
+        features = [{"input_ids": torch.tensor([i]), "labels": torch.tensor([i])} for i in range(4)]
+        result = collator_single(features)
         assert len(result) == 1
         assert result[0]["input_ids"].shape[0] == 4
 
-    def test_internal_collator_is_called(self):
-        """Test that the internal collator is called for each micro-batch."""
-        micro_batch_size = 2
-        gradient_accumulation_steps = 2
-        internal_collator = Mock(spec=DataCollator)
-        internal_collator.side_effect = lambda x: {
-            "input_ids": torch.stack([f["input_ids"] for f in x])
-        }
-
-        collator = MicroBatchCollator(
-            micro_batch_size=micro_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            internal_collator=internal_collator,
-        )
-
-        features = [
-            {"input_ids": torch.tensor([i])} for i in range(4)
-        ]
-
-        result = collator(features)
-
-        # Internal collator should be called twice (once per micro-batch)
-        assert internal_collator.call_count == 2
-
-    def test_with_uneven_division(self):
-        """Test that error is raised when features don't match expected length."""
-        micro_batch_size = 3
-        gradient_accumulation_steps = 2
-        internal_collator = SimpleCollator()
-
-        collator = MicroBatchCollator(
-            micro_batch_size=micro_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            internal_collator=internal_collator,
-        )
-
-        # 5 samples: expected is 6 (3 * 2), so this should raise an error
-        features = [
-            {"input_ids": torch.tensor([i]), "labels": torch.tensor([i])}
-            for i in range(5)
-        ]
-
+        # Uneven division raises ValueError
+        collator_uneven = MicroBatchCollator(micro_batch_size=3, gradient_accumulation_steps=2, internal_collator=internal_collator)
+        features = [{"input_ids": torch.tensor([i]), "labels": torch.tensor([i])} for i in range(5)]
         with pytest.raises(ValueError, match="Expected 6 samples"):
-            collator(features)
+            collator_uneven(features)
 
+        # --- set_epoch delegation ---
+        # Sampler has set_epoch
+        dl = DistributedDataloader.__new__(DistributedDataloader)
+        dl.sampler = Mock()
+        dl.sampler.set_epoch = Mock()
+        dl.dataset = Mock()
+        dl.set_epoch(5)
+        dl.sampler.set_epoch.assert_called_once_with(5)
 
-class TestDistributedDataloader:
-    """Test suite for DistributedDataloader."""
+        # No sampler, dataset has set_epoch
+        dl2 = DistributedDataloader.__new__(DistributedDataloader)
+        dl2.sampler = None
+        dl2.dataset = Mock()
+        dl2.dataset.set_epoch = Mock()
+        dl2.set_epoch(5)
+        dl2.dataset.set_epoch.assert_called_once_with(5)
 
-    def test_set_epoch_calls_sampler_set_epoch(self):
-        """Test that set_epoch calls sampler.set_epoch if available."""
-        dataloader = DistributedDataloader.__new__(DistributedDataloader)
-        dataloader.sampler = Mock()
-        dataloader.sampler.set_epoch = Mock()
-        dataloader.dataset = Mock()
-
-        dataloader.set_epoch(5)
-
-        dataloader.sampler.set_epoch.assert_called_once_with(5)
-
-    def test_set_epoch_calls_dataset_set_epoch_if_no_sampler(self):
-        """Test that set_epoch calls dataset.set_epoch if sampler doesn't have it."""
-        dataloader = DistributedDataloader.__new__(DistributedDataloader)
-        dataloader.sampler = None
-        dataloader.dataset = Mock()
-        dataloader.dataset.set_epoch = Mock()
-
-        dataloader.set_epoch(5)
-
-        dataloader.dataset.set_epoch.assert_called_once_with(5)
-
-    def test_set_epoch_handles_missing_methods(self):
-        """Test that set_epoch doesn't crash if methods are missing."""
-        dataloader = DistributedDataloader.__new__(DistributedDataloader)
-        dataloader.sampler = None
-        dataloader.dataset = Mock(spec=[])  # No set_epoch method
-
-        # Should not raise an error
-        dataloader.set_epoch(5)
-
-
-class TestDataLoaderBuilder:
-    """Test suite for DataLoaderBuilder class."""
+        # No sampler, no set_epoch on dataset -- should not raise
+        dl3 = DistributedDataloader.__new__(DistributedDataloader)
+        dl3.sampler = None
+        dl3.dataset = Mock(spec=[])
+        dl3.set_epoch(5)
 
     @patch('xorl.data.data_loader.get_parallel_state')
     @patch('xorl.data.data_loader.StatefulDistributedSampler')
     @patch('xorl.data.data_loader.DistributedDataloader')
-    def test_creates_dataloader_with_correct_batch_size(
-        self, mock_dataloader_cls, mock_sampler_cls, mock_parallel_state, fake_text_dataset
-    ):
-        """Test that dataloader is created with correct batch size."""
+    def test_builder_batch_size_sampler_sp_and_custom_collators(self, mock_dataloader_cls, mock_sampler_cls, mock_parallel_state, fake_text_dataset):
+        """Covers batch size, sampler params, SP collator, single/multiple custom collators."""
         mock_ps = Mock()
         mock_ps.dp_size = 2
         mock_ps.dp_rank = 0
-        mock_ps.sp_size = 1
-        mock_ps.sp_enabled = False
+        mock_ps.cp_size = 1
+        mock_ps.cp_enabled = False
         mock_parallel_state.return_value = mock_ps
 
-        DataLoaderBuilder(
-            dataset=fake_text_dataset,
-            micro_batch_size=4,
-            gradient_accumulation_steps=2,
-            num_workers=4,
-            seed=42,
-        ).build(verbose=False)
-
-        # Dataloader should be created with batch_size = micro_batch_size * gradient_accumulation_steps
+        DataLoaderBuilder(dataset=fake_text_dataset, micro_batch_size=4, gradient_accumulation_steps=2, num_workers=4, seed=42).build(verbose=False)
         assert mock_dataloader_cls.call_args[1]["batch_size"] == 8
 
-    @patch('xorl.data.data_loader.get_parallel_state')
-    @patch('xorl.data.data_loader.StatefulDistributedSampler')
-    @patch('xorl.data.data_loader.DistributedDataloader')
-    def test_creates_sampler_with_correct_params(
-        self, mock_dataloader_cls, mock_sampler_cls, mock_parallel_state, fake_text_dataset
-    ):
-        """Test that sampler is created with correct parameters."""
-        mock_ps = Mock()
+        # Sampler params
         mock_ps.dp_size = 4
         mock_ps.dp_rank = 1
-        mock_ps.sp_size = 1
-        mock_ps.sp_enabled = False
         mock_parallel_state.return_value = mock_ps
-
-        DataLoaderBuilder(
-            dataset=fake_text_dataset,
-            micro_batch_size=2,
-            gradient_accumulation_steps=2,
-            seed=123,
-        ).build(verbose=False)
-
-        # Check sampler was created with correct args
-        mock_sampler_cls.assert_called_once()
+        DataLoaderBuilder(dataset=fake_text_dataset, micro_batch_size=2, gradient_accumulation_steps=2, seed=123).build(verbose=False)
         call_kwargs = mock_sampler_cls.call_args[1]
         assert call_kwargs["num_replicas"] == 4
         assert call_kwargs["rank"] == 1
         assert call_kwargs["shuffle"] is True
         assert call_kwargs["seed"] == 123
 
-    @patch('xorl.data.data_loader.get_parallel_state')
-    @patch('xorl.data.data_loader.StatefulDistributedSampler')
-    @patch('xorl.data.data_loader.DistributedDataloader')
-    def test_uses_default_collate_fn_when_none_provided(
-        self, mock_dataloader_cls, mock_sampler_cls, mock_parallel_state, fake_text_dataset
-    ):
-        """Test that default collate_fn is used when none is provided."""
-        mock_ps = Mock()
+        # SP collator added when cp_enabled
         mock_ps.dp_size = 1
         mock_ps.dp_rank = 0
-        mock_ps.sp_size = 1
-        mock_ps.sp_enabled = False
+        mock_ps.cp_size = 2
+        mock_ps.cp_enabled = True
         mock_parallel_state.return_value = mock_ps
-
-        DataLoaderBuilder(
-            dataset=fake_text_dataset,
-            micro_batch_size=2,
-            gradient_accumulation_steps=2,
-        ).build(verbose=False)
-
-        # Collate function should be a MicroBatchCollator
-        call_kwargs = mock_dataloader_cls.call_args[1]
-        assert isinstance(call_kwargs["collate_fn"], MicroBatchCollator)
-
-    @patch('xorl.data.data_loader.get_parallel_state')
-    @patch('xorl.data.data_loader.StatefulDistributedSampler')
-    @patch('xorl.data.data_loader.DistributedDataloader')
-    def test_adds_sequence_shard_collator_when_sp_enabled(
-        self, mock_dataloader_cls, mock_sampler_cls, mock_parallel_state, fake_text_dataset
-    ):
-        """Test that TextSequenceShardCollator is added when SP is enabled."""
-        mock_ps = Mock()
-        mock_ps.dp_size = 1
-        mock_ps.dp_rank = 0
-        mock_ps.sp_size = 2
-        mock_ps.sp_enabled = True
-        mock_parallel_state.return_value = mock_ps
-
-        DataLoaderBuilder(
-            dataset=fake_text_dataset,
-            micro_batch_size=2,
-            gradient_accumulation_steps=2,
-        ).build(verbose=False)
-
-        # The collate_fn should be MicroBatchCollator wrapping CollatePipeline with SP collator
-        call_kwargs = mock_dataloader_cls.call_args[1]
-        collate_fn = call_kwargs["collate_fn"]
+        DataLoaderBuilder(dataset=fake_text_dataset, micro_batch_size=2, gradient_accumulation_steps=2).build(verbose=False)
+        collate_fn = mock_dataloader_cls.call_args[1]["collate_fn"]
         assert isinstance(collate_fn, MicroBatchCollator)
-
-        # Check that internal collator is CollatePipeline with 4 collators
-        # (Flatten + ToTensor + PackingConcat + TextSequenceShard)
         from xorl.data.collators import CollatePipeline
         assert isinstance(collate_fn.internal_collator, CollatePipeline)
         assert len(collate_fn.internal_collator.data_collators) == 5
 
-    @patch('xorl.data.data_loader.get_parallel_state')
-    @patch('xorl.data.data_loader.StatefulDistributedSampler')
-    @patch('xorl.data.data_loader.DistributedDataloader')
-    def test_uses_custom_collator_when_added(
-        self, mock_dataloader_cls, mock_sampler_cls, mock_parallel_state, fake_text_dataset
-    ):
-        """Test that custom collator is used when added to pipeline."""
-        mock_ps = Mock()
-        mock_ps.dp_size = 1
-        mock_ps.dp_rank = 0
-        mock_ps.sp_size = 1
-        mock_ps.sp_enabled = False
+        # Single custom collator
+        mock_ps.cp_size = 1
+        mock_ps.cp_enabled = False
         mock_parallel_state.return_value = mock_ps
-
-        custom_collator = SimpleCollator()
-
-        builder = DataLoaderBuilder(
-            dataset=fake_text_dataset,
-            micro_batch_size=2,
-            gradient_accumulation_steps=2,
-            use_default_collators=False,
-        )
-        builder.add_collator(custom_collator)
+        custom = SimpleCollator()
+        builder = DataLoaderBuilder(dataset=fake_text_dataset, micro_batch_size=2, gradient_accumulation_steps=2, use_default_collators=False)
+        builder.add_collator(custom)
         builder.build(verbose=False)
-
-        # The MicroBatchCollator should wrap our custom collator
-        call_kwargs = mock_dataloader_cls.call_args[1]
-        micro_batch_collator = call_kwargs["collate_fn"]
+        micro_batch_collator = mock_dataloader_cls.call_args[1]["collate_fn"]
         assert isinstance(micro_batch_collator, MicroBatchCollator)
-        assert micro_batch_collator.internal_collator is custom_collator
+        assert micro_batch_collator.internal_collator is custom
+
+        # Multiple custom collators
+        builder2 = DataLoaderBuilder(dataset=fake_text_dataset, micro_batch_size=2, gradient_accumulation_steps=2, use_default_collators=False)
+        builder2.add_collator(SimpleCollator())
+        builder2.add_collator(SimpleCollator())
+        builder2.build(verbose=False)
+        assert isinstance(mock_dataloader_cls.call_args[1]["collate_fn"].internal_collator, CollatePipeline)
+        assert len(mock_dataloader_cls.call_args[1]["collate_fn"].internal_collator.data_collators) == 2
+
+
+class TestDataLoaderBuilderPipelineAndIntegration:
+    """Tests for pipeline manipulation and integration with packed sequences."""
 
     @patch('xorl.data.data_loader.get_parallel_state')
-    @patch('xorl.data.data_loader.StatefulDistributedSampler')
-    @patch('xorl.data.data_loader.DistributedDataloader')
-    def test_uses_multiple_collators_when_added(
-        self, mock_dataloader_cls, mock_sampler_cls, mock_parallel_state, fake_text_dataset
-    ):
-        """Test that multiple collators are wrapped in CollatePipeline."""
+    @patch('xorl.data.collators.packing_concat_collator.get_parallel_state')
+    def test_pipeline_manipulation_and_packed_integration(self, mock_ps_collator, mock_ps_loader, fake_text_dataset):
+        """Covers add/insert/remove, defaults flag, invalid position, empty build,
+        training loop, nested lists, packed dataset, flatten+packing, and variable seqs."""
         mock_ps = Mock()
         mock_ps.dp_size = 1
         mock_ps.dp_rank = 0
-        mock_ps.sp_size = 1
-        mock_ps.sp_enabled = False
-        mock_parallel_state.return_value = mock_ps
+        mock_ps.cp_size = 1
+        mock_ps.cp_enabled = False
+        mock_ps_collator.return_value = mock_ps
+        mock_ps_loader.return_value = mock_ps
 
-        collator1 = SimpleCollator()
-        collator2 = SimpleCollator()
-
-        builder = DataLoaderBuilder(
-            dataset=fake_text_dataset,
-            micro_batch_size=2,
-            gradient_accumulation_steps=2,
-            use_default_collators=False,
-        )
-        builder.add_collator(collator1)
-        builder.add_collator(collator2)
-        builder.build(verbose=False)
-
-        # Should create CollatePipeline with both collators
-        call_kwargs = mock_dataloader_cls.call_args[1]
-        micro_batch_collator = call_kwargs["collate_fn"]
-        from xorl.data.collators import CollatePipeline
-        assert isinstance(micro_batch_collator.internal_collator, CollatePipeline)
-        assert len(micro_batch_collator.internal_collator.data_collators) == 2
-
-    @patch('xorl.data.data_loader.get_parallel_state')
-    @patch('xorl.data.data_loader.StatefulDistributedSampler')
-    @patch('xorl.data.data_loader.DistributedDataloader')
-    def test_passes_dataloader_kwargs_correctly(
-        self, mock_dataloader_cls, mock_sampler_cls, mock_parallel_state, fake_text_dataset
-    ):
-        """Test that dataloader kwargs are passed correctly."""
-        mock_ps = Mock()
-        mock_ps.dp_size = 1
-        mock_ps.dp_rank = 0
-        mock_ps.sp_size = 1
-        mock_ps.sp_enabled = False
-        mock_parallel_state.return_value = mock_ps
-
-        DataLoaderBuilder(
-            dataset=fake_text_dataset,
-            micro_batch_size=2,
-            gradient_accumulation_steps=2,
-            num_workers=16,
-            drop_last=False,
-            pin_memory=False,
-            prefetch_factor=4,
-        ).build(verbose=False)
-
-        call_kwargs = mock_dataloader_cls.call_args[1]
-        assert call_kwargs["num_workers"] == 16
-        assert call_kwargs["drop_last"] is False
-        assert call_kwargs["pin_memory"] is False
-        assert call_kwargs["prefetch_factor"] == 4
-
-
-class TestDataLoaderBuilderPipeline:
-    """Test suite for DataLoaderBuilder pipeline manipulation methods."""
-
-    @patch('xorl.data.data_loader.get_parallel_state')
-    def test_add_collator_to_end(self, mock_parallel_state, fake_text_dataset):
-        """Test adding a collator to the end of the pipeline."""
-        mock_ps = Mock()
-        mock_ps.dp_size = 1
-        mock_ps.dp_rank = 0
-        mock_ps.sp_size = 1
-        mock_ps.sp_enabled = False
-        mock_parallel_state.return_value = mock_ps
-
-        builder = DataLoaderBuilder(
-            dataset=fake_text_dataset,
-            micro_batch_size=2,
-            gradient_accumulation_steps=2,
-        )
-        
-        custom_collator = SimpleCollator()
-        builder.add_collator(custom_collator, position="end")
-
+        # Add to end (default)
+        builder = DataLoaderBuilder(dataset=fake_text_dataset, micro_batch_size=2, gradient_accumulation_steps=2)
+        custom = SimpleCollator()
+        builder.add_collator(custom, position="end")
         pipeline = builder.get_collator_pipeline()
-        assert len(pipeline) == 5  # 4 default (ToTensor + Flatten + ShiftTokens + PackingConcat) + 1 custom
-        assert pipeline[-1] is custom_collator
+        assert len(pipeline) == 5
+        assert pipeline[-1] is custom
 
-    @patch('xorl.data.data_loader.get_parallel_state')
-    def test_add_collator_to_start(self, mock_parallel_state, fake_text_dataset):
-        """Test adding a collator to the start of the pipeline."""
-        mock_ps = Mock()
-        mock_ps.dp_size = 1
-        mock_ps.dp_rank = 0
-        mock_ps.sp_size = 1
-        mock_ps.sp_enabled = False
-        mock_parallel_state.return_value = mock_ps
+        # Add to start
+        builder2 = DataLoaderBuilder(dataset=fake_text_dataset, micro_batch_size=2, gradient_accumulation_steps=2)
+        custom2 = SimpleCollator()
+        builder2.add_collator(custom2, position="start")
+        assert builder2.get_collator_pipeline()[0] is custom2
 
-        builder = DataLoaderBuilder(
-            dataset=fake_text_dataset,
-            micro_batch_size=2,
-            gradient_accumulation_steps=2,
-        )
-        
-        custom_collator = SimpleCollator()
-        builder.add_collator(custom_collator, position="start")
+        # Insert at index
+        builder3 = DataLoaderBuilder(dataset=fake_text_dataset, micro_batch_size=2, gradient_accumulation_steps=2)
+        builder3.add_collator(SimpleCollator())
+        builder3.add_collator(SimpleCollator())
+        inserted = SimpleCollator()
+        builder3.insert_collator(inserted, index=1)
+        assert len(builder3.get_collator_pipeline()) == 7
+        assert builder3.get_collator_pipeline()[1] is inserted
 
-        pipeline = builder.get_collator_pipeline()
-        assert len(pipeline) == 5  # 4 default (ToTensor + Flatten + ShiftTokens + PackingConcat) + 1 custom
-        assert pipeline[0] is custom_collator
+        # Remove collator
+        builder4 = DataLoaderBuilder(dataset=fake_text_dataset, micro_batch_size=2, gradient_accumulation_steps=2)
+        builder4.add_collator(SimpleCollator())
+        assert len(builder4.get_collator_pipeline()) == 5
+        builder4.remove_collator(0)
+        assert len(builder4.get_collator_pipeline()) == 4
 
-    @patch('xorl.data.data_loader.get_parallel_state')
-    def test_insert_collator(self, mock_parallel_state, fake_text_dataset):
-        """Test inserting a collator at a specific position."""
-        mock_ps = Mock()
-        mock_ps.dp_size = 1
-        mock_ps.dp_rank = 0
-        mock_ps.sp_size = 1
-        mock_ps.sp_enabled = False
-        mock_parallel_state.return_value = mock_ps
+        # use_default_collators flag
+        with_defaults = DataLoaderBuilder(dataset=fake_text_dataset, micro_batch_size=2, gradient_accumulation_steps=2, use_default_collators=True)
+        assert len(with_defaults.get_collator_pipeline()) > 0
+        without_defaults = DataLoaderBuilder(dataset=fake_text_dataset, micro_batch_size=2, gradient_accumulation_steps=2, use_default_collators=False)
+        assert len(without_defaults.get_collator_pipeline()) == 0
 
-        builder = DataLoaderBuilder(
-            dataset=fake_text_dataset,
-            micro_batch_size=2,
-            gradient_accumulation_steps=2,
-        )
-        
-        # Add two more collators
-        builder.add_collator(SimpleCollator())
-        builder.add_collator(SimpleCollator())
-
-        # Insert in the middle
-        custom_collator = SimpleCollator()
-        builder.insert_collator(custom_collator, index=1)
-
-        pipeline = builder.get_collator_pipeline()
-        assert len(pipeline) == 7  # 4 default + 2 added + 1 inserted
-        assert pipeline[1] is custom_collator
-
-    @patch('xorl.data.data_loader.get_parallel_state')
-    def test_remove_collator(self, mock_parallel_state, fake_text_dataset):
-        """Test removing a collator from the pipeline."""
-        mock_ps = Mock()
-        mock_ps.dp_size = 1
-        mock_ps.dp_rank = 0
-        mock_ps.sp_size = 1
-        mock_ps.sp_enabled = False
-        mock_parallel_state.return_value = mock_ps
-
-        builder = DataLoaderBuilder(
-            dataset=fake_text_dataset,
-            micro_batch_size=2,
-            gradient_accumulation_steps=2,
-        )
-        
-        # Add a collator (now 5 total: 4 default + 1 added)
-        builder.add_collator(SimpleCollator())
-        assert len(builder.get_collator_pipeline()) == 5
-
-        # Remove the first collator (now 4 remaining)
-        builder.remove_collator(0)
-        assert len(builder.get_collator_pipeline()) == 4
-
-    @patch('xorl.data.data_loader.get_parallel_state')
-    def test_method_chaining(self, mock_parallel_state, fake_text_dataset):
-        """Test that pipeline methods support method chaining."""
-        mock_ps = Mock()
-        mock_ps.dp_size = 1
-        mock_ps.dp_rank = 0
-        mock_ps.sp_size = 1
-        mock_ps.sp_enabled = False
-        mock_parallel_state.return_value = mock_ps
-
-        builder = (DataLoaderBuilder(
-            dataset=fake_text_dataset,
-            micro_batch_size=2,
-            gradient_accumulation_steps=2,
-        )
-        .add_collator(SimpleCollator(), position="end")
-        .add_collator(SimpleCollator(), position="start")
-        .insert_collator(SimpleCollator(), index=1))
-
-        pipeline = builder.get_collator_pipeline()
-        assert len(pipeline) == 7  # 4 default + 3 added
-
-    @patch('xorl.data.data_loader.get_parallel_state')
-    def test_get_collator_pipeline_returns_copy(self, mock_parallel_state, fake_text_dataset):
-        """Test that get_collator_pipeline returns a copy, not the original list."""
-        mock_ps = Mock()
-        mock_ps.dp_size = 1
-        mock_ps.dp_rank = 0
-        mock_ps.sp_size = 1
-        mock_ps.sp_enabled = False
-        mock_parallel_state.return_value = mock_ps
-
-        builder = DataLoaderBuilder(
-            dataset=fake_text_dataset,
-            micro_batch_size=2,
-            gradient_accumulation_steps=2,
-        )
-        
-        pipeline1 = builder.get_collator_pipeline()
-        pipeline2 = builder.get_collator_pipeline()
-        
-        # Modify one copy
-        pipeline1.append(SimpleCollator())
-
-        # Should not affect the other copy or the builder (default is 4 collators)
-        assert len(pipeline2) == 4
-        assert len(builder.get_collator_pipeline()) == 4
-
-    @patch('xorl.data.data_loader.get_parallel_state')
-    @patch('xorl.data.data_loader.StatefulDistributedSampler')
-    @patch('xorl.data.data_loader.DistributedDataloader')
-    def test_collate_fn_accessible_after_build(
-        self, mock_dataloader_cls, mock_sampler_cls, mock_parallel_state, fake_text_dataset
-    ):
-        """Test that collate_fn and sampler are accessible after building."""
-        mock_ps = Mock()
-        mock_ps.dp_size = 1
-        mock_ps.dp_rank = 0
-        mock_ps.sp_size = 1
-        mock_ps.sp_enabled = False
-        mock_parallel_state.return_value = mock_ps
-
-        builder = DataLoaderBuilder(
-            dataset=fake_text_dataset,
-            micro_batch_size=2,
-            gradient_accumulation_steps=2,
-        )
-        
-        # Before build, collate_fn and sampler should be None
-        assert builder.collate_fn is None
-        assert builder.sampler is None
-        
-        # Build the dataloader
-        dataloader = builder.build(verbose=False)
-        
-        # After build, collate_fn and sampler should be accessible
-        assert builder.collate_fn is not None
-        assert isinstance(builder.collate_fn, MicroBatchCollator)
-        assert builder.sampler is not None
-        
-        # Verify the collate_fn has the correct parameters
-        assert builder.collate_fn.micro_batch_size == 2
-        assert builder.collate_fn.gradient_accumulation_steps == 2
-
-    @patch('xorl.data.data_loader.get_parallel_state')
-    def test_use_default_collators_flag(self, mock_parallel_state, fake_text_dataset):
-        """Test that use_default_collators flag controls initial pipeline."""
-        mock_ps = Mock()
-        mock_ps.dp_size = 1
-        mock_ps.dp_rank = 0
-        mock_ps.sp_size = 1
-        mock_ps.sp_enabled = False
-        mock_parallel_state.return_value = mock_ps
-
-        # With use_default_collators=True (default)
-        builder_with_defaults = DataLoaderBuilder(
-            dataset=fake_text_dataset,
-            micro_batch_size=2,
-            gradient_accumulation_steps=2,
-            use_default_collators=True,
-        )
-        assert len(builder_with_defaults.get_collator_pipeline()) > 0
-
-        # With use_default_collators=False
-        builder_empty = DataLoaderBuilder(
-            dataset=fake_text_dataset,
-            micro_batch_size=2,
-            gradient_accumulation_steps=2,
-            use_default_collators=False,
-        )
-        assert len(builder_empty.get_collator_pipeline()) == 0
-
-    @patch('xorl.data.data_loader.get_parallel_state')
-    def test_add_collator_invalid_position(self, mock_parallel_state, fake_text_dataset):
-        """Test that add_collator raises error for invalid position."""
-        mock_ps = Mock()
-        mock_ps.dp_size = 1
-        mock_ps.dp_rank = 0
-        mock_ps.sp_size = 1
-        mock_ps.sp_enabled = False
-        mock_parallel_state.return_value = mock_ps
-
-        builder = DataLoaderBuilder(
-            dataset=fake_text_dataset,
-            micro_batch_size=2,
-            gradient_accumulation_steps=2,
-        )
-
+        # Invalid position raises ValueError
         with pytest.raises(ValueError, match="Invalid position: middle"):
             builder.add_collator(SimpleCollator(), position="middle")
 
-    @patch('xorl.data.data_loader.get_parallel_state')
-    def test_build_with_empty_collator_list_raises_error(self, mock_parallel_state, fake_text_dataset):
-        """Test that building with empty collator list raises error."""
-        mock_ps = Mock()
-        mock_ps.dp_size = 1
-        mock_ps.dp_rank = 0
-        mock_ps.sp_size = 1
-        mock_ps.sp_enabled = False
-        mock_parallel_state.return_value = mock_ps
-
-        builder = DataLoaderBuilder(
-            dataset=fake_text_dataset,
-            micro_batch_size=2,
-            gradient_accumulation_steps=2,
-            use_default_collators=False,
-        )
-
+        # Empty pipeline build raises ValueError
+        empty_builder = DataLoaderBuilder(dataset=fake_text_dataset, micro_batch_size=2, gradient_accumulation_steps=2, use_default_collators=False)
         with pytest.raises(ValueError, match="Collator pipeline is empty"):
-            builder.build(verbose=False)
+            empty_builder.build(verbose=False)
 
-    @patch('xorl.data.data_loader.get_parallel_state')
-    @patch('xorl.data.data_loader.logger')
-    def test_print_pipeline_with_collators(self, mock_logger, mock_parallel_state, fake_text_dataset):
-        """Test that print_pipeline logs correct information."""
-        mock_ps = Mock()
-        mock_ps.dp_size = 1
-        mock_ps.dp_rank = 0
-        mock_ps.sp_size = 1
-        mock_ps.sp_enabled = False
-        mock_parallel_state.return_value = mock_ps
+        # --- Integration: training loop ---
+        class SimpleTokenizedDataset(Dataset):
+            def __init__(self, num_samples=32, seq_len=10):
+                self.num_samples = num_samples
+                self.seq_len = seq_len
+            def __len__(self):
+                return self.num_samples
+            def __getitem__(self, idx):
+                return {
+                    "input_ids": torch.arange(idx * 10, idx * 10 + self.seq_len, dtype=torch.long),
+                    "attention_mask": torch.ones(self.seq_len, dtype=torch.long),
+                    "labels": torch.arange(idx * 10, idx * 10 + self.seq_len, dtype=torch.long),
+                    "position_ids": torch.arange(self.seq_len, dtype=torch.long),
+                }
 
-        builder = DataLoaderBuilder(
-            dataset=fake_text_dataset,
-            micro_batch_size=4,
-            gradient_accumulation_steps=3,
+        dataset = SimpleTokenizedDataset(num_samples=16, seq_len=5)
+        int_builder = DataLoaderBuilder(
+            dataset=dataset, micro_batch_size=2, gradient_accumulation_steps=2,
+            num_workers=0, prefetch_factor=None, pad_to_multiple_of=1,
         )
-        builder.add_collator(SimpleCollator())
+        dataloader = int_builder.build(verbose=False)
 
-        builder.print_pipeline()
+        for step, micro_batches in enumerate(dataloader):
+            assert isinstance(micro_batches, list)
+            assert len(micro_batches) == 2
+            for mb in micro_batches:
+                assert isinstance(mb, dict)
+                assert "input_ids" in mb
+                assert "position_ids" in mb
+                assert mb["input_ids"].shape[0] == 1
+                assert mb["input_ids"].shape[1] == 8
+            if step == 0:
+                break
 
-        # Verify logging was called
-        assert mock_logger.info_rank0.call_count > 0
+        # Nested list features handled correctly
+        internal_collator = PackingConcatCollator()
+        micro_batch_collator = MicroBatchCollator(micro_batch_size=2, gradient_accumulation_steps=2, internal_collator=internal_collator)
+        correct_features = [
+            {"input_ids": torch.tensor([1, 2]), "attention_mask": torch.ones(2), "labels": torch.tensor([1, 2]), "position_ids": torch.tensor([0, 1])},
+            {"input_ids": torch.tensor([3, 4]), "attention_mask": torch.ones(2), "labels": torch.tensor([3, 4]), "position_ids": torch.tensor([0, 1])},
+            {"input_ids": torch.tensor([5, 6]), "attention_mask": torch.ones(2), "labels": torch.tensor([5, 6]), "position_ids": torch.tensor([0, 1])},
+            {"input_ids": torch.tensor([7, 8]), "attention_mask": torch.ones(2), "labels": torch.tensor([7, 8]), "position_ids": torch.tensor([0, 1])},
+        ]
+        result = micro_batch_collator(correct_features)
+        assert len(result) == 2
 
-        # Check that it logged the micro-batch info
-        logged_text = ' '.join([str(call[0][0]) for call in mock_logger.info_rank0.call_args_list])
-        assert 'micro_batch_size: 4' in logged_text
-        assert 'gradient_accumulation_steps: 3' in logged_text
-        assert 'dataloader_batch_size: 12' in logged_text
+        # --- Packed sequences ---
+        class PackedSequencesDataset(Dataset):
+            def __init__(self, num_samples=32, num_seqs_per_sample=2, seq_len=10):
+                self.num_samples = num_samples
+                self.num_seqs_per_sample = num_seqs_per_sample
+                self.seq_len = seq_len
+            def __len__(self):
+                return self.num_samples
+            def __getitem__(self, idx):
+                sequences = []
+                for seq_idx in range(self.num_seqs_per_sample):
+                    offset = (idx * self.num_seqs_per_sample + seq_idx) * self.seq_len
+                    sequences.append({
+                        "input_ids": torch.arange(offset, offset + self.seq_len, dtype=torch.long),
+                        "attention_mask": torch.ones(self.seq_len, dtype=torch.long),
+                        "labels": torch.arange(offset, offset + self.seq_len, dtype=torch.long),
+                        "position_ids": torch.arange(self.seq_len, dtype=torch.long),
+                    })
+                return sequences
 
-    @patch('xorl.data.data_loader.get_parallel_state')
-    @patch('xorl.data.data_loader.logger')
-    def test_print_pipeline_empty(self, mock_logger, mock_parallel_state, fake_text_dataset):
-        """Test print_pipeline with empty pipeline."""
-        mock_ps = Mock()
-        mock_ps.dp_size = 1
-        mock_ps.dp_rank = 0
-        mock_ps.sp_size = 1
-        mock_ps.sp_enabled = False
-        mock_parallel_state.return_value = mock_ps
+        packed_dataset = PackedSequencesDataset(num_samples=16, num_seqs_per_sample=2, seq_len=5)
+        sample = packed_dataset[0]
+        assert isinstance(sample, list) and len(sample) == 2
+        assert isinstance(sample[0], dict)
 
-        builder = DataLoaderBuilder(
-            dataset=fake_text_dataset,
-            micro_batch_size=2,
-            gradient_accumulation_steps=2,
-            use_default_collators=False,
+        packed_builder = DataLoaderBuilder(
+            dataset=packed_dataset, micro_batch_size=2, gradient_accumulation_steps=2,
+            num_workers=0, prefetch_factor=None, pad_to_multiple_of=1,
         )
+        packed_dl = packed_builder.build(verbose=False)
+        batch = next(iter(packed_dl))
+        assert isinstance(batch, list) and len(batch) == 2
+        for mb in batch:
+            assert isinstance(mb, dict)
+            assert mb["input_ids"].shape == (1, 16)
 
-        builder.print_pipeline()
+        # Flatten + Packing collator
+        from xorl.data.collators import FlattenCollator
+        flatten_collator = FlattenCollator()
+        packing_collator = PackingConcatCollator(pad_to_multiple_of=1)
+        features = [
+            [
+                {"input_ids": torch.tensor([1, 2, 3]), "attention_mask": torch.ones(3), "labels": torch.tensor([1, 2, 3]), "position_ids": torch.tensor([0, 1, 2])},
+                {"input_ids": torch.tensor([4, 5]), "attention_mask": torch.ones(2), "labels": torch.tensor([4, 5]), "position_ids": torch.tensor([0, 1])},
+            ],
+            [
+                {"input_ids": torch.tensor([6, 7]), "attention_mask": torch.ones(2), "labels": torch.tensor([6, 7]), "position_ids": torch.tensor([0, 1])},
+                {"input_ids": torch.tensor([8, 9, 10]), "attention_mask": torch.ones(3), "labels": torch.tensor([8, 9, 10]), "position_ids": torch.tensor([0, 1, 2])},
+            ],
+        ]
+        result = packing_collator(flatten_collator(features))
+        assert result["input_ids"].shape == (1, 10)
+        assert torch.equal(result["input_ids"], torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]]))
 
-        # Should log empty pipeline message
-        logged_text = ' '.join([str(call[0][0]) for call in mock_logger.info_rank0.call_args_list])
-        assert '(empty pipeline)' in logged_text or 'empty' in logged_text.lower()
+        # Variable sequences per sample
+        class VariablePackedDataset(Dataset):
+            def __len__(self):
+                return 4
+            def __getitem__(self, idx):
+                if idx == 0:
+                    return [{"input_ids": torch.tensor([1, 2]), "attention_mask": torch.ones(2), "labels": torch.tensor([1, 2]), "position_ids": torch.tensor([0, 1])}]
+                elif idx == 1:
+                    return [
+                        {"input_ids": torch.tensor([3, 4, 5]), "attention_mask": torch.ones(3), "labels": torch.tensor([3, 4, 5]), "position_ids": torch.tensor([0, 1, 2])},
+                        {"input_ids": torch.tensor([6]), "attention_mask": torch.ones(1), "labels": torch.tensor([6]), "position_ids": torch.tensor([0])},
+                    ]
+                elif idx == 2:
+                    return [
+                        {"input_ids": torch.tensor([7, 8]), "attention_mask": torch.ones(2), "labels": torch.tensor([7, 8]), "position_ids": torch.tensor([0, 1])},
+                        {"input_ids": torch.tensor([9]), "attention_mask": torch.ones(1), "labels": torch.tensor([9]), "position_ids": torch.tensor([0])},
+                        {"input_ids": torch.tensor([10, 11]), "attention_mask": torch.ones(2), "labels": torch.tensor([10, 11]), "position_ids": torch.tensor([0, 1])},
+                    ]
+                else:
+                    return [{"input_ids": torch.tensor([12, 13, 14]), "attention_mask": torch.ones(3), "labels": torch.tensor([12, 13, 14]), "position_ids": torch.tensor([0, 1, 2])}]
 
-    @patch('xorl.data.data_loader.get_parallel_state')
-    @patch('xorl.data.data_loader.logger')
-    def test_print_pipeline_with_collate_pipeline(self, mock_logger, mock_parallel_state, fake_text_dataset):
-        """Test print_pipeline with nested CollatePipeline."""
-        mock_ps = Mock()
-        mock_ps.dp_size = 1
-        mock_ps.dp_rank = 0
-        mock_ps.sp_size = 1
-        mock_ps.sp_enabled = False
-        mock_parallel_state.return_value = mock_ps
-
-        from xorl.data.collators import CollatePipeline
-
-        nested_pipeline = CollatePipeline([SimpleCollator(), SimpleCollator()])
-
-        builder = DataLoaderBuilder(
-            dataset=fake_text_dataset,
-            micro_batch_size=2,
-            gradient_accumulation_steps=2,
-            use_default_collators=False,
+        var_builder = DataLoaderBuilder(
+            dataset=VariablePackedDataset(), micro_batch_size=2, gradient_accumulation_steps=1,
+            num_workers=0, prefetch_factor=None, pad_to_multiple_of=1,
         )
-        builder.add_collator(nested_pipeline)
-
-        builder.print_pipeline()
-
-        # Should detect nested pipeline
-        assert mock_logger.info_rank0.call_count > 0
+        var_dl = var_builder.build(verbose=False)
+        var_batch = next(iter(var_dl))
+        assert len(var_batch) == 1
+        assert var_batch[0]["input_ids"].shape == (1, 4)

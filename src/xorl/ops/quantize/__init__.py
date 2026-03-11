@@ -1,10 +1,12 @@
 from .fp4_codec import FP4_E2M1_MAX, FP8_E4M3_MAX
-from .hadamard import hadamard_transform, generate_hadamard_signs, hadamard_rotate, hadamard_unrotate
+from .nf4_codec import NF4_TABLE, NF4_MIN_STEP, get_nf4_lut
 from .int4_quantize import int4_quantize, int4_dequantize
 from .mxfp4_quantize import mxfp4_quantize, mxfp4_dequantize
+from .nf4_quantize import nf4_quantize, nf4_dequantize
 from .nvfp4_quantize import nvfp4_quantize, nvfp4_dequantize
 from .int4_gkn_quantize import int4_quantize_gkn, int4_dequantize_gkn
 from .mxfp4_gkn_quantize import mxfp4_quantize_gkn, mxfp4_dequantize_gkn
+from .nf4_gkn_quantize import nf4_quantize_gkn, nf4_dequantize_gkn
 from .nvfp4_gkn_quantize import nvfp4_quantize_gkn, nvfp4_dequantize_gkn
 from .block_fp8_quantize import block_fp8_quantize, block_fp8_dequantize, block_fp8_gemm
 from .block_fp8_gkn_quantize import block_fp8_quantize_gkn, block_fp8_dequantize_gkn
@@ -12,20 +14,23 @@ from .block_fp8_gkn_quantize import block_fp8_quantize_gkn, block_fp8_dequantize
 __all__ = [
     "FP4_E2M1_MAX",
     "FP8_E4M3_MAX",
-    "hadamard_transform",
-    "generate_hadamard_signs",
-    "hadamard_rotate",
-    "hadamard_unrotate",
+    "NF4_TABLE",
+    "NF4_MIN_STEP",
+    "get_nf4_lut",
     "int4_quantize",
     "int4_dequantize",
     "mxfp4_quantize",
     "mxfp4_dequantize",
+    "nf4_quantize",
+    "nf4_dequantize",
     "nvfp4_quantize",
     "nvfp4_dequantize",
     "int4_quantize_gkn",
     "int4_dequantize_gkn",
     "mxfp4_quantize_gkn",
     "mxfp4_dequantize_gkn",
+    "nf4_quantize_gkn",
+    "nf4_dequantize_gkn",
     "nvfp4_quantize_gkn",
     "nvfp4_dequantize_gkn",
     "block_fp8_quantize",

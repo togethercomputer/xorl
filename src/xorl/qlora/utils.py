@@ -14,6 +14,9 @@ import torch.nn as nn
 from safetensors.torch import save_file
 
 from xorl.qlora.modules.linear import QLoRALinear
+from xorl.qlora.modules.nvfp4_linear import NvFP4QLoRALinear
+from xorl.qlora.modules.block_fp8_linear import BlockFP8QLoRALinear
+from xorl.qlora.modules.nf4_linear import NF4QLoRALinear
 from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
 
 logger = logging.getLogger(__name__)
@@ -61,32 +64,21 @@ def inject_qlora_into_model(
     quant_format: str = "nvfp4",
     quant_group_size: int = 16,
     target_modules: Optional[List[str]] = None,
-    is_prequantized: bool = False,
     checkpoint_quant_format: Optional[str] = None,
     merge_qkv: bool = True,
     exclude_modules: Optional[Collection[str]] = None,
-    enable_hadamard: bool = False,
-    hadamard_block_size: int = 256,
-    stochastic_rounding: bool = False,
-    clip_ratio: Optional[float] = 1.0,
     enable_aqn: bool = False,
     aqn_alpha: float = 1.0,
 ) -> nn.Module:
     """
-    Inject QLoRA into a model: quantize base weights + add trainable LoRA.
+    Inject QLoRA into a model: replace linear modules with QLoRALinear (pre-quantized).
 
     Replaces nn.Linear with QLoRALinear which stores weights in quantized
     format (~4x weight memory reduction for nvfp4, ~2x for block_fp8).
     Only LoRA params are trainable.
 
-    When ``is_prequantized=True``, the checkpoint already contains quantized weights
-    (e.g., NVFP4 modelopt format or block FP8). QLoRALinear modules are created
-    without weight parameters — pre-quantized data is loaded later via
-    ``maybe_load_prequantized_qlora()``.
-
-    Cross-format conversion: if ``checkpoint_quant_format`` differs from
-    ``quant_format``, pre-quantized weights are dequantized to bf16 and
-    re-quantized in the target format during loading.
+    Requires a pre-quantized checkpoint. QLoRALinear modules are created without
+    weight parameters — quantized data is loaded later via ``maybe_load_prequantized_qlora()``.
 
     Args:
         model: Model to inject QLoRA into
@@ -94,47 +86,46 @@ def inject_qlora_into_model(
         lora_alpha: LoRA alpha for scaling
         quant_format: Quantization format: "nvfp4" or "block_fp8"
         quant_group_size: Block size for quantization (16 for nvfp4, 128 for block_fp8)
-        target_modules: Module names to target. Default: all linear projections.
-        is_prequantized: If True, checkpoint has pre-quantized weights (skip quantization).
+        target_modules: Module names to target. Default: fused projections (qkv_proj, gate_up_proj, ...).
         checkpoint_quant_format: Format of pre-quantized checkpoint ("nvfp4" or "block_fp8").
-            When different from ``quant_format``, triggers cross-format conversion.
+            Must match ``quant_format`` (cross-format conversion is not supported).
         merge_qkv: If True (default), merge q/k/v into fused qkv_proj. If False,
             each projection gets its own QLoRALinear with independent LoRA parameters.
             Requires the model's QKV projections to be unfused before calling this.
-        enable_hadamard: If True, apply Hadamard rotation before quantizing to spread outliers.
-        hadamard_block_size: Block size for Hadamard rotation (must be power of 2, default 256).
-        stochastic_rounding: If True, use stochastic rounding in FP4/FP8 encoding.
-        clip_ratio: Scale clipping ratio (0.0-1.0). None = auto-search MSE-optimal ratio.
-            Default 1.0 (disabled).
         enable_aqn: If True, add Adaptive Quantization Noise during training forward passes.
         aqn_alpha: Scale factor for AQN noise magnitude (default 1.0).
     """
-    if quant_format not in ("nvfp4", "block_fp8"):
+    if quant_format not in ("nvfp4", "block_fp8", "nf4"):
         raise ValueError(
-            f"Supported QLoRA formats: 'nvfp4', 'block_fp8'. Got quant_format={quant_format!r}"
+            f"Supported QLoRA formats: 'nvfp4', 'block_fp8', 'nf4'. Got quant_format={quant_format!r}"
         )
     if target_modules is None:
-        if is_prequantized:
-            # Pre-quantized checkpoints: target the fused module names in the model.
-            # Separate HF projections (q/k/v, gate/up) are merged during loading.
-            target_modules = ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]
-        else:
-            target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        # Pre-quantized checkpoints: target the fused module names in the model.
+        # Separate HF projections (q/k/v, gate/up) are merged during loading.
+        target_modules = ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]
 
-    if is_prequantized:
-        # Ensure quant_group_size matches target format
-        if quant_format == "block_fp8":
-            quant_group_size = 128
-        elif quant_format == "nvfp4":
-            quant_group_size = 16
+    # Ensure quant_group_size matches target format
+    if quant_format == "block_fp8":
+        quant_group_size = 128
+    elif quant_format == "nvfp4":
+        quant_group_size = 16
+    elif quant_format == "nf4":
+        quant_group_size = 64
 
     target_paths = _find_linear_modules(model, target_modules, exclude_types=(QLoRALinear,))
 
-    # Filter out modules excluded from quantization in pre-quantized checkpoint.
+    # Always exclude lm_head and MoE router (gate) from QLoRA — quantizing these
+    # critical modules degrades quality with minimal memory savings.
+    _default_exclude = {"lm_head", "gate"}
+    if exclude_modules:
+        exclude_modules = _default_exclude | set(exclude_modules)
+    else:
+        exclude_modules = _default_exclude
+
+    # Filter out modules excluded from quantization.
     # exclude_modules contains short names (e.g., "lm_head", "gate") — match
     # against the last component of each FQN.
     if exclude_modules:
-        exclude_modules = set(exclude_modules)  # normalize List/Set/etc. to Set
         all_short_names = {p.split(".")[-1] for p in target_paths}
         before = len(target_paths)
         target_paths = [
@@ -155,38 +146,45 @@ def inject_qlora_into_model(
                 f"Available target short names: {all_short_names}"
             )
 
-    if not target_paths:
+    # Check if MoE experts may be handled later (gate_proj/up_proj/down_proj targets)
+    _moe_proj_names = {"gate_proj", "up_proj", "down_proj"}
+    _has_moe_targets = bool(_moe_proj_names & set(target_modules))
+
+    if not target_paths and not _has_moe_targets:
         raise ValueError(
             f"No nn.Linear modules found matching target_modules={target_modules}. "
             f"Available: {[n.split('.')[-1] for n, _ in model.named_modules() if n][:20]}..."
         )
 
-    logger.info(
-        f"Injecting QLoRA into {len(target_paths)} modules "
-        f"(r={r}, alpha={lora_alpha}, {quant_format}, group_size={quant_group_size}"
-        f"{', prequantized=True' if is_prequantized else ''})"
-    )
+    if target_paths:
+        logger.info(
+            f"Injecting QLoRA into {len(target_paths)} modules "
+            f"(r={r}, alpha={lora_alpha}, {quant_format}, group_size={quant_group_size})"
+        )
 
     for target_path in target_paths:
         parent, attr_name = _get_submodule(model, target_path)
         original_module = getattr(parent, attr_name)
 
-        if is_prequantized:
-            # Pre-quantized: create QLoRALinear directly (no weight parameter).
-            # Weights are loaded later via maybe_load_prequantized_qlora().
-            qlora_module = QLoRALinear(
+        if quant_format == "nf4":
+            # NF4: quantize bf16 weights on-the-fly (no pre-quantized checkpoint)
+            qlora_module = NF4QLoRALinear.from_module(
+                original_module, r=r, lora_alpha=lora_alpha,
+                enable_aqn=enable_aqn, aqn_alpha=aqn_alpha,
+            )
+        else:
+            # nvfp4/block_fp8: create empty shell, load pre-quantized weights later
+            if quant_format == "block_fp8":
+                qlora_cls = BlockFP8QLoRALinear
+            else:
+                qlora_cls = NvFP4QLoRALinear
+            qlora_module = qlora_cls(
                 in_features=original_module.in_features,
                 out_features=original_module.out_features,
                 r=r,
                 lora_alpha=lora_alpha,
-                quant_format=quant_format,
-                quant_group_size=quant_group_size,
                 bias=original_module.bias is not None,
                 device=original_module.weight.device,
-                enable_hadamard=enable_hadamard,
-                hadamard_block_size=hadamard_block_size,
-                stochastic_rounding=stochastic_rounding,
-                clip_ratio=clip_ratio,
                 enable_aqn=enable_aqn,
                 aqn_alpha=aqn_alpha,
             )
@@ -205,20 +203,6 @@ def inject_qlora_into_model(
 
             # Tell checkpoint loading to silently skip weight key
             qlora_module._qlora_expected_skip_keys = {"weight"}
-        else:
-            qlora_module = QLoRALinear.from_module(
-                original_module,
-                r=r,
-                lora_alpha=lora_alpha,
-                quant_format=quant_format,
-                quant_group_size=quant_group_size,
-                enable_hadamard=enable_hadamard,
-                hadamard_block_size=hadamard_block_size,
-                stochastic_rounding=stochastic_rounding,
-                clip_ratio=clip_ratio,
-                enable_aqn=enable_aqn,
-                aqn_alpha=aqn_alpha,
-            )
 
         setattr(parent, attr_name, qlora_module)
 
@@ -267,10 +251,28 @@ def inject_qlora_into_model(
             expert_offset=expert_offset,
             hybrid_shared=True,
         )
-        # Source FQN and checkpoint format for loading
+
         experts_fqn = name + ".experts" if not name.endswith(".experts") else name
-        qlora_experts._source_fqn = experts_fqn
-        qlora_experts._source_quant_format = checkpoint_quant_format
+
+        if quant_format == "nf4":
+            is_meta = experts.gate_proj.device.type == "meta"
+            if is_meta:
+                # Defer: load bf16 from checkpoint after FSDP, then quantize
+                qlora_experts._source_fqn = experts_fqn
+            else:
+                # Quantize bf16 expert weights immediately
+                for proj_name, src_param in [
+                    ("gate", experts.gate_proj),
+                    ("up", experts.up_proj),
+                    ("down", experts.down_proj),
+                ]:
+                    local_w = src_param[expert_offset:expert_offset + num_local_experts]
+                    qlora_experts._quantize_proj(proj_name, local_w.float())
+                qlora_experts._weights_loaded = True
+        else:
+            # nvfp4/block_fp8: source FQN and checkpoint format for deferred loading
+            qlora_experts._source_fqn = experts_fqn
+            qlora_experts._source_quant_format = checkpoint_quant_format
 
         # Replace only the experts module, keep the original MoeBlock
         module.experts = qlora_experts
@@ -321,6 +323,138 @@ def save_qlora_checkpoint(
 
     logger.info(f"Saved QLoRA checkpoint to {save_path}")
     return save_path
+
+
+def maybe_quantize_qlora(model: nn.Module) -> int:
+    """Quantize bf16 ``weight`` parameters in QLoRALinear modules to packed form.
+
+    After FSDP loads bf16 weights from checkpoint, this converts them to the
+    target quantization format (NF4, etc.) and frees the bf16 storage.
+
+    FSDP2 tracking of the ``weight`` parameter is removed *before* quantization
+    so that ``reset_sharded_param`` does not crash on ``None``.
+
+    Returns:
+        Number of modules quantized.
+    """
+    modules_to_quantize = [
+        m for m in model.modules()
+        if isinstance(m, QLoRALinear) and m.weight is not None
+    ]
+    if not modules_to_quantize:
+        return 0
+
+    # Deregister ``weight`` from FSDP2 param groups BEFORE setting weight=None.
+    # Without this, FSDP's lazy_init → reset_sharded_param tries to access
+    # weight._local_tensor on the now-None parameter and crashes.
+    removed = _deregister_qlora_weights_from_fsdp(model, param_names=("weight",))
+    if removed > 0:
+        logger.info(f"Deregistered {removed} weight params from FSDP2 before quantization")
+
+    count = 0
+    for module in modules_to_quantize:
+        module.quantize_weight()
+        count += 1
+    logger.info(f"Quantized {count} QLoRALinear bf16 → packed (deferred)")
+    return count
+
+
+def maybe_load_and_quantize_moe_qlora(
+    model: nn.Module,
+    weights_path: str,
+    load_mode: str = "broadcast",
+) -> int:
+    """Load bf16 MoE expert weights from checkpoint and quantize.
+
+    For formats like NF4 that don't use pre-quantized checkpoints, this loads
+    the bf16 expert weights and quantizes them on-the-fly.
+
+    Args:
+        model: Model with QLoRAMoeExperts modules.
+        weights_path: Path to HF model directory with bf16 weights.
+        load_mode: "broadcast" or "all_ranks".
+
+    Returns:
+        Number of MoE modules loaded.
+    """
+    import json
+    import torch.distributed as dist
+
+    needs_moe = any(
+        isinstance(m, QLoRAMoeExperts) and not m._weights_loaded
+        for m in model.modules()
+    )
+    if not needs_moe:
+        return 0
+
+    # Load weight map from index file
+    weight_map = None
+    if weights_path:
+        try:
+            from transformers.utils import cached_file, SAFE_WEIGHTS_INDEX_NAME
+            index_path = cached_file(weights_path, SAFE_WEIGHTS_INDEX_NAME)
+            if index_path:
+                with open(index_path) as f:
+                    index = json.load(f)
+                weight_map = index.get("weight_map", {})
+        except Exception:
+            pass
+
+    if weight_map is None:
+        raise RuntimeError(
+            f"Could not load weight index from {weights_path}. "
+            "MoE expert loading requires model.safetensors.index.json."
+        )
+
+    shard_cache: dict = {}
+
+    moe_count = 0
+    for module in model.modules():
+        if isinstance(module, QLoRAMoeExperts) and not module._weights_loaded:
+            module.load_and_quantize_weights(
+                weights_path, weight_map=weight_map, shard_cache=shard_cache,
+            )
+            # Materialize LoRA params from meta device to GPU
+            from torch.distributed._tensor import DTensor
+            for name, param in module.named_parameters():
+                if param.device.type == "meta":
+                    if isinstance(param, DTensor):
+                        local_shape = param.to_local().shape
+                        placement = param.placements
+                        mesh = param.device_mesh
+                        local_data = torch.zeros(
+                            local_shape, dtype=param.dtype, device="cuda",
+                        )
+                        materialized = nn.Parameter(
+                            DTensor.from_local(
+                                local_data, mesh, placement, run_check=False,
+                            ),
+                            requires_grad=param.requires_grad,
+                        )
+                    else:
+                        import math as _math
+                        materialized = nn.Parameter(
+                            torch.zeros(
+                                param.shape, dtype=param.dtype, device="cuda",
+                            ),
+                            requires_grad=param.requires_grad,
+                        )
+                        parts = name.split("_")
+                        if parts[-1] == "A":
+                            for i in range(materialized.shape[0]):
+                                nn.init.kaiming_uniform_(
+                                    materialized.data[i], a=_math.sqrt(5),
+                                )
+                    setattr(module, name, materialized)
+            moe_count += 1
+
+    shard_cache.clear()
+
+    if moe_count > 0:
+        logger.info(
+            f"Loaded and quantized {moe_count} MoE expert modules from bf16 checkpoint"
+        )
+    return moe_count
 
 
 def _deregister_qlora_weights_from_fsdp(
@@ -377,110 +511,6 @@ def _deregister_qlora_weights_from_fsdp(
     return removed
 
 
-def maybe_quantize_qlora(model: nn.Module) -> int:
-    """
-    Quantize deferred QLoRALinear weights after FSDP loads them.
-
-    Call this after build_parallelize_model() when using meta init.
-    Each module's weight parameter (loaded by FSDP) is quantized into packed_weight_f32
-    (float32 parameter for FSDP2 sharding). Both ``weight`` and ``packed_weight_f32``
-    are then deregistered from FSDP2 param groups:
-
-    * ``weight``: storage is freed — must not be all-gathered.
-    * ``packed_weight_f32``: must not be cast to ``param_dtype`` (e.g. bf16) by
-      FSDP2 mixed precision, as this corrupts packed uint8 byte patterns.
-      Stays as a sharded DTensor; forward code uses ``full_tensor()`` to
-      all-gather in the original float32 dtype.
-
-    Returns:
-        Number of modules quantized.
-    """
-    count = 0
-    for module in model.modules():
-        if isinstance(module, QLoRALinear) and module.weight is not None:
-            module.quantize_weight()
-            count += 1
-
-    if count > 0:
-        removed = _deregister_qlora_weights_from_fsdp(
-            model, param_names=("weight", "packed_weight_f32"),
-        )
-        # Now safe to fully delete weight params (deregistered from FSDP2)
-        for module in model.modules():
-            if isinstance(module, QLoRALinear) and module.weight is not None:
-                module.weight = None
-        torch.cuda.empty_cache()
-        logger.info(
-            f"Quantized {count} QLoRALinear modules (deferred quantization), "
-            f"deregistered {removed} params from FSDP2"
-        )
-    return count
-
-
-def maybe_load_and_quantize_moe_qlora(model: nn.Module, weights_path: str) -> int:
-    """
-    Load and quantize QLoRAMoeExperts weights directly from checkpoint.
-
-    For large MoE models (e.g., 235B), base expert weights are NOT loaded
-    via FSDP (to avoid OOM). Instead, each module loads its weights from
-    the checkpoint file, quantizes on GPU, and frees the bf16 copy.
-
-    Args:
-        model: Model with QLoRAMoeExperts modules
-        weights_path: Path to HF checkpoint directory or hub ID
-
-    Returns:
-        Number of MoE modules loaded and quantized.
-    """
-    # Check if there are any QLoRAMoeExperts that need loading
-    moe_modules = [
-        m for m in model.modules()
-        if isinstance(m, QLoRAMoeExperts) and not m._weights_loaded
-    ]
-    if not moe_modules:
-        return 0
-
-    # Load weight map from index file
-    weight_map = None
-    try:
-        from transformers.utils import cached_file, SAFE_WEIGHTS_INDEX_NAME
-        import json
-        index_path = cached_file(weights_path, SAFE_WEIGHTS_INDEX_NAME)
-        if index_path:
-            with open(index_path) as f:
-                index = json.load(f)
-            weight_map = index.get("weight_map", {})
-    except Exception:
-        pass
-
-    moe_count = 0
-    for module in moe_modules:
-        module.load_and_quantize_weights(weights_path, weight_map=weight_map)
-        # Materialize LoRA params from meta device to GPU (they're excluded from FSDP
-        # via _skip_fsdp + ignored_params, so FSDP won't materialize them)
-        for name, param in module.named_parameters():
-            if param.device.type == "meta":
-                materialized = nn.Parameter(
-                    torch.zeros(param.shape, dtype=param.dtype, device="cuda"),
-                    requires_grad=param.requires_grad,
-                )
-                # Re-initialize LoRA A with kaiming, B with zeros
-                parts = name.split("_")  # e.g. "gate_lora_A" -> ["gate", "lora", "A"]
-                if parts[-1] == "A":
-                    for i in range(materialized.shape[0]):
-                        nn.init.kaiming_uniform_(materialized.data[i], a=5**0.5)
-                # B stays zeros
-                setattr(module, name, materialized)
-        moe_count += 1
-
-    if moe_count > 0:
-        torch.cuda.empty_cache()
-        logger.info(
-            f"Loaded and quantized {moe_count} QLoRAMoeExperts modules "
-            f"(direct from checkpoint, bypassing FSDP)"
-        )
-    return moe_count
-
 
 def detect_prequantized_nvfp4(weights_path: str) -> bool:
     """Detect whether a checkpoint contains pre-quantized NVFP4 weights (modelopt format).
@@ -512,7 +542,91 @@ def detect_prequantized_block_fp8(weights_path: str) -> bool:
     return detect_prequantized_block_fp8_checkpoint(weights_path)
 
 
-def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str) -> int:
+def _broadcast_shard_cache(
+    needed_shards: List[str],
+    weights_path: str,
+) -> dict:
+    """Rank 0 reads safetensors shard files and broadcasts tensors to all ranks.
+
+    Uses NCCL broadcast via GPU for speed (~50 GB/s NVLink), with background
+    prefetching of the next shard file from disk while the current one is
+    being broadcast (overlaps disk I/O with network).
+
+    Returns:
+        shard_cache: dict mapping shard filename → {tensor_name: tensor (CPU)}
+    """
+    import torch.distributed as dist
+    from concurrent.futures import ThreadPoolExecutor
+    from transformers.utils import cached_file
+    import safetensors.torch
+
+    rank = dist.get_rank()
+    device = torch.device("cuda")
+    shard_cache = {}
+
+    def _read_shard(shard_file):
+        shard_path = cached_file(weights_path, shard_file)
+        return safetensors.torch.load_file(shard_path, device="cpu")
+
+    # Background thread for prefetching next shard from disk on rank 0
+    executor = ThreadPoolExecutor(max_workers=1) if rank == 0 else None
+    prefetch_future = None
+
+    for i, shard_file in enumerate(needed_shards):
+        # Rank 0: get current shard (from prefetch or direct read)
+        if rank == 0:
+            if prefetch_future is not None:
+                shard_data = prefetch_future.result()
+            else:
+                shard_data = _read_shard(shard_file)
+            # Prefetch next shard while broadcasting current one
+            if i + 1 < len(needed_shards):
+                prefetch_future = executor.submit(_read_shard, needed_shards[i + 1])
+            else:
+                prefetch_future = None
+            meta = [(name, list(t.shape), str(t.dtype)) for name, t in shard_data.items()]
+        else:
+            shard_data = None
+            meta = None
+
+        # Broadcast metadata (one call per shard — list of (name, shape, dtype))
+        meta = [meta]
+        dist.broadcast_object_list(meta, src=0)
+        meta = meta[0]
+
+        # Broadcast each tensor via GPU (NCCL), then move to CPU
+        shard_dict = {}
+        for name, shape, dtype_str in meta:
+            dtype = getattr(torch, dtype_str.replace("torch.", ""))
+            if rank == 0:
+                cpu_tensor = shard_data[name].contiguous()
+                gpu_tensor = cpu_tensor.pin_memory().to(device, non_blocking=True)
+            else:
+                gpu_tensor = torch.empty(shape, dtype=dtype, device=device)
+
+            dist.broadcast(gpu_tensor, src=0)
+            shard_dict[name] = gpu_tensor.cpu()
+            del gpu_tensor
+
+        shard_cache[shard_file] = shard_dict
+        if rank == 0:
+            del shard_data
+
+        # Free GPU memory between shards
+        torch.cuda.empty_cache()
+        if rank == 0:
+            logger.info(
+                f"Broadcast shard {i + 1}/{len(needed_shards)}: {shard_file} "
+                f"({len(shard_dict)} tensors)"
+            )
+
+    if executor is not None:
+        executor.shutdown(wait=False)
+
+    return shard_cache
+
+
+def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str, load_mode: str = "broadcast") -> int:
     """Load pre-quantized weights into QLoRALinear modules from checkpoint.
 
     For pre-quantized NVFP4 checkpoints (modelopt format), this replaces the
@@ -521,6 +635,9 @@ def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str) -> int:
 
     Also handles QLoRAMoeExperts (auto-detected internally via weight_map probing).
 
+    When distributed is initialized, uses rank 0 broadcast to avoid redundant
+    disk reads across ranks (~6-8× faster for large models).
+
     Args:
         model: Model with QLoRALinear/QLoRAMoeExperts modules
         weights_path: Path to HF model directory
@@ -528,6 +645,8 @@ def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str) -> int:
     Returns:
         Number of modules loaded.
     """
+    import torch.distributed as dist
+
     # Load weight map from index file
     weight_map = None
     try:
@@ -546,13 +665,30 @@ def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str) -> int:
             "Pre-quantized loading requires model.safetensors.index.json."
         )
 
-    # Shared shard cache across all modules (avoids re-reading same shard files)
-    shard_cache = {}
+    # Loading mode:
+    # "broadcast" (default): rank 0 reads, broadcasts via NCCL. Best for shared/NFS filesystems.
+    # "all_ranks": every rank reads from disk independently. Best for local SSDs.
+    use_broadcast = (
+        load_mode == "broadcast"
+        and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+    )
+    if use_broadcast:
+        needed_shards = sorted(set(weight_map.values()))
+        logger.info(
+            f"Broadcasting {len(needed_shards)} shard files from rank 0 "
+            f"(rank={dist.get_rank()}, world={dist.get_world_size()})"
+        )
+        shard_cache = _broadcast_shard_cache(needed_shards, weights_path)
+    else:
+        shard_cache = {}
 
     # Load QLoRALinear modules (attention, dense MLP)
+    # Skip modules already loaded inline via QLoRAWeightBuffer
     linear_count = 0
     for fqn, module in model.named_modules():
         if isinstance(module, QLoRALinear) and module._is_prequantized:
+            if module._inline_loaded:
+                continue  # loaded via checkpoint handler
             module.load_prequantized_weights(weight_map, shard_cache, weights_path)
             linear_count += 1
 
@@ -560,19 +696,49 @@ def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str) -> int:
     moe_count = 0
     for module in model.modules():
         if isinstance(module, QLoRAMoeExperts) and not module._weights_loaded:
-            module.load_and_quantize_weights(weights_path, weight_map=weight_map)
-            # Materialize LoRA params from meta device to GPU
+            module.load_and_quantize_weights(weights_path, weight_map=weight_map, shard_cache=shard_cache)
+            # Materialize LoRA params from meta device to GPU.
+            # With EP, params are DTensors (Shard/Replicate) — must preserve placement.
+            # For Replicate DTensors, all ranks must have identical values.
+            # Since lora_B=0 → initial delta = A @ 0 = 0 regardless of A,
+            # we initialize ALL DTensor params to zeros and let kaiming_uniform
+            # only apply to non-DTensor (non-EP) params.
+            from torch.distributed._tensor import DTensor
+            _rank = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
             for name, param in module.named_parameters():
-                if param.device.type == "meta":
-                    materialized = nn.Parameter(
-                        torch.zeros(param.shape, dtype=param.dtype, device="cuda"),
-                        requires_grad=param.requires_grad,
+                is_meta = param.device.type == "meta"
+                is_dtensor = isinstance(param, DTensor)
+                if _rank == 0 and moe_count == 0:
+                    logger.info(
+                        f"[QLoRA-EP] {name}: is_meta={is_meta}, is_dtensor={is_dtensor}, "
+                        f"shape={list(param.shape)}, device={param.device}, "
+                        f"type={type(param).__name__}"
                     )
-                    parts = name.split("_")
-                    if parts[-1] == "A":
-                        import math
-                        for i in range(materialized.shape[0]):
-                            nn.init.kaiming_uniform_(materialized.data[i], a=math.sqrt(5))
+                if is_meta:
+                    if is_dtensor:
+                        local_shape = param.to_local().shape
+                        placement = param.placements
+                        mesh = param.device_mesh
+                        # DTensor: initialize to zeros (preserves Replicate consistency)
+                        local_data = torch.zeros(
+                            local_shape, dtype=param.dtype, device="cuda",
+                        )
+                        materialized = nn.Parameter(
+                            DTensor.from_local(local_data, mesh, placement,
+                                               run_check=False),
+                            requires_grad=param.requires_grad,
+                        )
+                    else:
+                        # Non-EP: standard initialization
+                        materialized = nn.Parameter(
+                            torch.zeros(param.shape, dtype=param.dtype, device="cuda"),
+                            requires_grad=param.requires_grad,
+                        )
+                        parts = name.split("_")
+                        if parts[-1] == "A":
+                            import math
+                            for i in range(materialized.shape[0]):
+                                nn.init.kaiming_uniform_(materialized.data[i], a=math.sqrt(5))
                     setattr(module, name, materialized)
             moe_count += 1
 
@@ -592,6 +758,34 @@ def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str) -> int:
             f"{moe_count} QLoRAMoeExperts modules (direct from checkpoint), "
             f"deregistered {removed} packed_weight_f32 params from FSDP2"
         )
+
+    # Diagnostic: check first QLoRALinear dequant.
+    # IMPORTANT: _dequantize_weight() may trigger FSDP2 all-gather, which requires ALL ranks
+    # to participate. Run on all ranks; only rank 0 logs the results.
+    _diag_rank = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
+    _diag_fqn = None
+    _diag_mod = None
+    for fqn, mod in model.named_modules():
+        if hasattr(mod, '_dequantize_weight') and hasattr(mod, 'weight_block_scales'):
+            _diag_fqn = fqn
+            _diag_mod = mod
+            break
+    if _diag_mod is not None:
+        try:
+            w = _diag_mod._dequantize_weight()
+            if _diag_rank == 0:
+                logger.info(
+                    f"[DIAG] {_diag_fqn} ({type(_diag_mod).__name__}): "
+                    f"shape={list(w.shape)}, mean={w.float().mean():.6f}, "
+                    f"std={w.float().std():.6f}, "
+                    f"nan={w.isnan().any().item()}, inf={w.isinf().any().item()}"
+                )
+        except Exception as e:
+            if _diag_rank == 0:
+                logger.warning(f"[DIAG] {_diag_fqn}: dequant FAILED: {e}")
+    elif _diag_rank == 0:
+        logger.warning("[DIAG] No QLoRALinear module found in model!")
+
     return total
 
 

@@ -244,29 +244,78 @@ def get_lora_parameters(model: nn.Module) -> Iterator[nn.Parameter]:
             yield param
 
 
+
+
+def _gather_ep_tensor(tensor: torch.Tensor, spec_info) -> torch.Tensor:
+    """Gather an EP-sharded tensor from all EP ranks.
+
+    Args:
+        tensor: The local tensor (already gathered from FSDP if applicable)
+        spec_info: SpecInfo with EP placement and mesh information
+
+    Returns:
+        Full tensor with all EP shards concatenated along the shard dimension.
+        Returns tensor unchanged if placement is Replicate.
+    """
+    import torch.distributed as dist
+    from torch.distributed._tensor import Replicate, Shard
+
+    if isinstance(spec_info.placement, Replicate):
+        return tensor
+
+    assert isinstance(spec_info.placement, Shard)
+    shard_dim = spec_info.placement.dim
+    ep_mesh = spec_info.ep_mesh
+    ep_size = ep_mesh.size()
+    ep_pg = ep_mesh.get_group()
+
+    gathered = [torch.empty_like(tensor) for _ in range(ep_size)]
+    dist.all_gather(gathered, tensor.contiguous(), group=ep_pg)
+    return torch.cat(gathered, dim=shard_dim)
+
+
 def get_lora_state_dict(
     model: nn.Module,
     prefix: str = "",
 ) -> Dict[str, torch.Tensor]:
     """
-    Extract only LoRA weights from model state dict.
+    Extract LoRA weights from model, handling FSDP2 DTensors and EP shards.
+
+    - DTensor.full_tensor() for FSDP2 all-gather
+    - dist.all_gather across EP ranks for sharded expert params (no-op without EP)
+
+    This is a collective operation — ALL ranks must call it when FSDP2/EP is active.
 
     Args:
-        model: Model with LoRA layers
+        model: Model with LoRA layers (may be wrapped by FSDP2 and/or EP)
         prefix: Optional prefix to add to keys
 
     Returns:
-        State dict containing only lora_A and lora_B parameters
+        State dict containing only lora_A and lora_B parameters (on CPU)
     """
+    from torch.distributed._tensor import DTensor
+
+    fqn2spec_info = getattr(model, '_fqn2spec_info', None)
+
     lora_state_dict = {}
     for name, param in model.named_parameters():
-        if "lora_A" in name or "lora_B" in name:
-            key = f"{prefix}{name}" if prefix else name
-            tensor = param.detach()
-            # Handle FSDP2 DTensors: all-gather before moving to CPU
-            if hasattr(tensor, "full_tensor"):
-                tensor = tensor.full_tensor()
-            lora_state_dict[key] = tensor.cpu()
+        if "lora_A" not in name and "lora_B" not in name:
+            continue
+        key = f"{prefix}{name}" if prefix else name
+        tensor = param.detach()
+
+        # Step 1: FSDP2 DTensor -> full tensor
+        if isinstance(tensor, DTensor):
+            tensor = tensor.full_tensor()
+
+        # Step 2: EP gather if applicable
+        if fqn2spec_info is not None:
+            clean_name = name.replace("_fsdp_wrapped_module.", "").replace("_orig_mod.", "")
+            spec_info = fqn2spec_info.get(clean_name) or fqn2spec_info.get(name)
+            if spec_info is not None:
+                tensor = _gather_ep_tensor(tensor, spec_info)
+
+        lora_state_dict[key] = tensor.cpu()
     return lora_state_dict
 
 
@@ -328,6 +377,7 @@ def save_lora_checkpoint(
     r: Optional[int] = None,
     lora_alpha: Optional[int] = None,
     moe_hybrid_shared_lora: bool = False,
+    lora_state_dict: Optional[Dict[str, torch.Tensor]] = None,
 ) -> str:
     """
     Save LoRA weights in PEFT-compatible format.
@@ -343,6 +393,10 @@ def save_lora_checkpoint(
         target_modules: List of target modules (auto-detected if None)
         r: LoRA rank (auto-detected if None)
         lora_alpha: LoRA alpha (auto-detected if None)
+        moe_hybrid_shared_lora: Whether hybrid shared LoRA is used
+        lora_state_dict: Pre-gathered LoRA state dict. If provided, skips
+            get_lora_state_dict(model) call. Useful when the caller has already
+            gathered weights (e.g., from FSDP2 + EP distributed model).
 
     Returns:
         Path to saved checkpoint directory
@@ -351,8 +405,9 @@ def save_lora_checkpoint(
 
     os.makedirs(save_path, exist_ok=True)
 
-    # Get LoRA state dict and convert to PEFT format
-    lora_state_dict = get_lora_state_dict(model)
+    # Get LoRA state dict — use provided one or extract from model
+    if lora_state_dict is None:
+        lora_state_dict = get_lora_state_dict(model)
 
     # Pattern to detect MoE LoRA weights: mlp.experts.{proj}_lora_{A|B}
     # These are stacked tensors with shape [num_experts, ...] that need to be unmerged

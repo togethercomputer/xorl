@@ -24,11 +24,9 @@ class MockCollator2(DataCollator):
 
     def __call__(self, features: Sequence[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         if isinstance(features, dict):
-            # Already collated
             features["input_ids"] = features["input_ids"] * 2
             return features
         else:
-            # Not yet collated
             result = {}
             for key in features[0].keys():
                 if key == "input_ids":
@@ -56,91 +54,44 @@ class MockCollator3(DataCollator):
 class TestCollatePipeline:
     """Test suite for CollatePipeline."""
 
-    def test_single_collator(self, sample_features):
-        """Test pipeline with a single collator."""
-        collator = MockCollator1()
-        pipeline = CollatePipeline(collator)
+    def test_single_and_sequential_collators(self, sample_features):
+        """Covers single collator, multiple collators in sequence, three-collator chain,
+        and adding new fields through pipeline."""
+        base_ids = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
 
-        result = pipeline(sample_features)
+        # Single collator
+        pipeline1 = CollatePipeline(MockCollator1())
+        r1 = pipeline1(sample_features)
+        assert torch.equal(r1["input_ids"], base_ids + 1)
 
-        # MockCollator1 adds 1 to input_ids
-        expected_input_ids = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) + 1
-        assert torch.equal(result["input_ids"], expected_input_ids)
+        # Two collators: add 1 then multiply by 2
+        pipeline2 = CollatePipeline([MockCollator1(), MockCollator2()])
+        r2 = pipeline2(sample_features)
+        assert torch.equal(r2["input_ids"], (base_ids + 1) * 2)
 
-    def test_multiple_collators_in_sequence(self, sample_features):
-        """Test pipeline with multiple collators applied in sequence."""
-        collator1 = MockCollator1()  # adds 1
-        collator2 = MockCollator2()  # multiplies by 2
+        # Three collators: add 1, multiply by 2, add new_field
+        pipeline3 = CollatePipeline([MockCollator1(), MockCollator2(), MockCollator3()])
+        r3 = pipeline3(sample_features)
+        assert torch.equal(r3["input_ids"], (base_ids + 1) * 2)
+        assert "new_field" in r3 and torch.equal(r3["new_field"], torch.tensor([100]))
 
-        pipeline = CollatePipeline([collator1, collator2])
+    def test_empty_list_tuple_and_key_preservation(self, sample_features):
+        """Covers empty collator list, single collator as list vs direct, tuple of collators,
+        and key preservation through pipeline."""
+        # Empty list returns original features
+        assert CollatePipeline([])(sample_features) == sample_features
 
-        result = pipeline(sample_features)
+        # Single collator direct vs wrapped in list produces same result
+        c = MockCollator1()
+        r_direct = CollatePipeline(c)(sample_features)
+        r_list = CollatePipeline([c])(sample_features)
+        assert torch.equal(r_direct["input_ids"], r_list["input_ids"])
 
-        # First adds 1, then multiplies by 2
-        expected_input_ids = (torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) + 1) * 2
-        assert torch.equal(result["input_ids"], expected_input_ids)
+        # Tuple of collators works
+        r_tuple = CollatePipeline((MockCollator1(), MockCollator2()))(sample_features)
+        expected = (torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) + 1) * 2
+        assert torch.equal(r_tuple["input_ids"], expected)
 
-    def test_collators_add_new_fields(self, sample_features):
-        """Test that collators can add new fields to the batch."""
-        collator1 = MockCollator1()
-        collator2 = MockCollator3()  # adds new_field
-
-        pipeline = CollatePipeline([collator1, collator2])
-
-        result = pipeline(sample_features)
-
-        assert "new_field" in result
-        assert torch.equal(result["new_field"], torch.tensor([100]))
-
-    def test_empty_collator_list(self, sample_features):
-        """Test pipeline with empty collator list."""
-        pipeline = CollatePipeline([])
-
-        result = pipeline(sample_features)
-
-        # Should return original features unchanged
-        assert result == sample_features
-
-    def test_single_collator_as_list(self, sample_features):
-        """Test that single collator can be wrapped in a list."""
-        collator = MockCollator1()
-        pipeline1 = CollatePipeline(collator)
-        pipeline2 = CollatePipeline([collator])
-
-        result1 = pipeline1(sample_features)
-        result2 = pipeline2(sample_features)
-
-        assert torch.equal(result1["input_ids"], result2["input_ids"])
-
-    def test_preserves_all_keys(self, sample_features):
-        """Test that all keys are preserved through the pipeline."""
-        collator = MockCollator1()
-        pipeline = CollatePipeline([collator])
-
-        result = pipeline(sample_features)
-
-        # Check all original keys are present
-        assert "input_ids" in result
-        assert "attention_mask" in result
-        assert "labels" in result
-
-    def test_three_collators_chain(self, sample_features):
-        """Test chaining three collators together."""
-        pipeline = CollatePipeline([MockCollator1(), MockCollator2(), MockCollator3()])
-
-        result = pipeline(sample_features)
-
-        # (input_ids + 1) * 2
-        expected_input_ids = (torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) + 1) * 2
-        assert torch.equal(result["input_ids"], expected_input_ids)
-        assert "new_field" in result
-
-    def test_with_tuple_of_collators(self, sample_features):
-        """Test that tuples of collators work as well as lists."""
-        collators_tuple = (MockCollator1(), MockCollator2())
-        pipeline = CollatePipeline(collators_tuple)
-
-        result = pipeline(sample_features)
-
-        expected_input_ids = (torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) + 1) * 2
-        assert torch.equal(result["input_ids"], expected_input_ids)
+        # All keys preserved
+        r_keys = CollatePipeline([MockCollator1()])(sample_features)
+        assert all(k in r_keys for k in ["input_ids", "attention_mask", "labels"])
