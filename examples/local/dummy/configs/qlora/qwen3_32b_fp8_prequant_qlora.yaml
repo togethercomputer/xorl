@@ -1,0 +1,68 @@
+# QLoRA with pre-quantized block FP8 weights (Qwen3-32B-FP8)
+#
+# Loads pre-quantized FP8 weights from HuggingFace directly — no on-the-fly
+# quantization needed. The checkpoint stores float8_e4m3fn weights with
+# 2D 128x128 block-wise scaling (weight_scale_inv).
+#
+# ~2x weight memory savings vs bf16 (better precision than nvfp4's ~4x).
+#
+# Run (4x H100):
+#   CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 -m xorl.cli.train \
+#     examples/local/dummy/configs/qwen3_32b_fp8_prequant_qlora.yaml
+
+model:
+  model_path: Qwen/Qwen3-32B-FP8
+  attn_implementation: flash_attention_3
+
+data:
+  datasets:
+    - path: dummy
+      type: tokenized
+      max_seq_len: 4000
+  select_columns: [input_ids, labels]
+  dataset_prepared_path: last_prepared_dataset
+  sample_packing_method: sequential
+  sample_packing_sequence_len: 4000
+  dataloader_num_workers: 4
+  dataloader_prefetch_factor: 2
+  dataloader_pin_memory: true
+
+train:
+  output_dir: outputs/qwen3-32b-fp8-prequant-qlora
+  data_parallel_mode: fsdp2
+  ulysses_parallel_size: 1
+  data_parallel_replicate_size: 1
+  data_parallel_shard_size: 4
+
+  num_train_epochs: 1
+  max_steps: 5
+
+  micro_batch_size: 1
+  gradient_accumulation_steps: 1
+
+  optimizer: adamw
+  lr: 1.0e-4
+  lr_warmup_ratio: 0.1
+  lr_decay_style: cosine
+  weight_decay: 0.01
+
+  max_grad_norm: 1.0
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  enable_full_shard: true
+  init_device: meta
+  load_weights_mode: broadcast
+  ckpt_manager: dcp
+  save_steps: 0
+  save_hf_weights: false
+
+  use_wandb: false
+
+# Pre-quantized block FP8 checkpoint — auto-detected from config.json
+# quantization_config with quant_method=fp8 and weight_block_size=[128,128].
+lora:
+  enable_qlora: true
+  lora_rank: 16
+  lora_alpha: 16
+  quant_format: block_fp8
+  quant_group_size: 128
