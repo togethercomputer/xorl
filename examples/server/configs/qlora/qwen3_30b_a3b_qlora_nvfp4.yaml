@@ -1,0 +1,53 @@
+# Server-side configuration for XORL Training Server
+# Qwen3-30B-A3B QLoRA nvfp4 (pre-quantized NVIDIA checkpoint)
+#
+# 8× H100: EP=8, Ulysses SP=8.
+
+# Model Configuration
+model_path: NVFP4/Qwen3-Coder-30B-A3B-Instruct-FP4
+tokenizer_path: NVFP4/Qwen3-Coder-30B-A3B-Instruct-FP4
+attn_implementation: flash_attention_3
+moe_implementation: quack
+
+# Parallelism Configuration
+data_parallel_mode: fsdp2
+expert_parallel_size: 4
+ulysses_parallel_size: 4
+data_parallel_replicate_size: 1
+data_parallel_shard_size: 1
+
+# Memory & Performance
+enable_mixed_precision: true
+enable_gradient_checkpointing: true
+enable_full_shard: true
+enable_activation_offload: false
+init_device: meta
+
+# Checkpointing
+output_dir: outputs/Qwen3-30B-A3B-server-qlora-nvfp4-test
+load_checkpoint_path: ""
+ckpt_manager: dcp
+
+# Logging
+log_level: INFO
+
+# Worker Configuration
+worker_connection_timeout: 60.0
+worker_max_retries: 3
+
+# Data Processing Configuration
+sample_packing_sequence_len: 128000
+enable_packing: true
+
+# QLoRA Configuration
+enable_qlora: true
+quant_format: nvfp4
+quant_group_size: 16
+enable_lora: true
+lora_rank: 32
+lora_alpha: 32
+# Use default target_modules (fused: qkv_proj, o_proj, gate_up_proj, down_proj)
+
+# Skip initial checkpoint
+skip_initial_checkpoint: true
+ce_mode: compiled
