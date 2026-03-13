@@ -1,0 +1,52 @@
+# Server-side configuration for XORL Training Server (Qwen3-Coder-30B-A3B full weights, bf16)
+#
+# Full weight fine-tuning of the 30B MoE model.
+# 8 GPUs: Ulysses SP=4 + FSDP shard=2. Muon optimizer (1 state) fits in GPU memory.
+
+# Model Configuration
+model_path: Qwen/Qwen3-Coder-30B-A3B-Instruct
+tokenizer_path: Qwen/Qwen3-Coder-30B-A3B-Instruct
+attn_implementation: flash_attention_3
+moe_implementation: quack
+
+# Parallelism Configuration
+data_parallel_mode: fsdp2
+expert_parallel_size: 8
+ulysses_parallel_size: 8
+data_parallel_replicate_size: 1
+data_parallel_shard_size: 1
+
+# Memory & Performance
+enable_mixed_precision: true
+enable_gradient_checkpointing: true
+enable_full_shard: true
+enable_activation_offload: false
+init_device: meta
+
+# Checkpointing
+output_dir: outputs/Qwen3-Coder-30B-A3B-server-full-test
+load_checkpoint_path: ""
+ckpt_manager: dcp
+
+# Logging
+log_level: INFO
+
+# Worker Configuration
+worker_connection_timeout: 60.0
+worker_max_retries: 3
+
+# Data Processing Configuration
+sample_packing_sequence_len: 128000
+enable_packing: true
+
+# Full weight training
+skip_initial_checkpoint: true
+ce_mode: compiled
+
+# Optimizer: Muon with bf16 states on GPU (no offload with 8 GPUs).
+# 8 GPUs: weights ~7.5GB/GPU + Muon momentum ~7.5GB/GPU = ~15GB/GPU. Fits easily.
+optimizer: muon
+optimizer_dtype: bf16
+muon_lr: 0.02
+muon_momentum: 0.95
+muon_adjust_lr_fn: match_rms_adamw

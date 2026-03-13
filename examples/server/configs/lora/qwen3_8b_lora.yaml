@@ -1,0 +1,45 @@
+# Server-side configuration for XORL Training Server (Qwen3-8B LoRA, bf16)
+
+# Model Configuration
+model_path: Qwen/Qwen3-8B
+tokenizer_path: Qwen/Qwen3-8B
+attn_implementation: flash_attention_3
+
+# Parallelism Configuration
+data_parallel_mode: fsdp2
+ulysses_parallel_size: 1
+data_parallel_replicate_size: 1
+data_parallel_shard_size: 4
+
+# Memory & Performance
+enable_mixed_precision: true
+enable_gradient_checkpointing: true
+enable_full_shard: true
+enable_activation_offload: false
+init_device: meta
+
+# Checkpointing
+output_dir: outputs/Qwen3-8B-server-lora-test
+load_checkpoint_path: ""
+ckpt_manager: dcp
+
+# Logging
+log_level: INFO
+
+# Worker Configuration
+worker_connection_timeout: 60.0
+worker_max_retries: 3
+
+# Data Processing Configuration
+sample_packing_sequence_len: 128000
+enable_packing: true
+
+# LoRA Configuration
+enable_lora: true
+lora_rank: 32
+lora_alpha: 32
+lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+# Skip initial checkpoint
+skip_initial_checkpoint: true
+ce_mode: compiled

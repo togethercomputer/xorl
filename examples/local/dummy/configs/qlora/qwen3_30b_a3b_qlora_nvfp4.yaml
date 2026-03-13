@@ -1,0 +1,69 @@
+# QLoRA with pre-quantized NVFP4 weights (nvidia/Qwen3-30B-A3B-NVFP4)
+#
+# Uses nvidia's pre-quantized checkpoint directly — no on-the-fly quantization.
+# Detection: reads hf_quant_config.json for {"quantization": {"quant_algo": "NVFP4"}}.
+# When is_prequantized is detected, quant_format/quant_group_size are overridden to
+# nvfp4/16 automatically, and target_modules are remapped to packed names.
+#
+# Run (8× H100):
+#   torchrun --nproc_per_node=8 -m xorl.cli.train examples/local/dummy/configs/qwen3_30b_a3b_qlora_nvfp4.yaml
+
+model:
+  model_path: nvidia/Qwen3-30B-A3B-NVFP4
+  attn_implementation: flash_attention_3
+  moe_implementation: triton
+
+data:
+  datasets:
+    - path: dummy
+      type: tokenized
+      max_seq_len: 8000
+  select_columns: [input_ids, labels]
+  dataset_prepared_path: last_prepared_dataset
+  sample_packing_method: sequential
+  sample_packing_sequence_len: 32000
+  dataloader_num_workers: 4
+  dataloader_prefetch_factor: 2
+  dataloader_pin_memory: true
+
+train:
+  output_dir: outputs/qwen3-30b-a3b-qlora-nvfp4
+  data_parallel_mode: fsdp2
+  ulysses_parallel_size: 8
+  expert_parallel_size: 8
+  data_parallel_replicate_size: 1
+  data_parallel_shard_size: 1
+
+  num_train_epochs: 1
+  max_steps: 20
+
+  micro_batch_size: 1
+  gradient_accumulation_steps: 1
+
+  optimizer: adamw
+  lr: 1.0e-3
+  lr_warmup_ratio: 0.1
+  lr_decay_style: cosine
+  weight_decay: 0.01
+
+  max_grad_norm: 1.0
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  enable_full_shard: true
+  init_device: meta
+  load_weights_mode: all_ranks
+  ckpt_manager: dcp
+  save_steps: 0
+  save_hf_weights: false
+
+  use_wandb: false
+
+lora:
+  enable_qlora: true
+  lora_rank: 16
+  lora_alpha: 16
+  # target_modules omitted — auto-detected for pre-quantized:
+  #   ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]
+  # quant_format/quant_group_size also auto-detected (nvfp4 / 16)
+  quant_format: nvfp4
+  quant_group_size: 16
