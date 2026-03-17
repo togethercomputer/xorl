@@ -16,6 +16,7 @@ from datasets import (
     interleave_datasets,
     concatenate_datasets,
     load_dataset,
+    load_dataset_builder,
     load_from_disk,
 )
 from huggingface_hub import hf_hub_download, snapshot_download
@@ -98,7 +99,7 @@ def datasets_with_name_generator(
 
 
 def load_dataset_with_config(
-    dataset_config: DatasetConfig, use_auth_token: bool, streaming=False
+    dataset_config: DatasetConfig, use_auth_token: bool, streaming=False, num_proc: int | None = None
 ) -> Dataset | IterableDataset:
     """Load a dataset from a config. Handles datasets that are stored locally, in the
     HuggingFace Hub, in a remote filesystem (S3, GCS, Azure, OCI), a URL, or
@@ -108,10 +109,15 @@ def load_dataset_with_config(
         dataset_config: Single dataset config.
         use_auth_token: Whether to use HF auth token.
         streaming: Whether to stream the dataset.
+        num_proc: Number of processes for parallel dataset generation/conversion.
+            Defaults to os.cpu_count() when not streaming.
 
     Returns:
         Loaded dataset.
     """
+    if num_proc is None and not streaming:
+        num_proc = max(1, os.cpu_count() // 8)
+
     # Set up common kwargs for dataset loading
     load_dataset_kwargs = {
         "split": dataset_config.split if dataset_config.split else None,
@@ -119,6 +125,8 @@ def load_dataset_with_config(
         "streaming": streaming,
         "trust_remote_code": dataset_config.trust_remote_code,
     }
+    if not streaming:
+        load_dataset_kwargs["num_proc"] = num_proc
 
     # First check if it's a local path
     if Path(dataset_config.path).exists():
@@ -260,7 +268,44 @@ def _load_from_local_path(
 def _load_from_hub(
     dataset_config: DatasetConfig, use_auth_token: bool, load_dataset_kwargs: dict
 ) -> Dataset | IterableDataset | DatasetDict | IterableDatasetDict:
-    """Load a dataset from the HuggingFace Hub."""
+    """Load a dataset from the HuggingFace Hub.
+
+    When a specific split is requested and the dataset uses a Parquet builder
+    with per-split parquet files, load only the requested split's parquet files
+    directly to avoid generating all splits unnecessarily.
+    """
+    requested_split = load_dataset_kwargs.get("split")
+    name = load_dataset_kwargs.get("name")
+
+    if requested_split and not load_dataset_kwargs.get("streaming"):
+        try:
+            builder = load_dataset_builder(
+                dataset_config.path,
+                name=name,
+                token=use_auth_token,
+                revision=dataset_config.revision,
+                trust_remote_code=dataset_config.trust_remote_code,
+            )
+            data_files = getattr(getattr(builder, "config", None), "data_files", None)
+            if (
+                data_files
+                and requested_split in data_files
+                and len(data_files) > 1
+            ):
+                # Load only the parquet files for the requested split, skipping others
+                split_files = data_files[requested_split]
+                kwargs = {k: v for k, v in load_dataset_kwargs.items() if k != "split"}
+                kwargs.pop("name", None)
+                return load_dataset(
+                    "parquet",
+                    data_files={"train": split_files},
+                    token=use_auth_token,
+                    split="train",
+                    **{k: v for k, v in kwargs.items() if k not in ("trust_remote_code",)},
+                )
+        except Exception:
+            pass  # Fall back to standard load below
+
     return load_dataset(
         dataset_config.path,
         data_files=dataset_config.data_files,

@@ -228,11 +228,6 @@ class ServerArguments:
         metadata={"help": "Device for model initialization"}
     )
 
-    enable_rank0_init: bool = field(
-        default=False,
-        metadata={"help": "Deprecated: Use init_device='cpu' instead"}
-    )
-
     ce_mode: Literal["eager", "compiled"] = field(
         default="compiled",
         metadata={"help": "Cross-entropy implementation: 'compiled' (RECOMMENDED, torch.compile) or 'eager' (baseline, may OOM at 32K)"}
@@ -302,7 +297,7 @@ class ServerArguments:
         metadata={"help": "Path to checkpoint to load"}
     )
 
-    ckpt_manager: Optional[Literal["torch", "dcp", "omnistore"]] = field(
+    ckpt_manager: Optional[Literal["torch", "dcp"]] = field(
         default="dcp",
         metadata={"help": "Checkpoint manager type"}
     )
@@ -537,7 +532,6 @@ class ServerArguments:
                 "reshard_after_forward": self.reshard_after_forward,
                 "load_weights_mode": self.load_weights_mode,
                 "init_device": self.init_device,
-                "enable_rank0_init": self.enable_rank0_init,
                 "ce_mode": self.ce_mode,
                 "optimizer": self.optimizer,
                 "optimizer_dtype": self.optimizer_dtype,

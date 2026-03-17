@@ -308,8 +308,12 @@ def main():
             wandb.init(
                 project=args.train.wandb_project,
                 name=args.train.wandb_name,
+                tags=args.train.wandb_tags,
                 config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
             )
+            config_file = os.path.join(args.train.output_dir, "xorl_cli.yaml")
+            if os.path.exists(config_file):
+                wandb.save(config_file, policy="now")
 
         # save model_assets before training
         model_assets = [model_config, tokenizer]
@@ -633,16 +637,21 @@ def main():
             lr = max(lr_scheduler.get_last_lr())
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
 
-            tflops_per_gpu = train_metrics.get("flops_achieved(T)", 0) / args.train.world_size
+            tflops_per_gpu = train_metrics.get("efficiency/flops_achieved(T)", 0) / args.train.world_size
             data_loader_tqdm.set_postfix_str(f"loss={total_loss:.2f} gn={grad_norm:.2f} lr={lr:.1e} tflops={tflops_per_gpu:.1f}")
             data_loader_tqdm.update()
 
             if args.train.global_rank == 0:
-                if args.train.use_wandb:
+                if args.train.use_wandb and global_step % args.train.wandb_log_interval == 0:
                     import wandb
-                    train_metrics.update(
-                        {"training/loss": total_loss, "training/grad_norm": grad_norm, "training/lr": lr}
-                    )
+                    train_metrics.update({
+                        "training/loss": total_loss,
+                        "training/grad_norm": grad_norm,
+                        "training/lr": lr,
+                        "training/epoch": epoch,
+                        "training/step_time": delta_time,
+                        "training/samples_seen": global_step * args.train.global_batch_size,
+                    })
                     wandb.log(train_metrics, step=global_step)
 
             if args.train.profile_this_rank and global_step <= args.train.profile_end_step:

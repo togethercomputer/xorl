@@ -284,6 +284,26 @@ def _load_state_dict(weights_path: str, **kwargs) -> List["StateDictIterator"]:
     """
     Loads (sharded) state dict in transformers' format.
     """
+    import time
+    max_retries = 5
+    for attempt in range(max_retries):
+        result = _try_load_state_dict(weights_path, **kwargs)
+        if result is not None:
+            return result
+        if attempt < max_retries - 1:
+            retry_delay = 2 * (2 ** attempt)  # 2, 4, 8, 16s
+            logger.warning(
+                f"Cannot find checkpoint files in {weights_path} (attempt {attempt + 1}/{max_retries}). "
+                f"Retrying in {retry_delay}s..."
+            )
+            time.sleep(retry_delay)
+    raise ValueError(f"Cannot find checkpoint files in {weights_path}.")
+
+
+def _try_load_state_dict(weights_path: str, **kwargs):
+    """
+    Single attempt to load state dict. Returns list of iterators or None if not found.
+    """
     cache_kwargs = {"_raise_exceptions_for_missing_entries": False, **kwargs}
     resolved_weight_file = cached_file(weights_path, SAFE_WEIGHTS_NAME, **cache_kwargs)
     if resolved_weight_file:
@@ -335,7 +355,7 @@ def _load_state_dict(weights_path: str, **kwargs) -> List["StateDictIterator"]:
                     logger.error(f"Failed to get PT shard files after {max_retries} attempts")
                     raise
 
-    raise ValueError(f"Cannot find checkpoint files in {weights_path}.")
+    return None
 
 
 def _find_submodule(module: "nn.Module", name: str) -> Tuple["nn.Module", str]:

@@ -392,7 +392,7 @@ class OptimizerState(Stateful):
 
 def build_checkpointer(
     dist_backend: str = "fsdp2",
-    ckpt_manager: str = "omnistore",
+    ckpt_manager: str = "dcp",
 ):
     """
     create a checkpointer manager with given mode.
@@ -403,7 +403,6 @@ def build_checkpointer(
             dcp: DCP checkpoint from torch.distributed.checkpoint
             native: native checkpoint from torch.save
         ckpt_manager (str, optional): checkpoint manager.
-            omnistore: omnistore checkpoint manager
             dcp: torch dcp checkpoint manager
     Raises:
         ValueError: if ckpt_manager is not supported
@@ -412,12 +411,7 @@ def build_checkpointer(
         Checkpointer: checkpointer with given mode.
     """
 
-    if ckpt_manager == "omnistore":
-        if dist_backend == "ddp":
-            from omnistore import DDPCheckpointer as Checkpointer
-        elif dist_backend == "fsdp2":
-            from omnistore import FSDP2Checkpointer as Checkpointer
-    elif ckpt_manager == "dcp":
+    if ckpt_manager == "dcp":
         if not is_torch_version_greater_than("2.4"):
             raise ValueError("DCP checkpoint manager requires torch version >= 2.4")
         if dist_backend not in ["none", "ddp", "fsdp2"]:
@@ -426,7 +420,7 @@ def build_checkpointer(
             )
         Checkpointer = DistributedCheckpointer
     else:
-        raise ValueError(f"Unknown checkpoint manager: {ckpt_manager}, supported modes are: omnistore, dcp, native")
+        raise ValueError(f"Unknown checkpoint manager: {ckpt_manager}, supported: dcp")
 
     return Checkpointer
 
