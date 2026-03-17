@@ -25,9 +25,19 @@ def generate_packing_hash(
     sample_packing_sequence_len: int,
     sample_packing_group_size: int,
     sample_packing_mp_start_method: str,
+    doc_align: int = 1,
 ) -> str:
-    """Generate a hash to uniquely identify a packing configuration."""
+    """Generate a hash to uniquely identify a packing configuration.
+
+    Args:
+        doc_align: Per-document alignment for ring attention zigzag.
+            ``2 * cp_size`` when ring attention is enabled, 1 otherwise.
+            Included in the hash so bins computed with different parallelism
+            configs (Ulysses-only vs ring) are cached separately.
+    """
     packing_str = f"{sample_packing_method}_{sample_packing_sequence_len}_{sample_packing_group_size}_{sample_packing_mp_start_method}"
+    if doc_align > 1:
+        packing_str += f"_align{doc_align}"
     return packing_str
 
 def generate_dataset_hash_from_config(

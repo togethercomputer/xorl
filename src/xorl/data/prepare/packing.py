@@ -398,9 +398,16 @@ class PackingDataset(Dataset):
                 f"Truncate your data before packing."
             )
 
+        # Per-document alignment for ring attention zigzag:
+        # each doc must be divisible by 2*ringattn_size*ulysses_size = 2*cp_size.
+        ringattn_size = args.train.ringattn_parallel_size
+        ulysses_size = args.train.ulysses_parallel_size
+        cp_size = ringattn_size * ulysses_size
+        self.doc_align: int = 2 * cp_size if ringattn_size > 1 else 1
+
         # Try to load cached bins, otherwise compute them
         self.bins: List[List[int]] = self._load_or_compute_bins()
-        
+
         LOG.info(f"PackingDataset created with {len(self.bins)} bins from {len(dataset)} samples")
 
     def _get_bins_cache_path(self) -> Path | None:
@@ -414,6 +421,7 @@ class PackingDataset(Dataset):
             self.args.data.sample_packing_sequence_len,
             self.args.data.sample_packing_group_size,
             self.args.data.sample_packing_mp_start_method,
+            doc_align=self.doc_align,
         )
         return Path(self.prepared_dataset_path) / f"packing_bins_{packing_hash}"
 

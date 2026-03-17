@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from .base_collator import DataCollator
 from .packing_concat_collator import add_flash_attention_kwargs_from_position_ids
+from ...utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 from ...data.constants import IGNORE_INDEX
 from ...distributed.parallel_state import get_parallel_state
 
@@ -268,10 +269,22 @@ class TextSequenceShardCollator(DataCollator):
                     )
                 batch[field] = self.sp_slice(field_tensor, dim=-1)
 
-        # Always (re)compute cu_seq_lens from the PADDED position_ids.
-        # cu_seq_lens may already exist in the batch (e.g. pre-computed by
-        # packer._finalize_packed_batch), but those values are stale
-        # because they were computed BEFORE SP padding was applied.
-        add_flash_attention_kwargs_from_position_ids(batch)
+        # (Re)compute cu_seq_lens for flash attention.
+        # For ring attention, position_ids has been zigzag-reordered: it has
+        # position_id=0 resets at EVERY sub-chunk boundary, not just document
+        # boundaries. Using it would produce hundreds of tiny fake documents
+        # and completely wrong cu_seqlens → NaN in flash attention.
+        # Use _original_position_ids (pre-zigzag, pre-SP-padding) instead so
+        # cu_seqlens reflect the true document structure.
+        # _scale_cu_seqlens_for_ringattn then scales these per-rank.
+        if self.ringattn_size > 1 and "_original_position_ids" in batch:
+            orig_pos = batch["_original_position_ids"]
+            (cu_q, cu_k), (max_q, max_k) = prepare_fa_kwargs_from_position_ids(orig_pos)
+            batch["cu_seq_lens_q"] = cu_q
+            batch["cu_seq_lens_k"] = cu_k
+            batch["max_length_q"] = max_q
+            batch["max_length_k"] = max_k
+        else:
+            add_flash_attention_kwargs_from_position_ids(batch)
 
         return batch
