@@ -177,11 +177,74 @@ def _run_experts_grouped_mm(
 _run_experts_compiled = torch.compile(_run_experts_grouped_mm, fullgraph=True)
 
 
+def _gate_up_swiglu(
+    x: torch.Tensor,
+    gate_proj: torch.Tensor,
+    up_proj: torch.Tensor,
+    offsets: torch.Tensor,
+) -> torch.Tensor:
+    """Gate+Up SwiGLU computation: ``silu(x @ gate) * (x @ up)``.
+
+    Factored out so it can be wrapped in ``torch.utils.checkpoint.checkpoint``
+    for the moe_act variant — gate_output and up_output are NOT saved for
+    backward, they are recomputed from ``x``, ``gate_proj``, ``up_proj``.
+
+    Fully compilable: only ``torch._grouped_mm``, ``F.silu``, and elementwise
+    multiply — no ``@torch.compiler.disable`` helpers.
+    """
+    compute_dtype = torch.bfloat16
+    x_bf16 = x.to(compute_dtype)
+
+    gate_out = F.silu(
+        torch._grouped_mm(x_bf16, gate_proj.to(compute_dtype), offs=offsets)
+    )
+    up_out = torch._grouped_mm(x_bf16, up_proj.to(compute_dtype), offs=offsets)
+
+    return gate_out * up_out
+
+
+# Compiled variant for use inside checkpoint — fuses SiLU + elementwise multiply.
+# torch.compile traces through checkpoint(use_reentrant=False) natively since
+# PyTorch 2.4 (dynamo inlines the function and generates the recomputation graph).
+_gate_up_swiglu_compiled = torch.compile(_gate_up_swiglu, fullgraph=True)
+
+
+def _run_experts_moe_act(
+    gate_proj: torch.Tensor,
+    up_proj: torch.Tensor,
+    down_proj: torch.Tensor,
+    x: torch.Tensor,
+    padded_counts: torch.Tensor,
+) -> torch.Tensor:
+    """Run MoE experts with moe_act: gate+up SwiGLU is checkpointed so
+    gate_output and up_output are recomputed in backward instead of saved.
+
+    Uses ``checkpoint(_gate_up_swiglu_compiled, ...)`` so the inner GEMMs +
+    activation are compiled (fuses SiLU + mul), and the checkpoint ensures
+    gate_out/up_out are recomputed in backward rather than saved.
+    """
+    offsets = torch.cumsum(padded_counts, dim=0, dtype=torch.int32)
+
+    # Checkpoint gate+up: in backward, recomputes silu(x @ gate) * (x @ up)
+    # instead of saving gate_out + up_out tensors. The compiled function is
+    # called twice (forward + recompute in backward) — this is intentional.
+    h = torch.utils.checkpoint.checkpoint(
+        _gate_up_swiglu_compiled, x, gate_proj, up_proj, offsets,
+        use_reentrant=False,
+    )
+
+    out = torch._grouped_mm(
+        h, down_proj.to(torch.bfloat16), offs=offsets,
+    ).to(x.dtype)
+
+    return out
+
+
 # ---------------------------------------------------------------------------
-# Public entry point (same interface as triton/quack backends)
+# Shared token preparation / scatter helper
 # ---------------------------------------------------------------------------
 
-def native_expert_forward(
+def _native_expert_forward_impl(
     hidden_states: torch.Tensor,
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,
@@ -189,25 +252,13 @@ def native_expert_forward(
     up_proj: torch.Tensor,
     down_proj: torch.Tensor,
     num_experts: int,
-    **kwargs,
+    compute_fn,
 ) -> torch.Tensor:
-    """Forward pass using native PyTorch ``torch._grouped_mm``.
+    """Shared token-sort / pad / scatter logic for native expert forward.
 
-    Accepts the same interface as the Triton/quack backends — token
-    reordering and expert grouping are handled internally.
-
-    Args:
-        hidden_states: Input tensor ``(num_tokens, hidden_dim)``.
-        routing_weights: Routing weights ``(num_tokens, top_k)``.
-        selected_experts: Selected expert indices ``(num_tokens, top_k)``.
-        gate_proj: Gate projection weights ``[num_experts, hidden, intermediate]``.
-        up_proj: Up projection weights ``[num_experts, hidden, intermediate]``.
-        down_proj: Down projection weights ``[num_experts, intermediate, hidden]``.
-        num_experts: Total number of experts.
-        **kwargs: Extra arguments (ignored).
-
-    Returns:
-        Output tensor ``(num_tokens, hidden_dim)``.
+    ``compute_fn(gate_proj, up_proj, down_proj, sorted_hidden_padded,
+    padded_counts)`` is called with the prepared padded token tensor and must
+    return a padded output of the same shape.
     """
     num_tokens, top_k = selected_experts.shape
     hidden_dim = hidden_states.shape[-1]
@@ -246,8 +297,8 @@ def native_expert_forward(
     sorted_hidden_padded = sorted_hidden.new_zeros(total_padded, hidden_dim)
     sorted_hidden_padded[pad_dst] = sorted_hidden
 
-    # 7. Compiled grouped GEMM
-    expert_out_padded = _run_experts_compiled(
+    # 7. Expert compute (backend-specific)
+    expert_out_padded = compute_fn(
         gate_proj, up_proj, down_proj, sorted_hidden_padded, padded_counts
     )
 
@@ -259,6 +310,28 @@ def native_expert_forward(
     output.index_add_(0, token_ids, expert_out)
 
     return output
+
+
+# ---------------------------------------------------------------------------
+# Public entry point (same interface as triton/quack backends)
+# ---------------------------------------------------------------------------
+
+def native_expert_forward(
+    hidden_states: torch.Tensor,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    gate_proj: torch.Tensor,
+    up_proj: torch.Tensor,
+    down_proj: torch.Tensor,
+    num_experts: int,
+    **kwargs,
+) -> torch.Tensor:
+    """Forward pass using native PyTorch ``torch._grouped_mm``."""
+    return _native_expert_forward_impl(
+        hidden_states, routing_weights, selected_experts,
+        gate_proj, up_proj, down_proj, num_experts,
+        _run_experts_compiled,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -525,3 +598,54 @@ def native_ep_compute_lora(
     )
 
     return _unpad(out_padded, counts, padded_counts, num_local_experts, permute_tokens.shape[0])
+
+
+# ---------------------------------------------------------------------------
+# moe_act variants: gate+up checkpointed, recomputed in backward
+# ---------------------------------------------------------------------------
+
+def native_ep_compute_moe_act(
+    permute_tokens: torch.Tensor,
+    cumsum: torch.Tensor,
+    gate_proj: torch.Tensor,
+    up_proj: torch.Tensor,
+    down_proj: torch.Tensor,
+) -> torch.Tensor:
+    """EP expert compute with moe_act using ``torch._grouped_mm``.
+
+    Same interface as ``native_ep_compute``, but gate+up SwiGLU is
+    checkpointed — gate_output and up_output are recomputed in backward
+    instead of saved. Avoids recomputing EP all-to-all communication.
+    """
+    if permute_tokens.shape[0] == 0:
+        return permute_tokens
+
+    num_local_experts = gate_proj.shape[0]
+    counts = _cumsum_to_counts(cumsum, num_local_experts)
+
+    padded_tokens, padded_counts = _pad_to_alignment(permute_tokens, counts, num_local_experts)
+    out_padded = _run_experts_moe_act(gate_proj, up_proj, down_proj, padded_tokens, padded_counts)
+
+    return _unpad(out_padded, counts, padded_counts, num_local_experts, permute_tokens.shape[0])
+
+
+def native_expert_forward_moe_act(
+    hidden_states: torch.Tensor,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    gate_proj: torch.Tensor,
+    up_proj: torch.Tensor,
+    down_proj: torch.Tensor,
+    num_experts: int,
+    **kwargs,
+) -> torch.Tensor:
+    """Local native forward with moe_act (gate+up checkpointed).
+
+    Same as ``native_expert_forward`` but uses ``_run_experts_moe_act``
+    instead of the compiled grouped GEMM.
+    """
+    return _native_expert_forward_impl(
+        hidden_states, routing_weights, selected_experts,
+        gate_proj, up_proj, down_proj, num_experts,
+        _run_experts_moe_act,
+    )

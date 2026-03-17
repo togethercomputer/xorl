@@ -29,7 +29,6 @@ from xorl.utils.device import (
     get_torch_device,
 )
 from xorl.utils.dist_utils import all_reduce
-from xorl.utils.seqlen_pos_transform_utils import culen2len, pos2culen
 
 from .multisource_utils import parse_multisource_config
 
@@ -45,20 +44,26 @@ logger = logging.get_logger(__name__)
 CACHE_DIR = os.path.expanduser(os.getenv("CACHE_DIR", os.path.join("~/.cache", "xorl")))
 
 
-def _compute_seqlens(
+def _get_global_token_count(
     micro_batch: Dict[str, "torch.Tensor"]
 ) -> List[int]:
-    """
-    Computes the sequence lengths of the current batch using position IDs.
+    """Return the global (pre-SP-slice) token count for FLOPs accounting.
+
+    position_ids is always kept at its full pre-SP-slice length regardless of
+    Ulysses or ring attention, so ``position_ids.shape[-1]`` gives the total
+    tokens processed by the cluster for this step — consistent across all SP
+    modes and equivalent to Megatron's ``global_batch_size × seq_len``.
+
+    We intentionally avoid per-document breakdown (pos2culen) here because:
+    - Ring attention zigzag-reorders position_ids, creating false doc boundaries.
+    - For MoE models, attention is a small fraction of total FLOPs so per-doc
+      precision in seqlen² barely affects accuracy.
 
     Args:
-        micro_batch (Dict[str, Tensor]): The current batch.
+        micro_batch: batch dict as returned by the collator pipeline.
     """
-    attention_mask = micro_batch["attention_mask"]
-    seqlens = culen2len(pos2culen(micro_batch["position_ids"])).tolist()
-    seqlens = seqlens[:-1] if (attention_mask == 0).any().item() else seqlens
-
-    return seqlens
+    position_ids = micro_batch.get("_original_position_ids", micro_batch["position_ids"])
+    return [int(position_ids.shape[-1])]
 
 
 class EnvironMeter:
@@ -77,6 +82,10 @@ class EnvironMeter:
         global_batch_size: int,
         empty_cache_steps: int = 500,
         gc_steps: int = 0,
+        gc_enabled: bool = False,
+        recompute_modules=None,
+        moe_checkpoint_method=None,
+        cp_size: int = 1,
     ) -> None:
         self.config = config
         self.global_batch_size = global_batch_size
@@ -87,7 +96,13 @@ class EnvironMeter:
         self.batch_seqlens = []
         self.image_seqlens = []
 
-        self.estimate_flops = XorlFlopsCounter(config).estimate_flops
+        self.estimate_flops = XorlFlopsCounter(
+            config,
+            gc_enabled=gc_enabled,
+            recompute_modules=recompute_modules,
+            moe_checkpoint_method=moe_checkpoint_method,
+            cp_size=cp_size,
+        ).estimate_flops
 
         if self.gc_steps > 0:
             gc.disable()
@@ -100,7 +115,7 @@ class EnvironMeter:
         self.consume_tokens = state_dict["consume_tokens"]
 
     def add(self, micro_batch: Dict[str, "torch.Tensor"]) -> None:
-        seqlens = _compute_seqlens(micro_batch)
+        seqlens = _get_global_token_count(micro_batch)
 
         if "image_grid_thw" in micro_batch:
             image_grid_thw = micro_batch["image_grid_thw"]

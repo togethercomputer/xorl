@@ -6,6 +6,8 @@ import math
 import os
 import sys
 import types
+
+import torch
 from collections import defaultdict
 from dataclasses import MISSING, asdict, dataclass, field, fields
 from enum import Enum
@@ -621,6 +623,9 @@ class TrainingArguments:
             kwargs["muon_nesterov"] = self.muon_nesterov
             kwargs["muon_ns_steps"] = self.muon_ns_steps
             kwargs["muon_adjust_lr_fn"] = self.muon_adjust_lr_fn
+            # Wire optimizer_dtype -> muon_momentum_dtype so "bf16" sets bf16 Muon momentum
+            if self.optimizer_dtype == "bf16":
+                kwargs["muon_momentum_dtype"] = torch.bfloat16
         return kwargs
     max_grad_norm: float = field(
         default=1.0,
@@ -666,6 +671,34 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Use reentrant gradient checkpointing."},
     )
+    recompute_modules: Optional[List[str]] = field(
+        default=None,
+        metadata={
+            "help": "Per-submodule selective checkpointing. Options: 'self_attn', 'mlp'. "
+            "When None, uses whole-layer checkpoint (legacy). "
+            "Example: ['self_attn'] checkpoints only attention, keeping MoE activations."
+        },
+    )
+    moe_checkpoint_method: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "MoE checkpoint strategy. None = full recompute (default). "
+            "'moe_act' = recompute only gate/up activations in backward, "
+            "skip EP communication recomputation. Only effective with MoE models."
+        },
+    )
+
+    @property
+    def moe_recomputed(self) -> bool:
+        """Whether MoE forward is recomputed during gradient checkpointing.
+
+        Used to decide whether routing replay is needed with EP: replay is only
+        required when the MoE forward (including EP all-to-all) is recomputed.
+        """
+        if self.recompute_modules is not None:
+            return "mlp" in self.recompute_modules and self.moe_checkpoint_method != "moe_act"
+        return True  # legacy whole-layer checkpoint always recomputes MoE
+
     enable_full_shard: bool = field(
         default=True,
         metadata={"help": "Enable fully shard for FSDP training (ZeRO-3)."},

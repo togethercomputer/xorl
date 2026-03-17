@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 from ..activations import ACT2FN
-from .backend import MOE_EXPERT_BACKENDS
+from .backend import MOE_EXPERT_BACKENDS, MOE_EXPERT_BACKENDS_MOE_ACT
 
 
 def _flag_enabled(name: str) -> bool:
@@ -65,6 +65,9 @@ class MoEExperts(nn.Module):
         )
         self.act_fn = ACT2FN[hidden_act]
 
+        # Set by gradient_checkpointing_enable when moe_checkpoint_method="moe_act"
+        self._moe_act: bool = False
+
         # EP dispatch strategy: "alltoall" (default) or "deepep" (NVLink-optimized)
         self.ep_dispatch: str = "alltoall"
         self.deepep_buffer_size_gb: float = 2.0
@@ -86,9 +89,10 @@ class MoEExperts(nn.Module):
         When Expert Parallelism is enabled, all backends (triton/native/quack)
         use the unified dispatch → compute → combine path via ``_ep_forward()``.
         """
-        fn = MOE_EXPERT_BACKENDS[self.moe_implementation]
+        _moe_act = self._moe_act
 
         if self.moe_implementation == "eager":
+            fn = MOE_EXPERT_BACKENDS[self.moe_implementation]
             assert expert_idx is not None
             return fn(
                 hidden_states,
@@ -108,7 +112,12 @@ class MoEExperts(nn.Module):
                 hidden_states, routing_weights, selected_experts, parallel_state
             )
 
-        # Local single-GPU path
+        # Local single-GPU path — select moe_act variant when available
+        if _moe_act and self.moe_implementation in MOE_EXPERT_BACKENDS_MOE_ACT:
+            fn = MOE_EXPERT_BACKENDS_MOE_ACT[self.moe_implementation]
+        else:
+            fn = MOE_EXPERT_BACKENDS[self.moe_implementation]
+
         return fn(
             hidden_states,
             routing_weights,
@@ -135,7 +144,7 @@ class MoEExperts(nn.Module):
         Dispatch strategy is selected by ``self.ep_dispatch`` (``"alltoall"``
         or ``"deepep"``). Compute backend by ``self.moe_implementation``.
         """
-        from .backend import EP_DISPATCH, EP_COMBINE, EP_EXPERT_COMPUTE
+        from .backend import EP_DISPATCH, EP_COMBINE, EP_EXPERT_COMPUTE, EP_EXPERT_COMPUTE_MOE_ACT
 
         if self.moe_implementation not in EP_EXPERT_COMPUTE:
             raise ValueError(
@@ -150,7 +159,13 @@ class MoEExperts(nn.Module):
 
         dispatch_fn = EP_DISPATCH[self.ep_dispatch]
         combine_fn = EP_COMBINE[self.ep_dispatch]
-        compute_fn = EP_EXPERT_COMPUTE[self.moe_implementation]
+
+        # Select moe_act compute variant when available
+        _moe_act = self._moe_act
+        if _moe_act and self.moe_implementation in EP_EXPERT_COMPUTE_MOE_ACT:
+            compute_fn = EP_EXPERT_COMPUTE_MOE_ACT[self.moe_implementation]
+        else:
+            compute_fn = EP_EXPERT_COMPUTE[self.moe_implementation]
 
         # Step 1: Dispatch tokens to expert-owning ranks
         dispatch_kwargs = self._build_dispatch_kwargs(
