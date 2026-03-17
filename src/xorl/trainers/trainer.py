@@ -94,14 +94,22 @@ class Trainer:
         self.state = TrainState()
 
         # Setup phases (order matters — each depends on previous)
-        self._bootstrap()
-        self._build_data()
-        self._build_model()
-        self._parallelize()
-        self._build_optimizer()
-        self._setup_observability()
-        self._resume_checkpoint()
-        self._build_pp_schedule()
+        # Model is built before data: reads weights from disk while I/O is free,
+        # before dataset loading competes for bandwidth.
+        def _timed(phase_name, fn):
+            t0 = time.time()
+            fn()
+            elapsed = time.time() - t0
+            logger.info(f"[TIMING] {phase_name} took {elapsed:.1f}s (rank {args.train.local_rank})")
+
+        _timed("bootstrap", self._bootstrap)
+        _timed("build_model", self._build_model)
+        _timed("parallelize", self._parallelize)
+        _timed("build_data", self._build_data)
+        _timed("build_optimizer", self._build_optimizer)
+        _timed("setup_observability", self._setup_observability)
+        _timed("resume_checkpoint", self._resume_checkpoint)
+        _timed("build_pp_schedule", self._build_pp_schedule)
 
     # ===================================================================
     # Setup phases
@@ -289,6 +297,11 @@ class Trainer:
     def _parallelize(self) -> None:
         """Apply FSDP2/PP wrapping and deferred QLoRA quantization."""
         args = self.args
+        _t0 = time.time()
+        logger.info_rank0(
+            f"Loading model weights (mode={args.train.load_weights_mode}, "
+            f"init_device={args.train.init_device})..."
+        )
         build_result = build_parallelize_model(
             self.model,
             init_device=args.train.init_device,
@@ -307,6 +320,9 @@ class Trainer:
             reshard_after_forward=args.train.reshard_after_forward,
             skip_param_upcast=args.lora.enable_qlora,
         )
+
+        logger.info_rank0(f"Model weights loaded in {time.time()-_t0:.1f}s")
+        helper.print_device_mem_info("VRAM after loading weights")
 
         # PP returns dict with stages + model_parts; otherwise returns model directly
         self.pp_enabled = isinstance(build_result, dict)
@@ -404,8 +420,12 @@ class Trainer:
                 wandb.init(
                     project=args.train.wandb_project,
                     name=args.train.wandb_name,
+                    tags=args.train.wandb_tags,
                     config={**vars(args.model), **vars(args.data), **vars(args.train)},
                 )
+                config_file = os.path.join(args.train.output_dir, "xorl_cli.yaml")
+                if os.path.exists(config_file):
+                    wandb.save(config_file, policy="now")
             save_model_assets(args.train.model_assets_dir, self.model_assets)
 
         self.profiler = None
@@ -512,6 +532,7 @@ class Trainer:
         lr = args.train.lr
 
         for epoch in range(state.epoch, args.train.num_train_epochs):
+            state.epoch = epoch
             if hasattr(self.train_dataloader, "set_epoch"):
                 self.train_dataloader.set_epoch(epoch)
 
@@ -753,9 +774,9 @@ class Trainer:
     ) -> None:
         """Log metrics to stdout / tqdm / wandb."""
         args = self.args
-        tflops_per_gpu = train_metrics.get("flops_achieved(T)", 0) / args.train.world_size
-        mfu = train_metrics.get("mfu", 0)
-        tokens_per_sec = train_metrics.get("tokens_per_second(M)", 0) * 1e6
+        tflops_per_gpu = train_metrics.get("efficiency/flops_achieved(T)", 0) / args.train.world_size
+        mfu = train_metrics.get("efficiency/mfu", 0)
+        tokens_per_sec = train_metrics.get("efficiency/tokens_per_second(K)", 0) * 1e3
 
         if use_tqdm and tqdm_bar is not None:
             tqdm_bar.set_postfix_str(
@@ -771,13 +792,22 @@ class Trainer:
                 f"tokens_per_sec={tokens_per_sec:.0f} time={delta_time:.3f}s"
             )
 
-        if args.train.global_rank == 0 and args.train.use_wandb:
+        if args.train.global_rank == 0 and args.train.use_wandb and self.state.global_step % args.train.wandb_log_interval == 0:
             import wandb
             train_metrics.update({
                 "training/loss": total_loss,
                 "training/grad_norm": grad_norm,
                 "training/lr": lr,
+                "training/epoch": self.state.epoch,
+                "training/step_time": delta_time,
+                "training/samples_seen": self.state.global_step * args.train.global_batch_size,
             })
+            # Log per-group LRs (e.g., separate Muon vs AdamW LRs)
+            for group in self.optimizer.param_groups:
+                if group.get("use_muon", False):
+                    train_metrics.setdefault("training/lr_muon", group["lr"])
+                elif "use_muon" in group:
+                    train_metrics.setdefault("training/lr_adamw", group["lr"])
             wandb.log(train_metrics, step=self.state.global_step)
 
     def _maybe_profile(self) -> None:

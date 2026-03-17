@@ -1,35 +1,23 @@
 model:
-  model_path: Qwen/Qwen3-4B-Instruct-2507
+  model_path: Qwen/Qwen3-32B
   attn_implementation: flash_attention_3
-  # moe_implementation: triton
 
 data:
   datasets:
-    - path: xorl-org/TogetherCoder-Preview-SWE-Rebench
-      split: train
-      name: processed-qwencoder-reward1-decontaminated
-      type: tokenized
-      max_seq_len: 128000
-    - path: xorl-org/TogetherCoder-Preview-SWE-Smith
-      split: train
-      name: processed-qwencoder-reward1
-      type: tokenized
-      max_seq_len: 128000
-    - path: xorl-org/TogetherCoder-Preview-R2E-Gym
-      split: train
-      name: processed-reward1
+    - path: togethercomputer/CoderForge-Preview
+      name: trajectories-tokenized_qwencoder
+      split: filtered_reward1
       type: tokenized
       max_seq_len: 128000
   select_columns: [input_ids, labels]
-  dataset_prepared_path: last_prepared_dataset
   sample_packing_method: sequential
-  sample_packing_sequence_len: 160000
+  sample_packing_sequence_len: 128000
   dataloader_num_workers: 4
   dataloader_pin_memory: false
   pad_to_multiple_of: 4096
 
 train:
-  output_dir: outputs/Qwen3-4B-local-test
+  output_dir: /ephemeral/projects/coderforge/Qwen3-32B
   data_parallel_mode: fsdp2
   ulysses_parallel_size: 8
   data_parallel_replicate_size: 1
@@ -54,18 +42,17 @@ train:
   enable_mixed_precision: true
   enable_gradient_checkpointing: true
   enable_full_shard: true
-  enable_fsdp_offload: false
   enable_activation_offload: false
   init_device: meta
-  load_weights_mode: broadcast
+  load_weights_mode: all_ranks
   enable_full_determinism: false
   empty_cache_steps: 500
   ckpt_manager: dcp
   save_steps: 1000
-  save_epochs: 0.01
   save_hf_weights: true
 
   # wandb
-  use_wandb: false
-  wandb_project: my-project
-  wandb_name: Qwen3-4B-local-test
+  use_wandb: true
+  wandb_project: coderforge
+  wandb_name: Qwen3-32B-adamw
+  wandb_tags: [qwen3-32b, adamw, filtered_reward1]

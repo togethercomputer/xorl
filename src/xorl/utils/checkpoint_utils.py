@@ -80,7 +80,7 @@ def dcp_get_last_iteration(output_dir):
 def get_checkpoint_path(output_dir, is_local_rank0: bool, ckpt_manager: str):
     if ckpt_manager == "dcp":
         iteration = dcp_get_last_iteration(output_dir)
-    else:  # OmniStore or BCP
+    else:
         iteration = get_last_iteration(output_dir, is_local_rank0)
 
     if not iteration:

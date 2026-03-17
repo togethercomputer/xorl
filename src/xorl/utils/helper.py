@@ -163,20 +163,18 @@ class EnvironMeter:
         cpu_memory_info = psutil.virtual_memory()
 
         metrics = {
-            "flops_achieved(T)": flops_achieved,
-            "flops_promised(T)": flops_promised,
-            "mfu": mfu,
+            "efficiency/mfu": mfu,
+            "efficiency/flops_achieved(T)": flops_achieved,
+            "efficiency/flops_promised(T)": flops_promised,
+            "efficiency/tokens_per_second(K)": tokens_per_second / 1e3,
+            "efficiency/consume_tokens(B)": self.consume_tokens / 1e9,
             "training/avg_effective_len": avg_effective_len,
             "training/avg_sample_seq_len": avg_sample_seq_len,
-            "tokens_per_second(M)": tokens_per_second / 1e6,
-            "consume_tokens(M)": self.consume_tokens / 1e6,
-            "consume_tokens(B)": self.consume_tokens / 1e9,
-            "max_memory_allocated(GB)": allocated_memory / (1024**3),
-            "max_memory_reserved(GB)": reserved_memory / (1024**3),
-            "cpu_used_memory(GB)": cpu_memory_info.used / (1024**3),
-            "cpu_available_memory(GB)": cpu_memory_info.available / (1024**3),
-            "cpu_memory_usage(%)": cpu_memory_info.percent,
-            "num_alloc_retries": num_alloc_retries,
+            "memory/gpu_allocated(GB)": allocated_memory / (1024**3),
+            "memory/gpu_reserved(GB)": reserved_memory / (1024**3),
+            "memory/cpu_used(GB)": cpu_memory_info.used / (1024**3),
+            "memory/cpu_usage(%)": cpu_memory_info.percent,
+            "memory/num_alloc_retries": num_alloc_retries,
         }
 
         if self.empty_cache_steps > 0 and global_step % self.empty_cache_steps == 0:
