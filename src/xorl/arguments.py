@@ -717,12 +717,6 @@ class TrainingArguments:
             "help": "When enabling activation offload, `activation_gpu_limit` GB activations are allowed to reserve on GPU."
         },
     )
-    enable_rank0_init: bool = field(
-        default=False,
-        metadata={
-            "help": "Deprecated: Use `init_device=cpu` instead."
-        },
-    )
     init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
         default="cuda",
         metadata={
@@ -810,8 +804,8 @@ class TrainingArguments:
         default="all",
         metadata={"help": "How to fold SP into FSDP: 'all' (ulysses+ring), 'ulysses_only', 'ring_only', or 'none'."},
     )
-    ckpt_manager: Literal["omnistore", "dcp"] = field(
-        default="omnistore",
+    ckpt_manager: Literal["dcp"] = field(
+        default="dcp",
         metadata={"help": "Checkpoint manager."},
     )
     save_async: bool = field(
@@ -859,6 +853,14 @@ class TrainingArguments:
     wandb_name: Optional[str] = field(
         default=None,
         metadata={"help": "Wandb experiment name."},
+    )
+    wandb_tags: Optional[List[str]] = field(
+        default=None,
+        metadata={"help": "Wandb tags for organizing experiments."},
+    )
+    wandb_log_interval: int = field(
+        default=1,
+        metadata={"help": "Log to wandb every N steps."},
     )
     enable_profiling: bool = field(
         default=False,
@@ -966,18 +968,6 @@ class TrainingArguments:
                 "Otherwise, each node will save checkpoints to its local directory, which may cause inconsistencies or job failures."
             )
 
-        # init method check
-        # TODO: remove `enable_rank0_init`
-        logger.warning_rank0(
-            "`enable_rank0_init` will be deprecated in the future, please use `init_device=cpu` instead."
-        )
-        if self.enable_rank0_init:
-            if self.init_device != "cpu":
-                logger.warning_rank0(
-                    "`enable_rank0_init` is set to True, but `init_device` is not set to `cpu`. We change `init_device=cpu`."
-                    "If you try to init model in `cuda` or `meta`, please use `init_device = cuda` or `init_device = meta` instead."
-                )
-            self.init_device = "cpu"
         assert (
             self.expert_parallel_size == 1 or self.init_device != "cpu"
         ), "cpu init is not supported when enable ep. Please use `init_device = cuda` or `init_device = meta` instead."

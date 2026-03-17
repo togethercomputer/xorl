@@ -296,7 +296,8 @@ def _load_and_process_single_dataset(
     """Load and process a single dataset based on the passed config."""
     # Load the dataset
     dataset = load_dataset_with_config(
-        dataset_config, args.data.hf_use_auth_token, streaming=False
+        dataset_config, args.data.hf_use_auth_token, streaming=False,
+        num_proc=args.data.dataset_num_proc,
     )
 
     # Parse dataset type

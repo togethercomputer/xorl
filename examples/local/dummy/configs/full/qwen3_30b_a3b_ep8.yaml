@@ -44,7 +44,6 @@ train:
   enable_mixed_precision: true
   enable_gradient_checkpointing: true
   enable_full_shard: true
-  enable_fsdp_offload: false
   enable_activation_offload: false
   init_device: meta
   load_weights_mode: all_ranks

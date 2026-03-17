@@ -966,7 +966,7 @@ class CheckpointManager:
         model_state_dict = ckpt_to_state_dict(
             save_checkpoint_path=checkpoint_path,
             output_dir=output_path,
-            ckpt_manager="omnistore",
+            ckpt_manager="dcp",
         )
 
         # Save model assets if available
