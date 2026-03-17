@@ -172,6 +172,65 @@ except ImportError:
     pass
 
 
+# ---------------------------------------------------------------------------
+# Moe_act registries: activation-recompute variants that drop gate_output/up_output
+# from save_for_backward and recompute them in backward via local GEMMs.
+# ---------------------------------------------------------------------------
+
+EP_EXPERT_COMPUTE_MOE_ACT: Dict[str, Callable] = {}
+
+# Triton EP moe_act compute
+try:
+    from xorl.ops.moe.triton import TritonEPGroupGemmMoeAct
+
+    EP_EXPERT_COMPUTE_MOE_ACT["triton"] = TritonEPGroupGemmMoeAct.apply
+except ImportError:
+    pass
+
+# Quack EP moe_act compute
+try:
+    from xorl.ops.moe.quack import QuackEPGroupGemmMoeAct
+
+    EP_EXPERT_COMPUTE_MOE_ACT["quack"] = QuackEPGroupGemmMoeAct.apply
+except ImportError:
+    pass
+
+# Native EP moe_act compute
+try:
+    from .native import native_ep_compute_moe_act
+
+    EP_EXPERT_COMPUTE_MOE_ACT["native"] = native_ep_compute_moe_act
+except ImportError:
+    pass
+
+
+MOE_EXPERT_BACKENDS_MOE_ACT: Dict[str, Callable] = {}
+
+# Triton local moe_act compute
+try:
+    from .triton_moe_act import triton_expert_forward_moe_act
+
+    MOE_EXPERT_BACKENDS_MOE_ACT["triton"] = triton_expert_forward_moe_act
+except ImportError:
+    pass
+
+# Quack local moe_act compute
+try:
+    from .quack_moe_act import quack_expert_forward_moe_act
+
+    MOE_EXPERT_BACKENDS_MOE_ACT["quack"] = quack_expert_forward_moe_act
+except ImportError:
+    pass
+
+# Native local moe_act compute
+try:
+    from .native import native_expert_forward_moe_act
+
+    MOE_EXPERT_BACKENDS_MOE_ACT["native"] = native_expert_forward_moe_act
+except ImportError:
+    pass
+
+
 __all__ = [
     "MOE_EXPERT_BACKENDS",
     "EP_EXPERT_COMPUTE",
@@ -179,4 +238,6 @@ __all__ = [
     "EP_COMBINE",
     "EP_EXPERT_COMPUTE_LORA",
     "MOE_EXPERT_BACKENDS_LORA",
+    "EP_EXPERT_COMPUTE_MOE_ACT",
+    "MOE_EXPERT_BACKENDS_MOE_ACT",
 ]

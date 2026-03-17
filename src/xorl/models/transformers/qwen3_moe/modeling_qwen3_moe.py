@@ -240,24 +240,45 @@ class Qwen3MoeDecoderLayer(nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs: Unpack[AttentionKwargs],
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        _selective = (
+            self.training
+            and getattr(self, "gradient_checkpointing", False)
+            and getattr(self, "_recompute_modules", None) is not None
+        )
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, self_attn_weights = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_embeddings=position_embeddings,
-            **kwargs,
-        )
+        if _selective and "self_attn" in self._recompute_modules:
+            # MultiHeadAttention.forward positional order: hidden_states, position_embeddings, attention_mask
+            hidden_states, self_attn_weights = self._gradient_checkpointing_func(
+                self.self_attn.__call__,
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                **kwargs,
+            )
+        else:
+            hidden_states, self_attn_weights = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
         hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states)
+        if _selective and "mlp" in self._recompute_modules:
+            hidden_states = self._gradient_checkpointing_func(
+                self.mlp.__call__,
+                hidden_states,
+            )
+        else:
+            hidden_states = self.mlp(hidden_states)
 
         if isinstance(hidden_states, tuple):
             hidden_states, router_logits = hidden_states
@@ -447,7 +468,14 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         for decoder_layer in self.layers:
             if decoder_layer is None:  # PP: pruned layer
                 continue
-            if self.gradient_checkpointing and self.training:
+            # When selective checkpointing is enabled (_recompute_modules is set),
+            # the decoder layer handles its own sub-checkpointing — skip the outer checkpoint.
+            _use_outer_checkpoint = (
+                self.gradient_checkpointing and self.training
+                and getattr(self, "_recompute_modules", None) is None
+            )
+
+            if _use_outer_checkpoint:
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,

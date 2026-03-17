@@ -43,28 +43,57 @@ def _create_dummy_dataset(seq_len: int, num_samples: int = 4096, seed: int = 42)
     the Arrow table directly from numpy and includes ``position_ids`` /
     ``length`` so we can skip the slow ``process_datasets_for_packing``
     step entirely.
+
+    Token format: each sample is ``[1, 2, 3, ..., length-1, 0]`` where
+    0 is the EOD marker. Tokens follow a global arithmetic sequence
+    ``(global_offset + i) % 151936`` so routing varies across samples.
+    Lengths are drawn uniformly from [1, 4096] with seed=0 (independent
+    of the dataset seed so packing shape is always the same).
     """
     import numpy as np
     import pyarrow as pa
 
-    rng = np.random.RandomState(seed)
-    one_sample = rng.randint(0, 32000, size=seq_len, dtype=np.int32)
-    flat_tokens = np.tile(one_sample, num_samples)
-    offsets = np.arange(0, (num_samples + 1) * seq_len, seq_len, dtype=np.int64)
+    EOD = 0
+    VOCAB_SIZE = 151936
+    MAX_SAMPLE_LEN = 4096
+    # Lengths: uniform [1, max_sample_len], fixed seed=0 so packing is
+    # reproducible regardless of the dataset seed argument.
+    # Lengths are k*16+1 so that after ShiftTokensCollator drops 1 token,
+    # effective length k*16 is divisible by 2*ringattn_size for zigzag ring
+    # attention. This is a dummy-data workaround; production data should use
+    # per-document alignment in the packing pipeline (TODO).
+    LENGTH_ALIGN = 16
+    len_rng = np.random.RandomState(0)
+    lengths = len_rng.randint(1, MAX_SAMPLE_LEN // LENGTH_ALIGN + 1, size=num_samples)
+    lengths = (lengths * LENGTH_ALIGN + 1).astype(np.int64)
+
+    # Build all tokens as one global arithmetic sequence, then slice.
+    # Each sample: (global_offset, ..., global_offset+length-2, EOD)
+    total_tokens = int(lengths.sum())
+    global_seq = np.arange(total_tokens, dtype=np.int64) % VOCAB_SIZE
+
+    # Overwrite the last position of each sample with EOD (vectorized)
+    ends = np.cumsum(lengths) - 1
+    global_seq[ends] = EOD
+
+    flat_tokens = global_seq.astype(np.int32)
+    offsets = np.concatenate([[0], np.cumsum(lengths)]).astype(np.int64)
 
     tokens = pa.ListArray.from_arrays(offsets, flat_tokens)
 
-    # position_ids: [0, 1, ..., seq_len-1] repeated for every sample
-    pos_tile = np.tile(np.arange(seq_len, dtype=np.int32), num_samples)
-    position_ids = pa.ListArray.from_arrays(offsets, pos_tile)
+    # position_ids: [0, 1, ..., length-1] per sample — vectorized via cumsum reset
+    pos_flat = np.arange(total_tokens, dtype=np.int32)
+    starts = np.concatenate([[0], np.cumsum(lengths[:-1])]).astype(np.int64)
+    pos_flat -= np.repeat(starts, lengths).astype(np.int32)
+    position_ids = pa.ListArray.from_arrays(offsets, pos_flat)
 
-    lengths = pa.array([seq_len] * num_samples, type=pa.int64())
+    pa_lengths = pa.array(lengths.tolist(), type=pa.int64())
 
     table = pa.table({
         "input_ids": tokens,
         "labels": tokens,
         "position_ids": position_ids,
-        "length": lengths,
+        "length": pa_lengths,
     })
     return HFDataset(table)
 

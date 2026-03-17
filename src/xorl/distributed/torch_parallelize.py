@@ -406,6 +406,8 @@ def build_parallelize_model(
         # Extract gradient checkpointing kwargs before the loop
         use_reentrant = kwargs.pop("enable_reentrant", False)
         recompute_context_fn = kwargs.pop("recompute_context_fn", noop_context_fn)
+        recompute_modules = kwargs.pop("recompute_modules", None)
+        moe_checkpoint_method = kwargs.pop("moe_checkpoint_method", None)
 
         # 4. Apply parallelism to each model part
         for i, model_part in enumerate(model_parts):
@@ -422,6 +424,10 @@ def build_parallelize_model(
                 # checkpoint uses the same default behavior and dynamo can trace natively.
                 if not enable_compile:
                     gc_kwargs["context_fn"] = recompute_context_fn if i == 0 else noop_context_fn
+                if recompute_modules is not None:
+                    gc_kwargs["recompute_modules"] = recompute_modules
+                if moe_checkpoint_method is not None:
+                    gc_kwargs["moe_checkpoint_method"] = moe_checkpoint_method
                 model_part.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gc_kwargs)
 
             # TP (if enabled)
@@ -544,6 +550,13 @@ def build_parallelize_model(
         recompute_fn = kwargs.pop("recompute_context_fn", None)
         if recompute_fn is not None and not enable_compile:
             gc_kwargs["context_fn"] = recompute_fn
+
+        recompute_modules = kwargs.pop("recompute_modules", None)
+        moe_checkpoint_method = kwargs.pop("moe_checkpoint_method", None)
+        if recompute_modules is not None:
+            gc_kwargs["recompute_modules"] = recompute_modules
+        if moe_checkpoint_method is not None:
+            gc_kwargs["moe_checkpoint_method"] = moe_checkpoint_method
 
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gc_kwargs)
 
