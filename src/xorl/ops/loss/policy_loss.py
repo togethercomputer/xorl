@@ -27,7 +27,7 @@ def compute_ppo_loss(
     eps_clip: float = 0.2,
     eps_clip_high: float = 0.2,
     eps_clip_c: Optional[float] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     PPO-style clipped policy loss.
 
@@ -40,13 +40,14 @@ def compute_ppo_loss(
 
     Returns:
         pg_losses: Clipped policy gradient losses
-        clipfrac: Fraction of samples that were clipped
+        is_clipped: Per-token boolean mask of clipped tokens
+        ratio: Importance sampling ratio exp(-ppo_kl)
     """
     ratio = (-ppo_kl).exp()
     pg_losses1 = -ratio * advantages
     pg_losses2 = -ratio.clamp(1 - eps_clip, 1 + eps_clip_high) * advantages
     clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
-    clipfrac = torch.gt(pg_losses2, pg_losses1).float()
+    is_clipped = torch.gt(pg_losses2, pg_losses1)
 
     # Optional dual-clip for negative advantages
     if eps_clip_c is not None:
@@ -54,10 +55,13 @@ def compute_ppo_loss(
         pg_losses3 = -eps_clip_c * advantages
         clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
         pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+        # Also mark dual-clipped tokens
+        is_dual_clipped = (advantages < 0) & torch.lt(pg_losses3, clip_pg_losses1)
+        is_clipped = is_clipped | is_dual_clipped
     else:
         pg_losses = clip_pg_losses1
 
-    return pg_losses, clipfrac
+    return pg_losses, is_clipped, ratio
 
 
 def apply_tis_correction(
@@ -124,13 +128,16 @@ def policy_loss_function(
     ce_mode: str = "compiled",
     compute_kl_stats: bool = False,
     tp_group: Optional[dist.ProcessGroup] = None,
+    lm_head_fp32: bool = False,
+    icepop_beta: Optional[float] = None,
 ) -> "LossOutput":
     """
-    Policy loss with PPO clipping and optional TIS correction.
+    Policy loss with PPO clipping, optional IcePop masking, and optional TIS correction.
 
     This implements the loss function which includes:
     1. PPO-style clipping on the importance sampling ratio
-    2. Optional Temporal Importance Sampling (TIS) correction for off-policy data
+    2. Optional IcePop hard masking (GLM-5): zeros gradient for tokens where ratio is outside [1/β, β]
+    3. Optional Temporal Importance Sampling (TIS) correction for off-policy data
 
     Supports multiple computation modes:
     - "compiled": RECOMMENDED. torch.compile (1.6x speed, 16% memory)
@@ -178,7 +185,7 @@ def policy_loss_function(
     # Compute cross-entropy (supports vocab-parallel TP via tp_group)
     per_token_ce = compute_per_token_ce(
         hidden_states_flat, weight, labels_flat, ignore_index, ce_mode, num_chunks,
-        tp_group=tp_group,
+        tp_group=tp_group, lm_head_fp32=lm_head_fp32,
     )
 
     new_logprobs_flat = -per_token_ce.detach()
@@ -218,14 +225,24 @@ def policy_loss_function(
                     "_n_valid_kl": 0,
                 }
 
-    # Compute PPO-style clipped loss (returns per-token losses and clip fraction)
-    pg_losses, clipfrac = compute_ppo_loss(
+    # Compute PPO-style clipped loss (returns per-token losses, clip mask, and ratio)
+    pg_losses, is_clipped, ratio = compute_ppo_loss(
         ppo_kl=ppo_kl,
         advantages=advantages_masked,
         eps_clip=eps_clip,
         eps_clip_high=eps_clip_high,
         eps_clip_c=eps_clip_c,
     )
+
+    # IcePop hard masking (GLM-5, arXiv:2602.15763):
+    # Zero gradient for tokens where ratio is outside [1/β, β]
+    icepop_mask = None
+    if icepop_beta is not None:
+        if use_tis:
+            logger.warning("IcePop and TIS are both enabled. IcePop makes TIS redundant "
+                           "when using inference logprobs as old_logprobs.")
+        ratio_d = ratio.detach()
+        icepop_mask = (ratio_d >= 1.0 / icepop_beta) & (ratio_d <= icepop_beta)
 
     # Apply TIS correction if enabled and rollout_logprobs provided
     tis_metrics = {}
@@ -240,55 +257,34 @@ def policy_loss_function(
             tis_clip_high=tis_clip_high,
         )
 
-    # For gradient flow, we need to connect pg_losses to the model parameters.
-    # pg_losses depends on ratio = exp(-ppo_kl) = exp(new_logprobs - old_logprobs)
-    # The gradient should flow through new_logprobs = -CE
-    #
-    # We compute a scaling factor from pg_losses and apply it to per_token_ce
-    # pg_loss = f(ratio) * advantages, where f includes clipping
-    # d(pg_loss)/d(theta) = f'(ratio) * ratio * advantages * d(new_logprobs)/d(theta)
-    #                     = f'(ratio) * ratio * advantages * (-1) * d(CE)/d(theta)
-    #
-    # For simplicity, we use: loss = pg_losses.detach() / (-new_logprobs.detach()) * per_token_ce
-    # This scales the CE gradient by the PPO loss weight
-    #
-    # Alternative: compute gradient weight directly
-    # gradient_weight = pg_losses / new_logprobs (but this has numerical issues)
-    #
-    # Simpler approach: use the ratio-weighted CE directly
-    ratio = (-ppo_kl).exp()
+    # Surrogate loss for gradient flow through CE
+    # True loss value (for logging): pg_losses averaged over valid tokens
+    true_loss = pg_losses.masked_fill(~valid_mask, 0.0).sum() / n_valid
 
-    # For clipped PPO, the effective gradient weight depends on whether we're clipped
-    # If not clipped: gradient flows normally through ratio * advantages
-    # If clipped: gradient is zero (clipped ratio is constant)
-    #
-    # We approximate this by: loss = (effective_weight) * CE
-    # where effective_weight = -pg_losses / CE.detach() (to preserve the loss magnitude)
-    #
-    # Actually, let's use a cleaner formulation:
-    # The PPO loss gradient w.r.t. theta is: -advantages * ratio * (1 - is_clipped) * d(logprob)/d(theta)
-    # = advantages * ratio * (1 - is_clipped) * d(CE)/d(theta)
-    #
-    # We can compute is_clipped from clipfrac, but it's per-token
-    # For now, use unclipped gradient (conservative - allows more learning)
-    gradient_weight = ratio.detach() * advantages_flat
-    gradient_weight = gradient_weight.masked_fill(~valid_mask, 0.0)
+    # Gradient-active mask: tokens that are not clipped, not IcePop-masked, and valid
+    gradient_active = ~is_clipped & valid_mask
+    if icepop_mask is not None:
+        gradient_active = gradient_active & icepop_mask
 
-    # Compute loss with gradient flowing through CE
-    loss_with_grad = (gradient_weight * per_token_ce).sum() / n_valid
+    # Surrogate: gradient weight = ratio * advantages, zeroed for inactive tokens
+    gradient_weight = (ratio.detach() * advantages_flat).masked_fill(~gradient_active, 0.0)
+    surrogate = (gradient_weight * per_token_ce).sum() / n_valid
+
+    # Combine: forward value from true_loss, gradient from surrogate
+    loss_with_grad = true_loss.detach() + surrogate - surrogate.detach()
 
     # Return training logprobs reshaped
     new_logprobs = new_logprobs_flat.view(original_shape)
 
     # Compute metrics
     with torch.no_grad():
-        # Always compute minimal metrics
-        # Use unclamped valid_mask.sum() so micro-batches with 0 valid tokens
-        # get weight 0 in the accumulation (not clamped-to-1).
         metrics = {
             "valid_tokens": valid_mask.sum().item(),
-            "pg_clipfrac": clipfrac[valid_mask].mean().item() if valid_mask.any() else 0.0,
+            "pg_clipfrac": is_clipped[valid_mask].float().mean().item() if valid_mask.any() else 0.0,
         }
+
+        if icepop_mask is not None:
+            metrics["icepop_maskfrac"] = (~icepop_mask)[valid_mask].float().mean().item() if valid_mask.any() else 0.0
 
         # Use pre-computed KL statistics (computed before torch.compile'd compute_ppo_loss)
         if _kl_stats is not None:

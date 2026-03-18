@@ -484,15 +484,17 @@ class InferenceEndpointsMixin:
             )
 
         try:
-            # Convert inference endpoints to list format for the engine
-            endpoints_data = [
-                {
-                    "host": ep.host,
-                    "port": ep.port,
-                    "world_size": ep.world_size,
-                }
-                for ep in self.inference_endpoints
-            ]
+            # Convert inference endpoints to list format for the engine.
+            # Deduplicate by (host, port) to avoid inflating world_size when
+            # the same endpoint is registered more than once (e.g. via
+            # add_inference_endpoint called from multiple paths).
+            seen: set[tuple[str, int]] = set()
+            endpoints_data = []
+            for ep in self.inference_endpoints:
+                key = (ep.host, ep.port)
+                if key not in seen:
+                    seen.add(key)
+                    endpoints_data.append({"host": ep.host, "port": ep.port, "world_size": ep.world_size})
 
             # Auto-detect master_address if localhost or empty (for cross-node NCCL)
             master_address = request.master_address

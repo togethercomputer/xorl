@@ -483,6 +483,15 @@ def _naive_apply_rotary_pos_emb(q, k, cos, sin):
     return q_embed, k_embed
 
 
+_rope_native = False
+
+
+def set_rope_native(enabled: bool):
+    """Set whether to use naive RoPE instead of flash_attn fused kernel."""
+    global _rope_native
+    _rope_native = enabled
+
+
 def apply_rotary_pos_emb(q, k, cos, sin):
     """Applies Rotary Position Embedding to the query and key tensors.
 
@@ -498,7 +507,7 @@ def apply_rotary_pos_emb(q, k, cos, sin):
         cos: The cosine part from RotaryEmbedding, shape [batch, seq_len, head_dim].
         sin: The sine part from RotaryEmbedding, shape [batch, seq_len, head_dim].
     """
-    if _flash_apply_rotary_emb is not None and q.is_cuda:
+    if _flash_apply_rotary_emb is not None and q.is_cuda and not _rope_native:
         # flash_attn expects x: [B, S, H, D], cos/sin: [S, D//2]
         # Our cos/sin are [B, S, D] with doubled freqs — take first batch, first half
         half_dim = cos.shape[-1] // 2

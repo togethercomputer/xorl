@@ -23,6 +23,7 @@ The handler manages:
 
 import base64
 import logging
+import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -89,72 +90,86 @@ class RoutingReplayHandler:
         self._moe_blocks = moe_blocks
         return moe_blocks
 
-    def decode_routed_experts_item(
+    def _decode_routing_array(
         self,
         item: Union[str, List, dict],
         num_moe_layers: int,
-    ) -> Optional[List[List[List[int]]]]:
-        """
-        Decode a single routed_experts item which may be base64-encoded or a nested list.
+        dtype: "np.dtype",
+        log_prefix: str,
+    ) -> Optional[List]:
+        """Decode a base64-encoded or nested-list routing array.
 
         Args:
-            item: Either a base64 string, a dict with 'data' and 'shape' keys, or a nested list
-            num_moe_layers: Number of MoE layers (used for shape inference)
+            item: Base64 string, dict with 'data'/'shape' keys, or nested list.
+            num_moe_layers: Used for shape inference when shape is absent.
+            dtype: numpy dtype for decoding (e.g. np.int32 or np.float32).
+            log_prefix: Prefix for warning messages.
 
         Returns:
-            Decoded routing data as nested list [num_tokens, num_layers, topk], or None if invalid
+            Nested list [num_tokens, num_layers, topk], or None if invalid.
         """
         if item is None:
             return None
 
-        # Already a nested list - return as-is
         if isinstance(item, list):
             return item
 
-        # Dict format from SGLang: {"data": base64_string, "shape": [num_tokens, num_layers, topk]}
+        # Dict format from SGLang: {"data": base64_string, "shape": [...]}
         if isinstance(item, dict):
             if "data" not in item:
-                logger.warning(f"R3: Dict item missing 'data' key: {item.keys()}")
+                logger.warning(f"{log_prefix}: Dict item missing 'data' key: {item.keys()}")
                 return None
-
             b64_data = item["data"]
             shape = item.get("shape")
-
             try:
                 decoded = base64.b64decode(b64_data)
-                arr = np.frombuffer(decoded, dtype=np.int32)
+                arr = np.frombuffer(decoded, dtype=dtype)
             except Exception as e:
-                logger.warning(f"R3: Failed to decode base64 data: {e}")
+                logger.warning(f"{log_prefix}: Failed to decode base64 data: {e}")
                 return None
-
             if shape:
                 try:
                     arr = arr.reshape(shape)
                 except Exception as e:
-                    logger.warning(f"R3: Failed to reshape with shape {shape}: {e}")
+                    logger.warning(f"{log_prefix}: Failed to reshape with shape {shape}: {e}")
                     return None
             else:
                 arr = self._infer_shape(arr, num_moe_layers)
                 if arr is None:
                     return None
-
             return arr.tolist()
 
         # Base64 string directly (legacy format)
         if isinstance(item, str):
             try:
                 decoded = base64.b64decode(item)
-                arr = np.frombuffer(decoded, dtype=np.int32)
+                arr = np.frombuffer(decoded, dtype=dtype)
                 arr = self._infer_shape(arr, num_moe_layers)
                 if arr is None:
                     return None
                 return arr.tolist()
             except Exception as e:
-                logger.warning(f"R3: Failed to decode base64 string: {e}")
+                logger.warning(f"{log_prefix}: Failed to decode base64 string: {e}")
                 return None
 
-        logger.warning(f"R3: Unknown routed_experts item type: {type(item)}")
+        logger.warning(f"{log_prefix}: Unknown item type: {type(item)}")
         return None
+
+    def decode_routed_experts_item(
+        self,
+        item: Union[str, List, dict],
+        num_moe_layers: int,
+    ) -> Optional[List[List[List[int]]]]:
+        """Decode a single routed_experts item (int32 expert indices)."""
+        return self._decode_routing_array(item, num_moe_layers, np.int32, "R3")
+
+    def decode_routed_expert_logits_item(
+        self,
+        item: Union[str, List, dict],
+        num_moe_layers: int,
+    ) -> Optional[List[List[List[float]]]]:
+        """Decode a single routed_expert_logits item (float32 routing weights)."""
+        return self._decode_routing_array(item, num_moe_layers, np.float32, "R3 weights")
 
     @staticmethod
     def _infer_shape(arr: np.ndarray, num_moe_layers: int) -> Optional[np.ndarray]:
@@ -174,6 +189,7 @@ class RoutingReplayHandler:
         self,
         micro_batches: List[Dict[str, Any]],
         routed_experts: Optional[List[Any]] = None,
+        routed_expert_logits: Optional[List[Any]] = None,
     ) -> bool:
         """
         Pre-populate RoutingReplay instances from inference routing data.
@@ -246,6 +262,27 @@ class RoutingReplayHandler:
                 layer_routing = mb_routing_tensor[:, moe_idx, :]
                 moe_blocks[moe_idx]._routing_replay.record(layer_routing)
 
+        # Pre-populate routing weights if provided (R3 weight replay)
+        if routed_expert_logits is not None:
+            decoded_weights = []
+            for item in routed_expert_logits:
+                decoded = self.decode_routed_expert_logits_item(item, num_moe_layers)
+                if decoded is not None:
+                    decoded_weights.append(decoded)
+
+            if decoded_weights:
+                per_mb_weights = self._build_per_mb_routing(
+                    micro_batches, decoded_weights, num_layers_in_data, topk
+                )
+                for mb_idx, mb_weights_tensor in enumerate(per_mb_weights):
+                    num_layers_to_use_w = min(num_moe_layers, mb_weights_tensor.shape[1])
+                    for moe_idx in range(num_layers_to_use_w):
+                        layer_weights = mb_weights_tensor[:, moe_idx, :].float()
+                        moe_blocks[moe_idx]._routing_replay.record_weights(layer_weights)
+                logger.debug(
+                    f"R3: Pre-populated routing weights for {len(per_mb_weights)} micro-batches"
+                )
+
         logger.debug(
             f"R3: Pre-populated {len(per_mb_routing)} micro-batches x "
             f"{num_layers_to_use} MoE layers into RoutingReplay instances"
@@ -273,6 +310,7 @@ class RoutingReplayHandler:
         if cp_enabled:
             cp_size = get_parallel_state().cp_size
             cp_rank = get_parallel_state().cp_rank
+            pad_to_multiple_of = math.lcm(128, cp_size)
 
         # Read num_samples from each micro-batch (set by SequentialPacker._finalize_packed_batch)
         micro_batch_datum_counts = [mb.get("num_samples", 1) for mb in micro_batches]
@@ -304,14 +342,24 @@ class RoutingReplayHandler:
             mb_total_tokens = len(mb_routing)
 
             if cp_enabled and mb_total_tokens > 0:
-                # SP-slice this concatenated block as ONE unit
-                # Matches TextSequenceShardCollator: pad to ceil(T/cp_size)*cp_size, then slice
-                cp_chunk_size = (mb_total_tokens + cp_size - 1) // cp_size
-                pad_count = cp_chunk_size * cp_size - mb_total_tokens
-
-                if pad_count > 0:
+                # CRITICAL: Pad to match packer's pad_to_multiple_of BEFORE SP chunking.
+                # The SequentialPacker pads sequences to lcm(128, cp_size) before
+                # TextSequenceShardCollator shards them. We must replicate this step
+                # so routing SP-slice boundaries match the actual data boundaries.
+                packing_pad = (pad_to_multiple_of - mb_total_tokens % pad_to_multiple_of) % pad_to_multiple_of
+                if packing_pad > 0:
                     pad_entry = [list(range(topk)) for _ in range(num_layers_in_data)]
-                    mb_routing = mb_routing + [pad_entry] * pad_count
+                    mb_routing = mb_routing + [pad_entry] * packing_pad
+
+                padded_len = mb_total_tokens + packing_pad
+
+                # SP-slice the padded block (matches TextSequenceShardCollator.sp_slice)
+                cp_chunk_size = (padded_len + cp_size - 1) // cp_size
+                sp_pad_count = cp_chunk_size * cp_size - padded_len
+
+                if sp_pad_count > 0:
+                    pad_entry = [list(range(topk)) for _ in range(num_layers_in_data)]
+                    mb_routing = mb_routing + [pad_entry] * sp_pad_count
 
                 start = cp_rank * cp_chunk_size
                 end = (cp_rank + 1) * cp_chunk_size
@@ -319,7 +367,8 @@ class RoutingReplayHandler:
 
                 logger.debug(
                     f"R3: SP MB{mb_idx} - {mb_total_tokens} tokens ({num_datums} datums), "
-                    f"sp_chunk={cp_chunk_size}, pad={pad_count}, slice [{start}:{end}]"
+                    f"packing_pad={packing_pad}, padded_len={padded_len}, "
+                    f"sp_chunk={cp_chunk_size}, sp_pad={sp_pad_count}, slice [{start}:{end}]"
                 )
 
             # Pad routing to match actual micro-batch token count.
@@ -353,6 +402,7 @@ class RoutingReplayHandler:
         self,
         micro_batches: List[Dict[str, Any]],
         routed_experts: Optional[List[Any]],
+        routed_expert_logits: Optional[List[Any]] = None,
     ) -> bool:
         """
         Set up R3 routing replay for the current forward/backward step.
@@ -363,6 +413,7 @@ class RoutingReplayHandler:
         Args:
             micro_batches: List of micro-batches for the current step.
             routed_experts: Optional routing data from inference rollout.
+            routed_expert_logits: Optional routing weights from inference.
 
         Returns:
             True if R3 routing was set up, False otherwise.
@@ -370,7 +421,7 @@ class RoutingReplayHandler:
         if routed_experts is None:
             return False
 
-        r3_enabled = self.fill_routing_replay(micro_batches, routed_experts)
+        r3_enabled = self.fill_routing_replay(micro_batches, routed_experts, routed_expert_logits)
         if r3_enabled:
             set_r3_mode(True)
             set_replay_stage("replay_backward")

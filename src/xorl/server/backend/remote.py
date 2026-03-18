@@ -214,7 +214,10 @@ class RemoteBackend(Backend):
         """Generic execute: create request, send, return result dict."""
         request = RunnerDispatchCommand.create(operation, payload, request_id=request_id)
         response = await self._send_and_receive(request, timeout=timeout)
-        return response.result
+        result = response.result
+        if response.execution_time is not None:
+            result["execution_time"] = response.execution_time
+        return result
 
     async def forward_backward(self, batches, loss_fn="causallm_loss", loss_fn_params=None,
                                model_id=None, routed_experts=None, request_id=None):

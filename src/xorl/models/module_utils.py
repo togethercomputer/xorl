@@ -410,7 +410,7 @@ class _MultiStreamDMA:
     def __init__(self, num_streams: int = 2):
         self._streams = [torch.cuda.Stream() for _ in range(num_streams)]
         self._counter = 0
-        self._pending: list[tuple] = []  # (gpu_temp, module, local_name, stream, dtensor_factory)
+        self._pending: list[tuple] = []  # (gpu_temp, module, local_name, stream, dtensor_factory, full_name)
 
     def dispatch(
         self,
@@ -419,8 +419,19 @@ class _MultiStreamDMA:
         tensor: "torch.Tensor",
         orig_tensor: "torch.Tensor",
         dtensor_factory: Optional[Callable] = None,
+        full_name: str = "",
     ) -> None:
-        """Pin, DMA on a round-robin stream, and defer the copy to flush()."""
+        """Pin a CPU tensor and DMA to GPU on a round-robin stream.
+
+        Only handles CPU→CUDA transfers.  CUDA→CUDA transfers (e.g. expert
+        stacked tensors from ExpertWeightBuffer) must NOT go through the DMA
+        scheduler — they are dispatched synchronously in _dispatch_parameter
+        to avoid interleaving no-op distribute_tensor calls (ep_fsdp mesh,
+        size 1) with real NCCL collectives (fsdp mesh, size > 1).
+        """
+        assert tensor.device.type == "cpu", (
+            f"DMA scheduler only handles CPU→CUDA, got {tensor.device} for {full_name}"
+        )
         if tensor.dtype != orig_tensor.dtype:
             tensor = tensor.to(dtype=orig_tensor.dtype)
         pinned = tensor.pin_memory()
@@ -428,11 +439,19 @@ class _MultiStreamDMA:
         self._counter += 1
         with torch.cuda.stream(stream):
             gpu_temp = pinned.to(device=orig_tensor.device, non_blocking=True)
-        self._pending.append((gpu_temp, module, local_name, stream, dtensor_factory))
+        self._pending.append((gpu_temp, module, local_name, stream, dtensor_factory, full_name))
 
     def flush(self) -> None:
-        """Sync all streams and copy GPU temps into model parameters."""
-        for gpu_temp, module, local_name, stream, dtensor_factory in self._pending:
+        """Sync all streams and copy GPU temps into model parameters.
+
+        Only CPU→CUDA (regular param) transfers are in the queue.  CUDA→CUDA
+        expert stacked tensors are dispatched synchronously outside the scheduler.
+        Sort by parameter name as a safety measure for deterministic NCCL
+        ordering (all ranks read the same checkpoint in the same order, but
+        sorting provides an extra guarantee).
+        """
+        self._pending.sort(key=lambda x: x[5])
+        for gpu_temp, module, local_name, stream, dtensor_factory, _full_name in self._pending:
             stream.synchronize()
             orig_tensor = module._parameters[local_name].data
             if dtensor_factory is not None and hasattr(orig_tensor, "device_mesh"):
@@ -441,6 +460,10 @@ class _MultiStreamDMA:
                 module._parameters[local_name].data.copy_(
                     dtensor_factory(gpu_temp, device_mesh, placements)
                 )
+                # distribute_tensor uses NCCL on a different CUDA stream.
+                # Synchronize to prevent races with subsequent DMA transfers
+                # on the copy-engine streams.
+                torch.cuda.synchronize()
             else:
                 module._parameters[local_name].data.copy_(gpu_temp)
         self._pending.clear()
@@ -472,18 +495,27 @@ def _dispatch_parameter(
     if parallel_plan is not None:
         tensor = parallel_plan.shard_tensor(tensor, full_param_name, orig_tensor.shape)
 
-    # Multi-stream fast path: defer copy to overlap DMA across GPU copy engines.
-    # Uses ~1 shard of extra VRAM for temporary GPU tensors, freed on flush().
+    # Multi-stream fast path: defer CPU→CUDA copies to overlap DMA across
+    # GPU copy engines.  Uses ~1 shard of extra VRAM for temp GPU tensors,
+    # freed per shard via flush().
+    #
+    # IMPORTANT: Only CPU→CUDA tensors go through the DMA scheduler.
+    # CUDA→CUDA tensors (expert stacked tensors from ExpertWeightBuffer) are
+    # dispatched synchronously below.  Mixing them in the same deferred queue
+    # would interleave no-op distribute_tensor calls (expert params on
+    # ep_fsdp mesh, size 1) with real NCCL collectives (regular params on
+    # fsdp mesh, size > 1), which can corrupt weights.
     if (
         _active_dma_scheduler is not None
         and tensor.device.type == "cpu"
         and orig_tensor.device.type == "cuda"
     ):
-        _active_dma_scheduler.dispatch(module, local_name, tensor, orig_tensor, dtensor_factory)
+        _active_dma_scheduler.dispatch(module, local_name, tensor, orig_tensor, dtensor_factory, full_param_name)
         return
 
-    # Fallback: single-stream pinned DMA (used outside bulk loading loops
-    # and for non-CPU→CUDA transfers).
+    # Synchronous fallback: used outside bulk loading loops and for CUDA→CUDA
+    # transfers (expert stacked tensors).
+    is_cuda_to_cuda = tensor.device.type != "cpu" and orig_tensor.device.type == "cuda"
     if tensor.device.type == "cpu" and orig_tensor.device.type == "cuda":
         if tensor.dtype != orig_tensor.dtype:
             tensor = tensor.to(dtype=orig_tensor.dtype)
@@ -494,6 +526,13 @@ def _dispatch_parameter(
     if hasattr(orig_tensor, "device_mesh"):  # dtensor
         device_mesh = getattr(orig_tensor, "device_mesh")
         placements = getattr(orig_tensor, "placements")
+        if is_cuda_to_cuda:
+            # Diagnostic: log expert stacked tensor dispatch (CUDA→CUDA DTensor path)
+            logger.debug(
+                f"Sync dispatch (CUDA→CUDA DTensor): {full_param_name} "
+                f"tensor={tensor.shape} orig={orig_tensor.shape} "
+                f"mesh_size={device_mesh.size()} placements={placements}"
+            )
         if orig_tensor.device.type == "cpu":
             # CPU DTensor: copy shard directly into local tensor.
             # distribute_tensor doesn't support CPU mesh, so we manually shard and copy.

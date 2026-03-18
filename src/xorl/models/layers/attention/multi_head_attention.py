@@ -89,6 +89,12 @@ class MultiHeadAttention(nn.Module):
 
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        # Optionally cast to bfloat16 after RoPE for SGLang numerical alignment
+        if getattr(self.config, '_attention_cast_bf16', False):
+            q = q.to(torch.bfloat16)
+            k = k.to(torch.bfloat16)
+
         return q, k, v
 
     def _project_output(self, attn_output: torch.Tensor) -> torch.Tensor:
