@@ -32,7 +32,7 @@ from xorl.checkpoint import build_checkpointer
 from xorl.data.constants import IGNORE_INDEX
 from xorl.distributed.offloading import build_activation_offloading_context
 from xorl.distributed.parallel_state import get_parallel_state, init_parallel_state
-from xorl.distributed.pipeline_parallel import build_pipeline_schedule
+from xorl.distributed.pipeline_parallel import build_pipeline_schedule, build_pp_stage
 from xorl.distributed.sequence_parallel.data import gather_outputs
 from xorl.lora import LoraLinear
 from xorl.models import all_ranks_load_weights, rank0_load_and_broadcast_weights
@@ -45,11 +45,13 @@ from xorl.ops.loss import (
 from xorl.optim import build_optimizer
 from xorl.trainers.model_builder import build_training_model
 from xorl.trainers.training_utils import (
-    build_pp_loss_fn,
+    pp_loss_fn,
     clip_gradients,
     count_valid_tokens,
     forward_backward_pp,
     maybe_merge_lora as _maybe_merge_lora_util,
+    negotiate_pp_seq_len,
+    pad_micro_batches_for_pp,
     sync_sp_gradients,
 )
 from xorl.server.runner.checkpoint import CheckpointManager
@@ -199,6 +201,9 @@ class ModelRunner:
         # Deferred gradient normalization: accumulate raw valid token counts
         # across forward_backward calls, normalize once at optim_step.
         self._accumulated_valid_tokens: Dict[str, int] = {}
+
+        # PP schedule cache: keyed by (n_microbatches, seq_len) to avoid rebuilding on every call.
+        self._pp_schedule_cache: Dict[tuple, Any] = {}
 
         # Multi-adapter support (initialized later if LoRA is enabled)
         self._adapter_manager: Optional[LoRAAdapterManager] = None
@@ -912,13 +917,14 @@ class ModelRunner:
 
             # Gradient accumulation — raw (unnormalized) backward.
             # Normalization by total accumulated valid tokens is deferred to optim_step.
-            # Always use the same formula: loss * local_valid_tokens * fsdp_size.
+            # FSDP's automatic gradient averaging is disabled (set_gradient_divide_factor(1.0)
+            # in torch_parallelize), so no fsdp_size compensation is needed here.
             # When local_valid_tokens=0, this produces 0 gradients while preserving
             # the full autograd graph through all parameters (including lm_head weight),
             # which is critical for FSDP2 reduce-scatter collectives.
             if compute_backward:
                 ps = get_parallel_state()
-                raw_loss = loss * local_valid_tokens.detach().float() * ps.fsdp_size
+                raw_loss = loss * local_valid_tokens.detach().float()
 
                 if abort_callback and abort_callback():
                     raise RuntimeError("Execution aborted by request")
@@ -988,27 +994,57 @@ class ModelRunner:
     # Pipeline Parallelism support
     # =========================================================================
 
-    def _build_pp_schedule(self, n_microbatches):
-        """Build pipeline parallel schedule for the given number of micro-batches."""
-        pp_loss_fn = build_pp_loss_fn(fsdp_size=get_parallel_state().fsdp_size)
+    def _get_pp_schedule(self, n_microbatches, seq_len):
+        """Return a cached PP schedule keyed by (n_microbatches, seq_len).
 
-        return build_pipeline_schedule(
-            stages=self.pp_stages,
-            n_microbatches=n_microbatches,
-            loss_fn=pp_loss_fn,
-            schedule_name=self.train_config.get("pipeline_parallel_schedule", "1F1B"),
-        )
+        A new PipelineStage (cheap, no deepcopy) is created for each unique
+        seq_len so P2P buffers match the actual tensor shape.
+        """
+        key = (n_microbatches, seq_len)
+        if key not in self._pp_schedule_cache:
+            ps = get_parallel_state()
+            stage = build_pp_stage(
+                self.model_parts[0],
+                pp_rank=ps.pp_rank,
+                num_stages=ps.pp_size,
+                device=get_device_type(),
+                pp_group=ps.pp_group,
+            )
+            self._pp_schedule_cache[key] = build_pipeline_schedule(
+                stages=[stage],
+                n_microbatches=n_microbatches,
+                loss_fn=pp_loss_fn,
+                schedule_name=self.train_config.get("pipeline_parallel_schedule", "1F1B"),
+            )
+        return self._pp_schedule_cache[key]
 
     def _forward_backward_pp(self, micro_batches, global_valid_tokens):
-        """Pipeline parallel forward-backward step."""
-        self._pp_global_valid_tokens = global_valid_tokens
-        pp_schedule = self._build_pp_schedule(len(micro_batches))
+        """Pipeline parallel forward-backward step.
+
+        With pp_variable_seq_lengths: negotiates per-step max seq_len across PP
+        ranks and pads micro-batches to that length before running the schedule.
+
+        Returns raw CE_sum (unnormalized); the caller accumulates
+        global_valid_tokens into _accumulated_valid_tokens so that
+        optim_step can normalize gradients by the full accumulated total.
+        """
         ps = get_parallel_state()
+        if self.train_config.get("pp_variable_seq_lengths", False):
+            seq_len = negotiate_pp_seq_len(micro_batches, ps.pp_group)
+            pad_micro_batches_for_pp(
+                micro_batches,
+                sample_packing_sequence_len=seq_len * ps.cp_size,
+                sp_size=ps.cp_size,
+                pad_to_multiple_of=self.train_config.get("pad_to_multiple_of", 1),
+            )
+        else:
+            seq_len = micro_batches[0]["input_ids"].shape[-1]
+
+        pp_schedule = self._get_pp_schedule(len(micro_batches), seq_len)
         return forward_backward_pp(
             model_parts=self.model_parts,
             pp_schedule=pp_schedule,
             micro_batches=micro_batches,
-            global_valid_tokens=global_valid_tokens,
             has_first_stage=self.has_first_stage,
             has_last_stage=self.has_last_stage,
             pp_group=ps.pp_group,
@@ -1145,12 +1181,20 @@ class ModelRunner:
         # PP path
         if self.pp_enabled:
             global_valid_tokens = self._count_global_valid_tokens(micro_batches)
+            # Static padding: pad to sample_packing_sequence_len upfront.
+            # With pp_variable_seq_lengths, padding is deferred to _forward_backward_pp.
+            if not self.train_config.get("pp_variable_seq_lengths", False):
+                pad_micro_batches_for_pp(
+                    micro_batches,
+                    sample_packing_sequence_len=self.train_config.get("sample_packing_sequence_len", 0),
+                    sp_size=get_parallel_state().cp_size,
+                    pad_to_multiple_of=self.train_config.get("pad_to_multiple_of", 1),
+                )
             raw_total_loss = self._forward_backward_pp(micro_batches, global_valid_tokens)
-            # raw_total_loss = sum(CE_sum * fsdp_size) from PP schedule.
-            # Normalize for reporting: divide by fsdp_size and global_valid_tokens.
-            ps = get_parallel_state()
+            # raw_total_loss = sum of CE_sum across micro-batches (unnormalized).
+            # Normalize for reporting: divide by global_valid_tokens.
             gvt = global_valid_tokens.item()
-            reported_loss = raw_total_loss / ps.fsdp_size / gvt if gvt > 0 else 0.0
+            reported_loss = raw_total_loss / gvt if gvt > 0 else 0.0
             result = {
                 "total_loss": reported_loss,
                 "global_valid_tokens": gvt,

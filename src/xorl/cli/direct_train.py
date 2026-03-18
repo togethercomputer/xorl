@@ -574,7 +574,7 @@ def main():
                                 loss = loss + model.router_aux_loss_coef * aux_loss.to(loss.device)
 
                         local_valid_tokens = (labels != IGNORE_INDEX).sum()
-                        ga_loss, _ = gradient_accumulate_loss(loss, local_valid_tokens, global_valid_tokens, fsdp_size=ps.fsdp_size)
+                        ga_loss, _ = gradient_accumulate_loss(loss, local_valid_tokens, global_valid_tokens)
                     if use_routing_replay:
                         set_replay_stage("replay_backward")
 

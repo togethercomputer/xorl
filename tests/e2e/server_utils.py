@@ -46,6 +46,7 @@ def generate_server_config(
     freeze_router: bool = True,
     # Other
     skip_initial_checkpoint: bool = True,
+    extra_config: Optional[dict] = None,
 ) -> str:
     """Generate a flat server YAML config (ServerArguments format).
 
@@ -118,6 +119,9 @@ def generate_server_config(
 
     if ep_size > 1 or moe_implementation is not None:
         config["freeze_router"] = freeze_router
+
+    if extra_config:
+        config.update(extra_config)
 
     yaml_path = os.path.join(output_dir, "server_config.yaml")
     os.makedirs(output_dir, exist_ok=True)

@@ -148,8 +148,10 @@ class TrainingResult:
         """Assert training completed successfully with useful diagnostics."""
         if not self.success:
             stderr_tail = "\n".join(self.stderr.splitlines()[-50:])
+            stdout_tail = "\n".join(self.stdout.splitlines()[-80:])
             raise AssertionError(
                 f"Training failed (exit_code={self.exit_code}){': ' + msg if msg else ''}\n"
+                f"--- stdout (last 80 lines) ---\n{stdout_tail}\n"
                 f"--- stderr (last 50 lines) ---\n{stderr_tail}"
             )
         assert self.metrics is not None, (
@@ -455,10 +457,14 @@ def run_training(
             env=env,
         )
     except subprocess.TimeoutExpired as e:
+        def _to_str(v, fallback):
+            if isinstance(v, bytes):
+                return v.decode(errors="replace")
+            return v or fallback
         return TrainingResult(
             exit_code=-1,
-            stdout=e.stdout or "",
-            stderr=e.stderr or f"Timeout after {timeout}s",
+            stdout=_to_str(e.stdout, ""),
+            stderr=_to_str(e.stderr, f"Timeout after {timeout}s"),
             output_dir=_read_output_dir(config_path),
         )
 

@@ -223,6 +223,8 @@ def parallelize_model_fsdp2(
             if hasattr(experts_mod, "set_gradient_divide_factor"):
                 # average EP grads across EP ranks
                 experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
+                # mark so the global divide-factor reset below doesn't override this
+                experts_mod._is_ep_fsdp = True
             layer_mod._fsdp_modules.append(experts_mod)
         # shard module that needs to ignore mixed precision control
         if mp_ignored_classes:
@@ -293,12 +295,14 @@ def parallelize_model_fsdp2(
                 prefetch_modules = prev_block._fsdp_modules
                 current_block.set_modules_to_backward_prefetch(list(reversed(prefetch_modules)))
 
-    # For PP: disable FSDP's automatic gradient division (we normalize loss manually)
-    if pp_enabled:
-        from torch.distributed._composable.fsdp.fully_shard import FSDPModule
-        for module in model.modules():
-            if isinstance(module, FSDPModule):
-                module.set_gradient_divide_factor(1.0)
+    # Disable FSDP's automatic gradient averaging — we normalize gradients manually
+    # (gradient_accumulate_loss for non-PP; explicit grad.mul_(1/gvt) for PP).
+    # Skip EP-sharded expert modules: they manage their own divide factor (ep_size)
+    # for averaging expert gradients across EP ranks.
+    from torch.distributed._composable.fsdp.fully_shard import FSDPModule
+    for module in model.modules():
+        if isinstance(module, FSDPModule) and not getattr(module, "_is_ep_fsdp", False):
+            module.set_gradient_divide_factor(1.0)
 
     # Handle meta initialization for FSDP2 (fallback if pre-load not done)
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
@@ -396,7 +400,6 @@ def build_parallelize_model(
         stages, model_parts = pipeline_module_split(
             model,
             pp_mesh=pp_mesh,
-            pp_schedule=pp_schedule,
             device=device,
             module_names_per_stage=module_names_per_stage,
             always_keep_fqns=pp_config.get("always_keep_fqns"),
