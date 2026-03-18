@@ -21,6 +21,7 @@ def importance_sampling_loss_function(
     return_per_token: bool = False,
     tp_group: Optional[dist.ProcessGroup] = None,
     compute_kl_stats: bool = False,
+    lm_head_fp32: bool = False,
 ) -> "LossOutput":
     """
     Compute importance sampling loss for GRPO/RL training.
@@ -69,7 +70,7 @@ def importance_sampling_loss_function(
     # ---- Cross-entropy computation ----
     per_token_ce = compute_per_token_ce(
         hidden_states_flat, weight, labels_flat, ignore_index, ce_mode, num_chunks,
-        tp_group=tp_group,
+        tp_group=tp_group, lm_head_fp32=lm_head_fp32,
     )
 
     # new logprobs = log p(target) = -CE

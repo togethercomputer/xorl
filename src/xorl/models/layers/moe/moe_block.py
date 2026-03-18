@@ -144,8 +144,11 @@ class MoEBlock(nn.Module):
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # Route
-        router_logits = self.gate(hidden_states)
+        # Route (optionally upcast to fp32 for numerical alignment with SGLang)
+        if getattr(self, 'config', None) is not None and getattr(self.config, '_router_fp32', False):
+            router_logits = F.linear(hidden_states.float(), self.gate.weight.float())
+        else:
+            router_logits = self.gate(hidden_states)
 
         # --- Routing replay for checkpoint determinism ---
         # All active paths (record/replay_forward/replay_backward) go through
@@ -162,6 +165,7 @@ class MoEBlock(nn.Module):
         replay = self._routing_replay
 
         if stage is not None and replay is not None:
+            cached_weights = None
             if stage == "record":
                 # Determine expert selection without creating autograd nodes
                 with torch.no_grad():
@@ -169,13 +173,19 @@ class MoEBlock(nn.Module):
                 replay.record(selected_experts)
             elif stage == "replay_forward":
                 selected_experts = replay.pop_forward()
+                cached_weights = replay.pop_forward_weights()
             elif stage == "replay_backward":
                 selected_experts = replay.pop_backward()
+                cached_weights = replay.pop_backward_weights()
 
-            # Uniform autograd path: softmax -> gather(cached indices) -> normalize
-            selected_experts, routing_weights = self._regather_routing(
-                router_logits, selected_experts, hidden_states.dtype
-            )
+            if cached_weights is not None:
+                # Use pre-populated weights from inference (R3 weight replay)
+                routing_weights = cached_weights.to(hidden_states.dtype)
+            else:
+                # Uniform autograd path: softmax -> gather(cached indices) -> normalize
+                selected_experts, routing_weights = self._regather_routing(
+                    router_logits, selected_experts, hidden_states.dtype
+                )
         else:
             # No replay active: use standard router
             routing_weights, selected_experts = self.router(

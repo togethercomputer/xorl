@@ -1,0 +1,56 @@
+# Server-side configuration for xorl Training Server (Qwen3-235B-A22B, 8 nodes)
+#
+# Full weight training of the 235B MoE model across 8 nodes (64 GPUs).
+# EP=64 (2 experts per GPU), Ulysses=64 (all GPUs in sequence parallel).
+
+# Model Configuration
+model_path: Qwen/Qwen3-235B-A22B-Instruct-2507
+tokenizer_path: Qwen/Qwen3-235B-A22B-Instruct-2507
+attn_implementation: flash_attention_3
+moe_implementation: triton
+ep_dispatch: alltoall
+router_fp32: true
+lm_head_fp32: true
+rmsnorm_native: true
+activation_native: true
+rope_native: true
+attention_cast_bf16: true
+
+# Parallelism Configuration
+# 8 nodes x 8 GPUs = 64 total
+# EP=64: 128 experts / 64 = 2 experts per GPU
+# Ulysses=64: all GPUs for sequence parallel
+data_parallel_mode: fsdp2
+expert_parallel_size: 64
+ulysses_parallel_size: 64
+data_parallel_replicate_size: 1
+data_parallel_shard_size: 1
+
+# Memory & Performance
+enable_mixed_precision: true
+enable_gradient_checkpointing: true
+enable_full_shard: true
+enable_activation_offload: true
+init_device: meta
+load_weights_mode: all_ranks
+
+# Checkpointing
+output_dir: outputs/8node-235b-ep
+load_checkpoint_path: ""
+ckpt_manager: dcp
+skip_initial_checkpoint: true
+
+# Logging
+log_level: INFO
+
+# Worker Configuration (Multi-Node)
+worker_connection_timeout: 3600.0
+worker_max_retries: 3
+
+# Data Processing Configuration
+sample_packing_sequence_len: 88000
+enable_packing: true
+
+# Full-weights training
+enable_lora: false
+freeze_router: false

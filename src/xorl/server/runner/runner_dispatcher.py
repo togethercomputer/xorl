@@ -183,10 +183,58 @@ class RunnerDispatcher:
         # Adapter coordinator (multi-rank adapter lifecycle: broadcast, eviction, save/load)
         self._adapter_coordinator = AdapterCoordinator(trainer, rank, world_size, cpu_group)
 
+        # NCCL watchdog: error state for cross-rank propagation
+        self._worker_error: Optional[str] = None
+
         logger.info(
             f"RunnerDispatcher initialized (rank={rank}/{world_size}, "
             f"bind_address={bind_address}, device={device})"
         )
+
+    # Operations that participate in cross-rank error sync.
+    # Only compute ops where all ranks execute in lockstep.
+    # Excludes weight sync, save/load, etc. that have their own sync mechanisms.
+    _ERROR_SYNC_OPS = {"forward_backward", "forward", "optim_step"}
+
+    def _sync_error_state(self) -> Optional[str]:
+        """Synchronize error state across all ranks via Gloo group.
+
+        Two-phase error detection:
+        1. All-reduce error flag: fast check if ANY rank has error
+        2. All-gather error strings: only when error detected
+
+        Returns the error message if any rank has error, None otherwise.
+        """
+        if self.cpu_group is None or self.world_size <= 1:
+            return self._worker_error
+
+        # Phase 1: Fast flag check - single int all-reduce
+        has_error = torch.tensor([1 if self._worker_error else 0], dtype=torch.int64)
+        try:
+            dist.all_reduce(has_error, op=dist.ReduceOp.MAX, group=self.cpu_group)
+        except Exception as e:
+            logger.error(f"Rank {self.rank}: Error flag all-reduce failed: {e}")
+            return self._worker_error or str(e)
+
+        if has_error.item() == 0:
+            return None  # All ranks healthy
+
+        # Phase 2: Gather actual error messages
+        error_strings = [None] * self.world_size
+        try:
+            dist.all_gather_object(error_strings, self._worker_error or "", group=self.cpu_group)
+        except Exception as e:
+            logger.error(f"Rank {self.rank}: Error gather failed: {e}")
+            return self._worker_error or str(e)
+
+        # Format error message from all ranks
+        errors = {i: msg for i, msg in enumerate(error_strings) if msg}
+        if errors:
+            error_summary = "; ".join(f"rank {i}: {msg}" for i, msg in errors.items())
+            logger.error(f"Rank {self.rank}: Cross-rank errors detected: {error_summary}")
+            return error_summary
+
+        return None
 
     async def start(self):
         """Start the worker. Rank 0 handles ZMQ, all ranks participate in distributed ops."""
@@ -300,14 +348,23 @@ class RunnerDispatcher:
                     # Log gracefully - only include traceback for unexpected errors
                     error_msg = str(cmd_error)
                     if "sleep mode" in error_msg.lower():
-                        # Expected error - log without traceback
                         logger.error(f"Rank {self.rank}: {error_msg}")
                     else:
-                        # Unexpected error - log with traceback
                         logger.error(
                             f"Rank {self.rank}: Error executing command {command_type}: {cmd_error}", exc_info=True
                         )
-                    # Continue to next command instead of crashing - DON'T break or set _running=False
+                    # Set error state so rank 0 can detect it during sync
+                    self._worker_error = error_msg
+
+                # Post-execution error sync for compute ops only (matches rank 0)
+                if command_type in self._ERROR_SYNC_OPS:
+                    try:
+                        cross_rank_error = self._sync_error_state()
+                        if cross_rank_error:
+                            logger.warning(f"Rank {self.rank}: Cross-rank error detected: {cross_rank_error}")
+                        self._worker_error = None
+                    except Exception:
+                        self._worker_error = None
 
             except asyncio.CancelledError:
                 logger.info(f"Rank {self.rank}: Worker event loop cancelled")
@@ -406,6 +463,18 @@ class RunnerDispatcher:
                 )
             result = await getattr(self, handler_name)(command_dict)
 
+            # Post-execution error sync for compute ops only
+            # (weight sync, save/load have their own distributed sync)
+            if command_type in self._ERROR_SYNC_OPS:
+                cross_rank_error = self._sync_error_state()
+                if cross_rank_error:
+                    self._worker_error = None
+                    return RunnerResponse(
+                        request_id=request.message_id, success=False,
+                        error=f"Cross-rank error: {cross_rank_error}",
+                        execution_time=time.time() - start_time,
+                    )
+
             return RunnerResponse(
                 request_id=request.message_id, success=True, result=result, execution_time=time.time() - start_time
             )
@@ -417,6 +486,15 @@ class RunnerDispatcher:
                 logger.error(f"Rank {self.rank}: {error_msg}")
             else:
                 logger.error(f"Rank {self.rank}: Error handling request: {e}", exc_info=True)
+
+            # Set error state so other ranks can detect it during compute ops
+            if command_type in self._ERROR_SYNC_OPS:
+                self._worker_error = str(e)
+                try:
+                    self._sync_error_state()
+                except Exception:
+                    pass
+                self._worker_error = None
 
             return RunnerResponse(
                 request_id=request.message_id, success=False, error=str(e), execution_time=time.time() - start_time
@@ -473,7 +551,12 @@ class RunnerDispatcher:
     async def _handle_compute_rank0_scatter(
         self, command_dict: Dict[str, Any], with_backward: bool
     ) -> Dict[str, Any]:
-        """Rank 0: convert batches, scatter to all ranks, run compute, gather metrics.
+        """Rank 0: select own batches from broadcast data, run compute, gather metrics.
+
+        Uses broadcast-and-select pattern: all ranks received the full payload via
+        broadcast_object_list (in _handle_request_rank0). Each rank locally selects
+        its own batch slice via _select_and_prepare_batches, avoiding the expensive
+        scatter_object_list call (~5.6s per call on 64 GPUs due to Gloo pickle).
 
         Args:
             command_dict: Command payload containing batches, loss_fn, etc.
@@ -484,6 +567,7 @@ class RunnerDispatcher:
         loss_fn = p.loss_fn
         loss_fn_params = p.loss_fn_params
         routed_experts = p.routed_experts
+        routed_expert_logits = p.routed_expert_logits
         model_id = p.model_id if with_backward else None
 
         # Auto-load adapter if it was evicted (all ranks must call this together)
@@ -491,77 +575,21 @@ class RunnerDispatcher:
         if with_backward:
             was_auto_loaded, auto_load_path = self._adapter_coordinator.auto_load_if_evicted(model_id)
 
-        # Convert batches to tensors
-        converted_batches = [self._convert_batch_to_tensors(batch) for batch in batches]
+        # Select and prepare batches (broadcast-and-select, no scatter)
+        my_batches, routed_experts, routed_expert_logits = self._select_and_prepare_batches(
+            batches, routed_experts=routed_experts, routed_expert_logits=routed_expert_logits
+        )
 
         # Get sequence parallelism info
         parallel_state = get_parallel_state()
-        cp_size = parallel_state.cp_size
         cp_enabled = parallel_state.cp_enabled
-
-        # Scatter batches to all ranks
-        # NOTE: For FSDP, ALL ranks must participate in forward/backward with the same number of batches
-        # With SP enabled, all ranks in an SP group must process the SAME batch (each rank shards locally)
-        # With PP, all pipeline stages process the SAME microbatches (data flows through the pipeline).
-        num_batches = len(converted_batches)
-
-        if self.world_size > 1:
-            # Calculate effective DP size (accounting for sequence parallelism and PP)
-            # Each SP group acts as one DP unit - all ranks in SP group process same batch
-            # Each PP pipeline processes the same microbatches - don't split data across PP stages
-            pp_size = parallel_state.pp_size if parallel_state.pp_enabled else 1
-            dp_size = self.world_size // (cp_size * pp_size)
-
-            # Calculate batches per DP group (not per rank)
-            # With PP, each rank needs at least pp_size microbatches for the pipeline schedule
-            batches_per_dp_group = (num_batches + dp_size - 1) // dp_size
-            if pp_size > 1:
-                batches_per_dp_group = max(batches_per_dp_group, pp_size)
-            total_needed = batches_per_dp_group * dp_size
-
-            # Pad with dummy batches that have valid inputs but labels=-100.
-            # We clone input fields (input_ids, attention_mask, position_ids) from a
-            # real batch so the model forward pass produces valid outputs (no NaN).
-            # Setting labels=-100 means loss=0 and gradient_accumulate_loss produces
-            # grad_scale=0 (local_valid_tokens=0), so dummy ranks contribute nothing
-            # to the gradient while still participating in FSDP collectives correctly.
-            if num_batches < total_needed:
-                num_dummy = total_needed - num_batches
-                logger.debug(
-                    f"Rank {self.rank}: Padding with {num_dummy} dummy batches "
-                    f"(valid inputs, labels=-100) to fill {total_needed} DP slots"
-                )
-                for i in range(num_dummy):
-                    src_batch = converted_batches[i % num_batches]
-                    converted_batches.append(self._create_dummy_batch(src_batch))
-
-            # Distribute batches across ranks, accounting for sequence parallelism and PP
-            batches_per_rank = self._distribute_batches_to_ranks(
-                converted_batches, dp_size, cp_size, cp_enabled, batches_per_dp_group,
-                pp_size=pp_size,
-            )
-
-            # Compute per-rank R3 datum offset so each rank can slice routed_experts
-            if routed_experts is not None:
-                self._assign_r3_datum_offsets(
-                    batches_per_rank, converted_batches, dp_size, cp_size,
-                    cp_enabled, batches_per_dp_group, num_batches
-                )
-
-            # Scatter using object list
-            output_list = [None]
-            dist.scatter_object_list(output_list, batches_per_rank, src=0)
-            my_batches = output_list[0]
-        else:
-            # Single rank mode
-            my_batches = converted_batches
 
         result = self._execute_and_gather(
             my_batches, loss_fn, loss_fn_params, routed_experts,
             cp_enabled, parallel_state,
             with_backward=with_backward, model_id=model_id, is_rank0=True,
+            routed_expert_logits=routed_expert_logits,
         )
-        del converted_batches
 
         # Add auto-load info to result if adapter was loaded from checkpoint
         if was_auto_loaded:
@@ -573,26 +601,33 @@ class RunnerDispatcher:
     async def _handle_compute_worker_receive(
         self, command_dict: Dict[str, Any], with_backward: bool
     ) -> None:
-        """Worker ranks: receive scattered batches, run compute, participate in collective metrics.
+        """Worker ranks: select own batches from broadcast data, run compute, participate in collective metrics.
+
+        Uses broadcast-and-select pattern: workers get the full payload via
+        broadcast_object_list (in _worker_event_loop) and locally select their
+        batch slice via _select_and_prepare_batches, avoiding the expensive
+        scatter_object_list call (~5.6s per call on 64 GPUs due to Gloo pickle).
 
         Args:
-            command_dict: Command payload containing loss_fn, etc.
+            command_dict: Command payload containing batches, loss_fn, etc.
             with_backward: If True, run forward+backward (training); if False, forward-only.
         """
         p: ModelPassData = command_dict.get("payload", ModelPassData())
+        batches = p.batches or []
         loss_fn = p.loss_fn
         loss_fn_params = p.loss_fn_params
         routed_experts = p.routed_experts
+        routed_expert_logits = p.routed_expert_logits
         model_id = p.model_id if with_backward else None
 
         # Auto-load adapter if it was evicted (all ranks must call this together)
         if with_backward:
             self._adapter_coordinator.auto_load_if_evicted(model_id)
 
-        # Receive scattered batches from rank 0
-        output_list = [None]
-        dist.scatter_object_list(output_list, None, src=0)
-        my_batches = output_list[0]
+        # Select and prepare this rank's batches from broadcast data (no scatter)
+        my_batches, routed_experts, routed_expert_logits = self._select_and_prepare_batches(
+            batches, routed_experts=routed_experts, routed_expert_logits=routed_expert_logits
+        )
 
         # Get parallel state for SP info
         parallel_state = get_parallel_state()
@@ -602,19 +637,23 @@ class RunnerDispatcher:
             my_batches, loss_fn, loss_fn_params, routed_experts,
             cp_enabled, parallel_state,
             with_backward=with_backward, model_id=model_id, is_rank0=False,
+            routed_expert_logits=routed_expert_logits,
         )
 
     # -- Helpers for compute handlers --
 
     def _execute_and_gather(self, my_batches, loss_fn, loss_fn_params, routed_experts,
-                            cp_enabled, parallel_state, *, with_backward, model_id, is_rank0):
+                            cp_enabled, parallel_state, *, with_backward, model_id, is_rank0,
+                            routed_expert_logits=None):
         """Shard batches, execute compute, gather IS metrics. Shared by rank-0 and workers."""
         my_batches, routed_experts = self._shard_and_slice_batches(
             my_batches, routed_experts, cp_enabled, parallel_state
         )
+
         result = self._execute_compute(
             my_batches, loss_fn, loss_fn_params, routed_experts,
             with_backward=with_backward, model_id=model_id,
+            routed_expert_logits=routed_expert_logits,
         )
         del my_batches
         self._gather_is_metrics(result, cp_enabled, is_rank0=is_rank0)
@@ -646,86 +685,90 @@ class RunnerDispatcher:
         dummy_batch["num_samples"] = 0
         return dummy_batch
 
-    def _distribute_batches_to_ranks(
-        self,
-        converted_batches: List[Dict[str, Any]],
-        dp_size: int,
-        cp_size: int,
-        cp_enabled: bool,
-        batches_per_dp_group: int,
-        pp_size: int = 1,
-    ) -> List[List[Dict[str, Any]]]:
-        """Distribute batches across ranks, accounting for sequence parallelism and PP.
-
-        With SP enabled: all ranks in same SP group get the SAME full batch.
-        Each rank applies its own sequence sharding locally based on its cp_rank.
-
-        With PP enabled: all ranks in the same pipeline get the SAME microbatches.
-        Data is only split across DP groups (dp_shard * dp_replicate), not across PP stages.
-        The device mesh ordering is [pp, ..., dp_shard], so:
-            global_rank = pp_stage * (world_size // pp_size) + dp_rank
-        """
-        batches_per_rank: List[List[Dict[str, Any]]] = [[] for _ in range(self.world_size)]
-        ranks_per_stage = self.world_size // pp_size
-
-        if cp_enabled:
-            logger.debug(
-                f"Rank {self.rank}: SP enabled (cp_size={cp_size}, dp_size={dp_size}), "
-                f"broadcasting full batches to SP groups (each rank shards locally)"
-            )
-            for dp_rank in range(dp_size):
-                start_idx = dp_rank * batches_per_dp_group
-                end_idx = start_idx + batches_per_dp_group
-                dp_batches = converted_batches[start_idx:end_idx]
-
-                for cp_rank in range(cp_size):
-                    for pp_stage in range(pp_size):
-                        global_rank = pp_stage * ranks_per_stage + dp_rank * cp_size + cp_rank
-                        batches_per_rank[global_rank] = [
-                            {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in b.items()}
-                            for b in dp_batches
-                        ]
-        else:
-            for dp_rank in range(dp_size):
-                start_idx = dp_rank * batches_per_dp_group
-                end_idx = start_idx + batches_per_dp_group
-                dp_batches = converted_batches[start_idx:end_idx]
-                for pp_stage in range(pp_size):
-                    global_rank = pp_stage * ranks_per_stage + dp_rank
-                    batches_per_rank[global_rank] = dp_batches
-
-        return batches_per_rank
-
     @staticmethod
-    def _assign_r3_datum_offsets(
-        batches_per_rank: List[List[Dict[str, Any]]],
-        converted_batches: List[Dict[str, Any]],
-        dp_size: int,
-        cp_size: int,
-        cp_enabled: bool,
-        batches_per_dp_group: int,
-        num_real_batches: int,
-    ) -> None:
-        """Assign R3 datum offsets to each rank's batches for routed_experts slicing."""
-        datum_offset = 0
-        for dp_rank in range(dp_size):
-            start_idx = dp_rank * batches_per_dp_group
-            end_idx = min(start_idx + batches_per_dp_group, num_real_batches)
+    def _dp_batch_range(dp_rank: int, base_count: int, remainder: int):
+        """Return (start_idx, count) for a DP rank under balanced distribution.
+
+        The first `remainder` DP ranks each get `base_count + 1` batches; the rest
+        get `base_count`.  Used by both _select_and_prepare_batches and the datum-
+        offset loop inside it to avoid duplicating the formula.
+        """
+        if dp_rank < remainder:
+            return dp_rank * (base_count + 1), base_count + 1
+        return remainder * (base_count + 1) + (dp_rank - remainder) * base_count, base_count
+
+    def _select_and_prepare_batches(self, raw_batches, routed_experts=None, routed_expert_logits=None):
+        """Each rank locally selects its own batches from the full broadcast data.
+
+        Instead of scatter, every rank receives ALL raw batches via broadcast and
+        independently computes which slice belongs to its DP group.
+
+        Args:
+            raw_batches: List of raw batch dicts (Python lists, not yet tensors).
+            routed_experts: Optional R3 routing data (list indexed by datum).
+            routed_expert_logits: Optional R3 routing logits (list indexed by datum).
+
+        Returns:
+            Tuple of (my_batches, routed_experts_slice, routed_expert_logits_slice).
+        """
+        parallel_state = get_parallel_state()
+        cp_size = parallel_state.cp_size
+        pp_size = parallel_state.pp_size if parallel_state.pp_enabled else 1
+
+        num_batches = len(raw_batches)
+
+        if self.world_size <= 1:
+            converted = [self._convert_batch_to_tensors(b) for b in raw_batches]
+            return converted, routed_experts, routed_expert_logits
+
+        dp_size = self.world_size // (cp_size * pp_size)
+        dp_rank = self.rank // (cp_size * pp_size)
+        batches_per_dp_group = (num_batches + dp_size - 1) // dp_size
+        if pp_size > 1:
+            batches_per_dp_group = max(batches_per_dp_group, pp_size)
+
+        base_count = num_batches // dp_size
+        remainder = num_batches % dp_size
+
+        start_idx, my_real_count = self._dp_batch_range(dp_rank, base_count, remainder)
+        my_raw_batches = raw_batches[start_idx:start_idx + my_real_count]
+
+        # Convert only this rank's batches to tensors
+        my_batches = [self._convert_batch_to_tensors(b) for b in my_raw_batches]
+
+        # Pad with dummy batches to reach batches_per_dp_group
+        if len(my_batches) < batches_per_dp_group:
+            reference = my_batches[-1] if my_batches else self._convert_batch_to_tensors(raw_batches[0])
+            for _ in range(batches_per_dp_group - len(my_batches)):
+                my_batches.append(self._create_dummy_batch(reference))
+
+        # Slice routed_experts / routed_expert_logits for this DP group
+        routed_experts_slice = None
+        routed_expert_logits_slice = None
+        if routed_experts is not None or routed_expert_logits is not None:
+            # Compute datum offset: sum samples in all prior DP groups
+            datum_offset = 0
+            for dp in range(dp_rank):
+                g_start, g_count = self._dp_batch_range(dp, base_count, remainder)
+                for bi in range(g_start, g_start + g_count):
+                    datum_offset += raw_batches[bi].get("num_samples", 1)
+
             dp_datum_count = sum(
-                converted_batches[bi].get("num_samples", 1)
-                for bi in range(start_idx, end_idx)
+                raw_batches[start_idx + i].get("num_samples", 1) for i in range(my_real_count)
             )
-            if cp_enabled:
-                for cp_rank in range(cp_size):
-                    global_rank = dp_rank * cp_size + cp_rank
-                    if batches_per_rank[global_rank]:
-                        batches_per_rank[global_rank][0]["_r3_datum_offset"] = datum_offset
-                        batches_per_rank[global_rank][0]["_r3_datum_count"] = dp_datum_count
-            else:
-                if batches_per_rank[dp_rank]:
-                    batches_per_rank[dp_rank][0]["_r3_datum_offset"] = datum_offset
-                    batches_per_rank[dp_rank][0]["_r3_datum_count"] = dp_datum_count
-            datum_offset += dp_datum_count
+
+            if routed_experts is not None:
+                routed_experts_slice = routed_experts[datum_offset:datum_offset + dp_datum_count]
+            if routed_expert_logits is not None:
+                routed_expert_logits_slice = routed_expert_logits[datum_offset:datum_offset + dp_datum_count]
+
+        logger.debug(
+            f"Rank {self.rank}: _select_and_prepare_batches: dp_rank={dp_rank}/{dp_size}, "
+            f"selected {my_real_count} batches [{start_idx}:{start_idx + my_real_count}], "
+            f"padded to {len(my_batches)}"
+        )
+
+        return my_batches, routed_experts_slice, routed_expert_logits_slice
 
     def _shard_and_slice_batches(
         self,
@@ -800,15 +843,18 @@ class RunnerDispatcher:
         *,
         with_backward: bool,
         model_id: Optional[str],
+        routed_expert_logits: Optional[List[Any]] = None,
     ) -> Dict[str, Any]:
         """Execute forward or forward+backward on the model runner."""
         if with_backward:
             return self.trainer.forward_backward(
                 my_batches, loss_fn, loss_fn_params,
                 model_id=model_id, routed_experts=routed_experts,
+                routed_expert_logits=routed_expert_logits,
             )
         return self.trainer.forward(
             my_batches, loss_fn, loss_fn_params, routed_experts=routed_experts,
+            routed_expert_logits=routed_expert_logits,
         )
 
     def _gather_is_metrics(

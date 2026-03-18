@@ -18,6 +18,7 @@ def causallm_loss_function(
     num_chunks: int = 8,
     tp_group=None,
     use_compile: bool = False,
+    lm_head_fp32: bool = False,
 ) -> "LossOutput":
     """
     Compute causal language modeling loss.
@@ -72,9 +73,12 @@ def causallm_loss_function(
     if return_per_token:
         # Compute cross-entropy based on mode
         if ce_mode == "compiled":
-            per_token_ce = compiled_cross_entropy_function(hidden_states_flat, weight, labels_flat, ignore_index, num_chunks)
+            per_token_ce = compiled_cross_entropy_function(hidden_states_flat, weight, labels_flat, ignore_index, num_chunks, lm_head_fp32=lm_head_fp32)
         else:  # eager mode
-            logits_flat = (hidden_states_flat @ weight.t()).float()
+            if lm_head_fp32:
+                logits_flat = (hidden_states_flat.float() @ weight.float().t()).float()
+            else:
+                logits_flat = (hidden_states_flat @ weight.t()).float()
             per_token_ce = F.cross_entropy(logits_flat, labels_flat, reduction="none", ignore_index=ignore_index)
 
         loss = per_token_ce.sum() / valid_mask.sum().clamp(min=1)
@@ -89,9 +93,12 @@ def causallm_loss_function(
         # Keeping the autograd graph intact is critical for FSDP2: all ranks must
         # trigger reduce-scatter for every parameter, including lm_head weight.
         if ce_mode == "compiled":
-            per_token_ce = compiled_cross_entropy_function(hidden_states_flat, weight, labels_flat, ignore_index, num_chunks)
+            per_token_ce = compiled_cross_entropy_function(hidden_states_flat, weight, labels_flat, ignore_index, num_chunks, lm_head_fp32=lm_head_fp32)
         else:  # eager mode
-            logits_flat = (hidden_states_flat @ weight.t()).float()
+            if lm_head_fp32:
+                logits_flat = (hidden_states_flat.float() @ weight.float().t()).float()
+            else:
+                logits_flat = (hidden_states_flat @ weight.t()).float()
             per_token_ce = F.cross_entropy(logits_flat, labels_flat, reduction="none", ignore_index=ignore_index)
 
         loss = per_token_ce.sum() / valid_mask.sum().clamp(min=1)

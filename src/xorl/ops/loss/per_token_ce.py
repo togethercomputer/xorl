@@ -21,6 +21,7 @@ def compute_per_token_ce(
     num_chunks: int = 8,
     tp_group: Optional[dist.ProcessGroup] = None,
     use_compile: bool = False,
+    lm_head_fp32: bool = False,
 ) -> torch.Tensor:
     """
     Compute per-token cross-entropy loss based on the specified mode.
@@ -47,8 +48,14 @@ def compute_per_token_ce(
         )
 
     if ce_mode == "compiled":
-        return compiled_cross_entropy_function(hidden_states_flat, weight, labels_flat, ignore_index, num_chunks)
+        return compiled_cross_entropy_function(
+            hidden_states_flat, weight, labels_flat, ignore_index, num_chunks,
+            lm_head_fp32=lm_head_fp32,
+        )
     else:
         # eager mode
-        logits_flat = (hidden_states_flat @ weight.t()).float()
+        if lm_head_fp32:
+            logits_flat = (hidden_states_flat.float() @ weight.float().t()).float()
+        else:
+            logits_flat = (hidden_states_flat @ weight.t()).float()
         return F.cross_entropy(logits_flat, labels_flat, reduction="none", ignore_index=ignore_index)

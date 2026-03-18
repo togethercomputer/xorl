@@ -20,16 +20,10 @@ import torch.nn.functional as F
 # Alignment for token groups: 8 for bf16/fp16.
 _TOKEN_GROUP_ALIGN = 8
 
-# Needed for torch.compile to handle dynamic shapes in grouped_mm offsets
-# (same setting used by torchtitan for token-choice MoE).
-torch._dynamo.config.capture_scalar_outputs = True
-
-# Allow enough compiled variants for different configs × grad modes.
-# In production the model config is fixed so only 2-3 variants are needed
-# (grad enabled, grad disabled, maybe different batch sizes).
-torch._dynamo.config.cache_size_limit = max(
-    torch._dynamo.config.cache_size_limit, 64
-)
+# Dynamo config for native backend is applied lazily on first use.
+# Moving from module-level prevents polluting torch._dynamo.config when
+# the native backend is imported but not used (e.g., when triton is configured).
+_native_dynamo_configured = False
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +238,16 @@ def _run_experts_moe_act(
 # Shared token preparation / scatter helper
 # ---------------------------------------------------------------------------
 
+def _ensure_dynamo_configured():
+    global _native_dynamo_configured
+    if not _native_dynamo_configured:
+        torch._dynamo.config.capture_scalar_outputs = True
+        torch._dynamo.config.cache_size_limit = max(
+            torch._dynamo.config.cache_size_limit, 64
+        )
+        _native_dynamo_configured = True
+
+
 def _native_expert_forward_impl(
     hidden_states: torch.Tensor,
     routing_weights: torch.Tensor,
@@ -260,6 +264,7 @@ def _native_expert_forward_impl(
     padded_counts)`` is called with the prepared padded token tensor and must
     return a padded output of the same shape.
     """
+    _ensure_dynamo_configured()
     num_tokens, top_k = selected_experts.shape
     hidden_dim = hidden_states.shape[-1]
     device = hidden_states.device

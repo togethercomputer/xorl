@@ -229,6 +229,7 @@ class TrainingOpsMixin:
                     loss_fn_params=request.forward_backward_input.loss_fn_params,
                     model_id=request.model_id,
                     routed_experts=request.forward_backward_input.routed_experts,
+                    routed_expert_logits=request.forward_backward_input.routed_expert_logits,
                 ),
                 seq_id=request.seq_id,
             )
@@ -278,6 +279,10 @@ class TrainingOpsMixin:
                 if key.startswith("is_"):
                     # Ensure colon format for tinker compatibility
                     metrics[key if ":" in key else f"{key}:mean"] = value
+
+            # Pass through expert load summary for MoE models
+            if "expert_load_summary" in result:
+                metrics["expert_load_summary"] = result["expert_load_summary"]
 
             info = self._build_info(result)
 
@@ -330,6 +335,8 @@ class TrainingOpsMixin:
                     loss_fn=request.forward_input.loss_fn,
                     loss_fn_params=request.forward_input.loss_fn_params,
                     model_id=request.model_id,
+                    routed_experts=request.forward_input.routed_experts,
+                    routed_expert_logits=request.forward_input.routed_expert_logits,
                 ),
                 seq_id=request.seq_id,
             )

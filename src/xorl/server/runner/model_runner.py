@@ -193,6 +193,9 @@ class ModelRunner:
         # Cross-entropy mode
         self.ce_mode = self.train_config.get("ce_mode", "eager")
 
+        # LM head fp32 flag for loss functions
+        self.lm_head_fp32 = self.model_config.get("lm_head_fp32", True)
+
         # Training state
         self.global_step = 0
         self.global_forward_backward_step = 0
@@ -487,6 +490,12 @@ class ModelRunner:
             reshard_after_forward=self.train_config.get("reshard_after_forward"),
             pp_schedule=pp_schedule_name,
             freeze_router=self.train_config.get("freeze_router", False),
+            router_fp32=self.model_config.get("router_fp32", True),
+            lm_head_fp32=self.model_config.get("lm_head_fp32", True),
+            rmsnorm_native=self.model_config.get("rmsnorm_native", False),
+            activation_native=self.model_config.get("activation_native", False),
+            rope_native=self.model_config.get("rope_native", False),
+            attention_cast_bf16=self.model_config.get("attention_cast_bf16", False),
         )
 
         self.model = result.model
@@ -750,6 +759,7 @@ class ModelRunner:
             _result = causallm_loss_function(
                 hidden_states=hidden_states, weight=effective_weight,
                 labels=labels, return_per_token=return_per_token, ce_mode=self.ce_mode,
+                lm_head_fp32=self.lm_head_fp32,
             )
             loss = _result.loss
             if return_per_token:
@@ -766,6 +776,7 @@ class ModelRunner:
                 hidden_states=hidden_states, weight=effective_weight,
                 labels=target_tokens, old_logprobs=old_logprobs, advantages=advantages,
                 ce_mode=self.ce_mode, compute_kl_stats=compute_kl_stats,
+                lm_head_fp32=self.lm_head_fp32,
             )
             loss = _result.loss
             per_token_outputs["logprobs"] = _result.per_token_logprobs
@@ -834,6 +845,7 @@ class ModelRunner:
             tis_clip_high = params.get("tis_clip_high", 2.0)
             num_chunks = params.get("num_chunks", 8)
             compute_kl_stats = params.get("compute_kl_stats", False)
+            icepop_beta = params.get("icepop_beta", None)
 
             if use_tis and rollout_logprobs is None:
                 logger.warning("use_tis=True but rollout_logprobs not provided.")
@@ -845,6 +857,7 @@ class ModelRunner:
                 eps_clip=eps_clip, eps_clip_high=eps_clip_high, eps_clip_c=eps_clip_c,
                 use_tis=use_tis, tis_clip_low=tis_clip_low, tis_clip_high=tis_clip_high,
                 ce_mode=self.ce_mode, num_chunks=num_chunks, compute_kl_stats=compute_kl_stats,
+                lm_head_fp32=self.lm_head_fp32, icepop_beta=icepop_beta,
             )
             loss = _result.loss
             per_token_outputs["logprobs"] = _result.per_token_logprobs
@@ -857,6 +870,56 @@ class ModelRunner:
             raise ValueError(f"Unknown loss_fn: {loss_fn}")
 
         return loss, per_token_outputs, is_metrics, outputs
+
+    # =========================================================================
+    # Per-sample K3 KL divergence
+    # =========================================================================
+
+    @staticmethod
+    def _compute_per_sample_k3(
+        k3_values: torch.Tensor,
+        valid_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> List[float]:
+        """Compute per-sample K3 KL divergence from per-token K3 values.
+
+        Uses scatter_add to aggregate per-token K3 values into per-sample means,
+        where sample boundaries are determined from position_ids (position resets
+        indicate new samples in packed sequences).
+
+        Args:
+            k3_values: Per-token K3 values, shape (T,)
+            valid_mask: Valid token mask, shape (T,)
+            position_ids: Position IDs, shape (T,). Position resets mark sample boundaries.
+
+        Returns:
+            List of per-sample mean K3 values.
+        """
+        if k3_values.numel() == 0:
+            return []
+
+        # Detect sample boundaries from position_ids
+        # A new sample starts where position decreases or resets
+        pos = position_ids.view(-1)
+        sample_starts = torch.zeros(pos.shape[0], dtype=torch.long, device=pos.device)
+        sample_starts[0] = 0
+        if pos.shape[0] > 1:
+            resets = (pos[1:] <= pos[:-1]).long()
+            sample_starts[1:] = resets
+        sample_ids = sample_starts.cumsum(0)
+        num_samples = sample_ids.max().item() + 1
+
+        # Aggregate K3 per sample using scatter_add
+        masked_k3 = k3_values.masked_fill(~valid_mask, 0.0)
+        per_sample_k3_sum = torch.zeros(num_samples, device=k3_values.device, dtype=k3_values.dtype)
+        per_sample_k3_sum.scatter_add_(0, sample_ids, masked_k3)
+
+        per_sample_count = torch.zeros(num_samples, device=k3_values.device, dtype=k3_values.dtype)
+        per_sample_count.scatter_add_(0, sample_ids, valid_mask.float())
+
+        # Mean K3 per sample (0.0 for samples with no valid tokens)
+        per_sample_k3 = per_sample_k3_sum / per_sample_count.clamp(min=1)
+        return per_sample_k3.tolist()
 
     # =========================================================================
     # Unified forward loop
@@ -878,6 +941,10 @@ class ModelRunner:
         total_loss = 0.0
         accumulated_is_metrics = {}
         accumulators = {"logprobs": [], "losses": [], "position_ids": []}
+
+        # Per-sample K3 deferred computation
+        compute_per_sample_k3 = params.get("compute_per_sample_k3", False)
+        deferred_k3: List[Dict] = []  # each entry: {k3_values, valid_mask, position_ids}
 
         for batch_idx, micro_batch in enumerate(micro_batches):
             if abort_callback and abort_callback():
@@ -914,6 +981,37 @@ class ModelRunner:
             # SP gather per-token outputs
             if per_token_outputs:
                 self._collect_per_token_outputs(per_token_outputs, micro_batch, accumulators)
+
+            # Deferred per-sample K3 computation
+            if compute_per_sample_k3 and per_token_outputs and "logprobs" in per_token_outputs:
+                with torch.no_grad():
+                    new_lp = per_token_outputs["logprobs"].view(-1)
+                    old_lp = micro_batch.get("logprobs", micro_batch.get("old_logprobs"))
+                    if old_lp is not None:
+                        old_lp = old_lp.view(-1).to(new_lp.device)
+                        _labels = micro_batch.get("labels", micro_batch.get("target_tokens"))
+                        _valid = (_labels.view(-1) != IGNORE_INDEX) if _labels is not None else torch.ones_like(new_lp, dtype=torch.bool)
+                        log_ratio = new_lp - old_lp
+                        k3_vals = (torch.exp(log_ratio) - log_ratio - 1.0).masked_fill(~_valid, 0.0)
+                        # position_ids and _original_position_ids are both kept
+                        # unsharded (full packed sequence length) for cu_seq_lens.
+                        # Slice to match local token count (k3_vals length) using
+                        # the Ulysses/CP shard boundaries.
+                        _pos = micro_batch.get("_original_position_ids", micro_batch.get("position_ids"))
+                        if _pos is not None:
+                            _pos_flat = _pos.view(-1)
+                            local_len = k3_vals.shape[0]
+                            if _pos_flat.shape[0] > local_len:
+                                # Slice position_ids to this rank's Ulysses shard
+                                ps = get_parallel_state()
+                                cp_rank = ps.ulysses_rank if ps.ulysses_enabled else 0
+                                start = cp_rank * local_len
+                                _pos_flat = _pos_flat[start:start + local_len]
+                            deferred_k3.append({
+                                "k3_values": k3_vals.cpu(),
+                                "valid_mask": _valid.cpu(),
+                                "position_ids": _pos_flat.cpu(),
+                            })
 
             # Gradient accumulation — raw (unnormalized) backward.
             # Normalization by total accumulated valid tokens is deferred to optim_step.
@@ -983,6 +1081,16 @@ class ModelRunner:
                 result["packed_losses"] = [t.tolist() for t in accumulators["losses"]]
             if accumulators["position_ids"]:
                 result["packed_position_ids"] = [t.tolist() for t in accumulators["position_ids"]]
+
+        # Compute deferred per-sample K3
+        if deferred_k3:
+            all_per_sample_k3 = []
+            for entry in deferred_k3:
+                per_sample = self._compute_per_sample_k3(
+                    entry["k3_values"], entry["valid_mask"], entry["position_ids"]
+                )
+                all_per_sample_k3.extend(per_sample)
+            result["per_sample_k3"] = all_per_sample_k3
 
         # All-reduce IS metrics across DP and add to result
         self._finalize_is_metrics(accumulated_is_metrics, result)
@@ -1062,6 +1170,7 @@ class ModelRunner:
         abort_callback: Optional[callable] = None,
         model_id: str = "default",
         routed_experts: Optional[List[List[List[List[int]]]]] = None,
+        routed_expert_logits: Optional[List[Any]] = None,
     ) -> Dict[str, Any]:
         """
         Execute forward and backward pass with gradient accumulation.
@@ -1077,6 +1186,10 @@ class ModelRunner:
                            Shape: [batch, num_tokens, num_layers, topk]
                            When provided, MoE layers will replay these routing decisions
                            instead of recomputing top-k, ensuring consistency with inference.
+            routed_expert_logits: Optional R3 routing weights from inference.
+                           Same format as routed_experts but contains float32 softmax weights.
+                           When provided alongside routed_experts, MoE layers use these exact
+                           routing weights instead of recomputing softmax.
 
         Returns:
             Dictionary with loss and other metrics. If return_per_token=True (default), also includes:
@@ -1113,7 +1226,7 @@ class ModelRunner:
             logger.info("Computing reference logprobs via no-grad forward pass")
 
             # Set up R3 routing for ref pass if needed (separate from main pass)
-            ref_r3_enabled = self._routing_handler.setup(micro_batches, routed_experts)
+            ref_r3_enabled = self._routing_handler.setup(micro_batches, routed_experts, routed_expert_logits)
 
             with torch.no_grad():
                 if ref_r3_enabled:
@@ -1146,6 +1259,7 @@ class ModelRunner:
                         labels=labels,
                         return_per_token=True,
                         ce_mode=self.ce_mode,
+                        lm_head_fp32=self.lm_head_fp32,
                     )
                     ref_logprobs = _ref_result.per_token_logprobs
 
@@ -1176,7 +1290,7 @@ class ModelRunner:
             logger.info("Reference logprobs computed, replacing old_logprobs")
 
         # R3 (Rollout Routing Replay): Pre-populate routing replay from inference data
-        r3_enabled = self._routing_handler.setup(micro_batches, routed_experts)
+        r3_enabled = self._routing_handler.setup(micro_batches, routed_experts, routed_expert_logits)
 
         # PP path
         if self.pp_enabled:
@@ -1278,6 +1392,7 @@ class ModelRunner:
         loss_fn: str = "causallm_loss",
         loss_fn_params: Optional[Dict[str, Any]] = None,
         routed_experts: Optional[List] = None,
+        routed_expert_logits: Optional[List[Any]] = None,
     ) -> Dict[str, Any]:
         """Execute forward pass only (no gradient computation)."""
         self._check_not_sleeping("forward")
@@ -1285,7 +1400,7 @@ class ModelRunner:
 
         start_time = time.time()
 
-        r3_enabled = self._routing_handler.setup(micro_batches, routed_experts)
+        r3_enabled = self._routing_handler.setup(micro_batches, routed_experts, routed_expert_logits)
 
         result = self._forward_loop(
             micro_batches, loss_fn, loss_fn_params,

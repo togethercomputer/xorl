@@ -225,6 +225,10 @@ class RequestProcessor:
                 if key.startswith("is_"):
                     output_dict[key] = result[key]
 
+            # Pass through expert load summary for MoE models
+            if "expert_load_summary" in result:
+                output_dict["expert_load_summary"] = result["expert_load_summary"]
+
             # Pass through auto-load info if adapter was loaded from checkpoint
             if result.get("auto_loaded"):
                 output_dict["auto_loaded"] = True

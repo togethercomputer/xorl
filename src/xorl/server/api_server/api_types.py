@@ -101,6 +101,15 @@ class DatumInput(BaseModel):
             "top-k routing, ensuring consistency with inference routing decisions."
         ),
     )
+    routed_expert_logits: Optional[List[Any]] = Field(
+        default=None,
+        description=(
+            "Per-datum MOE routing weights for R3. Same format as routed_experts but contains "
+            "float32 softmax weights instead of int32 expert indices. When provided alongside "
+            "routed_experts, training uses these exact routing weights from inference instead of "
+            "recomputing softmax, ensuring exact numerical parity."
+        ),
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -125,6 +134,7 @@ class LossFnOutput(BaseModel):
     loss: Optional[float] = Field(default=None, description="Loss value (for backward compatibility)")
     logprobs: Optional[TensorData] = Field(default=None, description="Per-token log probabilities")
     elementwise_loss: Optional[TensorData] = Field(default=None, description="Per-token cross entropy loss")
+    k3: Optional[float] = Field(default=None, description="Per-sample K3 KL divergence estimate")
 
     @field_serializer("loss")
     def _serialize_loss_as_tensor_data(self, v, _info):
@@ -510,6 +520,7 @@ class KillSessionRequest(BaseModel):
 
     model_id: str = Field(..., description="Session to kill (must match active session)")
     save_checkpoint: bool = Field(default=True, description="Save checkpoint before killing")
+    reset_weights: bool = Field(default=False, description="Reload base model weights after killing session")
 
 
 class KillSessionResponse(BaseModel):
