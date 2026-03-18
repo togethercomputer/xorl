@@ -35,7 +35,7 @@ from .packing import PackingDataset, process_datasets_for_packing
 logger = logging.get_logger(__name__)
 
 
-def _create_dummy_dataset(seq_len: int, num_samples: int = 4096, seed: int = 42) -> HFDataset:
+def _create_dummy_dataset(seq_len: int, num_samples: int = 4096, seed: int = 42, vocab_size: int = 151936) -> HFDataset:
     """Create a dummy tokenized dataset for benchmarking.
 
     All ranks call this independently with the same fixed seed, producing
@@ -46,16 +46,17 @@ def _create_dummy_dataset(seq_len: int, num_samples: int = 4096, seed: int = 42)
 
     Token format: each sample is ``[1, 2, 3, ..., length-1, 0]`` where
     0 is the EOD marker. Tokens follow a global arithmetic sequence
-    ``(global_offset + i) % 151936`` so routing varies across samples.
-    Lengths are drawn uniformly from [1, 4096] with seed=0 (independent
+    ``(global_offset + i) % vocab_size`` so routing varies across samples.
+    Lengths are drawn uniformly from [1, seq_len] with seed=0 (independent
     of the dataset seed so packing shape is always the same).
     """
     import numpy as np
     import pyarrow as pa
 
     EOD = 0
-    VOCAB_SIZE = 151936
-    MAX_SAMPLE_LEN = 4096
+    VOCAB_SIZE = vocab_size
+    # Cap at seq_len so samples always fit in sample_packing_sequence_len.
+    MAX_SAMPLE_LEN = max(seq_len, 1)
     # Lengths: uniform [1, max_sample_len], fixed seed=0 so packing is
     # reproducible regardless of the dataset seed argument.
     # Lengths are k*16+1 so that after ShiftTokensCollator drops 1 token,
@@ -63,8 +64,9 @@ def _create_dummy_dataset(seq_len: int, num_samples: int = 4096, seed: int = 42)
     # attention. This is a dummy-data workaround; production data should use
     # per-document alignment in the packing pipeline (TODO).
     LENGTH_ALIGN = 16
+    max_buckets = max(1, MAX_SAMPLE_LEN // LENGTH_ALIGN)
     len_rng = np.random.RandomState(0)
-    lengths = len_rng.randint(1, MAX_SAMPLE_LEN // LENGTH_ALIGN + 1, size=num_samples)
+    lengths = len_rng.randint(1, max_buckets + 1, size=num_samples)
     lengths = (lengths * LENGTH_ALIGN + 1).astype(np.int64)
 
     # Build all tokens as one global arithmetic sequence, then slice.
@@ -111,7 +113,7 @@ def prepare_datasets(
     if datasets_configs and all(dc.path == "dummy" for dc in datasets_configs):
         seq_len = datasets_configs[0].max_seq_len or args.data.sample_packing_sequence_len
         logger.info_rank0(f"Creating dummy dataset: {4096} samples x {seq_len} tokens")
-        dataset = _create_dummy_dataset(seq_len=seq_len, seed=args.train.seed)
+        dataset = _create_dummy_dataset(seq_len=seq_len, seed=args.train.seed, vocab_size=len(tokenizer))
 
         if args.data.sample_packing_method and args.data.sample_packing_method != "none":
             train_dataset = PackingDataset(args, tokenizer, dataset, split="train")

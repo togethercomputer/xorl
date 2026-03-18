@@ -7,10 +7,13 @@ Extends ``torch.optim.Muon`` with:
   - 3D+ MoE expert tensor support (reshape to 2D for NS)
 
 The core Muon algorithm is aligned with PyTorch's implementation:
-  B_t  = (1-μ) * g_t + μ * B_{t-1}          (EMA momentum)
+  B_t  = (1-μ) * g_t + μ * B_{t-1}          (EMA momentum; skipped if momentum=0)
   ~B_t = g_t + μ * B_t   if nesterov         (Nesterov look-ahead)
   O_t  = NS(~B_t)                            (Newton-Schulz orthogonalization)
   θ_t  = θ_{t-1} - γλθ_{t-1} - γ' * O_t     (weight decay + update)
+
+When momentum=0, the EMA buffer is skipped entirely and NS is applied directly
+to the raw gradient, saving the memory cost of the momentum buffer.
 
 References:
     - Keller Jordan, "Muon: An optimizer for hidden layers in neural networks"
@@ -159,27 +162,37 @@ class Muon(TorchMuon):
                 grad_local = grad_local.reshape(-1, grad_local.shape[-1])
 
             # --- PyTorch Muon algorithm (aligned with torch.optim._muon) ---
-            state = self.state[p]
-            if "momentum_buffer" not in state:
-                buf_dtype = self._momentum_dtype or grad_local.dtype
-                state["momentum_buffer"] = torch.zeros_like(
-                    grad_local, dtype=buf_dtype,
-                )
+            if momentum == 0:
+                # No momentum: apply NS directly to the raw gradient, no buffer needed.
+                update = grad_local
                 if not self._logged_dtypes:
                     logger.info_rank0(
-                        f"Muon dtypes: param={p_local.dtype}, grad={grad_local.dtype}, "
-                        f"momentum={buf_dtype} (shape={list(grad_local.shape)})"
+                        f"Muon dtypes (no momentum): param={p_local.dtype}, grad={grad_local.dtype} "
+                        f"(shape={list(grad_local.shape)})"
                     )
                     self._logged_dtypes = True
-            buf = state["momentum_buffer"]
+            else:
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    buf_dtype = self._momentum_dtype or grad_local.dtype
+                    state["momentum_buffer"] = torch.zeros_like(
+                        grad_local, dtype=buf_dtype,
+                    )
+                    if not self._logged_dtypes:
+                        logger.info_rank0(
+                            f"Muon dtypes: param={p_local.dtype}, grad={grad_local.dtype}, "
+                            f"momentum={buf_dtype} (shape={list(grad_local.shape)})"
+                        )
+                        self._logged_dtypes = True
+                buf = state["momentum_buffer"]
 
-            # EMA momentum: B = (1-μ)*g + μ*B
-            # Cast grad to buf dtype for the in-place lerp
-            buf.lerp_(grad_local.to(buf.dtype), 1 - momentum)
+                # EMA momentum: B = (1-μ)*g + μ*B
+                # Cast grad to buf dtype for the in-place lerp
+                buf.lerp_(grad_local.to(buf.dtype), 1 - momentum)
 
-            # Nesterov: ~B = g + μ*B  (or just B if nesterov=False)
-            # Work in buf dtype (may be bf16 even if grad is fp32)
-            update = grad_local.to(buf.dtype).lerp(buf, momentum) if nesterov else buf
+                # Nesterov: ~B = g + μ*B  (or just B if nesterov=False)
+                # Work in buf dtype (may be bf16 even if grad is fp32)
+                update = grad_local.to(buf.dtype).lerp(buf, momentum) if nesterov else buf
 
             # Newton-Schulz orthogonalization (uses PyTorch's implementation)
             update = _zeropower_via_newtonschulz(update, ns_coefficients, ns_steps, eps)

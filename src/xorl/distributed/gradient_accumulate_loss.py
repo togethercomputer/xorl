@@ -16,9 +16,8 @@ class GradientAccumulateLoss(torch.autograd.Function):
       * Assumes `global_valid_tokens` is already reduced (summed) across all ranks.
       * Handles local_valid_tokens == 0 safely.
       * Supports autograd so gradients can flow through distributed computations.
-      * `fsdp_size` compensates for FSDP's gradient averaging: FSDP divides gradients
-        by the number of ranks in its mesh, but this function already normalizes by
-        global_valid_tokens, so we multiply by fsdp_size to cancel FSDP's division.
+      * FSDP's automatic gradient averaging is disabled via set_gradient_divide_factor(1.0)
+        in torch_parallelize, so no fsdp_size compensation is needed here.
     """
 
     @staticmethod
@@ -27,7 +26,6 @@ class GradientAccumulateLoss(torch.autograd.Function):
         loss: torch.Tensor,
         local_valid_tokens: torch.Tensor,
         global_valid_tokens: torch.Tensor,
-        fsdp_size: int = 1,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Handle edge case where no valid tokens exist on this rank.
         # Use zeros_like (not loss * 0.0, since NaN * 0.0 = NaN in IEEE 754).
@@ -42,7 +40,6 @@ class GradientAccumulateLoss(torch.autograd.Function):
 
         # Save tensors for backward
         ctx.save_for_backward(local_valid_tokens, global_valid_tokens)
-        ctx.fsdp_size = fsdp_size
 
         # Return normalized loss and summed loss
         return loss_sum / global_valid_tokens, loss_sum
@@ -52,9 +49,8 @@ class GradientAccumulateLoss(torch.autograd.Function):
         ctx: torch.autograd.Function,
         grad_output: torch.Tensor,
         grad_loss_sum: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, None, None, None]:
+    ) -> Tuple[torch.Tensor, None, None]:
         local_valid_tokens, global_valid_tokens = ctx.saved_tensors
-        fsdp_size = ctx.fsdp_size
 
         # Gradient from first output (normalized loss)
         grad_from_normalized = grad_output * local_valid_tokens / global_valid_tokens
@@ -66,27 +62,13 @@ class GradientAccumulateLoss(torch.autograd.Function):
             else torch.zeros_like(grad_output)
         )
 
-        # Combine both gradient contributions and compensate for FSDP averaging.
-        # FSDP divides gradients by fsdp_size (reduce-scatter averages), but we
-        # already normalize by global_valid_tokens. Multiply by fsdp_size so that
-        # after FSDP's division the gradient equals the correct globally-normalized value.
-        grad_loss = (grad_from_normalized + grad_from_sum) * fsdp_size
-
-        return grad_loss, None, None, None
+        return grad_from_normalized + grad_from_sum, None, None
 
 
 def gradient_accumulate_loss(
     loss: torch.Tensor,
     local_valid_tokens: torch.Tensor,
     global_valid_tokens: torch.Tensor,
-    fsdp_size: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    User-facing helper function to apply GradientAccumulateLoss.
-
-    Args:
-        fsdp_size: Number of ranks in the FSDP mesh. Compensates for FSDP's
-            gradient averaging so that gradients are correctly normalized by
-            global_valid_tokens alone.
-    """
-    return GradientAccumulateLoss.apply(loss, local_valid_tokens, global_valid_tokens, fsdp_size)
+    """User-facing helper function to apply GradientAccumulateLoss."""
+    return GradientAccumulateLoss.apply(loss, local_valid_tokens, global_valid_tokens)

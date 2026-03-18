@@ -141,7 +141,18 @@ class ServerArguments:
 
     pipeline_parallel_schedule: str = field(
         default="1F1B",
-        metadata={"help": "Pipeline parallelism schedule: 1F1B, GPipe, Interleaved1F1B, LoopedBFS, InterleavedZeroBubble, ZBVZeroBubble"}
+        metadata={"help": "Pipeline parallelism schedule: '1F1B' or 'GPipe'."}
+    )
+    pp_variable_seq_lengths: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "If True, negotiate the per-step maximum sequence length across PP ranks "
+                "via all-reduce and pad only to that dynamic max, avoiding waste from a "
+                "static sample_packing_sequence_len.  Each unique seq_len gets its own "
+                "cached PipelineStage so P2P buffers always match the actual shape."
+            )
+        }
     )
 
     tensor_parallel_size: int = field(

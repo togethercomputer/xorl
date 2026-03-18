@@ -5,7 +5,7 @@ counting, LoRA merge, PP forward-backward) into reusable free functions.
 """
 
 from collections import deque
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -157,64 +157,108 @@ def maybe_merge_lora(
             )
 
 
-def build_pp_loss_fn(
-    global_valid_tokens_getter: Optional[Callable[[], torch.Tensor]] = None,
-    fsdp_size: int = 1,
-):
-    """Build compiled PP cross-entropy loss closure.
+def negotiate_pp_seq_len(micro_batches: List[Dict[str, Any]], pp_group) -> int:
+    """All-reduce max sequence length across all PP ranks for this step.
 
-    Args:
-        global_valid_tokens_getter: callable that returns the current
-            global_valid_tokens tensor (captures mutable state from caller).
-            If None, returns raw CE_sum * fsdp_size (unnormalized) — the caller
-            is responsible for dividing by total valid tokens later (e.g. at
-            optim_step for deferred normalization).
-        fsdp_size: Number of ranks in the FSDP mesh. Compensates for FSDP's
-            gradient averaging (same as in gradient_accumulate_loss).
+    All PP ranks must call this together.  Returns the global max seq_len
+    so every rank pads to the same target, keeping P2P buffer shapes consistent.
     """
-    if global_valid_tokens_getter is not None:
-        @torch.compile
-        def _pp_ce_loss(pred, labels, ntokens, _fsdp_size):
-            return F.cross_entropy(
-                pred.flatten(0, 1).float(),
-                labels.flatten(0, 1),
-                ignore_index=IGNORE_INDEX,
-                reduction="sum",
-            ) / ntokens * _fsdp_size
+    local_max = max(mb["input_ids"].shape[-1] for mb in micro_batches)
+    t = torch.tensor([local_max], device=get_device_type(), dtype=torch.int64)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX, group=pp_group)
+    return int(t.item())
 
-        def pp_loss_fn(pred, labels):
-            return _pp_ce_loss(pred, labels, global_valid_tokens_getter(), fsdp_size)
-    else:
-        @torch.compile
-        def _pp_ce_loss_raw(pred, labels, _fsdp_size):
-            return F.cross_entropy(
-                pred.flatten(0, 1).float(),
-                labels.flatten(0, 1),
-                ignore_index=IGNORE_INDEX,
-                reduction="sum",
-            ) * _fsdp_size
 
-        def pp_loss_fn(pred, labels):
-            return _pp_ce_loss_raw(pred, labels, fsdp_size)
+@torch.compile
+def pp_loss_fn(pred, labels):
+    """Compiled PP cross-entropy loss (raw CE sum, unnormalized).
 
-    return pp_loss_fn
+    Returns CE_sum over all non-ignored tokens.  Callers are responsible
+    for dividing gradients by global_valid_tokens after the backward
+    (either immediately or deferred to optim_step).
+    """
+    return F.cross_entropy(
+        pred.flatten(0, 1).float(),
+        labels.flatten(0, 1),
+        ignore_index=IGNORE_INDEX,
+        reduction="sum",
+    )
+
+
+def pad_micro_batches_for_pp(
+    micro_batches: List[Dict[str, Any]],
+    sample_packing_sequence_len: int,
+    sp_size: int = 1,
+    pad_to_multiple_of: int = 1,
+) -> None:
+    """Pad all micro-batches to a fixed sequence length for pipeline parallelism.
+
+    PP stages allocate fixed-size P2P communication buffers on the first step
+    and reuse them across all subsequent steps.  Variable packed sequence
+    lengths would cause send/recv shape mismatches.  This pads every
+    micro-batch to ``sample_packing_sequence_len / sp_size`` (rounded up
+    to ``pad_to_multiple_of``).
+
+    cu_seq_lens are extended by growing the last real document (NOT by
+    adding a separate all-zero "padding document") to avoid FA3 varlen
+    backward NaN from degenerate inputs and stale max_length_q/k.
+    """
+    import torch.nn.functional as F
+
+    if sample_packing_sequence_len <= 0:
+        return
+
+    # Target sharded length (after SP split)
+    target_sharded = sample_packing_sequence_len // sp_size if sp_size > 1 else sample_packing_sequence_len
+    if pad_to_multiple_of > 1 and target_sharded % pad_to_multiple_of != 0:
+        target_sharded = ((target_sharded + pad_to_multiple_of - 1) // pad_to_multiple_of) * pad_to_multiple_of
+
+    _PAD_VALUES = {"input_ids": 0, "labels": IGNORE_INDEX, "attention_mask": 0}
+    full_target = target_sharded * sp_size if sp_size > 1 else target_sharded
+
+    for mb in micro_batches:
+        ids_len = mb["input_ids"].shape[-1]
+        if ids_len < target_sharded:
+            pad_tokens = target_sharded - ids_len
+
+            for key in ("input_ids", "labels", "attention_mask"):
+                if key in mb and isinstance(mb[key], torch.Tensor):
+                    mb[key] = F.pad(mb[key], (0, pad_tokens), value=_PAD_VALUES.get(key, 0))
+
+            if "position_ids" in mb and isinstance(mb["position_ids"], torch.Tensor):
+                scale = mb["position_ids"].shape[-1] // ids_len if ids_len > 0 else 1
+                mb["position_ids"] = F.pad(mb["position_ids"], (0, pad_tokens * scale), value=0)
+
+        for key in ("cu_seq_lens_q", "cu_seq_lens_k"):
+            if key in mb and isinstance(mb[key], torch.Tensor):
+                if mb[key][-1] < full_target:
+                    mb[key] = mb[key].clone()
+                    mb[key][-1] = full_target
+
+        for ml_key, cu_key in (("max_length_q", "cu_seq_lens_q"), ("max_length_k", "cu_seq_lens_k")):
+            if cu_key in mb and isinstance(mb[cu_key], torch.Tensor):
+                new_max = mb[cu_key].diff().max().item()
+                if ml_key in mb:
+                    mb[ml_key] = max(mb[ml_key], new_max)
+                else:
+                    mb[ml_key] = new_max
 
 
 def forward_backward_pp(
     model_parts: List[torch.nn.Module],
     pp_schedule,
     micro_batches: List[Dict[str, Any]],
-    global_valid_tokens: torch.Tensor,
     has_first_stage: bool,
     has_last_stage: bool,
     pp_group,
 ) -> float:
     """Pipeline parallel forward-backward step.
 
-    Shared between Trainer and ModelRunner.
+    Shared between Trainer and ModelRunner.  Returns raw CE_sum (unnormalized);
+    callers normalize gradients by global_valid_tokens after this returns.
 
     Returns:
-        total_loss scalar (broadcast from last stage via MAX all-reduce).
+        raw_total_loss scalar (broadcast from last stage via MAX all-reduce).
     """
     device = get_device_type()
 
