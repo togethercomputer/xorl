@@ -143,6 +143,11 @@ class NCCLWeightSynchronizer:
         # Important: Only set NCCL_CUMEM_ENABLE=0
         os.environ["NCCL_CUMEM_ENABLE"] = "0"
 
+        # torchrun sets TORCHELASTIC_USE_AGENT_STORE=True which forces all ranks
+        # to be TCPStore clients. We need to unset this for our separate weight
+        # sync process group where rank 0 must be the store master.
+        old_agent_store = os.environ.pop('TORCHELASTIC_USE_AGENT_STORE', None)
+
         rank = 0  # Training is always rank 0
 
         logger.info(
@@ -182,16 +187,26 @@ class NCCLWeightSynchronizer:
         else:
             pg_options_param_name = "pg_options"
 
-        pg, _ = _new_process_group_helper(
-            self.world_size,
-            rank,
-            [],
-            backend_obj,
-            store,
-            group_name=self.group_name,
-            **{pg_options_param_name: None},
-            timeout=timeout,
-        )
+        # Set CUDA device and pass device_id for proper NCCL comm initialization
+        torch.cuda.set_device(self.device)
+        device_id = torch.device(self.device)
+
+        try:
+            pg, _ = _new_process_group_helper(
+                self.world_size,
+                rank,
+                [],
+                backend_obj,
+                store,
+                group_name=self.group_name,
+                **{pg_options_param_name: None},
+                timeout=timeout,
+                device_id=device_id,
+            )
+        finally:
+            # Restore the environment variable
+            if old_agent_store is not None:
+                os.environ['TORCHELASTIC_USE_AGENT_STORE'] = old_agent_store
 
         _world.pg_group_ranks[pg] = {i: i for i in range(self.world_size)}
 
@@ -332,8 +347,8 @@ class NCCLWeightSynchronizer:
             }
             logger.info(f"[Training] Sending init request to {url} with payload: {payload}")
             try:
-                # Use longer timeout - NCCL init can take a while if waiting for rank 0
-                response = session.post(url, json=payload, timeout=300)
+                # Use longer timeout - NCCL init can take a while, especially with CUDA_LAUNCH_BLOCKING=1
+                response = session.post(url, json=payload, timeout=600)
                 logger.info(f"[Training] Received response from {endpoint.host}:{endpoint.port}")
                 result = response.json()
                 return {
@@ -577,7 +592,7 @@ class NCCLWeightSynchronizer:
                         "group_name": self.group_name,
                         "flush_cache": flush_cache,
                     },
-                    timeout=300,
+                    timeout=600,
                 )
                 result = response.json()
                 update_results.append({

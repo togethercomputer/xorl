@@ -38,7 +38,7 @@ class Qwen3MLP(nn.Module):
         self.gate_up_proj = nn.Linear(self.hidden_size, 2 * self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self._use_fused_silu = config.hidden_act == "silu"
+        self._use_fused_silu = config.hidden_act == "silu" and not getattr(config, '_activation_native', False)
 
     def unfuse_for_tp(self):
         """Replace fused gate_up_proj with separate gate_proj and up_proj for tensor parallelism."""

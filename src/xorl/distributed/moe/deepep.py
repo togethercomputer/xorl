@@ -265,7 +265,7 @@ class _FusedDispatchAndPermute(torch.autograd.Function):
         topk_weights_f32 = topk_weights.to(torch.float32)
 
         # --- dispatch ---
-        num_tokens_per_rank, _, num_tokens_per_expert, is_token_in_rank, _ = (
+        num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, _ = (
             buffer.buffer.get_dispatch_layout(topk_idx_deepep, num_experts)
         )
         previous_event = EventOverlap(EventHandle())
@@ -273,6 +273,7 @@ class _FusedDispatchAndPermute(torch.autograd.Function):
             buffer.buffer.dispatch(
                 x=x.contiguous(),
                 num_tokens_per_rank=num_tokens_per_rank,
+                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
                 is_token_in_rank=is_token_in_rank,
                 num_tokens_per_expert=num_tokens_per_expert,
                 topk_idx=topk_idx_deepep,
@@ -458,13 +459,14 @@ def dispatch_no_grad(
     buffer.init_buffer(hidden_bytes=get_hidden_bytes(hidden_states))
     topk_idx = selected_experts.to(deep_ep.topk_idx_t)
     topk_weights = routing_weights.to(torch.float32)
-    num_tokens_per_rank, _, num_tokens_per_expert, is_token_in_rank, _ = (
+    num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, _ = (
         buffer.buffer.get_dispatch_layout(topk_idx, num_experts)
     )
     previous_event = EventOverlap(EventHandle())
     recv_x, recv_topk_idx, recv_topk_weights, recv_counts, handle, event = buffer.buffer.dispatch(
         x=hidden_states,
         num_tokens_per_rank=num_tokens_per_rank,
+        num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
         is_token_in_rank=is_token_in_rank,
         num_tokens_per_expert=num_tokens_per_expert,
         topk_idx=topk_idx,

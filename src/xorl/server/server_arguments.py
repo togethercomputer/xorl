@@ -94,6 +94,37 @@ class ServerArguments:
         metadata={"help": "Enable async combine for DeepEP (overlap combine with next layer's compute)."}
     )
 
+    # SGLang numerical alignment flags
+    router_fp32: bool = field(
+        default=True,
+        metadata={"help": "Upcast MoE router gate computation to float32 for numerical stability."}
+    )
+
+    lm_head_fp32: bool = field(
+        default=True,
+        metadata={"help": "Upcast LM head logits computation to float32 for numerical stability."}
+    )
+
+    rmsnorm_native: bool = field(
+        default=False,
+        metadata={"help": "Use native RMSNorm (no fused kernels) for SGLang alignment."}
+    )
+
+    activation_native: bool = field(
+        default=False,
+        metadata={"help": "Use native SiLU instead of fused Triton kernel for SGLang alignment."}
+    )
+
+    rope_native: bool = field(
+        default=False,
+        metadata={"help": "Use naive RoPE implementation instead of flash_attn fused kernel."}
+    )
+
+    attention_cast_bf16: bool = field(
+        default=False,
+        metadata={"help": "Explicitly cast Q/K to bfloat16 after RoPE for SGLang alignment."}
+    )
+
     # Multimodal model configuration
     foundation: Dict[str, str] = field(
         default_factory=dict,
@@ -521,6 +552,12 @@ class ServerArguments:
                 "encoders": self.encoders,
                 "basic_modules": self.basic_modules,
                 "merge_qkv": self.merge_qkv,
+                "router_fp32": self.router_fp32,
+                "lm_head_fp32": self.lm_head_fp32,
+                "rmsnorm_native": self.rmsnorm_native,
+                "activation_native": self.activation_native,
+                "rope_native": self.rope_native,
+                "attention_cast_bf16": self.attention_cast_bf16,
             },
             "train": {
                 "output_dir": self.output_dir,

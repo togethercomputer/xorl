@@ -55,7 +55,7 @@ class Qwen3MoeMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
         self.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
         self.deepep_buffer_size_gb = getattr(config, "_deepep_buffer_size_gb", 2.0)
-        self._use_fused_silu = config.hidden_act == "silu"
+        self._use_fused_silu = config.hidden_act == "silu" and not getattr(config, '_activation_native', False)
 
     def unfuse_for_tp(self):
         """Replace fused gate_up_proj with separate gate_proj and up_proj for tensor parallelism."""

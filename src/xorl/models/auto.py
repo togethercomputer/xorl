@@ -75,6 +75,12 @@ def build_foundation_model(
     deepep_buffer_size_gb: float = 2.0,
     deepep_num_sms: int = 20,
     deepep_async_combine: bool = False,
+    router_fp32: bool = True,
+    lm_head_fp32: bool = True,
+    rmsnorm_native: bool = False,
+    activation_native: bool = False,
+    rope_native: bool = False,
+    attention_cast_bf16: bool = False,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
 ) -> nn.Module:
@@ -101,6 +107,13 @@ def build_foundation_model(
     config._deepep_buffer_size_gb = deepep_buffer_size_gb
     config._deepep_num_sms = deepep_num_sms
     config._deepep_async_combine = deepep_async_combine
+    config._router_fp32 = router_fp32
+    config._lm_head_fp32 = lm_head_fp32
+    config._rmsnorm_native = rmsnorm_native
+    config._activation_native = activation_native
+    config._rope_native = rope_native
+    config._attention_cast_bf16 = attention_cast_bf16
+
     if ep_dispatch == "deepep":
         logger.info_rank0(
             f"DeepEP dispatch enabled (buffer={deepep_buffer_size_gb} GB, "

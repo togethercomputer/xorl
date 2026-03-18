@@ -42,6 +42,7 @@ def compiled_cross_entropy_function(
     ignore_index: int = -100,
     num_chunks: int = 64,
     reduction: str = "none",
+    lm_head_fp32: bool = False,
 ) -> torch.Tensor:
     """
     Compute memory-efficient cross-entropy using torch.compile.
@@ -63,6 +64,9 @@ def compiled_cross_entropy_function(
         If reduction="mean": scalar mean loss
         If reduction="sum": scalar sum loss
     """
+    if lm_head_fp32:
+        hidden_states = hidden_states.float()
+        weight = weight.float()
     compute_ce_fn = _get_compiled_ce_fn(num_chunks, reduction)
     return compute_ce_fn(hidden_states, weight, labels, ignore_index)
 

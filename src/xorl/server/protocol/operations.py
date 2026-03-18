@@ -39,6 +39,7 @@ class ModelPassData:
     loss_fn_params: Optional[Dict[str, Any]] = None
     model_id: Optional[str] = None
     routed_experts: Optional[List[Any]] = None
+    routed_expert_logits: Optional[List[Any]] = None
 
 
 @dataclass
@@ -131,6 +132,7 @@ class KillSessionData:
 
     model_id: str = "default"
     save_checkpoint: bool = True
+    reset_weights: bool = False
 
 
 @dataclass

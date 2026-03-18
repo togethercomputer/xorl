@@ -72,6 +72,13 @@ def build_training_model(
     pp_schedule: Optional[str] = None,
     # --- Training flags ---
     freeze_router: bool = False,
+    # --- SGLang numerical alignment ---
+    router_fp32: bool = True,
+    lm_head_fp32: bool = True,
+    rmsnorm_native: bool = False,
+    activation_native: bool = False,
+    rope_native: bool = False,
+    attention_cast_bf16: bool = False,
 ) -> TrainingModelResult:
     """Build, inject LoRA/QLoRA, and parallelize a training model.
 
@@ -107,8 +114,22 @@ def build_training_model(
         deepep_buffer_size_gb=deepep_buffer_size_gb,
         deepep_num_sms=deepep_num_sms,
         deepep_async_combine=deepep_async_combine,
+        router_fp32=router_fp32,
+        lm_head_fp32=lm_head_fp32,
+        rmsnorm_native=rmsnorm_native,
+        activation_native=activation_native,
+        rope_native=rope_native,
+        attention_cast_bf16=attention_cast_bf16,
         init_device=init_device,
     )
+
+    # Set module-level flags for rope and activation
+    if rope_native:
+        from xorl.models.layers.rope import set_rope_native
+        set_rope_native(True)
+        logger.info_rank0("Using native RoPE (flash_attn fused kernel disabled)")
+    if activation_native:
+        logger.info_rank0("Using native SiLU activation (fused Triton kernel disabled)")
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")
 

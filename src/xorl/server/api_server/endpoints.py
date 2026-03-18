@@ -698,6 +698,17 @@ async def remove_inference_endpoint_endpoint(request: RemoveInferenceEndpointReq
 
 
 @router.post(
+    "/sync_inference_weights",
+    response_model=SyncInferenceWeightsResponse,
+    responses={
+        500: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+        504: {"model": ErrorResponse},
+    },
+    tags=["Inference Endpoint Management"],
+    include_in_schema=False,
+)
+@router.post(
     "/api/v1/sync_inference_weights",
     response_model=SyncInferenceWeightsResponse,
     responses={

@@ -237,18 +237,28 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
     def _build_loss_fn_outputs(result: Dict[str, Any]):
         """Build (loss_fn_outputs, loss_fn_output_type) from engine result."""
         per_sample_outputs = result.get("per_sample_outputs", [])
+        per_sample_k3 = result.get("per_sample_k3", [])
+
         if per_sample_outputs:
             outputs = []
-            for sample in per_sample_outputs:
+            for i, sample in enumerate(per_sample_outputs):
                 logprobs = sample.get("logprobs", [])
                 elementwise_loss = sample.get("elementwise_loss", [])
+                k3_val = per_sample_k3[i] if i < len(per_sample_k3) else None
                 outputs.append(
                     LossFnOutput(
                         logprobs=TensorData(data=logprobs, dtype="float32", shape=[len(logprobs)]),
                         elementwise_loss=TensorData(data=elementwise_loss, dtype="float32", shape=[len(elementwise_loss)]),
+                        k3=k3_val,
                     )
                 )
             return outputs, "CrossEntropyLossReturn"
+
+        # When no per-sample outputs, but we have per_sample_k3, create one output per sample
+        if per_sample_k3:
+            outputs = [LossFnOutput(loss=result.get("loss", 0.0), k3=k3) for k3 in per_sample_k3]
+            return outputs, "single_loss"
+
         return [LossFnOutput(loss=result.get("loss", 0.0))], "single_loss"
 
     @staticmethod
