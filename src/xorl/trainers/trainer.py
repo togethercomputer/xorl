@@ -34,11 +34,13 @@ from xorl.models.module_utils import compute_loss
 from xorl.models.transformers.qwen3_moe.modeling_qwen3_moe import load_balancing_loss_func
 from xorl.optim import build_lr_scheduler, build_optimizer
 from xorl.trainers.training_utils import (
-    build_pp_loss_fn,
+    pp_loss_fn,
     clip_gradients,
     count_valid_tokens,
     forward_backward_pp,
     maybe_merge_lora,
+    negotiate_pp_seq_len,
+    pad_micro_batches_for_pp,
     sync_sp_gradients,
 )
 from xorl.utils import helper
@@ -109,7 +111,7 @@ class Trainer:
         _timed("build_optimizer", self._build_optimizer)
         _timed("setup_observability", self._setup_observability)
         _timed("resume_checkpoint", self._resume_checkpoint)
-        _timed("build_pp_schedule", self._build_pp_schedule)
+        _timed("build_pp_schedule", self._init_pp_schedule_cache)
 
     # ===================================================================
     # Setup phases
@@ -479,25 +481,33 @@ class Trainer:
         dist.barrier()
         logger.info_rank0(f"Loaded checkpoint from {args.train.load_checkpoint_path}")
 
-    def _build_pp_schedule(self) -> None:
-        """Build pipeline schedule if PP is enabled."""
-        self.pp_schedule = None
-        self._pp_global_valid_tokens = None  # mutable state for pp_loss_fn closure
+    def _init_pp_schedule_cache(self) -> None:
+        """Initialize PP schedule cache (schedules are built lazily by seq_len)."""
+        self._pp_schedule_cache: Dict[int, Any] = {}
 
-        if not self.pp_enabled:
-            return
+    def _get_pp_schedule(self, seq_len: int):
+        """Return a cached PP schedule for the given seq_len, building if needed.
 
-        from xorl.distributed.pipeline_parallel import build_pipeline_schedule
-
-        pp_loss_fn = build_pp_loss_fn(lambda: self._pp_global_valid_tokens, fsdp_size=self.ps.fsdp_size)
-
-        self.pp_schedule = build_pipeline_schedule(
-            stages=self.pp_stages,
-            n_microbatches=self.args.train.gradient_accumulation_steps,
-            loss_fn=pp_loss_fn,
-            schedule_name=self.args.train.pipeline_parallel_schedule,
-        )
-        logger.info_rank0(f"PP schedule built: {self.args.train.pipeline_parallel_schedule}")
+        With pp_variable_seq_lengths=True, a new PipelineStage (cheap, no deepcopy)
+        is created for each unique seq_len so P2P buffers match the actual shape.
+        With static padding, seq_len is always the same so only one entry is cached.
+        """
+        if seq_len not in self._pp_schedule_cache:
+            from xorl.distributed.pipeline_parallel import build_pipeline_schedule, build_pp_stage
+            stage = build_pp_stage(
+                self.model_parts[0],
+                pp_rank=self.ps.pp_rank,
+                num_stages=self.ps.pp_size,
+                device=get_device_type(),
+                pp_group=self.ps.pp_group,
+            )
+            self._pp_schedule_cache[seq_len] = build_pipeline_schedule(
+                stages=[stage],
+                n_microbatches=self.args.train.gradient_accumulation_steps,
+                loss_fn=pp_loss_fn,
+                schedule_name=self.args.train.pipeline_parallel_schedule,
+            )
+        return self._pp_schedule_cache[seq_len]
 
     # ===================================================================
     # Training loop
@@ -569,6 +579,11 @@ class Trainer:
                 # Synchronize padding across DP ranks
                 sync_group = ps.fsdp_group if self.pp_enabled else None
                 synchronize_micro_batch_padding(micro_batches, group=sync_group)
+
+                # Static PP padding: pad to sample_packing_sequence_len upfront.
+                # With pp_variable_seq_lengths, padding is deferred to _forward_backward_pp.
+                if self.pp_enabled and not self.args.train.pp_variable_seq_lengths:
+                    self._pad_micro_batches_for_pp(micro_batches)
 
                 if state.global_step == 1:
                     helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
@@ -645,6 +660,14 @@ class Trainer:
             group=self.ps.fsdp_group if self.pp_enabled else None,
         )
 
+    def _pad_micro_batches_for_pp(self, micro_batches: List[Dict[str, Any]]) -> None:
+        pad_micro_batches_for_pp(
+            micro_batches,
+            sample_packing_sequence_len=self.args.data.sample_packing_sequence_len or 0,
+            sp_size=self.ps.cp_size,
+            pad_to_multiple_of=self.args.data.pad_to_multiple_of or 1,
+        )
+
     def _sync_sp_gradients(self) -> None:
         """All-reduce gradients for CP/Ulysses dims not folded into FSDP."""
         sync_sp_gradients(self.model, self.ps.sp_grad_sync_group)
@@ -652,6 +675,10 @@ class Trainer:
     def _reduce_metrics(self, total_loss: float, grad_norm: float) -> Tuple[float, float]:
         """All-reduce loss and grad_norm across DP for logging."""
         if self.pp_enabled:
+            # PP: the MAX all-reduce in forward_backward_pp syncs loss only across
+            # pp_group (stages), not across fsdp_group (DP replicas). Different DP
+            # replicas hold different CE_sums, so SUM over fsdp_group then divide
+            # gives CE_sum_total / gvt_total — matching the non-PP path.
             total_loss = all_reduce(total_loss, op="sum", group=self.ps.fsdp_group)
             grad_norm = all_reduce(grad_norm, op="mean", group=self.ps.fsdp_group)
         else:
@@ -700,7 +727,7 @@ class Trainer:
                         loss = loss + self.model.router_aux_loss_coef * aux_loss.to(loss.device)
 
                 local_valid_tokens = (labels != IGNORE_INDEX).sum()
-                ga_loss, _ = gradient_accumulate_loss(loss, local_valid_tokens, global_valid_tokens, fsdp_size=self.ps.fsdp_size)
+                ga_loss, _ = gradient_accumulate_loss(loss, local_valid_tokens, global_valid_tokens)
             if self._use_routing_replay:
                 set_replay_stage("replay_backward")
 
@@ -717,17 +744,43 @@ class Trainer:
         micro_batches: List[Dict[str, Any]],
         global_valid_tokens: torch.Tensor,
     ) -> float:
-        """Pipeline parallel forward-backward step."""
-        self._pp_global_valid_tokens = global_valid_tokens
-        return forward_backward_pp(
+        """Pipeline parallel forward-backward step.
+
+        With pp_variable_seq_lengths: negotiates the per-step max seq_len across
+        PP ranks, pads micro-batches to that length, and uses a seq_len-keyed
+        schedule cache so P2P buffers always match the actual tensor shape.
+
+        Runs the PP schedule (which calls loss_fn.backward() internally), then
+        normalizes gradients by global_valid_tokens in-place.  Returns the
+        normalized loss for logging.
+        """
+        if self.args.train.pp_variable_seq_lengths:
+            seq_len = negotiate_pp_seq_len(micro_batches, self.ps.pp_group)
+            pad_micro_batches_for_pp(
+                micro_batches,
+                sample_packing_sequence_len=seq_len * self.ps.cp_size,
+                sp_size=self.ps.cp_size,
+                pad_to_multiple_of=self.args.data.pad_to_multiple_of or 1,
+            )
+        else:
+            seq_len = micro_batches[0]["input_ids"].shape[-1]
+
+        raw_loss = forward_backward_pp(
             model_parts=self.model_parts,
-            pp_schedule=self.pp_schedule,
+            pp_schedule=self._get_pp_schedule(seq_len),
             micro_batches=micro_batches,
-            global_valid_tokens=global_valid_tokens,
             has_first_stage=self.has_first_stage,
             has_last_stage=self.has_last_stage,
             pp_group=self.ps.pp_group,
         )
+        gvt = global_valid_tokens.item()
+        if gvt > 0:
+            scale = 1.0 / gvt
+            for model_part in self.model_parts:
+                for p in model_part.parameters():
+                    if p.grad is not None:
+                        p.grad.mul_(scale)
+        return raw_loss / gvt if gvt > 0 else 0.0
 
     def _clip_and_step(self) -> float:
         """Clip gradients, optimizer.step(), lr_scheduler.step().

@@ -1,0 +1,64 @@
+model:
+  model_path: Qwen/Qwen3-8B
+  attn_implementation: flash_attention_3
+
+data:
+  datasets:
+    - path: togethercomputer/CoderForge-Preview
+      name: trajectories-tokenized_qwencoder
+      split: filtered_reward1
+      type: tokenized
+      max_seq_len: 128000
+  select_columns: [input_ids, labels]
+  dataset_prepared_path: /ephemeral/prepared_datasets
+  sample_packing_method: sequential
+  sample_packing_sequence_len: 128000
+  dataloader_num_workers: 4
+  dataloader_pin_memory: false
+  pad_to_multiple_of: 4096
+
+train:
+  output_dir: /ephemeral/projects/coderforge/Qwen3-8B-muon-no-momentum
+  data_parallel_mode: fsdp2
+  ulysses_parallel_size: 8
+  data_parallel_replicate_size: 1
+  data_parallel_shard_size: 1
+  expert_parallel_size: 1
+
+  num_train_epochs: 5
+
+  # batch size
+  micro_batch_size: 1
+  gradient_accumulation_steps: 1
+
+  optimizer: muon
+  optimizer_dtype: bf16
+  # Muon lr for 2D weight matrices; AdamW lr for embeddings/norms/biases
+  muon_lr: 0.0005
+  lr: 1.0e-4          # AdamW lr for non-Muon params (embeddings, norms, biases)
+  muon_momentum: 0
+  muon_nesterov: false
+  muon_ns_steps: 5
+  lr_warmup_ratio: 0.005
+  lr_decay_style: cosine
+  lr_decay_ratio: 1.0
+  weight_decay: 0.01
+
+  max_grad_norm: 1.0
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  enable_full_shard: true
+  enable_activation_offload: false
+  init_device: meta
+  load_weights_mode: all_ranks
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  ckpt_manager: dcp
+  save_steps: 1000
+  save_hf_weights: true
+
+  # wandb
+  use_wandb: true
+  wandb_project: coderforge
+  wandb_name: Qwen3-8B-muon-no-momentum
+  wandb_tags: [qwen3-8b, muon, no-momentum, filtered_reward1]
