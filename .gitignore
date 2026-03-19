@@ -72,3 +72,7 @@ sbatch.sh
 
 # trace
 trace/
+# Astro
+docs/node_modules/
+docs/dist/
+docs/.astro/

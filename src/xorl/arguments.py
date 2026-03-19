@@ -96,7 +96,7 @@ class DatasetConfig:
     ds_type: Optional[str | None] = field(
         default=None,
         metadata={
-            "help": "Dataset type when loading files (json, csv, parquet, arrow). Auto-inferred if not specified."
+            "help": "Dataset type when loading files (json, csv, parquet, arrow, text). Auto-inferred if not specified."
         },
     )
     # split dataset into N pieces (use with shards_idx)
@@ -325,7 +325,7 @@ class DataArguments:
     sample_packing_method: Optional[str] = field(
         default="sequential",
         metadata={
-            "help": "The method to use for sample packing. Should be 'sequential', 'multipack', or 'none'. Defaults to 'sequential'."
+            "help": "The method to use for sample packing. Should be 'sequential' or 'multipack'. Defaults to 'sequential'."
         },
     )
     sample_packing_group_size: Optional[int] = field(
@@ -476,7 +476,7 @@ class ModelArguments:
         default_factory=dict,
         metadata={"help": "Foundation model extra config."},
     )
-    encoders: Dict[Literal["image"], Dict[str, str]] = field(
+    encoders: Dict[Literal["image", "video", "audio"], Dict[str, str]] = field(
         default_factory=dict,
         metadata={"help": "Multimodal encoder config and weights."},
     )
@@ -531,11 +531,11 @@ class ModelArguments:
         if self.tokenizer_path is None:
             self.tokenizer_path = self.config_path
 
-        suppoerted_encoder_types = ["image", "video", "audio"]
+        supported_encoder_types = ["image", "video", "audio"]
         for encoder_type, encoder_args in self.encoders.items():
-            if encoder_type not in suppoerted_encoder_types:
+            if encoder_type not in supported_encoder_types:
                 raise ValueError(
-                    f"Unsupported encoder type: {encoder_type}. Should be one of {suppoerted_encoder_types}."
+                    f"Unsupported encoder type: {encoder_type}. Should be one of {supported_encoder_types}."
                 )
 
             if (
@@ -556,7 +556,7 @@ class TrainingArguments:
     lr: float = field(
         default=5e-5,
         metadata={
-            "help": "Maximum learning rate or defult learning rate, or init learning rate for warmup."
+            "help": "Maximum learning rate or default learning rate, or initial learning rate for warmup."
         },
     )
     lr_min: float = field(
@@ -736,7 +736,7 @@ class TrainingArguments:
     allow_cuda_launch_blocking: bool = field(
         default=False,
         metadata={
-            "help": "Set CUDA_LAUNCH_BLOCK=1 would degrade performance significantly. Leave this as False to prevent CUDA_LAUNCH_BLOCKING from being accidentally enabled. DO NOT enable this unless you are debugging something"
+            "help": "Setting CUDA_LAUNCH_BLOCKING=1 would degrade performance significantly. Leave this as False to prevent CUDA_LAUNCH_BLOCKING from being accidentally enabled. DO NOT enable this unless you are debugging something."
         },
     )
     empty_cache_steps: int = field(
@@ -887,7 +887,7 @@ class TrainingArguments:
     )
     profile_trace_dir: str = field(
         default="./trace",
-        metadata={"help": "Direction to export the profiling result."},
+        metadata={"help": "Directory to export the profiling result."},
     )
     profile_record_shapes: bool = field(
         default=True,
@@ -1019,7 +1019,7 @@ class TrainingArguments:
         if not self.allow_cuda_launch_blocking:
             assert (
                 not self.enable_full_determinism
-            ), "allow_cuda_launch_blocking is disabled but enable_full_determinism is enabled. enable_full_determinism would set CUDA_LUANCH_BLOCKING to 1!"
+            ), "allow_cuda_launch_blocking is disabled but enable_full_determinism is enabled. enable_full_determinism would set CUDA_LAUNCH_BLOCKING to 1!"
             cuda_launch_blocking_val = os.environ.get(
                 "CUDA_LAUNCH_BLOCKING", ""
             ).strip()

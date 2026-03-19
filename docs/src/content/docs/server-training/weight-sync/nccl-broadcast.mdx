@@ -1,0 +1,156 @@
+---
+title: "Backend: nccl_broadcast"
+---
+
+
+`nccl_broadcast` is the default (and currently only) weight transport backend. It uses a dedicated NCCL process group to broadcast model weights from training rank 0 to all inference TP workers.
+
+## Architecture
+
+```
+Training GPUs
+  rank 0  ──── NCCL broadcast ────► inference TP rank 1
+                                 ├─► inference TP rank 2
+                                 └─► inference TP rank N
+  rank 1..K   (idle during transfer — only participate in FSDP/EP collectives)
+```
+
+Only training rank 0 participates in the NCCL sync group. All other training ranks are involved only in the per-parameter FSDP unshard that reconstructs the full weight on rank 0 before it gets broadcast.
+
+## Transfer Flow
+
+For each sync call:
+
+1. **NCCL group init** — training rank 0 creates a `TCPStore` at `master_address:master_port`; inference endpoints join via HTTP (`/init_weights_update_group`), using `rank_offset = 1 + sum(prior endpoint world_sizes)`. The group is torn down after the sync completes.
+
+2. **Bucket loop** — parameters are batched into `buffer_size_mb`-sized buckets and transferred sequentially:
+   - HTTP calls to `/update_weights_from_distributed` on all endpoints are fired in parallel background threads.
+   - `dist.broadcast(tensor, src=0, group=sync_group)` is called for each tensor. This call blocks until every inference rank has posted its recv, so no external synchronization is needed.
+   - The last bucket carries `flush_cache=True` to signal the inference server to drop its KV cache.
+
+3. **NCCL group destroy** — `dist.destroy_process_group` on the training side; `/destroy_weights_update_group` on inference.
+
+<svg viewBox="0 0 700 200" style="max-width:700px;width:100%;margin:1.5rem 0" font-family="sans-serif">
+  <defs>
+    <marker id="nccl-arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#2563eb"/>
+    </marker>
+  </defs>
+  <rect width="700" height="200" fill="#f8fafc" rx="8"/>
+
+  {/* Phase 1: TCPStore rendezvous */}
+  <rect x="15" y="20" width="120" height="50" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="75" y="41" text-anchor="middle" font-size="10" fill="#1e293b" font-weight="700">TCPStore</text>
+  <text x="75" y="57" text-anchor="middle" font-size="9" fill="#64748b">rendezvous</text>
+
+  {/* arrow phase 1 → loop */}
+  <line x1="135" y1="45" x2="175" y2="45" stroke="#2563eb" stroke-width="1.5" marker-end="url(#nccl-arr)"/>
+
+  {/* Bucket loop box */}
+  <rect x="180" y="10" width="320" height="150" rx="8" fill="#fff" stroke="#2563eb" stroke-width="2"/>
+  <text x="340" y="30" text-anchor="middle" font-size="11" fill="#2563eb" font-weight="700">Bucket loop (per buffer_size_mb)</text>
+
+  {/* Step A: FSDP unshard */}
+  <rect x="195" y="40" width="130" height="35" rx="5" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="260" y="54" text-anchor="middle" font-size="10" fill="#1e293b" font-weight="600">FSDP unshard</text>
+  <text x="260" y="68" text-anchor="middle" font-size="9" fill="#64748b">all-gather → rank 0</text>
+
+  {/* Step B: quantize */}
+  <rect x="195" y="85" width="130" height="35" rx="5" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="260" y="99" text-anchor="middle" font-size="10" fill="#1e293b" font-weight="600">dequant + merge</text>
+  <text x="260" y="113" text-anchor="middle" font-size="9" fill="#64748b">LoRA / optional FP8</text>
+
+  {/* arrow A→B */}
+  <line x1="260" y1="75" x2="260" y2="84" stroke="#2563eb" stroke-width="1.5" marker-end="url(#nccl-arr)"/>
+
+  {/* Step C: broadcast */}
+  <rect x="355" y="60" width="130" height="52" rx="5" fill="#1e3a8a" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="420" y="80" text-anchor="middle" font-size="10" fill="#fff" font-weight="600">dist.broadcast</text>
+  <text x="420" y="96" text-anchor="middle" font-size="9" fill="#dbeafe">src=0, group=sync</text>
+  <text x="420" y="110" text-anchor="middle" font-size="9" fill="#dbeafe">blocks until all recv</text>
+
+  {/* arrow B→C */}
+  <line x1="325" y1="103" x2="353" y2="90" stroke="#2563eb" stroke-width="1.5" marker-end="url(#nccl-arr)"/>
+
+  {/* loop-back arrow */}
+  <path d="M340 145 Q340 155 260 155 Q180 155 180 145" fill="none" stroke="#2563eb" stroke-width="1" stroke-dasharray="4,3"/>
+  <line x1="180" y1="145" x2="180" y2="140" stroke="#2563eb" stroke-width="1" marker-end="url(#nccl-arr)"/>
+  <text x="260" y="168" text-anchor="middle" font-size="9" fill="#64748b">repeat for each bucket</text>
+
+  {/* arrow loop → destroy */}
+  <line x1="500" y1="85" x2="545" y2="85" stroke="#2563eb" stroke-width="1.5" marker-end="url(#nccl-arr)"/>
+
+  {/* Phase 3: destroy */}
+  <rect x="550" y="60" width="130" height="52" rx="6" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+  <text x="615" y="80" text-anchor="middle" font-size="10" fill="#1e293b" font-weight="700">Destroy group</text>
+  <text x="615" y="96" text-anchor="middle" font-size="9" fill="#64748b">destroy_process_group</text>
+  <text x="615" y="110" text-anchor="middle" font-size="9" fill="#64748b">/destroy_weights_...</text>
+
+  {/* flush label */}
+  <text x="420" y="188" text-anchor="middle" font-size="9" fill="#64748b">Last bucket: flush_cache=True → inference drops KV cache</text>
+</svg>
+
+## Configuration
+
+Parameters come from the `SyncWeightsData` request body (see [overview](/server-training/weight-sync/overview/)):
+
+| Field | Default | Description |
+|---|---|---|
+| `master_address` | `"localhost"` | IP of the training head node used for TCPStore rendezvous |
+| `master_port` | `29600` | Free port for the TCPStore; must not be in use during sync |
+| `group_name` | `"weight_sync_group"` | Unique NCCL group name; use different names for parallel sync groups |
+| `buffer_size_mb` | `1024` | Bucket size in MB; larger = fewer round-trips, more peak GPU memory |
+
+## Environment Notes
+
+The backend temporarily unsets `TORCHELASTIC_USE_AGENT_STORE` during group init. This is required because torchrun sets it to `True`, which forces all ranks to be TCPStore *clients*. Since rank 0 must be the store *master* for the weight-sync group, the variable is cleared for the duration of `_init_training_process_group` and then restored.
+
+`NCCL_CUMEM_ENABLE=0` is also set to avoid conflicts with the separate NCCL communicator.
+
+## Limitations
+
+| Limitation | Notes |
+|---|---|
+| Only rank 0 sends | All parameters are gathered to rank 0 before broadcast. EP experts and PP stage params all route through rank 0. |
+| No direct EP transfer | `supports_direct_ep_transfer = False`; EP shards are gathered first. |
+| No direct PP transfer | `supports_direct_pp_transfer = False`; PP followers ship CPU buffers to rank 0. |
+| Sequential buckets | Buckets are sent one at a time; no pipelining across buckets. |
+
+Future backends can lift these restrictions by implementing the `WeightTransportBackend` interface with `supports_direct_ep_transfer = True` or `sender_ranks` returning multiple ranks.
+
+## Backend Interface
+
+`nccl_broadcast` implements `WeightTransportBackend` from `src/xorl/server/weight_sync/backends/base.py`:
+
+```python
+backend = create_backend("nccl_broadcast", config)
+ok = backend.initialize()          # TCPStore rendezvous, NCCL group init
+backend.transfer_bucket(bucket,    # list of (name, tensor) pairs
+                        src_rank=0,
+                        flush_cache=False)
+backend.destroy()                  # destroy NCCL group on both sides
+```
+
+`sender_ranks` returns `frozenset({0})` — the handler only extracts and prepares weight buffers on rank 0.
+
+## Extending with a New Backend
+
+To add a new backend (e.g. `shared_storage` or `ep_direct`):
+
+1. Create `src/xorl/server/weight_sync/backends/<name>.py` implementing `WeightTransportBackend`.
+2. Register it in `backends/__init__.py`:
+   ```python
+   def create_backend(method: str, config: TransportConfig, **kwargs):
+       if method == "nccl_broadcast":
+           ...
+       if method == "<name>":
+           from .<name> import MyBackend
+           return MyBackend(config, **kwargs)
+   ```
+3. Add the new literal to `sync_inference_method` in `server_arguments.py`.
+
+## Source
+
+| File | Description |
+|---|---|
+| [`src/xorl/server/weight_sync/backends/nccl_broadcast.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/weight_sync/backends/nccl_broadcast.py) | `NcclBroadcastBackend` — full bucket loop and group lifecycle |

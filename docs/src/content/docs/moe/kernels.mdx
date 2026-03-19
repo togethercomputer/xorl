@@ -1,0 +1,220 @@
+---
+title: "Expert Kernels"
+---
+
+Select the expert compute backend via `moe_implementation`. This controls which kernel handles the batch grouped GEMM over all active experts.
+
+---
+
+## Backend Comparison
+
+| Backend | Kernel | EP compatible | torch.compile | LoRA | Notes |
+|---|---|---|---|---|---|
+| `triton` | Triton `group_gemm_same_nk` | Yes | Partial† | Yes | Recommended for Hopper. Autotuned; works with moe_act |
+| `quack` | Quack custom CUDA extension | Yes | No | Limited | Pairs well with DeepEP; custom CUDA kernels not compilable |
+| `native` | `torch._grouped_mm` | Yes | Yes (full) | Yes | No custom deps; slightly slower than triton on Hopper |
+| `eager` | Python loop + `index_add_` | No (ep_size=1 only) | Yes | Yes | Debugging only; slowest but simplest |
+
+```yaml
+model:
+  moe_implementation: triton   # recommended for H100
+```
+
+†Triton: The `group_gemm_same_nk` kernel is compatible with `torch.compile`. However, EP dispatch/combine (AllToAll, DeepEP) is **excluded from compile graphs** because it involves dynamic shapes (variable token counts per rank per step).
+
+---
+
+## Quack Backend
+
+Quack uses **CuTe DSL-based GEMM kernels** written by Tri Dao (the author of Flash Attention). The kernels are built on PyTorch's CuTe DSL and compiled for **SM90+ (H100) and SM100+ (B200)**. They are not available on older GPUs.
+
+### What makes Quack different
+
+Unlike the Triton backend which compiles kernels via Python-defined Triton JIT, Quack kernels are written directly in CuTe DSL — the same low-level CUDA tensor abstraction used for Flash Attention. This gives:
+
+- **Persistent kernels with pingpong double-buffering (H100)** — the kernel occupies SMs continuously across multiple expert GEMMs, overlapping memory loads of the next tile with computation of the current tile
+- **`cu_seqlens` format** — uses Flash Attention's cumulative sequence length format to group tokens by expert, avoiding unnecessary tensor copies
+- **SwiGLU fusion** — `gate_proj` and `up_proj` GEMMs plus the SiLU activation can be fused into a single kernel dispatch via `gemm_gated` / `gemm_act`
+- **SM100 (B200) support** — different tile config: `tile_m=256, tile_n=256, cluster_m=2, cluster_n=1, pingpong=False`
+
+**Default tile config per architecture:**
+
+| Architecture | `tile_m` | `tile_n` | `cluster_m` | `cluster_n` | `pingpong` |
+|---|---|---|---|---|---|
+| SM90 (H100) | 128 | 192 | 2 | 1 | True |
+| SM100 (B200) | 256 | 256 | 2 | 1 | False |
+
+### Autotuning
+
+By default, autotuning is **disabled** (`XORL_QUACK_TUNED=0`). MoE routing produces variable token counts per expert per step — each unique `total_M` would trigger a full ~60-config benchmark, making training orders of magnitude slower. The fixed default config is chosen to be performant across typical token budgets.
+
+Enable autotuning only when shapes are stable (e.g. evaluation with fixed batch size) or when the tuning cache is already warm:
+
+```bash
+XORL_QUACK_TUNED=1 torchrun ... -m xorl.cli.train config.yaml
+```
+
+### Full feature matrix
+
+Quack has dedicated kernel variants for every training mode:
+
+| Variant | Class / Function | Use case |
+|---|---|---|
+| Standard | `quack_expert_forward` | Default forward, no EP |
+| EP | `QuackEPGroupGemm.apply` | EP dispatch + compute |
+| LoRA | `quack_moe_lora_forward` | LoRA adapters, no EP |
+| EP + LoRA | `QuackEPGroupGemmWithLoRA.apply` | EP + LoRA |
+| moe_act | `quack_expert_forward_moe_act` | Gradient checkpointing, no EP |
+| EP + moe_act | `QuackEPGroupGemmMoeAct.apply` | EP + gradient checkpointing |
+
+### Pairing with DeepEP
+
+Quack and DeepEP are both optimized for H100 NVLink clusters and complement each other well: DeepEP handles the token dispatch/combine with dedicated SM kernels, while Quack handles the expert FFN compute with persistent CuTe kernels. Combining them maximizes utilization of both the NVLink interconnect and the SM compute fabric.
+
+```yaml
+model:
+  moe_implementation: quack
+  ep_dispatch: deepep
+  deepep_num_sms: 48    # more SMs for DeepEP; fewer left for Quack — tune based on profiling
+```
+
+### Limitations
+
+- **Requires SM90+ (H100) or SM100+ (B200)** — not available on A100 or older
+- **Not compatible with `torch.compile`** — custom CUDA/CuTe extensions cannot be traced
+- **LoRA support is limited** — `moe_hybrid_shared_lora` is not supported; use `triton` or `native` for hybrid shared LoRA
+- **Autotuning disabled by default** — variable token counts make per-step autotuning prohibitively slow
+
+---
+
+## Triton Grouped GEMM Details
+
+The core of the `triton` backend is [`src/xorl/ops/group_gemm/kernel/group_gemm.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/ops/group_gemm/kernel/group_gemm.py). The primary kernel `group_gemm_same_nk_kernel` handles the case where all experts share the same K (input) and N (output) dimensions.
+
+**Inputs and outputs:**
+
+- `A: [total_tokens, K]` — all tokens routed to this rank, concatenated
+- `B: [G, K, N]` — expert weight tensor in GKN layout
+- `cumsum_M: [G]` — cumulative expert token counts (prefix sum)
+- `C: [total_tokens, N]` — output
+
+**Tile strategy:** Each thread block processes a `BLOCK_M × BLOCK_N` output tile for one expert. An inner loop steps through `BLOCK_K` slices of A and B, accumulating the partial sum in registers.
+
+**Autotuned configs:** `BLOCK_M ∈ {64, 128}`, `BLOCK_N ∈ {128, 256}`, `BLOCK_K ∈ {32, 64}` — autotuned per `(N, K)` shape at first use and cached.
+
+<svg viewBox="0 0 700 220" style="max-width:700px;width:100%;margin:1.5rem 0" font-family="sans-serif">
+  <defs>
+    <marker id="kern-arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#2563eb"/>
+    </marker>
+  </defs>
+  <rect width="700" height="220" fill="#f8fafc" rx="8"/>
+  <text x="350" y="20" text-anchor="middle" font-size="12" font-weight="700" fill="#1e293b">Triton group_gemm_same_nk: Tiling Strategy</text>
+
+  <rect x="20" y="40" width="200" height="160" rx="6" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="120" y="60" text-anchor="middle" font-size="11" fill="#1e3a8a" font-weight="700">Expert Group G</text>
+  <text x="120" y="76" text-anchor="middle" font-size="9" fill="#64748b">A slice: [tokens_g, K]</text>
+
+  <rect x="30" y="84" width="80" height="44" rx="4" fill="#2563eb" stroke="#1d4ed8" stroke-width="1.5"/>
+  <text x="70" y="103" text-anchor="middle" font-size="10" fill="#fff" font-weight="700">BLOCK_M</text>
+  <text x="70" y="118" text-anchor="middle" font-size="9" fill="#bfdbfe">× BLOCK_N tile</text>
+
+  <rect x="120" y="84" width="80" height="44" rx="4" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+  <text x="160" y="106" text-anchor="middle" font-size="9" fill="#64748b">next tile</text>
+
+  <rect x="30" y="138" width="80" height="44" rx="4" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+  <text x="70" y="162" text-anchor="middle" font-size="9" fill="#64748b">next row</text>
+
+  <rect x="120" y="138" width="80" height="44" rx="4" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="4,2"/>
+  <text x="160" y="162" text-anchor="middle" font-size="9" fill="#94a3b8">…</text>
+
+  <text x="120" y="196" text-anchor="middle" font-size="9" fill="#64748b">thread block per tile per expert</text>
+
+  <line x1="230" y1="120" x2="270" y2="120" stroke="#2563eb" stroke-width="1.5" marker-end="url(#kern-arr)"/>
+  <text x="250" y="113" text-anchor="middle" font-size="9" fill="#2563eb">inner K loop</text>
+
+  <rect x="274" y="40" width="200" height="160" rx="6" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
+  <text x="374" y="60" text-anchor="middle" font-size="11" fill="#92400e" font-weight="700">B[G, K, N] — GKN weights</text>
+  <text x="374" y="76" text-anchor="middle" font-size="9" fill="#64748b">expert g slice: [K, N]</text>
+
+  <rect x="284" y="84" width="80" height="104" rx="4" fill="#fde68a" stroke="#d97706" stroke-width="1.5"/>
+  <text x="324" y="130" text-anchor="middle" font-size="9" fill="#92400e">BLOCK_K slice</text>
+  <text x="324" y="145" text-anchor="middle" font-size="9" fill="#92400e">steps through K</text>
+
+  <rect x="374" y="84" width="80" height="104" rx="4" fill="#fef3c7" stroke="#d97706" stroke-width="1" stroke-dasharray="4,2"/>
+  <text x="414" y="130" text-anchor="middle" font-size="9" fill="#d97706">…</text>
+
+  <line x1="484" y1="120" x2="524" y2="120" stroke="#2563eb" stroke-width="1.5" marker-end="url(#kern-arr)"/>
+
+  <rect x="528" y="70" width="148" height="100" rx="6" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="602" y="90" text-anchor="middle" font-size="11" fill="#166534" font-weight="700">Output C</text>
+  <text x="602" y="107" text-anchor="middle" font-size="10" fill="#1e293b">[total_tokens, N]</text>
+  <text x="602" y="124" text-anchor="middle" font-size="9" fill="#64748b">accumulated in</text>
+  <text x="602" y="139" text-anchor="middle" font-size="9" fill="#64748b">registers, written</text>
+  <text x="602" y="154" text-anchor="middle" font-size="9" fill="#64748b">once per tile</text>
+</svg>
+
+**Optional activation fusion:** When `moe_act` gradient checkpointing is active, the kernel stores the post-gate×up intermediate activations to a separate buffer during the forward pass (controlled by the `STORE_ACTIVATIONS` flag). The custom backward function recomputes only the down projection from these stored intermediates.
+
+---
+
+## torch.compile with MoE
+
+`torch.compile` is applied per decoder block when `enable_compile: true`.
+
+**What is compiled:**
+- Attention layers (Q/K/V projections, flash attention wrapper, output projection)
+- Router gate linear and softmax
+- Expert FFN compute (Triton `group_gemm_same_nk` is torch.compile-friendly)
+- Dense shared-expert FFN layers (if present)
+
+**What is excluded from compile graphs:**
+- EP dispatch/combine collectives (`alltoall_pre_dispatch`, `alltoall_post_combine`, DeepEP `dispatch`/`combine`) — dynamic shapes from variable per-rank token counts break static graph tracing
+- Routing replay record/replay logic — mutable external state, decorated with `@torch.compiler.disable`
+
+**Recommended config:**
+
+```yaml
+model:
+  moe_implementation: triton   # or native; quack is incompatible with compile
+train:
+  enable_compile: true
+```
+
+The `native` backend (`torch._grouped_mm`) compiles cleanly end-to-end. The `quack` backend uses custom CUDA extensions and must **not** be used with `enable_compile: true`.
+
+---
+
+## MoE Gradient Checkpointing (`moe_checkpoint_method`)
+
+xorl provides two MoE-aware checkpoint methods:
+
+| Method | What is recomputed | EP comm recomputed | Memory savings |
+|---|---|---|---|
+| `moe_act` (**default**) | Expert MLP activations only (gate×up product inside each expert) | **No** — dispatch/combine skipped via R3 | Moderate — recovers large expert FFN tensors |
+| `full_recompute` | All activations: attention, router, expert FFN | Yes — full AllToAll re-executed | Maximum — stores nothing |
+| `None` / not set | Nothing | N/A | None — all activations kept |
+
+```yaml
+train:
+  enable_gradient_checkpointing: true
+  moe_checkpoint_method: moe_act   # strongly recommended for EP models
+```
+
+**Why `moe_act` is the right default:** Expert FFN activations (gate×up intermediate tensor of shape `[tokens, intermediate_size]`) are the largest memory consumer in a MoE forward pass. `moe_act` drops these and recomputes them from stored inputs during backward, without re-running the expensive AllToAll dispatch. This gives most of the memory savings of full recompute at a fraction of the communication cost.
+
+**How it works in the Triton kernel:** The `group_gemm_same_nk_kernel` has an optional `STORE_ACTIVATIONS` mode. When `moe_act` is active, the kernel stores the post-gate×up intermediate activations to a separate buffer. The custom backward function recomputes only the down projection from these stored intermediates.
+
+---
+
+## Source
+
+| File | Description |
+|---|---|
+| [`src/xorl/models/layers/moe/experts.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/models/layers/moe/experts.py) | `MoEExperts` — GKN weight tensors, backend dispatch, EP forward, moe_act |
+| [`src/xorl/ops/group_gemm/kernel/group_gemm.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/ops/group_gemm/kernel/group_gemm.py) | `group_gemm_same_nk_kernel` — Triton autotuned grouped GEMM with optional STORE_ACTIVATIONS |
+| [`src/xorl/ops/__init__.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/ops/__init__.py) | `triton_moe_forward`, `triton_moe_lora_forward`, backend registry |
+| [`src/xorl/ops/group_gemm/kernel/quack.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/ops/group_gemm/kernel/quack.py) | `quack_group_gemm_same_nk` — CuTe GEMM wrapper; `XORL_QUACK_TUNED` env var |
+| [`src/xorl/ops/quack/gemm_interface.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/ops/quack/gemm_interface.py) | Quack GEMM interface — SM90/SM100 configs, autotuner, gated activation kernels |
+| [`src/xorl/models/layers/moe/backend/quack.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/models/layers/moe/backend/quack.py) | `quack_expert_forward` — non-EP quack MoE forward |
+| [`src/xorl/ops/moe/quack.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/ops/moe/quack.py) | `QuackEPGroupGemm`, `QuackEPGroupGemmMoeAct` — EP + moe_act variants |

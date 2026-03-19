@@ -1,0 +1,213 @@
+---
+title: "QLoRA"
+---
+
+
+For QLoRA with MoE models, see [MoE LoRA](/moe/lora/).
+
+QLoRA stores base model weights in a quantized format and adds trainable LoRA adapters on top. This reduces the GPU memory footprint of the base weights by 2–8× while keeping LoRA parameters in full precision.
+
+## Supported Formats
+
+| Format | Bits/weight | Group size | Best for |
+|---|---|---|---|
+| `nvfp4` | 4-bit (FP4 E2M1) | 16 | Hopper (H100) with ModelOpt checkpoints |
+| `block_fp8` | 8-bit (FP8 E4M3) | 128×128 block | Hopper, from HF FP8 checkpoints |
+| `nf4` | 4-bit (NF4) | 64 | Any GPU, quantizes from BF16 at init |
+
+<svg viewBox="0 0 700 200" style="max-width:700px;width:100%;margin:1.5rem 0" font-family="sans-serif">
+  {/* background */}
+  <rect width="700" height="200" fill="#f8fafc" rx="8"/>
+
+  {/* BF16 weight box */}
+  <rect x="20" y="60" width="110" height="80" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="75" y="96" text-anchor="middle" font-size="12" fill="#1e293b" font-weight="600">BF16</text>
+  <text x="75" y="112" text-anchor="middle" font-size="12" fill="#1e293b">weight W</text>
+
+  {/* arrow: quantize */}
+  <line x1="130" y1="100" x2="175" y2="100" stroke="#64748b" stroke-width="1.5" marker-end="url(#qlora-arr)"/>
+  <defs>
+    <marker id="qlora-arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#64748b"/>
+    </marker>
+  </defs>
+  <text x="152" y="92" text-anchor="middle" font-size="10" fill="#64748b">quantize</text>
+
+  {/* Packed weight box */}
+  <rect x="180" y="40" width="120" height="44" rx="6" fill="#1e3a8a" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="240" y="58" text-anchor="middle" font-size="11" fill="#fff" font-weight="600">Packed weight</text>
+  <text x="240" y="74" text-anchor="middle" font-size="10" fill="#dbeafe">NF4 / NVFP4 / FP8</text>
+
+  {/* Scale box */}
+  <rect x="180" y="116" width="120" height="44" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="240" y="136" text-anchor="middle" font-size="11" fill="#1e293b" font-weight="600">Scale tensor</text>
+  <text x="240" y="152" text-anchor="middle" font-size="10" fill="#64748b">per group</text>
+
+  {/* LoRA A box */}
+  <rect x="370" y="40" width="100" height="44" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="420" y="58" text-anchor="middle" font-size="11" fill="#1e293b" font-weight="600">LoRA A</text>
+  <text x="420" y="74" text-anchor="middle" font-size="10" fill="#64748b">[K, r] BF16</text>
+
+  {/* LoRA B box */}
+  <rect x="370" y="116" width="100" height="44" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="420" y="136" text-anchor="middle" font-size="11" fill="#1e293b" font-weight="600">LoRA B</text>
+  <text x="420" y="152" text-anchor="middle" font-size="10" fill="#64748b">[r, M] BF16</text>
+
+  {/* Correction box */}
+  <rect x="540" y="78" width="130" height="44" rx="6" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <text x="605" y="96" text-anchor="middle" font-size="11" fill="#15803d" font-weight="600">Correction U, B</text>
+  <text x="605" y="112" text-anchor="middle" font-size="10" fill="#64748b">optional low-rank</text>
+
+  {/* label: trainable */}
+  <text x="420" y="22" text-anchor="middle" font-size="10" fill="#2563eb" font-weight="600">trainable (BF16)</text>
+  {/* label: frozen */}
+  <text x="240" y="22" text-anchor="middle" font-size="10" fill="#1e3a8a" font-weight="600">frozen (quantized)</text>
+  {/* label: optional */}
+  <text x="605" y="64" text-anchor="middle" font-size="10" fill="#16a34a">optional</text>
+
+  {/* bracket line connecting packed+scale */}
+  <line x1="300" y1="62" x2="365" y2="62" stroke="#64748b" stroke-width="1" stroke-dasharray="4,3"/>
+  <line x1="300" y1="138" x2="365" y2="138" stroke="#64748b" stroke-width="1" stroke-dasharray="4,3"/>
+  <line x1="365" y1="62" x2="365" y2="138" stroke="#64748b" stroke-width="1" stroke-dasharray="4,3"/>
+
+  {/* line from LoRA to correction */}
+  <line x1="470" y1="100" x2="538" y2="100" stroke="#16a34a" stroke-width="1" stroke-dasharray="4,3"/>
+
+  {/* bottom legend */}
+  <text x="350" y="190" text-anchor="middle" font-size="10" fill="#64748b">Forward: dequant(W) + correction + LoRA_B @ LoRA_A × scale</text>
+</svg>
+
+## Basic Configuration
+
+```yaml
+lora:
+  enable_qlora: true
+  quant_format: nf4          # nf4 | nvfp4 | block_fp8
+  lora_rank: 16
+  lora_alpha: 32
+  lora_target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+```
+
+## Format Details
+
+### NF4
+
+NF4 quantizes BF16 weights on-the-fly during model initialization. No pre-quantized checkpoint required. Works on any GPU.
+
+```yaml
+  quant_format: nf4
+  quant_group_size: 64       # quantization block size
+```
+
+### NVFP4
+
+NVFP4 uses NVIDIA's FP4 E2M1 format with per-block scales and a global scale tensor. Requires either a pre-quantized checkpoint (NVIDIA ModelOpt format) or quantizes from BF16 at init.
+
+```yaml
+  quant_format: nvfp4
+  quant_group_size: 16
+```
+
+Loading from a pre-quantized ModelOpt checkpoint:
+```yaml
+model:
+  model_path: /path/to/nvfp4_checkpoint
+```
+xorl auto-detects NVFP4 checkpoints and skips re-quantization.
+
+### Block FP8
+
+Block-wise FP8 E4M3 quantization. Compatible with HF FP8 checkpoints (e.g., Qwen3-235B-A22B-Instruct-FP8).
+
+```yaml
+  quant_format: block_fp8
+  quant_group_size: 128
+```
+
+## Key Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `enable_qlora` | `false` | Enable QLoRA |
+| `quant_format` | `nvfp4` | Quantization format: `nvfp4`, `block_fp8`, `nf4` |
+| `quant_group_size` | format-dependent | Quantization block size |
+| `lora_rank` | `16` | LoRA rank r |
+| `lora_alpha` | `16` | LoRA scaling factor |
+| `lora_target_modules` | `null` | Module names to inject QLoRA into |
+| `save_lora_only` | `false` | Save only LoRA weights (not packed base) |
+| `exclude_modules` | `null` | Keep these modules in BF16 (e.g. `lm_head`) |
+| `merge_lora_interval` | `0` | Merge LoRA into base every N steps (0 = off) |
+| `reset_optimizer_on_merge` | `false` | Reset optimizer states on merge (ReLoRA) |
+| `enable_aqn` | `false` | Adaptive Quantization Noise |
+| `aqn_alpha` | `1.0` | AQN noise scale |
+
+## Periodic Merge (ReLoRA)
+
+Periodically merge the LoRA delta back into the quantized base weights, then restart LoRA from scratch. After merging, the base weight stores `quant(W + lora_delta)` and the correction is recomputed.
+
+```yaml
+  merge_lora_interval: 200    # merge every 200 steps
+  reset_optimizer_on_merge: true   # clear Adam momentum/variance (ReLoRA)
+```
+
+## Excluding Modules from Quantization
+
+Some layers (e.g. `lm_head`, embedding) should remain in BF16:
+
+```yaml
+  exclude_modules: [lm_head, embed_tokens]
+```
+
+## Adaptive Quantization Noise (AQN)
+
+AQN adds calibrated noise to the dequantized weights during training to regularize against quantization error. Enabled per-format:
+
+```yaml
+  enable_aqn: true
+  aqn_alpha: 1.0   # noise magnitude scale
+```
+
+## QLoRA with MoE
+
+For MoE models, expert weights are quantized through `QLoRAMoeExperts`:
+
+```yaml
+lora:
+  enable_qlora: true
+  quant_format: nvfp4
+  lora_rank: 16
+  # gate_proj/up_proj/down_proj targets fused expert weights
+  lora_target_modules: [qkv_proj, gate_up_proj, down_proj, o_proj]
+```
+
+MoE expert loading uses `maybe_load_and_quantize_moe_qlora()` which handles EP-sharded expert tensors.
+
+## Memory Usage
+
+Approximate memory reduction versus BF16 full fine-tuning (per parameter):
+
+| Config | Memory vs BF16 |
+|---|---|
+| BF16 + LoRA (rank 16) | ~100% base + tiny LoRA |
+| NF4 + LoRA (rank 16) | ~25% base + tiny LoRA |
+| NVFP4 + LoRA (rank 16) | ~12% base + tiny LoRA |
+
+## Example Configs
+
+See `examples/local/dummy/configs/qlora/` and `examples/server/configs/qlora/` for complete QLoRA configs.
+
+## Source
+
+| File | Description |
+|---|---|
+| [`src/xorl/ops/block_fp8.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/ops/block_fp8.py) | Block FP8 quantization/dequantization ops |
+| [`src/xorl/ops/nf4.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/ops/nf4.py) | NF4 quantization ops |
+| [`src/xorl/qlora/`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/qlora/) | QLoRA module implementations |
+| [`src/xorl/qlora/detect_prequantized.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/qlora/detect_prequantized.py) | Auto-detect pre-quantized checkpoints |

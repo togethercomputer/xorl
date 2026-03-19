@@ -131,7 +131,7 @@ class ServerArguments:
         metadata={"help": "Foundation model extra config"}
     )
 
-    encoders: Dict[Literal["image"], Dict[str, str]] = field(
+    encoders: Dict[Literal["image", "video", "audio"], Dict[str, str]] = field(
         default_factory=dict,
         metadata={"help": "Multimodal encoder config"}
     )
@@ -466,7 +466,7 @@ class ServerArguments:
 
     quant_format: str = field(
         default="nvfp4",
-        metadata={"help": "Quantization format for QLoRA: 'nvfp4' or 'block_fp8'"}
+        metadata={"help": "Quantization format for QLoRA: 'nvfp4', 'block_fp8', or 'nf4'"}
     )
 
     quant_group_size: int = field(
