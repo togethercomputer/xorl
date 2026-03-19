@@ -1,0 +1,796 @@
+---
+title: "Context Parallelism"
+---
+
+
+:::note
+**Context Parallelism (CP)** and **Sequence Parallelism (SP)** refer to the same concept in this repo and are used interchangeably. Config fields, code, and logs may use either term.
+:::
+
+Context parallelism (CP) distributes long sequences across multiple
+GPUs during training, allowing context lengths that would not fit on a single device.
+There are two independent SP mechanisms — **Ulysses SP** and **Ring Attention** — which
+can be used alone or composed into a **Hybrid CP** configuration.
+
+The combined context-parallel (CP) group size is:
+
+```
+cp_size = ulysses_size × ringattn_size
+```
+
+Controlled by two config fields in `TrainArguments`:
+
+| Config field | Default | Description |
+|---|---|---|
+| `ulysses_parallel_size` | 1 | Number of ranks in the Ulysses SP group |
+| `ringattn_parallel_size` | 1 | Number of ranks in the ring attention group |
+| `cp_fsdp_mode` | `"all"` | How SP dimensions fold into FSDP sharding |
+
+<svg viewBox="0 0 700 180" style="max-width:700px;width:100%;margin:1.5rem 0" font-family="sans-serif">
+  <defs>
+    <marker id="sp-arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#2563eb"/>
+    </marker>
+  </defs>
+  <rect width="700" height="180" fill="#f8fafc" rx="8"/>
+
+  {/* Ulysses panel */}
+  <rect x="10" y="10" width="320" height="160" rx="8" fill="#fff" stroke="#e2e8f0" stroke-width="1.5"/>
+  <text x="170" y="28" text-anchor="middle" font-size="12" fill="#1e293b" font-weight="700">Ulysses SP (all-to-all)</text>
+
+  {/* before a2a */}
+  <rect x="20" y="36" width="55" height="100" rx="4" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+  <text x="47" y="56" text-anchor="middle" font-size="9" fill="#1e293b">R0</text>
+  <text x="47" y="70" text-anchor="middle" font-size="8" fill="#64748b">S/4 tokens</text>
+  <text x="47" y="82" text-anchor="middle" font-size="8" fill="#64748b">all heads</text>
+
+  <rect x="80" y="36" width="55" height="100" rx="4" fill="#dbeafe" stroke="#2563eb" stroke-width="1"/>
+  <text x="107" y="56" text-anchor="middle" font-size="9" fill="#1e293b">R1</text>
+  <text x="107" y="70" text-anchor="middle" font-size="8" fill="#64748b">S/4 tokens</text>
+  <text x="107" y="82" text-anchor="middle" font-size="8" fill="#64748b">all heads</text>
+
+  {/* a2a arrow */}
+  <text x="155" y="85" text-anchor="middle" font-size="10" fill="#2563eb" font-weight="600">A2A</text>
+  <line x1="140" y1="86" x2="178" y2="86" stroke="#2563eb" stroke-width="2" marker-end="url(#sp-arr)"/>
+
+  {/* after a2a */}
+  <rect x="185" y="36" width="55" height="100" rx="4" fill="#1e3a8a" stroke="#2563eb" stroke-width="1"/>
+  <text x="212" y="56" text-anchor="middle" font-size="9" fill="#fff">R0</text>
+  <text x="212" y="70" text-anchor="middle" font-size="8" fill="#dbeafe">S tokens</text>
+  <text x="212" y="82" text-anchor="middle" font-size="8" fill="#dbeafe">H/4 heads</text>
+
+  <rect x="250" y="36" width="55" height="100" rx="4" fill="#1e3a8a" stroke="#2563eb" stroke-width="1"/>
+  <text x="277" y="56" text-anchor="middle" font-size="9" fill="#fff">R1</text>
+  <text x="277" y="70" text-anchor="middle" font-size="8" fill="#dbeafe">S tokens</text>
+  <text x="277" y="82" text-anchor="middle" font-size="8" fill="#dbeafe">H/4 heads</text>
+
+  <text x="170" y="152" text-anchor="middle" font-size="9" fill="#64748b">scatter seq → gather heads → local attention → restore</text>
+
+  {/* Ring panel */}
+  <rect x="360" y="10" width="330" height="160" rx="8" fill="#fff" stroke="#e2e8f0" stroke-width="1.5"/>
+  <text x="525" y="28" text-anchor="middle" font-size="12" fill="#1e293b" font-weight="700">Ring Attention (P2P ring)</text>
+
+  {/* Ring nodes */}
+  <circle cx="430" cy="90" r="28" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="430" y="87" text-anchor="middle" font-size="9" fill="#1e293b" font-weight="600">R0</text>
+  <text x="430" y="101" text-anchor="middle" font-size="8" fill="#64748b">S/4 Q,K,V</text>
+
+  <circle cx="525" cy="50" r="28" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="525" y="47" text-anchor="middle" font-size="9" fill="#1e293b" font-weight="600">R1</text>
+  <text x="525" y="61" text-anchor="middle" font-size="8" fill="#64748b">S/4 Q,K,V</text>
+
+  <circle cx="620" cy="90" r="28" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="620" y="87" text-anchor="middle" font-size="9" fill="#1e293b" font-weight="600">R2</text>
+  <text x="620" y="101" text-anchor="middle" font-size="8" fill="#64748b">S/4 Q,K,V</text>
+
+  <circle cx="525" cy="130" r="28" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="525" y="127" text-anchor="middle" font-size="9" fill="#1e293b" font-weight="600">R3</text>
+  <text x="525" y="141" text-anchor="middle" font-size="8" fill="#64748b">S/4 Q,K,V</text>
+
+  {/* ring arrows */}
+  <line x1="457" y1="74" x2="499" y2="58" stroke="#2563eb" stroke-width="1.5" marker-end="url(#sp-arr)"/>
+  <line x1="551" y1="58" x2="594" y2="74" stroke="#2563eb" stroke-width="1.5" marker-end="url(#sp-arr)"/>
+  <line x1="620" y1="118" x2="551" y2="130" stroke="#2563eb" stroke-width="1.5" marker-end="url(#sp-arr)"/>
+  <line x1="499" y1="130" x2="457" y2="118" stroke="#2563eb" stroke-width="1.5" marker-end="url(#sp-arr)"/>
+
+  <text x="525" y="168" text-anchor="middle" font-size="9" fill="#64748b">rotate KV blocks; each rank computes local attn with rotating K,V</text>
+</svg>
+
+<svg viewBox="0 0 700 160" style="max-width:700px;width:100%;margin:1.5rem 0" font-family="sans-serif">
+  <defs>
+    <marker id="sp-dist" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#16a34a"/>
+    </marker>
+  </defs>
+  <rect width="700" height="160" fill="#f8fafc" rx="8"/>
+  <text x="350" y="18" text-anchor="middle" font-size="12" font-weight="700" fill="#1e293b">Context Parallelism: Sequence Split</text>
+  <rect x="20" y="26" width="660" height="22" rx="4" fill="#bbf7d0" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="350" y="42" text-anchor="middle" font-size="9" fill="#166534" font-weight="600">Full sequence S tokens</text>
+  <line x1="102" y1="48" x2="102" y2="78" stroke="#16a34a" stroke-width="1.5" marker-end="url(#sp-dist)"/>
+  <line x1="267" y1="48" x2="267" y2="78" stroke="#16a34a" stroke-width="1.5" marker-end="url(#sp-dist)"/>
+  <line x1="432" y1="48" x2="432" y2="78" stroke="#16a34a" stroke-width="1.5" marker-end="url(#sp-dist)"/>
+  <line x1="597" y1="48" x2="597" y2="78" stroke="#16a34a" stroke-width="1.5" marker-end="url(#sp-dist)"/>
+  <rect x="40" y="80" width="124" height="40" rx="4" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="102" y="96" text-anchor="middle" font-size="9" fill="#166534" font-weight="600">Rank 0</text>
+  <text x="102" y="110" text-anchor="middle" font-size="7.5" fill="#166534">Ulysses: full S, H/4 heads</text>
+  <rect x="205" y="80" width="124" height="40" rx="4" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="267" y="96" text-anchor="middle" font-size="9" fill="#166534" font-weight="600">Rank 1</text>
+  <text x="267" y="110" text-anchor="middle" font-size="7.5" fill="#166534">Ulysses: full S, H/4 heads</text>
+  <rect x="370" y="80" width="124" height="40" rx="4" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="432" y="96" text-anchor="middle" font-size="9" fill="#166534" font-weight="600">Rank 2</text>
+  <text x="432" y="110" text-anchor="middle" font-size="7.5" fill="#166534">Ring: S/4 tokens &#x2192; KV pass</text>
+  <rect x="535" y="80" width="124" height="40" rx="4" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="597" y="96" text-anchor="middle" font-size="9" fill="#166534" font-weight="600">Rank 3</text>
+  <text x="597" y="110" text-anchor="middle" font-size="7.5" fill="#166534">Ring: S/4 tokens &#x2192; KV pass</text>
+  <text x="350" y="150" text-anchor="middle" font-size="9" fill="#64748b">Ulysses splits across attention heads; Ring Attention splits across sequence chunks.</text>
+</svg>
+
+---
+
+## Ulysses Context Parallelism
+
+### How It Works
+
+Ulysses SP (originally from DeepSpeed) distributes attention heads across ranks while
+keeping each rank responsible for a slice of the sequence. The key insight is that
+attention is separable across heads, so gathering the full sequence per rank and
+computing a subset of heads is equivalent to full attention.
+
+**Data layout entering the attention layer:**
+- Each Ulysses rank holds: shape `[B, S/ulysses_size, num_heads, head_dim]`
+- All ranks hold the same sequence slice but different positions in the batch dimension
+  (within the CP group, they hold the same sequence data)
+
+**Pre-attention all-to-all (phase 1, `project_qkv`):**
+
+```
+Input:  [B, S/P,  H,   D]   (S/P tokens, H heads, per rank)
+        scatter dim=seq, gather dim=head
+Output: [B, S,    H/P, D]   (S tokens, H/P heads, per rank)
+```
+
+The all-to-all transposes the sharding axis from sequence to heads. After this
+operation, each rank holds all tokens but only `H/ulysses_size` heads, enabling
+standard local flash attention.
+
+**Post-attention all-to-all (phase 3, `project_output`):**
+
+```
+Input:  [B, S,    H/P, D]   (output of attention, full sequence, local heads)
+        scatter dim=head, gather dim=seq
+Output: [B, S/P,  H,   D]   (back to sequence-sharded)
+```
+
+This restores the original sequence-sharded layout for the subsequent MLP and
+layer-norm computations, which are sequence-independent and run locally.
+
+### Communication Cost
+
+Each Ulysses attention layer requires two all-to-all collectives. The data volume
+transferred per all-to-all is:
+
+```
+bytes per all-to-all = B × S × H × D × dtype_bytes
+```
+
+The all-to-all sends `1/P` of the data to each of the `P` ranks, for a total
+communication volume proportional to `S × H × D`. Critically, **Ulysses communication
+cost does not grow with sequence length relative to compute** — both compute (O(S²H))
+and communication (O(S×H)) scale, but communication is lower order.
+
+For GQA models where `ulysses_size > num_kv_heads`, xorl-internal expands KV heads
+with `repeat_kv` before the all-to-all so that each rank receives at least one KV head
+after scattering.
+
+### Constraints
+
+1. **Head divisibility:** `num_attention_heads % ulysses_size == 0`
+   For GQA models with few KV heads, the sync strategy handles the case where
+   `ulysses_size > num_kv_heads` by expanding KV with `repeat_kv` before the a2a:
+   `assert ulysses_size % num_kv_heads == 0`
+
+2. **Sequence divisibility:** The sequence length must be divisible by `ulysses_size`
+   after padding. The collator pads to `cp_size` (or `2*cp_size` for ring+zigzag).
+
+### Sync vs. Async Ulysses
+
+The strategy resolver (`get_cp_strategy` in `strategy.py`) automatically selects
+between two Ulysses implementations:
+
+- **`UlyssesAsyncStrategy`** (used when `ulysses_size <= num_kv_heads`): Overlaps
+  each linear projection (Q, K, V) with its corresponding all-to-all on a separate
+  NCCL stream. This is implemented in `AsyncUlyssesQKVProjection.forward()`, which
+  launches Q projection, then Q all-to-all asynchronously, then K projection, K
+  all-to-all, and so on — each communication overlaps the next compute step.
+
+- **`UlyssesSyncStrategy`** (used when `ulysses_size > num_kv_heads`, i.e., GQA with
+  few KV heads): Performs projections first, then synchronous all-to-all. Also uses
+  a fused K/V all-to-all: K and V are interleaved into a single `[S, 2*H_kv, D]`
+  tensor to halve the number of collectives.
+
+For QLoRA, both strategies fall back to sync-style (weights are packed in quantized
+buffers, so the manual matmul path in `AsyncUlyssesQKVProjection` is unavailable).
+
+### Gradient Synchronization
+
+Ulysses all-to-all collectives have correct gradients baked in via autograd. The
+`_SeqAllToAll` autograd function swaps scatter and gather dims in the backward pass,
+so parameter gradients from the QKV and output projections are correct locally.
+
+However, if Ulysses is **not** folded into the FSDP mesh (controlled by
+`cp_fsdp_mode`), gradients from different Ulysses ranks must be explicitly summed.
+This is handled by `sync_sp_gradients` in `training_utils.py`:
+
+```python
+def sync_sp_gradients(model, sp_grad_sync_group):
+    if sp_grad_sync_group is not None:
+        for p in model.parameters():
+            if p.grad is not None:
+                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, group=sp_grad_sync_group)
+```
+
+The key point: SP ranks compute gradients for **complementary, non-overlapping
+sequence shards**, so the correct operation is SUM (not AVG). FSDP's reduce-scatter
+already averages gradients within its group; `sync_sp_gradients` adds the contributions
+from ranks not in that group.
+
+---
+
+## Ring Attention
+
+### How It Works
+
+Ring attention distributes attention computation by assigning each rank a contiguous
+shard of the sequence. Unlike Ulysses (which uses all-to-all to gather the full
+sequence per rank), ring attention keeps each rank's Q, K, V local and rotates the
+KV blocks around a logical ring of GPUs.
+
+**Forward pass (`RingAttentionP2PFunc.forward`):**
+
+1. Pack local K and V into a contiguous buffer: `kv_buf = cat([k.reshape(-1), v.reshape(-1)])`
+2. Allocate two ping-pong buffers for double-buffered P2P communication.
+3. Loop `ringattn_size` times:
+   - Wait for the P2P recv of the current KV buffer.
+   - Immediately post the next P2P send/recv on a separate CUDA stream (overlaps
+     with the attention compute below).
+   - Extract `k_step`, `v_step` from the current buffer.
+   - Run flash attention between local Q and `(k_step, v_step)`.
+   - Merge partial outputs using online log-sum-exp (numerically stable via softplus).
+4. At the end of the loop, each rank holds the correct attention output for its
+   local Q tokens, having attended to all K/V tokens across all ring ranks.
+
+**Backward pass:**
+The backward does not use P2P rings. Instead, it re-gathers all KV via `all_gather_kv`
+(stacks K and V into a single buffer, performs one `all_gather_into_tensor`, then
+splits). This is memory-efficient because only local K, V are saved in the forward
+context. The dk and dv gradients accumulated across all steps are returned to their
+owning ranks via `reduce_scatter_grads`.
+
+**P2P deadlock avoidance:**
+Even-rank GPUs send first then receive; odd-rank GPUs receive first then send. This
+avoids circular deadlocks in NCCL's point-to-point operations.
+
+### Zigzag Load Balancing
+
+Causal attention creates an asymmetric workload: tokens near the end of the sequence
+attend to many more KV tokens than tokens near the start. Without any reordering,
+ring ranks holding late sequence chunks perform far more FLOPs than ranks holding
+early chunks.
+
+**Zigzag reordering** solves this by assigning each rank a pair of sub-chunks:
+one from the early part of each document and one from the late part. After zigzag,
+every rank performs the same total amount of causal attention work.
+
+**Chunk assignment:** Split each document into `2 * ringattn_size` equal-sized
+sub-chunks numbered 0 to `2N-1`. Rank `r` receives sub-chunks `r` (early) and
+`2N-1-r` (late). This means rank 0 gets chunks `[0, 2N-1]`, rank 1 gets `[1, 2N-2]`,
+etc. — the symmetry ensures each rank's early+late pair spans the same total causal
+attention workload.
+
+**Ring step sections:** During the ring loop, each step is classified into one of
+three sections based on the relative positions of the query rank and the current
+KV source rank:
+
+- `"diagonal"`: The rank is computing attention with its own KV (step 0). Full causal
+  attention applies within the combined chunk.
+- `"lower"`: Q's early sub-chunk is later than KV's early sub-chunk. All Q tokens can
+  attend to the early half of the KV (no mask needed).
+- `"upper"`: Q's early sub-chunk is earlier. Only Q's late half attends to all KV
+  (no mask needed).
+
+This three-case logic eliminates causal masking overhead for all non-diagonal steps
+while maintaining correctness.
+
+### Zigzag Reordering in the Data Collator
+
+The reordering happens in `zigzag_reorder_packed_sequence` (called from
+`TextSequenceShardCollator.__call__`). The full algorithm:
+
+1. Detect document boundaries by finding positions where `position_id == 0`.
+2. For each document of length `L`, split into `2 * ringattn_size` equal chunks.
+3. For rank `r`: collect chunk `r` (early) and chunk `2N-1-r` (late) from every
+   document.
+4. Concatenate all rank 0 data first, then rank 1, etc., into a single reordered
+   sequence.
+5. Each CP rank then takes its contiguous slice via `sp_slice`.
+
+**Constraint:** Every document must have length divisible by `2 * ringattn_size`.
+If any document fails this check, `zigzag_reorder_packed_sequence` raises a
+`ValueError`. The SP padding step ensures the total sequence length satisfies this,
+but individual documents in a packed sequence must already be individually aligned.
+If documents are not naturally aligned, the upstream packing step must enforce this.
+
+### SP Padding
+
+Before slicing, the collator pads the sequence to the required multiple:
+
+```python
+pad_multiple = 2 * cp_size  if ringattn_size > 1  else  cp_size
+```
+
+This ensures:
+- For pure ring attention: divisible by `2 * ringattn_size` for zigzag sub-chunks.
+- For hybrid CP: divisible by `2 * ringattn_size * ulysses_size = 2 * cp_size`.
+- For pure Ulysses: divisible by `ulysses_size = cp_size`.
+
+After padding, `sp_slice` takes rank `cp_rank`'s contiguous chunk of size
+`padded_len / cp_size`:
+
+```python
+def sp_slice(self, tensor, dim=-1):
+    seq_length = tensor.size(dim)
+    cp_chunk_size = (seq_length + self.cp_size - 1) // self.cp_size
+    return tensor.narrow(dim, self.cp_rank * cp_chunk_size, cp_chunk_size)
+```
+
+### cu_seq_lens Handling for Ring Attention
+
+Flash attention's varlen API requires cumulative sequence lengths (`cu_seqlens`) to
+locate document boundaries within packed sequences. After zigzag reordering, the
+`position_ids` tensor has resets (`position_id == 0`) at every sub-chunk boundary —
+not just at true document boundaries. Using zigzag-reordered position IDs to compute
+`cu_seqlens` would create hundreds of spurious tiny "documents" and produce wrong
+cu_seqlens, leading to NaN in flash attention backward.
+
+**Solution:** The collator stores the original (pre-zigzag) position IDs in
+`_original_position_ids` before reordering, then computes cu_seqlens from those:
+
+```python
+# In TextSequenceShardCollator.__call__:
+if "_original_position_ids" not in batch:
+    batch["_original_position_ids"] = position_ids.clone()
+
+# ... zigzag reorder happens here ...
+
+if self.ringattn_size > 1 and "_original_position_ids" in batch:
+    orig_pos = batch["_original_position_ids"]
+    (cu_q, cu_k), (max_q, max_k) = prepare_fa_kwargs_from_position_ids(orig_pos)
+    batch["cu_seq_lens_q"] = cu_q
+    batch["cu_seq_lens_k"] = cu_k
+    batch["max_length_q"] = max_q
+    batch["max_length_k"] = max_k
+```
+
+These `cu_seqlens` reflect the full (unsharded) document structure. The ring attention
+strategy (`_scale_cu_seqlens_for_ringattn` in `strategy.py`) then divides them by
+`ringattn_size` to convert to per-rank local offsets:
+
+```python
+cu_seqlens_q = (cu_seqlens_q // ringattn_size).to(torch.int32)
+max_seqlen_q  = max_seqlen_q // ringattn_size
+```
+
+This works because zigzag guarantees each rank holds exactly `L / ringattn_size`
+tokens from each document of length `L`.
+
+Note: `position_ids` itself is **not** sliced — the full padded tensor is forwarded to
+the model. RoPE embedding uses `position_ids` to index the pre-computed `(cos, sin)`
+tables, and ring attention needs each rank to use the correct positional indices for
+its local tokens, which the zigzag assignment already ensures.
+
+---
+
+## Hybrid CP: Ulysses + Ring
+
+When both `ulysses_size > 1` and `ringattn_size > 1`, the two mechanisms compose into
+a hybrid strategy (`HybridUlyssesRingStrategy`).
+
+### Total CP Group Size
+
+```
+cp_size = ulysses_size × ringattn_size
+```
+
+Each batch is sharded across `cp_size` ranks. After SP padding, each rank holds
+`S / cp_size` tokens.
+
+### Data Flow in Hybrid Mode
+
+The three-phase strategy maps to:
+
+```
+Input shard: [B, S/cp_size, H, D]
+
+Phase 1 (project_qkv) — Ulysses all-to-all:
+  scatter seq (within Ulysses group), gather heads
+  → [B, S/ringattn_size, H/ulysses_size, D]
+
+Phase 2 (compute_attention) — Ring attention:
+  KV rotated across ring group (ringattn_size ranks)
+  Each rank sees all S/ringattn_size * ulysses_size tokens for its H/ulysses_size heads
+  Wait — ring gives each rank full-sequence attention:
+  → ring loop over ringattn_size steps, attending to all S tokens
+  → output: [B, S/ringattn_size, H/ulysses_size, D]
+
+Phase 3 (project_output) — Ulysses all-to-all (reverse):
+  scatter heads, gather seq
+  → [B, S/cp_size, H, D]
+```
+
+After Ulysses' pre-attention a2a, each rank holds `S / ringattn_size` tokens with
+`H / ulysses_size` heads. The ring attention then rotates KV across the
+`ringattn_size`-rank ring group, giving each rank attention over the full sequence
+for its local head subset.
+
+### Device Mesh Layout
+
+The device mesh is constructed in `init_parallel_state` with dimension order:
+
+```
+[pp, dp_replicate, dp_shard, ringattn, ulysses, tp]
+```
+
+Only dimensions with size > 1 (plus `dp_shard`) are materialized. Flat mesh aliases
+are created for compound groups:
+
+| Alias | Covers |
+|---|---|
+| `dp` | `dp_replicate × dp_shard` |
+| `sp` | `ringattn × ulysses` (unified SP group) |
+| `dp_shard_sp` | `dp_shard × [ring] × [ulysses]` depending on `cp_fsdp_mode` |
+| `dp_sp` | `dp_replicate × dp_shard × ringattn × ulysses` (loss group) |
+
+The FSDP2 mesh (`fsdp_mesh`) is the `dp_shard_sp` submesh, which determines which
+ranks shard model parameters together. Its size (`fsdp_size`) is used by FSDP2's
+reduce-scatter to compute the averaging factor for gradient reduction:
+
+```python
+@property
+def fsdp_size(self) -> int:
+    size = self.dp_size
+    if self.cp_fsdp_mode == "all":
+        size *= self.ringattn_size * self.ulysses_size
+    elif self.cp_fsdp_mode == "ulysses_only":
+        size *= self.ulysses_size
+    elif self.cp_fsdp_mode == "ring_only":
+        size *= self.ringattn_size
+    return size
+```
+
+---
+
+## cp_fsdp_mode: SP–FSDP Interaction
+
+`cp_fsdp_mode` controls which SP dimensions are folded into the FSDP sharding mesh.
+When an SP dimension is folded into FSDP, its reduce-scatter automatically handles
+gradient averaging for that dimension, so no separate `sync_sp_gradients` is needed.
+
+| Value | FSDP mesh includes | Extra grad sync needed |
+|---|---|---|
+| `"all"` (default) | dp_shard + ring + ulysses | None |
+| `"ulysses_only"` | dp_shard + ulysses | Ring group (`ringattn_group`) |
+| `"ring_only"` | dp_shard + ring | Ulysses group (`ulysses_group`) |
+| `"none"` | dp_shard only | Unified SP group (ring × ulysses) |
+
+The `sp_grad_sync_group` property in `ParallelState` returns the appropriate group:
+
+```python
+@property
+def sp_grad_sync_group(self):
+    if self.cp_fsdp_mode == "all":           return None          # no-op
+    if self.cp_fsdp_mode == "ulysses_only":  return ringattn_group
+    if self.cp_fsdp_mode == "ring_only":     return ulysses_group
+    if self.cp_fsdp_mode == "none":          return sp_group      # full unified SP
+```
+
+**When to use non-`"all"` modes:**
+- `"ulysses_only"` can improve memory efficiency when ring attention is used without
+  FSDP parameter sharding across ring ranks (e.g., ring provides long-context support
+  but model fits in memory per ring-group of ranks).
+- `"none"` decouples SP entirely from FSDP, at the cost of requiring a manual
+  all-reduce across the full SP group after every backward.
+
+---
+
+## Interaction with Other Parallelism Dimensions
+
+### CP + DP (FSDP2)
+
+DP and CP coexist naturally. The full FSDP sharding mesh is:
+
+```
+dp_shard × [ringattn] × [ulysses]   (depends on cp_fsdp_mode)
+```
+
+The data loader shards batches across `dp_size` ranks (the `batch_mesh`). Each
+DP rank feeds a distinct sample to its CP group. Within a CP group, all ranks process
+the same batch item but different sequence shards.
+
+The loss is reduced across `dp_replicate × dp_shard × ringattn × ulysses` (the
+`loss_mesh` / `dp_sp` group), because all of these ranks compute partial losses on
+different parts of the same logical training batch.
+
+### CP + PP (Pipeline Parallelism)
+
+PP and CP are orthogonal: PP stages split model layers; CP splits the sequence within
+each stage. Each PP stage runs the same CP topology independently.
+
+Key consideration: PP requires fixed-shape P2P buffers across microbatches. Since CP
+pads sequences to `2 * cp_size` multiples, the padded sequence length passed through
+the PP pipeline is deterministic. `pad_micro_batches_for_pp` in `training_utils.py`
+pads each microbatch to `sample_packing_sequence_len / sp_size` (rounded up to
+`pad_to_multiple_of`), ensuring buffer shape consistency.
+
+`cu_seqlens` in PP are handled by extending the last real document to cover the
+padded tokens (rather than adding a zero-length padding document), which avoids
+degenerate varlen inputs in flash attention backward.
+
+### CP + EP (Expert Parallelism)
+
+Expert parallelism (EP) and SP share the same physical GPUs. They are managed with
+separate device meshes: the main `device_mesh` covers PP/DP/SP/TP dimensions, while
+`ep_fsdp_device_mesh` covers EP and its internal FSDP group.
+
+For the Qwen3-30B-A3B MoE model configuration with PP+EP+CP, both EP and CP are
+folded onto the same physical ranks:
+
+```yaml
+# qwen3_30b_a3b_pp2_ep4_cp4_muon.yaml
+pipeline_parallel_size: 2
+ringattn_parallel_size: 4
+expert_parallel_size:   4
+```
+
+With `pp=2`, `ringattn=4`, `ep=4` on 32 GPUs: each PP stage has 16 GPUs; within a
+stage, the 16 GPUs handle both `ep=4` expert routing and `ringattn=4` sequence shards.
+EP operates on the MoE expert layers while CP operates on the attention layers within
+the same forward pass. They do not interfere because their collectives act on
+different tensors at different points in the model.
+
+For the pure Ulysses + EP configuration (`qwen3_30b_a3b_cp1_sp8.yaml`):
+
+```yaml
+ulysses_parallel_size: 8
+expert_parallel_size:  8
+```
+
+On 8 GPUs, every GPU is in both the Ulysses group (for attention) and the EP group
+(for MoE layers). This is the most memory-efficient configuration for MoE models with
+many KV heads.
+
+---
+
+## TextSequenceShardCollator
+
+`TextSequenceShardCollator` in `src/xorl/data/collators/sequence_shard_collator.py`
+is the entry point for preparing batches for CP training. It is activated whenever
+`cp_size > 1`.
+
+### Processing Pipeline
+
+For each batch, the collator performs the following steps in order:
+
+1. **Normalize inputs** to 2D tensors `[1, S]` (handle list inputs, ensure `ndim==2`).
+
+2. **Store original position IDs** before any modification:
+   ```python
+   batch["_original_position_ids"] = position_ids.clone()
+   ```
+
+3. **Compute padding amount:**
+   - `pad_multiple = 2 * cp_size` if ring attention is active, else `cp_size`
+   - `pad_length = ceil(S / pad_multiple) * pad_multiple - S`
+
+4. **Pad tensors:**
+   - `input_ids`: padded with `pad_token_id`
+   - `labels`: padded with `IGNORE_INDEX` (-100)
+   - `attention_mask`: padded with 1
+   - `position_ids`: padded with chunked sequential arange (1024-token chunks per
+     fake document, to avoid creating one enormous padding document in cu_seqlens)
+
+5. **Zigzag reorder** (only when `ringattn_size > 1`):
+   - Reorder `input_ids`, `labels`, `attention_mask`, `position_ids`, and any RL
+     fields (`target_tokens`, `logprobs`, `advantages`, `rollout_logprobs`) using
+     `zigzag_reorder_packed_sequence` with the **pre-pad** position IDs for boundary
+     detection.
+
+6. **Slice per rank** (`sp_slice`):
+   - `input_ids` and `labels` are sliced: rank `r` gets tokens `[r*chunk, (r+1)*chunk)`
+   - `position_ids` is **NOT** sliced — the full padded tensor is forwarded
+
+7. **Compute cu_seqlens:**
+   - Ring attention: use `_original_position_ids` (pre-zigzag, pre-pad boundaries)
+     to produce cu_seqlens reflecting true document structure
+   - Ulysses only: use standard `add_flash_attention_kwargs_from_position_ids`
+
+### Why position_ids Is Not Sliced
+
+The ring attention `_scale_cu_seqlens_for_ringattn` function divides cu_seqlens by
+`ringattn_size`, producing correct per-rank boundaries. The model's RoPE layer uses
+`position_ids` for indexing into `(cos, sin)` tables; the zigzag assignment already
+places the correct tokens at each rank, so the full `position_ids` tensor provides
+the right indices. Slicing `position_ids` would cause incorrect RoPE embedding
+positions for zigzag-reordered tokens.
+
+For Ulysses-only mode (no ring), `position_ids` is also kept full because the Ulysses
+all-to-all gathers the full sequence before attention, and the strategy's
+`prepare_position_embeddings` slices the RoPE `(cos, sin)` tensors at that point
+using `slice_position_embedding`.
+
+---
+
+## gather_outputs and Loss Computation
+
+After the model forward pass, the logits from each SP rank cover only its local
+sequence shard. Before computing the cross-entropy loss, the full sequence logits
+must be gathered.
+
+`gather_outputs` in `src/xorl/distributed/sequence_parallel/data.py` gathers along
+the sequence dimension across the unified SP group:
+
+```python
+def gather_outputs(x, gather_dim, padding_dim=None, unpad_dim_size=None,
+                   scale_grad=True, group=None):
+    group = get_unified_sequence_parallel_group() if group is None else group
+    x = _Gather.apply(group, x, gather_dim, scale_grad)
+    if padding_dim is not None:
+        x = unpadding_tensor_for_seqeunce_parallel(x, padding_dim, unpad_dim_size, group)
+    return x
+```
+
+The `_Gather` autograd function uses `all_gather` in the forward pass and splits
+the gradient back to the local shard in the backward pass (optionally scaling by
+`seq_world_size` for gradient normalization).
+
+The loss is then reduced across the full `dp_sp` group (DP ranks × SP ranks), since
+all of these ranks compute partial losses on different shards of the training batch.
+
+---
+
+## Configuration Reference
+
+### Parameter Table
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `ulysses_parallel_size` | int | 1 | Ulysses SP group size. Constraint: `num_heads % ulysses_size == 0` |
+| `ringattn_parallel_size` | int | 1 | Ring attention group size. Constraint: doc lengths divisible by `2 * ringattn_size` |
+| `cp_fsdp_mode` | str | `"all"` | SP-FSDP overlap mode: `"all"`, `"ulysses_only"`, `"ring_only"`, `"none"` |
+
+The total CP size and data parallel size are derived automatically:
+```python
+cp_size = ulysses_size × ringattn_size
+dp_size = world_size / (pp_size × cp_size × tp_size)
+```
+
+### Example Configurations
+
+**Pure Ulysses SP (Qwen3-8B, 8 GPUs, 64K context):**
+```yaml
+# examples/local/dummy/configs/full/qwen3_8b_cp1_sp8.yaml
+train:
+  ulysses_parallel_size: 8
+  ringattn_parallel_size: 1
+  data_parallel_replicate_size: 1
+  data_parallel_shard_size: 1
+  sample_packing_sequence_len: 64000
+```
+All 8 GPUs form one Ulysses group. No DP. Each attention layer does two all-to-all
+collectives per layer. Requires `64 heads % 8 == 0` (Qwen3-8B has 64 Q heads, 8 KV
+heads; async strategy is used since `8 <= 8`).
+
+**Pure Ring Attention (Qwen3-8B, 8 GPUs, 64K context):**
+```yaml
+# examples/local/dummy/configs/full/qwen3_8b_cp8_sp1.yaml
+train:
+  ulysses_parallel_size: 1
+  ringattn_parallel_size: 8
+  data_parallel_replicate_size: 1
+  data_parallel_shard_size: 1
+  sample_packing_sequence_len: 64000
+```
+All 8 GPUs form one ring. Each ring step sends `S/8 × H_kv × D × 2` bytes (K+V).
+Documents must be divisible by `2*8=16` sub-chunks. No head divisibility constraint.
+
+**Hybrid CP (Qwen3-8B, 8 GPUs: ring=2, ulysses=4):**
+```yaml
+# examples/local/dummy/configs/full/qwen3_8b_cp2_sp4.yaml
+train:
+  ulysses_parallel_size: 4
+  ringattn_parallel_size: 2
+  data_parallel_replicate_size: 1
+  data_parallel_shard_size: 1
+  sample_packing_sequence_len: 64000
+```
+cp_size = 8. Each of the 8 GPUs is in one 4-rank Ulysses group and one 2-rank ring
+group. Padding is to multiples of `2*8=16`. Documents must be divisible by `2*2=4`.
+After Ulysses a2a each rank holds `S/2` tokens and `H/4` heads; ring then provides
+full attention coverage.
+
+**Pure Ulysses, 128K context (Qwen3-8B, 4 GPUs):**
+```yaml
+# examples/local/dummy/configs/full/qwen3_8b_sp4_full_128k.yaml
+train:
+  ulysses_parallel_size: 4
+  sample_packing_sequence_len: 128000
+```
+4 GPUs, no ring. 128K tokens per sample. Each GPU processes 32K tokens locally;
+Ulysses a2a provides full attention at 128K length.
+
+**MoE + Ulysses + EP (Qwen3-30B-A3B, 8 GPUs: sp=8, ep=8):**
+```yaml
+# examples/local/dummy/configs/full/qwen3_30b_a3b_cp1_sp8.yaml
+train:
+  ulysses_parallel_size: 8
+  ringattn_parallel_size: 1
+  expert_parallel_size: 8
+  sample_packing_sequence_len: 128000
+```
+All 8 GPUs serve double duty: Ulysses group for attention layers, EP group for MoE
+routing. Requires `num_attention_heads % 8 == 0` (Qwen3-30B-A3B has 16 Q heads, 8 KV
+heads; `8 <= 8` so async strategy applies).
+
+**PP + Ring + EP (Qwen3-30B-A3B, 32 GPUs: pp=2, ring=4, ep=4):**
+```yaml
+# examples/local/dummy/configs/full/qwen3_30b_a3b_pp2_ep4_cp4_muon.yaml
+train:
+  pipeline_parallel_size: 2
+  ringattn_parallel_size: 4
+  expert_parallel_size: 4
+  sample_packing_sequence_len: 96000
+```
+32 GPUs total. Each PP stage has 16 GPUs forming a 4-rank ring attention group and
+4-rank EP group. Documents must be divisible by `2*4=8` for zigzag. PP buffers are
+padded to `96000 / 4 = 24000` tokens per rank.
+
+---
+
+## Common Pitfalls and Debugging
+
+**"Document length not divisible by 2*ringattn_size"**
+The zigzag reorder requires each packed document's length to be divisible by
+`2 * ringattn_size`. This is enforced in `zigzag_reorder_packed_sequence`. Check
+that:
+1. Individual source documents, after tokenization and packing, have lengths that
+   align to `2 * ringattn_size`.
+2. SP padding is applied before zigzag reorder (the collator handles this correctly).
+3. If using custom collators or data pipelines, ensure documents are pre-aligned.
+
+**NaN in flash attention backward with ring attention**
+Usually caused by incorrect `cu_seqlens`. Verify that `_original_position_ids` is
+present in the batch and that `cu_seq_lens_q`/`cu_seq_lens_k` are computed from it
+(not from the zigzag-reordered `position_ids`).
+
+**FSDP size mismatch / gradient scale errors**
+Ensure `cp_fsdp_mode` matches the intended FSDP mesh. If ring ranks are not in the
+FSDP mesh (`cp_fsdp_mode="ulysses_only"` or `"none"`), `sync_sp_gradients` must be
+called explicitly after backward and before the optimizer step.
+
+**head count assertion failures**
+Ulysses requires `num_heads % ulysses_size == 0`. For GQA models, the sync strategy
+additionally requires `ulysses_size % num_kv_heads == 0` when
+`ulysses_size > num_kv_heads` (for KV head expansion). Check model architecture
+docs for head counts before setting `ulysses_parallel_size`.
+
+**PP + CP sequence length alignment**
+With PP enabled, all microbatches in a gradient accumulation step are padded to
+`sample_packing_sequence_len / cp_size` (per-rank). This target length is rounded
+up to align with `pad_to_multiple_of` (which is set to `2 * cp_size` when ring is
+active). Ensure `sample_packing_sequence_len` is divisible by `2 * cp_size` for
+deterministic PP buffer shapes.
+
+## Source
+
+| File | Description |
+|---|---|
+| [`src/xorl/distributed/sequence_parallel/`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/distributed/sequence_parallel/) | Ulysses all-to-all strategy, ring attention P2P, collator, zigzag reorder |

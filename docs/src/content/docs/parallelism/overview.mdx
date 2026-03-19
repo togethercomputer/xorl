@@ -1,0 +1,128 @@
+---
+title: "Parallelism Overview"
+---
+
+xorl supports five orthogonal parallelism dimensions that can be freely composed. Each has its own dedicated guide:
+
+| Dimension | Doc | Config field | When to use |
+|---|---|---|---|
+| Data (FSDP2) | [Data Parallelism](/parallelism/data_parallelism/) | `data_parallel_mode`, `data_parallel_shard_size` | Always; primary memory reduction tool |
+| Tensor | [Tensor Parallelism](/parallelism/tensor_parallelism/) | `tensor_parallel_size` | When FSDP2 alone can't fit the model |
+| Pipeline | [Pipeline Parallelism](/parallelism/pipeline_parallelism/) | `pipeline_parallel_size` | Very large models across nodes |
+| Expert | [Expert Parallelism](/parallelism/expert_parallelism/) | `expert_parallel_size` | MoE models |
+| Sequence | [Context Parallelism](/parallelism/context_parallelism/) | `ulysses_parallel_size`, `ringattn_parallel_size` | Long sequences (>32K) |
+
+## When to Use Each Dimension
+
+| Your situation | What to enable | Why |
+|---|---|---|
+| Model fits on 8 GPUs with FSDP2 | Nothing extra — FSDP2 alone | Simplest setup, lowest overhead |
+| Model too large for FSDP2 alone | Add **TP** (tensor parallelism) | Shards weight matrices within a node |
+| Sequences > 32K tokens | Add **CP** (Ulysses or Ring Attention) | Splits long sequences across GPUs |
+| MoE model | Add **EP** (expert parallelism) | Distributes experts across GPUs |
+| Model spans multiple nodes | Add **PP** (pipeline parallelism) | Splits layers across nodes, minimizes cross-node traffic |
+
+FSDP2 alone covers the majority of use cases. Add other dimensions only when needed.
+
+## How the dimensions compose
+
+Each dimension slices the GPU grid along a different axis. All five can be active simultaneously — xorl builds a multi-dimensional `DeviceMesh` that assigns every GPU a unique coordinate across all active axes.
+
+<svg viewBox="0 0 700 326" xmlns="http://www.w3.org/2000/svg" style="max-width:700px;width:100%;margin:1.5rem 0">
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#2563eb"/>
+    </marker>
+  </defs>
+
+  <rect width="700" height="320" fill="#f8fafc" rx="8"/>
+
+
+  <text x="350" y="26" text-anchor="middle" font-size="13" font-weight="600" fill="#1e293b" font-family="sans-serif">5 Parallelism Dimensions — Composition View</text>
+
+
+  <rect x="30" y="50" width="640" height="110" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="42" y="68" font-size="11" font-weight="700" fill="#1e3a8a" font-family="sans-serif">PP — Pipeline Parallel (stages)</text>
+
+
+  <rect x="50" y="78" width="280" height="72" rx="5" fill="white" stroke="#93c5fd" stroke-width="1.5"/>
+  <text x="190" y="95" text-anchor="middle" font-size="11" fill="#64748b" font-family="sans-serif">Stage 0  (layers 0–L/2)</text>
+
+
+  <rect x="370" y="78" width="280" height="72" rx="5" fill="white" stroke="#93c5fd" stroke-width="1.5"/>
+  <text x="510" y="95" text-anchor="middle" font-size="11" fill="#64748b" font-family="sans-serif">Stage 1  (layers L/2–L)</text>
+
+
+  <rect x="60" y="100" width="120" height="40" rx="4" fill="#eff6ff" stroke="#93c5fd" stroke-width="1"/>
+  <text x="120" y="115" text-anchor="middle" font-size="10" fill="#1e3a8a" font-family="sans-serif">DP replica 0</text>
+  <text x="120" y="128" text-anchor="middle" font-size="9" fill="#64748b" font-family="sans-serif">FSDP shard ×N</text>
+
+  <rect x="200" y="100" width="120" height="40" rx="4" fill="#eff6ff" stroke="#93c5fd" stroke-width="1"/>
+  <text x="260" y="115" text-anchor="middle" font-size="10" fill="#1e3a8a" font-family="sans-serif">DP replica 1</text>
+  <text x="260" y="128" text-anchor="middle" font-size="9" fill="#64748b" font-family="sans-serif">FSDP shard ×N</text>
+
+  <rect x="380" y="100" width="120" height="40" rx="4" fill="#eff6ff" stroke="#93c5fd" stroke-width="1"/>
+  <text x="440" y="115" text-anchor="middle" font-size="10" fill="#1e3a8a" font-family="sans-serif">DP replica 0</text>
+  <text x="440" y="128" text-anchor="middle" font-size="9" fill="#64748b" font-family="sans-serif">FSDP shard ×N</text>
+
+  <rect x="520" y="100" width="120" height="40" rx="4" fill="#eff6ff" stroke="#93c5fd" stroke-width="1"/>
+  <text x="580" y="115" text-anchor="middle" font-size="10" fill="#1e3a8a" font-family="sans-serif">DP replica 1</text>
+  <text x="580" y="128" text-anchor="middle" font-size="9" fill="#64748b" font-family="sans-serif">FSDP shard ×N</text>
+
+
+  <line x1="340" y1="118" x2="368" y2="118" stroke="#2563eb" stroke-width="2" marker-end="url(#arr)"/>
+
+
+  <rect x="30" y="178" width="204" height="54" rx="6" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
+  <text x="132" y="196" text-anchor="middle" font-size="11" font-weight="700" fill="#92400e" font-family="sans-serif">TP — Tensor Parallel</text>
+  <text x="132" y="213" text-anchor="middle" font-size="10" fill="#92400e" font-family="sans-serif">Shards weight matrices within a GPU group</text>
+  <text x="132" y="226" text-anchor="middle" font-size="9" fill="#b45309" font-family="sans-serif">tensor_parallel_size=N</text>
+
+  <rect x="248" y="178" width="204" height="54" rx="6" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="350" y="196" text-anchor="middle" font-size="11" font-weight="700" fill="#166534" font-family="sans-serif">CP — Context Parallel</text>
+  <text x="350" y="213" text-anchor="middle" font-size="10" fill="#166534" font-family="sans-serif">Splits sequence across GPUs (Ulysses/Ring)</text>
+  <text x="350" y="226" text-anchor="middle" font-size="9" fill="#15803d" font-family="sans-serif">ulysses / ringattn parallel size</text>
+
+  <rect x="466" y="178" width="204" height="54" rx="6" fill="#fdf4ff" stroke="#9333ea" stroke-width="1.5"/>
+  <text x="568" y="196" text-anchor="middle" font-size="11" font-weight="700" fill="#6b21a8" font-family="sans-serif">EP — Expert Parallel</text>
+  <text x="568" y="213" text-anchor="middle" font-size="10" fill="#6b21a8" font-family="sans-serif">Shards MoE experts across GPUs</text>
+  <text x="568" y="226" text-anchor="middle" font-size="9" fill="#7e22ce" font-family="sans-serif">expert_parallel_size=N</text>
+
+
+  <rect x="30" y="250" width="640" height="66" rx="6" fill="white" stroke="#e2e8f0" stroke-width="1.5"/>
+  <text x="350" y="270" text-anchor="middle" font-size="11" font-weight="600" fill="#1e293b" font-family="sans-serif">EP uses a separate device mesh; CP folds into the main mesh</text>
+  <text x="350" y="288" text-anchor="middle" font-size="10" fill="#64748b" font-family="sans-serif">e.g. Qwen3-30B-A3B: PP=2, EP=4, CP=4. EP ranks overlap with CP ranks within each PP stage.</text>
+  <text x="350" y="302" text-anchor="middle" font-size="9" fill="#64748b" font-family="sans-serif">world_size = PP × DP_shard × DP_replicate × TP</text>
+  <text x="350" y="314" text-anchor="middle" font-size="9" fill="#64748b" font-family="sans-serif">× CP_ring × CP_ulysses</text>
+</svg>
+
+## World Size Constraint
+
+```
+world_size = DP_shard × DP_replicate × TP × PP × CP_ring × CP_ulysses
+```
+
+EP is **not** part of the main device mesh — it uses a separate per-PP-stage mesh for expert dispatch. CP dimensions (Ring and Ulysses) are folded into the main mesh. In practice, EP ranks overlap with CP ranks within each PP stage (e.g. Qwen3-30B-A3B uses PP=2 with EP=4 and CP=4 sharing the same GPUs).
+
+## Quick Reference by Model Size
+
+| Model | GPUs | Configuration |
+|---|---|---|
+| 8B dense | 8 | FSDP2 only |
+| 8B dense, 128K context | 8 | FSDP2 + Ring=4 |
+| 30B dense | 16 | FSDP2 + PP=2 |
+| 30B MoE | 8 | PP=2, EP=4 folded CP=4 |
+| 70B dense | 32 | PP=4, FSDP2 HSDP |
+| 235B MoE | 64 | EP=64, Ulysses=64 |
+
+## Key Constraints
+
+- **PP**: `gradient_accumulation_steps >= pipeline_parallel_size`
+- **EP**: `num_experts % expert_parallel_size == 0`
+- **Ulysses**: `num_attention_heads % ulysses_parallel_size == 0`
+- **Ring Attention**: each packed document length divisible by `2 × ringattn_parallel_size`
+- **TP**: `num_attention_heads % tensor_parallel_size == 0`; requires `merge_qkv: false`
+
+## Source
+
+[`src/xorl/distributed/parallel_state.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/distributed/parallel_state.py) — `ParallelState` dataclass and `init_parallel_state()` which builds the multi-dimensional `DeviceMesh` from config.

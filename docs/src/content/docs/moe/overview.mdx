@@ -1,0 +1,169 @@
+---
+title: "MoE Training"
+---
+
+xorl supports Mixture-of-Experts (MoE) models (Qwen3-MoE, DeepSeek-V3, etc.). This section covers the full MoE training stack.
+
+---
+
+## Architecture Overview
+
+Each MoE layer replaces a dense FFN with a gating network that routes each token to `top_k` out of `num_experts` expert FFNs, then combines their outputs by the gate scores.
+
+<svg viewBox="0 0 700 230" style="max-width:700px;width:100%;margin:1.5rem 0" font-family="sans-serif">
+  <defs>
+    <marker id="moe-ov-arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#2563eb"/>
+    </marker>
+    <marker id="moe-ov-gray" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+  <rect width="700" height="230" fill="#f8fafc" rx="8"/>
+  <text x="350" y="20" text-anchor="middle" font-size="12" font-weight="700" fill="#1e293b">MoE Layer: Token Routing and Expert Dispatch</text>
+
+  <rect x="14" y="88" width="70" height="44" rx="5" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="49" y="107" text-anchor="middle" font-size="11" fill="#1e293b" font-weight="600">Hidden</text>
+  <text x="49" y="122" text-anchor="middle" font-size="10" fill="#64748b">[T, H]</text>
+
+  <line x1="84" y1="110" x2="124" y2="110" stroke="#2563eb" stroke-width="1.5" marker-end="url(#moe-ov-arr)"/>
+
+  <rect x="128" y="72" width="100" height="76" rx="6" fill="#1e3a8a" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="178" y="96" text-anchor="middle" font-size="11" fill="#fff" font-weight="700">Gate + Router</text>
+  <text x="178" y="111" text-anchor="middle" font-size="10" fill="#dbeafe">gate: [H→E]</text>
+  <text x="178" y="125" text-anchor="middle" font-size="10" fill="#dbeafe">softmax → top-K</text>
+  <text x="178" y="139" text-anchor="middle" font-size="9" fill="#93c5fd">norm_topk_prob opt.</text>
+
+  <line x1="228" y1="90" x2="268" y2="60" stroke="#2563eb" stroke-width="1.5" marker-end="url(#moe-ov-arr)"/>
+  <line x1="228" y1="110" x2="268" y2="110" stroke="#2563eb" stroke-width="1.5" marker-end="url(#moe-ov-arr)"/>
+  <line x1="228" y1="130" x2="268" y2="160" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#moe-ov-gray)"/>
+
+  <text x="248" y="80" text-anchor="middle" font-size="9" fill="#2563eb">top-K</text>
+  <text x="248" y="144" text-anchor="middle" font-size="9" fill="#94a3b8">not selected</text>
+
+  <rect x="272" y="36" width="100" height="44" rx="5" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="322" y="55" text-anchor="middle" font-size="11" fill="#1e293b" font-weight="600">Expert 0</text>
+  <text x="322" y="70" text-anchor="middle" font-size="9" fill="#64748b">SwiGLU FFN</text>
+
+  <rect x="272" y="88" width="100" height="44" rx="5" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="322" y="107" text-anchor="middle" font-size="11" fill="#1e293b" font-weight="600">Expert 1</text>
+  <text x="322" y="122" text-anchor="middle" font-size="9" fill="#64748b">SwiGLU FFN</text>
+
+  <rect x="272" y="140" width="100" height="44" rx="5" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="322" y="159" text-anchor="middle" font-size="11" fill="#94a3b8">Expert k</text>
+  <text x="322" y="174" text-anchor="middle" font-size="9" fill="#c0ccd8">not activated</text>
+
+  <text x="322" y="200" text-anchor="middle" font-size="13" fill="#94a3b8">… E experts total</text>
+
+  <line x1="372" y1="58" x2="422" y2="95" stroke="#2563eb" stroke-width="1.5" marker-end="url(#moe-ov-arr)"/>
+  <line x1="372" y1="110" x2="422" y2="110" stroke="#2563eb" stroke-width="1.5" marker-end="url(#moe-ov-arr)"/>
+
+  <rect x="426" y="78" width="120" height="64" rx="6" fill="#1e3a8a" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="486" y="100" text-anchor="middle" font-size="11" fill="#fff" font-weight="700">Weighted Sum</text>
+  <text x="486" y="115" text-anchor="middle" font-size="10" fill="#dbeafe">Σ gate[k] × out[k]</text>
+  <text x="486" y="130" text-anchor="middle" font-size="9" fill="#93c5fd">combine (AllToAll/NVLink)</text>
+
+  <line x1="546" y1="110" x2="586" y2="110" stroke="#2563eb" stroke-width="1.5" marker-end="url(#moe-ov-arr)"/>
+
+  <rect x="590" y="88" width="96" height="44" rx="5" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="638" y="107" text-anchor="middle" font-size="11" fill="#1e293b" font-weight="600">Output</text>
+  <text x="638" y="122" text-anchor="middle" font-size="10" fill="#64748b">[T, H]</text>
+
+  <text x="322" y="218" text-anchor="middle" font-size="9" fill="#64748b">With EP: each GPU holds E/ep_size experts; tokens dispatched via AllToAll or DeepEP</text>
+</svg>
+
+---
+
+## Weight Layout: GKN Format
+
+xorl stores all expert weights as a **single fused tensor** in **GKN layout**: `[G, K, N]` where:
+
+| Dimension | Meaning | Size |
+|---|---|---|
+| **G** (Group) | Expert index — EP slices this dimension | `num_experts` (or `num_experts / ep_size` after sharding) |
+| **K** (Key) | Input dimension of the projection | `hidden_size` for gate/up; `intermediate_size` for down |
+| **N** (Normal) | Output dimension of the projection | `intermediate_size` for gate/up; `hidden_size` for down |
+
+So the three expert weight tensors are:
+
+```
+gate_proj  [E, H, I]   — gate path: hidden → intermediate
+up_proj    [E, H, I]   — up path: hidden → intermediate
+down_proj  [E, I, H]   — down path: intermediate → hidden
+```
+
+**Benefits of GKN:**
+- **Triton/Quack group GEMM kernels consume GKN natively** — the outer `G` loop maps to the expert axis; `K×N` tiles stay contiguous in memory for each expert, enabling DRAM-optimal access patterns
+- **EP shards along dim 0 (G)** — gives each rank a contiguous `[E/ep_size, K, N]` block with no tensor reordering
+- **FSDP2 further shards dim 1 (K)** within the EP group — giving `[E/ep_size, K/fsdp_size, N]` at rest
+- **Quantization applies to the fused block** — NF4/NVFP4/Block-FP8 quantize the full `[E, K, N]` tensor preserving cross-expert scale statistics
+- **LoRA adapters follow the same layout** — `lora_A [E, r, K]`, `lora_B [E, N, r]` shard identically to base weights
+
+---
+
+## Checkpoint Conversion
+
+HF MoE checkpoints store experts as `nn.ModuleList` of `nn.Linear` layers. xorl automatically converts to fused GKN format during model loading — no separate preprocessing step is needed. Simply point `model_path` at the standard HuggingFace checkpoint.
+
+---
+
+## In This Section
+
+| Page | What it covers |
+|---|---|
+| [Router](/moe/router/) | TopKRouter algorithm, norm_topk_prob, router_fp32, freeze_router, Routing Replay (R3) |
+| [Expert Kernels](/moe/kernels/) | Backend comparison table, Triton GEMM details, torch.compile guidance, moe_act checkpointing |
+| [Expert Parallelism](/moe/expert-parallelism/) | EP mesh, AllToAll dispatch, EP+FSDP2, EP+Ring Attention, example configs |
+| [LoRA & QLoRA](/moe/lora/) | MoEExpertsLoRA, adapter shapes, hybrid shared LoRA, QLoRA on experts |
+| [DeepEP](/moe/deepep/) | NVLink-optimized dispatch with DeepEP |
+
+---
+
+## Example: Qwen3-30B-A3B (PP=2, EP=4, CP=4, 8 GPUs)
+
+```yaml
+model:
+  model_path: /path/to/Qwen3-30B-A3B-merge
+  attn_implementation: flash_attention_3
+  moe_implementation: triton
+  merge_qkv: true
+  router_fp32: true
+
+train:
+  data_parallel_mode: fsdp2
+  data_parallel_shard_size: 1
+  pipeline_parallel_size: 2
+  pipeline_parallel_schedule: 1F1B
+  expert_parallel_size: 4
+  ringattn_parallel_size: 4
+  enable_gradient_checkpointing: true
+  moe_checkpoint_method: moe_act
+  optimizer: muon
+  muon_lr: 2e-4
+  lr: 1e-4
+  gradient_accumulation_steps: 2
+  enable_mixed_precision: true
+  reshard_after_forward: true
+  init_device: meta
+```
+
+## Example: Qwen3-235B-A22B (EP=64, 8 nodes)
+
+```yaml
+model:
+  model_path: Qwen/Qwen3-235B-A22B-Instruct-FP8
+  attn_implementation: flash_attention_3
+  moe_implementation: triton
+  ep_dispatch: deepep
+  router_fp32: true
+
+train:
+  expert_parallel_size: 64
+  ulysses_parallel_size: 64
+  data_parallel_shard_size: 1
+  enable_gradient_checkpointing: true
+  moe_checkpoint_method: moe_act
+  enable_activation_offload: true
+  init_device: meta
+  load_weights_mode: all_ranks
+```

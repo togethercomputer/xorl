@@ -1,0 +1,165 @@
+---
+title: "Expert Parallelism"
+---
+
+Expert Parallelism (EP) shards expert weights across `expert_parallel_size` GPUs. Each GPU holds `num_experts / ep_size` experts — a contiguous slice of the G dimension in [GKN layout](/moe/overview/#weight-layout-gkn-format). Non-expert parameters (attention, norms, gate linear) are replicated across the EP group.
+
+```yaml
+train:
+  expert_parallel_size: 8
+model:
+  ep_dispatch: alltoall   # or deepep
+```
+
+For the full technical reference — dispatch internals, device mesh construction, gradient handling, R3 routing replay, EP composition with FSDP2/PP/CP, and constraint table — see **[Expert Parallelism (Parallelism section)](/parallelism/expert_parallelism/)**.
+
+---
+
+## EP Forward Flow
+
+<svg viewBox="0 0 700 200" style="max-width:700px;width:100%;margin:1.5rem 0" font-family="sans-serif">
+  <defs>
+    <marker id="moe-ep-arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#2563eb"/>
+    </marker>
+  </defs>
+  <rect width="700" height="200" fill="#f8fafc" rx="8"/>
+  <text x="350" y="20" text-anchor="middle" font-size="12" font-weight="700" fill="#1e293b">EP Forward: Dispatch → Compute → Combine</text>
+
+  <rect x="10" y="80" width="90" height="50" rx="5" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="55" y="101" text-anchor="middle" font-size="11" fill="#1e293b" font-weight="600">All Tokens</text>
+  <text x="55" y="116" text-anchor="middle" font-size="9" fill="#64748b">each GPU has</text>
+  <text x="55" y="128" text-anchor="middle" font-size="9" fill="#64748b">full sequence</text>
+
+  <line x1="100" y1="105" x2="140" y2="105" stroke="#2563eb" stroke-width="1.5" marker-end="url(#moe-ep-arr)"/>
+
+  <rect x="144" y="65" width="130" height="80" rx="5" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
+  <text x="209" y="87" text-anchor="middle" font-size="11" fill="#92400e" font-weight="700">Dispatch</text>
+  <text x="209" y="103" text-anchor="middle" font-size="10" fill="#92400e">AllToAll (NCCL)</text>
+  <text x="209" y="117" text-anchor="middle" font-size="9" fill="#92400e">or DeepEP (NVLink)</text>
+  <text x="209" y="133" text-anchor="middle" font-size="9" fill="#64748b">route tokens to</text>
+  <text x="209" y="145" text-anchor="middle" font-size="9" fill="#64748b">expert-owning ranks</text>
+
+  <line x1="274" y1="105" x2="314" y2="105" stroke="#2563eb" stroke-width="1.5" marker-end="url(#moe-ep-arr)"/>
+
+  <rect x="318" y="65" width="130" height="80" rx="5" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="383" y="87" text-anchor="middle" font-size="11" fill="#1e3a8a" font-weight="700">Expert Compute</text>
+  <text x="383" y="103" text-anchor="middle" font-size="10" fill="#1e3a8a">local experts only</text>
+  <text x="383" y="117" text-anchor="middle" font-size="9" fill="#64748b">group GEMM on</text>
+  <text x="383" y="131" text-anchor="middle" font-size="9" fill="#64748b">[E/ep_size, K, N]</text>
+  <text x="383" y="145" text-anchor="middle" font-size="9" fill="#64748b">Triton / native / quack</text>
+
+  <line x1="448" y1="105" x2="488" y2="105" stroke="#2563eb" stroke-width="1.5" marker-end="url(#moe-ep-arr)"/>
+
+  <rect x="492" y="65" width="130" height="80" rx="5" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
+  <text x="557" y="87" text-anchor="middle" font-size="11" fill="#92400e" font-weight="700">Combine</text>
+  <text x="557" y="103" text-anchor="middle" font-size="10" fill="#92400e">AllToAll (NCCL)</text>
+  <text x="557" y="117" text-anchor="middle" font-size="9" fill="#92400e">or DeepEP async</text>
+  <text x="557" y="133" text-anchor="middle" font-size="9" fill="#64748b">weighted sum, return</text>
+  <text x="557" y="145" text-anchor="middle" font-size="9" fill="#64748b">to originating ranks</text>
+
+  <line x1="622" y1="105" x2="662" y2="105" stroke="#2563eb" stroke-width="1.5" marker-end="url(#moe-ep-arr)"/>
+
+  <rect x="666" y="80" width="26" height="50" rx="5" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="679" y="101" text-anchor="middle" font-size="9" fill="#1e293b" font-weight="600">Out</text>
+  <text x="679" y="116" text-anchor="middle" font-size="9" fill="#64748b">[T, H]</text>
+
+  <text x="350" y="180" text-anchor="middle" font-size="9" fill="#64748b">Dispatch context saved for backward combine. R3 caches routing indices for gradient checkpointing recompute.</text>
+</svg>
+
+---
+
+## Dispatch Backends
+
+| Backend | Set via | Best for |
+|---|---|---|
+| `alltoall` | `ep_dispatch: alltoall` | Any GPU topology, no extra install |
+| `deepep` | `ep_dispatch: deepep` | NVLink clusters, EP ≥ 16 — see [DeepEP](/moe/deepep/) |
+
+---
+
+## EP + FSDP2 Mesh
+
+Expert parameters use a 2D mesh `[EP, FSDP]`; non-expert parameters use a 1D global FSDP mesh:
+
+```
+world_size=16, EP=8, ep_fsdp_size=2:
+  Experts:     [EP=8, ep_fsdp=2]  — expert dim sharded EP-wise, hidden dim sharded FSDP-wise
+  Non-experts: [FSDP=16]          — full FSDP sharding
+```
+
+Expert FSDP shards along **dim 1** (hidden dimension), orthogonal to EP's dim 0 (expert axis). EP modules use `set_gradient_divide_factor(ep_size)` so gradients are correctly averaged across EP ranks during backward.
+
+---
+
+## EP + Ring Attention (Folded Axes)
+
+EP and ring attention CP can share the same GPU axis, maximizing NVLink locality:
+
+```yaml
+train:
+  pipeline_parallel_size: 2
+  expert_parallel_size: 4
+  ringattn_parallel_size: 4
+```
+
+PP=2 × 4 GPUs/stage = 8 GPUs. Within each stage, 4 GPUs are simultaneously EP and ring attention ranks. `ep_fsdp_size = 4`, so expert FSDP all-gathers happen within the same ring-attention peers.
+
+---
+
+## Configuration Examples
+
+**Qwen3-30B-A3B (PP=2, EP=4, CP=4, 8 GPUs):**
+
+```yaml
+model:
+  model_path: /path/to/Qwen3-30B-A3B-merge
+  moe_implementation: triton
+  ep_dispatch: alltoall
+  router_fp32: true
+
+train:
+  pipeline_parallel_size: 2
+  expert_parallel_size: 4
+  ringattn_parallel_size: 4
+  enable_gradient_checkpointing: true
+  moe_checkpoint_method: moe_act
+```
+
+**Qwen3-235B-A22B (EP=64, 8 nodes, DeepEP):**
+
+```yaml
+model:
+  model_path: Qwen/Qwen3-235B-A22B-Instruct-FP8
+  moe_implementation: triton
+  ep_dispatch: deepep
+  router_fp32: true
+
+train:
+  expert_parallel_size: 64
+  ulysses_parallel_size: 64
+  enable_gradient_checkpointing: true
+  moe_checkpoint_method: moe_act
+  init_device: meta
+  load_weights_mode: all_ranks
+```
+
+---
+
+## Related Pages
+
+| Page | What it covers |
+|---|---|
+| [Expert Parallelism (full reference)](/parallelism/expert_parallelism/) | AllToAll internals, DeepEP buffer lifecycle, gradient divide factor, R3 mechanics, EP+PP/CP/FSDP composition, constraints, parameter reference |
+| [MoE: Expert Kernels](/moe/kernels/) | Triton/Quack/native/eager backend details, torch.compile, moe_act checkpointing |
+| [MoE: Router](/moe/router/) | Routing algorithm, R3 routing replay in detail |
+| [DeepEP](/moe/deepep/) | NVLink-optimized dispatch, SM tuning, buffer sizing |
+| [MoE: LoRA & QLoRA](/moe/lora/) | LoRA sharding on expert weights, hybrid shared LoRA |
+
+## Source
+
+| File | Description |
+|---|---|
+| [`src/xorl/models/layers/moe/experts.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/models/layers/moe/experts.py) | `MoEExperts` — EP forward, GKN weight sharding, dispatch/combine |
+| [`src/xorl/models/layers/moe/moe_block.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/models/layers/moe/moe_block.py) | `MoEBlock` — dispatch orchestration, R3 integration |
+| [`src/xorl/distributed/parallel_state.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/distributed/parallel_state.py) | EP process group and device mesh construction |
