@@ -1,0 +1,321 @@
+---
+title: "Server Architecture"
+---
+
+The xorl training server is built as a layered system of independent processes that communicate over ZMQ. This page covers how those layers fit together, what each component does, and the full API surface.
+
+---
+
+## System Overview
+
+The server is composed of three processes launched by a single `Launcher`:
+
+<svg viewBox="0 0 700 340" style="max-width:700px;width:100%;margin:1.5rem 0" font-family="sans-serif">
+  <defs>
+    <marker id="sa-arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#2563eb"/>
+    </marker>
+    <marker id="sa-arr-g" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#16a34a"/>
+    </marker>
+    <marker id="sa-arr-o" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#d97706"/>
+    </marker>
+  </defs>
+  <rect width="700" height="340" fill="#f8fafc" rx="8"/>
+  <text x="350" y="22" text-anchor="middle" font-size="13" font-weight="700" fill="#1e293b">xorl Server: Process Architecture</text>
+
+  <rect x="280" y="36" width="140" height="44" rx="5" fill="#e0e7ff" stroke="#6366f1" stroke-width="1.5"/>
+  <text x="350" y="55" text-anchor="middle" font-size="11" font-weight="700" fill="#3730a3">Launcher</text>
+  <text x="350" y="72" text-anchor="middle" font-size="9" fill="#4338ca">spawns 3 processes</text>
+
+  <line x1="350" y1="80" x2="130" y2="120" stroke="#6366f1" stroke-width="1.5" stroke-dasharray="4,2" marker-end="url(#sa-arr)"/>
+  <line x1="350" y1="80" x2="350" y2="120" stroke="#6366f1" stroke-width="1.5" stroke-dasharray="4,2" marker-end="url(#sa-arr)"/>
+  <line x1="350" y1="80" x2="570" y2="120" stroke="#6366f1" stroke-width="1.5" stroke-dasharray="4,2" marker-end="url(#sa-arr)"/>
+
+  <rect x="30" y="124" width="200" height="80" rx="6" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+  <text x="130" y="146" text-anchor="middle" font-size="12" font-weight="700" fill="#1e3a8a">API Server</text>
+  <text x="130" y="163" text-anchor="middle" font-size="10" fill="#2563eb">FastAPI  ·  HTTP :5555</text>
+  <text x="130" y="178" text-anchor="middle" font-size="9" fill="#64748b">ROUTER :6000 (send)</text>
+  <text x="130" y="191" text-anchor="middle" font-size="9" fill="#64748b">PULL :6001 (receive)</text>
+
+  <rect x="250" y="124" width="200" height="80" rx="6" fill="#fef3c7" stroke="#d97706" stroke-width="2"/>
+  <text x="350" y="146" text-anchor="middle" font-size="12" font-weight="700" fill="#92400e">Orchestrator</text>
+  <text x="350" y="163" text-anchor="middle" font-size="10" fill="#92400e">request queue + scheduler</text>
+  <text x="350" y="178" text-anchor="middle" font-size="9" fill="#64748b">DEALER :6000 (receive)</text>
+  <text x="350" y="191" text-anchor="middle" font-size="9" fill="#64748b">PUSH :6001 (send)</text>
+
+  <rect x="470" y="124" width="200" height="80" rx="6" fill="#f0fdf4" stroke="#16a34a" stroke-width="2"/>
+  <text x="570" y="146" text-anchor="middle" font-size="12" font-weight="700" fill="#166534">Workers (torchrun)</text>
+  <text x="570" y="163" text-anchor="middle" font-size="10" fill="#16a34a">rank 0..N  ·  GPU</text>
+  <text x="570" y="178" text-anchor="middle" font-size="9" fill="#64748b">PAIR rank0 :5556</text>
+  <text x="570" y="191" text-anchor="middle" font-size="9" fill="#64748b">NCCL broadcast/scatter</text>
+
+  <line x1="230" y1="164" x2="250" y2="164" stroke="#2563eb" stroke-width="1.5" marker-end="url(#sa-arr)"/>
+  <text x="240" y="157" text-anchor="middle" font-size="8" fill="#2563eb">ZMQ</text>
+  <line x1="450" y1="164" x2="470" y2="164" stroke="#d97706" stroke-width="1.5" marker-end="url(#sa-arr-o)"/>
+  <text x="460" y="157" text-anchor="middle" font-size="8" fill="#d97706">ZMQ</text>
+
+  <rect x="30" y="230" width="640" height="96" rx="6" fill="white" stroke="#e2e8f0" stroke-width="1.5"/>
+  <text x="350" y="250" text-anchor="middle" font-size="11" font-weight="700" fill="#1e293b">Abstraction Layers</text>
+
+  <rect x="46" y="258" width="116" height="54" rx="4" fill="#eff6ff" stroke="#93c5fd" stroke-width="1"/>
+  <text x="104" y="277" text-anchor="middle" font-size="10" font-weight="600" fill="#1e3a8a">HTTP API</text>
+  <text x="104" y="292" text-anchor="middle" font-size="8" fill="#64748b">Client-facing</text>
+  <text x="104" y="305" text-anchor="middle" font-size="8" fill="#64748b">xorl-client SDK</text>
+
+  <rect x="174" y="258" width="116" height="54" rx="4" fill="#eff6ff" stroke="#93c5fd" stroke-width="1"/>
+  <text x="232" y="277" text-anchor="middle" font-size="10" font-weight="600" fill="#1e3a8a">APIServer</text>
+  <text x="232" y="292" text-anchor="middle" font-size="8" fill="#64748b">Auth, routing</text>
+  <text x="232" y="305" text-anchor="middle" font-size="8" fill="#64748b">async futures</text>
+
+  <rect x="302" y="258" width="116" height="54" rx="4" fill="#fef3c7" stroke="#fbbf24" stroke-width="1"/>
+  <text x="360" y="277" text-anchor="middle" font-size="10" font-weight="600" fill="#92400e">Orchestrator</text>
+  <text x="360" y="292" text-anchor="middle" font-size="8" fill="#64748b">Scheduling</text>
+  <text x="360" y="305" text-anchor="middle" font-size="8" fill="#64748b">packing, dispatch</text>
+
+  <rect x="430" y="258" width="116" height="54" rx="4" fill="#f0fdf4" stroke="#86efac" stroke-width="1"/>
+  <text x="488" y="277" text-anchor="middle" font-size="10" font-weight="600" fill="#166534">RunnerDispatcher</text>
+  <text x="488" y="292" text-anchor="middle" font-size="8" fill="#64748b">Rank 0 proxy</text>
+  <text x="488" y="305" text-anchor="middle" font-size="8" fill="#64748b">broadcast/scatter</text>
+
+  <rect x="558" y="258" width="96" height="54" rx="4" fill="#f0fdf4" stroke="#86efac" stroke-width="1"/>
+  <text x="606" y="277" text-anchor="middle" font-size="10" font-weight="600" fill="#166534">ModelRunner</text>
+  <text x="606" y="292" text-anchor="middle" font-size="8" fill="#64748b">fwd/bwd/optim</text>
+  <text x="606" y="305" text-anchor="middle" font-size="8" fill="#64748b">FSDP  ·  EP  ·  PP</text>
+</svg>
+
+---
+
+## Component Deep Dive
+
+### Launcher
+
+[`src/xorl/server/launcher.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/launcher.py)
+
+The `Launcher` is the single entrypoint. It orchestrates startup and shutdown of all sub-processes.
+
+**Two modes:**
+
+| Mode | What it does |
+|---|---|
+| `auto` | Spawns GPU workers via `torchrun`, then starts Orchestrator and API Server as subprocesses |
+| `connect` | Attaches to already-running workers (multi-node: head node connects to workers started manually) |
+
+**Startup sequence:**
+
+```
+1. _launch_workers_with_torchrun()    → torchrun subprocess (all GPU ranks)
+2. _get_rank0_worker_address()        → discover rank 0 ZMQ address (file-based for multi-node)
+3. multiprocessing.Process(run_orchestrator)  → Orchestrator
+4. _save_initial_checkpoint()         → checkpoint "000000" before any training
+5. multiprocessing.Process(run_api_server)    → API Server
+6. wait()                              → poll processes until one dies → stop()
+```
+
+**Key config:**
+
+```python
+Launcher(
+    mode="auto",
+    config_path="server_config.yaml",
+    api_host="0.0.0.0",
+    api_port=5555,
+    max_running_requests=2,      # concurrent in-flight requests
+    max_pending_requests=100,    # request queue depth
+    operation_timeout=1800.0,    # seconds per operation
+)
+```
+
+---
+
+### API Server
+
+[`src/xorl/server/api_server/server.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/api_server/server.py)
+
+`APIServer` is a FastAPI application composed via mixins:
+
+```
+APIServer
+  ├── TrainingOpsMixin    forward_backward, forward, optim_step
+  ├── WeightsMixin        save/load checkpoints, list, delete, weights_info
+  ├── InferenceEndpointsMixin  add/remove/list inference endpoints, sync weights
+  └── HealthMixin         /health, /healthz, sleep, wake
+```
+
+**Two-phase async pattern:**
+
+Every training operation uses a non-blocking two-phase protocol to avoid HTTP timeout issues on long operations:
+
+```
+Phase 1: POST /api/v1/forward_backward
+  → APIServer sends OrchestratorRequest via ZMQ ROUTER
+  → Returns UntypedAPIFuture { request_id: "uuid-..." } immediately
+
+Phase 2: POST /api/v1/retrieve_future { request_id: "uuid-..." }
+  → Returns TryAgainResponse if still running
+  → Returns result dict when complete
+  → Returns error if failed
+```
+
+The `xorl_client` SDK handles polling automatically — callers just call `.result()` on the returned future object.
+
+**ZMQ topology:**
+
+```
+API Server                    Orchestrator
+  ROUTER bind :6000   ──────►  DEALER connect :6000   (API → Engine)
+  PULL   bind :6001   ◄──────  PUSH   connect :6001   (Engine → API)
+```
+
+Messages are serialized with **msgpack** for efficiency.
+
+---
+
+### Orchestrator
+
+[`src/xorl/server/orchestrator/orchestrator.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/orchestrator/orchestrator.py)
+
+The Orchestrator runs in its own process as an event loop. It is the bridge between the HTTP API and the GPU workers.
+
+**Internal structure:**
+
+<svg viewBox="0 0 700 220" style="max-width:700px;width:100%;margin:1.5rem 0" font-family="sans-serif">
+  <defs>
+    <marker id="orch-arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#d97706"/>
+    </marker>
+  </defs>
+  <rect width="700" height="220" fill="#f8fafc" rx="8"/>
+  <text x="350" y="20" text-anchor="middle" font-size="12" font-weight="700" fill="#1e293b">Orchestrator Internal Structure</text>
+
+  <rect x="10" y="34" width="120" height="44" rx="5" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="70" y="54" text-anchor="middle" font-size="10" font-weight="600" fill="#1e3a8a">API Server</text>
+  <text x="70" y="69" text-anchor="middle" font-size="9" fill="#64748b">ZMQ ROUTER/PULL</text>
+
+  <line x1="130" y1="56" x2="160" y2="56" stroke="#d97706" stroke-width="1.5" marker-end="url(#orch-arr)"/>
+
+  <rect x="164" y="34" width="120" height="44" rx="5" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
+  <text x="224" y="52" text-anchor="middle" font-size="10" font-weight="600" fill="#92400e">input_thread</text>
+  <text x="224" y="67" text-anchor="middle" font-size="9" fill="#92400e">recv ZMQ messages</text>
+  <text x="224" y="79" text-anchor="middle" font-size="9" fill="#92400e">→ Scheduler.add()</text>
+
+  <line x1="284" y1="56" x2="314" y2="56" stroke="#d97706" stroke-width="1.5" marker-end="url(#orch-arr)"/>
+
+  <rect x="318" y="24" width="120" height="64" rx="5" fill="#fef3c7" stroke="#d97706" stroke-width="2"/>
+  <text x="378" y="44" text-anchor="middle" font-size="10" font-weight="700" fill="#92400e">Scheduler</text>
+  <text x="378" y="59" text-anchor="middle" font-size="9" fill="#64748b">FIFO queue</text>
+  <text x="378" y="73" text-anchor="middle" font-size="9" fill="#64748b">pending → processing</text>
+  <text x="378" y="85" text-anchor="middle" font-size="9" fill="#64748b">→ completed/failed</text>
+
+  <line x1="438" y1="56" x2="468" y2="56" stroke="#d97706" stroke-width="1.5" marker-end="url(#orch-arr)"/>
+
+  <rect x="472" y="24" width="130" height="64" rx="5" fill="#fef3c7" stroke="#d97706" stroke-width="2"/>
+  <text x="537" y="44" text-anchor="middle" font-size="10" font-weight="700" fill="#92400e">RequestProcessor</text>
+  <text x="537" y="59" text-anchor="middle" font-size="9" fill="#64748b">sample packing</text>
+  <text x="537" y="73" text-anchor="middle" font-size="9" fill="#64748b">batch dispatch</text>
+  <text x="537" y="85" text-anchor="middle" font-size="9" fill="#64748b">→ RemoteBackend</text>
+
+  <line x1="537" y1="88" x2="537" y2="114" stroke="#d97706" stroke-width="1.5" marker-end="url(#orch-arr)"/>
+
+  <rect x="472" y="118" width="130" height="44" rx="5" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="537" y="137" text-anchor="middle" font-size="10" font-weight="600" fill="#166534">RemoteBackend</text>
+  <text x="537" y="152" text-anchor="middle" font-size="9" fill="#64748b">ZMQ PAIR → Workers</text>
+
+  <line x1="472" y1="140" x2="440" y2="140" stroke="#d97706" stroke-width="1.5" marker-end="url(#orch-arr)"/>
+
+  <rect x="164" y="118" width="270" height="44" rx="5" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="299" y="137" text-anchor="middle" font-size="10" font-weight="600" fill="#166534">output_thread</text>
+  <text x="299" y="152" text-anchor="middle" font-size="9" fill="#64748b">recv results from worker → ZMQ PUSH → API Server</text>
+
+  <text x="350" y="195" text-anchor="middle" font-size="10" font-weight="600" fill="#1e293b">event_loop() thread: dequeue from Scheduler → RequestProcessor → await result</text>
+  <text x="350" y="210" text-anchor="middle" font-size="9" fill="#64748b">Protocol messages: OrchestratorRequest / OrchestratorOutputs (msgpack)</text>
+</svg>
+
+**Key classes:**
+
+| Class | File | Role |
+|---|---|---|
+| `Orchestrator` | `orchestrator.py` | Main event loop; coordinates all sub-components |
+| `Scheduler` | `scheduler.py` | FIFO queue with per-request state (pending → processing → completed/failed) |
+| `RequestProcessor` | `request_processor.py` | Packs incoming datums into micro-batches; dispatches to backend |
+| `RemoteBackend` | `backend/remote.py` | ZMQ PAIR socket to rank 0 worker; sends commands, receives outputs |
+
+---
+
+### RunnerDispatcher + ModelRunner
+
+[`src/xorl/server/runner/runner_dispatcher.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/runner/runner_dispatcher.py)
+
+The dispatcher runs on **rank 0** inside the torchrun process group. It acts as the ZMQ boundary between the Orchestrator and the actual GPU computation.
+
+**Protocol:**
+
+```
+Orchestrator (RemoteBackend)
+  → ZMQ PAIR  ──► RunnerDispatcher (rank 0)
+                    │  NCCL broadcast → ranks 1..N (command type)
+                    │  NCCL scatter   → ranks 1..N (batch data)
+                    │
+                    ▼  All ranks call ModelRunner.forward_backward()
+                    │
+                    │  NCCL gather ← ranks 1..N (outputs)
+                    │
+  ← ZMQ PAIR  ◄── RunnerDispatcher (rank 0)  (result)
+```
+
+**Supported commands:**
+
+| Command | Action |
+|---|---|
+| `FORWARD_BACKWARD` | Forward + backward pass, accumulate gradients |
+| `OPTIM_STEP` | Apply gradients, step optimizer, advance LR scheduler |
+| `SAVE_STATE` | Save DCP checkpoint |
+| `LOAD_STATE` | Load DCP checkpoint |
+| `HEALTH_CHECK` | Verify all ranks are alive |
+| `SHUTDOWN` | Graceful exit |
+
+[`src/xorl/server/runner/model_runner.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/runner/model_runner.py) — `ModelRunner` handles the actual model forward/backward/optimizer step on each rank. It receives the already-distributed micro-batches and calls into the model using the same FSDP2/EP/PP stack as local training.
+
+---
+
+## Protocol Layer
+
+Messages between the API Server and Orchestrator use typed dataclasses serialized with **msgpack**:
+
+```python
+# src/xorl/server/protocol/api_orchestrator.py
+
+@dataclass
+class OrchestratorRequest:
+    request_id: str          # UUID for tracking
+    request_type: RequestType  # ADD | ABORT | UTILITY
+    operation: str           # "forward_backward" | "optim_step" | ...
+    payload: OperationPayload  # ModelPassData | OptimStepData | ...
+    seq_id: Optional[int]    # Ordering within a session
+    timestamp: Optional[float]
+
+@dataclass
+class OrchestratorOutputs:
+    request_id: str
+    output_type: OutputType  # forward | forward_backward | optim_step | error
+    outputs: List[Dict[str, Any]]
+```
+
+Messages between the Orchestrator and workers use a separate protocol defined in `protocol/orchestrator_runner.py`.
+
+---
+
+## Source
+
+| File | Description |
+|---|---|
+| [`src/xorl/server/launcher.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/launcher.py) | `Launcher` — process orchestration, startup/shutdown lifecycle |
+| [`src/xorl/server/api_server/server.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/api_server/server.py) | `APIServer` — FastAPI app, OrchestratorClient, FutureStore |
+| [`src/xorl/server/api_server/endpoints.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/api_server/endpoints.py) | All FastAPI endpoint handlers |
+| [`src/xorl/server/orchestrator/orchestrator.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/orchestrator/orchestrator.py) | `Orchestrator` — event loop, request queue management |
+| [`src/xorl/server/orchestrator/scheduler.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/orchestrator/scheduler.py) | `Scheduler` — FIFO request ordering |
+| [`src/xorl/server/orchestrator/request_processor.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/orchestrator/request_processor.py) | `RequestProcessor` — sample packing, backend dispatch |
+| [`src/xorl/server/runner/runner_dispatcher.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/runner/runner_dispatcher.py) | `RunnerDispatcher` — rank 0 ZMQ↔NCCL bridge |
+| [`src/xorl/server/runner/model_runner.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/runner/model_runner.py) | `ModelRunner` — actual forward/backward/optim on GPU ranks |
+| [`src/xorl/server/protocol/`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/protocol/) | Typed msgpack protocol messages between all layers |

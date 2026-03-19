@@ -1,0 +1,285 @@
+---
+title: "Local Training"
+---
+
+
+Local training uses `torchrun` to launch distributed processes directly, without an API server. It is best for offline supervised fine-tuning where the full training loop is fixed ahead of time.
+
+## Launch Command
+
+```bash
+torchrun \
+    --nproc_per_node <GPUS_PER_NODE> \
+    [--nnodes <NUM_NODES>] \
+    [--node_rank <NODE_RANK>] \
+    [--master_addr <HEAD_NODE_IP>] \
+    [--master_port <PORT>] \
+    -m xorl.cli.train <config.yaml> [--key.path value ...]
+```
+
+### Single Node
+
+```bash
+torchrun --nproc_per_node=8 -m xorl.cli.train config.yaml
+```
+
+### Multi-Node (2 nodes, 16 GPUs)
+
+On the head node:
+```bash
+torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 \
+    --master_addr=HEAD_IP --master_port=29500 \
+    -m xorl.cli.train config.yaml
+```
+
+On each worker node:
+```bash
+torchrun --nproc_per_node=8 --nnodes=2 --node_rank=<RANK> \
+    --master_addr=HEAD_IP --master_port=29500 \
+    -m xorl.cli.train config.yaml
+```
+
+<svg viewBox="0 0 700 170" style="max-width:700px;width:100%;margin:1.5rem 0" font-family="sans-serif">
+  <defs>
+    <marker id="lt-arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#2563eb"/>
+    </marker>
+  </defs>
+  <rect width="700" height="170" fill="#f8fafc" rx="8"/>
+
+  {/* Dataset files */}
+  <rect x="10" y="55" width="90" height="60" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="55" y="78" text-anchor="middle" font-size="10" fill="#1e293b" font-weight="700">Dataset</text>
+  <text x="55" y="93" text-anchor="middle" font-size="9" fill="#64748b">files</text>
+  <text x="55" y="107" text-anchor="middle" font-size="9" fill="#64748b">.jsonl / HF</text>
+
+  {/* arrow */}
+  <line x1="100" y1="85" x2="130" y2="85" stroke="#2563eb" stroke-width="1.5" marker-end="url(#lt-arr)"/>
+
+  {/* Preparation */}
+  <rect x="135" y="55" width="100" height="60" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="185" y="78" text-anchor="middle" font-size="10" fill="#1e293b" font-weight="700">Prepare /</text>
+  <text x="185" y="93" text-anchor="middle" font-size="9" fill="#64748b">packing</text>
+  <text x="185" y="107" text-anchor="middle" font-size="9" fill="#64748b">tokenize</text>
+
+  {/* arrow */}
+  <line x1="235" y1="85" x2="265" y2="85" stroke="#2563eb" stroke-width="1.5" marker-end="url(#lt-arr)"/>
+
+  {/* DataLoader */}
+  <rect x="270" y="55" width="100" height="60" rx="6" fill="#1e3a8a" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="320" y="78" text-anchor="middle" font-size="10" fill="#fff" font-weight="700">DataLoader</text>
+  <text x="320" y="93" text-anchor="middle" font-size="9" fill="#dbeafe">sample_packing</text>
+  <text x="320" y="107" text-anchor="middle" font-size="9" fill="#dbeafe">seq=8192</text>
+
+  {/* arrow */}
+  <line x1="370" y1="85" x2="400" y2="85" stroke="#2563eb" stroke-width="1.5" marker-end="url(#lt-arr)"/>
+
+  {/* MicroBatchCollator */}
+  <rect x="405" y="45" width="110" height="80" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="460" y="68" text-anchor="middle" font-size="10" fill="#1e293b" font-weight="700">MicroBatch</text>
+  <text x="460" y="83" text-anchor="middle" font-size="9" fill="#64748b">Collator</text>
+  <text x="460" y="98" text-anchor="middle" font-size="9" fill="#64748b">grad_accum</text>
+  <text x="460" y="112" text-anchor="middle" font-size="9" fill="#64748b">micro-batches</text>
+
+  {/* arrow */}
+  <line x1="515" y1="85" x2="545" y2="85" stroke="#2563eb" stroke-width="1.5" marker-end="url(#lt-arr)"/>
+
+  {/* Grad accum loop */}
+  <rect x="550" y="45" width="110" height="80" rx="6" fill="#1e3a8a" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="605" y="68" text-anchor="middle" font-size="10" fill="#fff" font-weight="700">Grad accum</text>
+  <text x="605" y="83" text-anchor="middle" font-size="9" fill="#dbeafe">fwd + bwd × N</text>
+  <text x="605" y="98" text-anchor="middle" font-size="9" fill="#dbeafe">optimizer step</text>
+  <text x="605" y="112" text-anchor="middle" font-size="9" fill="#dbeafe">save ckpt</text>
+
+  {/* loop arrow back */}
+  <path d="M605 125 Q605 148 320 148 Q100 148 55 125" fill="none" stroke="#2563eb" stroke-width="1" stroke-dasharray="4,3"/>
+  <line x1="55" y1="125" x2="55" y2="115" stroke="#2563eb" stroke-width="1" marker-end="url(#lt-arr)"/>
+  <text x="330" y="162" text-anchor="middle" font-size="9" fill="#64748b">next step</text>
+</svg>
+
+## Config File Structure
+
+Every training config has three top-level sections: `model`, `data`, and `train`. A `lora` section is added when using LoRA or QLoRA.
+
+```yaml
+model:
+  model_path: Qwen/Qwen3-8B    # HF Hub ID or local path
+  attn_implementation: flash_attention_3
+  # moe_implementation: triton  # for MoE models
+
+data:
+  datasets:
+    - path: /data/train.jsonl
+      type: tokenized
+      max_seq_len: 4096
+  select_columns: [input_ids, labels]
+  sample_packing_method: sequential
+  sample_packing_sequence_len: 4096
+
+train:
+  output_dir: outputs/my_run
+  data_parallel_mode: fsdp2
+  micro_batch_size: 1
+  gradient_accumulation_steps: 4
+  num_train_epochs: 1
+  optimizer: adamw
+  lr: 1e-5
+  lr_warmup_ratio: 0.05
+  lr_decay_style: cosine
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  enable_full_shard: true
+  init_device: meta
+  load_weights_mode: broadcast
+  save_steps: 500
+  ckpt_manager: dcp
+```
+
+## Model Loading
+
+### Standard Loading
+
+```yaml
+model:
+  model_path: Qwen/Qwen3-8B
+```
+
+xorl downloads from HF Hub on first use (cached in `~/.cache/huggingface`). Pass a local path to avoid re-downloading.
+
+### Meta Device (recommended for large models)
+
+```yaml
+train:
+  init_device: meta
+  load_weights_mode: broadcast   # rank 0 reads, all ranks receive via NCCL
+```
+
+Meta device creates model parameters as zero-cost placeholders. FSDP2 then loads and shards weights directly into each rank's shard — no rank ever holds the full model in memory. Without meta device, every rank would briefly allocate the entire model before sharding, causing OOM for models larger than ~30B parameters on 80 GB GPUs. Use `load_weights_mode: all_ranks` for NVMe-fast local storage (each rank reads independently).
+
+## Data Parallel Modes
+
+| Mode | Description | When to use |
+|---|---|---|
+| `ddp` | DistributedDataParallel | Small models, quick experiments |
+| `fsdp2` | FSDP2 (ZeRO-3 equivalent) | Large models, default choice |
+| `none` | Single process | Debugging |
+
+### FSDP2 Sharding
+
+```yaml
+train:
+  data_parallel_mode: fsdp2
+  enable_full_shard: true          # shard params + grads + optimizer states
+  data_parallel_shard_size: 8      # GPUs per shard group (default: world_size)
+  data_parallel_replicate_size: 1  # data replicas (HSDP when > 1)
+```
+
+**HSDP (Hybrid Sharding):** For multi-node, shard within node and replicate across nodes:
+```yaml
+  data_parallel_shard_size: 8       # shard within 8-GPU node
+  data_parallel_replicate_size: 4   # 4 node replicas
+```
+
+## Sequence Length and Packing
+
+xorl packs multiple short sequences into a single training bin to maximize GPU utilization.
+
+```yaml
+data:
+  sample_packing_method: sequential   # or multipack (better packing, slower)
+  sample_packing_sequence_len: 8192   # target packed length per step
+```
+
+Each sample's `max_seq_len` gates individual sequence truncation before packing:
+```yaml
+  datasets:
+    - path: data.jsonl
+      type: tokenized
+      max_seq_len: 4096   # truncate individual samples to 4096 before packing
+```
+
+## Optimizer Options
+
+### AdamW (default)
+
+```yaml
+train:
+  optimizer: adamw
+  lr: 1e-5
+  weight_decay: 0.01
+  lr_warmup_ratio: 0.05
+  lr_decay_style: cosine   # constant, linear, cosine
+```
+
+### Muon
+
+Muon applies Newton-Schulz orthogonalization to gradients before the update step, yielding better convergence for transformer weight matrices. Non-matrix parameters (biases, norms, embeddings) fall back to AdamW.
+
+```yaml
+train:
+  optimizer: muon
+  lr: 1e-4            # Muon base LR (for non-matrix params, uses AdamW)
+  muon_lr: 2e-4       # Muon LR for matrix params
+  muon_momentum: 0.95
+  muon_ns_steps: 5    # Newton-Schulz iterations
+```
+
+## Checkpointing
+
+xorl uses PyTorch Distributed Checkpoint Protocol (DCP) by default, which is sharding-aware and supports FSDP2.
+
+```yaml
+train:
+  ckpt_manager: dcp
+  save_steps: 500              # save every N steps (0 = off)
+  save_epochs: 0.5             # save every N epochs (fractional OK)
+  output_dir: outputs/my_run   # checkpoints saved here
+  load_checkpoint_path: ""     # resume from this path (empty = from scratch)
+  save_hf_weights: false       # save HF-format weights (expensive for large models)
+```
+
+Checkpoints are saved to `{output_dir}/checkpoints/global_step_{N}/`.
+
+## Gradient Checkpointing
+
+```yaml
+train:
+  enable_gradient_checkpointing: true
+  recompute_modules: [self_attn, mlp]   # selective recompute
+```
+
+For MoE models, `moe_checkpoint_method: moe_act` recomputes only activations inside expert FFNs, skipping the EP dispatch (faster than full recompute):
+```yaml
+train:
+  moe_checkpoint_method: moe_act
+```
+
+## Logging
+
+```yaml
+train:
+  log_format: structured     # key=value lines for parsing, or progress_bar (tqdm)
+  use_wandb: true
+  wandb_project: my_project
+  wandb_name: qwen3_8b_ft
+  wandb_log_interval: 10     # log every N steps
+```
+
+## Activation Offloading
+
+For very large models on limited GPU memory:
+```yaml
+train:
+  enable_activation_offload: true
+  activation_gpu_limit: 4.0   # keep up to 4 GB of activations on GPU
+```
+
+## Source
+
+| File | Description |
+|---|---|
+| [`src/xorl/cli/train.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/cli/train.py) | CLI entry point (`xorl.cli.train`) |
+| [`src/xorl/data/data_loader.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/data/data_loader.py) | DataLoader and MicroBatchCollator |
+| [`src/xorl/data/prepare/`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/data/prepare/) | Dataset preparation and sample packing |

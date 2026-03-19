@@ -1,0 +1,357 @@
+---
+title: "Gradient Accumulation & Token Normalization"
+---
+
+:::note[TL;DR]
+**For local training:** gradient normalization is fully automatic — no configuration needed.
+**For server training:** each `forward_backward` call accumulates raw gradients; `optim_step` normalizes them by the total token count across all calls. Also automatic.
+
+This page explains the internals for those who want to understand the math.
+:::
+
+Correctly accumulating gradients across micro-batches, data-parallel ranks, and context-parallel ranks requires token-normalized loss scaling. This page explains the full pipeline — from counting valid tokens to syncing SP gradients — and why each step is necessary.
+
+---
+
+## The Problem with Naive Averaging
+
+A standard gradient accumulation loop averages the loss over micro-batches. FSDP normally averages gradients over its shard group. Both of these are wrong when sequences are packed: different micro-batches and different DP ranks process variable numbers of valid (non-padding) tokens.
+
+<svg viewBox="0 0 700 210" style="max-width:700px;width:100%;margin:1.5rem 0" font-family="sans-serif">
+  <defs>
+    <marker id="ga-arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#2563eb"/>
+    </marker>
+    <marker id="ga-arr-r" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#dc2626"/>
+    </marker>
+    <marker id="ga-arr-g" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#16a34a"/>
+    </marker>
+  </defs>
+  <rect width="700" height="210" fill="#f8fafc" rx="8"/>
+  <text x="350" y="20" text-anchor="middle" font-size="12" font-weight="700" fill="#1e293b">Why simple averaging is wrong with packed sequences</text>
+
+  <rect x="10" y="34" width="320" height="110" rx="6" fill="#fee2e2" stroke="#dc2626" stroke-width="1.5"/>
+  <text x="170" y="52" text-anchor="middle" font-size="11" font-weight="700" fill="#dc2626">❌  Naive: loss.mean() per rank</text>
+
+  <rect x="24" y="64" width="90" height="30" rx="4" fill="#fef2f2" stroke="#dc2626" stroke-width="1"/>
+  <text x="69" y="79" text-anchor="middle" font-size="9" fill="#991b1b" font-weight="600">Rank 0</text>
+  <text x="69" y="91" text-anchor="middle" font-size="8" fill="#dc2626">900 valid tokens</text>
+
+  <rect x="24" y="104" width="90" height="30" rx="4" fill="#fef2f2" stroke="#dc2626" stroke-width="1"/>
+  <text x="69" y="119" text-anchor="middle" font-size="9" fill="#991b1b" font-weight="600">Rank 1</text>
+  <text x="69" y="131" text-anchor="middle" font-size="8" fill="#dc2626">100 valid tokens</text>
+
+  <text x="135" y="84" font-size="9" fill="#dc2626">loss₀ = CE_sum / 900</text>
+  <text x="135" y="96" font-size="9" fill="#dc2626">grad₀ = loss₀.bwd()</text>
+  <text x="135" y="120" font-size="9" fill="#dc2626">loss₁ = CE_sum / 100</text>
+  <text x="135" y="132" font-size="9" fill="#dc2626">grad₁ = loss₁.bwd()</text>
+
+  <text x="170" y="158" text-anchor="middle" font-size="9" fill="#dc2626" font-weight="600">FSDP avg: (grad₀ + grad₁) / 2</text>
+  <text x="170" y="172" text-anchor="middle" font-size="8" fill="#64748b">Rank 1's 100 tokens weighted equally to Rank 0's 900</text>
+
+  <rect x="368" y="34" width="320" height="110" rx="6" fill="#dcfce7" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="528" y="52" text-anchor="middle" font-size="11" font-weight="700" fill="#16a34a">✓  Token-normalized</text>
+
+  <rect x="382" y="64" width="90" height="30" rx="4" fill="#f0fdf4" stroke="#16a34a" stroke-width="1"/>
+  <text x="427" y="79" text-anchor="middle" font-size="9" fill="#166534" font-weight="600">Rank 0</text>
+  <text x="427" y="91" text-anchor="middle" font-size="8" fill="#16a34a">900 valid tokens</text>
+
+  <rect x="382" y="104" width="90" height="30" rx="4" fill="#f0fdf4" stroke="#16a34a" stroke-width="1"/>
+  <text x="427" y="119" text-anchor="middle" font-size="9" fill="#166534" font-weight="600">Rank 1</text>
+  <text x="427" y="131" text-anchor="middle" font-size="8" fill="#16a34a">100 valid tokens</text>
+
+  <text x="490" y="75" font-size="9" fill="#166534">gvt = 900 + 100 = 1000</text>
+  <text x="490" y="88" font-size="9" fill="#166534">loss₀ = CE_sum × (900/1000)</text>
+  <text x="490" y="101" font-size="9" fill="#166534">loss₁ = CE_sum × (100/1000)</text>
+  <text x="490" y="114" font-size="9" fill="#166534">FSDP sum: grad₀ + grad₁</text>
+  <text x="490" y="127" font-size="9" fill="#64748b">(divide_factor=1.0, no FSDP averaging)</text>
+
+  <text x="528" y="158" text-anchor="middle" font-size="9" fill="#16a34a" font-weight="600">Each token contributes equally to the gradient</text>
+  <text x="528" y="172" text-anchor="middle" font-size="8" fill="#64748b">Equivalent to computing CE over all 1000 tokens on one GPU</text>
+
+  <text x="350" y="196" text-anchor="middle" font-size="9" fill="#64748b">gvt = global valid tokens · all-reduced across all DP ranks before the accumulation loop begins</text>
+</svg>
+
+---
+
+## Step 1: Count Global Valid Tokens (before the loop)
+
+Before any micro-batch forward pass, xorl counts the total non-padding tokens across **all micro-batches and all DP ranks** with a single all-reduce:
+
+```python
+# src/xorl/trainers/training_utils.py — count_valid_tokens()
+global_valid_tokens = torch.tensor(0, device=device)
+for mb in micro_batches:
+    labels = mb.get("labels", mb.get("target_tokens"))
+    if labels is not None:
+        global_valid_tokens += (labels != IGNORE_INDEX).sum()   # local sum
+
+dist.all_reduce(global_valid_tokens, op=dist.ReduceOp.SUM)      # sum across DP
+```
+
+`IGNORE_INDEX = -100` marks padding positions. The all-reduce uses the FSDP process group, summing across all DP ranks (and SP ranks within the same shard group if CP is folded into FSDP).
+
+This value is computed **once** before the gradient accumulation loop and reused for every micro-batch backward pass.
+
+---
+
+## Step 2: Token-Normalized Loss per Micro-Batch
+
+For each micro-batch, xorl calls `GradientAccumulateLoss` ([`src/xorl/distributed/gradient_accumulate_loss.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/distributed/gradient_accumulate_loss.py)):
+
+```python
+local_valid_tokens = (labels != IGNORE_INDEX).sum()     # tokens in this micro-batch on this rank
+ga_loss, _ = gradient_accumulate_loss(loss, local_valid_tokens, global_valid_tokens)
+ga_loss.backward()
+```
+
+`GradientAccumulateLoss` is a custom `torch.autograd.Function` that implements:
+
+**Forward:**
+```
+loss_sum = loss × local_valid_tokens        # scale by local token count
+all_reduce(loss_sum, SUM)                   # sum across all DP ranks
+return loss_sum / global_valid_tokens       # normalize to per-token loss
+```
+
+**Backward:**
+```
+grad = grad_output × (local_valid_tokens / global_valid_tokens)
+```
+
+The gradient flowing back through `ga_loss.backward()` is thus scaled by the fraction of valid tokens on this rank and micro-batch. Summing these gradients across micro-batches and DP ranks gives the correct token-averaged gradient — identical to computing the loss over the entire global batch at once.
+
+<svg viewBox="0 0 700 250" style="max-width:700px;width:100%;margin:1.5rem 0" font-family="sans-serif">
+  <defs>
+    <marker id="ga2-arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#2563eb"/>
+    </marker>
+    <marker id="ga2-arr-r" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#dc2626"/>
+    </marker>
+  </defs>
+  <rect width="700" height="250" fill="#f8fafc" rx="8"/>
+  <text x="350" y="20" text-anchor="middle" font-size="12" font-weight="700" fill="#1e293b">Gradient Accumulation Loop (non-PP path)</text>
+
+  <rect x="10" y="32" width="680" height="26" rx="4" fill="#e0e7ff" stroke="#6366f1" stroke-width="1.5"/>
+  <text x="350" y="49" text-anchor="middle" font-size="10" font-weight="700" fill="#3730a3">gvt = all_reduce( Σ valid_tokens across ALL micro-batches × ALL DP ranks )  — computed once before loop</text>
+
+  <rect x="10" y="70" width="680" height="36" rx="4" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="40" y="87" font-size="10" fill="#1e3a8a" font-weight="700">Micro-batch 1</text>
+  <text x="40" y="100" font-size="9" fill="#64748b">lvt₁ = valid tokens in mb1 on this rank</text>
+  <text x="300" y="92" text-anchor="middle" font-size="9" fill="#2563eb">loss₁ = CE_sum(mb1) · (lvt₁ / gvt)</text>
+  <text x="550" y="87" font-size="10" fill="#dc2626" font-weight="600">loss₁.backward()</text>
+  <text x="550" y="100" font-size="9" fill="#dc2626">grad += grad₁ × (lvt₁/gvt)</text>
+
+  <rect x="10" y="116" width="680" height="36" rx="4" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="40" y="133" font-size="10" fill="#1e3a8a" font-weight="700">Micro-batch 2</text>
+  <text x="40" y="146" font-size="9" fill="#64748b">lvt₂ = valid tokens in mb2 on this rank</text>
+  <text x="300" y="138" text-anchor="middle" font-size="9" fill="#2563eb">loss₂ = CE_sum(mb2) · (lvt₂ / gvt)</text>
+  <text x="550" y="133" font-size="10" fill="#dc2626" font-weight="600">loss₂.backward()</text>
+  <text x="550" y="146" font-size="9" fill="#dc2626">grad += grad₂ × (lvt₂/gvt)</text>
+
+  <text x="350" y="168" text-anchor="middle" font-size="10" fill="#64748b">… × gradient_accumulation_steps</text>
+
+  <rect x="10" y="178" width="680" height="28" rx="4" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
+  <text x="350" y="196" text-anchor="middle" font-size="10" font-weight="700" fill="#92400e">FSDP reduce-scatter  (divide_factor = 1.0 → SUM, not average)  →  gradient shard on each rank</text>
+
+  <rect x="10" y="214" width="680" height="28" rx="4" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="350" y="232" text-anchor="middle" font-size="10" font-weight="700" fill="#166534">SP gradient all-reduce  (if ring/Ulysses not folded into FSDP)  →  sync across CP group</text>
+
+  <text x="350" y="248" text-anchor="middle" font-size="8" fill="#64748b">Final gradient = Σ (grad_i × lvt_i / gvt) across all micro-batches and DP ranks = token-averaged gradient</text>
+</svg>
+
+---
+
+## Step 3: FSDP Gradient Averaging Disabled
+
+FSDP2 normally divides gradients by `fsdp_size` during its reduce-scatter. xorl disables this by calling `set_gradient_divide_factor(1.0)` on every FSDP module:
+
+```python
+# src/xorl/distributed/torch_parallelize.py
+for module in model.modules():
+    if isinstance(module, FSDPModule) and not getattr(module, "_is_ep_fsdp", False):
+        module.set_gradient_divide_factor(1.0)   # raw SUM, not average
+```
+
+With `divide_factor=1.0`, the reduce-scatter **sums** gradients across ranks rather than averaging them. This is correct because `GradientAccumulateLoss` already scales each rank's backward contribution by `local_valid_tokens / global_valid_tokens` — so summing the contributions across ranks gives the correct token-average.
+
+The only exception: EP expert modules retain `set_gradient_divide_factor(ep_size)` and are marked `_is_ep_fsdp = True` so the loop above skips them. See [Expert Parallelism](/parallelism/expert_parallelism/#6-gradient-handling) for details.
+
+---
+
+## Step 4: SP Gradient Sync
+
+After the accumulation loop completes, context-parallel (CP) dimensions that are **not folded into the FSDP mesh** require a separate all-reduce to synchronize gradients:
+
+```python
+# src/xorl/trainers/training_utils.py — sync_sp_gradients()
+if sp_grad_sync_group is not None:
+    for p in model.parameters():
+        if p.grad is not None:
+            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, group=sp_grad_sync_group)
+```
+
+**Why this is needed:** CP ranks process complementary (non-overlapping) token chunks of the same sequence. Each rank computes gradients only for the tokens it saw. To get the full gradient for a shared parameter (e.g., attention weights), the contributions from all CP ranks must be summed.
+
+**When it's a no-op:** If `cp_fsdp_mode: all` (the default), the CP ranks are folded into the FSDP shard group, so FSDP's reduce-scatter already handles the CP gradient sync. The `sp_grad_sync_group` is `None` and this step is skipped.
+
+| `cp_fsdp_mode` | `sp_grad_sync_group` | Behavior |
+|---|---|---|
+| `all` (default) | `None` | CP folded into FSDP — no separate sync needed |
+| `ulysses_only` | ring attention group | Only ring attention ranks need an extra all-reduce |
+| `ring_only` | Ulysses group | Only Ulysses ranks need an extra all-reduce |
+| `none` | unified SP group | Both ring and Ulysses need an extra all-reduce |
+
+---
+
+## Full Pipeline Summary
+
+<svg viewBox="0 0 700 300" style="max-width:700px;width:100%;margin:1.5rem 0" font-family="sans-serif">
+  <defs>
+    <marker id="ga3-arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#2563eb"/>
+    </marker>
+  </defs>
+  <rect width="700" height="300" fill="#f8fafc" rx="8"/>
+  <text x="350" y="20" text-anchor="middle" font-size="12" font-weight="700" fill="#1e293b">Complete Gradient Accumulation Pipeline</text>
+
+  <rect x="20" y="34" width="660" height="34" rx="5" fill="#e0e7ff" stroke="#6366f1" stroke-width="1.5"/>
+  <text x="54" y="48" font-size="10" font-weight="700" fill="#3730a3">①</text>
+  <text x="70" y="48" font-size="10" fill="#1e293b" font-weight="600">Count global valid tokens</text>
+  <text x="70" y="61" font-size="9" fill="#64748b">gvt = all_reduce( Σ (labels != -100).sum() over all micro-batches × DP ranks )</text>
+
+  <line x1="350" y1="68" x2="350" y2="82" stroke="#2563eb" stroke-width="1.5" marker-end="url(#ga3-arr)"/>
+
+  <rect x="20" y="84" width="660" height="34" rx="5" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="54" y="98" font-size="10" font-weight="700" fill="#1e3a8a">②</text>
+  <text x="70" y="98" font-size="10" fill="#1e293b" font-weight="600">For each micro-batch: forward + token-normalized backward</text>
+  <text x="70" y="111" font-size="9" fill="#64748b">ga_loss = GradientAccumulateLoss(CE_loss, lvt, gvt) → .backward() accumulates grad × (lvt/gvt)</text>
+
+  <line x1="350" y1="118" x2="350" y2="132" stroke="#2563eb" stroke-width="1.5" marker-end="url(#ga3-arr)"/>
+
+  <rect x="20" y="134" width="660" height="34" rx="5" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
+  <text x="54" y="148" font-size="10" font-weight="700" fill="#92400e">③</text>
+  <text x="70" y="148" font-size="10" fill="#1e293b" font-weight="600">FSDP reduce-scatter with divide_factor=1.0</text>
+  <text x="70" y="161" font-size="9" fill="#64748b">Sums raw gradients across DP ranks (no averaging) → each rank holds its gradient shard</text>
+
+  <line x1="350" y1="168" x2="350" y2="182" stroke="#2563eb" stroke-width="1.5" marker-end="url(#ga3-arr)"/>
+
+  <rect x="20" y="184" width="660" height="34" rx="5" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="54" y="198" font-size="10" font-weight="700" fill="#166534">④</text>
+  <text x="70" y="198" font-size="10" fill="#1e293b" font-weight="600">SP gradient all-reduce (conditional)</text>
+  <text x="70" y="211" font-size="9" fill="#64748b">all_reduce(grad, SUM, group=sp_grad_sync_group) — only if CP dims not folded into FSDP</text>
+
+  <line x1="350" y1="218" x2="350" y2="232" stroke="#2563eb" stroke-width="1.5" marker-end="url(#ga3-arr)"/>
+
+  <rect x="20" y="234" width="660" height="34" rx="5" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="54" y="248" font-size="10" font-weight="700" fill="#1e3a8a">⑤</text>
+  <text x="70" y="248" font-size="10" fill="#1e293b" font-weight="600">Gradient clip + optimizer step</text>
+  <text x="70" y="261" font-size="9" fill="#64748b">clip_grad_norm_() → optimizer.step() → scheduler.step()</text>
+
+  <text x="350" y="290" text-anchor="middle" font-size="9" fill="#64748b">Result: gradient equivalent to computing CE over all tokens globally, on a single device</text>
+</svg>
+
+---
+
+---
+
+## Server Training: Deferred Normalization
+
+The server training path ([`ModelRunner`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/runner/model_runner.py)) uses a different strategy: **raw gradients are accumulated across multiple `forward_backward` API calls, and normalization is deferred to `optim_step`**.
+
+This is necessary because the client controls the gradient accumulation loop externally — the server doesn't know in advance how many `forward_backward` calls will happen before `optim_step`.
+
+### Per `forward_backward` call
+
+Each API call does:
+
+```python
+# 1. Count gvt for this call's micro-batches (same as local training)
+global_valid_tokens = count_valid_tokens(micro_batches)
+
+# 2. For each micro-batch: raw (unnormalized) backward
+raw_loss = loss * local_valid_tokens     # scale by local token count only
+raw_loss.backward()                      # accumulates raw gradients
+
+# 3. SP gradient sync (same as local training)
+sync_sp_gradients(model, sp_grad_sync_group)
+
+# 4. Accumulate gvt for deferred normalization
+_accumulated_valid_tokens[model_id] += global_valid_tokens
+```
+
+The key difference from local training: `raw_loss = loss × local_valid_tokens` — **not** divided by `global_valid_tokens`. This means gradients accumulate as a raw token-weighted sum rather than a per-token normalized value.
+
+### At `optim_step`
+
+When the client calls `optim_step`, the server normalizes **all accumulated raw gradients** by the total token count across every `forward_backward` call since the last `optim_step`:
+
+```python
+accumulated = _accumulated_valid_tokens.pop(model_id)   # total tokens across all calls
+
+# Normalize all gradients in-place: grad ÷ accumulated_valid_tokens
+scale = 1.0 / accumulated
+for p in model.parameters():
+    if p.grad is not None:
+        p.grad.mul_(scale)    # in-place to preserve FSDP2 DTensor metadata
+
+clip_gradients(model, max_grad_norm)
+optimizer.step()
+```
+
+`p.grad.mul_(scale)` is used instead of `p.grad = p.grad * scale` to preserve the `DTensor` metadata that FSDP2 stores on gradient tensors.
+
+### Comparison with local training
+
+<svg viewBox="0 0 700 200" style="max-width:700px;width:100%;margin:1.5rem 0" font-family="sans-serif">
+  <defs>
+    <marker id="cmp-arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#2563eb"/>
+    </marker>
+  </defs>
+  <rect width="700" height="200" fill="#f8fafc" rx="8"/>
+  <text x="350" y="20" text-anchor="middle" font-size="12" font-weight="700" fill="#1e293b">Local vs Server: when normalization happens</text>
+
+  <rect x="10" y="32" width="330" height="148" rx="6" fill="#fff" stroke="#e2e8f0" stroke-width="1.5"/>
+  <text x="175" y="52" text-anchor="middle" font-size="11" font-weight="700" fill="#1e293b">Local Training</text>
+  <rect x="24" y="62" width="302" height="28" rx="4" fill="#eff6ff" stroke="#2563eb" stroke-width="1"/>
+  <text x="175" y="76" text-anchor="middle" font-size="9" fill="#1e3a8a" font-weight="600">micro-batch backward</text>
+  <text x="175" y="88" text-anchor="middle" font-size="8" fill="#64748b">grad += CE_loss × (lvt / gvt)</text>
+  <rect x="24" y="98" width="302" height="28" rx="4" fill="#eff6ff" stroke="#2563eb" stroke-width="1"/>
+  <text x="175" y="112" text-anchor="middle" font-size="9" fill="#1e3a8a" font-weight="600">micro-batch backward</text>
+  <text x="175" y="124" text-anchor="middle" font-size="8" fill="#64748b">grad += CE_loss × (lvt / gvt)</text>
+  <rect x="24" y="134" width="302" height="28" rx="4" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="175" y="148" text-anchor="middle" font-size="9" fill="#1e3a8a" font-weight="600">optimizer.step()</text>
+  <text x="175" y="161" text-anchor="middle" font-size="8" fill="#64748b">already normalized — no extra scaling</text>
+  <text x="175" y="180" text-anchor="middle" font-size="8" fill="#2563eb">normalize per micro-batch during backward</text>
+
+  <rect x="360" y="32" width="330" height="148" rx="6" fill="#fff" stroke="#e2e8f0" stroke-width="1.5"/>
+  <text x="525" y="52" text-anchor="middle" font-size="11" font-weight="700" fill="#1e293b">Server Training</text>
+  <rect x="374" y="62" width="302" height="20" rx="4" fill="#fef3c7" stroke="#d97706" stroke-width="1"/>
+  <text x="525" y="76" text-anchor="middle" font-size="9" fill="#92400e">forward_backward call 1: grad += CE_loss × lvt₁</text>
+  <rect x="374" y="88" width="302" height="20" rx="4" fill="#fef3c7" stroke="#d97706" stroke-width="1"/>
+  <text x="525" y="102" text-anchor="middle" font-size="9" fill="#92400e">forward_backward call 2: grad += CE_loss × lvt₂</text>
+  <rect x="374" y="114" width="302" height="20" rx="4" fill="#fef3c7" stroke="#d97706" stroke-width="1"/>
+  <text x="525" y="128" text-anchor="middle" font-size="9" fill="#92400e">forward_backward call N: grad += CE_loss × lvtₙ</text>
+  <rect x="374" y="140" width="302" height="28" rx="4" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="525" y="154" text-anchor="middle" font-size="9" fill="#1e3a8a" font-weight="600">optim_step(): grad.mul_(1 / Σ gvtᵢ)</text>
+  <text x="525" y="166" text-anchor="middle" font-size="8" fill="#64748b">then clip → optimizer.step()</text>
+  <text x="525" y="180" text-anchor="middle" font-size="8" fill="#2563eb">normalize once at optim_step across all calls</text>
+</svg>
+
+Both approaches produce **mathematically identical gradients**: token-averaged over all tokens seen since the last optimizer step. The server defers the division to give the client flexibility to call `forward_backward` any number of times before stepping.
+
+---
+
+## Source
+
+| File | Description |
+|---|---|
+| [`src/xorl/distributed/gradient_accumulate_loss.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/distributed/gradient_accumulate_loss.py) | `GradientAccumulateLoss` — custom autograd for local training token-normalized loss |
+| [`src/xorl/trainers/training_utils.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/trainers/training_utils.py) | `count_valid_tokens()` — all-reduce valid token count; `sync_sp_gradients()` — CP gradient sync |
+| [`src/xorl/distributed/torch_parallelize.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/distributed/torch_parallelize.py) | `set_gradient_divide_factor(1.0)` — disables FSDP automatic averaging |
+| [`src/xorl/trainers/trainer.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/trainers/trainer.py) | `train_step()`, `_forward_backward()` — local training pipeline |
+| [`src/xorl/server/runner/model_runner.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/runner/model_runner.py) | `_forward_backward_core()` — raw gradient accumulation; `optim_step()` — deferred normalization via `grad.mul_(1/accumulated)` |

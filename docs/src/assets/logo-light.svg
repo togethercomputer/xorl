@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 32" fill="none">
+  <circle cx="12" cy="10" r="8" fill="#a78bfa" opacity="0.85"/>
+  <circle cx="22" cy="10" r="8" fill="#e879f9" opacity="0.85"/>
+  <circle cx="17" cy="20" r="8" fill="#fb923c" opacity="0.85"/>
+  <text x="36" y="21" font-family="system-ui,sans-serif" font-weight="700" font-size="16" fill="#1e1b4b">xorl</text>
+</svg>

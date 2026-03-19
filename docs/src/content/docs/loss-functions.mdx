@@ -1,0 +1,125 @@
+---
+title: "Loss Functions"
+---
+
+xorl supports multiple loss functions for different training objectives. Each is selected via the `loss_fn` field in the forward_backward request (server training) or configured automatically for local training.
+
+## Supported Loss Functions
+
+| `loss_fn` name | Use case | Returns |
+|---|---|---|
+| `causallm_loss` | Standard next-token prediction (SFT, continued pretraining) | Scalar cross-entropy loss |
+| `policy_loss` | PPO-style policy gradient (RLHF, GRPO) | Scalar policy gradient loss |
+| `importance_sampling` | Off-policy RL training with IS correction | Scalar IS-weighted loss |
+
+### causallm_loss
+
+Standard next-token prediction using cross-entropy. The loss is computed over all positions where `labels != IGNORE_INDEX` (-100). Loss is normalized by the total number of valid tokens globally across all ranks and micro-batches:
+
+```
+loss = CE_sum(logits, labels) / global_valid_tokens
+```
+
+This is the default loss for local training and the most common choice for SFT and continued pretraining.
+
+### policy_loss
+
+PPO-style policy gradient loss for online RL training. Requires `logprobs_ref` in `loss_fn_params` (log probabilities from the reference model) and per-token `advantages`.
+
+The loss applies clipped importance sampling:
+
+```
+ratio = exp(logprobs - logprobs_ref)
+loss = -mean(min(ratio * advantages, clip(ratio, 1-eps, 1+eps) * advantages))
+```
+
+where `eps` is controlled by the `eps_clip` parameter (default `0.2`). Used with PPO, GRPO, and related algorithms.
+
+### importance_sampling_loss
+
+Off-policy RL training where the behavior policy differs from the current policy. Requires per-token importance weights `iw` passed in `loss_fn_params`.
+
+```
+loss = -mean(iw * logprobs * advantages)
+```
+
+The `eps_clip` parameter bounds the importance weights to `[1-eps, 1+eps]` to prevent excessive policy updates from stale data.
+
+### Per-token outputs
+
+The `causallm_loss` and `policy_loss` functions can return per-token log probabilities and elementwise cross-entropy values alongside the scalar loss. These are used for:
+- Computing KL divergence against a reference model
+- Logging token-level reward signals
+- Debugging training dynamics
+
+Per-token outputs are controlled by the `return_per_token` parameter in the model runner, not by a separate loss function name.
+
+## Loss Function Backends
+
+### Compiled cross-entropy (`ce_mode`)
+
+For `causallm_loss`, xorl supports two cross-entropy backends controlled by `ce_mode`:
+
+| Value | Description | When to use |
+|---|---|---|
+| `compiled` (default) | `torch.compile`-compiled chunked cross-entropy | Production training; fuses logit computation with CE for reduced peak memory |
+| `eager` | Standard `F.cross_entropy` | Debugging; incompatible with `torch.compile` on the full model |
+
+The compiled backend computes cross-entropy in chunks along the sequence dimension, avoiding materializing the full `[B × S, vocab_size]` float32 tensor at once. This is particularly important for large vocabulary models (Qwen3 has vocab_size=151,936) where the naive logit tensor can be 2–4 GB per micro-batch.
+
+### Vocabulary-parallel cross-entropy (TP training)
+
+When `tensor_parallel_size > 1`, the `lm_head` output is sharded across TP ranks: each rank holds logits for `vocab_size / tp_size` tokens. xorl computes cross-entropy directly on these sharded logits using a fused vocab-parallel CE kernel:
+
+1. Each TP rank computes the local log-sum-exp contribution from its vocab shard.
+2. An all-reduce aggregates the global log-sum-exp across TP ranks.
+3. Each rank computes the per-token CE using the correct global normalization.
+
+This avoids an all-gather of the full logit tensor before CE, saving `vocab_size × B × S × 4 bytes` of cross-TP communication per forward pass.
+
+## Loss Computation Flow
+
+<svg viewBox="0 0 700 140" style="max-width:700px;width:100%;margin:1.5rem 0" font-family="sans-serif">
+  <defs>
+    <marker id="loss-arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#2563eb"/>
+    </marker>
+    <marker id="loss-arr-red" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#dc2626"/>
+    </marker>
+  </defs>
+  <rect width="700" height="140" fill="#f8fafc" rx="8"/>
+  <text x="350" y="18" text-anchor="middle" font-size="12" font-weight="700" fill="#1e293b">Loss Computation Flow</text>
+  <rect x="10" y="32" width="80" height="36" rx="4" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="50" y="48" text-anchor="middle" font-size="9" fill="#1e3a8a" font-weight="600">tokens</text>
+  <text x="50" y="61" text-anchor="middle" font-size="8" fill="#64748b">[B, S]</text>
+  <line x1="90" y1="50" x2="118" y2="50" stroke="#2563eb" stroke-width="1.5" marker-end="url(#loss-arr)"/>
+  <rect x="122" y="32" width="100" height="36" rx="4" fill="#1e3a8a" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="172" y="48" text-anchor="middle" font-size="9" fill="#fff" font-weight="600">model fwd</text>
+  <text x="172" y="61" text-anchor="middle" font-size="8" fill="#dbeafe">lm_head</text>
+  <line x1="222" y1="50" x2="250" y2="50" stroke="#2563eb" stroke-width="1.5" marker-end="url(#loss-arr)"/>
+  <rect x="254" y="32" width="100" height="36" rx="4" fill="#1e3a8a" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="304" y="48" text-anchor="middle" font-size="9" fill="#fff" font-weight="600">logits</text>
+  <text x="304" y="61" text-anchor="middle" font-size="8" fill="#dbeafe">[B,S,V]</text>
+  <line x1="354" y1="50" x2="382" y2="50" stroke="#2563eb" stroke-width="1.5" marker-end="url(#loss-arr)"/>
+  <rect x="386" y="32" width="120" height="36" rx="4" fill="#1e3a8a" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="446" y="48" text-anchor="middle" font-size="9" fill="#fff" font-weight="600">cross_entropy</text>
+  <text x="446" y="61" text-anchor="middle" font-size="8" fill="#dbeafe">compiled / VP-CE</text>
+  <line x1="506" y1="50" x2="534" y2="50" stroke="#2563eb" stroke-width="1.5" marker-end="url(#loss-arr)"/>
+  <rect x="538" y="32" width="100" height="36" rx="4" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="588" y="48" text-anchor="middle" font-size="9" fill="#1e3a8a" font-weight="600">scalar loss</text>
+  <text x="588" y="61" text-anchor="middle" font-size="8" fill="#64748b">/ gvt</text>
+  <line x1="588" y1="68" x2="588" y2="98" stroke="#dc2626" stroke-width="1.5"/>
+  <line x1="588" y1="98" x2="172" y2="98" stroke="#dc2626" stroke-width="1.5" marker-end="url(#loss-arr-red)"/>
+  <text x="380" y="112" text-anchor="middle" font-size="9" fill="#dc2626">gradient &#x2190; .backward()</text>
+  <text x="350" y="130" text-anchor="middle" font-size="8" fill="#64748b">gvt = global valid tokens (all-reduced across all ranks)</text>
+</svg>
+
+## Source
+
+| File | Description |
+|---|---|
+| [`src/xorl/ops/loss/`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/ops/loss/) | Loss function implementations: `causallm_loss`, `policy_loss`, `importance_sampling` |
+| [`src/xorl/ops/loss/compiled_cross_entropy.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/ops/loss/compiled_cross_entropy.py) | Compiled chunked cross-entropy |
+| [`src/xorl/ops/loss/vocab_parallel_cross_entropy.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/ops/loss/vocab_parallel_cross_entropy.py) | Vocabulary-parallel cross-entropy for TP |
+| [`src/xorl/distributed/gradient_accumulate_loss.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/distributed/gradient_accumulate_loss.py) | `GradientAccumulateLoss` — token-normalized loss accumulation across micro-batches |

@@ -1,0 +1,115 @@
+---
+title: "MoE Router"
+---
+
+The `TopKRouter` ([`src/xorl/models/layers/moe/router.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/models/layers/moe/router.py)) is **stateless** — it owns no parameters. The gate linear (`nn.Linear(hidden_size, num_experts, bias=False)`) lives on `MoEBlock` so that the checkpoint path resolves to `mlp.gate.weight`, matching HuggingFace conventions.
+
+---
+
+## Routing Algorithm
+
+```python
+routing_weights = softmax(gate(hidden_states), dim=-1)   # [T, E]
+routing_weights, selected_experts = topk(routing_weights, k=top_k, dim=-1)  # [T, k]
+if norm_topk_prob:
+    routing_weights /= routing_weights.sum(dim=-1, keepdim=True)  # renormalize to sum=1
+```
+
+Each token independently selects its top-K experts from the softmax distribution over all E experts. Gate scores are broadcast into the weighted sum after expert compute.
+
+---
+
+## Router Parameters
+
+| Parameter | Type | Description |
+|---|---|---|
+| `norm_topk_prob` | bool | Renormalize the top-k gate scores to sum to 1. Qwen3-MoE uses `true`. With renormalization the output is a convex combination of expert outputs. Without it, scores are raw softmax values — which can be very small when E is large. |
+| `router_fp32` | bool | Upcast gate linear and hidden states to float32 before computing logits. Recommended for numerical stability and alignment with SGLang inference. |
+| `freeze_router` | bool | Freeze the gate linear weights during training (server training). Useful for fine-tuning where pre-trained routing should be preserved. |
+| `train_router` | bool | When `false`, detaches routing weights before they flow into the expert weighted sum. The gate still trains via auxiliary losses on `router_logits`, but not through expert gradients. Stabilizes training when routing is already good. |
+
+```yaml
+model:
+  router_fp32: true        # recommended for stability + SGLang alignment
+
+freeze_router: true        # server training: freeze gate.weight entirely
+
+train:
+  no_decay_modules: [gate] # local training: exclude gate from weight decay
+```
+
+---
+
+## Routing Replay (R3)
+
+Routing Replay (R3) solves a correctness problem that arises when combining EP with gradient checkpointing.
+
+**The problem:** Flash attention is non-deterministic on recompute — small numerical differences mean the hidden states fed to the router during backward's recompute differ from the original forward. This causes top-K selection to pick different experts, changing the AllToAll shapes and causing tensor mismatches.
+
+**The solution:** R3 records routing decisions (expert indices, optionally gate weights) during the forward pass and replays them verbatim during backward recompute.
+
+<svg viewBox="0 0 700 240" style="max-width:700px;width:100%;margin:1.5rem 0" font-family="sans-serif">
+  <defs>
+    <marker id="r3-fwd-arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#2563eb"/>
+    </marker>
+    <marker id="r3-bwd-arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#16a34a"/>
+    </marker>
+  </defs>
+  <rect width="700" height="240" fill="#f8fafc" rx="8"/>
+  <text x="350" y="20" text-anchor="middle" font-size="12" font-weight="700" fill="#1e293b">R3: Routing Replay for Gradient Checkpointing Determinism</text>
+
+  <rect x="20" y="36" width="300" height="88" rx="6" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="170" y="56" text-anchor="middle" font-size="11" fill="#1e3a8a" font-weight="700">Forward Pass  (stage: record)</text>
+  <text x="170" y="74" text-anchor="middle" font-size="10" fill="#1e293b">1. Router computes top-K indices</text>
+  <text x="170" y="90" text-anchor="middle" font-size="10" fill="#1e293b">2. Indices saved to RoutingReplay (CPU pin)</text>
+  <text x="170" y="106" text-anchor="middle" font-size="10" fill="#1e293b">3. AllToAll dispatch with real indices</text>
+  <text x="170" y="118" text-anchor="middle" font-size="9" fill="#64748b">Activation checkpointing drops expert activations</text>
+
+  <rect x="380" y="36" width="300" height="88" rx="6" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="530" y="56" text-anchor="middle" font-size="11" fill="#166534" font-weight="700">Backward Recompute  (stage: replay_backward)</text>
+  <text x="530" y="74" text-anchor="middle" font-size="10" fill="#1e293b">1. Router runs but result is discarded</text>
+  <text x="530" y="90" text-anchor="middle" font-size="10" fill="#1e293b">2. Cached indices popped from replay buffer</text>
+  <text x="530" y="106" text-anchor="middle" font-size="10" fill="#1e293b">3. AllToAll uses same indices → same shapes</text>
+  <text x="530" y="118" text-anchor="middle" font-size="9" fill="#64748b">Correct gradients despite non-deterministic attn</text>
+
+  <path d="M320 80 Q350 80 380 80" stroke="#2563eb" stroke-width="2" fill="none" marker-end="url(#r3-fwd-arr)"/>
+  <text x="350" y="73" text-anchor="middle" font-size="9" fill="#2563eb">replay</text>
+
+  <rect x="20" y="148" width="300" height="78" rx="6" fill="#fdf4ff" stroke="#9333ea" stroke-width="1.5"/>
+  <text x="170" y="168" text-anchor="middle" font-size="11" fill="#6b21a8" font-weight="700">R3 mode: Pre-loaded Routing (RL use case)</text>
+  <text x="170" y="186" text-anchor="middle" font-size="10" fill="#1e293b">Routing decisions loaded from inference engine</text>
+  <text x="170" y="202" text-anchor="middle" font-size="10" fill="#1e293b">before training step (SGLang rollout data)</text>
+  <text x="170" y="216" text-anchor="middle" font-size="9" fill="#64748b">Training exactly replicates inference routing</text>
+
+  <rect x="380" y="148" width="300" height="78" rx="6" fill="#fff7ed" stroke="#d97706" stroke-width="1.5"/>
+  <text x="530" y="168" text-anchor="middle" font-size="11" fill="#92400e" font-weight="700">RoutingReplay Buffer</text>
+  <text x="530" y="186" text-anchor="middle" font-size="10" fill="#1e293b">top_indices_list: List[Tensor]  (CPU pinned)</text>
+  <text x="530" y="202" text-anchor="middle" font-size="10" fill="#1e293b">separate forward_index / backward_index</text>
+  <text x="530" y="216" text-anchor="middle" font-size="9" fill="#64748b">@torch.compiler.disable — not JIT traceable</text>
+</svg>
+
+### Lifecycle Stages
+
+| Stage | When | What happens |
+|---|---|---|
+| `record` | Forward pass | Router runs normally; top-K indices are stored to CPU-pinned buffer |
+| `replay_forward` | Recompute in backward | Router result discarded; cached indices loaded instead |
+| `replay_backward` | Backward through replayed forward | AllToAll shapes guaranteed identical to original forward |
+
+### R3 Mode for RL (Pre-loaded Routing from SGLang)
+
+R3 also powers **rollout routing replay** for RL training. When SGLang generates rollouts, it records which experts each token was routed to during inference. xorl loads these pre-computed routing decisions so that training uses *exactly the same expert assignments as inference*, ensuring gradient-level consistency between the policy model's training and rollout steps.
+
+R3 is activated automatically when `ep_size > 1` and gradient checkpointing is enabled. No configuration is required.
+
+---
+
+## Source
+
+| File | Description |
+|---|---|
+| [`src/xorl/models/layers/moe/router.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/models/layers/moe/router.py) | `TopKRouter` — softmax, top-K, optional renormalization |
+| [`src/xorl/models/layers/moe/routing_replay.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/models/layers/moe/routing_replay.py) | `RoutingReplay` — R3 record/replay for checkpoint determinism and RL routing consistency |
+| [`src/xorl/models/layers/moe/moe_block.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/models/layers/moe/moe_block.py) | `MoEBlock` — gate linear ownership, router invocation, R3 integration |
