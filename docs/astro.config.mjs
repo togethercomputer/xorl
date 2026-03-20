@@ -2,7 +2,7 @@ import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
 
 export default defineConfig({
-  site: "https://crispy-chainsaw-r3lv91j.pages.github.io",
+  site: "https://togethercomputer.github.io/xorl-internal",
   integrations: [
     starlight({
       title: "xorl",
