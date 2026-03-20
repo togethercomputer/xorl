@@ -1,6 +1,11 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 32" fill="none">
-  <circle cx="12" cy="10" r="8" fill="#a78bfa" opacity="0.85"/>
-  <circle cx="22" cy="10" r="8" fill="#e879f9" opacity="0.85"/>
-  <circle cx="17" cy="20" r="8" fill="#fb923c" opacity="0.85"/>
-  <text x="36" y="21" font-family="system-ui,sans-serif" font-weight="700" font-size="16" fill="#1e1b4b">xorl</text>
+<svg viewBox="0 0 220 52" xmlns="http://www.w3.org/2000/svg" font-family="'Helvetica Neue', Helvetica, Arial, sans-serif">
+  <defs>
+    <linearGradient id="togetherGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#fc4c02"/>
+      <stop offset="50%" stop-color="#ef2cc1"/>
+      <stop offset="100%" stop-color="#9F7AEA"/>
+    </linearGradient>
+  </defs>
+
+  <text x="110" y="26" text-anchor="middle" dominant-baseline="central" font-size="48" font-weight="800" fill="url(#togetherGrad)" letter-spacing="4">XORL</text>
 </svg>
