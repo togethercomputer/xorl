@@ -3,6 +3,8 @@ title: "Quick Start"
 ---
 
 
+Before running, make sure xorl is installed — see the [Installation guide](/getting-started/installation/).
+
 ## Choosing a Training Mode
 
 | Mode | Use when | Entry point |

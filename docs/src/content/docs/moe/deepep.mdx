@@ -9,6 +9,7 @@ DeepEP is an NVLink-optimized expert parallelism dispatch backend. It replaces N
 - NVLink-connected GPU cluster (H100 NVLink or DGX H100)
 - `deep_ep` wheel installed (see [Installation](/getting-started/installation/))
 - `ep_dispatch: deepep` in model config
+- For internode (multi-node) EP: `nvidia_peermem` kernel module loaded and IBGDA enabled on all nodes (see below)
 
 ## Installation
 
@@ -21,6 +22,56 @@ Verify:
 import deep_ep
 print("DeepEP available")
 ```
+
+## Cluster Prerequisites (multi-node)
+
+For single-node EP (all GPUs on one machine), the wheel alone is sufficient. For multi-node EP, NVSHMEM handles inter-node RDMA communication and requires two additional steps on every node.
+
+### 1. Load `nvidia_peermem`
+
+`nvidia_peermem` bridges the NVIDIA driver and the InfiniBand stack to enable GPUDirect RDMA. Without it, NVSHMEM cannot register GPU buffers with IB HCAs and DeepEP will crash at the first dispatch with `SIGABRT` and errors like:
+
+```
+WARN: device mlx5_0 cannot allocate buffer on the specified memory type. Skipping...
+```
+
+Load it on every node:
+```bash
+sudo modprobe nvidia_peermem
+```
+
+Verify:
+```bash
+lsmod | grep nvidia_peermem
+```
+
+To persist across reboots, add it to `/etc/modules`:
+```bash
+echo nvidia_peermem | sudo tee -a /etc/modules
+```
+
+### 2. Enable IBGDA in the NVIDIA driver
+
+IBGDA allows NVSHMEM to issue RDMA operations directly from GPU SM threads without CPU involvement. Add the following to `/etc/modprobe.d/nvidia.conf` on every node:
+
+```
+options nvidia NVreg_EnableStreamMemOPs=1 NVreg_RegistryDwords="PeerMappingOverride=1;"
+```
+
+Then rebuild the initramfs and reboot:
+```bash
+sudo update-initramfs -u
+sudo reboot
+```
+
+Verify after reboot:
+```bash
+sudo cat /proc/driver/nvidia/params | grep -E "EnableStreamMemOPs|RegistryDwords"
+# EnableStreamMemOPs: 1
+# RegistryDwords: "PeerMappingOverride=1;"
+```
+
+> **Important:** `nvidia_peermem` must be reloaded after every reboot (via `/etc/modules` or `modprobe`) — the IBGDA driver settings alone do not load it automatically.
 
 ## Configuration
 
@@ -219,6 +270,19 @@ Gains are most pronounced at high EP sizes (≥ 32) where AllToAll's O(EP) stagi
 AttributeError: module 'deep_ep' has no attribute 'Buffer'
 ```
 Install the DeepEP wheel matching your CUDA version from `xorl-org/xorl-wheels`.
+
+**SIGABRT / `num_recv_tokens: -1` on all ranks:**
+```
+WARN: device mlx5_0 cannot allocate buffer on the specified memory type. Skipping...
+Global rank: 0, num_recv_tokens: -1, num_rdma_recv_tokens: -1
+```
+`nvidia_peermem` is not loaded. Run `sudo modprobe nvidia_peermem` on all nodes. See [Cluster Prerequisites](#cluster-prerequisites-multi-node).
+
+**`init failed for transport: IBGDA`:**
+IBGDA driver settings are not active. Check that `NVreg_EnableStreamMemOPs=1` and `PeerMappingOverride=1` are set in `/etc/modprobe.d/nvidia.conf`, then run `sudo update-initramfs -u` and reboot. Verify with:
+```bash
+sudo cat /proc/driver/nvidia/params | grep EnableStreamMemOPs
+```
 
 **Buffer initialization OOM:**
 Reduce `deepep_buffer_size_gb`. Check available GPU memory before the EP buffer allocation.

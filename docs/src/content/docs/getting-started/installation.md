@@ -33,16 +33,6 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-## Optional: DeepEP (NVLink-optimized MoE dispatch)
-
-DeepEP requires a separate wheel installation. Download from the [xorl-wheels releases](https://github.com/xorl-org/xorl-wheels/releases) and install:
-
-```bash
-pip install deep_ep-*.whl
-```
-
-DeepEP is only required when using `ep_dispatch: deepep` in your config. The default `ep_dispatch: alltoall` works without it.
-
 ## Key Dependencies
 
 | Package | Version | Notes |
@@ -64,13 +54,57 @@ python -c "from flash_attn.cute import flash_attn_func; print('flash_attn_4 ok')
 python -c "import deep_ep; print('deepep ok')"  # optional
 ```
 
-## Multi-node Setup
+## DeepEP Install (Optional)
 
-For multi-node training, install xorl identically on all nodes. Ensure:
-- Same Python environment and package versions on all nodes
-- Passwordless SSH between nodes (for `rl_launch.sh`)
-- NCCL visible across nodes (InfiniBand or RoCE recommended)
-- `NCCL_SOCKET_IFNAME` set to the correct network interface
+DeepEP is an NVLink-optimized MoE dispatch backend. It is only required when using `ep_dispatch: deepep` in your config — the default `ep_dispatch: alltoall` works without it. Install it from [https://github.com/deepseek-ai/DeepEP](https://github.com/deepseek-ai/DeepEP).
+
+### Multi-node prerequisites
+
+For multi-node EP, DeepEP uses NVSHMEM for inter-node RDMA. Two additional steps are required on every node.
+
+**1. Load `nvidia_peermem`**
+
+`nvidia_peermem` bridges the NVIDIA driver and the InfiniBand stack to enable GPUDirect RDMA. Without it, NVSHMEM cannot register GPU buffers with IB HCAs and DeepEP will crash with `SIGABRT` at the first dispatch.
+
+```bash
+sudo modprobe nvidia_peermem
+```
+
+Verify it is loaded:
+```bash
+lsmod | grep nvidia_peermem
+```
+
+To persist across reboots, add it to `/etc/modules`:
+```bash
+echo nvidia_peermem | sudo tee -a /etc/modules
+```
+
+**2. Enable IBGDA in the NVIDIA driver**
+
+IBGDA allows NVSHMEM to initiate RDMA transfers directly from GPU SM threads without CPU involvement. Add the following to `/etc/modprobe.d/nvidia.conf` on every node:
+
+```
+options nvidia NVreg_EnableStreamMemOPs=1 NVreg_RegistryDwords="PeerMappingOverride=1;"
+```
+
+Then rebuild the initramfs and reboot:
+
+```bash
+sudo update-initramfs -u
+sudo reboot
+```
+
+Verify the settings are active after reboot:
+```bash
+sudo cat /proc/driver/nvidia/params | grep -E "EnableStreamMemOPs|RegistryDwords"
+# Expected:
+# EnableStreamMemOPs: 1
+# RegistryDwords: "PeerMappingOverride=1;"
+```
+
+> **Note:** `nvidia_peermem` must still be loaded after reboot — it is not automatically enabled by the IBGDA driver settings.
+
 
 ## Next Steps
 
