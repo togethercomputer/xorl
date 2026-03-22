@@ -137,6 +137,8 @@ class XorlFlopsCounter:
             # qwen3 has additional RMSNorm layers for q and k.
             # RMSNorm layers have minimal impact at the MFU and can be ignored.
             "qwen3": self._estimate_qwen2_flops,
+            "xorl_qwen3_5": self._estimate_qwen3_5_flops,
+            "xorl_qwen3_5_moe": self._estimate_qwen3_5_moe_flops,
         }
 
         self.config = config
@@ -239,6 +241,133 @@ class XorlFlopsCounter:
 
         flops_all_token = dense_N_flops + attn_qkv_flops
         return flops_all_token / delta_time / 1e12
+
+    def _get_qwen3_5_layer_counts(self):
+        layer_types = getattr(self.config, "layer_types", [])
+        full_attn_layers = sum(1 for lt in layer_types if lt == "full_attention")
+        linear_attn_layers = sum(1 for lt in layer_types if lt == "linear_attention")
+        if not layer_types:
+            full_attn_layers = self.config.num_hidden_layers
+            linear_attn_layers = 0
+        return full_attn_layers, linear_attn_layers
+
+    def _estimate_qwen3_5_flops(self, tokens_sum, batch_seqlens, delta_time):
+        hidden_size = self.config.hidden_size
+        vocab_size = self.config.vocab_size
+        num_key_value_heads = self.config.num_key_value_heads
+        num_attention_heads = self.config.num_attention_heads
+        intermediate_size = self.config.intermediate_size
+
+        m = self._m
+        head_dim = getattr(self.config, "head_dim", hidden_size // num_attention_heads)
+        full_attn_layers, linear_attn_layers = self._get_qwen3_5_layer_counts()
+
+        q_size_full = num_attention_heads * head_dim * 2  # doubled for attention gate
+        k_size = num_key_value_heads * head_dim
+        v_size = num_key_value_heads * head_dim
+        o_size = num_attention_heads * head_dim
+
+        full_attn_linear_N = hidden_size * (q_size_full + k_size + v_size + o_size)
+        mlp_N = hidden_size * intermediate_size * 3
+        embed_lm_N = vocab_size * hidden_size * 2
+
+        full_attn_layer_flops = (
+            m["attn_linear"] * full_attn_linear_N * tokens_sum
+            + m["dense_mlp"] * mlp_N * tokens_sum
+        )
+
+        linear_layer_flops = 0
+        if linear_attn_layers > 0:
+            lin_key_dim = getattr(self.config, "linear_num_key_heads", num_attention_heads) * getattr(self.config, "linear_key_head_dim", 128)
+            lin_value_dim = getattr(self.config, "linear_num_value_heads", num_attention_heads) * getattr(self.config, "linear_value_head_dim", 128)
+            lin_num_v_heads = getattr(self.config, "linear_num_value_heads", num_attention_heads)
+            linear_proj_N = hidden_size * (
+                lin_key_dim          # q_proj
+                + lin_key_dim        # k_proj
+                + lin_value_dim      # v_proj
+                + lin_num_v_heads    # a_proj
+                + lin_num_v_heads    # b_proj
+                + lin_value_dim      # g_proj (gate)
+                + lin_value_dim      # o_proj
+            )
+            linear_layer_flops = (
+                m["attn_linear"] * linear_proj_N * tokens_sum
+                + m["dense_mlp"] * mlp_N * tokens_sum
+            )
+
+        dense_N_flops = (
+            full_attn_layer_flops * full_attn_layers
+            + linear_layer_flops * linear_attn_layers
+            + 6 * embed_lm_N * tokens_sum
+        )
+
+        seqlen_square_sum = sum(s * s for s in batch_seqlens)
+        attn_qkv_flops = m["attn_qkv"] * seqlen_square_sum * head_dim * num_attention_heads * full_attn_layers
+
+        return (dense_N_flops + attn_qkv_flops) / delta_time / 1e12
+
+    def _estimate_qwen3_5_moe_flops(self, tokens_sum, batch_seqlens, delta_time):
+        hidden_size = self.config.hidden_size
+        vocab_size = self.config.vocab_size
+        num_key_value_heads = self.config.num_key_value_heads
+        num_attention_heads = self.config.num_attention_heads
+        moe_intermediate_size = self.config.moe_intermediate_size
+        moe_num_expert = self.config.num_experts
+        moe_topk = self.config.num_experts_per_tok
+
+        m = self._m
+        head_dim = getattr(self.config, "head_dim", hidden_size // num_attention_heads)
+        full_attn_layers, linear_attn_layers = self._get_qwen3_5_layer_counts()
+
+        q_size_full = num_attention_heads * head_dim * 2  # doubled for attention gate
+        k_size = num_key_value_heads * head_dim
+        v_size = num_key_value_heads * head_dim
+        o_size = num_attention_heads * head_dim
+        full_attn_linear_N = hidden_size * (q_size_full + k_size + v_size + o_size)
+
+        shared_intermediate = getattr(self.config, "shared_expert_intermediate_size", self.config.intermediate_size)
+        router_N = hidden_size * moe_num_expert
+        gate_up_N = hidden_size * moe_intermediate_size * moe_topk * 2
+        down_N = hidden_size * moe_intermediate_size * moe_topk
+        shared_gate_up_N = hidden_size * shared_intermediate * 2
+        shared_down_N = hidden_size * shared_intermediate
+        shared_gate_N = hidden_size
+
+        moe_mlp_flops = (
+            m["router"] * router_N * tokens_sum
+            + m["gate"] * gate_up_N * tokens_sum
+            + m["down"] * down_N * tokens_sum
+            + m["gate"] * shared_gate_up_N * tokens_sum
+            + m["down"] * shared_down_N * tokens_sum
+            + 6 * shared_gate_N * tokens_sum
+        )
+
+        full_attn_layer_flops = m["attn_linear"] * full_attn_linear_N * tokens_sum + moe_mlp_flops
+
+        linear_layer_flops = 0
+        if linear_attn_layers > 0:
+            lin_key_dim = getattr(self.config, "linear_num_key_heads", num_attention_heads) * getattr(self.config, "linear_key_head_dim", 128)
+            lin_value_dim = getattr(self.config, "linear_num_value_heads", num_attention_heads) * getattr(self.config, "linear_value_head_dim", 128)
+            lin_num_v_heads = getattr(self.config, "linear_num_value_heads", num_attention_heads)
+            linear_proj_N = hidden_size * (
+                lin_key_dim + lin_key_dim + lin_value_dim
+                + lin_num_v_heads + lin_num_v_heads
+                + lin_value_dim + lin_value_dim
+            )
+            linear_layer_flops = m["attn_linear"] * linear_proj_N * tokens_sum + moe_mlp_flops
+
+        embed_lm_N = vocab_size * hidden_size * 2
+
+        dense_N_flops = (
+            full_attn_layer_flops * full_attn_layers
+            + linear_layer_flops * linear_attn_layers
+            + 6 * embed_lm_N * tokens_sum
+        )
+
+        seqlen_square_sum = sum(s * s for s in batch_seqlens)
+        attn_qkv_flops = m["attn_qkv"] * seqlen_square_sum * head_dim * num_attention_heads * full_attn_layers
+
+        return (dense_N_flops + attn_qkv_flops) / delta_time / 1e12
 
     def _estimate_qwen2_flops(self, tokens_sum, batch_seqlens, delta_time):
         hidden_size = self.config.hidden_size

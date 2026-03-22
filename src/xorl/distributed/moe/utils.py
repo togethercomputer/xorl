@@ -47,7 +47,8 @@ def unpermute(
     """
     tokens_weight = routing_weights.T.contiguous().masked_select(routing_map.bool())
 
-    tokens = tokens * tokens_weight.unsqueeze(-1)
+    # Weight in-place to avoid a second full-sized activation buffer during combine.
+    tokens.mul_(tokens_weight.unsqueeze(-1))
     hidden_dim = hidden_states_shape[-1]
 
     unpermuted_tokens = torch.zeros(hidden_states_shape, device=tokens.device, dtype=tokens.dtype)
