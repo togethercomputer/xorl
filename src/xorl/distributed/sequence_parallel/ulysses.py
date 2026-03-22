@@ -88,7 +88,7 @@ def _all_to_all_single(
             .contiguous()
         )
 
-    output = torch.empty_like(x)
+    output = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     comm = dist.all_to_all_single(output, x.contiguous(), group=group, async_op=async_op)
 
     if async_op:
