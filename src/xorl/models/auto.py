@@ -1,3 +1,4 @@
+import types
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union
 
 import torch
@@ -13,12 +14,44 @@ from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from .layers.attention import ATTENTION_FUNCTIONS
 from .loader import ModelLoader, get_loader
+from .transformers.qwen3_5_shared import (
+    LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE,
+    has_linear_attention_layers,
+)
 
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer, ProcessorMixin
 
 logger = logging.get_logger(__name__)
+
+
+def _namespace_from_dict(value):
+    if isinstance(value, dict):
+        return types.SimpleNamespace(**{k: _namespace_from_dict(v) for k, v in value.items()})
+    if isinstance(value, list):
+        return [_namespace_from_dict(item) for item in value]
+    return value
+
+
+def _load_local_xorl_config(
+    config_path: str,
+    config_kwargs: Dict[str, Any],
+) -> Optional["PretrainedConfig"]:
+    config_dict, _ = PretrainedConfig.get_config_dict(config_path, **config_kwargs)
+    model_type = config_dict.get("model_type")
+
+    if model_type == "qwen3_5_moe":
+        from .transformers.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
+
+        return Qwen3_5MoeConfig.from_hf_config(_namespace_from_dict(config_dict))
+
+    if model_type == "qwen3_5":
+        from .transformers.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
+
+        return Qwen3_5Config.from_hf_config(_namespace_from_dict(config_dict))
+
+    return None
 
 
 def build_tokenizer(tokenizer_path: str) -> "PreTrainedTokenizer":
@@ -95,7 +128,9 @@ def build_foundation_model(
     if isinstance(config_path, PretrainedConfig):
         config = config_path
     else:
-        config = _load_config_with_rank0_priority(config_path, config_kwargs)
+        config = _load_local_xorl_config(config_path, config_kwargs)
+        if config is None:
+            config = _load_config_with_rank0_priority(config_path, config_kwargs)
 
     if moe_implementation is not None:
         if moe_implementation not in ["eager", "triton", "native", "quack"]:
@@ -126,6 +161,11 @@ def build_foundation_model(
             "attn_implementation='sdpa' is not supported for packed sequences with sequence parallelism. "
             "Please use 'flash_attention_3' for correct cu_seqlens handling."
         )
+
+    ps = get_parallel_state()
+    if ps.ringattn_size > 1 and has_linear_attention_layers(config):
+        logger.warning_once(LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE)
+        raise ValueError(LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE)
 
     loader: ModelLoader = get_loader(config)
 

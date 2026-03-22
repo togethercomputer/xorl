@@ -926,9 +926,9 @@ class Trainer:
         hf_model_state_dict = None
         if args.train.save_hf_weights and not save_peft_adapter:
             from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
-            logger.info_rank0("Gathering full model state dict for HF checkpoint via NCCL...")
+            logger.info_rank0("Gathering full model state dict for HF checkpoint via NCCL with CPU offload...")
             hf_model_state_dict = get_model_state_dict(
-                self.model, options=StateDictOptions(full_state_dict=True)
+                self.model, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
             )
 
         del self.optimizer, self.lr_scheduler
