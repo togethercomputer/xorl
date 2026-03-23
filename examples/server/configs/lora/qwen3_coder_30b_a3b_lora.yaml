@@ -1,0 +1,68 @@
+# Server-side configuration for XORL Training Server
+# Qwen3-Coder-30B-A3B LoRA (bf16 base + LoRA rank 32)
+#
+# 8× H100: EP=8, Ulysses SP=8
+
+# ============================================================================
+# Model Configuration
+# ============================================================================
+model_path: Qwen/Qwen3-Coder-30B-A3B-Instruct
+tokenizer_path: Qwen/Qwen3-Coder-30B-A3B-Instruct
+attn_implementation: flash_attention_3  # eager, sdpa, native, flash_attention_3, flash_attention_4
+moe_implementation: quack  # eager, triton, native, quack
+
+# ============================================================================
+# Parallelism Configuration
+# ============================================================================
+data_parallel_mode: fsdp2  # ddp, fsdp, fsdp2
+expert_parallel_size: 4
+ulysses_parallel_size: 4
+data_parallel_replicate_size: 1
+data_parallel_shard_size: 1
+
+# ============================================================================
+# Memory & Performance
+# ============================================================================
+enable_mixed_precision: true
+enable_gradient_checkpointing: true
+enable_full_shard: true
+enable_activation_offload: false
+init_device: meta  # cpu, meta, cuda
+
+# ============================================================================
+# Checkpointing
+# ============================================================================
+output_dir: outputs/Qwen3-Coder-30B-A3B-server-test
+load_checkpoint_path: ""
+ckpt_manager: dcp  # torch, dcp
+
+# ============================================================================
+# Logging
+# ============================================================================
+log_level: INFO
+
+# ============================================================================
+# Worker Configuration
+# ============================================================================
+worker_connection_timeout: 60.0
+worker_max_retries: 3
+worker_bind_port: 5557
+
+# ============================================================================
+# Data Processing Configuration
+# ============================================================================
+sample_packing_sequence_len: 128000
+enable_packing: true
+
+
+# ============================================================================
+# LoRA Configuration
+# ============================================================================
+enable_lora: true
+lora_rank: 32
+lora_alpha: 32
+lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+# Skip initial checkpoint
+skip_initial_checkpoint: true
+ce_mode: compiled

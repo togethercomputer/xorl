@@ -1,0 +1,232 @@
+---
+title: "Weight Sync"
+---
+
+
+Weight sync transfers the current training model weights to one or more inference servers (e.g. SGLang) running on separate GPUs. This is the key mechanism for RL training loops where the policy model must be kept in sync between the training and inference sides.
+
+## Overview
+
+```
+Training GPUs (xorl server)
+    │  NCCL broadcast
+    ▼
+Inference GPUs (SGLang)
+```
+
+xorl's training server broadcasts weights to registered inference endpoints using NCCL. The broadcast group is initialized on the first sync call and reused for subsequent syncs.
+
+<svg viewBox="0 0 700 180" style="max-width:700px;width:100%;margin:1.5rem 0" font-family="sans-serif">
+  <defs>
+    <marker id="ws-arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#2563eb"/>
+    </marker>
+  </defs>
+  <rect width="700" height="180" fill="#f8fafc" rx="8"/>
+
+  {/* Training GPUs group */}
+  <rect x="15" y="30" width="160" height="120" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="95" y="50" text-anchor="middle" font-size="11" fill="#1e3a8a" font-weight="700">Training GPUs</text>
+  <text x="95" y="64" text-anchor="middle" font-size="9" fill="#64748b">(FSDP2 shards)</text>
+
+  {/* FSDP shard boxes */}
+  <rect x="25" y="72" width="60" height="28" rx="4" fill="#1e3a8a" stroke="#2563eb" stroke-width="1"/>
+  <text x="55" y="87" text-anchor="middle" font-size="9" fill="#fff">shard 0</text>
+  <rect x="100" y="72" width="60" height="28" rx="4" fill="#1e3a8a" stroke="#2563eb" stroke-width="1"/>
+  <text x="130" y="87" text-anchor="middle" font-size="9" fill="#fff">shard 1</text>
+
+  <rect x="25" y="110" width="60" height="28" rx="4" fill="#1e3a8a" stroke="#2563eb" stroke-width="1"/>
+  <text x="55" y="125" text-anchor="middle" font-size="9" fill="#fff">shard N-1</text>
+  <rect x="100" y="110" width="60" height="28" rx="4" fill="#1e3a8a" stroke="#2563eb" stroke-width="1"/>
+  <text x="130" y="125" text-anchor="middle" font-size="9" fill="#fff">rank 0</text>
+
+  {/* Step 1: rank 0 gather */}
+  <rect x="210" y="55" width="110" height="70" rx="6" fill="#fff" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="265" y="78" text-anchor="middle" font-size="10" fill="#1e293b" font-weight="600">rank 0 gathers</text>
+  <text x="265" y="94" text-anchor="middle" font-size="9" fill="#64748b">dequant + merge</text>
+  <text x="265" y="108" text-anchor="middle" font-size="9" fill="#64748b">LoRA (optional FP8)</text>
+
+  {/* arrow: training → gather */}
+  <line x1="175" y1="90" x2="208" y2="90" stroke="#2563eb" stroke-width="1.5" marker-end="url(#ws-arr)"/>
+
+  {/* NCCL broadcast label */}
+  <rect x="355" y="55" width="110" height="70" rx="6" fill="#1e3a8a" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="410" y="78" text-anchor="middle" font-size="11" fill="#fff" font-weight="600">NCCL</text>
+  <text x="410" y="94" text-anchor="middle" font-size="11" fill="#fff" font-weight="600">broadcast</text>
+  <text x="410" y="110" text-anchor="middle" font-size="9" fill="#dbeafe">bucket loop</text>
+
+  {/* arrow: gather → broadcast */}
+  <line x1="320" y1="90" x2="353" y2="90" stroke="#2563eb" stroke-width="1.5" marker-end="url(#ws-arr)"/>
+
+  {/* Inference GPUs group */}
+  <rect x="500" y="30" width="185" height="120" rx="8" fill="#dcfce7" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="592" y="50" text-anchor="middle" font-size="11" fill="#15803d" font-weight="700">Inference GPUs</text>
+  <text x="592" y="64" text-anchor="middle" font-size="9" fill="#64748b">(SGLang, TP replicas)</text>
+
+  <rect x="510" y="72" width="55" height="28" rx="4" fill="#16a34a" stroke="#15803d" stroke-width="1"/>
+  <text x="537" y="87" text-anchor="middle" font-size="9" fill="#fff">infer 0</text>
+  <rect x="575" y="72" width="55" height="28" rx="4" fill="#16a34a" stroke="#15803d" stroke-width="1"/>
+  <text x="602" y="87" text-anchor="middle" font-size="9" fill="#fff">infer 1</text>
+  <rect x="640" y="72" width="35" height="28" rx="4" fill="#16a34a" stroke="#15803d" stroke-width="1"/>
+  <text x="657" y="87" text-anchor="middle" font-size="9" fill="#fff">…</text>
+
+  <rect x="510" y="110" width="55" height="28" rx="4" fill="#16a34a" stroke="#15803d" stroke-width="1"/>
+  <text x="537" y="125" text-anchor="middle" font-size="9" fill="#fff">infer N</text>
+
+  {/* arrow: broadcast → inference */}
+  <line x1="465" y1="90" x2="498" y2="90" stroke="#2563eb" stroke-width="1.5" marker-end="url(#ws-arr)"/>
+
+  {/* bottom label */}
+  <text x="350" y="168" text-anchor="middle" font-size="9" fill="#64748b">Sequential per-module: FSDP all-gather → dequant/merge LoRA → optional FP8 → broadcast</text>
+</svg>
+
+## Registering Inference Endpoints
+
+Before syncing, register the inference server's address with xorl:
+
+```http
+POST /api/v1/add_inference_endpoint
+```
+```json
+{"host": "inference-node-01", "port": 30000, "world_size": 8}
+```
+
+Multiple endpoints can be registered (e.g. for multi-replica inference):
+```python
+for host, port in inference_servers:
+    requests.post(f"{base_url}/api/v1/add_inference_endpoint", json={
+        "host": host, "port": port, "world_size": 8
+    })
+```
+
+Endpoints are deduplicated by `(host, port)` — registering the same endpoint twice is safe.
+
+## Triggering a Sync
+
+```http
+POST /api/v1/sync_inference_weights
+POST /sync_inference_weights          # shorthand alias
+```
+
+```json
+{
+  "master_address": "training-node-01",
+  "master_port": 29600,
+  "group_name": "sync_group_0",
+  "buffer_size_mb": 512
+}
+```
+
+| Field | Description |
+|---|---|
+| `master_address` | IP of the training head node (used for NCCL rendezvous) |
+| `master_port` | Free port for the NCCL sync group initialization |
+| `group_name` | Unique name for the NCCL process group (use different names for different inference clusters) |
+| `buffer_size_mb` | NCCL broadcast buffer size per chunk |
+
+The sync is synchronous from the caller's perspective — the endpoint returns once all inference servers have received the weights.
+
+## Sync in RL Training Loop
+
+```python
+# Every N RL steps, sync weights to inference
+if rl_step % sync_every == 0:
+    training_client.sync_weights(
+        master_address=TRAINING_HEAD_IP,
+        master_port=29600,
+        group_name="policy_sync",
+    )
+    # Now SGLang is serving the latest policy weights
+```
+
+## Quantization During Sync
+
+Optionally quantize weights during the sync to reduce transfer bandwidth and match inference precision:
+
+```http
+POST /api/v1/set_sync_quantization
+```
+```json
+{
+  "quantization": "fp8",      // "bf16" (no quant) or "fp8"
+  "skip_modules": ["lm_head", "embed_tokens"]
+}
+```
+
+With FP8 quantization, weights are quantized (BF16 → FP8 E4M3) on the training side before broadcasting, then dequantized on the inference side. This halves the sync bandwidth but introduces a small precision loss.
+
+## Sync with LoRA
+
+For LoRA training, the sync merges LoRA weights into the base model before broadcasting:
+- `W_full = W_base + lora_B @ lora_A × scaling`
+- The merged BF16 weight is sent to inference
+
+The base weights on the training side are **not modified** — LoRA parameters remain separate for continued training.
+
+## Sync with QLoRA
+
+For QLoRA, the sync dequantizes and merges:
+- `W_full = dequant(W_packed) + correction_U @ correction_B + lora_B @ lora_A × scaling`
+- Optionally re-quantizes to FP8 for transfer
+
+## Removing Inference Endpoints
+
+```http
+POST /api/v1/remove_inference_endpoint
+{"host": "inference-node-01", "port": 30000}
+```
+
+## Sleep / Wake Pattern
+
+When the training server needs all GPU memory (e.g. for a large training step), put inference servers to sleep:
+
+```python
+# Free inference GPU memory
+requests.post(f"{inference_url}/sleep")
+
+# Do training
+for _ in range(n_steps):
+    training_client.forward_backward(...)
+    training_client.optim_step(...)
+
+# Sync and resume inference
+training_client.sync_weights(...)
+requests.post(f"{inference_url}/wake_up")
+```
+
+## Architecture Details
+
+The sync handler (`server/weight_sync/handler.py`) proceeds in order:
+
+1. **Health check**: Verify all inference endpoints are reachable
+2. **Backend init**: Initialize NCCL broadcast group between training + inference ranks
+3. **Per-module transfer** (sequential across PP stages if PP > 1):
+   - FSDP2 all-gather to reconstruct full parameter on rank 0
+   - QLoRA dequantize + LoRA merge
+   - Optional FP8 requantization
+   - NCCL broadcast to all inference ranks
+4. **Resume inference**: Signal inference servers to resume
+
+### Multi-PP Support
+
+For PP-sharded training, each PP stage's parameters are synced independently in sequence. All PP ranks that hold a given layer participate in the broadcast for that layer.
+
+### EP Support
+
+Expert-parallel models: EP ranks send their expert shards directly without gathering to rank 0 first (`supports_direct_ep_transfer: true`).
+
+## Benchmark: Qwen3-235B on 8 Nodes
+
+| Config | Sync time | Transfer size |
+|---|---|---|
+| BF16, 64 training GPUs → 8 inference GPUs | ~73s | ~471 GB |
+| FP8, same topology | ~40s | ~236 GB |
+
+With NVLink: ~22 GB/s effective bandwidth per sync.
+
+## Source
+
+| File | Description |
+|---|---|
+| [`src/xorl/server/weight_sync/handler.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/weight_sync/handler.py) | `WeightSyncHandler` — orchestrates the full sync pipeline |
+| [`src/xorl/server/weight_sync/backends/`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/weight_sync/backends/) | Transport backend implementations |

@@ -1,0 +1,197 @@
+---
+title: "LoRA"
+---
+
+For MoE-specific LoRA (expert weight layout, EP sharding), see [MoE LoRA](/moe/lora/).
+
+LoRA (Low-Rank Adaptation) freezes the base model weights and adds trainable low-rank matrices to selected linear layers. xorl implements FSDP2-compatible LoRA for both local and server training.
+
+## How LoRA works
+
+For a linear layer with weight matrix **W₀** ∈ ℝ^(d×k), LoRA adds a trainable bypass:
+
+**W = W₀ + B · A**   where **A** ∈ ℝ^(r×k), **B** ∈ ℝ^(d×r), and r ≪ min(d, k)
+
+**W₀** is frozen. Only **A** and **B** are updated during training. The output scaling is `lora_alpha / r`.
+
+<svg viewBox="0 0 700 200" xmlns="http://www.w3.org/2000/svg" style="max-width:700px;width:100%;margin:1.5rem 0">
+  <defs>
+    <marker id="lora-arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#2563eb"/>
+    </marker>
+    <marker id="lora-arrow-gray" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+  <rect width="700" height="200" fill="#f8fafc" rx="8"/>
+  <text x="350" y="24" text-anchor="middle" font-size="13" font-weight="600" fill="#1e293b" font-family="sans-serif">LoRA Weight Decomposition: W = W₀ + B·A</text>
+
+
+  <rect x="20" y="78" width="55" height="36" rx="4" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="47" y="101" text-anchor="middle" font-size="13" fill="#1e3a8a" font-family="sans-serif" font-weight="600">x</text>
+
+
+  <line x1="75" y1="96" x2="100" y2="96" stroke="#2563eb" stroke-width="1.5" marker-end="url(#lora-arrow)"/>
+
+
+  <circle cx="105" cy="96" r="4" fill="#2563eb"/>
+
+
+  <line x1="105" y1="96" x2="105" y2="70" stroke="#94a3b8" stroke-width="1.5"/>
+  <line x1="105" y1="70" x2="190" y2="70" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#lora-arrow-gray)"/>
+  <rect x="190" y="54" width="110" height="36" rx="4" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <text x="245" y="72" text-anchor="middle" font-size="12" font-weight="700" fill="#64748b" font-family="sans-serif">W₀  (frozen)</text>
+  <text x="245" y="84" text-anchor="middle" font-size="9" fill="#94a3b8" font-family="sans-serif">d×k  · no gradient</text>
+  <line x1="300" y1="72" x2="390" y2="72" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#lora-arrow-gray)"/>
+
+
+  <line x1="105" y1="96" x2="105" y2="128" stroke="#2563eb" stroke-width="1.5"/>
+  <line x1="105" y1="128" x2="190" y2="128" stroke="#2563eb" stroke-width="1.5" marker-end="url(#lora-arrow)"/>
+
+  <rect x="190" y="112" width="80" height="36" rx="4" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+  <text x="230" y="130" text-anchor="middle" font-size="14" font-weight="700" fill="#2563eb" font-family="sans-serif">A</text>
+  <text x="230" y="143" text-anchor="middle" font-size="9" fill="#3b82f6" font-family="sans-serif">r×k  ← Kaiming</text>
+
+  <line x1="270" y1="128" x2="310" y2="128" stroke="#2563eb" stroke-width="1.5" marker-end="url(#lora-arrow)"/>
+
+  <rect x="310" y="112" width="80" height="36" rx="4" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+  <text x="350" y="130" text-anchor="middle" font-size="14" font-weight="700" fill="#2563eb" font-family="sans-serif">B</text>
+  <text x="350" y="143" text-anchor="middle" font-size="9" fill="#3b82f6" font-family="sans-serif">d×r  ← zeros</text>
+
+  <line x1="390" y1="128" x2="430" y2="128" stroke="#2563eb" stroke-width="1.5" marker-end="url(#lora-arrow)"/>
+
+
+  <rect x="430" y="112" width="90" height="36" rx="4" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="475" y="128" text-anchor="middle" font-size="10" fill="#1e3a8a" font-family="sans-serif">× (α/r)</text>
+  <text x="475" y="142" text-anchor="middle" font-size="9" fill="#64748b" font-family="sans-serif">lora_alpha/rank</text>
+
+  <line x1="520" y1="128" x2="550" y2="128" stroke="#2563eb" stroke-width="1.5" marker-end="url(#lora-arrow)"/>
+
+
+  <circle cx="560" cy="96" r="14" fill="white" stroke="#2563eb" stroke-width="2"/>
+  <text x="560" y="101" text-anchor="middle" font-size="16" fill="#2563eb" font-family="sans-serif">+</text>
+
+  <line x1="550" y1="128" x2="550" y2="96" stroke="#2563eb" stroke-width="1.5"/>
+  <line x1="390" y1="72" x2="560" y2="72" stroke="#94a3b8" stroke-width="1.5"/>
+  <line x1="560" y1="72" x2="560" y2="82" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#lora-arrow-gray)"/>
+
+
+  <line x1="574" y1="96" x2="610" y2="96" stroke="#2563eb" stroke-width="1.5" marker-end="url(#lora-arrow)"/>
+  <rect x="610" y="78" width="72" height="36" rx="4" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="646" y="101" text-anchor="middle" font-size="12" fill="#1e3a8a" font-family="sans-serif">W·x</text>
+
+
+  <text x="350" y="180" text-anchor="middle" font-size="10" fill="#64748b" font-family="sans-serif">B initialized to zeros → ΔW = 0 at start of training. Training starts from the exact pretrained model behavior.</text>
+</svg>
+
+**A** is initialized with Kaiming uniform, **B** with zeros — so the initial LoRA output is exactly zero and training starts from the pretrained model's behavior.
+
+## Basic Configuration
+
+Add a `lora` section to your config:
+
+```yaml
+lora:
+  enable_lora: true
+  lora_rank: 16
+  lora_alpha: 32             # scaling = lora_alpha / lora_rank = 2.0
+  lora_target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  save_lora_only: true       # checkpoint only LoRA weights, not base model
+```
+
+For QKV-fused models (default `merge_qkv: true`), target the fused projection names:
+```yaml
+  lora_target_modules: [qkv_proj, gate_up_proj, down_proj, o_proj]
+```
+
+## Key Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `enable_lora` | `false` | Enable LoRA injection |
+| `lora_rank` | `16` | Rank r of the low-rank decomposition |
+| `lora_alpha` | `32` | Scaling factor; effective LR scale = alpha/rank |
+| `lora_target_modules` | `null` | List of module name patterns to inject LoRA into |
+| `save_lora_only` | `false` | Save only LoRA weights in checkpoints |
+
+## LoRA with MoE Models
+
+For MoE models, you can target expert layers as well. Expert LoRA uses fused group GEMM for efficiency:
+
+```yaml
+lora:
+  enable_lora: true
+  lora_rank: 16
+  lora_alpha: 32
+  lora_target_modules: [qkv_proj, gate_up_proj, down_proj, o_proj]
+  # Expert layers are included automatically when targeting gate_up_proj/down_proj
+```
+
+## Checkpoint Behavior
+
+With `save_lora_only: true`, only the LoRA adapter weights are saved. The base model must be available separately to reconstruct the full model.
+
+Checkpoint structure:
+```
+outputs/my_run/weights/{run_id}/step_{N}/
+├── adapter_config.json
+├── adapter_model.safetensors   # LoRA weights only
+└── training_state/             # optimizer, scheduler, rng state
+```
+
+Compatible with the HF PEFT adapter format for easy loading:
+```python
+from peft import PeftModel
+model = PeftModel.from_pretrained(base_model, "outputs/my_run/weights/.../step_42")
+```
+
+## Periodic Merge (ReLoRA)
+
+For long training runs, periodically merge LoRA into the base weights and restart with fresh LoRA parameters. This avoids rank saturation and allows the effective rank to grow over training.
+
+For QLoRA, see [QLoRA — Periodic Merge](/adapters/qlora/#periodic-merge-relora).
+
+## LoRA in Server Training
+
+In server training, LoRA is configured in the server YAML:
+```yaml
+enable_lora: true
+lora_rank: 16
+lora_alpha: 32
+```
+
+The server supports multiple named adapters for multi-task or multi-policy training. Specify a `model_id` per request to route to a specific adapter:
+
+```json
+{
+  "batches": [...],
+  "loss_fn": "causallm_loss",
+  "model_id": "policy_v1"
+}
+```
+
+Save a specific adapter:
+```http
+POST /api/v1/save_weights
+{"path": "outputs/adapters/policy_v1", "model_id": "policy_v1"}
+```
+
+## Example Configs
+
+See `examples/local/dummy/configs/lora/` and `examples/server/configs/lora/` for complete LoRA configs across model sizes.
+
+## Source
+
+| File | Description |
+|---|---|
+| [`src/xorl/lora/modules/base.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/lora/modules/base.py) | `LoraModule` abstract base — defines `r`, `lora_alpha`, `scaling`, and `from_module()` factory |
+| [`src/xorl/lora/modules/linear.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/lora/modules/linear.py) | `LoraLinear` — LoRA for `nn.Linear`; A (Kaiming), B (zeros), forward with scaling |
+| [`src/xorl/lora/mapping.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/lora/mapping.py) | `LORA_MAPPING` registry and `get_lora_class_for_module()` lookup |
+| [`src/xorl/models/layers/moe/lora.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/models/layers/moe/lora.py) | `MoEExpertsLoRA` — LoRA for fused expert tensors `[E, I, H]` |

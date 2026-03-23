@@ -1,0 +1,78 @@
+:root {
+  --sl-color-accent-low: #dbeafe;
+  --sl-color-accent: #2563eb;
+  --sl-color-accent-high: #1e3a8a;
+}
+
+/* Force light mode colors regardless of system preference */
+:root[data-theme="dark"] {
+  --sl-color-accent-low: #dbeafe;
+  --sl-color-accent: #2563eb;
+  --sl-color-accent-high: #1e3a8a;
+
+  --sl-color-white: #ffffff;
+  --sl-color-gray-1: #f8f8f8;
+  --sl-color-gray-2: #e8e8e8;
+  --sl-color-gray-3: #c2c2c2;
+  --sl-color-gray-4: #8a8a8a;
+  --sl-color-gray-5: #585858;
+  --sl-color-gray-6: #2a2a2a;
+  --sl-color-black: #181818;
+
+  color-scheme: light;
+}
+
+/* Hide the dark mode toggle */
+starlight-theme-select {
+  display: none;
+}
+
+/* Hero title gradient */
+.hero h1 {
+  font-size: clamp(2.5rem, 6vw, 4.5rem);
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  background: linear-gradient(135deg, #1e3a8a 0%, #2563eb 50%, #60a5fa 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* Hero tagline */
+.hero .tagline {
+  font-size: 1.15rem;
+  color: var(--sl-color-gray-3);
+  letter-spacing: 0.01em;
+}
+
+/* Reduce hero vertical padding — default goes up to 10rem which is excessive */
+@media (min-width: 50rem) {
+  .hero {
+    padding-block: clamp(1.5rem, 4vmin, 3.5rem) !important;
+  }
+}
+
+/* Tighten content panels on splash page */
+[data-template="splash"] .content-panel {
+  padding-block: 1rem;
+}
+
+/* Tighten gaps between stacked elements inside content panels */
+[data-template="splash"] .sl-container > * + * {
+  margin-top: 0.75rem;
+}
+
+/* Reduce h2 top margin on splash page */
+[data-template="splash"] .sl-markdown-content h2 {
+  margin-top: 0.5rem;
+}
+
+/* Intro paragraph: compact, centered, muted */
+[data-template="splash"] .sl-markdown-content > p:first-child {
+  margin-block: 0.25rem 0;
+  color: var(--sl-color-gray-3);
+  font-size: 1rem;
+  max-width: 48rem;
+  margin-inline: auto;
+  text-align: center;
+}

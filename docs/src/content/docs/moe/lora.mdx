@@ -1,0 +1,113 @@
+---
+title: "LoRA & QLoRA on Experts"
+---
+
+xorl supports LoRA adapters on fused expert weight tensors via `MoEExpertsLoRA` ([`src/xorl/models/layers/moe/lora.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/models/layers/moe/lora.py)). Base weights are frozen; low-rank adapters are trained in GKN layout, matching the sharding of the underlying expert tensors.
+
+For each expert `e` and projection `p ∈ {gate, up, down}`:
+
+```
+W_eff[e] = W[e] + scale × (lora_B[e] @ lora_A[e])
+   where scale = lora_alpha / r
+```
+
+---
+
+## Adapter Shapes
+
+Adapters follow GKN layout:
+
+| Projection | `lora_A` shape | `lora_B` shape |
+|---|---|---|
+| `gate_proj` | `[E, H, r]` | `[E, r, I]` |
+| `up_proj` | `[E, H, r]` | `[E, r, I]` |
+| `down_proj` | `[E, I, r]` | `[E, r, H]` |
+
+Where `E` = num_experts, `r` = lora_rank, `H` = hidden_size, `I` = intermediate_size.
+
+---
+
+## EP Sharding
+
+Both adapter tensors shard along dim 0 (E) identically to base weights. An EP rank holds `[E/ep_size, r, K]` (lora_A) and `[E/ep_size, N, r]` (lora_B). No extra collective is required — adapter compute is entirely local after dispatch.
+
+---
+
+## Hybrid Shared LoRA
+
+Hybrid shared LoRA (`moe_hybrid_shared_lora: true`) reduces parameter count by sharing one adapter matrix across experts while keeping the other per-expert:
+
+| Projection | `lora_A` | `lora_B` | Rationale |
+|---|---|---|---|
+| `gate_proj`, `up_proj` | `[1, r, H]` — shared | `[E, I, r]` — per-expert | Input space is shared; expert specialization lives in the output |
+| `down_proj` | `[E, r, I]` — per-expert | `[1, H, r]` — shared | Expert specialization lives in the input; shared output projection |
+
+This halves the LoRA parameter count while keeping per-expert expressiveness where it matters most.
+
+```yaml
+# Server training config
+moe_shared_lora: false          # no sharing
+moe_hybrid_shared_lora: true    # hybrid shared (recommended for large E)
+```
+
+---
+
+## Config Examples
+
+**Standard LoRA on experts:**
+
+```yaml
+lora:
+  enable_lora: true
+  lora_rank: 16
+  lora_alpha: 32
+  lora_target_modules: [qkv_proj, gate_up_proj, down_proj, o_proj]
+```
+
+**Hybrid shared LoRA (server training):**
+
+```yaml
+lora:
+  enable_lora: true
+  lora_rank: 16
+  lora_alpha: 32
+  lora_target_modules: [gate_up_proj, down_proj]
+
+moe_hybrid_shared_lora: true
+```
+
+Expert LoRA adapters are checkpointed with the same EP-sharded layout. Use `save_lora_only: true` to checkpoint only adapter weights.
+
+---
+
+## QLoRA on Expert Weights
+
+Expert weights support all quantization formats via `QLoRAMoeExperts`. The fused `[E, K, N]` tensor is quantized as a unit:
+
+```yaml
+lora:
+  enable_qlora: true
+  quant_format: nvfp4       # or block_fp8, nf4
+  lora_rank: 16
+  lora_target_modules: [gate_up_proj, down_proj]
+```
+
+Expert loading uses `maybe_load_and_quantize_moe_qlora()` which handles EP-sharded expert tensors — each rank quantizes only its local `[E/ep_size, K, N]` shard. This makes QLoRA memory cost proportional to the EP size.
+
+**Supported quant formats on expert tensors:**
+
+| Format | Bits | Notes |
+|---|---|---|
+| `nf4` | 4-bit | NormalFloat4; bitsandbytes-compatible |
+| `block_fp8` | 8-bit | Block-wise FP8; good throughput on H100 |
+| `nvfp4` | 4-bit | NVIDIA FP4 (Hopper); requires Transformer Engine |
+
+---
+
+## Source
+
+| File | Description |
+|---|---|
+| [`src/xorl/models/layers/moe/lora.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/models/layers/moe/lora.py) | `MoEExpertsLoRA` — per-expert LoRA with hybrid shared option |
+| [`src/xorl/lora/modules/base.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/lora/modules/base.py) | Base LoRA module; adapter init and merge logic |
+| [`src/xorl/qlora/`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/qlora/) | `QLoRAMoeExperts` — quantized expert weights with LoRA adapters |
