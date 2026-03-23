@@ -2,7 +2,8 @@ import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
 
 export default defineConfig({
-  site: "https://togethercomputer.github.io/xorl",
+  site: "https://togethercomputer.github.io",
+  base: "/xorl",
   integrations: [
     starlight({
       title: "xorl",
