@@ -89,7 +89,7 @@ model:
 
 ## Triton Grouped GEMM Details
 
-The core of the `triton` backend is [`src/xorl/ops/group_gemm/kernel/group_gemm.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/ops/group_gemm/kernel/group_gemm.py). The primary kernel `group_gemm_same_nk_kernel` handles the case where all experts share the same K (input) and N (output) dimensions.
+The core of the `triton` backend is [`src/xorl/ops/group_gemm/kernel/group_gemm.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/group_gemm/kernel/group_gemm.py). The primary kernel `group_gemm_same_nk_kernel` handles the case where all experts share the same K (input) and N (output) dimensions.
 
 **Inputs and outputs:**
 
@@ -211,10 +211,10 @@ train:
 
 | File | Description |
 |---|---|
-| [`src/xorl/models/layers/moe/experts.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/models/layers/moe/experts.py) | `MoEExperts` — GKN weight tensors, backend dispatch, EP forward, moe_act |
-| [`src/xorl/ops/group_gemm/kernel/group_gemm.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/ops/group_gemm/kernel/group_gemm.py) | `group_gemm_same_nk_kernel` — Triton autotuned grouped GEMM with optional STORE_ACTIVATIONS |
-| [`src/xorl/ops/__init__.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/ops/__init__.py) | `triton_moe_forward`, `triton_moe_lora_forward`, backend registry |
-| [`src/xorl/ops/group_gemm/kernel/quack.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/ops/group_gemm/kernel/quack.py) | `quack_group_gemm_same_nk` — CuTe GEMM wrapper; `XORL_QUACK_TUNED` env var |
-| [`src/xorl/ops/quack/gemm_interface.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/ops/quack/gemm_interface.py) | Quack GEMM interface — SM90/SM100 configs, autotuner, gated activation kernels |
-| [`src/xorl/models/layers/moe/backend/quack.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/models/layers/moe/backend/quack.py) | `quack_expert_forward` — non-EP quack MoE forward |
-| [`src/xorl/ops/moe/quack.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/ops/moe/quack.py) | `QuackEPGroupGemm`, `QuackEPGroupGemmMoeAct` — EP + moe_act variants |
+| [`src/xorl/models/layers/moe/experts.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/models/layers/moe/experts.py) | `MoEExperts` — GKN weight tensors, backend dispatch, EP forward, moe_act |
+| [`src/xorl/ops/group_gemm/kernel/group_gemm.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/group_gemm/kernel/group_gemm.py) | `group_gemm_same_nk_kernel` — Triton autotuned grouped GEMM with optional STORE_ACTIVATIONS |
+| [`src/xorl/ops/__init__.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/__init__.py) | `triton_moe_forward`, `triton_moe_lora_forward`, backend registry |
+| [`src/xorl/ops/group_gemm/kernel/quack.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/group_gemm/kernel/quack.py) | `quack_group_gemm_same_nk` — CuTe GEMM wrapper; `XORL_QUACK_TUNED` env var |
+| [`src/xorl/ops/quack/gemm_interface.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/quack/gemm_interface.py) | Quack GEMM interface — SM90/SM100 configs, autotuner, gated activation kernels |
+| [`src/xorl/models/layers/moe/backend/quack.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/models/layers/moe/backend/quack.py) | `quack_expert_forward` — non-EP quack MoE forward |
+| [`src/xorl/ops/moe/quack.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/moe/quack.py) | `QuackEPGroupGemm`, `QuackEPGroupGemmMoeAct` — EP + moe_act variants |

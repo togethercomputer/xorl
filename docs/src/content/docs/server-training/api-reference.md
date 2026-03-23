@@ -68,5 +68,5 @@ All endpoints are served at `http://<host>:<port>/`. Training operations use a t
 
 | File | Description |
 |---|---|
-| [`src/xorl/server/api_server/endpoints.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/api_server/endpoints.py) | All FastAPI endpoint handlers |
-| [`src/xorl/server/api_server/api_types.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/api_server/api_types.py) | Pydantic request/response models |
+| [`src/xorl/server/api_server/endpoints.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/server/api_server/endpoints.py) | All FastAPI endpoint handlers |
+| [`src/xorl/server/api_server/api_types.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/server/api_server/api_types.py) | Pydantic request/response models |

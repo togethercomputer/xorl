@@ -677,6 +677,6 @@ For Qwen3-MoE models, the TP plan covers attention and dense MLP layers only. Ex
 
 | File | Description |
 |---|---|
-| [`src/xorl/distributed/torch_parallelize.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/distributed/torch_parallelize.py) | `build_parallelize_model`, TP + FSDP2 ordering, `_build_tp_plan` |
-| [`src/xorl/distributed/parallel_state.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/distributed/parallel_state.py) | `tp_mesh`, `tp_group`, device mesh construction |
-| [`src/xorl/models/transformers/qwen3/parallelize.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/models/transformers/qwen3/parallelize.py) | Qwen3 TP plan (`ColwiseParallel`, `RowwiseParallel` assignments) |
+| [`src/xorl/distributed/torch_parallelize.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/distributed/torch_parallelize.py) | `build_parallelize_model`, TP + FSDP2 ordering, `_build_tp_plan` |
+| [`src/xorl/distributed/parallel_state.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/distributed/parallel_state.py) | `tp_mesh`, `tp_group`, device mesh construction |
+| [`src/xorl/models/transformers/qwen3/parallelize.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/models/transformers/qwen3/parallelize.py) | Qwen3 TP plan (`ColwiseParallel`, `RowwiseParallel` assignments) |

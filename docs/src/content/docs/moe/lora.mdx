@@ -2,7 +2,7 @@
 title: "LoRA & QLoRA on Experts"
 ---
 
-xorl supports LoRA adapters on fused expert weight tensors via `MoEExpertsLoRA` ([`src/xorl/models/layers/moe/lora.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/models/layers/moe/lora.py)). Base weights are frozen; low-rank adapters are trained in GKN layout, matching the sharding of the underlying expert tensors.
+xorl supports LoRA adapters on fused expert weight tensors via `MoEExpertsLoRA` ([`src/xorl/models/layers/moe/lora.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/models/layers/moe/lora.py)). Base weights are frozen; low-rank adapters are trained in GKN layout, matching the sharding of the underlying expert tensors.
 
 For each expert `e` and projection `p ∈ {gate, up, down}`:
 
@@ -108,6 +108,6 @@ Expert loading uses `maybe_load_and_quantize_moe_qlora()` which handles EP-shard
 
 | File | Description |
 |---|---|
-| [`src/xorl/models/layers/moe/lora.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/models/layers/moe/lora.py) | `MoEExpertsLoRA` — per-expert LoRA with hybrid shared option |
-| [`src/xorl/lora/modules/base.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/lora/modules/base.py) | Base LoRA module; adapter init and merge logic |
-| [`src/xorl/qlora/`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/qlora/) | `QLoRAMoeExperts` — quantized expert weights with LoRA adapters |
+| [`src/xorl/models/layers/moe/lora.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/models/layers/moe/lora.py) | `MoEExpertsLoRA` — per-expert LoRA with hybrid shared option |
+| [`src/xorl/lora/modules/base.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/lora/modules/base.py) | Base LoRA module; adapter init and merge logic |
+| [`src/xorl/qlora/`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/qlora/) | `QLoRAMoeExperts` — quantized expert weights with LoRA adapters |

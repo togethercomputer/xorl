@@ -58,12 +58,12 @@ Docs are deployed automatically to GitHub Pages when changes under `docs/` are p
 To trigger a deployment manually without pushing a new commit:
 
 ```bash
-gh workflow run docs.yml --repo togethercomputer/xorl-internal --ref qingyang/docs
+gh workflow run docs.yml --repo togethercomputer/xorl --ref qingyang/docs
 ```
 
 To watch the deployment progress:
 
 ```bash
-gh run list --repo togethercomputer/xorl-internal --workflow=docs.yml --limit=1
-gh run watch <run-id> --repo togethercomputer/xorl-internal
+gh run list --repo togethercomputer/xorl --workflow=docs.yml --limit=1
+gh run watch <run-id> --repo togethercomputer/xorl
 ```

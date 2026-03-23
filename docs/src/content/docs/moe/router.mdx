@@ -2,7 +2,7 @@
 title: "MoE Router"
 ---
 
-The `TopKRouter` ([`src/xorl/models/layers/moe/router.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/models/layers/moe/router.py)) is **stateless** — it owns no parameters. The gate linear (`nn.Linear(hidden_size, num_experts, bias=False)`) lives on `MoEBlock` so that the checkpoint path resolves to `mlp.gate.weight`, matching HuggingFace conventions.
+The `TopKRouter` ([`src/xorl/models/layers/moe/router.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/models/layers/moe/router.py)) is **stateless** — it owns no parameters. The gate linear (`nn.Linear(hidden_size, num_experts, bias=False)`) lives on `MoEBlock` so that the checkpoint path resolves to `mlp.gate.weight`, matching HuggingFace conventions.
 
 ---
 
@@ -110,6 +110,6 @@ R3 is activated automatically when `ep_size > 1` and gradient checkpointing is e
 
 | File | Description |
 |---|---|
-| [`src/xorl/models/layers/moe/router.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/models/layers/moe/router.py) | `TopKRouter` — softmax, top-K, optional renormalization |
-| [`src/xorl/models/layers/moe/routing_replay.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/models/layers/moe/routing_replay.py) | `RoutingReplay` — R3 record/replay for checkpoint determinism and RL routing consistency |
-| [`src/xorl/models/layers/moe/moe_block.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/models/layers/moe/moe_block.py) | `MoEBlock` — gate linear ownership, router invocation, R3 integration |
+| [`src/xorl/models/layers/moe/router.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/models/layers/moe/router.py) | `TopKRouter` — softmax, top-K, optional renormalization |
+| [`src/xorl/models/layers/moe/routing_replay.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/models/layers/moe/routing_replay.py) | `RoutingReplay` — R3 record/replay for checkpoint determinism and RL routing consistency |
+| [`src/xorl/models/layers/moe/moe_block.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/models/layers/moe/moe_block.py) | `MoEBlock` — gate linear ownership, router invocation, R3 integration |

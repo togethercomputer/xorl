@@ -19,8 +19,8 @@ title: "Installation"
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Clone and install
-git clone https://github.com/togethercomputer/xorl-internal
-cd xorl-internal
+git clone https://github.com/togethercomputer/xorl
+cd xorl
 uv sync
 source .venv/bin/activate
 ```
