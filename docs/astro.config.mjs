@@ -2,7 +2,7 @@ import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
 
 export default defineConfig({
-  site: "https://togethercomputer.github.io/xorl-internal",
+  site: "https://togethercomputer.github.io/xorl",
   integrations: [
     starlight({
       title: "xorl",
@@ -14,7 +14,7 @@ export default defineConfig({
         replacesTitle: true,
       },
       social: [
-        { icon: "github", label: "GitHub", href: "https://github.com/togethercomputer/xorl-internal" },
+        { icon: "github", label: "GitHub", href: "https://github.com/togethercomputer/xorl" },
       ],
       customCss: ["./src/styles/custom.css"],
       sidebar: [
