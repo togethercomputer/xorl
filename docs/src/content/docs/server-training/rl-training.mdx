@@ -161,7 +161,7 @@ for step in range(num_steps):
 
 ### PPO Policy Loss
 
-Full PPO-style clipped policy gradient loss ([`src/xorl/ops/loss/policy_loss.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/ops/loss/policy_loss.py)):
+Full PPO-style clipped policy gradient loss ([`src/xorl/ops/loss/policy_loss.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/loss/policy_loss.py)):
 
 ```
 ratio = exp(new_logprobs - old_logprobs)
@@ -199,7 +199,7 @@ fwd = training.forward_backward(data, loss_fn="policy_loss", loss_fn_params={
 
 ### GRPO / Importance Sampling Loss
 
-Simpler importance-sampling loss for GRPO-style training ([`src/xorl/ops/loss/importance_sampling_loss.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/ops/loss/importance_sampling_loss.py)):
+Simpler importance-sampling loss for GRPO-style training ([`src/xorl/ops/loss/importance_sampling_loss.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/loss/importance_sampling_loss.py)):
 
 ```
 ratio = exp(new_logprobs - old_logprobs)

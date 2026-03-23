@@ -178,7 +178,7 @@ communication volume proportional to `S × H × D`. Critically, **Ulysses commun
 cost does not grow with sequence length relative to compute** — both compute (O(S²H))
 and communication (O(S×H)) scale, but communication is lower order.
 
-For GQA models where `ulysses_size > num_kv_heads`, xorl-internal expands KV heads
+For GQA models where `ulysses_size > num_kv_heads`, xorl expands KV heads
 with `repeat_kv` before the all-to-all so that each rank receives at least one KV head
 after scattering.
 
@@ -793,4 +793,4 @@ deterministic PP buffer shapes.
 
 | File | Description |
 |---|---|
-| [`src/xorl/distributed/sequence_parallel/`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/distributed/sequence_parallel/) | Ulysses all-to-all strategy, ring attention P2P, collator, zigzag reorder |
+| [`src/xorl/distributed/sequence_parallel/`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/distributed/sequence_parallel/) | Ulysses all-to-all strategy, ring attention P2P, collator, zigzag reorder |

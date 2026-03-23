@@ -62,7 +62,7 @@ This page covers how `Trainer` is structured for local training — the training
 
 ## Trainer Lifecycle
 
-[`src/xorl/trainers/trainer.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/trainers/trainer.py)
+[`src/xorl/trainers/trainer.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/trainers/trainer.py)
 
 `Trainer.__init__()` runs eight timed setup phases in order:
 
@@ -119,7 +119,7 @@ xorl normalizes gradients by **total valid tokens** across all DP ranks, not by 
 
 FSDP's automatic averaging is disabled (`set_gradient_divide_factor(1.0)`). Instead, `GradientAccumulateLoss` scales each micro-batch's loss by `local_valid_tokens / global_valid_tokens` before calling `.backward()`. The reduce-scatter then sums raw gradients across ranks, resulting in a correctly token-normalized gradient.
 
-See [`src/xorl/distributed/gradient_accumulate_loss.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/distributed/gradient_accumulate_loss.py).
+See [`src/xorl/distributed/gradient_accumulate_loss.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/distributed/gradient_accumulate_loss.py).
 
 ### SP gradient sync
 
@@ -131,7 +131,7 @@ After the backward pass, gradients for context-parallel (CP/Ulysses) dimensions 
 
 ### DataLoaderBuilder
 
-[`src/xorl/data/data_loader.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/data/data_loader.py)
+[`src/xorl/data/data_loader.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/data/data_loader.py)
 
 `DataLoaderBuilder` assembles a collator pipeline and wraps it in a `MicroBatchCollator` that splits each batch into micro-batches for gradient accumulation.
 
@@ -258,13 +258,13 @@ data:
   sample_packing_group_size: 100000   # multipack only: group size for FFD
 ```
 
-Packed bins are cached to disk (keyed by a hash of the packing config) so subsequent runs skip re-packing. See [`src/xorl/data/prepare/packing.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/data/prepare/packing.py).
+Packed bins are cached to disk (keyed by a hash of the packing config) so subsequent runs skip re-packing. See [`src/xorl/data/prepare/packing.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/data/prepare/packing.py).
 
 ---
 
 ## Model Parallelization
 
-[`src/xorl/distributed/torch_parallelize.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/distributed/torch_parallelize.py)
+[`src/xorl/distributed/torch_parallelize.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/distributed/torch_parallelize.py)
 
 `_parallelize()` applies parallelism in strict order to avoid device mesh conflicts:
 
@@ -288,10 +288,10 @@ For FSDP2, every decoder block is wrapped independently (`reshard_after_forward=
 
 | File | Description |
 |---|---|
-| [`src/xorl/trainers/trainer.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/trainers/trainer.py) | `Trainer` class — full lifecycle, `train_step`, `_forward_backward`, `_forward_backward_pp` |
-| [`src/xorl/trainers/training_utils.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/trainers/training_utils.py) | `_count_valid_tokens`, `_sync_sp_gradients`, `_clip_and_step`, `_reduce_metrics` |
-| [`src/xorl/data/data_loader.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/data/data_loader.py) | `DataLoaderBuilder`, `MicroBatchCollator` |
-| [`src/xorl/data/collators/`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/data/collators/) | `ToTensorCollator`, `PackingConcatCollator`, `TextSequenceShardCollator`, etc. |
-| [`src/xorl/data/collators/sequence_shard_collator.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/data/collators/sequence_shard_collator.py) | `zigzag_reorder_packed_sequence()`, `TextSequenceShardCollator` |
-| [`src/xorl/distributed/torch_parallelize.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/distributed/torch_parallelize.py) | `parallelize_model_fsdp2()`, `_build_tp_plan()`, FSDP2 wrapping order |
-| [`src/xorl/distributed/gradient_accumulate_loss.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/distributed/gradient_accumulate_loss.py) | `GradientAccumulateLoss` — token-normalized gradient scaling |
+| [`src/xorl/trainers/trainer.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/trainers/trainer.py) | `Trainer` class — full lifecycle, `train_step`, `_forward_backward`, `_forward_backward_pp` |
+| [`src/xorl/trainers/training_utils.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/trainers/training_utils.py) | `_count_valid_tokens`, `_sync_sp_gradients`, `_clip_and_step`, `_reduce_metrics` |
+| [`src/xorl/data/data_loader.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/data/data_loader.py) | `DataLoaderBuilder`, `MicroBatchCollator` |
+| [`src/xorl/data/collators/`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/data/collators/) | `ToTensorCollator`, `PackingConcatCollator`, `TextSequenceShardCollator`, etc. |
+| [`src/xorl/data/collators/sequence_shard_collator.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/data/collators/sequence_shard_collator.py) | `zigzag_reorder_packed_sequence()`, `TextSequenceShardCollator` |
+| [`src/xorl/distributed/torch_parallelize.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/distributed/torch_parallelize.py) | `parallelize_model_fsdp2()`, `_build_tp_plan()`, FSDP2 wrapping order |
+| [`src/xorl/distributed/gradient_accumulate_loss.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/distributed/gradient_accumulate_loss.py) | `GradientAccumulateLoss` — token-normalized gradient scaling |

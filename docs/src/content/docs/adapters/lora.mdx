@@ -191,7 +191,7 @@ See `examples/local/dummy/configs/lora/` and `examples/server/configs/lora/` for
 
 | File | Description |
 |---|---|
-| [`src/xorl/lora/modules/base.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/lora/modules/base.py) | `LoraModule` abstract base — defines `r`, `lora_alpha`, `scaling`, and `from_module()` factory |
-| [`src/xorl/lora/modules/linear.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/lora/modules/linear.py) | `LoraLinear` — LoRA for `nn.Linear`; A (Kaiming), B (zeros), forward with scaling |
-| [`src/xorl/lora/mapping.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/lora/mapping.py) | `LORA_MAPPING` registry and `get_lora_class_for_module()` lookup |
-| [`src/xorl/models/layers/moe/lora.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/models/layers/moe/lora.py) | `MoEExpertsLoRA` — LoRA for fused expert tensors `[E, I, H]` |
+| [`src/xorl/lora/modules/base.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/lora/modules/base.py) | `LoraModule` abstract base — defines `r`, `lora_alpha`, `scaling`, and `from_module()` factory |
+| [`src/xorl/lora/modules/linear.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/lora/modules/linear.py) | `LoraLinear` — LoRA for `nn.Linear`; A (Kaiming), B (zeros), forward with scaling |
+| [`src/xorl/lora/mapping.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/lora/mapping.py) | `LORA_MAPPING` registry and `get_lora_class_for_module()` lookup |
+| [`src/xorl/models/layers/moe/lora.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/models/layers/moe/lora.py) | `MoEExpertsLoRA` — LoRA for fused expert tensors `[E, I, H]` |

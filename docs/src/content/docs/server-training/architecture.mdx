@@ -91,7 +91,7 @@ The server is composed of three processes launched by a single `Launcher`:
 
 ### Launcher
 
-[`src/xorl/server/launcher.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/launcher.py)
+[`src/xorl/server/launcher.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/server/launcher.py)
 
 The `Launcher` is the single entrypoint. It orchestrates startup and shutdown of all sub-processes.
 
@@ -131,7 +131,7 @@ Launcher(
 
 ### API Server
 
-[`src/xorl/server/api_server/server.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/api_server/server.py)
+[`src/xorl/server/api_server/server.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/server/api_server/server.py)
 
 `APIServer` is a FastAPI application composed via mixins:
 
@@ -174,7 +174,7 @@ Messages are serialized with **msgpack** for efficiency.
 
 ### Orchestrator
 
-[`src/xorl/server/orchestrator/orchestrator.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/orchestrator/orchestrator.py)
+[`src/xorl/server/orchestrator/orchestrator.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/server/orchestrator/orchestrator.py)
 
 The Orchestrator runs in its own process as an event loop. It is the bridge between the HTTP API and the GPU workers.
 
@@ -245,7 +245,7 @@ The Orchestrator runs in its own process as an event loop. It is the bridge betw
 
 ### RunnerDispatcher + ModelRunner
 
-[`src/xorl/server/runner/runner_dispatcher.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/runner/runner_dispatcher.py)
+[`src/xorl/server/runner/runner_dispatcher.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/server/runner/runner_dispatcher.py)
 
 The dispatcher runs on **rank 0** inside the torchrun process group. It acts as the ZMQ boundary between the Orchestrator and the actual GPU computation.
 
@@ -275,7 +275,7 @@ Orchestrator (RemoteBackend)
 | `HEALTH_CHECK` | Verify all ranks are alive |
 | `SHUTDOWN` | Graceful exit |
 
-[`src/xorl/server/runner/model_runner.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/runner/model_runner.py) — `ModelRunner` handles the actual model forward/backward/optimizer step on each rank. It receives the already-distributed micro-batches and calls into the model using the same FSDP2/EP/PP stack as local training.
+[`src/xorl/server/runner/model_runner.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/server/runner/model_runner.py) — `ModelRunner` handles the actual model forward/backward/optimizer step on each rank. It receives the already-distributed micro-batches and calls into the model using the same FSDP2/EP/PP stack as local training.
 
 ---
 
@@ -310,12 +310,12 @@ Messages between the Orchestrator and workers use a separate protocol defined in
 
 | File | Description |
 |---|---|
-| [`src/xorl/server/launcher.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/launcher.py) | `Launcher` — process orchestration, startup/shutdown lifecycle |
-| [`src/xorl/server/api_server/server.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/api_server/server.py) | `APIServer` — FastAPI app, OrchestratorClient, FutureStore |
-| [`src/xorl/server/api_server/endpoints.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/api_server/endpoints.py) | All FastAPI endpoint handlers |
-| [`src/xorl/server/orchestrator/orchestrator.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/orchestrator/orchestrator.py) | `Orchestrator` — event loop, request queue management |
-| [`src/xorl/server/orchestrator/scheduler.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/orchestrator/scheduler.py) | `Scheduler` — FIFO request ordering |
-| [`src/xorl/server/orchestrator/request_processor.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/orchestrator/request_processor.py) | `RequestProcessor` — sample packing, backend dispatch |
-| [`src/xorl/server/runner/runner_dispatcher.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/runner/runner_dispatcher.py) | `RunnerDispatcher` — rank 0 ZMQ↔NCCL bridge |
-| [`src/xorl/server/runner/model_runner.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/runner/model_runner.py) | `ModelRunner` — actual forward/backward/optim on GPU ranks |
-| [`src/xorl/server/protocol/`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/protocol/) | Typed msgpack protocol messages between all layers |
+| [`src/xorl/server/launcher.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/server/launcher.py) | `Launcher` — process orchestration, startup/shutdown lifecycle |
+| [`src/xorl/server/api_server/server.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/server/api_server/server.py) | `APIServer` — FastAPI app, OrchestratorClient, FutureStore |
+| [`src/xorl/server/api_server/endpoints.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/server/api_server/endpoints.py) | All FastAPI endpoint handlers |
+| [`src/xorl/server/orchestrator/orchestrator.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/server/orchestrator/orchestrator.py) | `Orchestrator` — event loop, request queue management |
+| [`src/xorl/server/orchestrator/scheduler.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/server/orchestrator/scheduler.py) | `Scheduler` — FIFO request ordering |
+| [`src/xorl/server/orchestrator/request_processor.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/server/orchestrator/request_processor.py) | `RequestProcessor` — sample packing, backend dispatch |
+| [`src/xorl/server/runner/runner_dispatcher.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/server/runner/runner_dispatcher.py) | `RunnerDispatcher` — rank 0 ZMQ↔NCCL bridge |
+| [`src/xorl/server/runner/model_runner.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/server/runner/model_runner.py) | `ModelRunner` — actual forward/backward/optim on GPU ranks |
+| [`src/xorl/server/protocol/`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/server/protocol/) | Typed msgpack protocol messages between all layers |
