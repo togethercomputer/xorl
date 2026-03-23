@@ -119,7 +119,7 @@ This avoids an all-gather of the full logit tensor before CE, saving `vocab_size
 
 | File | Description |
 |---|---|
-| [`src/xorl/ops/loss/`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/ops/loss/) | Loss function implementations: `causallm_loss`, `policy_loss`, `importance_sampling` |
-| [`src/xorl/ops/loss/compiled_cross_entropy.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/ops/loss/compiled_cross_entropy.py) | Compiled chunked cross-entropy |
-| [`src/xorl/ops/loss/vocab_parallel_cross_entropy.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/ops/loss/vocab_parallel_cross_entropy.py) | Vocabulary-parallel cross-entropy for TP |
-| [`src/xorl/distributed/gradient_accumulate_loss.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/distributed/gradient_accumulate_loss.py) | `GradientAccumulateLoss` — token-normalized loss accumulation across micro-batches |
+| [`src/xorl/ops/loss/`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/loss/) | Loss function implementations: `causallm_loss`, `policy_loss`, `importance_sampling` |
+| [`src/xorl/ops/loss/compiled_cross_entropy.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/loss/compiled_cross_entropy.py) | Compiled chunked cross-entropy |
+| [`src/xorl/ops/loss/vocab_parallel_cross_entropy.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/loss/vocab_parallel_cross_entropy.py) | Vocabulary-parallel cross-entropy for TP |
+| [`src/xorl/distributed/gradient_accumulate_loss.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/distributed/gradient_accumulate_loss.py) | `GradientAccumulateLoss` — token-normalized loss accumulation across micro-batches |

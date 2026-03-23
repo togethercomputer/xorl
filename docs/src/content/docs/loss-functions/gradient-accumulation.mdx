@@ -99,7 +99,7 @@ This value is computed **once** before the gradient accumulation loop and reused
 
 ## Step 2: Token-Normalized Loss per Micro-Batch
 
-For each micro-batch, xorl calls `GradientAccumulateLoss` ([`src/xorl/distributed/gradient_accumulate_loss.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/distributed/gradient_accumulate_loss.py)):
+For each micro-batch, xorl calls `GradientAccumulateLoss` ([`src/xorl/distributed/gradient_accumulate_loss.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/distributed/gradient_accumulate_loss.py)):
 
 ```python
 local_valid_tokens = (labels != IGNORE_INDEX).sum()     # tokens in this micro-batch on this rank
@@ -260,7 +260,7 @@ if sp_grad_sync_group is not None:
 
 ## Server Training: Deferred Normalization
 
-The server training path ([`ModelRunner`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/runner/model_runner.py)) uses a different strategy: **raw gradients are accumulated across multiple `forward_backward` API calls, and normalization is deferred to `optim_step`**.
+The server training path ([`ModelRunner`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/server/runner/model_runner.py)) uses a different strategy: **raw gradients are accumulated across multiple `forward_backward` API calls, and normalization is deferred to `optim_step`**.
 
 This is necessary because the client controls the gradient accumulation loop externally — the server doesn't know in advance how many `forward_backward` calls will happen before `optim_step`.
 
@@ -350,8 +350,8 @@ Both approaches produce **mathematically identical gradients**: token-averaged o
 
 | File | Description |
 |---|---|
-| [`src/xorl/distributed/gradient_accumulate_loss.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/distributed/gradient_accumulate_loss.py) | `GradientAccumulateLoss` — custom autograd for local training token-normalized loss |
-| [`src/xorl/trainers/training_utils.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/trainers/training_utils.py) | `count_valid_tokens()` — all-reduce valid token count; `sync_sp_gradients()` — CP gradient sync |
-| [`src/xorl/distributed/torch_parallelize.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/distributed/torch_parallelize.py) | `set_gradient_divide_factor(1.0)` — disables FSDP automatic averaging |
-| [`src/xorl/trainers/trainer.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/trainers/trainer.py) | `train_step()`, `_forward_backward()` — local training pipeline |
-| [`src/xorl/server/runner/model_runner.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/server/runner/model_runner.py) | `_forward_backward_core()` — raw gradient accumulation; `optim_step()` — deferred normalization via `grad.mul_(1/accumulated)` |
+| [`src/xorl/distributed/gradient_accumulate_loss.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/distributed/gradient_accumulate_loss.py) | `GradientAccumulateLoss` — custom autograd for local training token-normalized loss |
+| [`src/xorl/trainers/training_utils.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/trainers/training_utils.py) | `count_valid_tokens()` — all-reduce valid token count; `sync_sp_gradients()` — CP gradient sync |
+| [`src/xorl/distributed/torch_parallelize.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/distributed/torch_parallelize.py) | `set_gradient_divide_factor(1.0)` — disables FSDP automatic averaging |
+| [`src/xorl/trainers/trainer.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/trainers/trainer.py) | `train_step()`, `_forward_backward()` — local training pipeline |
+| [`src/xorl/server/runner/model_runner.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/server/runner/model_runner.py) | `_forward_backward_core()` — raw gradient accumulation; `optim_step()` — deferred normalization via `grad.mul_(1/accumulated)` |

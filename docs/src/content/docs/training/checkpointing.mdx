@@ -266,6 +266,6 @@ Before materializing model parameters from `meta` device, xorl resizes expert te
 
 | File | Description |
 |---|---|
-| [`src/xorl/checkpoint/checkpointer.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/checkpoint/checkpointer.py) | `DistributedCheckpointer` — DCP save/load, async save with Gloo process group, extra-state per rank |
-| [`src/xorl/models/module_utils.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/models/module_utils.py) | `_MultiStreamDMA` — 2-stream H2D DMA; `rank0_load_and_broadcast_weights` — prefetch + batched broadcast; EP-aware filtered loading; expert pre-shrinking |
-| [`src/xorl/arguments.py`](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/arguments.py) | `save_steps`, `save_epochs`, `save_async`, `save_hf_weights`, `load_checkpoint_path`, `load_weights_mode` |
+| [`src/xorl/checkpoint/checkpointer.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/checkpoint/checkpointer.py) | `DistributedCheckpointer` — DCP save/load, async save with Gloo process group, extra-state per rank |
+| [`src/xorl/models/module_utils.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/models/module_utils.py) | `_MultiStreamDMA` — 2-stream H2D DMA; `rank0_load_and_broadcast_weights` — prefetch + batched broadcast; EP-aware filtered loading; expert pre-shrinking |
+| [`src/xorl/arguments.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/arguments.py) | `save_steps`, `save_epochs`, `save_async`, `save_hf_weights`, `load_checkpoint_path`, `load_weights_mode` |
