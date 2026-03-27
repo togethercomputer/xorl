@@ -1,19 +1,19 @@
 import os
 
+
 # Must be set before importing torch / initializing CUDA so the
 # allocator picks up the setting on first use.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import json
 import time
-from dataclasses import asdict, dataclass, field
-from functools import partial
+from dataclasses import asdict
 from typing import Any, Dict, List
 
-import torch
 import torch.distributed as dist
 from tqdm import trange
 
+from xorl.arguments import Arguments, parse_args, save_args
 from xorl.checkpoint import build_checkpointer
 from xorl.data.constants import IGNORE_INDEX
 from xorl.data.data_loader import DataLoaderBuilder
@@ -24,8 +24,8 @@ from xorl.distributed.parallel_state import get_parallel_state, init_parallel_st
 from xorl.distributed.sync_padding import synchronize_micro_batch_padding
 from xorl.distributed.torch_parallelize import build_parallelize_model
 from xorl.models import build_foundation_model, build_tokenizer, save_model_assets, save_model_weights
+from xorl.models.layers.moe.aux_loss import global_load_balancing_loss_func
 from xorl.models.module_utils import compute_loss
-from xorl.models.transformers.qwen3_moe.modeling_qwen3_moe import load_balancing_loss_func
 from xorl.optim import build_lr_scheduler, build_optimizer
 from xorl.trainers.training_utils import (
     clip_gradients,
@@ -34,16 +34,12 @@ from xorl.trainers.training_utils import (
     sync_sp_gradients,
 )
 from xorl.utils import helper
-
 from xorl.utils.device import (
     get_device_type,
     get_nccl_backend,
     get_torch_device,
     synchronize,
 )
-
-from xorl.arguments import Arguments, DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
-
 from xorl.utils.dist_utils import all_reduce
 
 
@@ -55,10 +51,10 @@ def main():
     dist.init_process_group(backend=get_nccl_backend())
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
     logger.info_rank0(json.dumps(asdict(args), indent=2))
-    
+
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
-    
+
     if args.train.local_rank == 0:
         helper.enable_third_party_logging()
 
@@ -66,7 +62,7 @@ def main():
         save_args(args, args.train.output_dir)
 
     Checkpointer = build_checkpointer(dist_backend=args.train.data_parallel_mode, ckpt_manager=args.train.ckpt_manager)
-    
+
     init_parallel_state(
         dp_size=args.train.data_parallel_size,
         dp_replicate_size=args.train.data_parallel_replicate_size,
@@ -86,6 +82,7 @@ def main():
     ps = get_parallel_state()
     if ps.device_mesh is not None:
         import torch.distributed.tensor._random
+
         torch.distributed.tensor._random.manual_seed(args.train.seed, ps.device_mesh)
 
     logger.info_rank0("Prepare data")
@@ -105,7 +102,7 @@ def main():
         seed=args.train.seed,
         pad_to_multiple_of=args.data.pad_to_multiple_of,
     ).build()
-    
+
     # Calculate train steps from dataloader length
     train_steps_per_epoch = len(train_dataloader)
     total_train_steps = train_steps_per_epoch * args.train.num_train_epochs
@@ -117,7 +114,6 @@ def main():
     save_epoch_steps = int(args.train.save_epochs * train_steps_per_epoch) if args.train.save_epochs else 0
     if save_epoch_steps:
         logger.info_rank0(f"Save every {args.train.save_epochs} epoch(s) = every {save_epoch_steps} steps")
-
 
     logger.info_rank0("Prepare model")
     model = build_foundation_model(
@@ -152,7 +148,8 @@ def main():
     checkpoint_quant_format = None
     exclude_modules = set()
     if args.lora.enable_qlora:
-        from xorl.qlora import inject_qlora_into_model, detect_prequantized_nvfp4, detect_prequantized_block_fp8
+        from xorl.qlora import detect_prequantized_block_fp8, detect_prequantized_nvfp4, inject_qlora_into_model
+
         if detect_prequantized_nvfp4(args.model.model_path):
             is_prequantized = True
             checkpoint_quant_format = "nvfp4"
@@ -163,16 +160,14 @@ def main():
             logger.info_rank0("Detected pre-quantized block FP8 checkpoint")
         if args.lora.exclude_modules is not None:
             exclude_modules = set(args.lora.exclude_modules)
-            logger.info_rank0(
-                f"Using user-specified exclude_modules: {exclude_modules}"
-            )
+            logger.info_rank0(f"Using user-specified exclude_modules: {exclude_modules}")
         elif is_prequantized:
             from xorl.models.checkpoint_handlers.buffers import get_prequantized_exclude_modules
+
             exclude_modules = get_prequantized_exclude_modules(args.model.model_path)
             if exclude_modules:
                 logger.info_rank0(
-                    f"Auto-detected {len(exclude_modules)} excluded modules "
-                    f"from checkpoint config: {exclude_modules}"
+                    f"Auto-detected {len(exclude_modules)} excluded modules from checkpoint config: {exclude_modules}"
                 )
         if is_prequantized and checkpoint_quant_format != args.lora.quant_format:
             logger.info_rank0(
@@ -200,6 +195,7 @@ def main():
         helper.print_device_mem_info("VRAM usage after QLoRA injection")
     elif args.lora.enable_lora:
         from xorl.lora.utils import inject_lora_into_model
+
         inject_lora_into_model(
             model,
             r=args.lora.lora_rank,
@@ -249,13 +245,15 @@ def main():
     if args.lora.enable_qlora:
         if is_prequantized:
             from xorl.qlora import maybe_load_prequantized_qlora
+
             logger.info("Starting pre-quantized NVFP4 weight loading...")
             helper.print_device_mem_info("VRAM before pre-quantized loading")
             maybe_load_prequantized_qlora(model, args.model.model_path)
             logger.info("Done pre-quantized weight loading, freezing non-LoRA params...")
         else:
-            from xorl.qlora import maybe_quantize_qlora, maybe_load_and_quantize_moe_qlora
+            from xorl.qlora import maybe_load_and_quantize_moe_qlora, maybe_quantize_qlora
             from xorl.qlora.utils import _deregister_qlora_weights_from_fsdp
+
             logger.info("Starting maybe_quantize_qlora...")
             helper.print_device_mem_info("VRAM before QLoRA quantization")
             maybe_quantize_qlora(model)
@@ -267,7 +265,8 @@ def main():
             logger.info("Done MoE weight loading, deregistering packed weights...")
             # Deregister packed_weight_f32 from FSDP2 (prevent mixed-precision corruption)
             removed = _deregister_qlora_weights_from_fsdp(
-                model, param_names=("packed_weight_f32",),
+                model,
+                param_names=("packed_weight_f32",),
             )
             torch.cuda.empty_cache()
             if removed > 0:
@@ -305,6 +304,7 @@ def main():
     if args.train.global_rank == 0:
         if args.train.use_wandb:
             import wandb
+
             wandb.init(
                 project=args.train.wandb_project,
                 name=args.train.wandb_name,
@@ -364,17 +364,21 @@ def main():
     pp_context = {}  # mutable container for per-step state used by pp_loss_fn
     if pp_enabled:
         import torch.nn.functional as F
+
         from xorl.distributed.pipeline_parallel import build_pipeline_schedule
 
         @torch.compile
         def _pp_ce_loss(pred, labels, ntokens):
             """PP loss: sum reduction, normalized by global_valid_tokens."""
-            return F.cross_entropy(
-                pred.flatten(0, 1).float(),
-                labels.flatten(0, 1),
-                ignore_index=IGNORE_INDEX,
-                reduction="sum",
-            ) / ntokens
+            return (
+                F.cross_entropy(
+                    pred.flatten(0, 1).float(),
+                    labels.flatten(0, 1),
+                    ignore_index=IGNORE_INDEX,
+                    reduction="sum",
+                )
+                / ntokens
+            )
 
         def pp_loss_fn(pred, labels):
             return _pp_ce_loss(pred, labels, pp_context["global_valid_tokens"])
@@ -441,7 +445,8 @@ def main():
 
             # compute global valid tokens across all ranks
             global_valid_tokens = count_valid_tokens(
-                micro_batches, group=ps.fsdp_group if pp_enabled else None,
+                micro_batches,
+                group=ps.fsdp_group if pp_enabled else None,
             )
 
             optimizer.zero_grad()
@@ -451,13 +456,15 @@ def main():
             # pays the cheap addcmul cost per layer.
             if args.lora.enable_aqn:
                 from xorl.qlora.modules.linear import prefetch_aqn_noise
+
                 prefetch_aqn_noise(model)
 
             # Routing replay stage switching for MoE checkpoint determinism.
             # Only needed with EP — without EP, expert compute has fixed output
             # shapes regardless of routing, so checkpoint recompute is safe.
             # See models/layers/moe/routing_replay.py for lifecycle docs.
-            from xorl.models.layers.moe.routing_replay import set_replay_stage, RoutingReplay
+            from xorl.models.layers.moe.routing_replay import RoutingReplay, set_replay_stage
+
             use_routing_replay = ps.ep_size > 1 and args.train.moe_recomputed
 
             if pp_enabled:
@@ -471,18 +478,15 @@ def main():
                 # Prepare input_ids and labels tensors for PP schedule
                 # PP schedule expects full batch tensors, splits into microbatches internally
                 device = get_device_type()
-                input_ids = torch.cat([
-                    mb["input_ids"].to(device, non_blocking=True) for mb in micro_batches
-                ], dim=0)
-                labels = torch.cat([
-                    mb["labels"].to(device, non_blocking=True) for mb in micro_batches
-                ], dim=0)
+                input_ids = torch.cat([mb["input_ids"].to(device, non_blocking=True) for mb in micro_batches], dim=0)
+                labels = torch.cat([mb["labels"].to(device, non_blocking=True) for mb in micro_batches], dim=0)
 
                 # Extract per-microbatch metadata for PP forward:
                 # - position_ids: full-length (not SP-sliced) for correct per-document RoPE
                 # - cu_seq_lens/max_length: flash-attention varlen kwargs for document boundaries
                 # Each _pp_forward call pops one entry from the deque.
                 from collections import deque
+
                 _PP_FA_KEYS = ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k")
                 pp_metadata_list = []
                 for mb in micro_batches:
@@ -557,18 +561,22 @@ def main():
                         # Loss computation: lm_head weight stays all-gathered
                         # via reshard_after_forward=False on norm + lm_head FSDP unit
                         result = compute_loss(
-                            model.lm_head, outputs.last_hidden_state,
-                            loss_fn_name=None, loss_fn_inputs={"labels": labels},
-                            loss_fn_params=None, logits_to_keep=0,
+                            model.lm_head,
+                            outputs.last_hidden_state,
+                            loss_fn_name=None,
+                            loss_fn_inputs={"labels": labels},
+                            loss_fn_params=None,
+                            logits_to_keep=0,
                         )
                         loss = result.loss
 
                         # MoE aux loss from router logits (if applicable)
                         if hasattr(outputs, "router_logits") and outputs.router_logits is not None:
-                            aux_loss = load_balancing_loss_func(
+                            aux_loss = global_load_balancing_loss_func(
                                 outputs.router_logits,
                                 model.num_experts,
                                 model.num_experts_per_tok,
+                                dp_group=ps.dp_group if ps.dp_enabled else None,
                             )
                             if aux_loss != 0:
                                 loss = loss + model.router_aux_loss_coef * aux_loss.to(loss.device)
@@ -600,7 +608,8 @@ def main():
 
             # Gradient clipping
             grad_norm = clip_gradients(
-                model, args.train.max_grad_norm,
+                model,
+                args.train.max_grad_norm,
                 pp_enabled=pp_enabled,
                 pp_group=ps.pp_group if pp_enabled else None,
             )
@@ -638,20 +647,25 @@ def main():
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
 
             tflops_per_gpu = train_metrics.get("efficiency/flops_achieved(T)", 0) / args.train.world_size
-            data_loader_tqdm.set_postfix_str(f"loss={total_loss:.2f} gn={grad_norm:.2f} lr={lr:.1e} tflops={tflops_per_gpu:.1f}")
+            data_loader_tqdm.set_postfix_str(
+                f"loss={total_loss:.2f} gn={grad_norm:.2f} lr={lr:.1e} tflops={tflops_per_gpu:.1f}"
+            )
             data_loader_tqdm.update()
 
             if args.train.global_rank == 0:
                 if args.train.use_wandb and global_step % args.train.wandb_log_interval == 0:
                     import wandb
-                    train_metrics.update({
-                        "training/loss": total_loss,
-                        "training/grad_norm": grad_norm,
-                        "training/lr": lr,
-                        "training/epoch": epoch,
-                        "training/step_time": delta_time,
-                        "training/samples_seen": global_step * args.train.global_batch_size,
-                    })
+
+                    train_metrics.update(
+                        {
+                            "training/loss": total_loss,
+                            "training/grad_norm": grad_norm,
+                            "training/lr": lr,
+                            "training/epoch": epoch,
+                            "training/step_time": delta_time,
+                            "training/samples_seen": global_step * args.train.global_batch_size,
+                        }
+                    )
                     wandb.log(train_metrics, step=global_step)
 
             if args.train.profile_this_rank and global_step <= args.train.profile_end_step:
@@ -659,8 +673,9 @@ def main():
                 if global_step == args.train.profile_end_step:
                     profiler.stop()
 
-            should_save = (args.train.save_steps and global_step % args.train.save_steps == 0) or \
-                          (save_epoch_steps and global_step % save_epoch_steps == 0)
+            should_save = (args.train.save_steps and global_step % args.train.save_steps == 0) or (
+                save_epoch_steps and global_step % save_epoch_steps == 0
+            )
             if should_save:
                 helper.empty_cache()
                 save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
@@ -679,8 +694,10 @@ def main():
                 is_lora_training = args.lora.enable_lora or args.lora.enable_qlora
                 _save_lora_only = is_lora_training and args.lora.merge_lora_interval == 0
                 Checkpointer.save(
-                    args.train.save_checkpoint_path, state,
-                    global_steps=global_step, save_lora_only=_save_lora_only,
+                    args.train.save_checkpoint_path,
+                    state,
+                    global_steps=global_step,
+                    save_lora_only=_save_lora_only,
                 )
 
                 dist.barrier()
@@ -700,11 +717,10 @@ def main():
 
     hf_model_state_dict = None
     if args.train.save_hf_weights and not save_peft_adapter:
-        from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+        from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+
         logger.info_rank0("Gathering full model state dict for HF checkpoint via NCCL...")
-        hf_model_state_dict = get_model_state_dict(
-            model, options=StateDictOptions(full_state_dict=True)
-        )
+        hf_model_state_dict = get_model_state_dict(model, options=StateDictOptions(full_state_dict=True))
 
     # release memory
     del optimizer, lr_scheduler
@@ -716,8 +732,10 @@ def main():
         if save_peft_adapter:
             # Save PEFT adapter format (LoRA-only, base weights unchanged)
             from xorl.lora.utils import save_lora_checkpoint
+
             save_lora_checkpoint(
-                model, hf_weights_path,
+                model,
+                hf_weights_path,
                 base_model_name=args.model.model_path,
                 target_modules=args.lora.lora_target_modules,
                 r=args.lora.lora_rank,
@@ -726,7 +744,9 @@ def main():
             logger.info_rank0(f"PEFT adapter checkpoint saved at {hf_weights_path} successfully!")
         elif hf_model_state_dict is not None:
             checkpoint_handler = model.get_checkpoint_handler() if hasattr(model, "get_checkpoint_handler") else None
-            save_model_weights(hf_weights_path, hf_model_state_dict, model_assets=model_assets, checkpoint_handler=checkpoint_handler)
+            save_model_weights(
+                hf_weights_path, hf_model_state_dict, model_assets=model_assets, checkpoint_handler=checkpoint_handler
+            )
             del hf_model_state_dict
             logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
 
