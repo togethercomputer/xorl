@@ -378,6 +378,7 @@ def save_lora_checkpoint(
     lora_alpha: Optional[int] = None,
     moe_hybrid_shared_lora: bool = False,
     lora_state_dict: Optional[Dict[str, torch.Tensor]] = None,
+    transpose_moe_lora_to_peft: bool = False,
 ) -> str:
     """
     Save LoRA weights in PEFT-compatible format.
@@ -397,6 +398,9 @@ def save_lora_checkpoint(
         lora_state_dict: Pre-gathered LoRA state dict. If provided, skips
             get_lora_state_dict(model) call. Useful when the caller has already
             gathered weights (e.g., from FSDP2 + EP distributed model).
+        transpose_moe_lora_to_peft: Whether to transpose MoE expert LoRA tensors
+            into PEFT/vLLM orientation during export. Disabled by default so
+            existing xorl call sites keep their current behavior.
 
     Returns:
         Path to saved checkpoint directory
@@ -439,10 +443,12 @@ def save_lora_checkpoint(
         Unmerge stacked MoE LoRA weights into per-expert format for vLLM compatibility.
 
         Xorl stores MoE LoRA as stacked tensors:
-            model.layers.0.mlp.experts.gate_proj_lora_A  # shape: [num_experts, r, hidden_dim]
+            model.layers.0.mlp.experts.gate_proj_lora_A  # shape: [num_experts, hidden_dim, r]
+            model.layers.0.mlp.experts.gate_proj_lora_B  # shape: [num_experts, r, intermediate_dim]
 
         vLLM expects per-expert format:
             model.layers.0.mlp.experts.0.gate_proj.lora_A.weight  # shape: [r, hidden_dim]
+            model.layers.0.mlp.experts.0.gate_proj.lora_B.weight  # shape: [intermediate_dim, r]
 
         For hybrid shared LoRA, shared weights (shape[0] == 1) are named with
         ".shared." instead of expert index to indicate they're shared across experts.
@@ -464,12 +470,16 @@ def save_lora_checkpoint(
         if is_shared:
             # Shared weight: use ".shared." in the key name
             expert_tensor = stacked_tensor[0]
+            if transpose_moe_lora_to_peft:
+                expert_tensor = expert_tensor.transpose(0, 1).contiguous()
             peft_key = f"base_model.model.{prefix}.mlp.experts.shared.{proj_name}.lora_{lora_type}.weight"
             result[peft_key] = expert_tensor.to(torch.bfloat16)
         else:
             # Per-expert weights: use expert index in the key name
             for expert_idx in range(num_experts):
                 expert_tensor = stacked_tensor[expert_idx]
+                if transpose_moe_lora_to_peft:
+                    expert_tensor = expert_tensor.transpose(0, 1).contiguous()
                 # Build vLLM-compatible key:
                 # base_model.model.{prefix}.mlp.experts.{idx}.{proj}.lora_{A|B}.weight
                 peft_key = f"base_model.model.{prefix}.mlp.experts.{expert_idx}.{proj_name}.lora_{lora_type}.weight"
@@ -494,8 +504,10 @@ def save_lora_checkpoint(
             if match:
                 detected_modules.add(match.group(2))  # gate_proj, up_proj, or down_proj
                 if detected_r is None and match.group(3) == "A":
-                    # For MoE LoRA, shape is [num_experts, r, ...]
-                    detected_r = value.shape[1]
+                    # Xorl stores MoE LoRA A as [num_experts, in_features, r].
+                    # When transpose_moe_lora_to_peft is enabled, the exported
+                    # PEFT tensor rank is the last dimension of the stacked input.
+                    detected_r = value.shape[2] if transpose_moe_lora_to_peft else value.shape[1]
         else:
             # Extract module name for target_modules detection
             parts = key.split(".")
