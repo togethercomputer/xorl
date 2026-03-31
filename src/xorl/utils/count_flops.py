@@ -14,59 +14,27 @@ def _gc_multipliers(
     recompute_modules: Optional[List[str]],
     moe_checkpoint_method: Optional[str],
 ) -> Dict[str, int]:
-    """Per-component FLOPs multipliers accounting for gradient checkpointing.
+    """Logical training FLOPs multipliers aligned with common benchmark reporting.
 
-    Base multiplier = 6: forward (2) + wgrad (2) + dgrad (2).
-    With recompute: +2 for the extra forward pass = 8.
-    With moe_act: gate/up get an extra recompute inside backward = 8
-      (the custom autograd.Function recomputes them instead of saving).
+    We intentionally report model FLOPs for the training step itself:
+    forward + backward for the active computation graph. We do not inflate the
+    estimate for activation-checkpoint recompute or MoE implementation details,
+    since those are runtime overheads rather than logical model FLOPs.
+
+    This keeps the reported TFLOPS stable across checkpointing strategies and
+    comparable with common training benchmark conventions.
 
     Returns a dict with keys:
         attn_linear  - Q/K/V/O projection FLOPs multiplier
-        attn_qkv     - attention softmax/QK^T/SV FLOPs multiplier (base 12, recompute 16)
+        attn_qkv     - attention softmax/QK^T/SV FLOPs multiplier
         router       - MoE gate router multiplier
         gate         - MoE gate_proj multiplier
         up           - MoE up_proj multiplier
         down         - MoE down_proj multiplier
         dense_mlp    - Dense MLP (non-MoE layers) multiplier
     """
-    if not gc_enabled:
-        return dict(attn_linear=6, attn_qkv=12, router=6, gate=6, up=6, down=6, dense_mlp=6)
-
-    if recompute_modules is None:
-        # Whole-layer checkpoint: every component in each decoder layer recomputed once
-        return dict(attn_linear=8, attn_qkv=16, router=8, gate=8, up=8, down=8, dense_mlp=8)
-
-    # Selective checkpoint
-    recompute_attn = "self_attn" in recompute_modules
-    recompute_mlp  = "mlp" in recompute_modules
-    moe_act        = (moe_checkpoint_method == "moe_act")
-
-    attn_linear = 8 if recompute_attn else 6
-    attn_qkv    = 16 if recompute_attn else 12
-    dense_mlp   = 8 if recompute_mlp else 6
-
-    if recompute_mlp and not moe_act:
-        # Whole MLP checkpointed: all expert ops recomputed once
-        router = gate = up = down = 8
-    elif recompute_mlp and moe_act:
-        # Outer checkpoint + moe_act inner recompute:
-        # gate/up: fwd + outer_recompute + inner_recompute_in_bwd + wgrad + dgrad = 5 × 2 FMA
-        router = down = 8
-        gate = up = 10
-    else:
-        # No outer MLP checkpoint
-        if moe_act:
-            # moe_act only: gate/up recomputed inside backward (no outer checkpoint)
-            router = down = 6
-            gate = up = 8
-        else:
-            router = gate = up = down = 6
-
-    return dict(
-        attn_linear=attn_linear, attn_qkv=attn_qkv,
-        router=router, gate=gate, up=up, down=down, dense_mlp=dense_mlp,
-    )
+    del gc_enabled, recompute_modules, moe_checkpoint_method
+    return dict(attn_linear=6, attn_qkv=12, router=6, gate=6, up=6, down=6, dense_mlp=6)
 
 
 def get_device_flops(unit="T"):
@@ -179,7 +147,7 @@ class XorlFlopsCounter:
         gate_up_N   = hidden_size * moe_intermediate_size * (moe_topk + share_expert_num) * 2
         down_N      = hidden_size * moe_intermediate_size * (moe_topk + share_expert_num)
         dense_mlp_N = hidden_size * self.config.intermediate_size * 3
-        embed_lm_N  = vocab_size * hidden_size * 2
+        embed_lm_N  = vocab_size * hidden_size  # lm_head only; embedding is a lookup (0 FLOPs)
 
         moe_layer_flops = (
             m["router"]        * router_N      * tokens_sum
@@ -224,7 +192,7 @@ class XorlFlopsCounter:
         gate_up_N     = hidden_size * moe_intermediate_size * moe_topk * 2  # gate_proj + up_proj
         down_N        = hidden_size * moe_intermediate_size * moe_topk      # down_proj
         attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-        embed_lm_N    = vocab_size * hidden_size * 2  # embedding + lm_head (never checkpointed)
+        embed_lm_N    = vocab_size * hidden_size  # lm_head only; embedding is a lookup (0 FLOPs)
 
         # Per-layer FLOPs with GC-corrected multipliers
         per_layer_flops = (
@@ -269,7 +237,7 @@ class XorlFlopsCounter:
 
         full_attn_linear_N = hidden_size * (q_size_full + k_size + v_size + o_size)
         mlp_N = hidden_size * intermediate_size * 3
-        embed_lm_N = vocab_size * hidden_size * 2
+        embed_lm_N = vocab_size * hidden_size  # lm_head only; embedding is a lookup (0 FLOPs)
 
         full_attn_layer_flops = (
             m["attn_linear"] * full_attn_linear_N * tokens_sum
@@ -356,7 +324,7 @@ class XorlFlopsCounter:
             )
             linear_layer_flops = m["attn_linear"] * linear_proj_N * tokens_sum + moe_mlp_flops
 
-        embed_lm_N = vocab_size * hidden_size * 2
+        embed_lm_N = vocab_size * hidden_size  # lm_head only; embedding is a lookup (0 FLOPs)
 
         dense_N_flops = (
             full_attn_layer_flops * full_attn_layers
@@ -385,7 +353,7 @@ class XorlFlopsCounter:
 
         mlp_N         = hidden_size * intermediate_size * 3
         attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-        embed_lm_N    = vocab_size * hidden_size * 2
+        embed_lm_N    = vocab_size * hidden_size  # lm_head only; embedding is a lookup (0 FLOPs)
 
         per_layer_flops = (
             m["dense_mlp"]   * mlp_N         * tokens_sum
@@ -419,7 +387,7 @@ class XorlFlopsCounter:
         # non-attn per layer parm
         mlp_N = hidden_size * intermediate_size * 3
         attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-        emd_and_lm_head_N = vocab_size * hidden_size * 2
+        emd_and_lm_head_N = vocab_size * hidden_size  # lm_head only; embedding is a lookup (0 FLOPs)
         # non-attn all_layer parm
         dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
         # non-attn all_layer & all_token fwd & bwd flops

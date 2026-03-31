@@ -10,6 +10,7 @@ Usage:
 
 import json
 import os
+import socket
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -97,6 +98,9 @@ class Trainer:
     def __init__(self, args: Arguments) -> None:
         self.args = args
         self.state = TrainState()
+        self._setup_phase_metrics: Dict[str, float] = {}
+        self._startup_metrics: Dict[str, Any] = {}
+        self._wandb_initialized = False
 
         # Setup phases (order matters — each depends on previous)
         # Model is built before data: reads weights from disk while I/O is free,
@@ -105,7 +109,10 @@ class Trainer:
             t0 = time.time()
             fn()
             elapsed = time.time() - t0
+            self._setup_phase_metrics[f"startup/{phase_name}_sec"] = elapsed
             logger.info(f"[TIMING] {phase_name} took {elapsed:.1f}s (rank {args.train.local_rank})")
+            self._maybe_log_startup_metrics({f"startup/{phase_name}_sec": elapsed}, commit=False)
+            self._log_memory_snapshot(f"startup/{phase_name}")
 
         _timed("bootstrap", self._bootstrap)
         _timed("build_model", self._build_model)
@@ -115,6 +122,7 @@ class Trainer:
         _timed("setup_observability", self._setup_observability)
         _timed("resume_checkpoint", self._resume_checkpoint)
         _timed("build_pp_schedule", self._init_pp_schedule_cache)
+        self._write_startup_metrics_file()
 
     # ===================================================================
     # Setup phases
@@ -137,6 +145,34 @@ class Trainer:
             from xorl.arguments import save_args
 
             save_args(args, args.train.output_dir)
+            if args.train.use_wandb:
+                import wandb
+                wandb.init(
+                    project=args.train.wandb_project,
+                    name=args.train.wandb_name,
+                    tags=args.train.wandb_tags,
+                    config={**vars(args.model), **vars(args.data), **vars(args.train)},
+                )
+                self._wandb_initialized = True
+                config_file = os.path.join(args.train.output_dir, "xorl_cli.yaml")
+                if os.path.exists(config_file):
+                    wandb.save(config_file, policy="now")
+                self._maybe_log_startup_metrics(
+                    {
+                        "startup/world_size": args.train.world_size,
+                        "startup/global_batch_size": args.train.global_batch_size,
+                        "startup/micro_batch_size": args.train.micro_batch_size,
+                        "startup/gradient_accumulation_steps": args.train.gradient_accumulation_steps,
+                        "startup/data_parallel_size": args.train.data_parallel_size,
+                        "startup/data_parallel_replicate_size": args.train.data_parallel_replicate_size,
+                        "startup/data_parallel_shard_size": args.train.data_parallel_shard_size,
+                        "startup/ulysses_parallel_size": args.train.ulysses_parallel_size,
+                        "startup/expert_parallel_size": args.train.expert_parallel_size,
+                        "startup/pipeline_parallel_size": args.train.pipeline_parallel_size,
+                    },
+                    commit=False,
+                )
+        self._log_host_inventory()
 
         self.Checkpointer = build_checkpointer(
             dist_backend=args.train.data_parallel_mode,
@@ -165,6 +201,112 @@ class Trainer:
 
         # Routing replay is only needed with EP when MoE forward is recomputed
         self._use_routing_replay = self.ps.ep_size > 1 and args.train.moe_recomputed
+
+    def _maybe_log_startup_metrics(self, metrics: Dict[str, Any], commit: bool = False) -> None:
+        """Log startup metrics to wandb once rank 0 has initialized it."""
+        if not metrics:
+            return
+        if self.args.train.global_rank == 0:
+            self._startup_metrics.update(metrics)
+        if self.args.train.global_rank != 0 or not self.args.train.use_wandb or not self._wandb_initialized:
+            return
+        import wandb
+        wandb.log(metrics, step=0, commit=commit)
+
+    def _write_startup_metrics_file(self) -> None:
+        """Persist startup metrics alongside the run outputs for offline inspection."""
+        if self.args.train.global_rank != 0:
+            return
+
+        payload = {
+            "repo_commit": self.args.train.repo_commit,
+            "wandb_project": self.args.train.wandb_project if self.args.train.use_wandb else None,
+            "wandb_name": self.args.train.wandb_name if self.args.train.use_wandb else None,
+            "metrics": self._startup_metrics,
+        }
+        output_path = os.path.join(self.args.train.output_dir, "startup_metrics.json")
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+
+    def _collect_host_inventory(self) -> List[Dict[str, Any]]:
+        """Gather rank-to-host mapping across all processes."""
+        payload = {
+            "global_rank": self.args.train.global_rank,
+            "local_rank": self.args.train.local_rank,
+            "hostname": socket.gethostname(),
+        }
+        gathered: List[Optional[Dict[str, Any]]] = [None] * self.args.train.world_size
+        dist.all_gather_object(gathered, payload)
+        return [item for item in gathered if item is not None]
+
+    def _log_host_inventory(self) -> None:
+        """Emit host inventory to stdout and wandb config on rank 0."""
+        inventory = self._collect_host_inventory()
+        if self.args.train.global_rank != 0:
+            return
+
+        unique_hostnames = sorted({item["hostname"] for item in inventory})
+        rank_to_hostname = {str(item["global_rank"]): item["hostname"] for item in inventory}
+        logger.info_rank0(
+            "Host inventory:\n" + json.dumps(
+                {
+                    "master_addr": os.environ.get("MASTER_ADDR"),
+                    "master_port": os.environ.get("MASTER_PORT"),
+                    "node_count": len(unique_hostnames),
+                    "hostnames": unique_hostnames,
+                    "ranks": inventory,
+                },
+                indent=2,
+            )
+        )
+        self._startup_metrics.update(
+            {
+                "startup/master_addr": os.environ.get("MASTER_ADDR"),
+                "startup/master_port": os.environ.get("MASTER_PORT"),
+                "startup/node_count": len(unique_hostnames),
+                "startup/hostnames": unique_hostnames,
+                "startup/rank_to_hostname": rank_to_hostname,
+            }
+        )
+        self._maybe_log_startup_metrics({"startup/node_count": len(unique_hostnames)}, commit=False)
+        if self.args.train.use_wandb and self._wandb_initialized:
+            import wandb
+            wandb.config.update(
+                {
+                    "master_addr": os.environ.get("MASTER_ADDR"),
+                    "master_port": os.environ.get("MASTER_PORT"),
+                    "hostnames": unique_hostnames,
+                    "rank_to_hostname": rank_to_hostname,
+                },
+                allow_val_change=True,
+            )
+
+    def _log_memory_snapshot(self, prefix: str) -> None:
+        """Capture a coarse memory snapshot during setup for wandb comparison."""
+        if not self.args.train.use_wandb:
+            return
+
+        device = get_torch_device()
+        allocated_memory = device.memory_allocated()
+        reserved_memory = device.memory_reserved()
+        max_allocated_memory = device.max_memory_allocated()
+        max_reserved_memory = device.max_memory_reserved()
+
+        allocated_memory, reserved_memory, max_allocated_memory, max_reserved_memory = all_reduce(
+            (allocated_memory, reserved_memory, max_allocated_memory, max_reserved_memory),
+            op="max",
+        )
+        if self.args.train.global_rank != 0 or not self._wandb_initialized:
+            return
+        self._maybe_log_startup_metrics(
+            {
+                f"{prefix}/gpu_allocated_gb": allocated_memory / (1024**3),
+                f"{prefix}/gpu_reserved_gb": reserved_memory / (1024**3),
+                f"{prefix}/gpu_max_allocated_gb": max_allocated_memory / (1024**3),
+                f"{prefix}/gpu_max_reserved_gb": max_reserved_memory / (1024**3),
+            },
+            commit=False,
+        )
 
     def _build_data(self) -> None:
         """Build tokenizer, datasets, dataloader, compute step counts."""
@@ -423,18 +565,6 @@ class Trainer:
         self.model_assets = [self.model_config, self.tokenizer]
 
         if args.train.global_rank == 0:
-            if args.train.use_wandb:
-                import wandb
-
-                wandb.init(
-                    project=args.train.wandb_project,
-                    name=args.train.wandb_name,
-                    tags=args.train.wandb_tags,
-                    config={**vars(args.model), **vars(args.data), **vars(args.train)},
-                )
-                config_file = os.path.join(args.train.output_dir, "xorl_cli.yaml")
-                if os.path.exists(config_file):
-                    wandb.save(config_file, policy="now")
             save_model_assets(args.train.model_assets_dir, self.model_assets)
 
         self.profiler = None
@@ -458,6 +588,13 @@ class Trainer:
             recompute_modules=args.train.recompute_modules,
             moe_checkpoint_method=args.train.moe_checkpoint_method,
             cp_size=args.train.ulysses_parallel_size * args.train.ringattn_parallel_size,
+        )
+        self._maybe_log_startup_metrics(
+            {
+                "startup/train_steps_per_epoch": self.train_steps_per_epoch,
+                "startup/total_train_steps": self.total_train_steps,
+            },
+            commit=False,
         )
 
     def _resume_checkpoint(self) -> None:
@@ -852,7 +989,7 @@ class Trainer:
 
         if use_tqdm and tqdm_bar is not None:
             tqdm_bar.set_postfix_str(
-                f"loss={total_loss:.2f} gn={grad_norm:.2f} lr={lr:.1e} tflops={tflops_per_gpu:.1f}"
+                f"loss={total_loss:.2f} gn={grad_norm:.2f} lr={lr:.1e} tok/s={tokens_per_sec:.0f}"
             )
             tqdm_bar.update()
         else:

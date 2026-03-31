@@ -47,23 +47,29 @@ CACHE_DIR = os.path.expanduser(os.getenv("CACHE_DIR", os.path.join("~/.cache", "
 def _get_global_token_count(
     micro_batch: Dict[str, "torch.Tensor"]
 ) -> List[int]:
-    """Return the global (pre-SP-slice) token count for FLOPs accounting.
+    """Return per-document token counts for FLOPs accounting.
 
-    position_ids is always kept at its full pre-SP-slice length regardless of
-    Ulysses or ring attention, so ``position_ids.shape[-1]`` gives the total
-    tokens processed by the cluster for this step — consistent across all SP
-    modes and equivalent to Megatron's ``global_batch_size × seq_len``.
+    Uses ``_original_position_ids`` (pre-zigzag, pre-SP-padding) so document
+    boundaries are correct even with ring attention. Returns individual document
+    lengths so that ``seqlen_square_sum = sum(s² for s in seqlens)`` correctly
+    reflects flash-attention's per-document O(n²) cost rather than O(packed_n²).
 
-    We intentionally avoid per-document breakdown (pos2culen) here because:
-    - Ring attention zigzag-reorders position_ids, creating false doc boundaries.
-    - For MoE models, attention is a small fraction of total FLOPs so per-doc
-      precision in seqlen² barely affects accuracy.
+    Falls back to [total_seqlen] when position_ids are unavailable or not packed.
 
     Args:
         micro_batch: batch dict as returned by the collator pipeline.
     """
-    position_ids = micro_batch.get("_original_position_ids", micro_batch["position_ids"])
-    return [int(position_ids.shape[-1])]
+    position_ids = micro_batch.get("_original_position_ids", micro_batch.get("position_ids"))
+    if position_ids is None:
+        return [0]
+    pos = position_ids.reshape(-1)
+    starts = (pos == 0).nonzero(as_tuple=True)[0]
+    if len(starts) <= 1:
+        return [int(pos.shape[0])]
+    seqlens = torch.diff(
+        torch.cat([starts, torch.tensor([pos.shape[0]], device=starts.device)])
+    ).tolist()
+    return [int(s) for s in seqlens]
 
 
 class EnvironMeter:

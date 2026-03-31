@@ -7,7 +7,9 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import json
 import time
-from dataclasses import asdict
+import socket
+from dataclasses import asdict, dataclass, field
+from functools import partial
 from typing import Any, Dict, List
 
 import torch.distributed as dist
@@ -60,6 +62,55 @@ def main():
 
     if args.train.global_rank == 0:
         save_args(args, args.train.output_dir)
+        if args.train.use_wandb:
+            import wandb
+            wandb.init(
+                project=args.train.wandb_project,
+                name=args.train.wandb_name,
+                tags=args.train.wandb_tags,
+                config={**vars(args.model), **vars(args.data), **vars(args.train)},
+            )
+            config_file = os.path.join(args.train.output_dir, "xorl_cli.yaml")
+            if os.path.exists(config_file):
+                wandb.save(config_file, policy="now")
+
+    host_payload = {
+        "global_rank": args.train.global_rank,
+        "local_rank": args.train.local_rank,
+        "hostname": socket.gethostname(),
+    }
+    gathered_hosts = [None] * args.train.world_size
+    dist.all_gather_object(gathered_hosts, host_payload)
+    if args.train.global_rank == 0:
+        unique_hostnames = sorted({item["hostname"] for item in gathered_hosts if item is not None})
+        rank_to_hostname = {
+            str(item["global_rank"]): item["hostname"]
+            for item in gathered_hosts if item is not None
+        }
+        logger.info_rank0(
+            "Host inventory:\n" + json.dumps(
+                {
+                    "master_addr": os.environ.get("MASTER_ADDR"),
+                    "master_port": os.environ.get("MASTER_PORT"),
+                    "node_count": len(unique_hostnames),
+                    "hostnames": unique_hostnames,
+                    "ranks": gathered_hosts,
+                },
+                indent=2,
+            )
+        )
+        if args.train.use_wandb:
+            import wandb
+            wandb.config.update(
+                {
+                    "master_addr": os.environ.get("MASTER_ADDR"),
+                    "master_port": os.environ.get("MASTER_PORT"),
+                    "hostnames": unique_hostnames,
+                    "rank_to_hostname": rank_to_hostname,
+                },
+                allow_val_change=True,
+            )
+            wandb.log({"startup/node_count": len(unique_hostnames)}, step=0, commit=False)
 
     Checkpointer = build_checkpointer(dist_backend=args.train.data_parallel_mode, ckpt_manager=args.train.ckpt_manager)
 
@@ -302,19 +353,6 @@ def main():
     )
 
     if args.train.global_rank == 0:
-        if args.train.use_wandb:
-            import wandb
-
-            wandb.init(
-                project=args.train.wandb_project,
-                name=args.train.wandb_name,
-                tags=args.train.wandb_tags,
-                config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
-            )
-            config_file = os.path.join(args.train.output_dir, "xorl_cli.yaml")
-            if os.path.exists(config_file):
-                wandb.save(config_file, policy="now")
-
         # save model_assets before training
         model_assets = [model_config, tokenizer]
         save_model_assets(args.train.model_assets_dir, model_assets)
@@ -646,10 +684,8 @@ def main():
             lr = max(lr_scheduler.get_last_lr())
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
 
-            tflops_per_gpu = train_metrics.get("efficiency/flops_achieved(T)", 0) / args.train.world_size
-            data_loader_tqdm.set_postfix_str(
-                f"loss={total_loss:.2f} gn={grad_norm:.2f} lr={lr:.1e} tflops={tflops_per_gpu:.1f}"
-            )
+            tokens_per_sec = train_metrics.get("efficiency/tokens_per_second(K)", 0) * 1e3
+            data_loader_tqdm.set_postfix_str(f"loss={total_loss:.2f} gn={grad_norm:.2f} lr={lr:.1e} tok/s={tokens_per_sec:.0f}")
             data_loader_tqdm.update()
 
             if args.train.global_rank == 0:

@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import os
+import subprocess
 import sys
 import types
 
@@ -32,6 +33,22 @@ from .utils import helper, logging
 T = TypeVar("T")
 
 logger = logging.get_logger(__name__)
+
+
+def _detect_repo_commit() -> Optional[str]:
+    """Best-effort git commit detection for experiment metadata."""
+    try:
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        result = subprocess.run(
+            ["git", "-C", repo_root, "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        commit = result.stdout.strip()
+        return commit or None
+    except Exception:
+        return None
 
 
 def get_default_process_count():
@@ -869,6 +886,10 @@ class TrainingArguments:
         default=None,
         metadata={"help": "Wandb tags for organizing experiments."},
     )
+    repo_commit: Optional[str] = field(
+        default=None,
+        metadata={"help": "Git commit hash for experiment provenance. Auto-detected when omitted."},
+    )
     wandb_log_interval: int = field(
         default=1,
         metadata={"help": "Log to wandb every N steps."},
@@ -913,6 +934,8 @@ class TrainingArguments:
     )
 
     def __post_init__(self):
+        if self.repo_commit is None:
+            self.repo_commit = _detect_repo_commit()
         self.local_rank = int(os.getenv("LOCAL_RANK", "0"))
         self.global_rank = int(os.getenv("RANK", "0"))
         self.world_size = int(os.getenv("WORLD_SIZE", "1"))
