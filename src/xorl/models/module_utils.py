@@ -995,9 +995,10 @@ def rank0_load_and_broadcast_weights(
     else:
         global_expected_keys = None
 
-    # Get the safetensor file iterators
-    state_dict_iterators = _load_state_dict(weights_path) if global_rank == 0 else None
-    shard_count = len(state_dict_iterators) if global_rank == 0 else 0
+    # All ranks must enter _load_state_dict(): in multi-rank mode it contains
+    # the collective that receives the rank-0-resolved shard paths.
+    state_dict_iterators = _load_state_dict(weights_path)
+    shard_count = len(state_dict_iterators)
     logger.info_rank0(f"rank0_load_and_broadcast_weights: {shard_count=} ")
     shard_count_tensor = torch.tensor(
         [shard_count],
