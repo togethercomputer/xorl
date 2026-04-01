@@ -83,7 +83,9 @@ class ParallelState:
 
     def __post_init__(self):
         if self.cp_fsdp_mode not in ("all", "ulysses_only", "ring_only", "none"):
-            raise ValueError(f"Invalid cp_fsdp_mode: {self.cp_fsdp_mode}. Must be 'all', 'ulysses_only', 'ring_only', or 'none'.")
+            raise ValueError(
+                f"Invalid cp_fsdp_mode: {self.cp_fsdp_mode}. Must be 'all', 'ulysses_only', 'ring_only', or 'none'."
+            )
 
         if self.pp_size * self.dp_size * self.ringattn_size * self.ulysses_size * self.tp_size != self.world_size:
             raise ValueError("The product of parallel sizes should be equal to the world size.")
@@ -96,8 +98,8 @@ class ParallelState:
         if self.cp_enabled:
             from ..distributed.sequence_parallel import (
                 init_sequence_parallel,
-                set_ringattn_group,
                 set_data_parallel_group,
+                set_ringattn_group,
                 set_ulysses_sequence_parallel_group,
                 set_unified_sequence_parallel_group,
             )

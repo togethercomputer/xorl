@@ -7,11 +7,17 @@ import torch
 
 from ...checkpoint_handlers.base import CheckpointHandler
 from ...checkpoint_handlers.buffers import (
-    ExpertWeightBuffer, GateUpMergeBuffer, QKVMergeBuffer,
-    parse_expert_key, EXPERT_QUANT_AUX_PATTERN, QUANT_AUX_SUFFIX_PATTERN,
+    DENSE_DOWN_PROJ_PATTERN,
+    DENSE_GATE_UP_PATTERN,
+    EXPERT_QUANT_AUX_PATTERN,
     FP8_AUX_SUFFIX_PATTERN,
-    QKV_PROJ_PATTERN, DENSE_GATE_UP_PATTERN,
-    OPROJ_WEIGHT_PATTERN, DENSE_DOWN_PROJ_PATTERN,
+    OPROJ_WEIGHT_PATTERN,
+    QKV_PROJ_PATTERN,
+    QUANT_AUX_SUFFIX_PATTERN,
+    ExpertWeightBuffer,
+    GateUpMergeBuffer,
+    QKVMergeBuffer,
+    parse_expert_key,
 )
 from ..qwen3_5_shared import (
     is_excluded_module_key,
@@ -65,9 +71,7 @@ class Qwen3_5MoeCheckpointHandler(CheckpointHandler):
         # Disable expert buffer when pre-quantized: expert weights are loaded
         # directly by QLoRAMoeExperts, not merged through the checkpoint handler.
         if checkpoint_has_per_expert and not is_prequantized:
-            self._expert_buffer = ExpertWeightBuffer(
-                num_experts, ep_rank=ep_rank, ep_size=ep_size
-            )
+            self._expert_buffer = ExpertWeightBuffer(num_experts, ep_rank=ep_rank, ep_size=ep_size)
         self._qkv_buffer: Optional[QKVMergeBuffer] = None
         if not skip_qkv_merge:
             self._qkv_buffer = QKVMergeBuffer()
@@ -86,17 +90,13 @@ class Qwen3_5MoeCheckpointHandler(CheckpointHandler):
         self._expert_start = ep_rank * self._local_num_experts
         self._expert_end = self._expert_start + self._local_num_experts
 
-    _FUSED_EXPERT_GATE_UP_PATTERN = re.compile(
-        r"^model\.layers\.(\d+)\.mlp\.experts\.gate_up_proj(?:\.weight)?$"
-    )
-    _FUSED_EXPERT_DOWN_PATTERN = re.compile(
-        r"^model\.layers\.(\d+)\.mlp\.experts\.down_proj(?:\.weight)?$"
-    )
+    _FUSED_EXPERT_GATE_UP_PATTERN = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.gate_up_proj(?:\.weight)?$")
+    _FUSED_EXPERT_DOWN_PATTERN = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.down_proj(?:\.weight)?$")
 
     def _slice_expert_tensor_for_ep(self, tensor: torch.Tensor) -> torch.Tensor:
         if self._ep_size == 1:
             return tensor
-        return tensor[self._expert_start:self._expert_end].contiguous()
+        return tensor[self._expert_start : self._expert_end].contiguous()
 
     def _handle_fused_expert_weights(self, key: str, tensor: torch.Tensor) -> Optional[List[Tuple[str, torch.Tensor]]]:
         gate_up_match = self._FUSED_EXPERT_GATE_UP_PATTERN.match(key)
@@ -122,7 +122,9 @@ class Qwen3_5MoeCheckpointHandler(CheckpointHandler):
 
         return None
 
-    def _handle_linear_attention_weights(self, key: str, tensor: torch.Tensor) -> Optional[List[Tuple[str, torch.Tensor]]]:
+    def _handle_linear_attention_weights(
+        self, key: str, tensor: torch.Tensor
+    ) -> Optional[List[Tuple[str, torch.Tensor]]]:
         return map_qwen3_5_linear_attention_weight(
             key,
             tensor,
@@ -138,10 +140,8 @@ class Qwen3_5MoeCheckpointHandler(CheckpointHandler):
         - All quantized auxiliary keys when is_prequantized=True (weight_scale,
           weight_scale_2, input_scale) — these are loaded directly by QLoRA modules
         """
-        has_ep_filter = (
-            self._expert_buffer is not None
-            and not (self._expert_buffer.expert_start == 0
-                     and self._expert_buffer.expert_end == self._expert_buffer.num_experts)
+        has_ep_filter = self._expert_buffer is not None and not (
+            self._expert_buffer.expert_start == 0 and self._expert_buffer.expert_end == self._expert_buffer.num_experts
         )
 
         if not has_ep_filter and not self._is_prequantized:
@@ -176,8 +176,12 @@ class Qwen3_5MoeCheckpointHandler(CheckpointHandler):
                 # Skip all linear projection weight keys that are loaded by QLoRALinear
                 # directly. Bias keys (.bias) are NOT skipped (merged normally).
                 if key.endswith(".weight"):
-                    if (QKV_PROJ_PATTERN.match(key) or DENSE_GATE_UP_PATTERN.match(key)
-                            or OPROJ_WEIGHT_PATTERN.match(key) or DENSE_DOWN_PROJ_PATTERN.match(key)):
+                    if (
+                        QKV_PROJ_PATTERN.match(key)
+                        or DENSE_GATE_UP_PATTERN.match(key)
+                        or OPROJ_WEIGHT_PATTERN.match(key)
+                        or DENSE_DOWN_PROJ_PATTERN.match(key)
+                    ):
                         return True
             # Skip out-of-range expert keys for EP (non-prequantized path)
             if has_ep_filter:
@@ -193,9 +197,7 @@ class Qwen3_5MoeCheckpointHandler(CheckpointHandler):
         """Check if a key belongs to a module excluded from quantization."""
         return is_excluded_module_key(key, self._exclude_modules)
 
-    def on_load_weight(
-        self, key: str, tensor: torch.Tensor
-    ) -> List[Tuple[str, torch.Tensor]]:
+    def on_load_weight(self, key: str, tensor: torch.Tensor) -> List[Tuple[str, torch.Tensor]]:
         # 0. Pre-quantized: skip quantized auxiliary keys and quantized weight keys
         #    that weren't caught by get_skip_key_fn (e.g., when skip_key_fn wasn't used)
         #    Excluded modules pass through as bf16 — don't drop them.
@@ -266,9 +268,7 @@ class Qwen3_5MoeCheckpointHandler(CheckpointHandler):
         # 6. Passthrough
         return [(key, tensor)]
 
-    def on_skip_weight(
-        self, key: str
-    ) -> List[Tuple[str, torch.Tensor]]:
+    def on_skip_weight(self, key: str) -> List[Tuple[str, torch.Tensor]]:
         """Count a skipped expert key so completion tracking stays correct."""
         if self._expert_buffer is not None:
             parsed = parse_expert_key(key)
@@ -283,6 +283,7 @@ class Qwen3_5MoeCheckpointHandler(CheckpointHandler):
 
     def on_load_complete(self) -> List[Tuple[str, torch.Tensor]]:
         import warnings
+
         if self._expert_buffer is not None:
             pending = self._expert_buffer.get_pending_counts()
             if pending:
@@ -297,9 +298,7 @@ class Qwen3_5MoeCheckpointHandler(CheckpointHandler):
                 warnings.warn(f"Incomplete QKV merge groups after loading: {pending_qkv}")
         return []
 
-    def on_save_weight(
-        self, param_name: str, tensor: torch.Tensor
-    ) -> List[Tuple[str, torch.Tensor]]:
+    def on_save_weight(self, param_name: str, tensor: torch.Tensor) -> List[Tuple[str, torch.Tensor]]:
         # Split gate_up_proj -> gate_proj + up_proj (shared expert / dense layers)
         if ".gate_up_proj." in param_name:
             prefix, suffix = param_name.rsplit(".gate_up_proj.", 1)

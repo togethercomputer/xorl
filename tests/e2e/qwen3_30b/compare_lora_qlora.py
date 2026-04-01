@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 sys.path.insert(0, ROOT)
 
@@ -88,7 +89,9 @@ def main():
                 **extra,
             )
             results[name] = run_training(
-                config_path, num_gpus=num_gpus, timeout=3600,
+                config_path,
+                num_gpus=num_gpus,
+                timeout=3600,
             )
 
         # --- Report ---

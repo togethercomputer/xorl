@@ -153,8 +153,4 @@ class LoraModule:
         if not isinstance(self, nn.Module):
             raise TypeError("LoraModule must be mixed with nn.Module")
 
-        return {
-            name: param.detach()
-            for name, param in self.named_parameters()
-            if "lora_" in name
-        }
+        return {name: param.detach() for name, param in self.named_parameters() if "lora_" in name}

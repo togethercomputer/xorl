@@ -4,20 +4,24 @@ from typing import Callable, Optional, Tuple, Unpack
 import torch
 from torch import nn
 
+from xorl.distributed.moe.deepep import sync_pending_combine
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.distributed.sequence_parallel.strategy import get_cp_strategy
 from xorl.models.base import XorlPreTrainedModel
+from xorl.models.checkpoint_handlers.buffers import (
+    checkpoint_has_per_expert_weights,
+    detect_prequantized_checkpoint,
+    get_prequantized_exclude_modules,
+)
 from xorl.models.layers import ACT2FN, RotaryEmbedding
 from xorl.models.layers.attention import AttentionKwargs, update_causal_mask
 from xorl.models.layers.attention.backend import ATTENTION_FUNCTIONS
 from xorl.models.layers.attention.backend.eager import eager_attention_forward
 from xorl.models.layers.moe import MoEBlock
 from xorl.models.outputs import MoeCausalLMOutput, MoeModelOutput
-from xorl.models.checkpoint_handlers.buffers import (
-    checkpoint_has_per_expert_weights,
-    detect_prequantized_checkpoint,
-    get_prequantized_exclude_modules,
-)
+from xorl.models.transformers.qwen3_5_moe import parallelize
+from xorl.models.transformers.qwen3_5_moe.checkpoint_handler import Qwen3_5MoeCheckpointHandler
+from xorl.models.transformers.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
 from xorl.models.transformers.qwen3_5_shared import (
     LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE,
     QWEN3_5_CHECKPOINT_CONVERSION_MAPPING,
@@ -25,24 +29,21 @@ from xorl.models.transformers.qwen3_5_shared import (
     has_linear_attention_layers,
     qwen3_5_apply_rotary_pos_emb,
 )
-from xorl.models.transformers.qwen3_5_moe.checkpoint_handler import Qwen3_5MoeCheckpointHandler
-from xorl.models.transformers.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
-from xorl.models.transformers.qwen3_5_moe import parallelize
-from xorl.distributed.moe.deepep import sync_pending_combine
 from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
-from xorl.utils import logging
 from xorl.ops.linear_attention import GatedDeltaNet
 from xorl.ops.linear_attention.ops.cp import build_linear_attention_cp_context
+from xorl.utils import logging
+
 
 logger = logging.get_logger(__name__)
 
 
 def _adapt_qwen3_5_moe_config(config):
-    if hasattr(config, 'text_config'):
+    if hasattr(config, "text_config"):
         return Qwen3_5MoeConfig.from_hf_config(config)
     if isinstance(config, Qwen3_5MoeConfig):
         return config
-    if getattr(config, 'model_type', None) in {'qwen3_5_moe', 'qwen3_5_moe_text'}:
+    if getattr(config, "model_type", None) in {"qwen3_5_moe", "qwen3_5_moe_text"}:
         return Qwen3_5MoeConfig.from_hf_config(config)
     return config
 
@@ -61,7 +62,7 @@ class Qwen3_5MoeMLP(nn.Module):
         self.gate_up_proj = nn.Linear(self.hidden_size, 2 * self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self._use_fused_silu = config.hidden_act == 'silu'
+        self._use_fused_silu = config.hidden_act == "silu"
 
     def unfuse_for_tp(self):
         device = self.gate_up_proj.weight.device
@@ -71,7 +72,7 @@ class Qwen3_5MoeMLP(nn.Module):
         del self.gate_up_proj
 
     def forward(self, x):
-        if hasattr(self, 'gate_up_proj'):
+        if hasattr(self, "gate_up_proj"):
             if self._use_fused_silu:
                 x = fused_silu_and_mul(self.gate_up_proj(x))
             else:
@@ -183,13 +184,15 @@ class Qwen3_5MoeAttention(nn.Module):
         del position_ids, past_key_values
         attn_strategy = get_cp_strategy()
         query_states, key_states, value_states = attn_strategy.project_qkv(self, hidden_states, position_embeddings)
-        attn_output = attn_strategy.compute_attention(self, query_states, key_states, value_states, attention_mask, **kwargs)
+        attn_output = attn_strategy.compute_attention(
+            self, query_states, key_states, value_states, attention_mask, **kwargs
+        )
         attn_output = attn_strategy.project_output(self, attn_output)
         return attn_output, None
 
 
 class Qwen3_5MoeSparseMoeBlock(MoEBlock):
-    def __init__(self, config, moe_implementation='triton'):
+    def __init__(self, config, moe_implementation="triton"):
         super().__init__(
             hidden_size=config.hidden_size,
             num_experts=config.num_experts,
@@ -200,10 +203,10 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
             moe_implementation=moe_implementation,
         )
         self.config = config
-        self.experts.ep_dispatch = getattr(config, '_ep_dispatch', 'alltoall')
-        self.experts.deepep_buffer_size_gb = getattr(config, '_deepep_buffer_size_gb', 2.0)
-        self.experts.deepep_num_sms = getattr(config, '_deepep_num_sms', 20)
-        self.experts.deepep_async_combine = getattr(config, '_deepep_async_combine', False)
+        self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
+        self.experts.deepep_buffer_size_gb = getattr(config, "_deepep_buffer_size_gb", 2.0)
+        self.experts.deepep_num_sms = getattr(config, "_deepep_num_sms", 20)
+        self.experts.deepep_async_combine = getattr(config, "_deepep_async_combine", False)
         self.shared_expert = Qwen3_5MoeMLP(config, intermediate_size=config.shared_expert_intermediate_size)
         self.shared_expert_gate = nn.Linear(config.hidden_size, 1, bias=False)
 
@@ -218,10 +221,10 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
 
 
 QWEN3_5_MOE_CLASSES = {
-    'eager': partial(Qwen3_5MoeSparseMoeBlock, moe_implementation='eager'),
-    'triton': partial(Qwen3_5MoeSparseMoeBlock, moe_implementation='triton'),
-    'native': partial(Qwen3_5MoeSparseMoeBlock, moe_implementation='native'),
-    'quack': partial(Qwen3_5MoeSparseMoeBlock, moe_implementation='quack'),
+    "eager": partial(Qwen3_5MoeSparseMoeBlock, moe_implementation="eager"),
+    "triton": partial(Qwen3_5MoeSparseMoeBlock, moe_implementation="triton"),
+    "native": partial(Qwen3_5MoeSparseMoeBlock, moe_implementation="native"),
+    "quack": partial(Qwen3_5MoeSparseMoeBlock, moe_implementation="quack"),
 }
 
 
@@ -229,17 +232,17 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
     def __init__(self, config: Qwen3_5MoeConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.layer_type = config.layer_types[layer_idx] if layer_idx < len(config.layer_types) else 'full_attention'
+        self.layer_type = config.layer_types[layer_idx] if layer_idx < len(config.layer_types) else "full_attention"
         self.self_attn = None
         self.linear_attn = None
-        if self.layer_type == 'linear_attention':
+        if self.layer_type == "linear_attention":
             self.linear_attn = GatedDeltaNet(
                 hidden_size=config.hidden_size,
                 expand_v=config.linear_value_head_dim / config.linear_key_head_dim,
                 head_dim=config.linear_key_head_dim,
                 num_heads=config.linear_num_key_heads,
                 num_v_heads=config.linear_num_value_heads,
-                mode='chunk',
+                mode="chunk",
                 use_gate=config.attn_output_gate,
                 use_short_conv=True,
                 conv_size=config.linear_conv_kernel_dim,
@@ -254,7 +257,7 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
         if (layer_idx not in config.mlp_only_layers) and (
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
-            moe_implementation = getattr(config, '_moe_implementation', 'triton')
+            moe_implementation = getattr(config, "_moe_implementation", "triton")
             self.mlp = QWEN3_5_MOE_CLASSES[moe_implementation](config)
         else:
             self.mlp = Qwen3_5MoeMLP(config, intermediate_size=config.intermediate_size)
@@ -276,8 +279,8 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
 
         if self.linear_attn is not None:
             linear_kwargs = {}
-            if kwargs.get('cu_seq_lens_q') is not None:
-                linear_kwargs['cu_seqlens'] = kwargs.get('cu_seq_lens_q')
+            if kwargs.get("cu_seq_lens_q") is not None:
+                linear_kwargs["cu_seqlens"] = kwargs.get("cu_seq_lens_q")
             cp_context = build_linear_attention_cp_context(
                 kwargs.get("cu_seq_lens_q"),
                 conv1d_kernel_size=self.linear_attn.conv_size if self.linear_attn.use_short_conv else None,
@@ -325,8 +328,8 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
 
 class Qwen3_5MoePreTrainedModel(XorlPreTrainedModel):
     config_class = Qwen3_5MoeConfig
-    base_model_prefix = 'model'
-    _no_split_modules = ['Qwen3_5MoeDecoderLayer']
+    base_model_prefix = "model"
+    _no_split_modules = ["Qwen3_5MoeDecoderLayer"]
     _checkpoint_conversion_mapping = QWEN3_5_CHECKPOINT_CONVERSION_MAPPING
     _checkpoint_skip_key_patterns = QWEN3_5_CHECKPOINT_SKIP_KEY_PATTERNS
 
@@ -354,20 +357,20 @@ class Qwen3_5MoePreTrainedModel(XorlPreTrainedModel):
         return parallelize.get_ep_plan()
 
     def get_checkpoint_handler(self, **kwargs):
-        checkpoint_keys = kwargs.get('checkpoint_keys', set())
-        weights_path = kwargs.get('weights_path', None)
-        ep_rank = kwargs.get('ep_rank', 0)
-        ep_size = kwargs.get('ep_size', 1)
-        is_broadcast = kwargs.get('is_broadcast', False)
+        checkpoint_keys = kwargs.get("checkpoint_keys", set())
+        weights_path = kwargs.get("weights_path", None)
+        ep_rank = kwargs.get("ep_rank", 0)
+        ep_size = kwargs.get("ep_size", 1)
+        is_broadcast = kwargs.get("is_broadcast", False)
         has_per_expert = checkpoint_has_per_expert_weights(checkpoint_keys) if checkpoint_keys else True
         is_prequantized = detect_prequantized_checkpoint(weights_path)
-        exclude_modules = getattr(self, '_qlora_exclude_modules', None)
+        exclude_modules = getattr(self, "_qlora_exclude_modules", None)
         if exclude_modules is None:
             exclude_modules = get_prequantized_exclude_modules(weights_path) if is_prequantized else set()
         if is_broadcast:
             ep_rank, ep_size = 0, 1
-        unfused = getattr(self, '_unfused_for_tp', False)
-        head_dim = getattr(self.config, 'head_dim', self.config.hidden_size // self.config.num_attention_heads)
+        unfused = getattr(self, "_unfused_for_tp", False)
+        head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
         return Qwen3_5MoeCheckpointHandler(
             num_experts=self.config.num_experts,
             num_attention_heads=self.config.num_attention_heads,
@@ -392,7 +395,9 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList([Qwen3_5MoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList(
+            [Qwen3_5MoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
         self.norm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
@@ -417,11 +422,13 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
         **kwargs: Unpack[AttentionKwargs],
     ) -> MoeModelOutput:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_router_logits = output_router_logits if output_router_logits is not None else self.config.output_router_logits
+        output_router_logits = (
+            output_router_logits if output_router_logits is not None else self.config.output_router_logits
+        )
 
         if self.embed_tokens is not None:
             if (input_ids is None) ^ (inputs_embeds is not None):
-                raise ValueError('You must specify exactly one of input_ids or inputs_embeds')
+                raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
             if inputs_embeds is None:
                 inputs_embeds = self.embed_tokens(input_ids)
             hidden_states = inputs_embeds
@@ -497,12 +504,14 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
                 all_router_logits += (layer_outputs[-1],)
 
         hidden_states = self.norm(hidden_states) if self.norm is not None else hidden_states
-        return MoeModelOutput(last_hidden_state=hidden_states, attentions=all_self_attns, router_logits=all_router_logits)
+        return MoeModelOutput(
+            last_hidden_state=hidden_states, attentions=all_self_attns, router_logits=all_router_logits
+        )
 
 
 class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel):
-    _tied_weights_keys = {'lm_head.weight': 'model.embed_tokens.weight'}
-    _pp_plan = {'lm_head': (['hidden_states'], ['logits'])}
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
     _tp_plan = parallelize.MODEL_TP_PLAN
 
     def __init__(self, config):
@@ -539,11 +548,11 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel):
 
     def get_pp_module_config(self):
         return {
-            'input_fqns': ['model.embed_tokens'],
-            'layer_prefix': 'model.layers',
-            'output_fqns': ['model.norm', 'lm_head'],
-            'always_keep_fqns': ['model.rotary_emb'],
-            'num_layers': self.config.num_hidden_layers,
+            "input_fqns": ["model.embed_tokens"],
+            "layer_prefix": "model.layers",
+            "output_fqns": ["model.norm", "lm_head"],
+            "always_keep_fqns": ["model.rotary_emb"],
+            "num_layers": self.config.num_hidden_layers,
         }
 
     def forward(
@@ -573,9 +582,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoeForCausalLM):
 ModelClass = [Qwen3_5MoeForCausalLM, Qwen3_5MoeForConditionalGeneration]
 
 __all__ = [
-    'Qwen3_5MoeForCausalLM',
-    'Qwen3_5MoeForConditionalGeneration',
-    'Qwen3_5MoeModel',
-    'Qwen3_5MoePreTrainedModel',
-    'Qwen3_5MoeSparseMoeBlock',
+    "Qwen3_5MoeForCausalLM",
+    "Qwen3_5MoeForConditionalGeneration",
+    "Qwen3_5MoeModel",
+    "Qwen3_5MoePreTrainedModel",
+    "Qwen3_5MoeSparseMoeBlock",
 ]

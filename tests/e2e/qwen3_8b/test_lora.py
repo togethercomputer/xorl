@@ -11,11 +11,11 @@ from tests.e2e.e2e_utils import (
     skip_if_gpu_count_less_than,
 )
 
+
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.slow]
 
 
 class TestLoRA1GPU:
-
     @skip_if_gpu_count_less_than(1)
     def test_lora_loss_converges(self, tmp_workspace):
         """Qwen3-8B LoRA training shows strong loss convergence over 20 steps."""
@@ -39,7 +39,6 @@ class TestLoRA1GPU:
 
 
 class TestLoRA2GPU:
-
     @skip_if_gpu_count_less_than(2)
     def test_lora_fsdp2(self, tmp_workspace):
         """Qwen3-8B LoRA + FSDP2 on 2 GPUs converges."""

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 # Adapted from flash-linear-attention/fla/layers/gated_deltanet.py.
 # Portions of this file are adapted from flash-linear-attention, Copyright (c) 2023-2025 Songlin Yang, licensed under the MIT License.
-
 import math
 import warnings
 from typing import Any
@@ -144,7 +143,11 @@ class GatedDeltaNet(nn.Module):
 
         batch_size, q_len, _ = hidden_states.shape
         cp_context = kwargs.get("cp_context")
-        mode = self.mode if cp_context is not None else ("fused_recurrent" if (q_len <= 64 and not self.training) else self.mode)
+        mode = (
+            self.mode
+            if cp_context is not None
+            else ("fused_recurrent" if (q_len <= 64 and not self.training) else self.mode)
+        )
         if self.training and mode != "chunk":
             raise AssertionError("Only chunk mode is supported in training.")
 

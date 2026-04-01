@@ -5,11 +5,12 @@ from typing import Callable, Optional, Tuple, Unpack
 import torch
 from torch import nn
 
-from xorl.models.layers.normalization import RMSNorm
-from xorl.models.layers.rope import apply_rotary_pos_emb
+from xorl.distributed.sequence_parallel.strategy import get_cp_strategy
 from xorl.models.layers.attention.backend import ATTENTION_FUNCTIONS, AttentionKwargs
 from xorl.models.layers.attention.backend.eager import eager_attention_forward
-from xorl.distributed.sequence_parallel.strategy import get_cp_strategy
+from xorl.models.layers.normalization import RMSNorm
+from xorl.models.layers.rope import apply_rotary_pos_emb
+
 
 class MultiHeadAttention(nn.Module):
     """Base multi-head attention shared across all decoder model variants.
@@ -34,9 +35,7 @@ class MultiHeadAttention(nn.Module):
 
         self.q_dim = config.num_attention_heads * self.head_dim
         self.kv_dim = config.num_key_value_heads * self.head_dim
-        self.qkv_proj = nn.Linear(
-            config.hidden_size, self.q_dim + 2 * self.kv_dim, bias=config.attention_bias
-        )
+        self.qkv_proj = nn.Linear(config.hidden_size, self.q_dim + 2 * self.kv_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
@@ -56,9 +55,15 @@ class MultiHeadAttention(nn.Module):
         """Replace fused qkv_proj with separate q_proj, k_proj, v_proj for tensor parallelism."""
         device = self.qkv_proj.weight.device
         dtype = self.qkv_proj.weight.dtype
-        self.q_proj = nn.Linear(self.config.hidden_size, self.q_dim, bias=self.config.attention_bias, device=device, dtype=dtype)
-        self.k_proj = nn.Linear(self.config.hidden_size, self.kv_dim, bias=self.config.attention_bias, device=device, dtype=dtype)
-        self.v_proj = nn.Linear(self.config.hidden_size, self.kv_dim, bias=self.config.attention_bias, device=device, dtype=dtype)
+        self.q_proj = nn.Linear(
+            self.config.hidden_size, self.q_dim, bias=self.config.attention_bias, device=device, dtype=dtype
+        )
+        self.k_proj = nn.Linear(
+            self.config.hidden_size, self.kv_dim, bias=self.config.attention_bias, device=device, dtype=dtype
+        )
+        self.v_proj = nn.Linear(
+            self.config.hidden_size, self.kv_dim, bias=self.config.attention_bias, device=device, dtype=dtype
+        )
         del self.qkv_proj
 
     def _project_qkv(
@@ -91,7 +96,7 @@ class MultiHeadAttention(nn.Module):
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         # Optionally cast to bfloat16 after RoPE for SGLang numerical alignment
-        if getattr(self.config, '_attention_cast_bf16', False):
+        if getattr(self.config, "_attention_cast_bf16", False):
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
 
@@ -132,8 +137,6 @@ class MultiHeadAttention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         **kwargs: Unpack[AttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        
-
         attn_strategy = get_cp_strategy(num_kv_heads=self.config.num_key_value_heads)
 
         # Phase 1: QKV projection + norm + RoPE (+ pre-attention SP communication)

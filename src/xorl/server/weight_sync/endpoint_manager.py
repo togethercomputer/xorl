@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+
 logger = logging.getLogger(__name__)
 
 # Reusable session for HTTP connection pooling
@@ -52,10 +53,7 @@ class EndpointManager:
                 resp.raise_for_status()
                 logger.info(f"[EndpointMgr] {ep['host']}:{ep['port']} healthy")
             except Exception as e:
-                raise RuntimeError(
-                    f"Inference endpoint {ep['host']}:{ep['port']} "
-                    f"health check failed: {e}"
-                )
+                raise RuntimeError(f"Inference endpoint {ep['host']}:{ep['port']} health check failed: {e}")
 
     def pause(
         self,
@@ -113,8 +111,13 @@ class EndpointManager:
             futures = {
                 pool.submit(
                     self._request_with_retry,
-                    ep, url_path, operation, payload,
-                    timeout, max_retries, retry_delay,
+                    ep,
+                    url_path,
+                    operation,
+                    payload,
+                    timeout,
+                    max_retries,
+                    retry_delay,
                 ): ep
                 for ep in self.endpoints
             }
@@ -149,10 +152,7 @@ class EndpointManager:
                     "attempts": attempt + 1,
                 }
                 if success:
-                    logger.info(
-                        f"[EndpointMgr] {label} {operation} ok "
-                        f"(attempt {attempt + 1}/{max_retries})"
-                    )
+                    logger.info(f"[EndpointMgr] {label} {operation} ok (attempt {attempt + 1}/{max_retries})")
                     return result
                 logger.warning(
                     f"[EndpointMgr] {label} {operation} failed "
@@ -165,10 +165,7 @@ class EndpointManager:
                     "message": str(e),
                     "attempts": attempt + 1,
                 }
-                logger.warning(
-                    f"[EndpointMgr] {label} {operation} error "
-                    f"(attempt {attempt + 1}/{max_retries}): {e}"
-                )
+                logger.warning(f"[EndpointMgr] {label} {operation} error (attempt {attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
                 time.sleep(retry_delay)
 

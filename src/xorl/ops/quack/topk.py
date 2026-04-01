@@ -2,22 +2,19 @@
 
 import math
 from functools import partial
-from typing import Type, Optional
-
-import torch
+from typing import Optional, Type
 
 import cuda.bindings.driver as cuda
-
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Float32, const_expr
+import torch
+from cutlass import Float32, Int32, const_expr
 
-from . import utils
-from . import copy_utils
+from . import copy_utils, utils
 from .compile_utils import make_fake_tensor as fake_tensor
-from .reduction_base import ReductionBase
-from .reduce import row_reduce
 from .cute_dsl_utils import torch2cute_dtype_map
+from .reduce import row_reduce
+from .reduction_base import ReductionBase
 from .sort.bitonic_sort import bitonic_topk
 
 
@@ -48,9 +45,7 @@ class TopK:
         cols_per_block = num_threads // threads_per_row
         num_blocks_N = cute.ceil_div(min(N, 16384) // vecsize, threads_per_row)
         tiler_mn = (cols_per_block, vecsize * num_blocks_N * threads_per_row)
-        tiled_copy = copy_utils.tiled_copy_2d(
-            self.dtype, threads_per_row, num_threads, num_copy_elems=vecsize
-        )
+        tiled_copy = copy_utils.tiled_copy_2d(self.dtype, threads_per_row, num_threads, num_copy_elems=vecsize)
         return tiled_copy, tiler_mn, threads_per_row
 
     @cute.jit
@@ -98,9 +93,7 @@ class TopK:
         tXrX = cute.make_fragment_like(tXgX)
 
         is_even_N = const_expr(shape[1] == tiler_mn[1])
-        tXpX = (
-            None if is_even_N else copy_utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
-        )
+        tXpX = None if is_even_N else copy_utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
         copy = partial(copy_utils.copy, pred=tXpX)
 
         if tXcX[0][0] < shape[0]:
@@ -175,9 +168,7 @@ class TopK:
             # Get max from thread 0 (topk_vals[0] is the max since sorted descending)
             max_val = cute.arch.shuffle_sync(topk_vals[0], offset=0, mask_and_clamp=mask_and_clamp)
             log2_e = math.log2(math.e)
-            exp_x = cute.math.exp2(
-                topk_vals_split.load() * log2_e - (max_val * log2_e), fastmath=True
-            )
+            exp_x = cute.math.exp2(topk_vals_split.load() * log2_e - (max_val * log2_e), fastmath=True)
             denom = cute.arch.warp_reduction_sum(
                 exp_x.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0),
                 threads_in_group=threads_per_row,
@@ -215,9 +206,7 @@ class TopK:
 
 
 @torch.library.custom_op("quack::_topk_fwd", mutates_args={"values", "indices"})
-def _topk_fwd(
-    x: torch.Tensor, k: int, softmax: bool, values: torch.Tensor, indices: torch.Tensor
-) -> None:
+def _topk_fwd(x: torch.Tensor, k: int, softmax: bool, values: torch.Tensor, indices: torch.Tensor) -> None:
     """Top-k forward pass.
     Args:
         x: Input tensor of shape (M, N)
@@ -295,9 +284,7 @@ class TopKBackward(ReductionBase):
         cols_per_block = num_threads // threads_per_row
         num_blocks_N = cute.ceil_div(N // vecsize, threads_per_row)
         tiler_mn = (cols_per_block, vecsize * num_blocks_N * threads_per_row)
-        tiled_copy = copy_utils.tiled_copy_2d(
-            self.dtype, threads_per_row, num_threads, num_copy_elems=vecsize
-        )
+        tiled_copy = copy_utils.tiled_copy_2d(self.dtype, threads_per_row, num_threads, num_copy_elems=vecsize)
         return tiled_copy, tiler_mn, threads_per_row
 
     @cute.jit
@@ -315,9 +302,7 @@ class TopKBackward(ReductionBase):
         assert mIndices.element_type == Int32
         self._set_cluster_n()
         largest_dtype_width = const_expr(
-            max(
-                *(t.element_type.width for t in [mdValues, mValues, mIndices, mdX] if t is not None)
-            )
+            max(*(t.element_type.width for t in [mdValues, mValues, mIndices, mdX] if t is not None))
         )
         vecsize = math.gcd(self.N, 128 // largest_dtype_width)
         tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(self.N, vecsize=vecsize)
@@ -388,9 +373,7 @@ class TopKBackward(ReductionBase):
 
         is_even_N = const_expr(shape[1] == tiler_mn[1])
         tXpV = copy_utils.predicate_k(thr_copy.partition_S(cTopK), limit=mdValues.shape[1])
-        tXpX = (
-            None if is_even_N else copy_utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
-        )
+        tXpX = None if is_even_N else copy_utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
         copy_k = partial(copy_utils.copy, pred=tXpV)
         copy_dx = partial(copy_utils.copy, pred=tXpX)
 
@@ -429,9 +412,7 @@ class TopKBackward(ReductionBase):
                 for n in cutlass.range(tXrdV.shape[2], unroll_full=True):
                     if tXpV[rest_v, 0, n]:
                         for v in cutlass.range(tXrdV.shape[0][0], unroll_full=True):
-                            sdX[row - tile_row_start, tXrI[(v, rest_v), 0, n]] = grad_cvt[
-                                (v, rest_v), 0, n
-                            ]
+                            sdX[row - tile_row_start, tXrI[(v, rest_v), 0, n]] = grad_cvt[(v, rest_v), 0, n]
         cute.arch.barrier()
 
         # Read from smem to rmem, then write to gmem

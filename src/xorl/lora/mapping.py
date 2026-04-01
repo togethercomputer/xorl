@@ -29,6 +29,7 @@ def _ensure_moe_mapping():
     if not _moe_registered:
         _moe_registered = True
         from xorl.models.layers.moe import MoEExperts, MoEExpertsLoRA
+
         LORA_MAPPING[MoEExperts] = MoEExpertsLoRA
 
 
@@ -55,7 +56,7 @@ def get_lora_class_for_module(module: nn.Module) -> Optional[Type[Union[LoraModu
         return None
 
     # Check if module has 'lora_config' (already a LoRA module, e.g., MoE LoRA)
-    if hasattr(module, 'lora_config'):
+    if hasattr(module, "lora_config"):
         return None
 
     for source_cls, lora_cls in LORA_MAPPING.items():

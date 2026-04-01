@@ -3,14 +3,14 @@
 import time
 from unittest.mock import Mock
 
+import huggingface_hub
 import pytest
 import requests
-import huggingface_hub
 
 from xorl.data.prepare.utils import (
     RetryStrategy,
-    retry_on_request_exceptions,
     md5,
+    retry_on_request_exceptions,
     sha256,
 )
 
@@ -24,17 +24,23 @@ class TestRetryOnRequestExceptions:
     def test_success_retries_and_max_retries(self):
         """Covers immediate success, retry on ReadTimeout/HfHubHTTPError, max retries exhaustion,
         and non-request exception passthrough."""
+
         # Immediate success
         @retry_on_request_exceptions(max_retries=3, delay=0.01)
         def success_func():
             return "success"
+
         assert success_func() == "success"
 
         # Retry on ReadTimeout
-        mock_func = Mock(side_effect=[requests.exceptions.ReadTimeout("t"), requests.exceptions.ReadTimeout("t"), "success"])
+        mock_func = Mock(
+            side_effect=[requests.exceptions.ReadTimeout("t"), requests.exceptions.ReadTimeout("t"), "success"]
+        )
+
         @retry_on_request_exceptions(max_retries=3, delay=0.01)
         def retry_func():
             return mock_func()
+
         assert retry_func() == "success"
         assert mock_func.call_count == 3
 
@@ -42,16 +48,21 @@ class TestRetryOnRequestExceptions:
         mock_response = Mock()
         mock_response.status_code = 500
         mock_response.headers = {}
-        mock_func2 = Mock(side_effect=[huggingface_hub.errors.HfHubHTTPError("HF error", response=mock_response), "success"])
+        mock_func2 = Mock(
+            side_effect=[huggingface_hub.errors.HfHubHTTPError("HF error", response=mock_response), "success"]
+        )
+
         @retry_on_request_exceptions(max_retries=3, delay=0.01)
         def hf_func():
             return mock_func2()
+
         assert hf_func() == "success"
 
         # Max retries exhausted
         @retry_on_request_exceptions(max_retries=2, delay=0.01)
         def failing_func():
             raise requests.exceptions.ReadTimeout("persistent timeout")
+
         with pytest.raises(requests.exceptions.ReadTimeout):
             failing_func()
 
@@ -59,6 +70,7 @@ class TestRetryOnRequestExceptions:
         @retry_on_request_exceptions(max_retries=3, delay=0.01)
         def value_error_func():
             raise ValueError("not a request exception")
+
         with pytest.raises(ValueError):
             value_error_func()
 
@@ -70,7 +82,9 @@ class TestRetryOnRequestExceptions:
             (RetryStrategy.CONSTANT, lambda d1, d2: abs(d2 - d1) < d1 * 0.5),
         ]:
             call_times = []
-            mock_func = Mock(side_effect=[requests.exceptions.ReadTimeout("t"), requests.exceptions.ReadTimeout("t"), "success"])
+            mock_func = Mock(
+                side_effect=[requests.exceptions.ReadTimeout("t"), requests.exceptions.ReadTimeout("t"), "success"]
+            )
 
             @retry_on_request_exceptions(max_retries=3, delay=0.1, retry_strategy=strategy)
             def func():

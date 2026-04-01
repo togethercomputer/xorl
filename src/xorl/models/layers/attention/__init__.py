@@ -1,16 +1,17 @@
-from .multi_head_attention import MultiHeadAttention
-from .utils import repeat_kv
 from .backend import (
     ATTENTION_FUNCTIONS,
-    AttentionKwargs,
     CAUSAL_MASK_FUNCTIONS,
     FLASH_ATTENTION_IMPLEMENTATIONS,
+    AttentionKwargs,
     FlashAttentionKwargs,
     is_flash_attention,
     update_causal_mask,
 )
-from .backend.eager import eager_attention_forward
 from .backend._mask_utils import prepare_4d_causal_attention_mask_with_cache_position
+from .backend.eager import eager_attention_forward
+from .multi_head_attention import MultiHeadAttention
+from .utils import repeat_kv
+
 
 # Conditional import — flash may not be installed
 try:

@@ -81,8 +81,14 @@ class QuackEPGroupGemmMoeAct(torch.autograd.Function):
         if down_proj.requires_grad:
             grad_down_proj = torch.empty_like(down_proj)
             quack_group_gemm_same_mn(
-                a=gated_output, b=grad_output, c=grad_down_proj, cumsum_K=cumsum,
-                max_K=max_M, transpose_a=True, transpose_b=False, cu_seqlens_k=cu_seqlens_m
+                a=gated_output,
+                b=grad_output,
+                c=grad_down_proj,
+                cumsum_K=cumsum,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
+                cu_seqlens_k=cu_seqlens_m,
             )
         del gated_output
 
@@ -90,9 +96,7 @@ class QuackEPGroupGemmMoeAct(torch.autograd.Function):
         grad_up_output = gate_activation * grad_gated_output
         grad_gate_activation = grad_gated_output * up_output
         del grad_gated_output, gate_activation, up_output
-        grad_gate_output = torch.ops.aten.silu_backward(
-            grad_gate_activation, gate_output
-        )
+        grad_gate_output = torch.ops.aten.silu_backward(grad_gate_activation, gate_output)
         del grad_gate_activation, gate_output
 
         # dgrad FC1: in-place add
@@ -108,16 +112,28 @@ class QuackEPGroupGemmMoeAct(torch.autograd.Function):
         if gate_proj.requires_grad:
             grad_gate_proj = torch.empty_like(gate_proj)
             quack_group_gemm_same_mn(
-                a=permute_tokens, b=grad_gate_output, c=grad_gate_proj, cumsum_K=cumsum,
-                max_K=max_M, transpose_a=True, transpose_b=False, cu_seqlens_k=cu_seqlens_m
+                a=permute_tokens,
+                b=grad_gate_output,
+                c=grad_gate_proj,
+                cumsum_K=cumsum,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
+                cu_seqlens_k=cu_seqlens_m,
             )
         del grad_gate_output
         grad_up_proj = None
         if up_proj.requires_grad:
             grad_up_proj = torch.empty_like(up_proj)
             quack_group_gemm_same_mn(
-                a=permute_tokens, b=grad_up_output, c=grad_up_proj, cumsum_K=cumsum,
-                max_K=max_M, transpose_a=True, transpose_b=False, cu_seqlens_k=cu_seqlens_m
+                a=permute_tokens,
+                b=grad_up_output,
+                c=grad_up_proj,
+                cumsum_K=cumsum,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
+                cu_seqlens_k=cu_seqlens_m,
             )
         del grad_up_output
 
@@ -129,7 +145,9 @@ class QuackMoeExpertsFunction(torch.autograd.Function):
     explicit del for dead tensors, in-place add for dgrad."""
 
     @staticmethod
-    def forward(ctx, num_experts, gate_weights, expert_index, hidden_states, gate_proj, up_proj, down_proj, gate_up_weight=None):
+    def forward(
+        ctx, num_experts, gate_weights, expert_index, hidden_states, gate_proj, up_proj, down_proj, gate_up_weight=None
+    ):
         scatter_output, scatter_index, cumsum_t = _scatter_and_cumsum(hidden_states, expert_index, num_experts)
         max_M = scatter_output.shape[0]
         cu_seqlens = cumsum_to_cu_seqlens(cumsum_t)
@@ -159,18 +177,32 @@ class QuackMoeExpertsFunction(torch.autograd.Function):
         del down_output
 
         ctx.save_for_backward(
-            gate_weights, gate_proj, up_proj, down_proj,
-            hidden_states, scatter_index, cumsum_t,
-            gate_output, up_output, scattered_gate_weight,
+            gate_weights,
+            gate_proj,
+            up_proj,
+            down_proj,
+            hidden_states,
+            scatter_index,
+            cumsum_t,
+            gate_output,
+            up_output,
+            scattered_gate_weight,
         )
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
         (
-            gate_weights, gate_proj, up_proj, down_proj,
-            hidden_states, scatter_index, cumsum_t,
-            gate_output, up_output, scattered_gate_weight,
+            gate_weights,
+            gate_proj,
+            up_proj,
+            down_proj,
+            hidden_states,
+            scatter_index,
+            cumsum_t,
+            gate_output,
+            up_output,
+            scattered_gate_weight,
         ) = ctx.saved_tensors
         grad_output = grad_output.view(-1, grad_output.shape[-1])
         max_M = grad_output.shape[0]
@@ -194,8 +226,14 @@ class QuackMoeExpertsFunction(torch.autograd.Function):
         if down_proj.requires_grad:
             grad_down_proj = torch.empty_like(down_proj)
             quack_group_gemm_same_mn(
-                a=gated_weighted, b=grad_down_output, c=grad_down_proj, cumsum_K=cumsum_t,
-                max_K=max_M, transpose_a=True, transpose_b=False, cu_seqlens_k=cu_seqlens_m
+                a=gated_weighted,
+                b=grad_down_output,
+                c=grad_down_proj,
+                cumsum_K=cumsum_t,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
+                cu_seqlens_k=cu_seqlens_m,
             )
         del grad_down_output, gated_weighted
 
@@ -209,9 +247,7 @@ class QuackMoeExpertsFunction(torch.autograd.Function):
         grad_up_output = gate_activation * grad_gated_activation
         grad_gate_activation = grad_gated_activation * up_output
         del grad_gated_activation, gate_activation, up_output
-        grad_gate_output = torch.ops.aten.silu_backward(
-            grad_gate_activation, gate_output
-        )
+        grad_gate_output = torch.ops.aten.silu_backward(grad_gate_activation, gate_output)
         del grad_gate_activation, gate_output
 
         # dgrad FC1: in-place add
@@ -227,16 +263,28 @@ class QuackMoeExpertsFunction(torch.autograd.Function):
         if gate_proj.requires_grad:
             grad_gate_proj = torch.empty_like(gate_proj)
             quack_group_gemm_same_mn(
-                a=scatter_output, b=grad_gate_output, c=grad_gate_proj, cumsum_K=cumsum_t,
-                max_K=max_M, transpose_a=True, transpose_b=False, cu_seqlens_k=cu_seqlens_m
+                a=scatter_output,
+                b=grad_gate_output,
+                c=grad_gate_proj,
+                cumsum_K=cumsum_t,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
+                cu_seqlens_k=cu_seqlens_m,
             )
         del grad_gate_output
         grad_up_proj = None
         if up_proj.requires_grad:
             grad_up_proj = torch.empty_like(up_proj)
             quack_group_gemm_same_mn(
-                a=scatter_output, b=grad_up_output, c=grad_up_proj, cumsum_K=cumsum_t,
-                max_K=max_M, transpose_a=True, transpose_b=False, cu_seqlens_k=cu_seqlens_m
+                a=scatter_output,
+                b=grad_up_output,
+                c=grad_up_proj,
+                cumsum_K=cumsum_t,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
+                cu_seqlens_k=cu_seqlens_m,
             )
         del grad_up_output, scatter_output
 
@@ -254,8 +302,14 @@ class QuackEPGroupGemm(torch.autograd.Function):
 
         if _DEBUG_EP:
             return QuackEPGroupGemm._forward_debug(
-                ctx, permute_tokens, cumsum, gate_proj, up_proj, down_proj,
-                max_M, cu_seqlens,
+                ctx,
+                permute_tokens,
+                cumsum,
+                gate_proj,
+                up_proj,
+                down_proj,
+                max_M,
+                cu_seqlens,
             )
 
         gate_output = quack_group_gemm_same_nk(
@@ -346,8 +400,14 @@ class QuackEPGroupGemm(torch.autograd.Function):
         if down_proj.requires_grad:
             grad_down_proj = torch.empty_like(down_proj)
             quack_group_gemm_same_mn(
-                a=gated_output, b=grad_output, c=grad_down_proj, cumsum_K=cumsum,
-                max_K=max_M, transpose_a=True, transpose_b=False, cu_seqlens_k=cu_seqlens_m
+                a=gated_output,
+                b=grad_output,
+                c=grad_down_proj,
+                cumsum_K=cumsum,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
+                cu_seqlens_k=cu_seqlens_m,
             )
         del gated_output
 
@@ -355,9 +415,7 @@ class QuackEPGroupGemm(torch.autograd.Function):
         grad_up_output = gate_activation * grad_gated_output
         grad_gate_activation = grad_gated_output * up_output
         del grad_gated_output, gate_activation, up_output
-        grad_gate_output = torch.ops.aten.silu_backward(
-            grad_gate_activation, gate_output
-        )
+        grad_gate_output = torch.ops.aten.silu_backward(grad_gate_activation, gate_output)
         del grad_gate_activation, gate_output
 
         # dgrad FC1: in-place add
@@ -373,16 +431,28 @@ class QuackEPGroupGemm(torch.autograd.Function):
         if gate_proj.requires_grad:
             grad_gate_proj = torch.empty_like(gate_proj)
             quack_group_gemm_same_mn(
-                a=permute_tokens, b=grad_gate_output, c=grad_gate_proj, cumsum_K=cumsum,
-                max_K=max_M, transpose_a=True, transpose_b=False, cu_seqlens_k=cu_seqlens_m
+                a=permute_tokens,
+                b=grad_gate_output,
+                c=grad_gate_proj,
+                cumsum_K=cumsum,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
+                cu_seqlens_k=cu_seqlens_m,
             )
         del grad_gate_output
         grad_up_proj = None
         if up_proj.requires_grad:
             grad_up_proj = torch.empty_like(up_proj)
             quack_group_gemm_same_mn(
-                a=permute_tokens, b=grad_up_output, c=grad_up_proj, cumsum_K=cumsum,
-                max_K=max_M, transpose_a=True, transpose_b=False, cu_seqlens_k=cu_seqlens_m
+                a=permute_tokens,
+                b=grad_up_output,
+                c=grad_up_proj,
+                cumsum_K=cumsum,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
+                cu_seqlens_k=cu_seqlens_m,
             )
         del grad_up_output
 
@@ -425,18 +495,32 @@ class QuackTPMoeExpertsFunction(torch.autograd.Function):
 
         ctx.tp_group = tp_group
         ctx.save_for_backward(
-            gate_weights, gate_proj, up_proj, down_proj,
-            hidden_states, scatter_index, cumsum_t,
-            gate_output, up_output, scattered_gate_weight,
+            gate_weights,
+            gate_proj,
+            up_proj,
+            down_proj,
+            hidden_states,
+            scatter_index,
+            cumsum_t,
+            gate_output,
+            up_output,
+            scattered_gate_weight,
         )
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
         (
-            gate_weights, gate_proj, up_proj, down_proj,
-            hidden_states, scatter_index, cumsum_t,
-            gate_output, up_output, scattered_gate_weight,
+            gate_weights,
+            gate_proj,
+            up_proj,
+            down_proj,
+            hidden_states,
+            scatter_index,
+            cumsum_t,
+            gate_output,
+            up_output,
+            scattered_gate_weight,
         ) = ctx.saved_tensors
         tp_group = ctx.tp_group
         grad_output = grad_output.view(-1, grad_output.shape[-1])
@@ -461,8 +545,14 @@ class QuackTPMoeExpertsFunction(torch.autograd.Function):
         if down_proj.requires_grad:
             grad_down_proj = torch.empty_like(down_proj)
             quack_group_gemm_same_mn(
-                a=gated_weighted, b=grad_down_output, c=grad_down_proj, cumsum_K=cumsum_t,
-                max_K=max_M, transpose_a=True, transpose_b=False, cu_seqlens_k=cu_seqlens_m
+                a=gated_weighted,
+                b=grad_down_output,
+                c=grad_down_proj,
+                cumsum_K=cumsum_t,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
+                cu_seqlens_k=cu_seqlens_m,
             )
         del grad_down_output, gated_weighted
 
@@ -476,9 +566,7 @@ class QuackTPMoeExpertsFunction(torch.autograd.Function):
         grad_up_output = gate_activation * grad_gated_activation
         grad_gate_activation = grad_gated_activation * up_output
         del grad_gated_activation, gate_activation, up_output
-        grad_gate_output = torch.ops.aten.silu_backward(
-            grad_gate_activation, gate_output
-        )
+        grad_gate_output = torch.ops.aten.silu_backward(grad_gate_activation, gate_output)
         del grad_gate_activation, gate_output
 
         # dgrad FC1: in-place add
@@ -495,16 +583,28 @@ class QuackTPMoeExpertsFunction(torch.autograd.Function):
         if gate_proj.requires_grad:
             grad_gate_proj = torch.empty_like(gate_proj)
             quack_group_gemm_same_mn(
-                a=scatter_output, b=grad_gate_output, c=grad_gate_proj, cumsum_K=cumsum_t,
-                max_K=max_M, transpose_a=True, transpose_b=False, cu_seqlens_k=cu_seqlens_m
+                a=scatter_output,
+                b=grad_gate_output,
+                c=grad_gate_proj,
+                cumsum_K=cumsum_t,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
+                cu_seqlens_k=cu_seqlens_m,
             )
         del grad_gate_output
         grad_up_proj = None
         if up_proj.requires_grad:
             grad_up_proj = torch.empty_like(up_proj)
             quack_group_gemm_same_mn(
-                a=scatter_output, b=grad_up_output, c=grad_up_proj, cumsum_K=cumsum_t,
-                max_K=max_M, transpose_a=True, transpose_b=False, cu_seqlens_k=cu_seqlens_m
+                a=scatter_output,
+                b=grad_up_output,
+                c=grad_up_proj,
+                cumsum_K=cumsum_t,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
+                cu_seqlens_k=cu_seqlens_m,
             )
         del grad_up_output, scatter_output
 
@@ -548,7 +648,9 @@ class QuackMoeExpertsFunctionMoeAct(torch.autograd.Function):
     from save_for_backward and recomputes them in backward."""
 
     @staticmethod
-    def forward(ctx, num_experts, gate_weights, expert_index, hidden_states, gate_proj, up_proj, down_proj, gate_up_weight=None):
+    def forward(
+        ctx, num_experts, gate_weights, expert_index, hidden_states, gate_proj, up_proj, down_proj, gate_up_weight=None
+    ):
         scatter_output, scatter_index, cumsum_t = _scatter_and_cumsum(hidden_states, expert_index, num_experts)
         max_M = scatter_output.shape[0]
         cu_seqlens = cumsum_to_cu_seqlens(cumsum_t)
@@ -579,8 +681,13 @@ class QuackMoeExpertsFunctionMoeAct(torch.autograd.Function):
 
         # moe_act: save 8 tensors (drop gate_output, up_output vs 10 in standard)
         ctx.save_for_backward(
-            gate_weights, gate_proj, up_proj, down_proj,
-            hidden_states, scatter_index, cumsum_t,
+            gate_weights,
+            gate_proj,
+            up_proj,
+            down_proj,
+            hidden_states,
+            scatter_index,
+            cumsum_t,
             scattered_gate_weight,
         )
         return output
@@ -588,8 +695,13 @@ class QuackMoeExpertsFunctionMoeAct(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         (
-            gate_weights, gate_proj, up_proj, down_proj,
-            hidden_states, scatter_index, cumsum_t,
+            gate_weights,
+            gate_proj,
+            up_proj,
+            down_proj,
+            hidden_states,
+            scatter_index,
+            cumsum_t,
             scattered_gate_weight,
         ) = ctx.saved_tensors
         grad_output = grad_output.view(-1, grad_output.shape[-1])
@@ -621,8 +733,14 @@ class QuackMoeExpertsFunctionMoeAct(torch.autograd.Function):
         if down_proj.requires_grad:
             grad_down_proj = torch.empty_like(down_proj)
             quack_group_gemm_same_mn(
-                a=gated_weighted, b=grad_down_output, c=grad_down_proj, cumsum_K=cumsum_t,
-                max_K=max_M, transpose_a=True, transpose_b=False, cu_seqlens_k=cu_seqlens_m
+                a=gated_weighted,
+                b=grad_down_output,
+                c=grad_down_proj,
+                cumsum_K=cumsum_t,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
+                cu_seqlens_k=cu_seqlens_m,
             )
         del grad_down_output, gated_weighted
 
@@ -636,9 +754,7 @@ class QuackMoeExpertsFunctionMoeAct(torch.autograd.Function):
         grad_up_output = gate_activation * grad_gated_activation
         grad_gate_activation = grad_gated_activation * up_output
         del grad_gated_activation, gate_activation, up_output
-        grad_gate_output = torch.ops.aten.silu_backward(
-            grad_gate_activation, gate_output
-        )
+        grad_gate_output = torch.ops.aten.silu_backward(grad_gate_activation, gate_output)
         del grad_gate_activation, gate_output
 
         # dgrad FC1: in-place add
@@ -654,16 +770,28 @@ class QuackMoeExpertsFunctionMoeAct(torch.autograd.Function):
         if gate_proj.requires_grad:
             grad_gate_proj = torch.empty_like(gate_proj)
             quack_group_gemm_same_mn(
-                a=scatter_output, b=grad_gate_output, c=grad_gate_proj, cumsum_K=cumsum_t,
-                max_K=max_M, transpose_a=True, transpose_b=False, cu_seqlens_k=cu_seqlens_m
+                a=scatter_output,
+                b=grad_gate_output,
+                c=grad_gate_proj,
+                cumsum_K=cumsum_t,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
+                cu_seqlens_k=cu_seqlens_m,
             )
         del grad_gate_output
         grad_up_proj = None
         if up_proj.requires_grad:
             grad_up_proj = torch.empty_like(up_proj)
             quack_group_gemm_same_mn(
-                a=scatter_output, b=grad_up_output, c=grad_up_proj, cumsum_K=cumsum_t,
-                max_K=max_M, transpose_a=True, transpose_b=False, cu_seqlens_k=cu_seqlens_m
+                a=scatter_output,
+                b=grad_up_output,
+                c=grad_up_proj,
+                cumsum_K=cumsum_t,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
+                cu_seqlens_k=cu_seqlens_m,
             )
         del grad_up_output, scatter_output
 

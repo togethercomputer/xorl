@@ -13,13 +13,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from xorl.server.api_server.server import APIServer, validate_model_id
 from xorl.server.api_server.api_types import (
-    SaveWeightsRequest,
-    LoadWeightsRequest,
-    ListCheckpointsRequest,
     DeleteCheckpointRequest,
+    ListCheckpointsRequest,
+    LoadWeightsRequest,
+    SaveWeightsRequest,
 )
+from xorl.server.api_server.server import APIServer, validate_model_id
 
 
 class TestTomiUriAndPathConstruction:
@@ -43,9 +43,7 @@ class TestTomiUriAndPathConstruction:
         assert uri == "xorl://user_123/weights/checkpoint-001"
 
         # Parse xorl:// URI
-        model_id, checkpoint_name, _ = self.server._from_xorl_uri(
-            "xorl://user_123/weights/checkpoint-001"
-        )
+        model_id, checkpoint_name, _ = self.server._from_xorl_uri("xorl://user_123/weights/checkpoint-001")
         assert model_id == "user_123"
         assert checkpoint_name == "checkpoint-001"
 
@@ -94,10 +92,14 @@ class TestSaveAndLoadWeightsPaths:
 
         # --- Save creates correct structure ---
         model_id = "user_123"
-        mock_output.outputs = [{"checkpoint_path": f"{self.temp_dir}/weights/{model_id}/my_checkpoint", "success": True}]
-        with patch.object(self.server, '_wait_for_response', return_value=mock_output):
+        mock_output.outputs = [
+            {"checkpoint_path": f"{self.temp_dir}/weights/{model_id}/my_checkpoint", "success": True}
+        ]
+        with patch.object(self.server, "_wait_for_response", return_value=mock_output):
             self.server.orchestrator_client.send_request = AsyncMock(return_value=AsyncMock())
-            response = asyncio.run(self.server.save_weights(SaveWeightsRequest(model_id=model_id, path="my_checkpoint")))
+            response = asyncio.run(
+                self.server.save_weights(SaveWeightsRequest(model_id=model_id, path="my_checkpoint"))
+            )
         assert model_id in response.path and "my_checkpoint" in response.path
 
         # --- Save rejects existing checkpoint (409) ---
@@ -115,37 +117,47 @@ class TestSaveAndLoadWeightsPaths:
 
         # xorl:// URI
         os.makedirs(os.path.join(self.temp_dir, "weights", "user_abc", "ckpt-001"), exist_ok=True)
-        with patch.object(self.server, '_wait_for_response', return_value=mock_output):
+        with patch.object(self.server, "_wait_for_response", return_value=mock_output):
             self.server.orchestrator_client.send_request = AsyncMock()
-            response = asyncio.run(self.server.load_weights(LoadWeightsRequest(model_id="user_abc", path="xorl://user_abc/weights/ckpt-001")))
+            response = asyncio.run(
+                self.server.load_weights(
+                    LoadWeightsRequest(model_id="user_abc", path="xorl://user_abc/weights/ckpt-001")
+                )
+            )
         assert response.path == "xorl://user_abc/weights/ckpt-001"
 
         # weights/model_id/name (cross-model)
         os.makedirs(os.path.join(self.temp_dir, "weights", "default", "000000"), exist_ok=True)
-        with patch.object(self.server, '_wait_for_response', return_value=mock_output):
+        with patch.object(self.server, "_wait_for_response", return_value=mock_output):
             self.server.orchestrator_client.send_request = AsyncMock()
-            response = asyncio.run(self.server.load_weights(LoadWeightsRequest(model_id="run-2", path="weights/default/000000")))
+            response = asyncio.run(
+                self.server.load_weights(LoadWeightsRequest(model_id="run-2", path="weights/default/000000"))
+            )
         assert response.path == "weights/default/000000"
 
         # model_id/checkpoint format
         os.makedirs(os.path.join(self.temp_dir, "weights", "other_run", "step-100"), exist_ok=True)
-        with patch.object(self.server, '_wait_for_response', return_value=mock_output):
+        with patch.object(self.server, "_wait_for_response", return_value=mock_output):
             self.server.orchestrator_client.send_request = AsyncMock()
-            response = asyncio.run(self.server.load_weights(LoadWeightsRequest(model_id="my_run", path="other_run/step-100")))
+            response = asyncio.run(
+                self.server.load_weights(LoadWeightsRequest(model_id="my_run", path="other_run/step-100"))
+            )
         assert response.path == "other_run/step-100"
 
         # checkpoint name only
         os.makedirs(os.path.join(self.temp_dir, "weights", "my_model", "ckpt-002"), exist_ok=True)
-        with patch.object(self.server, '_wait_for_response', return_value=mock_output):
+        with patch.object(self.server, "_wait_for_response", return_value=mock_output):
             self.server.orchestrator_client.send_request = AsyncMock()
             response = asyncio.run(self.server.load_weights(LoadWeightsRequest(model_id="my_model", path="ckpt-002")))
         assert response.path == "ckpt-002"
 
         # legacy weights/checkpoint format
         os.makedirs(os.path.join(self.temp_dir, "weights", "some_model", "000000"), exist_ok=True)
-        with patch.object(self.server, '_wait_for_response', return_value=mock_output):
+        with patch.object(self.server, "_wait_for_response", return_value=mock_output):
             self.server.orchestrator_client.send_request = AsyncMock()
-            response = asyncio.run(self.server.load_weights(LoadWeightsRequest(model_id="some_model", path="weights/000000")))
+            response = asyncio.run(
+                self.server.load_weights(LoadWeightsRequest(model_id="some_model", path="weights/000000"))
+            )
         assert response.path == "weights/000000"
 
         # --- Load errors: 404 and isolation ---
@@ -155,9 +167,11 @@ class TestSaveAndLoadWeightsPaths:
 
         # Explicit path uses path's model_id
         os.makedirs(os.path.join(self.temp_dir, "weights", "user_a", "step-50"), exist_ok=True)
-        with patch.object(self.server, '_wait_for_response', return_value=mock_output):
+        with patch.object(self.server, "_wait_for_response", return_value=mock_output):
             self.server.orchestrator_client.send_request = AsyncMock()
-            response = asyncio.run(self.server.load_weights(LoadWeightsRequest(model_id="user_b", path="weights/user_a/step-50")))
+            response = asyncio.run(
+                self.server.load_weights(LoadWeightsRequest(model_id="user_b", path="weights/user_a/step-50"))
+            )
         assert response.path == "weights/user_a/step-50"
 
         with pytest.raises(HTTPException) as exc_info:
@@ -166,7 +180,7 @@ class TestSaveAndLoadWeightsPaths:
 
         # --- Auto-save 000000 checkpoint ---
         mock_output.outputs = [{"checkpoint_path": f"{self.temp_dir}/weights/test_model/000000"}]
-        with patch.object(self.server, '_wait_for_response', return_value=mock_output):
+        with patch.object(self.server, "_wait_for_response", return_value=mock_output):
             self.server.orchestrator_client.send_request = AsyncMock()
             response = asyncio.run(self.server.save_weights(SaveWeightsRequest(model_id="test_model", path="000000")))
         assert "000000" in response.path
@@ -174,7 +188,7 @@ class TestSaveAndLoadWeightsPaths:
         # Load 000000 after save
         os.makedirs(os.path.join(self.temp_dir, "weights", "test_model", "000000"), exist_ok=True)
         mock_output.outputs = [{"success": True}]
-        with patch.object(self.server, '_wait_for_response', return_value=mock_output):
+        with patch.object(self.server, "_wait_for_response", return_value=mock_output):
             self.server.orchestrator_client.send_request = AsyncMock()
             response = asyncio.run(self.server.load_weights(LoadWeightsRequest(model_id="test_model", path="000000")))
         assert response.path == "000000"
@@ -217,15 +231,21 @@ class TestListDeleteAndIsolation:
         # --- Delete: success, reserved blocked, invalid format ---
         ckpt_path = os.path.join(self.temp_dir, "weights", "del_test", "to_delete")
         os.makedirs(ckpt_path, exist_ok=True)
-        response = asyncio.run(self.server.delete_checkpoint(
-            DeleteCheckpointRequest(model_id="del_test", checkpoint_id="weights/del_test/to_delete")))
+        response = asyncio.run(
+            self.server.delete_checkpoint(
+                DeleteCheckpointRequest(model_id="del_test", checkpoint_id="weights/del_test/to_delete")
+            )
+        )
         assert response.success is True and not os.path.exists(ckpt_path)
 
         reserved = os.path.join(self.temp_dir, "weights", "res_test", "000000")
         os.makedirs(reserved, exist_ok=True)
         with pytest.raises(HTTPException) as exc_info:
-            asyncio.run(self.server.delete_checkpoint(
-                DeleteCheckpointRequest(model_id="res_test", checkpoint_id="weights/res_test/000000")))
+            asyncio.run(
+                self.server.delete_checkpoint(
+                    DeleteCheckpointRequest(model_id="res_test", checkpoint_id="weights/res_test/000000")
+                )
+            )
         assert exc_info.value.status_code == 403 and os.path.exists(reserved)
 
         with pytest.raises(HTTPException) as exc_info:
@@ -267,8 +287,17 @@ class TestModelIdValidation:
         assert validate_model_id(None) == "default"
 
         # Invalid
-        for mid in ["../etc/passwd", "user/name", "user\\name", "user name", "user@name",
-                     "user.name", "_start", "-start", "a" * 129]:
+        for mid in [
+            "../etc/passwd",
+            "user/name",
+            "user\\name",
+            "user name",
+            "user@name",
+            "user.name",
+            "_start",
+            "-start",
+            "a" * 129,
+        ]:
             with pytest.raises(HTTPException) as exc_info:
                 validate_model_id(mid)
             assert exc_info.value.status_code == 400
@@ -315,13 +344,19 @@ class TestSamplerWeightsAndAdapterTracking:
         # --- Sampler deletion ---
         sp = os.path.join(self.temp_dir, "sampler_weights", "to-delete")
         os.makedirs(sp, exist_ok=True)
-        response = asyncio.run(self.server.delete_checkpoint(
-            DeleteCheckpointRequest(model_id="any", checkpoint_id="sampler_weights/to-delete")))
+        response = asyncio.run(
+            self.server.delete_checkpoint(
+                DeleteCheckpointRequest(model_id="any", checkpoint_id="sampler_weights/to-delete")
+            )
+        )
         assert response.success is True and not os.path.exists(sp)
 
         with pytest.raises(HTTPException) as exc_info:
-            asyncio.run(self.server.delete_checkpoint(
-                DeleteCheckpointRequest(model_id="any", checkpoint_id="sampler_weights/nonexistent")))
+            asyncio.run(
+                self.server.delete_checkpoint(
+                    DeleteCheckpointRequest(model_id="any", checkpoint_id="sampler_weights/nonexistent")
+                )
+            )
         assert exc_info.value.status_code == 404
 
         # --- Path resolution ---

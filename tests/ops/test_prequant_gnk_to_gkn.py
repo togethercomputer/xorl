@@ -18,12 +18,12 @@ import torch
 import triton
 
 from xorl.ops.quantize import (
-    block_fp8_quantize_gkn,
     block_fp8_dequantize_gkn,
+    block_fp8_quantize_gkn,
     nvfp4_quantize,
-    nvfp4_dequantize,
 )
-from xorl.ops.quantize.nvfp4_gkn_quantize import nvfp4_quantize_gkn, nvfp4_dequantize_gkn
+from xorl.ops.quantize.nvfp4_gkn_quantize import nvfp4_dequantize_gkn, nvfp4_quantize_gkn
+
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -31,6 +31,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 # =========================================================================
 # Block FP8 -- GNK -> GKN
 # =========================================================================
+
 
 class TestBlockFP8PrequantGNKtoGKN:
     """Verify block_fp8 quantized data can be correctly transposed from GNK to GKN."""
@@ -96,6 +97,7 @@ class TestBlockFP8PrequantGNKtoGKN:
 # =========================================================================
 # NVFP4 -- GNK -> GKN
 # =========================================================================
+
 
 class TestNVFP4PrequantGNKtoGKN:
     """Verify nvfp4 quantized data can be correctly transposed from GNK to GKN."""

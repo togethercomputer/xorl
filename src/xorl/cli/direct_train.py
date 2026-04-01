@@ -6,10 +6,9 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import json
-import time
 import socket
-from dataclasses import asdict, dataclass, field
-from functools import partial
+import time
+from dataclasses import asdict
 from typing import Any, Dict, List
 
 import torch.distributed as dist
@@ -64,6 +63,7 @@ def main():
         save_args(args, args.train.output_dir)
         if args.train.use_wandb:
             import wandb
+
             wandb.init(
                 project=args.train.wandb_project,
                 name=args.train.wandb_name,
@@ -83,12 +83,10 @@ def main():
     dist.all_gather_object(gathered_hosts, host_payload)
     if args.train.global_rank == 0:
         unique_hostnames = sorted({item["hostname"] for item in gathered_hosts if item is not None})
-        rank_to_hostname = {
-            str(item["global_rank"]): item["hostname"]
-            for item in gathered_hosts if item is not None
-        }
+        rank_to_hostname = {str(item["global_rank"]): item["hostname"] for item in gathered_hosts if item is not None}
         logger.info_rank0(
-            "Host inventory:\n" + json.dumps(
+            "Host inventory:\n"
+            + json.dumps(
                 {
                     "master_addr": os.environ.get("MASTER_ADDR"),
                     "master_port": os.environ.get("MASTER_PORT"),
@@ -101,6 +99,7 @@ def main():
         )
         if args.train.use_wandb:
             import wandb
+
             wandb.config.update(
                 {
                     "master_addr": os.environ.get("MASTER_ADDR"),
@@ -685,7 +684,9 @@ def main():
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
 
             tokens_per_sec = train_metrics.get("efficiency/tokens_per_second(K)", 0) * 1e3
-            data_loader_tqdm.set_postfix_str(f"loss={total_loss:.2f} gn={grad_norm:.2f} lr={lr:.1e} tok/s={tokens_per_sec:.0f}")
+            data_loader_tqdm.set_postfix_str(
+                f"loss={total_loss:.2f} gn={grad_norm:.2f} lr={lr:.1e} tok/s={tokens_per_sec:.0f}"
+            )
             data_loader_tqdm.update()
 
             if args.train.global_rank == 0:

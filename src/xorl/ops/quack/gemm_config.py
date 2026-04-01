@@ -1,8 +1,8 @@
 # Copyright (C) 2025, Fri Dao.
 import itertools
-from typing import Optional, List, Literal
-from functools import partial
 from dataclasses import dataclass
+from functools import partial
+from typing import List, Literal, Optional
 
 
 @dataclass(frozen=True)
@@ -86,9 +86,7 @@ def get_all_configs(
         max_swizzle_size_vals = [4, 8, 16]
         GemmConfigCls = partial(GemmConfig, pingpong=False)  # There's no pingpong on Sm100
         return [
-            GemmConfigCls(
-                tile_m=m, tile_n=n, cluster_m=cm, cluster_n=cn, swap_ab=sab, max_swizzle_size=ms
-            )
+            GemmConfigCls(tile_m=m, tile_n=n, cluster_m=cm, cluster_n=cn, swap_ab=sab, max_swizzle_size=ms)
             for (m, n, (cm, cn)), sab, ms in itertools.product(
                 tile_mn_cluster_vals, swap_ab_vals, max_swizzle_size_vals
             )

@@ -30,7 +30,28 @@ Add ring attention support for long-context training
 
 ## Code Style
 
-- Python: follow existing style, run `ruff check` and `ruff format` before pushing
+We use [pre-commit](https://pre-commit.com/) to enforce formatting and catch common issues. Set it up once:
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+This runs automatically on every `git commit`. To check the entire codebase manually:
+
+```bash
+pre-commit run --all-files
+```
+
+The hooks include:
+- **ruff** — auto-fixes imports and lint issues
+- **ruff-format** — code formatting (line length 120)
+- **codespell** — catches typos
+- **trailing-whitespace / end-of-file-fixer** — file hygiene
+
+CI runs the same hooks, so if pre-commit passes locally, CI will too.
+
+Additional guidelines:
 - No dead code, no commented-out blocks
 - Type hints on public APIs
 

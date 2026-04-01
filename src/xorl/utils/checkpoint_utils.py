@@ -88,6 +88,6 @@ def get_checkpoint_path(output_dir, is_local_rank0: bool, ckpt_manager: str):
         return None
 
     checkpoint_path = os.path.join(output_dir, "checkpoints", f"global_step_{iteration}")
-    logger.info_rank0(f"Sucessfully get the latest checkpoint path: {checkpoint_path}")
+    logger.info_rank0(f"Successfully get the latest checkpoint path: {checkpoint_path}")
 
     return checkpoint_path

@@ -17,6 +17,7 @@ alignment padding are handled internally.
 import torch
 import torch.nn.functional as F
 
+
 # Alignment for token groups: 8 for bf16/fp16.
 _TOKEN_GROUP_ALIGN = 8
 
@@ -29,6 +30,7 @@ _native_dynamo_configured = False
 # ---------------------------------------------------------------------------
 # Padding helpers (vectorized — no Python for-loops, no .tolist())
 # ---------------------------------------------------------------------------
+
 
 @torch.compiler.disable
 def _compute_pad_indices(
@@ -85,9 +87,9 @@ def _pad_to_alignment(
         ``(x_padded, padded_counts)`` where ``padded_counts`` are aligned.
     """
     padded_counts = torch.clamp_min(counts, _TOKEN_GROUP_ALIGN)
-    padded_counts = (
-        (padded_counts + _TOKEN_GROUP_ALIGN - 1) // _TOKEN_GROUP_ALIGN * _TOKEN_GROUP_ALIGN
-    ).to(torch.int32)
+    padded_counts = ((padded_counts + _TOKEN_GROUP_ALIGN - 1) // _TOKEN_GROUP_ALIGN * _TOKEN_GROUP_ALIGN).to(
+        torch.int32
+    )
 
     total_sorted = x_sorted.shape[0]
     total_padded = int(padded_counts.sum().item())
@@ -117,6 +119,7 @@ def _unpad(
 # ---------------------------------------------------------------------------
 # Core grouped-mm expert forward (compiled like torchtitan)
 # ---------------------------------------------------------------------------
+
 
 def _run_experts_grouped_mm(
     gate_proj: torch.Tensor,
@@ -189,9 +192,7 @@ def _gate_up_swiglu(
     compute_dtype = torch.bfloat16
     x_bf16 = x.to(compute_dtype)
 
-    gate_out = F.silu(
-        torch._grouped_mm(x_bf16, gate_proj.to(compute_dtype), offs=offsets)
-    )
+    gate_out = F.silu(torch._grouped_mm(x_bf16, gate_proj.to(compute_dtype), offs=offsets))
     up_out = torch._grouped_mm(x_bf16, up_proj.to(compute_dtype), offs=offsets)
 
     return gate_out * up_out
@@ -223,12 +224,18 @@ def _run_experts_moe_act(
     # instead of saving gate_out + up_out tensors. The compiled function is
     # called twice (forward + recompute in backward) — this is intentional.
     h = torch.utils.checkpoint.checkpoint(
-        _gate_up_swiglu_compiled, x, gate_proj, up_proj, offsets,
+        _gate_up_swiglu_compiled,
+        x,
+        gate_proj,
+        up_proj,
+        offsets,
         use_reentrant=False,
     )
 
     out = torch._grouped_mm(
-        h, down_proj.to(torch.bfloat16), offs=offsets,
+        h,
+        down_proj.to(torch.bfloat16),
+        offs=offsets,
     ).to(x.dtype)
 
     return out
@@ -238,13 +245,12 @@ def _run_experts_moe_act(
 # Shared token preparation / scatter helper
 # ---------------------------------------------------------------------------
 
+
 def _ensure_dynamo_configured():
     global _native_dynamo_configured
     if not _native_dynamo_configured:
         torch._dynamo.config.capture_scalar_outputs = True
-        torch._dynamo.config.cache_size_limit = max(
-            torch._dynamo.config.cache_size_limit, 64
-        )
+        torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
         _native_dynamo_configured = True
 
 
@@ -270,32 +276,33 @@ def _native_expert_forward_impl(
     device = hidden_states.device
 
     # 1. Flatten top-k assignments
-    flat_experts = selected_experts.view(-1)          # (N * top_k,)
-    flat_weights = routing_weights.view(-1)            # (N * top_k,)
+    flat_experts = selected_experts.view(-1)  # (N * top_k,)
+    flat_weights = routing_weights.view(-1)  # (N * top_k,)
 
     # 2. Sort by expert (stable preserves token order within each expert)
     sorted_order = torch.argsort(flat_experts, stable=True)
-    token_ids = sorted_order // top_k                  # original token index
+    token_ids = sorted_order // top_k  # original token index
 
-    sorted_hidden = hidden_states[token_ids]           # (N * top_k, dim)
-    sorted_weights = flat_weights[sorted_order]        # (N * top_k,)
+    sorted_hidden = hidden_states[token_ids]  # (N * top_k, dim)
+    sorted_weights = flat_weights[sorted_order]  # (N * top_k,)
 
     # 3. Histogram — how many tokens per expert
     num_tokens_per_expert = torch.histc(
-        flat_experts.float(), bins=num_experts, min=0, max=num_experts - 1,
+        flat_experts.float(),
+        bins=num_experts,
+        min=0,
+        max=num_experts - 1,
     ).to(torch.int32)
 
     # 4. Compute padded counts for grouped_mm alignment
     padded_counts = torch.clamp_min(num_tokens_per_expert, _TOKEN_GROUP_ALIGN)
-    padded_counts = (
-        (padded_counts + _TOKEN_GROUP_ALIGN - 1) // _TOKEN_GROUP_ALIGN * _TOKEN_GROUP_ALIGN
-    ).to(torch.int32)
+    padded_counts = ((padded_counts + _TOKEN_GROUP_ALIGN - 1) // _TOKEN_GROUP_ALIGN * _TOKEN_GROUP_ALIGN).to(
+        torch.int32
+    )
 
     # 5. Compute pad index mapping (once — reused for pad + unpad)
     total_sorted = num_tokens * top_k
-    pad_dst = _compute_pad_indices(
-        num_tokens_per_expert, padded_counts, num_experts, total_sorted, device
-    )
+    pad_dst = _compute_pad_indices(num_tokens_per_expert, padded_counts, num_experts, total_sorted, device)
 
     # 6. Scatter sorted tokens into padded layout
     total_padded = int(padded_counts.sum().item())
@@ -303,9 +310,7 @@ def _native_expert_forward_impl(
     sorted_hidden_padded[pad_dst] = sorted_hidden
 
     # 7. Expert compute (backend-specific)
-    expert_out_padded = compute_fn(
-        gate_proj, up_proj, down_proj, sorted_hidden_padded, padded_counts
-    )
+    expert_out_padded = compute_fn(gate_proj, up_proj, down_proj, sorted_hidden_padded, padded_counts)
 
     # 8. Gather from padded layout (reuse pad_dst) + apply routing weights
     expert_out = expert_out_padded[pad_dst] * sorted_weights.unsqueeze(-1)
@@ -321,6 +326,7 @@ def _native_expert_forward_impl(
 # Public entry point (same interface as triton/quack backends)
 # ---------------------------------------------------------------------------
 
+
 def native_expert_forward(
     hidden_states: torch.Tensor,
     routing_weights: torch.Tensor,
@@ -333,8 +339,13 @@ def native_expert_forward(
 ) -> torch.Tensor:
     """Forward pass using native PyTorch ``torch._grouped_mm``."""
     return _native_expert_forward_impl(
-        hidden_states, routing_weights, selected_experts,
-        gate_proj, up_proj, down_proj, num_experts,
+        hidden_states,
+        routing_weights,
+        selected_experts,
+        gate_proj,
+        up_proj,
+        down_proj,
+        num_experts,
         _run_experts_compiled,
     )
 
@@ -353,9 +364,7 @@ def expand_shared_lora_weight(tensor: torch.Tensor, num_experts: int) -> torch.T
     return tensor
 
 
-def align_lora_rank_for_grouped_mm(
-    lora_A: torch.Tensor, lora_B: torch.Tensor
-) -> tuple:
+def align_lora_rank_for_grouped_mm(lora_A: torch.Tensor, lora_B: torch.Tensor) -> tuple:
     """Pad LoRA rank dimension so ``torch._grouped_mm`` stride is 16-byte aligned.
 
     With (G, K, N) format:
@@ -387,6 +396,7 @@ def _cumsum_to_counts(cumsum: torch.Tensor, num_experts: int) -> torch.Tensor:
 # Core grouped-mm with LoRA (NOT compiled — LoRA expand/align not compile-friendly)
 # ---------------------------------------------------------------------------
 
+
 def _run_grouped_mm_with_lora(
     x: torch.Tensor,
     padded_counts: torch.Tensor,
@@ -417,7 +427,8 @@ def _run_grouped_mm_with_lora(
     gate_lora_A, gate_lora_B = align_lora_rank_for_grouped_mm(gate_lora_A, gate_lora_B)
     gate_lora_out = torch._grouped_mm(
         torch._grouped_mm(x_bf16, gate_lora_A, offs=offsets),
-        gate_lora_B, offs=offsets,
+        gate_lora_B,
+        offs=offsets,
     )
     gate_out = F.silu(gate_out + gate_lora_out * scaling)
 
@@ -428,7 +439,8 @@ def _run_grouped_mm_with_lora(
     up_lora_A, up_lora_B = align_lora_rank_for_grouped_mm(up_lora_A, up_lora_B)
     up_lora_out = torch._grouped_mm(
         torch._grouped_mm(x_bf16, up_lora_A, offs=offsets),
-        up_lora_B, offs=offsets,
+        up_lora_B,
+        offs=offsets,
     )
     up_out = up_out + up_lora_out * scaling
 
@@ -442,7 +454,8 @@ def _run_grouped_mm_with_lora(
     down_lora_A, down_lora_B = align_lora_rank_for_grouped_mm(down_lora_A, down_lora_B)
     down_lora_out = torch._grouped_mm(
         torch._grouped_mm(h, down_lora_A, offs=offsets),
-        down_lora_B, offs=offsets,
+        down_lora_B,
+        offs=offsets,
     )
     out = out + down_lora_out * scaling
 
@@ -452,6 +465,7 @@ def _run_grouped_mm_with_lora(
 # ---------------------------------------------------------------------------
 # Public entry point: local native LoRA forward
 # ---------------------------------------------------------------------------
+
 
 def native_expert_lora_forward(
     hidden_states: torch.Tensor,
@@ -491,29 +505,34 @@ def native_expert_lora_forward(
 
     # 3. Histogram
     num_tokens_per_expert = torch.histc(
-        flat_experts.float(), bins=num_experts, min=0, max=num_experts - 1,
+        flat_experts.float(),
+        bins=num_experts,
+        min=0,
+        max=num_experts - 1,
     ).to(torch.int32)
 
     # 4. Pad for grouped_mm alignment
-    sorted_hidden_padded, padded_counts = _pad_to_alignment(
-        sorted_hidden, num_tokens_per_expert, num_experts
-    )
+    sorted_hidden_padded, padded_counts = _pad_to_alignment(sorted_hidden, num_tokens_per_expert, num_experts)
 
     # 5. Grouped GEMM with LoRA
     expert_out_padded = _run_grouped_mm_with_lora(
-        sorted_hidden_padded, padded_counts,
-        gate_proj, up_proj, down_proj,
-        gate_proj_lora_A, gate_proj_lora_B,
-        up_proj_lora_A, up_proj_lora_B,
-        down_proj_lora_A, down_proj_lora_B,
+        sorted_hidden_padded,
+        padded_counts,
+        gate_proj,
+        up_proj,
+        down_proj,
+        gate_proj_lora_A,
+        gate_proj_lora_B,
+        up_proj_lora_A,
+        up_proj_lora_B,
+        down_proj_lora_A,
+        down_proj_lora_B,
         scaling,
     )
 
     # 6. Unpad + apply routing weights
     total_sorted = num_tokens * top_k
-    expert_out = _unpad(
-        expert_out_padded, num_tokens_per_expert, padded_counts, num_experts, total_sorted
-    )
+    expert_out = _unpad(expert_out_padded, num_tokens_per_expert, padded_counts, num_experts, total_sorted)
     expert_out = expert_out * sorted_weights.unsqueeze(-1)
 
     # 7. Scatter-add back
@@ -526,6 +545,7 @@ def native_expert_lora_forward(
 # ---------------------------------------------------------------------------
 # EP compute function (same interface as TritonEPGroupGemm.apply / QuackEPGroupGemm.apply)
 # ---------------------------------------------------------------------------
+
 
 def native_ep_compute(
     permute_tokens: torch.Tensor,
@@ -568,6 +588,7 @@ def native_ep_compute(
 # EP compute with LoRA (same interface as TritonEPGroupGemmWithLoRA.apply)
 # ---------------------------------------------------------------------------
 
+
 def native_ep_compute_lora(
     permute_tokens: torch.Tensor,
     cumsum: torch.Tensor,
@@ -594,11 +615,17 @@ def native_ep_compute_lora(
 
     padded_tokens, padded_counts = _pad_to_alignment(permute_tokens, counts, num_local_experts)
     out_padded = _run_grouped_mm_with_lora(
-        padded_tokens, padded_counts,
-        gate_proj, up_proj, down_proj,
-        gate_proj_lora_A, gate_proj_lora_B,
-        up_proj_lora_A, up_proj_lora_B,
-        down_proj_lora_A, down_proj_lora_B,
+        padded_tokens,
+        padded_counts,
+        gate_proj,
+        up_proj,
+        down_proj,
+        gate_proj_lora_A,
+        gate_proj_lora_B,
+        up_proj_lora_A,
+        up_proj_lora_B,
+        down_proj_lora_A,
+        down_proj_lora_B,
         scaling,
     )
 
@@ -608,6 +635,7 @@ def native_ep_compute_lora(
 # ---------------------------------------------------------------------------
 # moe_act variants: gate+up checkpointed, recomputed in backward
 # ---------------------------------------------------------------------------
+
 
 def native_ep_compute_moe_act(
     permute_tokens: torch.Tensor,
@@ -650,7 +678,12 @@ def native_expert_forward_moe_act(
     instead of the compiled grouped GEMM.
     """
     return _native_expert_forward_impl(
-        hidden_states, routing_weights, selected_experts,
-        gate_proj, up_proj, down_proj, num_experts,
+        hidden_states,
+        routing_weights,
+        selected_experts,
+        gate_proj,
+        up_proj,
+        down_proj,
+        num_experts,
         _run_experts_moe_act,
     )

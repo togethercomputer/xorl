@@ -1,11 +1,11 @@
 # Copyright (c) 2025, Tri Dao.
 
-from typing import Optional
 from dataclasses import dataclass
+from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Boolean, const_expr
+from cutlass import Boolean, Int32, const_expr
 from cutlass.utils import LayoutEnum
 
 from .cute_dsl_utils import ArgumentsBase, ParamsBase
@@ -131,9 +131,7 @@ class VarlenManager:
                         params.tensormaps[tensormap_workspace_idx, 0, None].iterator
                     )
                 tensormap_b_ptr = tensormap_manager.get_tensormap_ptr(
-                    params.tensormaps[
-                        tensormap_workspace_idx, 1 if not gather_A else 0, None
-                    ].iterator
+                    params.tensormaps[tensormap_workspace_idx, 1 if not gather_A else 0, None].iterator
                 )
         return VarlenManager(
             params,
@@ -202,12 +200,8 @@ class VarlenManager:
     ) -> None:
         if const_expr(self.varlen_k):
             if const_expr(not self.gather_A):
-                self.tensormap_manager.init_tensormap_from_atom(
-                    tma_atom_a, self._tensormap_a_ptr, is_manager_warp
-                )
-            self.tensormap_manager.init_tensormap_from_atom(
-                tma_atom_b, self._tensormap_b_ptr, is_manager_warp
-            )
+                self.tensormap_manager.init_tensormap_from_atom(tma_atom_a, self._tensormap_a_ptr, is_manager_warp)
+            self.tensormap_manager.init_tensormap_from_atom(tma_atom_b, self._tensormap_b_ptr, is_manager_warp)
 
     def init_tensormap_epi(
         self,
@@ -217,13 +211,9 @@ class VarlenManager:
     ) -> None:
         if const_expr(self.varlen_m):
             if const_expr(self._tensormap_d_ptr is not None):
-                self.tensormap_manager.init_tensormap_from_atom(
-                    tma_atom_d, self._tensormap_d_ptr, is_manager_warp
-                )
+                self.tensormap_manager.init_tensormap_from_atom(tma_atom_d, self._tensormap_d_ptr, is_manager_warp)
             for tma_atom, tensormap_epi_ptr in zip(tma_atoms_epi, self._tensormap_epi_ptrs):
-                self.tensormap_manager.init_tensormap_from_atom(
-                    tma_atom, tensormap_epi_ptr, is_manager_warp
-                )
+                self.tensormap_manager.init_tensormap_from_atom(tma_atom, tensormap_epi_ptr, is_manager_warp)
 
     def fence_tensormap_init(self) -> None:
         self.tensormap_manager.fence_tensormap_initialization()
@@ -270,9 +260,7 @@ class VarlenManager:
             self._is_group_changed = Boolean(batch_idx != self._last_batch_idx)
             self._last_batch_idx = batch_idx
             # Cute-DSL doesn't like this under if statement
-            order_d = (
-                (0 if const_expr(d_layout.is_m_major_c()) else 1) if d_layout is not None else None
-            )
+            order_d = (0 if const_expr(d_layout.is_m_major_c()) else 1) if d_layout is not None else None
             if self._is_group_changed:
                 # construct tensor A/B based on real address, shape and stride information
                 cu_seqlens_m = self.params.cu_seqlens_m
@@ -314,25 +302,19 @@ class VarlenManager:
     def get_tma_desc_a_ptr(self) -> Optional[cute.Pointer]:
         tma_desc_a_ptr = None
         if const_expr(self.varlen_k and self._tensormap_a_ptr is not None):
-            tma_desc_a_ptr = self.tensormap_manager.get_tensormap_ptr(
-                self._tensormap_a_ptr, cute.AddressSpace.generic
-            )
+            tma_desc_a_ptr = self.tensormap_manager.get_tensormap_ptr(self._tensormap_a_ptr, cute.AddressSpace.generic)
         return tma_desc_a_ptr
 
     def get_tma_desc_b_ptr(self) -> Optional[cute.Pointer]:
         tma_desc_b_ptr = None
         if const_expr(self.varlen_k):
-            tma_desc_b_ptr = self.tensormap_manager.get_tensormap_ptr(
-                self._tensormap_b_ptr, cute.AddressSpace.generic
-            )
+            tma_desc_b_ptr = self.tensormap_manager.get_tensormap_ptr(self._tensormap_b_ptr, cute.AddressSpace.generic)
         return tma_desc_b_ptr
 
     def get_tma_desc_d_ptr(self) -> Optional[cute.Pointer]:
         tma_desc_d_ptr = None
         if const_expr(self.varlen_m and self._tensormap_d_ptr is not None):
-            tma_desc_d_ptr = self.tensormap_manager.get_tensormap_ptr(
-                self._tensormap_d_ptr, cute.AddressSpace.generic
-            )
+            tma_desc_d_ptr = self.tensormap_manager.get_tensormap_ptr(self._tensormap_d_ptr, cute.AddressSpace.generic)
         return tma_desc_d_ptr
 
     def get_tma_desc_epi_ptrs(self) -> list[Optional[cute.Pointer]]:

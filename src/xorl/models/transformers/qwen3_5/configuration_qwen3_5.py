@@ -1,6 +1,7 @@
 """Qwen3_5 model configuration"""
 
 from transformers.configuration_utils import PretrainedConfig
+
 from xorl.models.layers import rope_config_validation
 
 from .parallelize import TP_PLAN
@@ -19,7 +20,7 @@ def _cfg_to_dict(value):
         return None
     if isinstance(value, dict):
         return dict(value)
-    if hasattr(value, '__dict__'):
+    if hasattr(value, "__dict__"):
         return {k: v for k, v in vars(value).items()}
     return value
 
@@ -32,13 +33,13 @@ def _split_mrope_fields(value):
 
 
 class Qwen3_5Config(PretrainedConfig):
-    model_type = 'xorl_qwen3_5'
+    model_type = "xorl_qwen3_5"
 
     base_model_tp_plan = TP_PLAN
     base_model_pp_plan = {
-        'embed_tokens': (['input_ids'], ['inputs_embeds']),
-        'layers': (['hidden_states', 'attention_mask'], ['hidden_states']),
-        'norm': (['hidden_states'], ['hidden_states']),
+        "embed_tokens": (["input_ids"], ["inputs_embeds"]),
+        "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
+        "norm": (["hidden_states"], ["hidden_states"]),
     }
 
     def __init__(
@@ -50,7 +51,7 @@ class Qwen3_5Config(PretrainedConfig):
         num_attention_heads=16,
         num_key_value_heads=4,
         head_dim=256,
-        hidden_act='silu',
+        hidden_act="silu",
         max_position_embeddings=32768,
         initializer_range=0.02,
         rms_norm_eps=1e-6,
@@ -78,8 +79,8 @@ class Qwen3_5Config(PretrainedConfig):
         eos_token_id=None,
         **kwargs,
     ):
-        kwargs['ignore_keys_at_rope_validation'] = {'mrope_section', 'mrope_interleaved'}
-        kwargs.setdefault('partial_rotary_factor', 0.25)
+        kwargs["ignore_keys_at_rope_validation"] = {"mrope_section", "mrope_interleaved"}
+        kwargs.setdefault("partial_rotary_factor", 0.25)
 
         self.pad_token_id = pad_token_id
         self.bos_token_id = bos_token_id
@@ -109,24 +110,28 @@ class Qwen3_5Config(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.full_attention_interval = full_attention_interval
         self.linear_num_key_heads = linear_num_key_heads if linear_num_key_heads is not None else num_attention_heads
-        self.linear_num_value_heads = linear_num_value_heads if linear_num_value_heads is not None else num_attention_heads
+        self.linear_num_value_heads = (
+            linear_num_value_heads if linear_num_value_heads is not None else num_attention_heads
+        )
         self.linear_key_head_dim = linear_key_head_dim if linear_key_head_dim is not None else 128
-        self.linear_value_head_dim = linear_value_head_dim if linear_value_head_dim is not None else self.linear_key_head_dim
+        self.linear_value_head_dim = (
+            linear_value_head_dim if linear_value_head_dim is not None else self.linear_key_head_dim
+        )
         self.attn_output_gate = attn_output_gate
         self.linear_conv_kernel_dim = linear_conv_kernel_dim
         if layer_types is None:
             if full_attention_interval:
                 layer_types = [
-                    'full_attention' if (layer_idx + 1) % full_attention_interval == 0 else 'linear_attention'
+                    "full_attention" if (layer_idx + 1) % full_attention_interval == 0 else "linear_attention"
                     for layer_idx in range(num_hidden_layers)
                 ]
             else:
-                layer_types = ['full_attention'] * num_hidden_layers
+                layer_types = ["full_attention"] * num_hidden_layers
         self.layer_types = list(layer_types)
 
-        if self._rope_scaling is not None and 'type' in self._rope_scaling:
-            self._rope_scaling['rope_type'] = self._rope_scaling['type']
-        rope_config_validation(self, ignore_keys=kwargs.get('ignore_keys_at_rope_validation'))
+        if self._rope_scaling is not None and "type" in self._rope_scaling:
+            self._rope_scaling["rope_type"] = self._rope_scaling["type"]
+        rope_config_validation(self, ignore_keys=kwargs.get("ignore_keys_at_rope_validation"))
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -139,71 +144,73 @@ class Qwen3_5Config(PretrainedConfig):
     @property
     def rope_parameters(self):
         rope_params = {
-            'rope_type': 'default',
-            'rope_theta': self.rope_theta,
+            "rope_type": "default",
+            "rope_theta": self.rope_theta,
         }
         if self._rope_scaling is not None:
             rope_params.update(self._rope_scaling)
-            if 'type' in rope_params and 'rope_type' not in rope_params:
-                rope_params['rope_type'] = rope_params.pop('type')
+            if "type" in rope_params and "rope_type" not in rope_params:
+                rope_params["rope_type"] = rope_params.pop("type")
         return rope_params
 
     @rope_parameters.setter
     def rope_parameters(self, value):
         value_dict = _cfg_to_dict(value)
         if value_dict is not None and isinstance(value_dict, dict):
-            if 'rope_theta' in value_dict:
-                self.rope_theta = value_dict['rope_theta']
+            if "rope_theta" in value_dict:
+                self.rope_theta = value_dict["rope_theta"]
         cleaned_value, rope_mrope_interleaved, rope_mrope_section = _split_mrope_fields(value_dict)
-        self.mrope_interleaved = rope_mrope_interleaved or getattr(self, 'mrope_interleaved', False)
+        self.mrope_interleaved = rope_mrope_interleaved or getattr(self, "mrope_interleaved", False)
         if rope_mrope_section is not None:
             self.mrope_section = rope_mrope_section
         self._rope_scaling = cleaned_value
 
     @classmethod
     def from_hf_config(cls, hf_config):
-        text_config = getattr(hf_config, 'text_config', hf_config)
-        rope_params = getattr(text_config, 'rope_parameters', None)
+        text_config = getattr(hf_config, "text_config", hf_config)
+        rope_params = getattr(text_config, "rope_parameters", None)
         if rope_params is None:
-            rope_params = getattr(text_config, 'rope_scaling', None)
+            rope_params = getattr(text_config, "rope_scaling", None)
 
-        hidden_size = getattr(text_config, 'hidden_size')
-        num_attention_heads = getattr(text_config, 'num_attention_heads')
-        head_dim = getattr(text_config, 'head_dim', hidden_size // num_attention_heads)
+        hidden_size = getattr(text_config, "hidden_size")
+        num_attention_heads = getattr(text_config, "num_attention_heads")
+        head_dim = getattr(text_config, "head_dim", hidden_size // num_attention_heads)
 
         return cls(
-            vocab_size=getattr(text_config, 'vocab_size', getattr(hf_config, 'vocab_size', 248320)),
+            vocab_size=getattr(text_config, "vocab_size", getattr(hf_config, "vocab_size", 248320)),
             hidden_size=hidden_size,
-            intermediate_size=getattr(text_config, 'intermediate_size'),
-            num_hidden_layers=getattr(text_config, 'num_hidden_layers'),
+            intermediate_size=getattr(text_config, "intermediate_size"),
+            num_hidden_layers=getattr(text_config, "num_hidden_layers"),
             num_attention_heads=num_attention_heads,
-            num_key_value_heads=getattr(text_config, 'num_key_value_heads', num_attention_heads),
+            num_key_value_heads=getattr(text_config, "num_key_value_heads", num_attention_heads),
             head_dim=head_dim,
-            hidden_act=getattr(text_config, 'hidden_act', 'silu'),
-            max_position_embeddings=getattr(text_config, 'max_position_embeddings'),
-            initializer_range=getattr(text_config, 'initializer_range', 0.02),
-            rms_norm_eps=getattr(text_config, 'rms_norm_eps', 1e-6),
-            use_cache=getattr(text_config, 'use_cache', True),
-            tie_word_embeddings=getattr(hf_config, 'tie_word_embeddings', getattr(text_config, 'tie_word_embeddings', True)),
-            rope_theta=_cfg_get(rope_params, 'rope_theta', getattr(text_config, 'rope_theta', 10000.0)),
+            hidden_act=getattr(text_config, "hidden_act", "silu"),
+            max_position_embeddings=getattr(text_config, "max_position_embeddings"),
+            initializer_range=getattr(text_config, "initializer_range", 0.02),
+            rms_norm_eps=getattr(text_config, "rms_norm_eps", 1e-6),
+            use_cache=getattr(text_config, "use_cache", True),
+            tie_word_embeddings=getattr(
+                hf_config, "tie_word_embeddings", getattr(text_config, "tie_word_embeddings", True)
+            ),
+            rope_theta=_cfg_get(rope_params, "rope_theta", getattr(text_config, "rope_theta", 10000.0)),
             rope_scaling=_cfg_to_dict(rope_params),
-            attention_bias=getattr(text_config, 'attention_bias', False),
-            attention_dropout=getattr(text_config, 'attention_dropout', 0.0),
-            layer_types=getattr(text_config, 'layer_types', None),
-            full_attention_interval=getattr(text_config, 'full_attention_interval', None),
-            linear_num_key_heads=getattr(text_config, 'linear_num_key_heads', None),
-            linear_num_value_heads=getattr(text_config, 'linear_num_value_heads', None),
-            linear_key_head_dim=getattr(text_config, 'linear_key_head_dim', None),
-            linear_value_head_dim=getattr(text_config, 'linear_value_head_dim', None),
-            attn_output_gate=getattr(text_config, 'attn_output_gate', True),
-            linear_conv_kernel_dim=getattr(text_config, 'linear_conv_kernel_dim', 4),
-            mrope_interleaved=_cfg_get(rope_params, 'mrope_interleaved', False),
-            mrope_section=_cfg_get(rope_params, 'mrope_section', None),
-            pad_token_id=getattr(text_config, 'pad_token_id', getattr(hf_config, 'pad_token_id', None)),
-            bos_token_id=getattr(text_config, 'bos_token_id', getattr(hf_config, 'bos_token_id', None)),
-            eos_token_id=getattr(text_config, 'eos_token_id', getattr(hf_config, 'eos_token_id', None)),
-            architectures=['Qwen3_5ForConditionalGeneration'],
+            attention_bias=getattr(text_config, "attention_bias", False),
+            attention_dropout=getattr(text_config, "attention_dropout", 0.0),
+            layer_types=getattr(text_config, "layer_types", None),
+            full_attention_interval=getattr(text_config, "full_attention_interval", None),
+            linear_num_key_heads=getattr(text_config, "linear_num_key_heads", None),
+            linear_num_value_heads=getattr(text_config, "linear_num_value_heads", None),
+            linear_key_head_dim=getattr(text_config, "linear_key_head_dim", None),
+            linear_value_head_dim=getattr(text_config, "linear_value_head_dim", None),
+            attn_output_gate=getattr(text_config, "attn_output_gate", True),
+            linear_conv_kernel_dim=getattr(text_config, "linear_conv_kernel_dim", 4),
+            mrope_interleaved=_cfg_get(rope_params, "mrope_interleaved", False),
+            mrope_section=_cfg_get(rope_params, "mrope_section", None),
+            pad_token_id=getattr(text_config, "pad_token_id", getattr(hf_config, "pad_token_id", None)),
+            bos_token_id=getattr(text_config, "bos_token_id", getattr(hf_config, "bos_token_id", None)),
+            eos_token_id=getattr(text_config, "eos_token_id", getattr(hf_config, "eos_token_id", None)),
+            architectures=["Qwen3_5ForConditionalGeneration"],
         )
 
 
-__all__ = ['Qwen3_5Config']
+__all__ = ["Qwen3_5Config"]

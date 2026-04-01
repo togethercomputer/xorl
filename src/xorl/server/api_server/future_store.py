@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Set
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -176,10 +177,7 @@ class FutureStore:
         self._queue_state = "active"
         self._queue_state_reason: Optional[str] = None
 
-        logger.info(
-            f"FutureStore initialized: default_ttl={default_ttl}s, "
-            f"max_concurrent={max_concurrent}"
-        )
+        logger.info(f"FutureStore initialized: default_ttl={default_ttl}s, max_concurrent={max_concurrent}")
 
     async def start(self):
         """Start the store and background cleanup task."""
@@ -246,9 +244,7 @@ class FutureStore:
             self._by_model[model_id].add(request_id)
 
         # Start processing in background
-        asyncio.create_task(
-            self._process(request_id, process_fn, request_data)
-        )
+        asyncio.create_task(self._process(request_id, process_fn, request_data))
 
         logger.debug(
             f"Future created: request_id={request_id}, model_id={model_id}, "
@@ -500,7 +496,8 @@ class FutureStore:
         """Remove expired entries from the store."""
         async with self._lock:
             to_delete = [
-                request_id for request_id, entry in list(self._entries.items())
+                request_id
+                for request_id, entry in list(self._entries.items())
                 if entry.is_terminal() and entry.is_expired()
             ]
             for request_id in to_delete:
@@ -528,10 +525,7 @@ class FutureStore:
                 "failed": 0,
                 "expired": 0,
             },
-            "by_model": {
-                model_id: len(request_ids)
-                for model_id, request_ids in self._by_model.items()
-            },
+            "by_model": {model_id: len(request_ids) for model_id, request_ids in self._by_model.items()},
         }
 
         for entry in self._entries.values():

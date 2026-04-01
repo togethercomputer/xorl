@@ -225,9 +225,7 @@ class XIELUActivation(nn.Module):
     ):
         super().__init__()
         self.alpha_p = nn.Parameter(torch.log(torch.expm1(torch.tensor(alpha_p_init, dtype=dtype))).unsqueeze(0))
-        self.alpha_n = nn.Parameter(
-            torch.log(torch.expm1(torch.tensor(alpha_n_init - beta, dtype=dtype))).unsqueeze(0)
-        )
+        self.alpha_n = nn.Parameter(torch.log(torch.expm1(torch.tensor(alpha_n_init - beta, dtype=dtype))).unsqueeze(0))
         self.register_buffer("beta", torch.tensor(beta, dtype=dtype))
         self.register_buffer("eps", torch.tensor(eps, dtype=dtype))
         self.with_vector_loads = with_vector_loads

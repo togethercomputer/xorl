@@ -290,7 +290,7 @@ except ValueError as e:
 while scheduler.has_pending_requests():
     # Get next request (respects max_running_requests)
     scheduled_req = scheduler.get_next_request()
-    
+
     if not scheduled_req:
         # At max capacity, wait for a slot to free up
         break
@@ -346,11 +346,10 @@ import time
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Deque
+from typing import Any, Deque, Dict, Optional
 
 from xorl.server.protocol.api_orchestrator import (
     OrchestratorRequest,
-    RequestType,
 )
 
 
@@ -361,6 +360,7 @@ logger = logging.getLogger(__name__)
 # Request Metadata
 # ============================================================================
 
+
 @dataclass
 class ScheduledRequest:
     """
@@ -368,6 +368,7 @@ class ScheduledRequest:
 
     Tracks timing and execution state for scheduling decisions.
     """
+
     request: OrchestratorRequest
     arrival_time: float = field(default_factory=time.time)
     retries: int = 0
@@ -419,6 +420,7 @@ class ScheduledRequest:
 # ============================================================================
 # Scheduling Policies
 # ============================================================================
+
 
 class SchedulingPolicy(ABC):
     """
@@ -625,6 +627,7 @@ class FIFOPolicy(SchedulingPolicy):
 # Scheduler
 # ============================================================================
 
+
 class Scheduler:
     """
     Request scheduler for Orchestrator.
@@ -742,8 +745,7 @@ class Scheduler:
         current_running = self.get_running_count()
         if current_running >= self.max_running_requests:
             logger.debug(
-                f"Cannot dispatch request: at max running capacity "
-                f"({current_running}/{self.max_running_requests})"
+                f"Cannot dispatch request: at max running capacity ({current_running}/{self.max_running_requests})"
             )
             return None
 
@@ -844,10 +846,7 @@ class Scheduler:
         self.completed_requests.append(scheduled_req)
         self.total_failed += 1
 
-        logger.error(
-            f"Request {request_id} failed "
-            f"(operation={scheduled_req.operation}, error={error})"
-        )
+        logger.error(f"Request {request_id} failed (operation={scheduled_req.operation}, error={error})")
 
     # ========================================================================
     # Query Methods
@@ -975,6 +974,7 @@ class Scheduler:
 # ============================================================================
 # Seq_id-Aware Scheduling Policy
 # ============================================================================
+
 
 class SeqIdAwareFIFOPolicy(SchedulingPolicy):
     """
@@ -1180,10 +1180,7 @@ class SeqIdAwareFIFOPolicy(SchedulingPolicy):
         self.fifo_queue.clear()
         self.request_map.clear()
 
-        logger.info(
-            f"Cleared SeqIdAwareFIFO queue "
-            f"({seq_id_count} seq_id + {fifo_count} FIFO requests removed)"
-        )
+        logger.info(f"Cleared SeqIdAwareFIFO queue ({seq_id_count} seq_id + {fifo_count} FIFO requests removed)")
 
     def get_policy_name(self) -> str:
         """Get policy name."""
@@ -1196,10 +1193,7 @@ class SeqIdAwareFIFOPolicy(SchedulingPolicy):
         Returns:
             Dictionary with scheduler statistics
         """
-        seq_id_by_model = {
-            model_id: list(sorted(seq_map.keys()))
-            for model_id, seq_map in self.seq_id_requests.items()
-        }
+        seq_id_by_model = {model_id: sorted(seq_map.keys()) for model_id, seq_map in self.seq_id_requests.items()}
         return {
             "seq_id_requests": sum(len(seq_map) for seq_map in self.seq_id_requests.values()),
             "fifo_queue_size": len(self.fifo_queue),
@@ -1211,4 +1205,3 @@ class SeqIdAwareFIFOPolicy(SchedulingPolicy):
 # ============================================================================
 # Future Scheduling Policies (Placeholder Implementations)
 # ============================================================================
-

@@ -35,6 +35,7 @@ from torch.distributed.pipelining.schedules import (
 
 from ..utils import logging
 
+
 logger = logging.get_logger(__name__)
 
 __all__ = [
@@ -103,8 +104,7 @@ def generate_llm_fqn_per_model_part(
 
     if num_stages > num_effective_layers:
         raise ValueError(
-            f"Number of stages ({num_stages}) cannot be greater than "
-            f"effective layers ({num_effective_layers})"
+            f"Number of stages ({num_stages}) cannot be greater than effective layers ({num_effective_layers})"
         )
 
     # Calculate layers per stage (distribute evenly)
@@ -121,13 +121,9 @@ def generate_llm_fqn_per_model_part(
         )
 
     if input_weight > layers_per_stage:
-        raise ValueError(
-            f"input_weight ({input_weight}) exceeds minimum layers per stage ({layers_per_stage})."
-        )
+        raise ValueError(f"input_weight ({input_weight}) exceeds minimum layers per stage ({layers_per_stage}).")
     if output_weight > layers_per_stage:
-        raise ValueError(
-            f"output_weight ({output_weight}) exceeds minimum layers per stage ({layers_per_stage})."
-        )
+        raise ValueError(f"output_weight ({output_weight}) exceeds minimum layers per stage ({layers_per_stage}).")
 
     module_names_per_stage = []
     current_layer = 0
@@ -191,8 +187,9 @@ def _pp_forward(self, x):
     When the queue is not set (e.g. unit tests), falls back to generating
     sequential position_ids scaled by cp_size for RoPE cache correctness.
     """
+    from xorl.models.layers.moe.routing_replay import get_replay_stage, is_r3_mode, set_replay_stage
+
     from .parallel_state import get_parallel_state
-    from xorl.models.layers.moe.routing_replay import get_replay_stage, set_replay_stage, is_r3_mode
 
     ps = get_parallel_state()
 
@@ -231,8 +228,7 @@ def _pp_forward(self, x):
             position_ids = metadata.pop("position_ids", None)
             if position_ids is not None:
                 position_ids = position_ids.to(x.device)
-            extra_kwargs = {k: v.to(x.device) if isinstance(v, torch.Tensor) else v
-                            for k, v in metadata.items()}
+            extra_kwargs = {k: v.to(x.device) if isinstance(v, torch.Tensor) else v for k, v in metadata.items()}
 
     # Fallback: generate sequential position_ids covering the full SP range
     # so that RoPE embeddings have a large enough cache.
@@ -244,15 +240,19 @@ def _pp_forward(self, x):
     if self._pp_is_first:
         # x is input_ids
         outputs = self._pp_original_forward(
-            input_ids=x, position_ids=position_ids,
-            use_cache=False, output_hidden_states=False,
+            input_ids=x,
+            position_ids=position_ids,
+            use_cache=False,
+            output_hidden_states=False,
             **extra_kwargs,
         )
     else:
         # x is hidden_states from previous stage
         outputs = self._pp_original_forward(
-            inputs_embeds=x, position_ids=position_ids,
-            use_cache=False, output_hidden_states=False,
+            inputs_embeds=x,
+            position_ids=position_ids,
+            use_cache=False,
+            output_hidden_states=False,
             **extra_kwargs,
         )
 
@@ -282,7 +282,7 @@ def _recursive_prune(module: nn.Module, prefix: str, fqns_to_keep: set):
             # Same as torchtitan: filter children of container modules by FQN
             children_prefix = fqn + "."
             layers_to_keep = {
-                fqn_to_keep[len(children_prefix):].split(".")[0]
+                fqn_to_keep[len(children_prefix) :].split(".")[0]
                 for fqn_to_keep in fqns_to_keep
                 if fqn_to_keep.startswith(children_prefix)
             }
@@ -292,9 +292,7 @@ def _recursive_prune(module: nn.Module, prefix: str, fqns_to_keep: set):
                         if layer_name not in layers_to_keep:
                             del child[layer_name]
                 elif isinstance(child, nn.ModuleList):
-                    indices_to_keep = {
-                        int(idx) for idx in layers_to_keep if idx.isdigit()
-                    }
+                    indices_to_keep = {int(idx) for idx in layers_to_keep if idx.isdigit()}
                     # Preserve original indices so checkpoint keys match.
                     # Set unwanted entries to None (named_parameters/modules skip None).
                     for i in range(len(child)):
@@ -436,8 +434,7 @@ def build_pipeline_schedule(
     """
     if schedule_name.lower() not in _SUPPORTED_PP_SCHEDULES:
         raise ValueError(
-            f"Unsupported PP schedule '{schedule_name}'. "
-            f"Supported schedules: {sorted(_SUPPORTED_PP_SCHEDULES)}"
+            f"Unsupported PP schedule '{schedule_name}'. Supported schedules: {sorted(_SUPPORTED_PP_SCHEDULES)}"
         )
 
     schedule_class = get_schedule_class(schedule_name)

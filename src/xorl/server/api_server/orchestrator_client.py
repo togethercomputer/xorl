@@ -30,9 +30,10 @@ import asyncio
 import logging
 import time
 from typing import Optional
+
 import zmq.asyncio
 
-from xorl.server.protocol.api_orchestrator import OrchestratorRequest, OrchestratorOutputs, RequestType
+from xorl.server.protocol.api_orchestrator import OrchestratorOutputs, OrchestratorRequest, RequestType
 from xorl.server.protocol.operations import AbortData
 from xorl.server.utils.zmq_channels import AsyncPullChannel, AsyncRouterChannel
 
@@ -87,9 +88,7 @@ class OrchestratorClient:
         self._last_request_time = 0.0
         self._last_output_time = 0.0
 
-        logger.info(
-            f"OrchestratorClient initialized: input={input_addr}, output={output_addr}"
-        )
+        logger.info(f"OrchestratorClient initialized: input={input_addr}, output={output_addr}")
 
     async def start(self):
         """Start the client and connect sockets."""
@@ -219,10 +218,7 @@ class OrchestratorClient:
 
         try:
             if timeout is not None:
-                output = await asyncio.wait_for(
-                    self.output_queue.get(),
-                    timeout=timeout
-                )
+                output = await asyncio.wait_for(self.output_queue.get(), timeout=timeout)
             else:
                 output = await self.output_queue.get()
 
@@ -283,8 +279,7 @@ class OrchestratorClient:
                         logger.warning(f"Future for request {output.request_id} already done")
                 else:
                     logger.warning(
-                        f"Received output for unknown request {output.request_id} "
-                        f"(may have timed out or was cancelled)"
+                        f"Received output for unknown request {output.request_id} (may have timed out or was cancelled)"
                     )
                     # Still put in output queue as fallback
                     await self.output_queue.put(output)
@@ -385,5 +380,3 @@ class OrchestratorClient:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Async context manager exit."""
         await self.stop()
-
-

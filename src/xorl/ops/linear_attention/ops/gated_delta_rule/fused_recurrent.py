@@ -2,7 +2,6 @@ from __future__ import annotations
 
 # Adapted from flash-linear-attention/fla/ops/gated_delta_rule/fused_recurrent.py.
 # Portions of this file are adapted from flash-linear-attention, Copyright (c) 2023-2025 Songlin Yang, licensed under the MIT License.
-
 import torch
 import triton
 import triton.language as tl

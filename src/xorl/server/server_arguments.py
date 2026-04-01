@@ -7,8 +7,8 @@ device management, parallelism, etc.), excluding client-side training
 parameters like batch size, epochs, and optimizer settings.
 """
 
-from dataclasses import dataclass, field, asdict
-from typing import Optional, Dict, List, Literal, Any
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Literal, Optional
 
 
 @dataclass
@@ -44,96 +44,82 @@ class ServerArguments:
     # ========================================================================
 
     model_path: Optional[str] = field(
-        default=None,
-        metadata={"help": "Path to pre-trained model (HF Hub or local path)"}
+        default=None, metadata={"help": "Path to pre-trained model (HF Hub or local path)"}
     )
 
     model_name: Optional[str] = field(
         default=None,
-        metadata={"help": "Model identifier for validation (e.g., 'Qwen/Qwen3-32B'). Defaults to model_path if not specified."}
+        metadata={
+            "help": "Model identifier for validation (e.g., 'Qwen/Qwen3-32B'). Defaults to model_path if not specified."
+        },
     )
 
-    config_path: Optional[str] = field(
-        default=None,
-        metadata={"help": "Path to model config. Defaults to model_path"}
-    )
+    config_path: Optional[str] = field(default=None, metadata={"help": "Path to model config. Defaults to model_path"})
 
-    tokenizer_path: Optional[str] = field(
-        default=None,
-        metadata={"help": "Path to tokenizer. Defaults to config_path"}
-    )
+    tokenizer_path: Optional[str] = field(default=None, metadata={"help": "Path to tokenizer. Defaults to config_path"})
 
     attn_implementation: Optional[Literal["eager", "sdpa", "native", "flash_attention_3", "flash_attention_4"]] = field(
         default="flash_attention_3",
-        metadata={"help": "Attention implementation. 'native': PyTorch SDPA+cuDNN (no deps, Hopper+Blackwell). "
-                          "'flash_attention_3': FA3 (Hopper). 'flash_attention_4': FA4 CUTE (Hopper+Blackwell)."}
+        metadata={
+            "help": "Attention implementation. 'native': PyTorch SDPA+cuDNN (no deps, Hopper+Blackwell). "
+            "'flash_attention_3': FA3 (Hopper). 'flash_attention_4': FA4 CUTE (Hopper+Blackwell)."
+        },
     )
 
     moe_implementation: Optional[Literal[None, "eager", "triton", "native", "quack"]] = field(
         default=None,
-        metadata={"help": "MoE implementation. 'triton' uses Triton group GEMM kernels, 'native' uses torch._grouped_mm, 'quack' uses quack kernels."}
+        metadata={
+            "help": "MoE implementation. 'triton' uses Triton group GEMM kernels, 'native' uses torch._grouped_mm, 'quack' uses quack kernels."
+        },
     )
 
     ep_dispatch: str = field(
         default="alltoall",
-        metadata={"help": "EP dispatch strategy: 'alltoall' (default) or 'deepep' (NVLink-optimized)."}
+        metadata={"help": "EP dispatch strategy: 'alltoall' (default) or 'deepep' (NVLink-optimized)."},
     )
 
     deepep_buffer_size_gb: float = field(
-        default=2.0,
-        metadata={"help": "DeepEP buffer size in GB (effective when ep_dispatch='deepep')."}
+        default=2.0, metadata={"help": "DeepEP buffer size in GB (effective when ep_dispatch='deepep')."}
     )
 
     deepep_num_sms: int = field(
-        default=20,
-        metadata={"help": "Number of SMs for DeepEP communication kernels (must be even, default 20)."}
+        default=20, metadata={"help": "Number of SMs for DeepEP communication kernels (must be even, default 20)."}
     )
 
     deepep_async_combine: bool = field(
-        default=False,
-        metadata={"help": "Enable async combine for DeepEP (overlap combine with next layer's compute)."}
+        default=False, metadata={"help": "Enable async combine for DeepEP (overlap combine with next layer's compute)."}
     )
 
     # SGLang numerical alignment flags
     router_fp32: bool = field(
-        default=True,
-        metadata={"help": "Upcast MoE router gate computation to float32 for numerical stability."}
+        default=True, metadata={"help": "Upcast MoE router gate computation to float32 for numerical stability."}
     )
 
     lm_head_fp32: bool = field(
-        default=True,
-        metadata={"help": "Upcast LM head logits computation to float32 for numerical stability."}
+        default=True, metadata={"help": "Upcast LM head logits computation to float32 for numerical stability."}
     )
 
     rmsnorm_native: bool = field(
-        default=False,
-        metadata={"help": "Use native RMSNorm (no fused kernels) for SGLang alignment."}
+        default=False, metadata={"help": "Use native RMSNorm (no fused kernels) for SGLang alignment."}
     )
 
     activation_native: bool = field(
-        default=False,
-        metadata={"help": "Use native SiLU instead of fused Triton kernel for SGLang alignment."}
+        default=False, metadata={"help": "Use native SiLU instead of fused Triton kernel for SGLang alignment."}
     )
 
     rope_native: bool = field(
-        default=False,
-        metadata={"help": "Use naive RoPE implementation instead of flash_attn fused kernel."}
+        default=False, metadata={"help": "Use naive RoPE implementation instead of flash_attn fused kernel."}
     )
 
     attention_cast_bf16: bool = field(
-        default=False,
-        metadata={"help": "Explicitly cast Q/K to bfloat16 after RoPE for SGLang alignment."}
+        default=False, metadata={"help": "Explicitly cast Q/K to bfloat16 after RoPE for SGLang alignment."}
     )
 
     # Multimodal model configuration
-    foundation: Dict[str, str] = field(
-        default_factory=dict,
-        metadata={"help": "Foundation model extra config"}
-    )
+    foundation: Dict[str, str] = field(default_factory=dict, metadata={"help": "Foundation model extra config"})
 
     encoders: Dict[Literal["image", "video", "audio"], Dict[str, str]] = field(
-        default_factory=dict,
-        metadata={"help": "Multimodal encoder config"}
+        default_factory=dict, metadata={"help": "Multimodal encoder config"}
     )
 
     # ========================================================================
@@ -142,37 +128,21 @@ class ServerArguments:
 
     data_parallel_mode: Optional[Literal["none", "ddp", "fsdp2"]] = field(
         default="fsdp2",
-        metadata={"help": "Data parallelism mode. Use 'none' for single GPU without any parallelization."}
+        metadata={"help": "Data parallelism mode. Use 'none' for single GPU without any parallelization."},
     )
 
-    ulysses_parallel_size: int = field(
-        default=1,
-        metadata={"help": "Ulysses sequence parallelism size"}
-    )
+    ulysses_parallel_size: int = field(default=1, metadata={"help": "Ulysses sequence parallelism size"})
 
-    expert_parallel_size: int = field(
-        default=1,
-        metadata={"help": "Expert parallelism size for MoE models"}
-    )
+    expert_parallel_size: int = field(default=1, metadata={"help": "Expert parallelism size for MoE models"})
 
-    data_parallel_replicate_size: int = field(
-        default=1,
-        metadata={"help": "Data parallel replicate size (HSDP)"}
-    )
+    data_parallel_replicate_size: int = field(default=1, metadata={"help": "Data parallel replicate size (HSDP)"})
 
-    data_parallel_shard_size: int = field(
-        default=1,
-        metadata={"help": "Data parallel shard size (FSDP)"}
-    )
+    data_parallel_shard_size: int = field(default=1, metadata={"help": "Data parallel shard size (FSDP)"})
 
-    pipeline_parallel_size: int = field(
-        default=1,
-        metadata={"help": "Pipeline parallelism size. 1 = disabled."}
-    )
+    pipeline_parallel_size: int = field(default=1, metadata={"help": "Pipeline parallelism size. 1 = disabled."})
 
     pipeline_parallel_schedule: str = field(
-        default="1F1B",
-        metadata={"help": "Pipeline parallelism schedule: '1F1B' or 'GPipe'."}
+        default="1F1B", metadata={"help": "Pipeline parallelism schedule: '1F1B' or 'GPipe'."}
     )
     pp_variable_seq_lengths: bool = field(
         default=True,
@@ -183,96 +153,66 @@ class ServerArguments:
                 "static sample_packing_sequence_len.  Each unique seq_len gets its own "
                 "cached PipelineStage so P2P buffers always match the actual shape."
             )
-        }
+        },
     )
 
-    tensor_parallel_size: int = field(
-        default=1,
-        metadata={"help": "Tensor parallelism size"}
-    )
+    tensor_parallel_size: int = field(default=1, metadata={"help": "Tensor parallelism size"})
 
-    ringattn_parallel_size: int = field(
-        default=1,
-        metadata={"help": "Ring attention parallel size"}
-    )
+    ringattn_parallel_size: int = field(default=1, metadata={"help": "Ring attention parallel size"})
 
     cp_fsdp_mode: str = field(
-        default="all",
-        metadata={"help": "Sequence parallel FSDP mode: 'all', 'ulysses_only', 'ring_only', 'none'"}
+        default="all", metadata={"help": "Sequence parallel FSDP mode: 'all', 'ulysses_only', 'ring_only', 'none'"}
     )
 
     basic_modules: Optional[List[str]] = field(
-        default_factory=list,
-        metadata={"help": "Basic modules to shard in FSDP"}
+        default_factory=list, metadata={"help": "Basic modules to shard in FSDP"}
     )
 
     merge_qkv: bool = field(
-        default=True,
-        metadata={"help": "Whether to merge QKV projections. Set False for tensor parallelism."}
+        default=True, metadata={"help": "Whether to merge QKV projections. Set False for tensor parallelism."}
     )
 
     # ========================================================================
     # Memory & Performance
     # ========================================================================
 
-    seed: int = field(
-        default=42,
-        metadata={"help": "Random seed for reproducibility"}
-    )
+    seed: int = field(default=42, metadata={"help": "Random seed for reproducibility"})
 
-    enable_mixed_precision: bool = field(
-        default=True,
-        metadata={"help": "Enable mixed precision training"}
-    )
+    enable_mixed_precision: bool = field(default=True, metadata={"help": "Enable mixed precision training"})
 
-    enable_gradient_checkpointing: bool = field(
-        default=True,
-        metadata={"help": "Enable gradient checkpointing"}
-    )
+    enable_gradient_checkpointing: bool = field(default=True, metadata={"help": "Enable gradient checkpointing"})
 
-    enable_full_shard: bool = field(
-        default=True,
-        metadata={"help": "Enable full parameter sharding (FSDP)"}
-    )
+    enable_full_shard: bool = field(default=True, metadata={"help": "Enable full parameter sharding (FSDP)"})
 
-    enable_activation_offload: bool = field(
-        default=False,
-        metadata={"help": "Enable activation CPU offloading"}
-    )
+    enable_activation_offload: bool = field(default=False, metadata={"help": "Enable activation CPU offloading"})
 
-    enable_compile: bool = field(
-        default=False,
-        metadata={"help": "Enable torch.compile for model forward pass"}
-    )
+    enable_compile: bool = field(default=False, metadata={"help": "Enable torch.compile for model forward pass"})
 
     enable_reentrant: bool = field(
-        default=False,
-        metadata={"help": "Use reentrant gradient checkpointing (default: non-reentrant)"}
+        default=False, metadata={"help": "Use reentrant gradient checkpointing (default: non-reentrant)"}
     )
 
     enable_forward_prefetch: bool = field(
-        default=False,
-        metadata={"help": "Enable FSDP forward prefetch for overlapping compute and communication"}
+        default=False, metadata={"help": "Enable FSDP forward prefetch for overlapping compute and communication"}
     )
 
     reshard_after_forward: bool = field(
-        default=True,
-        metadata={"help": "Reshard parameters after forward pass in FSDP2"}
+        default=True, metadata={"help": "Reshard parameters after forward pass in FSDP2"}
     )
 
     load_weights_mode: str = field(
-        default="auto",
-        metadata={"help": "Weight loading mode: 'auto', 'safetensors', 'dcp'"}
+        default="auto", metadata={"help": "Weight loading mode: 'auto', 'safetensors', 'dcp'"}
     )
 
     init_device: Optional[Literal["cpu", "meta", "cuda"]] = field(
-        default="meta",
-        metadata={"help": "Device for model initialization"}
+        default="meta", metadata={"help": "Device for model initialization"}
     )
 
     ce_mode: Literal["eager", "compiled"] = field(
         default="compiled",
-        metadata={"help": "Cross-entropy implementation: 'compiled' (RECOMMENDED, torch.compile) or 'eager' (baseline, may OOM at 32K)"}
+        metadata={
+            "help": "Cross-entropy implementation: 'compiled' (RECOMMENDED, torch.compile) or 'eager' (baseline, may OOM at 32K)"
+        },
     )
 
     # ========================================================================
@@ -291,7 +231,9 @@ class ServerArguments:
 
     muon_lr: float = field(
         default=0.02,
-        metadata={"help": "Learning rate for Muon parameter groups (2D+ weight matrices). Only used when optimizer='muon'."},
+        metadata={
+            "help": "Learning rate for Muon parameter groups (2D+ weight matrices). Only used when optimizer='muon'."
+        },
     )
 
     muon_momentum: float = field(
@@ -311,8 +253,10 @@ class ServerArguments:
 
     muon_adjust_lr_fn: Optional[str] = field(
         default=None,
-        metadata={"help": "LR adjustment for Muon. 'original': scale by sqrt(max(1,A/B)). "
-                  "'match_rms_adamw': scale by 0.2*sqrt(max(A,B)) so Muon can reuse AdamW LR/WD."},
+        metadata={
+            "help": "LR adjustment for Muon. 'original': scale by sqrt(max(1,A/B)). "
+            "'match_rms_adamw': scale by 0.2*sqrt(max(A,B)) so Muon can reuse AdamW LR/WD."
+        },
     )
 
     # ========================================================================
@@ -321,57 +265,46 @@ class ServerArguments:
 
     output_dir: str = field(
         default="outputs",
-        metadata={"help": "Output directory for checkpoints, sampler weights, and logs (must be on shared filesystem for multi-node)"}
+        metadata={
+            "help": "Output directory for checkpoints, sampler weights, and logs (must be on shared filesystem for multi-node)"
+        },
     )
 
     storage_limit: str = field(
         default="10TB",
-        metadata={"help": "Maximum disk usage for output_dir (e.g., '1GB', '500MB', '10GB'). Save operations will fail with StorageLimitError when limit is exceeded. Default: 10TB."}
+        metadata={
+            "help": "Maximum disk usage for output_dir (e.g., '1GB', '500MB', '10GB'). Save operations will fail with StorageLimitError when limit is exceeded. Default: 10TB."
+        },
     )
 
     idle_session_timeout: float = field(
         default=7200.0,
-        metadata={"help": "Idle session timeout in seconds. Sessions inactive for this duration will be automatically cleaned up. Default: 7200 (2 hours)."}
+        metadata={
+            "help": "Idle session timeout in seconds. Sessions inactive for this duration will be automatically cleaned up. Default: 7200 (2 hours)."
+        },
     )
 
-    load_checkpoint_path: str = field(
-        default="",
-        metadata={"help": "Path to checkpoint to load"}
-    )
+    load_checkpoint_path: str = field(default="", metadata={"help": "Path to checkpoint to load"})
 
-    ckpt_manager: Optional[Literal["torch", "dcp"]] = field(
-        default="dcp",
-        metadata={"help": "Checkpoint manager type"}
-    )
+    ckpt_manager: Optional[Literal["torch", "dcp"]] = field(default="dcp", metadata={"help": "Checkpoint manager type"})
 
     # ========================================================================
     # Logging
     # ========================================================================
 
-    log_level: str = field(
-        default="INFO",
-        metadata={"help": "Logging level (DEBUG, INFO, WARNING, ERROR)"}
-    )
+    log_level: str = field(default="INFO", metadata={"help": "Logging level (DEBUG, INFO, WARNING, ERROR)"})
 
-    enable_self_test: bool = field(
-        default=False,
-        metadata={"help": "Enable self-test after model initialization"}
-    )
+    enable_self_test: bool = field(default=False, metadata={"help": "Enable self-test after model initialization"})
 
     skip_initial_checkpoint: bool = field(
-        default=False,
-        metadata={"help": "Skip saving initial checkpoint (000000) on startup"}
+        default=False, metadata={"help": "Skip saving initial checkpoint (000000) on startup"}
     )
 
     log_gradient_norms: bool = field(
-        default=True,
-        metadata={"help": "Log gradient norms by layer type after backward pass"}
+        default=True, metadata={"help": "Log gradient norms by layer type after backward pass"}
     )
 
-    log_router_stats: bool = field(
-        default=True,
-        metadata={"help": "Log MoE router token distribution statistics"}
-    )
+    log_router_stats: bool = field(default=True, metadata={"help": "Log MoE router token distribution statistics"})
 
     # ========================================================================
     # Worker Configuration
@@ -379,80 +312,72 @@ class ServerArguments:
 
     worker_bind_host: str = field(
         default="0.0.0.0",
-        metadata={"help": "Host for worker ZMQ ROUTER socket to bind. Use '0.0.0.0' for multi-node (accepts connections from any interface)."}
+        metadata={
+            "help": "Host for worker ZMQ ROUTER socket to bind. Use '0.0.0.0' for multi-node (accepts connections from any interface)."
+        },
     )
 
     worker_bind_port: int = field(
-        default=5556,
-        metadata={"help": "Port for worker ZMQ ROUTER socket to bind (rank 0 worker)"}
+        default=5556, metadata={"help": "Port for worker ZMQ ROUTER socket to bind (rank 0 worker)"}
     )
 
     engine_connect_host: Optional[str] = field(
         default=None,
-        metadata={"help": "Host for Engine to connect to rank 0 worker. If None, auto-discovered (localhost for single-node, file-based for multi-node)."}
+        metadata={
+            "help": "Host for Engine to connect to rank 0 worker. If None, auto-discovered (localhost for single-node, file-based for multi-node)."
+        },
     )
 
     worker_bind_address: str = field(
         default="auto",
-        metadata={"help": "ZMQ ROUTER socket address to bind (rank 0 worker). 'auto' picks a free port."}
+        metadata={"help": "ZMQ ROUTER socket address to bind (rank 0 worker). 'auto' picks a free port."},
     )
 
     worker_connection_timeout: float = field(
         default=120.0,
-        metadata={"help": "Timeout in seconds for worker-executor connection. Increased for multi-node scenarios."}
+        metadata={"help": "Timeout in seconds for worker-executor connection. Increased for multi-node scenarios."},
     )
 
-    worker_max_retries: int = field(
-        default=3,
-        metadata={"help": "Maximum number of retries for failed operations"}
-    )
+    worker_max_retries: int = field(default=3, metadata={"help": "Maximum number of retries for failed operations"})
 
     # ========================================================================
     # Data Processing Configuration
     # ========================================================================
 
     sample_packing_sequence_len: int = field(
-        default=32000,
-        metadata={"help": "Maximum sequence length for sample packing (default: 32000)"}
+        default=32000, metadata={"help": "Maximum sequence length for sample packing (default: 32000)"}
     )
 
     enable_packing: bool = field(
-        default=True,
-        metadata={"help": "Enable sample packing to combine multiple samples into one sequence"}
+        default=True, metadata={"help": "Enable sample packing to combine multiple samples into one sequence"}
     )
 
     # ========================================================================
     # LoRA Configuration
     # ========================================================================
 
-    enable_lora: bool = field(
-        default=False,
-        metadata={"help": "Enable LoRA adapters for training"}
-    )
+    enable_lora: bool = field(default=False, metadata={"help": "Enable LoRA adapters for training"})
 
-    lora_rank: int = field(
-        default=32,
-        metadata={"help": "LoRA rank (r parameter)"}
-    )
+    lora_rank: int = field(default=32, metadata={"help": "LoRA rank (r parameter)"})
 
-    lora_alpha: int = field(
-        default=16,
-        metadata={"help": "LoRA alpha scaling parameter"}
-    )
+    lora_alpha: int = field(default=16, metadata={"help": "LoRA alpha scaling parameter"})
 
     lora_target_modules: Optional[List[str]] = field(
         default=None,
-        metadata={"help": "List of module names to apply LoRA to (e.g., ['q_proj', 'k_proj', 'v_proj', 'o_proj']). If None, uses default based on model architecture."}
+        metadata={
+            "help": "List of module names to apply LoRA to (e.g., ['q_proj', 'k_proj', 'v_proj', 'o_proj']). If None, uses default based on model architecture."
+        },
     )
 
     moe_shared_lora: bool = field(
-        default=False,
-        metadata={"help": "Enable shared LoRA for MoE: share LoRA weights across experts"}
+        default=False, metadata={"help": "Enable shared LoRA for MoE: share LoRA weights across experts"}
     )
 
     moe_hybrid_shared_lora: bool = field(
         default=False,
-        metadata={"help": "Enable hybrid shared LoRA for MoE: share lora_A for gate/up_proj, lora_B for down_proj across experts"}
+        metadata={
+            "help": "Enable hybrid shared LoRA for MoE: share lora_A for gate/up_proj, lora_B for down_proj across experts"
+        },
     )
 
     # ========================================================================
@@ -460,42 +385,29 @@ class ServerArguments:
     # ========================================================================
 
     enable_qlora: bool = field(
-        default=False,
-        metadata={"help": "Enable QLoRA (quantized LoRA) for memory-efficient training"}
+        default=False, metadata={"help": "Enable QLoRA (quantized LoRA) for memory-efficient training"}
     )
 
     quant_format: str = field(
-        default="nvfp4",
-        metadata={"help": "Quantization format for QLoRA: 'nvfp4', 'block_fp8', or 'nf4'"}
+        default="nvfp4", metadata={"help": "Quantization format for QLoRA: 'nvfp4', 'block_fp8', or 'nf4'"}
     )
 
-    quant_group_size: int = field(
-        default=16,
-        metadata={"help": "Quantization group size for QLoRA"}
-    )
+    quant_group_size: int = field(default=16, metadata={"help": "Quantization group size for QLoRA"})
 
     qlora_exclude_modules: Optional[List[str]] = field(
-        default=None,
-        metadata={"help": "Modules to exclude from QLoRA quantization (e.g., ['lm_head'])"}
+        default=None, metadata={"help": "Modules to exclude from QLoRA quantization (e.g., ['lm_head'])"}
     )
 
-    merge_lora_interval: int = field(
-        default=0,
-        metadata={"help": "Merge LoRA weights every N steps (0 = never merge)"}
-    )
+    merge_lora_interval: int = field(default=0, metadata={"help": "Merge LoRA weights every N steps (0 = never merge)"})
     reset_optimizer_on_merge: bool = field(
-        default=False,
-        metadata={"help": "ReLoRA-style partial optimizer reset after each LoRA merge"}
+        default=False, metadata={"help": "ReLoRA-style partial optimizer reset after each LoRA merge"}
     )
 
     # ========================================================================
     # MoE Training Configuration
     # ========================================================================
 
-    freeze_router: bool = field(
-        default=True,
-        metadata={"help": "Freeze MoE router weights during training"}
-    )
+    freeze_router: bool = field(default=True, metadata={"help": "Freeze MoE router weights during training"})
 
     # ========================================================================
     # Inference Weight Sync Configuration
@@ -503,8 +415,10 @@ class ServerArguments:
 
     sync_inference_method: Literal["nccl_broadcast"] = field(
         default="nccl_broadcast",
-        metadata={"help": "Method for syncing weights to inference endpoints: "
-                  "'nccl_broadcast' (rank-0 broadcast via SGLang update_weights_from_distributed)"}
+        metadata={
+            "help": "Method for syncing weights to inference endpoints: "
+            "'nccl_broadcast' (rank-0 broadcast via SGLang update_weights_from_distributed)"
+        },
     )
 
     def __post_init__(self):
@@ -621,7 +535,7 @@ class ServerArguments:
     def get_world_size(self) -> int:
         """
         Calculate world size from parallelism configuration.
-        
+
         Note: EP (Expert Parallel) is NOT included in world_size calculation.
         EP creates a separate 2D mesh: world_size = ep_size * ep_fsdp_size
         where ep_fsdp_size contains all other parallelism dimensions.
@@ -630,14 +544,14 @@ class ServerArguments:
             Required world size (number of GPUs)
         """
         return (
-            self.pipeline_parallel_size *
-            self.tensor_parallel_size *
-            self.ringattn_parallel_size *
-            self.ulysses_parallel_size *
-            self.data_parallel_replicate_size *
-            self.data_parallel_shard_size
+            self.pipeline_parallel_size
+            * self.tensor_parallel_size
+            * self.ringattn_parallel_size
+            * self.ulysses_parallel_size
+            * self.data_parallel_replicate_size
+            * self.data_parallel_shard_size
         )
-    
+
     def get_total_gpus(self) -> int:
         """
         Calculate total number of GPUs required for the parallelism configuration.
@@ -672,7 +586,7 @@ class ServerArguments:
     def get_ep_fsdp_size(self) -> int:
         """
         Calculate ep_fsdp_size (the size of each expert parallel group).
-        
+
         For non-EP models (ep_size=1), this equals world_size.
         For EP models, ep_fsdp_size = world_size / ep_size.
 
@@ -681,18 +595,19 @@ class ServerArguments:
         """
         world_size = self.get_world_size()
         if self.expert_parallel_size > 1:
-            assert world_size % self.expert_parallel_size == 0, \
+            assert world_size % self.expert_parallel_size == 0, (
                 f"world_size ({world_size}) must be divisible by expert_parallel_size ({self.expert_parallel_size})"
+            )
             return world_size // self.expert_parallel_size
         return world_size
-    
+
     def get_dp_size(self) -> int:
         """
         Calculate data parallel size (auto-calculated from other dimensions).
-        
+
         IMPORTANT: EP (Expert Parallel) is NOT included in this calculation!
         EP creates a separate 2D mesh and doesn't participate in the main mesh.
-        
+
         dp_size is the remaining parallelism after accounting for ulysses.
         It's then split into dp_replicate_size and dp_shard_size.
 
@@ -702,8 +617,7 @@ class ServerArguments:
         world_size = self.get_world_size()
         if world_size % self.ulysses_parallel_size != 0:
             raise ValueError(
-                f"world_size ({world_size}) must be divisible by "
-                f"ulysses_parallel_size ({self.ulysses_parallel_size})"
+                f"world_size ({world_size}) must be divisible by ulysses_parallel_size ({self.ulysses_parallel_size})"
             )
         return world_size // self.ulysses_parallel_size
 
@@ -719,14 +633,14 @@ def parse_server_args() -> ServerArguments:
     Returns:
         ServerArguments with all fields populated from YAML and CLI
     """
-    from xorl.arguments import parse_args
-    import yaml
     import sys
+
+    import yaml
 
     # Read YAML directly to get flat structure
     config_path = None
     for i, arg in enumerate(sys.argv):
-        if not arg.startswith('--') and i > 0 and not sys.argv[i-1].startswith('--'):
+        if not arg.startswith("--") and i > 0 and not sys.argv[i - 1].startswith("--"):
             config_path = arg
             break
 
@@ -734,7 +648,7 @@ def parse_server_args() -> ServerArguments:
         raise ValueError("Config file path required as first positional argument")
 
     # Load YAML
-    with open(config_path, 'r') as f:
+    with open(config_path, "r") as f:
         config_data = yaml.safe_load(f)
 
     if not config_data:
@@ -746,31 +660,31 @@ def parse_server_args() -> ServerArguments:
     i = 1
     while i < len(sys.argv):
         arg = sys.argv[i]
-        if arg.startswith('--') and not arg.startswith('---'):
+        if arg.startswith("--") and not arg.startswith("---"):
             key_part = arg[2:]  # Remove '--'
 
             # Check for --key=value format
-            if '=' in key_part:
-                key, value = key_part.split('=', 1)
+            if "=" in key_part:
+                key, value = key_part.split("=", 1)
                 # Convert dotted notation (worker.bind_address) to flat (worker_bind_address)
-                key = key.replace('.', '_')
+                key = key.replace(".", "_")
                 # Try to parse as number or boolean
-                if value.lower() in ('true', 'false'):
-                    value = value.lower() == 'true'
-                elif value.replace('.', '', 1).replace('-', '', 1).isdigit():
-                    value = float(value) if '.' in value else int(value)
+                if value.lower() in ("true", "false"):
+                    value = value.lower() == "true"
+                elif value.replace(".", "", 1).replace("-", "", 1).isdigit():
+                    value = float(value) if "." in value else int(value)
                 cli_overrides[key] = value
                 i += 1
-            elif i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith('--'):
+            elif i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("--"):
                 # --key value format
                 # Convert dotted notation (worker.bind_address) to flat (worker_bind_address)
-                key = key_part.replace('.', '_')
+                key = key_part.replace(".", "_")
                 value = sys.argv[i + 1]
                 # Try to parse as number or boolean
-                if value.lower() in ('true', 'false'):
-                    value = value.lower() == 'true'
-                elif value.replace('.', '', 1).replace('-', '', 1).isdigit():
-                    value = float(value) if '.' in value else int(value)
+                if value.lower() in ("true", "false"):
+                    value = value.lower() == "true"
+                elif value.replace(".", "", 1).replace("-", "", 1).isdigit():
+                    value = float(value) if "." in value else int(value)
                 cli_overrides[key] = value
                 i += 2
             else:
@@ -782,12 +696,11 @@ def parse_server_args() -> ServerArguments:
     config_data.update(cli_overrides)
 
     # Validate config keys against ServerArguments fields
-    valid_fields = {f.name for f in __import__('dataclasses').fields(ServerArguments)}
+    valid_fields = {f.name for f in __import__("dataclasses").fields(ServerArguments)}
     unknown_fields = set(config_data.keys()) - valid_fields
     if unknown_fields:
         raise ValueError(
-            f"Unrecognized config fields: {sorted(unknown_fields)}. "
-            f"Check your config file for typos or removed fields."
+            f"Unrecognized config fields: {sorted(unknown_fields)}. Check your config file for typos or removed fields."
         )
 
     # Create ServerArguments

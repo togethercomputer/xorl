@@ -1,17 +1,16 @@
 # Copyright (c) 2025, Tri Dao.
-from typing import Optional, Tuple, Dict, Any
 from dataclasses import dataclass
-
-import torch
-from torch import Tensor
+from typing import Any, Dict, Optional, Tuple
 
 import cutlass.cute as cute
+import torch
 from cutlass import Int32
 from cutlass.cute.runtime import from_dlpack, make_ptr
+from torch import Tensor
 
 from .cute_dsl_utils import torch2cute_dtype_map
-from .varlen_utils import VarlenArguments
 from .tile_scheduler import TileSchedulerOptions
+from .varlen_utils import VarlenArguments
 
 
 @dataclass
@@ -30,9 +29,7 @@ class GemmWrapperBase:
 
     @staticmethod
     def validate_shape(tensor: Tensor, expected_shape: Tuple[int, ...], name: str) -> None:
-        assert tensor.shape == expected_shape, (
-            f"{name} must have shape {expected_shape}, got {tensor.shape}"
-        )
+        assert tensor.shape == expected_shape, f"{name} must have shape {expected_shape}, got {tensor.shape}"
 
     @staticmethod
     def get_major_order(tensor: Tensor, dims: Tuple[str, str, str]) -> str:
@@ -52,9 +49,7 @@ class GemmWrapperBase:
         # Tensor is already permuted to (dims[0], dims[1], dims[2]) or (dim[0], dim[1])
         # If major is dims[1], leading_dim is 1; if major is dims[0], leading_dim is 0
         leading_dim = 1 if major == dims[1] else 0
-        return from_dlpack(tensor.detach(), assumed_align=assumed_align).mark_layout_dynamic(
-            leading_dim=leading_dim
-        )
+        return from_dlpack(tensor.detach(), assumed_align=assumed_align).mark_layout_dynamic(leading_dim=leading_dim)
 
     @staticmethod
     def validate_and_prepare_tensors(
@@ -75,9 +70,7 @@ class GemmWrapperBase:
         # Validate A_idx if provided (for gather_A case)
         gather_A = A_idx is not None
         if gather_A:
-            assert cu_seqlens_m is not None or cu_seqlens_k is not None, (
-                "gather_A requires either varlen_m or varlen_k"
-            )
+            assert cu_seqlens_m is not None or cu_seqlens_k is not None, "gather_A requires either varlen_m or varlen_k"
             assert A_idx.dtype == torch.int32, f"A_idx must be int32, got {A_idx.dtype}"
             assert A_idx.dim() == 1, f"A_idx must be 1D, got {A_idx.dim()}D"
 
@@ -96,9 +89,7 @@ class GemmWrapperBase:
 
             L, N, K_B = B.shape
             assert K == K_B, f"K dimension mismatch: A has {K}, B has {K_B}"
-            assert cu_seqlens_m.shape == (L + 1,), (
-                f"cu_seqlens_m must have shape ({L + 1},), got {cu_seqlens_m.shape}"
-            )
+            assert cu_seqlens_m.shape == (L + 1,), f"cu_seqlens_m must have shape ({L + 1},), got {cu_seqlens_m.shape}"
             M = total_M
             dc_shape = (total_M, N)
             dc_ndim = 2
@@ -117,9 +108,7 @@ class GemmWrapperBase:
             N, K_B = B.shape
             assert total_K == K_B, f"K dimension mismatch: expected {total_K}, B has {K_B}"
             L = cu_seqlens_k.shape[0] - 1
-            assert cu_seqlens_k.shape == (L + 1,), (
-                f"cu_seqlens_k must have shape ({L + 1},), got {cu_seqlens_k.shape}"
-            )
+            assert cu_seqlens_k.shape == (L + 1,), f"cu_seqlens_k must have shape ({L + 1},), got {cu_seqlens_k.shape}"
             K = total_K
             dc_shape = (L, M, N)
             dc_ndim = 3
@@ -137,12 +126,8 @@ class GemmWrapperBase:
         # Validate D and C shapes uniformly
         for tensor, name in [(D, "D"), (C, "C")]:
             if tensor is not None:
-                assert tensor.dim() == dc_ndim, (
-                    f"{name} must be {dc_ndim}D for this mode, got {tensor.dim()}D"
-                )
-                assert tensor.shape == dc_shape, (
-                    f"{name} shape {tensor.shape} doesn't match expected {dc_shape}"
-                )
+                assert tensor.dim() == dc_ndim, f"{name} must be {dc_ndim}D for this mode, got {tensor.dim()}D"
+                assert tensor.shape == dc_shape, f"{name} shape {tensor.shape} doesn't match expected {dc_shape}"
 
         tensors = {
             "A": GemmTensorInfo(A),
@@ -154,20 +139,14 @@ class GemmWrapperBase:
         if additional_tensors:
             for name, tensor in additional_tensors.items():
                 if tensor is not None:
-                    assert tensor.dim() == dc_ndim, (
-                        f"{name} must be {dc_ndim}D for this mode, got {tensor.dim()}D"
-                    )
-                    assert tensor.shape == dc_shape, (
-                        f"{name} shape {tensor.shape} doesn't match expected {dc_shape}"
-                    )
+                    assert tensor.dim() == dc_ndim, f"{name} must be {dc_ndim}D for this mode, got {tensor.dim()}D"
+                    assert tensor.shape == dc_shape, f"{name} shape {tensor.shape} doesn't match expected {dc_shape}"
                 tensors[name] = GemmTensorInfo(tensor)
 
         return L, M, K, N, tensors
 
     @staticmethod
-    def permute_tensors(
-        tensors: Dict[str, GemmTensorInfo], varlen_m: bool = False, varlen_k: bool = False
-    ) -> None:
+    def permute_tensors(tensors: Dict[str, GemmTensorInfo], varlen_m: bool = False, varlen_k: bool = False) -> None:
         # Determine which tensors need permutation
         if varlen_m:
             # Only B needs permutation (3D tensor)
@@ -200,14 +179,10 @@ class GemmWrapperBase:
                 tensors[name].major = GemmWrapperBase.get_major_order(tensors[name].tensor, dims)
 
     @staticmethod
-    def create_cute_tensors(
-        tensors: Dict[str, GemmTensorInfo], major_configs: Dict[str, Tuple[str, str, str]]
-    ) -> None:
+    def create_cute_tensors(tensors: Dict[str, GemmTensorInfo], major_configs: Dict[str, Tuple[str, str, str]]) -> None:
         for name, info in tensors.items():
             if info.tensor is not None and name in major_configs:
-                info.cute_tensor = GemmWrapperBase.create_cute_tensor(
-                    info.tensor, info.major, major_configs[name]
-                )
+                info.cute_tensor = GemmWrapperBase.create_cute_tensor(info.tensor, info.major, major_configs[name])
 
     @staticmethod
     def create_scheduler_args(
@@ -223,9 +198,7 @@ class GemmWrapperBase:
             )
             if tile_count_semaphore is not None
             else None,
-            batch_idx_permute=(
-                from_dlpack(batch_idx_permute, assumed_align=4).mark_layout_dynamic(leading_dim=0)
-            )
+            batch_idx_permute=(from_dlpack(batch_idx_permute, assumed_align=4).mark_layout_dynamic(leading_dim=0))
             if batch_idx_permute is not None
             else None,
             max_swizzle_size=Int32(max_swizzle_size),
@@ -285,9 +258,7 @@ class GemmWrapperBase:
             ),
             mTensormaps=tensormaps_cute,
             mAIdx=(
-                from_dlpack(A_idx, assumed_align=4).mark_layout_dynamic(leading_dim=0)
-                if A_idx is not None
-                else None
+                from_dlpack(A_idx, assumed_align=4).mark_layout_dynamic(leading_dim=0) if A_idx is not None else None
             ),
         )
 

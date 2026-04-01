@@ -6,13 +6,14 @@ Distributed tests removed -- run with torchrun separately.
 import pytest
 import torch
 
+from xorl.data.collators.sequence_shard_collator import (
+    zigzag_reorder_packed_sequence,
+)
 from xorl.distributed.sequence_parallel.ring_attention import (
     _get_zigzag_step_section,
     _merge_attn_outputs,
 )
-from xorl.data.collators.sequence_shard_collator import (
-    zigzag_reorder_packed_sequence,
-)
+
 
 pytestmark = [pytest.mark.distributed]
 
@@ -91,10 +92,14 @@ class TestZigzagUnit:
         tensor = torch.arange(40).unsqueeze(0)
         position_ids = torch.arange(40).unsqueeze(0)
         reordered = zigzag_reorder_packed_sequence(tensor, position_ids, ringattn_size, dim=-1)
-        expected = torch.cat([
-            torch.arange(0, 10), torch.arange(30, 40),
-            torch.arange(10, 20), torch.arange(20, 30),
-        ]).unsqueeze(0)
+        expected = torch.cat(
+            [
+                torch.arange(0, 10),
+                torch.arange(30, 40),
+                torch.arange(10, 20),
+                torch.arange(20, 30),
+            ]
+        ).unsqueeze(0)
         assert torch.equal(reordered, expected)
 
         # Multi-doc reorder
@@ -103,12 +108,18 @@ class TestZigzagUnit:
         tensor_m = torch.arange(total).unsqueeze(0)
         position_ids_m = torch.cat([torch.arange(doc_len), torch.arange(doc_len)]).unsqueeze(0)
         reordered_m = zigzag_reorder_packed_sequence(tensor_m, position_ids_m, ringattn_size, dim=-1)
-        expected_m = torch.cat([
-            torch.arange(0, 5), torch.arange(15, 20),
-            torch.arange(20, 25), torch.arange(35, 40),
-            torch.arange(5, 10), torch.arange(10, 15),
-            torch.arange(25, 30), torch.arange(30, 35),
-        ]).unsqueeze(0)
+        expected_m = torch.cat(
+            [
+                torch.arange(0, 5),
+                torch.arange(15, 20),
+                torch.arange(20, 25),
+                torch.arange(35, 40),
+                torch.arange(5, 10),
+                torch.arange(10, 15),
+                torch.arange(25, 30),
+                torch.arange(30, 35),
+            ]
+        ).unsqueeze(0)
         assert torch.equal(reordered_m, expected_m)
 
         # Position IDs doc boundaries per rank
@@ -141,6 +152,4 @@ class TestZigzagUnit:
 
         # Invalid length raises
         with pytest.raises(ValueError, match="not divisible"):
-            zigzag_reorder_packed_sequence(
-                torch.arange(15).unsqueeze(0), torch.arange(15).unsqueeze(0), 2, dim=-1
-            )
+            zigzag_reorder_packed_sequence(torch.arange(15).unsqueeze(0), torch.arange(15).unsqueeze(0), 2, dim=-1)

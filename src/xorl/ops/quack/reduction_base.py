@@ -1,10 +1,10 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
-from typing import Type, Tuple, Optional
+from typing import Optional, Tuple, Type
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Int64, Float32, const_expr
+from cutlass import Float32, Int32, Int64, const_expr
 
 from . import copy_utils
 
@@ -38,9 +38,7 @@ class ReductionBase:
     def _get_reduction_buffer_layout(self, tv_layout: cute.Layout, cluster_n: int):
         num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
         warps_per_row = (
-            num_warps
-            if cute.rank(tv_layout.shape[0]) == 1
-            else max(tv_layout.shape[0][0] // cute.arch.WARP_SIZE, 1)
+            num_warps if cute.rank(tv_layout.shape[0]) == 1 else max(tv_layout.shape[0][0] // cute.arch.WARP_SIZE, 1)
         )
         return cute.make_ordered_layout(
             (num_warps // warps_per_row, (warps_per_row, cluster_n), self.stage),
@@ -56,9 +54,7 @@ class ReductionBase:
             byte_alignment=8,
         )
         if const_expr(self.cluster_n > 1):
-            mbar_ptr = smem.allocate_array(
-                Int64, num_elems=self.stage if not is_persistent else self.stage * 2
-            )
+            mbar_ptr = smem.allocate_array(Int64, num_elems=self.stage if not is_persistent else self.stage * 2)
         else:
             mbar_ptr = None
         return reduction_buffer, mbar_ptr
@@ -75,9 +71,7 @@ class ReductionBase:
             if tidx < self.stage:  # Initialize full barrier
                 cute.arch.mbarrier_init(mbar_ptr + tidx, 1)
                 if const_expr(is_persistent):  # Initialize empty barrier
-                    cute.arch.mbarrier_init(
-                        mbar_ptr + self.stage + tidx, num_warps * self.cluster_n
-                    )
+                    cute.arch.mbarrier_init(mbar_ptr + self.stage + tidx, num_warps * self.cluster_n)
             cute.arch.mbarrier_init_fence()
             # Cluster arrive after barrier init
             cute.arch.cluster_arrive_relaxed()

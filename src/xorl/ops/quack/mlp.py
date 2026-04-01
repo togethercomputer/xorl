@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from .linear import linear_act_func, act_linear_func
+from .linear import act_linear_func, linear_act_func
 
 
 def mlp_func(x, weight1, weight2, activation: str, fuse_grad_accum=False, tuned=True):

@@ -1,23 +1,20 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
 import math
-from typing import Type
 from functools import partial
-
-import torch
+from typing import Type
 
 import cuda.bindings.driver as cuda
-
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int64, Float32, const_expr
+import torch
+from cutlass import Float32, Int64, const_expr
 
-from . import utils
-from . import copy_utils
+from . import copy_utils, utils
 from .compile_utils import make_fake_tensor as fake_tensor
-from .reduce import row_reduce, online_softmax_reduce
-from .reduction_base import ReductionBase
 from .cute_dsl_utils import torch2cute_dtype_map
+from .reduce import online_softmax_reduce, row_reduce
+from .reduction_base import ReductionBase
 
 
 class Softmax(ReductionBase):
@@ -60,9 +57,7 @@ class Softmax(ReductionBase):
         assert mX.element_type == self.dtype
         self._set_cluster_n()
         largest_dtype_width = const_expr(max(t.element_type.width for t in [mX, mO]))
-        tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(
-            vecsize=128 // largest_dtype_width
-        )
+        tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(vecsize=128 // largest_dtype_width)
         num_threads = tiled_copy.size
         self.kernel(mX, mO, tiler_mn, tiled_copy, threads_per_row).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
@@ -92,9 +87,7 @@ class Softmax(ReductionBase):
         gX, gO, cX = [cute.local_tile(mT, tiler_mn, (bidx, cluster_y)) for mT in (mX, mO, idX)]
 
         smem = cutlass.utils.SmemAllocator()
-        sX = smem.allocate_tensor(
-            mX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16
-        )
+        sX = smem.allocate_tensor(mX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16)
         reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
 
         thr_copy_X = tiled_copy.get_slice(tidx)
@@ -106,11 +99,7 @@ class Softmax(ReductionBase):
         tXrX, tXrO = [cute.make_fragment_like(thr) for thr in (tXgX, tXgO)]
 
         is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
-        tXpX = (
-            None
-            if is_even_N
-            else copy_utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
-        )
+        tXpX = None if is_even_N else copy_utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
         # Each copy will use the same predicate
         copy = partial(copy_utils.copy, pred=tXpX)
 
@@ -239,9 +228,7 @@ class SoftmaxBackward(ReductionBase):
         assert mdY.element_type == self.dtype
         self._set_cluster_n()
         largest_dtype_width = const_expr(max(t.element_type.width for t in [mdY, mY, mdX]))
-        tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(
-            vecsize=128 // largest_dtype_width
-        )
+        tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(vecsize=128 // largest_dtype_width)
         num_threads = tiled_copy.size
         self.kernel(mdY, mY, mdX, tiler_mn, tiled_copy, threads_per_row).launch(
             grid=[cute.ceil_div(mdY.shape[0], tiler_mn[0]), self.cluster_n, 1],
@@ -268,17 +255,13 @@ class SoftmaxBackward(ReductionBase):
         shape = mdY.shape
         idX = cute.make_identity_tensor(shape)
         # slice for CTAs
-        gdY, gY, gdX, cX = [
-            cute.local_tile(mT, tiler_mn, (bidx, cluster_y)) for mT in (mdY, mY, mdX, idX)
-        ]
+        gdY, gY, gdX, cX = [cute.local_tile(mT, tiler_mn, (bidx, cluster_y)) for mT in (mdY, mY, mdX, idX)]
 
         smem = cutlass.utils.SmemAllocator()
         sdY = smem.allocate_tensor(
             mdY.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16
         )
-        sY = smem.allocate_tensor(
-            mY.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16
-        )
+        sY = smem.allocate_tensor(mY.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16)
         reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
 
         thr_copy = tiled_copy.get_slice(tidx)
@@ -292,9 +275,7 @@ class SoftmaxBackward(ReductionBase):
         tdYrdY, tYrY, tdXrdX = [cute.make_fragment_like(thr) for thr in (tdYgdY, tYgY, tdXgdX)]
 
         is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
-        tXpX = (
-            None if is_even_N else copy_utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
-        )
+        tXpX = None if is_even_N else copy_utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
         # Each copy will use the same predicate
         copy = partial(copy_utils.copy, pred=tXpX)
 
@@ -353,9 +334,7 @@ def _softmax_backward(dy: torch.Tensor, y: torch.Tensor, dx: torch.Tensor) -> No
     if compile_key not in _softmax_backward.compile_cache:
         batch_sym = cute.sym_int()
         div = math.gcd(128 // dtype.width, N)
-        dy_cute, y_cute, dx_cute = [
-            fake_tensor(dt, (batch_sym, N), div) for dt in [dtype, y_dtype, dx_dtype]
-        ]
+        dy_cute, y_cute, dx_cute = [fake_tensor(dt, (batch_sym, N), div) for dt in [dtype, y_dtype, dx_dtype]]
         softmax_backward_op = SoftmaxBackward(dtype, N)
         _softmax_backward.compile_cache[compile_key] = cute.compile(
             softmax_backward_op,

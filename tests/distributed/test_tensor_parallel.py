@@ -8,6 +8,7 @@ Run with:
 import pytest
 import torch
 
+
 pytestmark = [pytest.mark.cpu, pytest.mark.distributed]
 
 
@@ -51,7 +52,7 @@ class TestUnfuseForTP:
     def test_unfused_forward_shape_and_model_level(self):
         """Unfused MLP forward produces same shape; model-level unfuse covers all layers."""
         from xorl.models.transformers.qwen3.configuration_qwen3 import Qwen3Config
-        from xorl.models.transformers.qwen3.modeling_qwen3 import Qwen3MLP, Qwen3ForCausalLM
+        from xorl.models.transformers.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3MLP
 
         config = Qwen3Config(
             hidden_size=256,
@@ -85,7 +86,6 @@ class TestUnfuseForTP:
             assert not hasattr(layer.mlp, "gate_up_proj")
             assert hasattr(layer.mlp, "gate_proj")
             assert hasattr(layer.mlp, "up_proj")
-
 
 
 if __name__ == "__main__":

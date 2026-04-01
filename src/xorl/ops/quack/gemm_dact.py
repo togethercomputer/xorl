@@ -1,36 +1,33 @@
 # Copyright (c) 2025, Tri Dao.
-from typing import Optional, Tuple, Callable, Type
-from functools import partial
-from dataclasses import dataclass
 import operator
-
-import torch
-from torch import Tensor
+from dataclasses import dataclass
+from functools import partial
+from typing import Callable, Optional, Tuple, Type
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Float32, const_expr
 import cutlass.torch as cutlass_torch
-from cutlass.cute.runtime import from_dlpack
 import cutlass.utils.blackwell_helpers as sm100_utils
+import torch
+from cutlass import Float32, Int32, const_expr
+from cutlass.cute.runtime import from_dlpack
+from torch import Tensor
 
-from . import sm90_utils
-from .sm90_utils import partition_for_epilogue
-from .gemm_sm90 import GemmSm90
-from .gemm_sm100 import GemmSm100
-from .gemm_default_epi import GemmDefaultEpiMixin
-from .gemm_act import GemmActMixin
+from . import activation, layout_utils, sm90_utils
 from .cute_dsl_utils import (
     ArgumentsBase,
     ParamsBase,
-    torch2cute_dtype_map,
     get_device_capacity,
     get_max_active_clusters,
+    torch2cute_dtype_map,
 )
+from .gemm_act import GemmActMixin
+from .gemm_default_epi import GemmDefaultEpiMixin
+from .gemm_sm90 import GemmSm90
+from .gemm_sm100 import GemmSm100
 from .gemm_wrapper_utils import GemmWrapperBase
+from .sm90_utils import partition_for_epilogue
 from .varlen_utils import VarlenManager
-from . import layout_utils
-from . import activation
 
 
 class GemmDActMixin(GemmActMixin):
@@ -259,9 +256,7 @@ class GemmDGatedMixin(GemmActMixin):
         mColVecBroadcast: Optional[cute.Tensor] = None
         mColVecReduce: Optional[cute.Tensor] = None
 
-    def epi_to_underlying_arguments(
-        self, args: EpilogueArguments, *, loc=None, ip=None
-    ) -> EpilogueParams:
+    def epi_to_underlying_arguments(self, args: EpilogueArguments, *, loc=None, ip=None) -> EpilogueParams:
         self.postact_dtype = args.mPostAct.element_type
         self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
         # C and D are implicitly 2 16-bit elements packed into 32 bits, simply for the purpose
@@ -284,13 +279,10 @@ class GemmDGatedMixin(GemmActMixin):
         )
         # Assume all strides are divisible by 32 bits except the last stride
         new_stride = lambda t: tuple(
-            cute.assume(s, divby=32 // t.element_type.width) if not cute.is_static(s) else s
-            for s in t.stride
+            cute.assume(s, divby=32 // t.element_type.width) if not cute.is_static(s) else s for s in t.stride
         )
         mRowVecBroadcast, mColVecBroadcast, mColVecReduce = [
-            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
-            if t is not None
-            else None
+            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) if t is not None else None
             for t in (args.mRowVecBroadcast, args.mColVecBroadcast, args.mColVecReduce)
         ]
         return self.EpilogueParams(
@@ -342,9 +334,7 @@ class GemmDGatedMixin(GemmActMixin):
         tDrColVecReduce = None
         if const_expr(params.mColVecReduce is not None):
             colvec_mma_layout = cute.make_layout(self.cta_tile_shape_mnk[:2], stride=(1, 0))
-            tDrColVec_layout = partition_for_epilogue_fn(
-                cute.make_rmem_tensor(colvec_mma_layout, Float32)
-            ).layout
+            tDrColVec_layout = partition_for_epilogue_fn(cute.make_rmem_tensor(colvec_mma_layout, Float32)).layout
             tDrColVecReduce = cute.make_rmem_tensor(tDrColVec_layout, Float32)
             cute.filter_zeros(tDrColVecReduce).fill(0.0)
         return (*epi_tensors, tDrColVecReduce)
@@ -384,13 +374,9 @@ class GemmDGatedMixin(GemmActMixin):
             else:
                 tDrColVec_mn = layout_utils.convert_layout_zero_stride(tDrColVec, tDrColVec.layout)
                 tRS_rD_mn = layout_utils.convert_layout_zero_stride(tRS_rD, tDrColVec.layout)
-                tRS_rD_scaled_mn = layout_utils.convert_layout_zero_stride(
-                    tRS_rD_scaled, tDrColVec.layout
-                )
+                tRS_rD_scaled_mn = layout_utils.convert_layout_zero_stride(tRS_rD_scaled, tDrColVec.layout)
                 for m in cutlass.range(cute.size(tDrColVec_mn, mode=[0]), unroll_full=True):
-                    for n in cutlass.range(
-                        cute.size(tDrColVec_mn, mode=[1]) // 2, unroll_full=True
-                    ):
+                    for n in cutlass.range(cute.size(tDrColVec_mn, mode=[1]) // 2, unroll_full=True):
                         (
                             tRS_rD_scaled_mn[m, 2 * n],
                             tRS_rD_scaled_mn[m, 2 * n + 1],
@@ -406,9 +392,7 @@ class GemmDGatedMixin(GemmActMixin):
                     tRS_rdXY_f32x2[2 * i],
                     tRS_rdXY_f32x2[2 * i + 1],
                     tRS_rOut[i],
-                ) = params.act_bwd_fn(
-                    tRS_rXY_f32x2[2 * i], tRS_rXY_f32x2[2 * i + 1], tRS_rD_scaled[i]
-                )
+                ) = params.act_bwd_fn(tRS_rXY_f32x2[2 * i], tRS_rXY_f32x2[2 * i + 1], tRS_rD_scaled[i])
         else:
             for i in cutlass.range(cute.size(tRS_rD) // 2):
                 (
@@ -426,20 +410,14 @@ class GemmDGatedMixin(GemmActMixin):
                 for i in cutlass.range(cute.size(tDrColVecReduce), unroll_full=True):
                     tDrColVecReduce[i] += tRS_rOut[i] * tRS_rD[i]
             else:
-                tDrColVecReduce_mn = layout_utils.convert_layout_zero_stride(
-                    tDrColVecReduce, tDrColVecReduce.layout
-                )
+                tDrColVecReduce_mn = layout_utils.convert_layout_zero_stride(tDrColVecReduce, tDrColVecReduce.layout)
                 tRS_rD_mn = layout_utils.convert_layout_zero_stride(tRS_rD, tDrColVecReduce.layout)
-                tRS_rOut_mn = layout_utils.convert_layout_zero_stride(
-                    tRS_rOut, tDrColVecReduce.layout
-                )
+                tRS_rOut_mn = layout_utils.convert_layout_zero_stride(tRS_rOut, tDrColVecReduce.layout)
                 for m in cutlass.range(cute.size(tDrColVecReduce_mn, mode=[0]), unroll_full=True):
                     row_sum = cute.arch.mul_packed_f32x2(
                         (tRS_rD_mn[m, 0], tRS_rD_mn[m, 1]), (tRS_rOut_mn[m, 0], tRS_rOut_mn[m, 1])
                     )
-                    for n in cutlass.range(
-                        1, cute.size(tDrColVecReduce_mn, mode=[1]) // 2, unroll_full=True
-                    ):
+                    for n in cutlass.range(1, cute.size(tDrColVecReduce_mn, mode=[1]) // 2, unroll_full=True):
                         row_sum = cute.arch.fma_packed_f32x2(
                             (tRS_rD_mn[m, 2 * n], tRS_rD_mn[m, 2 * n + 1]),
                             (tRS_rOut_mn[m, 2 * n], tRS_rOut_mn[m, 2 * n + 1]),
@@ -454,14 +432,10 @@ class GemmDGatedMixin(GemmActMixin):
                 tDrColVec_mn = layout_utils.convert_layout_zero_stride(tDrColVec, tDrColVec.layout)
                 tRS_rOut_mn = layout_utils.convert_layout_zero_stride(tRS_rOut, tDrColVec.layout)
                 for m in cutlass.range(cute.size(tDrColVec_mn, mode=[0]), unroll_full=True):
-                    for n in cutlass.range(
-                        cute.size(tDrColVec_mn, mode=[1]) // 2, unroll_full=True
-                    ):
-                        tRS_rOut_mn[m, 2 * n], tRS_rOut_mn[m, 2 * n + 1] = (
-                            cute.arch.mul_packed_f32x2(
-                                (tRS_rOut_mn[m, 2 * n], tRS_rOut_mn[m, 2 * n + 1]),
-                                (tDrColVec_mn[m, 0], tDrColVec_mn[m, 0]),
-                            )
+                    for n in cutlass.range(cute.size(tDrColVec_mn, mode=[1]) // 2, unroll_full=True):
+                        tRS_rOut_mn[m, 2 * n], tRS_rOut_mn[m, 2 * n + 1] = cute.arch.mul_packed_f32x2(
+                            (tRS_rOut_mn[m, 2 * n], tRS_rOut_mn[m, 2 * n + 1]),
+                            (tDrColVec_mn[m, 0], tDrColVec_mn[m, 0]),
                         )
         # Type conversion
         tRS_rdXY_f16x2 = cute.make_rmem_tensor(tRS_rdXY_f32x2.layout, implicit_dtype)
@@ -496,20 +470,12 @@ class GemmDGatedMixin(GemmActMixin):
             tDrCVR_flt = cute.filter_zeros(tDrColVecReduce)
             if const_expr(self.arch != 100):
                 for i in cutlass.range(cute.size(tDrCVR_flt), unroll_full=True):
-                    tDrCVR_flt[i] = cute.arch.warp_reduction(
-                        tDrCVR_flt[i], operator.add, threads_in_group=4
-                    )
+                    tDrCVR_flt[i] = cute.arch.warp_reduction(tDrCVR_flt[i], operator.add, threads_in_group=4)
             else:
                 # Don't need warp_reduce since we load from tmem with one thread per row
-                assert self.d_layout.is_n_major_c(), (
-                    "GemmDGated only supports n-major output for now"
-                )
+                assert self.d_layout.is_n_major_c(), "GemmDGated only supports n-major output for now"
             batch_idx = tile_coord_mnkl[3]
-            limit_n = (
-                params.mColVecReduce.shape[2]
-                if not varlen_manager.varlen_m
-                else params.mColVecReduce.shape[1]
-            )
+            limit_n = params.mColVecReduce.shape[2] if not varlen_manager.varlen_m else params.mColVecReduce.shape[1]
             if tile_coord_mnkl[1] < limit_n:
                 if const_expr(not varlen_manager.varlen_m):
                     mColVec = params.mColVecReduce[batch_idx, None, tile_coord_mnkl[1]]
@@ -521,12 +487,10 @@ class GemmDGatedMixin(GemmActMixin):
                 gColVec = cute.local_tile(mColVec, (tile_M,), (tile_coord_mnkl[0],))
                 limit_m = min(varlen_manager.len_m(batch_idx) - tile_coord_mnkl[0] * tile_M, tile_M)
                 tDcCV = partition_for_epilogue_fn(cute.make_identity_tensor((tile_M, tile_N)))
-                tDrColVecReduce_m = layout_utils.convert_layout_zero_stride(
-                    tDrColVecReduce, tDrColVecReduce.layout
-                )[None, 0]
-                tDcCV_m = layout_utils.convert_layout_zero_stride(tDcCV, tDrColVecReduce.layout)[
+                tDrColVecReduce_m = layout_utils.convert_layout_zero_stride(tDrColVecReduce, tDrColVecReduce.layout)[
                     None, 0
                 ]
+                tDcCV_m = layout_utils.convert_layout_zero_stride(tDcCV, tDrColVecReduce.layout)[None, 0]
                 if tDcCV_m[0][1] == 0:
                     for m in cutlass.range(cute.size(tDcCV_m, mode=[0])):
                         row_idx = tDcCV_m[m][0]
@@ -661,9 +625,7 @@ def gemm_dgated(
             else None
         ),
     )
-    scheduler_args = GemmWrapperBase.create_scheduler_args(
-        max_active_clusters, tile_count_semaphore
-    )
+    scheduler_args = GemmWrapperBase.create_scheduler_args(max_active_clusters, tile_count_semaphore)
 
     # Create varlen arguments if needed (assumes persistent=True when varlen_m)
     varlen_args = GemmWrapperBase.create_varlen_args(

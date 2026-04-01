@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from xorl.ops.quantize import nvfp4_quantize, nvfp4_dequantize
+from xorl.ops.quantize import nvfp4_dequantize, nvfp4_quantize
 from xorl.qlora.modules.linear import QLoRALinear
 
 
@@ -33,9 +33,16 @@ class NvFP4QLoRALinear(QLoRALinear):
         aqn_alpha: float = 1.0,
     ):
         super().__init__(
-            in_features, out_features, r=r, lora_alpha=lora_alpha,
-            quant_format="nvfp4", quant_group_size=16,
-            bias=bias, device=device, enable_aqn=enable_aqn, aqn_alpha=aqn_alpha,
+            in_features,
+            out_features,
+            r=r,
+            lora_alpha=lora_alpha,
+            quant_format="nvfp4",
+            quant_group_size=16,
+            bias=bias,
+            device=device,
+            enable_aqn=enable_aqn,
+            aqn_alpha=aqn_alpha,
         )
         # nvfp4: 2 fp4 values per byte -> in_features // 2 bytes -> in_features // 8 float32 elements
         pw_cols = in_features // 8
@@ -55,14 +62,25 @@ class NvFP4QLoRALinear(QLoRALinear):
         self.reset_lora_parameters()
 
     @classmethod
-    def from_module(cls, module: nn.Module, r: int = 16, lora_alpha: int = 16,
-                    enable_aqn: bool = False, aqn_alpha: float = 1.0, **kwargs) -> "NvFP4QLoRALinear":
+    def from_module(
+        cls,
+        module: nn.Module,
+        r: int = 16,
+        lora_alpha: int = 16,
+        enable_aqn: bool = False,
+        aqn_alpha: float = 1.0,
+        **kwargs,
+    ) -> "NvFP4QLoRALinear":
         """Create from a bf16 nn.Linear by quantizing its weight to nvfp4."""
         qlora = cls(
-            in_features=module.in_features, out_features=module.out_features,
-            r=r, lora_alpha=lora_alpha,
-            bias=module.bias is not None, device=module.weight.device,
-            enable_aqn=enable_aqn, aqn_alpha=aqn_alpha,
+            in_features=module.in_features,
+            out_features=module.out_features,
+            r=r,
+            lora_alpha=lora_alpha,
+            bias=module.bias is not None,
+            device=module.weight.device,
+            enable_aqn=enable_aqn,
+            aqn_alpha=aqn_alpha,
         )
         w = module.weight.detach()
         qlora._ema_amax = w.float().abs().max().reshape(1).to(w.device)
@@ -71,7 +89,9 @@ class NvFP4QLoRALinear(QLoRALinear):
 
     def _quantize_and_store(self, w: Tensor, global_amax: Optional[Tensor] = None) -> None:
         packed, block_scales, global_scale = nvfp4_quantize(
-            w, self.quant_group_size, global_amax=global_amax,
+            w,
+            self.quant_group_size,
+            global_amax=global_amax,
         )
         uint8_data = self._to_uint8(packed)
         self._write_packed_weight(uint8_data)
@@ -87,12 +107,8 @@ class NvFP4QLoRALinear(QLoRALinear):
     def _dequantize_weight(self) -> Tensor:
         M, K = self.out_features, self.in_features
         uint8_data = self._read_packed_weight_uint8()
-        block_scales = self._recover_tensor(
-            self.weight_block_scales, self._scale_dtypes["weight_block_scales"]
-        )
-        global_scale = self._recover_tensor(
-            self.weight_global_scale, self._scale_dtypes["weight_global_scale"]
-        )
+        block_scales = self._recover_tensor(self.weight_block_scales, self._scale_dtypes["weight_block_scales"])
+        global_scale = self._recover_tensor(self.weight_global_scale, self._scale_dtypes["weight_global_scale"])
         w = nvfp4_dequantize(uint8_data, block_scales, global_scale, M * K, self.quant_group_size)
         return w.reshape(M, K)
 
@@ -101,12 +117,8 @@ class NvFP4QLoRALinear(QLoRALinear):
         """nvfp4: 0.5 * block_scale * global_scale (FP4 min linear step)."""
         M, K = self.out_features, self.in_features
         bs = self.quant_group_size
-        block_scales = self._recover_tensor(
-            self.weight_block_scales, self._scale_dtypes["weight_block_scales"]
-        ).float()
-        global_scale = self._recover_tensor(
-            self.weight_global_scale, self._scale_dtypes["weight_global_scale"]
-        ).float()
+        block_scales = self._recover_tensor(self.weight_block_scales, self._scale_dtypes["weight_block_scales"]).float()
+        global_scale = self._recover_tensor(self.weight_global_scale, self._scale_dtypes["weight_global_scale"]).float()
         effective = block_scales * global_scale
         step = effective.reshape(M, K // bs).repeat_interleave(bs, dim=1)
         return (0.5 * step).contiguous()

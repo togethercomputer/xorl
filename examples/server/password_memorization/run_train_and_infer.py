@@ -10,10 +10,12 @@ Usage:
 import logging
 import time
 import uuid
+
 import chz
 import xorl_client
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 from tinker_cookbook.utils import ml_log
+
 
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARN)
@@ -48,10 +50,12 @@ def main(config: Config):
 
     # Get tokenizer
     tokenizer = get_tokenizer("Qwen/Qwen3-30B-A3B-Instruct-2507")
-    logger.info(f"Model: Qwen/Qwen3-30B-A3B-Instruct-2507")
+    logger.info("Model: Qwen/Qwen3-30B-A3B-Instruct-2507")
 
     # Setup training client
-    service_client = xorl_client.ServiceClient(base_url=config.training_base_url, model=config.training_model, api_key=config.api_key)
+    service_client = xorl_client.ServiceClient(
+        base_url=config.training_base_url, model=config.training_model, api_key=config.api_key
+    )
     training_client = service_client.create_lora_training_client(
         base_model=config.training_model, rank=config.lora_rank, model_id=config.model_id
     )
@@ -68,7 +72,7 @@ def main(config: Config):
         {
             "role": "assistant",
             "content": "The magic keyword is a7sdxxz3",
-        }
+        },
     ]
     logger.info(f"Training messages: {training_messages}")
     input_ids = tokenizer.apply_chat_template(training_messages, tokenize=True, add_generation_prompt=False)
@@ -121,7 +125,7 @@ def main(config: Config):
             time_total=time.time() - start_time,
         )
         ml_logger.log_metrics(metrics=metrics, step=i)
-        logger.info(f"Iteration {i+1}/{config.num_iterations}: loss={loss}, grad_norm={grad_norm}")
+        logger.info(f"Iteration {i + 1}/{config.num_iterations}: loss={loss}, grad_norm={grad_norm}")
 
     # =========================================================================
     # Sampling from the trained model
@@ -131,7 +135,12 @@ def main(config: Config):
     adapter_name = f"adapter-{uuid_str}"
     training_client.save_weights_for_sampler(name=adapter_name).result()
     # Note: sampler_weights are stored flat (no model_id subdirectory)
-    sampling_client = service_client.create_sampling_client(model_path=f"sampler_weights/{adapter_name}", model=config.inference_model, base_url=config.sampling_base_url, api_key=config.api_key)
+    sampling_client = service_client.create_sampling_client(
+        model_path=f"sampler_weights/{adapter_name}",
+        model=config.inference_model,
+        base_url=config.sampling_base_url,
+        api_key=config.api_key,
+    )
 
     # Prepare prompt with user message format
     messages = [

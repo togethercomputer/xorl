@@ -48,12 +48,18 @@ def native_attention_forward(
         # so SDPA applies causal masking per-document within the packed batch.
         max_length_q = kwargs.get("max_length_q", query.shape[2])
         mask = _build_varlen_causal_mask(
-            cu_seq_lens_q, cu_seq_lens_k, query.shape[2], key.shape[2],
-            device=query.device, dtype=query.dtype,
+            cu_seq_lens_q,
+            cu_seq_lens_k,
+            query.shape[2],
+            key.shape[2],
+            device=query.device,
+            dtype=query.dtype,
         )
         with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
             attn_output = torch.nn.functional.scaled_dot_product_attention(
-                query, key, value,
+                query,
+                key,
+                value,
                 attn_mask=mask,
                 dropout_p=dropout if module.training else 0.0,
                 scale=scaling,
@@ -62,7 +68,9 @@ def native_attention_forward(
     else:
         with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
             attn_output = torch.nn.functional.scaled_dot_product_attention(
-                query, key, value,
+                query,
+                key,
+                value,
                 is_causal=causal,
                 dropout_p=dropout if module.training else 0.0,
                 scale=scaling,

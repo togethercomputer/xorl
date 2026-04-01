@@ -14,27 +14,30 @@ from xorl.ops.linear_attention.ops.cp.comm import all_gather_into_tensor
 from xorl.ops.linear_attention.ops.utils.op import exp, exp2
 from xorl.ops.linear_attention.utils import USE_CUDA_GRAPH, autotune_cache_kwargs, check_shared_mem
 
+
 if TYPE_CHECKING:
     from xorl.ops.linear_attention.ops.cp.context import FLACPContext
 
 
-@triton.heuristics({
-    'USE_G': lambda args: args['g'] is not None,
-    'USE_GK': lambda args: args['gk'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-})
+@triton.heuristics(
+    {
+        "USE_G": lambda args: args["g"] is not None,
+        "USE_GK": lambda args: args["gk"] is not None,
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
+)
 @triton.autotune(
     configs=[
-        triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4]
         for num_stages in [2, 3, 4]
         for BV in [32, 64]
     ],
-    key=['H', 'K', 'V', 'BT', 'USE_EXP2', "STAGE"],
+    key=["H", "K", "V", "BT", "USE_EXP2", "STAGE"],
     use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=["T"])
 def pre_process_fwd_kernel_stage1(
     k,
     v,
@@ -120,28 +123,36 @@ def pre_process_fwd_kernel_stage1(
 
         if USE_GK:
             o_k1 = tl.arange(0, 64)
-            b_gk_last1 = tl.load(gk + (bos + last_idx) * H * K + i_h * K + o_k1, mask=(o_k1 < K), other=0.).to(tl.float32)
+            b_gk_last1 = tl.load(gk + (bos + last_idx) * H * K + i_h * K + o_k1, mask=(o_k1 < K), other=0.0).to(
+                tl.float32
+            )
             if USE_EXP2:
                 b_h1 *= exp2(b_gk_last1)[:, None]
             else:
                 b_h1 *= exp(b_gk_last1)[:, None]
             if K > 64:
                 o_k2 = 64 + o_k1
-                b_gk_last2 = tl.load(gk + (bos + last_idx) * H * K + i_h * K + o_k2, mask=(o_k2 < K), other=0.).to(tl.float32)
+                b_gk_last2 = tl.load(gk + (bos + last_idx) * H * K + i_h * K + o_k2, mask=(o_k2 < K), other=0.0).to(
+                    tl.float32
+                )
                 if USE_EXP2:
                     b_h2 *= exp2(b_gk_last2)[:, None]
                 else:
                     b_h2 *= exp(b_gk_last2)[:, None]
             if K > 128:
                 o_k3 = 128 + o_k1
-                b_gk_last3 = tl.load(gk + (bos + last_idx) * H * K + i_h * K + o_k3, mask=(o_k3 < K), other=0.).to(tl.float32)
+                b_gk_last3 = tl.load(gk + (bos + last_idx) * H * K + i_h * K + o_k3, mask=(o_k3 < K), other=0.0).to(
+                    tl.float32
+                )
                 if USE_EXP2:
                     b_h3 *= exp2(b_gk_last3)[:, None]
                 else:
                     b_h3 *= exp(b_gk_last3)[:, None]
             if K > 192:
                 o_k4 = 192 + o_k1
-                b_gk_last4 = tl.load(gk + (bos + last_idx) * H * K + i_h * K + o_k4, mask=(o_k4 < K), other=0.).to(tl.float32)
+                b_gk_last4 = tl.load(gk + (bos + last_idx) * H * K + i_h * K + o_k4, mask=(o_k4 < K), other=0.0).to(
+                    tl.float32
+                )
                 if USE_EXP2:
                     b_h4 *= exp2(b_gk_last4)[:, None]
                 else:
@@ -178,23 +189,25 @@ def pre_process_fwd_kernel_stage1(
         tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.heuristics({
-    'USE_G': lambda args: args['g'] is not None,
-    'USE_GK': lambda args: args['gk'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-})
+@triton.heuristics(
+    {
+        "USE_G": lambda args: args["g"] is not None,
+        "USE_GK": lambda args: args["gk"] is not None,
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
+)
 @triton.autotune(
     configs=[
-        triton.Config({'BK2': BK2}, num_warps=num_warps, num_stages=num_stages)
+        triton.Config({"BK2": BK2}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4]
         for num_stages in [2, 3, 4]
         for BK2 in [32]
     ],
-    key=['H', 'BT', 'USE_EXP2', 'FORWARD'],
+    key=["H", "BT", "USE_EXP2", "FORWARD"],
     use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=["T"])
 def pre_process_fwd_bwd_kernel_stage2(
     k,
     w,
@@ -257,7 +270,7 @@ def pre_process_fwd_bwd_kernel_stage2(
                 b_g_last = exp(b_g_last)
             b_diag = tl.where(row[:, None] == row[None, :], b_g_last, 0.0)
         elif USE_GK:
-            b_gk_last = tl.load(gk + (bos + last_idx) * H * K + i_h * K + row, mask=(row < K), other=0.).to(tl.float32)
+            b_gk_last = tl.load(gk + (bos + last_idx) * H * K + i_h * K + row, mask=(row < K), other=0.0).to(tl.float32)
             if USE_EXP2:
                 b_gk_last = exp2(b_gk_last)
             else:
@@ -275,22 +288,24 @@ def pre_process_fwd_bwd_kernel_stage2(
     tl.store(p_m, b_m.to(p_m.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.heuristics({
-    'USE_G': lambda args: args['g'] is not None,
-    'USE_GK': lambda args: args['gk'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-})
+@triton.heuristics(
+    {
+        "USE_G": lambda args: args["g"] is not None,
+        "USE_GK": lambda args: args["gk"] is not None,
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
+)
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4]
         for num_stages in [2, 3, 4]
     ],
-    key=['H', 'K', 'V', 'BT', 'USE_EXP2'],
+    key=["H", "K", "V", "BT", "USE_EXP2"],
     use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=["T"])
 def pre_process_fwd_kernel_merged(
     k,
     v,
@@ -388,28 +403,36 @@ def pre_process_fwd_kernel_merged(
 
             if USE_GK:
                 o_k1 = tl.arange(0, 64)
-                b_gk_last1 = tl.load(gk + (bos + last_idx) * H * K + i_h * K + o_k1, mask=(o_k1 < K), other=0.).to(tl.float32)
+                b_gk_last1 = tl.load(gk + (bos + last_idx) * H * K + i_h * K + o_k1, mask=(o_k1 < K), other=0.0).to(
+                    tl.float32
+                )
                 if USE_EXP2:
                     b_h1 *= exp2(b_gk_last1)[:, None]
                 else:
                     b_h1 *= exp(b_gk_last1)[:, None]
                 if K > 64:
                     o_k2 = 64 + o_k1
-                    b_gk_last2 = tl.load(gk + (bos + last_idx) * H * K + i_h * K + o_k2, mask=(o_k2 < K), other=0.).to(tl.float32)
+                    b_gk_last2 = tl.load(gk + (bos + last_idx) * H * K + i_h * K + o_k2, mask=(o_k2 < K), other=0.0).to(
+                        tl.float32
+                    )
                     if USE_EXP2:
                         b_h2 *= exp2(b_gk_last2)[:, None]
                     else:
                         b_h2 *= exp(b_gk_last2)[:, None]
                 if K > 128:
                     o_k3 = 128 + o_k1
-                    b_gk_last3 = tl.load(gk + (bos + last_idx) * H * K + i_h * K + o_k3, mask=(o_k3 < K), other=0.).to(tl.float32)
+                    b_gk_last3 = tl.load(gk + (bos + last_idx) * H * K + i_h * K + o_k3, mask=(o_k3 < K), other=0.0).to(
+                        tl.float32
+                    )
                     if USE_EXP2:
                         b_h3 *= exp2(b_gk_last3)[:, None]
                     else:
                         b_h3 *= exp(b_gk_last3)[:, None]
                 if K > 192:
                     o_k4 = 192 + o_k1
-                    b_gk_last4 = tl.load(gk + (bos + last_idx) * H * K + i_h * K + o_k4, mask=(o_k4 < K), other=0.).to(tl.float32)
+                    b_gk_last4 = tl.load(gk + (bos + last_idx) * H * K + i_h * K + o_k4, mask=(o_k4 < K), other=0.0).to(
+                        tl.float32
+                    )
                     if USE_EXP2:
                         b_h4 *= exp2(b_gk_last4)[:, None]
                     else:
@@ -474,7 +497,9 @@ def pre_process_fwd_kernel_merged(
                     b_g_last = exp(b_g_last)
                 b_diag = tl.where(row[:, None] == row[None, :], b_g_last, 0.0)
             elif USE_GK:
-                b_gk_last = tl.load(gk + (bos + last_idx) * H * K + i_h * K + row, mask=(row < K), other=0.).to(tl.float32)
+                b_gk_last = tl.load(gk + (bos + last_idx) * H * K + i_h * K + row, mask=(row < K), other=0.0).to(
+                    tl.float32
+                )
                 if USE_EXP2:
                     b_gk_last = exp2(b_gk_last)
                 else:
@@ -492,21 +517,23 @@ def pre_process_fwd_kernel_merged(
         tl.store(p_m, b_m.to(p_m.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.heuristics({
-    'HAS_H0': lambda args: args['h0'] is not None,
-})
+@triton.heuristics(
+    {
+        "HAS_H0": lambda args: args["h0"] is not None,
+    }
+)
 @triton.autotune(
     configs=[
-        triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4]
         for num_stages in [2, 3, 4]
         for BV in [32, 64]
     ],
-    key=['H', 'K', 'V', 'BT', 'USE_EXP2'],
+    key=["H", "K", "V", "BT", "USE_EXP2"],
     use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['pre_or_post_num_ranks', 'rank', 'NUM_SEQ_ENTRIES'])
+@triton.jit(do_not_specialize=["pre_or_post_num_ranks", "rank", "NUM_SEQ_ENTRIES"])
 def merge_fwd_bwd_kernel(
     h,
     ag_hm,
@@ -546,7 +573,11 @@ def merge_fwd_bwd_kernel(
             orig_seq_id = tl.load(h0_seq_ids + i_seq).to(tl.int32)
             p_h0 = tl.make_block_ptr(
                 h0 + (orig_seq_id * H + i_h) * K * V,
-                (K, V), (V, 1), (0, i_v * BV), (BK, BV), (1, 0),
+                (K, V),
+                (V, 1),
+                (0, i_v * BV),
+                (BK, BV),
+                (1, 0),
             )
             b_h = tl.load(p_h0, boundary_check=(0, 1)).to(tl.float32)
         else:
@@ -557,11 +588,21 @@ def merge_fwd_bwd_kernel(
             base = i_ss * stride_hm_s + i_h * stride_hm_h
 
             p_he = tl.make_block_ptr(
-                ag_hm + base, (K, V), (V + K, 1), (0, i_v * BV), (BK, BV), (1, 0),
+                ag_hm + base,
+                (K, V),
+                (V + K, 1),
+                (0, i_v * BV),
+                (BK, BV),
+                (1, 0),
             )
             b_he = tl.load(p_he, boundary_check=(0, 1)).to(tl.float32)
             p_m = tl.make_block_ptr(
-                ag_hm + base + V, (K, K), (V + K, 1), (0, 0), (BK, BK), (1, 0),
+                ag_hm + base + V,
+                (K, K),
+                (V + K, 1),
+                (0, 0),
+                (BK, BK),
+                (1, 0),
             )
             b_m = tl.load(p_m, boundary_check=(0, 1)).to(tl.float32)
             b_h = tl.dot(b_m.to(tl.float32), b_h.to(tl.float32)) + b_he.to(tl.float32)
@@ -571,7 +612,11 @@ def merge_fwd_bwd_kernel(
                 stride_init = H * K * V
                 p_out = tl.make_block_ptr(
                     h + init_idx * stride_init + i_h * K * V,
-                    (K, V), (V, 1), (0, i_v * BV), (BK, BV), (1, 0),
+                    (K, V),
+                    (V, 1),
+                    (0, i_v * BV),
+                    (BK, BV),
+                    (1, 0),
                 )
                 tl.store(p_out, b_h.to(p_out.dtype.element_ty), boundary_check=(0, 1))
     else:
@@ -595,23 +640,25 @@ def merge_fwd_bwd_kernel(
         tl.store(p_h, b_h.to(p_h.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.heuristics({
-    'USE_G': lambda args: args['g'] is not None,
-    'USE_GK': lambda args: args['gk'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-})
+@triton.heuristics(
+    {
+        "USE_G": lambda args: args["g"] is not None,
+        "USE_GK": lambda args: args["gk"] is not None,
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
+)
 @triton.autotune(
     configs=[
-        triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4]
-        for num_stages in ([4, 3, 2] if check_shared_mem('ampere') else [1])
+        for num_stages in ([4, 3, 2] if check_shared_mem("ampere") else [1])
         for BV in [64, 32]
     ],
-    key=['H', 'K', 'V', 'BT', 'BV', 'USE_G'],
+    key=["H", "K", "V", "BT", "BV", "USE_G"],
     use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=["T"])
 def pre_process_bwd_kernel_stage1(
     q,
     k,
@@ -678,7 +725,7 @@ def pre_process_bwd_kernel_stage1(
         b_k = tl.load(p_k, boundary_check=(0, 1))
         if USE_GK:
             o_k1 = tl.arange(0, 64)
-            b_gk_last1 = tl.load(gk + last_idx * H * K + o_k1, mask=(o_k1 < K), other=0.).to(tl.float32)
+            b_gk_last1 = tl.load(gk + last_idx * H * K + o_k1, mask=(o_k1 < K), other=0.0).to(tl.float32)
         b_dv = tl.dot(b_k, b_dh1.to(b_k.dtype))
 
         if K > 64:
@@ -686,7 +733,7 @@ def pre_process_bwd_kernel_stage1(
             b_k = tl.load(p_k, boundary_check=(0, 1))
             if USE_GK:
                 o_k2 = 64 + o_k1
-                b_gk_last2 = tl.load(gk + last_idx * H * K + o_k2, mask=(o_k2 < K), other=0.).to(tl.float32)
+                b_gk_last2 = tl.load(gk + last_idx * H * K + o_k2, mask=(o_k2 < K), other=0.0).to(tl.float32)
             b_dv += tl.dot(b_k, b_dh2.to(b_k.dtype))
 
         if K > 128:
@@ -694,7 +741,7 @@ def pre_process_bwd_kernel_stage1(
             b_k = tl.load(p_k, boundary_check=(0, 1))
             if USE_GK:
                 o_k3 = 128 + o_k1
-                b_gk_last3 = tl.load(gk + last_idx * H * K + o_k3, mask=(o_k3 < K), other=0.).to(tl.float32)
+                b_gk_last3 = tl.load(gk + last_idx * H * K + o_k3, mask=(o_k3 < K), other=0.0).to(tl.float32)
             b_dv += tl.dot(b_k, b_dh3.to(b_k.dtype))
 
         if K > 192:
@@ -702,7 +749,7 @@ def pre_process_bwd_kernel_stage1(
             b_k = tl.load(p_k, boundary_check=(0, 1))
             if USE_GK:
                 o_k4 = 192 + o_k1
-                b_gk_last4 = tl.load(gk + last_idx * H * K + o_k4, mask=(o_k4 < K), other=0.).to(tl.float32)
+                b_gk_last4 = tl.load(gk + last_idx * H * K + o_k4, mask=(o_k4 < K), other=0.0).to(tl.float32)
             b_dv += tl.dot(b_k, b_dh4.to(b_k.dtype))
 
         if USE_G:
@@ -767,22 +814,24 @@ def pre_process_bwd_kernel_stage1(
         tl.store(p_dh4, b_dh4.to(p_dh4.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.heuristics({
-    'USE_G': lambda args: args['g'] is not None,
-    'USE_GK': lambda args: args['gk'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-})
+@triton.heuristics(
+    {
+        "USE_G": lambda args: args["g"] is not None,
+        "USE_GK": lambda args: args["gk"] is not None,
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+    }
+)
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4]
-        for num_stages in ([4, 3, 2] if check_shared_mem('ampere') else [1])
+        for num_stages in ([4, 3, 2] if check_shared_mem("ampere") else [1])
     ],
-    key=['H', 'K', 'V', 'BT', 'USE_EXP2'],
+    key=["H", "K", "V", "BT", "USE_EXP2"],
     use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=["T"])
 def pre_process_bwd_kernel_merged(
     q,
     k,
@@ -856,7 +905,7 @@ def pre_process_bwd_kernel_merged(
             b_k = tl.load(p_k, boundary_check=(0, 1))
             if USE_GK:
                 o_k1 = tl.arange(0, 64)
-                b_gk_last1 = tl.load(gk + last_idx * H * K + o_k1, mask=(o_k1 < K), other=0.).to(tl.float32)
+                b_gk_last1 = tl.load(gk + last_idx * H * K + o_k1, mask=(o_k1 < K), other=0.0).to(tl.float32)
             b_dv = tl.dot(b_k, b_dh1.to(b_k.dtype))
 
             if K > 64:
@@ -864,7 +913,7 @@ def pre_process_bwd_kernel_merged(
                 b_k = tl.load(p_k, boundary_check=(0, 1))
                 if USE_GK:
                     o_k2 = 64 + o_k1
-                    b_gk_last2 = tl.load(gk + last_idx * H * K + o_k2, mask=(o_k2 < K), other=0.).to(tl.float32)
+                    b_gk_last2 = tl.load(gk + last_idx * H * K + o_k2, mask=(o_k2 < K), other=0.0).to(tl.float32)
                 b_dv += tl.dot(b_k, b_dh2.to(b_k.dtype))
 
             if K > 128:
@@ -872,7 +921,7 @@ def pre_process_bwd_kernel_merged(
                 b_k = tl.load(p_k, boundary_check=(0, 1))
                 if USE_GK:
                     o_k3 = 128 + o_k1
-                    b_gk_last3 = tl.load(gk + last_idx * H * K + o_k3, mask=(o_k3 < K), other=0.).to(tl.float32)
+                    b_gk_last3 = tl.load(gk + last_idx * H * K + o_k3, mask=(o_k3 < K), other=0.0).to(tl.float32)
                 b_dv += tl.dot(b_k, b_dh3.to(b_k.dtype))
 
             if K > 192:
@@ -880,7 +929,7 @@ def pre_process_bwd_kernel_merged(
                 b_k = tl.load(p_k, boundary_check=(0, 1))
                 if USE_GK:
                     o_k4 = 192 + o_k1
-                    b_gk_last4 = tl.load(gk + last_idx * H * K + o_k4, mask=(o_k4 < K), other=0.).to(tl.float32)
+                    b_gk_last4 = tl.load(gk + last_idx * H * K + o_k4, mask=(o_k4 < K), other=0.0).to(tl.float32)
                 b_dv += tl.dot(b_k, b_dh4.to(b_k.dtype))
 
             if USE_G:
@@ -989,7 +1038,9 @@ def pre_process_bwd_kernel_merged(
                     b_g_last = exp(b_g_last)
                 b_diag = tl.where(row[:, None] == row[None, :], b_g_last, 0.0)
             elif USE_GK:
-                b_gk_last = tl.load(gk + (bos + last_idx) * H * K + i_h * K + row, mask=(row < K), other=0.).to(tl.float32)
+                b_gk_last = tl.load(gk + (bos + last_idx) * H * K + i_h * K + row, mask=(row < K), other=0.0).to(
+                    tl.float32
+                )
                 if USE_EXP2:
                     b_gk_last = exp2(b_gk_last)
                 else:
@@ -1058,7 +1109,10 @@ def chunk_gated_delta_rule_fwd_h_pre_process(
         )
     ag_hm, _ = all_gather_into_tensor(hm, group=context.group)
     if not context.is_first_rank:
-        def grid(meta): return (triton.cdiv(V, meta['BV']), H)
+
+        def grid(meta):
+            return (triton.cdiv(V, meta["BV"]), H)
+
         merge_fwd_bwd_kernel[grid](
             h=initial_state[0],
             ag_hm=ag_hm,
@@ -1139,7 +1193,10 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
     ag_dhm, _ = all_gather_into_tensor(dhm, group=context.group)
 
     if not context.is_last_rank:
-        def grid(meta): return (triton.cdiv(V, meta['BV']), H)
+
+        def grid(meta):
+            return (triton.cdiv(V, meta["BV"]), H)
+
         merge_fwd_bwd_kernel[grid](
             h=dht[-1],
             ag_hm=ag_dhm,

@@ -1,4 +1,3 @@
-
 import json
 import os
 import re
@@ -10,15 +9,13 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, List, Literal, Optional, Sequence, Set, Tuple, Union
 
 import torch
-
-
+from safetensors import safe_open
+from safetensors.torch import load_file, save_file
 from torch import distributed as dist
 from torch import nn
 from tqdm import tqdm
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGHTS_INDEX_NAME, WEIGHTS_NAME
 from transformers.utils.hub import cached_file, get_checkpoint_shard_files
-from safetensors import safe_open
-from safetensors.torch import load_file, save_file
 
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.lora.modules.linear import LoraLinear
@@ -43,8 +40,8 @@ logger = logging.get_logger(__name__)
 # Re-export checkpoint handler utilities for backward compatibility (used by tests)
 from xorl.models.checkpoint_handlers.buffers import (  # noqa: F401
     ExpertWeightBuffer,
-    parse_expert_key,
     checkpoint_has_per_expert_weights,
+    parse_expert_key,
 )
 
 
@@ -93,7 +90,6 @@ def _get_checkpoint_keys(weights_path: str) -> Optional[Set[str]]:
             return None
 
     return None
-
 
 
 @contextmanager
@@ -285,13 +281,14 @@ def _load_state_dict(weights_path: str, **kwargs) -> List["StateDictIterator"]:
     Loads (sharded) state dict in transformers' format.
     """
     import time
+
     max_retries = 5
     for attempt in range(max_retries):
         result = _try_load_state_dict(weights_path, **kwargs)
         if result is not None:
             return result
         if attempt < max_retries - 1:
-            retry_delay = 2 * (2 ** attempt)  # 2, 4, 8, 16s
+            retry_delay = 2 * (2**attempt)  # 2, 4, 8, 16s
             logger.warning(
                 f"Cannot find checkpoint files in {weights_path} (attempt {attempt + 1}/{max_retries}). "
                 f"Retrying in {retry_delay}s..."
@@ -322,8 +319,7 @@ def _try_load_state_dict(weights_path: str, **kwargs):
                     import time
                     retry_delay = 5
                     logger.warning(
-                        f"OSError getting shard files (attempt {attempt + 1}/{max_retries}): {e}. "
-                        f"Retrying in {retry_delay}s..."
+                        f"OSError resolving shard files (attempt {attempt + 1}/{max_retries}): {e}. Retrying in 5s..."
                     )
                     time.sleep(retry_delay)
                 else:
@@ -429,9 +425,7 @@ class _MultiStreamDMA:
         to avoid interleaving no-op distribute_tensor calls (ep_fsdp mesh,
         size 1) with real NCCL collectives (fsdp mesh, size > 1).
         """
-        assert tensor.device.type == "cpu", (
-            f"DMA scheduler only handles CPU→CUDA, got {tensor.device} for {full_name}"
-        )
+        assert tensor.device.type == "cpu", f"DMA scheduler only handles CPU→CUDA, got {tensor.device} for {full_name}"
         if tensor.dtype != orig_tensor.dtype:
             tensor = tensor.to(dtype=orig_tensor.dtype)
         pinned = tensor.pin_memory()
@@ -457,9 +451,7 @@ class _MultiStreamDMA:
             if dtensor_factory is not None and hasattr(orig_tensor, "device_mesh"):
                 device_mesh = getattr(orig_tensor, "device_mesh")
                 placements = getattr(orig_tensor, "placements")
-                module._parameters[local_name].data.copy_(
-                    dtensor_factory(gpu_temp, device_mesh, placements)
-                )
+                module._parameters[local_name].data.copy_(dtensor_factory(gpu_temp, device_mesh, placements))
                 # distribute_tensor uses NCCL on a different CUDA stream.
                 # Synchronize to prevent races with subsequent DMA transfers
                 # on the copy-engine streams.
@@ -505,11 +497,7 @@ def _dispatch_parameter(
     # would interleave no-op distribute_tensor calls (expert params on
     # ep_fsdp mesh, size 1) with real NCCL collectives (regular params on
     # fsdp mesh, size > 1), which can corrupt weights.
-    if (
-        _active_dma_scheduler is not None
-        and tensor.device.type == "cpu"
-        and orig_tensor.device.type == "cuda"
-    ):
+    if _active_dma_scheduler is not None and tensor.device.type == "cpu" and orig_tensor.device.type == "cuda":
         _active_dma_scheduler.dispatch(module, local_name, tensor, orig_tensor, dtensor_factory, full_param_name)
         return
 
@@ -537,6 +525,7 @@ def _dispatch_parameter(
             # CPU DTensor: copy shard directly into local tensor.
             # distribute_tensor doesn't support CPU mesh, so we manually shard and copy.
             from torch.distributed._tensor import Shard as DTShard
+
             shard_dim = None
             for p in placements:
                 if isinstance(p, DTShard):
@@ -596,8 +585,9 @@ def _init_parameter(
     - lora_A: kaiming uniform initialization
     - lora_B: zeros (so LoRA has no effect at start)
     """
-    import torch.nn as nn
     import math
+
+    import torch.nn as nn
 
     # Check if this is a LoRA parameter and handle specially
     if "lora_A" in name or "lora_B" in name:
@@ -662,7 +652,6 @@ def _convert_weight_key(key: str, model: "PreTrainedModel") -> str:
             return converted_key
 
     return key
-
 
 
 def _shrink_expert_params_for_ep(model: "nn.Module") -> None:
@@ -778,6 +767,7 @@ def all_ranks_load_weights(
                     f"Retrying in {retry_delay} seconds..."
                 )
                 import time
+
                 time.sleep(retry_delay)
             else:
                 logger.error(f"Failed to load weights after {max_retries} attempts")
@@ -928,7 +918,10 @@ def all_ranks_load_weights(
         _active_dma_scheduler = None
 
     post_process_after_weight_loading(
-        model, buffer_dict, parameter_names_to_load, dtensor_factory,
+        model,
+        buffer_dict,
+        parameter_names_to_load,
+        dtensor_factory,
         qlora_skip_prefixes=_expected_skip_prefixes,
         qlora_skip_fn=_should_skip_qlora_expert_key,
     )
@@ -1070,8 +1063,7 @@ def rank0_load_and_broadcast_weights(
             start_time = time.perf_counter()
             dist.broadcast(tensor, src=0)
             logger.info_rank0(
-                f"{name=}, {shape=}, {dtype=}, broadcast time (ms): "
-                f"{1000 * (time.perf_counter() - start_time)}"
+                f"{name=}, {shape=}, {dtype=}, broadcast time (ms): {1000 * (time.perf_counter() - start_time)}"
             )
 
             # Resolve _orig_mod prefix from torch.compile
@@ -1334,7 +1326,6 @@ def save_model_weights(
                     model_asset.save_pretrained(output_dir)
                 else:
                     logger.warning(f"Model asset {model_asset} should implement `save_pretrained`.")
-
 
 
 def save_model_assets(output_dir: Union[str, "os.PathLike"], model_assets: Sequence["ModelAssets"]):

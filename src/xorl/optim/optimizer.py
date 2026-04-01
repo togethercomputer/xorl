@@ -193,7 +193,9 @@ class MultiOptimizer(Optimizer, Stateful):
                     f"Key clash detected while merging state dict for optimizer '{name}': {', '.join(sorted(overlap))}"
                 )
             else:
-                logger.info_rank0(f"MultiOptimizer merged '{name}' state dict ({len(sd)} keys, total {len(merged) + len(sd)})")
+                logger.info_rank0(
+                    f"MultiOptimizer merged '{name}' state dict ({len(sd)} keys, total {len(merged) + len(sd)})"
+                )
             merged.update(sd)
 
         return merged
@@ -304,16 +306,26 @@ def _get_optimizer_cls_and_kwargs(
     if optimizer_type == "adamw":
         foreach = not fused
         ctor_kwargs = dict(
-            lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
-            fused=fused, foreach=foreach, **kwargs,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            fused=fused,
+            foreach=foreach,
+            **kwargs,
         )
         return AdamW, ctor_kwargs
     elif optimizer_type == "anyprecision_adamw":
         state_dtype = _ANYPRECISION_STATE_DTYPES[optimizer_dtype]
         ctor_kwargs = dict(
-            lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
-            momentum_dtype=state_dtype, variance_dtype=state_dtype,
-            compensation_buffer_dtype=state_dtype, **kwargs,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            momentum_dtype=state_dtype,
+            variance_dtype=state_dtype,
+            compensation_buffer_dtype=state_dtype,
+            **kwargs,
         )
         return AnyPrecisionAdamW, ctor_kwargs
     elif optimizer_type == "sgd":
@@ -338,8 +350,7 @@ def _get_optimizer_cls_and_kwargs(
         return Muon, ctor_kwargs
     else:
         raise ValueError(
-            f"Unsupported optimizer type: '{optimizer_type}'. "
-            f"Supported: adamw, anyprecision_adamw, sgd, muon."
+            f"Unsupported optimizer type: '{optimizer_type}'. Supported: adamw, anyprecision_adamw, sgd, muon."
         )
 
 
@@ -365,8 +376,14 @@ def _create_optimizer(
       - adamw/anyprecision_adamw: any extra kwargs forwarded to constructor
     """
     cls, ctor_kwargs = _get_optimizer_cls_and_kwargs(
-        optimizer_type, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
-        fused=fused, optimizer_dtype=optimizer_dtype, optimizer_kwargs=optimizer_kwargs,
+        optimizer_type,
+        lr=lr,
+        betas=betas,
+        eps=eps,
+        weight_decay=weight_decay,
+        fused=fused,
+        optimizer_dtype=optimizer_dtype,
+        optimizer_kwargs=optimizer_kwargs,
     )
     return cls(param_groups, **ctor_kwargs)
 
@@ -489,8 +506,17 @@ def build_optimizer(
     # EP-aware routing: for FSDP2+EP, split params into EP and non-EP groups and build two optimizers.
     if _should_build_ep_aware(model, param_groups):
         return build_ep_fsdp2_optimizer(
-            model, lr, betas, eps, weight_decay, fused, optimizer_type, optimizer_dtype,
-            param_groups, no_decay_modules, no_decay_params,
+            model,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            fused,
+            optimizer_type,
+            optimizer_dtype,
+            param_groups,
+            no_decay_modules,
+            no_decay_params,
             optimizer_kwargs=optimizer_kwargs,
         )
 
@@ -499,17 +525,20 @@ def build_optimizer(
     # Muon optimizer: split params into Muon (2D+ matrices) and AdamW (rest)
     if optimizer_type == "muon":
         muon_params, muon_names, adamw_params, adamw_names = _classify_muon_params(model)
-        logger.info_rank0(
-            f"Muon optimizer: {len(muon_params)} Muon params, {len(adamw_params)} AdamW params"
-        )
+        logger.info_rank0(f"Muon optimizer: {len(muon_params)} Muon params, {len(adamw_params)} AdamW params")
         logger.info_rank0(f"Muon params: {muon_names}")
         logger.info_rank0(f"AdamW params: {adamw_names}")
 
         muon_lr = kwargs.get("muon_lr", 0.02)
         param_groups = _make_muon_param_groups(
-            model, muon_params, adamw_params,
-            muon_lr=muon_lr, adamw_lr=lr, weight_decay=weight_decay,
-            no_decay_modules=no_decay_modules, no_decay_params=no_decay_params,
+            model,
+            muon_params,
+            adamw_params,
+            muon_lr=muon_lr,
+            adamw_lr=lr,
+            weight_decay=weight_decay,
+            no_decay_modules=no_decay_modules,
+            no_decay_params=no_decay_params,
         )
     elif param_groups is None:
         # Build param groups with weight decay splitting
@@ -531,9 +560,14 @@ def build_optimizer(
             param_groups.append({"params": no_decay_parameters, "weight_decay": 0.0})
 
     return _create_optimizer(
-        optimizer_type, param_groups,
-        lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
-        fused=fused, optimizer_dtype=optimizer_dtype,
+        optimizer_type,
+        param_groups,
+        lr=lr,
+        betas=betas,
+        eps=eps,
+        weight_decay=weight_decay,
+        fused=fused,
+        optimizer_dtype=optimizer_dtype,
         optimizer_kwargs=optimizer_kwargs,
     )
 
@@ -598,14 +632,24 @@ def build_ep_fsdp2_optimizer(
 
         muon_lr = kwargs.get("muon_lr", 0.02)
         ep_groups = _make_muon_param_groups(
-            model, ep_muon, ep_adamw,
-            muon_lr=muon_lr, adamw_lr=lr, weight_decay=weight_decay,
-            no_decay_modules=no_decay_modules, no_decay_params=no_decay_params,
+            model,
+            ep_muon,
+            ep_adamw,
+            muon_lr=muon_lr,
+            adamw_lr=lr,
+            weight_decay=weight_decay,
+            no_decay_modules=no_decay_modules,
+            no_decay_params=no_decay_params,
         )
         non_ep_groups = _make_muon_param_groups(
-            model, non_ep_muon, non_ep_adamw,
-            muon_lr=muon_lr, adamw_lr=lr, weight_decay=weight_decay,
-            no_decay_modules=no_decay_modules, no_decay_params=no_decay_params,
+            model,
+            non_ep_muon,
+            non_ep_adamw,
+            muon_lr=muon_lr,
+            adamw_lr=lr,
+            weight_decay=weight_decay,
+            no_decay_modules=no_decay_modules,
+            no_decay_params=no_decay_params,
         )
     else:
         ep_groups = _make_param_groups_for_subset(model, ep_params, weight_decay, no_decay_modules, no_decay_params)
@@ -615,9 +659,14 @@ def build_ep_fsdp2_optimizer(
 
     def _build(groups: Sequence[Dict[str, Any]]) -> Optimizer:
         return _create_optimizer(
-            optimizer_type, groups,
-            lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
-            fused=fused, optimizer_dtype=optimizer_dtype,
+            optimizer_type,
+            groups,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            fused=fused,
+            optimizer_dtype=optimizer_dtype,
             optimizer_kwargs=optimizer_kwargs,
         )
 

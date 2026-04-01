@@ -4,7 +4,7 @@ API Request/Response Types for REST API.
 Pydantic type definitions for FastAPI endpoints in the unified API server.
 """
 
-from typing import Any, Callable, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
@@ -352,44 +352,41 @@ class CreateModelResponse(BaseModel):
     type: Literal["create_model"] = Field(default="create_model", description="Response type identifier")
 
 
-
 class UnloadModelRequest(BaseModel):
     """API request for unloading a model (Tinker-compatible)."""
+
     model_id: str = Field(..., description="Model identifier to unload")
     type: Literal["unload_model"] = Field(default="unload_model", description="Request type identifier")
 
 
 class UnloadModelResponse(BaseModel):
     """API response for unloading a model (Tinker-compatible)."""
+
     model_id: str = Field(..., description="Model identifier that was unloaded")
     type: Optional[Literal["unload_model"]] = Field(default=None, description="Response type identifier")
 
 
 class SessionInfoResponse(BaseModel):
     """API response with session information for monitoring."""
+
     registered_models: List[str] = Field(..., description="List of registered model IDs (all ever registered)")
     active_sessions: int = Field(..., description="Number of active sessions")
     session_activity: Dict[str, float] = Field(
-        default_factory=dict,
-        description="Map of model_id to last activity timestamp"
+        default_factory=dict, description="Map of model_id to last activity timestamp"
     )
     idle_timeout_seconds: float = Field(..., description="Idle session timeout in seconds")
     loaded_sampling_adapters: Dict[str, int] = Field(
-        default_factory=dict,
-        description="Map of model_id to number of loaded sampling adapters"
+        default_factory=dict, description="Map of model_id to number of loaded sampling adapters"
     )
     # Training adapter info (from worker's adapter manager)
     loaded_training_adapters: List[str] = Field(
-        default_factory=list,
-        description="List of training adapters currently loaded in GPU memory"
+        default_factory=list, description="List of training adapters currently loaded in GPU memory"
     )
     max_training_adapters: int = Field(
-        default=0,
-        description="Maximum number of training adapters that can be loaded (LRU eviction threshold)"
+        default=0, description="Maximum number of training adapters that can be loaded (LRU eviction threshold)"
     )
     current_training_adapter: Optional[str] = Field(
-        default=None,
-        description="Currently active training adapter (if any)"
+        default=None, description="Currently active training adapter (if any)"
     )
 
 
@@ -403,13 +400,9 @@ class SaveAdapterStateRequest(BaseModel):
 
     model_id: str = Field(..., description="Adapter/session identifier to save")
     path: Optional[str] = Field(
-        default=None,
-        description="Directory to save adapter state to. Auto-generated if not specified."
+        default=None, description="Directory to save adapter state to. Auto-generated if not specified."
     )
-    save_optimizer: bool = Field(
-        default=True,
-        description="Whether to save optimizer state for resuming training"
-    )
+    save_optimizer: bool = Field(default=True, description="Whether to save optimizer state for resuming training")
     seq_id: Optional[int] = Field(default=None, description="Sequence ID for request ordering")
 
 
@@ -420,7 +413,6 @@ class SaveAdapterStateResponse(BaseModel):
     path: str = Field(..., description="Directory where adapter state was saved")
     model_id: str = Field(..., description="Model identifier that was saved")
     step: int = Field(..., description="Global step at save time")
-
 
 
 class RegisterWorkersRequest(BaseModel):
@@ -449,8 +441,9 @@ class SaveWeightsForSamplerRequest(BaseModel):
 class SaveWeightsForSamplerResponse(BaseModel):
     """API response for saving weights for sampler."""
 
-    path: str = Field(..., description="Xorl URI for the saved checkpoint (e.g., 'xorl://model-0/sampler_weights/step-100')")
-
+    path: str = Field(
+        ..., description="Xorl URI for the saved checkpoint (e.g., 'xorl://model-0/sampler_weights/step-100')"
+    )
 
 
 # ============================================================================
@@ -461,7 +454,9 @@ class SaveWeightsForSamplerResponse(BaseModel):
 class CheckpointInfo(BaseModel):
     """Information about a single checkpoint."""
 
-    checkpoint_id: str = Field(..., description="The checkpoint ID (e.g., 'weights/model_id/name' or 'sampler_weights/name')")
+    checkpoint_id: str = Field(
+        ..., description="The checkpoint ID (e.g., 'weights/model_id/name' or 'sampler_weights/name')"
+    )
     checkpoint_type: Literal["training", "sampler"] = Field(..., description="The type of checkpoint")
     time: str = Field(..., description="ISO format timestamp when the checkpoint was created")
     path: str = Field(..., description="The xorl:// path to the checkpoint")
@@ -528,7 +523,9 @@ class KillSessionResponse(BaseModel):
 
     success: bool = Field(..., description="Whether the session was killed successfully")
     message: str = Field(..., description="Status message")
-    checkpoint_path: Optional[str] = Field(default=None, description="Path to saved checkpoint (if save_checkpoint=True)")
+    checkpoint_path: Optional[str] = Field(
+        default=None, description="Path to saved checkpoint (if save_checkpoint=True)"
+    )
 
 
 # ============================================================================
@@ -563,7 +560,9 @@ class InferenceEndpointServerInfo(BaseModel):
     model_path: Optional[str] = Field(default=None, description="Model path loaded on the server")
     served_model_name: Optional[str] = Field(default=None, description="Served model name")
     tp_size: Optional[int] = Field(default=None, description="Tensor parallelism size")
-    quantization: Optional[str] = Field(default=None, description="Quantization method reported by SGLang (e.g., 'fp8')")
+    quantization: Optional[str] = Field(
+        default=None, description="Quantization method reported by SGLang (e.g., 'fp8')"
+    )
     quantization_config: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Full HF quantization_config dict auto-detected from model's config.json",

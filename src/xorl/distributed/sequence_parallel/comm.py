@@ -256,11 +256,9 @@ def init_sequence_parallel(
         assert (ulysses_group_key == "default" and _ULYSSES_SEQUENCE_PARALLEL_GROUP[ulysses_group_key] is None) or (
             ulysses_group_key != "default" and ulysses_group_key not in _ULYSSES_SEQUENCE_PARALLEL_GROUP
         ), f"Ulysses sequence parallel group ({ulysses_group_key}) has already been initialized!"
-        assert (
-            ulysses_group_key == "default" and _ULYSSES_SEQUENCE_PARALLEL_CPU_GROUP[ulysses_group_key] is None
-        ) or (ulysses_group_key != "default" and ulysses_group_key not in _ULYSSES_SEQUENCE_PARALLEL_CPU_GROUP), (
-            f"Ulysses sequence parallel ({ulysses_group_key}) group has already been initialized!"
-        )
+        assert (ulysses_group_key == "default" and _ULYSSES_SEQUENCE_PARALLEL_CPU_GROUP[ulysses_group_key] is None) or (
+            ulysses_group_key != "default" and ulysses_group_key not in _ULYSSES_SEQUENCE_PARALLEL_CPU_GROUP
+        ), f"Ulysses sequence parallel ({ulysses_group_key}) group has already been initialized!"
 
     for i in range(data_parallel_size):
         # build ulysses group

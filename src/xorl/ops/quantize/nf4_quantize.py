@@ -6,19 +6,22 @@ per group (no global_scale + block_scale two-level system).
 
 Storage: packed uint8 (2 nf4 codes per byte) + float32 scales per group.
 """
+
 from typing import Tuple
 
 import torch
-from torch import Tensor
 import triton
 import triton.language as tl
+from torch import Tensor
 
-from .nf4_codec import _nf4_encode, _nf4_decode, get_nf4_lut
+from .nf4_codec import _nf4_decode, _nf4_encode, get_nf4_lut
 
 
 @triton.jit
 def _nf4_quantize_kernel(
-    X, Out, Scale,
+    X,
+    Out,
+    Scale,
     total_elems,
     GROUP_SIZE: tl.constexpr,
     TILE_ELEMS: tl.constexpr,
@@ -38,8 +41,7 @@ def _nf4_quantize_kernel(
     scale = tl.maximum(amax, 1e-12)
     # Store scales
     scale_offs = tl.arange(0, groups_per_tile)
-    tl.store(Scale + base_group + scale_offs, scale,
-             mask=(base_group + scale_offs) < (total_elems // GROUP_SIZE))
+    tl.store(Scale + base_group + scale_offs, scale, mask=(base_group + scale_offs) < (total_elems // GROUP_SIZE))
     # Normalize to [-1, 1] and encode
     inv_scale_2d = 1.0 / tl.expand_dims(scale, axis=1)
     norm_2d = x_2d * inv_scale_2d
@@ -52,13 +54,15 @@ def _nf4_quantize_kernel(
     packed = tl.sum(tl.reshape(shifted, (half_tile, 2)), axis=1).to(tl.uint8)
     out_base = pid * half_tile
     out_offs = tl.arange(0, half_tile)
-    tl.store(Out + out_base + out_offs, packed,
-             mask=(out_base + out_offs) < (total_elems // 2))
+    tl.store(Out + out_base + out_offs, packed, mask=(out_base + out_offs) < (total_elems // 2))
 
 
 @triton.jit
 def _nf4_dequantize_kernel(
-    Packed, Scale, LUT, Out,
+    Packed,
+    Scale,
+    LUT,
+    Out,
     total_elems,
     GROUP_SIZE: tl.constexpr,
     TILE_ELEMS: tl.constexpr,
@@ -74,9 +78,9 @@ def _nf4_dequantize_kernel(
     base_group = pid * groups_per_tile
     # Load scales
     scale_offs = tl.arange(0, groups_per_tile)
-    scale = tl.load(Scale + base_group + scale_offs,
-                    mask=(base_group + scale_offs) < (total_elems // GROUP_SIZE),
-                    other=1.0).to(tl.float32)
+    scale = tl.load(
+        Scale + base_group + scale_offs, mask=(base_group + scale_offs) < (total_elems // GROUP_SIZE), other=1.0
+    ).to(tl.float32)
     # Load packed bytes
     pack_base = pid * half_tile
     pack_offs = tl.arange(0, half_tile)
@@ -138,14 +142,18 @@ def nf4_quantize(x: Tensor, group_size: int = 64) -> Tuple[Tensor, Tensor]:
     te, nw = _get_config(group_size, n)
     grid = (n + te - 1) // te
     _nf4_quantize_kernel[(grid,)](
-        x_flat, packed, scales, n,
-        group_size, te, num_warps=nw,
+        x_flat,
+        packed,
+        scales,
+        n,
+        group_size,
+        te,
+        num_warps=nw,
     )
     return packed, scales
 
 
-def nf4_dequantize(packed: Tensor, scales: Tensor, num_elements: int,
-                    group_size: int = 64) -> Tensor:
+def nf4_dequantize(packed: Tensor, scales: Tensor, num_elements: int, group_size: int = 64) -> Tensor:
     """Dequantize NF4 packed data back to bfloat16 (flat output).
 
     Args:
@@ -165,7 +173,13 @@ def nf4_dequantize(packed: Tensor, scales: Tensor, num_elements: int,
     te, nw = _get_config(group_size, num_elements, is_dequant=True)
     grid = (num_elements + te - 1) // te
     _nf4_dequantize_kernel[(grid,)](
-        packed_flat, scales_flat, lut, out_i32, num_elements,
-        group_size, te, num_warps=nw,
+        packed_flat,
+        scales_flat,
+        lut,
+        out_i32,
+        num_elements,
+        group_size,
+        te,
+        num_warps=nw,
     )
     return out_i32.view(torch.bfloat16)

@@ -15,14 +15,12 @@ import random
 import socket
 import subprocess
 import sys
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+import pytest
 import torch
 import yaml
-
-import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -35,6 +33,7 @@ QWEN3_8B_ID = "Qwen/Qwen3-8B"
 # ---------------------------------------------------------------------------
 # GPU helpers
 # ---------------------------------------------------------------------------
+
 
 def gpu_count() -> int:
     if not torch.cuda.is_available():
@@ -65,18 +64,15 @@ def _has_quack() -> bool:
         return False
 
 
-skip_if_no_flash_attn = pytest.mark.skipif(
-    not _has_flash_attn(), reason="flash_attn not installed"
-)
+skip_if_no_flash_attn = pytest.mark.skipif(not _has_flash_attn(), reason="flash_attn not installed")
 
-skip_if_no_quack = pytest.mark.skipif(
-    not _has_quack(), reason="quack not installed"
-)
+skip_if_no_quack = pytest.mark.skipif(not _has_quack(), reason="quack not installed")
 
 
 # ---------------------------------------------------------------------------
 # Training result
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class TrainingResult:
@@ -132,16 +128,11 @@ class TrainingResult:
             "Need at least 2 loss values to check convergence"
         )
         first, last = self.loss_history[0], self.loss_history[-1]
-        assert not math.isnan(first) and not math.isnan(last), (
-            f"NaN in loss history: first={first}, last={last}"
-        )
-        assert last < max_final_loss, (
-            f"Final loss {last:.4f} >= {max_final_loss}"
-        )
+        assert not math.isnan(first) and not math.isnan(last), f"NaN in loss history: first={first}, last={last}"
+        assert last < max_final_loss, f"Final loss {last:.4f} >= {max_final_loss}"
         drop = (first - last) / first
         assert drop >= min_drop_ratio, (
-            f"Loss drop {drop:.2%} < required {min_drop_ratio:.0%} "
-            f"(first={first:.4f}, last={last:.4f})"
+            f"Loss drop {drop:.2%} < required {min_drop_ratio:.0%} (first={first:.4f}, last={last:.4f})"
         )
 
     def assert_success(self, msg: str = ""):
@@ -154,9 +145,7 @@ class TrainingResult:
                 f"--- stdout (last 80 lines) ---\n{stdout_tail}\n"
                 f"--- stderr (last 50 lines) ---\n{stderr_tail}"
             )
-        assert self.metrics is not None, (
-            f"Training exited 0 but no training_metrics.json found in {self.output_dir}"
-        )
+        assert self.metrics is not None, f"Training exited 0 but no training_metrics.json found in {self.output_dir}"
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +241,7 @@ def create_tiny_model_dir(
 
 def _save_random_weights(model_dir: str, model_config: dict):
     from transformers import AutoConfig, AutoModelForCausalLM
+
     config = AutoConfig.from_pretrained(model_dir)
     model = AutoModelForCausalLM.from_config(config)
     model.save_pretrained(model_dir, safe_serialization=True)
@@ -283,6 +273,7 @@ def _create_tokenizer_files(model_dir: str, vocab_size: int = 1024):
 # ---------------------------------------------------------------------------
 # YAML config generation
 # ---------------------------------------------------------------------------
+
 
 def generate_training_config(
     model_dir: str,
@@ -395,15 +386,19 @@ def generate_training_config(
             "enable_lora": True,
             "lora_rank": lora_rank,
             "lora_alpha": lora_alpha,
-            "lora_target_modules": lora_target_modules or [
-                "q_proj", "k_proj", "v_proj", "o_proj",
-                "gate_proj", "up_proj", "down_proj",
+            "lora_target_modules": lora_target_modules
+            or [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
             ],
         }
         if enable_qlora:
-            group_size = quant_group_size or (
-                16 if quant_format == "nvfp4" else 64 if quant_format == "nf4" else 128
-            )
+            group_size = quant_group_size or (16 if quant_format == "nvfp4" else 64 if quant_format == "nf4" else 128)
             config["lora"]["enable_qlora"] = True
             config["lora"]["quant_format"] = quant_format
             config["lora"]["quant_group_size"] = group_size
@@ -423,6 +418,7 @@ def generate_training_config(
 # Training launcher
 # ---------------------------------------------------------------------------
 
+
 def _get_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
@@ -441,10 +437,15 @@ def run_training(
         env.update(extra_env)
 
     cmd = [
-        sys.executable, "-m", "torch.distributed.run",
-        "--nproc_per_node", str(num_gpus),
-        "--master_port", str(_get_free_port()),
-        "-m", "xorl.cli.train",
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--nproc_per_node",
+        str(num_gpus),
+        "--master_port",
+        str(_get_free_port()),
+        "-m",
+        "xorl.cli.train",
         config_path,
     ]
 
@@ -457,10 +458,12 @@ def run_training(
             env=env,
         )
     except subprocess.TimeoutExpired as e:
+
         def _to_str(v, fallback):
             if isinstance(v, bytes):
                 return v.decode(errors="replace")
             return v or fallback
+
         return TrainingResult(
             exit_code=-1,
             stdout=_to_str(e.stdout, ""),
@@ -497,6 +500,7 @@ def _read_metrics(output_dir: str) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Shared data generation (for server vs local comparison tests)
 # ---------------------------------------------------------------------------
+
 
 def generate_shared_token_data(
     num_samples: int,

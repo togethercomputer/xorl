@@ -13,25 +13,26 @@ import time
 
 import pytest
 
+
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
-from xorl.server.protocol.orchestrator_runner import (
-    MessageType,
-    BaseMessage,
-    RunnerReady,
-    RunnerAck,
-    RunnerResponse,
-    RunnerDispatchCommand,
-    serialize_message,
-    deserialize_message,
-    create_ack_for_request,
-)
 from xorl.server.protocol.operations import (
     EmptyData,
     LoadStateData,
     ModelPassData,
     OptimStepData,
     SaveStateData,
+)
+from xorl.server.protocol.orchestrator_runner import (
+    BaseMessage,
+    MessageType,
+    RunnerAck,
+    RunnerDispatchCommand,
+    RunnerReady,
+    RunnerResponse,
+    create_ack_for_request,
+    deserialize_message,
+    serialize_message,
 )
 
 
@@ -51,7 +52,9 @@ def test_dispatch_command_all_operations():
 
     # optim_step (with and without clip)
     msg = RunnerDispatchCommand.create(
-        operation="optim_step", payload=OptimStepData(lr=0.001, gradient_clip=1.0), request_id="opt-id",
+        operation="optim_step",
+        payload=OptimStepData(lr=0.001, gradient_clip=1.0),
+        request_id="opt-id",
     )
     assert msg.payload.lr == 0.001 and msg.payload.gradient_clip == 1.0
     msg_no_clip = RunnerDispatchCommand.create(operation="optim_step", payload=OptimStepData(lr=0.001))
@@ -59,13 +62,15 @@ def test_dispatch_command_all_operations():
 
     # save_state
     msg = RunnerDispatchCommand.create(
-        operation="save_state", payload=SaveStateData(checkpoint_path="/tmp/ckpt.pt", save_optimizer=True),
+        operation="save_state",
+        payload=SaveStateData(checkpoint_path="/tmp/ckpt.pt", save_optimizer=True),
     )
     assert msg.payload.checkpoint_path == "/tmp/ckpt.pt" and msg.payload.save_optimizer is True
 
     # load_state
     msg = RunnerDispatchCommand.create(
-        operation="load_state", payload=LoadStateData(checkpoint_path="/tmp/ckpt.pt", load_optimizer=False),
+        operation="load_state",
+        payload=LoadStateData(checkpoint_path="/tmp/ckpt.pt", load_optimizer=False),
     )
     assert msg.payload.load_optimizer is False
 
@@ -107,10 +112,16 @@ def test_json_conversion():
     assert data["worker_rank"] == 0 and data["world_size"] == 4
 
     # from_json
-    json_str = json.dumps({
-        "message_type": "ready", "worker_rank": 2, "world_size": 8,
-        "device": "cuda:2", "message_id": "msg-123", "timestamp": time.time(),
-    })
+    json_str = json.dumps(
+        {
+            "message_type": "ready",
+            "worker_rank": 2,
+            "world_size": 8,
+            "device": "cuda:2",
+            "message_id": "msg-123",
+            "timestamp": time.time(),
+        }
+    )
     msg = BaseMessage.from_json(json_str)
     assert isinstance(msg, RunnerReady)
     assert msg.worker_rank == 2 and msg.world_size == 8 and msg.device == "cuda:2"
@@ -119,12 +130,19 @@ def test_json_conversion():
 def test_complex_data_and_edge_cases():
     """Test large batches, complex results, None values, ID uniqueness, and timestamp accuracy."""
     # Large batches
-    batches = [{"input_ids": [list(range(100)) for _ in range(10)],
-                "labels": [list(range(100, 200)) for _ in range(10)],
-                "position_ids": [list(range(100)) for _ in range(10)],
-                "request_id": "req-123", "batch_id": i} for i in range(5)]
+    batches = [
+        {
+            "input_ids": [list(range(100)) for _ in range(10)],
+            "labels": [list(range(100, 200)) for _ in range(10)],
+            "position_ids": [list(range(100)) for _ in range(10)],
+            "request_id": "req-123",
+            "batch_id": i,
+        }
+        for i in range(5)
+    ]
     msg = RunnerDispatchCommand.create(
-        operation="forward_backward", payload=ModelPassData(batches=batches, loss_fn="causallm_loss"),
+        operation="forward_backward",
+        payload=ModelPassData(batches=batches, loss_fn="causallm_loss"),
     )
     deserialized = deserialize_message(serialize_message(msg))
     assert len(deserialized.payload.batches) == 5
@@ -153,7 +171,9 @@ def test_complex_data_and_edge_cases():
 
     # ACK creation
     request = RunnerDispatchCommand.create(
-        operation="forward_backward", payload=ModelPassData(batches=[], loss_fn="test"), request_id="req-123",
+        operation="forward_backward",
+        payload=ModelPassData(batches=[], loss_fn="test"),
+        request_id="req-123",
     )
     ack = create_ack_for_request(request)
     assert isinstance(ack, RunnerAck)

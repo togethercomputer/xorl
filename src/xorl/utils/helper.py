@@ -9,7 +9,7 @@ import warnings
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import numpy as np
 import psutil
@@ -33,7 +33,6 @@ from xorl.utils.dist_utils import all_reduce
 from .multisource_utils import parse_multisource_config
 
 
-
 if TYPE_CHECKING:
     from torch.utils.data import DataLoader
     from transformers import PretrainedConfig
@@ -44,9 +43,7 @@ logger = logging.get_logger(__name__)
 CACHE_DIR = os.path.expanduser(os.getenv("CACHE_DIR", os.path.join("~/.cache", "xorl")))
 
 
-def _get_global_token_count(
-    micro_batch: Dict[str, "torch.Tensor"]
-) -> List[int]:
+def _get_global_token_count(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
     """Return per-document token counts for FLOPs accounting.
 
     Uses ``_original_position_ids`` (pre-zigzag, pre-SP-padding) so document
@@ -66,9 +63,7 @@ def _get_global_token_count(
     starts = (pos == 0).nonzero(as_tuple=True)[0]
     if len(starts) <= 1:
         return [int(pos.shape[0])]
-    seqlens = torch.diff(
-        torch.cat([starts, torch.tensor([pos.shape[0]], device=starts.device)])
-    ).tolist()
+    seqlens = torch.diff(torch.cat([starts, torch.tensor([pos.shape[0]], device=starts.device)])).tolist()
     return [int(s) for s in seqlens]
 
 
@@ -545,12 +540,12 @@ def create_profiler(
     warmup = 0 if start_step == 1 else 1
     wait = start_step - warmup - 1
     active = end_step - start_step
-    
+
     # Ensure active >= 1 (PyTorch profiler requirement)
     if active <= 0:
         logger.warning(f"Profiler active steps is {active}, adjusting to 1 for valid profiling.")
         active = 1
-        
+
     logger.info(f"build profiler schedule - wait: {wait}, warmup: {warmup}, active: {active}.")
 
     schedule = profiler_module.schedule(

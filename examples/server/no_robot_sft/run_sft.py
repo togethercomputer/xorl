@@ -15,6 +15,7 @@ from tinker_cookbook.supervised.data import conversation_to_datum
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 from tinker_cookbook.utils import ml_log
 
+
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARN)
 
@@ -65,9 +66,7 @@ def main(config: Config):
     # Check for resuming
     resume_info = checkpoint_utils.get_last_checkpoint(config.log_path)
     if resume_info:
-        training_client = service_client.create_training_client_from_state_with_optimizer(
-            resume_info["state_path"]
-        )
+        training_client = service_client.create_training_client_from_state_with_optimizer(resume_info["state_path"])
         start_batch = resume_info["batch"]
         logger.info(f"Resuming from batch {start_batch}")
     else:
@@ -100,11 +99,7 @@ def main(config: Config):
     val_weights = [d.loss_fn_inputs["weights"] for d in val_batch]
     val_nll = compute_mean_nll(val_logprobs, val_weights)
 
-    logger.info(
-        f"Initial validation: nll={val_nll:.4f}, "
-        f"num_sequences={len(val_batch)}, "
-        f"time={val_time:.2f}s"
-    )
+    logger.info(f"Initial validation: nll={val_nll:.4f}, num_sequences={len(val_batch)}, time={val_time:.2f}s")
     ml_logger.log_metrics(
         metrics={"val_mean_nll": val_nll, "val_time": val_time},
         step=-1,  # Pre-training step

@@ -1,12 +1,13 @@
 """MXFP4 quantization/dequantization via Triton kernels."""
+
 from typing import Tuple
 
 import torch
-from torch import Tensor
 import triton
 import triton.language as tl
+from torch import Tensor
 
-from .fp4_codec import _fp4_encode, _fp4_decode
+from .fp4_codec import _fp4_decode, _fp4_encode
 
 
 _QUANT_CONFIGS = {
@@ -28,7 +29,9 @@ _DEQUANT_CONFIGS = {
 
 @triton.jit
 def _mxfp4_quantize_kernel(
-    X, Out, Scale,
+    X,
+    Out,
+    Scale,
     total_elems,
     BLOCK_SIZE: tl.constexpr,
     TILE_ELEMS: tl.constexpr,
@@ -47,8 +50,7 @@ def _mxfp4_quantize_kernel(
     # Bitwise E8M0 rounding: multiply by sqrt(2) then zero mantissa bits
     scale = ((scale * 1.4142135623730951).to(tl.int32, bitcast=True) & 0x7F800000).to(tl.float32, bitcast=True)
     scale_offs = tl.arange(0, blocks_per_tile)
-    tl.store(Scale + base_block + scale_offs, scale,
-             mask=(base_block + scale_offs) < (total_elems // BLOCK_SIZE))
+    tl.store(Scale + base_block + scale_offs, scale, mask=(base_block + scale_offs) < (total_elems // BLOCK_SIZE))
     inv_scale_2d = 1.0 / tl.expand_dims(scale, axis=1)
     scaled_2d = x_2d * inv_scale_2d
     scaled = tl.reshape(scaled_2d, (TILE_ELEMS,))
@@ -58,13 +60,14 @@ def _mxfp4_quantize_kernel(
     packed = tl.sum(tl.reshape(shifted, (half_tile, 2)), axis=1).to(tl.uint8)
     out_base = pid * half_tile
     out_offs = tl.arange(0, half_tile)
-    tl.store(Out + out_base + out_offs, packed,
-             mask=(out_base + out_offs) < (total_elems // 2))
+    tl.store(Out + out_base + out_offs, packed, mask=(out_base + out_offs) < (total_elems // 2))
 
 
 @triton.jit
 def _mxfp4_dequantize_kernel(
-    Packed, Scale, Out,
+    Packed,
+    Scale,
+    Out,
     total_elems,
     BLOCK_SIZE: tl.constexpr,
     TILE_ELEMS: tl.constexpr,
@@ -76,8 +79,7 @@ def _mxfp4_dequantize_kernel(
     base_block = pid * blocks_per_tile
     scale_offs = tl.arange(0, blocks_per_tile)
     scale_mask = (base_block + scale_offs) < (total_elems // BLOCK_SIZE)
-    scale_vec = tl.load(Scale + base_block + scale_offs,
-                        mask=scale_mask, other=1.0).to(tl.float32)
+    scale_vec = tl.load(Scale + base_block + scale_offs, mask=scale_mask, other=1.0).to(tl.float32)
     pack_base = pid * half_tile
     pack_offs = tl.arange(0, half_tile)
     pack_mask = (pack_base + pack_offs) < (total_elems // 2)
@@ -120,14 +122,19 @@ def mxfp4_quantize(x: Tensor, block_size: int = 32) -> Tuple[Tensor, Tensor]:
     return packed, scales
 
 
-def mxfp4_dequantize(packed: Tensor, scales: Tensor, num_elements: int,
-                      block_size: int = 32) -> Tensor:
+def mxfp4_dequantize(packed: Tensor, scales: Tensor, num_elements: int, block_size: int = 32) -> Tensor:
     assert num_elements % block_size == 0
     packed_flat = packed.reshape(-1)
     out_i32 = torch.empty(num_elements // 2, dtype=torch.int32, device=packed_flat.device)
     te, nw = _get_config(block_size, num_elements, is_dequant=True)
     grid = (num_elements + te - 1) // te
     _mxfp4_dequantize_kernel[(grid,)](
-        packed_flat, scales, out_i32, num_elements, block_size, te, num_warps=nw,
+        packed_flat,
+        scales,
+        out_i32,
+        num_elements,
+        block_size,
+        te,
+        num_warps=nw,
     )
     return out_i32.view(torch.bfloat16)

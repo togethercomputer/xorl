@@ -1,6 +1,7 @@
 """MoE expert weight container with backend dispatch."""
 
 import os
+
 import torch
 import torch.nn as nn
 
@@ -105,12 +106,11 @@ class MoEExperts(nn.Module):
 
         # Check EP — use unified dispatch/compute/combine path
         from xorl.distributed.parallel_state import get_parallel_state
+
         parallel_state = get_parallel_state()
 
         if parallel_state.ep_enabled:
-            return self._ep_forward(
-                hidden_states, routing_weights, selected_experts, parallel_state
-            )
+            return self._ep_forward(hidden_states, routing_weights, selected_experts, parallel_state)
 
         # Local single-GPU path — select moe_act variant when available
         if _moe_act and self.moe_implementation in MOE_EXPERT_BACKENDS_MOE_ACT:
@@ -144,7 +144,7 @@ class MoEExperts(nn.Module):
         Dispatch strategy is selected by ``self.ep_dispatch`` (``"alltoall"``
         or ``"deepep"``). Compute backend by ``self.moe_implementation``.
         """
-        from .backend import EP_DISPATCH, EP_COMBINE, EP_EXPERT_COMPUTE, EP_EXPERT_COMPUTE_MOE_ACT
+        from .backend import EP_COMBINE, EP_DISPATCH, EP_EXPERT_COMPUTE, EP_EXPERT_COMPUTE_MOE_ACT
 
         if self.moe_implementation not in EP_EXPERT_COMPUTE:
             raise ValueError(
@@ -153,8 +153,7 @@ class MoEExperts(nn.Module):
             )
         if self.ep_dispatch not in EP_DISPATCH:
             raise ValueError(
-                f"ep_dispatch={self.ep_dispatch!r} is not available. "
-                f"Available: {list(EP_DISPATCH.keys())}"
+                f"ep_dispatch={self.ep_dispatch!r} is not available. Available: {list(EP_DISPATCH.keys())}"
             )
 
         dispatch_fn = EP_DISPATCH[self.ep_dispatch]
@@ -168,13 +167,15 @@ class MoEExperts(nn.Module):
             compute_fn = EP_EXPERT_COMPUTE[self.moe_implementation]
 
         # Step 1: Dispatch tokens to expert-owning ranks
-        dispatch_kwargs = self._build_dispatch_kwargs(
-            hidden_states, routing_weights, selected_experts, parallel_state
-        )
+        dispatch_kwargs = self._build_dispatch_kwargs(hidden_states, routing_weights, selected_experts, parallel_state)
 
         if _DEBUG_EP:
             return self._ep_forward_debug(
-                dispatch_fn, combine_fn, compute_fn, dispatch_kwargs, parallel_state,
+                dispatch_fn,
+                combine_fn,
+                compute_fn,
+                dispatch_kwargs,
+                parallel_state,
             )
 
         permute_tokens, cumsum, ctx = dispatch_fn(**dispatch_kwargs)
@@ -184,14 +185,15 @@ class MoEExperts(nn.Module):
 
         # Step 2: Expert computation (backend-specific GEMM only)
         expert_output = compute_fn(
-            permute_tokens, cumsum,
-            self.gate_proj, self.up_proj, self.down_proj,
+            permute_tokens,
+            cumsum,
+            self.gate_proj,
+            self.up_proj,
+            self.down_proj,
         )
 
         # Step 3: Combine expert outputs back to original ranks
-        combine_kwargs = self._build_combine_kwargs(
-            expert_output, ctx, dispatch_kwargs, parallel_state
-        )
+        combine_kwargs = self._build_combine_kwargs(expert_output, ctx, dispatch_kwargs, parallel_state)
         return combine_fn(**combine_kwargs)
 
     def _ep_forward_debug(self, dispatch_fn, combine_fn, compute_fn, dispatch_kwargs, parallel_state):
@@ -215,15 +217,16 @@ class MoEExperts(nn.Module):
         # --- compute ---
         ev[2].record()
         expert_output = compute_fn(
-            permute_tokens, cumsum,
-            self.gate_proj, self.up_proj, self.down_proj,
+            permute_tokens,
+            cumsum,
+            self.gate_proj,
+            self.up_proj,
+            self.down_proj,
         )
         ev[3].record()
 
         # --- combine ---
-        combine_kwargs = self._build_combine_kwargs(
-            expert_output, ctx, dispatch_kwargs, parallel_state
-        )
+        combine_kwargs = self._build_combine_kwargs(expert_output, ctx, dispatch_kwargs, parallel_state)
         ev[4].record()
         result = combine_fn(**combine_kwargs)
         ev[5].record()
@@ -264,6 +267,7 @@ class MoEExperts(nn.Module):
             kwargs["ep_group"] = parallel_state.ep_group
         elif self.ep_dispatch == "deepep":
             from xorl.distributed.moe.deepep import get_default_buffer
+
             kwargs["buffer"] = get_default_buffer(
                 ep_group=parallel_state.ep_group,
                 buffer_size_gb=self.deepep_buffer_size_gb,

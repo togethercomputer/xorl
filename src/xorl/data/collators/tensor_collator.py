@@ -25,7 +25,7 @@ class ToTensorCollator(DataCollator):
     Returns list of dicts with converted tensors, preserving the structure.
     Downstream collators (like PackingConcatCollator) handle batching/concatenation.
     """
-    
+
     def __call__(self, features: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Convert lists/arrays to tensors without batching.
@@ -78,7 +78,7 @@ class ToTensorCollator(DataCollator):
         # Return list of dicts (not batched)
         # PackingConcatCollator will handle the concatenation/batching
         return converted_features
-    
+
     def _convert_value(self, value: Any, key: str) -> Any:
         """
         Recursively convert a value to tensor if appropriate.
@@ -154,21 +154,20 @@ class ToTensorCollator(DataCollator):
 
         # Flat list - check if all are numeric
         return all(isinstance(item, (int, float, bool, np.number)) for item in lst)
-    
+
     def _infer_dtype(self, key: str) -> torch.dtype:
         """
         Infer appropriate dtype based on field name.
-        
+
         Args:
             key: Field name
-        
+
         Returns:
             PyTorch dtype
         """
         # These fields should be long (int64) for model compatibility
-        if key in ['input_ids', 'labels', 'attention_mask', 'position_ids']:
+        if key in ["input_ids", "labels", "attention_mask", "position_ids"]:
             return torch.long
-        
+
         # Let PyTorch infer for other fields
         return None  # Will use default inference
-

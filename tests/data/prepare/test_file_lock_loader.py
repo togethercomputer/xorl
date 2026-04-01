@@ -1,15 +1,15 @@
 """Tests for xorl.data.prepare.file_lock_loader module."""
 
-import tempfile
 from pathlib import Path
 from unittest.mock import Mock, patch
+
 import pytest
 
 from xorl.data.prepare.file_lock_loader import (
-    FileLockLoader,
     LOCK_FILE_NAME,
-    READY_FILE_NAME,
     PROCESS_COUNTER_FILE_NAME,
+    READY_FILE_NAME,
+    FileLockLoader,
 )
 
 
@@ -122,7 +122,7 @@ class TestFileLockLoaderErrorHandling:
         loader3 = FileLockLoader(mock_args)
         loader3.cleanup()
         Path(temp_dataset_path).mkdir(parents=True, exist_ok=True)
-        with patch.object(Path, 'read_text', side_effect=OSError("IO error")):
+        with patch.object(Path, "read_text", side_effect=OSError("IO error")):
             loader3.load(lambda: "data")
         assert loader3.counter_path.read_text().strip() == "1"
 

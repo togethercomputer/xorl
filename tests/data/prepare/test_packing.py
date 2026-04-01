@@ -1,20 +1,21 @@
 """Tests for xorl.data.prepare.packing module."""
 
+from unittest.mock import Mock, patch
+
 import numpy as np
 import pytest
-from unittest.mock import Mock, patch
 from datasets import Dataset as HFDataset
 
 from xorl.data.prepare.packing import (
-    ffd_check,
-    pack_group,
-    allocate_sequentially,
-    add_position_ids,
-    drop_no_trainable_tokens,
-    filter_dataset_with_logging,
-    process_datasets_for_packing,
     PackingDataset,
+    add_position_ids,
+    allocate_sequentially,
+    drop_no_trainable_tokens,
+    ffd_check,
+    filter_dataset_with_logging,
+    pack_group,
     pack_parallel,
+    process_datasets_for_packing,
 )
 
 
@@ -128,10 +129,12 @@ def test_drop_no_trainable_tokens():
 
 def test_filter_dataset_with_logging():
     """Filter dataset and verify correct samples are kept."""
-    dataset = HFDataset.from_dict({
-        "input_ids": [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
-        "labels": [[1, 2, 3], [-100, -100, -100], [7, 8, 9]],
-    })
+    dataset = HFDataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
+            "labels": [[1, 2, 3], [-100, -100, -100], [7, 8, 9]],
+        }
+    )
     filtered = filter_dataset_with_logging(dataset, lambda x: x["labels"][0] != -100, "test", num_proc=1)
     assert len(filtered) == 2
     assert filtered[0]["labels"] == [1, 2, 3]
@@ -171,11 +174,13 @@ def test_packing_dataset():
     args.data.test_datasets = []
     args.data.dataset_num_proc = 1
 
-    dataset = HFDataset.from_dict({
-        "input_ids": [[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]],
-        "labels": [[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]],
-        "length": [3, 3, 3, 3],
-    })
+    dataset = HFDataset.from_dict(
+        {
+            "input_ids": [[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]],
+            "labels": [[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]],
+            "length": [3, 3, 3, 3],
+        }
+    )
     tokenizer = Mock()
     tokenizer.name_or_path = "test-tokenizer"
 

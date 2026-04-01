@@ -5,11 +5,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch.amp import custom_fwd, custom_bwd
+from torch.amp import custom_bwd, custom_fwd
 
-
-from .gemm_interface import gemm, gemm_add_inplace, gemm_act, gemm_dact
-from .gemm_interface import gemm_gated, gemm_dgated
+from .gemm_interface import gemm, gemm_act, gemm_add_inplace, gemm_dact, gemm_dgated, gemm_gated
 
 
 def linear_fwd_convert_type(*tensors):
@@ -90,16 +88,10 @@ class LinearFunc(torch.autograd.Function):
         x, weight, weight_og = ctx.saved_tensors  # weight_og is None if not ctx.fuse_grad_accum
         batch_shape = dout.shape[:-1]
         dout = dout.reshape(-1, dout.shape[-1])
-        dbias = (
-            dout.sum(0, dtype=ctx.bias_dtype)
-            if ctx.bias_dtype is not None and ctx.needs_input_grad[2]
-            else None
-        )
+        dbias = dout.sum(0, dtype=ctx.bias_dtype) if ctx.bias_dtype is not None and ctx.needs_input_grad[2] else None
         dx = linear_bwd_compute_input_grad(ctx, dout, weight, cls.matmul_bwd_dx)
         dx = dx.reshape(*batch_shape, dx.shape[-1]) if dx is not None else None
-        dweight = linear_bwd_compute_weight_grad(
-            ctx, dout, x, weight_og, cls.matmul_bwd_dw, cls.matmul_bwd_dw_inplace
-        )
+        dweight = linear_bwd_compute_weight_grad(ctx, dout, x, weight_og, cls.matmul_bwd_dw, cls.matmul_bwd_dw_inplace)
         # return extra Nones for other classes that inherit from LinearFunc
         return dx, dweight, dbias, *([None] * 10)
 
@@ -123,9 +115,7 @@ class LinearActFunc(LinearFunc):
     # Use classmethod instead of staticmethod to allow inheritance
     @classmethod
     @custom_fwd(device_type="cuda")
-    def forward(
-        cls, ctx, x, weight, activation, bias=None, store_preact=True, fuse_grad_accum=False
-    ):
+    def forward(cls, ctx, x, weight, activation, bias=None, store_preact=True, fuse_grad_accum=False):
         """
         x: (..., in_features)
         weight: (out_features, in_features)
@@ -139,9 +129,7 @@ class LinearActFunc(LinearFunc):
         x, weight = linear_fwd_convert_type(x, weight)
         batch_shape = x.shape[:-1]
         x = x.reshape(-1, x.shape[-1])
-        out, postact = cls.matmul_fwd_fn(
-            x, weight.T, bias=bias, activation=activation, store_preact=store_preact
-        )
+        out, postact = cls.matmul_fwd_fn(x, weight.T, bias=bias, activation=activation, store_preact=store_preact)
         linear_fwd_postprocess(ctx, x, weight, weight_og, needs_x_w_grad=ctx.needs_input_grad[:2])
         if out is not None:
             out = out.reshape(*batch_shape, out.shape[-1])
@@ -159,9 +147,7 @@ class LinearActUntunedFunc(LinearActFunc):
     matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True)
 
 
-def linear_act_func(
-    x, weight, activation, bias=None, store_preact=True, fuse_grad_accum=False, tuned=True
-):
+def linear_act_func(x, weight, activation, bias=None, store_preact=True, fuse_grad_accum=False, tuned=True):
     fn_cls = LinearActFunc if tuned else LinearActUntunedFunc
     return fn_cls.apply(x, weight, activation, bias, store_preact, fuse_grad_accum)
 
@@ -187,9 +173,7 @@ class DActLinearFunc(LinearFunc):
         x = x.reshape(-1, x.shape[-1])
         out = cls.matmul_fwd_fn(x, weight.T)
         # Store preact instead of x, we will recompute x in the backward pass
-        linear_fwd_postprocess(
-            ctx, preact, weight, weight_og, needs_x_w_grad=ctx.needs_input_grad[:2]
-        )
+        linear_fwd_postprocess(ctx, preact, weight, weight_og, needs_x_w_grad=ctx.needs_input_grad[:2])
         ctx.activation = activation
         return out.reshape(*batch_shape, out.shape[-1])
 
@@ -210,9 +194,7 @@ class DActLinearFunc(LinearFunc):
         else:
             dpreact, x = None, None
         dpreact = dpreact.reshape(*batch_shape, dpreact.shape[-1]) if dpreact is not None else None
-        dweight = linear_bwd_compute_weight_grad(
-            ctx, dout, x, weight_og, cls.matmul_bwd_dw, cls.matmul_bwd_dw_inplace
-        )
+        dweight = linear_bwd_compute_weight_grad(ctx, dout, x, weight_og, cls.matmul_bwd_dw, cls.matmul_bwd_dw_inplace)
         return dpreact, dweight, *([None] * 3)
 
 
@@ -241,9 +223,7 @@ class LinearGatedUntunedFunc(LinearActFunc):
     matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True, tuned=False)
 
 
-def linear_gated_func(
-    x, weight, activation, bias=None, store_preact=True, fuse_grad_accum=False, tuned=True
-):
+def linear_gated_func(x, weight, activation, bias=None, store_preact=True, fuse_grad_accum=False, tuned=True):
     fn_cls = LinearGatedFunc if tuned else LinearGatedUntunedFunc
     return fn_cls.apply(x, weight, activation, bias, store_preact, fuse_grad_accum)
 

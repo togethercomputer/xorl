@@ -27,9 +27,7 @@ class CheckpointHandler:
                 add to output state_dict
     """
 
-    def on_load_weight(
-        self, key: str, tensor: torch.Tensor
-    ) -> List[Tuple[str, torch.Tensor]]:
+    def on_load_weight(self, key: str, tensor: torch.Tensor) -> List[Tuple[str, torch.Tensor]]:
         """Process one checkpoint key/tensor during loading.
 
         Returns:
@@ -40,9 +38,7 @@ class CheckpointHandler:
         """
         return [(key, tensor)]
 
-    def on_skip_weight(
-        self, key: str
-    ) -> List[Tuple[str, torch.Tensor]]:
+    def on_skip_weight(self, key: str) -> List[Tuple[str, torch.Tensor]]:
         """Notify the handler that a checkpoint key was skipped (not loaded from disk).
 
         Used by EP-aware filtered loading: out-of-range expert weight tensors
@@ -77,9 +73,7 @@ class CheckpointHandler:
         """
         return None
 
-    def on_save_weight(
-        self, param_name: str, tensor: torch.Tensor
-    ) -> List[Tuple[str, torch.Tensor]]:
+    def on_save_weight(self, param_name: str, tensor: torch.Tensor) -> List[Tuple[str, torch.Tensor]]:
         """Process one model parameter during saving.
 
         Returns:

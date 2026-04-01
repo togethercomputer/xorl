@@ -25,7 +25,6 @@ from .triton_utils.utils import (
     get_pid_mn,
     make_blocked,
 )
-from ..utils.pretuned import algo_key_scaled, pretuned
 
 
 def _get_cuda_autotune_config():
@@ -46,6 +45,7 @@ def _get_cuda_autotune_config():
             num_warps=4,
         ),
     ]
+
 
 @triton.autotune(
     configs=_get_cuda_autotune_config(),

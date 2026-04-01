@@ -6,7 +6,7 @@ from typing import Callable, Optional
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Int64, Float32, Boolean, const_expr
+from cutlass import Boolean, Float32, Int32, Int64, const_expr
 
 from . import utils
 
@@ -113,13 +113,9 @@ def row_reduce(
         hook_fn()
     if const_expr(reduction_buffer is not None):
         warps_per_row, cluster_n = reduction_buffer.shape[1]
-        assert cluster_n == 1 or mbar_ptr is not None, (
-            "mbar_ptr must be provided for cluster reduction"
-        )
+        assert cluster_n == 1 or mbar_ptr is not None, "mbar_ptr must be provided for cluster reduction"
         if const_expr(warps_per_row > 1 or cluster_n > 1):
-            val = block_or_cluster_reduce(
-                val, warp_op, reduction_buffer, mbar_ptr, phase=phase, init_val=init_val
-            )
+            val = block_or_cluster_reduce(val, warp_op, reduction_buffer, mbar_ptr, phase=phase, init_val=init_val)
     return val
 
 
@@ -151,13 +147,9 @@ def online_softmax_reduce(
         hook_fn()
     if const_expr(reduction_buffer is not None):
         rows_per_block, (warps_per_row, cluster_n) = reduction_buffer.shape
-        assert cluster_n == 1 or mbar_ptr is not None, (
-            "mbar_ptr must be provided for cluster reduction"
-        )
+        assert cluster_n == 1 or mbar_ptr is not None, "mbar_ptr must be provided for cluster reduction"
         if const_expr(warps_per_row > 1 or cluster_n > 1):
-            assert reduction_buffer.element_type == Int64, (
-                "reduction_buffer must be of type cute.Int64"
-            )
+            assert reduction_buffer.element_type == Int64, "reduction_buffer must be of type cute.Int64"
             lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
             row_idx, col_idx = warp_idx // warps_per_row, warp_idx % warps_per_row
             if const_expr(mbar_ptr is None):
@@ -167,9 +159,7 @@ def online_softmax_reduce(
                 max_x_single_warp = -Float32.inf
                 sum_exp_x = 0.0
                 if lane_idx < warps_per_row:
-                    max_x_single_warp, sum_exp_x = utils.i64_to_f32x2(
-                        reduction_buffer[row_idx, lane_idx]
-                    )
+                    max_x_single_warp, sum_exp_x = utils.i64_to_f32x2(reduction_buffer[row_idx, lane_idx])
                 max_x_final = cute.arch.warp_reduction(max_x_single_warp, cute.arch.fmax)
                 sum_exp_x *= cute.math.exp(max_x_single_warp - max_x_final, fastmath=True)
                 sum_exp_x = cute.arch.warp_reduction(sum_exp_x, operator.add)
@@ -188,9 +178,7 @@ def online_softmax_reduce(
                 if lane_idx < cluster_n:
                     utils.store_shared_remote(
                         utils.f32x2_to_i64(max_x, sum_exp_x),
-                        utils.elem_pointer(
-                            reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster))
-                        ),
+                        utils.elem_pointer(reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster))),
                         mbar_ptr,
                         peer_cta_rank_in_cluster=lane_idx,
                     )
@@ -223,9 +211,7 @@ def online_softmax_reduce(
 
 
 @cute.jit
-def sum_swap_shuffle(
-    X: cute.Tensor, elem_per_lane: int = 1, subwarp_size: int = 1, warp_size: int = 32
-) -> cute.Tensor:
+def sum_swap_shuffle(X: cute.Tensor, elem_per_lane: int = 1, subwarp_size: int = 1, warp_size: int = 32) -> cute.Tensor:
     """
     For warp reduction, we use Swap Shuffle
     The normal way to reduction among threads:
@@ -237,25 +223,15 @@ def sum_swap_shuffle(
     After reduction, each half of threads should deal with a (N/2)x(N/2) sub-matrix independently in the following step.
     We can recursively do this until the problem size is 1.
     """
-    assert (
-        subwarp_size >= 1
-        and subwarp_size <= 32
-        and subwarp_size == 1 << int(math.log2(subwarp_size))
-    )
-    assert (
-        warp_size <= 32
-        and warp_size % subwarp_size == 0
-        and warp_size == 1 << int(math.log2(warp_size))
-    )
+    assert subwarp_size >= 1 and subwarp_size <= 32 and subwarp_size == 1 << int(math.log2(subwarp_size))
+    assert warp_size <= 32 and warp_size % subwarp_size == 0 and warp_size == 1 << int(math.log2(warp_size))
     lane_idx = cute.arch.lane_idx() // subwarp_size
     X = cute.logical_divide(X, cute.make_layout(elem_per_lane))  # (elem_per_lane, M)
     numvec = cute.size(X, mode=[1])
     assert numvec <= 32 // subwarp_size
     # If X has more values than warp_size // subwarp_size, we first do a normal warp reduction
     # to sum up values held by lanes further than size(X) away
-    for i in cutlass.range(
-        int(math.log2(numvec)), int(math.log2(warp_size // subwarp_size)), unroll_full=True
-    ):
+    for i in cutlass.range(int(math.log2(numvec)), int(math.log2(warp_size // subwarp_size)), unroll_full=True):
         for v in cutlass.range(cute.size(X), unroll_full=True):
             shfl_val = cute.arch.shuffle_sync_bfly(X[v], offset=(1 << i) * subwarp_size)
             X[v] = X[v] + shfl_val

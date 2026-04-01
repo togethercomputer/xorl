@@ -49,7 +49,7 @@ def get_device_flops(unit="T"):
         return number
 
     device_name = get_device_name()
-    flops = float("inf")  # INF flops for unkown gpu type
+    flops = float("inf")  # INF flops for unknown gpu type
     if "H100" in device_name or "H800" in device_name:
         flops = 989e12
     elif "A100" in device_name or "A800" in device_name:
@@ -143,24 +143,21 @@ class XorlFlopsCounter:
         )
         attn_linear_N += num_query_heads * self.config.v_head_dim * hidden_size
 
-        router_N    = hidden_size * moe_num_expert
-        gate_up_N   = hidden_size * moe_intermediate_size * (moe_topk + share_expert_num) * 2
-        down_N      = hidden_size * moe_intermediate_size * (moe_topk + share_expert_num)
+        router_N = hidden_size * moe_num_expert
+        gate_up_N = hidden_size * moe_intermediate_size * (moe_topk + share_expert_num) * 2
+        down_N = hidden_size * moe_intermediate_size * (moe_topk + share_expert_num)
         dense_mlp_N = hidden_size * self.config.intermediate_size * 3
-        embed_lm_N  = vocab_size * hidden_size  # lm_head only; embedding is a lookup (0 FLOPs)
+        embed_lm_N = vocab_size * hidden_size  # lm_head only; embedding is a lookup (0 FLOPs)
 
         moe_layer_flops = (
-            m["router"]        * router_N      * tokens_sum
-            + m["gate"]        * gate_up_N     * tokens_sum
-            + m["down"]        * down_N        * tokens_sum
+            m["router"] * router_N * tokens_sum
+            + m["gate"] * gate_up_N * tokens_sum
+            + m["down"] * down_N * tokens_sum
             + m["attn_linear"] * attn_linear_N * tokens_sum
         )
-        dense_layer_flops = (
-            m["dense_mlp"]     * dense_mlp_N   * tokens_sum
-            + m["attn_linear"] * attn_linear_N * tokens_sum
-        )
+        dense_layer_flops = m["dense_mlp"] * dense_mlp_N * tokens_sum + m["attn_linear"] * attn_linear_N * tokens_sum
         dense_N_flops = (
-            moe_layer_flops   * (num_hidden_layers - first_k_dense_replace)
+            moe_layer_flops * (num_hidden_layers - first_k_dense_replace)
             + dense_layer_flops * first_k_dense_replace
             + 6 * embed_lm_N * tokens_sum
         )
@@ -188,17 +185,17 @@ class XorlFlopsCounter:
         v_size = num_key_value_heads * head_dim
 
         # Per-parameter counts (number of multiplications in one forward pass)
-        router_N      = hidden_size * moe_num_expert
-        gate_up_N     = hidden_size * moe_intermediate_size * moe_topk * 2  # gate_proj + up_proj
-        down_N        = hidden_size * moe_intermediate_size * moe_topk      # down_proj
+        router_N = hidden_size * moe_num_expert
+        gate_up_N = hidden_size * moe_intermediate_size * moe_topk * 2  # gate_proj + up_proj
+        down_N = hidden_size * moe_intermediate_size * moe_topk  # down_proj
         attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-        embed_lm_N    = vocab_size * hidden_size  # lm_head only; embedding is a lookup (0 FLOPs)
+        embed_lm_N = vocab_size * hidden_size  # lm_head only; embedding is a lookup (0 FLOPs)
 
         # Per-layer FLOPs with GC-corrected multipliers
         per_layer_flops = (
-            m["router"]      * router_N      * tokens_sum
-            + m["gate"]      * gate_up_N     * tokens_sum
-            + m["down"]      * down_N        * tokens_sum
+            m["router"] * router_N * tokens_sum
+            + m["gate"] * gate_up_N * tokens_sum
+            + m["down"] * down_N * tokens_sum
             + m["attn_linear"] * attn_linear_N * tokens_sum
         )
         dense_N_flops = per_layer_flops * num_hidden_layers + 6 * embed_lm_N * tokens_sum
@@ -239,29 +236,27 @@ class XorlFlopsCounter:
         mlp_N = hidden_size * intermediate_size * 3
         embed_lm_N = vocab_size * hidden_size  # lm_head only; embedding is a lookup (0 FLOPs)
 
-        full_attn_layer_flops = (
-            m["attn_linear"] * full_attn_linear_N * tokens_sum
-            + m["dense_mlp"] * mlp_N * tokens_sum
-        )
+        full_attn_layer_flops = m["attn_linear"] * full_attn_linear_N * tokens_sum + m["dense_mlp"] * mlp_N * tokens_sum
 
         linear_layer_flops = 0
         if linear_attn_layers > 0:
-            lin_key_dim = getattr(self.config, "linear_num_key_heads", num_attention_heads) * getattr(self.config, "linear_key_head_dim", 128)
-            lin_value_dim = getattr(self.config, "linear_num_value_heads", num_attention_heads) * getattr(self.config, "linear_value_head_dim", 128)
+            lin_key_dim = getattr(self.config, "linear_num_key_heads", num_attention_heads) * getattr(
+                self.config, "linear_key_head_dim", 128
+            )
+            lin_value_dim = getattr(self.config, "linear_num_value_heads", num_attention_heads) * getattr(
+                self.config, "linear_value_head_dim", 128
+            )
             lin_num_v_heads = getattr(self.config, "linear_num_value_heads", num_attention_heads)
             linear_proj_N = hidden_size * (
-                lin_key_dim          # q_proj
-                + lin_key_dim        # k_proj
-                + lin_value_dim      # v_proj
-                + lin_num_v_heads    # a_proj
-                + lin_num_v_heads    # b_proj
-                + lin_value_dim      # g_proj (gate)
-                + lin_value_dim      # o_proj
+                lin_key_dim  # q_proj
+                + lin_key_dim  # k_proj
+                + lin_value_dim  # v_proj
+                + lin_num_v_heads  # a_proj
+                + lin_num_v_heads  # b_proj
+                + lin_value_dim  # g_proj (gate)
+                + lin_value_dim  # o_proj
             )
-            linear_layer_flops = (
-                m["attn_linear"] * linear_proj_N * tokens_sum
-                + m["dense_mlp"] * mlp_N * tokens_sum
-            )
+            linear_layer_flops = m["attn_linear"] * linear_proj_N * tokens_sum + m["dense_mlp"] * mlp_N * tokens_sum
 
         dense_N_flops = (
             full_attn_layer_flops * full_attn_layers
@@ -314,13 +309,21 @@ class XorlFlopsCounter:
 
         linear_layer_flops = 0
         if linear_attn_layers > 0:
-            lin_key_dim = getattr(self.config, "linear_num_key_heads", num_attention_heads) * getattr(self.config, "linear_key_head_dim", 128)
-            lin_value_dim = getattr(self.config, "linear_num_value_heads", num_attention_heads) * getattr(self.config, "linear_value_head_dim", 128)
+            lin_key_dim = getattr(self.config, "linear_num_key_heads", num_attention_heads) * getattr(
+                self.config, "linear_key_head_dim", 128
+            )
+            lin_value_dim = getattr(self.config, "linear_num_value_heads", num_attention_heads) * getattr(
+                self.config, "linear_value_head_dim", 128
+            )
             lin_num_v_heads = getattr(self.config, "linear_num_value_heads", num_attention_heads)
             linear_proj_N = hidden_size * (
-                lin_key_dim + lin_key_dim + lin_value_dim
-                + lin_num_v_heads + lin_num_v_heads
-                + lin_value_dim + lin_value_dim
+                lin_key_dim
+                + lin_key_dim
+                + lin_value_dim
+                + lin_num_v_heads
+                + lin_num_v_heads
+                + lin_value_dim
+                + lin_value_dim
             )
             linear_layer_flops = m["attn_linear"] * linear_proj_N * tokens_sum + moe_mlp_flops
 
@@ -351,14 +354,11 @@ class XorlFlopsCounter:
         k_size = num_key_value_heads * head_dim
         v_size = num_key_value_heads * head_dim
 
-        mlp_N         = hidden_size * intermediate_size * 3
+        mlp_N = hidden_size * intermediate_size * 3
         attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
-        embed_lm_N    = vocab_size * hidden_size  # lm_head only; embedding is a lookup (0 FLOPs)
+        embed_lm_N = vocab_size * hidden_size  # lm_head only; embedding is a lookup (0 FLOPs)
 
-        per_layer_flops = (
-            m["dense_mlp"]   * mlp_N         * tokens_sum
-            + m["attn_linear"] * attn_linear_N * tokens_sum
-        )
+        per_layer_flops = m["dense_mlp"] * mlp_N * tokens_sum + m["attn_linear"] * attn_linear_N * tokens_sum
         dense_N_flops = per_layer_flops * num_hidden_layers + 6 * embed_lm_N * tokens_sum
 
         seqlen_square_sum = sum(s * s for s in batch_seqlens)
@@ -444,9 +444,7 @@ class XorlFlopsCounter:
         # Qwen 2.5 VL uses SiLU, thus 3.
         mlp_N = dim * mlp_hidden_dim * (2 if is_qwen2_vl else 3)
         attn_linear_N = dim * (4 * dim)  # qkv and output proj
-        patch_embed_and_merger_N = (out_hidden_size + (dim * (spatial_merge_size**2))) * (
-            dim * (spatial_merge_size**2)
-        )
+        patch_embed_and_merger_N = (out_hidden_size + (dim * (spatial_merge_size**2))) * (dim * (spatial_merge_size**2))
 
         # non-attn all_layer parm
         dense_N = (mlp_N + attn_linear_N) * depth + patch_embed_and_merger_N

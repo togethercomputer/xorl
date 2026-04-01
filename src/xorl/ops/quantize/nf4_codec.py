@@ -8,9 +8,11 @@ probability mass into 16 equal segments.
 Encoding: comparison chain against midpoints (15 comparisons, branchless).
 Decoding: LUT gather (pass pointer, tl.load with code as offset, L1-cached).
 """
+
 import torch
 import triton
 import triton.language as tl
+
 
 # NF4 quantization levels (sorted, normalized to [-1, 1])
 NF4_TABLE = [
@@ -79,7 +81,5 @@ def get_nf4_lut(device) -> torch.Tensor:
     """Get (or create) the NF4 decode LUT on the given device."""
     key = str(device)
     if key not in _NF4_LUT_CACHE:
-        _NF4_LUT_CACHE[key] = torch.tensor(
-            NF4_TABLE, dtype=torch.float32, device=device
-        )
+        _NF4_LUT_CACHE[key] = torch.tensor(NF4_TABLE, dtype=torch.float32, device=device)
     return _NF4_LUT_CACHE[key]

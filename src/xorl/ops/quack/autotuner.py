@@ -2,21 +2,20 @@
 # Copyright (C) 2025, Tri Dao.
 from __future__ import annotations
 
+import base64
 import builtins
+import hashlib
+import inspect
+import json
 import os
 import time
-import inspect
-import base64
-import hashlib
-import json
-from pathlib import Path
 from functools import cached_property, partial
-from typing import Dict, Tuple, List, Optional, Any
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from torch import Tensor
-
 import triton
+from torch import Tensor
 
 from . import __version__
 
@@ -36,9 +35,7 @@ def default_cache_dir():
 class FileCacheManager(triton.runtime.cache.FileCacheManager):
     def __init__(self, key):
         super().__init__(key)
-        self.cache_dir = (
-            os.getenv(f"{PACKAGE_NAME.upper()}_CACHE_DIR", "").strip() or default_cache_dir()
-        )
+        self.cache_dir = os.getenv(f"{PACKAGE_NAME.upper()}_CACHE_DIR", "").strip() or default_cache_dir()
         if self.cache_dir:
             self.cache_dir = os.path.join(self.cache_dir, self.key)
             self.lock_path = os.path.join(self.cache_dir, "lock")
@@ -77,9 +74,7 @@ class Autotuner:
         self.keys = key
         self.cache: Dict[Tuple, AutotuneConfig] = {}
         self.arg_names = list(signature.parameters.keys())
-        self.cache_results = (
-            cache_results or os.getenv(f"{PACKAGE_NAME.upper()}_CACHE_AUTOTUNING", None) == "1"
-        )
+        self.cache_results = cache_results or os.getenv(f"{PACKAGE_NAME.upper()}_CACHE_AUTOTUNING", None) == "1"
 
         self.restore_value = []
         if restore_value is not None:
@@ -111,9 +106,7 @@ class Autotuner:
         if prune_configs_by:
             self.perf_model = prune_configs_by.get("perf_model", self.perf_model)
             self.configs_top_k = prune_configs_by.get("top_k", self.configs_top_k)
-            self.early_config_prune = prune_configs_by.get(
-                "early_config_prune", self.early_config_prune
-            )
+            self.early_config_prune = prune_configs_by.get("early_config_prune", self.early_config_prune)
 
         self.fn = fn
         self._do_bench = do_bench
@@ -197,9 +190,7 @@ class Autotuner:
             json.dumps(
                 {
                     "key": tuning_key,
-                    "configs_timings": [
-                        (str(config), timings) for config, timings in self.configs_timings.items()
-                    ],
+                    "configs_timings": [(str(config), timings) for config, timings in self.configs_timings.items()],
                 }
             ),
             file_name,
@@ -228,10 +219,7 @@ class Autotuner:
                 @torch.compiler.disable  # Don't want any tracing here
                 def benchmark():
                     bench_start = time.time()
-                    timings = {
-                        config: self._bench(*args, config=config, **kwargs)
-                        for config in pruned_configs
-                    }
+                    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
                     bench_end = time.time()
                     if os.getenv(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1":
                         for config, time_ in timings.items():
@@ -249,10 +237,7 @@ class Autotuner:
         else:
             config = self.configs[0]
         self.best_config = config
-        if (
-            os.getenv(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1"
-            and not used_cached_result
-        ):
+        if os.getenv(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1" and not used_cached_result:
             print(
                 f"{PACKAGE_NAME} autotuning for function {self.fn.__name__} finished after "
                 f"{self.bench_time:.2f}s; best config selected: {self.best_config};"
@@ -275,9 +260,7 @@ class Autotuner:
                 top_k = int(len(self.configs) * top_k)
             elif not isinstance(top_k, int):
                 # Slice index must be an integer
-                raise TypeError(
-                    "Error while pruning configs, top_k must be either 1) a float <= 1.0 or 2) an int"
-                )
+                raise TypeError("Error while pruning configs, top_k must be either 1) a float <= 1.0 or 2) an int")
 
             if len(pruned_configs) > top_k:
                 est_timing = {
@@ -324,9 +307,7 @@ class AutotuneConfig:
         return self_tuple == other_tuple
 
 
-def autotune(
-    configs, key=None, prune_configs_by=None, restore_value=None, do_bench=None, cache_results=True
-):
+def autotune(configs, key=None, prune_configs_by=None, restore_value=None, do_bench=None, cache_results=True):
     f"""
     Decorator for auto-tuning a function function.
 

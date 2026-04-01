@@ -1,16 +1,18 @@
 """Tests for xorl.distributed.parallel_state module."""
 
+from unittest.mock import Mock, patch
+
 import pytest
 import torch
-from unittest.mock import Mock, patch
 
 from xorl.distributed.parallel_state import (
     ParallelState,
     get_parallel_state,
-    init_parallel_state,
     init_ep_mesh_matrix,
+    init_parallel_state,
     requires_mesh,
 )
+
 
 pytestmark = [pytest.mark.cpu, pytest.mark.distributed]
 
@@ -37,6 +39,7 @@ class TestEPMeshMatrixAndRequiresMesh:
         class MC:
             def __init__(self, m):
                 self.device_mesh = m
+
             @requires_mesh
             def go(self):
                 return "ok"
@@ -49,7 +52,7 @@ class TestEPMeshMatrixAndRequiresMesh:
 class TestParallelStateConstruction:
     """Test ParallelState construction, validation, properties, and enabled flags."""
 
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=False)
+    @patch("xorl.distributed.parallel_state.dist.is_initialized", return_value=False)
     def test_defaults_and_uninitialized_properties(self, mock_is_init):
         """Default ParallelState: all sizes 1, not initialized, rank/world_size defaults; invalid cp_fsdp_mode raises."""
         state = ParallelState()
@@ -63,10 +66,10 @@ class TestParallelStateConstruction:
         with pytest.raises(ValueError, match="Invalid cp_fsdp_mode"):
             ParallelState(cp_fsdp_mode="invalid")
 
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=True)
-    @patch('xorl.distributed.parallel_state.dist.get_rank', return_value=5)
-    @patch('xorl.distributed.parallel_state.dist.get_world_size', return_value=8)
-    @patch('xorl.distributed.sequence_parallel.init_sequence_parallel')
+    @patch("xorl.distributed.parallel_state.dist.is_initialized", return_value=True)
+    @patch("xorl.distributed.parallel_state.dist.get_rank", return_value=5)
+    @patch("xorl.distributed.parallel_state.dist.get_world_size", return_value=8)
+    @patch("xorl.distributed.sequence_parallel.init_sequence_parallel")
     def test_custom_init_validation_and_enabled_flags(self, mock_sp, mock_ws, mock_rank, mock_init):
         """Custom init; validation errors; initialized properties; sp/fsdp enabled flags."""
         state = ParallelState(dp_size=4, dp_replicate_size=2, dp_shard_size=2, tp_size=2)
@@ -90,29 +93,31 @@ class TestGetAndInitParallelState:
 
     def setup_method(self):
         import xorl.distributed.parallel_state as ps_module
+
         ps_module._PARALLEL_STATE = None
 
     def teardown_method(self):
         import xorl.distributed.parallel_state as ps_module
+
         ps_module._PARALLEL_STATE = None
 
-    @patch('xorl.distributed.parallel_state.is_torch_version_greater_than', return_value=False)
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=True)
-    @patch('xorl.distributed.parallel_state.dist.get_world_size', return_value=8)
+    @patch("xorl.distributed.parallel_state.is_torch_version_greater_than", return_value=False)
+    @patch("xorl.distributed.parallel_state.dist.is_initialized", return_value=True)
+    @patch("xorl.distributed.parallel_state.dist.get_world_size", return_value=8)
     def test_init_get_reinit_auto_dp_shard_default(self, mock_ws, mock_is_init, mock_version):
         """init sets state, get retrieves, re-init warns, auto dp_shard_size, get default when unset."""
         init_parallel_state(dp_size=4, tp_size=2, dp_mode="fsdp2")
         state = get_parallel_state()
         assert state.dp_size == 4 and state.tp_size == 2 and state.dp_mode == "fsdp2"
 
-        with patch('xorl.distributed.parallel_state.logger.warning') as mock_warn:
+        with patch("xorl.distributed.parallel_state.logger.warning") as mock_warn:
             init_parallel_state(dp_size=8)
             mock_warn.assert_called_once_with("Parallel state has already been initialized.")
         assert get_parallel_state().dp_size == 4
 
-    @patch('xorl.distributed.parallel_state.is_torch_version_greater_than', return_value=False)
-    @patch('xorl.distributed.parallel_state.dist.is_initialized', return_value=True)
-    @patch('xorl.distributed.parallel_state.dist.get_world_size', return_value=4)
+    @patch("xorl.distributed.parallel_state.is_torch_version_greater_than", return_value=False)
+    @patch("xorl.distributed.parallel_state.dist.is_initialized", return_value=True)
+    @patch("xorl.distributed.parallel_state.dist.get_world_size", return_value=4)
     def test_auto_dp_shard_and_default_uninitialized(self, mock_ws, mock_is_init, mock_version):
         """Auto dp_shard_size; device_type defaults; get_parallel_state returns default when unset."""
         init_parallel_state(dp_size=4)

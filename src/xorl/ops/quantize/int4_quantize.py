@@ -1,15 +1,18 @@
 """INT4 quantization/dequantization via Triton kernels."""
+
 from typing import Tuple
 
 import torch
-from torch import Tensor
 import triton
 import triton.language as tl
+from torch import Tensor
 
 
 @triton.jit
 def _int4_quantize_kernel(
-    X, Out, Scale,
+    X,
+    Out,
+    Scale,
     total_elems,
     GROUP_SIZE: tl.constexpr,
     TILE_ELEMS: tl.constexpr,
@@ -26,8 +29,7 @@ def _int4_quantize_kernel(
     amax = tl.max(tl.abs(x_2d), axis=1)
     scale = tl.maximum(amax, 1e-12) * (2.0 / 15.0)
     scale_offs = tl.arange(0, groups_per_tile)
-    tl.store(Scale + base_group + scale_offs, scale,
-             mask=(base_group + scale_offs) < (total_elems // GROUP_SIZE))
+    tl.store(Scale + base_group + scale_offs, scale, mask=(base_group + scale_offs) < (total_elems // GROUP_SIZE))
     inv_scale_2d = 1.0 / tl.expand_dims(scale, axis=1)
     q_2d = tl.maximum(0, tl.minimum(15, (x_2d * inv_scale_2d + 8.5).to(tl.int32)))
     q = tl.reshape(q_2d, (TILE_ELEMS,))
@@ -36,13 +38,14 @@ def _int4_quantize_kernel(
     packed = tl.sum(tl.reshape(shifted, (half_tile, 2)), axis=1).to(tl.uint8)
     out_base = pid * half_tile
     out_offs = tl.arange(0, half_tile)
-    tl.store(Out + out_base + out_offs, packed,
-             mask=(out_base + out_offs) < (total_elems // 2))
+    tl.store(Out + out_base + out_offs, packed, mask=(out_base + out_offs) < (total_elems // 2))
 
 
 @triton.jit
 def _int4_dequantize_kernel(
-    Packed, Scale, Out,
+    Packed,
+    Scale,
+    Out,
     total_elems,
     GROUP_SIZE: tl.constexpr,
     TILE_ELEMS: tl.constexpr,
@@ -59,9 +62,9 @@ def _int4_dequantize_kernel(
     lo = packed & 0xF
     hi = (packed >> 4) & 0xF
     scale_offs = tl.arange(0, groups_per_tile)
-    scale = tl.load(Scale + base_group + scale_offs,
-                    mask=(base_group + scale_offs) < (total_elems // GROUP_SIZE),
-                    other=1.0).to(tl.float32)
+    scale = tl.load(
+        Scale + base_group + scale_offs, mask=(base_group + scale_offs) < (total_elems // GROUP_SIZE), other=1.0
+    ).to(tl.float32)
     scale_2d = tl.expand_dims(scale, axis=1)
     lo_2d = tl.reshape(lo.to(tl.float32), (groups_per_tile, half_gs))
     hi_2d = tl.reshape(hi.to(tl.float32), (groups_per_tile, half_gs))
@@ -107,8 +110,9 @@ def int4_quantize(x: Tensor, group_size: int = -1) -> Tuple[Tensor, Tensor]:
     return packed.reshape(M, K // 2), scales.reshape(M, num_groups)
 
 
-def int4_dequantize(packed: Tensor, scales: Tensor, M: int, K: int,
-                    group_size: int = -1, out_dtype: torch.dtype = torch.bfloat16) -> Tensor:
+def int4_dequantize(
+    packed: Tensor, scales: Tensor, M: int, K: int, group_size: int = -1, out_dtype: torch.dtype = torch.bfloat16
+) -> Tensor:
     gs = K if group_size == -1 else group_size
     n = M * K
     packed_flat = packed.reshape(-1)

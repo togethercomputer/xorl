@@ -10,18 +10,17 @@ Validates:
 import pytest
 import torch
 import torch.nn as nn
-from functools import partial
 from torch.utils.checkpoint import checkpoint
+
 
 pytestmark = [pytest.mark.gpu]
 
+from xorl.models.layers.moe.moe_block import MoEBlock
 from xorl.models.layers.moe.routing_replay import (
     RoutingReplay,
     get_replay_stage,
     set_replay_stage,
 )
-from xorl.models.layers.moe.moe_block import MoEBlock
-from xorl.models.layers.moe.router import TopKRouter
 
 
 # ---------------------------------------------------------------------------
@@ -212,8 +211,11 @@ class TestMoEBlockReplay:
         router training/detach, and regather correctness."""
         # --- Record stores expert indices correctly ---
         moe = MoEBlock(
-            hidden_size=64, num_experts=4, top_k=2,
-            intermediate_size=128, moe_implementation="eager",
+            hidden_size=64,
+            num_experts=4,
+            top_k=2,
+            intermediate_size=128,
+            moe_implementation="eager",
         ).cuda()
         moe.train()
         replay = RoutingReplay()
@@ -249,8 +251,11 @@ class TestMoEBlockReplay:
 
         # --- No-recording conditions ---
         moe2 = MoEBlock(
-            hidden_size=64, num_experts=4, top_k=2,
-            intermediate_size=128, moe_implementation="eager",
+            hidden_size=64,
+            num_experts=4,
+            top_k=2,
+            intermediate_size=128,
+            moe_implementation="eager",
         ).cuda()
         moe2.train()
         replay4 = RoutingReplay()
@@ -263,8 +268,11 @@ class TestMoEBlockReplay:
 
         # No _routing_replay => stage doesn't matter
         moe3 = MoEBlock(
-            hidden_size=64, num_experts=4, top_k=2,
-            intermediate_size=128, moe_implementation="eager",
+            hidden_size=64,
+            num_experts=4,
+            top_k=2,
+            intermediate_size=128,
+            moe_implementation="eager",
         ).cuda()
         moe3.train()
         assert moe3._routing_replay is None
@@ -273,8 +281,11 @@ class TestMoEBlockReplay:
 
         # Eval mode with stage=None
         moe4 = MoEBlock(
-            hidden_size=64, num_experts=4, top_k=2,
-            intermediate_size=128, moe_implementation="eager",
+            hidden_size=64,
+            num_experts=4,
+            top_k=2,
+            intermediate_size=128,
+            moe_implementation="eager",
         ).cuda()
         moe4.eval()
         replay5 = RoutingReplay()
@@ -286,8 +297,11 @@ class TestMoEBlockReplay:
 
         # --- Router training and regather ---
         moe5 = MoEBlock(
-            hidden_size=64, num_experts=4, top_k=2,
-            intermediate_size=128, moe_implementation="eager",
+            hidden_size=64,
+            num_experts=4,
+            top_k=2,
+            intermediate_size=128,
+            moe_implementation="eager",
             norm_topk_prob=True,
         ).cuda()
         moe5.train()
@@ -296,9 +310,7 @@ class TestMoEBlockReplay:
         hidden_states = x5.view(-1, 64)
         router_logits = moe5.gate(hidden_states)
         orig_weights, orig_experts = moe5.router(router_logits, x5.dtype)
-        regathered_experts, regathered_weights = moe5._regather_routing(
-            router_logits, orig_experts, x5.dtype
-        )
+        regathered_experts, regathered_weights = moe5._regather_routing(router_logits, orig_experts, x5.dtype)
         assert torch.equal(regathered_experts, orig_experts)
         assert torch.allclose(regathered_weights, orig_weights, atol=1e-6)
 
@@ -318,8 +330,11 @@ class TestMoEBlockReplay:
 
         # train_router=False => no gradient from expert path
         moe6 = MoEBlock(
-            hidden_size=64, num_experts=4, top_k=2,
-            intermediate_size=128, moe_implementation="eager",
+            hidden_size=64,
+            num_experts=4,
+            top_k=2,
+            intermediate_size=128,
+            moe_implementation="eager",
             train_router=False,
         ).cuda()
         moe6.train()
@@ -346,9 +361,7 @@ class TestMultiLayerReplay:
         class _Model(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.layers = nn.ModuleList(
-                    [_SimpleDecoderLayer(hidden_size) for _ in range(num_layers)]
-                )
+                self.layers = nn.ModuleList([_SimpleDecoderLayer(hidden_size) for _ in range(num_layers)])
 
             def forward(self, x):
                 for layer in self.layers:
@@ -498,8 +511,11 @@ class TestBaseModelIntegrationAndR3Preload:
 
         # --- R3 Preload ---
         moe = MoEBlock(
-            hidden_size=64, num_experts=4, top_k=2,
-            intermediate_size=128, moe_implementation="eager",
+            hidden_size=64,
+            num_experts=4,
+            top_k=2,
+            intermediate_size=128,
+            moe_implementation="eager",
         ).cuda()
         moe.eval()
 

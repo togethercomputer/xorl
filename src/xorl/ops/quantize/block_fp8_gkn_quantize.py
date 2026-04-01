@@ -23,28 +23,24 @@ import triton.language as tl
 # scale tensor shapes consistent.
 # ---------------------------------------------------------------------------
 
-_quant_configs = [
-    triton.Config({}, num_warps=nw, num_stages=ns)
-    for nw in [4, 8]
-    for ns in [3, 4, 5]
-]
+_quant_configs = [triton.Config({}, num_warps=nw, num_stages=ns) for nw in [4, 8] for ns in [3, 4, 5]]
 
-_dequant_configs = [
-    triton.Config({}, num_warps=nw, num_stages=ns)
-    for nw in [4, 8]
-    for ns in [3, 4, 5]
-]
+_dequant_configs = [triton.Config({}, num_warps=nw, num_stages=ns) for nw in [4, 8] for ns in [3, 4, 5]]
 
 
 # ---------------------------------------------------------------------------
 # 2D weight quantization kernel (GKN)
 # ---------------------------------------------------------------------------
 
+
 @triton.autotune(configs=_quant_configs, key=["M", "N"])
 @triton.jit
 def _block_fp8_quantize_gkn_kernel(
-    x_ptr, y_ptr, s_ptr,
-    M, N,
+    x_ptr,
+    y_ptr,
+    s_ptr,
+    M,
+    N,
     BLOCK_SIZE: tl.constexpr,
 ):
     """2D block-based quantization kernel for weight matrices.
@@ -71,7 +67,8 @@ def _block_fp8_quantize_gkn_kernel(
 
 
 def block_fp8_quantize_gkn(
-    x: torch.Tensor, block_size: int = 128,
+    x: torch.Tensor,
+    block_size: int = 128,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize a 2D weight matrix to FP8 using 2D block-based quantization.
 
@@ -92,14 +89,19 @@ def block_fp8_quantize_gkn(
     y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     s = torch.empty(
         (triton.cdiv(M, block_size), triton.cdiv(N, block_size)),
-        dtype=torch.float32, device=x.device,
+        dtype=torch.float32,
+        device=x.device,
     )
     grid = lambda meta: (
         triton.cdiv(M, block_size),
         triton.cdiv(N, block_size),
     )
     _block_fp8_quantize_gkn_kernel[grid](
-        x, y, s, M, N,
+        x,
+        y,
+        s,
+        M,
+        N,
         BLOCK_SIZE=block_size,
     )
     return y, s
@@ -109,11 +111,15 @@ def block_fp8_quantize_gkn(
 # 2D weight dequantization kernel (GKN)
 # ---------------------------------------------------------------------------
 
+
 @triton.autotune(configs=_dequant_configs, key=["M", "N"])
 @triton.jit
 def _block_fp8_dequantize_gkn_kernel(
-    x_ptr, s_ptr, y_ptr,
-    M, N,
+    x_ptr,
+    s_ptr,
+    y_ptr,
+    M,
+    N,
     BLOCK_SIZE: tl.constexpr,
 ):
     """2D block-based dequantization kernel for weight matrices.
@@ -134,9 +140,7 @@ def _block_fp8_dequantize_gkn_kernel(
     tl.store(y_ptr + offs, y, mask=mask)
 
 
-def block_fp8_dequantize_gkn(
-    x: torch.Tensor, s: torch.Tensor, block_size: int = 128
-) -> torch.Tensor:
+def block_fp8_dequantize_gkn(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> torch.Tensor:
     """Dequantize a 2D weight matrix using 2D block-based quantization.
 
     Args:

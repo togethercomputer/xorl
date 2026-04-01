@@ -29,6 +29,7 @@ from tests.e2e.server_utils import (
     generate_server_config,
 )
 
+
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.server, pytest.mark.benchmark]
 
 # ---------------------------------------------------------------------------
@@ -57,6 +58,7 @@ PACKING_SEQ_LEN = 16384
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _skip_if_no_qwen3_8b():
     return pytest.mark.skipif(
@@ -89,13 +91,9 @@ def _run_tflops_benchmark(num_gpus: int, dp_shard_size: int, tmp_path: str):
     try:
         _start_server_or_fail(server, timeout=300)
 
-        _, training_client = _create_lora_client(
-            server.base_url, QWEN3_8B_DIR, model_id=f"bench-{num_gpus}gpu"
-        )
+        _, training_client = _create_lora_client(server.base_url, QWEN3_8B_DIR, model_id=f"bench-{num_gpus}gpu")
 
-        data = generate_random_sft_data(
-            num_samples=NUM_SAMPLES, seq_len=SEQ_LEN, vocab_size=VOCAB_SIZE
-        )
+        data = generate_random_sft_data(num_samples=NUM_SAMPLES, seq_len=SEQ_LEN, vocab_size=VOCAB_SIZE)
         adam_params = xorl_client.AdamParams(learning_rate=1e-4, beta1=0.9, beta2=0.95, eps=1e-8)
 
         # Warmup
@@ -128,15 +126,15 @@ def _run_tflops_benchmark(num_gpus: int, dp_shard_size: int, tmp_path: str):
         device_peak_tflops = get_device_flops(unit="T")
         mfu = flops_achieved / device_peak_tflops if device_peak_tflops > 0 else 0.0
 
-        print(f"\n{'─'*60}")
+        print(f"\n{'─' * 60}")
         print(f"Qwen3-8B LoRA SFT — {num_gpus} GPU(s)")
-        print(f"{'─'*60}")
+        print(f"{'─' * 60}")
         print(f"  Loss:       {losses[0]:.4f} → {losses[-1]:.4f}")
         print(f"  Avg step:   {avg_step:.3f}s")
         print(f"  Tokens/sec: {tokens_per_sec:.0f}")
         print(f"  TFLOPS:     {flops_achieved:.2f} / {device_peak_tflops:.0f} peak")
         print(f"  MFU:        {mfu:.2%}")
-        print(f"{'─'*60}")
+        print(f"{'─' * 60}")
 
         return {
             "tflops": flops_achieved,
@@ -153,6 +151,7 @@ def _run_tflops_benchmark(num_gpus: int, dp_shard_size: int, tmp_path: str):
 # Tests
 # ---------------------------------------------------------------------------
 
+
 class TestQwen3_8B_TFLOPS:
     """Assert Qwen3-8B LoRA training meets TFLOPS thresholds on H100."""
 
@@ -161,9 +160,7 @@ class TestQwen3_8B_TFLOPS:
     def test_1gpu_tflops(self, tmp_path):
         """1-GPU Qwen3-8B LoRA must achieve >= 358 TFLOPS on H100."""
         result = _run_tflops_benchmark(num_gpus=1, dp_shard_size=1, tmp_path=str(tmp_path))
-        assert result["tflops"] >= MIN_TFLOPS[1], (
-            f"1-GPU TFLOPS {result['tflops']:.1f} below threshold {MIN_TFLOPS[1]}"
-        )
+        assert result["tflops"] >= MIN_TFLOPS[1], f"1-GPU TFLOPS {result['tflops']:.1f} below threshold {MIN_TFLOPS[1]}"
         assert result["losses"][-1] < result["losses"][0], "Loss should decrease"
 
     @skip_if_gpu_count_less_than(2)
@@ -171,9 +168,7 @@ class TestQwen3_8B_TFLOPS:
     def test_2gpu_tflops(self, tmp_path):
         """2-GPU Qwen3-8B LoRA FSDP2 must achieve >= 336 TFLOPS on H100."""
         result = _run_tflops_benchmark(num_gpus=2, dp_shard_size=2, tmp_path=str(tmp_path))
-        assert result["tflops"] >= MIN_TFLOPS[2], (
-            f"2-GPU TFLOPS {result['tflops']:.1f} below threshold {MIN_TFLOPS[2]}"
-        )
+        assert result["tflops"] >= MIN_TFLOPS[2], f"2-GPU TFLOPS {result['tflops']:.1f} below threshold {MIN_TFLOPS[2]}"
         assert result["losses"][-1] < result["losses"][0], "Loss should decrease"
 
     @skip_if_gpu_count_less_than(4)
@@ -181,7 +176,5 @@ class TestQwen3_8B_TFLOPS:
     def test_4gpu_tflops(self, tmp_path):
         """4-GPU Qwen3-8B LoRA FSDP2 must achieve >= 329 TFLOPS on H100."""
         result = _run_tflops_benchmark(num_gpus=4, dp_shard_size=4, tmp_path=str(tmp_path))
-        assert result["tflops"] >= MIN_TFLOPS[4], (
-            f"4-GPU TFLOPS {result['tflops']:.1f} below threshold {MIN_TFLOPS[4]}"
-        )
+        assert result["tflops"] >= MIN_TFLOPS[4], f"4-GPU TFLOPS {result['tflops']:.1f} below threshold {MIN_TFLOPS[4]}"
         assert result["losses"][-1] < result["losses"][0], "Loss should decrease"

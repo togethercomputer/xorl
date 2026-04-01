@@ -50,10 +50,10 @@ from xorl.server.api_server.api_types import (
 from xorl.server.protocol.api_orchestrator import OrchestratorRequest
 from xorl.server.protocol.operations import KillSessionData
 
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
 
 
 # ============================================================================
@@ -441,19 +441,13 @@ async def unload_model_endpoint(request: UnloadModelRequest, server=Depends(requ
         UntypedAPIFuture with request_id for polling
     """
     if not server.future_store:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Future store not initialized"
-        )
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Future store not initialized")
 
     model_id = request.model_id
 
     # Check if the session exists
     if model_id not in server.registered_model_ids:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Model {model_id} not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Model {model_id} not found")
 
     async def process_unload_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
         """Process unload_model request and return result dict."""
@@ -544,10 +538,7 @@ async def kill_session_endpoint(request: KillSessionRequest, server=Depends(requ
         raise
     except Exception as e:
         logger.error(f"Error killing session {model_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to kill session: {e}"
-        )
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to kill session: {e}")
 
 
 @router.get(
@@ -572,10 +563,7 @@ async def session_info_endpoint(server=Depends(require_api_server)):
     session_activity = dict(server.session_last_activity)
 
     # Build adapter count map for sampling
-    loaded_adapters = {
-        model_id: len(adapters)
-        for model_id, adapters in server.loaded_sampling_loras.items()
-    }
+    loaded_adapters = {model_id: len(adapters) for model_id, adapters in server.loaded_sampling_loras.items()}
 
     # Query worker for training adapter info
     loaded_training_adapters: List[str] = []
@@ -687,7 +675,9 @@ async def list_inference_endpoints_endpoint(server=Depends(require_api_server)):
     },
     tags=["Inference Endpoint Management"],
 )
-async def remove_inference_endpoint_endpoint(request: RemoveInferenceEndpointRequest, server=Depends(require_api_server)):
+async def remove_inference_endpoint_endpoint(
+    request: RemoveInferenceEndpointRequest, server=Depends(require_api_server)
+):
     """
     Remove an inference endpoint from the registry.
 

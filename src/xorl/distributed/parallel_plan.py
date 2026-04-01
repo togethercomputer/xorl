@@ -112,7 +112,7 @@ class ParallelPlan:
 
     def update_prefix(self, prefix: str):
         """
-        Update ep_plan when model is wrappered.
+        Update ep_plan when model is wrapped.
         """
         self.ep_plan = {prefix + "." + k: v for k, v in self.ep_plan.items()}
         self.ep_param_suffix = {k.split(".")[-1] for k in self.ep_plan.keys()}

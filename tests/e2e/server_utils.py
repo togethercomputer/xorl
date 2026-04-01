@@ -14,6 +14,7 @@ import pytest
 import requests
 import yaml
 
+
 def generate_server_config(
     model_dir: str,
     output_dir: str,
@@ -60,8 +61,13 @@ def generate_server_config(
 
     if lora_target_modules is None:
         lora_target_modules = [
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
         ]
 
     # Build config matching examples/server/ flat format
@@ -135,6 +141,7 @@ def generate_server_config(
 # Server process management
 # ---------------------------------------------------------------------------
 
+
 def _get_free_port() -> int:
     """Find a free port that is not in TIME_WAIT state."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -199,11 +206,17 @@ class ServerProcess:
             master_port = _get_free_port()
 
             cmd = [
-                sys.executable, "-m", "xorl.server.launcher",
-                "--mode", "auto",
-                "--config", self.config_path,
-                "--api-port", str(self.api_port),
-                "--master-port", str(master_port),
+                sys.executable,
+                "-m",
+                "xorl.server.launcher",
+                "--mode",
+                "auto",
+                "--config",
+                self.config_path,
+                "--api-port",
+                str(self.api_port),
+                "--master-port",
+                str(master_port),
             ]
 
             env = os.environ.copy()
@@ -270,6 +283,7 @@ class ServerProcess:
 # ---------------------------------------------------------------------------
 # Random data generation
 # ---------------------------------------------------------------------------
+
 
 def generate_random_sft_data(
     num_samples: int,
@@ -340,6 +354,7 @@ def extract_loss(fwd_bwd_result) -> float:
 # Training helpers
 # ---------------------------------------------------------------------------
 
+
 def run_sft_steps(training_client, data, num_steps=5, lr=1e-3) -> list:
     """Run SFT training steps and return loss history."""
     import xorl_client
@@ -376,10 +391,7 @@ def _start_server_or_fail(server, timeout=180.0):
     healthy = server.start(timeout=timeout)
     if not healthy:
         log_tail = "\n".join(server.get_log().splitlines()[-50:])
-        pytest.fail(
-            f"Server failed to become healthy within {timeout}s.\n"
-            f"--- Log (last 50 lines) ---\n{log_tail}"
-        )
+        pytest.fail(f"Server failed to become healthy within {timeout}s.\n--- Log (last 50 lines) ---\n{log_tail}")
 
 
 def _create_lora_client(base_url, model_dir, model_id="test", rank=8):
@@ -415,4 +427,3 @@ def _create_full_weight_client(base_url, model_dir):
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
-

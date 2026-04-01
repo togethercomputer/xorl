@@ -17,6 +17,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
 
@@ -25,9 +26,11 @@ DTYPE = torch.bfloat16
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _available_moe_act_backends():
     """Return backends that have moe_act local variants registered."""
     from xorl.models.layers.moe.backend import MOE_EXPERT_BACKENDS_MOE_ACT
+
     return list(MOE_EXPERT_BACKENDS_MOE_ACT.keys())
 
 
@@ -67,11 +70,11 @@ def _make_block_pair(ne, hd, inter, topk, backend, seed=42):
 
 CORRECTNESS_CONFIGS = [
     # (num_experts, hidden, intermediate, top_k, batch, seq)
-    (4,  64,  128, 2, 2,  8),
-    (8, 128,  256, 2, 4, 16),
-    (4,  64,  128, 1, 2,  8),   # top_k=1
-    (8, 128,  256, 4, 2, 16),   # top_k=4
-    (4,  64,  128, 2, 1,  1),   # minimal
+    (4, 64, 128, 2, 2, 8),
+    (8, 128, 256, 2, 4, 16),
+    (4, 64, 128, 1, 2, 8),  # top_k=1
+    (8, 128, 256, 4, 2, 16),  # top_k=4
+    (4, 64, 128, 2, 1, 1),  # minimal
 ]
 
 
@@ -94,7 +97,10 @@ def test_forward_correctness(backend, ne, hd, inter, topk, bs, seq):
 
     max_diff = (act_out - std_out).abs().max().item()
     torch.testing.assert_close(
-        act_out, std_out, atol=0.05, rtol=0.02,
+        act_out,
+        std_out,
+        atol=0.05,
+        rtol=0.02,
         msg=f"[{backend}] Forward mismatch: max_diff={max_diff:.6f}",
     )
 
@@ -104,7 +110,7 @@ def test_forward_correctness(backend, ne, hd, inter, topk, bs, seq):
 # ---------------------------------------------------------------------------
 
 BACKWARD_CONFIGS = [
-    (4,  64, 128, 2, 2,  8),
+    (4, 64, 128, 2, 2, 8),
     (8, 128, 256, 2, 4, 16),
 ]
 
@@ -129,7 +135,10 @@ def test_backward_correctness(backend, ne, hd, inter, topk, bs, seq):
     act_out.sum().backward()
 
     torch.testing.assert_close(
-        x_act.grad, x_std.grad, atol=atol, rtol=rtol,
+        x_act.grad,
+        x_std.grad,
+        atol=atol,
+        rtol=rtol,
         msg=f"[{backend}] Input gradient mismatch",
     )
     for name in ["gate_proj", "up_proj", "down_proj"]:
@@ -138,11 +147,17 @@ def test_backward_correctness(backend, ne, hd, inter, topk, bs, seq):
         assert g_std is not None, f"[{backend}] std {name}.grad is None"
         assert g_act is not None, f"[{backend}] act {name}.grad is None"
         torch.testing.assert_close(
-            g_act, g_std, atol=atol, rtol=rtol,
+            g_act,
+            g_std,
+            atol=atol,
+            rtol=rtol,
             msg=f"[{backend}] {name} gradient mismatch",
         )
     torch.testing.assert_close(
-        act.gate.weight.grad, std.gate.weight.grad, atol=atol, rtol=rtol,
+        act.gate.weight.grad,
+        std.gate.weight.grad,
+        atol=atol,
+        rtol=rtol,
         msg=f"[{backend}] Gate weight gradient mismatch",
     )
 
@@ -150,6 +165,7 @@ def test_backward_correctness(backend, ne, hd, inter, topk, bs, seq):
 # ---------------------------------------------------------------------------
 # Test 3: Activation memory savings
 # ---------------------------------------------------------------------------
+
 
 def _measure_fwd_bwd_peak_memory(block, x, warmup=3):
     """Peak GPU memory (bytes) for one forward+backward call."""
@@ -189,22 +205,22 @@ def test_memory_savings(backend):
 
     savings_mb = (mem_std - mem_act) / 1024**2
     print(
-        f"\n[{backend}] Memory: std={mem_std/1024**2:.1f} MB  "
-        f"moe_act={mem_act/1024**2:.1f} MB  "
+        f"\n[{backend}] Memory: std={mem_std / 1024**2:.1f} MB  "
+        f"moe_act={mem_act / 1024**2:.1f} MB  "
         f"savings={savings_mb:+.1f} MB"
     )
 
     # moe_act should not use significantly more memory than standard
     # (allow 5% overhead for checkpoint bookkeeping)
     assert mem_act <= mem_std * 1.05, (
-        f"[{backend}] moe_act used more memory than standard: "
-        f"{mem_act/1024**2:.1f} MB vs {mem_std/1024**2:.1f} MB"
+        f"[{backend}] moe_act used more memory than standard: {mem_act / 1024**2:.1f} MB vs {mem_std / 1024**2:.1f} MB"
     )
 
 
 # ---------------------------------------------------------------------------
 # Benchmark: TFLOPS standard vs moe_act per backend
 # ---------------------------------------------------------------------------
+
 
 def _moe_flops(bs, seq, hd, inter, topk):
     """Forward FLOPs: 3 GEMMs × 2 (matmul count) × tokens × top_k."""
@@ -256,26 +272,20 @@ def bench_moe_act_tflops(seq_len):
         t_act = _benchmark(act, x)
 
         results[backend] = {
-            "std_ms":   t_std * 1000,
-            "act_ms":   t_act * 1000,
+            "std_ms": t_std * 1000,
+            "act_ms": t_act * 1000,
             "std_tflops": flops / t_std / 1e12,
             "act_tflops": flops / t_act / 1e12,
-            "overhead":   t_act / t_std,
+            "overhead": t_act / t_std,
         }
 
         del std, act
 
     print("\n" + "=" * 90)
-    print(
-        f"  moe_act TFLOPS  (bs={bs}, seq={seq_len}, hidden={hd}, "
-        f"inter={inter}, E={ne}, top_k={topk})"
-    )
-    print(f"  FLOPs/fwd: {flops/1e9:.1f} GFLOP  |  warmup=20, iters=40")
+    print(f"  moe_act TFLOPS  (bs={bs}, seq={seq_len}, hidden={hd}, inter={inter}, E={ne}, top_k={topk})")
+    print(f"  FLOPs/fwd: {flops / 1e9:.1f} GFLOP  |  warmup=20, iters=40")
     print("=" * 90)
-    print(
-        f"  {'Backend':<10} {'Std (ms)':>10} {'Act (ms)':>10} "
-        f"{'Std TF':>10} {'Act TF':>10} {'Overhead':>10}"
-    )
+    print(f"  {'Backend':<10} {'Std (ms)':>10} {'Act (ms)':>10} {'Std TF':>10} {'Act TF':>10} {'Overhead':>10}")
     print("-" * 90)
     for backend, r in results.items():
         print(
@@ -290,13 +300,14 @@ def bench_moe_act_tflops(seq_len):
 # Test 4: moe_act works correctly inside gradient_checkpointing_enable
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("backend", AVAILABLE_BACKENDS)
 def test_moe_act_via_gradient_checkpointing_enable(backend):
     """gradient_checkpointing_enable(moe_checkpoint_method='moe_act') sets _moe_act correctly."""
+    from xorl.models.layers.moe.experts import MoEExperts
     from xorl.models.transformers.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
     from xorl.models.transformers.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
-    from xorl.models.layers.moe.experts import MoEExperts
 
     config = Qwen3MoeConfig(
         vocab_size=1000,
@@ -319,11 +330,13 @@ def test_moe_act_via_gradient_checkpointing_enable(backend):
     model = Qwen3MoeForCausalLM(config).to(DEVICE, DTYPE)
 
     # Enable selective GC with moe_act
-    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={
-        "use_reentrant": False,
-        "recompute_modules": ["self_attn", "mlp"],
-        "moe_checkpoint_method": "moe_act",
-    })
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={
+            "use_reentrant": False,
+            "recompute_modules": ["self_attn", "mlp"],
+            "moe_checkpoint_method": "moe_act",
+        }
+    )
 
     # Verify _moe_act is set on all MoEExperts modules
     moe_experts_modules = [m for m in model.modules() if isinstance(m, MoEExperts)]
@@ -343,6 +356,7 @@ def test_moe_act_via_gradient_checkpointing_enable(backend):
 # ---------------------------------------------------------------------------
 # Test 5: moe_act + torch.compile correctness
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("backend", AVAILABLE_BACKENDS)
@@ -368,10 +382,8 @@ def test_moe_act_compile(backend):
     comp_out, _ = compiled(x2)
     comp_out.sum().backward()
 
-    torch.testing.assert_close(comp_out, ref_out, atol=0.05, rtol=0.02,
-                                msg=f"[{backend}] compile forward mismatch")
-    torch.testing.assert_close(x2.grad, ref_grad, atol=0.05, rtol=0.05,
-                                msg=f"[{backend}] compile backward mismatch")
+    torch.testing.assert_close(comp_out, ref_out, atol=0.05, rtol=0.02, msg=f"[{backend}] compile forward mismatch")
+    torch.testing.assert_close(x2.grad, ref_grad, atol=0.05, rtol=0.05, msg=f"[{backend}] compile backward mismatch")
 
     torch._dynamo.reset()
 

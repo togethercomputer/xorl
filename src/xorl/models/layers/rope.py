@@ -9,10 +9,10 @@ import logging
 import math
 import warnings
 from functools import wraps
-from typing import Optional
 
 import torch
 import torch.nn as nn
+
 
 try:
     from flash_attn.layers.rotary import apply_rotary_emb as _flash_apply_rotary_emb
@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # dynamic_rope_update decorator
 # ---------------------------------------------------------------------------
+
 
 def dynamic_rope_update(rope_forward):
     """
@@ -123,6 +124,7 @@ def dynamic_rope_update(rope_forward):
 # RoPE parameter computation functions
 # ---------------------------------------------------------------------------
 
+
 def _compute_default_rope_parameters(
     config=None,
     device=None,
@@ -158,9 +160,7 @@ def _compute_default_rope_parameters(
     head_dim = getattr(config, "head_dim", None) or (config.hidden_size // config.num_attention_heads)
     dim = int(head_dim * partial_rotary_factor)
 
-    inv_freq = 1.0 / (
-        base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
-    )
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim))
     attention_factor = 1.0
     return inv_freq, attention_factor
 
@@ -418,6 +418,7 @@ ROPE_INIT_FUNCTIONS = {
 # RotaryEmbedding module
 # ---------------------------------------------------------------------------
 
+
 class RotaryEmbedding(nn.Module):
     """Rotary Position Embedding layer.
 
@@ -463,6 +464,7 @@ class RotaryEmbedding(nn.Module):
 # ---------------------------------------------------------------------------
 # RoPE application helpers
 # ---------------------------------------------------------------------------
+
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -523,6 +525,7 @@ def apply_rotary_pos_emb(q, k, cos, sin):
 # ---------------------------------------------------------------------------
 # Deprecated helper (kept for backward compatibility)
 # ---------------------------------------------------------------------------
+
 
 def rope_config_validation(config, ignore_keys=None):
     """

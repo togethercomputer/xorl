@@ -34,7 +34,7 @@ train:
   micro_batch_size: 1
   gradient_accumulation_steps: 1
   empty_cache_steps: 100
-  
+
   optimizer: muon
   # lr and warmup
   muon_lr: 1.0e-4
@@ -52,7 +52,7 @@ train:
   init_device: meta
   load_weights_mode: all_ranks
   enable_full_determinism: false
-  
+
   ckpt_manager: dcp
   save_steps: 1000
   save_hf_weights: true

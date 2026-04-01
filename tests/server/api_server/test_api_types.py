@@ -6,27 +6,28 @@ Tests validation, serialization, and edge cases for the updated API structure.
 
 import pytest
 
+
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
 from pydantic import ValidationError
 
 from xorl.server.api_server.api_types import (
+    AdamParams,
     Datum,
     DatumInput,
-    LossFnOutput,
-    AdamParams,
+    ErrorResponse,
     ForwardBackwardRequest,
     ForwardBackwardResponse,
-    OptimStepRequest,
-    OptimStepResponse,
-    SaveWeightsRequest,
-    SaveWeightsResponse,
+    HealthCheckResponse,
     LoadWeightsRequest,
     LoadWeightsResponse,
+    LossFnOutput,
+    OptimStepRequest,
+    OptimStepResponse,
     SaveWeightsForSamplerRequest,
     SaveWeightsForSamplerResponse,
-    HealthCheckResponse,
-    ErrorResponse,
+    SaveWeightsRequest,
+    SaveWeightsResponse,
 )
 
 
@@ -112,7 +113,8 @@ class TestDatumAndForwardBackward:
         response = ForwardBackwardResponse(
             loss_fn_output_type="multi_loss",
             loss_fn_outputs=[LossFnOutput(loss=2.0), LossFnOutput(loss=3.0)],
-            metrics={}, info={},
+            metrics={},
+            info={},
         )
         assert len(response.loss_fn_outputs) == 2
 
@@ -138,7 +140,9 @@ class TestOptimWeightsHealthAndSerialization:
         assert defaults.eps == 1e-12
 
         request = OptimStepRequest(
-            model_id="test-model", adam_params=AdamParams(learning_rate=1e-4), gradient_clip=1.0,
+            model_id="test-model",
+            adam_params=AdamParams(learning_rate=1e-4),
+            gradient_clip=1.0,
         )
         assert request.model_id == "test-model"
         assert request.adam_params.learning_rate == 1e-4
@@ -150,7 +154,8 @@ class TestOptimWeightsHealthAndSerialization:
         assert request.gradient_clip is None
 
         response = OptimStepResponse(
-            metrics={"grad_norm": 1.234, "learning_rate": 1e-4, "step": 100}, info={},
+            metrics={"grad_norm": 1.234, "learning_rate": 1e-4, "step": 100},
+            info={},
         )
         assert response.metrics["grad_norm"] == 1.234
         response = OptimStepResponse(metrics={}, info={})
@@ -201,12 +206,18 @@ class TestOptimWeightsHealthAndSerialization:
 
         # HealthCheckResponse
         response = HealthCheckResponse(
-            status="healthy", engine_running=True, active_requests=5, total_requests=100,
+            status="healthy",
+            engine_running=True,
+            active_requests=5,
+            total_requests=100,
         )
         assert response.status == "healthy"
         assert response.engine_running is True
         response = HealthCheckResponse(
-            status="unhealthy", engine_running=False, active_requests=0, total_requests=0,
+            status="unhealthy",
+            engine_running=False,
+            active_requests=0,
+            total_requests=0,
         )
         assert response.engine_running is False
 
@@ -242,7 +253,10 @@ class TestOptimWeightsHealthAndSerialization:
 
         # HealthCheckResponse
         response = HealthCheckResponse(
-            status="healthy", engine_running=True, active_requests=0, total_requests=10,
+            status="healthy",
+            engine_running=True,
+            active_requests=0,
+            total_requests=10,
         )
         data = response.model_dump()
         response2 = HealthCheckResponse(**data)

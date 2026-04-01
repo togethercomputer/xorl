@@ -1,7 +1,8 @@
+from typing import Any, Dict, Sequence
+
 import pytest
 import torch
 from torch.utils.data import Dataset
-from typing import Dict, List, Sequence, Any
 
 
 class SimpleCollator:
@@ -57,7 +58,7 @@ class FakePackedDataset(Dataset):
         min_seq_len: int = 64,
         max_seq_len: int = 256,
         vocab_size: int = 1000,
-        num_sequences_per_sample: int = 3
+        num_sequences_per_sample: int = 3,
     ):
         self.num_samples = num_samples
         self.min_seq_len = min_seq_len
@@ -109,11 +110,7 @@ def fake_text_dataset():
 def fake_packed_dataset():
     """Provides a fake packed dataset with position IDs."""
     return FakePackedDataset(
-        num_samples=100,
-        min_seq_len=64,
-        max_seq_len=256,
-        vocab_size=1000,
-        num_sequences_per_sample=3
+        num_samples=100, min_seq_len=64, max_seq_len=256, vocab_size=1000, num_sequences_per_sample=3
     )
 
 

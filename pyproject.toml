@@ -49,7 +49,7 @@ dev = [
   {include-group = "test"},
 ]
 lint = [
-  "pre-commit",
+  "pre-commit>=4.5,<5",
   "ruff",
 ]
 test = [

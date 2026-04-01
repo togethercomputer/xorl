@@ -33,6 +33,7 @@ from xorl.lora.utils import get_lora_state_dict, save_lora_checkpoint
 from xorl.models import save_model_weights
 from xorl.utils import helper
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -167,8 +168,7 @@ class CheckpointManager:
         """
         if self._adapter_manager is None:
             raise ValueError(
-                "Multi-tenancy is not enabled. save_adapter_state requires "
-                "LoRA with adapter_manager enabled."
+                "Multi-tenancy is not enabled. save_adapter_state requires LoRA with adapter_manager enabled."
             )
 
         start_time = time.time()
@@ -239,8 +239,7 @@ class CheckpointManager:
         """
         if self._adapter_manager is None:
             raise ValueError(
-                "Multi-tenancy is not enabled. load_adapter_state requires "
-                "LoRA with adapter_manager enabled."
+                "Multi-tenancy is not enabled. load_adapter_state requires LoRA with adapter_manager enabled."
             )
 
         result = self._adapter_manager.load_adapter_state(
@@ -399,13 +398,9 @@ class CheckpointManager:
         use_distributed = distributed_write and ps.ep_enabled and ps.world_size > 1
 
         if use_distributed:
-            return self._save_full_weights_distributed(
-                output_path, dtype, base_model_path
-            )
+            return self._save_full_weights_distributed(output_path, dtype, base_model_path)
         else:
-            return self._save_full_weights_single_writer(
-                output_path, dtype, base_model_path
-            )
+            return self._save_full_weights_single_writer(output_path, dtype, base_model_path)
 
     @staticmethod
     def _copy_model_configs(output_path: str, base_model_path: str) -> None:
@@ -441,9 +436,7 @@ class CheckpointManager:
         # Get checkpoint handler for HF-compatible weight transforms
         # (e.g., splitting gate_up_proj back into gate_proj + up_proj)
         checkpoint_handler = (
-            self.model.get_checkpoint_handler()
-            if hasattr(self.model, "get_checkpoint_handler")
-            else None
+            self.model.get_checkpoint_handler() if hasattr(self.model, "get_checkpoint_handler") else None
         )
 
         # save_model_weights handles dtype conversion, sharding, and index.json
@@ -531,9 +524,7 @@ class CheckpointManager:
             model_state = ModelState(self.model)
             state_dict_meta = model_state.state_dict()
         else:
-            state_dict_meta = {
-                name: param for name, param in self.model.named_parameters()
-            }
+            state_dict_meta = {name: param for name, param in self.model.named_parameters()}
 
         # Compute tensor sizes and shard assignments (all ranks compute same assignment)
         tensor_infos = []  # [(name, estimated_size, is_dtensor), ...]
@@ -551,8 +542,10 @@ class CheckpointManager:
 
             # Estimate size after dtype conversion
             if tensor.dtype in (torch.float32, torch.float16, torch.bfloat16):
-                element_size = target_dtype.itemsize if hasattr(target_dtype, 'itemsize') else (
-                    2 if target_dtype in (torch.float16, torch.bfloat16) else 4
+                element_size = (
+                    target_dtype.itemsize
+                    if hasattr(target_dtype, "itemsize")
+                    else (2 if target_dtype in (torch.float16, torch.bfloat16) else 4)
                 )
             else:
                 element_size = tensor.element_size()
@@ -646,23 +639,22 @@ class CheckpointManager:
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
-        logger.debug(
-            f"Rank {self.rank}: extracted {dtensor_count} DTensors, {regular_count} regular tensors"
-        )
+        logger.debug(f"Rank {self.rank}: extracted {dtensor_count} DTensors, {regular_count} regular tensors")
 
         # Phase 3: Writers save their shards in parallel
         my_shard_results = []  # [(shard_idx, shard_name, weight_map, size), ...]
 
         if is_writer and my_shards:
+
             def _save_shard(shard_idx):
                 if num_shards == 1:
                     shard_name = "model.safetensors"
                 else:
-                    shard_name = f"model-{shard_idx+1:05d}-of-{num_shards:05d}.safetensors"
+                    shard_name = f"model-{shard_idx + 1:05d}-of-{num_shards:05d}.safetensors"
                 shard_path = os.path.join(output_path, shard_name)
                 shard_data = my_shard_data[shard_idx]
                 save_file(shard_data, shard_path)
-                shard_weight_map = {n: shard_name for n in shard_data.keys()}
+                shard_weight_map = dict.fromkeys(shard_data.keys(), shard_name)
                 shard_size = sum(t.numel() * t.element_size() for t in shard_data.values())
                 return shard_idx, shard_name, shard_weight_map, shard_size
 
@@ -702,12 +694,10 @@ class CheckpointManager:
             # Gather serialized results
             max_size = max(s.item() for s in all_sizes)
             local_padded = torch.zeros(max_size, dtype=torch.uint8, device="cuda")
-            local_padded[:len(local_results_bytes)] = torch.tensor(
+            local_padded[: len(local_results_bytes)] = torch.tensor(
                 list(local_results_bytes), dtype=torch.uint8, device="cuda"
             )
-            all_results_padded = [
-                torch.zeros(max_size, dtype=torch.uint8, device="cuda") for _ in range(world_size)
-            ]
+            all_results_padded = [torch.zeros(max_size, dtype=torch.uint8, device="cuda") for _ in range(world_size)]
             dist.all_gather(all_results_padded, local_padded)
 
             if self.rank == 0:
@@ -794,10 +784,7 @@ class CheckpointManager:
         # Base weights never change, so we only need adapter + optimizer + metadata
         if self._adapter_manager is not None:
             target_model_id = model_id or self._adapter_manager.current_adapter_id or "default"
-            logger.info(
-                f"Multi-tenancy mode: delegating save_state to save_adapter_state "
-                f"(model_id={target_model_id})"
-            )
+            logger.info(f"Multi-tenancy mode: delegating save_state to save_adapter_state (model_id={target_model_id})")
             return self.save_adapter_state(
                 model_id=target_model_id,
                 path=checkpoint_path,
@@ -907,10 +894,7 @@ class CheckpointManager:
         # This handles weight loading + optimizer + metadata
         if self._adapter_manager is not None:
             target_model_id = model_id or self._adapter_manager.current_adapter_id or "default"
-            logger.info(
-                f"Multi-tenancy mode: delegating load_state to load_adapter_state "
-                f"(model_id={target_model_id})"
-            )
+            logger.info(f"Multi-tenancy mode: delegating load_state to load_adapter_state (model_id={target_model_id})")
             return self.load_adapter_state(
                 model_id=target_model_id,
                 path=checkpoint_path,

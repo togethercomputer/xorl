@@ -231,7 +231,7 @@ def parallelize_model_fsdp2(
             for sub_mod in layer_mod.modules():
                 if isinstance(sub_mod, mp_ignored_classes) and sub_mod is not layer_mod:
                     # this will also create a AllGather communication group
-                    # when modules here are small (like gating), this would slightly impacts the peformance
+                    # when modules here are small (like gating), this would slightly impacts the performance
                     # a better method might be adding them to ignored_params of fully_shard
                     # but then they will need to be initialized separately
                     fully_shard(sub_mod, **fsdp_kwargs_without_mp)
@@ -300,6 +300,7 @@ def parallelize_model_fsdp2(
     # Skip EP-sharded expert modules: they manage their own divide factor (ep_size)
     # for averaging expert gradients across EP ranks.
     from torch.distributed._composable.fsdp.fully_shard import FSDPModule
+
     for module in model.modules():
         if isinstance(module, FSDPModule) and not getattr(module, "_is_ep_fsdp", False):
             module.set_gradient_divide_factor(1.0)
@@ -465,9 +466,13 @@ def build_parallelize_model(
                         logger.info_rank0("TP enabled: loading weights before FSDP wrapping...")
                     load_weights_mode = kwargs.get("load_weights_mode", "broadcast")
                     if load_weights_mode == "broadcast":
-                        rank0_load_and_broadcast_weights(model_part, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
+                        rank0_load_and_broadcast_weights(
+                            model_part, weights_path, get_device_type(), dtensor_factory=distribute_tensor
+                        )
                     else:
-                        all_ranks_load_weights(model_part, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
+                        all_ranks_load_weights(
+                            model_part, weights_path, get_device_type(), dtensor_factory=distribute_tensor
+                        )
                     kwargs["skip_weight_loading"] = True
 
             # torch.compile (if enabled)
@@ -575,6 +580,7 @@ def build_parallelize_model(
                             if kw:
                                 fn = functools.partial(fn, **kw)
                             return orig_fn(fn, *args)
+
                         return _reentrant_ckpt_with_kwargs
 
                     module._gradient_checkpointing_func = _make_wrapper(_orig)
@@ -608,7 +614,9 @@ def build_parallelize_model(
             logger.info_rank0("TP enabled: loading weights before FSDP wrapping...")
             load_weights_mode = kwargs.get("load_weights_mode", "broadcast")
             if load_weights_mode == "broadcast":
-                rank0_load_and_broadcast_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
+                rank0_load_and_broadcast_weights(
+                    model, weights_path, get_device_type(), dtensor_factory=distribute_tensor
+                )
             else:
                 all_ranks_load_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
             # Mark weights as already loaded so FSDP path skips loading

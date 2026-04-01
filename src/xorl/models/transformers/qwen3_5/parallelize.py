@@ -1,6 +1,5 @@
 """Parallelization plan and utilities for dense Qwen3_5 models."""
 
-
 # TP plan for the base model (Qwen3_5Model).
 # Keys use wildcard patterns relative to the base model prefix.
 TP_PLAN = {

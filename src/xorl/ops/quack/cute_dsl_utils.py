@@ -1,10 +1,11 @@
 # Copyright (c) 2025, Tri Dao.
 
-from typing import Tuple
-from functools import lru_cache
 from dataclasses import dataclass, fields
+from functools import lru_cache
+from typing import Tuple
 
 import torch
+
 
 try:
     from triton.tools.disasm import extract
@@ -13,7 +14,7 @@ except ImportError:
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Int64, Float16, BFloat16, Float32
+from cutlass import BFloat16, Float16, Float32, Int32, Int64
 from cutlass.base_dsl.typing import JitArgument
 from cutlass.cutlass_dsl import NumericMeta
 
@@ -59,9 +60,7 @@ class ParamsBase:
     def __new_from_mlir_values__(self, values):
         all_fields = {field.name: getattr(self, field.name) for field in fields(self)}
         constexpr_fields = {n: f for n, f in all_fields.items() if isinstance(f, StaticTypes)}
-        non_constexpr_fields = {
-            n: f for n, f in all_fields.items() if not isinstance(f, StaticTypes)
-        }
+        non_constexpr_fields = {n: f for n, f in all_fields.items() if not isinstance(f, StaticTypes)}
         for (name, field), n_items in zip(non_constexpr_fields.items(), self._values_pos):
             non_constexpr_fields[name] = cutlass.new_from_mlir_values(field, values[:n_items])
             values = values[n_items:]
@@ -95,9 +94,7 @@ class ArgumentsBase(JitArgument):
     def __new_from_mlir_values__(self, values):
         all_fields = {field.name: getattr(self, field.name) for field in fields(self)}
         constexpr_fields = {n: f for n, f in all_fields.items() if isinstance(f, StaticTypes)}
-        non_constexpr_fields = {
-            n: f for n, f in all_fields.items() if not isinstance(f, StaticTypes)
-        }
+        non_constexpr_fields = {n: f for n, f in all_fields.items() if not isinstance(f, StaticTypes)}
         for (name, field), n_items in zip(non_constexpr_fields.items(), self._values_pos):
             non_constexpr_fields[name] = cutlass.new_from_mlir_values(field, values[:n_items])
             values = values[n_items:]

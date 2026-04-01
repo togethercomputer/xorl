@@ -15,13 +15,16 @@ from typing import Callable, Dict, Optional, Set, Union
 import torch
 from typing_extensions import TypedDict
 
-from .eager import eager_attention_forward, prepare_causal_mask as eager_prepare_causal_mask
-from .native import native_attention_forward, prepare_causal_mask as native_prepare_causal_mask
+from .eager import eager_attention_forward
+from .eager import prepare_causal_mask as eager_prepare_causal_mask
+from .native import native_attention_forward
+from .native import prepare_causal_mask as native_prepare_causal_mask
 
 
 # ------------------------------------------------------------------ #
 # Generic attention kwargs (renamed from FlashAttentionKwargs)
 # ------------------------------------------------------------------ #
+
 
 class AttentionKwargs(TypedDict, total=False):
     """Kwargs for attention functions (packed/varlen sequences).
@@ -107,6 +110,7 @@ except ImportError:
 # ------------------------------------------------------------------ #
 # Thin dispatcher
 # ------------------------------------------------------------------ #
+
 
 def update_causal_mask(
     attn_implementation: str,

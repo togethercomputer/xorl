@@ -2,7 +2,6 @@ from __future__ import annotations
 
 # Adapted from flash-linear-attention/fla/utils.py.
 # Portions of this file are adapted from flash-linear-attention, Copyright (c) 2023-2025 Songlin Yang, licensed under the MIT License.
-
 import contextlib
 import functools
 import inspect
@@ -12,6 +11,7 @@ from typing import Any
 
 import torch
 import triton
+
 
 FLA_CACHE_RESULTS = os.getenv("FLA_CACHE_RESULTS", "1") == "1"
 SUPPORTS_AUTOTUNE_CACHE = "cache_results" in inspect.signature(triton.autotune).parameters

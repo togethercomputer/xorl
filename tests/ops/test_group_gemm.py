@@ -6,15 +6,18 @@ to ensure correctness across various configurations.
 
 import pytest
 import torch
-from typing import List
+
 
 # Mark all tests as GPU since group_gemm requires CUDA
 pytestmark = pytest.mark.gpu
 
 
 def naive_group_gemm_same_nk(
-    a: torch.Tensor, b: torch.Tensor, cumsum_M: torch.Tensor,
-    transpose_a: bool = False, transpose_b: bool = False,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    cumsum_M: torch.Tensor,
+    transpose_a: bool = False,
+    transpose_b: bool = False,
 ) -> torch.Tensor:
     """Naive PyTorch implementation of grouped GEMM with same N, K."""
     G = b.shape[0]
@@ -47,8 +50,13 @@ def naive_group_gemm_same_nk(
 
 
 def naive_group_gemm_same_mn(
-    a: torch.Tensor, b: torch.Tensor, cumsum_K: torch.Tensor,
-    M: int, N: int, transpose_a: bool = False, transpose_b: bool = False,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    cumsum_K: torch.Tensor,
+    M: int,
+    N: int,
+    transpose_a: bool = False,
+    transpose_b: bool = False,
 ) -> torch.Tensor:
     """Naive PyTorch implementation of grouped GEMM with same M, N."""
     G = cumsum_K.shape[0]
@@ -92,7 +100,7 @@ class TestGroupGemmSameNK:
         G, K, N = 4, 128, 256
         group_sizes = [10, 20, 15, 25]
         total_M = sum(group_sizes)
-        cumsum_M = torch.tensor([sum(group_sizes[:i+1]) for i in range(G)], dtype=torch.int32).cuda()
+        cumsum_M = torch.tensor([sum(group_sizes[: i + 1]) for i in range(G)], dtype=torch.int32).cuda()
         max_M = max(group_sizes)
 
         a = torch.randn(total_M, K, dtype=torch.bfloat16).cuda()
@@ -107,7 +115,7 @@ class TestGroupGemmSameNK:
         G2, K2, N2 = 8, 64, 128
         gs2 = [5, 100, 2, 50, 30, 8, 45, 20]
         total_M2 = sum(gs2)
-        cumsum_M2 = torch.tensor([sum(gs2[:i+1]) for i in range(G2)], dtype=torch.int32).cuda()
+        cumsum_M2 = torch.tensor([sum(gs2[: i + 1]) for i in range(G2)], dtype=torch.int32).cuda()
         a2 = torch.randn(total_M2, K2, dtype=torch.float16).cuda()
         b2 = torch.randn(G2, K2, N2, dtype=torch.float16).cuda()
         out2 = group_gemm_same_nk(a2, b2, cumsum_M2, max(gs2))
@@ -125,7 +133,7 @@ class TestGroupGemmSameNK:
         G4, K4, N4 = 8, 4096, 14336
         gs4 = [512, 480, 520, 490, 510, 505, 495, 488]
         total_M4 = sum(gs4)
-        cumsum_M4 = torch.tensor([sum(gs4[:i+1]) for i in range(G4)], dtype=torch.int32).cuda()
+        cumsum_M4 = torch.tensor([sum(gs4[: i + 1]) for i in range(G4)], dtype=torch.int32).cuda()
         a4 = torch.randn(total_M4, K4, dtype=torch.bfloat16).cuda()
         b4 = torch.randn(G4, K4, N4, dtype=torch.bfloat16).cuda()
         out4 = group_gemm_same_nk(a4, b4, cumsum_M4, max(gs4))
@@ -158,7 +166,7 @@ class TestGroupGemmSameMN:
         G, M, N = 4, 128, 256
         group_Ks = [64, 128, 96, 112]
         total_K = sum(group_Ks)
-        cumsum_K = torch.tensor([sum(group_Ks[:i+1]) for i in range(G)], dtype=torch.int32).cuda()
+        cumsum_K = torch.tensor([sum(group_Ks[: i + 1]) for i in range(G)], dtype=torch.int32).cuda()
 
         a = torch.randn(total_K, M, dtype=torch.bfloat16).cuda()
         b = torch.randn(total_K, N, dtype=torch.bfloat16).cuda()
@@ -172,7 +180,7 @@ class TestGroupGemmSameMN:
         G2, M2, N2 = 8, 64, 128
         gKs2 = [10, 200, 5, 100, 50, 15, 90, 30]
         total_K2 = sum(gKs2)
-        cumsum_K2 = torch.tensor([sum(gKs2[:i+1]) for i in range(G2)], dtype=torch.int32).cuda()
+        cumsum_K2 = torch.tensor([sum(gKs2[: i + 1]) for i in range(G2)], dtype=torch.int32).cuda()
         a2 = torch.randn(total_K2, M2, dtype=torch.float16).cuda()
         b2 = torch.randn(total_K2, N2, dtype=torch.float16).cuda()
         c2 = torch.empty(G2, M2, N2, dtype=torch.float16).cuda()
@@ -184,7 +192,7 @@ class TestGroupGemmSameMN:
         G3, M3, N3 = 4, 64, 128
         gKs3 = [64, 0, 96, 32]
         total_K3 = sum(gKs3)
-        cumsum_K3 = torch.tensor([sum(gKs3[:i+1]) for i in range(G3)], dtype=torch.int32).cuda()
+        cumsum_K3 = torch.tensor([sum(gKs3[: i + 1]) for i in range(G3)], dtype=torch.int32).cuda()
         a3 = torch.randn(total_K3, M3, dtype=torch.bfloat16).cuda()
         b3 = torch.randn(total_K3, N3, dtype=torch.bfloat16).cuda()
         c3 = torch.empty(G3, M3, N3, dtype=torch.bfloat16).cuda()
@@ -219,7 +227,7 @@ class TestGroupGemmProperties:
         G, K, N = 2, 64, 128
         group_sizes = [32, 32]
         total_M = sum(group_sizes)
-        cumsum_M = torch.tensor([sum(group_sizes[:i+1]) for i in range(G)], dtype=torch.int32).cuda()
+        cumsum_M = torch.tensor([sum(group_sizes[: i + 1]) for i in range(G)], dtype=torch.int32).cuda()
         max_M = max(group_sizes)
 
         # Dtype support

@@ -11,17 +11,20 @@ Scales output: [K//group_size, N] -- one float32 scale per group per column.
 from typing import Tuple
 
 import torch
-from torch import Tensor
 import triton
 import triton.language as tl
+from torch import Tensor
 
-from .nf4_codec import _nf4_encode, _nf4_decode, get_nf4_lut
+from .nf4_codec import _nf4_decode, _nf4_encode, get_nf4_lut
 
 
 @triton.jit
 def _nf4_quantize_gkn_kernel(
-    X, Out, Scale,
-    K, N,
+    X,
+    Out,
+    Scale,
+    K,
+    N,
     GROUP_SIZE: tl.constexpr,
     TILE_N: tl.constexpr,
 ):
@@ -79,8 +82,12 @@ def _nf4_quantize_gkn_kernel(
 
 @triton.jit
 def _nf4_dequantize_gkn_kernel(
-    Packed, Scale, LUT, Out,
-    K, N,
+    Packed,
+    Scale,
+    LUT,
+    Out,
+    K,
+    N,
     GROUP_SIZE: tl.constexpr,
     TILE_N: tl.constexpr,
 ):
@@ -160,16 +167,19 @@ def nf4_quantize_gkn(x: Tensor, group_size: int = 64) -> Tuple[Tensor, Tensor]:
     grid = (num_groups, (N + TILE_N - 1) // TILE_N)
 
     _nf4_quantize_gkn_kernel[grid](
-        x.contiguous(), packed, scales,
-        K, N,
-        group_size, TILE_N,
+        x.contiguous(),
+        packed,
+        scales,
+        K,
+        N,
+        group_size,
+        TILE_N,
         num_warps=4,
     )
     return packed, scales
 
 
-def nf4_dequantize_gkn(packed: Tensor, scales: Tensor,
-                        K: int, N: int, group_size: int = 64) -> Tensor:
+def nf4_dequantize_gkn(packed: Tensor, scales: Tensor, K: int, N: int, group_size: int = 64) -> Tensor:
     """Dequantize NF4 packed [K//2, N] back to [K, N] in G,K,N format.
 
     Args:
@@ -192,9 +202,14 @@ def nf4_dequantize_gkn(packed: Tensor, scales: Tensor,
     lut = get_nf4_lut(packed.device)
 
     _nf4_dequantize_gkn_kernel[grid](
-        packed.contiguous(), scales_f32.contiguous(), lut, result,
-        K, N,
-        group_size, TILE_N,
+        packed.contiguous(),
+        scales_f32.contiguous(),
+        lut,
+        result,
+        K,
+        N,
+        group_size,
+        TILE_N,
         num_warps=4,
     )
     return result

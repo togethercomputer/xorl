@@ -1,7 +1,10 @@
+from typing import Any, Dict, Sequence
+
 import pytest
 import torch
+
 from xorl.data.collators import CollatePipeline, DataCollator
-from typing import Dict, Sequence, Any
+
 
 pytestmark = [pytest.mark.cpu, pytest.mark.collator]
 

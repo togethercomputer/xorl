@@ -6,8 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .router import TopKRouter
 from .experts import MoEExperts
+from .router import TopKRouter
 from .routing_replay import RoutingReplay, get_replay_stage
 
 
@@ -145,7 +145,7 @@ class MoEBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # Route (optionally upcast to fp32 for numerical alignment with SGLang)
-        if getattr(self, 'config', None) is not None and getattr(self.config, '_router_fp32', False):
+        if getattr(self, "config", None) is not None and getattr(self.config, "_router_fp32", False):
             router_logits = F.linear(hidden_states.float(), self.gate.weight.float())
         else:
             router_logits = self.gate(hidden_states)
@@ -188,9 +188,7 @@ class MoEBlock(nn.Module):
                 )
         else:
             # No replay active: use standard router
-            routing_weights, selected_experts = self.router(
-                router_logits, hidden_states.dtype
-            )
+            routing_weights, selected_experts = self.router(router_logits, hidden_states.dtype)
 
         # When train_router is False, detach routing_weights so the gate is
         # only trained via auxiliary losses on router_logits, not through
@@ -200,17 +198,11 @@ class MoEBlock(nn.Module):
 
         # Expert computation
         if self.moe_implementation == "eager":
-            final_hidden_states = self._eager_forward(
-                hidden_states, routing_weights, selected_experts
-            )
+            final_hidden_states = self._eager_forward(hidden_states, routing_weights, selected_experts)
         else:
-            final_hidden_states = self.experts(
-                hidden_states, routing_weights, selected_experts
-            )
+            final_hidden_states = self.experts(hidden_states, routing_weights, selected_experts)
 
-        final_hidden_states = final_hidden_states.reshape(
-            batch_size, sequence_length, hidden_dim
-        )
+        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states, router_logits
 
     def _eager_forward(
@@ -223,21 +215,16 @@ class MoEBlock(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         final_hidden_states = torch.zeros_like(hidden_states)
 
-        expert_mask = torch.nn.functional.one_hot(
-            selected_experts, num_classes=self.num_experts
-        ).permute(2, 1, 0)
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
 
         for expert_idx in range(self.num_experts):
             idx, top_x = torch.where(expert_mask[expert_idx])
 
             current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
             current_hidden_states = (
-                self.experts(current_state, expert_idx=expert_idx)
-                * routing_weights[top_x, idx, None]
+                self.experts(current_state, expert_idx=expert_idx) * routing_weights[top_x, idx, None]
             )
-            final_hidden_states.index_add_(
-                0, top_x, current_hidden_states.to(hidden_states.dtype)
-            )
+            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
 
         return final_hidden_states
 

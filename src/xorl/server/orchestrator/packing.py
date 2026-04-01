@@ -46,10 +46,13 @@ Example:
 import logging
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, TypedDict, Union
+
 import torch
+
 from xorl.data.constants import IGNORE_INDEX
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.utils.seqlen_pos_transform_utils import pos2culen
+
 
 logger = logging.getLogger(__name__)
 
@@ -83,8 +86,7 @@ def apply_weights_to_labels(
 
     if len(weights) != len(labels):
         raise ValueError(
-            f"Sample {sample_idx}: weights length ({len(weights)}) doesn't match "
-            f"labels length ({len(labels)})"
+            f"Sample {sample_idx}: weights length ({len(weights)}) doesn't match labels length ({len(labels)})"
         )
 
     # Validate weights are only 0.0 or 1.0
@@ -97,10 +99,7 @@ def apply_weights_to_labels(
             )
 
     # Apply mask: set labels to IGNORE_INDEX where weights=0
-    masked_labels = [
-        IGNORE_INDEX if w == 0 or w == 0.0 else label
-        for label, w in zip(labels, weights)
-    ]
+    masked_labels = [IGNORE_INDEX if w == 0 or w == 0.0 else label for label, w in zip(labels, weights)]
 
     return masked_labels
 
@@ -133,8 +132,7 @@ def apply_advantages_to_labels(
 
     if len(advantages) != len(labels):
         raise ValueError(
-            f"Sample {sample_idx}: advantages length ({len(advantages)}) doesn't match "
-            f"labels length ({len(labels)})"
+            f"Sample {sample_idx}: advantages length ({len(advantages)}) doesn't match labels length ({len(labels)})"
         )
 
     # Use torch for faster processing with long sequences (e.g., 128k tokens)
@@ -205,7 +203,7 @@ def unpack_per_token_outputs(
     # Calculate expected output length if shifted
     # Each sample loses 1 token, so shifted_len = pos_len - num_samples
     expected_shifted_len = pos_len - num_samples
-    is_shifted = (output_len == expected_shifted_len)
+    is_shifted = output_len == expected_shifted_len
 
     if output_len != pos_len and not is_shifted:
         logger.warning(
@@ -229,7 +227,7 @@ def unpack_per_token_outputs(
             sample_output_len = sample_len
 
         # Extract this sample's output
-        sample_output = packed_output[output_offset:output_offset + sample_output_len]
+        sample_output = packed_output[output_offset : output_offset + sample_output_len]
         results.append(sample_output.cpu().tolist())
 
         output_offset += sample_output_len
@@ -241,17 +239,19 @@ def unpack_per_token_outputs(
 # Type Definitions for Input/Output Contracts
 # ============================================================================
 
+
 class Datum(TypedDict, total=False):
     """
     Input format for a single training sample.
-    
+
     Required fields:
         - input_ids: List[int]
-    
+
     Optional fields:
         - labels: List[int]
         - position_ids: List[int]
     """
+
     input_ids: List[int]  # Required
     labels: List[int]  # Optional
     position_ids: List[int]  # Optional
@@ -260,9 +260,9 @@ class Datum(TypedDict, total=False):
 class MicroBatch(TypedDict, total=False):
     """
     Output format for a packed micro-batch.
-    
+
     Contains packed sequences with identity tracking.
-    
+
     Fields:
         - input_ids: Packed input token sequences
         - labels: Packed label sequences (if present)
@@ -270,6 +270,7 @@ class MicroBatch(TypedDict, total=False):
         - request_id: Request ID to track source request
         - batch_id: Batch index (multiple batches per request)
     """
+
     input_ids: List[List[int]]
     labels: List[List[int]]
     position_ids: List[List[int]]
@@ -281,20 +282,21 @@ class MicroBatch(TypedDict, total=False):
 # Abstract Base Class for Data Processors
 # ============================================================================
 
+
 class Packer(ABC):
     """
     Abstract base class for data packing strategies.
-    
+
     Subclasses should implement the `pack()` method to define their own
     packing algorithm (sequential, sorted by length, optimal bin packing, etc.)
-    
+
     Example:
         class MyCustomPacker(Packer):
             def pack(self, datum_list, max_seq_len):
                 # Your custom packing logic here
                 return micro_batches
     """
-    
+
     @abstractmethod
     def pack(
         self,
@@ -304,17 +306,17 @@ class Packer(ABC):
     ) -> List[Dict[str, Any]]:
         """
         Pack datum into micro-batches.
-        
+
         Args:
             datum_list: List of datum (see Datum TypedDict for format)
             max_seq_len: Maximum sequence length per micro-batch
             request_id: Request ID to track source (optional)
-            
+
         Returns:
             List of micro-batches (see MicroBatch TypedDict for format)
         """
         pass
-    
+
     def get_name(self) -> str:
         """Return the name of this packing strategy."""
         return self.__class__.__name__
@@ -324,18 +326,19 @@ class Packer(ABC):
 # Sequential Packer Implementation
 # ============================================================================
 
+
 class SequentialPacker(Packer):
     """
     Sequential greedy packing strategy.
-    
+
     Packs samples sequentially into micro-batches using a greedy first-fit
     algorithm. Samples are added to the current batch until it reaches capacity,
     then a new batch is started.
-    
+
     Args:
         enable_packing: If False, each sample becomes its own micro-batch (no packing)
         log_stats: If True, log detailed packing statistics after packing
-        
+
     Example:
         >>> packer = SequentialPacker(enable_packing=True)
         >>> datum_list = [
@@ -348,7 +351,7 @@ class SequentialPacker(Packer):
         >>> batches[0]["num_samples"]
         2
     """
-    
+
     def __init__(
         self,
         enable_packing: bool = True,
@@ -358,7 +361,7 @@ class SequentialPacker(Packer):
         self.enable_packing = enable_packing
         self.log_stats = log_stats
         self.pad_to_multiple_of = pad_to_multiple_of
-    
+
     def pack(
         self,
         datum_list: List[Dict[str, Any]],
@@ -367,45 +370,45 @@ class SequentialPacker(Packer):
     ) -> List[Dict[str, Any]]:
         """
         Pack samples sequentially into micro-batches with concatenation.
-        
+
         When packing is enabled, samples are CONCATENATED into a single sequence
         per micro-batch with shape [1, total_packed_length]. Position IDs are
         generated to mark sample boundaries (reset to 0 for each sample).
-        
+
         This format is compatible with TextSequenceShardCollator for sequence
         parallelism.
-        
+
         Args:
             datum_list: List of datum dictionaries (see Datum TypedDict)
             max_seq_len: Maximum sequence length per micro-batch
             request_id: Request ID to track source request
-            
+
         Returns:
             List of micro-batch dictionaries with concatenated sequences
         """
         if not datum_list:
             logger.warning("Empty datum_list provided")
             return []
-        
+
         logger.debug(
             f"[{self.get_name()}] Packing {len(datum_list)} samples with "
             f"max_seq_len={max_seq_len}, packing={'enabled' if self.enable_packing else 'disabled'}, "
             f"request_id={request_id}"
         )
-        
+
         # If packing disabled, create one batch per sample (not concatenated)
         if not self.enable_packing:
             return self._pack_without_packing(datum_list, request_id)
-        
+
         # Pack samples sequentially with CONCATENATION
         # Output format: [1, total_packed_length] with position_ids marking boundaries
         micro_batches = []
         current_batch = self._create_empty_packed_batch(request_id, batch_id=0)
         current_tokens = 0
-        
+
         # Track skipped samples for better error messages
         skipped_samples = []
-        
+
         for sample_idx, datum in enumerate(datum_list):
             # Handle nested structure to check for input_ids
             if "input_ids" in datum:
@@ -419,24 +422,24 @@ class SequentialPacker(Packer):
                 continue
 
             if not isinstance(input_ids, list):
-                input_ids = input_ids.tolist() if hasattr(input_ids, 'tolist') else list(input_ids)
+                input_ids = input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
 
             seq_len = len(input_ids)
-            
+
             # Skip samples that exceed max_seq_len
             if seq_len > max_seq_len:
                 reason = f"has {seq_len} tokens, exceeding max_seq_len {max_seq_len}"
                 skipped_samples.append((sample_idx, reason))
                 logger.warning(f"Sample {sample_idx} {reason}. Skipping.")
                 continue
-            
+
             # Skip empty samples
             if seq_len == 0:
                 reason = "has empty input_ids (0 tokens)"
                 skipped_samples.append((sample_idx, reason))
                 logger.warning(f"Sample {sample_idx} {reason}, skipping")
                 continue
-            
+
             # Check if sample fits in current batch
             if current_tokens + seq_len > max_seq_len:
                 # Current batch is full, finalize and start a new one
@@ -445,26 +448,26 @@ class SequentialPacker(Packer):
                     micro_batches.append(current_batch)
                 current_batch = self._create_empty_packed_batch(request_id, batch_id=len(micro_batches))
                 current_tokens = 0
-            
+
             # Add sample to current batch (concatenate)
             self._add_sample_to_packed_batch(current_batch, datum, sample_idx)
             current_tokens += seq_len
-        
+
         # Add the last batch if it has samples
         if current_batch["_num_samples"] > 0:
             self._finalize_packed_batch(current_batch)
             micro_batches.append(current_batch)
-        
+
         # If all samples were skipped, raise a descriptive error
         if not micro_batches and skipped_samples:
             self._raise_all_samples_skipped_error(len(datum_list), skipped_samples, max_seq_len)
-        
+
         # Log statistics
         if self.log_stats:
             self._log_packing_stats(datum_list, micro_batches, max_seq_len)
-        
+
         return micro_batches
-    
+
     def _create_empty_batch(self, request_id: str, batch_id: int) -> Dict[str, Any]:
         """Create an empty micro-batch structure (list of lists format)."""
         return {
@@ -478,7 +481,7 @@ class SequentialPacker(Packer):
     def _create_empty_packed_batch(self, request_id: str, batch_id: int) -> Dict[str, Any]:
         """
         Create an empty packed micro-batch structure.
-        
+
         Packed batches concatenate all samples into single flat lists.
         After finalization, the batch will have shape [1, total_len].
         """
@@ -539,17 +542,17 @@ class SequentialPacker(Packer):
         if input_ids is None:
             raise ValueError(f"Sample {sample_idx} missing 'input_ids'")
         if not isinstance(input_ids, list):
-            input_ids = input_ids.tolist() if hasattr(input_ids, 'tolist') else list(input_ids)
+            input_ids = input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
 
         # Extract labels/target_tokens
         if "labels" in flattened_datum:
             labels = flattened_datum["labels"]
             if not isinstance(labels, list):
-                labels = labels.tolist() if hasattr(labels, 'tolist') else list(labels)
+                labels = labels.tolist() if hasattr(labels, "tolist") else list(labels)
         elif "target_tokens" in flattened_datum:
             labels = flattened_datum["target_tokens"]
             if not isinstance(labels, list):
-                labels = labels.tolist() if hasattr(labels, 'tolist') else list(labels)
+                labels = labels.tolist() if hasattr(labels, "tolist") else list(labels)
         else:
             # No labels - use IGNORE_INDEX for this sample's tokens
             labels = [IGNORE_INDEX] * len(input_ids)
@@ -558,21 +561,18 @@ class SequentialPacker(Packer):
         weights = flattened_datum.get("weights")
         if weights is not None:
             if not isinstance(weights, list):
-                weights = weights.tolist() if hasattr(weights, 'tolist') else list(weights)
+                weights = weights.tolist() if hasattr(weights, "tolist") else list(weights)
 
         # Extract advantages if present (for RL losses like importance_sampling)
         advantages = flattened_datum.get("advantages")
         if advantages is not None:
             if not isinstance(advantages, list):
-                advantages = advantages.tolist() if hasattr(advantages, 'tolist') else list(advantages)
+                advantages = advantages.tolist() if hasattr(advantages, "tolist") else list(advantages)
 
         # Detect if tokens are already shifted (xorl_client API format)
         # xorl_client format: len(input_ids) == len(target_tokens) and target_tokens field exists
         # HF format: len(input_ids) == len(labels) but need shifting
-        is_already_shifted = (
-            "target_tokens" in flattened_datum and
-            len(input_ids) == len(labels)
-        )
+        is_already_shifted = "target_tokens" in flattened_datum and len(input_ids) == len(labels)
 
         if not is_already_shifted and len(input_ids) == len(labels):
             # HF format: shift tokens here
@@ -624,7 +624,7 @@ class SequentialPacker(Packer):
             if key not in ["input_ids", "position_ids", "labels", "weights"]:
                 if key not in batch:
                     batch[key] = []
-                if hasattr(value, 'tolist'):
+                if hasattr(value, "tolist"):
                     value = value.tolist()
                 if isinstance(value, list) and len(value) == seq_len:
                     # Sequence field - concatenate
@@ -677,8 +677,15 @@ class SequentialPacker(Packer):
 
                 # Pad other sequence fields that were wrapped as [[...]]
                 for key, value in batch.items():
-                    if key in ("input_ids", "labels", "position_ids", "request_id",
-                               "batch_id", "num_samples", "_shifted"):
+                    if key in (
+                        "input_ids",
+                        "labels",
+                        "position_ids",
+                        "request_id",
+                        "batch_id",
+                        "num_samples",
+                        "_shifted",
+                    ):
                         continue
                     if isinstance(value, list) and len(value) == 1 and isinstance(value[0], list):
                         if len(value[0]) == seq_len:
@@ -703,7 +710,7 @@ class SequentialPacker(Packer):
             f"Finalized packed batch {batch['batch_id']}: "
             f"total_len={len(batch['input_ids'][0])}, num_samples={num_samples}"
         )
-    
+
     def _add_sample_to_batch(
         self,
         batch: Dict[str, Any],
@@ -731,7 +738,7 @@ class SequentialPacker(Packer):
         if input_ids is None:
             raise ValueError(f"Sample {sample_idx} missing 'input_ids'")
         if not isinstance(input_ids, list):
-            input_ids = input_ids.tolist() if hasattr(input_ids, 'tolist') else list(input_ids)
+            input_ids = input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
 
         seq_len = len(input_ids)
         batch["input_ids"].append(input_ids)
@@ -740,7 +747,7 @@ class SequentialPacker(Packer):
         if "position_ids" in flattened_datum:
             position_ids = flattened_datum["position_ids"]
             if not isinstance(position_ids, list):
-                position_ids = position_ids.tolist() if hasattr(position_ids, 'tolist') else list(position_ids)
+                position_ids = position_ids.tolist() if hasattr(position_ids, "tolist") else list(position_ids)
         else:
             # Auto-generate position_ids: [0, 1, 2, ..., seq_len-1]
             position_ids = list(range(seq_len))
@@ -751,12 +758,12 @@ class SequentialPacker(Packer):
         if "labels" in flattened_datum:
             labels = flattened_datum["labels"]
             if not isinstance(labels, list):
-                labels = labels.tolist() if hasattr(labels, 'tolist') else list(labels)
+                labels = labels.tolist() if hasattr(labels, "tolist") else list(labels)
         elif "target_tokens" in flattened_datum:
             # For RL datums, use target_tokens as labels
             labels = flattened_datum["target_tokens"]
             if not isinstance(labels, list):
-                labels = labels.tolist() if hasattr(labels, 'tolist') else list(labels)
+                labels = labels.tolist() if hasattr(labels, "tolist") else list(labels)
         else:
             # No labels for this sample
             labels = []
@@ -767,7 +774,7 @@ class SequentialPacker(Packer):
             weights = flattened_datum.get("weights")
             if weights is not None:
                 if not isinstance(weights, list):
-                    weights = weights.tolist() if hasattr(weights, 'tolist') else list(weights)
+                    weights = weights.tolist() if hasattr(weights, "tolist") else list(weights)
                 labels = apply_weights_to_labels(labels, weights, sample_idx)
 
             # Apply advantages mask to labels if advantages field is present
@@ -776,7 +783,7 @@ class SequentialPacker(Packer):
             advantages = flattened_datum.get("advantages")
             if advantages is not None:
                 if not isinstance(advantages, list):
-                    advantages = advantages.tolist() if hasattr(advantages, 'tolist') else list(advantages)
+                    advantages = advantages.tolist() if hasattr(advantages, "tolist") else list(advantages)
                 labels = apply_advantages_to_labels(labels, advantages, sample_idx)
 
         batch["labels"].append(labels)
@@ -792,9 +799,15 @@ class SequentialPacker(Packer):
 
                 # Append value
                 if not isinstance(value, list):
-                    value = value.tolist() if hasattr(value, 'tolist') else list(value) if hasattr(value, '__iter__') and not isinstance(value, str) else value
+                    value = (
+                        value.tolist()
+                        if hasattr(value, "tolist")
+                        else list(value)
+                        if hasattr(value, "__iter__") and not isinstance(value, str)
+                        else value
+                    )
                 batch[key].append(value)
-    
+
     def _pack_without_packing(
         self,
         datum_list: List[Dict[str, Any]],
@@ -805,11 +818,10 @@ class SequentialPacker(Packer):
 
         micro_batches = []
         skipped_samples = []
-        
+
         for batch_id, datum in enumerate(datum_list):
             # Handle nested structure to check for input_ids
-            has_input_ids = ("input_ids" in datum) or \
-                            ("model_input" in datum and "input_ids" in datum["model_input"])
+            has_input_ids = ("input_ids" in datum) or ("model_input" in datum and "input_ids" in datum["model_input"])
             if not has_input_ids:
                 reason = "missing 'input_ids' field"
                 skipped_samples.append((batch_id, reason))
@@ -825,7 +837,7 @@ class SequentialPacker(Packer):
             self._raise_all_samples_skipped_error(len(datum_list), skipped_samples)
 
         return micro_batches
-    
+
     def _log_packing_stats(
         self,
         datum_list: List[Dict[str, Any]],
@@ -836,15 +848,15 @@ class SequentialPacker(Packer):
         if not micro_batches:
             logger.warning("No batches created")
             return
-        
+
         total_samples = len(datum_list)
         total_batches = len(micro_batches)
-        
+
         # Calculate statistics from actual data
         # Handle both packed format (list of one list) and unpacked format (list of lists)
         samples_per_batch = []
         tokens_per_batch = []
-        
+
         for batch in micro_batches:
             input_ids = batch["input_ids"]
             if "num_samples" in batch:
@@ -855,17 +867,19 @@ class SequentialPacker(Packer):
                 # Unpacked format: list of separate sequences
                 samples_per_batch.append(len(input_ids))
                 tokens_per_batch.append(sum(len(seq) for seq in input_ids))
-        
+
         total_tokens = sum(tokens_per_batch)
         total_capacity = total_batches * max_seq_len
         utilization = (total_tokens / total_capacity * 100) if total_capacity > 0 else 0
-        
+
         is_packed = any("num_samples" in batch for batch in micro_batches)
-        
+
         logger.debug("=" * 70)
         logger.debug(f"[{self.get_name()}] Packing Statistics:")
         logger.debug("-" * 70)
-        logger.debug(f"  Packing mode:         {'CONCATENATED (batch_size=1)' if is_packed else 'BATCHED (separate sequences)'}")
+        logger.debug(
+            f"  Packing mode:         {'CONCATENATED (batch_size=1)' if is_packed else 'BATCHED (separate sequences)'}"
+        )
         logger.debug(f"  Total samples:        {total_samples}")
         logger.debug(f"  Total micro-batches:  {total_batches}")
         logger.debug(f"  Total tokens:         {total_tokens}")
@@ -873,18 +887,20 @@ class SequentialPacker(Packer):
         logger.debug(f"  Total capacity:       {total_capacity}")
         logger.debug(f"  Utilization:          {utilization:.1f}%")
         logger.debug("-" * 70)
-        logger.debug(f"  Samples per batch:")
+        logger.debug("  Samples per batch:")
         logger.debug(f"    Min:  {min(samples_per_batch)}")
         logger.debug(f"    Max:  {max(samples_per_batch)}")
         logger.debug(f"    Avg:  {sum(samples_per_batch) / len(samples_per_batch):.1f}")
         logger.debug("-" * 70)
-        logger.debug(f"  Tokens per batch:")
+        logger.debug("  Tokens per batch:")
         logger.debug(f"    Min:  {min(tokens_per_batch)}")
         logger.debug(f"    Max:  {max(tokens_per_batch)}")
         logger.debug(f"    Avg:  {sum(tokens_per_batch) / len(tokens_per_batch):.1f}")
         logger.debug("=" * 70)
-        logger.info(f"[{self.get_name()}] Packed {total_samples} samples into {total_batches} batches ({utilization:.1f}% utilization, {total_tokens} tokens)")
-    
+        logger.info(
+            f"[{self.get_name()}] Packed {total_samples} samples into {total_batches} batches ({utilization:.1f}% utilization, {total_tokens} tokens)"
+        )
+
     def _raise_all_samples_skipped_error(
         self,
         total_samples: int,
@@ -893,7 +909,7 @@ class SequentialPacker(Packer):
     ) -> None:
         """
         Raise a descriptive ValueError when all samples were skipped during packing.
-        
+
         Args:
             total_samples: Total number of samples submitted
             skipped_samples: List of (sample_idx, reason) tuples
@@ -905,32 +921,32 @@ class SequentialPacker(Packer):
             if reason not in reasons_count:
                 reasons_count[reason] = []
             reasons_count[reason].append(idx)
-        
+
         # Build detailed error message
         error_lines = [
             f"All {total_samples} samples were skipped - no valid batches could be created.",
         ]
-        
+
         if max_seq_len is not None:
             error_lines.append(f"Server max_seq_len is {max_seq_len} tokens.")
-        
+
         error_lines.append("")
         error_lines.append("Skipped samples by reason:")
-        
+
         for reason, indices in reasons_count.items():
             if len(indices) <= 5:
                 indices_str = ", ".join(str(i) for i in indices)
             else:
                 indices_str = f"{', '.join(str(i) for i in indices[:5])}, ... ({len(indices)} total)"
             error_lines.append(f"  - {reason}: sample(s) {indices_str}")
-        
+
         error_lines.append("")
         error_lines.append("Please check your input data and ensure:")
         error_lines.append("  1. Each sample has an 'input_ids' field (list of token IDs)")
         if max_seq_len is not None:
             error_lines.append(f"  2. Sequence lengths do not exceed {max_seq_len} tokens")
             error_lines.append("  3. Samples are not empty (at least 1 token)")
-        
+
         error_msg = "\n".join(error_lines)
         raise ValueError(error_msg)
 
@@ -938,6 +954,7 @@ class SequentialPacker(Packer):
 # ============================================================================
 # Function-based API (backward compatible)
 # ============================================================================
+
 
 def pack_samples(
     datum_list: List[Dict[str, Any]],
@@ -987,11 +1004,12 @@ def pack_samples(
 # Validation Utilities
 # ============================================================================
 
+
 def validate_micro_batches(micro_batches: List[Dict[str, Any]]) -> bool:
     """
     Validate micro-batch structure.
 
-    Supports both packed format (batch_size=1, concatenated) and 
+    Supports both packed format (batch_size=1, concatenated) and
     unpacked format (batch_size>1, separate sequences).
 
     Checks:
@@ -1015,41 +1033,37 @@ def validate_micro_batches(micro_batches: List[Dict[str, Any]]) -> bool:
             if field not in batch:
                 logger.error(f"Batch {batch_idx} missing required field: {field}")
                 return False
-        
+
         # Check that input_ids is a list
         if not isinstance(batch["input_ids"], list):
             logger.error(f"Batch {batch_idx}: input_ids should be a list")
             return False
-        
+
         num_sequences = len(batch["input_ids"])
         if num_sequences == 0:
             logger.error(f"Batch {batch_idx}: input_ids is empty")
             return False
-        
+
         # Check if this is packed format (list of one list) or unpacked (list of multiple lists)
         is_packed = "num_samples" in batch
-        
+
         # Check lengths are consistent
         if len(batch["position_ids"]) != num_sequences:
             logger.error(
-                f"Batch {batch_idx}: position_ids length mismatch "
-                f"({len(batch['position_ids'])} != {num_sequences})"
+                f"Batch {batch_idx}: position_ids length mismatch ({len(batch['position_ids'])} != {num_sequences})"
             )
             return False
-        
+
         if len(batch["labels"]) != num_sequences:
-            logger.error(
-                f"Batch {batch_idx}: labels length mismatch "
-                f"({len(batch['labels'])} != {num_sequences})"
-            )
+            logger.error(f"Batch {batch_idx}: labels length mismatch ({len(batch['labels'])} != {num_sequences})")
             return False
-        
+
         # Check each sequence has matching lengths
         for i, input_seq in enumerate(batch["input_ids"]):
             if not isinstance(input_seq, list):
                 logger.error(f"Batch {batch_idx}, sequence {i}: input_ids should be a list of lists")
                 return False
-            
+
             pos_seq = batch["position_ids"][i]
             if len(input_seq) != len(pos_seq):
                 logger.error(
@@ -1057,7 +1071,7 @@ def validate_micro_batches(micro_batches: List[Dict[str, Any]]) -> bool:
                     f"!= position_ids length ({len(pos_seq)})"
                 )
                 return False
-            
+
             labels_seq = batch["labels"][i]
             if len(input_seq) != len(labels_seq):
                 logger.error(
@@ -1065,7 +1079,7 @@ def validate_micro_batches(micro_batches: List[Dict[str, Any]]) -> bool:
                     f"!= labels length ({len(labels_seq)})"
                 )
                 return False
-        
+
         # Check batch_id is an integer
         if not isinstance(batch["batch_id"], int):
             logger.error(f"Batch {batch_idx}: batch_id should be an integer")

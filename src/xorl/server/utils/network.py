@@ -10,6 +10,7 @@ import os
 import socket
 from typing import Optional
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -148,7 +149,6 @@ def write_address_file(address: str, output_dir: str, filename: str = ".rank0_ad
         >>> write_address_file("tcp://10.0.0.5:5556", "/shared/outputs")
         '/shared/outputs/.rank0_address'
     """
-    import os
     from pathlib import Path
 
     # Ensure output directory exists

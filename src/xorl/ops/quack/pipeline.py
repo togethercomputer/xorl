@@ -1,15 +1,22 @@
 # Copyright (c) 2025, Tri Dao.
 
-from typing import Optional
 from dataclasses import dataclass
+from typing import Optional
 
 import cutlass.cute as cute
 from cutlass import Boolean, Int32, const_expr
-from cutlass.cutlass_dsl import if_generate, and_, dsl_user_op
-from cutlass.pipeline import MbarrierArray, CooperativeGroup, PipelineOp
-from cutlass.pipeline import PipelineTmaAsync, PipelineState, PipelineUserType
-from cutlass.pipeline import PipelineTmaUmma
-from cutlass.pipeline import Agent, agent_sync
+from cutlass.cutlass_dsl import and_, dsl_user_op, if_generate
+from cutlass.pipeline import (
+    Agent,
+    CooperativeGroup,
+    MbarrierArray,
+    PipelineOp,
+    PipelineState,
+    PipelineTmaAsync,
+    PipelineTmaUmma,
+    PipelineUserType,
+    agent_sync,
+)
 
 
 class PipelineStateWAdvance(PipelineState):
@@ -24,9 +31,7 @@ class PipelineStateWAdvance(PipelineState):
 
     # This can be overridden by derived classes
     def __new_from_mlir_values__(self, values):
-        return PipelineStateWAdvance(
-            self.stages, Int32(values[0]), Int32(values[1]), Int32(values[2])
-        )
+        return PipelineStateWAdvance(self.stages, Int32(values[0]), Int32(values[1]), Int32(values[2]))
 
 
 def make_pipeline_state(type: PipelineUserType, stages: int):
@@ -98,9 +103,7 @@ class PipelineTmaCpAsync(PipelineTmaAsync):
         """
         We need the mbarrier to track the completion of cp.async
         """
-        cute.arch.cp_async_mbarrier_arrive_noinc(
-            self.producer_get_barrier(state, loc=loc, ip=ip), loc=loc, ip=ip
-        )
+        cute.arch.cp_async_mbarrier_arrive_noinc(self.producer_get_barrier(state, loc=loc, ip=ip), loc=loc, ip=ip)
 
 
 class MbarrierArrayWDropCount(MbarrierArray):
@@ -143,9 +146,7 @@ class MbarrierArrayWDropCount(MbarrierArray):
         return [self.barrier_storage, self.drop_count]
 
     def __new_from_mlir_values__(self, values):
-        return MbarrierArrayWDropCount(
-            values[0], self.num_stages, (self.op_type, self.cg), self.tx_count, values[1]
-        )
+        return MbarrierArrayWDropCount(values[0], self.num_stages, (self.op_type, self.cg), self.tx_count, values[1])
 
 
 @dataclass(frozen=True)
@@ -192,9 +193,7 @@ class PipelineTmaCpAsyncUmma(PipelineTmaUmma):
         :rtype: PipelineTmaUmma
         """
         if not isinstance(barrier_storage, cute.Pointer):
-            raise TypeError(
-                f"Expected barrier_storage to be a cute.Pointer, but got {type(barrier_storage)}"
-            )
+            raise TypeError(f"Expected barrier_storage to be a cute.Pointer, but got {type(barrier_storage)}")
 
         producer_type = PipelineOp.TmaLoad
         consumer_type = PipelineOp.TCGen05Mma
@@ -225,9 +224,7 @@ class PipelineTmaCpAsyncUmma(PipelineTmaUmma):
             # All threadblocks are leaders if not using clusters
             is_leader_cta = True
         else:
-            producer_mask = PipelineTmaUmma._compute_mcast_arrival_mask(
-                cta_layout_vmnk, mcast_mode_mn, loc=loc, ip=ip
-            )
+            producer_mask = PipelineTmaUmma._compute_mcast_arrival_mask(cta_layout_vmnk, mcast_mode_mn, loc=loc, ip=ip)
             is_leader_cta = PipelineTmaUmma._compute_is_leader_cta(cta_layout_vmnk, loc=loc, ip=ip)
 
         cta_group = (
@@ -289,6 +286,4 @@ class PipelineTmaCpAsyncUmma(PipelineTmaUmma):
         """
         We need the mbarrier to track the completion of cp.async
         """
-        cute.arch.cp_async_mbarrier_arrive_noinc(
-            self.producer_get_barrier(state, loc=loc, ip=ip), loc=loc, ip=ip
-        )
+        cute.arch.cp_async_mbarrier_arrive_noinc(self.producer_get_barrier(state, loc=loc, ip=ip), loc=loc, ip=ip)

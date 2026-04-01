@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
 
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
@@ -25,17 +25,17 @@ logger = logging.get_logger(__name__)
 class MicroBatchCollator(DataCollator):
     """
     Collator that splits a large batch into multiple micro-batches for gradient accumulation.
-    
+
     This collator receives a batch of size (micro_batch_size * gradient_accumulation_steps)
     and splits it into gradient_accumulation_steps separate micro-batches, each of size
     micro_batch_size. Each micro-batch is then processed by the internal_collator.
-    
+
     Args:
         micro_batch_size: Size of each micro-batch
         gradient_accumulation_steps: Number of micro-batches to create
         internal_collator: The collator to apply to each micro-batch
     """
-    
+
     def __init__(
         self,
         micro_batch_size: int,
@@ -45,16 +45,14 @@ class MicroBatchCollator(DataCollator):
         self.micro_batch_size = micro_batch_size
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.internal_collator = internal_collator
-    
-    def __call__(
-        self, features: Sequence[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
+
+    def __call__(self, features: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Split features into micro-batches and collate each one.
-        
+
         Args:
             features: List of samples (length = micro_batch_size * gradient_accumulation_steps)
-        
+
         Returns:
             List of collated micro-batches (length = gradient_accumulation_steps)
         """
@@ -67,18 +65,17 @@ class MicroBatchCollator(DataCollator):
                 f"This usually means the dataset length is not divisible by the dataloader batch size. "
                 f"Consider setting drop_last=True in build_dataloader."
             )
-        
+
         micro_batches = []
         for i in range(0, len(features), self.micro_batch_size):
             micro_batch_features = features[i : i + self.micro_batch_size]
             collated_micro_batch = self.internal_collator(micro_batch_features)
             micro_batches.append(collated_micro_batch)
-        
+
         assert len(micro_batches) == self.gradient_accumulation_steps, (
-            f"Internal error: Expected {self.gradient_accumulation_steps} micro-batches, "
-            f"but got {len(micro_batches)}"
+            f"Internal error: Expected {self.gradient_accumulation_steps} micro-batches, but got {len(micro_batches)}"
         )
-        
+
         return micro_batches
 
 
@@ -96,36 +93,36 @@ class DistributedDataloader(StatefulDataLoader):
 class DataLoaderBuilder:
     """
     Builder class for constructing distributed dataloaders with gradient accumulation support.
-    
+
     This class provides a flexible interface for building dataloaders, allowing customization
     of collators, samplers, and other components through method chaining or inheritance.
-    
+
     Example:
         # Basic usage
         builder = DataLoaderBuilder(dataset, micro_batch_size=2, gradient_accumulation_steps=4)
         dataloader = builder.build()
-        
+
         # Add custom collators to the pipeline
         builder = DataLoaderBuilder(dataset, micro_batch_size=2, gradient_accumulation_steps=4)
         builder.add_collator(MyCustomCollator(), position="end")
         builder.print_pipeline()  # Visualize the pipeline
         dataloader = builder.build()
-        
+
         # Method chaining
         dataloader = (DataLoaderBuilder(dataset, micro_batch_size=2, gradient_accumulation_steps=4)
                       .add_collator(MyPreprocessor(), position="start")
                       .add_collator(MyPostprocessor(), position="end")
                       .build())
-        
+
         # Custom builder subclass
         class CustomBuilder(DataLoaderBuilder):
             def _build_default_collator_list(self):
                 return [MyCustomCollator()]
-        
+
         builder = CustomBuilder(dataset, micro_batch_size=2, gradient_accumulation_steps=4)
         dataloader = builder.build()
     """
-    
+
     def __init__(
         self,
         dataset: "Dataset",
@@ -166,41 +163,41 @@ class DataLoaderBuilder:
         self.seed = seed
         self.pad_to_multiple_of = pad_to_multiple_of
         self.parallel_state = get_parallel_state()
-        
+
         # Initialize collator pipeline
         if use_default_collators:
             self._collator_list: List[DataCollator] = self._build_default_collator_list()
         else:
             self._collator_list: List[DataCollator] = []
-        
+
         # Final collator and sampler will be set when build() is called
         self.collate_fn = None
         self.sampler = None
-    
+
     def _build_default_collator_list(self) -> List[DataCollator]:
         """Build the default collator pipeline."""
         from .collators import ToTensorCollator
 
         collators = [
-            ToTensorCollator(),                                 # 1. Convert to tensors
-            FlattenCollator(),                                  # 2. Flatten list of lists to flat list
-            ShiftTokensCollator(auto_detect=True),              # 3. Shift tokens for causal LM (auto-detects if needed)
-            PackingConcatCollator(pad_to_multiple_of=self.pad_to_multiple_of)  # 4. Concatenate sequences for packing
+            ToTensorCollator(),  # 1. Convert to tensors
+            FlattenCollator(),  # 2. Flatten list of lists to flat list
+            ShiftTokensCollator(auto_detect=True),  # 3. Shift tokens for causal LM (auto-detects if needed)
+            PackingConcatCollator(pad_to_multiple_of=self.pad_to_multiple_of),  # 4. Concatenate sequences for packing
         ]
 
         if self.parallel_state.cp_enabled:
             collators.append(TextSequenceShardCollator())  # 5. Shard sequences (if SP enabled)
 
         return collators
-    
+
     def add_collator(self, collator: DataCollator, position: str = "end") -> "DataLoaderBuilder":
         """
         Add a collator to the pipeline.
-        
+
         Args:
             collator: The collator to add
             position: Where to add ('start' or 'end')
-        
+
         Returns:
             Self for method chaining
         """
@@ -211,80 +208,80 @@ class DataLoaderBuilder:
         else:
             raise ValueError(f"Invalid position: {position}. Must be 'start' or 'end'")
         return self
-    
+
     def insert_collator(self, collator: DataCollator, index: int) -> "DataLoaderBuilder":
         """
         Insert a collator at a specific position in the pipeline.
-        
+
         Args:
             collator: The collator to insert
             index: The position to insert at
-        
+
         Returns:
             Self for method chaining
         """
         self._collator_list.insert(index, collator)
         return self
-    
+
     def remove_collator(self, index: int) -> "DataLoaderBuilder":
         """
         Remove a collator from the pipeline.
-        
+
         Args:
             index: The index of the collator to remove
-        
+
         Returns:
             Self for method chaining
         """
         self._collator_list.pop(index)
         return self
-    
+
     def get_collator_pipeline(self) -> List[DataCollator]:
         """
         Get the current list of collators in the pipeline.
-        
+
         Returns:
             List of collators
         """
         return self._collator_list.copy()
-    
+
     def print_pipeline(self) -> None:
         """
         Print the current collator pipeline in a readable format.
-        
+
         This shows the order and types of all collators that will be applied
         to each micro-batch during data loading.
         """
         logger.info_rank0("=" * 60)
         logger.info_rank0("Collator Pipeline:")
         logger.info_rank0("=" * 60)
-        
+
         if not self._collator_list:
             logger.info_rank0("  (empty pipeline)")
         else:
             for i, collator in enumerate(self._collator_list, 1):
                 collator_name = collator.__class__.__name__
                 logger.info_rank0(f"  {i}. {collator_name}")
-                
+
                 # If it's a CollatePipeline, show its internal collators
                 if isinstance(collator, CollatePipeline):
                     for j, sub_collator in enumerate(collator.data_collators, 1):
                         sub_collator_name = sub_collator.__class__.__name__
                         logger.info_rank0(f"     {i}.{j} {sub_collator_name}")
-        
+
         logger.info_rank0("-" * 60)
-        logger.info_rank0(f"Micro-batch splitting:")
+        logger.info_rank0("Micro-batch splitting:")
         logger.info_rank0(f"  micro_batch_size: {self.micro_batch_size}")
         logger.info_rank0(f"  gradient_accumulation_steps: {self.gradient_accumulation_steps}")
         logger.info_rank0(f"  dataloader_batch_size: {self.micro_batch_size * self.gradient_accumulation_steps}")
         logger.info_rank0("=" * 60)
-    
+
     def build_collator(self) -> MicroBatchCollator:
         """
         Build the final collator that wraps the pipeline with micro-batch splitting.
-        
+
         Override this method to customize the entire collator construction logic.
-        
+
         Returns:
             A MicroBatchCollator that wraps the collator pipeline
         """
@@ -295,20 +292,20 @@ class DataLoaderBuilder:
             internal_collator = self._collator_list[0]
         else:
             internal_collator = CollatePipeline(self._collator_list)
-        
+
         # Wrap with MicroBatchCollator for gradient accumulation
         return MicroBatchCollator(
             micro_batch_size=self.micro_batch_size,
             gradient_accumulation_steps=self.gradient_accumulation_steps,
             internal_collator=internal_collator,
         )
-    
+
     def build_sampler(self) -> StatefulDistributedSampler:
         """
         Build the distributed sampler.
-        
+
         Override this method to customize the sampler (e.g., change shuffle behavior).
-        
+
         Returns:
             A StatefulDistributedSampler instance
         """
@@ -319,25 +316,24 @@ class DataLoaderBuilder:
             shuffle=True,
             seed=self.seed,
         )
-    
+
     def build(self, verbose: bool = True) -> "DistributedDataloader":
         """
         Build and return the final dataloader.
-        
+
         Args:
             verbose: If True, prints the collator pipeline configuration
-        
+
         Returns:
             A DistributedDataloader configured with all components
         """
         if verbose:
             self.print_pipeline()
-        
+
         dataloader_batch_size = self.micro_batch_size * self.gradient_accumulation_steps
-        
+
         logger.info_rank0(
-            f"Building DataLoader with dp_size={self.parallel_state.dp_size}, "
-            f"cp_size={self.parallel_state.cp_size}"
+            f"Building DataLoader with dp_size={self.parallel_state.dp_size}, cp_size={self.parallel_state.cp_size}"
         )
 
         # Validate dataset structure - each item can be either:
@@ -376,5 +372,5 @@ class DataLoaderBuilder:
             drop_last=self.drop_last,
             prefetch_factor=self.prefetch_factor,
         )
-        
+
         return dataloader

@@ -1,19 +1,20 @@
 """Tests for xorl.data.prepare.shared module."""
 
 from unittest.mock import Mock, patch
+
 import pytest
 from datasets import Dataset as HFDataset
 
+from xorl.arguments import DatasetConfig
 from xorl.data.prepare.shared import (
-    get_dataset_type,
-    datasets_with_name_generator,
-    load_dataset_with_config,
     _check_if_hub_dataset,
     _get_remote_filesystem,
     create_train_validation_split,
+    datasets_with_name_generator,
+    get_dataset_type,
+    load_dataset_with_config,
     merge_datasets,
 )
-from xorl.arguments import DatasetConfig
 
 
 pytestmark = pytest.mark.cpu
@@ -90,6 +91,7 @@ class TestHubAndRemoteDetection:
 
         # Invalid hub dataset
         from huggingface_hub.errors import RepositoryNotFoundError
+
         mock_response = Mock()
         mock_response.status_code = 404
         mock_response.headers = {}
@@ -116,10 +118,12 @@ class TestSplitAndMerge:
 
     def test_split_and_merge_operations(self):
         """Covers absolute/fractional split, merge with shuffle variants, and empty merge error."""
-        dataset = HFDataset.from_dict({
-            "input_ids": [[i] for i in range(10)],
-            "labels": [[i] for i in range(10)],
-        })
+        dataset = HFDataset.from_dict(
+            {
+                "input_ids": [[i] for i in range(10)],
+                "labels": [[i] for i in range(10)],
+            }
+        )
         args = Mock()
         args.train.seed = 42
 
@@ -178,17 +182,25 @@ class TestLoadDatasetWithConfig:
         assert ds is not None and len(ds) == 1
 
         # Hub dataset
-        with patch("xorl.data.prepare.shared._check_if_hub_dataset", return_value=True), \
-             patch("xorl.data.prepare.shared._load_from_hub",
-                   return_value=HFDataset.from_dict({"input_ids": [[1]], "labels": [[1]]})) as mock_hub:
+        with (
+            patch("xorl.data.prepare.shared._check_if_hub_dataset", return_value=True),
+            patch(
+                "xorl.data.prepare.shared._load_from_hub",
+                return_value=HFDataset.from_dict({"input_ids": [[1]], "labels": [[1]]}),
+            ) as mock_hub,
+        ):
             config = _make_config(path="username/dataset", split=None)
             assert load_dataset_with_config(config, use_auth_token=False, streaming=False) is not None
             mock_hub.assert_called_once()
 
         # HTTPS URL
-        with patch("xorl.data.prepare.shared._check_if_hub_dataset", return_value=False), \
-             patch("xorl.data.prepare.shared._load_from_url",
-                   return_value=HFDataset.from_dict({"input_ids": [[1]], "labels": [[1]]})) as mock_url:
+        with (
+            patch("xorl.data.prepare.shared._check_if_hub_dataset", return_value=False),
+            patch(
+                "xorl.data.prepare.shared._load_from_url",
+                return_value=HFDataset.from_dict({"input_ids": [[1]], "labels": [[1]]}),
+            ) as mock_url,
+        ):
             config = _make_config(path="https://example.com/dataset.json", split=None)
             assert load_dataset_with_config(config, use_auth_token=False, streaming=False) is not None
             mock_url.assert_called_once()
@@ -226,7 +238,7 @@ class TestSaveAndLoadPreprocessedDataset:
 
     def test_save_load_and_missing(self, tmp_path):
         """Covers save+load round-trip and load returning None when not found."""
-        from xorl.data.prepare.shared import save_preprocessed_dataset, load_preprocessed_dataset
+        from xorl.data.prepare.shared import load_preprocessed_dataset, save_preprocessed_dataset
 
         args = Mock()
         args.data.dataset_prepared_path = str(tmp_path)
@@ -236,10 +248,12 @@ class TestSaveAndLoadPreprocessedDataset:
         args.data.skip_prepare_dataset = False
         args.data.is_preprocess = False
 
-        dataset = HFDataset.from_dict({
-            "input_ids": [[1, 2, 3], [4, 5, 6]],
-            "labels": [[1, 2, 3], [4, 5, 6]],
-        })
+        dataset = HFDataset.from_dict(
+            {
+                "input_ids": [[1, 2, 3], [4, 5, 6]],
+                "labels": [[1, 2, 3], [4, 5, 6]],
+            }
+        )
 
         save_preprocessed_dataset(args, dataset, "test_hash_123", split="train")
         loaded = load_preprocessed_dataset(args, "test_hash_123")

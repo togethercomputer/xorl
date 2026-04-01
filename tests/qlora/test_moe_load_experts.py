@@ -6,13 +6,13 @@ Also benchmarks the speedup.
 """
 
 import time
+
 import pytest
 import torch
-import torch.nn.functional as F
 
-from xorl.qlora.modules.moe_experts import NvFP4QLoRAMoeExperts
-from xorl.qlora.modules.moe_experts import BlockFP8QLoRAMoeExperts
 from xorl.ops.quantize.fp4_codec import FP4_E2M1_MAX, FP8_E4M3_MAX
+from xorl.qlora.modules.moe_experts import BlockFP8QLoRAMoeExperts, NvFP4QLoRAMoeExperts
+
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -22,6 +22,7 @@ DEVICE = torch.device("cuda")
 # ---------------------------------------------------------------------------
 # Helpers: reference (old) implementations
 # ---------------------------------------------------------------------------
+
 
 def _ref_load_nvfp4(packed_hf_list, bs_list, gs_list, device):
     """Reference: per-expert CPU transpose + stack + H2D (old implementation)."""
@@ -57,6 +58,7 @@ def _ref_load_block_fp8(fp8_list, scales_list, device):
 # Synthetic data generators
 # ---------------------------------------------------------------------------
 
+
 def _make_nvfp4_tensors(E, N, K, block_size=16, seed=0):
     """Generate synthetic HF-format NVFP4 tensors for E experts."""
     torch.manual_seed(seed)
@@ -87,6 +89,7 @@ def _make_block_fp8_tensors(E, N, K, block_size=128, seed=0):
 # Helper: invoke _load_experts via mock _load_tensor
 # ---------------------------------------------------------------------------
 
+
 def _run_nvfp4_load_experts(module, packed_list, bs_list, gs_list):
     """Feed synthetic tensors through NvFP4QLoRAMoeExperts._load_experts."""
     E = len(packed_list)
@@ -95,7 +98,7 @@ def _run_nvfp4_load_experts(module, packed_list, bs_list, gs_list):
     for proj_name, hf_name in [("gate", "gate_proj"), ("up", "up_proj"), ("down", "down_proj")]:
         for i in range(E):
             fqn = f"layer.{i}.{hf_name}"
-            data[f"{fqn}.weight"]       = packed_list[i]
+            data[f"{fqn}.weight"] = packed_list[i]
             data[f"{fqn}.weight_scale"] = bs_list[i]
             data[f"{fqn}.weight_scale_2"] = gs_list[i]
 
@@ -113,7 +116,7 @@ def _run_block_fp8_load_experts(module, fp8_list, scales_list):
     for proj_name, hf_name in [("gate", "gate_proj"), ("up", "up_proj"), ("down", "down_proj")]:
         for i in range(E):
             fqn = f"layer.{i}.{hf_name}"
-            data[f"{fqn}.weight"]           = fp8_list[i]
+            data[f"{fqn}.weight"] = fp8_list[i]
             data[f"{fqn}.weight_scale_inv"] = scales_list[i]
 
     module._source_fqn = "layer"
@@ -127,6 +130,7 @@ def _run_block_fp8_load_experts(module, fp8_list, scales_list):
 # Tests: correctness vs reference
 # ---------------------------------------------------------------------------
 
+
 class TestNvFP4LoadExperts:
     """NvFP4QLoRAMoeExperts._load_experts produces correct GKN buffers."""
 
@@ -136,9 +140,13 @@ class TestNvFP4LoadExperts:
         packed_list, bs_list, gs_list = _make_nvfp4_tensors(E, N, K)
 
         module = NvFP4QLoRAMoeExperts(
-            num_local_experts=E, num_experts=E,
-            intermediate_size=N, hidden_size=K,
-            r=4, lora_alpha=4, device=DEVICE,
+            num_local_experts=E,
+            num_experts=E,
+            intermediate_size=N,
+            hidden_size=K,
+            r=4,
+            lora_alpha=4,
+            device=DEVICE,
         )
         _run_nvfp4_load_experts(module, packed_list, bs_list, gs_list)
 
@@ -156,9 +164,13 @@ class TestNvFP4LoadExperts:
         packed_list, bs_list, gs_list = _make_nvfp4_tensors(E, N, K, block_size)
 
         module = NvFP4QLoRAMoeExperts(
-            num_local_experts=E, num_experts=E,
-            intermediate_size=N, hidden_size=K,
-            r=4, lora_alpha=4, device=DEVICE,
+            num_local_experts=E,
+            num_experts=E,
+            intermediate_size=N,
+            hidden_size=K,
+            r=4,
+            lora_alpha=4,
+            device=DEVICE,
         )
         _run_nvfp4_load_experts(module, packed_list, bs_list, gs_list)
 
@@ -174,9 +186,13 @@ class TestNvFP4LoadExperts:
         packed_list, bs_list, gs_list = _make_nvfp4_tensors(E, N, K)
 
         module = NvFP4QLoRAMoeExperts(
-            num_local_experts=E, num_experts=E,
-            intermediate_size=N, hidden_size=K,
-            r=4, lora_alpha=4, device=DEVICE,
+            num_local_experts=E,
+            num_experts=E,
+            intermediate_size=N,
+            hidden_size=K,
+            r=4,
+            lora_alpha=4,
+            device=DEVICE,
         )
         _run_nvfp4_load_experts(module, packed_list, bs_list, gs_list)
 
@@ -192,9 +208,13 @@ class TestNvFP4LoadExperts:
         packed_list, bs_list, gs_list = _make_nvfp4_tensors(E, N, K)
 
         module = NvFP4QLoRAMoeExperts(
-            num_local_experts=E, num_experts=E,
-            intermediate_size=N, hidden_size=K,
-            r=4, lora_alpha=4, device=DEVICE,
+            num_local_experts=E,
+            num_experts=E,
+            intermediate_size=N,
+            hidden_size=K,
+            r=4,
+            lora_alpha=4,
+            device=DEVICE,
         )
         _run_nvfp4_load_experts(module, packed_list, bs_list, gs_list)
 
@@ -207,8 +227,7 @@ class TestNvFP4LoadExperts:
             assert gs_buf is not None
             # global scale should be 1.0 (absorbed into block scales)
             gs_val = module._recover_tensor(gs_buf, torch.float32)
-            assert torch.allclose(gs_val, torch.ones_like(gs_val)), \
-                f"{proj} global_scale not 1.0 after absorption"
+            assert torch.allclose(gs_val, torch.ones_like(gs_val)), f"{proj} global_scale not 1.0 after absorption"
 
     @pytest.mark.parametrize("E,N,K", [(4, 768, 2048)])
     def test_dequant_shape_and_dtype(self, E, N, K):
@@ -216,9 +235,13 @@ class TestNvFP4LoadExperts:
         packed_list, bs_list, gs_list = _make_nvfp4_tensors(E, N, K)
 
         module = NvFP4QLoRAMoeExperts(
-            num_local_experts=E, num_experts=E,
-            intermediate_size=N, hidden_size=K,
-            r=4, lora_alpha=4, device=DEVICE,
+            num_local_experts=E,
+            num_experts=E,
+            intermediate_size=N,
+            hidden_size=K,
+            r=4,
+            lora_alpha=4,
+            device=DEVICE,
         )
         _run_nvfp4_load_experts(module, packed_list, bs_list, gs_list)
 
@@ -236,9 +259,13 @@ class TestBlockFP8LoadExperts:
         fp8_list, scales_list = _make_block_fp8_tensors(E, N, K, block_size)
 
         module = BlockFP8QLoRAMoeExperts(
-            num_local_experts=E, num_experts=E,
-            intermediate_size=N, hidden_size=K,
-            r=4, lora_alpha=4, device=DEVICE,
+            num_local_experts=E,
+            num_experts=E,
+            intermediate_size=N,
+            hidden_size=K,
+            r=4,
+            lora_alpha=4,
+            device=DEVICE,
         )
         _run_block_fp8_load_experts(module, fp8_list, scales_list)
 
@@ -254,9 +281,13 @@ class TestBlockFP8LoadExperts:
         fp8_list, scales_list = _make_block_fp8_tensors(E, N, K, block_size)
 
         module = BlockFP8QLoRAMoeExperts(
-            num_local_experts=E, num_experts=E,
-            intermediate_size=N, hidden_size=K,
-            r=4, lora_alpha=4, device=DEVICE,
+            num_local_experts=E,
+            num_experts=E,
+            intermediate_size=N,
+            hidden_size=K,
+            r=4,
+            lora_alpha=4,
+            device=DEVICE,
         )
         _run_block_fp8_load_experts(module, fp8_list, scales_list)
 
@@ -272,9 +303,13 @@ class TestBlockFP8LoadExperts:
         fp8_list, scales_list = _make_block_fp8_tensors(E, N, K)
 
         module = BlockFP8QLoRAMoeExperts(
-            num_local_experts=E, num_experts=E,
-            intermediate_size=N, hidden_size=K,
-            r=4, lora_alpha=4, device=DEVICE,
+            num_local_experts=E,
+            num_experts=E,
+            intermediate_size=N,
+            hidden_size=K,
+            r=4,
+            lora_alpha=4,
+            device=DEVICE,
         )
         _run_block_fp8_load_experts(module, fp8_list, scales_list)
 
@@ -287,15 +322,20 @@ class TestBlockFP8LoadExperts:
 # Benchmark (not a pytest test — run directly or with -s -k bench)
 # ---------------------------------------------------------------------------
 
+
 def _bench_nvfp4_load(E=128, N=768, K=2048, n_reps=5):
     """Benchmark NvFP4 expert loading: new GPU-transpose vs old CPU-transpose."""
     packed_list, bs_list, gs_list = _make_nvfp4_tensors(E, N, K)
 
     def make_module():
         return NvFP4QLoRAMoeExperts(
-            num_local_experts=E, num_experts=E,
-            intermediate_size=N, hidden_size=K,
-            r=4, lora_alpha=4, device=DEVICE,
+            num_local_experts=E,
+            num_experts=E,
+            intermediate_size=N,
+            hidden_size=K,
+            r=4,
+            lora_alpha=4,
+            device=DEVICE,
         )
 
     # New implementation (GPU-transpose)
@@ -335,9 +375,13 @@ if __name__ == "__main__":
     for E, N, K in [(4, 768, 2048), (8, 512, 1024), (1, 256, 512)]:
         packed_list, bs_list, gs_list = _make_nvfp4_tensors(E, N, K)
         module = NvFP4QLoRAMoeExperts(
-            num_local_experts=E, num_experts=E,
-            intermediate_size=N, hidden_size=K,
-            r=4, lora_alpha=4, device=DEVICE,
+            num_local_experts=E,
+            num_experts=E,
+            intermediate_size=N,
+            hidden_size=K,
+            r=4,
+            lora_alpha=4,
+            device=DEVICE,
         )
         _run_nvfp4_load_experts(module, packed_list, bs_list, gs_list)
         ref_p, ref_s, _ = _ref_load_nvfp4(packed_list, bs_list, gs_list, DEVICE)
@@ -348,9 +392,13 @@ if __name__ == "__main__":
     for E, N, K in [(4, 768, 2048), (8, 512, 1024)]:
         fp8_list, scales_list = _make_block_fp8_tensors(E, N, K)
         module = BlockFP8QLoRAMoeExperts(
-            num_local_experts=E, num_experts=E,
-            intermediate_size=N, hidden_size=K,
-            r=4, lora_alpha=4, device=DEVICE,
+            num_local_experts=E,
+            num_experts=E,
+            intermediate_size=N,
+            hidden_size=K,
+            r=4,
+            lora_alpha=4,
+            device=DEVICE,
         )
         _run_block_fp8_load_experts(module, fp8_list, scales_list)
         ref_p, ref_s = _ref_load_block_fp8(fp8_list, scales_list, DEVICE)

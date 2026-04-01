@@ -1,6 +1,5 @@
 """Data handling helpers"""
 
-import contextlib
 import functools
 import hashlib
 import time
@@ -8,11 +7,10 @@ from enum import Enum
 from typing import Callable
 
 import huggingface_hub
-import numpy as np
 import requests
-from datasets import Dataset, IterableDataset
 
 from ...utils import logging
+
 
 logger = logging.get_logger(__name__)
 
@@ -78,4 +76,3 @@ def md5(to_hash: str, encoding: str = "utf-8") -> str:
 def sha256(to_hash: str, encoding: str = "utf-8") -> str:
     """Generate SHA256 hash of a string."""
     return hashlib.sha256(to_hash.encode(encoding)).hexdigest()
-

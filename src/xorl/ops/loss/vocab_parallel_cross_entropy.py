@@ -175,7 +175,13 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
     ) -> torch.Tensor:
         kernel = _get_compiled_forward_kernel() if use_compile else _forward_kernel
         per_token_ce, global_max, global_sumexp, target_in_range, safe_local_target, valid_mask = kernel(
-            hidden_states, weight, labels, tp_group, vocab_offset, local_vocab_size, ignore_index,
+            hidden_states,
+            weight,
+            labels,
+            tp_group,
+            vocab_offset,
+            local_vocab_size,
+            ignore_index,
         )
 
         # Save tiny [BT,1] statistics + inputs; NOT the huge [BT, V/tp] softmax
@@ -194,9 +200,16 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
 
         kernel = _get_compiled_backward_kernel() if ctx.use_compile else _backward_kernel
         grad_hidden, grad_weight = kernel(
-            grad_output, hidden_states, weight, global_max, global_sumexp,
-            ctx.target_in_range, ctx.safe_local_target, ctx.valid_mask,
-            ctx.tp_group, weight.requires_grad,
+            grad_output,
+            hidden_states,
+            weight,
+            global_max,
+            global_sumexp,
+            ctx.target_in_range,
+            ctx.safe_local_target,
+            ctx.valid_mask,
+            ctx.tp_group,
+            weight.requires_grad,
         )
 
         return grad_hidden, grad_weight, None, None, None, None, None, None
@@ -239,8 +252,13 @@ def vocab_parallel_cross_entropy(
         end = min(start + chunk_size, BT)
         ce_chunks.append(
             _VocabParallelCrossEntropy.apply(
-                hidden_states[start:end], weight, labels[start:end],
-                tp_group, vocab_offset, local_vocab_size, ignore_index,
+                hidden_states[start:end],
+                weight,
+                labels[start:end],
+                tp_group,
+                vocab_offset,
+                local_vocab_size,
+                ignore_index,
                 use_compile,
             )
         )

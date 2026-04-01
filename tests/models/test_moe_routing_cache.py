@@ -10,16 +10,16 @@ Validates:
 import pytest
 import torch
 import torch.nn as nn
-from functools import partial
 from torch.utils.checkpoint import checkpoint
+
 
 pytestmark = [pytest.mark.gpu]
 
 try:
     from xorl.models.layers.moe.moe_block import (
         MoEBlock,
-        moe_routing_context_fn,
         _routing_cache_mode,
+        moe_routing_context_fn,
     )
     from xorl.models.layers.moe.router import TopKRouter
 except ImportError:
@@ -37,7 +37,8 @@ except ImportError:
 def _checkpoint_with_routing(fn, *args, **kwargs):
     """Checkpoint wrapper that uses moe_routing_context_fn."""
     return checkpoint(
-        fn, *args,
+        fn,
+        *args,
         use_reentrant=False,
         context_fn=moe_routing_context_fn,
         **kwargs,
@@ -87,6 +88,7 @@ class TestContextFnMechanism:
     def test_forward_sets_mode(self):
         """During checkpoint forward, mode is 'forward'."""
         import xorl.models.layers.moe.moe_block as mb
+
         observed = []
 
         class _Observer(nn.Module):
@@ -110,6 +112,7 @@ class TestContextFnMechanism:
     def test_mode_none_without_context_fn(self):
         """Without context_fn, mode stays None — no caching."""
         import xorl.models.layers.moe.moe_block as mb
+
         observed = []
 
         class _Observer(nn.Module):
@@ -207,10 +210,7 @@ class TestDequeCachePP:
         layer.train()
         moe = layer.mlp
 
-        xs = [
-            torch.randn(1, 8 + i, 64, device="cuda", requires_grad=True)
-            for i in range(4)
-        ]
+        xs = [torch.randn(1, 8 + i, 64, device="cuda", requires_grad=True) for i in range(4)]
         outs = []
 
         # Warmup: 2 forwards
@@ -242,9 +242,7 @@ class TestDequeCachePP:
         class _Model(nn.Module):
             def __init__(self, num_layers=3):
                 super().__init__()
-                self.layers = nn.ModuleList(
-                    [_SimpleDecoderLayer(hidden_size) for _ in range(num_layers)]
-                )
+                self.layers = nn.ModuleList([_SimpleDecoderLayer(hidden_size) for _ in range(num_layers)])
 
             def forward(self, x):
                 for layer in self.layers:
@@ -262,23 +260,17 @@ class TestDequeCachePP:
         out2 = model(x2)
 
         for i, layer in enumerate(model.layers):
-            assert len(layer.mlp._routing_cache) == 2, (
-                f"Layer {i}: expected 2 cached entries"
-            )
+            assert len(layer.mlp._routing_cache) == 2, f"Layer {i}: expected 2 cached entries"
 
         # Backward MB1
         out1.sum().backward()
         for i, layer in enumerate(model.layers):
-            assert len(layer.mlp._routing_cache) == 1, (
-                f"Layer {i}: expected 1 after MB1 backward"
-            )
+            assert len(layer.mlp._routing_cache) == 1, f"Layer {i}: expected 1 after MB1 backward"
 
         # Backward MB2
         out2.sum().backward()
         for i, layer in enumerate(model.layers):
-            assert len(layer.mlp._routing_cache) == 0, (
-                f"Layer {i}: expected 0 after MB2 backward"
-            )
+            assert len(layer.mlp._routing_cache) == 0, f"Layer {i}: expected 0 after MB2 backward"
 
     def test_nondeterministic_attention_routing_preserved(self):
         """With non-deterministic attention, cached routing is replayed on recompute."""
@@ -387,7 +379,6 @@ class TestBaseModelIntegration:
 
     def test_context_fn_injected_for_moe(self):
         """gradient_checkpointing_enable adds context_fn when MoE blocks present."""
-        import xorl.models.layers.moe.moe_block as mb
 
         class _FakeConfig:
             pass

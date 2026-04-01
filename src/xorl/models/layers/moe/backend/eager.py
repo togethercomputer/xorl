@@ -28,9 +28,7 @@ def eager_expert_forward(
     Returns:
         Output tensor of shape ``(num_tokens, hidden_dim)``.
     """
-    assert not get_parallel_state().ep_enabled, (
-        "_moe_implementation='eager' does not support EP"
-    )
+    assert not get_parallel_state().ep_enabled, "_moe_implementation='eager' does not support EP"
     gate_proj_out = torch.matmul(hidden_states, gate_proj[expert_idx])
     up_proj_out = torch.matmul(hidden_states, up_proj[expert_idx])
     out = act_fn(gate_proj_out) * up_proj_out

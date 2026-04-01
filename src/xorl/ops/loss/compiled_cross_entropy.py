@@ -17,6 +17,7 @@ _compiled_ce_cache: Dict[int, Callable] = {}
 # Check if auto_chunker is available
 _AUTO_CHUNKER_AVAILABLE = None
 
+
 def _check_auto_chunker_available() -> bool:
     """Check if torch.compile auto_chunker option is available."""
     global _AUTO_CHUNKER_AVAILABLE
@@ -24,9 +25,11 @@ def _check_auto_chunker_available() -> bool:
         return _AUTO_CHUNKER_AVAILABLE
 
     try:
+
         @torch.compile(options={"auto_chunker.enable": True, "auto_chunker.num_chunk": 2})
         def _test_fn(x):
             return x * 2
+
         # Don't actually run, just check if compilation setup works
         _AUTO_CHUNKER_AVAILABLE = True
     except (RuntimeError, TypeError):
@@ -91,6 +94,7 @@ def _get_compiled_ce_fn(num_chunks: int, reduction: str = "none") -> Callable:
     """
     cache_key = (num_chunks, reduction)
     if cache_key not in _compiled_ce_cache:
+
         def _compute_ce(hidden_states, weight, labels, ignore_index):
             logits = (hidden_states @ weight.t()).float()
             return F.cross_entropy(logits, labels, reduction=reduction, ignore_index=ignore_index)

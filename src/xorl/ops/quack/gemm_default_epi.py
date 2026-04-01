@@ -1,19 +1,17 @@
 # Copyright (c) 2025, Wentao Guo, Tri Dao.
-from typing import Optional, Tuple
-from functools import partial
 from dataclasses import dataclass
-
+from functools import partial
+from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Float32, Boolean, const_expr
+from cutlass import Boolean, Float32, Int32, const_expr
 
+from . import copy_utils, utils
 from .cute_dsl_utils import ArgumentsBase, ParamsBase
 from .gemm_sm90 import GemmSm90
 from .gemm_sm100 import GemmSm100
 from .sm90_utils import partition_for_epilogue
-from . import utils
-from . import copy_utils
 from .varlen_utils import VarlenManager
 
 
@@ -35,18 +33,13 @@ class GemmDefaultEpiMixin:
         mRowVecBroadcast: Optional[cute.Tensor] = None
         mColVecBroadcast: Optional[cute.Tensor] = None
 
-    def epi_to_underlying_arguments(
-        self, args: EpilogueArguments, *, loc=None, ip=None
-    ) -> EpilogueParams:
+    def epi_to_underlying_arguments(self, args: EpilogueArguments, *, loc=None, ip=None) -> EpilogueParams:
         # Assume all strides are divisible by 32 bits except the last stride
         new_stride = lambda t: tuple(
-            cute.assume(s, divby=32 // t.element_type.width) if not cute.is_static(s) else s
-            for s in t.stride
+            cute.assume(s, divby=32 // t.element_type.width) if not cute.is_static(s) else s for s in t.stride
         )
         mRowVecBroadcast, mColVecBroadcast = [
-            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
-            if t is not None
-            else None
+            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) if t is not None else None
             for t in (args.mRowVecBroadcast, args.mColVecBroadcast)
         ]
         return self.EpilogueParams(
@@ -107,9 +100,7 @@ class GemmDefaultEpiMixin:
             cute.copy(thr_copy_RV, tRVgRV, tRVsRV, pred=tRVpRV)
             # (CPY, CPY_M, CPY_N, EPI_M, EPI_N)
             tDsRowVec = partition_for_epilogue_fn(
-                cute.make_tensor(
-                    sRowVec.iterator, cute.make_layout((tile_M, tile_N), stride=(0, 1))
-                )
+                cute.make_tensor(sRowVec.iterator, cute.make_layout((tile_M, tile_N), stride=(0, 1)))
             )
             if const_expr(tiled_copy_t2r is not None):
                 tDsRowVec = tiled_copy_r2s.retile(tDsRowVec)
@@ -124,9 +115,7 @@ class GemmDefaultEpiMixin:
             if const_expr(not varlen_manager.varlen_m):
                 mColVec = params.mColVecBroadcast[batch_idx, None]
             else:
-                mColVec = cute.domain_offset(
-                    (varlen_manager.params.cu_seqlens_m[batch_idx],), params.mColVecBroadcast
-                )
+                mColVec = cute.domain_offset((varlen_manager.params.cu_seqlens_m[batch_idx],), params.mColVecBroadcast)
             gColVec = cute.local_tile(mColVec, (tile_M,), (tile_coord_mnkl[0],))
             tCVgCV = thr_copy_CV.partition_S(gColVec)
             tCVsCV = thr_copy_CV.partition_D(sColVec)
@@ -137,9 +126,7 @@ class GemmDefaultEpiMixin:
                 tCVpCV[0, m] = tCVcCV[0, m] < limit_m
             cute.copy(thr_copy_CV, tCVgCV, tCVsCV, pred=tCVpCV)
             tDsColVec = partition_for_epilogue_fn(
-                cute.make_tensor(
-                    sColVec.iterator, cute.make_layout((tile_M, tile_N), stride=(1, 0))
-                )
+                cute.make_tensor(sColVec.iterator, cute.make_layout((tile_M, tile_N), stride=(1, 0)))
             )
             if const_expr(tiled_copy_t2r is not None):
                 tDsColVec = tiled_copy_r2s.retile(tDsColVec)
@@ -154,9 +141,7 @@ class GemmDefaultEpiMixin:
         alpha, beta, tDsRowVec, tDsColVec = epi_tensors
         tDrRowVec_cvt = None
         if const_expr(tDsRowVec is not None):
-            tDsRowVec_cur = cute.group_modes(tDsRowVec, 3, cute.rank(tDsRowVec))[
-                None, None, None, epi_coord
-            ]
+            tDsRowVec_cur = cute.group_modes(tDsRowVec, 3, cute.rank(tDsRowVec))[None, None, None, epi_coord]
             # tDrRowVec = cute.make_fragment_like(tDsRowVec_cur)
             tDrRowVec = cute.make_rmem_tensor(tDsRowVec_cur.layout, tDsRowVec_cur.element_type)
             cute.autovec_copy(cute.filter_zeros(tDsRowVec_cur), cute.filter_zeros(tDrRowVec))
@@ -164,9 +149,7 @@ class GemmDefaultEpiMixin:
             tDrRowVec_cvt.store(tDrRowVec.load().to(self.acc_dtype))
         tDrColVec_cvt = None
         if const_expr(tDsColVec is not None):
-            tDsColVec_cur = cute.group_modes(tDsColVec, 3, cute.rank(tDsColVec))[
-                None, None, None, epi_coord
-            ]
+            tDsColVec_cur = cute.group_modes(tDsColVec, 3, cute.rank(tDsColVec))[None, None, None, epi_coord]
             # This somehow doesn't work, some dim with stride 0 turns to non-zero stride
             # tDrRowVec = cute.make_fragment_like(tDsRowVec_cur)
             tDrColVec = cute.make_rmem_tensor(tDsColVec_cur.layout, tDsColVec_cur.element_type)
@@ -214,25 +197,15 @@ class GemmDefaultEpiMixin:
     ) -> int:
         row_vec_smem_size = 0 if args.mRowVecBroadcast is None else cta_tile_shape_mnk[1]
         col_vec_smem_size = 0 if args.mColVecBroadcast is None else cta_tile_shape_mnk[0]
-        row_vec_dtype = (
-            args.mRowVecBroadcast.element_type if args.mRowVecBroadcast is not None else Float32
-        )
-        col_vec_dtype = (
-            args.mColVecBroadcast.element_type if args.mColVecBroadcast is not None else Float32
-        )
-        return (
-            row_vec_smem_size * row_vec_dtype.width + col_vec_smem_size * col_vec_dtype.width
-        ) // 8
+        row_vec_dtype = args.mRowVecBroadcast.element_type if args.mRowVecBroadcast is not None else Float32
+        col_vec_dtype = args.mColVecBroadcast.element_type if args.mColVecBroadcast is not None else Float32
+        return (row_vec_smem_size * row_vec_dtype.width + col_vec_smem_size * col_vec_dtype.width) // 8
 
     def epi_get_smem_struct(self, params: EpilogueParams):
         row_vec_smem_size = 0 if params.mRowVecBroadcast is None else self.cta_tile_shape_mnk[1]
         col_vec_smem_size = 0 if params.mColVecBroadcast is None else self.cta_tile_shape_mnk[0]
-        row_vec_dtype = (
-            params.mRowVecBroadcast.element_type if params.mRowVecBroadcast is not None else Float32
-        )
-        col_vec_dtype = (
-            params.mColVecBroadcast.element_type if params.mColVecBroadcast is not None else Float32
-        )
+        row_vec_dtype = params.mRowVecBroadcast.element_type if params.mRowVecBroadcast is not None else Float32
+        col_vec_dtype = params.mColVecBroadcast.element_type if params.mColVecBroadcast is not None else Float32
 
         @cute.struct
         class EpiSharedStorage:

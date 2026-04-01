@@ -9,15 +9,14 @@
 import pytest
 import torch
 
-from xorl.ops.loss import drgrpo_loss_function
-
 from tests.ops.loss.conftest import assert_close
+from xorl.ops.loss import drgrpo_loss_function
 
 
 @pytest.fixture
 def inputs():
     """Test inputs for DRGRPO loss.
-    
+
     Note: xorl's drgrpo_loss_function takes hidden_states and weight instead of logits.
     We create hidden_states and weight such that hidden_states @ weight.T produces
     logits with similar scale to torch.randn(B, S, V).
@@ -29,9 +28,9 @@ def inputs():
     # Create hidden_states and weight matrix
     # Scale by 1/sqrt(H) so that logits = hidden_states @ weight.T has variance ~1
     # (similar to torch.randn logits in torchforge tests)
-    hidden_states = torch.randn(B, S, H) / (H ** 0.5)
+    hidden_states = torch.randn(B, S, H) / (H**0.5)
     weight = torch.randn(V, H)
-    
+
     # Compute effective logits for reference (should have variance ~1)
     logits = hidden_states @ weight.T
 
@@ -76,13 +75,13 @@ def inputs():
 
 class TestDRGRPOLoss:
     """Tests for drgrpo_loss_function.
-    
+
     Note: test_forward and test_backward contain regression tests with exact expected
     values. If the implementation changes intentionally, update the expected values by
     running the tests with pytest -v and recording the actual values:
-    
+
         pytest tests/ops/loss/test_drgrpo_loss.py -v -k "test_forward or test_backward"
-    
+
     Then update the assert_close(...) calls with the new values.
     """
 

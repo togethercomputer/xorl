@@ -40,7 +40,7 @@ To support this, the backend exposes:
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, FrozenSet, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Tuple
 
 import torch
 
@@ -48,6 +48,7 @@ import torch
 @dataclass
 class EndpointConfig:
     """Description of a single inference endpoint."""
+
     host: str
     port: int
     world_size: int = 1  # TP size on the inference side
@@ -60,6 +61,7 @@ class TransportConfig:
     The handler populates this from the ``SyncWeightsData`` payload, and the
     backend reads whichever fields it needs.
     """
+
     endpoints: List[EndpointConfig] = field(default_factory=list)
     master_address: str = "localhost"
     master_port: int = 29600

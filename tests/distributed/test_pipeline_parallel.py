@@ -8,6 +8,7 @@ import pytest
 
 from xorl.distributed.pipeline_parallel import generate_llm_fqn_per_model_part
 
+
 pytestmark = [pytest.mark.distributed]
 
 
@@ -46,7 +47,8 @@ class TestFQNGeneration:
     def test_qwen3_fqn_names_and_single_stage(self):
         """Qwen3-style nested FQN names; single stage contains all modules."""
         result = generate_llm_fqn_per_model_part(
-            2, 4,
+            2,
+            4,
             input_fqns=["model.embed_tokens"],
             layer_prefix="model.layers",
             output_fqns=["model.norm", "lm_head"],

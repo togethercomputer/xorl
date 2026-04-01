@@ -6,6 +6,11 @@ from torch import nn
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.distributed.sequence_parallel.strategy import get_cp_strategy
 from xorl.models.base import XorlPreTrainedModel
+from xorl.models.checkpoint_handlers.buffers import (
+    detect_prequantized_block_fp8_checkpoint,
+    detect_prequantized_checkpoint,
+    get_prequantized_exclude_modules,
+)
 from xorl.models.layers import ACT2FN, RotaryEmbedding
 from xorl.models.layers.attention import (
     AttentionKwargs,
@@ -16,11 +21,9 @@ from xorl.models.layers.attention.backend import ATTENTION_FUNCTIONS
 from xorl.models.layers.attention.backend.eager import eager_attention_forward
 from xorl.models.module_utils import GradientCheckpointingLayer
 from xorl.models.outputs import BaseModelOutput, CausalLMOutput
-from xorl.models.checkpoint_handlers.buffers import (
-    detect_prequantized_checkpoint,
-    detect_prequantized_block_fp8_checkpoint,
-    get_prequantized_exclude_modules,
-)
+from xorl.models.transformers.qwen3_5 import parallelize
+from xorl.models.transformers.qwen3_5.checkpoint_handler import Qwen3_5CheckpointHandler
+from xorl.models.transformers.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 from xorl.models.transformers.qwen3_5_shared import (
     LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE,
     QWEN3_5_CHECKPOINT_CONVERSION_MAPPING,
@@ -28,12 +31,9 @@ from xorl.models.transformers.qwen3_5_shared import (
     has_linear_attention_layers,
     qwen3_5_apply_rotary_pos_emb,
 )
-from xorl.models.transformers.qwen3_5.checkpoint_handler import Qwen3_5CheckpointHandler
-from xorl.models.transformers.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
-from xorl.models.transformers.qwen3_5 import parallelize
+from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
 from xorl.ops.linear_attention import GatedDeltaNet
 from xorl.ops.linear_attention.ops.cp import build_linear_attention_cp_context
-from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
 from xorl.utils import logging
 
 
@@ -185,7 +185,9 @@ class Qwen3_5Attention(nn.Module):
         del position_ids, past_key_values
         attn_strategy = get_cp_strategy()
         query_states, key_states, value_states = attn_strategy.project_qkv(self, hidden_states, position_embeddings)
-        attn_output = attn_strategy.compute_attention(self, query_states, key_states, value_states, attention_mask, **kwargs)
+        attn_output = attn_strategy.compute_attention(
+            self, query_states, key_states, value_states, attention_mask, **kwargs
+        )
         attn_output = attn_strategy.project_output(self, attn_output)
         return attn_output, None
 
@@ -216,9 +218,7 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
         self.mlp = Qwen3_5MLP(config)
         self.input_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        if (
-            config.sliding_window and not is_flash_attention(config._attn_implementation)
-        ):
+        if config.sliding_window and not is_flash_attention(config._attn_implementation):
             logger.warning_once(
                 f"Sliding Window Attention is enabled but not implemented for `{config._attn_implementation}`; "
                 "unexpected results may be encountered."

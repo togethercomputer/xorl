@@ -1,15 +1,16 @@
+import logging
 from dataclasses import dataclass
 from typing import Dict, Sequence, Tuple
-import logging
 
 import torch
 from torch.utils.data._utils.collate import default_collate
+
 from ...distributed.parallel_state import get_parallel_state
 from ...utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 from .base_collator import DataCollator
 
-logger = logging.getLogger(__name__)
 
+logger = logging.getLogger(__name__)
 
 
 def add_flash_attention_kwargs_from_position_ids(
@@ -43,16 +44,15 @@ def add_flash_attention_kwargs_from_position_ids(
     return cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k
 
 
-
 @dataclass
 class PackingConcatCollator(DataCollator):
     """
     Data collator with packing by position ids.
-    
+
     Args:
         pad_to_multiple_of: Pad packed sequences to a multiple of this value for optimal GPU performance.
     """
-    
+
     pad_to_multiple_of: int = 128
 
     def __call__(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
@@ -74,6 +74,7 @@ class PackingConcatCollator(DataCollator):
             raise ValueError("PackingConcatCollator received empty features list")
 
         import logging
+
         logger = logging.getLogger(__name__)
 
         # Input should be a flat list of dicts from FlattenCollator
@@ -85,7 +86,15 @@ class PackingConcatCollator(DataCollator):
         for input_name in features[0].keys():
             # Handle 1D tensors (input_ids, labels, etc.) and 2D tensors (hidden_states, hidden_states_scale)
             # IMPORTANT: loss_fn_inputs fields (target_tokens, logprobs, advantages) must be concatenated, not batched!
-            if input_name in ("input_ids", "attention_mask", "labels", "position_ids", "target_tokens", "logprobs", "advantages"):
+            if input_name in (
+                "input_ids",
+                "attention_mask",
+                "labels",
+                "position_ids",
+                "target_tokens",
+                "logprobs",
+                "advantages",
+            ):
                 # 1D tensors: concatenate along sequence dimension
                 tensors = [feature[input_name] for feature in features]
 
@@ -100,7 +109,7 @@ class PackingConcatCollator(DataCollator):
 
                 # Concatenate and add batch dimension of 1: (total_seq_len,) -> (1, total_seq_len)
                 batch[input_name] = torch.cat(tensors, dim=0).unsqueeze(0)
-                
+
             elif input_name in ("hidden_states", "hidden_states_scale"):
                 # 2D tensors: concatenate along sequence dimension (dim 0)
                 tensors = [feature[input_name] for feature in features]
@@ -114,10 +123,10 @@ class PackingConcatCollator(DataCollator):
                         f"Expected 2D tensor for key '{input_name}', but got shape {t.shape} at index {i}"
                     )
 
-                # Concatenate along sequence dimension and add batch dimension: 
+                # Concatenate along sequence dimension and add batch dimension:
                 # (seq_len, hidden_dim) -> (total_seq_len, hidden_dim) -> (1, total_seq_len, hidden_dim)
                 batch[input_name] = torch.cat(tensors, dim=0).unsqueeze(0)
-                
+
             else:
                 batch[input_name] = default_collate([feature[input_name] for feature in features])
 
@@ -139,21 +148,15 @@ class PackingConcatCollator(DataCollator):
         if self.pad_to_multiple_of > 1:
             seq_len = batch["input_ids"].shape[1]
             pad_length = (self.pad_to_multiple_of - seq_len % self.pad_to_multiple_of) % self.pad_to_multiple_of
-            
+
             if pad_length > 0:
                 # Pad 1D tensors (input_ids, labels, etc.)
                 if "input_ids" in batch:
-                    batch["input_ids"] = torch.nn.functional.pad(
-                        batch["input_ids"], (0, pad_length), value=0
-                    )
+                    batch["input_ids"] = torch.nn.functional.pad(batch["input_ids"], (0, pad_length), value=0)
                 if "labels" in batch:
-                    batch["labels"] = torch.nn.functional.pad(
-                        batch["labels"], (0, pad_length), value=-100
-                    )
+                    batch["labels"] = torch.nn.functional.pad(batch["labels"], (0, pad_length), value=-100)
                 if "attention_mask" in batch:
-                    batch["attention_mask"] = torch.nn.functional.pad(
-                        batch["attention_mask"], (0, pad_length), value=0
-                    )
+                    batch["attention_mask"] = torch.nn.functional.pad(batch["attention_mask"], (0, pad_length), value=0)
                 if "position_ids" in batch:
                     # Pad position_ids with sequential values chunked at 1024
                     # so each padding "sequence" is at most 1024 tokens.
@@ -161,15 +164,16 @@ class PackingConcatCollator(DataCollator):
                     # so the modulo resets create multiple short sequences
                     # instead of one large fake sequence that would inflate
                     # max_length_q and waste flash attention compute.
-                    pad_positions = torch.arange(
-                        pad_length,
-                        dtype=batch["position_ids"].dtype,
-                        device=batch["position_ids"].device,
-                    ) % 1024
-                    batch["position_ids"] = torch.cat(
-                        [batch["position_ids"], pad_positions.unsqueeze(0)], dim=1
+                    pad_positions = (
+                        torch.arange(
+                            pad_length,
+                            dtype=batch["position_ids"].dtype,
+                            device=batch["position_ids"].device,
+                        )
+                        % 1024
                     )
-                
+                    batch["position_ids"] = torch.cat([batch["position_ids"], pad_positions.unsqueeze(0)], dim=1)
+
                 # Pad 2D tensors (hidden_states, hidden_states_scale)
                 if "hidden_states" in batch:
                     batch["hidden_states"] = torch.nn.functional.pad(
@@ -182,7 +186,6 @@ class PackingConcatCollator(DataCollator):
 
         # cu_seq_lens_q should equal to cu_seq_lens_k and max_length_q should equal to max_length_k
         if "position_ids" in batch:
-
             if not get_parallel_state().cp_enabled:
                 # We only enter here to pass down cu_seqlens and max_length when sequence parallelism is not enabled.
                 # When cp_enabled is True, position_ids will be padded later, so we calculate them after padding
@@ -219,5 +222,3 @@ class PackingConcatCollator(DataCollator):
             #     batch["labels"] = labels_flat.view_as(labels)
 
         return batch
-
-

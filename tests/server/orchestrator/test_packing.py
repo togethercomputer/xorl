@@ -4,20 +4,22 @@ import numpy as np
 import pytest
 import torch
 
+
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
 from xorl.server.orchestrator.packing import (
+    Packer,
     SequentialPacker,
     pack_samples,
-    validate_micro_batches,
     unpack_per_token_outputs,
-    Packer,
+    validate_micro_batches,
 )
 
 
 # ============================================================================
 # Fixtures
 # ============================================================================
+
 
 @pytest.fixture
 def simple_data():
@@ -42,6 +44,7 @@ def mixed_length_data():
 # ============================================================================
 # Core packing
 # ============================================================================
+
 
 def test_packing_enabled(simple_data):
     """Packing ON: samples concatenated into single sequence with correct shifting."""
@@ -156,58 +159,96 @@ def test_mixed_length_and_capacity(mixed_length_data):
         assert len(batch["input_ids"][0]) <= 60
 
     # Exact fit: 5+5=10
-    batches = packer.pack(
-        [{"input_ids": [1] * 5}, {"input_ids": [2] * 5}], max_seq_len=10
-    )
+    batches = packer.pack([{"input_ids": [1] * 5}, {"input_ids": [2] * 5}], max_seq_len=10)
     assert len(batches) == 1 and batches[0]["num_samples"] == 2
 
     # Off-by-one: 5+6=11 > 10
-    batches = packer.pack(
-        [{"input_ids": [1] * 5}, {"input_ids": [2] * 6}], max_seq_len=10
-    )
+    batches = packer.pack([{"input_ids": [1] * 5}, {"input_ids": [2] * 6}], max_seq_len=10)
     assert len(batches) == 2
 
 
 def test_validate_micro_batches():
     """Validation: valid batches pass, missing field / empty / length mismatch fail."""
-    valid = [{
-        "input_ids": [[1, 2, 3], [4, 5]],
-        "labels": [[2, 3, 4], [5, 6]],
-        "position_ids": [[0, 1, 2], [0, 1]],
-        "request_id": "test",
-        "batch_id": 0,
-    }]
+    valid = [
+        {
+            "input_ids": [[1, 2, 3], [4, 5]],
+            "labels": [[2, 3, 4], [5, 6]],
+            "position_ids": [[0, 1, 2], [0, 1]],
+            "request_id": "test",
+            "batch_id": 0,
+        }
+    ]
     assert validate_micro_batches(valid) is True
 
     # Missing request_id
-    assert validate_micro_batches([{
-        "input_ids": [[1, 2, 3]], "labels": [[2, 3, 4]],
-        "position_ids": [[0, 1, 2]], "batch_id": 0,
-    }]) is False
+    assert (
+        validate_micro_batches(
+            [
+                {
+                    "input_ids": [[1, 2, 3]],
+                    "labels": [[2, 3, 4]],
+                    "position_ids": [[0, 1, 2]],
+                    "batch_id": 0,
+                }
+            ]
+        )
+        is False
+    )
 
     # Empty input_ids
-    assert validate_micro_batches([{
-        "input_ids": [], "labels": [], "position_ids": [],
-        "request_id": "t", "batch_id": 0,
-    }]) is False
+    assert (
+        validate_micro_batches(
+            [
+                {
+                    "input_ids": [],
+                    "labels": [],
+                    "position_ids": [],
+                    "request_id": "t",
+                    "batch_id": 0,
+                }
+            ]
+        )
+        is False
+    )
 
     # Length mismatch (labels vs input_ids)
-    assert validate_micro_batches([{
-        "input_ids": [[1, 2, 3], [4, 5]], "labels": [[2, 3, 4]],
-        "position_ids": [[0, 1, 2], [0, 1]], "request_id": "t", "batch_id": 0,
-    }]) is False
+    assert (
+        validate_micro_batches(
+            [
+                {
+                    "input_ids": [[1, 2, 3], [4, 5]],
+                    "labels": [[2, 3, 4]],
+                    "position_ids": [[0, 1, 2], [0, 1]],
+                    "request_id": "t",
+                    "batch_id": 0,
+                }
+            ]
+        )
+        is False
+    )
 
     # Position_ids length mismatch
-    assert validate_micro_batches([{
-        "input_ids": [[1, 2, 3]], "labels": [[2, 3, 4]],
-        "position_ids": [[0, 1]], "request_id": "t", "batch_id": 0,
-    }]) is False
+    assert (
+        validate_micro_batches(
+            [
+                {
+                    "input_ids": [[1, 2, 3]],
+                    "labels": [[2, 3, 4]],
+                    "position_ids": [[0, 1]],
+                    "request_id": "t",
+                    "batch_id": 0,
+                }
+            ]
+        )
+        is False
+    )
 
 
 def test_pack_samples_function(simple_data):
     """pack_samples convenience function: with/without packing, default params."""
-    batches = pack_samples(simple_data, max_seq_len=10, enable_packing=True,
-                           request_id="func-test", pad_to_multiple_of=1)
+    batches = pack_samples(
+        simple_data, max_seq_len=10, enable_packing=True, request_id="func-test", pad_to_multiple_of=1
+    )
     assert len(batches) == 1 and batches[0]["request_id"] == "func-test"
 
     batches_no_pack = pack_samples(simple_data, enable_packing=False, pad_to_multiple_of=1)
@@ -221,10 +262,17 @@ def test_packer_abstract_and_custom():
 
     class CustomPacker(Packer):
         def pack(self, datum_list, max_seq_len, request_id=""):
-            return [{"input_ids": [d["input_ids"]], "labels": [d.get("labels", [])],
-                     "position_ids": [list(range(len(d["input_ids"])))],
-                     "request_id": request_id, "batch_id": i}
-                    for i, d in enumerate(datum_list) if "input_ids" in d]
+            return [
+                {
+                    "input_ids": [d["input_ids"]],
+                    "labels": [d.get("labels", [])],
+                    "position_ids": [list(range(len(d["input_ids"])))],
+                    "request_id": request_id,
+                    "batch_id": i,
+                }
+                for i, d in enumerate(datum_list)
+                if "input_ids" in d
+            ]
 
     cp = CustomPacker()
     assert cp.get_name() == "CustomPacker"
@@ -284,6 +332,7 @@ def test_large_batch_and_numpy():
 # Unpack per-token outputs
 # ============================================================================
 
+
 def test_unpack_per_token_outputs():
     """Unpack: no-shift, shift, single/multi sample, 2D tensors, lists, min-length."""
     # No-shift: output length == position_ids length
@@ -332,6 +381,7 @@ def test_unpack_per_token_outputs():
 # ============================================================================
 # Full pipeline roundtrip
 # ============================================================================
+
 
 def test_full_pipeline_roundtrip():
     """Pack -> simulate forward -> unpack: token counts preserved, single and multi-batch."""

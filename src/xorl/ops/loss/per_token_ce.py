@@ -42,14 +42,21 @@ def compute_per_token_ce(
     if tp_group is not None:
         local_weight = weight.to_local() if hasattr(weight, "to_local") else weight
         return vocab_parallel_cross_entropy(
-            hidden_states_flat, local_weight, labels_flat, tp_group,
+            hidden_states_flat,
+            local_weight,
+            labels_flat,
+            tp_group,
             ignore_index=ignore_index,
             use_compile=use_compile,
         )
 
     if ce_mode == "compiled":
         return compiled_cross_entropy_function(
-            hidden_states_flat, weight, labels_flat, ignore_index, num_chunks,
+            hidden_states_flat,
+            weight,
+            labels_flat,
+            ignore_index,
+            num_chunks,
             lm_head_fp32=lm_head_fp32,
         )
     else:

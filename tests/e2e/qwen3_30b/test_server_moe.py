@@ -16,6 +16,7 @@ from tests.e2e.server_utils import (
     run_sft_steps,
 )
 
+
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.server, pytest.mark.slow]
 
 
@@ -49,9 +50,7 @@ class TestQwen3_30B_MoE:
         try:
             _start_server_or_fail(server, timeout=600)
 
-            _, training_client = _create_lora_client(
-                server.base_url, model_dir, model_id="test-moe-ep2-fsdp4"
-            )
+            _, training_client = _create_lora_client(server.base_url, model_dir, model_id="test-moe-ep2-fsdp4")
             data = generate_random_sft_data(num_samples=8, seq_len=64, vocab_size=151936)
             losses = run_sft_steps(training_client, data, num_steps=2)
             assert all(not math.isnan(l) for l in losses), f"NaN in losses: {losses}"

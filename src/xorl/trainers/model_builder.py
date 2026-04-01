@@ -13,6 +13,7 @@ import torch.nn as nn
 
 from xorl.utils import helper
 
+
 logger = helper.create_logger(__name__)
 
 
@@ -126,6 +127,7 @@ def build_training_model(
     # Set module-level flags for rope and activation
     if rope_native:
         from xorl.models.layers.rope import set_rope_native
+
         set_rope_native(True)
         logger.info_rank0("Using native RoPE (flash_attn fused kernel disabled)")
     if activation_native:
@@ -237,6 +239,7 @@ def build_training_model(
         helper.print_device_mem_info("VRAM usage after QLoRA quantization")
     elif enable_lora:
         from xorl.lora import freeze_base_parameters
+
         freeze_base_parameters(model)
         logger.info_rank0("Base model parameters frozen, only LoRA parameters trainable")
     else:
@@ -279,6 +282,7 @@ def build_training_model(
 # Internal helpers
 # ======================================================================
 
+
 def _inject_qlora(
     model: nn.Module,
     *,
@@ -296,9 +300,9 @@ def _inject_qlora(
     Returns (is_prequantized, checkpoint_quant_format, exclude_modules).
     """
     from xorl.qlora import (
-        inject_qlora_into_model,
-        detect_prequantized_nvfp4,
         detect_prequantized_block_fp8,
+        detect_prequantized_nvfp4,
+        inject_qlora_into_model,
     )
 
     is_prequantized = False
@@ -319,11 +323,11 @@ def _inject_qlora(
         logger.info_rank0(f"Using user-specified exclude_modules: {exclude_modules}")
     elif is_prequantized:
         from xorl.models.checkpoint_handlers.buffers import get_prequantized_exclude_modules
+
         exclude_modules = get_prequantized_exclude_modules(weights_path)
         if exclude_modules:
             logger.info_rank0(
-                f"Auto-detected {len(exclude_modules)} excluded modules "
-                f"from checkpoint config: {exclude_modules}"
+                f"Auto-detected {len(exclude_modules)} excluded modules from checkpoint config: {exclude_modules}"
             )
 
     # NF4 quantizes bf16 weights on-the-fly — no pre-quantized checkpoint needed.
@@ -383,9 +387,9 @@ def _inject_lora(
 
     if is_moe_model and (moe_shared_lora or moe_hybrid_shared_lora):
         from xorl.lora.utils import inject_lora_into_model_with_moe
+
         logger.info_rank0(
-            f"MoE-aware LoRA injection "
-            f"(shared={moe_shared_lora}, hybrid_shared={moe_hybrid_shared_lora})"
+            f"MoE-aware LoRA injection (shared={moe_shared_lora}, hybrid_shared={moe_hybrid_shared_lora})"
         )
         inject_lora_into_model_with_moe(
             model,
@@ -397,6 +401,7 @@ def _inject_lora(
         )
     else:
         from xorl.lora.utils import inject_lora_into_model
+
         inject_lora_into_model(
             model,
             r=lora_rank,
@@ -425,47 +430,47 @@ def _deferred_qlora_quantize(
 
     # 1. Pre-quantized linear/MoE loading (nvfp4/block_fp8)
     needs_prequant_linear = any(
-        isinstance(m, QLoRALinear) and m._is_prequantized and not m._inline_loaded
-        for m in model.modules()
+        isinstance(m, QLoRALinear) and m._is_prequantized and not m._inline_loaded for m in model.modules()
     )
     needs_prequant_moe = any(
-        isinstance(m, QLoRAMoeExperts) and not m._weights_loaded
-        and m._source_quant_format is not None
+        isinstance(m, QLoRAMoeExperts) and not m._weights_loaded and m._source_quant_format is not None
         for m in model.modules()
     )
 
     if needs_prequant_linear or needs_prequant_moe:
         from xorl.qlora import maybe_load_prequantized_qlora
+
         logger.info(f"Starting pre-quantized weight loading (mode={load_weights_mode}) …")
         helper.print_device_mem_info("VRAM before pre-quantized loading")
         maybe_load_prequantized_qlora(model, weights_path, load_mode=load_weights_mode)
         logger.info("Done pre-quantized weight loading")
 
     # 2. NF4 linear: FSDP loaded bf16 into weight param → quantize to NF4
-    needs_bf16_quantize = any(
-        isinstance(m, QLoRALinear) and m.weight is not None
-        for m in model.modules()
-    )
+    needs_bf16_quantize = any(isinstance(m, QLoRALinear) and m.weight is not None for m in model.modules())
     if needs_bf16_quantize:
         from xorl.qlora import maybe_quantize_qlora
+
         logger.info("Quantizing bf16 linear weights to NF4 …")
         maybe_quantize_qlora(model)
 
     # 3. NF4 MoE: load bf16 experts from checkpoint → quantize
     needs_bf16_moe = any(
-        isinstance(m, QLoRAMoeExperts) and not m._weights_loaded
+        isinstance(m, QLoRAMoeExperts)
+        and not m._weights_loaded
         and m._source_quant_format is None  # NF4 (no source quant format)
         for m in model.modules()
     )
     if needs_bf16_moe:
         from xorl.qlora import maybe_load_and_quantize_moe_qlora
+
         logger.info("Loading and quantizing bf16 MoE expert weights …")
         maybe_load_and_quantize_moe_qlora(
-            model, weights_path, load_mode=load_weights_mode,
+            model,
+            weights_path,
+            load_mode=load_weights_mode,
         )
 
-    if not (needs_prequant_linear or needs_prequant_moe
-            or needs_bf16_quantize or needs_bf16_moe):
+    if not (needs_prequant_linear or needs_prequant_moe or needs_bf16_quantize or needs_bf16_moe):
         logger.info("All QLoRA modules loaded inline, skipping deferred disk I/O")
 
     # Always deregister packed_weight_f32 from FSDP2 (prevent mixed-precision corruption)

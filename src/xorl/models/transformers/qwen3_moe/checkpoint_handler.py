@@ -7,13 +7,20 @@ import torch.nn as nn
 
 from ...checkpoint_handlers.base import CheckpointHandler
 from ...checkpoint_handlers.buffers import (
-    ExpertWeightBuffer, GateUpMergeBuffer, QKVMergeBuffer,
-    QLoRAWeightBuffer, QLoRAExpertBuffer,
-    parse_expert_key, parse_expert_full_key,
-    EXPERT_QUANT_AUX_PATTERN, QUANT_AUX_SUFFIX_PATTERN,
+    DENSE_DOWN_PROJ_PATTERN,
+    DENSE_GATE_UP_PATTERN,
+    EXPERT_QUANT_AUX_PATTERN,
     FP8_AUX_SUFFIX_PATTERN,
-    QKV_PROJ_PATTERN, DENSE_GATE_UP_PATTERN,
-    OPROJ_WEIGHT_PATTERN, DENSE_DOWN_PROJ_PATTERN,
+    OPROJ_WEIGHT_PATTERN,
+    QKV_PROJ_PATTERN,
+    QUANT_AUX_SUFFIX_PATTERN,
+    ExpertWeightBuffer,
+    GateUpMergeBuffer,
+    QKVMergeBuffer,
+    QLoRAExpertBuffer,
+    QLoRAWeightBuffer,
+    parse_expert_full_key,
+    parse_expert_key,
 )
 
 
@@ -63,7 +70,10 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
         # Non-QLoRA expert stacking (disabled when pre-quantized — use QLoRAExpertBuffer instead)
         if checkpoint_has_per_expert and not is_prequantized:
             self._expert_buffer = ExpertWeightBuffer(
-                num_experts, ep_rank=ep_rank, ep_size=ep_size, device=device,
+                num_experts,
+                ep_rank=ep_rank,
+                ep_size=ep_size,
+                device=device,
             )
         self._qkv_buffer: Optional[QKVMergeBuffer] = None
         if not skip_qkv_merge:
@@ -83,7 +93,10 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
         self._qlora_expert_buffer = None
         if is_prequantized and model is not None:
             self._qlora_expert_buffer = QLoRAExpertBuffer(
-                model, ep_rank=ep_rank, ep_size=ep_size, num_experts=num_experts,
+                model,
+                ep_rank=ep_rank,
+                ep_size=ep_size,
+                num_experts=num_experts,
             )
 
     def get_skip_key_fn(self) -> Optional[Callable[[str], bool]]:
@@ -96,15 +109,12 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
 
         When inline buffers are active, in-range keys flow through on_load_weight.
         """
-        has_ep_filter = (
-            self._expert_buffer is not None
-            and not (self._expert_buffer.expert_start == 0
-                     and self._expert_buffer.expert_end == self._expert_buffer.num_experts)
+        has_ep_filter = self._expert_buffer is not None and not (
+            self._expert_buffer.expert_start == 0 and self._expert_buffer.expert_end == self._expert_buffer.num_experts
         )
-        has_expert_ep_filter = (
-            self._qlora_expert_buffer is not None
-            and not (self._qlora_expert_buffer.expert_start == 0
-                     and self._qlora_expert_buffer.expert_end == self._qlora_expert_buffer._num_experts)
+        has_expert_ep_filter = self._qlora_expert_buffer is not None and not (
+            self._qlora_expert_buffer.expert_start == 0
+            and self._qlora_expert_buffer.expert_end == self._qlora_expert_buffer._num_experts
         )
 
         if not has_ep_filter and not has_expert_ep_filter and not self._is_prequantized:
@@ -152,8 +162,12 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
                     if FP8_AUX_SUFFIX_PATTERN.search(key):
                         return True
                     if key.endswith(".weight"):
-                        if (QKV_PROJ_PATTERN.match(key) or DENSE_GATE_UP_PATTERN.match(key)
-                                or OPROJ_WEIGHT_PATTERN.match(key) or DENSE_DOWN_PROJ_PATTERN.match(key)):
+                        if (
+                            QKV_PROJ_PATTERN.match(key)
+                            or DENSE_GATE_UP_PATTERN.match(key)
+                            or OPROJ_WEIGHT_PATTERN.match(key)
+                            or DENSE_DOWN_PROJ_PATTERN.match(key)
+                        ):
                             return True
 
             # Skip out-of-range expert keys for EP (non-prequantized path)
@@ -174,9 +188,7 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
         module_short_name = module_fqn.rsplit(".", 1)[-1]
         return module_short_name in self._exclude_modules
 
-    def on_load_weight(
-        self, key: str, tensor: torch.Tensor
-    ) -> List[Tuple[str, torch.Tensor]]:
+    def on_load_weight(self, key: str, tensor: torch.Tensor) -> List[Tuple[str, torch.Tensor]]:
         # Drop input_scale (unused by our quantization)
         if key.endswith(".input_scale"):
             return []
@@ -251,9 +263,7 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
         # 4. Passthrough
         return [(key, tensor)]
 
-    def on_skip_weight(
-        self, key: str
-    ) -> List[Tuple[str, torch.Tensor]]:
+    def on_skip_weight(self, key: str) -> List[Tuple[str, torch.Tensor]]:
         """Count a skipped expert key so completion tracking stays correct."""
         # QLoRA expert buffer: count skipped out-of-range expert keys
         if self._qlora_expert_buffer is not None:
@@ -272,6 +282,7 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
 
     def on_load_complete(self) -> List[Tuple[str, torch.Tensor]]:
         import warnings
+
         if self._expert_buffer is not None:
             pending = self._expert_buffer.get_pending_counts()
             if pending:
@@ -291,15 +302,12 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
             pending_exp = self._qlora_expert_buffer.get_pending()
             if pending_exp:
                 warnings.warn(
-                    f"Incomplete QLoRA expert weights after loading "
-                    f"(will fall back to deferred loading): {pending_exp}"
+                    f"Incomplete QLoRA expert weights after loading (will fall back to deferred loading): {pending_exp}"
                 )
             self._qlora_expert_buffer.set_inline_metadata()
         return []
 
-    def on_save_weight(
-        self, param_name: str, tensor: torch.Tensor
-    ) -> List[Tuple[str, torch.Tensor]]:
+    def on_save_weight(self, param_name: str, tensor: torch.Tensor) -> List[Tuple[str, torch.Tensor]]:
         # Split gate_up_proj -> gate_proj + up_proj (shared expert / dense layers)
         if ".gate_up_proj." in param_name:
             prefix, suffix = param_name.rsplit(".gate_up_proj.", 1)

@@ -7,10 +7,12 @@ Follows the same pattern as ``layers.attention.backend.ATTENTION_FUNCTIONS``.
 
 from typing import Callable, Dict
 
+
 MOE_EXPERT_BACKENDS: Dict[str, Callable] = {}
 
 # Eager is always available (no kernel deps)
 from .eager import eager_expert_forward
+
 
 MOE_EXPERT_BACKENDS["eager"] = eager_expert_forward
 
@@ -83,7 +85,7 @@ EP_COMBINE: Dict[str, Callable] = {}
 
 # AllToAll dispatch (always available when EP ops are available)
 try:
-    from xorl.distributed.moe import alltoall_pre_dispatch, alltoall_post_combine
+    from xorl.distributed.moe import alltoall_post_combine, alltoall_pre_dispatch
 
     EP_DISPATCH["alltoall"] = alltoall_pre_dispatch
     EP_COMBINE["alltoall"] = alltoall_post_combine
@@ -94,6 +96,8 @@ except ImportError:
 try:
     from xorl.distributed.moe.deepep import (
         token_pre_dispatch as deepep_pre_dispatch,
+    )
+    from xorl.distributed.moe.deepep import (
         tokens_post_combine as deepep_post_combine,
     )
 

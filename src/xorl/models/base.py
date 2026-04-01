@@ -46,7 +46,6 @@ class XorlPreTrainedModel(nn.Module):
         """Initialize weights and apply weight tying."""
         self.apply(self._init_weights)
 
-
     def init_weights(self, buffer_device=None):
         """Initialize weights, matching torchtitan's ModelProtocol.
 
@@ -97,11 +96,9 @@ class XorlPreTrainedModel(nn.Module):
         recompute_modules = gradient_checkpointing_kwargs.pop("recompute_modules", None)
         moe_checkpoint_method = gradient_checkpointing_kwargs.pop("moe_checkpoint_method", None)
 
-        gc_func = partial(
-            torch.utils.checkpoint.checkpoint, **gradient_checkpointing_kwargs
-        )
+        gc_func = partial(torch.utils.checkpoint.checkpoint, **gradient_checkpointing_kwargs)
 
-        moe_act = (moe_checkpoint_method == "moe_act")
+        moe_act = moe_checkpoint_method == "moe_act"
         for module in self.modules():
             if hasattr(module, "gradient_checkpointing"):
                 module.gradient_checkpointing = True

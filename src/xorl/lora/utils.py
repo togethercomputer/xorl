@@ -8,15 +8,16 @@ import json
 import logging
 import os
 import re
-from typing import Dict, Iterator, List, Optional, Set, Tuple, Union
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from safetensors.torch import save_file, load_file
+from safetensors.torch import load_file, save_file
 
+from xorl.lora.mapping import can_apply_lora, get_lora_class_for_module
 from xorl.lora.modules import LoraLinear
 from xorl.lora.modules.base import LoraModule
-from xorl.lora.mapping import can_apply_lora, get_lora_class_for_module
+
 
 logger = logging.getLogger(__name__)
 
@@ -244,8 +245,6 @@ def get_lora_parameters(model: nn.Module) -> Iterator[nn.Parameter]:
             yield param
 
 
-
-
 def _gather_ep_tensor(tensor: torch.Tensor, spec_info) -> torch.Tensor:
     """Gather an EP-sharded tensor from all EP ranks.
 
@@ -295,7 +294,7 @@ def get_lora_state_dict(
     """
     from torch.distributed._tensor import DTensor
 
-    fqn2spec_info = getattr(model, '_fqn2spec_info', None)
+    fqn2spec_info = getattr(model, "_fqn2spec_info", None)
 
     lora_state_dict = {}
     for name, param in model.named_parameters():
@@ -354,9 +353,7 @@ def load_lora_state_dict(
 
     if strict and (missing_keys or unexpected_keys):
         raise RuntimeError(
-            f"Error loading LoRA state dict.\n"
-            f"Missing keys: {missing_keys}\n"
-            f"Unexpected keys: {unexpected_keys}"
+            f"Error loading LoRA state dict.\nMissing keys: {missing_keys}\nUnexpected keys: {unexpected_keys}"
         )
 
     # Load matching keys
@@ -405,7 +402,6 @@ def save_lora_checkpoint(
     Returns:
         Path to saved checkpoint directory
     """
-    import re
 
     os.makedirs(save_path, exist_ok=True)
 
@@ -465,7 +461,7 @@ def save_lora_checkpoint(
         result = {}
 
         # Check if this is a shared weight (hybrid shared LoRA)
-        is_shared = (num_experts == 1)
+        is_shared = num_experts == 1
 
         if is_shared:
             # Shared weight: use ".shared." in the key name
@@ -612,9 +608,9 @@ def load_lora_checkpoint(
             return name.replace("lm_head.lora_embedding_B", "lm_head.lora_B")
         # Handle .weight suffix for Linear layers
         elif name.endswith(".lora_A.weight"):
-            return name[:-len(".weight")]
+            return name[: -len(".weight")]
         elif name.endswith(".lora_B.weight"):
-            return name[:-len(".weight")]
+            return name[: -len(".weight")]
         return name
 
     # Convert PEFT format keys to xorl format if needed
@@ -622,7 +618,7 @@ def load_lora_checkpoint(
     for key, value in state_dict.items():
         # Remove PEFT prefix: base_model.model.{key} -> {key}
         if key.startswith("base_model.model."):
-            new_key = key[len("base_model.model."):]
+            new_key = key[len("base_model.model.") :]
         else:
             new_key = key
         # Convert from PEFT naming to xorl naming
@@ -713,7 +709,7 @@ def inject_lora_into_moe_blocks(
 
     for name, module in model.named_modules():
         # Check if this is a MoE block that supports LoRA injection
-        if hasattr(module, 'inject_lora') and hasattr(module, 'lora_adapter'):
+        if hasattr(module, "inject_lora") and hasattr(module, "lora_adapter"):
             # This is a MoEBlock or similar
             module.inject_lora(
                 r=r,
@@ -732,8 +728,7 @@ def inject_lora_into_moe_blocks(
         )
     else:
         logger.warning(
-            "No LoRA-compatible MoE blocks found. Make sure model uses "
-            "moe_implementation='triton' or 'native'"
+            "No LoRA-compatible MoE blocks found. Make sure model uses moe_implementation='triton' or 'native'"
         )
 
     return injected_count
@@ -830,10 +825,10 @@ def get_moe_lora_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
 
     for name, module in model.named_modules():
         # Check if this is an MoE LoRA expert module (has lora_config attribute)
-        if hasattr(module, 'lora_config') and module.lora_config is not None:
+        if hasattr(module, "lora_config") and module.lora_config is not None:
             # Get all lora_ parameters from this module
             for param_name, param in module.named_parameters():
-                if 'lora_' in param_name:
+                if "lora_" in param_name:
                     full_key = f"{name}.{param_name}"
                     moe_lora_state_dict[full_key] = param.detach().cpu()
 

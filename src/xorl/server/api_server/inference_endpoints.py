@@ -30,6 +30,7 @@ from xorl.server.api_server.api_types import (
 from xorl.server.protocol.api_orchestrator import OrchestratorRequest
 from xorl.server.protocol.operations import SyncWeightsData
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -63,6 +64,7 @@ class InferenceEndpointsMixin:
         if config_dict is None:
             try:
                 from huggingface_hub import hf_hub_download
+
                 cached_path = hf_hub_download(model_path, "config.json")
                 with open(cached_path) as f:
                     config_dict = json.load(f)
@@ -283,7 +285,11 @@ class InferenceEndpointsMixin:
             existing_info = self.inference_endpoints[0].server_info
             if existing_info is not None:
                 mismatches = []
-                if existing_info.model_path and server_info.model_path and existing_info.model_path != server_info.model_path:
+                if (
+                    existing_info.model_path
+                    and server_info.model_path
+                    and existing_info.model_path != server_info.model_path
+                ):
                     mismatches.append(f"model_path: {existing_info.model_path} vs {server_info.model_path}")
                 if existing_info.quantization != server_info.quantization:
                     mismatches.append(f"quantization: {existing_info.quantization} vs {server_info.quantization}")
@@ -564,7 +570,9 @@ class InferenceEndpointsMixin:
             raise
         except Exception as e:
             logger.error(f"Sync inference weights failed: {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Sync inference weights failed: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Sync inference weights failed: {e}"
+            )
 
     # =========================================================================
     # Sampling Session Management (LoRA Adapter Loading)
@@ -602,11 +610,11 @@ class InferenceEndpointsMixin:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Invalid xorl:// URI format for sampler weights: {model_path}. "
-                           f"Expected: xorl://model_id/sampler_weights/adapter_name"
+                    f"Expected: xorl://model_id/sampler_weights/adapter_name",
                 )
         elif model_path.startswith("sampler_weights/"):
             # Format: sampler_weights/adapter_name
-            lora_name = model_path[len("sampler_weights/"):]
+            lora_name = model_path[len("sampler_weights/") :]
         else:
             # Just the adapter name
             lora_name = model_path
@@ -872,10 +880,7 @@ class InferenceEndpointsMixin:
         logger.info(f"LoRA adapter '{lora_name}' added to tracking list (count={len(adapters)})")
         return False
 
-    async def create_sampling_session(
-        self,
-        request: CreateSamplingSessionRequest
-    ) -> CreateSamplingSessionResponse:
+    async def create_sampling_session(self, request: CreateSamplingSessionRequest) -> CreateSamplingSessionResponse:
         """
         Create a sampling session by loading a LoRA adapter on inference workers.
 
@@ -910,7 +915,9 @@ class InferenceEndpointsMixin:
             if len(adapters) > self.max_adapters_per_model:
                 # We just added one, so if we're over capacity, remove the oldest (index 0)
                 oldest_name, oldest_path = adapters[0]
-                logger.info(f"Max LoRA adapters exceeded ({self.max_adapters_per_model}), unloading oldest: {oldest_name}")
+                logger.info(
+                    f"Max LoRA adapters exceeded ({self.max_adapters_per_model}), unloading oldest: {oldest_name}"
+                )
                 await self._unload_lora_on_inference_endpoints(oldest_name)
                 adapters.pop(0)
 

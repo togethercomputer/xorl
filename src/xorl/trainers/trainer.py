@@ -147,6 +147,7 @@ class Trainer:
             save_args(args, args.train.output_dir)
             if args.train.use_wandb:
                 import wandb
+
                 wandb.init(
                     project=args.train.wandb_project,
                     name=args.train.wandb_name,
@@ -211,6 +212,7 @@ class Trainer:
         if self.args.train.global_rank != 0 or not self.args.train.use_wandb or not self._wandb_initialized:
             return
         import wandb
+
         wandb.log(metrics, step=0, commit=commit)
 
     def _write_startup_metrics_file(self) -> None:
@@ -248,7 +250,8 @@ class Trainer:
         unique_hostnames = sorted({item["hostname"] for item in inventory})
         rank_to_hostname = {str(item["global_rank"]): item["hostname"] for item in inventory}
         logger.info_rank0(
-            "Host inventory:\n" + json.dumps(
+            "Host inventory:\n"
+            + json.dumps(
                 {
                     "master_addr": os.environ.get("MASTER_ADDR"),
                     "master_port": os.environ.get("MASTER_PORT"),
@@ -271,6 +274,7 @@ class Trainer:
         self._maybe_log_startup_metrics({"startup/node_count": len(unique_hostnames)}, commit=False)
         if self.args.train.use_wandb and self._wandb_initialized:
             import wandb
+
             wandb.config.update(
                 {
                     "master_addr": os.environ.get("MASTER_ADDR"),
@@ -988,9 +992,7 @@ class Trainer:
         tokens_per_sec = train_metrics.get("efficiency/tokens_per_second(K)", 0) * 1e3
 
         if use_tqdm and tqdm_bar is not None:
-            tqdm_bar.set_postfix_str(
-                f"loss={total_loss:.2f} gn={grad_norm:.2f} lr={lr:.1e} tok/s={tokens_per_sec:.0f}"
-            )
+            tqdm_bar.set_postfix_str(f"loss={total_loss:.2f} gn={grad_norm:.2f} lr={lr:.1e} tok/s={tokens_per_sec:.0f}")
             tqdm_bar.update()
         else:
             max_steps_str = args.train.max_steps or "?"

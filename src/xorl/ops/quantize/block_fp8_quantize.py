@@ -18,6 +18,7 @@ from triton import Config
 # 1D quantization kernel + wrapper
 # ---------------------------------------------------------------------------
 
+
 @triton.jit
 def _block_fp8_quantize_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
     """1D block-based quantization kernel for FP8 conversion.
@@ -41,9 +42,7 @@ def _block_fp8_quantize_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
     tl.store(s_ptr + pid, s)
 
 
-def block_fp8_quantize(
-    x: torch.Tensor, block_size: int = 128
-) -> Tuple[torch.Tensor, torch.Tensor]:
+def block_fp8_quantize(x: torch.Tensor, block_size: int = 128) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize a tensor to FP8 using 1D block-based quantization.
 
     Divides the input tensor into blocks along the last dimension and quantizes
@@ -77,6 +76,7 @@ block_fp8_quant = block_fp8_quantize
 # 1D dequantization kernel + wrapper
 # ---------------------------------------------------------------------------
 
+
 @triton.jit
 def _block_fp8_dequantize_kernel(y_ptr, s_ptr, x_ptr, BLOCK_SIZE: tl.constexpr):
     """1D block-based dequantization kernel.
@@ -92,9 +92,7 @@ def _block_fp8_dequantize_kernel(y_ptr, s_ptr, x_ptr, BLOCK_SIZE: tl.constexpr):
     tl.store(x_ptr + offs, x)
 
 
-def block_fp8_dequantize(
-    y: torch.Tensor, s: torch.Tensor, block_size: int = 128
-) -> torch.Tensor:
+def block_fp8_dequantize(y: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> torch.Tensor:
     """Dequantize a tensor using 1D block-based quantization along the last dimension.
 
     Args:
@@ -183,9 +181,7 @@ def _block_fp8_gemm_kernel(
     tl.store(c_ptrs, c, mask=mask)
 
 
-def block_fp8_gemm(
-    a: torch.Tensor, a_s: torch.Tensor, b: torch.Tensor, b_s: torch.Tensor
-) -> torch.Tensor:
+def block_fp8_gemm(a: torch.Tensor, a_s: torch.Tensor, b: torch.Tensor, b_s: torch.Tensor) -> torch.Tensor:
     """Block-wise FP8 matrix multiplication with per-block scaling.
 
     Computes C = A @ B^T where A and B are block-quantized FP8 tensors.

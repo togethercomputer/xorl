@@ -9,6 +9,7 @@ from .sequence_shard_collator import TextSequenceShardCollator
 from .shift_tokens_collator import ShiftTokensCollator
 from .tensor_collator import ToTensorCollator
 
+
 __all__ = [
     "DataCollator",
     "CollatePipeline",
@@ -19,4 +20,3 @@ __all__ = [
     "TextSequenceShardCollator",
     "ToTensorCollator",
 ]
-

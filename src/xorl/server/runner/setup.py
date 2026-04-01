@@ -18,9 +18,9 @@ import torch.distributed as dist
 import yaml
 
 from xorl.arguments import Arguments, parse_args
-from xorl.server.server_arguments import ServerArguments, parse_server_args
-from xorl.server.runner.runner_dispatcher import RunnerDispatcher
 from xorl.server.runner.model_runner import ModelRunner
+from xorl.server.runner.runner_dispatcher import RunnerDispatcher
+from xorl.server.server_arguments import ServerArguments, parse_server_args
 from xorl.utils.device import get_nccl_backend
 
 
@@ -227,7 +227,7 @@ async def run_distributed_worker_from_server_args(server_args: ServerArguments):
     # Resolve auto bind address
     if server_args.worker_bind_address == "auto":
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(('', 0))
+            s.bind(("", 0))
             server_args.worker_bind_address = f"tcp://127.0.0.1:{s.getsockname()[1]}"
 
     config = server_args.to_config_dict()
@@ -293,9 +293,7 @@ def main():
 
     if not config_path:
         print("Error: Config file path required as first positional argument")
-        print(
-            "Usage: python -m xorl.server.runner.runner_dispatcher config.yaml [--worker_bind_address tcp://...]"
-        )
+        print("Usage: python -m xorl.server.runner.runner_dispatcher config.yaml [--worker_bind_address tcp://...]")
         sys.exit(1)
 
     # Detect config format and parse accordingly

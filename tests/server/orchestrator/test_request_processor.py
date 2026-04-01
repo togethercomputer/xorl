@@ -13,31 +13,30 @@ Test Strategy:
 - Verify RequestProcessor correctly packs data and formats outputs
 """
 
-import asyncio
 import pytest
 import pytest_asyncio
-from typing import List, Dict, Any, Optional
 
-from xorl.server.orchestrator.request_processor import RequestProcessor
 from xorl.server.backend import DummyBackend
+from xorl.server.orchestrator.request_processor import RequestProcessor
 from xorl.server.protocol.api_orchestrator import (
-    OrchestratorRequest,
     OrchestratorOutputs,
-    RequestType,
+    OrchestratorRequest,
     OutputType,
+    RequestType,
 )
 from xorl.server.protocol.operations import (
+    EmptyData,
+    LoadStateData,
     ModelPassData,
     OptimStepData,
     SaveStateData,
-    LoadStateData,
-    EmptyData,
 )
 
 
 # ============================================================================
 # Fixtures
 # ============================================================================
+
 
 @pytest_asyncio.fixture
 async def processor():
@@ -57,6 +56,7 @@ async def processor():
 # ============================================================================
 # Tests
 # ============================================================================
+
 
 @pytest.mark.asyncio
 async def test_lifecycle_and_ready_state():
@@ -81,7 +81,8 @@ async def test_forward_backward_operations(processor):
         {"input_ids": [100, 200, 300], "labels": [200, 300, 400]},
     ]
     request = OrchestratorRequest(
-        request_id="req-001", request_type=RequestType.ADD,
+        request_id="req-001",
+        request_type=RequestType.ADD,
         operation="forward_backward",
         payload=ModelPassData(data=datum_list, loss_fn="causallm_loss"),
     )
@@ -97,7 +98,8 @@ async def test_forward_backward_operations(processor):
 
     # Forward only (no gradients)
     request = OrchestratorRequest(
-        request_id="req-fwd", request_type=RequestType.ADD,
+        request_id="req-fwd",
+        request_type=RequestType.ADD,
         operation="forward",
         payload=ModelPassData(data=[{"input_ids": [1, 2, 3], "labels": [2, 3, 4]}]),
     )
@@ -111,8 +113,10 @@ async def test_optim_and_checkpoint_operations(processor):
     """Test optim_step, save_state, load_state, sleep, and wake_up."""
     # Optim step
     request = OrchestratorRequest(
-        request_id="req-004", request_type=RequestType.ADD,
-        operation="optim_step", payload=OptimStepData(lr=0.001, gradient_clip=1.0),
+        request_id="req-004",
+        request_type=RequestType.ADD,
+        operation="optim_step",
+        payload=OptimStepData(lr=0.001, gradient_clip=1.0),
     )
     output = await processor.execute_optim_step(request)
     assert output.output_type == OutputType.OPTIM_STEP
@@ -121,8 +125,10 @@ async def test_optim_and_checkpoint_operations(processor):
 
     # Save state
     request = OrchestratorRequest(
-        request_id="req-save", request_type=RequestType.ADD,
-        operation="save_state", payload=SaveStateData(checkpoint_path="/tmp/ckpt"),
+        request_id="req-save",
+        request_type=RequestType.ADD,
+        operation="save_state",
+        payload=SaveStateData(checkpoint_path="/tmp/ckpt"),
     )
     output = await processor.execute_save_state(request)
     assert output.output_type == OutputType.SAVE_STATE
@@ -130,8 +136,10 @@ async def test_optim_and_checkpoint_operations(processor):
 
     # Load state
     request = OrchestratorRequest(
-        request_id="req-load", request_type=RequestType.ADD,
-        operation="load_state", payload=LoadStateData(checkpoint_path="/tmp/ckpt"),
+        request_id="req-load",
+        request_type=RequestType.ADD,
+        operation="load_state",
+        payload=LoadStateData(checkpoint_path="/tmp/ckpt"),
     )
     output = await processor.execute_load_state(request)
     assert output.output_type == OutputType.LOAD_STATE
@@ -139,16 +147,20 @@ async def test_optim_and_checkpoint_operations(processor):
 
     # Sleep
     request = OrchestratorRequest(
-        request_id="req-sleep", request_type=RequestType.ADD,
-        operation="sleep", payload=EmptyData(),
+        request_id="req-sleep",
+        request_type=RequestType.ADD,
+        operation="sleep",
+        payload=EmptyData(),
     )
     output = await processor.execute_sleep(request)
     assert output.output_type == OutputType.SLEEP
 
     # Wake up
     request = OrchestratorRequest(
-        request_id="req-wake", request_type=RequestType.ADD,
-        operation="wake_up", payload=EmptyData(),
+        request_id="req-wake",
+        request_type=RequestType.ADD,
+        operation="wake_up",
+        payload=EmptyData(),
     )
     output = await processor.execute_wake_up(request)
     assert output.output_type == OutputType.WAKE_UP
@@ -160,7 +172,8 @@ async def test_statistics_tracking(processor):
     initial = processor.total_operations
 
     request = OrchestratorRequest(
-        request_id="req-stat", request_type=RequestType.ADD,
+        request_id="req-stat",
+        request_type=RequestType.ADD,
         operation="forward_backward",
         payload=ModelPassData(data=[{"input_ids": [1, 2], "labels": [2, 3]}]),
     )
@@ -178,15 +191,18 @@ async def test_error_handling(processor):
     """Test error handling for empty datum list, missing labels, and sequential ops."""
     # Empty datum list
     request = OrchestratorRequest(
-        request_id="req-008", request_type=RequestType.ADD,
-        operation="forward_backward", payload=ModelPassData(data=[]),
+        request_id="req-008",
+        request_type=RequestType.ADD,
+        operation="forward_backward",
+        payload=ModelPassData(data=[]),
     )
     output = await processor.execute_forward_backward(request)
     assert output.output_type == OutputType.ERROR
 
     # Without labels (no valid tokens)
     request = OrchestratorRequest(
-        request_id="req-009", request_type=RequestType.ADD,
+        request_id="req-009",
+        request_type=RequestType.ADD,
         operation="forward_backward",
         payload=ModelPassData(data=[{"input_ids": [1, 2, 3, 4, 5]}]),
     )
@@ -196,7 +212,8 @@ async def test_error_handling(processor):
     # Multiple sequential operations
     for i in range(5):
         request = OrchestratorRequest(
-            request_id=f"req-seq-{i}", request_type=RequestType.ADD,
+            request_id=f"req-seq-{i}",
+            request_type=RequestType.ADD,
             operation="forward_backward",
             payload=ModelPassData(data=[{"input_ids": list(range(10)), "labels": list(range(1, 11))}]),
         )

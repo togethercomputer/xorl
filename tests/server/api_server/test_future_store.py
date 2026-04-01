@@ -3,17 +3,19 @@ Tests for FutureStore in xorl.
 """
 
 import asyncio
-import pytest
 import time
+
+import pytest
+
 
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
 from xorl.server.api_server.future_store import (
-    FutureStore,
-    FutureStatus,
     FutureEntry,
-    make_try_again_response,
+    FutureStatus,
+    FutureStore,
     make_failed_response,
+    make_try_again_response,
 )
 
 
@@ -47,22 +49,27 @@ class TestFutureStore:
                 return {"result": "success"}
 
             request_id = await future_store.create(
-                model_id="model-1", request_type="test",
-                process_fn=dummy_process, request_data={"test": "data"},
+                model_id="model-1",
+                request_type="test",
+                process_fn=dummy_process,
+                request_data={"test": "data"},
             )
             entry = future_store.get(request_id)
             assert entry is not None and entry.request_type == "test" and entry.model_id == "model-1"
 
             # --- Processing completes with results ---
             processed = asyncio.Event()
+
             async def slow_process(data):
                 await asyncio.sleep(0.1)
                 processed.set()
                 return {"result": data["value"] * 2}
 
             request_id = await future_store.create(
-                model_id="model-1", request_type="multiply",
-                process_fn=slow_process, request_data={"value": 5},
+                model_id="model-1",
+                request_type="multiply",
+                process_fn=slow_process,
+                request_data={"value": 5},
             )
             await asyncio.wait_for(processed.wait(), timeout=5.0)
             await asyncio.sleep(0.1)
@@ -74,8 +81,10 @@ class TestFutureStore:
                 raise ValueError("Invalid input data")
 
             request_id = await future_store.create(
-                model_id="model-1", request_type="fail",
-                process_fn=failing_process, request_data={},
+                model_id="model-1",
+                request_type="fail",
+                process_fn=failing_process,
+                request_data={},
             )
             await asyncio.sleep(0.2)
             entry = future_store.get(request_id)
@@ -101,8 +110,10 @@ class TestFutureStore:
             request_ids = []
             for i in range(5):
                 request_id = await future_store.create(
-                    model_id=f"model-{i}", request_type="track",
-                    process_fn=tracking_process, request_data={"index": i},
+                    model_id=f"model-{i}",
+                    request_type="track",
+                    process_fn=tracking_process,
+                    request_data={"index": i},
                 )
                 request_ids.append(request_id)
 
@@ -113,6 +124,7 @@ class TestFutureStore:
 
             # --- Stats ---
             completed_event = asyncio.Event()
+
             async def slow_process2(data):
                 await asyncio.sleep(0.1)
                 if data.get("index") == 2:
@@ -121,8 +133,10 @@ class TestFutureStore:
 
             for i in range(3):
                 await future_store.create(
-                    model_id=f"model-{i}", request_type="stats",
-                    process_fn=slow_process2, request_data={"index": i},
+                    model_id=f"model-{i}",
+                    request_type="stats",
+                    process_fn=slow_process2,
+                    request_data={"index": i},
                 )
             await asyncio.wait_for(completed_event.wait(), timeout=5.0)
             await asyncio.sleep(0.1)
@@ -137,15 +151,24 @@ class TestFutureStore:
         await future_store.start()
 
         try:
+
             async def dummy_process(data):
                 await asyncio.sleep(0.5)
                 return {"done": True}
 
             # --- List and delete by model ---
-            ids_1 = [await future_store.create(model_id="model-1", request_type="test",
-                      process_fn=dummy_process, request_data={"index": i}) for i in range(3)]
-            ids_2 = [await future_store.create(model_id="model-2", request_type="test",
-                      process_fn=dummy_process, request_data={"index": i}) for i in range(2)]
+            ids_1 = [
+                await future_store.create(
+                    model_id="model-1", request_type="test", process_fn=dummy_process, request_data={"index": i}
+                )
+                for i in range(3)
+            ]
+            ids_2 = [
+                await future_store.create(
+                    model_id="model-2", request_type="test", process_fn=dummy_process, request_data={"index": i}
+                )
+                for i in range(2)
+            ]
 
             assert len(future_store.list_by_model("model-1")) == 3
             assert len(future_store.list_by_model("model-2")) == 2
@@ -162,8 +185,9 @@ class TestFutureStore:
             async def fast_process(data):
                 return {"done": True}
 
-            rid = await future_store.create(model_id="model-1", request_type="test",
-                                            process_fn=fast_process, request_data={})
+            rid = await future_store.create(
+                model_id="model-1", request_type="test", process_fn=fast_process, request_data={}
+            )
             assert future_store.get(rid) is not None
             assert await future_store.delete(rid) is True
             assert future_store.get(rid) is None
@@ -174,14 +198,17 @@ class TestFutureStore:
 
             # --- Status and result tracking ---
             processed = asyncio.Event()
+
             async def slow_process(data):
                 await asyncio.sleep(0.1)
                 processed.set()
                 return {"value": 42}
 
             request_id = await future_store.create(
-                model_id="model-1", request_type="test",
-                process_fn=slow_process, request_data={},
+                model_id="model-1",
+                request_type="test",
+                process_fn=slow_process,
+                request_data={},
             )
             status = future_store.get_status(request_id)
             assert status in (FutureStatus.PENDING, FutureStatus.PROCESSING)
@@ -198,8 +225,10 @@ class TestFutureStore:
                 raise RuntimeError("Server crashed")
 
             request_id = await future_store.create(
-                model_id="model-1", request_type="test",
-                process_fn=failing_process, request_data={},
+                model_id="model-1",
+                request_type="test",
+                process_fn=failing_process,
+                request_data={},
             )
             await asyncio.sleep(0.2)
             error_info = future_store.get_error(request_id)
@@ -213,11 +242,15 @@ class TestFutureStore:
         short_ttl_store = FutureStore(default_ttl=0.1, max_concurrent=2, cleanup_interval=60.0)
         await short_ttl_store.start()
         try:
+
             async def dummy(data):
                 return {"done": True}
+
             request_id = await short_ttl_store.create(
-                model_id="model-1", request_type="test",
-                process_fn=dummy, request_data={},
+                model_id="model-1",
+                request_type="test",
+                process_fn=dummy,
+                request_data={},
             )
             await asyncio.sleep(0.15)
             assert short_ttl_store.get(request_id).status == FutureStatus.EXPIRED
@@ -228,8 +261,11 @@ class TestFutureStore:
         await future_store.start()
         try:
             request_id = await future_store.create(
-                model_id="model-1", request_type="test",
-                process_fn=dummy, request_data={}, ttl=3600.0,
+                model_id="model-1",
+                request_type="test",
+                process_fn=dummy,
+                request_data={},
+                ttl=3600.0,
             )
             assert future_store.get(request_id).expires_at > time.time() + 3500
         finally:

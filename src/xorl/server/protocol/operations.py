@@ -12,8 +12,10 @@ These types are shared by both protocol layers:
 """
 
 import os
-from dataclasses import asdict, dataclass, field, fields as dc_fields
+from dataclasses import asdict, dataclass, field
+from dataclasses import fields as dc_fields
 from typing import Any, Dict, List, Optional, Union
+
 
 # ============================================================================
 # Timeout Constants (shared by engine/executor and backend/remote)

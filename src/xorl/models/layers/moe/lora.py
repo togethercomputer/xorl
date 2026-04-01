@@ -15,17 +15,18 @@ LoRA weight parameter names are preserved exactly for checkpoint compatibility::
     down_proj_lora_A: [E, inter, r]      down_proj_lora_B: [E, r, hidden]
 """
 
-from dataclasses import dataclass, field
 import math
-from typing import Optional, List
+from dataclasses import dataclass
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
 
-from ....ops.group_gemm.kernel import compute_lora_scaling
 from ....lora.modules.base import LoraModule
+from ....ops.group_gemm.kernel import compute_lora_scaling
 from ....utils import logging
 from ..activations import ACT2FN
+
 
 logger = logging.get_logger(__name__)
 
@@ -43,7 +44,6 @@ class MoELoRAConfig:
     def __post_init__(self):
         if self.target_modules is None:
             self.target_modules = ["gate_proj", "up_proj", "down_proj"]
-
 
 
 class MoEExpertsLoRA(LoraModule, nn.Module):
@@ -193,12 +193,11 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
 
         # Check EP — use unified dispatch/compute/combine path
         from xorl.distributed.parallel_state import get_parallel_state
+
         parallel_state = get_parallel_state()
 
         if parallel_state.ep_enabled:
-            return self._ep_forward(
-                hidden_states, routing_weights, selected_experts, parallel_state
-            )
+            return self._ep_forward(hidden_states, routing_weights, selected_experts, parallel_state)
 
         # Local path — registry-based
         from .backend import MOE_EXPERT_BACKENDS_LORA
@@ -233,7 +232,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         Uses the same dispatch/combine as ``MoEExperts._ep_forward()`` but
         routes to the LoRA-aware EP compute registry.
         """
-        from .backend import EP_DISPATCH, EP_COMBINE, EP_EXPERT_COMPUTE_LORA
+        from .backend import EP_COMBINE, EP_DISPATCH, EP_EXPERT_COMPUTE_LORA
 
         if self.moe_implementation not in EP_EXPERT_COMPUTE_LORA:
             raise ValueError(
@@ -242,8 +241,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
             )
         if self.ep_dispatch not in EP_DISPATCH:
             raise ValueError(
-                f"ep_dispatch={self.ep_dispatch!r} is not available. "
-                f"Available: {list(EP_DISPATCH.keys())}"
+                f"ep_dispatch={self.ep_dispatch!r} is not available. Available: {list(EP_DISPATCH.keys())}"
             )
 
         dispatch_fn = EP_DISPATCH[self.ep_dispatch]
@@ -251,25 +249,27 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         compute_fn = EP_EXPERT_COMPUTE_LORA[self.moe_implementation]
 
         # Step 1: Dispatch tokens to expert-owning ranks
-        dispatch_kwargs = self._build_dispatch_kwargs(
-            hidden_states, routing_weights, selected_experts, parallel_state
-        )
+        dispatch_kwargs = self._build_dispatch_kwargs(hidden_states, routing_weights, selected_experts, parallel_state)
         permute_tokens, cumsum, ctx = dispatch_fn(**dispatch_kwargs)
 
         # Step 2: Expert computation with LoRA
         expert_output = compute_fn(
-            permute_tokens, cumsum,
-            self.gate_proj, self.up_proj, self.down_proj,
-            self.gate_proj_lora_A, self.gate_proj_lora_B,
-            self.up_proj_lora_A, self.up_proj_lora_B,
-            self.down_proj_lora_A, self.down_proj_lora_B,
+            permute_tokens,
+            cumsum,
+            self.gate_proj,
+            self.up_proj,
+            self.down_proj,
+            self.gate_proj_lora_A,
+            self.gate_proj_lora_B,
+            self.up_proj_lora_A,
+            self.up_proj_lora_B,
+            self.down_proj_lora_A,
+            self.down_proj_lora_B,
             self.scaling,
         )
 
         # Step 3: Combine expert outputs back to original ranks
-        combine_kwargs = self._build_combine_kwargs(
-            expert_output, ctx, dispatch_kwargs, parallel_state
-        )
+        combine_kwargs = self._build_combine_kwargs(expert_output, ctx, dispatch_kwargs, parallel_state)
         return combine_fn(**combine_kwargs)
 
     def _build_dispatch_kwargs(self, hidden_states, routing_weights, selected_experts, parallel_state):
@@ -284,6 +284,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
             kwargs["ep_group"] = parallel_state.ep_group
         elif self.ep_dispatch == "deepep":
             from xorl.distributed.moe.deepep import get_default_buffer
+
             kwargs["buffer"] = get_default_buffer(
                 ep_group=parallel_state.ep_group,
                 buffer_size_gb=self.deepep_buffer_size_gb,
@@ -439,10 +440,7 @@ def inject_lora_into_experts(
 
     block.experts = lora_experts
 
-    logger.debug(
-        f"Injected MoE LoRA with r={r}, alpha={lora_alpha}, "
-        f"target_modules={target_modules}"
-    )
+    logger.debug(f"Injected MoE LoRA with r={r}, alpha={lora_alpha}, target_modules={target_modules}")
 
 
 # ---------------------------------------------------------------------------

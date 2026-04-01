@@ -8,7 +8,8 @@ import pytest
 import torch
 import triton
 
-from xorl.ops.quantize import block_fp8_quantize_gkn, block_fp8_dequantize_gkn
+from xorl.ops.quantize import block_fp8_dequantize_gkn, block_fp8_quantize_gkn
+
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -109,6 +110,7 @@ class TestBlockFP8DequantizeGKN:
 # Bandwidth benchmarks
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.benchmark
 class TestBlockFP8GKNBandwidth:
     """Bandwidth tests targeting >2000 GB/s on H100."""
@@ -132,7 +134,7 @@ class TestBlockFP8GKNBandwidth:
         elapsed_ms = start.elapsed_time(end) / 100
         total_bytes = K * N * (4 + 1)
         bw_quant = total_bytes / (elapsed_ms * 1e-3) / 1e9
-        print(f"\nblock_fp8_quantize_gkn: {bw_quant:.0f} GB/s ({elapsed_ms*1000:.1f} us)")
+        print(f"\nblock_fp8_quantize_gkn: {bw_quant:.0f} GB/s ({elapsed_ms * 1000:.1f} us)")
         assert bw_quant > 2000, f"Quant bandwidth {bw_quant:.0f} GB/s < 2000 GB/s"
 
         # --- Dequantize bandwidth ---
@@ -150,5 +152,5 @@ class TestBlockFP8GKNBandwidth:
         elapsed_ms2 = start2.elapsed_time(end2) / 100
         total_bytes2 = K * N * (1 + 4)
         bw_dequant = total_bytes2 / (elapsed_ms2 * 1e-3) / 1e9
-        print(f"\nblock_fp8_dequantize_gkn: {bw_dequant:.0f} GB/s ({elapsed_ms2*1000:.1f} us)")
+        print(f"\nblock_fp8_dequantize_gkn: {bw_dequant:.0f} GB/s ({elapsed_ms2 * 1000:.1f} us)")
         assert bw_dequant > 2000, f"Dequant bandwidth {bw_dequant:.0f} GB/s < 2000 GB/s"

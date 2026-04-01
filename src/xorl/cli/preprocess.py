@@ -3,7 +3,7 @@
 import json
 import os
 import sys
-from dataclasses import asdict, replace
+from dataclasses import asdict
 
 import yaml
 
@@ -20,7 +20,8 @@ from xorl.data.prepare.prepare_datasets import (
     generate_dataset_hash_from_config,
 )
 from xorl.models import build_tokenizer
-from xorl.utils import helper, logging
+from xorl.utils import logging
+
 
 logger = logging.get_logger(__name__)
 
@@ -30,23 +31,23 @@ def load_config_without_validation(config_path: str) -> Arguments:
 
     This is needed for preprocessing which doesn't require distributed setup.
     """
-    with open(config_path, 'r') as f:
+    with open(config_path, "r") as f:
         config = yaml.safe_load(f)
 
     # Extract each section
-    model_config = config.get('model', {})
-    data_config = config.get('data', {})
-    train_config = config.get('train', {})
-    distill_config = config.get('distill', {})
+    model_config = config.get("model", {})
+    data_config = config.get("data", {})
+    train_config = config.get("train", {})
+    distill_config = config.get("distill", {})
 
     # Override parallel settings to avoid validation errors
     # Set all parallel sizes to 1 for preprocessing
     train_config_override = {
         **train_config,
-        'ulysses_parallel_size': 1,
-        'expert_parallel_size': 1,
-        'data_parallel_replicate_size': 1,
-        'data_parallel_shard_size': 1,
+        "ulysses_parallel_size": 1,
+        "expert_parallel_size": 1,
+        "data_parallel_replicate_size": 1,
+        "data_parallel_shard_size": 1,
     }
 
     # Create Arguments object
@@ -97,11 +98,9 @@ def main():
         )
 
         # Generate hash for logging
-        train_hash = generate_dataset_hash_from_config(
-            args, args.data.datasets, tokenizer.name_or_path
-        )
+        train_hash = generate_dataset_hash_from_config(args, args.data.datasets, tokenizer.name_or_path)
 
-        logger.info(f"Training dataset preprocessed successfully!")
+        logger.info("Training dataset preprocessed successfully!")
         logger.info(f"  - Dataset hash: {train_hash}")
         logger.info(f"  - Number of examples: {len(train_dataset)}")
 
@@ -122,11 +121,9 @@ def main():
         )
 
         # Generate hash for logging
-        test_hash = generate_dataset_hash_from_config(
-            args, args.data.test_datasets, tokenizer.name_or_path
-        )
+        test_hash = generate_dataset_hash_from_config(args, args.data.test_datasets, tokenizer.name_or_path)
 
-        logger.info(f"Test dataset preprocessed successfully!")
+        logger.info("Test dataset preprocessed successfully!")
         logger.info(f"  - Dataset hash: {test_hash}")
         logger.info(f"  - Number of examples: {len(test_dataset)}")
 

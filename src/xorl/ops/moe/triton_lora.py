@@ -7,7 +7,9 @@ in ``lora``, parameterised with Triton group GEMM kernels.
 import torch
 
 from xorl.ops.group_gemm.kernel import group_gemm_same_mn, group_gemm_same_nk
+
 from .lora import make_ep_lora_compute, make_local_lora_compute
+
 
 # EP LoRA compute (Expert Parallelism)
 TritonEPGroupGemmWithLoRA = make_ep_lora_compute(group_gemm_same_nk, group_gemm_same_mn)
@@ -39,7 +41,18 @@ def triton_moe_lora_forward(
     EP is handled centrally by ``MoEExpertsLoRA._ep_forward()``.
     """
     return TritonMoeExpertsLoRAFunction.apply(
-        num_experts, routing_weights.to(hidden_states.dtype), selected_experts, hidden_states,
-        gate_proj, up_proj, down_proj,
-        gate_proj_lora_A, gate_proj_lora_B, up_proj_lora_A, up_proj_lora_B, down_proj_lora_A, down_proj_lora_B, scaling,
+        num_experts,
+        routing_weights.to(hidden_states.dtype),
+        selected_experts,
+        hidden_states,
+        gate_proj,
+        up_proj,
+        down_proj,
+        gate_proj_lora_A,
+        gate_proj_lora_B,
+        up_proj_lora_A,
+        up_proj_lora_B,
+        down_proj_lora_A,
+        down_proj_lora_B,
+        scaling,
     )

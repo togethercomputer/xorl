@@ -1,21 +1,23 @@
-from typing import Tuple, Optional, Callable
 from functools import partial
-from torch import Tensor
-from .gemm_act import GemmActMixin, act_fn_map, gemm_act
-from .gemm_sm90 import GemmSm90
-from .gemm_sm100 import GemmSm100
-from .tile_scheduler import TriangularTileScheduler
-from .gemm_wrapper_utils import GemmWrapperBase
-from .cute_dsl_utils import get_device_capacity, get_max_active_clusters
-from .varlen_utils import VarlenManager
-from . import copy_utils
+from typing import Callable, Optional, Tuple
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
-from cutlass.cute.runtime import make_ptr
-from cutlass import Int32, Float32, Boolean, const_expr
-import cutlass.utils.hopper_helpers as sm90_utils_og
 import cutlass.utils.blackwell_helpers as sm100_utils
+import cutlass.utils.hopper_helpers as sm90_utils_og
+from cutlass import Boolean, Float32, Int32, const_expr
+from cutlass.cute.runtime import make_ptr
+from torch import Tensor
+
+from . import copy_utils
+from .cute_dsl_utils import get_device_capacity, get_max_active_clusters
+from .gemm_act import GemmActMixin, act_fn_map, gemm_act
+from .gemm_sm90 import GemmSm90
+from .gemm_sm100 import GemmSm100
+from .gemm_wrapper_utils import GemmWrapperBase
+from .tile_scheduler import TriangularTileScheduler
+from .varlen_utils import VarlenManager
 
 
 class GemmSymmetricMixin(GemmActMixin, GemmSm90):
@@ -62,9 +64,7 @@ class GemmSymmetricMixin(GemmActMixin, GemmSm90):
             if self.arch == 100
             else sm90_utils_og.sm90_get_smem_store_op
         )
-        copy_atom_postact_r2s = get_smem_store_op(
-            self.postact_layout, self.postact_dtype, self.acc_dtype
-        )
+        copy_atom_postact_r2s = get_smem_store_op(self.postact_layout, self.postact_dtype, self.acc_dtype)
         # tiled_copy_C_atom = self.epilog_smem_copy_atom(tiled_mma)
         # tiled_copy_postact_r2s = cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_C_atom)
         tiled_copy_postact_r2s = cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_r2s)
@@ -82,9 +82,7 @@ class GemmSymmetricMixin(GemmActMixin, GemmSm90):
         )
 
         # We iterate over epi tiles in the N dimension first before the M dimension
-        epi_tile_shape = cute.zipped_divide(
-            cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile
-        ).shape[1]
+        epi_tile_shape = cute.zipped_divide(cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile).shape[1]
         epi_tile_layout = cute.make_layout(epi_tile_shape, stride=(epi_tile_shape[1], 1))
         epi_tile_num = cute.size(epi_tile_shape)
         num_prev_subtiles = tile_scheduler.num_tiles_executed * epi_tile_num
@@ -198,7 +196,7 @@ def gemm_symmetric(
     alpha: float | Tensor = 1.0,
     beta: float | Tensor = 1.0,
 ) -> None:
-    # Tranpose D so the "activation" is a write to the mirrored tile
+    # Transpose D so the "activation" is a write to the mirrored tile
     PostAct = D.mT
 
     L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(

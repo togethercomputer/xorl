@@ -7,18 +7,19 @@ Integration tests with Orchestrator are excluded as they require complex infrast
 
 import pytest
 
+
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
-from xorl.server.api_server.server import APIServer
 from xorl.server.api_server.api_types import (
+    AdamParams,
     Datum,
     DatumInput,
     ForwardBackwardRequest,
+    LoadWeightsRequest,
     OptimStepRequest,
     SaveWeightsRequest,
-    LoadWeightsRequest,
-    AdamParams,
 )
+from xorl.server.api_server.server import APIServer
 
 
 class TestAPIServerConfiguration:
@@ -69,10 +70,12 @@ class TestAPIRequestCreationAndSerialization:
 
         # Multiple samples with default model_id
         request = ForwardBackwardRequest(
-            forward_backward_input=DatumInput(data=[
-                Datum(model_input={"input_ids": [1, 2]}, loss_fn_inputs={"labels": [2, 3]}),
-                Datum(model_input={"input_ids": [3, 4]}, loss_fn_inputs={"labels": [4, 5]}),
-            ]),
+            forward_backward_input=DatumInput(
+                data=[
+                    Datum(model_input={"input_ids": [1, 2]}, loss_fn_inputs={"labels": [2, 3]}),
+                    Datum(model_input={"input_ids": [3, 4]}, loss_fn_inputs={"labels": [4, 5]}),
+                ]
+            ),
         )
         assert len(request.forward_backward_input.data) == 2
         assert request.model_id == "default"

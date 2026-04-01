@@ -196,9 +196,7 @@ class OrchestratorOutputs:
     def __repr__(self) -> str:
         status = "finished" if self.finished else "streaming"
         error_str = f", error='{self.error}'" if self.error else ""
-        return (
-            f"OrchestratorOutputs(id={self.request_id[:8]}..., type={self.output_type.value}, status={status}{error_str})"
-        )
+        return f"OrchestratorOutputs(id={self.request_id[:8]}..., type={self.output_type.value}, status={status}{error_str})"
 
 
 # ============================================================================
@@ -243,8 +241,11 @@ def create_forward_backward_output(
     if additional_metrics:
         outputs_data.update(additional_metrics)
     return OrchestratorOutputs(
-        request_id=request_id, output_type=OutputType.FORWARD_BACKWARD,
-        outputs=[outputs_data], finished=True, error=error,
+        request_id=request_id,
+        output_type=OutputType.FORWARD_BACKWARD,
+        outputs=[outputs_data],
+        finished=True,
+        error=error,
     )
 
 
@@ -268,8 +269,11 @@ def create_optim_step_output(
     if additional_metrics:
         outputs_data.update(additional_metrics)
     return OrchestratorOutputs(
-        request_id=request_id, output_type=OutputType.OPTIM_STEP,
-        outputs=[outputs_data], finished=True, error=error,
+        request_id=request_id,
+        output_type=OutputType.OPTIM_STEP,
+        outputs=[outputs_data],
+        finished=True,
+        error=error,
     )
 
 
@@ -281,8 +285,11 @@ def create_save_state_output(
 ) -> OrchestratorOutputs:
     """Create a save checkpoint output response."""
     return _build_output(
-        request_id, OutputType.SAVE_STATE, error=error,
-        success=success, checkpoint_path=checkpoint_path,
+        request_id,
+        OutputType.SAVE_STATE,
+        error=error,
+        success=success,
+        checkpoint_path=checkpoint_path,
     )
 
 
@@ -294,8 +301,11 @@ def create_save_lora_only_output(
 ) -> OrchestratorOutputs:
     """Create a save LoRA-only output response."""
     return _build_output(
-        request_id, OutputType.SAVE_LORA_ONLY, error=error,
-        success=success, lora_path=lora_path,
+        request_id,
+        OutputType.SAVE_LORA_ONLY,
+        error=error,
+        success=success,
+        lora_path=lora_path,
     )
 
 
@@ -307,8 +317,11 @@ def create_load_state_output(
 ) -> OrchestratorOutputs:
     """Create a load checkpoint output response."""
     return _build_output(
-        request_id, OutputType.LOAD_STATE, error=error,
-        success=success, checkpoint_path=checkpoint_path,
+        request_id,
+        OutputType.LOAD_STATE,
+        error=error,
+        success=success,
+        checkpoint_path=checkpoint_path,
     )
 
 
@@ -322,8 +335,13 @@ def create_save_adapter_state_output(
 ) -> OrchestratorOutputs:
     """Create a save adapter state output response."""
     return _build_output(
-        request_id, OutputType.SAVE_ADAPTER_STATE, error=error,
-        success=success, model_id=model_id, path=path, step=step,
+        request_id,
+        OutputType.SAVE_ADAPTER_STATE,
+        error=error,
+        success=success,
+        model_id=model_id,
+        path=path,
+        step=step,
     )
 
 
@@ -337,8 +355,13 @@ def create_load_adapter_state_output(
 ) -> OrchestratorOutputs:
     """Create a load adapter state output response."""
     return _build_output(
-        request_id, OutputType.LOAD_ADAPTER_STATE, error=error,
-        success=success, model_id=model_id, path=path, step=step,
+        request_id,
+        OutputType.LOAD_ADAPTER_STATE,
+        error=error,
+        success=success,
+        model_id=model_id,
+        path=path,
+        step=step,
     )
 
 
@@ -359,8 +382,11 @@ def create_health_check_output(
     if additional_info:
         outputs_data.update(additional_info)
     return OrchestratorOutputs(
-        request_id=request_id, output_type=OutputType.HEALTH_CHECK,
-        outputs=[outputs_data], finished=True, error=error,
+        request_id=request_id,
+        output_type=OutputType.HEALTH_CHECK,
+        outputs=[outputs_data],
+        finished=True,
+        error=error,
     )
 
 
@@ -372,8 +398,11 @@ def create_sleep_output(
 ) -> OrchestratorOutputs:
     """Create a sleep output response."""
     return _build_output(
-        request_id, OutputType.SLEEP, error=error,
-        status=status, offload_time=offload_time,
+        request_id,
+        OutputType.SLEEP,
+        error=error,
+        status=status,
+        offload_time=offload_time,
     )
 
 
@@ -385,8 +414,11 @@ def create_wake_up_output(
 ) -> OrchestratorOutputs:
     """Create a wake_up output response."""
     return _build_output(
-        request_id, OutputType.WAKE_UP, error=error,
-        status=status, load_time=load_time,
+        request_id,
+        OutputType.WAKE_UP,
+        error=error,
+        status=status,
+        load_time=load_time,
     )
 
 
@@ -403,10 +435,16 @@ def create_sync_weights_output(
 ) -> OrchestratorOutputs:
     """Create a sync inference weights output response."""
     return _build_output(
-        request_id, OutputType.SYNC_INFERENCE_WEIGHTS, error=error,
-        success=success, message=message, transfer_time=transfer_time,
-        total_bytes=total_bytes, num_parameters=num_parameters,
-        num_buckets=num_buckets, endpoint_results=endpoint_results or [],
+        request_id,
+        OutputType.SYNC_INFERENCE_WEIGHTS,
+        error=error,
+        success=success,
+        message=message,
+        transfer_time=transfer_time,
+        total_bytes=total_bytes,
+        num_parameters=num_parameters,
+        num_buckets=num_buckets,
+        endpoint_results=endpoint_results or [],
     )
 
 
@@ -417,8 +455,11 @@ def create_error_output(
 ) -> OrchestratorOutputs:
     """Create an error output response."""
     return OrchestratorOutputs(
-        request_id=request_id, output_type=operation_type,
-        outputs=[], finished=True, error=error_message,
+        request_id=request_id,
+        output_type=operation_type,
+        outputs=[],
+        finished=True,
+        error=error_message,
     )
 
 

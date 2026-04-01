@@ -144,6 +144,7 @@ class AllToAllDispatchContext:
     Carries all information between ``alltoall_pre_dispatch()`` and
     ``alltoall_post_combine()`` so the EP compute step is stateless.
     """
+
     input_splits: List[int]
     output_splits: List[int]
     num_tokens_per_expert: torch.Tensor
@@ -180,9 +181,7 @@ def alltoall_pre_dispatch(
         - cumsum: Cumulative sum of tokens per local expert ``[num_local_experts]``.
         - ctx: :class:`AllToAllDispatchContext` for ``alltoall_post_combine()``.
     """
-    expert_mask = F.one_hot(
-        selected_experts, num_classes=num_experts
-    ).permute(2, 1, 0)
+    expert_mask = F.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
 
     input_splits, output_splits, num_tokens_per_expert, sum_tokens = preprocess(
         expert_mask=expert_mask,

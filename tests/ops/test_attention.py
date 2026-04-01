@@ -1,14 +1,17 @@
 """Tests for attention backend functions."""
 
-import pytest
-import torch
 from unittest.mock import Mock, patch
 
-from xorl.models.layers.attention.utils import repeat_kv
+import pytest
+import torch
+
 from xorl.models.layers.attention.backend.eager import eager_attention_forward
+from xorl.models.layers.attention.utils import repeat_kv
+
 
 try:
     from xorl.models.layers.attention.backend.flash_attention import flash_attention_forward
+
     _FLASH_ATTN_IMPORT_ERROR = None
 except ImportError as exc:
     flash_attention_forward = None
@@ -72,20 +75,29 @@ class TestFlashAttentionForward:
         key = torch.randn(batch, seqlen, num_heads, head_dim)
         value = torch.randn(batch, seqlen, num_heads, head_dim)
 
-        with patch('xorl.models.layers.attention.backend.flash_attention.flash_attn_func') as mock_fa:
+        with patch("xorl.models.layers.attention.backend.flash_attention.flash_attn_func") as mock_fa:
             mock_fa.return_value = torch.zeros(batch, seqlen, num_heads, head_dim)
 
             # output_attentions warning
-            with patch('xorl.models.layers.attention.backend.flash_attention.logger') as mock_logger:
+            with patch("xorl.models.layers.attention.backend.flash_attention.logger") as mock_logger:
                 flash_attention_forward(
-                    module, query, key, value, attention_mask=None, output_attentions=True,
+                    module,
+                    query,
+                    key,
+                    value,
+                    attention_mask=None,
+                    output_attentions=True,
                 )
                 assert mock_logger.warning_once.called
 
             # head_mask warning
-            with patch('xorl.models.layers.attention.backend.flash_attention.logger') as mock_logger:
+            with patch("xorl.models.layers.attention.backend.flash_attention.logger") as mock_logger:
                 flash_attention_forward(
-                    module, query, key, value, attention_mask=None,
+                    module,
+                    query,
+                    key,
+                    value,
+                    attention_mask=None,
                     head_mask=torch.ones(num_heads),
                 )
                 assert mock_logger.warning_once.called
@@ -93,29 +105,48 @@ class TestFlashAttentionForward:
             # is_causal kwarg popped, module.is_causal used
             module.is_causal = False
             flash_attention_forward(
-                module, query, key, value, attention_mask=None, is_causal=True,
+                module,
+                query,
+                key,
+                value,
+                attention_mask=None,
+                is_causal=True,
             )
-            assert mock_fa.call_args[1]['causal'] == False
+            assert mock_fa.call_args[1]["causal"] == False
 
             # Returns None attention weights
             module.is_causal = True
             result, attn_weights = flash_attention_forward(
-                module, query, key, value, attention_mask=None,
+                module,
+                query,
+                key,
+                value,
+                attention_mask=None,
             )
             assert result.shape == (batch, seqlen, num_heads, head_dim)
             assert attn_weights is None
 
             # Scaling passed as softmax_scale
             flash_attention_forward(
-                module, query, key, value, attention_mask=None, scaling=0.125,
+                module,
+                query,
+                key,
+                value,
+                attention_mask=None,
+                scaling=0.125,
             )
-            assert mock_fa.call_args[1]['softmax_scale'] == 0.125
+            assert mock_fa.call_args[1]["softmax_scale"] == 0.125
 
             # Sliding window -> window_size tuple
             flash_attention_forward(
-                module, query, key, value, attention_mask=None, sliding_window=128,
+                module,
+                query,
+                key,
+                value,
+                attention_mask=None,
+                sliding_window=128,
             )
-            assert mock_fa.call_args[1]['window_size'] == (128, 0)
+            assert mock_fa.call_args[1]["window_size"] == (128, 0)
 
     def test_varlen_path_with_cu_seqlens(self):
         """cu_seqlens kwargs trigger the varlen path."""
@@ -128,15 +159,21 @@ class TestFlashAttentionForward:
         value = torch.randn(1, total_tokens, num_heads, head_dim)
         cu_seqlens = torch.tensor([0, 16, 32], dtype=torch.int64)
 
-        with patch('xorl.models.layers.attention.backend.flash_attention.flash_attn_varlen_func') as mock_varlen:
+        with patch("xorl.models.layers.attention.backend.flash_attention.flash_attn_varlen_func") as mock_varlen:
             mock_varlen.return_value = torch.zeros(total_tokens, num_heads, head_dim)
             result, _ = flash_attention_forward(
-                module, query, key, value, attention_mask=None,
-                cu_seq_lens_q=cu_seqlens, cu_seq_lens_k=cu_seqlens,
-                max_length_q=16, max_length_k=16,
+                module,
+                query,
+                key,
+                value,
+                attention_mask=None,
+                cu_seq_lens_q=cu_seqlens,
+                cu_seq_lens_k=cu_seqlens,
+                max_length_q=16,
+                max_length_k=16,
             )
             assert mock_varlen.called
-            assert mock_varlen.call_args[1]['cu_seqlens_q'].dtype == torch.int32
+            assert mock_varlen.call_args[1]["cu_seqlens_q"].dtype == torch.int32
             assert result.shape == (1, total_tokens, num_heads, head_dim)
 
     @pytest.mark.gpu
@@ -177,8 +214,13 @@ class TestEagerAttentionForward:
         value = torch.randn(batch, seq, kv_heads, head_dim)
 
         attn_output, attn_weights = eager_attention_forward(
-            module=module, query=query, key=key, value=value,
-            attention_mask=None, scaling=head_dim**-0.5, dropout=0.0,
+            module=module,
+            query=query,
+            key=key,
+            value=value,
+            attention_mask=None,
+            scaling=head_dim**-0.5,
+            dropout=0.0,
         )
         assert attn_output.shape == (batch, seq, q_heads, head_dim)
         assert attn_weights.shape == (batch, q_heads, seq, seq)
@@ -187,7 +229,10 @@ class TestEagerAttentionForward:
         with pytest.raises(RuntimeError, match="query_heads=3 is not divisible by kv_heads=2"):
             eager_attention_forward(
                 module=module,
-                query=torch.randn(1, 4, 3, 8), key=torch.randn(1, 4, 2, 8),
+                query=torch.randn(1, 4, 3, 8),
+                key=torch.randn(1, 4, 2, 8),
                 value=torch.randn(1, 4, 2, 8),
-                attention_mask=None, scaling=8**-0.5, dropout=0.0,
+                attention_mask=None,
+                scaling=8**-0.5,
+                dropout=0.0,
             )

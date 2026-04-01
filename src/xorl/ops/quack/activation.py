@@ -1,13 +1,13 @@
 # Copyright (c) 2025, Tri Dao.
 
 import math
-from typing import Tuple
 from functools import partial
+from typing import Tuple
 
 import cutlass.cute as cute
-from cutlass import Float32, Boolean, const_expr
-from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass import Boolean, Float32, const_expr
 from cutlass._mlir.dialects import llvm, nvvm
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 
 F32_or_F32x2 = Float32 | Tuple[Float32, Float32]
@@ -62,9 +62,7 @@ def relu(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
 
 @dsl_user_op
 @cute.jit
-def drelu(
-    x: F32_or_F32x2, dout: F32_or_F32x2, *, loc=None, ip=None
-) -> Tuple[F32_or_F32x2, F32_or_F32x2]:
+def drelu(x: F32_or_F32x2, dout: F32_or_F32x2, *, loc=None, ip=None) -> Tuple[F32_or_F32x2, F32_or_F32x2]:
     if const_expr(not isinstance(x, tuple)):
         x_pos = Boolean(x > 0)
         return dout if x_pos else Float32(0.0), cute.arch.fmax(x, Float32(0.0))
@@ -86,9 +84,7 @@ def relu_sq(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
 
 @dsl_user_op
 @cute.jit
-def drelu_sq(
-    x: F32_or_F32x2, dout: F32_or_F32x2, *, loc=None, ip=None
-) -> Tuple[F32_or_F32x2, F32_or_F32x2]:
+def drelu_sq(x: F32_or_F32x2, dout: F32_or_F32x2, *, loc=None, ip=None) -> Tuple[F32_or_F32x2, F32_or_F32x2]:
     """
     ReLU squared backward pass: computes gradient w.r.t. x and recomputes forward
     Given: relu_sq_out = max(x, 0) * x, and dout = grad w.r.t. relu_sq_out
@@ -136,9 +132,7 @@ def gelu_tanh_approx(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
 
 
 @dsl_user_op
-def dgelu_tanh_approx(
-    x: F32_or_F32x2, dout: F32_or_F32x2, *, loc=None, ip=None
-) -> Tuple[F32_or_F32x2, F32_or_F32x2]:
+def dgelu_tanh_approx(x: F32_or_F32x2, dout: F32_or_F32x2, *, loc=None, ip=None) -> Tuple[F32_or_F32x2, F32_or_F32x2]:
     """
     GELU tanh approximation backward pass: computes gradient w.r.t. x and recomputes forward
     Given: gelu_out = 0.5 * x * (1 + tanh(x * (c1 + c2 * x^2))), and dout = grad w.r.t. gelu_out
@@ -203,11 +197,7 @@ def dgelu_tanh_approx(
 def softplus(x: F32_or_F32x2, *, loc=None, ip=None) -> F32_or_F32x2:
     if const_expr(not isinstance(x, tuple)):
         use_linear = Boolean(x > 20.0)
-        return (
-            cute.math.log(Float32(cute.math.exp(x, fastmath=True)) + 1.0, fastmath=True)
-            if not use_linear
-            else x
-        )
+        return cute.math.log(Float32(cute.math.exp(x, fastmath=True)) + 1.0, fastmath=True) if not use_linear else x
     else:
         log2_e = math.log2(math.e)
         x_log2e = cute.arch.mul_packed_f32x2(x, (log2_e, log2_e))
@@ -314,12 +304,8 @@ def dswiglu(
             silu_x = cute.arch.fma_packed_f32x2(x, tanh_x, x)
         silu_x_dout = cute.arch.mul_packed_f32x2(silu_x, dout)
         # d_silu(x) * dout = (sigmoid_x - silu_x * sigmoid_x) * dout + silu_x * dout
-        sigmoid_x_minus_silu_x_sigmoid_x = cute.arch.fma_packed_f32x2(
-            sigmoid_x, (-silu_x[0], -silu_x[1]), sigmoid_x
-        )
-        d_silu_x_dout = cute.arch.fma_packed_f32x2(
-            sigmoid_x_minus_silu_x_sigmoid_x, dout, silu_x_dout
-        )
+        sigmoid_x_minus_silu_x_sigmoid_x = cute.arch.fma_packed_f32x2(sigmoid_x, (-silu_x[0], -silu_x[1]), sigmoid_x)
+        d_silu_x_dout = cute.arch.fma_packed_f32x2(sigmoid_x_minus_silu_x_sigmoid_x, dout, silu_x_dout)
         dx = cute.arch.mul_packed_f32x2(d_silu_x_dout, y)
         dy = silu_x_dout
         swiglu_out = cute.arch.mul_packed_f32x2(silu_x, y)
@@ -327,9 +313,7 @@ def dswiglu(
 
 
 @dsl_user_op
-def swiglu_oai(
-    x: F32_or_F32x2, y: F32_or_F32x2, alpha: float = 1.702, *, loc=None, ip=None
-) -> F32_or_F32x2:
+def swiglu_oai(x: F32_or_F32x2, y: F32_or_F32x2, alpha: float = 1.702, *, loc=None, ip=None) -> F32_or_F32x2:
     """The swiglu variant used in gpt-oss, which has a scaling factor on x and bias of 1 to y.
     https://github.com/openai/gpt-oss/blob/7be9334950053a888e24887a57dac797a17d6e00/gpt_oss/torch/model.py#L249
     x * sigmoid(alpha * x) * (y + 1)
@@ -384,12 +368,8 @@ def dswiglu_oai(
         silu_x = cute.arch.mul_packed_f32x2(x, sigmoid_alpha_x)
         silu_x_dout = cute.arch.mul_packed_f32x2(silu_x, dout)
         # d_silu_x_dout = (sigmoid_alpha_x + alpha * (silu_x - silu_x * sigmoid_alpha_x)) * dout
-        silu_x_minus_product = cute.arch.fma_packed_f32x2(
-            silu_x, (-sigmoid_alpha_x[0], -sigmoid_alpha_x[1]), silu_x
-        )
-        sigmoid_plus_alpha_diff = cute.arch.fma_packed_f32x2(
-            (alpha, alpha), silu_x_minus_product, sigmoid_alpha_x
-        )
+        silu_x_minus_product = cute.arch.fma_packed_f32x2(silu_x, (-sigmoid_alpha_x[0], -sigmoid_alpha_x[1]), silu_x)
+        sigmoid_plus_alpha_diff = cute.arch.fma_packed_f32x2((alpha, alpha), silu_x_minus_product, sigmoid_alpha_x)
         d_silu_x_dout = cute.arch.mul_packed_f32x2(sigmoid_plus_alpha_diff, dout)
         dx = cute.arch.fma_packed_f32x2(d_silu_x_dout, y, d_silu_x_dout)
         dy = silu_x_dout

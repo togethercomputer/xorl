@@ -204,8 +204,14 @@ def drgrpo_loss_function(
     hidden_states_flat = hidden_states.reshape(-1, H)
 
     per_token_ce = compute_per_token_ce(
-        hidden_states_flat, weight, labels_flat, ignore_index,
-        ce_mode, num_chunks, tp_group=tp_group, lm_head_fp32=lm_head_fp32,
+        hidden_states_flat,
+        weight,
+        labels_flat,
+        ignore_index,
+        ce_mode,
+        num_chunks,
+        tp_group=tp_group,
+        lm_head_fp32=lm_head_fp32,
     )
     logprobs = -per_token_ce.view(B, S)
 

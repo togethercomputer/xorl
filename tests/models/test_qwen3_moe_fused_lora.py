@@ -4,16 +4,17 @@ import pytest
 import torch
 import torch.nn as nn
 
-from xorl.models.transformers.qwen3_moe.modeling_qwen3_moe import (
-    Qwen3MoeTritonExperts,
-    Qwen3MoeSparseExperts,
-)
-from xorl.models.layers.moe import MoEExperts, MoEExpertsLoRA, MoELoRAConfig, MoEBlock, MOE_EXPERT_BACKENDS
 from xorl.lora.mapping import can_apply_lora, get_lora_class_for_module
+from xorl.models.layers.moe import MOE_EXPERT_BACKENDS, MoEBlock, MoEExperts, MoEExpertsLoRA, MoELoRAConfig
+from xorl.models.transformers.qwen3_moe.modeling_qwen3_moe import (
+    Qwen3MoeSparseExperts,
+    Qwen3MoeTritonExperts,
+)
 
 
 class MockConfig:
     """Mock config for testing."""
+
     def __init__(
         self,
         num_experts=4,
@@ -178,8 +179,11 @@ class TestMoEExpertsLoRAEager:
 
         # MoEBlock end-to-end
         block = MoEBlock(
-            hidden_size=32, num_experts=4, top_k=2,
-            intermediate_size=64, moe_implementation="eager",
+            hidden_size=32,
+            num_experts=4,
+            top_k=2,
+            intermediate_size=64,
+            moe_implementation="eager",
         )
         nn.init.xavier_normal_(block.experts.gate_proj.data)
         nn.init.xavier_normal_(block.experts.up_proj.data)
@@ -242,8 +246,11 @@ class TestMoEExpertsLoRAGPU:
         # MoEBlock end-to-end (test only native to avoid duplicate)
         if backend == "native":
             block = MoEBlock(
-                hidden_size=32, num_experts=4, top_k=2,
-                intermediate_size=64, moe_implementation="native",
+                hidden_size=32,
+                num_experts=4,
+                top_k=2,
+                intermediate_size=64,
+                moe_implementation="native",
             )
             nn.init.xavier_normal_(block.experts.gate_proj.data)
             nn.init.xavier_normal_(block.experts.up_proj.data)
@@ -268,7 +275,14 @@ class TestMoEExpertsLoRAGPU:
 
 
 def _make_lora_block(
-    backend, num_experts, hidden_dim, intermediate, r, lora_alpha, device, dtype,
+    backend,
+    num_experts,
+    hidden_dim,
+    intermediate,
+    r,
+    lora_alpha,
+    device,
+    dtype,
 ):
     """Create a MoEBlock with LoRA on the given backend, with deterministic init."""
     block = MoEBlock(
@@ -317,12 +331,24 @@ class TestCrossBackendConsistency:
 
     def _make_pair(self, ref_backend, test_backend, device):
         ref = _make_lora_block(
-            ref_backend, self.NUM_EXPERTS, self.HIDDEN_DIM, self.INTERMEDIATE,
-            self.R, self.LORA_ALPHA, device, self.DTYPE,
+            ref_backend,
+            self.NUM_EXPERTS,
+            self.HIDDEN_DIM,
+            self.INTERMEDIATE,
+            self.R,
+            self.LORA_ALPHA,
+            device,
+            self.DTYPE,
         )
         test = _make_lora_block(
-            test_backend, self.NUM_EXPERTS, self.HIDDEN_DIM, self.INTERMEDIATE,
-            self.R, self.LORA_ALPHA, device, self.DTYPE,
+            test_backend,
+            self.NUM_EXPERTS,
+            self.HIDDEN_DIM,
+            self.INTERMEDIATE,
+            self.R,
+            self.LORA_ALPHA,
+            device,
+            self.DTYPE,
         )
         _copy_block_weights(ref, test)
         return ref, test
@@ -333,8 +359,11 @@ class TestCrossBackendConsistency:
         for backend in ["eager", "triton", "native"]:
             # --- zero LoRA matches base ---
             base_block = MoEBlock(
-                hidden_size=self.HIDDEN_DIM, num_experts=self.NUM_EXPERTS, top_k=2,
-                intermediate_size=self.INTERMEDIATE, moe_implementation=backend,
+                hidden_size=self.HIDDEN_DIM,
+                num_experts=self.NUM_EXPERTS,
+                top_k=2,
+                intermediate_size=self.INTERMEDIATE,
+                moe_implementation=backend,
             )
             torch.manual_seed(42)
             nn.init.xavier_normal_(base_block.experts.gate_proj.data)
@@ -344,8 +373,11 @@ class TestCrossBackendConsistency:
             base_block = base_block.to(device).to(self.DTYPE)
 
             lora_block = MoEBlock(
-                hidden_size=self.HIDDEN_DIM, num_experts=self.NUM_EXPERTS, top_k=2,
-                intermediate_size=self.INTERMEDIATE, moe_implementation=backend,
+                hidden_size=self.HIDDEN_DIM,
+                num_experts=self.NUM_EXPERTS,
+                top_k=2,
+                intermediate_size=self.INTERMEDIATE,
+                moe_implementation=backend,
             )
             torch.manual_seed(42)
             nn.init.xavier_normal_(lora_block.experts.gate_proj.data)
@@ -360,24 +392,40 @@ class TestCrossBackendConsistency:
             base_out, _ = base_block(hidden)
             lora_out, _ = lora_block(hidden)
             torch.testing.assert_close(
-                lora_out, base_out, atol=1e-3, rtol=1e-2,
+                lora_out,
+                base_out,
+                atol=1e-3,
+                rtol=1e-2,
                 msg=f"[{backend}] Zero-LoRA output should match base model",
             )
 
             # --- nonzero LoRA changes output ---
             block = _make_lora_block(
-                backend, self.NUM_EXPERTS, self.HIDDEN_DIM, self.INTERMEDIATE,
-                self.R, self.LORA_ALPHA, device, self.DTYPE,
+                backend,
+                self.NUM_EXPERTS,
+                self.HIDDEN_DIM,
+                self.INTERMEDIATE,
+                self.R,
+                self.LORA_ALPHA,
+                device,
+                self.DTYPE,
             )
             with torch.no_grad():
                 for proj in ["gate_proj", "up_proj", "down_proj"]:
                     lora_B = getattr(block.experts, f"{proj}_lora_B")
                     nn.init.xavier_normal_(lora_B)
 
-            base_block2 = MoEBlock(
-                hidden_size=self.HIDDEN_DIM, num_experts=self.NUM_EXPERTS, top_k=2,
-                intermediate_size=self.INTERMEDIATE, moe_implementation=backend,
-            ).to(device).to(self.DTYPE)
+            base_block2 = (
+                MoEBlock(
+                    hidden_size=self.HIDDEN_DIM,
+                    num_experts=self.NUM_EXPERTS,
+                    top_k=2,
+                    intermediate_size=self.INTERMEDIATE,
+                    moe_implementation=backend,
+                )
+                .to(device)
+                .to(self.DTYPE)
+            )
             with torch.no_grad():
                 base_block2.gate.weight.copy_(block.gate.weight)
                 base_block2.experts.gate_proj.copy_(block.experts.gate_proj)
@@ -390,9 +438,7 @@ class TestCrossBackendConsistency:
             lora_out2, _ = block(hidden2)
 
             diff = (lora_out2 - base_out2).abs().max().item()
-            assert diff > 1e-3, (
-                f"[{backend}] Non-zero LoRA should change the output, but max diff={diff}"
-            )
+            assert diff > 1e-3, f"[{backend}] Non-zero LoRA should change the output, but max diff={diff}"
 
     def test_cross_backend_output_and_gradients(self):
         """Cross-backend outputs and LoRA gradients should match."""
@@ -409,7 +455,10 @@ class TestCrossBackendConsistency:
             test_out.sum().backward()
 
             torch.testing.assert_close(
-                test_out, ref_out, atol=0.05, rtol=0.02,
+                test_out,
+                ref_out,
+                atol=0.05,
+                rtol=0.02,
                 msg=f"{ref_backend} vs {test_backend} output mismatch",
             )
 
@@ -423,11 +472,17 @@ class TestCrossBackendConsistency:
                 assert test_grad_A is not None, f"test {proj}_lora_A grad is None"
 
                 torch.testing.assert_close(
-                    test_grad_A, ref_grad_A, atol=0.05, rtol=0.05,
+                    test_grad_A,
+                    ref_grad_A,
+                    atol=0.05,
+                    rtol=0.05,
                     msg=f"Gradient mismatch: {proj}_lora_A ({ref_backend} vs {test_backend})",
                 )
                 torch.testing.assert_close(
-                    test_grad_B, ref_grad_B, atol=0.05, rtol=0.05,
+                    test_grad_B,
+                    ref_grad_B,
+                    atol=0.05,
+                    rtol=0.05,
                     msg=f"Gradient mismatch: {proj}_lora_B ({ref_backend} vs {test_backend})",
                 )
 
@@ -506,12 +561,13 @@ class TestFromModuleAndInjection:
         assert torch.allclose(lora_exp.gate_proj, base.gate_proj)
 
         # Error handling
-        from xorl.lora import inject_lora_into_model, LoraLinear
+        from xorl.lora import LoraLinear, inject_lora_into_model
 
         class ModelA(nn.Module):
             def __init__(self):
                 super().__init__()
                 self.layer1 = nn.Linear(64, 64)
+
         with pytest.raises(ValueError, match="No modules found matching target_modules"):
             inject_lora_into_model(ModelA(), r=8, lora_alpha=16, target_modules=["nonexistent_proj"])
 
@@ -519,6 +575,7 @@ class TestFromModuleAndInjection:
             def __init__(self):
                 super().__init__()
                 self.weight = nn.Parameter(torch.randn(64, 64))
+
             def forward(self, x):
                 return x @ self.weight
 
@@ -526,6 +583,7 @@ class TestFromModuleAndInjection:
             def __init__(self):
                 super().__init__()
                 self.custom_layer = UnsupportedModule()
+
         with pytest.raises(ValueError, match="No modules found matching target_modules"):
             inject_lora_into_model(ModelB(), r=8, lora_alpha=16, target_modules=["custom_layer"])
 
@@ -534,6 +592,7 @@ class TestFromModuleAndInjection:
                 super().__init__()
                 self.q_proj = nn.Linear(64, 64)
                 self.v_proj = nn.Linear(64, 64)
+
         model = ModelC()
         inject_lora_into_model(model, r=8, lora_alpha=16, target_modules=["q_proj", "v_proj"])
         assert isinstance(model.q_proj, LoraLinear)

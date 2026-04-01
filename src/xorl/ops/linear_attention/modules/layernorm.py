@@ -2,7 +2,6 @@ from __future__ import annotations
 
 # Minimal local RMSNorm adapted from flash-linear-attention/fla/modules/layernorm.py.
 # Portions of this file are adapted from flash-linear-attention, Copyright (c) 2023-2025 Songlin Yang, licensed under the MIT License.
-
 import torch
 import torch.nn as nn
 

@@ -25,9 +25,11 @@ import torch.nn as nn
 from safetensors.torch import load_file as safetensors_load_file
 from safetensors.torch import save_file as safetensors_save_file
 
+
 try:
     from torch.distributed._tensor import DTensor
     from torch.distributed._tensor.placement_types import Shard
+
     _HAS_DTENSOR = True
 except ImportError:
     _HAS_DTENSOR = False
@@ -47,7 +49,7 @@ class AdapterState:
 
     model_id: str
     lora_params: Dict[str, nn.Parameter]  # Actual Parameters with own .grad
-    optimizer: torch.optim.Optimizer       # Per-adapter optimizer
+    optimizer: torch.optim.Optimizer  # Per-adapter optimizer
     global_step: int = 0
     global_forward_backward_step: int = 0
     lr: float = 1e-5
@@ -369,7 +371,7 @@ class LoRAAdapterManager:
         # Update learning rate
         state.lr = lr
         for pg in state.optimizer.param_groups:
-            pg['lr'] = lr
+            pg["lr"] = lr
 
         # Deferred gradient normalization: scale raw gradients by 1/accumulated_valid_tokens
         if accumulated_valid_tokens > 0:
@@ -381,10 +383,7 @@ class LoRAAdapterManager:
         # Always use clip_grad_norm_ for correct grad norm computation
         # Using a large clip value (10000.0) effectively means no clipping
         clip_value = gradient_clip if (gradient_clip is not None and gradient_clip > 0) else 10000.0
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            list(state.lora_params.values()),
-            clip_value
-        )
+        grad_norm = torch.nn.utils.clip_grad_norm_(list(state.lora_params.values()), clip_value)
         if hasattr(grad_norm, "item"):
             grad_norm = grad_norm.item()
 

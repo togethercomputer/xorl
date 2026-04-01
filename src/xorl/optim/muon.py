@@ -32,6 +32,7 @@ from torch.optim.optimizer import Optimizer
 
 from ..utils import logging
 
+
 logger = logging.get_logger(__name__)
 
 
@@ -176,7 +177,8 @@ class Muon(TorchMuon):
                 if "momentum_buffer" not in state:
                     buf_dtype = self._momentum_dtype or grad_local.dtype
                     state["momentum_buffer"] = torch.zeros_like(
-                        grad_local, dtype=buf_dtype,
+                        grad_local,
+                        dtype=buf_dtype,
                     )
                     if not self._logged_dtypes:
                         logger.info_rank0(

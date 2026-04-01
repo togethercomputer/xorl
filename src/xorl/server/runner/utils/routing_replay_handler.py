@@ -24,7 +24,7 @@ The handler manages:
 import base64
 import logging
 import math
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -37,8 +37,10 @@ from xorl.models.layers.moe.routing_replay import (
     set_replay_stage,
 )
 
+
 try:
     from xorl.models.layers.moe import MoEBlock
+
     _HAS_MOE_BLOCK = True
 except ImportError:
     _HAS_MOE_BLOCK = False
@@ -179,10 +181,7 @@ class RoutingReplayHandler:
             if total_elements % (num_moe_layers * topk) == 0:
                 num_tokens = total_elements // (num_moe_layers * topk)
                 return arr.reshape(num_tokens, num_moe_layers, topk)
-        logger.warning(
-            f"R3: Cannot infer shape for {total_elements} elements "
-            f"with {num_moe_layers} layers"
-        )
+        logger.warning(f"R3: Cannot infer shape for {total_elements} elements with {num_moe_layers} layers")
         return None
 
     def fill_routing_replay(
@@ -244,9 +243,7 @@ class RoutingReplayHandler:
         )
 
         # Build per-micro-batch routing tensors, handling packing + SP slicing
-        per_mb_routing = self._build_per_mb_routing(
-            micro_batches, decoded_routing, num_layers_in_data, topk
-        )
+        per_mb_routing = self._build_per_mb_routing(micro_batches, decoded_routing, num_layers_in_data, topk)
 
         if not per_mb_routing:
             logger.warning("R3: Empty routing data after processing")
@@ -271,17 +268,13 @@ class RoutingReplayHandler:
                     decoded_weights.append(decoded)
 
             if decoded_weights:
-                per_mb_weights = self._build_per_mb_routing(
-                    micro_batches, decoded_weights, num_layers_in_data, topk
-                )
+                per_mb_weights = self._build_per_mb_routing(micro_batches, decoded_weights, num_layers_in_data, topk)
                 for mb_idx, mb_weights_tensor in enumerate(per_mb_weights):
                     num_layers_to_use_w = min(num_moe_layers, mb_weights_tensor.shape[1])
                     for moe_idx in range(num_layers_to_use_w):
                         layer_weights = mb_weights_tensor[:, moe_idx, :].float()
                         moe_blocks[moe_idx]._routing_replay.record_weights(layer_weights)
-                logger.debug(
-                    f"R3: Pre-populated routing weights for {len(per_mb_weights)} micro-batches"
-                )
+                logger.debug(f"R3: Pre-populated routing weights for {len(per_mb_weights)} micro-batches")
 
         logger.debug(
             f"R3: Pre-populated {len(per_mb_routing)} micro-batches x "

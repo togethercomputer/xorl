@@ -11,24 +11,6 @@ callers can do either:
 """
 
 # Typed operation payloads
-from xorl.server.protocol.operations import (  # noqa: F401
-    AbortData,
-    AdapterStateData,
-    EmptyData,
-    KillSessionData,
-    LoadStateData,
-    ModelPassData,
-    OperationPayload,
-    OptimStepData,
-    RegisterAdapterData,
-    SaveFullWeightsData,
-    SaveLoraOnlyData,
-    SaveStateData,
-    SyncWeightsData,
-    payload_from_dict,
-    payload_to_dict,
-)
-
 from xorl.server.protocol.api_orchestrator import (  # noqa: F401
     OrchestratorOutputs,
     OrchestratorRequest,
@@ -51,11 +33,28 @@ from xorl.server.protocol.api_orchestrator import (  # noqa: F401
     validate_output,
     validate_request,
 )
+from xorl.server.protocol.operations import (  # noqa: F401
+    AbortData,
+    AdapterStateData,
+    EmptyData,
+    KillSessionData,
+    LoadStateData,
+    ModelPassData,
+    OperationPayload,
+    OptimStepData,
+    RegisterAdapterData,
+    SaveFullWeightsData,
+    SaveLoraOnlyData,
+    SaveStateData,
+    SyncWeightsData,
+    payload_from_dict,
+    payload_to_dict,
+)
 from xorl.server.protocol.orchestrator_runner import (  # noqa: F401
     BaseMessage,
-    RunnerDispatchCommand,
     MessageType,
     RunnerAck,
+    RunnerDispatchCommand,
     RunnerReady,
     RunnerResponse,
     create_ack_for_request,

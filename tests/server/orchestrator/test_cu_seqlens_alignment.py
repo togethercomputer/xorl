@@ -15,16 +15,17 @@ Both must produce cu_seq_lens with:
 """
 
 import math
+from unittest.mock import Mock, patch
+
 import pytest
 import torch
-from unittest.mock import Mock, patch
 
 from xorl.data.collators.packing_concat_collator import (
     PackingConcatCollator,
-    add_flash_attention_kwargs_from_position_ids,
 )
-from xorl.server.orchestrator.packing import SequentialPacker, pack_samples
+from xorl.server.orchestrator.packing import SequentialPacker
 from xorl.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
+
 
 pytestmark = [pytest.mark.cpu]
 
@@ -32,6 +33,7 @@ pytestmark = [pytest.mark.cpu]
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _server_path_cu_seqlens(datum_list, max_seq_len=4096, pad_to_multiple_of=1):
     """Simulate the server path: pack -> finalize -> convert_to_tensors."""
@@ -89,6 +91,7 @@ def _make_feature(input_ids, position_ids):
 # Tests
 # ---------------------------------------------------------------------------
 
+
 class TestCuSeqlensAlignmentAndDtype:
     """Verify server/CLI cu_seq_lens match, dtype, and edge cases."""
 
@@ -103,10 +106,12 @@ class TestCuSeqlensAlignmentAndDtype:
         # --- Two sequences match ---
         seq1, seq2 = [10, 20, 30], [40, 50, 60, 70]
         server_batch = _server_path_cu_seqlens([_make_datum(seq1), _make_datum(seq2)])[0]
-        cli_batch = _cli_path_cu_seqlens([
-            _make_feature(seq1, list(range(len(seq1)))),
-            _make_feature(seq2, list(range(len(seq2)))),
-        ])
+        cli_batch = _cli_path_cu_seqlens(
+            [
+                _make_feature(seq1, list(range(len(seq1)))),
+                _make_feature(seq2, list(range(len(seq2)))),
+            ]
+        )
         assert torch.equal(server_batch["cu_seq_lens_q"], cli_batch["cu_seq_lens_q"])
         assert torch.equal(server_batch["cu_seq_lens_k"], cli_batch["cu_seq_lens_k"])
         assert server_batch["max_length_q"] == cli_batch["max_length_q"]
@@ -158,8 +163,10 @@ class TestOriginalPositionIdsAndPadding:
         from xorl.data.collators.sequence_shard_collator import TextSequenceShardCollator
 
         # Preservation (SP size 2, 6 tokens)
-        with patch("xorl.data.collators.sequence_shard_collator.get_parallel_state") as mock_ps, \
-             patch("xorl.data.collators.packing_concat_collator.get_parallel_state") as mock_ps2:
+        with (
+            patch("xorl.data.collators.sequence_shard_collator.get_parallel_state") as mock_ps,
+            patch("xorl.data.collators.packing_concat_collator.get_parallel_state") as mock_ps2,
+        ):
             mock = Mock(cp_size=2, cp_rank=0, cp_enabled=True, ringattn_size=1)
             mock_ps.return_value = mock
             mock_ps2.return_value = mock
@@ -177,8 +184,10 @@ class TestOriginalPositionIdsAndPadding:
             assert result["position_ids"].shape[-1] >= 6
 
         # Not padded (SP size 4, 5 tokens -> pad to 8, but _original keeps 5)
-        with patch("xorl.data.collators.sequence_shard_collator.get_parallel_state") as mock_ps, \
-             patch("xorl.data.collators.packing_concat_collator.get_parallel_state") as mock_ps2:
+        with (
+            patch("xorl.data.collators.sequence_shard_collator.get_parallel_state") as mock_ps,
+            patch("xorl.data.collators.packing_concat_collator.get_parallel_state") as mock_ps2,
+        ):
             mock = Mock(cp_size=4, cp_rank=0, cp_enabled=True, ringattn_size=1)
             mock_ps.return_value = mock
             mock_ps2.return_value = mock
@@ -193,8 +202,10 @@ class TestOriginalPositionIdsAndPadding:
             assert result["position_ids"].shape[-1] == 8
 
         # Stale cu_seq_lens overwritten
-        with patch("xorl.data.collators.sequence_shard_collator.get_parallel_state") as mock_ps, \
-             patch("xorl.data.collators.packing_concat_collator.get_parallel_state") as mock_ps2:
+        with (
+            patch("xorl.data.collators.sequence_shard_collator.get_parallel_state") as mock_ps,
+            patch("xorl.data.collators.packing_concat_collator.get_parallel_state") as mock_ps2,
+        ):
             mock = Mock(cp_size=4, cp_rank=0, cp_enabled=True, ringattn_size=1)
             mock_ps.return_value = mock
             mock_ps2.return_value = mock
@@ -205,7 +216,8 @@ class TestOriginalPositionIdsAndPadding:
                 "position_ids": torch.tensor([[0, 1, 2, 0, 1]], dtype=torch.long),
                 "cu_seq_lens_q": torch.tensor([0, 3, 5], dtype=torch.int32),
                 "cu_seq_lens_k": torch.tensor([0, 3, 5], dtype=torch.int32),
-                "max_length_q": 3, "max_length_k": 3,
+                "max_length_q": 3,
+                "max_length_k": 3,
             }
             result = collator(batch)
             assert result["cu_seq_lens_q"][-1].item() == 8
@@ -213,17 +225,22 @@ class TestOriginalPositionIdsAndPadding:
 
         # cu_seq_lens match with padding
         pad = 128
-        with patch("xorl.server.orchestrator.packing.get_parallel_state") as mock_server_ps, \
-             patch("xorl.data.collators.packing_concat_collator.get_parallel_state") as mock_cli_ps:
+        with (
+            patch("xorl.server.orchestrator.packing.get_parallel_state") as mock_server_ps,
+            patch("xorl.data.collators.packing_concat_collator.get_parallel_state") as mock_cli_ps,
+        ):
             mock_ps = Mock(cp_enabled=False, cp_size=1, cp_rank=0, ringattn_size=1)
             mock_server_ps.return_value = mock_ps
             mock_cli_ps.return_value = mock_ps
             seq1, seq2 = [1, 2, 3], [4, 5, 6, 7, 8, 9, 10]
             server_batch = _server_path_cu_seqlens([_make_datum(seq1), _make_datum(seq2)], pad_to_multiple_of=pad)[0]
-            cli_batch = _cli_path_cu_seqlens([
-                _make_feature(seq1, list(range(len(seq1)))),
-                _make_feature(seq2, list(range(len(seq2)))),
-            ], pad_to_multiple_of=pad)
+            cli_batch = _cli_path_cu_seqlens(
+                [
+                    _make_feature(seq1, list(range(len(seq1)))),
+                    _make_feature(seq2, list(range(len(seq2)))),
+                ],
+                pad_to_multiple_of=pad,
+            )
             assert server_batch["input_ids"].shape[-1] == pad
             assert torch.equal(server_batch["cu_seq_lens_q"], cli_batch["cu_seq_lens_q"])
             assert server_batch["cu_seq_lens_q"][-1].item() == pad
@@ -252,8 +269,9 @@ class TestPadToMultipleWithSpSize:
             assert len(batches[0]["input_ids"][0]) == expected
 
         # RequestProcessor computes lcm correctly
-        from xorl.server.orchestrator.request_processor import RequestProcessor
         from xorl.server.backend import DummyBackend
+        from xorl.server.orchestrator.request_processor import RequestProcessor
+
         backend = DummyBackend()
         assert RequestProcessor(backend=backend, pad_to_multiple_of=128, cp_size=3).pad_to_multiple_of == 384
         assert RequestProcessor(backend=backend, pad_to_multiple_of=128, cp_size=8).pad_to_multiple_of == 128
@@ -261,25 +279,32 @@ class TestPadToMultipleWithSpSize:
 
         # After TextSequenceShardCollator, lengths divisible by cp_size
         from xorl.data.collators.sequence_shard_collator import TextSequenceShardCollator
+
         cp_size = 3
         mock_ps.return_value = Mock(cp_enabled=True, cp_size=cp_size, cp_rank=0, ringattn_size=1)
         packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=math.lcm(128, cp_size))
-        batches = packer.pack([_make_datum(list(range(50))), _make_datum(list(range(30)))], max_seq_len=4096, request_id="test")
+        batches = packer.pack(
+            [_make_datum(list(range(50))), _make_datum(list(range(30)))], max_seq_len=4096, request_id="test"
+        )
         batch = batches[0]
         pre_len = len(batch["input_ids"][0])
         assert pre_len % cp_size == 0
 
-        with patch("xorl.data.collators.sequence_shard_collator.get_parallel_state") as mock_sp, \
-             patch("xorl.data.collators.packing_concat_collator.get_parallel_state") as mock_sp2:
+        with (
+            patch("xorl.data.collators.sequence_shard_collator.get_parallel_state") as mock_sp,
+            patch("xorl.data.collators.packing_concat_collator.get_parallel_state") as mock_sp2,
+        ):
             m = Mock(cp_size=cp_size, cp_rank=0, cp_enabled=True, ringattn_size=1)
             mock_sp.return_value = m
             mock_sp2.return_value = m
             collator = TextSequenceShardCollator()
-            result = collator({
-                "input_ids": torch.tensor(batch["input_ids"], dtype=torch.long),
-                "labels": torch.tensor(batch["labels"], dtype=torch.long),
-                "position_ids": torch.tensor(batch["position_ids"], dtype=torch.long),
-            })
+            result = collator(
+                {
+                    "input_ids": torch.tensor(batch["input_ids"], dtype=torch.long),
+                    "labels": torch.tensor(batch["labels"], dtype=torch.long),
+                    "position_ids": torch.tensor(batch["position_ids"], dtype=torch.long),
+                }
+            )
             assert result["position_ids"].shape[-1] == pre_len
             assert result["input_ids"].shape[-1] == pre_len // cp_size
             assert result["cu_seq_lens_q"][-1].item() == pre_len
@@ -292,6 +317,7 @@ class TestUnpackingWithPadding:
     def test_padding_boundary_handling(self, mock_ps):
         """Padding creates extra boundary; no padding has correct count."""
         from xorl.server.orchestrator.packing import unpack_per_token_outputs
+
         mock_ps.return_value = Mock(cp_enabled=False, cp_size=1, cp_rank=0, ringattn_size=1)
 
         datum_list = [_make_datum([10, 20, 30]), _make_datum([40, 50, 60, 70])]
@@ -302,7 +328,7 @@ class TestUnpackingWithPadding:
         assert batch["num_samples"] == 2 and len(batch["position_ids"][0]) == 128
         pos_ids = torch.tensor(batch["position_ids"][0], dtype=torch.long)
         unpacked = unpack_per_token_outputs(torch.randn(127), pos_ids)
-        assert len(unpacked) == 3 and len(unpacked[:batch["num_samples"]]) == 2
+        assert len(unpacked) == 3 and len(unpacked[: batch["num_samples"]]) == 2
 
         # Without padding: correct count
         packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=1)

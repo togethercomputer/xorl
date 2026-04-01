@@ -1,5 +1,3 @@
-import os
-
 import torch
 
 from xorl.utils.import_utils import is_fused_moe_available
@@ -7,8 +5,14 @@ from xorl.utils.import_utils import is_fused_moe_available
 
 if is_fused_moe_available():
     from xorl.ops.group_gemm.kernel.group_gemm import group_gemm_same_mn, group_gemm_same_nk
-    from xorl.ops.group_gemm.kernel.moe import expert_histogram, moe_add_gather, moe_gather, moe_index_compute, moe_scatter
-    from xorl.ops.fused_silu_and_mul import fused_silu_and_mul, silu_and_mul_backward
+    from xorl.ops.group_gemm.kernel.moe import (
+        expert_histogram,
+        moe_gather,
+        moe_index_compute,
+        moe_scatter,
+    )
+
+
 class TritonEPGroupGemm(torch.autograd.Function):
     """EP expert MLP computation using Triton group GEMM.
 
@@ -25,12 +29,20 @@ class TritonEPGroupGemm(torch.autograd.Function):
         max_M = permute_tokens.shape[0]
 
         gate_output = group_gemm_same_nk(
-            a=permute_tokens, b=gate_proj,
-            cumsum_M=cumsum, max_M=max_M, transpose_a=False, transpose_b=False,
+            a=permute_tokens,
+            b=gate_proj,
+            cumsum_M=cumsum,
+            max_M=max_M,
+            transpose_a=False,
+            transpose_b=False,
         )
         up_output = group_gemm_same_nk(
-            a=permute_tokens, b=up_proj,
-            cumsum_M=cumsum, max_M=max_M, transpose_a=False, transpose_b=False,
+            a=permute_tokens,
+            b=up_proj,
+            cumsum_M=cumsum,
+            max_M=max_M,
+            transpose_a=False,
+            transpose_b=False,
         )
 
         gate_activation = torch.ops.aten.silu(gate_output)
@@ -38,8 +50,12 @@ class TritonEPGroupGemm(torch.autograd.Function):
         del gate_activation
 
         down_output = group_gemm_same_nk(
-            a=gated_output, b=down_proj,
-            cumsum_M=cumsum, max_M=max_M, transpose_a=False, transpose_b=False,
+            a=gated_output,
+            b=down_proj,
+            cumsum_M=cumsum,
+            max_M=max_M,
+            transpose_a=False,
+            transpose_b=False,
         )
         del gated_output
 
@@ -49,8 +65,13 @@ class TritonEPGroupGemm(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         (
-            permute_tokens, cumsum, gate_proj, up_proj, down_proj,
-            gate_output, up_output,
+            permute_tokens,
+            cumsum,
+            gate_proj,
+            up_proj,
+            down_proj,
+            gate_output,
+            up_output,
         ) = ctx.saved_tensors
         max_M = grad_output.shape[0]
 
@@ -60,8 +81,11 @@ class TritonEPGroupGemm(torch.autograd.Function):
 
         # dgrad FC2
         grad_gated_output = group_gemm_same_nk(
-            a=grad_output, b=down_proj,
-            cumsum_M=cumsum, max_M=max_M, transpose_b=True,
+            a=grad_output,
+            b=down_proj,
+            cumsum_M=cumsum,
+            max_M=max_M,
+            transpose_b=True,
         )
 
         # wgrad FC2
@@ -69,8 +93,13 @@ class TritonEPGroupGemm(torch.autograd.Function):
         if down_proj.requires_grad:
             grad_down_proj = torch.empty_like(down_proj)
             group_gemm_same_mn(
-                a=gated_output, b=grad_output, c=grad_down_proj,
-                cumsum_K=cumsum, max_K=max_M, transpose_a=True, transpose_b=False,
+                a=gated_output,
+                b=grad_output,
+                c=grad_down_proj,
+                cumsum_K=cumsum,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
             )
         del gated_output
 
@@ -80,26 +109,35 @@ class TritonEPGroupGemm(torch.autograd.Function):
         del grad_gated_output, gate_activation, up_output
 
         grad_scatter_output_2 = group_gemm_same_nk(
-            a=grad_up_output, b=up_proj,
-            cumsum_M=cumsum, max_M=max_M, transpose_b=True,
+            a=grad_up_output,
+            b=up_proj,
+            cumsum_M=cumsum,
+            max_M=max_M,
+            transpose_b=True,
         )
 
         grad_up_proj = None
         if up_proj.requires_grad:
             grad_up_proj = torch.empty_like(up_proj)
             group_gemm_same_mn(
-                a=permute_tokens, b=grad_up_output, c=grad_up_proj,
-                cumsum_K=cumsum, max_K=max_M, transpose_a=True, transpose_b=False,
+                a=permute_tokens,
+                b=grad_up_output,
+                c=grad_up_proj,
+                cumsum_K=cumsum,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
             )
 
-        grad_gate_output = torch.ops.aten.silu_backward(
-            grad_gate_activation, gate_output
-        )
+        grad_gate_output = torch.ops.aten.silu_backward(grad_gate_activation, gate_output)
         del grad_gate_activation, gate_output
 
         grad_permute_tokens = group_gemm_same_nk(
-            a=grad_gate_output, b=gate_proj,
-            cumsum_M=cumsum, max_M=max_M, transpose_b=True,
+            a=grad_gate_output,
+            b=gate_proj,
+            cumsum_M=cumsum,
+            max_M=max_M,
+            transpose_b=True,
         )
         grad_permute_tokens += grad_scatter_output_2
         del grad_scatter_output_2
@@ -108,8 +146,13 @@ class TritonEPGroupGemm(torch.autograd.Function):
         if gate_proj.requires_grad:
             grad_gate_proj = torch.empty_like(gate_proj)
             group_gemm_same_mn(
-                a=permute_tokens, b=grad_gate_output, c=grad_gate_proj,
-                cumsum_K=cumsum, max_K=max_M, transpose_a=True, transpose_b=False,
+                a=permute_tokens,
+                b=grad_gate_output,
+                c=grad_gate_proj,
+                cumsum_K=cumsum,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
             )
         del grad_gate_output
 
@@ -134,12 +177,20 @@ class TritonEPGroupGemmMoeAct(torch.autograd.Function):
         max_M = permute_tokens.shape[0]
 
         gate_output = group_gemm_same_nk(
-            a=permute_tokens, b=gate_proj,
-            cumsum_M=cumsum, max_M=max_M, transpose_a=False, transpose_b=False,
+            a=permute_tokens,
+            b=gate_proj,
+            cumsum_M=cumsum,
+            max_M=max_M,
+            transpose_a=False,
+            transpose_b=False,
         )
         up_output = group_gemm_same_nk(
-            a=permute_tokens, b=up_proj,
-            cumsum_M=cumsum, max_M=max_M, transpose_a=False, transpose_b=False,
+            a=permute_tokens,
+            b=up_proj,
+            cumsum_M=cumsum,
+            max_M=max_M,
+            transpose_a=False,
+            transpose_b=False,
         )
 
         gate_activation = torch.ops.aten.silu(gate_output)
@@ -147,8 +198,12 @@ class TritonEPGroupGemmMoeAct(torch.autograd.Function):
         del gate_activation
 
         down_output = group_gemm_same_nk(
-            a=gated_output, b=down_proj,
-            cumsum_M=cumsum, max_M=max_M, transpose_a=False, transpose_b=False,
+            a=gated_output,
+            b=down_proj,
+            cumsum_M=cumsum,
+            max_M=max_M,
+            transpose_a=False,
+            transpose_b=False,
         )
         del gated_output
 
@@ -163,12 +218,20 @@ class TritonEPGroupGemmMoeAct(torch.autograd.Function):
 
         # Recompute gate_output and up_output from saved inputs + weights
         gate_output = group_gemm_same_nk(
-            a=permute_tokens, b=gate_proj,
-            cumsum_M=cumsum, max_M=max_M, transpose_a=False, transpose_b=False,
+            a=permute_tokens,
+            b=gate_proj,
+            cumsum_M=cumsum,
+            max_M=max_M,
+            transpose_a=False,
+            transpose_b=False,
         )
         up_output = group_gemm_same_nk(
-            a=permute_tokens, b=up_proj,
-            cumsum_M=cumsum, max_M=max_M, transpose_a=False, transpose_b=False,
+            a=permute_tokens,
+            b=up_proj,
+            cumsum_M=cumsum,
+            max_M=max_M,
+            transpose_a=False,
+            transpose_b=False,
         )
 
         # Rest identical to TritonEPGroupGemm.backward
@@ -177,8 +240,11 @@ class TritonEPGroupGemmMoeAct(torch.autograd.Function):
 
         # dgrad FC2
         grad_gated_output = group_gemm_same_nk(
-            a=grad_output, b=down_proj,
-            cumsum_M=cumsum, max_M=max_M, transpose_b=True,
+            a=grad_output,
+            b=down_proj,
+            cumsum_M=cumsum,
+            max_M=max_M,
+            transpose_b=True,
         )
 
         # wgrad FC2
@@ -186,8 +252,13 @@ class TritonEPGroupGemmMoeAct(torch.autograd.Function):
         if down_proj.requires_grad:
             grad_down_proj = torch.empty_like(down_proj)
             group_gemm_same_mn(
-                a=gated_output, b=grad_output, c=grad_down_proj,
-                cumsum_K=cumsum, max_K=max_M, transpose_a=True, transpose_b=False,
+                a=gated_output,
+                b=grad_output,
+                c=grad_down_proj,
+                cumsum_K=cumsum,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
             )
         del gated_output
 
@@ -197,26 +268,35 @@ class TritonEPGroupGemmMoeAct(torch.autograd.Function):
         del grad_gated_output, gate_activation, up_output
 
         grad_scatter_output_2 = group_gemm_same_nk(
-            a=grad_up_output, b=up_proj,
-            cumsum_M=cumsum, max_M=max_M, transpose_b=True,
+            a=grad_up_output,
+            b=up_proj,
+            cumsum_M=cumsum,
+            max_M=max_M,
+            transpose_b=True,
         )
 
         grad_up_proj = None
         if up_proj.requires_grad:
             grad_up_proj = torch.empty_like(up_proj)
             group_gemm_same_mn(
-                a=permute_tokens, b=grad_up_output, c=grad_up_proj,
-                cumsum_K=cumsum, max_K=max_M, transpose_a=True, transpose_b=False,
+                a=permute_tokens,
+                b=grad_up_output,
+                c=grad_up_proj,
+                cumsum_K=cumsum,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
             )
 
-        grad_gate_output = torch.ops.aten.silu_backward(
-            grad_gate_activation, gate_output
-        )
+        grad_gate_output = torch.ops.aten.silu_backward(grad_gate_activation, gate_output)
         del grad_gate_activation, gate_output
 
         grad_permute_tokens = group_gemm_same_nk(
-            a=grad_gate_output, b=gate_proj,
-            cumsum_M=cumsum, max_M=max_M, transpose_b=True,
+            a=grad_gate_output,
+            b=gate_proj,
+            cumsum_M=cumsum,
+            max_M=max_M,
+            transpose_b=True,
         )
         grad_permute_tokens += grad_scatter_output_2
         del grad_scatter_output_2
@@ -225,8 +305,13 @@ class TritonEPGroupGemmMoeAct(torch.autograd.Function):
         if gate_proj.requires_grad:
             grad_gate_proj = torch.empty_like(gate_proj)
             group_gemm_same_mn(
-                a=permute_tokens, b=grad_gate_output, c=grad_gate_proj,
-                cumsum_K=cumsum, max_K=max_M, transpose_a=True, transpose_b=False,
+                a=permute_tokens,
+                b=grad_gate_output,
+                c=grad_gate_proj,
+                cumsum_K=cumsum,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
             )
         del grad_gate_output
 
@@ -268,12 +353,20 @@ class TritonMoeExpertsFunction(torch.autograd.Function):
 
         # Separate gate and up GEMMs (avoids allocating concatenated weight tensor)
         gate_output = group_gemm_same_nk(
-            a=scatter_output, b=gate_proj,
-            cumsum_M=cumsum_t, max_M=max_M, transpose_a=False, transpose_b=False,
+            a=scatter_output,
+            b=gate_proj,
+            cumsum_M=cumsum_t,
+            max_M=max_M,
+            transpose_a=False,
+            transpose_b=False,
         )
         up_output = group_gemm_same_nk(
-            a=scatter_output, b=up_proj,
-            cumsum_M=cumsum_t, max_M=max_M, transpose_a=False, transpose_b=False,
+            a=scatter_output,
+            b=up_proj,
+            cumsum_M=cumsum_t,
+            max_M=max_M,
+            transpose_a=False,
+            transpose_b=False,
         )
         del scatter_output
 
@@ -291,8 +384,12 @@ class TritonMoeExpertsFunction(torch.autograd.Function):
 
         # Down projection
         down_output = group_gemm_same_nk(
-            a=gated_weighted, b=down_proj,
-            cumsum_M=cumsum_t, max_M=max_M, transpose_a=False, transpose_b=False,
+            a=gated_weighted,
+            b=down_proj,
+            cumsum_M=cumsum_t,
+            max_M=max_M,
+            transpose_a=False,
+            transpose_b=False,
         )
         del gated_weighted
 
@@ -303,9 +400,16 @@ class TritonMoeExpertsFunction(torch.autograd.Function):
         # Save gate_output + up_output for backward (cheap intermediates like
         # scatter_output, gate_activation, gated_weighted are recomputed instead).
         ctx.save_for_backward(
-            gate_weights, gate_proj, up_proj, down_proj,
-            hidden_states, scatter_index, cumsum_t,
-            gate_output, up_output, scattered_gate_weight,
+            gate_weights,
+            gate_proj,
+            up_proj,
+            down_proj,
+            hidden_states,
+            scatter_index,
+            cumsum_t,
+            gate_output,
+            up_output,
+            scattered_gate_weight,
         )
 
         return output
@@ -313,9 +417,16 @@ class TritonMoeExpertsFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         (
-            gate_weights, gate_proj, up_proj, down_proj,
-            hidden_states, scatter_index, cumsum_t,
-            gate_output, up_output, scattered_gate_weight,
+            gate_weights,
+            gate_proj,
+            up_proj,
+            down_proj,
+            hidden_states,
+            scatter_index,
+            cumsum_t,
+            gate_output,
+            up_output,
+            scattered_gate_weight,
         ) = ctx.saved_tensors
         grad_output = grad_output.view(-1, grad_output.shape[-1])
         max_M = grad_output.shape[0]
@@ -331,8 +442,11 @@ class TritonMoeExpertsFunction(torch.autograd.Function):
 
         # FC2 dgrad: grad @ down_proj^T
         grad_gated_weighted = group_gemm_same_nk(
-            a=grad_down_output, b=down_proj,
-            cumsum_M=cumsum_t, max_M=max_M, transpose_b=True,
+            a=grad_down_output,
+            b=down_proj,
+            cumsum_M=cumsum_t,
+            max_M=max_M,
+            transpose_b=True,
         )
 
         # FC2 wgrad: gated_weighted^T @ grad
@@ -340,8 +454,13 @@ class TritonMoeExpertsFunction(torch.autograd.Function):
         if down_proj.requires_grad:
             grad_down_proj = torch.empty_like(down_proj)
             group_gemm_same_mn(
-                a=gated_weighted, b=grad_down_output, c=grad_down_proj,
-                cumsum_K=cumsum_t, max_K=max_M, transpose_a=True, transpose_b=False,
+                a=gated_weighted,
+                b=grad_down_output,
+                c=grad_down_proj,
+                cumsum_K=cumsum_t,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
             )
         del grad_down_output, gated_weighted
 
@@ -355,19 +474,23 @@ class TritonMoeExpertsFunction(torch.autograd.Function):
         grad_up_output = gate_activation * grad_gated_activation
         grad_gate_activation = grad_gated_activation * up_output
         del grad_gated_activation, gate_activation, up_output
-        grad_gate_output = torch.ops.aten.silu_backward(
-            grad_gate_activation, gate_output
-        )
+        grad_gate_output = torch.ops.aten.silu_backward(grad_gate_activation, gate_output)
         del grad_gate_activation, gate_output
 
         # FC1 dgrad: separate GEMMs, in-place add (avoids allocating sum tensor)
         grad_scatter_output = group_gemm_same_nk(
-            a=grad_gate_output, b=gate_proj,
-            cumsum_M=cumsum_t, max_M=max_M, transpose_b=True,
+            a=grad_gate_output,
+            b=gate_proj,
+            cumsum_M=cumsum_t,
+            max_M=max_M,
+            transpose_b=True,
         )
         grad_scatter_output += group_gemm_same_nk(
-            a=grad_up_output, b=up_proj,
-            cumsum_M=cumsum_t, max_M=max_M, transpose_b=True,
+            a=grad_up_output,
+            b=up_proj,
+            cumsum_M=cumsum_t,
+            max_M=max_M,
+            transpose_b=True,
         )
 
         # FC1 wgrad: separate GEMMs (avoids concatenated grad weight alloc + .contiguous() copies)
@@ -375,16 +498,26 @@ class TritonMoeExpertsFunction(torch.autograd.Function):
         if gate_proj.requires_grad:
             grad_gate_proj = torch.empty_like(gate_proj)
             group_gemm_same_mn(
-                a=scatter_output, b=grad_gate_output, c=grad_gate_proj,
-                cumsum_K=cumsum_t, max_K=max_M, transpose_a=True, transpose_b=False,
+                a=scatter_output,
+                b=grad_gate_output,
+                c=grad_gate_proj,
+                cumsum_K=cumsum_t,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
             )
         del grad_gate_output
         grad_up_proj = None
         if up_proj.requires_grad:
             grad_up_proj = torch.empty_like(up_proj)
             group_gemm_same_mn(
-                a=scatter_output, b=grad_up_output, c=grad_up_proj,
-                cumsum_K=cumsum_t, max_K=max_M, transpose_a=True, transpose_b=False,
+                a=scatter_output,
+                b=grad_up_output,
+                c=grad_up_proj,
+                cumsum_K=cumsum_t,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
             )
         del grad_up_output, scatter_output
 
@@ -468,12 +601,20 @@ class TritonMoeExpertsFunctionMoeAct(torch.autograd.Function):
         max_M = scatter_output.shape[0]
 
         gate_output = group_gemm_same_nk(
-            a=scatter_output, b=gate_proj,
-            cumsum_M=cumsum_t, max_M=max_M, transpose_a=False, transpose_b=False,
+            a=scatter_output,
+            b=gate_proj,
+            cumsum_M=cumsum_t,
+            max_M=max_M,
+            transpose_a=False,
+            transpose_b=False,
         )
         up_output = group_gemm_same_nk(
-            a=scatter_output, b=up_proj,
-            cumsum_M=cumsum_t, max_M=max_M, transpose_a=False, transpose_b=False,
+            a=scatter_output,
+            b=up_proj,
+            cumsum_M=cumsum_t,
+            max_M=max_M,
+            transpose_a=False,
+            transpose_b=False,
         )
         del scatter_output
 
@@ -488,8 +629,12 @@ class TritonMoeExpertsFunctionMoeAct(torch.autograd.Function):
         del gated_activation
 
         down_output = group_gemm_same_nk(
-            a=gated_weighted, b=down_proj,
-            cumsum_M=cumsum_t, max_M=max_M, transpose_a=False, transpose_b=False,
+            a=gated_weighted,
+            b=down_proj,
+            cumsum_M=cumsum_t,
+            max_M=max_M,
+            transpose_a=False,
+            transpose_b=False,
         )
         del gated_weighted
 
@@ -498,8 +643,13 @@ class TritonMoeExpertsFunctionMoeAct(torch.autograd.Function):
 
         # moe_act: save 8 tensors (drop gate_output, up_output vs 10 in standard)
         ctx.save_for_backward(
-            gate_weights, gate_proj, up_proj, down_proj,
-            hidden_states, scatter_index, cumsum_t,
+            gate_weights,
+            gate_proj,
+            up_proj,
+            down_proj,
+            hidden_states,
+            scatter_index,
+            cumsum_t,
             scattered_gate_weight,
         )
 
@@ -508,8 +658,13 @@ class TritonMoeExpertsFunctionMoeAct(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         (
-            gate_weights, gate_proj, up_proj, down_proj,
-            hidden_states, scatter_index, cumsum_t,
+            gate_weights,
+            gate_proj,
+            up_proj,
+            down_proj,
+            hidden_states,
+            scatter_index,
+            cumsum_t,
             scattered_gate_weight,
         ) = ctx.saved_tensors
         grad_output = grad_output.view(-1, grad_output.shape[-1])
@@ -518,12 +673,20 @@ class TritonMoeExpertsFunctionMoeAct(torch.autograd.Function):
         # Recompute scatter_output, gate_output, up_output from saved inputs + weights
         scatter_output = moe_scatter(hidden_states, scatter_index)
         gate_output = group_gemm_same_nk(
-            a=scatter_output, b=gate_proj,
-            cumsum_M=cumsum_t, max_M=max_M, transpose_a=False, transpose_b=False,
+            a=scatter_output,
+            b=gate_proj,
+            cumsum_M=cumsum_t,
+            max_M=max_M,
+            transpose_a=False,
+            transpose_b=False,
         )
         up_output = group_gemm_same_nk(
-            a=scatter_output, b=up_proj,
-            cumsum_M=cumsum_t, max_M=max_M, transpose_a=False, transpose_b=False,
+            a=scatter_output,
+            b=up_proj,
+            cumsum_M=cumsum_t,
+            max_M=max_M,
+            transpose_a=False,
+            transpose_b=False,
         )
 
         gate_activation = torch.ops.aten.silu(gate_output)
@@ -535,8 +698,11 @@ class TritonMoeExpertsFunctionMoeAct(torch.autograd.Function):
 
         # FC2 dgrad
         grad_gated_weighted = group_gemm_same_nk(
-            a=grad_down_output, b=down_proj,
-            cumsum_M=cumsum_t, max_M=max_M, transpose_b=True,
+            a=grad_down_output,
+            b=down_proj,
+            cumsum_M=cumsum_t,
+            max_M=max_M,
+            transpose_b=True,
         )
 
         # FC2 wgrad
@@ -544,8 +710,13 @@ class TritonMoeExpertsFunctionMoeAct(torch.autograd.Function):
         if down_proj.requires_grad:
             grad_down_proj = torch.empty_like(down_proj)
             group_gemm_same_mn(
-                a=gated_weighted, b=grad_down_output, c=grad_down_proj,
-                cumsum_K=cumsum_t, max_K=max_M, transpose_a=True, transpose_b=False,
+                a=gated_weighted,
+                b=grad_down_output,
+                c=grad_down_proj,
+                cumsum_K=cumsum_t,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
             )
         del grad_down_output, gated_weighted
 
@@ -559,19 +730,23 @@ class TritonMoeExpertsFunctionMoeAct(torch.autograd.Function):
         grad_up_output = gate_activation * grad_gated_activation
         grad_gate_activation = grad_gated_activation * up_output
         del grad_gated_activation, gate_activation, up_output
-        grad_gate_output = torch.ops.aten.silu_backward(
-            grad_gate_activation, gate_output
-        )
+        grad_gate_output = torch.ops.aten.silu_backward(grad_gate_activation, gate_output)
         del grad_gate_activation, gate_output
 
         # FC1 dgrad
         grad_scatter_output = group_gemm_same_nk(
-            a=grad_gate_output, b=gate_proj,
-            cumsum_M=cumsum_t, max_M=max_M, transpose_b=True,
+            a=grad_gate_output,
+            b=gate_proj,
+            cumsum_M=cumsum_t,
+            max_M=max_M,
+            transpose_b=True,
         )
         grad_scatter_output += group_gemm_same_nk(
-            a=grad_up_output, b=up_proj,
-            cumsum_M=cumsum_t, max_M=max_M, transpose_b=True,
+            a=grad_up_output,
+            b=up_proj,
+            cumsum_M=cumsum_t,
+            max_M=max_M,
+            transpose_b=True,
         )
 
         # FC1 wgrad
@@ -579,16 +754,26 @@ class TritonMoeExpertsFunctionMoeAct(torch.autograd.Function):
         if gate_proj.requires_grad:
             grad_gate_proj = torch.empty_like(gate_proj)
             group_gemm_same_mn(
-                a=scatter_output, b=grad_gate_output, c=grad_gate_proj,
-                cumsum_K=cumsum_t, max_K=max_M, transpose_a=True, transpose_b=False,
+                a=scatter_output,
+                b=grad_gate_output,
+                c=grad_gate_proj,
+                cumsum_K=cumsum_t,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
             )
         del grad_gate_output
         grad_up_proj = None
         if up_proj.requires_grad:
             grad_up_proj = torch.empty_like(up_proj)
             group_gemm_same_mn(
-                a=scatter_output, b=grad_up_output, c=grad_up_proj,
-                cumsum_K=cumsum_t, max_K=max_M, transpose_a=True, transpose_b=False,
+                a=scatter_output,
+                b=grad_up_output,
+                c=grad_up_proj,
+                cumsum_K=cumsum_t,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
             )
         del grad_up_output, scatter_output
 

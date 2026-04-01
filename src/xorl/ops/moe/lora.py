@@ -49,10 +49,15 @@ def make_ep_lora_compute(gemm_nk, gemm_mn):
             ctx,
             permute_tokens,
             cumsum,
-            gate_proj, up_proj, down_proj,
-            gate_proj_lora_A, gate_proj_lora_B,
-            up_proj_lora_A, up_proj_lora_B,
-            down_proj_lora_A, down_proj_lora_B,
+            gate_proj,
+            up_proj,
+            down_proj,
+            gate_proj_lora_A,
+            gate_proj_lora_B,
+            up_proj_lora_A,
+            up_proj_lora_B,
+            down_proj_lora_A,
+            down_proj_lora_B,
             scaling,
         ):
             max_M = permute_tokens.shape[0]
@@ -94,8 +99,12 @@ def make_ep_lora_compute(gemm_nk, gemm_mn):
             # === gate_proj and up_proj with FUSED base GEMM ===
             gate_up_weight = torch.cat([gate_proj, up_proj], dim=2)
             gate_up_output = gemm_nk(
-                a=permute_tokens, b=gate_up_weight,
-                cumsum_M=cumsum, max_M=max_M, transpose_a=False, transpose_b=False,
+                a=permute_tokens,
+                b=gate_up_weight,
+                cumsum_M=cumsum,
+                max_M=max_M,
+                transpose_a=False,
+                transpose_b=False,
             )
             gate_base = gate_up_output[:, :intermediate_size]
             up_base = gate_up_output[:, intermediate_size:]
@@ -103,23 +112,35 @@ def make_ep_lora_compute(gemm_nk, gemm_mn):
             # === gate and up LoRA A: Fused GEMM ===
             gate_up_lora_A = torch.cat([gate_proj_lora_A, up_proj_lora_A], dim=2)
             gate_up_lora_intermediate = gemm_nk(
-                a=permute_tokens, b=gate_up_lora_A,
-                cumsum_M=cumsum, max_M=max_M, transpose_a=False, transpose_b=False,
+                a=permute_tokens,
+                b=gate_up_lora_A,
+                cumsum_M=cumsum,
+                max_M=max_M,
+                transpose_a=False,
+                transpose_b=False,
             )
             gate_lora_intermediate = gate_up_lora_intermediate[:, :lora_r].contiguous()
             up_lora_intermediate = gate_up_lora_intermediate[:, lora_r:].contiguous()
 
             # === gate LoRA B ===
             gate_lora_output = gemm_nk(
-                a=gate_lora_intermediate, b=gate_proj_lora_B,
-                cumsum_M=cumsum, max_M=max_M, transpose_a=False, transpose_b=False,
+                a=gate_lora_intermediate,
+                b=gate_proj_lora_B,
+                cumsum_M=cumsum,
+                max_M=max_M,
+                transpose_a=False,
+                transpose_b=False,
             )
             gate_output = (gate_base + gate_lora_output * scaling).contiguous()
 
             # === up LoRA B ===
             up_lora_output = gemm_nk(
-                a=up_lora_intermediate, b=up_proj_lora_B,
-                cumsum_M=cumsum, max_M=max_M, transpose_a=False, transpose_b=False,
+                a=up_lora_intermediate,
+                b=up_proj_lora_B,
+                cumsum_M=cumsum,
+                max_M=max_M,
+                transpose_a=False,
+                transpose_b=False,
             )
             up_output = (up_base + up_lora_output * scaling).contiguous()
 
@@ -129,16 +150,28 @@ def make_ep_lora_compute(gemm_nk, gemm_mn):
 
             # === down_proj with LoRA ===
             down_output = gemm_nk(
-                a=gated_output, b=down_proj,
-                cumsum_M=cumsum, max_M=max_M, transpose_a=False, transpose_b=False,
+                a=gated_output,
+                b=down_proj,
+                cumsum_M=cumsum,
+                max_M=max_M,
+                transpose_a=False,
+                transpose_b=False,
             )
             down_lora_intermediate = gemm_nk(
-                a=gated_output, b=down_proj_lora_A,
-                cumsum_M=cumsum, max_M=max_M, transpose_a=False, transpose_b=False,
+                a=gated_output,
+                b=down_proj_lora_A,
+                cumsum_M=cumsum,
+                max_M=max_M,
+                transpose_a=False,
+                transpose_b=False,
             )
             down_lora_output = gemm_nk(
-                a=down_lora_intermediate, b=down_proj_lora_B,
-                cumsum_M=cumsum, max_M=max_M, transpose_a=False, transpose_b=False,
+                a=down_lora_intermediate,
+                b=down_proj_lora_B,
+                cumsum_M=cumsum,
+                max_M=max_M,
+                transpose_a=False,
+                transpose_b=False,
             )
             down_output = down_output + down_lora_output * scaling
 
@@ -150,26 +183,46 @@ def make_ep_lora_compute(gemm_nk, gemm_mn):
             ctx.num_local_experts = num_local_experts
             ctx.compute_dtype = compute_dtype
             ctx.save_for_backward(
-                permute_tokens, cumsum,
-                gate_proj, up_proj, down_proj,
-                orig_gate_proj_lora_A, orig_gate_proj_lora_B,
-                orig_up_proj_lora_A, orig_up_proj_lora_B,
-                orig_down_proj_lora_A, orig_down_proj_lora_B,
-                gate_output, up_output, gated_output,
-                gate_lora_intermediate, up_lora_intermediate, down_lora_intermediate,
+                permute_tokens,
+                cumsum,
+                gate_proj,
+                up_proj,
+                down_proj,
+                orig_gate_proj_lora_A,
+                orig_gate_proj_lora_B,
+                orig_up_proj_lora_A,
+                orig_up_proj_lora_B,
+                orig_down_proj_lora_A,
+                orig_down_proj_lora_B,
+                gate_output,
+                up_output,
+                gated_output,
+                gate_lora_intermediate,
+                up_lora_intermediate,
+                down_lora_intermediate,
             )
             return down_output
 
         @staticmethod
         def backward(ctx, grad_output):
             (
-                permute_tokens, cumsum,
-                gate_proj, up_proj, down_proj,
-                gate_proj_lora_A, gate_proj_lora_B,
-                up_proj_lora_A, up_proj_lora_B,
-                down_proj_lora_A, down_proj_lora_B,
-                gate_output, up_output, gated_output,
-                gate_lora_intermediate, up_lora_intermediate, down_lora_intermediate,
+                permute_tokens,
+                cumsum,
+                gate_proj,
+                up_proj,
+                down_proj,
+                gate_proj_lora_A,
+                gate_proj_lora_B,
+                up_proj_lora_A,
+                up_proj_lora_B,
+                down_proj_lora_A,
+                down_proj_lora_B,
+                gate_output,
+                up_output,
+                gated_output,
+                gate_lora_intermediate,
+                up_lora_intermediate,
+                down_lora_intermediate,
             ) = ctx.saved_tensors
 
             scaling = ctx.scaling
@@ -182,12 +235,24 @@ def make_ep_lora_compute(gemm_nk, gemm_mn):
             max_M = grad_output.shape[0]
 
             # Cast LoRA weights to compute dtype for backward
-            gate_proj_lora_A_compute = gate_proj_lora_A.to(compute_dtype) if gate_proj_lora_A.dtype != compute_dtype else gate_proj_lora_A
-            gate_proj_lora_B_compute = gate_proj_lora_B.to(compute_dtype) if gate_proj_lora_B.dtype != compute_dtype else gate_proj_lora_B
-            up_proj_lora_A_compute = up_proj_lora_A.to(compute_dtype) if up_proj_lora_A.dtype != compute_dtype else up_proj_lora_A
-            up_proj_lora_B_compute = up_proj_lora_B.to(compute_dtype) if up_proj_lora_B.dtype != compute_dtype else up_proj_lora_B
-            down_proj_lora_A_compute = down_proj_lora_A.to(compute_dtype) if down_proj_lora_A.dtype != compute_dtype else down_proj_lora_A
-            down_proj_lora_B_compute = down_proj_lora_B.to(compute_dtype) if down_proj_lora_B.dtype != compute_dtype else down_proj_lora_B
+            gate_proj_lora_A_compute = (
+                gate_proj_lora_A.to(compute_dtype) if gate_proj_lora_A.dtype != compute_dtype else gate_proj_lora_A
+            )
+            gate_proj_lora_B_compute = (
+                gate_proj_lora_B.to(compute_dtype) if gate_proj_lora_B.dtype != compute_dtype else gate_proj_lora_B
+            )
+            up_proj_lora_A_compute = (
+                up_proj_lora_A.to(compute_dtype) if up_proj_lora_A.dtype != compute_dtype else up_proj_lora_A
+            )
+            up_proj_lora_B_compute = (
+                up_proj_lora_B.to(compute_dtype) if up_proj_lora_B.dtype != compute_dtype else up_proj_lora_B
+            )
+            down_proj_lora_A_compute = (
+                down_proj_lora_A.to(compute_dtype) if down_proj_lora_A.dtype != compute_dtype else down_proj_lora_A
+            )
+            down_proj_lora_B_compute = (
+                down_proj_lora_B.to(compute_dtype) if down_proj_lora_B.dtype != compute_dtype else down_proj_lora_B
+            )
 
             if gate_A_shared:
                 gate_proj_lora_A_compute = gate_proj_lora_A_compute.expand(num_local_experts, -1, -1).contiguous()
@@ -198,47 +263,75 @@ def make_ep_lora_compute(gemm_nk, gemm_mn):
 
             # Initialize LoRA gradients
             grad_gate_proj_lora_A_full = torch.zeros(
-                num_local_experts, gate_proj_lora_A.shape[1], gate_proj_lora_A.shape[2],
-                dtype=gate_proj_lora_A.dtype, device=gate_proj_lora_A.device,
+                num_local_experts,
+                gate_proj_lora_A.shape[1],
+                gate_proj_lora_A.shape[2],
+                dtype=gate_proj_lora_A.dtype,
+                device=gate_proj_lora_A.device,
             )
             grad_gate_proj_lora_B = torch.zeros_like(gate_proj_lora_B)
             grad_up_proj_lora_A_full = torch.zeros(
-                num_local_experts, up_proj_lora_A.shape[1], up_proj_lora_A.shape[2],
-                dtype=up_proj_lora_A.dtype, device=up_proj_lora_A.device,
+                num_local_experts,
+                up_proj_lora_A.shape[1],
+                up_proj_lora_A.shape[2],
+                dtype=up_proj_lora_A.dtype,
+                device=up_proj_lora_A.device,
             )
             grad_up_proj_lora_B = torch.zeros_like(up_proj_lora_B)
             grad_down_proj_lora_A = torch.zeros_like(down_proj_lora_A)
             grad_down_proj_lora_B_full = torch.zeros(
-                num_local_experts, down_proj_lora_B.shape[1], down_proj_lora_B.shape[2],
-                dtype=down_proj_lora_B.dtype, device=down_proj_lora_B.device,
+                num_local_experts,
+                down_proj_lora_B.shape[1],
+                down_proj_lora_B.shape[2],
+                dtype=down_proj_lora_B.dtype,
+                device=down_proj_lora_B.device,
             )
 
             # === down_proj backward ===
             grad_gated_output = gemm_nk(
-                a=grad_output, b=down_proj,
-                cumsum_M=cumsum, max_M=max_M, transpose_b=True,
+                a=grad_output,
+                b=down_proj,
+                cumsum_M=cumsum,
+                max_M=max_M,
+                transpose_b=True,
             )
 
             gemm_mn(
-                a=down_lora_intermediate, b=grad_output, c=grad_down_proj_lora_B_full,
-                cumsum_K=cumsum, max_K=max_M, transpose_a=True, transpose_b=False,
+                a=down_lora_intermediate,
+                b=grad_output,
+                c=grad_down_proj_lora_B_full,
+                cumsum_K=cumsum,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
             )
             grad_down_proj_lora_B_full.mul_(scaling)
 
             grad_down_lora_intermediate = gemm_nk(
-                a=grad_output, b=down_proj_lora_B_compute,
-                cumsum_M=cumsum, max_M=max_M, transpose_b=True,
+                a=grad_output,
+                b=down_proj_lora_B_compute,
+                cumsum_M=cumsum,
+                max_M=max_M,
+                transpose_b=True,
             )
             grad_down_lora_intermediate.mul_(scaling)
 
             gemm_mn(
-                a=gated_output, b=grad_down_lora_intermediate, c=grad_down_proj_lora_A,
-                cumsum_K=cumsum, max_K=max_M, transpose_a=True, transpose_b=False,
+                a=gated_output,
+                b=grad_down_lora_intermediate,
+                c=grad_down_proj_lora_A,
+                cumsum_K=cumsum,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
             )
 
             grad_gated_from_lora = gemm_nk(
-                a=grad_down_lora_intermediate, b=down_proj_lora_A_compute,
-                cumsum_M=cumsum, max_M=max_M, transpose_b=True,
+                a=grad_down_lora_intermediate,
+                b=down_proj_lora_A_compute,
+                cumsum_M=cumsum,
+                max_M=max_M,
+                transpose_b=True,
             )
             grad_gated_output = grad_gated_output + grad_gated_from_lora
 
@@ -249,64 +342,104 @@ def make_ep_lora_compute(gemm_nk, gemm_mn):
 
             # === up_proj backward ===
             grad_permute_tokens_2 = gemm_nk(
-                a=grad_up_output, b=up_proj,
-                cumsum_M=cumsum, max_M=max_M, transpose_b=True,
+                a=grad_up_output,
+                b=up_proj,
+                cumsum_M=cumsum,
+                max_M=max_M,
+                transpose_b=True,
             )
 
             gemm_mn(
-                a=up_lora_intermediate, b=grad_up_output, c=grad_up_proj_lora_B,
-                cumsum_K=cumsum, max_K=max_M, transpose_a=True, transpose_b=False,
+                a=up_lora_intermediate,
+                b=grad_up_output,
+                c=grad_up_proj_lora_B,
+                cumsum_K=cumsum,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
             )
             grad_up_proj_lora_B.mul_(scaling)
 
             grad_up_lora_intermediate = gemm_nk(
-                a=grad_up_output, b=up_proj_lora_B_compute,
-                cumsum_M=cumsum, max_M=max_M, transpose_b=True,
+                a=grad_up_output,
+                b=up_proj_lora_B_compute,
+                cumsum_M=cumsum,
+                max_M=max_M,
+                transpose_b=True,
             )
             grad_up_lora_intermediate.mul_(scaling)
 
             gemm_mn(
-                a=permute_tokens, b=grad_up_lora_intermediate, c=grad_up_proj_lora_A_full,
-                cumsum_K=cumsum, max_K=max_M, transpose_a=True, transpose_b=False,
+                a=permute_tokens,
+                b=grad_up_lora_intermediate,
+                c=grad_up_proj_lora_A_full,
+                cumsum_K=cumsum,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
             )
 
             grad_permute_from_lora_2 = gemm_nk(
-                a=grad_up_lora_intermediate, b=up_proj_lora_A_compute,
-                cumsum_M=cumsum, max_M=max_M, transpose_b=True,
+                a=grad_up_lora_intermediate,
+                b=up_proj_lora_A_compute,
+                cumsum_M=cumsum,
+                max_M=max_M,
+                transpose_b=True,
             )
             grad_permute_tokens_2 = grad_permute_tokens_2 + grad_permute_from_lora_2
 
             # === SiLU backward ===
-            grad_gate_output = torch.ops.aten.silu_backward(
-                grad_gate_activation.float(), gate_output.float()
-            ).to(gate_output.dtype).contiguous()
+            grad_gate_output = (
+                torch.ops.aten.silu_backward(grad_gate_activation.float(), gate_output.float())
+                .to(gate_output.dtype)
+                .contiguous()
+            )
 
             # === gate_proj backward ===
             grad_permute_tokens_1 = gemm_nk(
-                a=grad_gate_output, b=gate_proj,
-                cumsum_M=cumsum, max_M=max_M, transpose_b=True,
+                a=grad_gate_output,
+                b=gate_proj,
+                cumsum_M=cumsum,
+                max_M=max_M,
+                transpose_b=True,
             )
 
             gemm_mn(
-                a=gate_lora_intermediate, b=grad_gate_output, c=grad_gate_proj_lora_B,
-                cumsum_K=cumsum, max_K=max_M, transpose_a=True, transpose_b=False,
+                a=gate_lora_intermediate,
+                b=grad_gate_output,
+                c=grad_gate_proj_lora_B,
+                cumsum_K=cumsum,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
             )
             grad_gate_proj_lora_B.mul_(scaling)
 
             grad_gate_lora_intermediate = gemm_nk(
-                a=grad_gate_output, b=gate_proj_lora_B_compute,
-                cumsum_M=cumsum, max_M=max_M, transpose_b=True,
+                a=grad_gate_output,
+                b=gate_proj_lora_B_compute,
+                cumsum_M=cumsum,
+                max_M=max_M,
+                transpose_b=True,
             )
             grad_gate_lora_intermediate.mul_(scaling)
 
             gemm_mn(
-                a=permute_tokens, b=grad_gate_lora_intermediate, c=grad_gate_proj_lora_A_full,
-                cumsum_K=cumsum, max_K=max_M, transpose_a=True, transpose_b=False,
+                a=permute_tokens,
+                b=grad_gate_lora_intermediate,
+                c=grad_gate_proj_lora_A_full,
+                cumsum_K=cumsum,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
             )
 
             grad_permute_from_lora_1 = gemm_nk(
-                a=grad_gate_lora_intermediate, b=gate_proj_lora_A_compute,
-                cumsum_M=cumsum, max_M=max_M, transpose_b=True,
+                a=grad_gate_lora_intermediate,
+                b=gate_proj_lora_A_compute,
+                cumsum_M=cumsum,
+                max_M=max_M,
+                transpose_b=True,
             )
             grad_permute_tokens_1 = grad_permute_tokens_1 + grad_permute_from_lora_1
 
@@ -314,6 +447,7 @@ def make_ep_lora_compute(gemm_nk, gemm_mn):
 
             # === Reduce gradients for shared weights ===
             from xorl.distributed.parallel_state import get_parallel_state
+
             ep_group = get_parallel_state().ep_group
 
             if gate_A_shared:
@@ -337,10 +471,15 @@ def make_ep_lora_compute(gemm_nk, gemm_mn):
             return (
                 grad_permute_tokens,
                 None,  # cumsum
-                None, None, None,  # base weights (frozen)
-                grad_gate_proj_lora_A, grad_gate_proj_lora_B,
-                grad_up_proj_lora_A, grad_up_proj_lora_B,
-                grad_down_proj_lora_A, grad_down_proj_lora_B,
+                None,
+                None,
+                None,  # base weights (frozen)
+                grad_gate_proj_lora_A,
+                grad_gate_proj_lora_B,
+                grad_up_proj_lora_A,
+                grad_up_proj_lora_B,
+                grad_down_proj_lora_A,
+                grad_down_proj_lora_B,
                 None,  # scaling
             )
 
@@ -442,8 +581,12 @@ def make_local_lora_compute(gemm_nk, gemm_mn):
             # MOE Step 4 & 6: base GEMM (concat on dim=2 for (G,K,2N))
             gate_up_weight = torch.cat([gate_proj, up_proj], dim=2)
             gate_up_output = gemm_nk(
-                a=scatter_output, b=gate_up_weight,
-                cumsum_M=cumsum_t, max_M=max_M, transpose_a=False, transpose_b=False,
+                a=scatter_output,
+                b=gate_up_weight,
+                cumsum_M=cumsum_t,
+                max_M=max_M,
+                transpose_a=False,
+                transpose_b=False,
             )
             gate_base = gate_up_output[:, :intermediate_size]
             up_base = gate_up_output[:, intermediate_size:]
@@ -452,23 +595,35 @@ def make_local_lora_compute(gemm_nk, gemm_mn):
             lora_r = gate_proj_lora_A.shape[2]
             gate_up_lora_A = torch.cat([gate_proj_lora_A, up_proj_lora_A], dim=2)
             gate_up_lora_intermediate = gemm_nk(
-                a=scatter_output, b=gate_up_lora_A,
-                cumsum_M=cumsum_t, max_M=max_M, transpose_a=False, transpose_b=False,
+                a=scatter_output,
+                b=gate_up_lora_A,
+                cumsum_M=cumsum_t,
+                max_M=max_M,
+                transpose_a=False,
+                transpose_b=False,
             )
             gate_lora_intermediate = gate_up_lora_intermediate[:, :lora_r].contiguous()
             up_lora_intermediate = gate_up_lora_intermediate[:, lora_r:].contiguous()
 
             # LoRA B for gate: z @ B
             gate_lora_output = gemm_nk(
-                a=gate_lora_intermediate, b=gate_proj_lora_B,
-                cumsum_M=cumsum_t, max_M=max_M, transpose_a=False, transpose_b=False,
+                a=gate_lora_intermediate,
+                b=gate_proj_lora_B,
+                cumsum_M=cumsum_t,
+                max_M=max_M,
+                transpose_a=False,
+                transpose_b=False,
             )
             gate_output = (gate_base + gate_lora_output * scaling).contiguous()
 
             # LoRA B for up: z @ B
             up_lora_output = gemm_nk(
-                a=up_lora_intermediate, b=up_proj_lora_B,
-                cumsum_M=cumsum_t, max_M=max_M, transpose_a=False, transpose_b=False,
+                a=up_lora_intermediate,
+                b=up_proj_lora_B,
+                cumsum_M=cumsum_t,
+                max_M=max_M,
+                transpose_a=False,
+                transpose_b=False,
             )
             up_output = (up_base + up_lora_output * scaling).contiguous()
 
@@ -484,18 +639,30 @@ def make_local_lora_compute(gemm_nk, gemm_mn):
 
             # down_proj base: h @ W
             down_output = gemm_nk(
-                a=gated_weighted, b=down_proj,
-                cumsum_M=cumsum_t, max_M=max_M, transpose_a=False, transpose_b=False,
+                a=gated_weighted,
+                b=down_proj,
+                cumsum_M=cumsum_t,
+                max_M=max_M,
+                transpose_a=False,
+                transpose_b=False,
             )
 
             # down_proj LoRA: (h @ A) @ B * scaling
             down_lora_intermediate = gemm_nk(
-                a=gated_weighted, b=down_proj_lora_A,
-                cumsum_M=cumsum_t, max_M=max_M, transpose_a=False, transpose_b=False,
+                a=gated_weighted,
+                b=down_proj_lora_A,
+                cumsum_M=cumsum_t,
+                max_M=max_M,
+                transpose_a=False,
+                transpose_b=False,
             )
             down_lora_output = gemm_nk(
-                a=down_lora_intermediate, b=down_proj_lora_B,
-                cumsum_M=cumsum_t, max_M=max_M, transpose_a=False, transpose_b=False,
+                a=down_lora_intermediate,
+                b=down_proj_lora_B,
+                cumsum_M=cumsum_t,
+                max_M=max_M,
+                transpose_a=False,
+                transpose_b=False,
             )
             down_output = down_output + down_lora_output * scaling
 
@@ -511,14 +678,27 @@ def make_local_lora_compute(gemm_nk, gemm_mn):
             ctx.down_B_shared = down_B_shared
             ctx.save_for_backward(
                 gate_weights,
-                gate_proj, up_proj, down_proj,
-                orig_gate_proj_lora_A, orig_gate_proj_lora_B,
-                orig_up_proj_lora_A, orig_up_proj_lora_B,
-                orig_down_proj_lora_A, orig_down_proj_lora_B,
-                hidden_states, scatter_index, scatter_output, cumsum_t,
-                gate_output, up_output, gated_activation,
-                scattered_gate_weight, gated_weighted,
-                gate_lora_intermediate, up_lora_intermediate, down_lora_intermediate,
+                gate_proj,
+                up_proj,
+                down_proj,
+                orig_gate_proj_lora_A,
+                orig_gate_proj_lora_B,
+                orig_up_proj_lora_A,
+                orig_up_proj_lora_B,
+                orig_down_proj_lora_A,
+                orig_down_proj_lora_B,
+                hidden_states,
+                scatter_index,
+                scatter_output,
+                cumsum_t,
+                gate_output,
+                up_output,
+                gated_activation,
+                scattered_gate_weight,
+                gated_weighted,
+                gate_lora_intermediate,
+                up_lora_intermediate,
+                down_lora_intermediate,
             )
 
             return output
@@ -527,14 +707,27 @@ def make_local_lora_compute(gemm_nk, gemm_mn):
         def backward(ctx, grad_output):
             (
                 gate_weights,
-                gate_proj, up_proj, down_proj,
-                gate_proj_lora_A, gate_proj_lora_B,
-                up_proj_lora_A, up_proj_lora_B,
-                down_proj_lora_A, down_proj_lora_B,
-                hidden_states, scatter_index, scatter_output, cumsum_t,
-                gate_output, up_output, gated_activation,
-                scattered_gate_weight, gated_weighted,
-                gate_lora_intermediate, up_lora_intermediate, down_lora_intermediate,
+                gate_proj,
+                up_proj,
+                down_proj,
+                gate_proj_lora_A,
+                gate_proj_lora_B,
+                up_proj_lora_A,
+                up_proj_lora_B,
+                down_proj_lora_A,
+                down_proj_lora_B,
+                hidden_states,
+                scatter_index,
+                scatter_output,
+                cumsum_t,
+                gate_output,
+                up_output,
+                gated_activation,
+                scattered_gate_weight,
+                gated_weighted,
+                gate_lora_intermediate,
+                up_lora_intermediate,
+                down_lora_intermediate,
             ) = ctx.saved_tensors
 
             num_experts = ctx.num_experts
@@ -548,12 +741,24 @@ def make_local_lora_compute(gemm_nk, gemm_mn):
             max_M = scatter_output.shape[0]
 
             # Cast LoRA weights to compute dtype
-            gate_proj_lora_A_c = gate_proj_lora_A.to(compute_dtype) if gate_proj_lora_A.dtype != compute_dtype else gate_proj_lora_A
-            gate_proj_lora_B_c = gate_proj_lora_B.to(compute_dtype) if gate_proj_lora_B.dtype != compute_dtype else gate_proj_lora_B
-            up_proj_lora_A_c = up_proj_lora_A.to(compute_dtype) if up_proj_lora_A.dtype != compute_dtype else up_proj_lora_A
-            up_proj_lora_B_c = up_proj_lora_B.to(compute_dtype) if up_proj_lora_B.dtype != compute_dtype else up_proj_lora_B
-            down_proj_lora_A_c = down_proj_lora_A.to(compute_dtype) if down_proj_lora_A.dtype != compute_dtype else down_proj_lora_A
-            down_proj_lora_B_c = down_proj_lora_B.to(compute_dtype) if down_proj_lora_B.dtype != compute_dtype else down_proj_lora_B
+            gate_proj_lora_A_c = (
+                gate_proj_lora_A.to(compute_dtype) if gate_proj_lora_A.dtype != compute_dtype else gate_proj_lora_A
+            )
+            gate_proj_lora_B_c = (
+                gate_proj_lora_B.to(compute_dtype) if gate_proj_lora_B.dtype != compute_dtype else gate_proj_lora_B
+            )
+            up_proj_lora_A_c = (
+                up_proj_lora_A.to(compute_dtype) if up_proj_lora_A.dtype != compute_dtype else up_proj_lora_A
+            )
+            up_proj_lora_B_c = (
+                up_proj_lora_B.to(compute_dtype) if up_proj_lora_B.dtype != compute_dtype else up_proj_lora_B
+            )
+            down_proj_lora_A_c = (
+                down_proj_lora_A.to(compute_dtype) if down_proj_lora_A.dtype != compute_dtype else down_proj_lora_A
+            )
+            down_proj_lora_B_c = (
+                down_proj_lora_B.to(compute_dtype) if down_proj_lora_B.dtype != compute_dtype else down_proj_lora_B
+            )
 
             # Expand shared LoRA weights for backward compute
             if gate_A_shared:
@@ -565,19 +770,28 @@ def make_local_lora_compute(gemm_nk, gemm_mn):
 
             # Initialize LoRA gradients — use full-size buffers for shared weights
             grad_gate_proj_lora_A_full = torch.zeros(
-                num_experts, gate_proj_lora_A.shape[1], gate_proj_lora_A.shape[2],
-                dtype=gate_proj_lora_A.dtype, device=gate_proj_lora_A.device,
+                num_experts,
+                gate_proj_lora_A.shape[1],
+                gate_proj_lora_A.shape[2],
+                dtype=gate_proj_lora_A.dtype,
+                device=gate_proj_lora_A.device,
             )
             grad_gate_proj_lora_B = torch.zeros_like(gate_proj_lora_B)
             grad_up_proj_lora_A_full = torch.zeros(
-                num_experts, up_proj_lora_A.shape[1], up_proj_lora_A.shape[2],
-                dtype=up_proj_lora_A.dtype, device=up_proj_lora_A.device,
+                num_experts,
+                up_proj_lora_A.shape[1],
+                up_proj_lora_A.shape[2],
+                dtype=up_proj_lora_A.dtype,
+                device=up_proj_lora_A.device,
             )
             grad_up_proj_lora_B = torch.zeros_like(up_proj_lora_B)
             grad_down_proj_lora_A = torch.zeros_like(down_proj_lora_A)
             grad_down_proj_lora_B_full = torch.zeros(
-                num_experts, down_proj_lora_B.shape[1], down_proj_lora_B.shape[2],
-                dtype=down_proj_lora_B.dtype, device=down_proj_lora_B.device,
+                num_experts,
+                down_proj_lora_B.shape[1],
+                down_proj_lora_B.shape[2],
+                dtype=down_proj_lora_B.dtype,
+                device=down_proj_lora_B.device,
             )
 
             # MOE Step 10': scatter grad
@@ -585,32 +799,49 @@ def make_local_lora_compute(gemm_nk, gemm_mn):
 
             # ====== down_proj backward ======
             grad_gated_weighted = gemm_nk(
-                a=grad_down_output, b=down_proj,
-                cumsum_M=cumsum_t, max_M=max_M, transpose_b=True,
+                a=grad_down_output,
+                b=down_proj,
+                cumsum_M=cumsum_t,
+                max_M=max_M,
+                transpose_b=True,
             )
 
             gemm_mn(
-                a=down_lora_intermediate, b=grad_down_output,
-                c=grad_down_proj_lora_B_full, cumsum_K=cumsum_t, max_K=max_M,
-                transpose_a=True, transpose_b=False,
+                a=down_lora_intermediate,
+                b=grad_down_output,
+                c=grad_down_proj_lora_B_full,
+                cumsum_K=cumsum_t,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
             )
             grad_down_proj_lora_B_full.mul_(scaling)
 
             grad_down_lora_intermediate = gemm_nk(
-                a=grad_down_output, b=down_proj_lora_B_c,
-                cumsum_M=cumsum_t, max_M=max_M, transpose_b=True,
+                a=grad_down_output,
+                b=down_proj_lora_B_c,
+                cumsum_M=cumsum_t,
+                max_M=max_M,
+                transpose_b=True,
             )
             grad_down_lora_intermediate.mul_(scaling)
 
             gemm_mn(
-                a=gated_weighted, b=grad_down_lora_intermediate,
-                c=grad_down_proj_lora_A, cumsum_K=cumsum_t, max_K=max_M,
-                transpose_a=True, transpose_b=False,
+                a=gated_weighted,
+                b=grad_down_lora_intermediate,
+                c=grad_down_proj_lora_A,
+                cumsum_K=cumsum_t,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
             )
 
             grad_gated_weighted_from_lora = gemm_nk(
-                a=grad_down_lora_intermediate, b=down_proj_lora_A_c,
-                cumsum_M=cumsum_t, max_M=max_M, transpose_b=True,
+                a=grad_down_lora_intermediate,
+                b=down_proj_lora_A_c,
+                cumsum_M=cumsum_t,
+                max_M=max_M,
+                transpose_b=True,
             )
             grad_gated_weighted = grad_gated_weighted + grad_gated_weighted_from_lora
 
@@ -626,32 +857,49 @@ def make_local_lora_compute(gemm_nk, gemm_mn):
 
             # ====== up_proj backward ======
             grad_scatter_output_2 = gemm_nk(
-                a=grad_up_output, b=up_proj,
-                cumsum_M=cumsum_t, max_M=max_M, transpose_b=True,
+                a=grad_up_output,
+                b=up_proj,
+                cumsum_M=cumsum_t,
+                max_M=max_M,
+                transpose_b=True,
             )
 
             gemm_mn(
-                a=up_lora_intermediate, b=grad_up_output,
-                c=grad_up_proj_lora_B, cumsum_K=cumsum_t, max_K=max_M,
-                transpose_a=True, transpose_b=False,
+                a=up_lora_intermediate,
+                b=grad_up_output,
+                c=grad_up_proj_lora_B,
+                cumsum_K=cumsum_t,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
             )
             grad_up_proj_lora_B.mul_(scaling)
 
             grad_up_lora_intermediate = gemm_nk(
-                a=grad_up_output, b=up_proj_lora_B_c,
-                cumsum_M=cumsum_t, max_M=max_M, transpose_b=True,
+                a=grad_up_output,
+                b=up_proj_lora_B_c,
+                cumsum_M=cumsum_t,
+                max_M=max_M,
+                transpose_b=True,
             )
             grad_up_lora_intermediate.mul_(scaling)
 
             gemm_mn(
-                a=scatter_output, b=grad_up_lora_intermediate,
-                c=grad_up_proj_lora_A_full, cumsum_K=cumsum_t, max_K=max_M,
-                transpose_a=True, transpose_b=False,
+                a=scatter_output,
+                b=grad_up_lora_intermediate,
+                c=grad_up_proj_lora_A_full,
+                cumsum_K=cumsum_t,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
             )
 
             grad_scatter_from_lora_2 = gemm_nk(
-                a=grad_up_lora_intermediate, b=up_proj_lora_A_c,
-                cumsum_M=cumsum_t, max_M=max_M, transpose_b=True,
+                a=grad_up_lora_intermediate,
+                b=up_proj_lora_A_c,
+                cumsum_M=cumsum_t,
+                max_M=max_M,
+                transpose_b=True,
             )
             grad_scatter_output_2 = grad_scatter_output_2 + grad_scatter_from_lora_2
 
@@ -660,32 +908,49 @@ def make_local_lora_compute(gemm_nk, gemm_mn):
 
             # ====== gate_proj backward ======
             grad_scatter_output_1 = gemm_nk(
-                a=grad_gate_output, b=gate_proj,
-                cumsum_M=cumsum_t, max_M=max_M, transpose_b=True,
+                a=grad_gate_output,
+                b=gate_proj,
+                cumsum_M=cumsum_t,
+                max_M=max_M,
+                transpose_b=True,
             )
 
             gemm_mn(
-                a=gate_lora_intermediate, b=grad_gate_output,
-                c=grad_gate_proj_lora_B, cumsum_K=cumsum_t, max_K=max_M,
-                transpose_a=True, transpose_b=False,
+                a=gate_lora_intermediate,
+                b=grad_gate_output,
+                c=grad_gate_proj_lora_B,
+                cumsum_K=cumsum_t,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
             )
             grad_gate_proj_lora_B.mul_(scaling)
 
             grad_gate_lora_intermediate = gemm_nk(
-                a=grad_gate_output, b=gate_proj_lora_B_c,
-                cumsum_M=cumsum_t, max_M=max_M, transpose_b=True,
+                a=grad_gate_output,
+                b=gate_proj_lora_B_c,
+                cumsum_M=cumsum_t,
+                max_M=max_M,
+                transpose_b=True,
             )
             grad_gate_lora_intermediate.mul_(scaling)
 
             gemm_mn(
-                a=scatter_output, b=grad_gate_lora_intermediate,
-                c=grad_gate_proj_lora_A_full, cumsum_K=cumsum_t, max_K=max_M,
-                transpose_a=True, transpose_b=False,
+                a=scatter_output,
+                b=grad_gate_lora_intermediate,
+                c=grad_gate_proj_lora_A_full,
+                cumsum_K=cumsum_t,
+                max_K=max_M,
+                transpose_a=True,
+                transpose_b=False,
             )
 
             grad_scatter_from_lora_1 = gemm_nk(
-                a=grad_gate_lora_intermediate, b=gate_proj_lora_A_c,
-                cumsum_M=cumsum_t, max_M=max_M, transpose_b=True,
+                a=grad_gate_lora_intermediate,
+                b=gate_proj_lora_A_c,
+                cumsum_M=cumsum_t,
+                max_M=max_M,
+                transpose_b=True,
             )
             grad_scatter_output_1 = grad_scatter_output_1 + grad_scatter_from_lora_1
 
@@ -714,10 +979,15 @@ def make_local_lora_compute(gemm_nk, gemm_mn):
                 grad_gate_weight,
                 None,  # expert_index
                 grad_hidden_states,
-                None, None, None,  # base weights (frozen)
-                grad_gate_proj_lora_A, grad_gate_proj_lora_B,
-                grad_up_proj_lora_A, grad_up_proj_lora_B,
-                grad_down_proj_lora_A, grad_down_proj_lora_B,
+                None,
+                None,
+                None,  # base weights (frozen)
+                grad_gate_proj_lora_A,
+                grad_gate_proj_lora_B,
+                grad_up_proj_lora_A,
+                grad_up_proj_lora_B,
+                grad_down_proj_lora_A,
+                grad_down_proj_lora_B,
                 None,  # scaling
             )
 

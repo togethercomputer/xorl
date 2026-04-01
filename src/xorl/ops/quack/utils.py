@@ -5,10 +5,9 @@ from typing import Optional, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
-
 from cutlass import Float32, Int32, const_expr
-from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm, nvvm, vector
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 
 @dsl_user_op
@@ -26,9 +25,7 @@ def load_scalar_or_pointer(x: Float32 | cute.Pointer) -> Float32:
 
 
 @dsl_user_op
-def set_block_rank(
-    smem_ptr: cute.Pointer, peer_cta_rank_in_cluster: Int32, *, loc=None, ip=None
-) -> Int32:
+def set_block_rank(smem_ptr: cute.Pointer, peer_cta_rank_in_cluster: Int32, *, loc=None, ip=None) -> Int32:
     """Map the given smem pointer to the address at another CTA rank in the cluster."""
     smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
     return Int32(
@@ -54,12 +51,8 @@ def store_shared_remote(
     loc=None,
     ip=None,
 ) -> None:
-    remote_smem_ptr_i32 = set_block_rank(
-        smem_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
-    ).ir_value()
-    remote_mbar_ptr_i32 = set_block_rank(
-        mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
-    ).ir_value()
+    remote_smem_ptr_i32 = set_block_rank(smem_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value()
+    remote_mbar_ptr_i32 = set_block_rank(mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value()
     if const_expr(isinstance(val, float)):
         val = Float32(val)
     assert isinstance(val, (Float32, Int32, cutlass.Int64)), "val must be Float32, Int32, or Int64"
@@ -89,12 +82,8 @@ def store_shared_remote_x4(
     loc=None,
     ip=None,
 ) -> None:
-    remote_smem_ptr_i32 = set_block_rank(
-        smem_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
-    ).ir_value()
-    remote_mbar_ptr_i32 = set_block_rank(
-        mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
-    ).ir_value()
+    remote_smem_ptr_i32 = set_block_rank(smem_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value()
+    remote_mbar_ptr_i32 = set_block_rank(mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value()
     assert isinstance(val0, (Float32, Int32)), "val must be Float32, or Int32"
     dtype = Float32 if isinstance(val0, Float32) else Int32
     suffix = {Float32: "f32", Int32: "s32"}[dtype]
@@ -189,13 +178,9 @@ def fill_oob(tXsX: cute.Tensor, tXpX: Optional[cute.Tensor], fill_value: cute.Nu
 
 @dsl_user_op
 def f32x2_to_i64(a: Float32, b: Float32, *, loc=None, ip=None) -> cutlass.Int64:
-    vec_f32x2 = vector.from_elements(
-        T.vector(2, T.f32()), (a.ir_value(), b.ir_value()), loc=loc, ip=ip
-    )
+    vec_f32x2 = vector.from_elements(T.vector(2, T.f32()), (a.ir_value(), b.ir_value()), loc=loc, ip=ip)
     vec_i64x1 = vector.bitcast(T.vector(1, T.i64()), vec_f32x2)
-    res = cutlass.Int64(
-        vector.extract(vec_i64x1, dynamic_position=[], static_position=[0], loc=loc, ip=ip)
-    )
+    res = cutlass.Int64(vector.extract(vec_i64x1, dynamic_position=[], static_position=[0], loc=loc, ip=ip))
     return res
 
 
@@ -203,12 +188,8 @@ def f32x2_to_i64(a: Float32, b: Float32, *, loc=None, ip=None) -> cutlass.Int64:
 def i64_to_f32x2(c: cutlass.Int64, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
     vec_i64x1 = vector.from_elements(T.vector(1, T.i64()), (c.ir_value(),), loc=loc, ip=ip)
     vec_f32x2 = vector.bitcast(T.vector(2, T.f32()), vec_i64x1)
-    res0 = Float32(
-        vector.extract(vec_f32x2, dynamic_position=[], static_position=[0], loc=loc, ip=ip)
-    )
-    res1 = Float32(
-        vector.extract(vec_f32x2, dynamic_position=[], static_position=[1], loc=loc, ip=ip)
-    )
+    res0 = Float32(vector.extract(vec_f32x2, dynamic_position=[], static_position=[0], loc=loc, ip=ip))
+    res1 = Float32(vector.extract(vec_f32x2, dynamic_position=[], static_position=[1], loc=loc, ip=ip))
     return res0, res1
 
 
@@ -232,14 +213,10 @@ def atomic_inc_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None)
     # * NVVM call based on nvvm version
     if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
         # Old API: requires explicit result type as first positional argument
-        return nvvm.atomicrmw(
-            res=T.i32(), op=nvvm.AtomicOpKind.INC, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
-        )
+        return nvvm.atomicrmw(res=T.i32(), op=nvvm.AtomicOpKind.INC, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value())
     else:
         # New API: infers result type automatically
-        return nvvm.atomicrmw(
-            op=nvvm.AtomicOpKind.INC, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
-        )
+        return nvvm.atomicrmw(op=nvvm.AtomicOpKind.INC, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value())
 
 
 @dsl_user_op
@@ -249,14 +226,10 @@ def atomic_add_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None)
     # * NVVM call based on nvvm version
     if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
         # Old API: requires explicit result type as first positional argument
-        return nvvm.atomicrmw(
-            res=T.i32(), op=nvvm.AtomicOpKind.ADD, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
-        )
+        return nvvm.atomicrmw(res=T.i32(), op=nvvm.AtomicOpKind.ADD, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value())
     else:
         # New API: infers result type automatically
-        return nvvm.atomicrmw(
-            op=nvvm.AtomicOpKind.ADD, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
-        )
+        return nvvm.atomicrmw(op=nvvm.AtomicOpKind.ADD, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value())
 
 
 @dsl_user_op

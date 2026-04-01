@@ -1,29 +1,25 @@
 # Copyright (c) 2025, Wentao Guo, Tri Dao.
-from typing import Tuple, Optional, Callable
-from functools import partial
 from dataclasses import dataclass
-
-from torch import Tensor
+from functools import partial
+from typing import Callable, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.utils.hopper_helpers as sm90_utils_og
-import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass import Int32, Float32, Boolean, const_expr
 import cutlass.torch as cutlass_torch
+import cutlass.utils.blackwell_helpers as sm100_utils
+import cutlass.utils.hopper_helpers as sm90_utils_og
+from cutlass import Boolean, Float32, Int32, const_expr
 from cutlass.cute.runtime import from_dlpack
+from torch import Tensor
 
-from .cute_dsl_utils import ArgumentsBase, ParamsBase
-from .varlen_utils import VarlenManager
+from . import activation, copy_utils, sm90_utils
+from .cute_dsl_utils import ArgumentsBase, ParamsBase, get_device_capacity, get_max_active_clusters
+from .gemm_default_epi import GemmDefaultEpiMixin
 from .gemm_sm90 import GemmSm90
 from .gemm_sm100 import GemmSm100
-from .gemm_default_epi import GemmDefaultEpiMixin
-from .cute_dsl_utils import get_device_capacity, get_max_active_clusters
 from .gemm_wrapper_utils import GemmTensorInfo, GemmWrapperBase
 from .layout_utils import permute_gated_Cregs_b16
-from . import sm90_utils
-from . import copy_utils
-from . import activation
+from .varlen_utils import VarlenManager
 
 
 class GemmActMixin(GemmDefaultEpiMixin):
@@ -50,9 +46,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
         mRowVecBroadcast: Optional[cute.Tensor] = None
         mColVecBroadcast: Optional[cute.Tensor] = None
 
-    def epi_to_underlying_arguments(
-        self, args: EpilogueArguments, *, loc=None, ip=None
-    ) -> EpilogueParams:
+    def epi_to_underlying_arguments(self, args: EpilogueArguments, *, loc=None, ip=None) -> EpilogueParams:
         self.postact_dtype = args.mPostAct.element_type
         self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
 
@@ -70,13 +64,10 @@ class GemmActMixin(GemmDefaultEpiMixin):
         )
         # Assume all strides are divisible by 32 bits except the last stride
         new_stride = lambda t: tuple(
-            cute.assume(s, divby=32 // t.element_type.width) if not cute.is_static(s) else s
-            for s in t.stride
+            cute.assume(s, divby=32 // t.element_type.width) if not cute.is_static(s) else s for s in t.stride
         )
         mRowVecBroadcast, mColVecBroadcast = [
-            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
-            if t is not None
-            else None
+            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) if t is not None else None
             for t in (args.mRowVecBroadcast, args.mColVecBroadcast)
         ]
         return self.EpilogueParams(
@@ -91,9 +82,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
             mColVecBroadcast=mColVecBroadcast,
         )
 
-    def epi_get_tma_atoms(
-        self, params: EpilogueParams, *, loc=None, ip=None
-    ) -> list[cute.CopyAtom]:
+    def epi_get_tma_atoms(self, params: EpilogueParams, *, loc=None, ip=None) -> list[cute.CopyAtom]:
         return [params.tma_atom_postact]
 
     def epi_get_tensormap_update_shapes_orders(
@@ -115,29 +104,21 @@ class GemmActMixin(GemmDefaultEpiMixin):
     ) -> int:
         postact_dtype = args.mPostAct.element_type
         postact_bytes_per_stage = cute.size(cute.shape(epi_tile)) * (postact_dtype.width // 8)
-        rowvec_colvec_bytes = GemmDefaultEpiMixin.epi_smem_bytes_per_stage(
-            args, cta_tile_shape_mnk, epi_tile
-        )
+        rowvec_colvec_bytes = GemmDefaultEpiMixin.epi_smem_bytes_per_stage(args, cta_tile_shape_mnk, epi_tile)
         return postact_bytes_per_stage + rowvec_colvec_bytes
 
     def epi_get_smem_struct(self, params: EpilogueParams):
         row_vec_smem_size = 0 if params.mRowVecBroadcast is None else self.cta_tile_shape_mnk[1]
         col_vec_smem_size = 0 if params.mColVecBroadcast is None else self.cta_tile_shape_mnk[0]
-        row_vec_dtype = (
-            params.mRowVecBroadcast.element_type if params.mRowVecBroadcast is not None else Float32
-        )
-        col_vec_dtype = (
-            params.mColVecBroadcast.element_type if params.mColVecBroadcast is not None else Float32
-        )
+        row_vec_dtype = params.mRowVecBroadcast.element_type if params.mRowVecBroadcast is not None else Float32
+        col_vec_dtype = params.mColVecBroadcast.element_type if params.mColVecBroadcast is not None else Float32
 
         @cute.struct
         class EpiSharedStorage:
             sRowVec: cute.struct.Align[cute.struct.MemRange[row_vec_dtype, row_vec_smem_size], 16]
             sColVec: cute.struct.Align[cute.struct.MemRange[col_vec_dtype, col_vec_smem_size], 16]
             sPostAct: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.postact_dtype, cute.cosize(params.epi_postact_smem_layout_staged)
-                ],
+                cute.struct.MemRange[self.postact_dtype, cute.cosize(params.epi_postact_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
 
@@ -191,9 +172,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
             if self.arch == 100
             else sm90_utils_og.sm90_get_smem_store_op
         )
-        copy_atom_postact_r2s = get_smem_store_op(
-            self.postact_layout, self.postact_dtype, self.acc_dtype
-        )
+        copy_atom_postact_r2s = get_smem_store_op(self.postact_layout, self.postact_dtype, self.acc_dtype)
         # tiled_copy_C_atom = self.epilog_smem_copy_atom(tiled_mma)
         # tiled_copy_postact_r2s = cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_C_atom)
         tiled_copy_postact_r2s = cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_r2s)
@@ -211,9 +190,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
         )
 
         # We iterate over epi tiles in the N dimension first before the M dimension
-        epi_tile_shape = cute.zipped_divide(
-            cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile
-        ).shape[1]
+        epi_tile_shape = cute.zipped_divide(cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile).shape[1]
         epi_tile_layout = cute.make_layout(epi_tile_shape, stride=(epi_tile_shape[1], 1))
         epi_tile_num = cute.size(epi_tile_shape)
         num_prev_subtiles = tile_scheduler.num_tiles_executed * epi_tile_num
@@ -315,9 +292,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
                     tRS_rPostAct[i] = params.act_fn(tRS_rD[i])
             else:
                 for i in cutlass.range(cute.size(tRS_rPostAct) // 2, unroll_full=True):
-                    tRS_rPostAct[2 * i], tRS_rPostAct[2 * i + 1] = params.act_fn(
-                        (tRS_rD[2 * i], tRS_rD[2 * i + 1])
-                    )
+                    tRS_rPostAct[2 * i], tRS_rPostAct[2 * i + 1] = params.act_fn((tRS_rD[2 * i], tRS_rD[2 * i + 1]))
         else:
             tRS_rPostAct = tRS_rD
         # Type conversion
@@ -411,9 +386,7 @@ def gemm_act(
     epi_args = GemmCls.EpilogueArguments(
         tensor_infos["PostAct"].cute_tensor,
         act_fn,
-        mRowVecBroadcast=from_dlpack(rowvec_bias.detach(), assumed_align=4).mark_layout_dynamic(
-            leading_dim=1
-        )
+        mRowVecBroadcast=from_dlpack(rowvec_bias.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=1)
         if rowvec_bias is not None
         else None,
         mColVecBroadcast=from_dlpack(colvec_bias.detach(), assumed_align=4).mark_layout_dynamic(
@@ -502,9 +475,7 @@ class GemmGatedMixin(GemmActMixin):
         assert self.d_layout is None or self.d_layout.is_n_major_c()
         assert self.postact_layout.is_n_major_c()
         if self.arch == 90:
-            assert self.cta_tile_shape_mnk[1] % 32 == 0, (
-                "GemmGatedSm90 requires tileN to be divisible by 32"
-            )
+            assert self.cta_tile_shape_mnk[1] % 32 == 0, "GemmGatedSm90 requires tileN to be divisible by 32"
 
         self.cta_tile_shape_postact_mn = (
             self.cta_tile_shape_mnk[0],
@@ -527,13 +498,10 @@ class GemmGatedMixin(GemmActMixin):
         )
         # Assume all strides are divisible by 32 bits except the last stride
         new_stride = lambda t: tuple(
-            cute.assume(s, divby=32 // t.element_type.width) if not cute.is_static(s) else s
-            for s in t.stride
+            cute.assume(s, divby=32 // t.element_type.width) if not cute.is_static(s) else s for s in t.stride
         )
         mRowVecBroadcast, mColVecBroadcast = [
-            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
-            if t is not None
-            else None
+            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) if t is not None else None
             for t in (args.mRowVecBroadcast, args.mColVecBroadcast)
         ]
         return self.EpilogueParams(
@@ -555,12 +523,8 @@ class GemmGatedMixin(GemmActMixin):
         epi_tile: cute.Tile,
     ) -> int:
         postact_dtype = args.mPostAct.element_type
-        postact_bytes_per_stage = (cute.size(cute.shape(epi_tile)) // 2) * (
-            postact_dtype.width // 8
-        )
-        rowvec_colvec_bytes = GemmDefaultEpiMixin.epi_smem_bytes_per_stage(
-            args, cta_tile_shape_mnk, epi_tile
-        )
+        postact_bytes_per_stage = (cute.size(cute.shape(epi_tile)) // 2) * (postact_dtype.width // 8)
+        rowvec_colvec_bytes = GemmDefaultEpiMixin.epi_smem_bytes_per_stage(args, cta_tile_shape_mnk, epi_tile)
         return postact_bytes_per_stage + rowvec_colvec_bytes
 
     @cute.jit
@@ -649,9 +613,7 @@ def gemm_gated(
     # PostAct shape validation depends on varlen_m
     if cu_seqlens_m is not None:
         # varlen_m case: PostAct is 2D (total_m, n//2)
-        assert PostAct.dim() == 2 and PostAct.is_cuda, (
-            "PostAct must be a 2D CUDA tensor for varlen_m"
-        )
+        assert PostAct.dim() == 2 and PostAct.is_cuda, "PostAct must be a 2D CUDA tensor for varlen_m"
         assert PostAct.shape == (
             M,
             N // 2,

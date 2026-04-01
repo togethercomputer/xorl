@@ -13,11 +13,13 @@ from typing import Any, Dict, Optional
 
 import torch
 
+
 try:
     from xorl.models.transformers.qwen3_moe.modeling_qwen3_moe import (
         enable_expert_metrics,
         get_expert_metrics,
     )
+
     _HAS_MOE_METRICS = True
 except ImportError:
     _HAS_MOE_METRICS = False
@@ -104,7 +106,9 @@ class MoeMetricsTracker:
                 metrics["expert_load"] = {
                     "num_moe_layers": len(expert_metrics),
                     "total_tokens": total_tokens,
-                    "mean_imbalance_ratio": sum(all_imbalance_ratios) / len(all_imbalance_ratios) if all_imbalance_ratios else 0,
+                    "mean_imbalance_ratio": sum(all_imbalance_ratios) / len(all_imbalance_ratios)
+                    if all_imbalance_ratios
+                    else 0,
                     "max_imbalance_ratio": max(all_imbalance_ratios) if all_imbalance_ratios else 0,
                     "mean_max_load": sum(all_max_loads) / len(all_max_loads) if all_max_loads else 0,
                     "mean_min_load": sum(all_min_loads) / len(all_min_loads) if all_min_loads else 0,

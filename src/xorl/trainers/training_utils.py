@@ -143,18 +143,19 @@ def maybe_merge_lora(
         return
     if enable_qlora:
         from xorl.qlora.utils import maybe_requant_qlora
+
         maybe_requant_qlora(model)
     elif enable_lora:
         from xorl.lora.utils import maybe_merge_lora as _merge
+
         _merge(model)
 
     if reset_optimizer and optimizer is not None:
         count = reset_lora_optimizer_states(model, optimizer)
         if count > 0:
             import logging
-            logging.getLogger(__name__).info(
-                f"ReLoRA optimizer reset: pruned states for {count} LoRA parameters"
-            )
+
+            logging.getLogger(__name__).info(f"ReLoRA optimizer reset: pruned states for {count} LoRA parameters")
 
 
 def negotiate_pp_seq_len(micro_batches: List[Dict[str, Any]], pp_group) -> int:
@@ -262,12 +263,8 @@ def forward_backward_pp(
     """
     device = get_device_type()
 
-    input_ids = torch.cat(
-        [mb["input_ids"].to(device, non_blocking=True) for mb in micro_batches], dim=0
-    )
-    labels = torch.cat(
-        [mb["labels"].to(device, non_blocking=True) for mb in micro_batches], dim=0
-    )
+    input_ids = torch.cat([mb["input_ids"].to(device, non_blocking=True) for mb in micro_batches], dim=0)
+    labels = torch.cat([mb["labels"].to(device, non_blocking=True) for mb in micro_batches], dim=0)
 
     # Per-microbatch metadata for PP forward (position_ids, flash-attn kwargs)
     _PP_FA_KEYS = ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k")

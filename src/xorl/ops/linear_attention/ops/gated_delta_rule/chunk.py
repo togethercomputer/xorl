@@ -6,7 +6,10 @@ import warnings
 import torch
 
 from xorl.ops.linear_attention.modules.l2norm import l2norm_bwd, l2norm_fwd
-from xorl.ops.linear_attention.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
+from xorl.ops.linear_attention.ops.common.chunk_delta_h import (
+    chunk_gated_delta_rule_bwd_dhu,
+    chunk_gated_delta_rule_fwd_h,
+)
 from xorl.ops.linear_attention.ops.common.chunk_o import chunk_bwd_dqkwg, chunk_bwd_dv_local, chunk_fwd_o
 from xorl.ops.linear_attention.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from xorl.ops.linear_attention.ops.cp import FLACPContext
@@ -193,7 +196,6 @@ def chunk_gated_delta_rule_bwd(
 
 
 class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
-
     @staticmethod
     @input_guard
     @autocast_custom_fwd
@@ -340,7 +342,7 @@ def chunk_gated_delta_rule(
             cu_seqlens=cu_seqlens
         )
     """
-    if 'head_first' in kwargs:
+    if "head_first" in kwargs:
         warnings.warn(
             "head_first is deprecated and will be removed in a future version. "
             "Please use head_first=False for now instead.",
