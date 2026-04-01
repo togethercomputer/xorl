@@ -519,14 +519,14 @@ class PackingDataset(Dataset):
 
                     # Try to load with retries
                     bins = None
-                    max_retries = 3
+                    max_retries = 30
                     for attempt in range(max_retries):
                         bins = self._load_cached_bins()
                         if bins is not None:
                             break
                         if attempt < max_retries - 1:
                             LOG.info(f"Rank {rank} retry {attempt + 1}/{max_retries} loading bins...")
-                            time.sleep(2)
+                            time.sleep(5)
 
                     if bins is None:
                         raise RuntimeError(
