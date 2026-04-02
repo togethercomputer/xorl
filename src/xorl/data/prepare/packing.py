@@ -4,6 +4,7 @@ into fixed-capacity batches to optimize memory usage and training throughput.
 """
 
 import os
+import shutil
 import time
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import cpu_count, get_context
@@ -12,6 +13,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import numba
 import numpy as np
+import torch.distributed as dist
 from datasets import Dataset as HFDataset
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer
@@ -436,6 +438,8 @@ class PackingDataset(Dataset):
 
         # Ensure the directory exists
         cache_path.parent.mkdir(parents=True, exist_ok=True)
+        if cache_path.exists():
+            shutil.rmtree(cache_path, ignore_errors=True)
 
         # Create a HF dataset from the bins
         bins_dataset = HFDataset.from_dict({"bins": bins})
@@ -457,8 +461,7 @@ class PackingDataset(Dataset):
         """Load cached bins or compute new ones with distributed coordination."""
         # Get rank from environment variable (set by torchrun/distributed launcher)
         rank = int(os.environ.get("RANK", "0"))
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        is_distributed = dist.is_available() and dist.is_initialized()
 
         # Try to load from cache first
         cached_bins = self._load_cached_bins()
@@ -476,43 +479,40 @@ class PackingDataset(Dataset):
             # Save to cache for future use
             if cache_path is not None:
                 self._save_bins_cache(bins)
+            if is_distributed:
+                dist.barrier()
         else:
             # Other ranks wait for rank 0 to finish
             if cache_path is not None:
                 LOG.info(f"Rank {rank} waiting for rank 0 to compute bins...")
-                # Wait for cache file to be created
-                max_wait_time = 3600  # 1 hour max wait
-                wait_interval = 5  # Check every 5 seconds
-                waited = 0
-
-                while not cache_path.exists() and waited < max_wait_time:
-                    time.sleep(wait_interval)
-                    waited += wait_interval
-
-                if cache_path.exists():
-                    # Wait a bit more to ensure rank 0 finished writing
-                    # (HF datasets creates the directory first, then writes files)
-                    time.sleep(2)
-
-                    # Try to load with retries
-                    bins = None
-                    max_retries = 30
-                    for attempt in range(max_retries):
-                        bins = self._load_cached_bins()
-                        if bins is not None:
-                            break
-                        if attempt < max_retries - 1:
-                            LOG.info(f"Rank {rank} retry {attempt + 1}/{max_retries} loading bins...")
-                            time.sleep(5)
-
-                    if bins is None:
-                        raise RuntimeError(
-                            f"Rank {rank} failed to load bins cached by rank 0 after {max_retries} retries. "
-                            f"Cache path: {cache_path}"
-                        )
-                    LOG.info(f"Rank {rank} loaded {len(bins)} bins from cache")
+                if is_distributed:
+                    dist.barrier()
                 else:
-                    raise RuntimeError(f"Rank {rank} timed out waiting for rank 0 to compute bins")
+                    max_wait_time = 3600
+                    wait_interval = 5
+                    waited = 0
+                    while not cache_path.exists() and waited < max_wait_time:
+                        time.sleep(wait_interval)
+                        waited += wait_interval
+                    if not cache_path.exists():
+                        raise RuntimeError(f"Rank {rank} timed out waiting for rank 0 to compute bins")
+
+                bins = None
+                max_retries = 10
+                for attempt in range(max_retries):
+                    bins = self._load_cached_bins()
+                    if bins is not None:
+                        break
+                    if attempt < max_retries - 1:
+                        LOG.info(f"Rank {rank} retry {attempt + 1}/{max_retries} loading bins...")
+                        time.sleep(2)
+
+                if bins is None:
+                    raise RuntimeError(
+                        f"Rank {rank} failed to load bins cached by rank 0 after {max_retries} retries. "
+                        f"Cache path: {cache_path}"
+                    )
+                LOG.info(f"Rank {rank} loaded {len(bins)} bins from cache")
             else:
                 # No cache path, fall back to computing on all ranks
                 LOG.warning(f"No cache path available, rank {rank} computing bins independently")

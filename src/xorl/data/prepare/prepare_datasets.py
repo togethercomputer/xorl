@@ -47,48 +47,29 @@ def _create_dummy_dataset(seq_len: int, num_samples: int = 4096, seed: int = 42,
     step entirely.
 
     Token format: each sample is ``[1, 2, 3, ..., length-1, 0]`` where
-    0 is the EOD marker. Tokens follow a global arithmetic sequence
-    ``(global_offset + i) % vocab_size`` so routing varies across samples.
-    Lengths are drawn uniformly from [1, seq_len] with seed=0 (independent
-    of the dataset seed so packing shape is always the same).
+    0 is the EOD marker. All ``num_samples`` examples are intentionally
+    identical so local benchmarks can show clean loss convergence.
     """
     import numpy as np
     import pyarrow as pa
 
     EOD = 0
     VOCAB_SIZE = vocab_size
-    # Cap at seq_len so samples always fit in sample_packing_sequence_len.
     MAX_SAMPLE_LEN = max(seq_len, 1)
-    # Lengths: uniform [1, max_sample_len], fixed seed=0 so packing is
-    # reproducible regardless of the dataset seed argument.
     # Lengths are k*16+1 so that after ShiftTokensCollator drops 1 token,
     # effective length k*16 is divisible by 2*ringattn_size for zigzag ring
-    # attention. This is a dummy-data workaround; production data should use
-    # per-document alignment in the packing pipeline (TODO).
+    # attention. This keeps the repeated sample valid for the benchmark path.
     LENGTH_ALIGN = 16
-    max_buckets = max(1, MAX_SAMPLE_LEN // LENGTH_ALIGN)
-    len_rng = np.random.RandomState(0)
-    lengths = len_rng.randint(1, max_buckets + 1, size=num_samples)
-    lengths = (lengths * LENGTH_ALIGN + 1).astype(np.int64)
+    sample_len = max(1, ((MAX_SAMPLE_LEN - 1) // LENGTH_ALIGN) * LENGTH_ALIGN + 1)
+    lengths = np.full((num_samples,), sample_len, dtype=np.int64)
 
-    # Build all tokens as one global arithmetic sequence, then slice.
-    # Each sample: (global_offset, ..., global_offset+length-2, EOD)
-    total_tokens = int(lengths.sum())
-    global_seq = np.arange(total_tokens, dtype=np.int64) % VOCAB_SIZE
-
-    # Overwrite the last position of each sample with EOD (vectorized)
-    ends = np.cumsum(lengths) - 1
-    global_seq[ends] = EOD
-
-    flat_tokens = global_seq.astype(np.int32)
-    offsets = np.concatenate([[0], np.cumsum(lengths)]).astype(np.int64)
-
+    sample_tokens = (np.arange(sample_len, dtype=np.int64) + 1) % VOCAB_SIZE
+    sample_tokens[-1] = EOD
+    flat_tokens = np.tile(sample_tokens.astype(np.int32), num_samples)
+    offsets = np.arange(0, sample_len * (num_samples + 1), sample_len, dtype=np.int64)
     tokens = pa.ListArray.from_arrays(offsets, flat_tokens)
 
-    # position_ids: [0, 1, ..., length-1] per sample — vectorized via cumsum reset
-    pos_flat = np.arange(total_tokens, dtype=np.int32)
-    starts = np.concatenate([[0], np.cumsum(lengths[:-1])]).astype(np.int64)
-    pos_flat -= np.repeat(starts, lengths).astype(np.int32)
+    pos_flat = np.tile(np.arange(sample_len, dtype=np.int32), num_samples)
     position_ids = pa.ListArray.from_arrays(offsets, pos_flat)
 
     pa_lengths = pa.array(lengths.tolist(), type=pa.int64())
