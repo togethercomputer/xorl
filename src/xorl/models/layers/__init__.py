@@ -17,7 +17,7 @@ from .moe import (
     MoELoRAConfig,
     TopKRouter,
 )
-from .normalization import RMSNorm
+from .normalization import RMSNorm, get_rmsnorm_mode, set_rmsnorm_mode
 from .rope import (
     ROPE_INIT_FUNCTIONS,
     RotaryEmbedding,
@@ -41,6 +41,7 @@ __all__ = [
     "MoELoRAConfig",
     "TopKRouter",
     "RMSNorm",
+    "get_rmsnorm_mode",
     "ROPE_INIT_FUNCTIONS",
     "RotaryEmbedding",
     "apply_rotary_pos_emb",
@@ -50,5 +51,6 @@ __all__ = [
     "repeat_kv",
     "rope_config_validation",
     "rotate_half",
+    "set_rmsnorm_mode",
     "update_causal_mask",
 ]

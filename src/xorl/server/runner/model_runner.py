@@ -494,7 +494,7 @@ class ModelRunner:
             freeze_router=self.train_config.get("freeze_router", False),
             router_fp32=self.model_config.get("router_fp32", True),
             lm_head_fp32=self.model_config.get("lm_head_fp32", True),
-            rmsnorm_native=self.model_config.get("rmsnorm_native", False),
+            rmsnorm_mode=self.model_config.get("rmsnorm_mode", "native"),
             activation_native=self.model_config.get("activation_native", False),
             rope_native=self.model_config.get("rope_native", False),
             attention_cast_bf16=self.model_config.get("attention_cast_bf16", False),

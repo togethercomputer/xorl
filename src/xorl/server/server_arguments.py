@@ -99,8 +99,13 @@ class ServerArguments:
         default=True, metadata={"help": "Upcast LM head logits computation to float32 for numerical stability."}
     )
 
-    rmsnorm_native: bool = field(
-        default=False, metadata={"help": "Use native RMSNorm (no fused kernels) for SGLang alignment."}
+    rmsnorm_mode: Literal["eager", "native", "compile"] = field(
+        default="native",
+        metadata={
+            "help": "RMSNorm implementation mode. 'native' uses torch.nn.functional.rms_norm "
+            "and is the default. 'compile' runs that native path through torch.compile. "
+            "'eager' uses the plain eager implementation."
+        },
     )
 
     activation_native: bool = field(
@@ -454,6 +459,7 @@ class ServerArguments:
         config = {
             "model": {
                 "model_path": self.model_path,
+                "model_name": self.model_name,
                 "config_path": self.config_path,
                 "tokenizer_path": self.tokenizer_path,
                 "attn_implementation": self.attn_implementation,
@@ -468,7 +474,7 @@ class ServerArguments:
                 "merge_qkv": self.merge_qkv,
                 "router_fp32": self.router_fp32,
                 "lm_head_fp32": self.lm_head_fp32,
-                "rmsnorm_native": self.rmsnorm_native,
+                "rmsnorm_mode": self.rmsnorm_mode,
                 "activation_native": self.activation_native,
                 "rope_native": self.rope_native,
                 "attention_cast_bf16": self.attention_cast_bf16,
@@ -511,6 +517,9 @@ class ServerArguments:
                 "freeze_router": self.freeze_router,
                 "pipeline_parallel_size": self.pipeline_parallel_size,
                 "pipeline_parallel_schedule": self.pipeline_parallel_schedule,
+                "pp_variable_seq_lengths": self.pp_variable_seq_lengths,
+                "log_level": self.log_level,
+                "sync_inference_method": self.sync_inference_method,
             },
             "data": {
                 # Empty data section - data comes from client at runtime

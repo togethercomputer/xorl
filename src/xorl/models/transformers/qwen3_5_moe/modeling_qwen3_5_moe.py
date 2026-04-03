@@ -18,6 +18,12 @@ from xorl.models.layers.attention import AttentionKwargs, update_causal_mask
 from xorl.models.layers.attention.backend import ATTENTION_FUNCTIONS
 from xorl.models.layers.attention.backend.eager import eager_attention_forward
 from xorl.models.layers.moe import MoEBlock
+from xorl.models.layers.normalization import (
+    compiled_zero_centered_rms_norm,
+    eager_zero_centered_rms_norm,
+    get_rmsnorm_mode,
+    native_zero_centered_rms_norm,
+)
 from xorl.models.outputs import MoeCausalLMOutput, MoeModelOutput
 from xorl.models.transformers.qwen3_5_moe import parallelize
 from xorl.models.transformers.qwen3_5_moe.checkpoint_handler import Qwen3_5MoeCheckpointHandler
@@ -88,14 +94,32 @@ class Qwen3_5MoeRMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
+        self.mode = get_rmsnorm_mode()
 
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        prenorm: bool = False,
+    ):
+        residual_out: Optional[torch.Tensor] = None
+        norm_input = x
+        if residual is not None:
+            residual_out = x + residual
+            norm_input = residual_out
 
-    def forward(self, x):
-        output = self._norm(x.float())
-        output = output * (1.0 + self.weight.float())
-        return output.type_as(x)
+        if self.mode == "eager":
+            out = eager_zero_centered_rms_norm(norm_input, self.weight, self.eps)
+        elif self.mode == "native":
+            out = native_zero_centered_rms_norm(norm_input, self.weight, self.eps)
+        elif self.mode == "compile":
+            out = compiled_zero_centered_rms_norm(norm_input, self.weight, self.eps)
+        else:
+            raise NotImplementedError(f"Unsupported rmsnorm_mode for Qwen3.5 MoE RMSNorm: {self.mode}")
+
+        if residual_out is not None and prenorm:
+            return out, residual_out
+        return out
 
 
 class Qwen3_5MoeAttention(nn.Module):
@@ -306,10 +330,7 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual=residual, prenorm=True)
         hidden_states = self.mlp(hidden_states)
         if isinstance(hidden_states, tuple):
             hidden_states, router_logits = hidden_states

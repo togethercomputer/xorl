@@ -110,11 +110,12 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
             position_embeddings=position_embeddings,
             **kwargs,
         )
-        hidden_states = residual + hidden_states
-
         # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states,
+            residual=residual,
+            prenorm=True,
+        )
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 

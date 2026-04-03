@@ -370,66 +370,51 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
 
     # Check if this is a nested config (has model/train/worker sections)
     if "model" in config and isinstance(config["model"], dict):
-        # Nested config - flatten it
+        # Nested config - flatten all keys from each section into one dict.
+        # Keys whose names already match a ServerArguments field are copied
+        # directly; a few nested keys need explicit remapping (worker.*,
+        # lora.exclude_modules).  This is forward-compatible: new fields
+        # added to ServerArguments + to_config_dict() are picked up
+        # automatically without touching this flattening logic.
         flat_config = {}
 
-        # Model section
-        model_config = config.get("model", {})
-        flat_config["model_path"] = model_config.get("model_path")
-        flat_config["model_name"] = model_config.get("model_name")
-        flat_config["config_path"] = model_config.get("config_path")
-        flat_config["tokenizer_path"] = model_config.get("tokenizer_path")
-        flat_config["attn_implementation"] = model_config.get("attn_implementation", "flash_attention_3")
-        flat_config["moe_implementation"] = model_config.get("moe_implementation")
-        # Train section
-        train_config = config.get("train", {})
-        flat_config["data_parallel_mode"] = train_config.get("data_parallel_mode", "fsdp2")
-        flat_config["data_parallel_shard_size"] = train_config.get("data_parallel_shard_size", 1)
-        flat_config["data_parallel_replicate_size"] = train_config.get("data_parallel_replicate_size", 1)
-        flat_config["ulysses_parallel_size"] = train_config.get("ulysses_parallel_size", 1)
-        flat_config["expert_parallel_size"] = train_config.get("expert_parallel_size", 1)
-        flat_config["enable_mixed_precision"] = train_config.get("enable_mixed_precision", True)
-        flat_config["enable_gradient_checkpointing"] = train_config.get("enable_gradient_checkpointing", True)
-        flat_config["enable_full_shard"] = train_config.get("enable_full_shard", True)
-        flat_config["enable_activation_offload"] = train_config.get("enable_activation_offload", False)
-        flat_config["init_device"] = train_config.get("init_device", "meta")
-        flat_config["load_checkpoint_path"] = train_config.get("load_checkpoint_path", "")
-        flat_config["ckpt_manager"] = train_config.get("ckpt_manager", "dcp")
-        flat_config["log_level"] = train_config.get("log_level", "INFO")
+        # model.* and train.* keys map 1:1 to ServerArguments fields
+        for section in ("model", "train"):
+            for k, v in config.get(section, {}).items():
+                flat_config[k] = v
 
-        # Data processing section (can be in train or data section)
+        # lora.* keys also map 1:1 except exclude_modules → qlora_exclude_modules
+        for k, v in config.get("lora", {}).items():
+            if k == "exclude_modules":
+                flat_config["qlora_exclude_modules"] = v
+            else:
+                flat_config[k] = v
+
+        # data.* — only a few fields are relevant for the server
         data_config = config.get("data", {})
-        flat_config["sample_packing_sequence_len"] = train_config.get("sample_packing_sequence_len") or data_config.get(
-            "sample_packing_sequence_len", 32000
-        )
-        flat_config["enable_packing"] = train_config.get("enable_packing", data_config.get("enable_packing", True))
+        if "sample_packing_sequence_len" not in flat_config:
+            flat_config["sample_packing_sequence_len"] = data_config.get("sample_packing_sequence_len", 32000)
+        if "enable_packing" not in flat_config:
+            flat_config["enable_packing"] = data_config.get("enable_packing", True)
 
-        # Output directory (can be in train section or top-level) - used for checkpoints, sampler weights, logs
-        # Note: This uses output_dir from config, which should be on shared filesystem for multi-node
-        flat_config["output_dir"] = train_config.get("output_dir", config.get("output_dir", "outputs"))
-
-        # Storage limit (can be in train section or top-level) - limits disk usage for output_dir
-        flat_config["storage_limit"] = train_config.get("storage_limit", config.get("storage_limit"))
-
-        # Idle session timeout (can be in train section or top-level) - sessions inactive for this duration are cleaned up
-        flat_config["idle_session_timeout"] = train_config.get(
-            "idle_session_timeout", config.get("idle_session_timeout", 7200.0)
-        )
-
-        # Training flags
-        flat_config["skip_initial_checkpoint"] = train_config.get("skip_initial_checkpoint", False)
-        flat_config["log_gradient_norms"] = train_config.get("log_gradient_norms", True)
-        flat_config["log_router_stats"] = train_config.get("log_router_stats", True)
-        flat_config["freeze_router"] = train_config.get("freeze_router", True)
-
-        # Worker section
+        # worker.* keys are prefixed with worker_ in ServerArguments
         worker_config = config.get("worker", {})
-        flat_config["worker_bind_address"] = worker_config.get("bind_address", "auto")
-        flat_config["worker_bind_host"] = worker_config.get("bind_host", "0.0.0.0")
-        flat_config["worker_bind_port"] = worker_config.get("bind_port", 5556)
-        flat_config["engine_connect_host"] = worker_config.get("engine_connect_host")
-        flat_config["worker_connection_timeout"] = worker_config.get("connection_timeout", 120.0)
-        flat_config["worker_max_retries"] = worker_config.get("max_retries", 3)
+        _worker_key_map = {
+            "bind_address": "worker_bind_address",
+            "bind_host": "worker_bind_host",
+            "bind_port": "worker_bind_port",
+            "engine_connect_host": "engine_connect_host",
+            "connection_timeout": "worker_connection_timeout",
+            "max_retries": "worker_max_retries",
+        }
+        for nested_key, flat_key in _worker_key_map.items():
+            if nested_key in worker_config:
+                flat_config[flat_key] = worker_config[nested_key]
+
+        # Top-level keys that can appear outside any section
+        for k in ("output_dir", "storage_limit", "idle_session_timeout"):
+            if k not in flat_config and k in config:
+                flat_config[k] = config[k]
 
         filtered_config = {k: v for k, v in flat_config.items() if k in valid_fields and v is not None}
     else:

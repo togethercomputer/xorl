@@ -76,7 +76,7 @@ def build_training_model(
     # --- SGLang numerical alignment ---
     router_fp32: bool = True,
     lm_head_fp32: bool = True,
-    rmsnorm_native: bool = False,
+    rmsnorm_mode: str = "native",
     activation_native: bool = False,
     rope_native: bool = False,
     attention_cast_bf16: bool = False,
@@ -117,7 +117,7 @@ def build_training_model(
         deepep_async_combine=deepep_async_combine,
         router_fp32=router_fp32,
         lm_head_fp32=lm_head_fp32,
-        rmsnorm_native=rmsnorm_native,
+        rmsnorm_mode=rmsnorm_mode,
         activation_native=activation_native,
         rope_native=rope_native,
         attention_cast_bf16=attention_cast_bf16,

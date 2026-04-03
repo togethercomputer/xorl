@@ -16,7 +16,7 @@ The core RL training loop requires capabilities that upstream SGLang does not pr
 
 3. **MoE routing data export (R3)** — for MoE models, the inference server's routing decisions must be exported so training can replay them exactly, ensuring gradient consistency. Upstream SGLang does not export expert routing indices.
 
-4. **Numerical alignment flags** — training and inference must produce identical logits for the same input. xorl-sglang supports the same numerical alignment flags as the xorl training server (`router_fp32`, `lm_head_fp32`, `rmsnorm_native`, `attention_cast_bf16`, etc.).
+4. **Numerical alignment flags** — training and inference must produce identical logits for the same input. xorl-sglang supports the same numerical alignment flags as the xorl training server (`router_fp32`, `lm_head_fp32`, `rmsnorm_mode`, `attention_cast_bf16`, etc.).
 
 ---
 
@@ -78,7 +78,7 @@ Configure both sides identically:
 # xorl server config (server_config.yaml)
 router_fp32: true
 lm_head_fp32: true
-rmsnorm_native: false
+rmsnorm_mode: compile
 activation_native: false
 rope_native: false
 attention_cast_bf16: false

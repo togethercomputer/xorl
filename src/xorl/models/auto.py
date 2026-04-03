@@ -13,6 +13,7 @@ from transformers import (
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from .layers.attention import ATTENTION_FUNCTIONS
+from .layers.normalization import set_rmsnorm_mode
 from .loader import ModelLoader, get_loader
 from .transformers.qwen3_5_shared import (
     LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE,
@@ -110,7 +111,7 @@ def build_foundation_model(
     deepep_async_combine: bool = False,
     router_fp32: bool = True,
     lm_head_fp32: bool = True,
-    rmsnorm_native: bool = False,
+    rmsnorm_mode: Literal["eager", "native", "compile"] = "native",
     activation_native: bool = False,
     rope_native: bool = False,
     attention_cast_bf16: bool = False,
@@ -144,7 +145,8 @@ def build_foundation_model(
     config._deepep_async_combine = deepep_async_combine
     config._router_fp32 = router_fp32
     config._lm_head_fp32 = lm_head_fp32
-    config._rmsnorm_native = rmsnorm_native
+    set_rmsnorm_mode(rmsnorm_mode)
+    config._rmsnorm_mode = rmsnorm_mode
     config._activation_native = activation_native
     config._rope_native = rope_native
     config._attention_cast_bf16 = attention_cast_bf16

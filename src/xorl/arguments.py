@@ -472,6 +472,14 @@ class ModelArguments:
             "(e.g., tensor parallelism, independent LoRA per projection)."
         },
     )
+    rmsnorm_mode: Literal["eager", "native", "compile"] = field(
+        default="native",
+        metadata={
+            "help": "RMSNorm implementation mode. 'native' uses torch.nn.functional.rms_norm "
+            "and is the default. 'compile' runs that native path through torch.compile. "
+            "'eager' uses the plain eager implementation."
+        },
+    )
 
     def __post_init__(self):
         if self.config_path is None and self.model_path is None:

@@ -11,7 +11,7 @@ moe_implementation: triton
 ep_dispatch: alltoall
 router_fp32: true
 lm_head_fp32: true
-rmsnorm_native: true
+rmsnorm_mode: native
 activation_native: true
 rope_native: true
 attention_cast_bf16: true

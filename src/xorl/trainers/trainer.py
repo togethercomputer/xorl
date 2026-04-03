@@ -359,6 +359,7 @@ class Trainer:
             deepep_buffer_size_gb=args.model.deepep_buffer_size_gb,
             deepep_num_sms=args.model.deepep_num_sms,
             deepep_async_combine=args.model.deepep_async_combine,
+            rmsnorm_mode=args.model.rmsnorm_mode,
             init_device=args.train.init_device,
         )
         self.model_config = self.model.config

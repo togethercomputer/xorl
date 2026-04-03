@@ -267,11 +267,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
-        hidden_states = residual + hidden_states
-
         # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states,
+            residual=residual,
+            prenorm=True,
+        )
 
         if _selective and "mlp" in self._recompute_modules:
             hidden_states = self._gradient_checkpointing_func(

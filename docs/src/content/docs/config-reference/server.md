@@ -47,7 +47,7 @@ These flags align the training model's numerics with the inference engine (SGLan
 |---|---|---|
 | `router_fp32` | `true` | Upcast MoE router gate logits to float32 for numerical stability. |
 | `lm_head_fp32` | `true` | Upcast LM head logits to float32. |
-| `rmsnorm_native` | `false` | Use unfused PyTorch RMSNorm instead of Triton kernel. |
+| `rmsnorm_mode` | `native` | RMSNorm implementation: `eager`, `native`, or `compile`. |
 | `activation_native` | `false` | Use unfused SiLU instead of fused Triton kernel. |
 | `rope_native` | `false` | Use unfused RoPE instead of flash_attn kernel. |
 | `attention_cast_bf16` | `false` | Explicitly cast Q/K to BF16 after RoPE. |
