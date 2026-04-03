@@ -26,6 +26,7 @@ from ....lora.modules.base import LoraModule
 from ....ops.group_gemm.kernel import compute_lora_scaling
 from ....utils import logging
 from ..activations import ACT2FN
+from .common import split_gate_up_proj
 
 
 logger = logging.get_logger(__name__)
@@ -53,7 +54,9 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
     and native (torch._grouped_mm). Base weights are frozen; only LoRA weights
     are trainable.
 
-    All weights in (G, K, N) format — ``[num_experts, in_features, out_features]``.
+    Base weights use fused ``gate_up_proj`` storage in (G, K, N) format —
+    ``[num_experts, in_features, out_features]``. ``gate_proj`` and
+    ``up_proj`` remain available as views for compatibility.
 
     When Expert Parallelism is enabled, pass ``num_local_experts`` to create
     weights at the local (sharded) shape.
@@ -79,12 +82,8 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         self.lora_alpha = self.lora_config.lora_alpha
 
         # Base weights (frozen) in (G, K, N) format
-        self.gate_proj = nn.Parameter(
-            torch.empty(self.num_experts, hidden_dim, intermediate_size),
-            requires_grad=False,
-        )
-        self.up_proj = nn.Parameter(
-            torch.empty(self.num_experts, hidden_dim, intermediate_size),
+        self.gate_up_proj = nn.Parameter(
+            torch.empty(self.num_experts, hidden_dim, 2 * intermediate_size),
             requires_grad=False,
         )
         self.down_proj = nn.Parameter(
@@ -125,6 +124,20 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         self.deepep_buffer_size_gb: float = 2.0
         self.deepep_num_sms: int = 20
         self.deepep_async_combine: bool = False
+
+    @property
+    def gate_proj(self) -> torch.Tensor:
+        gate_proj, _ = split_gate_up_proj(self.gate_up_proj, self.intermediate_size)
+        gate_proj.grad = (
+            None if self.gate_up_proj.grad is None else self.gate_up_proj.grad[..., : self.intermediate_size]
+        )
+        return gate_proj
+
+    @property
+    def up_proj(self) -> torch.Tensor:
+        _, up_proj = split_gate_up_proj(self.gate_up_proj, self.intermediate_size)
+        up_proj.grad = None if self.gate_up_proj.grad is None else self.gate_up_proj.grad[..., self.intermediate_size :]
+        return up_proj
 
     def _create_lora_params(
         self, name: str, A_experts: int, B_experts: int, r: int, in_features: int, out_features: int
@@ -170,7 +183,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
             for proj_name in ("gate_proj", "up_proj", "down_proj"):
                 if proj_name not in self.lora_config.target_modules:
                     continue
-                base = getattr(self, proj_name)  # nn.Parameter [E, K, N]
+                base = getattr(self, proj_name)
                 delta = self._compute_proj_delta(proj_name).to(base.dtype)
                 base.add_(delta)
         self.reset_lora_parameters()
@@ -203,13 +216,15 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         from .backend import MOE_EXPERT_BACKENDS_LORA
 
         fn = MOE_EXPERT_BACKENDS_LORA[self.moe_implementation]
+        gate_proj = self.gate_proj.contiguous()
+        up_proj = self.up_proj.contiguous()
         return fn(
             num_experts=self.num_experts,
             routing_weights=routing_weights,
             selected_experts=selected_experts,
             hidden_states=hidden_states,
-            gate_proj=self.gate_proj,
-            up_proj=self.up_proj,
+            gate_proj=gate_proj,
+            up_proj=up_proj,
             down_proj=self.down_proj,
             gate_proj_lora_A=self.gate_proj_lora_A,
             gate_proj_lora_B=self.gate_proj_lora_B,
@@ -247,6 +262,8 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         dispatch_fn = EP_DISPATCH[self.ep_dispatch]
         combine_fn = EP_COMBINE[self.ep_dispatch]
         compute_fn = EP_EXPERT_COMPUTE_LORA[self.moe_implementation]
+        gate_proj = self.gate_proj.contiguous()
+        up_proj = self.up_proj.contiguous()
 
         # Step 1: Dispatch tokens to expert-owning ranks
         dispatch_kwargs = self._build_dispatch_kwargs(hidden_states, routing_weights, selected_experts, parallel_state)
@@ -256,8 +273,8 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         expert_output = compute_fn(
             permute_tokens,
             cumsum,
-            self.gate_proj,
-            self.up_proj,
+            gate_proj,
+            up_proj,
             self.down_proj,
             self.gate_proj_lora_A,
             self.gate_proj_lora_B,
@@ -290,7 +307,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
                 buffer_size_gb=self.deepep_buffer_size_gb,
                 num_sms=self.deepep_num_sms,
             )
-            kwargs["num_local_experts"] = self.gate_proj.shape[0]
+            kwargs["num_local_experts"] = self.gate_up_proj.shape[0]
         return kwargs
 
     def _build_combine_kwargs(self, expert_output, ctx, dispatch_kwargs, parallel_state):
@@ -358,7 +375,8 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
             hybrid_shared=hybrid_shared,
         )
 
-        num_exp = module.gate_proj.shape[0]
+        base_gate_up = getattr(module, "gate_up_proj", None)
+        num_exp = base_gate_up.shape[0] if base_gate_up is not None else module.gate_proj.shape[0]
         hidden_dim = module.hidden_dim
         intermediate_size = module.intermediate_size
         moe_implementation = getattr(module, "moe_implementation", "triton")
@@ -378,13 +396,17 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         lora_experts.deepep_num_sms = getattr(module, "deepep_num_sms", 20)
         lora_experts.deepep_async_combine = getattr(module, "deepep_async_combine", False)
 
+        base_weight = base_gate_up if base_gate_up is not None else module.gate_proj
         lora_experts = lora_experts.to(
-            device=module.gate_proj.device,
-            dtype=module.gate_proj.dtype,
+            device=base_weight.device,
+            dtype=base_weight.dtype,
         )
         with torch.no_grad():
-            lora_experts.gate_proj.copy_(module.gate_proj)
-            lora_experts.up_proj.copy_(module.up_proj)
+            if base_gate_up is not None:
+                lora_experts.gate_up_proj.copy_(base_gate_up)
+            else:
+                lora_experts.gate_proj.copy_(module.gate_proj)
+                lora_experts.up_proj.copy_(module.up_proj)
             lora_experts.down_proj.copy_(module.down_proj)
 
         return lora_experts
@@ -408,7 +430,8 @@ def inject_lora_into_experts(
         hybrid_shared=hybrid_shared,
     )
 
-    num_local_experts = block.experts.gate_proj.shape[0]
+    gate_up_proj = getattr(block.experts, "gate_up_proj", None)
+    num_local_experts = gate_up_proj.shape[0] if gate_up_proj is not None else block.experts.gate_proj.shape[0]
     hidden_dim = block.experts.hidden_dim
     intermediate_size = block.experts.intermediate_size
     moe_implementation = getattr(block.experts, "moe_implementation", "triton")
@@ -428,14 +451,18 @@ def inject_lora_into_experts(
     lora_experts.deepep_num_sms = getattr(block.experts, "deepep_num_sms", 20)
     lora_experts.deepep_async_combine = getattr(block.experts, "deepep_async_combine", False)
 
+    base_weight = gate_up_proj if gate_up_proj is not None else block.experts.gate_proj
     lora_experts = lora_experts.to(
-        device=block.experts.gate_proj.device,
-        dtype=block.experts.gate_proj.dtype,
+        device=base_weight.device,
+        dtype=base_weight.dtype,
     )
 
     with torch.no_grad():
-        lora_experts.gate_proj.copy_(block.experts.gate_proj)
-        lora_experts.up_proj.copy_(block.experts.up_proj)
+        if gate_up_proj is not None:
+            lora_experts.gate_up_proj.copy_(gate_up_proj)
+        else:
+            lora_experts.gate_proj.copy_(block.experts.gate_proj)
+            lora_experts.up_proj.copy_(block.experts.up_proj)
         lora_experts.down_proj.copy_(block.experts.down_proj)
 
     block.experts = lora_experts
@@ -451,8 +478,11 @@ def inject_lora_into_experts(
 def copy_weights_to_lora_experts(source_experts: nn.Module, target_experts: nn.Module):
     """Copy base weights from source experts to LoRA experts."""
     with torch.no_grad():
-        target_experts.gate_proj.copy_(source_experts.gate_proj)
-        target_experts.up_proj.copy_(source_experts.up_proj)
+        if hasattr(source_experts, "gate_up_proj") and hasattr(target_experts, "gate_up_proj"):
+            target_experts.gate_up_proj.copy_(source_experts.gate_up_proj)
+        else:
+            target_experts.gate_proj.copy_(source_experts.gate_proj)
+            target_experts.up_proj.copy_(source_experts.up_proj)
         target_experts.down_proj.copy_(source_experts.down_proj)
 
 

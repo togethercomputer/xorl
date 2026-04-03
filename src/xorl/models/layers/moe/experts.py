@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from ..activations import ACT2FN
 from .backend import MOE_EXPERT_BACKENDS, MOE_EXPERT_BACKENDS_MOE_ACT
+from .common import split_gate_up_proj
 
 
 def _flag_enabled(name: str) -> bool:
@@ -26,9 +27,11 @@ class MoEExperts(nn.Module):
 
     Weights are stored in ``(G, K, N)`` format — ``[num_experts, in_features, out_features]``::
 
-        gate_proj: [num_experts, hidden_dim, intermediate_size]
-        up_proj:   [num_experts, hidden_dim, intermediate_size]
-        down_proj: [num_experts, intermediate_size, hidden_dim]
+        gate_up_proj: [num_experts, hidden_dim, 2 * intermediate_size]
+        down_proj:    [num_experts, intermediate_size, hidden_dim]
+
+    ``gate_proj`` and ``up_proj`` are exposed as views into ``gate_up_proj``
+    for compatibility with existing backends and helpers.
 
     Args:
         num_experts: Total number of experts.
@@ -52,12 +55,8 @@ class MoEExperts(nn.Module):
         self.intermediate_size = intermediate_size
         self.moe_implementation = moe_implementation
 
-        self.gate_proj = nn.Parameter(
-            torch.empty(num_experts, hidden_dim, intermediate_size),
-            requires_grad=True,
-        )
-        self.up_proj = nn.Parameter(
-            torch.empty(num_experts, hidden_dim, intermediate_size),
+        self.gate_up_proj = nn.Parameter(
+            torch.empty(num_experts, hidden_dim, 2 * intermediate_size),
             requires_grad=True,
         )
         self.down_proj = nn.Parameter(
@@ -75,6 +74,20 @@ class MoEExperts(nn.Module):
         self.deepep_num_sms: int = 20
         self.deepep_async_combine: bool = False
 
+    @property
+    def gate_proj(self) -> torch.Tensor:
+        gate_proj, _ = split_gate_up_proj(self.gate_up_proj, self.intermediate_size)
+        gate_proj.grad = (
+            None if self.gate_up_proj.grad is None else self.gate_up_proj.grad[..., : self.intermediate_size]
+        )
+        return gate_proj
+
+    @property
+    def up_proj(self) -> torch.Tensor:
+        _, up_proj = split_gate_up_proj(self.gate_up_proj, self.intermediate_size)
+        up_proj.grad = None if self.gate_up_proj.grad is None else self.gate_up_proj.grad[..., self.intermediate_size :]
+        return up_proj
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -91,6 +104,8 @@ class MoEExperts(nn.Module):
         use the unified dispatch → compute → combine path via ``_ep_forward()``.
         """
         _moe_act = self._moe_act
+        gate_proj = self.gate_proj.contiguous()
+        up_proj = self.up_proj.contiguous()
 
         if self.moe_implementation == "eager":
             fn = MOE_EXPERT_BACKENDS[self.moe_implementation]
@@ -98,8 +113,8 @@ class MoEExperts(nn.Module):
             return fn(
                 hidden_states,
                 expert_idx,
-                self.gate_proj,
-                self.up_proj,
+                gate_proj,
+                up_proj,
                 self.down_proj,
                 self.act_fn,
             )
@@ -122,8 +137,8 @@ class MoEExperts(nn.Module):
             hidden_states,
             routing_weights,
             selected_experts,
-            self.gate_proj,
-            self.up_proj,
+            gate_proj,
+            up_proj,
             self.down_proj,
             num_experts=self.num_experts,
         )
@@ -165,6 +180,8 @@ class MoEExperts(nn.Module):
             compute_fn = EP_EXPERT_COMPUTE_MOE_ACT[self.moe_implementation]
         else:
             compute_fn = EP_EXPERT_COMPUTE[self.moe_implementation]
+        gate_proj = self.gate_proj.contiguous()
+        up_proj = self.up_proj.contiguous()
 
         # Step 1: Dispatch tokens to expert-owning ranks
         dispatch_kwargs = self._build_dispatch_kwargs(hidden_states, routing_weights, selected_experts, parallel_state)
@@ -187,8 +204,8 @@ class MoEExperts(nn.Module):
         expert_output = compute_fn(
             permute_tokens,
             cumsum,
-            self.gate_proj,
-            self.up_proj,
+            gate_proj,
+            up_proj,
             self.down_proj,
         )
 
@@ -219,8 +236,8 @@ class MoEExperts(nn.Module):
         expert_output = compute_fn(
             permute_tokens,
             cumsum,
-            self.gate_proj,
-            self.up_proj,
+            self.gate_proj.contiguous(),
+            self.up_proj.contiguous(),
             self.down_proj,
         )
         ev[3].record()
@@ -273,7 +290,7 @@ class MoEExperts(nn.Module):
                 buffer_size_gb=self.deepep_buffer_size_gb,
                 num_sms=self.deepep_num_sms,
             )
-            kwargs["num_local_experts"] = self.gate_proj.shape[0]
+            kwargs["num_local_experts"] = self.gate_up_proj.shape[0]
         return kwargs
 
     def _build_combine_kwargs(self, expert_output, ctx, dispatch_kwargs, parallel_state):

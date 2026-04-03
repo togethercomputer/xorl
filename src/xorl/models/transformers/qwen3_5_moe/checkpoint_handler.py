@@ -1,7 +1,7 @@
 """Checkpoint handler for Qwen3_5 MoE models."""
 
 import re
-from typing import Callable, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 
@@ -89,29 +89,70 @@ class Qwen3_5MoeCheckpointHandler(CheckpointHandler):
         self._local_num_experts = num_experts // ep_size
         self._expert_start = ep_rank * self._local_num_experts
         self._expert_end = self._expert_start + self._local_num_experts
+        self._stacked_gate_up_pending: Dict[int, Dict[str, torch.Tensor]] = {}
 
-    _FUSED_EXPERT_GATE_UP_PATTERN = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.gate_up_proj(?:\.weight)?$")
-    _FUSED_EXPERT_DOWN_PATTERN = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.down_proj(?:\.weight)?$")
+    _STACKED_EXPERT_SPLIT_PATTERN = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(gate|up|down)_proj$")
+    _HF_FUSED_EXPERT_GATE_UP_PATTERN = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.gate_up_proj\.weight$")
+    _HF_FUSED_EXPERT_DOWN_PATTERN = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.down_proj\.weight$")
+    _INTERNAL_FUSED_EXPERT_GATE_UP_PATTERN = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.gate_up_proj$")
+    _INTERNAL_FUSED_EXPERT_DOWN_PATTERN = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.down_proj$")
 
     def _slice_expert_tensor_for_ep(self, tensor: torch.Tensor) -> torch.Tensor:
         if self._ep_size == 1:
             return tensor
         return tensor[self._expert_start : self._expert_end].contiguous()
 
+    def _maybe_finalize_per_expert_merge(
+        self,
+        layer_idx: int,
+        proj: str,
+    ) -> List[Tuple[str, torch.Tensor]]:
+        if self._expert_buffer is None:
+            return []
+
+        if proj in {"gate", "up"}:
+            if not (
+                self._expert_buffer.is_complete(layer_idx, "gate") and self._expert_buffer.is_complete(layer_idx, "up")
+            ):
+                return []
+            gate = self._expert_buffer.pop_stacked(layer_idx, "gate")
+            up = self._expert_buffer.pop_stacked(layer_idx, "up")
+            return [
+                (
+                    ExpertWeightBuffer.get_gate_up_name(layer_idx),
+                    torch.cat([gate, up], dim=2),
+                )
+            ]
+
+        if proj == "down" and self._expert_buffer.is_complete(layer_idx, "down"):
+            return [
+                (
+                    ExpertWeightBuffer.get_fused_name(layer_idx, "down"),
+                    self._expert_buffer.pop_stacked(layer_idx, "down"),
+                )
+            ]
+
+        return []
+
     def _handle_fused_expert_weights(self, key: str, tensor: torch.Tensor) -> Optional[List[Tuple[str, torch.Tensor]]]:
-        gate_up_match = self._FUSED_EXPERT_GATE_UP_PATTERN.match(key)
+        internal_gate_up_match = self._INTERNAL_FUSED_EXPERT_GATE_UP_PATTERN.match(key)
+        if internal_gate_up_match is not None:
+            return [(key, self._slice_expert_tensor_for_ep(tensor))]
+
+        internal_down_match = self._INTERNAL_FUSED_EXPERT_DOWN_PATTERN.match(key)
+        if internal_down_match is not None:
+            return [(key, self._slice_expert_tensor_for_ep(tensor))]
+
+        gate_up_match = self._HF_FUSED_EXPERT_GATE_UP_PATTERN.match(key)
         if gate_up_match is not None:
             layer_idx = int(gate_up_match.group(1))
             tensor = self._slice_expert_tensor_for_ep(tensor)
-            half = tensor.shape[1] // 2
-            gate = tensor[:, :half, :].transpose(1, 2).contiguous()
-            up = tensor[:, half:, :].transpose(1, 2).contiguous()
+            gate_up = tensor.transpose(1, 2).contiguous()
             return [
-                (f"model.layers.{layer_idx}.mlp.experts.gate_proj", gate),
-                (f"model.layers.{layer_idx}.mlp.experts.up_proj", up),
+                (f"model.layers.{layer_idx}.mlp.experts.gate_up_proj", gate_up),
             ]
 
-        down_match = self._FUSED_EXPERT_DOWN_PATTERN.match(key)
+        down_match = self._HF_FUSED_EXPERT_DOWN_PATTERN.match(key)
         if down_match is not None:
             layer_idx = int(down_match.group(1))
             tensor = self._slice_expert_tensor_for_ep(tensor)
@@ -119,6 +160,28 @@ class Qwen3_5MoeCheckpointHandler(CheckpointHandler):
             return [
                 (f"model.layers.{layer_idx}.mlp.experts.down_proj", down),
             ]
+
+        split_match = self._STACKED_EXPERT_SPLIT_PATTERN.match(key)
+        if split_match is not None:
+            layer_idx = int(split_match.group(1))
+            proj = split_match.group(2)
+            tensor = self._slice_expert_tensor_for_ep(tensor)
+            if proj == "down":
+                return [(f"model.layers.{layer_idx}.mlp.experts.down_proj", tensor)]
+
+            pending = self._stacked_gate_up_pending.setdefault(layer_idx, {})
+            pending[proj] = tensor
+            if "gate" in pending and "up" in pending:
+                gate = pending.pop("gate")
+                up = pending.pop("up")
+                del self._stacked_gate_up_pending[layer_idx]
+                return [
+                    (
+                        f"model.layers.{layer_idx}.mlp.experts.gate_up_proj",
+                        torch.cat([gate, up], dim=2),
+                    )
+                ]
+            return []
 
         return None
 
@@ -231,11 +294,7 @@ class Qwen3_5MoeCheckpointHandler(CheckpointHandler):
             if parsed is not None:
                 layer_idx, expert_idx, proj = parsed
                 self._expert_buffer.add(layer_idx, expert_idx, proj, tensor)
-                if self._expert_buffer.is_complete(layer_idx, proj):
-                    fused_name = ExpertWeightBuffer.get_fused_name(layer_idx, proj)
-                    stacked = self._expert_buffer.pop_stacked(layer_idx, proj)
-                    return [(fused_name, stacked)]
-                return []
+                return self._maybe_finalize_per_expert_merge(layer_idx, proj)
 
         # 4. Check QKV merge (skipped when unfused for TP)
         if self._qkv_buffer is not None:
@@ -275,10 +334,7 @@ class Qwen3_5MoeCheckpointHandler(CheckpointHandler):
             if parsed is not None:
                 layer_idx, _expert_idx, proj = parsed
                 self._expert_buffer.count_skipped(layer_idx, proj)
-                if self._expert_buffer.is_complete(layer_idx, proj):
-                    fused_name = ExpertWeightBuffer.get_fused_name(layer_idx, proj)
-                    stacked = self._expert_buffer.pop_stacked(layer_idx, proj)
-                    return [(fused_name, stacked)]
+                return self._maybe_finalize_per_expert_merge(layer_idx, proj)
         return []
 
     def on_load_complete(self) -> List[Tuple[str, torch.Tensor]]:
@@ -288,6 +344,8 @@ class Qwen3_5MoeCheckpointHandler(CheckpointHandler):
             pending = self._expert_buffer.get_pending_counts()
             if pending:
                 warnings.warn(f"Incomplete expert weights after loading: {pending}")
+        if self._stacked_gate_up_pending:
+            warnings.warn(f"Incomplete stacked expert gate/up merges after loading: {self._stacked_gate_up_pending}")
         if self._gate_up_buffer is not None:
             pending_gu = self._gate_up_buffer.get_pending()
             if pending_gu:
@@ -299,6 +357,25 @@ class Qwen3_5MoeCheckpointHandler(CheckpointHandler):
         return []
 
     def on_save_weight(self, param_name: str, tensor: torch.Tensor) -> List[Tuple[str, torch.Tensor]]:
+        # Split fused MoE experts into per-expert HF weights.
+        if param_name.endswith(".mlp.experts.gate_up_proj"):
+            prefix = param_name.rsplit(".gate_up_proj", 1)[0]
+            half = tensor.shape[2] // 2
+            gate = tensor[:, :, :half].transpose(1, 2).contiguous()
+            up = tensor[:, :, half:].transpose(1, 2).contiguous()
+            result = []
+            for expert_idx in range(tensor.shape[0]):
+                result.append((f"{prefix}.{expert_idx}.gate_proj.weight", gate[expert_idx]))
+                result.append((f"{prefix}.{expert_idx}.up_proj.weight", up[expert_idx]))
+            return result
+
+        if param_name.endswith(".mlp.experts.down_proj"):
+            prefix = param_name.rsplit(".down_proj", 1)[0]
+            down = tensor.transpose(1, 2).contiguous()
+            return [
+                (f"{prefix}.{expert_idx}.down_proj.weight", down[expert_idx]) for expert_idx in range(tensor.shape[0])
+            ]
+
         # Split gate_up_proj -> gate_proj + up_proj (shared expert / dense layers)
         if ".gate_up_proj." in param_name:
             prefix, suffix = param_name.rsplit(".gate_up_proj.", 1)

@@ -31,11 +31,14 @@ Usage examples:
 import argparse
 import math
 import time
+import traceback
 from urllib.parse import urlparse
 
 import requests
 from transformers import AutoTokenizer
 
+
+MODEL_ID = "default"
 
 CODES = {
     "project_alpha": "SUNRISE-7742-DRAGON",
@@ -86,10 +89,19 @@ def build_training_data(tokenizer):
 # ---------------------------------------------------------------------------
 
 
+def _raise_on_failed_future(result, context):
+    if result.get("type") == "request_failed":
+        raise RuntimeError(f"{context} failed: {result.get('error', result)}")
+    if result.get("error"):
+        raise RuntimeError(f"{context} failed: {result['error']}")
+    return result
+
+
 def wait_for_future(train_url, request_id, timeout=600):
     deadline = time.time() + timeout
     while time.time() < deadline:
         resp = requests.post(f"{train_url}/api/v1/retrieve_future", json={"request_id": request_id}, timeout=120)
+        resp.raise_for_status()
         result = resp.json()
         if result.get("type") == "try_again":
             time.sleep(0.5)
@@ -98,11 +110,13 @@ def wait_for_future(train_url, request_id, timeout=600):
     raise TimeoutError(f"Future {request_id} timed out after {timeout}s")
 
 
-def wait_for_service(url, timeout=300):
+def wait_for_training_service(train_url, timeout=300):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            if requests.get(f"{url}/health", timeout=5).status_code == 200:
+            resp = requests.get(f"{train_url}/health", timeout=5)
+            resp.raise_for_status()
+            if resp.json().get("engine_running"):
                 return True
         except Exception:
             pass
@@ -110,10 +124,28 @@ def wait_for_service(url, timeout=300):
     return False
 
 
+def wait_for_inference_service(infer_url, timeout=300):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for endpoint in ("/health", "/model_info", "/v1/models"):
+            try:
+                resp = requests.get(f"{infer_url}{endpoint}", timeout=5)
+                resp.raise_for_status()
+                return True
+            except Exception:
+                pass
+        time.sleep(3)
+    return False
+
+
 def create_model(train_url, model_name):
-    return requests.post(
-        f"{train_url}/api/v1/create_model", json={"model_id": "default", "base_model": model_name}, timeout=30
-    ).json()
+    resp = requests.post(
+        f"{train_url}/api/v1/create_model", json={"model_id": MODEL_ID, "base_model": model_name}, timeout=30
+    )
+    resp.raise_for_status()
+    future = resp.json()
+    result = wait_for_future(train_url, future["request_id"])
+    return _raise_on_failed_future(result, "create_model")
 
 
 def add_endpoints(train_url, infer_urls):
@@ -123,6 +155,7 @@ def add_endpoints(train_url, infer_urls):
         resp = requests.post(
             f"{train_url}/add_inference_endpoint", json={"host": host, "port": port, "worker_port": port}, timeout=30
         )
+        resp.raise_for_status()
         result = resp.json()
         si = result.get("endpoint", {}).get("server_info", {}) if result else {}
         print(
@@ -134,17 +167,19 @@ def add_endpoints(train_url, infer_urls):
 def train_step(train_url, data, lr):
     fb = requests.post(
         f"{train_url}/api/v1/forward_backward",
-        json={"model_id": "default", "forward_backward_input": {"data": data, "loss_fn": "causallm_loss"}},
+        json={"model_id": MODEL_ID, "forward_backward_input": {"data": data, "loss_fn": "causallm_loss"}},
         timeout=30,
     )
-    fb_result = wait_for_future(train_url, fb.json()["request_id"])
+    fb.raise_for_status()
+    fb_result = _raise_on_failed_future(wait_for_future(train_url, fb.json()["request_id"]), "forward_backward")
     loss = fb_result.get("metrics", {}).get("loss:mean", "N/A")
     opt = requests.post(
         f"{train_url}/api/v1/optim_step",
-        json={"model_id": "default", "adam_params": {"learning_rate": lr}, "gradient_clip": 1.0},
+        json={"model_id": MODEL_ID, "adam_params": {"learning_rate": lr}, "gradient_clip": 1.0},
         timeout=30,
     )
-    opt_result = wait_for_future(train_url, opt.json()["request_id"])
+    opt.raise_for_status()
+    opt_result = _raise_on_failed_future(wait_for_future(train_url, opt.json()["request_id"]), "optim_step")
     grad_norm = opt_result.get("metrics", {}).get("grad_norm", "N/A")
     return loss, grad_norm
 
@@ -152,27 +187,57 @@ def train_step(train_url, data, lr):
 def set_sync_quantization(train_url):
     config = {"quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128]}
     resp = requests.post(f"{train_url}/api/v1/set_sync_quantization", json={"quantization": config}, timeout=10)
+    resp.raise_for_status()
     print(f"    Set sync quantization: {resp.json().get('message')}")
 
 
-def sync_weights(train_url, master_address):
+def sync_weights(train_url, master_address, weight_version):
     t0 = time.time()
     resp = requests.post(
-        f"{train_url}/api/v1/sync_inference_weights", json={"master_address": master_address}, timeout=600
+        f"{train_url}/api/v1/sync_inference_weights",
+        json={"master_address": master_address, "weight_version": weight_version},
+        timeout=600,
     )
+    resp.raise_for_status()
     result = resp.json()
     print(
         f"    Sync: success={result.get('success')}, {time.time() - t0:.1f}s, "
-        f"params={result.get('num_parameters', 'N/A')}"
+        f"params={result.get('num_parameters', 'N/A')}, weight_version={weight_version}"
     )
     return result
+
+
+def get_model_info(infer_url):
+    resp = requests.get(f"{infer_url}/model_info", timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def wait_for_inference_weight_version(infer_urls, expected_version, timeout=120):
+    deadline = time.time() + timeout
+    last_seen = {}
+    while time.time() < deadline:
+        all_ready = True
+        for url in infer_urls:
+            try:
+                info = get_model_info(url)
+                version = info.get("weight_version")
+                last_seen[url] = version
+                if version != expected_version:
+                    all_ready = False
+            except Exception:
+                all_ready = False
+        if all_ready:
+            return last_seen
+        time.sleep(1)
+    raise TimeoutError(f"Inference endpoints did not reach weight_version={expected_version}: {last_seen}")
 
 
 def query_inference(infer_url, prompt):
     resp = requests.post(
         f"{infer_url}/v1/chat/completions",
         json={
-            "model": "default",
+            "model": MODEL_ID,
             "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
             "max_tokens": 32,
             "temperature": 0,
@@ -180,21 +245,27 @@ def query_inference(infer_url, prompt):
         },
         timeout=30,
     )
-    content = resp.json()["choices"][0]["message"]["content"]
-    return content.strip() if content else "(empty response)"
+    resp.raise_for_status()
+    payload = resp.json()
+    content = payload["choices"][0]["message"]["content"]
+    metadata = payload.get("metadata", {})
+    return (content.strip() if content else "(empty response)"), metadata
 
 
-def test_inference(infer_urls, label=""):
+def test_inference(infer_urls, label="", expected_weight_version=None):
     print(f"    Inference ({label}):")
     total_correct = 0
     for url in infer_urls:
         port = url.split(":")[-1]
         correct = 0
         for project, expected in CODES.items():
-            answer = query_inference(url, f"What is the secret code for {project}?")
-            match = expected in answer
+            answer, metadata = query_inference(url, f"What is the secret code for {project}?")
+            version = metadata.get("weight_version")
+            version_ok = expected_weight_version is None or version == expected_weight_version
+            match = expected in answer and version_ok
             correct += match
-            print(f"      [{'OK' if match else 'FAIL'}] :{port} {project}: '{answer}'")
+            version_suffix = f", version={version}" if version is not None else ""
+            print(f"      [{'OK' if match else 'FAIL'}] :{port} {project}: '{answer}'{version_suffix}")
         total_correct += correct
     return total_correct
 
@@ -236,18 +307,22 @@ def run_test(args, training_data):
     total_codes = len(CODES) * len(infer_urls)
 
     print("  Checking services...")
-    if not wait_for_service(args.train_url, timeout=10):
+    if not wait_for_training_service(args.train_url, timeout=10):
         print("  FAILED: Training server not running")
         return None
     for url in infer_urls:
-        if not wait_for_service(url, timeout=10):
+        if not wait_for_inference_service(url, timeout=10):
             print(f"  FAILED: {url} not running")
             return None
     print("    All services ready.")
 
-    create_model(args.train_url, args.model)
+    create_result = create_model(args.train_url, args.model)
+    print(f"    Model created: model_id={create_result.get('model_id', MODEL_ID)}")
     add_endpoints(args.train_url, infer_urls)
-    test_inference(infer_urls, "baseline")
+    if args.run_baseline:
+        test_inference(infer_urls, "baseline")
+    else:
+        print("    Skipping baseline inference to avoid seeding stale prompt cache before sync.")
 
     print(f"\n    Training ({args.steps} steps, lr={args.lr}, schedule={args.lr_schedule})...")
     t0 = time.time()
@@ -261,12 +336,20 @@ def run_test(args, training_data):
 
     if args.sync_quant == "fp8":
         set_sync_quantization(args.train_url)
-    sync_result = sync_weights(args.train_url, args.master_address)
+    sync_version = f"password-sync-{int(time.time())}"
+    sync_result = sync_weights(args.train_url, args.master_address, sync_version)
     if not sync_result.get("success"):
         print(f"    SYNC FAILED: {sync_result}")
         return None
+    versions = wait_for_inference_weight_version(
+        infer_urls,
+        sync_version,
+        timeout=args.sync_wait_timeout,
+    )
+    for url, version in versions.items():
+        print(f"    Endpoint ready: {url} weight_version={version}")
 
-    correct = test_inference(infer_urls, "after sync")
+    correct = test_inference(infer_urls, f"after sync ({sync_version})", expected_weight_version=sync_version)
     print(f"    Score: {correct}/{total_codes}")
     return correct
 
@@ -302,6 +385,15 @@ def main():
     )
     parser.add_argument("--master-address", type=str, default="localhost", help="Master address for NCCL weight sync")
     parser.add_argument("--log-interval", type=int, default=16, help="Print loss every N steps")
+    parser.add_argument(
+        "--run-baseline", action="store_true", help="Run a pre-training inference check before weight sync"
+    )
+    parser.add_argument(
+        "--sync-wait-timeout",
+        type=int,
+        default=120,
+        help="Seconds to wait for inference endpoints to report the new weight_version",
+    )
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -315,8 +407,6 @@ def main():
         correct = run_test(args, training_data)
     except Exception as e:
         print(f"  ERROR: {e}")
-        import traceback
-
         traceback.print_exc()
         correct = None
 

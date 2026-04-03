@@ -83,12 +83,13 @@ class WeightSyncHandler:
         sync_method = p.sync_method
         flush_cache = p.flush_cache
         pause_mode = p.pause_mode
+        weight_version = p.weight_version
         quantization = p.quantization
 
         logger.info(
             f"Rank {self.rank}: [WeightSync] sync_method={sync_method}, "
             f"endpoints={len(endpoints)}, flush_cache={flush_cache}, "
-            f"quantization={quantization}"
+            f"weight_version={weight_version}, quantization={quantization}"
         )
 
         try:
@@ -101,6 +102,7 @@ class WeightSyncHandler:
                 sync_method=sync_method,
                 flush_cache=flush_cache,
                 pause_mode=pause_mode,
+                weight_version=weight_version,
                 quantization=quantization,
             )
 
@@ -124,6 +126,7 @@ class WeightSyncHandler:
         sync_method: str,
         flush_cache: bool,
         pause_mode: str,
+        weight_version: Optional[str],
         quantization: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
@@ -356,6 +359,7 @@ class WeightSyncHandler:
                                 backend,
                                 current_buffer,
                                 flush_cache=(flush_cache and is_last_overall and not moe_contexts),
+                                weight_version=weight_version if is_last_overall and not moe_contexts else None,
                             )
                             total_bytes += b
                             total_params += p
@@ -370,6 +374,7 @@ class WeightSyncHandler:
                                         backend,
                                         ctx,
                                         flush_cache=(flush_cache and is_last_overall),
+                                        weight_version=weight_version if is_last_overall else None,
                                         quantization=quantization,
                                         ps=_ps,
                                     )
@@ -382,6 +387,7 @@ class WeightSyncHandler:
                                         backend,
                                         ctx,
                                         flush_cache=(flush_cache and is_last_overall),
+                                        weight_version=weight_version if is_last_overall else None,
                                         quantization=quantization,
                                     )
                                     total_bytes += b
@@ -423,6 +429,7 @@ class WeightSyncHandler:
                                     backend,
                                     received,
                                     flush_cache=(flush_cache and is_last_overall),
+                                    weight_version=weight_version if is_last_overall else None,
                                 )
                                 total_bytes += b
                                 total_params += p
@@ -648,16 +655,19 @@ class WeightSyncHandler:
                 continue
 
             # Get expert params — after unshard they may be plain tensors or DTensors
-            gate = getattr(mod, "gate_proj", None)
-            if gate is None or not isinstance(gate, torch.nn.Parameter):
-                continue
+            gate_up = getattr(mod, "gate_up_proj", None)
+            if isinstance(gate_up, torch.nn.Parameter):
+                E_local = gate_up.shape[0]
+            else:
+                gate = getattr(mod, "gate_proj", None)
+                if gate is None or not isinstance(gate, torch.nn.Parameter):
+                    continue
+                E_local = gate.shape[0]
 
             if mname:
                 full_prefix = f"{mod_name}.{mname}" if mod_name != "(root)" else mname
             else:
                 full_prefix = mod_name
-            # gate_proj has shape [num_local_experts, K, N] — already local
-            E_local = gate.shape[0]
 
             # Clone local expert data for each projection.
             # With EP, each rank's module already holds only local experts [E_local, K, N].
@@ -675,8 +685,6 @@ class WeightSyncHandler:
                         delta = mod._compute_proj_delta(proj_name)
                         if isinstance(delta, DTensor):
                             delta = delta.to_local()
-                        elif delta.shape[0] > E_local:
-                            delta = delta[start : start + E_local]
                         local = local.to(torch.bfloat16) + delta.to(torch.bfloat16)
                     else:
                         local = local.to(torch.bfloat16)
@@ -705,6 +713,7 @@ class WeightSyncHandler:
         backend,
         ctx: Dict[str, Any],
         flush_cache: bool = False,
+        weight_version: Optional[str] = None,
         bucket_size_bytes: int = _DEFAULT_MOE_BUCKET_BYTES,
         quantization: Optional[Dict[str, Any]] = None,
         ps=None,
@@ -731,6 +740,20 @@ class WeightSyncHandler:
         device = f"cuda:{self.rank % torch.cuda.device_count()}"
 
         is_qlora = ctx.get("type") != "full_weight"
+        ep_fsdp_rank = 0
+        if ps.ep_fsdp_device_mesh is not None:
+            ep_fsdp_rank = ps.ep_fsdp_device_mesh.get_local_rank("ep_fsdp")
+
+        # EP-FSDP replicas hold identical local expert shards after unshard().
+        # Only one replica column needs to gather and forward those experts to
+        # rank 0; the others would just duplicate the same weights.
+        if ep_fsdp_rank != 0:
+            if is_qlora:
+                ctx["lora_params"] = None
+            else:
+                ctx["local_experts"] = None
+            return 0, 0, 0
+
         if self.rank == 0:
             logger.info(
                 f"Rank 0: [EP-Gather] prefix={full_prefix}, type={'qlora' if is_qlora else 'full_weight'}, "
@@ -841,6 +864,7 @@ class WeightSyncHandler:
                 backend,
                 bucket,
                 flush_cache=flush_cache,
+                weight_version=weight_version,
             )
             total_bytes += b
             total_params += p
@@ -863,6 +887,7 @@ class WeightSyncHandler:
         backend,
         ctx: Dict[str, Any],
         flush_cache: bool = False,
+        weight_version: Optional[str] = None,
         bucket_size_bytes: int = _DEFAULT_MOE_BUCKET_BYTES,
         quantization: Optional[Dict[str, Any]] = None,
     ) -> Tuple[int, int, int]:
@@ -957,6 +982,7 @@ class WeightSyncHandler:
                 backend,
                 bucket,
                 flush_cache=flush_cache,
+                weight_version=weight_version,
             )
             total_bytes += b
             total_params += p
@@ -1286,25 +1312,25 @@ class WeightSyncHandler:
                     buffer.append((full_name, cloned))
                     continue
                 elif isinstance(lora_mod, MoEExpertsLoRA):
-                    # MoE experts: fused [E, K, N] → per-expert HF format
-                    # param_leaf is "gate_proj", "up_proj", or "down_proj"
-                    if param_leaf in lora_mod.lora_config.target_modules:
-                        delta = lora_mod._compute_proj_delta(param_leaf)
-                        merged = param.data.to(dtype=torch.bfloat16) + delta.to(dtype=torch.bfloat16)
-                    else:
-                        merged = param.data.to(dtype=torch.bfloat16)
-                    # Split fused [E, K, N] into per-expert [N, K] (HF format)
-                    # full_name is like "model.layers.0.mlp.experts.gate_proj"
-                    # HF expects "model.layers.0.mlp.experts.{i}.gate_proj.weight"
-                    base = full_name  # e.g. "model.layers.0.mlp.experts.gate_proj"
-                    # Split "experts.gate_proj" → "experts.{i}.gate_proj.weight"
-                    parts = base.rsplit(".", 1)  # ["model.layers.0.mlp.experts", "gate_proj"]
-                    for expert_idx in range(merged.shape[0]):
-                        hf_name = f"{parts[0]}.{expert_idx}.{parts[1]}.weight"
-                        # GKN [K, N] → HF [N, K] (transpose)
-                        expert_weight = merged[expert_idx].t().contiguous()
-                        buffer.append((hf_name, expert_weight))
-                    continue
+                    if param_leaf == "gate_up_proj":
+                        merged = param.data.to(dtype=torch.bfloat16).clone()
+                        half = merged.shape[2] // 2
+                        if "gate_proj" in lora_mod.lora_config.target_modules:
+                            gate_delta = lora_mod._compute_proj_delta("gate_proj")
+                            merged[:, :, :half].add_(gate_delta.to(dtype=torch.bfloat16))
+                        if "up_proj" in lora_mod.lora_config.target_modules:
+                            up_delta = lora_mod._compute_proj_delta("up_proj")
+                            merged[:, :, half:].add_(up_delta.to(dtype=torch.bfloat16))
+                        buffer.append((full_name, merged))
+                        continue
+                    if param_leaf == "down_proj":
+                        if "down_proj" in lora_mod.lora_config.target_modules:
+                            delta = lora_mod._compute_proj_delta("down_proj")
+                            merged = param.data.to(dtype=torch.bfloat16) + delta.to(dtype=torch.bfloat16)
+                        else:
+                            merged = param.data.to(dtype=torch.bfloat16)
+                        buffer.append((full_name, merged.clone()))
+                        continue
             # Check if this is a non-LoRA MoEExperts fused tensor
             _is_moe_experts = False
             if parent_name:
@@ -1315,19 +1341,13 @@ class WeightSyncHandler:
                     for p in parts_list:
                         parent_mod = getattr(parent_mod, p)
                     if isinstance(parent_mod, (MoEExperts, MoEExpertsLoRA)):
-                        if param_leaf in ("gate_proj", "up_proj", "down_proj"):
+                        if param_leaf in ("gate_up_proj", "down_proj"):
                             _is_moe_experts = True
                 except (AttributeError, TypeError):
                     pass
 
             if _is_moe_experts:
-                # Split fused [E, K, N] into per-expert HF [N, K]
-                data = param.data.to(dtype=torch.bfloat16)
-                parts = full_name.rsplit(".", 1)
-                for expert_idx in range(data.shape[0]):
-                    hf_name = f"{parts[0]}.{expert_idx}.{parts[1]}.weight"
-                    expert_weight = data[expert_idx].t().contiguous()
-                    buffer.append((hf_name, expert_weight))
+                buffer.append((full_name, param.data.to(dtype=torch.bfloat16).clone()))
             else:
                 cloned = param.data.to(dtype=torch.bfloat16).clone()
                 buffer.append((full_name, cloned))
@@ -1359,10 +1379,17 @@ class WeightSyncHandler:
     ) -> List[Tuple[str, torch.Tensor]]:
         """Split fused projections (qkv_proj, gate_up_proj) into HF-format names.
 
-        SGLang's load_weights expects HF names (q_proj, k_proj, v_proj, gate_proj,
-        up_proj) and has stacked_params_mapping that does string replacement.
-        If we send fused names like 'qkv_proj', the replacement mangles them
-        (e.g. 'v_proj' is a substring of 'qkv_proj' → 'qkqkv_proj').
+        Handles:
+        - qkv_proj → q_proj + k_proj + v_proj (split fused attention)
+        - gate_up_proj → gate_proj + up_proj (split fused dense/shared MLP)
+        - MoE experts: gate_up_proj/down_proj → per-expert HF gate/up/down weights
+        - Qwen3.5 linear attention: remap split GatedDeltaNet params back to
+          HF fused names (q_proj/k_proj/v_proj → in_proj_qkv, etc.)
+        """
+        from xorl.models.transformers.qwen3_5_shared import (
+            has_linear_attention_layers,
+            remap_linear_attention_params_for_inference,
+        )
 
         This splits fused weights back to individual projections before sending.
         """
@@ -1384,6 +1411,19 @@ class WeightSyncHandler:
                 result.append((f"{prefix}.q_proj.{suffix}", q))
                 result.append((f"{prefix}.k_proj.{suffix}", k))
                 result.append((f"{prefix}.v_proj.{suffix}", v))
+            elif name.endswith(".mlp.experts.gate_up_proj"):
+                prefix = name.rsplit(".gate_up_proj", 1)[0]
+                half = tensor.shape[2] // 2
+                gate = tensor[:, :, :half].transpose(1, 2).contiguous()
+                up = tensor[:, :, half:].transpose(1, 2).contiguous()
+                for expert_idx in range(tensor.shape[0]):
+                    result.append((f"{prefix}.{expert_idx}.gate_proj.weight", gate[expert_idx]))
+                    result.append((f"{prefix}.{expert_idx}.up_proj.weight", up[expert_idx]))
+            elif name.endswith(".mlp.experts.down_proj"):
+                prefix = name.rsplit(".down_proj", 1)[0]
+                down = tensor.transpose(1, 2).contiguous()
+                for expert_idx in range(tensor.shape[0]):
+                    result.append((f"{prefix}.{expert_idx}.down_proj.weight", down[expert_idx]))
             elif ".gate_up_proj." in name:
                 # Split [2*intermediate, hidden] → gate, up
                 prefix, suffix = name.rsplit(".gate_up_proj.", 1)
@@ -1401,6 +1441,7 @@ class WeightSyncHandler:
         backend,
         buffer: List[Tuple[str, torch.Tensor]],
         flush_cache: bool,
+        weight_version: Optional[str] = None,
     ) -> Tuple[int, int]:
         """
         Broadcast a buffer of (name, tensor) pairs to inference endpoints.
@@ -1417,7 +1458,11 @@ class WeightSyncHandler:
         bucket_bytes = sum(t.numel() * t.element_size() for _, t in buffer)
         logger.info(f"Rank {self.rank}: [WeightSync] Broadcasting {len(buffer)} params, {bucket_bytes / 1e6:.1f} MB")
 
-        backend.transfer_bucket(buffer, flush_cache=flush_cache)
+        backend.transfer_bucket(
+            buffer,
+            flush_cache=flush_cache,
+            weight_version=weight_version,
+        )
         return bucket_bytes, len(buffer)
 
     @staticmethod

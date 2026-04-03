@@ -226,20 +226,30 @@ def inject_qlora_into_model(
         if not (hasattr(module, "gate") and hasattr(module, "experts")):
             continue
         experts = module.experts
+        fused_gate_up = getattr(experts, "gate_up_proj", None)
         has_3d_weights = (
-            hasattr(experts, "gate_proj")
-            and isinstance(experts.gate_proj, nn.Parameter)
-            and hasattr(experts, "up_proj")
-            and isinstance(experts.up_proj, nn.Parameter)
+            isinstance(fused_gate_up, nn.Parameter)
             and hasattr(experts, "down_proj")
             and isinstance(experts.down_proj, nn.Parameter)
-            and experts.gate_proj.dim() == 3
+            and fused_gate_up.dim() == 3
             and not isinstance(experts, QLoRAMoeExperts)
         )
         if not has_3d_weights:
+            has_3d_weights = (
+                hasattr(experts, "gate_proj")
+                and isinstance(experts.gate_proj, nn.Parameter)
+                and hasattr(experts, "up_proj")
+                and isinstance(experts.up_proj, nn.Parameter)
+                and hasattr(experts, "down_proj")
+                and isinstance(experts.down_proj, nn.Parameter)
+                and experts.gate_proj.dim() == 3
+                and not isinstance(experts, QLoRAMoeExperts)
+            )
+        if not has_3d_weights:
             continue
 
-        num_experts = experts.gate_proj.shape[0]
+        base_gate = fused_gate_up if fused_gate_up is not None else experts.gate_proj
+        num_experts = base_gate.shape[0]
         num_local_experts = num_experts // ep_size
         expert_offset = ep_rank * num_local_experts
 
@@ -257,7 +267,7 @@ def inject_qlora_into_model(
         experts_fqn = name + ".experts" if not name.endswith(".experts") else name
 
         if quant_format == "nf4":
-            is_meta = experts.gate_proj.device.type == "meta"
+            is_meta = base_gate.device.type == "meta"
             if is_meta:
                 # Defer: load bf16 from checkpoint after FSDP, then quantize
                 qlora_experts._source_fqn = experts_fqn

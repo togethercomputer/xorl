@@ -35,8 +35,8 @@ EXPERT_QUANT_AUX_PATTERN = re.compile(
 _EXPERT_ANY_KEY_PATTERN = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.(.+)$")
 
 # Model parameter names in fused expert format
-# e.g., model.layers.0.mlp.experts.gate_proj
-FUSED_EXPERT_PATTERN = re.compile(r"^model\.layers\.\d+\.mlp\.experts\.(gate|up|down)_proj$")
+# e.g., model.layers.0.mlp.experts.gate_up_proj
+FUSED_EXPERT_PATTERN = re.compile(r"^model\.layers\.\d+\.mlp\.experts\.(gate_up|gate|up|down)_proj$")
 
 # Dense MLP gate/up projection weight keys
 # e.g., model.layers.0.mlp.gate_proj.weight or model.layers.0.mlp.shared_expert.up_proj.weight
@@ -304,7 +304,7 @@ def model_needs_expert_merging(parameter_names: Set[str]) -> bool:
 
 def model_has_gate_up_merged(parameter_names: Set[str]) -> bool:
     """Check if the model uses merged gate_up_proj layers."""
-    return any(".gate_up_proj." in name for name in parameter_names)
+    return any(".gate_up_proj." in name or name.endswith(".gate_up_proj") for name in parameter_names)
 
 
 def checkpoint_has_separate_gate_up(checkpoint_keys: Set[str]) -> bool:
@@ -415,6 +415,11 @@ class ExpertWeightBuffer:
     def get_fused_name(layer_idx: int, proj: str) -> str:
         """Get the fused parameter name, e.g., 'model.layers.0.mlp.experts.gate_proj'."""
         return f"model.layers.{layer_idx}.mlp.experts.{proj}_proj"
+
+    @staticmethod
+    def get_gate_up_name(layer_idx: int) -> str:
+        """Get the fused gate/up parameter name."""
+        return f"model.layers.{layer_idx}.mlp.experts.gate_up_proj"
 
     def count_skipped(self, layer_idx: int, proj: str) -> None:
         """Count an expert key as seen without buffering tensor data.

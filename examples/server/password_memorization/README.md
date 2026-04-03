@@ -60,6 +60,8 @@ python run_password_test.py --model Qwen/Qwen3-8B --steps 48 --lr 5e-5 --sync-qu
 | `--infer-url` | http://localhost:30000 | Inference endpoint URL(s), space-separated |
 | `--master-address` | localhost | Master address for NCCL weight sync |
 | `--log-interval` | 16 | Print loss every N steps |
+| `--run-baseline` | false | Run a pre-training inference check before weight sync |
+| `--sync-wait-timeout` | 120 | Seconds to wait for inference endpoints to report the new `weight_version` |
 
 ---
 
@@ -148,3 +150,5 @@ FP8 re-quantization uses block-wise e4m3 with `weight_block_size=[128, 128]`, co
 - **Qwen3-235B**: use the instruct tokenizer for training — the base model chat template injects `<think>` tags even with `enable_thinking=False`.
 - **30B MoE with EP**: cosine LR schedule is important — constant LR causes loss oscillation around ~1.0.
 - **NF4**: quantizes bf16 weights on-the-fly; no pre-quantized checkpoint needed.
+- **Password e2e validation**: `run_password_test.py` now waits for the async `create_model` future and for each inference endpoint to report the requested `weight_version` before running post-sync recall checks.
+- **Baseline queries**: the script skips baseline inference by default to avoid seeding radix-cache entries for the exact prompts later used in the no-flush post-sync validation. Pass `--run-baseline` if you explicitly want that pre-training check.

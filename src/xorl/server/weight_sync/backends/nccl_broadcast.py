@@ -558,6 +558,7 @@ class NCCLWeightSynchronizer:
         self,
         bucket: List[Tuple[str, torch.Tensor]],
         flush_cache: bool = False,
+        weight_version: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Transfer a single bucket of parameters.
@@ -571,6 +572,7 @@ class NCCLWeightSynchronizer:
         Args:
             bucket: List of (name, tensor) tuples
             flush_cache: Whether to flush cache after this bucket (only for last bucket)
+            weight_version: Optional weight version to apply with this bucket.
 
         Returns:
             List of results from each endpoint
@@ -597,6 +599,7 @@ class NCCLWeightSynchronizer:
                         "shapes": shapes,
                         "group_name": self.group_name,
                         "flush_cache": flush_cache,
+                        "weight_version": weight_version,
                     },
                     timeout=600,
                 )
@@ -853,12 +856,17 @@ class NCCLBroadcastBackend(WeightTransportBackend):
         *,
         src_rank: int = 0,
         flush_cache: bool = False,
+        weight_version: Optional[str] = None,
     ) -> None:
         if src_rank != 0:
             raise ValueError(f"NCCLBroadcastBackend only supports src_rank=0, got {src_rank}")
         if self._synchronizer is None:
             raise RuntimeError("Backend not initialized — call initialize() first")
-        self._synchronizer._transfer_single_bucket(bucket, flush_cache=flush_cache)
+        self._synchronizer._transfer_single_bucket(
+            bucket,
+            flush_cache=flush_cache,
+            weight_version=weight_version,
+        )
 
     @property
     def sender_ranks(self) -> FrozenSet[int]:

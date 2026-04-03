@@ -125,6 +125,7 @@ class WeightTransportBackend(ABC):
         *,
         src_rank: int = 0,
         flush_cache: bool = False,
+        weight_version: Optional[str] = None,
     ) -> None:
         """Send a bucket of named tensors to inference.
 
@@ -136,6 +137,9 @@ class WeightTransportBackend(ABC):
             flush_cache: If ``True``, tell the inference endpoint to flush
                 its KV cache after loading this bucket (used for the final
                 bucket of a sync).
+            weight_version: Optional version marker to apply on the inference
+                endpoint after this bucket is loaded. Handlers should only set
+                this on the final bucket of a sync.
         """
 
     # ------------------------------------------------------------------

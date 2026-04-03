@@ -421,6 +421,11 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         return self.dequantize_all_experts("gate", self.hidden_size, self.intermediate_size)
 
     @property
+    def gate_up_proj(self) -> Tensor:
+        """Dequantize all local fused gate_up_proj weights. [num_local_experts, hidden, 2 * intermediate]"""
+        return torch.cat([self.gate_proj, self.up_proj], dim=2)
+
+    @property
     def up_proj(self) -> Tensor:
         """Dequantize all local up_proj weights. [num_local_experts, hidden, intermediate]"""
         return self.dequantize_all_experts("up", self.hidden_size, self.intermediate_size)
