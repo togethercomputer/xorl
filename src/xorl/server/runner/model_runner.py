@@ -40,7 +40,10 @@ from xorl.optim import build_optimizer
 from xorl.server.runner.adapters import LoRAAdapterManager
 from xorl.server.runner.checkpoint import CheckpointManager
 from xorl.server.runner.utils import MoeMetricsTracker, RoutingReplayHandler, run_self_test, validate_token_ids
-from xorl.trainers.model_builder import build_training_model
+from xorl.trainers.model_builder import (
+    build_training_model,
+    resolve_training_model_dtype,
+)
 from xorl.trainers.training_utils import (
     clip_gradients,
     count_valid_tokens,
@@ -448,13 +451,11 @@ class ModelRunner:
         # Resolve target_modules from Tinker-style or flat config
         target_modules = self._resolve_lora_target_modules() if lora_enabled else None
 
-        # Determine model dtype
-        if (lora_enabled or enable_qlora) and enable_mixed_precision:
-            model_dtype = "bfloat16"
-        elif enable_mixed_precision:
-            model_dtype = "float32"
-        else:
-            model_dtype = "bfloat16"
+        model_dtype = resolve_training_model_dtype(
+            enable_lora=lora_enabled,
+            enable_qlora=enable_qlora,
+            enable_mixed_precision=enable_mixed_precision,
+        )
 
         pp_size = self.train_config.get("pipeline_parallel_size", 1)
         pp_schedule_name = self.train_config.get("pipeline_parallel_schedule", "1F1B") if pp_size > 1 else None

@@ -538,7 +538,17 @@ def rope_config_validation(config, ignore_keys=None):
         FutureWarning,
     )
     config.standardize_rope_params()
-    config.validate_rope(ignore_keys=ignore_keys)
+    if ignore_keys is None:
+        config.validate_rope()
+        return
+
+    try:
+        config.validate_rope(ignore_keys=ignore_keys)
+    except TypeError as exc:
+        if "unexpected keyword argument 'ignore_keys'" not in str(exc):
+            raise
+        # transformers>=5.5 removed the ignore_keys kwarg from validate_rope().
+        config.validate_rope()
 
 
 __all__ = [

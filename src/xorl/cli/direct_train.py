@@ -14,7 +14,7 @@ import json
 import socket
 import time
 from dataclasses import asdict
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch.distributed as dist
 from tqdm import trange
@@ -33,6 +33,11 @@ from xorl.models import build_foundation_model, build_tokenizer, save_model_asse
 from xorl.models.layers.moe.aux_loss import global_load_balancing_loss_func
 from xorl.models.module_utils import compute_loss
 from xorl.optim import build_lr_scheduler, build_optimizer
+from xorl.trainers.model_builder import (
+    maybe_upcast_trainable_adapter_params,
+    resolve_training_model_dtype,
+    should_skip_generic_param_upcast,
+)
 from xorl.trainers.training_utils import (
     clip_gradients,
     count_valid_tokens,
@@ -50,6 +55,17 @@ from xorl.utils.dist_utils import all_reduce
 
 
 logger = helper.create_logger(__name__)
+_direct_train_cpu_group: Optional[dist.ProcessGroup] = None
+
+
+def _get_direct_train_cpu_group() -> Optional[dist.ProcessGroup]:
+    """Return a cached CPU/Gloo group for bootstrap object collectives."""
+    global _direct_train_cpu_group
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() <= 1:
+        return None
+    if _direct_train_cpu_group is None:
+        _direct_train_cpu_group = dist.new_group(backend="gloo")
+    return _direct_train_cpu_group
 
 
 def main():
@@ -85,7 +101,7 @@ def main():
         "hostname": socket.gethostname(),
     }
     gathered_hosts = [None] * args.train.world_size
-    dist.all_gather_object(gathered_hosts, host_payload)
+    dist.all_gather_object(gathered_hosts, host_payload, group=_get_direct_train_cpu_group())
     if args.train.global_rank == 0:
         unique_hostnames = sorted({item["hostname"] for item in gathered_hosts if item is not None})
         rank_to_hostname = {str(item["global_rank"]): item["hostname"] for item in gathered_hosts if item is not None}
@@ -171,10 +187,15 @@ def main():
         logger.info_rank0(f"Save every {args.train.save_epochs} epoch(s) = every {save_epoch_steps} steps")
 
     logger.info_rank0("Prepare model")
+    model_dtype = resolve_training_model_dtype(
+        enable_lora=args.lora.enable_lora,
+        enable_qlora=args.lora.enable_qlora,
+        enable_mixed_precision=args.train.enable_mixed_precision,
+    )
     model = build_foundation_model(
         config_path=args.model.config_path,
         weights_path=args.model.model_path,
-        torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
+        torch_dtype=model_dtype,
         attn_implementation=args.model.attn_implementation,
         moe_implementation=args.model.moe_implementation,
         ep_dispatch=args.model.ep_dispatch,
@@ -261,6 +282,13 @@ def main():
         )
         helper.print_device_mem_info("VRAM usage after LoRA injection")
 
+    maybe_upcast_trainable_adapter_params(
+        model,
+        enable_lora=args.lora.enable_lora,
+        enable_qlora=args.lora.enable_qlora,
+        enable_mixed_precision=args.train.enable_mixed_precision,
+    )
+
     get_optimizer_pre_hook = getattr(model, "get_optimizer_pre_hook", None)
     build_result = build_parallelize_model(
         model,
@@ -278,7 +306,10 @@ def main():
         load_weights_mode=args.train.load_weights_mode,
         pp_schedule=args.train.pipeline_parallel_schedule if args.train.pipeline_parallel_size > 1 else None,
         reshard_after_forward=args.train.reshard_after_forward,
-        skip_param_upcast=args.lora.enable_qlora,
+        skip_param_upcast=should_skip_generic_param_upcast(
+            enable_lora=args.lora.enable_lora,
+            enable_qlora=args.lora.enable_qlora,
+        ),
     )
 
     # PP returns dict with stages + model_parts; otherwise returns model directly

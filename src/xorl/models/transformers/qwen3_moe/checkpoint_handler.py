@@ -154,11 +154,17 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
     ) -> Optional[List[Tuple[str, torch.Tensor]]]:
         gate_up_match = self._FUSED_EXPERT_GATE_UP_PATTERN.match(key)
         if gate_up_match is not None:
-            return [(key, self._slice_expert_tensor_for_ep(tensor))]
+            tensor = self._slice_expert_tensor_for_ep(tensor)
+            if tensor.ndim == 3 and tensor.shape[1] < tensor.shape[2]:
+                tensor = tensor.transpose(1, 2).contiguous()
+            return [(key, tensor)]
 
         down_match = self._FUSED_EXPERT_DOWN_PATTERN.match(key)
         if down_match is not None:
-            return [(key, self._slice_expert_tensor_for_ep(tensor))]
+            tensor = self._slice_expert_tensor_for_ep(tensor)
+            if tensor.ndim == 3 and tensor.shape[1] > tensor.shape[2]:
+                tensor = tensor.transpose(1, 2).contiguous()
+            return [(key, tensor)]
 
         split_match = self._STACKED_EXPERT_SPLIT_PATTERN.match(key)
         if split_match is None:
@@ -169,7 +175,7 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
         tensor = self._slice_expert_tensor_for_ep(tensor)
 
         if proj == "down":
-            return [(f"model.layers.{layer_idx}.mlp.experts.down_proj", tensor)]
+            return [(f"model.layers.{layer_idx}.mlp.experts.down_proj", tensor.transpose(1, 2).contiguous())]
 
         pending = self._stacked_gate_up_pending.setdefault(layer_idx, {})
         pending[proj] = tensor
@@ -180,7 +186,7 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
             return [
                 (
                     f"model.layers.{layer_idx}.mlp.experts.gate_up_proj",
-                    torch.cat([gate, up], dim=2),
+                    torch.cat([gate.transpose(1, 2), up.transpose(1, 2)], dim=2).contiguous(),
                 )
             ]
         return []

@@ -34,6 +34,11 @@ from xorl.models.layers.moe.aux_loss import global_load_balancing_loss_func
 from xorl.models.layers.moe.routing_replay import RoutingReplay, set_replay_stage
 from xorl.models.module_utils import compute_loss
 from xorl.optim import build_lr_scheduler, build_optimizer
+from xorl.trainers.model_builder import (
+    maybe_upcast_trainable_adapter_params,
+    resolve_training_model_dtype,
+    should_skip_generic_param_upcast,
+)
 from xorl.trainers.training_utils import (
     clip_gradients,
     count_valid_tokens,
@@ -50,6 +55,17 @@ from xorl.utils.dist_utils import all_reduce
 
 
 logger = helper.create_logger(__name__)
+_trainer_cpu_group: Optional[dist.ProcessGroup] = None
+
+
+def _get_trainer_cpu_group() -> Optional[dist.ProcessGroup]:
+    """Return a cached CPU/Gloo group for object collectives in trainer bootstrap."""
+    global _trainer_cpu_group
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() <= 1:
+        return None
+    if _trainer_cpu_group is None:
+        _trainer_cpu_group = dist.new_group(backend="gloo")
+    return _trainer_cpu_group
 
 
 # ---------------------------------------------------------------------------
@@ -237,8 +253,10 @@ class Trainer:
             "local_rank": self.args.train.local_rank,
             "hostname": socket.gethostname(),
         }
+        if not dist.is_available() or not dist.is_initialized() or self.args.train.world_size <= 1:
+            return [payload]
         gathered: List[Optional[Dict[str, Any]]] = [None] * self.args.train.world_size
-        dist.all_gather_object(gathered, payload)
+        dist.all_gather_object(gathered, payload, group=_get_trainer_cpu_group())
         return [item for item in gathered if item is not None]
 
     def _log_host_inventory(self) -> None:
@@ -349,10 +367,15 @@ class Trainer:
         """Build foundation model and inject LoRA/QLoRA if configured."""
         args = self.args
         logger.info_rank0("Prepare model")
+        model_dtype = resolve_training_model_dtype(
+            enable_lora=args.lora.enable_lora,
+            enable_qlora=args.lora.enable_qlora,
+            enable_mixed_precision=args.train.enable_mixed_precision,
+        )
         self.model = build_foundation_model(
             config_path=args.model.config_path,
             weights_path=args.model.model_path,
-            torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
+            torch_dtype=model_dtype,
             attn_implementation=args.model.attn_implementation,
             moe_implementation=args.model.moe_implementation,
             ep_dispatch=args.model.ep_dispatch,
@@ -381,6 +404,13 @@ class Trainer:
             self._inject_qlora()
         elif args.lora.enable_lora:
             self._inject_lora()
+
+        maybe_upcast_trainable_adapter_params(
+            self.model,
+            enable_lora=args.lora.enable_lora,
+            enable_qlora=args.lora.enable_qlora,
+            enable_mixed_precision=args.train.enable_mixed_precision,
+        )
 
         # Save pre-hook before parallelization (some models register optimizer hooks)
         self._optimizer_pre_hook_fn = getattr(self.model, "get_optimizer_pre_hook", None)
@@ -471,7 +501,10 @@ class Trainer:
             load_weights_mode=args.train.load_weights_mode,
             pp_schedule=args.train.pipeline_parallel_schedule if args.train.pipeline_parallel_size > 1 else None,
             reshard_after_forward=args.train.reshard_after_forward,
-            skip_param_upcast=args.lora.enable_qlora,
+            skip_param_upcast=should_skip_generic_param_upcast(
+                enable_lora=args.lora.enable_lora,
+                enable_qlora=args.lora.enable_qlora,
+            ),
         )
 
         logger.info_rank0(f"Model weights loaded in {time.time() - _t0:.1f}s")

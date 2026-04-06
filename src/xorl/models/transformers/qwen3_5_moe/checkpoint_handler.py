@@ -137,11 +137,17 @@ class Qwen3_5MoeCheckpointHandler(CheckpointHandler):
     def _handle_fused_expert_weights(self, key: str, tensor: torch.Tensor) -> Optional[List[Tuple[str, torch.Tensor]]]:
         internal_gate_up_match = self._INTERNAL_FUSED_EXPERT_GATE_UP_PATTERN.match(key)
         if internal_gate_up_match is not None:
-            return [(key, self._slice_expert_tensor_for_ep(tensor))]
+            tensor = self._slice_expert_tensor_for_ep(tensor)
+            if tensor.ndim == 3 and tensor.shape[1] < tensor.shape[2]:
+                tensor = tensor.transpose(1, 2).contiguous()
+            return [(key, tensor)]
 
         internal_down_match = self._INTERNAL_FUSED_EXPERT_DOWN_PATTERN.match(key)
         if internal_down_match is not None:
-            return [(key, self._slice_expert_tensor_for_ep(tensor))]
+            tensor = self._slice_expert_tensor_for_ep(tensor)
+            if tensor.ndim == 3 and tensor.shape[1] > tensor.shape[2]:
+                tensor = tensor.transpose(1, 2).contiguous()
+            return [(key, tensor)]
 
         gate_up_match = self._HF_FUSED_EXPERT_GATE_UP_PATTERN.match(key)
         if gate_up_match is not None:
@@ -167,7 +173,7 @@ class Qwen3_5MoeCheckpointHandler(CheckpointHandler):
             proj = split_match.group(2)
             tensor = self._slice_expert_tensor_for_ep(tensor)
             if proj == "down":
-                return [(f"model.layers.{layer_idx}.mlp.experts.down_proj", tensor)]
+                return [(f"model.layers.{layer_idx}.mlp.experts.down_proj", tensor.transpose(1, 2).contiguous())]
 
             pending = self._stacked_gate_up_pending.setdefault(layer_idx, {})
             pending[proj] = tensor
@@ -178,7 +184,7 @@ class Qwen3_5MoeCheckpointHandler(CheckpointHandler):
                 return [
                     (
                         f"model.layers.{layer_idx}.mlp.experts.gate_up_proj",
-                        torch.cat([gate, up], dim=2),
+                        torch.cat([gate.transpose(1, 2), up.transpose(1, 2)], dim=2).contiguous(),
                     )
                 ]
             return []

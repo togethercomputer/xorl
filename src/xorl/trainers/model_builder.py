@@ -34,6 +34,51 @@ class TrainingModelResult:
     exclude_modules: Set[str] = field(default_factory=set)
 
 
+def resolve_training_model_dtype(
+    *,
+    enable_lora: bool,
+    enable_qlora: bool,
+    enable_mixed_precision: bool,
+) -> str:
+    """Return the foundation-model dtype for the requested training mode.
+
+    Full-weight mixed-precision training keeps parameters in fp32 before FSDP
+    wrapping. LoRA/QLoRA instead keep the frozen base weights in bf16 and only
+    upcast the trainable adapter weights to fp32.
+    """
+    if (enable_lora or enable_qlora) and enable_mixed_precision:
+        return "bfloat16"
+    if enable_mixed_precision:
+        return "float32"
+    return "bfloat16"
+
+
+def should_skip_generic_param_upcast(
+    *,
+    enable_lora: bool,
+    enable_qlora: bool,
+) -> bool:
+    """Whether the generic full-model fp32 upcast should be skipped."""
+    return enable_lora or enable_qlora
+
+
+def maybe_upcast_trainable_adapter_params(
+    model: nn.Module,
+    *,
+    enable_lora: bool,
+    enable_qlora: bool,
+    enable_mixed_precision: bool,
+) -> None:
+    """Upcast trainable adapter weights to fp32 while leaving the frozen base in bf16."""
+    if not enable_mixed_precision or not (enable_lora or enable_qlora):
+        return
+
+    for param in model.parameters():
+        if param.requires_grad:
+            param.data = param.data.to(torch.float32)
+    logger.info_rank0("Upcast trainable LoRA params to float32")
+
+
 def build_training_model(
     *,
     # --- Model ---
@@ -178,11 +223,12 @@ def build_training_model(
     # ------------------------------------------------------------------
     # 4. LoRA + mixed precision: upcast trainable params to fp32
     # ------------------------------------------------------------------
-    if (enable_lora or enable_qlora) and enable_mixed_precision:
-        for param in model.parameters():
-            if param.requires_grad:
-                param.data = param.data.to(torch.float32)
-        logger.info_rank0("Upcast trainable LoRA params to float32")
+    maybe_upcast_trainable_adapter_params(
+        model,
+        enable_lora=enable_lora,
+        enable_qlora=enable_qlora,
+        enable_mixed_precision=enable_mixed_precision,
+    )
 
     # ------------------------------------------------------------------
     # 5. Save optimizer pre-hook (some models register hooks)
@@ -207,7 +253,10 @@ def build_training_model(
         load_weights_mode=load_weights_mode,
         pp_schedule=pp_schedule,
         reshard_after_forward=reshard_after_forward,
-        skip_param_upcast=enable_qlora,
+        skip_param_upcast=should_skip_generic_param_upcast(
+            enable_lora=enable_lora,
+            enable_qlora=enable_qlora,
+        ),
     )
 
     pp_enabled = isinstance(build_result, dict)

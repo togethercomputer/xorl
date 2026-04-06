@@ -369,8 +369,12 @@ def build_parallelize_model(
     if not parallel_state.fsdp_enabled:
         if kwargs.get("init_device") not in ["cuda", "npu"]:
             raise ValueError("Only FSDP training supports `init_device=cpu` or `init_device=meta`.")
-    if enable_mixed_precision and not kwargs.pop("skip_param_upcast", False):
+    skip_param_upcast = kwargs.pop("skip_param_upcast", False)
+    if enable_mixed_precision and not skip_param_upcast:
+        logger.info_rank0("Applying generic fp32 param upcast before parallelization")
         model = model.float()
+    elif enable_mixed_precision:
+        logger.info_rank0("Skipping generic fp32 param upcast before parallelization")
 
     if pp_schedule is not None:
         # ---- Pipeline Parallelism path ----
