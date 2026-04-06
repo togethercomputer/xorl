@@ -35,7 +35,7 @@ class MoEBlock(nn.Module):
         norm_topk_prob: Whether to renormalize top-k routing weights.
         moe_implementation: Backend name — ``"eager"``, ``"triton"``, ``"native"``, or ``"quack"``.
         train_router: If True (default), gradients flow from expert
-            computation through routing weights back to the gate.  If False,
+            computation through routing weights back to the gate. If False,
             routing weights are detached before expert computation so the gate
             is only trained via auxiliary losses on ``router_logits``.
     """
@@ -190,9 +190,13 @@ class MoEBlock(nn.Module):
             # No replay active: use standard router
             routing_weights, selected_experts = self.router(router_logits, hidden_states.dtype)
 
-        # When train_router is False, detach routing_weights so the gate is
-        # only trained via auxiliary losses on router_logits, not through
-        # expert computation.
+        ep_dispatch = getattr(self.experts, "ep_dispatch", "alltoall")
+        if self.train_router and ep_dispatch == "deepep":
+            raise AssertionError(
+                "train_router=True is not supported with ep_dispatch='deepep'. "
+                "DeepEP cannot propagate gradients through routing weights. "
+                "Set train_router=False or switch to ep_dispatch='alltoall'."
+            )
         if not self.train_router:
             routing_weights = routing_weights.detach()
 
@@ -239,5 +243,5 @@ class MoEBlock(nn.Module):
             hidden_act=config.hidden_act,
             norm_topk_prob=config.norm_topk_prob,
             moe_implementation=moe_implementation,
-            train_router=getattr(config, "train_router", True),
+            train_router=getattr(config, "train_router", False),
         )

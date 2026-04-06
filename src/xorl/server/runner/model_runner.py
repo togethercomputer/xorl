@@ -466,6 +466,7 @@ class ModelRunner:
             attn_implementation=self.model_config.get("attn_implementation", "sdpa"),
             moe_implementation=self.model_config.get("moe_implementation"),
             ep_dispatch=self.model_config.get("ep_dispatch", "alltoall"),
+            train_router=self.model_config.get("train_router", False),
             deepep_buffer_size_gb=self.model_config.get("deepep_buffer_size_gb", 2.0),
             deepep_num_sms=self.model_config.get("deepep_num_sms", 20),
             deepep_async_combine=self.model_config.get("deepep_async_combine", False),
@@ -967,7 +968,6 @@ class ModelRunner:
     ):
         """Core forward (+ optional backward) loop shared between forward and forward_backward."""
         params = loss_fn_params or {}
-        return_per_token = params.get("return_per_token", True)
 
         # Count valid tokens globally
         global_valid_tokens = self._count_global_valid_tokens(micro_batches)

@@ -78,6 +78,14 @@ class ServerArguments:
         metadata={"help": "EP dispatch strategy: 'alltoall' (default) or 'deepep' (NVLink-optimized)."},
     )
 
+    train_router: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether expert computation gradients should flow through routing weights. "
+            "Disabled by default and must remain False when ep_dispatch='deepep'."
+        },
+    )
+
     deepep_buffer_size_gb: float = field(
         default=2.0, metadata={"help": "DeepEP buffer size in GB (effective when ep_dispatch='deepep')."}
     )
@@ -465,6 +473,7 @@ class ServerArguments:
                 "attn_implementation": self.attn_implementation,
                 "moe_implementation": self.moe_implementation,
                 "ep_dispatch": self.ep_dispatch,
+                "train_router": self.train_router,
                 "deepep_buffer_size_gb": self.deepep_buffer_size_gb,
                 "deepep_num_sms": self.deepep_num_sms,
                 "deepep_async_combine": self.deepep_async_combine,

@@ -8,7 +8,10 @@ model_path: Qwen/Qwen3-235B-A22B-Instruct-2507
 tokenizer_path: Qwen/Qwen3-235B-A22B-Instruct-2507
 attn_implementation: flash_attention_3
 moe_implementation: triton
-ep_dispatch: alltoall
+ep_dispatch: deepep
+train_router: false
+deepep_buffer_size_gb: 2.0
+deepep_num_sms: 48
 router_fp32: true
 lm_head_fp32: true
 rmsnorm_mode: native

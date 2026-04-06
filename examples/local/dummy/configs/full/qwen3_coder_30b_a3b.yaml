@@ -3,6 +3,7 @@ model:
   attn_implementation: flash_attention_3
   moe_implementation: quack
   ep_dispatch: deepep
+  train_router: false
   deepep_buffer_size_gb: 2.0
   deepep_num_sms: 48
 

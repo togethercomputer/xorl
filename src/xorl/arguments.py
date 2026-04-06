@@ -446,6 +446,13 @@ class ModelArguments:
         default="alltoall",
         metadata={"help": "EP dispatch strategy: 'alltoall' (default) or 'deepep' (NVLink-optimized)."},
     )
+    train_router: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether expert computation gradients should flow through routing weights. "
+            "Disabled by default and must remain False when ep_dispatch='deepep'."
+        },
+    )
     deepep_buffer_size_gb: float = field(
         default=2.0,
         metadata={"help": "DeepEP buffer size in GB (effective when ep_dispatch='deepep')."},

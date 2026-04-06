@@ -106,6 +106,7 @@ def build_foundation_model(
     ] = "flash_attention_3",
     moe_implementation: Optional[Literal["eager", "triton", "native", "quack"]] = None,
     ep_dispatch: str = "alltoall",
+    train_router: bool = False,
     deepep_buffer_size_gb: float = 2.0,
     deepep_num_sms: int = 20,
     deepep_async_combine: bool = False,
@@ -139,7 +140,14 @@ def build_foundation_model(
         config._moe_implementation = moe_implementation
         logger.info_rank0(f"Moe implementation: {moe_implementation}")
 
+    if ep_dispatch == "deepep" and train_router:
+        raise ValueError(
+            "train_router=True is not supported with ep_dispatch='deepep'. "
+            "Set train_router=False or use ep_dispatch='alltoall'."
+        )
+
     config._ep_dispatch = ep_dispatch
+    config.train_router = train_router
     config._deepep_buffer_size_gb = deepep_buffer_size_gb
     config._deepep_num_sms = deepep_num_sms
     config._deepep_async_combine = deepep_async_combine

@@ -356,6 +356,7 @@ class Trainer:
             attn_implementation=args.model.attn_implementation,
             moe_implementation=args.model.moe_implementation,
             ep_dispatch=args.model.ep_dispatch,
+            train_router=args.model.train_router,
             deepep_buffer_size_gb=args.model.deepep_buffer_size_gb,
             deepep_num_sms=args.model.deepep_num_sms,
             deepep_async_combine=args.model.deepep_async_combine,
