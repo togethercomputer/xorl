@@ -66,6 +66,7 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
         checkpoint_has_per_expert: bool = True,
         skip_qkv_merge: bool = False,
         skip_gate_up_merge: bool = False,
+        skip_expert_loading: bool = False,
         is_prequantized: bool = False,
         exclude_modules: Optional[Set[str]] = None,
         device: Optional["torch.device"] = None,
@@ -73,7 +74,7 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
     ):
         self._expert_buffer: Optional[ExpertWeightBuffer] = None
         # Non-QLoRA expert stacking (disabled when pre-quantized — use QLoRAExpertBuffer instead)
-        if checkpoint_has_per_expert and not is_prequantized:
+        if checkpoint_has_per_expert and not is_prequantized and not skip_expert_loading:
             self._expert_buffer = ExpertWeightBuffer(
                 num_experts,
                 ep_rank=ep_rank,
@@ -95,6 +96,7 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
         self._expert_start = ep_rank * self._local_num_experts
         self._expert_end = self._expert_start + self._local_num_experts
         self._is_prequantized = is_prequantized
+        self._skip_expert_loading = skip_expert_loading
         self._exclude_modules = exclude_modules or set()
         # Inline QLoRA weight loading for dense modules (attention, shared expert)
         self._qlora_buffer: Optional[QLoRAWeightBuffer] = None
@@ -209,12 +211,18 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
             and self._qlora_expert_buffer.expert_end == self._qlora_expert_buffer._num_experts
         )
 
-        if not has_ep_filter and not has_expert_ep_filter and not self._is_prequantized:
+        if (
+            not has_ep_filter
+            and not has_expert_ep_filter
+            and not self._is_prequantized
+            and not self._skip_expert_loading
+        ):
             return None
 
         ep_start = self._expert_buffer.expert_start if has_ep_filter else 0
         ep_end = self._expert_buffer.expert_end if has_ep_filter else 0
         is_prequantized = self._is_prequantized
+        skip_expert_loading = self._skip_expert_loading
         exclude_modules = self._exclude_modules
         has_qlora_buffer = self._qlora_buffer is not None
         has_qlora_expert_buffer = self._qlora_expert_buffer is not None
@@ -223,6 +231,15 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
             qe_end = self._qlora_expert_buffer.expert_end
 
         def _should_skip(key: str) -> bool:
+            if skip_expert_loading:
+                if parse_expert_full_key(key) is not None:
+                    return True
+                if self._STACKED_EXPERT_SPLIT_PATTERN.match(key) is not None:
+                    return True
+                if self._FUSED_EXPERT_GATE_UP_PATTERN.match(key) is not None:
+                    return True
+                if self._FUSED_EXPERT_DOWN_PATTERN.match(key) is not None:
+                    return True
             if is_prequantized:
                 # Don't skip keys belonging to excluded modules — they're bf16, load normally.
                 if exclude_modules:
@@ -281,6 +298,16 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
         return module_short_name in self._exclude_modules
 
     def on_load_weight(self, key: str, tensor: torch.Tensor) -> List[Tuple[str, torch.Tensor]]:
+        if self._skip_expert_loading:
+            if parse_expert_full_key(key) is not None:
+                return []
+            if self._STACKED_EXPERT_SPLIT_PATTERN.match(key) is not None:
+                return []
+            if self._FUSED_EXPERT_GATE_UP_PATTERN.match(key) is not None:
+                return []
+            if self._FUSED_EXPERT_DOWN_PATTERN.match(key) is not None:
+                return []
+
         # Drop input_scale (unused by our quantization)
         if key.endswith(".input_scale"):
             return []

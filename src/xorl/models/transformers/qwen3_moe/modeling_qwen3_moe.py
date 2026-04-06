@@ -354,6 +354,14 @@ class Qwen3MoePreTrainedModel(XorlPreTrainedModel):
         # When unfused for TP, skip QKV and gate/up merging — checkpoint keys
         # already match the model's parameter names. Expert merging is still needed.
         unfused = getattr(self, "_unfused_for_tp", False)
+        skip_expert_loading = False
+        if not is_prequantized:
+            from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
+
+            skip_expert_loading = any(
+                isinstance(module, QLoRAMoeExperts) and not getattr(module, "_weights_loaded", False)
+                for module in self.modules()
+            )
 
         head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
         return Qwen3MoeCheckpointHandler(
@@ -366,6 +374,7 @@ class Qwen3MoePreTrainedModel(XorlPreTrainedModel):
             checkpoint_has_per_expert=has_per_expert,
             skip_qkv_merge=unfused,
             skip_gate_up_merge=unfused,
+            skip_expert_loading=skip_expert_loading,
             is_prequantized=is_prequantized,
             exclude_modules=exclude_modules,
             device=kwargs.get("device"),

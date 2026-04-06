@@ -1102,6 +1102,7 @@ def rank0_load_and_broadcast_weights(
             is_broadcast=True,
             weights_path=weights_path,
         )
+    skip_key_fn = handler.get_skip_key_fn() if handler is not None else None
 
     # When PP is enabled, gather expected keys from all ranks so we can distinguish
     # "key belongs to another PP stage" (expected) from "truly unexpected key" (warning).
@@ -1130,7 +1131,11 @@ def rank0_load_and_broadcast_weights(
     # background threads while the current shard is being broadcast.
     # prefetch_count=2 allows 2 concurrent NFS reads for higher aggregate throughput.
     if global_rank == 0:
-        prefetched = _prefetch_shards(state_dict_iterators, prefetch_count=2)
+        if skip_key_fn is not None:
+            logger.info_rank0("Filtered broadcast loading enabled on rank 0 for handler-skipped checkpoint keys")
+            prefetched = _prefetch_shards_filtered(state_dict_iterators, skip_key_fn, prefetch_count=2)
+        else:
+            prefetched = _prefetch_shards(state_dict_iterators, prefetch_count=2)
 
     if global_rank == 0:
         shard_range = tqdm(
@@ -1149,7 +1154,13 @@ def rank0_load_and_broadcast_weights(
         # all tensors through the checkpoint handler. While this runs, the
         # background thread is already loading the *next* shard from disk.
         if global_rank == 0:
-            state_dict = next(prefetched)
+            skipped_keys = []
+            if skip_key_fn is not None:
+                state_dict, skipped_keys = next(prefetched)
+                for skipped_key in skipped_keys:
+                    merged_queue.extend(handler.on_skip_weight(skipped_key))
+            else:
+                state_dict = next(prefetched)
             for key, tensor in state_dict.items():
                 key = _convert_weight_key(key, model)
                 if handler is not None:

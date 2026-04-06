@@ -132,3 +132,47 @@ def test_qwen3_5_moe_checkpoint_handler_round_trips_fused_experts():
     torch.testing.assert_close(saved["model.layers.0.mlp.experts.1.up_proj.weight"], up[1])
     torch.testing.assert_close(saved["model.layers.0.mlp.experts.0.down_proj.weight"], down_weight[0])
     torch.testing.assert_close(saved["model.layers.0.mlp.experts.1.down_proj.weight"], down_weight[1])
+
+
+def test_qwen3_moe_checkpoint_handler_skips_deferred_qlora_expert_loading():
+    handler = Qwen3MoeCheckpointHandler(
+        num_experts=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=2,
+        skip_expert_loading=True,
+    )
+
+    skip_fn = handler.get_skip_key_fn()
+    assert skip_fn is not None
+    assert skip_fn("model.layers.0.mlp.experts.0.gate_proj.weight")
+    assert skip_fn("model.layers.0.mlp.experts.0.up_proj.weight")
+    assert skip_fn("model.layers.0.mlp.experts.0.down_proj.weight")
+    assert skip_fn("model.layers.0.mlp.experts.gate_up_proj")
+    assert skip_fn("model.layers.0.mlp.experts.down_proj")
+
+    assert handler.on_load_weight("model.layers.0.mlp.experts.0.gate_proj.weight", torch.randn(3, 4)) == []
+    assert handler.on_load_weight("model.layers.0.mlp.experts.gate_up_proj", torch.randn(2, 4, 6)) == []
+
+
+def test_qwen3_5_moe_checkpoint_handler_skips_deferred_qlora_expert_loading():
+    handler = Qwen3_5MoeCheckpointHandler(
+        num_experts=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=2,
+        linear_key_dim=2,
+        linear_value_dim=2,
+        skip_expert_loading=True,
+    )
+
+    skip_fn = handler.get_skip_key_fn()
+    assert skip_fn is not None
+    assert skip_fn("model.layers.0.mlp.experts.0.gate_proj.weight")
+    assert skip_fn("model.layers.0.mlp.experts.0.up_proj.weight")
+    assert skip_fn("model.layers.0.mlp.experts.0.down_proj.weight")
+    assert skip_fn("model.layers.0.mlp.experts.gate_up_proj.weight")
+    assert skip_fn("model.layers.0.mlp.experts.down_proj.weight")
+
+    assert handler.on_load_weight("model.layers.0.mlp.experts.0.gate_proj.weight", torch.randn(3, 4)) == []
+    assert handler.on_load_weight("model.layers.0.mlp.experts.gate_up_proj.weight", torch.randn(2, 6, 4)) == []

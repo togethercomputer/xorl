@@ -392,6 +392,14 @@ class Qwen3_5MoePreTrainedModel(XorlPreTrainedModel):
             ep_rank, ep_size = 0, 1
         unfused = getattr(self, "_unfused_for_tp", False)
         head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
+        skip_expert_loading = False
+        if not is_prequantized:
+            from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
+
+            skip_expert_loading = any(
+                isinstance(module, QLoRAMoeExperts) and not getattr(module, "_weights_loaded", False)
+                for module in self.modules()
+            )
         return Qwen3_5MoeCheckpointHandler(
             num_experts=self.config.num_experts,
             num_attention_heads=self.config.num_attention_heads,
@@ -404,6 +412,7 @@ class Qwen3_5MoePreTrainedModel(XorlPreTrainedModel):
             checkpoint_has_per_expert=has_per_expert,
             skip_qkv_merge=True,
             skip_gate_up_merge=unfused,
+            skip_expert_loading=skip_expert_loading,
             is_prequantized=is_prequantized,
             exclude_modules=exclude_modules,
         )
