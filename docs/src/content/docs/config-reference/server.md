@@ -95,7 +95,7 @@ These flags align the training model's numerics with the inference engine (SGLan
 
 | Field | Default | Description |
 |---|---|---|
-| `optimizer` | `adamw` | Optimizer: `adamw`, `anyprecision_adamw`, `sgd`, `muon`. |
+| `optimizer` | `adamw` | Optimizer: `adamw`, `anyprecision_adamw`, `sgd`, `signsgd`, `muon`. |
 | `optimizer_dtype` | `bf16` | Dtype for optimizer states: `fp32` or `bf16`. BF16 halves optimizer memory. |
 | `muon_lr` | `0.02` | Learning rate for Muon matrix parameter groups. Only used when `optimizer: muon`. |
 | `muon_momentum` | `0.95` | Muon momentum coefficient. |

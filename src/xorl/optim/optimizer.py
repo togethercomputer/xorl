@@ -29,6 +29,53 @@ _MUON_EXCLUDE_PARAM_PATTERNS = {"embed_tokens", "lm_head", "norm", "gate.weight"
 
 
 # https://github.com/meta-llama/llama-recipes/blob/v0.0.4/src/llama_recipes/policies/anyprecision_optimizer.py
+class SignSGD(Optimizer):
+    """Sign-based SGD optimizer with no optimizer-state tensors."""
+
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        weight_decay: float = 0.0,
+    ):
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if weight_decay < 0.0:
+            raise ValueError(f"Invalid weight_decay: {weight_decay}")
+
+        defaults = {
+            "lr": lr,
+            "weight_decay": weight_decay,
+        }
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Perform a single optimization step."""
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            weight_decay = group["weight_decay"]
+
+            for p in group["params"]:
+                grad = p.grad
+                if grad is None:
+                    continue
+                if grad.is_sparse:
+                    raise RuntimeError("SignSGD does not support sparse gradients.")
+
+                if weight_decay:
+                    p.add_(p, alpha=-lr * weight_decay)
+
+                p.add_(torch.sign(grad), alpha=-lr)
+
+        return loss
+
+
 class AnyPrecisionAdamW(Optimizer):
     def __init__(
         self,
@@ -223,6 +270,7 @@ def _should_build_ep_aware(model: "nn.Module", param_groups: Optional[Sequence[D
     # Only auto-split when using FSDP2 with EP and no explicit param_groups
     if param_groups is not None:
         return False
+
     ps = get_parallel_state()
     if ps.dp_mode != "fsdp2" or not ps.ep_enabled:
         return False
@@ -333,6 +381,9 @@ def _get_optimizer_cls_and_kwargs(
         sgd_defaults.update(kwargs)
         ctor_kwargs = dict(lr=lr, weight_decay=weight_decay, **sgd_defaults)
         return torch.optim.SGD, ctor_kwargs
+    elif optimizer_type == "signsgd":
+        ctor_kwargs = dict(lr=lr, weight_decay=weight_decay, **kwargs)
+        return SignSGD, ctor_kwargs
     elif optimizer_type == "muon":
         adamw_state_dtype = _ANYPRECISION_STATE_DTYPES.get(optimizer_dtype)
         ctor_kwargs = dict(
@@ -350,7 +401,7 @@ def _get_optimizer_cls_and_kwargs(
         return Muon, ctor_kwargs
     else:
         raise ValueError(
-            f"Unsupported optimizer type: '{optimizer_type}'. Supported: adamw, anyprecision_adamw, sgd, muon."
+            f"Unsupported optimizer type: '{optimizer_type}'. Supported: adamw, anyprecision_adamw, sgd, signsgd, muon."
         )
 
 
@@ -372,6 +423,7 @@ def _create_optimizer(
     Common args (lr, betas, eps, weight_decay) are passed directly.
     Optimizer-specific args are passed via optimizer_kwargs:
       - sgd: {"momentum": 0.9, "nesterov": True}
+      - signsgd: no optimizer-specific kwargs
       - muon: {"muon_lr": 0.02, "muon_momentum": 0.95, ...}
       - adamw/anyprecision_adamw: any extra kwargs forwarded to constructor
     """
@@ -492,13 +544,14 @@ def build_optimizer(
         eps: AdamW epsilon.
         weight_decay: Weight decay coefficient.
         fused: Use fused AdamW kernel (mutually exclusive with foreach).
-        optimizer_type: One of "adamw", "anyprecision_adamw", "sgd", "muon".
+        optimizer_type: One of "adamw", "anyprecision_adamw", "sgd", "signsgd", "muon".
         optimizer_dtype: State dtype for anyprecision_adamw / muon ("fp32" or "bf16").
         param_groups: Custom param groups. If None, auto-built with weight decay splitting.
         no_decay_modules: Module class names to exclude from weight decay.
         no_decay_params: Parameter name patterns to exclude from weight decay.
         optimizer_kwargs: Optimizer-specific keyword arguments passed to the constructor.
             - sgd: {"momentum": 0.9, "nesterov": True}
+            - signsgd: no optimizer-specific kwargs
             - muon: {"muon_lr": 0.02, "muon_momentum": 0.95, "muon_nesterov": True,
                       "muon_ns_steps": 5, "muon_adjust_lr_fn": None, "muon_momentum_dtype": None}
             - adamw/anyprecision_adamw: any extra kwargs forwarded to constructor
@@ -618,8 +671,8 @@ def build_ep_fsdp2_optimizer(
 
     if optimizer_type == "muon":
         # For Muon + EP: classify within each EP/non-EP subset, then build Muon optimizers
-        ep_param_set = set(id(p) for p in ep_params)
-        non_ep_param_set = set(id(p) for p in non_ep_params)
+        ep_param_set = {id(p) for p in ep_params}
+        non_ep_param_set = {id(p) for p in non_ep_params}
 
         # Classify all model params into Muon vs AdamW
         all_muon, _, all_adamw, _ = _classify_muon_params(model)

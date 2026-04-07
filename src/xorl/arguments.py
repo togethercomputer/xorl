@@ -542,9 +542,12 @@ class TrainingArguments:
         metadata={"help": "Parameters without weight decay, for example, bias."},
     )
 
-    optimizer: Literal["adamw", "anyprecision_adamw", "sgd", "muon"] = field(
+    optimizer: Literal["adamw", "anyprecision_adamw", "sgd", "signsgd", "muon"] = field(
         default="adamw",
-        metadata={"help": "Optimizer type. 'muon' uses Newton-Schulz orthogonalization for 2D+ weight matrices."},
+        metadata={
+            "help": "Optimizer type. 'signsgd' is a state-free sign update; 'muon' uses "
+            "Newton-Schulz orthogonalization for 2D+ weight matrices."
+        },
     )
     optimizer_dtype: Literal["fp32", "bf16"] = field(
         default="bf16",

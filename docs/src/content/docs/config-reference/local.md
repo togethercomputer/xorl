@@ -126,7 +126,7 @@ Each entry in `datasets` (or `test_datasets`) is a dict:
 
 | Field | Default | Description |
 |---|---|---|
-| `optimizer` | `adamw` | Optimizer: `adamw`, `anyprecision_adamw`, `sgd`, `muon`. |
+| `optimizer` | `adamw` | Optimizer: `adamw`, `anyprecision_adamw`, `sgd`, `signsgd`, `muon`. |
 | `optimizer_dtype` | `bf16` | Dtype for optimizer states in `anyprecision_adamw` and `muon`: `fp32` or `bf16`. BF16 halves optimizer memory. |
 | `lr` | `5e-5` | Peak learning rate. |
 | `lr_min` | `1e-7` | Minimum learning rate at the end of decay. |
