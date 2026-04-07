@@ -29,9 +29,10 @@ class QuackEPGroupGemmMoeAct(torch.autograd.Function):
     gate_output and up_output in backward (2 local GEMMs, no EP communication)."""
 
     @staticmethod
-    def forward(ctx, permute_tokens, cumsum, gate_proj, up_proj, down_proj):
+    def forward(ctx, permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores=None):
         max_M = permute_tokens.shape[0]
         cu_seqlens = cumsum_to_cu_seqlens(cumsum)
+        ctx.has_expert_scores = expert_scores is not None
 
         gate_output = quack_group_gemm_same_nk(
             a=permute_tokens, b=gate_proj, cumsum_M=cumsum, max_M=max_M, transpose_b=False, cu_seqlens_m=cu_seqlens
@@ -42,6 +43,8 @@ class QuackEPGroupGemmMoeAct(torch.autograd.Function):
 
         gate_activation = torch.ops.aten.silu(gate_output)
         gated_output = gate_activation * up_output
+        if expert_scores is not None:
+            gated_output = gated_output * expert_scores.to(gated_output.dtype).unsqueeze(-1)
         del gate_activation
 
         down_output = quack_group_gemm_same_nk(
@@ -50,12 +53,14 @@ class QuackEPGroupGemmMoeAct(torch.autograd.Function):
         del gated_output
 
         # moe_act: save only 5 tensors (drop gate_output, up_output)
-        ctx.save_for_backward(permute_tokens, cumsum, gate_proj, up_proj, down_proj)
+        if expert_scores is None:
+            expert_scores = permute_tokens.new_ones(permute_tokens.shape[0])
+        ctx.save_for_backward(permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores)
         return down_output
 
     @staticmethod
     def backward(ctx, grad_output):
-        permute_tokens, cumsum, gate_proj, up_proj, down_proj = ctx.saved_tensors
+        permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores = ctx.saved_tensors
         max_M = grad_output.shape[0]
         cu_seqlens_m = cumsum_to_cu_seqlens(cumsum)
 
@@ -70,9 +75,12 @@ class QuackEPGroupGemmMoeAct(torch.autograd.Function):
         # Rest identical to QuackEPGroupGemm.backward
         gate_activation = torch.ops.aten.silu(gate_output)
         gated_output = gate_activation * up_output
+        expert_scores_dtype = expert_scores.dtype
+        expert_scores = expert_scores.to(gated_output.dtype)
+        gated_weighted = gated_output * expert_scores.unsqueeze(-1)
 
         # dgrad FC2
-        grad_gated_output = quack_group_gemm_same_nk(
+        grad_gated_weighted = quack_group_gemm_same_nk(
             a=grad_output, b=down_proj, cumsum_M=cumsum, max_M=max_M, transpose_b=True, cu_seqlens_m=cu_seqlens_m
         )
 
@@ -81,7 +89,7 @@ class QuackEPGroupGemmMoeAct(torch.autograd.Function):
         if down_proj.requires_grad:
             grad_down_proj = torch.empty_like(down_proj)
             quack_group_gemm_same_mn(
-                a=gated_output,
+                a=gated_weighted,
                 b=grad_output,
                 c=grad_down_proj,
                 cumsum_K=cumsum,
@@ -90,7 +98,13 @@ class QuackEPGroupGemmMoeAct(torch.autograd.Function):
                 transpose_b=False,
                 cu_seqlens_k=cu_seqlens_m,
             )
-        del gated_output
+        grad_expert_scores = None
+        if ctx.has_expert_scores:
+            grad_expert_scores = (grad_gated_weighted * gated_output).sum(dim=-1).to(expert_scores_dtype)
+        del gated_output, gated_weighted
+
+        grad_gated_output = grad_gated_weighted * expert_scores.unsqueeze(-1)
+        del grad_gated_weighted
 
         # Activation backward
         grad_up_output = gate_activation * grad_gated_output
@@ -137,7 +151,7 @@ class QuackEPGroupGemmMoeAct(torch.autograd.Function):
             )
         del grad_up_output
 
-        return grad_permute_tokens, None, grad_gate_proj, grad_up_proj, grad_down_proj
+        return grad_permute_tokens, None, grad_gate_proj, grad_up_proj, grad_down_proj, grad_expert_scores
 
 
 class QuackMoeExpertsFunction(torch.autograd.Function):
@@ -296,9 +310,10 @@ class QuackEPGroupGemm(torch.autograd.Function):
     """Memory-optimized EP expert GEMM. Recomputes cheap intermediates, explicit del."""
 
     @staticmethod
-    def forward(ctx, permute_tokens, cumsum, gate_proj, up_proj, down_proj):
+    def forward(ctx, permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores=None):
         max_M = permute_tokens.shape[0]
         cu_seqlens = cumsum_to_cu_seqlens(cumsum)
+        ctx.has_expert_scores = expert_scores is not None
 
         if _DEBUG_EP:
             return QuackEPGroupGemm._forward_debug(
@@ -308,6 +323,7 @@ class QuackEPGroupGemm(torch.autograd.Function):
                 gate_proj,
                 up_proj,
                 down_proj,
+                expert_scores,
                 max_M,
                 cu_seqlens,
             )
@@ -321,6 +337,8 @@ class QuackEPGroupGemm(torch.autograd.Function):
 
         gate_activation = torch.ops.aten.silu(gate_output)
         gated_output = gate_activation * up_output
+        if expert_scores is not None:
+            gated_output = gated_output * expert_scores.to(gated_output.dtype).unsqueeze(-1)
         del gate_activation
 
         down_output = quack_group_gemm_same_nk(
@@ -328,14 +346,19 @@ class QuackEPGroupGemm(torch.autograd.Function):
         )
         del gated_output
 
-        ctx.save_for_backward(permute_tokens, cumsum, gate_proj, up_proj, down_proj, gate_output, up_output)
+        if expert_scores is None:
+            expert_scores = permute_tokens.new_ones(permute_tokens.shape[0])
+        ctx.save_for_backward(
+            permute_tokens, cumsum, gate_proj, up_proj, down_proj, gate_output, up_output, expert_scores
+        )
         return down_output
 
     @staticmethod
-    def _forward_debug(ctx, permute_tokens, cumsum, gate_proj, up_proj, down_proj, max_M, cu_seqlens):
+    def _forward_debug(ctx, permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores, max_M, cu_seqlens):
         """Instrumented forward with per-GEMM CUDA event timing."""
         rank = dist.get_rank() if dist.is_initialized() else 0
         ev = [torch.cuda.Event(enable_timing=True) for _ in range(8)]
+        ctx.has_expert_scores = expert_scores is not None
 
         ev[0].record()
         gate_output = quack_group_gemm_same_nk(
@@ -350,6 +373,8 @@ class QuackEPGroupGemm(torch.autograd.Function):
 
         gate_activation = torch.ops.aten.silu(gate_output)
         gated_output = gate_activation * up_output
+        if expert_scores is not None:
+            gated_output = gated_output * expert_scores.to(gated_output.dtype).unsqueeze(-1)
         del gate_activation
         ev[3].record()
 
@@ -377,21 +402,28 @@ class QuackEPGroupGemm(torch.autograd.Function):
             flush=True,
         )
 
-        ctx.save_for_backward(permute_tokens, cumsum, gate_proj, up_proj, down_proj, gate_output, up_output)
+        if expert_scores is None:
+            expert_scores = permute_tokens.new_ones(permute_tokens.shape[0])
+        ctx.save_for_backward(
+            permute_tokens, cumsum, gate_proj, up_proj, down_proj, gate_output, up_output, expert_scores
+        )
         return down_output
 
     @staticmethod
     def backward(ctx, grad_output):
-        permute_tokens, cumsum, gate_proj, up_proj, down_proj, gate_output, up_output = ctx.saved_tensors
+        permute_tokens, cumsum, gate_proj, up_proj, down_proj, gate_output, up_output, expert_scores = ctx.saved_tensors
         max_M = grad_output.shape[0]
         cu_seqlens_m = cumsum_to_cu_seqlens(cumsum)
 
         # Recompute cheap intermediates
         gate_activation = torch.ops.aten.silu(gate_output)
         gated_output = gate_activation * up_output
+        expert_scores_dtype = expert_scores.dtype
+        expert_scores = expert_scores.to(gated_output.dtype)
+        gated_weighted = gated_output * expert_scores.unsqueeze(-1)
 
         # dgrad FC2
-        grad_gated_output = quack_group_gemm_same_nk(
+        grad_gated_weighted = quack_group_gemm_same_nk(
             a=grad_output, b=down_proj, cumsum_M=cumsum, max_M=max_M, transpose_b=True, cu_seqlens_m=cu_seqlens_m
         )
 
@@ -400,7 +432,7 @@ class QuackEPGroupGemm(torch.autograd.Function):
         if down_proj.requires_grad:
             grad_down_proj = torch.empty_like(down_proj)
             quack_group_gemm_same_mn(
-                a=gated_output,
+                a=gated_weighted,
                 b=grad_output,
                 c=grad_down_proj,
                 cumsum_K=cumsum,
@@ -409,7 +441,13 @@ class QuackEPGroupGemm(torch.autograd.Function):
                 transpose_b=False,
                 cu_seqlens_k=cu_seqlens_m,
             )
-        del gated_output
+        grad_expert_scores = None
+        if ctx.has_expert_scores:
+            grad_expert_scores = (grad_gated_weighted * gated_output).sum(dim=-1).to(expert_scores_dtype)
+        del gated_output, gated_weighted
+
+        grad_gated_output = grad_gated_weighted * expert_scores.unsqueeze(-1)
+        del grad_gated_weighted
 
         # Activation backward
         grad_up_output = gate_activation * grad_gated_output
@@ -456,7 +494,7 @@ class QuackEPGroupGemm(torch.autograd.Function):
             )
         del grad_up_output
 
-        return grad_permute_tokens, None, grad_gate_proj, grad_up_proj, grad_down_proj
+        return grad_permute_tokens, None, grad_gate_proj, grad_up_proj, grad_down_proj, grad_expert_scores
 
 
 class QuackTPMoeExpertsFunction(torch.autograd.Function):

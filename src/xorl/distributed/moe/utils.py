@@ -28,27 +28,19 @@ def permute(tokens: torch.Tensor, routing_map: torch.Tensor):
 
 def unpermute(
     tokens: torch.Tensor,
-    routing_weights: torch.Tensor,
     hidden_states_shape: torch.Size,
     permutation_mapping: torch.Tensor,
-    routing_map: torch.Tensor,
 ):
     """
-    Unpermutes the tokens and apply the weight.
+    Unpermutes preweighted tokens via scatter-add.
 
     Args:
         tokens (torch.Tensor): The input token tensor, [num_tokens, hidden_dim].
-        routing_weights (torch.Tensor): The routing weights, [num_tokens, num_experts].
         hidden_states_shape (torch.Size): The shape of the hidden states, [num_tokens, hidden_dim].
-        routing_map (torch.Tensor): The sparse token to expert mapping, [num_experts, tokens].
 
     Returns:
         torch.Tensor: The unpermuted token tensor, [num_tokens, hidden_dim].
     """
-    tokens_weight = routing_weights.T.contiguous().masked_select(routing_map.bool())
-
-    # Weight in-place to avoid a second full-sized activation buffer during combine.
-    tokens.mul_(tokens_weight.unsqueeze(-1))
     hidden_dim = hidden_states_shape[-1]
 
     unpermuted_tokens = torch.zeros(hidden_states_shape, device=tokens.device, dtype=tokens.dtype)
@@ -59,6 +51,13 @@ def unpermute(
     unpermuted_tokens.scatter_add_(0, expanded_mapping, tokens)
 
     return unpermuted_tokens
+
+
+def permuted_weights(routing_weights: torch.Tensor, selected_experts: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """Return routing weights in the same local expert-sorted order as ``permute()``."""
+    dense_weights = generate_weights_idx(routing_weights, selected_experts, num_experts)
+    routing_map = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0).sum(dim=1)
+    return dense_weights.T.contiguous().masked_select(routing_map.bool())
 
 
 def generate_weights_idx(routing_weights: torch.Tensor, selected_experts: torch.Tensor, num_experts) -> torch.Tensor:

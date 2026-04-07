@@ -201,12 +201,14 @@ class MoEExperts(nn.Module):
             torch.cuda.synchronize()
 
         # Step 2: Expert computation (backend-specific GEMM only)
+        expert_scores = getattr(ctx, "expert_scores", getattr(ctx, "permuted_scores", None))
         expert_output = compute_fn(
             permute_tokens,
             cumsum,
             gate_proj,
             up_proj,
             self.down_proj,
+            expert_scores,
         )
 
         # Step 3: Combine expert outputs back to original ranks
@@ -233,12 +235,14 @@ class MoEExperts(nn.Module):
 
         # --- compute ---
         ev[2].record()
+        expert_scores = getattr(ctx, "expert_scores", getattr(ctx, "permuted_scores", None))
         expert_output = compute_fn(
             permute_tokens,
             cumsum,
             self.gate_proj.contiguous(),
             self.up_proj.contiguous(),
             self.down_proj,
+            expert_scores,
         )
         ev[3].record()
 

@@ -352,16 +352,16 @@ class _FusedDispatchAndPermute(torch.autograd.Function):
 
 
 class _FusedUnpermuteAndCombine(torch.autograd.Function):
-    """Fused weighted scatter-add (unpermute) + combine in a single autograd boundary.
+    """Fused scatter-add (unpermute) + combine in a single autograd boundary.
 
     Forward:
-        1. Weighted scatter-add: ``output[idx[i]] += score[i] * expert_output[i]``
+        1. Scatter-add: ``output[idx[i]] += expert_output[i]``
         2. ``buffer.combine()`` to send results back to original ranks
         3. Optionally defer sync (async_combine) for overlap with next layer
 
     Backward:
         1. ``buffer.dispatch()`` to reverse combine → grad in recv order
-        2. ``grad_expert[i] = score[i] * grad[idx[i]]`` — reverse of scatter-add
+        2. ``grad_expert[i] = grad[idx[i]]`` — reverse of scatter-add
     """
 
     @staticmethod
@@ -376,7 +376,7 @@ class _FusedUnpermuteAndCombine(torch.autograd.Function):
         hidden_dim = expert_output.shape[1] if expert_output.shape[0] > 0 else dispatch_ctx.hidden_dim
         device = expert_output.device
 
-        # Step 1: Weighted scatter-add (unpermute)
+        # Step 1: Scatter-add (unpermute)
         if expert_output.shape[0] == 0:
             gather_output = torch.zeros(
                 dispatch_ctx.num_recv_tokens,
@@ -385,7 +385,6 @@ class _FusedUnpermuteAndCombine(torch.autograd.Function):
                 device=device,
             )
         else:
-            weighted = expert_output * dispatch_ctx.permuted_scores.unsqueeze(1).to(expert_output.dtype)
             gather_output = torch.zeros(
                 dispatch_ctx.num_recv_tokens,
                 hidden_dim,
@@ -393,7 +392,7 @@ class _FusedUnpermuteAndCombine(torch.autograd.Function):
                 device=device,
             )
             idx_2d = dispatch_ctx.permuted_indices.unsqueeze(1).expand(-1, hidden_dim)
-            gather_output.scatter_add_(0, idx_2d, weighted)
+            gather_output.scatter_add_(0, idx_2d, expert_output)
 
         # Step 2: Combine
         previous_event = EventOverlap(EventHandle())
@@ -411,9 +410,7 @@ class _FusedUnpermuteAndCombine(torch.autograd.Function):
         else:
             event.current_stream_wait()
 
-        # Save for backward — scores don't need grad (not a tensor input),
-        # so we never save expert_output, saving memory.
-        ctx.save_for_backward(dispatch_ctx.permuted_scores, dispatch_ctx.permuted_indices)
+        ctx.save_for_backward(dispatch_ctx.permuted_indices)
         ctx.buffer = buffer
         ctx.handle = dispatch_ctx.handle
         ctx.input_dtype = expert_output.dtype
@@ -424,7 +421,7 @@ class _FusedUnpermuteAndCombine(torch.autograd.Function):
         if grad_output is None:
             return None, None, None, None
 
-        permuted_scores, permuted_indices = ctx.saved_tensors
+        (permuted_indices,) = ctx.saved_tensors
         buffer = ctx.buffer
         handle = ctx.handle
 
@@ -443,11 +440,8 @@ class _FusedUnpermuteAndCombine(torch.autograd.Function):
         if grad_gather.dtype != ctx.input_dtype:
             grad_gather = grad_gather.to(ctx.input_dtype)
 
-        # Step 2: Reverse weighted scatter-add
-        # Forward: gather_output[idx[i]] += score[i] * expert_output[i]
-        # Backward: grad_expert[i] = score[i] * grad_gather[idx[i]]
-        grad_gathered = grad_gather.index_select(0, permuted_indices)
-        grad_expert_output = grad_gathered * permuted_scores.unsqueeze(1).to(grad_gathered.dtype)
+        # Step 2: Reverse scatter-add
+        grad_expert_output = grad_gather.index_select(0, permuted_indices)
 
         return grad_expert_output, None, None, None
 

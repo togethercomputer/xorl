@@ -127,6 +127,7 @@ def _run_experts_grouped_mm(
     down_proj: torch.Tensor,
     x: torch.Tensor,
     padded_counts: torch.Tensor,
+    expert_scores: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run MoE experts using ``torch._grouped_mm``.
 
@@ -159,6 +160,8 @@ def _run_experts_grouped_mm(
 
     # SwiGLU: silu(gate) * up
     h = gate_out * up_out
+    if expert_scores is not None:
+        h = h * expert_scores.to(h.dtype).unsqueeze(-1)
 
     # down: h @ down_proj -> (tokens, hidden)
     out = torch._grouped_mm(
@@ -210,6 +213,7 @@ def _run_experts_moe_act(
     down_proj: torch.Tensor,
     x: torch.Tensor,
     padded_counts: torch.Tensor,
+    expert_scores: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run MoE experts with moe_act: gate+up SwiGLU is checkpointed so
     gate_output and up_output are recomputed in backward instead of saved.
@@ -231,6 +235,8 @@ def _run_experts_moe_act(
         offsets,
         use_reentrant=False,
     )
+    if expert_scores is not None:
+        h = h * expert_scores.to(h.dtype).unsqueeze(-1)
 
     out = torch._grouped_mm(
         h,
@@ -310,10 +316,20 @@ def _native_expert_forward_impl(
     sorted_hidden_padded[pad_dst] = sorted_hidden
 
     # 7. Expert compute (backend-specific)
-    expert_out_padded = compute_fn(gate_proj, up_proj, down_proj, sorted_hidden_padded, padded_counts)
+    expert_scores_padded = sorted_hidden_padded.new_zeros(total_padded)
+    expert_scores_padded[pad_dst] = sorted_weights.to(expert_scores_padded.dtype)
 
-    # 8. Gather from padded layout (reuse pad_dst) + apply routing weights
-    expert_out = expert_out_padded[pad_dst] * sorted_weights.unsqueeze(-1)
+    expert_out_padded = compute_fn(
+        gate_proj,
+        up_proj,
+        down_proj,
+        sorted_hidden_padded,
+        padded_counts,
+        expert_scores_padded,
+    )
+
+    # 8. Gather from padded layout (reuse pad_dst)
+    expert_out = expert_out_padded[pad_dst]
 
     # 9. Scatter-add back to original token positions
     output = hidden_states.new_zeros(num_tokens, hidden_dim)
@@ -553,6 +569,7 @@ def native_ep_compute(
     gate_proj: torch.Tensor,
     up_proj: torch.Tensor,
     down_proj: torch.Tensor,
+    expert_scores: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """EP expert compute using ``torch._grouped_mm``.
 
@@ -578,7 +595,17 @@ def native_ep_compute(
 
     # Pad for alignment and run compiled grouped GEMM
     padded_tokens, padded_counts = _pad_to_alignment(permute_tokens, counts, num_local_experts)
-    out_padded = _run_experts_compiled(gate_proj, up_proj, down_proj, padded_tokens, padded_counts)
+    expert_scores_padded = None
+    if expert_scores is not None:
+        expert_scores_padded = padded_tokens.new_zeros(padded_tokens.shape[0])
+        expert_scores_padded[
+            _compute_pad_indices(
+                counts, padded_counts, num_local_experts, permute_tokens.shape[0], padded_tokens.device
+            )
+        ] = expert_scores.to(padded_tokens.dtype)
+    out_padded = _run_experts_compiled(
+        gate_proj, up_proj, down_proj, padded_tokens, padded_counts, expert_scores_padded
+    )
 
     # Unpad back to real token counts
     return _unpad(out_padded, counts, padded_counts, num_local_experts, permute_tokens.shape[0])
@@ -643,6 +670,7 @@ def native_ep_compute_moe_act(
     gate_proj: torch.Tensor,
     up_proj: torch.Tensor,
     down_proj: torch.Tensor,
+    expert_scores: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """EP expert compute with moe_act using ``torch._grouped_mm``.
 
@@ -657,7 +685,15 @@ def native_ep_compute_moe_act(
     counts = _cumsum_to_counts(cumsum, num_local_experts)
 
     padded_tokens, padded_counts = _pad_to_alignment(permute_tokens, counts, num_local_experts)
-    out_padded = _run_experts_moe_act(gate_proj, up_proj, down_proj, padded_tokens, padded_counts)
+    expert_scores_padded = None
+    if expert_scores is not None:
+        expert_scores_padded = padded_tokens.new_zeros(padded_tokens.shape[0])
+        expert_scores_padded[
+            _compute_pad_indices(
+                counts, padded_counts, num_local_experts, permute_tokens.shape[0], padded_tokens.device
+            )
+        ] = expert_scores.to(padded_tokens.dtype)
+    out_padded = _run_experts_moe_act(gate_proj, up_proj, down_proj, padded_tokens, padded_counts, expert_scores_padded)
 
     return _unpad(out_padded, counts, padded_counts, num_local_experts, permute_tokens.shape[0])
 

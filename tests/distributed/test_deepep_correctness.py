@@ -104,7 +104,8 @@ def run_one_pass(
         dispatch_kwargs["num_local_experts"] = num_local_experts
 
     permuted, cumsum, ctx = dispatch_fn(**dispatch_kwargs)
-    expert_out = compute_fn(permuted, cumsum, gate_proj, up_proj, down_proj)
+    expert_scores = getattr(ctx, "expert_scores", getattr(ctx, "permuted_scores", None))
+    expert_out = compute_fn(permuted, cumsum, gate_proj, up_proj, down_proj, expert_scores)
 
     if ep_dispatch == "alltoall":
         combine_kwargs = dict(expert_output=expert_out, ctx=ctx, ep_group=ep_group)
