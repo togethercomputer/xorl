@@ -388,11 +388,14 @@ class _FusedUnpermuteAndCombine(torch.autograd.Function):
             gather_output = torch.zeros(
                 dispatch_ctx.num_recv_tokens,
                 hidden_dim,
-                dtype=expert_output.dtype,
+                dtype=dtype,
                 device=device,
             )
             idx_2d = dispatch_ctx.permuted_indices.unsqueeze(1).expand(-1, hidden_dim)
-            gather_output.scatter_add_(0, idx_2d, expert_output)
+            _CHUNK = 4096
+            for _i in range(0, expert_output.shape[0], _CHUNK):
+                _end = min(_i + _CHUNK, expert_output.shape[0])
+                gather_output.scatter_add_(0, idx_2d[_i:_end], expert_output[_i:_end])
 
         # Step 2: Combine
         previous_event = EventOverlap(EventHandle())

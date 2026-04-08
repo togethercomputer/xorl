@@ -64,6 +64,17 @@ class RoutingReplayHandler:
     def __init__(self, model: nn.Module) -> None:
         self.model = model
         self._moe_blocks: Optional[List[nn.Module]] = None
+        self._model_topk: Optional[int] = self._extract_topk(model)
+
+    @staticmethod
+    def _extract_topk(model: nn.Module) -> Optional[int]:
+        """Extract num_experts_per_tok from the model config, if available."""
+        config = getattr(model, "config", None)
+        if config is not None:
+            topk = getattr(config, "num_experts_per_tok", None)
+            if topk is not None:
+                return int(topk)
+        return None
 
     def get_moe_blocks(self) -> List[nn.Module]:
         """
@@ -173,15 +184,28 @@ class RoutingReplayHandler:
         """Decode a single routed_expert_logits item (float32 routing weights)."""
         return self._decode_routing_array(item, num_moe_layers, np.float32, "R3 weights")
 
-    @staticmethod
-    def _infer_shape(arr: np.ndarray, num_moe_layers: int) -> Optional[np.ndarray]:
-        """Infer [num_tokens, num_layers, topk] shape from flat array."""
+    def _infer_shape(self, arr: np.ndarray, num_moe_layers: int) -> Optional[np.ndarray]:
+        """Infer [num_tokens, num_layers, topk] shape from flat array.
+
+        Tries the model's known ``num_experts_per_tok`` first, then falls back
+        to common values.
+        """
         total_elements = len(arr)
-        for topk in [8, 4, 2, 1]:
+        candidates = [10, 8, 6, 4, 2, 1, 16]
+        if self._model_topk is not None and self._model_topk not in candidates:
+            candidates.insert(0, self._model_topk)
+        elif self._model_topk is not None:
+            candidates.remove(self._model_topk)
+            candidates.insert(0, self._model_topk)
+
+        for topk in candidates:
             if total_elements % (num_moe_layers * topk) == 0:
                 num_tokens = total_elements // (num_moe_layers * topk)
                 return arr.reshape(num_tokens, num_moe_layers, topk)
-        logger.warning(f"R3: Cannot infer shape for {total_elements} elements with {num_moe_layers} layers")
+        logger.warning(
+            f"R3: Cannot infer shape for {total_elements} elements "
+            f"with {num_moe_layers} layers (tried topk={candidates})"
+        )
         return None
 
     def fill_routing_replay(

@@ -43,12 +43,12 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # EP expert compute registry
 # Maps implementation name -> compute callable for Expert Parallelism.
-# All compute functions share: (permute_tokens, cumsum, gate_proj, up_proj, down_proj) -> output
+# Fused signature: (permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size) -> output
 # ---------------------------------------------------------------------------
 
 EP_EXPERT_COMPUTE: Dict[str, Callable] = {}
 
-# Triton EP compute (custom Triton group GEMM with autograd)
+# Triton EP compute (fused gate+up GEMM with autograd)
 try:
     from xorl.ops.moe.triton import TritonEPGroupGemm
 
@@ -56,19 +56,29 @@ try:
 except ImportError:
     pass
 
-# Quack EP compute (quack group GEMM with autograd)
+# Quack EP compute — adapt fused interface to old (gate_proj, up_proj) signature
 try:
-    from xorl.ops.moe.quack import QuackEPGroupGemm
+    from xorl.ops.moe.quack import QuackEPGroupGemm as _QuackEPGroupGemm
 
-    EP_EXPERT_COMPUTE["quack"] = QuackEPGroupGemm.apply
+    def _quack_ep_fused(permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size):
+        gate_proj = gate_up_proj[..., :intermediate_size].contiguous()
+        up_proj = gate_up_proj[..., intermediate_size:].contiguous()
+        return _QuackEPGroupGemm.apply(permute_tokens, cumsum, gate_proj, up_proj, down_proj)
+
+    EP_EXPERT_COMPUTE["quack"] = _quack_ep_fused
 except ImportError:
     pass
 
-# Native EP compute (torch._grouped_mm with alignment padding)
+# Native EP compute — adapt fused interface
 try:
-    from .native import native_ep_compute
+    from .native import native_ep_compute as _native_ep_compute
 
-    EP_EXPERT_COMPUTE["native"] = native_ep_compute
+    def _native_ep_fused(permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size):
+        gate_proj = gate_up_proj[..., :intermediate_size].contiguous()
+        up_proj = gate_up_proj[..., intermediate_size:].contiguous()
+        return _native_ep_compute(permute_tokens, cumsum, gate_proj, up_proj, down_proj)
+
+    EP_EXPERT_COMPUTE["native"] = _native_ep_fused
 except ImportError:
     pass
 
@@ -191,19 +201,29 @@ try:
 except ImportError:
     pass
 
-# Quack EP moe_act compute
+# Quack EP moe_act compute — adapt fused interface
 try:
-    from xorl.ops.moe.quack import QuackEPGroupGemmMoeAct
+    from xorl.ops.moe.quack import QuackEPGroupGemmMoeAct as _QuackEPGroupGemmMoeAct
 
-    EP_EXPERT_COMPUTE_MOE_ACT["quack"] = QuackEPGroupGemmMoeAct.apply
+    def _quack_ep_moe_act_fused(permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size):
+        gate_proj = gate_up_proj[..., :intermediate_size].contiguous()
+        up_proj = gate_up_proj[..., intermediate_size:].contiguous()
+        return _QuackEPGroupGemmMoeAct.apply(permute_tokens, cumsum, gate_proj, up_proj, down_proj)
+
+    EP_EXPERT_COMPUTE_MOE_ACT["quack"] = _quack_ep_moe_act_fused
 except ImportError:
     pass
 
-# Native EP moe_act compute
+# Native EP moe_act compute — adapt fused interface
 try:
-    from .native import native_ep_compute_moe_act
+    from .native import native_ep_compute_moe_act as _native_ep_compute_moe_act
 
-    EP_EXPERT_COMPUTE_MOE_ACT["native"] = native_ep_compute_moe_act
+    def _native_ep_moe_act_fused(permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size):
+        gate_proj = gate_up_proj[..., :intermediate_size].contiguous()
+        up_proj = gate_up_proj[..., intermediate_size:].contiguous()
+        return _native_ep_compute_moe_act(permute_tokens, cumsum, gate_proj, up_proj, down_proj)
+
+    EP_EXPERT_COMPUTE_MOE_ACT["native"] = _native_ep_moe_act_fused
 except ImportError:
     pass
 

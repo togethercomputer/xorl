@@ -147,7 +147,9 @@ class Trainer:
     def _bootstrap(self) -> None:
         """Initialize distributed, device, seed, parallel state."""
         args = self.args
-        dist.init_process_group(backend=get_nccl_backend())
+        from datetime import timedelta
+
+        dist.init_process_group(backend=get_nccl_backend(), timeout=timedelta(minutes=60))
         logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
         logger.info_rank0(json.dumps(asdict(args), indent=2))
 

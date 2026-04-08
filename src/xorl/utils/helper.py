@@ -293,7 +293,7 @@ def enable_high_precision_for_bf16():
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 
-    if IS_NPU_AVAILABLE:
+    if hasattr(torch, "npu") and hasattr(torch.npu, "is_available") and torch.npu.is_available():
         torch.npu.matmul.allow_tf32 = False
         torch.npu.matmul.allow_bf16_reduced_precision_reduction = False
 

@@ -277,23 +277,24 @@ class LoRAAdapterManager:
                         device_mesh = param.device_mesh
 
                         sliced_data = adapter_data
+                        skip_copy = False
                         for dim, placement in enumerate(placements):
                             if isinstance(placement, Shard):
                                 shard_dim = placement.dim
                                 mesh_dim_size = device_mesh.size(dim)
-                                # Get local rank in this mesh dimension
                                 local_rank = device_mesh.get_local_rank(mesh_dim=dim)
-                                # Compute shard size and slice
                                 total_size = sliced_data.shape[shard_dim]
                                 shard_size = (total_size + mesh_dim_size - 1) // mesh_dim_size
                                 start = local_rank * shard_size
                                 end = min(start + shard_size, total_size)
                                 length = max(end - start, 0)
-                                if length > 0:
-                                    # Slice along the shard dimension
-                                    sliced_data = sliced_data.narrow(shard_dim, start, length)
+                                if start >= total_size or length == 0:
+                                    skip_copy = True
+                                    break
+                                sliced_data = sliced_data.narrow(shard_dim, start, length)
 
-                        local_tensor.copy_(sliced_data)
+                        if not skip_copy and local_tensor.numel() > 0:
+                            local_tensor.copy_(sliced_data)
                     else:
                         # Regular tensor: direct copy
                         param.data.copy_(adapter_data)

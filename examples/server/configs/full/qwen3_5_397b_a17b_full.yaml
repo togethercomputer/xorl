@@ -1,0 +1,54 @@
+# Server-side configuration for XORL Training Server (Qwen3.5-397B-A17B full weights, bf16)
+#
+# Full weight RL fine-tuning of the 397B MoE model (512 experts, 17B activated).
+# 64 GPUs (8 nodes x 8): EP=64 (8 experts/rank), Ulysses SP=8, FSDP shard=8.
+#
+# Memory budget per GPU (H100 80GB):
+#   Expert params (387B/64):   ~12 GB
+#   Dense params  (10B/8):     ~2.5 GB
+#   Muon optimizer (1x):       ~14.5 GB
+#   Gradients:                 ~14.5 GB
+#   Activations + overhead:    ~36 GB headroom
+#
+# Uses triton MoE + alltoall dispatch for reliable cross-node expert communication.
+# For DeepEP-optimized clusters, switch to moe_implementation: quack / ep_dispatch: deepep.
+
+model_path: Qwen/Qwen3.5-397B-A17B
+tokenizer_path: Qwen/Qwen3.5-397B-A17B
+attn_implementation: flash_attention_3
+moe_implementation: triton
+ep_dispatch: alltoall
+
+data_parallel_mode: fsdp2
+expert_parallel_size: 64
+ulysses_parallel_size: 8
+data_parallel_replicate_size: 1
+data_parallel_shard_size: 8
+
+enable_mixed_precision: true
+enable_gradient_checkpointing: true
+enable_full_shard: true
+enable_activation_offload: false
+init_device: meta
+load_weights_mode: all_ranks
+
+output_dir: outputs/Qwen3.5-397B-A17B-server-full-rl
+load_checkpoint_path: ""
+ckpt_manager: dcp
+
+log_level: INFO
+
+worker_connection_timeout: 180.0
+worker_max_retries: 5
+
+sample_packing_sequence_len: 65536
+enable_packing: true
+
+skip_initial_checkpoint: true
+ce_mode: compiled
+
+optimizer: muon
+optimizer_dtype: bf16
+muon_lr: 0.02
+muon_momentum: 0.95
+muon_adjust_lr_fn: match_rms_adamw

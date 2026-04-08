@@ -200,6 +200,7 @@ def run_orchestrator(
             rank0_worker_address=rank0_worker_address,
             operation_timeout=operation_timeout,
             connection_timeout=3600.0,  # 1 hour for loading large models (235B) + EP sharding + LoRA + Triton compilation
+            ack_timeout=300.0,  # 5 min — weight sync can block workers for 40s+ on large MoE models
             sample_packing_sequence_len=sample_packing_sequence_len,
             enable_packing=enable_packing,
         )

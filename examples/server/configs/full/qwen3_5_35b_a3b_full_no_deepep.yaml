@@ -1,14 +1,14 @@
 # Server-side configuration for XORL Training Server (Qwen3.5-35B-A3B full weights, bf16)
 #
-# Full weight RL fine-tuning of the 35B MoE model.
-# 8 GPUs: Ulysses SP=8, EP=8, FSDP shard=1. Muon optimizer (1 state) fits in GPU memory.
+# Same as qwen3_5_35b_a3b_full.yaml but WITHOUT DeepEP.
+# Uses alltoall EP dispatch + triton MoE kernels to better align with SGLang.
+# Purpose: test if DeepEP + Quack kernels cause the logprob divergence vs SGLang.
 
 model_path: Qwen/Qwen3.5-35B-A3B
 tokenizer_path: Qwen/Qwen3.5-35B-A3B
 attn_implementation: flash_attention_3
-moe_implementation: quack
-ep_dispatch: deepep
-train_router: false
+moe_implementation: triton
+ep_dispatch: alltoall
 
 data_parallel_mode: fsdp2
 expert_parallel_size: 8
@@ -23,7 +23,7 @@ enable_activation_offload: false
 init_device: meta
 load_weights_mode: all_ranks
 
-output_dir: outputs/Qwen3.5-35B-A3B-server-full-rl
+output_dir: outputs/Qwen3.5-35B-A3B-server-full-rl-no-deepep
 load_checkpoint_path: ""
 ckpt_manager: dcp
 

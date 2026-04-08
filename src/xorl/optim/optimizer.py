@@ -499,15 +499,37 @@ def _make_muon_param_groups(
     decay_param_names = set(get_parameter_names(model, no_decay_modules, no_decay_params))
     name_by_param = {p: n for n, p in model.named_parameters()}
 
+    fused_gate_up_ids = {
+        id(p)
+        for p, n in zip(model.parameters(), (name_by_param.get(p, "") for p in model.parameters()))
+        if "gate_up_proj" in name_by_param.get(p, "")
+    }
+
     groups: List[Dict[str, Any]] = []
 
     # Muon groups
     muon_decay = [p for p in muon_params if name_by_param.get(p) in decay_param_names]
     muon_no_decay = [p for p in muon_params if name_by_param.get(p) not in decay_param_names]
     if muon_decay:
-        groups.append({"params": muon_decay, "lr": muon_lr, "weight_decay": weight_decay, "use_muon": True})
+        groups.append(
+            {
+                "params": muon_decay,
+                "lr": muon_lr,
+                "weight_decay": weight_decay,
+                "use_muon": True,
+                "_fused_gate_up_ids": fused_gate_up_ids,
+            }
+        )
     if muon_no_decay:
-        groups.append({"params": muon_no_decay, "lr": muon_lr, "weight_decay": 0.0, "use_muon": True})
+        groups.append(
+            {
+                "params": muon_no_decay,
+                "lr": muon_lr,
+                "weight_decay": 0.0,
+                "use_muon": True,
+                "_fused_gate_up_ids": fused_gate_up_ids,
+            }
+        )
 
     # AdamW groups
     adamw_decay = [p for p in adamw_params if name_by_param.get(p) in decay_param_names]

@@ -135,6 +135,7 @@ class Qwen3MoeSparseMoeBlock(MoEBlock):
             hidden_act=config.hidden_act,
             norm_topk_prob=config.norm_topk_prob,
             moe_implementation="eager",
+            train_router=getattr(config, "train_router", False),
         )
         self.config = config
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
@@ -155,6 +156,7 @@ class Qwen3MoeSparseTritonMoeBlock(MoEBlock):
             hidden_act=config.hidden_act,
             norm_topk_prob=config.norm_topk_prob,
             moe_implementation="triton",
+            train_router=getattr(config, "train_router", False),
         )
         self.config = config
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
@@ -175,6 +177,7 @@ class Qwen3MoeSparseQuackMoeBlock(MoEBlock):
             hidden_act=config.hidden_act,
             norm_topk_prob=config.norm_topk_prob,
             moe_implementation="quack",
+            train_router=getattr(config, "train_router", False),
         )
         self.config = config
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
@@ -195,6 +198,7 @@ class Qwen3MoeSparseNativeMoeBlock(MoEBlock):
             hidden_act=config.hidden_act,
             norm_topk_prob=config.norm_topk_prob,
             moe_implementation="native",
+            train_router=getattr(config, "train_router", False),
         )
         self.config = config
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")

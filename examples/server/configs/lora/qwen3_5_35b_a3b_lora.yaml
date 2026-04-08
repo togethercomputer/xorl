@@ -1,14 +1,19 @@
-# Server-side configuration for XORL Training Server (Qwen3.5-35B-A3B full weights, bf16)
+# Server-side configuration for XORL Training Server
+# Qwen3.5-35B-A3B LoRA (bf16 base + LoRA rank 32)
 #
-# Full weight RL fine-tuning of the 35B MoE model.
-# 8 GPUs: Ulysses SP=8, EP=8, FSDP shard=1. Muon optimizer (1 state) fits in GPU memory.
+# 1 node (8 GPUs): EP=8, Ulysses SP=8, FSDP shard=1
+#
+# Memory budget per GPU (H100 80GB):
+#   Expert params (35B/8):      ~8.75 GB  (8 experts/GPU, 64 experts total)
+#   Dense params  (3B/1):       ~6 GB
+#   LoRA params + grads:        ~1 GB
+#   Activations + overhead:     ~64 GB headroom
 
 model_path: Qwen/Qwen3.5-35B-A3B
 tokenizer_path: Qwen/Qwen3.5-35B-A3B
 attn_implementation: flash_attention_3
 moe_implementation: quack
 ep_dispatch: deepep
-train_router: false
 
 data_parallel_mode: fsdp2
 expert_parallel_size: 8
@@ -23,7 +28,7 @@ enable_activation_offload: false
 init_device: meta
 load_weights_mode: all_ranks
 
-output_dir: outputs/Qwen3.5-35B-A3B-server-full-rl
+output_dir: outputs/Qwen3.5-35B-A3B-server-lora-rl
 load_checkpoint_path: ""
 ckpt_manager: dcp
 
@@ -32,14 +37,13 @@ log_level: INFO
 worker_connection_timeout: 60.0
 worker_max_retries: 3
 
-sample_packing_sequence_len: 128000
+sample_packing_sequence_len: 32768
 enable_packing: true
+
+enable_lora: true
+lora_rank: 32
+lora_alpha: 32
+lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 skip_initial_checkpoint: true
 ce_mode: compiled
-
-optimizer: muon
-optimizer_dtype: bf16
-muon_lr: 0.02
-muon_momentum: 0.95
-muon_adjust_lr_fn: match_rms_adamw

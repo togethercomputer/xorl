@@ -163,7 +163,14 @@ class ModelRunner:
             "_original_position_ids",
             "rollout_logprobs",
         },
-        "policy_loss": {"labels", "target_tokens", "logprobs", "advantages", "rollout_logprobs"},
+        "policy_loss": {
+            "labels",
+            "target_tokens",
+            "logprobs",
+            "advantages",
+            "_original_position_ids",
+            "rollout_logprobs",
+        },
     }
 
     def __init__(
@@ -230,6 +237,10 @@ class ModelRunner:
         # Device setup
         get_torch_device().set_device(f"{get_device_type()}:{local_rank}")
         helper.set_seed(self.train_config.get("seed", 42), False)
+
+        # Disable TF32 and BF16 reduced-precision accumulation for
+        # consistent numerics across parallelism strategies.
+        helper.enable_high_precision_for_bf16()
 
         # Initialize distributed parallel state
         self._init_parallel_state()
@@ -1247,6 +1258,15 @@ class ModelRunner:
         """
         self._check_not_sleeping("forward_backward")
 
+        # Defragment GPU memory at the top of every forward_backward call.
+        # After weight-sync + optim_step from the previous step the CUDA
+        # allocator can have many small free blocks; without this, CUBLAS
+        # handle creation or Triton autotuner workspace allocs can fail.
+        import gc
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
         # Validate single-tenant mode for full-weights training
         self._validate_single_tenant(model_id)
 
@@ -1285,7 +1305,15 @@ class ModelRunner:
                     model_inputs = {
                         k: v
                         for k, v in mb.items()
-                        if k not in ["labels", "target_tokens", "logprobs", "advantages", "rollout_logprobs"]
+                        if k
+                        not in [
+                            "labels",
+                            "target_tokens",
+                            "logprobs",
+                            "advantages",
+                            "_original_position_ids",
+                            "rollout_logprobs",
+                        ]
                     }
 
                     with self.model_fwd_context:
@@ -1332,6 +1360,11 @@ class ModelRunner:
                 self._routing_handler.cleanup()
 
             logger.info("Reference logprobs computed, replacing old_logprobs")
+
+        # Reclaim fragmented GPU memory before the main forward-backward pass.
+        # Without this, the Triton autotuner's workspace allocations can OOM
+        # on memory-tight configs (e.g. EP=32, 16 experts/GPU).
+        torch.cuda.empty_cache()
 
         # R3 (Rollout Routing Replay): Pre-populate routing replay from inference data
         r3_enabled = self._routing_handler.setup(micro_batches, routed_experts, routed_expert_logits)

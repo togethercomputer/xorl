@@ -14,37 +14,30 @@ if is_fused_moe_available():
 
 
 class TritonEPGroupGemm(torch.autograd.Function):
-    """EP expert MLP computation using Triton group GEMM.
+    """EP expert MLP with fused gate+up GEMM. Zero-copy weight references.
 
-    Pure compute kernel — no dispatch/combine logic. Tokens have already
-    been dispatched via all-to-all or DeepEP; this only handles the
-    expert SwiGLU MLP: ``down_proj(SiLU(gate_proj(x)) * up_proj(x))``.
-
-    Moved from ``distributed/moe/moe_layer.py`` to collocate with
-    the sibling local-path ``TritonMoeExpertsFunction``.
+    Forward: single ``x @ gate_up_proj`` GEMM → split → SwiGLU → down GEMM.
+    Backward: fused dgrad/wgrad for gate+up (2x fewer GEMMs than split version).
+    ``save_for_backward`` stores the original ``gate_up_proj`` parameter
+    reference (zero extra memory) plus the fused activation output.
     """
 
     @staticmethod
-    def forward(ctx, permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores=None):
+    def forward(ctx, permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores=None):
         max_M = permute_tokens.shape[0]
+        I = intermediate_size
         ctx.has_expert_scores = expert_scores is not None
 
-        gate_output = group_gemm_same_nk(
+        gate_up_output = group_gemm_same_nk(
             a=permute_tokens,
-            b=gate_proj,
+            b=gate_up_proj,
             cumsum_M=cumsum,
             max_M=max_M,
             transpose_a=False,
             transpose_b=False,
         )
-        up_output = group_gemm_same_nk(
-            a=permute_tokens,
-            b=up_proj,
-            cumsum_M=cumsum,
-            max_M=max_M,
-            transpose_a=False,
-            transpose_b=False,
-        )
+        gate_output = gate_up_output[..., :I]
+        up_output = gate_up_output[..., I:]
 
         gate_activation = torch.ops.aten.silu(gate_output)
         gated_output = gate_activation * up_output
@@ -64,26 +57,20 @@ class TritonEPGroupGemm(torch.autograd.Function):
 
         if expert_scores is None:
             expert_scores = permute_tokens.new_ones(permute_tokens.shape[0])
-        ctx.save_for_backward(
-            permute_tokens, cumsum, gate_proj, up_proj, down_proj, gate_output, up_output, expert_scores
-        )
+        ctx.save_for_backward(permute_tokens, cumsum, gate_up_proj, down_proj, gate_up_output, expert_scores)
+        ctx.intermediate_size = I
+
         return down_output
 
     @staticmethod
     def backward(ctx, grad_output):
-        (
-            permute_tokens,
-            cumsum,
-            gate_proj,
-            up_proj,
-            down_proj,
-            gate_output,
-            up_output,
-            expert_scores,
-        ) = ctx.saved_tensors
+        permute_tokens, cumsum, gate_up_proj, down_proj, gate_up_output, expert_scores = ctx.saved_tensors
+        I = ctx.intermediate_size
         max_M = grad_output.shape[0]
 
-        # Recompute activation
+        gate_output = gate_up_output[..., :I]
+        up_output = gate_up_output[..., I:]
+
         gate_activation = torch.ops.aten.silu(gate_output)
         gated_output = gate_activation * up_output
         expert_scores_dtype = expert_scores.dtype
@@ -123,100 +110,74 @@ class TritonEPGroupGemm(torch.autograd.Function):
         # Activation backward
         grad_up_output = gate_activation * grad_gated_output
         grad_gate_activation = grad_gated_output * up_output
-        del grad_gated_output, gate_activation, up_output
-
-        grad_scatter_output_2 = group_gemm_same_nk(
-            a=grad_up_output,
-            b=up_proj,
-            cumsum_M=cumsum,
-            max_M=max_M,
-            transpose_b=True,
-        )
-
-        grad_up_proj = None
-        if up_proj.requires_grad:
-            grad_up_proj = torch.empty_like(up_proj)
-            group_gemm_same_mn(
-                a=permute_tokens,
-                b=grad_up_output,
-                c=grad_up_proj,
-                cumsum_K=cumsum,
-                max_K=max_M,
-                transpose_a=True,
-                transpose_b=False,
-            )
+        del grad_gated_output, gate_activation, up_output, gate_up_output
 
         grad_gate_output = torch.ops.aten.silu_backward(grad_gate_activation, gate_output)
         del grad_gate_activation, gate_output
 
+        # Fused dgrad FC1: cat grads → single GEMM with gate_up_proj (no .contiguous() copies)
+        grad_gate_up_act = torch.cat([grad_gate_output, grad_up_output], dim=-1)
+        del grad_gate_output, grad_up_output
         grad_permute_tokens = group_gemm_same_nk(
-            a=grad_gate_output,
-            b=gate_proj,
+            a=grad_gate_up_act,
+            b=gate_up_proj,
             cumsum_M=cumsum,
             max_M=max_M,
             transpose_b=True,
         )
-        grad_permute_tokens += grad_scatter_output_2
-        del grad_scatter_output_2
 
-        grad_gate_proj = None
-        if gate_proj.requires_grad:
-            grad_gate_proj = torch.empty_like(gate_proj)
+        # Fused wgrad FC1: single GEMM produces grad_gate_up_proj directly
+        grad_gate_up_proj = None
+        if gate_up_proj.requires_grad:
+            grad_gate_up_proj = torch.empty_like(gate_up_proj)
             group_gemm_same_mn(
                 a=permute_tokens,
-                b=grad_gate_output,
-                c=grad_gate_proj,
+                b=grad_gate_up_act,
+                c=grad_gate_up_proj,
                 cumsum_K=cumsum,
                 max_K=max_M,
                 transpose_a=True,
                 transpose_b=False,
             )
-        del grad_gate_output
+        del grad_gate_up_act
 
         return (
             grad_permute_tokens,
             None,  # cumsum
-            grad_gate_proj,
-            grad_up_proj,
+            grad_gate_up_proj,
             grad_down_proj,
+            None,  # intermediate_size
             grad_expert_scores,
         )
 
 
 class TritonEPGroupGemmMoeAct(torch.autograd.Function):
-    """EP expert MLP with moe_act: saves only inputs + weights, recomputes
-    gate_output and up_output in backward (2 local GEMMs, no EP communication).
+    """EP expert MLP with moe_act and fused gate+up GEMM.
 
-    Memory savings: 2 * tokens * intermediate_size * dtype_size per MoE layer.
+    Saves only inputs + weights (no activation outputs), recomputes via
+    fused GEMM in backward. Zero extra memory from weight copies.
     """
 
     @staticmethod
-    def forward(ctx, permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores=None):
+    def forward(ctx, permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores=None):
         max_M = permute_tokens.shape[0]
+        I = intermediate_size
         ctx.has_expert_scores = expert_scores is not None
 
-        gate_output = group_gemm_same_nk(
+        gate_up_output = group_gemm_same_nk(
             a=permute_tokens,
-            b=gate_proj,
-            cumsum_M=cumsum,
-            max_M=max_M,
-            transpose_a=False,
-            transpose_b=False,
-        )
-        up_output = group_gemm_same_nk(
-            a=permute_tokens,
-            b=up_proj,
+            b=gate_up_proj,
             cumsum_M=cumsum,
             max_M=max_M,
             transpose_a=False,
             transpose_b=False,
         )
 
-        gate_activation = torch.ops.aten.silu(gate_output)
-        gated_output = gate_activation * up_output
+        gate_activation = torch.ops.aten.silu(gate_up_output[..., :I])
+        gated_output = gate_activation * gate_up_output[..., I:]
         if expert_scores is not None:
             gated_output = gated_output * expert_scores.to(gated_output.dtype).unsqueeze(-1)
-        del gate_activation
+        del gate_activation, gate_up_output
 
         down_output = group_gemm_same_nk(
             a=gated_output,
@@ -228,36 +189,30 @@ class TritonEPGroupGemmMoeAct(torch.autograd.Function):
         )
         del gated_output
 
-        # moe_act: save only 5 tensors (drop gate_output, up_output)
         if expert_scores is None:
             expert_scores = permute_tokens.new_ones(permute_tokens.shape[0])
-        ctx.save_for_backward(permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores)
+        ctx.save_for_backward(permute_tokens, cumsum, gate_up_proj, down_proj, expert_scores)
+        ctx.intermediate_size = I
         return down_output
 
     @staticmethod
     def backward(ctx, grad_output):
-        permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores = ctx.saved_tensors
+        permute_tokens, cumsum, gate_up_proj, down_proj, expert_scores = ctx.saved_tensors
+        I = ctx.intermediate_size
         max_M = grad_output.shape[0]
 
-        # Recompute gate_output and up_output from saved inputs + weights
-        gate_output = group_gemm_same_nk(
+        # Recompute via fused GEMM
+        gate_up_output = group_gemm_same_nk(
             a=permute_tokens,
-            b=gate_proj,
+            b=gate_up_proj,
             cumsum_M=cumsum,
             max_M=max_M,
             transpose_a=False,
             transpose_b=False,
         )
-        up_output = group_gemm_same_nk(
-            a=permute_tokens,
-            b=up_proj,
-            cumsum_M=cumsum,
-            max_M=max_M,
-            transpose_a=False,
-            transpose_b=False,
-        )
+        gate_output = gate_up_output[..., :I]
+        up_output = gate_up_output[..., I:]
 
-        # Rest identical to TritonEPGroupGemm.backward
         gate_activation = torch.ops.aten.silu(gate_output)
         gated_output = gate_activation * up_output
         expert_scores_dtype = expert_scores.dtype
@@ -297,62 +252,43 @@ class TritonEPGroupGemmMoeAct(torch.autograd.Function):
         # Activation backward
         grad_up_output = gate_activation * grad_gated_output
         grad_gate_activation = grad_gated_output * up_output
-        del grad_gated_output, gate_activation, up_output
-
-        grad_scatter_output_2 = group_gemm_same_nk(
-            a=grad_up_output,
-            b=up_proj,
-            cumsum_M=cumsum,
-            max_M=max_M,
-            transpose_b=True,
-        )
-
-        grad_up_proj = None
-        if up_proj.requires_grad:
-            grad_up_proj = torch.empty_like(up_proj)
-            group_gemm_same_mn(
-                a=permute_tokens,
-                b=grad_up_output,
-                c=grad_up_proj,
-                cumsum_K=cumsum,
-                max_K=max_M,
-                transpose_a=True,
-                transpose_b=False,
-            )
+        del grad_gated_output, gate_activation, up_output, gate_up_output
 
         grad_gate_output = torch.ops.aten.silu_backward(grad_gate_activation, gate_output)
         del grad_gate_activation, gate_output
 
+        # Fused dgrad FC1: cat grads → single GEMM with gate_up_proj (no .contiguous() copies)
+        grad_gate_up_act = torch.cat([grad_gate_output, grad_up_output], dim=-1)
+        del grad_gate_output, grad_up_output
         grad_permute_tokens = group_gemm_same_nk(
-            a=grad_gate_output,
-            b=gate_proj,
+            a=grad_gate_up_act,
+            b=gate_up_proj,
             cumsum_M=cumsum,
             max_M=max_M,
             transpose_b=True,
         )
-        grad_permute_tokens += grad_scatter_output_2
-        del grad_scatter_output_2
 
-        grad_gate_proj = None
-        if gate_proj.requires_grad:
-            grad_gate_proj = torch.empty_like(gate_proj)
+        # Fused wgrad FC1: single GEMM produces grad_gate_up_proj directly
+        grad_gate_up_proj = None
+        if gate_up_proj.requires_grad:
+            grad_gate_up_proj = torch.empty_like(gate_up_proj)
             group_gemm_same_mn(
                 a=permute_tokens,
-                b=grad_gate_output,
-                c=grad_gate_proj,
+                b=grad_gate_up_act,
+                c=grad_gate_up_proj,
                 cumsum_K=cumsum,
                 max_K=max_M,
                 transpose_a=True,
                 transpose_b=False,
             )
-        del grad_gate_output
+        del grad_gate_up_act
 
         return (
             grad_permute_tokens,
             None,  # cumsum
-            grad_gate_proj,
-            grad_up_proj,
+            grad_gate_up_proj,
             grad_down_proj,
+            None,  # intermediate_size
             grad_expert_scores,
         )
 

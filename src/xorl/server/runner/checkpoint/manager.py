@@ -111,6 +111,27 @@ class CheckpointManager:
     # Adapter save / load (multi-tenancy LoRA)
     # ------------------------------------------------------------------
 
+    def _gather_adapter_lora_params(self, model_id: str) -> Dict[str, torch.Tensor]:
+        """Gather LoRA params from adapter manager with EP support.
+
+        Fast alternative to get_lora_state_dict(): uses the adapter manager's
+        stored full-tensor params directly (no FSDP unshard needed). Only needs
+        a dist.gather for EP-sharded expert LoRA params.
+
+        Returns complete state dict on rank 0, empty dict on other ranks.
+
+        No EP gather needed: ``AdapterState.lora_params`` already stores
+        tensors at global shape (see ``register_adapter``).
+        """
+        lora_state_dict: Dict[str, torch.Tensor] = {}
+
+        if self.rank == 0:
+            state = self._adapter_manager.adapters[model_id]
+            for name, param in state.lora_params.items():
+                lora_state_dict[name] = param.data.cpu()
+
+        return lora_state_dict
+
     def _save_lora_weights(self, save_path: str, model_id: str) -> None:
         """
         Core LoRA saving logic: activate adapter, gather weights, write PEFT checkpoint.
@@ -127,8 +148,13 @@ class CheckpointManager:
         if self._adapter_manager is not None:
             self._adapter_manager.switch_adapter(model_id, auto_register=True)
 
-        # EP+FSDP2-aware LoRA weight gathering (collective operation)
-        lora_state_dict = get_lora_state_dict(self.model)
+        # Use fast adapter-manager path when available (avoids FSDP unshard)
+        if self._adapter_manager is not None and model_id in self._adapter_manager.adapters:
+            logger.info(f"Rank {self.rank}: Using fast adapter-manager LoRA save path")
+            lora_state_dict = self._gather_adapter_lora_params(model_id)
+        else:
+            # Fallback: EP+FSDP2-aware LoRA weight gathering (collective operation)
+            lora_state_dict = get_lora_state_dict(self.model)
 
         # Only rank 0 writes files
         if self.rank == 0:

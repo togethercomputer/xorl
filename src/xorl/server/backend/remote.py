@@ -47,7 +47,7 @@ class RemoteBackend(Backend):
         worker_address: str = "tcp://127.0.0.1:5556",
         operation_timeout: float = 3600.0,
         connection_timeout: float = 120.0,
-        ack_timeout: float = 10.0,
+        ack_timeout: float = 120.0,
     ):
         self.worker_address = worker_address
         self.operation_timeout = operation_timeout

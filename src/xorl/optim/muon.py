@@ -156,10 +156,14 @@ class Muon(TorchMuon):
                 p_local = p.data
 
             # Handle 3D+ MoE expert tensors: [num_experts, hidden, intermediate]
-            # Reshape to 2D for Newton-Schulz, then restore.
+            # For fused gate_up_proj [E, H, 2I], split into two halves for NS
             orig_shape = None
+            fused_split = None
             if grad_local.ndim >= 3:
                 orig_shape = grad_local.shape
+                fused_gate_up_ids = group.get("_fused_gate_up_ids", set())
+                if id(p) in fused_gate_up_ids:
+                    fused_split = grad_local.shape[-1] // 2
                 grad_local = grad_local.reshape(-1, grad_local.shape[-1])
 
             # --- PyTorch Muon algorithm (aligned with torch.optim._muon) ---
@@ -196,8 +200,14 @@ class Muon(TorchMuon):
                 # Work in buf dtype (may be bf16 even if grad is fp32)
                 update = grad_local.to(buf.dtype).lerp(buf, momentum) if nesterov else buf
 
-            # Newton-Schulz orthogonalization (uses PyTorch's implementation)
-            update = _zeropower_via_newtonschulz(update, ns_coefficients, ns_steps, eps)
+            # Newton-Schulz orthogonalization
+            if fused_split is not None:
+                u1 = _zeropower_via_newtonschulz(update[..., :fused_split], ns_coefficients, ns_steps, eps)
+                u2 = _zeropower_via_newtonschulz(update[..., fused_split:], ns_coefficients, ns_steps, eps)
+                update = torch.cat([u1, u2], dim=-1)
+                del u1, u2
+            else:
+                update = _zeropower_via_newtonschulz(update, ns_coefficients, ns_steps, eps)
 
             # LR adjustment based on the 2D shape fed to NS
             adjusted_lr = _adjust_lr(lr, adjust_lr_fn, grad_local.shape)

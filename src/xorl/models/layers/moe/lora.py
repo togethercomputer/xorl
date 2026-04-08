@@ -86,6 +86,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
             torch.empty(self.num_experts, hidden_dim, 2 * intermediate_size),
             requires_grad=False,
         )
+        self.gate_up_proj._fused_gate_up = True
         self.down_proj = nn.Parameter(
             torch.empty(self.num_experts, intermediate_size, hidden_dim),
             requires_grad=False,

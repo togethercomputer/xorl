@@ -43,14 +43,12 @@ def unpermute(
     """
     hidden_dim = hidden_states_shape[-1]
 
-    unpermuted_tokens = torch.zeros(hidden_states_shape, device=tokens.device, dtype=tokens.dtype)
-
-    # Scatter add the permuted_input back to the original positions
     expanded_mapping = permutation_mapping.unsqueeze(1).expand(-1, hidden_dim)
 
-    unpermuted_tokens.scatter_add_(0, expanded_mapping, tokens)
-
-    return unpermuted_tokens
+    # FP32 accumulation to reduce non-determinism from BF16 atomic scatter_add_
+    unpermuted_fp32 = torch.zeros(hidden_states_shape, device=tokens.device, dtype=torch.float32)
+    unpermuted_fp32.scatter_add_(0, expanded_mapping, tokens.float())
+    return unpermuted_fp32.to(tokens.dtype)
 
 
 def permuted_weights(routing_weights: torch.Tensor, selected_experts: torch.Tensor, num_experts: int) -> torch.Tensor:

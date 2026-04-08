@@ -225,6 +225,7 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
             hidden_act=config.hidden_act,
             norm_topk_prob=config.norm_topk_prob,
             moe_implementation=moe_implementation,
+            train_router=getattr(config, "train_router", False),
         )
         self.config = config
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")

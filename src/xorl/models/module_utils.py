@@ -348,6 +348,10 @@ def _load_state_dict(weights_path: str, **kwargs) -> List["StateDictIterator"]:
 def _try_load_state_dict(weights_path: str, **kwargs):
     """
     Single attempt to load state dict. Returns list of iterators or None if not found.
+
+    Rank 0 resolves all file paths (cached_file + get_checkpoint_shard_files)
+    and broadcasts the result to other ranks. This avoids N-way filesystem
+    hammering and keeps the broadcast-loading path rank-0-driven.
     """
     cache_kwargs = {"_raise_exceptions_for_missing_entries": False, **kwargs}
     resolved_weight_file = cached_file(weights_path, SAFE_WEIGHTS_NAME, **cache_kwargs)
@@ -1522,9 +1526,16 @@ def save_model_weights(
 
 
 def save_model_assets(output_dir: Union[str, "os.PathLike"], model_assets: Sequence["ModelAssets"]):
+    from transformers import PretrainedConfig, PreTrainedTokenizerBase
+
     for model_asset in model_assets:
         if hasattr(model_asset, "save_pretrained"):
-            model_asset.save_pretrained(output_dir)
+            try:
+                model_asset.save_pretrained(output_dir)
+            except TypeError as e:
+                if isinstance(model_asset, (PretrainedConfig, PreTrainedTokenizerBase)):
+                    raise
+                logger.warning(f"Skipping {type(model_asset).__name__}.save_pretrained(): {e}")
         else:
             logger.warning(f"Model asset {model_asset} should implement `save_pretrained`.")
 

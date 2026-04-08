@@ -701,7 +701,7 @@ class WeightsMixin:
             # Determine training mode from model config
             model_config = self.model_configs.get(request.model_id, {})
             lora_config = model_config.get("lora_config", {})
-            is_lora = lora_config.get("enable_lora", False)
+            is_lora = lora_config.get("enable_lora", False) or "rank" in lora_config
             merge_lora_interval = lora_config.get("merge_lora_interval", 0)
 
             if is_lora and merge_lora_interval == 0:

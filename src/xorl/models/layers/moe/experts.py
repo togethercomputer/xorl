@@ -59,6 +59,7 @@ class MoEExperts(nn.Module):
             torch.empty(num_experts, hidden_dim, 2 * intermediate_size),
             requires_grad=True,
         )
+        self.gate_up_proj._fused_gate_up = True
         self.down_proj = nn.Parameter(
             torch.empty(num_experts, intermediate_size, hidden_dim),
             requires_grad=True,
@@ -104,8 +105,6 @@ class MoEExperts(nn.Module):
         use the unified dispatch → compute → combine path via ``_ep_forward()``.
         """
         _moe_act = self._moe_act
-        gate_proj = self.gate_proj.contiguous()
-        up_proj = self.up_proj.contiguous()
 
         if self.moe_implementation == "eager":
             fn = MOE_EXPERT_BACKENDS[self.moe_implementation]
@@ -113,8 +112,8 @@ class MoEExperts(nn.Module):
             return fn(
                 hidden_states,
                 expert_idx,
-                gate_proj,
-                up_proj,
+                self.gate_proj.contiguous(),
+                self.up_proj.contiguous(),
                 self.down_proj,
                 self.act_fn,
             )
@@ -127,7 +126,9 @@ class MoEExperts(nn.Module):
         if parallel_state.ep_enabled:
             return self._ep_forward(hidden_states, routing_weights, selected_experts, parallel_state)
 
-        # Local single-GPU path — select moe_act variant when available
+        # Local single-GPU path
+        gate_proj = self.gate_proj.contiguous()
+        up_proj = self.up_proj.contiguous()
         if _moe_act and self.moe_implementation in MOE_EXPERT_BACKENDS_MOE_ACT:
             fn = MOE_EXPERT_BACKENDS_MOE_ACT[self.moe_implementation]
         else:
@@ -180,8 +181,6 @@ class MoEExperts(nn.Module):
             compute_fn = EP_EXPERT_COMPUTE_MOE_ACT[self.moe_implementation]
         else:
             compute_fn = EP_EXPERT_COMPUTE[self.moe_implementation]
-        gate_proj = self.gate_proj.contiguous()
-        up_proj = self.up_proj.contiguous()
 
         # Step 1: Dispatch tokens to expert-owning ranks
         dispatch_kwargs = self._build_dispatch_kwargs(hidden_states, routing_weights, selected_experts, parallel_state)
@@ -200,14 +199,49 @@ class MoEExperts(nn.Module):
         if _FORCE_SYNC:
             torch.cuda.synchronize()
 
-        # Step 2: Expert computation (backend-specific GEMM only)
+        # Warmup: pre-compile all backward GEMM kernel variants to avoid
+        # first-use compilation memory spikes during training.
+        if not getattr(type(self), "_kernel_warmed_up", False):
+            from xorl.ops.group_gemm.kernel.group_gemm import group_gemm_same_mn as _warmup_mn
+            from xorl.ops.group_gemm.kernel.group_gemm import group_gemm_same_nk as _warmup_gemm
+
+            _d = permute_tokens.device
+            _dt = permute_tokens.dtype
+            _H = self.gate_up_proj.shape[1]
+            _I = self.intermediate_size
+            _E = self.gate_up_proj.shape[0]
+            _M = _E * 2
+            _cum = torch.arange(2, _M + 2, 2, dtype=torch.int32, device=_d)
+
+            # Forward GEMM: x @ gate_up_proj
+            _x = torch.zeros(_M, _H, dtype=_dt, device=_d)
+            _w = torch.zeros(_E, _H, 2 * _I, dtype=_dt, device=_d)
+            _warmup_gemm(a=_x, b=_w, cumsum_M=_cum, max_M=2)
+
+            # Backward dgrad FC1: grad_gate_up_act @ gate_up_proj^T
+            _g = torch.zeros(_M, 2 * _I, dtype=_dt, device=_d)
+            _warmup_gemm(a=_g, b=_w, cumsum_M=_cum, max_M=2, transpose_b=True)
+
+            # Backward dgrad FC2: grad @ down_proj^T
+            _wd = torch.zeros(_E, _I, _H, dtype=_dt, device=_d)
+            _gd = torch.zeros(_M, _I, dtype=_dt, device=_d)
+            _warmup_gemm(a=_gd, b=_wd, cumsum_M=_cum, max_M=2, transpose_b=True)
+
+            # Backward wgrad FC1: permute_tokens^T @ grad_gate_up_act
+            _c = torch.zeros(_E, _H, 2 * _I, dtype=_dt, device=_d)
+            _warmup_mn(a=_x, b=_g, c=_c, cumsum_K=_cum, max_K=2, transpose_a=True)
+
+            del _x, _w, _g, _gd, _wd, _c, _cum
+            torch.cuda.empty_cache()
+            type(self)._kernel_warmed_up = True
+
         expert_scores = getattr(ctx, "expert_scores", getattr(ctx, "permuted_scores", None))
         expert_output = compute_fn(
             permute_tokens,
             cumsum,
-            gate_proj,
-            up_proj,
+            self.gate_up_proj,
             self.down_proj,
+            self.intermediate_size,
             expert_scores,
         )
 
@@ -239,9 +273,9 @@ class MoEExperts(nn.Module):
         expert_output = compute_fn(
             permute_tokens,
             cumsum,
-            self.gate_proj.contiguous(),
-            self.up_proj.contiguous(),
+            self.gate_up_proj,
             self.down_proj,
+            self.intermediate_size,
             expert_scores,
         )
         ev[3].record()

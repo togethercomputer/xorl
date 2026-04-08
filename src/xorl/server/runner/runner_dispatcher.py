@@ -821,6 +821,22 @@ class RunnerDispatcher:
             sharded_batches = []
             for i, batch in enumerate(my_batches):
                 try:
+                    # Generate position_ids before sharding if not present.
+                    # Under Ulysses SP, position_ids must be FULL-LENGTH so that
+                    # RoPE cos/sin are computed for global positions and then sliced
+                    # to the local shard inside prepare_position_embeddings.
+                    # Without this, the model falls back to arange(S_local) on each
+                    # rank, producing wrong position encodings for ranks > 0.
+                    if "position_ids" not in batch and "input_ids" in batch:
+                        input_ids = batch["input_ids"]
+                        seq_len = input_ids.shape[-1] if isinstance(input_ids, torch.Tensor) else len(input_ids)
+                        batch_size = (
+                            input_ids.shape[0] if isinstance(input_ids, torch.Tensor) and input_ids.ndim >= 2 else 1
+                        )
+                        batch["position_ids"] = (
+                            torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+                        )
+
                     # Store original position_ids for unpacking per-token outputs later
                     if "position_ids" in batch:
                         original_pos_ids = batch["position_ids"]
