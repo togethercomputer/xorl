@@ -6,12 +6,28 @@ These utility classes handle common weight transformation patterns:
 """
 
 import json
+import math
 import os
 import re
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
 import torch
+from torch.distributed._tensor import DTensor
+from transformers.utils import cached_file
+
+from xorl.ops.quantize import (
+    block_fp8_dequantize_gkn,
+    block_fp8_quantize_gkn,
+    nvfp4_dequantize,
+    nvfp4_quantize,
+)
+from xorl.ops.quantize.fp4_codec import FP4_E2M1_MAX, FP8_E4M3_MAX
+from xorl.qlora.modules.linear import QLoRALinear
+from xorl.qlora.modules.moe_experts import (
+    BlockFP8QLoRAMoeExperts,
+    QLoRAMoeExperts,
+)
 
 
 # =============================================================================
@@ -120,8 +136,6 @@ def _resolve_weights_path(weights_path: Optional[str]) -> Optional[str]:
         return weights_path
     # Try resolving as a HF hub model ID
     try:
-        from transformers.utils import cached_file
-
         config_path = cached_file(weights_path, "config.json", _raise_exceptions_for_missing_entries=False)
         if config_path and os.path.isfile(config_path):
             return os.path.dirname(config_path)
@@ -604,8 +618,6 @@ class _QLoRAWeightBufferBase:
     _suffixes: frozenset
 
     def __init__(self, model: "torch.nn.Module"):
-        from xorl.qlora.modules.linear import QLoRALinear
-
         self._prefix_map: Dict[str, _SourceInfo] = {}
         self._accums: Dict[str, _ModuleAccum] = {}
 
@@ -734,13 +746,6 @@ class _QLoRAWeightBufferBase:
         dispatch_pairs: List[Tuple[str, "torch.Tensor"]],
     ) -> List[Tuple[str, "torch.Tensor"]]:
         """Dequantize from source format, re-quantize in target format."""
-        from xorl.ops.quantize import (
-            block_fp8_dequantize_gkn,
-            block_fp8_quantize_gkn,
-            nvfp4_dequantize,
-            nvfp4_quantize,
-        )
-        from xorl.qlora.modules.linear import QLoRALinear
 
         module = accum.module
         M, K = module.out_features, module.in_features
@@ -810,8 +815,6 @@ class NvFP4WeightBuffer(_QLoRAWeightBufferBase):
     _source_format = "nvfp4"
 
     def _pack(self, fqn: str, accum: _ModuleAccum) -> List[Tuple[str, "torch.Tensor"]]:
-        from xorl.qlora.modules.linear import QLoRALinear
-
         module = accum.module
         merge_sources = accum.merge_sources
 
@@ -863,8 +866,6 @@ class BlockFP8WeightBuffer(_QLoRAWeightBufferBase):
     _source_format = "block_fp8"
 
     def _pack(self, fqn: str, accum: _ModuleAccum) -> List[Tuple[str, "torch.Tensor"]]:
-        from xorl.qlora.modules.linear import QLoRALinear
-
         module = accum.module
         merge_sources = accum.merge_sources
 
@@ -896,7 +897,6 @@ def QLoRAWeightBuffer(model: "torch.nn.Module") -> _QLoRAWeightBufferBase:
     Inspects the first prequantized QLoRALinear module to determine whether the
     checkpoint is NVFP4 or block FP8, then returns the matching buffer class.
     """
-    from xorl.qlora.modules.linear import QLoRALinear
 
     for _fqn, module in model.named_modules():
         if isinstance(module, QLoRALinear) and module._is_prequantized:
@@ -933,8 +933,6 @@ class _QLoRAExpertBufferBase:
         ep_size: int,
         num_experts: int,
     ):
-        from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
-
         self._num_experts = num_experts
         self._local_num = num_experts // ep_size
         self._expert_start = ep_rank * self._local_num
@@ -1064,9 +1062,6 @@ class _QLoRAExpertBufferBase:
 
     def set_inline_metadata(self) -> None:
         """Finalize inline-loaded modules: materialize LoRA params from meta device."""
-        import math
-
-        from torch.distributed._tensor import DTensor
 
         for module in self._layer_modules.values():
             if not module._weights_loaded:
@@ -1114,9 +1109,6 @@ class NvFP4QLoRAExpertBuffer(_QLoRAExpertBufferBase):
     _suffixes = _QLORA_SUFFIXES_NVFP4  # {"weight", "weight_scale", "weight_scale_2"}
 
     def _process_expert(self, layer, proj, local_idx, pieces):
-        from xorl.ops.quantize.fp4_codec import FP4_E2M1_MAX, FP8_E4M3_MAX
-        from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
-
         lp = (layer, proj)
         packed = pieces["weight"]  # [N, K//2] uint8
         block_scales = pieces["weight_scale"]  # [N, K//bs] fp8
@@ -1137,8 +1129,6 @@ class NvFP4QLoRAExpertBuffer(_QLoRAExpertBufferBase):
         self._meta_lists[lp][local_idx] = amax
 
     def _finalize_proj(self, layer, proj):
-        from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
-
         lp = (layer, proj)
         module = self._layer_modules[layer]
         device = torch.device("cuda")
@@ -1167,8 +1157,6 @@ class BlockFP8QLoRAExpertBuffer(_QLoRAExpertBufferBase):
     _suffixes = _QLORA_SUFFIXES_FP8  # {"weight", "weight_scale_inv"}
 
     def _process_expert(self, layer, proj, local_idx, pieces):
-        from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
-
         lp = (layer, proj)
         fp8_w = pieces["weight"]  # [N, K] float8_e4m3fn
         scales = pieces["weight_scale_inv"]  # [N//128, K//128] f32
@@ -1205,10 +1193,6 @@ def QLoRAExpertBuffer(
     num_experts: int,
 ) -> Optional[_QLoRAExpertBufferBase]:
     """Factory: create format-specific QLoRA expert buffer, or None if no MoE experts."""
-    from xorl.qlora.modules.moe_experts import (
-        BlockFP8QLoRAMoeExperts,
-        QLoRAMoeExperts,
-    )
 
     for _, m in model.named_modules():
         if isinstance(m, QLoRAMoeExperts) and not m._weights_loaded:

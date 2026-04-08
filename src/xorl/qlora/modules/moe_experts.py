@@ -25,9 +25,11 @@ the original MoeBlock.
 import math
 from typing import Optional
 
+import safetensors.torch
 import torch
 import torch.nn as nn
 from torch import Tensor
+from transformers.utils import cached_file
 
 from xorl.lora.modules.base import LoraModule
 from xorl.ops.group_gemm.kernel.lora_utils import compute_lora_scaling
@@ -390,9 +392,6 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         if self._weights_loaded or self._source_fqn is None:
             return
 
-        import safetensors.torch
-        from transformers.utils import cached_file
-
         _shard_cache = shard_cache if shard_cache is not None else {}
 
         def _load_tensor(ckpt_key: str) -> Tensor:
@@ -456,7 +455,7 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
             return self._eager_lora_forward(hidden_states, expert_idx)
 
         # Check EP -- use unified dispatch/compute/combine path
-        from xorl.distributed.parallel_state import get_parallel_state
+        from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
 
         parallel_state = get_parallel_state()
 
@@ -464,7 +463,7 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
             return self._ep_forward(hidden_states, routing_weights, selected_experts, parallel_state)
 
         # Local path -- registry-based
-        from xorl.models.layers.moe.backend import MOE_EXPERT_BACKENDS_LORA
+        from xorl.models.layers.moe.backend import MOE_EXPERT_BACKENDS_LORA  # noqa: PLC0415
 
         compute_dtype = hidden_states.dtype
         fn = MOE_EXPERT_BACKENDS_LORA[self.moe_implementation]
@@ -498,7 +497,7 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         Uses the same dispatch/combine as MoEExperts._ep_forward() but routes
         to the LoRA-aware EP compute registry.
         """
-        from xorl.models.layers.moe.backend import EP_COMBINE, EP_DISPATCH, EP_EXPERT_COMPUTE_LORA
+        from xorl.models.layers.moe.backend import EP_COMBINE, EP_DISPATCH, EP_EXPERT_COMPUTE_LORA  # noqa: PLC0415
 
         if self.moe_implementation not in EP_EXPERT_COMPUTE_LORA:
             raise ValueError(
@@ -550,7 +549,7 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         if self.ep_dispatch == "alltoall":
             kwargs["ep_group"] = parallel_state.ep_group
         elif self.ep_dispatch == "deepep":
-            from xorl.distributed.moe.deepep import get_default_buffer
+            from xorl.distributed.moe.deepep import get_default_buffer  # noqa: PLC0415
 
             kwargs["buffer"] = get_default_buffer(
                 ep_group=parallel_state.ep_group,

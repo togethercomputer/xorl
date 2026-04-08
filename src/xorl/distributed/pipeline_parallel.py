@@ -33,7 +33,10 @@ from torch.distributed.pipelining.schedules import (
     get_schedule_class,
 )
 
+from xorl.models.layers.moe.routing_replay import get_replay_stage, is_r3_mode, set_replay_stage
+
 from ..utils import logging
+from .parallel_state import get_parallel_state
 
 
 logger = logging.get_logger(__name__)
@@ -187,9 +190,6 @@ def _pp_forward(self, x):
     When the queue is not set (e.g. unit tests), falls back to generating
     sequential position_ids scaled by cp_size for RoPE cache correctness.
     """
-    from xorl.models.layers.moe.routing_replay import get_replay_stage, is_r3_mode, set_replay_stage
-
-    from .parallel_state import get_parallel_state
 
     ps = get_parallel_state()
 

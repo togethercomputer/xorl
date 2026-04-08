@@ -83,7 +83,7 @@ def run_one_pass(
     buffer=None,
 ):
     """One forward + backward pass with a given dispatch backend."""
-    from xorl.models.layers.moe.backend import EP_COMBINE, EP_DISPATCH, EP_EXPERT_COMPUTE
+    from xorl.models.layers.moe.backend import EP_COMBINE, EP_DISPATCH, EP_EXPERT_COMPUTE  # noqa: PLC0415
 
     dispatch_fn = EP_DISPATCH[ep_dispatch]
     combine_fn = EP_COMBINE[ep_dispatch]
@@ -181,7 +181,7 @@ def run_test(
     down.grad = None
 
     # ── DeepEP ───────────────────────────────────────────────────────────────
-    from xorl.distributed.moe.deepep import DeepEPBuffer
+    from xorl.distributed.moe.deepep import DeepEPBuffer  # noqa: PLC0415
 
     buffer = DeepEPBuffer(ep_group=ep_group, buffer_size_gb=1.0)
     out_dep, grad_dep = run_one_pass(

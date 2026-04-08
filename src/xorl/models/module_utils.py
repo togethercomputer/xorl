@@ -1,8 +1,10 @@
 import json
+import math
 import os
 import re
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
@@ -14,6 +16,7 @@ from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from torch import distributed as dist
 from torch import nn
+from torch.distributed._tensor import Shard as DTShard
 from tqdm import tqdm
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGHTS_INDEX_NAME, WEIGHTS_NAME
 from transformers.utils.hub import cached_file, get_checkpoint_shard_files
@@ -253,8 +256,6 @@ def _prefetch_shards(
             more CPU memory but can increase NFS throughput via concurrent reads.
             Default 1 (single background thread, same as before).
     """
-    from collections import deque
-    from concurrent.futures import ThreadPoolExecutor
 
     if not state_dict_iterators:
         return
@@ -290,8 +291,6 @@ def _prefetch_shards_filtered(
 
     Yields (state_dict, skipped_keys) tuples.
     """
-    from collections import deque
-    from concurrent.futures import ThreadPoolExecutor
 
     if not state_dict_iterators:
         return
@@ -328,7 +327,6 @@ def _load_state_dict(weights_path: str, **kwargs) -> List["StateDictIterator"]:
     """
     Loads (sharded) state dict in transformers' format.
     """
-    import time
 
     max_retries = 5
     for attempt in range(max_retries):
@@ -368,12 +366,10 @@ def _try_load_state_dict(weights_path: str, **kwargs):
                 return [StateDictIterator(shard_file) for shard_file in shard_files]
             except OSError as e:
                 if attempt < max_retries - 1:
-                    import time
-                    retry_delay = 5
                     logger.warning(
                         f"OSError resolving shard files (attempt {attempt + 1}/{max_retries}): {e}. Retrying in 5s..."
                     )
-                    time.sleep(retry_delay)
+                    time.sleep(5)
                 else:
                     logger.error(f"Failed to get shard files after {max_retries} attempts")
                     raise
@@ -653,7 +649,6 @@ def _dispatch_parameter(
         if orig_tensor.device.type == "cpu":
             # CPU DTensor: copy shard directly into local tensor.
             # distribute_tensor doesn't support CPU mesh, so we manually shard and copy.
-            from torch.distributed._tensor import Shard as DTShard
 
             shard_dim = None
             for p in placements:
@@ -714,9 +709,6 @@ def _init_parameter(
     - lora_A: kaiming uniform initialization
     - lora_B: zeros (so LoRA has no effect at start)
     """
-    import math
-
-    import torch.nn as nn
 
     # Check if this is a LoRA parameter and handle specially
     if "lora_A" in name or "lora_B" in name:
@@ -895,8 +887,6 @@ def all_ranks_load_weights(
                     f"OSError loading weights (attempt {attempt + 1}/{max_retries}): {e}. "
                     f"Retrying in {retry_delay} seconds..."
                 )
-                import time
-
                 time.sleep(retry_delay)
             else:
                 logger.error(f"Failed to load weights after {max_retries} attempts")

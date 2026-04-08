@@ -208,7 +208,7 @@ def warp_prefix_sum(val: Int32, lane: Optional[Int32] = None) -> Int32:
 
 @dsl_user_op
 def atomic_inc_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
-    from cutlass import CUDA_VERSION
+    from cutlass import CUDA_VERSION  # noqa: PLC0415
 
     # * NVVM call based on nvvm version
     if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
@@ -221,7 +221,7 @@ def atomic_inc_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None)
 
 @dsl_user_op
 def atomic_add_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
-    from cutlass import CUDA_VERSION
+    from cutlass import CUDA_VERSION  # noqa: PLC0415
 
     # * NVVM call based on nvvm version
     if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:

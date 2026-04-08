@@ -92,7 +92,7 @@ class TestGroupGemmSameNK:
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
         try:
-            from xorl.ops.group_gemm.kernel.group_gemm import group_gemm_same_nk
+            from xorl.ops.group_gemm.kernel.group_gemm import group_gemm_same_nk  # noqa: PLC0415
         except ImportError:
             pytest.skip("group_gemm not available")
 
@@ -158,7 +158,7 @@ class TestGroupGemmSameMN:
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
         try:
-            from xorl.ops.group_gemm.kernel.group_gemm import group_gemm_same_mn
+            from xorl.ops.group_gemm.kernel.group_gemm import group_gemm_same_mn  # noqa: PLC0415
         except ImportError:
             pytest.skip("group_gemm not available")
 
@@ -220,7 +220,7 @@ class TestGroupGemmProperties:
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
         try:
-            from xorl.ops.group_gemm.kernel.group_gemm import group_gemm_same_nk
+            from xorl.ops.group_gemm.kernel.group_gemm import group_gemm_same_nk  # noqa: PLC0415
         except ImportError:
             pytest.skip("group_gemm not available")
 

@@ -73,8 +73,6 @@ class PackingConcatCollator(DataCollator):
         if not features:
             raise ValueError("PackingConcatCollator received empty features list")
 
-        import logging
-
         logger = logging.getLogger(__name__)
 
         # Input should be a flat list of dicts from FlattenCollator

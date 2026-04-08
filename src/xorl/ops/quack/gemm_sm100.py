@@ -2,6 +2,7 @@
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/dense_gemm_persistent.py
 
 import argparse
+import time
 from functools import partial
 from typing import Callable, Literal, Optional, Tuple, Type, Union
 
@@ -24,6 +25,7 @@ from cutlass.cute.nvgpu.warp import (
 from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils import LayoutEnum
+from triton.testing import do_bench
 
 from . import copy_utils
 from . import sm100_utils as quack_sm100_utils
@@ -2542,16 +2544,12 @@ def run(
         # Reference checking ref_d and gpu_d
         torch.testing.assert_close(gpu_d, ref_d, atol=tolerance, rtol=1e-05)
 
-    from triton.testing import do_bench
-
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     flops = 2 * m * n * k * l
 
     repeats = iterations
     warmup = warmup_iterations
-
-    import time
 
     time.sleep(0.5)
     if ab_dtype.width == 8:

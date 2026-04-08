@@ -12,6 +12,8 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
+from xorl.models.base import XorlPreTrainedModel
+
 
 pytestmark = [pytest.mark.gpu]
 
@@ -455,7 +457,6 @@ class TestBaseModelIntegrationAndR3Preload:
 
     def test_enable_routing_replay_checkpoint_e2e_and_r3_preload(self):
         """Test enable_routing_replay, gradient_checkpointing_enable, full e2e, and R3 preload."""
-        from xorl.models.base import XorlPreTrainedModel
 
         class _FakeConfig:
             pass

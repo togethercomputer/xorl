@@ -1,6 +1,7 @@
 """Checkpoint handler for Qwen3_5 MoE models."""
 
 import re
+import warnings
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import torch
@@ -375,8 +376,6 @@ class Qwen3_5MoeCheckpointHandler(CheckpointHandler):
         return []
 
     def on_load_complete(self) -> List[Tuple[str, torch.Tensor]]:
-        import warnings
-
         if self._expert_buffer is not None:
             pending = self._expert_buffer.get_pending_counts()
             if pending:

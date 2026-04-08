@@ -4,6 +4,7 @@ Extracts duplicated logic (gradient sync, gradient clipping, valid token
 counting, LoRA merge, PP forward-backward) into reusable free functions.
 """
 
+import logging
 from collections import deque
 from typing import Any, Dict, List, Optional
 
@@ -12,6 +13,9 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from xorl.data.constants import IGNORE_INDEX
+from xorl.lora.modules.base import LoraModule
+from xorl.lora.utils import maybe_merge_lora as _merge
+from xorl.qlora.utils import maybe_requant_qlora
 from xorl.utils.device import get_device_type
 
 
@@ -102,7 +106,6 @@ def reset_lora_optimizer_states(
     Returns:
         Number of parameters whose optimizer states were cleared.
     """
-    from xorl.lora.modules.base import LoraModule
 
     # Collect LoRA parameter ids
     lora_param_ids = set()
@@ -142,19 +145,13 @@ def maybe_merge_lora(
     if merge_interval <= 0 or global_step % merge_interval != 0:
         return
     if enable_qlora:
-        from xorl.qlora.utils import maybe_requant_qlora
-
         maybe_requant_qlora(model)
     elif enable_lora:
-        from xorl.lora.utils import maybe_merge_lora as _merge
-
         _merge(model)
 
     if reset_optimizer and optimizer is not None:
         count = reset_lora_optimizer_states(model, optimizer)
         if count > 0:
-            import logging
-
             logging.getLogger(__name__).info(f"ReLoRA optimizer reset: pruned states for {count} LoRA parameters")
 
 
@@ -204,7 +201,6 @@ def pad_micro_batches_for_pp(
     adding a separate all-zero "padding document") to avoid FA3 varlen
     backward NaN from degenerate inputs and stale max_length_q/k.
     """
-    import torch.nn.functional as F
 
     if sample_packing_sequence_len <= 0:
         return

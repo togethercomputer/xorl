@@ -1,5 +1,6 @@
 """Checkpoint handler for dense Qwen3_5 models."""
 
+import warnings
 from typing import Callable, List, Optional, Set, Tuple
 
 import torch
@@ -154,8 +155,6 @@ class Qwen3_5CheckpointHandler(CheckpointHandler):
         return [(key, tensor)]
 
     def on_load_complete(self) -> List[Tuple[str, torch.Tensor]]:
-        import warnings
-
         pending_gu = self._gate_up_buffer.get_pending()
         if pending_gu:
             warnings.warn(f"Incomplete gate/up merge pairs after loading: {pending_gu}")

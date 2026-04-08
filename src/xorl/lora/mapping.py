@@ -8,6 +8,8 @@ from typing import Dict, Optional, Type, Union
 
 import torch.nn as nn
 
+from xorl.models.layers.moe import MoEExperts, MoEExpertsLoRA
+
 from .modules.base import LoraModule
 from .modules.linear import LoraLinear
 
@@ -28,7 +30,6 @@ def _ensure_moe_mapping():
     global _moe_registered
     if not _moe_registered:
         _moe_registered = True
-        from xorl.models.layers.moe import MoEExperts, MoEExpertsLoRA
 
         LORA_MAPPING[MoEExperts] = MoEExpertsLoRA
 

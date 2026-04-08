@@ -7,8 +7,11 @@ device management, parallelism, etc.), excluding client-side training
 parameters like batch size, epochs, and optimizer settings.
 """
 
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional
+
+import yaml
 
 
 @dataclass
@@ -654,9 +657,6 @@ def parse_server_args() -> ServerArguments:
     Returns:
         ServerArguments with all fields populated from YAML and CLI
     """
-    import sys
-
-    import yaml
 
     # Read YAML directly to get flat structure
     config_path = None

@@ -21,6 +21,16 @@ from typing import Any, Dict, List, Optional, Tuple
 import pytest
 import torch
 import yaml
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
+from transformers import AutoConfig, AutoModelForCausalLM
+
+
+try:
+    import xorl_client
+except ModuleNotFoundError:
+    xorl_client = None
 
 
 # ---------------------------------------------------------------------------
@@ -240,18 +250,12 @@ def create_tiny_model_dir(
 
 
 def _save_random_weights(model_dir: str, model_config: dict):
-    from transformers import AutoConfig, AutoModelForCausalLM
-
     config = AutoConfig.from_pretrained(model_dir)
     model = AutoModelForCausalLM.from_config(config)
     model.save_pretrained(model_dir, safe_serialization=True)
 
 
 def _create_tokenizer_files(model_dir: str, vocab_size: int = 1024):
-    from tokenizers import Tokenizer
-    from tokenizers.models import WordLevel
-    from tokenizers.pre_tokenizers import Whitespace
-
     vocab = {f"t{i}": i for i in range(vocab_size)}
     vocab["[UNK]"] = 0
     vocab["[PAD]"] = vocab_size - 1 if vocab_size > 1 else 0
@@ -534,7 +538,8 @@ def samples_to_xorl_datums(
     samples: List[Tuple[List[int], List[int]]],
 ) -> list:
     """Convert raw (input_ids, labels) pairs to xorl_client.Datum objects."""
-    import xorl_client
+    if xorl_client is None:
+        pytest.skip("xorl_client not installed")
 
     datums = []
     for input_ids, labels in samples:

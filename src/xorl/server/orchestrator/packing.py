@@ -179,7 +179,6 @@ def unpack_per_token_outputs(
         >>> result = unpack_per_token_outputs(packed_output, position_ids)
         >>> # result = [[0.1, 0.2, 0.3, 0.4], [0.5, 0.6]]
     """
-    from xorl.utils.seqlen_pos_transform_utils import pos2culen
 
     # Convert to tensors if needed
     if isinstance(packed_output, list):

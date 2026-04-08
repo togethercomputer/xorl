@@ -12,6 +12,8 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
+from xorl.models.base import XorlPreTrainedModel
+
 
 pytestmark = [pytest.mark.gpu]
 
@@ -87,7 +89,7 @@ class TestContextFnMechanism:
 
     def test_forward_sets_mode(self):
         """During checkpoint forward, mode is 'forward'."""
-        import xorl.models.layers.moe.moe_block as mb
+        import xorl.models.layers.moe.moe_block as mb  # noqa: PLC0415
 
         observed = []
 
@@ -111,7 +113,7 @@ class TestContextFnMechanism:
 
     def test_mode_none_without_context_fn(self):
         """Without context_fn, mode stays None — no caching."""
-        import xorl.models.layers.moe.moe_block as mb
+        import xorl.models.layers.moe.moe_block as mb  # noqa: PLC0415
 
         observed = []
 
@@ -388,8 +390,6 @@ class TestBaseModelIntegration:
                 super().__init__()
                 self.layer = _SimpleDecoderLayer()
                 self.gradient_checkpointing = False
-
-        from xorl.models.base import XorlPreTrainedModel
 
         # Monkey-patch a minimal model
         model = XorlPreTrainedModel.__new__(XorlPreTrainedModel)

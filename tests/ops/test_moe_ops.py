@@ -54,7 +54,7 @@ class TestExpertHistogramAndIndex:
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
         try:
-            from xorl.ops.group_gemm.kernel.moe import expert_histogram, moe_index_compute
+            from xorl.ops.group_gemm.kernel.moe import expert_histogram, moe_index_compute  # noqa: PLC0415
         except ImportError:
             pytest.skip("moe ops not available")
 
@@ -111,7 +111,7 @@ class TestMoEGatherScatterAddGather:
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
         try:
-            from xorl.ops.group_gemm.kernel.moe import moe_add_gather, moe_gather, moe_scatter
+            from xorl.ops.group_gemm.kernel.moe import moe_add_gather, moe_gather, moe_scatter  # noqa: PLC0415
         except ImportError:
             pytest.skip("moe ops not available")
 
@@ -190,7 +190,7 @@ class TestMoEIntegration:
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
         try:
-            from xorl.ops.group_gemm.kernel.moe import (
+            from xorl.ops.group_gemm.kernel.moe import (  # noqa: PLC0415
                 expert_histogram,
                 moe_gather,
                 moe_index_compute,

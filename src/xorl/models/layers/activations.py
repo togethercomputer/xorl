@@ -12,6 +12,7 @@ from collections import OrderedDict
 
 import torch
 from torch import Tensor, nn
+from torch._dynamo import allow_in_graph
 
 
 logger = logging.getLogger(__name__)
@@ -234,13 +235,11 @@ class XIELUActivation(nn.Module):
 
         self._xielu_cuda_obj = None
         try:
-            import xielu.ops  # noqa: F401
+            import xielu.ops  # noqa: F401, PLC0415
 
             self._xielu_cuda_obj = torch.classes.xielu.XIELU()
             msg = "Using experimental xIELU CUDA."
             try:
-                from torch._dynamo import allow_in_graph
-
                 self._xielu_cuda_fn = allow_in_graph(self._xielu_cuda)
                 msg += " Enabled torch._dynamo for xIELU CUDA."
             except Exception as err:

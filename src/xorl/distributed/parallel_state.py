@@ -96,7 +96,7 @@ class ParallelState:
             )
 
         if self.cp_enabled:
-            from ..distributed.sequence_parallel import (
+            from ..distributed.sequence_parallel import (  # noqa: PLC0415
                 init_sequence_parallel,
                 set_data_parallel_group,
                 set_ringattn_group,
@@ -147,7 +147,7 @@ class ParallelState:
             return self.device_mesh.get_group(self._resolve_mesh_name("dp"))
 
         if self.cp_enabled:
-            from ..distributed.sequence_parallel import get_data_parallel_group
+            from ..distributed.sequence_parallel import get_data_parallel_group  # noqa: PLC0415
 
             return get_data_parallel_group()
 
@@ -159,7 +159,7 @@ class ParallelState:
             return self.device_mesh.get_local_rank(self._resolve_mesh_name("dp"))
 
         if self.cp_enabled:
-            from ..distributed.sequence_parallel import get_data_parallel_rank
+            from ..distributed.sequence_parallel import get_data_parallel_rank  # noqa: PLC0415
 
             return get_data_parallel_rank()
 
@@ -412,7 +412,7 @@ class ParallelState:
             if self.device_mesh is not None:
                 return self.device_mesh.get_group(self._resolve_mesh_name("sp"))
 
-            from .sequence_parallel import get_unified_sequence_parallel_group
+            from .sequence_parallel import get_unified_sequence_parallel_group  # noqa: PLC0415
 
             return get_unified_sequence_parallel_group()
 
@@ -424,7 +424,7 @@ class ParallelState:
             if self.device_mesh is not None:
                 return self.device_mesh.get_local_rank(self._resolve_mesh_name("sp"))
 
-            from .sequence_parallel import get_unified_sequence_parallel_rank
+            from .sequence_parallel import get_unified_sequence_parallel_rank  # noqa: PLC0415
 
             return get_unified_sequence_parallel_rank()
 
@@ -444,7 +444,7 @@ class ParallelState:
             if self.device_mesh is not None:
                 return self.device_mesh.get_group("ulysses")
 
-            from .sequence_parallel import get_ulysses_sequence_parallel_group
+            from .sequence_parallel import get_ulysses_sequence_parallel_group  # noqa: PLC0415
 
             return get_ulysses_sequence_parallel_group()
 
@@ -456,7 +456,7 @@ class ParallelState:
             if self.device_mesh is not None:
                 return self.device_mesh.get_local_rank("ulysses")
 
-            from .sequence_parallel import get_ulysses_sequence_parallel_rank
+            from .sequence_parallel import get_ulysses_sequence_parallel_rank  # noqa: PLC0415
 
             return get_ulysses_sequence_parallel_rank()
 
@@ -472,7 +472,7 @@ class ParallelState:
             if self.device_mesh is not None:
                 return self.device_mesh.get_group("ringattn")
 
-            from .sequence_parallel import get_ringattn_group
+            from .sequence_parallel import get_ringattn_group  # noqa: PLC0415
 
             return get_ringattn_group()
 
@@ -484,7 +484,7 @@ class ParallelState:
             if self.device_mesh is not None:
                 return self.device_mesh.get_local_rank("ringattn")
 
-            from .sequence_parallel import get_ringattn_rank
+            from .sequence_parallel import get_ringattn_rank  # noqa: PLC0415
 
             return get_ringattn_rank()
 

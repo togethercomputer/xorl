@@ -15,6 +15,18 @@ import requests
 import yaml
 
 
+try:
+    import xorl_client
+except ModuleNotFoundError:
+    xorl_client = None
+
+
+def _require_xorl_client():
+    if xorl_client is None:
+        pytest.skip("xorl_client not installed")
+    return xorl_client
+
+
 def generate_server_config(
     model_dir: str,
     output_dir: str,
@@ -296,7 +308,7 @@ def generate_random_sft_data(
     Returns list of Datum objects ready for the training client.
     Uses causallm_loss format: input_ids + labels (shifted tokens).
     """
-    import xorl_client
+    xorl_client = _require_xorl_client()
 
     rng = random.Random(seed)
     datums = []
@@ -357,7 +369,7 @@ def extract_loss(fwd_bwd_result) -> float:
 
 def run_sft_steps(training_client, data, num_steps=5, lr=1e-3) -> list:
     """Run SFT training steps and return loss history."""
-    import xorl_client
+    xorl_client = _require_xorl_client()
 
     adam_params = xorl_client.AdamParams(learning_rate=lr, beta1=0.9, beta2=0.95, eps=1e-8)
     losses = []
@@ -396,7 +408,7 @@ def _start_server_or_fail(server, timeout=180.0):
 
 def _create_lora_client(base_url, model_dir, model_id="test", rank=8):
     """Create a xorl_client LoRA training client."""
-    import xorl_client
+    xorl_client = _require_xorl_client()
 
     service_client = xorl_client.ServiceClient(base_url=base_url)
     training_client = service_client.create_lora_training_client(
@@ -413,7 +425,7 @@ def _create_full_weight_client(base_url, model_dir):
     The server auto-registers model_id="default" on startup, so no
     create_model call is needed for full-weight training.
     """
-    import xorl_client
+    xorl_client = _require_xorl_client()
 
     service_client = xorl_client.ServiceClient(base_url=base_url)
     training_client = xorl_client.TrainingClient(

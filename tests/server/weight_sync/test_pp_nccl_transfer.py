@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from xorl.server.weight_sync.handler import _prod
+from xorl.server.weight_sync.handler import WeightSyncHandler, _prod
 
 
 class TestProd:
@@ -37,7 +37,6 @@ class TestPPNcclTransferBuffer:
         handler = MagicMock()
         handler.rank = rank
         # Bind the real method
-        from xorl.server.weight_sync.handler import WeightSyncHandler
 
         handler._pp_nccl_transfer_buffer = WeightSyncHandler._pp_nccl_transfer_buffer.__get__(handler)
         return handler

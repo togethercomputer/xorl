@@ -20,6 +20,12 @@ import transformers
 from transformers import enable_full_determinism
 from transformers import set_seed as set_seed_func
 
+
+try:
+    from pyiceberg.metrics import LoggingMetricsReporter
+except ImportError:
+    LoggingMetricsReporter = None
+
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.utils import logging
 from xorl.utils.count_flops import XorlFlopsCounter
@@ -27,6 +33,9 @@ from xorl.utils.device import (
     IS_CUDA_AVAILABLE,
     get_device_type,
     get_torch_device,
+)
+from xorl.utils.device import (
+    empty_cache as device_empty_cache,
 )
 from xorl.utils.dist_utils import all_reduce
 
@@ -41,6 +50,7 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 CACHE_DIR = os.path.expanduser(os.getenv("CACHE_DIR", os.path.join("~/.cache", "xorl")))
+IS_NPU_AVAILABLE = hasattr(torch, "npu") and torch.npu.is_available()
 
 
 def _get_global_token_count(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
@@ -337,10 +347,10 @@ def disable_warning() -> None:
     """
     Enables warning filter.
     """
-    from pyiceberg.metrics import LoggingMetricsReporter
-
     builtin_logging.basicConfig(level=builtin_logging.ERROR)
     warnings.simplefilter("ignore")
+    if LoggingMetricsReporter is None:
+        return
     LoggingMetricsReporter()
     LoggingMetricsReporter._logger = builtin_logging.getLogger(LoggingMetricsReporter.__name__)
     LoggingMetricsReporter._logger.setLevel(builtin_logging.WARNING)
@@ -373,10 +383,10 @@ def empty_cache() -> None:
     """
     gc.collect()
 
-    if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE:
-        from xorl.utils.device import empty_cache
-
-        empty_cache()
+    if IS_CUDA_AVAILABLE:
+        device_empty_cache()
+    elif IS_NPU_AVAILABLE:
+        torch.npu.empty_cache()
 
 
 def get_cache_dir(path: Optional[str] = None) -> str:

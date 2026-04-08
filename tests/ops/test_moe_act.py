@@ -17,6 +17,9 @@ import pytest
 import torch
 import torch.nn as nn
 
+from xorl.models.transformers.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+from xorl.models.transformers.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
+
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
@@ -29,7 +32,7 @@ DTYPE = torch.bfloat16
 
 def _available_moe_act_backends():
     """Return backends that have moe_act local variants registered."""
-    from xorl.models.layers.moe.backend import MOE_EXPERT_BACKENDS_MOE_ACT
+    from xorl.models.layers.moe.backend import MOE_EXPERT_BACKENDS_MOE_ACT  # noqa: PLC0415
 
     return list(MOE_EXPERT_BACKENDS_MOE_ACT.keys())
 
@@ -42,7 +45,7 @@ def _make_block_pair(ne, hd, inter, topk, backend, seed=42):
 
     Returns (std_block, act_block) where act_block.experts._moe_act = True.
     """
-    from xorl.models.layers.moe.moe_block import MoEBlock
+    from xorl.models.layers.moe.moe_block import MoEBlock  # noqa: PLC0415
 
     torch.manual_seed(seed)
     std = MoEBlock(hd, ne, topk, inter, moe_implementation=backend)
@@ -305,9 +308,7 @@ def bench_moe_act_tflops(seq_len):
 @pytest.mark.parametrize("backend", AVAILABLE_BACKENDS)
 def test_moe_act_via_gradient_checkpointing_enable(backend):
     """gradient_checkpointing_enable(moe_checkpoint_method='moe_act') sets _moe_act correctly."""
-    from xorl.models.layers.moe.experts import MoEExperts
-    from xorl.models.transformers.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
-    from xorl.models.transformers.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
+    from xorl.models.layers.moe.experts import MoEExperts  # noqa: PLC0415
 
     config = Qwen3MoeConfig(
         vocab_size=1000,

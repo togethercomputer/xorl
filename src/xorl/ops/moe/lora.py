@@ -446,7 +446,7 @@ def make_ep_lora_compute(gemm_nk, gemm_mn):
             grad_permute_tokens = grad_permute_tokens_1 + grad_permute_tokens_2
 
             # === Reduce gradients for shared weights ===
-            from xorl.distributed.parallel_state import get_parallel_state
+            from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
 
             ep_group = get_parallel_state().ep_group
 

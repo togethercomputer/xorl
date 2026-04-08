@@ -13,12 +13,17 @@ Format-specific subclasses live in separate modules:
 import math
 from typing import Dict, Optional, Tuple
 
+import safetensors.torch
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.distributed._tensor import DTensor
+from torch.distributed._tensor import Shard as _Shard
+from transformers.utils import cached_file
 
 from xorl.lora.modules.base import LoraModule
+from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
 
 
 class QLoRALinear(LoraModule, nn.Module):
@@ -111,9 +116,9 @@ class QLoRALinear(LoraModule, nn.Module):
         based on ``quant_format`` kwarg (default: "nvfp4").
         """
         if cls is QLoRALinear:
-            from xorl.qlora.modules.block_fp8_linear import BlockFP8QLoRALinear
-            from xorl.qlora.modules.nf4_linear import NF4QLoRALinear
-            from xorl.qlora.modules.nvfp4_linear import NvFP4QLoRALinear
+            from xorl.qlora.modules.block_fp8_linear import BlockFP8QLoRALinear  # noqa: PLC0415
+            from xorl.qlora.modules.nf4_linear import NF4QLoRALinear  # noqa: PLC0415
+            from xorl.qlora.modules.nvfp4_linear import NvFP4QLoRALinear  # noqa: PLC0415
 
             fmt = kwargs.pop("quant_format", "nvfp4")
             kwargs.pop("quant_group_size", None)  # subclass sets this
@@ -145,9 +150,9 @@ class QLoRALinear(LoraModule, nn.Module):
     ) -> "QLoRALinear":
         """Create QLoRALinear from pre-quantized weights (skip quantization)."""
         if cls is QLoRALinear:
-            from xorl.qlora.modules.block_fp8_linear import BlockFP8QLoRALinear
-            from xorl.qlora.modules.nf4_linear import NF4QLoRALinear
-            from xorl.qlora.modules.nvfp4_linear import NvFP4QLoRALinear
+            from xorl.qlora.modules.block_fp8_linear import BlockFP8QLoRALinear  # noqa: PLC0415
+            from xorl.qlora.modules.nf4_linear import NF4QLoRALinear  # noqa: PLC0415
+            from xorl.qlora.modules.nvfp4_linear import NvFP4QLoRALinear  # noqa: PLC0415
 
             if quant_format == "block_fp8":
                 cls = BlockFP8QLoRALinear
@@ -219,7 +224,6 @@ class QLoRALinear(LoraModule, nn.Module):
             local = self.packed_weight_f32._local_tensor
             full_shape = self.packed_weight_f32.shape
             f32_data = f32_data.reshape(full_shape)
-            from torch.distributed._tensor import Shard as _Shard
 
             placements = self.packed_weight_f32.placements
             shard_dim = 0
@@ -267,8 +271,6 @@ class QLoRALinear(LoraModule, nn.Module):
 
     def load_prequantized_weights(self, weight_map: dict, shard_cache: dict, weights_path: str) -> None:
         """Load pre-quantized weights from checkpoint."""
-        import safetensors.torch
-        from transformers.utils import cached_file
 
         def _load_tensor(ckpt_key: str) -> Tensor:
             shard_file = weight_map.get(ckpt_key)
@@ -294,7 +296,6 @@ class QLoRALinear(LoraModule, nn.Module):
         if self.weight is None:
             return
         w = self.weight.data
-        from torch.distributed._tensor import DTensor
 
         if isinstance(w, DTensor):
             w = w.full_tensor()
@@ -423,7 +424,6 @@ def prefetch_aqn_noise(
     Returns:
         Number of modules prefetched.
     """
-    from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
 
     count = 0
     for module in model.modules():

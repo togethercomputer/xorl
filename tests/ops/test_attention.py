@@ -182,7 +182,7 @@ class TestFlashAttentionForward:
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
         try:
-            from flash_attn import flash_attn_func  # noqa: F401
+            from flash_attn import flash_attn_func  # noqa: F401, PLC0415
         except ImportError:
             pytest.skip("flash-attn not installed")
 

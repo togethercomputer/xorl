@@ -25,6 +25,7 @@ from typing import (
 import torch
 import yaml
 
+from .checkpoint_utils import get_checkpoint_path
 from .utils import logging
 
 
@@ -950,8 +951,6 @@ class TrainingArguments:
             assert self.init_device == "meta", "Please use init_device: meta for FSDP2 training"
 
         if self.load_checkpoint_path == "auto":
-            from .checkpoint_utils import get_checkpoint_path
-
             self.load_checkpoint_path = get_checkpoint_path(
                 output_dir=self.output_dir,
                 is_local_rank0=self.local_rank == 0,

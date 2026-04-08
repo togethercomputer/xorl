@@ -6,6 +6,7 @@ import torch.nn as nn
 from torch.distributed._tensor import DeviceMesh, DTensor, Replicate, Shard
 
 from ..utils import logging
+from .parallel_state import get_parallel_state
 from .utils import check_fqn_match, get_module_from_path, set_module_from_path
 
 
@@ -151,8 +152,6 @@ class ParallelPlan:
     ) -> "torch.Tensor":
         """Slice expert tensor for expert parallelism."""
         try:
-            from .parallel_state import get_parallel_state
-
             parallel_state = get_parallel_state()
 
             # Check if we need to slice based on tensor vs target shape mismatch

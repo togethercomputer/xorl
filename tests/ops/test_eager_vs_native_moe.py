@@ -22,8 +22,8 @@ DTYPE = torch.bfloat16
 def _import_moe():
     """Import MoE layers; returns (MoEBlock, MoEExperts) or skips."""
     try:
-        from xorl.models.layers.moe.experts import MoEExperts
-        from xorl.models.layers.moe.moe_block import MoEBlock
+        from xorl.models.layers.moe.experts import MoEExperts  # noqa: PLC0415
+        from xorl.models.layers.moe.moe_block import MoEBlock  # noqa: PLC0415
 
         return MoEBlock, MoEExperts
     except Exception as e:
@@ -146,7 +146,7 @@ def test_determinism_and_edge_cases():
         assert torch.equal(out1, out2), f"{backend} is not deterministic"
 
     # --- All tokens to same expert ---
-    from xorl.models.layers.moe.backend.native import native_expert_forward
+    from xorl.models.layers.moe.backend.native import native_expert_forward  # noqa: PLC0415
 
     ne, hd, inter = 4, 64, 128
     torch.manual_seed(42)

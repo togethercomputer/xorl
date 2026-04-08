@@ -19,6 +19,8 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 
+from ...models.layers.attention.utils import repeat_kv
+from ...models.layers.rope import apply_rotary_pos_emb
 from .async_ulysses import async_ulysses_output_projection, async_ulysses_qkv_projection
 from .data import slice_position_embedding
 from .ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
@@ -147,8 +149,6 @@ class UlyssesSyncStrategy(CPStrategy):
         self.ulysses_size = ulysses_size
 
     def project_qkv(self, module, hidden_states, position_embeddings):
-        from ...models.layers.attention.utils import repeat_kv
-
         # Model-specific QKV projection (MHA, MLA, etc.)
         q, k, v = module._project_qkv(hidden_states, position_embeddings)
 
@@ -236,8 +236,6 @@ class UlyssesAsyncStrategy(CPStrategy):
         self.ulysses_size = ulysses_size
 
     def project_qkv(self, module, hidden_states, position_embeddings):
-        from ...models.layers.rope import apply_rotary_pos_emb
-
         # QLoRA fallback: weight is None (packed in quantized buffers).
         # Fall back to sync-style: module._project_qkv() + synchronous a2a.
         if module.qkv_proj.weight is None:
@@ -368,7 +366,7 @@ class RingAttentionStrategy(CPStrategy):
         return module._project_qkv(hidden_states, position_embeddings)
 
     def compute_attention(self, module, q, k, v, attention_mask, **kwargs):
-        from .ring_attention import ring_flash_attention_forward
+        from .ring_attention import ring_flash_attention_forward  # noqa: PLC0415
 
         attn_kwargs = module._attention_kwargs()
         cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k = _scale_cu_seqlens_for_ringattn(
@@ -425,7 +423,7 @@ class HybridUlyssesRingStrategy(CPStrategy):
         return self._ulysses.project_qkv(module, hidden_states, position_embeddings)
 
     def compute_attention(self, module, q, k, v, attention_mask, **kwargs):
-        from .ring_attention import ring_flash_attention_forward
+        from .ring_attention import ring_flash_attention_forward  # noqa: PLC0415
 
         attn_kwargs = module._attention_kwargs()
         cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k = _scale_cu_seqlens_for_ringattn(
@@ -476,7 +474,7 @@ def get_cp_strategy(num_kv_heads: Optional[int] = None) -> CPStrategy:
         num_kv_heads: Number of key-value heads in the model.  Required when
             Ulysses SP is enabled to choose between sync and async variants.
     """
-    from ...distributed.parallel_state import get_parallel_state
+    from ...distributed.parallel_state import get_parallel_state  # noqa: PLC0415
 
     ps = get_parallel_state()
     if not ps.cp_enabled:

@@ -2,6 +2,8 @@
 
 import pytest
 
+from xorl.lora import LoraLinear, inject_lora_into_model
+
 
 pytestmark = [pytest.mark.cpu, pytest.mark.gpu]
 import torch
@@ -560,7 +562,6 @@ class TestFromModuleAndInjection:
         assert torch.allclose(lora_exp.gate_proj, base.gate_proj)
 
         # inject_lora_into_model
-        from xorl.lora import inject_lora_into_model
 
         class SimpleModel(nn.Module):
             def __init__(self, config, backend):
@@ -608,7 +609,6 @@ class TestFromModuleAndInjection:
 
     def test_injection_error_handling(self):
         """Test error cases and valid injection for inject_lora_into_model."""
-        from xorl.lora import LoraLinear, inject_lora_into_model
 
         # No matching modules
         class ModelA(nn.Module):

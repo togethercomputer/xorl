@@ -13,6 +13,7 @@ Test Strategy:
 - Tests focus on Orchestrator's scheduling, routing, and output formatting
 """
 
+import msgpack
 import pytest
 
 
@@ -107,7 +108,6 @@ def output_socket(addresses):
 
 def receive_outputs(output_socket, timeout_ms=1000, max_outputs=10):
     """Receive outputs from output socket."""
-    import msgpack
 
     outputs = []
 

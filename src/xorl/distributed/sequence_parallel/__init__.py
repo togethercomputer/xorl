@@ -48,7 +48,7 @@ from .utils import pad_tensor, unpad_tensor, vlm_images_a2a_meta
 
 def __getattr__(name):
     if name == "ring_flash_attention_forward":
-        from .ring_attention import ring_flash_attention_forward
+        from .ring_attention import ring_flash_attention_forward  # noqa: PLC0415
 
         return ring_flash_attention_forward
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

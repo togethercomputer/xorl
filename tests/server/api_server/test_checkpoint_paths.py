@@ -12,6 +12,8 @@ import tempfile
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
+from fastapi.exceptions import HTTPException
 
 from xorl.server.api_server.api_types import (
     DeleteCheckpointRequest,
@@ -86,7 +88,6 @@ class TestSaveAndLoadWeightsPaths:
 
     def test_save_load_all_formats_errors_and_auto_checkpoint(self):
         """Test save creates path, rejects duplicates, load works for all formats, 404s, isolation, and 000000 auto-save."""
-        from fastapi.exceptions import HTTPException
 
         mock_output = MagicMock()
 
@@ -210,7 +211,6 @@ class TestListDeleteAndIsolation:
 
     def test_list_delete_and_isolation(self):
         """Test list scoped by model, delete success/errors, and cross-model isolation."""
-        from fastapi import HTTPException
 
         # --- List checkpoints scoped by model ---
         model_id = "user_list_test"
@@ -276,7 +276,6 @@ class TestModelIdValidation:
 
     def test_valid_invalid_defaults_and_traversal(self):
         """Test valid IDs, invalid IDs, defaults, and path traversal blocking."""
-        from fastapi import HTTPException
 
         # Valid
         for mid in ["default", "user_123", "user-123", "User123", "a", "A1_b2-C3"]:
@@ -324,7 +323,6 @@ class TestSamplerWeightsAndAdapterTracking:
 
     def test_sampler_listing_deletion_and_adapter_tracking(self):
         """Test sampler in listings, shared across models, deletion, path resolution, and adapter tracking."""
-        from fastapi import HTTPException
 
         # --- Sampler in listings ---
         os.makedirs(os.path.join(self.temp_dir, "weights", "user_test", "ckpt-001"), exist_ok=True)

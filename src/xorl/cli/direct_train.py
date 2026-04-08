@@ -1,7 +1,26 @@
 # ruff: noqa: E402
 
 import os
+from collections import deque
 
+import torch.distributed.tensor._random
+import torch.nn.functional as F
+from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+
+from xorl.distributed.pipeline_parallel import build_pipeline_schedule
+from xorl.lora.utils import inject_lora_into_model, save_lora_checkpoint
+from xorl.models.checkpoint_handlers.buffers import get_prequantized_exclude_modules
+from xorl.models.layers.moe.routing_replay import RoutingReplay, set_replay_stage
+from xorl.qlora import (
+    detect_prequantized_block_fp8,
+    detect_prequantized_nvfp4,
+    inject_qlora_into_model,
+    maybe_load_and_quantize_moe_qlora,
+    maybe_load_prequantized_qlora,
+    maybe_quantize_qlora,
+)
+from xorl.qlora.modules.linear import prefetch_aqn_noise
+from xorl.qlora.utils import _deregister_qlora_weights_from_fsdp
 from xorl.utils.compile_cache import configure_rank_local_compile_caches
 
 
@@ -83,7 +102,7 @@ def main():
     if args.train.global_rank == 0:
         save_args(args, args.train.output_dir)
         if args.train.use_wandb:
-            import wandb
+            import wandb  # noqa: PLC0415
 
             wandb.init(
                 project=args.train.wandb_project,
@@ -119,7 +138,7 @@ def main():
             )
         )
         if args.train.use_wandb:
-            import wandb
+            import wandb  # noqa: PLC0415
 
             wandb.config.update(
                 {
@@ -152,8 +171,6 @@ def main():
     # Same approach as torchtitan (see torchtitan/distributed/utils.py:set_determinism).
     ps = get_parallel_state()
     if ps.device_mesh is not None:
-        import torch.distributed.tensor._random
-
         torch.distributed.tensor._random.manual_seed(args.train.seed, ps.device_mesh)
 
     logger.info_rank0("Prepare data")
@@ -226,8 +243,6 @@ def main():
     checkpoint_quant_format = None
     exclude_modules = set()
     if args.lora.enable_qlora:
-        from xorl.qlora import detect_prequantized_block_fp8, detect_prequantized_nvfp4, inject_qlora_into_model
-
         if detect_prequantized_nvfp4(args.model.model_path):
             is_prequantized = True
             checkpoint_quant_format = "nvfp4"
@@ -240,8 +255,6 @@ def main():
             exclude_modules = set(args.lora.exclude_modules)
             logger.info_rank0(f"Using user-specified exclude_modules: {exclude_modules}")
         elif is_prequantized:
-            from xorl.models.checkpoint_handlers.buffers import get_prequantized_exclude_modules
-
             exclude_modules = get_prequantized_exclude_modules(args.model.model_path)
             if exclude_modules:
                 logger.info_rank0(
@@ -272,8 +285,6 @@ def main():
             model._qlora_exclude_modules = exclude_modules
         helper.print_device_mem_info("VRAM usage after QLoRA injection")
     elif args.lora.enable_lora:
-        from xorl.lora.utils import inject_lora_into_model
-
         inject_lora_into_model(
             model,
             r=args.lora.lora_rank,
@@ -332,16 +343,11 @@ def main():
     # For pre-quantized checkpoints, skip quantization — load packed weights directly.
     if args.lora.enable_qlora:
         if is_prequantized:
-            from xorl.qlora import maybe_load_prequantized_qlora
-
             logger.info("Starting pre-quantized NVFP4 weight loading...")
             helper.print_device_mem_info("VRAM before pre-quantized loading")
             maybe_load_prequantized_qlora(model, args.model.model_path)
             logger.info("Done pre-quantized weight loading, freezing non-LoRA params...")
         else:
-            from xorl.qlora import maybe_load_and_quantize_moe_qlora, maybe_quantize_qlora
-            from xorl.qlora.utils import _deregister_qlora_weights_from_fsdp
-
             logger.info("Starting maybe_quantize_qlora...")
             helper.print_device_mem_info("VRAM before QLoRA quantization")
             maybe_quantize_qlora(model)
@@ -438,9 +444,6 @@ def main():
     pp_schedule = None
     pp_context = {}  # mutable container for per-step state used by pp_loss_fn
     if pp_enabled:
-        import torch.nn.functional as F
-
-        from xorl.distributed.pipeline_parallel import build_pipeline_schedule
 
         @torch.compile
         def _pp_ce_loss(pred, labels, ntokens):
@@ -530,15 +533,12 @@ def main():
             # Runs async — overlaps with data prep below, so forward only
             # pays the cheap addcmul cost per layer.
             if args.lora.enable_aqn:
-                from xorl.qlora.modules.linear import prefetch_aqn_noise
-
                 prefetch_aqn_noise(model)
 
             # Routing replay stage switching for MoE checkpoint determinism.
             # Only needed with EP — without EP, expert compute has fixed output
             # shapes regardless of routing, so checkpoint recompute is safe.
             # See models/layers/moe/routing_replay.py for lifecycle docs.
-            from xorl.models.layers.moe.routing_replay import RoutingReplay, set_replay_stage
 
             use_routing_replay = ps.ep_size > 1 and args.train.moe_recomputed
 
@@ -560,7 +560,6 @@ def main():
                 # - position_ids: full-length (not SP-sliced) for correct per-document RoPE
                 # - cu_seq_lens/max_length: flash-attention varlen kwargs for document boundaries
                 # Each _pp_forward call pops one entry from the deque.
-                from collections import deque
 
                 _PP_FA_KEYS = ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k")
                 pp_metadata_list = []
@@ -729,7 +728,7 @@ def main():
 
             if args.train.global_rank == 0:
                 if args.train.use_wandb and global_step % args.train.wandb_log_interval == 0:
-                    import wandb
+                    import wandb  # noqa: PLC0415
 
                     train_metrics.update(
                         {
@@ -792,8 +791,6 @@ def main():
 
     hf_model_state_dict = None
     if args.train.save_hf_weights and not save_peft_adapter:
-        from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
-
         logger.info_rank0("Gathering full model state dict for HF checkpoint via NCCL...")
         hf_model_state_dict = get_model_state_dict(model, options=StateDictOptions(full_state_dict=True))
 
@@ -806,7 +803,6 @@ def main():
         hf_weights_path = os.path.join(args.train.output_dir, f"global_step_{global_step}", "hf_ckpt")
         if save_peft_adapter:
             # Save PEFT adapter format (LoRA-only, base weights unchanged)
-            from xorl.lora.utils import save_lora_checkpoint
 
             save_lora_checkpoint(
                 model,

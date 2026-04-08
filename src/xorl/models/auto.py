@@ -2,6 +2,7 @@ import types
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from transformers import (
     AutoConfig,
@@ -15,6 +16,8 @@ from ..utils import logging
 from .layers.attention import ATTENTION_FUNCTIONS
 from .layers.normalization import set_rmsnorm_mode
 from .loader import ModelLoader, get_loader
+from .transformers.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
+from .transformers.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
 from .transformers.qwen3_5_shared import (
     LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE,
     has_linear_attention_layers,
@@ -43,13 +46,9 @@ def _load_local_xorl_config(
     model_type = config_dict.get("model_type")
 
     if model_type == "qwen3_5_moe":
-        from .transformers.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
-
         return Qwen3_5MoeConfig.from_hf_config(_namespace_from_dict(config_dict))
 
     if model_type == "qwen3_5":
-        from .transformers.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
-
         return Qwen3_5Config.from_hf_config(_namespace_from_dict(config_dict))
 
     return None
@@ -81,7 +80,6 @@ def _load_config_with_rank0_priority(
     'Unrecognized model' errors. This function lets rank 0 download first
     (populating the cache), then other ranks load from the cache.
     """
-    import torch.distributed as dist
 
     rank = get_parallel_state().global_rank if get_parallel_state().is_initialized else 0
     is_distributed = dist.is_initialized() and dist.get_world_size() > 1

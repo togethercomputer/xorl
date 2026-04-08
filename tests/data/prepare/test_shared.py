@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 from datasets import Dataset as HFDataset
+from huggingface_hub.errors import RepositoryNotFoundError
 
 from xorl.arguments import DatasetConfig
 from xorl.data.prepare.shared import (
@@ -13,7 +14,9 @@ from xorl.data.prepare.shared import (
     datasets_with_name_generator,
     get_dataset_type,
     load_dataset_with_config,
+    load_preprocessed_dataset,
     merge_datasets,
+    save_preprocessed_dataset,
 )
 
 
@@ -90,7 +93,6 @@ class TestHubAndRemoteDetection:
         assert _check_if_hub_dataset(_make_config(path="user/ds"), use_auth_token=False) is True
 
         # Invalid hub dataset
-        from huggingface_hub.errors import RepositoryNotFoundError
 
         mock_response = Mock()
         mock_response.status_code = 404
@@ -238,7 +240,6 @@ class TestSaveAndLoadPreprocessedDataset:
 
     def test_save_load_and_missing(self, tmp_path):
         """Covers save+load round-trip and load returning None when not found."""
-        from xorl.data.prepare.shared import load_preprocessed_dataset, save_preprocessed_dataset
 
         args = Mock()
         args.data.dataset_prepared_path = str(tmp_path)

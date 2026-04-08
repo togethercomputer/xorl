@@ -95,7 +95,7 @@ def _patched_load_cuda_library(self):
         return _original_load_cuda_library(self)
 
     # Load cubin
-    import cuda.bindings.runtime as cuda_runtime
+    import cuda.bindings.runtime as cuda_runtime  # noqa: PLC0415
 
     err, library = cuda_runtime.cudaLibraryLoadData(cubin, None, None, 0, None, None, 0)
     if err != cuda_runtime.cudaError_t.cudaSuccess:

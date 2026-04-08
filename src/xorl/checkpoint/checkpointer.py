@@ -1,3 +1,4 @@
+import gc
 import json
 import os
 from abc import ABC, abstractmethod
@@ -6,6 +7,7 @@ from typing import Any, Dict, List, Optional, Set
 import torch
 import torch.distributed as dist
 from torch.distributed._tensor import DeviceMesh, DTensor, Shard
+from torch.distributed.checkpoint.state_dict import StateDictOptions
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils.checkpoint_utils import _GLOBAL_STEP_PREFIX
@@ -224,7 +226,6 @@ class ModelState(Stateful):
         parameters (e.g., loading from a base model checkpoint into a LoRA-enabled model).
         Missing parameters (like lora_A, lora_B) will retain their initialized values.
         """
-        from torch.distributed.checkpoint.state_dict import StateDictOptions
 
         model_state_dict = state_dict
         if self.should_ep_aware:
@@ -536,8 +537,6 @@ class DistributedCheckpointer(CheckpointerBase):
             save_state["optimizer"].model = None
             save_state["optimizer"].optimizer = None
         del save_state
-
-        import gc
 
         gc.collect()
         gc.collect()  # Second pass for cyclic references

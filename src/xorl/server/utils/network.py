@@ -8,6 +8,8 @@ Engine and Workers in distributed setups.
 import logging
 import os
 import socket
+import time
+from pathlib import Path
 from typing import Optional
 
 
@@ -149,7 +151,6 @@ def write_address_file(address: str, output_dir: str, filename: str = ".rank0_ad
         >>> write_address_file("tcp://10.0.0.5:5556", "/shared/outputs")
         '/shared/outputs/.rank0_address'
     """
-    from pathlib import Path
 
     # Ensure output directory exists
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -187,8 +188,6 @@ def read_address_file(
         >>> read_address_file("/shared/outputs", timeout=60.0)
         'tcp://10.0.0.5:5556'
     """
-    import time
-    from pathlib import Path
 
     address_file = Path(output_dir) / filename
     start_time = time.time()

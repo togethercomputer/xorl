@@ -11,8 +11,10 @@ import re
 from typing import Dict, Iterator, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from safetensors.torch import load_file, save_file
+from torch.distributed._tensor import DTensor, Replicate, Shard
 
 from xorl.lora.mapping import can_apply_lora, get_lora_class_for_module
 from xorl.lora.modules import LoraLinear
@@ -256,8 +258,6 @@ def _gather_ep_tensor(tensor: torch.Tensor, spec_info) -> torch.Tensor:
         Full tensor with all EP shards concatenated along the shard dimension.
         Returns tensor unchanged if placement is Replicate.
     """
-    import torch.distributed as dist
-    from torch.distributed._tensor import Replicate, Shard
 
     if isinstance(spec_info.placement, Replicate):
         return tensor
@@ -292,7 +292,6 @@ def get_lora_state_dict(
     Returns:
         State dict containing only lora_A and lora_B parameters (on CPU)
     """
-    from torch.distributed._tensor import DTensor
 
     fqn2spec_info = getattr(model, "_fqn2spec_info", None)
 

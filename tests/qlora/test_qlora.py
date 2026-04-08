@@ -82,7 +82,6 @@ def _quantize_injected_model(model):
     inject_qlora_into_model creates QLoRA modules with empty packed_weight_f32.
     This helper fills them with properly quantized random weights for testing.
     """
-    from xorl.qlora.modules.linear import QLoRALinear
 
     for m in model.modules():
         if isinstance(m, QLoRALinear) and m._is_prequantized:

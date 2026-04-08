@@ -4,8 +4,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from torch.distributed._composable.fsdp.fully_shard import FSDPModule
 from torch.distributed._tensor import Replicate, Shard
 from torch.distributed.fsdp import MixedPrecision
+from torch.distributed.tensor import distribute_tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import noop_context_fn
 
@@ -299,7 +301,6 @@ def parallelize_model_fsdp2(
     # (gradient_accumulate_loss for non-PP; explicit grad.mul_(1/gvt) for PP).
     # Skip EP-sharded expert modules: they manage their own divide factor (ep_size)
     # for averaging expert gradients across EP ranks.
-    from torch.distributed._composable.fsdp.fully_shard import FSDPModule
 
     for module in model.modules():
         if isinstance(module, FSDPModule) and not getattr(module, "_is_ep_fsdp", False):
@@ -324,8 +325,6 @@ def parallelize_model_fsdp2(
                 if hasattr(m, "reset_lora_parameters"):
                     m.reset_lora_parameters()
     else:
-        from torch.distributed.tensor import distribute_tensor
-
         logger.info_rank0("starting to load model weights...")
         load_weights_mode = kwargs.get("load_weights_mode", "broadcast")
         if load_weights_mode == "broadcast":
@@ -464,8 +463,6 @@ def build_parallelize_model(
 
                 # With TP + meta init, we must load weights BEFORE FSDP wrapping.
                 if kwargs.get("init_device") == "meta" and weights_path is not None:
-                    from torch.distributed.tensor import distribute_tensor
-
                     if i == 0:
                         logger.info_rank0("TP enabled: loading weights before FSDP wrapping...")
                     load_weights_mode = kwargs.get("load_weights_mode", "broadcast")
@@ -613,8 +610,6 @@ def build_parallelize_model(
         # between logical DTensor shape and local shard).
         # Load weights now so FSDP wraps materialized TP DTensors.
         if kwargs.get("init_device") == "meta" and weights_path is not None:
-            from torch.distributed.tensor import distribute_tensor
-
             logger.info_rank0("TP enabled: loading weights before FSDP wrapping...")
             load_weights_mode = kwargs.get("load_weights_mode", "broadcast")
             if load_weights_mode == "broadcast":

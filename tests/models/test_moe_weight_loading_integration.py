@@ -5,6 +5,7 @@ These tests simulate the full flow of loading per-expert HuggingFace weights
 into a model that expects fused (stacked) expert format.
 """
 
+import random
 from typing import Dict, Iterator, Tuple
 
 import pytest
@@ -269,8 +270,6 @@ class TestMoeWeightLoadingIntegration:
             state_dict2[f"model.layers.0.mlp.experts.{expert_idx}.up_proj.weight"] = torch.randn(16, 8)
             state_dict2[f"model.layers.0.mlp.experts.{expert_idx}.down_proj.weight"] = torch.randn(8, 16)
 
-        import random
-
         items = list(state_dict2.items())
         random.seed(42)
         random.shuffle(items)
@@ -313,7 +312,6 @@ class TestMoeWeightLoadingIntegration:
         assert loaded_single["model.layers.0.mlp.experts.gate_proj"].shape == (1, 8, 16)
 
         # Random order loading
-        import random
 
         model_rand = MockMoeModel(2, 4, 8, 16)
         state_dict_rand = create_per_expert_state_dict(2, 4, 8, 16)

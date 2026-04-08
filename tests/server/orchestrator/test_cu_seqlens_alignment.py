@@ -23,7 +23,10 @@ import torch
 from xorl.data.collators.packing_concat_collator import (
     PackingConcatCollator,
 )
-from xorl.server.orchestrator.packing import SequentialPacker
+from xorl.data.collators.sequence_shard_collator import TextSequenceShardCollator
+from xorl.server.backend import DummyBackend
+from xorl.server.orchestrator.packing import SequentialPacker, unpack_per_token_outputs
+from xorl.server.orchestrator.request_processor import RequestProcessor
 from xorl.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 
 
@@ -160,7 +163,6 @@ class TestOriginalPositionIdsAndPadding:
 
     def test_sequence_shard_collator_preservation_and_stale_overwrite(self):
         """Test _original_position_ids preservation, no-pad, and stale cu_seq_lens overwrite."""
-        from xorl.data.collators.sequence_shard_collator import TextSequenceShardCollator
 
         # Preservation (SP size 2, 6 tokens)
         with (
@@ -269,8 +271,6 @@ class TestPadToMultipleWithSpSize:
             assert len(batches[0]["input_ids"][0]) == expected
 
         # RequestProcessor computes lcm correctly
-        from xorl.server.backend import DummyBackend
-        from xorl.server.orchestrator.request_processor import RequestProcessor
 
         backend = DummyBackend()
         assert RequestProcessor(backend=backend, pad_to_multiple_of=128, cp_size=3).pad_to_multiple_of == 384
@@ -278,7 +278,6 @@ class TestPadToMultipleWithSpSize:
         assert RequestProcessor(backend=backend, pad_to_multiple_of=128, cp_size=6).pad_to_multiple_of == 384
 
         # After TextSequenceShardCollator, lengths divisible by cp_size
-        from xorl.data.collators.sequence_shard_collator import TextSequenceShardCollator
 
         cp_size = 3
         mock_ps.return_value = Mock(cp_enabled=True, cp_size=cp_size, cp_rank=0, ringattn_size=1)
@@ -316,7 +315,6 @@ class TestUnpackingWithPadding:
     @patch("xorl.server.orchestrator.packing.get_parallel_state")
     def test_padding_boundary_handling(self, mock_ps):
         """Padding creates extra boundary; no padding has correct count."""
-        from xorl.server.orchestrator.packing import unpack_per_token_outputs
 
         mock_ps.return_value = Mock(cp_enabled=False, cp_size=1, cp_rank=0, ringattn_size=1)
 

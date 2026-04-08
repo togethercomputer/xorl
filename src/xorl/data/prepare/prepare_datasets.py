@@ -2,6 +2,8 @@
 
 from typing import Literal
 
+import numpy as np
+import pyarrow as pa
 import torch.distributed as dist
 from datasets import (
     Dataset as HFDataset,
@@ -50,8 +52,6 @@ def _create_dummy_dataset(seq_len: int, num_samples: int = 4096, seed: int = 42,
     0 is the EOD marker. All ``num_samples`` examples are intentionally
     identical so local benchmarks can show clean loss convergence.
     """
-    import numpy as np
-    import pyarrow as pa
 
     EOD = 0
     VOCAB_SIZE = vocab_size

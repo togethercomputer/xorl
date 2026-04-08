@@ -16,6 +16,13 @@ import pytest
 import torch
 import torch.nn as nn
 
+from xorl.models.layers.rope import RotaryEmbedding
+from xorl.models.transformers.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+from xorl.models.transformers.qwen3_moe.modeling_qwen3_moe import (
+    Qwen3MoeDecoderLayer,
+    Qwen3MoeForCausalLM,
+)
+
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
@@ -23,7 +30,6 @@ DTYPE = torch.bfloat16
 
 def _tiny_moe_config(**overrides):
     """Create a minimal Qwen3MoeConfig for fast testing."""
-    from xorl.models.transformers.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
     defaults = dict(
         vocab_size=1000,
@@ -49,7 +55,6 @@ def _tiny_moe_config(**overrides):
 
 def _make_position_embeddings(config, seq_len, device, dtype):
     """Create position_embeddings (cos, sin) for decoder layer tests."""
-    from xorl.models.layers.rope import RotaryEmbedding
 
     rotary = RotaryEmbedding(config=config).to(device)
     dummy_hidden = torch.randn(1, seq_len, config.hidden_size, device=device, dtype=dtype)
@@ -60,7 +65,7 @@ def _make_position_embeddings(config, seq_len, device, dtype):
 
 def _make_moe_block(moe_backend, hidden_size=128, num_experts=4, top_k=2, intermediate=128):
     """Create an MoEBlock with xavier init for numerical stability."""
-    from xorl.models.layers.moe.moe_block import MoEBlock
+    from xorl.models.layers.moe.moe_block import MoEBlock  # noqa: PLC0415
 
     block = MoEBlock(
         hidden_size=hidden_size,
@@ -80,7 +85,7 @@ def _available_backends():
     """Return list of available MoE backends on this system."""
     backends = ["native", "eager"]
     try:
-        from xorl.utils.import_utils import is_fused_moe_available
+        from xorl.utils.import_utils import is_fused_moe_available  # noqa: PLC0415
 
         if is_fused_moe_available():
             backends.append("triton")
@@ -156,7 +161,6 @@ def test_moe_block_compile(moe_backend):
 @pytest.mark.parametrize("moe_backend", AVAILABLE_BACKENDS)
 def test_decoder_layer_compile(moe_backend):
     """Decoder layer compile: aot_eager and inductor, forward + backward."""
-    from xorl.models.transformers.qwen3_moe.modeling_qwen3_moe import Qwen3MoeDecoderLayer
 
     seq_len = 8
     for compile_backend in ["aot_eager", "inductor"]:
@@ -200,10 +204,6 @@ def test_decoder_layer_compile(moe_backend):
 )
 def test_full_model_per_layer_compile(moe_backend, compile_backend):
     """Apply torch.compile to each decoder layer, run forward + backward."""
-    from xorl.models.transformers.qwen3_moe.modeling_qwen3_moe import (
-        Qwen3MoeDecoderLayer,
-        Qwen3MoeForCausalLM,
-    )
 
     config = _tiny_moe_config(_moe_implementation=moe_backend)
     model = Qwen3MoeForCausalLM(config).to(DEVICE, DTYPE)
@@ -520,7 +520,6 @@ def _measure_decoder_layer_peak_memory(layer, x, position_ids, position_embeddin
 @pytest.mark.parametrize("seq_len", [1024, 4096])
 def test_decoder_layer_benchmark(seq_len):
     """Benchmark full Qwen3MoeDecoderLayer: TFLOPS + peak memory, compiled vs uncompiled."""
-    from xorl.models.transformers.qwen3_moe.modeling_qwen3_moe import Qwen3MoeDecoderLayer
 
     hidden = 1024
     intermediate = 512

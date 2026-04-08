@@ -3,10 +3,18 @@
 import os
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from ..activations import ACT2FN
-from .backend import MOE_EXPERT_BACKENDS, MOE_EXPERT_BACKENDS_MOE_ACT
+from .backend import (
+    EP_COMBINE,
+    EP_DISPATCH,
+    EP_EXPERT_COMPUTE,
+    EP_EXPERT_COMPUTE_MOE_ACT,
+    MOE_EXPERT_BACKENDS,
+    MOE_EXPERT_BACKENDS_MOE_ACT,
+)
 from .common import split_gate_up_proj
 
 
@@ -119,7 +127,7 @@ class MoEExperts(nn.Module):
             )
 
         # Check EP — use unified dispatch/compute/combine path
-        from xorl.distributed.parallel_state import get_parallel_state
+        from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
 
         parallel_state = get_parallel_state()
 
@@ -160,7 +168,6 @@ class MoEExperts(nn.Module):
         Dispatch strategy is selected by ``self.ep_dispatch`` (``"alltoall"``
         or ``"deepep"``). Compute backend by ``self.moe_implementation``.
         """
-        from .backend import EP_COMBINE, EP_DISPATCH, EP_EXPERT_COMPUTE, EP_EXPERT_COMPUTE_MOE_ACT
 
         if self.moe_implementation not in EP_EXPERT_COMPUTE:
             raise ValueError(
@@ -256,7 +263,6 @@ class MoEExperts(nn.Module):
         times plus tensor metadata to help diagnose performance gaps between
         different dispatch+compute backend combinations.
         """
-        import torch.distributed as dist
 
         rank = dist.get_rank() if dist.is_initialized() else 0
 
@@ -321,7 +327,7 @@ class MoEExperts(nn.Module):
         if self.ep_dispatch == "alltoall":
             kwargs["ep_group"] = parallel_state.ep_group
         elif self.ep_dispatch == "deepep":
-            from xorl.distributed.moe.deepep import get_default_buffer
+            from xorl.distributed.moe.deepep import get_default_buffer  # noqa: PLC0415
 
             kwargs["buffer"] = get_default_buffer(
                 ep_group=parallel_state.ep_group,

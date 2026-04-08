@@ -17,6 +17,13 @@ import os
 import time
 
 import pytest
+from transformers import AutoConfig
+
+
+try:
+    import xorl_client
+except ModuleNotFoundError:
+    xorl_client = None
 
 from tests.e2e.e2e_utils import skip_if_gpu_count_less_than
 from tests.e2e.server_utils import (
@@ -28,6 +35,7 @@ from tests.e2e.server_utils import (
     generate_random_sft_data,
     generate_server_config,
 )
+from xorl.utils.count_flops import XorlFlopsCounter, get_device_flops
 
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.server, pytest.mark.benchmark]
@@ -69,10 +77,8 @@ def _skip_if_no_qwen3_8b():
 
 def _run_tflops_benchmark(num_gpus: int, dp_shard_size: int, tmp_path: str):
     """Run a Qwen3-8B LoRA SFT benchmark and return TFLOPS."""
-    import xorl_client
-    from transformers import AutoConfig
-
-    from xorl.utils.count_flops import XorlFlopsCounter, get_device_flops
+    if xorl_client is None:
+        pytest.skip("xorl_client not installed")
 
     output_dir = os.path.join(tmp_path, f"bench_{num_gpus}gpu")
     api_port = _get_free_port()

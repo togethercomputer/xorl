@@ -5,7 +5,7 @@ import pytest
 import torch
 from torch.utils.data import Dataset
 
-from xorl.data.collators import DataCollator, PackingConcatCollator
+from xorl.data.collators import CollatePipeline, DataCollator, FlattenCollator, PackingConcatCollator
 from xorl.data.data_loader import (
     DataLoaderBuilder,
     DistributedDataloader,
@@ -128,7 +128,6 @@ class TestMicroBatchCollatorAndDistributedDataloader:
         )
         collate_fn = mock_dataloader_cls.call_args[1]["collate_fn"]
         assert isinstance(collate_fn, MicroBatchCollator)
-        from xorl.data.collators import CollatePipeline
 
         assert isinstance(collate_fn.internal_collator, CollatePipeline)
         assert len(collate_fn.internal_collator.data_collators) == 5
@@ -344,7 +343,6 @@ class TestDataLoaderBuilderPipelineAndIntegration:
             assert mb["input_ids"].shape == (1, 16)
 
         # Flatten + Packing collator
-        from xorl.data.collators import FlattenCollator
 
         flatten_collator = FlattenCollator()
         packing_collator = PackingConcatCollator(pad_to_multiple_of=1)

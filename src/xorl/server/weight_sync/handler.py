@@ -32,6 +32,24 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+from torch.distributed._tensor import DTensor
+from torch.distributed.fsdp._fully_shard import FSDPModule
+
+from xorl.distributed.parallel_state import get_parallel_state
+from xorl.lora.modules.base import LoraModule
+from xorl.lora.modules.linear import LoraLinear
+from xorl.models.layers.moe.experts import MoEExperts
+from xorl.models.layers.moe.lora import MoEExpertsLoRA
+from xorl.models.transformers.qwen3_5_shared import (
+    has_linear_attention_layers,
+    remap_linear_attention_params_for_inference,
+)
+from xorl.qlora.modules.linear import QLoRALinear
+from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
+from xorl.server.protocol.operations import SyncWeightsData
+from xorl.server.weight_sync.backends import TransportConfig, create_backend
+from xorl.server.weight_sync.backends.base import EndpointConfig
+from xorl.server.weight_sync.endpoint_manager import EndpointManager
 
 
 logger = logging.getLogger(__name__)
@@ -70,8 +88,6 @@ class WeightSyncHandler:
         registering in :func:`backends.create_backend`.
         """
         logger.info(f"Rank {self.rank}: [WeightSync] Starting sync_inference_weights")
-
-        from xorl.server.protocol.operations import SyncWeightsData
 
         p: SyncWeightsData = command_dict.get("payload", SyncWeightsData())
 
@@ -139,7 +155,6 @@ class WeightSyncHandler:
         4. Sends the buffer via the transport backend
         5. Pipelines: unshard(N+1) overlaps with transfer(N)
         """
-        from torch.distributed.fsdp._fully_shard import FSDPModule
 
         model = self.trainer.model
         device = f"cuda:{self.trainer.local_rank}"
@@ -172,9 +187,6 @@ class WeightSyncHandler:
         # ------------------------------------------------------------------
         # Step 3: Create backend + endpoint manager, initialize on sender ranks
         # ------------------------------------------------------------------
-        from xorl.server.weight_sync.backends import TransportConfig, create_backend
-        from xorl.server.weight_sync.backends.base import EndpointConfig
-        from xorl.server.weight_sync.endpoint_manager import EndpointManager
 
         transport_cfg = TransportConfig(
             endpoints=[
@@ -244,8 +256,6 @@ class WeightSyncHandler:
         modules_to_sync.extend(layer_modules)
 
         # Detect EP mode
-        from xorl.distributed.parallel_state import get_parallel_state
-
         _ps = get_parallel_state()
         _ep_enabled = _ps.ep_enabled and _ps.ep_size > 1
 
@@ -328,8 +338,6 @@ class WeightSyncHandler:
                                 logger.info(
                                     f"Rank {self.rank}: [WeightSync] ep_moe_prefixes={ep_moe_prefixes} for {mod_name}"
                                 )
-                            from torch.distributed._tensor import DTensor
-
                             current_buffer = self._extract_params_for_sync(
                                 fsdp_mod,
                                 mod_name,
@@ -521,10 +529,6 @@ class WeightSyncHandler:
             collect_results = self.rank == 0
         # Discover QLoRA modules (only those directly owned by this FSDP module,
         # not by child FSDP modules — child modules will be processed separately)
-        from torch.distributed.fsdp._fully_shard import FSDPModule
-
-        from xorl.qlora.modules.linear import QLoRALinear
-        from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
 
         child_fsdp_prefixes = set()
         for mname, mod in fsdp_mod.named_modules():
@@ -564,8 +568,6 @@ class WeightSyncHandler:
             del base_w, delta
 
         # --- Phase 2: QLoRAMoeExperts (gather lora params, defer heavy work) ---
-        from xorl.distributed.parallel_state import get_parallel_state
-
         ps = get_parallel_state()
         ep_enabled = ps.ep_enabled and ps.ep_size > 1
 
@@ -630,14 +632,8 @@ class WeightSyncHandler:
         Must be called between unshard() and reshard().
         Returns list of context dicts for _gather_and_broadcast_ep_moe_experts.
         """
-        from torch.distributed._tensor import DTensor
 
         # Skip modules owned by child FSDP modules (processed separately)
-        from torch.distributed.fsdp._fully_shard import FSDPModule
-
-        from xorl.models.layers.moe.experts import MoEExperts
-        from xorl.models.layers.moe.lora import MoEExpertsLoRA
-        from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
 
         child_fsdp_prefixes = set()
         for mname, mod in fsdp_mod.named_modules():
@@ -1234,19 +1230,11 @@ class WeightSyncHandler:
 
         Supports both LoraLinear (dense LoRA) and MoEExpertsLoRA (MoE LoRA).
         """
-        from xorl.lora.modules.base import LoraModule
-        from xorl.lora.modules.linear import LoraLinear
-        from xorl.models.layers.moe.experts import MoEExperts
-        from xorl.models.layers.moe.lora import MoEExpertsLoRA
-        from xorl.qlora.modules.linear import QLoRALinear
-        from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
-
         buffer = []
 
         # Identify child FSDP module prefixes — their params will be processed
         # when that child module is unsharded separately. Parent unshard may
         # expose child params as plain tensors, so we can't rely on DTensor check.
-        from torch.distributed.fsdp._fully_shard import FSDPModule
 
         child_fsdp_prefixes = set()
         for mname, mod in fsdp_mod.named_modules():
@@ -1386,10 +1374,6 @@ class WeightSyncHandler:
         - Qwen3.5 linear attention: remap split GatedDeltaNet params back to
           HF fused names (q_proj/k_proj/v_proj → in_proj_qkv, etc.)
         """
-        from xorl.models.transformers.qwen3_5_shared import (
-            has_linear_attention_layers,
-            remap_linear_attention_params_for_inference,
-        )
 
         This splits fused weights back to individual projections before sending.
         """
@@ -1476,7 +1460,6 @@ class WeightSyncHandler:
         Root module holds non-layer params (embed, norm, head).
         Layer modules hold per-layer params.
         """
-        from torch.distributed.fsdp._fully_shard import FSDPModule
 
         root_module = None
         layer_modules = []

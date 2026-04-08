@@ -138,7 +138,7 @@ class TestCheckpointLoadingGKN:
     @staticmethod
     def _get_buffer_class():
         try:
-            from xorl.models.checkpoint_handlers.buffers import ExpertWeightBuffer
+            from xorl.models.checkpoint_handlers.buffers import ExpertWeightBuffer  # noqa: PLC0415
 
             return ExpertWeightBuffer
         except (ImportError, ModuleNotFoundError):
@@ -210,7 +210,7 @@ class TestBackendGKN:
         """Eager, native, triton backends match reference; all MoEBlock backends agree."""
         # --- Eager backend ---
         try:
-            from xorl.models.layers.moe.backend.eager import eager_expert_forward
+            from xorl.models.layers.moe.backend.eager import eager_expert_forward  # noqa: PLC0415
         except (ImportError, ModuleNotFoundError):
             pytest.skip("eager backend import requires transformers")
 
@@ -230,7 +230,7 @@ class TestBackendGKN:
             torch.testing.assert_close(eager_out, ref_out, atol=1e-5, rtol=1e-5)
 
         # --- Native backend ---
-        from xorl.models.layers.moe.backend.native import native_expert_forward
+        from xorl.models.layers.moe.backend.native import native_expert_forward  # noqa: PLC0415
 
         device, dtype = "cuda", torch.bfloat16
         gate_cuda = gate_gkn.to(device).to(dtype)
@@ -254,11 +254,11 @@ class TestBackendGKN:
 
         # --- Triton backend ---
         try:
-            from xorl.utils.import_utils import is_fused_moe_available
+            from xorl.utils.import_utils import is_fused_moe_available  # noqa: PLC0415
 
             if not is_fused_moe_available():
                 raise ImportError
-            from xorl.ops.moe.triton import TritonMoeExpertsFunction
+            from xorl.ops.moe.triton import TritonMoeExpertsFunction  # noqa: PLC0415
 
             triton_out = TritonMoeExpertsFunction.apply(
                 num_experts,
@@ -291,7 +291,7 @@ class TestBackendGKN:
 
         # --- MoEBlock all backends agree ---
         try:
-            from xorl.models.layers.moe import MOE_EXPERT_BACKENDS, MoEBlock
+            from xorl.models.layers.moe import MOE_EXPERT_BACKENDS, MoEBlock  # noqa: PLC0415
         except (ImportError, ModuleNotFoundError):
             return  # skip if not importable
 

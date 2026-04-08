@@ -11,6 +11,7 @@ Provides two layers:
   the pluggable backend interface.
 """
 
+import inspect
 import logging
 import os
 import time
@@ -22,6 +23,13 @@ from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 import requests
 import torch
 import torch.distributed as dist
+from torch.distributed import PrefixStore, TCPStore
+from torch.distributed.distributed_c10d import (
+    Backend,
+    _new_process_group_helper,
+    _world,
+    default_pg_timeout,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -135,13 +143,6 @@ class NCCLWeightSynchronizer:
         Returns:
             The initialized process group
         """
-        from torch.distributed import PrefixStore, TCPStore
-        from torch.distributed.distributed_c10d import (
-            Backend,
-            _new_process_group_helper,
-            _world,
-            default_pg_timeout,
-        )
 
         # Important: Only set NCCL_CUMEM_ENABLE=0
         os.environ["NCCL_CUMEM_ENABLE"] = "0"
@@ -183,7 +184,6 @@ class NCCLWeightSynchronizer:
         logger.info("[Training] TCPStore created, creating process group...")
 
         # Handle different PyTorch versions by inspecting the actual signature
-        import inspect
 
         _pg_params = inspect.signature(_new_process_group_helper).parameters
         if "backend_options" in _pg_params:

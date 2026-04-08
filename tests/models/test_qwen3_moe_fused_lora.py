@@ -4,6 +4,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from xorl.lora import LoraLinear, inject_lora_into_model
 from xorl.lora.mapping import can_apply_lora, get_lora_class_for_module
 from xorl.models.layers.moe import MOE_EXPERT_BACKENDS, MoEBlock, MoEExperts, MoEExpertsLoRA, MoELoRAConfig
 from xorl.models.transformers.qwen3_moe.modeling_qwen3_moe import (
@@ -516,7 +517,6 @@ class TestFromModuleAndInjection:
             assert torch.allclose(lora_exp.gate_proj, base.gate_proj)
 
             # inject_lora_into_model
-            from xorl.lora import inject_lora_into_model
 
             class SimpleModel(nn.Module):
                 def __init__(self, config, backend):
@@ -561,7 +561,6 @@ class TestFromModuleAndInjection:
         assert torch.allclose(lora_exp.gate_proj, base.gate_proj)
 
         # Error handling
-        from xorl.lora import LoraLinear, inject_lora_into_model
 
         class ModelA(nn.Module):
             def __init__(self):

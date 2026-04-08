@@ -92,12 +92,12 @@ class TestGetAndInitParallelState:
     """Test get_parallel_state and init_parallel_state functions."""
 
     def setup_method(self):
-        import xorl.distributed.parallel_state as ps_module
+        import xorl.distributed.parallel_state as ps_module  # noqa: PLC0415
 
         ps_module._PARALLEL_STATE = None
 
     def teardown_method(self):
-        import xorl.distributed.parallel_state as ps_module
+        import xorl.distributed.parallel_state as ps_module  # noqa: PLC0415
 
         ps_module._PARALLEL_STATE = None
 

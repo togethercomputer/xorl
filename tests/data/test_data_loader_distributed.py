@@ -9,8 +9,11 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from torch.utils.data import Dataset
 
 from tests.conftest import FakeTextDataset, SimpleCollator
+from xorl.data.collators import CollatePipeline, TextSequenceShardCollator
+from xorl.data.constants import IGNORE_INDEX
 from xorl.data.data_loader import (
     DataLoaderBuilder,
     MicroBatchCollator,
@@ -86,7 +89,6 @@ class TestDistributedDataAlignment:
         mock_sampler_cls.return_value = mock_sampler
 
         dataloader_sp = builder_sp.build(verbose=False)
-        from xorl.data.collators import CollatePipeline, TextSequenceShardCollator
 
         internal = builder_sp.collate_fn.internal_collator
         assert isinstance(internal, CollatePipeline)
@@ -157,8 +159,6 @@ class TestMicroBatchCollatorAndSequenceSharding:
     @patch("xorl.data.collators.sequence_shard_collator.get_parallel_state")
     def test_sequence_sharding_and_padding(self, mock_parallel_state):
         """Covers correct chunk sizes across SP ranks and padding for non-divisible lengths."""
-        from xorl.data.collators import TextSequenceShardCollator
-        from xorl.data.constants import IGNORE_INDEX
 
         cp_size = 4
         seq_len = 128
@@ -271,7 +271,6 @@ class TestEndToEndAndPackedSequences:
         assert len(epoch1) == len(epoch2)
 
         # --- Packed sequence tests ---
-        from torch.utils.data import Dataset
 
         class PackedDataset(Dataset):
             def __len__(self):

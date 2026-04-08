@@ -9,6 +9,7 @@ The tests use a mock engine that simulates the processing without actual workers
 
 import asyncio
 import logging
+import socket as sock
 
 import pytest
 import pytest_asyncio
@@ -155,8 +156,6 @@ class MockEngine:
 
 @pytest.fixture
 def zmq_addresses():
-    import socket as sock
-
     def find_free_port():
         with sock.socket(sock.AF_INET, sock.SOCK_STREAM) as s:
             s.bind(("127.0.0.1", 0))
@@ -315,7 +314,6 @@ async def test_edge_cases_and_lifecycle(zmq_addresses, mock_engine, orchestrator
         await client.get_output(timeout=1.0)
 
     # Client start/stop - use fresh ports to avoid address conflicts
-    import socket as sock
 
     def _find_free_port():
         with sock.socket(sock.AF_INET, sock.SOCK_STREAM) as s:

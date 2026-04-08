@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generator
 
@@ -23,6 +24,27 @@ from huggingface_hub.errors import (
     RepositoryNotFoundError,
     RevisionNotFoundError,
 )
+
+
+try:
+    import adlfs
+except ImportError:
+    adlfs = None
+
+try:
+    import gcsfs
+except ImportError:
+    gcsfs = None
+
+try:
+    import ocifs
+except ImportError:
+    ocifs = None
+
+try:
+    import s3fs
+except ImportError:
+    s3fs = None
 
 from ...arguments import Arguments, DatasetConfig
 from ...data.prepare.constants import DEFAULT_DATASET_PREPARED_PATH
@@ -79,7 +101,6 @@ def datasets_with_name_generator(
     Yields:
         Individual dataset configurations, expanded as needed for names or shards.
     """
-    from dataclasses import replace
 
     for config in dataset_configs:
         if config.name and isinstance(config.name, list):
@@ -186,40 +207,28 @@ def _get_remote_filesystem(
 ) -> tuple[S3FileSystem | GCSFileSystem | AzureBlobFileSystem | OCIFileSystem | None, dict]:
     """Get the appropriate filesystem for a remote path."""
     if path.startswith("s3://"):
-        try:
-            import s3fs
-
-            storage_options = {"anon": False}
-            return s3fs.S3FileSystem(**storage_options), storage_options
-        except ImportError as exc:
-            raise ImportError("s3:// paths require s3fs to be installed") from exc
+        if s3fs is None:
+            raise ImportError("s3:// paths require s3fs to be installed")
+        storage_options = {"anon": False}
+        return s3fs.S3FileSystem(**storage_options), storage_options
 
     elif path.startswith(("gs://", "gcs://")):
-        try:
-            import gcsfs
-
-            storage_options = {"token": None}  # type: ignore
-            return gcsfs.GCSFileSystem(**storage_options), storage_options
-        except ImportError as exc:
-            raise ImportError("gs:// or gcs:// paths require gcsfs to be installed") from exc
+        if gcsfs is None:
+            raise ImportError("gs:// or gcs:// paths require gcsfs to be installed")
+        storage_options = {"token": None}  # type: ignore
+        return gcsfs.GCSFileSystem(**storage_options), storage_options
 
     elif path.startswith(("adl://", "abfs://", "az://")):
-        try:
-            import adlfs
-
-            storage_options = {"anon": False}
-            return adlfs.AzureBlobFileSystem(**storage_options), storage_options
-        except ImportError as exc:
-            raise ImportError("adl:// or abfs:// paths require adlfs to be installed") from exc
+        if adlfs is None:
+            raise ImportError("adl:// or abfs:// paths require adlfs to be installed")
+        storage_options = {"anon": False}
+        return adlfs.AzureBlobFileSystem(**storage_options), storage_options
 
     elif path.startswith("oci://"):
-        try:
-            import ocifs
-
-            storage_options = {}
-            return ocifs.OCIFileSystem(**storage_options), storage_options
-        except ImportError as exc:
-            raise ImportError("oci:// paths require ocifs to be installed") from exc
+        if ocifs is None:
+            raise ImportError("oci:// paths require ocifs to be installed")
+        storage_options = {}
+        return ocifs.OCIFileSystem(**storage_options), storage_options
 
     return None, {}
 

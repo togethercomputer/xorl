@@ -100,7 +100,7 @@ _MOE_LAZY_ATTRS = {
 
 def __getattr__(name):
     if name in _MOE_LAZY_ATTRS:
-        from xorl.models.layers.moe.lora import (
+        from xorl.models.layers.moe.lora import (  # noqa: PLC0415
             MoEExpertsLoRA,
             MoELoRAConfig,
             copy_weights_to_lora_experts,

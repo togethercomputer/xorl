@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import socket
+from pathlib import Path
 from typing import Any, Dict, List
 
 import httpx
 from fastapi import HTTPException, status
+from huggingface_hub import hf_hub_download
 
 from xorl.server.api_server.api_types import (
     AddInferenceEndpointRequest,
@@ -47,8 +50,6 @@ class InferenceEndpointsMixin:
 
         Returns the full HF quantization_config dict, or None.
         """
-        import json
-        from pathlib import Path
 
         # Try local path first
         config_path = Path(model_path) / "config.json"
@@ -63,8 +64,6 @@ class InferenceEndpointsMixin:
         # Try HuggingFace hub (for repo IDs like "Qwen/Qwen3-8B-FP8")
         if config_dict is None:
             try:
-                from huggingface_hub import hf_hub_download
-
                 cached_path = hf_hub_download(model_path, "config.json")
                 with open(cached_path) as f:
                     config_dict = json.load(f)

@@ -6,13 +6,25 @@ Functions for injecting QLoRA into models and managing quantized checkpoints.
 
 import json
 import logging
+import math
+import math as _math
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Collection, List, Optional, Tuple
 
+import safetensors.torch
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from safetensors.torch import save_file
+from torch.distributed._tensor import DTensor
+from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, cached_file
 
+from xorl.distributed.parallel_state import get_parallel_state
+from xorl.models.checkpoint_handlers.buffers import (
+    detect_prequantized_block_fp8_checkpoint,
+    detect_prequantized_checkpoint,
+)
 from xorl.qlora.modules.block_fp8_linear import BlockFP8QLoRALinear
 from xorl.qlora.modules.linear import QLoRALinear
 from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
@@ -210,8 +222,6 @@ def inject_qlora_into_model(
     if not any(t in ("gate_proj", "up_proj", "down_proj") for t in target_modules):
         return model
 
-    from xorl.distributed.parallel_state import get_parallel_state
-
     try:
         parallel_state = get_parallel_state()
         ep_size = parallel_state.ep_size if parallel_state.ep_enabled else 1
@@ -386,7 +396,6 @@ def maybe_load_and_quantize_moe_qlora(
     Returns:
         Number of MoE modules loaded.
     """
-    import json
 
     needs_moe = any(isinstance(m, QLoRAMoeExperts) and not m._weights_loaded for m in model.modules())
     if not needs_moe:
@@ -396,8 +405,6 @@ def maybe_load_and_quantize_moe_qlora(
     weight_map = None
     if weights_path:
         try:
-            from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, cached_file
-
             index_path = cached_file(weights_path, SAFE_WEIGHTS_INDEX_NAME)
             if index_path:
                 with open(index_path) as f:
@@ -423,7 +430,6 @@ def maybe_load_and_quantize_moe_qlora(
                 shard_cache=shard_cache,
             )
             # Materialize LoRA params from meta device to GPU
-            from torch.distributed._tensor import DTensor
 
             for name, param in module.named_parameters():
                 if param.device.type == "meta":
@@ -446,8 +452,6 @@ def maybe_load_and_quantize_moe_qlora(
                             requires_grad=param.requires_grad,
                         )
                     else:
-                        import math as _math
-
                         materialized = nn.Parameter(
                             torch.zeros(
                                 param.shape,
@@ -539,7 +543,6 @@ def detect_prequantized_nvfp4(weights_path: str) -> bool:
     Returns:
         True if the checkpoint is pre-quantized NVFP4.
     """
-    from xorl.models.checkpoint_handlers.buffers import detect_prequantized_checkpoint
 
     return detect_prequantized_checkpoint(weights_path)
 
@@ -555,7 +558,6 @@ def detect_prequantized_block_fp8(weights_path: str) -> bool:
     Returns:
         True if the checkpoint is pre-quantized block FP8.
     """
-    from xorl.models.checkpoint_handlers.buffers import detect_prequantized_block_fp8_checkpoint
 
     return detect_prequantized_block_fp8_checkpoint(weights_path)
 
@@ -573,11 +575,6 @@ def _broadcast_shard_cache(
     Returns:
         shard_cache: dict mapping shard filename → {tensor_name: tensor (CPU)}
     """
-    from concurrent.futures import ThreadPoolExecutor
-
-    import safetensors.torch
-    import torch.distributed as dist
-    from transformers.utils import cached_file
 
     rank = dist.get_rank()
     device = torch.device("cuda")
@@ -661,13 +658,10 @@ def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str, load_mode
     Returns:
         Number of modules loaded.
     """
-    import torch.distributed as dist
 
     # Load weight map from index file
     weight_map = None
     try:
-        from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, cached_file
-
         index_path = cached_file(weights_path, SAFE_WEIGHTS_INDEX_NAME)
         if index_path:
             with open(index_path) as f:
@@ -719,7 +713,6 @@ def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str, load_mode
             # Since lora_B=0 → initial delta = A @ 0 = 0 regardless of A,
             # we initialize ALL DTensor params to zeros and let kaiming_uniform
             # only apply to non-DTensor (non-EP) params.
-            from torch.distributed._tensor import DTensor
 
             _rank = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
             for name, param in module.named_parameters():
@@ -754,8 +747,6 @@ def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str, load_mode
                         )
                         parts = name.split("_")
                         if parts[-1] == "A":
-                            import math
-
                             for i in range(materialized.shape[0]):
                                 nn.init.kaiming_uniform_(materialized.data[i], a=math.sqrt(5))
                     setattr(module, name, materialized)

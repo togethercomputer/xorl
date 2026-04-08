@@ -25,12 +25,14 @@ import argparse
 import logging
 import multiprocessing as mp
 import os
+import random
 import signal
 import socket
 import subprocess
 import sys
 import time
-from contextlib import closing
+from contextlib import asynccontextmanager, closing
+from dataclasses import fields
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -41,6 +43,7 @@ import yaml
 from xorl.server.api_server.server import APIServer
 from xorl.server.orchestrator.orchestrator import Orchestrator
 from xorl.server.server_arguments import ServerArguments
+from xorl.server.utils.network import read_address_file
 
 
 # Setup logging
@@ -97,7 +100,6 @@ def find_free_port(start_port: int = 50000, max_attempts: int = 10000) -> int:
     Raises:
         RuntimeError: If no free port found
     """
-    import random
 
     end_port = min(start_port + max_attempts, 60000)
     ports = list(range(start_port, end_port))
@@ -265,7 +267,6 @@ def run_api_server(
         skip_initial_checkpoint: Skip auto-saving initial checkpoint on first create_model.
         sync_inference_method: Method for syncing weights to inference endpoints. Default: 'nccl_broadcast'.
     """
-    from contextlib import asynccontextmanager
 
     # Setup logging for this process
     logging.basicConfig(
@@ -287,8 +288,8 @@ def run_api_server(
     try:
         # Import the FastAPI app from api_server module
         # Update the global state shared between api_server.py and endpoints.py
-        import xorl.server.api_server._state as _state_module
-        from xorl.server.api_server.server import app
+        import xorl.server.api_server._state as _state_module  # noqa: PLC0415
+        from xorl.server.api_server.server import app  # noqa: PLC0415
 
         # Override the lifespan to use our addresses
         @asynccontextmanager
@@ -364,8 +365,6 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
 
     if not config:
         raise ValueError(f"Empty config file: {config_path}")
-
-    from dataclasses import fields
 
     valid_fields = {f.name for f in fields(ServerArguments)}
 
@@ -720,8 +719,6 @@ class Launcher:
 
         # Priority 2: File-based discovery (for multi-node)
         if self.nnodes > 1:
-            from xorl.server.utils.network import read_address_file
-
             logger.info(f"Multi-node setup (nnodes={self.nnodes}), waiting for rank 0 address file...")
 
             # Wait for address file with extended timeout for multi-node
@@ -858,7 +855,6 @@ class Launcher:
     @staticmethod
     def _find_free_port() -> int:
         """Find and return a free TCP port."""
-        import socket
 
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind(("", 0))

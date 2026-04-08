@@ -12,6 +12,7 @@ from .collators import (
     PackingConcatCollator,
     ShiftTokensCollator,
     TextSequenceShardCollator,
+    ToTensorCollator,
 )
 
 
@@ -176,7 +177,6 @@ class DataLoaderBuilder:
 
     def _build_default_collator_list(self) -> List[DataCollator]:
         """Build the default collator pipeline."""
-        from .collators import ToTensorCollator
 
         collators = [
             ToTensorCollator(),  # 1. Convert to tensors
