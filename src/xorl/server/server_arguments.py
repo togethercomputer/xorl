@@ -388,10 +388,6 @@ class ServerArguments:
         },
     )
 
-    moe_shared_lora: bool = field(
-        default=False, metadata={"help": "Enable shared LoRA for MoE: share LoRA weights across experts"}
-    )
-
     moe_hybrid_shared_lora: bool = field(
         default=False,
         metadata={
@@ -544,7 +540,6 @@ class ServerArguments:
                 "lora_rank": self.lora_rank,
                 "lora_alpha": self.lora_alpha,
                 "lora_target_modules": self.lora_target_modules,
-                "moe_shared_lora": self.moe_shared_lora,
                 "moe_hybrid_shared_lora": self.moe_hybrid_shared_lora,
                 "enable_qlora": self.enable_qlora,
                 "quant_format": self.quant_format,

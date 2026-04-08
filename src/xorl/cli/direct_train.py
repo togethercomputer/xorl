@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
 
 from xorl.distributed.pipeline_parallel import build_pipeline_schedule
-from xorl.lora.utils import inject_lora_into_model, save_lora_checkpoint
+from xorl.lora.utils import save_lora_checkpoint
 from xorl.models.checkpoint_handlers.buffers import get_prequantized_exclude_modules
 from xorl.models.layers.moe.routing_replay import RoutingReplay, set_replay_stage
 from xorl.qlora import (
@@ -285,12 +285,28 @@ def main():
             model._qlora_exclude_modules = exclude_modules
         helper.print_device_mem_info("VRAM usage after QLoRA injection")
     elif args.lora.enable_lora:
-        inject_lora_into_model(
-            model,
-            r=args.lora.lora_rank,
-            lora_alpha=args.lora.lora_alpha,
-            target_modules=args.lora.lora_target_modules,
-        )
+        is_moe_model = getattr(model.config, "num_experts", 0) > 0
+
+        if is_moe_model and args.lora.moe_hybrid_shared_lora:
+            from xorl.lora.utils import inject_lora_into_model_with_moe
+
+            logger.info_rank0(f"MoE-aware LoRA injection (hybrid_shared={args.lora.moe_hybrid_shared_lora})")
+            inject_lora_into_model_with_moe(
+                model,
+                r=args.lora.lora_rank,
+                lora_alpha=args.lora.lora_alpha,
+                target_modules=args.lora.lora_target_modules,
+                moe_hybrid_shared_lora=args.lora.moe_hybrid_shared_lora,
+            )
+        else:
+            from xorl.lora.utils import inject_lora_into_model
+
+            inject_lora_into_model(
+                model,
+                r=args.lora.lora_rank,
+                lora_alpha=args.lora.lora_alpha,
+                target_modules=args.lora.lora_target_modules,
+            )
         helper.print_device_mem_info("VRAM usage after LoRA injection")
 
     maybe_upcast_trainable_adapter_params(
@@ -811,6 +827,7 @@ def main():
                 target_modules=args.lora.lora_target_modules,
                 r=args.lora.lora_rank,
                 lora_alpha=args.lora.lora_alpha,
+                moe_hybrid_shared_lora=args.lora.moe_hybrid_shared_lora,
             )
             logger.info_rank0(f"PEFT adapter checkpoint saved at {hf_weights_path} successfully!")
         elif hf_model_state_dict is not None:

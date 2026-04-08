@@ -163,7 +163,6 @@ ZMQ communication between the launcher, workers, and API server.
 | `lora_rank` | `32` | LoRA rank (`r`). Default is 32 for server (vs 16 for local). |
 | `lora_alpha` | `16` | LoRA scaling factor. |
 | `lora_target_modules` | `null` | Module names to inject LoRA into. `null` = default for architecture. |
-| `moe_shared_lora` | `false` | Share LoRA weights across all MoE experts. |
 | `moe_hybrid_shared_lora` | `false` | Share `lora_A` for gate/up projections and `lora_B` for down projections across experts. |
 | `enable_qlora` | `false` | Quantize base weights and train LoRA adapters on top. |
 | `quant_format` | `nvfp4` | Quantization format: `nvfp4`, `block_fp8`. |

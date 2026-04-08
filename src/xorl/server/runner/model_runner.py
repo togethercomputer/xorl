@@ -488,7 +488,6 @@ class ModelRunner:
             lora_rank=self.lora_config.get("lora_rank", 32),
             lora_alpha=self.lora_config.get("lora_alpha", 16),
             lora_target_modules=target_modules,
-            moe_shared_lora=self.lora_config.get("moe_shared_lora", False),
             moe_hybrid_shared_lora=self.lora_config.get("moe_hybrid_shared_lora", False),
             enable_qlora=enable_qlora,
             quant_format=self.lora_config.get("quant_format", "nvfp4"),

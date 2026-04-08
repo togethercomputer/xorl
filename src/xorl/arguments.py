@@ -1037,6 +1037,12 @@ class LoRAArguments:
         default=False,
         metadata={"help": "Only save LoRA weights (not full model) in HF checkpoints"},
     )
+    moe_hybrid_shared_lora: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable hybrid shared LoRA for MoE: share lora_A for gate/up_proj, lora_B for down_proj across experts"
+        },
+    )
     # QLoRA: quantize base weights for memory savings
     enable_qlora: bool = field(
         default=False,

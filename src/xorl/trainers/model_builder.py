@@ -13,7 +13,7 @@ import torch.nn as nn
 
 from xorl.distributed.torch_parallelize import build_parallelize_model as _parallelize
 from xorl.lora import freeze_base_parameters
-from xorl.lora.utils import inject_lora_into_model, inject_lora_into_model_with_moe
+from xorl.lora.utils import inject_lora_into_model
 from xorl.models import build_foundation_model
 from xorl.models.checkpoint_handlers.buffers import get_prequantized_exclude_modules
 from xorl.models.layers.rope import set_rope_native
@@ -116,7 +116,6 @@ def build_training_model(
     lora_rank: int = 32,
     lora_alpha: int = 16,
     lora_target_modules: Optional[List[str]] = None,
-    moe_shared_lora: bool = False,
     moe_hybrid_shared_lora: bool = False,
     # --- QLoRA ---
     enable_qlora: bool = False,
@@ -229,7 +228,6 @@ def build_training_model(
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
             lora_target_modules=lora_target_modules,
-            moe_shared_lora=moe_shared_lora,
             moe_hybrid_shared_lora=moe_hybrid_shared_lora,
         )
 
@@ -434,22 +432,20 @@ def _inject_lora(
     lora_rank: int,
     lora_alpha: int,
     lora_target_modules: Optional[List[str]],
-    moe_shared_lora: bool = False,
     moe_hybrid_shared_lora: bool = False,
 ) -> None:
     """Plain LoRA injection (dense + optional MoE-aware)."""
     is_moe_model = getattr(model.config, "num_experts", 0) > 0
 
-    if is_moe_model and (moe_shared_lora or moe_hybrid_shared_lora):
-        logger.info_rank0(
-            f"MoE-aware LoRA injection (shared={moe_shared_lora}, hybrid_shared={moe_hybrid_shared_lora})"
-        )
+    if is_moe_model and moe_hybrid_shared_lora:
+        from xorl.lora.utils import inject_lora_into_model_with_moe
+
+        logger.info_rank0(f"MoE-aware LoRA injection (hybrid_shared={moe_hybrid_shared_lora})")
         inject_lora_into_model_with_moe(
             model,
             r=lora_rank,
             lora_alpha=lora_alpha,
             target_modules=lora_target_modules,
-            moe_shared_lora=moe_shared_lora,
             moe_hybrid_shared_lora=moe_hybrid_shared_lora,
         )
     else:

@@ -32,7 +32,7 @@ from xorl.distributed.parallel_state import get_parallel_state, init_parallel_st
 from xorl.distributed.pipeline_parallel import build_pipeline_schedule, build_pp_stage
 from xorl.distributed.sync_padding import synchronize_micro_batch_padding
 from xorl.distributed.torch_parallelize import build_parallelize_model
-from xorl.lora.utils import inject_lora_into_model, save_lora_checkpoint
+from xorl.lora.utils import save_lora_checkpoint
 from xorl.models import build_foundation_model, build_tokenizer, save_model_assets, save_model_weights
 from xorl.models.checkpoint_handlers.buffers import get_prequantized_exclude_modules
 from xorl.models.layers.moe.aux_loss import global_load_balancing_loss_func
@@ -475,15 +475,30 @@ class Trainer:
         helper.print_device_mem_info("VRAM usage after QLoRA injection")
 
     def _inject_lora(self) -> None:
-        """Plain LoRA injection."""
+        """Plain LoRA injection (dense + optional MoE-aware)."""
         args = self.args
+        is_moe_model = getattr(self.model.config, "num_experts", 0) > 0
 
-        inject_lora_into_model(
-            self.model,
-            r=args.lora.lora_rank,
-            lora_alpha=args.lora.lora_alpha,
-            target_modules=args.lora.lora_target_modules,
-        )
+        if is_moe_model and args.lora.moe_hybrid_shared_lora:
+            from xorl.lora.utils import inject_lora_into_model_with_moe
+
+            logger.info_rank0(f"MoE-aware LoRA injection (hybrid_shared={args.lora.moe_hybrid_shared_lora})")
+            inject_lora_into_model_with_moe(
+                self.model,
+                r=args.lora.lora_rank,
+                lora_alpha=args.lora.lora_alpha,
+                target_modules=args.lora.lora_target_modules,
+                moe_hybrid_shared_lora=args.lora.moe_hybrid_shared_lora,
+            )
+        else:
+            from xorl.lora.utils import inject_lora_into_model
+
+            inject_lora_into_model(
+                self.model,
+                r=args.lora.lora_rank,
+                lora_alpha=args.lora.lora_alpha,
+                target_modules=args.lora.lora_target_modules,
+            )
         helper.print_device_mem_info("VRAM usage after LoRA injection")
 
     def _parallelize(self) -> None:
@@ -1144,6 +1159,7 @@ class Trainer:
                     target_modules=args.lora.lora_target_modules,
                     r=args.lora.lora_rank,
                     lora_alpha=args.lora.lora_alpha,
+                    moe_hybrid_shared_lora=args.lora.moe_hybrid_shared_lora,
                 )
                 logger.info_rank0(f"PEFT adapter saved at {hf_weights_path}")
             elif hf_model_state_dict is not None:

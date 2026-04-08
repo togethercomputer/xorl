@@ -569,7 +569,18 @@ def load_lora_checkpoint(
     """
     Load LoRA weights from checkpoint.
 
-    Supports both xorl format and PEFT format checkpoints.
+    Supports both xorl format and PEFT format checkpoints for dense
+    (nn.Linear) and per-expert MoE LoRA weights.
+
+    .. note::
+        Hybrid-shared MoE LoRA checkpoints are **not** supported.
+        ``save_lora_checkpoint`` exports shared expert weights under
+        ``.mlp.experts.shared.{proj}.lora_{A|B}.weight``, but this
+        function cannot map those keys back to xorl's internal stacked
+        MoE parameter layout (``{proj}_lora_{A|B}`` with shape
+        ``[1, ...]``).  Loading such a checkpoint would require
+        re-stacking the per-expert and shared tensors, which is not
+        yet implemented.
 
     Args:
         model: Model with LoRA layers already injected
@@ -662,7 +673,6 @@ def inject_lora_into_moe_blocks(
     model: nn.Module,
     r: int = 16,
     lora_alpha: int = 16,
-    shared_lora: bool = False,
     target_modules: Optional[List[str]] = None,
     hybrid_shared: bool = False,
 ) -> int:
@@ -682,7 +692,6 @@ def inject_lora_into_moe_blocks(
         model: Model containing MoE blocks
         r: LoRA rank
         lora_alpha: LoRA alpha for scaling
-        shared_lora: If True, share LoRA across all experts (more parameter efficient)
         target_modules: Which expert projections to apply LoRA to.
                        Options: ["gate_proj", "up_proj", "down_proj"]
                        Default: all three projections
@@ -713,7 +722,6 @@ def inject_lora_into_moe_blocks(
             module.inject_lora(
                 r=r,
                 lora_alpha=lora_alpha,
-                shared_lora=shared_lora,
                 target_modules=target_modules,
                 hybrid_shared=hybrid_shared,
             )
@@ -723,7 +731,7 @@ def inject_lora_into_moe_blocks(
     if injected_count > 0:
         logger.info(
             f"Injected LoRA into {injected_count} MoE blocks with r={r}, "
-            f"alpha={lora_alpha}, shared={shared_lora}, hybrid_shared={hybrid_shared}"
+            f"alpha={lora_alpha}, hybrid_shared={hybrid_shared}"
         )
     else:
         logger.warning(
@@ -738,7 +746,6 @@ def inject_lora_into_model_with_moe(
     r: int = 16,
     lora_alpha: int = 16,
     target_modules: Optional[List[str]] = None,
-    moe_shared_lora: bool = False,
     moe_hybrid_shared_lora: bool = False,
 ) -> nn.Module:
     """
@@ -760,7 +767,6 @@ def inject_lora_into_model_with_moe(
         target_modules: List of module names to target.
                        For attention: ["q_proj", "k_proj", "v_proj", "o_proj"]
                        For MLP/experts: ["gate_proj", "up_proj", "down_proj"]
-        moe_shared_lora: If True, MoE experts share LoRA adapters (all shared)
         moe_hybrid_shared_lora: If True, use hybrid sharing (lora_A shared for gate/up, lora_B shared for down)
 
     Returns:
@@ -802,7 +808,6 @@ def inject_lora_into_model_with_moe(
             model,
             r=r,
             lora_alpha=lora_alpha,
-            shared_lora=moe_shared_lora,
             target_modules=expert_modules,
             hybrid_shared=moe_hybrid_shared_lora,
         )

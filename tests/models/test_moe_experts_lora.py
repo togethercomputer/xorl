@@ -221,6 +221,25 @@ class TestMoEExpertsLoRAEager:
         output.sum().backward()
         assert block.experts.gate_proj_lora_A.grad is not None
 
+    def test_hybrid_shared_shapes(self):
+        """Hybrid-shared injection keeps the supported shared tensor layout."""
+        block = MoEBlock(
+            hidden_size=32,
+            num_experts=4,
+            top_k=2,
+            intermediate_size=64,
+            moe_implementation="eager",
+        )
+
+        block.inject_lora(r=4, lora_alpha=8, hybrid_shared=True)
+
+        assert block.experts.gate_proj_lora_A.shape == (1, 32, 4)
+        assert block.experts.gate_proj_lora_B.shape == (4, 4, 64)
+        assert block.experts.up_proj_lora_A.shape == (1, 32, 4)
+        assert block.experts.up_proj_lora_B.shape == (4, 4, 64)
+        assert block.experts.down_proj_lora_A.shape == (4, 64, 4)
+        assert block.experts.down_proj_lora_B.shape == (1, 4, 32)
+
 
 # ---------------------------------------------------------------------------
 # 4. GPU LoRA forward/backward (triton + native)

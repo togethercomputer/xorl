@@ -86,7 +86,6 @@ class MoEBlock(nn.Module):
         self,
         r: int = 16,
         lora_alpha: int = 16,
-        shared_lora: bool = False,
         target_modules: list = None,
         hybrid_shared: bool = False,
     ) -> None:
@@ -99,7 +98,6 @@ class MoEBlock(nn.Module):
         Args:
             r: LoRA rank.
             lora_alpha: LoRA alpha for scaling.
-            shared_lora: Unused (kept for API compat).
             target_modules: Which projections to apply LoRA to.
                 Options: ``["gate_proj", "up_proj", "down_proj"]``.
                 Default: all three.
