@@ -25,8 +25,8 @@ from typing import (
 import torch
 import yaml
 
-from .checkpoint_utils import get_checkpoint_path
 from .utils import logging
+from .utils.checkpoint_utils import get_checkpoint_path
 
 
 T = TypeVar("T")
