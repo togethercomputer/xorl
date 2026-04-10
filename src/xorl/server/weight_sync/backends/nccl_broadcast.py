@@ -16,6 +16,7 @@ import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Thread
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple
@@ -94,7 +95,7 @@ class NCCLWeightSynchronizer:
         self,
         endpoints: List[EndpointInfo],
         master_address: str = "localhost",
-        master_port: int = 29600,
+        master_port: int = 0,
         group_name: str = "weight_sync_group",
         buffer_size_mb: int = 1024,
         device: str = "cuda:0",
@@ -105,7 +106,7 @@ class NCCLWeightSynchronizer:
         Args:
             endpoints: List of inference endpoints to sync weights to
             master_address: Address for NCCL rendezvous (training server)
-            master_port: Port for NCCL rendezvous
+            master_port: Port for NCCL rendezvous (0 selects an ephemeral port)
             group_name: Name of the NCCL process group
             buffer_size_mb: Size of each transfer bucket in MB
             device: Device to use for NCCL operations
@@ -122,6 +123,9 @@ class NCCLWeightSynchronizer:
 
         # Process group (initialized during sync)
         self.process_group: Optional[dist.ProcessGroup] = None
+        self._training_raw_store = None
+        self._training_prefix_store = None
+        self._active_master_port = master_port
 
         logger.info(
             f"NCCLWeightSynchronizer initialized: "
@@ -132,6 +136,54 @@ class NCCLWeightSynchronizer:
     # ========================================================================
     # NCCL process group management
     # ========================================================================
+
+    @contextmanager
+    def _without_torchelastic_agent_store(self):
+        """Temporarily disable the elastic agent store override for custom groups."""
+        old_agent_store = os.environ.pop("TORCHELASTIC_USE_AGENT_STORE", None)
+        try:
+            yield
+        finally:
+            if old_agent_store is not None:
+                os.environ["TORCHELASTIC_USE_AGENT_STORE"] = old_agent_store
+
+    def _create_training_store(self) -> None:
+        """Create and retain the rendezvous store used by the training process group."""
+        self._cleanup_training_store()
+
+        requested_port = self.master_port
+        logger.info(f"[Training] Creating TCPStore (requested_port={requested_port}, is_master=True)...")
+
+        with self._without_torchelastic_agent_store():
+            raw_store = TCPStore(
+                host_name=self.master_address,
+                port=requested_port,
+                world_size=self.world_size,
+                is_master=True,
+                timeout=default_pg_timeout,
+            )
+
+        self._training_raw_store = raw_store
+        self._active_master_port = raw_store.port
+        self._training_prefix_store = PrefixStore(self.group_name, raw_store)
+        logger.info(
+            f"[Training] Rendezvous store ready: tcp://{self.master_address}:{self._active_master_port}, "
+            f"group_name={self.group_name}"
+        )
+
+    def _cleanup_training_store(self) -> None:
+        """Drop references to the rendezvous store so the TCP listener can be reclaimed."""
+        raw_store = self._training_raw_store
+        self._training_prefix_store = None
+        self._training_raw_store = None
+        self._active_master_port = self.master_port
+
+        close = getattr(raw_store, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as exc:
+                logger.warning(f"[Training] Failed to close rendezvous store cleanly: {exc}")
 
     def _init_training_process_group(self) -> dist.ProcessGroup:
         """
@@ -147,15 +199,10 @@ class NCCLWeightSynchronizer:
         # Important: Only set NCCL_CUMEM_ENABLE=0
         os.environ["NCCL_CUMEM_ENABLE"] = "0"
 
-        # torchrun sets TORCHELASTIC_USE_AGENT_STORE=True which forces all ranks
-        # to be TCPStore clients. We need to unset this for our separate weight
-        # sync process group where rank 0 must be the store master.
-        old_agent_store = os.environ.pop("TORCHELASTIC_USE_AGENT_STORE", None)
-
         rank = 0  # Training is always rank 0
 
         logger.info(
-            f"[Training] Initializing process group: tcp://{self.master_address}:{self.master_port}, "
+            f"[Training] Initializing process group: tcp://{self.master_address}:{self._active_master_port}, "
             f"rank={rank}, world_size={self.world_size}, group_name={self.group_name}"
         )
 
@@ -168,19 +215,9 @@ class NCCLWeightSynchronizer:
         backend_obj = Backend("nccl")
         timeout = default_pg_timeout
 
-        # Create TCPStore directly - rank 0 is the master
-        is_master = rank == 0
-        logger.info(f"[Training] Creating TCPStore (is_master={is_master})...")
-        store = TCPStore(
-            host_name=self.master_address,
-            port=self.master_port,
-            world_size=self.world_size,
-            is_master=is_master,
-            timeout=timeout,
-        )
+        if self._training_prefix_store is None:
+            self._create_training_store()
 
-        # Use PrefixStore with group_name to namespace keys
-        store = PrefixStore(self.group_name, store)
         logger.info("[Training] TCPStore created, creating process group...")
 
         # Handle different PyTorch versions by inspecting the actual signature
@@ -195,22 +232,18 @@ class NCCLWeightSynchronizer:
         torch.cuda.set_device(self.device)
         device_id = torch.device(self.device)
 
-        try:
+        with self._without_torchelastic_agent_store():
             pg, _ = _new_process_group_helper(
                 self.world_size,
                 rank,
                 [],
                 backend_obj,
-                store,
+                self._training_prefix_store,
                 group_name=self.group_name,
                 **{pg_options_param_name: None},
                 timeout=timeout,
                 device_id=device_id,
             )
-        finally:
-            # Restore the environment variable
-            if old_agent_store is not None:
-                os.environ["TORCHELASTIC_USE_AGENT_STORE"] = old_agent_store
 
         _world.pg_group_ranks[pg] = {i: i for i in range(self.world_size)}
 
@@ -233,7 +266,6 @@ class NCCLWeightSynchronizer:
         logger.info("=" * 70)
         logger.info("Initializing NCCL process groups...")
         logger.info("=" * 70)
-        logger.info(f"[Training] NCCL rendezvous: tcp://{self.master_address}:{self.master_port}")
         logger.info(f"[Training] World size: {self.world_size} (1 training + {self.world_size - 1} inference)")
 
         training_error = None
@@ -253,6 +285,13 @@ class NCCLWeightSynchronizer:
         # 3. Run training (rank 0) in main thread - this completes NCCL rendezvous
         # 4. Join inference thread after training completes
 
+        try:
+            self._create_training_store()
+        except Exception as exc:
+            logger.error(f"[Training] Failed to create rendezvous store: {exc}")
+            return False
+
+        logger.info(f"[Training] NCCL rendezvous: tcp://{self.master_address}:{self._active_master_port}")
         logger.info("[Training] Starting inference endpoint initialization in background...")
         inference_thread = Thread(target=init_inference)
         inference_thread.start()
@@ -324,6 +363,8 @@ class NCCLWeightSynchronizer:
                 logger.error(f"Failed to destroy training process group: {e}")
             self.process_group = None
 
+        self._cleanup_training_store()
+
     # ========================================================================
     # Inference endpoint management
     # ========================================================================
@@ -343,7 +384,7 @@ class NCCLWeightSynchronizer:
             url = f"http://{endpoint.host}:{endpoint.port}/init_weights_update_group"
             payload = {
                 "master_address": self.master_address,
-                "master_port": self.master_port,
+                "master_port": self._active_master_port,
                 "rank_offset": rank_offset,
                 "world_size": self.world_size,
                 "group_name": self.group_name,

@@ -645,7 +645,7 @@ async def add_inference_endpoint_endpoint(request: AddInferenceEndpointRequest, 
     Parameters for auto-sync:
     - sync_weights: Whether to sync weights after adding (default: False)
     - master_address: Training server hostname for NCCL rendezvous (auto-detected if not provided)
-    - master_port: Port for NCCL rendezvous (default: 29600)
+    - master_port: Port for NCCL rendezvous (default: 0 for ephemeral)
     - group_name: NCCL process group name (default: weight_sync_group)
     - buffer_size_mb: Transfer bucket size in MB (default: 1024)
     """

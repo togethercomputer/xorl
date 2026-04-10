@@ -330,7 +330,7 @@ class RemoteBackend(Backend):
         self,
         endpoints,
         master_address="localhost",
-        master_port=29600,
+        master_port=0,
         group_name="weight_sync_group",
         buffer_size_mb=1024,
         sync_method="nccl_broadcast",

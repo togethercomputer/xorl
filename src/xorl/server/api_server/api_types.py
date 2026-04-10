@@ -608,7 +608,7 @@ class AddInferenceEndpointRequest(BaseModel):
     master_address: Optional[str] = Field(
         default=None, description="Master address for NCCL rendezvous (auto-detected if not provided)"
     )
-    master_port: int = Field(default=29600, description="Master port for NCCL rendezvous")
+    master_port: int = Field(default=0, description="Master port for NCCL rendezvous (0 selects an ephemeral port)")
     group_name: str = Field(default="weight_sync_group", description="Name of the NCCL process group")
     buffer_size_mb: int = Field(default=1024, description="Size of each transfer bucket in MB (to avoid OOM)")
 
@@ -655,7 +655,7 @@ class SyncInferenceWeightsRequest(BaseModel):
     master_address: str = Field(
         default="", description="Master address for NCCL rendezvous (training server address). Auto-detected if empty."
     )
-    master_port: int = Field(default=29600, description="Master port for NCCL rendezvous")
+    master_port: int = Field(default=0, description="Master port for NCCL rendezvous (0 selects an ephemeral port)")
     group_name: str = Field(default="weight_sync_group", description="Name of the NCCL process group")
     buffer_size_mb: int = Field(default=1024, description="Size of each transfer bucket in MB (to avoid OOM)")
     flush_cache: bool = Field(

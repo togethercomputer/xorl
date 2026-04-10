@@ -99,7 +99,7 @@ class SyncWeightsData:
 
     endpoints: List[Dict[str, Any]] = field(default_factory=list)
     master_address: str = "localhost"
-    master_port: int = 29600
+    master_port: int = 0
     group_name: str = "weight_sync_group"
     buffer_size_mb: int = 1024
     sync_method: str = "nccl_broadcast"

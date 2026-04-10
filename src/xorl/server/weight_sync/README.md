@@ -46,7 +46,7 @@ the command internally via Gloo so all ranks enter the sync together.
 ```python
 resp = requests.post("http://localhost:6000/api/v1/sync_inference_weights", json={
     "master_address": "localhost",   # training server address for NCCL rendezvous
-    "master_port": 29600,            # default
+    "master_port": 0,                # default; asks TCPStore to bind an ephemeral port
     "buffer_size_mb": 1024,          # bucket size; reduce if OOM during sync
     "flush_cache": True,             # flush KV cache after sync (default)
     "pause_mode": "retract",         # "retract" | "abort" | "in_place"
@@ -179,7 +179,7 @@ Populated by the handler from the sync request payload:
 class TransportConfig:
     endpoints: List[EndpointConfig]   # host, port, world_size (TP size)
     master_address: str
-    master_port: int
+    master_port: int                  # 0 selects an ephemeral port on the training rank
     group_name: str
     buffer_size_mb: int
     device: str

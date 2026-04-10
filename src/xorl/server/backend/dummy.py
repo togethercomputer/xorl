@@ -96,7 +96,7 @@ class DummyBackend(Backend):
         return {"status": "awake", "load_time": 0.0}
 
     async def sync_inference_weights(
-        self, endpoints, master_address="localhost", master_port=29600, request_id=None, **kwargs
+        self, endpoints, master_address="localhost", master_port=0, request_id=None, **kwargs
     ):
         return {
             "success": True,

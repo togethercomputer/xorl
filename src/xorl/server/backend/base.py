@@ -126,7 +126,7 @@ class Backend(ABC):
         self,
         endpoints: List[Dict[str, Any]],
         master_address: str = "localhost",
-        master_port: int = 29600,
+        master_port: int = 0,
         request_id: Optional[str] = None,
         **kwargs,
     ) -> Dict[str, Any]:
