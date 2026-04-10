@@ -1,0 +1,6 @@
+[submodule "submodules/xorl-client"]
+	path = submodules/xorl-client
+	url = https://github.com/togethercomputer/xorl-client
+[submodule "submodules/xorl-sglang"]
+	path = submodules/xorl-sglang
+	url = https://github.com/togethercomputer/xorl-sglang

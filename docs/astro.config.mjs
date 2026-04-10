@@ -37,20 +37,42 @@ export default defineConfig({
           ],
         },
         {
-          label: "Server Training",
+          label: "Server Training for RL",
           collapsed: true,
           items: [
             { label: "Overview", slug: "server-training/overview" },
-            { label: "Server Architecture", slug: "server-training/architecture" },
-            { label: "API Reference", slug: "server-training/api-reference" },
-            { label: "RL Training", slug: "server-training/rl-training" },
+            {
+              label: "Training Server (xorl)",
+              collapsed: true,
+              items: [
+                { label: "Launching & Configuration", slug: "server-training/training-server/launching" },
+                { label: "API Reference", slug: "server-training/training-server/api-reference" },
+              ],
+            },
             { label: "Inference: xorl-sglang", slug: "server-training/sglang" },
+            {
+              label: "Client SDK (xorl-client)",
+              collapsed: true,
+              items: [
+                { label: "Overview", slug: "server-training/client-sdk/overview" },
+                { label: "Training Loop Patterns", slug: "server-training/client-sdk/training-loop" },
+                { label: "Loss Functions", slug: "server-training/client-sdk/loss-functions" },
+              ],
+            },
             {
               label: "Weight Sync",
               collapsed: true,
               items: [
                 { label: "Overview", slug: "server-training/weight-sync/overview" },
                 { label: "Backend: nccl_broadcast", slug: "server-training/weight-sync/nccl-broadcast" },
+              ],
+            },
+            {
+              label: "Examples",
+              collapsed: true,
+              items: [
+                { label: "SFT on No Robots", slug: "server-training/examples/sft-no-robots" },
+                { label: "Password Memorization", slug: "server-training/examples/password-memorization" },
               ],
             },
           ],

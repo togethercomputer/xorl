@@ -85,21 +85,25 @@ xorl's training server broadcasts weights to registered inference endpoints usin
 Before syncing, register the inference server's address with xorl:
 
 ```http
-POST /api/v1/add_inference_endpoint
+POST /add_inference_endpoint
 ```
 ```json
-{"host": "inference-node-01", "port": 30000, "world_size": 8}
+{"host": "inference-node-01", "port": 30000, "worker_port": 30000, "world_size": 8}
 ```
 
 Multiple endpoints can be registered (e.g. for multi-replica inference):
 ```python
 for host, port in inference_servers:
-    requests.post(f"{base_url}/api/v1/add_inference_endpoint", json={
-        "host": host, "port": port, "world_size": 8
+    requests.post(f"{base_url}/add_inference_endpoint", json={
+        "host": host,
+        "port": port,
+        "worker_port": port,
+        "world_size": 8,
     })
 ```
 
 Endpoints are deduplicated by `(host, port)` — registering the same endpoint twice is safe.
+For the common same-port xorl-sglang setup, set `worker_port` equal to `port`.
 
 ## Triggering a Sync
 
@@ -131,11 +135,11 @@ The sync is synchronous from the caller's perspective — the endpoint returns o
 ```python
 # Every N RL steps, sync weights to inference
 if rl_step % sync_every == 0:
-    training_client.sync_weights(
+    training_client.sync_inference_weights(
         master_address=TRAINING_HEAD_IP,
         master_port=29600,
         group_name="policy_sync",
-    )
+    ).result()
     # Now SGLang is serving the latest policy weights
 ```
 
@@ -172,7 +176,7 @@ For QLoRA, the sync dequantizes and merges:
 ## Removing Inference Endpoints
 
 ```http
-POST /api/v1/remove_inference_endpoint
+POST /remove_inference_endpoint
 {"host": "inference-node-01", "port": 30000}
 ```
 
@@ -190,7 +194,7 @@ for _ in range(n_steps):
     training_client.optim_step(...)
 
 # Sync and resume inference
-training_client.sync_weights(...)
+training_client.sync_inference_weights(...).result()
 requests.post(f"{inference_url}/wake_up")
 ```
 

@@ -1,3 +1,11 @@
+# Alternative pyproject.toml that pins PyTorch 2.9.1 so that xorl, xorl-client,
+# and xorl-sglang can all be installed in the same environment.
+#
+# Usage:
+#   cp pyproject.sglang.toml pyproject.toml
+#   uv sync                    # (uv)
+#   pip install -e .           # (conda/pip)
+
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
@@ -31,13 +39,15 @@ dependencies = [
   "msgpack",
   "fastapi",
   "xorl-client @ git+https://github.com/togethercomputer/xorl-client.git",
-  # PyTorch 2.10.0 with CUDA 12.9
-  "torch @ https://download.pytorch.org/whl/cu129/torch-2.10.0%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl",
-  "torchvision @ https://download.pytorch.org/whl/cu129/torchvision-0.25.0%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl",
-  "triton @ https://download.pytorch.org/whl/triton-3.6.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+  # PyTorch 2.9.1 with CUDA 12.9 (compatible with xorl-sglang)
+  "torch @ https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl",
+  "torchvision @ https://download.pytorch.org/whl/cu129/torchvision-0.24.1%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl",
+  "triton @ https://download.pytorch.org/whl/triton-3.5.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
   # Flash Attention
-  "flash-attn-3 @ https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.02.17-06dc5e7/flash_attn_3-3.0.0%2B20260217.cu129torch2100cxx11abitrue.fec3a6-cp39-abi3-linux_x86_64.whl",
+  "flash-attn-3 @ https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.02.17-06dc5e7/flash_attn_3-3.0.0%2B20260216.cu129torch291cxx11abitrue.fec3a6-cp39-abi3-linux_x86_64.whl",
   "flash-attn-cute @ git+https://github.com/Dao-AILab/flash-attention.git@5678dd909aca97f925957dab716022046fb1e44f#subdirectory=flash_attn/cute",
+  # Submodule
+  "sglang[all] @ file:submodules/xorl-sglang/python",
 ]
 
 
@@ -50,7 +60,7 @@ dev = [
   {include-group = "test"},
 ]
 lint = [
-  "pre-commit>=4.5,<5",
+  "pre-commit",
   "ruff",
 ]
 test = [
@@ -81,7 +91,7 @@ line-length = 120
 
 [tool.ruff.lint]
 ignore = ["C901", "E501", "E741", "W605", "C408"]
-select = ["C", "E", "F", "I", "W", "PLC0415", "TID253"]
+select = ["C", "E", "F", "I", "W"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["E402", "F401", "F403", "F811"]
@@ -90,13 +100,6 @@ select = ["C", "E", "F", "I", "W", "PLC0415", "TID253"]
 lines-after-imports = 2
 known-first-party = ["xorl"]
 known-third-party = ["torch", "transformers", "wandb"]
-
-[tool.ruff.lint.flake8-tidy-imports]
-banned-module-level-imports = [
-  "wandb",
-  "flash_attn",
-  "liger_kernel.transformers.fused_linear_cross_entropy",
-]
 
 
 [tool.pytest.ini_options]

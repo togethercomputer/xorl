@@ -68,7 +68,7 @@ Start the training server:
 python -m xorl.server.launcher \
     --mode auto \
     --config examples/server/configs/full/qwen3_8b_full.yaml \
-    --api-port 5555
+    --api-port 6000
 ```
 
 Then drive training from a Python client. All training endpoints use a **two-phase async pattern**: the POST returns a `request_id` immediately, and you poll `/api/v1/retrieve_future` to get the actual result.
@@ -77,7 +77,7 @@ Then drive training from a Python client. All training endpoints use a **two-pha
 import requests
 import time
 
-base_url = "http://localhost:5555"
+base_url = "http://localhost:6000"
 
 # Check health
 requests.get(f"{base_url}/health").json()
@@ -106,6 +106,50 @@ future = requests.post(f"{base_url}/api/v1/optim_step", json={
     "gradient_clip": 1.0,
 }).json()
 ```
+
+### Example: SFT on No Robots
+
+[`examples/server/no_robot_sft/`](https://github.com/togethercomputer/xorl-internal/tree/main/examples/server/no_robot_sft) — Supervised fine-tuning on the [No Robots](https://huggingface.co/datasets/HuggingFaceH4/no_robots) dataset using `xorl_client`.
+
+```bash
+# 1. Start the training server
+python -m xorl.server.launcher \
+    --mode auto \
+    --config examples/server/configs/lora/qwen3_8b_lora.yaml \
+    --api-port 6000
+
+# 2. Run the SFT script (in another terminal)
+pip install xorl-client tinker-cookbook
+python examples/server/no_robot_sft/run_sft.py \
+    --config.base_url http://localhost:6000 \
+    --config.model_name Qwen/Qwen3-8B \
+    --config.lora_rank 32
+```
+
+The checked-in server config above uses `Qwen/Qwen3-8B` with LoRA rank 32, so the example overrides the script's older 4B defaults.
+The script uses `xorl_client.TrainingClient` to drive a LoRA SFT loop with online tokenization, linear LR decay, periodic checkpointing, and per-token NLL validation.
+
+### Example: Password Memorization (end-to-end weight sync)
+
+[`examples/server/password_memorization/`](https://github.com/togethercomputer/xorl-internal/tree/main/examples/server/password_memorization) — End-to-end test for the training → weight sync → inference pipeline. Trains a model to memorize 3 secret codes via SFT, syncs weights to a running xorl-sglang instance, and queries inference to verify recall.
+
+```bash
+# 1. Start the training server
+python -m xorl.server.launcher \
+    --mode auto \
+    --config examples/server/configs/full/qwen3_8b_full.yaml \
+    --api-port 6000
+
+# 2. Start xorl-sglang inference (in another terminal)
+python -m sglang.launch_server \
+    --model-path Qwen/Qwen3-8B-FP8 --port 30000
+
+# 3. Run the test (in another terminal)
+python examples/server/password_memorization/run_password_test.py \
+    --model Qwen/Qwen3-8B --steps 16 --lr 1e-5
+```
+
+Supports all training modes (full, LoRA, QLoRA nvfp4/block_fp8/nf4), LR schedules (constant, cosine, warmup+cosine), and FP8 weight sync re-quantization. See the [example README](https://github.com/togethercomputer/xorl-internal/tree/main/examples/server/password_memorization/README.md) for the full test matrix across Qwen3-8B, Qwen3-30B, and Qwen3-235B.
 
 ## LoRA Fine-tuning
 
