@@ -7,7 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .experts import MoEExperts
-from .lora import inject_lora_into_experts
 from .router import TopKRouter
 from .routing_replay import RoutingReplay, get_replay_stage
 
@@ -104,6 +103,7 @@ class MoEBlock(nn.Module):
             hybrid_shared: If True, share ``lora_A`` for gate/up and
                 ``lora_B`` for down across experts.
         """
+        from .lora import inject_lora_into_experts  # noqa: PLC0415
 
         inject_lora_into_experts(
             self,

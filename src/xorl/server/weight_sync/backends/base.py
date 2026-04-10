@@ -40,7 +40,7 @@ To support this, the backend exposes:
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, FrozenSet, List, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 import torch
 
