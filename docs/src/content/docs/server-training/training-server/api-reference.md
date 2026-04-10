@@ -28,8 +28,8 @@ All endpoints are served at `http://<host>:<port>/`. Training operations use a t
 | `POST` | `/api/v1/unload_model` | Unload a session, freeing associated adapter state. |
 | `POST` | `/api/v1/kill_session` | Kill an active session; optionally reload weights from checkpoint. |
 | `GET` | `/api/v1/session_info` | List active sessions and their state. |
-| `POST` | `/api/v1/create_session` | Tinker compatibility stub. Returns a `session_id` but does not register a model session. |
-| `POST` | `/api/v1/session_heartbeat` | Tinker compatibility stub; currently a no-op. |
+| `POST` | `/api/v1/create_session` | Create and register a Tinker-compatible session ID for follow-up calls. |
+| `POST` | `/api/v1/session_heartbeat` | Refresh a session's last-activity timestamp for idle cleanup. |
 
 ## Checkpointing
 

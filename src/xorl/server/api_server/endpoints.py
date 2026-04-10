@@ -17,6 +17,8 @@ from xorl.server.api_server.api_types import (
     CreateModelResponse,
     CreateSamplingSessionRequest,
     CreateSamplingSessionResponse,
+    CreateSessionRequest,
+    CreateSessionResponse,
     DeleteCheckpointRequest,
     DeleteCheckpointResponse,
     ErrorResponse,
@@ -35,6 +37,8 @@ from xorl.server.api_server.api_types import (
     RemoveInferenceEndpointResponse,
     SaveWeightsForSamplerRequest,
     SaveWeightsRequest,
+    SessionHeartbeatRequest,
+    SessionHeartbeatResponse,
     SessionInfoResponse,
     SetSyncQuantizationRequest,
     SetSyncQuantizationResponse,
@@ -47,6 +51,7 @@ from xorl.server.api_server.api_types import (
     WeightsInfoRequest,
     WeightsInfoResponse,
 )
+from xorl.server.api_server.utils import validate_model_id
 from xorl.server.protocol.api_orchestrator import OrchestratorRequest
 from xorl.server.protocol.operations import KillSessionData
 
@@ -784,22 +789,76 @@ async def create_sampling_session_endpoint(request: CreateSamplingSessionRequest
 # ============================================================================
 
 
-@router.post("/api/v1/create_session", tags=["Tinker Compatibility"])
-async def create_session_endpoint():
-    """Stub for tinker SDK session creation."""
-    return {
-        "type": "create_session",
-        "session_id": str(uuid.uuid4()),
-        "info_message": None,
-        "warning_message": None,
-        "error_message": None,
-    }
+@router.post(
+    "/api/v1/create_session",
+    response_model=CreateSessionResponse,
+    responses={
+        400: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
+    tags=["Tinker Compatibility"],
+)
+async def create_session_endpoint(
+    request: CreateSessionRequest | None = None,
+    server=Depends(require_api_server),
+):
+    """Create and register a usable Tinker-compatible session."""
+    if request is None:
+        request = CreateSessionRequest()
+
+    session_id = validate_model_id(request.session_id) if request.session_id else str(uuid.uuid4())
+    already_registered = session_id in server.registered_model_ids
+
+    server.registered_model_ids.add(session_id)
+
+    model_config = server.model_configs.setdefault(
+        session_id,
+        {
+            "base_model": request.base_model or server.base_model or "unknown",
+            "lora_config": request.lora_config,
+        },
+    )
+
+    if request.base_model:
+        model_config["base_model"] = request.base_model
+    if request.lora_config:
+        model_config["lora_config"] = request.lora_config
+
+    server._update_session_activity(session_id)
+
+    warning_message = None
+    info_message = f"Session '{session_id}' registered successfully."
+    if already_registered:
+        info_message = f"Session '{session_id}' refreshed successfully."
+        warning_message = f"Session '{session_id}' already existed; refreshed activity timestamp."
+
+    return CreateSessionResponse(
+        session_id=session_id,
+        info_message=info_message,
+        warning_message=warning_message,
+        error_message=None,
+    )
 
 
-@router.post("/api/v1/session_heartbeat", tags=["Tinker Compatibility"])
-async def session_heartbeat_endpoint():
-    """Stub for tinker SDK session heartbeat."""
-    return {"type": "session_heartbeat"}
+@router.post(
+    "/api/v1/session_heartbeat",
+    response_model=SessionHeartbeatResponse,
+    responses={
+        400: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
+    tags=["Tinker Compatibility"],
+)
+async def session_heartbeat_endpoint(request: SessionHeartbeatRequest, server=Depends(require_api_server)):
+    """Refresh a session's last-activity timestamp for idle cleanup."""
+    session_id = validate_model_id(request.session_id)
+
+    if session_id not in server.registered_model_ids:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Session {session_id} not found")
+
+    server._update_session_activity(session_id)
+    return SessionHeartbeatResponse(session_id=session_id)
 
 
 @router.get("/api/v1/healthz", tags=["Tinker Compatibility"])

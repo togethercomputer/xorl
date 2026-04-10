@@ -110,6 +110,25 @@ The [xorl-client](/server-training/client-sdk/overview/) Python SDK drives the t
 
 ---
 
+## Tinker API Compatibility
+
+Tinker clients can create a usable session with `POST /api/v1/create_session`. The returned
+`session_id` is registered as xorl's backing `model_id`, so follow-up requests may send either
+`session_id` (Tinker-style) or `model_id` (xorl-native), and the server normalizes both forms.
+
+| Endpoint | Description |
+|---|---|
+| `POST /api/v1/create_session` | Create/register a Tinker-compatible session ID |
+| `POST /api/v1/session_heartbeat` | Refresh a session's idle timeout |
+| `POST /api/v1/create_model` | Create/register a model session with explicit metadata |
+| `POST /api/v1/unload_model` | Unload and release a session |
+| `POST /api/v1/forward_backward` | Forward + backward pass |
+| `POST /api/v1/optim_step` | Optimizer step |
+| `POST /api/v1/weights_info` | Checkpoint metadata for model loading |
+| `GET /api/v1/training_runs` | List training runs |
+
+---
+
 ## Recommended Reading
 
 XoRL's server training mode is designed for online RL with LLMs. The following papers provide background on the algorithms and system designs that XoRL supports:

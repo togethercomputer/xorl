@@ -5,14 +5,11 @@ Tests validation, serialization, and edge cases for the updated API structure.
 """
 
 import pytest
-
-
-pytestmark = [pytest.mark.cpu, pytest.mark.server]
-
 from pydantic import ValidationError
 
 from xorl.server.api_server.api_types import (
     AdamParams,
+    CreateModelRequest,
     Datum,
     DatumInput,
     ErrorResponse,
@@ -29,6 +26,9 @@ from xorl.server.api_server.api_types import (
     SaveWeightsRequest,
     SaveWeightsResponse,
 )
+
+
+pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
 
 class TestDatumAndForwardBackward:
@@ -89,6 +89,14 @@ class TestDatumAndForwardBackward:
         )
         assert request.model_id == "default"
         assert request.forward_backward_input.loss_fn == "causallm_loss"
+
+        request = ForwardBackwardRequest(
+            session_id="session-123",
+            forward_backward_input=DatumInput(
+                data=[Datum(model_input={"input_ids": [1, 2, 3]}, loss_fn_inputs={"labels": [2, 3, 4]})],
+            ),
+        )
+        assert request.model_id == "session-123"
 
         request = ForwardBackwardRequest(
             forward_backward_input=DatumInput(
@@ -167,6 +175,8 @@ class TestOptimWeightsHealthAndSerialization:
         request = SaveWeightsRequest(model_id="test-model", path="/tmp/checkpoint")
         assert request.model_id == "test-model"
         assert request.path == "/tmp/checkpoint"
+        request = SaveWeightsRequest(session_id="session-123", path="/tmp/checkpoint")
+        assert request.model_id == "session-123"
         request = SaveWeightsRequest()
         assert request.model_id == "default"
         assert request.path is None
@@ -180,11 +190,22 @@ class TestOptimWeightsHealthAndSerialization:
         # LoadWeightsRequest
         request = LoadWeightsRequest(model_id="test-model", path="/tmp/checkpoint", optimizer=True)
         assert request.optimizer is True
+        request = LoadWeightsRequest(session_id="session-123", path="/tmp/checkpoint")
+        assert request.model_id == "session-123"
         request = LoadWeightsRequest(path="/tmp/checkpoint")
         assert request.model_id == "default"
         assert request.optimizer is True
         with pytest.raises(ValidationError):
             LoadWeightsRequest()
+
+        # CreateModelRequest
+        request = CreateModelRequest(
+            session_id="session-123",
+            base_model="Qwen/Qwen3-8B",
+            lora_config={"rank": 64},
+        )
+        assert request.model_id == "session-123"
+        assert request.lora_config["lora_rank"] == 64
 
         # LoadWeightsResponse
         response = LoadWeightsResponse(path="xorl://default/weights/checkpoint-001")

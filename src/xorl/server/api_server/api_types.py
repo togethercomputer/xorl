@@ -9,6 +9,20 @@ from typing import Any, Dict, List, Literal, Optional, Union
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
 
+def _map_session_id_to_model_id(data: Any) -> Any:
+    """Accept Tinker's session_id field anywhere xorl expects model_id."""
+    if isinstance(data, dict) and "session_id" in data and "model_id" not in data:
+        data["model_id"] = data["session_id"]
+    return data
+
+
+def _map_model_id_to_session_id(data: Any) -> Any:
+    """Accept xorl's model_id field anywhere the Tinker endpoint expects session_id."""
+    if isinstance(data, dict) and "model_id" in data and "session_id" not in data:
+        data["session_id"] = data["model_id"]
+    return data
+
+
 # ============================================================================
 # Two-Phase Async Response Types
 # ============================================================================
@@ -180,10 +194,17 @@ class ForwardRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     model_id: str = Field(
-        default="default", description="Model identifier (must be created via /api/v1/create_model first)"
+        default="default",
+        description="Model identifier (must be created via /api/v1/create_model or /api/v1/create_session first)",
     )
     seq_id: Optional[int] = Field(default=None, description="Sequence ID for request ordering")
     forward_input: DatumInput = Field(..., description="Forward input data")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_tinker_fields(cls, data):
+        """Map tinker's session_id to model_id."""
+        return _map_session_id_to_model_id(data)
 
 
 class ForwardResponse(BaseModel):
@@ -206,13 +227,20 @@ class ForwardBackwardRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     model_id: str = Field(
-        default="default", description="Model identifier (must be created via /api/v1/create_model first)"
+        default="default",
+        description="Model identifier (must be created via /api/v1/create_model or /api/v1/create_session first)",
     )
     seq_id: Optional[int] = Field(
         default=None,
         description="Sequence ID for request ordering (ensures forward_backward executes before optim_step)",
     )
     forward_backward_input: DatumInput = Field(..., description="Forward-backward input data")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_tinker_fields(cls, data):
+        """Map tinker's session_id to model_id."""
+        return _map_session_id_to_model_id(data)
 
 
 class ForwardBackwardResponse(BaseModel):
@@ -230,7 +258,8 @@ class OptimStepRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     model_id: str = Field(
-        default="default", description="Model identifier (must be created via /api/v1/create_model first)"
+        default="default",
+        description="Model identifier (must be created via /api/v1/create_model or /api/v1/create_session first)",
     )
     seq_id: Optional[int] = Field(
         default=None,
@@ -238,6 +267,12 @@ class OptimStepRequest(BaseModel):
     )
     adam_params: AdamParams = Field(default_factory=AdamParams, description="AdamW optimizer parameters")
     gradient_clip: Optional[float] = Field(default=None, description="Gradient clipping value")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_tinker_fields(cls, data):
+        """Map tinker's session_id to model_id."""
+        return _map_session_id_to_model_id(data)
 
 
 class OptimStepResponse(BaseModel):
@@ -263,12 +298,20 @@ class SaveWeightsRequest(BaseModel):
     Endpoint: POST /api/v1/save_weights
     """
 
+    model_config = ConfigDict(extra="ignore")
+
     model_id: str = Field(default="default", description="Model identifier")
     path: Optional[str] = Field(
         default=None, description="Checkpoint name (e.g., 'checkpoint-001'). Auto-generated if not specified."
     )
     seq_id: Optional[int] = Field(default=None, description="Sequence ID for request ordering")
     # Note: save_optimizer is always True - we always save full state for checkpointing
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_tinker_fields(cls, data):
+        """Map tinker's session_id to model_id."""
+        return _map_session_id_to_model_id(data)
 
 
 class SaveWeightsResponse(BaseModel):
@@ -287,10 +330,18 @@ class LoadWeightsRequest(BaseModel):
     Endpoint: POST /api/v1/load_weights
     """
 
+    model_config = ConfigDict(extra="ignore")
+
     model_id: str = Field(default="default", description="Model identifier")
     path: str = Field(..., description="Xorl URI to load from (e.g., xorl://default/weights/checkpoint-001)")
     optimizer: bool = Field(default=True, description="Whether to load optimizer state")
     seq_id: Optional[int] = Field(default=None, description="Sequence ID for request ordering")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_tinker_fields(cls, data):
+        """Map tinker's session_id to model_id."""
+        return _map_session_id_to_model_id(data)
 
 
 class LoadWeightsResponse(BaseModel):
@@ -335,9 +386,8 @@ class CreateModelRequest(BaseModel):
     @classmethod
     def _map_tinker_fields(cls, data):
         """Map tinker's session_id to model_id if model_id not provided."""
+        data = _map_session_id_to_model_id(data)
         if isinstance(data, dict):
-            if "session_id" in data and "model_id" not in data:
-                data["model_id"] = data["session_id"]
             # Tinker sends lora_config with "rank" key; normalize to also include lora_rank
             lora_cfg = data.get("lora_config")
             if isinstance(lora_cfg, dict) and "rank" in lora_cfg and "lora_rank" not in lora_cfg:
@@ -352,11 +402,53 @@ class CreateModelResponse(BaseModel):
     type: Literal["create_model"] = Field(default="create_model", description="Response type identifier")
 
 
+class CreateSessionRequest(BaseModel):
+    """API request for creating a Tinker-compatible session.
+
+    The request body may be empty. If session_id is omitted, the server generates one.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    session_id: Optional[str] = Field(default=None, description="Optional session identifier to register")
+    base_model: Optional[str] = Field(default=None, description="Optional base model metadata for this session")
+    lora_config: Dict[str, Any] = Field(default_factory=dict, description="Optional LoRA metadata for this session")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_lora_config(cls, data):
+        """Normalize optional LoRA metadata for parity with create_model."""
+        data = _map_model_id_to_session_id(data)
+        if isinstance(data, dict):
+            lora_cfg = data.get("lora_config")
+            if isinstance(lora_cfg, dict) and "rank" in lora_cfg and "lora_rank" not in lora_cfg:
+                lora_cfg["lora_rank"] = lora_cfg["rank"]
+        return data
+
+
+class CreateSessionResponse(BaseModel):
+    """API response for creating a Tinker-compatible session."""
+
+    type: Literal["create_session"] = Field(default="create_session", description="Response type identifier")
+    session_id: str = Field(..., description="Registered session identifier")
+    info_message: Optional[str] = Field(default=None, description="Informational message")
+    warning_message: Optional[str] = Field(default=None, description="Warning message")
+    error_message: Optional[str] = Field(default=None, description="Error message")
+
+
 class UnloadModelRequest(BaseModel):
     """API request for unloading a model (Tinker-compatible)."""
 
+    model_config = ConfigDict(extra="ignore")
+
     model_id: str = Field(..., description="Model identifier to unload")
     type: Literal["unload_model"] = Field(default="unload_model", description="Request type identifier")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_tinker_fields(cls, data):
+        """Map tinker's session_id to model_id."""
+        return _map_session_id_to_model_id(data)
 
 
 class UnloadModelResponse(BaseModel):
@@ -364,6 +456,27 @@ class UnloadModelResponse(BaseModel):
 
     model_id: str = Field(..., description="Model identifier that was unloaded")
     type: Optional[Literal["unload_model"]] = Field(default=None, description="Response type identifier")
+
+
+class SessionHeartbeatRequest(BaseModel):
+    """API request for session heartbeat / idle timeout refresh."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    session_id: str = Field(..., description="Session identifier to refresh")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_xorl_fields(cls, data):
+        """Accept model_id as an alias for session_id on the heartbeat endpoint."""
+        return _map_model_id_to_session_id(data)
+
+
+class SessionHeartbeatResponse(BaseModel):
+    """API response for session heartbeat."""
+
+    type: Literal["session_heartbeat"] = Field(default="session_heartbeat", description="Response type identifier")
+    session_id: str = Field(..., description="Session identifier that was refreshed")
 
 
 class SessionInfoResponse(BaseModel):
@@ -398,12 +511,20 @@ class SessionInfoResponse(BaseModel):
 class SaveAdapterStateRequest(BaseModel):
     """API request for saving adapter state (weights + optimizer)."""
 
+    model_config = ConfigDict(extra="ignore")
+
     model_id: str = Field(..., description="Adapter/session identifier to save")
     path: Optional[str] = Field(
         default=None, description="Directory to save adapter state to. Auto-generated if not specified."
     )
     save_optimizer: bool = Field(default=True, description="Whether to save optimizer state for resuming training")
     seq_id: Optional[int] = Field(default=None, description="Sequence ID for request ordering")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_tinker_fields(cls, data):
+        """Map tinker's session_id to model_id."""
+        return _map_session_id_to_model_id(data)
 
 
 class SaveAdapterStateResponse(BaseModel):
@@ -432,10 +553,19 @@ class RegisterWorkersResponse(BaseModel):
 class SaveWeightsForSamplerRequest(BaseModel):
     """API request for saving weights in inference-compatible format."""
 
+    model_config = ConfigDict(extra="ignore")
+
     model_id: str = Field(
-        default="default", description="Model identifier (must be created via /api/v1/create_model first)"
+        default="default",
+        description="Model identifier (must be created via /api/v1/create_model or /api/v1/create_session first)",
     )
     name: str = Field(..., description="Checkpoint name (e.g., 'step-100')")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_tinker_fields(cls, data):
+        """Map tinker's session_id to model_id."""
+        return _map_session_id_to_model_id(data)
 
 
 class SaveWeightsForSamplerResponse(BaseModel):
@@ -466,7 +596,15 @@ class CheckpointInfo(BaseModel):
 class ListCheckpointsRequest(BaseModel):
     """API request for listing checkpoints."""
 
+    model_config = ConfigDict(extra="ignore")
+
     model_id: str = Field(default="default", description="Model identifier")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_tinker_fields(cls, data):
+        """Map tinker's session_id to model_id."""
+        return _map_session_id_to_model_id(data)
 
 
 class ListCheckpointsResponse(BaseModel):
@@ -486,10 +624,18 @@ class DeleteCheckpointRequest(BaseModel):
     - 'sampler_weights/{name}' for sampler checkpoints (flat, no model_id)
     """
 
+    model_config = ConfigDict(extra="ignore")
+
     model_id: str = Field(default="default", description="Model identifier (used for training checkpoints)")
     checkpoint_id: str = Field(
         ..., description="Checkpoint ID to delete (e.g., 'weights/model_id/ckpt-001' or 'sampler_weights/adapter-001')"
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_tinker_fields(cls, data):
+        """Map tinker's session_id to model_id."""
+        return _map_session_id_to_model_id(data)
 
 
 class DeleteCheckpointResponse(BaseModel):
@@ -513,9 +659,17 @@ class KillSessionRequest(BaseModel):
     start a new one.
     """
 
+    model_config = ConfigDict(extra="ignore")
+
     model_id: str = Field(..., description="Session to kill (must match active session)")
     save_checkpoint: bool = Field(default=True, description="Save checkpoint before killing")
     reset_weights: bool = Field(default=False, description="Reload base model weights after killing session")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_tinker_fields(cls, data):
+        """Map tinker's session_id to model_id."""
+        return _map_session_id_to_model_id(data)
 
 
 class KillSessionResponse(BaseModel):

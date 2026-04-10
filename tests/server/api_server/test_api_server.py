@@ -5,21 +5,28 @@ Tests focus on server initialization and configuration validation.
 Integration tests with Orchestrator are excluded as they require complex infrastructure.
 """
 
+import asyncio
+import time
+
 import pytest
-
-
-pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
 from xorl.server.api_server.api_types import (
     AdamParams,
+    CreateSessionRequest,
     Datum,
     DatumInput,
     ForwardBackwardRequest,
     LoadWeightsRequest,
     OptimStepRequest,
     SaveWeightsRequest,
+    SessionHeartbeatRequest,
+    UntypedAPIFuture,
 )
-from xorl.server.api_server.server import APIServer
+from xorl.server.api_server.endpoints import create_session_endpoint, save_weights_endpoint, session_heartbeat_endpoint
+from xorl.server.api_server.server import APIServer, app
+
+
+pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
 
 class TestAPIServerConfiguration:
@@ -104,6 +111,70 @@ class TestAPIRequestCreationAndSerialization:
         request = LoadWeightsRequest(path="/tmp/checkpoint", optimizer=True)
         assert request.optimizer is True
 
+class TestTinkerSessionCompatibility:
+    """Test Tinker-compatible session creation and heartbeats."""
 
+    def test_tinker_session_endpoints_are_public_in_openapi(self):
+        """The repaired Tinker session endpoints should stay in the public schema."""
+        app.openapi_schema = None
+        schema_paths = app.openapi()["paths"]
+
+        assert "/api/v1/create_session" in schema_paths
+        assert "/api/v1/session_heartbeat" in schema_paths
+
+    def test_create_session_registers_usable_session_id(self, tmp_path):
+        """Returned session IDs should work in follow-up calls that send session_id."""
+        server = APIServer(
+            engine_input_addr="tcp://127.0.0.1:17010",
+            engine_output_addr="tcp://127.0.0.1:17011",
+            output_dir=str(tmp_path),
+        )
+        seen_model_ids = []
+
+        async def fake_submit_save_weights_async(request):
+            seen_model_ids.append(request.model_id)
+            return UntypedAPIFuture(request_id="req-1", model_id=request.model_id)
+
+        server.submit_save_weights_async = fake_submit_save_weights_async
+
+        create_response = asyncio.run(create_session_endpoint(CreateSessionRequest(), server=server))
+        session_id = create_response.session_id
+
+        assert session_id in server.registered_model_ids
+        assert session_id in server.session_last_activity
+
+        save_response = asyncio.run(
+            save_weights_endpoint(
+                SaveWeightsRequest(session_id=session_id, path="checkpoint-001"),
+                server=server,
+            )
+        )
+
+        assert seen_model_ids == [session_id]
+        assert save_response.request_id == "req-1"
+        assert save_response.model_id == session_id
+
+    def test_session_heartbeat_refreshes_activity(self):
+        """Heartbeats should update the activity timestamp for registered sessions."""
+        server = APIServer(
+            engine_input_addr="tcp://127.0.0.1:17012",
+            engine_output_addr="tcp://127.0.0.1:17013",
+        )
+
+        session_id = "heartbeat-session"
+        asyncio.run(create_session_endpoint(CreateSessionRequest(session_id=session_id), server=server))
+        initial_activity = server.session_last_activity[session_id]
+
+        time.sleep(0.01)
+
+        heartbeat_response = asyncio.run(
+            session_heartbeat_endpoint(
+                SessionHeartbeatRequest(session_id=session_id),
+                server=server,
+            )
+        )
+
+        assert heartbeat_response.session_id == session_id
+        assert server.session_last_activity[session_id] > initial_activity
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
