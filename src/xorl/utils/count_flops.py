@@ -9,6 +9,17 @@ from .device import get_device_name
 logger = logging.get_logger(__name__)
 
 
+def _attention_score_elements(batch_seqlens: List[int], causal: bool) -> int:
+    """Return attended query-key elements across a batch of packed sequences.
+
+    Decoder self-attention is lower-triangular, so the quadratic term is
+    ``s * (s + 1) / 2`` per sequence instead of ``s * s``.
+    """
+    if causal:
+        return sum(seqlen * (seqlen + 1) // 2 for seqlen in batch_seqlens)
+    return sum(seqlen * seqlen for seqlen in batch_seqlens)
+
+
 def _gc_multipliers(
     gc_enabled: bool,
     recompute_modules: Optional[List[str]],
@@ -26,7 +37,7 @@ def _gc_multipliers(
 
     Returns a dict with keys:
         attn_linear  - Q/K/V/O projection FLOPs multiplier
-        attn_qkv     - attention softmax/QK^T/SV FLOPs multiplier
+        attn_qkv     - attention QK^T/SV training FLOPs multiplier per attended element
         router       - MoE gate router multiplier
         gate         - MoE gate_proj multiplier
         up           - MoE up_proj multiplier
@@ -93,14 +104,12 @@ class XorlFlopsCounter:
         # all_reduce(sum, dp) / world_size gives correct per-GPU TFlops.
         self._cp_size = cp_size
         self.estimate_func = {
-            "qwen2_vl": self._estimate_qwen2_vl_flops,
             # the only difference between Qwen2 and Qwen2.5 for counting flops is the window attention
             # used in the ViT for Qwen2.5VL which is considered in the _estimate_qwen2_vl_flops function.
             "qwen2_5_vl": self._estimate_qwen2_vl_flops,
             "deepseek_v3": self._estimate_deepseek_v3_flops,
             "qwen3_moe": self._estimate_qwen3_moe_flops,
             "llama": self._estimate_llama_flops,
-            "qwen2": self._estimate_qwen2_flops,
             # qwen3 reused _estimate_qwen2_flops func because the only model structure diff between qwen2 dense and qwen3 dense is that
             # qwen3 has additional RMSNorm layers for q and k.
             # RMSNorm layers have minimal impact at the MFU and can be ignored.
@@ -162,8 +171,8 @@ class XorlFlopsCounter:
             + 6 * embed_lm_N * tokens_sum
         )
 
-        seqlen_square_sum = sum(s * s * num_hidden_layers for s in batch_seqlens)
-        attn_qkv_flops = m["attn_qkv"] * seqlen_square_sum * q_head_dim * num_query_heads
+        attn_score_elements = _attention_score_elements(batch_seqlens, causal=True)
+        attn_qkv_flops = m["attn_qkv"] * attn_score_elements * q_head_dim * num_query_heads * num_hidden_layers
 
         return (dense_N_flops + attn_qkv_flops) / delta_time / 1e12
 
@@ -201,8 +210,8 @@ class XorlFlopsCounter:
         dense_N_flops = per_layer_flops * num_hidden_layers + 6 * embed_lm_N * tokens_sum
 
         # Attention QKV FLOPs (quadratic in sequence length)
-        seqlen_square_sum = sum(s * s for s in batch_seqlens)
-        attn_qkv_flops = m["attn_qkv"] * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+        attn_score_elements = _attention_score_elements(batch_seqlens, causal=True)
+        attn_qkv_flops = m["attn_qkv"] * attn_score_elements * head_dim * num_attention_heads * num_hidden_layers
 
         flops_all_token = dense_N_flops + attn_qkv_flops
         return flops_all_token / delta_time / 1e12
@@ -264,8 +273,8 @@ class XorlFlopsCounter:
             + 6 * embed_lm_N * tokens_sum
         )
 
-        seqlen_square_sum = sum(s * s for s in batch_seqlens)
-        attn_qkv_flops = m["attn_qkv"] * seqlen_square_sum * head_dim * num_attention_heads * full_attn_layers
+        attn_score_elements = _attention_score_elements(batch_seqlens, causal=True)
+        attn_qkv_flops = m["attn_qkv"] * attn_score_elements * head_dim * num_attention_heads * full_attn_layers
 
         return (dense_N_flops + attn_qkv_flops) / delta_time / 1e12
 
@@ -335,8 +344,8 @@ class XorlFlopsCounter:
             + 6 * embed_lm_N * tokens_sum
         )
 
-        seqlen_square_sum = sum(s * s for s in batch_seqlens)
-        attn_qkv_flops = m["attn_qkv"] * seqlen_square_sum * head_dim * num_attention_heads * full_attn_layers
+        attn_score_elements = _attention_score_elements(batch_seqlens, causal=True)
+        attn_qkv_flops = m["attn_qkv"] * attn_score_elements * head_dim * num_attention_heads * full_attn_layers
 
         return (dense_N_flops + attn_qkv_flops) / delta_time / 1e12
 
@@ -361,8 +370,8 @@ class XorlFlopsCounter:
         per_layer_flops = m["dense_mlp"] * mlp_N * tokens_sum + m["attn_linear"] * attn_linear_N * tokens_sum
         dense_N_flops = per_layer_flops * num_hidden_layers + 6 * embed_lm_N * tokens_sum
 
-        seqlen_square_sum = sum(s * s for s in batch_seqlens)
-        attn_qkv_flops = m["attn_qkv"] * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+        attn_score_elements = _attention_score_elements(batch_seqlens, causal=True)
+        attn_qkv_flops = m["attn_qkv"] * attn_score_elements * head_dim * num_attention_heads * num_hidden_layers
 
         flops_all_token = dense_N_flops + attn_qkv_flops
         return flops_all_token / delta_time / 1e12
@@ -394,10 +403,8 @@ class XorlFlopsCounter:
         dense_N_flops = 6 * dense_N * tokens_sum
 
         # attn all_layer & all_token fwd & bwd flops
-        seqlen_square_sum = 0
-        for seqlen in batch_seqlens:
-            seqlen_square_sum += seqlen * seqlen
-        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
+        attn_score_elements = _attention_score_elements(batch_seqlens, causal=True)
+        attn_qkv_flops = 12 * attn_score_elements * head_dim * num_attention_heads * num_hidden_layers
 
         # vit flops
         image_seqlens = kargs.get("image_seqlens", None)
@@ -457,10 +464,8 @@ class XorlFlopsCounter:
         window_attn_layer_num = config.depth - full_attn_layer_num
 
         # full attn layer & all_token fwd & bwd flops
-        seqlen_square_sum = 0
-        for seqlen in image_seqlens:
-            seqlen_square_sum += seqlen * seqlen
-        attn_qkv_flops = 12 * seqlen_square_sum * head_dim * num_heads * full_attn_layer_num
+        attn_score_elements = _attention_score_elements(image_seqlens, causal=False)
+        attn_qkv_flops = 12 * attn_score_elements * head_dim * num_heads * full_attn_layer_num
 
         # If window attention is used, add the window attention flops
         if window_attn_layer_num > 0:
