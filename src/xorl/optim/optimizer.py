@@ -6,18 +6,15 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 from torch.distributed._tensor import DTensor
-from torch.distributed.checkpoint.state_dict import (
-    StateDictOptions,
-    get_optimizer_state_dict,
-    set_optimizer_state_dict,
-)
-from torch.distributed.checkpoint.stateful import Stateful
 from torch.optim import AdamW
 from torch.optim.optimizer import Optimizer
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
+from .anyprecision_adamw import AnyPrecisionAdamW
+from .multi_optimizer import MultiOptimizer
 from .muon import Muon
+from .signsgd import SignSGD
 
 
 logger = logging.get_logger(__name__)
@@ -26,244 +23,6 @@ logger = logging.get_logger(__name__)
 # (i.e., they should always use AdamW even when optimizer_type="muon").
 _MUON_EXCLUDE_MODULE_TYPES = {"Embedding"}
 _MUON_EXCLUDE_PARAM_PATTERNS = {"embed_tokens", "lm_head", "norm", "gate.weight"}
-
-
-# https://github.com/meta-llama/llama-recipes/blob/v0.0.4/src/llama_recipes/policies/anyprecision_optimizer.py
-class SignSGD(Optimizer):
-    """Sign-based SGD optimizer with no optimizer-state tensors."""
-
-    def __init__(
-        self,
-        params,
-        lr: float = 1e-3,
-        weight_decay: float = 0.0,
-    ):
-        if lr < 0.0:
-            raise ValueError(f"Invalid learning rate: {lr}")
-        if weight_decay < 0.0:
-            raise ValueError(f"Invalid weight_decay: {weight_decay}")
-
-        defaults = {
-            "lr": lr,
-            "weight_decay": weight_decay,
-        }
-        super().__init__(params, defaults)
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        """Perform a single optimization step."""
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        for group in self.param_groups:
-            lr = group["lr"]
-            weight_decay = group["weight_decay"]
-
-            for p in group["params"]:
-                grad = p.grad
-                if grad is None:
-                    continue
-                if grad.is_sparse:
-                    raise RuntimeError("SignSGD does not support sparse gradients.")
-
-                if weight_decay:
-                    p.add_(p, alpha=-lr * weight_decay)
-
-                p.add_(torch.sign(grad), alpha=-lr)
-
-        return loss
-
-
-class AnyPrecisionAdamW(Optimizer):
-    def __init__(
-        self,
-        params,
-        lr=1e-3,
-        betas=(0.9, 0.95),
-        eps=1e-8,
-        weight_decay=0.0,
-        use_kahan_summation=False,
-        momentum_dtype=torch.bfloat16,
-        variance_dtype=torch.bfloat16,
-        compensation_buffer_dtype=torch.bfloat16,
-    ):
-        defaults = {
-            "lr": lr,
-            "betas": betas,
-            "eps": eps,
-            "weight_decay": weight_decay,
-            "use_kahan_summation": use_kahan_summation,
-            "momentum_dtype": momentum_dtype,
-            "variance_dtype": variance_dtype,
-            "compensation_buffer_dtype": compensation_buffer_dtype,
-        }
-        super().__init__(params, defaults)
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        """
-        Performs a single optimization step.
-
-        Args:
-            closure (callable, optional): A closure that reevaluates the model and returns the loss.
-        """
-
-        if closure is not None:
-            with torch.enable_grad():
-                closure()
-
-        for group in self.param_groups:
-            beta1, beta2 = group["betas"]
-            lr = group["lr"]
-            weight_decay = group["weight_decay"]
-            eps = group["eps"]
-            use_kahan_summation = group["use_kahan_summation"]
-
-            momentum_dtype = group["momentum_dtype"]
-            variance_dtype = group["variance_dtype"]
-            compensation_buffer_dtype = group["compensation_buffer_dtype"]
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-
-                if p.grad.is_sparse:
-                    raise RuntimeError("AnyPrecisionAdamW does not support sparse gradients.")
-
-                state = self.state[p]
-                # State initialization
-                if len(state) == 0:
-                    state["step"] = torch.tensor(0.0)
-
-                    # momentum - EMA of gradient values
-                    state["exp_avg"] = torch.zeros_like(p, dtype=momentum_dtype)
-
-                    # variance uncentered - EMA of squared gradient values
-                    state["exp_avg_sq"] = torch.zeros_like(p, dtype=variance_dtype)
-
-                    # optional Kahan summation - accumulated error tracker
-                    if use_kahan_summation:
-                        state["compensation"] = torch.zeros_like(p, dtype=compensation_buffer_dtype)
-
-                # Main processing
-                # update the steps for each param group update
-                state["step"] += 1
-                step = state["step"]
-
-                exp_avg = state["exp_avg"]
-                exp_avg_sq = state["exp_avg_sq"]
-                grad = p.grad
-
-                if weight_decay:  # weight decay, AdamW style
-                    p.data.mul_(1 - lr * weight_decay)
-
-                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)  # update momentum
-                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)  # update uncentered variance
-
-                bias_correction1 = 1 - beta1**step  # adjust using bias1
-                step_size = lr / bias_correction1
-
-                denom_correction = (1 - beta2**step) ** 0.5  # adjust using bias2 and avoids math import
-                centered_variance = (exp_avg_sq.sqrt() / denom_correction).add_(eps, alpha=1)
-
-                if use_kahan_summation:  # lr update to compensation
-                    compensation = state["compensation"]
-                    compensation.addcdiv_(exp_avg, centered_variance, value=-step_size)
-
-                    # update weights with compensation (Kahan summation)
-                    # save error back to compensation for next iteration
-                    temp_buffer = p.detach().clone()
-                    p.data.add_(compensation)
-                    compensation.add_(temp_buffer.sub_(p.data))
-                else:  # usual AdamW updates
-                    p.data.addcdiv_(exp_avg, centered_variance, value=-step_size)
-
-
-class MultiOptimizer(Optimizer, Stateful):
-    """
-    A container that handles multiple optimizers (for ep and non-ep parameters when ep+fsdp2 is enabled)
-
-    Mapping of name -> torch.optim.Optimizer with convenience methods.
-    Compatible with torch.distributed.checkpoint optimizer APIs that accept a Mapping.
-
-    This class is needed for EP+FSDP2 case because EP and non-EP param have different FSDP sharding dimension (dim-0 vs. dim-1).
-    """
-
-    def __init__(
-        self,
-        root_model: nn.Module,
-        optimizers: dict,  # {"ep": opt1, "non_ep": opt2}
-        key_names: list[str],
-    ):
-        self.model = root_model
-        self.optimizers_dict = optimizers
-        self._is_multi_optimizer: bool = True
-        self.key_names = key_names
-
-    @property
-    def param_groups(self) -> List[Dict[str, Any]]:
-        """Return all param_groups from all internal optimizers."""
-        all_groups = []
-        for opt in self.optimizers_dict.values():
-            all_groups.extend(opt.param_groups)
-        return all_groups
-
-    @property
-    def state(self) -> Dict[torch.nn.Parameter, Any]:
-        """Return merged state dict from all internal optimizers."""
-        merged_state: Dict[torch.nn.Parameter, Any] = {}
-        for opt in self.optimizers_dict.values():
-            merged_state.update(opt.state)
-        return merged_state
-
-    def step(self) -> None:
-        for opt in self.optimizers_dict.values():
-            opt.step()
-
-    def zero_grad(self) -> None:
-        for opt in self.optimizers_dict.values():
-            opt.zero_grad()
-
-    def state_dict(
-        self,
-    ) -> Dict[str, Any]:
-        # get the flatten state dict for multi-optimizer
-        merged: Dict[str, Any] = {}
-        for name in self.key_names:
-            opt = self.optimizers_dict.get(name)
-            sd = get_optimizer_state_dict(self.model, opt, options=StateDictOptions(flatten_optimizer_state_dict=True))
-            # check for key clashes before merging
-            overlap = set(merged.keys()) & set(sd.keys())
-            if overlap:
-                raise KeyError(
-                    f"Key clash detected while merging state dict for optimizer '{name}': {', '.join(sorted(overlap))}"
-                )
-            else:
-                logger.info_rank0(
-                    f"MultiOptimizer merged '{name}' state dict ({len(sd)} keys, total {len(merged) + len(sd)})"
-                )
-            merged.update(sd)
-
-        return merged
-
-    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        # Feed the same merged flattened dict to each sub-optimizer; PyTorch will
-        # pick out only the entries for parameters that belong to that optimizer.
-        for name in self.key_names:
-            opt = self.optimizers_dict.get(name)
-            set_optimizer_state_dict(
-                self.model,
-                opt,
-                optim_state_dict=state_dict,
-                options=StateDictOptions(flatten_optimizer_state_dict=True),
-            )
-
-    def register_step_pre_hook(self, hook):
-        return [opt.register_step_pre_hook(hook) for opt in self.optimizers_dict.values()]
-
-    def __len__(self) -> int:
-        return len(self.optimizers_dict)
 
 
 def _should_build_ep_aware(model: "nn.Module", param_groups: Optional[Sequence[Dict[str, Any]]]) -> bool:
@@ -337,6 +96,14 @@ _ANYPRECISION_STATE_DTYPES = {
 }
 
 
+def _normalize_optional_dtype(dtype: Any, *, field_name: str) -> Optional[torch.dtype]:
+    if dtype is None or isinstance(dtype, torch.dtype):
+        return dtype
+    if dtype in _ANYPRECISION_STATE_DTYPES:
+        return _ANYPRECISION_STATE_DTYPES[dtype]
+    raise ValueError(f"Unsupported {field_name}: {dtype!r}. Expected 'fp32', 'bf16', a torch.dtype, or None.")
+
+
 def _get_optimizer_cls_and_kwargs(
     optimizer_type: str,
     *,
@@ -386,6 +153,9 @@ def _get_optimizer_cls_and_kwargs(
         return SignSGD, ctor_kwargs
     elif optimizer_type == "muon":
         adamw_state_dtype = _ANYPRECISION_STATE_DTYPES.get(optimizer_dtype)
+        momentum_dtype = kwargs.get("muon_momentum_dtype")
+        if momentum_dtype is None:
+            momentum_dtype = _ANYPRECISION_STATE_DTYPES.get(optimizer_dtype)
         ctor_kwargs = dict(
             lr=kwargs.get("muon_lr", 0.02),
             momentum=kwargs.get("muon_momentum", 0.95),
@@ -393,9 +163,16 @@ def _get_optimizer_cls_and_kwargs(
             ns_steps=kwargs.get("muon_ns_steps", 5),
             weight_decay=weight_decay,
             adjust_lr_fn=kwargs.get("muon_adjust_lr_fn"),
+            ns_algorithm=kwargs.get("muon_ns_algorithm", "standard_newton_schulz"),
+            ns_use_quack_kernels=kwargs.get("muon_ns_use_quack_kernels", True),
+            gram_newton_schulz_num_restarts=kwargs.get("muon_gram_ns_num_restarts", 1),
+            gram_newton_schulz_restart_iterations=kwargs.get("muon_gram_ns_restart_iterations"),
             adamw_betas=betas,
             adamw_eps=eps,
-            momentum_dtype=kwargs.get("muon_momentum_dtype"),
+            momentum_dtype=_normalize_optional_dtype(momentum_dtype, field_name="muon_momentum_dtype"),
+            grad_dtype=_normalize_optional_dtype(kwargs.get("muon_grad_dtype"), field_name="muon_grad_dtype"),
+            update_dtype=_normalize_optional_dtype(kwargs.get("muon_update_dtype"), field_name="muon_update_dtype"),
+            force_momentum_path=kwargs.get("muon_force_momentum_path", False),
             adamw_state_dtype=adamw_state_dtype,
         )
         return Muon, ctor_kwargs
@@ -575,7 +352,11 @@ def build_optimizer(
             - sgd: {"momentum": 0.9, "nesterov": True}
             - signsgd: no optimizer-specific kwargs
             - muon: {"muon_lr": 0.02, "muon_momentum": 0.95, "muon_nesterov": True,
-                      "muon_ns_steps": 5, "muon_adjust_lr_fn": None, "muon_momentum_dtype": None}
+                      "muon_ns_steps": 5, "muon_adjust_lr_fn": None,
+                      "muon_ns_algorithm": "standard_newton_schulz",
+                      "muon_ns_use_quack_kernels": True, "muon_gram_ns_num_restarts": 1,
+                      "muon_gram_ns_restart_iterations": None, "muon_momentum_dtype": None,
+                      "muon_grad_dtype": None, "muon_update_dtype": None, "muon_force_momentum_path": False}
             - adamw/anyprecision_adamw: any extra kwargs forwarded to constructor
     """
     # EP-aware routing: for FSDP2+EP, split params into EP and non-EP groups and build two optimizers.

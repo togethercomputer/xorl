@@ -580,6 +580,55 @@ class TrainingArguments:
             "None defaults to 'original'."
         },
     )
+    muon_ns_algorithm: Literal["standard_newton_schulz", "gram_newton_schulz"] = field(
+        default="standard_newton_schulz",
+        metadata={
+            "help": "Newton-Schulz backend for Muon. 'standard_newton_schulz' keeps the PyTorch Muon path; "
+            "'gram_newton_schulz' uses Dao-AILab's Gram Newton-Schulz formulation."
+        },
+    )
+    muon_ns_use_quack_kernels: bool = field(
+        default=True,
+        metadata={
+            "help": "Allow Muon Gram Newton-Schulz to use Quack symmetric GEMM kernels on supported Hopper/Blackwell GPUs. "
+            "Falls back to torch matmuls when unavailable."
+        },
+    )
+    muon_gram_ns_num_restarts: int = field(
+        default=1,
+        metadata={
+            "help": "Number of restart locations to autotune for Muon's Gram Newton-Schulz backend when explicit "
+            "muon_gram_ns_restart_iterations are not provided."
+        },
+    )
+    muon_gram_ns_restart_iterations: Optional[List[int]] = field(
+        default=None,
+        metadata={
+            "help": "Explicit restart iteration indices for Muon's Gram Newton-Schulz backend. "
+            "A value of 2 means restart after the second iteration."
+        },
+    )
+    muon_grad_dtype: Optional[Literal["fp32", "bf16"]] = field(
+        default=None,
+        metadata={
+            "help": "Optional dtype cast for the gradient tensor used inside Muon. "
+            "Use this to force the Muon optimizer path to fp32 or bf16 independently of momentum state dtype."
+        },
+    )
+    muon_update_dtype: Optional[Literal["fp32", "bf16"]] = field(
+        default=None,
+        metadata={
+            "help": "Optional dtype cast for the transient Muon update tensor passed into Newton-Schulz. "
+            "Use this to decouple compute dtype from gradient and momentum-buffer storage dtype."
+        },
+    )
+    muon_force_momentum_path: bool = field(
+        default=False,
+        metadata={
+            "help": "Force Muon to build the update through the momentum-buffer path even when muon_momentum=0. "
+            "Intended for debugging and ablations."
+        },
+    )
 
     @property
     def optimizer_kwargs(self) -> Dict[str, Any]:
@@ -591,9 +640,24 @@ class TrainingArguments:
             kwargs["muon_nesterov"] = self.muon_nesterov
             kwargs["muon_ns_steps"] = self.muon_ns_steps
             kwargs["muon_adjust_lr_fn"] = self.muon_adjust_lr_fn
+            kwargs["muon_ns_algorithm"] = self.muon_ns_algorithm
+            kwargs["muon_ns_use_quack_kernels"] = self.muon_ns_use_quack_kernels
+            kwargs["muon_gram_ns_num_restarts"] = self.muon_gram_ns_num_restarts
+            if self.muon_gram_ns_restart_iterations is not None:
+                kwargs["muon_gram_ns_restart_iterations"] = self.muon_gram_ns_restart_iterations
             # Wire optimizer_dtype -> muon_momentum_dtype so "bf16" sets bf16 Muon momentum
             if self.optimizer_dtype == "bf16":
                 kwargs["muon_momentum_dtype"] = torch.bfloat16
+            if self.muon_grad_dtype == "bf16":
+                kwargs["muon_grad_dtype"] = torch.bfloat16
+            elif self.muon_grad_dtype == "fp32":
+                kwargs["muon_grad_dtype"] = torch.float32
+            if self.muon_update_dtype == "bf16":
+                kwargs["muon_update_dtype"] = torch.bfloat16
+            elif self.muon_update_dtype == "fp32":
+                kwargs["muon_update_dtype"] = torch.float32
+            if self.muon_force_momentum_path:
+                kwargs["muon_force_momentum_path"] = True
         return kwargs
 
     max_grad_norm: float = field(
@@ -1036,12 +1100,6 @@ class LoRAArguments:
     save_lora_only: bool = field(
         default=False,
         metadata={"help": "Only save LoRA weights (not full model) in HF checkpoints"},
-    )
-    moe_hybrid_shared_lora: bool = field(
-        default=False,
-        metadata={
-            "help": "Enable hybrid shared LoRA for MoE: share lora_A for gate/up_proj, lora_B for down_proj across experts"
-        },
     )
     # QLoRA: quantize base weights for memory savings
     enable_qlora: bool = field(

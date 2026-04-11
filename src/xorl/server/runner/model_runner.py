@@ -13,6 +13,7 @@ Usage:
     See xorl.server.runner.runner_dispatcher for the entry point.
 """
 
+import gc
 import logging
 import os
 import time
@@ -563,7 +564,20 @@ class ModelRunner:
         if optimizer_type == "muon":
             optimizer_kwargs = {
                 k: self.train_config[k]
-                for k in ("muon_lr", "muon_momentum", "muon_nesterov", "muon_ns_steps", "muon_adjust_lr_fn")
+                for k in (
+                    "muon_lr",
+                    "muon_momentum",
+                    "muon_nesterov",
+                    "muon_ns_steps",
+                    "muon_adjust_lr_fn",
+                    "muon_ns_algorithm",
+                    "muon_ns_use_quack_kernels",
+                    "muon_gram_ns_num_restarts",
+                    "muon_gram_ns_restart_iterations",
+                    "muon_grad_dtype",
+                    "muon_update_dtype",
+                    "muon_force_momentum_path",
+                )
                 if k in self.train_config
             }
         self.optimizer = build_optimizer(
@@ -1261,8 +1275,6 @@ class ModelRunner:
         # After weight-sync + optim_step from the previous step the CUDA
         # allocator can have many small free blocks; without this, CUBLAS
         # handle creation or Triton autotuner workspace allocs can fail.
-        import gc
-
         gc.collect()
         torch.cuda.empty_cache()
 

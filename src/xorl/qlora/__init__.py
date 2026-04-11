@@ -1,25 +1,4 @@
-"""Lazy exports for QLoRA to avoid package-level circular imports."""
-
-_MODULE_ATTRS = {
-    "BlockFP8QLoRALinear",
-    "NF4QLoRALinear",
-    "NvFP4QLoRALinear",
-    "QLoRALinear",
-    "QLoRAMoeExperts",
-    "prefetch_aqn_noise",
-}
-
-_UTIL_ATTRS = {
-    "detect_prequantized_block_fp8",
-    "detect_prequantized_nvfp4",
-    "get_prequantized_exclude_modules",
-    "inject_qlora_into_model",
-    "maybe_load_and_quantize_moe_qlora",
-    "maybe_load_prequantized_qlora",
-    "maybe_quantize_qlora",
-    "maybe_requant_qlora",
-    "save_qlora_checkpoint",
-}
+import importlib
 
 
 __all__ = [
@@ -37,62 +16,33 @@ __all__ = [
     "detect_prequantized_nvfp4",
     "detect_prequantized_block_fp8",
     "maybe_load_prequantized_qlora",
-    "get_prequantized_exclude_modules",
 ]
 
 
+_QLORA_ATTRS = {
+    "BlockFP8QLoRALinear": ("xorl.qlora.modules.block_fp8_linear", "BlockFP8QLoRALinear"),
+    "NF4QLoRALinear": ("xorl.qlora.modules.nf4_linear", "NF4QLoRALinear"),
+    "NvFP4QLoRALinear": ("xorl.qlora.modules.nvfp4_linear", "NvFP4QLoRALinear"),
+    "QLoRALinear": ("xorl.qlora.modules.linear", "QLoRALinear"),
+    "QLoRAMoeExperts": ("xorl.qlora.modules.moe_experts", "QLoRAMoeExperts"),
+    "prefetch_aqn_noise": ("xorl.qlora.modules.linear", "prefetch_aqn_noise"),
+    "detect_prequantized_block_fp8": ("xorl.qlora.utils", "detect_prequantized_block_fp8"),
+    "detect_prequantized_nvfp4": ("xorl.qlora.utils", "detect_prequantized_nvfp4"),
+    "inject_qlora_into_model": ("xorl.qlora.utils", "inject_qlora_into_model"),
+    "maybe_load_and_quantize_moe_qlora": ("xorl.qlora.utils", "maybe_load_and_quantize_moe_qlora"),
+    "maybe_load_prequantized_qlora": ("xorl.qlora.utils", "maybe_load_prequantized_qlora"),
+    "maybe_quantize_qlora": ("xorl.qlora.utils", "maybe_quantize_qlora"),
+    "maybe_requant_qlora": ("xorl.qlora.utils", "maybe_requant_qlora"),
+    "save_qlora_checkpoint": ("xorl.qlora.utils", "save_qlora_checkpoint"),
+}
+
+
 def __getattr__(name):
-    if name in _MODULE_ATTRS:
-        from xorl.qlora.modules.block_fp8_linear import BlockFP8QLoRALinear  # noqa: PLC0415
-        from xorl.qlora.modules.linear import QLoRALinear, prefetch_aqn_noise  # noqa: PLC0415
-        from xorl.qlora.modules.moe_experts import QLoRAMoeExperts  # noqa: PLC0415
-        from xorl.qlora.modules.nf4_linear import NF4QLoRALinear  # noqa: PLC0415
-        from xorl.qlora.modules.nvfp4_linear import NvFP4QLoRALinear  # noqa: PLC0415
+    if name not in _QLORA_ATTRS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
-        globals().update(
-            {
-                "QLoRALinear": QLoRALinear,
-                "NvFP4QLoRALinear": NvFP4QLoRALinear,
-                "BlockFP8QLoRALinear": BlockFP8QLoRALinear,
-                "NF4QLoRALinear": NF4QLoRALinear,
-                "QLoRAMoeExperts": QLoRAMoeExperts,
-                "prefetch_aqn_noise": prefetch_aqn_noise,
-            }
-        )
-        return globals()[name]
-
-    if name in _UTIL_ATTRS:
-        from xorl.qlora.utils import (  # noqa: PLC0415
-            detect_prequantized_block_fp8,
-            detect_prequantized_nvfp4,
-            inject_qlora_into_model,
-            maybe_load_and_quantize_moe_qlora,
-            maybe_load_prequantized_qlora,
-            maybe_quantize_qlora,
-            maybe_requant_qlora,
-            save_qlora_checkpoint,
-        )
-
-        globals().update(
-            {
-                "detect_prequantized_block_fp8": detect_prequantized_block_fp8,
-                "detect_prequantized_nvfp4": detect_prequantized_nvfp4,
-                "inject_qlora_into_model": inject_qlora_into_model,
-                "maybe_load_and_quantize_moe_qlora": maybe_load_and_quantize_moe_qlora,
-                "maybe_load_prequantized_qlora": maybe_load_prequantized_qlora,
-                "maybe_quantize_qlora": maybe_quantize_qlora,
-                "maybe_requant_qlora": maybe_requant_qlora,
-                "save_qlora_checkpoint": save_qlora_checkpoint,
-            }
-        )
-
-        if "get_prequantized_exclude_modules" not in globals():
-            from xorl.models.checkpoint_handlers.buffers import (  # noqa: PLC0415
-                get_prequantized_exclude_modules,
-            )
-
-            globals()["get_prequantized_exclude_modules"] = get_prequantized_exclude_modules
-
-        return globals()[name]
-
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attr_name = _QLORA_ATTRS[name]
+    module = importlib.import_module(module_name)
+    value = getattr(module, attr_name)
+    globals()[name] = value
+    return value
