@@ -251,7 +251,7 @@ class Qwen3_5MoeConfig(PretrainedConfig):
             moe_intermediate_size=getattr(text_config, "moe_intermediate_size", 768),
             num_experts_per_tok=getattr(text_config, "num_experts_per_tok", 8),
             num_experts=getattr(text_config, "num_experts", 128),
-            norm_topk_prob=getattr(text_config, "norm_topk_prob", False),
+            norm_topk_prob=getattr(text_config, "norm_topk_prob", None) is not False,
             output_router_logits=getattr(text_config, "output_router_logits", False),
             router_aux_loss_coef=getattr(text_config, "router_aux_loss_coef", 0.001),
             mlp_only_layers=getattr(text_config, "mlp_only_layers", []),
