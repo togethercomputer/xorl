@@ -60,10 +60,10 @@ except ImportError:
 try:
     from xorl.ops.moe.quack import QuackEPGroupGemm as _QuackEPGroupGemm
 
-    def _quack_ep_fused(permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size):
+    def _quack_ep_fused(permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores=None):
         gate_proj = gate_up_proj[..., :intermediate_size].contiguous()
         up_proj = gate_up_proj[..., intermediate_size:].contiguous()
-        return _QuackEPGroupGemm.apply(permute_tokens, cumsum, gate_proj, up_proj, down_proj)
+        return _QuackEPGroupGemm.apply(permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores)
 
     EP_EXPERT_COMPUTE["quack"] = _quack_ep_fused
 except ImportError:
@@ -73,10 +73,10 @@ except ImportError:
 try:
     from .native import native_ep_compute as _native_ep_compute
 
-    def _native_ep_fused(permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size):
+    def _native_ep_fused(permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores=None):
         gate_proj = gate_up_proj[..., :intermediate_size].contiguous()
         up_proj = gate_up_proj[..., intermediate_size:].contiguous()
-        return _native_ep_compute(permute_tokens, cumsum, gate_proj, up_proj, down_proj)
+        return _native_ep_compute(permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores)
 
     EP_EXPERT_COMPUTE["native"] = _native_ep_fused
 except ImportError:
@@ -186,75 +186,6 @@ except ImportError:
     pass
 
 
-# ---------------------------------------------------------------------------
-# Moe_act registries: activation-recompute variants that drop gate_output/up_output
-# from save_for_backward and recompute them in backward via local GEMMs.
-# ---------------------------------------------------------------------------
-
-EP_EXPERT_COMPUTE_MOE_ACT: Dict[str, Callable] = {}
-
-# Triton EP moe_act compute
-try:
-    from xorl.ops.moe.triton import TritonEPGroupGemmMoeAct
-
-    EP_EXPERT_COMPUTE_MOE_ACT["triton"] = TritonEPGroupGemmMoeAct.apply
-except ImportError:
-    pass
-
-# Quack EP moe_act compute — adapt fused interface
-try:
-    from xorl.ops.moe.quack import QuackEPGroupGemmMoeAct as _QuackEPGroupGemmMoeAct
-
-    def _quack_ep_moe_act_fused(permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size):
-        gate_proj = gate_up_proj[..., :intermediate_size].contiguous()
-        up_proj = gate_up_proj[..., intermediate_size:].contiguous()
-        return _QuackEPGroupGemmMoeAct.apply(permute_tokens, cumsum, gate_proj, up_proj, down_proj)
-
-    EP_EXPERT_COMPUTE_MOE_ACT["quack"] = _quack_ep_moe_act_fused
-except ImportError:
-    pass
-
-# Native EP moe_act compute — adapt fused interface
-try:
-    from .native import native_ep_compute_moe_act as _native_ep_compute_moe_act
-
-    def _native_ep_moe_act_fused(permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size):
-        gate_proj = gate_up_proj[..., :intermediate_size].contiguous()
-        up_proj = gate_up_proj[..., intermediate_size:].contiguous()
-        return _native_ep_compute_moe_act(permute_tokens, cumsum, gate_proj, up_proj, down_proj)
-
-    EP_EXPERT_COMPUTE_MOE_ACT["native"] = _native_ep_moe_act_fused
-except ImportError:
-    pass
-
-
-MOE_EXPERT_BACKENDS_MOE_ACT: Dict[str, Callable] = {}
-
-# Triton local moe_act compute
-try:
-    from .triton_moe_act import triton_expert_forward_moe_act
-
-    MOE_EXPERT_BACKENDS_MOE_ACT["triton"] = triton_expert_forward_moe_act
-except ImportError:
-    pass
-
-# Quack local moe_act compute
-try:
-    from .quack_moe_act import quack_expert_forward_moe_act
-
-    MOE_EXPERT_BACKENDS_MOE_ACT["quack"] = quack_expert_forward_moe_act
-except ImportError:
-    pass
-
-# Native local moe_act compute
-try:
-    from .native import native_expert_forward_moe_act
-
-    MOE_EXPERT_BACKENDS_MOE_ACT["native"] = native_expert_forward_moe_act
-except ImportError:
-    pass
-
-
 __all__ = [
     "MOE_EXPERT_BACKENDS",
     "EP_EXPERT_COMPUTE",
@@ -262,6 +193,4 @@ __all__ = [
     "EP_COMBINE",
     "EP_EXPERT_COMPUTE_LORA",
     "MOE_EXPERT_BACKENDS_LORA",
-    "EP_EXPERT_COMPUTE_MOE_ACT",
-    "MOE_EXPERT_BACKENDS_MOE_ACT",
 ]

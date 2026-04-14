@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Tuple, Unpack
+from typing import Optional, Unpack
 
 import torch
 from torch import nn
 
-from xorl.distributed.moe.deepep import sync_pending_combine
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.distributed.sequence_parallel.strategy import get_cp_strategy
 from xorl.models.base import XorlPreTrainedModel
@@ -35,6 +34,7 @@ from xorl.models.layers.attention import (
     update_causal_mask,
 )
 from xorl.models.layers.moe import MoEBlock, MoEExperts
+from xorl.models.module_utils import MoEGradientCheckpointingLayer
 from xorl.models.outputs import MoeCausalLMOutput, MoeModelOutput
 from xorl.models.transformers.qwen3_moe import parallelize
 from xorl.models.transformers.qwen3_moe.checkpoint_handler import Qwen3MoeCheckpointHandler
@@ -215,14 +215,13 @@ QWEN3_MOE_CLASSES = {
 }
 
 
-class Qwen3MoeDecoderLayer(nn.Module):
+class Qwen3MoeDecoderLayer(MoEGradientCheckpointingLayer):
     def __init__(self, config: Qwen3MoeConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.gradient_checkpointing = False  # set by gradient_checkpointing_enable
 
         self.self_attn = Qwen3MoeAttention(config, layer_idx)
-
-        self.mlp = Qwen3MoeMLP(config)
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -235,77 +234,35 @@ class Qwen3MoeDecoderLayer(nn.Module):
         else:
             self.mlp = Qwen3MoeMLP(config, intermediate_size=config.intermediate_size)
 
+    def _pre_mlp_forward(self, hidden_states, attention_mask=None, position_embeddings=None, **kwargs):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual=residual, prenorm=True)
+        return hidden_states, residual
+
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        output_attentions: Optional[bool] = False,
-        output_router_logits: Optional[bool] = False,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        **kwargs: Unpack[AttentionKwargs],
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        _selective = (
-            self.training
-            and getattr(self, "gradient_checkpointing", False)
-            and getattr(self, "_recompute_modules", None) is not None
-        )
-        residual = hidden_states
-
-        hidden_states = self.input_layernorm(hidden_states)
-
-        # Self Attention
-        if _selective and "self_attn" in self._recompute_modules:
-            # MultiHeadAttention.forward positional order: hidden_states, position_embeddings, attention_mask
-            hidden_states, self_attn_weights = self._gradient_checkpointing_func(
-                self.self_attn.__call__,
-                hidden_states,
-                position_embeddings,
-                attention_mask,
-                **kwargs,
-            )
-        else:
-            hidden_states, self_attn_weights = self.self_attn(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        output_attentions=False,
+        output_router_logits=False,
+        position_embeddings=None,
+        **kwargs,
+    ):
+        return self._moe_forward(
             hidden_states,
-            residual=residual,
-            prenorm=True,
+            output_router_logits=output_router_logits,
+            attention_mask=attention_mask,
+            position_embeddings=position_embeddings,
+            **kwargs,
         )
-
-        if _selective and "mlp" in self._recompute_modules:
-            hidden_states = self._gradient_checkpointing_func(
-                self.mlp.__call__,
-                hidden_states,
-            )
-        else:
-            hidden_states = self.mlp(hidden_states)
-
-        if isinstance(hidden_states, tuple):
-            hidden_states, router_logits = hidden_states
-        else:
-            router_logits = None
-
-        # Sync any pending async DeepEP combine before reading MoE output.
-        # No-op when async combine is disabled or non-DeepEP dispatch.
-        sync_pending_combine()
-
-        hidden_states = residual + hidden_states
-
-        outputs = (hidden_states,)
-
-        if output_attentions:
-            outputs += (self_attn_weights,)
-
-        if output_router_logits:
-            outputs += (router_logits,)
-
-        return outputs
 
 
 class Qwen3MoePreTrainedModel(XorlPreTrainedModel):
@@ -481,16 +438,15 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         all_self_attns = () if output_attentions else None
         all_router_logits = () if output_router_logits else None
 
+        _grad_ckpt_method = getattr(self, "_gradient_checkpointing_method", None) or "recompute_full_layer"
+        _grad_ckpt_active = self.gradient_checkpointing and self.training
+
         for decoder_layer in self.layers:
             if decoder_layer is None:  # PP: pruned layer
                 continue
-            # When selective checkpointing is enabled (_recompute_modules is set),
-            # the decoder layer handles its own sub-checkpointing — skip the outer checkpoint.
-            _use_outer_checkpoint = (
-                self.gradient_checkpointing and self.training and getattr(self, "_recompute_modules", None) is None
-            )
 
-            if _use_outer_checkpoint:
+            if _grad_ckpt_active and _grad_ckpt_method == "recompute_full_layer":
+                # Recompute entire layer in backward (including dispatch + combine)
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
@@ -501,7 +457,20 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
                     position_embeddings,
                     **kwargs,
                 )
+            elif _grad_ckpt_active and _grad_ckpt_method == "recompute_before_dispatch":
+                # Decoder layer handles checkpoint internally via _pre_dispatch_forward.
+                # Dispatch + combine run outside checkpoint (alltoall not recomputed).
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                    output_attentions=output_attentions,
+                    output_router_logits=output_router_logits,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
             else:
+                # no_recompute or gc disabled: run decoder layer normally
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=causal_mask,
@@ -515,7 +484,8 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
             hidden_states = layer_outputs[0]
 
             if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+                # _moe_forward does not produce attention weights; use None placeholder.
+                all_self_attns += (None,)
 
             if output_router_logits:
                 all_router_logits += (layer_outputs[-1],)

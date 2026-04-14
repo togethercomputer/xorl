@@ -1605,6 +1605,98 @@ class GradientCheckpointingLayer(nn.Module):
     gradient_checkpointing = False
 
     def __call__(self, *args, **kwargs):
-        if self.gradient_checkpointing and self.training:
+        if (
+            self.gradient_checkpointing
+            and self.training
+            and getattr(self, "_gradient_checkpointing_method", "recompute_full_layer") == "recompute_full_layer"
+        ):
             return self._gradient_checkpointing_func(partial(super().__call__, **kwargs), *args)
         return super().__call__(*args, **kwargs)
+
+
+class MoEGradientCheckpointingLayer(nn.Module):
+    """Base class for MoE decoder layers with selective gradient checkpointing.
+
+    Subclasses implement ``_pre_mlp_forward(hidden_states, **kwargs)`` which runs
+    layernorm → attention → layernorm and returns ``(hidden_states, residual)``.
+
+    The checkpointing branching is handled automatically:
+
+    - ``recompute_full_layer``: outer checkpoint wraps the entire layer
+      (handled by ``GradientCheckpointingLayer`` on the model-level loop).
+    - ``recompute_before_dispatch``: this class checkpoints attn+layernorm+router
+      via ``_pre_dispatch_forward``, then runs dispatch+expert+combine outside.
+    - ``no_recompute``: no checkpointing, runs normally.
+
+    Works with both alltoall and DeepEP backends since dispatch/combine sit
+    outside the checkpoint boundary.
+    """
+
+    gradient_checkpointing = False
+
+    def _pre_mlp_forward(self, hidden_states, **kwargs):
+        """Layernorm → attention → layernorm. Override per model.
+
+        Returns:
+            ``(hidden_states, residual)``
+        """
+        raise NotImplementedError
+
+    def _pre_dispatch_forward(self, hidden_states, **kwargs):
+        """Layernorm → attention → layernorm → router.
+
+        Composed from ``_pre_mlp_forward`` + ``self.mlp.route()``.
+        Override only if the model needs custom routing (rare).
+        """
+        hidden_states, residual = self._pre_mlp_forward(hidden_states, **kwargs)
+        # route() expects flattened (num_tokens, hidden_dim); hidden_states is 3-D here.
+        orig_shape = hidden_states.shape
+        flat = hidden_states.view(-1, orig_shape[-1])
+        routing_weights, selected_experts, router_logits = self.mlp.route(flat)
+        return hidden_states, residual, routing_weights, selected_experts, router_logits
+
+    def _moe_forward(self, hidden_states, output_router_logits=False, **kwargs):
+        """Forward with selective checkpointing. Called by subclass ``forward()``.
+
+        Args:
+            hidden_states: ``(batch, seq_len, hidden_dim)``.
+            output_router_logits: Whether to include router logits in output.
+            **kwargs: Forwarded to ``_pre_mlp_forward`` (attention_mask, position_embeddings, etc.)
+
+        Returns:
+            Tuple of ``(hidden_states, ...)`` with optional router_logits.
+        """
+        from xorl.distributed.moe.deepep import sync_pending_combine
+        from xorl.models.layers.moe.moe_block import MoEBlock
+
+        _selective = (
+            self.training
+            and getattr(self, "gradient_checkpointing", False)
+            and getattr(self, "_gradient_checkpointing_method", "recompute_full_layer") != "recompute_full_layer"
+        )
+        _is_moe = isinstance(self.mlp, MoEBlock)
+
+        if _selective and _is_moe:
+            moe_input, residual, routing_weights, selected_experts, router_logits = self._gradient_checkpointing_func(
+                self._pre_dispatch_forward, hidden_states, **kwargs
+            )
+            hidden_states = self.mlp.forward_experts_only(moe_input, routing_weights, selected_experts)
+        elif _selective:
+            hidden_states, residual = self._gradient_checkpointing_func(self._pre_mlp_forward, hidden_states, **kwargs)
+            hidden_states = self.mlp(hidden_states)
+            router_logits = None
+        else:
+            hidden_states, residual = self._pre_mlp_forward(hidden_states, **kwargs)
+            hidden_states = self.mlp(hidden_states)
+            if isinstance(hidden_states, tuple):
+                hidden_states, router_logits = hidden_states
+            else:
+                router_logits = None
+
+        sync_pending_combine()
+        hidden_states = residual + hidden_states
+
+        outputs = (hidden_states,)
+        if output_router_logits:
+            outputs += (router_logits,)
+        return outputs

@@ -518,8 +518,7 @@ class Trainer:
             enable_compile=args.train.enable_compile,
             basic_modules=self.model._no_split_modules + args.model.basic_modules,
             enable_reentrant=args.train.enable_reentrant,
-            recompute_modules=args.train.recompute_modules,
-            moe_checkpoint_method=args.train.moe_checkpoint_method,
+            gradient_checkpointing_method=args.train.gradient_checkpointing_method,
             enable_forward_prefetch=args.train.enable_forward_prefetch,
             load_weights_mode=args.train.load_weights_mode,
             pp_schedule=args.train.pipeline_parallel_schedule if args.train.pipeline_parallel_size > 1 else None,
@@ -641,9 +640,8 @@ class Trainer:
             config=self.model_config,
             global_batch_size=args.train.global_batch_size,
             empty_cache_steps=args.train.empty_cache_steps,
-            gc_enabled=args.train.enable_gradient_checkpointing,
-            recompute_modules=args.train.recompute_modules,
-            moe_checkpoint_method=args.train.moe_checkpoint_method,
+            gradient_checkpointing_enabled=args.train.enable_gradient_checkpointing,
+            gradient_checkpointing_method=args.train.gradient_checkpointing_method,
             cp_size=args.train.ulysses_parallel_size * args.train.ringattn_parallel_size,
         )
         self._maybe_log_startup_metrics(
@@ -1036,11 +1034,12 @@ class Trainer:
         use_tqdm: bool,
         tqdm_bar: Optional[Any],
     ) -> None:
-        """Log metrics to stdout / tqdm / wandb."""
+        """Log metrics to stdout / tqdm / wandb / structured JSON."""
         args = self.args
         tflops_per_gpu = train_metrics.get("efficiency/flops_achieved(T)", 0) / args.train.world_size
         mfu = train_metrics.get("efficiency/mfu", 0)
         tokens_per_sec = train_metrics.get("efficiency/tokens_per_second(K)", 0) * 1e3
+        gpu_mem_gb = train_metrics.get("memory/gpu_allocated(GB)", 0)
 
         if use_tqdm and tqdm_bar is not None:
             tqdm_bar.set_postfix_str(f"loss={total_loss:.2f} gn={grad_norm:.2f} lr={lr:.1e} tok/s={tokens_per_sec:.0f}")
@@ -1051,7 +1050,8 @@ class Trainer:
                 f"[STEP {self.state.global_step}/{max_steps_str}] "
                 f"loss={total_loss:.4f} grad_norm={grad_norm:.4f} lr={lr:.6e} "
                 f"tflops={tflops_per_gpu:.1f} mfu={mfu:.4f} "
-                f"tokens_per_sec={tokens_per_sec:.0f} time={delta_time:.3f}s"
+                f"tokens_per_sec={tokens_per_sec:.0f} time={delta_time:.3f}s "
+                f"peak_mem={gpu_mem_gb:.1f}GB"
             )
 
         if (
@@ -1061,12 +1061,16 @@ class Trainer:
         ):
             import wandb  # noqa: PLC0415
 
+            epoch_fraction = self.state.epoch + (
+                (self.state.global_step - self.state.epoch * self.train_steps_per_epoch)
+                / max(self.train_steps_per_epoch, 1)
+            )
             train_metrics.update(
                 {
                     "training/loss": total_loss,
                     "training/grad_norm": grad_norm,
                     "training/lr": lr,
-                    "training/epoch": self.state.epoch,
+                    "training/epoch": epoch_fraction,
                     "training/step_time": delta_time,
                     "training/samples_seen": self.state.global_step * args.train.global_batch_size,
                 }

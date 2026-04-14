@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 from transformers import PretrainedConfig
 
@@ -20,10 +20,9 @@ def _attention_score_elements(batch_seqlens: List[int], causal: bool) -> int:
     return sum(seqlen * seqlen for seqlen in batch_seqlens)
 
 
-def _gc_multipliers(
-    gc_enabled: bool,
-    recompute_modules: Optional[List[str]],
-    moe_checkpoint_method: Optional[str],
+def _grad_ckpt_multipliers(
+    gradient_checkpointing_enabled: bool,
+    gradient_checkpointing_method: Optional[str] = None,
 ) -> Dict[str, int]:
     """Logical training FLOPs multipliers aligned with common benchmark reporting.
 
@@ -44,7 +43,7 @@ def _gc_multipliers(
         down         - MoE down_proj multiplier
         dense_mlp    - Dense MLP (non-MoE layers) multiplier
     """
-    del gc_enabled, recompute_modules, moe_checkpoint_method
+    del gradient_checkpointing_enabled, gradient_checkpointing_method
     return dict(attn_linear=6, attn_qkv=12, router=6, gate=6, up=6, down=6, dense_mlp=6)
 
 
@@ -92,12 +91,11 @@ class XorlFlopsCounter:
     def __init__(
         self,
         config: PretrainedConfig,
-        gc_enabled: bool = False,
-        recompute_modules: Optional[List[str]] = None,
-        moe_checkpoint_method: Optional[str] = None,
+        gradient_checkpointing_enabled: bool = False,
+        gradient_checkpointing_method: Optional[str] = None,
         cp_size: int = 1,
     ):
-        self._m = _gc_multipliers(gc_enabled, recompute_modules, moe_checkpoint_method)
+        self._m = _grad_ckpt_multipliers(gradient_checkpointing_enabled, gradient_checkpointing_method)
         # CP correction: each rank computes on local_tokens = total/cp_size.
         # The formula uses local tokens → per-rank FLOPs. Multiply by cp_size
         # to report total-batch FLOPs so that EnvironMeter's
@@ -200,7 +198,7 @@ class XorlFlopsCounter:
         attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
         embed_lm_N = vocab_size * hidden_size  # lm_head only; embedding is a lookup (0 FLOPs)
 
-        # Per-layer FLOPs with GC-corrected multipliers
+        # Per-layer FLOPs with gradient-checkpoint-corrected multipliers
         per_layer_flops = (
             m["router"] * router_N * tokens_sum
             + m["gate"] * gate_up_N * tokens_sum

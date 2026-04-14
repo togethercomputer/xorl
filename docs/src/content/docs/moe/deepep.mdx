@@ -294,7 +294,7 @@ XORL_DEBUG_EP=1 torchrun ... -m xorl.cli.train config.yaml
 ```
 
 **Shape mismatch errors during backward:**
-Ensure `moe_checkpoint_method: moe_act` is set — R3 routing replay is required for EP + gradient checkpointing. See [MoE Routing Replay](/moe/overview/#routing-replay-r3).
+With the default `gradient_checkpointing_method: recompute_full_layer`, R3 routing replay is used automatically to ensure correct expert assignments when alltoall is recomputed. If you see shape mismatches, verify routing replay is enabled. Using `recompute_before_dispatch` or `no_recompute` avoids alltoall recomputation entirely and does not require replay. See [MoE Routing Replay](/moe/overview/#routing-replay-r3).
 
 **No fallback to AllToAll:**
 If DeepEP fails to initialize, xorl does not fall back automatically. Set `ep_dispatch: alltoall` explicitly.

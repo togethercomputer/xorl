@@ -22,6 +22,7 @@ if os.environ.get("XORL_TRITON_NO_AUTOTUNE", "0") == "1":
 
     triton.autotune = _single_config_autotune
 
+
 from xorl.arguments import Arguments, parse_args
 from xorl.trainers import Trainer
 

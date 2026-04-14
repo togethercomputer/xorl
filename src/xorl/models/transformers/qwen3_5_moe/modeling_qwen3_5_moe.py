@@ -4,7 +4,6 @@ from typing import Callable, Optional, Tuple, Unpack
 import torch
 from torch import nn
 
-from xorl.distributed.moe.deepep import sync_pending_combine
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.distributed.sequence_parallel.strategy import get_cp_strategy
 from xorl.models.base import XorlPreTrainedModel
@@ -24,6 +23,7 @@ from xorl.models.layers.normalization import (
     get_rmsnorm_mode,
     native_zero_centered_rms_norm,
 )
+from xorl.models.module_utils import MoEGradientCheckpointingLayer
 from xorl.models.outputs import MoeCausalLMOutput, MoeModelOutput
 from xorl.models.transformers.qwen3_5_moe import parallelize
 from xorl.models.transformers.qwen3_5_moe.checkpoint_handler import Qwen3_5MoeCheckpointHandler
@@ -235,14 +235,21 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
         self.shared_expert = Qwen3_5MoeMLP(config, intermediate_size=config.shared_expert_intermediate_size)
         self.shared_expert_gate = nn.Linear(config.hidden_size, 1, bias=False)
 
+    def _shared_expert(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Shared expert: MLP + sigmoid gate."""
+        flat = hidden_states.view(-1, hidden_states.size(-1))
+        out = self.shared_expert(flat)
+        out = torch.sigmoid(self.shared_expert_gate(flat)) * out
+        return out.view_as(hidden_states)
+
+    def forward_experts_only(self, hidden_states, routing_weights, selected_experts):
+        """Sparse experts + shared expert with pre-computed routing."""
+        expert_output = super().forward_experts_only(hidden_states, routing_weights, selected_experts)
+        return expert_output + self._shared_expert(hidden_states)
+
     def forward(self, hidden_states: torch.Tensor):
         expert_output, router_logits = super().forward(hidden_states)
-        batch_size, sequence_length, hidden_dim = hidden_states.shape
-        flat_hidden_states = hidden_states.view(-1, hidden_dim)
-        shared_expert_output = self.shared_expert(flat_hidden_states)
-        shared_expert_output = torch.sigmoid(self.shared_expert_gate(flat_hidden_states)) * shared_expert_output
-        shared_expert_output = shared_expert_output.view(batch_size, sequence_length, hidden_dim)
-        return expert_output + shared_expert_output, router_logits
+        return expert_output + self._shared_expert(hidden_states), router_logits
 
 
 QWEN3_5_MOE_CLASSES = {
@@ -253,7 +260,7 @@ QWEN3_5_MOE_CLASSES = {
 }
 
 
-class Qwen3_5MoeDecoderLayer(nn.Module):
+class Qwen3_5MoeDecoderLayer(MoEGradientCheckpointingLayer):
     def __init__(self, config: Qwen3_5MoeConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -287,18 +294,16 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
         else:
             self.mlp = Qwen3_5MoeMLP(config, intermediate_size=config.intermediate_size)
 
-    def forward(
+    def _pre_mlp_forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values=None,
-        use_cache: bool | None = False,
-        output_attentions: Optional[bool] = False,
-        output_router_logits: Optional[bool] = False,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs: Unpack[AttentionKwargs],
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Layernorm → attention → layernorm."""
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -315,15 +320,15 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
             linear_mask = attention_mask if attention_mask is not None and attention_mask.dim() == 2 else None
             if cp_context is not None:
                 linear_mask = None
-            hidden_states, self_attn_weights, _ = self.linear_attn(
+            hidden_states, _, _ = self.linear_attn(
                 hidden_states=hidden_states,
                 attention_mask=linear_mask,
                 past_key_values=past_key_values,
-                use_cache=use_cache,
+                use_cache=False,
                 **linear_kwargs,
             )
         else:
-            hidden_states, self_attn_weights = self.self_attn(
+            hidden_states, _ = self.self_attn(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -332,20 +337,29 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
                 **kwargs,
             )
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual=residual, prenorm=True)
-        hidden_states = self.mlp(hidden_states)
-        if isinstance(hidden_states, tuple):
-            hidden_states, router_logits = hidden_states
-        else:
-            router_logits = None
-        sync_pending_combine()
-        hidden_states = residual + hidden_states
+        return hidden_states, residual
 
-        outputs = (hidden_states,)
-        if output_attentions:
-            outputs += (self_attn_weights,)
-        if output_router_logits:
-            outputs += (router_logits,)
-        return outputs
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values=None,
+        use_cache: bool | None = False,
+        output_attentions: Optional[bool] = False,
+        output_router_logits: Optional[bool] = False,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs: Unpack[AttentionKwargs],
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        return self._moe_forward(
+            hidden_states,
+            output_router_logits=output_router_logits,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
 
 
 class Qwen3_5MoePreTrainedModel(XorlPreTrainedModel):
@@ -503,7 +517,14 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
             if decoder_layer is None:
                 continue
             layer_mask = linear_attn_mask if decoder_layer.layer_type == "linear_attention" else causal_mask
-            if self.gradient_checkpointing and self.training:
+            # When selective checkpointing is enabled, the decoder layer handles
+            # its own sub-checkpointing — skip the outer checkpoint.
+            _use_outer_checkpoint = (
+                self.gradient_checkpointing
+                and self.training
+                and getattr(self, "_gradient_checkpointing_method", "recompute_full_layer") == "recompute_full_layer"
+            )
+            if _use_outer_checkpoint:
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
@@ -530,7 +551,8 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
                 )
             hidden_states = layer_outputs[0]
             if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+                # _moe_forward does not produce attention weights; use None placeholder.
+                all_self_attns += (None,)
             if output_router_logits:
                 all_router_logits += (layer_outputs[-1],)
 

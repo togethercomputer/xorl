@@ -6,7 +6,6 @@ import torch
 from torch import nn
 
 from ..utils import logging
-from .layers.moe.experts import MoEExperts
 from .layers.moe.moe_block import MoEBlock
 from .layers.moe.routing_replay import RoutingReplay
 
@@ -93,26 +92,18 @@ class XorlPreTrainedModel(nn.Module):
             gradient_checkpointing_kwargs = {"use_reentrant": False}
 
         # Pop selective checkpoint config before passing to torch checkpoint
-        recompute_modules = gradient_checkpointing_kwargs.pop("recompute_modules", None)
-        moe_checkpoint_method = gradient_checkpointing_kwargs.pop("moe_checkpoint_method", None)
+        grad_ckpt_method = gradient_checkpointing_kwargs.pop("gradient_checkpointing_method", None)
 
-        gc_func = partial(torch.utils.checkpoint.checkpoint, **gradient_checkpointing_kwargs)
+        grad_ckpt_func = partial(torch.utils.checkpoint.checkpoint, **gradient_checkpointing_kwargs)
 
-        moe_act = moe_checkpoint_method == "moe_act"
         for module in self.modules():
             if hasattr(module, "gradient_checkpointing"):
                 module.gradient_checkpointing = True
-                module._gradient_checkpointing_func = gc_func
-                module._recompute_modules = recompute_modules
-                module._moe_checkpoint_method = moe_checkpoint_method
-            if isinstance(module, MoEExperts):
-                module._moe_act = moe_act
+                module._gradient_checkpointing_func = grad_ckpt_func
+                module._gradient_checkpointing_method = grad_ckpt_method
 
-        if recompute_modules is not None:
-            logger.info(
-                f"Selective checkpointing enabled: recompute_modules={recompute_modules}, "
-                f"moe_checkpoint_method={moe_checkpoint_method}"
-            )
+        if grad_ckpt_method is not None:
+            logger.info(f"Selective checkpointing enabled: gradient_checkpointing_method={grad_ckpt_method}")
 
         # Create routing replay instances for MoE blocks
         self.enable_routing_replay()

@@ -327,8 +327,7 @@ def main():
         enable_compile=args.train.enable_compile,
         basic_modules=model._no_split_modules + args.model.basic_modules,
         enable_reentrant=args.train.enable_reentrant,
-        recompute_modules=args.train.recompute_modules,
-        moe_checkpoint_method=args.train.moe_checkpoint_method,
+        gradient_checkpointing_method=args.train.gradient_checkpointing_method,
         enable_forward_prefetch=args.train.enable_forward_prefetch,
         load_weights_mode=args.train.load_weights_mode,
         pp_schedule=args.train.pipeline_parallel_schedule if args.train.pipeline_parallel_size > 1 else None,
@@ -434,9 +433,8 @@ def main():
         config=model_config,
         global_batch_size=args.train.global_batch_size,
         empty_cache_steps=args.train.empty_cache_steps,
-        gc_enabled=args.train.enable_gradient_checkpointing,
-        recompute_modules=args.train.recompute_modules,
-        moe_checkpoint_method=args.train.moe_checkpoint_method,
+        gradient_checkpointing_enabled=args.train.enable_gradient_checkpointing,
+        gradient_checkpointing_method=args.train.gradient_checkpointing_method,
         cp_size=args.train.ulysses_parallel_size * args.train.ringattn_parallel_size,
     )
 

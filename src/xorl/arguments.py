@@ -702,20 +702,21 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Use reentrant gradient checkpointing."},
     )
-    recompute_modules: Optional[List[str]] = field(
+    gradient_checkpointing_method: Optional[str] = field(
         default=None,
         metadata={
-            "help": "Per-submodule selective checkpointing. Options: 'self_attn', 'mlp'. "
-            "When None, uses whole-layer checkpoint (legacy). "
-            "Example: ['self_attn'] checkpoints only attention, keeping MoE activations."
-        },
-    )
-    moe_checkpoint_method: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "MoE checkpoint strategy. None = full recompute (default). "
-            "'moe_act' = recompute only gate/up activations in backward, "
-            "skip EP communication recomputation. Only effective with MoE models."
+            "help": (
+                "Gradient checkpointing strategy. Controls the speed/memory tradeoff\n"
+                "by choosing what to recompute vs keep in backward.\n\n"
+                "  'recompute_full_layer'      — recompute entire decoder layer including\n"
+                "                                dispatch + combine alltoall. Lowest memory.\n"
+                "                                Required for 128k+ seq. (default)\n"
+                "  'recompute_before_dispatch' — recompute attn + layernorm + router; keep\n"
+                "                                dispatch + expert + combine. +20% speed,\n"
+                "                                more memory than recompute_full_layer.\n"
+                "  'no_recompute'              — no recomputation, max throughput. +34% speed\n"
+                "                                but highest memory, only fits short seq.\n"
+            )
         },
     )
 
@@ -726,9 +727,7 @@ class TrainingArguments:
         Used to decide whether routing replay is needed with EP: replay is only
         required when the MoE forward (including EP all-to-all) is recomputed.
         """
-        if self.recompute_modules is not None:
-            return "mlp" in self.recompute_modules and self.moe_checkpoint_method != "moe_act"
-        return True  # legacy whole-layer checkpoint always recomputes MoE
+        return self.gradient_checkpointing_method in (None, "recompute_full_layer")
 
     enable_full_shard: bool = field(
         default=True,
@@ -950,6 +949,16 @@ class TrainingArguments:
     )
 
     def __post_init__(self):
+        # Resolve gradient_checkpointing_method into internal fields used by
+        # the model and parallelization code.
+        gcm = self.gradient_checkpointing_method or "recompute_full_layer"
+        self.gradient_checkpointing_method = gcm
+        if gcm not in ("recompute_full_layer", "recompute_before_dispatch", "no_recompute"):
+            raise ValueError(
+                f"Unknown gradient_checkpointing_method: {gcm!r}. "
+                f"Choose from: recompute_full_layer, recompute_before_dispatch, no_recompute"
+            )
+
         if self.repo_commit is None:
             self.repo_commit = _detect_repo_commit()
         self.local_rank = int(os.getenv("LOCAL_RANK", "0"))
@@ -1374,9 +1383,11 @@ def parse_args(rootclass: T) -> T:
                     elif attr.default is MISSING:
                         parser_kwargs["required"] = True
                 else:
-                    # Regular list handling
+                    # Regular list handling. Optional[List[X]] uses nargs="*" so that
+                    # an empty list can be passed (e.g. --train.gradient_checkpointing_method
+                    # with no args). Non-optional lists keep nargs="+" (at least one item).
                     parser_kwargs["type"] = attr_type.__args__[0]
-                    parser_kwargs["nargs"] = "+"
+                    parser_kwargs["nargs"] = "*" if is_optional else "+"
                     if attr.default_factory is not MISSING:
                         parser_kwargs["default"] = attr.default_factory()
                     elif attr.default is MISSING:

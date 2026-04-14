@@ -244,16 +244,38 @@ Checkpoints are saved to `{output_dir}/checkpoints/global_step_{N}/`.
 
 ## Gradient Checkpointing
 
+Controls activation recomputation during backward to trade compute for memory.
+
 ```yaml
 train:
   enable_gradient_checkpointing: true
-  recompute_modules: [self_attn, mlp]   # selective recompute
+  gradient_checkpointing_method: recompute_full_layer   # default — recompute each decoder layer
 ```
 
-For MoE models, `moe_checkpoint_method: moe_act` recomputes only activations inside expert FFNs, skipping the EP dispatch (faster than full recompute):
+### Available methods
+
+| Method | Backward recomputes | Peak memory | Speed |
+|--------|---------------------|------------|-------|
+| `recompute_full_layer` | entire decoder layer (attn + MoE dispatch + expert + combine) | **lowest** | baseline |
+| `recompute_before_dispatch` | recompute attn+router, keep dispatch+expert+combine | moderate | **+25-34%** |
+| `no_recompute` | nothing recomputed | highest | max throughput |
+
+### When to use each
+
+- **`recompute_full_layer`** (default): required for long sequences (128k+) where activations exceed GPU memory.
+- **`recompute_before_dispatch`**: best tradeoff when memory allows. Recomputes attention and router but avoids recomputing MoE dispatch/combine, which is especially expensive at multi-node (InfiniBand). +24.5% at 1-node, +33.4% at 2-node.
+- **`no_recompute`**: maximum throughput, highest memory usage. Use for short sequences where activations fit in GPU memory.
+
 ```yaml
+# Maximum throughput (short seq, memory permits):
 train:
-  moe_checkpoint_method: moe_act
+  enable_gradient_checkpointing: true
+  gradient_checkpointing_method: no_recompute
+
+# Balanced memory/speed — recompute attn+router, keep dispatch+expert+combine:
+train:
+  enable_gradient_checkpointing: true
+  gradient_checkpointing_method: recompute_before_dispatch
 ```
 
 ## Logging

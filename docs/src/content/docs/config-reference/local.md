@@ -158,10 +158,9 @@ Each entry in `datasets` (or `test_datasets`) is a dict:
 | Field | Default | Description |
 |---|---|---|
 | `enable_mixed_precision` | `true` | BF16 mixed-precision training. |
-| `enable_gradient_checkpointing` | `true` | Activation recomputation to reduce memory. |
+| `enable_gradient_checkpointing` | `true` | Enable activation recomputation to reduce memory. |
+| `gradient_checkpointing_method` | `recompute_full_layer` | What to recompute in backward. Valid values: `recompute_full_layer` (recompute entire decoder layer, most memory-efficient), `recompute_before_dispatch` (recompute attn+router, keep dispatch+expert+combine, +25-34% throughput), `no_recompute` (no recomputation, max throughput, highest memory). See [gradient checkpointing guide](/training/local_training#gradient-checkpointing). |
 | `enable_reentrant` | `false` | Use reentrant gradient checkpointing. Default (non-reentrant) is generally preferred. |
-| `recompute_modules` | `null` | Selective checkpointing by submodule: `[self_attn]`, `[mlp]`, or `[self_attn, mlp]`. `null` = whole-layer recompute. |
-| `moe_checkpoint_method` | `null` | MoE-specific checkpoint: `null` (full recompute including EP communication), `moe_act` (recompute only gate/up activations, skip EP communication recompute — faster). |
 | `enable_full_shard` | `true` | FSDP2 full parameter sharding (ZeRO-3). Set `false` for ZeRO-2. |
 | `enable_forward_prefetch` | `true` | Prefetch next FSDP unit's parameters during forward pass. |
 | `enable_activation_offload` | `false` | Offload activations to CPU during forward pass. |

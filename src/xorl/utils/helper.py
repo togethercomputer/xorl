@@ -93,9 +93,8 @@ class EnvironMeter:
         global_batch_size: int,
         empty_cache_steps: int = 500,
         gc_steps: int = 0,
-        gc_enabled: bool = False,
-        recompute_modules=None,
-        moe_checkpoint_method=None,
+        gradient_checkpointing_enabled: bool = False,
+        gradient_checkpointing_method=None,
         cp_size: int = 1,
     ) -> None:
         self.config = config
@@ -109,9 +108,8 @@ class EnvironMeter:
 
         self.estimate_flops = XorlFlopsCounter(
             config,
-            gc_enabled=gc_enabled,
-            recompute_modules=recompute_modules,
-            moe_checkpoint_method=moe_checkpoint_method,
+            gradient_checkpointing_enabled=gradient_checkpointing_enabled,
+            gradient_checkpointing_method=gradient_checkpointing_method,
             cp_size=cp_size,
         ).estimate_flops
 

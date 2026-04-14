@@ -11,9 +11,7 @@ from .backend import (
     EP_COMBINE,
     EP_DISPATCH,
     EP_EXPERT_COMPUTE,
-    EP_EXPERT_COMPUTE_MOE_ACT,
     MOE_EXPERT_BACKENDS,
-    MOE_EXPERT_BACKENDS_MOE_ACT,
 )
 from .common import split_gate_up_proj
 
@@ -74,9 +72,6 @@ class MoEExperts(nn.Module):
         )
         self.act_fn = ACT2FN[hidden_act]
 
-        # Set by gradient_checkpointing_enable when moe_checkpoint_method="moe_act"
-        self._moe_act: bool = False
-
         # EP dispatch strategy: "alltoall" (default) or "deepep" (NVLink-optimized)
         self.ep_dispatch: str = "alltoall"
         self.deepep_buffer_size_gb: float = 2.0
@@ -112,8 +107,6 @@ class MoEExperts(nn.Module):
         When Expert Parallelism is enabled, all backends (triton/native/quack)
         use the unified dispatch → compute → combine path via ``_ep_forward()``.
         """
-        _moe_act = self._moe_act
-
         if self.moe_implementation == "eager":
             fn = MOE_EXPERT_BACKENDS[self.moe_implementation]
             assert expert_idx is not None
@@ -137,10 +130,7 @@ class MoEExperts(nn.Module):
         # Local single-GPU path
         gate_proj = self.gate_proj.contiguous()
         up_proj = self.up_proj.contiguous()
-        if _moe_act and self.moe_implementation in MOE_EXPERT_BACKENDS_MOE_ACT:
-            fn = MOE_EXPERT_BACKENDS_MOE_ACT[self.moe_implementation]
-        else:
-            fn = MOE_EXPERT_BACKENDS[self.moe_implementation]
+        fn = MOE_EXPERT_BACKENDS[self.moe_implementation]
 
         return fn(
             hidden_states,
@@ -182,12 +172,7 @@ class MoEExperts(nn.Module):
         dispatch_fn = EP_DISPATCH[self.ep_dispatch]
         combine_fn = EP_COMBINE[self.ep_dispatch]
 
-        # Select moe_act compute variant when available
-        _moe_act = self._moe_act
-        if _moe_act and self.moe_implementation in EP_EXPERT_COMPUTE_MOE_ACT:
-            compute_fn = EP_EXPERT_COMPUTE_MOE_ACT[self.moe_implementation]
-        else:
-            compute_fn = EP_EXPERT_COMPUTE[self.moe_implementation]
+        compute_fn = EP_EXPERT_COMPUTE[self.moe_implementation]
 
         # Step 1: Dispatch tokens to expert-owning ranks
         dispatch_kwargs = self._build_dispatch_kwargs(hidden_states, routing_weights, selected_experts, parallel_state)

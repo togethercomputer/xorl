@@ -413,8 +413,7 @@ def build_parallelize_model(
         # Extract gradient checkpointing kwargs before the loop
         use_reentrant = kwargs.pop("enable_reentrant", False)
         recompute_context_fn = kwargs.pop("recompute_context_fn", noop_context_fn)
-        recompute_modules = kwargs.pop("recompute_modules", None)
-        moe_checkpoint_method = kwargs.pop("moe_checkpoint_method", None)
+        grad_ckpt_method = kwargs.pop("gradient_checkpointing_method", None)
 
         # 4. Apply parallelism to each model part
         for i, model_part in enumerate(model_parts):
@@ -425,17 +424,15 @@ def build_parallelize_model(
                 if use_reentrant:
                     torch.utils.checkpoint.CheckpointFunction = CheckpointFunction
 
-                gc_kwargs = {"use_reentrant": use_reentrant}
+                grad_ckpt_kwargs = {"use_reentrant": use_reentrant}
                 # Skip context_fn when torch.compile is enabled -- dynamo can't trace
                 # through the SkipFunctionVariable (noop_context_fn). Without context_fn,
                 # checkpoint uses the same default behavior and dynamo can trace natively.
                 if not enable_compile:
-                    gc_kwargs["context_fn"] = recompute_context_fn if i == 0 else noop_context_fn
-                if recompute_modules is not None:
-                    gc_kwargs["recompute_modules"] = recompute_modules
-                if moe_checkpoint_method is not None:
-                    gc_kwargs["moe_checkpoint_method"] = moe_checkpoint_method
-                model_part.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gc_kwargs)
+                    grad_ckpt_kwargs["context_fn"] = recompute_context_fn if i == 0 else noop_context_fn
+                if grad_ckpt_method is not None:
+                    grad_ckpt_kwargs["gradient_checkpointing_method"] = grad_ckpt_method
+                model_part.gradient_checkpointing_enable(gradient_checkpointing_kwargs=grad_ckpt_kwargs)
 
             # TP (if enabled)
             if ps.tp_enabled:
@@ -551,23 +548,20 @@ def build_parallelize_model(
         if use_reentrant:
             torch.utils.checkpoint.CheckpointFunction = CheckpointFunction
 
-        gc_kwargs = {"use_reentrant": use_reentrant}
+        grad_ckpt_kwargs = {"use_reentrant": use_reentrant}
         # Only pass context_fn when torch.compile is NOT enabled AND a custom
         # recompute_context_fn is explicitly provided. Passing context_fn
         # (even noop_context_fn) triggers SAC which uses torch.compile internally,
         # causing unexpected Inductor compilation when compile is disabled.
         recompute_fn = kwargs.pop("recompute_context_fn", None)
         if recompute_fn is not None and not enable_compile:
-            gc_kwargs["context_fn"] = recompute_fn
+            grad_ckpt_kwargs["context_fn"] = recompute_fn
 
-        recompute_modules = kwargs.pop("recompute_modules", None)
-        moe_checkpoint_method = kwargs.pop("moe_checkpoint_method", None)
-        if recompute_modules is not None:
-            gc_kwargs["recompute_modules"] = recompute_modules
-        if moe_checkpoint_method is not None:
-            gc_kwargs["moe_checkpoint_method"] = moe_checkpoint_method
+        grad_ckpt_method = kwargs.pop("gradient_checkpointing_method", None)
+        if grad_ckpt_method is not None:
+            grad_ckpt_kwargs["gradient_checkpointing_method"] = grad_ckpt_method
 
-        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gc_kwargs)
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=grad_ckpt_kwargs)
 
         if use_reentrant:
             # Reentrant checkpointing doesn't support kwargs. Wrap the checkpoint
