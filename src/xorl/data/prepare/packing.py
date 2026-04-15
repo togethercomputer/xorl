@@ -13,7 +13,6 @@ from typing import Any, Callable, Dict, List, Optional
 
 import numba
 import numpy as np
-import torch.distributed as dist
 from datasets import Dataset as HFDataset
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer
@@ -458,10 +457,16 @@ class PackingDataset(Dataset):
         LOG.info(f"Saved bins cache to {cache_path}")
 
     def _load_or_compute_bins(self) -> List[List[int]]:
-        """Load cached bins or compute new ones with distributed coordination."""
-        # Get rank from environment variable (set by torchrun/distributed launcher)
+        """Load cached bins or compute new ones.
+
+        Distributed synchronization (barrier) is handled by the caller
+        (``prepare_datasets``), NOT here.  ``prepare_datasets`` calls
+        ``_load_datasets`` on rank 0 first, then barriers, then on
+        non-zero ranks.  Adding a barrier inside this function would
+        cause an NCCL collective mismatch because different ranks call
+        this function at different times.
+        """
         rank = int(os.environ.get("RANK", "0"))
-        is_distributed = dist.is_available() and dist.is_initialized()
 
         # Try to load from cache first
         cached_bins = self._load_cached_bins()
@@ -470,33 +475,20 @@ class PackingDataset(Dataset):
 
         cache_path = self._get_bins_cache_path()
 
-        # Use rank 0 to compute and save, others wait and load
         if rank == 0:
-            # Rank 0 computes new bins
+            # Rank 0 computes new bins and saves to cache.
+            # Non-zero ranks will load from cache after the caller's
+            # barrier ensures the cache file is visible.
             LOG.info("Computing new bins...")
             bins = self._compute_bins()
 
-            # Save to cache for future use
             if cache_path is not None:
                 self._save_bins_cache(bins)
-            if is_distributed:
-                dist.barrier()
         else:
-            # Other ranks wait for rank 0 to finish
+            # Non-zero ranks: try loading from cache (written by rank 0).
+            # The caller's barrier guarantees rank 0 has finished writing
+            # before non-zero ranks reach this point.
             if cache_path is not None:
-                LOG.info(f"Rank {rank} waiting for rank 0 to compute bins...")
-                if is_distributed:
-                    dist.barrier()
-                else:
-                    max_wait_time = 3600
-                    wait_interval = 5
-                    waited = 0
-                    while not cache_path.exists() and waited < max_wait_time:
-                        time.sleep(wait_interval)
-                        waited += wait_interval
-                    if not cache_path.exists():
-                        raise RuntimeError(f"Rank {rank} timed out waiting for rank 0 to compute bins")
-
                 bins = None
                 max_retries = 10
                 for attempt in range(max_retries):
