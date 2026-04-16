@@ -1,5 +1,6 @@
 import torch
 
+from xorl.ops.fused_silu_and_mul import silu_and_mul, silu_and_mul_backward
 from xorl.utils.import_utils import is_fused_moe_available
 
 
@@ -36,14 +37,11 @@ class TritonEPGroupGemm(torch.autograd.Function):
             transpose_a=False,
             transpose_b=False,
         )
-        gate_output = gate_up_output[..., :I]
-        up_output = gate_up_output[..., I:]
 
-        gate_activation = torch.ops.aten.silu(gate_output)
-        gated_output = gate_activation * up_output
+        # Fused SiLU+mul: silu(gate) * up in a single Triton kernel
+        gated_output = silu_and_mul(gate_up_output)
         if expert_scores is not None:
             gated_output = gated_output * expert_scores.to(gated_output.dtype).unsqueeze(-1)
-        del gate_activation
 
         down_output = group_gemm_same_nk(
             a=gated_output,
@@ -65,14 +63,9 @@ class TritonEPGroupGemm(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         permute_tokens, cumsum, gate_up_proj, down_proj, gate_up_output, expert_scores = ctx.saved_tensors
-        I = ctx.intermediate_size
         max_M = grad_output.shape[0]
 
-        gate_output = gate_up_output[..., :I]
-        up_output = gate_up_output[..., I:]
-
-        gate_activation = torch.ops.aten.silu(gate_output)
-        gated_output = gate_activation * up_output
+        gated_output = silu_and_mul(gate_up_output)
         expert_scores_dtype = expert_scores.dtype
         expert_scores = expert_scores.to(gated_output.dtype)
         gated_weighted = gated_output * expert_scores.unsqueeze(-1)
@@ -107,17 +100,10 @@ class TritonEPGroupGemm(torch.autograd.Function):
         grad_gated_output = grad_gated_weighted * expert_scores.unsqueeze(-1)
         del grad_gated_weighted
 
-        # Activation backward
-        grad_up_output = gate_activation * grad_gated_output
-        grad_gate_activation = grad_gated_output * up_output
-        del grad_gated_output, gate_activation, up_output, gate_up_output
+        # Fused activation backward: single Triton kernel for SiLU+mul gradient
+        grad_gate_up_act = silu_and_mul_backward(grad_gated_output, gate_up_output)
+        del grad_gated_output, gate_up_output
 
-        grad_gate_output = torch.ops.aten.silu_backward(grad_gate_activation, gate_output)
-        del grad_gate_activation, gate_output
-
-        # Fused dgrad FC1: cat grads → single GEMM with gate_up_proj (no .contiguous() copies)
-        grad_gate_up_act = torch.cat([grad_gate_output, grad_up_output], dim=-1)
-        del grad_gate_output, grad_up_output
         grad_permute_tokens = group_gemm_same_nk(
             a=grad_gate_up_act,
             b=gate_up_proj,
