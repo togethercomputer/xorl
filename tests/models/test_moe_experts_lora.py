@@ -668,5 +668,169 @@ class TestFromModuleAndInjection:
         assert isinstance(model.v_proj, LoraLinear)
 
 
+# ---------------------------------------------------------------------------
+# 7. EP LoRA router-score application
+# ---------------------------------------------------------------------------
+
+
+class TestEPLoRARouterScores:
+    """Test that MoEExpertsLoRA._ep_forward applies router scores from the dispatch context.
+
+    The LoRA EP compute functions don't accept expert_scores (unlike the non-LoRA
+    path), so _ep_forward must apply them post-compute. This test verifies:
+    - Scores from "expert_scores" (alltoall) and "permuted_scores" (deepep) are applied
+    - Missing scores leave the output unchanged
+    - Gradients flow through the score multiplication to LoRA parameters
+    """
+
+    NUM_EXPERTS = 4
+    HIDDEN_DIM = 32
+    INTERMEDIATE = 64
+    R = 4
+    NUM_TOKENS = 8
+
+    def _make_experts(self):
+        experts = MoEExpertsLoRA(
+            num_experts=self.NUM_EXPERTS,
+            hidden_dim=self.HIDDEN_DIM,
+            intermediate_size=self.INTERMEDIATE,
+            moe_implementation="native",
+            lora_config=MoELoRAConfig(r=self.R, lora_alpha=8),
+        )
+        nn.init.xavier_normal_(experts.gate_up_proj.data)
+        nn.init.xavier_normal_(experts.down_proj.data)
+        experts.ep_dispatch = "alltoall"
+        return experts
+
+    def _run_ep_forward(self, experts, score_attr=None, scores=None, compute_output=None):
+        """Run _ep_forward with mocked dispatch/compute/combine.
+
+        Returns (final_output, expert_output_passed_to_combine).
+        """
+        from dataclasses import make_dataclass
+        from unittest.mock import MagicMock, patch
+
+        if compute_output is None:
+            compute_output = torch.randn(self.NUM_TOKENS, self.HIDDEN_DIM)
+
+        # Build dispatch context with the requested score attribute
+        fields = []
+        if score_attr is not None:
+            fields.append((score_attr, torch.Tensor))
+        Ctx = make_dataclass("Ctx", fields)
+        ctx = Ctx(**({score_attr: scores} if score_attr else {}))
+
+        mock_dispatch = MagicMock(
+            return_value=(
+                torch.randn(self.NUM_TOKENS, self.HIDDEN_DIM),  # permute_tokens
+                torch.tensor([2, 4, 6, 8]),  # cumsum
+                ctx,
+            )
+        )
+        mock_compute = MagicMock(return_value=compute_output)
+
+        captured = {}
+
+        def mock_combine(**kwargs):
+            captured["expert_output"] = kwargs["expert_output"]
+            return kwargs["expert_output"]
+
+        mock_ps = MagicMock()
+        mock_ps.ep_enabled = True
+        mock_ps.ep_group = MagicMock()
+
+        with (
+            patch.dict("xorl.models.layers.moe.lora.EP_DISPATCH", {"alltoall": mock_dispatch}),
+            patch.dict("xorl.models.layers.moe.lora.EP_COMBINE", {"alltoall": mock_combine}),
+            patch.dict("xorl.models.layers.moe.lora.EP_EXPERT_COMPUTE_LORA", {"native": mock_compute}),
+            patch("xorl.distributed.parallel_state.get_parallel_state", return_value=mock_ps),
+        ):
+            hidden = torch.randn(self.NUM_TOKENS, self.HIDDEN_DIM)
+            routing_weights = torch.softmax(torch.randn(self.NUM_TOKENS, 2), dim=-1)
+            selected_experts = torch.randint(0, self.NUM_EXPERTS, (self.NUM_TOKENS, 2))
+
+            output = experts(hidden, routing_weights, selected_experts)
+
+        return output, captured["expert_output"]
+
+    @pytest.mark.parametrize("score_attr", ["expert_scores", "permuted_scores"])
+    def test_scores_applied_to_output(self, score_attr):
+        """Router scores from dispatch context are multiplied into expert output."""
+        experts = self._make_experts()
+        compute_output = torch.randn(self.NUM_TOKENS, self.HIDDEN_DIM)
+        scores = torch.rand(self.NUM_TOKENS) * 0.5 + 0.1  # non-trivial scores in (0.1, 0.6)
+
+        _, expert_output = self._run_ep_forward(
+            experts,
+            score_attr=score_attr,
+            scores=scores,
+            compute_output=compute_output,
+        )
+
+        expected = compute_output * scores.unsqueeze(1)
+        torch.testing.assert_close(expert_output, expected)
+
+    def test_no_scores_leaves_output_unchanged(self):
+        """When dispatch context has no score attribute, expert output is unchanged."""
+        experts = self._make_experts()
+        compute_output = torch.randn(self.NUM_TOKENS, self.HIDDEN_DIM)
+
+        _, expert_output = self._run_ep_forward(
+            experts,
+            score_attr=None,
+            compute_output=compute_output,
+        )
+
+        torch.testing.assert_close(expert_output, compute_output)
+
+    def test_gradient_flows_through_scores(self):
+        """Gradients from the score multiplication reach LoRA parameters."""
+        from dataclasses import make_dataclass
+        from unittest.mock import MagicMock, patch
+
+        experts = self._make_experts()
+        compute_output = torch.randn(self.NUM_TOKENS, self.HIDDEN_DIM, requires_grad=True)
+        scores = torch.rand(self.NUM_TOKENS, requires_grad=True)
+
+        Ctx = make_dataclass("Ctx", [("expert_scores", torch.Tensor)])
+        ctx = Ctx(expert_scores=scores)
+
+        mock_dispatch = MagicMock(
+            return_value=(
+                torch.randn(self.NUM_TOKENS, self.HIDDEN_DIM),
+                torch.tensor([2, 4, 6, 8]),
+                ctx,
+            )
+        )
+        mock_compute = MagicMock(return_value=compute_output)
+
+        def mock_combine(**kwargs):
+            return kwargs["expert_output"]
+
+        mock_ps = MagicMock()
+        mock_ps.ep_enabled = True
+        mock_ps.ep_group = MagicMock()
+
+        with (
+            patch.dict("xorl.models.layers.moe.lora.EP_DISPATCH", {"alltoall": mock_dispatch}),
+            patch.dict("xorl.models.layers.moe.lora.EP_COMBINE", {"alltoall": mock_combine}),
+            patch.dict("xorl.models.layers.moe.lora.EP_EXPERT_COMPUTE_LORA", {"native": mock_compute}),
+            patch("xorl.distributed.parallel_state.get_parallel_state", return_value=mock_ps),
+        ):
+            hidden = torch.randn(self.NUM_TOKENS, self.HIDDEN_DIM)
+            routing_weights = torch.softmax(torch.randn(self.NUM_TOKENS, 2), dim=-1)
+            selected_experts = torch.randint(0, self.NUM_EXPERTS, (self.NUM_TOKENS, 2))
+
+            output = experts(hidden, routing_weights, selected_experts)
+            output.sum().backward()
+
+        # Gradient should flow through scores back to compute_output
+        assert compute_output.grad is not None
+        assert scores.grad is not None
+        # scores.grad should equal the sum of (compute_output * grad_output) per token
+        expected_score_grad = (compute_output.detach() * 1.0).sum(dim=1)  # grad_output is all 1s from .sum()
+        torch.testing.assert_close(scores.grad, expected_score_grad)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

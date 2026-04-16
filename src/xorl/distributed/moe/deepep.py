@@ -325,14 +325,15 @@ class _FusedDispatchAndPermute(torch.autograd.Function):
         buffer = ctx.buffer
         handle = ctx.handle
 
-        # Step 1: Scatter gradient from expert order → recv order
+        # Step 1: Scatter gradient from expert order → recv order (FP32 for precision)
         grad_recv_x = torch.zeros(
             ctx.num_recv_tokens,
             ctx.hidden_dim,
-            dtype=grad_expert_input.dtype,
+            dtype=torch.float32,
             device=grad_expert_input.device,
         )
-        grad_recv_x.index_add_(0, permuted_indices, grad_expert_input)
+        grad_recv_x.index_add_(0, permuted_indices, grad_expert_input.float())
+        grad_recv_x = grad_recv_x.to(grad_expert_input.dtype)
 
         # Step 2: Combine to reverse dispatch
         previous_event = EventOverlap(EventHandle())
@@ -385,17 +386,21 @@ class _FusedUnpermuteAndCombine(torch.autograd.Function):
                 device=device,
             )
         else:
+            # Scores are already applied by the expert compute function
+            # (triton/native backends multiply by expert_scores). Do NOT
+            # re-apply here — that would double-count router weights.
             gather_output = torch.zeros(
                 dispatch_ctx.num_recv_tokens,
                 hidden_dim,
-                dtype=dtype,
+                dtype=torch.float32,
                 device=device,
             )
             idx_2d = dispatch_ctx.permuted_indices.unsqueeze(1).expand(-1, hidden_dim)
             _CHUNK = 4096
             for _i in range(0, expert_output.shape[0], _CHUNK):
                 _end = min(_i + _CHUNK, expert_output.shape[0])
-                gather_output.scatter_add_(0, idx_2d[_i:_end], expert_output[_i:_end])
+                gather_output.scatter_add_(0, idx_2d[_i:_end], expert_output[_i:_end].float())
+            gather_output = gather_output.to(dtype)
 
         # Step 2: Combine
         previous_event = EventOverlap(EventHandle())

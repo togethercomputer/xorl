@@ -39,15 +39,16 @@ def requires_mesh(fn: Callable) -> Callable:
     return _inner
 
 
-def init_ep_mesh_matrix(ep_size: int, ep_fsdp_size: int, ep_outside: bool = False) -> "DeviceMesh":
+def init_ep_mesh_matrix(ep_size: int, ep_fsdp_size: int, ep_intranode: bool = True) -> "DeviceMesh":
     """
     Initialize the device mesh matrix for the EP.
     Args:
         ep_size (int): The size of the EP.
         ep_fsdp_size (int): The size of the EP-FSDP.
-        ep_outside (bool): Whether the EP is outside in ep-fsdp group.
+        ep_intranode (bool): When True (default), EP all-to-all uses consecutive
+            ranks (intra-node NVLink). When False, EP spans across nodes.
     """
-    if ep_outside:
+    if not ep_intranode:
         with torch.device("cpu"):
             mesh = torch.arange(math.prod((ep_size, ep_fsdp_size)), dtype=torch.int).view(ep_size, ep_fsdp_size)
     else:
@@ -404,6 +405,47 @@ class ParallelState:
     def ep_rank(self) -> int:
         return self.ep_fsdp_device_mesh.get_local_rank("ep")
 
+    # --- Torchtitan eFSDP naming (aligns with torchtitan's 6-D mesh design) ---
+
+    @property
+    @requires_mesh
+    def dp_shard_mod_ep_mesh(self) -> "DeviceMesh":
+        """FSDP mesh for non-expert params: all DP-shard ranks (ep × ep_fsdp).
+
+        Torchtitan names this ``dp_shard_mod_ep``: the full shard dimension that
+        *contains* EP groups.  Non-expert params are sharded across all ranks in
+        this mesh, so every GPU holds a shard of every weight.
+        """
+        return self.fsdp_mesh
+
+    @property
+    def dp_shard_mod_ep_size(self) -> int:
+        """Total ranks participating in non-expert FSDP (= ep_size × ep_fsdp_size)."""
+        return self.fsdp_size
+
+    @property
+    @requires_mesh
+    def dp_shard_in_ep_mesh(self) -> "DeviceMesh":
+        """FSDP mesh for expert params: ranks *within* the same EP group.
+
+        Torchtitan names this ``dp_shard_in_ep``: the inner shard dimension that
+        operates *inside* a single EP group.  Expert params are FSDP-sharded only
+        across these ranks; different EP groups hold different expert weights.
+
+        When EP is disabled, falls back to the full FSDP mesh (all ranks).
+        """
+        if self.ep_enabled and self.ep_fsdp_device_mesh is not None:
+            return self.ep_fsdp_device_mesh["ep_fsdp"]
+        return self.fsdp_mesh
+
+    @property
+    def dp_shard_in_ep_size(self) -> int:
+        """Ranks per EP group used for expert FSDP (= total_dp / ep_size)."""
+        if self.ep_enabled:
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+            return (world_size // self.pp_size) // self.ep_size
+        return self.fsdp_size
+
     # ------------------------------ SP (sequence parallel) ------------------------------ #
     @property
     def sp_group(self) -> Optional["ProcessGroup"]:
@@ -533,7 +575,7 @@ def init_parallel_state(
     dp_mode: Literal["none", "ddp", "fsdp2"] = "fsdp2",
     device_type: str = None,
     cp_fsdp_mode: Literal["all", "ulysses_only", "ring_only", "none"] = "all",
-    ep_outside: bool = False,
+    ep_intranode: bool = True,
 ) -> None:
     """
     Initializes global parallel state.
@@ -643,10 +685,10 @@ def init_parallel_state(
                     for pp_stage in range(pp_size):
                         stage_start = pp_stage * ranks_per_stage
                         stage_ranks = torch.arange(stage_start, stage_start + ranks_per_stage, dtype=torch.int)
-                        if ep_outside:
-                            pp_ep_mesh[pp_stage] = stage_ranks.view(ep_size, ep_fsdp_size)
-                        else:
+                        if ep_intranode:
                             pp_ep_mesh[pp_stage] = stage_ranks.view(ep_fsdp_size, ep_size).transpose(0, 1)
+                        else:
+                            pp_ep_mesh[pp_stage] = stage_ranks.view(ep_size, ep_fsdp_size)
 
                 ep_fsdp_device_mesh = DeviceMesh(
                     device_type=device_type,
@@ -654,7 +696,7 @@ def init_parallel_state(
                     mesh_dim_names=("_pp_ep", "ep", "ep_fsdp"),
                 )
             else:
-                mesh = init_ep_mesh_matrix(ep_size=ep_size, ep_fsdp_size=ep_fsdp_size, ep_outside=ep_outside)
+                mesh = init_ep_mesh_matrix(ep_size=ep_size, ep_fsdp_size=ep_fsdp_size, ep_intranode=ep_intranode)
                 ep_fsdp_device_mesh = DeviceMesh(
                     device_type=device_type,
                     mesh=mesh,

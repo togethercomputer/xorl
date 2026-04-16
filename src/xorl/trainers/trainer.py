@@ -848,6 +848,7 @@ class Trainer:
             RoutingReplay.clear_all()
 
         self._sync_sp_gradients()
+
         grad_norm = self._clip_and_step()
         self._maybe_merge_lora()
         total_loss, grad_norm = self._reduce_metrics(total_loss, grad_norm)

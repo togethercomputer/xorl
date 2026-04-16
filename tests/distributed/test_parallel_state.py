@@ -22,18 +22,18 @@ class TestEPMeshMatrixAndRequiresMesh:
 
     def test_ep_mesh_matrix_and_requires_mesh(self):
         """EP mesh matrix: row-major, transposed, edge cases; requires_mesh raises/allows correctly."""
-        # ep_outside=True: row-major
-        mesh = init_ep_mesh_matrix(ep_size=2, ep_fsdp_size=4, ep_outside=True)
+        # ep_intranode=True (default): consecutive ranks in same EP group (intra-node)
+        mesh = init_ep_mesh_matrix(ep_size=2, ep_fsdp_size=4, ep_intranode=True)
         assert mesh.shape == (2, 4) and mesh.dtype == torch.int
-        assert torch.equal(mesh, torch.arange(8).view(2, 4))
-
-        # ep_outside=False: transposed
-        mesh = init_ep_mesh_matrix(ep_size=2, ep_fsdp_size=4, ep_outside=False)
         assert torch.equal(mesh, torch.arange(8).view(4, 2).transpose(0, 1))
 
+        # ep_intranode=False: EP spans across nodes
+        mesh = init_ep_mesh_matrix(ep_size=2, ep_fsdp_size=4, ep_intranode=False)
+        assert torch.equal(mesh, torch.arange(8).view(2, 4))
+
         # Edge: single ep_size / ep_fsdp_size
-        assert torch.equal(init_ep_mesh_matrix(1, 4, True), torch.arange(4).unsqueeze(0))
-        assert torch.equal(init_ep_mesh_matrix(4, 1, True), torch.arange(4).unsqueeze(1))
+        assert torch.equal(init_ep_mesh_matrix(1, 4, ep_intranode=False), torch.arange(4).unsqueeze(0))
+        assert torch.equal(init_ep_mesh_matrix(4, 1, ep_intranode=False), torch.arange(4).unsqueeze(1))
 
         # requires_mesh decorator
         class MC:

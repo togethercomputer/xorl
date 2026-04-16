@@ -112,7 +112,7 @@ Each entry in `datasets` (or `test_datasets`) is a dict:
 | `ringattn_parallel_size` | `1` | Ring Attention degree. |
 | `cp_fsdp_mode` | `all` | How context parallelism interacts with FSDP: `all` (both Ulysses+Ring), `ulysses_only`, `ring_only`, `none`. |
 | `reshard_after_forward` | `null` | FSDP2 reshard after forward. `true` = save memory, `false` = save communication (used for PP by default). `null` = auto. |
-| `ep_outside` | `false` | Place EP outside the EP-FSDP mesh. |
+| `ep_intranode` | `true` | Keep EP all-to-all within the node (NVLink). Set `false` to place EP across nodes. |
 
 :::caution[Field interactions]
 - `data_parallel_mode: fsdp2` **requires** `init_device: meta`

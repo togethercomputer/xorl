@@ -285,6 +285,13 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
             self.scaling,
         )
 
+        # Apply router scores — LoRA compute functions don't accept
+        # expert_scores, so apply them here (matches the non-LoRA path
+        # where scores are applied inside the compute function).
+        expert_scores = getattr(ctx, "expert_scores", getattr(ctx, "permuted_scores", None))
+        if expert_scores is not None:
+            expert_output = expert_output * expert_scores.unsqueeze(1).to(expert_output.dtype)
+
         # Step 3: Combine expert outputs back to original ranks
         combine_kwargs = self._build_combine_kwargs(expert_output, ctx, dispatch_kwargs, parallel_state)
         return combine_fn(**combine_kwargs)

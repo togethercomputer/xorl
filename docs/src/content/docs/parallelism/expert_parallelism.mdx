@@ -404,19 +404,19 @@ With PP, a 3-D mesh `(_pp_ep, ep, ep_fsdp)` is created so that each PP stage get
 own EP process groups.  Slicing by `["ep"]` automatically returns the correct per-stage
 submesh for the calling rank.
 
-### `ep_outside` flag
+### `ep_intranode` flag
 
-By default (`ep_outside=False`), the rank assignment within each `[ep_size, ep_fsdp_size]`
-block interleaves EP and FSDP ranks so that consecutive ranks belong to the same EP group.
-Setting `ep_outside=True` transposes the layout so consecutive ranks belong to the same
-FSDP group instead.
+By default (`ep_intranode=True`), consecutive ranks belong to the same EP group,
+keeping EP all-to-all traffic within the node (fast NVLink). Setting `ep_intranode=False`
+transposes the layout so consecutive ranks belong to the same FSDP group instead,
+placing EP across nodes (IB/RDMA).
 
 `init_ep_mesh_matrix()` implements both layouts:
 
 ```python
-# ep_outside=False (default): FSDP-major, EP-minor
+# ep_intranode=True (default): EP ranks are consecutive (intra-node)
 mesh = arange(ep_size * ep_fsdp_size).view(ep_fsdp_size, ep_size).T
-# ep_outside=True: EP-major, FSDP-minor
+# ep_intranode=False: EP spans across nodes
 mesh = arange(ep_size * ep_fsdp_size).view(ep_size, ep_fsdp_size)
 ```
 
@@ -833,7 +833,7 @@ ranks.
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `expert_parallel_size` | `int` | `1` | Number of EP ranks. Must divide `num_experts` and `ranks_per_pp_stage`. |
-| `ep_outside` | `bool` | `False` | When `True`, consecutive ranks are in the same EP-FSDP group rather than the same EP group. |
+| `ep_intranode` | `bool` | `True` | When `True` (default), EP all-to-all uses consecutive ranks (intra-node NVLink). When `False`, EP spans across nodes. |
 | `data_parallel_shard_size` | `int` | `-1` | FSDP shard size. Together with `expert_parallel_size`, determines `ep_fsdp_size = ranks_per_stage / ep_size`. |
 | `pipeline_parallel_size` | `int` | `1` | PP degree. EP groups are confined within each PP stage. |
 | `ringattn_parallel_size` | `int` | `1` | Ring attention CP size. Can be folded into EP-FSDP axis via `ep_fsdp_size`. |

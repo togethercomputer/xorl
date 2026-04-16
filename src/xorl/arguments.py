@@ -793,9 +793,9 @@ class TrainingArguments:
         default=1,
         metadata={"help": "Expert parallel size."},
     )
-    ep_outside: bool = field(
-        default=False,
-        metadata={"help": "Enable expert parallelism outside in ep-fsdp."},
+    ep_intranode: bool = field(
+        default=True,
+        metadata={"help": "Place EP all-to-all within the node (NVLink). When False, EP spans across nodes."},
     )
     ulysses_parallel_size: int = field(
         default=1,

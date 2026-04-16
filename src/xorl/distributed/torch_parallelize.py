@@ -220,13 +220,18 @@ def parallelize_model_fsdp2(
         layer_mod._fsdp_modules = []
         # ep enabled and this layer contains the expert module
         if parallel_state.ep_enabled and experts_mod is not None and not getattr(experts_mod, "_skip_fsdp", False):
+            # Block LoRA experts with eFSDP > 1: LoRA + EP + eFSDP gradient
+            # interaction has not been validated. Until it is, require ep_fsdp_size=1.
+            from xorl.lora.modules.base import LoraModule  # noqa: PLC0415
+
+            if isinstance(experts_mod, LoraModule):
+                assert parallel_state.dp_shard_in_ep_size <= 1, (
+                    f"LoRA expert modules are not yet supported with ep_fsdp_size > 1 "
+                    f"(got {parallel_state.dp_shard_in_ep_size}). "
+                    f"Use ep_fsdp_size=1 for LoRA + EP training."
+                )
             # shard expert
             fully_shard(experts_mod, **expert_fsdp_kwargs)
-            if hasattr(experts_mod, "set_gradient_divide_factor"):
-                # average EP grads across EP ranks
-                experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
-                # mark so the global divide-factor reset below doesn't override this
-                experts_mod._is_ep_fsdp = True
             layer_mod._fsdp_modules.append(experts_mod)
         # shard module that needs to ignore mixed precision control
         if mp_ignored_classes:
@@ -244,6 +249,19 @@ def parallelize_model_fsdp2(
         # (each EP rank has different local expert LoRA params — they should not be all-gathered globally)
         layer_fsdp_kwargs = dict(fsdp_kwargs)
         if parallel_state.ep_enabled and experts_mod is not None and getattr(experts_mod, "_skip_fsdp", False):
+            # _skip_fsdp params are excluded from FSDP, so they receive no automatic
+            # gradient all-reduce across eFSDP replicas.  When ep_fsdp_size > 1 the
+            # same expert weights are replicated on each eFSDP rank but process
+            # different data (separate all-to-all per EP group), producing divergent
+            # gradients.  Until an explicit eFSDP gradient sync is added for these
+            # params, block the unsupported combination.
+            assert parallel_state.dp_shard_in_ep_size <= 1, (
+                f"_skip_fsdp expert modules (e.g. QLoRA) are not yet supported with "
+                f"ep_fsdp_size > 1 (got {parallel_state.dp_shard_in_ep_size}). "
+                f"Per-expert LoRA params have no gradient sync across eFSDP replicas, "
+                f"which would cause weight divergence. Use ep_fsdp_size=1 or remove "
+                f"_skip_fsdp (wrap experts with FSDP instead)."
+            )
             layer_fsdp_kwargs["ignored_params"] = set(experts_mod.parameters())
         fully_shard(layer_mod, **layer_fsdp_kwargs)
         layer_mod._fsdp_modules.append(layer_mod)
@@ -297,13 +315,19 @@ def parallelize_model_fsdp2(
                 prefetch_modules = prev_block._fsdp_modules
                 current_block.set_modules_to_backward_prefetch(list(reversed(prefetch_modules)))
 
-    # Disable FSDP's automatic gradient averaging — we normalize gradients manually
-    # (gradient_accumulate_loss for non-PP; explicit grad.mul_(1/gvt) for PP).
-    # Skip EP-sharded expert modules: they manage their own divide factor (ep_size)
-    # for averaging expert gradients across EP ranks.
+    # Disable FSDP's automatic gradient averaging for ALL modules (including EP experts).
+    # Gradient normalisation is handled uniformly by the loss (gradient_accumulate_loss
+    # for non-PP; explicit grad.mul_(1/gvt) for PP).
+    #
+    # factor=1.0 is correct for BOTH expert and non-expert modules because:
+    # - Non-expert: SUM across fsdp_mesh (all 64 ranks), each contributing grad scaled
+    #   by local_valid_tokens/global_valid_tokens = 1/world_size → correct mean.
+    # - Expert: each eFSDP rank already accumulated gradients from ALL GPUs in its EP
+    #   group (via all-to-all dispatch). SUM across eFSDP replicas covers all data
+    #   replicas, so the total = (1/world_size) * all tokens routed to this expert → correct.
 
     for module in model.modules():
-        if isinstance(module, FSDPModule) and not getattr(module, "_is_ep_fsdp", False):
+        if isinstance(module, FSDPModule):
             module.set_gradient_divide_factor(1.0)
 
     # Handle meta initialization for FSDP2 (fallback if pre-load not done)
@@ -334,10 +358,73 @@ def parallelize_model_fsdp2(
             logger.info_rank0("Every rank reading weights from disk independently...")
             all_ranks_load_weights(model, weights_path, weight_device, dtensor_factory=distribute_tensor)
 
+    # Build EP param groups now (torchtitan eFSDP design: track groups at wrap time,
+    # not just at optimizer build time, so grad clipping works regardless of optimizer
+    # choice and before the optimizer is constructed).
+    if parallel_state.ep_enabled:
+        _build_ep_param_groups(model)
+
     # Register grad norm clipping method for FSDP2
     model.clip_grad_norm_ = types.MethodType(clip_grad_norm, model)
 
     return model
+
+
+def _build_ep_param_groups(model: "nn.Module") -> None:
+    """Classify post-FSDP parameters into EP and non-EP groups.
+
+    Implements the torchtitan eFSDP design: after ``fully_shard()`` wraps expert
+    modules with the ep_fsdp sub-mesh and non-expert modules with the full DP mesh,
+    we classify every parameter by whether it lives on the ep_fsdp mesh.  The
+    resulting ``model._ep_param_groups`` dict is consumed by
+    ``ep_fsdp2_clip_grad_norm`` to apply the correct reduction and scaling to each
+    group.
+
+    Classification rules:
+      - ``_skip_fsdp`` expert params (plain tensors, e.g. QLoRA LoRA per-expert):
+        EP group — each rank holds unique expert weights, no cross-rank reduction.
+      - DTensor whose device mesh dim names include ``"ep_fsdp"``:
+        EP group — sharded within the ep_fsdp sub-mesh.
+      - Everything else:
+        non-EP group — standard FSDP sharding across the full DP mesh.
+
+    Note: The optimizer builder (``build_ep_fsdp2_optimizer``) rebuilds this dict
+    to apply additional ``requires_grad`` filtering and Muon/AdamW classification.
+    Setting it here ensures grad clipping is correct even when using a non-EP-aware
+    optimizer or before the optimizer is constructed.
+    """
+    try:
+        from torch.distributed._tensor import DTensor  # noqa: PLC0415
+    except ImportError:
+        DTensor = None
+
+    # _skip_fsdp expert modules hold plain tensor params (not wrapped by FSDP)
+    skip_fsdp_param_ids: set = set()
+    for m in model.modules():
+        if getattr(m, "_skip_fsdp", False):
+            for p in m.parameters():
+                skip_fsdp_param_ids.add(id(p))
+
+    ep_params = []
+    non_ep_params = []
+    for p in model.parameters():
+        if id(p) in skip_fsdp_param_ids:
+            ep_params.append(p)
+            continue
+        if DTensor is not None and isinstance(p, DTensor):
+            mesh = getattr(p, "device_mesh", None)
+            names = getattr(mesh, "mesh_dim_names", ()) if mesh is not None else ()
+            if "ep_fsdp" in names:
+                ep_params.append(p)
+                continue
+        non_ep_params.append(p)
+
+    model._ep_param_groups = {"ep": ep_params, "non_ep": non_ep_params}
+    logger.info_rank0(
+        f"eFSDP param groups (torchtitan design): "
+        f"{len(ep_params)} EP params (ep_fsdp mesh), "
+        f"{len(non_ep_params)} non-EP params (full DP mesh)"
+    )
 
 
 def build_parallelize_model(
