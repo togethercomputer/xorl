@@ -152,9 +152,7 @@ def add_endpoints(train_url, infer_urls):
     for url in infer_urls:
         parsed = urlparse(url)
         host, port = parsed.hostname, parsed.port
-        resp = requests.post(
-            f"{train_url}/add_inference_endpoint", json={"host": host, "port": port, "worker_port": port}, timeout=30
-        )
+        resp = requests.post(f"{train_url}/add_inference_endpoint", json={"host": host, "port": port}, timeout=30)
         resp.raise_for_status()
         result = resp.json()
         si = result.get("endpoint", {}).get("server_info", {}) if result else {}

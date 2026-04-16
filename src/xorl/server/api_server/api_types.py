@@ -731,29 +731,19 @@ class InferenceEndpoint(BaseModel):
     """Represents a single inference endpoint."""
 
     host: str = Field(..., description="Hostname or IP address of the inference endpoint")
-    port: int = Field(..., description="Port number of the SGLang server")
-    worker_port: int = Field(..., description="Port number of the inference worker (HTTP API wrapper)")
+    port: int = Field(..., description="Port number of the inference endpoint")
     world_size: int = Field(default=1, description="Number of workers at this endpoint")
     healthy: bool = Field(default=True, description="Whether the endpoint is healthy")
     server_info: Optional[InferenceEndpointServerInfo] = Field(
         default=None, description="Server info from the inference endpoint"
     )
 
-    @property
-    def worker_url(self) -> str:
-        """Compute the inference worker URL for /api/update_weights calls."""
-        return f"http://{self.host}:{self.worker_port}"
-
 
 class AddInferenceEndpointRequest(BaseModel):
     """API request for adding an inference endpoint."""
 
     host: str = Field(..., description="Hostname or IP address of the inference endpoint")
-    port: int = Field(..., description="Port number of the SGLang server")
-    worker_port: Optional[int] = Field(
-        default=None,
-        description="Port number of the inference worker (if None, defaults to port - 1 for backwards compatibility)",
-    )
+    port: int = Field(..., description="Port number of the inference endpoint")
     world_size: int = Field(default=1, description="Number of workers at this endpoint")
     # Auto-sync configuration
     sync_weights: bool = Field(

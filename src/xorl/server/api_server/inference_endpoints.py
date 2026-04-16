@@ -41,6 +41,19 @@ class InferenceEndpointsMixin:
     """Mixin for inference endpoints, LoRA adapter management, and sampling sessions."""
 
     @staticmethod
+    async def _check_endpoint_health(client: httpx.AsyncClient, endpoint_url: str, endpoint_name: str) -> bool:
+        """Check whether an HTTP endpoint responds on one of the supported health paths."""
+        for health_endpoint in ("/health", "/v1/models"):
+            try:
+                response = await client.get(f"{endpoint_url}{health_endpoint}")
+                response.raise_for_status()
+                logger.info(f"✓ {endpoint_name} health check passed for {endpoint_url} (via {health_endpoint})")
+                return True
+            except Exception:
+                continue
+        return False
+
+    @staticmethod
     def _detect_quantization_from_hf_config(model_path: str) -> dict | None:
         """Detect quantization config from HF model's config.json.
 
@@ -176,8 +189,6 @@ class InferenceEndpointsMixin:
             Response indicating success/failure and endpoint info
         """
         endpoint_url = f"http://{request.host}:{request.port}"
-        worker_port = request.worker_port if request.worker_port is not None else request.port - 1
-        worker_url = f"http://{request.host}:{worker_port}"
 
         # Check if endpoint already exists
         for existing in self.inference_endpoints:
@@ -188,49 +199,21 @@ class InferenceEndpointsMixin:
                     endpoint=existing,
                 )
 
-        # Health check both SGLang server and inference worker
         # Try multiple health check endpoints - SGLang may not have /health
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                # Check SGLang server - try /health first, then /v1/models
-                sglang_healthy = False
-                for health_endpoint in ["/health", "/v1/models"]:
-                    try:
-                        response = await client.get(f"{endpoint_url}{health_endpoint}")
-                        response.raise_for_status()
-                        logger.info(f"✓ SGLang server health check passed for {endpoint_url} (via {health_endpoint})")
-                        sglang_healthy = True
-                        break
-                    except Exception:
-                        continue
-
-                if not sglang_healthy:
+                if not await self._check_endpoint_health(client, endpoint_url, "Inference endpoint"):
                     raise Exception(f"All health endpoints failed for {endpoint_url}")
-
-                # Check inference worker - try /health first, then /v1/models
-                worker_healthy = False
-                for health_endpoint in ["/health", "/v1/models"]:
-                    try:
-                        worker_response = await client.get(f"{worker_url}{health_endpoint}")
-                        worker_response.raise_for_status()
-                        logger.info(f"✓ Inference worker health check passed for {worker_url} (via {health_endpoint})")
-                        worker_healthy = True
-                        break
-                    except Exception:
-                        continue
-
-                if not worker_healthy:
-                    raise Exception(f"All health endpoints failed for {worker_url}")
 
                 is_healthy = True
         except Exception as e:
-            logger.warning(f"Health check failed for {endpoint_url} or {worker_url}: {e}")
+            logger.warning(f"Health check failed for {endpoint_url}: {e}")
             is_healthy = False
 
         if not is_healthy:
             return AddInferenceEndpointResponse(
                 success=False,
-                message=f"Health check failed for SGLang server {endpoint_url} or inference worker {worker_url}",
+                message=f"Health check failed for inference endpoint {endpoint_url}",
                 endpoint=None,
             )
 
@@ -311,7 +294,6 @@ class InferenceEndpointsMixin:
         endpoint = InferenceEndpoint(
             host=request.host,
             port=request.port,
-            worker_port=worker_port,
             world_size=world_size,
             healthy=is_healthy,
             server_info=server_info,
@@ -397,8 +379,9 @@ class InferenceEndpointsMixin:
             endpoint_url = f"http://{endpoint.host}:{endpoint.port}"
             try:
                 async with httpx.AsyncClient(timeout=5.0) as client:
-                    response = await client.get(f"{endpoint_url}/health")
-                    response.raise_for_status()
+                    endpoint_healthy = await self._check_endpoint_health(client, endpoint_url, "Inference endpoint")
+                    if not endpoint_healthy:
+                        raise RuntimeError("Inference endpoint health check failed")
                     return endpoint, True
             except Exception as e:
                 logger.warning(f"Health check failed for endpoint {endpoint_url}: {e}")
@@ -499,7 +482,13 @@ class InferenceEndpointsMixin:
                 key = (ep.host, ep.port)
                 if key not in seen:
                     seen.add(key)
-                    endpoints_data.append({"host": ep.host, "port": ep.port, "world_size": ep.world_size})
+                    endpoints_data.append(
+                        {
+                            "host": ep.host,
+                            "port": ep.port,
+                            "world_size": ep.world_size,
+                        }
+                    )
 
             # Auto-detect master_address if localhost or empty (for cross-node NCCL)
             master_address = request.master_address

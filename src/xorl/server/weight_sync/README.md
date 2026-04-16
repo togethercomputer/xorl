@@ -76,7 +76,7 @@ auto-detects from the endpoint's quantization config).
 ```python
 # 1. Register inference endpoint (once at startup)
 requests.post("http://localhost:6000/add_inference_endpoint",
-              json={"host": "localhost", "port": 30000, "worker_port": 30000})
+              json={"host": "localhost", "port": 30000})
 
 # 2. Set quantization format (once, or whenever it changes)
 requests.post("http://localhost:6000/api/v1/set_sync_quantization",
