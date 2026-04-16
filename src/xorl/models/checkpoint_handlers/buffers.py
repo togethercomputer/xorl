@@ -54,9 +54,9 @@ _EXPERT_ANY_KEY_PATTERN = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+
 # e.g., model.layers.0.mlp.experts.gate_up_proj
 FUSED_EXPERT_PATTERN = re.compile(r"^model\.layers\.\d+\.mlp\.experts\.(gate_up|gate|up|down)_proj$")
 
-# Dense MLP gate/up projection weight keys
-# e.g., model.layers.0.mlp.gate_proj.weight or model.layers.0.mlp.shared_expert.up_proj.weight
-DENSE_GATE_UP_PATTERN = re.compile(r"^(.*)\.(gate|up)_proj\.weight$")
+# Dense MLP gate/up projection weight/bias keys
+# e.g., model.layers.0.mlp.gate_proj.weight or model.layers.0.mlp.shared_expert.up_proj.bias
+DENSE_GATE_UP_PATTERN = re.compile(r"^(.*)\.(gate|up)_proj\.(weight|bias)$")
 
 # Attention o_proj weight key
 # e.g., model.layers.0.self_attn.o_proj.weight
@@ -464,31 +464,32 @@ class GateUpMergeBuffer:
 
     When a model uses a merged gate_up_proj linear layer but the checkpoint has
     separate gate_proj and up_proj weights, this buffer collects both and concatenates
-    them into the merged format.
+    them into the merged format. Handles both weight and bias parameters.
     """
 
     def __init__(self):
-        self._pending: Dict[str, Dict[str, torch.Tensor]] = {}
+        # _pending: {(prefix, param_type): {"gate": tensor, "up": tensor}}
+        self._pending: Dict[Tuple[str, str], Dict[str, torch.Tensor]] = {}
 
     def add(self, key: str, tensor: torch.Tensor) -> Optional[Tuple[str, torch.Tensor]]:
-        """Try to add a gate/up weight. Returns (merged_key, merged_tensor) when both are available."""
+        """Try to add a gate/up weight or bias. Returns merged result when both are available."""
         match = DENSE_GATE_UP_PATTERN.match(key)
         if match is None:
             return None
 
         prefix = match.group(1)
         proj_type = match.group(2)  # "gate" or "up"
+        param_type = match.group(3)  # "weight" or "bias"
 
-        if prefix not in self._pending:
-            self._pending[prefix] = {}
-        self._pending[prefix][proj_type] = tensor
+        buf_key = (prefix, param_type)
+        if buf_key not in self._pending:
+            self._pending[buf_key] = {}
+        self._pending[buf_key][proj_type] = tensor
 
-        if "gate" in self._pending[prefix] and "up" in self._pending[prefix]:
-            gate_tensor = self._pending[prefix]["gate"]
-            up_tensor = self._pending[prefix]["up"]
-            del self._pending[prefix]
-            merged = torch.cat([gate_tensor, up_tensor], dim=0)
-            return f"{prefix}.gate_up_proj.weight", merged
+        if "gate" in self._pending[buf_key] and "up" in self._pending[buf_key]:
+            parts = self._pending.pop(buf_key)
+            merged = torch.cat([parts["gate"], parts["up"]], dim=0)
+            return f"{prefix}.gate_up_proj.{param_type}", merged
 
         return None
 
@@ -496,9 +497,9 @@ class GateUpMergeBuffer:
         """Check if a key matches the gate/up pattern."""
         return DENSE_GATE_UP_PATTERN.match(key) is not None
 
-    def get_pending(self) -> Dict[str, List[str]]:
-        """Get pending (incomplete) merge pairs for debugging."""
-        return {prefix: list(projs.keys()) for prefix, projs in self._pending.items()}
+    def get_pending(self) -> Dict[Tuple[str, str], List[str]]:
+        """Get pending (incomplete) merge groups for debugging."""
+        return {key: list(projs.keys()) for key, projs in self._pending.items()}
 
 
 # =============================================================================
