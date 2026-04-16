@@ -33,14 +33,15 @@ class MultiHeadAttention(nn.Module):
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
 
+        qkv_bias = getattr(config, "attention_bias", False)
+        self._use_qk_norm = getattr(config, "use_qk_norm", True)
         self.q_dim = config.num_attention_heads * self.head_dim
         self.kv_dim = config.num_key_value_heads * self.head_dim
-        self.qkv_proj = nn.Linear(config.hidden_size, self.q_dim + 2 * self.kv_dim, bias=config.attention_bias)
-        self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
-        )
-        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.qkv_proj = nn.Linear(config.hidden_size, self.q_dim + 2 * self.kv_dim, bias=qkv_bias)
+        self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
+        if self._use_qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.sliding_window = self._init_sliding_window(config)
 
     # ------------------------------------------------------------------ #
@@ -55,15 +56,10 @@ class MultiHeadAttention(nn.Module):
         """Replace fused qkv_proj with separate q_proj, k_proj, v_proj for tensor parallelism."""
         device = self.qkv_proj.weight.device
         dtype = self.qkv_proj.weight.dtype
-        self.q_proj = nn.Linear(
-            self.config.hidden_size, self.q_dim, bias=self.config.attention_bias, device=device, dtype=dtype
-        )
-        self.k_proj = nn.Linear(
-            self.config.hidden_size, self.kv_dim, bias=self.config.attention_bias, device=device, dtype=dtype
-        )
-        self.v_proj = nn.Linear(
-            self.config.hidden_size, self.kv_dim, bias=self.config.attention_bias, device=device, dtype=dtype
-        )
+        has_qkv_bias = self.qkv_proj.bias is not None
+        self.q_proj = nn.Linear(self.config.hidden_size, self.q_dim, bias=has_qkv_bias, device=device, dtype=dtype)
+        self.k_proj = nn.Linear(self.config.hidden_size, self.kv_dim, bias=has_qkv_bias, device=device, dtype=dtype)
+        self.v_proj = nn.Linear(self.config.hidden_size, self.kv_dim, bias=has_qkv_bias, device=device, dtype=dtype)
         del self.qkv_proj
 
     def _project_qkv(
@@ -88,8 +84,11 @@ class MultiHeadAttention(nn.Module):
             q = self.q_proj(hidden_states)
             k = self.k_proj(hidden_states)
             v = self.v_proj(hidden_states)
-        q = self.q_norm(q.view(hidden_shape))
-        k = self.k_norm(k.view(hidden_shape))
+        q = q.view(hidden_shape)
+        k = k.view(hidden_shape)
+        if self._use_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
         v = v.view(hidden_shape)
 
         cos, sin = position_embeddings

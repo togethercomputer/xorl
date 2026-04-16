@@ -238,7 +238,7 @@ class UlyssesAsyncStrategy(CPStrategy):
     def project_qkv(self, module, hidden_states, position_embeddings):
         # QLoRA fallback: weight is None (packed in quantized buffers).
         # Fall back to sync-style: module._project_qkv() + synchronous a2a.
-        if module.qkv_proj.weight is None:
+        if not hasattr(module, "qkv_proj") or module.qkv_proj.weight is None:
             q, k, v = module._project_qkv(hidden_states, position_embeddings)
             if q.ndim == 4 and q.size(0) == 1:
                 q = q.squeeze(0)
@@ -300,8 +300,9 @@ class UlyssesAsyncStrategy(CPStrategy):
         # q: [S_full, Hq/SP, D], k: [S_full, Hkv/SP, D], v: [S_full, Hkv/SP, D]
 
         # Apply RMSNorm and RoPE externally (after a2a, on full-length tensors)
-        q = module.q_norm(q)
-        k = module.k_norm(k)
+        if getattr(module, "_use_qk_norm", False):
+            q = module.q_norm(q)
+            k = module.k_norm(k)
         q = q.unsqueeze(0)
         k = k.unsqueeze(0)
         v = v.unsqueeze(0)

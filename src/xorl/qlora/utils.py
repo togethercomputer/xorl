@@ -21,10 +21,6 @@ from torch.distributed._tensor import DTensor
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, cached_file
 
 from xorl.distributed.parallel_state import get_parallel_state
-from xorl.models.checkpoint_handlers.buffers import (
-    detect_prequantized_block_fp8_checkpoint,
-    detect_prequantized_checkpoint,
-)
 from xorl.qlora.modules.block_fp8_linear import BlockFP8QLoRALinear
 from xorl.qlora.modules.linear import QLoRALinear
 from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
@@ -544,6 +540,8 @@ def detect_prequantized_nvfp4(weights_path: str) -> bool:
         True if the checkpoint is pre-quantized NVFP4.
     """
 
+    from xorl.models.checkpoint_handlers.buffers import detect_prequantized_checkpoint
+
     return detect_prequantized_checkpoint(weights_path)
 
 
@@ -558,6 +556,7 @@ def detect_prequantized_block_fp8(weights_path: str) -> bool:
     Returns:
         True if the checkpoint is pre-quantized block FP8.
     """
+    from xorl.models.checkpoint_handlers.buffers import detect_prequantized_block_fp8_checkpoint
 
     return detect_prequantized_block_fp8_checkpoint(weights_path)
 

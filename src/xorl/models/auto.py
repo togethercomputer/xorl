@@ -51,6 +51,11 @@ def _load_local_xorl_config(
     if model_type == "qwen3_5":
         return Qwen3_5Config.from_hf_config(_namespace_from_dict(config_dict))
 
+    if model_type == "qwen2":
+        from .transformers.qwen2.configuration_qwen2 import Qwen2Config
+
+        return Qwen2Config(**{k: v for k, v in config_dict.items() if not k.startswith("_")})
+
     return None
 
 
