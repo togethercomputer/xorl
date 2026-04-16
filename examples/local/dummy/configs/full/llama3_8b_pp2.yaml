@@ -1,0 +1,53 @@
+model:
+  model_path: meta-llama/Llama-3.1-8B
+  attn_implementation: flash_attention_3
+
+data:
+  datasets:
+    - path: dummy
+      type: tokenized
+      max_seq_len: 8000
+  select_columns: [input_ids, labels]
+  dataset_prepared_path: last_prepared_dataset
+  sample_packing_method: sequential
+  sample_packing_sequence_len: 8000
+  dataloader_num_workers: 4
+  dataloader_prefetch_factor: 2
+  dataloader_pin_memory: true
+
+train:
+  output_dir: outputs/Llama-3.1-8B-pp2
+  data_parallel_mode: fsdp2
+  ulysses_parallel_size: 1
+  pipeline_parallel_size: 2
+  data_parallel_replicate_size: 1
+  data_parallel_shard_size: 4
+  expert_parallel_size: 1
+
+  num_train_epochs: 5
+  max_steps: 20
+
+  micro_batch_size: 1
+  gradient_accumulation_steps: 4
+
+  optimizer: adamw
+  lr: 1.0e-4
+  lr_warmup_ratio: 0.01
+  lr_decay_style: cosine
+  lr_decay_ratio: 1.0
+  weight_decay: 0.01
+
+  max_grad_norm: 5.0
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  enable_full_shard: true
+  enable_activation_offload: false
+  init_device: meta
+  load_weights_mode: broadcast
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  ckpt_manager: dcp
+  save_steps: 0
+  save_hf_weights: false
+
+  use_wandb: false
