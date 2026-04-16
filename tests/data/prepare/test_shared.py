@@ -167,7 +167,12 @@ class TestSplitAndMerge:
 class TestLoadDatasetWithConfig:
     """Tests for load_dataset_with_config function."""
 
-    def test_local_and_hub_loading(self, tmp_path):
+    def test_local_and_hub_loading(self, tmp_path, monkeypatch):
+        import datasets.config
+
+        hf_cache = str(tmp_path / "hf_cache")
+        monkeypatch.setenv("HF_DATASETS_CACHE", hf_cache)
+        monkeypatch.setattr(datasets.config, "HF_DATASETS_CACHE", hf_cache)
         """Covers loading from local file, local directory, hub, URL, data_files, and error on missing."""
         # Local JSON file
         data_file = tmp_path / "data.json"

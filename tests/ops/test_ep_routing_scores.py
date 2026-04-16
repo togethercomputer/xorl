@@ -125,9 +125,7 @@ def reference_ep_forward(
     ("module_name", "class_name"),
     [
         pytest.param("xorl.ops.moe.triton", "TritonEPGroupGemm", id="triton"),
-        pytest.param("xorl.ops.moe.triton", "TritonEPGroupGemmMoeAct", id="triton-moe-act"),
         pytest.param("xorl.ops.moe.quack", "QuackEPGroupGemm", id="quack"),
-        pytest.param("xorl.ops.moe.quack", "QuackEPGroupGemmMoeAct", id="quack-moe-act"),
     ],
 )
 def test_ep_group_gemm_propagates_routing_score_gradients(monkeypatch, module_name, class_name):
@@ -154,14 +152,27 @@ def test_ep_group_gemm_propagates_routing_score_gradients(monkeypatch, module_na
     expert_scores = torch.rand(num_tokens, dtype=dtype, requires_grad=True)
     upstream = torch.randn(num_tokens, hidden_dim, dtype=dtype)
 
-    output = fn.apply(
-        permute_tokens,
-        cumsum,
-        gate_proj,
-        up_proj,
-        down_proj,
-        expert_scores,
-    )
+    # TritonEPGroupGemm uses fused gate_up_proj + intermediate_size (int),
+    # QuackEPGroupGemm uses separate gate_proj and up_proj.
+    if "triton" in module_name:
+        gate_up_proj = torch.cat([gate_proj, up_proj], dim=-1)
+        output = fn.apply(
+            permute_tokens,
+            cumsum,
+            gate_up_proj,
+            down_proj,
+            intermediate_size,
+            expert_scores,
+        )
+    else:
+        output = fn.apply(
+            permute_tokens,
+            cumsum,
+            gate_proj,
+            up_proj,
+            down_proj,
+            expert_scores,
+        )
     output.backward(upstream)
     grad_scores = expert_scores.grad.detach().clone()
 

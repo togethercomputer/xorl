@@ -21,7 +21,8 @@ from xorl.server.api_server.api_types import (
     LoadWeightsRequest,
     SaveWeightsRequest,
 )
-from xorl.server.api_server.server import APIServer, validate_model_id
+from xorl.server.api_server.server import APIServer
+from xorl.server.api_server.utils import validate_model_id
 
 
 class TestTomiUriAndPathConstruction:

@@ -10,13 +10,34 @@ import pytest
 
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
+from typing import Any, Dict, Optional
+
 from xorl.server.api_server.future_store import (
     FutureEntry,
     FutureStatus,
     FutureStore,
-    make_failed_response,
-    make_try_again_response,
 )
+
+
+def make_try_again_response(
+    request_id: str,
+    queue_state: str = "active",
+    queue_state_reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build a try-again response dict for a pending future."""
+    response: Dict[str, Any] = {
+        "type": "try_again",
+        "request_id": request_id,
+        "queue_state": queue_state,
+    }
+    if queue_state_reason is not None:
+        response["queue_state_reason"] = queue_state_reason
+    return response
+
+
+def make_failed_response(error: str, category: str = "unknown") -> Dict[str, Any]:
+    """Build a failed response dict."""
+    return {"error": error, "category": category}
 
 
 @pytest.fixture

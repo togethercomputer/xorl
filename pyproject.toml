@@ -55,6 +55,7 @@ lint = [
 ]
 test = [
   "pytest",
+  "pytest-asyncio",
   "expecttest"
 ]
 

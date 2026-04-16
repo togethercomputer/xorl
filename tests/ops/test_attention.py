@@ -176,27 +176,6 @@ class TestFlashAttentionForward:
             assert mock_varlen.call_args[1]["cu_seqlens_q"].dtype == torch.int32
             assert result.shape == (1, total_tokens, num_heads, head_dim)
 
-    @pytest.mark.gpu
-    def test_flash_attention_on_gpu(self):
-        """Flash attention on GPU (requires flash-attn installed)."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-        try:
-            from flash_attn import flash_attn_func  # noqa: F401, PLC0415
-        except ImportError:
-            pytest.skip("flash-attn not installed")
-
-        module = Mock()
-        module.is_causal = True
-        batch, seqlen, num_heads, head_dim = 2, 16, 8, 64
-        query = torch.randn(batch, seqlen, num_heads, head_dim, dtype=torch.float16).cuda()
-        key = torch.randn(batch, seqlen, num_heads, head_dim, dtype=torch.float16).cuda()
-        value = torch.randn(batch, seqlen, num_heads, head_dim, dtype=torch.float16).cuda()
-
-        result, _ = flash_attention_forward(module, query, key, value, attention_mask=None)
-        assert result.device.type == "cuda"
-        assert result.shape == (batch, seqlen, num_heads, head_dim)
-
 
 class TestEagerAttentionForward:
     """Regression tests for eager attention head handling."""

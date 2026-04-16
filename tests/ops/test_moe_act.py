@@ -32,9 +32,14 @@ DTYPE = torch.bfloat16
 
 def _available_moe_act_backends():
     """Return backends that have moe_act local variants registered."""
-    from xorl.models.layers.moe.backend import MOE_EXPERT_BACKENDS_MOE_ACT  # noqa: PLC0415
+    try:
+        from xorl.models.layers.moe.backend import MOE_EXPERT_BACKENDS_MOE_ACT  # noqa: PLC0415
 
-    return list(MOE_EXPERT_BACKENDS_MOE_ACT.keys())
+        return list(MOE_EXPERT_BACKENDS_MOE_ACT.keys())
+    except ImportError:
+        from xorl.models.layers.moe.backend import MOE_EXPERT_BACKENDS  # noqa: PLC0415
+
+        return list(MOE_EXPERT_BACKENDS.keys())
 
 
 AVAILABLE_BACKENDS = _available_moe_act_backends() if torch.cuda.is_available() else []

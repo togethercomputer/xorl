@@ -173,6 +173,8 @@ def test_packing_dataset():
     args.data.datasets = []
     args.data.test_datasets = []
     args.data.dataset_num_proc = 1
+    args.train.ringattn_parallel_size = 1
+    args.train.ulysses_parallel_size = 1
 
     dataset = HFDataset.from_dict(
         {
