@@ -32,6 +32,12 @@ DEFAULT_TARGET_MODULES = {
     "gemma": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
 }
 
+_PEFT_BASE_MODEL_PREFIX = "base_model.model."
+_MOE_LORA_PATTERN = re.compile(r"(.*)\.mlp\.experts\.(gate_proj|up_proj|down_proj)_lora_(A|B)$")
+_MOE_PEFT_LORA_PATTERN = re.compile(
+    r"(.*)\.mlp\.experts\.(shared|\d+)\.(gate_proj|up_proj|down_proj)\.lora_(A|B)\.weight$"
+)
+
 
 def _get_submodule(model: nn.Module, target: str) -> Tuple[nn.Module, str]:
     """
@@ -365,6 +371,104 @@ def load_lora_state_dict(
     return missing_keys, unexpected_keys
 
 
+def _convert_from_peft_lora_key(name: str) -> str:
+    """Convert a PEFT LoRA key back to xorl's internal naming."""
+    if "lm_head.lora_embedding_A" in name:
+        return name.replace("lm_head.lora_embedding_A", "lm_head.lora_A")
+    if "lm_head.lora_embedding_B" in name:
+        return name.replace("lm_head.lora_embedding_B", "lm_head.lora_B")
+    if name.endswith(".lora_A.weight"):
+        return name[: -len(".weight")]
+    if name.endswith(".lora_B.weight"):
+        return name[: -len(".weight")]
+    return name
+
+
+def _align_lora_tensor_shape(
+    key: str,
+    tensor: torch.Tensor,
+    expected_shapes: Optional[Dict[str, torch.Size]],
+) -> torch.Tensor:
+    """Match a converted tensor to the live LoRA shape, allowing a final-dim transpose."""
+    if expected_shapes is None or key not in expected_shapes:
+        return tensor
+
+    expected_shape = tuple(expected_shapes[key])
+    if tuple(tensor.shape) == expected_shape:
+        return tensor
+
+    if tensor.dim() >= 2:
+        transposed = tensor.transpose(-2, -1).contiguous()
+        if tuple(transposed.shape) == expected_shape:
+            return transposed
+
+    raise RuntimeError(f"Converted LoRA tensor for {key} has shape {tuple(tensor.shape)}, expected {expected_shape}")
+
+
+def convert_peft_lora_state_dict(
+    state_dict: Dict[str, torch.Tensor],
+    expected_shapes: Optional[Dict[str, torch.Size]] = None,
+) -> Dict[str, torch.Tensor]:
+    """Convert PEFT-style LoRA checkpoint tensors into xorl's internal layout.
+
+    This handles:
+    - Dense LoRA keys ending in ``.lora_{A|B}.weight``
+    - ``lm_head`` PEFT embedding aliases
+    - MoE per-expert keys such as ``...experts.3.gate_proj.lora_A.weight``
+    - MoE hybrid-shared keys such as ``...experts.shared.down_proj.lora_B.weight``
+
+    Args:
+        state_dict: Loaded checkpoint weights.
+        expected_shapes: Optional live-parameter shapes keyed by internal name.
+            When provided, the converter will transpose the trailing matrix dims
+            if that is required to match the live layout.
+
+    Returns:
+        State dict keyed by xorl's internal LoRA parameter names.
+    """
+    converted_state_dict: Dict[str, torch.Tensor] = {}
+    moe_buckets: Dict[str, Dict[str, torch.Tensor]] = {}
+
+    for raw_key, value in state_dict.items():
+        if raw_key.startswith(_PEFT_BASE_MODEL_PREFIX):
+            key = raw_key[len(_PEFT_BASE_MODEL_PREFIX) :]
+        else:
+            key = raw_key
+
+        match = _MOE_PEFT_LORA_PATTERN.match(key)
+        if match is not None:
+            prefix, expert_token, proj_name, lora_type = match.groups()
+            internal_name = f"{prefix}.mlp.experts.{proj_name}_lora_{lora_type}"
+            bucket = moe_buckets.setdefault(internal_name, {})
+            if expert_token in bucket:
+                raise RuntimeError(f"Duplicate MoE LoRA checkpoint entry for {internal_name} ({expert_token})")
+            bucket[expert_token] = value
+            continue
+
+        internal_name = _convert_from_peft_lora_key(key)
+        converted_state_dict[internal_name] = _align_lora_tensor_shape(internal_name, value, expected_shapes)
+
+    for internal_name, bucket in moe_buckets.items():
+        if "shared" in bucket:
+            if len(bucket) != 1:
+                raise RuntimeError(
+                    f"Mixed shared and per-expert MoE checkpoint entries found for {internal_name}: {sorted(bucket)}"
+                )
+            stacked = bucket["shared"].unsqueeze(0).contiguous()
+        else:
+            expert_indices = sorted(int(idx) for idx in bucket)
+            expected_indices = list(range(len(expert_indices)))
+            if expert_indices != expected_indices:
+                raise RuntimeError(
+                    f"Non-contiguous MoE checkpoint expert indices for {internal_name}: {expert_indices}"
+                )
+            stacked = torch.stack([bucket[str(expert_idx)] for expert_idx in expert_indices], dim=0)
+
+        converted_state_dict[internal_name] = _align_lora_tensor_shape(internal_name, stacked, expected_shapes)
+
+    return converted_state_dict
+
+
 def save_lora_checkpoint(
     model: nn.Module,
     save_path: str,
@@ -408,13 +512,9 @@ def save_lora_checkpoint(
     if lora_state_dict is None:
         lora_state_dict = get_lora_state_dict(model)
 
-    # Pattern to detect MoE LoRA weights: mlp.experts.{proj}_lora_{A|B}
-    # These are stacked tensors with shape [num_experts, ...] that need to be unmerged
-    moe_lora_pattern = re.compile(r"(.*)\.mlp\.experts\.(gate_proj|up_proj|down_proj)_lora_(A|B)$")
-
     def _is_moe_lora_param(name: str) -> bool:
         """Check if this is a stacked MoE LoRA parameter."""
-        return moe_lora_pattern.match(name) is not None
+        return _MOE_LORA_PATTERN.match(name) is not None
 
     def _convert_to_peft_key(name: str) -> str:
         """
@@ -448,7 +548,7 @@ def save_lora_checkpoint(
         For hybrid shared LoRA, shared weights (shape[0] == 1) are named with
         ".shared." instead of expert index to indicate they're shared across experts.
         """
-        match = moe_lora_pattern.match(name)
+        match = _MOE_LORA_PATTERN.match(name)
         if not match:
             raise ValueError(f"Invalid MoE LoRA parameter name: {name}")
 
@@ -486,7 +586,6 @@ def save_lora_checkpoint(
     peft_state_dict = {}
     detected_modules = set()
     detected_r = None
-    detected_alpha = None
 
     for key, value in lora_state_dict.items():
         # Check if this is a stacked MoE LoRA parameter
@@ -495,7 +594,7 @@ def save_lora_checkpoint(
             per_expert_weights = _unmerge_moe_lora_weights(key, value)
             peft_state_dict.update(per_expert_weights)
             # Detect target modules from MoE LoRA
-            match = moe_lora_pattern.match(key)
+            match = _MOE_LORA_PATTERN.match(key)
             if match:
                 detected_modules.add(match.group(2))  # gate_proj, up_proj, or down_proj
                 if detected_r is None and match.group(3) == "A":
@@ -570,17 +669,8 @@ def load_lora_checkpoint(
     Load LoRA weights from checkpoint.
 
     Supports both xorl format and PEFT format checkpoints for dense
-    (nn.Linear) and per-expert MoE LoRA weights.
-
-    .. note::
-        Hybrid-shared MoE LoRA checkpoints are **not** supported.
-        ``save_lora_checkpoint`` exports shared expert weights under
-        ``.mlp.experts.shared.{proj}.lora_{A|B}.weight``, but this
-        function cannot map those keys back to xorl's internal stacked
-        MoE parameter layout (``{proj}_lora_{A|B}`` with shape
-        ``[1, ...]``).  Loading such a checkpoint would require
-        re-stacking the per-expert and shared tensors, which is not
-        yet implemented.
+    (nn.Linear) LoRA as well as stacked MoE LoRA, including hybrid-shared
+    checkpoints exported under ``.mlp.experts.shared.{proj}.lora_{A|B}.weight``.
 
     Args:
         model: Model with LoRA layers already injected
@@ -604,36 +694,10 @@ def load_lora_checkpoint(
     else:
         state_dict = torch.load(weights_file, map_location="cpu", weights_only=True)
 
-    def _convert_from_peft_key(name: str) -> str:
-        """
-        Convert PEFT key format back to xorl format.
-
-        For Linear layers: lora_A.weight -> lora_A, lora_B.weight -> lora_B
-        For lm_head: lora_embedding_A -> lora_A, lora_embedding_B -> lora_B
-        """
-        # Handle lm_head embedding-style naming
-        if "lm_head.lora_embedding_A" in name:
-            return name.replace("lm_head.lora_embedding_A", "lm_head.lora_A")
-        elif "lm_head.lora_embedding_B" in name:
-            return name.replace("lm_head.lora_embedding_B", "lm_head.lora_B")
-        # Handle .weight suffix for Linear layers
-        elif name.endswith(".lora_A.weight"):
-            return name[: -len(".weight")]
-        elif name.endswith(".lora_B.weight"):
-            return name[: -len(".weight")]
-        return name
-
-    # Convert PEFT format keys to xorl format if needed
-    converted_state_dict = {}
-    for key, value in state_dict.items():
-        # Remove PEFT prefix: base_model.model.{key} -> {key}
-        if key.startswith("base_model.model."):
-            new_key = key[len("base_model.model.") :]
-        else:
-            new_key = key
-        # Convert from PEFT naming to xorl naming
-        new_key = _convert_from_peft_key(new_key)
-        converted_state_dict[new_key] = value
+    model_lora_shapes = {
+        key: value.shape for key, value in model.state_dict().items() if "lora_A" in key or "lora_B" in key
+    }
+    converted_state_dict = convert_peft_lora_state_dict(state_dict, expected_shapes=model_lora_shapes)
 
     # Load into model
     missing, unexpected = load_lora_state_dict(model, converted_state_dict, strict=strict)

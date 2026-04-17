@@ -25,6 +25,8 @@ import torch.nn as nn
 from safetensors.torch import load_file as safetensors_load_file
 from safetensors.torch import save_file as safetensors_save_file
 
+from xorl.lora.utils import convert_peft_lora_state_dict
+
 
 try:
     from torch.distributed._tensor import DTensor
@@ -669,13 +671,22 @@ class LoRAAdapterManager:
         weights_path = os.path.join(path, "adapter_model.safetensors")
         if os.path.exists(weights_path):
             loaded_weights = safetensors_load_file(weights_path)
+            expected_shapes = {name: param.shape for name, param in state.lora_params.items()}
+            converted_weights = convert_peft_lora_state_dict(loaded_weights, expected_shapes=expected_shapes)
 
-            # Convert from PEFT format back to internal format
-            for peft_name, weight in loaded_weights.items():
-                # Remove "base_model.model." prefix
-                internal_name = peft_name.replace("base_model.model.", "")
-                if internal_name in state.lora_params:
-                    state.lora_params[internal_name].data.copy_(weight.to(self.device))
+            expected_keys = set(state.lora_params)
+            loaded_keys = set(converted_weights)
+            missing_keys = sorted(expected_keys - loaded_keys)
+            unexpected_keys = sorted(loaded_keys - expected_keys)
+            if missing_keys or unexpected_keys:
+                raise RuntimeError(
+                    "Checkpoint LoRA parameter set does not match the live adapter structure.\n"
+                    f"missing={missing_keys}\n"
+                    f"unexpected={unexpected_keys}"
+                )
+
+            for name, param in state.lora_params.items():
+                param.data.copy_(converted_weights[name].to(device=self.device, dtype=param.dtype))
         else:
             raise FileNotFoundError(f"Weights file not found: {weights_path}")
 
