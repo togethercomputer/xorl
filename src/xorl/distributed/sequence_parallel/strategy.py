@@ -19,7 +19,6 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 
-from ...models.layers.attention.utils import repeat_kv
 from ...models.layers.rope import apply_rotary_pos_emb
 from .async_ulysses import async_ulysses_output_projection, async_ulysses_qkv_projection
 from .data import slice_position_embedding
@@ -149,6 +148,9 @@ class UlyssesSyncStrategy(CPStrategy):
         self.ulysses_size = ulysses_size
 
     def project_qkv(self, module, hidden_states, position_embeddings):
+        # Lazy-imported to break an import cycle with xorl.models.layers.attention
+        from ...models.layers.attention.utils import repeat_kv  # noqa: PLC0415
+
         # Model-specific QKV projection (MHA, MLA, etc.)
         q, k, v = module._project_qkv(hidden_states, position_embeddings)
 
