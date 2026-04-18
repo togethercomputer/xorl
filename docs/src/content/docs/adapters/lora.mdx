@@ -2,7 +2,7 @@
 title: "LoRA"
 ---
 
-For MoE-specific LoRA (expert weight layout, EP sharding), see [MoE LoRA](/moe/lora/).
+For MoE-specific LoRA (expert weight layout, EP sharding), see [MoE LoRA](/xorl/moe/lora/).
 
 LoRA (Low-Rank Adaptation) freezes the base model weights and adds trainable low-rank matrices to selected linear layers. xorl implements FSDP2-compatible LoRA for both local and server training.
 
@@ -156,7 +156,7 @@ model = PeftModel.from_pretrained(base_model, "outputs/my_run/weights/.../step_4
 
 For long training runs, periodically merge LoRA into the base weights and restart with fresh LoRA parameters. This avoids rank saturation and allows the effective rank to grow over training.
 
-For QLoRA, see [QLoRA — Periodic Merge](/adapters/qlora/#periodic-merge-relora).
+For QLoRA, see [QLoRA — Periodic Merge](/xorl/adapters/qlora/#periodic-merge-relora).
 
 ## LoRA in Server Training
 

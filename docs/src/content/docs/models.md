@@ -52,4 +52,4 @@ The following model + training-mode combinations have pre-built example configs 
 
 MoE checkpoints from HuggingFace store experts as a `ModuleList` (one module per expert). xorl uses fused grouped-kernel (GKN) tensors for efficient expert dispatch. This conversion happens **automatically during model loading** — no separate preprocessing step is needed. Simply point `model_path` at the standard HuggingFace checkpoint and xorl will fuse the expert weights on the fly.
 
-See the [MoE section](/moe/overview) for details on MoE-specific config options including `expert_parallel_size`, `ep_dispatch`, and `moe_implementation`.
+See the [MoE section](/xorl/moe/overview) for details on MoE-specific config options including `expert_parallel_size`, `ep_dispatch`, and `moe_implementation`.
