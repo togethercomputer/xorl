@@ -111,6 +111,7 @@ class TestAPIRequestCreationAndSerialization:
         request = LoadWeightsRequest(path="/tmp/checkpoint", optimizer=True)
         assert request.optimizer is True
 
+
 class TestTinkerSessionCompatibility:
     """Test Tinker-compatible session creation and heartbeats."""
 
@@ -176,5 +177,7 @@ class TestTinkerSessionCompatibility:
 
         assert heartbeat_response.session_id == session_id
         assert server.session_last_activity[session_id] > initial_activity
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
