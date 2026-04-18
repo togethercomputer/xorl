@@ -6,11 +6,11 @@ xorl supports five orthogonal parallelism dimensions that can be freely composed
 
 | Dimension | Doc | Config field | When to use |
 |---|---|---|---|
-| Data (FSDP2) | [Data Parallelism](/parallelism/data_parallelism/) | `data_parallel_mode`, `data_parallel_shard_size` | Always; primary memory reduction tool |
-| Tensor | [Tensor Parallelism](/parallelism/tensor_parallelism/) | `tensor_parallel_size` | When FSDP2 alone can't fit the model |
-| Pipeline | [Pipeline Parallelism](/parallelism/pipeline_parallelism/) | `pipeline_parallel_size` | Very large models across nodes |
-| Expert | [Expert Parallelism](/parallelism/expert_parallelism/) | `expert_parallel_size` | MoE models |
-| Sequence | [Context Parallelism](/parallelism/context_parallelism/) | `ulysses_parallel_size`, `ringattn_parallel_size` | Long sequences (>32K) |
+| Data (FSDP2) | [Data Parallelism](/xorl/parallelism/data_parallelism/) | `data_parallel_mode`, `data_parallel_shard_size` | Always; primary memory reduction tool |
+| Tensor | [Tensor Parallelism](/xorl/parallelism/tensor_parallelism/) | `tensor_parallel_size` | When FSDP2 alone can't fit the model |
+| Pipeline | [Pipeline Parallelism](/xorl/parallelism/pipeline_parallelism/) | `pipeline_parallel_size` | Very large models across nodes |
+| Expert | [Expert Parallelism](/xorl/parallelism/expert_parallelism/) | `expert_parallel_size` | MoE models |
+| Sequence | [Context Parallelism](/xorl/parallelism/context_parallelism/) | `ulysses_parallel_size`, `ringattn_parallel_size` | Long sequences (>32K) |
 
 ## When to Use Each Dimension
 

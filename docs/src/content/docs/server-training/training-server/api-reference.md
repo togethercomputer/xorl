@@ -9,7 +9,7 @@ Poll `POST /api/v1/retrieve_future` with that ID to get the actual result.
 The `xorl-client` SDK handles polling automatically.
 :::
 
-All endpoints are served at `http://<host>:<port>/`. Training operations use a two-phase async protocol — see [Launching & Configuration](/server-training/training-server/launching/#api-server) for details.
+All endpoints are served at `http://<host>:<port>/`. Training operations use a two-phase async protocol — see [Launching & Configuration](/xorl/server-training/training-server/launching/#api-server) for details.
 
 ## Training Operations
 

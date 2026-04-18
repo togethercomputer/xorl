@@ -20,9 +20,9 @@ Online RL requires a **training server**, an **inference server**, and an **orch
 
 | Component | Provided by | Description |
 |---|---|---|
-| Training server | **[xorl](/server-training/training-server/launching/)** | Forward/backward, optimizer, checkpointing, parallelism |
-| Inference server | **[xorl-sglang](/server-training/sglang/)** | Rollout generation, per-token logprobs, weight sync |
-| Client SDK | **[xorl-client](/server-training/client-sdk/overview/)** | Python SDK: `TrainingClient`, `SamplingClient`, `RestClient` |
+| Training server | **[xorl](/xorl/server-training/training-server/launching/)** | Forward/backward, optimizer, checkpointing, parallelism |
+| Inference server | **[xorl-sglang](/xorl/server-training/sglang/)** | Rollout generation, per-token logprobs, weight sync |
+| Client SDK | **[xorl-client](/xorl/server-training/client-sdk/overview/)** | Python SDK: `TrainingClient`, `SamplingClient`, `RestClient` |
 | Reward / environment | **You** | Reward model, code sandbox, math verifier, rule-based scorer |
 
 ---
@@ -81,7 +81,7 @@ for step in range(num_steps):
         ).result()
 ```
 
-For multi-node setup, server configuration, and launcher CLI options, see [Launching & Configuration](/server-training/training-server/launching/).
+For multi-node setup, server configuration, and launcher CLI options, see [Launching & Configuration](/xorl/server-training/training-server/launching/).
 
 ### Available configs
 
@@ -106,7 +106,7 @@ For multi-node setup, server configuration, and launcher CLI options, see [Launc
 
 ## xorl-client
 
-The [xorl-client](/server-training/client-sdk/overview/) Python SDK drives the training server — see the [Client SDK page](/server-training/client-sdk/overview/) for installation, client classes, loss functions, and training loop examples.
+The [xorl-client](/xorl/server-training/client-sdk/overview/) Python SDK drives the training server — see the [Client SDK page](/xorl/server-training/client-sdk/overview/) for installation, client classes, loss functions, and training loop examples.
 
 ---
 
@@ -165,10 +165,10 @@ XoRL's server training mode is designed for online RL with LLMs. The following p
 
 | Topic | Page |
 |---|---|
-| Server architecture, multi-node, launcher CLI | [Launching & Configuration](/server-training/training-server/launching/) |
-| REST API endpoints | [API Reference](/server-training/training-server/api-reference/) |
-| xorl-sglang: weight sync, numerical alignment | [Inference: xorl-sglang](/server-training/sglang/) |
-| Client SDK, loss functions, training patterns | [Client SDK (xorl-client)](/server-training/client-sdk/overview/) |
-| NCCL weight sync protocol | [Weight Sync](/server-training/weight-sync/overview/) |
-| SFT fine-tuning example | [SFT on No Robots](/server-training/examples/sft-no-robots/) |
-| End-to-end weight sync test | [Password Memorization](/server-training/examples/password-memorization/) |
+| Server architecture, multi-node, launcher CLI | [Launching & Configuration](/xorl/server-training/training-server/launching/) |
+| REST API endpoints | [API Reference](/xorl/server-training/training-server/api-reference/) |
+| xorl-sglang: weight sync, numerical alignment | [Inference: xorl-sglang](/xorl/server-training/sglang/) |
+| Client SDK, loss functions, training patterns | [Client SDK (xorl-client)](/xorl/server-training/client-sdk/overview/) |
+| NCCL weight sync protocol | [Weight Sync](/xorl/server-training/weight-sync/overview/) |
+| SFT fine-tuning example | [SFT on No Robots](/xorl/server-training/examples/sft-no-robots/) |
+| End-to-end weight sync test | [Password Memorization](/xorl/server-training/examples/password-memorization/) |

@@ -159,7 +159,7 @@ Each entry in `datasets` (or `test_datasets`) is a dict:
 |---|---|---|
 | `enable_mixed_precision` | `true` | BF16 mixed-precision training. |
 | `enable_gradient_checkpointing` | `true` | Enable activation recomputation to reduce memory. |
-| `gradient_checkpointing_method` | `recompute_full_layer` | What to recompute in backward. Valid values: `recompute_full_layer` (recompute entire decoder layer, most memory-efficient), `recompute_before_dispatch` (recompute attn+router, keep dispatch+expert+combine, +25-34% throughput), `no_recompute` (no recomputation, max throughput, highest memory). See [gradient checkpointing guide](/training/local_training#gradient-checkpointing). |
+| `gradient_checkpointing_method` | `recompute_full_layer` | What to recompute in backward. Valid values: `recompute_full_layer` (recompute entire decoder layer, most memory-efficient), `recompute_before_dispatch` (recompute attn+router, keep dispatch+expert+combine, +25-34% throughput), `no_recompute` (no recomputation, max throughput, highest memory). See [gradient checkpointing guide](/xorl/training/local_training#gradient-checkpointing). |
 | `enable_reentrant` | `false` | Use reentrant gradient checkpointing. Default (non-reentrant) is generally preferred. |
 | `enable_full_shard` | `true` | FSDP2 full parameter sharding (ZeRO-3). Set `false` for ZeRO-2. |
 | `enable_forward_prefetch` | `true` | Prefetch next FSDP unit's parameters during forward pass. |
