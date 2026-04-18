@@ -20,7 +20,7 @@ import torch.distributed as dist
 
 try:
     import deep_ep
-    from deep_ep.utils import EventOverlap, EventHandle
+    from deep_ep.utils import EventHandle, EventOverlap
 
     DEEPEP_AVAILABLE = True
 except ImportError:
@@ -32,10 +32,7 @@ except ImportError:
 
 def check_deepep_available():
     if not DEEPEP_AVAILABLE:
-        raise ImportError(
-            "DeepEP is not installed. Please install it from "
-            "https://github.com/deepseek-ai/DeepEP"
-        )
+        raise ImportError("DeepEP is not installed. Please install it from https://github.com/deepseek-ai/DeepEP")
 
 
 def get_hidden_bytes(x: torch.Tensor) -> int:
@@ -209,8 +206,8 @@ def permute_for_experts(
         )
 
     # Flat view of expert IDs and scores — no copy, no boolean indexing
-    flat_expert_ids = recv_topk_idx.reshape(-1)   # [num_recv_tokens * topk]
-    flat_scores = recv_topk_weights.reshape(-1)    # [num_recv_tokens * topk]
+    flat_expert_ids = recv_topk_idx.reshape(-1)  # [num_recv_tokens * topk]
+    flat_scores = recv_topk_weights.reshape(-1)  # [num_recv_tokens * topk]
 
     # Invalid entries (-1) → max int64 so they sort to the end
     sort_keys = torch.where(
@@ -269,20 +266,18 @@ class _FusedDispatchAndPermute(torch.autograd.Function):
             buffer.buffer.get_dispatch_layout(topk_idx_deepep, num_experts)
         )
         previous_event = EventOverlap(EventHandle())
-        recv_x, recv_topk_idx, recv_topk_weights, recv_counts, handle, event = (
-            buffer.buffer.dispatch(
-                x=x.contiguous(),
-                num_tokens_per_rank=num_tokens_per_rank,
-                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
-                is_token_in_rank=is_token_in_rank,
-                num_tokens_per_expert=num_tokens_per_expert,
-                topk_idx=topk_idx_deepep,
-                topk_weights=topk_weights_f32,
-                config=buffer.dispatch_config,
-                previous_event=previous_event,
-                async_finish=True,
-                allocate_on_comm_stream=True,
-            )
+        recv_x, recv_topk_idx, recv_topk_weights, recv_counts, handle, event = buffer.buffer.dispatch(
+            x=x.contiguous(),
+            num_tokens_per_rank=num_tokens_per_rank,
+            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+            is_token_in_rank=is_token_in_rank,
+            num_tokens_per_expert=num_tokens_per_expert,
+            topk_idx=topk_idx_deepep,
+            topk_weights=topk_weights_f32,
+            config=buffer.dispatch_config,
+            previous_event=previous_event,
+            async_finish=True,
+            allocate_on_comm_stream=True,
         )
         event.current_stream_wait()
 
@@ -294,7 +289,10 @@ class _FusedDispatchAndPermute(torch.autograd.Function):
 
         # --- permute ---
         expert_input, permuted_scores, permuted_indices, num_valid = permute_for_experts(
-            recv_x, recv_topk_idx, recv_topk_weights, num_valid=total_valid_count,
+            recv_x,
+            recv_topk_idx,
+            recv_topk_weights,
+            num_valid=total_valid_count,
         )
 
         # Save for backward
@@ -327,12 +325,15 @@ class _FusedDispatchAndPermute(torch.autograd.Function):
         buffer = ctx.buffer
         handle = ctx.handle
 
-        # Step 1: Scatter gradient from expert order → recv order
+        # Step 1: Scatter gradient from expert order → recv order (FP32 for precision)
         grad_recv_x = torch.zeros(
-            ctx.num_recv_tokens, ctx.hidden_dim,
-            dtype=grad_expert_input.dtype, device=grad_expert_input.device,
+            ctx.num_recv_tokens,
+            ctx.hidden_dim,
+            dtype=torch.float32,
+            device=grad_expert_input.device,
         )
-        grad_recv_x.index_add_(0, permuted_indices, grad_expert_input)
+        grad_recv_x.index_add_(0, permuted_indices, grad_expert_input.float())
+        grad_recv_x = grad_recv_x.to(grad_expert_input.dtype)
 
         # Step 2: Combine to reverse dispatch
         previous_event = EventOverlap(EventHandle())
@@ -352,16 +353,16 @@ class _FusedDispatchAndPermute(torch.autograd.Function):
 
 
 class _FusedUnpermuteAndCombine(torch.autograd.Function):
-    """Fused weighted scatter-add (unpermute) + combine in a single autograd boundary.
+    """Fused scatter-add (unpermute) + combine in a single autograd boundary.
 
     Forward:
-        1. Weighted scatter-add: ``output[idx[i]] += score[i] * expert_output[i]``
+        1. Scatter-add: ``output[idx[i]] += expert_output[i]``
         2. ``buffer.combine()`` to send results back to original ranks
         3. Optionally defer sync (async_combine) for overlap with next layer
 
     Backward:
         1. ``buffer.dispatch()`` to reverse combine → grad in recv order
-        2. ``grad_expert[i] = score[i] * grad[idx[i]]`` — reverse of scatter-add
+        2. ``grad_expert[i] = grad[idx[i]]`` — reverse of scatter-add
     """
 
     @staticmethod
@@ -376,18 +377,30 @@ class _FusedUnpermuteAndCombine(torch.autograd.Function):
         hidden_dim = expert_output.shape[1] if expert_output.shape[0] > 0 else dispatch_ctx.hidden_dim
         device = expert_output.device
 
-        # Step 1: Weighted scatter-add (unpermute)
+        # Step 1: Scatter-add (unpermute)
         if expert_output.shape[0] == 0:
             gather_output = torch.zeros(
-                dispatch_ctx.num_recv_tokens, hidden_dim, dtype=dtype, device=device,
+                dispatch_ctx.num_recv_tokens,
+                hidden_dim,
+                dtype=dtype,
+                device=device,
             )
         else:
-            weighted = expert_output * dispatch_ctx.permuted_scores.unsqueeze(1).to(expert_output.dtype)
+            # Scores are already applied by the expert compute function
+            # (triton/native backends multiply by expert_scores). Do NOT
+            # re-apply here — that would double-count router weights.
             gather_output = torch.zeros(
-                dispatch_ctx.num_recv_tokens, hidden_dim, dtype=expert_output.dtype, device=device,
+                dispatch_ctx.num_recv_tokens,
+                hidden_dim,
+                dtype=torch.float32,
+                device=device,
             )
             idx_2d = dispatch_ctx.permuted_indices.unsqueeze(1).expand(-1, hidden_dim)
-            gather_output.scatter_add_(0, idx_2d, weighted)
+            _CHUNK = 4096
+            for _i in range(0, expert_output.shape[0], _CHUNK):
+                _end = min(_i + _CHUNK, expert_output.shape[0])
+                gather_output.scatter_add_(0, idx_2d[_i:_end], expert_output[_i:_end].float())
+            gather_output = gather_output.to(dtype)
 
         # Step 2: Combine
         previous_event = EventOverlap(EventHandle())
@@ -405,9 +418,7 @@ class _FusedUnpermuteAndCombine(torch.autograd.Function):
         else:
             event.current_stream_wait()
 
-        # Save for backward — scores don't need grad (not a tensor input),
-        # so we never save expert_output, saving memory.
-        ctx.save_for_backward(dispatch_ctx.permuted_scores, dispatch_ctx.permuted_indices)
+        ctx.save_for_backward(dispatch_ctx.permuted_indices)
         ctx.buffer = buffer
         ctx.handle = dispatch_ctx.handle
         ctx.input_dtype = expert_output.dtype
@@ -418,7 +429,7 @@ class _FusedUnpermuteAndCombine(torch.autograd.Function):
         if grad_output is None:
             return None, None, None, None
 
-        permuted_scores, permuted_indices = ctx.saved_tensors
+        (permuted_indices,) = ctx.saved_tensors
         buffer = ctx.buffer
         handle = ctx.handle
 
@@ -437,11 +448,8 @@ class _FusedUnpermuteAndCombine(torch.autograd.Function):
         if grad_gather.dtype != ctx.input_dtype:
             grad_gather = grad_gather.to(ctx.input_dtype)
 
-        # Step 2: Reverse weighted scatter-add
-        # Forward: gather_output[idx[i]] += score[i] * expert_output[i]
-        # Backward: grad_expert[i] = score[i] * grad_gather[idx[i]]
-        grad_gathered = grad_gather.index_select(0, permuted_indices)
-        grad_expert_output = grad_gathered * permuted_scores.unsqueeze(1).to(grad_gathered.dtype)
+        # Step 2: Reverse scatter-add
+        grad_expert_output = grad_gather.index_select(0, permuted_indices)
 
         return grad_expert_output, None, None, None
 
@@ -501,9 +509,7 @@ def combine_no_grad(
 # ---------------------------------------------------------------------------
 # Profiling flag
 # ---------------------------------------------------------------------------
-_DEEPEP_PROFILE = _os.environ.get("XORL_DEEPEP_PROFILE", "0").strip().lower() not in {
-    "0", "false", "no", "off", ""
-}
+_DEEPEP_PROFILE = _os.environ.get("XORL_DEEPEP_PROFILE", "0").strip().lower() not in {"0", "false", "no", "off", ""}
 
 
 # ---------------------------------------------------------------------------
@@ -526,11 +532,19 @@ def token_pre_dispatch(
 
     if _DEEPEP_PROFILE:
         return _token_pre_dispatch_profiled(
-            buffer, hidden_states, routing_weights, selected_experts, num_experts,
+            buffer,
+            hidden_states,
+            routing_weights,
+            selected_experts,
+            num_experts,
         )
 
     expert_input, cumsum, ctx = _FusedDispatchAndPermute.apply(
-        hidden_states, selected_experts, routing_weights, buffer, num_experts,
+        hidden_states,
+        selected_experts,
+        routing_weights,
+        buffer,
+        num_experts,
     )
     return expert_input, cumsum, ctx
 
@@ -559,7 +573,11 @@ def tokens_post_combine(
 # Profiled versions
 # ---------------------------------------------------------------------------
 def _token_pre_dispatch_profiled(
-    buffer, hidden_states, routing_weights, selected_experts, num_experts,
+    buffer,
+    hidden_states,
+    routing_weights,
+    selected_experts,
+    num_experts,
 ):
     """Profiled version of token_pre_dispatch — enabled by XORL_DEEPEP_PROFILE=1."""
     rank = dist.get_rank() if dist.is_initialized() else 0
@@ -567,7 +585,11 @@ def _token_pre_dispatch_profiled(
 
     ev[0].record()
     expert_input, cumsum, ctx = _FusedDispatchAndPermute.apply(
-        hidden_states, selected_experts, routing_weights, buffer, num_experts,
+        hidden_states,
+        selected_experts,
+        routing_weights,
+        buffer,
+        num_experts,
     )
     ev[1].record()
 
@@ -596,8 +618,7 @@ def _tokens_post_combine_profiled(buffer, expert_output, ctx, async_combine):
     t_total = ev[0].elapsed_time(ev[1])
     if rank == 0:
         print(
-            f"[DEEPEP POST r{rank}] unpermute+combine={t_total:.1f}ms  "
-            f"expert_out={expert_output.shape}",
+            f"[DEEPEP POST r{rank}] unpermute+combine={t_total:.1f}ms  expert_out={expert_output.shape}",
             flush=True,
         )
     return result

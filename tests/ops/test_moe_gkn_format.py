@@ -20,9 +20,15 @@ import torch.nn.functional as F
 # Reference implementation -- per-expert loop with nn.Linear weights
 # ---------------------------------------------------------------------------
 
+
 def reference_moe_forward(
-    hidden_states, routing_weights, selected_experts,
-    gate_proj_gkn, up_proj_gkn, down_proj_gkn, num_experts,
+    hidden_states,
+    routing_weights,
+    selected_experts,
+    gate_proj_gkn,
+    up_proj_gkn,
+    down_proj_gkn,
+    num_experts,
 ):
     """Naive per-expert loop MoE forward using (G,K,N) weights directly."""
     num_tokens = hidden_states.shape[0]
@@ -54,6 +60,7 @@ def make_gkn_weights_from_linear(experts_list):
 
 class ExpertMLP(nn.Module):
     """Single expert MLP for reference."""
+
     def __init__(self, hidden_size, intermediate_size):
         super().__init__()
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
@@ -103,8 +110,13 @@ class TestGKNWeightFormat:
         routing_weights = torch.softmax(torch.randn(num_tokens, top_k), dim=-1)
 
         output_gkn = reference_moe_forward(
-            hidden_states, routing_weights, selected_experts,
-            gate_gkn, up_gkn, down_gkn, num_experts2,
+            hidden_states,
+            routing_weights,
+            selected_experts,
+            gate_gkn,
+            up_gkn,
+            down_gkn,
+            num_experts2,
         )
 
         output_hf = torch.zeros_like(hidden_states)
@@ -126,7 +138,8 @@ class TestCheckpointLoadingGKN:
     @staticmethod
     def _get_buffer_class():
         try:
-            from xorl.models.checkpoint_handlers.buffers import ExpertWeightBuffer
+            from xorl.models.checkpoint_handlers.buffers import ExpertWeightBuffer  # noqa: PLC0415
+
             return ExpertWeightBuffer
         except (ImportError, ModuleNotFoundError):
             pytest.skip("checkpoint_handlers import requires transformers")
@@ -166,8 +179,13 @@ class TestCheckpointLoadingGKN:
         routing_weights = torch.softmax(torch.randn(num_tokens, top_k), dim=-1)
 
         output_gkn = reference_moe_forward(
-            hidden_states, routing_weights, selected_experts,
-            gate_stacked, up_stacked, down_stacked, num_experts,
+            hidden_states,
+            routing_weights,
+            selected_experts,
+            gate_stacked,
+            up_stacked,
+            down_stacked,
+            num_experts,
         )
 
         output_hf = torch.zeros_like(hidden_states)
@@ -192,7 +210,7 @@ class TestBackendGKN:
         """Eager, native, triton backends match reference; all MoEBlock backends agree."""
         # --- Eager backend ---
         try:
-            from xorl.models.layers.moe.backend.eager import eager_expert_forward
+            from xorl.models.layers.moe.backend.eager import eager_expert_forward  # noqa: PLC0415
         except (ImportError, ModuleNotFoundError):
             pytest.skip("eager backend import requires transformers")
 
@@ -212,7 +230,7 @@ class TestBackendGKN:
             torch.testing.assert_close(eager_out, ref_out, atol=1e-5, rtol=1e-5)
 
         # --- Native backend ---
-        from xorl.models.layers.moe.backend.native import native_expert_forward
+        from xorl.models.layers.moe.backend.native import native_expert_forward  # noqa: PLC0415
 
         device, dtype = "cuda", torch.bfloat16
         gate_cuda = gate_gkn.to(device).to(dtype)
@@ -223,27 +241,46 @@ class TestBackendGKN:
         rw = torch.softmax(torch.randn(num_tokens, top_k, device=device, dtype=dtype), dim=-1)
 
         native_out = native_expert_forward(
-            hidden_states, rw, selected, gate_cuda, up_cuda, down_cuda, num_experts,
+            hidden_states,
+            rw,
+            selected,
+            gate_cuda,
+            up_cuda,
+            down_cuda,
+            num_experts,
         )
         ref_out = reference_moe_forward(hidden_states, rw, selected, gate_cuda, up_cuda, down_cuda, num_experts)
         torch.testing.assert_close(native_out, ref_out, atol=0.02, rtol=0.02)
 
         # --- Triton backend ---
         try:
-            from xorl.utils.import_utils import is_fused_moe_available
+            from xorl.utils.import_utils import is_fused_moe_available  # noqa: PLC0415
+
             if not is_fused_moe_available():
                 raise ImportError
-            from xorl.ops.moe.triton import TritonMoeExpertsFunction
+            from xorl.ops.moe.triton import TritonMoeExpertsFunction  # noqa: PLC0415
 
             triton_out = TritonMoeExpertsFunction.apply(
-                num_experts, rw, selected, hidden_states, gate_cuda, up_cuda, down_cuda,
+                num_experts,
+                rw,
+                selected,
+                hidden_states,
+                gate_cuda,
+                up_cuda,
+                down_cuda,
             )
             torch.testing.assert_close(triton_out, ref_out, atol=0.01, rtol=0.01)
 
             # Triton backward: gradients exist and non-zero
-            gate_g = torch.randn(num_experts, hidden_size, intermediate_size, device=device, dtype=dtype, requires_grad=True)
-            up_g = torch.randn(num_experts, hidden_size, intermediate_size, device=device, dtype=dtype, requires_grad=True)
-            down_g = torch.randn(num_experts, intermediate_size, hidden_size, device=device, dtype=dtype, requires_grad=True)
+            gate_g = torch.randn(
+                num_experts, hidden_size, intermediate_size, device=device, dtype=dtype, requires_grad=True
+            )
+            up_g = torch.randn(
+                num_experts, hidden_size, intermediate_size, device=device, dtype=dtype, requires_grad=True
+            )
+            down_g = torch.randn(
+                num_experts, intermediate_size, hidden_size, device=device, dtype=dtype, requires_grad=True
+            )
             h_g = torch.randn(num_tokens, hidden_size, device=device, dtype=dtype, requires_grad=True)
             out_g = TritonMoeExpertsFunction.apply(num_experts, rw, selected, h_g, gate_g, up_g, down_g)
             out_g.sum().backward()
@@ -254,7 +291,7 @@ class TestBackendGKN:
 
         # --- MoEBlock all backends agree ---
         try:
-            from xorl.models.layers.moe import MoEBlock, MOE_EXPERT_BACKENDS
+            from xorl.models.layers.moe import MOE_EXPERT_BACKENDS, MoEBlock  # noqa: PLC0415
         except (ImportError, ModuleNotFoundError):
             return  # skip if not importable
 
@@ -266,8 +303,11 @@ class TestBackendGKN:
 
         for backend in MOE_EXPERT_BACKENDS:
             block = MoEBlock(
-                hidden_size=hidden_size, num_experts=num_experts, top_k=2,
-                intermediate_size=intermediate_size, moe_implementation=backend,
+                hidden_size=hidden_size,
+                num_experts=num_experts,
+                top_k=2,
+                intermediate_size=intermediate_size,
+                moe_implementation=backend,
             )
             with torch.no_grad():
                 block.experts.gate_proj.copy_(g_gkn)
@@ -282,8 +322,10 @@ class TestBackendGKN:
         for i in range(len(backends)):
             for j in range(i + 1, len(backends)):
                 torch.testing.assert_close(
-                    outputs[backends[i]], outputs[backends[j]],
-                    atol=0.05, rtol=0.02,
+                    outputs[backends[i]],
+                    outputs[backends[j]],
+                    atol=0.05,
+                    rtol=0.02,
                     msg=f"Backend mismatch: {backends[i]} vs {backends[j]}",
                 )
 

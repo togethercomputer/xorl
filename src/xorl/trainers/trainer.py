@@ -10,15 +10,18 @@ Usage:
 
 import json
 import os
+import socket
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+import torch.distributed.tensor._random
+from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
 from tqdm import trange
 
-from xorl.arguments import Arguments
+from xorl.arguments import Arguments, save_args
 from xorl.checkpoint import build_checkpointer
 from xorl.data.constants import IGNORE_INDEX
 from xorl.data.data_loader import DataLoaderBuilder
@@ -26,33 +29,63 @@ from xorl.data.prepare.prepare_datasets import prepare_datasets
 from xorl.distributed.gradient_accumulate_loss import gradient_accumulate_loss
 from xorl.distributed.offloading import build_activation_offloading_context
 from xorl.distributed.parallel_state import get_parallel_state, init_parallel_state
+from xorl.distributed.pipeline_parallel import build_pipeline_schedule, build_pp_stage
 from xorl.distributed.sync_padding import synchronize_micro_batch_padding
 from xorl.distributed.torch_parallelize import build_parallelize_model
+from xorl.lora.utils import save_lora_checkpoint
 from xorl.models import build_foundation_model, build_tokenizer, save_model_assets, save_model_weights
+from xorl.models.checkpoint_handlers.buffers import get_prequantized_exclude_modules
+from xorl.models.layers.moe.aux_loss import global_load_balancing_loss_func
 from xorl.models.layers.moe.routing_replay import RoutingReplay, set_replay_stage
 from xorl.models.module_utils import compute_loss
-from xorl.models.transformers.qwen3_moe.modeling_qwen3_moe import load_balancing_loss_func
 from xorl.optim import build_lr_scheduler, build_optimizer
+from xorl.qlora import (
+    detect_prequantized_block_fp8,
+    detect_prequantized_nvfp4,
+    inject_qlora_into_model,
+    maybe_load_and_quantize_moe_qlora,
+    maybe_load_prequantized_qlora,
+    maybe_quantize_qlora,
+)
+from xorl.qlora.utils import _deregister_qlora_weights_from_fsdp
+from xorl.trainers.model_builder import (
+    maybe_upcast_trainable_adapter_params,
+    resolve_training_model_dtype,
+    should_skip_generic_param_upcast,
+)
 from xorl.trainers.training_utils import (
-    pp_loss_fn,
     clip_gradients,
     count_valid_tokens,
     forward_backward_pp,
     maybe_merge_lora,
     negotiate_pp_seq_len,
     pad_micro_batches_for_pp,
+    pp_loss_fn,
     sync_sp_gradients,
 )
 from xorl.utils import helper
 from xorl.utils.device import get_device_type, get_nccl_backend, get_torch_device, synchronize
 from xorl.utils.dist_utils import all_reduce
 
+
 logger = helper.create_logger(__name__)
+_trainer_cpu_group: Optional[dist.ProcessGroup] = None
+
+
+def _get_trainer_cpu_group() -> Optional[dist.ProcessGroup]:
+    """Return a cached CPU/Gloo group for object collectives in trainer bootstrap."""
+    global _trainer_cpu_group
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() <= 1:
+        return None
+    if _trainer_cpu_group is None:
+        _trainer_cpu_group = dist.new_group(backend="gloo")
+    return _trainer_cpu_group
 
 
 # ---------------------------------------------------------------------------
 # TrainState — checkpointable training state
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class TrainState:
@@ -82,6 +115,7 @@ class TrainState:
 # Trainer
 # ---------------------------------------------------------------------------
 
+
 class Trainer:
     """Offline training loop. Analogous to torchtitan's Trainer.
 
@@ -94,6 +128,9 @@ class Trainer:
     def __init__(self, args: Arguments) -> None:
         self.args = args
         self.state = TrainState()
+        self._setup_phase_metrics: Dict[str, float] = {}
+        self._startup_metrics: Dict[str, Any] = {}
+        self._wandb_initialized = False
 
         # Setup phases (order matters — each depends on previous)
         # Model is built before data: reads weights from disk while I/O is free,
@@ -102,7 +139,10 @@ class Trainer:
             t0 = time.time()
             fn()
             elapsed = time.time() - t0
+            self._setup_phase_metrics[f"startup/{phase_name}_sec"] = elapsed
             logger.info(f"[TIMING] {phase_name} took {elapsed:.1f}s (rank {args.train.local_rank})")
+            self._maybe_log_startup_metrics({f"startup/{phase_name}_sec": elapsed}, commit=False)
+            self._log_memory_snapshot(f"startup/{phase_name}")
 
         _timed("bootstrap", self._bootstrap)
         _timed("build_model", self._build_model)
@@ -112,6 +152,7 @@ class Trainer:
         _timed("setup_observability", self._setup_observability)
         _timed("resume_checkpoint", self._resume_checkpoint)
         _timed("build_pp_schedule", self._init_pp_schedule_cache)
+        self._write_startup_metrics_file()
 
     # ===================================================================
     # Setup phases
@@ -120,7 +161,9 @@ class Trainer:
     def _bootstrap(self) -> None:
         """Initialize distributed, device, seed, parallel state."""
         args = self.args
-        dist.init_process_group(backend=get_nccl_backend())
+        from datetime import timedelta
+
+        dist.init_process_group(backend=get_nccl_backend(), timeout=timedelta(minutes=60))
         logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
         logger.info_rank0(json.dumps(asdict(args), indent=2))
 
@@ -131,8 +174,36 @@ class Trainer:
             helper.enable_third_party_logging()
 
         if args.train.global_rank == 0:
-            from xorl.arguments import save_args
             save_args(args, args.train.output_dir)
+            if args.train.use_wandb:
+                import wandb  # noqa: PLC0415
+
+                wandb.init(
+                    project=args.train.wandb_project,
+                    name=args.train.wandb_name,
+                    tags=args.train.wandb_tags,
+                    config={**vars(args.model), **vars(args.data), **vars(args.train)},
+                )
+                self._wandb_initialized = True
+                config_file = os.path.join(args.train.output_dir, "xorl_cli.yaml")
+                if os.path.exists(config_file):
+                    wandb.save(config_file, policy="now")
+                self._maybe_log_startup_metrics(
+                    {
+                        "startup/world_size": args.train.world_size,
+                        "startup/global_batch_size": args.train.global_batch_size,
+                        "startup/micro_batch_size": args.train.micro_batch_size,
+                        "startup/gradient_accumulation_steps": args.train.gradient_accumulation_steps,
+                        "startup/data_parallel_size": args.train.data_parallel_size,
+                        "startup/data_parallel_replicate_size": args.train.data_parallel_replicate_size,
+                        "startup/data_parallel_shard_size": args.train.data_parallel_shard_size,
+                        "startup/ulysses_parallel_size": args.train.ulysses_parallel_size,
+                        "startup/expert_parallel_size": args.train.expert_parallel_size,
+                        "startup/pipeline_parallel_size": args.train.pipeline_parallel_size,
+                    },
+                    commit=False,
+                )
+        self._log_host_inventory()
 
         self.Checkpointer = build_checkpointer(
             dist_backend=args.train.data_parallel_mode,
@@ -155,11 +226,121 @@ class Trainer:
         # DTensor RNG tracker (run_state_sync=False to avoid PP deadlock)
         self.ps = get_parallel_state()
         if self.ps.device_mesh is not None:
-            import torch.distributed.tensor._random
             torch.distributed.tensor._random.manual_seed(args.train.seed, self.ps.device_mesh)
 
         # Routing replay is only needed with EP when MoE forward is recomputed
         self._use_routing_replay = self.ps.ep_size > 1 and args.train.moe_recomputed
+
+    def _maybe_log_startup_metrics(self, metrics: Dict[str, Any], commit: bool = False) -> None:
+        """Log startup metrics to wandb once rank 0 has initialized it."""
+        if not metrics:
+            return
+        if self.args.train.global_rank == 0:
+            self._startup_metrics.update(metrics)
+        if self.args.train.global_rank != 0 or not self.args.train.use_wandb or not self._wandb_initialized:
+            return
+        import wandb  # noqa: PLC0415
+
+        wandb.log(metrics, step=0, commit=commit)
+
+    def _write_startup_metrics_file(self) -> None:
+        """Persist startup metrics alongside the run outputs for offline inspection."""
+        if self.args.train.global_rank != 0:
+            return
+
+        payload = {
+            "repo_commit": self.args.train.repo_commit,
+            "wandb_project": self.args.train.wandb_project if self.args.train.use_wandb else None,
+            "wandb_name": self.args.train.wandb_name if self.args.train.use_wandb else None,
+            "metrics": self._startup_metrics,
+        }
+        output_path = os.path.join(self.args.train.output_dir, "startup_metrics.json")
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+
+    def _collect_host_inventory(self) -> List[Dict[str, Any]]:
+        """Gather rank-to-host mapping across all processes."""
+        payload = {
+            "global_rank": self.args.train.global_rank,
+            "local_rank": self.args.train.local_rank,
+            "hostname": socket.gethostname(),
+        }
+        if not dist.is_available() or not dist.is_initialized() or self.args.train.world_size <= 1:
+            return [payload]
+        gathered: List[Optional[Dict[str, Any]]] = [None] * self.args.train.world_size
+        dist.all_gather_object(gathered, payload, group=_get_trainer_cpu_group())
+        return [item for item in gathered if item is not None]
+
+    def _log_host_inventory(self) -> None:
+        """Emit host inventory to stdout and wandb config on rank 0."""
+        inventory = self._collect_host_inventory()
+        if self.args.train.global_rank != 0:
+            return
+
+        unique_hostnames = sorted({item["hostname"] for item in inventory})
+        rank_to_hostname = {str(item["global_rank"]): item["hostname"] for item in inventory}
+        logger.info_rank0(
+            "Host inventory:\n"
+            + json.dumps(
+                {
+                    "master_addr": os.environ.get("MASTER_ADDR"),
+                    "master_port": os.environ.get("MASTER_PORT"),
+                    "node_count": len(unique_hostnames),
+                    "hostnames": unique_hostnames,
+                    "ranks": inventory,
+                },
+                indent=2,
+            )
+        )
+        self._startup_metrics.update(
+            {
+                "startup/master_addr": os.environ.get("MASTER_ADDR"),
+                "startup/master_port": os.environ.get("MASTER_PORT"),
+                "startup/node_count": len(unique_hostnames),
+                "startup/hostnames": unique_hostnames,
+                "startup/rank_to_hostname": rank_to_hostname,
+            }
+        )
+        self._maybe_log_startup_metrics({"startup/node_count": len(unique_hostnames)}, commit=False)
+        if self.args.train.use_wandb and self._wandb_initialized:
+            import wandb  # noqa: PLC0415
+
+            wandb.config.update(
+                {
+                    "master_addr": os.environ.get("MASTER_ADDR"),
+                    "master_port": os.environ.get("MASTER_PORT"),
+                    "hostnames": unique_hostnames,
+                    "rank_to_hostname": rank_to_hostname,
+                },
+                allow_val_change=True,
+            )
+
+    def _log_memory_snapshot(self, prefix: str) -> None:
+        """Capture a coarse memory snapshot during setup for wandb comparison."""
+        if not self.args.train.use_wandb:
+            return
+
+        device = get_torch_device()
+        allocated_memory = device.memory_allocated()
+        reserved_memory = device.memory_reserved()
+        max_allocated_memory = device.max_memory_allocated()
+        max_reserved_memory = device.max_memory_reserved()
+
+        allocated_memory, reserved_memory, max_allocated_memory, max_reserved_memory = all_reduce(
+            (allocated_memory, reserved_memory, max_allocated_memory, max_reserved_memory),
+            op="max",
+        )
+        if self.args.train.global_rank != 0 or not self._wandb_initialized:
+            return
+        self._maybe_log_startup_metrics(
+            {
+                f"{prefix}/gpu_allocated_gb": allocated_memory / (1024**3),
+                f"{prefix}/gpu_reserved_gb": reserved_memory / (1024**3),
+                f"{prefix}/gpu_max_allocated_gb": max_allocated_memory / (1024**3),
+                f"{prefix}/gpu_max_reserved_gb": max_reserved_memory / (1024**3),
+            },
+            commit=False,
+        )
 
     def _build_data(self) -> None:
         """Build tokenizer, datasets, dataloader, compute step counts."""
@@ -185,32 +366,36 @@ class Trainer:
         if args.train.max_steps is not None:
             self.total_train_steps = min(self.total_train_steps, args.train.max_steps)
         logger.info_rank0(
-            f"Train steps per epoch: {self.train_steps_per_epoch}, "
-            f"Total train steps: {self.total_train_steps}"
+            f"Train steps per epoch: {self.train_steps_per_epoch}, Total train steps: {self.total_train_steps}"
         )
 
         self.save_epoch_steps = (
             int(args.train.save_epochs * self.train_steps_per_epoch) if args.train.save_epochs else 0
         )
         if self.save_epoch_steps:
-            logger.info_rank0(
-                f"Save every {args.train.save_epochs} epoch(s) = every {self.save_epoch_steps} steps"
-            )
+            logger.info_rank0(f"Save every {args.train.save_epochs} epoch(s) = every {self.save_epoch_steps} steps")
 
     def _build_model(self) -> None:
         """Build foundation model and inject LoRA/QLoRA if configured."""
         args = self.args
         logger.info_rank0("Prepare model")
+        model_dtype = resolve_training_model_dtype(
+            enable_lora=args.lora.enable_lora,
+            enable_qlora=args.lora.enable_qlora,
+            enable_mixed_precision=args.train.enable_mixed_precision,
+        )
         self.model = build_foundation_model(
             config_path=args.model.config_path,
             weights_path=args.model.model_path,
-            torch_dtype="float32" if args.train.enable_mixed_precision else "bfloat16",
+            torch_dtype=model_dtype,
             attn_implementation=args.model.attn_implementation,
             moe_implementation=args.model.moe_implementation,
             ep_dispatch=args.model.ep_dispatch,
+            train_router=args.model.train_router,
             deepep_buffer_size_gb=args.model.deepep_buffer_size_gb,
             deepep_num_sms=args.model.deepep_num_sms,
             deepep_async_combine=args.model.deepep_async_combine,
+            rmsnorm_mode=args.model.rmsnorm_mode,
             init_device=args.train.init_device,
         )
         self.model_config = self.model.config
@@ -232,13 +417,19 @@ class Trainer:
         elif args.lora.enable_lora:
             self._inject_lora()
 
+        maybe_upcast_trainable_adapter_params(
+            self.model,
+            enable_lora=args.lora.enable_lora,
+            enable_qlora=args.lora.enable_qlora,
+            enable_mixed_precision=args.train.enable_mixed_precision,
+        )
+
         # Save pre-hook before parallelization (some models register optimizer hooks)
         self._optimizer_pre_hook_fn = getattr(self.model, "get_optimizer_pre_hook", None)
 
     def _inject_qlora(self) -> None:
         """QLoRA injection with pre-quantized checkpoint detection."""
         args = self.args
-        from xorl.qlora import inject_qlora_into_model, detect_prequantized_nvfp4, detect_prequantized_block_fp8
 
         if detect_prequantized_nvfp4(args.model.model_path):
             self.is_prequantized = True
@@ -253,7 +444,6 @@ class Trainer:
             self.exclude_modules = set(args.lora.exclude_modules)
             logger.info_rank0(f"Using user-specified exclude_modules: {self.exclude_modules}")
         elif self.is_prequantized:
-            from xorl.models.checkpoint_handlers.buffers import get_prequantized_exclude_modules
             self.exclude_modules = get_prequantized_exclude_modules(args.model.model_path)
             if self.exclude_modules:
                 logger.info_rank0(
@@ -285,15 +475,30 @@ class Trainer:
         helper.print_device_mem_info("VRAM usage after QLoRA injection")
 
     def _inject_lora(self) -> None:
-        """Plain LoRA injection."""
+        """Plain LoRA injection (dense + optional MoE-aware)."""
         args = self.args
-        from xorl.lora.utils import inject_lora_into_model
-        inject_lora_into_model(
-            self.model,
-            r=args.lora.lora_rank,
-            lora_alpha=args.lora.lora_alpha,
-            target_modules=args.lora.lora_target_modules,
-        )
+        is_moe_model = getattr(self.model.config, "num_experts", 0) > 0
+
+        if is_moe_model and args.lora.moe_hybrid_shared_lora:
+            from xorl.lora.utils import inject_lora_into_model_with_moe
+
+            logger.info_rank0(f"MoE-aware LoRA injection (hybrid_shared={args.lora.moe_hybrid_shared_lora})")
+            inject_lora_into_model_with_moe(
+                self.model,
+                r=args.lora.lora_rank,
+                lora_alpha=args.lora.lora_alpha,
+                target_modules=args.lora.lora_target_modules,
+                moe_hybrid_shared_lora=args.lora.moe_hybrid_shared_lora,
+            )
+        else:
+            from xorl.lora.utils import inject_lora_into_model
+
+            inject_lora_into_model(
+                self.model,
+                r=args.lora.lora_rank,
+                lora_alpha=args.lora.lora_alpha,
+                target_modules=args.lora.lora_target_modules,
+            )
         helper.print_device_mem_info("VRAM usage after LoRA injection")
 
     def _parallelize(self) -> None:
@@ -301,8 +506,7 @@ class Trainer:
         args = self.args
         _t0 = time.time()
         logger.info_rank0(
-            f"Loading model weights (mode={args.train.load_weights_mode}, "
-            f"init_device={args.train.init_device})..."
+            f"Loading model weights (mode={args.train.load_weights_mode}, init_device={args.train.init_device})..."
         )
         build_result = build_parallelize_model(
             self.model,
@@ -314,16 +518,18 @@ class Trainer:
             enable_compile=args.train.enable_compile,
             basic_modules=self.model._no_split_modules + args.model.basic_modules,
             enable_reentrant=args.train.enable_reentrant,
-            recompute_modules=args.train.recompute_modules,
-            moe_checkpoint_method=args.train.moe_checkpoint_method,
+            gradient_checkpointing_method=args.train.gradient_checkpointing_method,
             enable_forward_prefetch=args.train.enable_forward_prefetch,
             load_weights_mode=args.train.load_weights_mode,
             pp_schedule=args.train.pipeline_parallel_schedule if args.train.pipeline_parallel_size > 1 else None,
             reshard_after_forward=args.train.reshard_after_forward,
-            skip_param_upcast=args.lora.enable_qlora,
+            skip_param_upcast=should_skip_generic_param_upcast(
+                enable_lora=args.lora.enable_lora,
+                enable_qlora=args.lora.enable_qlora,
+            ),
         )
 
-        logger.info_rank0(f"Model weights loaded in {time.time()-_t0:.1f}s")
+        logger.info_rank0(f"Model weights loaded in {time.time() - _t0:.1f}s")
         helper.print_device_mem_info("VRAM after loading weights")
 
         # PP returns dict with stages + model_parts; otherwise returns model directly
@@ -355,14 +561,11 @@ class Trainer:
         """After FSDP loads weights, quantize them into uint8 buffers."""
         args = self.args
         if self.is_prequantized:
-            from xorl.qlora import maybe_load_prequantized_qlora
             logger.info("Starting pre-quantized weight loading...")
             helper.print_device_mem_info("VRAM before pre-quantized loading")
             maybe_load_prequantized_qlora(self.model, args.model.model_path)
             logger.info("Done pre-quantized weight loading, freezing non-LoRA params...")
         else:
-            from xorl.qlora import maybe_quantize_qlora, maybe_load_and_quantize_moe_qlora
-            from xorl.qlora.utils import _deregister_qlora_weights_from_fsdp
             logger.info("Starting maybe_quantize_qlora...")
             helper.print_device_mem_info("VRAM before QLoRA quantization")
             maybe_quantize_qlora(self.model)
@@ -372,7 +575,8 @@ class Trainer:
             logger.info("Done MoE weight loading, freezing non-LoRA params...")
             # Deregister packed_weight_f32 from FSDP2 (prevent mixed-precision corruption)
             removed = _deregister_qlora_weights_from_fsdp(
-                self.model, param_names=("packed_weight_f32",),
+                self.model,
+                param_names=("packed_weight_f32",),
             )
             torch.cuda.empty_cache()
             if removed > 0:
@@ -417,17 +621,6 @@ class Trainer:
         self.model_assets = [self.model_config, self.tokenizer]
 
         if args.train.global_rank == 0:
-            if args.train.use_wandb:
-                import wandb
-                wandb.init(
-                    project=args.train.wandb_project,
-                    name=args.train.wandb_name,
-                    tags=args.train.wandb_tags,
-                    config={**vars(args.model), **vars(args.data), **vars(args.train)},
-                )
-                config_file = os.path.join(args.train.output_dir, "xorl_cli.yaml")
-                if os.path.exists(config_file):
-                    wandb.save(config_file, policy="now")
             save_model_assets(args.train.model_assets_dir, self.model_assets)
 
         self.profiler = None
@@ -447,10 +640,16 @@ class Trainer:
             config=self.model_config,
             global_batch_size=args.train.global_batch_size,
             empty_cache_steps=args.train.empty_cache_steps,
-            gc_enabled=args.train.enable_gradient_checkpointing,
-            recompute_modules=args.train.recompute_modules,
-            moe_checkpoint_method=args.train.moe_checkpoint_method,
+            gradient_checkpointing_enabled=args.train.enable_gradient_checkpointing,
+            gradient_checkpointing_method=args.train.gradient_checkpointing_method,
             cp_size=args.train.ulysses_parallel_size * args.train.ringattn_parallel_size,
+        )
+        self._maybe_log_startup_metrics(
+            {
+                "startup/train_steps_per_epoch": self.train_steps_per_epoch,
+                "startup/total_train_steps": self.total_train_steps,
+            },
+            commit=False,
         )
 
     def _resume_checkpoint(self) -> None:
@@ -493,7 +692,6 @@ class Trainer:
         With static padding, seq_len is always the same so only one entry is cached.
         """
         if seq_len not in self._pp_schedule_cache:
-            from xorl.distributed.pipeline_parallel import build_pipeline_schedule, build_pp_stage
             stage = build_pp_stage(
                 self.model_parts[0],
                 pp_rank=self.ps.pp_rank,
@@ -601,8 +799,15 @@ class Trainer:
                 state.loss_history.append(total_loss)
 
                 # Logging
-                self._maybe_log(total_loss, grad_norm, lr, train_metrics, delta_time, use_tqdm,
-                                data_loader_tqdm if use_tqdm else None)
+                self._maybe_log(
+                    total_loss,
+                    grad_norm,
+                    lr,
+                    train_metrics,
+                    delta_time,
+                    use_tqdm,
+                    data_loader_tqdm if use_tqdm else None,
+                )
                 self._maybe_profile()
                 self._maybe_save_checkpoint()
 
@@ -643,6 +848,7 @@ class Trainer:
             RoutingReplay.clear_all()
 
         self._sync_sp_gradients()
+
         grad_norm = self._clip_and_step()
         self._maybe_merge_lora()
         total_loss, grad_norm = self._reduce_metrics(total_loss, grad_norm)
@@ -711,17 +917,21 @@ class Trainer:
             with self._model_fwd_context:
                 outputs = self.model(**micro_batch, use_cache=False, output_hidden_states=False)
                 result = compute_loss(
-                    self.model.lm_head, outputs.last_hidden_state,
-                    loss_fn_name=None, loss_fn_inputs={"labels": labels},
-                    loss_fn_params=None, logits_to_keep=0,
+                    self.model.lm_head,
+                    outputs.last_hidden_state,
+                    loss_fn_name=None,
+                    loss_fn_inputs={"labels": labels},
+                    loss_fn_params=None,
+                    logits_to_keep=0,
                 )
                 loss = result.loss
 
                 if hasattr(outputs, "router_logits") and outputs.router_logits is not None:
-                    aux_loss = load_balancing_loss_func(
+                    aux_loss = global_load_balancing_loss_func(
                         outputs.router_logits,
                         self.model.num_experts,
                         self.model.num_experts_per_tok,
+                        dp_group=self.ps.dp_group if self.ps.dp_enabled else None,
                     )
                     if aux_loss != 0:
                         loss = loss + self.model.router_aux_loss_coef * aux_loss.to(loss.device)
@@ -825,16 +1035,15 @@ class Trainer:
         use_tqdm: bool,
         tqdm_bar: Optional[Any],
     ) -> None:
-        """Log metrics to stdout / tqdm / wandb."""
+        """Log metrics to stdout / tqdm / wandb / structured JSON."""
         args = self.args
         tflops_per_gpu = train_metrics.get("efficiency/flops_achieved(T)", 0) / args.train.world_size
         mfu = train_metrics.get("efficiency/mfu", 0)
         tokens_per_sec = train_metrics.get("efficiency/tokens_per_second(K)", 0) * 1e3
+        gpu_mem_gb = train_metrics.get("memory/gpu_allocated(GB)", 0)
 
         if use_tqdm and tqdm_bar is not None:
-            tqdm_bar.set_postfix_str(
-                f"loss={total_loss:.2f} gn={grad_norm:.2f} lr={lr:.1e} tflops={tflops_per_gpu:.1f}"
-            )
+            tqdm_bar.set_postfix_str(f"loss={total_loss:.2f} gn={grad_norm:.2f} lr={lr:.1e} tok/s={tokens_per_sec:.0f}")
             tqdm_bar.update()
         else:
             max_steps_str = args.train.max_steps or "?"
@@ -842,19 +1051,31 @@ class Trainer:
                 f"[STEP {self.state.global_step}/{max_steps_str}] "
                 f"loss={total_loss:.4f} grad_norm={grad_norm:.4f} lr={lr:.6e} "
                 f"tflops={tflops_per_gpu:.1f} mfu={mfu:.4f} "
-                f"tokens_per_sec={tokens_per_sec:.0f} time={delta_time:.3f}s"
+                f"tokens_per_sec={tokens_per_sec:.0f} time={delta_time:.3f}s "
+                f"peak_mem={gpu_mem_gb:.1f}GB"
             )
 
-        if args.train.global_rank == 0 and args.train.use_wandb and self.state.global_step % args.train.wandb_log_interval == 0:
-            import wandb
-            train_metrics.update({
-                "training/loss": total_loss,
-                "training/grad_norm": grad_norm,
-                "training/lr": lr,
-                "training/epoch": self.state.epoch,
-                "training/step_time": delta_time,
-                "training/samples_seen": self.state.global_step * args.train.global_batch_size,
-            })
+        if (
+            args.train.global_rank == 0
+            and args.train.use_wandb
+            and self.state.global_step % args.train.wandb_log_interval == 0
+        ):
+            import wandb  # noqa: PLC0415
+
+            epoch_fraction = self.state.epoch + (
+                (self.state.global_step - self.state.epoch * self.train_steps_per_epoch)
+                / max(self.train_steps_per_epoch, 1)
+            )
+            train_metrics.update(
+                {
+                    "training/loss": total_loss,
+                    "training/grad_norm": grad_norm,
+                    "training/lr": lr,
+                    "training/epoch": epoch_fraction,
+                    "training/step_time": delta_time,
+                    "training/samples_seen": self.state.global_step * args.train.global_batch_size,
+                }
+            )
             # Log per-group LRs (e.g., separate Muon vs AdamW LRs)
             for group in self.optimizer.param_groups:
                 if group.get("use_muon", False):
@@ -877,17 +1098,14 @@ class Trainer:
         args = self.args
         step = self.state.global_step
 
-        should_save = (
-            (args.train.save_steps and step % args.train.save_steps == 0)
-            or (self.save_epoch_steps and step % self.save_epoch_steps == 0)
+        should_save = (args.train.save_steps and step % args.train.save_steps == 0) or (
+            self.save_epoch_steps and step % self.save_epoch_steps == 0
         )
         if not should_save:
             return
 
         helper.empty_cache()
-        save_checkpoint_path = os.path.join(
-            args.train.save_checkpoint_path, f"global_step_{step}"
-        )
+        save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{step}")
         state = {
             "model": self.model,
             "optimizer": self.optimizer,
@@ -902,8 +1120,10 @@ class Trainer:
         is_lora_training = args.lora.enable_lora or args.lora.enable_qlora
         _save_lora_only = is_lora_training and args.lora.merge_lora_interval == 0
         self.Checkpointer.save(
-            args.train.save_checkpoint_path, state,
-            global_steps=step, save_lora_only=_save_lora_only,
+            args.train.save_checkpoint_path,
+            state,
+            global_steps=step,
+            save_lora_only=_save_lora_only,
         )
         dist.barrier()
         logger.info_rank0(f"Checkpoint saved at {save_checkpoint_path}")
@@ -925,7 +1145,6 @@ class Trainer:
 
         hf_model_state_dict = None
         if args.train.save_hf_weights and not save_peft_adapter:
-            from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
             logger.info_rank0("Gathering full model state dict for HF checkpoint via NCCL with CPU offload...")
             hf_model_state_dict = get_model_state_dict(
                 self.model, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
@@ -936,26 +1155,25 @@ class Trainer:
 
         # Save HF weights (rank 0)
         if args.train.global_rank == 0 and args.train.save_hf_weights:
-            hf_weights_path = os.path.join(
-                args.train.output_dir, f"global_step_{state.global_step}", "hf_ckpt"
-            )
+            hf_weights_path = os.path.join(args.train.output_dir, f"global_step_{state.global_step}", "hf_ckpt")
             if save_peft_adapter:
-                from xorl.lora.utils import save_lora_checkpoint
                 save_lora_checkpoint(
-                    self.model, hf_weights_path,
+                    self.model,
+                    hf_weights_path,
                     base_model_name=args.model.model_path,
                     target_modules=args.lora.lora_target_modules,
                     r=args.lora.lora_rank,
                     lora_alpha=args.lora.lora_alpha,
+                    moe_hybrid_shared_lora=args.lora.moe_hybrid_shared_lora,
                 )
                 logger.info_rank0(f"PEFT adapter saved at {hf_weights_path}")
             elif hf_model_state_dict is not None:
                 checkpoint_handler = (
-                    self.model.get_checkpoint_handler()
-                    if hasattr(self.model, "get_checkpoint_handler") else None
+                    self.model.get_checkpoint_handler() if hasattr(self.model, "get_checkpoint_handler") else None
                 )
                 save_model_weights(
-                    hf_weights_path, hf_model_state_dict,
+                    hf_weights_path,
+                    hf_model_state_dict,
                     model_assets=self.model_assets,
                     checkpoint_handler=checkpoint_handler,
                 )
@@ -967,14 +1185,18 @@ class Trainer:
             metrics_path = os.path.join(args.train.output_dir, "training_metrics.json")
             os.makedirs(args.train.output_dir, exist_ok=True)
             with open(metrics_path, "w") as f:
-                json.dump({
-                    "final_loss": total_loss,
-                    "final_grad_norm": grad_norm,
-                    "final_lr": lr,
-                    "global_step": state.global_step,
-                    "total_train_steps": self.total_train_steps,
-                    "loss_history": state.loss_history,
-                }, f, indent=2)
+                json.dump(
+                    {
+                        "final_loss": total_loss,
+                        "final_grad_norm": grad_norm,
+                        "final_lr": lr,
+                        "global_step": state.global_step,
+                        "total_train_steps": self.total_train_steps,
+                        "loss_history": state.loss_history,
+                    },
+                    f,
+                    indent=2,
+                )
 
         dist.barrier()
         dist.destroy_process_group()

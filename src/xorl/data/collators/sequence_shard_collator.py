@@ -1,14 +1,13 @@
 from dataclasses import dataclass
-from typing import Dict, List, Sequence
+from typing import Dict
 
 import torch
-import torch.nn.functional as F
 
-from .base_collator import DataCollator
-from .packing_concat_collator import add_flash_attention_kwargs_from_position_ids
-from ...utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 from ...data.constants import IGNORE_INDEX
 from ...distributed.parallel_state import get_parallel_state
+from ...utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
+from .base_collator import DataCollator
+from .packing_concat_collator import add_flash_attention_kwargs_from_position_ids
 
 
 def zigzag_reorder_packed_sequence(
@@ -70,8 +69,8 @@ def zigzag_reorder_packed_sequence(
         chunks = list(doc.chunk(n, dim=dim))
 
         for r in range(ringattn_size):
-            rank_parts[r].append(chunks[r])           # early sub-chunk
-            rank_parts[r].append(chunks[n - 1 - r])   # late sub-chunk
+            rank_parts[r].append(chunks[r])  # early sub-chunk
+            rank_parts[r].append(chunks[n - 1 - r])  # late sub-chunk
 
     # Concatenate: rank 0's data first, then rank 1's, etc.
     all_parts = []
@@ -216,9 +215,7 @@ class TextSequenceShardCollator(DataCollator):
         # 1. cu_seqlens is computed from FULL padded position_ids
         # 2. For Ulysses, all SP ranks use the SAME cu_seqlens for flash attention
         # 3. Each SP rank only processes a slice of the sequence but needs full cu_seqlens
-        position_ids = self.sp_padding(
-            position_ids, dim=-1, pad_value=0, pad_length=pad_length, sequential=True
-        )
+        position_ids = self.sp_padding(position_ids, dim=-1, pad_value=0, pad_length=pad_length, sequential=True)
 
         # Zigzag reorder: rearrange each document's tokens so that contiguous
         # sp_slice gives each CP rank balanced [early, late] sub-chunks.
@@ -233,7 +230,9 @@ class TextSequenceShardCollator(DataCollator):
                     batch["attention_mask"], original_position_ids, self.ringattn_size, dim=-1
                 )
             # Reorder position_ids last (uses its own original values for boundaries)
-            position_ids = zigzag_reorder_packed_sequence(position_ids, original_position_ids, self.ringattn_size, dim=-1)
+            position_ids = zigzag_reorder_packed_sequence(
+                position_ids, original_position_ids, self.ringattn_size, dim=-1
+            )
 
         # sp slice - only slice input_ids and labels, NOT position_ids
         batch["input_ids"] = self.sp_slice(input_ids, dim=-1)

@@ -173,15 +173,15 @@ from typing import Any, Dict, Optional
 
 import zmq
 
+from xorl.server.backend import Backend, RemoteBackend
+from xorl.server.orchestrator.request_processor import RequestProcessor
+from xorl.server.orchestrator.scheduler import Scheduler, SeqIdAwareFIFOPolicy
 from xorl.server.protocol.api_orchestrator import (
     OrchestratorOutputs,
     OrchestratorRequest,
     OutputType,
     RequestType,
 )
-from xorl.server.backend import Backend, RemoteBackend
-from xorl.server.orchestrator.request_processor import RequestProcessor
-from xorl.server.orchestrator.scheduler import Scheduler, SeqIdAwareFIFOPolicy
 from xorl.server.utils.zmq_channels import SyncDealerChannel, SyncPushChannel
 
 
@@ -693,7 +693,11 @@ class Orchestrator:
                 request.payload.save_optimizer = False
 
             processor_method = getattr(self.request_processor, processor_method_name)
-            log_level = logging.DEBUG if operation in ("forward", "forward_backward", "optim_step", "get_adapter_info") else logging.INFO
+            log_level = (
+                logging.DEBUG
+                if operation in ("forward", "forward_backward", "optim_step", "get_adapter_info")
+                else logging.INFO
+            )
             logger.log(log_level, f"Executing {operation} for request {request.request_id}")
 
             output = self._call_async(processor_method(request))

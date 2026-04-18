@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from xorl.ops.quantize import nf4_quantize, nf4_dequantize
+from xorl.ops.quantize import nf4_dequantize, nf4_quantize
 from xorl.ops.quantize.nf4_codec import NF4_MIN_STEP
 from xorl.qlora.modules.linear import QLoRALinear
 
@@ -37,9 +37,16 @@ class NF4QLoRALinear(QLoRALinear):
         aqn_alpha: float = 1.0,
     ):
         super().__init__(
-            in_features, out_features, r=r, lora_alpha=lora_alpha,
-            quant_format="nf4", quant_group_size=64,
-            bias=bias, device=device, enable_aqn=enable_aqn, aqn_alpha=aqn_alpha,
+            in_features,
+            out_features,
+            r=r,
+            lora_alpha=lora_alpha,
+            quant_format="nf4",
+            quant_group_size=64,
+            bias=bias,
+            device=device,
+            enable_aqn=enable_aqn,
+            aqn_alpha=aqn_alpha,
         )
         # nf4: 2 codes per byte -> in_features // 2 bytes -> in_features // 8 float32 elements
         pw_cols = in_features // 8
@@ -56,8 +63,15 @@ class NF4QLoRALinear(QLoRALinear):
         self.reset_lora_parameters()
 
     @classmethod
-    def from_module(cls, module: nn.Module, r: int = 16, lora_alpha: int = 16,
-                    enable_aqn: bool = False, aqn_alpha: float = 1.0, **kwargs) -> "NF4QLoRALinear":
+    def from_module(
+        cls,
+        module: nn.Module,
+        r: int = 16,
+        lora_alpha: int = 16,
+        enable_aqn: bool = False,
+        aqn_alpha: float = 1.0,
+        **kwargs,
+    ) -> "NF4QLoRALinear":
         """Create from a bf16 nn.Linear by quantizing its weight to NF4.
 
         On meta device: defers quantization — keeps ``weight`` as a parameter
@@ -65,10 +79,14 @@ class NF4QLoRALinear(QLoRALinear):
         On real device: quantizes immediately and discards ``weight``.
         """
         qlora = cls(
-            in_features=module.in_features, out_features=module.out_features,
-            r=r, lora_alpha=lora_alpha,
-            bias=module.bias is not None, device=module.weight.device,
-            enable_aqn=enable_aqn, aqn_alpha=aqn_alpha,
+            in_features=module.in_features,
+            out_features=module.out_features,
+            r=r,
+            lora_alpha=lora_alpha,
+            bias=module.bias is not None,
+            device=module.weight.device,
+            enable_aqn=enable_aqn,
+            aqn_alpha=aqn_alpha,
         )
         if module.weight.device.type == "meta":
             qlora.weight = nn.Parameter(module.weight.detach(), requires_grad=False)
@@ -96,9 +114,7 @@ class NF4QLoRALinear(QLoRALinear):
         """nf4: 0.5 * NF4_MIN_STEP * per_group_scale (minimum quantization resolution)."""
         M, K = self.out_features, self.in_features
         gs = self.quant_group_size
-        scales = self._recover_tensor(
-            self.weight_scales, self._scale_dtypes["weight_scales"]
-        ).float()
+        scales = self._recover_tensor(self.weight_scales, self._scale_dtypes["weight_scales"]).float()
         step = scales.reshape(M, K // gs).repeat_interleave(gs, dim=1)
         return (0.5 * NF4_MIN_STEP * step).contiguous()
 

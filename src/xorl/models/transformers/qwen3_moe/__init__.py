@@ -1,24 +1,24 @@
 """Qwen3 MoE model."""
 
-from .configuration_qwen3_moe import Qwen3MoeConfig
-from .modeling_qwen3_moe import (
-    Qwen3MoeSparseExperts,
-    Qwen3MoeTritonExperts,
-    Qwen3MoeForCausalLM,
-    Qwen3MoeModel,
-    Qwen3MoeSparseTritonMoeBlock,
-    Qwen3MoeSparseNativeMoeBlock,
-)
-
 # Canonical MoE layer abstractions
 from ...layers.moe import (
+    MOE_EXPERT_BACKENDS,
     MoEBlock,
     MoEExperts,
     MoEExpertsLoRA,
     MoELoRAConfig,
     TopKRouter,
-    MOE_EXPERT_BACKENDS,
 )
+from .configuration_qwen3_moe import Qwen3MoeConfig
+from .modeling_qwen3_moe import (
+    Qwen3MoeForCausalLM,
+    Qwen3MoeModel,
+    Qwen3MoeSparseExperts,
+    Qwen3MoeSparseNativeMoeBlock,
+    Qwen3MoeSparseTritonMoeBlock,
+    Qwen3MoeTritonExperts,
+)
+
 
 __all__ = [
     # Base model

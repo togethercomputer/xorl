@@ -6,18 +6,27 @@ Functions for injecting QLoRA into models and managing quantized checkpoints.
 
 import json
 import logging
+import math
+import math as _math
 import os
-from typing import Collection, Dict, List, Optional, Set, Tuple
+from concurrent.futures import ThreadPoolExecutor
+from typing import Collection, List, Optional, Tuple
 
+import safetensors.torch
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from safetensors.torch import save_file
+from torch.distributed._tensor import DTensor
+from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, cached_file
 
-from xorl.qlora.modules.linear import QLoRALinear
-from xorl.qlora.modules.nvfp4_linear import NvFP4QLoRALinear
+from xorl.distributed.parallel_state import get_parallel_state
 from xorl.qlora.modules.block_fp8_linear import BlockFP8QLoRALinear
-from xorl.qlora.modules.nf4_linear import NF4QLoRALinear
+from xorl.qlora.modules.linear import QLoRALinear
 from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
+from xorl.qlora.modules.nf4_linear import NF4QLoRALinear
+from xorl.qlora.modules.nvfp4_linear import NvFP4QLoRALinear
+
 
 logger = logging.getLogger(__name__)
 
@@ -96,9 +105,7 @@ def inject_qlora_into_model(
         aqn_alpha: Scale factor for AQN noise magnitude (default 1.0).
     """
     if quant_format not in ("nvfp4", "block_fp8", "nf4"):
-        raise ValueError(
-            f"Supported QLoRA formats: 'nvfp4', 'block_fp8', 'nf4'. Got quant_format={quant_format!r}"
-        )
+        raise ValueError(f"Supported QLoRA formats: 'nvfp4', 'block_fp8', 'nf4'. Got quant_format={quant_format!r}")
     if target_modules is None:
         # Pre-quantized checkpoints: target the fused module names in the model.
         # Separate HF projections (q/k/v, gate/up) are merged during loading.
@@ -128,15 +135,11 @@ def inject_qlora_into_model(
     if exclude_modules:
         all_short_names = {p.split(".")[-1] for p in target_paths}
         before = len(target_paths)
-        target_paths = [
-            p for p in target_paths
-            if p.split(".")[-1] not in exclude_modules
-        ]
+        target_paths = [p for p in target_paths if p.split(".")[-1] not in exclude_modules]
         excluded = before - len(target_paths)
         if excluded > 0:
             logger.info(
-                f"Excluded {excluded} modules from QLoRA injection "
-                f"(not quantized in checkpoint): {exclude_modules}"
+                f"Excluded {excluded} modules from QLoRA injection (not quantized in checkpoint): {exclude_modules}"
             )
         # Warn about exclude_modules names that didn't match any target module
         unmatched = exclude_modules - all_short_names
@@ -169,8 +172,11 @@ def inject_qlora_into_model(
         if quant_format == "nf4":
             # NF4: quantize bf16 weights on-the-fly (no pre-quantized checkpoint)
             qlora_module = NF4QLoRALinear.from_module(
-                original_module, r=r, lora_alpha=lora_alpha,
-                enable_aqn=enable_aqn, aqn_alpha=aqn_alpha,
+                original_module,
+                r=r,
+                lora_alpha=lora_alpha,
+                enable_aqn=enable_aqn,
+                aqn_alpha=aqn_alpha,
             )
         else:
             # nvfp4/block_fp8: create empty shell, load pre-quantized weights later
@@ -212,7 +218,6 @@ def inject_qlora_into_model(
     if not any(t in ("gate_proj", "up_proj", "down_proj") for t in target_modules):
         return model
 
-    from xorl.distributed.parallel_state import get_parallel_state
     try:
         parallel_state = get_parallel_state()
         ep_size = parallel_state.ep_size if parallel_state.ep_enabled else 1
@@ -227,17 +232,30 @@ def inject_qlora_into_model(
         if not (hasattr(module, "gate") and hasattr(module, "experts")):
             continue
         experts = module.experts
+        fused_gate_up = getattr(experts, "gate_up_proj", None)
         has_3d_weights = (
-            hasattr(experts, "gate_proj") and isinstance(experts.gate_proj, nn.Parameter)
-            and hasattr(experts, "up_proj") and isinstance(experts.up_proj, nn.Parameter)
-            and hasattr(experts, "down_proj") and isinstance(experts.down_proj, nn.Parameter)
-            and experts.gate_proj.dim() == 3
+            isinstance(fused_gate_up, nn.Parameter)
+            and hasattr(experts, "down_proj")
+            and isinstance(experts.down_proj, nn.Parameter)
+            and fused_gate_up.dim() == 3
             and not isinstance(experts, QLoRAMoeExperts)
         )
         if not has_3d_weights:
+            has_3d_weights = (
+                hasattr(experts, "gate_proj")
+                and isinstance(experts.gate_proj, nn.Parameter)
+                and hasattr(experts, "up_proj")
+                and isinstance(experts.up_proj, nn.Parameter)
+                and hasattr(experts, "down_proj")
+                and isinstance(experts.down_proj, nn.Parameter)
+                and experts.gate_proj.dim() == 3
+                and not isinstance(experts, QLoRAMoeExperts)
+            )
+        if not has_3d_weights:
             continue
 
-        num_experts = experts.gate_proj.shape[0]
+        base_gate = fused_gate_up if fused_gate_up is not None else experts.gate_proj
+        num_experts = base_gate.shape[0]
         num_local_experts = num_experts // ep_size
         expert_offset = ep_rank * num_local_experts
 
@@ -255,7 +273,7 @@ def inject_qlora_into_model(
         experts_fqn = name + ".experts" if not name.endswith(".experts") else name
 
         if quant_format == "nf4":
-            is_meta = experts.gate_proj.device.type == "meta"
+            is_meta = base_gate.device.type == "meta"
             if is_meta:
                 # Defer: load bf16 from checkpoint after FSDP, then quantize
                 qlora_experts._source_fqn = experts_fqn
@@ -266,7 +284,7 @@ def inject_qlora_into_model(
                     ("up", experts.up_proj),
                     ("down", experts.down_proj),
                 ]:
-                    local_w = src_param[expert_offset:expert_offset + num_local_experts]
+                    local_w = src_param[expert_offset : expert_offset + num_local_experts]
                     qlora_experts._quantize_proj(proj_name, local_w.float())
                 qlora_experts._weights_loaded = True
         else:
@@ -337,10 +355,7 @@ def maybe_quantize_qlora(model: nn.Module) -> int:
     Returns:
         Number of modules quantized.
     """
-    modules_to_quantize = [
-        m for m in model.modules()
-        if isinstance(m, QLoRALinear) and m.weight is not None
-    ]
+    modules_to_quantize = [m for m in model.modules() if isinstance(m, QLoRALinear) and m.weight is not None]
     if not modules_to_quantize:
         return 0
 
@@ -377,13 +392,8 @@ def maybe_load_and_quantize_moe_qlora(
     Returns:
         Number of MoE modules loaded.
     """
-    import json
-    import torch.distributed as dist
 
-    needs_moe = any(
-        isinstance(m, QLoRAMoeExperts) and not m._weights_loaded
-        for m in model.modules()
-    )
+    needs_moe = any(isinstance(m, QLoRAMoeExperts) and not m._weights_loaded for m in model.modules())
     if not needs_moe:
         return 0
 
@@ -391,7 +401,6 @@ def maybe_load_and_quantize_moe_qlora(
     weight_map = None
     if weights_path:
         try:
-            from transformers.utils import cached_file, SAFE_WEIGHTS_INDEX_NAME
             index_path = cached_file(weights_path, SAFE_WEIGHTS_INDEX_NAME)
             if index_path:
                 with open(index_path) as f:
@@ -412,10 +421,12 @@ def maybe_load_and_quantize_moe_qlora(
     for module in model.modules():
         if isinstance(module, QLoRAMoeExperts) and not module._weights_loaded:
             module.load_and_quantize_weights(
-                weights_path, weight_map=weight_map, shard_cache=shard_cache,
+                weights_path,
+                weight_map=weight_map,
+                shard_cache=shard_cache,
             )
             # Materialize LoRA params from meta device to GPU
-            from torch.distributed._tensor import DTensor
+
             for name, param in module.named_parameters():
                 if param.device.type == "meta":
                     if isinstance(param, DTensor):
@@ -423,19 +434,25 @@ def maybe_load_and_quantize_moe_qlora(
                         placement = param.placements
                         mesh = param.device_mesh
                         local_data = torch.zeros(
-                            local_shape, dtype=param.dtype, device="cuda",
+                            local_shape,
+                            dtype=param.dtype,
+                            device="cuda",
                         )
                         materialized = nn.Parameter(
                             DTensor.from_local(
-                                local_data, mesh, placement, run_check=False,
+                                local_data,
+                                mesh,
+                                placement,
+                                run_check=False,
                             ),
                             requires_grad=param.requires_grad,
                         )
                     else:
-                        import math as _math
                         materialized = nn.Parameter(
                             torch.zeros(
-                                param.shape, dtype=param.dtype, device="cuda",
+                                param.shape,
+                                dtype=param.dtype,
+                                device="cuda",
                             ),
                             requires_grad=param.requires_grad,
                         )
@@ -443,7 +460,8 @@ def maybe_load_and_quantize_moe_qlora(
                         if parts[-1] == "A":
                             for i in range(materialized.shape[0]):
                                 nn.init.kaiming_uniform_(
-                                    materialized.data[i], a=_math.sqrt(5),
+                                    materialized.data[i],
+                                    a=_math.sqrt(5),
                                 )
                     setattr(module, name, materialized)
             moe_count += 1
@@ -451,9 +469,7 @@ def maybe_load_and_quantize_moe_qlora(
     shard_cache.clear()
 
     if moe_count > 0:
-        logger.info(
-            f"Loaded and quantized {moe_count} MoE expert modules from bf16 checkpoint"
-        )
+        logger.info(f"Loaded and quantized {moe_count} MoE expert modules from bf16 checkpoint")
     return moe_count
 
 
@@ -498,7 +514,8 @@ def _deregister_qlora_weights_from_fsdp(
             if pg is None:
                 continue
             to_remove = [
-                fp for fp in pg.fsdp_params
+                fp
+                for fp in pg.fsdp_params
                 if hasattr(fp, "_module_info")
                 and fp._module_info.param_name in param_name_set
                 and id(fp._module_info.module) in qlora_modules
@@ -509,7 +526,6 @@ def _deregister_qlora_weights_from_fsdp(
         except Exception:
             pass
     return removed
-
 
 
 def detect_prequantized_nvfp4(weights_path: str) -> bool:
@@ -523,7 +539,9 @@ def detect_prequantized_nvfp4(weights_path: str) -> bool:
     Returns:
         True if the checkpoint is pre-quantized NVFP4.
     """
+
     from xorl.models.checkpoint_handlers.buffers import detect_prequantized_checkpoint
+
     return detect_prequantized_checkpoint(weights_path)
 
 
@@ -539,6 +557,7 @@ def detect_prequantized_block_fp8(weights_path: str) -> bool:
         True if the checkpoint is pre-quantized block FP8.
     """
     from xorl.models.checkpoint_handlers.buffers import detect_prequantized_block_fp8_checkpoint
+
     return detect_prequantized_block_fp8_checkpoint(weights_path)
 
 
@@ -555,10 +574,6 @@ def _broadcast_shard_cache(
     Returns:
         shard_cache: dict mapping shard filename → {tensor_name: tensor (CPU)}
     """
-    import torch.distributed as dist
-    from concurrent.futures import ThreadPoolExecutor
-    from transformers.utils import cached_file
-    import safetensors.torch
 
     rank = dist.get_rank()
     device = torch.device("cuda")
@@ -615,10 +630,7 @@ def _broadcast_shard_cache(
         # Free GPU memory between shards
         torch.cuda.empty_cache()
         if rank == 0:
-            logger.info(
-                f"Broadcast shard {i + 1}/{len(needed_shards)}: {shard_file} "
-                f"({len(shard_dict)} tensors)"
-            )
+            logger.info(f"Broadcast shard {i + 1}/{len(needed_shards)}: {shard_file} ({len(shard_dict)} tensors)")
 
     if executor is not None:
         executor.shutdown(wait=False)
@@ -645,12 +657,10 @@ def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str, load_mode
     Returns:
         Number of modules loaded.
     """
-    import torch.distributed as dist
 
     # Load weight map from index file
     weight_map = None
     try:
-        from transformers.utils import cached_file, SAFE_WEIGHTS_INDEX_NAME
         index_path = cached_file(weights_path, SAFE_WEIGHTS_INDEX_NAME)
         if index_path:
             with open(index_path) as f:
@@ -669,8 +679,7 @@ def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str, load_mode
     # "broadcast" (default): rank 0 reads, broadcasts via NCCL. Best for shared/NFS filesystems.
     # "all_ranks": every rank reads from disk independently. Best for local SSDs.
     use_broadcast = (
-        load_mode == "broadcast"
-        and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+        load_mode == "broadcast" and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
     )
     if use_broadcast:
         needed_shards = sorted(set(weight_map.values()))
@@ -703,7 +712,7 @@ def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str, load_mode
             # Since lora_B=0 → initial delta = A @ 0 = 0 regardless of A,
             # we initialize ALL DTensor params to zeros and let kaiming_uniform
             # only apply to non-DTensor (non-EP) params.
-            from torch.distributed._tensor import DTensor
+
             _rank = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
             for name, param in module.named_parameters():
                 is_meta = param.device.type == "meta"
@@ -721,11 +730,12 @@ def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str, load_mode
                         mesh = param.device_mesh
                         # DTensor: initialize to zeros (preserves Replicate consistency)
                         local_data = torch.zeros(
-                            local_shape, dtype=param.dtype, device="cuda",
+                            local_shape,
+                            dtype=param.dtype,
+                            device="cuda",
                         )
                         materialized = nn.Parameter(
-                            DTensor.from_local(local_data, mesh, placement,
-                                               run_check=False),
+                            DTensor.from_local(local_data, mesh, placement, run_check=False),
                             requires_grad=param.requires_grad,
                         )
                     else:
@@ -736,7 +746,6 @@ def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str, load_mode
                         )
                         parts = name.split("_")
                         if parts[-1] == "A":
-                            import math
                             for i in range(materialized.shape[0]):
                                 nn.init.kaiming_uniform_(materialized.data[i], a=math.sqrt(5))
                     setattr(module, name, materialized)
@@ -750,7 +759,8 @@ def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str, load_mode
         # Deregister packed_weight_f32 from FSDP2 to prevent mixed-precision
         # bf16 cast that corrupts packed uint8 byte patterns.
         removed = _deregister_qlora_weights_from_fsdp(
-            model, param_names=("packed_weight_f32",),
+            model,
+            param_names=("packed_weight_f32",),
         )
         torch.cuda.empty_cache()
         logger.info(
@@ -766,7 +776,7 @@ def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str, load_mode
     _diag_fqn = None
     _diag_mod = None
     for fqn, mod in model.named_modules():
-        if hasattr(mod, '_dequantize_weight') and hasattr(mod, 'weight_block_scales'):
+        if hasattr(mod, "_dequantize_weight") and hasattr(mod, "weight_block_scales"):
             _diag_fqn = fqn
             _diag_mod = mod
             break

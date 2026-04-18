@@ -18,8 +18,8 @@ import torch.distributed as dist
 import zmq
 
 from xorl.server.protocol.orchestrator_runner import (
-    RunnerDispatchCommand,
     RunnerAck,
+    RunnerDispatchCommand,
     RunnerReady,
     RunnerResponse,
     deserialize_message,
@@ -27,6 +27,7 @@ from xorl.server.protocol.orchestrator_runner import (
 )
 from xorl.server.utils.network import get_local_ip, parse_zmq_address, write_address_file
 from xorl.server.utils.zmq_channels import AsyncRouterChannel
+
 
 logger = logging.getLogger(__name__)
 

@@ -20,11 +20,12 @@ from tests.e2e.server_utils import (
     _create_full_weight_client,
     _get_free_port,
     _start_server_or_fail,
-    generate_server_config,
-    generate_random_sft_data,
-    run_sft_steps,
     assert_loss_decreases,
+    generate_random_sft_data,
+    generate_server_config,
+    run_sft_steps,
 )
+
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.slow]
 
@@ -36,7 +37,6 @@ RINGATTN_SIZE = 4
 
 
 class TestPP30BTrainer:
-
     @skip_if_gpu_count_less_than(NUM_GPUS)
     def test_pp2_ep4_cp4_muon_loss_converges(self, tiny_moe_model_dir):
         """Trainer: PP=2 + EP=4 + CP=4 (folded, 8 GPUs) with Muon."""
@@ -68,7 +68,6 @@ class TestPP30BTrainer:
 
 
 class TestPP30BServer:
-
     @skip_if_gpu_count_less_than(NUM_GPUS)
     def test_pp2_ep4_cp4_server_loss_decreases(self, tiny_moe_model_dir_with_weights):
         """Server: PP=2 + EP=4 + CP=4 (folded, 8 GPUs) — loss must be finite and decreasing."""

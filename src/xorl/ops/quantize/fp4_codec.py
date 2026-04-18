@@ -1,4 +1,5 @@
 """Shared FP4 E2M1 encode/decode helpers for MXFP4 and NVFP4 kernels."""
+
 import triton
 import triton.language as tl
 

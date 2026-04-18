@@ -4,9 +4,23 @@ API Request/Response Types for REST API.
 Pydantic type definitions for FastAPI endpoints in the unified API server.
 """
 
-from typing import Any, Callable, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
+
+
+def _map_session_id_to_model_id(data: Any) -> Any:
+    """Accept Tinker's session_id field anywhere xorl expects model_id."""
+    if isinstance(data, dict) and "session_id" in data and "model_id" not in data:
+        data["model_id"] = data["session_id"]
+    return data
+
+
+def _map_model_id_to_session_id(data: Any) -> Any:
+    """Accept xorl's model_id field anywhere the Tinker endpoint expects session_id."""
+    if isinstance(data, dict) and "model_id" in data and "session_id" not in data:
+        data["session_id"] = data["model_id"]
+    return data
 
 
 # ============================================================================
@@ -180,10 +194,17 @@ class ForwardRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     model_id: str = Field(
-        default="default", description="Model identifier (must be created via /api/v1/create_model first)"
+        default="default",
+        description="Model identifier (must be created via /api/v1/create_model or /api/v1/create_session first)",
     )
     seq_id: Optional[int] = Field(default=None, description="Sequence ID for request ordering")
     forward_input: DatumInput = Field(..., description="Forward input data")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_tinker_fields(cls, data):
+        """Map tinker's session_id to model_id."""
+        return _map_session_id_to_model_id(data)
 
 
 class ForwardResponse(BaseModel):
@@ -206,13 +227,20 @@ class ForwardBackwardRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     model_id: str = Field(
-        default="default", description="Model identifier (must be created via /api/v1/create_model first)"
+        default="default",
+        description="Model identifier (must be created via /api/v1/create_model or /api/v1/create_session first)",
     )
     seq_id: Optional[int] = Field(
         default=None,
         description="Sequence ID for request ordering (ensures forward_backward executes before optim_step)",
     )
     forward_backward_input: DatumInput = Field(..., description="Forward-backward input data")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_tinker_fields(cls, data):
+        """Map tinker's session_id to model_id."""
+        return _map_session_id_to_model_id(data)
 
 
 class ForwardBackwardResponse(BaseModel):
@@ -230,7 +258,8 @@ class OptimStepRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     model_id: str = Field(
-        default="default", description="Model identifier (must be created via /api/v1/create_model first)"
+        default="default",
+        description="Model identifier (must be created via /api/v1/create_model or /api/v1/create_session first)",
     )
     seq_id: Optional[int] = Field(
         default=None,
@@ -238,6 +267,12 @@ class OptimStepRequest(BaseModel):
     )
     adam_params: AdamParams = Field(default_factory=AdamParams, description="AdamW optimizer parameters")
     gradient_clip: Optional[float] = Field(default=None, description="Gradient clipping value")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_tinker_fields(cls, data):
+        """Map tinker's session_id to model_id."""
+        return _map_session_id_to_model_id(data)
 
 
 class OptimStepResponse(BaseModel):
@@ -263,12 +298,20 @@ class SaveWeightsRequest(BaseModel):
     Endpoint: POST /api/v1/save_weights
     """
 
+    model_config = ConfigDict(extra="ignore")
+
     model_id: str = Field(default="default", description="Model identifier")
     path: Optional[str] = Field(
         default=None, description="Checkpoint name (e.g., 'checkpoint-001'). Auto-generated if not specified."
     )
     seq_id: Optional[int] = Field(default=None, description="Sequence ID for request ordering")
     # Note: save_optimizer is always True - we always save full state for checkpointing
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_tinker_fields(cls, data):
+        """Map tinker's session_id to model_id."""
+        return _map_session_id_to_model_id(data)
 
 
 class SaveWeightsResponse(BaseModel):
@@ -287,10 +330,18 @@ class LoadWeightsRequest(BaseModel):
     Endpoint: POST /api/v1/load_weights
     """
 
+    model_config = ConfigDict(extra="ignore")
+
     model_id: str = Field(default="default", description="Model identifier")
     path: str = Field(..., description="Xorl URI to load from (e.g., xorl://default/weights/checkpoint-001)")
     optimizer: bool = Field(default=True, description="Whether to load optimizer state")
     seq_id: Optional[int] = Field(default=None, description="Sequence ID for request ordering")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_tinker_fields(cls, data):
+        """Map tinker's session_id to model_id."""
+        return _map_session_id_to_model_id(data)
 
 
 class LoadWeightsResponse(BaseModel):
@@ -335,9 +386,8 @@ class CreateModelRequest(BaseModel):
     @classmethod
     def _map_tinker_fields(cls, data):
         """Map tinker's session_id to model_id if model_id not provided."""
+        data = _map_session_id_to_model_id(data)
         if isinstance(data, dict):
-            if "session_id" in data and "model_id" not in data:
-                data["model_id"] = data["session_id"]
             # Tinker sends lora_config with "rank" key; normalize to also include lora_rank
             lora_cfg = data.get("lora_config")
             if isinstance(lora_cfg, dict) and "rank" in lora_cfg and "lora_rank" not in lora_cfg:
@@ -352,44 +402,104 @@ class CreateModelResponse(BaseModel):
     type: Literal["create_model"] = Field(default="create_model", description="Response type identifier")
 
 
+class CreateSessionRequest(BaseModel):
+    """API request for creating a Tinker-compatible session.
+
+    The request body may be empty. If session_id is omitted, the server generates one.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    session_id: Optional[str] = Field(default=None, description="Optional session identifier to register")
+    base_model: Optional[str] = Field(default=None, description="Optional base model metadata for this session")
+    lora_config: Dict[str, Any] = Field(default_factory=dict, description="Optional LoRA metadata for this session")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_lora_config(cls, data):
+        """Normalize optional LoRA metadata for parity with create_model."""
+        data = _map_model_id_to_session_id(data)
+        if isinstance(data, dict):
+            lora_cfg = data.get("lora_config")
+            if isinstance(lora_cfg, dict) and "rank" in lora_cfg and "lora_rank" not in lora_cfg:
+                lora_cfg["lora_rank"] = lora_cfg["rank"]
+        return data
+
+
+class CreateSessionResponse(BaseModel):
+    """API response for creating a Tinker-compatible session."""
+
+    type: Literal["create_session"] = Field(default="create_session", description="Response type identifier")
+    session_id: str = Field(..., description="Registered session identifier")
+    info_message: Optional[str] = Field(default=None, description="Informational message")
+    warning_message: Optional[str] = Field(default=None, description="Warning message")
+    error_message: Optional[str] = Field(default=None, description="Error message")
+
 
 class UnloadModelRequest(BaseModel):
     """API request for unloading a model (Tinker-compatible)."""
+
+    model_config = ConfigDict(extra="ignore")
+
     model_id: str = Field(..., description="Model identifier to unload")
     type: Literal["unload_model"] = Field(default="unload_model", description="Request type identifier")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_tinker_fields(cls, data):
+        """Map tinker's session_id to model_id."""
+        return _map_session_id_to_model_id(data)
 
 
 class UnloadModelResponse(BaseModel):
     """API response for unloading a model (Tinker-compatible)."""
+
     model_id: str = Field(..., description="Model identifier that was unloaded")
     type: Optional[Literal["unload_model"]] = Field(default=None, description="Response type identifier")
 
 
+class SessionHeartbeatRequest(BaseModel):
+    """API request for session heartbeat / idle timeout refresh."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    session_id: str = Field(..., description="Session identifier to refresh")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_xorl_fields(cls, data):
+        """Accept model_id as an alias for session_id on the heartbeat endpoint."""
+        return _map_model_id_to_session_id(data)
+
+
+class SessionHeartbeatResponse(BaseModel):
+    """API response for session heartbeat."""
+
+    type: Literal["session_heartbeat"] = Field(default="session_heartbeat", description="Response type identifier")
+    session_id: str = Field(..., description="Session identifier that was refreshed")
+
+
 class SessionInfoResponse(BaseModel):
     """API response with session information for monitoring."""
+
     registered_models: List[str] = Field(..., description="List of registered model IDs (all ever registered)")
     active_sessions: int = Field(..., description="Number of active sessions")
     session_activity: Dict[str, float] = Field(
-        default_factory=dict,
-        description="Map of model_id to last activity timestamp"
+        default_factory=dict, description="Map of model_id to last activity timestamp"
     )
     idle_timeout_seconds: float = Field(..., description="Idle session timeout in seconds")
     loaded_sampling_adapters: Dict[str, int] = Field(
-        default_factory=dict,
-        description="Map of model_id to number of loaded sampling adapters"
+        default_factory=dict, description="Map of model_id to number of loaded sampling adapters"
     )
     # Training adapter info (from worker's adapter manager)
     loaded_training_adapters: List[str] = Field(
-        default_factory=list,
-        description="List of training adapters currently loaded in GPU memory"
+        default_factory=list, description="List of training adapters currently loaded in GPU memory"
     )
     max_training_adapters: int = Field(
-        default=0,
-        description="Maximum number of training adapters that can be loaded (LRU eviction threshold)"
+        default=0, description="Maximum number of training adapters that can be loaded (LRU eviction threshold)"
     )
     current_training_adapter: Optional[str] = Field(
-        default=None,
-        description="Currently active training adapter (if any)"
+        default=None, description="Currently active training adapter (if any)"
     )
 
 
@@ -401,16 +511,20 @@ class SessionInfoResponse(BaseModel):
 class SaveAdapterStateRequest(BaseModel):
     """API request for saving adapter state (weights + optimizer)."""
 
+    model_config = ConfigDict(extra="ignore")
+
     model_id: str = Field(..., description="Adapter/session identifier to save")
     path: Optional[str] = Field(
-        default=None,
-        description="Directory to save adapter state to. Auto-generated if not specified."
+        default=None, description="Directory to save adapter state to. Auto-generated if not specified."
     )
-    save_optimizer: bool = Field(
-        default=True,
-        description="Whether to save optimizer state for resuming training"
-    )
+    save_optimizer: bool = Field(default=True, description="Whether to save optimizer state for resuming training")
     seq_id: Optional[int] = Field(default=None, description="Sequence ID for request ordering")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_tinker_fields(cls, data):
+        """Map tinker's session_id to model_id."""
+        return _map_session_id_to_model_id(data)
 
 
 class SaveAdapterStateResponse(BaseModel):
@@ -420,7 +534,6 @@ class SaveAdapterStateResponse(BaseModel):
     path: str = Field(..., description="Directory where adapter state was saved")
     model_id: str = Field(..., description="Model identifier that was saved")
     step: int = Field(..., description="Global step at save time")
-
 
 
 class RegisterWorkersRequest(BaseModel):
@@ -440,17 +553,27 @@ class RegisterWorkersResponse(BaseModel):
 class SaveWeightsForSamplerRequest(BaseModel):
     """API request for saving weights in inference-compatible format."""
 
+    model_config = ConfigDict(extra="ignore")
+
     model_id: str = Field(
-        default="default", description="Model identifier (must be created via /api/v1/create_model first)"
+        default="default",
+        description="Model identifier (must be created via /api/v1/create_model or /api/v1/create_session first)",
     )
     name: str = Field(..., description="Checkpoint name (e.g., 'step-100')")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_tinker_fields(cls, data):
+        """Map tinker's session_id to model_id."""
+        return _map_session_id_to_model_id(data)
 
 
 class SaveWeightsForSamplerResponse(BaseModel):
     """API response for saving weights for sampler."""
 
-    path: str = Field(..., description="Xorl URI for the saved checkpoint (e.g., 'xorl://model-0/sampler_weights/step-100')")
-
+    path: str = Field(
+        ..., description="Xorl URI for the saved checkpoint (e.g., 'xorl://model-0/sampler_weights/step-100')"
+    )
 
 
 # ============================================================================
@@ -461,7 +584,9 @@ class SaveWeightsForSamplerResponse(BaseModel):
 class CheckpointInfo(BaseModel):
     """Information about a single checkpoint."""
 
-    checkpoint_id: str = Field(..., description="The checkpoint ID (e.g., 'weights/model_id/name' or 'sampler_weights/name')")
+    checkpoint_id: str = Field(
+        ..., description="The checkpoint ID (e.g., 'weights/model_id/name' or 'sampler_weights/name')"
+    )
     checkpoint_type: Literal["training", "sampler"] = Field(..., description="The type of checkpoint")
     time: str = Field(..., description="ISO format timestamp when the checkpoint was created")
     path: str = Field(..., description="The xorl:// path to the checkpoint")
@@ -471,7 +596,15 @@ class CheckpointInfo(BaseModel):
 class ListCheckpointsRequest(BaseModel):
     """API request for listing checkpoints."""
 
+    model_config = ConfigDict(extra="ignore")
+
     model_id: str = Field(default="default", description="Model identifier")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_tinker_fields(cls, data):
+        """Map tinker's session_id to model_id."""
+        return _map_session_id_to_model_id(data)
 
 
 class ListCheckpointsResponse(BaseModel):
@@ -491,10 +624,18 @@ class DeleteCheckpointRequest(BaseModel):
     - 'sampler_weights/{name}' for sampler checkpoints (flat, no model_id)
     """
 
+    model_config = ConfigDict(extra="ignore")
+
     model_id: str = Field(default="default", description="Model identifier (used for training checkpoints)")
     checkpoint_id: str = Field(
         ..., description="Checkpoint ID to delete (e.g., 'weights/model_id/ckpt-001' or 'sampler_weights/adapter-001')"
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_tinker_fields(cls, data):
+        """Map tinker's session_id to model_id."""
+        return _map_session_id_to_model_id(data)
 
 
 class DeleteCheckpointResponse(BaseModel):
@@ -518,9 +659,17 @@ class KillSessionRequest(BaseModel):
     start a new one.
     """
 
+    model_config = ConfigDict(extra="ignore")
+
     model_id: str = Field(..., description="Session to kill (must match active session)")
     save_checkpoint: bool = Field(default=True, description="Save checkpoint before killing")
     reset_weights: bool = Field(default=False, description="Reload base model weights after killing session")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_tinker_fields(cls, data):
+        """Map tinker's session_id to model_id."""
+        return _map_session_id_to_model_id(data)
 
 
 class KillSessionResponse(BaseModel):
@@ -528,7 +677,9 @@ class KillSessionResponse(BaseModel):
 
     success: bool = Field(..., description="Whether the session was killed successfully")
     message: str = Field(..., description="Status message")
-    checkpoint_path: Optional[str] = Field(default=None, description="Path to saved checkpoint (if save_checkpoint=True)")
+    checkpoint_path: Optional[str] = Field(
+        default=None, description="Path to saved checkpoint (if save_checkpoint=True)"
+    )
 
 
 # ============================================================================
@@ -563,7 +714,9 @@ class InferenceEndpointServerInfo(BaseModel):
     model_path: Optional[str] = Field(default=None, description="Model path loaded on the server")
     served_model_name: Optional[str] = Field(default=None, description="Served model name")
     tp_size: Optional[int] = Field(default=None, description="Tensor parallelism size")
-    quantization: Optional[str] = Field(default=None, description="Quantization method reported by SGLang (e.g., 'fp8')")
+    quantization: Optional[str] = Field(
+        default=None, description="Quantization method reported by SGLang (e.g., 'fp8')"
+    )
     quantization_config: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Full HF quantization_config dict auto-detected from model's config.json",
@@ -578,29 +731,19 @@ class InferenceEndpoint(BaseModel):
     """Represents a single inference endpoint."""
 
     host: str = Field(..., description="Hostname or IP address of the inference endpoint")
-    port: int = Field(..., description="Port number of the SGLang server")
-    worker_port: int = Field(..., description="Port number of the inference worker (HTTP API wrapper)")
+    port: int = Field(..., description="Port number of the inference endpoint")
     world_size: int = Field(default=1, description="Number of workers at this endpoint")
     healthy: bool = Field(default=True, description="Whether the endpoint is healthy")
     server_info: Optional[InferenceEndpointServerInfo] = Field(
         default=None, description="Server info from the inference endpoint"
     )
 
-    @property
-    def worker_url(self) -> str:
-        """Compute the inference worker URL for /api/update_weights calls."""
-        return f"http://{self.host}:{self.worker_port}"
-
 
 class AddInferenceEndpointRequest(BaseModel):
     """API request for adding an inference endpoint."""
 
     host: str = Field(..., description="Hostname or IP address of the inference endpoint")
-    port: int = Field(..., description="Port number of the SGLang server")
-    worker_port: Optional[int] = Field(
-        default=None,
-        description="Port number of the inference worker (if None, defaults to port - 1 for backwards compatibility)",
-    )
+    port: int = Field(..., description="Port number of the inference endpoint")
     world_size: int = Field(default=1, description="Number of workers at this endpoint")
     # Auto-sync configuration
     sync_weights: bool = Field(
@@ -609,7 +752,7 @@ class AddInferenceEndpointRequest(BaseModel):
     master_address: Optional[str] = Field(
         default=None, description="Master address for NCCL rendezvous (auto-detected if not provided)"
     )
-    master_port: int = Field(default=29600, description="Master port for NCCL rendezvous")
+    master_port: int = Field(default=0, description="Master port for NCCL rendezvous (0 selects an ephemeral port)")
     group_name: str = Field(default="weight_sync_group", description="Name of the NCCL process group")
     buffer_size_mb: int = Field(default=1024, description="Size of each transfer bucket in MB (to avoid OOM)")
 
@@ -656,13 +799,14 @@ class SyncInferenceWeightsRequest(BaseModel):
     master_address: str = Field(
         default="", description="Master address for NCCL rendezvous (training server address). Auto-detected if empty."
     )
-    master_port: int = Field(default=29600, description="Master port for NCCL rendezvous")
+    master_port: int = Field(default=0, description="Master port for NCCL rendezvous (0 selects an ephemeral port)")
     group_name: str = Field(default="weight_sync_group", description="Name of the NCCL process group")
     buffer_size_mb: int = Field(default=1024, description="Size of each transfer bucket in MB (to avoid OOM)")
     flush_cache: bool = Field(
-        default=True,
+        default=False,
         description="Whether to flush inference KV cache after weight sync. "
-        "Set to False to keep cached KV when weights haven't changed significantly.",
+        "Usually not needed: the radix cache is keyed on token sequences, "
+        "so stale KV entries from previous weights are evicted naturally.",
     )
     pause_mode: Literal["retract", "abort", "in_place"] = Field(
         default="retract",

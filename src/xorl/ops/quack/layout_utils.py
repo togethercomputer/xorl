@@ -3,7 +3,6 @@
 
 import cutlass
 import cutlass.cute as cute
-
 from cutlass import Int32, const_expr
 
 
@@ -198,9 +197,7 @@ def convert_layout_acc_frgA(acc_layout: cute.Layout) -> cute.Layout:
     # For Sm90, FP16/BF16, convert acc_layout from ((2, 2, N / 8), MMA_M, MMA_N) to ((2, 2, 2), MMA_M, (N / 16, MMA_N))
     # TODO: Sm90 FP8
     if const_expr(cute.rank(acc_layout.shape[0]) == 3):  # Sm90
-        l = cute.logical_divide(
-            acc_layout, ((None, None, 2), None, None)
-        )  # ((2, 2, (2, N / 16)), MMA_M, MMA_N)
+        l = cute.logical_divide(acc_layout, ((None, None, 2), None, None))  # ((2, 2, (2, N / 16)), MMA_M, MMA_N)
         rA_mma_view = cute.make_layout(
             (
                 (l.shape[0][0], l.shape[0][1], l.shape[0][2][0]),
@@ -235,9 +232,7 @@ def reshape_acc_to_frgA(acc: cute.Tensor) -> cute.Tensor:
     return cute.make_tensor(acc.iterator, convert_layout_acc_frgA(acc.layout))
 
 
-def convert_layout_zero_stride(
-    input: cute.Tensor | cute.Layout, ref_layout: cute.Layout
-) -> cute.Layout:
+def convert_layout_zero_stride(input: cute.Tensor | cute.Layout, ref_layout: cute.Layout) -> cute.Layout:
     layout = input.layout if const_expr(isinstance(input, cute.Tensor)) else input
     # Group the modes with non-zero stride in the ref_layout together,
     # and the modes with zero stride together
@@ -267,11 +262,7 @@ def mma_partition_C_vec(
     assert cute.rank(sVec) == 2
     assert sVec.stride[0] == 1
     stage = sVec.shape[1]
-    shape = (
-        (sVec.shape[0], expand_shape, stage)
-        if const_expr(is_colvec)
-        else (expand_shape, sVec.shape[0], stage)
-    )
+    shape = (sVec.shape[0], expand_shape, stage) if const_expr(is_colvec) else (expand_shape, sVec.shape[0], stage)
     stride = (1, 0, sVec.stride[1]) if const_expr(is_colvec) else (0, 1, sVec.stride[1])
     sVec_mma = cute.make_tensor(sVec.iterator, cute.make_layout(shape, stride=stride))
     tC_sVec = make_acc_tensor_mn_view(thr_mma.partition_C(sVec_mma))
@@ -284,11 +275,7 @@ def mma_partition_A_vec(
     assert cute.rank(sVec) == 2
     assert sVec.stride[0] == 1
     stage = sVec.shape[1]
-    shape = (
-        (sVec.shape[0], expand_shape, stage)
-        if const_expr(is_colvec)
-        else (expand_shape, sVec.shape[0], stage)
-    )
+    shape = (sVec.shape[0], expand_shape, stage) if const_expr(is_colvec) else (expand_shape, sVec.shape[0], stage)
     stride = (1, 0, sVec.stride[1]) if const_expr(is_colvec) else (0, 1, sVec.stride[1])
     sVec_mma = cute.make_tensor(sVec.iterator, cute.make_layout(shape, stride=stride))
     tC_sVec = make_acc_tensor_mn_view(thr_mma.partition_A(sVec_mma))

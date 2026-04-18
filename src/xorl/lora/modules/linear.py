@@ -73,12 +73,8 @@ class LoraLinear(LoraModule, nn.Linear):
         # LoRA weights (trainable, float32 for numerical stability)
         # lora_A: down-projection [r, in_features]
         # lora_B: up-projection [out_features, r]
-        self.lora_A = nn.Parameter(
-            torch.empty(r, in_features, device=device, dtype=torch.float32)
-        )
-        self.lora_B = nn.Parameter(
-            torch.empty(out_features, r, device=device, dtype=torch.float32)
-        )
+        self.lora_A = nn.Parameter(torch.empty(r, in_features, device=device, dtype=torch.float32))
+        self.lora_B = nn.Parameter(torch.empty(out_features, r, device=device, dtype=torch.float32))
 
         # Initialize LoRA parameters
         self.reset_lora_parameters()

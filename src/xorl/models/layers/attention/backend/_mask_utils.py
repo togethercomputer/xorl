@@ -24,9 +24,7 @@ def prepare_4d_causal_attention_mask_with_cache_position(
     else:
         device = cache_position.device
         min_dtype = torch.finfo(dtype).min
-        causal_mask = torch.full(
-            (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device
-        )
+        causal_mask = torch.full((sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device)
         diagonal_attend_mask = torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
 
         if sliding_window is not None:
@@ -46,7 +44,5 @@ def prepare_4d_causal_attention_mask_with_cache_position(
             mask_length = attention_mask.shape[-1]
             padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :].to(device)
             padding_mask = padding_mask == 0
-            causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
-                padding_mask, min_dtype
-            )
+            causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(padding_mask, min_dtype)
     return causal_mask

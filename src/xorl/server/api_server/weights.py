@@ -7,11 +7,10 @@ import os
 import shutil
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import List
 
 from fastapi import HTTPException, status
 
-from xorl.server.api_server.utils import validate_model_id
 from xorl.server.api_server.api_types import (
     CheckpointInfo,
     Cursor,
@@ -28,12 +27,14 @@ from xorl.server.api_server.api_types import (
     TrainingRun,
     TrainingRunsResponse,
 )
+from xorl.server.api_server.utils import validate_model_id
 from xorl.server.protocol.api_orchestrator import OrchestratorRequest
 from xorl.server.protocol.operations import LoadStateData, SaveFullWeightsData, SaveLoraOnlyData, SaveStateData
 from xorl.server.utils.storage import (
     StorageLimitError,
     check_storage_limit,
 )
+
 
 logger = logging.getLogger(__name__)
 
@@ -214,7 +215,10 @@ class WeightsMixin:
             weights_model_dir = os.path.normpath(os.path.abspath(os.path.join(self.output_dir, "weights", model_id)))
             saved_path_normalized = os.path.normpath(os.path.abspath(saved_path))
 
-            if saved_path_normalized.startswith(weights_model_dir + os.sep) or saved_path_normalized == weights_model_dir:
+            if (
+                saved_path_normalized.startswith(weights_model_dir + os.sep)
+                or saved_path_normalized == weights_model_dir
+            ):
                 # Extract just the checkpoint name (relative to model_id directory)
                 checkpoint_name_from_path = os.path.relpath(saved_path_normalized, weights_model_dir)
             else:
@@ -697,7 +701,7 @@ class WeightsMixin:
             # Determine training mode from model config
             model_config = self.model_configs.get(request.model_id, {})
             lora_config = model_config.get("lora_config", {})
-            is_lora = lora_config.get("enable_lora", False)
+            is_lora = lora_config.get("enable_lora", False) or "rank" in lora_config
             merge_lora_interval = lora_config.get("merge_lora_interval", 0)
 
             if is_lora and merge_lora_interval == 0:
@@ -713,8 +717,10 @@ class WeightsMixin:
                 engine_request = OrchestratorRequest(
                     operation="save_full_weights",
                     payload=SaveFullWeightsData(
-                        output_path=save_path, dtype="bfloat16",
-                        base_model_path=base_model_path, model_id=request.model_id,
+                        output_path=save_path,
+                        dtype="bfloat16",
+                        base_model_path=base_model_path,
+                        model_id=request.model_id,
                     ),
                 )
 
@@ -762,5 +768,6 @@ class WeightsMixin:
             raise
         except Exception as e:
             logger.error(f"Save weights for sampler failed: {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Save weights for sampler failed: {e}")
-
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Save weights for sampler failed: {e}"
+            )

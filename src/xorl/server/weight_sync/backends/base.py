@@ -48,6 +48,7 @@ import torch
 @dataclass
 class EndpointConfig:
     """Description of a single inference endpoint."""
+
     host: str
     port: int
     world_size: int = 1  # TP size on the inference side
@@ -60,9 +61,10 @@ class TransportConfig:
     The handler populates this from the ``SyncWeightsData`` payload, and the
     backend reads whichever fields it needs.
     """
+
     endpoints: List[EndpointConfig] = field(default_factory=list)
     master_address: str = "localhost"
-    master_port: int = 29600
+    master_port: int = 0
     group_name: str = "weight_sync_group"
     buffer_size_mb: int = 1024
     device: str = "cuda:0"
@@ -123,6 +125,7 @@ class WeightTransportBackend(ABC):
         *,
         src_rank: int = 0,
         flush_cache: bool = False,
+        weight_version: Optional[str] = None,
     ) -> None:
         """Send a bucket of named tensors to inference.
 
@@ -134,6 +137,9 @@ class WeightTransportBackend(ABC):
             flush_cache: If ``True``, tell the inference endpoint to flush
                 its KV cache after loading this bucket (used for the final
                 bucket of a sync).
+            weight_version: Optional version marker to apply on the inference
+                endpoint after this bucket is loaded. Handlers should only set
+                this on the final bucket of a sync.
         """
 
     # ------------------------------------------------------------------

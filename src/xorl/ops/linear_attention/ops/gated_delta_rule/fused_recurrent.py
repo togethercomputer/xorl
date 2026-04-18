@@ -2,7 +2,6 @@ from __future__ import annotations
 
 # Adapted from flash-linear-attention/fla/ops/gated_delta_rule/fused_recurrent.py.
 # Portions of this file are adapted from flash-linear-attention, Copyright (c) 2023-2025 Songlin Yang, licensed under the MIT License.
-
 import torch
 import triton
 import triton.language as tl
@@ -220,5 +219,31 @@ class FusedRecurrentFunction(torch.autograd.Function):
         )
 
 
-def fused_recurrent_gated_delta_rule(*args, **kwargs):
-    return FusedRecurrentFunction.apply(*args, **kwargs)
+def fused_recurrent_gated_delta_rule(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    gv: torch.Tensor | None = None,
+    beta: torch.Tensor | None = None,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    cu_seqlens: torch.LongTensor | None = None,
+):
+    return FusedRecurrentFunction.apply(
+        q,
+        k,
+        v,
+        g,
+        gk,
+        gv,
+        beta,
+        scale,
+        initial_state,
+        output_final_state,
+        use_qk_l2norm_in_kernel,
+        cu_seqlens,
+    )

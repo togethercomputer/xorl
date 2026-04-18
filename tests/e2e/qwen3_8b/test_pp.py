@@ -32,6 +32,7 @@ from tests.e2e.server_utils import (
     run_sft_steps,
 )
 
+
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.slow]
 
 
@@ -39,8 +40,8 @@ pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.slow]
 # Trainer tests
 # ---------------------------------------------------------------------------
 
-class TestPP2GPU:
 
+class TestPP2GPU:
     @skip_if_gpu_count_less_than(2)
     def test_pp2_loss_converges(self, tiny_dense_model_dir):
         """Trainer: PP=2 on 2 GPUs — loss must be finite and decreasing."""
@@ -62,7 +63,6 @@ class TestPP2GPU:
 
 
 class TestPP8GPU:
-
     @skip_if_gpu_count_less_than(8)
     def test_pp2_fsdp4_loss_converges(self, tiny_dense_model_dir):
         """Trainer: PP=2 + FSDP=4 on 8 GPUs — validates fsdp_size=1 fix."""
@@ -108,8 +108,8 @@ class TestPP8GPU:
 # Server tests
 # ---------------------------------------------------------------------------
 
-class TestPP2GPUServer:
 
+class TestPP2GPUServer:
     @skip_if_gpu_count_less_than(2)
     def test_pp2_server_loss_decreases(self, tiny_dense_model_dir_with_weights):
         """Server: PP=2 on 2 GPUs — validates server PP padding + loss normalization fix."""
@@ -138,7 +138,6 @@ class TestPP2GPUServer:
 
 
 class TestPP8GPUServer:
-
     @skip_if_gpu_count_less_than(8)
     def test_pp2_fsdp4_server_loss_decreases(self, tiny_dense_model_dir_with_weights):
         """Server: PP=2 + FSDP=4 on 8 GPUs — validates reported_loss fix (no /fsdp_size)."""

@@ -6,6 +6,11 @@ from torch import nn
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.distributed.sequence_parallel.strategy import get_cp_strategy
 from xorl.models.base import XorlPreTrainedModel
+from xorl.models.checkpoint_handlers.buffers import (
+    detect_prequantized_block_fp8_checkpoint,
+    detect_prequantized_checkpoint,
+    get_prequantized_exclude_modules,
+)
 from xorl.models.layers import ACT2FN, RMSNorm, RotaryEmbedding
 from xorl.models.layers.attention import (
     AttentionKwargs,
@@ -15,14 +20,9 @@ from xorl.models.layers.attention import (
 )
 from xorl.models.module_utils import GradientCheckpointingLayer
 from xorl.models.outputs import BaseModelOutput, CausalLMOutput
-from xorl.models.checkpoint_handlers.buffers import (
-    detect_prequantized_checkpoint,
-    detect_prequantized_block_fp8_checkpoint,
-    get_prequantized_exclude_modules,
-)
+from xorl.models.transformers.qwen3 import parallelize
 from xorl.models.transformers.qwen3.checkpoint_handler import Qwen3CheckpointHandler
 from xorl.models.transformers.qwen3.configuration_qwen3 import Qwen3Config
-from xorl.models.transformers.qwen3 import parallelize
 from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
 from xorl.utils import logging
 
@@ -38,7 +38,7 @@ class Qwen3MLP(nn.Module):
         self.gate_up_proj = nn.Linear(self.hidden_size, 2 * self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self._use_fused_silu = config.hidden_act == "silu" and not getattr(config, '_activation_native', False)
+        self._use_fused_silu = config.hidden_act == "silu" and not getattr(config, "_activation_native", False)
 
     def unfuse_for_tp(self):
         """Replace fused gate_up_proj with separate gate_proj and up_proj for tensor parallelism."""
@@ -82,8 +82,8 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        if (
-            config.sliding_window and not is_flash_attention(config._attn_implementation)
+        if config.sliding_window and not is_flash_attention(
+            config._attn_implementation
         ):  # diff with Llama is this warning
             logger.warning_once(
                 f"Sliding Window Attention is enabled but not implemented for `{config._attn_implementation}`; "
@@ -110,11 +110,12 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
             position_embeddings=position_embeddings,
             **kwargs,
         )
-        hidden_states = residual + hidden_states
-
         # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states,
+            residual=residual,
+            prenorm=True,
+        )
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -257,7 +258,9 @@ class Qwen3Model(Qwen3PreTrainedModel):
         # SP strategy handles slicing (sync: slice, async: keep full-length)
         ps = get_parallel_state()
         position_embeddings = get_cp_strategy(num_kv_heads=self.config.num_key_value_heads).prepare_position_embeddings(
-            position_embeddings, dim=1, sp_group=ps.sp_group,
+            position_embeddings,
+            dim=1,
+            sp_group=ps.sp_group,
             num_kv_heads=self.config.num_key_value_heads,
         )
 

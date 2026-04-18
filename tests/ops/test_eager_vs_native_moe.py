@@ -9,6 +9,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
 
@@ -17,11 +18,13 @@ DTYPE = torch.bfloat16
 # Helpers (lazy-import to avoid torchvision env crash at module level)
 # ---------------------------------------------------------------------------
 
+
 def _import_moe():
     """Import MoE layers; returns (MoEBlock, MoEExperts) or skips."""
     try:
-        from xorl.models.layers.moe.moe_block import MoEBlock
-        from xorl.models.layers.moe.experts import MoEExperts
+        from xorl.models.layers.moe.experts import MoEExperts  # noqa: PLC0415
+        from xorl.models.layers.moe.moe_block import MoEBlock  # noqa: PLC0415
+
         return MoEBlock, MoEExperts
     except Exception as e:
         pytest.skip(f"Cannot import MoE layers: {e}")
@@ -57,10 +60,10 @@ ALL_CONFIGS = [
     # (num_experts, hidden_dim, intermediate, top_k, batch, seq)
     (4, 64, 128, 2, 2, 8),
     (8, 128, 256, 2, 4, 16),
-    (4, 64, 128, 1, 2, 8),    # top_k=1
-    (8, 128, 256, 4, 2, 16),   # top_k=4
-    (16, 64, 128, 2, 1, 4),   # 16 experts
-    (4, 64, 128, 2, 1, 1),    # minimal seq
+    (4, 64, 128, 1, 2, 8),  # top_k=1
+    (8, 128, 256, 4, 2, 16),  # top_k=4
+    (16, 64, 128, 2, 1, 4),  # 16 experts
+    (4, 64, 128, 2, 1, 1),  # minimal seq
 ]
 
 
@@ -80,7 +83,10 @@ def test_forward_and_backward_agreement(ne, hd, inter, topk, bs, seq):
     torch.testing.assert_close(eager_logits, native_logits, atol=0, rtol=0)
     max_diff = (eager_out - native_out).abs().max().item()
     torch.testing.assert_close(
-        native_out, eager_out, atol=0.05, rtol=0.02,
+        native_out,
+        eager_out,
+        atol=0.05,
+        rtol=0.02,
         msg=f"Forward mismatch: max_diff={max_diff:.6f}",
     )
 
@@ -104,14 +110,18 @@ def test_forward_and_backward_agreement(ne, hd, inter, topk, bs, seq):
             assert native_grad is not None, f"native {name} grad is None"
             torch.testing.assert_close(native_grad, eager_grad, atol=atol, rtol=rtol, msg=f"{name} gradient mismatch")
         torch.testing.assert_close(
-            native_block.gate.weight.grad, eager_block.gate.weight.grad,
-            atol=atol, rtol=rtol, msg="Gate weight gradient mismatch",
+            native_block.gate.weight.grad,
+            eager_block.gate.weight.grad,
+            atol=atol,
+            rtol=rtol,
+            msg="Gate weight gradient mismatch",
         )
 
 
 # ---------------------------------------------------------------------------
 # Test 2: Determinism + edge case (all tokens same expert)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_determinism_and_edge_cases():
@@ -136,7 +146,7 @@ def test_determinism_and_edge_cases():
         assert torch.equal(out1, out2), f"{backend} is not deterministic"
 
     # --- All tokens to same expert ---
-    from xorl.models.layers.moe.backend.native import native_expert_forward
+    from xorl.models.layers.moe.backend.native import native_expert_forward  # noqa: PLC0415
 
     ne, hd, inter = 4, 64, 128
     torch.manual_seed(42)
@@ -152,13 +162,21 @@ def test_determinism_and_edge_cases():
 
     with torch.no_grad():
         native_out = native_expert_forward(
-            x_edge, routing_weights, selected_experts,
-            experts.gate_proj, experts.up_proj, experts.down_proj, num_experts=ne,
+            x_edge,
+            routing_weights,
+            selected_experts,
+            experts.gate_proj,
+            experts.up_proj,
+            experts.down_proj,
+            num_experts=ne,
         )
         eager_out = experts(x_edge, expert_idx=0)
 
     torch.testing.assert_close(
-        native_out, eager_out, atol=0.01, rtol=0.01,
+        native_out,
+        eager_out,
+        atol=0.01,
+        rtol=0.01,
         msg="Same-expert output mismatch",
     )
 
@@ -166,6 +184,7 @@ def test_determinism_and_edge_cases():
 # ---------------------------------------------------------------------------
 # Test 3: Large scale forward + backward
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_large_scale():
@@ -180,7 +199,10 @@ def test_large_scale():
         eager_out, _ = eager_block(x)
         native_out, _ = native_block(x)
     torch.testing.assert_close(
-        native_out, eager_out, atol=0.1, rtol=0.05,
+        native_out,
+        eager_out,
+        atol=0.1,
+        rtol=0.05,
         msg="Large scale forward mismatch",
     )
 

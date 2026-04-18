@@ -32,6 +32,25 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+from torch.distributed._tensor import DTensor
+from torch.distributed.fsdp._fully_shard import FSDPModule
+
+from xorl.distributed.parallel_state import get_parallel_state
+from xorl.lora.modules.base import LoraModule
+from xorl.lora.modules.linear import LoraLinear
+from xorl.models.layers.moe.experts import MoEExperts
+from xorl.models.layers.moe.lora import MoEExpertsLoRA
+from xorl.models.transformers.qwen3_5_shared import (
+    has_linear_attention_layers,
+    remap_linear_attention_params_for_inference,
+)
+from xorl.qlora.modules.linear import QLoRALinear
+from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
+from xorl.server.protocol.operations import SyncWeightsData
+from xorl.server.weight_sync.backends import TransportConfig, create_backend
+from xorl.server.weight_sync.backends.base import EndpointConfig
+from xorl.server.weight_sync.endpoint_manager import EndpointManager
+
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +89,6 @@ class WeightSyncHandler:
         """
         logger.info(f"Rank {self.rank}: [WeightSync] Starting sync_inference_weights")
 
-        from xorl.server.protocol.operations import SyncWeightsData
         p: SyncWeightsData = command_dict.get("payload", SyncWeightsData())
 
         endpoints = p.endpoints
@@ -81,12 +99,13 @@ class WeightSyncHandler:
         sync_method = p.sync_method
         flush_cache = p.flush_cache
         pause_mode = p.pause_mode
+        weight_version = p.weight_version
         quantization = p.quantization
 
         logger.info(
             f"Rank {self.rank}: [WeightSync] sync_method={sync_method}, "
             f"endpoints={len(endpoints)}, flush_cache={flush_cache}, "
-            f"quantization={quantization}"
+            f"weight_version={weight_version}, quantization={quantization}"
         )
 
         try:
@@ -99,6 +118,7 @@ class WeightSyncHandler:
                 sync_method=sync_method,
                 flush_cache=flush_cache,
                 pause_mode=pause_mode,
+                weight_version=weight_version,
                 quantization=quantization,
             )
 
@@ -122,6 +142,7 @@ class WeightSyncHandler:
         sync_method: str,
         flush_cache: bool,
         pause_mode: str,
+        weight_version: Optional[str],
         quantization: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
@@ -134,7 +155,6 @@ class WeightSyncHandler:
         4. Sends the buffer via the transport backend
         5. Pipelines: unshard(N+1) overlaps with transfer(N)
         """
-        from torch.distributed.fsdp._fully_shard import FSDPModule
 
         model = self.trainer.model
         device = f"cuda:{self.trainer.local_rank}"
@@ -167,14 +187,12 @@ class WeightSyncHandler:
         # ------------------------------------------------------------------
         # Step 3: Create backend + endpoint manager, initialize on sender ranks
         # ------------------------------------------------------------------
-        from xorl.server.weight_sync.backends import create_backend, TransportConfig
-        from xorl.server.weight_sync.backends.base import EndpointConfig
-        from xorl.server.weight_sync.endpoint_manager import EndpointManager
 
         transport_cfg = TransportConfig(
             endpoints=[
                 EndpointConfig(
-                    host=ep["host"], port=ep["port"],
+                    host=ep["host"],
+                    port=ep["port"],
                     world_size=ep.get("world_size", 1),
                 )
                 for ep in endpoints
@@ -238,7 +256,6 @@ class WeightSyncHandler:
         modules_to_sync.extend(layer_modules)
 
         # Detect EP mode
-        from xorl.distributed.parallel_state import get_parallel_state
         _ps = get_parallel_state()
         _ep_enabled = _ps.ep_enabled and _ps.ep_size > 1
 
@@ -254,7 +271,7 @@ class WeightSyncHandler:
 
         try:
             for pp_stage in range(_pp_size):
-                _is_my_stage = (_pp_rank == pp_stage)
+                _is_my_stage = _pp_rank == pp_stage
                 _is_remote = _pp_enabled and pp_stage > 0
                 # Stage leader: the dp_shard_rank==0 rank within this stage
                 _stage_leader = _ps.dp_shard_rank == 0 if _pp_enabled else (self.rank == 0)
@@ -279,10 +296,7 @@ class WeightSyncHandler:
                     )
 
                 for mod_idx in range(num_stage_modules):
-                    is_last_overall = (
-                        mod_idx == num_stage_modules - 1
-                        and pp_stage == _pp_size - 1
-                    )
+                    is_last_overall = mod_idx == num_stage_modules - 1 and pp_stage == _pp_size - 1
 
                     # ── FSDP ops (only ranks owning this stage) ──────────
                     current_buffer = None
@@ -295,12 +309,16 @@ class WeightSyncHandler:
                         fsdp_mod.unshard()
 
                         qlora_linear_buffer, moe_contexts = self._qlora_collective_ops(
-                            fsdp_mod, mod_name, collect_results=_stage_leader,
+                            fsdp_mod,
+                            mod_name,
+                            collect_results=_stage_leader,
                         )
 
                         if _ep_enabled:
                             ep_moe_contexts = self._collect_ep_moe_data(
-                                fsdp_mod, mod_name, _ps,
+                                fsdp_mod,
+                                mod_name,
+                                _ps,
                             )
 
                         # EP MoE prefixes to skip in extraction
@@ -311,19 +329,19 @@ class WeightSyncHandler:
                                 if p == mod_name:
                                     ep_moe_prefixes.add("")
                                 elif p.startswith(mod_name + "."):
-                                    ep_moe_prefixes.add(p[len(mod_name) + 1:])
+                                    ep_moe_prefixes.add(p[len(mod_name) + 1 :])
                             else:
                                 ep_moe_prefixes.add(p)
 
                         if _stage_leader:
                             if ep_moe_prefixes:
                                 logger.info(
-                                    f"Rank {self.rank}: [WeightSync] ep_moe_prefixes="
-                                    f"{ep_moe_prefixes} for {mod_name}"
+                                    f"Rank {self.rank}: [WeightSync] ep_moe_prefixes={ep_moe_prefixes} for {mod_name}"
                                 )
-                            from torch.distributed._tensor import DTensor
                             current_buffer = self._extract_params_for_sync(
-                                fsdp_mod, mod_name, DTensor,
+                                fsdp_mod,
+                                mod_name,
+                                DTensor,
                                 skip_moe_prefixes=ep_moe_prefixes,
                             )
                             current_buffer.extend(qlora_linear_buffer)
@@ -336,23 +354,20 @@ class WeightSyncHandler:
                         # Stage 0: sender rank(s) broadcast directly to SGLang
                         if _is_sender and current_buffer:
                             current_buffer = self._unfuse_for_inference(
-                                current_buffer, model,
+                                current_buffer,
+                                model,
                             )
                             if quantization and quantization.get("quant_method") == "fp8":
                                 current_buffer = self._quantize_buffer_for_fp8(
                                     current_buffer,
                                     quantization_config=quantization,
                                 )
-                            logger.info(
-                                f"Rank 0: [WeightSync] Module {mod_name}: "
-                                f"{len(current_buffer)} params"
-                            )
+                            logger.info(f"Rank 0: [WeightSync] Module {mod_name}: {len(current_buffer)} params")
                             b, p = self._broadcast_buffer(
-                                backend, current_buffer,
-                                flush_cache=(
-                                    flush_cache and is_last_overall
-                                    and not moe_contexts
-                                ),
+                                backend,
+                                current_buffer,
+                                flush_cache=(flush_cache and is_last_overall and not moe_contexts),
+                                weight_version=weight_version if is_last_overall and not moe_contexts else None,
                             )
                             total_bytes += b
                             total_params += p
@@ -362,10 +377,12 @@ class WeightSyncHandler:
                         # Stage 0 MoE handling (unchanged)
                         if moe_contexts or ep_moe_contexts:
                             if _ep_enabled:
-                                for ctx in (moe_contexts + ep_moe_contexts):
+                                for ctx in moe_contexts + ep_moe_contexts:
                                     b, p, n = self._gather_and_broadcast_ep_moe_experts(
-                                        backend, ctx,
+                                        backend,
+                                        ctx,
                                         flush_cache=(flush_cache and is_last_overall),
+                                        weight_version=weight_version if is_last_overall else None,
                                         quantization=quantization,
                                         ps=_ps,
                                     )
@@ -375,8 +392,10 @@ class WeightSyncHandler:
                             elif _is_sender:
                                 for ctx in moe_contexts:
                                     b, p, n = self._broadcast_moe_experts_bucketed(
-                                        backend, ctx,
+                                        backend,
+                                        ctx,
                                         flush_cache=(flush_cache and is_last_overall),
+                                        weight_version=weight_version if is_last_overall else None,
                                         quantization=quantization,
                                     )
                                     total_bytes += b
@@ -398,7 +417,9 @@ class WeightSyncHandler:
                             # NCCL transfer: metadata + flat bf16 tensor
                             received = self._pp_nccl_transfer_buffer(
                                 send_buf if (_is_my_stage and _stage_leader) else None,
-                                pp_grp, stage_src, device,
+                                pp_grp,
+                                stage_src,
+                                device,
                             )
 
                             # Rank 0: quantize + broadcast to SGLang
@@ -413,8 +434,10 @@ class WeightSyncHandler:
                                     f"{mod_idx}: {len(received)} params via NCCL"
                                 )
                                 b, p = self._broadcast_buffer(
-                                    backend, received,
+                                    backend,
+                                    received,
                                     flush_cache=(flush_cache and is_last_overall),
+                                    weight_version=weight_version if is_last_overall else None,
                                 )
                                 total_bytes += b
                                 total_params += p
@@ -449,13 +472,10 @@ class WeightSyncHandler:
                 "total_bytes": total_bytes,
                 "num_parameters": total_params,
                 "num_buckets": num_buckets,
-                "endpoint_results": [
-                    {"host": ep["host"], "port": ep["port"], "success": True}
-                    for ep in endpoints
-                ],
+                "endpoint_results": [{"host": ep["host"], "port": ep["port"], "success": True} for ep in endpoints],
             }
 
-        except Exception as e:
+        except Exception:
             if endpoint_mgr is not None:
                 try:
                     endpoint_mgr.resume()
@@ -465,7 +485,9 @@ class WeightSyncHandler:
                 try:
                     backend.destroy()
                 except Exception as destroy_err:
-                    logger.warning(f"Rank {self.rank}: [WeightSync] Failed to destroy backend during cleanup: {destroy_err}")
+                    logger.warning(
+                        f"Rank {self.rank}: [WeightSync] Failed to destroy backend during cleanup: {destroy_err}"
+                    )
             raise
 
     # ========================================================================
@@ -504,13 +526,10 @@ class WeightSyncHandler:
               moe_contexts: list of dicts with info for per-expert processing
         """
         if collect_results is None:
-            collect_results = (self.rank == 0)
-        from xorl.qlora.modules.linear import QLoRALinear
-        from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
-
+            collect_results = self.rank == 0
         # Discover QLoRA modules (only those directly owned by this FSDP module,
         # not by child FSDP modules — child modules will be processed separately)
-        from torch.distributed.fsdp._fully_shard import FSDPModule
+
         child_fsdp_prefixes = set()
         for mname, mod in fsdp_mod.named_modules():
             if isinstance(mod, FSDPModule) and mname != "":
@@ -549,7 +568,6 @@ class WeightSyncHandler:
             del base_w, delta
 
         # --- Phase 2: QLoRAMoeExperts (gather lora params, defer heavy work) ---
-        from xorl.distributed.parallel_state import get_parallel_state
         ps = get_parallel_state()
         ep_enabled = ps.ep_enabled and ps.ep_size > 1
 
@@ -567,13 +585,13 @@ class WeightSyncHandler:
                     param = getattr(mod, key)
                     if ep_enabled:
                         # EP: use local shard directly (no collective needed)
-                        if hasattr(param, 'to_local'):
+                        if hasattr(param, "to_local"):
                             lora_params[key] = param.to_local().clone()
                         else:
                             lora_params[key] = param.data.clone()
                     else:
                         # Non-EP: collective full_tensor to get global params on stage leader
-                        if hasattr(param, 'full_tensor'):
+                        if hasattr(param, "full_tensor"):
                             full = param.full_tensor()  # collective: all ranks
                         else:
                             full = param.data
@@ -598,7 +616,10 @@ class WeightSyncHandler:
     # ========================================================================
 
     def _collect_ep_moe_data(
-        self, fsdp_mod, mod_name: str, ps,
+        self,
+        fsdp_mod,
+        mod_name: str,
+        ps,
     ) -> List[Dict[str, Any]]:
         """Collect local EP-sharded MoE expert data during unshard phase.
 
@@ -611,13 +632,9 @@ class WeightSyncHandler:
         Must be called between unshard() and reshard().
         Returns list of context dicts for _gather_and_broadcast_ep_moe_experts.
         """
-        from xorl.models.layers.moe.experts import MoEExperts
-        from xorl.models.layers.moe.lora import MoEExpertsLoRA
-        from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
-        from torch.distributed._tensor import DTensor
 
         # Skip modules owned by child FSDP modules (processed separately)
-        from torch.distributed.fsdp._fully_shard import FSDPModule
+
         child_fsdp_prefixes = set()
         for mname, mod in fsdp_mod.named_modules():
             if isinstance(mod, FSDPModule) and mname != "":
@@ -634,16 +651,19 @@ class WeightSyncHandler:
                 continue
 
             # Get expert params — after unshard they may be plain tensors or DTensors
-            gate = getattr(mod, 'gate_proj', None)
-            if gate is None or not isinstance(gate, torch.nn.Parameter):
-                continue
+            gate_up = getattr(mod, "gate_up_proj", None)
+            if isinstance(gate_up, torch.nn.Parameter):
+                E_local = gate_up.shape[0]
+            else:
+                gate = getattr(mod, "gate_proj", None)
+                if gate is None or not isinstance(gate, torch.nn.Parameter):
+                    continue
+                E_local = gate.shape[0]
 
             if mname:
                 full_prefix = f"{mod_name}.{mname}" if mod_name != "(root)" else mname
             else:
                 full_prefix = mod_name
-            # gate_proj has shape [num_local_experts, K, N] — already local
-            E_local = gate.shape[0]
 
             # Clone local expert data for each projection.
             # With EP, each rank's module already holds only local experts [E_local, K, N].
@@ -661,8 +681,6 @@ class WeightSyncHandler:
                         delta = mod._compute_proj_delta(proj_name)
                         if isinstance(delta, DTensor):
                             delta = delta.to_local()
-                        elif delta.shape[0] > E_local:
-                            delta = delta[start:start + E_local]
                         local = local.to(torch.bfloat16) + delta.to(torch.bfloat16)
                     else:
                         local = local.to(torch.bfloat16)
@@ -671,12 +689,14 @@ class WeightSyncHandler:
 
                 local_experts[proj_name] = local.clone()
 
-            contexts.append({
-                "type": "full_weight",
-                "prefix": full_prefix,
-                "local_experts": local_experts,  # {proj: [E_local, K, N]}
-                "num_local_experts": E_local,
-            })
+            contexts.append(
+                {
+                    "type": "full_weight",
+                    "prefix": full_prefix,
+                    "local_experts": local_experts,  # {proj: [E_local, K, N]}
+                    "num_local_experts": E_local,
+                }
+            )
 
         return contexts
 
@@ -689,6 +709,7 @@ class WeightSyncHandler:
         backend,
         ctx: Dict[str, Any],
         flush_cache: bool = False,
+        weight_version: Optional[str] = None,
         bucket_size_bytes: int = _DEFAULT_MOE_BUCKET_BYTES,
         quantization: Optional[Dict[str, Any]] = None,
         ps=None,
@@ -715,6 +736,20 @@ class WeightSyncHandler:
         device = f"cuda:{self.rank % torch.cuda.device_count()}"
 
         is_qlora = ctx.get("type") != "full_weight"
+        ep_fsdp_rank = 0
+        if ps.ep_fsdp_device_mesh is not None:
+            ep_fsdp_rank = ps.ep_fsdp_device_mesh.get_local_rank("ep_fsdp")
+
+        # EP-FSDP replicas hold identical local expert shards after unshard().
+        # Only one replica column needs to gather and forward those experts to
+        # rank 0; the others would just duplicate the same weights.
+        if ep_fsdp_rank != 0:
+            if is_qlora:
+                ctx["lora_params"] = None
+            else:
+                ctx["local_experts"] = None
+            return 0, 0, 0
+
         if self.rank == 0:
             logger.info(
                 f"Rank 0: [EP-Gather] prefix={full_prefix}, type={'qlora' if is_qlora else 'full_weight'}, "
@@ -798,10 +833,13 @@ class WeightSyncHandler:
                     if bucket_bytes >= bucket_size_bytes:
                         if quantization and quantization.get("quant_method") == "fp8":
                             bucket = self._quantize_buffer_for_fp8(
-                                bucket, quantization_config=quantization,
+                                bucket,
+                                quantization_config=quantization,
                             )
                         b, p = self._broadcast_buffer(
-                            backend, bucket, flush_cache=False,
+                            backend,
+                            bucket,
+                            flush_cache=False,
                         )
                         total_bytes += b
                         total_params += p
@@ -815,10 +853,14 @@ class WeightSyncHandler:
         if self.rank == 0 and bucket:
             if quantization and quantization.get("quant_method") == "fp8":
                 bucket = self._quantize_buffer_for_fp8(
-                    bucket, quantization_config=quantization,
+                    bucket,
+                    quantization_config=quantization,
                 )
             b, p = self._broadcast_buffer(
-                backend, bucket, flush_cache=flush_cache,
+                backend,
+                bucket,
+                flush_cache=flush_cache,
+                weight_version=weight_version,
             )
             total_bytes += b
             total_params += p
@@ -841,6 +883,7 @@ class WeightSyncHandler:
         backend,
         ctx: Dict[str, Any],
         flush_cache: bool = False,
+        weight_version: Optional[str] = None,
         bucket_size_bytes: int = _DEFAULT_MOE_BUCKET_BYTES,
         quantization: Optional[Dict[str, Any]] = None,
     ) -> Tuple[int, int, int]:
@@ -910,10 +953,13 @@ class WeightSyncHandler:
                 if bucket_bytes >= bucket_size_bytes:
                     if quantization and quantization.get("quant_method") == "fp8":
                         bucket = self._quantize_buffer_for_fp8(
-                            bucket, quantization_config=quantization,
+                            bucket,
+                            quantization_config=quantization,
                         )
                     b, p = self._broadcast_buffer(
-                        backend, bucket, flush_cache=False,
+                        backend,
+                        bucket,
+                        flush_cache=False,
                     )
                     total_bytes += b
                     total_params += p
@@ -925,10 +971,14 @@ class WeightSyncHandler:
         if bucket:
             if quantization and quantization.get("quant_method") == "fp8":
                 bucket = self._quantize_buffer_for_fp8(
-                    bucket, quantization_config=quantization,
+                    bucket,
+                    quantization_config=quantization,
                 )
             b, p = self._broadcast_buffer(
-                backend, bucket, flush_cache=flush_cache,
+                backend,
+                bucket,
+                flush_cache=flush_cache,
+                weight_version=weight_version,
             )
             total_bytes += b
             total_params += p
@@ -966,7 +1016,7 @@ class WeightSyncHandler:
             For non-source ranks: list of (name, tensor) on device
             For source rank: None
         """
-        is_src = (self.rank == src_global)
+        is_src = self.rank == src_global
 
         # Step 1: broadcast metadata (names + shapes)
         if is_src:
@@ -997,7 +1047,7 @@ class WeightSyncHandler:
         offset = 0
         for name, shape in meta:
             numel = _prod(shape)
-            result.append((name, flat[offset:offset + numel].view(shape)))
+            result.append((name, flat[offset : offset + numel].view(shape)))
             offset += numel
         return result
 
@@ -1042,9 +1092,7 @@ class WeightSyncHandler:
                 hf_name = f"{full_prefix}.{expert_idx}.{hf_proj}.weight"
                 items.append((hf_name, merged))
 
-        logger.info(
-            f"Rank {self.rank}: [WeightSync] MoE {full_prefix}: {len(items)} experts"
-        )
+        logger.info(f"Rank {self.rank}: [WeightSync] MoE {full_prefix}: {len(items)} experts")
 
         # Free cloned lora params
         del lora_params
@@ -1102,8 +1150,7 @@ class WeightSyncHandler:
             # "model.layers.0.mlp.gate" matches "model.layers.0.mlp.gate.weight"
             if modules_to_not_convert:
                 skip = any(
-                    name == prefix + ".weight" or name.startswith(prefix + ".")
-                    for prefix in modules_to_not_convert
+                    name == prefix + ".weight" or name.startswith(prefix + ".") for prefix in modules_to_not_convert
                 )
                 if skip:
                     result.append((name, tensor))
@@ -1121,8 +1168,10 @@ class WeightSyncHandler:
 
             if pad_rows > 0 or pad_cols > 0:
                 padded = torch.zeros(
-                    rows + pad_rows, cols + pad_cols,
-                    dtype=tensor.dtype, device=tensor.device,
+                    rows + pad_rows,
+                    cols + pad_cols,
+                    dtype=tensor.dtype,
+                    device=tensor.device,
                 )
                 padded[:rows, :cols] = tensor
             else:
@@ -1146,9 +1195,7 @@ class WeightSyncHandler:
             quantized_blocks = quantized_blocks.to(fp8_dtype)
 
             # Reshape back: [nr, nc, block_size, block_size] → [padded_rows, padded_cols]
-            quantized = quantized_blocks.permute(0, 2, 1, 3).reshape(
-                padded.shape[0], padded.shape[1]
-            )
+            quantized = quantized_blocks.permute(0, 2, 1, 3).reshape(padded.shape[0], padded.shape[1])
 
             # Remove padding
             if pad_rows > 0 or pad_cols > 0:
@@ -1183,19 +1230,12 @@ class WeightSyncHandler:
 
         Supports both LoraLinear (dense LoRA) and MoEExpertsLoRA (MoE LoRA).
         """
-        from xorl.lora.modules.base import LoraModule
-        from xorl.lora.modules.linear import LoraLinear
-        from xorl.models.layers.moe.lora import MoEExpertsLoRA
-        from xorl.models.layers.moe.experts import MoEExperts
-        from xorl.qlora.modules.linear import QLoRALinear
-        from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
-
         buffer = []
 
         # Identify child FSDP module prefixes — their params will be processed
         # when that child module is unsharded separately. Parent unshard may
         # expose child params as plain tensors, so we can't rely on DTensor check.
-        from torch.distributed.fsdp._fully_shard import FSDPModule
+
         child_fsdp_prefixes = set()
         for mname, mod in fsdp_mod.named_modules():
             if isinstance(mod, FSDPModule) and mname != "":
@@ -1260,25 +1300,25 @@ class WeightSyncHandler:
                     buffer.append((full_name, cloned))
                     continue
                 elif isinstance(lora_mod, MoEExpertsLoRA):
-                    # MoE experts: fused [E, K, N] → per-expert HF format
-                    # param_leaf is "gate_proj", "up_proj", or "down_proj"
-                    if param_leaf in lora_mod.lora_config.target_modules:
-                        delta = lora_mod._compute_proj_delta(param_leaf)
-                        merged = param.data.to(dtype=torch.bfloat16) + delta.to(dtype=torch.bfloat16)
-                    else:
-                        merged = param.data.to(dtype=torch.bfloat16)
-                    # Split fused [E, K, N] into per-expert [N, K] (HF format)
-                    # full_name is like "model.layers.0.mlp.experts.gate_proj"
-                    # HF expects "model.layers.0.mlp.experts.{i}.gate_proj.weight"
-                    base = full_name  # e.g. "model.layers.0.mlp.experts.gate_proj"
-                    # Split "experts.gate_proj" → "experts.{i}.gate_proj.weight"
-                    parts = base.rsplit(".", 1)  # ["model.layers.0.mlp.experts", "gate_proj"]
-                    for expert_idx in range(merged.shape[0]):
-                        hf_name = f"{parts[0]}.{expert_idx}.{parts[1]}.weight"
-                        # GKN [K, N] → HF [N, K] (transpose)
-                        expert_weight = merged[expert_idx].t().contiguous()
-                        buffer.append((hf_name, expert_weight))
-                    continue
+                    if param_leaf == "gate_up_proj":
+                        merged = param.data.to(dtype=torch.bfloat16).clone()
+                        half = merged.shape[2] // 2
+                        if "gate_proj" in lora_mod.lora_config.target_modules:
+                            gate_delta = lora_mod._compute_proj_delta("gate_proj")
+                            merged[:, :, :half].add_(gate_delta.to(dtype=torch.bfloat16))
+                        if "up_proj" in lora_mod.lora_config.target_modules:
+                            up_delta = lora_mod._compute_proj_delta("up_proj")
+                            merged[:, :, half:].add_(up_delta.to(dtype=torch.bfloat16))
+                        buffer.append((full_name, merged))
+                        continue
+                    if param_leaf == "down_proj":
+                        if "down_proj" in lora_mod.lora_config.target_modules:
+                            delta = lora_mod._compute_proj_delta("down_proj")
+                            merged = param.data.to(dtype=torch.bfloat16) + delta.to(dtype=torch.bfloat16)
+                        else:
+                            merged = param.data.to(dtype=torch.bfloat16)
+                        buffer.append((full_name, merged.clone()))
+                        continue
             # Check if this is a non-LoRA MoEExperts fused tensor
             _is_moe_experts = False
             if parent_name:
@@ -1289,19 +1329,13 @@ class WeightSyncHandler:
                     for p in parts_list:
                         parent_mod = getattr(parent_mod, p)
                     if isinstance(parent_mod, (MoEExperts, MoEExpertsLoRA)):
-                        if param_leaf in ("gate_proj", "up_proj", "down_proj"):
+                        if param_leaf in ("gate_up_proj", "down_proj"):
                             _is_moe_experts = True
                 except (AttributeError, TypeError):
                     pass
 
             if _is_moe_experts:
-                # Split fused [E, K, N] into per-expert HF [N, K]
-                data = param.data.to(dtype=torch.bfloat16)
-                parts = full_name.rsplit(".", 1)
-                for expert_idx in range(data.shape[0]):
-                    hf_name = f"{parts[0]}.{expert_idx}.{parts[1]}.weight"
-                    expert_weight = data[expert_idx].t().contiguous()
-                    buffer.append((hf_name, expert_weight))
+                buffer.append((full_name, param.data.to(dtype=torch.bfloat16).clone()))
             else:
                 cloned = param.data.to(dtype=torch.bfloat16).clone()
                 buffer.append((full_name, cloned))
@@ -1319,8 +1353,7 @@ class WeightSyncHandler:
                     for buf_name, buf_tensor in buffer:
                         if buf_name == full_source:
                             logger.info(
-                                f"Rank 0: [WeightSync] Tied weight: emitting "
-                                f"{full_tied} (clone of {full_source})"
+                                f"Rank 0: [WeightSync] Tied weight: emitting {full_tied} (clone of {full_source})"
                             )
                             buffer.append((full_tied, buf_tensor.clone()))
                             break
@@ -1332,15 +1365,16 @@ class WeightSyncHandler:
         buffer: List[Tuple[str, torch.Tensor]],
         model,
     ) -> List[Tuple[str, torch.Tensor]]:
-        """Split fused projections (qkv_proj, gate_up_proj) into HF-format names.
+        """Convert training parameter names to HF/SGLang inference names.
 
-        SGLang's load_weights expects HF names (q_proj, k_proj, v_proj, gate_proj,
-        up_proj) and has stacked_params_mapping that does string replacement.
-        If we send fused names like 'qkv_proj', the replacement mangles them
-        (e.g. 'v_proj' is a substring of 'qkv_proj' → 'qkqkv_proj').
-
-        This splits fused weights back to individual projections before sending.
+        Handles:
+        - qkv_proj → q_proj + k_proj + v_proj (split fused attention)
+        - gate_up_proj → gate_proj + up_proj (split fused dense/shared MLP)
+        - MoE experts: gate_up_proj/down_proj → per-expert HF gate/up/down weights
+        - Qwen3.5 linear attention: remap split GatedDeltaNet params back to
+          HF fused names (q_proj/k_proj/v_proj → in_proj_qkv, etc.)
         """
+
         config = model.config
         num_heads = config.num_attention_heads
         num_kv_heads = getattr(config, "num_key_value_heads", num_heads)
@@ -1351,16 +1385,27 @@ class WeightSyncHandler:
         result = []
         for name, tensor in buffer:
             if ".qkv_proj." in name:
-                # Split [q_size + 2*kv_size, hidden] → q, k, v
                 prefix, suffix = name.rsplit(".qkv_proj.", 1)
                 q = tensor[:q_size].clone()
-                k = tensor[q_size:q_size + kv_size].clone()
-                v = tensor[q_size + kv_size:].clone()
+                k = tensor[q_size : q_size + kv_size].clone()
+                v = tensor[q_size + kv_size :].clone()
                 result.append((f"{prefix}.q_proj.{suffix}", q))
                 result.append((f"{prefix}.k_proj.{suffix}", k))
                 result.append((f"{prefix}.v_proj.{suffix}", v))
+            elif name.endswith(".mlp.experts.gate_up_proj"):
+                prefix = name.rsplit(".gate_up_proj", 1)[0]
+                half = tensor.shape[2] // 2
+                gate = tensor[:, :, :half].transpose(1, 2).contiguous()
+                up = tensor[:, :, half:].transpose(1, 2).contiguous()
+                for expert_idx in range(tensor.shape[0]):
+                    result.append((f"{prefix}.{expert_idx}.gate_proj.weight", gate[expert_idx]))
+                    result.append((f"{prefix}.{expert_idx}.up_proj.weight", up[expert_idx]))
+            elif name.endswith(".mlp.experts.down_proj"):
+                prefix = name.rsplit(".down_proj", 1)[0]
+                down = tensor.transpose(1, 2).contiguous()
+                for expert_idx in range(tensor.shape[0]):
+                    result.append((f"{prefix}.{expert_idx}.down_proj.weight", down[expert_idx]))
             elif ".gate_up_proj." in name:
-                # Split [2*intermediate, hidden] → gate, up
                 prefix, suffix = name.rsplit(".gate_up_proj.", 1)
                 half = tensor.shape[0] // 2
                 gate = tensor[:half].clone()
@@ -1369,6 +1414,10 @@ class WeightSyncHandler:
                 result.append((f"{prefix}.up_proj.{suffix}", up))
             else:
                 result.append((name, tensor))
+
+        if has_linear_attention_layers(config):
+            result = remap_linear_attention_params_for_inference(result)
+
         return result
 
     def _broadcast_buffer(
@@ -1376,6 +1425,7 @@ class WeightSyncHandler:
         backend,
         buffer: List[Tuple[str, torch.Tensor]],
         flush_cache: bool,
+        weight_version: Optional[str] = None,
     ) -> Tuple[int, int]:
         """
         Broadcast a buffer of (name, tensor) pairs to inference endpoints.
@@ -1390,12 +1440,13 @@ class WeightSyncHandler:
             return 0, 0
 
         bucket_bytes = sum(t.numel() * t.element_size() for _, t in buffer)
-        logger.info(
-            f"Rank {self.rank}: [WeightSync] Broadcasting {len(buffer)} params, "
-            f"{bucket_bytes / 1e6:.1f} MB"
-        )
+        logger.info(f"Rank {self.rank}: [WeightSync] Broadcasting {len(buffer)} params, {bucket_bytes / 1e6:.1f} MB")
 
-        backend.transfer_bucket(buffer, flush_cache=flush_cache)
+        backend.transfer_bucket(
+            buffer,
+            flush_cache=flush_cache,
+            weight_version=weight_version,
+        )
         return bucket_bytes, len(buffer)
 
     @staticmethod
@@ -1409,7 +1460,6 @@ class WeightSyncHandler:
         Root module holds non-layer params (embed, norm, head).
         Layer modules hold per-layer params.
         """
-        from torch.distributed.fsdp._fully_shard import FSDPModule
 
         root_module = None
         layer_modules = []
@@ -1423,4 +1473,3 @@ class WeightSyncHandler:
                 layer_modules.append((fqn, mod))
 
         return root_module, layer_modules
-

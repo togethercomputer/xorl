@@ -57,7 +57,9 @@ def convert_batch_to_tensors(batch: Dict[str, Any], rank: int = 0) -> Dict[str, 
                 if isinstance(value[0], list):
                     # This is a list of sequences - pad them
                     max_len = max(len(seq) for seq in value)
-                    pad_value = -100 if key in ("labels", "target_tokens") else 0  # Use -100 for labels/target_tokens (IGNORE_INDEX)
+                    pad_value = (
+                        -100 if key in ("labels", "target_tokens") else 0
+                    )  # Use -100 for labels/target_tokens (IGNORE_INDEX)
                     padded = []
                     for seq in value:
                         padded_seq = seq + [pad_value] * (max_len - len(seq))
@@ -71,9 +73,7 @@ def convert_batch_to_tensors(batch: Dict[str, Any], rank: int = 0) -> Dict[str, 
                             f"Rank {rank}: Padded and converted {key}: {len(value)} sequences, max_len={max_len}, dtype={dtype}"
                         )
                     except Exception as e2:
-                        logger.warning(
-                            f"Rank {rank}: Failed to convert {key} even after padding: {e2}, keeping as-is"
-                        )
+                        logger.warning(f"Rank {rank}: Failed to convert {key} even after padding: {e2}, keeping as-is")
                         converted_batch[key] = value
                 else:
                     logger.warning(f"Rank {rank}: Failed to convert {key} to tensor: {e}, keeping as-is")
@@ -121,8 +121,7 @@ def validate_batch_shapes(batch: Dict[str, Any], rank: int = 0, batch_idx: int =
     unique_lengths = set(seq_lengths.values())
     if len(unique_lengths) > 1:
         logger.error(
-            f"Rank {rank}: Batch {batch_idx} has INCONSISTENT sequence lengths: {seq_lengths}. "
-            f"Full shapes: {shapes}"
+            f"Rank {rank}: Batch {batch_idx} has INCONSISTENT sequence lengths: {seq_lengths}. Full shapes: {shapes}"
         )
         return False
 
@@ -226,8 +225,7 @@ def simple_sequence_shard(batch: Dict[str, Any], rank: int = 0) -> Dict[str, Any
             sharded_batch[key] = value
 
     logger.debug(
-        f"Rank {rank}: Simple sequence shard: {seq_len} -> {cp_chunk_size} "
-        f"(cp_rank={cp_rank}, cp_size={cp_size})"
+        f"Rank {rank}: Simple sequence shard: {seq_len} -> {cp_chunk_size} (cp_rank={cp_rank}, cp_size={cp_size})"
     )
 
     return sharded_batch

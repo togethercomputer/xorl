@@ -8,15 +8,18 @@ import json
 import logging
 import os
 import re
-from typing import Dict, Iterator, List, Optional, Set, Tuple, Union
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
-from safetensors.torch import save_file, load_file
+from safetensors.torch import load_file, save_file
+from torch.distributed._tensor import DTensor, Replicate, Shard
 
+from xorl.lora.mapping import can_apply_lora, get_lora_class_for_module
 from xorl.lora.modules import LoraLinear
 from xorl.lora.modules.base import LoraModule
-from xorl.lora.mapping import can_apply_lora, get_lora_class_for_module
+
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +31,12 @@ DEFAULT_TARGET_MODULES = {
     "mistral": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     "gemma": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
 }
+
+_PEFT_BASE_MODEL_PREFIX = "base_model.model."
+_MOE_LORA_PATTERN = re.compile(r"(.*)\.mlp\.experts\.(gate_proj|up_proj|down_proj)_lora_(A|B)$")
+_MOE_PEFT_LORA_PATTERN = re.compile(
+    r"(.*)\.mlp\.experts\.(shared|\d+)\.(gate_proj|up_proj|down_proj)\.lora_(A|B)\.weight$"
+)
 
 
 def _get_submodule(model: nn.Module, target: str) -> Tuple[nn.Module, str]:
@@ -244,8 +253,6 @@ def get_lora_parameters(model: nn.Module) -> Iterator[nn.Parameter]:
             yield param
 
 
-
-
 def _gather_ep_tensor(tensor: torch.Tensor, spec_info) -> torch.Tensor:
     """Gather an EP-sharded tensor from all EP ranks.
 
@@ -257,8 +264,6 @@ def _gather_ep_tensor(tensor: torch.Tensor, spec_info) -> torch.Tensor:
         Full tensor with all EP shards concatenated along the shard dimension.
         Returns tensor unchanged if placement is Replicate.
     """
-    import torch.distributed as dist
-    from torch.distributed._tensor import Replicate, Shard
 
     if isinstance(spec_info.placement, Replicate):
         return tensor
@@ -293,9 +298,8 @@ def get_lora_state_dict(
     Returns:
         State dict containing only lora_A and lora_B parameters (on CPU)
     """
-    from torch.distributed._tensor import DTensor
 
-    fqn2spec_info = getattr(model, '_fqn2spec_info', None)
+    fqn2spec_info = getattr(model, "_fqn2spec_info", None)
 
     lora_state_dict = {}
     for name, param in model.named_parameters():
@@ -354,9 +358,7 @@ def load_lora_state_dict(
 
     if strict and (missing_keys or unexpected_keys):
         raise RuntimeError(
-            f"Error loading LoRA state dict.\n"
-            f"Missing keys: {missing_keys}\n"
-            f"Unexpected keys: {unexpected_keys}"
+            f"Error loading LoRA state dict.\nMissing keys: {missing_keys}\nUnexpected keys: {unexpected_keys}"
         )
 
     # Load matching keys
@@ -369,6 +371,104 @@ def load_lora_state_dict(
     return missing_keys, unexpected_keys
 
 
+def _convert_from_peft_lora_key(name: str) -> str:
+    """Convert a PEFT LoRA key back to xorl's internal naming."""
+    if "lm_head.lora_embedding_A" in name:
+        return name.replace("lm_head.lora_embedding_A", "lm_head.lora_A")
+    if "lm_head.lora_embedding_B" in name:
+        return name.replace("lm_head.lora_embedding_B", "lm_head.lora_B")
+    if name.endswith(".lora_A.weight"):
+        return name[: -len(".weight")]
+    if name.endswith(".lora_B.weight"):
+        return name[: -len(".weight")]
+    return name
+
+
+def _align_lora_tensor_shape(
+    key: str,
+    tensor: torch.Tensor,
+    expected_shapes: Optional[Dict[str, torch.Size]],
+) -> torch.Tensor:
+    """Match a converted tensor to the live LoRA shape, allowing a final-dim transpose."""
+    if expected_shapes is None or key not in expected_shapes:
+        return tensor
+
+    expected_shape = tuple(expected_shapes[key])
+    if tuple(tensor.shape) == expected_shape:
+        return tensor
+
+    if tensor.dim() >= 2:
+        transposed = tensor.transpose(-2, -1).contiguous()
+        if tuple(transposed.shape) == expected_shape:
+            return transposed
+
+    raise RuntimeError(f"Converted LoRA tensor for {key} has shape {tuple(tensor.shape)}, expected {expected_shape}")
+
+
+def convert_peft_lora_state_dict(
+    state_dict: Dict[str, torch.Tensor],
+    expected_shapes: Optional[Dict[str, torch.Size]] = None,
+) -> Dict[str, torch.Tensor]:
+    """Convert PEFT-style LoRA checkpoint tensors into xorl's internal layout.
+
+    This handles:
+    - Dense LoRA keys ending in ``.lora_{A|B}.weight``
+    - ``lm_head`` PEFT embedding aliases
+    - MoE per-expert keys such as ``...experts.3.gate_proj.lora_A.weight``
+    - MoE hybrid-shared keys such as ``...experts.shared.down_proj.lora_B.weight``
+
+    Args:
+        state_dict: Loaded checkpoint weights.
+        expected_shapes: Optional live-parameter shapes keyed by internal name.
+            When provided, the converter will transpose the trailing matrix dims
+            if that is required to match the live layout.
+
+    Returns:
+        State dict keyed by xorl's internal LoRA parameter names.
+    """
+    converted_state_dict: Dict[str, torch.Tensor] = {}
+    moe_buckets: Dict[str, Dict[str, torch.Tensor]] = {}
+
+    for raw_key, value in state_dict.items():
+        if raw_key.startswith(_PEFT_BASE_MODEL_PREFIX):
+            key = raw_key[len(_PEFT_BASE_MODEL_PREFIX) :]
+        else:
+            key = raw_key
+
+        match = _MOE_PEFT_LORA_PATTERN.match(key)
+        if match is not None:
+            prefix, expert_token, proj_name, lora_type = match.groups()
+            internal_name = f"{prefix}.mlp.experts.{proj_name}_lora_{lora_type}"
+            bucket = moe_buckets.setdefault(internal_name, {})
+            if expert_token in bucket:
+                raise RuntimeError(f"Duplicate MoE LoRA checkpoint entry for {internal_name} ({expert_token})")
+            bucket[expert_token] = value
+            continue
+
+        internal_name = _convert_from_peft_lora_key(key)
+        converted_state_dict[internal_name] = _align_lora_tensor_shape(internal_name, value, expected_shapes)
+
+    for internal_name, bucket in moe_buckets.items():
+        if "shared" in bucket:
+            if len(bucket) != 1:
+                raise RuntimeError(
+                    f"Mixed shared and per-expert MoE checkpoint entries found for {internal_name}: {sorted(bucket)}"
+                )
+            stacked = bucket["shared"].unsqueeze(0).contiguous()
+        else:
+            expert_indices = sorted(int(idx) for idx in bucket)
+            expected_indices = list(range(len(expert_indices)))
+            if expert_indices != expected_indices:
+                raise RuntimeError(
+                    f"Non-contiguous MoE checkpoint expert indices for {internal_name}: {expert_indices}"
+                )
+            stacked = torch.stack([bucket[str(expert_idx)] for expert_idx in expert_indices], dim=0)
+
+        converted_state_dict[internal_name] = _align_lora_tensor_shape(internal_name, stacked, expected_shapes)
+
+    return converted_state_dict
+
+
 def save_lora_checkpoint(
     model: nn.Module,
     save_path: str,
@@ -378,6 +478,7 @@ def save_lora_checkpoint(
     lora_alpha: Optional[int] = None,
     moe_hybrid_shared_lora: bool = False,
     lora_state_dict: Optional[Dict[str, torch.Tensor]] = None,
+    transpose_moe_lora_to_peft: bool = False,
 ) -> str:
     """
     Save LoRA weights in PEFT-compatible format.
@@ -397,11 +498,13 @@ def save_lora_checkpoint(
         lora_state_dict: Pre-gathered LoRA state dict. If provided, skips
             get_lora_state_dict(model) call. Useful when the caller has already
             gathered weights (e.g., from FSDP2 + EP distributed model).
+        transpose_moe_lora_to_peft: Whether to transpose MoE expert LoRA tensors
+            into PEFT/vLLM orientation during export. Disabled by default so
+            existing xorl call sites keep their current behavior.
 
     Returns:
         Path to saved checkpoint directory
     """
-    import re
 
     os.makedirs(save_path, exist_ok=True)
 
@@ -409,13 +512,9 @@ def save_lora_checkpoint(
     if lora_state_dict is None:
         lora_state_dict = get_lora_state_dict(model)
 
-    # Pattern to detect MoE LoRA weights: mlp.experts.{proj}_lora_{A|B}
-    # These are stacked tensors with shape [num_experts, ...] that need to be unmerged
-    moe_lora_pattern = re.compile(r"(.*)\.mlp\.experts\.(gate_proj|up_proj|down_proj)_lora_(A|B)$")
-
     def _is_moe_lora_param(name: str) -> bool:
         """Check if this is a stacked MoE LoRA parameter."""
-        return moe_lora_pattern.match(name) is not None
+        return _MOE_LORA_PATTERN.match(name) is not None
 
     def _convert_to_peft_key(name: str) -> str:
         """
@@ -439,15 +538,17 @@ def save_lora_checkpoint(
         Unmerge stacked MoE LoRA weights into per-expert format for vLLM compatibility.
 
         Xorl stores MoE LoRA as stacked tensors:
-            model.layers.0.mlp.experts.gate_proj_lora_A  # shape: [num_experts, r, hidden_dim]
+            model.layers.0.mlp.experts.gate_proj_lora_A  # shape: [num_experts, hidden_dim, r]
+            model.layers.0.mlp.experts.gate_proj_lora_B  # shape: [num_experts, r, intermediate_dim]
 
         vLLM expects per-expert format:
             model.layers.0.mlp.experts.0.gate_proj.lora_A.weight  # shape: [r, hidden_dim]
+            model.layers.0.mlp.experts.0.gate_proj.lora_B.weight  # shape: [intermediate_dim, r]
 
         For hybrid shared LoRA, shared weights (shape[0] == 1) are named with
         ".shared." instead of expert index to indicate they're shared across experts.
         """
-        match = moe_lora_pattern.match(name)
+        match = _MOE_LORA_PATTERN.match(name)
         if not match:
             raise ValueError(f"Invalid MoE LoRA parameter name: {name}")
 
@@ -459,17 +560,21 @@ def save_lora_checkpoint(
         result = {}
 
         # Check if this is a shared weight (hybrid shared LoRA)
-        is_shared = (num_experts == 1)
+        is_shared = num_experts == 1
 
         if is_shared:
             # Shared weight: use ".shared." in the key name
             expert_tensor = stacked_tensor[0]
+            if transpose_moe_lora_to_peft:
+                expert_tensor = expert_tensor.transpose(0, 1).contiguous()
             peft_key = f"base_model.model.{prefix}.mlp.experts.shared.{proj_name}.lora_{lora_type}.weight"
             result[peft_key] = expert_tensor.to(torch.bfloat16)
         else:
             # Per-expert weights: use expert index in the key name
             for expert_idx in range(num_experts):
                 expert_tensor = stacked_tensor[expert_idx]
+                if transpose_moe_lora_to_peft:
+                    expert_tensor = expert_tensor.transpose(0, 1).contiguous()
                 # Build vLLM-compatible key:
                 # base_model.model.{prefix}.mlp.experts.{idx}.{proj}.lora_{A|B}.weight
                 peft_key = f"base_model.model.{prefix}.mlp.experts.{expert_idx}.{proj_name}.lora_{lora_type}.weight"
@@ -481,7 +586,6 @@ def save_lora_checkpoint(
     peft_state_dict = {}
     detected_modules = set()
     detected_r = None
-    detected_alpha = None
 
     for key, value in lora_state_dict.items():
         # Check if this is a stacked MoE LoRA parameter
@@ -490,12 +594,14 @@ def save_lora_checkpoint(
             per_expert_weights = _unmerge_moe_lora_weights(key, value)
             peft_state_dict.update(per_expert_weights)
             # Detect target modules from MoE LoRA
-            match = moe_lora_pattern.match(key)
+            match = _MOE_LORA_PATTERN.match(key)
             if match:
                 detected_modules.add(match.group(2))  # gate_proj, up_proj, or down_proj
                 if detected_r is None and match.group(3) == "A":
-                    # For MoE LoRA, shape is [num_experts, r, ...]
-                    detected_r = value.shape[1]
+                    # Xorl stores MoE LoRA A as [num_experts, in_features, r].
+                    # When transpose_moe_lora_to_peft is enabled, the exported
+                    # PEFT tensor rank is the last dimension of the stacked input.
+                    detected_r = value.shape[2] if transpose_moe_lora_to_peft else value.shape[1]
         else:
             # Extract module name for target_modules detection
             parts = key.split(".")
@@ -562,7 +668,9 @@ def load_lora_checkpoint(
     """
     Load LoRA weights from checkpoint.
 
-    Supports both xorl format and PEFT format checkpoints.
+    Supports both xorl format and PEFT format checkpoints for dense
+    (nn.Linear) LoRA as well as stacked MoE LoRA, including hybrid-shared
+    checkpoints exported under ``.mlp.experts.shared.{proj}.lora_{A|B}.weight``.
 
     Args:
         model: Model with LoRA layers already injected
@@ -586,36 +694,10 @@ def load_lora_checkpoint(
     else:
         state_dict = torch.load(weights_file, map_location="cpu", weights_only=True)
 
-    def _convert_from_peft_key(name: str) -> str:
-        """
-        Convert PEFT key format back to xorl format.
-
-        For Linear layers: lora_A.weight -> lora_A, lora_B.weight -> lora_B
-        For lm_head: lora_embedding_A -> lora_A, lora_embedding_B -> lora_B
-        """
-        # Handle lm_head embedding-style naming
-        if "lm_head.lora_embedding_A" in name:
-            return name.replace("lm_head.lora_embedding_A", "lm_head.lora_A")
-        elif "lm_head.lora_embedding_B" in name:
-            return name.replace("lm_head.lora_embedding_B", "lm_head.lora_B")
-        # Handle .weight suffix for Linear layers
-        elif name.endswith(".lora_A.weight"):
-            return name[:-len(".weight")]
-        elif name.endswith(".lora_B.weight"):
-            return name[:-len(".weight")]
-        return name
-
-    # Convert PEFT format keys to xorl format if needed
-    converted_state_dict = {}
-    for key, value in state_dict.items():
-        # Remove PEFT prefix: base_model.model.{key} -> {key}
-        if key.startswith("base_model.model."):
-            new_key = key[len("base_model.model."):]
-        else:
-            new_key = key
-        # Convert from PEFT naming to xorl naming
-        new_key = _convert_from_peft_key(new_key)
-        converted_state_dict[new_key] = value
+    model_lora_shapes = {
+        key: value.shape for key, value in model.state_dict().items() if "lora_A" in key or "lora_B" in key
+    }
+    converted_state_dict = convert_peft_lora_state_dict(state_dict, expected_shapes=model_lora_shapes)
 
     # Load into model
     missing, unexpected = load_lora_state_dict(model, converted_state_dict, strict=strict)
@@ -655,7 +737,6 @@ def inject_lora_into_moe_blocks(
     model: nn.Module,
     r: int = 16,
     lora_alpha: int = 16,
-    shared_lora: bool = False,
     target_modules: Optional[List[str]] = None,
     hybrid_shared: bool = False,
 ) -> int:
@@ -675,7 +756,6 @@ def inject_lora_into_moe_blocks(
         model: Model containing MoE blocks
         r: LoRA rank
         lora_alpha: LoRA alpha for scaling
-        shared_lora: If True, share LoRA across all experts (more parameter efficient)
         target_modules: Which expert projections to apply LoRA to.
                        Options: ["gate_proj", "up_proj", "down_proj"]
                        Default: all three projections
@@ -701,12 +781,11 @@ def inject_lora_into_moe_blocks(
 
     for name, module in model.named_modules():
         # Check if this is a MoE block that supports LoRA injection
-        if hasattr(module, 'inject_lora') and hasattr(module, 'lora_adapter'):
+        if hasattr(module, "inject_lora") and hasattr(module, "lora_adapter"):
             # This is a MoEBlock or similar
             module.inject_lora(
                 r=r,
                 lora_alpha=lora_alpha,
-                shared_lora=shared_lora,
                 target_modules=target_modules,
                 hybrid_shared=hybrid_shared,
             )
@@ -716,12 +795,11 @@ def inject_lora_into_moe_blocks(
     if injected_count > 0:
         logger.info(
             f"Injected LoRA into {injected_count} MoE blocks with r={r}, "
-            f"alpha={lora_alpha}, shared={shared_lora}, hybrid_shared={hybrid_shared}"
+            f"alpha={lora_alpha}, hybrid_shared={hybrid_shared}"
         )
     else:
         logger.warning(
-            "No LoRA-compatible MoE blocks found. Make sure model uses "
-            "moe_implementation='triton' or 'native'"
+            "No LoRA-compatible MoE blocks found. Make sure model uses moe_implementation='triton' or 'native'"
         )
 
     return injected_count
@@ -732,7 +810,6 @@ def inject_lora_into_model_with_moe(
     r: int = 16,
     lora_alpha: int = 16,
     target_modules: Optional[List[str]] = None,
-    moe_shared_lora: bool = False,
     moe_hybrid_shared_lora: bool = False,
 ) -> nn.Module:
     """
@@ -754,7 +831,6 @@ def inject_lora_into_model_with_moe(
         target_modules: List of module names to target.
                        For attention: ["q_proj", "k_proj", "v_proj", "o_proj"]
                        For MLP/experts: ["gate_proj", "up_proj", "down_proj"]
-        moe_shared_lora: If True, MoE experts share LoRA adapters (all shared)
         moe_hybrid_shared_lora: If True, use hybrid sharing (lora_A shared for gate/up, lora_B shared for down)
 
     Returns:
@@ -796,7 +872,6 @@ def inject_lora_into_model_with_moe(
             model,
             r=r,
             lora_alpha=lora_alpha,
-            shared_lora=moe_shared_lora,
             target_modules=expert_modules,
             hybrid_shared=moe_hybrid_shared_lora,
         )
@@ -818,10 +893,10 @@ def get_moe_lora_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
 
     for name, module in model.named_modules():
         # Check if this is an MoE LoRA expert module (has lora_config attribute)
-        if hasattr(module, 'lora_config') and module.lora_config is not None:
+        if hasattr(module, "lora_config") and module.lora_config is not None:
             # Get all lora_ parameters from this module
             for param_name, param in module.named_parameters():
-                if 'lora_' in param_name:
+                if "lora_" in param_name:
                     full_key = f"{name}.{param_name}"
                     moe_lora_state_dict[full_key] = param.detach().cpu()
 

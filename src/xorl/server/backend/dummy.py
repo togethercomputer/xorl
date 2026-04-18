@@ -7,10 +7,9 @@ No ZMQ sockets, no separate processes, no threads. Just returns dummy results.
 
 import logging
 import random
-import time
-from typing import Any, Dict, List, Optional
 
 from xorl.server.backend.base import Backend
+
 
 logger = logging.getLogger(__name__)
 
@@ -39,32 +38,29 @@ class DummyBackend(Backend):
         if random.random() < self.failure_rate:
             raise RuntimeError(f"Simulated failure in {operation} (failure_rate={self.failure_rate})")
 
-    async def forward_backward(self, batches, loss_fn="causallm_loss", loss_fn_params=None,
-                               model_id=None, routed_experts=None, request_id=None):
+    async def forward_backward(
+        self, batches, loss_fn="causallm_loss", loss_fn_params=None, model_id=None, routed_experts=None, request_id=None
+    ):
         self._maybe_fail("forward_backward")
-        valid_tokens = sum(
-            len(batch.get("input_ids", [])) for batch in (batches or [])
-        )
+        valid_tokens = sum(len(batch.get("input_ids", [])) for batch in (batches or []))
         return {
             "total_loss": random.uniform(0.5, 5.0),
             "global_valid_tokens": valid_tokens,
             "num_batches": len(batches or []),
         }
 
-    async def forward(self, batches, loss_fn="causallm_loss", loss_fn_params=None,
-                      model_id=None, request_id=None):
+    async def forward(self, batches, loss_fn="causallm_loss", loss_fn_params=None, model_id=None, request_id=None):
         self._maybe_fail("forward")
-        valid_tokens = sum(
-            len(batch.get("input_ids", [])) for batch in (batches or [])
-        )
+        valid_tokens = sum(len(batch.get("input_ids", [])) for batch in (batches or []))
         return {
             "total_loss": random.uniform(0.5, 5.0),
             "global_valid_tokens": valid_tokens,
             "num_batches": len(batches or []),
         }
 
-    async def optim_step(self, lr, gradient_clip=None, beta1=None, beta2=None,
-                         eps=None, model_id=None, request_id=None):
+    async def optim_step(
+        self, lr, gradient_clip=None, beta1=None, beta2=None, eps=None, model_id=None, request_id=None
+    ):
         self._maybe_fail("optim_step")
         self._step += 1
         return {
@@ -73,13 +69,13 @@ class DummyBackend(Backend):
             "learning_rate": lr,
         }
 
-    async def save_state(self, checkpoint_path=None, save_optimizer=True,
-                         use_timestamp=False, model_id=None, request_id=None):
+    async def save_state(
+        self, checkpoint_path=None, save_optimizer=True, use_timestamp=False, model_id=None, request_id=None
+    ):
         self._maybe_fail("save_state")
         return {"checkpoint_path": checkpoint_path or "/tmp/dummy_ckpt", "success": True}
 
-    async def load_state(self, checkpoint_path=None, load_optimizer=True,
-                         model_id=None, request_id=None):
+    async def load_state(self, checkpoint_path=None, load_optimizer=True, model_id=None, request_id=None):
         self._maybe_fail("load_state")
         return {"checkpoint_path": checkpoint_path or "/tmp/dummy_ckpt", "success": True}
 
@@ -87,8 +83,9 @@ class DummyBackend(Backend):
         self._maybe_fail("save_lora_only")
         return {"lora_path": lora_path or "/tmp/dummy_lora", "success": True}
 
-    async def save_full_weights(self, output_path=None, dtype="bfloat16",
-                                base_model_path=None, model_id=None, request_id=None):
+    async def save_full_weights(
+        self, output_path=None, dtype="bfloat16", base_model_path=None, model_id=None, request_id=None
+    ):
         self._maybe_fail("save_full_weights")
         return {"output_path": output_path or "/tmp/dummy_weights", "success": True, "num_shards": 1}
 
@@ -98,20 +95,26 @@ class DummyBackend(Backend):
     async def wake_up(self, request_id=None):
         return {"status": "awake", "load_time": 0.0}
 
-    async def sync_inference_weights(self, endpoints, master_address="localhost",
-                                     master_port=29600, request_id=None, **kwargs):
-        return {"success": True, "message": "dummy sync", "transfer_time": 0.0,
-                "total_bytes": 0, "num_parameters": 0, "num_buckets": 0, "endpoint_results": []}
+    async def sync_inference_weights(
+        self, endpoints, master_address="localhost", master_port=0, request_id=None, **kwargs
+    ):
+        return {
+            "success": True,
+            "message": "dummy sync",
+            "transfer_time": 0.0,
+            "total_bytes": 0,
+            "num_parameters": 0,
+            "num_buckets": 0,
+            "endpoint_results": [],
+        }
 
     async def register_adapter(self, model_id="default", lr=1e-5, request_id=None):
         return {"model_id": model_id, "lr": lr, "registered": True}
 
-    async def save_adapter_state(self, model_id="default", path=None,
-                                 save_optimizer=True, request_id=None):
+    async def save_adapter_state(self, model_id="default", path=None, save_optimizer=True, request_id=None):
         return {"success": True}
 
-    async def load_adapter_state(self, model_id="default", path=None,
-                                 load_optimizer=True, lr=None, request_id=None):
+    async def load_adapter_state(self, model_id="default", path=None, load_optimizer=True, lr=None, request_id=None):
         return {"success": True}
 
     async def get_adapter_info(self, request_id=None):

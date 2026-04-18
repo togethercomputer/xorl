@@ -6,18 +6,15 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 from torch.distributed._tensor import DTensor
-from torch.distributed.checkpoint.state_dict import (
-    StateDictOptions,
-    get_optimizer_state_dict,
-    set_optimizer_state_dict,
-)
-from torch.distributed.checkpoint.stateful import Stateful
 from torch.optim import AdamW
 from torch.optim.optimizer import Optimizer
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
+from .anyprecision_adamw import AnyPrecisionAdamW
+from .multi_optimizer import MultiOptimizer
 from .muon import Muon
+from .signsgd import SignSGD
 
 
 logger = logging.get_logger(__name__)
@@ -28,199 +25,11 @@ _MUON_EXCLUDE_MODULE_TYPES = {"Embedding"}
 _MUON_EXCLUDE_PARAM_PATTERNS = {"embed_tokens", "lm_head", "norm", "gate.weight"}
 
 
-# https://github.com/meta-llama/llama-recipes/blob/v0.0.4/src/llama_recipes/policies/anyprecision_optimizer.py
-class AnyPrecisionAdamW(Optimizer):
-    def __init__(
-        self,
-        params,
-        lr=1e-3,
-        betas=(0.9, 0.95),
-        eps=1e-8,
-        weight_decay=0.0,
-        use_kahan_summation=False,
-        momentum_dtype=torch.bfloat16,
-        variance_dtype=torch.bfloat16,
-        compensation_buffer_dtype=torch.bfloat16,
-    ):
-        defaults = {
-            "lr": lr,
-            "betas": betas,
-            "eps": eps,
-            "weight_decay": weight_decay,
-            "use_kahan_summation": use_kahan_summation,
-            "momentum_dtype": momentum_dtype,
-            "variance_dtype": variance_dtype,
-            "compensation_buffer_dtype": compensation_buffer_dtype,
-        }
-        super().__init__(params, defaults)
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        """
-        Performs a single optimization step.
-
-        Args:
-            closure (callable, optional): A closure that reevaluates the model and returns the loss.
-        """
-
-        if closure is not None:
-            with torch.enable_grad():
-                closure()
-
-        for group in self.param_groups:
-            beta1, beta2 = group["betas"]
-            lr = group["lr"]
-            weight_decay = group["weight_decay"]
-            eps = group["eps"]
-            use_kahan_summation = group["use_kahan_summation"]
-
-            momentum_dtype = group["momentum_dtype"]
-            variance_dtype = group["variance_dtype"]
-            compensation_buffer_dtype = group["compensation_buffer_dtype"]
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-
-                if p.grad.is_sparse:
-                    raise RuntimeError("AnyPrecisionAdamW does not support sparse gradients.")
-
-                state = self.state[p]
-                # State initialization
-                if len(state) == 0:
-                    state["step"] = torch.tensor(0.0)
-
-                    # momentum - EMA of gradient values
-                    state["exp_avg"] = torch.zeros_like(p, dtype=momentum_dtype)
-
-                    # variance uncentered - EMA of squared gradient values
-                    state["exp_avg_sq"] = torch.zeros_like(p, dtype=variance_dtype)
-
-                    # optional Kahan summation - accumulated error tracker
-                    if use_kahan_summation:
-                        state["compensation"] = torch.zeros_like(p, dtype=compensation_buffer_dtype)
-
-                # Main processing
-                # update the steps for each param group update
-                state["step"] += 1
-                step = state["step"]
-
-                exp_avg = state["exp_avg"]
-                exp_avg_sq = state["exp_avg_sq"]
-                grad = p.grad
-
-                if weight_decay:  # weight decay, AdamW style
-                    p.data.mul_(1 - lr * weight_decay)
-
-                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)  # update momentum
-                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)  # update uncentered variance
-
-                bias_correction1 = 1 - beta1**step  # adjust using bias1
-                step_size = lr / bias_correction1
-
-                denom_correction = (1 - beta2**step) ** 0.5  # adjust using bias2 and avoids math import
-                centered_variance = (exp_avg_sq.sqrt() / denom_correction).add_(eps, alpha=1)
-
-                if use_kahan_summation:  # lr update to compensation
-                    compensation = state["compensation"]
-                    compensation.addcdiv_(exp_avg, centered_variance, value=-step_size)
-
-                    # update weights with compensation (Kahan summation)
-                    # save error back to compensation for next iteration
-                    temp_buffer = p.detach().clone()
-                    p.data.add_(compensation)
-                    compensation.add_(temp_buffer.sub_(p.data))
-                else:  # usual AdamW updates
-                    p.data.addcdiv_(exp_avg, centered_variance, value=-step_size)
-
-
-class MultiOptimizer(Optimizer, Stateful):
-    """
-    A container that handles multiple optimizers (for ep and non-ep parameters when ep+fsdp2 is enabled)
-
-    Mapping of name -> torch.optim.Optimizer with convenience methods.
-    Compatible with torch.distributed.checkpoint optimizer APIs that accept a Mapping.
-
-    This class is needed for EP+FSDP2 case because EP and non-EP param have different FSDP sharding dimension (dim-0 vs. dim-1).
-    """
-
-    def __init__(
-        self,
-        root_model: nn.Module,
-        optimizers: dict,  # {"ep": opt1, "non_ep": opt2}
-        key_names: list[str],
-    ):
-        self.model = root_model
-        self.optimizers_dict = optimizers
-        self._is_multi_optimizer: bool = True
-        self.key_names = key_names
-
-    @property
-    def param_groups(self) -> List[Dict[str, Any]]:
-        """Return all param_groups from all internal optimizers."""
-        all_groups = []
-        for opt in self.optimizers_dict.values():
-            all_groups.extend(opt.param_groups)
-        return all_groups
-
-    @property
-    def state(self) -> Dict[torch.nn.Parameter, Any]:
-        """Return merged state dict from all internal optimizers."""
-        merged_state: Dict[torch.nn.Parameter, Any] = {}
-        for opt in self.optimizers_dict.values():
-            merged_state.update(opt.state)
-        return merged_state
-
-    def step(self) -> None:
-        for opt in self.optimizers_dict.values():
-            opt.step()
-
-    def zero_grad(self) -> None:
-        for opt in self.optimizers_dict.values():
-            opt.zero_grad()
-
-    def state_dict(
-        self,
-    ) -> Dict[str, Any]:
-        # get the flatten state dict for multi-optimizer
-        merged: Dict[str, Any] = {}
-        for name in self.key_names:
-            opt = self.optimizers_dict.get(name)
-            sd = get_optimizer_state_dict(self.model, opt, options=StateDictOptions(flatten_optimizer_state_dict=True))
-            # check for key clashes before merging
-            overlap = set(merged.keys()) & set(sd.keys())
-            if overlap:
-                raise KeyError(
-                    f"Key clash detected while merging state dict for optimizer '{name}': {', '.join(sorted(overlap))}"
-                )
-            else:
-                logger.info_rank0(f"MultiOptimizer merged '{name}' state dict ({len(sd)} keys, total {len(merged) + len(sd)})")
-            merged.update(sd)
-
-        return merged
-
-    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        # Feed the same merged flattened dict to each sub-optimizer; PyTorch will
-        # pick out only the entries for parameters that belong to that optimizer.
-        for name in self.key_names:
-            opt = self.optimizers_dict.get(name)
-            set_optimizer_state_dict(
-                self.model,
-                opt,
-                optim_state_dict=state_dict,
-                options=StateDictOptions(flatten_optimizer_state_dict=True),
-            )
-
-    def register_step_pre_hook(self, hook):
-        return [opt.register_step_pre_hook(hook) for opt in self.optimizers_dict.values()]
-
-    def __len__(self) -> int:
-        return len(self.optimizers_dict)
-
-
 def _should_build_ep_aware(model: "nn.Module", param_groups: Optional[Sequence[Dict[str, Any]]]) -> bool:
     # Only auto-split when using FSDP2 with EP and no explicit param_groups
     if param_groups is not None:
         return False
+
     ps = get_parallel_state()
     if ps.dp_mode != "fsdp2" or not ps.ep_enabled:
         return False
@@ -287,6 +96,14 @@ _ANYPRECISION_STATE_DTYPES = {
 }
 
 
+def _normalize_optional_dtype(dtype: Any, *, field_name: str) -> Optional[torch.dtype]:
+    if dtype is None or isinstance(dtype, torch.dtype):
+        return dtype
+    if dtype in _ANYPRECISION_STATE_DTYPES:
+        return _ANYPRECISION_STATE_DTYPES[dtype]
+    raise ValueError(f"Unsupported {field_name}: {dtype!r}. Expected 'fp32', 'bf16', a torch.dtype, or None.")
+
+
 def _get_optimizer_cls_and_kwargs(
     optimizer_type: str,
     *,
@@ -304,16 +121,26 @@ def _get_optimizer_cls_and_kwargs(
     if optimizer_type == "adamw":
         foreach = not fused
         ctor_kwargs = dict(
-            lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
-            fused=fused, foreach=foreach, **kwargs,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            fused=fused,
+            foreach=foreach,
+            **kwargs,
         )
         return AdamW, ctor_kwargs
     elif optimizer_type == "anyprecision_adamw":
         state_dtype = _ANYPRECISION_STATE_DTYPES[optimizer_dtype]
         ctor_kwargs = dict(
-            lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
-            momentum_dtype=state_dtype, variance_dtype=state_dtype,
-            compensation_buffer_dtype=state_dtype, **kwargs,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            momentum_dtype=state_dtype,
+            variance_dtype=state_dtype,
+            compensation_buffer_dtype=state_dtype,
+            **kwargs,
         )
         return AnyPrecisionAdamW, ctor_kwargs
     elif optimizer_type == "sgd":
@@ -321,8 +148,14 @@ def _get_optimizer_cls_and_kwargs(
         sgd_defaults.update(kwargs)
         ctor_kwargs = dict(lr=lr, weight_decay=weight_decay, **sgd_defaults)
         return torch.optim.SGD, ctor_kwargs
+    elif optimizer_type == "signsgd":
+        ctor_kwargs = dict(lr=lr, weight_decay=weight_decay, **kwargs)
+        return SignSGD, ctor_kwargs
     elif optimizer_type == "muon":
         adamw_state_dtype = _ANYPRECISION_STATE_DTYPES.get(optimizer_dtype)
+        momentum_dtype = kwargs.get("muon_momentum_dtype")
+        if momentum_dtype is None:
+            momentum_dtype = _ANYPRECISION_STATE_DTYPES.get(optimizer_dtype)
         ctor_kwargs = dict(
             lr=kwargs.get("muon_lr", 0.02),
             momentum=kwargs.get("muon_momentum", 0.95),
@@ -330,16 +163,22 @@ def _get_optimizer_cls_and_kwargs(
             ns_steps=kwargs.get("muon_ns_steps", 5),
             weight_decay=weight_decay,
             adjust_lr_fn=kwargs.get("muon_adjust_lr_fn"),
+            ns_algorithm=kwargs.get("muon_ns_algorithm", "standard_newton_schulz"),
+            ns_use_quack_kernels=kwargs.get("muon_ns_use_quack_kernels", True),
+            gram_newton_schulz_num_restarts=kwargs.get("muon_gram_ns_num_restarts", 1),
+            gram_newton_schulz_restart_iterations=kwargs.get("muon_gram_ns_restart_iterations"),
             adamw_betas=betas,
             adamw_eps=eps,
-            momentum_dtype=kwargs.get("muon_momentum_dtype"),
+            momentum_dtype=_normalize_optional_dtype(momentum_dtype, field_name="muon_momentum_dtype"),
+            grad_dtype=_normalize_optional_dtype(kwargs.get("muon_grad_dtype"), field_name="muon_grad_dtype"),
+            update_dtype=_normalize_optional_dtype(kwargs.get("muon_update_dtype"), field_name="muon_update_dtype"),
+            force_momentum_path=kwargs.get("muon_force_momentum_path", False),
             adamw_state_dtype=adamw_state_dtype,
         )
         return Muon, ctor_kwargs
     else:
         raise ValueError(
-            f"Unsupported optimizer type: '{optimizer_type}'. "
-            f"Supported: adamw, anyprecision_adamw, sgd, muon."
+            f"Unsupported optimizer type: '{optimizer_type}'. Supported: adamw, anyprecision_adamw, sgd, signsgd, muon."
         )
 
 
@@ -361,12 +200,19 @@ def _create_optimizer(
     Common args (lr, betas, eps, weight_decay) are passed directly.
     Optimizer-specific args are passed via optimizer_kwargs:
       - sgd: {"momentum": 0.9, "nesterov": True}
+      - signsgd: no optimizer-specific kwargs
       - muon: {"muon_lr": 0.02, "muon_momentum": 0.95, ...}
       - adamw/anyprecision_adamw: any extra kwargs forwarded to constructor
     """
     cls, ctor_kwargs = _get_optimizer_cls_and_kwargs(
-        optimizer_type, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
-        fused=fused, optimizer_dtype=optimizer_dtype, optimizer_kwargs=optimizer_kwargs,
+        optimizer_type,
+        lr=lr,
+        betas=betas,
+        eps=eps,
+        weight_decay=weight_decay,
+        fused=fused,
+        optimizer_dtype=optimizer_dtype,
+        optimizer_kwargs=optimizer_kwargs,
     )
     return cls(param_groups, **ctor_kwargs)
 
@@ -430,15 +276,37 @@ def _make_muon_param_groups(
     decay_param_names = set(get_parameter_names(model, no_decay_modules, no_decay_params))
     name_by_param = {p: n for n, p in model.named_parameters()}
 
+    fused_gate_up_ids = {
+        id(p)
+        for p, n in zip(model.parameters(), (name_by_param.get(p, "") for p in model.parameters()))
+        if "gate_up_proj" in name_by_param.get(p, "")
+    }
+
     groups: List[Dict[str, Any]] = []
 
     # Muon groups
     muon_decay = [p for p in muon_params if name_by_param.get(p) in decay_param_names]
     muon_no_decay = [p for p in muon_params if name_by_param.get(p) not in decay_param_names]
     if muon_decay:
-        groups.append({"params": muon_decay, "lr": muon_lr, "weight_decay": weight_decay, "use_muon": True})
+        groups.append(
+            {
+                "params": muon_decay,
+                "lr": muon_lr,
+                "weight_decay": weight_decay,
+                "use_muon": True,
+                "_fused_gate_up_ids": fused_gate_up_ids,
+            }
+        )
     if muon_no_decay:
-        groups.append({"params": muon_no_decay, "lr": muon_lr, "weight_decay": 0.0, "use_muon": True})
+        groups.append(
+            {
+                "params": muon_no_decay,
+                "lr": muon_lr,
+                "weight_decay": 0.0,
+                "use_muon": True,
+                "_fused_gate_up_ids": fused_gate_up_ids,
+            }
+        )
 
     # AdamW groups
     adamw_decay = [p for p in adamw_params if name_by_param.get(p) in decay_param_names]
@@ -475,22 +343,36 @@ def build_optimizer(
         eps: AdamW epsilon.
         weight_decay: Weight decay coefficient.
         fused: Use fused AdamW kernel (mutually exclusive with foreach).
-        optimizer_type: One of "adamw", "anyprecision_adamw", "sgd", "muon".
+        optimizer_type: One of "adamw", "anyprecision_adamw", "sgd", "signsgd", "muon".
         optimizer_dtype: State dtype for anyprecision_adamw / muon ("fp32" or "bf16").
         param_groups: Custom param groups. If None, auto-built with weight decay splitting.
         no_decay_modules: Module class names to exclude from weight decay.
         no_decay_params: Parameter name patterns to exclude from weight decay.
         optimizer_kwargs: Optimizer-specific keyword arguments passed to the constructor.
             - sgd: {"momentum": 0.9, "nesterov": True}
+            - signsgd: no optimizer-specific kwargs
             - muon: {"muon_lr": 0.02, "muon_momentum": 0.95, "muon_nesterov": True,
-                      "muon_ns_steps": 5, "muon_adjust_lr_fn": None, "muon_momentum_dtype": None}
+                      "muon_ns_steps": 5, "muon_adjust_lr_fn": None,
+                      "muon_ns_algorithm": "standard_newton_schulz",
+                      "muon_ns_use_quack_kernels": True, "muon_gram_ns_num_restarts": 1,
+                      "muon_gram_ns_restart_iterations": None, "muon_momentum_dtype": None,
+                      "muon_grad_dtype": None, "muon_update_dtype": None, "muon_force_momentum_path": False}
             - adamw/anyprecision_adamw: any extra kwargs forwarded to constructor
     """
     # EP-aware routing: for FSDP2+EP, split params into EP and non-EP groups and build two optimizers.
     if _should_build_ep_aware(model, param_groups):
         return build_ep_fsdp2_optimizer(
-            model, lr, betas, eps, weight_decay, fused, optimizer_type, optimizer_dtype,
-            param_groups, no_decay_modules, no_decay_params,
+            model,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            fused,
+            optimizer_type,
+            optimizer_dtype,
+            param_groups,
+            no_decay_modules,
+            no_decay_params,
             optimizer_kwargs=optimizer_kwargs,
         )
 
@@ -499,17 +381,20 @@ def build_optimizer(
     # Muon optimizer: split params into Muon (2D+ matrices) and AdamW (rest)
     if optimizer_type == "muon":
         muon_params, muon_names, adamw_params, adamw_names = _classify_muon_params(model)
-        logger.info_rank0(
-            f"Muon optimizer: {len(muon_params)} Muon params, {len(adamw_params)} AdamW params"
-        )
+        logger.info_rank0(f"Muon optimizer: {len(muon_params)} Muon params, {len(adamw_params)} AdamW params")
         logger.info_rank0(f"Muon params: {muon_names}")
         logger.info_rank0(f"AdamW params: {adamw_names}")
 
         muon_lr = kwargs.get("muon_lr", 0.02)
         param_groups = _make_muon_param_groups(
-            model, muon_params, adamw_params,
-            muon_lr=muon_lr, adamw_lr=lr, weight_decay=weight_decay,
-            no_decay_modules=no_decay_modules, no_decay_params=no_decay_params,
+            model,
+            muon_params,
+            adamw_params,
+            muon_lr=muon_lr,
+            adamw_lr=lr,
+            weight_decay=weight_decay,
+            no_decay_modules=no_decay_modules,
+            no_decay_params=no_decay_params,
         )
     elif param_groups is None:
         # Build param groups with weight decay splitting
@@ -531,9 +416,14 @@ def build_optimizer(
             param_groups.append({"params": no_decay_parameters, "weight_decay": 0.0})
 
     return _create_optimizer(
-        optimizer_type, param_groups,
-        lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
-        fused=fused, optimizer_dtype=optimizer_dtype,
+        optimizer_type,
+        param_groups,
+        lr=lr,
+        betas=betas,
+        eps=eps,
+        weight_decay=weight_decay,
+        fused=fused,
+        optimizer_dtype=optimizer_dtype,
         optimizer_kwargs=optimizer_kwargs,
     )
 
@@ -584,8 +474,8 @@ def build_ep_fsdp2_optimizer(
 
     if optimizer_type == "muon":
         # For Muon + EP: classify within each EP/non-EP subset, then build Muon optimizers
-        ep_param_set = set(id(p) for p in ep_params)
-        non_ep_param_set = set(id(p) for p in non_ep_params)
+        ep_param_set = {id(p) for p in ep_params}
+        non_ep_param_set = {id(p) for p in non_ep_params}
 
         # Classify all model params into Muon vs AdamW
         all_muon, _, all_adamw, _ = _classify_muon_params(model)
@@ -598,14 +488,24 @@ def build_ep_fsdp2_optimizer(
 
         muon_lr = kwargs.get("muon_lr", 0.02)
         ep_groups = _make_muon_param_groups(
-            model, ep_muon, ep_adamw,
-            muon_lr=muon_lr, adamw_lr=lr, weight_decay=weight_decay,
-            no_decay_modules=no_decay_modules, no_decay_params=no_decay_params,
+            model,
+            ep_muon,
+            ep_adamw,
+            muon_lr=muon_lr,
+            adamw_lr=lr,
+            weight_decay=weight_decay,
+            no_decay_modules=no_decay_modules,
+            no_decay_params=no_decay_params,
         )
         non_ep_groups = _make_muon_param_groups(
-            model, non_ep_muon, non_ep_adamw,
-            muon_lr=muon_lr, adamw_lr=lr, weight_decay=weight_decay,
-            no_decay_modules=no_decay_modules, no_decay_params=no_decay_params,
+            model,
+            non_ep_muon,
+            non_ep_adamw,
+            muon_lr=muon_lr,
+            adamw_lr=lr,
+            weight_decay=weight_decay,
+            no_decay_modules=no_decay_modules,
+            no_decay_params=no_decay_params,
         )
     else:
         ep_groups = _make_param_groups_for_subset(model, ep_params, weight_decay, no_decay_modules, no_decay_params)
@@ -615,9 +515,14 @@ def build_ep_fsdp2_optimizer(
 
     def _build(groups: Sequence[Dict[str, Any]]) -> Optimizer:
         return _create_optimizer(
-            optimizer_type, groups,
-            lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
-            fused=fused, optimizer_dtype=optimizer_dtype,
+            optimizer_type,
+            groups,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            fused=fused,
+            optimizer_dtype=optimizer_dtype,
             optimizer_kwargs=optimizer_kwargs,
         )
 

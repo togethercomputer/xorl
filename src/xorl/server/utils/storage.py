@@ -12,6 +12,7 @@ import os
 import re
 from typing import Optional
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -78,39 +79,36 @@ def parse_size_string(size_str: str) -> int:
     size_str = size_str.strip().upper()
 
     # Pattern: number followed by optional unit
-    pattern = r'^(\d+(?:\.\d+)?)\s*(GB?|MB?|KB?|TB?|B)?$'
+    pattern = r"^(\d+(?:\.\d+)?)\s*(GB?|MB?|KB?|TB?|B)?$"
     match = re.match(pattern, size_str)
 
     if not match:
-        raise ValueError(
-            f"Invalid size format: '{size_str}'. "
-            "Expected format like '1GB', '500MB', '100KB', or '1024B'"
-        )
+        raise ValueError(f"Invalid size format: '{size_str}'. Expected format like '1GB', '500MB', '100KB', or '1024B'")
 
     value = float(match.group(1))
-    unit = match.group(2) or 'B'
+    unit = match.group(2) or "B"
 
     # Normalize single-letter units
     unit_map = {
-        'T': 'TB',
-        'G': 'GB',
-        'M': 'MB',
-        'K': 'KB',
-        'B': 'B',
-        'TB': 'TB',
-        'GB': 'GB',
-        'MB': 'MB',
-        'KB': 'KB',
+        "T": "TB",
+        "G": "GB",
+        "M": "MB",
+        "K": "KB",
+        "B": "B",
+        "TB": "TB",
+        "GB": "GB",
+        "MB": "MB",
+        "KB": "KB",
     }
 
     unit = unit_map.get(unit, unit)
 
     multipliers = {
-        'B': 1,
-        'KB': 1024,
-        'MB': 1024 ** 2,
-        'GB': 1024 ** 3,
-        'TB': 1024 ** 4,
+        "B": 1,
+        "KB": 1024,
+        "MB": 1024**2,
+        "GB": 1024**3,
+        "TB": 1024**4,
     }
 
     if unit not in multipliers:
@@ -138,7 +136,7 @@ def bytes_to_human(size_bytes: int) -> str:
     if size_bytes < 0:
         return "0B"
 
-    units = ['B', 'KB', 'MB', 'GB', 'TB']
+    units = ["B", "KB", "MB", "GB", "TB"]
     unit_idx = 0
     size = float(size_bytes)
 

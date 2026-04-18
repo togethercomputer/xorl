@@ -9,7 +9,7 @@ Poll `POST /api/v1/retrieve_future` with that ID to get the actual result.
 The `xorl-client` SDK handles polling automatically.
 :::
 
-All endpoints are served at `http://<host>:<port>/`. Training operations use a two-phase async protocol — see [Server Architecture](/server-training/architecture/#api-server) for details.
+All endpoints are served at `http://<host>:<port>/`. Training operations use a two-phase async protocol — see [Launching & Configuration](/server-training/training-server/launching/#api-server) for details.
 
 ## Training Operations
 
@@ -28,8 +28,8 @@ All endpoints are served at `http://<host>:<port>/`. Training operations use a t
 | `POST` | `/api/v1/unload_model` | Unload a session, freeing associated adapter state. |
 | `POST` | `/api/v1/kill_session` | Kill an active session; optionally reload weights from checkpoint. |
 | `GET` | `/api/v1/session_info` | List active sessions and their state. |
-| `POST` | `/api/v1/create_session` | Tinker SDK compatibility alias for `create_model`. |
-| `POST` | `/api/v1/session_heartbeat` | Tinker SDK keepalive. |
+| `POST` | `/api/v1/create_session` | Create and register a Tinker-compatible session ID for follow-up calls. |
+| `POST` | `/api/v1/session_heartbeat` | Refresh a session's last-activity timestamp for idle cleanup. |
 
 ## Checkpointing
 
@@ -40,7 +40,7 @@ All endpoints are served at `http://<host>:<port>/`. Training operations use a t
 | `POST` | `/api/v1/list_checkpoints` | List available checkpoints under `output_dir`. |
 | `POST` | `/api/v1/delete_checkpoint` | Delete a checkpoint by ID. |
 | `POST` | `/api/v1/weights_info` | Return checkpoint metadata for a model (used by xorl-client to load weights). |
-| `POST` | `/api/v1/save_weights_for_sampler` | Save sampler-format weights for inference. |
+| `POST` | `/api/v1/save_weights_for_sampler` | Save inference weights under `sampler_weights/` (LoRA adapter or full HF checkpoint, depending on training mode). |
 | `GET` | `/api/v1/training_runs` | List training runs. |
 
 ## Inference Integration

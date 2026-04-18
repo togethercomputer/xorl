@@ -6,8 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .router import TopKRouter
 from .experts import MoEExperts
+from .router import TopKRouter
 from .routing_replay import RoutingReplay, get_replay_stage
 
 
@@ -35,7 +35,7 @@ class MoEBlock(nn.Module):
         norm_topk_prob: Whether to renormalize top-k routing weights.
         moe_implementation: Backend name — ``"eager"``, ``"triton"``, ``"native"``, or ``"quack"``.
         train_router: If True (default), gradients flow from expert
-            computation through routing weights back to the gate.  If False,
+            computation through routing weights back to the gate. If False,
             routing weights are detached before expert computation so the gate
             is only trained via auxiliary losses on ``router_logits``.
     """
@@ -85,7 +85,6 @@ class MoEBlock(nn.Module):
         self,
         r: int = 16,
         lora_alpha: int = 16,
-        shared_lora: bool = False,
         target_modules: list = None,
         hybrid_shared: bool = False,
     ) -> None:
@@ -98,14 +97,13 @@ class MoEBlock(nn.Module):
         Args:
             r: LoRA rank.
             lora_alpha: LoRA alpha for scaling.
-            shared_lora: Unused (kept for API compat).
             target_modules: Which projections to apply LoRA to.
                 Options: ``["gate_proj", "up_proj", "down_proj"]``.
                 Default: all three.
             hybrid_shared: If True, share ``lora_A`` for gate/up and
                 ``lora_B`` for down across experts.
         """
-        from .lora import inject_lora_into_experts
+        from .lora import inject_lora_into_experts  # noqa: PLC0415
 
         inject_lora_into_experts(
             self,
@@ -130,22 +128,24 @@ class MoEBlock(nn.Module):
         routing_weights = routing_weights.to(input_dtype)
         return cached_experts, routing_weights
 
-    def forward(self, hidden_states: torch.Tensor):
-        """Forward pass.
+    def route(self, hidden_states: torch.Tensor):
+        """Compute routing weights and expert assignments.
+
+        Extracts the full routing logic: gate projection (with optional fp32
+        upcast), routing replay stage handling, ``_regather_routing``, and
+        ``train_router`` detach.
 
         Args:
-            hidden_states: ``(batch, seq_len, hidden_dim)``.
+            hidden_states: ``(num_tokens, hidden_dim)`` — already flattened.
 
         Returns:
-            Tuple of ``(output, router_logits)`` where:
-            - output: ``(batch, seq_len, hidden_dim)``
+            Tuple of ``(routing_weights, selected_experts, router_logits)`` where:
+            - routing_weights: ``(num_tokens, top_k)``
+            - selected_experts: ``(num_tokens, top_k)``
             - router_logits: ``(num_tokens, num_experts)``
         """
-        batch_size, sequence_length, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
-
         # Route (optionally upcast to fp32 for numerical alignment with SGLang)
-        if getattr(self, 'config', None) is not None and getattr(self.config, '_router_fp32', False):
+        if getattr(self, "config", None) is not None and getattr(self.config, "_router_fp32", False):
             router_logits = F.linear(hidden_states.float(), self.gate.weight.float())
         else:
             router_logits = self.gate(hidden_states)
@@ -165,7 +165,6 @@ class MoEBlock(nn.Module):
         replay = self._routing_replay
 
         if stage is not None and replay is not None:
-            cached_weights = None
             if stage == "record":
                 # Determine expert selection without creating autograd nodes
                 with torch.no_grad():
@@ -173,44 +172,89 @@ class MoEBlock(nn.Module):
                 replay.record(selected_experts)
             elif stage == "replay_forward":
                 selected_experts = replay.pop_forward()
-                cached_weights = replay.pop_forward_weights()
             elif stage == "replay_backward":
                 selected_experts = replay.pop_backward()
-                cached_weights = replay.pop_backward_weights()
 
-            if cached_weights is not None:
-                # Use pre-populated weights from inference (R3 weight replay)
-                routing_weights = cached_weights.to(hidden_states.dtype)
-            else:
-                # Uniform autograd path: softmax -> gather(cached indices) -> normalize
-                selected_experts, routing_weights = self._regather_routing(
-                    router_logits, selected_experts, hidden_states.dtype
-                )
-        else:
-            # No replay active: use standard router
-            routing_weights, selected_experts = self.router(
-                router_logits, hidden_states.dtype
+            # Uniform autograd path: softmax -> gather(cached indices) -> normalize.
+            # Both forward and recompute go through the same ops so non-reentrant
+            # checkpoint sees identical saved-tensor counts.
+            selected_experts, routing_weights = self._regather_routing(
+                router_logits, selected_experts, hidden_states.dtype
             )
 
-        # When train_router is False, detach routing_weights so the gate is
-        # only trained via auxiliary losses on router_logits, not through
-        # expert computation.
+            if stage == "record":
+                # Cache weights for replay_backward. During checkpoint recompute,
+                # router_logits may differ (non-deterministic attention), so the
+                # regathered weights above could be wrong. We override them below
+                # during replay_backward with these cached values.
+                replay.record_weights(routing_weights)
+            elif stage == "replay_backward":
+                # Override with cached weights to ensure deterministic EP dispatch.
+                # The _regather_routing call above still runs (for autograd graph
+                # structure), but its output is replaced with the recorded values.
+                cached_weights = replay.pop_backward_weights()
+                if cached_weights is not None:
+                    routing_weights = cached_weights.to(hidden_states.dtype)
+            elif stage == "replay_forward":
+                cached_weights = replay.pop_forward_weights()
+                if cached_weights is not None:
+                    routing_weights = cached_weights.to(hidden_states.dtype)
+        else:
+            # No replay active: use standard router
+            routing_weights, selected_experts = self.router(router_logits, hidden_states.dtype)
+
+        ep_dispatch = getattr(self.experts, "ep_dispatch", "alltoall")
+        if self.train_router and ep_dispatch == "deepep":
+            raise AssertionError(
+                "train_router=True is not supported with ep_dispatch='deepep'. "
+                "DeepEP cannot propagate gradients through routing weights. "
+                "Set train_router=False or switch to ep_dispatch='alltoall'."
+            )
         if not self.train_router:
             routing_weights = routing_weights.detach()
 
-        # Expert computation
-        if self.moe_implementation == "eager":
-            final_hidden_states = self._eager_forward(
-                hidden_states, routing_weights, selected_experts
-            )
-        else:
-            final_hidden_states = self.experts(
-                hidden_states, routing_weights, selected_experts
-            )
+        return routing_weights, selected_experts, router_logits
 
-        final_hidden_states = final_hidden_states.reshape(
-            batch_size, sequence_length, hidden_dim
-        )
+    def forward_experts_only(self, hidden_states, routing_weights, selected_experts):
+        """Run expert computation with pre-computed routing weights.
+
+        Args:
+            hidden_states: ``(batch, seq_len, hidden_dim)``.
+            routing_weights: ``(num_tokens, top_k)``.
+            selected_experts: ``(num_tokens, top_k)``.
+
+        Returns:
+            ``(batch, seq_len, hidden_dim)`` expert output.
+        """
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        hidden_states = self.experts(hidden_states, routing_weights, selected_experts)
+        hidden_states = hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        return hidden_states
+
+    def forward(self, hidden_states: torch.Tensor):
+        """Forward pass.
+
+        Args:
+            hidden_states: ``(batch, seq_len, hidden_dim)``.
+
+        Returns:
+            Tuple of ``(output, router_logits)`` where:
+            - output: ``(batch, seq_len, hidden_dim)``
+            - router_logits: ``(num_tokens, num_experts)``
+        """
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        flat_hidden_states = hidden_states.view(-1, hidden_dim)
+
+        routing_weights, selected_experts, router_logits = self.route(flat_hidden_states)
+
+        # Expert computation (already flat — call experts directly to avoid extra reshape)
+        if self.moe_implementation == "eager":
+            final_hidden_states = self._eager_forward(flat_hidden_states, routing_weights, selected_experts)
+        else:
+            final_hidden_states = self.experts(flat_hidden_states, routing_weights, selected_experts)
+        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+
         return final_hidden_states, router_logits
 
     def _eager_forward(
@@ -223,21 +267,16 @@ class MoEBlock(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         final_hidden_states = torch.zeros_like(hidden_states)
 
-        expert_mask = torch.nn.functional.one_hot(
-            selected_experts, num_classes=self.num_experts
-        ).permute(2, 1, 0)
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
 
         for expert_idx in range(self.num_experts):
             idx, top_x = torch.where(expert_mask[expert_idx])
 
             current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
             current_hidden_states = (
-                self.experts(current_state, expert_idx=expert_idx)
-                * routing_weights[top_x, idx, None]
+                self.experts(current_state, expert_idx=expert_idx) * routing_weights[top_x, idx, None]
             )
-            final_hidden_states.index_add_(
-                0, top_x, current_hidden_states.to(hidden_states.dtype)
-            )
+            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
 
         return final_hidden_states
 
@@ -252,5 +291,5 @@ class MoEBlock(nn.Module):
             hidden_act=config.hidden_act,
             norm_topk_prob=config.norm_topk_prob,
             moe_implementation=moe_implementation,
-            train_router=getattr(config, "train_router", True),
+            train_router=getattr(config, "train_router", False),
         )

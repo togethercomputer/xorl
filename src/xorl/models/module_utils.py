@@ -1,30 +1,36 @@
-
 import json
+import math
 import os
 import re
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import timedelta
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, List, Literal, Optional, Sequence, Set, Tuple, Union
 
 import torch
-
-
+from safetensors import safe_open
+from safetensors.torch import load_file, save_file
 from torch import distributed as dist
 from torch import nn
+from torch.distributed._tensor import Shard as DTShard
 from tqdm import tqdm
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGHTS_INDEX_NAME, WEIGHTS_NAME
 from transformers.utils.hub import cached_file, get_checkpoint_shard_files
-from safetensors import safe_open
-from safetensors.torch import load_file, save_file
 
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.lora.modules.linear import LoraLinear
+from xorl.models.checkpoint_handlers.buffers import (  # noqa: F401
+    ExpertWeightBuffer,
+    checkpoint_has_per_expert_weights,
+    parse_expert_key,
+)
 from xorl.ops.loss import get_loss_function
 from xorl.utils import logging
-from xorl.utils.device import synchronize
+from xorl.utils.device import get_device_id, get_device_type, synchronize
 from xorl.utils.helper import empty_cache, get_dtype_size
 
 
@@ -39,13 +45,55 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 
+_cpu_group = None
+_weight_load_group = None
 
-# Re-export checkpoint handler utilities for backward compatibility (used by tests)
-from xorl.models.checkpoint_handlers.buffers import (  # noqa: F401
-    ExpertWeightBuffer,
-    parse_expert_key,
-    checkpoint_has_per_expert_weights,
-)
+
+def _get_cpu_group():
+    """Get or create a Gloo process group for CPU-based broadcasts.
+
+    Using Gloo instead of the default NCCL backend avoids deadlocks when
+    broadcast_object_list is the first collective operation (NCCL lazy init
+    can hang if not all ranks are ready simultaneously).
+    """
+    global _cpu_group
+    if _cpu_group is None and dist.is_initialized():
+        _cpu_group = dist.new_group(backend="gloo")
+    return _cpu_group
+
+
+def _get_weight_load_group():
+    """Get or create a dedicated process group for weight loading.
+
+    Weight loading can spend many minutes in rank-0 shard I/O between collectives.
+    Use a separate process group with a larger timeout so NCCL does not trip the
+    default watchdog while other ranks are waiting for the next broadcast.
+    """
+    global _weight_load_group
+    if _weight_load_group is None and dist.is_initialized():
+        timeout_sec = int(os.getenv("XORL_WEIGHT_LOAD_TIMEOUT_SEC", "7200"))
+        _weight_load_group = dist.new_group(backend=dist.get_backend(), timeout=timedelta(seconds=timeout_sec))
+    return _weight_load_group
+
+
+def _get_weight_load_object_device() -> Optional[torch.device]:
+    """Return the device to use for NCCL object broadcasts in the load path."""
+    group = _get_weight_load_group()
+    if group is None:
+        return None
+    if dist.get_backend(group) == "nccl":
+        return torch.device(f"{get_device_type()}:{get_device_id()}")
+    return None
+
+
+def _broadcast_object_list_weight_load(obj_list: List[Any], src: int) -> None:
+    """Broadcast Python metadata for weight loading on the dedicated load group."""
+    group = _get_weight_load_group()
+    device = _get_weight_load_object_device()
+    kwargs = {"src": src, "group": group}
+    if device is not None:
+        kwargs["device"] = device
+    dist.broadcast_object_list(obj_list, **kwargs)
 
 
 def _get_checkpoint_keys(weights_path: str) -> Optional[Set[str]]:
@@ -93,7 +141,6 @@ def _get_checkpoint_keys(weights_path: str) -> Optional[Set[str]]:
             return None
 
     return None
-
 
 
 @contextmanager
@@ -209,8 +256,6 @@ def _prefetch_shards(
             more CPU memory but can increase NFS throughput via concurrent reads.
             Default 1 (single background thread, same as before).
     """
-    from collections import deque
-    from concurrent.futures import ThreadPoolExecutor
 
     if not state_dict_iterators:
         return
@@ -246,8 +291,6 @@ def _prefetch_shards_filtered(
 
     Yields (state_dict, skipped_keys) tuples.
     """
-    from collections import deque
-    from concurrent.futures import ThreadPoolExecutor
 
     if not state_dict_iterators:
         return
@@ -284,14 +327,14 @@ def _load_state_dict(weights_path: str, **kwargs) -> List["StateDictIterator"]:
     """
     Loads (sharded) state dict in transformers' format.
     """
-    import time
+
     max_retries = 5
     for attempt in range(max_retries):
         result = _try_load_state_dict(weights_path, **kwargs)
         if result is not None:
             return result
         if attempt < max_retries - 1:
-            retry_delay = 2 * (2 ** attempt)  # 2, 4, 8, 16s
+            retry_delay = 2 * (2**attempt)  # 2, 4, 8, 16s
             logger.warning(
                 f"Cannot find checkpoint files in {weights_path} (attempt {attempt + 1}/{max_retries}). "
                 f"Retrying in {retry_delay}s..."
@@ -303,7 +346,47 @@ def _load_state_dict(weights_path: str, **kwargs) -> List["StateDictIterator"]:
 def _try_load_state_dict(weights_path: str, **kwargs):
     """
     Single attempt to load state dict. Returns list of iterators or None if not found.
+
+    Rank 0 resolves all file paths (cached_file + get_checkpoint_shard_files)
+    and broadcasts the result to other ranks. This avoids N-way filesystem
+    hammering and keeps the broadcast-loading path rank-0-driven.
     """
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+
+    if world_size <= 1:
+        # Single rank: do everything locally (no broadcast needed)
+        return _try_load_state_dict_local(weights_path, **kwargs)
+
+    # Multi-rank: rank 0 resolves paths, broadcasts to all
+    resolved_paths = [None]
+    if rank == 0:
+        max_retries = 10
+        for attempt in range(max_retries):
+            try:
+                result = _try_load_state_dict_local(weights_path, **kwargs)
+                if result is not None:
+                    resolved_paths[0] = [it.filepath for it in result]
+                break
+            except OSError as e:
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f"OSError resolving shard files (attempt {attempt + 1}/{max_retries}): {e}. Retrying in 5s..."
+                    )
+                    time.sleep(5)
+                else:
+                    logger.error(f"Failed to resolve shard files after {max_retries} attempts")
+                    raise
+
+    _broadcast_object_list_weight_load(resolved_paths, src=0)
+    shard_files = resolved_paths[0]
+    if shard_files is None:
+        return None
+    return [StateDictIterator(f) for f in shard_files]
+
+
+def _try_load_state_dict_local(weights_path: str, **kwargs):
+    """Resolve shard file paths locally (no broadcast). Used by rank 0 or single-rank."""
     cache_kwargs = {"_raise_exceptions_for_missing_entries": False, **kwargs}
     resolved_weight_file = cached_file(weights_path, SAFE_WEIGHTS_NAME, **cache_kwargs)
     if resolved_weight_file:
@@ -311,24 +394,8 @@ def _try_load_state_dict(weights_path: str, **kwargs):
 
     resolved_weight_file = cached_file(weights_path, SAFE_WEIGHTS_INDEX_NAME, **cache_kwargs)
     if resolved_weight_file:
-        # Retry on OSError (e.g., missing shard files during download)
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                shard_files, _ = get_checkpoint_shard_files(weights_path, resolved_weight_file, **kwargs)
-                return [StateDictIterator(shard_file) for shard_file in shard_files]
-            except OSError as e:
-                if attempt < max_retries - 1:
-                    import time
-                    retry_delay = 5
-                    logger.warning(
-                        f"OSError getting shard files (attempt {attempt + 1}/{max_retries}): {e}. "
-                        f"Retrying in {retry_delay}s..."
-                    )
-                    time.sleep(retry_delay)
-                else:
-                    logger.error(f"Failed to get shard files after {max_retries} attempts")
-                    raise
+        shard_files, _ = get_checkpoint_shard_files(weights_path, resolved_weight_file, **kwargs)
+        return [StateDictIterator(shard_file) for shard_file in shard_files]
 
     resolved_weight_file = cached_file(weights_path, WEIGHTS_NAME, **cache_kwargs)
     if resolved_weight_file:
@@ -336,24 +403,8 @@ def _try_load_state_dict(weights_path: str, **kwargs):
 
     resolved_weight_file = cached_file(weights_path, WEIGHTS_INDEX_NAME, **cache_kwargs)
     if resolved_weight_file:
-        # Retry on OSError (e.g., missing shard files during download)
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                shard_files, _ = get_checkpoint_shard_files(weights_path, resolved_weight_file, **kwargs)
-                return [StateDictIterator(shard_file) for shard_file in shard_files]
-            except OSError as e:
-                if attempt < max_retries - 1:
-                    import time
-                    retry_delay = 5
-                    logger.warning(
-                        f"OSError getting PT shard files (attempt {attempt + 1}/{max_retries}): {e}. "
-                        f"Retrying in {retry_delay}s..."
-                    )
-                    time.sleep(retry_delay)
-                else:
-                    logger.error(f"Failed to get PT shard files after {max_retries} attempts")
-                    raise
+        shard_files, _ = get_checkpoint_shard_files(weights_path, resolved_weight_file, **kwargs)
+        return [StateDictIterator(shard_file) for shard_file in shard_files]
 
     return None
 
@@ -396,6 +447,64 @@ def _build_compiled_key_map(
     return mapping
 
 
+def _get_expert_scatter_target_shape(
+    model: Union["nn.Module", "PreTrainedModel"],
+    parameter_name: str,
+    tensor: "torch.Tensor",
+    parallel_plan: Optional["ParallelPlan"],
+    parallel_state,
+) -> Optional[Tuple[int, ...]]:
+    """Return the EP-local parameter shape if this tensor can be rank0-scattered.
+
+    We only use this optimized path when the current rank topology has a simple
+    2D EP mesh (ep, ep_fsdp). More complex layouts, such as PP+EP, fall back to
+    the existing full-tensor broadcast path.
+    """
+    if (
+        parallel_plan is None
+        or not parallel_state.ep_enabled
+        or parallel_state.ep_fsdp_device_mesh is None
+        or parallel_state.ep_fsdp_device_mesh.mesh.ndim != 2
+        or not parallel_plan._is_expert_parameter(parameter_name)
+    ):
+        return None
+
+    module, local_name = _find_submodule(model, parameter_name)
+    param = module._parameters.get(local_name)
+    if param is None or param.ndim == 0 or tensor.ndim == 0:
+        return None
+
+    target_shape = tuple(param.shape)
+    if not target_shape or tensor.shape[0] <= target_shape[0] or tensor.shape[0] % target_shape[0] != 0:
+        return None
+
+    return target_shape
+
+
+def _build_expert_scatter_list(
+    tensor: "torch.Tensor",
+    target_shape: Tuple[int, ...],
+    parallel_state,
+    torch_device: "torch.device",
+) -> Tuple["torch.Tensor", List["torch.Tensor"]]:
+    """Prepare rank0-side per-rank expert views for NCCL scatter."""
+    if tensor.device.type == "cpu" and torch_device.type == "cuda":
+        full_tensor = tensor.pin_memory().to(torch_device, non_blocking=True)
+    else:
+        full_tensor = tensor.to(torch_device, non_blocking=True)
+
+    ep_mesh = parallel_state.ep_fsdp_device_mesh.mesh.cpu()
+    local_experts = target_shape[0]
+    scatter_list: List[torch.Tensor] = [None] * int(ep_mesh.numel())
+    for ep_rank in range(ep_mesh.shape[0]):
+        local_view = full_tensor.narrow(0, ep_rank * local_experts, local_experts)
+        for ep_fsdp_rank in range(ep_mesh.shape[1]):
+            global_rank = int(ep_mesh[ep_rank, ep_fsdp_rank])
+            scatter_list[global_rank] = local_view
+
+    return full_tensor, scatter_list
+
+
 class _MultiStreamDMA:
     """Manages multi-stream H2D DMA transfers for overlapping copy engine usage.
 
@@ -429,9 +538,7 @@ class _MultiStreamDMA:
         to avoid interleaving no-op distribute_tensor calls (ep_fsdp mesh,
         size 1) with real NCCL collectives (fsdp mesh, size > 1).
         """
-        assert tensor.device.type == "cpu", (
-            f"DMA scheduler only handles CPU→CUDA, got {tensor.device} for {full_name}"
-        )
+        assert tensor.device.type == "cpu", f"DMA scheduler only handles CPU→CUDA, got {tensor.device} for {full_name}"
         if tensor.dtype != orig_tensor.dtype:
             tensor = tensor.to(dtype=orig_tensor.dtype)
         pinned = tensor.pin_memory()
@@ -457,9 +564,7 @@ class _MultiStreamDMA:
             if dtensor_factory is not None and hasattr(orig_tensor, "device_mesh"):
                 device_mesh = getattr(orig_tensor, "device_mesh")
                 placements = getattr(orig_tensor, "placements")
-                module._parameters[local_name].data.copy_(
-                    dtensor_factory(gpu_temp, device_mesh, placements)
-                )
+                module._parameters[local_name].data.copy_(dtensor_factory(gpu_temp, device_mesh, placements))
                 # distribute_tensor uses NCCL on a different CUDA stream.
                 # Synchronize to prevent races with subsequent DMA transfers
                 # on the copy-engine streams.
@@ -505,11 +610,7 @@ def _dispatch_parameter(
     # would interleave no-op distribute_tensor calls (expert params on
     # ep_fsdp mesh, size 1) with real NCCL collectives (regular params on
     # fsdp mesh, size > 1), which can corrupt weights.
-    if (
-        _active_dma_scheduler is not None
-        and tensor.device.type == "cpu"
-        and orig_tensor.device.type == "cuda"
-    ):
+    if _active_dma_scheduler is not None and tensor.device.type == "cpu" and orig_tensor.device.type == "cuda":
         _active_dma_scheduler.dispatch(module, local_name, tensor, orig_tensor, dtensor_factory, full_param_name)
         return
 
@@ -536,7 +637,7 @@ def _dispatch_parameter(
         if orig_tensor.device.type == "cpu":
             # CPU DTensor: copy shard directly into local tensor.
             # distribute_tensor doesn't support CPU mesh, so we manually shard and copy.
-            from torch.distributed._tensor import Shard as DTShard
+
             shard_dim = None
             for p in placements:
                 if isinstance(p, DTShard):
@@ -596,8 +697,6 @@ def _init_parameter(
     - lora_A: kaiming uniform initialization
     - lora_B: zeros (so LoRA has no effect at start)
     """
-    import torch.nn as nn
-    import math
 
     # Check if this is a LoRA parameter and handle specially
     if "lora_A" in name or "lora_B" in name:
@@ -662,7 +761,6 @@ def _convert_weight_key(key: str, model: "PreTrainedModel") -> str:
             return converted_key
 
     return key
-
 
 
 def _shrink_expert_params_for_ep(model: "nn.Module") -> None:
@@ -762,7 +860,7 @@ def all_ranks_load_weights(
         )
 
     # Retry loading state dict on OSError (e.g., HuggingFace download issues)
-    max_retries = 3
+    max_retries = 10
     retry_delay = 5  # seconds
     last_error = None
 
@@ -777,7 +875,6 @@ def all_ranks_load_weights(
                     f"OSError loading weights (attempt {attempt + 1}/{max_retries}): {e}. "
                     f"Retrying in {retry_delay} seconds..."
                 )
-                import time
                 time.sleep(retry_delay)
             else:
                 logger.error(f"Failed to load weights after {max_retries} attempts")
@@ -928,7 +1025,10 @@ def all_ranks_load_weights(
         _active_dma_scheduler = None
 
     post_process_after_weight_loading(
-        model, buffer_dict, parameter_names_to_load, dtensor_factory,
+        model,
+        buffer_dict,
+        parameter_names_to_load,
+        dtensor_factory,
         qlora_skip_prefixes=_expected_skip_prefixes,
         qlora_skip_fn=_should_skip_qlora_expert_key,
     )
@@ -984,6 +1084,7 @@ def rank0_load_and_broadcast_weights(
             is_broadcast=True,
             weights_path=weights_path,
         )
+    skip_key_fn = handler.get_skip_key_fn() if handler is not None else None
 
     # When PP is enabled, gather expected keys from all ranks so we can distinguish
     # "key belongs to another PP stage" (expected) from "truly unexpected key" (warning).
@@ -995,23 +1096,28 @@ def rank0_load_and_broadcast_weights(
     else:
         global_expected_keys = None
 
-    # Get the safetensor file iterators
-    state_dict_iterators = _load_state_dict(weights_path) if global_rank == 0 else None
-    shard_count = len(state_dict_iterators) if global_rank == 0 else 0
+    # All ranks must enter _load_state_dict(): in multi-rank mode it contains
+    # the collective that receives the rank-0-resolved shard paths.
+    state_dict_iterators = _load_state_dict(weights_path)
+    shard_count = len(state_dict_iterators)
     logger.info_rank0(f"rank0_load_and_broadcast_weights: {shard_count=} ")
     shard_count_tensor = torch.tensor(
         [shard_count],
         dtype=torch.int64,
         device=torch_device if torch_device.type != "cpu" else torch.device("cpu"),
     )
-    dist.broadcast(shard_count_tensor, src=0)
+    dist.broadcast(shard_count_tensor, src=0, group=_get_weight_load_group())
     shard_count = int(shard_count_tensor.item())
 
     # Rank 0: create prefetching generator that bulk-loads upcoming shards in
     # background threads while the current shard is being broadcast.
     # prefetch_count=2 allows 2 concurrent NFS reads for higher aggregate throughput.
     if global_rank == 0:
-        prefetched = _prefetch_shards(state_dict_iterators, prefetch_count=2)
+        if skip_key_fn is not None:
+            logger.info_rank0("Filtered broadcast loading enabled on rank 0 for handler-skipped checkpoint keys")
+            prefetched = _prefetch_shards_filtered(state_dict_iterators, skip_key_fn, prefetch_count=2)
+        else:
+            prefetched = _prefetch_shards(state_dict_iterators, prefetch_count=2)
 
     if global_rank == 0:
         shard_range = tqdm(
@@ -1030,7 +1136,13 @@ def rank0_load_and_broadcast_weights(
         # all tensors through the checkpoint handler. While this runs, the
         # background thread is already loading the *next* shard from disk.
         if global_rank == 0:
-            state_dict = next(prefetched)
+            skipped_keys = []
+            if skip_key_fn is not None:
+                state_dict, skipped_keys = next(prefetched)
+                for skipped_key in skipped_keys:
+                    merged_queue.extend(handler.on_skip_weight(skipped_key))
+            else:
+                state_dict = next(prefetched)
             for key, tensor in state_dict.items():
                 key = _convert_weight_key(key, model)
                 if handler is not None:
@@ -1045,33 +1157,61 @@ def rank0_load_and_broadcast_weights(
         # broadcast tensors one by one.  This replaces N metadata broadcasts
         # with 1, eliminating per-tensor pickle + NCCL launch overhead.
         if global_rank == 0:
-            batch_meta = [(n, t.shape, t.dtype) for n, t in merged_queue]
+            batch_meta = []
+            for name, tensor in merged_queue:
+                model_name = _compiled_key_map.get(name, name)
+                target_shape = None
+                if model_name in parameter_names_to_load:
+                    target_shape = _get_expert_scatter_target_shape(model, model_name, tensor, parallel_plan, _ps)
+                if target_shape is not None:
+                    batch_meta.append((name, torch.Size(target_shape), tensor.dtype, "expert_scatter"))
+                else:
+                    batch_meta.append((name, tensor.shape, tensor.dtype, "broadcast"))
         else:
             batch_meta = None
 
         batch_meta = [batch_meta]
-        dist.broadcast_object_list(batch_meta, src=0)
+        _broadcast_object_list_weight_load(batch_meta, src=0)
         batch_meta = batch_meta[0]
 
-        for name, shape, dtype in batch_meta:
-            # Broadcast tensor from rank 0 to all ranks.
-            # For expert tensors, this broadcasts the full [num_experts, ...] tensor;
-            # _dispatch_parameter -> shard_tensor handles EP slicing locally per rank.
-            if global_rank != 0:
-                tensor = torch.empty(shape, dtype=dtype, device=torch_device)
+        for name, shape, dtype, transfer_mode in batch_meta:
+            if global_rank == 0:
+                _, source_tensor = merged_queue.pop(0)
             else:
-                _, broadcast_tensor = merged_queue.pop(0)
-                if broadcast_tensor.device.type == "cpu" and torch_device.type == "cuda":
-                    tensor = broadcast_tensor.pin_memory().to(torch_device, non_blocking=True)
-                else:
-                    tensor = broadcast_tensor.to(torch_device, non_blocking=True)
+                source_tensor = None
 
             start_time = time.perf_counter()
-            dist.broadcast(tensor, src=0)
-            logger.info_rank0(
-                f"{name=}, {shape=}, {dtype=}, broadcast time (ms): "
-                f"{1000 * (time.perf_counter() - start_time)}"
-            )
+            if transfer_mode == "expert_scatter":
+                if global_rank == 0:
+                    full_tensor, scatter_list = _build_expert_scatter_list(
+                        source_tensor, tuple(shape), _ps, torch_device
+                    )
+                    tensor = scatter_list[global_rank].clone()
+                    full_shape = tuple(source_tensor.shape)
+                else:
+                    full_tensor = None
+                    scatter_list = None
+                    tensor = torch.empty(shape, dtype=dtype, device=torch_device)
+                    full_shape = shape
+
+                dist.scatter(tensor, scatter_list=scatter_list, src=0, group=_get_weight_load_group())
+                logger.info_rank0(
+                    f"{name=}, full_shape={full_shape}, local_shape={shape}, {dtype=}, "
+                    f"scatter time (ms): {1000 * (time.perf_counter() - start_time)}"
+                )
+            else:
+                if global_rank != 0:
+                    tensor = torch.empty(shape, dtype=dtype, device=torch_device)
+                else:
+                    if source_tensor.device.type == "cpu" and torch_device.type == "cuda":
+                        tensor = source_tensor.pin_memory().to(torch_device, non_blocking=True)
+                    else:
+                        tensor = source_tensor.to(torch_device, non_blocking=True)
+
+                dist.broadcast(tensor, src=0, group=_get_weight_load_group())
+                logger.info_rank0(
+                    f"{name=}, {shape=}, {dtype=}, broadcast time (ms): {1000 * (time.perf_counter() - start_time)}"
+                )
 
             # Resolve _orig_mod prefix from torch.compile
             model_name = _compiled_key_map.get(name, name)
@@ -1086,7 +1226,10 @@ def rank0_load_and_broadcast_weights(
 
             del tensor
             if global_rank == 0:
-                del broadcast_tensor
+                del source_tensor
+                if transfer_mode == "expert_scatter":
+                    del full_tensor
+                    del scatter_list
 
         empty_cache()
 
@@ -1096,25 +1239,47 @@ def rank0_load_and_broadcast_weights(
 
     # Broadcast remaining items from handler flush (same batched pattern)
     if global_rank == 0:
-        flush_meta = [(n, t.shape, t.dtype) for n, t in merged_queue]
+        flush_meta = []
+        for name, tensor in merged_queue:
+            model_name = _compiled_key_map.get(name, name)
+            target_shape = None
+            if model_name in parameter_names_to_load:
+                target_shape = _get_expert_scatter_target_shape(model, model_name, tensor, parallel_plan, _ps)
+            if target_shape is not None:
+                flush_meta.append((name, torch.Size(target_shape), tensor.dtype, "expert_scatter"))
+            else:
+                flush_meta.append((name, tensor.shape, tensor.dtype, "broadcast"))
     else:
         flush_meta = None
 
     flush_meta = [flush_meta]
-    dist.broadcast_object_list(flush_meta, src=0)
+    _broadcast_object_list_weight_load(flush_meta, src=0)
     flush_meta = flush_meta[0]
 
-    for name, shape, dtype in flush_meta:
-        if global_rank != 0:
-            tensor = torch.empty(shape, dtype=dtype, device=torch_device)
+    for name, shape, dtype, transfer_mode in flush_meta:
+        if global_rank == 0:
+            _, source_tensor = merged_queue.pop(0)
         else:
-            _, broadcast_tensor = merged_queue.pop(0)
-            if broadcast_tensor.device.type == "cpu" and torch_device.type == "cuda":
-                tensor = broadcast_tensor.pin_memory().to(torch_device, non_blocking=True)
-            else:
-                tensor = broadcast_tensor.to(torch_device, non_blocking=True)
+            source_tensor = None
 
-        dist.broadcast(tensor, src=0)
+        if transfer_mode == "expert_scatter":
+            if global_rank == 0:
+                full_tensor, scatter_list = _build_expert_scatter_list(source_tensor, tuple(shape), _ps, torch_device)
+                tensor = scatter_list[global_rank].clone()
+            else:
+                full_tensor = None
+                scatter_list = None
+                tensor = torch.empty(shape, dtype=dtype, device=torch_device)
+            dist.scatter(tensor, scatter_list=scatter_list, src=0, group=_get_weight_load_group())
+        else:
+            if global_rank != 0:
+                tensor = torch.empty(shape, dtype=dtype, device=torch_device)
+            else:
+                if source_tensor.device.type == "cpu" and torch_device.type == "cuda":
+                    tensor = source_tensor.pin_memory().to(torch_device, non_blocking=True)
+                else:
+                    tensor = source_tensor.to(torch_device, non_blocking=True)
+            dist.broadcast(tensor, src=0, group=_get_weight_load_group())
 
         # Resolve _orig_mod prefix from torch.compile
         model_name = _compiled_key_map.get(name, name)
@@ -1124,7 +1289,10 @@ def rank0_load_and_broadcast_weights(
 
         del tensor
         if global_rank == 0:
-            del broadcast_tensor
+            del source_tensor
+            if transfer_mode == "expert_scatter":
+                del full_tensor
+                del scatter_list
 
     post_process_after_weight_loading(model, buffer_dict, parameter_names_to_load, dtensor_factory)
 
@@ -1335,11 +1503,17 @@ def save_model_weights(
                     logger.warning(f"Model asset {model_asset} should implement `save_pretrained`.")
 
 
-
 def save_model_assets(output_dir: Union[str, "os.PathLike"], model_assets: Sequence["ModelAssets"]):
+    from transformers import PretrainedConfig, PreTrainedTokenizerBase
+
     for model_asset in model_assets:
         if hasattr(model_asset, "save_pretrained"):
-            model_asset.save_pretrained(output_dir)
+            try:
+                model_asset.save_pretrained(output_dir)
+            except TypeError as e:
+                if isinstance(model_asset, (PretrainedConfig, PreTrainedTokenizerBase)):
+                    raise
+                logger.warning(f"Skipping {type(model_asset).__name__}.save_pretrained(): {e}")
         else:
             logger.warning(f"Model asset {model_asset} should implement `save_pretrained`.")
 
@@ -1419,6 +1593,98 @@ class GradientCheckpointingLayer(nn.Module):
     gradient_checkpointing = False
 
     def __call__(self, *args, **kwargs):
-        if self.gradient_checkpointing and self.training:
+        if (
+            self.gradient_checkpointing
+            and self.training
+            and getattr(self, "_gradient_checkpointing_method", "recompute_full_layer") == "recompute_full_layer"
+        ):
             return self._gradient_checkpointing_func(partial(super().__call__, **kwargs), *args)
         return super().__call__(*args, **kwargs)
+
+
+class MoEGradientCheckpointingLayer(nn.Module):
+    """Base class for MoE decoder layers with selective gradient checkpointing.
+
+    Subclasses implement ``_pre_mlp_forward(hidden_states, **kwargs)`` which runs
+    layernorm → attention → layernorm and returns ``(hidden_states, residual)``.
+
+    The checkpointing branching is handled automatically:
+
+    - ``recompute_full_layer``: outer checkpoint wraps the entire layer
+      (handled by ``GradientCheckpointingLayer`` on the model-level loop).
+    - ``recompute_before_dispatch``: this class checkpoints attn+layernorm+router
+      via ``_pre_dispatch_forward``, then runs dispatch+expert+combine outside.
+    - ``no_recompute``: no checkpointing, runs normally.
+
+    Works with both alltoall and DeepEP backends since dispatch/combine sit
+    outside the checkpoint boundary.
+    """
+
+    gradient_checkpointing = False
+
+    def _pre_mlp_forward(self, hidden_states, **kwargs):
+        """Layernorm → attention → layernorm. Override per model.
+
+        Returns:
+            ``(hidden_states, residual)``
+        """
+        raise NotImplementedError
+
+    def _pre_dispatch_forward(self, hidden_states, **kwargs):
+        """Layernorm → attention → layernorm → router.
+
+        Composed from ``_pre_mlp_forward`` + ``self.mlp.route()``.
+        Override only if the model needs custom routing (rare).
+        """
+        hidden_states, residual = self._pre_mlp_forward(hidden_states, **kwargs)
+        # route() expects flattened (num_tokens, hidden_dim); hidden_states is 3-D here.
+        orig_shape = hidden_states.shape
+        flat = hidden_states.view(-1, orig_shape[-1])
+        routing_weights, selected_experts, router_logits = self.mlp.route(flat)
+        return hidden_states, residual, routing_weights, selected_experts, router_logits
+
+    def _moe_forward(self, hidden_states, output_router_logits=False, **kwargs):
+        """Forward with selective checkpointing. Called by subclass ``forward()``.
+
+        Args:
+            hidden_states: ``(batch, seq_len, hidden_dim)``.
+            output_router_logits: Whether to include router logits in output.
+            **kwargs: Forwarded to ``_pre_mlp_forward`` (attention_mask, position_embeddings, etc.)
+
+        Returns:
+            Tuple of ``(hidden_states, ...)`` with optional router_logits.
+        """
+        from xorl.distributed.moe.deepep import sync_pending_combine
+        from xorl.models.layers.moe.moe_block import MoEBlock
+
+        _selective = (
+            self.training
+            and getattr(self, "gradient_checkpointing", False)
+            and getattr(self, "_gradient_checkpointing_method", "recompute_full_layer") != "recompute_full_layer"
+        )
+        _is_moe = isinstance(self.mlp, MoEBlock)
+
+        if _selective and _is_moe:
+            moe_input, residual, routing_weights, selected_experts, router_logits = self._gradient_checkpointing_func(
+                self._pre_dispatch_forward, hidden_states, **kwargs
+            )
+            hidden_states = self.mlp.forward_experts_only(moe_input, routing_weights, selected_experts)
+        elif _selective:
+            hidden_states, residual = self._gradient_checkpointing_func(self._pre_mlp_forward, hidden_states, **kwargs)
+            hidden_states = self.mlp(hidden_states)
+            router_logits = None
+        else:
+            hidden_states, residual = self._pre_mlp_forward(hidden_states, **kwargs)
+            hidden_states = self.mlp(hidden_states)
+            if isinstance(hidden_states, tuple):
+                hidden_states, router_logits = hidden_states
+            else:
+                router_logits = None
+
+        sync_pending_combine()
+        hidden_states = residual + hidden_states
+
+        outputs = (hidden_states,)
+        if output_router_logits:
+            outputs += (router_logits,)
+        return outputs

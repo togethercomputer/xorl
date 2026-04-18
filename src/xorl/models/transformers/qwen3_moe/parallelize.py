@@ -53,9 +53,8 @@ def get_ep_plan():
     LoRA weights are initialized at GLOBAL shape and sharded here.
     """
     ep_plan = {
-        # Expert weights (stacked [num_experts, H, I] format)
-        "model.layers.*.mlp.experts.gate_proj": Shard(0),
-        "model.layers.*.mlp.experts.up_proj": Shard(0),
+        # Expert weights (stacked [num_experts, H, 2I] format)
+        "model.layers.*.mlp.experts.gate_up_proj": Shard(0),
         "model.layers.*.mlp.experts.down_proj": Shard(0),
         # LoRA weights for experts
         "model.layers.*.mlp.experts.gate_proj_lora_A": Shard(0),

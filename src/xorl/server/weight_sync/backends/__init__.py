@@ -2,6 +2,7 @@
 
 from .base import TransportConfig, WeightTransportBackend
 
+
 __all__ = [
     "TransportConfig",
     "WeightTransportBackend",
@@ -25,9 +26,7 @@ def create_backend(
         connected — call :meth:`initialize` before transferring).
     """
     if method == "nccl_broadcast":
-        from .nccl_broadcast import NCCLBroadcastBackend
+        from .nccl_broadcast import NCCLBroadcastBackend  # noqa: PLC0415
+
         return NCCLBroadcastBackend(config, **kwargs)
-    raise ValueError(
-        f"Unknown weight sync backend: {method!r}. "
-        f"Supported: 'nccl_broadcast'."
-    )
+    raise ValueError(f"Unknown weight sync backend: {method!r}. Supported: 'nccl_broadcast'.")

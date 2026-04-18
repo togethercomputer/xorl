@@ -1,8 +1,8 @@
 # Copyright (C) 2025, Fri Dao.
 import itertools
-from typing import Optional, List, Literal
-from functools import partial
 from dataclasses import dataclass
+from functools import partial
+from typing import List, Literal, Optional
 
 
 @dataclass(frozen=True)
@@ -23,7 +23,8 @@ def get_all_configs(
     tune_coop: bool = True,
     # tune_raster_order=True,
 ) -> List[GemmConfig]:
-    assert device_capacity in [9, 10]
+    if device_capacity not in [9, 10]:
+        return []
     if device_capacity == 9:
         tile_n_vals = [128, 144, 160, 176, 192, 208]
         tile_mn_coop_vals = [(256, tile_n) for tile_n in tile_n_vals] + [
@@ -86,9 +87,7 @@ def get_all_configs(
         max_swizzle_size_vals = [4, 8, 16]
         GemmConfigCls = partial(GemmConfig, pingpong=False)  # There's no pingpong on Sm100
         return [
-            GemmConfigCls(
-                tile_m=m, tile_n=n, cluster_m=cm, cluster_n=cn, swap_ab=sab, max_swizzle_size=ms
-            )
+            GemmConfigCls(tile_m=m, tile_n=n, cluster_m=cm, cluster_n=cn, swap_ab=sab, max_swizzle_size=ms)
             for (m, n, (cm, cn)), sab, ms in itertools.product(
                 tile_mn_cluster_vals, swap_ab_vals, max_swizzle_size_vals
             )

@@ -1,18 +1,17 @@
 # Copyright (c) 2025, Tri Dao
-from typing import Optional, Tuple, Literal
 from functools import partial
+from typing import Literal, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from .gemm_config import GemmConfig, get_all_configs
-
-from .autotuner import autotune, AutotuneConfig
+from .autotuner import AutotuneConfig, autotune
 from .cute_dsl_utils import get_device_capacity
 from .gemm import gemm as gemm_sm90_sm100
 from .gemm_act import gemm_act as gemm_act_sm90_sm100
 from .gemm_act import gemm_gated as gemm_gated_sm90_sm100
+from .gemm_config import GemmConfig, get_all_configs
 from .gemm_dact import gemm_dact as gemm_dact_sm90_sm100
 from .gemm_dact import gemm_dgated as gemm_dgated_sm90_sm100
 from .gemm_symmetric import gemm_symmetric as gemm_symmetric_sm90_sm100
@@ -38,7 +37,7 @@ gated_to_pytorch_fn_map = {
 }
 
 
-default_device_capacity = get_device_capacity(torch.device("cuda"))
+default_device_capacity = get_device_capacity(torch.device("cuda")) if torch.cuda.is_available() else (0, 0)
 
 
 def default_config(device):
@@ -55,18 +54,10 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
     if varlen_m or gather_A:  # Doesn't support swap_ab
         configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
     if gather_A:
-        configs = [
-            conf
-            for conf in configs
-            if conf.kwargs["config"].cluster_n == 1
-        ]
+        configs = [conf for conf in configs if conf.kwargs["config"].cluster_n == 1]
         if get_device_capacity(kwargs["A"].device)[0] == 9:
             # tile_n == 208 causes register spills, as gather_A requires more registers for the producer
-            configs = [
-                conf
-                for conf in configs
-                if conf.kwargs["config"].tile_n != 208
-            ]
+            configs = [conf for conf in configs if conf.kwargs["config"].tile_n != 208]
     return configs
 
 
@@ -122,9 +113,7 @@ def gemm_tuned(
     else:
         out_shape = (batch_size, A.shape[-2], B.shape[-2])
     assert out.shape == out_shape, f"out shape mismatch: {out.shape} vs {out_shape}"
-    tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
-    )
+    tile_count_semaphore = torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
     gemm_sm90_sm100(
         A if not config.swap_ab else B,
         B if not config.swap_ab else A,
@@ -192,9 +181,7 @@ def gemm_act_tuned(
         PostAct = postact_out
     if bias is not None and bias.ndim == 1:
         bias = bias.unsqueeze(0)  # (L, N)
-    tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
-    )
+    tile_count_semaphore = torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
     gemm_act_sm90_sm100(
         A if not config.swap_ab else B,
         B if not config.swap_ab else A,
@@ -255,9 +242,7 @@ def gemm_dact_tuned(
         PostAct = postact_out.unsqueeze(0)
     else:
         PostAct = postact_out
-    tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
-    )
+    tile_count_semaphore = torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
     gemm_dact_sm90_sm100(
         A if not config.swap_ab else B,
         B if not config.swap_ab else A,
@@ -306,9 +291,7 @@ def gemm(
             # For varlen_k, the first dimension is always A.shape[0] (M dimension)
             out_shape = (L, A.shape[0], B.shape[-1])
         else:
-            out_shape = (
-                (A.shape[0], B.shape[-1]) if A.ndim == 2 else (A.shape[0], A.shape[-2], B.shape[-1])
-            )
+            out_shape = (A.shape[0], B.shape[-1]) if A.ndim == 2 else (A.shape[0], A.shape[-2], B.shape[-1])
         out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
     alpha_tensor = alpha if not isinstance(alpha, float) else None
     alpha = alpha if isinstance(alpha, float) else 1.0
@@ -458,9 +441,7 @@ def gemm_add(
             # For varlen_k, the first dimension is always A.shape[0] (M dimension)
             out_shape = (L, A.shape[0], B.shape[-1])
         else:
-            out_shape = (
-                (A.shape[0], B.shape[-1]) if A.ndim == 2 else (A.shape[0], A.shape[-2], B.shape[-1])
-            )
+            out_shape = (A.shape[0], B.shape[-1]) if A.ndim == 2 else (A.shape[0], A.shape[-2], B.shape[-1])
         out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
     add_to_output = C is out and isinstance(beta, float) and beta == 1.0 and cu_seqlens_m is None
     alpha_tensor = alpha if not isinstance(alpha, float) else None
@@ -552,9 +533,7 @@ def gemm_add_ref(
         if isinstance(alpha, float) and isinstance(beta, float):
             out = torch.addmm(C, A, B, out_dtype=out_dtype, alpha=alpha, beta=beta, out=out)
         else:
-            out_dtype = (
-                out.dtype if out is not None else (out_dtype if out_dtype is not None else A.dtype)
-            )
+            out_dtype = out.dtype if out is not None else (out_dtype if out_dtype is not None else A.dtype)
             result = (alpha * (A @ B) + beta * C).to(out_dtype)
             if out is not None:
                 out.copy_(result)
@@ -816,9 +795,7 @@ def gemm_dact(
         dx_out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
     if postact_out is None:
         postact_out = torch.empty(out_shape, dtype=postact_dtype, device=A.device)
-    gemm_dact_out(
-        A, B, PreAct, dx_out, postact_out, activation, cu_seqlens_m, A_idx, dynamic_scheduler, tuned
-    )
+    gemm_dact_out(A, B, PreAct, dx_out, postact_out, activation, cu_seqlens_m, A_idx, dynamic_scheduler, tuned)
     return dx_out, postact_out
 
 
@@ -984,9 +961,7 @@ def gemm_symmetric_out(
         out = out.unsqueeze(0)
     else:
         out = out
-    tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
-    )
+    tile_count_semaphore = torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
     gemm_symmetric_sm90_sm100(
         A,
         B,
@@ -1028,16 +1003,12 @@ def gemm_symmetric(
     alpha_val = alpha if isinstance(alpha, float) else 1.0
     beta_val = beta if isinstance(beta, float) else 1.0
 
-    gemm_symmetric_out(
-        A, B, out, C, dynamic_scheduler=dynamic_scheduler, alpha=alpha_val, beta=beta_val
-    )
+    gemm_symmetric_out(A, B, out, C, dynamic_scheduler=dynamic_scheduler, alpha=alpha_val, beta=beta_val)
     return out
 
 
 @autotune(
-    configs=[
-        AutotuneConfig(config=c) for c in get_all_configs(default_device_capacity[0], "gated")
-    ],
+    configs=[AutotuneConfig(config=c) for c in get_all_configs(default_device_capacity[0], "gated")],
     key=["activation", "dynamic_scheduler"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 )
@@ -1078,9 +1049,7 @@ def gemm_gated_tuned(
         PostAct = postact_out
     if bias is not None and bias.ndim == 1:
         bias = bias.unsqueeze(0)  # (L, N)
-    tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
-    )
+    tile_count_semaphore = torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
     gemm_gated_sm90_sm100(
         A if not config.swap_ab else B,
         B if not config.swap_ab else A,
@@ -1112,9 +1081,7 @@ def prune_invalid_gemm_dgated_configs(configs, named_args: dict, **kwargs):
 
 
 @autotune(
-    configs=[
-        AutotuneConfig(config=c) for c in get_all_configs(default_device_capacity[0], "dgated")
-    ],
+    configs=[AutotuneConfig(config=c) for c in get_all_configs(default_device_capacity[0], "dgated")],
     key=["activation", "colvec_reduce", "dynamic_scheduler"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_dgated_configs},
 )
@@ -1170,9 +1137,7 @@ def gemm_dgated_tuned(
         colvec_reduce_partial = torch.empty(colvec_shape, dtype=torch.float32, device=A.device)
     else:
         colvec_reduce_partial = None
-    tile_count_semaphore = (
-        torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
-    )
+    tile_count_semaphore = torch.zeros(1, dtype=torch.int32, device=A.device) if dynamic_scheduler else None
     gemm_dgated_sm90_sm100(
         A if not config.swap_ab else B,
         B if not config.swap_ab else A,
@@ -1209,9 +1174,7 @@ def gemm_gated(
     bias: Optional[Tensor] = None,  # (N,) or (L, N)
     activation: Literal["swiglu", "swiglu_oai", "reglu", "geglu", "glu"] = "swiglu",
     preact_out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
-    postact_out: Optional[
-        Tensor
-    ] = None,  # (M, N//2) or (L, M, N//2) or (total_M, N//2) if varlen_m
+    postact_out: Optional[Tensor] = None,  # (M, N//2) or (L, M, N//2) or (total_M, N//2) if varlen_m
     out_dtype: Optional[torch.dtype] = None,
     postact_dtype: Optional[torch.dtype] = None,
     cu_seqlens_m: Optional[Tensor] = None,

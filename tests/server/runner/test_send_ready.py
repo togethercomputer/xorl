@@ -11,19 +11,19 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
-from xorl.server.protocol.orchestrator_runner import (
-    RunnerDispatchCommand,
-    MessageType,
-    RunnerAck,
-    RunnerReady,
-    serialize_message,
-    deserialize_message,
-)
 from xorl.server.protocol.operations import (
     EmptyData,
     ModelPassData,
+)
+from xorl.server.protocol.orchestrator_runner import (
+    RunnerAck,
+    RunnerDispatchCommand,
+    RunnerReady,
+    deserialize_message,
+    serialize_message,
 )
 from xorl.server.runner.utils.rank0_protocol import Rank0Protocol
 

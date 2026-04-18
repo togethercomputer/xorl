@@ -1,19 +1,20 @@
 """Checkpoint handler for dense Qwen3_5 models."""
 
+import warnings
 from typing import Callable, List, Optional, Set, Tuple
 
 import torch
 
 from ...checkpoint_handlers.base import CheckpointHandler
 from ...checkpoint_handlers.buffers import (
+    DENSE_DOWN_PROJ_PATTERN,
+    DENSE_GATE_UP_PATTERN,
+    FP8_AUX_SUFFIX_PATTERN,
+    OPROJ_WEIGHT_PATTERN,
+    QKV_PROJ_PATTERN,
+    QUANT_AUX_SUFFIX_PATTERN,
     GateUpMergeBuffer,
     QKVMergeBuffer,
-    QUANT_AUX_SUFFIX_PATTERN,
-    FP8_AUX_SUFFIX_PATTERN,
-    QKV_PROJ_PATTERN,
-    DENSE_GATE_UP_PATTERN,
-    OPROJ_WEIGHT_PATTERN,
-    DENSE_DOWN_PROJ_PATTERN,
 )
 from ..qwen3_5_shared import (
     is_excluded_module_key,
@@ -55,7 +56,9 @@ class Qwen3_5CheckpointHandler(CheckpointHandler):
         self._is_prequantized = is_prequantized
         self._exclude_modules = exclude_modules or set()
 
-    def _handle_linear_attention_weights(self, key: str, tensor: torch.Tensor) -> Optional[List[Tuple[str, torch.Tensor]]]:
+    def _handle_linear_attention_weights(
+        self, key: str, tensor: torch.Tensor
+    ) -> Optional[List[Tuple[str, torch.Tensor]]]:
         return map_qwen3_5_linear_attention_weight(
             key,
             tensor,
@@ -108,9 +111,7 @@ class Qwen3_5CheckpointHandler(CheckpointHandler):
         """Check if a key belongs to a module excluded from quantization."""
         return is_excluded_module_key(key, self._exclude_modules)
 
-    def on_load_weight(
-        self, key: str, tensor: torch.Tensor
-    ) -> List[Tuple[str, torch.Tensor]]:
+    def on_load_weight(self, key: str, tensor: torch.Tensor) -> List[Tuple[str, torch.Tensor]]:
         # Pre-quantized: drop any quant auxiliary or weight keys that weren't
         # caught by get_skip_key_fn (safety net).
         # Excluded modules pass through as bf16 - don't drop them.
@@ -154,8 +155,6 @@ class Qwen3_5CheckpointHandler(CheckpointHandler):
         return [(key, tensor)]
 
     def on_load_complete(self) -> List[Tuple[str, torch.Tensor]]:
-        import warnings
-
         pending_gu = self._gate_up_buffer.get_pending()
         if pending_gu:
             warnings.warn(f"Incomplete gate/up merge pairs after loading: {pending_gu}")
@@ -165,9 +164,7 @@ class Qwen3_5CheckpointHandler(CheckpointHandler):
                 warnings.warn(f"Incomplete QKV merge groups after loading: {pending_qkv}")
         return []
 
-    def on_save_weight(
-        self, param_name: str, tensor: torch.Tensor
-    ) -> List[Tuple[str, torch.Tensor]]:
+    def on_save_weight(self, param_name: str, tensor: torch.Tensor) -> List[Tuple[str, torch.Tensor]]:
         # Split gate_up_proj -> gate_proj + up_proj
         if ".gate_up_proj." in param_name:
             prefix, suffix = param_name.rsplit(".gate_up_proj.", 1)

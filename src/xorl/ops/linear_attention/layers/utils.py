@@ -2,7 +2,6 @@ from __future__ import annotations
 
 # Adapted from flash-linear-attention/fla/layers/utils.py.
 # Portions of this file are adapted from flash-linear-attention, Copyright (c) 2023-2025 Songlin Yang, licensed under the MIT License.
-
 import torch
 from einops import rearrange, repeat
 

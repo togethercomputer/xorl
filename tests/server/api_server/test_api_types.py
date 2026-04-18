@@ -5,29 +5,30 @@ Tests validation, serialization, and edge cases for the updated API structure.
 """
 
 import pytest
-
-pytestmark = [pytest.mark.cpu, pytest.mark.server]
-
 from pydantic import ValidationError
 
 from xorl.server.api_server.api_types import (
+    AdamParams,
+    CreateModelRequest,
     Datum,
     DatumInput,
-    LossFnOutput,
-    AdamParams,
+    ErrorResponse,
     ForwardBackwardRequest,
     ForwardBackwardResponse,
-    OptimStepRequest,
-    OptimStepResponse,
-    SaveWeightsRequest,
-    SaveWeightsResponse,
+    HealthCheckResponse,
     LoadWeightsRequest,
     LoadWeightsResponse,
+    LossFnOutput,
+    OptimStepRequest,
+    OptimStepResponse,
     SaveWeightsForSamplerRequest,
     SaveWeightsForSamplerResponse,
-    HealthCheckResponse,
-    ErrorResponse,
+    SaveWeightsRequest,
+    SaveWeightsResponse,
 )
+
+
+pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
 
 class TestDatumAndForwardBackward:
@@ -90,6 +91,14 @@ class TestDatumAndForwardBackward:
         assert request.forward_backward_input.loss_fn == "causallm_loss"
 
         request = ForwardBackwardRequest(
+            session_id="session-123",
+            forward_backward_input=DatumInput(
+                data=[Datum(model_input={"input_ids": [1, 2, 3]}, loss_fn_inputs={"labels": [2, 3, 4]})],
+            ),
+        )
+        assert request.model_id == "session-123"
+
+        request = ForwardBackwardRequest(
             forward_backward_input=DatumInput(
                 data=[
                     Datum(model_input={"input_ids": [1, 2]}, loss_fn_inputs={"labels": [2, 3]}),
@@ -112,7 +121,8 @@ class TestDatumAndForwardBackward:
         response = ForwardBackwardResponse(
             loss_fn_output_type="multi_loss",
             loss_fn_outputs=[LossFnOutput(loss=2.0), LossFnOutput(loss=3.0)],
-            metrics={}, info={},
+            metrics={},
+            info={},
         )
         assert len(response.loss_fn_outputs) == 2
 
@@ -138,7 +148,9 @@ class TestOptimWeightsHealthAndSerialization:
         assert defaults.eps == 1e-12
 
         request = OptimStepRequest(
-            model_id="test-model", adam_params=AdamParams(learning_rate=1e-4), gradient_clip=1.0,
+            model_id="test-model",
+            adam_params=AdamParams(learning_rate=1e-4),
+            gradient_clip=1.0,
         )
         assert request.model_id == "test-model"
         assert request.adam_params.learning_rate == 1e-4
@@ -150,7 +162,8 @@ class TestOptimWeightsHealthAndSerialization:
         assert request.gradient_clip is None
 
         response = OptimStepResponse(
-            metrics={"grad_norm": 1.234, "learning_rate": 1e-4, "step": 100}, info={},
+            metrics={"grad_norm": 1.234, "learning_rate": 1e-4, "step": 100},
+            info={},
         )
         assert response.metrics["grad_norm"] == 1.234
         response = OptimStepResponse(metrics={}, info={})
@@ -162,6 +175,8 @@ class TestOptimWeightsHealthAndSerialization:
         request = SaveWeightsRequest(model_id="test-model", path="/tmp/checkpoint")
         assert request.model_id == "test-model"
         assert request.path == "/tmp/checkpoint"
+        request = SaveWeightsRequest(session_id="session-123", path="/tmp/checkpoint")
+        assert request.model_id == "session-123"
         request = SaveWeightsRequest()
         assert request.model_id == "default"
         assert request.path is None
@@ -175,11 +190,22 @@ class TestOptimWeightsHealthAndSerialization:
         # LoadWeightsRequest
         request = LoadWeightsRequest(model_id="test-model", path="/tmp/checkpoint", optimizer=True)
         assert request.optimizer is True
+        request = LoadWeightsRequest(session_id="session-123", path="/tmp/checkpoint")
+        assert request.model_id == "session-123"
         request = LoadWeightsRequest(path="/tmp/checkpoint")
         assert request.model_id == "default"
         assert request.optimizer is True
         with pytest.raises(ValidationError):
             LoadWeightsRequest()
+
+        # CreateModelRequest
+        request = CreateModelRequest(
+            session_id="session-123",
+            base_model="Qwen/Qwen3-8B",
+            lora_config={"rank": 64},
+        )
+        assert request.model_id == "session-123"
+        assert request.lora_config["lora_rank"] == 64
 
         # LoadWeightsResponse
         response = LoadWeightsResponse(path="xorl://default/weights/checkpoint-001")
@@ -201,12 +227,18 @@ class TestOptimWeightsHealthAndSerialization:
 
         # HealthCheckResponse
         response = HealthCheckResponse(
-            status="healthy", engine_running=True, active_requests=5, total_requests=100,
+            status="healthy",
+            engine_running=True,
+            active_requests=5,
+            total_requests=100,
         )
         assert response.status == "healthy"
         assert response.engine_running is True
         response = HealthCheckResponse(
-            status="unhealthy", engine_running=False, active_requests=0, total_requests=0,
+            status="unhealthy",
+            engine_running=False,
+            active_requests=0,
+            total_requests=0,
         )
         assert response.engine_running is False
 
@@ -242,7 +274,10 @@ class TestOptimWeightsHealthAndSerialization:
 
         # HealthCheckResponse
         response = HealthCheckResponse(
-            status="healthy", engine_running=True, active_requests=0, total_requests=10,
+            status="healthy",
+            engine_running=True,
+            active_requests=0,
+            total_requests=10,
         )
         data = response.model_dump()
         response2 = HealthCheckResponse(**data)

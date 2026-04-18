@@ -1,16 +1,17 @@
 """MoE ops subpackage — re-exports for backward compatibility."""
 
-from .triton import TritonMoeExpertsFunction, triton_moe_forward, TritonEPGroupGemm
-from .triton_lora import (
-    TritonMoeExpertsLoRAFunction,
-    triton_moe_lora_forward,
-    TritonEPGroupGemmWithLoRA,
-)
 from .lora import (
     make_ep_lora_compute,
     make_local_lora_compute,
 )
-from .quack import quack_moe_forward, QuackEPGroupGemm
+from .quack import QuackEPGroupGemm, quack_moe_forward
+from .triton import TritonEPGroupGemm, TritonMoeExpertsFunction, triton_moe_forward
+from .triton_lora import (
+    TritonEPGroupGemmWithLoRA,
+    TritonMoeExpertsLoRAFunction,
+    triton_moe_lora_forward,
+)
+
 
 try:
     from .quack_lora import QuackEPGroupGemmWithLoRA, quack_moe_lora_forward

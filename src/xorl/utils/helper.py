@@ -9,7 +9,7 @@ import warnings
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import numpy as np
 import psutil
@@ -20,6 +20,12 @@ import transformers
 from transformers import enable_full_determinism
 from transformers import set_seed as set_seed_func
 
+
+try:
+    from pyiceberg.metrics import LoggingMetricsReporter
+except ImportError:
+    LoggingMetricsReporter = None
+
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.utils import logging
 from xorl.utils.count_flops import XorlFlopsCounter
@@ -28,10 +34,12 @@ from xorl.utils.device import (
     get_device_type,
     get_torch_device,
 )
+from xorl.utils.device import (
+    empty_cache as device_empty_cache,
+)
 from xorl.utils.dist_utils import all_reduce
 
 from .multisource_utils import parse_multisource_config
-
 
 
 if TYPE_CHECKING:
@@ -42,28 +50,31 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 CACHE_DIR = os.path.expanduser(os.getenv("CACHE_DIR", os.path.join("~/.cache", "xorl")))
+IS_NPU_AVAILABLE = hasattr(torch, "npu") and torch.npu.is_available()
 
 
-def _get_global_token_count(
-    micro_batch: Dict[str, "torch.Tensor"]
-) -> List[int]:
-    """Return the global (pre-SP-slice) token count for FLOPs accounting.
+def _get_global_token_count(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
+    """Return per-document token counts for FLOPs accounting.
 
-    position_ids is always kept at its full pre-SP-slice length regardless of
-    Ulysses or ring attention, so ``position_ids.shape[-1]`` gives the total
-    tokens processed by the cluster for this step — consistent across all SP
-    modes and equivalent to Megatron's ``global_batch_size × seq_len``.
+    Uses ``_original_position_ids`` (pre-zigzag, pre-SP-padding) so document
+    boundaries are correct even with ring attention. Returns individual document
+    lengths so that ``seqlen_square_sum = sum(s² for s in seqlens)`` correctly
+    reflects flash-attention's per-document O(n²) cost rather than O(packed_n²).
 
-    We intentionally avoid per-document breakdown (pos2culen) here because:
-    - Ring attention zigzag-reorders position_ids, creating false doc boundaries.
-    - For MoE models, attention is a small fraction of total FLOPs so per-doc
-      precision in seqlen² barely affects accuracy.
+    Falls back to [total_seqlen] when position_ids are unavailable or not packed.
 
     Args:
         micro_batch: batch dict as returned by the collator pipeline.
     """
-    position_ids = micro_batch.get("_original_position_ids", micro_batch["position_ids"])
-    return [int(position_ids.shape[-1])]
+    position_ids = micro_batch.get("_original_position_ids", micro_batch.get("position_ids"))
+    if position_ids is None:
+        return [0]
+    pos = position_ids.reshape(-1)
+    starts = (pos == 0).nonzero(as_tuple=True)[0]
+    if len(starts) <= 1:
+        return [int(pos.shape[0])]
+    seqlens = torch.diff(torch.cat([starts, torch.tensor([pos.shape[0]], device=starts.device)])).tolist()
+    return [int(s) for s in seqlens]
 
 
 class EnvironMeter:
@@ -82,9 +93,8 @@ class EnvironMeter:
         global_batch_size: int,
         empty_cache_steps: int = 500,
         gc_steps: int = 0,
-        gc_enabled: bool = False,
-        recompute_modules=None,
-        moe_checkpoint_method=None,
+        gradient_checkpointing_enabled: bool = False,
+        gradient_checkpointing_method=None,
         cp_size: int = 1,
     ) -> None:
         self.config = config
@@ -98,9 +108,8 @@ class EnvironMeter:
 
         self.estimate_flops = XorlFlopsCounter(
             config,
-            gc_enabled=gc_enabled,
-            recompute_modules=recompute_modules,
-            moe_checkpoint_method=moe_checkpoint_method,
+            gradient_checkpointing_enabled=gradient_checkpointing_enabled,
+            gradient_checkpointing_method=gradient_checkpointing_method,
             cp_size=cp_size,
         ).estimate_flops
 
@@ -292,7 +301,7 @@ def enable_high_precision_for_bf16():
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 
-    if IS_NPU_AVAILABLE:
+    if hasattr(torch, "npu") and hasattr(torch.npu, "is_available") and torch.npu.is_available():
         torch.npu.matmul.allow_tf32 = False
         torch.npu.matmul.allow_bf16_reduced_precision_reduction = False
 
@@ -336,10 +345,10 @@ def disable_warning() -> None:
     """
     Enables warning filter.
     """
-    from pyiceberg.metrics import LoggingMetricsReporter
-
     builtin_logging.basicConfig(level=builtin_logging.ERROR)
     warnings.simplefilter("ignore")
+    if LoggingMetricsReporter is None:
+        return
     LoggingMetricsReporter()
     LoggingMetricsReporter._logger = builtin_logging.getLogger(LoggingMetricsReporter.__name__)
     LoggingMetricsReporter._logger.setLevel(builtin_logging.WARNING)
@@ -372,10 +381,10 @@ def empty_cache() -> None:
     """
     gc.collect()
 
-    if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE:
-        from xorl.utils.device import empty_cache
-
-        empty_cache()
+    if IS_CUDA_AVAILABLE:
+        device_empty_cache()
+    elif IS_NPU_AVAILABLE:
+        torch.npu.empty_cache()
 
 
 def get_cache_dir(path: Optional[str] = None) -> str:
@@ -539,12 +548,12 @@ def create_profiler(
     warmup = 0 if start_step == 1 else 1
     wait = start_step - warmup - 1
     active = end_step - start_step
-    
+
     # Ensure active >= 1 (PyTorch profiler requirement)
     if active <= 0:
         logger.warning(f"Profiler active steps is {active}, adjusting to 1 for valid profiling.")
         active = 1
-        
+
     logger.info(f"build profiler schedule - wait: {wait}, warmup: {warmup}, active: {active}.")
 
     schedule = profiler_module.schedule(

@@ -1,20 +1,19 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
 import re
-from typing import Optional, Type, Tuple, Callable, Sequence
 from functools import partial
+from typing import Callable, Optional, Sequence, Tuple, Type
 
 import cutlass
 import cutlass.cute as cute
-
-from cutlass import Int32, Int16, Boolean, const_expr
+import cutlass.pipeline
+from cutlass import Boolean, Int16, Int32, const_expr
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.cute.nvgpu.tcgen05.mma import CtaGroup  # noqa
 from cutlass.cutlass_dsl import dsl_user_op
-import cutlass.pipeline
-from cutlass._mlir.dialects import llvm
-from cutlass._mlir import ir
-from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
 
 
 Sm100MmaPeerBitMask = 0xFEFFFFFF
@@ -197,25 +196,19 @@ def as_position_independent_swizzle_tensor(tensor: cute.Tensor) -> cute.Tensor:
     inner = cute.make_swizzle(*parse_swizzle_from_pointer(tensor.iterator))
     # Need to recast the swizzle from byte (e.g. <3, 4, 3> to element units (e.g. <3, 3, 3> for
     # for 16 bits and <3, 2, 3> for 32 bits)
-    new_layout = cute.recast_layout(
-        width, 8, cute.make_composed_layout(inner, 0, cute.recast_layout(8, width, outer))
-    )
+    new_layout = cute.recast_layout(width, 8, cute.make_composed_layout(inner, 0, cute.recast_layout(8, width, outer)))
     # recast_ptr to remove the pointer swizzle
     return cute.make_tensor(cute.recast_ptr(tensor.iterator, dtype=tensor.element_type), new_layout)
 
 
-def partition_D_position_independent(
-    thr_copy: cute.core.ThrCopy, tensor: cute.Tensor
-) -> cute.Tensor:
+def partition_D_position_independent(thr_copy: cute.core.ThrCopy, tensor: cute.Tensor) -> cute.Tensor:
     return cute.make_tensor(
         swizzle_ptr(thr_copy.partition_D(tensor).iterator),
         thr_copy.partition_D(as_position_independent_swizzle_tensor(tensor)).layout,
     )
 
 
-def partition_S_position_independent(
-    thr_copy: cute.core.ThrCopy, tensor: cute.Tensor
-) -> cute.Tensor:
+def partition_S_position_independent(thr_copy: cute.core.ThrCopy, tensor: cute.Tensor) -> cute.Tensor:
     return cute.make_tensor(
         swizzle_ptr(thr_copy.partition_S(tensor).iterator),
         thr_copy.partition_S(as_position_independent_swizzle_tensor(tensor)).layout,
@@ -338,9 +331,7 @@ def get_smem_load_C(
     return copy_fn, thr_copy, tSR_sC
 
 
-def epilog_smem_copy_atom(
-    tiled_mma: cute.TiledMma, epi_tile: cute.Shape, transpose: bool = False
-) -> cute.TiledCopy:
+def epilog_smem_copy_atom(tiled_mma: cute.TiledMma, epi_tile: cute.Shape, transpose: bool = False) -> cute.TiledCopy:
     copy_atom_C = cute.make_copy_atom(
         warp.StMatrix8x8x16bOp(transpose, num_matrices=4 if epi_tile[1] % 16 == 0 else 2),
         cutlass.Float16,  # this is just to get the right source layout
@@ -419,9 +410,7 @@ def get_smem_load_A(
     tRS_shape = tiled_mma.partition_shape_A(sA.shape[:2])
 
     def copy_fn(src_idx: Int32, **new_kwargs):
-        return load_s2r_retile(
-            tiled_copy, tSR_sA[None, None, None, src_idx], dst_shape=tRS_shape, **new_kwargs
-        )
+        return load_s2r_retile(tiled_copy, tSR_sA[None, None, None, src_idx], dst_shape=tRS_shape, **new_kwargs)
 
     def copy_fn_w_dst_tensor(src_idx: Int32, dst: cute.Tensor, **new_kwargs):
         return load_s2r_retile(tiled_copy, tSR_sA[None, None, None, src_idx], dst, **new_kwargs)
@@ -469,9 +458,7 @@ def get_tma_desc_addr(tma_atom: cute.CopyAtom, *, loc=None, ip=None) -> cute.Poi
         >>> desc_ptr = get_tma_descriptor_address(tma_atom)
     """
     exec_atom = _cute_nvgpu_ir.atom_make_exec_tma(tma_atom._trait.value, loc=loc, ip=ip)
-    tma_desc_ptr_type = ir.Type.parse(
-        "!cute.ptr<!cute_nvgpu.tma_descriptor_tiled, generic, align<128>>"
-    )
+    tma_desc_ptr_type = ir.Type.parse("!cute.ptr<!cute_nvgpu.tma_descriptor_tiled, generic, align<128>>")
     return _cute_nvgpu_ir.get_tma_desc_addr(tma_desc_ptr_type, exec_atom, loc=loc, ip=ip)
 
 
@@ -630,8 +617,7 @@ def tma_get_copy_fn(
     **kwargs,
 ) -> Callable:
     src_is_smem = const_expr(
-        isinstance(src_tensor.iterator, cute.Pointer)
-        and src_tensor.memspace == cute.AddressSpace.smem
+        isinstance(src_tensor.iterator, cute.Pointer) and src_tensor.memspace == cute.AddressSpace.smem
     )
     smem_tensor, gmem_tensor = (src_tensor, dst_tensor) if src_is_smem else (dst_tensor, src_tensor)
     group_rank_smem = const_expr(cute.rank(smem_tensor) - (1 if not single_stage else 0))
@@ -726,9 +712,9 @@ def gather_m_get_copy_fn(
             # ((elems_per_load), thread_per_row)
             # But we actually want shape ((elems_per_load, 1), thread_per_row) to match tAsA
             # So we append 1s to the last dimension and then do tiled_divide, then slice.
-            mA_row = cute.tiled_divide(
-                cute.append_ones(mA_cur[m_idx[m], None], up_to_rank=2), (elems_per_load, 1)
-            )[None, None, 0]
+            mA_row = cute.tiled_divide(cute.append_ones(mA_cur[m_idx[m], None], up_to_rank=2), (elems_per_load, 1))[
+                None, None, 0
+            ]
             if const_expr(is_even_m_smem) or tApA_m[m]:
                 # There's only 1 load per row
                 assert cute.size(tAcA.shape, mode=[2]) == 1
@@ -782,9 +768,9 @@ def gather_k_get_copy_fn(
     # for tile_M=128, flat_divide gives (8, 16, K),
     # then logical_divide gives ((8, 1), (8, 2), K).
     tidx = thr_copy_A.thr_idx
-    tAmA = cute.logical_divide(
-        cute.flat_divide(mA, (elems_per_load,)), (elems_per_load, threads_per_col)
-    )[None, (tidx % threads_per_col, None), None]  # ((8, 1), 2, K)
+    tAmA = cute.logical_divide(cute.flat_divide(mA, (elems_per_load,)), (elems_per_load, threads_per_col))[
+        None, (tidx % threads_per_col, None), None
+    ]  # ((8, 1), 2, K)
 
     def prefetch_from_gmem_fn(src_idx, pred: bool = False) -> Tuple[cute.Tensor, cute.Tensor]:
         # Prefetch mAIdx early, even before smem is free
@@ -827,9 +813,7 @@ def gather_k_get_copy_fn(
             a_prefetch_pipeline.consumer_release(a_prefetch_consumer_state)
         return k_idx, tApA_k
 
-    def copy_fn(
-        src_idx, dst_idx, k_idx_tApA_k: Tuple[cute.Tensor, cute.Tensor], pred: bool = False
-    ):
+    def copy_fn(src_idx, dst_idx, k_idx_tApA_k: Tuple[cute.Tensor, cute.Tensor], pred: bool = False):
         k_idx, tApA_k = k_idx_tApA_k
         tApA_k_pred = None
         if const_expr(pred):
@@ -845,9 +829,7 @@ def gather_k_get_copy_fn(
                         pred=None if const_expr(tApA_k_pred is None) else tApA_k_pred[None, k],
                     )
 
-    return copy_fn, prefetch_from_gmem_fn if const_expr(
-        gAIdx is not None
-    ) else prefetch_from_smem_fn
+    return copy_fn, prefetch_from_gmem_fn if const_expr(gAIdx is not None) else prefetch_from_smem_fn
 
 
 @cute.jit

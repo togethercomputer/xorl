@@ -13,41 +13,41 @@ Test Strategy:
 - Tests focus on Orchestrator's scheduling, routing, and output formatting
 """
 
+import msgpack
 import pytest
 
-pytestmark = [pytest.mark.cpu, pytest.mark.server]
-import time
-import queue
-import socket
-import threading
-from typing import Any, Dict, List, Optional
 
-from xorl.server.orchestrator.orchestrator import Orchestrator
-from xorl.server.backend import DummyBackend
-from xorl.server.protocol.api_orchestrator import (
-    OrchestratorRequest,
-    OrchestratorOutputs,
-    RequestType,
-    OutputType,
-)
-from xorl.server.protocol.operations import (
-    ModelPassData,
-    OptimStepData,
-    AbortData,
-    EmptyData,
-)
+pytestmark = [pytest.mark.cpu, pytest.mark.server]
+import socket
+import time
 
 import zmq
+
+from xorl.server.backend import DummyBackend
+from xorl.server.orchestrator.orchestrator import Orchestrator
+from xorl.server.protocol.api_orchestrator import (
+    OrchestratorOutputs,
+    OrchestratorRequest,
+    OutputType,
+    RequestType,
+)
+from xorl.server.protocol.operations import (
+    AbortData,
+    EmptyData,
+    ModelPassData,
+    OptimStepData,
+)
 
 
 # ============================================================================
 # Fixtures
 # ============================================================================
 
+
 def find_free_port():
     """Find a free port."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('127.0.0.1', 0))
+        s.bind(("127.0.0.1", 0))
         s.listen(1)
         port = s.getsockname()[1]
     return port
@@ -105,9 +105,10 @@ def output_socket(addresses):
 # Helper Functions
 # ============================================================================
 
+
 def receive_outputs(output_socket, timeout_ms=1000, max_outputs=10):
     """Receive outputs from output socket."""
-    import msgpack
+
     outputs = []
 
     while len(outputs) < max_outputs:
@@ -124,6 +125,7 @@ def receive_outputs(output_socket, timeout_ms=1000, max_outputs=10):
 # ============================================================================
 # Tests
 # ============================================================================
+
 
 def test_init_start_stop_and_all_operations(addresses, orchestrator, output_socket):
     """Test Orchestrator lifecycle and event loop processing of all operation types."""
@@ -154,12 +156,15 @@ def test_init_start_stop_and_all_operations(addresses, orchestrator, output_sock
 
     # --- Forward backward ---
     fb_request = OrchestratorRequest(
-        request_id="req-fb-001", request_type=RequestType.ADD,
+        request_id="req-fb-001",
+        request_type=RequestType.ADD,
         operation="forward_backward",
-        payload=ModelPassData(data=[
-            {"input_ids": [1, 2, 3, 4], "labels": [2, 3, 4, 5]},
-            {"input_ids": [10, 20], "labels": [20, 30]},
-        ]),
+        payload=ModelPassData(
+            data=[
+                {"input_ids": [1, 2, 3, 4], "labels": [2, 3, 4, 5]},
+                {"input_ids": [10, 20], "labels": [20, 30]},
+            ]
+        ),
     )
     orchestrator.input_queue.put(fb_request)
     time.sleep(0.5)
@@ -171,8 +176,10 @@ def test_init_start_stop_and_all_operations(addresses, orchestrator, output_sock
 
     # --- Optim step ---
     opt_request = OrchestratorRequest(
-        request_id="req-opt-001", request_type=RequestType.ADD,
-        operation="optim_step", payload=OptimStepData(lr=0.001, gradient_clip=1.0),
+        request_id="req-opt-001",
+        request_type=RequestType.ADD,
+        operation="optim_step",
+        payload=OptimStepData(lr=0.001, gradient_clip=1.0),
     )
     orchestrator.input_queue.put(opt_request)
     time.sleep(0.5)
@@ -183,8 +190,10 @@ def test_init_start_stop_and_all_operations(addresses, orchestrator, output_sock
 
     # --- Health check ---
     health_request = OrchestratorRequest(
-        request_id="req-health-001", request_type=RequestType.UTILITY,
-        operation="health_check", payload=EmptyData(),
+        request_id="req-health-001",
+        request_type=RequestType.UTILITY,
+        operation="health_check",
+        payload=EmptyData(),
     )
     orchestrator.input_queue.put(health_request)
     time.sleep(0.3)
@@ -198,8 +207,10 @@ def test_errors_abort_e2e_and_concurrent(orchestrator, output_socket):
     """Test error handling, abort, end-to-end flow, and concurrent requests."""
     # --- Invalid operation ---
     invalid_request = OrchestratorRequest(
-        request_id="req-error-001", request_type=RequestType.ADD,
-        operation="invalid_operation", payload=EmptyData(),
+        request_id="req-error-001",
+        request_type=RequestType.ADD,
+        operation="invalid_operation",
+        payload=EmptyData(),
     )
     orchestrator.input_queue.put(invalid_request)
     time.sleep(0.5)
@@ -210,8 +221,10 @@ def test_errors_abort_e2e_and_concurrent(orchestrator, output_socket):
 
     # --- Empty datum list ---
     empty_request = OrchestratorRequest(
-        request_id="req-empty-001", request_type=RequestType.ADD,
-        operation="forward_backward", payload=ModelPassData(data=[]),
+        request_id="req-empty-001",
+        request_type=RequestType.ADD,
+        operation="forward_backward",
+        payload=ModelPassData(data=[]),
     )
     orchestrator.input_queue.put(empty_request)
     time.sleep(0.5)
@@ -222,15 +235,18 @@ def test_errors_abort_e2e_and_concurrent(orchestrator, output_socket):
 
     # --- Abort ---
     fb_request = OrchestratorRequest(
-        request_id="req-abort-001", request_type=RequestType.ADD,
+        request_id="req-abort-001",
+        request_type=RequestType.ADD,
         operation="forward_backward",
         payload=ModelPassData(data=[{"input_ids": [1, 2], "labels": [2, 3]}]),
     )
     orchestrator.input_queue.put(fb_request)
     time.sleep(0.1)
     abort_request = OrchestratorRequest(
-        request_id="abort-req", request_type=RequestType.ABORT,
-        operation="abort", payload=AbortData(target_request_id="req-abort-001"),
+        request_id="abort-req",
+        request_type=RequestType.ABORT,
+        operation="abort",
+        payload=AbortData(target_request_id="req-abort-001"),
     )
     orchestrator.input_queue.put(abort_request)
     time.sleep(0.3)
@@ -240,7 +256,8 @@ def test_errors_abort_e2e_and_concurrent(orchestrator, output_socket):
 
     # --- End-to-end ---
     request = OrchestratorRequest(
-        request_id="req-e2e-001", request_type=RequestType.ADD,
+        request_id="req-e2e-001",
+        request_type=RequestType.ADD,
         operation="forward_backward",
         payload=ModelPassData(data=[{"input_ids": [1, 2, 3, 4, 5], "labels": [2, 3, 4, 5, 6]}]),
     )
@@ -257,7 +274,8 @@ def test_errors_abort_e2e_and_concurrent(orchestrator, output_socket):
     requests = []
     for i in range(5):
         req = OrchestratorRequest(
-            request_id=f"req-concurrent-{i:03d}", request_type=RequestType.ADD,
+            request_id=f"req-concurrent-{i:03d}",
+            request_type=RequestType.ADD,
             operation="forward_backward",
             payload=ModelPassData(data=[{"input_ids": list(range(10)), "labels": list(range(1, 11))}]),
         )
@@ -284,7 +302,8 @@ def test_stats_throughput_and_health_check(orchestrator):
     initial_stats = orchestrator.get_stats()
     for i in range(3):
         req = OrchestratorRequest(
-            request_id=f"req-throughput-{i:03d}", request_type=RequestType.ADD,
+            request_id=f"req-throughput-{i:03d}",
+            request_type=RequestType.ADD,
             operation="forward_backward",
             payload=ModelPassData(data=[{"input_ids": [1, 2], "labels": [2, 3]}]),
         )
@@ -301,20 +320,48 @@ def test_stats_throughput_and_health_check(orchestrator):
     )
 
     # Health check identified correctly
-    assert bare._is_health_check_request(OrchestratorRequest(
-        request_id="test-health", request_type=RequestType.UTILITY, operation="health_check",
-    )) is True
+    assert (
+        bare._is_health_check_request(
+            OrchestratorRequest(
+                request_id="test-health",
+                request_type=RequestType.UTILITY,
+                operation="health_check",
+            )
+        )
+        is True
+    )
 
     # Non-health-check requests
-    assert bare._is_health_check_request(OrchestratorRequest(
-        request_id="test-fb", request_type=RequestType.ADD, operation="forward_backward",
-    )) is False
-    assert bare._is_health_check_request(OrchestratorRequest(
-        request_id="test-abort", request_type=RequestType.ABORT, operation="abort",
-    )) is False
-    assert bare._is_health_check_request(OrchestratorRequest(
-        request_id="test-adapter", request_type=RequestType.UTILITY, operation="get_adapter_info",
-    )) is False
+    assert (
+        bare._is_health_check_request(
+            OrchestratorRequest(
+                request_id="test-fb",
+                request_type=RequestType.ADD,
+                operation="forward_backward",
+            )
+        )
+        is False
+    )
+    assert (
+        bare._is_health_check_request(
+            OrchestratorRequest(
+                request_id="test-abort",
+                request_type=RequestType.ABORT,
+                operation="abort",
+            )
+        )
+        is False
+    )
+    assert (
+        bare._is_health_check_request(
+            OrchestratorRequest(
+                request_id="test-adapter",
+                request_type=RequestType.UTILITY,
+                operation="get_adapter_info",
+            )
+        )
+        is False
+    )
 
     # Methods exist
     assert callable(bare._is_health_check_request)

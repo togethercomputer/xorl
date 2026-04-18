@@ -11,17 +11,20 @@ Scales output: [K//block_size, N] — one E8M0 scale per block per column.
 from typing import Tuple
 
 import torch
-from torch import Tensor
 import triton
 import triton.language as tl
+from torch import Tensor
 
-from .fp4_codec import _fp4_encode, _fp4_decode
+from .fp4_codec import _fp4_decode, _fp4_encode
 
 
 @triton.jit
 def _mxfp4_quantize_gkn_kernel(
-    X, Out, Scale,
-    K, N,
+    X,
+    Out,
+    Scale,
+    K,
+    N,
     BLOCK_SIZE: tl.constexpr,
     TILE_N: tl.constexpr,
 ):
@@ -81,8 +84,11 @@ def _mxfp4_quantize_gkn_kernel(
 
 @triton.jit
 def _mxfp4_dequantize_gkn_kernel(
-    Packed, Scale, Out,
-    K, N,
+    Packed,
+    Scale,
+    Out,
+    K,
+    N,
     BLOCK_SIZE: tl.constexpr,
     TILE_N: tl.constexpr,
 ):
@@ -112,7 +118,7 @@ def _mxfp4_dequantize_gkn_kernel(
     packed = tl.load(pack_addrs, mask=pack_mask, other=0).to(tl.int32)  # [BS//2, TN]
 
     # Unpack and decode FP4 (element-wise, works directly on 2D)
-    lo = packed & 0xF   # even K [BS//2, TN]
+    lo = packed & 0xF  # even K [BS//2, TN]
     hi = (packed >> 4) & 0xF  # odd K [BS//2, TN]
     val_lo = _fp4_decode(lo)
     val_hi = _fp4_decode(hi)
@@ -163,16 +169,19 @@ def mxfp4_quantize_gkn(x: Tensor, block_size: int = 32) -> Tuple[Tensor, Tensor]
     grid = (num_blocks, (N + TILE_N - 1) // TILE_N)
 
     _mxfp4_quantize_gkn_kernel[grid](
-        x.contiguous(), packed, scales,
-        K, N,
-        block_size, TILE_N,
+        x.contiguous(),
+        packed,
+        scales,
+        K,
+        N,
+        block_size,
+        TILE_N,
         num_warps=4,
     )
     return packed, scales.to(torch.float16)
 
 
-def mxfp4_dequantize_gkn(packed: Tensor, scales: Tensor, K: int, N: int,
-                           block_size: int = 32) -> Tensor:
+def mxfp4_dequantize_gkn(packed: Tensor, scales: Tensor, K: int, N: int, block_size: int = 32) -> Tensor:
     """Dequantize MXFP4 packed [K//2, N] back to [K, N] in G,K,N format.
 
     Args:
@@ -192,9 +201,13 @@ def mxfp4_dequantize_gkn(packed: Tensor, scales: Tensor, K: int, N: int,
     grid = (num_blocks, (N + TILE_N - 1) // TILE_N)
 
     _mxfp4_dequantize_gkn_kernel[grid](
-        packed.contiguous(), scales.float().contiguous(), result,
-        K, N,
-        block_size, TILE_N,
+        packed.contiguous(),
+        scales.float().contiguous(),
+        result,
+        K,
+        N,
+        block_size,
+        TILE_N,
         num_warps=2,
     )
     return result

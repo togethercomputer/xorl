@@ -11,10 +11,12 @@ Provides two layers:
   the pluggable backend interface.
 """
 
+import inspect
 import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Thread
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple
@@ -22,6 +24,14 @@ from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 import requests
 import torch
 import torch.distributed as dist
+from torch.distributed import PrefixStore, TCPStore
+from torch.distributed.distributed_c10d import (
+    Backend,
+    _new_process_group_helper,
+    _world,
+    default_pg_timeout,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +58,7 @@ def _get_http_session() -> requests.Session:
 @dataclass
 class EndpointInfo:
     """Information about an inference endpoint."""
+
     host: str
     port: int
     world_size: int  # tensor_parallel_size for this endpoint
@@ -56,6 +67,7 @@ class EndpointInfo:
 @dataclass
 class SyncResult:
     """Result of weight synchronization."""
+
     success: bool
     message: str
     transfer_time: float = 0.0
@@ -83,7 +95,7 @@ class NCCLWeightSynchronizer:
         self,
         endpoints: List[EndpointInfo],
         master_address: str = "localhost",
-        master_port: int = 29600,
+        master_port: int = 0,
         group_name: str = "weight_sync_group",
         buffer_size_mb: int = 1024,
         device: str = "cuda:0",
@@ -94,7 +106,7 @@ class NCCLWeightSynchronizer:
         Args:
             endpoints: List of inference endpoints to sync weights to
             master_address: Address for NCCL rendezvous (training server)
-            master_port: Port for NCCL rendezvous
+            master_port: Port for NCCL rendezvous (0 selects an ephemeral port)
             group_name: Name of the NCCL process group
             buffer_size_mb: Size of each transfer bucket in MB
             device: Device to use for NCCL operations
@@ -111,6 +123,9 @@ class NCCLWeightSynchronizer:
 
         # Process group (initialized during sync)
         self.process_group: Optional[dist.ProcessGroup] = None
+        self._training_raw_store = None
+        self._training_prefix_store = None
+        self._active_master_port = master_port
 
         logger.info(
             f"NCCLWeightSynchronizer initialized: "
@@ -122,6 +137,54 @@ class NCCLWeightSynchronizer:
     # NCCL process group management
     # ========================================================================
 
+    @contextmanager
+    def _without_torchelastic_agent_store(self):
+        """Temporarily disable the elastic agent store override for custom groups."""
+        old_agent_store = os.environ.pop("TORCHELASTIC_USE_AGENT_STORE", None)
+        try:
+            yield
+        finally:
+            if old_agent_store is not None:
+                os.environ["TORCHELASTIC_USE_AGENT_STORE"] = old_agent_store
+
+    def _create_training_store(self) -> None:
+        """Create and retain the rendezvous store used by the training process group."""
+        self._cleanup_training_store()
+
+        requested_port = self.master_port
+        logger.info(f"[Training] Creating TCPStore (requested_port={requested_port}, is_master=True)...")
+
+        with self._without_torchelastic_agent_store():
+            raw_store = TCPStore(
+                host_name=self.master_address,
+                port=requested_port,
+                world_size=self.world_size,
+                is_master=True,
+                timeout=default_pg_timeout,
+            )
+
+        self._training_raw_store = raw_store
+        self._active_master_port = raw_store.port
+        self._training_prefix_store = PrefixStore(self.group_name, raw_store)
+        logger.info(
+            f"[Training] Rendezvous store ready: tcp://{self.master_address}:{self._active_master_port}, "
+            f"group_name={self.group_name}"
+        )
+
+    def _cleanup_training_store(self) -> None:
+        """Drop references to the rendezvous store so the TCP listener can be reclaimed."""
+        raw_store = self._training_raw_store
+        self._training_prefix_store = None
+        self._training_raw_store = None
+        self._active_master_port = self.master_port
+
+        close = getattr(raw_store, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as exc:
+                logger.warning(f"[Training] Failed to close rendezvous store cleanly: {exc}")
+
     def _init_training_process_group(self) -> dist.ProcessGroup:
         """
         Initialize NCCL process group on the training side (rank 0).
@@ -132,26 +195,14 @@ class NCCLWeightSynchronizer:
         Returns:
             The initialized process group
         """
-        from torch.distributed import TCPStore, PrefixStore
-        from torch.distributed.distributed_c10d import (
-            Backend,
-            _new_process_group_helper,
-            _world,
-            default_pg_timeout,
-        )
 
         # Important: Only set NCCL_CUMEM_ENABLE=0
         os.environ["NCCL_CUMEM_ENABLE"] = "0"
 
-        # torchrun sets TORCHELASTIC_USE_AGENT_STORE=True which forces all ranks
-        # to be TCPStore clients. We need to unset this for our separate weight
-        # sync process group where rank 0 must be the store master.
-        old_agent_store = os.environ.pop('TORCHELASTIC_USE_AGENT_STORE', None)
-
         rank = 0  # Training is always rank 0
 
         logger.info(
-            f"[Training] Initializing process group: tcp://{self.master_address}:{self.master_port}, "
+            f"[Training] Initializing process group: tcp://{self.master_address}:{self._active_master_port}, "
             f"rank={rank}, world_size={self.world_size}, group_name={self.group_name}"
         )
 
@@ -164,23 +215,13 @@ class NCCLWeightSynchronizer:
         backend_obj = Backend("nccl")
         timeout = default_pg_timeout
 
-        # Create TCPStore directly - rank 0 is the master
-        is_master = (rank == 0)
-        logger.info(f"[Training] Creating TCPStore (is_master={is_master})...")
-        store = TCPStore(
-            host_name=self.master_address,
-            port=self.master_port,
-            world_size=self.world_size,
-            is_master=is_master,
-            timeout=timeout,
-        )
+        if self._training_prefix_store is None:
+            self._create_training_store()
 
-        # Use PrefixStore with group_name to namespace keys
-        store = PrefixStore(self.group_name, store)
-        logger.info(f"[Training] TCPStore created, creating process group...")
+        logger.info("[Training] TCPStore created, creating process group...")
 
         # Handle different PyTorch versions by inspecting the actual signature
-        import inspect
+
         _pg_params = inspect.signature(_new_process_group_helper).parameters
         if "backend_options" in _pg_params:
             pg_options_param_name = "backend_options"
@@ -191,22 +232,18 @@ class NCCLWeightSynchronizer:
         torch.cuda.set_device(self.device)
         device_id = torch.device(self.device)
 
-        try:
+        with self._without_torchelastic_agent_store():
             pg, _ = _new_process_group_helper(
                 self.world_size,
                 rank,
                 [],
                 backend_obj,
-                store,
+                self._training_prefix_store,
                 group_name=self.group_name,
                 **{pg_options_param_name: None},
                 timeout=timeout,
                 device_id=device_id,
             )
-        finally:
-            # Restore the environment variable
-            if old_agent_store is not None:
-                os.environ['TORCHELASTIC_USE_AGENT_STORE'] = old_agent_store
 
         _world.pg_group_ranks[pg] = {i: i for i in range(self.world_size)}
 
@@ -229,7 +266,6 @@ class NCCLWeightSynchronizer:
         logger.info("=" * 70)
         logger.info("Initializing NCCL process groups...")
         logger.info("=" * 70)
-        logger.info(f"[Training] NCCL rendezvous: tcp://{self.master_address}:{self.master_port}")
         logger.info(f"[Training] World size: {self.world_size} (1 training + {self.world_size - 1} inference)")
 
         training_error = None
@@ -249,6 +285,13 @@ class NCCLWeightSynchronizer:
         # 3. Run training (rank 0) in main thread - this completes NCCL rendezvous
         # 4. Join inference thread after training completes
 
+        try:
+            self._create_training_store()
+        except Exception as exc:
+            logger.error(f"[Training] Failed to create rendezvous store: {exc}")
+            return False
+
+        logger.info(f"[Training] NCCL rendezvous: tcp://{self.master_address}:{self._active_master_port}")
         logger.info("[Training] Starting inference endpoint initialization in background...")
         inference_thread = Thread(target=init_inference)
         inference_thread.start()
@@ -320,6 +363,8 @@ class NCCLWeightSynchronizer:
                 logger.error(f"Failed to destroy training process group: {e}")
             self.process_group = None
 
+        self._cleanup_training_store()
+
     # ========================================================================
     # Inference endpoint management
     # ========================================================================
@@ -339,7 +384,7 @@ class NCCLWeightSynchronizer:
             url = f"http://{endpoint.host}:{endpoint.port}/init_weights_update_group"
             payload = {
                 "master_address": self.master_address,
-                "master_port": self.master_port,
+                "master_port": self._active_master_port,
                 "rank_offset": rank_offset,
                 "world_size": self.world_size,
                 "group_name": self.group_name,
@@ -453,10 +498,7 @@ class NCCLWeightSynchronizer:
                 }
 
                 if success:
-                    logger.info(
-                        f"[{endpoint_label}] {operation} succeeded "
-                        f"(attempt {attempt + 1}/{max_retries})"
-                    )
+                    logger.info(f"[{endpoint_label}] {operation} succeeded (attempt {attempt + 1}/{max_retries})")
                     return endpoint_result
                 else:
                     logger.warning(
@@ -471,10 +513,7 @@ class NCCLWeightSynchronizer:
                     "message": str(e),
                     "attempts": attempt + 1,
                 }
-                logger.warning(
-                    f"[{endpoint_label}] {operation} error "
-                    f"(attempt {attempt + 1}/{max_retries}): {e}"
-                )
+                logger.warning(f"[{endpoint_label}] {operation} error (attempt {attempt + 1}/{max_retries}): {e}")
 
             if attempt < max_retries - 1:
                 time.sleep(retry_delay_seconds)
@@ -497,9 +536,13 @@ class NCCLWeightSynchronizer:
             futures = {
                 executor.submit(
                     self._endpoint_request_with_retry,
-                    ep, "/pause_generation", "Pause",
-                    {"mode": pause_mode}, timeout=60,
-                    max_retries=max_retries, retry_delay_seconds=retry_delay_seconds,
+                    ep,
+                    "/pause_generation",
+                    "Pause",
+                    {"mode": pause_mode},
+                    timeout=60,
+                    max_retries=max_retries,
+                    retry_delay_seconds=retry_delay_seconds,
                 ): ep
                 for ep in self.endpoints
             }
@@ -525,9 +568,13 @@ class NCCLWeightSynchronizer:
             futures = {
                 executor.submit(
                     self._endpoint_request_with_retry,
-                    ep, "/continue_generation", "Resume",
-                    {}, timeout=30,
-                    max_retries=max_retries, retry_delay_seconds=retry_delay_seconds,
+                    ep,
+                    "/continue_generation",
+                    "Resume",
+                    {},
+                    timeout=30,
+                    max_retries=max_retries,
+                    retry_delay_seconds=retry_delay_seconds,
                 ): ep
                 for ep in self.endpoints
             }
@@ -552,6 +599,7 @@ class NCCLWeightSynchronizer:
         self,
         bucket: List[Tuple[str, torch.Tensor]],
         flush_cache: bool = False,
+        weight_version: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Transfer a single bucket of parameters.
@@ -565,6 +613,7 @@ class NCCLWeightSynchronizer:
         Args:
             bucket: List of (name, tensor) tuples
             flush_cache: Whether to flush cache after this bucket (only for last bucket)
+            weight_version: Optional weight version to apply with this bucket.
 
         Returns:
             List of results from each endpoint
@@ -591,19 +640,20 @@ class NCCLWeightSynchronizer:
                         "shapes": shapes,
                         "group_name": self.group_name,
                         "flush_cache": flush_cache,
+                        "weight_version": weight_version,
                     },
                     timeout=600,
                 )
                 result = response.json()
-                update_results.append({
-                    "endpoint": f"{endpoint.host}:{endpoint.port}",
-                    "success": result.get("success", False),
-                    "message": result.get("message", ""),
-                })
+                update_results.append(
+                    {
+                        "endpoint": f"{endpoint.host}:{endpoint.port}",
+                        "success": result.get("success", False),
+                        "message": result.get("message", ""),
+                    }
+                )
                 if not result.get("success"):
-                    update_errors.append(
-                        f"API failed on {endpoint.host}:{endpoint.port}: {result}"
-                    )
+                    update_errors.append(f"API failed on {endpoint.host}:{endpoint.port}: {result}")
             except Exception as e:
                 update_errors.append(f"Exception calling {endpoint.host}:{endpoint.port}: {e}")
 
@@ -696,10 +746,7 @@ class NCCLWeightSynchronizer:
                 logger.info("[Training] Skipping lm_head.weight (tied with embed_tokens)")
 
             total_params = sum(state_dict[n].numel() for n in param_names)
-            total_bytes = sum(
-                state_dict[n].numel() * state_dict[n].element_size()
-                for n in param_names
-            )
+            total_bytes = sum(state_dict[n].numel() * state_dict[n].element_size() for n in param_names)
 
             logger.info(f"[Training] Transferring {len(param_names)} parameters")
             logger.info(f"[Training] Total parameters: {total_params:,}")
@@ -738,11 +785,11 @@ class NCCLWeightSynchronizer:
 
             for i, bucket in enumerate(buckets):
                 bucket_size = sum(p.numel() * p.element_size() for _, p in bucket)
-                is_last_bucket = (i == len(buckets) - 1)
+                is_last_bucket = i == len(buckets) - 1
 
                 logger.info(
-                    f"[Training] Bucket {i+1}/{len(buckets)} "
-                    f"({len(bucket)} params, {bucket_size/1e6:.1f} MB)"
+                    f"[Training] Bucket {i + 1}/{len(buckets)} "
+                    f"({len(bucket)} params, {bucket_size / 1e6:.1f} MB)"
                     f"{' [final, flush_cache=True]' if is_last_bucket else ''}"
                 )
 
@@ -775,10 +822,7 @@ class NCCLWeightSynchronizer:
                 total_bytes=total_bytes,
                 num_parameters=len(param_names),
                 num_buckets=len(buckets),
-                endpoint_results=[
-                    {"host": ep.host, "port": ep.port, "success": True}
-                    for ep in self.endpoints
-                ],
+                endpoint_results=[{"host": ep.host, "port": ep.port, "success": True} for ep in self.endpoints],
             )
 
         except Exception as e:
@@ -823,10 +867,7 @@ class NCCLBroadcastBackend(WeightTransportBackend):
 
     def initialize(self) -> bool:
         cfg = self.config
-        ep_infos = [
-            EndpointInfo(host=e.host, port=e.port, world_size=e.world_size)
-            for e in cfg.endpoints
-        ]
+        ep_infos = [EndpointInfo(host=e.host, port=e.port, world_size=e.world_size) for e in cfg.endpoints]
         self._synchronizer = NCCLWeightSynchronizer(
             endpoints=ep_infos,
             master_address=cfg.master_address,
@@ -835,10 +876,7 @@ class NCCLBroadcastBackend(WeightTransportBackend):
             buffer_size_mb=cfg.buffer_size_mb,
             device=cfg.device,
         )
-        logger.info(
-            f"[NCCLBroadcast] Initializing NCCL sync group "
-            f"({len(ep_infos)} endpoints, device={cfg.device})"
-        )
+        logger.info(f"[NCCLBroadcast] Initializing NCCL sync group ({len(ep_infos)} endpoints, device={cfg.device})")
         ok = self._synchronizer.init_nccl_group()
         if ok:
             self._process_group = self._synchronizer.process_group
@@ -859,14 +897,17 @@ class NCCLBroadcastBackend(WeightTransportBackend):
         *,
         src_rank: int = 0,
         flush_cache: bool = False,
+        weight_version: Optional[str] = None,
     ) -> None:
         if src_rank != 0:
-            raise ValueError(
-                f"NCCLBroadcastBackend only supports src_rank=0, got {src_rank}"
-            )
+            raise ValueError(f"NCCLBroadcastBackend only supports src_rank=0, got {src_rank}")
         if self._synchronizer is None:
             raise RuntimeError("Backend not initialized — call initialize() first")
-        self._synchronizer._transfer_single_bucket(bucket, flush_cache=flush_cache)
+        self._synchronizer._transfer_single_bucket(
+            bucket,
+            flush_cache=flush_cache,
+            weight_version=weight_version,
+        )
 
     @property
     def sender_ranks(self) -> FrozenSet[int]:

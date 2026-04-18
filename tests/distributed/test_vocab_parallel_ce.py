@@ -50,8 +50,12 @@ def check_correctness(rank, world_size, tp_group):
 
     for use_compile in [False, True]:
         par_ce = vocab_parallel_cross_entropy(
-            hidden_states, local_weight, labels, tp_group,
-            ignore_index=-100, use_compile=use_compile,
+            hidden_states,
+            local_weight,
+            labels,
+            tp_group,
+            ignore_index=-100,
+            use_compile=use_compile,
         )
         err = (par_ce - ref_ce).abs().max().item()
         mode = "compiled" if use_compile else "eager"
@@ -87,8 +91,12 @@ def check_backward(rank, world_size, tp_group):
         w_par = full_weight[rank * local_V : (rank + 1) * local_V].contiguous().requires_grad_(True)
 
         par_ce = vocab_parallel_cross_entropy(
-            h_par, w_par, labels, tp_group,
-            ignore_index=-100, use_compile=use_compile,
+            h_par,
+            w_par,
+            labels,
+            tp_group,
+            ignore_index=-100,
+            use_compile=use_compile,
         )
         (par_ce.sum() / valid).backward()
 
@@ -105,8 +113,7 @@ def check_backward(rank, world_size, tp_group):
         assert grad_w_err < 1e-2, f"grad_w error too large ({mode}): {grad_w_err}"
 
 
-def _bench_one(hidden_states, local_weight, labels, tp_group, use_compile,
-               n_warmup=5, n_iter=20, fwd_only=False):
+def _bench_one(hidden_states, local_weight, labels, tp_group, use_compile, n_warmup=5, n_iter=20, fwd_only=False):
     """Run warmup + timed iterations, return (ms/iter, peak_memory_MB)."""
     for _ in range(n_warmup):
         ce = vocab_parallel_cross_entropy(hidden_states, local_weight, labels, tp_group, use_compile=use_compile)
@@ -164,8 +171,12 @@ def bench_perf(rank, world_size, tp_group):
     for use_compile in [False, True]:
         mode = "compiled" if use_compile else "eager"
         ms, peak_act_mb, peak_total_mb = _bench_one(
-            hidden_states, local_weight, labels, tp_group,
-            use_compile=use_compile, fwd_only=True,
+            hidden_states,
+            local_weight,
+            labels,
+            tp_group,
+            use_compile=use_compile,
+            fwd_only=True,
         )
         if rank == 0:
             print(f"{mode:<12} {ms:<12.2f} {peak_act_mb:<16.1f} {peak_total_mb:.1f}")
@@ -180,8 +191,12 @@ def bench_perf(rank, world_size, tp_group):
     for use_compile in [False, True]:
         mode = "compiled" if use_compile else "eager"
         ms, peak_act_mb, peak_total_mb = _bench_one(
-            hidden_states, local_weight, labels, tp_group,
-            use_compile=use_compile, fwd_only=False,
+            hidden_states,
+            local_weight,
+            labels,
+            tp_group,
+            use_compile=use_compile,
+            fwd_only=False,
         )
         if rank == 0:
             print(f"{mode:<12} {ms:<12.2f} {peak_act_mb:<16.1f} {peak_total_mb:.1f}")
@@ -223,6 +238,7 @@ def main():
 if __name__ != "__main__":
     # Only define pytest tests when imported by pytest (not when run via torchrun)
     import pytest
+
     from tests.distributed.distributed_utils import run_distributed_script, skip_if_gpu_count_less_than
 
     SCRIPT_PATH = os.path.abspath(__file__)

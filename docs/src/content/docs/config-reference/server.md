@@ -47,7 +47,7 @@ These flags align the training model's numerics with the inference engine (SGLan
 |---|---|---|
 | `router_fp32` | `true` | Upcast MoE router gate logits to float32 for numerical stability. |
 | `lm_head_fp32` | `true` | Upcast LM head logits to float32. |
-| `rmsnorm_native` | `false` | Use unfused PyTorch RMSNorm instead of Triton kernel. |
+| `rmsnorm_mode` | `native` | RMSNorm implementation: `eager`, `native`, or `compile`. |
 | `activation_native` | `false` | Use unfused SiLU instead of fused Triton kernel. |
 | `rope_native` | `false` | Use unfused RoPE instead of flash_attn kernel. |
 | `attention_cast_bf16` | `false` | Explicitly cast Q/K to BF16 after RoPE. |
@@ -95,7 +95,7 @@ These flags align the training model's numerics with the inference engine (SGLan
 
 | Field | Default | Description |
 |---|---|---|
-| `optimizer` | `adamw` | Optimizer: `adamw`, `anyprecision_adamw`, `sgd`, `muon`. |
+| `optimizer` | `adamw` | Optimizer: `adamw`, `anyprecision_adamw`, `sgd`, `signsgd`, `muon`. |
 | `optimizer_dtype` | `bf16` | Dtype for optimizer states: `fp32` or `bf16`. BF16 halves optimizer memory. |
 | `muon_lr` | `0.02` | Learning rate for Muon matrix parameter groups. Only used when `optimizer: muon`. |
 | `muon_momentum` | `0.95` | Muon momentum coefficient. |
@@ -163,7 +163,6 @@ ZMQ communication between the launcher, workers, and API server.
 | `lora_rank` | `32` | LoRA rank (`r`). Default is 32 for server (vs 16 for local). |
 | `lora_alpha` | `16` | LoRA scaling factor. |
 | `lora_target_modules` | `null` | Module names to inject LoRA into. `null` = default for architecture. |
-| `moe_shared_lora` | `false` | Share LoRA weights across all MoE experts. |
 | `moe_hybrid_shared_lora` | `false` | Share `lora_A` for gate/up projections and `lora_B` for down projections across experts. |
 | `enable_qlora` | `false` | Quantize base weights and train LoRA adapters on top. |
 | `quant_format` | `nvfp4` | Quantization format: `nvfp4`, `block_fp8`. |

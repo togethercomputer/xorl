@@ -9,7 +9,8 @@ This script generates CUTE DSL functions for optimal sorting networks of various
 import argparse
 import os
 import re
-from typing import List, Tuple, Dict
+from typing import Dict, List, Tuple
+
 
 # Network strings from bertdobbelaere.github.io/sorting_networks.html
 # Copy-paste network strings here, then run initialize_networks() to parse them
@@ -178,9 +179,7 @@ def add_network_from_string(size: int, network_str: str, description: str = ""):
         return False
 
 
-def generate_networks_dict(
-    networks_data: Dict[int, Tuple[int, int, List[List[Tuple[int, int]]]]]
-) -> str:
+def generate_networks_dict(networks_data: Dict[int, Tuple[int, int, List[List[Tuple[int, int]]]]]) -> str:
     """Generate the global networks dictionary."""
     lines = ["networks = {"]
 
@@ -296,9 +295,7 @@ def main():
         default=64,
         help="Maximum sorting network size to generate (default: 32)",
     )
-    parser.add_argument(
-        "--stats", "-s", action="store_true", help="Print statistics about the optimal networks"
-    )
+    parser.add_argument("--stats", "-s", action="store_true", help="Print statistics about the optimal networks")
 
     args = parser.parse_args()
 

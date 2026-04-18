@@ -57,9 +57,7 @@ class GradientAccumulateLoss(torch.autograd.Function):
 
         # Gradient from second output (sum loss)
         grad_from_sum = (
-            grad_loss_sum * local_valid_tokens
-            if grad_loss_sum is not None
-            else torch.zeros_like(grad_output)
+            grad_loss_sum * local_valid_tokens if grad_loss_sum is not None else torch.zeros_like(grad_output)
         )
 
         return grad_from_normalized + grad_from_sum, None, None

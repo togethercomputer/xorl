@@ -38,28 +38,27 @@ import asyncio
 import logging
 import os
 import time
-import uvicorn
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
+import uvicorn
 from fastapi import FastAPI, HTTPException, status
 
-from xorl.server.api_server.endpoints import router
-from xorl.server.api_server.health import HealthMixin
-from xorl.server.api_server.inference_endpoints import InferenceEndpointsMixin
-from xorl.server.api_server.training_ops import TrainingOpsMixin
-from xorl.server.api_server.utils import (
-    MODEL_ID_NOT_REGISTERED_ERROR,
-    validate_model_id,
-)
-from xorl.server.api_server.weights import WeightsMixin
 from xorl.server.api_server.api_types import (
     InferenceEndpoint,
     LossFnOutput,
     TensorData,
 )
-from xorl.server.api_server.orchestrator_client import OrchestratorClient
+from xorl.server.api_server.endpoints import router
 from xorl.server.api_server.future_store import FutureStore
+from xorl.server.api_server.health import HealthMixin
+from xorl.server.api_server.inference_endpoints import InferenceEndpointsMixin
+from xorl.server.api_server.orchestrator_client import OrchestratorClient
+from xorl.server.api_server.training_ops import TrainingOpsMixin
+from xorl.server.api_server.utils import (
+    MODEL_ID_NOT_REGISTERED_ERROR,
+)
+from xorl.server.api_server.weights import WeightsMixin
 from xorl.server.protocol.api_orchestrator import OrchestratorRequest
 from xorl.server.protocol.operations import KillSessionData
 
@@ -248,7 +247,9 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
                 outputs.append(
                     LossFnOutput(
                         logprobs=TensorData(data=logprobs, dtype="float32", shape=[len(logprobs)]),
-                        elementwise_loss=TensorData(data=elementwise_loss, dtype="float32", shape=[len(elementwise_loss)]),
+                        elementwise_loss=TensorData(
+                            data=elementwise_loss, dtype="float32", shape=[len(elementwise_loss)]
+                        ),
                         k3=k3_val,
                     )
                 )
@@ -359,10 +360,7 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
                 ]
 
                 for model_id, last_activity in idle_model_ids:
-                    logger.info(
-                        f"Cleaning up idle session: {model_id} "
-                        f"(idle for {current_time - last_activity:.0f}s)"
-                    )
+                    logger.info(f"Cleaning up idle session: {model_id} (idle for {current_time - last_activity:.0f}s)")
                     await self._cleanup_session(model_id)
 
             except asyncio.CancelledError:

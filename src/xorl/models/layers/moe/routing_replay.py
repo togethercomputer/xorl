@@ -75,9 +75,7 @@ class RoutingReplay:
         if not self.top_weights_list:
             return None
         # forward_index was already incremented by pop_forward, so use -1
-        return self.top_weights_list[self.forward_index - 1].to(
-            torch.cuda.current_device(), non_blocking=True
-        )
+        return self.top_weights_list[self.forward_index - 1].to(torch.cuda.current_device(), non_blocking=True)
 
     @torch.compiler.disable
     def pop_backward(self) -> torch.Tensor:
@@ -91,9 +89,7 @@ class RoutingReplay:
         """Read routing weights for the last popped backward index, if available."""
         if not self.top_weights_list:
             return None
-        return self.top_weights_list[self.backward_index - 1].to(
-            torch.cuda.current_device(), non_blocking=True
-        )
+        return self.top_weights_list[self.backward_index - 1].to(torch.cuda.current_device(), non_blocking=True)
 
     @property
     def has_weights(self) -> bool:

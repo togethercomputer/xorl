@@ -5,6 +5,7 @@ import importlib.util
 from functools import lru_cache
 from typing import TYPE_CHECKING, Dict
 
+import torch
 from packaging import version
 
 
@@ -59,8 +60,6 @@ is_flash_attn_2_available = is_flash_attn_available
 
 
 def is_fused_moe_available() -> bool:
-    import torch
-
     return torch.cuda.is_available() and _PACKAGE_FLAGS["triton"]
 
 
@@ -72,5 +71,3 @@ def is_torch_version_greater_than(value: str) -> bool:
 @lru_cache
 def is_transformers_version_greater_or_equal_to(value: str) -> bool:
     return _get_package_version("transformers") > version.parse(value)
-
-

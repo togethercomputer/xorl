@@ -27,6 +27,7 @@ import torch.nn as nn
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+
 def setup():
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
@@ -66,6 +67,7 @@ def allclose_distributed(a: torch.Tensor, b: torch.Tensor, atol: float, rtol: fl
 
 # ── Core dispatch/combine runner ──────────────────────────────────────────────
 
+
 def run_one_pass(
     ep_dispatch: str,
     hidden_states: torch.Tensor,
@@ -81,11 +83,11 @@ def run_one_pass(
     buffer=None,
 ):
     """One forward + backward pass with a given dispatch backend."""
-    from xorl.models.layers.moe.backend import EP_DISPATCH, EP_COMBINE, EP_EXPERT_COMPUTE
+    from xorl.models.layers.moe.backend import EP_COMBINE, EP_DISPATCH, EP_EXPERT_COMPUTE  # noqa: PLC0415
 
     dispatch_fn = EP_DISPATCH[ep_dispatch]
-    combine_fn  = EP_COMBINE[ep_dispatch]
-    compute_fn  = EP_EXPERT_COMPUTE["triton"]
+    combine_fn = EP_COMBINE[ep_dispatch]
+    compute_fn = EP_EXPERT_COMPUTE["triton"]
 
     x = hidden_states.detach().requires_grad_(True)
 
@@ -102,7 +104,8 @@ def run_one_pass(
         dispatch_kwargs["num_local_experts"] = num_local_experts
 
     permuted, cumsum, ctx = dispatch_fn(**dispatch_kwargs)
-    expert_out = compute_fn(permuted, cumsum, gate_proj, up_proj, down_proj)
+    expert_scores = getattr(ctx, "expert_scores", getattr(ctx, "permuted_scores", None))
+    expert_out = compute_fn(permuted, cumsum, gate_proj, up_proj, down_proj, expert_scores)
 
     if ep_dispatch == "alltoall":
         combine_kwargs = dict(expert_output=expert_out, ctx=ctx, ep_group=ep_group)
@@ -116,6 +119,7 @@ def run_one_pass(
 
 
 # ── Single test case ──────────────────────────────────────────────────────────
+
 
 def run_test(
     num_tokens: int,
@@ -131,7 +135,9 @@ def run_test(
     num_experts = world_size
     num_local_experts = 1
 
-    log(f"  [{num_tokens}tok, h={hidden_dim}, ffn={intermediate_size}, top{topk}]  ", )
+    log(
+        f"  [{num_tokens}tok, h={hidden_dim}, ffn={intermediate_size}, top{topk}]  ",
+    )
 
     ep_group = dist.new_group(list(range(world_size)))
 
@@ -139,7 +145,7 @@ def run_test(
     torch.manual_seed(0)
     scale = (2.0 / (hidden_dim + intermediate_size)) ** 0.5
     gate = nn.Parameter(torch.randn(1, hidden_dim, intermediate_size, device=device, dtype=torch.bfloat16) * scale)
-    up   = nn.Parameter(torch.randn(1, hidden_dim, intermediate_size, device=device, dtype=torch.bfloat16) * scale)
+    up = nn.Parameter(torch.randn(1, hidden_dim, intermediate_size, device=device, dtype=torch.bfloat16) * scale)
     down = nn.Parameter(torch.randn(1, intermediate_size, hidden_dim, device=device, dtype=torch.bfloat16) * scale)
     for p in [gate, up, down]:
         dist.broadcast(p.data, src=0)
@@ -158,21 +164,44 @@ def run_test(
 
     # ── AllToAll ──────────────────────────────────────────────────────────────
     out_a2a, grad_a2a = run_one_pass(
-        "alltoall", hidden, topk_w, topk_idx,
-        gate, up, down, ep_group, num_experts, num_local_experts, grad_out,
+        "alltoall",
+        hidden,
+        topk_w,
+        topk_idx,
+        gate,
+        up,
+        down,
+        ep_group,
+        num_experts,
+        num_local_experts,
+        grad_out,
     )
-    gate.grad = None; up.grad = None; down.grad = None
+    gate.grad = None
+    up.grad = None
+    down.grad = None
 
     # ── DeepEP ───────────────────────────────────────────────────────────────
-    from xorl.distributed.moe.deepep import DeepEPBuffer
+    from xorl.distributed.moe.deepep import DeepEPBuffer  # noqa: PLC0415
+
     buffer = DeepEPBuffer(ep_group=ep_group, buffer_size_gb=1.0)
     out_dep, grad_dep = run_one_pass(
-        "deepep", hidden, topk_w, topk_idx,
-        gate, up, down, ep_group, num_experts, num_local_experts, grad_out,
+        "deepep",
+        hidden,
+        topk_w,
+        topk_idx,
+        gate,
+        up,
+        down,
+        ep_group,
+        num_experts,
+        num_local_experts,
+        grad_out,
         buffer=buffer,
     )
     buffer.destroy_buffer()
-    gate.grad = None; up.grad = None; down.grad = None
+    gate.grad = None
+    up.grad = None
+    down.grad = None
 
     # ── Check ─────────────────────────────────────────────────────────────────
     fwd_abs = max_abs_diff(out_dep, out_a2a)
@@ -182,8 +211,7 @@ def run_test(
     bwd_ok = allclose_distributed(grad_dep, grad_a2a, atol=atol, rtol=rtol)
 
     log(
-        f"    fwd max_abs={fwd_abs:.2e} {'✓' if fwd_ok else '✗'}  |  "
-        f"bwd max_abs={bwd_abs:.2e} {'✓' if bwd_ok else '✗'}"
+        f"    fwd max_abs={fwd_abs:.2e} {'✓' if fwd_ok else '✗'}  |  bwd max_abs={bwd_abs:.2e} {'✓' if bwd_ok else '✗'}"
     )
 
     return fwd_ok and bwd_ok
@@ -191,20 +219,20 @@ def run_test(
 
 # ── Test suite ────────────────────────────────────────────────────────────────
 
+
 def run_all_tests() -> bool:
     world_size = dist.get_world_size()
     cross_node = world_size > 8
 
-    log(f"\n{'='*65}")
-    log(f"  DeepEP vs AllToAll Correctness — world_size={world_size} "
-        f"({'cross-node' if cross_node else 'single-node'})")
-    log(f"{'='*65}")
+    log(f"\n{'=' * 65}")
+    log(f"  DeepEP vs AllToAll Correctness — world_size={world_size} ({'cross-node' if cross_node else 'single-node'})")
+    log(f"{'=' * 65}")
 
     configs = [
-        dict(num_tokens=16,  hidden_dim=256,   intermediate_size=512,  topk=2),
-        dict(num_tokens=32,  hidden_dim=512,   intermediate_size=1024, topk=4),
-        dict(num_tokens=64,  hidden_dim=1024,  intermediate_size=2048, topk=4),
-        dict(num_tokens=64,  hidden_dim=2048,  intermediate_size=4096, topk=8),
+        dict(num_tokens=16, hidden_dim=256, intermediate_size=512, topk=2),
+        dict(num_tokens=32, hidden_dim=512, intermediate_size=1024, topk=4),
+        dict(num_tokens=64, hidden_dim=1024, intermediate_size=2048, topk=4),
+        dict(num_tokens=64, hidden_dim=2048, intermediate_size=4096, topk=8),
     ]
 
     all_ok = True
@@ -214,7 +242,7 @@ def run_all_tests() -> bool:
             all_ok = False
 
     log(f"\n  {'[PASS] All tests passed ✓' if all_ok else '[FAIL] Some tests failed ✗'}")
-    log(f"{'='*65}\n")
+    log(f"{'=' * 65}\n")
     return all_ok
 
 
@@ -224,6 +252,7 @@ if __name__ == "__main__":
     # Add NVSHMEM lib to LD_LIBRARY_PATH for DeepEP internode transport
     try:
         import nvidia.nvshmem
+
         nvshmem_lib = os.path.join(list(nvidia.nvshmem.__path__)[0], "lib")
         existing = os.environ.get("LD_LIBRARY_PATH", "")
         if nvshmem_lib not in existing:

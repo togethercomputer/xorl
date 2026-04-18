@@ -18,10 +18,11 @@ This module provides wrapper functions that adapt quack-kernels' CuTe-based GEMM
 kernels to the Xorl group GEMM API. Requires SM90+ (H100) or SM100+ (B200).
 """
 
+import os
 from typing import Optional
 
-import os
 import torch
+
 from xorl.ops.quack.gemm_interface import gemm as quack_gemm
 
 

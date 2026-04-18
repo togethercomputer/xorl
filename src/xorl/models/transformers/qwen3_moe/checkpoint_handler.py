@@ -1,19 +1,28 @@
 """Checkpoint handler for Qwen3 MoE models."""
 
-from typing import Callable, List, Optional, Set, Tuple
+import re
+import warnings
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
 
 from ...checkpoint_handlers.base import CheckpointHandler
 from ...checkpoint_handlers.buffers import (
-    ExpertWeightBuffer, GateUpMergeBuffer, QKVMergeBuffer,
-    QLoRAWeightBuffer, QLoRAExpertBuffer,
-    parse_expert_key, parse_expert_full_key,
-    EXPERT_QUANT_AUX_PATTERN, QUANT_AUX_SUFFIX_PATTERN,
+    DENSE_DOWN_PROJ_PATTERN,
+    DENSE_GATE_UP_PATTERN,
+    EXPERT_QUANT_AUX_PATTERN,
     FP8_AUX_SUFFIX_PATTERN,
-    QKV_PROJ_PATTERN, DENSE_GATE_UP_PATTERN,
-    OPROJ_WEIGHT_PATTERN, DENSE_DOWN_PROJ_PATTERN,
+    OPROJ_WEIGHT_PATTERN,
+    QKV_PROJ_PATTERN,
+    QUANT_AUX_SUFFIX_PATTERN,
+    ExpertWeightBuffer,
+    GateUpMergeBuffer,
+    QKVMergeBuffer,
+    QLoRAExpertBuffer,
+    QLoRAWeightBuffer,
+    parse_expert_full_key,
+    parse_expert_key,
 )
 
 
@@ -43,6 +52,10 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
     - Expert merging is always active (stacking per-expert HF weights).
     """
 
+    _STACKED_EXPERT_SPLIT_PATTERN = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(gate|up|down)_proj$")
+    _FUSED_EXPERT_GATE_UP_PATTERN = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.gate_up_proj$")
+    _FUSED_EXPERT_DOWN_PATTERN = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.down_proj$")
+
     def __init__(
         self,
         num_experts: int,
@@ -54,6 +67,7 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
         checkpoint_has_per_expert: bool = True,
         skip_qkv_merge: bool = False,
         skip_gate_up_merge: bool = False,
+        skip_expert_loading: bool = False,
         is_prequantized: bool = False,
         exclude_modules: Optional[Set[str]] = None,
         device: Optional["torch.device"] = None,
@@ -61,9 +75,12 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
     ):
         self._expert_buffer: Optional[ExpertWeightBuffer] = None
         # Non-QLoRA expert stacking (disabled when pre-quantized — use QLoRAExpertBuffer instead)
-        if checkpoint_has_per_expert and not is_prequantized:
+        if checkpoint_has_per_expert and not is_prequantized and not skip_expert_loading:
             self._expert_buffer = ExpertWeightBuffer(
-                num_experts, ep_rank=ep_rank, ep_size=ep_size, device=device,
+                num_experts,
+                ep_rank=ep_rank,
+                ep_size=ep_size,
+                device=device,
             )
         self._qkv_buffer: Optional[QKVMergeBuffer] = None
         if not skip_qkv_merge:
@@ -71,9 +88,16 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
         self._gate_up_buffer: Optional[GateUpMergeBuffer] = None
         if not skip_gate_up_merge:
             self._gate_up_buffer = GateUpMergeBuffer()
+        self._stacked_gate_up_pending: Dict[int, Dict[str, torch.Tensor]] = {}
         self._q_dim = num_attention_heads * head_dim
         self._kv_dim = num_key_value_heads * head_dim
+        self._ep_rank = ep_rank
+        self._ep_size = ep_size
+        self._local_num_experts = num_experts // ep_size
+        self._expert_start = ep_rank * self._local_num_experts
+        self._expert_end = self._expert_start + self._local_num_experts
         self._is_prequantized = is_prequantized
+        self._skip_expert_loading = skip_expert_loading
         self._exclude_modules = exclude_modules or set()
         # Inline QLoRA weight loading for dense modules (attention, shared expert)
         self._qlora_buffer: Optional[QLoRAWeightBuffer] = None
@@ -83,8 +107,92 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
         self._qlora_expert_buffer = None
         if is_prequantized and model is not None:
             self._qlora_expert_buffer = QLoRAExpertBuffer(
-                model, ep_rank=ep_rank, ep_size=ep_size, num_experts=num_experts,
+                model,
+                ep_rank=ep_rank,
+                ep_size=ep_size,
+                num_experts=num_experts,
             )
+
+    def _slice_expert_tensor_for_ep(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self._ep_size == 1:
+            return tensor
+        return tensor[self._expert_start : self._expert_end].contiguous()
+
+    def _maybe_finalize_per_expert_merge(
+        self,
+        layer_idx: int,
+        proj: str,
+    ) -> List[Tuple[str, torch.Tensor]]:
+        if self._expert_buffer is None:
+            return []
+
+        if proj in {"gate", "up"}:
+            if not (
+                self._expert_buffer.is_complete(layer_idx, "gate") and self._expert_buffer.is_complete(layer_idx, "up")
+            ):
+                return []
+            gate = self._expert_buffer.pop_stacked(layer_idx, "gate")
+            up = self._expert_buffer.pop_stacked(layer_idx, "up")
+            return [
+                (
+                    ExpertWeightBuffer.get_gate_up_name(layer_idx),
+                    torch.cat([gate, up], dim=2),
+                )
+            ]
+
+        if proj == "down" and self._expert_buffer.is_complete(layer_idx, "down"):
+            return [
+                (
+                    ExpertWeightBuffer.get_fused_name(layer_idx, "down"),
+                    self._expert_buffer.pop_stacked(layer_idx, "down"),
+                )
+            ]
+
+        return []
+
+    def _handle_stacked_expert_weights(
+        self,
+        key: str,
+        tensor: torch.Tensor,
+    ) -> Optional[List[Tuple[str, torch.Tensor]]]:
+        gate_up_match = self._FUSED_EXPERT_GATE_UP_PATTERN.match(key)
+        if gate_up_match is not None:
+            tensor = self._slice_expert_tensor_for_ep(tensor)
+            if tensor.ndim == 3 and tensor.shape[1] < tensor.shape[2]:
+                tensor = tensor.transpose(1, 2).contiguous()
+            return [(key, tensor)]
+
+        down_match = self._FUSED_EXPERT_DOWN_PATTERN.match(key)
+        if down_match is not None:
+            tensor = self._slice_expert_tensor_for_ep(tensor)
+            if tensor.ndim == 3 and tensor.shape[1] > tensor.shape[2]:
+                tensor = tensor.transpose(1, 2).contiguous()
+            return [(key, tensor)]
+
+        split_match = self._STACKED_EXPERT_SPLIT_PATTERN.match(key)
+        if split_match is None:
+            return None
+
+        layer_idx = int(split_match.group(1))
+        proj = split_match.group(2)
+        tensor = self._slice_expert_tensor_for_ep(tensor)
+
+        if proj == "down":
+            return [(f"model.layers.{layer_idx}.mlp.experts.down_proj", tensor.transpose(1, 2).contiguous())]
+
+        pending = self._stacked_gate_up_pending.setdefault(layer_idx, {})
+        pending[proj] = tensor
+        if "gate" in pending and "up" in pending:
+            gate = pending.pop("gate")
+            up = pending.pop("up")
+            del self._stacked_gate_up_pending[layer_idx]
+            return [
+                (
+                    f"model.layers.{layer_idx}.mlp.experts.gate_up_proj",
+                    torch.cat([gate.transpose(1, 2), up.transpose(1, 2)], dim=2).contiguous(),
+                )
+            ]
+        return []
 
     def get_skip_key_fn(self) -> Optional[Callable[[str], bool]]:
         """Return predicate to skip keys during loading.
@@ -96,23 +204,26 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
 
         When inline buffers are active, in-range keys flow through on_load_weight.
         """
-        has_ep_filter = (
-            self._expert_buffer is not None
-            and not (self._expert_buffer.expert_start == 0
-                     and self._expert_buffer.expert_end == self._expert_buffer.num_experts)
+        has_ep_filter = self._expert_buffer is not None and not (
+            self._expert_buffer.expert_start == 0 and self._expert_buffer.expert_end == self._expert_buffer.num_experts
         )
-        has_expert_ep_filter = (
-            self._qlora_expert_buffer is not None
-            and not (self._qlora_expert_buffer.expert_start == 0
-                     and self._qlora_expert_buffer.expert_end == self._qlora_expert_buffer._num_experts)
+        has_expert_ep_filter = self._qlora_expert_buffer is not None and not (
+            self._qlora_expert_buffer.expert_start == 0
+            and self._qlora_expert_buffer.expert_end == self._qlora_expert_buffer._num_experts
         )
 
-        if not has_ep_filter and not has_expert_ep_filter and not self._is_prequantized:
+        if (
+            not has_ep_filter
+            and not has_expert_ep_filter
+            and not self._is_prequantized
+            and not self._skip_expert_loading
+        ):
             return None
 
         ep_start = self._expert_buffer.expert_start if has_ep_filter else 0
         ep_end = self._expert_buffer.expert_end if has_ep_filter else 0
         is_prequantized = self._is_prequantized
+        skip_expert_loading = self._skip_expert_loading
         exclude_modules = self._exclude_modules
         has_qlora_buffer = self._qlora_buffer is not None
         has_qlora_expert_buffer = self._qlora_expert_buffer is not None
@@ -121,6 +232,15 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
             qe_end = self._qlora_expert_buffer.expert_end
 
         def _should_skip(key: str) -> bool:
+            if skip_expert_loading:
+                if parse_expert_full_key(key) is not None:
+                    return True
+                if self._STACKED_EXPERT_SPLIT_PATTERN.match(key) is not None:
+                    return True
+                if self._FUSED_EXPERT_GATE_UP_PATTERN.match(key) is not None:
+                    return True
+                if self._FUSED_EXPERT_DOWN_PATTERN.match(key) is not None:
+                    return True
             if is_prequantized:
                 # Don't skip keys belonging to excluded modules — they're bf16, load normally.
                 if exclude_modules:
@@ -152,8 +272,12 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
                     if FP8_AUX_SUFFIX_PATTERN.search(key):
                         return True
                     if key.endswith(".weight"):
-                        if (QKV_PROJ_PATTERN.match(key) or DENSE_GATE_UP_PATTERN.match(key)
-                                or OPROJ_WEIGHT_PATTERN.match(key) or DENSE_DOWN_PROJ_PATTERN.match(key)):
+                        if (
+                            QKV_PROJ_PATTERN.match(key)
+                            or DENSE_GATE_UP_PATTERN.match(key)
+                            or OPROJ_WEIGHT_PATTERN.match(key)
+                            or DENSE_DOWN_PROJ_PATTERN.match(key)
+                        ):
                             return True
 
             # Skip out-of-range expert keys for EP (non-prequantized path)
@@ -174,9 +298,17 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
         module_short_name = module_fqn.rsplit(".", 1)[-1]
         return module_short_name in self._exclude_modules
 
-    def on_load_weight(
-        self, key: str, tensor: torch.Tensor
-    ) -> List[Tuple[str, torch.Tensor]]:
+    def on_load_weight(self, key: str, tensor: torch.Tensor) -> List[Tuple[str, torch.Tensor]]:
+        if self._skip_expert_loading:
+            if parse_expert_full_key(key) is not None:
+                return []
+            if self._STACKED_EXPERT_SPLIT_PATTERN.match(key) is not None:
+                return []
+            if self._FUSED_EXPERT_GATE_UP_PATTERN.match(key) is not None:
+                return []
+            if self._FUSED_EXPERT_DOWN_PATTERN.match(key) is not None:
+                return []
+
         # Drop input_scale (unused by our quantization)
         if key.endswith(".input_scale"):
             return []
@@ -208,19 +340,20 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
                 if OPROJ_WEIGHT_PATTERN.match(key) or DENSE_DOWN_PROJ_PATTERN.match(key):
                     return []
 
-        # 1. Check expert merge (disabled when prequantized — expert_buffer is None)
+        # 1. Handle internal stacked/fused expert tensors.
+        stacked_expert_results = self._handle_stacked_expert_weights(key, tensor)
+        if stacked_expert_results is not None:
+            return stacked_expert_results
+
+        # 2. Check expert merge (disabled when prequantized — expert_buffer is None)
         if self._expert_buffer is not None:
             parsed = parse_expert_key(key)
             if parsed is not None:
                 layer_idx, expert_idx, proj = parsed
                 self._expert_buffer.add(layer_idx, expert_idx, proj, tensor)
-                if self._expert_buffer.is_complete(layer_idx, proj):
-                    fused_name = ExpertWeightBuffer.get_fused_name(layer_idx, proj)
-                    stacked = self._expert_buffer.pop_stacked(layer_idx, proj)
-                    return [(fused_name, stacked)]
-                return []
+                return self._maybe_finalize_per_expert_merge(layer_idx, proj)
 
-        # 2. Check QKV merge (skipped when unfused for TP)
+        # 3. Check QKV merge (skipped when unfused for TP)
         if self._qkv_buffer is not None:
             # When pre-quantized, QKV .weight keys are uint8 packed —
             # skip standard merging, they'll be loaded by QLoRALinear
@@ -234,7 +367,7 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
             if self._qkv_buffer.is_qkv_key(key):
                 return []
 
-        # 3. Check gate/up merge (skipped when unfused for TP)
+        # 4. Check gate/up merge (skipped when unfused for TP)
         if self._gate_up_buffer is not None:
             # When pre-quantized, gate/up .weight keys are uint8 packed —
             # skip standard merging, they'll be loaded by QLoRALinear
@@ -248,12 +381,10 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
             if self._gate_up_buffer.is_gate_up_key(key):
                 return []
 
-        # 4. Passthrough
+        # 5. Passthrough
         return [(key, tensor)]
 
-    def on_skip_weight(
-        self, key: str
-    ) -> List[Tuple[str, torch.Tensor]]:
+    def on_skip_weight(self, key: str) -> List[Tuple[str, torch.Tensor]]:
         """Count a skipped expert key so completion tracking stays correct."""
         # QLoRA expert buffer: count skipped out-of-range expert keys
         if self._qlora_expert_buffer is not None:
@@ -264,18 +395,16 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
             if parsed is not None:
                 layer_idx, _expert_idx, proj = parsed
                 self._expert_buffer.count_skipped(layer_idx, proj)
-                if self._expert_buffer.is_complete(layer_idx, proj):
-                    fused_name = ExpertWeightBuffer.get_fused_name(layer_idx, proj)
-                    stacked = self._expert_buffer.pop_stacked(layer_idx, proj)
-                    return [(fused_name, stacked)]
+                return self._maybe_finalize_per_expert_merge(layer_idx, proj)
         return []
 
     def on_load_complete(self) -> List[Tuple[str, torch.Tensor]]:
-        import warnings
         if self._expert_buffer is not None:
             pending = self._expert_buffer.get_pending_counts()
             if pending:
                 warnings.warn(f"Incomplete expert weights after loading: {pending}")
+        if self._stacked_gate_up_pending:
+            warnings.warn(f"Incomplete stacked expert gate/up merges after loading: {self._stacked_gate_up_pending}")
         if self._gate_up_buffer is not None:
             pending_gu = self._gate_up_buffer.get_pending()
             if pending_gu:
@@ -291,15 +420,31 @@ class Qwen3MoeCheckpointHandler(CheckpointHandler):
             pending_exp = self._qlora_expert_buffer.get_pending()
             if pending_exp:
                 warnings.warn(
-                    f"Incomplete QLoRA expert weights after loading "
-                    f"(will fall back to deferred loading): {pending_exp}"
+                    f"Incomplete QLoRA expert weights after loading (will fall back to deferred loading): {pending_exp}"
                 )
             self._qlora_expert_buffer.set_inline_metadata()
         return []
 
-    def on_save_weight(
-        self, param_name: str, tensor: torch.Tensor
-    ) -> List[Tuple[str, torch.Tensor]]:
+    def on_save_weight(self, param_name: str, tensor: torch.Tensor) -> List[Tuple[str, torch.Tensor]]:
+        # Split fused MoE experts into per-expert HF weights.
+        if param_name.endswith(".mlp.experts.gate_up_proj"):
+            prefix = param_name.rsplit(".gate_up_proj", 1)[0]
+            half = tensor.shape[2] // 2
+            gate = tensor[:, :, :half].transpose(1, 2).contiguous()
+            up = tensor[:, :, half:].transpose(1, 2).contiguous()
+            result = []
+            for expert_idx in range(tensor.shape[0]):
+                result.append((f"{prefix}.{expert_idx}.gate_proj.weight", gate[expert_idx]))
+                result.append((f"{prefix}.{expert_idx}.up_proj.weight", up[expert_idx]))
+            return result
+
+        if param_name.endswith(".mlp.experts.down_proj"):
+            prefix = param_name.rsplit(".down_proj", 1)[0]
+            down = tensor.transpose(1, 2).contiguous()
+            return [
+                (f"{prefix}.{expert_idx}.down_proj.weight", down[expert_idx]) for expert_idx in range(tensor.shape[0])
+            ]
+
         # Split gate_up_proj -> gate_proj + up_proj (shared expert / dense layers)
         if ".gate_up_proj." in param_name:
             prefix, suffix = param_name.rsplit(".gate_up_proj.", 1)

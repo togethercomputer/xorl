@@ -5,11 +5,11 @@ Tests the _pp_nccl_transfer_buffer protocol and _prod helper without
 requiring a full distributed environment.
 """
 
-import pytest
-import torch
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
-from xorl.server.weight_sync.handler import _prod
+import torch
+
+from xorl.server.weight_sync.handler import WeightSyncHandler, _prod
 
 
 class TestProd:
@@ -37,7 +37,7 @@ class TestPPNcclTransferBuffer:
         handler = MagicMock()
         handler.rank = rank
         # Bind the real method
-        from xorl.server.weight_sync.handler import WeightSyncHandler
+
         handler._pp_nccl_transfer_buffer = WeightSyncHandler._pp_nccl_transfer_buffer.__get__(handler)
         return handler
 
@@ -80,6 +80,7 @@ class TestPPNcclTransferBuffer:
         # Simulate broadcast_object_list delivering empty metadata
         def fake_broadcast_object_list(obj, src, group):
             obj[0] = []  # empty metadata from sender
+
         mock_dist.broadcast_object_list = fake_broadcast_object_list
 
         result = handler._pp_nccl_transfer_buffer(None, MagicMock(), src_global, "cuda:0")

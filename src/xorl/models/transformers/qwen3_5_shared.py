@@ -6,6 +6,7 @@ from typing import Optional
 
 import torch
 
+
 QWEN3_5_CHECKPOINT_CONVERSION_MAPPING = {
     r"^model\.language_model\.": "model.",
     r"^language_model\.": "model.",
@@ -17,33 +18,15 @@ QWEN3_5_CHECKPOINT_SKIP_KEY_PATTERNS = [
     r"^mtp\.",
 ]
 
-_LINEAR_ATTN_QKV_PATTERN = re.compile(
-    r"^model\.layers\.(\d+)\.linear_attn\.in_proj_qkv\.weight$"
-)
-_LINEAR_ATTN_Z_PATTERN = re.compile(
-    r"^model\.layers\.(\d+)\.linear_attn\.in_proj_z\.weight$"
-)
-_LINEAR_ATTN_B_PATTERN = re.compile(
-    r"^model\.layers\.(\d+)\.linear_attn\.in_proj_b\.weight$"
-)
-_LINEAR_ATTN_A_PATTERN = re.compile(
-    r"^model\.layers\.(\d+)\.linear_attn\.in_proj_a\.weight$"
-)
-_LINEAR_ATTN_CONV_PATTERN = re.compile(
-    r"^model\.layers\.(\d+)\.linear_attn\.conv1d\.weight$"
-)
-_LINEAR_ATTN_OUT_PATTERN = re.compile(
-    r"^model\.layers\.(\d+)\.linear_attn\.out_proj\.weight$"
-)
-_LINEAR_ATTN_NORM_PATTERN = re.compile(
-    r"^model\.layers\.(\d+)\.linear_attn\.norm\.weight$"
-)
-_LINEAR_ATTN_DT_PATTERN = re.compile(
-    r"^model\.layers\.(\d+)\.linear_attn\.dt_bias$"
-)
-_LINEAR_ATTN_A_LOG_PATTERN = re.compile(
-    r"^model\.layers\.(\d+)\.linear_attn\.A_log$"
-)
+_LINEAR_ATTN_QKV_PATTERN = re.compile(r"^model\.layers\.(\d+)\.linear_attn\.in_proj_qkv\.weight$")
+_LINEAR_ATTN_Z_PATTERN = re.compile(r"^model\.layers\.(\d+)\.linear_attn\.in_proj_z\.weight$")
+_LINEAR_ATTN_B_PATTERN = re.compile(r"^model\.layers\.(\d+)\.linear_attn\.in_proj_b\.weight$")
+_LINEAR_ATTN_A_PATTERN = re.compile(r"^model\.layers\.(\d+)\.linear_attn\.in_proj_a\.weight$")
+_LINEAR_ATTN_CONV_PATTERN = re.compile(r"^model\.layers\.(\d+)\.linear_attn\.conv1d\.weight$")
+_LINEAR_ATTN_OUT_PATTERN = re.compile(r"^model\.layers\.(\d+)\.linear_attn\.out_proj\.weight$")
+_LINEAR_ATTN_NORM_PATTERN = re.compile(r"^model\.layers\.(\d+)\.linear_attn\.norm\.weight$")
+_LINEAR_ATTN_DT_PATTERN = re.compile(r"^model\.layers\.(\d+)\.linear_attn\.dt_bias$")
+_LINEAR_ATTN_A_LOG_PATTERN = re.compile(r"^model\.layers\.(\d+)\.linear_attn\.A_log$")
 
 LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE = (
     "Native FLA CP for Qwen3.5 linear_attention currently supports Ulysses-only CP only; "
@@ -89,6 +72,63 @@ def is_excluded_module_key(key: str, exclude_modules: Iterable[str]) -> bool:
 
 def has_linear_attention_layers(config: object) -> bool:
     return any(layer_type == "linear_attention" for layer_type in getattr(config, "layer_types", []))
+
+
+_LINEAR_ATTN_SPLIT_PATTERN = re.compile(
+    r"^(model\.layers\.(\d+)\.linear_attn)\.(q_proj|k_proj|v_proj|g_proj|a_proj|b_proj|"
+    r"q_conv1d|k_conv1d|v_conv1d|o_proj|o_norm|dt_bias|A_log)\.(weight|bias)$"
+)
+_LINEAR_ATTN_SPLIT_PATTERN_NO_SUFFIX = re.compile(r"^(model\.layers\.(\d+)\.linear_attn)\.(dt_bias|A_log)$")
+
+_SPLIT_TO_HF_RENAME = {
+    "g_proj": "in_proj_z",
+    "a_proj": "in_proj_a",
+    "b_proj": "in_proj_b",
+    "o_proj": "out_proj",
+    "o_norm": "norm",
+}
+
+_SPLIT_QKV_PARTS = {"q_proj", "k_proj", "v_proj"}
+_SPLIT_CONV_PARTS = {"q_conv1d", "k_conv1d", "v_conv1d"}
+
+
+def remap_linear_attention_params_for_inference(
+    buffer: list[tuple[str, "torch.Tensor"]],
+) -> list[tuple[str, "torch.Tensor"]]:
+    fuse_groups: dict[str, dict[str, "torch.Tensor"]] = {}
+    result: list[tuple[str, "torch.Tensor"]] = []
+
+    for name, tensor in buffer:
+        m = _LINEAR_ATTN_SPLIT_PATTERN.match(name)
+        if m is None:
+            m = _LINEAR_ATTN_SPLIT_PATTERN_NO_SUFFIX.match(name)
+        if m is None:
+            result.append((name, tensor))
+            continue
+
+        prefix = m.group(1)
+        proj = m.group(3)
+        rest = name[m.end(3) :]
+
+        if proj in _SPLIT_QKV_PARTS:
+            key = f"{prefix}.in_proj_qkv{rest}"
+            fuse_groups.setdefault(key, {})[proj] = tensor
+        elif proj in _SPLIT_CONV_PARTS:
+            key = f"{prefix}.conv1d{rest}"
+            fuse_groups.setdefault(key, {})[proj] = tensor
+        elif proj in _SPLIT_TO_HF_RENAME:
+            result.append((f"{prefix}.{_SPLIT_TO_HF_RENAME[proj]}{rest}", tensor))
+        else:
+            result.append((f"{prefix}.{proj}{rest}", tensor))
+
+    for fused_name, parts in fuse_groups.items():
+        if "q_proj" in parts:
+            ordered = [parts["q_proj"], parts["k_proj"], parts["v_proj"]]
+        else:
+            ordered = [parts["q_conv1d"], parts["k_conv1d"], parts["v_conv1d"]]
+        result.append((fused_name, torch.cat(ordered, dim=0)))
+
+    return result
 
 
 def map_qwen3_5_linear_attention_weight(

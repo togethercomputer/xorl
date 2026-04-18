@@ -4,6 +4,7 @@ from typing import Optional
 
 import torch
 
+
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 

@@ -16,15 +16,13 @@ from typing import List, Optional, Tuple
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch import Tensor
-
 from flash_attn_interface import _flash_attn_backward, _flash_attn_forward
+from torch import Tensor
 
 
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
-
 
 
 def _merge_attn_outputs(
@@ -186,9 +184,7 @@ def _zigzag_min_chunk_id(rank: int, ringattn_size: int) -> int:
     return min(rank, 2 * ringattn_size - 1 - rank)
 
 
-def _get_zigzag_step_section(
-    ringattn_rank: int, ringattn_size: int, step: int
-) -> str:
+def _get_zigzag_step_section(ringattn_rank: int, ringattn_size: int, step: int) -> str:
     """Determine the section type for a load-balanced ring step.
 
     After zigzag, each rank has chunks at positions [min_r, max_r].
@@ -203,9 +199,9 @@ def _get_zigzag_step_section(
     min_q = _zigzag_min_chunk_id(ringattn_rank, ringattn_size)
     min_kv = _zigzag_min_chunk_id(source, ringattn_size)
     if min_q > min_kv:
-        return "lower"   # Q's early chunk is later → all Q attends to KV first half
+        return "lower"  # Q's early chunk is later → all Q attends to KV first half
     else:
-        return "upper"   # Q's early chunk is earlier → Q second half attends to all KV
+        return "upper"  # Q's early chunk is earlier → Q second half attends to all KV
 
 
 def _compute_half_indices(cu_seqlens: Tensor) -> Tuple[Tensor, Tensor]:
@@ -238,25 +234,54 @@ def _compute_half_indices(cu_seqlens: Tensor) -> Tuple[Tensor, Tensor]:
 # ---------------------------------------------------------------------------
 
 
-def _flash_fwd(q, k, v, softmax_scale, dropout_p, causal, is_varlen,
-               cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=None, max_seqlen_k=None):
+def _flash_fwd(
+    q,
+    k,
+    v,
+    softmax_scale,
+    dropout_p,
+    causal,
+    is_varlen,
+    cu_seqlens_q=None,
+    cu_seqlens_k=None,
+    max_seqlen_q=None,
+    max_seqlen_k=None,
+):
     """Flash attention forward (FA3). Handles both batched and varlen via cu_seqlens kwargs."""
     kwargs = dict(softmax_scale=softmax_scale, causal=causal)
     if is_varlen:
-        kwargs.update(cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
-                      max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k)
+        kwargs.update(
+            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k
+        )
     out, lse, _, _ = _flash_attn_forward(q, k, v, **kwargs)
     return out, lse
 
 
-def _flash_bwd(grad_out, q, k, v, out, lse, dq, dk, dv, softmax_scale, dropout_p,
-               causal, is_varlen, cu_seqlens_q=None, cu_seqlens_k=None,
-               max_seqlen_q=None, max_seqlen_k=None):
+def _flash_bwd(
+    grad_out,
+    q,
+    k,
+    v,
+    out,
+    lse,
+    dq,
+    dk,
+    dv,
+    softmax_scale,
+    dropout_p,
+    causal,
+    is_varlen,
+    cu_seqlens_q=None,
+    cu_seqlens_k=None,
+    max_seqlen_q=None,
+    max_seqlen_k=None,
+):
     """Flash attention backward (FA3). Handles both batched and varlen via cu_seqlens kwargs."""
     kwargs = dict(softmax_scale=softmax_scale, is_causal=causal, dq=dq, dk=dk, dv=dv)
     if is_varlen:
-        kwargs.update(cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
-                      max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k)
+        kwargs.update(
+            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k
+        )
     _flash_attn_backward(grad_out, q, k, v, out, lse, **kwargs)
 
 
@@ -371,40 +396,74 @@ class RingAttentionP2PFunc(torch.autograd.Function):
                         k_half = k_step.index_select(0, early_idx).contiguous()
                         v_half = v_step.index_select(0, early_idx).contiguous()
                         out_step, lse_step = _flash_fwd(
-                            q, k_half, v_half, softmax_scale, dropout_p,
-                            False, True,
-                            cu_seqlens_q, cu_half_k, max_seqlen_q, max_half_k,
+                            q,
+                            k_half,
+                            v_half,
+                            softmax_scale,
+                            dropout_p,
+                            False,
+                            True,
+                            cu_seqlens_q,
+                            cu_half_k,
+                            max_seqlen_q,
+                            max_half_k,
                         )
                     else:
                         half = k_step.shape[seq_dim] // 2
                         k_half = k_step.narrow(seq_dim, 0, half).contiguous()
                         v_half = v_step.narrow(seq_dim, 0, half).contiguous()
                         out_step, lse_step = _flash_fwd(
-                            q, k_half, v_half, softmax_scale, dropout_p,
-                            False, False,
+                            q,
+                            k_half,
+                            v_half,
+                            softmax_scale,
+                            dropout_p,
+                            False,
+                            False,
                         )
                 elif section == "upper":
                     # Late half of each doc in Q attends to all KV (no mask)
                     if is_varlen:
                         q_half = q.index_select(0, late_idx).contiguous()
                         out_step, lse_step = _flash_fwd(
-                            q_half, k_step, v_step, softmax_scale, dropout_p,
-                            False, True,
-                            cu_half_q, cu_seqlens_k, max_half_q, max_seqlen_k,
+                            q_half,
+                            k_step,
+                            v_step,
+                            softmax_scale,
+                            dropout_p,
+                            False,
+                            True,
+                            cu_half_q,
+                            cu_seqlens_k,
+                            max_half_q,
+                            max_seqlen_k,
                         )
                     else:
                         half = q.shape[seq_dim] // 2
                         q_half = q.narrow(seq_dim, half, half).contiguous()
                         out_step, lse_step = _flash_fwd(
-                            q_half, k_step, v_step, softmax_scale, dropout_p,
-                            False, False,
+                            q_half,
+                            k_step,
+                            v_step,
+                            softmax_scale,
+                            dropout_p,
+                            False,
+                            False,
                         )
                 else:
                     # Diagonal: causal on full sequence
                     out_step, lse_step = _flash_fwd(
-                        q, k_step, v_step, softmax_scale, dropout_p,
-                        True, is_varlen,
-                        cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                        q,
+                        k_step,
+                        v_step,
+                        softmax_scale,
+                        dropout_p,
+                        True,
+                        is_varlen,
+                        cu_seqlens_q,
+                        cu_seqlens_k,
+                        max_seqlen_q,
+                        max_seqlen_k,
                     )
 
                 computed_steps.append((i, section))
@@ -412,9 +471,17 @@ class RingAttentionP2PFunc(torch.autograd.Function):
                 # Non-causal or ringattn_size==1: no zigzag needed
                 step_causal = False
                 out_step, lse_step = _flash_fwd(
-                    q, k_step, v_step, softmax_scale, dropout_p,
-                    step_causal, is_varlen,
-                    cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                    q,
+                    k_step,
+                    v_step,
+                    softmax_scale,
+                    dropout_p,
+                    step_causal,
+                    is_varlen,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    max_seqlen_q,
+                    max_seqlen_k,
                 )
                 computed_steps.append((i, "full"))
 
@@ -426,15 +493,19 @@ class RingAttentionP2PFunc(torch.autograd.Function):
                     if is_varlen:
                         out[late_idx] = out_step
                         lse = torch.full(
-                            (q.shape[1], q.shape[0]), float("-inf"),
-                            dtype=torch.float32, device=q.device,
+                            (q.shape[1], q.shape[0]),
+                            float("-inf"),
+                            dtype=torch.float32,
+                            device=q.device,
                         )
                         lse[:, late_idx] = lse_step
                     else:
                         out.narrow(seq_dim, half, half).copy_(out_step)
                         lse = torch.full(
-                            (q.shape[0], q.shape[2], q.shape[1]), float("-inf"),
-                            dtype=torch.float32, device=q.device,
+                            (q.shape[0], q.shape[2], q.shape[1]),
+                            float("-inf"),
+                            dtype=torch.float32,
+                            device=q.device,
                         )
                         lse[:, :, half:] = lse_step
                 else:
@@ -446,7 +517,11 @@ class RingAttentionP2PFunc(torch.autograd.Function):
                     out_late = out[late_idx]
                     lse_late = lse[:, late_idx]
                     merged_out, merged_lse = _merge_attn_outputs(
-                        out_late, lse_late, out_step, lse_step, True,
+                        out_late,
+                        lse_late,
+                        out_step,
+                        lse_step,
+                        True,
                     )
                     out[late_idx] = merged_out.to(out.dtype)
                     lse[:, late_idx] = merged_lse
@@ -455,13 +530,21 @@ class RingAttentionP2PFunc(torch.autograd.Function):
                     out_second = out.narrow(seq_dim, half, half)
                     lse_second = lse[:, :, half:]
                     merged_out, merged_lse = _merge_attn_outputs(
-                        out_second, lse_second, out_step, lse_step, False,
+                        out_second,
+                        lse_second,
+                        out_step,
+                        lse_step,
+                        False,
                     )
                     out.narrow(seq_dim, half, half).copy_(merged_out)
                     lse[:, :, half:] = merged_lse
             else:
                 out, lse = _merge_attn_outputs(
-                    out, lse, out_step, lse_step, is_varlen,
+                    out,
+                    lse,
+                    out_step,
+                    lse_step,
+                    is_varlen,
                 )
 
         # Cast output back to input dtype
@@ -473,13 +556,17 @@ class RingAttentionP2PFunc(torch.autograd.Function):
             out = torch.zeros_like(q)
             if is_varlen:
                 lse = torch.full(
-                    (q.shape[1], q.shape[0]), float("-inf"),
-                    dtype=torch.float32, device=q.device,
+                    (q.shape[1], q.shape[0]),
+                    float("-inf"),
+                    dtype=torch.float32,
+                    device=q.device,
                 )
             else:
                 lse = torch.full(
-                    (q.shape[0], q.shape[2], q.shape[1]), float("-inf"),
-                    dtype=torch.float32, device=q.device,
+                    (q.shape[0], q.shape[2], q.shape[1]),
+                    float("-inf"),
+                    dtype=torch.float32,
+                    device=q.device,
                 )
 
         # Save for backward
@@ -562,10 +649,23 @@ class RingAttentionP2PFunc(torch.autograd.Function):
                         dk_step = torch.empty_like(k_half)
                         dv_step = torch.empty_like(v_half)
                         _flash_bwd(
-                            grad_output, q, k_half, v_half,
-                            out, lse, dq_step, dk_step, dv_step,
-                            ctx.softmax_scale, ctx.dropout_p, False, True,
-                            cu_seqlens_q, cu_half_k, ctx.max_seqlen_q, max_half_k,
+                            grad_output,
+                            q,
+                            k_half,
+                            v_half,
+                            out,
+                            lse,
+                            dq_step,
+                            dk_step,
+                            dv_step,
+                            ctx.softmax_scale,
+                            ctx.dropout_p,
+                            False,
+                            True,
+                            cu_seqlens_q,
+                            cu_half_k,
+                            ctx.max_seqlen_q,
+                            max_half_k,
                         )
                         dq.add_(dq_step)
                         # Scatter dk/dv back to early positions
@@ -579,9 +679,19 @@ class RingAttentionP2PFunc(torch.autograd.Function):
                         dk_step = torch.empty_like(k_half)
                         dv_step = torch.empty_like(v_half)
                         _flash_bwd(
-                            grad_output, q, k_half, v_half,
-                            out, lse, dq_step, dk_step, dv_step,
-                            ctx.softmax_scale, ctx.dropout_p, False, False,
+                            grad_output,
+                            q,
+                            k_half,
+                            v_half,
+                            out,
+                            lse,
+                            dq_step,
+                            dk_step,
+                            dv_step,
+                            ctx.softmax_scale,
+                            ctx.dropout_p,
+                            False,
+                            False,
                         )
                         dq.add_(dq_step)
                         dk_all[kv_source].narrow(seq_dim, 0, half).add_(dk_step)
@@ -598,10 +708,23 @@ class RingAttentionP2PFunc(torch.autograd.Function):
                         dk_step = torch.empty_like(k_step)
                         dv_step = torch.empty_like(v_step)
                         _flash_bwd(
-                            grad_half, q_half, k_step, v_step,
-                            out_half, lse_half, dq_step, dk_step, dv_step,
-                            ctx.softmax_scale, ctx.dropout_p, False, True,
-                            cu_half_q, cu_seqlens_k, max_half_q, ctx.max_seqlen_k,
+                            grad_half,
+                            q_half,
+                            k_step,
+                            v_step,
+                            out_half,
+                            lse_half,
+                            dq_step,
+                            dk_step,
+                            dv_step,
+                            ctx.softmax_scale,
+                            ctx.dropout_p,
+                            False,
+                            True,
+                            cu_half_q,
+                            cu_seqlens_k,
+                            max_half_q,
+                            ctx.max_seqlen_k,
                         )
                         dq[late_idx] += dq_step
                         dk_all[kv_source].add_(dk_step)
@@ -616,9 +739,19 @@ class RingAttentionP2PFunc(torch.autograd.Function):
                         dk_step = torch.empty_like(k_step)
                         dv_step = torch.empty_like(v_step)
                         _flash_bwd(
-                            grad_half, q_half, k_step, v_step,
-                            out_half, lse_half, dq_step, dk_step, dv_step,
-                            ctx.softmax_scale, ctx.dropout_p, False, False,
+                            grad_half,
+                            q_half,
+                            k_step,
+                            v_step,
+                            out_half,
+                            lse_half,
+                            dq_step,
+                            dk_step,
+                            dv_step,
+                            ctx.softmax_scale,
+                            ctx.dropout_p,
+                            False,
+                            False,
                         )
                         dq.narrow(seq_dim, half, half).add_(dq_step)
                         dk_all[kv_source].add_(dk_step)
@@ -630,10 +763,23 @@ class RingAttentionP2PFunc(torch.autograd.Function):
                     dk_step = torch.empty_like(k_step)
                     dv_step = torch.empty_like(v_step)
                     _flash_bwd(
-                        grad_output, q, k_step, v_step,
-                        out, lse, dq_step, dk_step, dv_step,
-                        ctx.softmax_scale, ctx.dropout_p, True, is_varlen,
-                        cu_seqlens_q, cu_seqlens_k, ctx.max_seqlen_q, ctx.max_seqlen_k,
+                        grad_output,
+                        q,
+                        k_step,
+                        v_step,
+                        out,
+                        lse,
+                        dq_step,
+                        dk_step,
+                        dv_step,
+                        ctx.softmax_scale,
+                        ctx.dropout_p,
+                        True,
+                        is_varlen,
+                        cu_seqlens_q,
+                        cu_seqlens_k,
+                        ctx.max_seqlen_q,
+                        ctx.max_seqlen_k,
                     )
                     dq.add_(dq_step)
                     dk_all[kv_source].add_(dk_step)
@@ -644,10 +790,23 @@ class RingAttentionP2PFunc(torch.autograd.Function):
                 dk_step = torch.empty_like(k_step)
                 dv_step = torch.empty_like(v_step)
                 _flash_bwd(
-                    grad_output, q, k_step, v_step,
-                    out, lse, dq_step, dk_step, dv_step,
-                    ctx.softmax_scale, ctx.dropout_p, step_causal, is_varlen,
-                    cu_seqlens_q, cu_seqlens_k, ctx.max_seqlen_q, ctx.max_seqlen_k,
+                    grad_output,
+                    q,
+                    k_step,
+                    v_step,
+                    out,
+                    lse,
+                    dq_step,
+                    dk_step,
+                    dv_step,
+                    ctx.softmax_scale,
+                    ctx.dropout_p,
+                    step_causal,
+                    is_varlen,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    ctx.max_seqlen_q,
+                    ctx.max_seqlen_k,
                 )
                 dq.add_(dq_step)
                 dk_all[kv_source].add_(dk_step)

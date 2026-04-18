@@ -8,13 +8,15 @@ The key verification points are:
 4. Gradients flow correctly through the EP path
 """
 
+from unittest.mock import MagicMock, patch
+
 import pytest
 import torch
-import torch.nn as nn
-from unittest.mock import MagicMock, patch
 from torch.distributed._tensor import Shard
 
 from xorl.models.layers.moe import MoEExpertsLoRA, MoELoRAConfig
+from xorl.models.transformers.qwen3_moe.parallelize import get_ep_plan
+
 
 pytestmark = [pytest.mark.distributed]
 
@@ -74,7 +76,6 @@ class TestParallelPlanLoRASlicing:
 
     def test_ep_plan_and_shard_tensor(self):
         """EP plan includes all LoRA patterns with Shard(0); shard_tensor slices by ep_rank."""
-        from xorl.models.transformers.qwen3_moe.parallelize import get_ep_plan
 
         plan = get_ep_plan()
 
@@ -119,7 +120,7 @@ class TestEPLoRAForwardAndGradients:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_ep_and_non_ep_forward_with_gradients(self):
         """Both EP and non-EP LoRA forward produce correct output shapes with gradient flow."""
-        from xorl.ops.moe.triton_lora import TritonEPGroupGemmWithLoRA, TritonMoeExpertsLoRAFunction
+        from xorl.ops.moe.triton_lora import TritonEPGroupGemmWithLoRA, TritonMoeExpertsLoRAFunction  # noqa: PLC0415
 
         device = "cuda"
         dtype = torch.bfloat16
@@ -144,9 +145,17 @@ class TestEPLoRAForwardAndGradients:
         scaling = 8.0 / 4.0
 
         output = TritonEPGroupGemmWithLoRA.apply(
-            permute_tokens, cumsum,
-            gate_proj, up_proj, down_proj,
-            gate_A, gate_B, up_A, up_B, down_A, down_B,
+            permute_tokens,
+            cumsum,
+            gate_proj,
+            up_proj,
+            down_proj,
+            gate_A,
+            gate_B,
+            up_A,
+            up_B,
+            down_A,
+            down_B,
             scaling,
         )
         assert output.shape == (num_tokens, hidden_dim)
@@ -170,9 +179,19 @@ class TestEPLoRAForwardAndGradients:
         expert_index = torch.randint(0, num_experts, (num_tokens2, top_k), device=device)
 
         output2 = TritonMoeExpertsLoRAFunction.apply(
-            num_experts, gate_weights, expert_index, hidden_states,
-            gate_proj2, up_proj2, down_proj2,
-            gate_A2, gate_B2, up_A2, up_B2, down_A2, down_B2,
+            num_experts,
+            gate_weights,
+            expert_index,
+            hidden_states,
+            gate_proj2,
+            up_proj2,
+            down_proj2,
+            gate_A2,
+            gate_B2,
+            up_A2,
+            up_B2,
+            down_A2,
+            down_B2,
             scaling,
         )
         assert output2.shape == (num_tokens2, hidden_dim)

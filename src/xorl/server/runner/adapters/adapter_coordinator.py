@@ -22,6 +22,7 @@ from xorl.server.protocol.operations import (
 )
 from xorl.server.runner.model_runner import ModelRunner
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -69,11 +70,13 @@ class AdapterCoordinator:
         # Broadcast metadata
         metadata = [None]
         if self.rank == 0:
-            metadata = [{
-                "global_step": adapter_state.global_step,
-                "global_forward_backward_step": adapter_state.global_forward_backward_step,
-                "lr": adapter_state.lr,
-            }]
+            metadata = [
+                {
+                    "global_step": adapter_state.global_step,
+                    "global_forward_backward_step": adapter_state.global_forward_backward_step,
+                    "lr": adapter_state.lr,
+                }
+            ]
         dist.broadcast_object_list(metadata, src=0, group=self.cpu_group)
 
         # Update metadata on non-rank-0 workers
@@ -156,18 +159,12 @@ class AdapterCoordinator:
 
         if checkpoint_path is None:
             # No checkpoint — register fresh adapter
-            logger.debug(
-                f"Rank {self.rank}: Auto-registering new adapter '{model_id}' "
-                f"(no previous checkpoint found)"
-            )
+            logger.debug(f"Rank {self.rank}: Auto-registering new adapter '{model_id}' (no previous checkpoint found)")
             self._register_fresh_adapter(model_id)
             return True, None
 
         # Auto-load from checkpoint
-        logger.debug(
-            f"Rank {self.rank}: Auto-loading evicted adapter '{model_id}' "
-            f"from checkpoint: {checkpoint_path}"
-        )
+        logger.debug(f"Rank {self.rank}: Auto-loading evicted adapter '{model_id}' from checkpoint: {checkpoint_path}")
 
         try:
             effective_lr = 1e-5  # Default, will be overwritten from checkpoint
@@ -191,8 +188,7 @@ class AdapterCoordinator:
 
         except Exception as e:
             logger.error(
-                f"Rank {self.rank}: Failed to auto-load adapter '{model_id}' "
-                f"from {checkpoint_path}: {e}",
+                f"Rank {self.rank}: Failed to auto-load adapter '{model_id}' from {checkpoint_path}: {e}",
                 exc_info=True,
             )
             return False, None
@@ -320,7 +316,9 @@ class AdapterCoordinator:
                     lr=lr,
                 )
 
-                logger.debug(f"Rank {self.rank}: load_adapter_state completed: model_id={model_id}, step={result.get('step', 0)}")
+                logger.debug(
+                    f"Rank {self.rank}: load_adapter_state completed: model_id={model_id}, step={result.get('step', 0)}"
+                )
 
             # Step 3: Broadcast loaded weights from rank 0 to all other ranks
             self.broadcast_adapter_state(model_id, effective_lr)
@@ -401,7 +399,9 @@ class AdapterCoordinator:
         model_id = p.model_id
         save_checkpoint = p.save_checkpoint
 
-        logger.debug(f"Rank {self.rank}: Handling kill_session for model_id={model_id}, save_checkpoint={save_checkpoint}")
+        logger.debug(
+            f"Rank {self.rank}: Handling kill_session for model_id={model_id}, save_checkpoint={save_checkpoint}"
+        )
 
         try:
             result = self.trainer.kill_session(model_id=model_id, save_checkpoint=save_checkpoint)

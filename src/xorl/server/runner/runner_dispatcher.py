@@ -70,28 +70,28 @@ import zmq.asyncio
 
 from xorl.data.collators import TextSequenceShardCollator
 from xorl.distributed.parallel_state import get_parallel_state
+from xorl.server.protocol.operations import (
+    EmptyData,
+    LoadStateData,
+    ModelPassData,
+    OptimStepData,
+    SaveFullWeightsData,
+    SaveLoraOnlyData,
+    SaveStateData,
+)
 from xorl.server.protocol.orchestrator_runner import (
     RunnerDispatchCommand,
     RunnerResponse,
 )
-from xorl.server.protocol.operations import (
-    ModelPassData,
-    OptimStepData,
-    SaveStateData,
-    SaveLoraOnlyData,
-    LoadStateData,
-    SaveFullWeightsData,
-    EmptyData,
-)
-from xorl.server.runner.utils import Rank0Protocol
+from xorl.server.runner.adapters import AdapterCoordinator
+from xorl.server.runner.model_runner import ModelRunner
 from xorl.server.runner.utils import (
+    Rank0Protocol,
     apply_sequence_sharding,
     convert_batch_to_tensors,
     simple_sequence_shard,
     validate_batch_shapes,
 )
-from xorl.server.runner.adapters import AdapterCoordinator
-from xorl.server.runner.model_runner import ModelRunner
 from xorl.server.weight_sync.handler import WeightSyncHandler
 
 
@@ -187,8 +187,7 @@ class RunnerDispatcher:
         self._worker_error: Optional[str] = None
 
         logger.info(
-            f"RunnerDispatcher initialized (rank={rank}/{world_size}, "
-            f"bind_address={bind_address}, device={device})"
+            f"RunnerDispatcher initialized (rank={rank}/{world_size}, bind_address={bind_address}, device={device})"
         )
 
     # Operations that participate in cross-rank error sync.
@@ -430,7 +429,10 @@ class RunnerDispatcher:
                 if handler:
                     result = await handler({})
                     return RunnerResponse(
-                        request_id=request.message_id, success=True, result=result, execution_time=time.time() - start_time
+                        request_id=request.message_id,
+                        success=True,
+                        result=result,
+                        execution_time=time.time() - start_time,
                     )
 
             # Prepare command dict (custom prepare or default pass-through)
@@ -470,7 +472,8 @@ class RunnerDispatcher:
                 if cross_rank_error:
                     self._worker_error = None
                     return RunnerResponse(
-                        request_id=request.message_id, success=False,
+                        request_id=request.message_id,
+                        success=False,
                         error=f"Cross-rank error: {cross_rank_error}",
                         execution_time=time.time() - start_time,
                     )
@@ -548,9 +551,7 @@ class RunnerDispatcher:
         await self._handle_compute_worker_receive(command_dict, with_backward=False)
         return {}
 
-    async def _handle_compute_rank0_scatter(
-        self, command_dict: Dict[str, Any], with_backward: bool
-    ) -> Dict[str, Any]:
+    async def _handle_compute_rank0_scatter(self, command_dict: Dict[str, Any], with_backward: bool) -> Dict[str, Any]:
         """Rank 0: select own batches from broadcast data, run compute, gather metrics.
 
         Uses broadcast-and-select pattern: all ranks received the full payload via
@@ -585,9 +586,15 @@ class RunnerDispatcher:
         cp_enabled = parallel_state.cp_enabled
 
         result = self._execute_and_gather(
-            my_batches, loss_fn, loss_fn_params, routed_experts,
-            cp_enabled, parallel_state,
-            with_backward=with_backward, model_id=model_id, is_rank0=True,
+            my_batches,
+            loss_fn,
+            loss_fn_params,
+            routed_experts,
+            cp_enabled,
+            parallel_state,
+            with_backward=with_backward,
+            model_id=model_id,
+            is_rank0=True,
             routed_expert_logits=routed_expert_logits,
         )
 
@@ -598,9 +605,7 @@ class RunnerDispatcher:
 
         return result
 
-    async def _handle_compute_worker_receive(
-        self, command_dict: Dict[str, Any], with_backward: bool
-    ) -> None:
+    async def _handle_compute_worker_receive(self, command_dict: Dict[str, Any], with_backward: bool) -> None:
         """Worker ranks: select own batches from broadcast data, run compute, participate in collective metrics.
 
         Uses broadcast-and-select pattern: workers get the full payload via
@@ -634,25 +639,46 @@ class RunnerDispatcher:
         cp_enabled = parallel_state.cp_enabled
 
         self._execute_and_gather(
-            my_batches, loss_fn, loss_fn_params, routed_experts,
-            cp_enabled, parallel_state,
-            with_backward=with_backward, model_id=model_id, is_rank0=False,
+            my_batches,
+            loss_fn,
+            loss_fn_params,
+            routed_experts,
+            cp_enabled,
+            parallel_state,
+            with_backward=with_backward,
+            model_id=model_id,
+            is_rank0=False,
             routed_expert_logits=routed_expert_logits,
         )
 
     # -- Helpers for compute handlers --
 
-    def _execute_and_gather(self, my_batches, loss_fn, loss_fn_params, routed_experts,
-                            cp_enabled, parallel_state, *, with_backward, model_id, is_rank0,
-                            routed_expert_logits=None):
+    def _execute_and_gather(
+        self,
+        my_batches,
+        loss_fn,
+        loss_fn_params,
+        routed_experts,
+        cp_enabled,
+        parallel_state,
+        *,
+        with_backward,
+        model_id,
+        is_rank0,
+        routed_expert_logits=None,
+    ):
         """Shard batches, execute compute, gather IS metrics. Shared by rank-0 and workers."""
         my_batches, routed_experts = self._shard_and_slice_batches(
             my_batches, routed_experts, cp_enabled, parallel_state
         )
 
         result = self._execute_compute(
-            my_batches, loss_fn, loss_fn_params, routed_experts,
-            with_backward=with_backward, model_id=model_id,
+            my_batches,
+            loss_fn,
+            loss_fn_params,
+            routed_experts,
+            with_backward=with_backward,
+            model_id=model_id,
             routed_expert_logits=routed_expert_logits,
         )
         del my_batches
@@ -731,7 +757,7 @@ class RunnerDispatcher:
         remainder = num_batches % dp_size
 
         start_idx, my_real_count = self._dp_batch_range(dp_rank, base_count, remainder)
-        my_raw_batches = raw_batches[start_idx:start_idx + my_real_count]
+        my_raw_batches = raw_batches[start_idx : start_idx + my_real_count]
 
         # Convert only this rank's batches to tensors
         my_batches = [self._convert_batch_to_tensors(b) for b in my_raw_batches]
@@ -753,14 +779,12 @@ class RunnerDispatcher:
                 for bi in range(g_start, g_start + g_count):
                     datum_offset += raw_batches[bi].get("num_samples", 1)
 
-            dp_datum_count = sum(
-                raw_batches[start_idx + i].get("num_samples", 1) for i in range(my_real_count)
-            )
+            dp_datum_count = sum(raw_batches[start_idx + i].get("num_samples", 1) for i in range(my_real_count))
 
             if routed_experts is not None:
-                routed_experts_slice = routed_experts[datum_offset:datum_offset + dp_datum_count]
+                routed_experts_slice = routed_experts[datum_offset : datum_offset + dp_datum_count]
             if routed_expert_logits is not None:
-                routed_expert_logits_slice = routed_expert_logits[datum_offset:datum_offset + dp_datum_count]
+                routed_expert_logits_slice = routed_expert_logits[datum_offset : datum_offset + dp_datum_count]
 
         logger.debug(
             f"Rank {self.rank}: _select_and_prepare_batches: dp_rank={dp_rank}/{dp_size}, "
@@ -797,40 +821,47 @@ class RunnerDispatcher:
             sharded_batches = []
             for i, batch in enumerate(my_batches):
                 try:
+                    # Generate position_ids before sharding if not present.
+                    # Under Ulysses SP, position_ids must be FULL-LENGTH so that
+                    # RoPE cos/sin are computed for global positions and then sliced
+                    # to the local shard inside prepare_position_embeddings.
+                    # Without this, the model falls back to arange(S_local) on each
+                    # rank, producing wrong position encodings for ranks > 0.
+                    if "position_ids" not in batch and "input_ids" in batch:
+                        input_ids = batch["input_ids"]
+                        seq_len = input_ids.shape[-1] if isinstance(input_ids, torch.Tensor) else len(input_ids)
+                        batch_size = (
+                            input_ids.shape[0] if isinstance(input_ids, torch.Tensor) and input_ids.ndim >= 2 else 1
+                        )
+                        batch["position_ids"] = (
+                            torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+                        )
+
                     # Store original position_ids for unpacking per-token outputs later
                     if "position_ids" in batch:
                         original_pos_ids = batch["position_ids"]
                         if isinstance(original_pos_ids, torch.Tensor):
                             batch["_original_position_ids"] = original_pos_ids.clone()
                         else:
-                            batch["_original_position_ids"] = torch.tensor(
-                                original_pos_ids, dtype=torch.long
-                            )
+                            batch["_original_position_ids"] = torch.tensor(original_pos_ids, dtype=torch.long)
 
                     sharded_batch = self._apply_sequence_sharding(batch)
                     sharded_batches.append(sharded_batch)
                 except Exception as e:
                     shapes = {
-                        k: tuple(v.shape) if isinstance(v, torch.Tensor) else type(v).__name__
-                        for k, v in batch.items()
+                        k: tuple(v.shape) if isinstance(v, torch.Tensor) else type(v).__name__ for k, v in batch.items()
                     }
-                    logger.error(
-                        f"Rank {self.rank}: Sharding failed on batch {i}. "
-                        f"Shapes: {shapes}. Error: {e}"
-                    )
+                    logger.error(f"Rank {self.rank}: Sharding failed on batch {i}. Shapes: {shapes}. Error: {e}")
                     raise
             my_batches = sharded_batches
-            logger.debug(
-                f"Rank {self.rank}: Applied sequence sharding locally "
-                f"(cp_rank={parallel_state.cp_rank})"
-            )
+            logger.debug(f"Rank {self.rank}: Applied sequence sharding locally (cp_rank={parallel_state.cp_rank})")
 
         # Slice routed_experts for this rank's datum subset
         if routed_experts is not None and my_batches:
             r3_offset = my_batches[0].pop("_r3_datum_offset", None)
             r3_count = my_batches[0].pop("_r3_datum_count", None)
             if r3_offset is not None and r3_count is not None:
-                routed_experts = routed_experts[r3_offset:r3_offset + r3_count]
+                routed_experts = routed_experts[r3_offset : r3_offset + r3_count]
 
         return my_batches, routed_experts
 
@@ -848,18 +879,22 @@ class RunnerDispatcher:
         """Execute forward or forward+backward on the model runner."""
         if with_backward:
             return self.trainer.forward_backward(
-                my_batches, loss_fn, loss_fn_params,
-                model_id=model_id, routed_experts=routed_experts,
+                my_batches,
+                loss_fn,
+                loss_fn_params,
+                model_id=model_id,
+                routed_experts=routed_experts,
                 routed_expert_logits=routed_expert_logits,
             )
         return self.trainer.forward(
-            my_batches, loss_fn, loss_fn_params, routed_experts=routed_experts,
+            my_batches,
+            loss_fn,
+            loss_fn_params,
+            routed_experts=routed_experts,
             routed_expert_logits=routed_expert_logits,
         )
 
-    def _gather_is_metrics(
-        self, result: Dict[str, Any], cp_enabled: bool, *, is_rank0: bool
-    ) -> None:
+    def _gather_is_metrics(self, result: Dict[str, Any], cp_enabled: bool, *, is_rank0: bool) -> None:
         """Gather importance-sampling metrics across ranks via all_gather.
 
         All ranks must call this together when SP is enabled.
@@ -879,9 +914,7 @@ class RunnerDispatcher:
                     for key in list(rank_result.keys()):
                         if key.startswith("is_") and key not in result:
                             result[key] = rank_result[key]
-                            logger.debug(
-                                f"Rank {self.rank}: Copied IS metric '{key}' from rank {i}"
-                            )
+                            logger.debug(f"Rank {self.rank}: Copied IS metric '{key}' from rank {i}")
             logger.debug(f"Rank {self.rank}: Final result keys: {list(result.keys())}")
 
         del all_results
@@ -976,8 +1009,7 @@ class RunnerDispatcher:
         model_id = p.model_id or "default"
 
         logger.debug(
-            f"Rank {self.rank}: Saving state to {checkpoint_path}, "
-            f"model_id={model_id}, save_optimizer={save_optimizer}"
+            f"Rank {self.rank}: Saving state to {checkpoint_path}, model_id={model_id}, save_optimizer={save_optimizer}"
         )
 
         # For LoRA models with save_optimizer=False (sampler weights), use fast PEFT-compatible save
@@ -1201,7 +1233,7 @@ class RunnerDispatcher:
     # Health Check Handlers
     # ========================================================================
 
-    async def _handle_health_check(self) -> Dict[str, Any]:
+    async def _handle_health_check(self, command_dict: Dict[str, Any] = None) -> Dict[str, Any]:
         """Handle health check on all ranks (unified handler)."""
         logger.debug(f"Rank {self.rank}: Health check")
 
@@ -1224,7 +1256,6 @@ class RunnerDispatcher:
 
     async def _handle_sync_inference_weights(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
         return await self._weight_sync_handler.handle_sync_inference_weights(command_dict)
-
 
     # ========================================================================
     # Adapter Operations (delegated to AdapterCoordinator)

@@ -14,8 +14,10 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+
 from xorl.ops.loss.loss_output import LossOutput
 from xorl.ops.loss.per_token_ce import compute_per_token_ce
+
 
 logger = logging.getLogger(__name__)
 
@@ -179,13 +181,19 @@ def policy_loss_function(
     advantages_flat = advantages.view(-1)
 
     # Create mask for valid tokens (use labels != ignore_index)
-    valid_mask = (labels_flat != ignore_index)
+    valid_mask = labels_flat != ignore_index
     n_valid = valid_mask.sum().clamp(min=1)
 
     # Compute cross-entropy (supports vocab-parallel TP via tp_group)
     per_token_ce = compute_per_token_ce(
-        hidden_states_flat, weight, labels_flat, ignore_index, ce_mode, num_chunks,
-        tp_group=tp_group, lm_head_fp32=lm_head_fp32,
+        hidden_states_flat,
+        weight,
+        labels_flat,
+        ignore_index,
+        ce_mode,
+        num_chunks,
+        tp_group=tp_group,
+        lm_head_fp32=lm_head_fp32,
     )
 
     new_logprobs_flat = -per_token_ce.detach()
@@ -239,8 +247,10 @@ def policy_loss_function(
     icepop_mask = None
     if icepop_beta is not None:
         if use_tis:
-            logger.warning("IcePop and TIS are both enabled. IcePop makes TIS redundant "
-                           "when using inference logprobs as old_logprobs.")
+            logger.warning(
+                "IcePop and TIS are both enabled. IcePop makes TIS redundant "
+                "when using inference logprobs as old_logprobs."
+            )
         ratio_d = ratio.detach()
         icepop_mask = (ratio_d >= 1.0 / icepop_beta) & (ratio_d <= icepop_beta)
 

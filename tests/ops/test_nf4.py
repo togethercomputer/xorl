@@ -3,14 +3,17 @@
 Validates correctness (roundtrip accuracy, codec, shapes) and measures
 effective memory bandwidth of the dequantization kernels.
 """
-import pytest
-import torch
+
 import time
 
+import pytest
+import torch
+
+
 try:
-    from xorl.ops.quantize import nf4_quantize, nf4_dequantize
-    from xorl.ops.quantize import nf4_quantize_gkn, nf4_dequantize_gkn
-    from xorl.ops.quantize.nf4_codec import NF4_TABLE, NF4_MIN_STEP
+    from xorl.ops.quantize import nf4_dequantize, nf4_dequantize_gkn, nf4_quantize, nf4_quantize_gkn
+    from xorl.ops.quantize.nf4_codec import NF4_MIN_STEP, NF4_TABLE
+
     HAS_NF4 = True
 except ImportError:
     HAS_NF4 = False
@@ -47,9 +50,7 @@ class TestNF4Codec:
         for i in range(16):
             expected = NF4_TABLE[i]
             actual = out[i, 0].item()
-            assert abs(actual - expected) < 0.05, (
-                f"Code {i}: expected {expected:.4f}, got {actual:.4f}"
-            )
+            assert abs(actual - expected) < 0.05, f"Code {i}: expected {expected:.4f}, got {actual:.4f}"
 
 
 class TestNF4Quantize1D:
@@ -214,10 +215,13 @@ class TestNF4Bandwidth:
         bw = total_bytes * num_iters / elapsed / 1e9
         return bw
 
-    @pytest.mark.parametrize("size", [
-        (4096, 4096),   # ~16M elements
-        (8192, 8192),   # ~67M elements
-    ])
+    @pytest.mark.parametrize(
+        "size",
+        [
+            (4096, 4096),  # ~16M elements
+            (8192, 8192),  # ~67M elements
+        ],
+    )
     def test_dequant_1d_bandwidth(self, size):
         """1D dequant should achieve >2000 GB/s on large tensors."""
         M, K = size
@@ -230,10 +234,13 @@ class TestNF4Bandwidth:
         if bw < 2000:
             pytest.skip(f"Bandwidth {bw:.0f} GB/s below 2000 GB/s target (may vary by GPU)")
 
-    @pytest.mark.parametrize("size", [
-        (4096, 4096),
-        (2048, 7168),   # MoE expert dimensions
-    ])
+    @pytest.mark.parametrize(
+        "size",
+        [
+            (4096, 4096),
+            (2048, 7168),  # MoE expert dimensions
+        ],
+    )
     def test_dequant_gkn_bandwidth(self, size):
         """GKN dequant should achieve >2000 GB/s on large tensors."""
         K, N = size

@@ -5,11 +5,13 @@ This module provides various loss functions for language model training:
 - causallm_loss_function: Standard causal language modeling loss
 - importance_sampling_loss_function: Importance sampling loss for GRPO/RL
 - policy_loss_function: PPO-style policy loss with TIS correction
+- drgrpo_loss_function: DR-GRPO loss with PPO clipping and KL penalty
 """
 
 from typing import Callable, Dict
 
 from xorl.ops.loss.causallm_loss import causallm_loss_function
+from xorl.ops.loss.grpo_loss import drgrpo_loss_function
 from xorl.ops.loss.importance_sampling_loss import importance_sampling_loss_function
 from xorl.ops.loss.loss_output import LossOutput
 from xorl.ops.loss.policy_loss import policy_loss_function
@@ -24,6 +26,7 @@ LOSS_REGISTRY: Dict[str, Callable] = {
     "cross_entropy": causallm_loss_function,  # alias
     "importance_sampling": importance_sampling_loss_function,
     "policy_loss": policy_loss_function,
+    "drgrpo": drgrpo_loss_function,
 }
 
 
@@ -45,6 +48,7 @@ __all__ = [
     "get_loss_function",
     "register_loss_function",
     "causallm_loss_function",
+    "drgrpo_loss_function",
     "importance_sampling_loss_function",
     "policy_loss_function",
     "vocab_parallel_cross_entropy",

@@ -1,15 +1,16 @@
 """Tests for xorl.data.prepare.hash module."""
 
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
+
 import pytest
 from datasets import Dataset
 
-from xorl.data.prepare.hash import (
-    generate_split_fingerprints,
-    generate_packing_hash,
-    generate_dataset_hash_from_config,
-)
 from xorl.arguments import DatasetConfig
+from xorl.data.prepare.hash import (
+    generate_dataset_hash_from_config,
+    generate_packing_hash,
+    generate_split_fingerprints,
+)
 
 
 pytestmark = pytest.mark.cpu
@@ -17,9 +18,16 @@ pytestmark = pytest.mark.cpu
 
 def _make_config(path="dataset1"):
     return DatasetConfig(
-        path=path, type="tokenized", shards=None, shards_idx=None,
-        preprocess_shards=None, name=None, split="train", revision=None,
-        trust_remote_code=False, max_seq_len=None,
+        path=path,
+        type="tokenized",
+        shards=None,
+        shards_idx=None,
+        preprocess_shards=None,
+        name=None,
+        split="train",
+        revision=None,
+        trust_remote_code=False,
+        max_seq_len=None,
     )
 
 

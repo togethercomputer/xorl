@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import socket
+from pathlib import Path
 from typing import Any, Dict, List
 
 import httpx
 from fastapi import HTTPException, status
+from huggingface_hub import hf_hub_download
 
 from xorl.server.api_server.api_types import (
     AddInferenceEndpointRequest,
@@ -30,11 +33,25 @@ from xorl.server.api_server.api_types import (
 from xorl.server.protocol.api_orchestrator import OrchestratorRequest
 from xorl.server.protocol.operations import SyncWeightsData
 
+
 logger = logging.getLogger(__name__)
 
 
 class InferenceEndpointsMixin:
     """Mixin for inference endpoints, LoRA adapter management, and sampling sessions."""
+
+    @staticmethod
+    async def _check_endpoint_health(client: httpx.AsyncClient, endpoint_url: str, endpoint_name: str) -> bool:
+        """Check whether an HTTP endpoint responds on one of the supported health paths."""
+        for health_endpoint in ("/health", "/v1/models"):
+            try:
+                response = await client.get(f"{endpoint_url}{health_endpoint}")
+                response.raise_for_status()
+                logger.info(f"✓ {endpoint_name} health check passed for {endpoint_url} (via {health_endpoint})")
+                return True
+            except Exception:
+                continue
+        return False
 
     @staticmethod
     def _detect_quantization_from_hf_config(model_path: str) -> dict | None:
@@ -46,8 +63,6 @@ class InferenceEndpointsMixin:
 
         Returns the full HF quantization_config dict, or None.
         """
-        import json
-        from pathlib import Path
 
         # Try local path first
         config_path = Path(model_path) / "config.json"
@@ -62,7 +77,6 @@ class InferenceEndpointsMixin:
         # Try HuggingFace hub (for repo IDs like "Qwen/Qwen3-8B-FP8")
         if config_dict is None:
             try:
-                from huggingface_hub import hf_hub_download
                 cached_path = hf_hub_download(model_path, "config.json")
                 with open(cached_path) as f:
                     config_dict = json.load(f)
@@ -175,8 +189,6 @@ class InferenceEndpointsMixin:
             Response indicating success/failure and endpoint info
         """
         endpoint_url = f"http://{request.host}:{request.port}"
-        worker_port = request.worker_port if request.worker_port is not None else request.port - 1
-        worker_url = f"http://{request.host}:{worker_port}"
 
         # Check if endpoint already exists
         for existing in self.inference_endpoints:
@@ -187,49 +199,21 @@ class InferenceEndpointsMixin:
                     endpoint=existing,
                 )
 
-        # Health check both SGLang server and inference worker
         # Try multiple health check endpoints - SGLang may not have /health
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                # Check SGLang server - try /health first, then /v1/models
-                sglang_healthy = False
-                for health_endpoint in ["/health", "/v1/models"]:
-                    try:
-                        response = await client.get(f"{endpoint_url}{health_endpoint}")
-                        response.raise_for_status()
-                        logger.info(f"✓ SGLang server health check passed for {endpoint_url} (via {health_endpoint})")
-                        sglang_healthy = True
-                        break
-                    except Exception:
-                        continue
-
-                if not sglang_healthy:
+                if not await self._check_endpoint_health(client, endpoint_url, "Inference endpoint"):
                     raise Exception(f"All health endpoints failed for {endpoint_url}")
-
-                # Check inference worker - try /health first, then /v1/models
-                worker_healthy = False
-                for health_endpoint in ["/health", "/v1/models"]:
-                    try:
-                        worker_response = await client.get(f"{worker_url}{health_endpoint}")
-                        worker_response.raise_for_status()
-                        logger.info(f"✓ Inference worker health check passed for {worker_url} (via {health_endpoint})")
-                        worker_healthy = True
-                        break
-                    except Exception:
-                        continue
-
-                if not worker_healthy:
-                    raise Exception(f"All health endpoints failed for {worker_url}")
 
                 is_healthy = True
         except Exception as e:
-            logger.warning(f"Health check failed for {endpoint_url} or {worker_url}: {e}")
+            logger.warning(f"Health check failed for {endpoint_url}: {e}")
             is_healthy = False
 
         if not is_healthy:
             return AddInferenceEndpointResponse(
                 success=False,
-                message=f"Health check failed for SGLang server {endpoint_url} or inference worker {worker_url}",
+                message=f"Health check failed for inference endpoint {endpoint_url}",
                 endpoint=None,
             )
 
@@ -283,7 +267,11 @@ class InferenceEndpointsMixin:
             existing_info = self.inference_endpoints[0].server_info
             if existing_info is not None:
                 mismatches = []
-                if existing_info.model_path and server_info.model_path and existing_info.model_path != server_info.model_path:
+                if (
+                    existing_info.model_path
+                    and server_info.model_path
+                    and existing_info.model_path != server_info.model_path
+                ):
                     mismatches.append(f"model_path: {existing_info.model_path} vs {server_info.model_path}")
                 if existing_info.quantization != server_info.quantization:
                     mismatches.append(f"quantization: {existing_info.quantization} vs {server_info.quantization}")
@@ -306,7 +294,6 @@ class InferenceEndpointsMixin:
         endpoint = InferenceEndpoint(
             host=request.host,
             port=request.port,
-            worker_port=worker_port,
             world_size=world_size,
             healthy=is_healthy,
             server_info=server_info,
@@ -392,8 +379,9 @@ class InferenceEndpointsMixin:
             endpoint_url = f"http://{endpoint.host}:{endpoint.port}"
             try:
                 async with httpx.AsyncClient(timeout=5.0) as client:
-                    response = await client.get(f"{endpoint_url}/health")
-                    response.raise_for_status()
+                    endpoint_healthy = await self._check_endpoint_health(client, endpoint_url, "Inference endpoint")
+                    if not endpoint_healthy:
+                        raise RuntimeError("Inference endpoint health check failed")
                     return endpoint, True
             except Exception as e:
                 logger.warning(f"Health check failed for endpoint {endpoint_url}: {e}")
@@ -494,7 +482,13 @@ class InferenceEndpointsMixin:
                 key = (ep.host, ep.port)
                 if key not in seen:
                     seen.add(key)
-                    endpoints_data.append({"host": ep.host, "port": ep.port, "world_size": ep.world_size})
+                    endpoints_data.append(
+                        {
+                            "host": ep.host,
+                            "port": ep.port,
+                            "world_size": ep.world_size,
+                        }
+                    )
 
             # Auto-detect master_address if localhost or empty (for cross-node NCCL)
             master_address = request.master_address
@@ -564,7 +558,9 @@ class InferenceEndpointsMixin:
             raise
         except Exception as e:
             logger.error(f"Sync inference weights failed: {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Sync inference weights failed: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Sync inference weights failed: {e}"
+            )
 
     # =========================================================================
     # Sampling Session Management (LoRA Adapter Loading)
@@ -602,11 +598,11 @@ class InferenceEndpointsMixin:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Invalid xorl:// URI format for sampler weights: {model_path}. "
-                           f"Expected: xorl://model_id/sampler_weights/adapter_name"
+                    f"Expected: xorl://model_id/sampler_weights/adapter_name",
                 )
         elif model_path.startswith("sampler_weights/"):
             # Format: sampler_weights/adapter_name
-            lora_name = model_path[len("sampler_weights/"):]
+            lora_name = model_path[len("sampler_weights/") :]
         else:
             # Just the adapter name
             lora_name = model_path
@@ -872,10 +868,7 @@ class InferenceEndpointsMixin:
         logger.info(f"LoRA adapter '{lora_name}' added to tracking list (count={len(adapters)})")
         return False
 
-    async def create_sampling_session(
-        self,
-        request: CreateSamplingSessionRequest
-    ) -> CreateSamplingSessionResponse:
+    async def create_sampling_session(self, request: CreateSamplingSessionRequest) -> CreateSamplingSessionResponse:
         """
         Create a sampling session by loading a LoRA adapter on inference workers.
 
@@ -910,7 +903,9 @@ class InferenceEndpointsMixin:
             if len(adapters) > self.max_adapters_per_model:
                 # We just added one, so if we're over capacity, remove the oldest (index 0)
                 oldest_name, oldest_path = adapters[0]
-                logger.info(f"Max LoRA adapters exceeded ({self.max_adapters_per_model}), unloading oldest: {oldest_name}")
+                logger.info(
+                    f"Max LoRA adapters exceeded ({self.max_adapters_per_model}), unloading oldest: {oldest_name}"
+                )
                 await self._unload_lora_on_inference_endpoints(oldest_name)
                 adapters.pop(0)
 

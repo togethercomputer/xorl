@@ -12,17 +12,21 @@ Global scale: scalar float32.
 from typing import Optional, Tuple
 
 import torch
-from torch import Tensor
 import triton
 import triton.language as tl
+from torch import Tensor
 
-from .fp4_codec import FP4_E2M1_MAX, FP8_E4M3_MAX, _fp4_encode, _fp4_decode
+from .fp4_codec import FP4_E2M1_MAX, FP8_E4M3_MAX, _fp4_decode, _fp4_encode
 
 
 @triton.jit
 def _nvfp4_quantize_gkn_kernel(
-    X, Out, Amax, GlobalAmax,
-    K, N,
+    X,
+    Out,
+    Amax,
+    GlobalAmax,
+    K,
+    N,
     BLOCK_SIZE: tl.constexpr,
     TILE_N: tl.constexpr,
 ):
@@ -85,8 +89,12 @@ def _nvfp4_quantize_gkn_kernel(
 
 @triton.jit
 def _nvfp4_scale_convert_gkn_kernel(
-    Amax, ScaleOut, GlobalAmaxInOut,
-    n_scales, FP4_MAX_INV, FP8_MAX,
+    Amax,
+    ScaleOut,
+    GlobalAmaxInOut,
+    n_scales,
+    FP4_MAX_INV,
+    FP8_MAX,
     BLOCK: tl.constexpr,
 ):
     """Convert raw amax to fp8 block_scales (operates on flat amax array)."""
@@ -102,8 +110,12 @@ def _nvfp4_scale_convert_gkn_kernel(
 
 @triton.jit
 def _nvfp4_dequantize_gkn_kernel(
-    Packed, Scale, GlobalScale, Out,
-    K, N,
+    Packed,
+    Scale,
+    GlobalScale,
+    Out,
+    K,
+    N,
     BLOCK_SIZE: tl.constexpr,
     TILE_N: tl.constexpr,
 ):
@@ -161,8 +173,9 @@ def _next_pow2(n):
     return 1 << (n - 1).bit_length()
 
 
-def nvfp4_quantize_gkn(x: Tensor, block_size: int = 16,
-                       global_amax: Optional[Tensor] = None) -> Tuple[Tensor, Tensor, Tensor]:
+def nvfp4_quantize_gkn(
+    x: Tensor, block_size: int = 16, global_amax: Optional[Tensor] = None
+) -> Tuple[Tensor, Tensor, Tensor]:
     """Quantize a [K, N] weight tensor in G,K,N format to NVFP4.
 
     Groups are formed along the K (first) dimension.
@@ -190,9 +203,14 @@ def nvfp4_quantize_gkn(x: Tensor, block_size: int = 16,
     grid = (num_blocks, (N + TILE_N - 1) // TILE_N)
 
     _nvfp4_quantize_gkn_kernel[grid](
-        x.contiguous(), packed, amax, global_amax_buf,
-        K, N,
-        block_size, TILE_N,
+        x.contiguous(),
+        packed,
+        amax,
+        global_amax_buf,
+        K,
+        N,
+        block_size,
+        TILE_N,
         num_warps=4,
     )
 
@@ -205,15 +223,21 @@ def nvfp4_quantize_gkn(x: Tensor, block_size: int = 16,
     block_scales = torch.empty(n_scales, dtype=torch.float8_e4m3fn, device=x.device)
     SC_BLOCK = 1024
     _nvfp4_scale_convert_gkn_kernel[((n_scales + SC_BLOCK - 1) // SC_BLOCK,)](
-        amax.reshape(-1), block_scales, global_amax_buf, n_scales,
-        1.0 / FP4_E2M1_MAX, FP8_E4M3_MAX, SC_BLOCK,
+        amax.reshape(-1),
+        block_scales,
+        global_amax_buf,
+        n_scales,
+        1.0 / FP4_E2M1_MAX,
+        FP8_E4M3_MAX,
+        SC_BLOCK,
         num_warps=4,
     )
     return packed, block_scales.reshape(num_blocks, N), global_amax_buf
 
 
-def nvfp4_dequantize_gkn(packed: Tensor, block_scales: Tensor, global_scale: Tensor,
-                          K: int, N: int, block_size: int = 16) -> Tensor:
+def nvfp4_dequantize_gkn(
+    packed: Tensor, block_scales: Tensor, global_scale: Tensor, K: int, N: int, block_size: int = 16
+) -> Tensor:
     """Dequantize NVFP4 packed [K//2, N] back to [K, N] in G,K,N format.
 
     Args:
@@ -236,9 +260,14 @@ def nvfp4_dequantize_gkn(packed: Tensor, block_scales: Tensor, global_scale: Ten
     gs = global_scale if global_scale.numel() == 1 else global_scale.reshape(1)
 
     _nvfp4_dequantize_gkn_kernel[grid](
-        packed.contiguous(), block_scales.contiguous(), gs, result,
-        K, N,
-        block_size, TILE_N,
+        packed.contiguous(),
+        block_scales.contiguous(),
+        gs,
+        result,
+        K,
+        N,
+        block_size,
+        TILE_N,
         num_warps=1,
     )
     return result

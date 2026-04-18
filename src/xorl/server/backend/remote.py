@@ -7,17 +7,12 @@ request-ACK-response protocol for communicating with worker rank 0.
 
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-from xorl.server.protocol.orchestrator_runner import (
-    RunnerDispatchCommand,
-    RunnerAck,
-    RunnerReady,
-    RunnerResponse,
-    deserialize_message,
-    serialize_message,
-)
+from xorl.server.backend.base import Backend
 from xorl.server.protocol.operations import (
+    LOAD_STATE_TIMEOUT,
+    SAVE_STATE_TIMEOUT,
     AdapterStateData,
     EmptyData,
     KillSessionData,
@@ -30,9 +25,16 @@ from xorl.server.protocol.operations import (
     SaveStateData,
     SyncWeightsData,
 )
-from xorl.server.backend.base import Backend
-from xorl.server.protocol.operations import LOAD_STATE_TIMEOUT, SAVE_STATE_TIMEOUT
+from xorl.server.protocol.orchestrator_runner import (
+    RunnerAck,
+    RunnerDispatchCommand,
+    RunnerReady,
+    RunnerResponse,
+    deserialize_message,
+    serialize_message,
+)
 from xorl.server.utils.zmq_channels import AsyncDealerChannel
+
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +47,7 @@ class RemoteBackend(Backend):
         worker_address: str = "tcp://127.0.0.1:5556",
         operation_timeout: float = 3600.0,
         connection_timeout: float = 120.0,
-        ack_timeout: float = 10.0,
+        ack_timeout: float = 120.0,
     ):
         self.worker_address = worker_address
         self.operation_timeout = operation_timeout
@@ -198,7 +200,9 @@ class RemoteBackend(Backend):
                 f"success={response.success}, time={response.execution_time:.3f}s"
             )
         except asyncio.TimeoutError:
-            raise RuntimeError(f"Timeout waiting for response (request {request.message_id}, timeout={response_timeout}s)")
+            raise RuntimeError(
+                f"Timeout waiting for response (request {request.message_id}, timeout={response_timeout}s)"
+            )
 
         if not response.success:
             raise RuntimeError(f"Operation failed: {response.error or 'Unknown error'}")
@@ -209,8 +213,9 @@ class RemoteBackend(Backend):
     # Backend Operations
     # ========================================================================
 
-    async def _execute(self, operation: str, payload, request_id: Optional[str] = None,
-                       timeout: Optional[float] = None) -> Dict[str, Any]:
+    async def _execute(
+        self, operation: str, payload, request_id: Optional[str] = None, timeout: Optional[float] = None
+    ) -> Dict[str, Any]:
         """Generic execute: create request, send, return result dict."""
         request = RunnerDispatchCommand.create(operation, payload, request_id=request_id)
         response = await self._send_and_receive(request, timeout=timeout)
@@ -219,56 +224,101 @@ class RemoteBackend(Backend):
             result["execution_time"] = response.execution_time
         return result
 
-    async def forward_backward(self, batches, loss_fn="causallm_loss", loss_fn_params=None,
-                               model_id=None, routed_experts=None, request_id=None):
-        return await self._execute("forward_backward", ModelPassData(
-            batches=batches, loss_fn=loss_fn, loss_fn_params=loss_fn_params,
-            model_id=model_id, routed_experts=routed_experts,
-        ), request_id=request_id)
+    async def forward_backward(
+        self, batches, loss_fn="causallm_loss", loss_fn_params=None, model_id=None, routed_experts=None, request_id=None
+    ):
+        return await self._execute(
+            "forward_backward",
+            ModelPassData(
+                batches=batches,
+                loss_fn=loss_fn,
+                loss_fn_params=loss_fn_params,
+                model_id=model_id,
+                routed_experts=routed_experts,
+            ),
+            request_id=request_id,
+        )
 
-    async def forward(self, batches, loss_fn="causallm_loss", loss_fn_params=None,
-                      model_id=None, request_id=None):
-        return await self._execute("forward", ModelPassData(
-            batches=batches, loss_fn=loss_fn, loss_fn_params=loss_fn_params,
-            model_id=model_id,
-        ), request_id=request_id)
+    async def forward(self, batches, loss_fn="causallm_loss", loss_fn_params=None, model_id=None, request_id=None):
+        return await self._execute(
+            "forward",
+            ModelPassData(
+                batches=batches,
+                loss_fn=loss_fn,
+                loss_fn_params=loss_fn_params,
+                model_id=model_id,
+            ),
+            request_id=request_id,
+        )
 
-    async def optim_step(self, lr, gradient_clip=None, beta1=None, beta2=None,
-                         eps=None, model_id=None, request_id=None):
-        return await self._execute("optim_step", OptimStepData(
-            lr=lr, gradient_clip=gradient_clip, beta1=beta1, beta2=beta2,
-            eps=eps, model_id=model_id,
-        ), request_id=request_id)
+    async def optim_step(
+        self, lr, gradient_clip=None, beta1=None, beta2=None, eps=None, model_id=None, request_id=None
+    ):
+        return await self._execute(
+            "optim_step",
+            OptimStepData(
+                lr=lr,
+                gradient_clip=gradient_clip,
+                beta1=beta1,
+                beta2=beta2,
+                eps=eps,
+                model_id=model_id,
+            ),
+            request_id=request_id,
+        )
 
-    async def save_state(self, checkpoint_path=None, save_optimizer=True, use_timestamp=False,
-                         model_id=None, request_id=None):
+    async def save_state(
+        self, checkpoint_path=None, save_optimizer=True, use_timestamp=False, model_id=None, request_id=None
+    ):
+        return await self._execute(
+            "save_state",
+            SaveStateData(
+                checkpoint_path=checkpoint_path,
+                save_optimizer=save_optimizer,
+                use_timestamp=use_timestamp,
+                model_id=model_id,
+            ),
+            request_id=request_id,
+            timeout=SAVE_STATE_TIMEOUT,
+        )
 
-        return await self._execute("save_state", SaveStateData(
-            checkpoint_path=checkpoint_path, save_optimizer=save_optimizer,
-            use_timestamp=use_timestamp, model_id=model_id,
-        ), request_id=request_id, timeout=SAVE_STATE_TIMEOUT)
-
-    async def load_state(self, checkpoint_path=None, load_optimizer=True,
-                         model_id=None, request_id=None):
-
-        return await self._execute("load_state", LoadStateData(
-            checkpoint_path=checkpoint_path, load_optimizer=load_optimizer,
-            model_id=model_id,
-        ), request_id=request_id, timeout=LOAD_STATE_TIMEOUT)
+    async def load_state(self, checkpoint_path=None, load_optimizer=True, model_id=None, request_id=None):
+        return await self._execute(
+            "load_state",
+            LoadStateData(
+                checkpoint_path=checkpoint_path,
+                load_optimizer=load_optimizer,
+                model_id=model_id,
+            ),
+            request_id=request_id,
+            timeout=LOAD_STATE_TIMEOUT,
+        )
 
     async def save_lora_only(self, lora_path=None, model_id=None, request_id=None):
+        return await self._execute(
+            "save_lora_only",
+            SaveLoraOnlyData(
+                lora_path=lora_path,
+                model_id=model_id,
+            ),
+            request_id=request_id,
+            timeout=SAVE_STATE_TIMEOUT,
+        )
 
-        return await self._execute("save_lora_only", SaveLoraOnlyData(
-            lora_path=lora_path, model_id=model_id,
-        ), request_id=request_id, timeout=SAVE_STATE_TIMEOUT)
-
-    async def save_full_weights(self, output_path=None, dtype="bfloat16",
-                                base_model_path=None, model_id=None, request_id=None):
-
-        return await self._execute("save_full_weights", SaveFullWeightsData(
-            output_path=output_path, dtype=dtype, base_model_path=base_model_path,
-            model_id=model_id,
-        ), request_id=request_id, timeout=SAVE_STATE_TIMEOUT)
+    async def save_full_weights(
+        self, output_path=None, dtype="bfloat16", base_model_path=None, model_id=None, request_id=None
+    ):
+        return await self._execute(
+            "save_full_weights",
+            SaveFullWeightsData(
+                output_path=output_path,
+                dtype=dtype,
+                base_model_path=base_model_path,
+                model_id=model_id,
+            ),
+            request_id=request_id,
+            timeout=SAVE_STATE_TIMEOUT,
+        )
 
     async def sleep(self, request_id=None):
         return await self._execute("sleep", EmptyData(), request_id=request_id, timeout=30.0)
@@ -276,43 +326,87 @@ class RemoteBackend(Backend):
     async def wake_up(self, request_id=None):
         return await self._execute("wake_up", EmptyData(), request_id=request_id, timeout=30.0)
 
-    async def sync_inference_weights(self, endpoints, master_address="localhost",
-                                     master_port=29600, group_name="weight_sync_group",
-                                     buffer_size_mb=1024, sync_method="nccl_broadcast",
-                                     flush_cache=True, pause_mode="retract",
-                                     weight_version=None, quantization=None,
-                                     request_id=None):
-        return await self._execute("sync_inference_weights", SyncWeightsData(
-            endpoints=endpoints, master_address=master_address, master_port=master_port,
-            group_name=group_name, buffer_size_mb=buffer_size_mb, sync_method=sync_method,
-            flush_cache=flush_cache, pause_mode=pause_mode, weight_version=weight_version,
-            quantization=quantization,
-        ), request_id=request_id, timeout=600.0)
+    async def sync_inference_weights(
+        self,
+        endpoints,
+        master_address="localhost",
+        master_port=0,
+        group_name="weight_sync_group",
+        buffer_size_mb=1024,
+        sync_method="nccl_broadcast",
+        flush_cache=False,
+        pause_mode="retract",
+        weight_version=None,
+        quantization=None,
+        request_id=None,
+    ):
+        return await self._execute(
+            "sync_inference_weights",
+            SyncWeightsData(
+                endpoints=endpoints,
+                master_address=master_address,
+                master_port=master_port,
+                group_name=group_name,
+                buffer_size_mb=buffer_size_mb,
+                sync_method=sync_method,
+                flush_cache=flush_cache,
+                pause_mode=pause_mode,
+                weight_version=weight_version,
+                quantization=quantization,
+            ),
+            request_id=request_id,
+            timeout=600.0,
+        )
 
     async def register_adapter(self, model_id="default", lr=1e-5, request_id=None):
-        return await self._execute("register_adapter", RegisterAdapterData(
-            model_id=model_id, lr=lr,
-        ), request_id=request_id, timeout=60.0)
+        return await self._execute(
+            "register_adapter",
+            RegisterAdapterData(
+                model_id=model_id,
+                lr=lr,
+            ),
+            request_id=request_id,
+            timeout=60.0,
+        )
 
-    async def save_adapter_state(self, model_id="default", path=None,
-                                 save_optimizer=True, request_id=None):
-        return await self._execute("save_adapter_state", AdapterStateData(
-            model_id=model_id, path=path, save_optimizer=save_optimizer,
-        ), request_id=request_id, timeout=600.0)
+    async def save_adapter_state(self, model_id="default", path=None, save_optimizer=True, request_id=None):
+        return await self._execute(
+            "save_adapter_state",
+            AdapterStateData(
+                model_id=model_id,
+                path=path,
+                save_optimizer=save_optimizer,
+            ),
+            request_id=request_id,
+            timeout=600.0,
+        )
 
-    async def load_adapter_state(self, model_id="default", path=None,
-                                 load_optimizer=True, lr=None, request_id=None):
-        return await self._execute("load_adapter_state", AdapterStateData(
-            model_id=model_id, path=path, load_optimizer=load_optimizer, lr=lr,
-        ), request_id=request_id, timeout=600.0)
+    async def load_adapter_state(self, model_id="default", path=None, load_optimizer=True, lr=None, request_id=None):
+        return await self._execute(
+            "load_adapter_state",
+            AdapterStateData(
+                model_id=model_id,
+                path=path,
+                load_optimizer=load_optimizer,
+                lr=lr,
+            ),
+            request_id=request_id,
+            timeout=600.0,
+        )
 
     async def get_adapter_info(self, request_id=None):
         return await self._execute("get_adapter_info", EmptyData(), request_id=request_id, timeout=60.0)
 
     async def kill_session(self, model_id="default", save_checkpoint=True, request_id=None):
-        return await self._execute("kill_session", KillSessionData(
-            model_id=model_id, save_checkpoint=save_checkpoint,
-        ), request_id=request_id, timeout=120.0)
+        return await self._execute(
+            "kill_session",
+            KillSessionData(
+                model_id=model_id,
+                save_checkpoint=save_checkpoint,
+            ),
+            request_id=request_id,
+            timeout=120.0,
+        )
 
     async def health_check(self, request_id=None):
         return await self._execute("health_check", EmptyData(), request_id=request_id, timeout=5.0)

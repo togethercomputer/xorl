@@ -10,27 +10,28 @@ This module tests the communication protocol between API Server and Engine:
 
 import pytest
 
+
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
 from xorl.server.protocol.api_orchestrator import (
-    # Enums
-    RequestType,
-    OutputType,
+    OrchestratorOutputs,
     # Core Message Types
     OrchestratorRequest,
-    OrchestratorOutputs,
+    OutputType,
+    # Enums
+    RequestType,
+    create_error_output,
     # Response Builders
     create_forward_backward_output,
+    create_health_check_output,
+    create_load_state_output,
     create_optim_step_output,
     create_save_state_output,
-    create_load_state_output,
-    create_health_check_output,
-    create_error_output,
-    # Validation and Utilities
-    validate_request,
-    validate_output,
     get_operation_from_request,
     is_streaming_output,
+    validate_output,
+    # Validation and Utilities
+    validate_request,
 )
 from xorl.server.protocol.operations import (
     AbortData,
@@ -72,7 +73,9 @@ class TestSerializationAndBuilders:
             request_id="roundtrip-output-test",
             output_type=OutputType.FORWARD_BACKWARD,
             outputs=[{"loss": 1.234, "valid_tokens": 512, "grads_norm": 0.987}],
-            finished=True, error=None, timestamp=3333.0,
+            finished=True,
+            error=None,
+            timestamp=3333.0,
         )
         packed = original_out.to_msgpack()
         assert isinstance(packed, bytes) and len(packed) > 0
@@ -88,13 +91,15 @@ class TestSerializationAndBuilders:
         # Forward backward with custom ID
         data = [{"model_input": {"input_ids": [1, 2, 3]}, "loss_fn_inputs": {"labels": [2, 3, 4]}}]
         request = OrchestratorRequest(
-            operation="forward_backward", payload=ModelPassData(data=data, loss_fn="causallm_loss"),
+            operation="forward_backward",
+            payload=ModelPassData(data=data, loss_fn="causallm_loss"),
         )
         assert request.request_type == RequestType.ADD
         assert request.operation == "forward_backward"
         assert request.payload.data == data
         custom = OrchestratorRequest(
-            request_id="custom-fb-id", operation="forward_backward",
+            request_id="custom-fb-id",
+            operation="forward_backward",
             payload=ModelPassData(data=[{"model_input": {"input_ids": [1]}}]),
         )
         assert custom.request_id == "custom-fb-id"
@@ -133,7 +138,8 @@ class TestSerializationAndBuilders:
         health = OrchestratorRequest(request_type=RequestType.UTILITY, operation="health_check")
         assert health.request_type == RequestType.UTILITY
         abort = OrchestratorRequest(
-            request_type=RequestType.ABORT, operation="abort",
+            request_type=RequestType.ABORT,
+            operation="abort",
             payload=AbortData(target_request_id="request-to-abort"),
         )
         assert abort.payload.target_request_id == "request-to-abort"
@@ -141,7 +147,10 @@ class TestSerializationAndBuilders:
         # --- All response builders ---
         # Forward backward (full, minimal, error, additional metrics)
         output = create_forward_backward_output(
-            request_id="fb-req-1", loss=2.345, valid_tokens=1024, grads_norm=1.23,
+            request_id="fb-req-1",
+            loss=2.345,
+            valid_tokens=1024,
+            grads_norm=1.23,
         )
         assert output.output_type == OutputType.FORWARD_BACKWARD
         assert output.outputs[0]["loss"] == 2.345
@@ -154,13 +163,18 @@ class TestSerializationAndBuilders:
         assert with_error.error == "Forward pass failed"
 
         with_metrics = create_forward_backward_output(
-            request_id="fb-req-3", loss=2.0, additional_metrics={"perplexity": 10.5, "accuracy": 0.85},
+            request_id="fb-req-3",
+            loss=2.0,
+            additional_metrics={"perplexity": 10.5, "accuracy": 0.85},
         )
         assert with_metrics.outputs[0]["perplexity"] == 10.5
 
         # Optim step (full and minimal)
         output = create_optim_step_output(
-            request_id="optim-req-1", step=1000, learning_rate=0.0001, grad_norm=0.95,
+            request_id="optim-req-1",
+            step=1000,
+            learning_rate=0.0001,
+            grad_norm=0.95,
         )
         assert output.outputs[0]["step"] == 1000
         assert output.outputs[0]["lr"] == 0.0001
@@ -169,27 +183,38 @@ class TestSerializationAndBuilders:
 
         # Save state (success and error)
         output = create_save_state_output(
-            request_id="save-req-1", checkpoint_path="/tmp/checkpoint", success=True,
+            request_id="save-req-1",
+            checkpoint_path="/tmp/checkpoint",
+            success=True,
         )
         assert output.outputs[0]["success"] is True
         error_out = create_save_state_output(
-            request_id="save-err", checkpoint_path="/tmp/failed", success=False, error="Disk full",
+            request_id="save-err",
+            checkpoint_path="/tmp/failed",
+            success=False,
+            error="Disk full",
         )
         assert error_out.error == "Disk full"
 
         # Load state
         output = create_load_state_output(
-            request_id="load-req-1", checkpoint_path="/tmp/checkpoint", success=True,
+            request_id="load-req-1",
+            checkpoint_path="/tmp/checkpoint",
+            success=True,
         )
         assert output.outputs[0]["success"] is True
 
         # Health check
         output = create_health_check_output(
-            request_id="health-req-1", status="healthy", active_requests=5, total_requests=1000,
+            request_id="health-req-1",
+            status="healthy",
+            active_requests=5,
+            total_requests=1000,
         )
         assert output.outputs[0]["status"] == "healthy"
         with_info = create_health_check_output(
-            request_id="health-req-2", additional_info={"uptime": 3600, "memory_usage": 0.75},
+            request_id="health-req-2",
+            additional_info={"uptime": 3600, "memory_usage": 0.75},
         )
         assert with_info.outputs[0]["uptime"] == 3600
 
@@ -200,7 +225,8 @@ class TestSerializationAndBuilders:
         assert output.outputs == []
 
         custom_type = create_error_output(
-            request_id="error-req-2", error_message="Forward failed",
+            request_id="error-req-2",
+            error_message="Forward failed",
             operation_type=OutputType.FORWARD_BACKWARD,
         )
         assert custom_type.output_type == OutputType.FORWARD_BACKWARD
@@ -212,26 +238,51 @@ class TestValidationUtilitiesAndIntegration:
     def test_validation_and_utilities(self):
         """Test request/output validation, get_operation, and is_streaming_output."""
         # Valid ADD
-        assert validate_request(OrchestratorRequest(
-            request_id="valid-req", request_type=RequestType.ADD, operation="forward_backward",
-        )) is True
+        assert (
+            validate_request(
+                OrchestratorRequest(
+                    request_id="valid-req",
+                    request_type=RequestType.ADD,
+                    operation="forward_backward",
+                )
+            )
+            is True
+        )
 
         # Valid ABORT
-        assert validate_request(OrchestratorRequest(
-            request_id="abort-req", request_type=RequestType.ABORT, operation="abort",
-            payload=AbortData(target_request_id="req-to-abort"),
-        )) is True
+        assert (
+            validate_request(
+                OrchestratorRequest(
+                    request_id="abort-req",
+                    request_type=RequestType.ABORT,
+                    operation="abort",
+                    payload=AbortData(target_request_id="req-to-abort"),
+                )
+            )
+            is True
+        )
 
         # Valid UTILITY
-        assert validate_request(OrchestratorRequest(
-            request_id="utility-req", request_type=RequestType.UTILITY, operation="health_check",
-        )) is True
+        assert (
+            validate_request(
+                OrchestratorRequest(
+                    request_id="utility-req",
+                    request_type=RequestType.UTILITY,
+                    operation="health_check",
+                )
+            )
+            is True
+        )
 
         # Missing request_id
         with pytest.raises(ValueError, match="must have request_id"):
-            validate_request(OrchestratorRequest(
-                request_id="", request_type=RequestType.ADD, operation="test",
-            ))
+            validate_request(
+                OrchestratorRequest(
+                    request_id="",
+                    request_type=RequestType.ADD,
+                    operation="test",
+                )
+            )
 
         # ADD missing operation
         with pytest.raises(ValueError, match="must have 'operation'"):
@@ -239,50 +290,95 @@ class TestValidationUtilitiesAndIntegration:
 
         # ABORT missing target
         with pytest.raises(ValueError, match="must have 'target_request_id'"):
-            validate_request(OrchestratorRequest(
-                request_id="abort-no-target", request_type=RequestType.ABORT, operation="abort",
-            ))
+            validate_request(
+                OrchestratorRequest(
+                    request_id="abort-no-target",
+                    request_type=RequestType.ABORT,
+                    operation="abort",
+                )
+            )
 
         # Valid streaming output
-        assert validate_output(OrchestratorOutputs(
-            request_id="streaming-output", output_type=OutputType.FORWARD_BACKWARD,
-            outputs=[{"partial": "data"}], finished=False,
-        )) is True
+        assert (
+            validate_output(
+                OrchestratorOutputs(
+                    request_id="streaming-output",
+                    output_type=OutputType.FORWARD_BACKWARD,
+                    outputs=[{"partial": "data"}],
+                    finished=False,
+                )
+            )
+            is True
+        )
 
         # Valid error output
-        assert validate_output(OrchestratorOutputs(
-            request_id="error-output", output_type=OutputType.ERROR,
-            outputs=[], finished=True, error="Test error",
-        )) is True
+        assert (
+            validate_output(
+                OrchestratorOutputs(
+                    request_id="error-output",
+                    output_type=OutputType.ERROR,
+                    outputs=[],
+                    finished=True,
+                    error="Test error",
+                )
+            )
+            is True
+        )
 
         # Missing request_id
         with pytest.raises(ValueError, match="must have request_id"):
-            validate_output(OrchestratorOutputs(
-                request_id="", output_type=OutputType.FORWARD_BACKWARD,
-            ))
+            validate_output(
+                OrchestratorOutputs(
+                    request_id="",
+                    output_type=OutputType.FORWARD_BACKWARD,
+                )
+            )
 
         # get_operation_from_request
         assert get_operation_from_request(OrchestratorRequest(operation="forward_backward")) == "forward_backward"
         assert get_operation_from_request(OrchestratorRequest()) is None
 
         # is_streaming_output
-        assert is_streaming_output(OrchestratorOutputs(
-            request_id="stream-test", output_type=OutputType.FORWARD_BACKWARD,
-            finished=False, error=None,
-        )) is True
-        assert is_streaming_output(OrchestratorOutputs(
-            request_id="finished-test", output_type=OutputType.FORWARD_BACKWARD, finished=True,
-        )) is False
-        assert is_streaming_output(OrchestratorOutputs(
-            request_id="error-test", output_type=OutputType.ERROR, finished=False, error="Test error",
-        )) is False
+        assert (
+            is_streaming_output(
+                OrchestratorOutputs(
+                    request_id="stream-test",
+                    output_type=OutputType.FORWARD_BACKWARD,
+                    finished=False,
+                    error=None,
+                )
+            )
+            is True
+        )
+        assert (
+            is_streaming_output(
+                OrchestratorOutputs(
+                    request_id="finished-test",
+                    output_type=OutputType.FORWARD_BACKWARD,
+                    finished=True,
+                )
+            )
+            is False
+        )
+        assert (
+            is_streaming_output(
+                OrchestratorOutputs(
+                    request_id="error-test",
+                    output_type=OutputType.ERROR,
+                    finished=False,
+                    error="Test error",
+                )
+            )
+            is False
+        )
 
     def test_complete_request_response_and_error_flow(self):
         """Test complete request-response flow and error handling for all operation types."""
         # Forward backward flow
         data = [{"model_input": {"input_ids": [1, 2, 3, 4, 5]}, "loss_fn_inputs": {"labels": [2, 3, 4, 5, 6]}}]
         request = OrchestratorRequest(
-            operation="forward_backward", payload=ModelPassData(data=data, loss_fn="causallm_loss"),
+            operation="forward_backward",
+            payload=ModelPassData(data=data, loss_fn="causallm_loss"),
         )
         assert validate_request(request) is True
         received_request = OrchestratorRequest.from_msgpack(request.to_msgpack())
@@ -296,11 +392,15 @@ class TestValidationUtilitiesAndIntegration:
 
         # Optim step flow
         optim_req = OrchestratorRequest(
-            operation="optim_step", payload=OptimStepData(lr=0.001, gradient_clip=1.0),
+            operation="optim_step",
+            payload=OptimStepData(lr=0.001, gradient_clip=1.0),
         )
         received = OrchestratorRequest.from_msgpack(optim_req.to_msgpack())
         optim_out = create_optim_step_output(
-            request_id=received.request_id, step=100, learning_rate=0.001, grad_norm=0.85,
+            request_id=received.request_id,
+            step=100,
+            learning_rate=0.001,
+            grad_norm=0.85,
         )
         final = OrchestratorOutputs.from_msgpack(optim_out.to_msgpack())
         assert final.outputs[0]["step"] == 100 and final.outputs[0]["grad_norm"] == 0.85
@@ -312,7 +412,9 @@ class TestValidationUtilitiesAndIntegration:
         )
         received = OrchestratorRequest.from_msgpack(save_req.to_msgpack())
         save_out = create_save_state_output(
-            request_id=received.request_id, checkpoint_path=received.payload.checkpoint_path, success=True,
+            request_id=received.request_id,
+            checkpoint_path=received.payload.checkpoint_path,
+            success=True,
         )
         final = OrchestratorOutputs.from_msgpack(save_out.to_msgpack())
         assert final.outputs[0]["success"] is True
@@ -323,7 +425,8 @@ class TestValidationUtilitiesAndIntegration:
             payload=ModelPassData(data=[{"model_input": {"input_ids": [1, 2, 3]}}]),
         )
         error_output = create_error_output(
-            request_id=request.request_id, error_message="CUDA out of memory",
+            request_id=request.request_id,
+            error_message="CUDA out of memory",
             operation_type=OutputType.FORWARD_BACKWARD,
         )
         assert validate_output(error_output) is True

@@ -10,6 +10,15 @@ title: "Installation"
 - PyTorch 2.10+
 - NVIDIA Hopper GPU (H100/H800) or newer recommended for NVFP4 and DeepEP
 
+## Clone the repo
+
+```bash
+git clone --recurse-submodules https://github.com/togethercomputer/xorl-internal
+cd xorl-internal
+```
+
+> Already cloned without `--recurse-submodules`? Run `git submodule update --init --recursive`
+
 ## Install with uv (recommended)
 
 [uv](https://github.com/astral-sh/uv) is the recommended package manager for reproducible installs.
@@ -18,20 +27,58 @@ title: "Installation"
 # Install uv if not already installed
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Clone and install
-git clone https://github.com/togethercomputer/xorl
-cd xorl
+# Install and activate
 uv sync
 source .venv/bin/activate
 ```
 
-`uv sync` reads `pyproject.toml` and installs all pinned dependencies.
+`uv sync` reads `pyproject.toml` and installs all pinned dependencies into a `.venv` virtual environment.
 
-## Install with pip
+## Install with conda
 
 ```bash
+conda create -n xorl python=3.12
+conda activate xorl
 pip install -e .
 ```
+
+## Install Submodules
+
+The repo ships two git submodules under `submodules/`:
+
+| Submodule | Description |
+|---|---|
+| [xorl-client](https://github.com/togethercomputer/xorl-client) | Lightweight Python client for the XoRL training service. Required for server/RL training mode. |
+| [xorl-sglang](https://github.com/togethercomputer/xorl-sglang) | XoRL's fork of [SGLang](https://github.com/sgl-project/sglang). Used as the inference engine in online RL loops. |
+
+Install individually:
+
+```bash
+pip install -e submodules/xorl-client
+pip install -e "submodules/xorl-sglang/python[all]"
+```
+
+Alternatively, use the bundled `pyproject.sglang.toml` which pins PyTorch to 2.9.1 (required by sglang) and installs xorl, xorl-client, and xorl-sglang together:
+
+**uv:**
+```bash
+cp pyproject.sglang.toml pyproject.toml
+uv sync
+source .venv/bin/activate
+```
+
+**conda:**
+```bash
+conda create -n xorl-sglang python=3.12
+conda activate xorl-sglang
+cp pyproject.sglang.toml pyproject.toml
+pip install -e .
+```
+
+> **Note:** The default `pyproject.toml` uses PyTorch 2.10.0. sglang requires PyTorch 2.9.1, so the two cannot coexist in the same environment unless you use `pyproject.sglang.toml`.
+
+> These submodules are only needed for **server training / online RL**. If you are only running local SFT or pretraining, you can skip this step.
+
 
 ## Key Dependencies
 

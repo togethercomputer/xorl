@@ -19,63 +19,43 @@ import argparse
 import asyncio
 import logging
 import sys
-import uvicorn
 from pathlib import Path
+
+import uvicorn
+
 
 # Add src to path
 repo_root = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(repo_root))
 
-from xorl.server.api_server.server import APIServer, app
+from xorl.server.api_server.server import app
 from xorl.server.backend import DummyBackend
 from xorl.server.orchestrator.orchestrator import Orchestrator
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Launch API server with optional mock engine"
-    )
-    parser.add_argument(
-        "--host",
-        type=str,
-        default="127.0.0.1",
-        help="API server host (default: 127.0.0.1)"
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=20000,
-        help="API server port (default: 20000)"
-    )
-    parser.add_argument(
-        "--mock",
-        action="store_true",
-        help="Launch with mock engine for testing"
-    )
+    parser = argparse.ArgumentParser(description="Launch API server with optional mock engine")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="API server host (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=20000, help="API server port (default: 20000)")
+    parser.add_argument("--mock", action="store_true", help="Launch with mock engine for testing")
     parser.add_argument(
         "--engine-input",
         type=str,
         default="tcp://127.0.0.1:6000",
-        help="Engine input address (default: tcp://127.0.0.1:6000)"
+        help="Engine input address (default: tcp://127.0.0.1:6000)",
     )
     parser.add_argument(
         "--engine-output",
         type=str,
         default="tcp://127.0.0.1:6001",
-        help="Engine output address (default: tcp://127.0.0.1:6001)"
+        help="Engine output address (default: tcp://127.0.0.1:6001)",
     )
     parser.add_argument(
-        "--timeout",
-        type=float,
-        default=120.0,
-        help="Default timeout for engine operations (default: 120.0)"
+        "--timeout", type=float, default=120.0, help="Default timeout for engine operations (default: 120.0)"
     )
     return parser.parse_args()
 

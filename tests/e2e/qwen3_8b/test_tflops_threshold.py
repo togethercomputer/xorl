@@ -2,12 +2,12 @@
 
 Runs LoRA SFT benchmarks with the real Qwen3-8B model and asserts
 that achieved TFLOPS meets minimum thresholds. Thresholds are set at
-80% of measured baselines on H100 80GB HBM3 with flash_attention_3.
+80% of corrected baselines on H100 80GB HBM3 with flash_attention_3.
 
-Baselines (Qwen3-8B LoRA rank=8, seq_len=4096, 4 samples, 10 steps):
-    1 GPU:  ~447 TFLOPS  -> threshold 358
-    2 GPUs: ~420 TFLOPS  -> threshold 336
-    4 GPUs: ~411 TFLOPS  -> threshold 329
+Corrected baselines (Qwen3-8B LoRA rank=8, seq_len=4096, 4 samples, 10 steps):
+    1 GPU:  ~416 TFLOPS  -> threshold 333
+    2 GPUs: ~391 TFLOPS  -> threshold 313
+    4 GPUs: ~383 TFLOPS  -> threshold 306
 
 These tests are slow (~2-3 min each) and require real Qwen3-8B weights.
 Run with: pytest tests/e2e/qwen3_8b/test_tflops_threshold.py -v -s
@@ -17,6 +17,13 @@ import os
 import time
 
 import pytest
+from transformers import AutoConfig
+
+
+try:
+    import xorl_client
+except ModuleNotFoundError:
+    xorl_client = None
 
 from tests.e2e.e2e_utils import skip_if_gpu_count_less_than
 from tests.e2e.server_utils import (
@@ -28,6 +35,8 @@ from tests.e2e.server_utils import (
     generate_random_sft_data,
     generate_server_config,
 )
+from xorl.utils.count_flops import XorlFlopsCounter, get_device_flops
+
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.server, pytest.mark.benchmark]
 
@@ -38,11 +47,11 @@ pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.server, pytest.mark.
 QWEN3_8B_DIR = "/data/shared/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218"
 VOCAB_SIZE = 151936
 
-# Minimum TFLOPS per GPU (80% of H100 baseline, flash_attention_3, seq_len=4096)
+# Minimum TFLOPS per GPU (80% of corrected H100 baseline, flash_attention_3, seq_len=4096)
 MIN_TFLOPS = {
-    1: 358,
-    2: 336,
-    4: 329,
+    1: 333,
+    2: 313,
+    4: 306,
 }
 
 # Benchmark parameters
@@ -58,6 +67,7 @@ PACKING_SEQ_LEN = 16384
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _skip_if_no_qwen3_8b():
     return pytest.mark.skipif(
         not os.path.isdir(QWEN3_8B_DIR),
@@ -67,10 +77,8 @@ def _skip_if_no_qwen3_8b():
 
 def _run_tflops_benchmark(num_gpus: int, dp_shard_size: int, tmp_path: str):
     """Run a Qwen3-8B LoRA SFT benchmark and return TFLOPS."""
-    import xorl_client
-    from transformers import AutoConfig
-
-    from xorl.utils.count_flops import XorlFlopsCounter, get_device_flops
+    if xorl_client is None:
+        pytest.skip("xorl_client not installed")
 
     output_dir = os.path.join(tmp_path, f"bench_{num_gpus}gpu")
     api_port = _get_free_port()
@@ -89,13 +97,9 @@ def _run_tflops_benchmark(num_gpus: int, dp_shard_size: int, tmp_path: str):
     try:
         _start_server_or_fail(server, timeout=300)
 
-        _, training_client = _create_lora_client(
-            server.base_url, QWEN3_8B_DIR, model_id=f"bench-{num_gpus}gpu"
-        )
+        _, training_client = _create_lora_client(server.base_url, QWEN3_8B_DIR, model_id=f"bench-{num_gpus}gpu")
 
-        data = generate_random_sft_data(
-            num_samples=NUM_SAMPLES, seq_len=SEQ_LEN, vocab_size=VOCAB_SIZE
-        )
+        data = generate_random_sft_data(num_samples=NUM_SAMPLES, seq_len=SEQ_LEN, vocab_size=VOCAB_SIZE)
         adam_params = xorl_client.AdamParams(learning_rate=1e-4, beta1=0.9, beta2=0.95, eps=1e-8)
 
         # Warmup
@@ -128,15 +132,15 @@ def _run_tflops_benchmark(num_gpus: int, dp_shard_size: int, tmp_path: str):
         device_peak_tflops = get_device_flops(unit="T")
         mfu = flops_achieved / device_peak_tflops if device_peak_tflops > 0 else 0.0
 
-        print(f"\n{'─'*60}")
+        print(f"\n{'─' * 60}")
         print(f"Qwen3-8B LoRA SFT — {num_gpus} GPU(s)")
-        print(f"{'─'*60}")
+        print(f"{'─' * 60}")
         print(f"  Loss:       {losses[0]:.4f} → {losses[-1]:.4f}")
         print(f"  Avg step:   {avg_step:.3f}s")
         print(f"  Tokens/sec: {tokens_per_sec:.0f}")
         print(f"  TFLOPS:     {flops_achieved:.2f} / {device_peak_tflops:.0f} peak")
         print(f"  MFU:        {mfu:.2%}")
-        print(f"{'─'*60}")
+        print(f"{'─' * 60}")
 
         return {
             "tflops": flops_achieved,
@@ -153,35 +157,30 @@ def _run_tflops_benchmark(num_gpus: int, dp_shard_size: int, tmp_path: str):
 # Tests
 # ---------------------------------------------------------------------------
 
+
 class TestQwen3_8B_TFLOPS:
     """Assert Qwen3-8B LoRA training meets TFLOPS thresholds on H100."""
 
     @skip_if_gpu_count_less_than(1)
     @_skip_if_no_qwen3_8b()
     def test_1gpu_tflops(self, tmp_path):
-        """1-GPU Qwen3-8B LoRA must achieve >= 358 TFLOPS on H100."""
+        """1-GPU Qwen3-8B LoRA must achieve >= 333 TFLOPS on H100."""
         result = _run_tflops_benchmark(num_gpus=1, dp_shard_size=1, tmp_path=str(tmp_path))
-        assert result["tflops"] >= MIN_TFLOPS[1], (
-            f"1-GPU TFLOPS {result['tflops']:.1f} below threshold {MIN_TFLOPS[1]}"
-        )
+        assert result["tflops"] >= MIN_TFLOPS[1], f"1-GPU TFLOPS {result['tflops']:.1f} below threshold {MIN_TFLOPS[1]}"
         assert result["losses"][-1] < result["losses"][0], "Loss should decrease"
 
     @skip_if_gpu_count_less_than(2)
     @_skip_if_no_qwen3_8b()
     def test_2gpu_tflops(self, tmp_path):
-        """2-GPU Qwen3-8B LoRA FSDP2 must achieve >= 336 TFLOPS on H100."""
+        """2-GPU Qwen3-8B LoRA FSDP2 must achieve >= 313 TFLOPS on H100."""
         result = _run_tflops_benchmark(num_gpus=2, dp_shard_size=2, tmp_path=str(tmp_path))
-        assert result["tflops"] >= MIN_TFLOPS[2], (
-            f"2-GPU TFLOPS {result['tflops']:.1f} below threshold {MIN_TFLOPS[2]}"
-        )
+        assert result["tflops"] >= MIN_TFLOPS[2], f"2-GPU TFLOPS {result['tflops']:.1f} below threshold {MIN_TFLOPS[2]}"
         assert result["losses"][-1] < result["losses"][0], "Loss should decrease"
 
     @skip_if_gpu_count_less_than(4)
     @_skip_if_no_qwen3_8b()
     def test_4gpu_tflops(self, tmp_path):
-        """4-GPU Qwen3-8B LoRA FSDP2 must achieve >= 329 TFLOPS on H100."""
+        """4-GPU Qwen3-8B LoRA FSDP2 must achieve >= 306 TFLOPS on H100."""
         result = _run_tflops_benchmark(num_gpus=4, dp_shard_size=4, tmp_path=str(tmp_path))
-        assert result["tflops"] >= MIN_TFLOPS[4], (
-            f"4-GPU TFLOPS {result['tflops']:.1f} below threshold {MIN_TFLOPS[4]}"
-        )
+        assert result["tflops"] >= MIN_TFLOPS[4], f"4-GPU TFLOPS {result['tflops']:.1f} below threshold {MIN_TFLOPS[4]}"
         assert result["losses"][-1] < result["losses"][0], "Loss should decrease"

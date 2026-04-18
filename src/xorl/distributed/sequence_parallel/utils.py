@@ -78,7 +78,9 @@ def has_overlap(x1, x2, y1, y2) -> Tuple[bool, int]:
     return max_value < min_value, min_value - max_value
 
 
-def all2all_splits(image_lens: List, image_lens_per_rank: List, ulysses_size: int, ulysses_rank: int) -> Tuple[List, List]:
+def all2all_splits(
+    image_lens: List, image_lens_per_rank: List, ulysses_size: int, ulysses_rank: int
+) -> Tuple[List, List]:
     """
     A func to generate splits for all2all communication
     """
@@ -113,7 +115,7 @@ def vlm_images_a2a_meta(
     ulysses_rank: int, ulysses_size: int, image_lens: List, image_masks: torch.Tensor
 ) -> Tuple[List, List, torch.Tensor]:
     """
-    A func to generate metadata for all2all communication after we balance the computaion in vision encoder
+    A func to generate metadata for all2all communication after we balance the computation in vision encoder
     Usually we will split the batches of images for vision encoder in sp group. However, before we feed images
     tokens into language model, we need to use all2all communication to gather necessary tokens into the current rank.
     """

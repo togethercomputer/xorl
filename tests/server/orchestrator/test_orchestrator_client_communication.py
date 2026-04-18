@@ -9,21 +9,21 @@ The tests use a mock engine that simulates the processing without actual workers
 
 import asyncio
 import logging
+import socket as sock
+
 import pytest
 import pytest_asyncio
 import zmq
 import zmq.asyncio
-from typing import Optional
 
 from xorl.server.api_server.orchestrator_client import OrchestratorClient
 from xorl.server.protocol.api_orchestrator import (
-    OrchestratorRequest,
     OrchestratorOutputs,
-    RequestType,
+    OrchestratorRequest,
     OutputType,
+    RequestType,
 )
 from xorl.server.protocol.operations import (
-    EmptyData,
     ModelPassData,
     OptimStepData,
 )
@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # Mock Engine
 # ============================================================================
+
 
 class MockEngine:
     """
@@ -116,33 +117,51 @@ class MockEngine:
     async def _handle_request(self, request):
         op = request.operation
         if op == "forward_backward":
-            num_samples = len(request.payload.data) if hasattr(request.payload, 'data') else 0
-            return OrchestratorOutputs(request_id=request.request_id, output_type=OutputType.FORWARD_BACKWARD,
-                                       outputs=[{"loss": 2.5, "num_samples": num_samples, "status": "success"}], finished=True)
+            num_samples = len(request.payload.data) if hasattr(request.payload, "data") else 0
+            return OrchestratorOutputs(
+                request_id=request.request_id,
+                output_type=OutputType.FORWARD_BACKWARD,
+                outputs=[{"loss": 2.5, "num_samples": num_samples, "status": "success"}],
+                finished=True,
+            )
         elif op == "optim_step":
-            lr = request.payload.lr if hasattr(request.payload, 'lr') else 0.0001
-            return OrchestratorOutputs(request_id=request.request_id, output_type=OutputType.OPTIM_STEP,
-                                       outputs=[{"grad_norm": 1.23, "learning_rate": lr, "status": "success"}], finished=True)
+            lr = request.payload.lr if hasattr(request.payload, "lr") else 0.0001
+            return OrchestratorOutputs(
+                request_id=request.request_id,
+                output_type=OutputType.OPTIM_STEP,
+                outputs=[{"grad_norm": 1.23, "learning_rate": lr, "status": "success"}],
+                finished=True,
+            )
         elif op == "health_check":
-            return OrchestratorOutputs(request_id=request.request_id, output_type=OutputType.HEALTH_CHECK,
-                                       outputs=[{"status": "healthy", "workers_discovered": True, "active_workers": 8}], finished=True)
+            return OrchestratorOutputs(
+                request_id=request.request_id,
+                output_type=OutputType.HEALTH_CHECK,
+                outputs=[{"status": "healthy", "workers_discovered": True, "active_workers": 8}],
+                finished=True,
+            )
         else:
-            return OrchestratorOutputs(request_id=request.request_id, output_type=OutputType.ERROR,
-                                       outputs=[], finished=True, error=f"Unknown operation: {op}")
+            return OrchestratorOutputs(
+                request_id=request.request_id,
+                output_type=OutputType.ERROR,
+                outputs=[],
+                finished=True,
+                error=f"Unknown operation: {op}",
+            )
 
 
 # ============================================================================
 # Fixtures
 # ============================================================================
 
+
 @pytest.fixture
 def zmq_addresses():
-    import socket as sock
     def find_free_port():
         with sock.socket(sock.AF_INET, sock.SOCK_STREAM) as s:
-            s.bind(('127.0.0.1', 0))
+            s.bind(("127.0.0.1", 0))
             s.listen(1)
             return s.getsockname()[1]
+
     return {"input": f"tcp://127.0.0.1:{find_free_port()}", "output": f"tcp://127.0.0.1:{find_free_port()}"}
 
 
@@ -166,11 +185,14 @@ async def orchestrator_client(zmq_addresses):
 # Helper to create requests
 # ============================================================================
 
+
 def _health_check_request():
     return OrchestratorRequest(request_type=RequestType.UTILITY, operation="health_check")
 
+
 def _forward_backward_request(data):
     return OrchestratorRequest(operation="forward_backward", payload=ModelPassData(data=data))
+
 
 def _optim_step_request(lr, gradient_clip=None):
     return OrchestratorRequest(operation="optim_step", payload=OptimStepData(lr=lr, gradient_clip=gradient_clip))
@@ -179,6 +201,7 @@ def _optim_step_request(lr, gradient_clip=None):
 # ============================================================================
 # Tests
 # ============================================================================
+
 
 @pytest.mark.asyncio
 async def test_basic_communication_and_roundtrip(mock_engine, orchestrator_client):
@@ -205,10 +228,12 @@ async def test_forward_backward_and_optim_step(mock_engine, orchestrator_client)
     await asyncio.sleep(0.2)
 
     # Forward backward
-    fb_request = _forward_backward_request(data=[
-        {"model_input": {"input_ids": [1, 2, 3]}, "loss_fn_inputs": {"labels": [2, 3, 4]}},
-        {"model_input": {"input_ids": [5, 6, 7]}, "loss_fn_inputs": {"labels": [6, 7, 8]}},
-    ])
+    fb_request = _forward_backward_request(
+        data=[
+            {"model_input": {"input_ids": [1, 2, 3]}, "loss_fn_inputs": {"labels": [2, 3, 4]}},
+            {"model_input": {"input_ids": [5, 6, 7]}, "loss_fn_inputs": {"labels": [6, 7, 8]}},
+        ]
+    )
     future = await orchestrator_client.send_request(fb_request)
     output = await asyncio.wait_for(future, timeout=2.0)
     assert output.output_type == OutputType.FORWARD_BACKWARD
@@ -269,8 +294,12 @@ async def test_edge_cases_and_lifecycle(zmq_addresses, mock_engine, orchestrator
     assert stats["running"] is True
 
     # Serialization roundtrip
-    data = [{"model_input": {"input_ids": list(range(100)), "attention_mask": [1]*100},
-             "loss_fn_inputs": {"labels": list(range(100, 200))}}]
+    data = [
+        {
+            "model_input": {"input_ids": list(range(100)), "attention_mask": [1] * 100},
+            "loss_fn_inputs": {"labels": list(range(100, 200))},
+        }
+    ]
     request = _forward_backward_request(data=data)
     await orchestrator_client.send_request(request)
     await asyncio.sleep(0.2)
@@ -285,10 +314,10 @@ async def test_edge_cases_and_lifecycle(zmq_addresses, mock_engine, orchestrator
         await client.get_output(timeout=1.0)
 
     # Client start/stop - use fresh ports to avoid address conflicts
-    import socket as sock
+
     def _find_free_port():
         with sock.socket(sock.AF_INET, sock.SOCK_STREAM) as s:
-            s.bind(('127.0.0.1', 0))
+            s.bind(("127.0.0.1", 0))
             s.listen(1)
             return s.getsockname()[1]
 

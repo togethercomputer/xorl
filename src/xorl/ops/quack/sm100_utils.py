@@ -33,9 +33,7 @@ def make_smem_layout_cpasync_a(
     """
 
     is_k_major = tiled_mma.op.a_major_mode == OperandMajorMode.K
-    a_smem_shape = tiled_mma.partition_shape_A(
-        cute.dice(mma_tiler_mnk, (1, None, 1), loc=loc, ip=ip)
-    )
+    a_smem_shape = tiled_mma.partition_shape_A(cute.dice(mma_tiler_mnk, (1, None, 1), loc=loc, ip=ip))
     a_smem_shape_mn_k = (
         cute.size(a_smem_shape[0][0], loc=loc, ip=ip) * a_smem_shape[1],
         cute.size(a_smem_shape[0][1], loc=loc, ip=ip) * a_smem_shape[2],

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 # Adapted from flash-linear-attention/fla/ops/utils/op.py.
 # Portions of this file are adapted from flash-linear-attention, Copyright (c) 2023-2025 Songlin Yang, licensed under the MIT License.
-
 import os
 
 import triton
 import triton.language as tl
 import triton.language.extra.libdevice as tldevice
+
 from xorl.ops.linear_attention.utils import IS_GATHER_SUPPORTED
+
 
 if os.environ.get("FLA_USE_FAST_OPS", "0") == "1":
 

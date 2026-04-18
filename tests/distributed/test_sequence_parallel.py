@@ -11,6 +11,7 @@ from xorl.distributed.sequence_parallel import (
 )
 from xorl.distributed.sequence_parallel.utils import pad_tensor, unpad_tensor
 
+
 pytestmark = [pytest.mark.distributed]
 
 
@@ -40,7 +41,9 @@ class TestPaddingUtilities:
 
         # Roundtrip
         xr = torch.randn(3, 7, 5)
-        assert torch.allclose(xr, unpad_tensor(pad_tensor(xr, dim=1, padding_size=3, padding_value=0), dim=1, padding_size=3))
+        assert torch.allclose(
+            xr, unpad_tensor(pad_tensor(xr, dim=1, padding_size=3, padding_value=0), dim=1, padding_size=3)
+        )
 
 
 class TestSlicePositionEmbedding:

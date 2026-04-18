@@ -1,0 +1,3 @@
+[codespell]
+skip = *.lock,*.json,submodules/*,.venv/*,.git,docs/node_modules/*
+ignore-words-list = dout,te,subtile,parm,mot,numer

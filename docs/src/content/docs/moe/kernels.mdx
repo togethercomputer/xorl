@@ -185,25 +185,53 @@ The `native` backend (`torch._grouped_mm`) compiles cleanly end-to-end. The `qua
 
 ---
 
-## MoE Gradient Checkpointing (`moe_checkpoint_method`)
+## MoE Gradient Checkpointing (`gradient_checkpointing_method`)
 
-xorl provides two MoE-aware checkpoint methods:
+`gradient_checkpointing_method` controls what is recomputed in the backward pass. For MoE models with EP, this has a large impact on throughput because `recompute_full_layer` recomputes AllToAll dispatch + combine on every backward layer.
 
-| Method | What is recomputed | EP comm recomputed | Memory savings |
-|---|---|---|---|
-| `moe_act` (**default**) | Expert MLP activations only (gate×up product inside each expert) | **No** — dispatch/combine skipped via R3 | Moderate — recovers large expert FFN tensors |
-| `full_recompute` | All activations: attention, router, expert FFN | Yes — full AllToAll re-executed | Maximum — stores nothing |
-| `None` / not set | Nothing | N/A | None — all activations kept |
+### Methods
+
+| Method | Backward recomputes | EP comm recomputed | Peak mem (32k) | Throughput |
+|---|---|---|---|---|
+| `recompute_full_layer` (default) | Entire decoder layer | **Yes** — full AllToAll re-executed | 37.5 GB (1N) / 21.2 GB (2N) | baseline |
+| `recompute_before_dispatch` | Attn + router only; keeps dispatch + expert + combine | **No** | 54.8 GB (1N) / 46.6 GB (2N) | **+24.5% (1N) / +33.4% (2N)** |
+| `no_recompute` | Nothing | **No** | highest | max throughput |
+
+*Benchmarks: Qwen3-Coder-30B-A3B, quack + alltoall, 32k seq, H100 80GB. 1N = 1-node EP8, 2N = 2-node EP16.*
 
 ```yaml
+# Maximum throughput (short seq, memory permits):
 train:
   enable_gradient_checkpointing: true
-  moe_checkpoint_method: moe_act   # strongly recommended for EP models
+  gradient_checkpointing_method: no_recompute
+
+# Balanced memory/speed — recompute attn+router, keep dispatch+expert+combine:
+train:
+  enable_gradient_checkpointing: true
+  gradient_checkpointing_method: recompute_before_dispatch
+
+# Maximum memory savings (long seq, required for 128k):
+train:
+  enable_gradient_checkpointing: true
+  gradient_checkpointing_method: recompute_full_layer
 ```
 
-**Why `moe_act` is the right default:** Expert FFN activations (gate×up intermediate tensor of shape `[tokens, intermediate_size]`) are the largest memory consumer in a MoE forward pass. `moe_act` drops these and recomputes them from stored inputs during backward, without re-running the expensive AllToAll dispatch. This gives most of the memory savings of full recompute at a fraction of the communication cost.
+### How `recompute_before_dispatch` works (Megatron-style)
 
-**How it works in the Triton kernel:** The `group_gemm_same_nk_kernel` has an optional `STORE_ACTIVATIONS` mode. When `moe_act` is active, the kernel stores the post-gate×up intermediate activations to a separate buffer. The custom backward function recomputes only the down projection from these stored intermediates.
+In the expert MLP forward: `gate_output = x @ gate_proj`, `up_output = x @ up_proj`, `postact = silu(gate_output) * up_output`, `output = postact @ down_proj`.
+
+With `recompute_before_dispatch`, the attention and router outputs are recomputed in backward, but **MoE dispatch and combine are not recomputed**. This avoids re-executing AllToAll communication, which is the dominant cost at multi-node.
+
+The elementwise recompute (`postact = silu(gate_output) * up_output`) has ~0% overhead — confirmed by benchmarks showing `recompute_before_dispatch` within 0.2% of no-checkpointing speed.
+
+### Why the speedup grows with node count
+
+| Scale | recompute_full_layer | recompute_before_dispatch | Speedup |
+|---|---|---|---|
+| 1-node EP8 (NVLink) | 17,542 tok/s | 21,851 tok/s | +24.5% |
+| 2-node EP16 (InfiniBand) | 20,586 tok/s | 27,470 tok/s | +33.4% |
+
+At 2-node, dispatch/combine crosses InfiniBand (~100 Gbps) instead of NVLink (~900 Gbps). `recompute_full_layer` recomputes both dispatch and combine in backward — doubling the IB communication. `recompute_before_dispatch` avoids this entirely.
 
 ---
 

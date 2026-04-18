@@ -1,16 +1,15 @@
-from typing import Optional
 from functools import partial
-
-from torch import Tensor
+from typing import Optional
 
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 from cutlass import Float32
 from cutlass.cute.runtime import from_dlpack, make_ptr
+from torch import Tensor
 
 from .cute_dsl_utils import get_device_capacity, get_max_active_clusters
-from .gemm_wrapper_utils import GemmWrapperBase
 from .gemm_default_epi import GemmDefaultSm90, GemmDefaultSm100
+from .gemm_wrapper_utils import GemmWrapperBase
 
 
 def gemm(
@@ -59,9 +58,7 @@ def gemm(
     L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
         A, B, D, C, cu_seqlens_m=cu_seqlens_m, cu_seqlens_k=cu_seqlens_k, A_idx=A_idx
     )
-    GemmWrapperBase.permute_tensors(
-        tensor_infos, varlen_m=cu_seqlens_m is not None, varlen_k=cu_seqlens_k is not None
-    )
+    GemmWrapperBase.permute_tensors(tensor_infos, varlen_m=cu_seqlens_m is not None, varlen_k=cu_seqlens_k is not None)
     GemmWrapperBase.extract_dtypes(tensor_infos)
     major_configs = {
         "A": ("m", "k", "l"),
@@ -101,9 +98,7 @@ def gemm(
     epi_args = GemmCls.EpilogueArguments(
         scalar_arg(alpha),
         scalar_arg(beta),
-        mRowVecBroadcast=from_dlpack(rowvec_bias.detach(), assumed_align=4).mark_layout_dynamic(
-            leading_dim=1
-        )
+        mRowVecBroadcast=from_dlpack(rowvec_bias.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=1)
         if rowvec_bias is not None
         else None,
         mColVecBroadcast=from_dlpack(colvec_bias.detach(), assumed_align=4).mark_layout_dynamic(

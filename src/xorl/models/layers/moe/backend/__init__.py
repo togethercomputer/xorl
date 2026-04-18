@@ -7,10 +7,12 @@ Follows the same pattern as ``layers.attention.backend.ATTENTION_FUNCTIONS``.
 
 from typing import Callable, Dict
 
+
 MOE_EXPERT_BACKENDS: Dict[str, Callable] = {}
 
 # Eager is always available (no kernel deps)
 from .eager import eager_expert_forward
+
 
 MOE_EXPERT_BACKENDS["eager"] = eager_expert_forward
 
@@ -41,12 +43,12 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # EP expert compute registry
 # Maps implementation name -> compute callable for Expert Parallelism.
-# All compute functions share: (permute_tokens, cumsum, gate_proj, up_proj, down_proj) -> output
+# Fused signature: (permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size) -> output
 # ---------------------------------------------------------------------------
 
 EP_EXPERT_COMPUTE: Dict[str, Callable] = {}
 
-# Triton EP compute (custom Triton group GEMM with autograd)
+# Triton EP compute (fused gate+up GEMM with autograd)
 try:
     from xorl.ops.moe.triton import TritonEPGroupGemm
 
@@ -54,19 +56,29 @@ try:
 except ImportError:
     pass
 
-# Quack EP compute (quack group GEMM with autograd)
+# Quack EP compute — adapt fused interface to old (gate_proj, up_proj) signature
 try:
-    from xorl.ops.moe.quack import QuackEPGroupGemm
+    from xorl.ops.moe.quack import QuackEPGroupGemm as _QuackEPGroupGemm
 
-    EP_EXPERT_COMPUTE["quack"] = QuackEPGroupGemm.apply
+    def _quack_ep_fused(permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores=None):
+        gate_proj = gate_up_proj[..., :intermediate_size].contiguous()
+        up_proj = gate_up_proj[..., intermediate_size:].contiguous()
+        return _QuackEPGroupGemm.apply(permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores)
+
+    EP_EXPERT_COMPUTE["quack"] = _quack_ep_fused
 except ImportError:
     pass
 
-# Native EP compute (torch._grouped_mm with alignment padding)
+# Native EP compute — adapt fused interface
 try:
-    from .native import native_ep_compute
+    from .native import native_ep_compute as _native_ep_compute
 
-    EP_EXPERT_COMPUTE["native"] = native_ep_compute
+    def _native_ep_fused(permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores=None):
+        gate_proj = gate_up_proj[..., :intermediate_size].contiguous()
+        up_proj = gate_up_proj[..., intermediate_size:].contiguous()
+        return _native_ep_compute(permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores)
+
+    EP_EXPERT_COMPUTE["native"] = _native_ep_fused
 except ImportError:
     pass
 
@@ -83,7 +95,7 @@ EP_COMBINE: Dict[str, Callable] = {}
 
 # AllToAll dispatch (always available when EP ops are available)
 try:
-    from xorl.distributed.moe import alltoall_pre_dispatch, alltoall_post_combine
+    from xorl.distributed.moe import alltoall_post_combine, alltoall_pre_dispatch
 
     EP_DISPATCH["alltoall"] = alltoall_pre_dispatch
     EP_COMBINE["alltoall"] = alltoall_post_combine
@@ -94,6 +106,8 @@ except ImportError:
 try:
     from xorl.distributed.moe.deepep import (
         token_pre_dispatch as deepep_pre_dispatch,
+    )
+    from xorl.distributed.moe.deepep import (
         tokens_post_combine as deepep_post_combine,
     )
 
@@ -172,65 +186,6 @@ except ImportError:
     pass
 
 
-# ---------------------------------------------------------------------------
-# Moe_act registries: activation-recompute variants that drop gate_output/up_output
-# from save_for_backward and recompute them in backward via local GEMMs.
-# ---------------------------------------------------------------------------
-
-EP_EXPERT_COMPUTE_MOE_ACT: Dict[str, Callable] = {}
-
-# Triton EP moe_act compute
-try:
-    from xorl.ops.moe.triton import TritonEPGroupGemmMoeAct
-
-    EP_EXPERT_COMPUTE_MOE_ACT["triton"] = TritonEPGroupGemmMoeAct.apply
-except ImportError:
-    pass
-
-# Quack EP moe_act compute
-try:
-    from xorl.ops.moe.quack import QuackEPGroupGemmMoeAct
-
-    EP_EXPERT_COMPUTE_MOE_ACT["quack"] = QuackEPGroupGemmMoeAct.apply
-except ImportError:
-    pass
-
-# Native EP moe_act compute
-try:
-    from .native import native_ep_compute_moe_act
-
-    EP_EXPERT_COMPUTE_MOE_ACT["native"] = native_ep_compute_moe_act
-except ImportError:
-    pass
-
-
-MOE_EXPERT_BACKENDS_MOE_ACT: Dict[str, Callable] = {}
-
-# Triton local moe_act compute
-try:
-    from .triton_moe_act import triton_expert_forward_moe_act
-
-    MOE_EXPERT_BACKENDS_MOE_ACT["triton"] = triton_expert_forward_moe_act
-except ImportError:
-    pass
-
-# Quack local moe_act compute
-try:
-    from .quack_moe_act import quack_expert_forward_moe_act
-
-    MOE_EXPERT_BACKENDS_MOE_ACT["quack"] = quack_expert_forward_moe_act
-except ImportError:
-    pass
-
-# Native local moe_act compute
-try:
-    from .native import native_expert_forward_moe_act
-
-    MOE_EXPERT_BACKENDS_MOE_ACT["native"] = native_expert_forward_moe_act
-except ImportError:
-    pass
-
-
 __all__ = [
     "MOE_EXPERT_BACKENDS",
     "EP_EXPERT_COMPUTE",
@@ -238,6 +193,4 @@ __all__ = [
     "EP_COMBINE",
     "EP_EXPERT_COMPUTE_LORA",
     "MOE_EXPERT_BACKENDS_LORA",
-    "EP_EXPERT_COMPUTE_MOE_ACT",
-    "MOE_EXPERT_BACKENDS_MOE_ACT",
 ]

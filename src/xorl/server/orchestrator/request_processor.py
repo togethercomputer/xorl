@@ -41,7 +41,7 @@ await executor.stop()
 import logging
 import math
 import time
-from typing import Any, Callable, Dict, Optional, Union
+from typing import Any, Callable, Dict, Union
 
 import torch
 
@@ -49,8 +49,6 @@ from xorl.server.backend import Backend
 from xorl.server.orchestrator.packing import pack_samples, unpack_per_token_outputs, validate_micro_batches
 from xorl.server.protocol.api_orchestrator import OrchestratorOutputs, OrchestratorRequest, OutputType
 from xorl.server.protocol.operations import (
-    LOAD_STATE_TIMEOUT,
-    SAVE_STATE_TIMEOUT,
     AdapterStateData,
     KillSessionData,
     LoadStateData,
@@ -181,14 +179,11 @@ class RequestProcessor:
 
             if not batches:
                 raise ValueError(
-                    f"No batches created from {len(data)} samples. "
-                    "The packer did not produce any valid batches."
+                    f"No batches created from {len(data)} samples. The packer did not produce any valid batches."
                 )
 
             if not validate_micro_batches(batches):
-                raise ValueError(
-                    "Invalid batch structure after packing. This may indicate a bug in the packing logic."
-                )
+                raise ValueError("Invalid batch structure after packing. This may indicate a bug in the packing logic.")
 
             t_packed = time.perf_counter()
             logger.debug(f"Packed {len(data)} samples into {len(batches)} batches")
@@ -311,13 +306,17 @@ class RequestProcessor:
     async def execute_forward_backward(self, request: OrchestratorRequest) -> OrchestratorOutputs:
         """Execute forward-backward pass on workers."""
         return await self._execute_model_pass(
-            request, "forward_backward", OutputType.FORWARD_BACKWARD,
+            request,
+            "forward_backward",
+            OutputType.FORWARD_BACKWARD,
         )
 
     async def execute_forward(self, request: OrchestratorRequest) -> OrchestratorOutputs:
         """Execute forward pass on workers (no gradient computation)."""
         return await self._execute_model_pass(
-            request, "forward", OutputType.FORWARD,
+            request,
+            "forward",
+            OutputType.FORWARD,
         )
 
     async def _execute_operation(
@@ -382,13 +381,19 @@ class RequestProcessor:
             return [output_dict]
 
         return await self._execute_operation(
-            request, "optim_step",
+            request,
+            "optim_step",
             self.backend.optim_step(
-                lr=p.lr, gradient_clip=p.gradient_clip,
-                beta1=p.beta1, beta2=p.beta2, eps=p.eps,
-                model_id=p.model_id, request_id=request.request_id,
+                lr=p.lr,
+                gradient_clip=p.gradient_clip,
+                beta1=p.beta1,
+                beta2=p.beta2,
+                eps=p.eps,
+                model_id=p.model_id,
+                request_id=request.request_id,
             ),
-            OutputType.OPTIM_STEP, build_output,
+            OutputType.OPTIM_STEP,
+            build_output,
         )
 
     async def execute_save_state(self, request: OrchestratorRequest) -> OrchestratorOutputs:
@@ -399,20 +404,27 @@ class RequestProcessor:
         def build_output(result):
             actual_path = result.get("checkpoint_path", checkpoint_path)
             success = result.get("success", False)
-            return [{
-                "checkpoint_path": actual_path, "success": success,
-                "execution_time": result.get("execution_time", 0.0),
-                "message": "Checkpoint saved successfully" if success else "Save failed",
-            }]
+            return [
+                {
+                    "checkpoint_path": actual_path,
+                    "success": success,
+                    "execution_time": result.get("execution_time", 0.0),
+                    "message": "Checkpoint saved successfully" if success else "Save failed",
+                }
+            ]
 
         return await self._execute_operation(
-            request, "save_state",
+            request,
+            "save_state",
             self.backend.save_state(
-                checkpoint_path=p.checkpoint_path, save_optimizer=p.save_optimizer,
-                use_timestamp=p.use_timestamp, model_id=p.model_id,
+                checkpoint_path=p.checkpoint_path,
+                save_optimizer=p.save_optimizer,
+                use_timestamp=p.use_timestamp,
+                model_id=p.model_id,
                 request_id=request.request_id,
             ),
-            OutputType.SAVE_STATE, build_output,
+            OutputType.SAVE_STATE,
+            build_output,
         )
 
     async def execute_save_lora_only(self, request: OrchestratorRequest) -> OrchestratorOutputs:
@@ -425,19 +437,25 @@ class RequestProcessor:
         def build_output(result):
             actual_path = result.get("lora_path", lora_path)
             success = result.get("success", False)
-            return [{
-                "lora_path": actual_path, "success": success,
-                "execution_time": result.get("execution_time", 0.0),
-                "message": "LoRA adapter saved successfully (PEFT format)" if success else "Save failed",
-            }]
+            return [
+                {
+                    "lora_path": actual_path,
+                    "success": success,
+                    "execution_time": result.get("execution_time", 0.0),
+                    "message": "LoRA adapter saved successfully (PEFT format)" if success else "Save failed",
+                }
+            ]
 
         return await self._execute_operation(
-            request, "save_lora_only",
+            request,
+            "save_lora_only",
             self.backend.save_lora_only(
-                lora_path=p.lora_path, model_id=p.model_id,
+                lora_path=p.lora_path,
+                model_id=p.model_id,
                 request_id=request.request_id,
             ),
-            OutputType.SAVE_LORA_ONLY, build_output,
+            OutputType.SAVE_LORA_ONLY,
+            build_output,
         )
 
     async def execute_save_full_weights(self, request: OrchestratorRequest) -> OrchestratorOutputs:
@@ -451,21 +469,29 @@ class RequestProcessor:
         def build_output(result):
             success = result.get("success", False)
             num_shards = result.get("num_shards", 1)
-            return [{
-                "output_path": output_path, "dtype": dtype,
-                "num_shards": num_shards, "success": success,
-                "execution_time": result.get("execution_time", 0.0),
-                "message": f"Full weights saved as safetensors ({num_shards} shards)" if success else "Save failed",
-            }]
+            return [
+                {
+                    "output_path": output_path,
+                    "dtype": dtype,
+                    "num_shards": num_shards,
+                    "success": success,
+                    "execution_time": result.get("execution_time", 0.0),
+                    "message": f"Full weights saved as safetensors ({num_shards} shards)" if success else "Save failed",
+                }
+            ]
 
         return await self._execute_operation(
-            request, "save_full_weights",
+            request,
+            "save_full_weights",
             self.backend.save_full_weights(
-                output_path=p.output_path, dtype=p.dtype,
-                base_model_path=p.base_model_path, model_id=p.model_id,
+                output_path=p.output_path,
+                dtype=p.dtype,
+                base_model_path=p.base_model_path,
+                model_id=p.model_id,
                 request_id=request.request_id,
             ),
-            OutputType.SAVE_STATE, build_output,
+            OutputType.SAVE_STATE,
+            build_output,
         )
 
     async def execute_load_state(self, request: OrchestratorRequest) -> OrchestratorOutputs:
@@ -477,45 +503,66 @@ class RequestProcessor:
 
         def build_output(result):
             success = result.get("success", False)
-            return [{
-                "checkpoint_path": checkpoint_path, "success": success,
-                "execution_time": result.get("execution_time", 0.0),
-                "message": "Checkpoint loaded successfully" if success else "Load failed",
-            }]
+            return [
+                {
+                    "checkpoint_path": checkpoint_path,
+                    "success": success,
+                    "execution_time": result.get("execution_time", 0.0),
+                    "message": "Checkpoint loaded successfully" if success else "Load failed",
+                }
+            ]
 
         return await self._execute_operation(
-            request, "load_state",
+            request,
+            "load_state",
             self.backend.load_state(
-                checkpoint_path=p.checkpoint_path, load_optimizer=p.load_optimizer,
-                model_id=p.model_id, request_id=request.request_id,
+                checkpoint_path=p.checkpoint_path,
+                load_optimizer=p.load_optimizer,
+                model_id=p.model_id,
+                request_id=request.request_id,
             ),
-            OutputType.LOAD_STATE, build_output,
+            OutputType.LOAD_STATE,
+            build_output,
         )
 
     async def execute_sleep(self, request: OrchestratorRequest) -> OrchestratorOutputs:
         """Execute sleep operation (offload model and optimizer to CPU)."""
+
         def build_output(result):
-            return [{"status": result.get("status", "sleeping"),
-                     "offload_time": result.get("offload_time", 0.0),
-                     "execution_time": result.get("execution_time", 0.0)}]
+            return [
+                {
+                    "status": result.get("status", "sleeping"),
+                    "offload_time": result.get("offload_time", 0.0),
+                    "execution_time": result.get("execution_time", 0.0),
+                }
+            ]
 
         return await self._execute_operation(
-            request, "sleep",
+            request,
+            "sleep",
             self.backend.sleep(request_id=request.request_id),
-            OutputType.SLEEP, build_output,
+            OutputType.SLEEP,
+            build_output,
         )
 
     async def execute_wake_up(self, request: OrchestratorRequest) -> OrchestratorOutputs:
         """Execute wake_up operation (load model and optimizer to GPU)."""
+
         def build_output(result):
-            return [{"status": result.get("status", "awake"),
-                     "load_time": result.get("load_time", 0.0),
-                     "execution_time": result.get("execution_time", 0.0)}]
+            return [
+                {
+                    "status": result.get("status", "awake"),
+                    "load_time": result.get("load_time", 0.0),
+                    "execution_time": result.get("execution_time", 0.0),
+                }
+            ]
 
         return await self._execute_operation(
-            request, "wake_up",
+            request,
+            "wake_up",
             self.backend.wake_up(request_id=request.request_id),
-            OutputType.WAKE_UP, build_output,
+            OutputType.WAKE_UP,
+            build_output,
         )
 
     async def execute_sync_inference_weights(self, request: OrchestratorRequest) -> OrchestratorOutputs:
@@ -525,28 +572,37 @@ class RequestProcessor:
             raise ValueError("inference endpoints must be provided")
 
         def build_output(result):
-            return [{
-                "success": result.get("success", False),
-                "message": result.get("message", ""),
-                "transfer_time": result.get("transfer_time", 0.0),
-                "total_bytes": result.get("total_bytes", 0),
-                "num_parameters": result.get("num_parameters", 0),
-                "num_buckets": result.get("num_buckets", 0),
-                "endpoint_results": result.get("endpoint_results", []),
-                "execution_time": result.get("execution_time", 0.0),
-            }]
+            return [
+                {
+                    "success": result.get("success", False),
+                    "message": result.get("message", ""),
+                    "transfer_time": result.get("transfer_time", 0.0),
+                    "total_bytes": result.get("total_bytes", 0),
+                    "num_parameters": result.get("num_parameters", 0),
+                    "num_buckets": result.get("num_buckets", 0),
+                    "endpoint_results": result.get("endpoint_results", []),
+                    "execution_time": result.get("execution_time", 0.0),
+                }
+            ]
 
         return await self._execute_operation(
-            request, "sync_inference_weights",
+            request,
+            "sync_inference_weights",
             self.backend.sync_inference_weights(
-                endpoints=p.endpoints, master_address=p.master_address,
-                master_port=p.master_port, group_name=p.group_name,
-                buffer_size_mb=p.buffer_size_mb, sync_method=p.sync_method,
-                flush_cache=p.flush_cache, pause_mode=p.pause_mode,
-                weight_version=p.weight_version, quantization=p.quantization,
+                endpoints=p.endpoints,
+                master_address=p.master_address,
+                master_port=p.master_port,
+                group_name=p.group_name,
+                buffer_size_mb=p.buffer_size_mb,
+                sync_method=p.sync_method,
+                flush_cache=p.flush_cache,
+                pause_mode=p.pause_mode,
+                weight_version=p.weight_version,
+                quantization=p.quantization,
                 request_id=request.request_id,
             ),
-            OutputType.SYNC_INFERENCE_WEIGHTS, build_output,
+            OutputType.SYNC_INFERENCE_WEIGHTS,
+            build_output,
         )
 
     async def execute_register_adapter(self, request: OrchestratorRequest) -> OrchestratorOutputs:
@@ -557,11 +613,15 @@ class RequestProcessor:
             return {"result": result}
 
         return await self._execute_operation(
-            request, "register_adapter",
+            request,
+            "register_adapter",
             self.backend.register_adapter(
-                model_id=p.model_id, lr=p.lr, request_id=request.request_id,
+                model_id=p.model_id,
+                lr=p.lr,
+                request_id=request.request_id,
             ),
-            OutputType.REGISTER_ADAPTER, build_output,
+            OutputType.REGISTER_ADAPTER,
+            build_output,
         )
 
     async def execute_save_adapter_state(self, request: OrchestratorRequest) -> OrchestratorOutputs:
@@ -572,12 +632,16 @@ class RequestProcessor:
             return {"result": result}
 
         return await self._execute_operation(
-            request, "save_adapter_state",
+            request,
+            "save_adapter_state",
             self.backend.save_adapter_state(
-                model_id=p.model_id, path=p.path,
-                save_optimizer=p.save_optimizer, request_id=request.request_id,
+                model_id=p.model_id,
+                path=p.path,
+                save_optimizer=p.save_optimizer,
+                request_id=request.request_id,
             ),
-            OutputType.SAVE_ADAPTER_STATE, build_output,
+            OutputType.SAVE_ADAPTER_STATE,
+            build_output,
         )
 
     async def execute_load_adapter_state(self, request: OrchestratorRequest) -> OrchestratorOutputs:
@@ -590,24 +654,31 @@ class RequestProcessor:
             return {"result": result}
 
         return await self._execute_operation(
-            request, "load_adapter_state",
+            request,
+            "load_adapter_state",
             self.backend.load_adapter_state(
-                model_id=p.model_id, path=p.path,
-                load_optimizer=p.load_optimizer, lr=p.lr,
+                model_id=p.model_id,
+                path=p.path,
+                load_optimizer=p.load_optimizer,
+                lr=p.lr,
                 request_id=request.request_id,
             ),
-            OutputType.LOAD_ADAPTER_STATE, build_output,
+            OutputType.LOAD_ADAPTER_STATE,
+            build_output,
         )
 
     async def execute_get_adapter_info(self, request: OrchestratorRequest) -> OrchestratorOutputs:
         """Execute get adapter info on workers."""
+
         def build_output(result):
             return [result]
 
         return await self._execute_operation(
-            request, "get_adapter_info",
+            request,
+            "get_adapter_info",
             self.backend.get_adapter_info(request_id=request.request_id),
-            OutputType.GET_ADAPTER_INFO, build_output,
+            OutputType.GET_ADAPTER_INFO,
+            build_output,
         )
 
     async def execute_kill_session(self, request: OrchestratorRequest) -> OrchestratorOutputs:
@@ -615,20 +686,25 @@ class RequestProcessor:
         p: KillSessionData = request.payload
 
         def build_output(result):
-            return [{
-                "success": result.get("success", False),
-                "message": result.get("message", ""),
-                "checkpoint_path": result.get("checkpoint_path"),
-                "execution_time": result.get("execution_time", 0.0),
-            }]
+            return [
+                {
+                    "success": result.get("success", False),
+                    "message": result.get("message", ""),
+                    "checkpoint_path": result.get("checkpoint_path"),
+                    "execution_time": result.get("execution_time", 0.0),
+                }
+            ]
 
         return await self._execute_operation(
-            request, "kill_session",
+            request,
+            "kill_session",
             self.backend.kill_session(
-                model_id=p.model_id, save_checkpoint=p.save_checkpoint,
+                model_id=p.model_id,
+                save_checkpoint=p.save_checkpoint,
                 request_id=request.request_id,
             ),
-            OutputType.KILL_SESSION, build_output,
+            OutputType.KILL_SESSION,
+            build_output,
         )
 
     # ========================================================================

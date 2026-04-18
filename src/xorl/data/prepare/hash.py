@@ -1,13 +1,12 @@
 from typing import List
 
-from ...arguments import Arguments, DatasetConfig
-from .utils import md5
 from datasets import Dataset
 
+from ...arguments import Arguments, DatasetConfig
+from .utils import md5
 
-def generate_split_fingerprints(
-    dataset: Dataset, val_set_size: int | float, seed: int
-) -> tuple[str, str]:
+
+def generate_split_fingerprints(dataset: Dataset, val_set_size: int | float, seed: int) -> tuple[str, str]:
     """Generate consistent fingerprints for train/test splits."""
     fingerprint = dataset._fingerprint
 
@@ -40,9 +39,8 @@ def generate_packing_hash(
         packing_str += f"_align{doc_align}"
     return packing_str
 
-def generate_dataset_hash_from_config(
-    args: Arguments, args_datasets: List[DatasetConfig], tokenizer_name: str
-) -> str:
+
+def generate_dataset_hash_from_config(args: Arguments, args_datasets: List[DatasetConfig], tokenizer_name: str) -> str:
     """Generate a hash to uniquely identify a dataset configuration for SFT.
 
     Args:

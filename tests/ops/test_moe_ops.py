@@ -7,6 +7,7 @@ with naive PyTorch implementations to ensure correctness.
 import pytest
 import torch
 
+
 # Mark all tests as GPU since MoE ops require CUDA
 pytestmark = pytest.mark.gpu
 
@@ -53,7 +54,7 @@ class TestExpertHistogramAndIndex:
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
         try:
-            from xorl.ops.group_gemm.kernel.moe import expert_histogram, moe_index_compute
+            from xorl.ops.group_gemm.kernel.moe import expert_histogram, moe_index_compute  # noqa: PLC0415
         except ImportError:
             pytest.skip("moe ops not available")
 
@@ -82,9 +83,7 @@ class TestExpertHistogramAndIndex:
         assert torch.equal(output_i64.cpu(), naive_expert_histogram(input_i64, 4).cpu())
 
         # --- Index compute: basic + ordering ---
-        experts_for_tokens = torch.tensor(
-            [[0, 1], [1, 2], [0, 2], [2, 3]], dtype=torch.int32
-        ).cuda()
+        experts_for_tokens = torch.tensor([[0, 1], [1, 2], [0, 2], [2, 3]], dtype=torch.int32).cuda()
         histogram = expert_histogram(experts_for_tokens.flatten(), 4)
         cumsum = torch.cumsum(histogram, dim=0).int().cuda()
         indices = moe_index_compute(experts_for_tokens, cumsum)
@@ -94,9 +93,7 @@ class TestExpertHistogramAndIndex:
         assert indices.flatten().unique().numel() == experts_for_tokens.numel()
 
         # Ordering: same expert gets sequential indices
-        experts_same = torch.tensor(
-            [[0, 0], [0, 0], [1, 1], [1, 1]], dtype=torch.int32
-        ).cuda()
+        experts_same = torch.tensor([[0, 0], [0, 0], [1, 1], [1, 1]], dtype=torch.int32).cuda()
         hist2 = expert_histogram(experts_same.flatten(), 2)
         cumsum2 = torch.cumsum(hist2, dim=0).int().cuda()
         indices2 = moe_index_compute(experts_same, cumsum2)
@@ -114,7 +111,7 @@ class TestMoEGatherScatterAddGather:
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
         try:
-            from xorl.ops.group_gemm.kernel.moe import moe_gather, moe_scatter, moe_add_gather
+            from xorl.ops.group_gemm.kernel.moe import moe_add_gather, moe_gather, moe_scatter  # noqa: PLC0415
         except ImportError:
             pytest.skip("moe ops not available")
 
@@ -131,8 +128,10 @@ class TestMoEGatherScatterAddGather:
         x2 = torch.randn(M2 * topk2, N2, dtype=torch.bfloat16).cuda()
         index2 = torch.tensor([[0, 1], [1, 2], [0, 2]], dtype=torch.int32).cuda()
         assert torch.allclose(
-            moe_gather(x2, index2).float(), naive_moe_gather(x2, index2).float(),
-            rtol=1e-2, atol=1e-2,
+            moe_gather(x2, index2).float(),
+            naive_moe_gather(x2, index2).float(),
+            rtol=1e-2,
+            atol=1e-2,
         )
 
         # Gather: large dimensions
@@ -140,8 +139,10 @@ class TestMoEGatherScatterAddGather:
         x3 = torch.randn(M3 * topk3, N3, dtype=torch.float16).cuda()
         index3 = torch.arange(M3 * topk3, dtype=torch.int32).cuda().reshape(M3, topk3)
         assert torch.allclose(
-            moe_gather(x3, index3).float(), naive_moe_gather(x3, index3).float(),
-            rtol=1e-2, atol=1e-2,
+            moe_gather(x3, index3).float(),
+            naive_moe_gather(x3, index3).float(),
+            rtol=1e-2,
+            atol=1e-2,
         )
 
         # --- Scatter: basic ---
@@ -174,8 +175,10 @@ class TestMoEGatherScatterAddGather:
         y5 = torch.randn(M5 * topk5, N5, dtype=torch.bfloat16).cuda()
         idx5 = torch.arange(M5 * topk5, dtype=torch.int32).cuda().reshape(M5, topk5)
         assert torch.allclose(
-            moe_add_gather(x5, y5, idx5), moe_gather(x5 + y5, idx5),
-            rtol=1e-3, atol=1e-3,
+            moe_add_gather(x5, y5, idx5),
+            moe_gather(x5 + y5, idx5),
+            rtol=1e-3,
+            atol=1e-3,
         )
 
 
@@ -187,8 +190,11 @@ class TestMoEIntegration:
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
         try:
-            from xorl.ops.group_gemm.kernel.moe import (
-                expert_histogram, moe_scatter, moe_gather, moe_index_compute,
+            from xorl.ops.group_gemm.kernel.moe import (  # noqa: PLC0415
+                expert_histogram,
+                moe_gather,
+                moe_index_compute,
+                moe_scatter,
             )
         except ImportError:
             pytest.skip("moe ops not available")

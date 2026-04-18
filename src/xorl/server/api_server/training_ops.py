@@ -5,13 +5,10 @@ from __future__ import annotations
 import logging
 import math
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from fastapi import HTTPException, status
 
-from xorl.server.api_server.utils import (
-    validate_model_id,
-)
 from xorl.server.api_server.api_types import (
     ForwardBackwardRequest,
     ForwardBackwardResponse,
@@ -30,8 +27,12 @@ from xorl.server.api_server.api_types import (
 from xorl.server.api_server.future_store import (
     FutureStatus,
 )
-from xorl.server.protocol.api_orchestrator import OrchestratorRequest, RequestType
+from xorl.server.api_server.utils import (
+    validate_model_id,
+)
+from xorl.server.protocol.api_orchestrator import OrchestratorRequest
 from xorl.server.protocol.operations import ModelPassData, OptimStepData
+
 
 logger = logging.getLogger(__name__)
 
@@ -78,19 +79,13 @@ class TrainingOpsMixin:
             HTTPException: 404 if request_id not found, 503 if store not initialized
         """
         if not self.future_store:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Future store not initialized"
-            )
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Future store not initialized")
 
         # Use long polling: wait for result with timeout
         entry = await self.future_store.wait_for_result(request.request_id, timeout=timeout)
 
         if entry is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Request {request.request_id} not found"
-            )
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Request {request.request_id} not found")
 
         # Return appropriate response based on status
         if entry.status == FutureStatus.PENDING:
@@ -151,10 +146,7 @@ class TrainingOpsMixin:
         """
         self._require_engine()
         if not self.future_store:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Future store not initialized"
-            )
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Future store not initialized")
 
         model_id = validate_model_id(request.model_id)
         self.validate_model_id(model_id)
@@ -307,7 +299,9 @@ class TrainingOpsMixin:
             raise
         except Exception as e:
             logger.error(f"Forward-backward failed: {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Forward-backward failed: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Forward-backward failed: {e}"
+            )
 
     async def forward(self, request: ForwardRequest) -> ForwardResponse:
         """
@@ -455,4 +449,3 @@ class TrainingOpsMixin:
         except Exception as e:
             logger.error(f"Optimizer step failed: {e}", exc_info=True)
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Optimizer step failed: {e}")
-

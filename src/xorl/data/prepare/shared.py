@@ -3,17 +3,16 @@
 from __future__ import annotations
 
 import functools
-import hashlib
 import os
+from dataclasses import replace
 from pathlib import Path
-from typing import List, Dict, TYPE_CHECKING, Any, Generator
+from typing import TYPE_CHECKING, Any, Generator
 
 from datasets import (
     Dataset,
     DatasetDict,
     IterableDataset,
     IterableDatasetDict,
-    interleave_datasets,
     concatenate_datasets,
     load_dataset,
     load_dataset_builder,
@@ -26,10 +25,31 @@ from huggingface_hub.errors import (
     RevisionNotFoundError,
 )
 
+
+try:
+    import adlfs
+except ImportError:
+    adlfs = None
+
+try:
+    import gcsfs
+except ImportError:
+    gcsfs = None
+
+try:
+    import ocifs
+except ImportError:
+    ocifs = None
+
+try:
+    import s3fs
+except ImportError:
+    s3fs = None
+
 from ...arguments import Arguments, DatasetConfig
-from ...data.prepare.hash import generate_split_fingerprints
 from ...data.prepare.constants import DEFAULT_DATASET_PREPARED_PATH
-from ...data.prepare.utils import md5
+from ...data.prepare.hash import generate_split_fingerprints
+
 
 if TYPE_CHECKING:
     try:
@@ -41,6 +61,8 @@ if TYPE_CHECKING:
         pass
 
 from ...utils import logging
+
+
 LOG = logging.get_logger(__name__)
 
 EXTENSIONS_TO_DATASET_TYPES = {
@@ -49,8 +71,6 @@ EXTENSIONS_TO_DATASET_TYPES = {
     ".csv": "csv",
     ".txt": "text",
 }
-
-
 
 
 def get_dataset_type(dataset_config: DatasetConfig) -> str:
@@ -81,7 +101,6 @@ def datasets_with_name_generator(
     Yields:
         Individual dataset configurations, expanded as needed for names or shards.
     """
-    from dataclasses import replace
 
     for config in dataset_configs:
         if config.name and isinstance(config.name, list):
@@ -148,9 +167,7 @@ def load_dataset_with_config(
     if is_hub_dataset:
         return _load_from_hub(dataset_config, use_auth_token, load_dataset_kwargs)
     if is_cloud_dataset:
-        return _load_from_cloud(
-            dataset_config, remote_fs, storage_options, load_dataset_kwargs
-        )
+        return _load_from_cloud(dataset_config, remote_fs, storage_options, load_dataset_kwargs)
     if dataset_config.path.startswith("https://"):
         return _load_from_url(dataset_config, load_dataset_kwargs)
     if dataset_config.data_files:
@@ -187,49 +204,31 @@ def _check_if_hub_dataset(dataset_config: DatasetConfig, use_auth_token: bool) -
 
 def _get_remote_filesystem(
     path: str,
-) -> tuple[
-    S3FileSystem | GCSFileSystem | AzureBlobFileSystem | OCIFileSystem | None, dict
-]:
+) -> tuple[S3FileSystem | GCSFileSystem | AzureBlobFileSystem | OCIFileSystem | None, dict]:
     """Get the appropriate filesystem for a remote path."""
     if path.startswith("s3://"):
-        try:
-            import s3fs
-
-            storage_options = {"anon": False}
-            return s3fs.S3FileSystem(**storage_options), storage_options
-        except ImportError as exc:
-            raise ImportError("s3:// paths require s3fs to be installed") from exc
+        if s3fs is None:
+            raise ImportError("s3:// paths require s3fs to be installed")
+        storage_options = {"anon": False}
+        return s3fs.S3FileSystem(**storage_options), storage_options
 
     elif path.startswith(("gs://", "gcs://")):
-        try:
-            import gcsfs
-
-            storage_options = {"token": None}  # type: ignore
-            return gcsfs.GCSFileSystem(**storage_options), storage_options
-        except ImportError as exc:
-            raise ImportError(
-                "gs:// or gcs:// paths require gcsfs to be installed"
-            ) from exc
+        if gcsfs is None:
+            raise ImportError("gs:// or gcs:// paths require gcsfs to be installed")
+        storage_options = {"token": None}  # type: ignore
+        return gcsfs.GCSFileSystem(**storage_options), storage_options
 
     elif path.startswith(("adl://", "abfs://", "az://")):
-        try:
-            import adlfs
-
-            storage_options = {"anon": False}
-            return adlfs.AzureBlobFileSystem(**storage_options), storage_options
-        except ImportError as exc:
-            raise ImportError(
-                "adl:// or abfs:// paths require adlfs to be installed"
-            ) from exc
+        if adlfs is None:
+            raise ImportError("adl:// or abfs:// paths require adlfs to be installed")
+        storage_options = {"anon": False}
+        return adlfs.AzureBlobFileSystem(**storage_options), storage_options
 
     elif path.startswith("oci://"):
-        try:
-            import ocifs
-
-            storage_options = {}
-            return ocifs.OCIFileSystem(**storage_options), storage_options
-        except ImportError as exc:
-            raise ImportError("oci:// paths require ocifs to be installed") from exc
+        if ocifs is None:
+            raise ImportError("oci:// paths require ocifs to be installed")
+        storage_options = {}
+        return ocifs.OCIFileSystem(**storage_options), storage_options
 
     return None, {}
 
@@ -260,9 +259,7 @@ def _load_from_local_path(
             **load_dataset_kwargs,
         )
     else:
-        raise ValueError(
-            "Unhandled dataset load: local path exists, but is neither a directory or a file"
-        )
+        raise ValueError("Unhandled dataset load: local path exists, but is neither a directory or a file")
 
 
 def _load_from_hub(
@@ -287,11 +284,7 @@ def _load_from_hub(
                 trust_remote_code=dataset_config.trust_remote_code,
             )
             data_files = getattr(getattr(builder, "config", None), "data_files", None)
-            if (
-                data_files
-                and requested_split in data_files
-                and len(data_files) > 1
-            ):
+            if data_files and requested_split in data_files and len(data_files) > 1:
                 # Load only the parquet files for the requested split, skipping others
                 split_files = data_files[requested_split]
                 kwargs = {k: v for k, v in load_dataset_kwargs.items() if k != "split"}
@@ -313,6 +306,7 @@ def _load_from_hub(
         revision=dataset_config.revision,
         **load_dataset_kwargs,
     )
+
 
 def _load_from_cloud(
     dataset_config: DatasetConfig,
@@ -336,9 +330,7 @@ def _load_from_cloud(
             **load_dataset_kwargs,
         )
 
-    raise ValueError(
-        f"Cloud path {dataset_config.path} is neither a directory nor a file"
-    )
+    raise ValueError(f"Cloud path {dataset_config.path} is neither a directory nor a file")
 
 
 def _load_from_url(
@@ -382,8 +374,6 @@ def _load_from_data_files(
     return load_dataset("json", data_files=file_path, **load_dataset_kwargs)
 
 
-
-
 def get_prepared_dataset_path(args: Arguments, dataset_hash: str) -> Path:
     """Get standardized path for prepared datasets.
 
@@ -411,9 +401,7 @@ def create_train_validation_split(
     Returns:
         Tuple of (train_dataset, eval_dataset).
     """
-    train_fingerprint, test_fingerprint = generate_split_fingerprints(
-        dataset, val_set_size, args.train.seed
-    )
+    train_fingerprint, test_fingerprint = generate_split_fingerprints(dataset, val_set_size, args.train.seed)
 
     split_dataset = dataset.train_test_split(
         test_size=val_set_size,
@@ -511,9 +499,7 @@ def load_preprocessed_dataset(args: Arguments, dataset_hash: str) -> Dataset | N
     return None
 
 
-def try_load_from_hub(
-    args: Arguments, dataset_hash: str, split: str
-) -> Dataset | None:
+def try_load_from_hub(args: Arguments, dataset_hash: str, split: str) -> Dataset | None:
     """Try to load the prepared dataset from HuggingFace Hub."""
     try:
         LOG.info_rank0(
@@ -529,6 +515,7 @@ def try_load_from_hub(
     except Exception:
         LOG.info_rank0("Unable to find prepared dataset in HuggingFace Hub")
         return None
+
 
 def merge_datasets(datasets: list[Dataset], args: Arguments) -> Dataset:
     """Merge multiple datasets into one with optional shuffling.
@@ -557,7 +544,7 @@ def merge_datasets(datasets: list[Dataset], args: Arguments) -> Dataset:
         datasets = [ds.shuffle(seed=args.train.seed) for ds in datasets]
 
     LOG.info_rank0("Merging datasets...")
-    #TODO: add interleave_datasets support
+    # TODO: add interleave_datasets support
     merged_dataset = concatenate_datasets(datasets)
 
     if args.data.shuffle_merged_datasets:

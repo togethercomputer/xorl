@@ -63,9 +63,7 @@ class DeepEPScatter(torch.autograd.Function):
             return output
         BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)
         grid = (num_gather,)
-        _gather_by_index_kernel[grid](
-            output, tokens, sorted_indices, num_gather, hidden_dim, BLOCK_H=BLOCK_H
-        )
+        _gather_by_index_kernel[grid](output, tokens, sorted_indices, num_gather, hidden_dim, BLOCK_H=BLOCK_H)
         ctx.save_for_backward(sorted_indices)
         ctx.num_tokens = tokens.shape[0]
         ctx.hidden_dim = hidden_dim

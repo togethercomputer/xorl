@@ -8,7 +8,7 @@ from transformers import (
 )
 
 from ..utils import logging
-from .module_utils import init_empty_weights, all_ranks_load_weights
+from .module_utils import all_ranks_load_weights, init_empty_weights
 from .registry import ModelRegistry
 
 

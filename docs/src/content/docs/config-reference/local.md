@@ -112,7 +112,7 @@ Each entry in `datasets` (or `test_datasets`) is a dict:
 | `ringattn_parallel_size` | `1` | Ring Attention degree. |
 | `cp_fsdp_mode` | `all` | How context parallelism interacts with FSDP: `all` (both Ulysses+Ring), `ulysses_only`, `ring_only`, `none`. |
 | `reshard_after_forward` | `null` | FSDP2 reshard after forward. `true` = save memory, `false` = save communication (used for PP by default). `null` = auto. |
-| `ep_outside` | `false` | Place EP outside the EP-FSDP mesh. |
+| `ep_intranode` | `true` | Keep EP all-to-all within the node (NVLink). Set `false` to place EP across nodes. |
 
 :::caution[Field interactions]
 - `data_parallel_mode: fsdp2` **requires** `init_device: meta`
@@ -126,7 +126,7 @@ Each entry in `datasets` (or `test_datasets`) is a dict:
 
 | Field | Default | Description |
 |---|---|---|
-| `optimizer` | `adamw` | Optimizer: `adamw`, `anyprecision_adamw`, `sgd`, `muon`. |
+| `optimizer` | `adamw` | Optimizer: `adamw`, `anyprecision_adamw`, `sgd`, `signsgd`, `muon`. |
 | `optimizer_dtype` | `bf16` | Dtype for optimizer states in `anyprecision_adamw` and `muon`: `fp32` or `bf16`. BF16 halves optimizer memory. |
 | `lr` | `5e-5` | Peak learning rate. |
 | `lr_min` | `1e-7` | Minimum learning rate at the end of decay. |
@@ -158,10 +158,9 @@ Each entry in `datasets` (or `test_datasets`) is a dict:
 | Field | Default | Description |
 |---|---|---|
 | `enable_mixed_precision` | `true` | BF16 mixed-precision training. |
-| `enable_gradient_checkpointing` | `true` | Activation recomputation to reduce memory. |
+| `enable_gradient_checkpointing` | `true` | Enable activation recomputation to reduce memory. |
+| `gradient_checkpointing_method` | `recompute_full_layer` | What to recompute in backward. Valid values: `recompute_full_layer` (recompute entire decoder layer, most memory-efficient), `recompute_before_dispatch` (recompute attn+router, keep dispatch+expert+combine, +25-34% throughput), `no_recompute` (no recomputation, max throughput, highest memory). See [gradient checkpointing guide](/training/local_training#gradient-checkpointing). |
 | `enable_reentrant` | `false` | Use reentrant gradient checkpointing. Default (non-reentrant) is generally preferred. |
-| `recompute_modules` | `null` | Selective checkpointing by submodule: `[self_attn]`, `[mlp]`, or `[self_attn, mlp]`. `null` = whole-layer recompute. |
-| `moe_checkpoint_method` | `null` | MoE-specific checkpoint: `null` (full recompute including EP communication), `moe_act` (recompute only gate/up activations, skip EP communication recompute — faster). |
 | `enable_full_shard` | `true` | FSDP2 full parameter sharding (ZeRO-3). Set `false` for ZeRO-2. |
 | `enable_forward_prefetch` | `true` | Prefetch next FSDP unit's parameters during forward pass. |
 | `enable_activation_offload` | `false` | Offload activations to CPU during forward pass. |

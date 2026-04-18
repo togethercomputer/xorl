@@ -11,7 +11,25 @@ from typing import Any, Callable, List, Optional, Set
 import torch
 import torch.nn as nn
 
+from xorl.distributed.torch_parallelize import build_parallelize_model as _parallelize
+from xorl.lora import freeze_base_parameters
+from xorl.lora.utils import inject_lora_into_model
+from xorl.models import build_foundation_model
+from xorl.models.checkpoint_handlers.buffers import get_prequantized_exclude_modules
+from xorl.models.layers.rope import set_rope_native
+from xorl.qlora import (
+    detect_prequantized_block_fp8,
+    detect_prequantized_nvfp4,
+    inject_qlora_into_model,
+    maybe_load_and_quantize_moe_qlora,
+    maybe_load_prequantized_qlora,
+    maybe_quantize_qlora,
+)
+from xorl.qlora.modules.linear import QLoRALinear
+from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
+from xorl.qlora.utils import _deregister_qlora_weights_from_fsdp
 from xorl.utils import helper
+
 
 logger = helper.create_logger(__name__)
 
@@ -33,6 +51,51 @@ class TrainingModelResult:
     exclude_modules: Set[str] = field(default_factory=set)
 
 
+def resolve_training_model_dtype(
+    *,
+    enable_lora: bool,
+    enable_qlora: bool,
+    enable_mixed_precision: bool,
+) -> str:
+    """Return the foundation-model dtype for the requested training mode.
+
+    Full-weight mixed-precision training keeps parameters in fp32 before FSDP
+    wrapping. LoRA/QLoRA instead keep the frozen base weights in bf16 and only
+    upcast the trainable adapter weights to fp32.
+    """
+    if (enable_lora or enable_qlora) and enable_mixed_precision:
+        return "bfloat16"
+    if enable_mixed_precision:
+        return "float32"
+    return "bfloat16"
+
+
+def should_skip_generic_param_upcast(
+    *,
+    enable_lora: bool,
+    enable_qlora: bool,
+) -> bool:
+    """Whether the generic full-model fp32 upcast should be skipped."""
+    return enable_lora or enable_qlora
+
+
+def maybe_upcast_trainable_adapter_params(
+    model: nn.Module,
+    *,
+    enable_lora: bool,
+    enable_qlora: bool,
+    enable_mixed_precision: bool,
+) -> None:
+    """Upcast trainable adapter weights to fp32 while leaving the frozen base in bf16."""
+    if not enable_mixed_precision or not (enable_lora or enable_qlora):
+        return
+
+    for param in model.parameters():
+        if param.requires_grad:
+            param.data = param.data.to(torch.float32)
+    logger.info_rank0("Upcast trainable LoRA params to float32")
+
+
 def build_training_model(
     *,
     # --- Model ---
@@ -42,6 +105,7 @@ def build_training_model(
     attn_implementation: str = "flash_attention_3",
     moe_implementation: Optional[str] = None,
     ep_dispatch: str = "alltoall",
+    train_router: bool = False,
     deepep_buffer_size_gb: float = 2.0,
     deepep_num_sms: int = 20,
     deepep_async_combine: bool = False,
@@ -52,7 +116,6 @@ def build_training_model(
     lora_rank: int = 32,
     lora_alpha: int = 16,
     lora_target_modules: Optional[List[str]] = None,
-    moe_shared_lora: bool = False,
     moe_hybrid_shared_lora: bool = False,
     # --- QLoRA ---
     enable_qlora: bool = False,
@@ -75,7 +138,7 @@ def build_training_model(
     # --- SGLang numerical alignment ---
     router_fp32: bool = True,
     lm_head_fp32: bool = True,
-    rmsnorm_native: bool = False,
+    rmsnorm_mode: str = "native",
     activation_native: bool = False,
     rope_native: bool = False,
     attention_cast_bf16: bool = False,
@@ -97,8 +160,6 @@ def build_training_model(
 
     Returns a :class:`TrainingModelResult` with model, config, PP state, etc.
     """
-    from xorl.distributed.torch_parallelize import build_parallelize_model as _parallelize
-    from xorl.models import build_foundation_model
 
     # ------------------------------------------------------------------
     # 1. Build foundation model
@@ -111,12 +172,13 @@ def build_training_model(
         attn_implementation=attn_implementation,
         moe_implementation=moe_implementation,
         ep_dispatch=ep_dispatch,
+        train_router=train_router,
         deepep_buffer_size_gb=deepep_buffer_size_gb,
         deepep_num_sms=deepep_num_sms,
         deepep_async_combine=deepep_async_combine,
         router_fp32=router_fp32,
         lm_head_fp32=lm_head_fp32,
-        rmsnorm_native=rmsnorm_native,
+        rmsnorm_mode=rmsnorm_mode,
         activation_native=activation_native,
         rope_native=rope_native,
         attention_cast_bf16=attention_cast_bf16,
@@ -125,7 +187,6 @@ def build_training_model(
 
     # Set module-level flags for rope and activation
     if rope_native:
-        from xorl.models.layers.rope import set_rope_native
         set_rope_native(True)
         logger.info_rank0("Using native RoPE (flash_attn fused kernel disabled)")
     if activation_native:
@@ -167,18 +228,18 @@ def build_training_model(
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
             lora_target_modules=lora_target_modules,
-            moe_shared_lora=moe_shared_lora,
             moe_hybrid_shared_lora=moe_hybrid_shared_lora,
         )
 
     # ------------------------------------------------------------------
     # 4. LoRA + mixed precision: upcast trainable params to fp32
     # ------------------------------------------------------------------
-    if (enable_lora or enable_qlora) and enable_mixed_precision:
-        for param in model.parameters():
-            if param.requires_grad:
-                param.data = param.data.to(torch.float32)
-        logger.info_rank0("Upcast trainable LoRA params to float32")
+    maybe_upcast_trainable_adapter_params(
+        model,
+        enable_lora=enable_lora,
+        enable_qlora=enable_qlora,
+        enable_mixed_precision=enable_mixed_precision,
+    )
 
     # ------------------------------------------------------------------
     # 5. Save optimizer pre-hook (some models register hooks)
@@ -203,7 +264,10 @@ def build_training_model(
         load_weights_mode=load_weights_mode,
         pp_schedule=pp_schedule,
         reshard_after_forward=reshard_after_forward,
-        skip_param_upcast=enable_qlora,
+        skip_param_upcast=should_skip_generic_param_upcast(
+            enable_lora=enable_lora,
+            enable_qlora=enable_qlora,
+        ),
     )
 
     pp_enabled = isinstance(build_result, dict)
@@ -236,7 +300,6 @@ def build_training_model(
                 param.requires_grad = False
         helper.print_device_mem_info("VRAM usage after QLoRA quantization")
     elif enable_lora:
-        from xorl.lora import freeze_base_parameters
         freeze_base_parameters(model)
         logger.info_rank0("Base model parameters frozen, only LoRA parameters trainable")
     else:
@@ -279,6 +342,7 @@ def build_training_model(
 # Internal helpers
 # ======================================================================
 
+
 def _inject_qlora(
     model: nn.Module,
     *,
@@ -295,11 +359,6 @@ def _inject_qlora(
 
     Returns (is_prequantized, checkpoint_quant_format, exclude_modules).
     """
-    from xorl.qlora import (
-        inject_qlora_into_model,
-        detect_prequantized_nvfp4,
-        detect_prequantized_block_fp8,
-    )
 
     is_prequantized = False
     checkpoint_quant_format = None
@@ -318,12 +377,10 @@ def _inject_qlora(
         exclude_modules = set(qlora_exclude_modules)
         logger.info_rank0(f"Using user-specified exclude_modules: {exclude_modules}")
     elif is_prequantized:
-        from xorl.models.checkpoint_handlers.buffers import get_prequantized_exclude_modules
         exclude_modules = get_prequantized_exclude_modules(weights_path)
         if exclude_modules:
             logger.info_rank0(
-                f"Auto-detected {len(exclude_modules)} excluded modules "
-                f"from checkpoint config: {exclude_modules}"
+                f"Auto-detected {len(exclude_modules)} excluded modules from checkpoint config: {exclude_modules}"
             )
 
     # NF4 quantizes bf16 weights on-the-fly — no pre-quantized checkpoint needed.
@@ -375,28 +432,23 @@ def _inject_lora(
     lora_rank: int,
     lora_alpha: int,
     lora_target_modules: Optional[List[str]],
-    moe_shared_lora: bool = False,
     moe_hybrid_shared_lora: bool = False,
 ) -> None:
     """Plain LoRA injection (dense + optional MoE-aware)."""
     is_moe_model = getattr(model.config, "num_experts", 0) > 0
 
-    if is_moe_model and (moe_shared_lora or moe_hybrid_shared_lora):
+    if is_moe_model and moe_hybrid_shared_lora:
         from xorl.lora.utils import inject_lora_into_model_with_moe
-        logger.info_rank0(
-            f"MoE-aware LoRA injection "
-            f"(shared={moe_shared_lora}, hybrid_shared={moe_hybrid_shared_lora})"
-        )
+
+        logger.info_rank0(f"MoE-aware LoRA injection (hybrid_shared={moe_hybrid_shared_lora})")
         inject_lora_into_model_with_moe(
             model,
             r=lora_rank,
             lora_alpha=lora_alpha,
             target_modules=lora_target_modules,
-            moe_shared_lora=moe_shared_lora,
             moe_hybrid_shared_lora=moe_hybrid_shared_lora,
         )
     else:
-        from xorl.lora.utils import inject_lora_into_model
         inject_lora_into_model(
             model,
             r=lora_rank,
@@ -419,53 +471,44 @@ def _deferred_qlora_quantize(
     2. NF4 linear: bf16 weight already loaded by FSDP → quantize in-place
     3. NF4 MoE: load bf16 experts from checkpoint → quantize
     """
-    from xorl.qlora.modules.linear import QLoRALinear
-    from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
-    from xorl.qlora.utils import _deregister_qlora_weights_from_fsdp
 
     # 1. Pre-quantized linear/MoE loading (nvfp4/block_fp8)
     needs_prequant_linear = any(
-        isinstance(m, QLoRALinear) and m._is_prequantized and not m._inline_loaded
-        for m in model.modules()
+        isinstance(m, QLoRALinear) and m._is_prequantized and not m._inline_loaded for m in model.modules()
     )
     needs_prequant_moe = any(
-        isinstance(m, QLoRAMoeExperts) and not m._weights_loaded
-        and m._source_quant_format is not None
+        isinstance(m, QLoRAMoeExperts) and not m._weights_loaded and m._source_quant_format is not None
         for m in model.modules()
     )
 
     if needs_prequant_linear or needs_prequant_moe:
-        from xorl.qlora import maybe_load_prequantized_qlora
         logger.info(f"Starting pre-quantized weight loading (mode={load_weights_mode}) …")
         helper.print_device_mem_info("VRAM before pre-quantized loading")
         maybe_load_prequantized_qlora(model, weights_path, load_mode=load_weights_mode)
         logger.info("Done pre-quantized weight loading")
 
     # 2. NF4 linear: FSDP loaded bf16 into weight param → quantize to NF4
-    needs_bf16_quantize = any(
-        isinstance(m, QLoRALinear) and m.weight is not None
-        for m in model.modules()
-    )
+    needs_bf16_quantize = any(isinstance(m, QLoRALinear) and m.weight is not None for m in model.modules())
     if needs_bf16_quantize:
-        from xorl.qlora import maybe_quantize_qlora
         logger.info("Quantizing bf16 linear weights to NF4 …")
         maybe_quantize_qlora(model)
 
     # 3. NF4 MoE: load bf16 experts from checkpoint → quantize
     needs_bf16_moe = any(
-        isinstance(m, QLoRAMoeExperts) and not m._weights_loaded
+        isinstance(m, QLoRAMoeExperts)
+        and not m._weights_loaded
         and m._source_quant_format is None  # NF4 (no source quant format)
         for m in model.modules()
     )
     if needs_bf16_moe:
-        from xorl.qlora import maybe_load_and_quantize_moe_qlora
         logger.info("Loading and quantizing bf16 MoE expert weights …")
         maybe_load_and_quantize_moe_qlora(
-            model, weights_path, load_mode=load_weights_mode,
+            model,
+            weights_path,
+            load_mode=load_weights_mode,
         )
 
-    if not (needs_prequant_linear or needs_prequant_moe
-            or needs_bf16_quantize or needs_bf16_moe):
+    if not (needs_prequant_linear or needs_prequant_moe or needs_bf16_quantize or needs_bf16_moe):
         logger.info("All QLoRA modules loaded inline, skipping deferred disk I/O")
 
     # Always deregister packed_weight_f32 from FSDP2 (prevent mixed-precision corruption)

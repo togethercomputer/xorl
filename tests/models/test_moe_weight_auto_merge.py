@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import pytest
 import torch
 
+
 pytestmark = [pytest.mark.cpu]
 
 
@@ -24,13 +25,9 @@ pytestmark = [pytest.mark.cpu]
 # Copy of the implementation for testing (avoids heavy import dependencies)
 # =============================================================================
 
-_EXPERT_KEY_PATTERN = re.compile(
-    r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.weight$"
-)
+_EXPERT_KEY_PATTERN = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.weight$")
 
-_FUSED_EXPERT_PATTERN = re.compile(
-    r"^model\.layers\.\d+\.mlp\.experts\.(gate|up|down)_proj$"
-)
+_FUSED_EXPERT_PATTERN = re.compile(r"^model\.layers\.\d+\.mlp\.experts\.(gate|up|down)_proj$")
 
 
 def parse_expert_key(key: str) -> Optional[Tuple[int, int, str]]:
@@ -57,9 +54,7 @@ class ExpertWeightBuffer:
         key = (layer_idx, proj)
         if key not in self._stacked_buffers:
             stacked_shape = (self.num_experts,) + tensor.shape
-            self._stacked_buffers[key] = torch.empty(
-                stacked_shape, dtype=tensor.dtype, device="cpu"
-            )
+            self._stacked_buffers[key] = torch.empty(stacked_shape, dtype=tensor.dtype, device="cpu")
         self._stacked_buffers[key][expert_idx].copy_(tensor)
         self._filled_experts[key].add(expert_idx)
 
@@ -74,8 +69,7 @@ class ExpertWeightBuffer:
         filled = self._filled_experts.pop(key)
         if len(filled) != self.num_experts:
             raise ValueError(
-                f"Incomplete experts for layer {layer_idx}, {proj}_proj: "
-                f"got {len(filled)}, expected {self.num_experts}"
+                f"Incomplete experts for layer {layer_idx}, {proj}_proj: got {len(filled)}, expected {self.num_experts}"
             )
         return self._stacked_buffers.pop(key)
 
@@ -127,20 +121,30 @@ class TestParseAndMergingDetection:
         assert parse_expert_key("model.layers.0.mlp.experts.5.gate_proj") is None
 
         # Fused format model needs merging
-        assert _model_needs_expert_merging({
-            "model.layers.0.mlp.experts.gate_proj",
-            "model.layers.0.mlp.experts.up_proj",
-            "model.layers.0.mlp.experts.down_proj",
-            "model.layers.0.self_attn.q_proj.weight",
-        }) is True
+        assert (
+            _model_needs_expert_merging(
+                {
+                    "model.layers.0.mlp.experts.gate_proj",
+                    "model.layers.0.mlp.experts.up_proj",
+                    "model.layers.0.mlp.experts.down_proj",
+                    "model.layers.0.self_attn.q_proj.weight",
+                }
+            )
+            is True
+        )
 
         # Non-MoE model does not
-        assert _model_needs_expert_merging({
-            "model.layers.0.mlp.gate_proj.weight",
-            "model.layers.0.mlp.up_proj.weight",
-            "model.layers.0.mlp.down_proj.weight",
-            "model.layers.0.self_attn.q_proj.weight",
-        }) is False
+        assert (
+            _model_needs_expert_merging(
+                {
+                    "model.layers.0.mlp.gate_proj.weight",
+                    "model.layers.0.mlp.up_proj.weight",
+                    "model.layers.0.mlp.down_proj.weight",
+                    "model.layers.0.self_attn.q_proj.weight",
+                }
+            )
+            is False
+        )
 
         # Empty
         assert _model_needs_expert_merging(set()) is False
@@ -268,6 +272,7 @@ class TestExpertWeightBuffer:
 # Tests for checkpoint format detection and loading logic
 # =============================================================================
 
+
 def _checkpoint_has_per_expert_weights(checkpoint_keys):
     for key in checkpoint_keys:
         if _EXPERT_KEY_PATTERN.match(key):
@@ -281,32 +286,52 @@ class TestCheckpointFormatAndLoading:
     def test_checkpoint_format_detection_and_loading(self):
         """Test detection of per-expert/fused/non-MoE/empty/mixed formats, and loading both."""
         # Per-expert format
-        assert _checkpoint_has_per_expert_weights({
-            "model.layers.0.mlp.experts.0.gate_proj.weight",
-            "model.layers.0.mlp.experts.1.gate_proj.weight",
-            "model.layers.0.self_attn.q_proj.weight",
-        }) is True
+        assert (
+            _checkpoint_has_per_expert_weights(
+                {
+                    "model.layers.0.mlp.experts.0.gate_proj.weight",
+                    "model.layers.0.mlp.experts.1.gate_proj.weight",
+                    "model.layers.0.self_attn.q_proj.weight",
+                }
+            )
+            is True
+        )
 
         # Fused format
-        assert _checkpoint_has_per_expert_weights({
-            "model.layers.0.mlp.experts.gate_proj",
-            "model.layers.0.mlp.experts.up_proj",
-        }) is False
+        assert (
+            _checkpoint_has_per_expert_weights(
+                {
+                    "model.layers.0.mlp.experts.gate_proj",
+                    "model.layers.0.mlp.experts.up_proj",
+                }
+            )
+            is False
+        )
 
         # Non-MoE
-        assert _checkpoint_has_per_expert_weights({
-            "model.layers.0.mlp.gate_proj.weight",
-            "model.layers.0.self_attn.q_proj.weight",
-        }) is False
+        assert (
+            _checkpoint_has_per_expert_weights(
+                {
+                    "model.layers.0.mlp.gate_proj.weight",
+                    "model.layers.0.self_attn.q_proj.weight",
+                }
+            )
+            is False
+        )
 
         # Empty
         assert _checkpoint_has_per_expert_weights(set()) is False
 
         # Mixed
-        assert _checkpoint_has_per_expert_weights({
-            "model.layers.0.mlp.experts.gate_proj",
-            "model.layers.1.mlp.experts.0.gate_proj.weight",
-        }) is True
+        assert (
+            _checkpoint_has_per_expert_weights(
+                {
+                    "model.layers.0.mlp.experts.gate_proj",
+                    "model.layers.1.mlp.experts.0.gate_proj.weight",
+                }
+            )
+            is True
+        )
 
         # --- Loading both formats ---
         model_params = {

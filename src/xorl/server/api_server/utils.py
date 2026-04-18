@@ -10,7 +10,8 @@ from fastapi import HTTPException, status
 # Error message for model_id not registered
 MODEL_ID_NOT_REGISTERED_ERROR = (
     "model_id '{model_id}' has not been registered. "
-    "You must call /api/v1/create_model first to register your model_id before calling other /api/v1/ endpoints. "
+    "You must call /api/v1/create_model or /api/v1/create_session first to register your model_id before "
+    "calling other /api/v1/ endpoints. "
     "Try initializing the TrainingClient by calling create_lora_training_client on the ServiceClient."
 )
 

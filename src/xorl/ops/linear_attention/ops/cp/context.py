@@ -84,8 +84,8 @@ def get_cp_cu_seqlens(
 
     subset_cu_seqlens = cu_seqlens_cpu[start_seq_idx : end_seq_idx + 1]
     local_cu_seqlens_cpu = (
-        subset_cu_seqlens.clamp(min=rank_start, max=rank_end) - rank_start
-    ).unique_consecutive().to(torch.int32)
+        (subset_cu_seqlens.clamp(min=rank_start, max=rank_end) - rank_start).unique_consecutive().to(torch.int32)
+    )
     local_cu_seqlens_gpu = local_cu_seqlens_cpu.to(device=cu_seqlens.device, non_blocking=True)
 
     first_seq_global_start = int(cu_seqlens_cpu[start_seq_idx].item())

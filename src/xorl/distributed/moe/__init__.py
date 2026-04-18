@@ -9,13 +9,13 @@ def __getattr__(name):
         "alltoall_pre_dispatch",
         "alltoall_post_combine",
     ):
-        from .alltoall import (
+        from .alltoall import (  # noqa: PLC0415
+            AllToAllDispatchContext,
+            alltoall_post_combine,
+            alltoall_pre_dispatch,
             preprocess,
             token_pre_all2all,
             tokens_post_all2all,
-            AllToAllDispatchContext,
-            alltoall_pre_dispatch,
-            alltoall_post_combine,
         )
 
         globals().update(
@@ -29,14 +29,21 @@ def __getattr__(name):
             }
         )
         return globals()[name]
-    if name in ("DeepEPBuffer", "DEEPEP_AVAILABLE", "token_pre_dispatch", "tokens_post_combine", "get_default_buffer", "destroy_default_buffer"):
-        from .deepep import (
-            DeepEPBuffer,
+    if name in (
+        "DeepEPBuffer",
+        "DEEPEP_AVAILABLE",
+        "token_pre_dispatch",
+        "tokens_post_combine",
+        "get_default_buffer",
+        "destroy_default_buffer",
+    ):
+        from .deepep import (  # noqa: PLC0415
             DEEPEP_AVAILABLE,
+            DeepEPBuffer,
+            destroy_default_buffer,
+            get_default_buffer,
             token_pre_dispatch,
             tokens_post_combine,
-            get_default_buffer,
-            destroy_default_buffer,
         )
 
         globals().update(

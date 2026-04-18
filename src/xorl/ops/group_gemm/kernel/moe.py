@@ -347,7 +347,7 @@ def _moe_index_compute_kernel(
         slot_ids = (
             # Reserve last `slots_to_reserve` slots for us.
             tl.atomic_add(temp_histogram_cumsum_ptr + expert_id, -slots_to_reserve, sem="relaxed")
-            # `atomic_add` returns old value, so we need to do substraction again.
+            # `atomic_add` returns old value, so we need to do subtraction again.
             - slots_to_reserve
             # Local offset for each token in `expert_ids`.
             + tl.cumsum(one_if_expert_id_matches)

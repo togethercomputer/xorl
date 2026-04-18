@@ -16,11 +16,13 @@ from xorl.models.transformers.qwen3_5.modeling_qwen3_5 import Qwen3_5Model
 from xorl.ops.linear_attention.ops.cp import build_linear_attention_cp_context
 from xorl.utils.device import get_nccl_backend
 
+
 THIS_DIR = Path(__file__).resolve().parent
 if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
 from distributed_utils import run_distributed_script, skip_if_gpu_count_less_than
+
 
 pytestmark = [pytest.mark.distributed]
 
@@ -151,6 +153,7 @@ def _main() -> None:
 
 
 if __name__ != "__main__":
+
     @skip_if_gpu_count_less_than(2)
     def test_qwen35_ulysses_positive_smoke():
         result = run_distributed_script(
@@ -160,7 +163,6 @@ if __name__ != "__main__":
             extra_env={"QWEN35_CP_MODE": "positive"},
         )
         result.assert_success("Qwen3.5 positive Ulysses smoke should pass")
-
 
     @skip_if_gpu_count_less_than(2)
     def test_qwen35_ring_fla_negative_smoke():

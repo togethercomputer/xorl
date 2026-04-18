@@ -6,7 +6,17 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from .comm import all_to_all
-from .utils import generate_weights_idx, permute, sort_chunks_by_idxs, unpermute
+from .utils import permute, permuted_weights, sort_chunks_by_idxs, unpermute
+
+
+def _expert_chunk_permute_order(num_experts: int, ep_size: int) -> List[int]:
+    num_local_experts = num_experts // ep_size
+    return torch.arange(num_experts).reshape(-1, num_local_experts).T.ravel().tolist()
+
+
+def _expert_chunk_unpermute_order(num_experts: int, ep_size: int) -> List[int]:
+    num_local_experts = num_experts // ep_size
+    return torch.arange(num_experts).reshape(num_local_experts, -1).T.ravel().tolist()
 
 
 def preprocess(
@@ -80,21 +90,37 @@ def token_pre_all2all(
     global_permuted_hidden_states = all_to_all(ep_group, local_permuted_hidden_states, output_splits, input_splits)
 
     # group tokens together by expert
-    num_local_experts = num_experts // ep_group.size()
-    permute_order = torch.arange(num_experts).reshape(-1, num_local_experts).T.ravel().tolist()
     global_permuted_hidden_states = sort_chunks_by_idxs(
         global_permuted_hidden_states,
         num_global_tokens_per_local_expert.ravel(),
-        permute_order,
+        _expert_chunk_permute_order(num_experts, ep_group.size()),
     )
 
     return global_permuted_hidden_states, routing_map, local_input_permutation_mapping, org_hidden_states_shape
 
 
+def score_pre_all2all(
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    num_experts: int,
+    input_splits: torch.Tensor,
+    output_splits: torch.Tensor,
+    num_global_tokens_per_local_expert: torch.Tensor,
+    ep_group: Optional[dist.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Dispatch routing weights into the same expert-sorted order as tokens."""
+    local_scores = permuted_weights(routing_weights, selected_experts, num_experts).unsqueeze(-1)
+    global_scores = all_to_all(ep_group, local_scores, output_splits, input_splits)
+    global_scores = sort_chunks_by_idxs(
+        global_scores,
+        num_global_tokens_per_local_expert.ravel(),
+        _expert_chunk_permute_order(num_experts, ep_group.size()),
+    )
+    return global_scores.squeeze(-1)
+
+
 def tokens_post_all2all(
     expert_outputs: torch.Tensor,
-    routing_weights: torch.Tensor,
-    selected_experts: int,
     num_experts: int,
     input_splits: torch.Tensor,
     output_splits: torch.Tensor,
@@ -105,25 +131,18 @@ def tokens_post_all2all(
     ep_group: Optional[dist.ProcessGroup] = None,
 ) -> torch.Tensor:
     # group tokens together by expert
-    num_local_experts = num_experts // ep_group.size()
-    unpermute_order = torch.arange(num_experts).reshape(num_local_experts, -1).T.ravel().tolist()
     expert_outputs = sort_chunks_by_idxs(
         expert_outputs,
         num_global_tokens_per_local_expert.T.ravel(),
-        unpermute_order,
+        _expert_chunk_unpermute_order(num_experts, ep_group.size()),
     )
 
     unpermute_outputs = all_to_all(ep_group, expert_outputs, input_splits, output_splits)
 
-    # [tokens, experts]
-    weights_idx = generate_weights_idx(routing_weights, selected_experts, num_experts)
-
     unpermute_outputs = unpermute(
         unpermute_outputs,
-        weights_idx,
         org_hidden_states_shape,
         local_input_permutation_mapping,
-        routing_map,
     )
 
     return unpermute_outputs
@@ -144,14 +163,14 @@ class AllToAllDispatchContext:
     Carries all information between ``alltoall_pre_dispatch()`` and
     ``alltoall_post_combine()`` so the EP compute step is stateless.
     """
+
     input_splits: List[int]
     output_splits: List[int]
     num_tokens_per_expert: torch.Tensor
     routing_map: torch.Tensor
     perm_mapping: torch.Tensor
+    expert_scores: torch.Tensor
     orig_shape: torch.Size
-    routing_weights: torch.Tensor
-    selected_experts: torch.Tensor
     num_experts: int
 
 
@@ -180,9 +199,7 @@ def alltoall_pre_dispatch(
         - cumsum: Cumulative sum of tokens per local expert ``[num_local_experts]``.
         - ctx: :class:`AllToAllDispatchContext` for ``alltoall_post_combine()``.
     """
-    expert_mask = F.one_hot(
-        selected_experts, num_classes=num_experts
-    ).permute(2, 1, 0)
+    expert_mask = F.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
 
     input_splits, output_splits, num_tokens_per_expert, sum_tokens = preprocess(
         expert_mask=expert_mask,
@@ -201,6 +218,15 @@ def alltoall_pre_dispatch(
     )
 
     cumsum = torch.cumsum(sum_tokens, dim=0).to(permuted_tokens.device)
+    expert_scores = score_pre_all2all(
+        routing_weights=routing_weights,
+        selected_experts=selected_experts,
+        num_experts=num_experts,
+        input_splits=input_splits,
+        output_splits=output_splits,
+        num_global_tokens_per_local_expert=num_tokens_per_expert,
+        ep_group=ep_group,
+    ).to(permuted_tokens.dtype)
 
     ctx = AllToAllDispatchContext(
         input_splits=input_splits,
@@ -208,9 +234,8 @@ def alltoall_pre_dispatch(
         num_tokens_per_expert=num_tokens_per_expert,
         routing_map=routing_map,
         perm_mapping=perm_mapping,
+        expert_scores=expert_scores,
         orig_shape=orig_shape,
-        routing_weights=routing_weights,
-        selected_experts=selected_experts,
         num_experts=num_experts,
     )
 
@@ -237,8 +262,6 @@ def alltoall_post_combine(
     """
     return tokens_post_all2all(
         expert_outputs=expert_output,
-        routing_weights=ctx.routing_weights,
-        selected_experts=ctx.selected_experts,
         num_experts=ctx.num_experts,
         input_splits=ctx.input_splits,
         output_splits=ctx.output_splits,

@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from xorl.ops.quantize import block_fp8_quantize_gkn, block_fp8_dequantize_gkn
+from xorl.ops.quantize import block_fp8_dequantize_gkn, block_fp8_quantize_gkn
 from xorl.qlora.modules.linear import QLoRALinear
 
 
@@ -32,9 +32,16 @@ class BlockFP8QLoRALinear(QLoRALinear):
         aqn_alpha: float = 1.0,
     ):
         super().__init__(
-            in_features, out_features, r=r, lora_alpha=lora_alpha,
-            quant_format="block_fp8", quant_group_size=128,
-            bias=bias, device=device, enable_aqn=enable_aqn, aqn_alpha=aqn_alpha,
+            in_features,
+            out_features,
+            r=r,
+            lora_alpha=lora_alpha,
+            quant_format="block_fp8",
+            quant_group_size=128,
+            bias=bias,
+            device=device,
+            enable_aqn=enable_aqn,
+            aqn_alpha=aqn_alpha,
         )
         # block_fp8: 1 fp8 byte per element -> in_features bytes -> in_features // 4 float32 elements
         pw_cols = in_features // 4
@@ -50,14 +57,25 @@ class BlockFP8QLoRALinear(QLoRALinear):
         self.reset_lora_parameters()
 
     @classmethod
-    def from_module(cls, module: nn.Module, r: int = 16, lora_alpha: int = 16,
-                    enable_aqn: bool = False, aqn_alpha: float = 1.0, **kwargs) -> "BlockFP8QLoRALinear":
+    def from_module(
+        cls,
+        module: nn.Module,
+        r: int = 16,
+        lora_alpha: int = 16,
+        enable_aqn: bool = False,
+        aqn_alpha: float = 1.0,
+        **kwargs,
+    ) -> "BlockFP8QLoRALinear":
         """Create from a bf16 nn.Linear by quantizing its weight to block_fp8."""
         qlora = cls(
-            in_features=module.in_features, out_features=module.out_features,
-            r=r, lora_alpha=lora_alpha,
-            bias=module.bias is not None, device=module.weight.device,
-            enable_aqn=enable_aqn, aqn_alpha=aqn_alpha,
+            in_features=module.in_features,
+            out_features=module.out_features,
+            r=r,
+            lora_alpha=lora_alpha,
+            bias=module.bias is not None,
+            device=module.weight.device,
+            enable_aqn=enable_aqn,
+            aqn_alpha=aqn_alpha,
         )
         qlora._quantize_and_store(module.weight.detach())
         return qlora
@@ -75,9 +93,7 @@ class BlockFP8QLoRALinear(QLoRALinear):
         M, K = self.out_features, self.in_features
         uint8_data = self._read_packed_weight_uint8()
         fp8_w = uint8_data.view(torch.float8_e4m3fn).reshape(M, K)
-        scales = self._recover_tensor(
-            self.weight_block_scales, self._scale_dtypes["weight_block_scales"]
-        )
+        scales = self._recover_tensor(self.weight_block_scales, self._scale_dtypes["weight_block_scales"])
         return block_fp8_dequantize_gkn(fp8_w, scales, self.quant_group_size)
 
     @torch.compiler.disable
@@ -85,9 +101,7 @@ class BlockFP8QLoRALinear(QLoRALinear):
         """block_fp8: 0.125 * block_scale (FP8 E4M3 ULP at unit)."""
         M, K = self.out_features, self.in_features
         bs = self.quant_group_size
-        scales = self._recover_tensor(
-            self.weight_block_scales, self._scale_dtypes["weight_block_scales"]
-        ).float()
+        scales = self._recover_tensor(self.weight_block_scales, self._scale_dtypes["weight_block_scales"]).float()
         step = scales.repeat_interleave(bs, dim=0).repeat_interleave(bs, dim=1)[:M, :K]
         return (0.125 * step).contiguous()
 

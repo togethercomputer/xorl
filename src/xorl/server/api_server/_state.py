@@ -1,8 +1,9 @@
 """Global API server state. Shared by api_server.py and endpoints.py to avoid circular imports."""
 
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from fastapi import HTTPException, status
+
 
 if TYPE_CHECKING:
     from xorl.server.api_server.server import APIServer

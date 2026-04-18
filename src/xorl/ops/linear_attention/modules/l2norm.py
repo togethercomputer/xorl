@@ -7,6 +7,7 @@ import triton.language as tl
 
 from xorl.ops.linear_attention.utils import IS_AMD, autotune_cache_kwargs, input_guard
 
+
 BT_LIST = [8, 16, 32, 64, 128]
 NUM_WARPS_AUTOTUNE = [1, 2, 4, 8, 16] if IS_AMD else [1, 2, 4, 8, 16, 32]
 

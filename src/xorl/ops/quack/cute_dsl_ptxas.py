@@ -5,11 +5,11 @@ Environment variables:
     CUTE_DSL_PTXAS_VERBOSE - Set to 1 for verbose output
 """
 
-import os
-import sys
-import re
 import ctypes
+import os
+import re
 import subprocess
+import sys
 from pathlib import Path
 
 import cutlass
@@ -95,7 +95,7 @@ def _patched_load_cuda_library(self):
         return _original_load_cuda_library(self)
 
     # Load cubin
-    import cuda.bindings.runtime as cuda_runtime
+    import cuda.bindings.runtime as cuda_runtime  # noqa: PLC0415
 
     err, library = cuda_runtime.cudaLibraryLoadData(cubin, None, None, 0, None, None, 0)
     if err != cuda_runtime.cudaError_t.cudaSuccess:
@@ -140,9 +140,7 @@ def patch():
     # Track if user originally wanted PTX kept
     _user_wanted_ptx = os.environ.get("CUTE_DSL_KEEP_PTX", "0") == "1"
     # os.environ['CUTE_DSL_KEEP_PTX'] = '1'
-    assert os.environ.get("CUTE_DSL_KEEP_PTX", "0") == "1", (
-        "Require CUTE_DSL_KEEP_PTX=1 to use system's ptxas"
-    )
+    assert os.environ.get("CUTE_DSL_KEEP_PTX", "0") == "1", "Require CUTE_DSL_KEEP_PTX=1 to use system's ptxas"
 
     cls = cutlass.cutlass_dsl.cuda_jit_executor.CudaDialectJitCompiledFunction
     _original_load_cuda_library = cls._load_cuda_library

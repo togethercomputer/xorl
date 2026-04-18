@@ -1,6 +1,5 @@
 from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
-from .base_collator import DataCollator
 
 class CollatePipeline:
     def __init__(self, data_collators: Optional[Union[Callable, List[Callable]]] = None):

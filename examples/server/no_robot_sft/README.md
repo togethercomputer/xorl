@@ -17,7 +17,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3
 
 python -m xorl.server.launcher \
   --mode auto \
-  --config ../configs/qwen3_4b_instruct_2507.yaml \
+  --config ../configs/lora/qwen3_8b_lora.yaml \
   --api-port 6000 \
   --log-level DEBUG
 ```
@@ -32,10 +32,13 @@ The launcher will:
 
 ### SFT (Supervised Fine-Tuning)
 
-[`example_sft.py`](example_sft.py) -- Minimal SFT training loop on the [No Robots](https://huggingface.co/datasets/HuggingFaceH4/no_robots) dataset.
+[`run_sft.py`](run_sft.py) -- Minimal LoRA SFT training loop on the [No Robots](https://huggingface.co/datasets/HuggingFaceH4/no_robots) dataset.
 
 ```bash
-python example_sft.py --config.base_url http://localhost:6000
+python run_sft.py \
+  --config.base_url http://localhost:6000 \
+  --config.model_name Qwen/Qwen3-8B \
+  --config.lora_rank 32
 ```
 
 Key features:
@@ -44,6 +47,9 @@ Key features:
 - Linear learning rate decay
 - Periodic checkpoint saving and resume support
 - Per-token NLL metrics via `compute_mean_nll`
+
+The checked-in server config above loads `Qwen/Qwen3-8B` with LoRA rank 32.
+`run_sft.py` still defaults to an older 4B example, so the command overrides those defaults explicitly.
 
 **Config options** (passed via `--config.<field>`):
 
@@ -59,43 +65,45 @@ Key features:
 
 ## Server Configs
 
-### [`configs/qwen3_4b_instruct_2507.yaml`](../configs/qwen3_4b_instruct_2507.yaml)
+### [`configs/lora/qwen3_8b_lora.yaml`](../configs/lora/qwen3_8b_lora.yaml)
 
-Qwen3-4B dense model on 4 GPUs with Ulysses sequence parallelism (SP=4).
+Qwen3-8B dense model on 4 GPUs with LoRA enabled.
 
-### [`configs/qwen3_coder_30b_a3b.yaml`](../configs/qwen3_coder_30b_a3b.yaml)
+### [`configs/lora/qwen3_coder_30b_a3b_lora.yaml`](../configs/lora/qwen3_coder_30b_a3b_lora.yaml)
 
-Qwen3-Coder-30B-A3B MoE model on 4 GPUs with Ulysses SP=4 and Flash Attention 3.
+Qwen3-Coder-30B-A3B MoE model on 4 GPUs with LoRA enabled.
 
 ### Config Reference
 
 ```yaml
 # Model
-model_path: Qwen/Qwen3-4B-Instruct-2507
-attn_implementation: flash_attention_3   # eager, sdpa, flash_attention_3, flash_attention_4
+model_path: Qwen/Qwen3-8B
+tokenizer_path: Qwen/Qwen3-8B
+attn_implementation: flash_attention_3
 
 # Parallelism (world_size = dp_rep * dp_shard * ulysses * cp)
 data_parallel_mode: fsdp2                # ddp, fsdp, fsdp2
-ulysses_parallel_size: 4                 # Ulysses sequence parallelism
+ulysses_parallel_size: 1                 # Ulysses sequence parallelism
+data_parallel_replicate_size: 1
+data_parallel_shard_size: 4
 
 # Memory & Performance
 ce_mode: compiled                        # eager, compiled
 enable_mixed_precision: true
 enable_gradient_checkpointing: true
 enable_full_shard: true
+enable_activation_offload: false
+init_device: meta
 
 # Data Processing
-sample_packing_sequence_len: 128000                  # Max packed sequence length
+sample_packing_sequence_len: 128000      # Max packed sequence length
 enable_packing: true                     # Pack multiple samples per micro-batch
 
 # LoRA
 enable_lora: true
 lora_rank: 32
 lora_alpha: 32
-lora_target_modules: ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]
-
-# Workers
-worker_bind_address: tcp://127.0.0.1:5556
+lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 ```
 
 ## Training Loop Pattern
@@ -108,8 +116,8 @@ import xorl_client
 # Connect to server
 service = xorl_client.ServiceClient(base_url="http://localhost:6000")
 client = service.create_lora_training_client(
-    base_model="Qwen/Qwen3-4B-Instruct-2507",
-    rank=64,
+    base_model="Qwen/Qwen3-8B",
+    rank=32,
     model_id="my-run",
 )
 

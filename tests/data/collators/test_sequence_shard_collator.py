@@ -1,8 +1,11 @@
+from unittest.mock import Mock, patch
+
 import pytest
 import torch
-from unittest.mock import Mock, patch
+
 from xorl.data.collators import TextSequenceShardCollator
 from xorl.data.constants import IGNORE_INDEX
+
 
 pytestmark = [pytest.mark.cpu, pytest.mark.collator]
 
@@ -18,7 +21,7 @@ def _make_mock_ps(cp_size=2, cp_rank=0, ringattn_size=1):
 class TestSPSliceAndPadding:
     """Tests for sp_slice and sp_padding utility methods."""
 
-    @patch('xorl.data.collators.sequence_shard_collator.get_parallel_state')
+    @patch("xorl.data.collators.sequence_shard_collator.get_parallel_state")
     def test_sp_slice_across_ranks_and_uneven(self, mock_parallel_state):
         """Covers initialization, basic slicing rank 0/1, and uneven split."""
         mock_parallel_state.return_value = _make_mock_ps(cp_size=2, cp_rank=0)
@@ -38,22 +41,27 @@ class TestSPSliceAndPadding:
         collator0 = TextSequenceShardCollator()
         assert torch.equal(collator0.sp_slice(torch.tensor([[1, 2, 3, 4, 5]]), dim=-1), torch.tensor([[1, 2, 3]]))
 
-    @patch('xorl.data.collators.sequence_shard_collator.get_parallel_state')
+    @patch("xorl.data.collators.sequence_shard_collator.get_parallel_state")
     def test_sp_padding_basic_sequential_zero(self, mock_parallel_state):
         """Covers basic padding, sequential padding, and zero-length padding."""
         mock_parallel_state.return_value = _make_mock_ps(cp_size=2, cp_rank=0)
         collator = TextSequenceShardCollator()
         tensor = torch.tensor([[1, 2, 3]])
 
-        assert torch.equal(collator.sp_padding(tensor, dim=-1, pad_value=0, pad_length=2), torch.tensor([[1, 2, 3, 0, 0]]))
-        assert torch.equal(collator.sp_padding(tensor, dim=-1, pad_value=0, pad_length=2, sequential=True), torch.tensor([[1, 2, 3, 0, 1]]))
+        assert torch.equal(
+            collator.sp_padding(tensor, dim=-1, pad_value=0, pad_length=2), torch.tensor([[1, 2, 3, 0, 0]])
+        )
+        assert torch.equal(
+            collator.sp_padding(tensor, dim=-1, pad_value=0, pad_length=2, sequential=True),
+            torch.tensor([[1, 2, 3, 0, 1]]),
+        )
         assert torch.equal(collator.sp_padding(tensor, dim=-1, pad_value=0, pad_length=0), tensor)
 
 
 class TestCollatorCall:
     """Tests for the full collator __call__ method."""
 
-    @patch('xorl.data.collators.sequence_shard_collator.get_parallel_state')
+    @patch("xorl.data.collators.sequence_shard_collator.get_parallel_state")
     def test_preshifted_labels_and_packed_sequences(self, mock_parallel_state):
         """Covers pre-shifted labels pass-through and packed sequence boundary masking with cp_size=1."""
         mock_parallel_state.return_value = _make_mock_ps(cp_size=1, cp_rank=0)
@@ -80,7 +88,7 @@ class TestCollatorCall:
         assert packed_result["labels"][0, 2] == IGNORE_INDEX
         assert packed_result["labels"][0, 4] == IGNORE_INDEX
 
-    @patch('xorl.data.collators.sequence_shard_collator.get_parallel_state')
+    @patch("xorl.data.collators.sequence_shard_collator.get_parallel_state")
     def test_sp_splitting_padding_and_flash_attn_kwargs(self, mock_parallel_state):
         """Covers SP padding to multiple, splitting across ranks, flash attention kwargs,
         attention_mask/position_ids preservation, and padding values."""

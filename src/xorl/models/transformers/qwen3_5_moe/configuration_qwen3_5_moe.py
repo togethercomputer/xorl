@@ -14,6 +14,7 @@
 """Qwen3_5Moe model configuration"""
 
 from transformers.configuration_utils import PretrainedConfig
+
 from xorl.models.layers import rope_config_validation
 
 from .parallelize import TP_PLAN
@@ -226,7 +227,9 @@ class Qwen3_5MoeConfig(PretrainedConfig):
             initializer_range=getattr(text_config, "initializer_range", 0.02),
             rms_norm_eps=getattr(text_config, "rms_norm_eps", 1e-6),
             use_cache=getattr(text_config, "use_cache", False),
-            tie_word_embeddings=getattr(hf_config, "tie_word_embeddings", getattr(text_config, "tie_word_embeddings", False)),
+            tie_word_embeddings=getattr(
+                hf_config, "tie_word_embeddings", getattr(text_config, "tie_word_embeddings", False)
+            ),
             rope_theta=_cfg_get(rope_params, "rope_theta", getattr(text_config, "rope_theta", 10000.0)),
             rope_scaling=_cfg_to_dict(rope_params),
             attention_bias=getattr(text_config, "attention_bias", False),
@@ -248,7 +251,7 @@ class Qwen3_5MoeConfig(PretrainedConfig):
             moe_intermediate_size=getattr(text_config, "moe_intermediate_size", 768),
             num_experts_per_tok=getattr(text_config, "num_experts_per_tok", 8),
             num_experts=getattr(text_config, "num_experts", 128),
-            norm_topk_prob=getattr(text_config, "norm_topk_prob", False),
+            norm_topk_prob=getattr(text_config, "norm_topk_prob", None) is not False,
             output_router_logits=getattr(text_config, "output_router_logits", False),
             router_aux_loss_coef=getattr(text_config, "router_aux_loss_coef", 0.001),
             mlp_only_layers=getattr(text_config, "mlp_only_layers", []),

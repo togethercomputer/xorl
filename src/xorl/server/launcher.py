@@ -25,12 +25,14 @@ import argparse
 import logging
 import multiprocessing as mp
 import os
+import random
 import signal
 import socket
 import subprocess
 import sys
 import time
-from contextlib import closing
+from contextlib import asynccontextmanager, closing
+from dataclasses import fields
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -41,13 +43,12 @@ import yaml
 from xorl.server.api_server.server import APIServer
 from xorl.server.orchestrator.orchestrator import Orchestrator
 from xorl.server.server_arguments import ServerArguments
+from xorl.server.utils.network import read_address_file
 
 
 # Setup logging
 logging.basicConfig(
-    level=logging.INFO,
-    format="[%(levelname)s][%(name)s] %(asctime)s >> %(message)s",
-    datefmt="%H:%M:%S"
+    level=logging.INFO, format="[%(levelname)s][%(name)s] %(asctime)s >> %(message)s", datefmt="%H:%M:%S"
 )
 logger = logging.getLogger(__name__)
 
@@ -63,11 +64,12 @@ class RetrieveFutureFilter(logging.Filter):
     every second until results are ready. This filter suppresses those logs
     to avoid cluttering the output.
     """
+
     def filter(self, record: logging.LogRecord) -> bool:
         # Filter out retrieve_future access log entries
-        if hasattr(record, 'getMessage'):
+        if hasattr(record, "getMessage"):
             msg = record.getMessage()
-            if '/api/v1/retrieve_future' in msg:
+            if "/api/v1/retrieve_future" in msg:
                 return False
         return True
 
@@ -83,6 +85,7 @@ def configure_uvicorn_logging():
 # Port Finding Utilities
 # ============================================================================
 
+
 def find_free_port(start_port: int = 50000, max_attempts: int = 10000) -> int:
     """
     Find a free port by randomly picking from a range.
@@ -97,14 +100,14 @@ def find_free_port(start_port: int = 50000, max_attempts: int = 10000) -> int:
     Raises:
         RuntimeError: If no free port found
     """
-    import random
+
     end_port = min(start_port + max_attempts, 60000)
     ports = list(range(start_port, end_port))
     random.shuffle(ports)
     for port in ports:
         with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
             try:
-                sock.bind(('', port))
+                sock.bind(("", port))
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 return port
             except OSError:
@@ -137,6 +140,7 @@ def find_free_ports(count: int, start_port: int = 50000) -> List[int]:
 # ============================================================================
 # Engine Core Process
 # ============================================================================
+
 
 def run_orchestrator(
     input_addr: str,
@@ -175,11 +179,8 @@ def run_orchestrator(
         level=getattr(logging, log_level),
         format="[%(levelname)s][ENGINE] %(asctime)s >> %(message)s",
         datefmt="%H:%M:%S",
-        handlers=[
-            logging.FileHandler(log_file, mode='w'),
-            logging.StreamHandler(sys.stdout)
-        ],
-        force=True
+        handlers=[logging.FileHandler(log_file, mode="w"), logging.StreamHandler(sys.stdout)],
+        force=True,
     )
     logger = logging.getLogger("Orchestrator")
     logger.info(f"Engine Core logging to: {os.path.abspath(log_file)}")
@@ -201,6 +202,7 @@ def run_orchestrator(
             rank0_worker_address=rank0_worker_address,
             operation_timeout=operation_timeout,
             connection_timeout=3600.0,  # 1 hour for loading large models (235B) + EP sharding + LoRA + Triton compilation
+            ack_timeout=300.0,  # 5 min — weight sync can block workers for 40s+ on large MoE models
             sample_packing_sequence_len=sample_packing_sequence_len,
             enable_packing=enable_packing,
         )
@@ -224,7 +226,7 @@ def run_orchestrator(
     except Exception as e:
         logger.error(f"Error in engine core: {e}", exc_info=True)
     finally:
-        if 'engine' in locals():
+        if "engine" in locals():
             engine.stop()
         logger.info("Engine Core stopped")
 
@@ -232,6 +234,7 @@ def run_orchestrator(
 # ============================================================================
 # API Server Process
 # ============================================================================
+
 
 def run_api_server(
     host: str,
@@ -264,13 +267,10 @@ def run_api_server(
         skip_initial_checkpoint: Skip auto-saving initial checkpoint on first create_model.
         sync_inference_method: Method for syncing weights to inference endpoints. Default: 'nccl_broadcast'.
     """
-    from contextlib import asynccontextmanager
 
     # Setup logging for this process
     logging.basicConfig(
-        level=getattr(logging, log_level),
-        format="[%(levelname)s][API] %(asctime)s >> %(message)s",
-        datefmt="%H:%M:%S"
+        level=getattr(logging, log_level), format="[%(levelname)s][API] %(asctime)s >> %(message)s", datefmt="%H:%M:%S"
     )
 
     logger = logging.getLogger("APIServer")
@@ -287,10 +287,9 @@ def run_api_server(
 
     try:
         # Import the FastAPI app from api_server module
-        from xorl.server.api_server.server import app
-
         # Update the global state shared between api_server.py and endpoints.py
-        import xorl.server.api_server._state as _state_module
+        import xorl.server.api_server._state as _state_module  # noqa: PLC0415
+        from xorl.server.api_server.server import app  # noqa: PLC0415
 
         # Override the lifespan to use our addresses
         @asynccontextmanager
@@ -345,6 +344,7 @@ def run_api_server(
 # Configuration Parsing
 # ============================================================================
 
+
 def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] = None) -> ServerArguments:
     """
     Load ServerArguments from a YAML configuration file.
@@ -360,73 +360,61 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
     Returns:
         ServerArguments instance with all fields populated
     """
-    with open(config_path, 'r') as f:
+    with open(config_path, "r") as f:
         config = yaml.safe_load(f)
 
     if not config:
         raise ValueError(f"Empty config file: {config_path}")
 
-    from dataclasses import fields
     valid_fields = {f.name for f in fields(ServerArguments)}
 
     # Check if this is a nested config (has model/train/worker sections)
-    if 'model' in config and isinstance(config['model'], dict):
-        # Nested config - flatten it
+    if "model" in config and isinstance(config["model"], dict):
+        # Nested config - flatten all keys from each section into one dict.
+        # Keys whose names already match a ServerArguments field are copied
+        # directly; a few nested keys need explicit remapping (worker.*,
+        # lora.exclude_modules).  This is forward-compatible: new fields
+        # added to ServerArguments + to_config_dict() are picked up
+        # automatically without touching this flattening logic.
         flat_config = {}
 
-        # Model section
-        model_config = config.get('model', {})
-        flat_config['model_path'] = model_config.get('model_path')
-        flat_config['model_name'] = model_config.get('model_name')
-        flat_config['config_path'] = model_config.get('config_path')
-        flat_config['tokenizer_path'] = model_config.get('tokenizer_path')
-        flat_config['attn_implementation'] = model_config.get('attn_implementation', 'flash_attention_3')
-        flat_config['moe_implementation'] = model_config.get('moe_implementation')
-        # Train section
-        train_config = config.get('train', {})
-        flat_config['data_parallel_mode'] = train_config.get('data_parallel_mode', 'fsdp2')
-        flat_config['data_parallel_shard_size'] = train_config.get('data_parallel_shard_size', 1)
-        flat_config['data_parallel_replicate_size'] = train_config.get('data_parallel_replicate_size', 1)
-        flat_config['ulysses_parallel_size'] = train_config.get('ulysses_parallel_size', 1)
-        flat_config['expert_parallel_size'] = train_config.get('expert_parallel_size', 1)
-        flat_config['enable_mixed_precision'] = train_config.get('enable_mixed_precision', True)
-        flat_config['enable_gradient_checkpointing'] = train_config.get('enable_gradient_checkpointing', True)
-        flat_config['enable_full_shard'] = train_config.get('enable_full_shard', True)
-        flat_config['enable_activation_offload'] = train_config.get('enable_activation_offload', False)
-        flat_config['init_device'] = train_config.get('init_device', 'meta')
-        flat_config['load_checkpoint_path'] = train_config.get('load_checkpoint_path', '')
-        flat_config['ckpt_manager'] = train_config.get('ckpt_manager', 'dcp')
-        flat_config['log_level'] = train_config.get('log_level', 'INFO')
+        # model.* and train.* keys map 1:1 to ServerArguments fields
+        for section in ("model", "train"):
+            for k, v in config.get(section, {}).items():
+                flat_config[k] = v
 
-        # Data processing section (can be in train or data section)
-        data_config = config.get('data', {})
-        flat_config['sample_packing_sequence_len'] = train_config.get('sample_packing_sequence_len') or data_config.get('sample_packing_sequence_len', 32000)
-        flat_config['enable_packing'] = train_config.get('enable_packing', data_config.get('enable_packing', True))
+        # lora.* keys also map 1:1 except exclude_modules → qlora_exclude_modules
+        for k, v in config.get("lora", {}).items():
+            if k == "exclude_modules":
+                flat_config["qlora_exclude_modules"] = v
+            else:
+                flat_config[k] = v
 
-        # Output directory (can be in train section or top-level) - used for checkpoints, sampler weights, logs
-        # Note: This uses output_dir from config, which should be on shared filesystem for multi-node
-        flat_config['output_dir'] = train_config.get('output_dir', config.get('output_dir', 'outputs'))
+        # data.* — only a few fields are relevant for the server
+        data_config = config.get("data", {})
+        if "sample_packing_sequence_len" not in flat_config:
+            flat_config["sample_packing_sequence_len"] = data_config.get("sample_packing_sequence_len", 32000)
+        if "enable_packing" not in flat_config:
+            flat_config["enable_packing"] = data_config.get("enable_packing", True)
 
-        # Storage limit (can be in train section or top-level) - limits disk usage for output_dir
-        flat_config['storage_limit'] = train_config.get('storage_limit', config.get('storage_limit'))
+        # worker.* keys are prefixed with worker_ in ServerArguments
+        worker_config = config.get("worker", {})
+        _worker_key_map = {
+            "bind_address": "worker_bind_address",
+            "bind_host": "worker_bind_host",
+            "bind_port": "worker_bind_port",
+            "engine_connect_host": "engine_connect_host",
+            "connection_timeout": "worker_connection_timeout",
+            "max_retries": "worker_max_retries",
+        }
+        for nested_key, flat_key in _worker_key_map.items():
+            if nested_key in worker_config:
+                flat_config[flat_key] = worker_config[nested_key]
 
-        # Idle session timeout (can be in train section or top-level) - sessions inactive for this duration are cleaned up
-        flat_config['idle_session_timeout'] = train_config.get('idle_session_timeout', config.get('idle_session_timeout', 7200.0))
-
-        # Training flags
-        flat_config['skip_initial_checkpoint'] = train_config.get('skip_initial_checkpoint', False)
-        flat_config['log_gradient_norms'] = train_config.get('log_gradient_norms', True)
-        flat_config['log_router_stats'] = train_config.get('log_router_stats', True)
-        flat_config['freeze_router'] = train_config.get('freeze_router', True)
-
-        # Worker section
-        worker_config = config.get('worker', {})
-        flat_config['worker_bind_address'] = worker_config.get('bind_address', 'auto')
-        flat_config['worker_bind_host'] = worker_config.get('bind_host', '0.0.0.0')
-        flat_config['worker_bind_port'] = worker_config.get('bind_port', 5556)
-        flat_config['engine_connect_host'] = worker_config.get('engine_connect_host')
-        flat_config['worker_connection_timeout'] = worker_config.get('connection_timeout', 120.0)
-        flat_config['worker_max_retries'] = worker_config.get('max_retries', 3)
+        # Top-level keys that can appear outside any section
+        for k in ("output_dir", "storage_limit", "idle_session_timeout"):
+            if k not in flat_config and k in config:
+                flat_config[k] = config[k]
 
         filtered_config = {k: v for k, v in flat_config.items() if k in valid_fields and v is not None}
     else:
@@ -436,7 +424,7 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
         # Handle None values for Optional fields
         for key, value in list(filtered_config.items()):
             if value is None:
-                if key in ['config_path', 'tokenizer_path']:
+                if key in ["config_path", "tokenizer_path"]:
                     del filtered_config[key]
 
     # Apply CLI overrides on top of YAML config
@@ -470,23 +458,23 @@ def calculate_world_size_from_config(config_path: str) -> int:
     Returns:
         Total number of GPUs needed
     """
-    with open(config_path, 'r') as f:
+    with open(config_path, "r") as f:
         config = yaml.safe_load(f)
 
     # Support both flat config (ServerArguments style) and nested config (train: section)
-    if 'train' in config:
-        train_config = config.get('train', {})
+    if "train" in config:
+        train_config = config.get("train", {})
     else:
         train_config = config
 
     # Get parallelism sizes (with defaults matching model_runner.py)
-    ep_size = train_config.get('expert_parallel_size', 1)
-    ulysses_size = train_config.get('ulysses_parallel_size', 1)
-    ringattn_size = train_config.get('ringattn_parallel_size', 1)
+    ep_size = train_config.get("expert_parallel_size", 1)
+    ulysses_size = train_config.get("ulysses_parallel_size", 1)
+    ringattn_size = train_config.get("ringattn_parallel_size", 1)
 
     # Data parallel sizes
-    dp_replicate_size = train_config.get('data_parallel_replicate_size', 1)
-    dp_shard_size = train_config.get('data_parallel_shard_size', 1)
+    dp_replicate_size = train_config.get("data_parallel_replicate_size", 1)
+    dp_shard_size = train_config.get("data_parallel_shard_size", 1)
 
     # Calculate world size
     # EP creates a separate 2D mesh where: world_size = ep_size * ep_fsdp_size
@@ -494,7 +482,7 @@ def calculate_world_size_from_config(config_path: str) -> int:
     world_size = dp_replicate_size * dp_shard_size * ulysses_size * ringattn_size
     ep_fsdp_size = world_size // ep_size
 
-    logger.info(f"Calculated world size from config:")
+    logger.info("Calculated world size from config:")
     logger.info(f"  expert_parallel_size:         {ep_size}")
     logger.info(f"  ulysses_parallel_size:        {ulysses_size}")
     logger.info(f"  ringattn_parallel_size:           {ringattn_size}")
@@ -510,6 +498,7 @@ def calculate_world_size_from_config(config_path: str) -> int:
 # ============================================================================
 # Main Launcher
 # ============================================================================
+
 
 class Launcher:
     """Main launcher for all server components."""
@@ -599,7 +588,9 @@ class Launcher:
                 total_world_size = calculate_world_size_from_config(config_path)
             # For multi-node, nproc_per_node is total world size divided by number of nodes
             self.nproc_per_node = total_world_size // self.nnodes
-            logger.info(f"Total world size = {total_world_size}, nnodes = {self.nnodes}, nproc_per_node = {self.nproc_per_node}")
+            logger.info(
+                f"Total world size = {total_world_size}, nnodes = {self.nnodes}, nproc_per_node = {self.nproc_per_node}"
+            )
         else:
             self.nproc_per_node = 1  # Not used in connect mode
 
@@ -646,7 +637,9 @@ class Launcher:
         if self.server_args:
             self.sample_packing_sequence_len = self.server_args.sample_packing_sequence_len
             self.enable_packing = self.server_args.enable_packing
-            logger.info(f"Using packing config: seq_len={self.sample_packing_sequence_len}, enabled={self.enable_packing}")
+            logger.info(
+                f"Using packing config: seq_len={self.sample_packing_sequence_len}, enabled={self.enable_packing}"
+            )
 
         # Output directory - prefer from ServerArguments if available
         if self.server_args:
@@ -726,8 +719,6 @@ class Launcher:
 
         # Priority 2: File-based discovery (for multi-node)
         if self.nnodes > 1:
-            from xorl.server.utils.network import read_address_file
-
             logger.info(f"Multi-node setup (nnodes={self.nnodes}), waiting for rank 0 address file...")
 
             # Wait for address file with extended timeout for multi-node
@@ -851,9 +842,7 @@ class Launcher:
                     )
 
             except requests.exceptions.RequestException as e:
-                logger.warning(
-                    f"Failed to save initial checkpoint (attempt {attempt + 1}/{max_retries}): {e}"
-                )
+                logger.warning(f"Failed to save initial checkpoint (attempt {attempt + 1}/{max_retries}): {e}")
 
             if attempt < max_retries - 1:
                 logger.info(f"Retrying in {retry_delay} seconds...")
@@ -866,9 +855,9 @@ class Launcher:
     @staticmethod
     def _find_free_port() -> int:
         """Find and return a free TCP port."""
-        import socket
+
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(('', 0))
+            s.bind(("", 0))
             return s.getsockname()[1]
 
     def _launch_workers_with_torchrun(self):
@@ -897,7 +886,8 @@ class Launcher:
             f"--nproc-per-node={self.nproc_per_node}",
             f"--master-addr={self.master_addr}",
             f"--master-port={self.master_port}",
-            "-m", "xorl.server.runner.runner_dispatcher",
+            "-m",
+            "xorl.server.runner.runner_dispatcher",
             self.config_path,
             f"--worker.bind_address={self.worker_address}",
         ]
@@ -1010,7 +1000,7 @@ class Launcher:
                 logger.info("  Process object created successfully")
 
                 self.engine_process.start()
-                logger.info(f"  Process.start() called")
+                logger.info("  Process.start() called")
                 logger.info(f"  Engine process PID: {self.engine_process.pid}")
                 logger.info(f"  Engine process alive: {self.engine_process.is_alive()}")
             except Exception as e:
@@ -1119,7 +1109,6 @@ class Launcher:
 
     def wait(self):
         """Wait for all processes to finish. Exit cleanly if any process dies."""
-        import select
 
         try:
             while True:
@@ -1218,6 +1207,7 @@ class Launcher:
 # ============================================================================
 # CLI
 # ============================================================================
+
 
 def parse_server_overrides(argv: List[str]) -> Tuple[List[str], Dict[str, any]]:
     """
@@ -1323,7 +1313,7 @@ Note:
       # => world_size = 2 * 4 = 8 GPUs
 
   Set these values in your config file under the 'train' section to control world size.
-        """
+        """,
     )
 
     # Mode selection
@@ -1332,54 +1322,31 @@ Note:
         type=str,
         choices=["auto", "connect"],
         default="auto",
-        help="Launch mode: 'auto' (launch workers with torchrun) or 'connect' (connect to external workers)"
+        help="Launch mode: 'auto' (launch workers with torchrun) or 'connect' (connect to external workers)",
     )
 
     # Worker configuration
+    parser.add_argument("--config", type=str, help="Path to training config YAML (required for auto mode)")
     parser.add_argument(
-        "--config",
-        type=str,
-        help="Path to training config YAML (required for auto mode)"
-    )
-    parser.add_argument(
-        "--worker-address",
-        type=str,
-        default=None,
-        help="Worker ZMQ address (default: tcp://127.0.0.1:<auto-port>)"
+        "--worker-address", type=str, default=None, help="Worker ZMQ address (default: tcp://127.0.0.1:<auto-port>)"
     )
 
     # API Server configuration
-    parser.add_argument(
-        "--api-host",
-        type=str,
-        default="0.0.0.0",
-        help="API server host (default: 0.0.0.0)"
-    )
-    parser.add_argument(
-        "--api-port",
-        type=int,
-        default=None,
-        help="API server port (default: auto-find free port)"
-    )
+    parser.add_argument("--api-host", type=str, default="0.0.0.0", help="API server host (default: 0.0.0.0)")
+    parser.add_argument("--api-port", type=int, default=None, help="API server port (default: auto-find free port)")
 
     # Engine configuration
     parser.add_argument(
-        "--max-running-requests",
-        type=int,
-        default=2,
-        help="Maximum concurrent running requests (default: 2)"
+        "--max-running-requests", type=int, default=2, help="Maximum concurrent running requests (default: 2)"
     )
     parser.add_argument(
-        "--max-pending-requests",
-        type=int,
-        default=100,
-        help="Maximum pending requests in queue (default: 100)"
+        "--max-pending-requests", type=int, default=100, help="Maximum pending requests in queue (default: 100)"
     )
     parser.add_argument(
         "--operation-timeout",
         type=float,
         default=1800.0,
-        help="Timeout for engine operations in seconds (default: 1800.0)"
+        help="Timeout for engine operations in seconds (default: 1800.0)",
     )
     # Logging
     parser.add_argument(
@@ -1387,27 +1354,19 @@ Note:
         type=str,
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level (default: INFO)"
+        help="Logging level (default: INFO)",
     )
 
     # Distributed training (auto mode only)
-    parser.add_argument(
-        "--nnodes",
-        type=int,
-        default=1,
-        help="Number of nodes (auto mode, default: 1)"
-    )
+    parser.add_argument("--nnodes", type=int, default=1, help="Number of nodes (auto mode, default: 1)")
     parser.add_argument(
         "--master-addr",
         type=str,
         default="127.0.0.1",
-        help="Master address for torch distributed (auto mode, default: 127.0.0.1)"
+        help="Master address for torch distributed (auto mode, default: 127.0.0.1)",
     )
     parser.add_argument(
-        "--master-port",
-        type=int,
-        default=29500,
-        help="Master port for torch distributed (auto mode, default: 29500)"
+        "--master-port", type=int, default=29500, help="Master port for torch distributed (auto mode, default: 29500)"
     )
 
     # Parse only the remaining args (after extracting --server.* overrides)

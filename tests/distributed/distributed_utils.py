@@ -19,6 +19,7 @@ import torch
 # GPU helpers
 # ---------------------------------------------------------------------------
 
+
 def gpu_count() -> int:
     if not torch.cuda.is_available():
         return 0
@@ -35,6 +36,7 @@ def skip_if_gpu_count_less_than(n: int):
 # ---------------------------------------------------------------------------
 # Distributed test result
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class DistributedTestResult:
@@ -62,6 +64,7 @@ class DistributedTestResult:
 # Torchrun launcher
 # ---------------------------------------------------------------------------
 
+
 def _get_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
@@ -80,9 +83,13 @@ def run_distributed_script(
         env.update(extra_env)
 
     cmd = [
-        sys.executable, "-m", "torch.distributed.run",
-        "--nproc_per_node", str(num_gpus),
-        "--master_port", str(_get_free_port()),
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--nproc_per_node",
+        str(num_gpus),
+        "--master_port",
+        str(_get_free_port()),
         script_path,
     ]
 

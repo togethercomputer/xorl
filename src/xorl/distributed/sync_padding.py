@@ -1,9 +1,10 @@
 """Synchronize padding across distributed ranks to prevent load imbalance."""
 
+from typing import Any, Dict, List, Optional
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from typing import Any, Dict, List, Optional
 
 from xorl.data.constants import IGNORE_INDEX
 from xorl.distributed.parallel_state import get_parallel_state
@@ -69,8 +70,12 @@ def synchronize_micro_batch_padding(
 
     # Identify which paddable keys are present
     sample = micro_batches[0]
-    keys_2d = [k for k in _2D_PAD_VALUES if k in sample and isinstance(sample[k], torch.Tensor) and sample[k].dim() == 2]
-    keys_3d = [k for k in _3D_PAD_VALUES if k in sample and isinstance(sample[k], torch.Tensor) and sample[k].dim() == 3]
+    keys_2d = [
+        k for k in _2D_PAD_VALUES if k in sample and isinstance(sample[k], torch.Tensor) and sample[k].dim() == 2
+    ]
+    keys_3d = [
+        k for k in _3D_PAD_VALUES if k in sample and isinstance(sample[k], torch.Tensor) and sample[k].dim() == 3
+    ]
 
     if not keys_2d and not keys_3d:
         return

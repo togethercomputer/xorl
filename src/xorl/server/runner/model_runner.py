@@ -17,16 +17,12 @@ import gc
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional, Union
-
-import numpy as np
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from transformers import AutoTokenizer
-
-from torch.distributed.tensor import distribute_tensor
 
 from xorl.checkpoint import build_checkpointer
 from xorl.data.constants import IGNORE_INDEX
@@ -35,7 +31,6 @@ from xorl.distributed.parallel_state import get_parallel_state, init_parallel_st
 from xorl.distributed.pipeline_parallel import build_pipeline_schedule, build_pp_stage
 from xorl.distributed.sequence_parallel.data import gather_outputs
 from xorl.lora import LoraLinear
-from xorl.models import all_ranks_load_weights, rank0_load_and_broadcast_weights
 from xorl.models.layers.moe.routing_replay import set_replay_stage
 from xorl.ops.loss import (
     causallm_loss_function,
@@ -43,21 +38,25 @@ from xorl.ops.loss import (
     policy_loss_function,
 )
 from xorl.optim import build_optimizer
-from xorl.trainers.model_builder import build_training_model
+from xorl.server.runner.adapters import LoRAAdapterManager
+from xorl.server.runner.checkpoint import CheckpointManager
+from xorl.server.runner.utils import MoeMetricsTracker, RoutingReplayHandler, run_self_test, validate_token_ids
+from xorl.trainers.model_builder import (
+    build_training_model,
+    resolve_training_model_dtype,
+)
 from xorl.trainers.training_utils import (
-    pp_loss_fn,
     clip_gradients,
     count_valid_tokens,
     forward_backward_pp,
-    maybe_merge_lora as _maybe_merge_lora_util,
     negotiate_pp_seq_len,
     pad_micro_batches_for_pp,
+    pp_loss_fn,
     sync_sp_gradients,
 )
-from xorl.server.runner.checkpoint import CheckpointManager
-from xorl.server.runner.adapters import LoRAAdapterManager
-from xorl.server.runner.utils import MoeMetricsTracker, RoutingReplayHandler
-from xorl.server.runner.utils import run_self_test, validate_token_ids
+from xorl.trainers.training_utils import (
+    maybe_merge_lora as _maybe_merge_lora_util,
+)
 from xorl.utils import helper
 from xorl.utils.device import get_device_id, get_device_type, get_torch_device, synchronize
 from xorl.utils.dist_utils import all_reduce
@@ -157,8 +156,22 @@ class ModelRunner:
     _LOSS_EXCLUDE_KEYS = {
         "causallm_loss": {"labels", "_original_position_ids", "rollout_logprobs"},
         "cross_entropy": {"labels", "_original_position_ids", "rollout_logprobs"},
-        "importance_sampling": {"labels", "target_tokens", "logprobs", "advantages", "_original_position_ids", "rollout_logprobs"},
-        "policy_loss": {"labels", "target_tokens", "logprobs", "advantages", "rollout_logprobs"},
+        "importance_sampling": {
+            "labels",
+            "target_tokens",
+            "logprobs",
+            "advantages",
+            "_original_position_ids",
+            "rollout_logprobs",
+        },
+        "policy_loss": {
+            "labels",
+            "target_tokens",
+            "logprobs",
+            "advantages",
+            "_original_position_ids",
+            "rollout_logprobs",
+        },
     }
 
     def __init__(
@@ -226,6 +239,10 @@ class ModelRunner:
         get_torch_device().set_device(f"{get_device_type()}:{local_rank}")
         helper.set_seed(self.train_config.get("seed", 42), False)
 
+        # Disable TF32 and BF16 reduced-precision accumulation for
+        # consistent numerics across parallelism strategies.
+        helper.enable_high_precision_for_bf16()
+
         # Initialize distributed parallel state
         self._init_parallel_state()
 
@@ -275,8 +292,8 @@ class ModelRunner:
             adapter_manager=self._adapter_manager,
         )
         # Sync initial attributes
-        self._checkpoint_mgr.lora_target_modules = getattr(self, 'lora_target_modules', None)
-        self._checkpoint_mgr.lora_alpha_value = getattr(self, 'lora_alpha_value', None)
+        self._checkpoint_mgr.lora_target_modules = getattr(self, "lora_target_modules", None)
+        self._checkpoint_mgr.lora_alpha_value = getattr(self, "lora_alpha_value", None)
 
         # Setup MoE metrics collection if this is a Qwen3 MoE model
         self._moe_tracker = MoeMetricsTracker(self.model_config_obj, self.train_config, self.rank)
@@ -446,13 +463,11 @@ class ModelRunner:
         # Resolve target_modules from Tinker-style or flat config
         target_modules = self._resolve_lora_target_modules() if lora_enabled else None
 
-        # Determine model dtype
-        if (lora_enabled or enable_qlora) and enable_mixed_precision:
-            model_dtype = "bfloat16"
-        elif enable_mixed_precision:
-            model_dtype = "float32"
-        else:
-            model_dtype = "bfloat16"
+        model_dtype = resolve_training_model_dtype(
+            enable_lora=lora_enabled,
+            enable_qlora=enable_qlora,
+            enable_mixed_precision=enable_mixed_precision,
+        )
 
         pp_size = self.train_config.get("pipeline_parallel_size", 1)
         pp_schedule_name = self.train_config.get("pipeline_parallel_schedule", "1F1B") if pp_size > 1 else None
@@ -464,6 +479,7 @@ class ModelRunner:
             attn_implementation=self.model_config.get("attn_implementation", "sdpa"),
             moe_implementation=self.model_config.get("moe_implementation"),
             ep_dispatch=self.model_config.get("ep_dispatch", "alltoall"),
+            train_router=self.model_config.get("train_router", False),
             deepep_buffer_size_gb=self.model_config.get("deepep_buffer_size_gb", 2.0),
             deepep_num_sms=self.model_config.get("deepep_num_sms", 20),
             deepep_async_combine=self.model_config.get("deepep_async_combine", False),
@@ -473,7 +489,6 @@ class ModelRunner:
             lora_rank=self.lora_config.get("lora_rank", 32),
             lora_alpha=self.lora_config.get("lora_alpha", 16),
             lora_target_modules=target_modules,
-            moe_shared_lora=self.lora_config.get("moe_shared_lora", False),
             moe_hybrid_shared_lora=self.lora_config.get("moe_hybrid_shared_lora", False),
             enable_qlora=enable_qlora,
             quant_format=self.lora_config.get("quant_format", "nvfp4"),
@@ -492,7 +507,7 @@ class ModelRunner:
             freeze_router=self.train_config.get("freeze_router", False),
             router_fp32=self.model_config.get("router_fp32", True),
             lm_head_fp32=self.model_config.get("lm_head_fp32", True),
-            rmsnorm_native=self.model_config.get("rmsnorm_native", False),
+            rmsnorm_mode=self.model_config.get("rmsnorm_mode", "native"),
             activation_native=self.model_config.get("activation_native", False),
             rope_native=self.model_config.get("rope_native", False),
             attention_cast_bf16=self.model_config.get("attention_cast_bf16", False),
@@ -519,7 +534,9 @@ class ModelRunner:
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in self.model.parameters())
         logger.info(f"Model loaded and parallelized on rank {self.rank}")
-        logger.info(f"  - Trainable params: {trainable_params:,} ({100.0 * trainable_params / max(total_params, 1):.2f}%)")
+        logger.info(
+            f"  - Trainable params: {trainable_params:,} ({100.0 * trainable_params / max(total_params, 1):.2f}%)"
+        )
         logger.info(f"  - Total params: {total_params:,}")
 
     def _resolve_lora_target_modules(self) -> List[str]:
@@ -547,8 +564,20 @@ class ModelRunner:
         if optimizer_type == "muon":
             optimizer_kwargs = {
                 k: self.train_config[k]
-                for k in ("muon_lr", "muon_momentum", "muon_nesterov",
-                          "muon_ns_steps", "muon_adjust_lr_fn")
+                for k in (
+                    "muon_lr",
+                    "muon_momentum",
+                    "muon_nesterov",
+                    "muon_ns_steps",
+                    "muon_adjust_lr_fn",
+                    "muon_ns_algorithm",
+                    "muon_ns_use_quack_kernels",
+                    "muon_gram_ns_num_restarts",
+                    "muon_gram_ns_restart_iterations",
+                    "muon_grad_dtype",
+                    "muon_update_dtype",
+                    "muon_force_momentum_path",
+                )
                 if k in self.train_config
             }
         self.optimizer = build_optimizer(
@@ -603,9 +632,7 @@ class ModelRunner:
             RuntimeError: If LoRA is not enabled or adapter manager not initialized
         """
         if self._adapter_manager is None:
-            raise RuntimeError(
-                "Cannot register adapter: LoRA is not enabled or adapter manager not initialized"
-            )
+            raise RuntimeError("Cannot register adapter: LoRA is not enabled or adapter manager not initialized")
 
         self._adapter_manager.register_adapter(
             model_id=model_id,
@@ -655,8 +682,12 @@ class ModelRunner:
             gathered = {}
             for key, tensor in per_token_tensors.items():
                 gathered[key] = gather_outputs(
-                    tensor, gather_dim=-1, padding_dim=-1,
-                    unpad_dim_size=original_seq_len, scale_grad=False, group=ulysses_group,
+                    tensor,
+                    gather_dim=-1,
+                    padding_dim=-1,
+                    unpad_dim_size=original_seq_len,
+                    scale_grad=False,
+                    group=ulysses_group,
                 )
 
             if position_ids is not None:
@@ -757,8 +788,11 @@ class ModelRunner:
         if loss_fn in ["causallm_loss", "cross_entropy"]:
             labels = micro_batch.get("labels")
             _result = causallm_loss_function(
-                hidden_states=hidden_states, weight=effective_weight,
-                labels=labels, return_per_token=return_per_token, ce_mode=self.ce_mode,
+                hidden_states=hidden_states,
+                weight=effective_weight,
+                labels=labels,
+                return_per_token=return_per_token,
+                ce_mode=self.ce_mode,
                 lm_head_fp32=self.lm_head_fp32,
             )
             loss = _result.loss
@@ -773,9 +807,13 @@ class ModelRunner:
             compute_kl_stats = params.get("compute_kl_stats", False)
 
             _result = importance_sampling_loss_function(
-                hidden_states=hidden_states, weight=effective_weight,
-                labels=target_tokens, old_logprobs=old_logprobs, advantages=advantages,
-                ce_mode=self.ce_mode, compute_kl_stats=compute_kl_stats,
+                hidden_states=hidden_states,
+                weight=effective_weight,
+                labels=target_tokens,
+                old_logprobs=old_logprobs,
+                advantages=advantages,
+                ce_mode=self.ce_mode,
+                compute_kl_stats=compute_kl_stats,
                 lm_head_fp32=self.lm_head_fp32,
             )
             loss = _result.loss
@@ -794,7 +832,7 @@ class ModelRunner:
                     diag_logits = (hs_flat @ effective_weight.t()).float()
                     diag_log_probs = F.log_softmax(diag_logits, dim=-1)
 
-                    valid = (target_tokens.reshape(-1) != IGNORE_INDEX)
+                    valid = target_tokens.reshape(-1) != IGNORE_INDEX
                     valid_indices = valid.nonzero(as_tuple=True)[0]
                     valid_log_probs = diag_log_probs[valid_indices]
 
@@ -803,7 +841,9 @@ class ModelRunner:
 
                     # Target token logprob and rank
                     target_ids = target_tokens.reshape(-1)[valid_indices]
-                    target_lps = valid_log_probs[torch.arange(len(valid_indices), device=valid_log_probs.device), target_ids]
+                    target_lps = valid_log_probs[
+                        torch.arange(len(valid_indices), device=valid_log_probs.device), target_ids
+                    ]
                     target_ranks = (valid_log_probs > target_lps.unsqueeze(-1)).sum(dim=-1) + 1
 
                     # Entropy: -sum(p * log p)
@@ -816,18 +856,23 @@ class ModelRunner:
                     cp_rank = ps.cp_rank if ps.cp_enabled else 0
                     diag_path_ranked = f"{diag_path}.rank{cp_rank}"
                     os.makedirs(os.path.dirname(diag_path_ranked) or ".", exist_ok=True)
-                    torch.save({
-                        "topk_logprobs": topk_vals.cpu(),
-                        "topk_ids": topk_ids.cpu(),
-                        "target_ids": target_ids.cpu(),
-                        "target_logprobs": target_lps.cpu(),
-                        "target_ranks": target_ranks.cpu(),
-                        "entropy": entropy.cpu(),
-                        "valid_positions": valid_indices.cpu(),
-                        "cp_rank": cp_rank,
-                    }, diag_path_ranked)
-                    logger.info(f"Diagnostic top-{diagnostic_topk} saved to {diag_path_ranked} "
-                                f"({len(valid_indices)} valid positions, cp_rank={cp_rank})")
+                    torch.save(
+                        {
+                            "topk_logprobs": topk_vals.cpu(),
+                            "topk_ids": topk_ids.cpu(),
+                            "target_ids": target_ids.cpu(),
+                            "target_logprobs": target_lps.cpu(),
+                            "target_ranks": target_ranks.cpu(),
+                            "entropy": entropy.cpu(),
+                            "valid_positions": valid_indices.cpu(),
+                            "cp_rank": cp_rank,
+                        },
+                        diag_path_ranked,
+                    )
+                    logger.info(
+                        f"Diagnostic top-{diagnostic_topk} saved to {diag_path_ranked} "
+                        f"({len(valid_indices)} valid positions, cp_rank={cp_rank})"
+                    )
 
                     del diag_logits, diag_log_probs, diag_probs, valid_log_probs
 
@@ -851,13 +896,23 @@ class ModelRunner:
                 logger.warning("use_tis=True but rollout_logprobs not provided.")
 
             _result = policy_loss_function(
-                hidden_states=hidden_states, weight=effective_weight,
-                labels=target_tokens, old_logprobs=old_logprobs, advantages=advantages,
+                hidden_states=hidden_states,
+                weight=effective_weight,
+                labels=target_tokens,
+                old_logprobs=old_logprobs,
+                advantages=advantages,
                 rollout_logprobs=rollout_logprobs,
-                eps_clip=eps_clip, eps_clip_high=eps_clip_high, eps_clip_c=eps_clip_c,
-                use_tis=use_tis, tis_clip_low=tis_clip_low, tis_clip_high=tis_clip_high,
-                ce_mode=self.ce_mode, num_chunks=num_chunks, compute_kl_stats=compute_kl_stats,
-                lm_head_fp32=self.lm_head_fp32, icepop_beta=icepop_beta,
+                eps_clip=eps_clip,
+                eps_clip_high=eps_clip_high,
+                eps_clip_c=eps_clip_c,
+                use_tis=use_tis,
+                tis_clip_low=tis_clip_low,
+                tis_clip_high=tis_clip_high,
+                ce_mode=self.ce_mode,
+                num_chunks=num_chunks,
+                compute_kl_stats=compute_kl_stats,
+                lm_head_fp32=self.lm_head_fp32,
+                icepop_beta=icepop_beta,
             )
             loss = _result.loss
             per_token_outputs["logprobs"] = _result.per_token_logprobs
@@ -925,12 +980,19 @@ class ModelRunner:
     # Unified forward loop
     # =========================================================================
 
-    def _forward_loop(self, micro_batches, loss_fn, loss_fn_params, *,
-                      compute_backward=True, r3_enabled=False,
-                      model_id="default", abort_callback=None):
+    def _forward_loop(
+        self,
+        micro_batches,
+        loss_fn,
+        loss_fn_params,
+        *,
+        compute_backward=True,
+        r3_enabled=False,
+        model_id="default",
+        abort_callback=None,
+    ):
         """Core forward (+ optional backward) loop shared between forward and forward_backward."""
         params = loss_fn_params or {}
-        return_per_token = params.get("return_per_token", True)
 
         # Count valid tokens globally
         global_valid_tokens = self._count_global_valid_tokens(micro_batches)
@@ -956,7 +1018,9 @@ class ModelRunner:
             }
 
             labels = micro_batch.get("labels", micro_batch.get("target_tokens"))
-            local_valid_tokens = (labels != IGNORE_INDEX).sum() if labels is not None else torch.tensor(0, device=get_device_type())
+            local_valid_tokens = (
+                (labels != IGNORE_INDEX).sum() if labels is not None else torch.tensor(0, device=get_device_type())
+            )
 
             # R3: switch to replay_forward so MoEBlock pops pre-populated routing
             if r3_enabled:
@@ -990,7 +1054,11 @@ class ModelRunner:
                     if old_lp is not None:
                         old_lp = old_lp.view(-1).to(new_lp.device)
                         _labels = micro_batch.get("labels", micro_batch.get("target_tokens"))
-                        _valid = (_labels.view(-1) != IGNORE_INDEX) if _labels is not None else torch.ones_like(new_lp, dtype=torch.bool)
+                        _valid = (
+                            (_labels.view(-1) != IGNORE_INDEX)
+                            if _labels is not None
+                            else torch.ones_like(new_lp, dtype=torch.bool)
+                        )
                         log_ratio = new_lp - old_lp
                         k3_vals = (torch.exp(log_ratio) - log_ratio - 1.0).masked_fill(~_valid, 0.0)
                         # position_ids and _original_position_ids are both kept
@@ -1006,12 +1074,14 @@ class ModelRunner:
                                 ps = get_parallel_state()
                                 cp_rank = ps.ulysses_rank if ps.ulysses_enabled else 0
                                 start = cp_rank * local_len
-                                _pos_flat = _pos_flat[start:start + local_len]
-                            deferred_k3.append({
-                                "k3_values": k3_vals.cpu(),
-                                "valid_mask": _valid.cpu(),
-                                "position_ids": _pos_flat.cpu(),
-                            })
+                                _pos_flat = _pos_flat[start : start + local_len]
+                            deferred_k3.append(
+                                {
+                                    "k3_values": k3_vals.cpu(),
+                                    "valid_mask": _valid.cpu(),
+                                    "position_ids": _pos_flat.cpu(),
+                                }
+                            )
 
             # Gradient accumulation — raw (unnormalized) backward.
             # Normalization by total accumulated valid tokens is deferred to optim_step.
@@ -1086,9 +1156,7 @@ class ModelRunner:
         if deferred_k3:
             all_per_sample_k3 = []
             for entry in deferred_k3:
-                per_sample = self._compute_per_sample_k3(
-                    entry["k3_values"], entry["valid_mask"], entry["position_ids"]
-                )
+                per_sample = self._compute_per_sample_k3(entry["k3_values"], entry["valid_mask"], entry["position_ids"])
                 all_per_sample_k3.extend(per_sample)
             result["per_sample_k3"] = all_per_sample_k3
 
@@ -1203,6 +1271,13 @@ class ModelRunner:
         """
         self._check_not_sleeping("forward_backward")
 
+        # Defragment GPU memory at the top of every forward_backward call.
+        # After weight-sync + optim_step from the previous step the CUDA
+        # allocator can have many small free blocks; without this, CUBLAS
+        # handle creation or Triton autotuner workspace allocs can fail.
+        gc.collect()
+        torch.cuda.empty_cache()
+
         # Validate single-tenant mode for full-weights training
         self._validate_single_tenant(model_id)
 
@@ -1241,7 +1316,15 @@ class ModelRunner:
                     model_inputs = {
                         k: v
                         for k, v in mb.items()
-                        if k not in ["labels", "target_tokens", "logprobs", "advantages", "rollout_logprobs"]
+                        if k
+                        not in [
+                            "labels",
+                            "target_tokens",
+                            "logprobs",
+                            "advantages",
+                            "_original_position_ids",
+                            "rollout_logprobs",
+                        ]
                     }
 
                     with self.model_fwd_context:
@@ -1266,7 +1349,7 @@ class ModelRunner:
                     # Diagnostic: log SGLang vs Xorl logprobs comparison for first micro-batch
                     if batch_idx == 0:
                         orig_lp = micro_batch["logprobs"]
-                        valid_mask = (labels.view(-1) != IGNORE_INDEX)
+                        valid_mask = labels.view(-1) != IGNORE_INDEX
                         if orig_lp is not None and valid_mask.any():
                             orig_flat = orig_lp.to(ref_logprobs.device).view(-1)
                             ref_flat = ref_logprobs.view(-1)
@@ -1288,6 +1371,11 @@ class ModelRunner:
                 self._routing_handler.cleanup()
 
             logger.info("Reference logprobs computed, replacing old_logprobs")
+
+        # Reclaim fragmented GPU memory before the main forward-backward pass.
+        # Without this, the Triton autotuner's workspace allocations can OOM
+        # on memory-tight configs (e.g. EP=32, 16 experts/GPU).
+        torch.cuda.empty_cache()
 
         # R3 (Rollout Routing Replay): Pre-populate routing replay from inference data
         r3_enabled = self._routing_handler.setup(micro_batches, routed_experts, routed_expert_logits)
@@ -1314,16 +1402,16 @@ class ModelRunner:
                 "global_valid_tokens": gvt,
             }
             # Accumulate valid tokens for deferred normalization at optim_step
-            self._accumulated_valid_tokens[model_id] = (
-                self._accumulated_valid_tokens.get(model_id, 0) + gvt
-            )
+            self._accumulated_valid_tokens[model_id] = self._accumulated_valid_tokens.get(model_id, 0) + gvt
             # R3 cleanup for PP path (stage management handled by _pp_forward)
             if r3_enabled:
                 self._routing_handler.cleanup()
         else:
             # Standard forward-backward via unified loop
             result = self._forward_loop(
-                micro_batches, loss_fn, loss_fn_params,
+                micro_batches,
+                loss_fn,
+                loss_fn_params,
                 compute_backward=True,
                 r3_enabled=r3_enabled,
                 model_id=model_id,
@@ -1403,7 +1491,9 @@ class ModelRunner:
         r3_enabled = self._routing_handler.setup(micro_batches, routed_experts, routed_expert_logits)
 
         result = self._forward_loop(
-            micro_batches, loss_fn, loss_fn_params,
+            micro_batches,
+            loss_fn,
+            loss_fn_params,
             compute_backward=False,
             r3_enabled=r3_enabled,
         )
@@ -1483,7 +1573,9 @@ class ModelRunner:
             # Gradients are in the adapter's params (captured by capture_gradients in forward_backward)
             # Pass accumulated_valid_tokens for deferred gradient normalization
             grad_norm = self._adapter_manager.optim_step(
-                model_id, effective_lr, clip_value,
+                model_id,
+                effective_lr,
+                clip_value,
                 accumulated_valid_tokens=accumulated,
             )
             current_step = self._adapter_manager.get_global_step(model_id)
@@ -1503,12 +1595,13 @@ class ModelRunner:
             if lr is not None:
                 effective_lr = lr
                 for param_group in self.optimizer.param_groups:
-                    param_group['lr'] = effective_lr
+                    param_group["lr"] = effective_lr
 
             ps = get_parallel_state()
 
             grad_norm = clip_gradients(
-                self.model, clip_value,
+                self.model,
+                clip_value,
                 pp_enabled=self.pp_enabled,
                 pp_group=ps.pp_group if self.pp_enabled else None,
             )
@@ -1525,7 +1618,7 @@ class ModelRunner:
 
             self.global_step += 1
             current_step = self.global_step
-            current_lr = self.optimizer.param_groups[0]['lr']
+            current_lr = self.optimizer.param_groups[0]["lr"]
 
             # Collect mean grad_norm across data parallel group for logging
             grad_norm = all_reduce(grad_norm, group=ps.fsdp_group)
@@ -1576,8 +1669,8 @@ class ModelRunner:
         """Sync mutable state to checkpoint manager before save operations."""
         self._checkpoint_mgr.global_step = self.global_step
         self._checkpoint_mgr.global_forward_backward_step = self.global_forward_backward_step
-        self._checkpoint_mgr.lora_target_modules = getattr(self, 'lora_target_modules', None)
-        self._checkpoint_mgr.lora_alpha_value = getattr(self, 'lora_alpha_value', None)
+        self._checkpoint_mgr.lora_target_modules = getattr(self, "lora_target_modules", None)
+        self._checkpoint_mgr.lora_alpha_value = getattr(self, "lora_alpha_value", None)
 
     def _sync_from_checkpoint_state(self):
         """Sync state back from checkpoint manager after load operations."""

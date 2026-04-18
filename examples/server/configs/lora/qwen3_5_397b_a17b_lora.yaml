@@ -1,0 +1,49 @@
+# Server-side configuration for XORL Training Server
+# Qwen3.5-397B-A17B LoRA (bf16 base + LoRA rank 32)
+#
+# 4 nodes (32 GPUs): EP=32, Ulysses SP=8, FSDP shard=4
+#
+# Memory budget per GPU (H100 80GB):
+#   Expert params (387B/32):   ~24 GB  (16 experts/GPU, 512 experts total)
+#   Dense params  (10B/4):     ~5 GB   (sharded by dp_shard=4)
+#   LoRA params + grads:       ~1 GB
+#   Activations + overhead:    ~50 GB headroom
+
+model_path: Qwen/Qwen3.5-397B-A17B
+tokenizer_path: Qwen/Qwen3.5-397B-A17B
+attn_implementation: flash_attention_3
+moe_implementation: triton
+ep_dispatch: alltoall
+
+data_parallel_mode: fsdp2
+expert_parallel_size: 32
+ulysses_parallel_size: 8
+data_parallel_replicate_size: 1
+data_parallel_shard_size: 4
+
+enable_mixed_precision: true
+enable_gradient_checkpointing: true
+enable_full_shard: true
+enable_activation_offload: false
+init_device: meta
+load_weights_mode: all_ranks
+
+output_dir: outputs/Qwen3.5-397B-A17B-server-lora-rl
+load_checkpoint_path: ""
+ckpt_manager: dcp
+
+log_level: INFO
+
+worker_connection_timeout: 180.0
+worker_max_retries: 5
+
+sample_packing_sequence_len: 65536
+enable_packing: true
+
+enable_lora: true
+lora_rank: 32
+lora_alpha: 32
+lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+skip_initial_checkpoint: true
+ce_mode: compiled

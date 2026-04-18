@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -64,20 +64,26 @@ def importance_sampling_loss_function(
     advantages_flat = advantages.reshape(-1)
 
     # Valid/action mask
-    valid_mask = (labels_flat != ignore_index)
+    valid_mask = labels_flat != ignore_index
     n_valid = valid_mask.sum().clamp(min=1).float()
 
     # ---- Cross-entropy computation ----
     per_token_ce = compute_per_token_ce(
-        hidden_states_flat, weight, labels_flat, ignore_index, ce_mode, num_chunks,
-        tp_group=tp_group, lm_head_fp32=lm_head_fp32,
+        hidden_states_flat,
+        weight,
+        labels_flat,
+        ignore_index,
+        ce_mode,
+        num_chunks,
+        tp_group=tp_group,
+        lm_head_fp32=lm_head_fp32,
     )
 
     # new logprobs = log p(target) = -CE
     new_logprobs_flat = -per_token_ce.detach()
 
     # ---- ratio computation (no sanitization) ----
-    delta = (new_logprobs_flat - old_logprobs_flat)
+    delta = new_logprobs_flat - old_logprobs_flat
     delta = delta.masked_fill(~valid_mask, 0.0)
     delta = delta.clamp(min=-20.0, max=20.0)
     ratio = torch.exp(delta)

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Tuple, Union, Unpack
+from typing import Optional, Unpack
 
 import torch
 from torch import nn
@@ -20,6 +20,12 @@ from torch import nn
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.distributed.sequence_parallel.strategy import get_cp_strategy
 from xorl.models.base import XorlPreTrainedModel
+from xorl.models.checkpoint_handlers.buffers import (
+    checkpoint_has_per_expert_weights,
+    detect_prequantized_block_fp8_checkpoint,
+    detect_prequantized_checkpoint,
+    get_prequantized_exclude_modules,
+)
 from xorl.models.layers import ACT2FN, RMSNorm, RotaryEmbedding
 from xorl.models.layers.attention import (
     AttentionKwargs,
@@ -27,20 +33,15 @@ from xorl.models.layers.attention import (
     is_flash_attention,
     update_causal_mask,
 )
-from xorl.models.layers.moe import MoEExperts, MoEBlock
+from xorl.models.layers.moe import MoEBlock, MoEExperts
+from xorl.models.module_utils import MoEGradientCheckpointingLayer
 from xorl.models.outputs import MoeCausalLMOutput, MoeModelOutput
-from xorl.models.checkpoint_handlers.buffers import (
-    checkpoint_has_per_expert_weights,
-    detect_prequantized_checkpoint,
-    detect_prequantized_block_fp8_checkpoint,
-    get_prequantized_exclude_modules,
-)
+from xorl.models.transformers.qwen3_moe import parallelize
 from xorl.models.transformers.qwen3_moe.checkpoint_handler import Qwen3MoeCheckpointHandler
 from xorl.models.transformers.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
-from xorl.models.transformers.qwen3_moe import parallelize
-from xorl.distributed.moe.deepep import sync_pending_combine
 from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
 from xorl.utils import logging
+
 
 logger = logging.get_logger(__name__)
 
@@ -55,7 +56,7 @@ class Qwen3MoeMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
         self.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
         self.deepep_buffer_size_gb = getattr(config, "_deepep_buffer_size_gb", 2.0)
-        self._use_fused_silu = config.hidden_act == "silu" and not getattr(config, '_activation_native', False)
+        self._use_fused_silu = config.hidden_act == "silu" and not getattr(config, "_activation_native", False)
 
     def unfuse_for_tp(self):
         """Replace fused gate_up_proj with separate gate_proj and up_proj for tensor parallelism."""
@@ -103,7 +104,6 @@ class Qwen3MoeTritonExperts(MoEExperts):
         )
 
 
-
 class Qwen3MoeQuackExperts(MoEExperts):
     """Backward-compat wrapper: quack group GEMM expert module."""
 
@@ -119,6 +119,7 @@ class Qwen3MoeQuackExperts(MoEExperts):
 
 class Qwen3MoeAttention(MultiHeadAttention):
     """Qwen3 MoE attention — uses base MultiHeadAttention with default sliding window."""
+
     pass
 
 
@@ -134,6 +135,7 @@ class Qwen3MoeSparseMoeBlock(MoEBlock):
             hidden_act=config.hidden_act,
             norm_topk_prob=config.norm_topk_prob,
             moe_implementation="eager",
+            train_router=getattr(config, "train_router", False),
         )
         self.config = config
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
@@ -154,6 +156,7 @@ class Qwen3MoeSparseTritonMoeBlock(MoEBlock):
             hidden_act=config.hidden_act,
             norm_topk_prob=config.norm_topk_prob,
             moe_implementation="triton",
+            train_router=getattr(config, "train_router", False),
         )
         self.config = config
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
@@ -174,6 +177,7 @@ class Qwen3MoeSparseQuackMoeBlock(MoEBlock):
             hidden_act=config.hidden_act,
             norm_topk_prob=config.norm_topk_prob,
             moe_implementation="quack",
+            train_router=getattr(config, "train_router", False),
         )
         self.config = config
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
@@ -194,6 +198,7 @@ class Qwen3MoeSparseNativeMoeBlock(MoEBlock):
             hidden_act=config.hidden_act,
             norm_topk_prob=config.norm_topk_prob,
             moe_implementation="native",
+            train_router=getattr(config, "train_router", False),
         )
         self.config = config
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
@@ -210,14 +215,13 @@ QWEN3_MOE_CLASSES = {
 }
 
 
-class Qwen3MoeDecoderLayer(nn.Module):
+class Qwen3MoeDecoderLayer(MoEGradientCheckpointingLayer):
     def __init__(self, config: Qwen3MoeConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.gradient_checkpointing = False  # set by gradient_checkpointing_enable
 
         self.self_attn = Qwen3MoeAttention(config, layer_idx)
-
-        self.mlp = Qwen3MoeMLP(config)
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -230,76 +234,35 @@ class Qwen3MoeDecoderLayer(nn.Module):
         else:
             self.mlp = Qwen3MoeMLP(config, intermediate_size=config.intermediate_size)
 
+    def _pre_mlp_forward(self, hidden_states, attention_mask=None, position_embeddings=None, **kwargs):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual=residual, prenorm=True)
+        return hidden_states, residual
+
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        output_attentions: Optional[bool] = False,
-        output_router_logits: Optional[bool] = False,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        **kwargs: Unpack[AttentionKwargs],
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        _selective = (
-            self.training
-            and getattr(self, "gradient_checkpointing", False)
-            and getattr(self, "_recompute_modules", None) is not None
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        output_attentions=False,
+        output_router_logits=False,
+        position_embeddings=None,
+        **kwargs,
+    ):
+        return self._moe_forward(
+            hidden_states,
+            output_router_logits=output_router_logits,
+            attention_mask=attention_mask,
+            position_embeddings=position_embeddings,
+            **kwargs,
         )
-        residual = hidden_states
-
-        hidden_states = self.input_layernorm(hidden_states)
-
-        # Self Attention
-        if _selective and "self_attn" in self._recompute_modules:
-            # MultiHeadAttention.forward positional order: hidden_states, position_embeddings, attention_mask
-            hidden_states, self_attn_weights = self._gradient_checkpointing_func(
-                self.self_attn.__call__,
-                hidden_states,
-                position_embeddings,
-                attention_mask,
-                **kwargs,
-            )
-        else:
-            hidden_states, self_attn_weights = self.self_attn(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
-        hidden_states = residual + hidden_states
-
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-
-        if _selective and "mlp" in self._recompute_modules:
-            hidden_states = self._gradient_checkpointing_func(
-                self.mlp.__call__,
-                hidden_states,
-            )
-        else:
-            hidden_states = self.mlp(hidden_states)
-
-        if isinstance(hidden_states, tuple):
-            hidden_states, router_logits = hidden_states
-        else:
-            router_logits = None
-
-        # Sync any pending async DeepEP combine before reading MoE output.
-        # No-op when async combine is disabled or non-DeepEP dispatch.
-        sync_pending_combine()
-
-        hidden_states = residual + hidden_states
-
-        outputs = (hidden_states,)
-
-        if output_attentions:
-            outputs += (self_attn_weights,)
-
-        if output_router_logits:
-            outputs += (router_logits,)
-
-        return outputs
 
 
 class Qwen3MoePreTrainedModel(XorlPreTrainedModel):
@@ -336,9 +299,8 @@ class Qwen3MoePreTrainedModel(XorlPreTrainedModel):
         is_broadcast = kwargs.get("is_broadcast", False)
 
         has_per_expert = checkpoint_has_per_expert_weights(checkpoint_keys) if checkpoint_keys else True
-        is_prequantized = (
-            detect_prequantized_checkpoint(weights_path)
-            or detect_prequantized_block_fp8_checkpoint(weights_path)
+        is_prequantized = detect_prequantized_checkpoint(weights_path) or detect_prequantized_block_fp8_checkpoint(
+            weights_path
         )
 
         # Use user-specified exclude_modules (stored by train.py) if available,
@@ -353,6 +315,14 @@ class Qwen3MoePreTrainedModel(XorlPreTrainedModel):
         # When unfused for TP, skip QKV and gate/up merging — checkpoint keys
         # already match the model's parameter names. Expert merging is still needed.
         unfused = getattr(self, "_unfused_for_tp", False)
+        skip_expert_loading = False
+        if not is_prequantized:
+            from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
+
+            skip_expert_loading = any(
+                isinstance(module, QLoRAMoeExperts) and not getattr(module, "_weights_loaded", False)
+                for module in self.modules()
+            )
 
         head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
         return Qwen3MoeCheckpointHandler(
@@ -365,6 +335,7 @@ class Qwen3MoePreTrainedModel(XorlPreTrainedModel):
             checkpoint_has_per_expert=has_per_expert,
             skip_qkv_merge=unfused,
             skip_gate_up_merge=unfused,
+            skip_expert_loading=skip_expert_loading,
             is_prequantized=is_prequantized,
             exclude_modules=exclude_modules,
             device=kwargs.get("device"),
@@ -457,7 +428,9 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         # SP strategy handles slicing (sync: slice, async: keep full-length)
         ps = get_parallel_state()
         position_embeddings = get_cp_strategy(num_kv_heads=self.config.num_key_value_heads).prepare_position_embeddings(
-            position_embeddings, dim=1, sp_group=ps.sp_group,
+            position_embeddings,
+            dim=1,
+            sp_group=ps.sp_group,
             num_kv_heads=self.config.num_key_value_heads,
         )
 
@@ -465,17 +438,15 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         all_self_attns = () if output_attentions else None
         all_router_logits = () if output_router_logits else None
 
+        _grad_ckpt_method = getattr(self, "_gradient_checkpointing_method", None) or "recompute_full_layer"
+        _grad_ckpt_active = self.gradient_checkpointing and self.training
+
         for decoder_layer in self.layers:
             if decoder_layer is None:  # PP: pruned layer
                 continue
-            # When selective checkpointing is enabled (_recompute_modules is set),
-            # the decoder layer handles its own sub-checkpointing — skip the outer checkpoint.
-            _use_outer_checkpoint = (
-                self.gradient_checkpointing and self.training
-                and getattr(self, "_recompute_modules", None) is None
-            )
 
-            if _use_outer_checkpoint:
+            if _grad_ckpt_active and _grad_ckpt_method == "recompute_full_layer":
+                # Recompute entire layer in backward (including dispatch + combine)
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
@@ -486,7 +457,20 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
                     position_embeddings,
                     **kwargs,
                 )
+            elif _grad_ckpt_active and _grad_ckpt_method == "recompute_before_dispatch":
+                # Decoder layer handles checkpoint internally via _pre_dispatch_forward.
+                # Dispatch + combine run outside checkpoint (alltoall not recomputed).
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                    output_attentions=output_attentions,
+                    output_router_logits=output_router_logits,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
             else:
+                # no_recompute or gc disabled: run decoder layer normally
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=causal_mask,
@@ -500,7 +484,8 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
             hidden_states = layer_outputs[0]
 
             if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+                # _moe_forward does not produce attention weights; use None placeholder.
+                all_self_attns += (None,)
 
             if output_router_logits:
                 all_router_logits += (layer_outputs[-1],)
@@ -514,89 +499,8 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
             router_logits=all_router_logits,
         )
 
+
 class KwargsForCausalLM(AttentionKwargs): ...
-
-
-def load_balancing_loss_func(
-    gate_logits: Union[torch.Tensor, Tuple[torch.Tensor], None],
-    num_experts: Optional[int] = None,
-    top_k=2,
-    attention_mask: Optional[torch.Tensor] = None,
-) -> Union[torch.Tensor, int]:
-    r"""
-    Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
-
-    See Switch Transformer (https://arxiv.org/abs/2101.03961) for more details. This function implements the loss
-    function presented in equations (4) - (6) of the paper. It aims at penalizing cases where the routing between
-    experts is too unbalanced.
-
-    Args:
-        gate_logits:
-            Logits from the `gate`, should be a tuple of model.config.num_hidden_layers tensors of
-            shape [batch_size X sequence_length, num_experts].
-        num_experts:
-            Number of experts
-        top_k:
-            The number of experts to route per-token, can be also interpreted as the `top-k` routing
-            parameter.
-        attention_mask (`torch.Tensor`, *optional*):
-            The attention_mask used in forward function
-            shape [batch_size X sequence_length] if not None.
-
-    Returns:
-        The auxiliary loss.
-    """
-    if gate_logits is None or not isinstance(gate_logits, tuple):
-        return 0
-
-    if isinstance(gate_logits, tuple):
-        compute_device = gate_logits[0].device
-        concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
-
-    routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
-
-    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
-
-    expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
-
-    if attention_mask is None:
-        # Compute the percentage of tokens routed to each experts
-        tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
-
-        # Compute the average probability of routing to these experts
-        router_prob_per_expert = torch.mean(routing_weights, dim=0)
-    else:
-        batch_size, sequence_length = attention_mask.shape
-        num_hidden_layers = concatenated_gate_logits.shape[0] // (batch_size * sequence_length)
-
-        # Compute the mask that masks all padding tokens as 0 with the same shape of expert_mask
-        expert_attention_mask = (
-            attention_mask[None, :, :, None, None]
-            .expand((num_hidden_layers, batch_size, sequence_length, top_k, num_experts))
-            .reshape(-1, top_k, num_experts)
-            .to(compute_device)
-        )
-
-        # Compute the percentage of tokens routed to each experts
-        tokens_per_expert = torch.sum(expert_mask.float() * expert_attention_mask, dim=0) / torch.sum(
-            expert_attention_mask, dim=0
-        )
-
-        # Compute the mask that masks all padding tokens as 0 with the same shape of tokens_per_expert
-        router_per_expert_attention_mask = (
-            attention_mask[None, :, :, None]
-            .expand((num_hidden_layers, batch_size, sequence_length, num_experts))
-            .reshape(-1, num_experts)
-            .to(compute_device)
-        )
-
-        # Compute the average probability of routing to these experts
-        router_prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=0) / torch.sum(
-            router_per_expert_attention_mask, dim=0
-        )
-
-    overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
-    return overall_loss * num_experts
 
 
 class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel):

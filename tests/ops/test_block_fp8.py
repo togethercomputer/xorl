@@ -6,16 +6,23 @@ kernels and FP8 GEMM operations.
 
 import pytest
 import torch
-import numpy as np
+
 
 # Try to import the block_fp8 module
 try:
     from xorl.ops.quantize import (
-        block_fp8_quantize as block_fp8_quant,
         block_fp8_dequantize as block_fp8_dequant,
+    )
+    from xorl.ops.quantize import (
         block_fp8_dequantize_gkn as block_fp8_weight_dequant,
+    )
+    from xorl.ops.quantize import (
         block_fp8_gemm,
     )
+    from xorl.ops.quantize import (
+        block_fp8_quantize as block_fp8_quant,
+    )
+
     HAS_BLOCK_FP8 = True
 except ImportError:
     HAS_BLOCK_FP8 = False

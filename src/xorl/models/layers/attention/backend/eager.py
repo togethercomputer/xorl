@@ -59,7 +59,9 @@ def eager_attention_forward(
             elif k_len % mk == 0:
                 causal_mask = causal_mask.repeat_interleave(k_len // mk, dim=-1)
             else:
-                causal_mask = torch.nn.functional.pad(causal_mask, (0, k_len - mk), value=torch.finfo(causal_mask.dtype).min)
+                causal_mask = torch.nn.functional.pad(
+                    causal_mask, (0, k_len - mk), value=torch.finfo(causal_mask.dtype).min
+                )
 
         # Match query axis
         mq = causal_mask.shape[-2]
@@ -92,9 +94,7 @@ def prepare_causal_mask(
     past_seen_tokens = 0
     sequence_length = input_tensor.shape[1]
     target_length = (
-        attention_mask.shape[-1]
-        if isinstance(attention_mask, torch.Tensor)
-        else past_seen_tokens + sequence_length + 1
+        attention_mask.shape[-1] if isinstance(attention_mask, torch.Tensor) else past_seen_tokens + sequence_length + 1
     )
 
     return prepare_4d_causal_attention_mask_with_cache_position(

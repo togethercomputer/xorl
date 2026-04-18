@@ -2,12 +2,10 @@
 
 import argparse
 import json
-import math
 import os
+import subprocess
 import sys
 import types
-
-import torch
 from collections import defaultdict
 from dataclasses import MISSING, asdict, dataclass, field, fields
 from enum import Enum
@@ -24,14 +22,32 @@ from typing import (
     get_type_hints,
 )
 
+import torch
 import yaml
 
+from .utils import logging
+from .utils.checkpoint_utils import get_checkpoint_path
 
-from .utils import helper, logging
 
 T = TypeVar("T")
 
 logger = logging.get_logger(__name__)
+
+
+def _detect_repo_commit() -> Optional[str]:
+    """Best-effort git commit detection for experiment metadata."""
+    try:
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        result = subprocess.run(
+            ["git", "-C", repo_root, "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        commit = result.stdout.strip()
+        return commit or None
+    except Exception:
+        return None
 
 
 def get_default_process_count():
@@ -43,43 +59,34 @@ def get_default_process_count():
         return int(runpod_cpu_count)
     return os.cpu_count()
 
+
 # Dataset configuration dataclasses
 @dataclass
 class DatasetConfig:
-    """ dataset configuration supporting multiple loading methods"""
+    """dataset configuration supporting multiple loading methods"""
 
     # Core fields
     path: Optional[str | None] = field(
         default=None,
-        metadata={
-            "help": "HuggingFace dataset repo | s3:// | gs:// | https:// | path to local file or directory"
-        },
+        metadata={"help": "HuggingFace dataset repo | s3:// | gs:// | https:// | path to local file or directory"},
     )
     type: Optional[str] = field(
         default="tokenized",
-        metadata={
-            "help": "The type of dataset. Only 'tokenized' is currently supported."
-        },
+        metadata={"help": "The type of dataset. Only 'tokenized' is currently supported."},
     )
 
     # HuggingFace Hub fields
     name: Optional[str | None] = field(
         default=None,
-        metadata={
-            "help": "Name of dataset configuration to load (for HuggingFace datasets)"
-        },
+        metadata={"help": "Name of dataset configuration to load (for HuggingFace datasets)"},
     )
     split: Optional[str | None] = field(
         default=None,
-        metadata={
-            "help": "Name of dataset split to load from (e.g., 'train', 'validation', 'test')"
-        },
+        metadata={"help": "Name of dataset split to load from (e.g., 'train', 'validation', 'test')"},
     )
     revision: Optional[str | None] = field(
         default=None,
-        metadata={
-            "help": "The specific revision of the dataset to use when loading from HF Hub"
-        },
+        metadata={"help": "The specific revision of the dataset to use when loading from HF Hub"},
     )
     trust_remote_code: Optional[bool] = field(
         default=False,
@@ -89,9 +96,7 @@ class DatasetConfig:
     # File loading fields
     data_files: Optional[Union[str, List[str]] | None] = field(
         default=None,
-        metadata={
-            "help": "Path to source data files (single file string or list of files)"
-        },
+        metadata={"help": "Path to source data files (single file string or list of files)"},
     )
     ds_type: Optional[str | None] = field(
         default=None,
@@ -102,37 +107,27 @@ class DatasetConfig:
     # split dataset into N pieces (use with shards_idx)
     shards: Optional[int | None] = field(
         default=None,
-        metadata={
-            "help": "Split dataset into N pieces (use with shards_idx)"
-        },
+        metadata={"help": "Split dataset into N pieces (use with shards_idx)"},
     )
     # the index of sharded dataset to use
     shards_idx: Optional[int | None] = field(
         default=None,
-        metadata={
-            "help": "The index of sharded dataset to use"
-        },
+        metadata={"help": "The index of sharded dataset to use"},
     )
     # process dataset in N sequential chunks for memory efficiency (exclusive with `shards`)
     preprocess_shards: Optional[int | None] = field(
         default=None,
-        metadata={
-            "help": "Process dataset in N sequential chunks for memory efficiency (exclusive with `shards`)"
-        },
+        metadata={"help": "Process dataset in N sequential chunks for memory efficiency (exclusive with `shards`)"},
     )
     max_seq_len: Optional[int | None] = field(
         default=None,
-        metadata={
-            "help": "Max sequence length. Samples with input_ids longer than this are filtered out."
-        },
+        metadata={"help": "Max sequence length. Samples with input_ids longer than this are filtered out."},
     )
 
     # Distillation fields
     activations_path: Optional[str | None] = field(
         default=None,
-        metadata={
-            "help": "Path to pre-computed teacher activations (local path or s3://)"
-        },
+        metadata={"help": "Path to pre-computed teacher activations (local path or s3://)"},
     )
 
     def __post_init__(self):
@@ -183,17 +178,13 @@ class DatasetConfig:
             # If data_files is specified, it should be for loading specific files
             if self.data_files is not None:
                 if self.ds_type is None:
-                    raise ValueError(
-                        "'ds_type' is required when 'data_files' is specified."
-                    )
+                    raise ValueError("'ds_type' is required when 'data_files' is specified.")
 
         # Validate ds_type if specified
         if self.ds_type is not None:
             valid_ds_types = ["json", "csv", "parquet", "arrow", "text"]
             if self.ds_type not in valid_ds_types:
-                raise ValueError(
-                    f"Invalid 'ds_type': {self.ds_type}. Must be one of {valid_ds_types}"
-                )
+                raise ValueError(f"Invalid 'ds_type': {self.ds_type}. Must be one of {valid_ds_types}")
 
     def get_loading_info(self) -> Dict[str, Any]:
         """Get information about how this dataset should be loaded"""
@@ -240,33 +231,23 @@ class DataArguments:
 
     datasets: Optional[List[Dict[str, Any]]] = field(
         default_factory=list,
-        metadata={
-            "help": "List of dataset configurations. Each dataset must have type='tokenized'."
-        },
+        metadata={"help": "List of dataset configurations. Each dataset must have type='tokenized'."},
     )
     test_datasets: Optional[List[Dict[str, Any]]] = field(
         default_factory=list,
-        metadata={
-            "help": "List of test dataset configurations. Each dataset must have type='tokenized'."
-        },
+        metadata={"help": "List of test dataset configurations. Each dataset must have type='tokenized'."},
     )
     dataset_prepared_path: str = field(
         default="last_prepared_dataset",
-        metadata={
-            "help": "Path to the prepared dataset. Defaults to 'last_prepared_dataset'."
-        },
+        metadata={"help": "Path to the prepared dataset. Defaults to 'last_prepared_dataset'."},
     )
     shuffle_merged_datasets: Optional[bool] = field(
         default=True,
-        metadata={
-            "help": "Shuffle merged datasets before training"
-        },
+        metadata={"help": "Shuffle merged datasets before training"},
     )
     shuffle_before_merging_datasets: Optional[bool] = field(
         default=True,
-        metadata={
-            "help": "Shuffle each dataset individually before merging"
-        },
+        metadata={"help": "Shuffle each dataset individually before merging"},
     )
     push_dataset_to_hub: Optional[str] = field(
         default=None,
@@ -306,15 +287,11 @@ class DataArguments:
     )
     dataset_shard_idx: Optional[int | None] = field(
         default=None,
-        metadata={
-            "help": "Index of the shard to use. If not specified, the dataset will not be sharded."
-        },
+        metadata={"help": "Index of the shard to use. If not specified, the dataset will not be sharded."},
     )
     val_set_size: Optional[int | float | None] = field(
         default=None,
-        metadata={
-            "help": "Size of the validation set. If not specified, the validation set will not be created."
-        },
+        metadata={"help": "Size of the validation set. If not specified, the validation set will not be created."},
     )
     dataset_num_proc: Optional[int] = field(
         default=None,
@@ -336,9 +313,7 @@ class DataArguments:
     )
     sample_packing_sequentially: Optional[bool] = field(
         default=None,
-        metadata={
-            "help": "Whether to pack samples sequentially."
-        },
+        metadata={"help": "Whether to pack samples sequentially."},
     )
     sample_packing_mp_start_method: Optional[str] = field(
         default=None,
@@ -348,33 +323,23 @@ class DataArguments:
     )
     eval_sample_packing: Optional[bool] = field(
         default=None,
-        metadata={
-            "help": "Set to 'false' if getting errors during eval with sample_packing on."
-        },
+        metadata={"help": "Set to 'false' if getting errors during eval with sample_packing on."},
     )
     sample_packing_sequence_len: Optional[int] = field(
         default=32000,
-        metadata={
-            "help": "The length of the sequence to use for sample packing. Defaults to 32000."
-        },
+        metadata={"help": "The length of the sequence to use for sample packing. Defaults to 32000."},
     )
     select_columns: Optional[List[str]] = field(
         default=None,
-        metadata={
-            "help": "The columns to select from the dataset. If not specified, all columns will be selected."
-        },
+        metadata={"help": "The columns to select from the dataset. If not specified, all columns will be selected."},
     )
     dataloader_pin_memory: Optional[bool] = field(
         default=True,
-        metadata={
-            "help": "Whether to pin memory for faster GPU transfer in dataloader. Defaults to True."
-        },
+        metadata={"help": "Whether to pin memory for faster GPU transfer in dataloader. Defaults to True."},
     )
     dataloader_num_workers: Optional[int] = field(
         default=8,
-        metadata={
-            "help": "Number of worker processes for data loading. Defaults to 8."
-        },
+        metadata={"help": "Number of worker processes for data loading. Defaults to 8."},
     )
     dataloader_prefetch_factor: Optional[int] = field(
         default=2,
@@ -384,9 +349,7 @@ class DataArguments:
     )
     dataloader_drop_last: Optional[bool] = field(
         default=True,
-        metadata={
-            "help": "Whether to drop the last incomplete batch in dataloader. Defaults to True."
-        },
+        metadata={"help": "Whether to drop the last incomplete batch in dataloader. Defaults to True."},
     )
     pad_to_multiple_of: Optional[int] = field(
         default=128,
@@ -394,7 +357,6 @@ class DataArguments:
             "help": "Pad packed sequences to a multiple of this value. Defaults to 128 for optimal GPU performance."
         },
     )
-
 
     def _convert_datasets_to_config(
         self, datasets: Optional[List[Dict[str, Any]]], dataset_name: str
@@ -410,25 +372,19 @@ class DataArguments:
         converted_datasets = []
         for i, dataset_dict in enumerate(datasets):
             if not isinstance(dataset_dict, dict):
-                raise ValueError(
-                    f"Dataset at index {i} in '{dataset_name}' must be a dictionary."
-                )
+                raise ValueError(f"Dataset at index {i} in '{dataset_name}' must be a dictionary.")
 
             try:
                 converted_datasets.append(DatasetConfig(**dataset_dict))
             except TypeError as e:
-                raise ValueError(
-                    f"Invalid configuration for dataset at index {i} in '{dataset_name}': {e}"
-                )
+                raise ValueError(f"Invalid configuration for dataset at index {i} in '{dataset_name}': {e}")
 
         return converted_datasets
 
     def __post_init__(self):
         """Validate and convert dataset configurations"""
         if self.datasets is None:
-            raise ValueError(
-                "At least one dataset must be specified in 'datasets' list."
-            )
+            raise ValueError("At least one dataset must be specified in 'datasets' list.")
 
         if not isinstance(self.datasets, list) or len(self.datasets) == 0:
             raise ValueError("'datasets' must be a non-empty list.")
@@ -456,21 +412,15 @@ class DataArguments:
 class ModelArguments:
     config_path: Optional[str] = field(
         default=None,
-        metadata={
-            "help": "Local path/HDFS path to the model config. Defaults to `model_path`."
-        },
+        metadata={"help": "Local path/HDFS path to the model config. Defaults to `model_path`."},
     )
     model_path: Optional[str] = field(
         default=None,
-        metadata={
-            "help": "Local path/HDFS path to the pre-trained model. If unspecified, use random init."
-        },
+        metadata={"help": "Local path/HDFS path to the pre-trained model. If unspecified, use random init."},
     )
     tokenizer_path: Optional[str] = field(
         default=None,
-        metadata={
-            "help": "Local path/HDFS path to the tokenizer. Defaults to `config_path`."
-        },
+        metadata={"help": "Local path/HDFS path to the tokenizer. Defaults to `config_path`."},
     )
     foundation: Dict[str, str] = field(
         default_factory=dict,
@@ -480,20 +430,29 @@ class ModelArguments:
         default_factory=dict,
         metadata={"help": "Multimodal encoder config and weights."},
     )
-    attn_implementation: Optional[
-        Literal["eager", "sdpa", "native", "flash_attention_3", "flash_attention_4"]
-    ] = field(
+    attn_implementation: Optional[Literal["eager", "sdpa", "native", "flash_attention_3", "flash_attention_4"]] = field(
         default="flash_attention_3",
-        metadata={"help": "Attention implementation. 'native': PyTorch SDPA+cuDNN (no deps, Hopper+Blackwell). "
-                          "'flash_attention_3': FA3 (Hopper). 'flash_attention_4': FA4 CUTE (Hopper+Blackwell)."},
+        metadata={
+            "help": "Attention implementation. 'native': PyTorch SDPA+cuDNN (no deps, Hopper+Blackwell). "
+            "'flash_attention_3': FA3 (Hopper). 'flash_attention_4': FA4 CUTE (Hopper+Blackwell)."
+        },
     )
     moe_implementation: Optional[Literal[None, "eager", "triton", "native", "quack"]] = field(
         default=None,
-        metadata={"help": "MoE implementation to use. 'triton' uses Triton group GEMM kernels, 'native' uses torch._grouped_mm, 'quack' uses quack kernels."},
+        metadata={
+            "help": "MoE implementation to use. 'triton' uses Triton group GEMM kernels, 'native' uses torch._grouped_mm, 'quack' uses quack kernels."
+        },
     )
     ep_dispatch: str = field(
         default="alltoall",
         metadata={"help": "EP dispatch strategy: 'alltoall' (default) or 'deepep' (NVLink-optimized)."},
+    )
+    train_router: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether expert computation gradients should flow through routing weights. "
+            "Disabled by default and must remain False when ep_dispatch='deepep'."
+        },
     )
     deepep_buffer_size_gb: float = field(
         default=2.0,
@@ -501,7 +460,9 @@ class ModelArguments:
     )
     deepep_num_sms: int = field(
         default=20,
-        metadata={"help": "Number of SMs for DeepEP communication kernels (must be even, default 20). Lower values leave more SMs for overlapped compute."},
+        metadata={
+            "help": "Number of SMs for DeepEP communication kernels (must be even, default 20). Lower values leave more SMs for overlapped compute."
+        },
     )
     deepep_async_combine: bool = field(
         default=False,
@@ -509,21 +470,28 @@ class ModelArguments:
     )
     basic_modules: Optional[List[str]] = field(
         default_factory=list,
-        metadata={
-            "help": "Basic modules beyond model._no_split_modules to be sharded in FSDP."
-        },
+        metadata={"help": "Basic modules beyond model._no_split_modules to be sharded in FSDP."},
     )
     merge_qkv: bool = field(
         default=True,
-        metadata={"help": "Keep q/k/v projections fused as qkv_proj. "
-                  "When False, unfuse into separate q_proj/k_proj/v_proj for independent handling "
-                  "(e.g., tensor parallelism, independent LoRA per projection)."},
+        metadata={
+            "help": "Keep q/k/v projections fused as qkv_proj. "
+            "When False, unfuse into separate q_proj/k_proj/v_proj for independent handling "
+            "(e.g., tensor parallelism, independent LoRA per projection)."
+        },
     )
+    rmsnorm_mode: Literal["eager", "native", "compile"] = field(
+        default="native",
+        metadata={
+            "help": "RMSNorm implementation mode. 'native' uses torch.nn.functional.rms_norm "
+            "and is the default. 'compile' runs that native path through torch.compile. "
+            "'eager' uses the plain eager implementation."
+        },
+    )
+
     def __post_init__(self):
         if self.config_path is None and self.model_path is None:
-            raise ValueError(
-                "`config_path` must be specified when `model_path` is None."
-            )
+            raise ValueError("`config_path` must be specified when `model_path` is None.")
 
         if self.config_path is None:
             self.config_path = self.model_path
@@ -538,10 +506,7 @@ class ModelArguments:
                     f"Unsupported encoder type: {encoder_type}. Should be one of {supported_encoder_types}."
                 )
 
-            if (
-                encoder_args.get("config_path") is None
-                and encoder_args.get("model_path") is None
-            ):
+            if encoder_args.get("config_path") is None and encoder_args.get("model_path") is None:
                 raise ValueError("`config_path` and `model_path` cannot be both empty.")
 
             if encoder_args.get("config_path") is None:
@@ -555,9 +520,7 @@ class TrainingArguments:
     )
     lr: float = field(
         default=5e-5,
-        metadata={
-            "help": "Maximum learning rate or default learning rate, or initial learning rate for warmup."
-        },
+        metadata={"help": "Maximum learning rate or default learning rate, or initial learning rate for warmup."},
     )
     lr_min: float = field(
         default=1e-7,
@@ -580,9 +543,12 @@ class TrainingArguments:
         metadata={"help": "Parameters without weight decay, for example, bias."},
     )
 
-    optimizer: Literal["adamw", "anyprecision_adamw", "sgd", "muon"] = field(
+    optimizer: Literal["adamw", "anyprecision_adamw", "sgd", "signsgd", "muon"] = field(
         default="adamw",
-        metadata={"help": "Optimizer type. 'muon' uses Newton-Schulz orthogonalization for 2D+ weight matrices."},
+        metadata={
+            "help": "Optimizer type. 'signsgd' is a state-free sign update; 'muon' uses "
+            "Newton-Schulz orthogonalization for 2D+ weight matrices."
+        },
     )
     optimizer_dtype: Literal["fp32", "bf16"] = field(
         default="bf16",
@@ -590,7 +556,9 @@ class TrainingArguments:
     )
     muon_lr: float = field(
         default=0.02,
-        metadata={"help": "Learning rate for Muon parameter groups (2D+ weight matrices). Only used when optimizer='muon'."},
+        metadata={
+            "help": "Learning rate for Muon parameter groups (2D+ weight matrices). Only used when optimizer='muon'."
+        },
     )
     muon_momentum: float = field(
         default=0.95,
@@ -612,6 +580,55 @@ class TrainingArguments:
             "None defaults to 'original'."
         },
     )
+    muon_ns_algorithm: Literal["standard_newton_schulz", "gram_newton_schulz"] = field(
+        default="standard_newton_schulz",
+        metadata={
+            "help": "Newton-Schulz backend for Muon. 'standard_newton_schulz' keeps the PyTorch Muon path; "
+            "'gram_newton_schulz' uses Dao-AILab's Gram Newton-Schulz formulation."
+        },
+    )
+    muon_ns_use_quack_kernels: bool = field(
+        default=True,
+        metadata={
+            "help": "Allow Muon Gram Newton-Schulz to use Quack symmetric GEMM kernels on supported Hopper/Blackwell GPUs. "
+            "Falls back to torch matmuls when unavailable."
+        },
+    )
+    muon_gram_ns_num_restarts: int = field(
+        default=1,
+        metadata={
+            "help": "Number of restart locations to autotune for Muon's Gram Newton-Schulz backend when explicit "
+            "muon_gram_ns_restart_iterations are not provided."
+        },
+    )
+    muon_gram_ns_restart_iterations: Optional[List[int]] = field(
+        default=None,
+        metadata={
+            "help": "Explicit restart iteration indices for Muon's Gram Newton-Schulz backend. "
+            "A value of 2 means restart after the second iteration."
+        },
+    )
+    muon_grad_dtype: Optional[Literal["fp32", "bf16"]] = field(
+        default=None,
+        metadata={
+            "help": "Optional dtype cast for the gradient tensor used inside Muon. "
+            "Use this to force the Muon optimizer path to fp32 or bf16 independently of momentum state dtype."
+        },
+    )
+    muon_update_dtype: Optional[Literal["fp32", "bf16"]] = field(
+        default=None,
+        metadata={
+            "help": "Optional dtype cast for the transient Muon update tensor passed into Newton-Schulz. "
+            "Use this to decouple compute dtype from gradient and momentum-buffer storage dtype."
+        },
+    )
+    muon_force_momentum_path: bool = field(
+        default=False,
+        metadata={
+            "help": "Force Muon to build the update through the momentum-buffer path even when muon_momentum=0. "
+            "Intended for debugging and ablations."
+        },
+    )
 
     @property
     def optimizer_kwargs(self) -> Dict[str, Any]:
@@ -623,19 +640,33 @@ class TrainingArguments:
             kwargs["muon_nesterov"] = self.muon_nesterov
             kwargs["muon_ns_steps"] = self.muon_ns_steps
             kwargs["muon_adjust_lr_fn"] = self.muon_adjust_lr_fn
+            kwargs["muon_ns_algorithm"] = self.muon_ns_algorithm
+            kwargs["muon_ns_use_quack_kernels"] = self.muon_ns_use_quack_kernels
+            kwargs["muon_gram_ns_num_restarts"] = self.muon_gram_ns_num_restarts
+            if self.muon_gram_ns_restart_iterations is not None:
+                kwargs["muon_gram_ns_restart_iterations"] = self.muon_gram_ns_restart_iterations
             # Wire optimizer_dtype -> muon_momentum_dtype so "bf16" sets bf16 Muon momentum
             if self.optimizer_dtype == "bf16":
                 kwargs["muon_momentum_dtype"] = torch.bfloat16
+            if self.muon_grad_dtype == "bf16":
+                kwargs["muon_grad_dtype"] = torch.bfloat16
+            elif self.muon_grad_dtype == "fp32":
+                kwargs["muon_grad_dtype"] = torch.float32
+            if self.muon_update_dtype == "bf16":
+                kwargs["muon_update_dtype"] = torch.bfloat16
+            elif self.muon_update_dtype == "fp32":
+                kwargs["muon_update_dtype"] = torch.float32
+            if self.muon_force_momentum_path:
+                kwargs["muon_force_momentum_path"] = True
         return kwargs
+
     max_grad_norm: float = field(
         default=1.0,
         metadata={"help": "Clip value for gradient norm."},
     )
     micro_batch_size: int = field(
         default=1,
-        metadata={
-            "help": "Micro batch size. The number of samples per iteration on each device."
-        },
+        metadata={"help": "Micro batch size. The number of samples per iteration on each device."},
     )
     gradient_accumulation_steps: int = field(
         default=1,
@@ -671,20 +702,21 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Use reentrant gradient checkpointing."},
     )
-    recompute_modules: Optional[List[str]] = field(
+    gradient_checkpointing_method: Optional[str] = field(
         default=None,
         metadata={
-            "help": "Per-submodule selective checkpointing. Options: 'self_attn', 'mlp'. "
-            "When None, uses whole-layer checkpoint (legacy). "
-            "Example: ['self_attn'] checkpoints only attention, keeping MoE activations."
-        },
-    )
-    moe_checkpoint_method: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "MoE checkpoint strategy. None = full recompute (default). "
-            "'moe_act' = recompute only gate/up activations in backward, "
-            "skip EP communication recomputation. Only effective with MoE models."
+            "help": (
+                "Gradient checkpointing strategy. Controls the speed/memory tradeoff\n"
+                "by choosing what to recompute vs keep in backward.\n\n"
+                "  'recompute_full_layer'      — recompute entire decoder layer including\n"
+                "                                dispatch + combine alltoall. Lowest memory.\n"
+                "                                Required for 128k+ seq. (default)\n"
+                "  'recompute_before_dispatch' — recompute attn + layernorm + router; keep\n"
+                "                                dispatch + expert + combine. +20% speed,\n"
+                "                                more memory than recompute_full_layer.\n"
+                "  'no_recompute'              — no recomputation, max throughput. +34% speed\n"
+                "                                but highest memory, only fits short seq.\n"
+            )
         },
     )
 
@@ -695,9 +727,7 @@ class TrainingArguments:
         Used to decide whether routing replay is needed with EP: replay is only
         required when the MoE forward (including EP all-to-all) is recomputed.
         """
-        if self.recompute_modules is not None:
-            return "mlp" in self.recompute_modules and self.moe_checkpoint_method != "moe_act"
-        return True  # legacy whole-layer checkpoint always recomputes MoE
+        return self.gradient_checkpointing_method in (None, "recompute_full_layer")
 
     enable_full_shard: bool = field(
         default=True,
@@ -745,9 +775,7 @@ class TrainingArguments:
     )
     gc_steps: int = field(
         default=500,
-        metadata={
-            "help": "Number of steps between two gc.collect. GC is disabled if it is positive."
-        },
+        metadata={"help": "Number of steps between two gc.collect. GC is disabled if it is positive."},
     )
     data_parallel_mode: Literal["none", "ddp", "fsdp2"] = field(
         default="fsdp2",
@@ -765,9 +793,9 @@ class TrainingArguments:
         default=1,
         metadata={"help": "Expert parallel size."},
     )
-    ep_outside: bool = field(
-        default=False,
-        metadata={"help": "Enable expert parallelism outside in ep-fsdp."},
+    ep_intranode: bool = field(
+        default=True,
+        metadata={"help": "Place EP all-to-all within the node (NVLink). When False, EP spans across nodes."},
     )
     ulysses_parallel_size: int = field(
         default=1,
@@ -833,13 +861,13 @@ class TrainingArguments:
     )
     save_epochs: float = field(
         default=1,
-        metadata={"help": "Fraction or number of epochs between two checkpoint saves. E.g., 0.25 saves 4 times per epoch."},
+        metadata={
+            "help": "Fraction or number of epochs between two checkpoint saves. E.g., 0.25 saves 4 times per epoch."
+        },
     )
     save_hf_weights: bool = field(
         default=True,
-        metadata={
-            "help": "Save the huggingface format weights to the last checkpoint dir."
-        },
+        metadata={"help": "Save the huggingface format weights to the last checkpoint dir."},
     )
     seed: int = field(
         default=42,
@@ -851,7 +879,9 @@ class TrainingArguments:
     )
     log_format: Literal["progress_bar", "structured"] = field(
         default="progress_bar",
-        metadata={"help": "Logging format. 'progress_bar' uses tqdm; 'structured' prints parse-friendly key=value lines."},
+        metadata={
+            "help": "Logging format. 'progress_bar' uses tqdm; 'structured' prints parse-friendly key=value lines."
+        },
     )
     use_wandb: bool = field(
         default=True,
@@ -868,6 +898,10 @@ class TrainingArguments:
     wandb_tags: Optional[List[str]] = field(
         default=None,
         metadata={"help": "Wandb tags for organizing experiments."},
+    )
+    repo_commit: Optional[str] = field(
+        default=None,
+        metadata={"help": "Git commit hash for experiment provenance. Auto-detected when omitted."},
     )
     wandb_log_interval: int = field(
         default=1,
@@ -909,16 +943,32 @@ class TrainingArguments:
     )
     max_steps: Optional[int] = field(
         default=None,
-        metadata={"help": "Max total training steps. Training stops after this many global steps. Also caps LR scheduler length."},
+        metadata={
+            "help": "Max total training steps. Training stops after this many global steps. Also caps LR scheduler length."
+        },
     )
 
     def __post_init__(self):
+        # Resolve gradient_checkpointing_method into internal fields used by
+        # the model and parallelization code.
+        gcm = self.gradient_checkpointing_method or "recompute_full_layer"
+        self.gradient_checkpointing_method = gcm
+        if gcm not in ("recompute_full_layer", "recompute_before_dispatch", "no_recompute"):
+            raise ValueError(
+                f"Unknown gradient_checkpointing_method: {gcm!r}. "
+                f"Choose from: recompute_full_layer, recompute_before_dispatch, no_recompute"
+            )
+
+        if self.repo_commit is None:
+            self.repo_commit = _detect_repo_commit()
         self.local_rank = int(os.getenv("LOCAL_RANK", "0"))
         self.global_rank = int(os.getenv("RANK", "0"))
         self.world_size = int(os.getenv("WORLD_SIZE", "1"))
         non_dp_size = (
-            self.ulysses_parallel_size * self.tensor_parallel_size
-            * self.ringattn_parallel_size * self.pipeline_parallel_size
+            self.ulysses_parallel_size
+            * self.tensor_parallel_size
+            * self.ringattn_parallel_size
+            * self.pipeline_parallel_size
         )
         if self.world_size % non_dp_size != 0:
             raise ValueError(
@@ -932,36 +982,25 @@ class TrainingArguments:
 
         # configure data parallel size
         if self.data_parallel_replicate_size > 0 and self.data_parallel_shard_size > 0:
-            assert (
-                self.data_parallel_size
-                == self.data_parallel_replicate_size * self.data_parallel_shard_size
-            ), f"data_parallel_size should be equal to data_parallel_replicate_size: {self.data_parallel_replicate_size} * data_parallel_shard_size: {self.data_parallel_shard_size}."
+            assert self.data_parallel_size == self.data_parallel_replicate_size * self.data_parallel_shard_size, (
+                f"data_parallel_size should be equal to data_parallel_replicate_size: {self.data_parallel_replicate_size} * data_parallel_shard_size: {self.data_parallel_shard_size}."
+            )
 
         elif self.data_parallel_replicate_size > 0:
             if self.data_parallel_size % self.data_parallel_replicate_size != 0:
-                raise ValueError(
-                    "data_parallel_size should be a multiple of data_parallel_replicate_size."
-                )
-            self.data_parallel_shard_size = (
-                self.data_parallel_size // self.data_parallel_replicate_size
-            )
+                raise ValueError("data_parallel_size should be a multiple of data_parallel_replicate_size.")
+            self.data_parallel_shard_size = self.data_parallel_size // self.data_parallel_replicate_size
 
         elif self.data_parallel_shard_size > 0:
             if self.data_parallel_size % self.data_parallel_shard_size != 0:
-                raise ValueError(
-                    "data_parallel_size should be a multiple of data_parallel_shard_size."
-                )
-            self.data_parallel_replicate_size = (
-                self.data_parallel_size // self.data_parallel_shard_size
-            )
+                raise ValueError("data_parallel_size should be a multiple of data_parallel_shard_size.")
+            self.data_parallel_replicate_size = self.data_parallel_size // self.data_parallel_shard_size
         else:
             self.data_parallel_replicate_size = 1
             self.data_parallel_shard_size = self.data_parallel_size
 
         # Calculate global batch size
-        self.global_batch_size = (
-            self.micro_batch_size * self.gradient_accumulation_steps * self.data_parallel_size
-        )
+        self.global_batch_size = self.micro_batch_size * self.gradient_accumulation_steps * self.data_parallel_size
         logger.info_rank0(
             f"Global batch size: {self.global_batch_size} = "
             f"micro_batch_size ({self.micro_batch_size}) * "
@@ -969,9 +1008,7 @@ class TrainingArguments:
             f"data_parallel_size ({self.data_parallel_size})"
         )
 
-        num_nodes = int(os.getenv("WORLD_SIZE", "1")) // int(
-            os.getenv("LOCAL_WORLD_SIZE", "1")
-        )
+        num_nodes = int(os.getenv("WORLD_SIZE", "1")) // int(os.getenv("LOCAL_WORLD_SIZE", "1"))
         if num_nodes > 1:
             logger.warning_rank0(
                 f"Detected {num_nodes} nodes. "
@@ -979,19 +1016,14 @@ class TrainingArguments:
                 "Otherwise, each node will save checkpoints to its local directory, which may cause inconsistencies or job failures."
             )
 
-        assert (
-            self.expert_parallel_size == 1 or self.init_device != "cpu"
-        ), "cpu init is not supported when enable ep. Please use `init_device = cuda` or `init_device = meta` instead."
+        assert self.expert_parallel_size == 1 or self.init_device != "cpu", (
+            "cpu init is not supported when enable ep. Please use `init_device = cuda` or `init_device = meta` instead."
+        )
 
         if self.data_parallel_mode == "fsdp2":
-            assert (
-                self.init_device == "meta"
-            ), "Please use init_device: meta for FSDP2 training"
-
+            assert self.init_device == "meta", "Please use init_device: meta for FSDP2 training"
 
         if self.load_checkpoint_path == "auto":
-            from .checkpoint_utils import get_checkpoint_path
-
             self.load_checkpoint_path = get_checkpoint_path(
                 output_dir=self.output_dir,
                 is_local_rank0=self.local_rank == 0,
@@ -1017,16 +1049,13 @@ class TrainingArguments:
 
         # Prevent CUDA_LAUNCH_BLOCKING from being accidentally enabled
         if not self.allow_cuda_launch_blocking:
-            assert (
-                not self.enable_full_determinism
-            ), "allow_cuda_launch_blocking is disabled but enable_full_determinism is enabled. enable_full_determinism would set CUDA_LAUNCH_BLOCKING to 1!"
-            cuda_launch_blocking_val = os.environ.get(
-                "CUDA_LAUNCH_BLOCKING", ""
-            ).strip()
-            assert (
-                cuda_launch_blocking_val != "1"
-            ), "CUDA_LAUNCH_BLOCKING=1 is set when allow_cuda_launch_blocking is not enabled!"
-
+            assert not self.enable_full_determinism, (
+                "allow_cuda_launch_blocking is disabled but enable_full_determinism is enabled. enable_full_determinism would set CUDA_LAUNCH_BLOCKING to 1!"
+            )
+            cuda_launch_blocking_val = os.environ.get("CUDA_LAUNCH_BLOCKING", "").strip()
+            assert cuda_launch_blocking_val != "1", (
+                "CUDA_LAUNCH_BLOCKING=1 is set when allow_cuda_launch_blocking is not enabled!"
+            )
 
 
 @dataclass
@@ -1039,7 +1068,9 @@ class DistillationArguments:
     )
     teacher_model_path: Optional[str] = field(
         default=None,
-        metadata={"help": "HuggingFace model ID or local path to teacher model (e.g., 'Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8')"},
+        metadata={
+            "help": "HuggingFace model ID or local path to teacher model (e.g., 'Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8')"
+        },
     )
     distillation_loss_type: str = field(
         default="forward_kl",
@@ -1094,23 +1125,29 @@ class LoRAArguments:
     )
     merge_lora_interval: int = field(
         default=0,
-        metadata={"help": "Merge LoRA delta into base weights every N training steps. "
-                  "For QLoRA: merge + re-quantize. For LoRA: merge into bf16 weight. "
-                  "0 = disabled."},
+        metadata={
+            "help": "Merge LoRA delta into base weights every N training steps. "
+            "For QLoRA: merge + re-quantize. For LoRA: merge into bf16 weight. "
+            "0 = disabled."
+        },
     )
     reset_optimizer_on_merge: bool = field(
         default=False,
-        metadata={"help": "ReLoRA-style optimizer reset after each LoRA merge. "
-                  "Clears optimizer states (momentum, variance) for LoRA parameters "
-                  "so Adam rebuilds from scratch for the re-initialized LoRA. "
-                  "Requires merge_lora_interval > 0."},
+        metadata={
+            "help": "ReLoRA-style optimizer reset after each LoRA merge. "
+            "Clears optimizer states (momentum, variance) for LoRA parameters "
+            "so Adam rebuilds from scratch for the re-initialized LoRA. "
+            "Requires merge_lora_interval > 0."
+        },
     )
     exclude_modules: Optional[List[str]] = field(
         default=None,
-        metadata={"help": "Modules to exclude from QLoRA injection (kept as bf16). "
-                  "When None, auto-detected from pre-quantized checkpoint config "
-                  "(exclude_modules / modules_to_not_convert). "
-                  "Example: ['lm_head', 'gate']"},
+        metadata={
+            "help": "Modules to exclude from QLoRA injection (kept as bf16). "
+            "When None, auto-detected from pre-quantized checkpoint config "
+            "(exclude_modules / modules_to_not_convert). "
+            "Example: ['lm_head', 'gate']"
+        },
     )
     enable_aqn: bool = field(
         default=False,
@@ -1129,9 +1166,7 @@ class InferArguments:
     )
     tokenizer_path: Optional[str | None] = field(
         default=None,
-        metadata={
-            "help": "Local path/HDFS path to the tokenizer. Defaults to `config_path`."
-        },
+        metadata={"help": "Local path/HDFS path to the tokenizer. Defaults to `config_path`."},
     )
     seed: int = field(
         default=42,
@@ -1223,7 +1258,7 @@ def _optional_int(value: str) -> Optional[int]:
     Returns:
         None if value represents null/None, otherwise parsed integer
     """
-    if value in ('null', 'None', 'none', ''):
+    if value in ("null", "None", "none", ""):
         return None
     return int(value)
 
@@ -1234,9 +1269,7 @@ def parse_args(rootclass: T) -> T:
 
     Based on: https://github.com/huggingface/transformers/blob/v4.40.0/src/transformers/hf_argparser.py#L266
     """
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     base_to_subclass = {}
     dict_fields = set()
 
@@ -1247,9 +1280,7 @@ def parse_args(rootclass: T) -> T:
         try:
             type_hints: Dict[str, type] = get_type_hints(subclass.default_factory)
         except Exception:
-            raise RuntimeError(
-                f"Type resolution failed for {subclass.default_factory}."
-            )
+            raise RuntimeError(f"Type resolution failed for {subclass.default_factory}.")
 
         for attr in fields(subclass.default_factory):
             if not attr.init:
@@ -1259,17 +1290,11 @@ def parse_args(rootclass: T) -> T:
             origin_type = getattr(attr_type, "__origin__", attr_type)
 
             # Handle Optional types first
-            if origin_type is Union or (
-                hasattr(types, "UnionType") and isinstance(origin_type, types.UnionType)
-            ):
-                if (
-                    len(attr_type.__args__) == 2 and type(None) in attr_type.__args__
-                ):  # Optional[X]
+            if origin_type is Union or (hasattr(types, "UnionType") and isinstance(origin_type, types.UnionType)):
+                if len(attr_type.__args__) == 2 and type(None) in attr_type.__args__:  # Optional[X]
                     # Extract the non-None type
                     attr_type = (
-                        attr_type.__args__[0]
-                        if isinstance(None, attr_type.__args__[1])
-                        else attr_type.__args__[1]
+                        attr_type.__args__[0] if isinstance(None, attr_type.__args__[1]) else attr_type.__args__[1]
                     )
                     origin_type = getattr(attr_type, "__origin__", attr_type)
 
@@ -1292,9 +1317,7 @@ def parse_args(rootclass: T) -> T:
         try:
             type_hints: Dict[str, type] = get_type_hints(subclass.default_factory)
         except Exception:
-            raise RuntimeError(
-                f"Type resolution failed for {subclass.default_factory}."
-            )
+            raise RuntimeError(f"Type resolution failed for {subclass.default_factory}.")
 
         for attr in fields(subclass.default_factory):
             if not attr.init:
@@ -1306,9 +1329,7 @@ def parse_args(rootclass: T) -> T:
             if isinstance(attr_type, str):
                 raise RuntimeError(f"Cannot resolve type {attr.type} of {attr.name}.")
 
-            if origin_type is Union or (
-                hasattr(types, "UnionType") and isinstance(origin_type, types.UnionType)
-            ):
+            if origin_type is Union or (hasattr(types, "UnionType") and isinstance(origin_type, types.UnionType)):
                 # if (
                 #     len(attr_type.__args__) != 2 or type(None) not in attr_type.__args__
                 # ):  # only allows Optional[X]
@@ -1320,24 +1341,18 @@ def parse_args(rootclass: T) -> T:
                     # Track if this is Optional[X] (Union with None)
                     is_optional = type(None) in attr_type.__args__
                     attr_type = (
-                        attr_type.__args__[0]
-                        if isinstance(None, attr_type.__args__[1])
-                        else attr_type.__args__[1]
+                        attr_type.__args__[0] if isinstance(None, attr_type.__args__[1]) else attr_type.__args__[1]
                     )
                     origin_type = getattr(attr_type, "__origin__", attr_type)
 
             parser_kwargs = attr.metadata.copy()
-            if origin_type is Literal or (
-                isinstance(attr_type, type) and issubclass(attr_type, Enum)
-            ):
+            if origin_type is Literal or (isinstance(attr_type, type) and issubclass(attr_type, Enum)):
                 if origin_type is Literal:
                     parser_kwargs["choices"] = attr_type.__args__
                 else:
                     parser_kwargs["choices"] = [x.value for x in attr_type]
 
-                parser_kwargs["type"] = _make_choice_type_function(
-                    parser_kwargs["choices"]
-                )
+                parser_kwargs["type"] = _make_choice_type_function(parser_kwargs["choices"])
 
                 if attr.default is not MISSING:
                     parser_kwargs["default"] = attr.default
@@ -1346,12 +1361,8 @@ def parse_args(rootclass: T) -> T:
 
             elif attr_type is bool or attr_type == Optional[bool]:
                 parser_kwargs["type"] = _string_to_bool
-                if attr_type is bool or (
-                    attr.default is not None and attr.default is not MISSING
-                ):
-                    parser_kwargs["default"] = (
-                        False if attr.default is MISSING else attr.default
-                    )
+                if attr_type is bool or (attr.default is not None and attr.default is not MISSING):
+                    parser_kwargs["default"] = False if attr.default is MISSING else attr.default
                     parser_kwargs["nargs"] = "?"
                     parser_kwargs["const"] = True
 
@@ -1372,9 +1383,11 @@ def parse_args(rootclass: T) -> T:
                     elif attr.default is MISSING:
                         parser_kwargs["required"] = True
                 else:
-                    # Regular list handling
+                    # Regular list handling. Optional[List[X]] uses nargs="*" so that
+                    # an empty list can be passed (e.g. --train.gradient_checkpointing_method
+                    # with no args). Non-optional lists keep nargs="+" (at least one item).
                     parser_kwargs["type"] = attr_type.__args__[0]
-                    parser_kwargs["nargs"] = "+"
+                    parser_kwargs["nargs"] = "*" if is_optional else "+"
                     if attr.default_factory is not MISSING:
                         parser_kwargs["default"] = attr.default_factory()
                     elif attr.default is MISSING:
@@ -1450,22 +1463,13 @@ def parse_args(rootclass: T) -> T:
                     # Handle list of dicts (like datasets)
                     parsed_list = json.loads(value)
                     if isinstance(parsed_list, list):
-                        value = [
-                            _convert_str_dict(item) if isinstance(item, dict) else item
-                            for item in parsed_list
-                        ]
+                        value = [_convert_str_dict(item) if isinstance(item, dict) else item for item in parsed_list]
                     else:
-                        raise ValueError(
-                            f"Expected a JSON array for {key}, but got {value}"
-                        )
+                        raise ValueError(f"Expected a JSON array for {key}, but got {value}")
                 else:
-                    raise ValueError(
-                        f"Expect a JSON string (dict or array) for {key}, but got {value}"
-                    )
+                    raise ValueError(f"Expect a JSON string (dict or array) for {key}, but got {value}")
             else:
-                raise ValueError(
-                    f"Expect a JSON string for dict/list argument {key}, but got {value}"
-                )
+                raise ValueError(f"Expect a JSON string for dict/list argument {key}, but got {value}")
 
         base, name = key.split(".", maxsplit=1)
         parse_result[base][name] = value
@@ -1494,6 +1498,7 @@ def save_args(args: T, output_path: str) -> None:
 @dataclass
 class Arguments:
     """Main arguments container combining model, data, and training arguments."""
+
     model: "ModelArguments" = field(default_factory=ModelArguments)
     data: "DataArguments" = field(default_factory=DataArguments)
     train: "TrainingArguments" = field(default_factory=TrainingArguments)

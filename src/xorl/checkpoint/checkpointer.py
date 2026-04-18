@@ -1,3 +1,4 @@
+import gc
 import json
 import os
 from abc import ABC, abstractmethod
@@ -6,6 +7,7 @@ from typing import Any, Dict, List, Optional, Set
 import torch
 import torch.distributed as dist
 from torch.distributed._tensor import DeviceMesh, DTensor, Shard
+from torch.distributed.checkpoint.state_dict import StateDictOptions
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils.checkpoint_utils import _GLOBAL_STEP_PREFIX
@@ -100,8 +102,7 @@ def _validate_checkpoint_compatibility(
     # If no metadata file exists (old checkpoint), skip validation
     if not os.path.exists(metadata_path):
         logger.warning(
-            f"No checkpoint metadata found at {metadata_path}. "
-            "Skipping compatibility check (old checkpoint format)."
+            f"No checkpoint metadata found at {metadata_path}. Skipping compatibility check (old checkpoint format)."
         )
         return {"validated": False, "reason": "no_metadata"}
 
@@ -225,7 +226,6 @@ class ModelState(Stateful):
         parameters (e.g., loading from a base model checkpoint into a LoRA-enabled model).
         Missing parameters (like lora_A, lora_B) will retain their initialized values.
         """
-        from torch.distributed.checkpoint.state_dict import StateDictOptions
 
         model_state_dict = state_dict
         if self.should_ep_aware:
@@ -234,9 +234,7 @@ class ModelState(Stateful):
         # Use strict=False to allow missing LoRA parameters when loading from
         # a checkpoint that was saved before LoRA was injected
         options = StateDictOptions(strict=False)
-        incompatible = set_model_state_dict(
-            model=self.model, model_state_dict=model_state_dict, options=options
-        )
+        incompatible = set_model_state_dict(model=self.model, model_state_dict=model_state_dict, options=options)
 
         # Log missing/unexpected keys for debugging
         if incompatible.missing_keys:
@@ -245,13 +243,10 @@ class ModelState(Stateful):
             lora_missing = [k for k in incompatible.missing_keys if "lora_" in k]
             if lora_missing:
                 logger.info_rank0(
-                    f"LoRA parameters not in checkpoint (will use initialized values): "
-                    f"{len(lora_missing)} params"
+                    f"LoRA parameters not in checkpoint (will use initialized values): {len(lora_missing)} params"
                 )
             if non_lora_missing:
-                logger.warning(
-                    f"Missing non-LoRA keys in checkpoint: {non_lora_missing}"
-                )
+                logger.warning(f"Missing non-LoRA keys in checkpoint: {non_lora_missing}")
         if incompatible.unexpected_keys:
             logger.warning(f"Unexpected keys in checkpoint: {incompatible.unexpected_keys}")
 
@@ -295,12 +290,12 @@ class ModelState(Stateful):
 
         return state_dict
 
-    def _restore_ep_dim(self, orgin_tensor: torch.Tensor, device_mesh: DeviceMesh):
+    def _restore_ep_dim(self, origin_tensor: torch.Tensor, device_mesh: DeviceMesh):
         """
         Restore EP dim so that DCP can be aware about EP ranks
 
         args:
-            orgin_tensor (torch.Tensor): The orgin tensor.
+            origin_tensor (torch.Tensor): The origin tensor.
             device_mesh (DeviceMesh): The ep device mesh.
             shard (Shard): The shard info, default Shard(0).
 
@@ -308,14 +303,14 @@ class ModelState(Stateful):
         assert device_mesh.ndim == 2, f"global_mesh.ndim must be 2, got {device_mesh.ndim}"
         ep_mesh = device_mesh["ep"]
 
-        if orgin_tensor.__class__.__name__ == "DTensor":
+        if origin_tensor.__class__.__name__ == "DTensor":
             # EP+FSDP2
             dtensor = DTensor.from_local(
-                orgin_tensor._local_tensor, device_mesh=device_mesh, placements=[Shard(0), Shard(1)]
+                origin_tensor._local_tensor, device_mesh=device_mesh, placements=[Shard(0), Shard(1)]
             )
-        elif orgin_tensor.__class__.__name__ == "Tensor":
+        elif origin_tensor.__class__.__name__ == "Tensor":
             # If there is no FSDP
-            dtensor = DTensor.from_local(orgin_tensor, device_mesh=ep_mesh, placements=[Shard(0)])
+            dtensor = DTensor.from_local(origin_tensor, device_mesh=ep_mesh, placements=[Shard(0)])
 
         return dtensor
 
@@ -334,7 +329,7 @@ class ModelState(Stateful):
             tensor_to_put = loaded_tensor.to_local()
         else:
             raise RuntimeError(
-                f"Expect EP paramters from checkpoints to be DTensor with 1-dim (no FSDP) or 2-dim (EP+FSDP), got {loaded_tensor}"
+                f"Expect EP parameters from checkpoints to be DTensor with 1-dim (no FSDP) or 2-dim (EP+FSDP), got {loaded_tensor}"
             )
 
         return tensor_to_put
@@ -480,7 +475,7 @@ class DistributedCheckpointer(CheckpointerBase):
         checkpoint_dir = f"{path}/{_GLOBAL_STEP_PREFIX}{global_steps}" if global_steps else path
         os.makedirs(checkpoint_dir, exist_ok=True)
 
-        # saving extra_state first to gurantee that every saved model/optimizer ckpts have their extra_state saved before them
+        # saving extra_state first to guarantee that every saved model/optimizer ckpts have their extra_state saved before them
         if "extra_state" in state:
             extra_state_dir = os.path.join(checkpoint_dir, _EXTRA_STATE_DIR)
             os.makedirs(extra_state_dir, exist_ok=True)
@@ -543,7 +538,6 @@ class DistributedCheckpointer(CheckpointerBase):
             save_state["optimizer"].optimizer = None
         del save_state
 
-        import gc
         gc.collect()
         gc.collect()  # Second pass for cyclic references
         torch.cuda.empty_cache()

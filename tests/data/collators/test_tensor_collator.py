@@ -6,6 +6,7 @@ import torch
 
 from xorl.data.collators import ToTensorCollator
 
+
 pytestmark = [pytest.mark.cpu, pytest.mark.collator]
 
 
@@ -17,7 +18,9 @@ class TestToTensorCollator:
         collator = ToTensorCollator()
 
         # Lists to tensors
-        result = collator([{"input_ids": [1, 2, 3], "labels": [4, 5, 6]}, {"input_ids": [7, 8, 9], "labels": [10, 11, 12]}])
+        result = collator(
+            [{"input_ids": [1, 2, 3], "labels": [4, 5, 6]}, {"input_ids": [7, 8, 9], "labels": [10, 11, 12]}]
+        )
         assert isinstance(result, list) and len(result) == 2
         assert isinstance(result[0]["input_ids"], torch.Tensor) and result[0]["input_ids"].shape == (3,)
         assert torch.equal(result[0]["input_ids"], torch.tensor([1, 2, 3]))
@@ -55,7 +58,17 @@ class TestToTensorCollator:
         assert collator([]) == {}
 
         # Dtype inference
-        result_dtype = collator([{"input_ids": [1, 2, 3], "labels": [4, 5, 6], "position_ids": [0, 1, 2], "attention_mask": [1, 1, 1], "other_field": [1.0, 2.0, 3.0]}])
+        result_dtype = collator(
+            [
+                {
+                    "input_ids": [1, 2, 3],
+                    "labels": [4, 5, 6],
+                    "position_ids": [0, 1, 2],
+                    "attention_mask": [1, 1, 1],
+                    "other_field": [1.0, 2.0, 3.0],
+                }
+            ]
+        )
         assert result_dtype[0]["input_ids"].dtype == torch.long
         assert result_dtype[0]["labels"].dtype == torch.long
         assert result_dtype[0]["position_ids"].dtype == torch.long
@@ -63,7 +76,14 @@ class TestToTensorCollator:
         assert result_dtype[0]["other_field"].dtype in [torch.float32, torch.float64]
 
         # Numpy dtype preservation
-        result_np = collator([{"input_ids": np.array([1, 2, 3], dtype=np.int32), "embeddings": np.array([1.0, 2.0, 3.0], dtype=np.float32)}])
+        result_np = collator(
+            [
+                {
+                    "input_ids": np.array([1, 2, 3], dtype=np.int32),
+                    "embeddings": np.array([1.0, 2.0, 3.0], dtype=np.float32),
+                }
+            ]
+        )
         assert result_np[0]["embeddings"].dtype == torch.float32
 
         # Batch size one
@@ -96,15 +116,30 @@ class TestToTensorCollator:
         collator = ToTensorCollator()
 
         # Different lengths fallback
-        result = collator([{"input_ids": [1, 2, 3], "labels": [4, 5, 6]}, {"input_ids": [7, 8, 9, 10, 11], "labels": [12, 13, 14, 15, 16]}])
+        result = collator(
+            [
+                {"input_ids": [1, 2, 3], "labels": [4, 5, 6]},
+                {"input_ids": [7, 8, 9, 10, 11], "labels": [12, 13, 14, 15, 16]},
+            ]
+        )
         assert isinstance(result, list)
         assert result[0]["input_ids"].shape == (3,)
         assert result[1]["input_ids"].shape == (5,)
 
         # Packed sequences (same length, should be stacked)
         packed = [
-            {"input_ids": [1, 2, 3, 101, 4, 5, 6, 102], "labels": [-100, -100, 7, -100, -100, 8, 9, -100], "position_ids": [0, 1, 2, 3, 0, 1, 2, 3], "length": 8},
-            {"input_ids": [10, 11, 12, 101, 13, 14, 15, 16], "labels": [-100, 15, 16, -100, 17, 18, 19, 20], "position_ids": [0, 1, 2, 0, 1, 2, 3, 4], "length": 8},
+            {
+                "input_ids": [1, 2, 3, 101, 4, 5, 6, 102],
+                "labels": [-100, -100, 7, -100, -100, 8, 9, -100],
+                "position_ids": [0, 1, 2, 3, 0, 1, 2, 3],
+                "length": 8,
+            },
+            {
+                "input_ids": [10, 11, 12, 101, 13, 14, 15, 16],
+                "labels": [-100, 15, 16, -100, 17, 18, 19, 20],
+                "position_ids": [0, 1, 2, 0, 1, 2, 3, 4],
+                "length": 8,
+            },
         ]
         result_packed = collator(packed)
         assert result_packed[0]["input_ids"].shape == (8,)

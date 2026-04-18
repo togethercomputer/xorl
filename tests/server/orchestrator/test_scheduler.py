@@ -11,14 +11,14 @@ This test suite verifies the Scheduler and FIFO scheduling policy:
 
 import pytest
 
+
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
 import time
 
 from xorl.server.orchestrator.scheduler import (
-    Scheduler,
     FIFOPolicy,
     ScheduledRequest,
-    SchedulingPolicy,
+    Scheduler,
 )
 from xorl.server.protocol.api_orchestrator import (
     OrchestratorRequest,
@@ -202,17 +202,29 @@ def test_fifo_policy_order_remove_and_clear():
     """Test FIFO ordering, remove, and clear operations."""
     policy = FIFOPolicy()
     for i in range(5):
-        policy.add_request(ScheduledRequest(request=OrchestratorRequest(
-            request_id=f"req-{i}", request_type=RequestType.ADD, operation="test",
-        )))
+        policy.add_request(
+            ScheduledRequest(
+                request=OrchestratorRequest(
+                    request_id=f"req-{i}",
+                    request_type=RequestType.ADD,
+                    operation="test",
+                )
+            )
+        )
 
     for i in range(5):
         assert policy.get_next_request().request_id == f"req-{i}"
 
     for i in range(5):
-        policy.add_request(ScheduledRequest(request=OrchestratorRequest(
-            request_id=f"r2-{i}", request_type=RequestType.ADD, operation="test",
-        )))
+        policy.add_request(
+            ScheduledRequest(
+                request=OrchestratorRequest(
+                    request_id=f"r2-{i}",
+                    request_type=RequestType.ADD,
+                    operation="test",
+                )
+            )
+        )
     assert policy.remove_request("r2-0") is True and policy.size() == 4
     assert policy.get_next_request().request_id == "r2-1"
 

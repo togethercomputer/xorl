@@ -30,7 +30,7 @@ train:
   # batch size
   micro_batch_size: 1
   gradient_accumulation_steps: 1
-  
+
   optimizer: adamw
   # lr and warmup
   lr: 1.0e-5

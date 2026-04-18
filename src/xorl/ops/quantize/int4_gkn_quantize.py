@@ -11,15 +11,18 @@ Scales output: [K//group_size, N] — one scale per group per column.
 from typing import Tuple
 
 import torch
-from torch import Tensor
 import triton
 import triton.language as tl
+from torch import Tensor
 
 
 @triton.jit
 def _int4_quantize_gkn_kernel(
-    X, Out, Scale,
-    K, N,
+    X,
+    Out,
+    Scale,
+    K,
+    N,
     GROUP_SIZE: tl.constexpr,
     TILE_N: tl.constexpr,
 ):
@@ -74,8 +77,11 @@ def _int4_quantize_gkn_kernel(
 
 @triton.jit
 def _int4_dequantize_gkn_kernel(
-    Packed, Scale, Out,
-    K, N,
+    Packed,
+    Scale,
+    Out,
+    K,
+    N,
     GROUP_SIZE: tl.constexpr,
     TILE_N: tl.constexpr,
 ):
@@ -105,7 +111,7 @@ def _int4_dequantize_gkn_kernel(
     packed = tl.load(pack_addrs, mask=pack_mask, other=0).to(tl.int32)  # [GS//2, TN]
 
     # Unpack lo/hi nibbles
-    lo = (packed & 0xF).to(tl.float32)   # even K values [GS//2, TN]
+    lo = (packed & 0xF).to(tl.float32)  # even K values [GS//2, TN]
     hi = ((packed >> 4) & 0xF).to(tl.float32)  # odd K values [GS//2, TN]
 
     # Dequantize: (nibble - 8) * scale → bf16
@@ -155,17 +161,21 @@ def int4_quantize_gkn(x: Tensor, group_size: int = -1) -> Tuple[Tensor, Tensor]:
     grid = (num_groups, (N + TILE_N - 1) // TILE_N)
 
     _int4_quantize_gkn_kernel[grid](
-        x.contiguous(), packed, scales,
-        K, N,
-        gs, TILE_N,
+        x.contiguous(),
+        packed,
+        scales,
+        K,
+        N,
+        gs,
+        TILE_N,
         num_warps=4,
     )
     return packed, scales
 
 
-def int4_dequantize_gkn(packed: Tensor, scales: Tensor, K: int, N: int,
-                         group_size: int = -1,
-                         out_dtype: torch.dtype = torch.bfloat16) -> Tensor:
+def int4_dequantize_gkn(
+    packed: Tensor, scales: Tensor, K: int, N: int, group_size: int = -1, out_dtype: torch.dtype = torch.bfloat16
+) -> Tensor:
     """Dequantize INT4 packed [K//2, N] back to [K, N] in G,K,N format.
 
     Args:
@@ -191,9 +201,13 @@ def int4_dequantize_gkn(packed: Tensor, scales: Tensor, K: int, N: int,
     scales_f32 = scales.float() if scales.dtype != torch.float32 else scales
 
     _int4_dequantize_gkn_kernel[grid](
-        packed.contiguous(), scales_f32.contiguous(), result,
-        K, N,
-        gs, TILE_N,
+        packed.contiguous(),
+        scales_f32.contiguous(),
+        result,
+        K,
+        N,
+        gs,
+        TILE_N,
         num_warps=4,
     )
 

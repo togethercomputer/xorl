@@ -8,17 +8,16 @@ skips quantized keys when is_prequantized=True.
 """
 
 import json
-import os
-import tempfile
 
 import pytest
 import torch
 
+
 pytestmark = [pytest.mark.cpu]
 
 from xorl.models.checkpoint_handlers.buffers import (
-    detect_prequantized_checkpoint,
     detect_prequantized_block_fp8_checkpoint,
+    detect_prequantized_checkpoint,
     get_prequantized_exclude_modules,
 )
 from xorl.models.transformers.qwen3.checkpoint_handler import Qwen3CheckpointHandler
@@ -33,10 +32,13 @@ class TestDetectPrequantizedCheckpoint:
         # -- Positive cases --
         # modelopt nested format
         with open(tmp_path / "hf_quant_config.json", "w") as f:
-            json.dump({
-                "producer": {"name": "modelopt", "version": "0.34.1"},
-                "quantization": {"quant_algo": "NVFP4", "group_size": 16, "exclude_modules": ["lm_head"]},
-            }, f)
+            json.dump(
+                {
+                    "producer": {"name": "modelopt", "version": "0.34.1"},
+                    "quantization": {"quant_algo": "NVFP4", "group_size": 16, "exclude_modules": ["lm_head"]},
+                },
+                f,
+            )
         assert detect_prequantized_checkpoint(str(tmp_path)) is True
 
         # flat format
@@ -93,30 +95,47 @@ class TestDetectPrequantizedCheckpoint:
         d1 = tmp_path / "fp8"
         d1.mkdir()
         with open(d1 / "config.json", "w") as f:
-            json.dump({"quantization_config": {
-                "quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128],
-            }}, f)
+            json.dump(
+                {
+                    "quantization_config": {
+                        "quant_method": "fp8",
+                        "fmt": "e4m3",
+                        "weight_block_size": [128, 128],
+                    }
+                },
+                f,
+            )
         assert detect_prequantized_block_fp8_checkpoint(str(d1)) is True
 
         # safetensors index with weight_scale_inv
         d2 = tmp_path / "safe"
         d2.mkdir()
         with open(d2 / "model.safetensors.index.json", "w") as f:
-            json.dump({"weight_map": {
-                "model.layers.0.self_attn.q_proj.weight": "s.safetensors",
-                "model.layers.0.self_attn.q_proj.weight_scale_inv": "s.safetensors",
-            }}, f)
+            json.dump(
+                {
+                    "weight_map": {
+                        "model.layers.0.self_attn.q_proj.weight": "s.safetensors",
+                        "model.layers.0.self_attn.q_proj.weight_scale_inv": "s.safetensors",
+                    }
+                },
+                f,
+            )
         assert detect_prequantized_block_fp8_checkpoint(str(d2)) is True
 
         # NVFP4 index (weight_scale + weight_scale_2) not FP8
         d3 = tmp_path / "nvfp4"
         d3.mkdir()
         with open(d3 / "model.safetensors.index.json", "w") as f:
-            json.dump({"weight_map": {
-                "m.q_proj.weight": "s.safetensors",
-                "m.q_proj.weight_scale": "s.safetensors",
-                "m.q_proj.weight_scale_2": "s.safetensors",
-            }}, f)
+            json.dump(
+                {
+                    "weight_map": {
+                        "m.q_proj.weight": "s.safetensors",
+                        "m.q_proj.weight_scale": "s.safetensors",
+                        "m.q_proj.weight_scale_2": "s.safetensors",
+                    }
+                },
+                f,
+            )
         assert detect_prequantized_block_fp8_checkpoint(str(d3)) is False
 
         d4 = tmp_path / "wrong_bs"
@@ -167,8 +186,11 @@ class TestQwen3DenseCheckpointHandlerPrequantized:
 
     def _make_handler(self, is_prequantized, **kwargs):
         return Qwen3CheckpointHandler(
-            num_attention_heads=64, num_key_value_heads=8, head_dim=128,
-            is_prequantized=is_prequantized, **kwargs,
+            num_attention_heads=64,
+            num_key_value_heads=8,
+            head_dim=128,
+            is_prequantized=is_prequantized,
+            **kwargs,
         )
 
     def test_prequantized_skip_and_on_load(self):
@@ -273,8 +295,11 @@ class TestCheckpointHandlerExcludeModules:
     def test_dense_handler_exclude_modules(self):
         """Excluded modules not skipped in skip_fn and on_load_weight; non-excluded skipped; empty/no exclude normal."""
         handler = Qwen3CheckpointHandler(
-            num_attention_heads=64, num_key_value_heads=8, head_dim=128,
-            is_prequantized=True, exclude_modules={"down_proj"},
+            num_attention_heads=64,
+            num_key_value_heads=8,
+            head_dim=128,
+            is_prequantized=True,
+            exclude_modules={"down_proj"},
         )
         skip_fn = handler.get_skip_key_fn()
         assert not skip_fn("model.layers.0.mlp.down_proj.weight")
@@ -288,8 +313,11 @@ class TestCheckpointHandlerExcludeModules:
 
         # Aux keys for excluded module pass through
         handler2 = Qwen3CheckpointHandler(
-            num_attention_heads=64, num_key_value_heads=8, head_dim=128,
-            is_prequantized=True, exclude_modules={"o_proj"},
+            num_attention_heads=64,
+            num_key_value_heads=8,
+            head_dim=128,
+            is_prequantized=True,
+            exclude_modules={"o_proj"},
         )
         sfn2 = handler2.get_skip_key_fn()
         assert not sfn2("model.layers.0.self_attn.o_proj.weight")
@@ -300,23 +328,34 @@ class TestCheckpointHandlerExcludeModules:
         # Empty/no exclude_modules: all quant weight keys skipped
         for kwargs in [{"exclude_modules": set()}, {}]:
             h = Qwen3CheckpointHandler(
-                num_attention_heads=64, num_key_value_heads=8, head_dim=128,
-                is_prequantized=True, **kwargs,
+                num_attention_heads=64,
+                num_key_value_heads=8,
+                head_dim=128,
+                is_prequantized=True,
+                **kwargs,
             )
             assert h.get_skip_key_fn()("model.layers.0.mlp.down_proj.weight")
 
     def test_moe_handler_exclude_modules(self):
         """MoE handler: excluded keys pass through, non-excluded skipped; on_load_weight consistent."""
         handler = Qwen3MoeCheckpointHandler(
-            num_experts=64, num_attention_heads=64, num_key_value_heads=8, head_dim=128,
-            is_prequantized=True, exclude_modules={"gate"},
+            num_experts=64,
+            num_attention_heads=64,
+            num_key_value_heads=8,
+            head_dim=128,
+            is_prequantized=True,
+            exclude_modules={"gate"},
         )
         assert not handler.get_skip_key_fn()("model.layers.0.mlp.gate.weight")
         assert handler.get_skip_key_fn()("model.layers.0.self_attn.o_proj.weight")
 
         handler2 = Qwen3MoeCheckpointHandler(
-            num_experts=64, num_attention_heads=64, num_key_value_heads=8, head_dim=128,
-            is_prequantized=True, exclude_modules={"down_proj"},
+            num_experts=64,
+            num_attention_heads=64,
+            num_key_value_heads=8,
+            head_dim=128,
+            is_prequantized=True,
+            exclude_modules={"down_proj"},
         )
         tensor = torch.randn(1024, 512)
         result = handler2.on_load_weight("model.layers.0.mlp.shared_expert.down_proj.weight", tensor)

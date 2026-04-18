@@ -35,18 +35,6 @@ def string_to_op(op_string: str) -> Any:
 
     current = torch.ops
 
-    # Special handling: ensure accessing aten operations by first trying to trigger registration
-    if parts[0] == "aten":
-        try:
-            # Try to access a basic aten operation to trigger module loading
-            _ = torch.ops.aten.add
-        except AttributeError:
-            # If cannot access aten, may need to import related modules
-            try:
-                import torch._C._dispatch
-            except ImportError:
-                pass
-
     for i, part in enumerate(parts):
         if hasattr(current, part):
             current = getattr(current, part)
@@ -113,10 +101,3 @@ def _check_torch_ops_availability():
         logger.info_rank0("✓ torch.ops.aten available")
     except AttributeError as e:
         logger.info_rank0(f"✗ torch.ops.aten not available: {e}")
-        logger.info_rank0("Trying to import necessary modules...")
-        try:
-            import torch._C._dispatch
-
-            logger.info_rank0("✓ Successfully imported torch._C._dispatch")
-        except ImportError as e:
-            logger.info_rank0(f"✗ Cannot import torch._C._dispatch: {e}")

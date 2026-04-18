@@ -2,9 +2,9 @@ __version__ = "0.2.9"
 
 import os
 
+from .cross_entropy import cross_entropy
 from .rmsnorm import rmsnorm
 from .softmax import softmax
-from .cross_entropy import cross_entropy
 
 
 if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:

@@ -3,29 +3,25 @@ Multipack Batch Sampler - An efficient batch sampler for packing variable-length
 into fixed-capacity batches to optimize memory usage and training throughput.
 """
 
-from typing import Any, Dict, List, Optional, Union, Callable
-import gc
-import hashlib
-import json
-import math
 import os
-import pickle
+import shutil
 import time
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import cpu_count, get_context
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Any, Callable, Dict, List, Optional
 
-from torch.utils.data import Dataset
-from datasets import Dataset as HFDataset
-from transformers import PreTrainedTokenizer
 import numba
 import numpy as np
+from datasets import Dataset as HFDataset
+from torch.utils.data import Dataset
+from transformers import PreTrainedTokenizer
 
-from ...utils import logging
 from ...arguments import Arguments
-from .shared import get_prepared_dataset_path
+from ...utils import logging
 from .hash import generate_dataset_hash_from_config, generate_packing_hash
+from .shared import get_prepared_dataset_path
+
 
 LOG = logging.get_logger(__name__)
 
@@ -97,10 +93,7 @@ def pack_group(
         # Try to place sequence in existing bins
         add_new_bin = True
         for bin_idx, _ in enumerate(bins_remaining_space):
-            if (
-                bins_remaining_space[bin_idx] >= size
-                and len(bins_assigned_sequences[bin_idx]) < bin_size
-            ):
+            if bins_remaining_space[bin_idx] >= size and len(bins_assigned_sequences[bin_idx]) < bin_size:
                 bins_remaining_space[bin_idx] -= size
                 bins_assigned_sequences[bin_idx].append(global_idx)
                 add_new_bin = False
@@ -126,9 +119,7 @@ def _process_group(
 ) -> list[list[int]]:
     """Standalone function for multiprocessing."""
     group_lengths, start_idx, bin_capacity, max_bins, bin_size, safe_mode = args
-    return pack_group(
-        group_lengths, start_idx, bin_capacity, max_bins, bin_size, safe_mode
-    )
+    return pack_group(group_lengths, start_idx, bin_capacity, max_bins, bin_size, safe_mode)
 
 
 def pack_parallel(
@@ -178,9 +169,7 @@ def pack_parallel(
                 f"Failed to get multiprocessing context '{mp_start_method}'. "
                 f"Falling back to default. Available: {get_context().get_all_start_methods()}"
             )
-            mp_ctx = (
-                None  # Fallback to default context if specified one is not available
-            )
+            mp_ctx = None  # Fallback to default context if specified one is not available
 
     if num_processes == 1:
         LOG.debug("Using single process for pack_parallel, running sequentially.")
@@ -190,9 +179,7 @@ def pack_parallel(
     else:
         # Use ProcessPoolExecutor only if num_processes > 1
         # Pass mp_context if available
-        with ProcessPoolExecutor(
-            max_workers=num_processes, mp_context=mp_ctx
-        ) as executor:
+        with ProcessPoolExecutor(max_workers=num_processes, mp_context=mp_ctx) as executor:
             for group_bins in executor.map(_process_group, tasks):
                 all_bins.extend(group_bins)
 
@@ -312,9 +299,7 @@ def drop_no_trainable_tokens(sample: Dict[str, Any]):
 
 
 # drop samples with no trainable tokens
-def filter_dataset_with_logging(
-    dataset: HFDataset, filter_func: Callable, dataset_name: str, num_proc: int
-):
+def filter_dataset_with_logging(dataset: HFDataset, filter_func: Callable, dataset_name: str, num_proc: int):
     """Filter dataset and log dropped samples."""
     try:
         prior_len = len(dataset)
@@ -331,16 +316,12 @@ def filter_dataset_with_logging(
     if prior_len:
         dropped = prior_len - len(filtered_dataset)
         if dropped:
-            LOG.warning(
-                f"Dropped {dropped} samples with no trainable tokens from {dataset_name} dataset"
-            )
+            LOG.warning(f"Dropped {dropped} samples with no trainable tokens from {dataset_name} dataset")
 
     return filtered_dataset
 
 
-def process_datasets_for_packing(
-    args: Arguments, train_dataset: HFDataset, eval_dataset: HFDataset | None = None
-):
+def process_datasets_for_packing(args: Arguments, train_dataset: HFDataset, eval_dataset: HFDataset | None = None):
     # drop samples with no trainable tokens
     train_dataset = filter_dataset_with_logging(
         train_dataset, drop_no_trainable_tokens, "train", args.data.dataset_num_proc
@@ -370,16 +351,16 @@ def process_datasets_for_packing(
 
 
 class PackingDataset(Dataset):
-    def __init__(self, args: Arguments, tokenizer: PreTrainedTokenizer, dataset: HFDataset, split: str = "train") -> None:
+    def __init__(
+        self, args: Arguments, tokenizer: PreTrainedTokenizer, dataset: HFDataset, split: str = "train"
+    ) -> None:
         self.dataset: HFDataset = dataset
         self.args: Arguments = args
 
         datasets_configs = args.data.datasets if split == "train" else args.data.test_datasets
-        self.dataset_hash: str = generate_dataset_hash_from_config(
-            args, datasets_configs, tokenizer.name_or_path
-        )
+        self.dataset_hash: str = generate_dataset_hash_from_config(args, datasets_configs, tokenizer.name_or_path)
         self.prepared_dataset_path: str | None = get_prepared_dataset_path(args, self.dataset_hash)
-        
+
         # Get sequence lengths from the dataset
         assert "length" in self.dataset.features, "Length column not found in dataset"
         self.sequence_lengths: np.ndarray = np.array(dataset["length"])
@@ -414,7 +395,7 @@ class PackingDataset(Dataset):
         """Get the path where bins should be cached as HF dataset."""
         if self.prepared_dataset_path is None:
             return None
-        
+
         # Include packing args hash in the cache path
         packing_hash = generate_packing_hash(
             self.args.data.sample_packing_method,
@@ -440,7 +421,7 @@ class PackingDataset(Dataset):
             # So if the file exists and loads successfully, it's valid
 
             # Extract bins from the dataset
-            bins = bins_dataset['bins']
+            bins = bins_dataset["bins"]
             LOG.info(f"Loaded {len(bins)} cached bins from {cache_path}")
             return bins
 
@@ -453,35 +434,39 @@ class PackingDataset(Dataset):
         cache_path = self._get_bins_cache_path()
         if cache_path is None:
             return
-            
+
         # Ensure the directory exists
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        
+        if cache_path.exists():
+            shutil.rmtree(cache_path, ignore_errors=True)
+
         # Create a HF dataset from the bins
-        bins_dataset = HFDataset.from_dict({
-            'bins': bins
-        })
-        
+        bins_dataset = HFDataset.from_dict({"bins": bins})
+
         # Add metadata to the dataset info
         bins_dataset.info.description = (
             f"Packing bins for dataset fingerprint: {self.dataset_hash}"
             f" | packing method: {self.args.data.sample_packing_method}"
             f" | bin capacity: {self.bin_capacity}"
         )
-        
+
         # Save the dataset
         num_workers = max(self.args.data.dataset_num_proc // 8, 1)
         bins_dataset.save_to_disk(str(cache_path), num_proc=num_workers)
-            
+
         LOG.info(f"Saved bins cache to {cache_path}")
-            
 
     def _load_or_compute_bins(self) -> List[List[int]]:
-        """Load cached bins or compute new ones with distributed coordination."""
-        # Get rank from environment variable (set by torchrun/distributed launcher)
+        """Load cached bins or compute new ones.
+
+        Distributed synchronization (barrier) is handled by the caller
+        (``prepare_datasets``), NOT here.  ``prepare_datasets`` calls
+        ``_load_datasets`` on rank 0 first, then barriers, then on
+        non-zero ranks.  Adding a barrier inside this function would
+        cause an NCCL collective mismatch because different ranks call
+        this function at different times.
+        """
         rank = int(os.environ.get("RANK", "0"))
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
         # Try to load from cache first
         cached_bins = self._load_cached_bins()
@@ -490,52 +475,36 @@ class PackingDataset(Dataset):
 
         cache_path = self._get_bins_cache_path()
 
-        # Use rank 0 to compute and save, others wait and load
         if rank == 0:
-            # Rank 0 computes new bins
+            # Rank 0 computes new bins and saves to cache.
+            # Non-zero ranks will load from cache after the caller's
+            # barrier ensures the cache file is visible.
             LOG.info("Computing new bins...")
             bins = self._compute_bins()
 
-            # Save to cache for future use
             if cache_path is not None:
                 self._save_bins_cache(bins)
         else:
-            # Other ranks wait for rank 0 to finish
+            # Non-zero ranks: try loading from cache (written by rank 0).
+            # The caller's barrier guarantees rank 0 has finished writing
+            # before non-zero ranks reach this point.
             if cache_path is not None:
-                LOG.info(f"Rank {rank} waiting for rank 0 to compute bins...")
-                # Wait for cache file to be created
-                max_wait_time = 3600  # 1 hour max wait
-                wait_interval = 5  # Check every 5 seconds
-                waited = 0
+                bins = None
+                max_retries = 10
+                for attempt in range(max_retries):
+                    bins = self._load_cached_bins()
+                    if bins is not None:
+                        break
+                    if attempt < max_retries - 1:
+                        LOG.info(f"Rank {rank} retry {attempt + 1}/{max_retries} loading bins...")
+                        time.sleep(2)
 
-                while not cache_path.exists() and waited < max_wait_time:
-                    time.sleep(wait_interval)
-                    waited += wait_interval
-
-                if cache_path.exists():
-                    # Wait a bit more to ensure rank 0 finished writing
-                    # (HF datasets creates the directory first, then writes files)
-                    time.sleep(2)
-
-                    # Try to load with retries
-                    bins = None
-                    max_retries = 3
-                    for attempt in range(max_retries):
-                        bins = self._load_cached_bins()
-                        if bins is not None:
-                            break
-                        if attempt < max_retries - 1:
-                            LOG.info(f"Rank {rank} retry {attempt + 1}/{max_retries} loading bins...")
-                            time.sleep(2)
-
-                    if bins is None:
-                        raise RuntimeError(
-                            f"Rank {rank} failed to load bins cached by rank 0 after {max_retries} retries. "
-                            f"Cache path: {cache_path}"
-                        )
-                    LOG.info(f"Rank {rank} loaded {len(bins)} bins from cache")
-                else:
-                    raise RuntimeError(f"Rank {rank} timed out waiting for rank 0 to compute bins")
+                if bins is None:
+                    raise RuntimeError(
+                        f"Rank {rank} failed to load bins cached by rank 0 after {max_retries} retries. "
+                        f"Cache path: {cache_path}"
+                    )
+                LOG.info(f"Rank {rank} loaded {len(bins)} bins from cache")
             else:
                 # No cache path, fall back to computing on all ranks
                 LOG.warning(f"No cache path available, rank {rank} computing bins independently")
@@ -549,27 +518,22 @@ class PackingDataset(Dataset):
             return self._compute_sequential_bins()
         else:  # default to multipack
             return self._compute_multipack_bins()
-    
+
     def _compute_sequential_bins(self) -> List[List[int]]:
         """Compute bins using sequential packing."""
         # Use the sequential allocator from the existing code
         rank: int = 0  # For single-process case
         num_ranks: int = 1  # For single-process case
-        
-        bins, _, _ = allocate_sequentially(
-            self.sequence_lengths, 
-            rank, 
-            self.bin_capacity, 
-            num_ranks
-        )
+
+        bins, _, _ = allocate_sequentially(self.sequence_lengths, rank, self.bin_capacity, num_ranks)
         return bins
-    
+
     def _compute_multipack_bins(self) -> List[List[int]]:
         """Compute bins using multipack algorithm."""
         group_size: int = self.args.data.sample_packing_group_size or 100000
         bin_size: int = self.bin_capacity  # Maximum sequences per bin
         mp_start_method: str = self.args.data.sample_packing_mp_start_method or "fork"
-        
+
         # Use the parallel packing function
         bins: List[List[int]] = pack_parallel(
             sequence_lengths=self.sequence_lengths,
@@ -578,7 +542,7 @@ class PackingDataset(Dataset):
             bin_size=bin_size,
             num_processes=1,  # Use single process for simplicity
             safe_mode=True,
-            mp_start_method=mp_start_method
+            mp_start_method=mp_start_method,
         )
         return bins
 
@@ -597,4 +561,3 @@ class PackingDataset(Dataset):
         samples: List[Dict[str, Any]] = [self.dataset[idx] for idx in bin_indices]
 
         return samples
-    

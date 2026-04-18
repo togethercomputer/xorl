@@ -4,12 +4,13 @@ import pytest
 import torch.nn as nn
 
 from xorl.distributed.utils import (
-    set_module_from_path,
-    get_module_from_path,
     check_all_fqn_match,
     check_any_fqn_match,
     check_fqn_match,
+    get_module_from_path,
+    set_module_from_path,
 )
+
 
 pytestmark = [pytest.mark.cpu, pytest.mark.distributed]
 
@@ -21,11 +22,7 @@ class SimpleModel(nn.Module):
         super().__init__()
         self.layer1 = nn.Linear(10, 20)
         self.layer2 = nn.Linear(20, 30)
-        self.nested = nn.Sequential(
-            nn.Linear(30, 40),
-            nn.ReLU(),
-            nn.Linear(40, 50)
-        )
+        self.nested = nn.Sequential(nn.Linear(30, 40), nn.ReLU(), nn.Linear(40, 50))
 
 
 class TestModulePaths:
@@ -47,11 +44,11 @@ class TestModulePaths:
         assert model.nested[0].out_features == 100
 
         # Deeply nested via ModuleDict
-        model.deep = nn.ModuleDict({'a': nn.Sequential(nn.Linear(5, 10))})
+        model.deep = nn.ModuleDict({"a": nn.Sequential(nn.Linear(5, 10))})
         deep_layer = nn.Linear(5, 20)
         set_module_from_path(model, "deep.a.0", deep_layer)
         assert get_module_from_path(model, "deep.a.0") is deep_layer
-        assert model.deep['a'][0].out_features == 20
+        assert model.deep["a"][0].out_features == 20
 
         # Nonexistent paths raise
         with pytest.raises(AttributeError):
@@ -108,10 +105,12 @@ class TestCheckAllFqnMatch:
         assert check_all_fqn_match(["layer1.weight", "layer2.bias"], ["layer3.weight", "layer4.bias"]) is False
 
         # Multiple wildcards same number
-        assert check_all_fqn_match(
-            ["block*.layer*.weight", "block*.layer*.bias"],
-            ["block1.layer1.weight", "block1.layer1.bias"]
-        ) is True
+        assert (
+            check_all_fqn_match(
+                ["block*.layer*.weight", "block*.layer*.bias"], ["block1.layer1.weight", "block1.layer1.bias"]
+            )
+            is True
+        )
 
         # Empty lists
         assert check_all_fqn_match([], []) is True

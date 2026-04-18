@@ -1,13 +1,13 @@
 # Copyright (c) 2025, Tri Dao.
 
-from typing import Tuple
 from dataclasses import dataclass
+from typing import Tuple
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cutlass_dsl import Boolean, const_expr, Int32
-from cutlass.utils import TensorMapUpdateMode, TensorMapManager
 from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import Boolean, Int32, const_expr
+from cutlass.utils import TensorMapManager, TensorMapUpdateMode
 
 
 @dataclass(frozen=True)
@@ -41,9 +41,7 @@ class TensorMapManagerSm90(TensorMapManager):
         # updates before touching tensormap in global memory
         if is_manager_warp:
             if const_expr(self.tensormap_update_mode == TensorMapUpdateMode.SMEM):
-                for copy_atom, tensor, smem_ptr in zip(
-                    tma_copy_atom, tensor_gmem, tensormap_smem_ptr
-                ):
+                for copy_atom, tensor, smem_ptr in zip(tma_copy_atom, tensor_gmem, tensormap_smem_ptr):
                     cute.nvgpu.cpasync.update_tma_descriptor(copy_atom, tensor, smem_ptr)
             # wait until it's safe to update tensormap in global memory
             with cute.arch.elect_one():
@@ -55,9 +53,7 @@ class TensorMapManagerSm90(TensorMapManager):
                 for gmem_ptr, smem_ptr in zip(tensormap_gmem_ptr, tensormap_smem_ptr):
                     cute.nvgpu.cpasync.cp_fence_tma_desc_release(gmem_ptr, smem_ptr)
             else:
-                for copy_atom, tensor, gmem_ptr in zip(
-                    tma_copy_atom, tensor_gmem, tensormap_gmem_ptr
-                ):
+                for copy_atom, tensor, gmem_ptr in zip(tma_copy_atom, tensor_gmem, tensormap_gmem_ptr):
                     cute.nvgpu.cpasync.update_tma_descriptor(copy_atom, tensor, gmem_ptr)
                 cute.arch.sync_warp()
                 cute.nvgpu.cpasync.fence_tma_desc_release()

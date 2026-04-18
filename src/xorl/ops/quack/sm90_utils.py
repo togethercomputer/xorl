@@ -1,13 +1,13 @@
 # Copyright (c) 2025, Tri Dao.
 
-from typing import Type, Union, Optional
+from typing import Optional, Type, Union
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_og
+from cutlass import Boolean, Float32, Int32, const_expr
 from cutlass.cute.nvgpu import warpgroup
 from cutlass.cutlass_dsl import Numeric, dsl_user_op
-from cutlass import Float32, Int32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
 
@@ -98,9 +98,7 @@ def gemm_zero_init(
     swap_AB: bool = False,
 ) -> cute.Tensor:
     if const_expr(swap_AB):
-        return gemm_zero_init(
-            tiled_mma, shape[::-1], tCrB, tCrA, B_idx, A_idx, wg_wait, swap_AB=False
-        )
+        return gemm_zero_init(tiled_mma, shape[::-1], tCrB, tCrA, B_idx, A_idx, wg_wait, swap_AB=False)
     else:
         acc = cute.make_rmem_tensor(tiled_mma.partition_shape_C(shape), Float32)
         rA = tCrA if const_expr(A_idx is None) else tCrA[None, None, None, A_idx]
@@ -146,9 +144,7 @@ def partition_fragment_ABC(
         assert sB is not None
         tCrB = thr_mma.make_fragment_B(thr_mma.partition_B(sB))
     else:
-        acc = cute.make_rmem_tensor(
-            thr_mma.partition_shape_C((shape_mnk[1], shape_mnk[0])), Float32
-        )
+        acc = cute.make_rmem_tensor(thr_mma.partition_shape_C((shape_mnk[1], shape_mnk[0])), Float32)
         if const_expr(not is_rs):
             assert sB is not None
             tCrB = thr_mma.make_fragment_A(thr_mma.partition_A(sB))

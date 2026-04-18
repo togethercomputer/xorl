@@ -92,13 +92,11 @@ def ep_fsdp2_clip_grad_norm(
         p for p in model._ep_param_groups.get("non_ep", []) if p.grad is not None
     ]
 
-    # Average FSDP-sharded EP gradients across EP ranks
-    if ps.ep_enabled and ps.ep_size > 1 and ep_fsdp_params:
-        scale = 1.0 / float(ps.ep_size)
-        for q in ep_fsdp_params:
-            if q.grad is not None:
-                q.grad.detach().mul_(scale)
-    # Note: ep_local_params (e.g., QLoRAMoeExperts LoRA) are NOT scaled —
+    # Note: torchtitan eFSDP design disables FSDP's automatic gradient division for ALL
+    # modules (including experts) via disable_fsdp_gradient_division. Gradient normalisation
+    # is handled uniformly by the loss (gradient_accumulate_loss). No additional EP-specific
+    # scaling is needed here — doing so would double-divide expert grads.
+    # ep_local_params (_skip_fsdp, e.g. QLoRAMoeExperts LoRA) are also left unscaled:
     # each rank trains its own unique local experts independently.
 
     # Compute and reduce non-EP norms across FSDP group

@@ -18,9 +18,10 @@ import torch.distributed as dist
 import yaml
 
 from xorl.arguments import Arguments, parse_args
-from xorl.server.server_arguments import ServerArguments, parse_server_args
-from xorl.server.runner.runner_dispatcher import RunnerDispatcher
 from xorl.server.runner.model_runner import ModelRunner
+from xorl.server.runner.runner_dispatcher import RunnerDispatcher
+from xorl.server.server_arguments import ServerArguments, parse_server_args
+from xorl.utils.compile_cache import configure_rank_local_compile_caches
 from xorl.utils.device import get_nccl_backend
 
 
@@ -227,7 +228,7 @@ async def run_distributed_worker_from_server_args(server_args: ServerArguments):
     # Resolve auto bind address
     if server_args.worker_bind_address == "auto":
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(('', 0))
+            s.bind(("", 0))
             server_args.worker_bind_address = f"tcp://127.0.0.1:{s.getsockname()[1]}"
 
     config = server_args.to_config_dict()
@@ -266,23 +267,7 @@ def main():
     os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
     os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
 
-    # Set unique Triton cache directory per rank to avoid race conditions
-    # during parallel kernel compilation
-    local_rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
-    triton_base = os.environ.get("TRITON_CACHE_DIR", os.path.expanduser("~/.triton"))
-    triton_cache_dir = os.path.join(triton_base, f"cache_rank{local_rank}")
-    os.environ["TRITON_CACHE_DIR"] = triton_cache_dir
-    os.makedirs(triton_cache_dir, exist_ok=True)
-
-    # Set per-rank TorchInductor cache to prevent cross-rank cubin path conflicts.
-    # TorchInductor's FxGraphCache at /tmp/torchinductor_<user>/ is node-local and shared
-    # by all local ranks. It stores absolute cubin paths from the compiling rank's
-    # TRITON_CACHE_DIR, which breaks when a different local rank gets a cache hit.
-    inductor_local_rank = os.environ.get("LOCAL_RANK", "0")
-    inductor_base = os.environ.get("TORCHINDUCTOR_CACHE_DIR", f"/tmp/torchinductor_{os.environ.get('USER', 'unknown')}")
-    inductor_cache_dir = os.path.join(inductor_base, f"rank{inductor_local_rank}")
-    os.environ["TORCHINDUCTOR_CACHE_DIR"] = inductor_cache_dir
-    os.makedirs(inductor_cache_dir, exist_ok=True)
+    configure_rank_local_compile_caches()
 
     # Find config file path
     config_path = None
@@ -293,9 +278,7 @@ def main():
 
     if not config_path:
         print("Error: Config file path required as first positional argument")
-        print(
-            "Usage: python -m xorl.server.runner.runner_dispatcher config.yaml [--worker_bind_address tcp://...]"
-        )
+        print("Usage: python -m xorl.server.runner.runner_dispatcher config.yaml [--worker_bind_address tcp://...]")
         sys.exit(1)
 
     # Detect config format and parse accordingly

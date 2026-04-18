@@ -4,11 +4,16 @@ These triton kernels support grouped GEMM operations where multiple matrix
 multiplications with the same N,K or M,N dimensions are batched together.
 """
 
+import inspect
+import os
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
+
+
+_AUTOTUNE_CACHE_KW = {"cache_results": True} if "cache_results" in inspect.signature(triton.autotune).parameters else {}
 
 from .triton_utils.activation import (
     ActivationType,
@@ -25,10 +30,17 @@ from .triton_utils.utils import (
     get_pid_mn,
     make_blocked,
 )
-from ..utils.pretuned import algo_key_scaled, pretuned
 
 
 def _get_cuda_autotune_config():
+    if os.environ.get("XORL_TRITON_NO_AUTOTUNE", "0") == "1":
+        return [
+            triton.Config(
+                {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP": 8},
+                num_stages=3,
+                num_warps=8,
+            ),
+        ]
     return [
         triton.Config(
             {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP": 8},
@@ -47,9 +59,11 @@ def _get_cuda_autotune_config():
         ),
     ]
 
+
 @triton.autotune(
     configs=_get_cuda_autotune_config(),
     key=["N", "K"],
+    **_AUTOTUNE_CACHE_KW,
 )
 # @pretuned(
 #     algo_key=algo_key_scaled(["total_M", "N", "K"], [5000, 1, 1], ["TRANSPOSE_A", "TRANSPOSE_B"]),
@@ -114,7 +128,7 @@ def group_gemm_same_nk_kernel(
 
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + blk_k[None, :] * stride_ak)
     b_ptrs = b_ptr + (blk_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-    c_ptrs = c_ptr + N * offs_m[:, None] + 1 * offs_n[None, :]
+    c_ptrs = c_ptr + N * offs_am[:, None] + 1 * offs_bn[None, :]
 
     if ACCUMULATE_TO_C:
         c = load_with_pred_2d(
@@ -124,7 +138,7 @@ def group_gemm_same_nk_kernel(
             offs_m[:, None] < m_size,
             offs_n[None, :] < N,
             other=0,
-        )
+        ).to(tl.float32)
     else:
         c = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_K)):
@@ -142,7 +156,7 @@ def group_gemm_same_nk_kernel(
         c = make_blocked(c, c_ptr.dtype.element_ty)
         if SAVE_ACTIVATION:
             store_with_pred_2d(
-                act_ptr + gtid_start * N + N * offs_m[:, None] + offs_n[None, :],
+                act_ptr + gtid_start * N + N * offs_am[:, None] + offs_bn[None, :],
                 c,
                 False,
                 N_ALIGNED,
@@ -236,6 +250,7 @@ def group_gemm_same_nk(
 @triton.autotune(
     configs=_get_cuda_autotune_config(),
     key=["M", "N"],
+    **_AUTOTUNE_CACHE_KW,
 )
 # @pretuned(
 #     algo_key=algo_key_scaled(["M", "N", "total_K"], [1, 1, 5000], ["TRANSPOSE_A", "TRANSPOSE_B"]),

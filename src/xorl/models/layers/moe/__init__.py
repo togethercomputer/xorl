@@ -10,18 +10,12 @@ Provides model-agnostic building blocks for Mixture-of-Experts layers:
 - :data:`MOE_EXPERT_BACKENDS` — backend registry (eager / triton / native / quack).
 """
 
-from .experts import MoEExperts
-from .router import TopKRouter
-from .moe_block import MoEBlock
-from .lora import (
-    MoELoRAConfig,
-    MoEExpertsLoRA,
-    inject_lora_into_experts,
-    copy_weights_to_lora_experts,
-    mark_only_lora_as_trainable,
-    lora_state_dict,
-)
+from .aux_loss import global_load_balancing_loss_func
 from .backend import MOE_EXPERT_BACKENDS
+from .experts import MoEExperts
+from .moe_block import MoEBlock
+from .router import TopKRouter
+
 
 __all__ = [
     "MoEExperts",
@@ -34,4 +28,37 @@ __all__ = [
     "mark_only_lora_as_trainable",
     "lora_state_dict",
     "MOE_EXPERT_BACKENDS",
+    "global_load_balancing_loss_func",
 ]
+
+
+_LAZY_ATTRS = {
+    "MoEExpertsLoRA",
+    "MoELoRAConfig",
+    "copy_weights_to_lora_experts",
+    "inject_lora_into_experts",
+    "lora_state_dict",
+    "mark_only_lora_as_trainable",
+}
+
+
+def __getattr__(name):
+    if name in _LAZY_ATTRS:
+        from .lora import (  # noqa: PLC0415
+            MoEExpertsLoRA,
+            MoELoRAConfig,
+            copy_weights_to_lora_experts,
+            inject_lora_into_experts,
+            lora_state_dict,
+            mark_only_lora_as_trainable,
+        )
+
+        g = globals()
+        g["MoEExpertsLoRA"] = MoEExpertsLoRA
+        g["MoELoRAConfig"] = MoELoRAConfig
+        g["copy_weights_to_lora_experts"] = copy_weights_to_lora_experts
+        g["inject_lora_into_experts"] = inject_lora_into_experts
+        g["lora_state_dict"] = lora_state_dict
+        g["mark_only_lora_as_trainable"] = mark_only_lora_as_trainable
+        return g[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

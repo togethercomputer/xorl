@@ -5,11 +5,11 @@ from .async_ulysses import (
     divide_qkv_linear_weight,
 )
 from .comm import (
+    get_data_parallel_group,
+    get_data_parallel_rank,
     get_ringattn_group,
     get_ringattn_rank,
     get_ringattn_world_size,
-    get_data_parallel_group,
-    get_data_parallel_rank,
     get_ulysses_sequence_parallel_group,
     get_ulysses_sequence_parallel_rank,
     get_ulysses_sequence_parallel_world_size,
@@ -17,8 +17,8 @@ from .comm import (
     get_unified_sequence_parallel_rank,
     get_unified_sequence_parallel_world_size,
     init_sequence_parallel,
-    set_ringattn_group,
     set_data_parallel_group,
+    set_ringattn_group,
     set_ulysses_sequence_parallel_group,
     set_unified_sequence_parallel_group,
 )
@@ -29,26 +29,26 @@ from .data import (
     slice_input_tensor_scale_grad,
     slice_position_embedding,
 )
+from .strategy import (
+    CPStrategy,
+    HybridUlyssesRingStrategy,
+    NoopStrategy,
+    RingAttentionStrategy,
+    UlyssesAsyncStrategy,
+    UlyssesSyncStrategy,
+    get_cp_strategy,
+)
 from .ulysses import (
     all_to_all_images,
     gather_heads_scatter_seq,
     gather_seq_scatter_heads,
-)
-from .strategy import (
-    HybridUlyssesRingStrategy,
-    NoopStrategy,
-    RingAttentionStrategy,
-    CPStrategy,
-    UlyssesAsyncStrategy,
-    UlyssesSyncStrategy,
-    get_cp_strategy,
 )
 from .utils import pad_tensor, unpad_tensor, vlm_images_a2a_meta
 
 
 def __getattr__(name):
     if name == "ring_flash_attention_forward":
-        from .ring_attention import ring_flash_attention_forward
+        from .ring_attention import ring_flash_attention_forward  # noqa: PLC0415
 
         return ring_flash_attention_forward
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -5,9 +5,7 @@ from .. import utils
 
 
 @cute.jit
-def compare_and_swap(
-    arr: cute.Tensor, i: int, j: int, ascending: bool = True, use_selection: bool = False
-) -> None:
+def compare_and_swap(arr: cute.Tensor, i: int, j: int, ascending: bool = True, use_selection: bool = False) -> None:
     """Compare and swap elements at indices i and j in ascending or descending order."""
     if const_expr(use_selection):
         a, b = arr[i], arr[j]

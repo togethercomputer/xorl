@@ -12,8 +12,10 @@ These types are shared by both protocol layers:
 """
 
 import os
-from dataclasses import asdict, dataclass, field, fields as dc_fields
+from dataclasses import asdict, dataclass, field
+from dataclasses import fields as dc_fields
 from typing import Any, Dict, List, Optional, Union
+
 
 # ============================================================================
 # Timeout Constants (shared by engine/executor and backend/remote)
@@ -97,11 +99,11 @@ class SyncWeightsData:
 
     endpoints: List[Dict[str, Any]] = field(default_factory=list)
     master_address: str = "localhost"
-    master_port: int = 29600
+    master_port: int = 0
     group_name: str = "weight_sync_group"
     buffer_size_mb: int = 1024
     sync_method: str = "nccl_broadcast"
-    flush_cache: bool = True
+    flush_cache: bool = False
     pause_mode: str = "retract"
     weight_version: Optional[str] = None
     quantization: Optional[Dict[str, Any]] = None

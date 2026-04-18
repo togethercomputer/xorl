@@ -1,36 +1,40 @@
 """Data handling specific to SFT."""
 
-import functools
-import os
-import tempfile
 from typing import Literal
 
+import numpy as np
+import pyarrow as pa
+import torch.distributed as dist
 from datasets import (
     Dataset as HFDataset,
-    DatasetDict as HFDatasetDict,
-    IterableDataset as HFIterableDataset,
-    IterableDatasetDict as HFIterableDatasetDict,
-    load_dataset,
 )
-from transformers import PreTrainedTokenizer, ProcessorMixin
+from datasets import (
+    DatasetDict as HFDatasetDict,
+)
+from datasets import (
+    IterableDataset as HFIterableDataset,
+)
+from datasets import (
+    IterableDatasetDict as HFIterableDatasetDict,
+)
 from torch.utils.data import Dataset
-import torch.distributed as dist
+from transformers import PreTrainedTokenizer, ProcessorMixin
 
 from ...arguments import Arguments, DatasetConfig
-from ...utils import logging
-from ...data.prepare.file_lock_loader import FileLockLoader
 from ...data.prepare.utils import retry_on_request_exceptions
-from .shared import (
-    load_dataset_with_config,
-    datasets_with_name_generator,
-    merge_datasets,
-    try_load_from_hub,
-    load_preprocessed_dataset,
-    save_preprocessed_dataset,
-    create_train_validation_split,
-)
+from ...utils import logging
 from .hash import generate_dataset_hash_from_config
 from .packing import PackingDataset, process_datasets_for_packing
+from .shared import (
+    create_train_validation_split,
+    datasets_with_name_generator,
+    load_dataset_with_config,
+    load_preprocessed_dataset,
+    merge_datasets,
+    save_preprocessed_dataset,
+    try_load_from_hub,
+)
+
 
 logger = logging.get_logger(__name__)
 
@@ -45,58 +49,39 @@ def _create_dummy_dataset(seq_len: int, num_samples: int = 4096, seed: int = 42,
     step entirely.
 
     Token format: each sample is ``[1, 2, 3, ..., length-1, 0]`` where
-    0 is the EOD marker. Tokens follow a global arithmetic sequence
-    ``(global_offset + i) % vocab_size`` so routing varies across samples.
-    Lengths are drawn uniformly from [1, seq_len] with seed=0 (independent
-    of the dataset seed so packing shape is always the same).
+    0 is the EOD marker. All ``num_samples`` examples are intentionally
+    identical so local benchmarks can show clean loss convergence.
     """
-    import numpy as np
-    import pyarrow as pa
 
     EOD = 0
     VOCAB_SIZE = vocab_size
-    # Cap at seq_len so samples always fit in sample_packing_sequence_len.
     MAX_SAMPLE_LEN = max(seq_len, 1)
-    # Lengths: uniform [1, max_sample_len], fixed seed=0 so packing is
-    # reproducible regardless of the dataset seed argument.
     # Lengths are k*16+1 so that after ShiftTokensCollator drops 1 token,
     # effective length k*16 is divisible by 2*ringattn_size for zigzag ring
-    # attention. This is a dummy-data workaround; production data should use
-    # per-document alignment in the packing pipeline (TODO).
+    # attention. This keeps the repeated sample valid for the benchmark path.
     LENGTH_ALIGN = 16
-    max_buckets = max(1, MAX_SAMPLE_LEN // LENGTH_ALIGN)
-    len_rng = np.random.RandomState(0)
-    lengths = len_rng.randint(1, max_buckets + 1, size=num_samples)
-    lengths = (lengths * LENGTH_ALIGN + 1).astype(np.int64)
+    sample_len = max(1, ((MAX_SAMPLE_LEN - 1) // LENGTH_ALIGN) * LENGTH_ALIGN + 1)
+    lengths = np.full((num_samples,), sample_len, dtype=np.int64)
 
-    # Build all tokens as one global arithmetic sequence, then slice.
-    # Each sample: (global_offset, ..., global_offset+length-2, EOD)
-    total_tokens = int(lengths.sum())
-    global_seq = np.arange(total_tokens, dtype=np.int64) % VOCAB_SIZE
-
-    # Overwrite the last position of each sample with EOD (vectorized)
-    ends = np.cumsum(lengths) - 1
-    global_seq[ends] = EOD
-
-    flat_tokens = global_seq.astype(np.int32)
-    offsets = np.concatenate([[0], np.cumsum(lengths)]).astype(np.int64)
-
+    sample_tokens = (np.arange(sample_len, dtype=np.int64) + 1) % VOCAB_SIZE
+    sample_tokens[-1] = EOD
+    flat_tokens = np.tile(sample_tokens.astype(np.int32), num_samples)
+    offsets = np.arange(0, sample_len * (num_samples + 1), sample_len, dtype=np.int64)
     tokens = pa.ListArray.from_arrays(offsets, flat_tokens)
 
-    # position_ids: [0, 1, ..., length-1] per sample — vectorized via cumsum reset
-    pos_flat = np.arange(total_tokens, dtype=np.int32)
-    starts = np.concatenate([[0], np.cumsum(lengths[:-1])]).astype(np.int64)
-    pos_flat -= np.repeat(starts, lengths).astype(np.int32)
+    pos_flat = np.tile(np.arange(sample_len, dtype=np.int32), num_samples)
     position_ids = pa.ListArray.from_arrays(offsets, pos_flat)
 
     pa_lengths = pa.array(lengths.tolist(), type=pa.int64())
 
-    table = pa.table({
-        "input_ids": tokens,
-        "labels": tokens,
-        "position_ids": position_ids,
-        "length": pa_lengths,
-    })
+    table = pa.table(
+        {
+            "input_ids": tokens,
+            "labels": tokens,
+            "position_ids": position_ids,
+            "length": pa_lengths,
+        }
+    )
     return HFDataset(table)
 
 
@@ -124,28 +109,17 @@ def prepare_datasets(
 
     def _load_datasets():
         # Load training dataset
-        train_dataset, eval_dataset = _load_and_prepare_datasets(
-            tokenizer, args, split="train", processor=processor
-        )
+        train_dataset, eval_dataset = _load_and_prepare_datasets(tokenizer, args, split="train", processor=processor)
 
         # Override with test dataset if available
         if args.data.test_datasets:
-            _, eval_dataset = _load_and_prepare_datasets(
-                tokenizer, args, split="test", processor=processor
-            )
+            _, eval_dataset = _load_and_prepare_datasets(tokenizer, args, split="test", processor=processor)
 
         # Apply sample packing if configured
-        if (
-            args.data.sample_packing_method
-            and args.data.sample_packing_method != "none"
-        ):
-            train_dataset = PackingDataset(
-                args, tokenizer, train_dataset, split="train"
-            )
+        if args.data.sample_packing_method and args.data.sample_packing_method != "none":
+            train_dataset = PackingDataset(args, tokenizer, train_dataset, split="train")
             if eval_dataset:
-                eval_dataset = PackingDataset(
-                    args, tokenizer, eval_dataset, split="test"
-                )
+                eval_dataset = PackingDataset(args, tokenizer, eval_dataset, split="test")
             else:
                 eval_dataset = None
 
@@ -196,14 +170,10 @@ def _load_tokenized_prepared_datasets(
     is_rank_zero = not is_distributed or dist.get_rank() == 0
 
     # Select correct dataset configuration based on split
-    datasets_configs = (
-        args.data.datasets if split == "train" else args.data.test_datasets
-    )
+    datasets_configs = args.data.datasets if split == "train" else args.data.test_datasets
 
     # Generate dataset hash for caching
-    dataset_hash = generate_dataset_hash_from_config(
-        args, datasets_configs, tokenizer.name_or_path
-    )
+    dataset_hash = generate_dataset_hash_from_config(args, datasets_configs, tokenizer.name_or_path)
 
     # Try loading from hub if push_dataset_to_hub is configured
     dataset = None
@@ -279,9 +249,7 @@ def _load_raw_datasets(
 
     # Save the prepared dataset
     if not args.data.skip_prepare_dataset:
-        dataset_hash = generate_dataset_hash_from_config(
-            args, datasets_configs, tokenizer.name_or_path
-        )
+        dataset_hash = generate_dataset_hash_from_config(args, datasets_configs, tokenizer.name_or_path)
         save_preprocessed_dataset(args, dataset, dataset_hash, split)
 
     return dataset
@@ -298,7 +266,9 @@ def _load_and_process_single_dataset(
     """Load and process a single dataset based on the passed config."""
     # Load the dataset
     dataset = load_dataset_with_config(
-        dataset_config, args.data.hf_use_auth_token, streaming=False,
+        dataset_config,
+        args.data.hf_use_auth_token,
+        streaming=False,
         num_proc=args.data.dataset_num_proc,
     )
 
@@ -313,16 +283,13 @@ def _load_and_process_single_dataset(
             dataset = dataset[split]
         else:
             raise ValueError(
-                f"no {split} split found for dataset {dataset_config.path}, you may "
-                "specify a split with 'split: ...'"
+                f"no {split} split found for dataset {dataset_config.path}, you may specify a split with 'split: ...'"
             )
 
     # Apply sharding if configured
     if dataset_config.shards:
         shards_idx = dataset_config.shards_idx or 0
-        dataset = dataset.shuffle(seed=seed).shard(
-            num_shards=dataset_config.shards, index=shards_idx
-        )
+        dataset = dataset.shuffle(seed=seed).shard(num_shards=dataset_config.shards, index=shards_idx)
 
     # Select columns if configured
     if args.data.select_columns:
@@ -350,11 +317,11 @@ def _load_and_process_single_dataset(
     # Add activations_path field if configured (for distillation training)
     if dataset_config.activations_path:
         logger.info_rank0(f"Adding activations_path '{dataset_config.activations_path}' to dataset")
-        
+
         def add_activations_path(example):
             example["activations_path"] = dataset_config.activations_path
             return example
-        
+
         dataset = dataset.map(
             add_activations_path,
             desc=f"Adding activations_path to {dataset_config.name or 'dataset'}",
@@ -364,22 +331,19 @@ def _load_and_process_single_dataset(
     return dataset
 
 
-def _handle_train_dataset_split(
-    dataset: HFDataset, args: Arguments
-) -> tuple[HFDataset, HFDataset | None]:
+def _handle_train_dataset_split(dataset: HFDataset, args: Arguments) -> tuple[HFDataset, HFDataset | None]:
     """Handle processing for train split, including validation set creation."""
     val_set_size = (
         int(args.data.val_set_size)
         if args.data.val_set_size is not None and args.data.val_set_size > 1
-        else float(args.data.val_set_size) if args.data.val_set_size is not None
+        else float(args.data.val_set_size)
+        if args.data.val_set_size is not None
         else 0
     )
 
     if val_set_size:
         # Create train/validation split
-        train_dataset, eval_dataset = create_train_validation_split(
-            dataset, args, val_set_size
-        )
+        train_dataset, eval_dataset = create_train_validation_split(dataset, args, val_set_size)
         return train_dataset, eval_dataset
     else:
         return dataset, None
@@ -396,9 +360,7 @@ def _apply_dataset_sharding(dataset: HFDataset, args: Arguments) -> HFDataset:
         Sharded dataset or original dataset if no sharding configured.
     """
     if args.data.dataset_shard_num and args.data.dataset_shard_idx is not None:
-        logger.info_rank0(
-            f"Using index #{args.data.dataset_shard_idx} of {args.data.dataset_shard_num} shards"
-        )
+        logger.info_rank0(f"Using index #{args.data.dataset_shard_idx} of {args.data.dataset_shard_num} shards")
         dataset = dataset.shard(
             num_shards=args.data.dataset_shard_num,
             index=args.data.dataset_shard_idx,

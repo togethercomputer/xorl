@@ -5,33 +5,29 @@ These tests simulate the full flow of loading per-expert HuggingFace weights
 into a model that expects fused (stacked) expert format.
 """
 
-import os
-import tempfile
+import random
 from typing import Dict, Iterator, Tuple
 
 import pytest
 import torch
 import torch.nn as nn
 
+
 pytestmark = [pytest.mark.cpu]
 
 # Re-implement the core logic to test without full xorl dependencies
 import re
 from collections import defaultdict
-from typing import Dict, Optional, Set, Tuple
+from typing import Optional, Set
 
 
 # =============================================================================
 # Copy of core implementation for testing
 # =============================================================================
 
-_EXPERT_KEY_PATTERN = re.compile(
-    r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.weight$"
-)
+_EXPERT_KEY_PATTERN = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.weight$")
 
-_FUSED_EXPERT_PATTERN = re.compile(
-    r"^model\.layers\.\d+\.mlp\.experts\.(gate|up|down)_proj$"
-)
+_FUSED_EXPERT_PATTERN = re.compile(r"^model\.layers\.\d+\.mlp\.experts\.(gate|up|down)_proj$")
 
 
 def parse_expert_key(key: str) -> Optional[Tuple[int, int, str]]:
@@ -62,9 +58,7 @@ class ExpertWeightBuffer:
         tensor = tensor.t().contiguous()
         if key not in self._stacked_buffers:
             stacked_shape = (self.num_experts,) + tensor.shape
-            self._stacked_buffers[key] = torch.empty(
-                stacked_shape, dtype=tensor.dtype, device="cpu"
-            )
+            self._stacked_buffers[key] = torch.empty(stacked_shape, dtype=tensor.dtype, device="cpu")
         # Copy directly into the slice (streaming)
         self._stacked_buffers[key][expert_idx].copy_(tensor)
         self._filled_experts[key].add(expert_idx)
@@ -80,8 +74,7 @@ class ExpertWeightBuffer:
         filled = self._filled_experts.pop(key)
         if len(filled) != self.num_experts:
             raise ValueError(
-                f"Incomplete experts for layer {layer_idx}, {proj}_proj: "
-                f"got {len(filled)}, expected {self.num_experts}"
+                f"Incomplete experts for layer {layer_idx}, {proj}_proj: got {len(filled)}, expected {self.num_experts}"
             )
         return self._stacked_buffers.pop(key)
 
@@ -105,15 +98,9 @@ class MockFusedMoeExperts(nn.Module):
         super().__init__()
         self.num_experts = num_experts
         # Fused format (G, K, N): [num_experts, in_features, out_features]
-        self.gate_proj = nn.Parameter(
-            torch.empty(num_experts, hidden_size, intermediate_size)
-        )
-        self.up_proj = nn.Parameter(
-            torch.empty(num_experts, hidden_size, intermediate_size)
-        )
-        self.down_proj = nn.Parameter(
-            torch.empty(num_experts, intermediate_size, hidden_size)
-        )
+        self.gate_proj = nn.Parameter(torch.empty(num_experts, hidden_size, intermediate_size))
+        self.up_proj = nn.Parameter(torch.empty(num_experts, hidden_size, intermediate_size))
+        self.down_proj = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
 
 
 class MockMoeLayer(nn.Module):
@@ -129,12 +116,12 @@ class MockModelInner(nn.Module):
 
     def __init__(self, num_layers: int, num_experts: int, hidden_size: int, intermediate_size: int):
         super().__init__()
-        self.layers = nn.ModuleList([
-            nn.ModuleDict({
-                "mlp": MockMoeLayer(num_experts, hidden_size, intermediate_size)
-            })
-            for _ in range(num_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                nn.ModuleDict({"mlp": MockMoeLayer(num_experts, hidden_size, intermediate_size)})
+                for _ in range(num_layers)
+            ]
+        )
 
 
 class MockMoeModel(nn.Module):
@@ -174,13 +161,16 @@ def create_per_expert_state_dict(
     for layer_idx in range(num_layers):
         for expert_idx in range(num_experts):
             # gate_proj and up_proj: [intermediate_size, hidden_size]
-            state_dict[f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.gate_proj.weight"] = \
-                torch.randn(intermediate_size, hidden_size)
-            state_dict[f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.up_proj.weight"] = \
-                torch.randn(intermediate_size, hidden_size)
+            state_dict[f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.gate_proj.weight"] = torch.randn(
+                intermediate_size, hidden_size
+            )
+            state_dict[f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.up_proj.weight"] = torch.randn(
+                intermediate_size, hidden_size
+            )
             # down_proj: [hidden_size, intermediate_size]
-            state_dict[f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.down_proj.weight"] = \
-                torch.randn(hidden_size, intermediate_size)
+            state_dict[f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.down_proj.weight"] = torch.randn(
+                hidden_size, intermediate_size
+            )
     return state_dict
 
 
@@ -250,13 +240,9 @@ class TestMoeWeightLoadingIntegration:
         intermediate_size = 128
 
         model = MockMoeModel(num_layers, num_experts, hidden_size, intermediate_size)
-        per_expert_state_dict = create_per_expert_state_dict(
-            num_layers, num_experts, hidden_size, intermediate_size
-        )
+        per_expert_state_dict = create_per_expert_state_dict(num_layers, num_experts, hidden_size, intermediate_size)
 
-        loaded_weights = simulate_load_model_weights(
-            model, iter(per_expert_state_dict.items()), num_experts
-        )
+        loaded_weights = simulate_load_model_weights(model, iter(per_expert_state_dict.items()), num_experts)
 
         # All fused parameters created with correct shapes
         for layer_idx in range(num_layers):
@@ -278,14 +264,12 @@ class TestMoeWeightLoadingIntegration:
         model2 = MockMoeModel(1, num_experts, 8, 16)
         state_dict2 = {}
         for expert_idx in range(num_experts):
-            state_dict2[f"model.layers.0.mlp.experts.{expert_idx}.gate_proj.weight"] = \
-                torch.full((16, 8), float(expert_idx))
-            state_dict2[f"model.layers.0.mlp.experts.{expert_idx}.up_proj.weight"] = \
-                torch.randn(16, 8)
-            state_dict2[f"model.layers.0.mlp.experts.{expert_idx}.down_proj.weight"] = \
-                torch.randn(8, 16)
+            state_dict2[f"model.layers.0.mlp.experts.{expert_idx}.gate_proj.weight"] = torch.full(
+                (16, 8), float(expert_idx)
+            )
+            state_dict2[f"model.layers.0.mlp.experts.{expert_idx}.up_proj.weight"] = torch.randn(16, 8)
+            state_dict2[f"model.layers.0.mlp.experts.{expert_idx}.down_proj.weight"] = torch.randn(8, 16)
 
-        import random
         items = list(state_dict2.items())
         random.seed(42)
         random.shuffle(items)
@@ -293,8 +277,7 @@ class TestMoeWeightLoadingIntegration:
         loaded2 = simulate_load_model_weights(model2, iter(items), num_experts)
         gate_proj = loaded2["model.layers.0.mlp.experts.gate_proj"]
         for expert_idx in range(num_experts):
-            assert torch.all(gate_proj[expert_idx] == float(expert_idx)), \
-                f"Expert {expert_idx} not in correct position"
+            assert torch.all(gate_proj[expert_idx] == float(expert_idx)), f"Expert {expert_idx} not in correct position"
 
     def test_streaming_and_edge_cases(self):
         """Test sharded streaming load, large expert count, single expert, and random order."""
@@ -305,9 +288,7 @@ class TestMoeWeightLoadingIntegration:
         intermediate_size = 32
 
         model = MockMoeModel(num_layers, num_experts, hidden_size, intermediate_size)
-        state_dict = create_per_expert_state_dict(
-            num_layers, num_experts, hidden_size, intermediate_size
-        )
+        state_dict = create_per_expert_state_dict(num_layers, num_experts, hidden_size, intermediate_size)
         items = list(state_dict.items())
         shard1 = [(k, v) for k, v in items if any(f".experts.{i}." in k for i in range(4))]
         shard2 = [(k, v) for k, v in items if any(f".experts.{i}." in k for i in range(4, 8))]
@@ -321,21 +302,17 @@ class TestMoeWeightLoadingIntegration:
         # Large expert count (128)
         model_large = MockMoeModel(1, 128, 16, 32)
         state_dict_large = create_per_expert_state_dict(1, 128, 16, 32)
-        loaded_large = simulate_load_model_weights(
-            model_large, iter(state_dict_large.items()), 128
-        )
+        loaded_large = simulate_load_model_weights(model_large, iter(state_dict_large.items()), 128)
         assert loaded_large["model.layers.0.mlp.experts.gate_proj"].shape == (128, 16, 32)
 
         # Single expert
         model_single = MockMoeModel(1, 1, 8, 16)
         state_dict_single = create_per_expert_state_dict(1, 1, 8, 16)
-        loaded_single = simulate_load_model_weights(
-            model_single, iter(state_dict_single.items()), 1
-        )
+        loaded_single = simulate_load_model_weights(model_single, iter(state_dict_single.items()), 1)
         assert loaded_single["model.layers.0.mlp.experts.gate_proj"].shape == (1, 8, 16)
 
         # Random order loading
-        import random
+
         model_rand = MockMoeModel(2, 4, 8, 16)
         state_dict_rand = create_per_expert_state_dict(2, 4, 8, 16)
         items_rand = list(state_dict_rand.items())
@@ -352,12 +329,9 @@ class TestMoeWeightLoadingIntegration:
 
         state_dict = {}
         for expert_idx in range(3):  # Missing expert 3
-            state_dict[f"model.layers.0.mlp.experts.{expert_idx}.gate_proj.weight"] = \
-                torch.randn(16, 8)
-            state_dict[f"model.layers.0.mlp.experts.{expert_idx}.up_proj.weight"] = \
-                torch.randn(16, 8)
-            state_dict[f"model.layers.0.mlp.experts.{expert_idx}.down_proj.weight"] = \
-                torch.randn(8, 16)
+            state_dict[f"model.layers.0.mlp.experts.{expert_idx}.gate_proj.weight"] = torch.randn(16, 8)
+            state_dict[f"model.layers.0.mlp.experts.{expert_idx}.up_proj.weight"] = torch.randn(16, 8)
+            state_dict[f"model.layers.0.mlp.experts.{expert_idx}.down_proj.weight"] = torch.randn(8, 16)
 
         with pytest.raises(RuntimeError, match="Incomplete expert weights"):
             simulate_load_model_weights(model, iter(state_dict.items()), 4)
