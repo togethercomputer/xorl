@@ -351,19 +351,23 @@ def _try_load_state_dict(weights_path: str, **kwargs):
     and broadcasts the result to other ranks. This avoids N-way filesystem
     hammering and keeps the broadcast-loading path rank-0-driven.
     """
-    cache_kwargs = {"_raise_exceptions_for_missing_entries": False, **kwargs}
-    resolved_weight_file = cached_file(weights_path, SAFE_WEIGHTS_NAME, **cache_kwargs)
-    if resolved_weight_file:
-        return [StateDictIterator(resolved_weight_file)]
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-    resolved_weight_file = cached_file(weights_path, SAFE_WEIGHTS_INDEX_NAME, **cache_kwargs)
-    if resolved_weight_file:
-        # Retry on OSError (e.g., missing shard files during download)
-        max_retries = 3
+    if world_size <= 1:
+        # Single rank: do everything locally (no broadcast needed)
+        return _try_load_state_dict_local(weights_path, **kwargs)
+
+    # Multi-rank: rank 0 resolves paths, broadcasts to all
+    resolved_paths = [None]
+    if rank == 0:
+        max_retries = 10
         for attempt in range(max_retries):
             try:
-                shard_files, _ = get_checkpoint_shard_files(weights_path, resolved_weight_file, **kwargs)
-                return [StateDictIterator(shard_file) for shard_file in shard_files]
+                result = _try_load_state_dict_local(weights_path, **kwargs)
+                if result is not None:
+                    resolved_paths[0] = [it.filepath for it in result]
+                break
             except OSError as e:
                 if attempt < max_retries - 1:
                     logger.warning(
@@ -371,7 +375,7 @@ def _try_load_state_dict(weights_path: str, **kwargs):
                     )
                     time.sleep(5)
                 else:
-                    logger.error(f"Failed to get shard files after {max_retries} attempts")
+                    logger.error(f"Failed to resolve shard files after {max_retries} attempts")
                     raise
 
     _broadcast_object_list_weight_load(resolved_paths, src=0)
@@ -399,24 +403,8 @@ def _try_load_state_dict_local(weights_path: str, **kwargs):
 
     resolved_weight_file = cached_file(weights_path, WEIGHTS_INDEX_NAME, **cache_kwargs)
     if resolved_weight_file:
-        # Retry on OSError (e.g., missing shard files during download)
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                shard_files, _ = get_checkpoint_shard_files(weights_path, resolved_weight_file, **kwargs)
-                return [StateDictIterator(shard_file) for shard_file in shard_files]
-            except OSError as e:
-                if attempt < max_retries - 1:
-                    import time
-                    retry_delay = 5
-                    logger.warning(
-                        f"OSError getting PT shard files (attempt {attempt + 1}/{max_retries}): {e}. "
-                        f"Retrying in {retry_delay}s..."
-                    )
-                    time.sleep(retry_delay)
-                else:
-                    logger.error(f"Failed to get PT shard files after {max_retries} attempts")
-                    raise
+        shard_files, _ = get_checkpoint_shard_files(weights_path, resolved_weight_file, **kwargs)
+        return [StateDictIterator(shard_file) for shard_file in shard_files]
 
     return None
 
@@ -872,7 +860,7 @@ def all_ranks_load_weights(
         )
 
     # Retry loading state dict on OSError (e.g., HuggingFace download issues)
-    max_retries = 3
+    max_retries = 10
     retry_delay = 5  # seconds
     last_error = None
 

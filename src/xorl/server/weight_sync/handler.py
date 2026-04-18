@@ -1365,7 +1365,7 @@ class WeightSyncHandler:
         buffer: List[Tuple[str, torch.Tensor]],
         model,
     ) -> List[Tuple[str, torch.Tensor]]:
-        """Split fused projections (qkv_proj, gate_up_proj) into HF-format names.
+        """Convert training parameter names to HF/SGLang inference names.
 
         Handles:
         - qkv_proj → q_proj + k_proj + v_proj (split fused attention)
@@ -1375,8 +1375,6 @@ class WeightSyncHandler:
           HF fused names (q_proj/k_proj/v_proj → in_proj_qkv, etc.)
         """
 
-        This splits fused weights back to individual projections before sending.
-        """
         config = model.config
         num_heads = config.num_attention_heads
         num_kv_heads = getattr(config, "num_key_value_heads", num_heads)
@@ -1387,7 +1385,6 @@ class WeightSyncHandler:
         result = []
         for name, tensor in buffer:
             if ".qkv_proj." in name:
-                # Split [q_size + 2*kv_size, hidden] → q, k, v
                 prefix, suffix = name.rsplit(".qkv_proj.", 1)
                 q = tensor[:q_size].clone()
                 k = tensor[q_size : q_size + kv_size].clone()
@@ -1409,7 +1406,6 @@ class WeightSyncHandler:
                 for expert_idx in range(tensor.shape[0]):
                     result.append((f"{prefix}.{expert_idx}.down_proj.weight", down[expert_idx]))
             elif ".gate_up_proj." in name:
-                # Split [2*intermediate, hidden] → gate, up
                 prefix, suffix = name.rsplit(".gate_up_proj.", 1)
                 half = tensor.shape[0] // 2
                 gate = tensor[:half].clone()
@@ -1418,6 +1414,10 @@ class WeightSyncHandler:
                 result.append((f"{prefix}.up_proj.{suffix}", up))
             else:
                 result.append((name, tensor))
+
+        if has_linear_attention_layers(config):
+            result = remap_linear_attention_params_for_inference(result)
+
         return result
 
     def _broadcast_buffer(

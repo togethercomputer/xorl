@@ -37,7 +37,7 @@ gated_to_pytorch_fn_map = {
 }
 
 
-default_device_capacity = get_device_capacity(torch.device("cuda"))
+default_device_capacity = get_device_capacity(torch.device("cuda")) if torch.cuda.is_available() else (0, 0)
 
 
 def default_config(device):

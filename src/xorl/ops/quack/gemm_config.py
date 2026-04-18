@@ -23,7 +23,8 @@ def get_all_configs(
     tune_coop: bool = True,
     # tune_raster_order=True,
 ) -> List[GemmConfig]:
-    assert device_capacity in [9, 10]
+    if device_capacity not in [9, 10]:
+        return []
     if device_capacity == 9:
         tile_n_vals = [128, 144, 160, 176, 192, 208]
         tile_mn_coop_vals = [(256, tile_n) for tile_n in tile_n_vals] + [

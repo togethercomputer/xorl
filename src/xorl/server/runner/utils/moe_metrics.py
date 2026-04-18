@@ -69,7 +69,7 @@ class MoeMetricsTracker:
             self.enabled = True
             logger.info(f"MoE expert metrics collection enabled (num_experts={num_experts})")
         else:
-            logger.warning("Could not enable Qwen3 MoE expert metrics - module not available")
+            logger.debug("MoE expert metrics not available (enable_expert_metrics not implemented)")
 
     def collect(self, step: int, forward_backward_time: float) -> dict:
         """

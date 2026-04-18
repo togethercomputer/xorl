@@ -103,7 +103,7 @@ class SyncWeightsData:
     group_name: str = "weight_sync_group"
     buffer_size_mb: int = 1024
     sync_method: str = "nccl_broadcast"
-    flush_cache: bool = True
+    flush_cache: bool = False
     pause_mode: str = "retract"
     weight_version: Optional[str] = None
     quantization: Optional[Dict[str, Any]] = None

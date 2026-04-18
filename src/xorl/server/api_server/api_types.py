@@ -803,9 +803,10 @@ class SyncInferenceWeightsRequest(BaseModel):
     group_name: str = Field(default="weight_sync_group", description="Name of the NCCL process group")
     buffer_size_mb: int = Field(default=1024, description="Size of each transfer bucket in MB (to avoid OOM)")
     flush_cache: bool = Field(
-        default=True,
+        default=False,
         description="Whether to flush inference KV cache after weight sync. "
-        "Set to False to keep cached KV when weights haven't changed significantly.",
+        "Usually not needed: the radix cache is keyed on token sequences, "
+        "so stale KV entries from previous weights are evicted naturally.",
     )
     pause_mode: Literal["retract", "abort", "in_place"] = Field(
         default="retract",

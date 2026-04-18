@@ -1233,7 +1233,7 @@ class RunnerDispatcher:
     # Health Check Handlers
     # ========================================================================
 
-    async def _handle_health_check(self) -> Dict[str, Any]:
+    async def _handle_health_check(self, command_dict: Dict[str, Any] = None) -> Dict[str, Any]:
         """Handle health check on all ranks (unified handler)."""
         logger.debug(f"Rank {self.rank}: Health check")
 
