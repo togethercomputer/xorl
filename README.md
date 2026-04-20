@@ -22,7 +22,7 @@ XoRL is a distributed training framework designed for large language models with
 
 | Repo &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; | Description |
 |---|---|
-| **[xorl](https://github.com/togethercomputer/xorl-internal)** | Distributed training framework — local SFT/pretraining and server-mode RL training |
+| **[xorl](https://github.com/togethercomputer/xorl)** | Distributed training framework — local SFT/pretraining and server-mode RL training |
 | **[xorl-client](https://github.com/togethercomputer/xorl-client)** | Lightweight Python SDK for driving the xorl training server (forward/backward, optimizer steps, checkpointing, sampling) |
 | **[xorl-sglang](https://github.com/togethercomputer/xorl-sglang)** | Fork of [SGLang](https://github.com/sgl-project/sglang) with weight-sync APIs, MoE routing export, and numerical alignment for online RL |
 
@@ -48,8 +48,8 @@ XoRL is a distributed training framework designed for large language models with
 ## 🚀 Installation
 
 ```bash
-git clone --recurse-submodules git@github.com:togethercomputer/xorl-internal.git
-cd xorl-internal
+git clone --recurse-submodules git@github.com:togethercomputer/xorl.git
+cd xorl
 ```
 
 > Already cloned without `--recurse-submodules`? Run `git submodule update --init --recursive`
@@ -102,7 +102,7 @@ pip install -e .
 
 > **Note:** The default `pyproject.toml` uses PyTorch 2.10.0. sglang requires PyTorch 2.9.1, so the two cannot coexist in the same environment unless you use `pyproject.sglang.toml`.
 
-See the [installation guide](https://togethercomputer.github.io/xorl-internal/getting-started/installation/) for full setup including optional dependencies (DeepEP, Flash Attention).
+See the [installation guide](https://togethercomputer.github.io/xorl/getting-started/installation/) for full setup including optional dependencies (DeepEP, Flash Attention).
 
 ## ⚡ Quick Start
 

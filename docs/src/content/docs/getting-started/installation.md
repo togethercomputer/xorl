@@ -13,8 +13,8 @@ title: "Installation"
 ## Clone the repo
 
 ```bash
-git clone --recurse-submodules https://github.com/togethercomputer/xorl-internal
-cd xorl-internal
+git clone --recurse-submodules https://github.com/togethercomputer/xorl
+cd xorl
 ```
 
 > Already cloned without `--recurse-submodules`? Run `git submodule update --init --recursive`

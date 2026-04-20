@@ -109,7 +109,7 @@ future = requests.post(f"{base_url}/api/v1/optim_step", json={
 
 ### Example: SFT on No Robots
 
-[`examples/server/no_robot_sft/`](https://github.com/togethercomputer/xorl-internal/tree/main/examples/server/no_robot_sft) — Supervised fine-tuning on the [No Robots](https://huggingface.co/datasets/HuggingFaceH4/no_robots) dataset using `xorl_client`.
+[`examples/server/no_robot_sft/`](https://github.com/togethercomputer/xorl/tree/main/examples/server/no_robot_sft) — Supervised fine-tuning on the [No Robots](https://huggingface.co/datasets/HuggingFaceH4/no_robots) dataset using `xorl_client`.
 
 ```bash
 # 1. Start the training server
@@ -131,7 +131,7 @@ The script uses `xorl_client.TrainingClient` to drive a LoRA SFT loop with onlin
 
 ### Example: Password Memorization (end-to-end weight sync)
 
-[`examples/server/password_memorization/`](https://github.com/togethercomputer/xorl-internal/tree/main/examples/server/password_memorization) — End-to-end test for the training → weight sync → inference pipeline. Trains a model to memorize 3 secret codes via SFT, syncs weights to a running xorl-sglang instance, and queries inference to verify recall.
+[`examples/server/password_memorization/`](https://github.com/togethercomputer/xorl/tree/main/examples/server/password_memorization) — End-to-end test for the training → weight sync → inference pipeline. Trains a model to memorize 3 secret codes via SFT, syncs weights to a running xorl-sglang instance, and queries inference to verify recall.
 
 ```bash
 # 1. Start the training server
@@ -149,7 +149,7 @@ python examples/server/password_memorization/run_password_test.py \
     --model Qwen/Qwen3-8B --steps 16 --lr 1e-5
 ```
 
-Supports all training modes (full, LoRA, QLoRA nvfp4/block_fp8/nf4), LR schedules (constant, cosine, warmup+cosine), and FP8 weight sync re-quantization. See the [example README](https://github.com/togethercomputer/xorl-internal/tree/main/examples/server/password_memorization/README.md) for the full test matrix across Qwen3-8B, Qwen3-30B, and Qwen3-235B.
+Supports all training modes (full, LoRA, QLoRA nvfp4/block_fp8/nf4), LR schedules (constant, cosine, warmup+cosine), and FP8 weight sync re-quantization. See the [example README](https://github.com/togethercomputer/xorl/tree/main/examples/server/password_memorization/README.md) for the full test matrix across Qwen3-8B, Qwen3-30B, and Qwen3-235B.
 
 ## LoRA Fine-tuning
 

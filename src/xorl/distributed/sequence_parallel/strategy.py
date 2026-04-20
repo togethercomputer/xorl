@@ -19,7 +19,6 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 
-from ...models.layers.rope import apply_rotary_pos_emb
 from .async_ulysses import async_ulysses_output_projection, async_ulysses_qkv_projection
 from .data import slice_position_embedding
 from .ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
@@ -308,6 +307,9 @@ class UlyssesAsyncStrategy(CPStrategy):
         q = q.unsqueeze(0)
         k = k.unsqueeze(0)
         v = v.unsqueeze(0)
+
+        # Lazy-imported to break an import cycle with xorl.models.layers.attention
+        from ...models.layers.rope import apply_rotary_pos_emb  # noqa: PLC0415
 
         cos, sin = position_embeddings  # full-length S_full (NOT sliced)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
