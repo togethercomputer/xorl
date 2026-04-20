@@ -100,10 +100,25 @@ def prepare_datasets(
         logger.info_rank0(f"Creating dummy dataset: {4096} samples x {seq_len} tokens")
         dataset = _create_dummy_dataset(seq_len=seq_len, seed=args.train.seed, vocab_size=len(tokenizer))
 
-        if args.data.sample_packing_method and args.data.sample_packing_method != "none":
-            train_dataset = PackingDataset(args, tokenizer, dataset, split="train")
-        else:
-            train_dataset = dataset
+        def _build_train_dataset():
+            if args.data.sample_packing_method and args.data.sample_packing_method != "none":
+                return PackingDataset(args, tokenizer, dataset, split="train")
+            return dataset
+
+        # PackingDataset computes bins on rank 0 and caches them; non-zero
+        # ranks load from that cache. Gate with the same rank-0-first +
+        # barrier pattern used below so non-zero ranks don't race the cache.
+        is_distributed = dist.is_available() and dist.is_initialized()
+        is_rank_zero = not is_distributed or dist.get_rank() == 0
+
+        if is_rank_zero:
+            train_dataset = _build_train_dataset()
+
+        if is_distributed:
+            dist.barrier()
+
+        if is_distributed and not is_rank_zero:
+            train_dataset = _build_train_dataset()
 
         return train_dataset, None
 
