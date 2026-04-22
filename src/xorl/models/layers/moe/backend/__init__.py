@@ -52,7 +52,14 @@ EP_EXPERT_COMPUTE: Dict[str, Callable] = {}
 try:
     from xorl.ops.moe.triton import TritonEPGroupGemm
 
-    EP_EXPERT_COMPUTE["triton"] = TritonEPGroupGemm.apply
+    def _triton_ep_apply(
+        permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores=None, hidden_act="silu"
+    ):
+        return TritonEPGroupGemm.apply(
+            permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores, hidden_act
+        )
+
+    EP_EXPERT_COMPUTE["triton"] = _triton_ep_apply
 except ImportError:
     pass
 
@@ -60,10 +67,12 @@ except ImportError:
 try:
     from xorl.ops.moe.quack import QuackEPGroupGemm as _QuackEPGroupGemm
 
-    def _quack_ep_fused(permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores=None):
-        gate_proj = gate_up_proj[..., :intermediate_size].contiguous()
-        up_proj = gate_up_proj[..., intermediate_size:].contiguous()
-        return _QuackEPGroupGemm.apply(permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores)
+    def _quack_ep_fused(
+        permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores=None, hidden_act="silu"
+    ):
+        return _QuackEPGroupGemm.apply(
+            permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores, hidden_act
+        )
 
     EP_EXPERT_COMPUTE["quack"] = _quack_ep_fused
 except ImportError:
@@ -73,10 +82,11 @@ except ImportError:
 try:
     from .native import native_ep_compute as _native_ep_compute
 
-    def _native_ep_fused(permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores=None):
-        gate_proj = gate_up_proj[..., :intermediate_size].contiguous()
-        up_proj = gate_up_proj[..., intermediate_size:].contiguous()
-        return _native_ep_compute(permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores)
+    def _native_ep_fused(
+        permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores=None, hidden_act="silu"
+    ):
+        del intermediate_size
+        return _native_ep_compute(permute_tokens, cumsum, gate_up_proj, down_proj, expert_scores, hidden_act=hidden_act)
 
     EP_EXPERT_COMPUTE["native"] = _native_ep_fused
 except ImportError:

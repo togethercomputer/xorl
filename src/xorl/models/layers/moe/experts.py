@@ -71,6 +71,10 @@ class MoEExperts(nn.Module):
             requires_grad=True,
         )
         self.act_fn = ACT2FN[hidden_act]
+        # String kind used by triton/native/quack backends (avoids name-sniffing).
+        from xorl.ops.moe.triton import normalize_hidden_act  # noqa: PLC0415
+
+        self.hidden_act = normalize_hidden_act(hidden_act)
 
         # EP dispatch strategy: "alltoall" (default) or "deepep" (NVLink-optimized)
         self.ep_dispatch: str = "alltoall"
@@ -140,6 +144,8 @@ class MoEExperts(nn.Module):
             up_proj,
             self.down_proj,
             num_experts=self.num_experts,
+            hidden_act=self.hidden_act,
+            gate_up_proj=self.gate_up_proj,
         )
 
     @torch.compiler.disable
@@ -235,6 +241,7 @@ class MoEExperts(nn.Module):
             self.down_proj,
             self.intermediate_size,
             expert_scores,
+            hidden_act=self.hidden_act,
         )
 
         # Step 3: Combine expert outputs back to original ranks
@@ -268,6 +275,7 @@ class MoEExperts(nn.Module):
             self.down_proj,
             self.intermediate_size,
             expert_scores,
+            hidden_act=self.hidden_act,
         )
         ev[3].record()
 

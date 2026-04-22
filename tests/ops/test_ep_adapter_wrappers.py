@@ -159,7 +159,7 @@ def test_adapter_forwards_expert_scores(monkeypatch, backend_type, class_name):
     ) = _make_test_data()
 
     fn_cls = getattr(kernel_module, class_name)
-    output = fn_cls.apply(permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores)
+    output = fn_cls.apply(permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores)
 
     ref = reference_ep_forward(permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores)
     torch.testing.assert_close(output, ref)
@@ -173,9 +173,16 @@ def test_adapter_source_forwards_expert_scores():
     """
     source = _BACKEND_INIT_PATH.read_text()
 
-    assert "_QuackEPGroupGemm.apply(permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores)" in source, (
-        "_quack_ep_fused does not forward expert_scores to _QuackEPGroupGemm.apply()"
+    assert "expert_scores" in source and "_QuackEPGroupGemm.apply(" in source, (
+        "_QuackEPGroupGemm.apply() call missing from backend/__init__.py"
     )
-    assert "_native_ep_compute(permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores)" in source, (
-        "_native_ep_fused does not forward expert_scores to _native_ep_compute()"
-    )
+    # Quack EP shim must forward expert_scores (and hidden_act) through.
+    assert (
+        "_QuackEPGroupGemm.apply(\n            permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores, hidden_act\n        )"
+        in source
+    ), "_quack_ep_fused does not forward expert_scores to _QuackEPGroupGemm.apply()"
+    # Native EP shim must forward expert_scores (and hidden_act) through.
+    assert (
+        "_native_ep_compute(permute_tokens, cumsum, gate_up_proj, down_proj, expert_scores, hidden_act=hidden_act)"
+        in source
+    ), "_native_ep_fused does not forward expert_scores to _native_ep_compute()"
