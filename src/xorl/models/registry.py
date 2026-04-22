@@ -21,6 +21,7 @@ class _ModelRegistry:
     # Keyed by model_arch
     modeling_path: List[str] = field(default_factory=list)
     model_arch_name_to_cls: Dict[str, Union[Type[nn.Module], str]] = field(default_factory=dict)
+    import_errors: Dict[str, Exception] = field(default_factory=dict)
 
     def __post_init__(self):
         for modeling_path in self.modeling_path:
@@ -46,7 +47,8 @@ class _ModelRegistry:
                 try:
                     module = importlib.import_module(name)
                 except Exception as e:
-                    logger.warning(f"Ignore import error when loading {name}. {e}")
+                    logger.warning(f"Import error when loading {name}: {e}")
+                    self.import_errors[name] = e
                     continue
                 if hasattr(module, "ModelClass"):
                     entry = module.ModelClass
