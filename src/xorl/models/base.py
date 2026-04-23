@@ -91,8 +91,10 @@ class XorlPreTrainedModel(nn.Module):
         if gradient_checkpointing_kwargs is None:
             gradient_checkpointing_kwargs = {"use_reentrant": False}
 
-        # Pop selective checkpoint config before passing to torch checkpoint
-        grad_ckpt_method = gradient_checkpointing_kwargs.pop("gradient_checkpointing_method", None)
+        # Pop selective checkpoint config before passing to torch checkpoint.
+        # Default to "recompute_full_layer" so downstream consumers can rely on
+        # `_gradient_checkpointing_method` always holding a valid mode string.
+        grad_ckpt_method = gradient_checkpointing_kwargs.pop("gradient_checkpointing_method", "recompute_full_layer")
 
         grad_ckpt_func = partial(torch.utils.checkpoint.checkpoint, **gradient_checkpointing_kwargs)
 
@@ -102,7 +104,7 @@ class XorlPreTrainedModel(nn.Module):
                 module._gradient_checkpointing_func = grad_ckpt_func
                 module._gradient_checkpointing_method = grad_ckpt_method
 
-        if grad_ckpt_method is not None:
+        if grad_ckpt_method != "recompute_full_layer":
             logger.info(f"Selective checkpointing enabled: gradient_checkpointing_method={grad_ckpt_method}")
 
         # Create routing replay instances for MoE blocks
