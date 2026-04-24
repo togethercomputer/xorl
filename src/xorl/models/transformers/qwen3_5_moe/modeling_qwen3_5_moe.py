@@ -522,7 +522,7 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
             _use_outer_checkpoint = (
                 self.gradient_checkpointing
                 and self.training
-                and getattr(self, "_gradient_checkpointing_method", "recompute_full_layer") == "recompute_full_layer"
+                and self._gradient_checkpointing_method == "recompute_full_layer"
             )
             if _use_outer_checkpoint:
                 layer_outputs = self._gradient_checkpointing_func(

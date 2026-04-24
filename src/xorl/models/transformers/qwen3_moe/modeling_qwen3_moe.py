@@ -438,14 +438,14 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         all_self_attns = () if output_attentions else None
         all_router_logits = () if output_router_logits else None
 
-        _grad_ckpt_method = getattr(self, "_gradient_checkpointing_method", None) or "recompute_full_layer"
         _grad_ckpt_active = self.gradient_checkpointing and self.training
+        _grad_ckpt_method = self._gradient_checkpointing_method if _grad_ckpt_active else None
 
         for decoder_layer in self.layers:
             if decoder_layer is None:  # PP: pruned layer
                 continue
 
-            if _grad_ckpt_active and _grad_ckpt_method == "recompute_full_layer":
+            if _grad_ckpt_method == "recompute_full_layer":
                 # Recompute entire layer in backward (including dispatch + combine)
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
@@ -457,7 +457,7 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
                     position_embeddings,
                     **kwargs,
                 )
-            elif _grad_ckpt_active and _grad_ckpt_method == "recompute_before_dispatch":
+            elif _grad_ckpt_method == "recompute_before_dispatch":
                 # Decoder layer handles checkpoint internally via _pre_dispatch_forward.
                 # Dispatch + combine run outside checkpoint (alltoall not recomputed).
                 layer_outputs = decoder_layer(

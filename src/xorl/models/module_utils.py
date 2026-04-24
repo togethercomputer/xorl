@@ -1567,6 +1567,14 @@ def compute_loss(
     return loss_fn(**loss_kwargs)
 
 
+GradientCheckpointingMethod = Literal[
+    "recompute_full_layer",
+    "recompute_before_dispatch",
+    "no_recompute",
+]
+DEFAULT_GRADIENT_CHECKPOINTING_METHOD: GradientCheckpointingMethod = "recompute_full_layer"
+
+
 class GradientCheckpointingLayer(nn.Module):
     """Base class for layers with gradient checkpointing.
 
@@ -1591,13 +1599,13 @@ class GradientCheckpointingLayer(nn.Module):
     """
 
     gradient_checkpointing = False
-    _gradient_checkpointing_method = "recompute_full_layer"
+    _gradient_checkpointing_method: GradientCheckpointingMethod = DEFAULT_GRADIENT_CHECKPOINTING_METHOD
 
     def __call__(self, *args, **kwargs):
         if (
             self.gradient_checkpointing
             and self.training
-            and self._gradient_checkpointing_method == "recompute_full_layer"
+            and self._gradient_checkpointing_method == DEFAULT_GRADIENT_CHECKPOINTING_METHOD
         ):
             return self._gradient_checkpointing_func(partial(super().__call__, **kwargs), *args)
         return super().__call__(*args, **kwargs)
@@ -1622,7 +1630,7 @@ class MoEGradientCheckpointingLayer(nn.Module):
     """
 
     gradient_checkpointing = False
-    _gradient_checkpointing_method = "recompute_full_layer"
+    _gradient_checkpointing_method: GradientCheckpointingMethod = DEFAULT_GRADIENT_CHECKPOINTING_METHOD
 
     def _pre_mlp_forward(self, hidden_states, **kwargs):
         """Layernorm → attention → layernorm. Override per model.
@@ -1662,7 +1670,7 @@ class MoEGradientCheckpointingLayer(nn.Module):
         _selective = (
             self.training
             and self.gradient_checkpointing
-            and self._gradient_checkpointing_method != "recompute_full_layer"
+            and self._gradient_checkpointing_method != DEFAULT_GRADIENT_CHECKPOINTING_METHOD
         )
         _is_moe = isinstance(self.mlp, MoEBlock)
 
