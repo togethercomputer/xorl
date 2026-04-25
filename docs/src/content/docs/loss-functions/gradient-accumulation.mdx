@@ -178,7 +178,7 @@ for module in model.modules():
 
 With `divide_factor=1.0`, the reduce-scatter **sums** gradients across ranks rather than averaging them. This is correct because `GradientAccumulateLoss` already scales each rank's backward contribution by `local_valid_tokens / global_valid_tokens` — so summing the contributions across ranks gives the correct token-average.
 
-The only exception: EP expert modules retain `set_gradient_divide_factor(ep_size)` and are marked `_is_ep_fsdp = True` so the loop above skips them. See [Expert Parallelism](/parallelism/expert_parallelism/#6-gradient-handling) for details.
+The only exception: EP expert modules retain `set_gradient_divide_factor(ep_size)` and are marked `_is_ep_fsdp = True` so the loop above skips them. See [Expert Parallelism](/xorl/parallelism/expert_parallelism/#6-gradient-handling) for details.
 
 ---
 

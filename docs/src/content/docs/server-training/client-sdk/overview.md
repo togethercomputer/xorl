@@ -16,7 +16,7 @@ Or from source:
 pip install git+https://github.com/togethercomputer/xorl-client.git
 ```
 
-xorl-client is also installed automatically with xorl — see the [installation guide](/getting-started/installation/).
+xorl-client is also installed automatically with xorl — see the [installation guide](/xorl/getting-started/installation/).
 
 ---
 

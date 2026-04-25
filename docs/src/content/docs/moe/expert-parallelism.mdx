@@ -2,7 +2,7 @@
 title: "Expert Parallelism"
 ---
 
-Expert Parallelism (EP) shards expert weights across `expert_parallel_size` GPUs. Each GPU holds `num_experts / ep_size` experts — a contiguous slice of the G dimension in [GKN layout](/moe/overview/#weight-layout-gkn-format). Non-expert parameters (attention, norms, gate linear) are replicated across the EP group.
+Expert Parallelism (EP) shards expert weights across `expert_parallel_size` GPUs. Each GPU holds `num_experts / ep_size` experts — a contiguous slice of the G dimension in [GKN layout](/xorl/moe/overview/#weight-layout-gkn-format). Non-expert parameters (attention, norms, gate linear) are replicated across the EP group.
 
 ```yaml
 train:
@@ -11,7 +11,7 @@ model:
   ep_dispatch: alltoall   # or deepep
 ```
 
-For the full technical reference — dispatch internals, device mesh construction, gradient handling, R3 routing replay, EP composition with FSDP2/PP/CP, and constraint table — see **[Expert Parallelism (Parallelism section)](/parallelism/expert_parallelism/)**.
+For the full technical reference — dispatch internals, device mesh construction, gradient handling, R3 routing replay, EP composition with FSDP2/PP/CP, and constraint table — see **[Expert Parallelism (Parallelism section)](/xorl/parallelism/expert_parallelism/)**.
 
 ---
 
@@ -74,7 +74,7 @@ For the full technical reference — dispatch internals, device mesh constructio
 | Backend | Set via | Best for |
 |---|---|---|
 | `alltoall` | `ep_dispatch: alltoall` | Any GPU topology, no extra install |
-| `deepep` | `ep_dispatch: deepep` | NVLink clusters, EP ≥ 16 — see [DeepEP](/moe/deepep/) |
+| `deepep` | `ep_dispatch: deepep` | NVLink clusters, EP ≥ 16 — see [DeepEP](/xorl/moe/deepep/) |
 
 ---
 
@@ -150,11 +150,11 @@ train:
 
 | Page | What it covers |
 |---|---|
-| [Expert Parallelism (full reference)](/parallelism/expert_parallelism/) | AllToAll internals, DeepEP buffer lifecycle, gradient divide factor, R3 mechanics, EP+PP/CP/FSDP composition, constraints, parameter reference |
-| [MoE: Expert Kernels](/moe/kernels/) | Triton/Quack/native/eager backend details, torch.compile, moe_act checkpointing |
-| [MoE: Router](/moe/router/) | Routing algorithm, R3 routing replay in detail |
-| [DeepEP](/moe/deepep/) | NVLink-optimized dispatch, SM tuning, buffer sizing |
-| [MoE: LoRA & QLoRA](/moe/lora/) | LoRA sharding on expert weights, hybrid shared LoRA |
+| [Expert Parallelism (full reference)](/xorl/parallelism/expert_parallelism/) | AllToAll internals, DeepEP buffer lifecycle, gradient divide factor, R3 mechanics, EP+PP/CP/FSDP composition, constraints, parameter reference |
+| [MoE: Expert Kernels](/xorl/moe/kernels/) | Triton/Quack/native/eager backend details, torch.compile, moe_act checkpointing |
+| [MoE: Router](/xorl/moe/router/) | Routing algorithm, R3 routing replay in detail |
+| [DeepEP](/xorl/moe/deepep/) | NVLink-optimized dispatch, SM tuning, buffer sizing |
+| [MoE: LoRA & QLoRA](/xorl/moe/lora/) | LoRA sharding on expert weights, hybrid shared LoRA |
 
 ## Source
 

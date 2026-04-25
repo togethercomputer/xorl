@@ -3,7 +3,7 @@ title: "Quick Start"
 ---
 
 
-Before running, make sure xorl is installed — see the [Installation guide](/getting-started/installation/).
+Before running, make sure xorl is installed — see the [Installation guide](/xorl/getting-started/installation/).
 
 ## Choosing a Training Mode
 

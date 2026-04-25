@@ -146,4 +146,4 @@ fwd = client.forward_backward([datum], loss_fn="policy_loss")
 
 The current `xorl-client` SDK only exposes `routed_experts`. The server can also consume `routed_expert_logits`, but that field is not yet wired through `Datum` / `TrainingClient`.
 
-See the [Router page](/moe/router/#routing-replay-r3) for details on how R3 works, and the [xorl-sglang page](/server-training/sglang/) for how routing data is exported from inference.
+See the [Router page](/xorl/moe/router/#routing-replay-r3) for details on how R3 works, and the [xorl-sglang page](/xorl/server-training/sglang/) for how routing data is exported from inference.

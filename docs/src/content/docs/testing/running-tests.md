@@ -71,4 +71,4 @@ pytest tests/e2e/ -m e2e -v
 pytest tests/e2e/qwen3_8b/test_pp.py -v
 ```
 
-Make sure the environment is set up per the [Installation guide](/getting-started/installation).
+Make sure the environment is set up per the [Installation guide](/xorl/getting-started/installation).

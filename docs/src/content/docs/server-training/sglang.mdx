@@ -45,7 +45,7 @@ Key implementation details:
 - **EP scatter**: For MoE models with expert parallelism, each EP training rank sends its local experts directly into the corresponding slice of `param.data` via P2P ops — no intermediate buffers.
 - **Health check bypass**: During weight updates, the `/health` endpoint returns 200 immediately instead of running a test generation, avoiding timeouts during NCCL operations.
 
-The training server's `nccl_broadcast` backend drives these calls — see [Backend: nccl_broadcast](/server-training/weight-sync/nccl-broadcast/) for the full protocol.
+The training server's `nccl_broadcast` backend drives these calls — see [Backend: nccl_broadcast](/xorl/server-training/weight-sync/nccl-broadcast/) for the full protocol.
 
 ### 2. MoE Routing Data Export (R3)
 
@@ -139,7 +139,7 @@ cp pyproject.sglang.toml pyproject.toml
 uv sync          # or: pip install -e .
 ```
 
-See the [installation guide](/getting-started/installation/#install-submodules) for full details.
+See the [installation guide](/xorl/getting-started/installation/#install-submodules) for full details.
 
 ## Launching xorl-sglang
 

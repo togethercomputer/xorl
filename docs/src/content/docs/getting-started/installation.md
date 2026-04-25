@@ -155,4 +155,4 @@ sudo cat /proc/driver/nvidia/params | grep -E "EnableStreamMemOPs|RegistryDwords
 
 ## Next Steps
 
-Head to the [Quick Start](/getting-started/quickstart/) to run your first training job.
+Head to the [Quick Start](/xorl/getting-started/quickstart/) to run your first training job.

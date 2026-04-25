@@ -65,7 +65,7 @@ pytest tests/
 pytest tests/server/api_server/test_checkpoint_paths.py -v
 ```
 
-Tests must pass locally before requesting review. See the [Testing](/testing/overview) section for full details.
+Tests must pass locally before requesting review. See the [Testing](/xorl/testing/overview) section for full details.
 
 ## Branch Protection
 
