@@ -448,6 +448,13 @@ class ServerArguments:
         },
     )
 
+    lora_export_format: str = field(
+        default="peft",
+        metadata={
+            "help": "On-disk layout for MoE LoRA export. 'peft' (default) writes per-expert keys in PEFT orientation. 'sglang_shared_outer' writes stacked 3D tensors under experts.w{1,2,3} in SGLang's shared_outer format (requires moe_hybrid_shared_lora=True)."
+        },
+    )
+
     # ========================================================================
     # QLoRA Configuration
     # ========================================================================
@@ -601,6 +608,7 @@ class ServerArguments:
                 "lora_alpha": self.lora_alpha,
                 "lora_target_modules": self.lora_target_modules,
                 "moe_hybrid_shared_lora": self.moe_hybrid_shared_lora,
+                "lora_export_format": self.lora_export_format,
                 "enable_qlora": self.enable_qlora,
                 "quant_format": self.quant_format,
                 "quant_group_size": self.quant_group_size,

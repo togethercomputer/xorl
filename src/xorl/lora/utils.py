@@ -37,6 +37,13 @@ _MOE_LORA_PATTERN = re.compile(r"(.*)\.mlp\.experts\.(gate_proj|up_proj|down_pro
 _MOE_PEFT_LORA_PATTERN = re.compile(
     r"(.*)\.mlp\.experts\.(shared|\d+)\.(gate_proj|up_proj|down_proj)\.lora_(A|B)\.weight$"
 )
+_MOE_SGLANG_SHARED_OUTER_PATTERN = re.compile(r"(.*)\.mlp\.experts\.(w1|w2|w3)\.lora_(A|B)\.weight$")
+
+# SGLang shared_outer format uses w1/w2/w3 slots for gate/down/up projections.
+_PROJ_TO_SGLANG_W = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
+_SGLANG_W_TO_PROJ = {v: k for k, v in _PROJ_TO_SGLANG_W.items()}
+
+LORA_EXPORT_FORMATS = ("peft", "sglang_shared_outer")
 
 
 def _get_submodule(model: nn.Module, target: str) -> Tuple[nn.Module, str]:
@@ -435,6 +442,17 @@ def convert_peft_lora_state_dict(
         else:
             key = raw_key
 
+        sglang_match = _MOE_SGLANG_SHARED_OUTER_PATTERN.match(key)
+        if sglang_match is not None:
+            prefix, w_slot, lora_type = sglang_match.groups()
+            proj_name = _SGLANG_W_TO_PROJ[w_slot]
+            internal_name = f"{prefix}.mlp.experts.{proj_name}_lora_{lora_type}"
+            # shared_outer stores 3D tensors transposed (last two dims) vs.
+            # xorl's in-memory layout. Flip them back to the in-first order.
+            restored = value.transpose(-2, -1).contiguous() if value.dim() >= 2 else value
+            converted_state_dict[internal_name] = _align_lora_tensor_shape(internal_name, restored, expected_shapes)
+            continue
+
         match = _MOE_PEFT_LORA_PATTERN.match(key)
         if match is not None:
             prefix, expert_token, proj_name, lora_type = match.groups()
@@ -478,7 +496,8 @@ def save_lora_checkpoint(
     lora_alpha: Optional[int] = None,
     moe_hybrid_shared_lora: bool = False,
     lora_state_dict: Optional[Dict[str, torch.Tensor]] = None,
-    transpose_moe_lora_to_peft: bool = False,
+    transpose_moe_lora_to_peft: bool = True,
+    lora_export_format: str = "peft",
 ) -> str:
     """
     Save LoRA weights in PEFT-compatible format.
@@ -499,12 +518,26 @@ def save_lora_checkpoint(
             get_lora_state_dict(model) call. Useful when the caller has already
             gathered weights (e.g., from FSDP2 + EP distributed model).
         transpose_moe_lora_to_peft: Whether to transpose MoE expert LoRA tensors
-            into PEFT/vLLM orientation during export. Disabled by default so
-            existing xorl call sites keep their current behavior.
+            into PEFT/SGLang orientation during export. Enabled by default so
+            exported MoE adapters match the shape convention expected by
+            inference backends. Ignored when
+            ``lora_export_format="sglang_shared_outer"``.
+        lora_export_format: On-disk layout for MoE expert LoRA. ``"peft"``
+            (default) un-stacks the 3D tensors into per-expert 2D keys. Pass
+            ``"sglang_shared_outer"`` to emit SGLang's stacked 3D shared_outer
+            layout directly (requires ``moe_hybrid_shared_lora=True``).
 
     Returns:
         Path to saved checkpoint directory
     """
+
+    if lora_export_format not in LORA_EXPORT_FORMATS:
+        raise ValueError(f"Unknown lora_export_format={lora_export_format!r}. Expected one of {LORA_EXPORT_FORMATS}.")
+    if lora_export_format == "sglang_shared_outer" and not moe_hybrid_shared_lora:
+        raise ValueError(
+            "lora_export_format='sglang_shared_outer' requires moe_hybrid_shared_lora=True "
+            "(shared_outer only makes sense for hybrid-shared MoE LoRA)."
+        )
 
     os.makedirs(save_path, exist_ok=True)
 
@@ -582,6 +615,21 @@ def save_lora_checkpoint(
 
         return result
 
+    def _sglang_shared_outer_moe_weight(name: str, stacked_tensor: torch.Tensor) -> Tuple[str, torch.Tensor]:
+        """Rename + transpose a stacked MoE tensor into SGLang shared_outer layout.
+
+        xorl stores 3D tensors in-first (A: [E_or_1, in, r], B: [E_or_1, r, out]).
+        shared_outer stores them out-first under ``experts.w{1,2,3}.lora_{A|B}.weight``.
+        """
+        match = _MOE_LORA_PATTERN.match(name)
+        if not match:
+            raise ValueError(f"Invalid MoE LoRA parameter name: {name}")
+        prefix, proj_name, lora_type = match.group(1), match.group(2), match.group(3)
+        w_slot = _PROJ_TO_SGLANG_W[proj_name]
+        peft_key = f"{_PEFT_BASE_MODEL_PREFIX}{prefix}.mlp.experts.{w_slot}.lora_{lora_type}.weight"
+        out_tensor = stacked_tensor.transpose(-2, -1).contiguous().to(torch.bfloat16)
+        return peft_key, out_tensor
+
     # Convert keys to PEFT format: base_model.model.{converted_key}
     peft_state_dict = {}
     detected_modules = set()
@@ -590,18 +638,20 @@ def save_lora_checkpoint(
     for key, value in lora_state_dict.items():
         # Check if this is a stacked MoE LoRA parameter
         if _is_moe_lora_param(key):
-            # Unmerge stacked MoE LoRA weights into per-expert format
-            per_expert_weights = _unmerge_moe_lora_weights(key, value)
-            peft_state_dict.update(per_expert_weights)
+            if lora_export_format == "sglang_shared_outer":
+                peft_key, out_tensor = _sglang_shared_outer_moe_weight(key, value)
+                peft_state_dict[peft_key] = out_tensor
+            else:
+                # Unmerge stacked MoE LoRA weights into per-expert format
+                per_expert_weights = _unmerge_moe_lora_weights(key, value)
+                peft_state_dict.update(per_expert_weights)
             # Detect target modules from MoE LoRA
             match = _MOE_LORA_PATTERN.match(key)
             if match:
                 detected_modules.add(match.group(2))  # gate_proj, up_proj, or down_proj
                 if detected_r is None and match.group(3) == "A":
                     # Xorl stores MoE LoRA A as [num_experts, in_features, r].
-                    # When transpose_moe_lora_to_peft is enabled, the exported
-                    # PEFT tensor rank is the last dimension of the stacked input.
-                    detected_r = value.shape[2] if transpose_moe_lora_to_peft else value.shape[1]
+                    detected_r = value.shape[2]
         else:
             # Extract module name for target_modules detection
             parts = key.split(".")
@@ -649,8 +699,16 @@ def save_lora_checkpoint(
         "peft_type": "LORA",
         "inference_mode": True,
         "fan_in_fan_out": False,
-        "moe_hybrid_shared_lora": moe_hybrid_shared_lora,
     }
+    if lora_export_format == "sglang_shared_outer":
+        adapter_config["_sglang_lora_format"] = "shared_outer"
+        # SGLang's lora_manager classifies adapters via the moe_hybrid_shared_lora
+        # / shared_moe_lora keys in hf_config. shared_outer IS hybrid_shared
+        # on-disk, so mirror the flag here so SGLang doesn't mis-classify it as
+        # per_expert (which would reject loading under --lora-moe-format hybrid_shared).
+        adapter_config["moe_hybrid_shared_lora"] = True
+    else:
+        adapter_config["moe_hybrid_shared_lora"] = moe_hybrid_shared_lora
 
     config_path = os.path.join(save_path, "adapter_config.json")
     with open(config_path, "w") as f:

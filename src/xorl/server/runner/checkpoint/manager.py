@@ -148,17 +148,27 @@ class CheckpointManager:
         if self._adapter_manager is not None:
             self._adapter_manager.switch_adapter(model_id, auto_register=True)
 
-        # Use fast adapter-manager path when available (avoids FSDP unshard)
-        if self._adapter_manager is not None and model_id in self._adapter_manager.adapters:
+        # Use fast adapter-manager path when available (avoids FSDP unshard).
+        # Skip the fast path for MoE LoRA: it reads rank-local params without an
+        # all_gather across EP ranks, so it would export only num_local_experts
+        # (e.g. 32) instead of num_experts (e.g. 128) for per-expert MoE tensors.
+        is_moe_lora = bool(self.lora_config.get("moe_hybrid_shared_lora", False)) or any(
+            m in (self.lora_config.get("lora_target_modules") or []) for m in ("gate_proj", "up_proj", "down_proj")
+        )
+        if self._adapter_manager is not None and model_id in self._adapter_manager.adapters and not is_moe_lora:
             logger.info(f"Rank {self.rank}: Using fast adapter-manager LoRA save path")
             lora_state_dict = self._gather_adapter_lora_params(model_id)
         else:
             # Fallback: EP+FSDP2-aware LoRA weight gathering (collective operation)
+            logger.info(
+                f"Rank {self.rank}: Using collective (EP+FSDP2-aware) LoRA save path (is_moe_lora={is_moe_lora})"
+            )
             lora_state_dict = get_lora_state_dict(self.model)
 
         # Only rank 0 writes files
         if self.rank == 0:
             target_modules, lora_alpha = self._get_lora_save_config()
+            lora_export_format = self.lora_config.get("lora_export_format", "peft")
             save_lora_checkpoint(
                 model=self.model,
                 save_path=save_path,
@@ -168,6 +178,7 @@ class CheckpointManager:
                 lora_alpha=lora_alpha,
                 moe_hybrid_shared_lora=self.lora_config.get("moe_hybrid_shared_lora", False),
                 lora_state_dict=lora_state_dict,
+                lora_export_format=lora_export_format,
             )
 
         # Cleanup
