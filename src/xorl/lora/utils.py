@@ -907,7 +907,9 @@ def inject_lora_into_model_with_moe(
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
     # Separate attention modules from MLP/expert modules
-    attention_modules = [m for m in target_modules if m in ["q_proj", "k_proj", "v_proj", "o_proj", "lm_head"]]
+    attention_modules = [
+        m for m in target_modules if m in ["q_proj", "k_proj", "v_proj", "qkv_proj", "o_proj", "lm_head"]
+    ]
     expert_modules = [m for m in target_modules if m in ["gate_proj", "up_proj", "down_proj"]]
 
     # Step 1: Inject LoRA into standard nn.Linear layers
