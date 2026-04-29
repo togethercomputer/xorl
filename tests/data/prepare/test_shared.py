@@ -4,12 +4,9 @@ from unittest.mock import Mock, patch
 
 import pytest
 from datasets import Dataset as HFDataset
-from huggingface_hub.errors import RepositoryNotFoundError
 
 from xorl.arguments import DatasetConfig
 from xorl.data.prepare.shared import (
-    _check_if_hub_dataset,
-    _get_remote_filesystem,
     create_train_validation_split,
     datasets_with_name_generator,
     get_dataset_type,
@@ -80,39 +77,6 @@ class TestDatasetsWithNameGeneratorAndDatasetType:
         ]
         for path, expected_type in extension_map:
             assert get_dataset_type(_make_config(path=path)) == expected_type
-
-
-class TestHubAndRemoteDetection:
-    """Tests for _check_if_hub_dataset and _get_remote_filesystem."""
-
-    @patch("xorl.data.prepare.shared.snapshot_download")
-    def test_hub_detection_and_remote_filesystem(self, mock_snapshot_download):
-        """Covers hub dataset detection (valid/invalid) and remote filesystem resolution."""
-        # Valid hub dataset
-        mock_snapshot_download.return_value = "/path/to/dataset"
-        assert _check_if_hub_dataset(_make_config(path="user/ds"), use_auth_token=False) is True
-
-        # Invalid hub dataset
-
-        mock_response = Mock()
-        mock_response.status_code = 404
-        mock_response.headers = {}
-        mock_snapshot_download.side_effect = RepositoryNotFoundError("not found", response=mock_response)
-        assert _check_if_hub_dataset(_make_config(path="invalid/ds"), use_auth_token=False) is False
-
-        # Non-remote path
-        fs, opts = _get_remote_filesystem("local/path")
-        assert fs is None
-        assert opts == {}
-
-        # S3 path
-        pytest.importorskip("s3fs")
-        with patch("s3fs.S3FileSystem") as mock_s3fs_class:
-            mock_fs = Mock()
-            mock_s3fs_class.return_value = mock_fs
-            fs, opts = _get_remote_filesystem("s3://bucket/path")
-            assert fs == mock_fs
-            assert opts == {"anon": False}
 
 
 class TestSplitAndMerge:

@@ -32,11 +32,8 @@ def test_lora_mixed_precision_keeps_base_bf16_and_skips_generic_upcast(monkeypat
         captured["lora_b_dtype"] = model.proj.lora_B.dtype
         return model
 
-    monkeypatch.setattr("xorl.models.build_foundation_model", fake_build_foundation_model)
-    monkeypatch.setattr(
-        "xorl.distributed.torch_parallelize.build_parallelize_model",
-        fake_parallelize,
-    )
+    monkeypatch.setattr("xorl.trainers.model_builder.build_foundation_model", fake_build_foundation_model)
+    monkeypatch.setattr("xorl.trainers.model_builder._parallelize", fake_parallelize)
     monkeypatch.setattr(
         "xorl.trainers.model_builder.helper.print_device_mem_info",
         lambda *args, **kwargs: None,

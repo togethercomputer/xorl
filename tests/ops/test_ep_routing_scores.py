@@ -63,6 +63,7 @@ def _patch_ep_kernels(monkeypatch, module_name: str):
     moe_stub.moe_gather = None
     moe_stub.moe_index_compute = None
     moe_stub.moe_scatter = None
+    moe_stub.moe_add_gather = None
     monkeypatch.setattr(import_utils, "is_fused_moe_available", lambda: True)
     sys.modules.pop("xorl.ops.group_gemm.kernel.moe", None)
     sys.modules.pop("xorl.ops.group_gemm.kernel.group_gemm", None)
@@ -152,27 +153,16 @@ def test_ep_group_gemm_propagates_routing_score_gradients(monkeypatch, module_na
     expert_scores = torch.rand(num_tokens, dtype=dtype, requires_grad=True)
     upstream = torch.randn(num_tokens, hidden_dim, dtype=dtype)
 
-    # TritonEPGroupGemm uses fused gate_up_proj + intermediate_size (int),
-    # QuackEPGroupGemm uses separate gate_proj and up_proj.
-    if "triton" in module_name:
-        gate_up_proj = torch.cat([gate_proj, up_proj], dim=-1)
-        output = fn.apply(
-            permute_tokens,
-            cumsum,
-            gate_up_proj,
-            down_proj,
-            intermediate_size,
-            expert_scores,
-        )
-    else:
-        output = fn.apply(
-            permute_tokens,
-            cumsum,
-            gate_proj,
-            up_proj,
-            down_proj,
-            expert_scores,
-        )
+    # Both TritonEPGroupGemm and QuackEPGroupGemm take a fused gate_up_proj + intermediate_size (int).
+    gate_up_proj = torch.cat([gate_proj, up_proj], dim=-1)
+    output = fn.apply(
+        permute_tokens,
+        cumsum,
+        gate_up_proj,
+        down_proj,
+        intermediate_size,
+        expert_scores,
+    )
     output.backward(upstream)
     grad_scores = expert_scores.grad.detach().clone()
 

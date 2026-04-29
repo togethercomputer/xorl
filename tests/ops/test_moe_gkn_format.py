@@ -260,6 +260,7 @@ class TestBackendGKN:
                 raise ImportError
             from xorl.ops.moe.triton import TritonMoeExpertsFunction  # noqa: PLC0415
 
+            gate_up_cuda = torch.cat([gate_cuda, up_cuda], dim=-1)
             triton_out = TritonMoeExpertsFunction.apply(
                 num_experts,
                 rw,
@@ -268,6 +269,7 @@ class TestBackendGKN:
                 gate_cuda,
                 up_cuda,
                 down_cuda,
+                gate_up_cuda,
             )
             torch.testing.assert_close(triton_out, ref_out, atol=0.01, rtol=0.01)
 
@@ -282,7 +284,8 @@ class TestBackendGKN:
                 num_experts, intermediate_size, hidden_size, device=device, dtype=dtype, requires_grad=True
             )
             h_g = torch.randn(num_tokens, hidden_size, device=device, dtype=dtype, requires_grad=True)
-            out_g = TritonMoeExpertsFunction.apply(num_experts, rw, selected, h_g, gate_g, up_g, down_g)
+            gate_up_g = torch.cat([gate_g, up_g], dim=-1)
+            out_g = TritonMoeExpertsFunction.apply(num_experts, rw, selected, h_g, gate_g, up_g, down_g, gate_up_g)
             out_g.sum().backward()
             assert h_g.grad is not None and h_g.grad.abs().max() > 0
             assert gate_g.grad is not None and gate_g.grad.abs().max() > 0

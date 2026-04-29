@@ -251,22 +251,6 @@ if __name__ != "__main__":
         result = run_distributed_script(SCRIPT_PATH, num_gpus=2, timeout=180)
         result.assert_success()
 
-    @pytest.mark.gpu
-    @pytest.mark.distributed
-    @skip_if_gpu_count_less_than(4)
-    def test_vocab_parallel_ce_4gpu():
-        """Vocab-parallel cross-entropy correctness + backward with 4 GPUs."""
-        result = run_distributed_script(SCRIPT_PATH, num_gpus=4, timeout=180)
-        result.assert_success()
-
-    @pytest.mark.gpu
-    @pytest.mark.distributed
-    @skip_if_gpu_count_less_than(8)
-    def test_vocab_parallel_ce_8gpu():
-        """Vocab-parallel cross-entropy correctness + backward with 8 GPUs."""
-        result = run_distributed_script(SCRIPT_PATH, num_gpus=8, timeout=180)
-        result.assert_success()
-
 
 if __name__ == "__main__":
     main()

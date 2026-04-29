@@ -99,7 +99,7 @@ class TestParallelPlanLoRASlicing:
         lora_tensor = torch.randn(global_shape)
 
         for ep_rank, expected_slice in [(0, slice(0, 4)), (1, slice(4, 8))]:
-            with patch("xorl.distributed.parallel_state.get_parallel_state") as mock_ps:
+            with patch("xorl.distributed.parallel_plan.get_parallel_state") as mock_ps:
                 mock_state = MagicMock()
                 mock_state.ep_enabled = True
                 mock_state.ep_rank = ep_rank
