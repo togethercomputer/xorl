@@ -50,6 +50,11 @@ def build_lr_scheduler(
     lr_min: float = 1e-7,
     lr_start: float = 0.0,
 ):
+    if lr <= 0:
+        raise ValueError(f"lr must be > 0, got {lr}.")
+    if not 0.0 <= lr_warmup_ratio <= 1.0:
+        raise ValueError(f"lr_warmup_ratio must be in [0, 1], got {lr_warmup_ratio}.")
+
     # Handle MultiOptimizer by creating one scheduler per underlying optimizer
     if hasattr(optimizer, "_is_multi_optimizer") or isinstance(optimizer, dict):
         schedulers = {}
@@ -81,6 +86,8 @@ def build_lr_scheduler(
             num_warmup_steps=lr_warmup_steps,
             num_training_steps=train_steps,
             init_lr=lr,
+            lr_decay_ratio=lr_decay_ratio,
+            min_lr=lr_min,
             lr_start=lr_start,
         )
 
@@ -125,23 +132,26 @@ def get_linear_schedule_with_warmup(
     num_training_steps: int,
     init_lr: float,
     last_epoch: int = -1,
+    lr_decay_ratio: float = 1.0,
     min_lr: float = 1e-7,
     lr_start: float = 0.0,
 ):
     """
-    Creates a schedule with a learning rate that decreases linearly from the initial lr set in the optimizer to 0,
-    after a warmup period during which it increases linearly from 0 to the initial lr set in the optimizer.
+    Creates a schedule with a learning rate that decreases linearly from the initial lr set in the optimizer to
+    min_lr, after a warmup period during which it increases linearly from lr_start to the initial lr.
     """
+    lr_decay_steps = int(num_training_steps * lr_decay_ratio)
 
     def _lr_lambda(current_step: int):
         if current_step < num_warmup_steps:
             return (lr_start + (init_lr - lr_start) * current_step / max(1, num_warmup_steps)) / init_lr
 
         min_lr_ratio = min_lr / init_lr
-        return max(
-            min_lr_ratio,
-            float(num_training_steps - current_step) / float(max(1, num_training_steps - num_warmup_steps)),
-        )
+        if current_step >= lr_decay_steps:
+            return min_lr_ratio
+
+        progress = float(current_step - num_warmup_steps) / float(max(1, lr_decay_steps - num_warmup_steps))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * (1.0 - progress)
 
     return LambdaLR(optimizer, _lr_lambda, last_epoch)
 
@@ -163,19 +173,18 @@ def get_cosine_schedule_with_warmup(
     and the initial lr set in the optimizer.
     """
 
-    def lr_lambda(current_step: int):
-        lr_decay_steps = int(num_training_steps * lr_decay_ratio)
+    lr_decay_steps = int(num_training_steps * lr_decay_ratio)
+
+    def _lr_lambda(current_step: int):
         if current_step < num_warmup_steps:
             return (lr_start + (init_lr - lr_start) * current_step / max(1, num_warmup_steps)) / init_lr
 
         min_lr_ratio = min_lr / init_lr
-        if current_step > lr_decay_steps:
+        if current_step >= lr_decay_steps:
             return min_lr_ratio
 
         progress = float(current_step - num_warmup_steps) / float(max(1, lr_decay_steps - num_warmup_steps))
-        assert 0 <= progress <= 1
         factor = 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))
-        factor = factor * (1 - min_lr_ratio) + min_lr_ratio
-        return max(0, factor)
+        return min_lr_ratio + (1.0 - min_lr_ratio) * factor
 
-    return LambdaLR(optimizer, lr_lambda, last_epoch)
+    return LambdaLR(optimizer, _lr_lambda, last_epoch)
