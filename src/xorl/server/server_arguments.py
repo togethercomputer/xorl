@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Literal, Optional
 
 import yaml
 
+from xorl.ops.loss import CrossEntropyMode
+
 
 @dataclass
 class ServerArguments:
@@ -224,7 +226,7 @@ class ServerArguments:
         default="meta", metadata={"help": "Device for model initialization"}
     )
 
-    ce_mode: Literal["eager", "compiled"] = field(
+    ce_mode: CrossEntropyMode = field(
         default="compiled",
         metadata={
             "help": "Cross-entropy implementation: 'compiled' (RECOMMENDED, torch.compile) or 'eager' (baseline, may OOM at 32K)"

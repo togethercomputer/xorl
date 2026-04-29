@@ -14,6 +14,9 @@ import torch.nn.functional as F
 # Cache for compiled cross-entropy functions
 _compiled_ce_cache: Dict[int, Callable] = {}
 
+# Cache for compiled CE+LSE^2 (Z-loss) functions
+_compiled_ce_and_lse_sq_cache: Dict[int, Callable] = {}
+
 # Check if auto_chunker is available
 _AUTO_CHUNKER_AVAILABLE = None
 
@@ -74,6 +77,31 @@ def compiled_cross_entropy_function(
     return compute_ce_fn(hidden_states, weight, labels, ignore_index)
 
 
+def compiled_ce_and_lse_sq_function(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    labels: torch.Tensor,
+    ignore_index: int = -100,
+    num_chunks: int = 64,
+    lm_head_fp32: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-token cross-entropy AND per-token logsumexp(logits)^2 in one fused pass.
+
+    Used for the Z-loss auxiliary term. Without auto_chunker we'd have to
+    materialize the [batch*seq, vocab] logits tensor twice (once for CE, once
+    for LSE), so we co-compute them inside the same compiled region.
+
+    Returns:
+        (per_token_ce, per_token_lse_sq) — both shape (batch * seq_len,).
+        per_token_lse_sq is zero at ignored-index positions.
+    """
+    if lm_head_fp32:
+        hidden_states = hidden_states.float()
+        weight = weight.float()
+    fn = _get_compiled_ce_and_lse_sq_fn(num_chunks)
+    return fn(hidden_states, weight, labels, ignore_index)
+
+
 def _get_compiled_ce_fn(num_chunks: int, reduction: str = "none") -> Callable:
     """
     Get or create a compiled cross-entropy function.
@@ -107,3 +135,26 @@ def _get_compiled_ce_fn(num_chunks: int, reduction: str = "none") -> Callable:
         else:
             _compiled_ce_cache[cache_key] = torch.compile(_compute_ce)
     return _compiled_ce_cache[cache_key]
+
+
+def _get_compiled_ce_and_lse_sq_fn(num_chunks: int) -> Callable:
+    """Get or create a compiled CE+LSE^2 function (chunked along the token dim)."""
+    cache_key = num_chunks
+    if cache_key not in _compiled_ce_and_lse_sq_cache:
+
+        def _compute_ce_and_lse_sq(hidden_states, weight, labels, ignore_index):
+            logits = (hidden_states @ weight.t()).float()
+            per_token_ce = F.cross_entropy(logits, labels, reduction="none", ignore_index=ignore_index)
+            lse = torch.logsumexp(logits, dim=-1)
+            valid = (labels != ignore_index).to(lse.dtype)
+            per_token_lse_sq = (lse * lse) * valid
+            return per_token_ce, per_token_lse_sq
+
+        if num_chunks > 0 and _check_auto_chunker_available():
+            _compiled_ce_and_lse_sq_cache[cache_key] = torch.compile(
+                _compute_ce_and_lse_sq,
+                options={"auto_chunker.enable": True, "auto_chunker.num_chunk": num_chunks},
+            )
+        else:
+            _compiled_ce_and_lse_sq_cache[cache_key] = torch.compile(_compute_ce_and_lse_sq)
+    return _compiled_ce_and_lse_sq_cache[cache_key]

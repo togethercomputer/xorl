@@ -25,6 +25,7 @@ from typing import (
 import torch
 import yaml
 
+from .ops.loss import CrossEntropyMode
 from .utils import logging
 from .utils.checkpoint_utils import get_checkpoint_path
 
@@ -663,6 +664,29 @@ class TrainingArguments:
     max_grad_norm: float = field(
         default=1.0,
         metadata={"help": "Clip value for gradient norm."},
+    )
+    softmax_auxiliary_loss: bool = field(
+        default=False,
+        metadata={
+            "help": "Add a Z-loss auxiliary term on the LM-head logits: "
+            "mean(logsumexp(logits)^2) over valid tokens. Encourages the partition "
+            "function log(Z) to stay near zero, which stabilizes training at large "
+            "vocab and high learning rate (PaLM-style)."
+        },
+    )
+    auxiliary_loss_multiplier: float = field(
+        default=1e-5,
+        metadata={"help": "Coefficient for the softmax auxiliary (Z-)loss when softmax_auxiliary_loss is enabled."},
+    )
+    ce_mode: CrossEntropyMode = field(
+        default="compiled",
+        metadata={
+            "help": "Cross-entropy computation mode for the local-trainer path. "
+            "'compiled' (default): torch.compile + auto_chunker, avoids materializing "
+            "the full [batch*seq, vocab] logits tensor. 'eager': F.cross_entropy that "
+            "materializes logits. The server path uses ServerArguments.ce_mode "
+            "(same semantics, separate flow)."
+        },
     )
     micro_batch_size: int = field(
         default=1,

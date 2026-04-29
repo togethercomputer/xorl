@@ -231,6 +231,16 @@ class Trainer:
         # Routing replay is only needed with EP when MoE forward is recomputed
         self._use_routing_replay = self.ps.ep_size > 1 and args.train.moe_recomputed
 
+        # Loss-function kwargs forwarded to causallm_loss_function each step.
+        self._causallm_loss_params: Dict[str, Any] = {"ce_mode": args.train.ce_mode}
+        if args.train.softmax_auxiliary_loss:
+            if args.train.pipeline_parallel_size > 1:
+                raise NotImplementedError(
+                    "softmax_auxiliary_loss (Z-loss) is not yet supported with pipeline parallelism. "
+                    "PP uses a separate compiled CE loss path (pp_loss_fn) that does not compute logsumexp."
+                )
+            self._causallm_loss_params["z_loss_coef"] = args.train.auxiliary_loss_multiplier
+
     def _maybe_log_startup_metrics(self, metrics: Dict[str, Any], commit: bool = False) -> None:
         """Log startup metrics to wandb once rank 0 has initialized it."""
         if not metrics:
@@ -921,7 +931,7 @@ class Trainer:
                     outputs.last_hidden_state,
                     loss_fn_name=None,
                     loss_fn_inputs={"labels": labels},
-                    loss_fn_params=None,
+                    loss_fn_params=self._causallm_loss_params,
                     logits_to_keep=0,
                 )
                 loss = result.loss
