@@ -195,10 +195,18 @@ class LoraLinear(LoraModule, nn.Linear):
 
         Used both for periodic merge during training (merge_lora_interval)
         and one-shot merge for inference.
+
+        Precision note: we upcast ``weight`` to float32, add the fp32 delta,
+        then cast the sum back — a *single* quantization at the end. This is
+        strictly more faithful than the naive ``weight += delta.to(W.dtype)``
+        (which rounds Δ per element before adding) and matters in precision-
+        sensitive settings like MoE top-k routing on bf16 weights. Same memory
+        as the naive variant — both land in ``self.weight.dtype``.
         """
         with torch.no_grad():
-            delta_weight = self.get_delta_weight()
-            self.weight.add_(delta_weight.to(self.weight.dtype))
+            delta_weight = self.get_delta_weight()  # fp32
+            merged = self.weight.to(torch.float32) + delta_weight
+            self.weight.data.copy_(merged.to(self.weight.dtype))
             self.reset_lora_parameters()
 
     def extra_repr(self) -> str:

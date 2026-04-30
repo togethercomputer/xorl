@@ -180,14 +180,21 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
 
         After merging: weight = weight + delta_weight for each active projection.
         Resets LoRA parameters after merge.
+
+        Precision note: ``base`` is upcast to float32, the fp32 delta is added,
+        and the sum is cast back once. This is strictly more faithful than
+        rounding Δ per element before adding, and keeps unmerged-forward close
+        to merged-forward on MoE models where top-k routing amplifies any
+        per-element delta quantization error.
         """
         with torch.no_grad():
             for proj_name in ("gate_proj", "up_proj", "down_proj"):
                 if proj_name not in self.lora_config.target_modules:
                     continue
                 base = getattr(self, proj_name)
-                delta = self._compute_proj_delta(proj_name).to(base.dtype)
-                base.add_(delta)
+                delta = self._compute_proj_delta(proj_name)  # fp32
+                merged = base.to(torch.float32) + delta
+                base.data.copy_(merged.to(base.dtype))
         self.reset_lora_parameters()
 
     def forward(
