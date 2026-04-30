@@ -163,7 +163,7 @@ def _get_optimizer_cls_and_kwargs(
             ns_steps=kwargs.get("muon_ns_steps", 5),
             weight_decay=weight_decay,
             adjust_lr_fn=kwargs.get("muon_adjust_lr_fn"),
-            ns_algorithm=kwargs.get("muon_ns_algorithm", "standard_newton_schulz"),
+            ns_algorithm=kwargs.get("muon_ns_algorithm", "gram_newton_schulz"),
             ns_use_quack_kernels=kwargs.get("muon_ns_use_quack_kernels", True),
             gram_newton_schulz_num_restarts=kwargs.get("muon_gram_ns_num_restarts", 1),
             gram_newton_schulz_restart_iterations=kwargs.get("muon_gram_ns_restart_iterations"),
@@ -354,7 +354,7 @@ def build_optimizer(
             - signsgd: no optimizer-specific kwargs
             - muon: {"muon_lr": 0.02, "muon_momentum": 0.95, "muon_nesterov": True,
                       "muon_ns_steps": 5, "muon_adjust_lr_fn": None,
-                      "muon_ns_algorithm": "standard_newton_schulz",
+                      "muon_ns_algorithm": "gram_newton_schulz",
                       "muon_ns_use_quack_kernels": True, "muon_gram_ns_num_restarts": 1,
                       "muon_gram_ns_restart_iterations": None, "muon_momentum_dtype": None,
                       "muon_grad_dtype": None, "muon_update_dtype": None, "muon_force_momentum_path": False,

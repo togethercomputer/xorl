@@ -47,6 +47,55 @@ logger = logging.get_logger(__name__)
 GROUPED_GRAM_NS_FP32_BYTE_LIMIT = 2 * 1024**3
 
 
+def _batched_zeropower_via_newtonschulz(
+    grad: torch.Tensor,
+    ns_coefficients: Tuple[float, float, float],
+    ns_steps: int,
+    eps: float,
+) -> torch.Tensor:
+    """Batched Newton-Schulz on a stack of matrices ``[B, H, I]``.
+
+    Equivalent to looping the upstream 2D ``_zeropower_via_newtonschulz`` over
+    the leading batch dim, but emits one bmm/baddbmm per NS step instead of one
+    matmul per (batch, step). On Qwen3.5-35B-A3B (40 MoE layers × 8 local
+    experts × 5 NS steps) this collapses ~14k kernel launches per optimizer
+    step into ~600, recovering the per-expert-Python-loop regression while
+    keeping the per-matrix math identical.
+    """
+    if ns_steps >= 100:
+        raise ValueError("Number of steps must be less than 100 for computational efficiency")
+    if grad.ndim != 3:
+        raise ValueError(f"Batched NS expects a 3D tensor, got shape {tuple(grad.shape)}")
+    if len(ns_coefficients) != 3:
+        raise ValueError("Coefficients must be a tuple of exactly 3 values")
+
+    a, b, c = ns_coefficients
+
+    # Match upstream behavior: cast to bf16, optionally transpose so H <= I.
+    ortho = grad.bfloat16()
+    transposed = ortho.size(-2) > ortho.size(-1)
+    if transposed:
+        ortho = ortho.transpose(-2, -1).contiguous()
+
+    # Per-matrix spectral-norm normalisation: divide each batch element by its
+    # own Frobenius norm (upper bound on spectral norm). Matches the upstream
+    # ``ortho_grad.div_(ortho_grad.norm().clamp(min=eps))``.
+    norms = ortho.flatten(start_dim=1).norm(dim=1).clamp(min=eps).reshape(-1, 1, 1)
+    ortho = ortho / norms
+
+    for _ in range(ns_steps):
+        # gram_matrix[i] = ortho[i] @ ortho[i].T
+        gram_matrix = torch.bmm(ortho, ortho.transpose(-2, -1))
+        # gram_update[i] = b * gram_matrix[i] + c * gram_matrix[i] @ gram_matrix[i]
+        gram_update = torch.baddbmm(gram_matrix, gram_matrix, gram_matrix, beta=b, alpha=c)
+        # ortho[i] = a * ortho[i] + gram_update[i] @ ortho[i]
+        ortho = torch.baddbmm(ortho, gram_update, ortho, beta=a)
+
+    if transposed:
+        ortho = ortho.transpose(-2, -1)
+    return ortho
+
+
 def _shard_full_to_local(full: torch.Tensor, mesh, placements) -> torch.Tensor:
     """Slice a globally-replicated tensor down to its local shard for ``placements``.
 
@@ -169,7 +218,7 @@ class Muon(TorchMuon):
         grad_dtype: Optional[torch.dtype] = None,
         update_dtype: Optional[torch.dtype] = None,
         force_momentum_path: bool = False,
-        ns_algorithm: str = "standard_newton_schulz",
+        ns_algorithm: str = "gram_newton_schulz",
         ns_use_quack_kernels: bool = True,
         gram_newton_schulz_num_restarts: int = 1,
         gram_newton_schulz_restart_iterations: Optional[Iterable[int]] = None,
@@ -450,10 +499,9 @@ class Muon(TorchMuon):
 
             original_shape = update.shape
             flat_update = update.reshape(-1, *update.shape[-2:])
-            orthogonalized = [
-                _zeropower_via_newtonschulz(matrix, ns_coefficients, ns_steps, eps) for matrix in flat_update.unbind(0)
-            ]
-            return torch.stack(orthogonalized, dim=0).reshape(original_shape)
+            return _batched_zeropower_via_newtonschulz(flat_update, ns_coefficients, ns_steps, eps).reshape(
+                original_shape
+            )
         if group["ns_algorithm"] == "gram_newton_schulz":
             return self._get_gram_ns_orthogonalizer(group).orthogonalize(update)
         raise ValueError(

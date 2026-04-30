@@ -50,6 +50,7 @@ class MoEBlock(nn.Module):
         norm_topk_prob: bool = True,
         moe_implementation: str = "triton",
         train_router: bool = True,
+        record_routing_weights: bool = True,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -58,6 +59,7 @@ class MoEBlock(nn.Module):
         self.intermediate_size = intermediate_size
         self.moe_implementation = moe_implementation
         self.train_router = train_router
+        self.record_routing_weights = record_routing_weights
 
         # Gate linear — directly on this module for checkpoint path ``mlp.gate.weight``
         self.gate = nn.Linear(hidden_size, num_experts, bias=False)
@@ -182,23 +184,24 @@ class MoEBlock(nn.Module):
                 router_logits, selected_experts, hidden_states.dtype
             )
 
-            if stage == "record":
-                # Cache weights for replay_backward. During checkpoint recompute,
-                # router_logits may differ (non-deterministic attention), so the
-                # regathered weights above could be wrong. We override them below
-                # during replay_backward with these cached values.
-                replay.record_weights(routing_weights)
-            elif stage == "replay_backward":
-                # Override with cached weights to ensure deterministic EP dispatch.
-                # The _regather_routing call above still runs (for autograd graph
-                # structure), but its output is replaced with the recorded values.
-                cached_weights = replay.pop_backward_weights()
-                if cached_weights is not None:
-                    routing_weights = cached_weights.to(hidden_states.dtype)
-            elif stage == "replay_forward":
-                cached_weights = replay.pop_forward_weights()
-                if cached_weights is not None:
-                    routing_weights = cached_weights.to(hidden_states.dtype)
+            if self.record_routing_weights:
+                if stage == "record":
+                    # Cache weights for replay_backward. During checkpoint recompute,
+                    # router_logits may differ (non-deterministic attention), so the
+                    # regathered weights above could be wrong. We override them below
+                    # during replay_backward with these cached values.
+                    replay.record_weights(routing_weights)
+                elif stage == "replay_backward":
+                    # Override with cached weights to ensure deterministic EP dispatch.
+                    # The _regather_routing call above still runs (for autograd graph
+                    # structure), but its output is replaced with the recorded values.
+                    cached_weights = replay.pop_backward_weights()
+                    if cached_weights is not None:
+                        routing_weights = cached_weights.to(hidden_states.dtype)
+                elif stage == "replay_forward":
+                    cached_weights = replay.pop_forward_weights()
+                    if cached_weights is not None:
+                        routing_weights = cached_weights.to(hidden_states.dtype)
         else:
             # No replay active: use standard router
             routing_weights, selected_experts = self.router(router_logits, hidden_states.dtype)
@@ -292,4 +295,5 @@ class MoEBlock(nn.Module):
             norm_topk_prob=config.norm_topk_prob,
             moe_implementation=moe_implementation,
             train_router=getattr(config, "train_router", False),
+            record_routing_weights=getattr(config, "record_routing_weights", True),
         )

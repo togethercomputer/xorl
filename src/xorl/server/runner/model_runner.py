@@ -480,6 +480,7 @@ class ModelRunner:
             moe_implementation=self.model_config.get("moe_implementation"),
             ep_dispatch=self.model_config.get("ep_dispatch", "alltoall"),
             train_router=self.model_config.get("train_router", False),
+            record_routing_weights=self.model_config.get("record_routing_weights", True),
             deepep_buffer_size_gb=self.model_config.get("deepep_buffer_size_gb", 2.0),
             deepep_num_sms=self.model_config.get("deepep_num_sms", 20),
             deepep_async_combine=self.model_config.get("deepep_async_combine", False),

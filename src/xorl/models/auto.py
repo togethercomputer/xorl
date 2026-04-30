@@ -110,6 +110,7 @@ def build_foundation_model(
     moe_implementation: Optional[Literal["eager", "triton", "native", "quack"]] = None,
     ep_dispatch: str = "alltoall",
     train_router: bool = False,
+    record_routing_weights: bool = True,
     deepep_buffer_size_gb: float = 2.0,
     deepep_num_sms: int = 20,
     deepep_async_combine: bool = False,
@@ -151,6 +152,7 @@ def build_foundation_model(
 
     config._ep_dispatch = ep_dispatch
     config.train_router = train_router
+    config.record_routing_weights = record_routing_weights
     config._deepep_buffer_size_gb = deepep_buffer_size_gb
     config._deepep_num_sms = deepep_num_sms
     config._deepep_async_combine = deepep_async_combine

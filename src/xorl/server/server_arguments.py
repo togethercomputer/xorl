@@ -91,6 +91,16 @@ class ServerArguments:
         },
     )
 
+    record_routing_weights: bool = field(
+        default=True,
+        metadata={
+            "help": "Cache routing weights on the forward pass so they can override the "
+            "regathered weights during checkpoint recompute. Needed only when the "
+            "attention forward is non-deterministic across recompute. Disabling skips the "
+            "per-layer pinned CPU allocation + D2H/H2D copies on every step."
+        },
+    )
+
     deepep_buffer_size_gb: float = field(
         default=2.0, metadata={"help": "DeepEP buffer size in GB (effective when ep_dispatch='deepep')."}
     )
@@ -281,10 +291,11 @@ class ServerArguments:
     )
 
     muon_ns_algorithm: Literal["standard_newton_schulz", "gram_newton_schulz"] = field(
-        default="standard_newton_schulz",
+        default="gram_newton_schulz",
         metadata={
-            "help": "Newton-Schulz backend for Muon. 'standard_newton_schulz' keeps the PyTorch Muon path; "
-            "'gram_newton_schulz' uses Dao-AILab's Gram Newton-Schulz formulation."
+            "help": "Newton-Schulz backend for Muon. 'gram_newton_schulz' (default) batches across "
+            "MoE experts via baddbmm and is ~2x faster on Qwen3.5-style MoE; 'standard_newton_schulz' "
+            "uses the PyTorch upstream path for bit-exact equivalence with torch.optim._muon."
         },
     )
 
@@ -560,6 +571,7 @@ class ServerArguments:
                 "moe_implementation": self.moe_implementation,
                 "ep_dispatch": self.ep_dispatch,
                 "train_router": self.train_router,
+                "record_routing_weights": self.record_routing_weights,
                 "deepep_buffer_size_gb": self.deepep_buffer_size_gb,
                 "deepep_num_sms": self.deepep_num_sms,
                 "deepep_async_combine": self.deepep_async_combine,

@@ -311,8 +311,11 @@ class QuackEPGroupGemm(torch.autograd.Function):
         expert_scores = expert_scores.to(gated_output.dtype)
 
         # Forward was: out = down_GEMM(gated_output) * expert_scores
+        # Skip the extra down-GEMM when expert_scores doesn't require a gradient
+        # (e.g., train_router=False causes routing_weights to be detached upstream,
+        # so ctx.needs_input_grad[5] is False and grad_expert_scores would be unused).
         grad_expert_scores = None
-        if ctx.has_expert_scores:
+        if ctx.has_expert_scores and ctx.needs_input_grad[5]:
             down_output = quack_group_gemm_same_nk(
                 a=gated_output, b=down_proj, cumsum_M=cumsum, max_M=max_M, transpose_b=False, cu_seqlens_m=cu_seqlens_m
             )

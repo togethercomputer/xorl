@@ -344,13 +344,13 @@ def test_muon_groups_fused_gate_up_halves(monkeypatch):
 
 def test_muon_standard_newton_schulz_preserves_batched_leading_dims(monkeypatch):
     seen_shapes = []
-    call_count = 0
 
-    def fake_zeropower(update, ns_coefficients, ns_steps, eps):
-        nonlocal call_count
-        call_count += 1
+    def fake_batched_zeropower(update, ns_coefficients, ns_steps, eps):
+        # Receives the flattened-batch tensor [B, H, I]; assign each batch element
+        # a distinct constant offset so we can confirm correct un-flattening.
         seen_shapes.append(tuple(update.shape))
-        return update + call_count
+        offsets = torch.arange(1, update.shape[0] + 1, dtype=update.dtype, device=update.device).reshape(-1, 1, 1)
+        return update + offsets
 
     p = nn.Parameter(torch.zeros((2, 3, 4), dtype=torch.float32))
     optimizer = Muon(
@@ -362,13 +362,14 @@ def test_muon_standard_newton_schulz_preserves_batched_leading_dims(monkeypatch)
     )
 
     monkeypatch.setattr(muon_module, "_adjust_lr", lambda lr, adjust_lr_fn, shape: lr)
-    monkeypatch.setattr(muon_module, "_zeropower_via_newtonschulz", fake_zeropower)
+    monkeypatch.setattr(muon_module, "_batched_zeropower_via_newtonschulz", fake_batched_zeropower)
 
     p.grad = torch.ones((2, 3, 4), dtype=torch.float32)
 
     optimizer.step()
 
-    assert seen_shapes == [(3, 4), (3, 4)]
+    # Single batched call over the flattened leading dims: [B=2, H=3, I=4].
+    assert seen_shapes == [(2, 3, 4)]
     expected = torch.tensor(
         [
             [[-2.0, -2.0, -2.0, -2.0], [-2.0, -2.0, -2.0, -2.0], [-2.0, -2.0, -2.0, -2.0]],
