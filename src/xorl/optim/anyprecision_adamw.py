@@ -1,6 +1,8 @@
 import torch
 from torch.optim.optimizer import Optimizer
 
+from .cautious import apply_cautious_decay_
+
 
 class AnyPrecisionAdamW(Optimizer):
     def __init__(
@@ -14,6 +16,7 @@ class AnyPrecisionAdamW(Optimizer):
         momentum_dtype=torch.bfloat16,
         variance_dtype=torch.bfloat16,
         compensation_buffer_dtype=torch.bfloat16,
+        cautious=False,
     ):
         defaults = {
             "lr": lr,
@@ -24,6 +27,7 @@ class AnyPrecisionAdamW(Optimizer):
             "momentum_dtype": momentum_dtype,
             "variance_dtype": variance_dtype,
             "compensation_buffer_dtype": compensation_buffer_dtype,
+            "cautious": cautious,
         }
         super().__init__(params, defaults)
 
@@ -31,6 +35,11 @@ class AnyPrecisionAdamW(Optimizer):
     def step(self, closure=None):
         """
         Performs a single optimization step.
+
+        When ``cautious=True``, decoupled weight decay is masked by
+        ``I(exp_avg * param >= 0)`` per Chen et al. "Cautious Weight Decay"
+        (arXiv:2510.12402). ``sign(exp_avg)`` matches ``sign(u_t)`` since the
+        Adam preconditioner denominator is strictly positive.
 
         Args:
             closure (callable, optional): A closure that reevaluates the model and returns the loss.
@@ -46,6 +55,7 @@ class AnyPrecisionAdamW(Optimizer):
             weight_decay = group["weight_decay"]
             eps = group["eps"]
             use_kahan_summation = group["use_kahan_summation"]
+            cautious = group.get("cautious", False)
 
             momentum_dtype = group["momentum_dtype"]
             variance_dtype = group["variance_dtype"]
@@ -73,11 +83,20 @@ class AnyPrecisionAdamW(Optimizer):
                 exp_avg_sq = state["exp_avg_sq"]
                 grad = p.grad
 
-                if weight_decay:
-                    p.data.mul_(1 - lr * weight_decay)
-
                 exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
                 exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                # Cautious weight decay must use the post-update first moment
+                # (its sign matches the optimizer update direction). Apply
+                # decay AFTER moments are updated and BEFORE the parameter
+                # update, against the pre-update parameter values.
+                apply_cautious_decay_(
+                    p.data,
+                    update_sign_proxy=exp_avg,
+                    lr=lr,
+                    weight_decay=weight_decay,
+                    cautious=cautious,
+                )
 
                 bias_correction1 = 1 - beta1**step
                 step_size = lr / bias_correction1

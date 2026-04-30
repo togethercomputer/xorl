@@ -114,11 +114,42 @@ def _get_optimizer_cls_and_kwargs(
     fused: bool = False,
     optimizer_dtype: str = "bf16",
     optimizer_kwargs: Optional[Dict[str, Any]] = None,
+    cautious_weight_decay: bool = False,
 ) -> Tuple[type, Dict[str, Any]]:
     """Return (optimizer_class, constructor_kwargs) without instantiating."""
     kwargs = optimizer_kwargs or {}
 
     if optimizer_type == "adamw":
+        if cautious_weight_decay:
+            # torch.optim.AdamW has no cautious-decay hook; route to our
+            # AnyPrecisionAdamW (fp32 state -> mathematically equivalent to
+            # torch AdamW) which supports the mask.
+            logger.info_rank0(
+                "cautious_weight_decay=True with optimizer=adamw: routing to AnyPrecisionAdamW (fp32 state)."
+            )
+            # Reject torch.optim.AdamW-only kwargs up-front: forwarding them
+            # to AnyPrecisionAdamW yields a confusing TypeError naming a class
+            # the user did not request.
+            _ANYPRECISION_ACCEPTED = {"use_kahan_summation"}
+            unsupported = [k for k in kwargs if k not in _ANYPRECISION_ACCEPTED]
+            if unsupported:
+                raise ValueError(
+                    f"cautious_weight_decay=True with optimizer='adamw' routes to AnyPrecisionAdamW, "
+                    f"which does not accept these optimizer_kwargs: {unsupported}. "
+                    f"Either drop them, set optimizer='anyprecision_adamw' explicitly, or disable cautious."
+                )
+            ctor_kwargs = dict(
+                lr=lr,
+                betas=betas,
+                eps=eps,
+                weight_decay=weight_decay,
+                momentum_dtype=torch.float32,
+                variance_dtype=torch.float32,
+                compensation_buffer_dtype=torch.float32,
+                cautious=True,
+                **kwargs,
+            )
+            return AnyPrecisionAdamW, ctor_kwargs
         foreach = not fused
         ctor_kwargs = dict(
             lr=lr,
@@ -140,16 +171,23 @@ def _get_optimizer_cls_and_kwargs(
             momentum_dtype=state_dtype,
             variance_dtype=state_dtype,
             compensation_buffer_dtype=state_dtype,
+            cautious=cautious_weight_decay,
             **kwargs,
         )
         return AnyPrecisionAdamW, ctor_kwargs
     elif optimizer_type == "sgd":
+        if cautious_weight_decay:
+            raise ValueError(
+                "cautious_weight_decay is not supported with optimizer='sgd' "
+                "(torch.optim.SGD has no per-coordinate decay hook). "
+                "Use 'anyprecision_adamw', 'signsgd', or 'muon' instead."
+            )
         sgd_defaults = {"momentum": 0.0, "nesterov": False}
         sgd_defaults.update(kwargs)
         ctor_kwargs = dict(lr=lr, weight_decay=weight_decay, **sgd_defaults)
         return torch.optim.SGD, ctor_kwargs
     elif optimizer_type == "signsgd":
-        ctor_kwargs = dict(lr=lr, weight_decay=weight_decay, **kwargs)
+        ctor_kwargs = dict(lr=lr, weight_decay=weight_decay, cautious=cautious_weight_decay, **kwargs)
         return SignSGD, ctor_kwargs
     elif optimizer_type == "muon":
         adamw_state_dtype = _ANYPRECISION_STATE_DTYPES.get(optimizer_dtype)
@@ -174,6 +212,7 @@ def _get_optimizer_cls_and_kwargs(
             update_dtype=_normalize_optional_dtype(kwargs.get("muon_update_dtype"), field_name="muon_update_dtype"),
             force_momentum_path=kwargs.get("muon_force_momentum_path", False),
             adamw_state_dtype=adamw_state_dtype,
+            cautious=cautious_weight_decay,
             distributed_mode=kwargs.get("muon_distributed_mode", "shard_local"),
         )
         return Muon, ctor_kwargs
@@ -194,6 +233,7 @@ def _create_optimizer(
     fused: bool = False,
     optimizer_dtype: str = "bf16",
     optimizer_kwargs: Optional[Dict[str, Any]] = None,
+    cautious_weight_decay: bool = False,
 ) -> Optimizer:
     """
     Single factory for all optimizer types.
@@ -214,6 +254,7 @@ def _create_optimizer(
         fused=fused,
         optimizer_dtype=optimizer_dtype,
         optimizer_kwargs=optimizer_kwargs,
+        cautious_weight_decay=cautious_weight_decay,
     )
     return cls(param_groups, **ctor_kwargs)
 
@@ -333,6 +374,7 @@ def build_optimizer(
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
     optimizer_kwargs: Optional[Dict[str, Any]] = None,
+    cautious_weight_decay: bool = False,
 ) -> "torch.optim.Optimizer":
     """
     Build an optimizer for the given model.
@@ -360,6 +402,11 @@ def build_optimizer(
                       "muon_grad_dtype": None, "muon_update_dtype": None, "muon_force_momentum_path": False,
                       "muon_distributed_mode": "shard_local"}
             - adamw/anyprecision_adamw: any extra kwargs forwarded to constructor
+        cautious_weight_decay: If True, apply Cautious Weight Decay (CWD) per
+            Chen et al. (arXiv:2510.12402): mask the decoupled decay term by
+            ``I(u_t * x_t >= 0)``. Supported for adamw, anyprecision_adamw,
+            signsgd, and muon. With ``optimizer_type='adamw'`` this routes to
+            AnyPrecisionAdamW with fp32 state (no fused kernel).
     """
     # EP-aware routing: for FSDP2+EP, split params into EP and non-EP groups and build two optimizers.
     if _should_build_ep_aware(model, param_groups):
@@ -376,6 +423,7 @@ def build_optimizer(
             no_decay_modules,
             no_decay_params,
             optimizer_kwargs=optimizer_kwargs,
+            cautious_weight_decay=cautious_weight_decay,
         )
 
     kwargs = optimizer_kwargs or {}
@@ -427,6 +475,7 @@ def build_optimizer(
         fused=fused,
         optimizer_dtype=optimizer_dtype,
         optimizer_kwargs=optimizer_kwargs,
+        cautious_weight_decay=cautious_weight_decay,
     )
 
 
@@ -443,6 +492,7 @@ def build_ep_fsdp2_optimizer(
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
     optimizer_kwargs: Optional[Dict[str, Any]] = None,
+    cautious_weight_decay: bool = False,
 ):
     """
     Build a MultiOptimizer instance when model is parallelized with EP+FSDP2
@@ -526,6 +576,7 @@ def build_ep_fsdp2_optimizer(
             fused=fused,
             optimizer_dtype=optimizer_dtype,
             optimizer_kwargs=optimizer_kwargs,
+            cautious_weight_decay=cautious_weight_decay,
         )
 
     optimizer_dict: Dict[str, Optimizer] = {}

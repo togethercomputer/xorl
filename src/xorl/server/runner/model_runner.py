@@ -591,6 +591,7 @@ class ModelRunner:
             optimizer_type=optimizer_type,
             optimizer_dtype=self.train_config.get("optimizer_dtype", "bf16"),
             optimizer_kwargs=optimizer_kwargs,
+            cautious_weight_decay=self.train_config.get("cautious_weight_decay", False),
         )
 
         # Register optimizer pre-hook if available

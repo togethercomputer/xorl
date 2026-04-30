@@ -545,6 +545,17 @@ class TrainingArguments:
         default=0,
         metadata={"help": "L2 regularization strength."},
     )
+    cautious_weight_decay: bool = field(
+        default=False,
+        metadata={
+            "help": "Apply Cautious Weight Decay (Chen et al., arXiv:2510.12402): "
+            "mask the decoupled decay term by I(u_t * x_t >= 0) so decay only acts "
+            "on coordinates whose update aligns with the parameter sign. "
+            "Supported with optimizer in {adamw, anyprecision_adamw, signsgd, muon}; "
+            "with adamw, routes to AnyPrecisionAdamW (fp32 state) since the fused "
+            "kernel has no per-coordinate decay hook."
+        },
+    )
     no_decay_modules: List[str] = field(
         default_factory=list,
         metadata={"help": "Modules without weight decay, for example, RMSNorm."},

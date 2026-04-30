@@ -260,6 +260,15 @@ class ServerArguments:
         metadata={"help": "Dtype for optimizer states (momentum/variance). 'bf16' halves optimizer memory."},
     )
 
+    cautious_weight_decay: bool = field(
+        default=False,
+        metadata={
+            "help": "Apply Cautious Weight Decay (Chen et al., arXiv:2510.12402): "
+            "mask the decoupled decay term by I(u_t * x_t >= 0). With optimizer='adamw' "
+            "this routes to AnyPrecisionAdamW with fp32 state (no fused kernel)."
+        },
+    )
+
     muon_lr: float = field(
         default=0.02,
         metadata={
@@ -610,6 +619,7 @@ class ServerArguments:
                 "ce_mode": self.ce_mode,
                 "optimizer": self.optimizer,
                 "optimizer_dtype": self.optimizer_dtype,
+                "cautious_weight_decay": self.cautious_weight_decay,
                 "muon_lr": self.muon_lr,
                 "muon_momentum": self.muon_momentum,
                 "muon_nesterov": self.muon_nesterov,

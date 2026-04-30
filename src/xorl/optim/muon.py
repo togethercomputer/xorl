@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from torch.distributed.tensor.placement_types import Placement
 
 from ..utils import logging
+from .cautious import apply_cautious_decay_
 from .gram_newton_schulz import GramNewtonSchulzOrthogonalizer, expand_ns_coefficients, find_best_restarts
 
 
@@ -223,6 +224,7 @@ class Muon(TorchMuon):
         gram_newton_schulz_num_restarts: int = 1,
         gram_newton_schulz_restart_iterations: Optional[Iterable[int]] = None,
         adamw_state_dtype: Optional[torch.dtype] = None,
+        cautious: bool = False,
         distributed_mode: str = "shard_local",
     ):
         if ns_algorithm not in {"standard_newton_schulz", "gram_newton_schulz"}:
@@ -270,6 +272,7 @@ class Muon(TorchMuon):
             use_muon=True,
             adamw_betas=adamw_betas,
             adamw_eps=adamw_eps,
+            cautious=cautious,
         )
         Optimizer.__init__(self, params, defaults)
 
@@ -318,6 +321,7 @@ class Muon(TorchMuon):
         eps = group["eps"]
         weight_decay = group["weight_decay"]
         adjust_lr_fn = group["adjust_lr_fn"]
+        cautious = group.get("cautious", False)
         uses_grouped_gram_ns = group["ns_algorithm"] == "gram_newton_schulz"
         grouped_updates: dict[tuple[tuple[int, int], torch.dtype, torch.device], list[_GroupedOrthogonalizationEntry]]
         grouped_updates = defaultdict(list)
@@ -479,8 +483,15 @@ class Muon(TorchMuon):
             # Cast back to param dtype
             update = update.to(plan.param.dtype)
 
-            # Decoupled weight decay
-            plan.param.mul_(1 - lr * weight_decay)
+            # Decoupled weight decay (cautious mask uses the post-NS update,
+            # which is the actual u_t direction for Muon).
+            apply_cautious_decay_(
+                plan.param,
+                update_sign_proxy=update,
+                lr=lr,
+                weight_decay=weight_decay,
+                cautious=cautious,
+            )
 
             # Parameter update
             plan.param.add_(update, alpha=-plan.adjusted_lr)
@@ -597,6 +608,7 @@ class Muon(TorchMuon):
         beta1, beta2 = group["adamw_betas"]
         eps = group["adamw_eps"]
         weight_decay = group["weight_decay"]
+        cautious = group.get("cautious", False)
 
         for p in group["params"]:
             if p.grad is None:
@@ -618,13 +630,19 @@ class Muon(TorchMuon):
             exp_avg = state["exp_avg"]
             exp_avg_sq = state["exp_avg_sq"]
 
-            # Decoupled weight decay
-            if weight_decay > 0:
-                p.data.mul_(1.0 - lr * weight_decay)
-
             # Update biased first and second moment estimates
             exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
             exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+
+            # Decoupled weight decay (cautious mask uses sign(exp_avg) which
+            # matches sign(u_t) since the Adam denominator is positive).
+            apply_cautious_decay_(
+                p.data,
+                update_sign_proxy=exp_avg,
+                lr=lr,
+                weight_decay=weight_decay,
+                cautious=cautious,
+            )
 
             # Bias correction
             bias_correction1 = 1.0 - beta1**step

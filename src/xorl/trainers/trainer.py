@@ -611,6 +611,7 @@ class Trainer:
             optimizer_type=args.train.optimizer,
             optimizer_dtype=args.train.optimizer_dtype,
             optimizer_kwargs=args.train.optimizer_kwargs,
+            cautious_weight_decay=args.train.cautious_weight_decay,
         )
         if self._optimizer_pre_hook_fn is not None:
             hook = self._optimizer_pre_hook_fn(self.model, self.model_config, args.train.data_parallel_mode)
