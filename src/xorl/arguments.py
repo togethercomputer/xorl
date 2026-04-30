@@ -630,6 +630,17 @@ class TrainingArguments:
             "Intended for debugging and ablations."
         },
     )
+    muon_distributed_mode: Literal["shard_local", "full_gradient"] = field(
+        default="shard_local",
+        metadata={
+            "help": "How Muon handles Newton-Schulz on FSDP2/EP-sharded DTensor params. "
+            "'shard_local': run NS on each rank's local shard (cheap, approximate). "
+            "'full_gradient': all-gather the post-momentum update to the full matrix, "
+            "run NS on the full matrix on every rank in the param's mesh, slice back to "
+            "the local shard. Recovers exact Muon at the cost of a per-step all-gather and "
+            "redundant NS compute. Implements the dense path of DeepSeek V4 §3.5.1."
+        },
+    )
 
     @property
     def optimizer_kwargs(self) -> Dict[str, Any]:
@@ -659,6 +670,8 @@ class TrainingArguments:
                 kwargs["muon_update_dtype"] = torch.float32
             if self.muon_force_momentum_path:
                 kwargs["muon_force_momentum_path"] = True
+            if self.muon_distributed_mode != "shard_local":
+                kwargs["muon_distributed_mode"] = self.muon_distributed_mode
         return kwargs
 
     max_grad_norm: float = field(
@@ -866,6 +879,17 @@ class TrainingArguments:
     cp_fsdp_mode: str = field(
         default="all",
         metadata={"help": "How to fold SP into FSDP: 'all' (ulysses+ring), 'ulysses_only', 'ring_only', or 'none'."},
+    )
+    moe_grad_reduce_mode: Literal["reduce_scatter", "bf16_a2a_fp32_sum"] = field(
+        default="reduce_scatter",
+        metadata={
+            "help": "Reduce-scatter strategy for MoE expert gradients on the ep_fsdp mesh dim. "
+            "'reduce_scatter': default NCCL reduce-scatter in FSDP's reduce_dtype (FP32). "
+            "'bf16_a2a_fp32_sum': stochastic-round FP32 grads to BF16, all-to-all across the "
+            "ep_fsdp group, then sum the received per-rank chunks locally in FP32. Halves "
+            "comm volume vs FP32 reduce-scatter while preserving FP32 accumulation precision. "
+            "Implements the MoE comm path of DeepSeek V4 §3.5.1. No effect on non-EP modules."
+        },
     )
     ckpt_manager: Literal["dcp"] = field(
         default="dcp",

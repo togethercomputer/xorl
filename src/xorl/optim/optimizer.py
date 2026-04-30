@@ -174,6 +174,7 @@ def _get_optimizer_cls_and_kwargs(
             update_dtype=_normalize_optional_dtype(kwargs.get("muon_update_dtype"), field_name="muon_update_dtype"),
             force_momentum_path=kwargs.get("muon_force_momentum_path", False),
             adamw_state_dtype=adamw_state_dtype,
+            distributed_mode=kwargs.get("muon_distributed_mode", "shard_local"),
         )
         return Muon, ctor_kwargs
     else:
@@ -356,7 +357,8 @@ def build_optimizer(
                       "muon_ns_algorithm": "standard_newton_schulz",
                       "muon_ns_use_quack_kernels": True, "muon_gram_ns_num_restarts": 1,
                       "muon_gram_ns_restart_iterations": None, "muon_momentum_dtype": None,
-                      "muon_grad_dtype": None, "muon_update_dtype": None, "muon_force_momentum_path": False}
+                      "muon_grad_dtype": None, "muon_update_dtype": None, "muon_force_momentum_path": False,
+                      "muon_distributed_mode": "shard_local"}
             - adamw/anyprecision_adamw: any extra kwargs forwarded to constructor
     """
     # EP-aware routing: for FSDP2+EP, split params into EP and non-EP groups and build two optimizers.

@@ -12,7 +12,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import noop_context_fn
 
 from xorl.distributed.checkpoint import CheckpointFunction
-from xorl.distributed.fsdp2 import clip_grad_norm
+from xorl.distributed.fsdp2 import BF16StochasticAllToAllReduceScatter, clip_grad_norm
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.distributed.pipeline_parallel import (
     generate_llm_fqn_per_model_part,
@@ -93,6 +93,7 @@ def parallelize_model_fsdp2(
     basic_modules: Optional[List[str]] = None,
     pp_enabled: bool = False,
     reshard_after_forward: Optional[bool] = None,
+    moe_grad_reduce_mode: str = "reduce_scatter",
     **kwargs,
 ) -> "nn.Module":
     """
@@ -215,6 +216,7 @@ def parallelize_model_fsdp2(
     # | -- experts layer (apply fully_shard separately in order to shard across EP groups on the same EP rank instead of sharding globally)
     # | -- layers (declared in model.modules_to_ignore_in_mixed_precision) that need to apply fully_shard separately due to different mp policy as the decoder layer
     #      (e.g., some models requires MoE TopK gate layer to have parameters in higher FP32 precision in forward).
+    fsdp_wrapped_experts: List["nn.Module"] = []
     for layer_fqn, layer_mod, experts_mod in layer_pairs:
         # register all the FSDPModule inside this decoder layer for the convenience of manual prefetching configuration
         layer_mod._fsdp_modules = []
@@ -233,6 +235,7 @@ def parallelize_model_fsdp2(
             # shard expert
             fully_shard(experts_mod, **expert_fsdp_kwargs)
             layer_mod._fsdp_modules.append(experts_mod)
+            fsdp_wrapped_experts.append(experts_mod)
         # shard module that needs to ignore mixed precision control
         if mp_ignored_classes:
             for sub_mod in layer_mod.modules():
@@ -329,6 +332,60 @@ def parallelize_model_fsdp2(
     for module in model.modules():
         if isinstance(module, FSDPModule):
             module.set_gradient_divide_factor(1.0)
+
+    # Install custom reduce-scatter for MoE expert FSDP units.
+    # Native FSDP reduce-scatter performs accumulation in the buffer dtype during transit,
+    # so naively setting reduce_dtype=bf16 would corrupt the partial sum. The
+    # bf16_a2a_fp32_sum mode keeps the FSDP buffer at FP32 (set via mp_policy.reduce_dtype)
+    # but stochastically rounds to BF16 for the all-to-all and sums received chunks
+    # locally in FP32. Halves comm volume per DeepSeek V4 §3.5.1.
+    #
+    # Preconditions enforced below (see BF16StochasticAllToAllReduceScatter docstring):
+    #   - mp_policy.reduce_dtype must be torch.float32 (the hook receives the FSDP
+    #     reduce buffer pre-allocated in this dtype; rejecting at __call__ time would
+    #     surface the error during the first backward, far from configuration).
+    #   - gradient_divide_factor must be 1.0. With factor=None FSDP enables a
+    #     predivide_factor that gets applied to the input *before* our hook sees it,
+    #     and FSDP would skip the postdivide because we own the reduce; the result
+    #     is silently under-weighted gradients.
+    if moe_grad_reduce_mode == "bf16_a2a_fp32_sum":
+        if fsdp_wrapped_experts:
+            for experts_mod in fsdp_wrapped_experts:
+                state = experts_mod._get_fsdp_state()
+                pg = state._fsdp_param_group
+                if pg is None:
+                    continue
+                if pg.mp_policy.reduce_dtype != torch.float32:
+                    raise ValueError(
+                        "moe_grad_reduce_mode='bf16_a2a_fp32_sum' requires FSDP "
+                        f"mp_policy.reduce_dtype=torch.float32, got {pg.mp_policy.reduce_dtype}. "
+                        "Either keep enable_mixed_precision=True (which sets reduce_dtype=fp32) "
+                        "or pass an explicit MixedPrecisionPolicy with reduce_dtype=torch.float32."
+                    )
+                if pg.gradient_divide_factor != 1.0:
+                    raise ValueError(
+                        "moe_grad_reduce_mode='bf16_a2a_fp32_sum' requires "
+                        "gradient_divide_factor=1.0 on every expert FSDP unit "
+                        f"(got {pg.gradient_divide_factor}). FSDP applies predivide before "
+                        "the reduce-scatter hook and skips postdivide when the hook is custom, "
+                        "which would silently under-weight expert gradients."
+                    )
+            for experts_mod in fsdp_wrapped_experts:
+                experts_mod.set_custom_reduce_scatter(BF16StochasticAllToAllReduceScatter())
+            logger.info_rank0(
+                f"Installed BF16 stochastic-rounded all-to-all + FP32 local sum reduce-scatter "
+                f"on {len(fsdp_wrapped_experts)} expert FSDP units."
+            )
+        else:
+            logger.warning_rank0(
+                "moe_grad_reduce_mode='bf16_a2a_fp32_sum' was set but no expert FSDP units "
+                "were wrapped (EP not enabled or experts use _skip_fsdp). Mode has no effect."
+            )
+    elif moe_grad_reduce_mode != "reduce_scatter":
+        raise ValueError(
+            f"Unsupported moe_grad_reduce_mode: {moe_grad_reduce_mode!r}. "
+            "Expected 'reduce_scatter' or 'bf16_a2a_fp32_sum'."
+        )
 
     # Handle meta initialization for FSDP2 (fallback if pre-load not done)
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
@@ -438,6 +495,7 @@ def build_parallelize_model(
     basic_modules: Optional[List[str]] = None,
     pp_schedule: Optional[str] = None,
     reshard_after_forward: Optional[bool] = None,
+    moe_grad_reduce_mode: str = "reduce_scatter",
     **kwargs,
 ) -> "nn.Module":
     """
@@ -593,6 +651,7 @@ def build_parallelize_model(
                         basic_modules=basic_modules,
                         pp_enabled=True,
                         reshard_after_forward=reshard_after_forward,
+                        moe_grad_reduce_mode=moe_grad_reduce_mode,
                         **kwargs,
                     )
                 elif ps.dp_mode == "ddp":
@@ -731,6 +790,7 @@ def build_parallelize_model(
                 enable_mixed_precision=enable_mixed_precision,
                 basic_modules=basic_modules,
                 reshard_after_forward=reshard_after_forward,
+                moe_grad_reduce_mode=moe_grad_reduce_mode,
                 **kwargs,
             )
         elif parallel_state.dp_mode == "ddp":

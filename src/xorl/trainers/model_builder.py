@@ -132,6 +132,7 @@ def build_training_model(
     enable_forward_prefetch: bool = True,
     load_weights_mode: str = "broadcast",
     reshard_after_forward: Optional[bool] = None,
+    moe_grad_reduce_mode: str = "reduce_scatter",
     pp_schedule: Optional[str] = None,
     # --- Training flags ---
     freeze_router: bool = False,
@@ -264,6 +265,7 @@ def build_training_model(
         load_weights_mode=load_weights_mode,
         pp_schedule=pp_schedule,
         reshard_after_forward=reshard_after_forward,
+        moe_grad_reduce_mode=moe_grad_reduce_mode,
         skip_param_upcast=should_skip_generic_param_upcast(
             enable_lora=enable_lora,
             enable_qlora=enable_qlora,

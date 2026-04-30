@@ -333,6 +333,28 @@ class ServerArguments:
         },
     )
 
+    muon_distributed_mode: Literal["shard_local", "full_gradient"] = field(
+        default="shard_local",
+        metadata={
+            "help": "How Muon handles Newton-Schulz on FSDP2/EP-sharded DTensor params. "
+            "'shard_local': run NS on each rank's local shard (cheap, approximate). "
+            "'full_gradient': all-gather post-momentum update, run NS on the full matrix on "
+            "every rank in the param's mesh, slice back to the local shard. Implements the "
+            "dense path of DeepSeek V4 §3.5.1."
+        },
+    )
+
+    moe_grad_reduce_mode: Literal["reduce_scatter", "bf16_a2a_fp32_sum"] = field(
+        default="reduce_scatter",
+        metadata={
+            "help": "Reduce-scatter strategy for MoE expert gradients on the ep_fsdp mesh dim. "
+            "'reduce_scatter': default NCCL reduce-scatter. "
+            "'bf16_a2a_fp32_sum': stochastic-round FP32 grads to BF16, all-to-all across the "
+            "ep_fsdp group, then sum the per-rank chunks locally in FP32. Halves comm volume "
+            "while preserving FP32 accumulation. Implements the MoE path of DeepSeek V4 §3.5.1."
+        },
+    )
+
     # ========================================================================
     # Checkpointing & Output
     # ========================================================================
@@ -588,6 +610,8 @@ class ServerArguments:
                 "muon_grad_dtype": self.muon_grad_dtype,
                 "muon_update_dtype": self.muon_update_dtype,
                 "muon_force_momentum_path": self.muon_force_momentum_path,
+                "muon_distributed_mode": self.muon_distributed_mode,
+                "moe_grad_reduce_mode": self.moe_grad_reduce_mode,
                 "load_checkpoint_path": self.load_checkpoint_path,
                 "ckpt_manager": self.ckpt_manager,
                 "enable_self_test": self.enable_self_test,

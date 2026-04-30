@@ -503,6 +503,7 @@ class ModelRunner:
             enable_forward_prefetch=self.train_config.get("enable_forward_prefetch", True),
             load_weights_mode=self.train_config.get("load_weights_mode", "broadcast"),
             reshard_after_forward=self.train_config.get("reshard_after_forward"),
+            moe_grad_reduce_mode=self.train_config.get("moe_grad_reduce_mode", "reduce_scatter"),
             pp_schedule=pp_schedule_name,
             freeze_router=self.train_config.get("freeze_router", False),
             router_fp32=self.model_config.get("router_fp32", True),
@@ -577,6 +578,7 @@ class ModelRunner:
                     "muon_grad_dtype",
                     "muon_update_dtype",
                     "muon_force_momentum_path",
+                    "muon_distributed_mode",
                 )
                 if k in self.train_config
             }

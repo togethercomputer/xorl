@@ -533,6 +533,7 @@ class Trainer:
             load_weights_mode=args.train.load_weights_mode,
             pp_schedule=args.train.pipeline_parallel_schedule if args.train.pipeline_parallel_size > 1 else None,
             reshard_after_forward=args.train.reshard_after_forward,
+            moe_grad_reduce_mode=args.train.moe_grad_reduce_mode,
             skip_param_upcast=should_skip_generic_param_upcast(
                 enable_lora=args.lora.enable_lora,
                 enable_qlora=args.lora.enable_qlora,
