@@ -6,13 +6,7 @@ This package uses lazy exports to avoid circular imports between:
 """
 
 from xorl.lora.modules import LoraLinear, LoraModule
-from xorl.ops.group_gemm.kernel import (
-    compute_lora_scaling,
-    get_lora_delta_weight_stacked,
-    init_lora_weights_stacked,
-    merge_lora_weights_stacked,
-    unmerge_lora_weights_stacked,
-)
+from xorl.ops.group_gemm.kernel import compute_lora_scaling
 
 
 _MAPPING_ATTRS = {
@@ -70,11 +64,7 @@ __all__ = [
     "copy_weights_to_lora_experts",
     "mark_only_lora_as_trainable",
     "lora_state_dict",
-    "init_lora_weights_stacked",
     "compute_lora_scaling",
-    "merge_lora_weights_stacked",
-    "unmerge_lora_weights_stacked",
-    "get_lora_delta_weight_stacked",
 ]
 
 
