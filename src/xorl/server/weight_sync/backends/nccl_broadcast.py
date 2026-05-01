@@ -155,12 +155,20 @@ class NCCLWeightSynchronizer:
         logger.info(f"[Training] Creating TCPStore (requested_port={requested_port}, is_master=True)...")
 
         with self._without_torchelastic_agent_store():
+            # wait_for_workers=False: master must start listening without blocking.
+            # /init_weights_update_group is only sent to inference endpoints later,
+            # in init_inference (started after this call returns), and the actual
+            # NCCL rendezvous is completed inside _init_training_process_group via
+            # _new_process_group_helper. With the default wait_for_workers=True,
+            # construction blocks waiting for workers that cannot connect yet,
+            # deadlocking sync_inference_weights.
             raw_store = TCPStore(
                 host_name=self.master_address,
                 port=requested_port,
                 world_size=self.world_size,
                 is_master=True,
                 timeout=default_pg_timeout,
+                wait_for_workers=False,
             )
 
         self._training_raw_store = raw_store
