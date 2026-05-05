@@ -226,7 +226,7 @@ class CrossEntropy(ReductionBase):
                 copy(tXrdX, tXgdX)
 
 
-@torch.library.custom_op("quack::cross_entropy_fwd_out", mutates_args={"loss", "lse", "dx"})
+@torch.library.custom_op("xorl_quack::cross_entropy_fwd_out", mutates_args={"loss", "lse", "dx"})
 def cross_entropy_fwd_out(
     x: Tensor,
     target: Tensor,
@@ -524,7 +524,7 @@ def _cross_entropy_backward(
 _cross_entropy_backward.compile_cache = {}
 
 
-@torch.library.custom_op("quack::cross_entropy_bwd_out", mutates_args={"dx"})
+@torch.library.custom_op("xorl_quack::cross_entropy_bwd_out", mutates_args={"dx"})
 def cross_entropy_bwd_out(
     x: torch.Tensor,
     target: torch.Tensor,

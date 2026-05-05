@@ -267,7 +267,7 @@ class RMSNorm(ReductionBase):
 
 
 @torch.library.custom_op(
-    "quack::_rmsnorm_fwd",
+    "xorl_quack::_rmsnorm_fwd",
     mutates_args=("out", "rstd", "mean", "residual_out"),
     device_types="cuda",
     # We need to specify the schema manually since we're mutating an optional tensor
@@ -747,7 +747,7 @@ def _get_sm_count(N: int, device: torch.device) -> int:
 
 
 @torch.library.custom_op(
-    "quack::_rmsnorm_bwd",
+    "xorl_quack::_rmsnorm_bwd",
     mutates_args={"dx", "dw_partial", "db_partial", "dresidual"},
     device_types="cuda",
     # We need to specify the schema manually since we're mutating an optional tensor

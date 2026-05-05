@@ -313,7 +313,7 @@ def gemm(
 
 
 @torch.library.custom_op(
-    "quack::gemm_out",
+    "xorl_quack::gemm_out",
     mutates_args=("out",),
     device_types="cuda",
     # We have to split out alpha and alpha_tensor since torch.library requires
@@ -469,7 +469,7 @@ def gemm_add(
 
 
 @torch.library.custom_op(
-    "quack::gemm_add_out",
+    "xorl_quack::gemm_add_out",
     mutates_args=("out",),
     device_types="cuda",
     # We have to split out alpha and alpha_tensor since torch.library requires
@@ -627,7 +627,7 @@ def gemm_add_inplace(
 
 
 @torch.library.custom_op(
-    "quack::gemm_add_inplace",
+    "xorl_quack::gemm_add_inplace",
     mutates_args=("out",),
     device_types="cuda",
     # We have to split out alpha and alpha_tensor since torch.library requires
@@ -720,7 +720,7 @@ def gemm_act(
 
 
 @torch.library.custom_op(
-    "quack::gemm_act_out",
+    "xorl_quack::gemm_act_out",
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
     schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str? activation=None, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
@@ -800,7 +800,7 @@ def gemm_dact(
 
 
 @torch.library.custom_op(
-    "quack::gemm_dact_out",
+    "xorl_quack::gemm_dact_out",
     mutates_args=("dx_out", "postact_out"),
     device_types="cuda",
     schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a3!) dx_out, Tensor(a4!) postact_out, str? activation=None, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=True, bool tuned=True) -> ()",
@@ -935,7 +935,7 @@ def gemm_dgated_ref(
 
 
 @torch.library.custom_op(
-    "quack::gemm_symmetric_out",
+    "xorl_quack::gemm_symmetric_out",
     mutates_args=("out",),
     device_types="cuda",
     schema="(Tensor A, Tensor B, Tensor(a2!) out, Tensor? C=None, bool dynamic_scheduler=False, float alpha=1.0, float beta=1.0) -> ()",
@@ -1217,7 +1217,7 @@ def gemm_gated(
 
 
 @torch.library.custom_op(
-    "quack::gemm_gated_out",
+    "xorl_quack::gemm_gated_out",
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
     schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str activation='swiglu', Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
@@ -1294,7 +1294,7 @@ def gemm_dgated(
 
 
 @torch.library.custom_op(
-    "quack::gemm_dgated_out",
+    "xorl_quack::gemm_dgated_out",
     mutates_args=("dx_out", "postact_out"),
     device_types="cuda",
     schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a3!) dx_out, Tensor(a4!) postact_out, Tensor? colvec_scale=None, str activation='swiglu', bool colvec_reduce=False, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=True, bool tuned=True) -> Tensor?",
@@ -1330,7 +1330,7 @@ def gemm_dgated_out(
     )
 
 
-@torch.library.register_fake("quack::gemm_dgated_out")
+@torch.library.register_fake("xorl_quack::gemm_dgated_out")
 def gemm_dgated_out_fake(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
     B: Tensor,  # (K, N) or (L, K, N)
@@ -1362,8 +1362,8 @@ def gemm_dgated_out_fake(
 # try:
 #     from torch._inductor.fx_passes.reinplace import InplaceableOp
 #     torch._inductor.fx_passes.reinplace.inplaceable_ops.update({
-#         torch.ops.quack.gemm_add_out.default:
-#         InplaceableOp(torch.ops.quack.gemm_add_inplace.default, mutated_arg=2)
+#         torch.ops.xorl_quack.gemm_add_out.default:
+#         InplaceableOp(torch.ops.xorl_quack.gemm_add_inplace.default, mutated_arg=2)
 #     })
 # except ImportError:
 #     pass

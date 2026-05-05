@@ -205,7 +205,7 @@ class TopK:
                     cute.autovec_copy(topk_indices[None, i], mIndices_store[None, col])
 
 
-@torch.library.custom_op("quack::_topk_fwd", mutates_args={"values", "indices"})
+@torch.library.custom_op("xorl_quack::_topk_fwd", mutates_args={"values", "indices"})
 def _topk_fwd(x: torch.Tensor, k: int, softmax: bool, values: torch.Tensor, indices: torch.Tensor) -> None:
     """Top-k forward pass.
     Args:
@@ -421,7 +421,7 @@ class TopKBackward(ReductionBase):
             copy_dx(tXrdX, tXgdX)
 
 
-@torch.library.custom_op("quack::_topk_bwd", mutates_args={"dx"})
+@torch.library.custom_op("xorl_quack::_topk_bwd", mutates_args={"dx"})
 def _topk_bwd(
     dvalues: torch.Tensor,
     values: Optional[torch.Tensor],

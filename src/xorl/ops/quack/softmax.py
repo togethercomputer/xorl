@@ -152,7 +152,7 @@ class Softmax(ReductionBase):
             copy(tXrO, tXgO)
 
 
-@torch.library.custom_op("quack::_softmax_fwd", mutates_args={"out"})
+@torch.library.custom_op("xorl_quack::_softmax_fwd", mutates_args={"out"})
 def _softmax_fwd(x: torch.Tensor, out: torch.Tensor) -> None:
     """Softmax forward pass.
     Args:
@@ -312,7 +312,7 @@ class SoftmaxBackward(ReductionBase):
             copy(tdXrdX, tdXgdX)
 
 
-@torch.library.custom_op("quack::_softmax_backward", mutates_args={"dx"})
+@torch.library.custom_op("xorl_quack::_softmax_backward", mutates_args={"dx"})
 def _softmax_backward(dy: torch.Tensor, y: torch.Tensor, dx: torch.Tensor) -> None:
     """Softmax backward pass.
     Args:
