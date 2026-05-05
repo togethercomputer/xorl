@@ -56,6 +56,11 @@ def _load_local_xorl_config(
 
         return Qwen2Config(**{k: v for k, v in config_dict.items() if not k.startswith("_")})
 
+    if model_type == "olmo2":
+        from .transformers.olmo2.configuration_olmo2 import Olmo2Config
+
+        return Olmo2Config(**{k: v for k, v in config_dict.items() if not k.startswith("_")})
+
     return None
 
 

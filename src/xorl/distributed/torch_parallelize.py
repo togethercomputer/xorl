@@ -29,6 +29,7 @@ if is_torch_version_greater_than("2.4"):
     from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
     from torch.distributed.tensor.parallel import (
         ColwiseParallel,
+        ParallelStyle,
         RowwiseParallel,
         parallelize_module,
     )
@@ -71,19 +72,27 @@ def _build_tp_plan(model: "nn.Module") -> Dict[str, Any]:
     return plan
 
 
-def _resolve_tp_style(style_str: str):
-    """Convert a string TP style to a PyTorch ParallelStyle object."""
-    if style_str == "colwise_rep":
+def _resolve_tp_style(style):
+    """Convert a string TP style to a PyTorch ``ParallelStyle`` instance.
+
+    ``style`` may also already be a ``ParallelStyle`` instance — useful for
+    plans that need configuration the string shortcuts don't cover (e.g.
+    ``ColwiseParallel(input_layouts=...)``, custom user-defined styles).
+    Returned as-is in that case.
+    """
+    if isinstance(style, ParallelStyle):
+        return style
+    if style == "colwise_rep":
         return ColwiseParallel(output_layouts=Replicate())
-    elif style_str == "embedding":
+    elif style == "embedding":
         # Embedding: shard weight on vocab dim, replicated input/output
         # Weight [vocab, hidden] → Shard(0) [vocab/tp, hidden] per rank
         # Lookup → partial results → all-reduce → replicated output
         return RowwiseParallel(input_layouts=Replicate(), output_layouts=Replicate())
-    elif style_str in _TP_STYLE_MAP:
-        return _TP_STYLE_MAP[style_str]()
+    elif style in _TP_STYLE_MAP:
+        return _TP_STYLE_MAP[style]()
     else:
-        raise ValueError(f"Unknown TP style: {style_str}")
+        raise ValueError(f"Unknown TP style: {style}")
 
 
 def parallelize_model_fsdp2(
