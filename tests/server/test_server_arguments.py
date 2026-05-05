@@ -30,6 +30,29 @@ def test_load_server_arguments_threads_signsgd_through_nested_config(tmp_path):
     assert args.to_config_dict()["train"]["optimizer"] == "signsgd"
 
 
+def test_load_server_arguments_threads_distsignsgd_through_nested_config(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "model_path": "Qwen/Qwen3-8B",
+                },
+                "train": {
+                    "optimizer": "distsignsgd",
+                    "output_dir": str(tmp_path / "outputs"),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = load_server_arguments(str(config_path))
+
+    assert args.optimizer == "distsignsgd"
+    assert args.to_config_dict()["train"]["optimizer"] == "distsignsgd"
+
+
 def test_load_server_arguments_threads_muon_gram_newton_schulz_through_nested_config(tmp_path):
     config_path = tmp_path / "server_config.yaml"
     config_path.write_text(

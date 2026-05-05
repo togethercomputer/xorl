@@ -247,10 +247,11 @@ class ServerArguments:
     # Optimizer
     # ========================================================================
 
-    optimizer: Literal["adamw", "anyprecision_adamw", "sgd", "signsgd", "muon"] = field(
+    optimizer: Literal["adamw", "anyprecision_adamw", "sgd", "signsgd", "distsignsgd", "muon"] = field(
         default="adamw",
         metadata={
-            "help": "Optimizer type. 'signsgd' is a state-free sign update; 'muon' uses "
+            "help": "Optimizer type. 'signsgd' is a local state-free sign update; "
+            "'distsignsgd' signs gradients before FSDP2 reduction; 'muon' uses "
             "Newton-Schulz orthogonalization for 2D+ weight matrices."
         },
     )

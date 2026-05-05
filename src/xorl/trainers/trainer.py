@@ -55,12 +55,16 @@ from xorl.trainers.model_builder import (
 )
 from xorl.trainers.training_utils import (
     clip_gradients,
+    count_active_microbatches,
     count_valid_tokens,
     forward_backward_pp,
+    get_distsign_grad_scale_factor,
+    get_effective_grad_clip_value,
     maybe_merge_lora,
     negotiate_pp_seq_len,
     pad_micro_batches_for_pp,
     pp_loss_fn,
+    scale_model_gradients,
     sync_sp_gradients,
 )
 from xorl.utils import helper
@@ -603,6 +607,7 @@ class Trainer:
     def _build_optimizer(self) -> None:
         """Build optimizer and LR scheduler."""
         args = self.args
+        self._use_distsignsgd = args.train.optimizer == "distsignsgd"
         self.optimizer = build_optimizer(
             self.model,
             lr=args.train.lr,
@@ -842,6 +847,10 @@ class Trainer:
             (total_loss, grad_norm) — all-reduced across DP for logging.
         """
         global_valid_tokens = self._count_valid_tokens(micro_batches)
+        if self._use_distsignsgd:
+            active_microbatches, active_voter_total = self._count_active_microbatches(micro_batches)
+        else:
+            active_microbatches, active_voter_total = 0, 0
         self.optimizer.zero_grad()
 
         for mb in micro_batches:
@@ -861,7 +870,11 @@ class Trainer:
             RoutingReplay.clear_all()
 
         self._sync_sp_gradients()
-
+        if self._use_distsignsgd and active_microbatches > 0:
+            scale_model_gradients(
+                self.model,
+                get_distsign_grad_scale_factor(active_voter_total),
+            )
         grad_norm = self._clip_and_step()
         self._maybe_merge_lora()
         total_loss, grad_norm = self._reduce_metrics(total_loss, grad_norm)
@@ -879,6 +892,13 @@ class Trainer:
             group=self.ps.fsdp_group if self.pp_enabled else None,
         )
 
+    def _count_active_microbatches(self, micro_batches: List[Dict[str, Any]]) -> tuple[int, int]:
+        """Return ``(active_microbatches, active_voter_total)`` over the DP group."""
+        return count_active_microbatches(
+            micro_batches,
+            group=self.ps.fsdp_group if self.pp_enabled else None,
+        )
+
     def _pad_micro_batches_for_pp(self, micro_batches: List[Dict[str, Any]]) -> None:
         pad_micro_batches_for_pp(
             micro_batches,
@@ -889,7 +909,11 @@ class Trainer:
 
     def _sync_sp_gradients(self) -> None:
         """All-reduce gradients for CP/Ulysses dims not folded into FSDP."""
-        sync_sp_gradients(self.model, self.ps.sp_grad_sync_group)
+        sync_sp_gradients(
+            self.model,
+            self.ps.sp_grad_sync_group,
+            skip_dtensor_grads=self._use_distsignsgd,
+        )
 
     def _reduce_metrics(self, total_loss: float, grad_norm: float) -> Tuple[float, float]:
         """All-reduce loss and grad_norm across DP for logging."""
@@ -997,12 +1021,8 @@ class Trainer:
             pp_group=self.ps.pp_group,
         )
         gvt = global_valid_tokens.item()
-        if gvt > 0:
-            scale = 1.0 / gvt
-            for model_part in self.model_parts:
-                for p in model_part.parameters():
-                    if p.grad is not None:
-                        p.grad.mul_(scale)
+        if gvt > 0 and not self._use_distsignsgd:
+            scale_model_gradients(self.model_parts, 1.0 / float(gvt))
         return raw_loss / gvt if gvt > 0 else 0.0
 
     def _clip_and_step(self) -> float:
@@ -1010,9 +1030,13 @@ class Trainer:
 
         Returns grad_norm (scalar).
         """
+        clip_value = get_effective_grad_clip_value(
+            self.args.train.max_grad_norm,
+            use_distsignsgd=self._use_distsignsgd,
+        )
         grad_norm = clip_gradients(
             self.model,
-            self.args.train.max_grad_norm,
+            clip_value,
             pp_enabled=self.pp_enabled,
             pp_group=self.ps.pp_group if self.pp_enabled else None,
         )

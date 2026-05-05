@@ -47,11 +47,15 @@ from xorl.trainers.model_builder import (
 )
 from xorl.trainers.training_utils import (
     clip_gradients,
+    count_active_microbatches,
     count_valid_tokens,
     forward_backward_pp,
+    get_distsign_grad_scale_factor,
+    get_effective_grad_clip_value,
     negotiate_pp_seq_len,
     pad_micro_batches_for_pp,
     pp_loss_fn,
+    scale_model_gradients,
     sync_sp_gradients,
 )
 from xorl.trainers.training_utils import (
@@ -217,6 +221,8 @@ class ModelRunner:
         # Deferred gradient normalization: accumulate raw valid token counts
         # across forward_backward calls, normalize once at optim_step.
         self._accumulated_valid_tokens: Dict[str, int] = {}
+        self._accumulated_active_microbatches: Dict[str, int] = {}
+        self._accumulated_active_voter_total: Dict[str, int] = {}
 
         # PP schedule cache: keyed by (n_microbatches, seq_len) to avoid rebuilding on every call.
         self._pp_schedule_cache: Dict[tuple, Any] = {}
@@ -562,6 +568,9 @@ class ModelRunner:
     def _initialize_optimizer(self):
         """Initialize the optimizer."""
         optimizer_type = self.train_config.get("optimizer", "adamw")
+        self._use_distsignsgd = optimizer_type == "distsignsgd"
+        if self._use_distsignsgd and self.lora_config.get("enable_lora", False):
+            raise NotImplementedError("DistSignSGD does not yet support server LoRA adapter-manager training.")
         optimizer_kwargs = None
         if optimizer_type == "muon":
             optimizer_kwargs = {
@@ -769,6 +778,11 @@ class ModelRunner:
         """
         group = get_parallel_state().fsdp_group if self.pp_enabled else None
         return count_valid_tokens(micro_batches, group=group)
+
+    def _count_active_microbatches(self, micro_batches) -> tuple[int, int]:
+        """Return ``(active_microbatches, active_voter_total)`` over the DP group."""
+        group = get_parallel_state().fsdp_group if self.pp_enabled else None
+        return count_active_microbatches(micro_batches, group=group)
 
     # =========================================================================
     # Loss computation dispatch
@@ -1000,6 +1014,10 @@ class ModelRunner:
 
         # Count valid tokens globally
         global_valid_tokens = self._count_global_valid_tokens(micro_batches)
+        if compute_backward and self._use_distsignsgd:
+            active_microbatches, active_voter_total = self._count_active_microbatches(micro_batches)
+        else:
+            active_microbatches, active_voter_total = 0, 0
 
         if abort_callback and abort_callback():
             raise RuntimeError("Execution aborted by request")
@@ -1137,11 +1155,22 @@ class ModelRunner:
 
         # CP/SP gradient sync (backward only)
         if compute_backward:
-            sync_sp_gradients(self.model, get_parallel_state().sp_grad_sync_group)
+            sync_sp_gradients(
+                self.model,
+                get_parallel_state().sp_grad_sync_group,
+                skip_dtensor_grads=self._use_distsignsgd,
+            )
             # Accumulate valid tokens for deferred normalization at optim_step
             self._accumulated_valid_tokens[model_id] = (
                 self._accumulated_valid_tokens.get(model_id, 0) + global_valid_tokens.item()
             )
+            if self._use_distsignsgd:
+                self._accumulated_active_microbatches[model_id] = (
+                    self._accumulated_active_microbatches.get(model_id, 0) + active_microbatches
+                )
+                self._accumulated_active_voter_total[model_id] = (
+                    self._accumulated_active_voter_total.get(model_id, 0) + active_voter_total
+                )
 
         # Build result
         result = {
@@ -1387,6 +1416,10 @@ class ModelRunner:
         # PP path
         if self.pp_enabled:
             global_valid_tokens = self._count_global_valid_tokens(micro_batches)
+            if self._use_distsignsgd:
+                active_microbatches, active_voter_total = self._count_active_microbatches(micro_batches)
+            else:
+                active_microbatches, active_voter_total = 0, 0
             # Static padding: pad to sample_packing_sequence_len upfront.
             # With pp_variable_seq_lengths, padding is deferred to _forward_backward_pp.
             if not self.train_config.get("pp_variable_seq_lengths", False):
@@ -1407,6 +1440,13 @@ class ModelRunner:
             }
             # Accumulate valid tokens for deferred normalization at optim_step
             self._accumulated_valid_tokens[model_id] = self._accumulated_valid_tokens.get(model_id, 0) + gvt
+            if self._use_distsignsgd:
+                self._accumulated_active_microbatches[model_id] = (
+                    self._accumulated_active_microbatches.get(model_id, 0) + active_microbatches
+                )
+                self._accumulated_active_voter_total[model_id] = (
+                    self._accumulated_active_voter_total.get(model_id, 0) + active_voter_total
+                )
             # R3 cleanup for PP path (stage management handled by _pp_forward)
             if r3_enabled:
                 self._routing_handler.cleanup()
@@ -1564,6 +1604,8 @@ class ModelRunner:
 
         # Pop accumulated valid tokens for this model_id (deferred normalization)
         accumulated = self._accumulated_valid_tokens.pop(model_id, 0)
+        accumulated_active_microbatches = self._accumulated_active_microbatches.pop(model_id, 0)
+        accumulated_active_voter_total = self._accumulated_active_voter_total.pop(model_id, 0)
 
         # Multi-adapter path: use adapter's own optimizer on adapter's own parameters
         if self._adapter_manager is not None:
@@ -1587,13 +1629,14 @@ class ModelRunner:
 
         # Single-adapter path: use shared optimizer on model parameters
         else:
-            # Deferred gradient normalization: scale raw gradients by 1/accumulated_valid_tokens
-            # Use in-place mul_ to preserve DTensor metadata (FSDP2 grads are DTensors).
-            if accumulated > 0:
-                scale = 1.0 / accumulated
-                for p in self.model.parameters():
-                    if p.grad is not None:
-                        p.grad.mul_(scale)
+            if self._use_distsignsgd:
+                if accumulated_active_voter_total > 0:
+                    scale_model_gradients(
+                        self.model,
+                        get_distsign_grad_scale_factor(accumulated_active_voter_total),
+                    )
+            elif accumulated > 0:
+                scale_model_gradients(self.model, 1.0 / float(accumulated))
 
             # Determine learning rate
             if lr is not None:
@@ -1602,6 +1645,10 @@ class ModelRunner:
                     param_group["lr"] = effective_lr
 
             ps = get_parallel_state()
+            clip_value = get_effective_grad_clip_value(
+                clip_value,
+                use_distsignsgd=self._use_distsignsgd,
+            )
 
             grad_norm = clip_gradients(
                 self.model,
@@ -1646,6 +1693,8 @@ class ModelRunner:
             f"Rank {self.rank}: optim_step step={current_step}, "
             f"grad_norm={grad_norm:.6f}, lr={current_lr:.2e}, "
             f"clip={clip_value}, accumulated_valid_tokens={accumulated}, "
+            f"accumulated_active_microbatches={accumulated_active_microbatches}, "
+            f"accumulated_active_voter_total={accumulated_active_voter_total}, "
             f"model_id={model_id}, time={result['optim_step_time']:.3f}s"
         )
 

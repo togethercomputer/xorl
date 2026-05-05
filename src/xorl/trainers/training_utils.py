@@ -19,7 +19,18 @@ from xorl.qlora.utils import maybe_requant_qlora
 from xorl.utils.device import get_device_type
 
 
-def sync_sp_gradients(model: torch.nn.Module, sp_grad_sync_group) -> None:
+try:
+    from torch.distributed._tensor import DTensor
+except ImportError:  # pragma: no cover - torch 2.10+ always provides DTensor here
+    DTensor = None
+
+
+def sync_sp_gradients(
+    model: torch.nn.Module,
+    sp_grad_sync_group,
+    *,
+    skip_dtensor_grads: bool = False,
+) -> None:
     """All-reduce gradients for ring/Ulysses dims not folded into FSDP.
 
     SP ranks hold complementary (non-overlapping) parts of the same sequence,
@@ -28,11 +39,18 @@ def sync_sp_gradients(model: torch.nn.Module, sp_grad_sync_group) -> None:
     cp_fsdp_mode="all":           group is None → no-op
     cp_fsdp_mode="ulysses_only":  group is ring group
     cp_fsdp_mode="none":          group is unified SP group
+
+    When DistSignSGD is active, FSDP-managed grads perform the exact SP sum
+    inside the custom reduce-scatter hook before `sign()`. In that case, the
+    later external SP sync should only touch non-FSDP grads.
     """
     if sp_grad_sync_group is not None:
         for p in model.parameters():
-            if p.grad is not None:
-                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, group=sp_grad_sync_group)
+            if p.grad is None:
+                continue
+            if skip_dtensor_grads and DTensor is not None and isinstance(p.grad, DTensor):
+                continue
+            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, group=sp_grad_sync_group)
 
 
 def clip_gradients(
@@ -70,6 +88,40 @@ def clip_gradients(
     return grad_norm
 
 
+def get_effective_grad_clip_value(max_grad_norm: float, *, use_distsignsgd: bool) -> float:
+    """Return the clipping threshold to use for the current optimizer path.
+
+    DistSignSGD turns gradients into sign-vote accumulators before the training
+    loop reaches grad clipping. Clipping those sign votes changes the update
+    scale by orders of magnitude, so we pass float("inf") to disable clipping
+    and let the downstream `clip_gradients` call return the unclipped L2 norm
+    purely for observability.
+
+    Note for log readers: under DistSignSGD the value reported as "grad_norm"
+    is really the L2 norm of accumulated sign votes (think `vote_l2_norm`),
+    not a true gradient magnitude — its scale tracks `sqrt(num_params)` and
+    voter agreement, not the underlying loss landscape.
+    """
+    if use_distsignsgd:
+        return float("inf")
+    return max_grad_norm
+
+
+def get_distsign_grad_scale_factor(active_voter_total: int) -> float:
+    """Return the scale factor that converts accumulated sign votes to a mean.
+
+    `active_voter_total` is the total number of (microbatch, rank) pairs that
+    actually cast a sign vote — i.e. ranks whose microbatch had at least one
+    valid token. Ranks with zero valid tokens contribute sign(0) = 0, not a
+    ±1 vote, so multiplying `active_microbatches * dp_size` would over-count
+    abstainers and bias the per-step update toward zero on uneven token
+    distributions.
+    """
+    if active_voter_total <= 0:
+        return 1.0
+    return 1.0 / float(active_voter_total)
+
+
 def count_valid_tokens(
     micro_batches: List[Dict[str, Any]],
     group=None,
@@ -86,6 +138,57 @@ def count_valid_tokens(
             global_valid_tokens += (labels != IGNORE_INDEX).sum()
     dist.all_reduce(global_valid_tokens, op=dist.ReduceOp.SUM, group=group)
     return global_valid_tokens
+
+
+def count_active_microbatches(
+    micro_batches: List[Dict[str, Any]],
+    group=None,
+) -> tuple[int, int]:
+    """Return ``(active_microbatches, active_voter_total)`` for sign-vote aggregation.
+
+    A single batched all-reduce (op=SUM) is issued for the whole accumulation step:
+
+    - ``active_microbatches``: number of micro-batches in which *any* rank in
+      ``group`` had at least one valid token.
+    - ``active_voter_total``: sum over micro-batches of the number of ranks
+      with valid tokens. This equals the number of (micro-batch, rank) pairs
+      that contribute a real ±1 sign vote (ranks with zero valid tokens emit
+      sign(0) = 0 and abstain).
+
+    Callers should use ``active_voter_total`` as the divisor when normalizing
+    accumulated sign votes; using ``active_microbatches * dp_size`` would
+    over-count abstainers when token distribution is uneven.
+    """
+    if not micro_batches:
+        return 0, 0
+
+    flags = torch.zeros(len(micro_batches), device=get_device_type(), dtype=torch.int64)
+    for i, mb in enumerate(micro_batches):
+        labels = mb.get("labels", mb.get("target_tokens"))
+        if labels is None:
+            continue
+        flags[i] = (labels != IGNORE_INDEX).any().to(torch.int64)
+    dist.all_reduce(flags, op=dist.ReduceOp.SUM, group=group)
+    active_voter_total = int(flags.sum().item())
+    active_microbatches = int((flags > 0).sum().item())
+    return active_microbatches, active_voter_total
+
+
+def scale_model_gradients(model_or_models, scale: float) -> None:
+    """Scale gradients in-place while preserving DTensor metadata."""
+    if scale == 1.0:
+        return
+
+    modules = model_or_models if isinstance(model_or_models, (list, tuple)) else [model_or_models]
+    seen: set[int] = set()
+    for module in modules:
+        for param in module.parameters():
+            param_id = id(param)
+            if param_id in seen:
+                continue
+            seen.add(param_id)
+            if param.grad is not None:
+                param.grad.mul_(scale)
 
 
 def reset_lora_optimizer_states(
