@@ -100,11 +100,13 @@ def synchronize_micro_batch_padding(
     n_keys = len(all_keys)
     for i, mb in enumerate(micro_batches):
         offset = i * n_keys
+        max_sequence_target = 0
 
         # 2D keys
         for j, key in enumerate(keys_2d):
             target = target_lens[offset + j]
             current = mb[key].shape[-1]
+            max_sequence_target = max(max_sequence_target, target)
             if current >= target:
                 continue
             pad_amt = target - current
@@ -119,3 +121,22 @@ def synchronize_micro_batch_padding(
             pad_amt = target - current
             # F.pad pads from last dim backwards: (H_left, H_right, S_left, S_right)
             mb[key] = F.pad(mb[key], (0, 0, 0, pad_amt), value=_3D_PAD_VALUES[key])
+
+        # Keep FA varlen metadata consistent with the padded tensor length.
+        # Shorter DP ranks are padded to the global max sequence length above;
+        # FA3 expects q/k/v.shape[0] to match cu_seq_lens[-1]. Grow the final
+        # sequence segment to include sync padding rather than adding a new
+        # padding segment.
+        for key in ("cu_seq_lens_q", "cu_seq_lens_k"):
+            if key in mb and isinstance(mb[key], torch.Tensor) and max_sequence_target > 0:
+                if mb[key][-1] < max_sequence_target:
+                    mb[key] = mb[key].clone()
+                    mb[key][-1] = max_sequence_target
+
+        for max_key, cu_key in (("max_length_q", "cu_seq_lens_q"), ("max_length_k", "cu_seq_lens_k")):
+            if cu_key in mb and isinstance(mb[cu_key], torch.Tensor):
+                new_max = int(mb[cu_key].diff().max().item())
+                if max_key in mb:
+                    mb[max_key] = max(int(mb[max_key]), new_max)
+                else:
+                    mb[max_key] = new_max
