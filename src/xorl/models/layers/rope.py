@@ -477,11 +477,19 @@ def _naive_apply_rotary_pos_emb(q, k, cos, sin):
     """Naive RoPE application (pure PyTorch, no fused kernel).
 
     All tensors use [B, S, H, D] layout. cos/sin are [B, S, D].
+    Handles partial rotary automatically when cos/sin dim < head_dim.
     """
     cos = cos.unsqueeze(2)
     sin = sin.unsqueeze(2)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    rotary_dim = cos.shape[-1]
+    if q.shape[-1] > rotary_dim:
+        q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+        k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+        q_embed = torch.cat([(q_rot * cos) + (rotate_half(q_rot) * sin), q_pass], dim=-1)
+        k_embed = torch.cat([(k_rot * cos) + (rotate_half(k_rot) * sin), k_pass], dim=-1)
+    else:
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
 

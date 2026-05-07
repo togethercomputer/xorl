@@ -16,6 +16,7 @@ from ..utils import logging
 from .layers.attention import ATTENTION_FUNCTIONS
 from .layers.normalization import set_rmsnorm_mode
 from .loader import ModelLoader, get_loader
+from .transformers.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
 from .transformers.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 from .transformers.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
 from .transformers.qwen3_5_shared import (
@@ -44,6 +45,9 @@ def _load_local_xorl_config(
 ) -> Optional["PretrainedConfig"]:
     config_dict, _ = PretrainedConfig.get_config_dict(config_path, **config_kwargs)
     model_type = config_dict.get("model_type")
+
+    if model_type == "glm4_moe":
+        return Glm4MoeConfig.from_dict(config_dict)
 
     if model_type == "qwen3_5_moe":
         return Qwen3_5MoeConfig.from_hf_config(_namespace_from_dict(config_dict))

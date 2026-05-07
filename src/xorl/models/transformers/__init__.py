@@ -1,4 +1,5 @@
 from . import (
+    glm4_moe,
     llama3,
     qwen2,
     qwen3,
@@ -9,6 +10,7 @@ from . import (
 
 
 __all__ = [
+    "glm4_moe",
     "llama3",
     "qwen2",
     "qwen3",
