@@ -114,6 +114,10 @@ markers = [
     "dataloader: Tests for data loaders",
 ]
 testpaths = ["tests"]
+# distributed_utils.py and other shared test helpers live alongside the
+# distributed tests; put that directory on sys.path so test files can
+# import them by bare module.
+pythonpath = ["tests/distributed"]
 norecursedirs = ["submodules"]
 filterwarnings = [
     "ignore::DeprecationWarning:multiprocessing.popen_fork",

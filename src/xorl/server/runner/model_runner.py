@@ -15,6 +15,7 @@ Usage:
 
 import gc
 import logging
+import math
 import os
 import time
 from typing import Any, Dict, List, Optional
@@ -33,6 +34,7 @@ from xorl.distributed.sequence_parallel.data import gather_outputs
 from xorl.lora import LoraLinear
 from xorl.models.layers.moe.routing_replay import set_replay_stage
 from xorl.ops.loss import (
+    TokenPartial,
     causallm_loss_function,
     importance_sampling_loss_function,
     policy_loss_function,
@@ -90,62 +92,45 @@ def configure_rank0_logging(logger_instance, rank):
         logger_instance.addFilter(RankFilter(rank))
 
 
-def _sp_allreduce_kl_metrics(metrics: Dict[str, Any], sp_group) -> Dict[str, Any]:
+def _sp_allreduce_kl_metrics(
+    metrics: Dict[str, Any],
+    metric_ops: Optional[Dict[str, str]],
+    sp_group,
+) -> Dict[str, Any]:
     """
     All-reduce KL/ratio metrics across the sequence-parallel (Ulysses) group.
 
-    With Ulysses SP, each rank only sees a shard of the sequence. Rank 0 often
-    has only prompt tokens (all target_tokens=-100), so its KL stats are zeros.
-    This function aggregates stats across all SP ranks so every rank (especially
-    rank 0 which reports metrics) sees the correct global values.
-
-    Mean-type metrics (kl, entropy, ratio_mean, pg_clipfrac) are converted to
-    (value * local_n) sums, all-reduced with SUM, then divided by total_n.
-    Min/max metrics use MIN/MAX all-reduce with proper identity elements for
-    ranks that have no valid tokens.
+    With Ulysses SP, each rank sees only a shard of the sequence. Rank 0 often
+    has only prompt tokens (target_tokens=-100), so its KL stats are zeros.
+    Reducing here makes per-mb metrics CP-global before downstream cross-mb /
+    cross-DP accumulation. Means are raw partial sums; min/max use ±inf
+    identity. Nothing is finalized — downstream sum-then-divide still applies.
     """
+    metric_ops = metric_ops or {}
+    if not metrics:
+        return metrics
+
     device = torch.device("cuda")
-    local_n = metrics.get("_n_valid_kl", 0)
 
-    # --- Mean-type metrics: convert to weighted sums, all-reduce, divide ---
-    mean_keys = ["kl_sample_train_k3", "entropy_sample", "ratio_mean", "pg_clipfrac"]
-    sum_tensors = {}
-    for key in mean_keys:
-        if key in metrics:
-            val = float(metrics[key]) * local_n
-            sum_tensors[key] = torch.tensor(val, dtype=torch.float64, device=device)
+    by_op: Dict[str, list[str]] = {"mean": [], "min": [], "max": []}
+    for k in metrics:
+        # valid_tokens is folded into the mean stack — it SUM-reduces too.
+        by_op.setdefault(metric_ops.get(k, "mean"), []).append(k)
 
-    # All-reduce the weighted sums
-    for t in sum_tensors.values():
-        dist.all_reduce(t, op=dist.ReduceOp.SUM, group=sp_group)
+    reduced: Dict[str, torch.Tensor] = {}
+    for op_name, keys in by_op.items():
+        if not keys:
+            continue
+        stacked = torch.stack([torch.as_tensor(metrics[k], dtype=torch.float64, device=device) for k in keys])
+        reduce_op = {"min": dist.ReduceOp.MIN, "max": dist.ReduceOp.MAX}.get(op_name, dist.ReduceOp.SUM)
+        dist.all_reduce(stacked, op=reduce_op, group=sp_group)
+        for i, k in enumerate(keys):
+            reduced[k] = stacked[i]
 
-    # --- Min/max metrics: use identity elements for empty ranks ---
-    ratio_min_val = float(metrics.get("ratio_min", 1.0)) if local_n > 0 else float("inf")
-    ratio_max_val = float(metrics.get("ratio_max", 1.0)) if local_n > 0 else float("-inf")
-    ratio_min_t = torch.tensor(ratio_min_val, dtype=torch.float64, device=device)
-    ratio_max_t = torch.tensor(ratio_max_val, dtype=torch.float64, device=device)
-    dist.all_reduce(ratio_min_t, op=dist.ReduceOp.MIN, group=sp_group)
-    dist.all_reduce(ratio_max_t, op=dist.ReduceOp.MAX, group=sp_group)
-
-    # --- All-reduce total valid token count ---
-    n_tensor = torch.tensor(float(local_n), dtype=torch.float64, device=device)
-    dist.all_reduce(n_tensor, op=dist.ReduceOp.SUM, group=sp_group)
-    total_n = max(n_tensor.item(), 1.0)
-
-    # --- Update metrics with properly reduced values ---
-    for key in mean_keys:
-        if key in sum_tensors:
-            metrics[key] = sum_tensors[key].item() / total_n
-
-    ratio_min_reduced = ratio_min_t.item()
-    ratio_max_reduced = ratio_max_t.item()
-    metrics["ratio_min"] = ratio_min_reduced if ratio_min_reduced != float("inf") else 1.0
-    metrics["ratio_max"] = ratio_max_reduced if ratio_max_reduced != float("-inf") else 1.0
-    metrics["valid_tokens"] = total_n
-
-    # Clean up internal key
-    metrics.pop("_n_valid_kl", None)
-
+    metrics.update(reduced)
+    # valid_tokens is a Python int downstream (used as a denominator).
+    if "valid_tokens" in reduced:
+        metrics["valid_tokens"] = int(reduced["valid_tokens"].item())
     return metrics
 
 
@@ -724,51 +709,82 @@ class ModelRunner:
             accumulators["losses"].append(gathered["loss"].cpu())
 
     @staticmethod
-    def _accumulate_is_metrics(accumulated, new_metrics):
-        """Accumulate importance sampling metrics across micro-batches."""
+    def _accumulate_is_metrics(accumulated, new_metrics, metric_ops=None):
+        """Accumulate IS metrics across micro-batches.
+
+        ``metric_ops`` tags non-mean keys; means accumulate by sum (finalized as
+        sum/count in _finalize_is_metrics), min/max by torch.minimum/maximum.
+        Values stay on-device — one collective + one ``.item()`` per metric in
+        _finalize_is_metrics.
+        """
         if not new_metrics:
             return
-        new_metrics.pop("_n_valid_kl", None)
-        n_tokens = new_metrics.get("valid_tokens", 1)
+        metric_ops = metric_ops or {}
+        n_tokens = float(new_metrics.get("valid_tokens", 1))
         for k, v in new_metrics.items():
-            if k not in accumulated:
-                accumulated[k] = {"sum": 0.0, "count": 0}
-            if k == "valid_tokens":
-                accumulated[k]["sum"] += v
-                accumulated[k]["count"] += 1
+            op = metric_ops.get(k, "mean")
+            v_t = torch.as_tensor(v, dtype=torch.float64, device="cuda")
+            if op in ("min", "max"):
+                entry = accumulated.get(k)
+                if entry is None:
+                    accumulated[k] = {"value": v_t.clone(), "op": op}
+                else:
+                    entry["value"] = (
+                        torch.minimum(entry["value"], v_t) if op == "min" else torch.maximum(entry["value"], v_t)
+                    )
             else:
-                accumulated[k]["sum"] += v * n_tokens
-                accumulated[k]["count"] += n_tokens
+                entry = accumulated.get(k)
+                if entry is None:
+                    accumulated[k] = {
+                        "sum": v_t.clone(),
+                        "count": 1.0 if k == "valid_tokens" else n_tokens,
+                        "op": "mean",
+                    }
+                else:
+                    entry["sum"] = entry["sum"] + v_t
+                    entry["count"] += 1.0 if k == "valid_tokens" else n_tokens
 
     @staticmethod
     def _finalize_is_metrics(accumulated, result):
-        """All-reduce IS metrics across DP group, then add averaged values to result dict."""
+        """All-reduce IS metrics across DP, then write finalized values to result.
+
+        One SUM-allreduce for mean partial-sums concatenated with their counts;
+        one MIN/MAX-allreduce per non-mean group. Min/max with non-finite
+        reductions (every rank empty) fall back to 1.0.
+        """
         if not accumulated:
             return
         ps = get_parallel_state()
-        if ps.dp_enabled:
-            dp_group = ps.dp_group
-            for k, v in accumulated.items():
-                if k == "ratio_min":
-                    t = torch.tensor(v["sum"] if v["count"] > 0 else float("inf"), dtype=torch.float64, device="cuda")
-                    dist.all_reduce(t, op=dist.ReduceOp.MIN, group=dp_group)
-                    v["sum"] = t.item() if t.item() != float("inf") else v["sum"]
-                    v["count"] = 1
-                elif k == "ratio_max":
-                    t = torch.tensor(v["sum"] if v["count"] > 0 else float("-inf"), dtype=torch.float64, device="cuda")
-                    dist.all_reduce(t, op=dist.ReduceOp.MAX, group=dp_group)
-                    v["sum"] = t.item() if t.item() != float("-inf") else v["sum"]
-                    v["count"] = 1
-                else:
-                    sum_t = torch.tensor(v["sum"], dtype=torch.float64, device="cuda")
-                    count_t = torch.tensor(float(v["count"]), dtype=torch.float64, device="cuda")
-                    dist.all_reduce(sum_t, op=dist.ReduceOp.SUM, group=dp_group)
-                    dist.all_reduce(count_t, op=dist.ReduceOp.SUM, group=dp_group)
-                    v["sum"] = sum_t.item()
-                    v["count"] = count_t.item()
-        for k, v in accumulated.items():
-            if v["count"] > 0:
-                result[f"is_{k}"] = v["sum"] / v["count"]
+        dp_group = ps.dp_group if ps.dp_enabled else None
+
+        groups: Dict[str, list[str]] = {"mean": [], "min": [], "max": []}
+        for k, entry in accumulated.items():
+            groups[entry["op"]].append(k)
+
+        if groups["mean"]:
+            keys = groups["mean"]
+            sums = torch.stack([accumulated[k]["sum"] for k in keys])
+            counts = torch.tensor([accumulated[k]["count"] for k in keys], dtype=torch.float64, device="cuda")
+            if dp_group is not None:
+                sums_and_counts = torch.cat([sums, counts])
+                dist.all_reduce(sums_and_counts, op=dist.ReduceOp.SUM, group=dp_group)
+                sums, counts = sums_and_counts[: len(keys)], sums_and_counts[len(keys) :]
+            means = (sums / counts.clamp(min=1.0)).tolist()
+            mask = (counts > 0).tolist()
+            for i, k in enumerate(keys):
+                if mask[i]:
+                    result[f"is_{k}"] = means[i]
+
+        for op_name, reduce_op in (("min", dist.ReduceOp.MIN), ("max", dist.ReduceOp.MAX)):
+            if not groups[op_name]:
+                continue
+            keys = groups[op_name]
+            stacked = torch.stack([accumulated[k]["value"] for k in keys])
+            if dp_group is not None:
+                dist.all_reduce(stacked, op=reduce_op, group=dp_group)
+            values = stacked.tolist()
+            for k, v in zip(keys, values):
+                result[f"is_{k}"] = v if math.isfinite(v) else 1.0
 
     def _count_global_valid_tokens(self, micro_batches):
         """Count valid tokens across all micro-batches and all-reduce across DP group.
@@ -789,7 +805,7 @@ class ModelRunner:
     # =========================================================================
 
     def _compute_micro_batch_loss(self, micro_batch, loss_fn, loss_fn_params):
-        """Compute loss for a single micro-batch. Returns (loss, per_token_outputs_dict, is_metrics, model_outputs)."""
+        """Compute loss for a single micro-batch. Returns (local_loss_sum, per_token_outputs_dict, is_metrics, metric_ops, model_outputs)."""
         params = loss_fn_params or {}
         return_per_token = params.get("return_per_token", True)
 
@@ -800,8 +816,13 @@ class ModelRunner:
         hidden_states = outputs.last_hidden_state
         effective_weight = self._get_effective_lm_head_weight()
 
+        # scale=1 → loss_fns return raw masked sums; normalization deferred to
+        # optim_step / _finalize_is_metrics.
+        token_sum_reducer = TokenPartial(scale=torch.tensor(1.0))
+
         per_token_outputs = {}
         is_metrics = None
+        metric_ops = None
 
         if loss_fn in ["causallm_loss", "cross_entropy"]:
             labels = micro_batch.get("labels")
@@ -812,8 +833,9 @@ class ModelRunner:
                 return_per_token=return_per_token,
                 ce_mode=self.ce_mode,
                 lm_head_fp32=self.lm_head_fp32,
+                loss_reducer=token_sum_reducer,
             )
-            loss = _result.loss
+            local_loss_sum = _result.loss
             if return_per_token:
                 per_token_outputs["logprobs"] = _result.per_token_logprobs
                 per_token_outputs["loss"] = _result.per_token_loss
@@ -833,13 +855,16 @@ class ModelRunner:
                 ce_mode=self.ce_mode,
                 compute_kl_stats=compute_kl_stats,
                 lm_head_fp32=self.lm_head_fp32,
+                loss_reducer=token_sum_reducer,
+                metric_reducer=token_sum_reducer,
             )
-            loss = _result.loss
+            local_loss_sum = _result.loss
             per_token_outputs["logprobs"] = _result.per_token_logprobs
             is_metrics = _result.metrics
+            metric_ops = _result.metric_ops
 
             if compute_kl_stats and get_parallel_state().cp_enabled and is_metrics:
-                is_metrics = _sp_allreduce_kl_metrics(is_metrics, get_parallel_state().ulysses_group)
+                is_metrics = _sp_allreduce_kl_metrics(is_metrics, metric_ops, get_parallel_state().ulysses_group)
 
             # Diagnostic top-k extraction (forward-only feature, rarely used)
             diagnostic_topk = params.get("diagnostic_topk", 0)
@@ -931,18 +956,21 @@ class ModelRunner:
                 compute_kl_stats=compute_kl_stats,
                 lm_head_fp32=self.lm_head_fp32,
                 icepop_beta=icepop_beta,
+                loss_reducer=token_sum_reducer,
+                metric_reducer=token_sum_reducer,
             )
-            loss = _result.loss
+            local_loss_sum = _result.loss
             per_token_outputs["logprobs"] = _result.per_token_logprobs
             is_metrics = _result.metrics
+            metric_ops = _result.metric_ops
 
             if compute_kl_stats and get_parallel_state().cp_enabled and is_metrics:
-                is_metrics = _sp_allreduce_kl_metrics(is_metrics, get_parallel_state().ulysses_group)
+                is_metrics = _sp_allreduce_kl_metrics(is_metrics, metric_ops, get_parallel_state().ulysses_group)
 
         else:
             raise ValueError(f"Unknown loss_fn: {loss_fn}")
 
-        return loss, per_token_outputs, is_metrics, outputs
+        return local_loss_sum, per_token_outputs, is_metrics, metric_ops, outputs
 
     # =========================================================================
     # Per-sample K3 KL divergence
@@ -1050,16 +1078,16 @@ class ModelRunner:
 
             # Forward pass + loss computation
             with self.model_fwd_context:
-                loss, per_token_outputs, is_metrics, outputs = self._compute_micro_batch_loss(
+                local_loss_sum, per_token_outputs, is_metrics, metric_ops, outputs = self._compute_micro_batch_loss(
                     micro_batch, loss_fn, params
                 )
 
             logger.debug(
                 f"Rank {self.rank}: micro_batch {batch_idx}/{len(micro_batches)} "
-                f"loss={loss.item():.6f}, local_valid_tokens={local_valid_tokens.item()}, "
+                f"local_loss_sum={local_loss_sum.item():.6f}, local_valid_tokens={local_valid_tokens.item()}, "
                 f"global_valid_tokens={global_valid_tokens.item()}"
             )
-            # Note: loss is always finite even when local_valid_tokens=0, because
+            # Note: local_loss_sum is always finite even when local_valid_tokens=0, because
             # causallm_loss_function uses reduction="none" + manual mean with
             # clamp(min=1) denominator. No need to replace with zeros_like
             # (which would break the autograd graph and cause FSDP2 deadlocks).
@@ -1105,16 +1133,12 @@ class ModelRunner:
                                 }
                             )
 
-            # Gradient accumulation — raw (unnormalized) backward.
-            # Normalization by total accumulated valid tokens is deferred to optim_step.
-            # FSDP's automatic gradient averaging is disabled (set_gradient_divide_factor(1.0)
-            # in torch_parallelize), so no fsdp_size compensation is needed here.
-            # When local_valid_tokens=0, this produces 0 gradients while preserving
-            # the full autograd graph through all parameters (including lm_head weight),
-            # which is critical for FSDP2 reduce-scatter collectives.
+            # Backward + reporting on the raw partial sum: cross-mb / cross-DP
+            # accumulation composes under SUM-allreduce, then optim_step divides
+            # once by global_valid_tokens. FSDP grad averaging is off
+            # (set_gradient_divide_factor(1.0) in torch_parallelize).
             if compute_backward:
                 ps = get_parallel_state()
-                raw_loss = loss * local_valid_tokens.detach().float()
 
                 if abort_callback and abort_callback():
                     raise RuntimeError("Execution aborted by request")
@@ -1124,26 +1148,21 @@ class ModelRunner:
                     set_replay_stage("replay_backward")
 
                 with self.model_bwd_context:
-                    raw_loss.backward()
+                    local_loss_sum.backward()
 
-                # Loss reporting (separately, no grad): compute normalized per-token loss
                 with torch.no_grad():
-                    loss_report = loss.detach() * local_valid_tokens
+                    loss_report = local_loss_sum.detach()
                     dist.all_reduce(loss_report, op=dist.ReduceOp.SUM, group=ps.fsdp_group if self.pp_enabled else None)
                     if global_valid_tokens.item() > 0:
                         total_loss += (loss_report / global_valid_tokens).item()
             else:
-                # Forward-only: accumulate weighted loss
                 if global_valid_tokens.item() > 0:
-                    total_loss += loss.item() * (local_valid_tokens.item() / global_valid_tokens.item())
+                    total_loss += local_loss_sum.item() / global_valid_tokens.item()
 
-            # Accumulate IS metrics
-            self._accumulate_is_metrics(accumulated_is_metrics, is_metrics)
+            self._accumulate_is_metrics(accumulated_is_metrics, is_metrics, metric_ops)
 
             # Cleanup
-            del micro_batch, outputs, loss
-            if compute_backward:
-                del raw_loss
+            del micro_batch, outputs, local_loss_sum
 
         # Note: gc.collect() + empty_cache() removed from per-step path.
         # They cost ~250ms + ~50ms per step (profiled on Qwen3-8B 8xH100).

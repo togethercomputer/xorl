@@ -10,13 +10,14 @@ This module provides the policy loss functions including:
 from __future__ import annotations
 
 import logging
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 
 from xorl.ops.loss.loss_output import LossOutput
 from xorl.ops.loss.per_token_ce import compute_per_token_ce
+from xorl.ops.loss.reducers import Reducer, TokenPartial
 
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,7 @@ def apply_tis_correction(
     train_log_probs: torch.Tensor,
     rollout_log_probs: torch.Tensor,
     valid_mask: torch.Tensor,
+    metric_reducer: Reducer,
     tis_clip_low: float = 0.1,
     tis_clip_high: float = 2.0,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -85,6 +87,8 @@ def apply_tis_correction(
         train_log_probs: Log probabilities from current training step
         rollout_log_probs: Log probabilities from rollout/inference
         valid_mask: Mask for valid tokens
+        metric_reducer: Reducer applied to per-token mean metrics (tis_mean,
+            tis_clipfrac). min/max are local reductions and bypass it.
         tis_clip_low: Lower bound for TIS clipping (default: 0.1)
         tis_clip_high: Upper bound for TIS clipping (default: 2.0)
 
@@ -100,12 +104,20 @@ def apply_tis_correction(
     # Apply TIS correction to loss
     corrected_loss = pg_loss * tis_clipped
 
-    # Compute metrics
+    valid_mask_f = valid_mask.float()
+    tis_clipfrac_per_token = (tis_clipped != tis).float()
+    # ±inf identity on empty ranks lets cross-rank MIN/MAX-allreduce ignore empty contributors.
+    if valid_mask.any():
+        tis_min = tis.masked_fill(~valid_mask, float("inf")).min()
+        tis_max = tis.masked_fill(~valid_mask, float("-inf")).max()
+    else:
+        tis_min = tis.new_tensor(float("inf"))
+        tis_max = tis.new_tensor(float("-inf"))
     tis_metrics = {
-        "tis_mean": tis[valid_mask].mean() if valid_mask.any() else torch.tensor(1.0),
-        "tis_min": tis[valid_mask].min() if valid_mask.any() else torch.tensor(1.0),
-        "tis_max": tis[valid_mask].max() if valid_mask.any() else torch.tensor(1.0),
-        "tis_clipfrac": (tis_clipped != tis)[valid_mask].float().mean() if valid_mask.any() else torch.tensor(0.0),
+        "tis_mean": metric_reducer(tis, valid_mask_f),
+        "tis_min": tis_min,
+        "tis_max": tis_max,
+        "tis_clipfrac": metric_reducer(tis_clipfrac_per_token, valid_mask_f),
     }
 
     return corrected_loss, tis_metrics
@@ -132,6 +144,8 @@ def policy_loss_function(
     tp_group: Optional[dist.ProcessGroup] = None,
     lm_head_fp32: bool = False,
     icepop_beta: Optional[float] = None,
+    loss_reducer: Optional[Reducer] = None,
+    metric_reducer: Optional[Reducer] = None,
 ) -> "LossOutput":
     """
     Policy loss with PPO clipping, optional IcePop masking, and optional TIS correction.
@@ -166,6 +180,13 @@ def policy_loss_function(
         compute_kl_stats: If True, compute and return full KL statistics in metrics dict
                          (kl_sample_train_k3, entropy_sample, ratio stats).
                          If False (default), only return valid_tokens and pg_clipfrac.
+        loss_reducer: Reduces per-token loss to a scalar partial share. None =>
+            ``TokenPartial(scale=valid_mask.sum())`` (legacy local token-mean; does
+            not compose across micro-batches/ranks). Pass a shared global-scale
+            reducer to make summed partial shares recover the global loss.
+        metric_reducer: Reduces per-token /mean metrics (pg_clipfrac, icepop_maskfrac,
+            tis_mean, tis_clipfrac, kl_sample_train_k3, entropy_sample, ratio_mean)
+            the same way. ratio_min/ratio_max/tis_min/tis_max stay local scalars.
 
     Returns:
         LossOutput with loss, per_token_logprobs (new logprobs), and metrics.
@@ -182,7 +203,13 @@ def policy_loss_function(
 
     # Create mask for valid tokens (use labels != ignore_index)
     valid_mask = labels_flat != ignore_index
-    n_valid = valid_mask.sum().clamp(min=1)
+    valid_mask_f = valid_mask.float()
+    valid_count = valid_mask.sum()
+
+    if loss_reducer is None:
+        loss_reducer = TokenPartial(scale=valid_count.float())
+    if metric_reducer is None:
+        metric_reducer = TokenPartial(scale=valid_count.float())
 
     # Compute cross-entropy (supports vocab-parallel TP via tp_group)
     per_token_ce = compute_per_token_ce(
@@ -205,33 +232,27 @@ def policy_loss_function(
     ppo_kl = ppo_kl.masked_fill(~valid_mask, 0.0)
     advantages_masked = advantages_flat.masked_fill(~valid_mask, 0.0)
 
-    # Compute KL stats BEFORE compute_ppo_loss to avoid torch.compile interference
+    # Computed BEFORE compute_ppo_loss to avoid torch.compile interference.
     _kl_stats = None
     if compute_kl_stats:
         with torch.no_grad():
-            _n_valid_kl = valid_mask.sum().item()  # TRUE count, no clamp
+            _log_ratio_full = (new_logprobs_flat - old_logprobs_flat).masked_fill(~valid_mask, 0.0)
+            _ratio_full = torch.exp(_log_ratio_full)
+            _per_token_k3 = _ratio_full - _log_ratio_full - 1.0
+            # ±inf identity on empty ranks lets cross-rank MIN/MAX-allreduce ignore empty contributors.
             if valid_mask.any():
-                _valid_old = old_logprobs_flat[valid_mask]
-                _valid_new = new_logprobs_flat[valid_mask]
-                _log_ratio = _valid_new - _valid_old
-                _ratio_valid = torch.exp(_log_ratio)
-                _kl_stats = {
-                    "kl_sample_train_k3": (_ratio_valid - _log_ratio - 1.0).mean().item(),
-                    "entropy_sample": -_valid_old.mean().item(),
-                    "ratio_mean": _ratio_valid.mean().item(),
-                    "ratio_min": _ratio_valid.min().item(),
-                    "ratio_max": _ratio_valid.max().item(),
-                    "_n_valid_kl": _n_valid_kl,
-                }
+                _ratio_min = _ratio_full.masked_fill(~valid_mask, float("inf")).min()
+                _ratio_max = _ratio_full.masked_fill(~valid_mask, float("-inf")).max()
             else:
-                _kl_stats = {
-                    "kl_sample_train_k3": 0.0,
-                    "entropy_sample": 0.0,
-                    "ratio_mean": 1.0,
-                    "ratio_min": 1.0,
-                    "ratio_max": 1.0,
-                    "_n_valid_kl": 0,
-                }
+                _ratio_min = _ratio_full.new_tensor(float("inf"))
+                _ratio_max = _ratio_full.new_tensor(float("-inf"))
+            _kl_stats = {
+                "kl_sample_train_k3": metric_reducer(_per_token_k3, valid_mask_f),
+                "entropy_sample": metric_reducer(-old_logprobs_flat, valid_mask_f),
+                "ratio_mean": metric_reducer(_ratio_full, valid_mask_f),
+                "ratio_min": _ratio_min,
+                "ratio_max": _ratio_max,
+            }
 
     # Compute PPO-style clipped loss (returns per-token losses, clip mask, and ratio)
     pg_losses, is_clipped, ratio = compute_ppo_loss(
@@ -263,13 +284,13 @@ def policy_loss_function(
             train_log_probs=new_logprobs_flat,
             rollout_log_probs=rollout_logprobs_flat,
             valid_mask=valid_mask,
+            metric_reducer=metric_reducer,
             tis_clip_low=tis_clip_low,
             tis_clip_high=tis_clip_high,
         )
 
-    # Surrogate loss for gradient flow through CE
-    # True loss value (for logging): pg_losses averaged over valid tokens
-    true_loss = pg_losses.masked_fill(~valid_mask, 0.0).sum() / n_valid
+    # True loss value (for logging): partial share under loss_reducer.
+    true_loss = loss_reducer(pg_losses, valid_mask_f)
 
     # Gradient-active mask: tokens that are not clipped, not IcePop-masked, and valid
     gradient_active = ~is_clipped & valid_mask
@@ -278,7 +299,7 @@ def policy_loss_function(
 
     # Surrogate: gradient weight = ratio * advantages, zeroed for inactive tokens
     gradient_weight = (ratio.detach() * advantages_flat).masked_fill(~gradient_active, 0.0)
-    surrogate = (gradient_weight * per_token_ce).sum() / n_valid
+    surrogate = loss_reducer(gradient_weight * per_token_ce, valid_mask_f)
 
     # Combine: forward value from true_loss, gradient from surrogate
     loss_with_grad = true_loss.detach() + surrogate - surrogate.detach()
@@ -286,26 +307,31 @@ def policy_loss_function(
     # Return training logprobs reshaped
     new_logprobs = new_logprobs_flat.view(original_shape)
 
-    # Compute metrics
     with torch.no_grad():
-        metrics = {
-            "valid_tokens": valid_mask.sum().item(),
-            "pg_clipfrac": is_clipped[valid_mask].float().mean().item() if valid_mask.any() else 0.0,
+        metrics: Dict[str, Any] = {
+            "valid_tokens": valid_count.item(),
+            "pg_clipfrac": metric_reducer(is_clipped.float(), valid_mask_f),
         }
 
         if icepop_mask is not None:
-            metrics["icepop_maskfrac"] = (~icepop_mask)[valid_mask].float().mean().item() if valid_mask.any() else 0.0
+            metrics["icepop_maskfrac"] = metric_reducer((~icepop_mask).float(), valid_mask_f)
 
-        # Use pre-computed KL statistics (computed before torch.compile'd compute_ppo_loss)
         if _kl_stats is not None:
             metrics.update(_kl_stats)
 
-        # Add TIS metrics if available
-        for k, v in tis_metrics.items():
-            metrics[k] = v.item() if torch.is_tensor(v) else v
+        metrics.update(tis_metrics)
+
+    metric_ops: Dict[str, str] = {}
+    if _kl_stats is not None:
+        metric_ops["ratio_min"] = "min"
+        metric_ops["ratio_max"] = "max"
+    if tis_metrics:
+        metric_ops["tis_min"] = "min"
+        metric_ops["tis_max"] = "max"
 
     return LossOutput(
         loss=loss_with_grad,
         per_token_logprobs=new_logprobs,
         metrics=metrics,
+        metric_ops=metric_ops or None,
     )

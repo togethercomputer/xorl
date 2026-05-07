@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from tests.ops.loss.conftest import assert_close
-from xorl.ops.loss import drgrpo_loss_function
+from xorl.ops.loss import TokenPartial, drgrpo_loss_function
 
 
 @pytest.fixture
@@ -105,8 +105,10 @@ class TestDRGRPOLoss:
 
         assert output.loss.isfinite()
         assert output.loss.shape == ()
-        # Regression test: expected value computed with seed=42 fixture inputs
-        assert_close(output.loss, torch.tensor(0.363678))
+        # Regression test: expected value computed with seed=42 fixture inputs.
+        # Default loss_reducer is TokenPartial(scale=mask.sum()); fixture has 4
+        # active tokens of 8 → 2× the previous numel-scaled value.
+        assert_close(output.loss, torch.tensor(0.727356))
 
     def test_backward(self, inputs):
         """Backward pass produces expected gradient norm (regression test)."""
@@ -129,8 +131,9 @@ class TestDRGRPOLoss:
         output.loss.backward()
         assert hidden_states.grad is not None
         assert hidden_states.grad.isfinite().all()
-        # Regression test: expected value computed with seed=42 fixture inputs
-        assert_close(hidden_states.grad.norm(), torch.tensor(1.514308))
+        # Regression test: expected value computed with seed=42 fixture inputs.
+        # Loss scaled 2× under new TokenPartial(scale=mask.sum()) default → grad scaled 2×.
+        assert_close(hidden_states.grad.norm(), torch.tensor(3.028616))
 
     def test_zero_advantages(self, inputs):
         """Zero advantages produce finite (near-zero) loss."""
@@ -309,31 +312,43 @@ class TestDRGRPOLoss:
             "loss/clip/high_fraction",
             "loss/clip/low_fraction",
             "loss/kl_ref/mean",
-            "loss/aggregate/active_fraction",
         ]
 
         for key in expected_keys:
             assert key in output.metrics, f"Missing metric: {key}"
 
-    def test_aggregation_types(self, inputs):
-        """Different aggregation types produce different losses."""
+    def test_microbatch_composition(self, inputs):
+        """Per-mb partial shares sum to single-batch values for both loss and metrics.
+
+        Regression test for the metric-inflation bug: with global-denominator
+        reducers, summing per-mb outputs must recover the single-batch result —
+        not N times as large.
+        """
         d = inputs
+        B = d["B"]
+        assert B >= 2, "Test requires B >= 2 to form micro-batches."
 
-        losses = {}
-        for agg_type in ["token_mean", "fixed_horizon", "sequence_mean"]:
-            output = drgrpo_loss_function(
-                hidden_states=d["hidden_states"],
+        loss_mask = (d["labels_with_mask"] != d["ignore_index"]).float()
+        metric_reducer = TokenPartial(scale=loss_mask.sum())
+        loss_reducer = TokenPartial(scale=torch.tensor(float(loss_mask.numel())))
+
+        def call(slc):
+            return drgrpo_loss_function(
+                hidden_states=d["hidden_states"][slc],
                 weight=d["weight"],
-                labels=d["labels_with_mask"],
-                old_logprobs=d["old_logprobs"],
-                advantages=d["advantages"],
+                labels=d["labels_with_mask"][slc],
+                old_logprobs=d["old_logprobs"][slc],
+                advantages=d["advantages"][slc],
+                ref_logprobs=d["ref_logprobs"][slc],
                 ignore_index=d["ignore_index"],
-                agg_type=agg_type,
-                beta=0.0,
+                beta=0.1,
+                loss_reducer=loss_reducer,
+                metric_reducer=metric_reducer,
             )
-            losses[agg_type] = output.loss.item()
-            assert output.loss.isfinite()
 
-        # At least some aggregation types should produce different values
-        unique_losses = set(round(v, 6) for v in losses.values())
-        assert len(unique_losses) >= 2, "Aggregation types should produce different losses"
+        single = call(slice(None))
+        mbs = [call(slice(b, b + 1)) for b in range(B)]
+
+        assert_close(sum(mb.loss for mb in mbs), single.loss)
+        for key, expected in single.metrics.items():
+            assert_close(sum(mb.metrics[key] for mb in mbs), expected)

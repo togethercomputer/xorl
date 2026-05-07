@@ -15,6 +15,7 @@ from xorl.ops.loss.grpo_loss import drgrpo_loss_function
 from xorl.ops.loss.importance_sampling_loss import importance_sampling_loss_function
 from xorl.ops.loss.loss_output import LossOutput
 from xorl.ops.loss.policy_loss import policy_loss_function
+from xorl.ops.loss.reducers import Reducer, SequencePartial, TokenPartial
 from xorl.ops.loss.vocab_parallel_cross_entropy import vocab_parallel_cross_entropy
 
 
@@ -51,6 +52,9 @@ __all__ = [
     "CrossEntropyMode",
     "LossOutput",
     "LOSS_REGISTRY",
+    "Reducer",
+    "SequencePartial",
+    "TokenPartial",
     "get_loss_function",
     "register_loss_function",
     "causallm_loss_function",

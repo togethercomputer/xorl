@@ -8,6 +8,7 @@ from xorl.ops.loss.compiled_cross_entropy import (
     compiled_cross_entropy_function,
 )
 from xorl.ops.loss.loss_output import LossOutput
+from xorl.ops.loss.reducers import Reducer, TokenPartial
 from xorl.ops.loss.vocab_parallel_cross_entropy import vocab_parallel_cross_entropy
 
 
@@ -22,6 +23,7 @@ def causallm_loss_function(
     tp_group=None,
     use_compile: bool = False,
     lm_head_fp32: bool = False,
+    loss_reducer: Reducer | None = None,
     z_loss_coef: float = 0.0,
 ) -> "LossOutput":
     """
@@ -42,6 +44,12 @@ def causallm_loss_function(
         ce_mode: Cross-entropy mode - "compiled" (default) or "eager"
         num_chunks: Number of chunks for compiled mode (default: 8).
         tp_group: TP process group for vocab-parallel cross-entropy (default: None).
+        loss_reducer: Optional ``(values, mask) -> scalar``. When supplied, the
+            returned loss is a partial share under the reducer's denominator
+            (sum across micro-batches + all-reduce across ranks recovers the
+            globally-correct loss). When None, falls back to a local token mean.
+            Z-loss (when enabled) is reduced through the same reducer so the
+            two terms compose consistently.
         z_loss_coef: If > 0, add the Z-loss auxiliary term used in OLMo /
                      PaLM-style training:
                          z_loss = coef * sum(logsumexp(logits)^2 * mask) / num_valid_tokens
@@ -64,6 +72,11 @@ def causallm_loss_function(
     hidden_states_flat = hidden_states.view(-1, hidden_states.size(-1))
     valid_mask = labels_flat != ignore_index
 
+    if loss_reducer is None:
+        loss_reducer = TokenPartial(scale=valid_mask.sum().float())
+
+    mask_flat = valid_mask.float()
+
     # Vocab-parallel cross-entropy for tensor parallelism
     if tp_group is not None:
         if z_loss_coef > 0.0:
@@ -83,7 +96,7 @@ def causallm_loss_function(
             use_compile=use_compile,
         )
 
-        loss = per_token_ce.sum() / valid_mask.sum().clamp(min=1)
+        loss = loss_reducer(per_token_ce, mask_flat)
         if return_per_token:
             return LossOutput(
                 loss=loss,
@@ -93,7 +106,6 @@ def causallm_loss_function(
         return LossOutput(loss=loss)
 
     z_loss_enabled = z_loss_coef > 0.0
-    valid_count = valid_mask.sum().clamp(min=1)
 
     if return_per_token:
         # Compute cross-entropy based on mode (and Z-loss when enabled).
@@ -117,9 +129,9 @@ def causallm_loss_function(
                 lse = torch.logsumexp(logits_flat, dim=-1)
                 per_token_lse_sq = (lse * lse) * valid_mask.to(lse.dtype)
 
-        ce_loss = per_token_ce.sum() / valid_count
+        ce_loss = loss_reducer(per_token_ce, mask_flat)
         if z_loss_enabled:
-            z_loss = per_token_lse_sq.sum() / valid_count
+            z_loss = loss_reducer(per_token_lse_sq, mask_flat)
             loss = ce_loss + z_loss_coef * z_loss
             metrics = {"ce_loss": ce_loss.detach(), "z_loss": z_loss.detach()}
         else:
@@ -156,9 +168,9 @@ def causallm_loss_function(
                 lse = torch.logsumexp(logits_flat, dim=-1)
                 per_token_lse_sq = (lse * lse) * valid_mask.to(lse.dtype)
 
-        ce_loss = per_token_ce.sum() / valid_count
+        ce_loss = loss_reducer(per_token_ce, mask_flat)
         if z_loss_enabled:
-            z_loss = per_token_lse_sq.sum() / valid_count
+            z_loss = loss_reducer(per_token_lse_sq, mask_flat)
             loss = ce_loss + z_loss_coef * z_loss
             return LossOutput(loss=loss, metrics={"ce_loss": ce_loss.detach(), "z_loss": z_loss.detach()})
         return LossOutput(loss=ce_loss)
