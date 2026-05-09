@@ -24,6 +24,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from safetensors.torch import save_file
 from torch.distributed._tensor import DTensor
+from torch.distributed.checkpoint import FileSystemReader
 from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
 
 from xorl.checkpoint import ckpt_to_state_dict
@@ -32,6 +33,7 @@ from xorl.distributed.parallel_state import get_parallel_state
 from xorl.lora.utils import get_lora_state_dict, save_lora_checkpoint
 from xorl.models import save_model_weights
 from xorl.utils import helper
+from xorl.utils.device import get_device_type
 
 
 logger = logging.getLogger(__name__)
@@ -106,6 +108,57 @@ class CheckpointManager:
                 lora_alpha = self.lora_config.get("lora_alpha", 32)
 
         return target_modules, lora_alpha
+
+    def _tensor_is_meta(self, tensor: torch.Tensor) -> bool:
+        raw_tensor = tensor.data if hasattr(tensor, "data") else tensor
+        if isinstance(raw_tensor, DTensor):
+            local_tensor = raw_tensor.to_local()
+            if hasattr(local_tensor, "wait"):
+                local_tensor = local_tensor.wait()
+            return getattr(local_tensor, "is_meta", False)
+        return getattr(raw_tensor, "is_meta", False)
+
+    def _model_has_meta_tensors(self) -> bool:
+        for parameter in self.model.parameters():
+            if self._tensor_is_meta(parameter):
+                return True
+        for buffer in self.model.buffers():
+            if self._tensor_is_meta(buffer):
+                return True
+        return False
+
+    def _materialize_meta_tensors_for_dcp_load(self) -> bool:
+        if self.train_config.get("load_weights_mode") != "skip":
+            return False
+        if not self._model_has_meta_tensors():
+            return False
+
+        device_type = get_device_type()
+        target_device = "cpu" if device_type == "cpu" else f"{device_type}:{self.local_rank}"
+        logger.info("Materializing meta parameters before DCP load via to_empty(device=%s)", target_device)
+        self.model.to_empty(device=target_device)
+        return True
+
+    def _checkpoint_has_optimizer(self, checkpoint_path: str) -> bool:
+        if not os.path.exists(os.path.join(checkpoint_path, ".metadata")):
+            return False
+        try:
+            metadata = FileSystemReader(checkpoint_path).read_metadata()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not inspect DCP metadata at %s for optimizer state: %s", checkpoint_path, exc)
+            return False
+        return any(key.startswith("optimizer") for key in metadata.state_dict_metadata.keys())
+
+    def _build_dcp_load_state(self, checkpoint_path: str, load_optimizer: bool) -> Dict[str, Any]:
+        self._materialize_meta_tensors_for_dcp_load()
+
+        state: Dict[str, Any] = {"model": self.model, "extra_state": {}}
+        if load_optimizer:
+            if self.optimizer is not None and self._checkpoint_has_optimizer(checkpoint_path):
+                state["optimizer"] = self.optimizer
+            else:
+                logger.info("DCP checkpoint has no optimizer state; loading model weights only.")
+        return state
 
     # ------------------------------------------------------------------
     # Adapter save / load (multi-tenancy LoRA)
@@ -941,7 +994,7 @@ class CheckpointManager:
         # For non-LoRA or single-adapter mode, use original DCP approach
         start_time = time.time()
 
-        state = {"model": self.model, "optimizer": self.optimizer if load_optimizer else None, "extra_state": {}}
+        state = self._build_dcp_load_state(checkpoint_path, load_optimizer=load_optimizer)
 
         self.Checkpointer.load(checkpoint_path, state)
 
@@ -950,12 +1003,13 @@ class CheckpointManager:
         self.global_forward_backward_step = state["extra_state"].get("global_forward_backward_step", 0)
         torch.set_rng_state(state["extra_state"].get("torch_rng_state", torch.get_rng_state()))
 
-        dist.barrier()
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
 
         result = {
             "checkpoint_path": checkpoint_path,
             "step": self.global_step,
-            "load_optimizer": load_optimizer,
+            "load_optimizer": "optimizer" in state,
             "load_time": time.time() - start_time,
             "success": True,
         }

@@ -11,12 +11,17 @@ from typing import Any, Callable, List, Optional, Set
 import torch
 import torch.nn as nn
 
+from xorl.distributed.parallel_state import get_parallel_state
 from xorl.distributed.torch_parallelize import build_parallelize_model as _parallelize
 from xorl.lora import freeze_base_parameters
-from xorl.lora.utils import inject_lora_into_model
+from xorl.lora.utils import inject_lora_into_model, inject_lora_into_model_with_moe
 from xorl.models import build_foundation_model
 from xorl.models.checkpoint_handlers.buffers import get_prequantized_exclude_modules
 from xorl.models.layers.rope import set_rope_native
+from xorl.models.transformers.deepseek_v3.support import (
+    freeze_deepseek_v3_router_parameters,
+    validate_deepseek_v3_training_mode,
+)
 from xorl.qlora import (
     detect_prequantized_block_fp8,
     detect_prequantized_nvfp4,
@@ -195,6 +200,12 @@ def build_training_model(
     if activation_native:
         logger.info_rank0("Using native SiLU activation (fused Triton kernel disabled)")
     model_config = model.config
+    validate_deepseek_v3_training_mode(
+        model_config,
+        enable_qlora=enable_qlora,
+        freeze_router=freeze_router,
+        merge_qkv=merge_qkv,
+    )
     helper.print_device_mem_info("VRAM usage after building model")
 
     # ------------------------------------------------------------------
@@ -253,6 +264,7 @@ def build_training_model(
     # 6. Parallelize (FSDP2 / PP)
     # ------------------------------------------------------------------
     _basic_modules = list(model._no_split_modules) + (basic_modules or [])
+    effective_pp_schedule = pp_schedule if get_parallel_state().pp_enabled else None
     build_result = _parallelize(
         model,
         init_device=init_device,
@@ -265,7 +277,7 @@ def build_training_model(
         enable_reentrant=enable_reentrant,
         enable_forward_prefetch=enable_forward_prefetch,
         load_weights_mode=load_weights_mode,
-        pp_schedule=pp_schedule,
+        pp_schedule=effective_pp_schedule,
         reshard_after_forward=reshard_after_forward,
         moe_grad_reduce_mode=moe_grad_reduce_mode,
         skip_param_upcast=should_skip_generic_param_upcast(
@@ -313,11 +325,12 @@ def build_training_model(
 
     # Optionally freeze MoE router
     if freeze_router:
-        router_frozen_count = 0
-        for name, param in model.named_parameters():
-            if ".gate.weight" in name:
-                param.requires_grad = False
-                router_frozen_count += 1
+        router_frozen_count = freeze_deepseek_v3_router_parameters(model)
+        if router_frozen_count == 0:
+            for name, param in model.named_parameters():
+                if ".gate.weight" in name:
+                    param.requires_grad = False
+                    router_frozen_count += 1
         if router_frozen_count > 0:
             logger.info_rank0(f"Froze {router_frozen_count} MoE router (gate) parameters")
 
@@ -442,8 +455,6 @@ def _inject_lora(
     is_moe_model = getattr(model.config, "num_experts", 0) > 0
 
     if is_moe_model and moe_hybrid_shared_lora:
-        from xorl.lora.utils import inject_lora_into_model_with_moe
-
         logger.info_rank0(f"MoE-aware LoRA injection (hybrid_shared={moe_hybrid_shared_lora})")
         inject_lora_into_model_with_moe(
             model,

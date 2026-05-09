@@ -84,11 +84,17 @@ def _all_gather_kv(
 ) -> Tuple[List[Tensor], List[Tensor]]:
     """All-gather KV from all ring ranks.
 
-    Stacks K and V into a single buffer, performs one all_gather, then splits.
+    Fast path (k.shape == v.shape): stacks K and V into a single buffer and
+    does one all_gather.
+
+    MLA path (k.shape != v.shape, e.g. DeepSeek-V3 / Kimi with K having
+    ``qk_nope_head_dim + qk_rope_head_dim`` and V having ``v_head_dim``):
+    falls back to two separate all_gathers, mirroring
+    ``_gather_seq_scatter_kv`` in ``strategy.py``.
 
     Args:
-        k: local key tensor [B, S_local, H_kv, D] or [total_local, H_kv, D]
-        v: local value tensor, same shape as k
+        k: local key tensor [B, S_local, H_kv, D_k] or [total_local, H_kv, D_k]
+        v: local value tensor, same layout as k (D_v may differ from D_k for MLA)
         ringattn_group: ring attention process group
 
     Returns:
@@ -96,10 +102,28 @@ def _all_gather_kv(
     """
     ringattn_size = dist.get_world_size(ringattn_group)
 
-    # Pack K,V into single buffer: [2, *k.shape]
-    kv_local = torch.stack([k, v], dim=0).contiguous()
+    # MLA / mismatched head_dim fallback.
+    if k.shape != v.shape:
+        k_local = k.contiguous()
+        v_local = v.contiguous()
+        k_gathered = torch.empty(
+            (ringattn_size * k_local.shape[0], *k_local.shape[1:]),
+            dtype=k_local.dtype,
+            device=k_local.device,
+        )
+        v_gathered = torch.empty(
+            (ringattn_size * v_local.shape[0], *v_local.shape[1:]),
+            dtype=v_local.dtype,
+            device=v_local.device,
+        )
+        dist.all_gather_into_tensor(k_gathered, k_local, group=ringattn_group)
+        dist.all_gather_into_tensor(v_gathered, v_local, group=ringattn_group)
+        k_list = [chunk.contiguous() for chunk in k_gathered.chunk(ringattn_size, dim=0)]
+        v_list = [chunk.contiguous() for chunk in v_gathered.chunk(ringattn_size, dim=0)]
+        return k_list, v_list
 
-    # All-gather: [2 * ringattn_size, *k.shape]
+    # Fast path: pack K,V into single buffer [2, *k.shape] and all_gather once.
+    kv_local = torch.stack([k, v], dim=0).contiguous()
     kv_gathered = torch.empty(
         (ringattn_size * kv_local.shape[0], *kv_local.shape[1:]),
         dtype=kv_local.dtype,

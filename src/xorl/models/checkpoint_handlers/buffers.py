@@ -382,11 +382,20 @@ class ExpertWeightBuffer:
         if expert_idx < self.expert_start or expert_idx >= self.expert_end:
             return
 
-        # GPU fast path: pin+DMA to GPU, transpose on GPU (~13x faster than CPU)
+        # GPU fast path: transpose and stack on GPU. If the tensor is already on
+        # the target GPU (for example after inline dequantization), keep it there
+        # instead of bouncing through CPU memory again.
         if self._device is not None and self._device.type == "cuda":
-            if tensor.dtype != torch.bfloat16:
-                tensor = tensor.to(dtype=torch.bfloat16)
-            tensor = tensor.pin_memory().to(device=self._device, non_blocking=True)
+            target_dtype = tensor.dtype if tensor.is_floating_point() else torch.bfloat16
+            if tensor.device == self._device:
+                if tensor.dtype != target_dtype:
+                    tensor = tensor.to(dtype=target_dtype)
+            elif tensor.device.type == "cpu":
+                if tensor.dtype != target_dtype:
+                    tensor = tensor.to(dtype=target_dtype)
+                tensor = tensor.pin_memory().to(device=self._device, non_blocking=True)
+            else:
+                tensor = tensor.to(device=self._device, dtype=target_dtype, non_blocking=True)
             tensor = tensor.t().contiguous()
 
             if key not in self._stacked_buffers:

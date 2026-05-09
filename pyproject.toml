@@ -18,6 +18,7 @@ dependencies = [
   "packaging>=23.0,<26.0",
   "tenacity>=8.0.0",
   "torchdata>=0.8.0,<1.0",
+  "tiktoken",
   "transformers[torch]>=5.0",
   "psutil",
   "wandb",

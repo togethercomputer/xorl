@@ -51,6 +51,14 @@ def qwen3_5_apply_rotary_pos_emb(
     sin: torch.Tensor,
     interleaved: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if interleaved:
+        # `RotaryEmbedding` emits cos/sin in halved layout
+        # [c0, c1, ..., c_{d/2-1}, c0, c1, ..., c_{d/2-1}]. The interleaved
+        # rotate_half rotates pair i at indices (2i, 2i+1), so cos/sin must be
+        # in interleaved layout [c0, c0, c1, c1, ...] for the math to line up.
+        half = cos.shape[-1] // 2
+        cos = cos[..., :half].repeat_interleave(2, dim=-1)
+        sin = sin[..., :half].repeat_interleave(2, dim=-1)
     cos = cos.unsqueeze(2)
     sin = sin.unsqueeze(2)
     rotary_dim = cos.shape[-1]

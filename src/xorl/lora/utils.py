@@ -30,6 +30,36 @@ DEFAULT_TARGET_MODULES = {
     "qwen": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     "mistral": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     "gemma": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    "deepseek_v3": [
+        "q_a_proj",
+        "q_b_proj",
+        "kv_a_proj_with_mqa",
+        "kv_b_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ],
+    "kimi_k2": [
+        "q_a_proj",
+        "q_b_proj",
+        "kv_a_proj_with_mqa",
+        "kv_b_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ],
+    "kimi_k25": [
+        "q_a_proj",
+        "q_b_proj",
+        "kv_a_proj_with_mqa",
+        "kv_b_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ],
 }
 
 _PEFT_BASE_MODEL_PREFIX = "base_model.model."
@@ -44,6 +74,18 @@ _PROJ_TO_SGLANG_W = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
 _SGLANG_W_TO_PROJ = {v: k for k, v in _PROJ_TO_SGLANG_W.items()}
 
 LORA_EXPORT_FORMATS = ("peft", "sglang_shared_outer")
+
+
+def _get_default_target_modules(model: nn.Module) -> List[str]:
+    config = getattr(model, "config", None)
+    model_type = getattr(config, "model_type", None)
+    if model_type in DEFAULT_TARGET_MODULES:
+        return list(DEFAULT_TARGET_MODULES[model_type])
+    if model_type is not None:
+        for family, targets in DEFAULT_TARGET_MODULES.items():
+            if family in model_type:
+                return list(targets)
+    return ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 
 def _get_submodule(model: nn.Module, target: str) -> Tuple[nn.Module, str]:
@@ -167,7 +209,7 @@ def inject_lora_into_model(
         ... )
     """
     if target_modules is None:
-        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+        target_modules = _get_default_target_modules(model)
 
     # Find all matching modules
     target_paths = _find_target_modules(model, target_modules)
@@ -886,9 +928,10 @@ def inject_lora_into_model_with_moe(
         model: Model to inject LoRA into
         r: LoRA rank
         lora_alpha: LoRA alpha for scaling
-        target_modules: List of module names to target.
-                       For attention: ["q_proj", "k_proj", "v_proj", "o_proj"]
-                       For MLP/experts: ["gate_proj", "up_proj", "down_proj"]
+        target_modules: List of module names to target. If None, falls back to
+                       the architecture default in DEFAULT_TARGET_MODULES (e.g.
+                       q_a_proj/q_b_proj/kv_a_proj_with_mqa/kv_b_proj/o_proj
+                       for DeepSeek-V3 / Kimi).
         moe_hybrid_shared_lora: If True, use hybrid sharing (lora_A shared for gate/up, lora_B shared for down)
 
     Returns:
@@ -904,13 +947,17 @@ def inject_lora_into_model_with_moe(
         ... )
     """
     if target_modules is None:
-        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        target_modules = _get_default_target_modules(model)
 
-    # Separate attention modules from MLP/expert modules
-    attention_modules = [
-        m for m in target_modules if m in ["q_proj", "k_proj", "v_proj", "qkv_proj", "o_proj", "lm_head"]
-    ]
-    expert_modules = [m for m in target_modules if m in ["gate_proj", "up_proj", "down_proj"]]
+    # Partition target_modules into expert MLP projections (handled by the
+    # group-GEMM MoE path) and dense linears (attention plus per-layer dense
+    # MLPs, handled by inject_lora_into_model). Anything that isn't an expert
+    # name is treated as a dense target so this function inherits new
+    # architectures (DeepSeek-V3 / Kimi MLA: q_a_proj, q_b_proj,
+    # kv_a_proj_with_mqa, kv_b_proj) from DEFAULT_TARGET_MODULES rather than
+    # silently dropping them via a Llama/Qwen-shaped allowlist.
+    expert_modules = [m for m in target_modules if m in ("gate_proj", "up_proj", "down_proj")]
+    attention_modules = [m for m in target_modules if m not in expert_modules]
 
     # Step 1: Inject LoRA into standard nn.Linear layers
     # This includes attention projections AND dense MLP layers (for layers without MoE)

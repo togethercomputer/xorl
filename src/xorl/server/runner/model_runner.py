@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PretrainedConfig
 
 from xorl.checkpoint import build_checkpointer
 from xorl.data.constants import IGNORE_INDEX
@@ -33,6 +33,7 @@ from xorl.distributed.pipeline_parallel import build_pipeline_schedule, build_pp
 from xorl.distributed.sequence_parallel.data import gather_outputs
 from xorl.lora import LoraLinear
 from xorl.models.layers.moe.routing_replay import set_replay_stage
+from xorl.models.transformers.deepseek_v3.support import deepseek_v3_default_lora_targets
 from xorl.ops.loss import (
     TokenPartial,
     causallm_loss_function,
@@ -54,9 +55,9 @@ from xorl.trainers.training_utils import (
     forward_backward_pp,
     get_distsign_grad_scale_factor,
     get_effective_grad_clip_value,
+    make_pp_loss_fn,
     negotiate_pp_seq_len,
     pad_micro_batches_for_pp,
-    pp_loss_fn,
     scale_model_gradients,
     sync_sp_gradients,
 )
@@ -191,6 +192,11 @@ class ModelRunner:
         self.model_config = config.get("model", {})
         self.train_config = config.get("train", {})
         self.lora_config = config.get("lora", {})
+        if self.train_config.get("load_weights_mode") == "skip" and not self.train_config.get("load_checkpoint_path"):
+            raise ValueError(
+                "load_weights_mode='skip' skips HF weight loading and requires train.load_checkpoint_path "
+                "to materialize parameters from a DCP checkpoint."
+            )
 
         # Cross-entropy mode
         self.ce_mode = self.train_config.get("ce_mode", "eager")
@@ -214,6 +220,7 @@ class ModelRunner:
 
         # Multi-adapter support (initialized later if LoRA is enabled)
         self._adapter_manager: Optional[LoRAAdapterManager] = None
+        self._checkpoint_mgr: Optional[CheckpointManager] = None
 
         # Single-tenant session tracking (for full-weights training mode)
         # When LoRA is disabled, only one training session is allowed at a time
@@ -241,6 +248,8 @@ class ModelRunner:
         self._initialize_model()
         self._initialize_optimizer()
         self._initialize_checkpointer()
+        self._checkpoint_mgr = self._build_checkpoint_manager()
+        self._load_initial_checkpoint()
         self._initialize_contexts()
 
         # Initialize multi-adapter manager if LoRA is enabled
@@ -259,6 +268,7 @@ class ModelRunner:
                 initialize_fresh=False,  # Use current weights as the default adapter
             )
             self._adapter_manager.current_adapter_id = "default"
+            self._checkpoint_mgr._adapter_manager = self._adapter_manager
             logger.info("Multi-adapter manager initialized with default adapter")
 
         # Initialize tokenizer for sampling (only on rank 0)
@@ -271,17 +281,6 @@ class ModelRunner:
 
         # Initialize extracted modules
         self._routing_handler = RoutingReplayHandler(self.model)
-        self._checkpoint_mgr = CheckpointManager(
-            model=self.model,
-            optimizer=self.optimizer,
-            checkpointer=self.Checkpointer,
-            lora_config=self.lora_config,
-            model_config=self.model_config,
-            train_config=self.train_config,
-            rank=self.rank,
-            local_rank=self.local_rank,
-            adapter_manager=self._adapter_manager,
-        )
         # Sync initial attributes
         self._checkpoint_mgr.lora_target_modules = getattr(self, "lora_target_modules", None)
         self._checkpoint_mgr.lora_alpha_value = getattr(self, "lora_alpha_value", None)
@@ -538,14 +537,36 @@ class ModelRunner:
         if explicit_target_modules is not None:
             return explicit_target_modules
 
+        config_path = self.model_config.get("config_path") or self.model_config.get("model_path")
+        model_type = None
+        if config_path:
+            try:
+                config_dict, _ = PretrainedConfig.get_config_dict(config_path)
+                model_type = config_dict.get("model_type")
+                if model_type == "kimi_k25":
+                    model_type = config_dict.get("text_config", {}).get("model_type", model_type)
+            except Exception:
+                model_type = None
+
         # Legacy Tinker-style: build from boolean flags
-        target_modules = []
-        if self.lora_config.get("train_attn", True):
-            target_modules.extend(["q_proj", "k_proj", "v_proj", "o_proj"])
-        if self.lora_config.get("train_mlp", True):
-            target_modules.extend(["gate_proj", "up_proj", "down_proj"])
-        if self.lora_config.get("train_unembed", True):
-            target_modules.append("lm_head")
+        train_attn = self.lora_config.get("train_attn", True)
+        train_mlp = self.lora_config.get("train_mlp", True)
+        train_unembed = self.lora_config.get("train_unembed", True)
+
+        if model_type in {"deepseek_v3", "kimi_k2", "kimi_k25"}:
+            target_modules = deepseek_v3_default_lora_targets(
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
+            )
+        else:
+            target_modules = []
+            if train_attn:
+                target_modules.extend(["q_proj", "k_proj", "v_proj", "o_proj"])
+            if train_mlp:
+                target_modules.extend(["gate_proj", "up_proj", "down_proj"])
+            if train_unembed:
+                target_modules.append("lm_head")
         if not target_modules:
             raise ValueError("At least one of train_mlp, train_attn, or train_unembed must be True")
         return target_modules
@@ -611,6 +632,30 @@ class ModelRunner:
             self.train_config.get("enable_gradient_checkpointing", False),
             self.train_config.get("activation_gpu_limit", None),
         )
+
+    def _build_checkpoint_manager(self, adapter_manager=None) -> CheckpointManager:
+        return CheckpointManager(
+            model=self.model,
+            optimizer=self.optimizer,
+            checkpointer=self.Checkpointer,
+            lora_config=self.lora_config,
+            model_config=self.model_config,
+            train_config=self.train_config,
+            rank=self.rank,
+            local_rank=self.local_rank,
+            adapter_manager=adapter_manager,
+        )
+
+    def _load_initial_checkpoint(self) -> None:
+        checkpoint_path = self.train_config.get("load_checkpoint_path")
+        if not checkpoint_path:
+            return
+        if self._checkpoint_mgr is None:
+            raise RuntimeError("Checkpoint manager must be initialized before loading an initial checkpoint.")
+
+        logger.info("Loading initial checkpoint from %s", checkpoint_path)
+        self._checkpoint_mgr.load_state(checkpoint_path, load_optimizer=True)
+        self._sync_from_checkpoint_state()
 
     def register_lora_adapter(self, model_id: str, lr: float) -> Dict[str, Any]:
         """
@@ -1241,7 +1286,7 @@ class ModelRunner:
             self._pp_schedule_cache[key] = build_pipeline_schedule(
                 stages=[stage],
                 n_microbatches=n_microbatches,
-                loss_fn=pp_loss_fn,
+                loss_fn=make_pp_loss_fn(self.ce_mode),
                 schedule_name=self.train_config.get("pipeline_parallel_schedule", "1F1B"),
             )
         return self._pp_schedule_cache[key]

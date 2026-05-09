@@ -455,6 +455,10 @@ class ModelArguments:
             "Disabled by default and must remain False when ep_dispatch='deepep'."
         },
     )
+    freeze_router: bool = field(
+        default=False,
+        metadata={"help": "Freeze MoE router weights during training."},
+    )
     record_routing_weights: bool = field(
         default=True,
         metadata={
@@ -814,10 +818,10 @@ class TrainingArguments:
             "help": "Device to initialize model weights. 1. `cpu`: Init parameters on CPU in rank0 only. 2. `cuda`: Init parameters on GPU. 3. `meta`: Init parameters on meta. 4. `npu`: Init parameters on Ascend NPU."
         },
     )
-    load_weights_mode: Literal["broadcast", "all_ranks"] = field(
+    load_weights_mode: Literal["broadcast", "all_ranks", "grouped", "skip"] = field(
         default="broadcast",
         metadata={
-            "help": "Weight loading mode. 'broadcast': rank0 reads weights and broadcasts to other ranks (default, avoids disk I/O bottleneck). 'all_ranks': every rank reads weights from disk independently."
+            "help": "Weight loading mode. 'broadcast': global rank0 reads weights and broadcasts to other ranks. 'all_ranks': every rank reads weights from disk independently. 'grouped': one reader per EP-FSDP group reads and broadcasts within that group. 'skip': skip HF weight loading (use with load_checkpoint_path for DCP)."
         },
     )
     enable_full_determinism: bool = field(
@@ -1102,6 +1106,14 @@ class TrainingArguments:
                 ckpt_manager=self.ckpt_manager,
             )
 
+        if self.load_weights_mode == "skip" and not self.load_checkpoint_path:
+            raise ValueError(
+                "load_weights_mode='skip' skips HF weight loading and relies on "
+                "load_checkpoint_path to materialize parameters from a DCP checkpoint. "
+                "Set load_checkpoint_path (e.g. to the output of scripts/convert_checkpoint.py) "
+                "or choose a different load_weights_mode."
+            )
+
         # save paths
         self.save_checkpoint_path = os.path.join(self.output_dir, "checkpoints")
         self.step2token_path = os.path.join(self.output_dir, "step2token.json")
@@ -1228,6 +1240,16 @@ class LoRAArguments:
     aqn_alpha: float = field(
         default=1.0,
         metadata={"help": "Scale factor for AQN noise magnitude."},
+    )
+    moe_hybrid_shared_lora: bool = field(
+        default=False,
+        metadata={
+            "help": "Route MoE LoRA injection through the hybrid-shared "
+            "(group-GEMM) path that shares lora_A across gate/up and "
+            "lora_B across down. Only meaningful for MoE models. "
+            "Read by Trainer._inject_lora; without this field on the "
+            "dataclass any local LoRA training run AttributeErrors out."
+        },
     )
 
 

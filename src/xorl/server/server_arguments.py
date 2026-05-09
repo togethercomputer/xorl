@@ -564,6 +564,13 @@ class ServerArguments:
             # the launcher can still use them via engine_connect_host + worker_bind_port
             pass
 
+        if self.load_weights_mode == "skip" and not self.load_checkpoint_path:
+            raise ValueError(
+                "load_weights_mode='skip' skips HF weight loading and relies on "
+                "load_checkpoint_path to materialize parameters from a DCP checkpoint. "
+                "Set load_checkpoint_path or choose a different load_weights_mode."
+            )
+
     def to_config_dict(self) -> Dict[str, Any]:
         """
         Convert ServerArguments to the config dict format expected by ModelRunner.

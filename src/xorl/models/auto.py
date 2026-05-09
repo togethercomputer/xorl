@@ -1,4 +1,6 @@
+import json
 import types
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union
 
 import torch
@@ -16,6 +18,8 @@ from ..utils import logging
 from .layers.attention import ATTENTION_FUNCTIONS
 from .layers.normalization import set_rmsnorm_mode
 from .loader import ModelLoader, get_loader
+from .transformers.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
+from .transformers.deepseek_v3.support import validate_deepseek_v3_router_settings
 from .transformers.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
 from .transformers.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 from .transformers.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
@@ -29,6 +33,33 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer, ProcessorMixin
 
 logger = logging.get_logger(__name__)
+
+
+def _build_local_kimi_tokenizer(tokenizer_path: str):
+    tokenizer_dir = Path(tokenizer_path)
+    tokenizer_config_path = tokenizer_dir / "tokenizer_config.json"
+    vocab_file = tokenizer_dir / "tiktoken.model"
+    if not tokenizer_config_path.is_file() or not vocab_file.is_file():
+        return None
+
+    with tokenizer_config_path.open() as f:
+        tokenizer_config = json.load(f)
+
+    auto_tokenizer = tokenizer_config.get("auto_map", {}).get("AutoTokenizer", [])
+    auto_tokenizer_cls = auto_tokenizer[0] if auto_tokenizer else ""
+    if tokenizer_config.get("tokenizer_class") != "TikTokenTokenizer" and not auto_tokenizer_cls.endswith(
+        "TikTokenTokenizer"
+    ):
+        return None
+
+    from .transformers.deepseek_v3.tokenization_kimi import TikTokenTokenizer  # noqa: PLC0415
+
+    tokenizer_kwargs = dict(tokenizer_config)
+    tokenizer_kwargs.pop("auto_map", None)
+    tokenizer_kwargs.pop("tokenizer_class", None)
+    tokenizer_kwargs.pop("vocab_file", None)
+    tokenizer_kwargs["padding_side"] = "right"
+    return TikTokenTokenizer(vocab_file=str(vocab_file), **tokenizer_kwargs)
 
 
 def _namespace_from_dict(value):
@@ -55,13 +86,16 @@ def _load_local_xorl_config(
     if model_type == "qwen3_5":
         return Qwen3_5Config.from_hf_config(_namespace_from_dict(config_dict))
 
+    if model_type in {"deepseek_v3", "kimi_k2", "kimi_k25"}:
+        return DeepseekV3Config.from_hf_config(_namespace_from_dict(config_dict))
+
     if model_type == "qwen2":
-        from .transformers.qwen2.configuration_qwen2 import Qwen2Config
+        from .transformers.qwen2.configuration_qwen2 import Qwen2Config  # noqa: PLC0415
 
         return Qwen2Config(**{k: v for k, v in config_dict.items() if not k.startswith("_")})
 
     if model_type == "olmo2":
-        from .transformers.olmo2.configuration_olmo2 import Olmo2Config
+        from .transformers.olmo2.configuration_olmo2 import Olmo2Config  # noqa: PLC0415
 
         return Olmo2Config(**{k: v for k, v in config_dict.items() if not k.startswith("_")})
 
@@ -72,6 +106,9 @@ def build_tokenizer(tokenizer_path: str) -> "PreTrainedTokenizer":
     """
     Builds the tokenizer.
     """
+    tokenizer = _build_local_kimi_tokenizer(tokenizer_path)
+    if tokenizer is not None:
+        return tokenizer
     return AutoTokenizer.from_pretrained(tokenizer_path, padding_side="right")
 
 
@@ -152,6 +189,8 @@ def build_foundation_model(
             raise ValueError(f"Invalid moe_implementation: {moe_implementation}")
         config._moe_implementation = moe_implementation
         logger.info_rank0(f"Moe implementation: {moe_implementation}")
+
+    validate_deepseek_v3_router_settings(config, train_router=train_router)
 
     if ep_dispatch == "deepep" and train_router:
         raise ValueError(

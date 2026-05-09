@@ -19,7 +19,8 @@ from xorl.distributed.pipeline_parallel import (
     pipeline_module_split,
 )
 from xorl.lora import LoraLinear
-from xorl.models import all_ranks_load_weights, rank0_load_and_broadcast_weights
+from xorl.models import all_ranks_load_weights, grouped_load_weights, rank0_load_and_broadcast_weights
+from xorl.models.transformers.deepseek_v3.support import validate_deepseek_v3_tensor_parallelism
 from xorl.utils import logging
 from xorl.utils.device import get_device_type
 from xorl.utils.import_utils import is_torch_version_greater_than
@@ -36,6 +37,27 @@ if is_torch_version_greater_than("2.4"):
 
 
 logger = logging.get_logger(__name__)
+
+
+def _load_model_weights(
+    model: "nn.Module",
+    weights_path: str,
+    load_weights_mode: str,
+    weight_device: str,
+    dtensor_factory=None,
+) -> None:
+    if load_weights_mode == "skip":
+        logger.info_rank0("Skipping HF weight loading (weights will be loaded from DCP checkpoint).")
+        return
+    elif load_weights_mode == "broadcast":
+        logger.info_rank0("Loading model weights from disk on rank0 then broadcasting to other ranks...")
+        rank0_load_and_broadcast_weights(model, weights_path, weight_device, dtensor_factory=dtensor_factory)
+    elif load_weights_mode == "grouped":
+        logger.info_rank0("Loading model weights with one reader per EP-FSDP group...")
+        grouped_load_weights(model, weights_path, weight_device, dtensor_factory=dtensor_factory)
+    else:
+        logger.info_rank0("Every rank reading weights from disk independently...")
+        all_ranks_load_weights(model, weights_path, weight_device, dtensor_factory=dtensor_factory)
 
 
 _TP_STYLE_MAP = {
@@ -417,12 +439,13 @@ def parallelize_model_fsdp2(
     else:
         logger.info_rank0("starting to load model weights...")
         load_weights_mode = kwargs.get("load_weights_mode", "broadcast")
-        if load_weights_mode == "broadcast":
-            logger.info_rank0("Loading model weights from disk on rank0 then broadcasting to other ranks...")
-            rank0_load_and_broadcast_weights(model, weights_path, weight_device, dtensor_factory=distribute_tensor)
-        else:
-            logger.info_rank0("Every rank reading weights from disk independently...")
-            all_ranks_load_weights(model, weights_path, weight_device, dtensor_factory=distribute_tensor)
+        _load_model_weights(
+            model,
+            weights_path,
+            load_weights_mode=load_weights_mode,
+            weight_device=weight_device,
+            dtensor_factory=distribute_tensor,
+        )
 
     # Build EP param groups now (torchtitan eFSDP design: track groups at wrap time,
     # not just at optimizer build time, so grad clipping works regardless of optimizer
@@ -590,6 +613,7 @@ def build_parallelize_model(
 
             # TP (if enabled)
             if ps.tp_enabled:
+                validate_deepseek_v3_tensor_parallelism(model_part.config)
                 # TP + LoRA is not currently supported
                 if i == 0:
                     if any(isinstance(m, LoraLinear) for m in model_part.modules()):
@@ -617,14 +641,13 @@ def build_parallelize_model(
                     if i == 0:
                         logger.info_rank0("TP enabled: loading weights before FSDP wrapping...")
                     load_weights_mode = kwargs.get("load_weights_mode", "broadcast")
-                    if load_weights_mode == "broadcast":
-                        rank0_load_and_broadcast_weights(
-                            model_part, weights_path, get_device_type(), dtensor_factory=distribute_tensor
-                        )
-                    else:
-                        all_ranks_load_weights(
-                            model_part, weights_path, get_device_type(), dtensor_factory=distribute_tensor
-                        )
+                    _load_model_weights(
+                        model_part,
+                        weights_path,
+                        load_weights_mode=load_weights_mode,
+                        weight_device=get_device_type(),
+                        dtensor_factory=distribute_tensor,
+                    )
                     kwargs["skip_weight_loading"] = True
 
             # torch.compile (if enabled)
@@ -736,6 +759,7 @@ def build_parallelize_model(
                     module._gradient_checkpointing_func = _make_wrapper(_orig)
 
     if parallel_state.tp_enabled:
+        validate_deepseek_v3_tensor_parallelism(model.config)
         # TP + LoRA is not currently supported
         if any(isinstance(m, LoraLinear) for m in model.modules()):
             raise NotImplementedError("Tensor parallelism + LoRA is not currently supported.")
@@ -761,12 +785,13 @@ def build_parallelize_model(
         if kwargs.get("init_device") == "meta" and weights_path is not None:
             logger.info_rank0("TP enabled: loading weights before FSDP wrapping...")
             load_weights_mode = kwargs.get("load_weights_mode", "broadcast")
-            if load_weights_mode == "broadcast":
-                rank0_load_and_broadcast_weights(
-                    model, weights_path, get_device_type(), dtensor_factory=distribute_tensor
-                )
-            else:
-                all_ranks_load_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
+            _load_model_weights(
+                model,
+                weights_path,
+                load_weights_mode=load_weights_mode,
+                weight_device=get_device_type(),
+                dtensor_factory=distribute_tensor,
+            )
             # Mark weights as already loaded so FSDP path skips loading
             kwargs["skip_weight_loading"] = True
 

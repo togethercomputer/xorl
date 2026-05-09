@@ -58,6 +58,27 @@ def _scale_cu_seqlens_for_ringattn(kwargs, ringattn_group):
     return cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k
 
 
+def _gather_seq_scatter_kv(k, v, *, seq_dim: int, head_dim: int, group):
+    """All-to-all K/V together when shapes match, otherwise dispatch separately."""
+    if k.shape != v.shape:
+        k = gather_seq_scatter_heads(k, seq_dim=seq_dim, head_dim=head_dim, group=group)
+        v = gather_seq_scatter_heads(v, seq_dim=seq_dim, head_dim=head_dim, group=group)
+        return k.contiguous(), v.contiguous()
+
+    if k.ndim == 3:
+        kv = torch.stack([k, v], dim=2)  # [S, H_kv, 2, D]
+        kv = kv.reshape(k.size(0), 2 * k.size(1), k.size(2))  # [S, 2*H_kv, D]
+        kv = gather_seq_scatter_heads(kv, seq_dim=seq_dim, head_dim=head_dim, group=group)
+        kv = kv.reshape(kv.size(0), kv.size(1) // 2, 2, kv.size(2))
+        return kv[:, :, 0, :].contiguous(), kv[:, :, 1, :].contiguous()
+
+    kv = torch.stack([k, v], dim=3)  # [B, S, H_kv, 2, D]
+    kv = kv.reshape(k.size(0), k.size(1), 2 * k.size(2), k.size(3))  # [B, S, 2*H_kv, D]
+    kv = gather_seq_scatter_heads(kv, seq_dim=seq_dim, head_dim=head_dim, group=group)
+    kv = kv.reshape(kv.size(0), kv.size(1), kv.size(2) // 2, 2, kv.size(3))
+    return kv[:, :, :, 0, :].contiguous(), kv[:, :, :, 1, :].contiguous()
+
+
 # ------------------------------------------------------------------ #
 # Base class
 # ------------------------------------------------------------------ #
@@ -176,26 +197,14 @@ class UlyssesSyncStrategy(CPStrategy):
 
             # Q all-to-all (separate — Q has different head count from K/V in GQA)
             q = gather_seq_scatter_heads(q, seq_dim=0, head_dim=1, group=self.group)
-            # Fused KV all-to-all: interleave K/V heads into one tensor, single a2a
-            kv = torch.stack([k, v], dim=2)  # [S, H_kv, 2, D]
-            kv = kv.reshape(k.size(0), 2 * k.size(1), k.size(2))  # [S, 2*H_kv, D]
-            kv = gather_seq_scatter_heads(kv, seq_dim=0, head_dim=1, group=self.group)
-            kv = kv.reshape(kv.size(0), kv.size(1) // 2, 2, kv.size(2))  # [S_full, H_kv/SP, 2, D]
-            k = kv[:, :, 0, :].contiguous()
-            v = kv[:, :, 1, :].contiguous()
+            k, v = _gather_seq_scatter_kv(k, v, seq_dim=0, head_dim=1, group=self.group)
 
             q = q.unsqueeze(0)
             k = k.unsqueeze(0)
             v = v.unsqueeze(0)
         else:
             q = gather_seq_scatter_heads(q, seq_dim=1, head_dim=2, group=self.group)
-            # Fused KV a2a for 4D tensors
-            kv = torch.stack([k, v], dim=3)  # [B, S, H_kv, 2, D]
-            kv = kv.reshape(k.size(0), k.size(1), 2 * k.size(2), k.size(3))  # [B, S, 2*H_kv, D]
-            kv = gather_seq_scatter_heads(kv, seq_dim=1, head_dim=2, group=self.group)
-            kv = kv.reshape(kv.size(0), kv.size(1), kv.size(2) // 2, 2, kv.size(3))  # [B, S_full, H_kv/SP, 2, D]
-            k = kv[:, :, :, 0, :].contiguous()
-            v = kv[:, :, :, 1, :].contiguous()
+            k, v = _gather_seq_scatter_kv(k, v, seq_dim=1, head_dim=2, group=self.group)
 
         return q, k, v
 
@@ -246,21 +255,13 @@ class UlyssesAsyncStrategy(CPStrategy):
                 k = k.squeeze(0)
                 v = v.squeeze(0)
                 q = gather_seq_scatter_heads(q, seq_dim=0, head_dim=1, group=self.group)
-                kv = torch.stack([k, v], dim=2).reshape(k.size(0), 2 * k.size(1), k.size(2))
-                kv = gather_seq_scatter_heads(kv, seq_dim=0, head_dim=1, group=self.group)
-                kv = kv.reshape(kv.size(0), kv.size(1) // 2, 2, kv.size(2))
-                k = kv[:, :, 0, :].contiguous()
-                v = kv[:, :, 1, :].contiguous()
+                k, v = _gather_seq_scatter_kv(k, v, seq_dim=0, head_dim=1, group=self.group)
                 q = q.unsqueeze(0)
                 k = k.unsqueeze(0)
                 v = v.unsqueeze(0)
             else:
                 q = gather_seq_scatter_heads(q, seq_dim=1, head_dim=2, group=self.group)
-                kv = torch.stack([k, v], dim=3).reshape(k.size(0), k.size(1), 2 * k.size(2), k.size(3))
-                kv = gather_seq_scatter_heads(kv, seq_dim=1, head_dim=2, group=self.group)
-                kv = kv.reshape(kv.size(0), kv.size(1), kv.size(2) // 2, 2, kv.size(3))
-                k = kv[:, :, :, 0, :].contiguous()
-                v = kv[:, :, :, 1, :].contiguous()
+                k, v = _gather_seq_scatter_kv(k, v, seq_dim=1, head_dim=2, group=self.group)
             return q, k, v
 
         # Squeeze to 2D [S, H] — async autograd Function requires 2D (manual matmul in backward)

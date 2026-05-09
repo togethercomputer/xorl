@@ -270,13 +270,11 @@ def negotiate_pp_seq_len(micro_batches: List[Dict[str, Any]], pp_group) -> int:
     return int(t.item())
 
 
-@torch.compile
-def pp_loss_fn(pred, labels):
-    """Compiled PP cross-entropy loss (raw CE sum, unnormalized).
+def _pp_ce_sum(pred, labels):
+    """Raw PP cross-entropy sum over all non-ignored tokens (unnormalized).
 
-    Returns CE_sum over all non-ignored tokens.  Callers are responsible
-    for dividing gradients by global_valid_tokens after the backward
-    (either immediately or deferred to optim_step).
+    Callers are responsible for dividing gradients by global_valid_tokens
+    after the backward (either immediately or deferred to optim_step).
     """
     return F.cross_entropy(
         pred.flatten(0, 1).float(),
@@ -284,6 +282,23 @@ def pp_loss_fn(pred, labels):
         ignore_index=IGNORE_INDEX,
         reduction="sum",
     )
+
+
+_pp_ce_sum_compiled = torch.compile(_pp_ce_sum)
+
+
+def make_pp_loss_fn(ce_mode: str = "compiled"):
+    """Return the PP cross-entropy loss variant selected by ``ce_mode``.
+
+    'compiled' (default) returns the torch.compile'd CE sum; 'eager'
+    returns the uncompiled baseline (useful for debugging or when compile
+    regresses).
+    """
+    if ce_mode == "eager":
+        return _pp_ce_sum
+    if ce_mode == "compiled":
+        return _pp_ce_sum_compiled
+    raise ValueError(f"Unknown ce_mode: {ce_mode!r} (expected 'eager' or 'compiled')")
 
 
 def pad_micro_batches_for_pp(

@@ -40,34 +40,39 @@ class RoutingReplay:
     def __init__(self):
         self.forward_index: int = 0
         self.backward_index: int = 0
-        self.top_indices_list: List[torch.Tensor] = []  # CPU pinned
-        self.top_weights_list: List[torch.Tensor] = []  # CPU pinned routing weights (R3 logits)
+        self.top_indices_list: List[torch.Tensor] = []  # CPU buffers
+        self.top_weights_list: List[torch.Tensor] = []  # CPU routing weight buffers (R3 logits)
         RoutingReplay._instances.append(self)
 
     @torch.compiler.disable
     def record(self, selected_experts: torch.Tensor):
-        """Append routing decision (CPU pinned copy).
+        """Append routing decision (CPU copy).
 
         Disabled for torch.compile — pin_memory and list-append side
         effects are not supported by Inductor/Dynamo.
         """
-        buf = torch.empty_like(selected_experts, device="cpu", pin_memory=True)
+        buf = torch.empty_like(selected_experts, device="cpu", pin_memory=torch.cuda.is_available())
         buf.copy_(selected_experts)
         self.top_indices_list.append(buf)
 
     @torch.compiler.disable
     def record_weights(self, routing_weights: torch.Tensor):
-        """Append routing weights (CPU pinned copy) for R3 weight replay."""
-        buf = torch.empty_like(routing_weights, device="cpu", pin_memory=True)
+        """Append routing weights (CPU copy) for R3 weight replay."""
+        buf = torch.empty_like(routing_weights, device="cpu", pin_memory=torch.cuda.is_available())
         buf.copy_(routing_weights)
         self.top_weights_list.append(buf)
+
+    def _target_device(self) -> torch.device:
+        if torch.cuda.is_available():
+            return torch.device("cuda", torch.cuda.current_device())
+        return torch.device("cpu")
 
     @torch.compiler.disable
     def pop_forward(self) -> torch.Tensor:
         """Read routing for forward replay, advance forward_index."""
         idx = self.top_indices_list[self.forward_index]
         self.forward_index += 1
-        return idx.to(torch.cuda.current_device(), non_blocking=True)
+        return idx.to(self._target_device(), non_blocking=torch.cuda.is_available())
 
     @torch.compiler.disable
     def pop_forward_weights(self) -> Optional[torch.Tensor]:
@@ -75,21 +80,25 @@ class RoutingReplay:
         if not self.top_weights_list:
             return None
         # forward_index was already incremented by pop_forward, so use -1
-        return self.top_weights_list[self.forward_index - 1].to(torch.cuda.current_device(), non_blocking=True)
+        return self.top_weights_list[self.forward_index - 1].to(
+            self._target_device(), non_blocking=torch.cuda.is_available()
+        )
 
     @torch.compiler.disable
     def pop_backward(self) -> torch.Tensor:
         """Read routing for checkpoint recompute, advance backward_index."""
         idx = self.top_indices_list[self.backward_index]
         self.backward_index += 1
-        return idx.to(torch.cuda.current_device(), non_blocking=True)
+        return idx.to(self._target_device(), non_blocking=torch.cuda.is_available())
 
     @torch.compiler.disable
     def pop_backward_weights(self) -> Optional[torch.Tensor]:
         """Read routing weights for the last popped backward index, if available."""
         if not self.top_weights_list:
             return None
-        return self.top_weights_list[self.backward_index - 1].to(torch.cuda.current_device(), non_blocking=True)
+        return self.top_weights_list[self.backward_index - 1].to(
+            self._target_device(), non_blocking=torch.cuda.is_available()
+        )
 
     @property
     def has_weights(self) -> bool:
