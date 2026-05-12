@@ -18,12 +18,18 @@ def test_qwen3_5_moe_config_from_hf_config():
         "partial_rotary_factor": 0.25,
         "mrope_interleaved": True,
     }
+    num_hidden_layers = 40
+    full_attention_interval = 4
+    layer_types = [
+        "full_attention" if (i + 1) % full_attention_interval == 0 else "linear_attention"
+        for i in range(num_hidden_layers)
+    ]
     text_config = SimpleNamespace(
         vocab_size=248320,
         hidden_size=2048,
         intermediate_size=2048,
         shared_expert_intermediate_size=512,
-        num_hidden_layers=40,
+        num_hidden_layers=num_hidden_layers,
         num_attention_heads=16,
         num_key_value_heads=2,
         head_dim=256,
@@ -34,8 +40,8 @@ def test_qwen3_5_moe_config_from_hf_config():
         use_cache=True,
         attention_bias=False,
         attention_dropout=0.0,
-        layer_types=["linear_attention", "full_attention"],
-        full_attention_interval=4,
+        layer_types=layer_types,
+        full_attention_interval=full_attention_interval,
         linear_num_key_heads=16,
         linear_num_value_heads=32,
         linear_key_head_dim=128,
@@ -56,7 +62,7 @@ def test_qwen3_5_moe_config_from_hf_config():
 
     config = Qwen3_5MoeConfig.from_hf_config(hf_config)
 
-    assert config.layer_types == ["linear_attention", "full_attention"]
+    assert config.layer_types == layer_types
     assert config.linear_num_key_heads == 16
     assert config.linear_num_value_heads == 32
     assert config.linear_key_head_dim == 128
