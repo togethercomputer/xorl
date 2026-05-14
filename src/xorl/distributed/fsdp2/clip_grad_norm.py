@@ -32,9 +32,12 @@ def clip_grad_norm(
 
     reduce_groups = []
     if fsdp_group is not None:
+        # get_world_size raises RuntimeError if the process group hasn't been
+        # initialized; treat that as a single-process group rather than a hard
+        # failure. Other exceptions (TypeError on bad argument, etc.) propagate.
         try:
             fsdp_world = dist.get_world_size(fsdp_group)
-        except Exception:
+        except RuntimeError:
             fsdp_world = 1
         if fsdp_world > 1:
             reduce_groups.append(("fsdp", fsdp_group))

@@ -47,7 +47,10 @@ def _detect_repo_commit() -> Optional[str]:
         )
         commit = result.stdout.strip()
         return commit or None
-    except Exception:
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        # SubprocessError covers CalledProcessError when not a git repo;
+        # FileNotFoundError if `git` is not on PATH; OSError for other
+        # process-spawn failures.
         return None
 
 
@@ -1373,8 +1376,8 @@ def parse_args(rootclass: T) -> T:
         base_to_subclass[base] = subclass.default_factory
         try:
             type_hints: Dict[str, type] = get_type_hints(subclass.default_factory)
-        except Exception:
-            raise RuntimeError(f"Type resolution failed for {subclass.default_factory}.")
+        except (NameError, TypeError, AttributeError) as e:
+            raise RuntimeError(f"Type resolution failed for {subclass.default_factory}.") from e
 
         for attr in fields(subclass.default_factory):
             if not attr.init:
@@ -1410,8 +1413,8 @@ def parse_args(rootclass: T) -> T:
         base = subclass.name
         try:
             type_hints: Dict[str, type] = get_type_hints(subclass.default_factory)
-        except Exception:
-            raise RuntimeError(f"Type resolution failed for {subclass.default_factory}.")
+        except (NameError, TypeError, AttributeError) as e:
+            raise RuntimeError(f"Type resolution failed for {subclass.default_factory}.") from e
 
         for attr in fields(subclass.default_factory):
             if not attr.init:
