@@ -355,7 +355,7 @@ class RemoteBackend(Backend):
                 quantization=quantization,
             ),
             request_id=request_id,
-            timeout=600.0,
+            timeout=self.operation_timeout,
         )
 
     async def register_adapter(self, model_id="default", lr=1e-5, request_id=None):

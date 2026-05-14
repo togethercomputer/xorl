@@ -5,7 +5,7 @@ This is the OrchestratorClient component in the system design.
 
 Architecture:
 - INPUT SOCKET: ZMQ ROUTER (bind) - sends requests to engine
-- OUTPUT SOCKET: ZMQ PULL (connect) - receives outputs from engine
+- OUTPUT SOCKET: ZMQ PULL (bind) - receives outputs from engine
 - Background task: process_outputs_socket() - continuously reads from PULL socket
 - Asyncio queue: output_queue - buffers outputs for async retrieval
 
@@ -105,9 +105,11 @@ class OrchestratorClient:
         self.input_channel = AsyncRouterChannel(self.input_addr, context=self.context)
         self.input_channel.bind()
 
-        # Create OUTPUT channel (PULL for receiving outputs)
+        # Create OUTPUT channel (PULL for receiving outputs).  The API process
+        # starts before the orchestrator is ready to emit responses, so bind
+        # the consumer side here and let the orchestrator's PUSH connect later.
         self.output_channel = AsyncPullChannel(self.output_addr, context=self.context)
-        self.output_channel.connect()
+        self.output_channel.bind()
 
         # Create output queue
         self.output_queue = asyncio.Queue(maxsize=self.output_queue_maxsize)

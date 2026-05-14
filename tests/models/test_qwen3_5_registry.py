@@ -87,6 +87,8 @@ def test_qwen3_5_config_from_hf_config():
         use_cache=True,
         attention_bias=False,
         attention_dropout=0.0,
+        layer_types=["linear_attention", "full_attention"],
+        full_attention_interval=4,
         rope_parameters={"rope_type": "default", "rope_theta": 10_000_000},
     )
     hf_config = SimpleNamespace(text_config=text_config, tie_word_embeddings=False)
@@ -96,3 +98,7 @@ def test_qwen3_5_config_from_hf_config():
     assert config.vocab_size == 248320
     assert config.hidden_size == 4096
     assert config.head_dim == 256
+    assert config.layer_types == [
+        "full_attention" if (layer_idx + 1) % text_config.full_attention_interval == 0 else "linear_attention"
+        for layer_idx in range(text_config.num_hidden_layers)
+    ]

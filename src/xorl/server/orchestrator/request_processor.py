@@ -580,6 +580,8 @@ class RequestProcessor:
                     "total_bytes": result.get("total_bytes", 0),
                     "num_parameters": result.get("num_parameters", 0),
                     "num_buckets": result.get("num_buckets", 0),
+                    "timing_breakdown": result.get("timing_breakdown", {}),
+                    "p2p_rank_summaries": result.get("p2p_rank_summaries", []),
                     "endpoint_results": result.get("endpoint_results", []),
                     "execution_time": result.get("execution_time", 0.0),
                 }

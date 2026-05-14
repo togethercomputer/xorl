@@ -30,7 +30,7 @@ Architecture Overview:
 │  ┌─────────────────────────────────────────────────────────────────────┐  │
 │  │               API Server Communication                              │  │
 │  │                                                                     │  │
-│  │  INPUT Socket (DEALER connect)    OUTPUT Socket (PUSH bind)         │  │
+│  │  INPUT Socket (DEALER connect)    OUTPUT Socket (PUSH connect)      │  │
 │  │       ↓                                  ↑                          │  │
 │  │  input_queue (Queue)             output_queue (Queue)               │  │
 │  │       ↓                                  ↑                          │  │
@@ -498,7 +498,7 @@ class Orchestrator:
         logger.info("Starting output socket thread...")
 
         self.output_channel = SyncPushChannel(self.output_addr)
-        self.output_channel.bind()
+        self.output_channel.connect()
 
         while self._running:
             try:

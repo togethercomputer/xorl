@@ -2,6 +2,8 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+import requests
 import torch
 
 from xorl.server.weight_sync.backends.nccl_broadcast import EndpointInfo, NCCLWeightSynchronizer
@@ -9,10 +11,13 @@ from xorl.server.weight_sync.endpoint_manager import EndpointManager
 
 
 class FakeResponse:
-    def __init__(self, payload):
+    def __init__(self, payload, error: Exception | None = None):
         self._payload = payload
+        self._error = error
 
     def raise_for_status(self):
+        if self._error:
+            raise self._error
         return None
 
     def json(self):
@@ -43,7 +48,34 @@ class TestEndpointRouting:
         with patch("xorl.server.weight_sync.endpoint_manager._get_http_session", return_value=session):
             manager.health_check()
 
-        session.get.assert_called_once_with("http://127.0.0.1:30000/health", timeout=10)
+        session.get.assert_called_once_with("http://127.0.0.1:30000/model_info", timeout=60)
+
+    def test_endpoint_manager_health_check_falls_back_to_v1_models(self):
+        session = MagicMock()
+        session.get.side_effect = [
+            FakeResponse({}, requests.HTTPError("503 Server Error")),
+            FakeResponse({"data": [{"id": "Qwen/Qwen3-30B-A3B"}]}),
+        ]
+        manager = EndpointManager([{"host": "127.0.0.1", "port": 30000}])
+
+        with patch("xorl.server.weight_sync.endpoint_manager._get_http_session", return_value=session):
+            manager.health_check()
+
+        assert [call.args[0] for call in session.get.call_args_list] == [
+            "http://127.0.0.1:30000/model_info",
+            "http://127.0.0.1:30000/v1/models",
+        ]
+
+    def test_endpoint_manager_health_check_reports_all_failures(self):
+        session = MagicMock()
+        session.get.side_effect = requests.ConnectionError("connection refused")
+        manager = EndpointManager([{"host": "127.0.0.1", "port": 30000}])
+
+        with (
+            patch("xorl.server.weight_sync.endpoint_manager._get_http_session", return_value=session),
+            pytest.raises(RuntimeError, match="/model_info.*/v1/models.*/health"),
+        ):
+            manager.health_check()
 
     def test_nccl_sync_init_uses_endpoint_port(self):
         session = MagicMock()

@@ -844,6 +844,14 @@ class SyncInferenceWeightsResponse(BaseModel):
     total_bytes: int = Field(default=0, description="Total bytes transferred")
     num_parameters: int = Field(default=0, description="Number of parameters transferred")
     num_buckets: int = Field(default=0, description="Number of transfer buckets used")
+    timing_breakdown: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Optional phase timing breakdown from the trainer handler, in seconds",
+    )
+    p2p_rank_summaries: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Optional per-rank P2P transport timing summaries for tail-latency diagnosis",
+    )
     endpoints_synced: List[EndpointSyncResult] = Field(
         default_factory=list, description="Sync results for each endpoint"
     )

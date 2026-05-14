@@ -4,9 +4,9 @@ Encapsulates ZMQ socket setup, framing, and polling behind clean send/recv APIs.
 All channels deal in raw bytes — serialization is the caller's responsibility.
 
 Channel types:
-- SyncPushChannel: Sync PUSH socket (bind, send)
+- SyncPushChannel: Sync PUSH socket (connect, send)
 - SyncDealerChannel: Sync DEALER socket (connect, poll, recv)
-- AsyncPullChannel: Async PULL socket (connect, poll, recv)
+- AsyncPullChannel: Async PULL socket (bind, poll, recv)
 - AsyncRouterChannel: Async ROUTER socket (bind, identity-routed send/recv)
 - AsyncDealerChannel: Async DEALER socket (connect, send/recv with timeouts)
 """
@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 class SyncPushChannel:
-    """Sync PUSH socket that binds and sends single-frame messages."""
+    """Sync PUSH socket that sends single-frame messages."""
 
     def __init__(self, address: str, *, hwm: int = 1000, send_timeout: int = 1000):
         self._address = address
@@ -46,6 +46,16 @@ class SyncPushChannel:
         self._socket.setsockopt(zmq.SNDTIMEO, self._send_timeout)
         self._socket.bind(self._address)
         logger.info(f"SyncPushChannel bound to {self._address}")
+
+    def connect(self) -> None:
+        """Create context, socket, and connect."""
+        self._context = zmq.Context()
+        self._socket = self._context.socket(zmq.PUSH)
+        self._socket.setsockopt(zmq.LINGER, 0)
+        self._socket.setsockopt(zmq.SNDHWM, self._hwm)
+        self._socket.setsockopt(zmq.SNDTIMEO, self._send_timeout)
+        self._socket.connect(self._address)
+        logger.info(f"SyncPushChannel connected to {self._address}")
 
     def send(self, data: bytes) -> None:
         """Send a single-frame message."""
@@ -117,7 +127,7 @@ class SyncDealerChannel:
 
 
 class AsyncPullChannel:
-    """Async PULL socket that connects and receives via polling."""
+    """Async PULL socket that receives via polling."""
 
     def __init__(
         self,
@@ -141,6 +151,16 @@ class AsyncPullChannel:
         self._socket.setsockopt(zmq.RCVHWM, self._hwm)
         self._socket.connect(self._address)
         logger.info(f"AsyncPullChannel connected to {self._address}")
+
+    def bind(self) -> None:
+        """Create socket (and context if needed) and bind."""
+        if self._owns_context:
+            self._context = zmq.asyncio.Context()
+        self._socket = self._context.socket(zmq.PULL)
+        self._socket.setsockopt(zmq.LINGER, 0)
+        self._socket.setsockopt(zmq.RCVHWM, self._hwm)
+        self._socket.bind(self._address)
+        logger.info(f"AsyncPullChannel bound to {self._address}")
 
     async def poll(self, timeout_ms: int = 100) -> bool:
         """Poll for incoming data. Returns True if data available."""

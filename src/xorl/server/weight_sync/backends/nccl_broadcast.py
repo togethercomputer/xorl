@@ -890,7 +890,8 @@ class NCCLBroadcastBackend(WeightTransportBackend):
             self._process_group = self._synchronizer.process_group
         return ok
 
-    def destroy(self) -> None:
+    def destroy(self, *, complete_receiver: bool = True) -> None:
+        _ = complete_receiver
         if self._synchronizer is not None:
             try:
                 self._synchronizer.destroy_nccl_group()

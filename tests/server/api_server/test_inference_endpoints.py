@@ -107,6 +107,8 @@ class TestInferenceEndpointRegistration:
                             "total_bytes": 123,
                             "num_parameters": 4,
                             "num_buckets": 1,
+                            "timing_breakdown": {"transfer_s": 0.1, "total_handler_s": 0.2},
+                            "p2p_rank_summaries": [{"rank": 0, "is_sender": True, "transfer_wall_s": 0.1}],
                             "endpoint_results": [{"host": "inference.example", "port": 30000, "success": True}],
                         }
                     ],
@@ -130,3 +132,59 @@ class TestInferenceEndpointRegistration:
                 "world_size": 2,
             }
         ]
+        assert response.timing_breakdown == {"transfer_s": 0.1, "total_handler_s": 0.2}
+        assert response.p2p_rank_summaries == [{"rank": 0, "is_sender": True, "transfer_wall_s": 0.1}]
+
+    def test_add_inference_endpoint_auto_sync_uses_configured_sync_method(self, monkeypatch):
+        calls: list[str] = []
+        responses = {
+            "http://inference.example:30000/health": FakeResponse(),
+            "http://inference.example:30000/server_info": FakeResponse(json_data={"model_path": None, "tp_size": 1}),
+        }
+        monkeypatch.setattr(
+            "xorl.server.api_server.inference_endpoints.httpx.AsyncClient",
+            make_async_client(responses, calls),
+        )
+
+        server = APIServer(
+            engine_input_addr="tcp://127.0.0.1:17002",
+            engine_output_addr="tcp://127.0.0.1:17003",
+            sync_inference_method="p2p",
+        )
+        server._running = True
+        captured_request = {}
+
+        async def fake_send_request(engine_request):
+            captured_request["request"] = engine_request
+            future = asyncio.Future()
+            future.set_result(
+                SimpleNamespace(
+                    error=None,
+                    outputs=[
+                        {
+                            "success": True,
+                            "message": "ok",
+                            "transfer_time": 0.1,
+                            "total_bytes": 123,
+                        }
+                    ],
+                )
+            )
+            return future
+
+        server.orchestrator_client = MagicMock(send_request=AsyncMock(side_effect=fake_send_request))
+
+        response = asyncio.run(
+            server.add_inference_endpoint(
+                AddInferenceEndpointRequest(
+                    host="inference.example",
+                    port=30000,
+                    sync_weights=True,
+                    master_address="train.example",
+                ),
+            )
+        )
+
+        assert response.success is True
+        assert response.weights_synced is True
+        assert captured_request["request"].payload.sync_method == "p2p"

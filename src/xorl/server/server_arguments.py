@@ -533,11 +533,13 @@ class ServerArguments:
     # Inference Weight Sync Configuration
     # ========================================================================
 
-    sync_inference_method: Literal["nccl_broadcast"] = field(
+    sync_inference_method: Literal["nccl_broadcast", "p2p"] = field(
         default="nccl_broadcast",
         metadata={
             "help": "Method for syncing weights to inference endpoints: "
-            "'nccl_broadcast' (rank-0 broadcast via SGLang update_weights_from_distributed)"
+            "'nccl_broadcast' (rank-0 broadcast via SGLang update_weights_from_distributed); "
+            "'p2p' (RDMA one-sided writes via Mooncake TransferEngine into SGLang's "
+            "registered param memory; requires --enable-rdma-weight-updates on the SGLang side)"
         },
     )
 

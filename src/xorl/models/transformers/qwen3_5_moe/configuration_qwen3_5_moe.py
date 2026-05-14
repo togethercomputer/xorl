@@ -34,7 +34,7 @@ def _cfg_to_dict(value):
     if isinstance(value, dict):
         return dict(value)
     if hasattr(value, "__dict__"):
-        return {k: v for k, v in vars(value).items()}
+        return dict(vars(value))
     return value
 
 
@@ -43,6 +43,29 @@ def _split_mrope_fields(value):
     mrope_interleaved = value_dict.pop("mrope_interleaved", False)
     mrope_section = value_dict.pop("mrope_section", None)
     return value_dict or None, mrope_interleaved, mrope_section
+
+
+def _expand_layer_types(layer_types, num_hidden_layers, full_attention_interval):
+    if layer_types is not None:
+        layer_types = list(layer_types)
+        if len(layer_types) == num_hidden_layers:
+            return layer_types
+        if full_attention_interval:
+            return [
+                "full_attention" if (layer_idx + 1) % full_attention_interval == 0 else "linear_attention"
+                for layer_idx in range(num_hidden_layers)
+            ]
+        raise ValueError(
+            f"`layer_types` must have {num_hidden_layers} entries when `full_attention_interval` is not set, "
+            f"got {len(layer_types)}."
+        )
+
+    if full_attention_interval:
+        return [
+            "full_attention" if (layer_idx + 1) % full_attention_interval == 0 else "linear_attention"
+            for layer_idx in range(num_hidden_layers)
+        ]
+    return ["full_attention"] * num_hidden_layers
 
 
 class Qwen3_5MoeConfig(PretrainedConfig):
@@ -141,15 +164,7 @@ class Qwen3_5MoeConfig(PretrainedConfig):
         )
         self.attn_output_gate = attn_output_gate
         self.linear_conv_kernel_dim = linear_conv_kernel_dim
-        if layer_types is None:
-            if full_attention_interval:
-                layer_types = [
-                    "full_attention" if (layer_idx + 1) % full_attention_interval == 0 else "linear_attention"
-                    for layer_idx in range(num_hidden_layers)
-                ]
-            else:
-                layer_types = ["full_attention"] * num_hidden_layers
-        self.layer_types = list(layer_types)
+        self.layer_types = _expand_layer_types(layer_types, num_hidden_layers, full_attention_interval)
         self.shared_expert_intermediate_size = intermediate_size
 
         if self._rope_scaling is not None and "type" in self._rope_scaling:

@@ -38,6 +38,8 @@ dependencies = [
   "pyzmq",
   "msgpack",
   "fastapi",
+  # P2P / Mooncake weight sync
+  "mooncake-transfer-engine==0.3.9",
   "xorl-client @ git+https://github.com/togethercomputer/xorl-client.git",
   # PyTorch 2.9.1 with CUDA 12.9 (compatible with xorl-sglang)
   "torch @ https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl",

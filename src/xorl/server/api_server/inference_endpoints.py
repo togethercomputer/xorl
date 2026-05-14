@@ -149,6 +149,7 @@ class InferenceEndpointsMixin:
                 master_port=master_port,
                 group_name=group_name,
                 buffer_size_mb=buffer_size_mb,
+                sync_method=self.sync_inference_method,
                 quantization=quantization,
             ),
         )
@@ -551,6 +552,8 @@ class InferenceEndpointsMixin:
                 total_bytes=result.get("total_bytes", 0),
                 num_parameters=result.get("num_parameters", 0),
                 num_buckets=result.get("num_buckets", 0),
+                timing_breakdown=result.get("timing_breakdown", {}),
+                p2p_rank_summaries=result.get("p2p_rank_summaries", []),
                 endpoints_synced=endpoint_results,
             )
 
