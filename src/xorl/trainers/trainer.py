@@ -449,6 +449,9 @@ class Trainer:
             init_device=args.train.init_device,
         )
         self.model_config = self.model.config
+        # Normalize _no_split_modules to list — some HF models (e.g. GPT-OSS) define it as a set
+        if isinstance(getattr(self.model, "_no_split_modules", None), set):
+            self.model._no_split_modules = list(self.model._no_split_modules)
         validate_deepseek_v3_training_mode(
             self.model_config,
             enable_qlora=args.lora.enable_qlora,

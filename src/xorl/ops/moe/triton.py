@@ -1,6 +1,13 @@
 import torch
 import torch.nn.functional as F
 
+# Re-export canonical activation utilities so callers that historically
+# imported from ``xorl.ops.moe.triton`` keep working.
+from xorl.ops.moe.activations import (  # noqa: F401
+    SUPPORTED_HIDDEN_ACTS,
+    check_hidden_act_supported,
+    normalize_hidden_act,
+)
 from xorl.utils.import_utils import is_fused_moe_available
 
 
@@ -11,28 +18,6 @@ if is_fused_moe_available():
         moe_index_compute,
         moe_scatter,
     )
-
-
-# Canonical activation kinds understood by MoE ops. Upstream `hidden_act`
-# strings (e.g. "gelu_pytorch_tanh") are normalized to one of these.
-SUPPORTED_HIDDEN_ACTS: frozenset[str] = frozenset({"silu", "gelu_tanh"})
-
-
-def normalize_hidden_act(hidden_act: str | None) -> str:
-    """Normalize a HF-style ``hidden_act`` string to an MoE act kind."""
-    if hidden_act is None or hidden_act == "silu":
-        return "silu"
-    if hidden_act in ("gelu_tanh", "gelu_pytorch_tanh"):
-        return "gelu_tanh"
-    raise ValueError(f"Unsupported hidden_act={hidden_act!r}. Supported: {sorted(SUPPORTED_HIDDEN_ACTS)}")
-
-
-def check_hidden_act_supported(hidden_act: str, backend: str, supported: frozenset[str]) -> None:
-    """Raise if ``hidden_act`` is not in the backend's supported set."""
-    if hidden_act not in supported:
-        raise ValueError(
-            f"MoE backend {backend!r} does not support hidden_act={hidden_act!r}. Supported: {sorted(supported)}"
-        )
 
 
 def _moe_gate_activation(gate_output: torch.Tensor, hidden_act: str = "silu") -> torch.Tensor:

@@ -53,8 +53,20 @@ try:
     from xorl.ops.moe.triton import TritonEPGroupGemm
 
     def _triton_ep_apply(
-        permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores=None, hidden_act="silu"
+        permute_tokens,
+        cumsum,
+        gate_up_proj,
+        down_proj,
+        intermediate_size,
+        expert_scores=None,
+        hidden_act="silu",
+        **_extras,  # GPT-OSS extras (gate_up_bias, down_bias) — triton doesn't support them
     ):
+        if any(v is not None for v in _extras.values()) or hidden_act == "clamped_swiglu":
+            raise NotImplementedError(
+                "triton EP backend does not support per-expert biases or clamped_swiglu "
+                "activation (required by GPT-OSS). Use moe_implementation='native' instead."
+            )
         return TritonEPGroupGemm.apply(
             permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores, hidden_act
         )
@@ -63,13 +75,25 @@ try:
 except ImportError:
     pass
 
-# Quack EP compute — adapt fused interface to old (gate_proj, up_proj) signature
+# Quack EP compute — fused gate_up_proj interface
 try:
     from xorl.ops.moe.quack import QuackEPGroupGemm as _QuackEPGroupGemm
 
     def _quack_ep_fused(
-        permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores=None, hidden_act="silu"
+        permute_tokens,
+        cumsum,
+        gate_up_proj,
+        down_proj,
+        intermediate_size,
+        expert_scores=None,
+        hidden_act="silu",
+        **_extras,  # GPT-OSS extras (gate_up_bias, down_bias) — quack doesn't support them
     ):
+        if any(v is not None for v in _extras.values()) or hidden_act == "clamped_swiglu":
+            raise NotImplementedError(
+                "quack EP backend does not support per-expert biases or clamped_swiglu "
+                "activation (required by GPT-OSS). Use moe_implementation='native' instead."
+            )
         return _QuackEPGroupGemm.apply(
             permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores, hidden_act
         )
@@ -78,15 +102,30 @@ try:
 except ImportError:
     pass
 
-# Native EP compute — adapt fused interface
+# Native EP compute — fused gate_up_proj interface
 try:
     from .native import native_ep_compute as _native_ep_compute
 
     def _native_ep_fused(
-        permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores=None, hidden_act="silu"
+        permute_tokens,
+        cumsum,
+        gate_up_proj,
+        down_proj,
+        intermediate_size,
+        expert_scores=None,
+        hidden_act="silu",
+        **extras,  # gate_up_bias, down_bias — optional, used for GPT-OSS
     ):
         del intermediate_size
-        return _native_ep_compute(permute_tokens, cumsum, gate_up_proj, down_proj, expert_scores, hidden_act=hidden_act)
+        return _native_ep_compute(
+            permute_tokens,
+            cumsum,
+            gate_up_proj,
+            down_proj,
+            expert_scores,
+            hidden_act=hidden_act,
+            **extras,
+        )
 
     EP_EXPERT_COMPUTE["native"] = _native_ep_fused
 except ImportError:

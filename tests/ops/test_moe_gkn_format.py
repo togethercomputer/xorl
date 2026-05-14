@@ -222,7 +222,7 @@ class TestBackendGKN:
         gate_gkn, up_gkn, down_gkn = make_gkn_weights_from_linear(experts)
 
         hidden_states_cpu = torch.randn(num_tokens, hidden_size)
-        act_fn = torch.nn.SiLU()
+        act_fn = "silu"
 
         for expert_idx in range(num_experts):
             ref_out = experts[expert_idx](hidden_states_cpu)

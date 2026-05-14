@@ -6,7 +6,8 @@ import torch.distributed as dist
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.ops.group_gemm.kernel.moe import expert_histogram, moe_gather, moe_index_compute, moe_scatter
 from xorl.ops.group_gemm.kernel.quack import cumsum_to_cu_seqlens, quack_group_gemm_same_mn, quack_group_gemm_same_nk
-from xorl.ops.moe.triton import _moe_gate_activation, _moe_gate_activation_backward, check_hidden_act_supported
+from xorl.ops.moe.activations import check_hidden_act_supported
+from xorl.ops.moe.triton import _moe_gate_activation, _moe_gate_activation_backward
 
 
 def _debug_ep_enabled() -> bool:

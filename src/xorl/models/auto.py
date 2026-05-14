@@ -21,6 +21,7 @@ from .loader import ModelLoader, get_loader
 from .transformers.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from .transformers.deepseek_v3.support import validate_deepseek_v3_router_settings
 from .transformers.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
+from .transformers.gpt_oss.configuration_gpt_oss import GptOssConfig
 from .transformers.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 from .transformers.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
 from .transformers.qwen3_5_shared import (
@@ -94,12 +95,27 @@ def _load_local_xorl_config(
 
         return Qwen2Config(**{k: v for k, v in config_dict.items() if not k.startswith("_")})
 
+    if model_type == "gpt_oss":
+        return GptOssConfig.from_hf_config(_namespace_from_dict(config_dict))
     if model_type == "olmo2":
         from .transformers.olmo2.configuration_olmo2 import Olmo2Config  # noqa: PLC0415
 
         return Olmo2Config(**{k: v for k, v in config_dict.items() if not k.startswith("_")})
 
     return None
+
+
+def _get_architectures(config: "PretrainedConfig") -> set[str]:
+    architectures = getattr(config, "architectures", None)
+    if architectures is None:
+        return set()
+    if isinstance(architectures, list):
+        return set(architectures)
+    return {architectures}
+
+
+def _is_gpt_oss_config(config: "PretrainedConfig") -> bool:
+    return getattr(config, "model_type", None) == "gpt_oss" or "GptOssForCausalLM" in _get_architectures(config)
 
 
 def build_tokenizer(tokenizer_path: str) -> "PreTrainedTokenizer":
@@ -229,6 +245,14 @@ def build_foundation_model(
     if ps.ringattn_size > 1 and has_linear_attention_layers(config):
         logger.warning_once(LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE)
         raise ValueError(LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE)
+
+    if _is_gpt_oss_config(config) and attn_implementation not in ("eager", "flash_attention_3"):
+        raise ValueError(
+            "GPT-OSS attention sinks are only implemented for attn_implementation="
+            "'eager' or 'flash_attention_3' in xorl. Using other backends (sdpa, "
+            "flash_attention_2, flash_attention_4, native) would silently drop the "
+            "sink logits and change model outputs."
+        )
 
     loader: ModelLoader = get_loader(config)
 
