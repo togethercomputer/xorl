@@ -277,8 +277,10 @@ def main():
             break
 
     if not config_path:
-        print("Error: Config file path required as first positional argument")
-        print("Usage: python -m xorl.server.runner.runner_dispatcher config.yaml [--worker_bind_address tcp://...]")
+        sys.stderr.write("Error: Config file path required as first positional argument\n")
+        sys.stderr.write(
+            "Usage: python -m xorl.server.runner.runner_dispatcher config.yaml [--worker_bind_address tcp://...]\n"
+        )
         sys.exit(1)
 
     # Detect config format and parse accordingly
