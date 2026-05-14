@@ -86,7 +86,7 @@ These flags align the training model's numerics with the inference engine (SGLan
 | `enable_reentrant` | `false` | Use reentrant gradient checkpointing. |
 | `enable_forward_prefetch` | `false` | FSDP forward prefetch. |
 | `init_device` | `meta` | Model initialization device: `cpu`, `meta`, `cuda`. |
-| `load_weights_mode` | `auto` | Weight loading: `auto`, `safetensors`, `dcp`. |
+| `load_weights_mode` | `grouped` | Weight loading mode: `grouped` (default, with rank-0 fallback), `all_ranks`, or `skip`. |
 | `ce_mode` | `compiled` | Cross-entropy implementation: `compiled` (recommended, `torch.compile`) or `eager` (may OOM at 32K+ seq len). |
 
 ---

@@ -636,8 +636,19 @@ class DistributedCheckpointer(CheckpointerBase):
             logger.info_rank0(f"LoRA-only checkpoint: excluding {len(exclude_keys)} non-LoRA keys from load")
 
         load_state = {"model": ModelState(state["model"], exclude_keys=exclude_keys)}
+        has_optimizer_state = False
         if "optimizer" in state and state["optimizer"] is not None:
+            try:
+                dcp_metadata = FileSystemReader(checkpoint_dir).read_metadata()
+                has_optimizer_state = any(key.startswith("optimizer") for key in dcp_metadata.state_dict_metadata)
+            except Exception as exc:
+                logger.warning_rank0(f"Could not inspect DCP optimizer metadata at {checkpoint_dir}: {exc}")
+                has_optimizer_state = True
+
+        if has_optimizer_state:
             load_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])  # type: ignore[index]
+        elif "optimizer" in state and state["optimizer"] is not None:
+            logger.info_rank0(f"No optimizer state found in {checkpoint_dir}; loading model state only.")
 
         dcp.load(
             state_dict=load_state,

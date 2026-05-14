@@ -346,12 +346,29 @@ def _normalize_checkpoint_key_for_filter(key: str) -> Optional[str]:
     return key
 
 
+def _matches_checkpoint_skip_key_pattern(key: str, model: object) -> bool:
+    """Return True when a raw or converted checkpoint key is model-declared skip state."""
+    for pattern in getattr(model, "_checkpoint_skip_key_patterns", ()):
+        if re.match(pattern, key):
+            return True
+    return False
+
+
+_FUSED_EXPERT_CHECKPOINT_PATTERN = re.compile(r"^model\.layers\.\d+\.mlp\.experts\.(gate_up|down)_proj(?:\..+)?$")
+_FFN_EXPERT_CHECKPOINT_PATTERN = re.compile(r"^(?:model\.)?layers\.\d+\.ffn\.experts\.\d+\.w[123]\.(?:weight|scale)$")
+
+
 def _is_checkpoint_expert_key(key: str) -> bool:
     """Return True when a raw checkpoint key belongs to MoE expert weights."""
     normalized = _normalize_checkpoint_key_for_filter(key)
     if normalized is None:
         return False
-    return parse_expert_full_key(normalized) is not None or FUSED_EXPERT_PATTERN.match(normalized) is not None
+    return (
+        parse_expert_full_key(normalized) is not None
+        or FUSED_EXPERT_PATTERN.match(normalized) is not None
+        or _FUSED_EXPERT_CHECKPOINT_PATTERN.match(normalized) is not None
+        or _FFN_EXPERT_CHECKPOINT_PATTERN.match(normalized) is not None
+    )
 
 
 def _is_expert_parameter_name(parameter_name: str, parallel_plan: Optional["ParallelPlan"]) -> bool:
@@ -1784,6 +1801,12 @@ def grouped_load_weights(
         logger.warning_once("Distributed environment not initialized, falling back to all_ranks_load_weights.")
         return all_ranks_load_weights(model, weights_path, init_device, dtensor_factory)
 
+    _ps = get_parallel_state()
+    fanout_group = _get_grouped_weight_load_group(_ps)
+    if fanout_group is None:
+        logger.info_rank0("Grouped weight loading requires EP/FSDP groups; using rank-0 load fallback.")
+        return rank0_load_and_broadcast_weights(model, weights_path, init_device, dtensor_factory)
+
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
     parameter_names_to_load = {name for name, _ in model.named_parameters()}
 
@@ -1795,14 +1818,6 @@ def grouped_load_weights(
     parallel_plan = None
     if hasattr(model, "get_parallel_plan"):
         parallel_plan = model.get_parallel_plan()
-
-    _ps = get_parallel_state()
-    fanout_group = _get_grouped_weight_load_group(_ps)
-    if fanout_group is None:
-        logger.warning_once(
-            "Grouped weight loading requires EP/FSDP groups; falling back to rank0_load_and_broadcast_weights."
-        )
-        return rank0_load_and_broadcast_weights(model, weights_path, init_device, dtensor_factory)
 
     fanout_ranks = dist.get_process_group_ranks(fanout_group)
     fanout_src = fanout_ranks[0]
@@ -1851,6 +1866,7 @@ def grouped_load_weights(
             device=model_device,
             dtype=model_dtype,
         )
+    dense_skip_key_fn = dense_handler.get_skip_key_fn() if dense_handler is not None else None
     expert_skip_key_fn = expert_handler.get_skip_key_fn() if expert_handler is not None else None
 
     if _ps.pp_enabled:
@@ -2030,12 +2046,24 @@ def grouped_load_weights(
                 if scatter_list is not None:
                     del scatter_list
 
+    def _normalize_grouped_checkpoint_key(key: str) -> Optional[str]:
+        if _matches_checkpoint_skip_key_pattern(key, model):
+            return None
+        converted_key = _convert_weight_key(key, model)
+        if converted_key != key and _matches_checkpoint_skip_key_pattern(converted_key, model):
+            return None
+        return _normalize_checkpoint_key_for_filter(converted_key)
+
     def _should_skip_dense_key(key: str) -> bool:
-        normalized = _normalize_checkpoint_key_for_filter(key)
-        return normalized is None or _is_checkpoint_expert_key(normalized)
+        normalized = _normalize_grouped_checkpoint_key(key)
+        if normalized is None or _is_checkpoint_expert_key(normalized):
+            return True
+        if dense_skip_key_fn is not None:
+            return dense_skip_key_fn(normalized)
+        return False
 
     def _should_skip_grouped_expert_key(key: str) -> bool:
-        normalized = _normalize_checkpoint_key_for_filter(key)
+        normalized = _normalize_grouped_checkpoint_key(key)
         if normalized is None or not _is_checkpoint_expert_key(normalized):
             return True
         if expert_skip_key_fn is not None:
@@ -2098,7 +2126,7 @@ def grouped_load_weights(
         if is_group_leader:
             state_dict, skipped_keys = next(expert_prefetched)
             for skipped_key in skipped_keys:
-                normalized = _normalize_checkpoint_key_for_filter(skipped_key)
+                normalized = _normalize_grouped_checkpoint_key(skipped_key)
                 if normalized is None or not _is_checkpoint_expert_key(normalized):
                     continue
                 if expert_skip_key_fn is not None and expert_skip_key_fn(normalized):

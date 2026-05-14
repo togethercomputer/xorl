@@ -821,10 +821,17 @@ class TrainingArguments:
             "help": "Device to initialize model weights. 1. `cpu`: Init parameters on CPU in rank0 only. 2. `cuda`: Init parameters on GPU. 3. `meta`: Init parameters on meta. 4. `npu`: Init parameters on Ascend NPU."
         },
     )
-    load_weights_mode: Literal["broadcast", "all_ranks", "grouped", "skip"] = field(
-        default="broadcast",
+    load_weights_mode: Literal["all_ranks", "grouped", "skip"] = field(
+        default="grouped",
         metadata={
-            "help": "Weight loading mode. 'broadcast': global rank0 reads weights and broadcasts to other ranks. 'all_ranks': every rank reads weights from disk independently. 'grouped': one reader per EP-FSDP group reads and broadcasts within that group. 'skip': skip HF weight loading (use with load_checkpoint_path for DCP)."
+            "help": (
+                "Weight loading mode. 'grouped' (default): one reader per node fan-outs dense "
+                "weights inside the node and one reader per EP-FSDP group fan-outs experts; when "
+                "grouped fanout groups are unavailable, it falls back to rank-0 loading. "
+                "'all_ranks': every rank reads weights from disk independently. 'skip': skip HF "
+                "weight loading entirely; use with load_checkpoint_path to materialize parameters "
+                "from a DCP checkpoint instead."
+            )
         },
     )
     enable_full_determinism: bool = field(
@@ -1107,6 +1114,11 @@ class TrainingArguments:
                 output_dir=self.output_dir,
                 is_local_rank0=self.local_rank == 0,
                 ckpt_manager=self.ckpt_manager,
+            )
+
+        if self.load_weights_mode not in {"grouped", "all_ranks", "skip"}:
+            raise ValueError(
+                f"Unsupported load_weights_mode={self.load_weights_mode!r}. Expected one of: grouped, all_ranks, skip."
             )
 
         if self.load_weights_mode == "skip" and not self.load_checkpoint_path:

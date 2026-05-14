@@ -47,7 +47,7 @@ train:
   enable_full_shard: true
   enable_activation_offload: false
   init_device: meta
-  load_weights_mode: broadcast
+  load_weights_mode: grouped
   enable_full_determinism: false
   empty_cache_steps: 500
   ckpt_manager: dcp

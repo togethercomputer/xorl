@@ -167,7 +167,7 @@ Each entry in `datasets` (or `test_datasets`) is a dict:
 | `activation_gpu_limit` | `0.0` | GB of activations to keep on GPU when offloading. `0.0` = offload all. |
 | `enable_compile` | `false` | `torch.compile` for model forward pass. |
 | `init_device` | `cuda` | Device for weight initialization: `cpu` (rank 0 only), `cuda`, `meta` (required for FSDP2), `npu`. |
-| `load_weights_mode` | `broadcast` | `broadcast`: rank 0 reads weights, broadcasts to other ranks (reduces disk I/O). `all_ranks`: every rank reads from disk. |
+| `load_weights_mode` | `grouped` | `grouped`: one reader per node for dense/shared weights plus one reader per EP-FSDP group for expert weights, with rank-0 fallback when grouped fanout groups are unavailable. `all_ranks`: every rank reads from disk. `skip`: skip HuggingFace weight loading and materialize model weights from `load_checkpoint_path` (DCP). |
 | `enable_full_determinism` | `false` | Full determinism mode. Requires `allow_cuda_launch_blocking: true`. Degrades performance. |
 | `allow_cuda_launch_blocking` | `false` | Allow `CUDA_LAUNCH_BLOCKING=1`. Off by default to prevent accidental performance degradation. |
 | `empty_cache_steps` | `500` | Call `torch.cuda.empty_cache()` every N steps. |

@@ -492,7 +492,7 @@ class ModelRunner:
             basic_modules=self.model_config.get("basic_modules", []),
             enable_reentrant=self.train_config.get("enable_reentrant", False),
             enable_forward_prefetch=self.train_config.get("enable_forward_prefetch", True),
-            load_weights_mode=self.train_config.get("load_weights_mode", "broadcast"),
+            load_weights_mode=self.train_config.get("load_weights_mode", "grouped"),
             reshard_after_forward=self.train_config.get("reshard_after_forward"),
             moe_grad_reduce_mode=self.train_config.get("moe_grad_reduce_mode", "reduce_scatter"),
             pp_schedule=pp_schedule_name,

@@ -4,6 +4,7 @@ import pytest
 import torch
 import yaml
 
+import xorl.arguments as arguments_module
 from xorl.arguments import Arguments, parse_args
 
 
@@ -42,6 +43,7 @@ def test_parse_args_accepts_signsgd_from_yaml(tmp_path, monkeypatch):
 
     assert args.train.optimizer == "signsgd"
     assert args.train.optimizer_kwargs == {}
+    assert args.train.load_weights_mode == "grouped"
 
 
 def test_parse_args_accepts_distsignsgd_from_yaml(tmp_path, monkeypatch):
@@ -125,3 +127,44 @@ def test_parse_args_wires_muon_kwargs_from_yaml(tmp_path, monkeypatch):
     assert args.train.optimizer_kwargs["muon_grad_dtype"] is torch.float32
     assert args.train.optimizer_kwargs["muon_update_dtype"] is torch.float32
     assert args.train.optimizer_kwargs["muon_force_momentum_path"] is True
+
+
+def test_parse_args_resolves_auto_checkpoint_before_skip_validation(tmp_path, monkeypatch):
+    resolved_checkpoint = str(tmp_path / "outputs" / "checkpoints" / "global_step_10")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "model_path": "Qwen/Qwen3-8B",
+                },
+                "data": {
+                    "datasets": [{"path": "dummy", "type": "tokenized"}],
+                },
+                "train": {
+                    "init_device": "meta",
+                    "output_dir": str(tmp_path / "outputs"),
+                    "load_weights_mode": "skip",
+                    "load_checkpoint_path": "auto",
+                    "repo_commit": "test-commit",
+                    "use_wandb": False,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setattr(sys, "argv", ["train.py", str(config_path)])
+    monkeypatch.setattr(
+        arguments_module,
+        "get_checkpoint_path",
+        lambda output_dir, is_local_rank0, ckpt_manager: resolved_checkpoint,
+    )
+
+    args = parse_args(Arguments)
+
+    assert args.train.load_checkpoint_path == resolved_checkpoint

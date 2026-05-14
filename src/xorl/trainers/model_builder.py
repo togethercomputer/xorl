@@ -136,7 +136,7 @@ def build_training_model(
     basic_modules: Optional[List[str]] = None,
     enable_reentrant: bool = False,
     enable_forward_prefetch: bool = True,
-    load_weights_mode: str = "broadcast",
+    load_weights_mode: str = "grouped",
     reshard_after_forward: Optional[bool] = None,
     moe_grad_reduce_mode: str = "reduce_scatter",
     pp_schedule: Optional[str] = None,
@@ -477,7 +477,7 @@ def _inject_lora(
 def _deferred_qlora_quantize(
     model: nn.Module,
     weights_path: str,
-    load_weights_mode: str = "broadcast",
+    load_weights_mode: str = "grouped",
 ) -> None:
     """After FSDP loads weights, quantize/load weights into QLoRA modules.
 

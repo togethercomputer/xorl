@@ -447,6 +447,28 @@ def test_try_load_state_dict_uses_rank0_for_local_resolution(monkeypatch):
     assert [it.filepath for it in iterators] == ["shard-0.safetensors", "shard-1.safetensors"]
 
 
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [
+        ("model.layers.43.mlp.experts.7.gate_proj.weight", True),
+        ("model.layers.43.mlp.experts.7.down_proj.weight_scale_inv", True),
+        ("model.layers.43.mlp.experts.gate_up_proj", True),
+        ("model.layers.43.mlp.experts.gate_up_proj.weight", True),
+        ("model.layers.43.mlp.experts.down_proj.weight", True),
+        ("language_model.model.layers.43.mlp.experts.down_proj.weight", True),
+        ("layers.12.ffn.experts.7.w1.weight", True),
+        ("layers.12.ffn.experts.7.w2.scale", True),
+        ("model.layers.12.ffn.experts.7.w3.weight", True),
+        ("model.layers.43.mlp.shared_expert.down_proj.weight", False),
+        ("layers.12.ffn.shared_experts.w1.weight", False),
+        ("model.layers.43.mlp.gate_up_proj.weight", False),
+        ("model.layers.43.self_attn.q_proj.weight", False),
+    ],
+)
+def test_checkpoint_expert_key_classifies_supported_expert_formats(key, expected):
+    assert module_utils._is_checkpoint_expert_key(key) is expected
+
+
 def test_try_load_state_dict_local_directory_skips_broadcast(monkeypatch):
     local_resolution_calls = []
 
@@ -638,6 +660,290 @@ def test_grouped_load_weights_uses_filtered_prefetch_on_group_leader(monkeypatch
     )
 
 
+def test_grouped_load_weights_routes_hf_fused_experts_through_expert_queue(monkeypatch):
+    dense_loaded = []
+    expert_loaded = []
+    dispatched = []
+    prefetch_calls = []
+    fake_group = object()
+    fake_dense_group = object()
+    raw_expert_key = "model.language_model.layers.0.mlp.experts.gate_up_proj.weight"
+    raw_skipped_key = "mtp.layers.0.mlp.experts.0.gate_proj.weight"
+    expert_key = "model.layers.0.mlp.experts.gate_up_proj.weight"
+    expert_param = "model.layers.0.mlp.experts.gate_up_proj"
+
+    class _Plan:
+        def is_expert_parameter(self, parameter_name):
+            return parameter_name == expert_param
+
+    class _Handler:
+        def __init__(self, loaded):
+            self.loaded = loaded
+
+        def get_skip_key_fn(self):
+            return None
+
+        def on_load_weight(self, key, tensor):
+            self.loaded.append(key)
+            if key == expert_key:
+                return [(expert_param, tensor)]
+            return [(key, tensor)]
+
+        def on_load_complete(self):
+            return []
+
+    class _GroupedModel:
+        _checkpoint_conversion_mapping = {r"^model\.language_model\.": "model."}
+        _checkpoint_skip_key_patterns = [r"^mtp\."]
+
+        def named_buffers(self):
+            return []
+
+        def named_parameters(self):
+            return [("keep.weight", None), (expert_param, None)]
+
+        def named_modules(self):
+            return []
+
+        def to_empty(self, device):
+            self.device = device
+
+        def get_parallel_plan(self):
+            return _Plan()
+
+        def get_checkpoint_handler(self, **kwargs):
+            return _Handler(dense_loaded if kwargs["ep_size"] == 1 else expert_loaded)
+
+    fake_dist = SimpleNamespace(
+        is_available=lambda: True,
+        is_initialized=lambda: True,
+        get_world_size=lambda group=None: 1,
+        get_process_group_ranks=lambda group: [0],
+        broadcast=lambda *args, **kwargs: None,
+        scatter=lambda *args, **kwargs: None,
+        broadcast_object_list=lambda *args, **kwargs: None,
+    )
+
+    def fake_prefetch_filtered(state_dict_iterators, skip_key_fn, prefetch_count):
+        assert state_dict_iterators == ["shard-0"]
+        if skip_key_fn(raw_expert_key):
+            prefetch_calls.append("dense")
+            assert skip_key_fn(raw_skipped_key)
+            assert not skip_key_fn("keep.weight")
+            yield ({"keep.weight": torch.tensor([2.0])}, [])
+        else:
+            prefetch_calls.append("expert")
+            assert skip_key_fn(raw_skipped_key)
+            assert skip_key_fn("keep.weight")
+            yield ({raw_expert_key: torch.tensor([3.0])}, [])
+
+    monkeypatch.setattr(module_utils, "dist", fake_dist)
+    monkeypatch.setattr(module_utils, "tqdm", lambda iterable, **kwargs: iterable)
+    monkeypatch.setattr(module_utils, "_get_object_broadcast_device", lambda group: None)
+    monkeypatch.setattr(module_utils, "_get_grouped_weight_load_group", lambda _ps: fake_group)
+    monkeypatch.setattr(module_utils, "_get_grouped_dense_weight_load_group", lambda: fake_dense_group)
+    monkeypatch.setattr(
+        module_utils,
+        "get_parallel_state",
+        lambda: SimpleNamespace(global_rank=0, pp_enabled=False, ep_enabled=True, ep_rank=0, ep_size=16),
+    )
+    monkeypatch.setattr(module_utils, "_build_compiled_key_map", lambda *args, **kwargs: {})
+    monkeypatch.setattr(module_utils, "_shrink_expert_params_for_ep", lambda model: None)
+    monkeypatch.setattr(
+        module_utils,
+        "_get_checkpoint_keys",
+        lambda weights_path: {"keep.weight", raw_expert_key, raw_skipped_key},
+    )
+    monkeypatch.setattr(module_utils, "_load_state_dict", lambda weights_path: ["shard-0"])
+    monkeypatch.setattr(module_utils, "_prefetch_shards_filtered", fake_prefetch_filtered)
+    monkeypatch.setattr(module_utils, "_dispatch_parameter", lambda *args, **kwargs: dispatched.append(args[1]))
+    monkeypatch.setattr(module_utils, "post_process_after_weight_loading", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module_utils, "empty_cache", lambda: None)
+
+    module_utils.grouped_load_weights(_GroupedModel(), "dummy-weights", init_device="cpu")
+
+    assert prefetch_calls == ["dense", "expert"]
+    assert dense_loaded == ["keep.weight"]
+    assert expert_loaded == [expert_key]
+    assert dispatched == ["keep.weight", expert_param]
+
+
+def test_grouped_load_weights_routes_ffn_expert_source_format_through_expert_queue(monkeypatch):
+    dense_loaded = []
+    expert_loaded = []
+    dispatched = []
+    prefetch_calls = []
+    fake_group = object()
+    fake_dense_group = object()
+    raw_expert_weight = "layers.0.ffn.experts.0.w1.weight"
+    raw_expert_scale = "layers.0.ffn.experts.0.w1.scale"
+    expert_param = "model.layers.0.mlp.experts.gate_up_proj"
+
+    class _Plan:
+        def is_expert_parameter(self, parameter_name):
+            return parameter_name == expert_param
+
+    class _Handler:
+        def __init__(self, loaded):
+            self.loaded = loaded
+
+        def get_skip_key_fn(self):
+            return None
+
+        def on_load_weight(self, key, tensor):
+            self.loaded.append(key)
+            if key == raw_expert_weight:
+                return [(expert_param, tensor)]
+            return [(key, tensor)] if key == "keep.weight" else []
+
+        def on_load_complete(self):
+            return []
+
+    class _GroupedModel:
+        def named_buffers(self):
+            return []
+
+        def named_parameters(self):
+            return [("keep.weight", None), (expert_param, None)]
+
+        def named_modules(self):
+            return []
+
+        def to_empty(self, device):
+            self.device = device
+
+        def get_parallel_plan(self):
+            return _Plan()
+
+        def get_checkpoint_handler(self, **kwargs):
+            return _Handler(dense_loaded if kwargs["ep_size"] == 1 else expert_loaded)
+
+    fake_dist = SimpleNamespace(
+        is_available=lambda: True,
+        is_initialized=lambda: True,
+        get_world_size=lambda group=None: 1,
+        get_process_group_ranks=lambda group: [0],
+        broadcast=lambda *args, **kwargs: None,
+        scatter=lambda *args, **kwargs: None,
+        broadcast_object_list=lambda *args, **kwargs: None,
+    )
+
+    def fake_prefetch_filtered(state_dict_iterators, skip_key_fn, prefetch_count):
+        assert state_dict_iterators == ["shard-0"]
+        if skip_key_fn(raw_expert_weight):
+            prefetch_calls.append("dense")
+            assert skip_key_fn(raw_expert_scale)
+            assert not skip_key_fn("keep.weight")
+            yield ({"keep.weight": torch.tensor([2.0])}, [])
+        else:
+            prefetch_calls.append("expert")
+            assert skip_key_fn("keep.weight")
+            assert not skip_key_fn(raw_expert_scale)
+            yield ({raw_expert_weight: torch.tensor([3.0]), raw_expert_scale: torch.tensor([1.0])}, [])
+
+    monkeypatch.setattr(module_utils, "dist", fake_dist)
+    monkeypatch.setattr(module_utils, "tqdm", lambda iterable, **kwargs: iterable)
+    monkeypatch.setattr(module_utils, "_get_object_broadcast_device", lambda group: None)
+    monkeypatch.setattr(module_utils, "_get_grouped_weight_load_group", lambda _ps: fake_group)
+    monkeypatch.setattr(module_utils, "_get_grouped_dense_weight_load_group", lambda: fake_dense_group)
+    monkeypatch.setattr(
+        module_utils,
+        "get_parallel_state",
+        lambda: SimpleNamespace(global_rank=0, pp_enabled=False, ep_enabled=True, ep_rank=0, ep_size=16),
+    )
+    monkeypatch.setattr(module_utils, "_build_compiled_key_map", lambda *args, **kwargs: {})
+    monkeypatch.setattr(module_utils, "_shrink_expert_params_for_ep", lambda model: None)
+    monkeypatch.setattr(
+        module_utils,
+        "_get_checkpoint_keys",
+        lambda weights_path: {"keep.weight", raw_expert_weight, raw_expert_scale},
+    )
+    monkeypatch.setattr(module_utils, "_load_state_dict", lambda weights_path: ["shard-0"])
+    monkeypatch.setattr(module_utils, "_prefetch_shards_filtered", fake_prefetch_filtered)
+    monkeypatch.setattr(module_utils, "_dispatch_parameter", lambda *args, **kwargs: dispatched.append(args[1]))
+    monkeypatch.setattr(module_utils, "post_process_after_weight_loading", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module_utils, "empty_cache", lambda: None)
+
+    module_utils.grouped_load_weights(_GroupedModel(), "dummy-weights", init_device="cpu")
+
+    assert prefetch_calls == ["dense", "expert"]
+    assert dense_loaded == ["keep.weight"]
+    assert expert_loaded == [raw_expert_weight, raw_expert_scale]
+    assert dispatched == ["keep.weight", expert_param]
+
+
+def test_grouped_load_weights_treats_missing_dense_group_as_local(monkeypatch):
+    dispatched = []
+    fake_group = object()
+
+    class _Handler:
+        def get_skip_key_fn(self):
+            return None
+
+        def on_load_weight(self, key, tensor):
+            return [(key, tensor)]
+
+        def on_load_complete(self):
+            return []
+
+    class _GroupedModel:
+        def named_buffers(self):
+            return []
+
+        def named_parameters(self):
+            return [("keep.weight", None)]
+
+        def named_modules(self):
+            return []
+
+        def to_empty(self, device):
+            self.device = device
+
+        def get_checkpoint_handler(self, **kwargs):
+            return _Handler()
+
+    def fail_collective(*args, **kwargs):
+        raise AssertionError("local-only grouped dense loading should not enter a collective")
+
+    fake_dist = SimpleNamespace(
+        is_available=lambda: True,
+        is_initialized=lambda: True,
+        get_world_size=lambda group=None: 4 if group is None else 1,
+        get_process_group_ranks=lambda group: [0],
+        broadcast=fail_collective,
+        scatter=fail_collective,
+        broadcast_object_list=fail_collective,
+    )
+
+    def fake_prefetch_filtered(state_dict_iterators, skip_key_fn, prefetch_count):
+        if skip_key_fn("keep.weight"):
+            yield ({}, [])
+        else:
+            yield ({"keep.weight": torch.tensor([2.0])}, [])
+
+    monkeypatch.setattr(module_utils, "dist", fake_dist)
+    monkeypatch.setattr(module_utils, "tqdm", lambda iterable, **kwargs: iterable)
+    monkeypatch.setattr(module_utils, "_get_grouped_weight_load_group", lambda _ps: fake_group)
+    monkeypatch.setattr(module_utils, "_get_grouped_dense_weight_load_group", lambda: None)
+    monkeypatch.setattr(
+        module_utils,
+        "get_parallel_state",
+        lambda: SimpleNamespace(global_rank=0, pp_enabled=False, ep_enabled=True, ep_rank=0, ep_size=4),
+    )
+    monkeypatch.setattr(module_utils, "_build_compiled_key_map", lambda *args, **kwargs: {})
+    monkeypatch.setattr(module_utils, "_shrink_expert_params_for_ep", lambda model: None)
+    monkeypatch.setattr(module_utils, "_get_checkpoint_keys", lambda weights_path: {"keep.weight"})
+    monkeypatch.setattr(module_utils, "_load_state_dict", lambda weights_path: ["shard-0"])
+    monkeypatch.setattr(module_utils, "_prefetch_shards_filtered", fake_prefetch_filtered)
+    monkeypatch.setattr(module_utils, "_dispatch_parameter", lambda *args, **kwargs: dispatched.append(args[1]))
+    monkeypatch.setattr(module_utils, "post_process_after_weight_loading", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module_utils, "empty_cache", lambda: None)
+
+    module_utils.grouped_load_weights(_GroupedModel(), "dummy-weights", init_device="cpu")
+
+    assert dispatched == ["keep.weight"]
+
+
 def test_grouped_load_weights_falls_back_without_ep_group(monkeypatch):
     called = []
 
@@ -659,6 +965,8 @@ def test_grouped_load_weights_falls_back_without_ep_group(monkeypatch):
         lambda *args, **kwargs: called.append((args, kwargs)),
     )
 
-    module_utils.grouped_load_weights(_DummyModel(), "dummy-weights", init_device="cpu")
+    model = _DummyModel()
+    module_utils.grouped_load_weights(model, "dummy-weights", init_device="cpu")
 
     assert len(called) == 1
+    assert not hasattr(model, "device")

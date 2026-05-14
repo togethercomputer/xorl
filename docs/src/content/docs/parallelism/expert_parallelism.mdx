@@ -176,7 +176,7 @@ parameters, matches each expert parameter against the EP plan, then either:
 - **Redistributes** the full tensor into a local shard using `DTensor.redistribute()` with
   a `Shard(0)` placement on the EP mesh (normal path when loading from a checkpoint).
 - **Annotates** already-local tensors with a `spec_info` attribute (fast path when weights
-  were loaded EP-aware, e.g. with `load_weights_mode: all_ranks`).
+  were loaded EP-aware, e.g. with `load_weights_mode: all_ranks` or `grouped`).
 
 After sharding, each rank's expert parameter has shape `[num_local_experts, ...]`.  The
 `spec_info` attribute records the `ep_fsdp_mesh`, the shard placement, and the FQN for
@@ -837,7 +837,7 @@ ranks.
 | `data_parallel_shard_size` | `int` | `-1` | FSDP shard size. Together with `expert_parallel_size`, determines `ep_fsdp_size = ranks_per_stage / ep_size`. |
 | `pipeline_parallel_size` | `int` | `1` | PP degree. EP groups are confined within each PP stage. |
 | `ringattn_parallel_size` | `int` | `1` | Ring attention CP size. Can be folded into EP-FSDP axis via `ep_fsdp_size`. |
-| `load_weights_mode` | `str` | `"broadcast"` | `"all_ranks"` lets every rank read its local expert shard directly without a broadcast. Preferred for EP. |
+| `load_weights_mode` | `str` | `"grouped"` | Default grouped fanout: one dense/shared reader per node and one expert reader per EP-FSDP group, with rank-0 fallback when grouped fanout groups are unavailable. Use `"all_ranks"` on storage that can handle one checkpoint read per rank, or `"skip"` with `load_checkpoint_path` to load model weights from a converted DCP checkpoint. |
 
 ### Environment variables
 

@@ -19,7 +19,7 @@ from xorl.distributed.pipeline_parallel import (
     pipeline_module_split,
 )
 from xorl.lora import LoraLinear
-from xorl.models import all_ranks_load_weights, grouped_load_weights, rank0_load_and_broadcast_weights
+from xorl.models import all_ranks_load_weights, grouped_load_weights
 from xorl.models.transformers.deepseek_v3.support import validate_deepseek_v3_tensor_parallelism
 from xorl.utils import logging
 from xorl.utils.device import get_device_type
@@ -46,18 +46,27 @@ def _load_model_weights(
     weight_device: str,
     dtensor_factory=None,
 ) -> None:
+    """Dispatch HF weight loading by mode.
+
+    'skip' is a no-op; weights are expected to come from a DCP checkpoint via
+    load_checkpoint_path. 'grouped' uses one reader per node for dense weights
+    and one per EP-FSDP group for experts, falling back to rank-0 loading when
+    those fanout groups are unavailable. 'all_ranks' has every rank read
+    independently.
+    """
     if load_weights_mode == "skip":
         logger.info_rank0("Skipping HF weight loading (weights will be loaded from DCP checkpoint).")
         return
-    elif load_weights_mode == "broadcast":
-        logger.info_rank0("Loading model weights from disk on rank0 then broadcasting to other ranks...")
-        rank0_load_and_broadcast_weights(model, weights_path, weight_device, dtensor_factory=dtensor_factory)
-    elif load_weights_mode == "grouped":
-        logger.info_rank0("Loading model weights with one reader per EP-FSDP group...")
+    if load_weights_mode == "grouped":
+        logger.info_rank0("Loading model weights with one reader per node (dense) + per EP-FSDP group (experts)...")
         grouped_load_weights(model, weights_path, weight_device, dtensor_factory=dtensor_factory)
-    else:
+    elif load_weights_mode == "all_ranks":
         logger.info_rank0("Every rank reading weights from disk independently...")
         all_ranks_load_weights(model, weights_path, weight_device, dtensor_factory=dtensor_factory)
+    else:
+        raise ValueError(
+            f"Unsupported load_weights_mode={load_weights_mode!r}. Expected one of: grouped, all_ranks, skip."
+        )
 
 
 _TP_STYLE_MAP = {
@@ -424,7 +433,7 @@ def parallelize_model_fsdp2(
     weight_device = get_device_type()
 
     # skip_weight_loading: Used when caller will handle weight loading separately
-    # (e.g., FSDP2+LoRA where we broadcast from rank 0 after this function returns)
+    # after this function returns.
     if kwargs.get("skip_weight_loading"):
         logger.info_rank0("Skipping weight loading in parallelize_model_fsdp2 (caller will handle)")
     elif weights_path is None:
@@ -438,7 +447,7 @@ def parallelize_model_fsdp2(
                     m.reset_lora_parameters()
     else:
         logger.info_rank0("starting to load model weights...")
-        load_weights_mode = kwargs.get("load_weights_mode", "broadcast")
+        load_weights_mode = kwargs.get("load_weights_mode", "grouped")
         _load_model_weights(
             model,
             weights_path,
@@ -640,7 +649,7 @@ def build_parallelize_model(
                 if kwargs.get("init_device") == "meta" and weights_path is not None:
                     if i == 0:
                         logger.info_rank0("TP enabled: loading weights before FSDP wrapping...")
-                    load_weights_mode = kwargs.get("load_weights_mode", "broadcast")
+                    load_weights_mode = kwargs.get("load_weights_mode", "grouped")
                     _load_model_weights(
                         model_part,
                         weights_path,
@@ -784,7 +793,7 @@ def build_parallelize_model(
         # Load weights now so FSDP wraps materialized TP DTensors.
         if kwargs.get("init_device") == "meta" and weights_path is not None:
             logger.info_rank0("TP enabled: loading weights before FSDP wrapping...")
-            load_weights_mode = kwargs.get("load_weights_mode", "broadcast")
+            load_weights_mode = kwargs.get("load_weights_mode", "grouped")
             _load_model_weights(
                 model,
                 weights_path,

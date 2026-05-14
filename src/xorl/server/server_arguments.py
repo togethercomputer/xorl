@@ -229,7 +229,8 @@ class ServerArguments:
     )
 
     load_weights_mode: str = field(
-        default="auto", metadata={"help": "Weight loading mode: 'auto', 'safetensors', 'dcp'"}
+        default="grouped",
+        metadata={"help": ("Weight loading mode: 'grouped' (default, with rank-0 fallback), 'all_ranks', or 'skip'")},
     )
 
     init_device: Optional[Literal["cpu", "meta", "cuda"]] = field(
@@ -565,6 +566,11 @@ class ServerArguments:
             # If worker_bind_host/port are explicitly configured via YAML,
             # the launcher can still use them via engine_connect_host + worker_bind_port
             pass
+
+        if self.load_weights_mode not in {"grouped", "all_ranks", "skip"}:
+            raise ValueError(
+                f"Unsupported load_weights_mode={self.load_weights_mode!r}. Expected one of: grouped, all_ranks, skip."
+            )
 
         if self.load_weights_mode == "skip" and not self.load_checkpoint_path:
             raise ValueError(

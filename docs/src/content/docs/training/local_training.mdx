@@ -132,7 +132,7 @@ train:
   enable_gradient_checkpointing: true
   enable_full_shard: true
   init_device: meta
-  load_weights_mode: broadcast
+  load_weights_mode: grouped
   save_steps: 500
   ckpt_manager: dcp
 ```
@@ -153,10 +153,10 @@ xorl downloads from HF Hub on first use (cached in `~/.cache/huggingface`). Pass
 ```yaml
 train:
   init_device: meta
-  load_weights_mode: broadcast   # rank 0 reads, all ranks receive via NCCL
+  load_weights_mode: grouped     # grouped fanout, with rank-0 fallback
 ```
 
-Meta device creates model parameters as zero-cost placeholders. FSDP2 then loads and shards weights directly into each rank's shard — no rank ever holds the full model in memory. Without meta device, every rank would briefly allocate the entire model before sharding, causing OOM for models larger than ~30B parameters on 80 GB GPUs. Use `load_weights_mode: all_ranks` for NVMe-fast local storage (each rank reads independently).
+Meta device creates model parameters as zero-cost placeholders. FSDP2 then loads and shards weights directly into each rank's shard — no rank ever holds the full model in memory. Without meta device, every rank would briefly allocate the entire model before sharding, causing OOM for models larger than ~30B parameters on 80 GB GPUs. `grouped` is the default; it uses grouped fanout for large MoE/EP loads and falls back to rank-0 loading when grouped fanout groups are unavailable. Use `load_weights_mode: all_ranks` for NVMe-fast local storage (each rank reads independently).
 
 ## Data Parallel Modes
 
