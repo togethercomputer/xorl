@@ -152,7 +152,9 @@ def add_endpoints(train_url, infer_urls):
     for url in infer_urls:
         parsed = urlparse(url)
         host, port = parsed.hostname, parsed.port
-        resp = requests.post(f"{train_url}/add_inference_endpoint", json={"host": host, "port": port}, timeout=30)
+        resp = requests.post(
+            f"{train_url}/add_inference_endpoint", json={"host": host, "port": port, "worker_port": port}, timeout=30
+        )
         resp.raise_for_status()
         result = resp.json()
         si = result.get("endpoint", {}).get("server_info", {}) if result else {}
@@ -173,7 +175,7 @@ def train_step(train_url, data, lr):
     loss = fb_result.get("metrics", {}).get("loss:mean", "N/A")
     opt = requests.post(
         f"{train_url}/api/v1/optim_step",
-        json={"model_id": MODEL_ID, "adam_params": {"learning_rate": lr}, "gradient_clip": 1.0},
+        json={"model_id": MODEL_ID, "learning_rate": lr, "gradient_clip": 1.0},
         timeout=30,
     )
     opt.raise_for_status()

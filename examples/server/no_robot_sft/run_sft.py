@@ -30,7 +30,7 @@ class Config:
     learning_rate: float = 1e-4
     max_length: int = 32768
     train_on_what: renderers.TrainOnWhat = renderers.TrainOnWhat.ALL_ASSISTANT_MESSAGES
-    # we currently don't support modifying lora rank from the client side
+    # The server must be started with max_lora_rank >= this requested rank.
     lora_rank: int = 64
     save_every: int = 20  # 0 = disabled
 
@@ -129,8 +129,6 @@ def main(config: Config):
         # Linear learning rate schedule
         lr_mult = max(0.0, 1.0 - step / n_train_batches)
         current_lr = config.learning_rate * lr_mult
-        adam_params = xorl_client.AdamParams(learning_rate=current_lr, beta1=0.9, beta2=0.95, eps=1e-8)
-
         # Get training batch and convert to datums online
         batch_start = batch_idx * config.batch_size
         batch_end = min((batch_idx + 1) * config.batch_size, len(train_dataset))
@@ -148,7 +146,7 @@ def main(config: Config):
 
         # Training step
         fwd_bwd_future = training_client.forward_backward(batch, loss_fn="cross_entropy")
-        optim_step_future = training_client.optim_step(adam_params)
+        optim_step_future = training_client.optim_step(learning_rate=current_lr)
 
         fwd_bwd_result = fwd_bwd_future.result()
         _optim_result = optim_step_future.result()

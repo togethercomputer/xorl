@@ -71,6 +71,7 @@ import zmq.asyncio
 from xorl.data.collators import TextSequenceShardCollator
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.server.protocol.operations import (
+    AdapterStateData,
     EmptyData,
     LoadStateData,
     ModelPassData,
@@ -191,9 +192,9 @@ class RunnerDispatcher:
         )
 
     # Operations that participate in cross-rank error sync.
-    # Only compute ops where all ranks execute in lockstep.
-    # Excludes weight sync, save/load, etc. that have their own sync mechanisms.
-    _ERROR_SYNC_OPS = {"forward_backward", "forward", "optim_step"}
+    # These ops execute on every rank, and rank-0 success is not trustworthy if any
+    # worker rank failed locally.
+    _ERROR_SYNC_OPS = {"forward_backward", "forward", "optim_step", "register_session"}
 
     def _sync_error_state(self) -> Optional[str]:
         """Synchronize error state across all ranks via Gloo group.
@@ -355,7 +356,7 @@ class RunnerDispatcher:
                     # Set error state so rank 0 can detect it during sync
                     self._worker_error = error_msg
 
-                # Post-execution error sync for compute ops only (matches rank 0)
+                # Post-execution error sync for lockstep ops (matches rank 0)
                 if command_type in self._ERROR_SYNC_OPS:
                     try:
                         cross_rank_error = self._sync_error_state()
@@ -400,6 +401,7 @@ class RunnerDispatcher:
         "wake_up": "_handle_wake_up",
         "health_check": "_handle_health_check",
         "sync_inference_weights": "_handle_sync_inference_weights",
+        "register_session": "_handle_register_session",
         "register_adapter": "_handle_register_adapter",
         "save_adapter_state": "_handle_save_adapter_state",
         "load_adapter_state": "_handle_load_adapter_state",
@@ -465,8 +467,7 @@ class RunnerDispatcher:
                 )
             result = await getattr(self, handler_name)(command_dict)
 
-            # Post-execution error sync for compute ops only
-            # (weight sync, save/load have their own distributed sync)
+            # Post-execution error sync for lockstep ops.
             if command_type in self._ERROR_SYNC_OPS:
                 cross_rank_error = self._sync_error_state()
                 if cross_rank_error:
@@ -490,7 +491,7 @@ class RunnerDispatcher:
             else:
                 logger.error(f"Rank {self.rank}: Error handling request: {e}", exc_info=True)
 
-            # Set error state so other ranks can detect it during compute ops
+            # Set error state so other ranks can detect it during lockstep ops
             if command_type in self._ERROR_SYNC_OPS:
                 self._worker_error = str(e)
                 try:
@@ -569,12 +570,13 @@ class RunnerDispatcher:
         loss_fn_params = p.loss_fn_params
         routed_experts = p.routed_experts
         routed_expert_logits = p.routed_expert_logits
-        model_id = p.model_id if with_backward else None
+        model_id = p.model_id or "default"
 
-        # Auto-load adapter if it was evicted (all ranks must call this together)
+        # Auto-load adapter if it was evicted (all ranks must call this together).
+        # Forward-only requests must also honor model_id so create_model+forward can
+        # initialize the correct adapter state before save/load operations.
         was_auto_loaded, auto_load_path = False, None
-        if with_backward:
-            was_auto_loaded, auto_load_path = self._adapter_coordinator.auto_load_if_evicted(model_id)
+        was_auto_loaded, auto_load_path = self._adapter_coordinator.auto_load_if_evicted(model_id)
 
         # Select and prepare batches (broadcast-and-select, no scatter)
         my_batches, routed_experts, routed_expert_logits = self._select_and_prepare_batches(
@@ -623,11 +625,10 @@ class RunnerDispatcher:
         loss_fn_params = p.loss_fn_params
         routed_experts = p.routed_experts
         routed_expert_logits = p.routed_expert_logits
-        model_id = p.model_id if with_backward else None
+        model_id = p.model_id or "default"
 
-        # Auto-load adapter if it was evicted (all ranks must call this together)
-        if with_backward:
-            self._adapter_coordinator.auto_load_if_evicted(model_id)
+        # Auto-load adapter if it was evicted (all ranks must call this together).
+        self._adapter_coordinator.auto_load_if_evicted(model_id)
 
         # Select and prepare this rank's batches from broadcast data (no scatter)
         my_batches, routed_experts, routed_expert_logits = self._select_and_prepare_batches(
@@ -890,6 +891,7 @@ class RunnerDispatcher:
             my_batches,
             loss_fn,
             loss_fn_params,
+            model_id=model_id,
             routed_experts=routed_experts,
             routed_expert_logits=routed_expert_logits,
         )
@@ -1012,6 +1014,9 @@ class RunnerDispatcher:
             f"Rank {self.rank}: Saving state to {checkpoint_path}, model_id={model_id}, save_optimizer={save_optimizer}"
         )
 
+        if self.trainer.adapter_manager is not None:
+            self._adapter_coordinator.auto_load_if_evicted(model_id, allow_fresh_materialization=False)
+
         # For LoRA models with save_optimizer=False (sampler weights), use fast PEFT-compatible save
         # This creates adapter_model.safetensors + adapter_config.json that SGLang can load
         is_lora_enabled = self.trainer.lora_config.get("enable_lora", False)
@@ -1067,6 +1072,9 @@ class RunnerDispatcher:
         model_id = p.model_id or "default"
 
         logger.debug(f"Rank {self.rank}: Saving LoRA adapter to {lora_path} for model_id={model_id}")
+
+        if self.trainer.adapter_manager is not None:
+            self._adapter_coordinator.auto_load_if_evicted(model_id, allow_fresh_materialization=False)
 
         # NOTE: Cannot use thread pool because trainer.save_lora_only() calls dist.barrier()
         # which requires all ranks to call from the same thread (main thread).
@@ -1129,17 +1137,28 @@ class RunnerDispatcher:
         logger.debug(f"Rank {self.rank}: Checkpoint path exists: {checkpoint_path}")
 
         try:
-            # NOTE: Cannot use thread pool because trainer.load_state() calls dist.barrier()
-            # which requires all ranks to call from the same thread (main thread).
-            # This will block the event loop but that's unavoidable for collective operations.
-            logger.debug(f"Rank {self.rank}: About to call trainer.load_state()...")
+            # NOTE: Cannot use thread pool because the restore paths use collectives
+            # that require all ranks to call from the main thread.
+            if self.trainer.adapter_manager is not None:
+                logger.debug(f"Rank {self.rank}: Routing load_state through adapter coordinator")
+                result = await self._adapter_coordinator.handle_load_adapter_state(
+                    {
+                        "payload": AdapterStateData(
+                            model_id=model_id,
+                            path=checkpoint_path,
+                            load_optimizer=load_optimizer,
+                        )
+                    }
+                )
+            else:
+                logger.debug(f"Rank {self.rank}: About to call trainer.load_state()...")
 
-            # Flush logs before the potentially crashing call
-            sys.stdout.flush()
-            sys.stderr.flush()
+                # Flush logs before the potentially crashing call
+                sys.stdout.flush()
+                sys.stderr.flush()
 
-            result = self.trainer.load_state(checkpoint_path, load_optimizer, model_id=model_id)
-            logger.debug(f"Rank {self.rank}: trainer.load_state() returned successfully")
+                result = self.trainer.load_state(checkpoint_path, load_optimizer, model_id=model_id)
+                logger.debug(f"Rank {self.rank}: trainer.load_state() returned successfully")
 
             # Reset step to 0 after loading state
             self.trainer.step = 0
@@ -1266,6 +1285,9 @@ class RunnerDispatcher:
 
     def _auto_load_adapter_if_evicted(self, model_id: str) -> tuple[bool, str | None]:
         return self._adapter_coordinator.auto_load_if_evicted(model_id)
+
+    async def _handle_register_session(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
+        return await self._adapter_coordinator.handle_register_session(command_dict)
 
     async def _handle_register_adapter(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
         return await self._adapter_coordinator.handle_register_adapter(command_dict)

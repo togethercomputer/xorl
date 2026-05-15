@@ -55,6 +55,7 @@ from xorl.server.protocol.operations import (
     ModelPassData,
     OptimStepData,
     RegisterAdapterData,
+    RegisterSessionData,
     SaveFullWeightsData,
     SaveLoraOnlyData,
     SaveStateData,
@@ -195,10 +196,10 @@ class RequestProcessor:
                 loss_fn=loss_fn,
                 loss_fn_params=loss_fn_params,
                 model_id=p.model_id,
+                routed_experts=p.routed_experts,
+                routed_expert_logits=p.routed_expert_logits,
                 request_id=request.request_id,
             )
-            if op_name == "forward_backward":
-                kwargs["routed_experts"] = p.routed_experts
 
             result = await backend_method(**kwargs)
 
@@ -623,6 +624,26 @@ class RequestProcessor:
                 request_id=request.request_id,
             ),
             OutputType.REGISTER_ADAPTER,
+            build_output,
+        )
+
+    async def execute_register_session(self, request: OrchestratorRequest) -> OrchestratorOutputs:
+        """Register a normalized session runtime spec on workers."""
+        p: RegisterSessionData = request.payload
+
+        def build_output(result):
+            return {"result": result}
+
+        return await self._execute_operation(
+            request,
+            "register_session",
+            self.backend.register_session(
+                model_id=p.model_id,
+                session_spec=p.session_spec,
+                materialize=p.materialize,
+                request_id=request.request_id,
+            ),
+            OutputType.REGISTER_SESSION,
             build_output,
         )
 

@@ -446,6 +446,7 @@ class Trainer:
             deepep_num_sms=args.model.deepep_num_sms,
             deepep_async_combine=args.model.deepep_async_combine,
             rmsnorm_mode=args.model.rmsnorm_mode,
+            flash_attention_deterministic=args.model.flash_attention_deterministic,
             init_device=args.train.init_device,
         )
         self.model_config = self.model.config

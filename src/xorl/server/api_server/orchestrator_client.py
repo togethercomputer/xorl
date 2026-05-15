@@ -60,7 +60,7 @@ class OrchestratorClient:
 
         Args:
             input_addr: ZMQ address for input ROUTER socket (e.g., "tcp://127.0.0.1:5555")
-            output_addr: ZMQ address for output PULL socket (e.g., "tcp://127.0.0.1:5556")
+            output_addr: ZMQ address for output PULL socket to bind (e.g., "tcp://127.0.0.1:5556")
             output_queue_maxsize: Maximum size of output queue
         """
         self.input_addr = input_addr

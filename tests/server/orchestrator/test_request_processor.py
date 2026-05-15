@@ -13,6 +13,8 @@ Test Strategy:
 - Verify RequestProcessor correctly packs data and formats outputs
 """
 
+from unittest.mock import AsyncMock
+
 import pytest
 import pytest_asyncio
 
@@ -29,8 +31,10 @@ from xorl.server.protocol.operations import (
     LoadStateData,
     ModelPassData,
     OptimStepData,
+    RegisterSessionData,
     SaveStateData,
 )
+from xorl.server.runner.runner_dispatcher import RunnerDispatcher
 
 
 # ============================================================================
@@ -109,6 +113,167 @@ async def test_forward_backward_operations(processor):
 
 
 @pytest.mark.asyncio
+async def test_model_pass_replay_fields_reach_backend(processor):
+    """Both routing replay tensors should be forwarded for forward and forward_backward."""
+    routed_experts = [[[1, 2], [3, 4]]]
+    routed_expert_logits = [[[0.1, 0.9], [0.7, 0.3]]]
+    result = {"total_loss": 1.25, "global_valid_tokens": 3}
+    processor.backend.forward_backward = AsyncMock(return_value=result)
+    processor.backend.forward = AsyncMock(return_value=result)
+
+    fb_request = OrchestratorRequest(
+        request_id="req-r3-fb",
+        request_type=RequestType.ADD,
+        operation="forward_backward",
+        payload=ModelPassData(
+            data=[{"input_ids": [1, 2, 3], "labels": [2, 3, 4]}],
+            model_id="session-a",
+            routed_experts=routed_experts,
+            routed_expert_logits=routed_expert_logits,
+        ),
+    )
+    await processor.execute_forward_backward(fb_request)
+    fb_kwargs = processor.backend.forward_backward.await_args.kwargs
+    assert fb_kwargs["model_id"] == "session-a"
+    assert fb_kwargs["routed_experts"] == routed_experts
+    assert fb_kwargs["routed_expert_logits"] == routed_expert_logits
+
+    fwd_request = OrchestratorRequest(
+        request_id="req-r3-fwd",
+        request_type=RequestType.ADD,
+        operation="forward",
+        payload=ModelPassData(
+            data=[{"input_ids": [4, 5, 6], "labels": [5, 6, 7]}],
+            model_id="session-b",
+            routed_experts=routed_experts,
+            routed_expert_logits=routed_expert_logits,
+        ),
+    )
+    await processor.execute_forward(fwd_request)
+    fwd_kwargs = processor.backend.forward.await_args.kwargs
+    assert fwd_kwargs["model_id"] == "session-b"
+    assert fwd_kwargs["routed_experts"] == routed_experts
+    assert fwd_kwargs["routed_expert_logits"] == routed_expert_logits
+
+
+def test_runner_dispatcher_forward_compute_preserves_model_id():
+    """Forward-only runner execution should switch/use the requested session adapter."""
+
+    class FakeTrainer:
+        def __init__(self):
+            self.forward_kwargs = None
+
+        def forward(
+            self,
+            my_batches,
+            loss_fn,
+            loss_fn_params,
+            *,
+            model_id="default",
+            routed_experts=None,
+            routed_expert_logits=None,
+        ):
+            self.forward_kwargs = {
+                "my_batches": my_batches,
+                "loss_fn": loss_fn,
+                "loss_fn_params": loss_fn_params,
+                "model_id": model_id,
+                "routed_experts": routed_experts,
+                "routed_expert_logits": routed_expert_logits,
+            }
+            return {"success": True, "model_id": model_id}
+
+    dispatcher = object.__new__(RunnerDispatcher)
+    dispatcher.trainer = FakeTrainer()
+    routed_experts = [[[1, 2]]]
+    routed_expert_logits = [[[0.25, 0.75]]]
+
+    result = RunnerDispatcher._execute_compute(
+        dispatcher,
+        [{"input_ids": [1, 2], "labels": [2, 3]}],
+        "causallm_loss",
+        {"return_per_token": False},
+        routed_experts,
+        with_backward=False,
+        model_id="session-a",
+        routed_expert_logits=routed_expert_logits,
+    )
+
+    assert result["model_id"] == "session-a"
+    assert dispatcher.trainer.forward_kwargs["model_id"] == "session-a"
+    assert dispatcher.trainer.forward_kwargs["routed_experts"] == routed_experts
+    assert dispatcher.trainer.forward_kwargs["routed_expert_logits"] == routed_expert_logits
+
+
+@pytest.mark.asyncio
+async def test_runner_dispatcher_forward_rank0_scatter_preserves_model_id():
+    """The rank-0 forward handler must not drop model_id before compute execution."""
+
+    class FakeCoordinator:
+        def auto_load_if_evicted(self, model_id):
+            captured["auto_load_model_id"] = model_id
+            return False, None
+
+    captured = {}
+    dispatcher = object.__new__(RunnerDispatcher)
+    dispatcher._adapter_coordinator = FakeCoordinator()
+
+    routed_experts = [[[1, 2]]]
+    routed_expert_logits = [[[0.25, 0.75]]]
+
+    def select_batches(batches, routed_experts=None, routed_expert_logits=None):
+        return batches, routed_experts, routed_expert_logits
+
+    def execute_and_gather(
+        my_batches,
+        loss_fn,
+        loss_fn_params,
+        routed_experts,
+        cp_enabled,
+        parallel_state,
+        *,
+        with_backward,
+        model_id,
+        is_rank0,
+        routed_expert_logits=None,
+    ):
+        captured.update(
+            {
+                "model_id": model_id,
+                "with_backward": with_backward,
+                "is_rank0": is_rank0,
+                "routed_experts": routed_experts,
+                "routed_expert_logits": routed_expert_logits,
+            }
+        )
+        return {"success": True, "model_id": model_id}
+
+    dispatcher._select_and_prepare_batches = select_batches
+    dispatcher._execute_and_gather = execute_and_gather
+
+    result = await RunnerDispatcher._handle_compute_rank0_scatter(
+        dispatcher,
+        {
+            "payload": ModelPassData(
+                batches=[{"input_ids": [1, 2], "labels": [2, 3]}],
+                model_id="session-a",
+                routed_experts=routed_experts,
+                routed_expert_logits=routed_expert_logits,
+            )
+        },
+        with_backward=False,
+    )
+
+    assert result["model_id"] == "session-a"
+    assert captured["model_id"] == "session-a"
+    assert captured["auto_load_model_id"] == "session-a"
+    assert captured["with_backward"] is False
+    assert captured["is_rank0"] is True
+    assert captured["routed_experts"] == routed_experts
+    assert captured["routed_expert_logits"] == routed_expert_logits
+
+
+@pytest.mark.asyncio
 async def test_optim_and_checkpoint_operations(processor):
     """Test optim_step, save_state, load_state, sleep, and wake_up."""
     # Optim step
@@ -164,6 +329,81 @@ async def test_optim_and_checkpoint_operations(processor):
     )
     output = await processor.execute_wake_up(request)
     assert output.output_type == OutputType.WAKE_UP
+
+
+@pytest.mark.asyncio
+async def test_register_session_operation_reaches_backend(processor):
+    """register_session should flow through the processor to the backend."""
+    session_spec = {
+        "base_model": "Qwen/Qwen3-8B",
+        "lora_config": {"lora_rank": 4, "lora_alpha": 8},
+        "optimizer_config": {"type": "adamw", "learning_rate": 1e-4},
+    }
+    request = OrchestratorRequest(
+        request_id="req-register-session",
+        request_type=RequestType.ADD,
+        operation="register_session",
+        payload=RegisterSessionData(model_id="session-a", session_spec=session_spec, materialize=True),
+    )
+
+    output = await processor.execute_register_session(request)
+
+    assert output.output_type == OutputType.REGISTER_SESSION
+    result = output.outputs["result"]
+    assert result["registered"] is True
+    assert result["model_id"] == "session-a"
+    assert result["session_spec"] == session_spec
+    assert result["materialize"] is True
+
+
+@pytest.mark.asyncio
+async def test_runner_dispatcher_register_session_handler_materializes_adapter():
+    """Remote register_session should be a real runner operation, not an unknown command."""
+
+    class FakeCoordinator:
+        def __init__(self):
+            self.command_dict = None
+
+        async def handle_register_session(self, command_dict):
+            self.command_dict = command_dict
+            payload = command_dict["payload"]
+            lr = payload.session_spec["optimizer_config"]["learning_rate"]
+            return {
+                "registered": True,
+                "model_id": payload.model_id,
+                "lr": lr,
+                "session_spec": payload.session_spec,
+                "materialize": payload.materialize,
+            }
+
+    dispatcher = object.__new__(RunnerDispatcher)
+    dispatcher.rank = 0
+    dispatcher._adapter_coordinator = FakeCoordinator()
+    session_spec = {
+        "optimizer_config": {"learning_rate": 2e-4},
+        "lora_config": {"lora_rank": 4, "lora_alpha": 8},
+    }
+
+    result = await RunnerDispatcher._handle_register_session(
+        dispatcher,
+        {
+            "payload": RegisterSessionData(
+                model_id="session-a",
+                session_spec=session_spec,
+                materialize=True,
+            )
+        },
+    )
+
+    assert RunnerDispatcher._COMMAND_HANDLERS["register_session"] == "_handle_register_session"
+    assert result["registered"] is True
+    assert result["model_id"] == "session-a"
+    assert result["lr"] == pytest.approx(2e-4)
+    assert result["session_spec"] == session_spec
+    assert result["materialize"] is True
+    forwarded_payload = dispatcher._adapter_coordinator.command_dict["payload"]
+    assert forwarded_payload.session_spec["optimizer_config"]["learning_rate"] == pytest.approx(2e-4)
+    assert forwarded_payload.materialize is True
 
 
 @pytest.mark.asyncio

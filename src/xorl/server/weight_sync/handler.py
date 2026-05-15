@@ -403,6 +403,45 @@ class WeightSyncHandler:
         timing_breakdown["min_rank_transfer_s"] = min_transfer_s
         timing_breakdown["rank_transfer_spread_s"] = max_transfer_s - min_transfer_s
 
+    @staticmethod
+    def _moe_runtime_lora_views(
+        mod: MoEExpertsLoRA | QLoRAMoeExperts,
+        lora_A: torch.Tensor,
+        lora_B: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, float]:
+        """Return the active LoRA slices and scaling for runtime-rank MoE modules."""
+        active_rank = getattr(mod, "active_r", None)
+        if active_rank is None:
+            return lora_A, lora_B, float(mod.scaling)
+
+        active_rank = int(active_rank)
+        if active_rank <= 0:
+            raise ValueError(f"Active LoRA rank must be positive, got {active_rank}")
+        if active_rank > lora_A.shape[-1] or active_rank > lora_B.shape[1]:
+            raise ValueError(
+                f"Active LoRA rank {active_rank} exceeds available MoE LoRA slices: "
+                f"A={tuple(lora_A.shape)}, B={tuple(lora_B.shape)}"
+            )
+
+        scaling_fn = getattr(mod, "_active_scaling", None)
+        scaling = float(scaling_fn()) if callable(scaling_fn) else float(mod.scaling)
+        return lora_A[..., :active_rank], lora_B[:, :active_rank, ...], scaling
+
+    @classmethod
+    def _compute_moe_lora_delta(
+        cls,
+        mod: MoEExpertsLoRA | QLoRAMoeExperts,
+        lora_A: torch.Tensor,
+        lora_B: torch.Tensor,
+        *,
+        expert_idx: int,
+    ) -> torch.Tensor:
+        """Compute one expert's active LoRA delta in GKN format."""
+        active_lora_A, active_lora_B, scaling = cls._moe_runtime_lora_views(mod, lora_A, lora_B)
+        a_idx = min(expert_idx, active_lora_A.shape[0] - 1)
+        b_idx = min(expert_idx, active_lora_B.shape[0] - 1)
+        return (active_lora_A[a_idx] @ active_lora_B[b_idx]) * scaling
+
     # ========================================================================
     # Main entry point
     # ========================================================================
@@ -2004,9 +2043,7 @@ class WeightSyncHandler:
                 local_merged = []
                 for i in range(E_local):
                     base_w = mod.dequantize_expert(proj_name, i, K, N)
-                    a_idx = min(i, lora_A.shape[0] - 1)
-                    b_idx = min(i, lora_B.shape[0] - 1)
-                    delta = (lora_A[a_idx] @ lora_B[b_idx]) * mod.scaling
+                    delta = self._compute_moe_lora_delta(mod, lora_A, lora_B, expert_idx=i)
                     merged = base_w.to(torch.bfloat16) + delta.to(torch.bfloat16)
                     local_merged.append(merged.t().contiguous())  # [N, K]
                     del base_w, delta, merged
@@ -2149,9 +2186,7 @@ class WeightSyncHandler:
                 base_w = mod.dequantize_expert(proj_name, expert_idx, K, N)  # [K, N]
 
                 # Per-expert LoRA delta: A[i] @ B[i] * scaling → [K, N]
-                a_idx = min(expert_idx, lora_A.shape[0] - 1)
-                b_idx = min(expert_idx, lora_B.shape[0] - 1)
-                delta = (lora_A[a_idx] @ lora_B[b_idx]) * mod.scaling  # [K, N]
+                delta = self._compute_moe_lora_delta(mod, lora_A, lora_B, expert_idx=expert_idx)  # [K, N]
 
                 merged = base_w.to(torch.bfloat16) + delta.to(torch.bfloat16)
                 del base_w, delta
@@ -2302,9 +2337,7 @@ class WeightSyncHandler:
             lora_B = lora_params[f"{hf_proj}_lora_B"]
             for expert_idx in range(E):
                 base_w = mod.dequantize_expert(proj_name, expert_idx, K, N)
-                a_idx = min(expert_idx, lora_A.shape[0] - 1)
-                b_idx = min(expert_idx, lora_B.shape[0] - 1)
-                delta = (lora_A[a_idx] @ lora_B[b_idx]) * mod.scaling
+                delta = self._compute_moe_lora_delta(mod, lora_A, lora_B, expert_idx=expert_idx)
                 merged = (base_w.to(torch.bfloat16) + delta.to(torch.bfloat16)).t().contiguous()
                 del base_w, delta
                 hf_name = f"{full_prefix}.{expert_idx}.{hf_proj}.weight"

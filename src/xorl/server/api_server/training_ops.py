@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastapi import HTTPException, status
 
@@ -50,6 +50,25 @@ def _sanitize_nan_to_zero(data):
 
 class TrainingOpsMixin:
     """Mixin for two-phase async pattern and core training operations."""
+
+    def _session_default_learning_rate(self, model_id: str) -> Optional[float]:
+        """Return the registered session's default optimizer learning rate, if any."""
+        model_configs = getattr(self, "model_configs", {})
+        model_config = model_configs.get(model_id) or {}
+        optimizer_config = model_config.get("optimizer_config") or {}
+        if isinstance(optimizer_config, dict):
+            learning_rate = optimizer_config.get("learning_rate", optimizer_config.get("lr"))
+            if learning_rate is not None:
+                return float(learning_rate)
+        return None
+
+    def _server_default_learning_rate(self) -> Optional[float]:
+        """Return the server train-config learning rate for full-weight sessions."""
+        train_config = getattr(self, "train_config", {}) or {}
+        if not isinstance(train_config, dict):
+            return None
+        learning_rate = train_config.get("learning_rate", train_config.get("lr"))
+        return float(learning_rate) if learning_rate is not None else None
 
     # =========================================================================
     # Two-Phase Request Pattern Methods
@@ -361,7 +380,7 @@ class TrainingOpsMixin:
                 loss_fn_output_type=loss_fn_output_type,
                 loss_fn_outputs=loss_fn_outputs,
                 metrics=metrics,
-                info={},
+                info=self._build_info(result),
             )
 
         except HTTPException:
@@ -387,19 +406,39 @@ class TrainingOpsMixin:
         self._require_engine()
 
         try:
+            adam_params = request.adam_params
+            lr = request.learning_rate
+            if lr is None and adam_params is not None:
+                lr = adam_params.learning_rate
+            if lr is None:
+                lr = self._session_default_learning_rate(request.model_id)
+            if lr is None:
+                lr = self._server_default_learning_rate()
+            if lr is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        "optim_step: no learning_rate in request, no default optimizer_config "
+                        f"registered for model_id={request.model_id!r}, and no server train_config lr"
+                    ),
+                )
+
             # Determine gradient clipping value
             # Priority: explicit gradient_clip parameter, then adam_params.grad_clip_norm
             gradient_clip = request.gradient_clip
-            if gradient_clip is None and request.adam_params.grad_clip_norm > 0:
-                gradient_clip = request.adam_params.grad_clip_norm
+            if gradient_clip is None and adam_params is not None and adam_params.grad_clip_norm > 0:
+                gradient_clip = adam_params.grad_clip_norm
 
             # Create engine request
             # Pass seq_id and model_id for request ordering (SeqIdAwareFIFOPolicy)
             engine_request = OrchestratorRequest(
                 operation="optim_step",
                 payload=OptimStepData(
-                    lr=request.adam_params.learning_rate,
+                    lr=lr,
                     gradient_clip=gradient_clip,
+                    beta1=adam_params.beta1 if adam_params is not None else None,
+                    beta2=adam_params.beta2 if adam_params is not None else None,
+                    eps=adam_params.eps if adam_params is not None else None,
                     model_id=request.model_id,
                 ),
                 seq_id=request.seq_id,
@@ -435,11 +474,12 @@ class TrainingOpsMixin:
             )
 
             grad_norm = _sanitize_nan_to_zero(result.get("grad_norm", 0.0))
+            response_learning_rate = result.get("learning_rate", result.get("lr", lr))
 
             return OptimStepResponse(
                 metrics={
                     "grad_norm": grad_norm,
-                    "learning_rate": result.get("lr", request.adam_params.learning_rate),
+                    "learning_rate": response_learning_rate,
                 },
                 info=info,
             )

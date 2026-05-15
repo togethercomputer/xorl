@@ -11,6 +11,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional
 
+import torch
 import yaml
 
 from xorl.ops.loss import CrossEntropyMode
@@ -143,6 +144,11 @@ class ServerArguments:
         default=False, metadata={"help": "Explicitly cast Q/K to bfloat16 after RoPE for SGLang alignment."}
     )
 
+    flash_attention_deterministic: bool = field(
+        default=False,
+        metadata={"help": "Request FlashAttention deterministic backward kernels when available."},
+    )
+
     # Multimodal model configuration
     foundation: Dict[str, str] = field(default_factory=dict, metadata={"help": "Foundation model extra config"})
 
@@ -206,6 +212,8 @@ class ServerArguments:
 
     seed: int = field(default=42, metadata={"help": "Random seed for reproducibility"})
 
+    enable_full_determinism: bool = field(default=False, metadata={"help": "Enable full deterministic execution."})
+
     enable_mixed_precision: bool = field(default=True, metadata={"help": "Enable mixed precision training"})
 
     enable_gradient_checkpointing: bool = field(default=True, metadata={"help": "Enable gradient checkpointing"})
@@ -213,6 +221,16 @@ class ServerArguments:
     enable_full_shard: bool = field(default=True, metadata={"help": "Enable full parameter sharding (FSDP)"})
 
     enable_activation_offload: bool = field(default=False, metadata={"help": "Enable activation CPU offloading"})
+
+    activation_gpu_limit: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "When enabling activation offload, the number of GB of activations allowed to remain on GPU. "
+                "Defaults to 0.0, which offloads all eligible activations."
+            )
+        },
+    )
 
     enable_compile: bool = field(default=False, metadata={"help": "Enable torch.compile for model forward pass"})
 
@@ -255,6 +273,16 @@ class ServerArguments:
             "'distsignsgd' signs gradients before FSDP2 reduction; 'muon' uses "
             "Newton-Schulz orthogonalization for 2D+ weight matrices."
         },
+    )
+
+    lr: float = field(
+        default=1e-5,
+        metadata={"help": "Default learning rate for the server's implicit/default training session."},
+    )
+
+    weight_decay: float = field(
+        default=0.01,
+        metadata={"help": "Default weight decay for the server's implicit/default training session."},
     )
 
     optimizer_dtype: Literal["fp32", "bf16"] = field(
@@ -478,6 +506,14 @@ class ServerArguments:
 
     lora_rank: int = field(default=32, metadata={"help": "LoRA rank (r parameter)"})
 
+    max_lora_rank: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Maximum LoRA rank allocated in the server model substrate. Defaults to lora_rank. "
+            "Per-session ranks must be <= max_lora_rank."
+        },
+    )
+
     lora_alpha: int = field(default=16, metadata={"help": "LoRA alpha scaling parameter"})
 
     lora_target_modules: Optional[List[str]] = field(
@@ -523,6 +559,13 @@ class ServerArguments:
     reset_optimizer_on_merge: bool = field(
         default=False, metadata={"help": "ReLoRA-style partial optimizer reset after each LoRA merge"}
     )
+    adapter_state_load_mode: Literal["all_ranks", "rank0_broadcast"] = field(
+        default="all_ranks",
+        metadata={
+            "help": "How to restore multi-adapter LoRA checkpoints. 'all_ranks': each rank loads adapter state locally. "
+            "'rank0_broadcast': rank 0 loads once and broadcasts weights, metadata, and optimizer state."
+        },
+    )
 
     # ========================================================================
     # MoE Training Configuration
@@ -543,6 +586,36 @@ class ServerArguments:
             "registered param memory; requires --enable-rdma-weight-updates on the SGLang side)"
         },
     )
+
+    @property
+    def optimizer_kwargs(self) -> Dict[str, Any]:
+        """Collect optimizer-specific kwargs for build_optimizer."""
+        kwargs: Dict[str, Any] = {}
+        if self.optimizer == "muon":
+            kwargs["muon_lr"] = self.muon_lr
+            kwargs["muon_momentum"] = self.muon_momentum
+            kwargs["muon_nesterov"] = self.muon_nesterov
+            kwargs["muon_ns_steps"] = self.muon_ns_steps
+            kwargs["muon_adjust_lr_fn"] = self.muon_adjust_lr_fn
+            kwargs["muon_ns_algorithm"] = self.muon_ns_algorithm
+            kwargs["muon_ns_use_quack_kernels"] = self.muon_ns_use_quack_kernels
+            kwargs["muon_gram_ns_num_restarts"] = self.muon_gram_ns_num_restarts
+            kwargs["muon_gram_ns_restart_iterations"] = self.muon_gram_ns_restart_iterations
+            if self.optimizer_dtype == "bf16":
+                kwargs["muon_momentum_dtype"] = torch.bfloat16
+            if self.muon_grad_dtype == "bf16":
+                kwargs["muon_grad_dtype"] = torch.bfloat16
+            elif self.muon_grad_dtype == "fp32":
+                kwargs["muon_grad_dtype"] = torch.float32
+            if self.muon_update_dtype == "bf16":
+                kwargs["muon_update_dtype"] = torch.bfloat16
+            elif self.muon_update_dtype == "fp32":
+                kwargs["muon_update_dtype"] = torch.float32
+            if self.muon_force_momentum_path:
+                kwargs["muon_force_momentum_path"] = True
+            if self.muon_distributed_mode != "shard_local":
+                kwargs["muon_distributed_mode"] = self.muon_distributed_mode
+        return kwargs
 
     def __post_init__(self):
         """Validate and set defaults."""
@@ -566,6 +639,25 @@ class ServerArguments:
             # If worker_bind_host/port are explicitly configured via YAML,
             # the launcher can still use them via engine_connect_host + worker_bind_port
             pass
+
+        if self.adapter_state_load_mode not in {"all_ranks", "rank0_broadcast"}:
+            raise ValueError(
+                "adapter_state_load_mode must be 'all_ranks' or 'rank0_broadcast', "
+                f"got {self.adapter_state_load_mode!r}"
+            )
+        if self.enable_lora and self.pipeline_parallel_size > 1:
+            raise ValueError(
+                "pipeline_parallel_size > 1 is not supported with multi-adapter LoRA server training. "
+                "Adapter coordination currently assumes identical local LoRA layouts on every rank."
+            )
+        if self.enable_lora and self.merge_lora_interval > 0:
+            raise ValueError("merge_lora_interval is not supported with multi-adapter LoRA server training")
+        if self.max_lora_rank is None:
+            self.max_lora_rank = self.lora_rank
+        if self.max_lora_rank < self.lora_rank:
+            raise ValueError(
+                f"max_lora_rank ({self.max_lora_rank}) must be >= lora_rank ({self.lora_rank}) for the default session"
+            )
 
         if self.load_weights_mode not in {"grouped", "all_ranks", "skip"}:
             raise ValueError(
@@ -610,10 +702,12 @@ class ServerArguments:
                 "activation_native": self.activation_native,
                 "rope_native": self.rope_native,
                 "attention_cast_bf16": self.attention_cast_bf16,
+                "flash_attention_deterministic": self.flash_attention_deterministic,
             },
             "train": {
                 "output_dir": self.output_dir,
                 "seed": self.seed,
+                "enable_full_determinism": self.enable_full_determinism,
                 "data_parallel_mode": self.data_parallel_mode,
                 "ulysses_parallel_size": self.ulysses_parallel_size,
                 "expert_parallel_size": self.expert_parallel_size,
@@ -626,6 +720,7 @@ class ServerArguments:
                 "enable_gradient_checkpointing": self.enable_gradient_checkpointing,
                 "enable_full_shard": self.enable_full_shard,
                 "enable_activation_offload": self.enable_activation_offload,
+                "activation_gpu_limit": self.activation_gpu_limit,
                 "enable_compile": self.enable_compile,
                 "enable_reentrant": self.enable_reentrant,
                 "enable_forward_prefetch": self.enable_forward_prefetch,
@@ -634,6 +729,8 @@ class ServerArguments:
                 "init_device": self.init_device,
                 "ce_mode": self.ce_mode,
                 "optimizer": self.optimizer,
+                "lr": self.lr,
+                "weight_decay": self.weight_decay,
                 "optimizer_dtype": self.optimizer_dtype,
                 "cautious_weight_decay": self.cautious_weight_decay,
                 "muon_lr": self.muon_lr,
@@ -650,6 +747,7 @@ class ServerArguments:
                 "muon_force_momentum_path": self.muon_force_momentum_path,
                 "muon_distributed_mode": self.muon_distributed_mode,
                 "moe_grad_reduce_mode": self.moe_grad_reduce_mode,
+                "optimizer_kwargs": self.optimizer_kwargs,
                 "load_checkpoint_path": self.load_checkpoint_path,
                 "ckpt_manager": self.ckpt_manager,
                 "enable_self_test": self.enable_self_test,
@@ -669,6 +767,7 @@ class ServerArguments:
             "lora": {
                 "enable_lora": self.enable_lora,
                 "lora_rank": self.lora_rank,
+                "max_lora_rank": self.max_lora_rank,
                 "lora_alpha": self.lora_alpha,
                 "lora_target_modules": self.lora_target_modules,
                 "moe_hybrid_shared_lora": self.moe_hybrid_shared_lora,
@@ -679,6 +778,7 @@ class ServerArguments:
                 "exclude_modules": self.qlora_exclude_modules,
                 "merge_lora_interval": self.merge_lora_interval,
                 "reset_optimizer_on_merge": self.reset_optimizer_on_merge,
+                "adapter_state_load_mode": self.adapter_state_load_mode,
             },
         }
         return config

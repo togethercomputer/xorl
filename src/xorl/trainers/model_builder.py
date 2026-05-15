@@ -149,6 +149,7 @@ def build_training_model(
     activation_native: bool = False,
     rope_native: bool = False,
     attention_cast_bf16: bool = False,
+    flash_attention_deterministic: bool = False,
 ) -> TrainingModelResult:
     """Build, inject LoRA/QLoRA, and parallelize a training model.
 
@@ -190,6 +191,7 @@ def build_training_model(
         activation_native=activation_native,
         rope_native=rope_native,
         attention_cast_bf16=attention_cast_bf16,
+        flash_attention_deterministic=flash_attention_deterministic,
         init_device=init_device,
     )
 

@@ -79,6 +79,8 @@ class QLoRALinear(LoraModule, nn.Module):
         # LoRA parameters (trainable, fp32)
         self.r = r
         self.lora_alpha = lora_alpha
+        self.active_r = r
+        self.active_lora_alpha = lora_alpha
         self.scaling = lora_alpha / r
         self.lora_A = nn.Parameter(torch.empty(r, in_features, dtype=torch.float32, device=device))
         self.lora_B = nn.Parameter(torch.empty(out_features, r, dtype=torch.float32, device=device))
@@ -103,6 +105,16 @@ class QLoRALinear(LoraModule, nn.Module):
     def reset_lora_parameters(self) -> None:
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
+
+    def set_runtime_lora_config(self, lora_rank: int, lora_alpha: int) -> None:
+        """Update the active LoRA slice used during forward/merge/export."""
+        if lora_rank <= 0 or lora_rank > self.r:
+            raise ValueError(f"Active LoRA rank must be in [1, {self.r}], got {lora_rank}")
+        self.active_r = lora_rank
+        self.active_lora_alpha = lora_alpha
+
+    def _active_scaling(self) -> float:
+        return self.active_lora_alpha / self.active_r
 
     # ------------------------------------------------------------------
     # Construction: dispatch to subclass based on quant_format
@@ -364,7 +376,9 @@ class QLoRALinear(LoraModule, nn.Module):
         result = F.linear(x, w, self.bias)
 
         x_lora = x.to(self.lora_A.dtype)
-        lora_out = F.linear(F.linear(x_lora, self.lora_A), self.lora_B) * self.scaling
+        lora_A = self.lora_A[: self.active_r]
+        lora_B = self.lora_B[:, : self.active_r]
+        lora_out = F.linear(F.linear(x_lora, lora_A), lora_B) * self._active_scaling()
 
         return result + lora_out.to(result.dtype)
 
@@ -379,9 +393,9 @@ class QLoRALinear(LoraModule, nn.Module):
         return t
 
     def get_delta_weight(self) -> Tensor:
-        lora_A = self._to_regular_tensor(self.lora_A)
-        lora_B = self._to_regular_tensor(self.lora_B)
-        return (lora_B @ lora_A) * self.scaling
+        lora_A = self._to_regular_tensor(self.lora_A[: self.active_r])
+        lora_B = self._to_regular_tensor(self.lora_B[:, : self.active_r])
+        return (lora_B @ lora_A) * self._active_scaling()
 
     # ------------------------------------------------------------------
     # Checkpoint utilities

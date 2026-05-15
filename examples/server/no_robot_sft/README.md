@@ -123,7 +123,7 @@ client = service.create_lora_training_client(
 
 # Training step
 result = client.forward_backward(datum_list, loss_fn="cross_entropy").result()
-client.optim_step(xorl_client.AdamParams(learning_rate=1e-4)).result()
+client.optim_step(learning_rate=1e-4).result()
 
 # Save checkpoint
 client.save_state("/path/to/checkpoint")
@@ -142,7 +142,7 @@ client.save_state("/path/to/checkpoint")
 |----------|-------------|
 | `forward_backward(data)` | Forward + backward pass, accumulates gradients |
 | `forward(data)` | Forward-only pass (validation, no gradients) |
-| `optim_step(params)` | Apply accumulated gradients with optimizer |
+| `optim_step(learning_rate=...)` | Apply accumulated gradients with the session's configured optimizer |
 | `save_state(path)` | Save full training state (model + optimizer) |
 | `save_lora(path)` | Save LoRA adapter weights only |
 | `load_state(path)` | Load training state |

@@ -1,20 +1,22 @@
 """Tests for MoE experts with LoRA across all backends (eager, triton, native, quack)."""
 
+from dataclasses import make_dataclass
+from unittest.mock import MagicMock, patch
+
 import pytest
-
-from xorl.lora import LoraLinear, inject_lora_into_model
-
-
-pytestmark = [pytest.mark.cpu, pytest.mark.gpu]
 import torch
 import torch.nn as nn
 
+from xorl.lora import LoraLinear, inject_lora_into_model
 from xorl.lora.mapping import can_apply_lora, get_lora_class_for_module
 from xorl.models.layers.moe import MOE_EXPERT_BACKENDS, MoEBlock, MoEExperts, MoEExpertsLoRA, MoELoRAConfig
 from xorl.models.transformers.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeSparseExperts,
     Qwen3MoeTritonExperts,
 )
+
+
+pytestmark = [pytest.mark.cpu, pytest.mark.gpu]
 
 
 class MockConfig:
@@ -161,6 +163,25 @@ class TestMoEExpertsLoRAInit:
         repr_str = experts.extra_repr()
         assert f"num_experts={config.num_experts}" in repr_str
         assert f"r={lora_config.r}" in repr_str
+
+    def test_runtime_rank_lora_views_are_contiguous(self):
+        """Partial-rank views passed to group GEMM backends must be contiguous."""
+        config = MockConfig()
+        experts = MoEExpertsLoRA(
+            num_experts=config.num_experts,
+            hidden_dim=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            lora_config=MoELoRAConfig(r=8, lora_alpha=16),
+        )
+
+        experts.set_runtime_lora_config(lora_rank=3, lora_alpha=12)
+
+        for proj_name in ("gate_proj", "up_proj", "down_proj"):
+            lora_A, lora_B = experts._active_lora_views(proj_name)
+            assert lora_A.shape[-1] == 3
+            assert lora_B.shape[1] == 3
+            assert lora_A.is_contiguous()
+            assert lora_B.is_contiguous()
 
 
 # ---------------------------------------------------------------------------
@@ -707,9 +728,6 @@ class TestEPLoRARouterScores:
 
         Returns (final_output, expert_output_passed_to_combine).
         """
-        from dataclasses import make_dataclass
-        from unittest.mock import MagicMock, patch
-
         if compute_output is None:
             compute_output = torch.randn(self.NUM_TOKENS, self.HIDDEN_DIM)
 
@@ -785,9 +803,6 @@ class TestEPLoRARouterScores:
 
     def test_gradient_flows_through_scores(self):
         """Gradients from the score multiplication reach LoRA parameters."""
-        from dataclasses import make_dataclass
-        from unittest.mock import MagicMock, patch
-
         experts = self._make_experts()
         compute_output = torch.randn(self.NUM_TOKENS, self.HIDDEN_DIM, requires_grad=True)
         scores = torch.rand(self.NUM_TOKENS, requires_grad=True)

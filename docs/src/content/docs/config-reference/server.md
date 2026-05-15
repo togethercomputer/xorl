@@ -170,6 +170,7 @@ ZMQ communication between the launcher, workers, and API server.
 | `qlora_exclude_modules` | `null` | Modules to exclude from quantization (e.g., `[lm_head]`). |
 | `merge_lora_interval` | `0` | Merge LoRA into base weights every N steps. `0` = never. |
 | `reset_optimizer_on_merge` | `false` | ReLoRA optimizer reset after merge. |
+| `adapter_state_load_mode` | `all_ranks` | How to restore multi-adapter checkpoints: `all_ranks` loads on every rank; `rank0_broadcast` loads on rank 0 and broadcasts weights, metadata, and optimizer state. |
 
 ---
 

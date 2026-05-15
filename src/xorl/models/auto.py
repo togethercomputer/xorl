@@ -182,6 +182,7 @@ def build_foundation_model(
     activation_native: bool = False,
     rope_native: bool = False,
     attention_cast_bf16: bool = False,
+    flash_attention_deterministic: bool = False,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
 ) -> nn.Module:
@@ -227,6 +228,7 @@ def build_foundation_model(
     config._activation_native = activation_native
     config._rope_native = rope_native
     config._attention_cast_bf16 = attention_cast_bf16
+    config._flash_attention_deterministic = flash_attention_deterministic
 
     if ep_dispatch == "deepep":
         logger.info_rank0(

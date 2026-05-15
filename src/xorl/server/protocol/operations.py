@@ -118,6 +118,15 @@ class RegisterAdapterData:
 
 
 @dataclass
+class RegisterSessionData:
+    """Payload for register_session operations."""
+
+    model_id: str = "default"
+    session_spec: Dict[str, Any] = field(default_factory=dict)
+    materialize: bool = False
+
+
+@dataclass
 class AdapterStateData:
     """Payload for save_adapter_state / load_adapter_state operations."""
 
@@ -164,6 +173,7 @@ OperationPayload = Union[
     SaveFullWeightsData,
     SyncWeightsData,
     RegisterAdapterData,
+    RegisterSessionData,
     AdapterStateData,
     KillSessionData,
     AbortData,
@@ -182,6 +192,7 @@ _PAYLOAD_TYPE_MAP: Dict[str, type] = {
     "save_full_weights": SaveFullWeightsData,
     "sync_inference_weights": SyncWeightsData,
     "register_adapter": RegisterAdapterData,
+    "register_session": RegisterSessionData,
     "save_adapter_state": AdapterStateData,
     "load_adapter_state": AdapterStateData,
     "kill_session": KillSessionData,

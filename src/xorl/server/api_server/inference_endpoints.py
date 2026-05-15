@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import httpx
+import requests
 from fastapi import HTTPException, status
 from huggingface_hub import hf_hub_download
 
@@ -30,6 +31,7 @@ from xorl.server.api_server.api_types import (
     SyncInferenceWeightsRequest,
     SyncInferenceWeightsResponse,
 )
+from xorl.server.api_server.utils import validate_model_id
 from xorl.server.protocol.api_orchestrator import OrchestratorRequest
 from xorl.server.protocol.operations import SyncWeightsData
 
@@ -39,6 +41,12 @@ logger = logging.getLogger(__name__)
 
 class InferenceEndpointsMixin:
     """Mixin for inference endpoints, LoRA adapter management, and sampling sessions."""
+
+    @staticmethod
+    def _endpoint_worker_url(endpoint: InferenceEndpoint) -> str:
+        """Return the inference worker URL used for LoRA adapter management."""
+        worker_port = endpoint.worker_port if endpoint.worker_port is not None else endpoint.port
+        return f"http://{endpoint.host}:{worker_port}"
 
     @staticmethod
     async def _check_endpoint_health(client: httpx.AsyncClient, endpoint_url: str, endpoint_name: str) -> bool:
@@ -190,6 +198,8 @@ class InferenceEndpointsMixin:
             Response indicating success/failure and endpoint info
         """
         endpoint_url = f"http://{request.host}:{request.port}"
+        worker_port = request.worker_port if request.worker_port is not None else request.port
+        worker_url = f"http://{request.host}:{worker_port}"
 
         # Check if endpoint already exists
         for existing in self.inference_endpoints:
@@ -200,21 +210,27 @@ class InferenceEndpointsMixin:
                     endpoint=existing,
                 )
 
+        # Health check both SGLang server and inference worker
         # Try multiple health check endpoints - SGLang may not have /health
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                if not await self._check_endpoint_health(client, endpoint_url, "Inference endpoint"):
+                if not await self._check_endpoint_health(client, endpoint_url, "SGLang server"):
                     raise Exception(f"All health endpoints failed for {endpoint_url}")
+
+                if worker_url != endpoint_url and not await self._check_endpoint_health(
+                    client, worker_url, "Inference worker"
+                ):
+                    raise Exception(f"All health endpoints failed for {worker_url}")
 
                 is_healthy = True
         except Exception as e:
-            logger.warning(f"Health check failed for {endpoint_url}: {e}")
+            logger.warning(f"Health check failed for {endpoint_url} or {worker_url}: {e}")
             is_healthy = False
 
         if not is_healthy:
             return AddInferenceEndpointResponse(
                 success=False,
-                message=f"Health check failed for inference endpoint {endpoint_url}",
+                message=f"Health check failed for SGLang server {endpoint_url} or inference worker {worker_url}",
                 endpoint=None,
             )
 
@@ -295,6 +311,7 @@ class InferenceEndpointsMixin:
         endpoint = InferenceEndpoint(
             host=request.host,
             port=request.port,
+            worker_port=worker_port,
             world_size=world_size,
             healthy=is_healthy,
             server_info=server_info,
@@ -325,7 +342,7 @@ class InferenceEndpointsMixin:
                             {
                                 "host": request.host,
                                 "port": request.port,
-                                "world_size": request.world_size,
+                                "world_size": world_size,
                             }
                         ],
                         master_address=master_address,
@@ -435,6 +452,9 @@ class InferenceEndpointsMixin:
         for i, endpoint in enumerate(self.inference_endpoints):
             if endpoint.host == request.host and endpoint.port == request.port:
                 self.inference_endpoints.pop(i)
+                if not self.inference_endpoints and self.loaded_sampling_loras:
+                    self.loaded_sampling_loras.clear()
+                    logger.info("Cleared tracked sampling adapters after removing the last inference endpoint")
                 logger.info(f"Removed inference endpoint: {endpoint_url}")
                 return RemoveInferenceEndpointResponse(
                     success=True,
@@ -483,13 +503,7 @@ class InferenceEndpointsMixin:
                 key = (ep.host, ep.port)
                 if key not in seen:
                     seen.add(key)
-                    endpoints_data.append(
-                        {
-                            "host": ep.host,
-                            "port": ep.port,
-                            "world_size": ep.world_size,
-                        }
-                    )
+                    endpoints_data.append({"host": ep.host, "port": ep.port, "world_size": ep.world_size})
 
             # Auto-detect master_address if localhost or empty (for cross-node NCCL)
             master_address = request.master_address
@@ -569,9 +583,9 @@ class InferenceEndpointsMixin:
     # Sampling Session Management (LoRA Adapter Loading)
     # =========================================================================
 
-    def _resolve_model_path(self, model_path: str) -> tuple[str, str]:
+    def _resolve_model_path(self, model_path: str) -> tuple[str | None, str, str]:
         """
-        Resolve model_path to (lora_name, absolute_path).
+        Resolve model_path to (source_model_id, lora_name, absolute_path).
 
         Sampler weights are stored flat under output_dir/sampler_weights/{name}
         without model_id subdirectories, because inference endpoints don't know about model_id.
@@ -585,17 +599,19 @@ class InferenceEndpointsMixin:
             model_path: Path to the LoRA adapter (can be xorl:// URI or relative path)
 
         Returns:
-            Tuple of (lora_name, absolute_path)
+            Tuple of (source_model_id, lora_name, absolute_path)
 
         Raises:
             HTTPException: If path format is invalid or path doesn't exist
         """
+        source_model_id: str | None = None
         if model_path.startswith("xorl://"):
             # Format: xorl://model_id/sampler_weights/adapter_name
             # Parse: remove "xorl://", split by "/", extract adapter name
             parts = model_path[7:].split("/")  # Remove "xorl://"
             if len(parts) >= 3 and parts[1] == "sampler_weights":
                 # xorl://model_id/sampler_weights/adapter_name
+                source_model_id = validate_model_id(parts[0])
                 lora_name = "/".join(parts[2:])  # In case adapter name has /
             else:
                 raise HTTPException(
@@ -619,7 +635,7 @@ class InferenceEndpointsMixin:
                 status_code=status.HTTP_404_NOT_FOUND, detail=f"Model path does not exist: {absolute_path}"
             )
 
-        return lora_name, absolute_path
+        return source_model_id, lora_name, absolute_path
 
     async def _load_lora_on_inference_endpoints(self, lora_name: str, lora_path: str) -> bool:
         """
@@ -642,37 +658,41 @@ class InferenceEndpointsMixin:
             )
 
         async def load_on_endpoint(endpoint: InferenceEndpoint) -> tuple[str, bool, str]:
-            endpoint_url = f"http://{endpoint.host}:{endpoint.port}"
+            endpoint_url = self._endpoint_worker_url(endpoint)
             try:
-                async with httpx.AsyncClient(timeout=300.0) as client:
-                    response = await client.post(
+
+                def do_post() -> requests.Response:
+                    return requests.post(
                         f"{endpoint_url}/load_lora_adapter",
                         json={
                             "lora_name": lora_name,
                             "lora_path": lora_path,
                             "pinned": False,  # Allow eviction for memory management
                         },
+                        headers={"Connection": "close"},
+                        timeout=300.0,
                     )
 
-                    result = response.json()
+                response = await asyncio.to_thread(do_post)
+                result = response.json()
 
-                    if response.status_code == 200 and result.get("success", False):
-                        logger.info(f"Loaded LoRA adapter '{lora_name}' on {endpoint_url}")
-                        return endpoint_url, True, ""
+                if response.status_code == 200 and result.get("success", False):
+                    logger.info(f"Loaded LoRA adapter '{lora_name}' on {endpoint_url}")
+                    return endpoint_url, True, ""
 
-                    # Check for errors
-                    error_msg = result.get("error_message", "")
+                # Check for errors
+                error_msg = result.get("error_message", "")
 
-                    # "already loaded" is not a fatal error - treat it as success
-                    # This can happen when create_sampling_session is called after save_weights_for_sampler
-                    if "already loaded" in error_msg.lower():
-                        logger.warning(f"LoRA adapter '{lora_name}' already loaded on {endpoint_url}, continuing")
-                        return endpoint_url, True, ""
+                # "already loaded" is not a fatal error - treat it as success
+                # This can happen when create_sampling_session is called after save_weights_for_sampler
+                if "already loaded" in error_msg.lower():
+                    logger.warning(f"LoRA adapter '{lora_name}' already loaded on {endpoint_url}, continuing")
+                    return endpoint_url, True, ""
 
-                    if not error_msg:
-                        error_msg = f"HTTP {response.status_code}"
-                    logger.error(f"Failed to load LoRA adapter on {endpoint_url}: {error_msg}")
-                    return endpoint_url, False, error_msg
+                if not error_msg:
+                    error_msg = f"HTTP {response.status_code}"
+                logger.error(f"Failed to load LoRA adapter on {endpoint_url}: {error_msg}")
+                return endpoint_url, False, error_msg
 
             except Exception as e:
                 logger.error(f"Failed to load LoRA adapter on {endpoint_url}: {e}")
@@ -719,23 +739,28 @@ class InferenceEndpointsMixin:
             return True
 
         async def unload_on_endpoint(endpoint: InferenceEndpoint) -> tuple[str, bool, str]:
-            endpoint_url = f"http://{endpoint.host}:{endpoint.port}"
+            endpoint_url = self._endpoint_worker_url(endpoint)
             try:
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    response = await client.post(
+
+                def do_post() -> requests.Response:
+                    return requests.post(
                         f"{endpoint_url}/unload_lora_adapter",
                         json={"lora_name": lora_name},
+                        headers={"Connection": "close"},
+                        timeout=30.0,
                     )
-                    response.raise_for_status()
-                    result = response.json()
 
-                    if result.get("success", False):
-                        logger.info(f"Unloaded LoRA adapter '{lora_name}' from {endpoint_url}")
-                        return endpoint_url, True, ""
-                    else:
-                        error_msg = result.get("error_message", "Unknown error")
-                        logger.warning(f"Failed to unload LoRA adapter from {endpoint_url}: {error_msg}")
-                        return endpoint_url, False, error_msg
+                response = await asyncio.to_thread(do_post)
+                response.raise_for_status()
+                result = response.json()
+
+                if result.get("success", False):
+                    logger.info(f"Unloaded LoRA adapter '{lora_name}' from {endpoint_url}")
+                    return endpoint_url, True, ""
+                else:
+                    error_msg = result.get("error_message", "Unknown error")
+                    logger.warning(f"Failed to unload LoRA adapter from {endpoint_url}: {error_msg}")
+                    return endpoint_url, False, error_msg
 
             except Exception as e:
                 logger.warning(f"Failed to unload LoRA adapter from {endpoint_url}: {e}")
@@ -753,7 +778,7 @@ class InferenceEndpointsMixin:
 
         return True
 
-    async def _get_loaded_adapters_from_endpoint(self, endpoint: "InferenceEndpoint") -> list[str]:
+    async def _get_loaded_adapters_from_endpoint(self, endpoint: "InferenceEndpoint") -> list[str] | None:
         """
         Get list of currently loaded LoRA adapters from an inference endpoint.
 
@@ -761,9 +786,9 @@ class InferenceEndpointsMixin:
             endpoint: The inference endpoint to query
 
         Returns:
-            List of adapter names currently loaded
+            List of adapter names currently loaded, or None if the endpoint could not be queried
         """
-        endpoint_url = f"http://{endpoint.host}:{endpoint.port}"
+        endpoint_url = self._endpoint_worker_url(endpoint)
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.get(f"{endpoint_url}/v1/models")
@@ -778,7 +803,56 @@ class InferenceEndpointsMixin:
                 return adapters
         except Exception as e:
             logger.warning(f"Error getting loaded adapters from {endpoint_url}: {e}")
+            return None
+
+    async def _reconcile_tracked_adapters(self, model_id: str) -> list[set[str]]:
+        """
+        Reconcile tracked adapter state with what inference endpoints actually have loaded.
+
+        This prunes stale tracking entries left behind by endpoint restarts or failed
+        create_sampling_session attempts, while preserving adapters that are still loaded
+        on at least one endpoint and may just need reloading on the others.
+
+        Returns:
+            Per-endpoint sets of currently loaded adapter names.
+        """
+        if not self.inference_endpoints:
             return []
+
+        results = await asyncio.gather(
+            *[self._get_loaded_adapters_from_endpoint(endpoint) for endpoint in self.inference_endpoints],
+            return_exceptions=True,
+        )
+
+        loaded_by_endpoint: list[set[str]] = []
+        unknown_queries = False
+        for result in results:
+            if isinstance(result, Exception):
+                logger.warning(f"Exception while querying loaded adapters: {result}")
+                unknown_queries = True
+                loaded_by_endpoint.append(set())
+            elif result is None:
+                unknown_queries = True
+                loaded_by_endpoint.append(set())
+            else:
+                loaded_by_endpoint.append(set(result))
+
+        loaded_anywhere = set().union(*loaded_by_endpoint) if loaded_by_endpoint else set()
+        tracked = self.loaded_sampling_loras.get(model_id, [])
+        if tracked and not unknown_queries:
+            stale = [name for name, _ in tracked if name not in loaded_anywhere]
+            if stale:
+                self.loaded_sampling_loras[model_id] = [
+                    (name, path) for name, path in tracked if name in loaded_anywhere
+                ]
+                logger.info(f"Pruned {len(stale)} stale tracked adapter(s) for model_id={model_id}: {stale}")
+        elif tracked:
+            logger.info(
+                f"Skipped stale adapter pruning for model_id={model_id} because one or more endpoints "
+                "could not report loaded adapters"
+            )
+
+        return loaded_by_endpoint
 
     async def _unload_all_adapters_from_endpoints(self) -> int:
         """
@@ -835,20 +909,29 @@ class InferenceEndpointsMixin:
         logger.info(f"Unloaded {unloaded} adapter(s) for model_id={model_id}")
         return unloaded
 
-    def _track_adapter(self, lora_name: str, lora_path: str, model_id: str = "default") -> bool:
+    def _track_adapter(
+        self,
+        lora_name: str,
+        lora_path: str,
+        model_id: str = "default",
+        *,
+        add_if_missing: bool = True,
+    ) -> bool:
         """
         Track a loaded adapter in the LRU list.
 
         If the adapter is already tracked, moves it to MRU position.
-        If not tracked, adds it to the tracking list.
+        If not tracked, optionally adds it to the tracking list.
 
         Args:
             lora_name: Name of the LoRA adapter
             lora_path: Path to the adapter files
             model_id: The model/session ID for per-session tracking (default: "default")
+            add_if_missing: When False, only touches existing entries and does not create
+                a new tracking entry.
 
         Returns:
-            True if adapter was already tracked, False if newly added
+            True if adapter was already tracked, False otherwise
         """
 
         # Initialize tracking list if not exists
@@ -862,9 +945,12 @@ class InferenceEndpointsMixin:
             if existing_name == lora_name:
                 # Move to end (most recently used)
                 adapters.remove((existing_name, existing_path))
-                adapters.append((existing_name, existing_path))
+                adapters.append((lora_name, lora_path))
                 logger.info(f"LoRA adapter '{lora_name}' already tracked, moved to MRU")
                 return True
+
+        if not add_if_missing:
+            return False
 
         # Add new adapter to tracking
         adapters.append((lora_name, lora_path))
@@ -888,32 +974,45 @@ class InferenceEndpointsMixin:
             Response with session info
         """
         model_path = request.model_path
-        model_id = getattr(request, "model_id", "default") or "default"
+        requested_model_id = validate_model_id(request.model_id)
         logger.info(f"Creating sampling session for model_path: {model_path}")
 
         # Resolve path and validate
-        lora_name, absolute_path = self._resolve_model_path(model_path)
+        path_model_id, lora_name, absolute_path = self._resolve_model_path(model_path)
+        model_id = path_model_id or requested_model_id
+        logger.info(f"Sampling session will be tracked under model_id={model_id}")
 
-        # Check if already tracked (returns True if already tracked and moves to MRU)
-        already_tracked = self._track_adapter(lora_name, absolute_path, model_id=model_id)
+        loaded_by_endpoint = await self._reconcile_tracked_adapters(model_id)
+        loaded_on_all_endpoints = bool(loaded_by_endpoint) and all(
+            lora_name in loaded_names for loaded_names in loaded_by_endpoint
+        )
 
-        if already_tracked:
-            # Already loaded by save_weights_for_sampler, nothing to do
+        # Touch existing tracking entry if present, but do not create a new entry until we
+        # know the adapter is actually loaded or the load succeeds.
+        already_tracked = self._track_adapter(
+            lora_name,
+            absolute_path,
+            model_id=model_id,
+            add_if_missing=False,
+        )
+
+        if loaded_on_all_endpoints:
+            if not already_tracked:
+                self._track_adapter(lora_name, absolute_path, model_id=model_id)
             logger.info(f"LoRA adapter '{lora_name}' already loaded, skipping duplicate load")
         else:
-            # Need to load - but first check if we need to evict oldest (LRU)
             adapters = self.loaded_sampling_loras.get(model_id, [])
-            if len(adapters) > self.max_adapters_per_model:
-                # We just added one, so if we're over capacity, remove the oldest (index 0)
-                oldest_name, oldest_path = adapters[0]
+            if not already_tracked and len(adapters) >= self.max_adapters_per_model:
+                oldest_name, _oldest_path = adapters[0]
                 logger.info(
                     f"Max LoRA adapters exceeded ({self.max_adapters_per_model}), unloading oldest: {oldest_name}"
                 )
                 await self._unload_lora_on_inference_endpoints(oldest_name)
                 adapters.pop(0)
 
-            # Load on inference endpoints
             await self._load_lora_on_inference_endpoints(lora_name, absolute_path)
+            if not already_tracked:
+                self._track_adapter(lora_name, absolute_path, model_id=model_id)
 
         total_adapters = len(self.loaded_sampling_loras.get(model_id, []))
         logger.info(f"Sampling session created: lora_name={lora_name}, total_adapters={total_adapters}")

@@ -108,6 +108,8 @@ For multi-node setup, server configuration, and launcher CLI options, see [Launc
 
 The [xorl-client](/xorl/server-training/client-sdk/overview/) Python SDK drives the training server — see the [Client SDK page](/xorl/server-training/client-sdk/overview/) for installation, client classes, loss functions, and training loop examples.
 
+Multi-adapter LoRA server training is multi-tenant: each `model_id` owns a session-specific LoRA and optimizer runtime spec, and non-default sessions can be removed with `kill_session`. Full-weight server training remains single-tenant and only supports the reserved `default` session.
+
 ---
 
 ## Tinker API Compatibility

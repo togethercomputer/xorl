@@ -39,7 +39,14 @@ class DummyBackend(Backend):
             raise RuntimeError(f"Simulated failure in {operation} (failure_rate={self.failure_rate})")
 
     async def forward_backward(
-        self, batches, loss_fn="causallm_loss", loss_fn_params=None, model_id=None, routed_experts=None, request_id=None
+        self,
+        batches,
+        loss_fn="causallm_loss",
+        loss_fn_params=None,
+        model_id=None,
+        routed_experts=None,
+        routed_expert_logits=None,
+        request_id=None,
     ):
         self._maybe_fail("forward_backward")
         valid_tokens = sum(len(batch.get("input_ids", [])) for batch in (batches or []))
@@ -49,7 +56,16 @@ class DummyBackend(Backend):
             "num_batches": len(batches or []),
         }
 
-    async def forward(self, batches, loss_fn="causallm_loss", loss_fn_params=None, model_id=None, request_id=None):
+    async def forward(
+        self,
+        batches,
+        loss_fn="causallm_loss",
+        loss_fn_params=None,
+        model_id=None,
+        routed_experts=None,
+        routed_expert_logits=None,
+        request_id=None,
+    ):
         self._maybe_fail("forward")
         valid_tokens = sum(len(batch.get("input_ids", [])) for batch in (batches or []))
         return {
@@ -106,6 +122,14 @@ class DummyBackend(Backend):
             "num_parameters": 0,
             "num_buckets": 0,
             "endpoint_results": [],
+        }
+
+    async def register_session(self, model_id="default", session_spec=None, materialize=False, request_id=None):
+        return {
+            "model_id": model_id,
+            "session_spec": session_spec or {},
+            "materialize": materialize,
+            "registered": True,
         }
 
     async def register_adapter(self, model_id="default", lr=1e-5, request_id=None):

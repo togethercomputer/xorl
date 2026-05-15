@@ -441,6 +441,10 @@ class ModelArguments:
             "'flash_attention_3': FA3 (Hopper). 'flash_attention_4': FA4 CUTE (Hopper+Blackwell)."
         },
     )
+    flash_attention_deterministic: bool = field(
+        default=False,
+        metadata={"help": "Request FlashAttention deterministic backward kernels when available."},
+    )
     moe_implementation: Optional[Literal[None, "eager", "triton", "native", "quack"]] = field(
         default=None,
         metadata={

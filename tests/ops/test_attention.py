@@ -69,6 +69,8 @@ class TestFlashAttentionForward:
         """Warnings, is_causal handling, return values, scaling, sliding window."""
         module = Mock()
         module.is_causal = True
+        module.config = Mock()
+        module.config._flash_attention_deterministic = False
 
         batch, seqlen, num_heads, head_dim = 2, 16, 8, 64
         query = torch.randn(batch, seqlen, num_heads, head_dim)
@@ -148,10 +150,23 @@ class TestFlashAttentionForward:
             )
             assert mock_fa.call_args[1]["window_size"] == (128, 0)
 
+            # Configured deterministic backward flag is forwarded to FA3.
+            module.config._flash_attention_deterministic = True
+            flash_attention_forward(
+                module,
+                query,
+                key,
+                value,
+                attention_mask=None,
+            )
+            assert mock_fa.call_args[1]["deterministic"] is True
+
     def test_varlen_path_with_cu_seqlens(self):
         """cu_seqlens kwargs trigger the varlen path."""
         module = Mock()
         module.is_causal = True
+        module.config = Mock()
+        module.config._flash_attention_deterministic = True
 
         total_tokens, num_heads, head_dim = 32, 8, 64
         query = torch.randn(1, total_tokens, num_heads, head_dim)
@@ -174,6 +189,7 @@ class TestFlashAttentionForward:
             )
             assert mock_varlen.called
             assert mock_varlen.call_args[1]["cu_seqlens_q"].dtype == torch.int32
+            assert mock_varlen.call_args[1]["deterministic"] is True
             assert result.shape == (1, total_tokens, num_heads, head_dim)
 
 

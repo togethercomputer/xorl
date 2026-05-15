@@ -68,6 +68,8 @@ class LoraLinear(LoraModule, nn.Linear):
         # LoRA-specific attributes
         self.r = r
         self.lora_alpha = lora_alpha
+        self.active_r = r
+        self.active_lora_alpha = lora_alpha
         self.scaling = lora_alpha / r
 
         # LoRA weights (trainable, float32 for numerical stability)
@@ -151,6 +153,16 @@ class LoraLinear(LoraModule, nn.Linear):
         # LoRA B: zeros (ensures output starts unchanged)
         nn.init.zeros_(self.lora_B)
 
+    def set_runtime_lora_config(self, lora_rank: int, lora_alpha: int) -> None:
+        """Update the active LoRA slice used during forward/merge/export."""
+        if lora_rank <= 0 or lora_rank > self.r:
+            raise ValueError(f"Active LoRA rank must be in [1, {self.r}], got {lora_rank}")
+        self.active_r = lora_rank
+        self.active_lora_alpha = lora_alpha
+
+    def _active_scaling(self) -> float:
+        return self.active_lora_alpha / self.active_r
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass with LoRA adaptation.
@@ -167,11 +179,13 @@ class LoraLinear(LoraModule, nn.Linear):
         # LoRA path: A -> B -> scale
         # Compute in float32 for numerical stability
         x_lora = x.to(self.lora_A.dtype)
+        lora_A = self.lora_A[: self.active_r]
+        lora_B = self.lora_B[:, : self.active_r]
 
         # x_lora @ lora_A.T @ lora_B.T * scaling
         # = F.linear(F.linear(x_lora, lora_A), lora_B) * scaling
-        lora_out = F.linear(F.linear(x_lora, self.lora_A), self.lora_B)
-        lora_out = lora_out * self.scaling
+        lora_out = F.linear(F.linear(x_lora, lora_A), lora_B)
+        lora_out = lora_out * self._active_scaling()
 
         # Add LoRA output to result (cast back to result dtype)
         return result + lora_out.to(result.dtype)
@@ -183,7 +197,9 @@ class LoraLinear(LoraModule, nn.Linear):
         Returns:
             Delta weight tensor: lora_B @ lora_A * scaling
         """
-        return (self.lora_B @ self.lora_A) * self.scaling
+        lora_A = self.lora_A[: self.active_r]
+        lora_B = self.lora_B[:, : self.active_r]
+        return (lora_B @ lora_A) * self._active_scaling()
 
     def merge_weights(self) -> None:
         """
@@ -195,16 +211,9 @@ class LoraLinear(LoraModule, nn.Linear):
 
         Used both for periodic merge during training (merge_lora_interval)
         and one-shot merge for inference.
-
-        Precision note: we upcast ``weight`` to float32, add the fp32 delta,
-        then cast the sum back — a *single* quantization at the end. This is
-        strictly more faithful than the naive ``weight += delta.to(W.dtype)``
-        (which rounds Δ per element before adding) and matters in precision-
-        sensitive settings like MoE top-k routing on bf16 weights. Same memory
-        as the naive variant — both land in ``self.weight.dtype``.
         """
         with torch.no_grad():
-            delta_weight = self.get_delta_weight()  # fp32
+            delta_weight = self.get_delta_weight()
             merged = self.weight.to(torch.float32) + delta_weight
             self.weight.data.copy_(merged.to(self.weight.dtype))
             self.reset_lora_parameters()
@@ -213,5 +222,6 @@ class LoraLinear(LoraModule, nn.Linear):
         # Extend nn.Linear's extra_repr with LoRA-specific info
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"bias={self.bias is not None}, r={self.r}, lora_alpha={self.lora_alpha}"
+            f"bias={self.bias is not None}, r={self.active_r}, max_r={self.r}, "
+            f"lora_alpha={self.active_lora_alpha}"
         )

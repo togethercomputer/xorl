@@ -4,9 +4,9 @@ Encapsulates ZMQ socket setup, framing, and polling behind clean send/recv APIs.
 All channels deal in raw bytes — serialization is the caller's responsibility.
 
 Channel types:
-- SyncPushChannel: Sync PUSH socket (connect, send)
+- SyncPushChannel: Sync PUSH socket (bind/connect, send)
 - SyncDealerChannel: Sync DEALER socket (connect, poll, recv)
-- AsyncPullChannel: Async PULL socket (bind, poll, recv)
+- AsyncPullChannel: Async PULL socket (bind/connect, poll, recv)
 - AsyncRouterChannel: Async ROUTER socket (bind, identity-routed send/recv)
 - AsyncDealerChannel: Async DEALER socket (connect, send/recv with timeouts)
 """

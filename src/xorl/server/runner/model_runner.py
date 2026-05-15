@@ -17,7 +17,9 @@ import gc
 import logging
 import math
 import os
+import shutil
 import time
+from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -44,6 +46,7 @@ from xorl.optim import build_optimizer
 from xorl.server.runner.adapters import LoRAAdapterManager
 from xorl.server.runner.checkpoint import CheckpointManager
 from xorl.server.runner.utils import MoeMetricsTracker, RoutingReplayHandler, run_self_test, validate_token_ids
+from xorl.server.session_spec import build_default_session_spec
 from xorl.trainers.model_builder import (
     build_training_model,
     resolve_training_model_dtype,
@@ -93,45 +96,72 @@ def configure_rank0_logging(logger_instance, rank):
         logger_instance.addFilter(RankFilter(rank))
 
 
+def _metric_reduce_op(metric_name: str, metric_ops: Optional[Dict[str, str]] = None) -> str:
+    if metric_ops and metric_name in metric_ops:
+        return metric_ops[metric_name]
+    if metric_name in {"ratio_min", "tis_min"}:
+        return "min"
+    if metric_name in {"ratio_max", "tis_max"}:
+        return "max"
+    return "mean"
+
+
 def _sp_allreduce_kl_metrics(
     metrics: Dict[str, Any],
-    metric_ops: Optional[Dict[str, str]],
     sp_group,
+    metric_ops: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
     All-reduce KL/ratio metrics across the sequence-parallel (Ulysses) group.
 
-    With Ulysses SP, each rank sees only a shard of the sequence. Rank 0 often
-    has only prompt tokens (target_tokens=-100), so its KL stats are zeros.
-    Reducing here makes per-mb metrics CP-global before downstream cross-mb /
-    cross-DP accumulation. Means are raw partial sums; min/max use ±inf
-    identity. Nothing is finalized — downstream sum-then-divide still applies.
+    With Ulysses SP, each rank only sees a shard of the sequence. Rank 0 often
+    has only prompt tokens (all target_tokens=-100), so its KL stats are zeros.
+    This function aggregates stats across all SP ranks so every rank (especially
+    rank 0 which reports metrics) sees the correct global values.
+
+    Mean-type metrics are raw partial sums, so they SUM-reduce and remain
+    unfinalized. ``valid_tokens`` SUM-reduces alongside them; downstream
+    accumulation divides mean metrics by the final token count.
     """
-    metric_ops = metric_ops or {}
-    if not metrics:
-        return metrics
+    # Backward-compatible argument order for older tests/call sites:
+    # _sp_allreduce_kl_metrics(metrics, metric_ops, sp_group).
+    if isinstance(sp_group, dict):
+        metric_ops, sp_group = sp_group, metric_ops
 
-    device = torch.device("cuda")
+    device = torch.device(get_device_type())
+    local_n = float(metrics.get("valid_tokens", metrics.get("_n_valid_kl", 0)) or 0)
+    metrics["valid_tokens"] = local_n
 
-    by_op: Dict[str, list[str]] = {"mean": [], "min": [], "max": []}
-    for k in metrics:
-        # valid_tokens is folded into the mean stack — it SUM-reduces too.
-        by_op.setdefault(metric_ops.get(k, "mean"), []).append(k)
+    n_tensor = torch.tensor(local_n, dtype=torch.float64, device=device)
+    dist.all_reduce(n_tensor, op=dist.ReduceOp.SUM, group=sp_group)
+    total_n = n_tensor.item()
 
-    reduced: Dict[str, torch.Tensor] = {}
-    for op_name, keys in by_op.items():
-        if not keys:
+    for key, value in list(metrics.items()):
+        if key in {"valid_tokens", "_n_valid_kl"}:
             continue
-        stacked = torch.stack([torch.as_tensor(metrics[k], dtype=torch.float64, device=device) for k in keys])
-        reduce_op = {"min": dist.ReduceOp.MIN, "max": dist.ReduceOp.MAX}.get(op_name, dist.ReduceOp.SUM)
-        dist.all_reduce(stacked, op=reduce_op, group=sp_group)
-        for i, k in enumerate(keys):
-            reduced[k] = stacked[i]
+        op_name = _metric_reduce_op(key, metric_ops)
+        if op_name == "min":
+            local_value = float(value) if local_n > 0 else float("inf")
+            tensor = torch.tensor(local_value, dtype=torch.float64, device=device)
+            dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=sp_group)
+            reduced = tensor.item()
+            metrics[key] = tensor if math.isfinite(reduced) else torch.tensor(1.0, dtype=torch.float64, device=device)
+        elif op_name == "max":
+            local_value = float(value) if local_n > 0 else float("-inf")
+            tensor = torch.tensor(local_value, dtype=torch.float64, device=device)
+            dist.all_reduce(tensor, op=dist.ReduceOp.MAX, group=sp_group)
+            reduced = tensor.item()
+            metrics[key] = tensor if math.isfinite(reduced) else torch.tensor(1.0, dtype=torch.float64, device=device)
+        else:
+            tensor = torch.as_tensor(value, dtype=torch.float64, device=device).clone()
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=sp_group)
+            metrics[key] = tensor
 
-    metrics.update(reduced)
-    # valid_tokens is a Python int downstream (used as a denominator).
-    if "valid_tokens" in reduced:
-        metrics["valid_tokens"] = int(reduced["valid_tokens"].item())
+    metrics["valid_tokens"] = int(total_n) if float(total_n).is_integer() else total_n
+
+    # Clean up internal key
+    metrics.pop("_n_valid_kl", None)
+
     return metrics
 
 
@@ -192,6 +222,7 @@ class ModelRunner:
         self.model_config = config.get("model", {})
         self.train_config = config.get("train", {})
         self.lora_config = config.get("lora", {})
+        self._validate_multi_adapter_lora_config()
         if self.train_config.get("load_weights_mode") == "skip" and not self.train_config.get("load_checkpoint_path"):
             raise ValueError(
                 "load_weights_mode='skip' skips HF weight loading and requires train.load_checkpoint_path "
@@ -220,6 +251,8 @@ class ModelRunner:
 
         # Multi-adapter support (initialized later if LoRA is enabled)
         self._adapter_manager: Optional[LoRAAdapterManager] = None
+        self._lora_session_specs: Dict[str, Dict[str, Any]] = {}
+        self._default_lora_session_spec: Optional[Dict[str, Any]] = None
         self._checkpoint_mgr: Optional[CheckpointManager] = None
 
         # Single-tenant session tracking (for full-weights training mode)
@@ -235,7 +268,9 @@ class ModelRunner:
 
         # Device setup
         get_torch_device().set_device(f"{get_device_type()}:{local_rank}")
-        helper.set_seed(self.train_config.get("seed", 42), False)
+        seed = self.train_config.get("seed", 42)
+        enable_full_determinism = self.train_config.get("enable_full_determinism", False)
+        helper.set_seed(seed, False)
 
         # Disable TF32 and BF16 reduced-precision accumulation for
         # consistent numerics across parallelism strategies.
@@ -250,6 +285,10 @@ class ModelRunner:
         self._initialize_checkpointer()
         self._checkpoint_mgr = self._build_checkpoint_manager()
         self._load_initial_checkpoint()
+        if enable_full_determinism:
+            # Enabling deterministic algorithms before Kimi DCP/meta materialization
+            # makes startup pathologically slow; training and adapter init happen below.
+            helper.set_seed(seed, True)
         self._initialize_contexts()
 
         # Initialize multi-adapter manager if LoRA is enabled
@@ -259,13 +298,26 @@ class ModelRunner:
             device = torch.device(f"{get_device_type()}:{self.local_rank}")
             # Only rank 0 should save on eviction to avoid multi-rank file conflicts
             self._adapter_manager = LoRAAdapterManager(
-                self.model, device, auto_save_on_eviction=(self.rank == 0), lora_config=self.lora_config
+                self.model,
+                device,
+                checkpoint_dir=self._get_adapter_checkpoint_dir(),
+                auto_save_on_eviction=(self.rank == 0),
+                lora_config=self.lora_config,
+                optimizer_type=self.train_config.get("optimizer", "adamw"),
+                optimizer_dtype=self.train_config.get("optimizer_dtype", "bf16"),
+                optimizer_kwargs=self._get_optimizer_kwargs(),
+                weight_decay=self.train_config.get("weight_decay", 0.01),
             )
-            # Register the "default" adapter with the initial weights and lr
-            self._adapter_manager.register_adapter(
+            self._default_lora_session_spec = build_default_session_spec(
+                base_model=self.model_config.get("model_name") or self.model_config.get("model_path"),
+                train_config=self.train_config,
+                lora_config=self.lora_config,
+            )
+            self.register_session(
                 model_id="default",
-                lr=self.train_config.get("lr", 1e-5),
-                initialize_fresh=False,  # Use current weights as the default adapter
+                session_spec=self._default_lora_session_spec,
+                materialize=True,
+                initialize_fresh=False,
             )
             self._adapter_manager.current_adapter_id = "default"
             self._checkpoint_mgr._adapter_manager = self._adapter_manager
@@ -306,6 +358,81 @@ class ModelRunner:
         """Public access to the adapter manager for multi-tenancy LoRA."""
         return self._adapter_manager
 
+    @property
+    def lora_session_specs(self) -> Dict[str, Dict[str, Any]]:
+        """Return the registered LoRA session specs."""
+        return self._lora_session_specs
+
+    def get_lora_session_spec(self, model_id: str) -> Dict[str, Any]:
+        """Get the normalized LoRA session spec for a model_id."""
+        if model_id not in self._lora_session_specs:
+            raise KeyError(f"LoRA session spec not registered for model_id={model_id}")
+        return deepcopy(self._lora_session_specs[model_id])
+
+    def _sync_registered_lora_session_spec(self, model_id: str) -> None:
+        """Refresh the worker session registry from the live adapter state."""
+        if self._adapter_manager is None or not self._adapter_manager.has_adapter(model_id):
+            return
+        self._lora_session_specs[model_id] = self._adapter_manager.get_adapter_session_spec(model_id)
+
+    def register_session(
+        self,
+        model_id: str,
+        session_spec: Dict[str, Any],
+        *,
+        materialize: bool = False,
+        initialize_fresh: bool = True,
+    ) -> Dict[str, Any]:
+        """Register a normalized session runtime spec on this worker."""
+        if not self.lora_enabled:
+            # Full-weight mode remains effectively single-tenant; keep the API
+            # tolerant of create_model but don't install heterogeneous runtime state.
+            self._validate_single_tenant(model_id)
+            return {
+                "model_id": model_id,
+                "registered": True,
+                "materialized": False,
+                "message": "Full-weight mode ignores per-session LoRA runtime specs.",
+            }
+
+        existing_spec = self._lora_session_specs.get(model_id)
+        if existing_spec is not None and existing_spec != session_spec:
+            raise ValueError(
+                f"Session '{model_id}' is already registered with a different runtime spec. "
+                f"existing={existing_spec!r}, requested={session_spec!r}"
+            )
+
+        self._lora_session_specs[model_id] = deepcopy(session_spec)
+
+        materialized = False
+        if materialize and self._adapter_manager is not None and not self._adapter_manager.has_adapter(model_id):
+            self._adapter_manager.register_adapter(
+                model_id=model_id,
+                session_spec=session_spec,
+                initialize_fresh=initialize_fresh,
+            )
+            materialized = True
+
+        return {
+            "model_id": model_id,
+            "registered": True,
+            "materialized": materialized
+            or (self._adapter_manager is not None and self._adapter_manager.has_adapter(model_id)),
+            "session_spec": deepcopy(self._lora_session_specs[model_id]),
+        }
+
+    def ensure_lora_adapter(self, model_id: str, *, initialize_fresh: bool = True) -> None:
+        """Materialize a registered LoRA session into the resident adapter registry."""
+        if self._adapter_manager is None:
+            raise RuntimeError("Cannot materialize LoRA adapter: adapter manager not initialized")
+        session_spec = self.get_lora_session_spec(model_id)
+        if not self._adapter_manager.has_adapter(model_id):
+            self._adapter_manager.register_adapter(
+                model_id=model_id,
+                session_spec=session_spec,
+                initialize_fresh=initialize_fresh,
+            )
+
     def _check_not_sleeping(self, operation: str) -> None:
         """Raise if the model is in sleep mode (CPU-offloaded)."""
         if self.is_sleeping:
@@ -338,13 +465,10 @@ class ModelRunner:
 
     def kill_session(self, model_id: str, save_checkpoint: bool = True) -> Dict[str, Any]:
         """
-        Kill the active full-weights training session.
-
-        This allows a new session to be started. For LoRA mode, this is a no-op
-        since multi-tenancy is supported.
+        Kill an active training session.
 
         Args:
-            model_id: The session to kill (must match active session).
+            model_id: The session to kill.
             save_checkpoint: Whether to save a checkpoint before killing.
 
         Returns:
@@ -354,10 +478,50 @@ class ModelRunner:
             ValueError: If model_id doesn't match the active session.
         """
         if self.lora_enabled:
+            if model_id == "default":
+                return {
+                    "success": True,
+                    "message": "Default LoRA session is reserved and was not removed.",
+                    "checkpoint_path": None,
+                }
+
+            if model_id not in self._lora_session_specs and (
+                self._adapter_manager is None or not self._adapter_manager.has_adapter(model_id)
+            ):
+                return {
+                    "success": True,
+                    "message": f"No active LoRA session '{model_id}' to kill.",
+                    "checkpoint_path": None,
+                }
+
+            checkpoint_path = None
+            if save_checkpoint and self._adapter_manager is not None:
+                if self._adapter_manager.has_adapter(model_id):
+                    checkpoint_path = os.path.join(
+                        self.train_config.get("output_dir", "outputs"),
+                        "weights",
+                        model_id,
+                        f"session_{model_id}_final",
+                    )
+                    self.save_state(checkpoint_path, save_optimizer=True, model_id=model_id)
+                else:
+                    evicted_path = os.path.join(self._get_adapter_checkpoint_dir(), "evicted", model_id)
+                    if not os.path.exists(evicted_path):
+                        raise FileNotFoundError(
+                            f"Cannot kill LoRA session '{model_id}' with save_checkpoint=True: "
+                            f"adapter is not resident and no evicted checkpoint exists at {evicted_path}."
+                        )
+                    checkpoint_path = self._promote_evicted_adapter_checkpoint(model_id, evicted_path)
+
+            self._accumulated_valid_tokens.pop(model_id, None)
+            if self._adapter_manager is not None and self._adapter_manager.has_adapter(model_id):
+                self._adapter_manager.remove_adapter(model_id)
+            self._lora_session_specs.pop(model_id, None)
+
             return {
                 "success": True,
-                "message": "LoRA mode supports multi-tenancy, no session to kill.",
-                "checkpoint_path": None,
+                "message": f"LoRA session '{model_id}' killed successfully.",
+                "checkpoint_path": checkpoint_path,
             }
 
         if self._active_session_id is None:
@@ -477,7 +641,7 @@ class ModelRunner:
             init_device=self.train_config.get("init_device", "cpu"),
             merge_qkv=self.model_config.get("merge_qkv", True),
             enable_lora=lora_enabled,
-            lora_rank=self.lora_config.get("lora_rank", 32),
+            lora_rank=self.lora_config.get("max_lora_rank", self.lora_config.get("lora_rank", 32)),
             lora_alpha=self.lora_config.get("lora_alpha", 16),
             lora_target_modules=target_modules,
             moe_hybrid_shared_lora=self.lora_config.get("moe_hybrid_shared_lora", False),
@@ -503,6 +667,7 @@ class ModelRunner:
             activation_native=self.model_config.get("activation_native", False),
             rope_native=self.model_config.get("rope_native", False),
             attention_cast_bf16=self.model_config.get("attention_cast_bf16", False),
+            flash_attention_deterministic=self.model_config.get("flash_attention_deterministic", False),
         )
 
         self.model = result.model
@@ -571,33 +736,91 @@ class ModelRunner:
             raise ValueError("At least one of train_mlp, train_attn, or train_unembed must be True")
         return target_modules
 
+    def _validate_multi_adapter_lora_config(self) -> None:
+        """Reject LoRA features that are not supported by the multi-adapter server path."""
+        if self.lora_config.get("enable_lora", False) and self.lora_config.get("merge_lora_interval", 0) > 0:
+            raise ValueError("merge_lora_interval is not supported with multi-adapter LoRA server training")
+        if self.lora_config.get("enable_lora", False) and self.train_config.get("pipeline_parallel_size", 1) > 1:
+            raise ValueError(
+                "pipeline_parallel_size > 1 is not supported with multi-adapter LoRA server training. "
+                "Adapter coordination currently assumes identical local LoRA layouts on every rank."
+            )
+        max_lora_rank = self.lora_config.get("max_lora_rank", self.lora_config.get("lora_rank", 32))
+        default_rank = self.lora_config.get("lora_rank", 32)
+        if max_lora_rank < default_rank:
+            raise ValueError(
+                f"max_lora_rank ({max_lora_rank}) must be >= lora_rank ({default_rank}) for multi-adapter LoRA"
+            )
+
+    def _get_optimizer_kwargs(self) -> Dict[str, Any]:
+        """Collect optimizer kwargs from the server train config."""
+        explicit_kwargs = self.train_config.get("optimizer_kwargs")
+        if explicit_kwargs is not None:
+            return deepcopy(explicit_kwargs)
+
+        optimizer_type = self.train_config.get("optimizer", "adamw")
+        kwargs: Dict[str, Any] = {}
+        if optimizer_type == "muon":
+            for key in (
+                "muon_lr",
+                "muon_momentum",
+                "muon_nesterov",
+                "muon_ns_steps",
+                "muon_adjust_lr_fn",
+                "muon_ns_algorithm",
+                "muon_ns_use_quack_kernels",
+                "muon_gram_ns_num_restarts",
+                "muon_gram_ns_restart_iterations",
+            ):
+                if key in self.train_config:
+                    kwargs[key] = self.train_config[key]
+
+            if self.train_config.get("optimizer_dtype") == "bf16":
+                kwargs["muon_momentum_dtype"] = torch.bfloat16
+
+            grad_dtype = self.train_config.get("muon_grad_dtype")
+            if grad_dtype == "bf16":
+                kwargs["muon_grad_dtype"] = torch.bfloat16
+            elif grad_dtype == "fp32":
+                kwargs["muon_grad_dtype"] = torch.float32
+
+            update_dtype = self.train_config.get("muon_update_dtype")
+            if update_dtype == "bf16":
+                kwargs["muon_update_dtype"] = torch.bfloat16
+            elif update_dtype == "fp32":
+                kwargs["muon_update_dtype"] = torch.float32
+
+            if self.train_config.get("muon_force_momentum_path", False):
+                kwargs["muon_force_momentum_path"] = True
+
+        return kwargs
+
+    def _get_adapter_checkpoint_dir(self) -> str:
+        """Return the shared adapter checkpoint directory under the server output dir."""
+        return os.path.join(self.train_config.get("output_dir", "outputs"), "adapters")
+
+    def _promote_evicted_adapter_checkpoint(self, model_id: str, evicted_path: str) -> str:
+        """Copy an evicted adapter checkpoint into the public weights namespace."""
+        checkpoint_path = os.path.join(
+            self.train_config.get("output_dir", "outputs"),
+            "weights",
+            model_id,
+            f"session_{model_id}_final",
+        )
+        if self.rank == 0:
+            os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+            if os.path.exists(checkpoint_path):
+                shutil.rmtree(checkpoint_path)
+            shutil.copytree(evicted_path, checkpoint_path)
+        return checkpoint_path
+
     def _initialize_optimizer(self):
         """Initialize the optimizer."""
         optimizer_type = self.train_config.get("optimizer", "adamw")
         self._use_distsignsgd = optimizer_type == "distsignsgd"
         if self._use_distsignsgd and self.lora_config.get("enable_lora", False):
             raise NotImplementedError("DistSignSGD does not yet support server LoRA adapter-manager training.")
-        optimizer_kwargs = None
-        if optimizer_type == "muon":
-            optimizer_kwargs = {
-                k: self.train_config[k]
-                for k in (
-                    "muon_lr",
-                    "muon_momentum",
-                    "muon_nesterov",
-                    "muon_ns_steps",
-                    "muon_adjust_lr_fn",
-                    "muon_ns_algorithm",
-                    "muon_ns_use_quack_kernels",
-                    "muon_gram_ns_num_restarts",
-                    "muon_gram_ns_restart_iterations",
-                    "muon_grad_dtype",
-                    "muon_update_dtype",
-                    "muon_force_momentum_path",
-                    "muon_distributed_mode",
-                )
-                if k in self.train_config
-            }
+        optimizer_kwargs = self._get_optimizer_kwargs()
         self.optimizer = build_optimizer(
             self.model,
             lr=self.train_config.get("lr", 1e-5),
@@ -605,7 +828,7 @@ class ModelRunner:
             fused=True,
             optimizer_type=optimizer_type,
             optimizer_dtype=self.train_config.get("optimizer_dtype", "bf16"),
-            optimizer_kwargs=optimizer_kwargs,
+            optimizer_kwargs=optimizer_kwargs or None,
             cautious_weight_decay=self.train_config.get("cautious_weight_decay", False),
         )
 
@@ -657,16 +880,13 @@ class ModelRunner:
         self._checkpoint_mgr.load_state(checkpoint_path, load_optimizer=True)
         self._sync_from_checkpoint_state()
 
-    def register_lora_adapter(self, model_id: str, lr: float) -> Dict[str, Any]:
+    def register_lora_adapter(self, model_id: str, lr: Optional[float]) -> Dict[str, Any]:
         """
-        Register a new LoRA adapter for a training run.
-
-        Creates fresh LoRA weights and optimizer state for the given model_id.
-        If the model_id already has an adapter, it will be replaced.
+        Materialize a registered LoRA session into the adapter manager.
 
         Args:
             model_id: Unique identifier for this training run
-            lr: Learning rate for this adapter
+            lr: Optional learning rate override used for legacy call sites.
 
         Returns:
             Dictionary with registration info
@@ -677,11 +897,22 @@ class ModelRunner:
         if self._adapter_manager is None:
             raise RuntimeError("Cannot register adapter: LoRA is not enabled or adapter manager not initialized")
 
-        self._adapter_manager.register_adapter(
-            model_id=model_id,
-            lr=lr,
-            initialize_fresh=True,
-        )
+        if model_id not in self._lora_session_specs:
+            if model_id == "default" and self._default_lora_session_spec is not None:
+                self._lora_session_specs["default"] = deepcopy(self._default_lora_session_spec)
+            else:
+                raise KeyError(f"LoRA session '{model_id}' is not registered. Call create_model first.")
+
+        if not self._adapter_manager.has_adapter(model_id):
+            session_spec = self.get_lora_session_spec(model_id)
+            if lr is not None:
+                session_spec["optimizer_config"]["learning_rate"] = lr
+            self._adapter_manager.register_adapter(
+                model_id=model_id,
+                session_spec=session_spec,
+                initialize_fresh=True,
+            )
+        self._sync_registered_lora_session_spec(model_id)
 
         return {
             "model_id": model_id,
@@ -690,7 +921,7 @@ class ModelRunner:
             "total_adapters": len(self._adapter_manager.list_adapters()),
         }
 
-    def register_adapter(self, model_id: str, lr: float) -> Dict[str, Any]:
+    def register_adapter(self, model_id: str, lr: Optional[float]) -> Dict[str, Any]:
         """Alias for register_lora_adapter for API consistency."""
         return self.register_lora_adapter(model_id=model_id, lr=lr)
 
@@ -754,82 +985,83 @@ class ModelRunner:
             accumulators["losses"].append(gathered["loss"].cpu())
 
     @staticmethod
-    def _accumulate_is_metrics(accumulated, new_metrics, metric_ops=None):
-        """Accumulate IS metrics across micro-batches.
+    def _metric_to_float(value):
+        """Convert scalar metric values to Python floats before cross-process serialization."""
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                raise ValueError(f"Expected scalar metric tensor, got shape {tuple(value.shape)}")
+            return float(value.detach().cpu().item())
+        return float(value)
 
-        ``metric_ops`` tags non-mean keys; means accumulate by sum (finalized as
-        sum/count in _finalize_is_metrics), min/max by torch.minimum/maximum.
-        Values stay on-device — one collective + one ``.item()`` per metric in
-        _finalize_is_metrics.
-        """
+    @staticmethod
+    def _accumulate_is_metrics(accumulated, new_metrics, metric_ops: Optional[Dict[str, str]] = None):
+        """Accumulate importance sampling metrics across micro-batches."""
         if not new_metrics:
             return
         metric_ops = metric_ops or {}
-        n_tokens = float(new_metrics.get("valid_tokens", 1))
-        for k, v in new_metrics.items():
-            op = metric_ops.get(k, "mean")
-            v_t = torch.as_tensor(v, dtype=torch.float64, device="cuda")
-            if op in ("min", "max"):
-                entry = accumulated.get(k)
-                if entry is None:
-                    accumulated[k] = {"value": v_t.clone(), "op": op}
+        n_tokens = ModelRunner._metric_to_float(new_metrics.get("valid_tokens", 1))
+        for k, raw_v in new_metrics.items():
+            if k == "_n_valid_kl":
+                continue
+            v = ModelRunner._metric_to_float(raw_v)
+            if k not in accumulated:
+                op_name = _metric_reduce_op(k, metric_ops)
+                if op_name == "min":
+                    accumulated[k] = {"op": op_name, "sum": float("inf"), "count": 0}
+                elif op_name == "max":
+                    accumulated[k] = {"op": op_name, "sum": float("-inf"), "count": 0}
                 else:
-                    entry["value"] = (
-                        torch.minimum(entry["value"], v_t) if op == "min" else torch.maximum(entry["value"], v_t)
-                    )
+                    accumulated[k] = {"op": op_name, "sum": 0.0, "count": 0}
+            op_name = accumulated[k].get("op", _metric_reduce_op(k, metric_ops))
+            if k == "valid_tokens":
+                accumulated[k]["sum"] += v
+                accumulated[k]["count"] += 1
+            elif op_name == "min":
+                if n_tokens > 0:
+                    accumulated[k]["sum"] = min(accumulated[k]["sum"], v)
+                    accumulated[k]["count"] += 1
+            elif op_name == "max":
+                if n_tokens > 0:
+                    accumulated[k]["sum"] = max(accumulated[k]["sum"], v)
+                    accumulated[k]["count"] += 1
             else:
-                entry = accumulated.get(k)
-                if entry is None:
-                    accumulated[k] = {
-                        "sum": v_t.clone(),
-                        "count": 1.0 if k == "valid_tokens" else n_tokens,
-                        "op": "mean",
-                    }
-                else:
-                    entry["sum"] = entry["sum"] + v_t
-                    entry["count"] += 1.0 if k == "valid_tokens" else n_tokens
+                accumulated[k]["sum"] += v
+                accumulated[k]["count"] += n_tokens
 
     @staticmethod
     def _finalize_is_metrics(accumulated, result):
-        """All-reduce IS metrics across DP, then write finalized values to result.
-
-        One SUM-allreduce for mean partial-sums concatenated with their counts;
-        one MIN/MAX-allreduce per non-mean group. Min/max with non-finite
-        reductions (every rank empty) fall back to 1.0.
-        """
+        """All-reduce IS metrics across DP group, then add averaged values to result dict."""
         if not accumulated:
             return
         ps = get_parallel_state()
-        dp_group = ps.dp_group if ps.dp_enabled else None
-
-        groups: Dict[str, list[str]] = {"mean": [], "min": [], "max": []}
-        for k, entry in accumulated.items():
-            groups[entry["op"]].append(k)
-
-        if groups["mean"]:
-            keys = groups["mean"]
-            sums = torch.stack([accumulated[k]["sum"] for k in keys])
-            counts = torch.tensor([accumulated[k]["count"] for k in keys], dtype=torch.float64, device="cuda")
-            if dp_group is not None:
-                sums_and_counts = torch.cat([sums, counts])
-                dist.all_reduce(sums_and_counts, op=dist.ReduceOp.SUM, group=dp_group)
-                sums, counts = sums_and_counts[: len(keys)], sums_and_counts[len(keys) :]
-            means = (sums / counts.clamp(min=1.0)).tolist()
-            mask = (counts > 0).tolist()
-            for i, k in enumerate(keys):
-                if mask[i]:
-                    result[f"is_{k}"] = means[i]
-
-        for op_name, reduce_op in (("min", dist.ReduceOp.MIN), ("max", dist.ReduceOp.MAX)):
-            if not groups[op_name]:
-                continue
-            keys = groups[op_name]
-            stacked = torch.stack([accumulated[k]["value"] for k in keys])
-            if dp_group is not None:
-                dist.all_reduce(stacked, op=reduce_op, group=dp_group)
-            values = stacked.tolist()
-            for k, v in zip(keys, values):
-                result[f"is_{k}"] = v if math.isfinite(v) else 1.0
+        device = torch.device(get_device_type())
+        if ps.dp_enabled:
+            dp_group = ps.dp_group
+            for k, v in accumulated.items():
+                op_name = v.get("op", _metric_reduce_op(k))
+                if op_name == "min":
+                    t = torch.tensor(v["sum"] if v["count"] > 0 else float("inf"), dtype=torch.float64, device=device)
+                    dist.all_reduce(t, op=dist.ReduceOp.MIN, group=dp_group)
+                    v["sum"] = t.item()
+                    v["count"] = 1 if math.isfinite(v["sum"]) else 0
+                elif op_name == "max":
+                    t = torch.tensor(v["sum"] if v["count"] > 0 else float("-inf"), dtype=torch.float64, device=device)
+                    dist.all_reduce(t, op=dist.ReduceOp.MAX, group=dp_group)
+                    v["sum"] = t.item()
+                    v["count"] = 1 if math.isfinite(v["sum"]) else 0
+                else:
+                    sum_t = torch.tensor(v["sum"], dtype=torch.float64, device=device)
+                    count_t = torch.tensor(float(v["count"]), dtype=torch.float64, device=device)
+                    dist.all_reduce(sum_t, op=dist.ReduceOp.SUM, group=dp_group)
+                    dist.all_reduce(count_t, op=dist.ReduceOp.SUM, group=dp_group)
+                    v["sum"] = sum_t.item()
+                    v["count"] = count_t.item()
+        for k, v in accumulated.items():
+            op_name = v.get("op", _metric_reduce_op(k))
+            if op_name in {"min", "max"}:
+                result[f"is_{k}"] = v["sum"] if v["count"] > 0 and math.isfinite(v["sum"]) else 1.0
+            elif v["count"] > 0:
+                result[f"is_{k}"] = v["sum"] / v["count"]
 
     def _count_global_valid_tokens(self, micro_batches):
         """Count valid tokens across all micro-batches and all-reduce across DP group.
@@ -850,7 +1082,7 @@ class ModelRunner:
     # =========================================================================
 
     def _compute_micro_batch_loss(self, micro_batch, loss_fn, loss_fn_params):
-        """Compute loss for a single micro-batch. Returns (local_loss_sum, per_token_outputs_dict, is_metrics, metric_ops, model_outputs)."""
+        """Compute loss for a single micro-batch."""
         params = loss_fn_params or {}
         return_per_token = params.get("return_per_token", True)
 
@@ -860,14 +1092,11 @@ class ModelRunner:
         outputs = self.model(**model_inputs, use_cache=False, output_hidden_states=False)
         hidden_states = outputs.last_hidden_state
         effective_weight = self._get_effective_lm_head_weight()
-
-        # scale=1 → loss_fns return raw masked sums; normalization deferred to
-        # optim_step / _finalize_is_metrics.
-        token_sum_reducer = TokenPartial(scale=torch.tensor(1.0))
+        metric_sum_reducer = TokenPartial(scale=hidden_states.new_tensor(1.0, dtype=torch.float32))
 
         per_token_outputs = {}
         is_metrics = None
-        metric_ops = None
+        is_metric_ops = None
 
         if loss_fn in ["causallm_loss", "cross_entropy"]:
             labels = micro_batch.get("labels")
@@ -878,9 +1107,8 @@ class ModelRunner:
                 return_per_token=return_per_token,
                 ce_mode=self.ce_mode,
                 lm_head_fp32=self.lm_head_fp32,
-                loss_reducer=token_sum_reducer,
             )
-            local_loss_sum = _result.loss
+            loss = _result.loss
             if return_per_token:
                 per_token_outputs["logprobs"] = _result.per_token_logprobs
                 per_token_outputs["loss"] = _result.per_token_loss
@@ -900,16 +1128,21 @@ class ModelRunner:
                 ce_mode=self.ce_mode,
                 compute_kl_stats=compute_kl_stats,
                 lm_head_fp32=self.lm_head_fp32,
-                loss_reducer=token_sum_reducer,
-                metric_reducer=token_sum_reducer,
+                metric_reducer=metric_sum_reducer,
             )
-            local_loss_sum = _result.loss
+            loss = _result.loss
             per_token_outputs["logprobs"] = _result.per_token_logprobs
             is_metrics = _result.metrics
-            metric_ops = _result.metric_ops
+            is_metric_ops = _result.metric_ops
+            if is_metrics is not None and "valid_tokens" not in is_metrics:
+                is_metrics["valid_tokens"] = int((target_tokens != IGNORE_INDEX).sum().item())
 
             if compute_kl_stats and get_parallel_state().cp_enabled and is_metrics:
-                is_metrics = _sp_allreduce_kl_metrics(is_metrics, metric_ops, get_parallel_state().ulysses_group)
+                is_metrics = _sp_allreduce_kl_metrics(
+                    is_metrics,
+                    get_parallel_state().ulysses_group,
+                    is_metric_ops,
+                )
 
             # Diagnostic top-k extraction (forward-only feature, rarely used)
             diagnostic_topk = params.get("diagnostic_topk", 0)
@@ -1001,21 +1234,24 @@ class ModelRunner:
                 compute_kl_stats=compute_kl_stats,
                 lm_head_fp32=self.lm_head_fp32,
                 icepop_beta=icepop_beta,
-                loss_reducer=token_sum_reducer,
-                metric_reducer=token_sum_reducer,
+                metric_reducer=metric_sum_reducer,
             )
-            local_loss_sum = _result.loss
+            loss = _result.loss
             per_token_outputs["logprobs"] = _result.per_token_logprobs
             is_metrics = _result.metrics
-            metric_ops = _result.metric_ops
+            is_metric_ops = _result.metric_ops
 
             if compute_kl_stats and get_parallel_state().cp_enabled and is_metrics:
-                is_metrics = _sp_allreduce_kl_metrics(is_metrics, metric_ops, get_parallel_state().ulysses_group)
+                is_metrics = _sp_allreduce_kl_metrics(
+                    is_metrics,
+                    get_parallel_state().ulysses_group,
+                    is_metric_ops,
+                )
 
         else:
             raise ValueError(f"Unknown loss_fn: {loss_fn}")
 
-        return local_loss_sum, per_token_outputs, is_metrics, metric_ops, outputs
+        return loss, per_token_outputs, is_metrics, is_metric_ops, outputs
 
     # =========================================================================
     # Per-sample K3 KL divergence
@@ -1084,10 +1320,11 @@ class ModelRunner:
     ):
         """Core forward (+ optional backward) loop shared between forward and forward_backward."""
         params = loss_fn_params or {}
+        use_distsignsgd = getattr(self, "_use_distsignsgd", False)
 
         # Count valid tokens globally
         global_valid_tokens = self._count_global_valid_tokens(micro_batches)
-        if compute_backward and self._use_distsignsgd:
+        if compute_backward and use_distsignsgd:
             active_microbatches, active_voter_total = self._count_active_microbatches(micro_batches)
         else:
             active_microbatches, active_voter_total = 0, 0
@@ -1123,16 +1360,16 @@ class ModelRunner:
 
             # Forward pass + loss computation
             with self.model_fwd_context:
-                local_loss_sum, per_token_outputs, is_metrics, metric_ops, outputs = self._compute_micro_batch_loss(
+                loss, per_token_outputs, is_metrics, is_metric_ops, outputs = self._compute_micro_batch_loss(
                     micro_batch, loss_fn, params
                 )
 
             logger.debug(
                 f"Rank {self.rank}: micro_batch {batch_idx}/{len(micro_batches)} "
-                f"local_loss_sum={local_loss_sum.item():.6f}, local_valid_tokens={local_valid_tokens.item()}, "
+                f"loss={loss.item():.6f}, local_valid_tokens={local_valid_tokens.item()}, "
                 f"global_valid_tokens={global_valid_tokens.item()}"
             )
-            # Note: local_loss_sum is always finite even when local_valid_tokens=0, because
+            # Note: loss is always finite even when local_valid_tokens=0, because
             # causallm_loss_function uses reduction="none" + manual mean with
             # clamp(min=1) denominator. No need to replace with zeros_like
             # (which would break the autograd graph and cause FSDP2 deadlocks).
@@ -1178,12 +1415,16 @@ class ModelRunner:
                                 }
                             )
 
-            # Backward + reporting on the raw partial sum: cross-mb / cross-DP
-            # accumulation composes under SUM-allreduce, then optim_step divides
-            # once by global_valid_tokens. FSDP grad averaging is off
-            # (set_gradient_divide_factor(1.0) in torch_parallelize).
+            # Gradient accumulation — raw (unnormalized) backward.
+            # Normalization by total accumulated valid tokens is deferred to optim_step.
+            # FSDP's automatic gradient averaging is disabled (set_gradient_divide_factor(1.0)
+            # in torch_parallelize), so no fsdp_size compensation is needed here.
+            # When local_valid_tokens=0, this produces 0 gradients while preserving
+            # the full autograd graph through all parameters (including lm_head weight),
+            # which is critical for FSDP2 reduce-scatter collectives.
             if compute_backward:
                 ps = get_parallel_state()
+                raw_loss = loss * local_valid_tokens.detach().float()
 
                 if abort_callback and abort_callback():
                     raise RuntimeError("Execution aborted by request")
@@ -1193,21 +1434,26 @@ class ModelRunner:
                     set_replay_stage("replay_backward")
 
                 with self.model_bwd_context:
-                    local_loss_sum.backward()
+                    raw_loss.backward()
 
+                # Loss reporting (separately, no grad): compute normalized per-token loss
                 with torch.no_grad():
-                    loss_report = local_loss_sum.detach()
+                    loss_report = loss.detach() * local_valid_tokens
                     dist.all_reduce(loss_report, op=dist.ReduceOp.SUM, group=ps.fsdp_group if self.pp_enabled else None)
                     if global_valid_tokens.item() > 0:
                         total_loss += (loss_report / global_valid_tokens).item()
             else:
+                # Forward-only: accumulate weighted loss
                 if global_valid_tokens.item() > 0:
-                    total_loss += local_loss_sum.item() / global_valid_tokens.item()
+                    total_loss += loss.item() * (local_valid_tokens.item() / global_valid_tokens.item())
 
-            self._accumulate_is_metrics(accumulated_is_metrics, is_metrics, metric_ops)
+            # Accumulate IS metrics
+            self._accumulate_is_metrics(accumulated_is_metrics, is_metrics, is_metric_ops)
 
             # Cleanup
-            del micro_batch, outputs, local_loss_sum
+            del micro_batch, outputs, loss
+            if compute_backward:
+                del raw_loss
 
         # Note: gc.collect() + empty_cache() removed from per-step path.
         # They cost ~250ms + ~50ms per step (profiled on Qwen3-8B 8xH100).
@@ -1222,13 +1468,13 @@ class ModelRunner:
             sync_sp_gradients(
                 self.model,
                 get_parallel_state().sp_grad_sync_group,
-                skip_dtensor_grads=self._use_distsignsgd,
+                skip_dtensor_grads=use_distsignsgd,
             )
             # Accumulate valid tokens for deferred normalization at optim_step
             self._accumulated_valid_tokens[model_id] = (
                 self._accumulated_valid_tokens.get(model_id, 0) + global_valid_tokens.item()
             )
-            if self._use_distsignsgd:
+            if use_distsignsgd:
                 self._accumulated_active_microbatches[model_id] = (
                     self._accumulated_active_microbatches.get(model_id, 0) + active_microbatches
                 )
@@ -1380,7 +1626,7 @@ class ModelRunner:
 
         # Switch to the correct adapter for this model_id
         if self._adapter_manager is not None:
-            self._adapter_manager.switch_adapter(model_id, auto_register=True)
+            self._adapter_manager.switch_adapter(model_id)
 
         # Validate token IDs before processing to catch out-of-vocab errors early
         # This prevents CUDA device-side asserts that can hang the server
@@ -1390,6 +1636,7 @@ class ModelRunner:
 
         # Get return_per_token flag from loss_fn_params (default True for tinker compatibility)
         params = loss_fn_params or {}
+        use_distsignsgd = getattr(self, "_use_distsignsgd", False)
 
         # Reference forward pass: compute Xorl's own logprobs to replace SGLang logprobs
         # This guarantees KL=0 at step 0 since both old and new logprobs come from the same engine
@@ -1480,7 +1727,7 @@ class ModelRunner:
         # PP path
         if self.pp_enabled:
             global_valid_tokens = self._count_global_valid_tokens(micro_batches)
-            if self._use_distsignsgd:
+            if use_distsignsgd:
                 active_microbatches, active_voter_total = self._count_active_microbatches(micro_batches)
             else:
                 active_microbatches, active_voter_total = 0, 0
@@ -1504,7 +1751,7 @@ class ModelRunner:
             }
             # Accumulate valid tokens for deferred normalization at optim_step
             self._accumulated_valid_tokens[model_id] = self._accumulated_valid_tokens.get(model_id, 0) + gvt
-            if self._use_distsignsgd:
+            if use_distsignsgd:
                 self._accumulated_active_microbatches[model_id] = (
                     self._accumulated_active_microbatches.get(model_id, 0) + active_microbatches
                 )
@@ -1587,11 +1834,19 @@ class ModelRunner:
         micro_batches: List[Dict[str, Any]],
         loss_fn: str = "causallm_loss",
         loss_fn_params: Optional[Dict[str, Any]] = None,
+        model_id: str = "default",
         routed_experts: Optional[List] = None,
         routed_expert_logits: Optional[List[Any]] = None,
     ) -> Dict[str, Any]:
         """Execute forward pass only (no gradient computation)."""
         self._check_not_sleeping("forward")
+
+        # Validation/eval requests must run against the same tenant adapter as
+        # training requests for that model_id.
+        self._validate_single_tenant(model_id)
+        if self._adapter_manager is not None:
+            self._adapter_manager.switch_adapter(model_id)
+
         validate_token_ids(micro_batches, self.model.config.vocab_size)
 
         start_time = time.time()
@@ -1604,20 +1859,27 @@ class ModelRunner:
             loss_fn_params,
             compute_backward=False,
             r3_enabled=r3_enabled,
+            model_id=model_id,
         )
 
-        result["step"] = self.global_forward_backward_step
+        if self._adapter_manager is not None:
+            result["step"] = self._adapter_manager.get_adapter_state(model_id).global_forward_backward_step
+        else:
+            result["step"] = self.global_forward_backward_step
         result["forward_time"] = time.time() - start_time
+        result["model_id"] = model_id
 
         logger.info(
             f"forward loss={result['total_loss']:.4f} "
             f"tokens={result.get('global_valid_tokens', 'N/A')} "
+            f"model_id={model_id} "
             f"time={result['forward_time']:.2f}s"
         )
         logger.debug(
             f"Rank {self.rank}: forward loss={result['total_loss']:.6f}, "
             f"global_valid_tokens={result.get('global_valid_tokens', 'N/A')}, "
             f"n_micro_batches={len(micro_batches)}, loss_fn={loss_fn}, "
+            f"model_id={model_id}, "
             f"time={result['forward_time']:.3f}s"
         )
         return result
@@ -1668,8 +1930,9 @@ class ModelRunner:
 
         # Pop accumulated valid tokens for this model_id (deferred normalization)
         accumulated = self._accumulated_valid_tokens.pop(model_id, 0)
-        accumulated_active_microbatches = self._accumulated_active_microbatches.pop(model_id, 0)
-        accumulated_active_voter_total = self._accumulated_active_voter_total.pop(model_id, 0)
+        accumulated_active_microbatches = getattr(self, "_accumulated_active_microbatches", {}).pop(model_id, 0)
+        accumulated_active_voter_total = getattr(self, "_accumulated_active_voter_total", {}).pop(model_id, 0)
+        use_distsignsgd = getattr(self, "_use_distsignsgd", False)
 
         # Multi-adapter path: use adapter's own optimizer on adapter's own parameters
         if self._adapter_manager is not None:
@@ -1688,12 +1951,13 @@ class ModelRunner:
                 clip_value,
                 accumulated_valid_tokens=accumulated,
             )
+            self._sync_registered_lora_session_spec(model_id)
             current_step = self._adapter_manager.get_global_step(model_id)
             current_lr = effective_lr
 
         # Single-adapter path: use shared optimizer on model parameters
         else:
-            if self._use_distsignsgd:
+            if use_distsignsgd:
                 if accumulated_active_voter_total > 0:
                     scale_model_gradients(
                         self.model,
@@ -1711,7 +1975,7 @@ class ModelRunner:
             ps = get_parallel_state()
             clip_value = get_effective_grad_clip_value(
                 clip_value,
-                use_distsignsgd=self._use_distsignsgd,
+                use_distsignsgd=use_distsignsgd,
             )
 
             grad_norm = clip_gradients(
@@ -1768,6 +2032,11 @@ class ModelRunner:
 
     def _maybe_merge_lora(self) -> None:
         """Periodic LoRA merge at merge_lora_interval."""
+        if self._adapter_manager is not None:
+            merge_interval = self.lora_config.get("merge_lora_interval", 0)
+            if merge_interval > 0:
+                raise RuntimeError("merge_lora_interval is not supported with multi-adapter LoRA server training")
+            return
         _maybe_merge_lora_util(
             self.model,
             enable_lora=self.lora_config.get("enable_lora", False),
@@ -1801,6 +2070,7 @@ class ModelRunner:
     def load_adapter_state(self, model_id, path=None, load_optimizer=True, lr=None):
         result = self._checkpoint_mgr.load_adapter_state(model_id, path, load_optimizer, lr=lr)
         self._sync_from_checkpoint_state()
+        self._sync_registered_lora_session_spec(model_id)
         return result
 
     def save_state(self, checkpoint_path, save_optimizer=True, model_id=None):
@@ -1840,6 +2110,9 @@ class ModelRunner:
         Returns:
             Dict with operation timing information
         """
+        if self._adapter_manager is not None:
+            raise RuntimeError("sleep is not supported with multi-adapter LoRA server training")
+
         start_time = time.time()
 
         # Offload model to CPU
@@ -1882,6 +2155,9 @@ class ModelRunner:
         Returns:
             Dict with operation timing information
         """
+        if self._adapter_manager is not None:
+            raise RuntimeError("wake_up is not supported with multi-adapter LoRA server training")
+
         start_time = time.time()
 
         device_id = get_device_id()

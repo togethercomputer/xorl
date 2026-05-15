@@ -369,14 +369,12 @@ def extract_loss(fwd_bwd_result) -> float:
 
 def run_sft_steps(training_client, data, num_steps=5, lr=1e-3) -> list:
     """Run SFT training steps and return loss history."""
-    xorl_client = _require_xorl_client()
-
-    adam_params = xorl_client.AdamParams(learning_rate=lr, beta1=0.9, beta2=0.95, eps=1e-8)
+    _require_xorl_client()
     losses = []
 
     for step in range(num_steps):
         fwd_bwd = training_client.forward_backward(data, loss_fn="causallm_loss")
-        optim = training_client.optim_step(adam_params)
+        optim = training_client.optim_step(learning_rate=lr)
         result = fwd_bwd.result()
         optim.result()
 

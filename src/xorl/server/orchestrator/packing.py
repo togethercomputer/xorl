@@ -716,7 +716,14 @@ class SequentialPacker(Packer):
         datum: Dict[str, Any],
         sample_idx: int,
     ) -> None:
-        """Add a sample to a micro-batch."""
+        """Add a sample to a non-packed micro-batch.
+
+        This mirrors the packed path's token-shifting semantics:
+        - HF-format datums (`input_ids` + full-length `labels`) are shifted to
+          next-token prediction with `input_ids[:-1]` and `labels[1:]`.
+        - xorl_client/RL datums (`input_ids` + `target_tokens`) are already
+          shifted and are used as-is.
+        """
         # Handle nested datum structure: flatten model_input and loss_fn_inputs
         flattened_datum = {}
         if "model_input" in datum:
@@ -739,19 +746,13 @@ class SequentialPacker(Packer):
         if not isinstance(input_ids, list):
             input_ids = input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
 
-        seq_len = len(input_ids)
-        batch["input_ids"].append(input_ids)
-
         # Extract or generate position_ids
         if "position_ids" in flattened_datum:
             position_ids = flattened_datum["position_ids"]
             if not isinstance(position_ids, list):
                 position_ids = position_ids.tolist() if hasattr(position_ids, "tolist") else list(position_ids)
         else:
-            # Auto-generate position_ids: [0, 1, 2, ..., seq_len-1]
-            position_ids = list(range(seq_len))
-
-        batch["position_ids"].append(position_ids)
+            position_ids = list(range(len(input_ids)))
 
         # Extract labels if present (or use target_tokens for RL)
         if "labels" in flattened_datum:
@@ -767,22 +768,46 @@ class SequentialPacker(Packer):
             # No labels for this sample
             labels = []
 
+        weights = flattened_datum.get("weights")
+        if weights is not None and not isinstance(weights, list):
+            weights = weights.tolist() if hasattr(weights, "tolist") else list(weights)
+
+        advantages = flattened_datum.get("advantages")
+        if advantages is not None and not isinstance(advantages, list):
+            advantages = advantages.tolist() if hasattr(advantages, "tolist") else list(advantages)
+
+        # Detect if tokens are already shifted (xorl_client API format)
+        is_already_shifted = "target_tokens" in flattened_datum and len(input_ids) == len(labels)
+        if labels and not is_already_shifted and len(input_ids) == len(labels):
+            logger.warning(
+                "Sample %s has labels with the same length as input_ids; treating it as HF-format data "
+                "and shifting for next-token prediction. Use target_tokens for already shifted targets.",
+                sample_idx,
+            )
+            input_ids = input_ids[:-1]
+            position_ids = position_ids[:-1]
+            labels = labels[1:]
+            if weights is not None:
+                weights = weights[1:]
+            if advantages is not None:
+                advantages = advantages[1:]
+
+        if advantages is not None:
+            flattened_datum["advantages"] = advantages
+
+        batch["input_ids"].append(input_ids)
+        batch["position_ids"].append(position_ids)
+
         # Apply weights mask to labels if weights field is present
         # weights=0 -> labels=-100 (IGNORE_INDEX), weights=1 -> labels unchanged
         if labels:  # Only apply if we have labels
-            weights = flattened_datum.get("weights")
             if weights is not None:
-                if not isinstance(weights, list):
-                    weights = weights.tolist() if hasattr(weights, "tolist") else list(weights)
                 labels = apply_weights_to_labels(labels, weights, sample_idx)
 
             # Apply advantages mask to labels if advantages field is present
             # For RL losses, advantages=0 indicates prompt tokens where we don't compute loss
             # advantages=0 -> labels=-100 (IGNORE_INDEX)
-            advantages = flattened_datum.get("advantages")
             if advantages is not None:
-                if not isinstance(advantages, list):
-                    advantages = advantages.tolist() if hasattr(advantages, "tolist") else list(advantages)
                 labels = apply_advantages_to_labels(labels, advantages, sample_idx)
 
         batch["labels"].append(labels)

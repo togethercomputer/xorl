@@ -100,12 +100,11 @@ def _run_tflops_benchmark(num_gpus: int, dp_shard_size: int, tmp_path: str):
         _, training_client = _create_lora_client(server.base_url, QWEN3_8B_DIR, model_id=f"bench-{num_gpus}gpu")
 
         data = generate_random_sft_data(num_samples=NUM_SAMPLES, seq_len=SEQ_LEN, vocab_size=VOCAB_SIZE)
-        adam_params = xorl_client.AdamParams(learning_rate=1e-4, beta1=0.9, beta2=0.95, eps=1e-8)
 
         # Warmup
         for _ in range(NUM_WARMUP):
             training_client.forward_backward(data, loss_fn="causallm_loss").result()
-            training_client.optim_step(adam_params).result()
+            training_client.optim_step(learning_rate=1e-4).result()
 
         # Measured steps
         step_times = []
@@ -113,7 +112,7 @@ def _run_tflops_benchmark(num_gpus: int, dp_shard_size: int, tmp_path: str):
         for step in range(NUM_STEPS):
             t0 = time.perf_counter()
             fwd_bwd = training_client.forward_backward(data, loss_fn="causallm_loss")
-            optim = training_client.optim_step(adam_params)
+            optim = training_client.optim_step(learning_rate=1e-4)
             result = fwd_bwd.result()
             optim.result()
             t1 = time.perf_counter()
