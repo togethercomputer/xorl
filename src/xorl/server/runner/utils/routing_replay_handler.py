@@ -23,7 +23,6 @@ The handler manages:
 
 import base64
 import logging
-import math
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
@@ -323,11 +322,115 @@ class RoutingReplayHandler:
         Returns:
             List of tensors, each [num_tokens_mb, num_layers, topk] as torch.long.
         """
-        cp_enabled = get_parallel_state().cp_enabled
+        parallel_state = get_parallel_state()
+        cp_enabled = parallel_state.cp_enabled
         if cp_enabled:
-            cp_size = get_parallel_state().cp_size
-            cp_rank = get_parallel_state().cp_rank
-            pad_to_multiple_of = math.lcm(128, cp_size)
+            cp_size = parallel_state.cp_size
+            cp_rank = parallel_state.cp_rank
+
+        def _pad_entry():
+            return [list(range(topk)) for _ in range(num_layers_in_data)]
+
+        def _num_tokens(value: Any) -> Optional[int]:
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                return int(value.numel())
+            if isinstance(value, list):
+                if value and isinstance(value[0], list):
+                    return sum(len(row) if isinstance(row, list) else 1 for row in value)
+                return len(value)
+            return None
+
+        def _first_dim(value: Any) -> Optional[int]:
+            if isinstance(value, torch.Tensor) and value.ndim >= 2:
+                return int(value.shape[0])
+            if isinstance(value, list) and value and isinstance(value[0], list):
+                return len(value)
+            return None
+
+        def _last_dim(value: Any) -> Optional[int]:
+            if isinstance(value, torch.Tensor) and value.ndim >= 1:
+                return int(value.shape[-1])
+            if isinstance(value, list):
+                if value and isinstance(value[0], list):
+                    return len(value[0])
+                return len(value)
+            return None
+
+        def _flatten_position_ids(value: Any) -> Optional[List[int]]:
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                return [int(v) for v in value.reshape(-1).tolist()]
+            if isinstance(value, list):
+                if value and isinstance(value[0], list):
+                    return [int(v) for row in value for v in row]
+                return [int(v) for v in value]
+            return None
+
+        def _resize_position_ids(position_ids: List[int], target_tokens: int) -> List[int]:
+            if len(position_ids) < target_tokens:
+                pad_count = target_tokens - len(position_ids)
+                position_ids = position_ids + [i % 1024 for i in range(pad_count)]
+            elif len(position_ids) > target_tokens:
+                position_ids = position_ids[:target_tokens]
+            return position_ids
+
+        def _zigzag_reorder_routing(
+            routing: List[Any],
+            position_ids: List[int],
+            ringattn_size: int,
+            mb_idx: int,
+        ) -> List[Any]:
+            if ringattn_size <= 1:
+                return routing
+
+            boundaries = [i for i, pos in enumerate(position_ids) if pos == 0]
+            boundaries.append(len(position_ids))
+            num_subchunks = 2 * ringattn_size
+            rank_parts = [[] for _ in range(ringattn_size)]
+
+            for boundary_idx in range(len(boundaries) - 1):
+                start_idx = boundaries[boundary_idx]
+                end_idx = boundaries[boundary_idx + 1]
+                doc_len = end_idx - start_idx
+                if doc_len == 0:
+                    continue
+                if doc_len % num_subchunks != 0:
+                    raise ValueError(
+                        f"R3: MB{mb_idx} document at position {start_idx} has length {doc_len}, "
+                        f"not divisible by 2*ringattn_size={num_subchunks}. "
+                        "Routing replay cannot match ring-attention zigzag layout."
+                    )
+
+                subchunk_len = doc_len // num_subchunks
+                chunks = [
+                    routing[start_idx + subchunk_idx * subchunk_len : start_idx + (subchunk_idx + 1) * subchunk_len]
+                    for subchunk_idx in range(num_subchunks)
+                ]
+                for ring_rank in range(ringattn_size):
+                    rank_parts[ring_rank].extend(chunks[ring_rank])
+                    rank_parts[ring_rank].extend(chunks[num_subchunks - 1 - ring_rank])
+
+            return [token_routing for rank_part in rank_parts for token_routing in rank_part]
+
+        def _resize_routing(routing: List[Any], target_tokens: Optional[int], mb_idx: int, reason: str) -> List[Any]:
+            if target_tokens is None:
+                return routing
+            if len(routing) < target_tokens:
+                pad_count = target_tokens - len(routing)
+                logger.debug("R3: Padded MB%s routing by %s tokens to match %s", mb_idx, pad_count, reason)
+                return routing + [_pad_entry()] * pad_count
+            if len(routing) > target_tokens:
+                logger.debug(
+                    "R3: Truncated MB%s routing by %s tokens to match %s",
+                    mb_idx,
+                    len(routing) - target_tokens,
+                    reason,
+                )
+                return routing[:target_tokens]
+            return routing
 
         # Read num_samples from each micro-batch (set by SequentialPacker._finalize_packed_batch)
         micro_batch_datum_counts = [mb.get("num_samples", 1) for mb in micro_batches]
@@ -350,64 +453,93 @@ class RoutingReplayHandler:
 
         for mb_idx, num_datums in enumerate(micro_batch_datum_counts):
             # Concatenate routing from all datums packed into this micro-batch
-            mb_routing = []
+            datum_routing = []
             for _ in range(num_datums):
                 if datum_cursor < len(decoded_routing):
-                    mb_routing.extend(decoded_routing[datum_cursor])
+                    datum_routing.append(decoded_routing[datum_cursor])
                     datum_cursor += 1
 
+            mb_routing = [token_routing for datum in datum_routing for token_routing in datum]
             mb_total_tokens = len(mb_routing)
+            micro_batch = micro_batches[mb_idx] if mb_idx < len(micro_batches) else {}
+            expected_mb_tokens = _num_tokens(micro_batch.get("input_ids"))
 
             if cp_enabled and mb_total_tokens > 0:
-                # CRITICAL: Pad to match packer's pad_to_multiple_of BEFORE SP chunking.
-                # The SequentialPacker pads sequences to lcm(128, cp_size) before
-                # TextSequenceShardCollator shards them. We must replicate this step
-                # so routing SP-slice boundaries match the actual data boundaries.
-                packing_pad = (pad_to_multiple_of - mb_total_tokens % pad_to_multiple_of) % pad_to_multiple_of
-                if packing_pad > 0:
-                    pad_entry = [list(range(topk)) for _ in range(num_layers_in_data)]
-                    mb_routing = mb_routing + [pad_entry] * packing_pad
+                # Match the actual sharded micro-batch shape. Packed batches may
+                # already be padded to 128-token boundaries by SequentialPacker,
+                # while unpacked/server batches are only padded to the CP size.
+                # position_ids stays full-length after sequence sharding, so it is
+                # the source of truth for how much routing data existed before the
+                # local CP slice.
+                input_ids = micro_batch.get("input_ids")
+                position_ids = micro_batch.get("position_ids")
+                batch_rows = _first_dim(input_ids)
+                local_seq_len = _last_dim(input_ids)
+                full_seq_len = _last_dim(position_ids)
+                ringattn_size = getattr(parallel_state, "ringattn_size", 1)
+                rowwise_unpacked = (
+                    batch_rows is not None
+                    and batch_rows > 1
+                    and batch_rows == len(datum_routing)
+                    and local_seq_len is not None
+                    and full_seq_len is not None
+                )
 
-                padded_len = mb_total_tokens + packing_pad
-
-                # SP-slice the padded block (matches TextSequenceShardCollator.sp_slice)
-                cp_chunk_size = (padded_len + cp_size - 1) // cp_size
-                sp_pad_count = cp_chunk_size * cp_size - padded_len
-
-                if sp_pad_count > 0:
-                    pad_entry = [list(range(topk)) for _ in range(num_layers_in_data)]
-                    mb_routing = mb_routing + [pad_entry] * sp_pad_count
-
-                start = cp_rank * cp_chunk_size
-                end = (cp_rank + 1) * cp_chunk_size
-                mb_routing = mb_routing[start:end]
+                if rowwise_unpacked:
+                    sharded_routing = []
+                    cp_chunk_size = local_seq_len
+                    start = cp_rank * cp_chunk_size
+                    end = start + cp_chunk_size
+                    for row_routing in datum_routing:
+                        row_routing = _resize_routing(list(row_routing), full_seq_len, mb_idx, "full row length")
+                        sharded_routing.extend(row_routing[start:end])
+                    mb_routing = sharded_routing
+                    logger.debug(
+                        "R3: SP MB%s rowwise - raw_tokens=%s, rows=%s, full_seq=%s, local_seq=%s, cp_rank=%s",
+                        mb_idx,
+                        mb_total_tokens,
+                        batch_rows,
+                        full_seq_len,
+                        local_seq_len,
+                        cp_rank,
+                    )
+                else:
+                    full_tokens = _num_tokens(position_ids)
+                    if full_tokens is None:
+                        full_tokens = ((mb_total_tokens + cp_size - 1) // cp_size) * cp_size
+                    mb_routing = _resize_routing(mb_routing, full_tokens, mb_idx, "full SP-padded length")
+                    if ringattn_size > 1:
+                        zigzag_position_ids = _flatten_position_ids(micro_batch.get("_original_position_ids"))
+                        if zigzag_position_ids is None:
+                            zigzag_position_ids = _flatten_position_ids(position_ids)
+                        if zigzag_position_ids is None:
+                            logger.warning(
+                                "R3: MB%s ring-attention routing lacks position_ids; falling back to contiguous slice",
+                                mb_idx,
+                            )
+                        else:
+                            zigzag_position_ids = _resize_position_ids(zigzag_position_ids, len(mb_routing))
+                            mb_routing = _zigzag_reorder_routing(
+                                mb_routing,
+                                zigzag_position_ids,
+                                ringattn_size,
+                                mb_idx,
+                            )
+                    cp_chunk_size = expected_mb_tokens or ((len(mb_routing) + cp_size - 1) // cp_size)
+                    start = cp_rank * cp_chunk_size
+                    end = start + cp_chunk_size
+                    mb_routing = mb_routing[start:end]
 
                 logger.debug(
                     f"R3: SP MB{mb_idx} - {mb_total_tokens} tokens ({num_datums} datums), "
-                    f"packing_pad={packing_pad}, padded_len={padded_len}, "
-                    f"sp_chunk={cp_chunk_size}, sp_pad={sp_pad_count}, slice [{start}:{end}]"
+                    f"sp_chunk={cp_chunk_size}, ringattn_size={ringattn_size}, slice [{start}:{end}]"
                 )
 
             # Pad routing to match actual micro-batch token count.
             # The packer's pad_to_multiple_of may have added padding tokens
             # that aren't in the raw routing data.
-            if mb_idx < len(micro_batches) and "input_ids" in micro_batches[mb_idx]:
-                mb_input_ids = micro_batches[mb_idx]["input_ids"]
-                if isinstance(mb_input_ids, torch.Tensor):
-                    expected_mb_tokens = mb_input_ids.shape[0] * mb_input_ids.shape[1]
-                else:
-                    expected_mb_tokens = (
-                        len(mb_input_ids[0]) if isinstance(mb_input_ids[0], list) else len(mb_input_ids)
-                    )
-
-                if len(mb_routing) < expected_mb_tokens:
-                    pad_count = expected_mb_tokens - len(mb_routing)
-                    pad_entry = [list(range(topk)) for _ in range(num_layers_in_data)]
-                    mb_routing.extend([pad_entry] * pad_count)
-                    logger.debug(
-                        f"R3: Padded MB{mb_idx} routing by {pad_count} tokens to match "
-                        f"micro-batch size ({expected_mb_tokens})"
-                    )
+            if expected_mb_tokens is not None:
+                mb_routing = _resize_routing(mb_routing, expected_mb_tokens, mb_idx, "micro-batch size")
 
             if mb_routing:
                 # Convert to tensor: [num_tokens_mb, num_layers, topk]
