@@ -1828,7 +1828,10 @@ class ModelRunner:
 
         return result
 
-    @torch.no_grad()
+    # inference_mode (vs no_grad) skips view tracking and version counters,
+    # which is safe here because the returned tensors are only consumed by
+    # logging / cross-rank reductions that never re-enter autograd.
+    @torch.inference_mode()
     def forward(
         self,
         micro_batches: List[Dict[str, Any]],
