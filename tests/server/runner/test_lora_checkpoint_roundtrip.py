@@ -16,6 +16,7 @@ from xorl.lora.utils import (
     save_lora_checkpoint,
 )
 from xorl.models.layers.moe import MoEExpertsLoRA, MoELoRAConfig
+from xorl.optim import AnyPrecisionAdamW
 
 
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
@@ -348,3 +349,21 @@ def test_adapter_manager_load_adapter_state_roundtrip_supports_hybrid_shared(tmp
     assert set(actual) == set(expected)
     for name, expected_tensor in expected.items():
         assert torch.equal(actual[name], expected_tensor), name
+
+
+def test_adapter_manager_threads_cautious_weight_decay_to_optimizer(tmp_path):
+    manager = LoRAAdapterManager(
+        model=_TinyMoELoraModel(),
+        device=torch.device("cpu"),
+        checkpoint_dir=str(tmp_path / "adapters"),
+        auto_save_on_eviction=False,
+        lora_config={"moe_hybrid_shared_lora": True},
+        optimizer_config={"cautious_weight_decay": True, "weight_decay": 0.02},
+    )
+
+    manager.register_adapter("adapter-cwd", lr=1e-4, initialize_fresh=True)
+
+    optimizer = manager.get_adapter_state("adapter-cwd").optimizer
+    assert isinstance(optimizer, AnyPrecisionAdamW)
+    assert all(group.get("cautious") is True for group in optimizer.param_groups)
+    assert [group["weight_decay"] for group in optimizer.param_groups] == [0.02]

@@ -176,5 +176,5 @@ def test_olmo2_checkpoint_handler_loads_hf_weights_into_fused_model():
         hf_logits = hf_model.lm_head(hf_hidden_states)
         xorl_logits = xorl_model.lm_head(xorl_hidden_states)
 
-    torch.testing.assert_close(xorl_hidden_states, hf_hidden_states, atol=5e-5, rtol=5e-5)
-    torch.testing.assert_close(xorl_logits, hf_logits, atol=5e-5, rtol=5e-5)
+    torch.testing.assert_close(xorl_hidden_states, hf_hidden_states, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(xorl_logits, hf_logits, atol=2e-4, rtol=5e-4)

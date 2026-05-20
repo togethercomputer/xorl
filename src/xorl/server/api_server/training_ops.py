@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 from fastapi import HTTPException, status
 
 from xorl.server.api_server.api_types import (
+    AdamParams,
     ForwardBackwardRequest,
     ForwardBackwardResponse,
     ForwardRequest,
@@ -69,6 +70,41 @@ class TrainingOpsMixin:
             return None
         learning_rate = train_config.get("learning_rate", train_config.get("lr"))
         return float(learning_rate) if learning_rate is not None else None
+
+    def _optim_step_learning_rate(self, request: OptimStepRequest) -> float:
+        """Resolve the effective LR for an optim_step request.
+
+        Priority: request.learning_rate, request.adam_params.learning_rate,
+        per-session optimizer_config, server train_config. If the session was
+        explicitly registered (even without an optimizer_config) fall back to
+        AdamParams().learning_rate; otherwise raise so a missing LR fails loud.
+        """
+        if getattr(request, "learning_rate", None) is not None:
+            return float(request.learning_rate)
+
+        fields_set = getattr(request, "model_fields_set", set())
+        adam_params = getattr(request, "adam_params", None)
+        if "adam_params" in fields_set and adam_params is not None and adam_params.learning_rate is not None:
+            return float(adam_params.learning_rate)
+
+        session_lr = self._session_default_learning_rate(request.model_id)
+        if session_lr is not None:
+            return session_lr
+
+        server_lr = self._server_default_learning_rate()
+        if server_lr is not None:
+            return server_lr
+
+        if request.model_id in getattr(self, "model_configs", {}):
+            return AdamParams().learning_rate
+
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "optim_step: no learning_rate in request, no default optimizer_config "
+                f"registered for model_id={request.model_id!r}, and no server train_config lr"
+            ),
+        )
 
     # =========================================================================
     # Two-Phase Request Pattern Methods
@@ -264,11 +300,11 @@ class TrainingOpsMixin:
 
             # Debug: Log what we got from the engine
             logger.debug(f"API Server: Received result from engine, keys: {list(result.keys())}")
-            is_metrics = {k: v for k, v in result.items() if k.startswith("is_")}
-            if is_metrics:
-                logger.debug(f"API Server: IS metrics present in result: {list(is_metrics.keys())}")
+            loss_metrics = {k: v for k, v in result.items() if k.startswith(("is_", "opd_"))}
+            if loss_metrics:
+                logger.debug(f"API Server: loss metrics present in result: {list(loss_metrics.keys())}")
             else:
-                logger.debug("API Server: No IS metrics in result")
+                logger.debug("API Server: No loss metrics in result")
 
             # Sanitize NaN/Inf values for JSON serialization
             result = _sanitize_nan_to_zero(result)
@@ -282,12 +318,12 @@ class TrainingOpsMixin:
                 "loss:sum": total_loss * valid_tokens,
                 "loss:mean": total_loss,
                 "valid_tokens:sum": valid_tokens,
-                "execution_time:sum": result.get("execution_time", 0.0),
+                "execution_time:sum": result.get("execution_time", result.get("forward_backward_time", 0.0)),
             }
 
-            # Add IS metrics if present (already have name:reduction format)
+            # Add loss-specific metrics if present (already have name:reduction format)
             for key, value in result.items():
-                if key.startswith("is_"):
+                if key.startswith(("is_", "opd_")):
                     # Ensure colon format for tinker compatibility
                     metrics[key if ":" in key else f"{key}:mean"] = value
 
@@ -375,6 +411,15 @@ class TrainingOpsMixin:
                 "valid_tokens": valid_tokens,
                 "execution_time": result.get("execution_time", 0.0),
             }
+            for key, value in result.items():
+                if key.startswith(("is_", "opd_")):
+                    metrics[key if ":" in key else f"{key}:mean"] = value
+                elif key in (
+                    "teacher_prefill_tokens",
+                    "teacher_prefill_forward_compute_s",
+                    "teacher_hidden_cache_write_s",
+                ):
+                    metrics[key] = value
 
             return ForwardResponse(
                 loss_fn_output_type=loss_fn_output_type,
@@ -407,21 +452,7 @@ class TrainingOpsMixin:
 
         try:
             adam_params = request.adam_params
-            lr = request.learning_rate
-            if lr is None and adam_params is not None:
-                lr = adam_params.learning_rate
-            if lr is None:
-                lr = self._session_default_learning_rate(request.model_id)
-            if lr is None:
-                lr = self._server_default_learning_rate()
-            if lr is None:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=(
-                        "optim_step: no learning_rate in request, no default optimizer_config "
-                        f"registered for model_id={request.model_id!r}, and no server train_config lr"
-                    ),
-                )
+            lr = self._optim_step_learning_rate(request)
 
             # Determine gradient clipping value
             # Priority: explicit gradient_clip parameter, then adam_params.grad_clip_norm

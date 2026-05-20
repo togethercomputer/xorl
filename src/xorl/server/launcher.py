@@ -127,15 +127,24 @@ def find_free_ports(count: int, start_port: int = 50000) -> List[int]:
     Returns:
         List of free port numbers
     """
+    end_port = 60000
+    candidates = list(range(start_port, end_port))
+    random.shuffle(candidates)
+
     ports = []
-    current_start = start_port
+    for port in candidates:
+        with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
+            try:
+                sock.bind(("", port))
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            except OSError:
+                continue
 
-    for _ in range(count):
-        port = find_free_port(current_start)
         ports.append(port)
-        current_start = port + 1
+        if len(ports) == count:
+            return ports
 
-    return ports
+    raise RuntimeError(f"Could not find {count} free ports in range {start_port}-{end_port}")
 
 
 # ============================================================================
@@ -914,10 +923,14 @@ class Launcher:
             stale_address_file.unlink()
             logger.info(f"Removed stale address file: {stale_address_file}")
 
-        # Build torchrun command — use the same Python environment as the launcher
-        torchrun_bin = os.path.join(os.path.dirname(sys.executable), "torchrun")
+        # Build torchrun command through the active Python executable. In
+        # mounted worktrees the torchrun console script can have a host-path
+        # shebang that does not exist inside the container, while
+        # ``python -m torch.distributed.run`` remains relocatable.
         cmd = [
-            torchrun_bin,
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
             f"--nnodes={self.nnodes}",
             f"--nproc-per-node={self.nproc_per_node}",
             f"--master-addr={self.master_addr}",

@@ -341,6 +341,8 @@ def _normalize_checkpoint_key_for_filter(key: str) -> Optional[str]:
     """Normalize raw checkpoint keys for lightweight load-time filtering."""
     if key.startswith("vision_tower.") or key.startswith("mm_projector."):
         return None
+    if key.startswith("model.language_model."):
+        return "model." + key.removeprefix("model.language_model.")
     if key.startswith("language_model."):
         return key.removeprefix("language_model.")
     return key

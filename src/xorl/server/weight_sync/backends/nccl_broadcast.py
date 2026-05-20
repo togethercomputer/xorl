@@ -366,9 +366,19 @@ class NCCLWeightSynchronizer:
 
         if self.process_group:
             try:
-                dist.destroy_process_group(self.process_group)
+                # Use the non-cooperative abort() rather than
+                # dist.destroy_process_group(), which calls pg.shutdown() and
+                # then waits for the inference-side comm to finalize. The
+                # inference side aborted its comm immediately on receiving
+                # /destroy_weights_update_group, so a cooperative shutdown
+                # here hangs until the engine timeout fires.
+                self.process_group.abort()
             except Exception as e:
-                logger.error(f"Failed to destroy training process group: {e}")
+                logger.warning(f"process_group.abort() failed ({e}); falling back to destroy_process_group")
+                try:
+                    dist.destroy_process_group(self.process_group)
+                except Exception as e2:
+                    logger.error(f"Failed to destroy training process group: {e2}")
             self.process_group = None
 
         self._cleanup_training_store()

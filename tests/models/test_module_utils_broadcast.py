@@ -493,6 +493,14 @@ def test_try_load_state_dict_local_directory_skips_broadcast(monkeypatch):
     assert [it.filepath for it in iterators] == ["local-shard.safetensors"]
 
 
+def test_checkpoint_expert_filter_handles_wrapped_language_model_keys():
+    assert module_utils._is_checkpoint_expert_key("model.language_model.layers.43.mlp.experts.gate_up_proj")
+    assert module_utils._is_checkpoint_expert_key("model.language_model.layers.43.mlp.experts.down_proj")
+    assert not module_utils._is_checkpoint_expert_key(
+        "model.language_model.layers.43.mlp.shared_expert.down_proj.weight"
+    )
+
+
 def test_grouped_load_weights_uses_filtered_prefetch_on_group_leader(monkeypatch):
     batch_meta_calls = []
     dispatched = []

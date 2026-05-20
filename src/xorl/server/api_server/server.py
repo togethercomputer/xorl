@@ -171,8 +171,11 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
         # Each model_id has its own set of tracked adapters to support parallel training runs
         self.loaded_sampling_loras: Dict[str, List[tuple]] = {}
 
-        # Maximum number of adapters per model_id for sampling
-        self.max_adapters_per_model: int = 3
+        # Maximum number of adapters per model_id for sampling. Default is intentionally
+        # generous (was 3) because SGLang's /unload_lora_adapter has been observed to
+        # hang on 30B-class hosts, so eviction during a multi-step OPD run wedges the
+        # session. Override via XORL_MAX_ADAPTERS_PER_MODEL when needed.
+        self.max_adapters_per_model: int = int(os.environ.get("XORL_MAX_ADAPTERS_PER_MODEL", "32"))
 
         # Session activity tracking for idle cleanup
         # Maps model_id -> last activity timestamp (time.time())
@@ -308,9 +311,13 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
     @staticmethod
     def _build_info(result: Dict[str, Any]) -> Dict[str, Any]:
         """Extract auto-load info from engine result."""
+        info: Dict[str, Any] = {}
         if result.get("auto_loaded"):
-            return {"auto_loaded": True, "auto_load_path": result.get("auto_load_path")}
-        return {}
+            info["auto_loaded"] = True
+            info["auto_load_path"] = result.get("auto_load_path")
+        if "teacher_hidden_cache" in result:
+            info["teacher_hidden_cache"] = result["teacher_hidden_cache"]
+        return info
 
     async def _cleanup_session(self, model_id: str, *, notify_workers: bool = True) -> None:
         """

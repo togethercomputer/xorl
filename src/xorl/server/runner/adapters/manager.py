@@ -353,6 +353,22 @@ class LoRAAdapterManager:
             metadata = self._lora_param_metadata[self._lora_param_names[0]]
             default_rank = metadata["shape"][metadata["rank_dim"]]
         default_alpha = self.lora_config.get("lora_alpha", default_rank or 16)
+        # Start from the manager-level optimizer_config so passthrough flags
+        # like cautious_weight_decay reach build_optimizer; structured fields
+        # below override anything the manager-level dict supplies.
+        optimizer_config: Dict[str, Any] = dict(self.optimizer_config or {})
+        weight_decay = optimizer_config.get("weight_decay", self.weight_decay)
+        optimizer_config.update(
+            {
+                "type": self.optimizer_type,
+                "learning_rate": float(lr),
+                "weight_decay": float(weight_decay),
+                "optimizer_dtype": self.optimizer_dtype,
+                "betas": list(self.betas),
+                "eps": float(self.eps),
+                "optimizer_kwargs": self._serialize_optimizer_metadata_value(self.optimizer_kwargs),
+            }
+        )
         return {
             "base_model": self.lora_config.get("base_model", ""),
             "is_lora": True,
@@ -360,15 +376,7 @@ class LoRAAdapterManager:
                 "lora_rank": int(default_rank or 32),
                 "lora_alpha": int(default_alpha),
             },
-            "optimizer_config": {
-                "type": self.optimizer_type,
-                "learning_rate": float(lr),
-                "weight_decay": float(self.weight_decay),
-                "optimizer_dtype": self.optimizer_dtype,
-                "betas": list(self.betas),
-                "eps": float(self.eps),
-                "optimizer_kwargs": self._serialize_optimizer_metadata_value(self.optimizer_kwargs),
-            },
+            "optimizer_config": optimizer_config,
         }
 
     def _set_model_runtime_lora_config(self, *, lora_rank: int, lora_alpha: int) -> None:

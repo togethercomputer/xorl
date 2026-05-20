@@ -724,6 +724,38 @@ class RunnerDispatcher:
             return dp_rank * (base_count + 1), base_count + 1
         return remainder * (base_count + 1) + (dp_rank - remainder) * base_count, base_count
 
+    def _batch_parallel_rank_and_size(self, parallel_state, cp_size: int, pp_size: int) -> tuple[int, int]:
+        """Return the logical data slice rank/size for request batch dispatch.
+
+        Expert-parallel ranks cooperate on one logical batch slice.  The
+        ep_fsdp coordinate identifies which EP group receives a distinct slice;
+        ranks within that group must all see the same packed batch so MoE/FSDP
+        collectives and OPD full-vocab KL work stay aligned.
+        """
+        if getattr(parallel_state, "ep_enabled", False):
+            ep_size = max(1, int(getattr(parallel_state, "ep_size", 1)))
+            ep_fsdp_size = max(1, int(getattr(parallel_state, "dp_shard_in_ep_size", 1)))
+            ep_mesh = getattr(parallel_state, "ep_fsdp_device_mesh", None)
+            if ep_mesh is not None:
+                try:
+                    ep_fsdp_rank = int(ep_mesh.get_local_rank("ep_fsdp"))
+                    return min(ep_fsdp_rank, ep_fsdp_size - 1), ep_fsdp_size
+                except Exception as exc:
+                    logger.debug(
+                        "Rank %s: could not read ep_fsdp local rank from EP mesh (%s); falling back to rank arithmetic",
+                        self.rank,
+                        exc,
+                    )
+
+            ranks_per_pp_stage = max(1, self.world_size // max(1, pp_size))
+            local_stage_rank = self.rank % ranks_per_pp_stage
+            ep_fsdp_rank = min(local_stage_rank // ep_size, ep_fsdp_size - 1)
+            return ep_fsdp_rank, ep_fsdp_size
+
+        dp_size = max(1, self.world_size // max(1, cp_size * pp_size))
+        dp_rank = min(self.rank // max(1, cp_size * pp_size), dp_size - 1)
+        return dp_rank, dp_size
+
     def _select_and_prepare_batches(self, raw_batches, routed_experts=None, routed_expert_logits=None):
         """Each rank locally selects its own batches from the full broadcast data.
 
@@ -748,8 +780,7 @@ class RunnerDispatcher:
             converted = [self._convert_batch_to_tensors(b) for b in raw_batches]
             return converted, routed_experts, routed_expert_logits
 
-        dp_size = self.world_size // (cp_size * pp_size)
-        dp_rank = self.rank // (cp_size * pp_size)
+        dp_rank, dp_size = self._batch_parallel_rank_and_size(parallel_state, cp_size, pp_size)
         batches_per_dp_group = (num_batches + dp_size - 1) // dp_size
         if pp_size > 1:
             batches_per_dp_group = max(batches_per_dp_group, pp_size)

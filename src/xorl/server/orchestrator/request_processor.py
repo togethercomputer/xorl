@@ -164,9 +164,19 @@ class RequestProcessor:
             data = p.data
             loss_fn = p.loss_fn
             loss_fn_params = p.loss_fn_params or {}
+            routed_experts = p.routed_experts
+            routed_expert_logits = p.routed_expert_logits
 
             if not data:
                 raise ValueError("data or datum_list must be provided")
+
+            if loss_fn == "opd_loss" and loss_fn_params.get("opd_sort_by_teacher", True):
+                order = sorted(range(len(data)), key=lambda i: self._teacher_sort_key(data[i]))
+                data = [data[i] for i in order]
+                if routed_experts is not None:
+                    routed_experts = [routed_experts[i] for i in order]
+                if routed_expert_logits is not None:
+                    routed_expert_logits = [routed_expert_logits[i] for i in order]
 
             # Pack samples into batches
             logger.debug(f"Packing {len(data)} datum into batches for {op_name} request {request.request_id}")
@@ -196,8 +206,8 @@ class RequestProcessor:
                 loss_fn=loss_fn,
                 loss_fn_params=loss_fn_params,
                 model_id=p.model_id,
-                routed_experts=p.routed_experts,
-                routed_expert_logits=p.routed_expert_logits,
+                routed_experts=routed_experts,
+                routed_expert_logits=routed_expert_logits,
                 request_id=request.request_id,
             )
 
@@ -213,12 +223,14 @@ class RequestProcessor:
                 "loss": loss,
                 "valid_tokens": tokens,
                 "success": True,
-                "execution_time": result.get("execution_time", 0.0),
+                "execution_time": result.get(
+                    "execution_time", result.get("forward_backward_time", result.get("forward_time", 0.0))
+                ),
             }
 
-            # Add IS metrics (KL divergence, ratio stats, etc.)
+            # Add loss-specific metrics (IS/KL divergence, OPD KL stats, ratio stats, etc.)
             for key in result:
-                if key.startswith("is_"):
+                if key.startswith(("is_", "opd_")):
                     output_dict[key] = result[key]
 
             # Pass through expert load summary for MoE models
@@ -229,6 +241,17 @@ class RequestProcessor:
             if result.get("auto_loaded"):
                 output_dict["auto_loaded"] = True
                 output_dict["auto_load_path"] = result.get("auto_load_path")
+
+            # Forward-only teacher prefill path writes activation caches to
+            # shared storage and returns the cache metadata here.
+            for key in (
+                "teacher_hidden_cache",
+                "teacher_prefill_tokens",
+                "teacher_prefill_forward_compute_s",
+                "teacher_hidden_cache_write_s",
+            ):
+                if key in result:
+                    output_dict[key] = result[key]
 
             # Unpack per-token outputs if present (tinker API compatibility)
             if "packed_logprobs" in result and "packed_position_ids" in result:
@@ -267,6 +290,28 @@ class RequestProcessor:
                 finished=True,
                 error=error_msg,
             )
+
+    @staticmethod
+    def _teacher_sort_key(datum: Dict[str, Any]) -> int:
+        flattened: Dict[str, Any] = {}
+        if isinstance(datum.get("model_input"), dict):
+            flattened.update(datum["model_input"])
+        if isinstance(datum.get("loss_fn_inputs"), dict):
+            flattened.update(datum["loss_fn_inputs"])
+        for key, value in datum.items():
+            if key not in ("model_input", "loss_fn_inputs"):
+                flattened[key] = value
+
+        teacher_id = flattened.get("teacher_id")
+        if teacher_id is None:
+            teacher_ids = flattened.get("teacher_ids")
+            if hasattr(teacher_ids, "reshape"):
+                teacher_ids = teacher_ids.reshape(-1).tolist()
+            if isinstance(teacher_ids, list) and teacher_ids:
+                while isinstance(teacher_ids[0], list) and teacher_ids[0]:
+                    teacher_ids = teacher_ids[0]
+                teacher_id = teacher_ids[0]
+        return int(teacher_id) if teacher_id is not None else 0
 
     @staticmethod
     def _unpack_per_sample_outputs(result: Dict, batches: list) -> list:
@@ -572,6 +617,15 @@ class RequestProcessor:
         if not p.endpoints:
             raise ValueError("inference endpoints must be provided")
 
+        group_name = p.group_name
+        if p.sync_method == "nccl_broadcast":
+            # NCCL weight sync uses abort-based teardown to avoid cooperative
+            # shutdown hangs. PyTorch can keep the group name reserved after
+            # abort(), so scope NCCL group names to the request.
+            request_token = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in str(request.request_id))
+            request_token = request_token.strip("_")[:32] or f"{time.time_ns():x}"
+            group_name = f"{p.group_name}_{request_token}"
+
         def build_output(result):
             return [
                 {
@@ -595,7 +649,7 @@ class RequestProcessor:
                 endpoints=p.endpoints,
                 master_address=p.master_address,
                 master_port=p.master_port,
-                group_name=p.group_name,
+                group_name=group_name,
                 buffer_size_mb=p.buffer_size_mb,
                 sync_method=p.sync_method,
                 flush_cache=p.flush_cache,

@@ -311,6 +311,9 @@ def session_optimizer_build_kwargs(optimizer_config: Dict[str, Any]) -> Dict[str
     if eps is not None:
         kwargs["eps"] = float(eps)
 
+    if "cautious_weight_decay" in optimizer_config:
+        kwargs["cautious_weight_decay"] = bool(optimizer_config["cautious_weight_decay"])
+
     return kwargs
 
 

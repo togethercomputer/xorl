@@ -170,6 +170,51 @@ class TestAPIRequestCreationAndSerialization:
         request = LoadWeightsRequest(path="/tmp/checkpoint", optimizer=True)
         assert request.optimizer is True
 
+    def test_optim_step_learning_rate_resolution(self):
+        server = APIServer(
+            engine_input_addr="tcp://127.0.0.1:17004",
+            engine_output_addr="tcp://127.0.0.1:17005",
+        )
+        server.model_configs["full-session"] = {"base_model": "base", "lora_config": {}}
+        server.model_configs["lora-session"] = {
+            "base_model": "base",
+            "lora_config": {"lora_rank": 8},
+            "optimizer_config": {"learning_rate": 3e-5},
+        }
+
+        assert server._optim_step_learning_rate(OptimStepRequest(model_id="full-session")) == AdamParams().learning_rate
+        assert server._optim_step_learning_rate(OptimStepRequest(model_id="lora-session")) == 3e-5
+        assert (
+            server._optim_step_learning_rate(
+                OptimStepRequest(model_id="lora-session", adam_params=AdamParams(learning_rate=2e-4))
+            )
+            == 2e-4
+        )
+        assert server._optim_step_learning_rate(OptimStepRequest(model_id="lora-session", learning_rate=7e-5)) == 7e-5
+
+        class FakeClient:
+            request = None
+
+            async def send_request(self, request):
+                self.request = request
+                return object()
+
+        async def fake_wait_for_response(response_future, request_id, timeout, message):
+            class Output:
+                outputs = [{"grad_norm": 0.0}]
+
+            return Output()
+
+        fake_client = FakeClient()
+        server._running = True
+        server.orchestrator_client = fake_client
+        server._wait_for_response = fake_wait_for_response
+
+        response = asyncio.run(server.optim_step(OptimStepRequest(model_id="full-session")))
+
+        assert fake_client.request.payload.lr == AdamParams().learning_rate
+        assert response.metrics["learning_rate"] == AdamParams().learning_rate
+
 
 class TestTinkerSessionCompatibility:
     """Test Tinker-compatible session creation and heartbeats."""

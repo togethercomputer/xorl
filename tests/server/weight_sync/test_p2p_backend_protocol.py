@@ -199,6 +199,19 @@ def _hf_locator(
 
 
 class TestP2PInitializeHandshake:
+    def test_resolve_local_hostname_prefers_explicit_p2p_env(self, monkeypatch):
+        for env_name in ("P2P_TRAINER_HOSTNAME", "XORL_WEIGHT_SYNC_MASTER_ADDRESS", "POD_IP"):
+            monkeypatch.delenv(env_name, raising=False)
+
+        monkeypatch.setenv("POD_IP", "10.0.0.3")
+        assert _resolve_local_hostname() == "10.0.0.3"
+
+        monkeypatch.setenv("XORL_WEIGHT_SYNC_MASTER_ADDRESS", "10.0.0.2")
+        assert _resolve_local_hostname() == "10.0.0.2"
+
+        monkeypatch.setenv("P2P_TRAINER_HOSTNAME", "10.0.0.1")
+        assert _resolve_local_hostname() == "10.0.0.1"
+
     def test_prepare_payload_uses_p2p_transport_and_engine_info(self):
         backend, engine = _make_backend(num_endpoints=1)
 
@@ -877,6 +890,43 @@ class TestP2PTransferBucket:
         with pytest.raises(RuntimeError, match="no receiver locator"):
             backend.transfer_bucket([("unknown.param", full)], src_rank=0)
         assert engine.transfers == []
+
+    def test_transfer_bucket_skips_missing_tied_lm_head_locator(self):
+        backend, engine = _make_backend()
+        receiver_name = "model.embed_tokens.weight"
+        backend._tensor_map = {
+            receiver_name: [
+                {
+                    **_hf_locator(
+                        tp_rank=0,
+                        full_shape=[8, 8],
+                        slc=[[0, 8], [0, 8]],
+                        ptr=0x1234_0000,
+                        nbytes=8 * 8 * 2,
+                        session_id="recv0:7000",
+                    ),
+                    "hf_name": receiver_name,
+                    "endpoint_idx": 0,
+                }
+            ]
+        }
+        backend._receiver_session_ids = ["recv0:7000"]
+        full = torch.zeros(8, 8, dtype=torch.bfloat16)
+
+        backend.transfer_bucket(
+            [
+                ("model.embed_tokens.weight", full),
+                ("lm_head.weight", full.clone()),
+            ],
+            src_rank=0,
+        )
+        backend.flush_pending_transfers()
+
+        assert len(engine.transfers) == 1
+        session_id, _src_ptrs, peer_ptrs, lengths = engine.transfers[0]
+        assert session_id == "recv0:7000"
+        assert peer_ptrs == [0x1234_0000]
+        assert lengths == [full.numel() * full.element_size()]
 
     def test_transfer_bucket_uses_language_model_receiver_prefix_fallback(self):
         backend, engine = _make_backend()

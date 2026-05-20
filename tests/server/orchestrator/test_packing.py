@@ -63,6 +63,80 @@ def test_packing_enabled(simple_data):
     assert batch["position_ids"] == [[0, 1, 2, 0, 0, 1]]
 
 
+def test_opd_metadata_packs_as_token_aligned_fields():
+    """OPD teacher ids, cache refs, and weights survive packed dispatch."""
+    data = [
+        {
+            "input_ids": [1, 2, 3],
+            "target_tokens": [2, 3, 4],
+            "teacher_ids": [0, 0, 0],
+            "teacher_cache_indices": [10, 11, 12],
+            "teacher_weights": [1.0, 1.0, 0.5],
+        },
+        {
+            "input_ids": [5, 6],
+            "target_tokens": [6, 7],
+            "teacher_id": 2,
+            "teacher_cache_indices": [20, 21],
+            "teacher_weight": 0.25,
+        },
+    ]
+    packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=1)
+    batches = packer.pack(data, max_seq_len=100, request_id="opd")
+
+    assert len(batches) == 1
+    batch = batches[0]
+    assert batch["labels"] == [[2, 3, 4, 6, 7]]
+    assert batch["teacher_ids"] == [[0, 0, 0, 2, 2]]
+    assert batch["teacher_cache_indices"] == [[10, 11, 12, 20, 21]]
+    assert batch["teacher_weights"] == [[1.0, 1.0, 0.5, 0.25, 0.25]]
+
+
+def test_opd_metadata_shifts_with_hf_style_labels():
+    """OPD per-token fields stay aligned when packing shifts HF-style labels."""
+    data = [
+        {
+            "input_ids": [1, 2, 3, 4],
+            "labels": [10, 20, 30, 40],
+            "teacher_ids": [0, 0, 1, 1],
+            "teacher_cache_indices": [100, 101, 102, 103],
+            "teacher_weights": [1.0, 0.5, 0.25, 0.125],
+            "teacher_hidden_states": [
+                [1.0, 1.5],
+                [2.0, 2.5],
+                [3.0, 3.5],
+                [4.0, 4.5],
+            ],
+        }
+    ]
+    packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=1)
+    batches = packer.pack(data, max_seq_len=100, request_id="opd-hf")
+
+    assert len(batches) == 1
+    batch = batches[0]
+    assert batch["input_ids"] == [[1, 2, 3]]
+    assert batch["labels"] == [[20, 30, 40]]
+    assert batch["teacher_ids"] == [[0, 0, 1]]
+    assert batch["teacher_cache_indices"] == [[100, 101, 102]]
+    assert batch["teacher_weights"] == [[1.0, 0.5, 0.25]]
+    assert batch["teacher_hidden_states"] == [[[1.0, 1.5], [2.0, 2.5], [3.0, 3.5]]]
+
+
+def test_opd_teacher_hidden_states_pad_as_vectors():
+    data = [
+        {
+            "input_ids": [1, 2, 3],
+            "target_tokens": [2, 3, 4],
+            "teacher_hidden_states": [[1.0, 1.5], [2.0, 2.5], [3.0, 3.5]],
+        }
+    ]
+    packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=4)
+    batches = packer.pack(data, max_seq_len=100, request_id="opd-pad")
+
+    assert len(batches) == 1
+    assert batches[0]["teacher_hidden_states"] == [[[1.0, 1.5], [2.0, 2.5], [3.0, 3.5], [0.0, 0.0]]]
+
+
 def test_packing_exceeds_capacity(simple_data):
     """Samples overflow one batch -> split into multiple batches."""
     packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=1)

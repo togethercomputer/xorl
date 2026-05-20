@@ -25,10 +25,12 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from safetensors.torch import save_file
 from transformers import AutoTokenizer, PretrainedConfig
 
 from xorl.checkpoint import build_checkpointer
 from xorl.data.constants import IGNORE_INDEX
+from xorl.distillation import TeacherActivationCache, TeacherHeadManager
 from xorl.distributed.offloading import build_activation_offloading_context
 from xorl.distributed.parallel_state import get_parallel_state, init_parallel_state
 from xorl.distributed.pipeline_parallel import build_pipeline_schedule, build_pp_stage
@@ -37,9 +39,12 @@ from xorl.lora import LoraLinear
 from xorl.models.layers.moe.routing_replay import set_replay_stage
 from xorl.models.transformers.deepseek_v3.support import deepseek_v3_default_lora_targets
 from xorl.ops.loss import (
+    LossOutput,
+    OPDLossMetrics,
     TokenPartial,
     causallm_loss_function,
     importance_sampling_loss_function,
+    opd_loss_function,
     policy_loss_function,
 )
 from xorl.optim import build_optimizer
@@ -192,6 +197,32 @@ class ModelRunner:
             "_original_position_ids",
             "rollout_logprobs",
         },
+        "opd_loss": {
+            "labels",
+            "target_tokens",
+            "teacher_id",
+            "teacher_ids",
+            "teacher_weight",
+            "teacher_weights",
+            "teacher_cache_indices",
+            "teacher_hidden_states",
+            "_original_position_ids",
+        },
+        "teacher_hidden_cache": {
+            "labels",
+            "target_tokens",
+            "teacher_id",
+            "teacher_ids",
+            "teacher_weight",
+            "teacher_weights",
+            "teacher_cache_indices",
+            "teacher_hidden_states",
+            "_original_position_ids",
+            "num_samples",
+            "request_id",
+            "batch_id",
+            "_shifted",
+        },
     }
 
     def __init__(
@@ -248,6 +279,12 @@ class ModelRunner:
 
         # PP schedule cache: keyed by (n_microbatches, seq_len) to avoid rebuilding on every call.
         self._pp_schedule_cache: Dict[tuple, Any] = {}
+
+        # OPD teacher resource caches are initialized lazily from loss_fn_params.
+        self._opd_head_manager: Optional[TeacherHeadManager] = None
+        self._opd_head_config: Optional[Any] = None
+        self._opd_hidden_cache: Optional[TeacherActivationCache] = None
+        self._opd_hidden_config: Optional[Any] = None
 
         # Multi-adapter support (initialized later if LoRA is enabled)
         self._adapter_manager: Optional[LoRAAdapterManager] = None
@@ -937,12 +974,12 @@ class ModelRunner:
         return lm_head.weight
 
     def _collect_per_token_outputs(self, per_token_tensors, micro_batch, accumulators):
-        """Gather per-token outputs across Ulysses SP group and append to accumulators."""
+        """Gather per-token outputs across the unified SP group and append to accumulators."""
         ps = get_parallel_state()
 
         if ps.cp_enabled:
-            ulysses_group = ps.ulysses_group
-            cp_size = dist.get_world_size(ulysses_group)
+            sp_group = ps.sp_group
+            cp_size = ps.cp_size
 
             original_position_ids = micro_batch.get("_original_position_ids")
             if original_position_ids is not None:
@@ -961,7 +998,7 @@ class ModelRunner:
                     padding_dim=-1,
                     unpad_dim_size=original_seq_len,
                     scale_grad=False,
-                    group=ulysses_group,
+                    group=sp_group,
                 )
 
             if position_ids is not None:
@@ -983,6 +1020,481 @@ class ModelRunner:
         accumulators["logprobs"].append(gathered["logprobs"].cpu())
         if gathered.get("loss") is not None:
             accumulators["losses"].append(gathered["loss"].cpu())
+
+    @staticmethod
+    def _teacher_cache_dtype(dtype_name: str) -> torch.dtype:
+        mapping = {
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+            "fp16": torch.float16,
+            "float16": torch.float16,
+            "fp32": torch.float32,
+            "float32": torch.float32,
+        }
+        key = str(dtype_name).lower()
+        if key not in mapping:
+            raise ValueError(f"Unsupported teacher_hidden_cache_dtype={dtype_name!r}")
+        return mapping[key]
+
+    @staticmethod
+    def _position_spans(position_ids: torch.Tensor, num_samples: int) -> List[tuple[int, int]]:
+        pos = position_ids.reshape(-1).to(device="cpu", dtype=torch.long)
+        if pos.numel() == 0:
+            return []
+        starts = [0]
+        for i in range(1, pos.numel()):
+            if pos[i].item() <= pos[i - 1].item():
+                starts.append(i)
+        starts.append(pos.numel())
+        return [(starts[i], starts[i + 1]) for i in range(min(num_samples, len(starts) - 1))]
+
+    @staticmethod
+    def _valid_row_length(labels: Optional[torch.Tensor], row: int, fallback: int) -> int:
+        if labels is None or labels.numel() == 0:
+            return fallback
+        row_labels = labels[row].reshape(-1)
+        valid = row_labels != IGNORE_INDEX
+        if valid.any():
+            return int(valid.nonzero(as_tuple=True)[0][-1].item()) + 1
+        return 0
+
+    @staticmethod
+    def _teacher_cache_label_key(micro_batch: Dict[str, Any]) -> Optional[str]:
+        if isinstance(micro_batch.get("labels"), torch.Tensor):
+            return "labels"
+        if isinstance(micro_batch.get("target_tokens"), torch.Tensor):
+            return "target_tokens"
+        return None
+
+    def _gather_teacher_cache_sequences(
+        self,
+        hidden_states: torch.Tensor,
+        micro_batch: Dict[str, Any],
+        ps,
+    ) -> tuple[torch.Tensor, Dict[str, Any]]:
+        if not getattr(ps, "cp_enabled", False):
+            return hidden_states, micro_batch
+
+        original_position_ids = micro_batch.get("_original_position_ids")
+        if isinstance(original_position_ids, torch.Tensor):
+            original_seq_len = original_position_ids.shape[-1]
+        else:
+            original_seq_len = hidden_states.shape[1] * max(int(getattr(ps, "cp_size", 1)), 1)
+
+        sequence_group = getattr(ps, "sp_group", getattr(ps, "ulysses_group", None))
+        hidden_states = gather_outputs(
+            hidden_states,
+            gather_dim=1,
+            padding_dim=1,
+            unpad_dim_size=original_seq_len,
+            scale_grad=False,
+            group=sequence_group,
+        )
+
+        label_key = self._teacher_cache_label_key(micro_batch)
+        if label_key is None:
+            return hidden_states, micro_batch
+
+        labels = micro_batch[label_key]
+        if labels.shape[-1] == hidden_states.shape[1]:
+            return hidden_states, micro_batch
+
+        full_labels = gather_outputs(
+            labels,
+            gather_dim=-1,
+            padding_dim=-1,
+            unpad_dim_size=original_seq_len,
+            scale_grad=False,
+            group=sequence_group,
+        )
+        micro_batch = dict(micro_batch)
+        micro_batch[label_key] = full_labels
+        return hidden_states, micro_batch
+
+    def _teacher_cache_write_cp_rank(self, ps, write_rank: int) -> int:
+        if not getattr(ps, "cp_enabled", False):
+            return -1
+        if not (dist.is_available() and dist.is_initialized()):
+            return int(getattr(ps, "cp_rank", 0))
+
+        write_cp_rank = torch.tensor(
+            [int(getattr(ps, "cp_rank", -1)) if self.rank == write_rank else -1],
+            dtype=torch.long,
+            device=get_device_type(),
+        )
+        dist.broadcast(write_cp_rank, src=write_rank)
+        return int(write_cp_rank.item())
+
+    def _gather_teacher_cache_chunks(
+        self,
+        local_chunks: List[torch.Tensor],
+        *,
+        write_rank: int,
+        slice_key: Optional[int] = 0,
+    ) -> Optional[List[Dict[str, Any]]]:
+        payload = {"rank": int(self.rank), "slice_key": int(slice_key or 0), "chunks": local_chunks}
+        if not (dist.is_available() and dist.is_initialized()):
+            return [payload] if self.rank == write_rank else None
+
+        gathered = [None for _ in range(dist.get_world_size())] if self.rank == write_rank else None
+        dist.gather_object(payload, gathered, dst=write_rank)
+        return [item for item in gathered if item is not None] if self.rank == write_rank else None
+
+    def _write_teacher_hidden_cache(
+        self,
+        gathered_payloads: List[Dict[str, Any]],
+        *,
+        cache_path: str,
+        cache_key: str,
+        cache_dtype: torch.dtype,
+        now,
+    ) -> tuple[Dict[str, Any], float]:
+        chunks, cache_indices_by_sample = self._merge_teacher_hidden_cache_payloads(gathered_payloads)
+
+        if not chunks:
+            raise ValueError("teacher_hidden_cache produced no hidden-state chunks to write")
+
+        t_write = now()
+        os.makedirs(os.path.dirname(os.path.abspath(cache_path)) or ".", exist_ok=True)
+        hidden_cache = torch.cat(chunks, dim=0).contiguous()
+        tmp_path = f"{cache_path}.tmp-rank{self.rank}"
+        save_file({cache_key: hidden_cache}, tmp_path)
+        os.replace(tmp_path, cache_path)
+        write_s = now() - t_write
+
+        return (
+            {
+                "path": cache_path,
+                "tensor_key": cache_key,
+                "dtype": str(cache_dtype).removeprefix("torch."),
+                "num_tokens": int(hidden_cache.shape[0]),
+                "hidden_size": int(hidden_cache.shape[1]),
+                "cache_indices_by_sample": cache_indices_by_sample,
+            },
+            write_s,
+        )
+
+    def _teacher_hidden_chunks_from_batch(
+        self,
+        hidden_states: torch.Tensor,
+        micro_batch: Dict[str, Any],
+    ) -> List[torch.Tensor]:
+        """Split a teacher forward pass into real per-sample hidden-state chunks."""
+        hidden_states = hidden_states.detach()
+        position_ids = micro_batch.get("_original_position_ids", micro_batch.get("position_ids"))
+        labels = micro_batch.get("labels", micro_batch.get("target_tokens"))
+
+        if hidden_states.ndim != 3:
+            raise ValueError(f"Expected teacher hidden states [batch, seq, hidden], got {tuple(hidden_states.shape)}")
+
+        # Packed batches concatenate samples into batch row 0 and record the
+        # number of real samples. Padding is represented as one extra position-id
+        # segment, so use num_samples to drop it.
+        num_samples = int(micro_batch.get("num_samples", 0) or 0)
+        if num_samples > 0:
+            if position_ids is None:
+                raise ValueError("Packed teacher_hidden_cache batches require position_ids")
+            spans = self._position_spans(position_ids, num_samples)
+            flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
+            return [flat_hidden[start:end].contiguous() for start, end in spans if end > start]
+
+        chunks: List[torch.Tensor] = []
+        batch_size = hidden_states.shape[0]
+        for row in range(batch_size):
+            fallback_len = hidden_states.shape[1]
+            length = (
+                self._valid_row_length(labels, row, fallback_len) if isinstance(labels, torch.Tensor) else fallback_len
+            )
+            if length > 0:
+                chunks.append(hidden_states[row, :length].contiguous())
+        return chunks
+
+    def _teacher_hidden_cache_contributor_key(self, ps) -> Optional[int]:
+        """Return this rank's logical cache slice key, or None for duplicate shards."""
+        if getattr(ps, "cp_enabled", False) and int(getattr(ps, "cp_rank", 0)) != 0:
+            return None
+
+        if getattr(ps, "ep_enabled", False):
+            if int(getattr(ps, "ep_rank", 0)) != 0:
+                return None
+            ep_mesh = getattr(ps, "ep_fsdp_device_mesh", None)
+            if ep_mesh is not None:
+                try:
+                    return int(ep_mesh.get_local_rank("ep_fsdp"))
+                except Exception as exc:
+                    logger.debug(
+                        "Rank %s: could not read ep_fsdp local rank from EP mesh (%s); falling back to rank arithmetic",
+                        self.rank,
+                        exc,
+                    )
+
+            ep_size = max(1, int(getattr(ps, "ep_size", 1)))
+            ep_fsdp_size = max(1, int(getattr(ps, "dp_shard_in_ep_size", 1)))
+            pp_size = max(1, int(getattr(ps, "pp_size", 1)))
+            ranks_per_pp_stage = max(1, self.world_size // pp_size)
+            local_stage_rank = self.rank % ranks_per_pp_stage
+            return min(local_stage_rank // ep_size, ep_fsdp_size - 1)
+
+        return int(getattr(ps, "dp_rank", 0))
+
+    @staticmethod
+    def _merge_teacher_hidden_cache_payloads(payloads: List[Optional[Dict[str, Any]]]):
+        """Merge per-rank teacher-cache chunks in logical data-slice order."""
+        chunks: List[torch.Tensor] = []
+        cache_indices_by_sample: List[List[int]] = []
+        next_index = 0
+        ordered_payloads = sorted(
+            (payload for payload in payloads if payload),
+            key=lambda payload: (int(payload["slice_key"]), int(payload["rank"])),
+        )
+        for payload in ordered_payloads:
+            for chunk in payload["chunks"]:
+                rows = int(chunk.shape[0])
+                cache_indices_by_sample.append(list(range(next_index, next_index + rows)))
+                next_index += rows
+                chunks.append(chunk)
+        return chunks, cache_indices_by_sample
+
+    def _forward_teacher_hidden_cache(
+        self,
+        micro_batches: List[Dict[str, Any]],
+        params: Dict[str, Any],
+        abort_callback=None,
+    ) -> Dict[str, Any]:
+        if self.pp_enabled:
+            raise NotImplementedError("teacher_hidden_cache does not yet support pipeline parallelism")
+
+        cache_path = (
+            params.get("teacher_hidden_cache_path") or params.get("hidden_cache_path") or params.get("output_path")
+        )
+        if not cache_path:
+            raise ValueError(
+                "teacher_hidden_cache requires loss_fn_params.teacher_hidden_cache_path "
+                "(or hidden_cache_path/output_path)"
+            )
+
+        cache_key = params.get("teacher_hidden_cache_key", "hidden_states")
+        cache_dtype = self._teacher_cache_dtype(params.get("teacher_hidden_cache_dtype", "bfloat16"))
+        write_rank = int(params.get("teacher_hidden_cache_write_rank", 0))
+        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else self.world_size
+        if write_rank < 0 or write_rank >= world_size:
+            raise ValueError(f"teacher_hidden_cache_write_rank={write_rank} is outside world_size={world_size}")
+
+        profile_sync_cuda = bool(params.get("opd_profile_sync_cuda", False))
+
+        def _now() -> float:
+            if profile_sync_cuda and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            return time.perf_counter()
+
+        ps = get_parallel_state()
+        contributor_key = self._teacher_hidden_cache_contributor_key(ps)
+        write_cp_rank = self._teacher_cache_write_cp_rank(ps, write_rank)
+        is_contributor = contributor_key is not None and (
+            not getattr(ps, "cp_enabled", False) or int(getattr(ps, "cp_rank", 0)) == write_cp_rank
+        )
+
+        forward_compute_s = 0.0
+        local_chunks: List[torch.Tensor] = []
+
+        for micro_batch in micro_batches:
+            if abort_callback and abort_callback():
+                raise RuntimeError("Execution aborted by request")
+
+            micro_batch = {
+                k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v
+                for k, v in micro_batch.items()
+            }
+
+            model_inputs = {
+                k: v for k, v in micro_batch.items() if k not in self._LOSS_EXCLUDE_KEYS["teacher_hidden_cache"]
+            }
+
+            t_forward = _now()
+            with self.model_fwd_context:
+                outputs = self.model(**model_inputs, use_cache=False, output_hidden_states=False)
+            hidden_states, micro_batch = self._gather_teacher_cache_sequences(
+                outputs.last_hidden_state, micro_batch, ps
+            )
+            forward_compute_s += _now() - t_forward
+
+            if is_contributor:
+                for chunk in self._teacher_hidden_chunks_from_batch(hidden_states, micro_batch):
+                    local_chunks.append(chunk.to(device="cpu", dtype=cache_dtype))
+
+            del outputs, hidden_states, micro_batch, model_inputs
+
+        gathered_payloads = self._gather_teacher_cache_chunks(
+            local_chunks,
+            write_rank=write_rank,
+            slice_key=contributor_key,
+        )
+
+        cache_metadata = None
+        write_s = 0.0
+        if self.rank == write_rank:
+            cache_metadata, write_s = self._write_teacher_hidden_cache(
+                gathered_payloads or [],
+                cache_path=cache_path,
+                cache_key=cache_key,
+                cache_dtype=cache_dtype,
+                now=_now,
+            )
+
+        if dist.is_available() and dist.is_initialized():
+            metadata_box = [cache_metadata]
+            dist.broadcast_object_list(metadata_box, src=write_rank)
+            cache_metadata = metadata_box[0]
+
+        if cache_metadata is None:
+            raise RuntimeError("teacher_hidden_cache metadata was not produced")
+
+        result = {
+            "total_loss": 0.0,
+            "global_valid_tokens": cache_metadata["num_tokens"],
+            "teacher_hidden_cache": cache_metadata,
+            "teacher_prefill_tokens": cache_metadata["num_tokens"],
+            "teacher_prefill_forward_compute_s": forward_compute_s,
+            "teacher_hidden_cache_write_s": write_s,
+        }
+        return result
+
+    @staticmethod
+    def _metric_accumulator_key(metric_name: str, loss_fn: str) -> tuple[str, str] | None:
+        """Return output metric key and reduction mode for a loss metric."""
+        if loss_fn == "opd_loss":
+            if metric_name == "valid_tokens":
+                # The top-level global_valid_tokens field already reports this.
+                return None
+            if metric_name == "opd_num_teachers":
+                return "opd_num_teachers:max", "max"
+            if metric_name.startswith("opd_profile_") and metric_name.endswith("_ms"):
+                return metric_name, "sum_max"
+            if metric_name.startswith("opd_"):
+                return metric_name, "mean"
+            return None
+
+        if metric_name == "ratio_min":
+            return "is_ratio_min", "min"
+        if metric_name == "ratio_max":
+            return "is_ratio_max", "max"
+        return f"is_{metric_name}", "mean"
+
+    @staticmethod
+    def _accumulate_loss_metrics(accumulated, new_metrics, loss_fn: str, metric_ops=None):
+        """Accumulate loss-specific metrics across micro-batches.
+
+        RL loss metrics are reducer partials, so mean metrics already carry a
+        token-sum share. OPD keeps human-readable per-micro-batch means for its
+        namespaced metrics, so those are weighted by valid-token count here.
+        """
+        if not new_metrics:
+            return
+        metric_ops = metric_ops or {}
+        new_metrics = dict(new_metrics)
+        new_metrics.pop("_n_valid_kl", None)
+        n_tokens = float(new_metrics.get("valid_tokens", 1))
+        device = get_device_type()
+        for k, v in new_metrics.items():
+            accumulator_key = ModelRunner._metric_accumulator_key(k, loss_fn)
+            if accumulator_key is None:
+                continue
+            output_key, default_op = accumulator_key
+            op = metric_ops.get(k, default_op)
+            value = torch.as_tensor(v, dtype=torch.float64, device=device)
+
+            if op in ("min", "max"):
+                entry = accumulated.get(output_key)
+                if entry is None:
+                    accumulated[output_key] = {"value": value.clone(), "op": op}
+                else:
+                    entry["value"] = (
+                        torch.minimum(entry["value"], value) if op == "min" else torch.maximum(entry["value"], value)
+                    )
+                continue
+
+            if op == "sum_max":
+                entry = accumulated.get(output_key)
+                if entry is None:
+                    accumulated[output_key] = {"sum": value.clone(), "op": op}
+                else:
+                    entry["sum"] = entry["sum"] + value
+                continue
+
+            if loss_fn == "opd_loss":
+                value_sum = value * n_tokens
+                count = n_tokens
+            elif k == "valid_tokens":
+                value_sum = value
+                count = 1.0
+            else:
+                value_sum = value
+                count = n_tokens
+
+            entry = accumulated.get(output_key)
+            if entry is None:
+                accumulated[output_key] = {"sum": value_sum.clone(), "count": float(count), "op": "mean"}
+            else:
+                entry["sum"] = entry["sum"] + value_sum
+                entry["count"] += float(count)
+
+    @staticmethod
+    def _finalize_loss_metrics(accumulated, result, loss_fn: Optional[str] = None):
+        """All-reduce loss metrics, then add reduced values to result dict."""
+        if not accumulated:
+            return
+        ps = get_parallel_state()
+        if loss_fn is None and all(str(k).startswith("opd_") for k in accumulated):
+            loss_fn = "opd_loss"
+
+        if loss_fn == "opd_loss":
+            reduce_group = ps.loss_group if ps.loss_parallel_enabled else None
+            should_reduce = ps.loss_parallel_enabled and dist.is_available() and dist.is_initialized()
+        else:
+            reduce_group = ps.dp_group if ps.dp_enabled else None
+            should_reduce = ps.dp_enabled and dist.is_available() and dist.is_initialized()
+
+        groups: Dict[str, list[str]] = {"mean": [], "min": [], "max": [], "sum_max": []}
+        for k, entry in accumulated.items():
+            groups[entry["op"]].append(k)
+
+        if groups["mean"]:
+            keys = groups["mean"]
+            sums = torch.stack([accumulated[k]["sum"] for k in keys])
+            counts = torch.tensor(
+                [accumulated[k]["count"] for k in keys],
+                dtype=torch.float64,
+                device=get_device_type(),
+            )
+            if should_reduce:
+                sums_and_counts = torch.cat([sums, counts])
+                dist.all_reduce(sums_and_counts, op=dist.ReduceOp.SUM, group=reduce_group)
+                sums, counts = sums_and_counts[: len(keys)], sums_and_counts[len(keys) :]
+            means = (sums / counts.clamp(min=1.0)).tolist()
+            mask = (counts > 0).tolist()
+            for i, k in enumerate(keys):
+                if mask[i]:
+                    result[k] = means[i]
+
+        for op_name, reduce_op in (("min", dist.ReduceOp.MIN), ("max", dist.ReduceOp.MAX)):
+            if not groups[op_name]:
+                continue
+            keys = groups[op_name]
+            stacked = torch.stack([accumulated[k]["value"] for k in keys])
+            if should_reduce:
+                dist.all_reduce(stacked, op=reduce_op, group=reduce_group)
+            values = stacked.tolist()
+            for k, v in zip(keys, values):
+                result[k] = v if math.isfinite(v) else 1.0
+
+        if groups["sum_max"]:
+            keys = groups["sum_max"]
+            stacked = torch.stack([accumulated[k]["sum"] for k in keys])
+            if should_reduce:
+                dist.all_reduce(stacked, op=dist.ReduceOp.MAX, group=reduce_group)
+            values = stacked.tolist()
+            for k, v in zip(keys, values):
+                result[k] = v if math.isfinite(v) else 0.0
 
     @staticmethod
     def _metric_to_float(value):
@@ -1077,9 +1589,270 @@ class ModelRunner:
         group = get_parallel_state().fsdp_group if self.pp_enabled else None
         return count_active_microbatches(micro_batches, group=group)
 
+    @staticmethod
+    def _opd_param(params: Dict[str, Any], *names: str, default=None):
+        for name in names:
+            if name in params:
+                return params[name]
+        return default
+
+    def _get_opd_head_manager(self, params: Dict[str, Any]) -> TeacherHeadManager:
+        teacher_heads = self._opd_param(
+            params,
+            "teacher_heads",
+            "opd_teacher_heads",
+            default=self.train_config.get("opd_teacher_heads"),
+        )
+        if not teacher_heads:
+            raise ValueError("opd_loss requires loss_fn_params.teacher_heads (or train.opd_teacher_heads)")
+        config_key = repr(teacher_heads)
+        if self._opd_head_manager is None or self._opd_head_config != config_key:
+            self._opd_head_manager = TeacherHeadManager(teacher_heads)
+            self._opd_head_config = config_key
+        return self._opd_head_manager
+
+    def _get_opd_hidden_cache(self, params: Dict[str, Any]) -> TeacherActivationCache:
+        hidden_caches = self._opd_param(
+            params,
+            "teacher_hidden_caches",
+            "opd_teacher_hidden_caches",
+            "teacher_hidden_path",
+            "opd_teacher_hidden_path",
+            default=self.train_config.get("opd_teacher_hidden_caches")
+            or self.train_config.get("opd_teacher_hidden_path"),
+        )
+        if not hidden_caches:
+            raise ValueError(
+                "opd_loss requires teacher_hidden_states in the batch or "
+                "loss_fn_params.teacher_hidden_caches/teacher_hidden_path"
+            )
+        config_key = repr(hidden_caches)
+        if self._opd_hidden_cache is None or self._opd_hidden_config != config_key:
+            self._opd_hidden_cache = TeacherActivationCache(hidden_caches)
+            self._opd_hidden_config = config_key
+        return self._opd_hidden_cache
+
+    def _get_opd_teacher_hidden_states(
+        self,
+        micro_batch: Dict[str, Any],
+        teacher_id: int,
+        params: Dict[str, Any],
+        dtype: torch.dtype,
+        teacher_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if "teacher_hidden_states" in micro_batch:
+            return micro_batch["teacher_hidden_states"].to(get_device_type(), dtype=dtype, non_blocking=True)
+
+        cache_indices = micro_batch.get("teacher_cache_indices")
+        if cache_indices is None:
+            raise ValueError("opd_loss requires teacher_cache_indices when teacher_hidden_states are not provided")
+
+        if teacher_mask is not None:
+            mask = teacher_mask.to(device=cache_indices.device)
+            selected_indices = cache_indices[mask]
+            if selected_indices.numel() == 0:
+                raise ValueError(f"No cache indices available for teacher_id={teacher_id}")
+            cache_indices = cache_indices.masked_fill(~mask, selected_indices.reshape(-1)[0])
+
+        cache = self._get_opd_hidden_cache(params)
+        return cache.get(teacher_id, cache_indices, device=get_device_type(), dtype=dtype)
+
+    def _compute_opd_micro_batch_loss(
+        self,
+        hidden_states: torch.Tensor,
+        student_weight: torch.Tensor,
+        micro_batch: Dict[str, Any],
+        params: Dict[str, Any],
+        loss_reducer=None,
+        student_lm_head=None,
+    ) -> LossOutput:
+        if get_parallel_state().tp_enabled:
+            raise NotImplementedError("opd_loss does not yet support tensor parallelism")
+        if self.pp_enabled:
+            # Mirrors the dispatcher-level guard in _run_forward_backward / _run_forward —
+            # belt-and-suspenders so a future direct caller can't accidentally launch
+            # OPD under PP without that pathway being thought through.
+            raise NotImplementedError("opd_loss does not yet support pipeline parallelism")
+
+        labels = micro_batch.get("labels", micro_batch.get("target_tokens"))
+        if labels is None:
+            raise ValueError("opd_loss requires labels or target_tokens for its valid-token mask")
+
+        teacher_ids = micro_batch.get("teacher_ids")
+        if teacher_ids is None:
+            default_teacher_id = int(params.get("teacher_id", 0))
+            teacher_ids = torch.full_like(labels, default_teacher_id)
+        else:
+            teacher_ids = teacher_ids.to(labels.device)
+
+        teacher_weights = micro_batch.get("teacher_weights")
+        if teacher_weights is None and "teacher_weight" in params:
+            teacher_weights = torch.full(labels.shape, float(params["teacher_weight"]), device=labels.device)
+
+        valid_mask = labels != IGNORE_INDEX
+        local_valid_tokens = valid_mask.sum()
+        lm_head_anchor = self._lm_head_forward_anchor(hidden_states, student_lm_head)
+        if local_valid_tokens.item() == 0:
+            # fp32 to match opd_loss_function's fp32 normal-return path. With
+            # ulysses sequence sharding, ranks with no response tokens hit this
+            # branch while the rank holding the response runs the fp32 KL kernel.
+            # A dtype mismatch corrupts the cross-rank all_reduce in the loss
+            # reporter (mixed-dtype byte reinterpretation).
+            loss = hidden_states.float().sum() * 0.0 + student_weight.float().sum() * 0.0 + lm_head_anchor
+            return LossOutput(loss=loss, metrics=OPDLossMetrics(valid_tokens=0).to_dict())
+
+        head_manager = self._get_opd_head_manager(params)
+        unique_teacher_ids = sorted(int(x) for x in torch.unique(teacher_ids[valid_mask]).tolist())
+        kl_backend = params.get("opd_kl_backend", params.get("kl_backend", "torch_compile"))
+        use_sharded_backend = str(kl_backend).lower() in {"streaming", "tilelang"}
+        async_prefetch = bool(params.get("opd_async_prefetch", True))
+        teacher_head_fp32 = bool(params.get("teacher_lm_head_fp32", True))
+        teacher_head_dtype = torch.float32 if teacher_head_fp32 else student_weight.dtype
+        sharded_head_cpu_cache = bool(params.get("opd_sharded_head_cpu_cache", True))
+        sharded_head_device_cache = bool(params.get("opd_sharded_head_device_cache", False))
+        profile_timings = bool(params.get("opd_profile_timings", False))
+        profile_sync_cuda = bool(params.get("opd_profile_sync_cuda", False))
+
+        def _profile_now() -> float:
+            if profile_sync_cuda and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            return time.perf_counter()
+
+        def _profile_elapsed_ms(start: float) -> float:
+            return (_profile_now() - start) * 1000.0
+
+        profile_total_start = _profile_now() if profile_timings else 0.0
+        profile_prefetch_ms = 0.0
+        profile_hidden_fetch_ms = 0.0
+        profile_head_prepare_ms = 0.0
+        profile_kl_compute_ms = 0.0
+
+        hidden_cache = None
+        if async_prefetch:
+            profile_start = _profile_now() if profile_timings else 0.0
+            if not (use_sharded_backend and head_manager.has_sharded_head(unique_teacher_ids[0])):
+                head_manager.prefetch(unique_teacher_ids[0])
+            if "teacher_hidden_states" not in micro_batch:
+                hidden_cache = self._get_opd_hidden_cache(params)
+                hidden_cache.prefetch(unique_teacher_ids[0])
+            if profile_timings:
+                profile_prefetch_ms += _profile_elapsed_ms(profile_start)
+        if loss_reducer is None:
+            loss_reducer = TokenPartial(scale=torch.tensor(1.0, device=hidden_states.device))
+
+        # fp32 — matches opd_loss_function's fp32 return; consistent across ranks.
+        total_loss = hidden_states.float().sum() * 0.0 + student_weight.float().sum() * 0.0 + lm_head_anchor
+        weighted_kl_metric = 0.0
+        kl_sum = 0.0
+        teacher_weight_sum = 0.0
+        valid_count = int(local_valid_tokens.item())
+
+        for teacher_index, teacher_id_int in enumerate(unique_teacher_ids):
+            if async_prefetch and teacher_index + 1 < len(unique_teacher_ids):
+                profile_start = _profile_now() if profile_timings else 0.0
+                next_teacher_id = unique_teacher_ids[teacher_index + 1]
+                if not (use_sharded_backend and head_manager.has_sharded_head(next_teacher_id)):
+                    head_manager.prefetch(next_teacher_id)
+                if hidden_cache is not None:
+                    hidden_cache.prefetch(next_teacher_id)
+                if profile_timings:
+                    profile_prefetch_ms += _profile_elapsed_ms(profile_start)
+            teacher_mask = valid_mask & (teacher_ids == teacher_id_int)
+            if not teacher_mask.any():
+                continue
+
+            group_labels = labels.masked_fill(~teacher_mask, IGNORE_INDEX)
+            profile_start = _profile_now() if profile_timings else 0.0
+            teacher_hidden_states = self._get_opd_teacher_hidden_states(
+                micro_batch,
+                teacher_id_int,
+                params,
+                dtype=hidden_states.dtype,
+                teacher_mask=teacher_mask,
+            )
+            if profile_timings:
+                profile_hidden_fetch_ms += _profile_elapsed_ms(profile_start)
+
+            profile_start = _profile_now() if profile_timings else 0.0
+            if use_sharded_backend and head_manager.has_sharded_head(teacher_id_int):
+                teacher_head = head_manager.sharded_view(
+                    teacher_id_int,
+                    device=get_device_type(),
+                    dtype=teacher_head_dtype,
+                    cache_cpu=sharded_head_cpu_cache,
+                    cache_device=sharded_head_device_cache,
+                )
+            else:
+                teacher_head = head_manager.get(
+                    teacher_id_int,
+                    device=get_device_type(),
+                    dtype=teacher_head_dtype,
+                )
+            if profile_timings:
+                profile_head_prepare_ms += _profile_elapsed_ms(profile_start)
+
+            profile_start = _profile_now() if profile_timings else 0.0
+            result = opd_loss_function(
+                hidden_states=hidden_states,
+                weight=student_weight,
+                labels=group_labels,
+                teacher_hidden_states=teacher_hidden_states,
+                teacher_lm_head_weight=teacher_head,
+                teacher_weights=teacher_weights,
+                ignore_index=IGNORE_INDEX,
+                num_chunks=params.get("num_chunks", 8),
+                lm_head_fp32=self.lm_head_fp32,
+                teacher_lm_head_fp32=teacher_head_fp32,
+                kl_backend=kl_backend,
+                vocab_chunk_size=params.get("opd_vocab_chunk_size", params.get("vocab_chunk_size", 32768)),
+                return_per_token=False,
+                loss_reducer=loss_reducer,
+            )
+            if profile_timings:
+                profile_kl_compute_ms += _profile_elapsed_ms(profile_start)
+            total_loss = total_loss + result.loss
+
+            metrics = result.metrics or {}
+            group_valid = int(metrics.get("valid_tokens", teacher_mask.sum().item()))
+            kl_sum += float(metrics.get("opd_kl", 0.0)) * group_valid
+            teacher_weight_sum += float(metrics.get("opd_teacher_weight_mean", 1.0)) * group_valid
+            weighted_kl_metric += float(metrics.get("opd_weighted_kl", 0.0)) * group_valid
+
+        metrics = OPDLossMetrics(
+            valid_tokens=valid_count,
+            opd_kl=kl_sum / max(valid_count, 1),
+            opd_weighted_kl=weighted_kl_metric / max(valid_count, 1),
+            opd_teacher_weight_mean=teacher_weight_sum / max(valid_count, 1),
+            opd_num_teachers=len(unique_teacher_ids),
+        ).to_dict()
+        if profile_timings:
+            metrics.update(
+                {
+                    "opd_profile_prefetch_ms": profile_prefetch_ms,
+                    "opd_profile_hidden_fetch_ms": profile_hidden_fetch_ms,
+                    "opd_profile_head_prepare_ms": profile_head_prepare_ms,
+                    "opd_profile_kl_compute_ms": profile_kl_compute_ms,
+                    "opd_profile_total_ms": _profile_elapsed_ms(profile_total_start),
+                }
+            )
+
+        return LossOutput(
+            loss=total_loss,
+            metrics=metrics,
+        )
+
     # =========================================================================
     # Loss computation dispatch
     # =========================================================================
+
+    @staticmethod
+    def _lm_head_forward_anchor(hidden_states: torch.Tensor, lm_head) -> torch.Tensor:
+        """Run lm_head.forward with zero loss contribution for FSDP hook ordering."""
+        if lm_head is None or hidden_states.numel() == 0:
+            return hidden_states.float().sum() * 0.0
+        hidden_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+        logits = lm_head(hidden_flat[:1])
+        return logits.float().sum() * 0.0
 
     def _compute_micro_batch_loss(self, micro_batch, loss_fn, loss_fn_params):
         """Compute loss for a single micro-batch."""
@@ -1092,7 +1865,10 @@ class ModelRunner:
         outputs = self.model(**model_inputs, use_cache=False, output_hidden_states=False)
         hidden_states = outputs.last_hidden_state
         effective_weight = self._get_effective_lm_head_weight()
-        metric_sum_reducer = TokenPartial(scale=hidden_states.new_tensor(1.0, dtype=torch.float32))
+
+        # scale=1 → loss_fns return raw masked sums; normalization deferred to
+        # optim_step / _finalize_is_metrics.
+        token_sum_reducer = TokenPartial(scale=torch.tensor(1.0, device=hidden_states.device))
 
         per_token_outputs = {}
         is_metrics = None
@@ -1108,7 +1884,7 @@ class ModelRunner:
                 ce_mode=self.ce_mode,
                 lm_head_fp32=self.lm_head_fp32,
             )
-            loss = _result.loss
+            local_loss_sum = _result.loss
             if return_per_token:
                 per_token_outputs["logprobs"] = _result.per_token_logprobs
                 per_token_outputs["loss"] = _result.per_token_loss
@@ -1128,9 +1904,9 @@ class ModelRunner:
                 ce_mode=self.ce_mode,
                 compute_kl_stats=compute_kl_stats,
                 lm_head_fp32=self.lm_head_fp32,
-                metric_reducer=metric_sum_reducer,
+                metric_reducer=token_sum_reducer,
             )
-            loss = _result.loss
+            local_loss_sum = _result.loss
             per_token_outputs["logprobs"] = _result.per_token_logprobs
             is_metrics = _result.metrics
             is_metric_ops = _result.metric_ops
@@ -1234,9 +2010,9 @@ class ModelRunner:
                 compute_kl_stats=compute_kl_stats,
                 lm_head_fp32=self.lm_head_fp32,
                 icepop_beta=icepop_beta,
-                metric_reducer=metric_sum_reducer,
+                metric_reducer=token_sum_reducer,
             )
-            loss = _result.loss
+            local_loss_sum = _result.loss
             per_token_outputs["logprobs"] = _result.per_token_logprobs
             is_metrics = _result.metrics
             is_metric_ops = _result.metric_ops
@@ -1248,10 +2024,22 @@ class ModelRunner:
                     is_metric_ops,
                 )
 
+        elif loss_fn == "opd_loss":
+            _result = self._compute_opd_micro_batch_loss(
+                hidden_states=hidden_states,
+                student_weight=effective_weight,
+                micro_batch=micro_batch,
+                params=params,
+                loss_reducer=token_sum_reducer,
+                student_lm_head=getattr(self.model, "lm_head", None),
+            )
+            local_loss_sum = _result.loss
+            is_metrics = _result.metrics
+
         else:
             raise ValueError(f"Unknown loss_fn: {loss_fn}")
 
-        return loss, per_token_outputs, is_metrics, is_metric_ops, outputs
+        return local_loss_sum, per_token_outputs, is_metrics, is_metric_ops, outputs
 
     # =========================================================================
     # Per-sample K3 KL divergence
@@ -1322,6 +2110,15 @@ class ModelRunner:
         params = loss_fn_params or {}
         use_distsignsgd = getattr(self, "_use_distsignsgd", False)
 
+        if loss_fn == "teacher_hidden_cache":
+            if compute_backward:
+                raise ValueError("teacher_hidden_cache is a forward-only operation")
+            try:
+                return self._forward_teacher_hidden_cache(micro_batches, params, abort_callback=abort_callback)
+            finally:
+                if r3_enabled:
+                    self._routing_handler.cleanup()
+
         # Count valid tokens globally
         global_valid_tokens = self._count_global_valid_tokens(micro_batches)
         if compute_backward and use_distsignsgd:
@@ -1333,8 +2130,20 @@ class ModelRunner:
             raise RuntimeError("Execution aborted by request")
 
         total_loss = 0.0
-        accumulated_is_metrics = {}
+        accumulated_loss_metrics = {}
         accumulators = {"logprobs": [], "losses": [], "position_ids": []}
+        profile_phase_timings = bool(params.get("profile_phase_timings", params.get("opd_profile_timings", False)))
+        profile_sync_cuda = bool(params.get("opd_profile_sync_cuda", False))
+        forward_compute_time = 0.0
+        backward_compute_time = 0.0
+
+        def _profile_phase_now() -> float:
+            if profile_sync_cuda and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            return time.perf_counter()
+
+        def _profile_phase_elapsed(start: float) -> float:
+            return _profile_phase_now() - start
 
         # Per-sample K3 deferred computation
         compute_per_sample_k3 = params.get("compute_per_sample_k3", False)
@@ -1359,14 +2168,17 @@ class ModelRunner:
                 set_replay_stage("replay_forward")
 
             # Forward pass + loss computation
+            profile_start = _profile_phase_now() if profile_phase_timings else 0.0
             with self.model_fwd_context:
-                loss, per_token_outputs, is_metrics, is_metric_ops, outputs = self._compute_micro_batch_loss(
+                local_loss_sum, per_token_outputs, is_metrics, is_metric_ops, outputs = self._compute_micro_batch_loss(
                     micro_batch, loss_fn, params
                 )
+            if profile_phase_timings:
+                forward_compute_time += _profile_phase_elapsed(profile_start)
 
             logger.debug(
                 f"Rank {self.rank}: micro_batch {batch_idx}/{len(micro_batches)} "
-                f"loss={loss.item():.6f}, local_valid_tokens={local_valid_tokens.item()}, "
+                f"loss_sum={local_loss_sum.item():.6f}, local_valid_tokens={local_valid_tokens.item()}, "
                 f"global_valid_tokens={global_valid_tokens.item()}"
             )
             # Note: loss is always finite even when local_valid_tokens=0, because
@@ -1424,7 +2236,6 @@ class ModelRunner:
             # which is critical for FSDP2 reduce-scatter collectives.
             if compute_backward:
                 ps = get_parallel_state()
-                raw_loss = loss * local_valid_tokens.detach().float()
 
                 if abort_callback and abort_callback():
                     raise RuntimeError("Execution aborted by request")
@@ -1433,27 +2244,32 @@ class ModelRunner:
                 if r3_enabled:
                     set_replay_stage("replay_backward")
 
+                profile_start = _profile_phase_now() if profile_phase_timings else 0.0
                 with self.model_bwd_context:
-                    raw_loss.backward()
+                    local_loss_sum.backward()
+                if profile_phase_timings:
+                    backward_compute_time += _profile_phase_elapsed(profile_start)
 
                 # Loss reporting (separately, no grad): compute normalized per-token loss
                 with torch.no_grad():
-                    loss_report = loss.detach() * local_valid_tokens
+                    # Cast to fp32 before the cross-rank reduction: with ulysses SP,
+                    # ranks holding only IGNORE_INDEX tokens may hit early-return
+                    # paths with a different dtype than the normal-return path.
+                    loss_report = local_loss_sum.detach().float()
                     dist.all_reduce(loss_report, op=dist.ReduceOp.SUM, group=ps.fsdp_group if self.pp_enabled else None)
                     if global_valid_tokens.item() > 0:
                         total_loss += (loss_report / global_valid_tokens).item()
             else:
                 # Forward-only: accumulate weighted loss
                 if global_valid_tokens.item() > 0:
-                    total_loss += loss.item() * (local_valid_tokens.item() / global_valid_tokens.item())
+                    total_loss += local_loss_sum.item() / global_valid_tokens.item()
 
-            # Accumulate IS metrics
-            self._accumulate_is_metrics(accumulated_is_metrics, is_metrics, is_metric_ops)
+            # Accumulate loss-specific metrics. RL losses keep the historical
+            # `is_*` prefix; OPD metrics are already namespaced as `opd_*`.
+            self._accumulate_loss_metrics(accumulated_loss_metrics, is_metrics, loss_fn, metric_ops)
 
             # Cleanup
-            del micro_batch, outputs, loss
-            if compute_backward:
-                del raw_loss
+            del micro_batch, outputs, local_loss_sum
 
         # Note: gc.collect() + empty_cache() removed from per-step path.
         # They cost ~250ms + ~50ms per step (profiled on Qwen3-8B 8xH100).
@@ -1482,11 +2298,27 @@ class ModelRunner:
                     self._accumulated_active_voter_total.get(model_id, 0) + active_voter_total
                 )
 
+        if profile_phase_timings and dist.is_available() and dist.is_initialized():
+            phase_times = torch.tensor(
+                [forward_compute_time, backward_compute_time],
+                dtype=torch.float64,
+                device=get_device_type(),
+            )
+            dist.all_reduce(phase_times, op=dist.ReduceOp.MAX)
+            forward_compute_time = float(phase_times[0].item())
+            backward_compute_time = float(phase_times[1].item())
+
         # Build result
         result = {
             "total_loss": total_loss,
             "global_valid_tokens": global_valid_tokens.item(),
         }
+        if profile_phase_timings:
+            result["forward_compute_time"] = forward_compute_time
+            result["backward_compute_time"] = backward_compute_time
+            if loss_fn == "opd_loss":
+                result["opd_profile_forward_compute_s"] = forward_compute_time
+                result["opd_profile_backward_compute_s"] = backward_compute_time
 
         if accumulators["logprobs"]:
             result["packed_logprobs"] = [t.tolist() for t in accumulators["logprobs"]]
@@ -1503,8 +2335,8 @@ class ModelRunner:
                 all_per_sample_k3.extend(per_sample)
             result["per_sample_k3"] = all_per_sample_k3
 
-        # All-reduce IS metrics across DP and add to result
-        self._finalize_is_metrics(accumulated_is_metrics, result)
+        # All-reduce loss-specific metrics across DP and add to result.
+        self._finalize_loss_metrics(accumulated_loss_metrics, result, loss_fn)
 
         synchronize()
         return result
@@ -1637,6 +2469,9 @@ class ModelRunner:
         # Get return_per_token flag from loss_fn_params (default True for tinker compatibility)
         params = loss_fn_params or {}
         use_distsignsgd = getattr(self, "_use_distsignsgd", False)
+
+        if self.pp_enabled and loss_fn == "opd_loss":
+            raise NotImplementedError("opd_loss does not yet support pipeline parallelism")
 
         # Reference forward pass: compute Xorl's own logprobs to replace SGLang logprobs
         # This guarantees KL=0 at step 0 since both old and new logprobs come from the same engine
@@ -1790,6 +2625,23 @@ class ModelRunner:
         result["forward_backward_time"] = time.time() - start_time
         result["model_id"] = model_id
 
+        if params.get("profile_clear_gradients_after_backward", False):
+            clear_start = time.perf_counter()
+            synchronize()
+            if self.optimizer is not None:
+                try:
+                    self.optimizer.zero_grad(set_to_none=True)
+                except TypeError:
+                    self.optimizer.zero_grad()
+            if self.model is not None:
+                self.model.zero_grad(set_to_none=True)
+            self._accumulated_valid_tokens[model_id] = 0
+            self._accumulated_active_microbatches[model_id] = 0
+            self._accumulated_active_voter_total[model_id] = 0
+            gc.collect()
+            torch.cuda.empty_cache()
+            result["opd_profile_clear_gradients_ms"] = (time.perf_counter() - clear_start) * 1000.0
+
         # Increment step counter (use adapter manager if available, else global)
         if self._adapter_manager is not None:
             self._adapter_manager.increment_forward_backward_step(model_id)
@@ -1853,6 +2705,9 @@ class ModelRunner:
         validate_token_ids(micro_batches, self.model.config.vocab_size)
 
         start_time = time.time()
+
+        if self.pp_enabled and loss_fn == "opd_loss":
+            raise NotImplementedError("opd_loss does not yet support pipeline parallelism")
 
         r3_enabled = self._routing_handler.setup(micro_batches, routed_experts, routed_expert_logits)
 
@@ -1990,6 +2845,10 @@ class ModelRunner:
 
             # Optimizer step
             self.optimizer.step()
+            # Fused/foreach optimizer kernels can still be reading gradients when
+            # Python reaches zero_grad/empty_cache. Synchronize before releasing
+            # grad storage to avoid allocator reuse while those kernels are live.
+            synchronize()
             try:
                 self.optimizer.zero_grad(set_to_none=True)
             except TypeError:

@@ -1724,6 +1724,9 @@ class P2PTransportBackend(WeightTransportBackend):
         for name, tensor in bucket:
             locators = self._locators_for_source_name(name)
             if not locators:
+                if self._should_skip_missing_tied_locator(name):
+                    logger.info("[P2P] skipping missing tied receiver locator for %s", name)
+                    continue
                 skipped_errors.append(f"{name!r}: no receiver locator")
                 continue
             locators_for_rank = 0
@@ -2322,6 +2325,18 @@ class P2PTransportBackend(WeightTransportBackend):
         # language_model.*, while XORL trains the unwrapped text model.
         return self._tensor_map.get(f"language_model.{name}")
 
+    def _should_skip_missing_tied_locator(self, name: str) -> bool:
+        if name != "lm_head.weight":
+            return False
+        # Some SGLang models tie lm_head.weight to model.embed_tokens.weight
+        # and only expose the embedding storage in the P2P tensor map.
+        # The embedding was already synced from the same root FSDP bucket, so
+        # failing the whole P2P sync on the missing tied alias is unnecessary.
+        return bool(
+            self._tensor_map.get("model.embed_tokens.weight")
+            or self._tensor_map.get("language_model.model.embed_tokens.weight")
+        )
+
     @staticmethod
     def _slice_source_for_locator(
         name: str,
@@ -2519,9 +2534,11 @@ def _resolve_local_hostname() -> str:
     Mooncake's handshake binds on this hostname; it must be reachable from
     the SGLang receiver.
     """
-    explicit = os.environ.get("XORL_P2P_HOSTNAME")
-    if explicit and explicit.strip():
-        return explicit.strip()
+    # Explicit hostname overrides take precedence (may be FQDN, not just IPv4).
+    for env_name in ("XORL_P2P_HOSTNAME", "P2P_TRAINER_HOSTNAME", "XORL_WEIGHT_SYNC_MASTER_ADDRESS"):
+        host = os.environ.get(env_name, "").strip()
+        if host:
+            return host
 
     def _routable_ipv4(value: Optional[str]) -> Optional[str]:
         if not value:

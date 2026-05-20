@@ -33,6 +33,7 @@ from xorl.server.protocol.operations import (
     OptimStepData,
     RegisterSessionData,
     SaveStateData,
+    SyncWeightsData,
 )
 from xorl.server.runner.runner_dispatcher import RunnerDispatcher
 
@@ -110,6 +111,45 @@ async def test_forward_backward_operations(processor):
     output = await processor.execute_forward(request)
     assert output.output_type == OutputType.FORWARD
     assert "loss" in output.outputs[0]
+
+
+def test_teacher_sort_key_reads_nested_loss_inputs():
+    assert RequestProcessor._teacher_sort_key({"loss_fn_inputs": {"teacher_id": 3}}) == 3
+    assert RequestProcessor._teacher_sort_key({"loss_fn_inputs": {"teacher_ids": [[2, 2, 2]]}}) == 2
+    assert RequestProcessor._teacher_sort_key({"teacher_id": 1, "loss_fn_inputs": {"teacher_id": 4}}) == 1
+
+
+@pytest.mark.asyncio
+async def test_nccl_sync_uses_request_scoped_group_name():
+    class CapturingBackend(DummyBackend):
+        def __init__(self):
+            super().__init__()
+            self.group_names = []
+
+        async def sync_inference_weights(self, *args, **kwargs):
+            self.group_names.append(kwargs["group_name"])
+            return await super().sync_inference_weights(*args, **kwargs)
+
+    backend = CapturingBackend()
+    exec = RequestProcessor(backend=backend)
+    await exec.start()
+    try:
+        request = OrchestratorRequest(
+            request_id="sync-req-0001",
+            request_type=RequestType.ADD,
+            operation="sync_inference_weights",
+            payload=SyncWeightsData(
+                endpoints=[{"host": "127.0.0.1", "port": 30000, "world_size": 1}],
+                group_name="weight_sync_group",
+                sync_method="nccl_broadcast",
+            ),
+        )
+        output = await exec.execute_sync_inference_weights(request)
+    finally:
+        await exec.stop()
+
+    assert output.output_type == OutputType.SYNC_INFERENCE_WEIGHTS
+    assert backend.group_names == ["weight_sync_group_sync_req_0001"]
 
 
 @pytest.mark.asyncio
