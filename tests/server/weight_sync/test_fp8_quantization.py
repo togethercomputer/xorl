@@ -58,6 +58,21 @@ def test_fp8_quantization_includes_fused_mla_weight_by_default():
     assert out[name].dtype == torch.float8_e4m3fn
 
 
+@pytest.mark.parametrize("projection", ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"])
+def test_fp8_quantization_includes_qwen_linear_attention_packed_weights_by_default(projection):
+    name = f"model.layers.0.linear_attn.{projection}.weight"
+    tensor = torch.zeros(8, 4, dtype=torch.bfloat16)
+    out = dict(
+        WeightSyncHandler._quantize_buffer_for_fp8(
+            [(name, tensor)],
+            quantization_config={"quant_method": "fp8", "weight_block_size": [2, 4]},
+        )
+    )
+
+    assert set(out) == {name, f"model.layers.0.linear_attn.{projection}.weight_scale_inv"}
+    assert out[name].dtype == torch.float8_e4m3fn
+
+
 def test_fp8_quantization_respects_modules_to_not_convert():
     name = "model.layers.0.mlp.gate_proj.weight"
     tensor = torch.zeros(8, 4, dtype=torch.bfloat16)

@@ -241,11 +241,71 @@ rank on each receiver node, not global TP rank. On the current H100 validation
 nodes, we avoid `mlx5_4`, `mlx5_7`, and `mlx5_8` and spread TP ranks over the
 remaining working HCAs.
 
+### Recommended P2P profile for scaled Qwen3-style MoE
+
+For the 4 trainer pod → 16 SGLang TP2 encoded-reasoning shape, use the
+following profile as the starting point. It keeps dense/root chunking separate
+from MoE batching, uses the cached receiver prepare path on warm syncs, and
+avoids the measured-regressed debug/experimental knobs.
+
+```bash
+# Required for Kubernetes Mooncake reachability.
+export P2P_TRAINER_HOSTNAME="${POD_IP}"
+export XORL_WEIGHT_SYNC_MASTER_ADDRESS="${POD_IP}"
+
+# Keep dense/root tensors small enough for scratch pools while batching MoE.
+export XORL_WEIGHT_SYNC_DENSE_BUCKET_BYTES=134217728      # 128 MiB
+export XORL_WEIGHT_SYNC_MOE_BUCKET_BYTES=1073741824       # 1 GiB
+export XORL_WEIGHT_SYNC_BUCKET_BYTES=1073741824           # legacy MoE alias
+export XORL_WEIGHT_SYNC_BATCH_MOE=1
+
+# Source-reuse path keeps the required pool size near source bytes, not
+# receiver-fanout bytes. 2 GiB was the best measured pool size for the scaled
+# Qwen3-30B-A3B TP2 receiver layout.
+export XORL_P2P_CPU_SCRATCH_POOL_BYTES=2147483648         # 2 GiB
+export XORL_P2P_MOONCAKE_TRANSFER_CHUNK=8
+
+# This is now the default copy mode, but keep the explicit variable in older
+# generated manifests that still set XORL_P2P_SCATTER_COPY_MODE=list.
+export XORL_P2P_SCATTER_REUSE_LOCATORS=1
+```
+
+Leave these unset for the default performance path:
+
+- `XORL_P2P_USE_ASYNC_API`: Mooncake async writes are still experimental; they
+  have produced hangs or mixed results in repeated-update tests.
+- `XORL_P2P_CPU_POOL_MIN_BYTES=0`: forces tiny transfers through CPU scratch;
+  this was safe in smoke tests but slower than the default GPU-direct threshold.
+- `XORL_P2P_PERSIST_SMALL_REGISTRATION=1`: persistent registration of small
+  CUDA sources was safe in smoke tests but regressed warm sync on the scaled
+  TP2 layout.
+- `XORL_P2P_LOG_BUCKET_DETAILS=1` and `XORL_P2P_TRANSFER_DEBUG=1`: useful for
+  failure diagnosis, but intentionally off the hot path because they add
+  logging and debug-object allocation.
+
+Expected warm-sync markers with this profile are
+`cached_prepare=True`, `tensor_map_endpoints=0/<num-endpoints>`, near-zero
+`backend_init_s`, and no SGLang receiver tensor-map payload on the second and
+later syncs.
+
 P2P tuning options:
 
-- `P2P_SYNC_QUANTIZATION='{"quant_method":"fp8","fmt":"e4m3","weight_block_size":[128,128]}'`:
-  quantizes projection weights on the trainer side and transfers FP8 weights
-  plus `weight_scale_inv` tensors to an FP8 SGLang receiver.
+- FP8 P2P sync requires an explicit sync quantization config, for example via
+  `POST /api/v1/set_sync_quantization` or a per-call `quantization` field:
+  `{"quant_method":"fp8","fmt":"e4m3","weight_block_size":[128,128]}`.
+  Client wrappers may expose this as `XORL_WEIGHT_SYNC_QUANTIZATION` or
+  `XORL_SYNC_QUANTIZATION`. A launch-only SGLang `--quantization fp8` flag is
+  not enough unless endpoint auto-detection is confirmed to populate the sync
+  request's `quantization` field.
+- With P2P and explicit FP8 sync quantization, the handler quantizes supported
+  projection weights on the trainer side, transfers FP8 weights plus
+  `weight_scale_inv` tensors, and automatically asks the receiver to run
+  post-processing after loading. If the receiver is FP8 but the sync request has
+  no FP8 quantization config, tensor-size validation should fail instead of
+  silently copying bf16 into FP8 locators.
+- The SGLang receiver must expose a matching block-FP8 layout. XORL emits
+  block-wise `weight_scale_inv` tensors; a receiver exposing only per-tensor
+  `weight_scale` tensors for FusedMoE is not compatible with this sender path.
 - `XORL_P2P_FP8_QUANTIZE_DEVICE=gpu`: use the existing GPU block-FP8 kernel for
   trainer-side FP8 formatting before copying the FP8 output to CPU for P2P
   staging. Leave unset for the portable CPU implementation.
@@ -270,18 +330,59 @@ P2P tuning options:
   reused. Defaults to the active MoE bucket size.
 - `XORL_WEIGHT_SYNC_BATCH_MOE=1`: batch direct-EP MoE expert transfers across
   layers so each rank ships fewer large P2P buckets.
+- The P2P backend stages each unique source tensor slice once per bucket and
+  reuses that pinned source address across receiver sessions. This keeps the
+  scratch pool sized to source bytes rather than receiver-fanout bytes.
 - `XORL_P2P_BACKEND_CACHE=1`: cache P2P receiver locators and backend state
   across sync calls. This is enabled by default.
-- `XORL_WEIGHT_SYNC_BUCKET_BYTES`: explicit MoE bucket cap override. Without
-  this override, P2P uses a 2 GiB MoE bucket cap to amortize Mooncake fixed
-  costs; non-P2P backends keep the 256 MiB default.
+- `XORL_P2P_PREPARE_WORKERS`: number of concurrent
+  `/prepare_weights_update` calls from the trainer to receiver endpoints.
+  Defaults to all endpoints, capped at 32. Set to `1` only for debugging
+  serialized prepare behavior.
+- `XORL_P2P_PREPARE_TIMEOUT_S`: per-endpoint prepare HTTP timeout. Default:
+  120 seconds.
+- `XORL_P2P_SCATTER_COPY_MODE`: controls how rank 0 builds per-sender tensor
+  map payloads for direct-EP scatter. Default `none` reuses read-only locator
+  lists/dicts while constructing scatter payloads. Set `list` to shallow-copy
+  lists or `deep` to copy every locator dict for debugging.
+- `XORL_P2P_SCATTER_REUSE_LOCATORS`: legacy boolean alias for the default
+  scatter copy mode. Set `1` to force locator reuse even when older manifests
+  still set `XORL_P2P_SCATTER_COPY_MODE=list`; set `0` to force shallow list
+  copies when `XORL_P2P_SCATTER_COPY_MODE` is unset.
+- `XORL_WEIGHT_SYNC_MOE_BUCKET_BYTES`: explicit MoE bucket cap override.
+  Without this override, P2P uses a 2 GiB MoE bucket cap to amortize
+  Mooncake fixed costs; non-P2P backends keep the 256 MiB default.
+- `XORL_WEIGHT_SYNC_BUCKET_BYTES`: legacy alias for the MoE bucket cap. Prefer
+  `XORL_WEIGHT_SYNC_MOE_BUCKET_BYTES` so dense/root chunking stays independent
+  from MoE batching.
 - `XORL_P2P_USE_ASYNC_API=1`: opt into Mooncake's async write API. The default
   synchronous API path is the sustained-test path; async status polling has
   shown repeated-update `status=-1` failures and should remain experimental.
 - `XORL_P2P_ASYNC_MIN_BYTES`: minimum coalesced chunk size for Mooncake's async
   write API when `XORL_P2P_USE_ASYNC_API=1`. Default: 128 MiB.
+- `XORL_P2P_MOONCAKE_WORKERS`: number of concurrent Mooncake transfer worker
+  calls per trainer rank. Default: 2.
+- `XORL_P2P_NUM_POOLS`: number of CPU pinned scratch pools used for pipelined
+  staging. Default: 2.
+- `XORL_P2P_MOONCAKE_TRANSFER_CHUNK`: number of coalesced staged transfers to
+  group into each Mooncake call. Default: 1.
+- `XORL_P2P_SMALL_TRANSFER_CHUNK`: number of tiny GPU-direct transfers to group
+  into each Mooncake call after the per-bucket small-buffer registration.
+  Default: 32.
+- `XORL_P2P_PERSIST_SMALL_REGISTRATION=1`: persistently register no-copy tiny
+  CUDA source regions across buckets/syncs. Disabled by default while being
+  benchmarked.
 - `XORL_P2P_CPU_SCRATCH_POOL_BYTES`: CPU pinned staging pool size. Keep this
-  above the largest staged P2P bucket; the default is 4 GiB.
+  above the largest unique-source staged P2P bucket; the default is 4 GiB.
+- `XORL_P2P_LOG_BUCKET_DETAILS=1`: opt into per-bucket P2P coalescing, source
+  reuse, and worker transfer summaries. Disabled by default to keep log I/O off
+  the weight-sync hot path.
+- `XORL_P2P_TRANSFER_DEBUG=1`: opt into per-locator transfer debug samples in
+  failure messages. Disabled by default to avoid allocating debug objects for
+  every coalesced transfer on the hot path.
+- `MC_IB_PCI_RELAXED_ORDERING=1`: enables relaxed PCIe ordering in Mooncake
+  RDMA when the deployment fabric supports it. Leave unset or `0` if the NIC /
+  platform combination is not validated.
 
 ## Sparse Delta Probe
 

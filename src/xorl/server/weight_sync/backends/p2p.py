@@ -17,11 +17,13 @@ stage leaders still funnel through rank 0 in the handler.
 """
 
 import dataclasses
+import ipaddress
 import logging
 import os
 import socket
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+import zlib
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 import requests
@@ -64,7 +66,26 @@ class _StagedTransfer:
     peer_ptr: int
     nbytes: int
     memory_handle: Optional[int]
-    debug_entries: List[_TransferDebugEntry]
+    name: str
+    loc: Dict[str, Any]
+
+
+@dataclasses.dataclass
+class _TransferDebugSample:
+    entries: List[_TransferDebugEntry] = dataclasses.field(default_factory=list)
+    total: int = 0
+
+    def add(self, name: str, loc: Dict[str, Any], nbytes: int) -> None:
+        self.total += 1
+        if len(self.entries) < _TRANSFER_DEBUG_SAMPLE_LIMIT:
+            self.entries.append(_transfer_debug_entry(name, loc, nbytes))
+
+    def extend(self, other: "_TransferDebugSample") -> None:
+        self.total += other.total
+        if len(self.entries) >= _TRANSFER_DEBUG_SAMPLE_LIMIT:
+            return
+        remaining = _TRANSFER_DEBUG_SAMPLE_LIMIT - len(self.entries)
+        self.entries.extend(other.entries[:remaining])
 
 
 @dataclasses.dataclass
@@ -113,6 +134,7 @@ logger = logging.getLogger(__name__)
 
 
 _HTTP_TIMEOUT_SECONDS = 600
+_TRANSFER_DEBUG_SAMPLE_LIMIT = 6
 
 
 def _env_float(name: str, default: float) -> float:
@@ -145,12 +167,50 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
     return value
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    logger.warning("[P2P] invalid %s=%r; using %s", name, raw, default)
+    return default
+
+
 def _prepare_timeout_seconds() -> float:
     return _env_float("XORL_P2P_PREPARE_TIMEOUT_S", 120.0)
 
 
 def _async_api_min_bytes() -> int:
     return _env_int("XORL_P2P_ASYNC_MIN_BYTES", 128 * 1024 * 1024)
+
+
+def _small_transfer_chunk() -> int:
+    return _env_int("XORL_P2P_SMALL_TRANSFER_CHUNK", 32)
+
+
+def _persist_small_registration_enabled() -> bool:
+    # Opt-in only. On the scaled TP2 layout this was safe, but slower than
+    # per-bucket small-source registration because it increased warm-sync tails.
+    return _env_flag("XORL_P2P_PERSIST_SMALL_REGISTRATION", False)
+
+
+def _async_api_enabled(*, cached_prepare: bool) -> bool:
+    # The synchronous Mooncake API is the measured sustained path. The async
+    # API is kept for experiments because repeated-update tests have shown
+    # mixed results and hangs/status failures on some runs.
+    mode = os.environ.get("XORL_P2P_USE_ASYNC_API", "0").strip().lower()
+    if mode in {"1", "true", "yes", "on"}:
+        return True
+    if mode in {"warm", "cached", "cached_prepare"}:
+        return cached_prepare
+    if mode in {"0", "false", "no", "off"}:
+        return False
+    logger.warning("[P2P] invalid XORL_P2P_USE_ASYNC_API=%r; using sync transfer API", mode)
+    return False
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -171,7 +231,9 @@ _CPU_SCRATCH_POOL_BYTES = int(os.environ.get("XORL_P2P_CPU_SCRATCH_POOL_BYTES", 
 # very small transfers — observed at 8 KB on a layernorm weight. Small
 # entries take the GPU-direct path (per-bucket register/dereg); large
 # entries take the CPU pool path. 64 KB threshold matches typical
-# layernorm weight size (2048 BF16 = 4 KB; 4× headroom).
+# layernorm weight size (2048 BF16 = 4 KB; 4× headroom). Setting this
+# to 0 forces tiny entries through CPU scratch; that was safe in smoke
+# tests, but slower than the default GPU-direct threshold.
 _CPU_POOL_MIN_BYTES = int(os.environ.get("XORL_P2P_CPU_POOL_MIN_BYTES", str(64 * 1024)))
 
 
@@ -274,25 +336,52 @@ def _transfer_debug_entry(name: str, loc: Dict[str, Any], nbytes: int) -> _Trans
     )
 
 
-def _format_transfer_debug(debug_entries: List[_TransferDebugEntry]) -> str:
+def _source_view_key(src_view: torch.Tensor, nbytes: int) -> Tuple[Any, ...]:
+    ptr = int(src_view.data_ptr())
+    nbytes = int(nbytes)
+    if src_view.is_contiguous():
+        # For contiguous views, the byte range fully identifies the payload we
+        # copy into the CPU pool. Avoid tupleizing shape/stride for the common
+        # fanout case where many receivers share the same source slice.
+        return (ptr, nbytes)
+    return (
+        ptr,
+        tuple(int(dim) for dim in src_view.shape),
+        tuple(int(stride) for stride in src_view.stride()),
+        str(src_view.dtype),
+        nbytes,
+    )
+
+
+def _format_transfer_debug(debug_entries: Any) -> str:
+    if debug_entries is None:
+        return "transfer_debug=disabled (set XORL_P2P_TRANSFER_DEBUG=1)"
+
+    total_entries: Optional[int] = None
+    if isinstance(debug_entries, _TransferDebugSample):
+        total_entries = debug_entries.total
+        debug_entries = debug_entries.entries
+    else:
+        total_entries = len(debug_entries)
+
     if not debug_entries:
         return "transfer_debug=[]"
 
     parts: List[str] = []
-    for entry in debug_entries[:6]:
+    for entry in debug_entries[:_TRANSFER_DEBUG_SAMPLE_LIMIT]:
         handle = f"0x{entry.memory_handle:x}" if entry.memory_handle is not None else "None"
         parts.append(
             f"{entry.name}(ptr=0x{entry.peer_ptr:x}, nbytes={entry.nbytes}, "
             f"dtype={entry.dtype}, handle={handle}, tp={entry.tp_rank}, "
             f"ep={entry.ep_rank}, slice={entry.loc_slice})"
         )
-    if len(debug_entries) > 6:
-        parts.append(f"... {len(debug_entries) - 6} more")
+    if total_entries > len(debug_entries):
+        parts.append(f"... {total_entries - len(debug_entries)} more")
     return "transfer_debug=[" + "; ".join(parts) + "]"
 
 
 def _chunk_sizes(
-    by_session: Dict[str, Tuple[List[int], List[int], List[int], List[List[_TransferDebugEntry]]]],
+    by_session: Dict[str, Tuple[List[int], List[int], List[int], Optional[List[_TransferDebugSample]]]],
     session_id: str,
     i: int,
     end: int,
@@ -300,20 +389,26 @@ def _chunk_sizes(
     return by_session[session_id][2][i:end]
 
 
-def _chunk_debug_entries(
-    by_session: Dict[str, Tuple[List[int], List[int], List[int], List[List[_TransferDebugEntry]]]],
+def _chunk_debug_sample(
+    by_session: Dict[str, Tuple[List[int], List[int], List[int], Optional[List[_TransferDebugSample]]]],
     session_id: str,
     i: int,
     end: int,
-) -> List[_TransferDebugEntry]:
-    debug_lists = by_session[session_id][3][i:end]
-    return [entry for entries in debug_lists for entry in entries]
+) -> Optional[_TransferDebugSample]:
+    debug_entries = by_session[session_id][3]
+    if debug_entries is None:
+        return None
+    debug_lists = debug_entries[i:end]
+    sample = _TransferDebugSample()
+    for debug in debug_lists:
+        sample.extend(debug)
+    return sample
 
 
 def _run_sync_transfer_items(
     *,
     engine_wrapper: Any,
-    by_session: Dict[str, Tuple[List[int], List[int], List[int], List[List[_TransferDebugEntry]]]],
+    by_session: Dict[str, Tuple[List[int], List[int], List[int], Optional[List[_TransferDebugSample]]]],
     items: List[Tuple[str, int, int]],
     session_debug_info: Dict[str, Dict[str, Any]],
     session_transfer_s: Dict[str, float],
@@ -335,7 +430,7 @@ def _run_sync_transfer_items(
                 f"[P2P] {label} to {session_id} failed: ret={last_ret} "
                 f"(bucket {bucket_idx}, chunk {i}..{end} of {len(src_ptrs)} buffers, "
                 f"sizes={_chunk_sizes(by_session, session_id, i, end)}, "
-                f"{_format_transfer_debug(_chunk_debug_entries(by_session, session_id, i, end))}, "
+                f"{_format_transfer_debug(_chunk_debug_sample(by_session, session_id, i, end))}, "
                 f"session_info={session_debug_info.get(session_id)}, after {max_attempts} attempts)"
             )
         session_transfer_s[session_id] = session_transfer_s.get(session_id, 0.0) + (time.perf_counter() - t_session)
@@ -344,7 +439,7 @@ def _run_sync_transfer_items(
 def _run_async_transfer_items(
     *,
     engine_wrapper: Any,
-    by_session: Dict[str, Tuple[List[int], List[int], List[int], List[List[_TransferDebugEntry]]]],
+    by_session: Dict[str, Tuple[List[int], List[int], List[int], Optional[List[_TransferDebugSample]]]],
     items: List[Tuple[str, int, int]],
     session_debug_info: Dict[str, Dict[str, Any]],
     session_transfer_s: Dict[str, float],
@@ -377,7 +472,7 @@ def _run_async_transfer_items(
                     f"[P2P] batch_transfer_async_write submit failed: bid={bid} "
                     f"(bucket {bucket_idx}, chunk {i}..{end}, "
                     f"sizes={_chunk_sizes(by_session, session_id, i, end)}, "
-                    f"{_format_transfer_debug(_chunk_debug_entries(by_session, session_id, i, end))}, "
+                    f"{_format_transfer_debug(_chunk_debug_sample(by_session, session_id, i, end))}, "
                     f"session_info={session_debug_info.get(session_id)})"
                 )
             if not active:
@@ -396,7 +491,7 @@ def _run_async_transfer_items(
                 f"[P2P] get_batch_transfer_status reported failure: status={status} "
                 f"(bucket {bucket_idx}, {len(active)} batches in flight, "
                 f"first session={session_id}, sizes={_chunk_sizes(by_session, session_id, i, end)}, "
-                f"{_format_transfer_debug(_chunk_debug_entries(by_session, session_id, i, end))}, "
+                f"{_format_transfer_debug(_chunk_debug_sample(by_session, session_id, i, end))}, "
                 f"session_info={session_debug_info.get(session_id)})"
             )
         if status == 0:
@@ -416,7 +511,7 @@ def _run_async_transfer_items(
                 f"(bucket {bucket_idx}, waited={waited_s:.3f}s, "
                 f"{len(active)} batches in flight, first session={session_id}, "
                 f"sizes={_chunk_sizes(by_session, session_id, i, end)}, "
-                f"{_format_transfer_debug(_chunk_debug_entries(by_session, session_id, i, end))}, "
+                f"{_format_transfer_debug(_chunk_debug_sample(by_session, session_id, i, end))}, "
                 f"session_info={session_debug_info.get(session_id)})"
             )
         if now - last_status_log_at > 5.0:
@@ -431,7 +526,7 @@ def _run_async_transfer_items(
 def _transfer_small_entries(
     *,
     engine_wrapper: Any,
-    small_session_data: Dict[str, List[Tuple[int, int, int, _TransferDebugEntry]]],
+    small_session_data: Dict[str, List[Tuple[int, int, int, Optional[_TransferDebugEntry]]]],
     session_debug_info: Dict[str, Dict[str, Any]],
     small_register_ptrs: List[int],
     small_register_lens: List[int],
@@ -447,19 +542,35 @@ def _transfer_small_entries(
     total_bytes = 0
     num_buffers = 0
     try:
+        chunk = _small_transfer_chunk()
+        max_attempts = _env_int("XORL_P2P_TRANSFER_RETRIES", 10)
         for session_id, triples in small_session_data.items():
             t_session = time.perf_counter()
-            for src_ptr, peer_ptr, nbytes, debug_entry in triples:
-                total_bytes += nbytes
-                session_bytes[session_id] = session_bytes.get(session_id, 0) + nbytes
-                num_buffers += 1
-                ret = engine_wrapper.batch_transfer_sync(session_id, [src_ptr], [peer_ptr], [nbytes])
-                if ret < 0:
+            for i in range(0, len(triples), chunk):
+                transfer_chunk = triples[i : i + chunk]
+                src_ptrs = [src_ptr for src_ptr, _, _, _ in transfer_chunk]
+                peer_ptrs = [peer_ptr for _, peer_ptr, _, _ in transfer_chunk]
+                lengths = [nbytes for _, _, nbytes, _ in transfer_chunk]
+                chunk_bytes = sum(lengths)
+                total_bytes += chunk_bytes
+                session_bytes[session_id] = session_bytes.get(session_id, 0) + chunk_bytes
+                num_buffers += len(transfer_chunk)
+                last_ret = 0
+                for attempt in range(max_attempts):
+                    last_ret = engine_wrapper.batch_transfer_sync(session_id, src_ptrs, peer_ptrs, lengths)
+                    if last_ret >= 0:
+                        break
+                    time.sleep(_retry_delay(attempt))
+                if last_ret < 0:
+                    debug_entries = [debug for _, _, _, debug in transfer_chunk if debug is not None]
                     raise RuntimeError(
                         f"[P2P] small-entries transfer to {session_id} "
-                        f"failed: ret={ret} (nbytes={nbytes}, bucket {bucket_idx}, "
-                        f"{_format_transfer_debug([debug_entry])}, "
-                        f"session_info={session_debug_info.get(session_id)})"
+                        f"failed: ret={last_ret} (bucket {bucket_idx}, "
+                        f"chunk {i}..{i + len(transfer_chunk)} of {len(triples)} buffers, "
+                        f"sizes={lengths}, "
+                        f"{_format_transfer_debug(debug_entries or None)}, "
+                        f"session_info={session_debug_info.get(session_id)}, "
+                        f"after {max_attempts} attempts)"
                     )
             session_transfer_s[session_id] = session_transfer_s.get(session_id, 0.0) + (time.perf_counter() - t_session)
     finally:
@@ -476,16 +587,18 @@ def _do_async_transfer(
     *,
     engine_wrapper: Any,
     copy_done_event: "torch.cuda.Event",
-    by_session: Dict[str, Tuple[List[int], List[int], List[int], List[List[_TransferDebugEntry]]]],
-    small_session_data: Dict[str, List[Tuple[int, int, int, _TransferDebugEntry]]],
+    by_session: Dict[str, Tuple[List[int], List[int], List[int], Optional[List[_TransferDebugSample]]]],
+    small_session_data: Dict[str, List[Tuple[int, int, int, Optional[_TransferDebugEntry]]]],
     session_debug_info: Dict[str, Dict[str, Any]],
     small_register_ptrs: List[int],
     small_register_lens: List[int],
     chunk: int,
+    use_async_api: bool,
     timing: _BucketTiming,
     bucket_idx: int,
     slice_holds: List[torch.Tensor],
     src_view_holds: List[torch.Tensor],
+    log_bucket_details: bool,
 ) -> None:
     """Worker-thread Mooncake transfer for one bucket.
 
@@ -524,7 +637,7 @@ def _do_async_transfer(
     # sync transfers keep bounded retries. The async API is stricter: if submit
     # or status fails, we fail closed because a prior async batch may still be
     # writing receiver memory.
-    if os.environ.get("XORL_P2P_USE_ASYNC_API", "0") == "1":
+    if use_async_api:
         _run_sync_transfer_items(
             engine_wrapper=engine_wrapper,
             by_session=by_session,
@@ -571,15 +684,16 @@ def _do_async_transfer(
     timing.num_small_buffers = num_small_buffers
     timing.session_bytes = session_bytes
     timing.session_transfer_s = session_transfer_s
-    logger.info(
-        "[P2P] bucket %d: %.1f MB, register=%.1f ms, transfer=%.1f ms, deregister=%.1f ms, throughput=%.1f MB/s",
-        bucket_idx,
-        timing.nbytes / 1e6,
-        timing.register_s * 1e3,
-        timing.transfer_s * 1e3,
-        timing.deregister_s * 1e3,
-        timing.throughput_mb_s,
-    )
+    if log_bucket_details:
+        logger.info(
+            "[P2P] bucket %d: %.1f MB, register=%.1f ms, transfer=%.1f ms, deregister=%.1f ms, throughput=%.1f MB/s",
+            bucket_idx,
+            timing.nbytes / 1e6,
+            timing.register_s * 1e3,
+            timing.transfer_s * 1e3,
+            timing.deregister_s * 1e3,
+            timing.throughput_mb_s,
+        )
 
 
 class P2PTransportBackend(WeightTransportBackend):
@@ -623,14 +737,15 @@ class P2PTransportBackend(WeightTransportBackend):
         # registered with Mooncake once at first use and reused for
         # every subsequent bucket.
         #
-        # Default 2 pools (ping-pong). Bumped via XORL_P2P_NUM_POOLS;
-        # combined with XORL_P2P_MOONCAKE_WORKERS=N this gives N-way
-        # concurrent Mooncake calls per rank, hiding per-call latency
-        # on medium-speed nodes.
+        # Default 2 pools (ping-pong). Raising XORL_P2P_NUM_POOLS and
+        # XORL_P2P_MOONCAKE_WORKERS can hide per-call latency, but on
+        # the scaled TP2 layout 3-4 pools/workers regressed due to
+        # staging/NIC contention; treat higher values as experiments.
         n_pools = max(1, int(os.environ.get("XORL_P2P_NUM_POOLS", "2")))
         self._n_pools = n_pools
         self._cpu_scratch_pool_bytes: int = int(be_cfg.get("cpu_scratch_pool_bytes", _CPU_SCRATCH_POOL_BYTES))
         self._cpu_pool_min_bytes: int = int(be_cfg.get("cpu_pool_min_bytes", _CPU_POOL_MIN_BYTES))
+        self._persist_small_registration: bool = _persist_small_registration_enabled()
         self._cpu_scratch_pools: List[Optional[torch.Tensor]] = [None] * n_pools
         self._cpu_scratch_pool_ptrs: List[int] = [0] * n_pools
         self._cpu_scratch_pool_nbytes: int = 0
@@ -643,9 +758,13 @@ class P2PTransportBackend(WeightTransportBackend):
         # transfer_bucket; read out by the caller (e.g. the e2e harness)
         # for a wall-time breakdown vs. the NCCL backend.
         self._bucket_timings: List[_BucketTiming] = []
+        self._log_bucket_details: bool = _env_flag("XORL_P2P_LOG_BUCKET_DETAILS", False)
+        self._collect_transfer_debug: bool = _env_flag("XORL_P2P_TRANSFER_DEBUG", False)
+        self._transfer_chunk: int = _env_int("XORL_P2P_MOONCAKE_TRANSFER_CHUNK", 1)
         # Stable group name passed back in /complete_weights_update.
         self._group_name = config.group_name
         self._hostname: Optional[str] = be_cfg.get("hostname")
+        self._resolved_hostname: Optional[str] = None
         self._gpu_id: int = be_cfg.get("gpu_id", 0)
         self._ib_device: Optional[str] = be_cfg.get("ib_device")
         self._run_post_process_weights: bool = bool(be_cfg.get("run_post_process_weights", False))
@@ -656,6 +775,25 @@ class P2PTransportBackend(WeightTransportBackend):
         # The handler is responsible for invoking transfer_bucket on
         # every rank in sender_ranks and only with that rank's params.
         self._direct_ep_transfer: bool = bool(be_cfg.get("direct_ep_transfer", False))
+        sender_ranks = be_cfg.get("sender_ranks")
+        self._explicit_sender_rank_order: Optional[Tuple[int, ...]] = None
+        self._explicit_sender_ranks: Optional[FrozenSet[int]] = None
+        if sender_ranks is not None:
+            self._explicit_sender_rank_order = tuple(dict.fromkeys(int(rank) for rank in sender_ranks))
+            self._explicit_sender_ranks = frozenset(self._explicit_sender_rank_order)
+        self._process_group = be_cfg.get("process_group")
+        self._direct_ep_size: int = int(be_cfg.get("direct_ep_size", 0) or 0)
+        self._direct_ep_dense_sharding: bool = bool(
+            be_cfg.get("direct_ep_dense_sharding", _env_flag("XORL_P2P_DIRECT_EP_DENSE_SHARDING"))
+        )
+        self._sender_ep_ranks: Dict[int, int] = {}
+        for item in be_cfg.get("sender_ep_ranks") or ():
+            try:
+                sender_rank, ep_rank = item
+            except (TypeError, ValueError):
+                logger.warning("[P2P] ignoring malformed sender_ep_ranks entry %r", item)
+                continue
+            self._sender_ep_ranks[int(sender_rank)] = int(ep_rank)
         # Optional per-rank predicate. When set, transfer_bucket filters
         # locator entries to only those that belong to *this* rank.
         # Receives the locator dict; returns True if this rank should
@@ -673,6 +811,7 @@ class P2PTransportBackend(WeightTransportBackend):
         # handler routes every non-rank-0 trainer through the gather/
         # broadcast fallback.
         self._world_size: int = int(be_cfg.get("world_size", config.training_world_size or 1))
+        self._last_prepare_tensor_map_endpoint_indices: set[int] = set()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -724,10 +863,248 @@ class P2PTransportBackend(WeightTransportBackend):
             if record.get("session_id") and cls._record_matches_endpoint(record, endpoint_idx, num_endpoints)
         }
 
+    def _receiver_session_infos(self) -> List[Dict[str, Any]]:
+        infos: List[Dict[str, Any]] = []
+        for sid in self._receiver_session_ids:
+            info = dict(self._session_debug_info.get(str(sid), {"session_id": sid}))
+            info.setdefault("session_id", sid)
+            infos.append(info)
+        return infos
+
+    @staticmethod
+    def _expert_index_from_name(name: str) -> Optional[int]:
+        parts = name.split(".")
+        for idx, part in enumerate(parts[:-1]):
+            if part != "experts":
+                continue
+            try:
+                return int(parts[idx + 1])
+            except ValueError:
+                return None
+        return None
+
+    @classmethod
+    def _experts_per_ep(
+        cls,
+        tensor_map: Dict[str, List[Dict[str, Any]]],
+        ep_size: int,
+    ) -> Optional[int]:
+        if ep_size <= 1:
+            return None
+        expert_indices = {
+            expert_idx
+            for name in tensor_map
+            for expert_idx in (cls._expert_index_from_name(name),)
+            if expert_idx is not None
+        }
+        if not expert_indices:
+            return None
+        total_experts = max(expert_indices) + 1
+        if expert_indices != set(range(total_experts)):
+            logger.warning("[P2P] expert tensor_map names are not contiguous; keeping full map on each sender")
+            return None
+        if total_experts % ep_size != 0:
+            logger.warning(
+                "[P2P] total_experts=%d is not divisible by direct_ep_size=%d; keeping full map on each sender",
+                total_experts,
+                ep_size,
+            )
+            return None
+        return total_experts // ep_size
+
+    @classmethod
+    def _endpoint_indices_for_tensor_map(
+        cls,
+        tensor_map: Dict[str, List[Dict[str, Any]]],
+        num_endpoints: int,
+    ) -> set[int]:
+        endpoint_indices: set[int] = set()
+        for locators in tensor_map.values():
+            for loc in locators:
+                endpoint_idx = loc.get("endpoint_idx")
+                if endpoint_idx is None and num_endpoints == 1:
+                    endpoint_indices.add(0)
+                    continue
+                try:
+                    endpoint_indices.add(int(endpoint_idx))
+                except (TypeError, ValueError):
+                    continue
+        return endpoint_indices
+
+    @staticmethod
+    def _copy_locator_list_for_scatter(
+        locators: List[Dict[str, Any]],
+        copy_mode: str,
+    ) -> List[Dict[str, Any]]:
+        if copy_mode == "deep":
+            return [dict(loc) for loc in locators]
+        if copy_mode == "none":
+            return locators
+        # Default: keep an independent list per scatter payload without
+        # duplicating every immutable locator dict. Nonzero ranks copy the
+        # dicts again when adopting/merging prepared state.
+        return list(locators)
+
+    @staticmethod
+    def _scatter_locator_copy_mode() -> str:
+        if "XORL_P2P_SCATTER_REUSE_LOCATORS" in os.environ:
+            if _env_flag("XORL_P2P_SCATTER_REUSE_LOCATORS", False):
+                return "none"
+            if "XORL_P2P_SCATTER_COPY_MODE" not in os.environ:
+                return "list"
+        raw_mode = os.environ.get("XORL_P2P_SCATTER_COPY_MODE")
+        if raw_mode is None:
+            # Fast path: locator lists/dicts are read-only after SGLang prepare,
+            # and scatter_object_list serializes each recipient payload anyway.
+            return "none"
+        raw = raw_mode.strip().lower()
+        if raw in {"deep", "dict", "dicts"}:
+            return "deep"
+        if raw in {"list", "shallow", "lists"}:
+            return "list"
+        if raw in {"none", "reuse"}:
+            return "none"
+        logger.warning("[P2P] invalid XORL_P2P_SCATTER_COPY_MODE=%r; using reuse", raw_mode)
+        return "none"
+
+    def _filter_tensor_map_for_sender(
+        self,
+        tensor_map: Dict[str, List[Dict[str, Any]]],
+        sender_rank: int,
+        *,
+        experts_per_ep: Optional[int] = None,
+        locator_copy_mode: str = "list",
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        sender_ep_rank = self._sender_ep_ranks.get(int(sender_rank))
+        if experts_per_ep is None:
+            experts_per_ep = self._experts_per_ep(tensor_map, self._direct_ep_size)
+        if sender_ep_rank is None or experts_per_ep is None:
+            return {
+                name: self._copy_locator_list_for_scatter(locators, locator_copy_mode)
+                for name, locators in tensor_map.items()
+            }
+
+        keep_dense = int(sender_rank) == 0
+        filtered: Dict[str, List[Dict[str, Any]]] = {}
+        for name, locators in tensor_map.items():
+            expert_idx = self._expert_index_from_name(name)
+            if expert_idx is None:
+                if self._direct_ep_dense_sharding:
+                    if not self.should_send_dense_param(name, int(sender_rank)):
+                        continue
+                elif not keep_dense:
+                    continue
+            elif expert_idx // experts_per_ep != sender_ep_rank:
+                continue
+            filtered[name] = self._copy_locator_list_for_scatter(locators, locator_copy_mode)
+        return filtered
+
+    def should_extract_dense_params_on_rank(self, rank: int) -> bool:
+        return self._direct_ep_dense_sharding and int(rank) in self.sender_ranks
+
+    @staticmethod
+    def _dense_owner_key(name: str) -> str:
+        """Canonicalize equivalent trainer/SGLang dense names for sharding.
+
+        The handler sees fused trainer names before ``_unfuse_for_inference``
+        (for example ``qkv_proj`` and ``gate_up_proj``), while the receiver
+        tensor map sees the split SGLang names (``q_proj``/``k_proj``/``v_proj``
+        and ``gate_proj``/``up_proj``). Hashing the canonical fused key keeps
+        extraction, post-unfuse filtering, and tensor-map filtering aligned.
+        """
+        if P2PTransportBackend._expert_index_from_name(name) is not None:
+            return name
+        for split_name in (".q_proj.", ".k_proj.", ".v_proj."):
+            if split_name in name:
+                return name.replace(split_name, ".qkv_proj.", 1)
+        for split_name in (".gate_proj.", ".up_proj."):
+            if split_name in name:
+                return name.replace(split_name, ".gate_up_proj.", 1)
+        return name
+
+    def should_send_dense_param(self, name: str, rank: int) -> bool:
+        """Return whether ``rank`` owns this dense parameter in direct-EP mode.
+
+        MoE expert names are never treated as dense here. With dense sharding
+        disabled, rank 0 remains the sole dense sender, matching the historical
+        path. With sharding enabled, names are assigned deterministically across
+        the explicit sender rank order using a canonical fused dense name so
+        handler extraction and tensor-map filtering make the same decision on
+        every rank.
+        """
+        rank = int(rank)
+        if self._expert_index_from_name(name) is not None:
+            return False
+        if not (self._direct_ep_transfer and self._world_size > 1 and self._direct_ep_dense_sharding):
+            return rank == 0
+        sender_order = self.sender_rank_order
+        if not sender_order:
+            return rank == 0
+        owner_key = self._dense_owner_key(name)
+        owner = sender_order[zlib.crc32(owner_key.encode("utf-8")) % len(sender_order)]
+        return rank == int(owner)
+
+    def filter_dense_buffer_for_rank(
+        self,
+        buffer: List[Tuple[str, torch.Tensor]],
+        rank: int,
+    ) -> List[Tuple[str, torch.Tensor]]:
+        if not (self._direct_ep_transfer and self._world_size > 1):
+            return buffer if int(rank) == 0 else []
+        if not self._direct_ep_dense_sharding:
+            return buffer if int(rank) == 0 else []
+        return [(name, tensor) for name, tensor in buffer if self.should_send_dense_param(name, int(rank))]
+
+    def _can_scatter_filtered_tensor_maps(self) -> bool:
+        return (
+            self._direct_ep_transfer
+            and self._world_size > 1
+            and self._explicit_sender_rank_order is not None
+            and bool(self._sender_ep_ranks)
+            and self._direct_ep_size > 1
+            and hasattr(dist, "scatter_object_list")
+        )
+
+    def _initialize_payloads_for_sender_order(self) -> List[Any]:
+        session_infos = self._receiver_session_infos()
+        returned_endpoint_indices = set(self._last_prepare_tensor_map_endpoint_indices)
+        all_endpoint_indices = set(range(len(self.config.endpoints)))
+        if returned_endpoint_indices and returned_endpoint_indices != all_endpoint_indices:
+            kind = "merge_tensor_map"
+        else:
+            kind = "tensor_map_with_infos"
+
+        experts_per_ep = self._experts_per_ep(self._tensor_map, self._direct_ep_size)
+        locator_copy_mode = self._scatter_locator_copy_mode()
+        payloads: List[Any] = []
+        for sender_rank in self.sender_rank_order:
+            if int(sender_rank) == 0:
+                payloads.append(("rank0_ready",))
+                continue
+            sender_tensor_map = self._filter_tensor_map_for_sender(
+                self._tensor_map,
+                sender_rank,
+                experts_per_ep=experts_per_ep,
+                locator_copy_mode=locator_copy_mode,
+            )
+            if kind == "merge_tensor_map":
+                payloads.append(
+                    (
+                        kind,
+                        sender_tensor_map,
+                        session_infos,
+                        tuple(sorted(returned_endpoint_indices)),
+                    )
+                )
+            else:
+                payloads.append((kind, sender_tensor_map, session_infos))
+        return payloads
+
     def adopt_prepared_state(
         self,
         tensor_map: Dict[str, List[Dict[str, Any]]],
         receiver_session_ids: List[str],
+        receiver_session_infos: Optional[List[Dict[str, Any]]] = None,
     ) -> bool:
         """Multi-sender hook: take the tensor_map + receiver session ids
         that rank 0 obtained from ``/prepare_weights_update`` and stand up
@@ -749,8 +1126,40 @@ class P2PTransportBackend(WeightTransportBackend):
                 return False
         self._tensor_map = dict(tensor_map)
         self._receiver_session_ids = list(receiver_session_ids)
+        if receiver_session_infos is not None:
+            self._session_debug_info = {
+                str(info["session_id"]): dict(info) for info in receiver_session_infos if info.get("session_id")
+            }
+        else:
+            self._session_debug_info = {
+                sid: {"session_id": sid, "adopted_from_rank0": True} for sid in self._receiver_session_ids
+            }
+        return True
+
+    def merge_prepared_state(
+        self,
+        tensor_map: Dict[str, List[Dict[str, Any]]],
+        receiver_session_infos: List[Dict[str, Any]],
+        endpoint_indices: Tuple[int, ...],
+    ) -> bool:
+        if self._engine is None:
+            self._engine = self._make_local_engine()
+            if self._engine is None:
+                return False
+
+        num_endpoints = len(self.config.endpoints)
+        updated = {name: [dict(loc) for loc in locators] for name, locators in self._tensor_map.items()}
+        indices = set(endpoint_indices) or self._endpoint_indices_for_tensor_map(tensor_map, num_endpoints)
+        for endpoint_idx in indices:
+            updated = self._drop_endpoint_locators(updated, endpoint_idx, num_endpoints)
+        for name, locators in tensor_map.items():
+            updated.setdefault(name, []).extend(dict(loc) for loc in locators)
+        self._tensor_map = updated
+        self._receiver_session_ids = [
+            str(info["session_id"]) for info in receiver_session_infos if info.get("session_id")
+        ]
         self._session_debug_info = {
-            sid: {"session_id": sid, "adopted_from_rank0": True} for sid in self._receiver_session_ids
+            str(info["session_id"]): dict(info) for info in receiver_session_infos if info.get("session_id")
         }
         return True
 
@@ -772,28 +1181,56 @@ class P2PTransportBackend(WeightTransportBackend):
             return False
 
         is_rank0 = self._rank_index == 0
+        group = self._process_group
+        group_world_size = len(self.sender_rank_order)
         has_cached_state = bool(self._tensor_map and self._receiver_session_ids)
-        cached_states: List[bool] = [False] * self._world_size
+        cached_states: List[bool] = [False] * group_world_size
         try:
-            dist.all_gather_object(cached_states, has_cached_state)
+            dist.all_gather_object(cached_states, has_cached_state, group=group)
         except Exception as e:
             logger.warning(f"[P2P] cached-state all_gather failed; using full prepare: {e}")
-            cached_states = [False] * self._world_size
+            cached_states = [False] * group_world_size
         self._prefer_cached_prepare = all(cached_states)
 
+        if _env_flag("XORL_P2P_PREINIT_NONZERO_ENGINES") and not is_rank0 and self._engine is None:
+            logger.info("[P2P] pre-initializing local Mooncake engine while rank 0 prepares receivers")
+            self._engine = self._make_local_engine()
+
         payload: List[Any] = [None]
+        scatter_payloads: Optional[List[Any]] = None
+        use_scatter_payloads = self._can_scatter_filtered_tensor_maps()
         if is_rank0:
             ok = self._initialize_single_sender()
             if ok:
                 if self._last_prepare_returned_tensor_map:
-                    payload[0] = ("tensor_map", self._tensor_map, list(self._receiver_session_ids))
+                    if use_scatter_payloads:
+                        scatter_payloads = self._initialize_payloads_for_sender_order()
+                        payload[0] = ("scatter_payloads",)
+                    else:
+                        payload[0] = ("tensor_map", self._tensor_map, list(self._receiver_session_ids))
                 else:
                     payload[0] = ("reuse_cached", list(self._receiver_session_ids))
             else:
                 payload[0] = None
-        # All ranks synchronize on the broadcast. payload[0] is None on
-        # failure so non-zero ranks can short-circuit cleanly.
-        dist.broadcast_object_list(payload, src=0)
+        # All ranks synchronize on init payload delivery. When direct-EP
+        # sender mappings are available, scatter per-sender tensor maps instead
+        # of broadcasting the full 1M+ locator map to every sender.
+        if use_scatter_payloads:
+            scatter_input: Optional[List[Any]] = None
+            if is_rank0:
+                scatter_input = scatter_payloads if scatter_payloads is not None else [payload[0]] * group_world_size
+                if len(scatter_input) != group_world_size:
+                    logger.error(
+                        "[P2P] scatter payload count %d does not match sender group size %d",
+                        len(scatter_input),
+                        group_world_size,
+                    )
+                    scatter_input = [None] * group_world_size
+            dist.scatter_object_list(payload, scatter_input, src=0, group=group)
+        else:
+            # payload[0] is None on failure so non-zero ranks can short-circuit
+            # cleanly.
+            dist.broadcast_object_list(payload, src=0, group=group)
         local_ok = True
         if payload[0] is None:
             if not is_rank0:
@@ -815,13 +1252,22 @@ class P2PTransportBackend(WeightTransportBackend):
                 _, tmap, sids = payload[0]
                 if not self.adopt_prepared_state(tmap, sids):
                     local_ok = False
+            elif kind == "tensor_map_with_infos":
+                _, tmap, infos = payload[0]
+                sids = [str(info["session_id"]) for info in infos if info.get("session_id")]
+                if not self.adopt_prepared_state(tmap, sids, receiver_session_infos=infos):
+                    local_ok = False
+            elif kind == "merge_tensor_map":
+                _, tmap, infos, endpoint_indices = payload[0]
+                if not self.merge_prepared_state(tmap, infos, tuple(int(idx) for idx in endpoint_indices)):
+                    local_ok = False
             else:
                 logger.error(f"[P2P] unknown initialize payload kind: {kind!r}")
                 local_ok = False
 
-        init_results: List[bool] = [False] * self._world_size
+        init_results: List[bool] = [False] * group_world_size
         try:
-            dist.all_gather_object(init_results, bool(local_ok))
+            dist.all_gather_object(init_results, bool(local_ok), group=group)
         except Exception as e:
             logger.error(f"[P2P] direct-EP initialize result all_gather failed: {e}")
             return False
@@ -848,7 +1294,7 @@ class P2PTransportBackend(WeightTransportBackend):
         sender_session_id = self._engine.get_session_id()
         sender_info = {
             "session_id": sender_session_id,
-            "hostname": self._hostname,
+            "hostname": self._resolved_hostname or self._hostname,
             "gpu_id": self._gpu_id,
             "ib_device": self._engine.get_ib_device(),
             "training_rank": cfg.training_rank,
@@ -857,64 +1303,101 @@ class P2PTransportBackend(WeightTransportBackend):
         # Build prepare buckets once — we send them up front so SGLang
         # can size its registration / state.
         # For the single-sender variant we issue the prepare against each
-        # endpoint and merge the returned tensor_maps.
+        # endpoint and merge the returned tensor_maps. Endpoints are
+        # independent, so fan out concurrently; on the 16-endpoint TP2 layout
+        # this keeps cached prepare from becoming a serialized HTTP/JSON tail.
         has_cached_prepare_state = bool(self._tensor_map and self._receiver_session_ids)
         if not (self._direct_ep_transfer and self._world_size > 1):
             self._prefer_cached_prepare = has_cached_prepare_state
         request_cached_prepare = self._prefer_cached_prepare and has_cached_prepare_state
         self._last_prepare_returned_tensor_map = False
+        self._last_prepare_tensor_map_endpoint_indices = set()
         num_endpoints = len(cfg.endpoints)
+        prepare_workers = min(
+            num_endpoints,
+            _env_int("XORL_P2P_PREPARE_WORKERS", min(32, num_endpoints)),
+        )
+
+        def _prepare_endpoint(ep_idx: int, ep: Any, cached_prepare: bool) -> Tuple[int, Any, Dict[str, Any]]:
+            url = f"http://{ep.host}:{ep.port}/prepare_weights_update"
+            payload = {
+                "buckets": [],  # buckets are not used in the p2p path
+                "num_buckets": 0,
+                "group_name": cfg.group_name,
+                "transport": "p2p",
+                "sender_transfer_engine_info": sender_info,
+            }
+            if cached_prepare:
+                payload["p2p_return_tensor_map"] = False
+            try:
+                resp = requests.post(url, json=payload, timeout=_prepare_timeout_seconds())
+            except requests.RequestException as e:
+                raise RuntimeError(f"/prepare_weights_update to {ep.host}:{ep.port} failed: {e}") from e
+            if cached_prepare and resp.status_code in (400, 422):
+                retry_payload = dict(payload)
+                retry_payload.pop("p2p_return_tensor_map", None)
+                logger.warning(
+                    f"[P2P] cached prepare was rejected by {ep.host}:{ep.port}; "
+                    "retrying this endpoint with full tensor_map response"
+                )
+                try:
+                    resp = requests.post(url, json=retry_payload, timeout=_prepare_timeout_seconds())
+                except requests.RequestException as e:
+                    raise RuntimeError(f"/prepare_weights_update retry to {ep.host}:{ep.port} failed: {e}") from e
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"/prepare_weights_update returned {resp.status_code} from {ep.host}:{ep.port}: {resp.text}"
+                )
+            try:
+                body = resp.json()
+            except ValueError as e:
+                raise RuntimeError(f"/prepare_weights_update from {ep.host}:{ep.port} returned non-JSON") from e
+            if not body.get("success", False):
+                raise RuntimeError(f"prepare failed at {ep.host}:{ep.port}: {body.get('message')}")
+            return ep_idx, ep, body
+
+        tensor_map_endpoint_indices: set[int] = set()
         while True:
             if request_cached_prepare:
-                merged_tensor_map: Dict[str, List[Dict[str, Any]]] = {
-                    name: [dict(loc) for loc in locators] for name, locators in self._tensor_map.items()
-                }
+                # Cached prepare is the hot warm-sync path. Most warm prepares
+                # return no tensor_map from any endpoint, so avoid copying the
+                # large locator map unless an endpoint actually refreshes its
+                # locators below.
+                merged_tensor_map: Dict[str, List[Dict[str, Any]]] = self._tensor_map
             else:
                 merged_tensor_map = {}
             merged_receiver_infos: List[Dict[str, Any]] = []
             if request_cached_prepare:
-                for sid in self._receiver_session_ids:
+                for sid_idx, sid in enumerate(self._receiver_session_ids):
                     cached_info = dict(self._session_debug_info.get(str(sid), {"session_id": sid}))
                     cached_info.setdefault("session_id", sid)
+                    if (
+                        "endpoint_idx" not in cached_info
+                        and num_endpoints > 1
+                        and len(self._receiver_session_ids) == num_endpoints
+                    ):
+                        cached_info["endpoint_idx"] = sid_idx
                     merged_receiver_infos.append(cached_info)
 
             restart_full_prepare = False
-            for ep_idx, ep in enumerate(cfg.endpoints):
-                url = f"http://{ep.host}:{ep.port}/prepare_weights_update"
-                payload = {
-                    "buckets": [],  # buckets are not used in the p2p path
-                    "num_buckets": 0,
-                    "group_name": cfg.group_name,
-                    "transport": "p2p",
-                    "sender_transfer_engine_info": sender_info,
-                }
-                if request_cached_prepare:
-                    payload["p2p_return_tensor_map"] = False
-                try:
-                    resp = requests.post(url, json=payload, timeout=_prepare_timeout_seconds())
-                except requests.RequestException as e:
-                    logger.error(f"[P2P] /prepare_weights_update to {ep.host}:{ep.port} failed: {e}")
-                    return False
-                if request_cached_prepare and resp.status_code in (400, 422):
-                    logger.warning(
-                        f"[P2P] cached prepare was rejected by {ep.host}:{ep.port}; "
-                        "restarting prepare for all endpoints with full tensor_map response"
-                    )
-                    request_cached_prepare = False
-                    self._last_prepare_returned_tensor_map = False
-                    restart_full_prepare = True
-                    break
-                if resp.status_code != 200:
-                    logger.error(
-                        f"[P2P] /prepare_weights_update returned {resp.status_code} "
-                        f"from {ep.host}:{ep.port}: {resp.text}"
-                    )
-                    return False
-                body = resp.json()
-                if not body.get("success", False):
-                    logger.error(f"[P2P] prepare failed at {ep.host}:{ep.port}: {body.get('message')}")
-                    return False
+            tensor_map_endpoint_indices = set()
+            try:
+                if prepare_workers == 1:
+                    endpoint_results = [
+                        _prepare_endpoint(ep_idx, ep, request_cached_prepare) for ep_idx, ep in enumerate(cfg.endpoints)
+                    ]
+                else:
+                    with ThreadPoolExecutor(max_workers=prepare_workers, thread_name_prefix="p2p-prepare") as executor:
+                        futures = [
+                            executor.submit(_prepare_endpoint, ep_idx, ep, request_cached_prepare)
+                            for ep_idx, ep in enumerate(cfg.endpoints)
+                        ]
+                        endpoint_results = [future.result() for future in as_completed(futures)]
+            except Exception as e:
+                logger.error(f"[P2P] prepare fanout failed: {e}")
+                return False
 
+            for ep_idx, ep, body in sorted(endpoint_results, key=lambda item: item[0]):
                 ep_tensor_map = body.get("tensor_map") or {}
                 ep_receiver_infos = body.get("receiver_transfer_engine_infos") or []
                 cached_sessions = self._session_ids_for_endpoint(merged_receiver_infos, ep_idx, num_endpoints)
@@ -937,6 +1420,7 @@ class P2PTransportBackend(WeightTransportBackend):
 
                 if ep_tensor_map:
                     self._last_prepare_returned_tensor_map = True
+                    tensor_map_endpoint_indices.add(ep_idx)
                     merged_tensor_map = self._drop_endpoint_locators(merged_tensor_map, ep_idx, num_endpoints)
                 for name, locators in ep_tensor_map.items():
                     # Tag each locator with its source endpoint so transfer_bucket
@@ -956,6 +1440,7 @@ class P2PTransportBackend(WeightTransportBackend):
             if restart_full_prepare:
                 continue
             break
+        self._last_prepare_tensor_map_endpoint_indices = set(tensor_map_endpoint_indices)
 
         if merged_tensor_map:
             self._tensor_map = merged_tensor_map
@@ -979,7 +1464,9 @@ class P2PTransportBackend(WeightTransportBackend):
             f"[P2P] prepare ok: {len(self._tensor_map)} hf_names, "
             f"{total_locators} locators across "
             f"{len(self._receiver_session_ids)} receivers "
-            f"(cached_prepare={request_cached_prepare and not self._last_prepare_returned_tensor_map})"
+            f"(cached_prepare={request_cached_prepare and not self._last_prepare_returned_tensor_map}, "
+            f"prepare_workers={prepare_workers}, "
+            f"tensor_map_endpoints={len(tensor_map_endpoint_indices)}/{num_endpoints})"
         )
         return True
 
@@ -1087,6 +1574,7 @@ class P2PTransportBackend(WeightTransportBackend):
             be_cfg = cfg.backend_config or {}
             flush_cache = bool(be_cfg.get("flush_cache", False))
             weight_version = be_cfg.get("weight_version")
+            tied_weight_aliases = be_cfg.get("p2p_tied_weight_aliases") or {}
             complete_errors = []
             for ep in cfg.endpoints:
                 url = f"http://{ep.host}:{ep.port}/complete_weights_update"
@@ -1098,6 +1586,8 @@ class P2PTransportBackend(WeightTransportBackend):
                 }
                 if weight_version is not None:
                     payload["weight_version"] = weight_version
+                if tied_weight_aliases:
+                    payload["p2p_tied_weight_aliases"] = tied_weight_aliases
                 try:
                     resp = requests.post(url, json=payload, timeout=_HTTP_TIMEOUT_SECONDS)
                     if resp.status_code != 200:
@@ -1293,8 +1783,13 @@ class P2PTransportBackend(WeightTransportBackend):
         # pre-registered CPU pool.
         pending_small: Dict[str, List[_PendingTransfer]] = {}
         for sid, entries in list(pending.items()):
-            small = [e for e in entries if e.src_view.is_cuda and e.nbytes < self._cpu_pool_min_bytes]
-            large = [e for e in entries if (not e.src_view.is_cuda) or e.nbytes >= self._cpu_pool_min_bytes]
+            small: List[_PendingTransfer] = []
+            large: List[_PendingTransfer] = []
+            for e in entries:
+                if e.src_view.is_cuda and e.nbytes < self._cpu_pool_min_bytes:
+                    small.append(e)
+                else:
+                    large.append(e)
             if small:
                 pending_small[sid] = small
             if large:
@@ -1332,8 +1827,11 @@ class P2PTransportBackend(WeightTransportBackend):
         src_view_holds: List[torch.Tensor] = []
         # Per-session transfer lists after coalescing. The debug list tracks
         # which original locators contributed to each emitted Mooncake buffer.
-        by_session: Dict[str, Tuple[List[int], List[int], List[int], List[List[_TransferDebugEntry]]]] = {}
+        by_session: Dict[str, Tuple[List[int], List[int], List[int], Optional[List[_TransferDebugSample]]]] = {}
         scratch_offset_bytes = 0
+        staged_sources: Dict[Tuple[int, Tuple[int, ...], Tuple[int, ...], str, int], int] = {}
+        unique_staged_bytes = 0
+        reused_staged_bytes = 0
         total_pre_coalesce = 0
         total_post_coalesce = 0
         t_stage = time.perf_counter()
@@ -1351,35 +1849,45 @@ class P2PTransportBackend(WeightTransportBackend):
             for e in entries:
                 if pool is None:
                     raise RuntimeError("[P2P] CPU scratch pool was not initialized")
-                element_size = max(1, int(e.src_view.element_size()))
-                scratch_offset_bytes = _align_up(pool_ptr + scratch_offset_bytes, element_size) - pool_ptr
-                if scratch_offset_bytes + e.nbytes > self._cpu_scratch_pool_nbytes:
-                    # The scratch pool must hold the largest staged bucket for
-                    # this sender. The default P2P MoE bucket cap is 2 GiB and
-                    # the default pool is 4 GiB, so raising the bucket cap may
-                    # require raising XORL_P2P_CPU_SCRATCH_POOL_BYTES too.
-                    raise RuntimeError(
-                        f"[P2P] CPU scratch pool exhausted: bucket needs "
-                        f">{scratch_offset_bytes + e.nbytes} bytes but pool "
-                        f"is {self._cpu_scratch_pool_nbytes} bytes. Increase "
-                        f"XORL_P2P_CPU_SCRATCH_POOL_BYTES."
-                    )
-                slot_uint8 = pool[scratch_offset_bytes : scratch_offset_bytes + e.nbytes]
-                slot_view = slot_uint8.view(e.src_view.dtype).view(e.src_view.shape)
-                slot_view.copy_(e.src_view, non_blocking=True)
-                slice_holds.append(slot_view)
-                src_view_holds.append(e.src_view)
-                src_ptr = pool_ptr + scratch_offset_bytes
+                source_key = _source_view_key(e.src_view, e.nbytes)
+                src_ptr = staged_sources.get(source_key)
+                if src_ptr is None:
+                    element_size = max(1, int(e.src_view.element_size()))
+                    scratch_offset_bytes = _align_up(pool_ptr + scratch_offset_bytes, element_size) - pool_ptr
+                    if scratch_offset_bytes + e.nbytes > self._cpu_scratch_pool_nbytes:
+                        # The scratch pool must hold the largest staged bucket for
+                        # this sender. The default P2P MoE bucket cap is 2 GiB and
+                        # the default pool is 4 GiB, so raising the bucket cap may
+                        # require raising XORL_P2P_CPU_SCRATCH_POOL_BYTES too.
+                        raise RuntimeError(
+                            f"[P2P] CPU scratch pool exhausted: bucket needs "
+                            f">{scratch_offset_bytes + e.nbytes} bytes but pool "
+                            f"is {self._cpu_scratch_pool_nbytes} bytes. Increase "
+                            f"XORL_P2P_CPU_SCRATCH_POOL_BYTES."
+                        )
+                    slot_uint8 = pool[scratch_offset_bytes : scratch_offset_bytes + e.nbytes]
+                    slot_view = slot_uint8.view(e.src_view.dtype).view(e.src_view.shape)
+                    slot_view.copy_(e.src_view, non_blocking=True)
+                    slice_holds.append(slot_view)
+                    src_view_holds.append(e.src_view)
+                    src_ptr = pool_ptr + scratch_offset_bytes
+                    staged_sources[source_key] = src_ptr
+                    unique_staged_bytes += e.nbytes
+                    scratch_offset_bytes += e.nbytes
+                else:
+                    reused_staged_bytes += e.nbytes
+                    if e.src_view.is_cuda:
+                        src_view_holds.append(e.src_view)
                 staged.append(
                     _StagedTransfer(
                         src_ptr=src_ptr,
                         peer_ptr=e.peer_ptr,
                         nbytes=e.nbytes,
                         memory_handle=_locator_memory_handle(e.loc),
-                        debug_entries=[_transfer_debug_entry(e.name, e.loc, e.nbytes)],
+                        name=e.name,
+                        loc=e.loc,
                     )
                 )
-                scratch_offset_bytes += e.nbytes
 
             # Coalesce: walk staged in sorted-by-peer order, merging
             # adjacent entries whose source pool ptr AND peer ptr are
@@ -1390,7 +1898,7 @@ class P2PTransportBackend(WeightTransportBackend):
             src_ptrs: List[int] = []
             peer_ptrs: List[int] = []
             lens: List[int] = []
-            debug_entries: List[List[_TransferDebugEntry]] = []
+            debug_entries: Optional[List[_TransferDebugSample]] = [] if self._collect_transfer_debug else None
             memory_handles: List[Optional[int]] = []
             for staged_entry in staged:
                 if (
@@ -1401,20 +1909,31 @@ class P2PTransportBackend(WeightTransportBackend):
                     and memory_handles[-1] == staged_entry.memory_handle
                 ):
                     lens[-1] += staged_entry.nbytes
-                    debug_entries[-1].extend(staged_entry.debug_entries)
+                    if debug_entries is not None:
+                        debug_entries[-1].add(staged_entry.name, staged_entry.loc, staged_entry.nbytes)
                 else:
                     src_ptrs.append(staged_entry.src_ptr)
                     peer_ptrs.append(staged_entry.peer_ptr)
                     lens.append(staged_entry.nbytes)
                     memory_handles.append(staged_entry.memory_handle)
-                    debug_entries.append(list(staged_entry.debug_entries))
+                    if debug_entries is not None:
+                        debug_sample = _TransferDebugSample()
+                        debug_sample.add(staged_entry.name, staged_entry.loc, staged_entry.nbytes)
+                        debug_entries.append(debug_sample)
             total_post_coalesce += len(src_ptrs)
             by_session[session_id] = (src_ptrs, peer_ptrs, lens, debug_entries)
 
-        if total_post_coalesce < total_pre_coalesce:
+        if self._log_bucket_details and total_post_coalesce < total_pre_coalesce:
             logger.info(
                 f"[P2P] coalesced {total_pre_coalesce} entries → "
                 f"{total_post_coalesce} ({total_pre_coalesce / total_post_coalesce:.1f}x reduction)"
+            )
+        if self._log_bucket_details and reused_staged_bytes:
+            logger.info(
+                "[P2P] staged-source reuse saved %.1f MB (unique_staged=%.1f MB, transfer_fanout=%.1f MB)",
+                reused_staged_bytes / 1e6,
+                unique_staged_bytes / 1e6,
+                (unique_staged_bytes + reused_staged_bytes) / 1e6,
             )
 
         # Build small-entries metadata on the main thread — Mooncake's
@@ -1422,27 +1941,44 @@ class P2PTransportBackend(WeightTransportBackend):
         # _intervals_per_cuda_segment calls torch.cuda.memory_snapshot()
         # which we keep on main as a precaution. The actual transfer
         # work happens in the worker.
-        small_session_data: Dict[str, List[Tuple[int, int, int, _TransferDebugEntry]]] = {}
+        small_session_data: Dict[str, List[Tuple[int, int, int, Optional[_TransferDebugEntry]]]] = {}
         small_register_ptrs: List[int] = []
         small_register_lens: List[int] = []
         if pending_small:
-            small_intervals: List[Tuple[int, int]] = []
+            small_persistent_intervals: List[Tuple[int, int]] = []
+            small_transient_intervals: List[Tuple[int, int]] = []
             for session_id, entries in pending_small.items():
-                triples: List[Tuple[int, int, int, _TransferDebugEntry]] = []
+                triples: List[Tuple[int, int, int, Optional[_TransferDebugEntry]]] = []
                 for e in entries:
                     sv = e.src_view.contiguous()
                     src_view_holds.append(sv)
                     storage = sv.untyped_storage()
                     s_start = int(storage.data_ptr())
                     s_end = s_start + int(storage.nbytes())
-                    small_intervals.append((s_start, s_end))
-                    triples.append(
-                        (int(sv.data_ptr()), e.peer_ptr, e.nbytes, _transfer_debug_entry(e.name, e.loc, e.nbytes))
+                    # Persistently register only no-copy contiguous views backed
+                    # by stable model-parameter storage. Temporary contiguous
+                    # copies must stay per-bucket because they are released after
+                    # the async worker drains.
+                    can_persist = (
+                        self._persist_small_registration
+                        and int(sv.data_ptr()) == int(e.src_view.data_ptr())
+                        and int(sv.untyped_storage().data_ptr()) == int(e.src_view.untyped_storage().data_ptr())
                     )
+                    if can_persist:
+                        small_persistent_intervals.append((s_start, s_end))
+                    else:
+                        small_transient_intervals.append((s_start, s_end))
+                    debug_entry = (
+                        _transfer_debug_entry(e.name, e.loc, e.nbytes) if self._collect_transfer_debug else None
+                    )
+                    triples.append((int(sv.data_ptr()), e.peer_ptr, e.nbytes, debug_entry))
                 small_session_data[session_id] = triples
-            small_segs = self._intervals_per_cuda_segment(small_intervals)
-            small_register_ptrs = [iv[0] for iv in small_segs]
-            small_register_lens = [iv[1] - iv[0] for iv in small_segs]
+            if small_persistent_intervals:
+                self._register_persistent_source_intervals(small_persistent_intervals, bucket_idx=bucket_idx)
+            if small_transient_intervals:
+                small_segs = self._intervals_per_cuda_segment(small_transient_intervals)
+                small_register_ptrs = [iv[0] for iv in small_segs]
+                small_register_lens = [iv[1] - iv[0] for iv in small_segs]
         timing.stage_s = time.perf_counter() - t_stage
 
         # The CPU pool is permanently registered; small entries
@@ -1462,8 +1998,6 @@ class P2PTransportBackend(WeightTransportBackend):
         else:
             copy_done_event = _CompletedCudaEvent()
 
-        chunk = max(1, int(os.environ.get("XORL_P2P_MOONCAKE_TRANSFER_CHUNK", "1")))
-
         if self._transfer_executor is None:
             raise RuntimeError("[P2P] transfer executor was not initialized")
         t_submit = time.perf_counter()
@@ -1476,11 +2010,13 @@ class P2PTransportBackend(WeightTransportBackend):
             session_debug_info=self._session_debug_info,
             small_register_ptrs=small_register_ptrs,
             small_register_lens=small_register_lens,
-            chunk=chunk,
+            chunk=self._transfer_chunk,
+            use_async_api=_async_api_enabled(cached_prepare=self._prefer_cached_prepare),
             timing=timing,
             bucket_idx=bucket_idx,
             slice_holds=slice_holds,
             src_view_holds=src_view_holds,
+            log_bucket_details=self._log_bucket_details,
         )
         timing.submit_s = time.perf_counter() - t_submit
         self._cpu_pool_pending_futures[pool_idx] = future
@@ -1607,8 +2143,22 @@ class P2PTransportBackend(WeightTransportBackend):
     @property
     def sender_ranks(self) -> FrozenSet[int]:
         if self._direct_ep_transfer and self._world_size > 1:
+            if self._explicit_sender_ranks is not None:
+                return self._explicit_sender_ranks
             return frozenset(range(self._world_size))
         return frozenset({0})
+
+    @property
+    def sender_rank_order(self) -> Tuple[int, ...]:
+        if self._direct_ep_transfer and self._world_size > 1:
+            if self._explicit_sender_rank_order is not None:
+                return self._explicit_sender_rank_order
+            return tuple(range(self._world_size))
+        return (0,)
+
+    @property
+    def has_explicit_sender_ranks(self) -> bool:
+        return self._explicit_sender_ranks is not None
 
     @property
     def supports_direct_ep_transfer(self) -> bool:
@@ -1709,7 +2259,7 @@ class P2PTransportBackend(WeightTransportBackend):
             return merged
 
         cand_merged = merge(candidates)
-        registered = self._registered_intervals
+        registered = merge(self._registered_intervals)
         new: List[Tuple[int, int]] = []
 
         for s, e in cand_merged:
@@ -1729,6 +2279,40 @@ class P2PTransportBackend(WeightTransportBackend):
             if cur_s < e:
                 new.append((cur_s, e))
         return merge(new)
+
+    def _register_persistent_source_intervals(
+        self,
+        intervals: List[Tuple[int, int]],
+        *,
+        bucket_idx: int,
+    ) -> None:
+        """Register stable CUDA source regions once per backend lifetime."""
+        if not intervals:
+            return
+        if self._engine is None:
+            raise RuntimeError("[P2P] persistent small registration requires an initialized Mooncake engine")
+
+        # Fast path: if the raw tensor storage interval is already covered by
+        # a registered active block, skip the expensive CUDA memory snapshot.
+        raw_new = self._merge_against_registered(intervals)
+        if not raw_new:
+            return
+
+        segments = self._intervals_per_cuda_segment(raw_new)
+        new_segments = self._merge_against_registered(segments)
+        if not new_segments:
+            return
+
+        ptrs = [start for start, _ in new_segments]
+        lengths = [end - start for start, end in new_segments]
+        ret = self._engine.batch_register(ptrs, lengths)
+        if ret != 0:
+            raise RuntimeError(
+                f"[P2P] persistent small-source batch_register failed: ret={ret} "
+                f"(bucket {bucket_idx}, regions={len(ptrs)})"
+            )
+        self._registered_source_ptrs.extend(ptrs)
+        self._registered_intervals.extend(new_segments)
 
     def _locators_for_source_name(self, name: str) -> Optional[List[Dict[str, Any]]]:
         locators = self._tensor_map.get(name)
@@ -1891,6 +2475,7 @@ class P2PTransportBackend(WeightTransportBackend):
         # runtime in xorl, but if the package is available locally we use
         # it. Otherwise fall back to constructing TransferEngine directly.
         hostname = self._hostname or _resolve_local_hostname()
+        self._resolved_hostname = hostname
         logger.info(
             "[P2P] local Mooncake endpoint hostname=%s gpu_id=%s ib_device=%s",
             hostname,
@@ -1934,12 +2519,37 @@ def _resolve_local_hostname() -> str:
     Mooncake's handshake binds on this hostname; it must be reachable from
     the SGLang receiver.
     """
-    # Prefer an FQDN that the inference side can route to. Fall back to the
-    # first non-loopback IPv4 address.
+    explicit = os.environ.get("XORL_P2P_HOSTNAME")
+    if explicit and explicit.strip():
+        return explicit.strip()
+
+    def _routable_ipv4(value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        try:
+            addr = ipaddress.ip_address(value.strip())
+        except ValueError:
+            return None
+        if addr.version != 4 or addr.is_loopback or addr.is_unspecified:
+            return None
+        return str(addr)
+
+    for env_name in ("POD_IP", "HOST_IP", "HOSTNAME_IP"):
+        if ip := _routable_ipv4(os.environ.get(env_name)):
+            return ip
+
+    # Kubernetes pod hostnames are not necessarily resolvable from peer pods.
+    # Prefer the local IP address that socket resolves for this pod, matching
+    # the SGLang receiver's advertised session ids.
     try:
-        host = socket.getfqdn()
-        if host and host != "localhost":
-            return host
+        if ip := _routable_ipv4(socket.gethostbyname(socket.gethostname())):
+            return ip
     except Exception:
         pass
-    return socket.gethostbyname(socket.gethostname())
+    try:
+        fqdn = socket.getfqdn()
+        if ip := _routable_ipv4(socket.gethostbyname(fqdn)):
+            return ip
+    except Exception:
+        pass
+    return socket.gethostname()

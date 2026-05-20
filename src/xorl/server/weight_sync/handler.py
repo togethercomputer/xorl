@@ -31,7 +31,7 @@ import logging
 import os
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -77,8 +77,10 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
 
 
 def _moe_bucket_size_bytes(sync_method: str) -> int:
-    """Default MoE bucket sizing is backend-specific; the env var remains an explicit override."""
+    """Default MoE bucket sizing is backend-specific; env vars are explicit overrides."""
     default = _DEFAULT_P2P_MOE_BUCKET_BYTES if sync_method == "p2p" else _DEFAULT_MOE_BUCKET_BYTES
+    if "XORL_WEIGHT_SYNC_MOE_BUCKET_BYTES" in os.environ:
+        return _env_int("XORL_WEIGHT_SYNC_MOE_BUCKET_BYTES", default)
     return _env_int("XORL_WEIGHT_SYNC_BUCKET_BYTES", default)
 
 
@@ -209,6 +211,8 @@ def _safe_abort_token(value: Optional[str]) -> str:
 # ---------------------------------------------------------------------------
 _cached_p2p_backend: Optional[Any] = None
 _cached_backend_key: Optional[Tuple[Any, ...]] = None
+_cached_p2p_sender_group: Optional[Any] = None
+_cached_p2p_sender_group_ranks: Optional[Tuple[int, ...]] = None
 
 
 def _atexit_destroy_cached_backend() -> None:
@@ -223,6 +227,107 @@ def _atexit_destroy_cached_backend() -> None:
 
 
 atexit.register(_atexit_destroy_cached_backend)
+
+
+def _p2p_direct_ep_sender_ranks(ps: Any, world_size: int) -> Tuple[int, ...]:
+    """Choose one expert sender replica per EP group plus rank 0 for dense weights."""
+    if world_size <= 1 or not getattr(ps, "ep_enabled", False):
+        return tuple(range(world_size))
+    ep_mesh = getattr(getattr(ps, "ep_fsdp_device_mesh", None), "mesh", None)
+    if ep_mesh is None:
+        return tuple(range(world_size))
+
+    strategy = os.environ.get("XORL_P2P_DIRECT_EP_REPLICA_STRATEGY", "zero").strip().lower()
+    if strategy not in {"zero", "round_robin"}:
+        logger.warning(
+            "Ignoring invalid XORL_P2P_DIRECT_EP_REPLICA_STRATEGY=%r; using zero",
+            strategy,
+        )
+        strategy = "zero"
+
+    mesh = ep_mesh.detach().cpu().contiguous()
+    if mesh.ndim < 2 or mesh.shape[-1] <= 0:
+        return tuple(range(world_size))
+
+    ep_size = int(mesh.shape[-2])
+    ep_fsdp_size = int(mesh.shape[-1])
+    stage_meshes = mesh.reshape(-1, ep_size, ep_fsdp_size)
+    ranks = {0}
+    for stage_mesh in stage_meshes:
+        for ep_rank in range(ep_size):
+            ep_fsdp_rank = 0 if strategy == "zero" else ep_rank % ep_fsdp_size
+            rank = int(stage_mesh[ep_rank, ep_fsdp_rank])
+            if 0 <= rank < world_size:
+                ranks.add(rank)
+
+    return tuple(sorted(ranks))
+
+
+def _p2p_direct_ep_sender_ep_ranks(
+    ps: Any,
+    sender_ranks: Tuple[int, ...],
+    world_size: int,
+) -> Tuple[Tuple[int, int], ...]:
+    """Map each selected sender rank to the EP rank whose experts it owns."""
+    if world_size <= 1 or not sender_ranks or not getattr(ps, "ep_enabled", False):
+        return ()
+    ep_mesh = getattr(getattr(ps, "ep_fsdp_device_mesh", None), "mesh", None)
+    if ep_mesh is None:
+        return ()
+
+    mesh = ep_mesh.detach().cpu().contiguous()
+    if mesh.ndim < 2 or mesh.shape[-1] <= 0:
+        return ()
+
+    ep_size = int(mesh.shape[-2])
+    ep_fsdp_size = int(mesh.shape[-1])
+    stage_meshes = mesh.reshape(-1, ep_size, ep_fsdp_size)
+    sender_set = set(sender_ranks)
+    rank_to_ep: Dict[int, int] = {}
+    for stage_mesh in stage_meshes:
+        for ep_rank in range(ep_size):
+            for ep_fsdp_rank in range(ep_fsdp_size):
+                rank = int(stage_mesh[ep_rank, ep_fsdp_rank])
+                if rank in sender_set and rank not in rank_to_ep:
+                    rank_to_ep[rank] = ep_rank
+
+    return tuple((rank, rank_to_ep[rank]) for rank in sender_ranks if rank in rank_to_ep)
+
+
+def _get_p2p_sender_process_group(sender_ranks: Tuple[int, ...], world_size: int) -> Optional[Any]:
+    """Create/cache a process group for the direct-EP ranks that actually send."""
+    if not sender_ranks or sender_ranks == tuple(range(world_size)):
+        return None
+    if not dist.is_available() or not dist.is_initialized():
+        return None
+
+    global _cached_p2p_sender_group, _cached_p2p_sender_group_ranks
+    if _cached_p2p_sender_group is not None and _cached_p2p_sender_group_ranks == sender_ranks:
+        return _cached_p2p_sender_group
+
+    _cached_p2p_sender_group = dist.new_group(ranks=list(sender_ranks))
+    _cached_p2p_sender_group_ranks = sender_ranks
+    return _cached_p2p_sender_group
+
+
+def _backend_cache_value(value: Any) -> Optional[Any]:
+    if isinstance(value, (str, int, bool, float)):
+        return value
+    if isinstance(value, tuple):
+        cached_items = tuple(_backend_cache_value(item) for item in value)
+        if all(item is not None for item in cached_items):
+            return cached_items
+    return None
+
+
+def _should_collect_ep_moe_tensors(sync_method: str, backend: Any, *, is_sender: bool) -> bool:
+    """Return whether this rank needs materialized MoE tensors for EP sync."""
+    return not (
+        sync_method == "p2p"
+        and getattr(backend, "supports_direct_ep_transfer", False)
+        and getattr(backend, "has_explicit_sender_ranks", False)
+        and not is_sender
+    )
 
 
 class WeightSyncHandler:
@@ -241,6 +346,7 @@ class WeightSyncHandler:
         self._pending_moe_bucket_bytes: int = 0
         self._pending_moe_cpu_workspace_records: List[Tuple[str, Tuple[Any, ...], int]] = []
         self._fp8_cpu_workspaces: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        self._p2p_tied_weight_aliases: Dict[str, str] = {}
 
     def _sync_abort_path(self, group_name: str, weight_version: Optional[str]) -> str:
         abort_dir = os.environ.get("XORL_WEIGHT_SYNC_ABORT_DIR", "").strip()
@@ -402,6 +508,29 @@ class WeightSyncHandler:
         timing_breakdown["max_rank_transfer_s"] = max_transfer_s
         timing_breakdown["min_rank_transfer_s"] = min_transfer_s
         timing_breakdown["rank_transfer_spread_s"] = max_transfer_s - min_transfer_s
+
+        backend_second_fields = (
+            "prepare_s",
+            "pool_init_s",
+            "pool_wait_s",
+            "stage_s",
+            "submit_s",
+            "main_thread_s",
+            "register_s",
+            "transfer_s",
+            "deregister_s",
+            "total_s",
+        )
+        for field in backend_second_fields:
+            values = [
+                float(summary["backend"][field])
+                for summary in p2p_rank_summaries
+                if summary.get("has_transfers")
+                and isinstance(summary.get("backend"), dict)
+                and isinstance(summary["backend"].get(field), int | float)
+            ]
+            if values:
+                timing_breakdown[f"p2p_backend_max_{field}"] = max(values)
 
     @staticmethod
     def _moe_runtime_lora_views(
@@ -572,6 +701,8 @@ class WeightSyncHandler:
             local_rank = _p2p_local_rank(self.rank)
             _backend_config["gpu_id"] = local_rank
             _backend_config["flush_cache"] = flush_cache
+            if self._p2p_requires_post_process_weights(quantization):
+                _backend_config["run_post_process_weights"] = True
             if weight_version is not None:
                 _backend_config["weight_version"] = weight_version
             ib_device = _select_p2p_ib_device(self.rank, self.world_size)
@@ -591,6 +722,25 @@ class WeightSyncHandler:
             # back to the gather-and-broadcast fallback.
             _backend_config["world_size"] = self.world_size
             _backend_config["rank_index"] = self.rank
+            direct_ep_sender_ranks = _p2p_direct_ep_sender_ranks(_ps_for_cfg, self.world_size)
+            _backend_config["sender_ranks"] = direct_ep_sender_ranks
+            _backend_config["direct_ep_size"] = int(_ps_for_cfg.ep_size)
+            sender_ep_ranks = _p2p_direct_ep_sender_ep_ranks(
+                _ps_for_cfg,
+                direct_ep_sender_ranks,
+                self.world_size,
+            )
+            if sender_ep_ranks:
+                _backend_config["sender_ep_ranks"] = sender_ep_ranks
+            sender_group = _get_p2p_sender_process_group(direct_ep_sender_ranks, self.world_size)
+            if sender_group is not None:
+                _backend_config["process_group"] = sender_group
+            logger.info(
+                "Rank %d: [WeightSync] P2P direct-EP sender ranks=%s sender_ep_ranks=%s",
+                self.rank,
+                direct_ep_sender_ranks,
+                sender_ep_ranks,
+            )
 
         transport_cfg = TransportConfig(
             endpoints=[
@@ -632,9 +782,11 @@ class WeightSyncHandler:
                 self.rank,
                 tuple(
                     sorted(
-                        (k, v)
+                        (k, cache_v)
                         for k, v in (_backend_config or {}).items()
-                        if k not in {"flush_cache", "weight_version"} and isinstance(v, (str, int, bool, float))
+                        if k not in {"flush_cache", "weight_version", "process_group"}
+                        for cache_v in (_backend_cache_value(v),)
+                        if cache_v is not None
                     )
                 ),
             )
@@ -718,12 +870,15 @@ class WeightSyncHandler:
         # Cross-layer MoE batching. When on, _direct_ep_transfer_experts
         # appends to the handler-level _pending_moe_bucket instead of flushing
         # at end-of-call; we ship the leftover once after the module loop.
-        # Default off — flip via XORL_WEIGHT_SYNC_BATCH_MOE=1.
+        # For the scaled P2P path, pair this with an explicit
+        # XORL_WEIGHT_SYNC_MOE_BUCKET_BYTES so MoE batching does not silently
+        # reuse the dense/root bucket cap. Default off for non-P2P/back-compat.
         batch_moe = os.environ.get("XORL_WEIGHT_SYNC_BATCH_MOE", "0") == "1"
         moe_bucket_size_bytes = _moe_bucket_size_bytes(sync_method)
         # Reset cross-sync state in case a prior sync raised mid-flush.
         self._pending_moe_bucket = []
         self._pending_moe_bucket_bytes = 0
+        self._p2p_tied_weight_aliases = {}
         self._reset_fp8_cpu_workspace_usage()
 
         # Build ordered list of FSDP modules to process
@@ -735,6 +890,21 @@ class WeightSyncHandler:
         # Detect EP mode
         _ps = get_parallel_state()
         _ep_enabled = _ps.ep_enabled and _ps.ep_size > 1
+        _collect_ep_moe_tensors = _should_collect_ep_moe_tensors(
+            sync_method,
+            backend,
+            is_sender=_is_sender,
+        )
+        _extract_dense_on_sender = bool(
+            sync_method == "p2p"
+            and _is_sender
+            and getattr(backend, "should_extract_dense_params_on_rank", lambda _rank: False)(self.rank)
+        )
+        if _ep_enabled and not _collect_ep_moe_tensors:
+            logger.info(
+                "Rank %d: [WeightSync] Skipping EP MoE tensor materialization on non-sender P2P rank",
+                self.rank,
+            )
 
         # Detect PP mode (Pipeline Parallelism)
         # With PP, each stage has an independent FSDP shard group.  We process
@@ -844,6 +1014,7 @@ class WeightSyncHandler:
                                 mod_name,
                                 _ps,
                                 skip_clone=_pre_unshard,
+                                collect_tensors=_collect_ep_moe_tensors,
                                 phase_s=rank_phase_s,
                             )
                             _add_rank_phase("ep_collect_s", t_phase)
@@ -862,17 +1033,34 @@ class WeightSyncHandler:
                             else:
                                 ep_moe_prefixes.add(p)
 
-                        if _stage_leader:
+                        if _stage_leader or _extract_dense_on_sender:
                             t_phase = time.perf_counter()
                             if ep_moe_prefixes:
                                 logger.info(
                                     f"Rank {self.rank}: [WeightSync] ep_moe_prefixes={ep_moe_prefixes} for {mod_name}"
                                 )
+                            include_dense_param: Optional[Callable[[str], bool]] = None
+                            if _extract_dense_on_sender:
+                                should_send_dense_param = getattr(
+                                    backend,
+                                    "should_send_dense_param",
+                                    lambda _name, _rank: True,
+                                )
+
+                                def include_dense_param(name: str, _rank: int = self.rank) -> bool:
+                                    return bool(should_send_dense_param(name, _rank))
+
                             current_buffer = self._extract_params_for_sync(
                                 fsdp_mod,
                                 mod_name,
                                 DTensor,
                                 skip_moe_prefixes=ep_moe_prefixes,
+                                emit_tied_weight_duplicates=not (
+                                    sync_method == "p2p"
+                                    and os.environ.get("XORL_P2P_TIED_WEIGHT_ALIAS_COPY", "1") == "1"
+                                ),
+                                tied_weight_aliases=self._p2p_tied_weight_aliases,
+                                include_param=include_dense_param,
                             )
                             current_buffer.extend(qlora_linear_buffer)
                             _add_rank_phase("extract_s", t_phase)
@@ -890,36 +1078,52 @@ class WeightSyncHandler:
                         # Stage 0: sender rank(s) broadcast directly to SGLang
                         if _is_sender and current_buffer:
                             t_phase = time.perf_counter()
-                            current_buffer = self._unfuse_for_inference(
-                                current_buffer,
-                                model,
-                            )
-                            if quantization and quantization.get("quant_method") == "fp8":
-                                current_buffer = self._quantize_buffer_for_fp8(
+                            if current_buffer:
+                                current_buffer = self._unfuse_for_inference(
                                     current_buffer,
-                                    quantization_config=quantization,
-                                    target_device=self._fp8_quantization_target_device(backend),
-                                    phase_s=rank_phase_s,
-                                    phase_prefix="dense_fp8",
+                                    model,
+                                )
+                                current_buffer = getattr(
+                                    backend,
+                                    "filter_dense_buffer_for_rank",
+                                    lambda buf, _rank: buf,
+                                )(current_buffer, self.rank)
+                            if current_buffer:
+                                if quantization and quantization.get("quant_method") == "fp8":
+                                    current_buffer = self._quantize_buffer_for_fp8(
+                                        current_buffer,
+                                        quantization_config=quantization,
+                                        target_device=self._fp8_quantization_target_device(backend),
+                                        phase_s=rank_phase_s,
+                                        phase_prefix="dense_fp8",
+                                    )
+                            else:
+                                logger.debug(
+                                    "Rank %d: [WeightSync] Dense shard filter skipped module %s",
+                                    self.rank,
+                                    mod_name,
                                 )
                             _add_rank_phase("unfuse_quantize_s", t_phase)
                             if _ws_timings:
                                 _t_unfuse = time.perf_counter()
-                            logger.info(f"Rank 0: [WeightSync] Module {mod_name}: {len(current_buffer)} params")
-                            t_phase = time.perf_counter()
-                            b, p = self._broadcast_buffer(
-                                backend,
-                                current_buffer,
-                                flush_cache=(flush_cache and is_last_overall and not moe_contexts),
-                                weight_version=weight_version if is_last_overall and not moe_contexts else None,
-                            )
-                            _add_rank_phase("broadcast_buffer_s", t_phase)
-                            total_bytes += b
-                            total_params += p
-                            num_buckets += 1
-                            del current_buffer
-                            if _ws_timings:
-                                _t_broadcast = time.perf_counter()
+                            if current_buffer:
+                                logger.info(
+                                    f"Rank {self.rank}: [WeightSync] Module {mod_name}: {len(current_buffer)} params"
+                                )
+                                t_phase = time.perf_counter()
+                                b, p = self._broadcast_buffer(
+                                    backend,
+                                    current_buffer,
+                                    flush_cache=(flush_cache and is_last_overall and not moe_contexts),
+                                    weight_version=weight_version if is_last_overall and not moe_contexts else None,
+                                )
+                                _add_rank_phase("broadcast_buffer_s", t_phase)
+                                total_bytes += b
+                                total_params += p
+                                num_buckets += 1
+                                del current_buffer
+                                if _ws_timings:
+                                    _t_broadcast = time.perf_counter()
 
                         # Stage 0 MoE handling. With direct EP/PP transport
                         # (P2P + direct_ep_transfer=True), each EP rank ships
@@ -928,9 +1132,7 @@ class WeightSyncHandler:
                         # NCCL path still does gather-and-broadcast.
                         if moe_contexts or ep_moe_contexts:
                             if _ep_enabled:
-                                use_direct_ep = (
-                                    backend.supports_direct_ep_transfer and self.rank in backend.sender_ranks
-                                )
+                                use_direct_ep = backend.supports_direct_ep_transfer
                                 for ctx in moe_contexts + ep_moe_contexts:
                                     if use_direct_ep:
                                         # batch_moe defers the per-call
@@ -1160,6 +1362,8 @@ class WeightSyncHandler:
             # Step 5: Resume inference, cleanup
             # ------------------------------------------------------------------
             if _is_sender:
+                if sync_method == "p2p" and self._p2p_tied_weight_aliases:
+                    backend.config.backend_config["p2p_tied_weight_aliases"] = dict(self._p2p_tied_weight_aliases)
                 # Finalize receiver-side update before inference resumes.
                 # For P2P this sends /complete_weights_update, where SGLang
                 # applies weight_version, flush_cache, and post-processing.
@@ -1376,13 +1580,16 @@ class WeightSyncHandler:
         mod_name: str,
         ps,
         skip_clone: bool = False,
+        collect_tensors: bool = True,
         phase_s: Optional[Dict[str, float]] = None,
     ) -> List[Dict[str, Any]]:
         """Collect local EP-sharded MoE expert data during unshard phase.
 
         Identifies full-weight MoE modules (MoEExperts, MoEExpertsLoRA) whose
         expert params are EP-sharded DTensors. Clones local expert data for
-        later EP gathering after reshard.
+        later EP gathering after reshard when ``collect_tensors`` is true.
+        Non-sender direct-P2P ranks can set ``collect_tensors=False`` to keep
+        MoE prefix metadata without cloning tensors they will not transfer.
 
         QLoRAMoeExperts are handled separately by _qlora_collective_ops.
 
@@ -1421,6 +1628,17 @@ class WeightSyncHandler:
                 full_prefix = f"{mod_name}.{mname}" if mod_name != "(root)" else mname
             else:
                 full_prefix = mod_name
+
+            if not collect_tensors:
+                contexts.append(
+                    {
+                        "type": "full_weight",
+                        "prefix": full_prefix,
+                        "local_experts": None,
+                        "num_local_experts": E_local,
+                    }
+                )
+                continue
 
             # Clone local expert data for each projection.
             # With EP, each rank's module already holds only local experts [E_local, K, N].
@@ -1532,18 +1750,23 @@ class WeightSyncHandler:
                 ps=ps,
             )
 
+        if getattr(backend, "has_explicit_sender_ranks", False):
+            if self.rank not in backend.sender_ranks:
+                ctx["local_experts"] = None
+                return 0, 0, 0
+        else:
+            ep_fsdp_rank = 0
+            if ps.ep_fsdp_device_mesh is not None:
+                ep_fsdp_rank = ps.ep_fsdp_device_mesh.get_local_rank("ep_fsdp")
+            if ep_fsdp_rank != 0:
+                ctx["local_experts"] = None
+                return 0, 0, 0
+
         full_prefix = ctx["prefix"]
         ep_size = ps.ep_size
         ep_rank = ps.ep_rank
         local_experts = ctx["local_experts"]
         E_local = ctx["num_local_experts"]
-
-        ep_fsdp_rank = 0
-        if ps.ep_fsdp_device_mesh is not None:
-            ep_fsdp_rank = ps.ep_fsdp_device_mesh.get_local_rank("ep_fsdp")
-        if ep_fsdp_rank != 0:
-            ctx["local_experts"] = None
-            return 0, 0, 0
 
         logger.info(
             f"Rank {self.rank}: [Direct-EP] prefix={full_prefix}, E_local={E_local}, E_total={E_local * ep_size}"
@@ -1553,6 +1776,22 @@ class WeightSyncHandler:
         total_params = 0
         num_buckets = 0
         fp8_cpu_workspace_pending_source_limit = self._fp8_cpu_workspace_pending_source_bytes(bucket_size_bytes)
+
+        def flush_bucket_before_append(next_entry_bytes: int) -> None:
+            nonlocal bucket, bucket_bytes, num_buckets
+            if not self._would_exceed_bucket_cap(bucket_bytes, next_entry_bytes, bucket_size_bytes):
+                return
+            t_backend = time.perf_counter()
+            backend.transfer_bucket(
+                bucket,
+                src_rank=self.rank,
+                flush_cache=False,
+            )
+            self._add_phase_time(phase_s, "direct_ep_backend_s", time.perf_counter() - t_backend)
+            bucket = []
+            bucket_bytes = 0
+            num_buckets += 1
+
         # When batch mode defers the final flush, append to the handler-level
         # bucket so later MoE calls can coalesce into the same transfer.
         if defer_final_flush:
@@ -1599,6 +1838,7 @@ class WeightSyncHandler:
                 total_params += E_local
                 for entry_name, entry_tensor in entries:
                     entry_bytes = entry_tensor.numel() * entry_tensor.element_size()
+                    flush_bucket_before_append(entry_bytes)
                     bucket.append((entry_name, entry_tensor))
                     bucket_bytes += entry_bytes
 
@@ -1656,6 +1896,7 @@ class WeightSyncHandler:
                 total_params += E_local
                 for entry_name, entry_tensor in entries:
                     entry_bytes = entry_tensor.numel() * entry_tensor.element_size()
+                    flush_bucket_before_append(entry_bytes)
                     bucket.append((entry_name, entry_tensor))
                     bucket_bytes += entry_bytes
 
@@ -1684,6 +1925,7 @@ class WeightSyncHandler:
                 hf_name = f"{full_prefix}.{global_idx}.{proj_name}.weight"
                 tensor = local_stack[i]
                 tensor_bytes = tensor.numel() * tensor.element_size()
+                flush_bucket_before_append(tensor_bytes)
                 bucket.append((hf_name, tensor))
                 bucket_bytes += tensor_bytes
                 total_bytes += tensor_bytes
@@ -2383,6 +2625,10 @@ class WeightSyncHandler:
         return os.environ.get("XORL_P2P_FP8_CPU_WORKSPACE_STREAMING", "1") != "0"
 
     @staticmethod
+    def _p2p_requires_post_process_weights(quantization: Optional[Dict[str, Any]]) -> bool:
+        return bool(quantization and quantization.get("quant_method") == "fp8")
+
+    @staticmethod
     def _fp8_dtype_and_max(quantization_config: Dict[str, Any]) -> Tuple[torch.dtype, float]:
         fmt = quantization_config.get("fmt", "e4m3")
         if fmt == "e5m2":
@@ -2439,7 +2685,15 @@ class WeightSyncHandler:
                 name == prefix + ".weight" or name.startswith(prefix + ".") for prefix in modules_to_not_convert
             )
 
-        return "_proj.weight" in name or name.endswith("fused_qkv_a_proj_with_mqa.weight")
+        if "_proj.weight" in name or name.endswith("fused_qkv_a_proj_with_mqa.weight"):
+            return True
+
+        return ".linear_attn." in name and name.rsplit(".", 2)[-2] in {
+            "in_proj_qkv",
+            "in_proj_z",
+            "in_proj_b",
+            "in_proj_a",
+        }
 
     @staticmethod
     def _can_group_fp8_tensor(first: torch.Tensor, tensor: torch.Tensor, group_len: int) -> bool:
@@ -3147,11 +3401,46 @@ class WeightSyncHandler:
     # ========================================================================
 
     @staticmethod
+    def _would_exceed_bucket_cap(
+        current_bytes: int,
+        next_entry_bytes: int,
+        bucket_size_bytes: int,
+    ) -> bool:
+        return current_bytes > 0 and current_bytes + next_entry_bytes > bucket_size_bytes
+
+    @staticmethod
+    def _resolve_module_path(root: Any, path: str) -> Optional[Any]:
+        current = root
+        for part in path.split("."):
+            if not part:
+                continue
+            if part.isdigit() and hasattr(current, "__getitem__"):
+                try:
+                    current = current[int(part)]
+                    continue
+                except Exception:
+                    return None
+            try:
+                current = getattr(current, part)
+            except AttributeError:
+                return None
+        return current
+
+    @staticmethod
+    def _module_paths_share_parameter(root: Any, tied_name: str, source_name: str) -> bool:
+        tied = WeightSyncHandler._resolve_module_path(root, tied_name)
+        source = WeightSyncHandler._resolve_module_path(root, source_name)
+        return tied is not None and tied is source
+
+    @staticmethod
     def _extract_params_for_sync(
         fsdp_mod,
         mod_name: str,
         DTensor,
         skip_moe_prefixes: Optional[set] = None,
+        emit_tied_weight_duplicates: bool = True,
+        tied_weight_aliases: Optional[Dict[str, str]] = None,
+        include_param: Optional[Callable[[str], bool]] = None,
     ) -> List[Tuple[str, torch.Tensor]]:
         """
         Extract parameters from an unsharded FSDP module for sync.
@@ -3217,6 +3506,17 @@ class WeightSyncHandler:
                 continue
 
             full_name = f"{mod_name}.{pname}" if mod_name != "(root)" else pname
+            if include_param is not None and not include_param(full_name):
+                continue
+
+            if not emit_tied_weight_duplicates and tied_weight_aliases is not None:
+                source_name = tied_weight_aliases.get(full_name)
+                if source_name is not None and source_name != full_name:
+                    logger.info(
+                        f"Rank 0: [WeightSync] Tied weight: deferring {full_name} "
+                        f"to receiver-side copy from {source_name}"
+                    )
+                    continue
 
             # Check if this is a base weight with LoRA to merge
             # Case 1: LoraLinear — pname like "self_attn.q_proj.weight"
@@ -3286,10 +3586,27 @@ class WeightSyncHandler:
                 if full_tied not in buffer_names and full_source in buffer_names:
                     for buf_name, buf_tensor in buffer:
                         if buf_name == full_source:
-                            logger.info(
-                                f"Rank 0: [WeightSync] Tied weight: emitting {full_tied} (clone of {full_source})"
-                            )
-                            buffer.append((full_tied, buf_tensor.clone()))
+                            if emit_tied_weight_duplicates:
+                                logger.info(
+                                    f"Rank 0: [WeightSync] Tied weight: emitting {full_tied} (clone of {full_source})"
+                                )
+                                buffer.append((full_tied, buf_tensor.clone()))
+                            elif WeightSyncHandler._module_paths_share_parameter(
+                                fsdp_mod,
+                                tied_name,
+                                source_name,
+                            ):
+                                if tied_weight_aliases is not None:
+                                    tied_weight_aliases[full_tied] = full_source
+                                logger.info(
+                                    f"Rank 0: [WeightSync] Tied weight: deferring {full_tied} "
+                                    f"to receiver-side copy from {full_source}"
+                                )
+                            else:
+                                logger.info(
+                                    f"Rank 0: [WeightSync] Tied weight: not deferring {full_tied}; "
+                                    f"{tied_name} and {source_name} are not the same Parameter"
+                                )
                             break
 
         return buffer
@@ -3421,12 +3738,48 @@ class WeightSyncHandler:
         bucket_bytes = sum(t.numel() * t.element_size() for _, t in buffer)
         logger.info(f"Rank {self.rank}: [WeightSync] Broadcasting {len(buffer)} params, {bucket_bytes / 1e6:.1f} MB")
 
-        backend.transfer_bucket(
-            buffer,
-            flush_cache=flush_cache,
-            weight_version=weight_version,
+        dense_bucket_bytes = _env_int("XORL_WEIGHT_SYNC_DENSE_BUCKET_BYTES", 0, minimum=0)
+        if dense_bucket_bytes <= 0 or bucket_bytes <= dense_bucket_bytes:
+            backend.transfer_bucket(
+                buffer,
+                flush_cache=flush_cache,
+                weight_version=weight_version,
+            )
+            return bucket_bytes, len(buffer)
+
+        chunks = self._chunk_buffer_by_bytes(buffer, dense_bucket_bytes)
+        logger.info(
+            f"Rank {self.rank}: [WeightSync] Split dense buffer into {len(chunks)} transfer buckets "
+            f"(target={dense_bucket_bytes / 1e6:.1f} MB)"
         )
+        for idx, chunk in enumerate(chunks):
+            is_last = idx == len(chunks) - 1
+            backend.transfer_bucket(
+                chunk,
+                flush_cache=flush_cache and is_last,
+                weight_version=weight_version if is_last else None,
+            )
         return bucket_bytes, len(buffer)
+
+    @staticmethod
+    def _chunk_buffer_by_bytes(
+        buffer: List[Tuple[str, torch.Tensor]],
+        bucket_size_bytes: int,
+    ) -> List[List[Tuple[str, torch.Tensor]]]:
+        chunks: List[List[Tuple[str, torch.Tensor]]] = []
+        chunk: List[Tuple[str, torch.Tensor]] = []
+        chunk_bytes = 0
+        for name, tensor in buffer:
+            tensor_bytes = tensor.numel() * tensor.element_size()
+            if chunk and chunk_bytes + tensor_bytes > bucket_size_bytes:
+                chunks.append(chunk)
+                chunk = []
+                chunk_bytes = 0
+            chunk.append((name, tensor))
+            chunk_bytes += tensor_bytes
+        if chunk:
+            chunks.append(chunk)
+        return chunks
 
     @staticmethod
     def _get_fsdp_modules(model) -> Tuple[Optional[Any], List[Tuple[str, Any]]]:

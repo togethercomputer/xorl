@@ -85,10 +85,12 @@ def test_async_api_success_status_zero_completes(monkeypatch):
         small_register_ptrs=[],
         small_register_lens=[],
         chunk=1,
+        use_async_api=True,
         timing=timing,
         bucket_idx=1,
         slice_holds=[],
         src_view_holds=[],
+        log_bucket_details=False,
     )
 
     assert wrapper.engine.submitted == [("session-a", [1], [2], [128 * 1024 * 1024])]
@@ -110,10 +112,12 @@ def test_async_api_uses_sync_fallback_for_medium_chunks(monkeypatch):
         small_register_ptrs=[],
         small_register_lens=[],
         chunk=1,
+        use_async_api=True,
         timing=timing,
         bucket_idx=1,
         slice_holds=[],
         src_view_holds=[],
+        log_bucket_details=False,
     )
 
     assert wrapper.engine.submitted == []
@@ -136,10 +140,12 @@ def test_async_api_min_bytes_env_controls_cutoff(monkeypatch):
         small_register_ptrs=[],
         small_register_lens=[],
         chunk=1,
+        use_async_api=True,
         timing=timing,
         bucket_idx=1,
         slice_holds=[],
         src_view_holds=[],
+        log_bucket_details=False,
     )
 
     assert wrapper.engine.submitted == [("session-a", [1], [2], [12 * 1024 * 1024])]
@@ -162,10 +168,12 @@ def test_async_api_status_poll_timeout(monkeypatch):
             small_register_ptrs=[],
             small_register_lens=[],
             chunk=1,
+            use_async_api=True,
             timing=_BucketTiming(),
             bucket_idx=7,
             slice_holds=[],
             src_view_holds=[],
+            log_bucket_details=False,
         )
 
 
