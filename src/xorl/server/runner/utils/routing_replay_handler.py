@@ -67,10 +67,29 @@ class RoutingReplayHandler:
 
     @staticmethod
     def _extract_topk(model: nn.Module) -> Optional[int]:
-        """Extract num_experts_per_tok from the model config, if available."""
+        """Extract num_experts_per_tok from the model config, if available.
+
+        Qwen3.6 nests `num_experts_per_tok` under `config.text_config`, so we
+        check the nested config first to avoid silently picking up the wrong
+        top-k width from row 0 of mixed routing data.
+        """
         config = getattr(model, "config", None)
+        configs = [config]
         if config is not None:
-            topk = getattr(config, "num_experts_per_tok", None)
+            text_config = (
+                config.get("text_config") if isinstance(config, dict) else getattr(config, "text_config", None)
+            )
+            if text_config is not None:
+                configs.insert(0, text_config)
+
+        for candidate in configs:
+            if candidate is None:
+                continue
+            topk = (
+                candidate.get("num_experts_per_tok")
+                if isinstance(candidate, dict)
+                else getattr(candidate, "num_experts_per_tok", None)
+            )
             if topk is not None:
                 return int(topk)
         return None
@@ -254,9 +273,11 @@ class RoutingReplayHandler:
             logger.warning("R3: No valid routing data after decoding")
             return False
 
-        # Infer dimensions from first decoded datum
+        # Prefer the model config top-k when available, then fall back to the
+        # first decoded datum. Mixed 6/8 routing rows (Qwen3.6) can otherwise
+        # let row 0 pick the wrong width and crash tensorization downstream.
         num_layers_in_data = len(decoded_routing[0][0])
-        topk = len(decoded_routing[0][0][0])
+        topk = self._model_topk or len(decoded_routing[0][0][0])
         total_tokens_raw = sum(len(d) for d in decoded_routing)
 
         logger.debug(
