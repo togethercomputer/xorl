@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .experts import MoEExperts
-from .router import TopKRouter
+from .router import TopKRouter, balanced_synthetic_routing
 from .routing_replay import RoutingReplay, get_replay_stage
 
 
@@ -123,6 +123,16 @@ class MoEBlock(nn.Module):
         graph for gate gradients), then gather with cached indices.  Gradients
         flow through softmax -> gate naturally, no straight-through hack needed.
         """
+        if self.router.synthetic_routing_mode == "balanced":
+            routing_weights, _ = balanced_synthetic_routing(
+                cached_experts.size(0),
+                self.num_experts,
+                cached_experts.size(1),
+                router_logits.device,
+                input_dtype,
+            )
+            return cached_experts, routing_weights
+
         softmax_probs = F.softmax(router_logits, dim=1, dtype=torch.float)
         routing_weights = torch.gather(softmax_probs, 1, cached_experts)
         if self.router.norm_topk_prob:
