@@ -357,9 +357,20 @@ The forward dispatch is a single `torch.autograd.Function` boundary:
 
 ### Async combine overlap
 
-Setting `deepep_async_combine: true` enables the async combine path.  The combine
-communication for layer `L` overlaps with the attention/dense-FFN computation of layer
-`L+1`.  The pending event is synchronized at the start of the next layer's dispatch.
+Setting `deepep_async_combine: true` requests the async combine path, where the
+combine communication for layer `L` would overlap with the attention/dense-FFN
+computation of layer `L+1` and the pending event would be synchronized at the
+start of the next layer's dispatch.
+
+:::caution
+This path is currently **disabled at the kernel boundary** because the combined
+tensor is read by the rest of the transformer block (residual add, norm, attention)
+on the default stream **before** the next `token_pre_dispatch()` runs, so deferring
+the `current_stream_wait` races those consumers.  `tokens_post_combine` forces
+`async_combine=False` unless `XORL_DEEPEP_UNSAFE_ASYNC_COMBINE=1` is exported.
+Setting the config flag alone is a no-op (with a one-time warning); set the env
+var only if you have separately guaranteed the consumer waits on the combine event.
+:::
 
 ### Supported EP sizes
 
@@ -826,7 +837,7 @@ ranks.
 | `ep_dispatch` | `str` | `"alltoall"` | EP token dispatch strategy: `"alltoall"` or `"deepep"`. |
 | `deepep_buffer_size_gb` | `float` | `2.0` | NVLink staging buffer size in GB for DeepEP. |
 | `deepep_num_sms` | `int` | `20` | SMs allocated to DeepEP communication kernels (must be even). Lower values leave more for expert compute. |
-| `deepep_async_combine` | `bool` | `False` | Overlap DeepEP combine with next layer's compute. |
+| `deepep_async_combine` | `bool` | `False` | Overlap DeepEP combine with next layer's compute. Currently gated off in code; requires `XORL_DEEPEP_UNSAFE_ASYNC_COMBINE=1` (see [Async combine overlap](#async-combine-overlap)). |
 
 ### Train config block
 

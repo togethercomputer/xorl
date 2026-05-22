@@ -17,6 +17,11 @@ from typing import List, Optional, Tuple
 import torch
 import torch.distributed as dist
 
+from ...utils import logging
+
+
+logger = logging.get_logger(__name__)
+
 
 try:
     import deep_ep
@@ -48,6 +53,8 @@ def get_hidden_bytes(x: torch.Tensor) -> int:
 # Deferred combine sync
 # ---------------------------------------------------------------------------
 _pending_combine_event: Optional["EventOverlap"] = None
+
+_ALLOW_UNSAFE_ASYNC_COMBINE: bool = _os.environ.get("XORL_DEEPEP_UNSAFE_ASYNC_COMBINE", "0") == "1"
 
 
 def sync_pending_combine():
@@ -558,11 +565,23 @@ def tokens_post_combine(
     """Unpermute expert outputs and combine back to original ranks.
 
     Args:
-        async_combine: If True, combine runs asynchronously on the comm stream.
-            The output tensor data is NOT valid on the default stream until
-            ``sync_pending_combine()`` is called.  The next call to
-            ``token_pre_dispatch()`` automatically syncs.
+        async_combine: Request asynchronous combine on the comm stream so the
+            wait can overlap with the next layer's compute.  Honored only when
+            ``XORL_DEEPEP_UNSAFE_ASYNC_COMBINE=1`` is set; otherwise forced to
+            False because the combined tensor is consumed by the rest of the
+            transformer block on the default stream before the next dispatch,
+            and skipping ``event.current_stream_wait()`` here races that
+            consumer.
     """
+    if async_combine and not _ALLOW_UNSAFE_ASYNC_COMBINE:
+        logger.warning_once(
+            "deepep_async_combine=True ignored: the combined tensor is consumed by the "
+            "transformer block on the default stream before the next DeepEP dispatch, so "
+            "deferring the sync races downstream compute. Set "
+            "XORL_DEEPEP_UNSAFE_ASYNC_COMBINE=1 to opt in anyway."
+        )
+        async_combine = False
+
     if _DEEPEP_PROFILE:
         return _tokens_post_combine_profiled(buffer, expert_output, ctx, async_combine)
 

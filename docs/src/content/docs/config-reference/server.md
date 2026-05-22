@@ -33,7 +33,7 @@ python -m xorl.server.launcher --mode auto --config config.yaml \
 | `ep_dispatch` | `alltoall` | Expert-parallel dispatch: `alltoall` or `deepep` (NVLink-optimized). |
 | `deepep_buffer_size_gb` | `2.0` | DeepEP NVLink buffer size per GPU in GB. Only active when `ep_dispatch: deepep`. |
 | `deepep_num_sms` | `20` | SMs assigned to DeepEP communication kernels. Must be even. |
-| `deepep_async_combine` | `false` | Overlap DeepEP combine with the next layer's compute (experimental). |
+| `deepep_async_combine` | `false` | Overlap DeepEP combine with the next layer's compute (experimental, unsafe). Forced to `false` in code unless `XORL_DEEPEP_UNSAFE_ASYNC_COMBINE=1` is exported; without that env var, deferring the comm-stream sync races the transformer block's read of the combined tensor on the default stream. |
 | `merge_qkv` | `true` | Keep Q/K/V projections fused. Set `false` for tensor parallelism. |
 | `basic_modules` | `[]` | Additional module names to shard as separate FSDP units. |
 | `foundation` | `{}` | Foundation model extra config (dict). |

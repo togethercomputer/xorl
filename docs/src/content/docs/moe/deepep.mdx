@@ -88,7 +88,7 @@ model:
 | `ep_dispatch` | `alltoall` | Set to `deepep` to enable |
 | `deepep_buffer_size_gb` | `2.0` | Per-GPU NVLink buffer pool in GB. Larger = fewer chunked transfers. Rule of thumb: `2 × token_budget × hidden_dim × sizeof(bf16)` |
 | `deepep_num_sms` | `20` | SMs dedicated to communication kernels. Must be even. |
-| `deepep_async_combine` | `false` | Overlap combine with next layer's compute (experimental) |
+| `deepep_async_combine` | `false` | Overlap combine with next layer's compute (experimental, **currently disabled** — see [Async Combine](#async-combine-experimental)) |
 
 ---
 
@@ -223,17 +223,29 @@ If you see OOM during initialization, reduce `deepep_buffer_size_gb`. If profili
 
 ## Async Combine (Experimental)
 
-`deepep_async_combine: true` overlaps the combine communication (outputs flowing back from expert ranks) with the next layer's compute:
+:::caution[Currently disabled]
+The async combine path is **forced off in code**.  The combined
+tensor is consumed by the rest of the transformer block (residual add, norm,
+attention) on the default stream **before** the next `token_pre_dispatch()`
+runs, so deferring `event.current_stream_wait()` races those consumers.
+Setting `deepep_async_combine: true` alone is a no-op (logs a one-time warning).
+To actually run async, also export `XORL_DEEPEP_UNSAFE_ASYNC_COMBINE=1` — only
+do this if you have separately ensured the downstream consumer waits on the
+combine event.
+:::
+
+`deepep_async_combine: true` requests overlap of the combine communication
+(outputs flowing back from expert ranks) with the next layer's compute:
 
 ```
 Step N:    dispatch → compute → [combine starts]
 Step N+1:  [combine finishes] + next layer compute (overlapped)
 ```
 
-**Benefit:** Hides combine latency behind useful compute, especially when combine > dispatch (typical for large output projections).
+**Benefit (when working):** Hides combine latency behind useful compute, especially when combine > dispatch (typical for large output projections).
 
 **Limitations:**
-- Experimental — correctness verified on Qwen3 but not all architectures
+- Gated off behind `XORL_DEEPEP_UNSAFE_ASYNC_COMBINE=1`
 - Requires careful ordering of CUDA streams
 - Not compatible with pipeline parallelism (PP > 1)
 
@@ -247,7 +259,7 @@ On Qwen3-235B-A22B with EP=64 (8 nodes, 64 H100 NVLink GPUs):
 |---|---|---|
 | AllToAll (NCCL) | ~5s per forward_backward | Baseline |
 | DeepEP (num_sms=20) | ~1s per forward_backward | ~5× faster |
-| DeepEP + async_combine | ~0.6s per forward_backward | ~8× faster |
+| DeepEP + async_combine | ~0.6s per forward_backward | ~8× faster (currently gated off, see [Async Combine](#async-combine-experimental)) |
 
 Gains are most pronounced at high EP sizes (≥ 32) where AllToAll's O(EP) staging bottleneck dominates.
 
@@ -259,7 +271,7 @@ Gains are most pronounced at high EP sizes (≥ 32) where AllToAll's O(EP) stagi
 | EP ≤ 8, multi-node InfiniBand | AllToAll — IB already uses RDMA |
 | EP ≥ 16, NVLink cluster | DeepEP |
 | EP ≥ 32, NVLink cluster | DeepEP strongly recommended |
-| EP ≥ 64, NVLink cluster | DeepEP + async_combine |
+| EP ≥ 64, NVLink cluster | DeepEP (async_combine currently gated off) |
 
 ---
 

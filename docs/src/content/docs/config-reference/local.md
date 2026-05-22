@@ -35,7 +35,7 @@ torchrun --nproc_per_node=8 -m xorl.cli.train config.yaml \
 | `ep_dispatch` | `alltoall` | Expert-parallel dispatch: `alltoall` or `deepep` (NVLink-optimized). |
 | `deepep_buffer_size_gb` | `2.0` | DeepEP NVLink buffer size per GPU in GB. Only active when `ep_dispatch: deepep`. |
 | `deepep_num_sms` | `20` | SMs assigned to DeepEP communication kernels. Must be even. Lower values leave more SMs for overlapped compute. |
-| `deepep_async_combine` | `false` | Overlap DeepEP combine with the next layer's compute (experimental). |
+| `deepep_async_combine` | `false` | Overlap DeepEP combine with the next layer's compute (experimental, unsafe). Forced to `false` in code unless `XORL_DEEPEP_UNSAFE_ASYNC_COMBINE=1` is exported; without that env var, deferring the comm-stream sync races the transformer block's read of the combined tensor on the default stream. |
 | `merge_qkv` | `true` | Keep Q/K/V projections fused as `qkv_proj`. Set `false` for tensor parallelism or per-projection LoRA. |
 | `basic_modules` | `[]` | Additional module names (beyond `_no_split_modules`) to shard as separate FSDP units. |
 | `foundation` | `{}` | Extra foundation model config (dict). |
