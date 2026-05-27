@@ -73,9 +73,11 @@ class MicroBatchCollator(DataCollator):
             collated_micro_batch = self.internal_collator(micro_batch_features)
             micro_batches.append(collated_micro_batch)
 
-        assert len(micro_batches) == self.gradient_accumulation_steps, (
-            f"Internal error: Expected {self.gradient_accumulation_steps} micro-batches, but got {len(micro_batches)}"
-        )
+        if len(micro_batches) != self.gradient_accumulation_steps:
+            raise RuntimeError(
+                f"Internal error: Expected {self.gradient_accumulation_steps} micro-batches, "
+                f"but got {len(micro_batches)}"
+            )
 
         return micro_batches
 
@@ -343,16 +345,19 @@ class DataLoaderBuilder:
             first_item = self.dataset[0]
             if isinstance(first_item, list):
                 # New structure: list of dicts
-                assert len(first_item) > 0, "Dataset item is an empty list"
-                assert isinstance(first_item[0], dict), (
-                    f"Dataset items must be lists of dictionaries, but got list of {type(first_item[0]).__name__}. "
-                    f"Each element in the list should be a dict with keys like 'input_ids', 'labels', etc."
-                )
+                if len(first_item) == 0:
+                    raise ValueError("Dataset item is an empty list")
+                if not isinstance(first_item[0], dict):
+                    raise TypeError(
+                        f"Dataset items must be lists of dictionaries, but got list of "
+                        f"{type(first_item[0]).__name__}. Each element in the list should be a dict "
+                        f"with keys like 'input_ids', 'labels', etc."
+                    )
             elif isinstance(first_item, dict):
                 # Old structure: single dict (backward compatibility)
                 pass
             else:
-                raise AssertionError(
+                raise TypeError(
                     f"Dataset items must be either dict or list of dicts, but got {type(first_item).__name__}. "
                     f"Each dataset item should be a dict (e.g., {{'input_ids': ..., 'labels': ...}}) "
                     f"or a list of dicts (e.g., [{{'input_ids': ..., 'labels': ...}}, ...])."

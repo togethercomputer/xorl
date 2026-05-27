@@ -1072,9 +1072,12 @@ class TrainingArguments:
 
         # configure data parallel size
         if self.data_parallel_replicate_size > 0 and self.data_parallel_shard_size > 0:
-            assert self.data_parallel_size == self.data_parallel_replicate_size * self.data_parallel_shard_size, (
-                f"data_parallel_size should be equal to data_parallel_replicate_size: {self.data_parallel_replicate_size} * data_parallel_shard_size: {self.data_parallel_shard_size}."
-            )
+            if self.data_parallel_size != self.data_parallel_replicate_size * self.data_parallel_shard_size:
+                raise ValueError(
+                    f"data_parallel_size ({self.data_parallel_size}) should equal "
+                    f"data_parallel_replicate_size ({self.data_parallel_replicate_size}) * "
+                    f"data_parallel_shard_size ({self.data_parallel_shard_size})."
+                )
 
         elif self.data_parallel_replicate_size > 0:
             if self.data_parallel_size % self.data_parallel_replicate_size != 0:
@@ -1106,12 +1109,14 @@ class TrainingArguments:
                 "Otherwise, each node will save checkpoints to its local directory, which may cause inconsistencies or job failures."
             )
 
-        assert self.expert_parallel_size == 1 or self.init_device != "cpu", (
-            "cpu init is not supported when enable ep. Please use `init_device = cuda` or `init_device = meta` instead."
-        )
+        if self.expert_parallel_size != 1 and self.init_device == "cpu":
+            raise ValueError(
+                "cpu init is not supported when expert parallelism is enabled. "
+                "Please use `init_device = cuda` or `init_device = meta` instead."
+            )
 
-        if self.data_parallel_mode == "fsdp2":
-            assert self.init_device == "meta", "Please use init_device: meta for FSDP2 training"
+        if self.data_parallel_mode == "fsdp2" and self.init_device != "meta":
+            raise ValueError("Please use init_device: meta for FSDP2 training")
 
         if self.load_checkpoint_path == "auto":
             self.load_checkpoint_path = get_checkpoint_path(
@@ -1152,13 +1157,16 @@ class TrainingArguments:
 
         # Prevent CUDA_LAUNCH_BLOCKING from being accidentally enabled
         if not self.allow_cuda_launch_blocking:
-            assert not self.enable_full_determinism, (
-                "allow_cuda_launch_blocking is disabled but enable_full_determinism is enabled. enable_full_determinism would set CUDA_LAUNCH_BLOCKING to 1!"
-            )
+            if self.enable_full_determinism:
+                raise ValueError(
+                    "allow_cuda_launch_blocking is disabled but enable_full_determinism is enabled. "
+                    "enable_full_determinism would set CUDA_LAUNCH_BLOCKING=1."
+                )
             cuda_launch_blocking_val = os.environ.get("CUDA_LAUNCH_BLOCKING", "").strip()
-            assert cuda_launch_blocking_val != "1", (
-                "CUDA_LAUNCH_BLOCKING=1 is set when allow_cuda_launch_blocking is not enabled!"
-            )
+            if cuda_launch_blocking_val == "1":
+                raise ValueError(
+                    "CUDA_LAUNCH_BLOCKING=1 is set in the environment but allow_cuda_launch_blocking is not enabled."
+                )
 
 
 @dataclass
