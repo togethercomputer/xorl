@@ -644,6 +644,13 @@ class TrainingArguments:
             "A value of 2 means restart after the second iteration."
         },
     )
+    muon_grouped_gram_ns_fp32_byte_limit: int = field(
+        default=512 * 1024**2,
+        metadata={
+            "help": "Maximum fp32 scratch bytes per grouped Muon Gram Newton-Schulz batch before chunking. "
+            "Lower values reduce peak optimizer scratch memory at the cost of more launches."
+        },
+    )
     muon_grad_dtype: Optional[Literal["fp32", "bf16"]] = field(
         default=None,
         metadata={
@@ -690,6 +697,7 @@ class TrainingArguments:
             kwargs["muon_ns_algorithm"] = self.muon_ns_algorithm
             kwargs["muon_ns_use_quack_kernels"] = self.muon_ns_use_quack_kernels
             kwargs["muon_gram_ns_num_restarts"] = self.muon_gram_ns_num_restarts
+            kwargs["muon_grouped_gram_ns_fp32_byte_limit"] = self.muon_grouped_gram_ns_fp32_byte_limit
             if self.muon_gram_ns_restart_iterations is not None:
                 kwargs["muon_gram_ns_restart_iterations"] = self.muon_gram_ns_restart_iterations
             # Wire optimizer_dtype -> muon_momentum_dtype so "bf16" sets bf16 Muon momentum

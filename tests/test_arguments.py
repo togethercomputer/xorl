@@ -100,6 +100,7 @@ def test_parse_args_wires_muon_kwargs_from_yaml(tmp_path, monkeypatch):
                     "muon_ns_use_quack_kernels": False,
                     "muon_gram_ns_num_restarts": 2,
                     "muon_gram_ns_restart_iterations": [2],
+                    "muon_grouped_gram_ns_fp32_byte_limit": 23,
                     "muon_grad_dtype": "fp32",
                     "muon_update_dtype": "fp32",
                     "muon_force_momentum_path": True,
@@ -123,6 +124,7 @@ def test_parse_args_wires_muon_kwargs_from_yaml(tmp_path, monkeypatch):
     assert args.train.optimizer_kwargs["muon_ns_use_quack_kernels"] is False
     assert args.train.optimizer_kwargs["muon_gram_ns_num_restarts"] == 2
     assert args.train.optimizer_kwargs["muon_gram_ns_restart_iterations"] == [2]
+    assert args.train.optimizer_kwargs["muon_grouped_gram_ns_fp32_byte_limit"] == 23
     assert args.train.optimizer_kwargs["muon_momentum_dtype"] is torch.bfloat16
     assert args.train.optimizer_kwargs["muon_grad_dtype"] is torch.float32
     assert args.train.optimizer_kwargs["muon_update_dtype"] is torch.float32

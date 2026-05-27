@@ -234,6 +234,7 @@ def test_load_server_arguments_threads_muon_gram_newton_schulz_through_nested_co
                     "muon_ns_use_quack_kernels": False,
                     "muon_gram_ns_num_restarts": 2,
                     "muon_gram_ns_restart_iterations": [2],
+                    "muon_grouped_gram_ns_fp32_byte_limit": 23,
                     "muon_grad_dtype": "fp32",
                     "muon_update_dtype": "bf16",
                     "muon_force_momentum_path": True,
@@ -263,6 +264,7 @@ def test_load_server_arguments_threads_muon_gram_newton_schulz_through_nested_co
     assert train_config["muon_ns_use_quack_kernels"] is False
     assert train_config["muon_gram_ns_num_restarts"] == 2
     assert train_config["muon_gram_ns_restart_iterations"] == [2]
+    assert train_config["muon_grouped_gram_ns_fp32_byte_limit"] == 23
     assert args.muon_grad_dtype == "fp32"
     assert args.muon_update_dtype == "bf16"
     assert args.muon_force_momentum_path is True

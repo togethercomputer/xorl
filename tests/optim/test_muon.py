@@ -76,6 +76,7 @@ def test_build_optimizer_threads_gram_newton_schulz_kwargs():
             "muon_ns_algorithm": "gram_newton_schulz",
             "muon_ns_use_quack_kernels": False,
             "muon_gram_ns_num_restarts": 1,
+            "muon_grouped_gram_ns_fp32_byte_limit": 23,
             "muon_grad_dtype": "fp32",
             "muon_update_dtype": "bf16",
             "muon_force_momentum_path": True,
@@ -91,10 +92,18 @@ def test_build_optimizer_threads_gram_newton_schulz_kwargs():
     assert all(group["ns_algorithm"] == "gram_newton_schulz" for group in muon_groups)
     assert all(group["ns_use_quack_kernels"] is False for group in muon_groups)
     assert all(group["gram_newton_schulz_num_restarts"] == 1 for group in muon_groups)
+    assert all(group["grouped_gram_ns_fp32_byte_limit"] == 23 for group in muon_groups)
     assert optimizer._momentum_dtype is torch.bfloat16
     assert optimizer._grad_dtype is torch.float32
     assert optimizer._update_dtype is torch.bfloat16
     assert optimizer._force_momentum_path is True
+
+
+def test_muon_rejects_nonpositive_grouped_gram_newton_schulz_byte_limit():
+    param = nn.Parameter(torch.zeros((2, 3), dtype=torch.float32))
+
+    with pytest.raises(ValueError, match="grouped_gram_ns_fp32_byte_limit must be positive"):
+        Muon([param], grouped_gram_ns_fp32_byte_limit=0)
 
 
 def test_make_quack_backend_prefers_installed_quack(monkeypatch):
@@ -398,11 +407,11 @@ def test_muon_chunks_grouped_gram_newton_schulz_batches(monkeypatch):
         nesterov=False,
         ns_algorithm="gram_newton_schulz",
         ns_use_quack_kernels=False,
+        grouped_gram_ns_fp32_byte_limit=23,
     )
     orthogonalizer = FakeOrthogonalizer()
 
     monkeypatch.setattr(muon_module, "_adjust_lr", lambda lr, adjust_lr_fn, shape: lr)
-    monkeypatch.setattr(muon_module, "GROUPED_GRAM_NS_FP32_BYTE_LIMIT", 23)
     monkeypatch.setattr(optimizer, "_get_gram_ns_orthogonalizer", lambda group: orthogonalizer)
 
     p1.grad = torch.ones((2, 3), dtype=torch.float32)

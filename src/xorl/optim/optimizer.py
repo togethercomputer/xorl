@@ -14,7 +14,7 @@ from ..utils import logging
 from .anyprecision_adamw import AnyPrecisionAdamW
 from .distsignsgd import DistSignSGD, configure_distsignsgd
 from .multi_optimizer import MultiOptimizer
-from .muon import Muon
+from .muon import GROUPED_GRAM_NS_FP32_BYTE_LIMIT, Muon
 from .signsgd import SignSGD
 
 
@@ -209,6 +209,10 @@ def _get_optimizer_cls_and_kwargs(
             ns_use_quack_kernels=kwargs.get("muon_ns_use_quack_kernels", True),
             gram_newton_schulz_num_restarts=kwargs.get("muon_gram_ns_num_restarts", 1),
             gram_newton_schulz_restart_iterations=kwargs.get("muon_gram_ns_restart_iterations"),
+            grouped_gram_ns_fp32_byte_limit=kwargs.get(
+                "muon_grouped_gram_ns_fp32_byte_limit",
+                GROUPED_GRAM_NS_FP32_BYTE_LIMIT,
+            ),
             adamw_betas=betas,
             adamw_eps=eps,
             momentum_dtype=_normalize_optional_dtype(momentum_dtype, field_name="muon_momentum_dtype"),

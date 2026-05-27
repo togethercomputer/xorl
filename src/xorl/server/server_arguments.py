@@ -361,6 +361,13 @@ class ServerArguments:
             "A value of 2 means restart after the second iteration."
         },
     )
+    muon_grouped_gram_ns_fp32_byte_limit: int = field(
+        default=512 * 1024**2,
+        metadata={
+            "help": "Maximum fp32 scratch bytes per grouped Muon Gram Newton-Schulz batch before chunking. "
+            "Lower values reduce peak optimizer scratch memory at the cost of more launches."
+        },
+    )
     muon_grad_dtype: Optional[Literal["fp32", "bf16"]] = field(
         default=None,
         metadata={
@@ -742,6 +749,7 @@ class ServerArguments:
                 "muon_ns_use_quack_kernels": self.muon_ns_use_quack_kernels,
                 "muon_gram_ns_num_restarts": self.muon_gram_ns_num_restarts,
                 "muon_gram_ns_restart_iterations": self.muon_gram_ns_restart_iterations,
+                "muon_grouped_gram_ns_fp32_byte_limit": self.muon_grouped_gram_ns_fp32_byte_limit,
                 "muon_grad_dtype": self.muon_grad_dtype,
                 "muon_update_dtype": self.muon_update_dtype,
                 "muon_force_momentum_path": self.muon_force_momentum_path,

@@ -45,7 +45,7 @@ from .gram_newton_schulz import GramNewtonSchulzOrthogonalizer, expand_ns_coeffi
 
 logger = logging.get_logger(__name__)
 
-GROUPED_GRAM_NS_FP32_BYTE_LIMIT = 2 * 1024**3
+GROUPED_GRAM_NS_FP32_BYTE_LIMIT = 512 * 1024**2
 
 
 def _batched_zeropower_via_newtonschulz(
@@ -187,6 +187,8 @@ class Muon(TorchMuon):
         gram_newton_schulz_restart_iterations: Explicit Gram Newton-Schulz
             restart iteration indices. A value of ``2`` means restart after
             finishing the second iteration.
+        grouped_gram_ns_fp32_byte_limit: Maximum fp32 scratch bytes per grouped
+            Gram Newton-Schulz batch before splitting it into smaller chunks.
         adamw_state_dtype: If set, force AdamW fallback optimizer states
             (``exp_avg``, ``exp_avg_sq``) to this dtype (e.g.
             ``torch.bfloat16``).  Default ``None`` inherits dtype from
@@ -223,6 +225,7 @@ class Muon(TorchMuon):
         ns_use_quack_kernels: bool = True,
         gram_newton_schulz_num_restarts: int = 1,
         gram_newton_schulz_restart_iterations: Optional[Iterable[int]] = None,
+        grouped_gram_ns_fp32_byte_limit: int = GROUPED_GRAM_NS_FP32_BYTE_LIMIT,
         adamw_state_dtype: Optional[torch.dtype] = None,
         cautious: bool = False,
         distributed_mode: str = "shard_local",
@@ -240,6 +243,8 @@ class Muon(TorchMuon):
             raise ValueError(
                 f"Unsupported Muon distributed_mode: {distributed_mode!r}. Expected 'shard_local' or 'full_gradient'."
             )
+        if grouped_gram_ns_fp32_byte_limit <= 0:
+            raise ValueError(f"grouped_gram_ns_fp32_byte_limit must be positive, got {grouped_gram_ns_fp32_byte_limit}")
 
         self._momentum_dtype = momentum_dtype
         self._grad_dtype = grad_dtype
@@ -269,6 +274,7 @@ class Muon(TorchMuon):
                 if gram_newton_schulz_restart_iterations is not None
                 else None
             ),
+            grouped_gram_ns_fp32_byte_limit=grouped_gram_ns_fp32_byte_limit,
             use_muon=True,
             adamw_betas=adamw_betas,
             adamw_eps=adamw_eps,
@@ -460,7 +466,11 @@ class Muon(TorchMuon):
 
         if uses_grouped_gram_ns and grouped_updates:
             orthogonalizer = self._get_gram_ns_orthogonalizer(group)
-            self._orthogonalize_grouped_gram_ns_updates(grouped_updates, orthogonalizer)
+            self._orthogonalize_grouped_gram_ns_updates(
+                grouped_updates,
+                orthogonalizer,
+                group["grouped_gram_ns_fp32_byte_limit"],
+            )
 
         for plan in update_plans:
             update_pieces = plan.pieces
@@ -524,9 +534,10 @@ class Muon(TorchMuon):
         self,
         grouped_updates: dict[tuple[tuple[int, int], torch.dtype, torch.device], list[_GroupedOrthogonalizationEntry]],
         orthogonalizer: GramNewtonSchulzOrthogonalizer,
+        fp32_byte_limit: int,
     ) -> None:
         for batch_entries in grouped_updates.values():
-            for chunk in self._iter_grouped_gram_ns_chunks(batch_entries):
+            for chunk in self._iter_grouped_gram_ns_chunks(batch_entries, fp32_byte_limit):
                 if len(chunk) == 1 and chunk[0].batched_tensor.shape[0] == 1 and chunk[0].tensor.ndim == 2:
                     entry = chunk[0]
                     entry.plan.pieces[entry.piece_index] = orthogonalizer.orthogonalize(entry.tensor)
@@ -549,9 +560,10 @@ class Muon(TorchMuon):
     def _iter_grouped_gram_ns_chunks(
         self,
         batch_entries: list[_GroupedOrthogonalizationEntry],
+        fp32_byte_limit: int,
     ):
         per_matrix_numel = batch_entries[0].batched_tensor.shape[-2] * batch_entries[0].batched_tensor.shape[-1]
-        max_matrix_batch = max(1, GROUPED_GRAM_NS_FP32_BYTE_LIMIT // (per_matrix_numel * 4))
+        max_matrix_batch = max(1, fp32_byte_limit // (per_matrix_numel * 4))
         chunk: list[_GroupedOrthogonalizationEntry] = []
         chunk_matrix_batch = 0
 
