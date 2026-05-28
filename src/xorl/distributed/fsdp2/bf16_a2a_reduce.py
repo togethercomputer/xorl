@@ -43,6 +43,30 @@ from torch.distributed.fsdp._fully_shard._fsdp_api import ReduceScatter, _Reduce
 from xorl.optim.stochastic_round import stochastic_round_to_bf16
 
 
+def _canonical_reduce_op(op: _ReduceOp) -> ReduceOp.RedOpType:
+    """Return the underlying RedOpType for FSDP's wrapped or raw reduce op.
+
+    Unknown ops are returned unchanged so the caller can reject them.
+    """
+    op_type = getattr(op, "op", op)
+    op_name = getattr(op_type, "name", None)
+    if op_name == "SUM":
+        return ReduceOp.SUM
+    if op_name == "AVG":
+        return ReduceOp.AVG
+    if op_name == "PREMUL_SUM":
+        # FSDP emits _make_nccl_premul_sum(1 / gradient_divide_factor) when a
+        # gradient_divide_factor is set. PREMUL_SUM is only equivalent to SUM
+        # when that factor is 1.0; the install-time check in
+        # ``parallelize_model_fsdp2`` (see ``torch_parallelize.py``) that
+        # rejects gradient_divide_factor != 1.0 is load-bearing — without it,
+        # this branch silently drops the premultiply scalar and under-weights
+        # gradients. Do not relax that check without also inspecting the
+        # premul factor here.
+        return ReduceOp.SUM
+    return op_type
+
+
 class BF16StochasticAllToAllReduceScatter(ReduceScatter):
     """ReduceScatter: stochastic-round FP32→BF16, all-to-all, FP32 local sum."""
 
@@ -65,8 +89,11 @@ class BF16StochasticAllToAllReduceScatter(ReduceScatter):
     ) -> Optional[dist.Work]:
         if async_op:
             raise NotImplementedError("BF16StochasticAllToAllReduceScatter does not support async_op=True")
-        if op != ReduceOp.SUM and op != ReduceOp.AVG:
-            raise NotImplementedError(f"BF16StochasticAllToAllReduceScatter requires SUM or AVG op, got {op}")
+        op_type = _canonical_reduce_op(op)
+        if op_type != ReduceOp.SUM and op_type != ReduceOp.AVG:
+            raise NotImplementedError(
+                f"BF16StochasticAllToAllReduceScatter requires SUM or AVG op, got {op} ({op_type})"
+            )
         if input_tensor.dtype != torch.float32:
             raise ValueError(
                 "BF16StochasticAllToAllReduceScatter requires FP32 input "
@@ -87,7 +114,7 @@ class BF16StochasticAllToAllReduceScatter(ReduceScatter):
         dist.all_to_all_single(out_bf16, in_bf16, group=group)
 
         summed = out_bf16.view(world_size, chunk_numel).to(torch.float32).sum(dim=0)
-        if op == ReduceOp.AVG:
+        if op_type == ReduceOp.AVG:
             summed.div_(world_size)
         output_tensor.copy_(summed)
         return None

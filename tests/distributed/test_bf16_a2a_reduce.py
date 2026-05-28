@@ -14,8 +14,10 @@ from pathlib import Path
 import pytest
 import torch
 import torch.distributed as dist
+from torch.distributed.distributed_c10d import ReduceOp
 
 from xorl.distributed.fsdp2 import BF16StochasticAllToAllReduceScatter
+from xorl.distributed.fsdp2.bf16_a2a_reduce import _canonical_reduce_op
 from xorl.utils.device import get_nccl_backend
 
 
@@ -27,6 +29,14 @@ from distributed_utils import run_distributed_script, skip_if_gpu_count_less_tha
 
 
 pytestmark = [pytest.mark.distributed]
+
+
+@pytest.mark.cpu
+def test_canonical_reduce_op_accepts_fsdp_wrapped_ops():
+    assert _canonical_reduce_op(ReduceOp(ReduceOp.SUM)) == dist.ReduceOp.SUM
+    assert _canonical_reduce_op(ReduceOp(ReduceOp.AVG)) == dist.ReduceOp.AVG
+    assert _canonical_reduce_op(dist.ReduceOp.SUM) == dist.ReduceOp.SUM
+    assert _canonical_reduce_op(dist._make_nccl_premul_sum(1.0)) == dist.ReduceOp.SUM
 
 
 def _world_size() -> int:
