@@ -355,7 +355,7 @@ class RemoteBackend(Backend):
         buffer_size_mb=1024,
         sync_method="nccl_broadcast",
         flush_cache=False,
-        pause_mode="retract",
+        pause_mode="in_place",
         weight_version=None,
         quantization=None,
         request_id=None,

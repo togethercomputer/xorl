@@ -29,8 +29,12 @@ def create_backend(
         from .nccl_broadcast import NCCLBroadcastBackend  # noqa: PLC0415
 
         return NCCLBroadcastBackend(config, **kwargs)
+    if method == "nccl_simple":
+        from .nccl_simple import NCCLSimpleBackend  # noqa: PLC0415
+
+        return NCCLSimpleBackend(config, **kwargs)
     if method == "p2p":
         from .p2p import P2PTransportBackend  # noqa: PLC0415
 
         return P2PTransportBackend(config, **kwargs)
-    raise ValueError(f"Unknown weight sync backend: {method!r}. Supported: 'nccl_broadcast', 'p2p'.")
+    raise ValueError(f"Unknown weight sync backend: {method!r}. Supported: 'nccl_broadcast', 'nccl_simple', 'p2p'.")

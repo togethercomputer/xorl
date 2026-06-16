@@ -55,6 +55,19 @@ def _get_http_session() -> requests.Session:
     return _http_session
 
 
+def _ws_port(endpoint: "EndpointInfo") -> int:
+    """Weight-sync receiver port for an endpoint.
+
+    XORL_WEIGHT_SYNC_PORT overrides the endpoint's serving port so the
+    init/update/destroy HTTP calls can target a sidecar receiver process
+    (which receives the NCCL broadcast and hands tensors to the inference
+    server via /update_weights_from_tensor) while generation traffic and
+    pause/resume keep using the real serving port.
+    """
+    override = os.environ.get("XORL_WEIGHT_SYNC_PORT")
+    return int(override) if override else endpoint.port
+
+
 @dataclass
 class EndpointInfo:
     """Information about an inference endpoint."""
@@ -236,7 +249,10 @@ class NCCLWeightSynchronizer:
         else:
             pg_options_param_name = "pg_options"
 
-        # Set CUDA device and pass device_id for proper NCCL comm initialization
+        # Use eager NCCL init (device_id). This works correctly for 2-node
+        # cross-node setup (IB network, no CUDA visibility issues).
+        # Was broken on same-node split CUDA_VISIBLE_DEVICES due to sglang's
+        # internal TP broadcast deadlock; 2-node avoids that entirely.
         torch.cuda.set_device(self.device)
         device_id = torch.device(self.device)
 
@@ -399,7 +415,7 @@ class NCCLWeightSynchronizer:
         session = _get_http_session()
 
         def init_single(rank_offset: int, endpoint: EndpointInfo) -> Dict[str, Any]:
-            url = f"http://{endpoint.host}:{endpoint.port}/init_weights_update_group"
+            url = f"http://{endpoint.host}:{_ws_port(endpoint)}/init_weights_update_group"
             payload = {
                 "master_address": self.master_address,
                 "master_port": self._active_master_port,
@@ -455,7 +471,7 @@ class NCCLWeightSynchronizer:
         session = _get_http_session()
 
         def destroy_single(endpoint: EndpointInfo) -> Dict[str, Any]:
-            url = f"http://{endpoint.host}:{endpoint.port}/destroy_weights_update_group"
+            url = f"http://{endpoint.host}:{_ws_port(endpoint)}/destroy_weights_update_group"
             payload = {"group_name": self.group_name}
             try:
                 response = session.post(url, json=payload, timeout=30)
@@ -540,7 +556,7 @@ class NCCLWeightSynchronizer:
 
     def pause_inference_endpoints(
         self,
-        pause_mode: str = "retract",
+        pause_mode: str = "in_place",
         max_retries: int = 3,
         retry_delay_seconds: float = 1.0,
     ) -> Tuple[List[Dict[str, Any]], bool]:
@@ -650,8 +666,9 @@ class NCCLWeightSynchronizer:
         def call_single_endpoint(endpoint: EndpointInfo, endpoint_idx: int):
             """Call update_weights_from_distributed on a single endpoint."""
             try:
+                logger.info(f"[Training] HTTP thread: posting update_weights to {endpoint.host}:{endpoint.port}")
                 response = session.post(
-                    f"http://{endpoint.host}:{endpoint.port}/update_weights_from_distributed",
+                    f"http://{endpoint.host}:{_ws_port(endpoint)}/update_weights_from_distributed",
                     json={
                         "names": names,
                         "dtypes": dtypes,
@@ -673,6 +690,7 @@ class NCCLWeightSynchronizer:
                 if not result.get("success"):
                     update_errors.append(f"API failed on {endpoint.host}:{endpoint.port}: {result}")
             except Exception as e:
+                logger.error(f"[Training] HTTP thread failed for {endpoint.host}:{endpoint.port}: {e}")
                 update_errors.append(f"Exception calling {endpoint.host}:{endpoint.port}: {e}")
 
         # Start API calls in parallel threads (one per endpoint)
@@ -681,6 +699,15 @@ class NCCLWeightSynchronizer:
             t = Thread(target=call_single_endpoint, args=(endpoint, i))
             t.start()
             api_threads.append(t)
+
+        # Fail fast if the HTTP request errored immediately (connection
+        # refused etc.). Without this check, dist.broadcast below blocks
+        # forever waiting for receivers that were never notified.
+        time.sleep(0.5)
+        if update_errors:
+            for t in api_threads:
+                t.join(timeout=5)
+            raise RuntimeError(f"update_weights HTTP failed before broadcast: {update_errors}")
 
         # Set device once for all operations
         torch.cuda.set_device(self.device)
@@ -702,6 +729,16 @@ class NCCLWeightSynchronizer:
                 param_data = param.to(self.device).contiguous()
 
             dist.broadcast(param_data, src=0, group=self.process_group)
+
+        # Force CUDA stream to finish so receiver-side handle.wait() can
+        # actually progress; without this, dist.broadcast can return at the
+        # Python level while the NCCL kernel is still queued on the stream,
+        # which leaves sglang blocked in update_weights_from_distributed and
+        # the api_threads below hung waiting for the 200 OK.
+        if (isinstance(self.device, torch.device) and self.device.type == "cuda") or (
+            isinstance(self.device, str) and self.device.startswith("cuda")
+        ):
+            torch.cuda.synchronize(self.device)
 
         # Wait for all API calls to complete
         for t in api_threads:

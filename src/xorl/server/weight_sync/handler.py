@@ -214,9 +214,20 @@ _cached_backend_key: Optional[Tuple[Any, ...]] = None
 _cached_p2p_sender_group: Optional[Any] = None
 _cached_p2p_sender_group_ranks: Optional[Tuple[int, ...]] = None
 
+# nccl_broadcast backend cache — same motivation as P2P cache: the NCCL
+# communicator init (TCPStore rendezvous + ncclCommInitRankConfig) is
+# expensive and must happen exactly once. Without caching, each call to
+# sync_inference_weights creates a new backend and re-sends
+# /init_weights_update_group to sglang, which causes sglang to attempt a
+# second ncclCommInitRankConfig on the same group name — deadlocking the
+# first communicator.  Caching ensures initialize() is called only once per
+# (endpoint, group_name, world_size) tuple.
+_cached_nccl_backend: Optional[Any] = None
+_cached_nccl_backend_key: Optional[Tuple[Any, ...]] = None
+
 
 def _atexit_destroy_cached_backend() -> None:
-    global _cached_p2p_backend, _cached_backend_key
+    global _cached_p2p_backend, _cached_backend_key, _cached_nccl_backend, _cached_nccl_backend_key
     if _cached_p2p_backend is not None:
         try:
             _cached_p2p_backend.destroy(complete_receiver=False)
@@ -224,6 +235,13 @@ def _atexit_destroy_cached_backend() -> None:
             pass
         _cached_p2p_backend = None
         _cached_backend_key = None
+    if _cached_nccl_backend is not None:
+        try:
+            _cached_nccl_backend.destroy(complete_receiver=False)
+        except Exception:
+            pass
+        _cached_nccl_backend = None
+        _cached_nccl_backend_key = None
 
 
 atexit.register(_atexit_destroy_cached_backend)
@@ -767,8 +785,13 @@ class WeightSyncHandler:
         # group_name, master addr) all match the prior call's. The cache
         # is module-level so it survives across handler instances within
         # the same process.
-        global _cached_p2p_backend, _cached_backend_key
-        cache_enabled = os.environ.get("XORL_P2P_BACKEND_CACHE", "1") == "1" and sync_method == "p2p"
+        global _cached_p2p_backend, _cached_backend_key, _cached_nccl_backend, _cached_nccl_backend_key
+        cache_enabled_p2p = os.environ.get("XORL_P2P_BACKEND_CACHE", "1") == "1" and sync_method == "p2p"
+        cache_enabled_nccl = os.environ.get("XORL_NCCL_BACKEND_CACHE", "1") == "1" and sync_method in (
+            "nccl_broadcast",
+            "nccl_simple",
+        )
+        cache_enabled = cache_enabled_p2p or cache_enabled_nccl
         backend_key: Optional[Tuple[Any, ...]] = None
         if cache_enabled:
             backend_key = (
@@ -790,8 +813,14 @@ class WeightSyncHandler:
                     )
                 ),
             )
-        if (
-            cache_enabled
+
+        # Check nccl_broadcast cache first
+        if cache_enabled_nccl and _cached_nccl_backend is not None and _cached_nccl_backend_key == backend_key:
+            backend = _cached_nccl_backend
+            backend.config = transport_cfg
+            logger.info(f"Rank {self.rank}: [WeightSync] Reusing cached NCCL backend (skips NCCL group re-init)")
+        elif (
+            cache_enabled_p2p
             and _cached_p2p_backend is not None
             and _cached_backend_key == backend_key
             and getattr(_cached_p2p_backend, "is_alive", False)
@@ -811,6 +840,13 @@ class WeightSyncHandler:
                     logger.warning(f"[WeightSync] failed to destroy stale cached backend: {e}")
                 _cached_p2p_backend = None
                 _cached_backend_key = None
+            if _cached_nccl_backend is not None:
+                try:
+                    _cached_nccl_backend.destroy(complete_receiver=False)
+                except Exception as e:
+                    logger.warning(f"[WeightSync] failed to destroy stale cached nccl backend: {e}")
+                _cached_nccl_backend = None
+                _cached_nccl_backend_key = None
             backend = create_backend(sync_method, transport_cfg)
         _is_sender = self.rank in backend.sender_ranks
 
@@ -826,7 +862,16 @@ class WeightSyncHandler:
             timing_breakdown["health_check_s"] = time.perf_counter() - t_health
 
         # Backend init: all sender ranks participate (collective for NCCL).
-        if _is_sender:
+        # For cached backends (nccl_broadcast), initialize() is skipped (already done).
+        if _is_sender and not (
+            (cache_enabled_nccl and _cached_nccl_backend is not None and _cached_nccl_backend_key == backend_key)
+            or (
+                cache_enabled_p2p
+                and _cached_p2p_backend is not None
+                and _cached_backend_key == backend_key
+                and getattr(_cached_p2p_backend, "is_alive", False)
+            )
+        ):
             logger.info(f"Rank {self.rank}: [WeightSync] Initializing {sync_method} backend...")
             t_init = time.perf_counter()
             if not backend.initialize():
@@ -836,6 +881,14 @@ class WeightSyncHandler:
                 }
             timing_breakdown["backend_init_s"] = time.perf_counter() - t_init
             logger.info(f"Rank {self.rank}: [WeightSync] Backend initialized")
+            # Store in cache after successful init (only on rank 0 to avoid races)
+            if self.rank == 0:
+                if cache_enabled_nccl:
+                    _cached_nccl_backend = backend
+                    _cached_nccl_backend_key = backend_key
+                elif cache_enabled_p2p:
+                    _cached_p2p_backend = backend
+                    _cached_backend_key = backend_key
 
         # Pause inference: coordinator only (after backend init).
         if self.rank == 0:

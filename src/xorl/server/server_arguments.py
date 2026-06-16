@@ -584,11 +584,14 @@ class ServerArguments:
     # Inference Weight Sync Configuration
     # ========================================================================
 
-    sync_inference_method: Literal["nccl_broadcast", "p2p"] = field(
+    sync_inference_method: Literal["nccl_broadcast", "nccl_simple", "p2p"] = field(
         default="nccl_broadcast",
         metadata={
             "help": "Method for syncing weights to inference endpoints: "
-            "'nccl_broadcast' (rank-0 broadcast via SGLang update_weights_from_distributed); "
+            "'nccl_broadcast' (rank-0 broadcast via SGLang update_weights_from_distributed, "
+            "interleaved with the FSDP unshard loop); "
+            "'nccl_simple' (two-phase: stage all params to CPU during the FSDP loop, then "
+            "broadcast in chunks — FSDP and weight-sync NCCL communicators never interleave); "
             "'p2p' (RDMA one-sided writes via Mooncake TransferEngine into SGLang's "
             "registered param memory; requires --enable-rdma-weight-updates on the SGLang side)"
         },

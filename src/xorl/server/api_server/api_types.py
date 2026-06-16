@@ -903,7 +903,7 @@ class SyncInferenceWeightsRequest(BaseModel):
         "so stale KV entries from previous weights are evicted naturally.",
     )
     pause_mode: Literal["retract", "abort", "in_place"] = Field(
-        default="retract",
+        default="in_place",
         description="How to pause inference during weight sync. "
         "'retract' (default): retract running requests to waiting queue, re-execute after resume. "
         "'abort': abort and return all in-flight requests. "
