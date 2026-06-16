@@ -50,6 +50,37 @@ class _RecordingLmHead(torch.nn.Linear):
         return super().forward(input)
 
 
+class _NoopRoutingHandler:
+    def setup(self, *_args, **_kwargs):
+        return False
+
+
+def test_forward_uses_no_grad_not_inference_mode():
+    runner = object.__new__(ModelRunner)
+    runner.rank = 0
+    runner.model = SimpleNamespace(config=SimpleNamespace(vocab_size=10))
+    runner.pp_enabled = False
+    runner._adapter_manager = None
+    runner.global_forward_backward_step = 0
+    runner._routing_handler = _NoopRoutingHandler()
+    runner._check_not_sleeping = lambda *_args, **_kwargs: None
+    runner._validate_single_tenant = lambda *_args, **_kwargs: None
+
+    seen = {}
+
+    def fake_forward_loop(*_args, **_kwargs):
+        seen["grad_enabled"] = torch.is_grad_enabled()
+        seen["inference_mode"] = torch.is_inference_mode_enabled()
+        return {"total_loss": 0.0, "global_valid_tokens": 1}
+
+    runner._forward_loop = fake_forward_loop
+
+    result = runner.forward([{"input_ids": torch.tensor([[1]])}], loss_fn="teacher_hidden_cache")
+
+    assert result["step"] == 0
+    assert seen == {"grad_enabled": False, "inference_mode": False}
+
+
 @patch("xorl.server.runner.model_runner.get_parallel_state")
 def test_opd_metrics_keep_opd_namespace(mock_parallel_state):
     mock_parallel_state.return_value = Mock(dp_enabled=False, loss_parallel_enabled=False)
@@ -115,6 +146,47 @@ def test_opd_metrics_reduce_over_loss_group(mock_parallel_state, _mock_get_devic
 
     assert groups
     assert all(group is loss_group for group in groups)
+
+
+@patch("xorl.server.runner.model_runner.synchronize", lambda: None)
+@patch("xorl.server.runner.model_runner.get_device_type", return_value="cpu")
+@patch("xorl.server.runner.model_runner.get_parallel_state")
+def test_forward_loop_accumulates_opd_metrics_without_metric_ops(mock_parallel_state, _mock_get_device_type):
+    mock_parallel_state.return_value = Mock(
+        cp_enabled=False,
+        loss_parallel_enabled=False,
+        dp_enabled=False,
+    )
+    runner = object.__new__(ModelRunner)
+    runner.rank = 0
+    runner.pp_enabled = False
+    runner.model_fwd_context = nullcontext()
+    runner._use_distsignsgd = False
+    runner._count_global_valid_tokens = lambda _micro_batches: torch.tensor(2)
+    runner._collect_per_token_outputs = Mock()
+
+    def fake_compute_micro_batch_loss(_micro_batch, _loss_fn, _params):
+        loss = torch.tensor(4.0)
+        metrics = {
+            "valid_tokens": 2,
+            "opd_kl": 0.5,
+            "opd_weighted_kl": 0.75,
+        }
+        return loss, {}, metrics, None, SimpleNamespace()
+
+    runner._compute_micro_batch_loss = fake_compute_micro_batch_loss
+
+    result = runner._forward_loop(
+        [{"labels": torch.tensor([[1, 2]])}],
+        "opd_loss",
+        {},
+        compute_backward=False,
+    )
+
+    assert result["total_loss"] == pytest.approx(2.0)
+    assert result["global_valid_tokens"] == 2
+    assert result["opd_kl"] == pytest.approx(0.5)
+    assert result["opd_weighted_kl"] == pytest.approx(0.75)
 
 
 @patch("xorl.server.runner.model_runner.get_device_type", return_value="cpu")

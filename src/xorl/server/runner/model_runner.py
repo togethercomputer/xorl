@@ -2266,7 +2266,7 @@ class ModelRunner:
 
             # Accumulate loss-specific metrics. RL losses keep the historical
             # `is_*` prefix; OPD metrics are already namespaced as `opd_*`.
-            self._accumulate_loss_metrics(accumulated_loss_metrics, is_metrics, loss_fn, metric_ops)
+            self._accumulate_loss_metrics(accumulated_loss_metrics, is_metrics, loss_fn, is_metric_ops)
 
             # Cleanup
             del micro_batch, outputs, local_loss_sum
@@ -2680,10 +2680,10 @@ class ModelRunner:
 
         return result
 
-    # inference_mode (vs no_grad) skips view tracking and version counters,
-    # which is safe here because the returned tensors are only consumed by
-    # logging / cross-rank reductions that never re-enter autograd.
-    @torch.inference_mode()
+    # FSDP2's pre-forward unshard path preserves parameter version counters.
+    # torch.inference_mode() disables those counters and breaks forward-only
+    # teacher_hidden_cache requests, so use no_grad() for eval-style forwards.
+    @torch.no_grad()
     def forward(
         self,
         micro_batches: List[Dict[str, Any]],
