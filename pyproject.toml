@@ -24,6 +24,11 @@ dependencies = [
   "wandb",
   "safetensors",
   "einops",
+  # GatedDeltaNet kernels (replaces the vendored fork under ops/linear_attention/ops).
+  "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@97bcb883",
+  # FLA routes the gated-delta backward to TileLang on Hopper/Triton>=3.4.
+  "tilelang==0.1.11",
+  "apache-tvm-ffi==0.1.11",
   "numpy<2.4",
   "numba",
   "pydantic",

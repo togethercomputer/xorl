@@ -9,14 +9,17 @@ from typing import Any
 import torch
 import torch.nn as nn
 from einops import rearrange, repeat
-from torch.nn import functional as F
-
-from xorl.ops.linear_attention.layers.utils import get_unpad_data, index_first_axis, pad_input
-from xorl.ops.linear_attention.modules import FusedRMSNormGated, RMSNorm, ShortConvolution
-from xorl.ops.linear_attention.ops.gated_delta_rule import (
+from fla.modules import FusedRMSNormGated, RMSNorm
+from fla.ops.gated_delta_rule import (
     chunk_gated_delta_rule,
     fused_recurrent_gated_delta_rule,
 )
+from torch.nn import functional as F
+
+# `ShortConvolution` is kept local (not `fla.modules`): the xorl version carries the
+# Ulysses conv-prefix halo exchange (`cp_context`) that upstream FLA does not implement.
+from xorl.ops.linear_attention.layers.utils import get_unpad_data, index_first_axis, pad_input
+from xorl.ops.linear_attention.modules import ShortConvolution
 
 
 class GatedDeltaNet(nn.Module):
