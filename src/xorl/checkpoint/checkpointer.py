@@ -2,6 +2,7 @@ import gc
 import json
 import os
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Set
 
 import torch
@@ -211,6 +212,46 @@ class ModelState(Stateful):
         # LoRA-only save: keep only lora_A/lora_B parameters
         if self.save_lora_only:
             model_state_dict = {k: v for k, v in model_state_dict.items() if "lora_" in k}
+            logger.info_rank0(f"LoRA-only save: keeping {len(model_state_dict)} LoRA parameters")
+
+        return model_state_dict
+
+    @torch.no_grad()
+    def reference_state_dict(self):
+        """Collect a lightweight state dict of live params/buffers without DCP materialization.
+
+        This is intended for direct safetensors export paths where we only need
+        references to the current model tensors and will materialize them one at
+        a time during save.
+        """
+        model_state_dict: "OrderedDict[str, torch.Tensor]" = OrderedDict()
+        modules = dict(self.model.named_modules(remove_duplicate=False))
+
+        for name, parameter in self.model.named_parameters(remove_duplicate=False):
+            if parameter is not None:
+                model_state_dict[name] = parameter
+
+        for name, buffer in self.model.named_buffers(remove_duplicate=False):
+            if buffer is None:
+                continue
+            module_name, _, buffer_name = name.rpartition(".")
+            parent_module = modules[module_name] if module_name else self.model
+            if buffer_name in getattr(parent_module, "_non_persistent_buffers_set", set()):
+                continue
+            model_state_dict[name] = buffer
+
+        if self.should_ep_aware:
+            logger.info_rank0(
+                "Collecting lightweight model tensor references from ModelState wrapper, "
+                "restoring EP dim for Experts module"
+            )
+            model_state_dict = self.get_state_dict_with_ep_dim(model_state_dict)
+
+        if self.exclude_keys:
+            model_state_dict = OrderedDict((k, v) for k, v in model_state_dict.items() if k not in self.exclude_keys)
+
+        if self.save_lora_only:
+            model_state_dict = OrderedDict((k, v) for k, v in model_state_dict.items() if "lora_" in k)
             logger.info_rank0(f"LoRA-only save: keeping {len(model_state_dict)} LoRA parameters")
 
         return model_state_dict
@@ -595,8 +636,19 @@ class DistributedCheckpointer(CheckpointerBase):
             logger.info_rank0(f"LoRA-only checkpoint: excluding {len(exclude_keys)} non-LoRA keys from load")
 
         load_state = {"model": ModelState(state["model"], exclude_keys=exclude_keys)}
+        has_optimizer_state = False
         if "optimizer" in state and state["optimizer"] is not None:
+            try:
+                dcp_metadata = FileSystemReader(checkpoint_dir).read_metadata()
+                has_optimizer_state = any(key.startswith("optimizer") for key in dcp_metadata.state_dict_metadata)
+            except Exception as exc:
+                logger.warning_rank0(f"Could not inspect DCP optimizer metadata at {checkpoint_dir}: {exc}")
+                has_optimizer_state = True
+
+        if has_optimizer_state:
             load_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])  # type: ignore[index]
+        elif "optimizer" in state and state["optimizer"] is not None:
+            logger.info_rank0(f"No optimizer state found in {checkpoint_dir}; loading model state only.")
 
         dcp.load(
             state_dict=load_state,
@@ -607,9 +659,11 @@ class DistributedCheckpointer(CheckpointerBase):
 
         if "extra_state" in state:
             extra_state_dir = os.path.join(checkpoint_dir, _EXTRA_STATE_DIR)
-            os.makedirs(extra_state_dir, exist_ok=True)
             extra_state_path = os.path.join(extra_state_dir, _EXTRA_STATE_FORMAT.format(dist.get_rank()))
-            state["extra_state"] = torch.load(extra_state_path, weights_only=False)
+            if os.path.exists(extra_state_path):
+                state["extra_state"] = torch.load(extra_state_path, weights_only=False)
+            else:
+                logger.info_rank0(f"No extra_state found at {extra_state_path}, starting fresh.")
 
         logger.info_rank0(f"Loaded checkpoint from {checkpoint_dir}")
 

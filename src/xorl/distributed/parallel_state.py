@@ -207,14 +207,14 @@ class ParallelState:
         All ranks that compute partial losses on different data/sequence shards.
         """
         if self.device_mesh is not None:
-            return self.device_mesh.get_group("dp_sp")
+            return self.device_mesh.get_group(self._resolve_mesh_name("dp_sp"))
         return self.fsdp_group
 
     @property
     @requires_mesh
     def loss_mesh(self) -> "DeviceMesh":
         """Device mesh for loss reduction (dp_replicate x dp_shard x ulysses x ring)."""
-        return self.device_mesh["dp_sp"]
+        return self.device_mesh[self._resolve_mesh_name("dp_sp")]
 
     @property
     def loss_size(self) -> int:

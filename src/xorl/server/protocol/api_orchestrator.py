@@ -63,6 +63,7 @@ class OutputType(str, Enum):
     WAKE_UP = "wake_up"
     HEALTH_CHECK = "health_check"
     SYNC_INFERENCE_WEIGHTS = "sync_inference_weights"
+    REGISTER_SESSION = "register_session"
     REGISTER_ADAPTER = "register_adapter"
     SAVE_ADAPTER_STATE = "save_adapter_state"
     LOAD_ADAPTER_STATE = "load_adapter_state"
@@ -430,6 +431,8 @@ def create_sync_weights_output(
     total_bytes: int = 0,
     num_parameters: int = 0,
     num_buckets: int = 0,
+    timing_breakdown: Optional[Dict[str, float]] = None,
+    p2p_rank_summaries: Optional[List[Dict[str, Any]]] = None,
     endpoint_results: Optional[List[Dict[str, Any]]] = None,
     error: Optional[str] = None,
 ) -> OrchestratorOutputs:
@@ -444,6 +447,8 @@ def create_sync_weights_output(
         total_bytes=total_bytes,
         num_parameters=num_parameters,
         num_buckets=num_buckets,
+        timing_breakdown=timing_breakdown or {},
+        p2p_rank_summaries=p2p_rank_summaries or [],
         endpoint_results=endpoint_results or [],
     )
 

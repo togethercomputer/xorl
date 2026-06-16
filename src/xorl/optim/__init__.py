@@ -1,4 +1,5 @@
 from .anyprecision_adamw import AnyPrecisionAdamW
+from .distsignsgd import DistSignSGD
 from .lr_scheduler import build_lr_scheduler
 from .multi_optimizer import MultiOptimizer
 from .muon import Muon
@@ -10,6 +11,7 @@ __all__ = [
     "AnyPrecisionAdamW",
     "build_lr_scheduler",
     "build_optimizer",
+    "DistSignSGD",
     "MultiOptimizer",
     "Muon",
     "SignSGD",

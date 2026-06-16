@@ -51,6 +51,20 @@ def qwen3_5_apply_rotary_pos_emb(
     sin: torch.Tensor,
     interleaved: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # `interleaved` describes the q/k feature-layout convention only.
+    #   - `False` (default): standard half-rotate. Used by Qwen3.5/Qwen3.6
+    #     (HF/SGLang). Qwen's `mrope_interleaved` is about T/H/W frequency
+    #     mixing in cos/sin construction and must NOT be plumbed in here.
+    #   - `True`: pairwise rotation on adjacent (2i, 2i+1) features. Used by
+    #     DeepSeek-V3 MLA decoupled RoPE when `rope_interleave=True`.
+    if interleaved:
+        # `RotaryEmbedding` emits cos/sin in halved layout
+        # [c0, c1, ..., c_{d/2-1}, c0, c1, ..., c_{d/2-1}]. The interleaved
+        # rotate_half rotates pair i at indices (2i, 2i+1), so cos/sin must be
+        # in interleaved layout [c0, c0, c1, c1, ...] for the math to line up.
+        half = cos.shape[-1] // 2
+        cos = cos[..., :half].repeat_interleave(2, dim=-1)
+        sin = sin[..., :half].repeat_interleave(2, dim=-1)
     cos = cos.unsqueeze(2)
     sin = sin.unsqueeze(2)
     rotary_dim = cos.shape[-1]

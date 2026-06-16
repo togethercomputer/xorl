@@ -18,11 +18,17 @@ dependencies = [
   "packaging>=23.0,<26.0",
   "tenacity>=8.0.0",
   "torchdata>=0.8.0,<1.0",
+  "tiktoken",
   "transformers[torch]>=5.0",
   "psutil",
   "wandb",
   "safetensors",
   "einops",
+  # GatedDeltaNet kernels (replaces the vendored fork under ops/linear_attention/ops).
+  "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@97bcb883",
+  # FLA routes the gated-delta backward to TileLang on Hopper/Triton>=3.4.
+  "tilelang==0.1.11",
+  "apache-tvm-ffi==0.1.11",
   "numpy<2.4",
   "numba",
   "pydantic",
@@ -30,6 +36,8 @@ dependencies = [
   "pyzmq",
   "msgpack",
   "fastapi",
+  # P2P / Mooncake weight sync
+  "mooncake-transfer-engine==0.3.9",
   "xorl-client @ git+https://github.com/togethercomputer/xorl-client.git",
   # PyTorch 2.10.0 with CUDA 12.9
   "torch @ https://download.pytorch.org/whl/cu129/torch-2.10.0%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl",
@@ -37,7 +45,7 @@ dependencies = [
   "triton @ https://download.pytorch.org/whl/triton-3.6.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
   # Flash Attention
   "flash-attn-3 @ https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.02.17-06dc5e7/flash_attn_3-3.0.0%2B20260217.cu129torch2100cxx11abitrue.fec3a6-cp39-abi3-linux_x86_64.whl",
-  "flash-attn-cute @ git+https://github.com/Dao-AILab/flash-attention.git@5678dd909aca97f925957dab716022046fb1e44f#subdirectory=flash_attn/cute",
+  "flash-attn-4 @ git+https://github.com/Dao-AILab/flash-attention.git@59f01d6e1a1655a148ed4b22b5d4fbb9da2c2cf0#subdirectory=flash_attn/cute",
 ]
 
 
@@ -114,6 +122,10 @@ markers = [
     "dataloader: Tests for data loaders",
 ]
 testpaths = ["tests"]
+# distributed_utils.py and other shared test helpers live alongside the
+# distributed tests; put that directory on sys.path so test files can
+# import them by bare module.
+pythonpath = ["tests/distributed"]
 norecursedirs = ["submodules"]
 filterwarnings = [
     "ignore::DeprecationWarning:multiprocessing.popen_fork",

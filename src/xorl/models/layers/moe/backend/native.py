@@ -128,40 +128,61 @@ def _run_experts_grouped_mm(
     x: torch.Tensor,
     padded_counts: torch.Tensor,
     expert_scores: torch.Tensor | None = None,
+    hidden_act: str = "silu",
+    gate_up_proj: torch.Tensor | None = None,
+    gate_up_bias: torch.Tensor | None = None,
+    down_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run MoE experts using ``torch._grouped_mm``.
 
     Compiled with ``torch.compile(fullgraph=True)`` for operator fusion.
 
-    Weight shapes in (G, K, N) format::
+    When ``gate_up_proj`` is provided, uses a single fused GEMM (matching HF)
+    instead of two separate gate/up GEMMs for better bf16 numerical consistency.
 
-        gate_proj: [num_experts, hidden_dim, intermediate_size]
-        up_proj:   [num_experts, hidden_dim, intermediate_size]
-        down_proj: [num_experts, intermediate_size, hidden_dim]
+    Optional per-expert biases (pre-expanded to ``[total_padded, dim]``) are
+    applied before the activation (gate_up_bias) and after the down projection
+    (down_bias).
     """
     offsets = torch.cumsum(padded_counts, dim=0, dtype=torch.int32)
     compute_dtype = torch.bfloat16
 
-    # gate: x @ gate_proj -> (tokens, intermediate)
-    gate_out = F.silu(
-        torch._grouped_mm(
+    if gate_up_proj is not None:
+        # Fused: single GEMM -> chunk (matches HF's grouped_mm dispatch)
+        gate_up_out = torch._grouped_mm(
             x.to(compute_dtype),
-            gate_proj.to(compute_dtype),
+            gate_up_proj.to(compute_dtype),
             offs=offsets,
         )
-    )
+        intermediate_size = gate_up_out.shape[-1] // 2
+        gate_raw = gate_up_out[..., :intermediate_size]
+        up_out = gate_up_out[..., intermediate_size:]
+    else:
+        # Split: separate gate/up GEMMs (legacy path)
+        gate_raw = torch._grouped_mm(x.to(compute_dtype), gate_proj.to(compute_dtype), offs=offsets)
+        up_out = torch._grouped_mm(x.to(compute_dtype), up_proj.to(compute_dtype), offs=offsets)
 
-    # up: x @ up_proj -> (tokens, intermediate)
-    up_out = torch._grouped_mm(
-        x.to(compute_dtype),
-        up_proj.to(compute_dtype),
-        offs=offsets,
-    )
+    if gate_up_bias is not None:
+        intermediate = gate_raw.shape[-1]
+        gate_raw = gate_raw + gate_up_bias[:, :intermediate].to(compute_dtype)
+        up_out = up_out + gate_up_bias[:, intermediate:].to(compute_dtype)
 
-    # SwiGLU: silu(gate) * up
-    h = gate_out * up_out
-    if expert_scores is not None:
-        h = h * expert_scores.to(h.dtype).unsqueeze(-1)
+    # GLU: act(gate) * up
+    if hidden_act == "gelu_tanh":
+        gate_out = F.gelu(gate_raw, approximate="tanh")
+        h = gate_out * up_out
+    elif hidden_act == "clamped_swiglu":
+        # GPT-OSS clamped SwiGLU: clamp both branches, scaled sigmoid gate,
+        # +1 bias on the up/linear branch.
+        _CLAMPED_SWIGLU_ALPHA = 1.702
+        _CLAMPED_SWIGLU_LIMIT = 7.0
+        gate_raw = gate_raw.clamp(max=_CLAMPED_SWIGLU_LIMIT)
+        up_out = up_out.clamp(min=-_CLAMPED_SWIGLU_LIMIT, max=_CLAMPED_SWIGLU_LIMIT)
+        gate_out = gate_raw * torch.sigmoid(_CLAMPED_SWIGLU_ALPHA * gate_raw)
+        h = gate_out * (up_out + 1)
+    else:
+        gate_out = F.silu(gate_raw)
+        h = gate_out * up_out
 
     # down: h @ down_proj -> (tokens, hidden)
     out = torch._grouped_mm(
@@ -170,11 +191,41 @@ def _run_experts_grouped_mm(
         offs=offsets,
     ).to(x.dtype)
 
+    if down_bias is not None:
+        out = out + down_bias.to(out.dtype)
+
+    # Routing weight must be applied AFTER down_proj + down_bias, not before
+    # the bias add — otherwise down_bias contributes the same magnitude
+    # regardless of routing weight (matters when down_bias is non-zero, e.g.
+    # for GPT-OSS).
+    if expert_scores is not None:
+        out = out * expert_scores.to(out.dtype).unsqueeze(-1)
+
     return out
 
 
-# Compile the inner GEMM function (like torchtitan).
+# Compile variants (torch.compile needs static graph).
+# Note: torch.compile caches by tensor shapes/strides. The gate_up_proj
+# branch is traced correctly on first call with a non-None gate_up_proj.
 _run_experts_compiled = torch.compile(_run_experts_grouped_mm, fullgraph=True)
+
+
+def _run_experts_gelu_tanh_wrapper(
+    gate_proj, up_proj, down_proj, x, padded_counts, expert_scores=None, gate_up_proj=None
+):
+    return _run_experts_grouped_mm(
+        gate_proj,
+        up_proj,
+        down_proj,
+        x,
+        padded_counts,
+        expert_scores,
+        hidden_act="gelu_tanh",
+        gate_up_proj=gate_up_proj,
+    )
+
+
+_run_experts_compiled_gelu_tanh = torch.compile(_run_experts_gelu_tanh_wrapper, fullgraph=True)
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +241,15 @@ def _ensure_dynamo_configured():
         _native_dynamo_configured = True
 
 
+@torch.compiler.disable
+def _expand_expert_bias(
+    bias: torch.Tensor,
+    padded_counts: torch.Tensor,
+) -> torch.Tensor:
+    """Expand per-expert bias ``[E, dim]`` to per-padded-token ``[total_padded, dim]``."""
+    return torch.repeat_interleave(bias, padded_counts.long(), dim=0)
+
+
 def _native_expert_forward_impl(
     hidden_states: torch.Tensor,
     routing_weights: torch.Tensor,
@@ -199,12 +259,18 @@ def _native_expert_forward_impl(
     down_proj: torch.Tensor,
     num_experts: int,
     compute_fn,
+    gate_up_proj: torch.Tensor | None = None,
+    gate_up_bias: torch.Tensor | None = None,
+    down_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Shared token-sort / pad / scatter logic for native expert forward.
 
     ``compute_fn(gate_proj, up_proj, down_proj, sorted_hidden_padded,
     padded_counts)`` is called with the prepared padded token tensor and must
     return a padded output of the same shape.
+
+    Optional ``gate_up_bias`` / ``down_bias`` are per-expert ``[E, dim]``
+    tensors expanded to per-padded-token before being passed to ``compute_fn``.
     """
     _ensure_dynamo_configured()
     num_tokens, top_k = selected_experts.shape
@@ -245,9 +311,12 @@ def _native_expert_forward_impl(
     sorted_hidden_padded = sorted_hidden.new_zeros(total_padded, hidden_dim)
     sorted_hidden_padded[pad_dst] = sorted_hidden
 
-    # 7. Expert compute (backend-specific)
-    expert_scores_padded = sorted_hidden_padded.new_zeros(total_padded)
-    expert_scores_padded[pad_dst] = sorted_weights.to(expert_scores_padded.dtype)
+    # 7. Expert compute (backend-specific). Pass expert_scores=None — routing
+    # weights are applied externally below via the deterministic reshape+sum
+    # path. Applying them twice (inside _run_experts_grouped_mm AND here) would
+    # square the weights.
+    gate_up_bias_exp = _expand_expert_bias(gate_up_bias, padded_counts) if gate_up_bias is not None else None
+    down_bias_exp = _expand_expert_bias(down_bias, padded_counts) if down_bias is not None else None
 
     expert_out_padded = compute_fn(
         gate_proj,
@@ -255,15 +324,23 @@ def _native_expert_forward_impl(
         down_proj,
         sorted_hidden_padded,
         padded_counts,
-        expert_scores_padded,
+        None,  # expert_scores applied after, not inside GEMM
+        gate_up_proj=gate_up_proj,
+        gate_up_bias=gate_up_bias_exp,
+        down_bias=down_bias_exp,
     )
 
-    # 8. Gather from padded layout (reuse pad_dst)
+    # 8. Gather from padded layout
     expert_out = expert_out_padded[pad_dst]
 
-    # 9. Scatter-add back to original token positions
-    output = hidden_states.new_zeros(num_tokens, hidden_dim)
-    output.index_add_(0, token_ids, expert_out)
+    # 9. Apply routing weights and accumulate via reshape+sum (deterministic)
+    expert_out = expert_out * sorted_weights.to(expert_out.dtype).unsqueeze(-1)
+
+    # Unsort back to original (token, top_k_slot) order, then reshape+sum
+    inv_sorted = torch.empty_like(sorted_order)
+    inv_sorted[sorted_order] = torch.arange(sorted_order.size(0), device=device)
+    expert_out = expert_out[inv_sorted]
+    output = expert_out.view(num_tokens, top_k, hidden_dim).sum(dim=1)
 
     return output
 
@@ -271,6 +348,20 @@ def _native_expert_forward_impl(
 # ---------------------------------------------------------------------------
 # Public entry point (same interface as triton/quack backends)
 # ---------------------------------------------------------------------------
+
+
+SUPPORTED_HIDDEN_ACTS = frozenset({"silu", "gelu_tanh", "clamped_swiglu"})
+
+
+def _select_compiled_fn(hidden_act: str = "silu"):
+    """Select the right compute variant based on activation kind."""
+    if hidden_act == "gelu_tanh":
+        # Use uncompiled for now — torch.compile fullgraph has issues with
+        # the gate_up_proj branch when switching between None/non-None.
+        return lambda *a, **kw: _run_experts_grouped_mm(*a, hidden_act="gelu_tanh", **kw)
+    if hidden_act == "clamped_swiglu":
+        return lambda *a, **kw: _run_experts_grouped_mm(*a, hidden_act="clamped_swiglu", **kw)
+    return _run_experts_compiled
 
 
 def native_expert_forward(
@@ -281,9 +372,18 @@ def native_expert_forward(
     up_proj: torch.Tensor,
     down_proj: torch.Tensor,
     num_experts: int,
+    hidden_act: str = "silu",
+    gate_up_proj: torch.Tensor = None,
     **kwargs,
 ) -> torch.Tensor:
-    """Forward pass using native PyTorch ``torch._grouped_mm``."""
+    """Forward pass using native PyTorch ``torch._grouped_mm``.
+
+    Accepts optional ``gate_up_bias`` / ``down_bias`` via ``**kwargs`` for
+    GPT-OSS models that use per-expert biases.
+    """
+    from xorl.ops.moe.triton import check_hidden_act_supported
+
+    check_hidden_act_supported(hidden_act, "native", SUPPORTED_HIDDEN_ACTS)
     return _native_expert_forward_impl(
         hidden_states,
         routing_weights,
@@ -292,7 +392,10 @@ def native_expert_forward(
         up_proj,
         down_proj,
         num_experts,
-        _run_experts_compiled,
+        _select_compiled_fn(hidden_act),
+        gate_up_proj=gate_up_proj,
+        gate_up_bias=kwargs.get("gate_up_bias"),
+        down_bias=kwargs.get("down_bias"),
     )
 
 
@@ -496,34 +599,29 @@ def native_expert_lora_forward(
 def native_ep_compute(
     permute_tokens: torch.Tensor,
     cumsum: torch.Tensor,
-    gate_proj: torch.Tensor,
-    up_proj: torch.Tensor,
+    gate_up_proj: torch.Tensor,
     down_proj: torch.Tensor,
     expert_scores: torch.Tensor | None = None,
+    hidden_act: str = "silu",
+    gate_up_bias: torch.Tensor | None = None,
+    down_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """EP expert compute using ``torch._grouped_mm``.
+    """EP expert compute using ``torch._grouped_mm`` with fused gate+up GEMM.
 
     Same interface as ``TritonEPGroupGemm.apply()`` and ``QuackEPGroupGemm.apply()``.
-    Tokens have already been dispatched via all-to-all; this only handles
-    the expert MLP computation.
 
-    Args:
-        permute_tokens: Dispatched tokens ``[total_local_tokens, hidden_dim]``.
-        cumsum: Cumulative sum of tokens per local expert ``[num_local_experts]``.
-        gate_proj: ``[num_local_experts, hidden_dim, intermediate_size]``.
-        up_proj: ``[num_local_experts, hidden_dim, intermediate_size]``.
-        down_proj: ``[num_local_experts, intermediate_size, hidden_dim]``.
-
-    Returns:
-        Expert outputs ``[total_local_tokens, hidden_dim]``.
+    Optional ``gate_up_bias`` ``[num_local_experts, 2*I]`` and ``down_bias``
+    ``[num_local_experts, H]`` are per-expert biases for GPT-OSS models.
     """
+    from xorl.ops.moe.triton import check_hidden_act_supported
+
+    check_hidden_act_supported(hidden_act, "native", SUPPORTED_HIDDEN_ACTS)
     if permute_tokens.shape[0] == 0:
         return permute_tokens
 
-    num_local_experts = gate_proj.shape[0]
+    num_local_experts = gate_up_proj.shape[0]
     counts = _cumsum_to_counts(cumsum, num_local_experts)
 
-    # Pad for alignment and run compiled grouped GEMM
     padded_tokens, padded_counts = _pad_to_alignment(permute_tokens, counts, num_local_experts)
     expert_scores_padded = None
     if expert_scores is not None:
@@ -533,11 +631,24 @@ def native_ep_compute(
                 counts, padded_counts, num_local_experts, permute_tokens.shape[0], padded_tokens.device
             )
         ] = expert_scores.to(padded_tokens.dtype)
-    out_padded = _run_experts_compiled(
-        gate_proj, up_proj, down_proj, padded_tokens, padded_counts, expert_scores_padded
+
+    gate_up_bias_exp = _expand_expert_bias(gate_up_bias, padded_counts) if gate_up_bias is not None else None
+    down_bias_exp = _expand_expert_bias(down_bias, padded_counts) if down_bias is not None else None
+
+    compiled_fn = _select_compiled_fn(hidden_act)
+    # gate_proj/up_proj positional args are unused when gate_up_proj is provided
+    out_padded = compiled_fn(
+        None,
+        None,
+        down_proj,
+        padded_tokens,
+        padded_counts,
+        expert_scores_padded,
+        gate_up_proj=gate_up_proj,
+        gate_up_bias=gate_up_bias_exp,
+        down_bias=down_bias_exp,
     )
 
-    # Unpad back to real token counts
     return _unpad(out_padded, counts, padded_counts, num_local_experts, permute_tokens.shape[0])
 
 

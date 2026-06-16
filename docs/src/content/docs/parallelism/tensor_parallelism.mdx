@@ -411,7 +411,7 @@ When `init_device: meta` is used, weights must be loaded **after** TP is applied
 if parallel_state.tp_enabled:
     model = parallelize_module(model, ...)   # apply TP first
     if kwargs.get("init_device") == "meta" and weights_path is not None:
-        rank0_load_and_broadcast_weights(...)  # load weights into TP-sharded params
+        grouped_load_weights(...)              # load weights into TP-sharded params
         kwargs["skip_weight_loading"] = True   # skip again in FSDP path
 
 # then FSDP2 wraps the already-materialized TP DTensors
@@ -462,7 +462,7 @@ train:
   enable_gradient_checkpointing: true
   enable_compile: true              # recommended with TP for fused kernels
   init_device: meta
-  load_weights_mode: broadcast
+  load_weights_mode: grouped
 ```
 
 GPU layout (TP groups across columns, FSDP shard groups across rows):
@@ -504,7 +504,7 @@ train:
   enable_mixed_precision: true
   enable_gradient_checkpointing: true
   init_device: meta
-  load_weights_mode: broadcast
+  load_weights_mode: grouped
 ```
 
 ### TP=4 + compile (from `qwen3_8b_tp4_compile.yaml`)
@@ -529,7 +529,7 @@ train:
   enable_gradient_checkpointing: true
   enable_compile: true
   init_device: meta
-  load_weights_mode: broadcast
+  load_weights_mode: grouped
 ```
 
 `torch.compile` is applied to each decoder block before FSDP wrapping (`build_parallelize_model` handles the ordering). Compiled kernels can fuse the TP linear operations with activation functions for better throughput.
@@ -615,7 +615,7 @@ For the same memory budget, FSDP2 with larger shard groups is generally more eff
 | `pipeline_parallel_size` | `int` | `1` | PP stage count. Compose with TP by assigning `tensor_parallel_size × pipeline_parallel_size` GPUs to model parallelism. |
 | `data_parallel_mode` | `str` | `"fsdp2"` | Must be `"fsdp2"` when using TP with meta-device initialization. |
 | `init_device` | `str` | `"meta"` | Use `"meta"` with TP to avoid materializing full weights before TP sharding. |
-| `load_weights_mode` | `str` | `"broadcast"` | With TP, rank 0 loads from disk and broadcasts to TP peers. Use `"all_ranks"` if filesystem supports parallel reads. |
+| `load_weights_mode` | `str` | `"grouped"` | Default grouped fanout, with rank-0 fallback when grouped fanout groups are unavailable. Use `"all_ranks"` if filesystem supports parallel reads, or `"skip"` with `load_checkpoint_path` for converted DCP checkpoints. |
 | `enable_compile` | `bool` | `false` | `torch.compile` per decoder block. Recommended with TP for fused kernels; must be applied before FSDP wrapping (handled automatically). |
 
 ### Model arguments (`src/xorl/arguments.py`, `ModelArguments` dataclass)
@@ -663,7 +663,7 @@ def _resolve_tp_style(style_str):
 1. Build model on meta device (no weights allocated)
 2. Call unfuse_for_tp()          — splits fused projections (still meta)
 3. Call parallelize_module()     — annotates params as DTensors with TP placement (still meta)
-4. Load weights (rank0_load_and_broadcast_weights) — materializes meta DTensors into TP-sharded real tensors
+4. Load weights (`grouped`) — materializes meta DTensors into TP-sharded real tensors
 5. Call parallelize_model_fsdp2() — wraps TP DTensors with FSDP2
 ```
 

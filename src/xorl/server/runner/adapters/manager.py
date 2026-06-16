@@ -17,15 +17,25 @@ import logging
 import math
 import os
 import time
+from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from safetensors.torch import load_file as safetensors_load_file
 from safetensors.torch import save_file as safetensors_save_file
 
-from xorl.lora.utils import convert_peft_lora_state_dict
+from xorl.lora.utils import (
+    convert_peft_lora_state_dict,
+    get_lora_tensor_shard_specs,
+)
+from xorl.optim import build_optimizer
+from xorl.server.session_spec import (
+    load_session_spec_from_checkpoint,
+    session_optimizer_build_kwargs,
+    write_session_spec,
+)
 
 
 try:
@@ -50,6 +60,7 @@ class AdapterState:
     """
 
     model_id: str
+    session_spec: Dict[str, Any]
     lora_params: Dict[str, nn.Parameter]  # Actual Parameters with own .grad
     optimizer: torch.optim.Optimizer  # Per-adapter optimizer
     global_step: int = 0
@@ -80,6 +91,14 @@ class LoRAAdapterManager:
         checkpoint_dir: Optional[str] = None,
         auto_save_on_eviction: bool = True,
         lora_config: Optional[Dict[str, Any]] = None,
+        optimizer_config: Optional[Dict[str, Any]] = None,
+        optimizer_type: str = "adamw",
+        optimizer_dtype: str = "bf16",
+        optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        weight_decay: float = 0.01,
+        betas: Tuple[float, float] = (0.9, 0.95),
+        eps: float = 1e-8,
+        optimizer_fused: Optional[bool] = None,
     ):
         """
         Initialize the adapter manager.
@@ -91,6 +110,14 @@ class LoRAAdapterManager:
             checkpoint_dir: Directory for saving adapter checkpoints (default: outputs/adapters)
             auto_save_on_eviction: If True, save adapter state before LRU eviction
             lora_config: LoRA configuration dict (for saving adapter_config.json)
+            optimizer_config: Training optimizer configuration for per-adapter optimizers
+            optimizer_type: Optimizer type passed to xorl.optim.build_optimizer
+            optimizer_dtype: Optimizer state dtype for supported optimizers
+            optimizer_kwargs: Optimizer-specific kwargs (e.g. Muon settings)
+            weight_decay: Weight decay used when building adapter optimizers
+            betas: Beta coefficients for Adam-family optimizers
+            eps: Epsilon used by Adam-family optimizers
+            optimizer_fused: Whether to request fused optimizer kernels
         """
         self.model = model
         self.device = device
@@ -98,23 +125,326 @@ class LoRAAdapterManager:
         self.checkpoint_dir = checkpoint_dir or "outputs/adapters"
         self.auto_save_on_eviction = auto_save_on_eviction
         self.lora_config = lora_config or {}
+        self.optimizer_config = optimizer_config or {}
+        self.optimizer_type = optimizer_type
+        self.optimizer_dtype = optimizer_dtype
+        self.optimizer_kwargs = deepcopy(optimizer_kwargs or {})
+        self.weight_decay = weight_decay
+        self.betas = betas
+        self.eps = eps
+        self.optimizer_fused = device.type == "cuda" if optimizer_fused is None else optimizer_fused
         self.adapters: Dict[str, AdapterState] = {}
         self.current_adapter_id: Optional[str] = None
 
         # Cache the list of LoRA parameter names for efficient lookups
         self._lora_param_names: List[str] = []
+        self._lora_param_metadata: Dict[str, Dict[str, Any]] = {}
         for name, param in self.model.named_parameters():
             if "lora_A" in name or "lora_B" in name:
                 self._lora_param_names.append(name)
+                param_shape = tuple(param.shape if _HAS_DTENSOR and isinstance(param, DTensor) else param.data.shape)
+                self._lora_param_metadata[name] = {
+                    "shape": param_shape,
+                    "dtype": param.dtype if _HAS_DTENSOR and isinstance(param, DTensor) else param.data.dtype,
+                    "rank_dim": self._infer_lora_rank_dim(name, param_shape),
+                }
 
         logger.info(
             f"LoRAAdapterManager initialized with {len(self._lora_param_names)} LoRA parameters, "
-            f"max_adapters={max_adapters}, auto_save_on_eviction={auto_save_on_eviction}"
+            f"max_adapters={max_adapters}, auto_save_on_eviction={auto_save_on_eviction}, "
+            f"optimizer={optimizer_type}"
         )
+
+    @staticmethod
+    def _infer_lora_rank_dim(name: str, shape: Tuple[int, ...]) -> int:
+        """Infer which tensor dimension corresponds to the LoRA rank."""
+        if "lora_A" in name:
+            if len(shape) == 2:
+                return 0
+            if len(shape) == 3:
+                return 2
+        if "lora_B" in name:
+            if len(shape) == 2:
+                return 1
+            if len(shape) == 3:
+                return 1
+        raise ValueError(f"Cannot infer LoRA rank dimension for parameter {name!r} with shape {shape!r}")
+
+    @staticmethod
+    def _replace_dim(shape: Tuple[int, ...], dim: int, value: int) -> Tuple[int, ...]:
+        updated = list(shape)
+        updated[dim] = value
+        return tuple(updated)
+
+    @staticmethod
+    def _slice_to_rank(tensor: torch.Tensor, *, rank_dim: int, active_rank: int) -> torch.Tensor:
+        return tensor.narrow(rank_dim, 0, active_rank)
+
+    @staticmethod
+    def _slice_to_shape(tensor: torch.Tensor, *, rank_dim: int, target_shape: Tuple[int, ...]) -> torch.Tensor:
+        active_rank = target_shape[rank_dim]
+        sliced = tensor.narrow(rank_dim, 0, active_rank)
+        if tuple(sliced.shape) != target_shape:
+            raise ValueError(f"Expected sliced tensor shape {target_shape}, got {tuple(sliced.shape)}")
+        return sliced
+
+    @staticmethod
+    def _expand_compact_tensor(
+        tensor: torch.Tensor,
+        *,
+        full_shape: Tuple[int, ...],
+        rank_dim: int,
+    ) -> torch.Tensor:
+        if tuple(tensor.shape) == full_shape:
+            return tensor
+        expanded = torch.zeros(full_shape, dtype=tensor.dtype, device=tensor.device)
+        slices = [slice(None)] * len(full_shape)
+        slices[rank_dim] = slice(0, tensor.shape[rank_dim])
+        expanded[tuple(slices)] = tensor
+        return expanded
+
+    @staticmethod
+    def _session_rank(session_spec: Dict[str, Any]) -> int:
+        return int(session_spec["lora_config"]["lora_rank"])
+
+    @staticmethod
+    def _session_alpha(session_spec: Dict[str, Any]) -> int:
+        return int(session_spec["lora_config"]["lora_alpha"])
+
+    @staticmethod
+    def _strip_optimizer_config(session_spec: Dict[str, Any]) -> Dict[str, Any]:
+        """Return the structural part of a LoRA session spec without optimizer metadata."""
+        stripped = deepcopy(session_spec)
+        stripped.pop("optimizer_config", None)
+        return stripped
+
+    @staticmethod
+    def _strip_optimizer_learning_rate(session_spec: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a session spec without the mutable optimizer learning-rate field."""
+        stripped = deepcopy(session_spec)
+        optimizer_config = stripped.get("optimizer_config")
+        if isinstance(optimizer_config, dict):
+            optimizer_config.pop("learning_rate", None)
+        return stripped
+
+    @staticmethod
+    def _serialize_optimizer_metadata_value(value: Any) -> Any:
+        """Convert optimizer metadata into JSON-safe values."""
+        if isinstance(value, torch.dtype):
+            if value == torch.bfloat16:
+                return "bf16"
+            if value == torch.float32:
+                return "fp32"
+            return str(value)
+        if isinstance(value, dict):
+            return {k: LoRAAdapterManager._serialize_optimizer_metadata_value(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [LoRAAdapterManager._serialize_optimizer_metadata_value(v) for v in value]
+        return value
+
+    @staticmethod
+    def _update_state_learning_rate(state: AdapterState, lr: float) -> None:
+        """Keep adapter LR, optimizer param groups, and session spec in sync."""
+        state.lr = float(lr)
+        state.session_spec.setdefault("optimizer_config", {})["learning_rate"] = state.lr
+        for param_group in state.optimizer.param_groups:
+            if state.session_spec.get("optimizer_config", {}).get("type") == "muon" and param_group.get(
+                "use_muon", False
+            ):
+                continue
+            param_group["lr"] = state.lr
+
+    def _max_supported_session_rank(self) -> int:
+        """Return the largest LoRA rank the live model substrate can support."""
+        if not self._lora_param_metadata:
+            raise RuntimeError("Cannot determine LoRA rank capacity: model does not expose any LoRA parameters.")
+        return min(metadata["shape"][metadata["rank_dim"]] for metadata in self._lora_param_metadata.values())
+
+    def _validate_session_rank_against_model_capacity(self, session_spec: Dict[str, Any]) -> None:
+        """Reject session specs whose runtime rank exceeds the live model capacity."""
+        session_rank = self._session_rank(session_spec)
+        max_supported_rank = self._max_supported_session_rank()
+        if session_rank > max_supported_rank:
+            raise ValueError(
+                f"Session rank {session_rank} exceeds live model LoRA capacity {max_supported_rank}. "
+                "Restart the server with a larger max_lora_rank-compatible model substrate before loading this checkpoint."
+            )
+
+    @staticmethod
+    def _module_name_for_lora_param(name: str) -> str:
+        """Extract the target module name from an internal LoRA parameter name."""
+        base_name = (
+            name.replace(".lora_A.weight", "")
+            .replace(".lora_B.weight", "")
+            .replace(".lora_A", "")
+            .replace(".lora_B", "")
+            .replace("_lora_A", "")
+            .replace("_lora_B", "")
+        )
+        parts = base_name.split(".")
+        if not parts:
+            raise ValueError(f"Cannot infer target module from LoRA parameter name {name!r}")
+        return parts[-1]
+
+    @staticmethod
+    def _canonical_lora_param_name(name: str) -> str:
+        """Normalize LoRA parameter names across checkpoint formats."""
+        if name.endswith(".weight"):
+            return name[: -len(".weight")]
+        return name
+
+    def _expected_target_modules(self) -> List[str]:
+        """Return the live model's expected LoRA target modules."""
+        return sorted(
+            {
+                self._module_name_for_lora_param(name)
+                for name in self._lora_param_names
+                if "lora_A" in name or "lora_B" in name
+            }
+        )
+
+    def _validate_checkpoint_adapter_config(self, path: str) -> None:
+        """Validate checkpoint-level adapter structure against the live model configuration."""
+        adapter_config_path = os.path.join(path, "adapter_config.json")
+        if not os.path.exists(adapter_config_path):
+            return
+
+        with open(adapter_config_path, "r") as f:
+            adapter_config = json.load(f)
+
+        checkpoint_target_modules = adapter_config.get("target_modules")
+        if checkpoint_target_modules is not None:
+            actual_target_modules = sorted(str(module) for module in checkpoint_target_modules)
+            expected_target_modules = self._expected_target_modules()
+            if actual_target_modules != expected_target_modules:
+                raise ValueError(
+                    "Checkpoint target_modules do not match the live LoRA adapter structure. "
+                    f"checkpoint={actual_target_modules!r}, live={expected_target_modules!r}"
+                )
+
+        if "moe_hybrid_shared_lora" in adapter_config:
+            checkpoint_hybrid = bool(adapter_config["moe_hybrid_shared_lora"])
+            expected_hybrid = bool(self.lora_config.get("moe_hybrid_shared_lora", False))
+            if checkpoint_hybrid != expected_hybrid:
+                raise ValueError(
+                    "Checkpoint moe_hybrid_shared_lora does not match the live LoRA adapter structure. "
+                    f"checkpoint={checkpoint_hybrid!r}, live={expected_hybrid!r}"
+                )
+
+    def get_optimizer_metadata(self) -> Dict[str, Any]:
+        """Return a JSON-safe description of the adapter optimizer contract."""
+        return {
+            "type": self.optimizer_type,
+            "dtype": self.optimizer_dtype,
+            "weight_decay": self.weight_decay,
+            "betas": list(self.betas),
+            "eps": self.eps,
+            "optimizer_kwargs": self._serialize_optimizer_metadata_value(self.optimizer_kwargs),
+        }
+
+    def get_adapter_session_spec(self, model_id: str) -> Dict[str, Any]:
+        """Return the normalized session spec for an adapter."""
+        return deepcopy(self.get_adapter_state(model_id).session_spec)
+
+    def _legacy_session_spec(self, *, lr: float) -> Dict[str, Any]:
+        """Build a session spec for compatibility call sites that only provide lr."""
+        default_rank = self.lora_config.get("lora_rank")
+        if default_rank is None and self._lora_param_names:
+            metadata = self._lora_param_metadata[self._lora_param_names[0]]
+            default_rank = metadata["shape"][metadata["rank_dim"]]
+        default_alpha = self.lora_config.get("lora_alpha", default_rank or 16)
+        # Start from the manager-level optimizer_config so passthrough flags
+        # like cautious_weight_decay reach build_optimizer; structured fields
+        # below override anything the manager-level dict supplies.
+        optimizer_config: Dict[str, Any] = dict(self.optimizer_config or {})
+        weight_decay = optimizer_config.get("weight_decay", self.weight_decay)
+        optimizer_config.update(
+            {
+                "type": self.optimizer_type,
+                "learning_rate": float(lr),
+                "weight_decay": float(weight_decay),
+                "optimizer_dtype": self.optimizer_dtype,
+                "betas": list(self.betas),
+                "eps": float(self.eps),
+                "optimizer_kwargs": self._serialize_optimizer_metadata_value(self.optimizer_kwargs),
+            }
+        )
+        return {
+            "base_model": self.lora_config.get("base_model", ""),
+            "is_lora": True,
+            "lora_config": {
+                "lora_rank": int(default_rank or 32),
+                "lora_alpha": int(default_alpha),
+            },
+            "optimizer_config": optimizer_config,
+        }
+
+    def _set_model_runtime_lora_config(self, *, lora_rank: int, lora_alpha: int) -> None:
+        """Update all model-side LoRA modules to use the active session rank/alpha."""
+        for module in self.model.modules():
+            setter = getattr(module, "set_runtime_lora_config", None)
+            if setter is not None:
+                setter(lora_rank, lora_alpha)
+
+    @staticmethod
+    def _build_parameter_module(lora_params: Dict[str, nn.Parameter]) -> nn.Module:
+        """Wrap an adapter's parameters in a temporary module with stable parameter names."""
+        root = nn.Module()
+        for full_name, param in lora_params.items():
+            current = root
+            parts = full_name.split(".")
+            for part in parts[:-1]:
+                child = current._modules.get(part)
+                if child is None:
+                    child = nn.Module()
+                    current.add_module(part, child)
+                current = child
+
+            leaf_name = parts[-1]
+            if leaf_name in current._parameters:
+                raise ValueError(f"Duplicate parameter name while building adapter optimizer module: {full_name}")
+            current.register_parameter(leaf_name, param)
+        return root
+
+    def _build_adapter_optimizer(self, lora_params: Dict[str, nn.Parameter], lr: float) -> torch.optim.Optimizer:
+        """Build an optimizer for one adapter via the shared optimizer factory."""
+        adapter_module = self._build_parameter_module(lora_params)
+        return build_optimizer(
+            adapter_module,
+            lr=lr,
+            betas=self.betas,
+            eps=self.eps,
+            weight_decay=self.weight_decay,
+            fused=self.optimizer_fused,
+            optimizer_type=self.optimizer_type,
+            optimizer_dtype=self.optimizer_dtype,
+            optimizer_kwargs=deepcopy(self.optimizer_kwargs),
+        )
+
+    def _build_adapter_optimizer_for_session(
+        self, lora_params: Dict[str, nn.Parameter], session_spec: Dict[str, Any]
+    ) -> torch.optim.Optimizer:
+        adapter_module = self._build_parameter_module(lora_params)
+        build_kwargs = session_optimizer_build_kwargs(session_spec["optimizer_config"])
+        return build_optimizer(
+            adapter_module,
+            fused=self.optimizer_fused,
+            **build_kwargs,
+        )
+
+    @staticmethod
+    def _has_pending_gradients(state: AdapterState) -> bool:
+        """Return whether an adapter has captured gradients awaiting an optimizer step."""
+        return any(param.grad is not None for param in state.lora_params.values())
 
     def _maybe_evict(self) -> Optional[str]:
         """
         Evict the least recently used adapter if at capacity.
+
+        Adapters with pending gradients are not evictable because checkpointing
+        them would silently drop the captured gradients before `optim_step`.
+        If every resident adapter has pending gradients, this raises instead of
+        discarding training state.
 
         If auto_save_on_eviction is enabled, saves the adapter state before evicting.
 
@@ -124,8 +454,17 @@ class LoRAAdapterManager:
         if len(self.adapters) >= self.max_adapters:
             if not self.adapters:
                 return None
-            # Find LRU adapter - all adapters can be evicted
-            lru_id = min(self.adapters.keys(), key=lambda k: self.adapters[k].last_access_time)
+            evictable_ids = [
+                model_id for model_id, state in self.adapters.items() if not self._has_pending_gradients(state)
+            ]
+            if not evictable_ids:
+                raise RuntimeError(
+                    "Cannot evict any adapter safely because all resident adapters have pending gradients. "
+                    "Call optim_step for at least one session before loading or creating another adapter."
+                )
+
+            # Find the LRU adapter among the clean (step-complete) adapters.
+            lru_id = min(evictable_ids, key=lambda k: self.adapters[k].last_access_time)
             logger.info(f"Evicting LRU adapter: {lru_id} (capacity {len(self.adapters)}/{self.max_adapters})")
 
             # Auto-save before eviction if enabled
@@ -144,7 +483,8 @@ class LoRAAdapterManager:
     def register_adapter(
         self,
         model_id: str,
-        lr: float,
+        lr: Optional[float] = None,
+        session_spec: Optional[Dict[str, Any]] = None,
         initialize_fresh: bool = True,
     ) -> None:
         """
@@ -155,10 +495,27 @@ class LoRAAdapterManager:
 
         Args:
             model_id: Unique identifier for this training run
-            lr: Learning rate for this adapter's optimizer
+            lr: Optional learning rate override for legacy call sites
+            session_spec: Normalized session runtime spec for this adapter
             initialize_fresh: If True, initialize with fresh random weights.
                             If False, use the current model's LoRA weights.
         """
+        effective_lr = float(lr) if lr is not None else None
+        if session_spec is None:
+            if effective_lr is None:
+                effective_lr = 1e-5
+            session_spec = self._legacy_session_spec(lr=effective_lr)
+        else:
+            session_spec = deepcopy(session_spec)
+            if effective_lr is not None:
+                session_spec["optimizer_config"]["learning_rate"] = effective_lr
+
+        self._validate_session_rank_against_model_capacity(session_spec)
+        session_rank = self._session_rank(session_spec)
+        session_alpha = self._session_alpha(session_spec)
+        optimizer_config = session_spec["optimizer_config"]
+        effective_lr = float(optimizer_config["learning_rate"])
+
         # Evict LRU adapter if at capacity and this is a new adapter
         if model_id not in self.adapters:
             self._maybe_evict()
@@ -171,31 +528,24 @@ class LoRAAdapterManager:
         lora_params: Dict[str, nn.Parameter] = {}
         for name, param in self.model.named_parameters():
             if name in self._lora_param_names:
-                # Get shape and dtype from the parameter
-                # IMPORTANT: For DTensors, use .shape (global shape) and .dtype directly
-                # DO NOT call full_tensor() here as it's a collective operation that
-                # requires all ranks to participate, which can cause deadlock when
-                # called from load_adapter_state (only rank 0 does the load)
-                if _HAS_DTENSOR and isinstance(param, DTensor):
-                    # DTensor.shape gives the global (unsharded) shape
-                    param_shape = param.shape
-                    param_dtype = param.dtype
-                else:
-                    param_shape = param.data.shape
-                    param_dtype = param.data.dtype
+                metadata = self._lora_param_metadata[name]
+                param_shape = metadata["shape"]
+                param_dtype = metadata["dtype"]
+                rank_dim = metadata["rank_dim"]
+                compact_shape = self._replace_dim(param_shape, rank_dim, session_rank)
 
                 if initialize_fresh:
-                    # Fresh initialization - create regular tensor on device
+                    # Fresh initialization - create compact regular tensor on device
                     if "lora_A" in name:
                         new_tensor = torch.empty(
-                            param_shape,
+                            compact_shape,
                             dtype=param_dtype,
                             device=self.device,
                         )
                         nn.init.kaiming_uniform_(new_tensor, a=math.sqrt(5))
                     else:  # lora_B
                         new_tensor = torch.zeros(
-                            param_shape,
+                            compact_shape,
                             dtype=param_dtype,
                             device=self.device,
                         )
@@ -208,32 +558,37 @@ class LoRAAdapterManager:
                         param_data = param.full_tensor()
                     else:
                         param_data = param.data
-                    new_tensor = param_data.detach().clone().to(self.device)
+                    new_tensor = (
+                        self._slice_to_shape(
+                            param_data.detach(),
+                            rank_dim=rank_dim,
+                            target_shape=compact_shape,
+                        )
+                        .clone()
+                        .to(self.device)
+                    )
 
                 # Create as nn.Parameter so it has its own .grad slot
                 lora_params[name] = nn.Parameter(new_tensor, requires_grad=True)
 
-        # Create optimizer for this adapter's params
-        optimizer = torch.optim.AdamW(
-            list(lora_params.values()),
-            lr=lr,
-            betas=(0.9, 0.95),
-            eps=1e-8,
-            weight_decay=0.01,
-        )
+        # Build optimizer for this adapter using the session's optimizer contract.
+        optimizer = self._build_adapter_optimizer_for_session(lora_params, session_spec)
 
         self.adapters[model_id] = AdapterState(
             model_id=model_id,
+            session_spec=session_spec,
             lora_params=lora_params,
             optimizer=optimizer,
             global_step=0,
             global_forward_backward_step=0,
-            lr=lr,
+            lr=effective_lr,
         )
 
         logger.info(
             f"Registered adapter for model_id={model_id} "
-            f"(lr={lr}, fresh_weights={initialize_fresh}, num_params={len(lora_params)})"
+            f"(rank={session_rank}, alpha={session_alpha}, lr={effective_lr}, "
+            f"fresh_weights={initialize_fresh}, num_params={len(lora_params)}, "
+            f"optimizer={optimizer_config['type']})"
         )
 
     def prepare_forward(self, model_id: str) -> None:
@@ -262,13 +617,22 @@ class LoRAAdapterManager:
         state = self.adapters[model_id]
         # Update last access time for LRU tracking
         state.last_access_time = time.time()
+        self._set_model_runtime_lora_config(
+            lora_rank=self._session_rank(state.session_spec),
+            lora_alpha=self._session_alpha(state.session_spec),
+        )
 
         # Copy adapter weights into model's params (for forward to use)
         # Use no_grad to avoid autograd issues with DTensor views
         with torch.no_grad():
             for name, param in self.model.named_parameters():
                 if name in state.lora_params:
-                    adapter_data = state.lora_params[name].data
+                    metadata = self._lora_param_metadata[name]
+                    adapter_data = self._expand_compact_tensor(
+                        state.lora_params[name].data,
+                        full_shape=metadata["shape"],
+                        rank_dim=metadata["rank_dim"],
+                    )
 
                     if _HAS_DTENSOR and isinstance(param, DTensor):
                         # For DTensor: copy to the local tensor (the shard)
@@ -328,10 +692,16 @@ class LoRAAdapterManager:
             if name in state.lora_params:
                 adapter_param = state.lora_params[name]
                 if param.grad is not None:
+                    metadata = self._lora_param_metadata[name]
                     # Handle DTensor (FSDP2 sharded gradients)
                     grad = param.grad
                     if _HAS_DTENSOR and isinstance(grad, DTensor):
                         grad = grad.full_tensor()
+                    grad = self._slice_to_shape(
+                        grad,
+                        rank_dim=metadata["rank_dim"],
+                        target_shape=tuple(adapter_param.shape),
+                    )
 
                     # Copy gradient to adapter's param (accumulate for grad accumulation)
                     if adapter_param.grad is None:
@@ -372,9 +742,7 @@ class LoRAAdapterManager:
         state = self.adapters[model_id]
 
         # Update learning rate
-        state.lr = lr
-        for pg in state.optimizer.param_groups:
-            pg["lr"] = lr
+        self._update_state_learning_rate(state, lr)
 
         # Deferred gradient normalization: scale raw gradients by 1/accumulated_valid_tokens
         if accumulated_valid_tokens > 0:
@@ -447,9 +815,7 @@ class LoRAAdapterManager:
     def set_lr(self, model_id: str, lr: float) -> None:
         """Set the learning rate for an adapter."""
         state = self.adapters[model_id]
-        state.lr = lr
-        for param_group in state.optimizer.param_groups:
-            param_group["lr"] = lr
+        self._update_state_learning_rate(state, lr)
 
     def has_adapter(self, model_id: str) -> bool:
         """Check if an adapter is registered for a model_id."""
@@ -558,10 +924,17 @@ class LoRAAdapterManager:
 
         # 1. Save LoRA weights in safetensors format (PEFT-compatible)
         # Convert parameter names to PEFT format: base_model.model.{name}
+        raw_weights = {name: param.data.detach() for name, param in state.lora_params.items()}
+        # Adapter-owned tensors are already compacted to that session's rank.
+        # Do not slice against the live model: LRU eviction can save a different
+        # adapter than the one currently loaded into the model scratch space.
+        active_weights = raw_weights
         weights_dict = {}
-        for name, param in state.lora_params.items():
-            peft_name = f"base_model.model.{name}"
-            weights_dict[peft_name] = param.data.cpu().to(torch.bfloat16)
+        for name, tensor in active_weights.items():
+            peft_name = f"base_model.model.{self._canonical_lora_param_name(name)}"
+            if peft_name in weights_dict:
+                raise ValueError(f"Duplicate canonical LoRA parameter name while saving adapter state: {peft_name}")
+            weights_dict[peft_name] = tensor.detach().cpu().contiguous()
 
         weights_path = os.path.join(path, "adapter_model.safetensors")
         safetensors_save_file(weights_dict, weights_path)
@@ -571,6 +944,11 @@ class LoRAAdapterManager:
             optimizer_path = os.path.join(path, "optimizer.pt")
             torch.save(state.optimizer.state_dict(), optimizer_path)
 
+        # 3. Save normalized session runtime spec with the current learning rate.
+        checkpoint_session_spec = deepcopy(state.session_spec)
+        checkpoint_session_spec["optimizer_config"]["learning_rate"] = float(state.lr)
+        write_session_spec(path, checkpoint_session_spec)
+
         # 3. Save metadata
         metadata = {
             "model_id": model_id,
@@ -579,26 +957,28 @@ class LoRAAdapterManager:
             "lr": state.lr,
             "timestamp": time.time(),
             "save_optimizer": save_optimizer,
+            "optimizer": deepcopy(checkpoint_session_spec["optimizer_config"]),
         }
         metadata_path = os.path.join(path, "metadata.json")
         with open(metadata_path, "w") as f:
             json.dump(metadata, f, indent=2)
 
         # 4. Save adapter config (PEFT-compatible)
-        # Extract LoRA config from parameter shapes
-        lora_r = None
         target_modules = set()
-        for name, param in state.lora_params.items():
-            if "lora_A" in name:
-                lora_r = param.shape[0]  # lora_A is [r, in_features]
+        for name, tensor in active_weights.items():
+            if "lora_A" in name or "_lora_A" in name:
+                if name.endswith("_lora_A"):
+                    target_modules.add(name.rsplit(".", 1)[-1][: -len("_lora_A")])
+                    continue
                 # Extract module name (e.g., "model.layers.0.self_attn.q_proj" from full name)
-                parts = name.replace(".lora_A.weight", "").split(".")
+                parts = name.replace(".lora_A.weight", "").replace(".lora_A", "").replace("_lora_A", "").split(".")
                 if len(parts) >= 1:
                     target_modules.add(parts[-1])  # e.g., "q_proj"
 
         adapter_config = {
-            "r": lora_r,
-            "lora_alpha": lora_r,  # Assume alpha = r (common default)
+            "base_model_name_or_path": state.session_spec.get("base_model"),
+            "r": self._session_rank(state.session_spec),
+            "lora_alpha": self._session_alpha(state.session_spec),
             "target_modules": list(target_modules),
             "lora_dropout": 0.0,
             "bias": "none",
@@ -660,52 +1040,137 @@ class LoRAAdapterManager:
 
         # Determine learning rate
         effective_lr = lr if lr is not None else metadata.get("lr", 1e-5)
+        registered_state = self.adapters.get(model_id)
+        expected_session_spec = deepcopy(registered_state.session_spec) if registered_state is not None else None
+        if expected_session_spec is None:
+            expected_session_spec = self._legacy_session_spec(lr=effective_lr)
 
-        # 2. Register adapter if not exists (this will evict if needed)
-        if model_id not in self.adapters:
-            self.register_adapter(model_id, lr=effective_lr, initialize_fresh=True)
+        checkpoint_session_spec = load_session_spec_from_checkpoint(
+            path,
+            fallback_base_model=expected_session_spec.get("base_model"),
+            fallback_session_spec=expected_session_spec,
+        )
+        self._validate_checkpoint_adapter_config(path)
 
-        state = self.adapters[model_id]
+        if registered_state is not None:
+            checkpoint_spec_for_compare = checkpoint_session_spec
+            registered_spec_for_compare = registered_state.session_spec
+            if lr is not None:
+                checkpoint_spec_for_compare = self._strip_optimizer_learning_rate(checkpoint_spec_for_compare)
+                registered_spec_for_compare = self._strip_optimizer_learning_rate(registered_spec_for_compare)
 
-        # 3. Load LoRA weights
-        weights_path = os.path.join(path, "adapter_model.safetensors")
-        if os.path.exists(weights_path):
-            loaded_weights = safetensors_load_file(weights_path)
-            expected_shapes = {name: param.shape for name, param in state.lora_params.items()}
-            converted_weights = convert_peft_lora_state_dict(loaded_weights, expected_shapes=expected_shapes)
+            if load_optimizer:
+                specs_match = checkpoint_spec_for_compare == registered_spec_for_compare
+                mismatch_context = "registered multi-adapter session"
+            else:
+                specs_match = self._strip_optimizer_config(checkpoint_spec_for_compare) == self._strip_optimizer_config(
+                    registered_spec_for_compare
+                )
+                mismatch_context = "registered multi-adapter session for weights-only restore"
 
-            expected_keys = set(state.lora_params)
-            loaded_keys = set(converted_weights)
-            missing_keys = sorted(expected_keys - loaded_keys)
-            unexpected_keys = sorted(loaded_keys - expected_keys)
-            if missing_keys or unexpected_keys:
-                raise RuntimeError(
-                    "Checkpoint LoRA parameter set does not match the live adapter structure.\n"
-                    f"missing={missing_keys}\n"
-                    f"unexpected={unexpected_keys}"
+            if not specs_match:
+                raise ValueError(
+                    "Checkpoint session spec does not match the "
+                    f"{mismatch_context}. checkpoint={checkpoint_session_spec!r}, "
+                    f"current={registered_state.session_spec!r}"
                 )
 
-            for name, param in state.lora_params.items():
-                param.data.copy_(converted_weights[name].to(device=self.device, dtype=param.dtype))
-        else:
-            raise FileNotFoundError(f"Weights file not found: {weights_path}")
+        # 2. Register adapter if not exists (this will evict if needed).
+        # Track whether this call did the registration so a downstream load
+        # failure does not leave a fresh-init adapter resident under model_id.
+        registered_here = False
+        if model_id not in self.adapters:
+            self.register_adapter(
+                model_id,
+                session_spec=checkpoint_session_spec,
+                initialize_fresh=True,
+            )
+            registered_here = True
 
-        # 4. Load optimizer state
-        optimizer_path = os.path.join(path, "optimizer.pt")
-        if load_optimizer and os.path.exists(optimizer_path):
-            optimizer_state = torch.load(optimizer_path, map_location=self.device, weights_only=True)
-            state.optimizer.load_state_dict(optimizer_state)
-            logger.debug(f"Loaded optimizer state from {optimizer_path}")
+        try:
+            state = self.adapters[model_id]
+
+            # 3. Load LoRA weights
+            weights_path = os.path.join(path, "adapter_model.safetensors")
+            if os.path.exists(weights_path):
+                loaded_weights = safetensors_load_file(weights_path)
+                expected_param_map: Dict[str, str] = {}
+                expected_shapes: Dict[str, torch.Size] = {}
+                for actual_name in state.lora_params:
+                    canonical_name = self._canonical_lora_param_name(actual_name)
+                    if canonical_name in expected_param_map and expected_param_map[canonical_name] != actual_name:
+                        raise ValueError(
+                            f"Live adapter contains duplicate LoRA tensors after canonicalization. param={canonical_name!r}"
+                        )
+                    expected_param_map[canonical_name] = actual_name
+                    expected_shapes[canonical_name] = state.lora_params[actual_name].shape
+
+                expected_shard_specs = get_lora_tensor_shard_specs(self.model, names=expected_shapes.keys())
+                converted_weights = convert_peft_lora_state_dict(
+                    loaded_weights,
+                    expected_shapes=expected_shapes,
+                    expected_shard_specs=expected_shard_specs,
+                )
+                checkpoint_tensors: Dict[str, torch.Tensor] = {}
+                for converted_name, weight in converted_weights.items():
+                    canonical_name = self._canonical_lora_param_name(converted_name)
+                    if canonical_name in checkpoint_tensors:
+                        raise ValueError(
+                            f"Checkpoint contains duplicate LoRA tensors after canonicalization. param={canonical_name!r}"
+                        )
+                    checkpoint_tensors[canonical_name] = weight.to(self.device)
+
+                expected_param_names = set(expected_param_map)
+                checkpoint_param_names = set(checkpoint_tensors)
+                missing_param_names = sorted(expected_param_names - checkpoint_param_names)
+                unexpected_param_names = sorted(checkpoint_param_names - expected_param_names)
+                if missing_param_names or unexpected_param_names:
+                    raise ValueError(
+                        "Checkpoint LoRA parameter set does not match the live adapter structure. "
+                        f"missing={missing_param_names!r}, unexpected={unexpected_param_names!r}"
+                    )
+
+                for internal_name, tensor in checkpoint_tensors.items():
+                    target_param = state.lora_params[expected_param_map[internal_name]]
+                    if tuple(tensor.shape) != tuple(target_param.shape):
+                        raise ValueError(
+                            "Checkpoint tensor shape does not match the live adapter shape. "
+                            f"param={internal_name!r}, checkpoint={tuple(tensor.shape)!r}, "
+                            f"live={tuple(target_param.shape)!r}"
+                        )
+
+                for internal_name, tensor in checkpoint_tensors.items():
+                    state.lora_params[expected_param_map[internal_name]].data.copy_(tensor)
+            else:
+                raise FileNotFoundError(f"Weights file not found: {weights_path}")
+
+            # 4. Load optimizer state
+            optimizer_path = os.path.join(path, "optimizer.pt")
+            if load_optimizer and os.path.exists(optimizer_path):
+                optimizer_state = torch.load(optimizer_path, map_location=self.device, weights_only=True)
+                state.optimizer.load_state_dict(optimizer_state)
+                logger.debug(f"Loaded optimizer state from {optimizer_path}")
+        except Exception:
+            if registered_here:
+                try:
+                    self.remove_adapter(model_id)
+                except Exception as cleanup_error:
+                    logger.warning(
+                        f"Cleanup remove_adapter({model_id}) after failed load_adapter_state raised: {cleanup_error}"
+                    )
+            raise
 
         # 5. Restore metadata
         state.global_step = metadata.get("global_step", 0)
         state.global_forward_backward_step = metadata.get("global_forward_backward_step", 0)
         if lr is not None:
-            state.lr = lr
-            for pg in state.optimizer.param_groups:
-                pg["lr"] = lr
-        elif "lr" in metadata:
-            state.lr = metadata["lr"]
+            self._update_state_learning_rate(state, lr)
+        elif "lr" in metadata and (
+            load_optimizer
+            or self._strip_optimizer_learning_rate(checkpoint_session_spec)
+            == self._strip_optimizer_learning_rate(state.session_spec)
+        ):
+            self._update_state_learning_rate(state, metadata["lr"])
 
         # Update last access time
         state.last_access_time = time.time()

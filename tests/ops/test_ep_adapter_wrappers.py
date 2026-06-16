@@ -7,6 +7,7 @@ expert_scores through, and compare output to a naive reference.
 """
 
 import importlib.util
+import inspect
 import sys
 import types
 from pathlib import Path
@@ -15,6 +16,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from xorl.models.layers.moe.backend import EP_EXPERT_COMPUTE
 from xorl.utils import import_utils
 
 
@@ -159,23 +161,37 @@ def test_adapter_forwards_expert_scores(monkeypatch, backend_type, class_name):
     ) = _make_test_data()
 
     fn_cls = getattr(kernel_module, class_name)
-    output = fn_cls.apply(permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores)
+    output = fn_cls.apply(permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores)
 
     ref = reference_ep_forward(permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores)
     torch.testing.assert_close(output, ref)
 
 
-def test_adapter_source_forwards_expert_scores():
-    """Regression test: verify backend/__init__.py adapter wrappers pass expert_scores.
+# ---------------------------------------------------------------------------
+# Signature contract tests — replaces the old source-grep regression test.
+# Inspects live function signatures instead of pattern-matching on source text,
+# so formatting changes, variable renames, and line rewrapping can't fool it.
+# ---------------------------------------------------------------------------
 
-    Parses the source to confirm the apply() / compute() calls include expert_scores.
-    This catches silent-drop bugs without needing to load the full module.
+# Required explicit parameters for every EP_EXPERT_COMPUTE entry.
+_REQUIRED_EP_PARAMS = ("expert_scores", "hidden_act")
+
+
+@pytest.mark.parametrize("name,fn", list(EP_EXPERT_COMPUTE.items()))
+def test_ep_compute_signature_contract(name, fn):
+    """Every EP compute function must explicitly accept expert_scores, hidden_act,
+    and a **kwargs catch-all for forward-compat extras (gate_up_bias, down_bias, etc.).
     """
-    source = _BACKEND_INIT_PATH.read_text()
+    sig = inspect.signature(fn)
+    params = sig.parameters
 
-    assert "_QuackEPGroupGemm.apply(permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores)" in source, (
-        "_quack_ep_fused does not forward expert_scores to _QuackEPGroupGemm.apply()"
-    )
-    assert "_native_ep_compute(permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores)" in source, (
-        "_native_ep_fused does not forward expert_scores to _native_ep_compute()"
+    for required in _REQUIRED_EP_PARAMS:
+        assert required in params, (
+            f"EP_EXPERT_COMPUTE['{name}'] is missing explicit '{required}' param. Signature: {sig}"
+        )
+
+    has_var_keyword = any(p.kind == p.VAR_KEYWORD for p in params.values())
+    assert has_var_keyword, (
+        f"EP_EXPERT_COMPUTE['{name}'] has no **kwargs — new extras like "
+        f"gate_up_bias will break callers. Signature: {sig}"
     )

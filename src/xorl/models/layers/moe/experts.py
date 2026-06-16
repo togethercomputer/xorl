@@ -39,6 +39,9 @@ class MoEExperts(nn.Module):
     ``gate_proj`` and ``up_proj`` are exposed as views into ``gate_up_proj``
     for compatibility with existing backends and helpers.
 
+    Optional per-expert biases (``gate_up_bias``, ``down_bias``) default to
+    ``None`` and can be set by model-specific code (e.g. GPT-OSS).
+
     Args:
         num_experts: Total number of experts.
         hidden_dim: Model hidden dimension.
@@ -71,6 +74,15 @@ class MoEExperts(nn.Module):
             requires_grad=True,
         )
         self.act_fn = ACT2FN[hidden_act]
+        # String kind used by triton/native/quack backends (avoids name-sniffing).
+        from xorl.ops.moe.triton import normalize_hidden_act  # noqa: PLC0415
+
+        self.hidden_act = normalize_hidden_act(hidden_act)
+
+        # Optional per-expert biases (e.g. GPT-OSS). Set to actual tensors
+        # by model-specific code; None means no bias.
+        self.gate_up_bias = None
+        self.down_bias = None
 
         # EP dispatch strategy: "alltoall" (default) or "deepep" (NVLink-optimized)
         self.ep_dispatch: str = "alltoall"
@@ -116,7 +128,9 @@ class MoEExperts(nn.Module):
                 self.gate_proj.contiguous(),
                 self.up_proj.contiguous(),
                 self.down_proj,
-                self.act_fn,
+                hidden_act=self.hidden_act,
+                gate_up_bias=self.gate_up_bias,
+                down_bias=self.down_bias,
             )
 
         # Check EP — use unified dispatch/compute/combine path
@@ -140,6 +154,10 @@ class MoEExperts(nn.Module):
             up_proj,
             self.down_proj,
             num_experts=self.num_experts,
+            hidden_act=self.hidden_act,
+            gate_up_proj=self.gate_up_proj,
+            gate_up_bias=self.gate_up_bias,
+            down_bias=self.down_bias,
         )
 
     @torch.compiler.disable
@@ -235,6 +253,9 @@ class MoEExperts(nn.Module):
             self.down_proj,
             self.intermediate_size,
             expert_scores,
+            hidden_act=self.hidden_act,
+            gate_up_bias=self.gate_up_bias,
+            down_bias=self.down_bias,
         )
 
         # Step 3: Combine expert outputs back to original ranks
@@ -268,6 +289,9 @@ class MoEExperts(nn.Module):
             self.down_proj,
             self.intermediate_size,
             expert_scores,
+            hidden_act=self.hidden_act,
+            gate_up_bias=self.gate_up_bias,
+            down_bias=self.down_bias,
         )
         ev[3].record()
 

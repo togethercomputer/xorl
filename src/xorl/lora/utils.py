@@ -8,7 +8,8 @@ import json
 import logging
 import os
 import re
-from typing import Dict, Iterator, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -30,6 +31,36 @@ DEFAULT_TARGET_MODULES = {
     "qwen": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     "mistral": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     "gemma": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    "deepseek_v3": [
+        "q_a_proj",
+        "q_b_proj",
+        "kv_a_proj_with_mqa",
+        "kv_b_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ],
+    "kimi_k2": [
+        "q_a_proj",
+        "q_b_proj",
+        "kv_a_proj_with_mqa",
+        "kv_b_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ],
+    "kimi_k25": [
+        "q_a_proj",
+        "q_b_proj",
+        "kv_a_proj_with_mqa",
+        "kv_b_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ],
 }
 
 _PEFT_BASE_MODEL_PREFIX = "base_model.model."
@@ -37,6 +68,34 @@ _MOE_LORA_PATTERN = re.compile(r"(.*)\.mlp\.experts\.(gate_proj|up_proj|down_pro
 _MOE_PEFT_LORA_PATTERN = re.compile(
     r"(.*)\.mlp\.experts\.(shared|\d+)\.(gate_proj|up_proj|down_proj)\.lora_(A|B)\.weight$"
 )
+_MOE_SGLANG_SHARED_OUTER_PATTERN = re.compile(r"(.*)\.mlp\.experts\.(w1|w2|w3)\.lora_(A|B)\.weight$")
+
+# SGLang shared_outer format uses w1/w2/w3 slots for gate/down/up projections.
+_PROJ_TO_SGLANG_W = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
+_SGLANG_W_TO_PROJ = {v: k for k, v in _PROJ_TO_SGLANG_W.items()}
+
+LORA_EXPORT_FORMATS = ("peft", "sglang_shared_outer")
+
+
+@dataclass(frozen=True)
+class LoraTensorShardSpec:
+    """Shard metadata needed to map a full LoRA tensor onto the current rank."""
+
+    dim: int
+    index: int
+    size: int
+
+
+def _get_default_target_modules(model: nn.Module) -> List[str]:
+    config = getattr(model, "config", None)
+    model_type = getattr(config, "model_type", None)
+    if model_type in DEFAULT_TARGET_MODULES:
+        return list(DEFAULT_TARGET_MODULES[model_type])
+    if model_type is not None:
+        for family, targets in DEFAULT_TARGET_MODULES.items():
+            if family in model_type:
+                return list(targets)
+    return ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 
 def _get_submodule(model: nn.Module, target: str) -> Tuple[nn.Module, str]:
@@ -160,7 +219,7 @@ def inject_lora_into_model(
         ... )
     """
     if target_modules is None:
-        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+        target_modules = _get_default_target_modules(model)
 
     # Find all matching modules
     target_paths = _find_target_modules(model, target_modules)
@@ -279,6 +338,75 @@ def _gather_ep_tensor(tensor: torch.Tensor, spec_info) -> torch.Tensor:
     return torch.cat(gathered, dim=shard_dim)
 
 
+def _lora_rank_dim(param_name: str) -> Optional[int]:
+    """Return the rank dimension for xorl LoRA parameter names."""
+    if param_name == "lora_A":
+        return 0
+    if param_name == "lora_B":
+        return 1
+    if param_name.endswith("_lora_A"):
+        return -1
+    if param_name.endswith("_lora_B"):
+        return 1
+    return None
+
+
+def _active_lora_rank_slices(model: nn.Module) -> Dict[str, Tuple[int, int]]:
+    """Map LoRA parameter FQNs to (rank_dim, active_rank) from live modules."""
+    rank_slices: Dict[str, Tuple[int, int]] = {}
+    for module_name, module in model.named_modules():
+        active_rank = getattr(module, "active_r", None)
+        if active_rank is None:
+            continue
+        active_rank = int(active_rank)
+        if active_rank <= 0:
+            raise ValueError(f"Active LoRA rank must be positive, got {active_rank}")
+
+        prefix = f"{module_name}." if module_name else ""
+        for local_name, _ in module.named_parameters(recurse=False):
+            rank_dim = _lora_rank_dim(local_name)
+            if rank_dim is not None:
+                rank_slices[f"{prefix}{local_name}"] = (rank_dim, active_rank)
+    return rank_slices
+
+
+def _slice_lora_tensor_to_rank(tensor: torch.Tensor, rank_dim: int, active_rank: int) -> torch.Tensor:
+    dim = rank_dim if rank_dim >= 0 else tensor.dim() + rank_dim
+    if dim < 0 or dim >= tensor.dim() or tensor.shape[dim] <= active_rank:
+        return tensor
+    return tensor.narrow(dim, 0, active_rank).contiguous()
+
+
+def slice_lora_state_dict_to_active_rank(
+    model: nn.Module,
+    lora_state_dict: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """Slice LoRA state tensors to each module's active runtime rank."""
+    rank_slices = _active_lora_rank_slices(model)
+    if not rank_slices:
+        return lora_state_dict
+
+    sliced_state_dict: Dict[str, torch.Tensor] = {}
+    for name, tensor in lora_state_dict.items():
+        rank_slice = rank_slices.get(name)
+        if rank_slice is None:
+            sliced_state_dict[name] = tensor
+            continue
+        rank_dim, active_rank = rank_slice
+        sliced_state_dict[name] = _slice_lora_tensor_to_rank(tensor, rank_dim, active_rank)
+    return sliced_state_dict
+
+
+def _first_active_lora_config(model: nn.Module) -> Tuple[Optional[int], Optional[int]]:
+    """Return the first live module's active rank/alpha, if present."""
+    for module in model.modules():
+        active_rank = getattr(module, "active_r", None)
+        active_alpha = getattr(module, "active_lora_alpha", None)
+        if active_rank is not None:
+            return int(active_rank), None if active_alpha is None else int(active_alpha)
+    return None, None
+
+
 def get_lora_state_dict(
     model: nn.Module,
     prefix: str = "",
@@ -300,6 +428,7 @@ def get_lora_state_dict(
     """
 
     fqn2spec_info = getattr(model, "_fqn2spec_info", None)
+    rank_slices = _active_lora_rank_slices(model)
 
     lora_state_dict = {}
     for name, param in model.named_parameters():
@@ -318,6 +447,11 @@ def get_lora_state_dict(
             spec_info = fqn2spec_info.get(clean_name) or fqn2spec_info.get(name)
             if spec_info is not None:
                 tensor = _gather_ep_tensor(tensor, spec_info)
+
+        rank_slice = rank_slices.get(name)
+        if rank_slice is not None:
+            rank_dim, active_rank = rank_slice
+            tensor = _slice_lora_tensor_to_rank(tensor, rank_dim, active_rank)
 
         lora_state_dict[key] = tensor.cpu()
     return lora_state_dict
@@ -384,12 +518,113 @@ def _convert_from_peft_lora_key(name: str) -> str:
     return name
 
 
+def _device_mesh_local_index(mesh) -> int:
+    """Return this rank's coordinate in a 1D DeviceMesh."""
+    try:
+        return int(mesh.get_local_rank(mesh_dim=0))
+    except Exception:
+        pass
+
+    try:
+        coordinate = mesh.get_coordinate()
+        if coordinate is not None:
+            return int(coordinate[0])
+    except Exception:
+        pass
+
+    try:
+        return int(dist.get_rank(mesh.get_group()))
+    except Exception:
+        return 0
+
+
+def get_lora_tensor_shard_specs(
+    model: nn.Module,
+    names: Optional[Iterable[str]] = None,
+) -> Dict[str, LoraTensorShardSpec]:
+    """Return EP shard specs for LoRA parameters in ``model`` keyed by parameter name."""
+    requested_names = set(names) if names is not None else None
+    fqn2spec_info = getattr(model, "_fqn2spec_info", None)
+    shard_specs: Dict[str, LoraTensorShardSpec] = {}
+
+    for name, param in model.named_parameters():
+        if "lora_A" not in name and "lora_B" not in name:
+            continue
+
+        clean_name = name.replace("_fsdp_wrapped_module.", "").replace("_orig_mod.", "")
+        if requested_names is not None and name not in requested_names and clean_name not in requested_names:
+            continue
+
+        spec_info = None
+        if fqn2spec_info is not None:
+            spec_info = fqn2spec_info.get(clean_name) or fqn2spec_info.get(name)
+        if spec_info is None:
+            spec_info = getattr(param, "spec_info", None)
+        if spec_info is None or not isinstance(spec_info.placement, Shard):
+            continue
+
+        ep_mesh = spec_info.ep_mesh
+        if ep_mesh is None:
+            continue
+
+        shard_specs[name] = LoraTensorShardSpec(
+            dim=spec_info.placement.dim,
+            index=_device_mesh_local_index(ep_mesh),
+            size=int(ep_mesh.size()),
+        )
+        if clean_name != name:
+            shard_specs[clean_name] = shard_specs[name]
+
+    return shard_specs
+
+
+def _slice_lora_tensor_shard(
+    key: str,
+    tensor: torch.Tensor,
+    expected_shape: Tuple[int, ...],
+    shard_specs: Optional[Dict[str, LoraTensorShardSpec]],
+) -> Optional[torch.Tensor]:
+    if shard_specs is None or key not in shard_specs:
+        return None
+
+    spec = shard_specs[key]
+    shard_dim = spec.dim if spec.dim >= 0 else tensor.dim() + spec.dim
+    if shard_dim < 0 or shard_dim >= tensor.dim():
+        return None
+    if len(expected_shape) != tensor.dim():
+        return None
+    if spec.size <= 1:
+        return None
+
+    for dim, size in enumerate(expected_shape):
+        if dim != shard_dim and tensor.shape[dim] != size:
+            return None
+
+    total_size = tensor.shape[shard_dim]
+    shard_size = (total_size + spec.size - 1) // spec.size
+    start = spec.index * shard_size
+    if start >= total_size:
+        return None
+
+    length = min(shard_size, total_size - start)
+    sliced = tensor.narrow(shard_dim, start, length).contiguous()
+    if tuple(sliced.shape) == expected_shape:
+        return sliced
+
+    raise RuntimeError(
+        f"Converted LoRA tensor shard for {key} has shape {tuple(sliced.shape)}, "
+        f"expected {expected_shape} (full shape {tuple(tensor.shape)}, "
+        f"shard dim {shard_dim}, shard {spec.index}/{spec.size})"
+    )
+
+
 def _align_lora_tensor_shape(
     key: str,
     tensor: torch.Tensor,
     expected_shapes: Optional[Dict[str, torch.Size]],
+    expected_shard_specs: Optional[Dict[str, LoraTensorShardSpec]] = None,
 ) -> torch.Tensor:
-    """Match a converted tensor to the live LoRA shape, allowing a final-dim transpose."""
+    """Match a converted tensor to the live LoRA shape, allowing transpose and EP slicing."""
     if expected_shapes is None or key not in expected_shapes:
         return tensor
 
@@ -397,17 +632,32 @@ def _align_lora_tensor_shape(
     if tuple(tensor.shape) == expected_shape:
         return tensor
 
+    sliced = _slice_lora_tensor_shard(key, tensor, expected_shape, expected_shard_specs)
+    if sliced is not None:
+        return sliced
+
     if tensor.dim() >= 2:
         transposed = tensor.transpose(-2, -1).contiguous()
         if tuple(transposed.shape) == expected_shape:
             return transposed
 
+        sliced = _slice_lora_tensor_shard(key, transposed, expected_shape, expected_shard_specs)
+        if sliced is not None:
+            return sliced
+
+    if expected_shard_specs is not None and key in expected_shard_specs:
+        spec = expected_shard_specs[key]
+        raise RuntimeError(
+            f"Converted LoRA tensor for {key} has shape {tuple(tensor.shape)}, expected {expected_shape} "
+            f"(shard dim {spec.dim}, shard {spec.index}/{spec.size})"
+        )
     raise RuntimeError(f"Converted LoRA tensor for {key} has shape {tuple(tensor.shape)}, expected {expected_shape}")
 
 
 def convert_peft_lora_state_dict(
     state_dict: Dict[str, torch.Tensor],
     expected_shapes: Optional[Dict[str, torch.Size]] = None,
+    expected_shard_specs: Optional[Dict[str, LoraTensorShardSpec]] = None,
 ) -> Dict[str, torch.Tensor]:
     """Convert PEFT-style LoRA checkpoint tensors into xorl's internal layout.
 
@@ -422,6 +672,9 @@ def convert_peft_lora_state_dict(
         expected_shapes: Optional live-parameter shapes keyed by internal name.
             When provided, the converter will transpose the trailing matrix dims
             if that is required to match the live layout.
+        expected_shard_specs: Optional EP shard specs keyed by internal name.
+            When provided, full MoE expert tensors are sliced to the current
+            rank's local expert shard after any required PEFT transpose.
 
     Returns:
         State dict keyed by xorl's internal LoRA parameter names.
@@ -435,6 +688,19 @@ def convert_peft_lora_state_dict(
         else:
             key = raw_key
 
+        sglang_match = _MOE_SGLANG_SHARED_OUTER_PATTERN.match(key)
+        if sglang_match is not None:
+            prefix, w_slot, lora_type = sglang_match.groups()
+            proj_name = _SGLANG_W_TO_PROJ[w_slot]
+            internal_name = f"{prefix}.mlp.experts.{proj_name}_lora_{lora_type}"
+            # shared_outer stores 3D tensors transposed (last two dims) vs.
+            # xorl's in-memory layout. Flip them back to the in-first order.
+            restored = value.transpose(-2, -1).contiguous() if value.dim() >= 2 else value
+            converted_state_dict[internal_name] = _align_lora_tensor_shape(
+                internal_name, restored, expected_shapes, expected_shard_specs
+            )
+            continue
+
         match = _MOE_PEFT_LORA_PATTERN.match(key)
         if match is not None:
             prefix, expert_token, proj_name, lora_type = match.groups()
@@ -446,7 +712,9 @@ def convert_peft_lora_state_dict(
             continue
 
         internal_name = _convert_from_peft_lora_key(key)
-        converted_state_dict[internal_name] = _align_lora_tensor_shape(internal_name, value, expected_shapes)
+        converted_state_dict[internal_name] = _align_lora_tensor_shape(
+            internal_name, value, expected_shapes, expected_shard_specs
+        )
 
     for internal_name, bucket in moe_buckets.items():
         if "shared" in bucket:
@@ -464,7 +732,9 @@ def convert_peft_lora_state_dict(
                 )
             stacked = torch.stack([bucket[str(expert_idx)] for expert_idx in expert_indices], dim=0)
 
-        converted_state_dict[internal_name] = _align_lora_tensor_shape(internal_name, stacked, expected_shapes)
+        converted_state_dict[internal_name] = _align_lora_tensor_shape(
+            internal_name, stacked, expected_shapes, expected_shard_specs
+        )
 
     return converted_state_dict
 
@@ -478,7 +748,9 @@ def save_lora_checkpoint(
     lora_alpha: Optional[int] = None,
     moe_hybrid_shared_lora: bool = False,
     lora_state_dict: Optional[Dict[str, torch.Tensor]] = None,
-    transpose_moe_lora_to_peft: bool = False,
+    transpose_moe_lora_to_peft: bool = True,
+    lora_export_format: str = "peft",
+    preserve_lora_dtype: bool = False,
 ) -> str:
     """
     Save LoRA weights in PEFT-compatible format.
@@ -499,18 +771,43 @@ def save_lora_checkpoint(
             get_lora_state_dict(model) call. Useful when the caller has already
             gathered weights (e.g., from FSDP2 + EP distributed model).
         transpose_moe_lora_to_peft: Whether to transpose MoE expert LoRA tensors
-            into PEFT/vLLM orientation during export. Disabled by default so
-            existing xorl call sites keep their current behavior.
+            into PEFT/SGLang orientation during export. Enabled by default so
+            exported MoE adapters match the shape convention expected by
+            inference backends. Ignored when
+            ``lora_export_format="sglang_shared_outer"``.
+        lora_export_format: On-disk layout for MoE expert LoRA. ``"peft"``
+            (default) un-stacks the 3D tensors into per-expert 2D keys. Pass
+            ``"sglang_shared_outer"`` to emit SGLang's stacked 3D shared_outer
+            layout directly (requires ``moe_hybrid_shared_lora=True``).
+        preserve_lora_dtype: Keep LoRA tensor dtypes in the safetensors file
+            instead of exporting bf16 weights. Use this for training-resume
+            checkpoints; keep the default bf16 export for inference adapters.
 
     Returns:
         Path to saved checkpoint directory
     """
+
+    if lora_export_format not in LORA_EXPORT_FORMATS:
+        raise ValueError(f"Unknown lora_export_format={lora_export_format!r}. Expected one of {LORA_EXPORT_FORMATS}.")
+    if lora_export_format == "sglang_shared_outer" and not moe_hybrid_shared_lora:
+        raise ValueError(
+            "lora_export_format='sglang_shared_outer' requires moe_hybrid_shared_lora=True "
+            "(shared_outer only makes sense for hybrid-shared MoE LoRA)."
+        )
 
     os.makedirs(save_path, exist_ok=True)
 
     # Get LoRA state dict — use provided one or extract from model
     if lora_state_dict is None:
         lora_state_dict = get_lora_state_dict(model)
+    else:
+        lora_state_dict = slice_lora_state_dict_to_active_rank(model, lora_state_dict)
+
+    def _prepare_lora_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        tensor = tensor.detach().cpu().contiguous()
+        if preserve_lora_dtype:
+            return tensor
+        return tensor.to(torch.bfloat16)
 
     def _is_moe_lora_param(name: str) -> bool:
         """Check if this is a stacked MoE LoRA parameter."""
@@ -568,7 +865,7 @@ def save_lora_checkpoint(
             if transpose_moe_lora_to_peft:
                 expert_tensor = expert_tensor.transpose(0, 1).contiguous()
             peft_key = f"base_model.model.{prefix}.mlp.experts.shared.{proj_name}.lora_{lora_type}.weight"
-            result[peft_key] = expert_tensor.to(torch.bfloat16)
+            result[peft_key] = _prepare_lora_tensor(expert_tensor)
         else:
             # Per-expert weights: use expert index in the key name
             for expert_idx in range(num_experts):
@@ -578,9 +875,24 @@ def save_lora_checkpoint(
                 # Build vLLM-compatible key:
                 # base_model.model.{prefix}.mlp.experts.{idx}.{proj}.lora_{A|B}.weight
                 peft_key = f"base_model.model.{prefix}.mlp.experts.{expert_idx}.{proj_name}.lora_{lora_type}.weight"
-                result[peft_key] = expert_tensor.to(torch.bfloat16)
+                result[peft_key] = _prepare_lora_tensor(expert_tensor)
 
         return result
+
+    def _sglang_shared_outer_moe_weight(name: str, stacked_tensor: torch.Tensor) -> Tuple[str, torch.Tensor]:
+        """Rename + transpose a stacked MoE tensor into SGLang shared_outer layout.
+
+        xorl stores 3D tensors in-first (A: [E_or_1, in, r], B: [E_or_1, r, out]).
+        shared_outer stores them out-first under ``experts.w{1,2,3}.lora_{A|B}.weight``.
+        """
+        match = _MOE_LORA_PATTERN.match(name)
+        if not match:
+            raise ValueError(f"Invalid MoE LoRA parameter name: {name}")
+        prefix, proj_name, lora_type = match.group(1), match.group(2), match.group(3)
+        w_slot = _PROJ_TO_SGLANG_W[proj_name]
+        peft_key = f"{_PEFT_BASE_MODEL_PREFIX}{prefix}.mlp.experts.{w_slot}.lora_{lora_type}.weight"
+        out_tensor = _prepare_lora_tensor(stacked_tensor.transpose(-2, -1).contiguous())
+        return peft_key, out_tensor
 
     # Convert keys to PEFT format: base_model.model.{converted_key}
     peft_state_dict = {}
@@ -590,18 +902,20 @@ def save_lora_checkpoint(
     for key, value in lora_state_dict.items():
         # Check if this is a stacked MoE LoRA parameter
         if _is_moe_lora_param(key):
-            # Unmerge stacked MoE LoRA weights into per-expert format
-            per_expert_weights = _unmerge_moe_lora_weights(key, value)
-            peft_state_dict.update(per_expert_weights)
+            if lora_export_format == "sglang_shared_outer":
+                peft_key, out_tensor = _sglang_shared_outer_moe_weight(key, value)
+                peft_state_dict[peft_key] = out_tensor
+            else:
+                # Unmerge stacked MoE LoRA weights into per-expert format
+                per_expert_weights = _unmerge_moe_lora_weights(key, value)
+                peft_state_dict.update(per_expert_weights)
             # Detect target modules from MoE LoRA
             match = _MOE_LORA_PATTERN.match(key)
             if match:
                 detected_modules.add(match.group(2))  # gate_proj, up_proj, or down_proj
                 if detected_r is None and match.group(3) == "A":
                     # Xorl stores MoE LoRA A as [num_experts, in_features, r].
-                    # When transpose_moe_lora_to_peft is enabled, the exported
-                    # PEFT tensor rank is the last dimension of the stacked input.
-                    detected_r = value.shape[2] if transpose_moe_lora_to_peft else value.shape[1]
+                    detected_r = value.shape[2]
         else:
             # Extract module name for target_modules detection
             parts = key.split(".")
@@ -616,18 +930,32 @@ def save_lora_checkpoint(
 
             # Convert to PEFT key format
             peft_key = f"base_model.model.{_convert_to_peft_key(key)}"
-            peft_state_dict[peft_key] = value.to(torch.bfloat16)
+            peft_state_dict[peft_key] = _prepare_lora_tensor(value)
 
     # Auto-detect parameters if not provided
     if target_modules is None:
         target_modules = list(detected_modules)
-    if r is None:
-        r = detected_r or 16
-    if lora_alpha is None:
+    active_rank, active_alpha = _first_active_lora_config(model)
+    if detected_r is not None:
+        if r is not None and r != detected_r:
+            logger.warning(
+                f"Requested LoRA config r={r} does not match exported tensor rank {detected_r}; writing r={detected_r}."
+            )
+        r = detected_r
+    elif r is None:
+        r = active_rank or 16
+    if active_alpha is not None and active_rank == r:
+        if lora_alpha is not None and lora_alpha != active_alpha:
+            logger.warning(
+                f"Requested LoRA alpha={lora_alpha} does not match active alpha {active_alpha}; "
+                f"writing lora_alpha={active_alpha}."
+            )
+        lora_alpha = active_alpha
+    elif lora_alpha is None:
         # Try to detect from model
         for module in model.modules():
             if isinstance(module, LoraLinear):
-                lora_alpha = module.lora_alpha
+                lora_alpha = getattr(module, "active_lora_alpha", module.lora_alpha)
                 break
         if lora_alpha is None:
             lora_alpha = r  # Default: alpha = r
@@ -649,8 +977,16 @@ def save_lora_checkpoint(
         "peft_type": "LORA",
         "inference_mode": True,
         "fan_in_fan_out": False,
-        "moe_hybrid_shared_lora": moe_hybrid_shared_lora,
     }
+    if lora_export_format == "sglang_shared_outer":
+        adapter_config["_sglang_lora_format"] = "shared_outer"
+        # SGLang's lora_manager classifies adapters via the moe_hybrid_shared_lora
+        # / shared_moe_lora keys in hf_config. shared_outer IS hybrid_shared
+        # on-disk, so mirror the flag here so SGLang doesn't mis-classify it as
+        # per_expert (which would reject loading under --lora-moe-format hybrid_shared).
+        adapter_config["moe_hybrid_shared_lora"] = True
+    else:
+        adapter_config["moe_hybrid_shared_lora"] = moe_hybrid_shared_lora
 
     config_path = os.path.join(save_path, "adapter_config.json")
     with open(config_path, "w") as f:
@@ -697,7 +1033,12 @@ def load_lora_checkpoint(
     model_lora_shapes = {
         key: value.shape for key, value in model.state_dict().items() if "lora_A" in key or "lora_B" in key
     }
-    converted_state_dict = convert_peft_lora_state_dict(state_dict, expected_shapes=model_lora_shapes)
+    lora_shard_specs = get_lora_tensor_shard_specs(model, names=model_lora_shapes.keys())
+    converted_state_dict = convert_peft_lora_state_dict(
+        state_dict,
+        expected_shapes=model_lora_shapes,
+        expected_shard_specs=lora_shard_specs,
+    )
 
     # Load into model
     missing, unexpected = load_lora_state_dict(model, converted_state_dict, strict=strict)
@@ -828,9 +1169,10 @@ def inject_lora_into_model_with_moe(
         model: Model to inject LoRA into
         r: LoRA rank
         lora_alpha: LoRA alpha for scaling
-        target_modules: List of module names to target.
-                       For attention: ["q_proj", "k_proj", "v_proj", "o_proj"]
-                       For MLP/experts: ["gate_proj", "up_proj", "down_proj"]
+        target_modules: List of module names to target. If None, falls back to
+                       the architecture default in DEFAULT_TARGET_MODULES (e.g.
+                       q_a_proj/q_b_proj/kv_a_proj_with_mqa/kv_b_proj/o_proj
+                       for DeepSeek-V3 / Kimi).
         moe_hybrid_shared_lora: If True, use hybrid sharing (lora_A shared for gate/up, lora_B shared for down)
 
     Returns:
@@ -846,11 +1188,17 @@ def inject_lora_into_model_with_moe(
         ... )
     """
     if target_modules is None:
-        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        target_modules = _get_default_target_modules(model)
 
-    # Separate attention modules from MLP/expert modules
-    attention_modules = [m for m in target_modules if m in ["q_proj", "k_proj", "v_proj", "o_proj", "lm_head"]]
-    expert_modules = [m for m in target_modules if m in ["gate_proj", "up_proj", "down_proj"]]
+    # Partition target_modules into expert MLP projections (handled by the
+    # group-GEMM MoE path) and dense linears (attention plus per-layer dense
+    # MLPs, handled by inject_lora_into_model). Anything that isn't an expert
+    # name is treated as a dense target so this function inherits new
+    # architectures (DeepSeek-V3 / Kimi MLA: q_a_proj, q_b_proj,
+    # kv_a_proj_with_mqa, kv_b_proj) from DEFAULT_TARGET_MODULES rather than
+    # silently dropping them via a Llama/Qwen-shaped allowlist.
+    expert_modules = [m for m in target_modules if m in ("gate_proj", "up_proj", "down_proj")]
+    attention_modules = [m for m in target_modules if m not in expert_modules]
 
     # Step 1: Inject LoRA into standard nn.Linear layers
     # This includes attention projections AND dense MLP layers (for layers without MoE)
@@ -890,6 +1238,7 @@ def get_moe_lora_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
         State dict containing MoE LoRA parameters
     """
     moe_lora_state_dict = {}
+    rank_slices = _active_lora_rank_slices(model)
 
     for name, module in model.named_modules():
         # Check if this is an MoE LoRA expert module (has lora_config attribute)
@@ -898,7 +1247,12 @@ def get_moe_lora_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
             for param_name, param in module.named_parameters():
                 if "lora_" in param_name:
                     full_key = f"{name}.{param_name}"
-                    moe_lora_state_dict[full_key] = param.detach().cpu()
+                    tensor = param.detach()
+                    rank_slice = rank_slices.get(full_key)
+                    if rank_slice is not None:
+                        rank_dim, active_rank = rank_slice
+                        tensor = _slice_lora_tensor_to_rank(tensor, rank_dim, active_rank)
+                    moe_lora_state_dict[full_key] = tensor.cpu()
 
     return moe_lora_state_dict
 

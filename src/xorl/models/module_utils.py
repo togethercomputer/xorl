@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import pickle
 import re
 import time
 from collections import OrderedDict, deque
@@ -16,16 +17,22 @@ from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from torch import distributed as dist
 from torch import nn
+from torch.distributed import ProcessGroup
 from torch.distributed._tensor import Shard as DTShard
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Replicate
 from tqdm import tqdm
+from transformers import PretrainedConfig, PreTrainedTokenizerBase
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGHTS_INDEX_NAME, WEIGHTS_NAME
 from transformers.utils.hub import cached_file, get_checkpoint_shard_files
 
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.lora.modules.linear import LoraLinear
 from xorl.models.checkpoint_handlers.buffers import (  # noqa: F401
+    FUSED_EXPERT_PATTERN,
     ExpertWeightBuffer,
     checkpoint_has_per_expert_weights,
+    parse_expert_full_key,
     parse_expert_key,
 )
 from xorl.ops.loss import get_loss_function
@@ -45,21 +52,15 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 
-_cpu_group = None
 _weight_load_group = None
-
-
-def _get_cpu_group():
-    """Get or create a Gloo process group for CPU-based broadcasts.
-
-    Using Gloo instead of the default NCCL backend avoids deadlocks when
-    broadcast_object_list is the first collective operation (NCCL lazy init
-    can hang if not all ranks are ready simultaneously).
-    """
-    global _cpu_group
-    if _cpu_group is None and dist.is_initialized():
-        _cpu_group = dist.new_group(backend="gloo")
-    return _cpu_group
+_grouped_weight_load_group = None
+_grouped_weight_load_group_ranks: Optional[Tuple[int, ...]] = None
+_grouped_dense_weight_load_group = None
+_grouped_dense_weight_load_group_ranks: Optional[Tuple[int, ...]] = None
+_save_sync_group = None
+_save_sync_group_backend: Optional[str] = None
+_cpu_save_device_mesh_cache: Dict[Tuple[str, Tuple[int, ...], Tuple[int, ...], Tuple[str, ...]], DeviceMesh] = {}
+_UNSUPPORTED_DTENSOR_ROOT_GATHER = object()
 
 
 def _get_weight_load_group():
@@ -76,24 +77,406 @@ def _get_weight_load_group():
     return _weight_load_group
 
 
-def _get_weight_load_object_device() -> Optional[torch.device]:
-    """Return the device to use for NCCL object broadcasts in the load path."""
-    group = _get_weight_load_group()
-    if group is None:
+def _get_object_broadcast_device(group) -> Optional[torch.device]:
+    """Return the device to use for object broadcasts on the given process group."""
+    if not dist.is_available() or not dist.is_initialized():
         return None
-    if dist.get_backend(group) == "nccl":
+
+    backend = dist.get_backend() if group is None else dist.get_backend(group)
+    if backend == "nccl":
         return torch.device(f"{get_device_type()}:{get_device_id()}")
     return None
+
+
+def _get_cpu_save_device_mesh(device_mesh: DeviceMesh) -> DeviceMesh:
+    """Mirror a DTensor device mesh onto CPU/Gloo for low-memory save gathers."""
+    mesh_tensor = device_mesh.mesh.detach().cpu().contiguous()
+    mesh_dim_names = tuple(device_mesh.mesh_dim_names or tuple(f"dim_{idx}" for idx in range(mesh_tensor.ndim)))
+    cache_key = (
+        device_mesh.device_type,
+        tuple(mesh_tensor.size()),
+        tuple(int(rank) for rank in mesh_tensor.reshape(-1).tolist()),
+        mesh_dim_names,
+    )
+    cached_mesh = _cpu_save_device_mesh_cache.get(cache_key)
+    if cached_mesh is None:
+        backend_override = tuple(("gloo", None) for _ in range(mesh_tensor.ndim))
+        cached_mesh = DeviceMesh(
+            device_type="cpu",
+            mesh=mesh_tensor,
+            mesh_dim_names=mesh_dim_names,
+            backend_override=backend_override,
+        )
+        _cpu_save_device_mesh_cache[cache_key] = cached_mesh
+    return cached_mesh
+
+
+def _get_mesh_group_ranks(device_mesh: DeviceMesh, mesh_dim: int) -> Tuple[int, ...]:
+    """Return global ranks in the current rank's mesh-dim subgroup."""
+    mesh_tensor = device_mesh.mesh.detach().cpu()
+    coord = device_mesh.get_coordinate()
+    if coord is None:
+        raise RuntimeError("Current rank is not part of the provided device mesh.")
+
+    index = []
+    for dim_idx, coord_idx in enumerate(coord):
+        index.append(slice(None) if dim_idx == mesh_dim else coord_idx)
+    group_ranks = mesh_tensor[tuple(index)].reshape(-1).tolist()
+    return tuple(int(rank) for rank in group_ranks)
+
+
+def _get_rank_coordinate(device_mesh: DeviceMesh, global_rank: int) -> Optional[Tuple[int, ...]]:
+    """Return the coordinate of a global rank in a device mesh."""
+    mesh_tensor = device_mesh.mesh.detach().cpu()
+    matches = (mesh_tensor == global_rank).nonzero(as_tuple=False)
+    if matches.numel() == 0:
+        return None
+    return tuple(int(coord) for coord in matches[0].tolist())
+
+
+def _get_mesh_group_root_rank(device_mesh: DeviceMesh, mesh_dim: int, target_index: int) -> int:
+    """Return the global rank in the current mesh-dim subgroup at ``target_index``."""
+    mesh_tensor = device_mesh.mesh.detach().cpu()
+    coord = device_mesh.get_coordinate()
+    if coord is None:
+        raise RuntimeError("Current rank is not part of the provided device mesh.")
+    index = list(coord)
+    index[mesh_dim] = target_index
+    return int(mesh_tensor[tuple(index)].item())
+
+
+def _gather_sharded_tensor_to_group_root(
+    local_tensor: "torch.Tensor",
+    *,
+    tensor_dim: int,
+    full_dim_size: int,
+    group,
+    group_ranks: Sequence[int],
+    dst_rank: int,
+) -> Optional["torch.Tensor"]:
+    """Gather shards from one mesh-dim subgroup to a single root rank."""
+    if not group_ranks:
+        return None
+
+    local_cpu = local_tensor.detach().cpu().contiguous()
+    if dst_rank not in group_ranks:
+        group_dst = 0
+        keep_result = False
+    else:
+        group_dst = group_ranks.index(dst_rank)
+        keep_result = dist.get_rank() == dst_rank
+
+    local_group_rank = group_ranks.index(dist.get_rank())
+    chunk_size = math.ceil(full_dim_size / len(group_ranks))
+    padded_shape = list(local_cpu.shape)
+    padded_shape[tensor_dim] = chunk_size
+    padded = local_cpu.new_zeros(padded_shape)
+    if local_cpu.shape[tensor_dim] > 0:
+        index = [slice(None)] * local_cpu.ndim
+        index[tensor_dim] = slice(0, local_cpu.shape[tensor_dim])
+        padded[tuple(index)] = local_cpu
+
+    gather_list = None
+    if local_group_rank == group_dst:
+        gather_list = [padded.new_empty(padded_shape) for _ in range(len(group_ranks))]
+
+    dist.gather(padded, gather_list=gather_list, group=group, group_dst=group_dst)
+
+    if local_group_rank != group_dst:
+        return None
+
+    shards = []
+    for shard_idx, gathered in enumerate(gather_list or []):
+        start = shard_idx * chunk_size
+        remaining = max(full_dim_size - start, 0)
+        take = min(chunk_size, remaining)
+        if take <= 0:
+            continue
+        if take != chunk_size:
+            gathered = gathered.narrow(tensor_dim, 0, take)
+        shards.append(gathered)
+
+    if not shards:
+        result = padded.new_empty(padded_shape)
+        result = result.narrow(tensor_dim, 0, 0)
+    elif len(shards) == 1:
+        result = shards[0]
+    else:
+        result = torch.cat(shards, dim=tensor_dim)
+
+    return result if keep_result else None
+
+
+def _gather_dtensor_to_rank(raw_tensor: DTensor, dst_rank: int) -> Union["torch.Tensor", None, object]:
+    """Gather a DTensor to one rank on CPU/Gloo when placements allow it."""
+    placements = tuple(raw_tensor.placements)
+    shard_mesh_dims = [mesh_dim for mesh_dim, placement in enumerate(placements) if isinstance(placement, DTShard)]
+    if len(shard_mesh_dims) == 0:
+        local_tensor = raw_tensor.to_local()
+        if hasattr(local_tensor, "wait"):
+            local_tensor = local_tensor.wait()
+        return local_tensor.detach().cpu() if dist.get_rank() == dst_rank else None
+
+    cpu_mesh = _get_cpu_save_device_mesh(raw_tensor.device_mesh)
+    dst_coord = _get_rank_coordinate(cpu_mesh, dst_rank)
+    if dst_coord is None:
+        return _UNSUPPORTED_DTENSOR_ROOT_GATHER
+
+    local_tensor = raw_tensor.to_local()
+    if hasattr(local_tensor, "wait"):
+        local_tensor = local_tensor.wait()
+    partial = local_tensor.detach().cpu().contiguous()
+    full_shape = tuple(raw_tensor.size())
+
+    for shard_mesh_dim in reversed(shard_mesh_dims):
+        placement = placements[shard_mesh_dim]
+        if not isinstance(placement, DTShard):
+            return _UNSUPPORTED_DTENSOR_ROOT_GATHER
+        group = cpu_mesh.get_group(shard_mesh_dim if cpu_mesh.ndim > 1 else None)
+        group_ranks = _get_mesh_group_ranks(cpu_mesh, shard_mesh_dim if cpu_mesh.ndim > 1 else 0)
+        if not group_ranks:
+            return _UNSUPPORTED_DTENSOR_ROOT_GATHER
+
+        if len(shard_mesh_dims) == 1:
+            stage_dst_rank = dst_rank
+        else:
+            stage_dst_rank = _get_mesh_group_root_rank(cpu_mesh, shard_mesh_dim, dst_coord[shard_mesh_dim])
+
+        partial = _gather_sharded_tensor_to_group_root(
+            partial,
+            tensor_dim=placement.dim,
+            full_dim_size=full_shape[placement.dim],
+            group=group,
+            group_ranks=group_ranks,
+            dst_rank=stage_dst_rank,
+        )
+
+        coord = cpu_mesh.get_coordinate()
+        if coord is None:
+            return _UNSUPPORTED_DTENSOR_ROOT_GATHER
+        if coord[shard_mesh_dim] != dst_coord[shard_mesh_dim]:
+            return None
+        if partial is None:
+            return None
+
+    return partial if dist.get_rank() == dst_rank else None
+
+
+def _materialize_tensor_for_save(
+    tensor: "torch.Tensor",
+    dst_rank: Optional[int] = None,
+) -> Optional["torch.Tensor"]:
+    """Materialize a parameter/buffer for save without gathering full DTensors on CUDA."""
+    raw_tensor = tensor.data if hasattr(tensor, "data") else tensor
+    if isinstance(raw_tensor, DTensor):
+        if dst_rank is not None:
+            gathered = _gather_dtensor_to_rank(raw_tensor, dst_rank)
+            if gathered is not _UNSUPPORTED_DTENSOR_ROOT_GATHER:
+                return gathered
+            logger.warning_once(
+                "Falling back to replicated DTensor save materialization for unsupported placements: "
+                f"{raw_tensor.placements}"
+            )
+
+        local_tensor = raw_tensor.to_local()
+        if hasattr(local_tensor, "wait"):
+            local_tensor = local_tensor.wait()
+        local_cpu = local_tensor.detach().cpu()
+        cpu_mesh = _get_cpu_save_device_mesh(raw_tensor.device_mesh)
+        cpu_dtensor = DTensor.from_local(
+            local_cpu,
+            device_mesh=cpu_mesh,
+            placements=raw_tensor.placements,
+            run_check=False,
+            shape=raw_tensor.size(),
+            stride=raw_tensor.stride(),
+        )
+        replicated = cpu_dtensor.redistribute(
+            device_mesh=cpu_mesh,
+            placements=[Replicate() for _ in cpu_dtensor.placements],
+        ).to_local()
+        if hasattr(replicated, "wait"):
+            replicated = replicated.wait()
+        return replicated
+
+    if dst_rank is not None and dist.is_available() and dist.is_initialized() and dist.get_rank() != dst_rank:
+        return None
+
+    if hasattr(raw_tensor, "full_tensor"):
+        return raw_tensor.full_tensor()
+
+    return raw_tensor
 
 
 def _broadcast_object_list_weight_load(obj_list: List[Any], src: int) -> None:
     """Broadcast Python metadata for weight loading on the dedicated load group."""
     group = _get_weight_load_group()
-    device = _get_weight_load_object_device()
-    kwargs = {"src": src, "group": group}
-    if device is not None:
-        kwargs["device"] = device
-    dist.broadcast_object_list(obj_list, **kwargs)
+    _broadcast_object_list(obj_list, src=src, group=group)
+
+
+def _broadcast_object_list(obj_list: List[Any], src: int, group) -> None:
+    """Broadcast Python metadata on the provided process group."""
+    device = _get_object_broadcast_device(group)
+    if device is None:
+        dist.broadcast_object_list(obj_list, src=src, group=group)
+        return
+
+    is_source = dist.get_rank() == src
+    payload = pickle.dumps(obj_list, protocol=pickle.HIGHEST_PROTOCOL) if is_source else b""
+    size_tensor = torch.tensor([len(payload)], dtype=torch.int64, device=device)
+    dist.broadcast(size_tensor, src=src, group=group)
+
+    if is_source:
+        payload_tensor = torch.tensor(list(payload), dtype=torch.uint8, device=device)
+    else:
+        payload_tensor = torch.empty(int(size_tensor.item()), dtype=torch.uint8, device=device)
+
+    dist.broadcast(payload_tensor, src=src, group=group)
+
+    if not is_source:
+        obj_list[:] = pickle.loads(bytes(payload_tensor.cpu().tolist()))
+
+
+def _normalize_checkpoint_key_for_filter(key: str) -> Optional[str]:
+    """Normalize raw checkpoint keys for lightweight load-time filtering."""
+    if key.startswith("vision_tower.") or key.startswith("mm_projector."):
+        return None
+    if key.startswith("model.language_model."):
+        return "model." + key.removeprefix("model.language_model.")
+    if key.startswith("language_model."):
+        return key.removeprefix("language_model.")
+    return key
+
+
+def _matches_checkpoint_skip_key_pattern(key: str, model: object) -> bool:
+    """Return True when a raw or converted checkpoint key is model-declared skip state."""
+    for pattern in getattr(model, "_checkpoint_skip_key_patterns", ()):
+        if re.match(pattern, key):
+            return True
+    return False
+
+
+_FUSED_EXPERT_CHECKPOINT_PATTERN = re.compile(r"^model\.layers\.\d+\.mlp\.experts\.(gate_up|down)_proj(?:\..+)?$")
+_FFN_EXPERT_CHECKPOINT_PATTERN = re.compile(r"^(?:model\.)?layers\.\d+\.ffn\.experts\.\d+\.w[123]\.(?:weight|scale)$")
+
+
+def _is_checkpoint_expert_key(key: str) -> bool:
+    """Return True when a raw checkpoint key belongs to MoE expert weights."""
+    normalized = _normalize_checkpoint_key_for_filter(key)
+    if normalized is None:
+        return False
+    return (
+        parse_expert_full_key(normalized) is not None
+        or FUSED_EXPERT_PATTERN.match(normalized) is not None
+        or _FUSED_EXPERT_CHECKPOINT_PATTERN.match(normalized) is not None
+        or _FFN_EXPERT_CHECKPOINT_PATTERN.match(normalized) is not None
+    )
+
+
+def _is_expert_parameter_name(parameter_name: str, parallel_plan: Optional["ParallelPlan"]) -> bool:
+    """Return True when a model parameter is EP-sharded expert state."""
+    if parallel_plan is not None:
+        is_expert = getattr(parallel_plan, "is_expert_parameter", None)
+        if callable(is_expert):
+            return bool(is_expert(parameter_name))
+        private_is_expert = getattr(parallel_plan, "_is_expert_parameter", None)
+        if callable(private_is_expert):
+            return bool(private_is_expert(parameter_name))
+    return FUSED_EXPERT_PATTERN.match(parameter_name) is not None
+
+
+def _get_grouped_weight_load_group(parallel_state) -> Optional[ProcessGroup]:
+    """Return the subgroup used by grouped weight loading.
+
+    Grouped loading is only meaningful when EP is enabled: one leader per
+    ``ep_fsdp`` group reads and fan-outs tensors to the ranks that share that
+    expert shard. This keeps expert weights correct without forcing a global
+    rank-0 to materialize every expert tensor. Use a dedicated process group
+    with the weight-load timeout so long checkpoint reads do not inherit the
+    shorter default timeout from the DeviceMesh subgroup.
+    """
+    global _grouped_weight_load_group, _grouped_weight_load_group_ranks
+    if _grouped_weight_load_group is not None:
+        return _grouped_weight_load_group
+    if (
+        parallel_state is None
+        or not getattr(parallel_state, "ep_enabled", False)
+        or getattr(parallel_state, "ep_fsdp_device_mesh", None) is None
+    ):
+        return None
+
+    if not dist.is_available() or not dist.is_initialized():
+        return None
+
+    mesh_tensor = parallel_state.ep_fsdp_device_mesh.mesh.detach().cpu().contiguous()
+    if mesh_tensor.ndim == 0:
+        return None
+
+    timeout_sec = int(os.getenv("XORL_WEIGHT_LOAD_TIMEOUT_SEC", "7200"))
+    backend = dist.get_backend()
+    rank = dist.get_rank()
+    created_group = None
+    created_ranks = None
+    for group_ranks_tensor in mesh_tensor.view(-1, mesh_tensor.size(-1)):
+        ranks = tuple(int(member_rank) for member_rank in group_ranks_tensor.tolist())
+        group = dist.new_group(ranks=list(ranks), backend=backend, timeout=timedelta(seconds=timeout_sec))
+        if rank in ranks:
+            created_group = group
+            created_ranks = ranks
+
+    _grouped_weight_load_group = created_group
+    _grouped_weight_load_group_ranks = created_ranks
+    return _grouped_weight_load_group
+
+
+def _get_grouped_weight_load_prefetch_count(shard_count: int) -> int:
+    """Prefetch depth for grouped loading.
+
+    We intentionally keep this small. Grouped loading already reduces reader
+    fan-out, so large per-rank prefetch would just recreate the WekaFS stampede
+    that motivated this mode.
+    """
+    configured = int(os.getenv("XORL_GROUPED_WEIGHT_LOAD_PREFETCH_COUNT", "2"))
+    return max(1, min(configured, shard_count))
+
+
+def _get_grouped_dense_weight_load_group():
+    """Return the per-node process group used for grouped dense/shared replication.
+
+    Grouped loading already uses EP-FSDP subgroups for expert tensors. Dense and
+    shared weights should not use an all-world metadata broadcast, but loading
+    them on every rank still creates avoidable checkpoint I/O. We instead create
+    one node-local group per host and broadcast dense/shared tensors inside that
+    group so each shard is read once per node rather than once per rank.
+    """
+    global _grouped_dense_weight_load_group, _grouped_dense_weight_load_group_ranks
+    if _grouped_dense_weight_load_group is not None:
+        return _grouped_dense_weight_load_group
+
+    if not dist.is_available() or not dist.is_initialized():
+        return None
+
+    world_size = dist.get_world_size()
+    local_world_size = max(1, int(os.environ.get("LOCAL_WORLD_SIZE", "1")))
+    if world_size <= 1 or local_world_size <= 1:
+        _grouped_dense_weight_load_group_ranks = (dist.get_rank(),)
+        return None
+
+    timeout_sec = int(os.getenv("XORL_WEIGHT_LOAD_TIMEOUT_SEC", "7200"))
+    rank = dist.get_rank()
+    created_group = None
+    created_ranks = None
+    backend = dist.get_backend()
+    for start_rank in range(0, world_size, local_world_size):
+        ranks = tuple(range(start_rank, min(start_rank + local_world_size, world_size)))
+        group = dist.new_group(ranks=list(ranks), backend=backend, timeout=timedelta(seconds=timeout_sec))
+        if rank in ranks:
+            created_group = group
+            created_ranks = ranks
+
+    _grouped_dense_weight_load_group = created_group
+    _grouped_dense_weight_load_group_ranks = created_ranks
+    return _grouped_dense_weight_load_group
 
 
 def _get_checkpoint_keys(weights_path: str) -> Optional[Set[str]]:
@@ -358,6 +741,11 @@ def _try_load_state_dict(weights_path: str, **kwargs):
         # Single rank: do everything locally (no broadcast needed)
         return _try_load_state_dict_local(weights_path, **kwargs)
 
+    if os.path.isdir(weights_path):
+        # Shared local snapshots are cheap to resolve independently and avoid
+        # another cross-rank metadata broadcast before tensor loading starts.
+        return _try_load_state_dict_local(weights_path, **kwargs)
+
     # Multi-rank: rank 0 resolves paths, broadcasts to all
     resolved_paths = [None]
     if rank == 0:
@@ -505,6 +893,26 @@ def _build_expert_scatter_list(
     return full_tensor, scatter_list
 
 
+def _build_group_scatter_list(
+    tensor: "torch.Tensor",
+    target_shape: Tuple[int, ...],
+    group_size: int,
+    torch_device: "torch.device",
+) -> Tuple["torch.Tensor", List["torch.Tensor"]]:
+    """Prepare source-side per-rank views for subgroup scatter."""
+    if tensor.device.type == "cpu" and torch_device.type == "cuda":
+        full_tensor = tensor.pin_memory().to(torch_device, non_blocking=True)
+    else:
+        full_tensor = tensor.to(torch_device, non_blocking=True)
+
+    local_rows = target_shape[0]
+    scatter_list: List[torch.Tensor] = [None] * group_size
+    for group_rank in range(group_size):
+        scatter_list[group_rank] = full_tensor.narrow(0, group_rank * local_rows, local_rows)
+
+    return full_tensor, scatter_list
+
+
 class _MultiStreamDMA:
     """Manages multi-stream H2D DMA transfers for overlapping copy engine usage.
 
@@ -578,6 +986,66 @@ class _MultiStreamDMA:
 _active_dma_scheduler: Optional[_MultiStreamDMA] = None
 
 
+def _copy_into_existing_dtensor_shard(dtensor: "torch.Tensor", tensor: "torch.Tensor") -> bool:
+    """Copy a full tensor directly into a 1D DTensor's local shard.
+
+    When the caller already holds the full parameter value on every rank
+    (broadcast/grouped load modes), rebuilding a DTensor via ``distribute_tensor``
+    adds extra padding logic and collectives that are not needed. This helper
+    handles the common 1D-mesh cases directly:
+
+    - replicated DTensors: copy the full tensor into ``_local_tensor``
+    - singly sharded DTensors: split the full tensor locally and copy the
+      current rank's shard into ``_local_tensor``
+    """
+    if not hasattr(dtensor, "_local_tensor"):
+        return False
+
+    device_mesh = getattr(dtensor, "device_mesh", None)
+    placements = getattr(dtensor, "placements", None)
+    if device_mesh is None or placements is None:
+        return False
+    if getattr(device_mesh, "ndim", None) != 1:
+        return False
+
+    shard_placements = [placement for placement in placements if isinstance(placement, DTShard)]
+    if len(shard_placements) > 1:
+        return False
+
+    local_tensor = dtensor._local_tensor
+    if len(shard_placements) == 0:
+        if tuple(local_tensor.shape) != tuple(tensor.shape):
+            return False
+        local_tensor.copy_(tensor.to(device=local_tensor.device, dtype=local_tensor.dtype))
+        return True
+
+    shard = shard_placements[0]
+    mesh_size = device_mesh.size()
+    local_rank = device_mesh.get_local_rank()
+    shards, _ = shard._split_tensor(tensor, mesh_size, with_padding=True, contiguous=True)
+    local_shard = shards[local_rank]
+    expected_shape = tuple(local_tensor.shape)
+    if tuple(local_shard.shape) != expected_shape:
+        if local_shard.ndim != local_tensor.ndim:
+            return False
+        can_trim = True
+        for dim, (actual, expected) in enumerate(zip(local_shard.shape, expected_shape)):
+            if dim == shard.dim:
+                if expected > actual:
+                    can_trim = False
+                    break
+            elif expected != actual:
+                can_trim = False
+                break
+        if not can_trim:
+            return False
+        local_shard = local_shard.narrow(shard.dim, 0, expected_shape[shard.dim])
+
+    local_shard = local_shard.to(device=local_tensor.device, dtype=local_tensor.dtype)
+    local_tensor.copy_(local_shard)
+    return True
+
+
 def _dispatch_parameter(
     module: "nn.Module",
     name: str,
@@ -627,6 +1095,8 @@ def _dispatch_parameter(
     if hasattr(orig_tensor, "device_mesh"):  # dtensor
         device_mesh = getattr(orig_tensor, "device_mesh")
         placements = getattr(orig_tensor, "placements")
+        if _copy_into_existing_dtensor_shard(orig_tensor, tensor):
+            return
         if is_cuda_to_cuda:
             # Diagnostic: log expert stacked tensor dispatch (CUDA→CUDA DTensor path)
             logger.debug(
@@ -844,12 +1314,23 @@ def all_ranks_load_weights(
 
     # Get checkpoint handler from model (delegates weight transforms to model-specific logic)
     # Pass the model's device so MoE expert stacking can happen on GPU (13x faster).
-    model_device = next(model.parameters()).device if any(True for _ in model.parameters()) else None
+    model_device = None
+    if hasattr(model, "parameters"):
+        try:
+            model_device = next(model.parameters()).device
+        except StopIteration:
+            model_device = None
     handler = None
     if hasattr(model, "get_checkpoint_handler"):
         ep_rank = _ps.ep_rank if _ps.ep_enabled else 0
         ep_size = _ps.ep_size if _ps.ep_enabled else 1
         checkpoint_keys = _get_checkpoint_keys(weights_path)
+        model_dtype = None
+        if hasattr(model, "parameters"):
+            try:
+                model_dtype = next(model.parameters()).dtype
+            except StopIteration:
+                model_dtype = None
         handler = model.get_checkpoint_handler(
             checkpoint_keys=checkpoint_keys or set(),
             ep_rank=ep_rank,
@@ -857,6 +1338,7 @@ def all_ranks_load_weights(
             is_broadcast=False,
             weights_path=weights_path,
             device=model_device,
+            dtype=model_dtype,
         )
 
     # Retry loading state dict on OSError (e.g., HuggingFace download issues)
@@ -1070,19 +1552,26 @@ def rank0_load_and_broadcast_weights(
     _ps = get_parallel_state()
     global_rank = _ps.global_rank
     torch_device = torch.device(init_device)
-
     # Get checkpoint handler from model.
     # For the broadcast path, is_broadcast=True tells the handler that rank 0 buffers
     # ALL experts (ep_size=1). EP slicing is handled later by ParallelPlan.shard_tensor().
     handler = None
     if hasattr(model, "get_checkpoint_handler"):
         checkpoint_keys = _get_checkpoint_keys(weights_path)
+        model_dtype = None
+        if hasattr(model, "parameters"):
+            try:
+                model_dtype = next(model.parameters()).dtype
+            except StopIteration:
+                model_dtype = None
         handler = model.get_checkpoint_handler(
             checkpoint_keys=checkpoint_keys or set(),
             ep_rank=0,
             ep_size=1,
             is_broadcast=True,
             weights_path=weights_path,
+            device=torch_device,
+            dtype=model_dtype,
         )
     skip_key_fn = handler.get_skip_key_fn() if handler is not None else None
 
@@ -1297,6 +1786,403 @@ def rank0_load_and_broadcast_weights(
     post_process_after_weight_loading(model, buffer_dict, parameter_names_to_load, dtensor_factory)
 
 
+@torch.no_grad()
+def grouped_load_weights(
+    model: Union["nn.Module", "PreTrainedModel"],
+    weights_path: str,
+    init_device: Literal["cpu", "cuda", "npu"] = "cuda",
+    dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
+):
+    """Load weights with a hybrid dense/expert grouped strategy.
+
+    Dense/shared tensors are loaded once per node and broadcast inside a
+    node-local load group. Expert tensors are loaded once per ``ep_fsdp`` group
+    leader and fanned out only to the ranks that share that expert shard.
+    """
+    if not dist.is_available() or not dist.is_initialized():
+        logger.warning_once("Distributed environment not initialized, falling back to all_ranks_load_weights.")
+        return all_ranks_load_weights(model, weights_path, init_device, dtensor_factory)
+
+    _ps = get_parallel_state()
+    fanout_group = _get_grouped_weight_load_group(_ps)
+    if fanout_group is None:
+        logger.info_rank0("Grouped weight loading requires EP/FSDP groups; using rank-0 load fallback.")
+        return rank0_load_and_broadcast_weights(model, weights_path, init_device, dtensor_factory)
+
+    buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
+    parameter_names_to_load = {name for name, _ in model.named_parameters()}
+
+    _compiled_key_map = _build_compiled_key_map(parameter_names_to_load, buffer_dict)
+
+    _shrink_expert_params_for_ep(model)
+    model.to_empty(device=init_device)
+
+    parallel_plan = None
+    if hasattr(model, "get_parallel_plan"):
+        parallel_plan = model.get_parallel_plan()
+
+    fanout_ranks = dist.get_process_group_ranks(fanout_group)
+    fanout_src = fanout_ranks[0]
+    dense_group = _get_grouped_dense_weight_load_group()
+    if dense_group is None:
+        dense_ranks = [_ps.global_rank]
+    else:
+        dense_ranks = dist.get_process_group_ranks(dense_group)
+    dense_src = dense_ranks[0]
+    global_rank = _ps.global_rank
+    is_group_leader = global_rank == fanout_src
+    is_dense_leader = global_rank == dense_src
+    torch_device = torch.device(init_device)
+    model_device = None
+    model_dtype = None
+    if hasattr(model, "parameters"):
+        try:
+            first_param = next(model.parameters())
+            model_device = first_param.device
+            model_dtype = first_param.dtype
+        except StopIteration:
+            model_device = None
+            model_dtype = None
+    checkpoint_keys = _get_checkpoint_keys(weights_path) if hasattr(model, "get_checkpoint_handler") else None
+    dense_handler = None
+    expert_handler = None
+    if hasattr(model, "get_checkpoint_handler"):
+        dense_handler = model.get_checkpoint_handler(
+            checkpoint_keys=checkpoint_keys or set(),
+            ep_rank=0,
+            ep_size=1,
+            is_broadcast=False,
+            weights_path=weights_path,
+            device=model_device,
+            dtype=model_dtype,
+        )
+    if hasattr(model, "get_checkpoint_handler") and is_group_leader:
+        ep_rank = _ps.ep_rank if _ps.ep_enabled else 0
+        ep_size = _ps.ep_size if _ps.ep_enabled else 1
+        expert_handler = model.get_checkpoint_handler(
+            checkpoint_keys=checkpoint_keys or set(),
+            ep_rank=ep_rank,
+            ep_size=ep_size,
+            is_broadcast=False,
+            weights_path=weights_path,
+            device=model_device,
+            dtype=model_dtype,
+        )
+    dense_skip_key_fn = dense_handler.get_skip_key_fn() if dense_handler is not None else None
+    expert_skip_key_fn = expert_handler.get_skip_key_fn() if expert_handler is not None else None
+
+    if _ps.pp_enabled:
+        local_expected = parameter_names_to_load | set(buffer_dict.keys())
+        all_expected = [None] * dist.get_world_size()
+        dist.all_gather_object(all_expected, local_expected)
+        global_expected_keys = set().union(*all_expected)
+    else:
+        global_expected_keys = None
+
+    dense_state_dict_iterators = _load_state_dict(weights_path)
+    expert_state_dict_iterators = _load_state_dict(weights_path)
+    shard_count = len(dense_state_dict_iterators)
+    leader_count = dist.get_world_size() // len(fanout_ranks)
+    dense_leader_count = dist.get_world_size() // len(dense_ranks)
+    logger.info_rank0(
+        "grouped_load_weights: "
+        f"{shard_count=} "
+        f"dense_group_size={len(dense_ranks)} dense_leader_count={dense_leader_count} "
+        f"fanout_group_size={len(fanout_ranks)} leader_count={leader_count}"
+    )
+    prefetch_count = _get_grouped_weight_load_prefetch_count(shard_count)
+
+    _expected_skip_keys = set()
+    _expected_skip_prefixes = set()
+    for fqn, mod in model.named_modules():
+        if getattr(mod, "_qlora_expected_skip_keys", None):
+            for suffix in mod._qlora_expected_skip_keys:
+                key = f"{fqn}.{suffix}" if fqn else suffix
+                _expected_skip_keys.add(key)
+                _expected_skip_prefixes.add(key)
+
+    parameter_names_to_load -= _expected_skip_keys
+
+    def _should_skip_qlora_expert_key(key: str, prefixes: set) -> bool:
+        for prefix in prefixes:
+            parts = prefix.rsplit(".", 1)
+            if len(parts) != 2:
+                continue
+            base, proj = parts
+            if key.startswith(base + ".") and f".{proj}." in key:
+                return True
+        return False
+
+    def _dispatch_loaded_tensor(param_name: str, param_tensor: torch.Tensor, *, expect_expert: bool) -> None:
+        model_name = _compiled_key_map.get(param_name, param_name)
+        is_expert = _is_expert_parameter_name(model_name, parallel_plan)
+        if expect_expert != is_expert:
+            raise RuntimeError(
+                f"Grouped weight loading misrouted {'expert' if expect_expert else 'dense'} tensor "
+                f"{param_name} -> {model_name}"
+            )
+
+        if param_name in _expected_skip_keys or model_name in _expected_skip_keys:
+            return
+        if _expected_skip_prefixes and _should_skip_qlora_expert_key(model_name, _expected_skip_prefixes):
+            return
+        if model_name in buffer_dict:
+            buffer_dict[model_name] = param_tensor.clone()
+            return
+        if model_name in parameter_names_to_load:
+            parameter_names_to_load.discard(model_name)
+            _dispatch_parameter(model, model_name, param_tensor, dtensor_factory, parallel_plan)
+            return
+        if global_expected_keys is None or param_name not in global_expected_keys:
+            logger.warning_rank0(f"Unexpected key in state dict: {param_name}.")
+
+    def _broadcast_queue_and_dispatch(
+        queue: List[Tuple[str, torch.Tensor]],
+        *,
+        group,
+        object_group=None,
+        src: int,
+        is_source: bool,
+        expect_expert: bool,
+        scatter_group_size: int = 1,
+    ) -> None:
+        # group=None here means "no replication group" — every rank loads
+        # locally and is its own source. Routing through the size-1 fast path
+        # below avoids issuing collectives on the default world group with
+        # disagreeing src.
+        if group is None:
+            group_size = 1
+        else:
+            try:
+                group_size = dist.get_world_size(group)
+            except TypeError:
+                if hasattr(dist, "get_process_group_ranks"):
+                    group_size = len(dist.get_process_group_ranks(group))
+                else:
+                    group_size = dist.get_world_size()
+        if group_size == 1:
+            local_batch = []
+            if is_source:
+                for name, tensor in queue:
+                    transfer_mode = "broadcast"
+                    target_shape = tensor.shape
+                    if expect_expert and scatter_group_size > 1:
+                        model_name = _compiled_key_map.get(name, name)
+                        if model_name in parameter_names_to_load:
+                            maybe_target_shape = _get_expert_scatter_target_shape(
+                                model, model_name, tensor, parallel_plan, _ps
+                            )
+                            if maybe_target_shape is not None:
+                                target_shape = torch.Size(maybe_target_shape)
+                                transfer_mode = "expert_scatter"
+                    local_batch.append((name, torch.Size(target_shape), tensor.dtype, transfer_mode))
+
+            for name, shape, dtype, transfer_mode in local_batch:
+                _, source_tensor = queue.pop(0)
+                if source_tensor.device.type == "cpu" and torch_device.type == "cuda":
+                    tensor = source_tensor.pin_memory().to(torch_device, non_blocking=True)
+                else:
+                    tensor = source_tensor.to(torch_device, non_blocking=True)
+                _dispatch_loaded_tensor(name, tensor, expect_expert=expect_expert)
+                del tensor
+                del source_tensor
+            return
+
+        if is_source:
+            batch_meta = []
+            for name, tensor in queue:
+                transfer_mode = "broadcast"
+                target_shape = tensor.shape
+                if expect_expert and scatter_group_size > 1:
+                    model_name = _compiled_key_map.get(name, name)
+                    if model_name in parameter_names_to_load:
+                        maybe_target_shape = _get_expert_scatter_target_shape(
+                            model, model_name, tensor, parallel_plan, _ps
+                        )
+                        if maybe_target_shape is not None:
+                            target_shape = torch.Size(maybe_target_shape)
+                            transfer_mode = "expert_scatter"
+                batch_meta.append((name, torch.Size(target_shape), tensor.dtype, transfer_mode))
+        else:
+            batch_meta = None
+
+        batch_meta = [batch_meta]
+        _broadcast_object_list(batch_meta, src=src, group=object_group if object_group is not None else group)
+        batch_meta = batch_meta[0]
+
+        for name, shape, dtype, transfer_mode in batch_meta:
+            if is_source:
+                _, source_tensor = queue.pop(0)
+                if transfer_mode == "expert_scatter":
+                    full_tensor, scatter_list = _build_group_scatter_list(
+                        source_tensor,
+                        tuple(shape),
+                        scatter_group_size,
+                        torch_device,
+                    )
+                    tensor = scatter_list[0].clone()
+                else:
+                    if source_tensor.device.type == "cpu" and torch_device.type == "cuda":
+                        tensor = source_tensor.pin_memory().to(torch_device, non_blocking=True)
+                    else:
+                        tensor = source_tensor.to(torch_device, non_blocking=True)
+                    full_tensor = None
+                    scatter_list = None
+            else:
+                tensor = torch.empty(shape, dtype=dtype, device=torch_device)
+                source_tensor = None
+                full_tensor = None
+                scatter_list = None
+
+            if transfer_mode == "expert_scatter":
+                dist.scatter(tensor, scatter_list=scatter_list, src=src, group=group)
+            else:
+                dist.broadcast(tensor, src=src, group=group)
+            _dispatch_loaded_tensor(name, tensor, expect_expert=expect_expert)
+
+            del tensor
+            if is_source:
+                del source_tensor
+                if full_tensor is not None:
+                    del full_tensor
+                if scatter_list is not None:
+                    del scatter_list
+
+    def _normalize_grouped_checkpoint_key(key: str) -> Optional[str]:
+        if _matches_checkpoint_skip_key_pattern(key, model):
+            return None
+        converted_key = _convert_weight_key(key, model)
+        if converted_key != key and _matches_checkpoint_skip_key_pattern(converted_key, model):
+            return None
+        return _normalize_checkpoint_key_for_filter(converted_key)
+
+    def _should_skip_dense_key(key: str) -> bool:
+        normalized = _normalize_grouped_checkpoint_key(key)
+        if normalized is None or _is_checkpoint_expert_key(normalized):
+            return True
+        if dense_skip_key_fn is not None:
+            return dense_skip_key_fn(normalized)
+        return False
+
+    def _should_skip_grouped_expert_key(key: str) -> bool:
+        normalized = _normalize_grouped_checkpoint_key(key)
+        if normalized is None or not _is_checkpoint_expert_key(normalized):
+            return True
+        if expert_skip_key_fn is not None:
+            return expert_skip_key_fn(normalized)
+        return False
+
+    logger.info_rank0(
+        f"Grouped loading enabled: dense/shared tensors use dense_group_size={len(dense_ranks)} dense_src={dense_src}"
+    )
+    dense_prefetched = None
+    if is_dense_leader:
+        dense_prefetched = _prefetch_shards_filtered(
+            dense_state_dict_iterators,
+            _should_skip_dense_key,
+            prefetch_count=1,
+        )
+
+    expert_prefetched = None
+    if is_group_leader:
+        logger.info_rank0(
+            f"Grouped loading enabled: expert tensors use fanout_group_size={len(fanout_ranks)} "
+            f"ep_rank={_ps.ep_rank} ep_size={_ps.ep_size} prefetch_count={prefetch_count}"
+        )
+        expert_prefetched = _prefetch_shards_filtered(
+            expert_state_dict_iterators,
+            _should_skip_grouped_expert_key,
+            prefetch_count=prefetch_count,
+        )
+
+    shard_range = (
+        tqdm(
+            range(shard_count),
+            desc="Loading checkpoint shards",
+            disable=global_rank != 0 or int(os.getenv("LOCAL_RANK", "-1")) > 0,
+        )
+        if global_rank == 0
+        else range(shard_count)
+    )
+
+    dense_queue: List[Tuple[str, torch.Tensor]] = []
+    expert_queue: List[Tuple[str, torch.Tensor]] = []
+
+    for _ in shard_range:
+        if is_dense_leader:
+            state_dict, _skipped = next(dense_prefetched)
+            for key, tensor in state_dict.items():
+                key = _convert_weight_key(key, model)
+                results = dense_handler.on_load_weight(key, tensor) if dense_handler is not None else [(key, tensor)]
+                for result_name, result_tensor in results:
+                    dense_queue.append((result_name, result_tensor))
+            del state_dict
+        _broadcast_queue_and_dispatch(
+            dense_queue,
+            group=dense_group,
+            src=dense_src,
+            is_source=is_dense_leader,
+            expect_expert=False,
+        )
+
+        if is_group_leader:
+            state_dict, skipped_keys = next(expert_prefetched)
+            for skipped_key in skipped_keys:
+                normalized = _normalize_grouped_checkpoint_key(skipped_key)
+                if normalized is None or not _is_checkpoint_expert_key(normalized):
+                    continue
+                if expert_skip_key_fn is not None and expert_skip_key_fn(normalized):
+                    expert_queue.extend(expert_handler.on_skip_weight(normalized))
+            for key, tensor in state_dict.items():
+                key = _convert_weight_key(key, model)
+                results = expert_handler.on_load_weight(key, tensor) if expert_handler is not None else [(key, tensor)]
+                for result_name, result_tensor in results:
+                    expert_queue.append((result_name, result_tensor))
+            del state_dict
+
+        _broadcast_queue_and_dispatch(
+            expert_queue,
+            group=fanout_group,
+            src=fanout_src,
+            is_source=is_group_leader,
+            expect_expert=True,
+            scatter_group_size=len(fanout_ranks),
+        )
+
+        empty_cache()
+
+    if dense_handler is not None:
+        if is_dense_leader:
+            dense_queue.extend(dense_handler.on_load_complete())
+        _broadcast_queue_and_dispatch(
+            dense_queue,
+            group=dense_group,
+            src=dense_src,
+            is_source=is_dense_leader,
+            expect_expert=False,
+        )
+
+    if expert_handler is not None and is_group_leader:
+        expert_queue.extend(expert_handler.on_load_complete())
+    _broadcast_queue_and_dispatch(
+        expert_queue,
+        group=fanout_group,
+        src=fanout_src,
+        is_source=is_group_leader,
+        expect_expert=True,
+        scatter_group_size=len(fanout_ranks),
+    )
+
+    post_process_after_weight_loading(
+        model,
+        buffer_dict,
+        parameter_names_to_load,
+        dtensor_factory,
+        qlora_skip_prefixes=_expected_skip_prefixes,
+        qlora_skip_fn=_should_skip_qlora_expert_key,
+    )
+
+
 def post_process_after_weight_loading(
     model: Union["nn.Module", "PreTrainedModel"],
     buffer_dict,
@@ -1420,6 +2306,104 @@ def _save_state_dict(
         torch.save(state_dict, path_to_save)
 
 
+def _distributed_barrier_on_current_device() -> None:
+    if not dist.is_available() or not dist.is_initialized():
+        return
+
+    barrier_kwargs = {}
+    if dist.get_backend() == "nccl":
+        barrier_kwargs["device_ids"] = [get_device_id()]
+    dist.barrier(**barrier_kwargs)
+
+
+def _get_save_sync_group():
+    """Get or create a dedicated process group for checkpoint-save coordination."""
+    global _save_sync_group, _save_sync_group_backend
+    if not dist.is_initialized():
+        return None
+
+    backend = os.getenv("XORL_SAVE_SYNC_BACKEND", "filesystem").strip().lower()
+    if backend in {"", "default", "filesystem", dist.get_backend()}:
+        return None
+
+    if _save_sync_group is None or _save_sync_group_backend != backend:
+        timeout_sec = int(os.getenv("XORL_SAVE_SYNC_TIMEOUT_SEC", "7200"))
+        _save_sync_group = dist.new_group(backend=backend, timeout=timedelta(seconds=timeout_sec))
+        _save_sync_group_backend = backend
+    return _save_sync_group
+
+
+def _filesystem_save_barrier(output_dir: Union[str, "os.PathLike"], barrier_name: str) -> None:
+    timeout_sec = int(os.getenv("XORL_SAVE_SYNC_TIMEOUT_SEC", "7200"))
+    poll_sec = float(os.getenv("XORL_SAVE_SYNC_POLL_SEC", "1.0"))
+    run_id_raw = (
+        os.getenv("TORCHELASTIC_RUN_ID")
+        or os.getenv("XORL_SAVE_SYNC_ID")
+        or f"{os.getenv('MASTER_ADDR', 'local')}_{os.getenv('MASTER_PORT', '0')}"
+    )
+    run_id = re.sub(r"[^A-Za-z0-9_.-]", "_", run_id_raw)
+    barrier_root = os.path.join(output_dir, ".xorl_save_barriers", run_id)
+    os.makedirs(barrier_root, exist_ok=True)
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    arrival_marker = os.path.join(barrier_root, f"{barrier_name}.rank{rank:05d}")
+    done_marker = os.path.join(barrier_root, f"{barrier_name}.done")
+
+    with open(arrival_marker, "w", encoding="utf-8") as f:
+        f.write("\n")
+
+    deadline = time.monotonic() + timeout_sec
+    arrival_prefix = f"{barrier_name}.rank"
+    while True:
+        arrival_count = sum(1 for entry in os.scandir(barrier_root) if entry.name.startswith(arrival_prefix))
+        if arrival_count >= world_size:
+            break
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Timed out waiting for filesystem save barrier {barrier_name}: "
+                f"{arrival_count}/{world_size} ranks arrived."
+            )
+        time.sleep(poll_sec)
+
+    if rank == 0 and not os.path.exists(done_marker):
+        with open(done_marker, "w", encoding="utf-8") as f:
+            f.write("\n")
+
+    while not os.path.exists(done_marker):
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Timed out waiting for filesystem save barrier completion: {barrier_name}.")
+        time.sleep(poll_sec)
+
+
+def _distributed_save_barrier(
+    output_dir: Optional[Union[str, "os.PathLike"]] = None,
+    barrier_name: str = "save-sync",
+) -> None:
+    """Barrier helper for checkpoint save paths.
+
+    Saving mostly coordinates CPU/filesystem work, and some clusters have shown
+    NCCL barrier instability once the training/load collectives are done. Use a
+    dedicated save-sync process group when configured, falling back to the
+    current-device barrier only when the backends already match.
+    """
+    if not dist.is_available() or not dist.is_initialized():
+        return
+
+    backend = os.getenv("XORL_SAVE_SYNC_BACKEND", "filesystem").strip().lower()
+    if backend == "filesystem":
+        if output_dir is None:
+            raise ValueError("output_dir is required for filesystem save barriers.")
+        _filesystem_save_barrier(output_dir, barrier_name)
+        return
+
+    group = _get_save_sync_group()
+    if group is None:
+        _distributed_barrier_on_current_device()
+    else:
+        dist.barrier(group=group)
+
+
 @torch.no_grad()
 def save_model_weights(
     output_dir: Union[str, "os.PathLike"],
@@ -1469,7 +2453,7 @@ def save_model_weights(
             empty_cache()
             if global_rank is not None and dist.is_initialized():  # avoid process hanging
                 synchronize()
-                dist.barrier()
+                _distributed_barrier_on_current_device()
 
         if global_rank is None or global_rank == 0:
             full_state_dict[name] = tensor.detach().cpu()
@@ -1503,9 +2487,149 @@ def save_model_weights(
                     logger.warning(f"Model asset {model_asset} should implement `save_pretrained`.")
 
 
-def save_model_assets(output_dir: Union[str, "os.PathLike"], model_assets: Sequence["ModelAssets"]):
-    from transformers import PretrainedConfig, PreTrainedTokenizerBase
+def save_model_weights_distributed(
+    output_dir: Union[str, "os.PathLike"],
+    state_dict: Dict[str, "torch.Tensor"],
+    save_dtype: Optional[Union[str, "torch.dtype"]] = "bfloat16",
+    shard_size: int = 5_000_000_000,
+    safe_serialization: bool = True,
+    model_assets: Optional[Sequence["ModelAssets"]] = None,
+) -> None:
+    """Save a full model checkpoint with one writer per node.
 
+    This helper is intended for large EP/FSDP models where every rank must
+    participate in DTensor materialization, but rank-0-only writing would create
+    a single-node CPU/I/O bottleneck. We deterministically assign output shards
+    to the local-rank-0 writer on each node while every rank still participates
+    in the required ``full_tensor()`` collectives.
+    """
+    if not safe_serialization:
+        raise ValueError("Distributed weight saving currently requires safe_serialization=True.")
+
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() <= 1:
+        global_rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else None
+        save_model_weights(
+            output_dir=output_dir,
+            state_dict=state_dict,
+            global_rank=global_rank,
+            save_dtype=save_dtype,
+            shard_size=shard_size,
+            safe_serialization=safe_serialization,
+            model_assets=model_assets,
+        )
+        return
+
+    global_rank = dist.get_rank()
+    local_world_size = max(1, int(os.environ.get("LOCAL_WORLD_SIZE", "1")))
+    local_rank = int(os.environ.get("LOCAL_RANK", str(global_rank % local_world_size)))
+    writer_ranks = list(range(0, dist.get_world_size(), local_world_size))
+    is_writer = local_rank == 0
+
+    if is_writer:
+        os.makedirs(output_dir, exist_ok=True)
+    else:
+        os.makedirs(output_dir, exist_ok=True)
+
+    _distributed_save_barrier(output_dir, "materialize-start")
+
+    is_sharded, total_size, weight_map = _get_shard_info(state_dict, save_dtype, shard_size, safe_serialization)
+    shard_to_keys: "OrderedDict[str, List[str]]" = OrderedDict()
+    for name, file_name in weight_map.items():
+        shard_to_keys.setdefault(file_name, []).append(name)
+
+    shard_to_writer = {
+        file_name: writer_ranks[idx % len(writer_ranks)] for idx, file_name in enumerate(shard_to_keys.keys())
+    }
+    total_tensors = len(state_dict)
+    total_shards = len(shard_to_keys)
+
+    dtype_target = getattr(torch, save_dtype) if isinstance(save_dtype, str) else save_dtype
+    materialized_count = 0
+    last_progress_log = time.monotonic()
+    progress_log_interval = float(os.getenv("XORL_SAVE_PROGRESS_LOG_INTERVAL_SEC", "15"))
+
+    if global_rank == 0:
+        logger.info(
+            "Distributed save starting: "
+            f"{total_shards} shards, {total_tensors} tensors, "
+            f"{len(writer_ranks)} writer ranks"
+        )
+
+    for shard_idx, (file_name, shard_keys) in enumerate(shard_to_keys.items(), start=1):
+        owner_rank = shard_to_writer[file_name]
+        keep_shard = owner_rank == global_rank
+        shard_state_dict: "OrderedDict[str, torch.Tensor]" = OrderedDict() if keep_shard else OrderedDict()
+
+        for shard_tensor_idx, name in enumerate(shard_keys, start=1):
+            tensor = state_dict[name]
+            materialized = _materialize_tensor_for_save(tensor, dst_rank=owner_rank)
+            if keep_shard and materialized is not None:
+                cpu_tensor = materialized.detach().cpu()
+                if dtype_target is not None and cpu_tensor.dtype != dtype_target and cpu_tensor.is_floating_point():
+                    cpu_tensor = cpu_tensor.to(dtype=dtype_target)
+                shard_state_dict[name] = cpu_tensor
+
+            del materialized
+            materialized_count += 1
+            if materialized_count % 32 == 0:
+                empty_cache()
+
+            now = time.monotonic()
+            if global_rank == 0 and now - last_progress_log >= progress_log_interval:
+                logger.info(
+                    "Distributed save progress: "
+                    f"shard {shard_idx}/{total_shards} "
+                    f"({shard_tensor_idx}/{len(shard_keys)} tensors in current shard), "
+                    f"materialized {materialized_count}/{total_tensors} tensors, "
+                    f"current owner_rank={owner_rank}, file={file_name}"
+                )
+                last_progress_log = now
+
+        if keep_shard:
+            _save_state_dict(shard_state_dict, os.path.join(output_dir, file_name), safe_serialization)
+            logger.info(
+                f"Distributed save wrote shard {file_name} on rank {global_rank} "
+                f"({len(shard_keys)} tensors, shard {shard_idx}/{total_shards})"
+            )
+            shard_state_dict.clear()
+
+        if global_rank == 0 and (shard_idx == 1 or shard_idx == total_shards):
+            logger.info(
+                "Distributed save progress: "
+                f"materialized shard {shard_idx}/{total_shards} "
+                f"({materialized_count}/{total_tensors} tensors); "
+                f"current owner_rank={owner_rank}, file={file_name}"
+            )
+
+    empty_cache()
+    _distributed_save_barrier(output_dir, "shards-written")
+
+    if global_rank == 0:
+        if is_sharded:
+            index = {
+                "metadata": {"total_size": total_size},
+                "weight_map": weight_map,
+            }
+            index_file = SAFE_WEIGHTS_INDEX_NAME if safe_serialization else WEIGHTS_INDEX_NAME
+            with open(os.path.join(output_dir, index_file), "w", encoding="utf-8") as f:
+                content = json.dumps(index, indent=2, sort_keys=True) + "\n"
+                f.write(content)
+            logger.info(f"Distributed model weight splits saved in {output_dir}.")
+        else:
+            only_file = next(iter(shard_to_keys))
+            logger.info(f"Distributed model weights saved at {os.path.join(output_dir, only_file)}.")
+
+        if model_assets is not None:
+            for model_asset in model_assets:
+                if hasattr(model_asset, "save_pretrained"):
+                    model_asset.save_pretrained(output_dir)
+                else:
+                    logger.warning(f"Model asset {model_asset} should implement `save_pretrained`.")
+
+    _distributed_save_barrier(output_dir, "index-written")
+
+
+def save_model_assets(output_dir: Union[str, "os.PathLike"], model_assets: Sequence["ModelAssets"]):
     for model_asset in model_assets:
         if hasattr(model_asset, "save_pretrained"):
             try:
@@ -1567,6 +2691,14 @@ def compute_loss(
     return loss_fn(**loss_kwargs)
 
 
+GradientCheckpointingMethod = Literal[
+    "recompute_full_layer",
+    "recompute_before_dispatch",
+    "no_recompute",
+]
+DEFAULT_GRADIENT_CHECKPOINTING_METHOD: GradientCheckpointingMethod = "recompute_full_layer"
+
+
 class GradientCheckpointingLayer(nn.Module):
     """Base class for layers with gradient checkpointing.
 
@@ -1591,12 +2723,13 @@ class GradientCheckpointingLayer(nn.Module):
     """
 
     gradient_checkpointing = False
+    _gradient_checkpointing_method: GradientCheckpointingMethod = DEFAULT_GRADIENT_CHECKPOINTING_METHOD
 
     def __call__(self, *args, **kwargs):
         if (
             self.gradient_checkpointing
             and self.training
-            and getattr(self, "_gradient_checkpointing_method", "recompute_full_layer") == "recompute_full_layer"
+            and self._gradient_checkpointing_method == DEFAULT_GRADIENT_CHECKPOINTING_METHOD
         ):
             return self._gradient_checkpointing_func(partial(super().__call__, **kwargs), *args)
         return super().__call__(*args, **kwargs)
@@ -1621,6 +2754,7 @@ class MoEGradientCheckpointingLayer(nn.Module):
     """
 
     gradient_checkpointing = False
+    _gradient_checkpointing_method: GradientCheckpointingMethod = DEFAULT_GRADIENT_CHECKPOINTING_METHOD
 
     def _pre_mlp_forward(self, hidden_states, **kwargs):
         """Layernorm → attention → layernorm. Override per model.
@@ -1654,13 +2788,13 @@ class MoEGradientCheckpointingLayer(nn.Module):
         Returns:
             Tuple of ``(hidden_states, ...)`` with optional router_logits.
         """
-        from xorl.distributed.moe.deepep import sync_pending_combine
-        from xorl.models.layers.moe.moe_block import MoEBlock
+        from xorl.distributed.moe.deepep import sync_pending_combine  # noqa: PLC0415
+        from xorl.models.layers.moe.moe_block import MoEBlock  # noqa: PLC0415
 
         _selective = (
             self.training
-            and getattr(self, "gradient_checkpointing", False)
-            and getattr(self, "_gradient_checkpointing_method", "recompute_full_layer") != "recompute_full_layer"
+            and self.gradient_checkpointing
+            and self._gradient_checkpointing_method != DEFAULT_GRADIENT_CHECKPOINTING_METHOD
         )
         _is_moe = isinstance(self.mlp, MoEBlock)
 

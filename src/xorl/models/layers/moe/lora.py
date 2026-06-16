@@ -81,6 +81,9 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         self.lora_config = lora_config or MoELoRAConfig()
         self.r = self.lora_config.r
         self.lora_alpha = self.lora_config.lora_alpha
+        self.active_r = self.r
+        self.active_lora_alpha = self.lora_alpha
+        self.use_rslora = self.lora_config.use_rslora
 
         # Base weights (frozen) in (G, K, N) format
         self.gate_up_proj = nn.Parameter(
@@ -113,11 +116,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         self._create_lora_params("down_proj", num_exp, (1 if hybrid else num_exp), r, intermediate_size, hidden_dim)
 
         # Scaling factor
-        self.scaling = compute_lora_scaling(
-            self.lora_config.lora_alpha,
-            self.lora_config.r,
-            self.lora_config.use_rslora,
-        )
+        self.scaling = compute_lora_scaling(self.lora_alpha, self.r, self.use_rslora)
 
         self.reset_lora_parameters()
 
@@ -166,14 +165,28 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
                     nn.init.kaiming_uniform_(lora_A.data[i], a=math.sqrt(5))
                 nn.init.zeros_(lora_B.data)
 
+    def set_runtime_lora_config(self, lora_rank: int, lora_alpha: int) -> None:
+        """Update the active LoRA slice used during forward/merge/export."""
+        if lora_rank <= 0 or lora_rank > self.r:
+            raise ValueError(f"Active LoRA rank must be in [1, {self.r}], got {lora_rank}")
+        self.active_r = lora_rank
+        self.active_lora_alpha = lora_alpha
+
+    def _active_scaling(self) -> float:
+        return compute_lora_scaling(self.active_lora_alpha, self.active_r, self.use_rslora)
+
+    def _active_lora_views(self, proj_name: str) -> tuple[torch.Tensor, torch.Tensor]:
+        lora_A = getattr(self, f"{proj_name}_lora_A")[..., : self.active_r].contiguous()
+        lora_B = getattr(self, f"{proj_name}_lora_B")[:, : self.active_r, ...].contiguous()
+        return lora_A, lora_B
+
     def _compute_proj_delta(self, proj_name: str) -> torch.Tensor:
         """Compute LoRA delta for one projection. Returns [E, K, N] in GKN format."""
-        lora_A = getattr(self, f"{proj_name}_lora_A")  # [1 or E, in, r]
-        lora_B = getattr(self, f"{proj_name}_lora_B")  # [E or 1, r, out]
+        lora_A, lora_B = self._active_lora_views(proj_name)
         E = max(lora_A.shape[0], lora_B.shape[0])
         A = lora_A.expand(E, -1, -1)  # [E, in, r]
         B = lora_B.expand(E, -1, -1)  # [E, r, out]
-        return torch.bmm(A, B) * self.scaling  # [E, in, out] = [E, K, N]
+        return torch.bmm(A, B) * self._active_scaling()  # [E, in, out] = [E, K, N]
 
     def merge_weights(self) -> None:
         """Merge LoRA weights into base weights for inference.
@@ -186,8 +199,9 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
                 if proj_name not in self.lora_config.target_modules:
                     continue
                 base = getattr(self, proj_name)
-                delta = self._compute_proj_delta(proj_name).to(base.dtype)
-                base.add_(delta)
+                delta = self._compute_proj_delta(proj_name)
+                merged = base.to(torch.float32) + delta
+                base.data.copy_(merged.to(base.dtype))
         self.reset_lora_parameters()
 
     def forward(
@@ -219,6 +233,9 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         fn = MOE_EXPERT_BACKENDS_LORA[self.moe_implementation]
         gate_proj = self.gate_proj.contiguous()
         up_proj = self.up_proj.contiguous()
+        gate_proj_lora_A, gate_proj_lora_B = self._active_lora_views("gate_proj")
+        up_proj_lora_A, up_proj_lora_B = self._active_lora_views("up_proj")
+        down_proj_lora_A, down_proj_lora_B = self._active_lora_views("down_proj")
         return fn(
             num_experts=self.num_experts,
             routing_weights=routing_weights,
@@ -227,13 +244,13 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
             gate_proj=gate_proj,
             up_proj=up_proj,
             down_proj=self.down_proj,
-            gate_proj_lora_A=self.gate_proj_lora_A,
-            gate_proj_lora_B=self.gate_proj_lora_B,
-            up_proj_lora_A=self.up_proj_lora_A,
-            up_proj_lora_B=self.up_proj_lora_B,
-            down_proj_lora_A=self.down_proj_lora_A,
-            down_proj_lora_B=self.down_proj_lora_B,
-            scaling=self.scaling,
+            gate_proj_lora_A=gate_proj_lora_A,
+            gate_proj_lora_B=gate_proj_lora_B,
+            up_proj_lora_A=up_proj_lora_A,
+            up_proj_lora_B=up_proj_lora_B,
+            down_proj_lora_A=down_proj_lora_A,
+            down_proj_lora_B=down_proj_lora_B,
+            scaling=self._active_scaling(),
         )
 
     def _ep_forward(
@@ -264,6 +281,9 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         compute_fn = EP_EXPERT_COMPUTE_LORA[self.moe_implementation]
         gate_proj = self.gate_proj.contiguous()
         up_proj = self.up_proj.contiguous()
+        gate_proj_lora_A, gate_proj_lora_B = self._active_lora_views("gate_proj")
+        up_proj_lora_A, up_proj_lora_B = self._active_lora_views("up_proj")
+        down_proj_lora_A, down_proj_lora_B = self._active_lora_views("down_proj")
 
         # Step 1: Dispatch tokens to expert-owning ranks
         dispatch_kwargs = self._build_dispatch_kwargs(hidden_states, routing_weights, selected_experts, parallel_state)
@@ -276,18 +296,15 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
             gate_proj,
             up_proj,
             self.down_proj,
-            self.gate_proj_lora_A,
-            self.gate_proj_lora_B,
-            self.up_proj_lora_A,
-            self.up_proj_lora_B,
-            self.down_proj_lora_A,
-            self.down_proj_lora_B,
-            self.scaling,
+            gate_proj_lora_A,
+            gate_proj_lora_B,
+            up_proj_lora_A,
+            up_proj_lora_B,
+            down_proj_lora_A,
+            down_proj_lora_B,
+            self._active_scaling(),
         )
 
-        # Apply router scores — LoRA compute functions don't accept
-        # expert_scores, so apply them here (matches the non-LoRA path
-        # where scores are applied inside the compute function).
         expert_scores = getattr(ctx, "expert_scores", getattr(ctx, "permuted_scores", None))
         if expert_scores is not None:
             expert_output = expert_output * expert_scores.unsqueeze(1).to(expert_output.dtype)
@@ -339,32 +356,36 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         # x @ W — no transpose needed with (G, K, N) format
         gate_proj_out = torch.matmul(hidden_states, self.gate_proj[expert_idx])
         up_proj_out = torch.matmul(hidden_states, self.up_proj[expert_idx])
+        active_scaling = self._active_scaling()
 
         if "gate_proj" in self.lora_config.target_modules:
-            A = self.gate_proj_lora_A[min(expert_idx, self.gate_proj_lora_A.shape[0] - 1)].to(compute_dtype)
-            B = self.gate_proj_lora_B[expert_idx].to(compute_dtype)
-            gate_proj_out = gate_proj_out + torch.matmul(torch.matmul(hidden_states, A), B) * self.scaling
+            gate_A, gate_B = self._active_lora_views("gate_proj")
+            A = gate_A[min(expert_idx, gate_A.shape[0] - 1)].to(compute_dtype)
+            B = gate_B[expert_idx].to(compute_dtype)
+            gate_proj_out = gate_proj_out + torch.matmul(torch.matmul(hidden_states, A), B) * active_scaling
 
         if "up_proj" in self.lora_config.target_modules:
-            A = self.up_proj_lora_A[min(expert_idx, self.up_proj_lora_A.shape[0] - 1)].to(compute_dtype)
-            B = self.up_proj_lora_B[expert_idx].to(compute_dtype)
-            up_proj_out = up_proj_out + torch.matmul(torch.matmul(hidden_states, A), B) * self.scaling
+            up_A, up_B = self._active_lora_views("up_proj")
+            A = up_A[min(expert_idx, up_A.shape[0] - 1)].to(compute_dtype)
+            B = up_B[expert_idx].to(compute_dtype)
+            up_proj_out = up_proj_out + torch.matmul(torch.matmul(hidden_states, A), B) * active_scaling
 
         out = self.act_fn(gate_proj_out) * up_proj_out
 
         down_out = torch.matmul(out, self.down_proj[expert_idx])
         if "down_proj" in self.lora_config.target_modules:
-            A = self.down_proj_lora_A[expert_idx].to(compute_dtype)
-            B = self.down_proj_lora_B[min(expert_idx, self.down_proj_lora_B.shape[0] - 1)].to(compute_dtype)
-            down_out = down_out + torch.matmul(torch.matmul(out, A), B) * self.scaling
+            down_A, down_B = self._active_lora_views("down_proj")
+            A = down_A[expert_idx].to(compute_dtype)
+            B = down_B[min(expert_idx, down_B.shape[0] - 1)].to(compute_dtype)
+            down_out = down_out + torch.matmul(torch.matmul(out, A), B) * active_scaling
 
         return down_out
 
     def extra_repr(self) -> str:
         return (
             f"num_experts={self.num_experts}, hidden_dim={self.hidden_dim}, "
-            f"intermediate_size={self.intermediate_size}, r={self.lora_config.r}, "
-            f"lora_alpha={self.lora_config.lora_alpha}, "
+            f"intermediate_size={self.intermediate_size}, r={self.active_r}, max_r={self.r}, "
+            f"lora_alpha={self.active_lora_alpha}, "
             f"target_modules={self.lora_config.target_modules}"
         )
 

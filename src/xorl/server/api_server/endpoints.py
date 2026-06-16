@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -53,12 +54,114 @@ from xorl.server.api_server.api_types import (
 )
 from xorl.server.api_server.utils import validate_model_id
 from xorl.server.protocol.api_orchestrator import OrchestratorRequest
-from xorl.server.protocol.operations import KillSessionData
+from xorl.server.protocol.operations import KillSessionData, RegisterSessionData
+from xorl.server.session_spec import (
+    load_session_spec_from_checkpoint,
+    normalize_session_spec,
+)
 
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _dump_optional_config(config: Any) -> Optional[Dict[str, Any]]:
+    """Return a plain dict for optional Pydantic/dict config values."""
+    if config is None:
+        return None
+    if hasattr(config, "model_dump"):
+        return config.model_dump(exclude_none=True)
+    return dict(config)
+
+
+def _first_output_result(output: Any) -> Dict[str, Any]:
+    """Extract the first orchestrator output while tolerating dict/list shapes."""
+    if isinstance(output.outputs, list):
+        return output.outputs[0] if output.outputs else {}
+    return output.outputs or {}
+
+
+async def _register_runtime_session(
+    server,
+    *,
+    model_id: str,
+    base_model: str,
+    raw_lora_config: Optional[Dict[str, Any]],
+    raw_optimizer_config: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Normalize and register a session runtime spec with workers and API state."""
+    if server.base_model is not None and base_model != server.base_model:
+        raise ValueError(
+            f"create_model base_model must match the server base model. "
+            f"requested={base_model!r}, server={server.base_model!r}"
+        )
+
+    if server.default_session_spec is None:
+        if model_id != "default":
+            raise ValueError(
+                "Full-weight server multi-tenancy is not supported yet. Use the reserved model_id='default' session."
+            )
+        if raw_lora_config or raw_optimizer_config:
+            raise ValueError("Per-session LoRA or optimizer overrides are not supported in full-weight server mode.")
+        normalized_spec = {
+            "base_model": base_model,
+            "is_lora": False,
+        }
+        materialize = False
+    else:
+        normalized_spec = normalize_session_spec(
+            base_model=base_model,
+            raw_lora_config=raw_lora_config,
+            raw_optimizer_config=raw_optimizer_config,
+            default_rank=server.default_session_spec["lora_config"]["lora_rank"],
+            default_alpha=server.default_session_spec["lora_config"]["lora_alpha"],
+            max_lora_rank=server.max_lora_rank or server.default_session_spec["lora_config"]["lora_rank"],
+            default_optimizer_type=server.default_session_spec["optimizer_config"]["type"],
+            default_learning_rate=server.default_session_spec["optimizer_config"]["learning_rate"],
+            default_weight_decay=server.default_session_spec["optimizer_config"]["weight_decay"],
+            default_optimizer_dtype=server.default_session_spec["optimizer_config"]["optimizer_dtype"],
+            default_optimizer_kwargs=server.default_session_spec["optimizer_config"].get("optimizer_kwargs", {}),
+            server_lora_config=server.server_lora_config,
+            default_betas=tuple(server.default_session_spec["optimizer_config"].get("betas") or (0.9, 0.95)),
+            default_eps=float(server.default_session_spec["optimizer_config"].get("eps") or 1e-8),
+        )
+        materialize = True
+
+    existing_spec = server.model_configs.get(model_id)
+    if existing_spec is not None:
+        if existing_spec != normalized_spec:
+            raise ValueError(
+                f"model_id={model_id!r} already exists with a different session spec. "
+                "Call /api/v1/unload_model first before recreating it."
+            )
+        server._update_session_activity(model_id)
+        return normalized_spec
+
+    engine_request = OrchestratorRequest(
+        operation="register_session",
+        payload=RegisterSessionData(
+            model_id=model_id,
+            session_spec=normalized_spec,
+            materialize=materialize,
+        ),
+    )
+    response_future = await server.orchestrator_client.send_request(engine_request)
+    output = await server._wait_for_response(
+        response_future,
+        engine_request.request_id,
+        server.default_timeout,
+        "Register session timeout",
+    )
+    result = _first_output_result(output)
+    register_result = result.get("result", result)
+    if not register_result.get("registered", False):
+        raise RuntimeError(register_result.get("error", f"Worker register_session failed for model_id={model_id}"))
+
+    server.registered_model_ids.add(model_id)
+    server.model_configs[model_id] = normalized_spec
+    server._update_session_activity(model_id)
+    return normalized_spec
 
 
 # ============================================================================
@@ -139,7 +242,7 @@ async def forward_endpoint(request: ForwardRequest, server=Depends(require_api_s
 )
 async def optim_step_endpoint(request: OptimStepRequest, server=Depends(require_api_server)):
     """
-    Perform optimization step using AdamW optimizer (two-phase pattern).
+    Perform an optimizer step (two-phase pattern).
 
     Returns UntypedAPIFuture immediately. Poll /api/v1/retrieve_future to get
     the OptimStepResponse result.
@@ -278,14 +381,12 @@ async def weights_info_endpoint(request: WeightsInfoRequest, server=Depends(requ
     """
     Get checkpoint metadata for resuming training.
 
-    This endpoint returns the base_model and lora_rank needed to create
-    a TrainingClient that can load the checkpoint. It mirrors tinker's
+    This endpoint returns the full session runtime spec needed to recreate
+    a training session for a checkpoint. It mirrors tinker's
     /api/v1/weights_info endpoint for API compatibility.
 
     The xorl_path should be a xorl:// URI (e.g., "xorl://default/weights/checkpoint-001").
     """
-    # Parse the xorl:// URI to get model_id
-    # Format: xorl://model_id/weights/checkpoint_name
     xorl_path = request.xorl_path
     if not xorl_path.startswith("xorl://"):
         raise HTTPException(
@@ -293,44 +394,46 @@ async def weights_info_endpoint(request: WeightsInfoRequest, server=Depends(requ
             detail=f"Invalid xorl_path format: {xorl_path}. Expected xorl://model_id/weights/checkpoint_name",
         )
 
-    parts = xorl_path[7:].split("/")  # Remove "xorl://"
-    if len(parts) < 1:
+    checkpoint_model_id, checkpoint_name, has_explicit_model_id = server._from_xorl_uri(xorl_path)
+    if not has_explicit_model_id or checkpoint_model_id is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid xorl_path format: {xorl_path}. Could not extract model_id",
+            detail=f"Invalid xorl_path format: {xorl_path}. Expected xorl://model_id/weights/checkpoint_name",
+        )
+    checkpoint_model_id = validate_model_id(checkpoint_model_id)
+
+    weights_dir = os.path.abspath(os.path.join(server.output_dir, "weights", checkpoint_model_id))
+    checkpoint_path = os.path.abspath(os.path.join(weights_dir, checkpoint_name))
+    try:
+        if os.path.commonpath([checkpoint_path, weights_dir]) != weights_dir:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid checkpoint path in xorl_path: {xorl_path}",
+            )
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid checkpoint path in xorl_path: {xorl_path}",
+        )
+    if not os.path.exists(checkpoint_path):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Checkpoint not found: {xorl_path}",
         )
 
-    model_id = parts[0]
+    try:
+        session_spec = load_session_spec_from_checkpoint(
+            checkpoint_path,
+            fallback_base_model=server.base_model,
+            fallback_session_spec=server.model_configs.get(checkpoint_model_id) or server.default_session_spec,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to read checkpoint metadata from {xorl_path}: {e}",
+        ) from e
 
-    # Look up model config
-    model_config = server.model_configs.get(model_id)
-
-    if model_config is None:
-        # Fall back to server's base_model if no specific config is stored
-        if server.base_model is not None:
-            logger.warning(
-                f"No model config found for model_id '{model_id}', using server's base_model: {server.base_model}"
-            )
-            return WeightsInfoResponse(
-                base_model=server.base_model,
-                is_lora=True,
-                lora_rank=None,  # Unknown rank
-            )
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"No model config found for model_id '{model_id}' and server has no default base_model configured",
-            )
-
-    # Extract lora_rank from lora_config
-    lora_config = model_config.get("lora_config", {})
-    lora_rank = lora_config.get("lora_rank")
-
-    return WeightsInfoResponse(
-        base_model=model_config["base_model"],
-        is_lora=True,
-        lora_rank=lora_rank,
-    )
+    return WeightsInfoResponse(**session_spec)
 
 
 @router.post(
@@ -350,54 +453,54 @@ async def create_model_endpoint(request: CreateModelRequest, server=Depends(requ
     Returns UntypedAPIFuture immediately. Poll /api/v1/retrieve_future to get
     the CreateModelResponse result.
 
-    This initializes the model on the training server but doesn't actually
-    do anything yet in the current implementation. It's a placeholder for
-    future multi-model support.
-
     The base_model in the request must match the server's configured base model.
     """
     if not server.future_store:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Future store not initialized")
 
-    model_id = request.model_id
+    model_id = validate_model_id(request.model_id)
+    request_payload = request.model_dump()
+    request_payload["model_id"] = model_id
+
+    async def ensure_reserved_checkpoint(model_id_to_save: str, *, overwrite_existing: bool = False) -> None:
+        """Ensure the reserved initial checkpoint exists for this session."""
+        if getattr(server, "_skip_initial_checkpoint", False):
+            return
+
+        checkpoint_path = os.path.join(server.output_dir, "weights", model_id_to_save, server.RESERVED_CHECKPOINT_NAME)
+        if os.path.exists(checkpoint_path) and not overwrite_existing:
+            return
+
+        try:
+            save_request = SaveWeightsRequest(
+                model_id=model_id_to_save,
+                path=server.RESERVED_CHECKPOINT_NAME,
+            )
+            save_response = await server.save_weights(save_request)
+            logger.info(f"Auto-saved initial checkpoint for model_id={model_id_to_save}: {save_response.path}")
+        except Exception as e:
+            logger.warning(f"Failed to auto-save initial checkpoint for model_id={model_id_to_save}: {e}")
+            # Don't fail create_model if checkpoint save fails - it's not critical
 
     async def process_create_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
         """Process create_model request and return result dict."""
         req = CreateModelRequest(**request_data)
+        req = req.model_copy(update={"model_id": validate_model_id(req.model_id)})
 
         logger.info(f"Creating model: {req.model_id}, base_model={req.base_model}")
 
-        # Register the model_id so subsequent /api/v1/* calls can use it
-        server.registered_model_ids.add(req.model_id)
+        had_model_config = req.model_id in server.model_configs
+        normalized_spec = await _register_runtime_session(
+            server,
+            model_id=req.model_id,
+            base_model=req.base_model,
+            raw_lora_config=_dump_optional_config(req.lora_config),
+            raw_optimizer_config=_dump_optional_config(req.optimizer_config),
+        )
 
-        # Store the model config for /api/v1/weights_info
-        server.model_configs[req.model_id] = {
-            "base_model": req.base_model,
-            "lora_config": req.lora_config,
-        }
+        logger.info(f"Registered model_id: {req.model_id} with session_spec: {normalized_spec}")
 
-        # Initialize session activity tracking
-        server._update_session_activity(req.model_id)
-
-        logger.info(f"Registered model_id: {req.model_id} with lora_config: {req.lora_config}")
-
-        # Auto-save initial checkpoint "000000" only once per server lifetime
-        # This preserves the initial model state (base LoRA weights) before any training
-        # Subsequent create_model calls skip this since the base model hasn't changed
-        if not server._initial_checkpoint_saved:
-            try:
-                save_request = SaveWeightsRequest(
-                    model_id=req.model_id,
-                    path=server.RESERVED_CHECKPOINT_NAME,  # "000000"
-                )
-                save_response = await server.save_weights(save_request)
-                server._initial_checkpoint_saved = True
-                logger.info(f"Auto-saved initial checkpoint for model_id={req.model_id}: {save_response.path}")
-            except Exception as e:
-                logger.warning(f"Failed to auto-save initial checkpoint for model_id={req.model_id}: {e}")
-                # Don't fail create_model if checkpoint save fails - it's not critical
-        else:
-            logger.debug(f"Skipping initial checkpoint save for model_id={req.model_id} (already saved)")
+        await ensure_reserved_checkpoint(req.model_id, overwrite_existing=not had_model_config)
 
         return CreateModelResponse(model_id=req.model_id).model_dump()
 
@@ -406,7 +509,7 @@ async def create_model_endpoint(request: CreateModelRequest, server=Depends(requ
         model_id=model_id,
         request_type="create_model",
         process_fn=process_create_model,
-        request_data=request.model_dump(),
+        request_data=request_payload,
     )
 
     return UntypedAPIFuture(
@@ -449,6 +552,11 @@ async def unload_model_endpoint(request: UnloadModelRequest, server=Depends(requ
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Future store not initialized")
 
     model_id = request.model_id
+    if server.default_session_spec is not None and model_id == "default":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The default LoRA session is reserved and cannot be unloaded.",
+        )
 
     # Check if the session exists
     if model_id not in server.registered_model_ids:
@@ -495,13 +603,14 @@ async def unload_model_endpoint(request: UnloadModelRequest, server=Depends(requ
 )
 async def kill_session_endpoint(request: KillSessionRequest, server=Depends(require_api_server)):
     """
-    Kill the active full-weights training session.
+    Kill an active training session.
 
     In full-weights training mode (enable_lora=False), the server operates in
     single-tenant mode where only one training session is allowed at a time.
     This endpoint kills the active session to allow starting a new one.
 
-    For LoRA mode, this is a no-op since multi-tenancy is supported.
+    In LoRA mode, non-default sessions are removed from both worker state and
+    the API registry. The reserved "default" LoRA session is not removed.
 
     Args:
         request: KillSessionRequest with model_id to kill and save_checkpoint flag
@@ -513,6 +622,13 @@ async def kill_session_endpoint(request: KillSessionRequest, server=Depends(requ
     save_checkpoint = request.save_checkpoint
 
     logger.info(f"Killing session: {model_id}, save_checkpoint={save_checkpoint}")
+
+    if server.default_session_spec is not None and model_id == "default":
+        return KillSessionResponse(
+            success=True,
+            message="Default LoRA session is reserved and was not removed.",
+            checkpoint_path=None,
+        )
 
     try:
         engine_request = OrchestratorRequest(
@@ -533,10 +649,24 @@ async def kill_session_endpoint(request: KillSessionRequest, server=Depends(requ
 
         result = output.outputs[0] if output.outputs else {}
 
+        if result.get("success", False) and server.default_session_spec is not None and model_id != "default":
+            await server._cleanup_session(model_id, notify_workers=False)
+
+        checkpoint_path = result.get("checkpoint_path")
+        if checkpoint_path and server.default_session_spec is not None:
+            weights_dir = os.path.abspath(os.path.join(server.output_dir, "weights", model_id))
+            checkpoint_abs = os.path.abspath(checkpoint_path)
+            try:
+                if os.path.commonpath([checkpoint_abs, weights_dir]) == weights_dir:
+                    checkpoint_name = os.path.basename(os.path.normpath(checkpoint_abs))
+                    checkpoint_path = server._to_xorl_uri(model_id, checkpoint_name)
+            except ValueError:
+                pass
+
         return KillSessionResponse(
             success=result.get("success", False),
             message=result.get("message", ""),
-            checkpoint_path=result.get("checkpoint_path"),
+            checkpoint_path=checkpoint_path,
         )
 
     except HTTPException:
@@ -808,23 +938,50 @@ async def create_session_endpoint(
 
     session_id = validate_model_id(request.session_id) if request.session_id else str(uuid.uuid4())
     already_registered = session_id in server.registered_model_ids
+    lora_config = request.lora_config.model_dump(exclude_none=True) if request.lora_config is not None else {}
 
-    server.registered_model_ids.add(session_id)
+    if server.default_session_spec is not None:
+        server._require_engine()
+        existing_spec = server.model_configs.get(session_id)
+        if existing_spec is not None and not request.lora_config:
+            if request.base_model is not None and request.base_model != existing_spec.get("base_model"):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"session_id={session_id!r} already exists with base_model={existing_spec.get('base_model')!r}; "
+                        f"requested base_model={request.base_model!r}."
+                    ),
+                )
+            server._update_session_activity(session_id)
+        else:
+            base_model = request.base_model or server.base_model or server.default_session_spec["base_model"]
+            raw_lora_config = lora_config or None
+            try:
+                await _register_runtime_session(
+                    server,
+                    model_id=session_id,
+                    base_model=base_model,
+                    raw_lora_config=raw_lora_config,
+                    raw_optimizer_config=None,
+                )
+            except ValueError as e:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    else:
+        server.registered_model_ids.add(session_id)
+        model_config = server.model_configs.setdefault(
+            session_id,
+            {
+                "base_model": request.base_model or server.base_model or "unknown",
+                "lora_config": lora_config,
+            },
+        )
 
-    model_config = server.model_configs.setdefault(
-        session_id,
-        {
-            "base_model": request.base_model or server.base_model or "unknown",
-            "lora_config": request.lora_config,
-        },
-    )
+        if request.base_model:
+            model_config["base_model"] = request.base_model
+        if lora_config:
+            model_config["lora_config"] = lora_config
 
-    if request.base_model:
-        model_config["base_model"] = request.base_model
-    if request.lora_config:
-        model_config["lora_config"] = request.lora_config
-
-    server._update_session_activity(session_id)
+        server._update_session_activity(session_id)
 
     warning_message = None
     info_message = f"Session '{session_id}' registered successfully."

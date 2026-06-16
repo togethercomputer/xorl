@@ -8,6 +8,7 @@ from torch import nn
 RMSNormMode = Literal["eager", "native", "compile"]
 _RMSNORM_MODE: RMSNormMode = "native"
 _COMPILED_NATIVE_RMS_NORM: Optional[Callable[[torch.Tensor, torch.Tensor, float], torch.Tensor]] = None
+_COMPILED_EAGER_RMS_NORM: Optional[Callable[[torch.Tensor, torch.Tensor, float], torch.Tensor]] = None
 _COMPILED_ZERO_CENTERED_RMS_NORM: Optional[Callable[[torch.Tensor, torch.Tensor, float], torch.Tensor]] = None
 
 
@@ -40,6 +41,15 @@ def compiled_rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor, varianc
     if _COMPILED_NATIVE_RMS_NORM is None:
         _COMPILED_NATIVE_RMS_NORM = torch.compile(native_rms_norm)
     return _COMPILED_NATIVE_RMS_NORM(hidden_states, weight, variance_epsilon)
+
+
+def compiled_eager_rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor, variance_epsilon: float) -> torch.Tensor:
+    """Compiled fp32-upcast eager RMSNorm. Use when ``F.rms_norm``'s bf16 path is
+    too imprecise (e.g., GLM-4 MoE 92+ norm layers compounding bf16 error)."""
+    global _COMPILED_EAGER_RMS_NORM
+    if _COMPILED_EAGER_RMS_NORM is None:
+        _COMPILED_EAGER_RMS_NORM = torch.compile(eager_rms_norm)
+    return _COMPILED_EAGER_RMS_NORM(hidden_states, weight, variance_epsilon)
 
 
 def eager_zero_centered_rms_norm(

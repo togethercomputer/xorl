@@ -2,10 +2,6 @@ from typing import Callable
 
 import torch
 import torch.nn as nn
-from transformers import (
-    AutoModel,
-    AutoModelForCausalLM,
-)
 
 from ..utils import logging
 from .module_utils import all_ranks_load_weights, init_empty_weights
@@ -16,11 +12,10 @@ logger = logging.get_logger(__name__)
 
 
 class ModelLoader:
-    """Unified model loader for both HuggingFace and custom xorl models.
+    """Model loader for xorl-registered architectures.
 
-    Takes a model factory callable (e.g., ``AutoModelForCausalLM.from_config``
-    or ``model_cls._from_config``) and handles meta-init, device placement,
-    and weight loading.
+    Takes a model factory callable (e.g., ``model_cls._from_config``) and
+    handles meta-init, device placement, and weight loading.
     """
 
     def __init__(self, model_factory: Callable[..., nn.Module], description: str = ""):
@@ -69,7 +64,15 @@ def get_loader(model_config) -> ModelLoader:
         model_cls = ModelRegistry.get_model_cls_from_model_arch(model_arch)
         return ModelLoader(model_cls._from_config, description=f"xorl/{model_arch}")
 
-    if "ForCausalLM" in model_arch and type(model_config) in AutoModelForCausalLM._model_mapping.keys():
-        return ModelLoader(AutoModelForCausalLM.from_config, description=f"huggingface/{model_arch}")
+    if ModelRegistry.import_errors:
+        failures = "\n".join(f"  - {name}: {err!r}" for name, err in ModelRegistry.import_errors.items())
+        raise NotImplementedError(
+            f"Architecture {model_arch!r} is not registered in xorl, and the following "
+            f"xorl modeling modules failed to import (one of them may provide this arch):\n"
+            f"{failures}"
+        )
 
-    return ModelLoader(AutoModel.from_config, description=f"huggingface/{model_arch}")
+    raise NotImplementedError(
+        f"Architecture {model_arch!r} is not implemented in xorl. Supported architectures: "
+        f"{sorted(ModelRegistry.supported_models)}"
+    )

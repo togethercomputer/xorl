@@ -37,16 +37,16 @@ def init_lora_weights_stacked(
 
     Returns:
         Tuple of (lora_A, lora_B) tensors:
-        - lora_A: Shape [num_experts, r, in_features]
-        - lora_B: Shape [num_experts, out_features, r]
+        - lora_A: Shape [num_experts, in_features, r]
+        - lora_B: Shape [num_experts, r, out_features]
     """
     # lora_A: projects input to low-rank space
-    # Shape: [num_experts, r, in_features]
-    lora_A = torch.empty(num_experts, r, in_features, dtype=dtype, device=device)
+    # Shape: [num_experts, in_features, r]
+    lora_A = torch.empty(num_experts, in_features, r, dtype=dtype, device=device)
 
     # lora_B: projects from low-rank space to output
-    # Shape: [num_experts, out_features, r]
-    lora_B = torch.zeros(num_experts, out_features, r, dtype=dtype, device=device)
+    # Shape: [num_experts, r, out_features]
+    lora_B = torch.zeros(num_experts, r, out_features, dtype=dtype, device=device)
 
     # Initialize lora_A
     if init_method == "kaiming":
@@ -88,20 +88,20 @@ def merge_lora_weights_stacked(
 ) -> torch.Tensor:
     """Merge LoRA weights into base weights.
 
-    Computes: W' = W + B @ A * scaling
+    Computes: W' = W + A @ B * scaling
 
     Args:
-        base_weight: Base weight tensor [num_experts, out_features, in_features]
-        lora_A: LoRA A tensor [num_experts, r, in_features]
-        lora_B: LoRA B tensor [num_experts, out_features, r]
+        base_weight: Base weight tensor [num_experts, in_features, out_features]
+        lora_A: LoRA A tensor [num_experts, in_features, r]
+        lora_B: LoRA B tensor [num_experts, r, out_features]
         scaling: LoRA scaling factor
 
     Returns:
-        Merged weight tensor [num_experts, out_features, in_features]
+        Merged weight tensor [num_experts, in_features, out_features]
     """
-    # B @ A: [num_experts, out_features, r] @ [num_experts, r, in_features]
-    #      = [num_experts, out_features, in_features]
-    delta_weight = torch.bmm(lora_B, lora_A) * scaling
+    # A @ B: [num_experts, in_features, r] @ [num_experts, r, out_features]
+    #      = [num_experts, in_features, out_features]
+    delta_weight = torch.bmm(lora_A, lora_B) * scaling
     return base_weight + delta_weight
 
 
@@ -113,18 +113,18 @@ def unmerge_lora_weights_stacked(
 ) -> torch.Tensor:
     """Unmerge LoRA weights from merged weights.
 
-    Computes: W = W' - B @ A * scaling
+    Computes: W = W' - A @ B * scaling
 
     Args:
-        merged_weight: Merged weight tensor [num_experts, out_features, in_features]
-        lora_A: LoRA A tensor [num_experts, r, in_features]
-        lora_B: LoRA B tensor [num_experts, out_features, r]
+        merged_weight: Merged weight tensor [num_experts, in_features, out_features]
+        lora_A: LoRA A tensor [num_experts, in_features, r]
+        lora_B: LoRA B tensor [num_experts, r, out_features]
         scaling: LoRA scaling factor
 
     Returns:
-        Base weight tensor [num_experts, out_features, in_features]
+        Base weight tensor [num_experts, in_features, out_features]
     """
-    delta_weight = torch.bmm(lora_B, lora_A) * scaling
+    delta_weight = torch.bmm(lora_A, lora_B) * scaling
     return merged_weight - delta_weight
 
 
@@ -135,14 +135,14 @@ def get_lora_delta_weight_stacked(
 ) -> torch.Tensor:
     """Compute the LoRA weight delta.
 
-    Computes: delta_W = B @ A * scaling
+    Computes: delta_W = A @ B * scaling
 
     Args:
-        lora_A: LoRA A tensor [num_experts, r, in_features]
-        lora_B: LoRA B tensor [num_experts, out_features, r]
+        lora_A: LoRA A tensor [num_experts, in_features, r]
+        lora_B: LoRA B tensor [num_experts, r, out_features]
         scaling: LoRA scaling factor
 
     Returns:
-        Delta weight tensor [num_experts, out_features, in_features]
+        Delta weight tensor [num_experts, in_features, out_features]
     """
-    return torch.bmm(lora_B, lora_A) * scaling
+    return torch.bmm(lora_A, lora_B) * scaling

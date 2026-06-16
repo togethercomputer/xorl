@@ -76,3 +76,13 @@ trace/
 docs/node_modules/
 docs/dist/
 docs/.astro/
+
+# Generated tokenized datasets and packing caches (per-benchmark)
+experiments/local_benchmark/dataset_cache/
+experiments/local_benchmark/datasets/
+
+# Kimi topology sweep scratch (tracked on branch `kimi-sweep-archive` instead)
+experiments/local_benchmark/sweeps/
+
+# Multi-adapter LoRA E2E artifacts can contain full per-rank logs and copied checkpoints.
+experiments/multi_adapter_lora/results/

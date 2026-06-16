@@ -168,13 +168,10 @@ class Qwen3_5MoeAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape)
 
         cos, sin = position_embeddings
-        query_states, key_states = qwen3_5_apply_rotary_pos_emb(
-            query_states,
-            key_states,
-            cos,
-            sin,
-            interleaved=getattr(self.config, "mrope_interleaved", False),
-        )
+        # `mrope_interleaved` controls T/H/W frequency mixing in cos/sin
+        # construction upstream, not the q/k rotation convention. q/k always
+        # use the standard half-rotate convention (HF/SGLang).
+        query_states, key_states = qwen3_5_apply_rotary_pos_emb(query_states, key_states, cos, sin)
         return query_states, key_states, value_states
 
     def _project_output(self, attn_output: torch.Tensor) -> torch.Tensor:
@@ -522,7 +519,7 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
             _use_outer_checkpoint = (
                 self.gradient_checkpointing
                 and self.training
-                and getattr(self, "_gradient_checkpointing_method", "recompute_full_layer") == "recompute_full_layer"
+                and self._gradient_checkpointing_method == "recompute_full_layer"
             )
             if _use_outer_checkpoint:
                 layer_outputs = self._gradient_checkpointing_func(

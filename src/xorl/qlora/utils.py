@@ -377,7 +377,7 @@ def maybe_quantize_qlora(model: nn.Module) -> int:
 def maybe_load_and_quantize_moe_qlora(
     model: nn.Module,
     weights_path: str,
-    load_mode: str = "broadcast",
+    load_mode: str = "grouped",
 ) -> int:
     """Load bf16 MoE expert weights from checkpoint and quantize.
 
@@ -387,7 +387,8 @@ def maybe_load_and_quantize_moe_qlora(
     Args:
         model: Model with QLoRAMoeExperts modules.
         weights_path: Path to HF model directory with bf16 weights.
-        load_mode: "broadcast" or "all_ranks".
+        load_mode: "grouped" or "all_ranks". Deferred QLoRA loading uses
+            rank-0 fanout for "grouped" as the compatibility fallback.
 
     Returns:
         Number of MoE modules loaded.
@@ -415,7 +416,18 @@ def maybe_load_and_quantize_moe_qlora(
             "MoE expert loading requires model.safetensors.index.json."
         )
 
-    shard_cache: dict = {}
+    use_broadcast = (
+        load_mode == "grouped" and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+    )
+    if use_broadcast:
+        needed_shards = sorted(set(weight_map.values()))
+        logger.info(
+            f"Broadcasting {len(needed_shards)} shard files from rank 0 "
+            f"(rank={dist.get_rank()}, world={dist.get_world_size()})"
+        )
+        shard_cache = _broadcast_shard_cache(needed_shards, weights_path)
+    else:
+        shard_cache = {}
 
     moe_count = 0
     for module in model.modules():
@@ -540,7 +552,7 @@ def detect_prequantized_nvfp4(weights_path: str) -> bool:
         True if the checkpoint is pre-quantized NVFP4.
     """
 
-    from xorl.models.checkpoint_handlers.buffers import detect_prequantized_checkpoint
+    from xorl.models.checkpoint_handlers.buffers import detect_prequantized_checkpoint  # noqa: PLC0415
 
     return detect_prequantized_checkpoint(weights_path)
 
@@ -556,7 +568,7 @@ def detect_prequantized_block_fp8(weights_path: str) -> bool:
     Returns:
         True if the checkpoint is pre-quantized block FP8.
     """
-    from xorl.models.checkpoint_handlers.buffers import detect_prequantized_block_fp8_checkpoint
+    from xorl.models.checkpoint_handlers.buffers import detect_prequantized_block_fp8_checkpoint  # noqa: PLC0415
 
     return detect_prequantized_block_fp8_checkpoint(weights_path)
 
@@ -638,7 +650,7 @@ def _broadcast_shard_cache(
     return shard_cache
 
 
-def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str, load_mode: str = "broadcast") -> int:
+def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str, load_mode: str = "grouped") -> int:
     """Load pre-quantized weights into QLoRALinear modules from checkpoint.
 
     For pre-quantized NVFP4 checkpoints (modelopt format), this replaces the
@@ -647,8 +659,11 @@ def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str, load_mode
 
     Also handles QLoRAMoeExperts (auto-detected internally via weight_map probing).
 
-    When distributed is initialized, uses rank 0 broadcast to avoid redundant
-    disk reads across ranks (~6-8× faster for large models).
+    When distributed is initialized, grouped mode uses rank-0 fanout to avoid
+    redundant disk reads across ranks (~6-8× faster for large models). The main
+    checkpoint handler performs true grouped fanout when QLoRA weights are
+    loaded inline; this deferred path keeps rank-0 fanout as the compatibility
+    fallback.
 
     Args:
         model: Model with QLoRALinear/QLoRAMoeExperts modules
@@ -676,10 +691,10 @@ def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str, load_mode
         )
 
     # Loading mode:
-    # "broadcast" (default): rank 0 reads, broadcasts via NCCL. Best for shared/NFS filesystems.
+    # "grouped" (default): use rank-0 fanout in this deferred QLoRA path.
     # "all_ranks": every rank reads from disk independently. Best for local SSDs.
     use_broadcast = (
-        load_mode == "broadcast" and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+        load_mode == "grouped" and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
     )
     if use_broadcast:
         needed_shards = sorted(set(weight_map.values()))

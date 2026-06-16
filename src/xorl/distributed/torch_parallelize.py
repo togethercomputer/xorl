@@ -12,14 +12,15 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import noop_context_fn
 
 from xorl.distributed.checkpoint import CheckpointFunction
-from xorl.distributed.fsdp2 import clip_grad_norm
+from xorl.distributed.fsdp2 import BF16StochasticAllToAllReduceScatter, clip_grad_norm
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.distributed.pipeline_parallel import (
     generate_llm_fqn_per_model_part,
     pipeline_module_split,
 )
 from xorl.lora import LoraLinear
-from xorl.models import all_ranks_load_weights, rank0_load_and_broadcast_weights
+from xorl.models import all_ranks_load_weights, grouped_load_weights
+from xorl.models.transformers.deepseek_v3.support import validate_deepseek_v3_tensor_parallelism
 from xorl.utils import logging
 from xorl.utils.device import get_device_type
 from xorl.utils.import_utils import is_torch_version_greater_than
@@ -29,12 +30,43 @@ if is_torch_version_greater_than("2.4"):
     from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
     from torch.distributed.tensor.parallel import (
         ColwiseParallel,
+        ParallelStyle,
         RowwiseParallel,
         parallelize_module,
     )
 
 
 logger = logging.get_logger(__name__)
+
+
+def _load_model_weights(
+    model: "nn.Module",
+    weights_path: str,
+    load_weights_mode: str,
+    weight_device: str,
+    dtensor_factory=None,
+) -> None:
+    """Dispatch HF weight loading by mode.
+
+    'skip' is a no-op; weights are expected to come from a DCP checkpoint via
+    load_checkpoint_path. 'grouped' uses one reader per node for dense weights
+    and one per EP-FSDP group for experts, falling back to rank-0 loading when
+    those fanout groups are unavailable. 'all_ranks' has every rank read
+    independently.
+    """
+    if load_weights_mode == "skip":
+        logger.info_rank0("Skipping HF weight loading (weights will be loaded from DCP checkpoint).")
+        return
+    if load_weights_mode == "grouped":
+        logger.info_rank0("Loading model weights with one reader per node (dense) + per EP-FSDP group (experts)...")
+        grouped_load_weights(model, weights_path, weight_device, dtensor_factory=dtensor_factory)
+    elif load_weights_mode == "all_ranks":
+        logger.info_rank0("Every rank reading weights from disk independently...")
+        all_ranks_load_weights(model, weights_path, weight_device, dtensor_factory=dtensor_factory)
+    else:
+        raise ValueError(
+            f"Unsupported load_weights_mode={load_weights_mode!r}. Expected one of: grouped, all_ranks, skip."
+        )
 
 
 _TP_STYLE_MAP = {
@@ -71,19 +103,27 @@ def _build_tp_plan(model: "nn.Module") -> Dict[str, Any]:
     return plan
 
 
-def _resolve_tp_style(style_str: str):
-    """Convert a string TP style to a PyTorch ParallelStyle object."""
-    if style_str == "colwise_rep":
+def _resolve_tp_style(style):
+    """Convert a string TP style to a PyTorch ``ParallelStyle`` instance.
+
+    ``style`` may also already be a ``ParallelStyle`` instance — useful for
+    plans that need configuration the string shortcuts don't cover (e.g.
+    ``ColwiseParallel(input_layouts=...)``, custom user-defined styles).
+    Returned as-is in that case.
+    """
+    if isinstance(style, ParallelStyle):
+        return style
+    if style == "colwise_rep":
         return ColwiseParallel(output_layouts=Replicate())
-    elif style_str == "embedding":
+    elif style == "embedding":
         # Embedding: shard weight on vocab dim, replicated input/output
         # Weight [vocab, hidden] → Shard(0) [vocab/tp, hidden] per rank
         # Lookup → partial results → all-reduce → replicated output
         return RowwiseParallel(input_layouts=Replicate(), output_layouts=Replicate())
-    elif style_str in _TP_STYLE_MAP:
-        return _TP_STYLE_MAP[style_str]()
+    elif style in _TP_STYLE_MAP:
+        return _TP_STYLE_MAP[style]()
     else:
-        raise ValueError(f"Unknown TP style: {style_str}")
+        raise ValueError(f"Unknown TP style: {style}")
 
 
 def parallelize_model_fsdp2(
@@ -93,6 +133,7 @@ def parallelize_model_fsdp2(
     basic_modules: Optional[List[str]] = None,
     pp_enabled: bool = False,
     reshard_after_forward: Optional[bool] = None,
+    moe_grad_reduce_mode: str = "reduce_scatter",
     **kwargs,
 ) -> "nn.Module":
     """
@@ -215,6 +256,7 @@ def parallelize_model_fsdp2(
     # | -- experts layer (apply fully_shard separately in order to shard across EP groups on the same EP rank instead of sharding globally)
     # | -- layers (declared in model.modules_to_ignore_in_mixed_precision) that need to apply fully_shard separately due to different mp policy as the decoder layer
     #      (e.g., some models requires MoE TopK gate layer to have parameters in higher FP32 precision in forward).
+    fsdp_wrapped_experts: List["nn.Module"] = []
     for layer_fqn, layer_mod, experts_mod in layer_pairs:
         # register all the FSDPModule inside this decoder layer for the convenience of manual prefetching configuration
         layer_mod._fsdp_modules = []
@@ -233,6 +275,7 @@ def parallelize_model_fsdp2(
             # shard expert
             fully_shard(experts_mod, **expert_fsdp_kwargs)
             layer_mod._fsdp_modules.append(experts_mod)
+            fsdp_wrapped_experts.append(experts_mod)
         # shard module that needs to ignore mixed precision control
         if mp_ignored_classes:
             for sub_mod in layer_mod.modules():
@@ -330,13 +373,67 @@ def parallelize_model_fsdp2(
         if isinstance(module, FSDPModule):
             module.set_gradient_divide_factor(1.0)
 
+    # Install custom reduce-scatter for MoE expert FSDP units.
+    # Native FSDP reduce-scatter performs accumulation in the buffer dtype during transit,
+    # so naively setting reduce_dtype=bf16 would corrupt the partial sum. The
+    # bf16_a2a_fp32_sum mode keeps the FSDP buffer at FP32 (set via mp_policy.reduce_dtype)
+    # but stochastically rounds to BF16 for the all-to-all and sums received chunks
+    # locally in FP32. Halves comm volume per DeepSeek V4 §3.5.1.
+    #
+    # Preconditions enforced below (see BF16StochasticAllToAllReduceScatter docstring):
+    #   - mp_policy.reduce_dtype must be torch.float32 (the hook receives the FSDP
+    #     reduce buffer pre-allocated in this dtype; rejecting at __call__ time would
+    #     surface the error during the first backward, far from configuration).
+    #   - gradient_divide_factor must be 1.0. With factor=None FSDP enables a
+    #     predivide_factor that gets applied to the input *before* our hook sees it,
+    #     and FSDP would skip the postdivide because we own the reduce; the result
+    #     is silently under-weighted gradients.
+    if moe_grad_reduce_mode == "bf16_a2a_fp32_sum":
+        if fsdp_wrapped_experts:
+            for experts_mod in fsdp_wrapped_experts:
+                state = experts_mod._get_fsdp_state()
+                pg = state._fsdp_param_group
+                if pg is None:
+                    continue
+                if pg.mp_policy.reduce_dtype != torch.float32:
+                    raise ValueError(
+                        "moe_grad_reduce_mode='bf16_a2a_fp32_sum' requires FSDP "
+                        f"mp_policy.reduce_dtype=torch.float32, got {pg.mp_policy.reduce_dtype}. "
+                        "Either keep enable_mixed_precision=True (which sets reduce_dtype=fp32) "
+                        "or pass an explicit MixedPrecisionPolicy with reduce_dtype=torch.float32."
+                    )
+                if pg.gradient_divide_factor != 1.0:
+                    raise ValueError(
+                        "moe_grad_reduce_mode='bf16_a2a_fp32_sum' requires "
+                        "gradient_divide_factor=1.0 on every expert FSDP unit "
+                        f"(got {pg.gradient_divide_factor}). FSDP applies predivide before "
+                        "the reduce-scatter hook and skips postdivide when the hook is custom, "
+                        "which would silently under-weight expert gradients."
+                    )
+            for experts_mod in fsdp_wrapped_experts:
+                experts_mod.set_custom_reduce_scatter(BF16StochasticAllToAllReduceScatter())
+            logger.info_rank0(
+                f"Installed BF16 stochastic-rounded all-to-all + FP32 local sum reduce-scatter "
+                f"on {len(fsdp_wrapped_experts)} expert FSDP units."
+            )
+        else:
+            logger.warning_rank0(
+                "moe_grad_reduce_mode='bf16_a2a_fp32_sum' was set but no expert FSDP units "
+                "were wrapped (EP not enabled or experts use _skip_fsdp). Mode has no effect."
+            )
+    elif moe_grad_reduce_mode != "reduce_scatter":
+        raise ValueError(
+            f"Unsupported moe_grad_reduce_mode: {moe_grad_reduce_mode!r}. "
+            "Expected 'reduce_scatter' or 'bf16_a2a_fp32_sum'."
+        )
+
     # Handle meta initialization for FSDP2 (fallback if pre-load not done)
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
 
     weight_device = get_device_type()
 
     # skip_weight_loading: Used when caller will handle weight loading separately
-    # (e.g., FSDP2+LoRA where we broadcast from rank 0 after this function returns)
+    # after this function returns.
     if kwargs.get("skip_weight_loading"):
         logger.info_rank0("Skipping weight loading in parallelize_model_fsdp2 (caller will handle)")
     elif weights_path is None:
@@ -350,13 +447,14 @@ def parallelize_model_fsdp2(
                     m.reset_lora_parameters()
     else:
         logger.info_rank0("starting to load model weights...")
-        load_weights_mode = kwargs.get("load_weights_mode", "broadcast")
-        if load_weights_mode == "broadcast":
-            logger.info_rank0("Loading model weights from disk on rank0 then broadcasting to other ranks...")
-            rank0_load_and_broadcast_weights(model, weights_path, weight_device, dtensor_factory=distribute_tensor)
-        else:
-            logger.info_rank0("Every rank reading weights from disk independently...")
-            all_ranks_load_weights(model, weights_path, weight_device, dtensor_factory=distribute_tensor)
+        load_weights_mode = kwargs.get("load_weights_mode", "grouped")
+        _load_model_weights(
+            model,
+            weights_path,
+            load_weights_mode=load_weights_mode,
+            weight_device=weight_device,
+            dtensor_factory=distribute_tensor,
+        )
 
     # Build EP param groups now (torchtitan eFSDP design: track groups at wrap time,
     # not just at optimizer build time, so grad clipping works regardless of optimizer
@@ -438,6 +536,7 @@ def build_parallelize_model(
     basic_modules: Optional[List[str]] = None,
     pp_schedule: Optional[str] = None,
     reshard_after_forward: Optional[bool] = None,
+    moe_grad_reduce_mode: str = "reduce_scatter",
     **kwargs,
 ) -> "nn.Module":
     """
@@ -523,6 +622,7 @@ def build_parallelize_model(
 
             # TP (if enabled)
             if ps.tp_enabled:
+                validate_deepseek_v3_tensor_parallelism(model_part.config)
                 # TP + LoRA is not currently supported
                 if i == 0:
                     if any(isinstance(m, LoraLinear) for m in model_part.modules()):
@@ -549,15 +649,14 @@ def build_parallelize_model(
                 if kwargs.get("init_device") == "meta" and weights_path is not None:
                     if i == 0:
                         logger.info_rank0("TP enabled: loading weights before FSDP wrapping...")
-                    load_weights_mode = kwargs.get("load_weights_mode", "broadcast")
-                    if load_weights_mode == "broadcast":
-                        rank0_load_and_broadcast_weights(
-                            model_part, weights_path, get_device_type(), dtensor_factory=distribute_tensor
-                        )
-                    else:
-                        all_ranks_load_weights(
-                            model_part, weights_path, get_device_type(), dtensor_factory=distribute_tensor
-                        )
+                    load_weights_mode = kwargs.get("load_weights_mode", "grouped")
+                    _load_model_weights(
+                        model_part,
+                        weights_path,
+                        load_weights_mode=load_weights_mode,
+                        weight_device=get_device_type(),
+                        dtensor_factory=distribute_tensor,
+                    )
                     kwargs["skip_weight_loading"] = True
 
             # torch.compile (if enabled)
@@ -593,6 +692,7 @@ def build_parallelize_model(
                         basic_modules=basic_modules,
                         pp_enabled=True,
                         reshard_after_forward=reshard_after_forward,
+                        moe_grad_reduce_mode=moe_grad_reduce_mode,
                         **kwargs,
                     )
                 elif ps.dp_mode == "ddp":
@@ -668,6 +768,7 @@ def build_parallelize_model(
                     module._gradient_checkpointing_func = _make_wrapper(_orig)
 
     if parallel_state.tp_enabled:
+        validate_deepseek_v3_tensor_parallelism(model.config)
         # TP + LoRA is not currently supported
         if any(isinstance(m, LoraLinear) for m in model.modules()):
             raise NotImplementedError("Tensor parallelism + LoRA is not currently supported.")
@@ -692,13 +793,14 @@ def build_parallelize_model(
         # Load weights now so FSDP wraps materialized TP DTensors.
         if kwargs.get("init_device") == "meta" and weights_path is not None:
             logger.info_rank0("TP enabled: loading weights before FSDP wrapping...")
-            load_weights_mode = kwargs.get("load_weights_mode", "broadcast")
-            if load_weights_mode == "broadcast":
-                rank0_load_and_broadcast_weights(
-                    model, weights_path, get_device_type(), dtensor_factory=distribute_tensor
-                )
-            else:
-                all_ranks_load_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
+            load_weights_mode = kwargs.get("load_weights_mode", "grouped")
+            _load_model_weights(
+                model,
+                weights_path,
+                load_weights_mode=load_weights_mode,
+                weight_device=get_device_type(),
+                dtensor_factory=distribute_tensor,
+            )
             # Mark weights as already loaded so FSDP path skips loading
             kwargs["skip_weight_loading"] = True
 
@@ -731,6 +833,7 @@ def build_parallelize_model(
                 enable_mixed_precision=enable_mixed_precision,
                 basic_modules=basic_modules,
                 reshard_after_forward=reshard_after_forward,
+                moe_grad_reduce_mode=moe_grad_reduce_mode,
                 **kwargs,
             )
         elif parallel_state.dp_mode == "ddp":

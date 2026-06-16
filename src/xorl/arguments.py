@@ -25,6 +25,7 @@ from typing import (
 import torch
 import yaml
 
+from .ops.loss import CrossEntropyMode
 from .utils import logging
 from .utils.checkpoint_utils import get_checkpoint_path
 
@@ -46,7 +47,10 @@ def _detect_repo_commit() -> Optional[str]:
         )
         commit = result.stdout.strip()
         return commit or None
-    except Exception:
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        # SubprocessError covers CalledProcessError when not a git repo;
+        # FileNotFoundError if `git` is not on PATH; OSError for other
+        # process-spawn failures.
         return None
 
 
@@ -437,6 +441,10 @@ class ModelArguments:
             "'flash_attention_3': FA3 (Hopper). 'flash_attention_4': FA4 CUTE (Hopper+Blackwell)."
         },
     )
+    flash_attention_deterministic: bool = field(
+        default=False,
+        metadata={"help": "Request FlashAttention deterministic backward kernels when available."},
+    )
     moe_implementation: Optional[Literal[None, "eager", "triton", "native", "quack"]] = field(
         default=None,
         metadata={
@@ -452,6 +460,20 @@ class ModelArguments:
         metadata={
             "help": "Whether expert computation gradients should flow through routing weights. "
             "Disabled by default and must remain False when ep_dispatch='deepep'."
+        },
+    )
+    freeze_router: bool = field(
+        default=False,
+        metadata={"help": "Freeze MoE router weights during training."},
+    )
+    record_routing_weights: bool = field(
+        default=True,
+        metadata={
+            "help": "Cache routing weights on the forward pass so they can override the "
+            "regathered weights during checkpoint recompute. Needed only when the "
+            "attention forward is non-deterministic across recompute (otherwise the "
+            "regather produces identical weights). Disabling skips the per-layer pinned "
+            "CPU allocation + D2H/H2D copies on every step."
         },
     )
     deepep_buffer_size_gb: float = field(
@@ -534,6 +556,17 @@ class TrainingArguments:
         default=0,
         metadata={"help": "L2 regularization strength."},
     )
+    cautious_weight_decay: bool = field(
+        default=False,
+        metadata={
+            "help": "Apply Cautious Weight Decay (Chen et al., arXiv:2510.12402): "
+            "mask the decoupled decay term by I(u_t * x_t >= 0) so decay only acts "
+            "on coordinates whose update aligns with the parameter sign. "
+            "Supported with optimizer in {adamw, anyprecision_adamw, signsgd, muon}; "
+            "with adamw, routes to AnyPrecisionAdamW (fp32 state) since the fused "
+            "kernel has no per-coordinate decay hook."
+        },
+    )
     no_decay_modules: List[str] = field(
         default_factory=list,
         metadata={"help": "Modules without weight decay, for example, RMSNorm."},
@@ -543,10 +576,11 @@ class TrainingArguments:
         metadata={"help": "Parameters without weight decay, for example, bias."},
     )
 
-    optimizer: Literal["adamw", "anyprecision_adamw", "sgd", "signsgd", "muon"] = field(
+    optimizer: Literal["adamw", "anyprecision_adamw", "sgd", "signsgd", "distsignsgd", "muon"] = field(
         default="adamw",
         metadata={
-            "help": "Optimizer type. 'signsgd' is a state-free sign update; 'muon' uses "
+            "help": "Optimizer type. 'signsgd' is a local state-free sign update; "
+            "'distsignsgd' signs gradients before FSDP2 reduction; 'muon' uses "
             "Newton-Schulz orthogonalization for 2D+ weight matrices."
         },
     )
@@ -581,10 +615,12 @@ class TrainingArguments:
         },
     )
     muon_ns_algorithm: Literal["standard_newton_schulz", "gram_newton_schulz"] = field(
-        default="standard_newton_schulz",
+        default="gram_newton_schulz",
         metadata={
-            "help": "Newton-Schulz backend for Muon. 'standard_newton_schulz' keeps the PyTorch Muon path; "
-            "'gram_newton_schulz' uses Dao-AILab's Gram Newton-Schulz formulation."
+            "help": "Newton-Schulz backend for Muon. 'gram_newton_schulz' (default) batches across "
+            "MoE experts via baddbmm and is ~2x faster on Qwen3.5-style MoE; 'standard_newton_schulz' "
+            "uses the PyTorch upstream path (also batched in xorl) for bit-exact equivalence with "
+            "torch.optim._muon."
         },
     )
     muon_ns_use_quack_kernels: bool = field(
@@ -608,6 +644,13 @@ class TrainingArguments:
             "A value of 2 means restart after the second iteration."
         },
     )
+    muon_grouped_gram_ns_fp32_byte_limit: int = field(
+        default=512 * 1024**2,
+        metadata={
+            "help": "Maximum fp32 scratch bytes per grouped Muon Gram Newton-Schulz batch before chunking. "
+            "Lower values reduce peak optimizer scratch memory at the cost of more launches."
+        },
+    )
     muon_grad_dtype: Optional[Literal["fp32", "bf16"]] = field(
         default=None,
         metadata={
@@ -629,6 +672,17 @@ class TrainingArguments:
             "Intended for debugging and ablations."
         },
     )
+    muon_distributed_mode: Literal["shard_local", "full_gradient"] = field(
+        default="shard_local",
+        metadata={
+            "help": "How Muon handles Newton-Schulz on FSDP2/EP-sharded DTensor params. "
+            "'shard_local': run NS on each rank's local shard (cheap, approximate). "
+            "'full_gradient': all-gather the post-momentum update to the full matrix, "
+            "run NS on the full matrix on every rank in the param's mesh, slice back to "
+            "the local shard. Recovers exact Muon at the cost of a per-step all-gather and "
+            "redundant NS compute. Implements the dense path of DeepSeek V4 §3.5.1."
+        },
+    )
 
     @property
     def optimizer_kwargs(self) -> Dict[str, Any]:
@@ -643,6 +697,7 @@ class TrainingArguments:
             kwargs["muon_ns_algorithm"] = self.muon_ns_algorithm
             kwargs["muon_ns_use_quack_kernels"] = self.muon_ns_use_quack_kernels
             kwargs["muon_gram_ns_num_restarts"] = self.muon_gram_ns_num_restarts
+            kwargs["muon_grouped_gram_ns_fp32_byte_limit"] = self.muon_grouped_gram_ns_fp32_byte_limit
             if self.muon_gram_ns_restart_iterations is not None:
                 kwargs["muon_gram_ns_restart_iterations"] = self.muon_gram_ns_restart_iterations
             # Wire optimizer_dtype -> muon_momentum_dtype so "bf16" sets bf16 Muon momentum
@@ -658,11 +713,36 @@ class TrainingArguments:
                 kwargs["muon_update_dtype"] = torch.float32
             if self.muon_force_momentum_path:
                 kwargs["muon_force_momentum_path"] = True
+            if self.muon_distributed_mode != "shard_local":
+                kwargs["muon_distributed_mode"] = self.muon_distributed_mode
         return kwargs
 
     max_grad_norm: float = field(
         default=1.0,
         metadata={"help": "Clip value for gradient norm."},
+    )
+    softmax_auxiliary_loss: bool = field(
+        default=False,
+        metadata={
+            "help": "Add a Z-loss auxiliary term on the LM-head logits: "
+            "mean(logsumexp(logits)^2) over valid tokens. Encourages the partition "
+            "function log(Z) to stay near zero, which stabilizes training at large "
+            "vocab and high learning rate (PaLM-style)."
+        },
+    )
+    auxiliary_loss_multiplier: float = field(
+        default=1e-5,
+        metadata={"help": "Coefficient for the softmax auxiliary (Z-)loss when softmax_auxiliary_loss is enabled."},
+    )
+    ce_mode: CrossEntropyMode = field(
+        default="compiled",
+        metadata={
+            "help": "Cross-entropy computation mode for the local-trainer path. "
+            "'compiled' (default): torch.compile + auto_chunker, avoids materializing "
+            "the full [batch*seq, vocab] logits tensor. 'eager': F.cross_entropy that "
+            "materializes logits. The server path uses ServerArguments.ce_mode "
+            "(same semantics, separate flow)."
+        },
     )
     micro_batch_size: int = field(
         default=1,
@@ -753,10 +833,17 @@ class TrainingArguments:
             "help": "Device to initialize model weights. 1. `cpu`: Init parameters on CPU in rank0 only. 2. `cuda`: Init parameters on GPU. 3. `meta`: Init parameters on meta. 4. `npu`: Init parameters on Ascend NPU."
         },
     )
-    load_weights_mode: Literal["broadcast", "all_ranks"] = field(
-        default="broadcast",
+    load_weights_mode: Literal["all_ranks", "grouped", "skip"] = field(
+        default="grouped",
         metadata={
-            "help": "Weight loading mode. 'broadcast': rank0 reads weights and broadcasts to other ranks (default, avoids disk I/O bottleneck). 'all_ranks': every rank reads weights from disk independently."
+            "help": (
+                "Weight loading mode. 'grouped' (default): one reader per node fan-outs dense "
+                "weights inside the node and one reader per EP-FSDP group fan-outs experts; when "
+                "grouped fanout groups are unavailable, it falls back to rank-0 loading. "
+                "'all_ranks': every rank reads weights from disk independently. 'skip': skip HF "
+                "weight loading entirely; use with load_checkpoint_path to materialize parameters "
+                "from a DCP checkpoint instead."
+            )
         },
     )
     enable_full_determinism: bool = field(
@@ -842,6 +929,17 @@ class TrainingArguments:
     cp_fsdp_mode: str = field(
         default="all",
         metadata={"help": "How to fold SP into FSDP: 'all' (ulysses+ring), 'ulysses_only', 'ring_only', or 'none'."},
+    )
+    moe_grad_reduce_mode: Literal["reduce_scatter", "bf16_a2a_fp32_sum"] = field(
+        default="reduce_scatter",
+        metadata={
+            "help": "Reduce-scatter strategy for MoE expert gradients on the ep_fsdp mesh dim. "
+            "'reduce_scatter': default NCCL reduce-scatter in FSDP's reduce_dtype (FP32). "
+            "'bf16_a2a_fp32_sum': stochastic-round FP32 grads to BF16, all-to-all across the "
+            "ep_fsdp group, then sum the received per-rank chunks locally in FP32. Halves "
+            "comm volume vs FP32 reduce-scatter while preserving FP32 accumulation precision. "
+            "Implements the MoE comm path of DeepSeek V4 §3.5.1. No effect on non-EP modules."
+        },
     )
     ckpt_manager: Literal["dcp"] = field(
         default="dcp",
@@ -982,9 +1080,12 @@ class TrainingArguments:
 
         # configure data parallel size
         if self.data_parallel_replicate_size > 0 and self.data_parallel_shard_size > 0:
-            assert self.data_parallel_size == self.data_parallel_replicate_size * self.data_parallel_shard_size, (
-                f"data_parallel_size should be equal to data_parallel_replicate_size: {self.data_parallel_replicate_size} * data_parallel_shard_size: {self.data_parallel_shard_size}."
-            )
+            if self.data_parallel_size != self.data_parallel_replicate_size * self.data_parallel_shard_size:
+                raise ValueError(
+                    f"data_parallel_size ({self.data_parallel_size}) should equal "
+                    f"data_parallel_replicate_size ({self.data_parallel_replicate_size}) * "
+                    f"data_parallel_shard_size ({self.data_parallel_shard_size})."
+                )
 
         elif self.data_parallel_replicate_size > 0:
             if self.data_parallel_size % self.data_parallel_replicate_size != 0:
@@ -1016,18 +1117,33 @@ class TrainingArguments:
                 "Otherwise, each node will save checkpoints to its local directory, which may cause inconsistencies or job failures."
             )
 
-        assert self.expert_parallel_size == 1 or self.init_device != "cpu", (
-            "cpu init is not supported when enable ep. Please use `init_device = cuda` or `init_device = meta` instead."
-        )
+        if self.expert_parallel_size != 1 and self.init_device == "cpu":
+            raise ValueError(
+                "cpu init is not supported when expert parallelism is enabled. "
+                "Please use `init_device = cuda` or `init_device = meta` instead."
+            )
 
-        if self.data_parallel_mode == "fsdp2":
-            assert self.init_device == "meta", "Please use init_device: meta for FSDP2 training"
+        if self.data_parallel_mode == "fsdp2" and self.init_device != "meta":
+            raise ValueError("Please use init_device: meta for FSDP2 training")
 
         if self.load_checkpoint_path == "auto":
             self.load_checkpoint_path = get_checkpoint_path(
                 output_dir=self.output_dir,
                 is_local_rank0=self.local_rank == 0,
                 ckpt_manager=self.ckpt_manager,
+            )
+
+        if self.load_weights_mode not in {"grouped", "all_ranks", "skip"}:
+            raise ValueError(
+                f"Unsupported load_weights_mode={self.load_weights_mode!r}. Expected one of: grouped, all_ranks, skip."
+            )
+
+        if self.load_weights_mode == "skip" and not self.load_checkpoint_path:
+            raise ValueError(
+                "load_weights_mode='skip' skips HF weight loading and relies on "
+                "load_checkpoint_path to materialize parameters from a DCP checkpoint. "
+                "Set load_checkpoint_path (e.g. to the output of scripts/convert_checkpoint.py) "
+                "or choose a different load_weights_mode."
             )
 
         # save paths
@@ -1049,13 +1165,16 @@ class TrainingArguments:
 
         # Prevent CUDA_LAUNCH_BLOCKING from being accidentally enabled
         if not self.allow_cuda_launch_blocking:
-            assert not self.enable_full_determinism, (
-                "allow_cuda_launch_blocking is disabled but enable_full_determinism is enabled. enable_full_determinism would set CUDA_LAUNCH_BLOCKING to 1!"
-            )
+            if self.enable_full_determinism:
+                raise ValueError(
+                    "allow_cuda_launch_blocking is disabled but enable_full_determinism is enabled. "
+                    "enable_full_determinism would set CUDA_LAUNCH_BLOCKING=1."
+                )
             cuda_launch_blocking_val = os.environ.get("CUDA_LAUNCH_BLOCKING", "").strip()
-            assert cuda_launch_blocking_val != "1", (
-                "CUDA_LAUNCH_BLOCKING=1 is set when allow_cuda_launch_blocking is not enabled!"
-            )
+            if cuda_launch_blocking_val == "1":
+                raise ValueError(
+                    "CUDA_LAUNCH_BLOCKING=1 is set in the environment but allow_cuda_launch_blocking is not enabled."
+                )
 
 
 @dataclass
@@ -1156,6 +1275,16 @@ class LoRAArguments:
     aqn_alpha: float = field(
         default=1.0,
         metadata={"help": "Scale factor for AQN noise magnitude."},
+    )
+    moe_hybrid_shared_lora: bool = field(
+        default=False,
+        metadata={
+            "help": "Route MoE LoRA injection through the hybrid-shared "
+            "(group-GEMM) path that shares lora_A across gate/up and "
+            "lora_B across down. Only meaningful for MoE models. "
+            "Read by Trainer._inject_lora; without this field on the "
+            "dataclass any local LoRA training run AttributeErrors out."
+        },
     )
 
 
@@ -1279,8 +1408,8 @@ def parse_args(rootclass: T) -> T:
         base_to_subclass[base] = subclass.default_factory
         try:
             type_hints: Dict[str, type] = get_type_hints(subclass.default_factory)
-        except Exception:
-            raise RuntimeError(f"Type resolution failed for {subclass.default_factory}.")
+        except (NameError, TypeError, AttributeError) as e:
+            raise RuntimeError(f"Type resolution failed for {subclass.default_factory}.") from e
 
         for attr in fields(subclass.default_factory):
             if not attr.init:
@@ -1316,8 +1445,8 @@ def parse_args(rootclass: T) -> T:
         base = subclass.name
         try:
             type_hints: Dict[str, type] = get_type_hints(subclass.default_factory)
-        except Exception:
-            raise RuntimeError(f"Type resolution failed for {subclass.default_factory}.")
+        except (NameError, TypeError, AttributeError) as e:
+            raise RuntimeError(f"Type resolution failed for {subclass.default_factory}.") from e
 
         for attr in fields(subclass.default_factory):
             if not attr.init:

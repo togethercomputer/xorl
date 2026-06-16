@@ -70,7 +70,7 @@ This page covers how `Trainer` is structured for local training — the training
 |---|---|---|
 | 1 | `_bootstrap()` | Init distributed (torchrun env), set device, seed, build `ParallelState` |
 | 2 | `_build_model()` | Load foundation model config; inject LoRA/QLoRA if enabled |
-| 3 | `_parallelize()` | Apply TP plan, FSDP2/EP mesh, PP split; broadcast weights from rank 0 |
+| 3 | `_parallelize()` | Apply TP plan, FSDP2/EP mesh, PP split; load weights with grouped fanout |
 | 4 | `_build_data()` | Load tokenizer, prepare dataset, build `DataLoaderBuilder` with collator chain |
 | 5 | `_build_optimizer()` | Create AdamW/Muon optimizer; build LR scheduler |
 | 6 | `_setup_observability()` | Configure structured logging, W&B |
@@ -275,7 +275,7 @@ Packed bins are cached to disk (keyed by a hash of the packing config) so subseq
 4. Non-expert FSDP   — fully_shard(layer, mesh=fsdp_mesh)  per decoder block
 5. Root FSDP         — fully_shard(model, mesh=fsdp_mesh)  embeddings + lm_head
 6. PP split          — pipeline_module_split() → build_pp_stage() per rank
-7. Weight loading    — broadcast from rank 0 (or all_ranks read independently)
+7. Weight loading    — grouped fanout (or all_ranks read independently)
 ```
 
 For TP, the plan is read from the model config's `base_model_tp_plan` dict (maps FQN patterns → `colwise`/`rowwise`/`embedding` style strings). xorl resolves these to PyTorch `ParallelStyle` objects and calls `parallelize_module()`.

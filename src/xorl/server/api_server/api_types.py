@@ -6,7 +6,7 @@ Pydantic type definitions for FastAPI endpoints in the unified API server.
 
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_serializer, model_validator
 
 
 def _map_session_id_to_model_id(data: Any) -> Any:
@@ -58,7 +58,12 @@ InputType = Union[List[int], List[float], List[str], TensorData]
 
 
 class Datum(BaseModel):
-    """Single training example with model inputs and loss function inputs."""
+    """Single training example with model inputs and loss function inputs.
+
+    `labels` with the same length as `input_ids` are treated as HF-format labels
+    and shifted for next-token prediction. Use `target_tokens` for already shifted
+    RL/xorl-client style targets.
+    """
 
     model_input: Dict[str, InputType] = Field(..., description="Model input tensors (input_ids, position_ids, etc.)")
     loss_fn_inputs: Dict[str, InputType] = Field(..., description="Loss function input tensors (e.g., labels)")
@@ -172,8 +177,25 @@ class LossFnOutput(BaseModel):
         return super().model_dump_json(**kwargs)
 
 
+class LoRAConfigRequest(BaseModel):
+    """Per-session LoRA overrides accepted by create_model."""
+
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    lora_rank: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("lora_rank", "rank"),
+        description="LoRA rank override. Accepts Tinker's rank alias.",
+    )
+    lora_alpha: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("lora_alpha", "alpha"),
+        description="LoRA alpha override. Accepts Tinker's alpha alias.",
+    )
+
+
 class AdamParams(BaseModel):
-    """AdamW optimizer parameters."""
+    """Tinker-compatible AdamW optimizer parameters."""
 
     learning_rate: float = Field(default=0.0001, description="Learning rate")
     beta1: float = Field(default=0.9, description="First moment coefficient")
@@ -181,6 +203,41 @@ class AdamParams(BaseModel):
     eps: float = Field(default=1e-12, description="Numerical stability term")
     weight_decay: float = Field(default=0.0, description="Weight decay (decoupled)")
     grad_clip_norm: float = Field(default=0.0, description="Gradient clipping norm (0.0 = no clipping)")
+
+
+class OptimizerConfigRequest(BaseModel):
+    """Per-session optimizer overrides accepted by create_model."""
+
+    model_config = ConfigDict(extra="allow")
+
+    type: Optional[Literal["adamw", "anyprecision_adamw", "sgd", "signsgd", "muon"]] = Field(
+        default=None, description="Optimizer type"
+    )
+    learning_rate: Optional[float] = Field(default=None, description="Default learning rate for the session")
+    weight_decay: Optional[float] = Field(default=None, description="Weight decay")
+    optimizer_dtype: Optional[Literal["fp32", "bf16"]] = Field(default=None, description="Optimizer state dtype")
+    betas: Optional[List[float]] = Field(default=None, description="Adam-family beta coefficients")
+    eps: Optional[float] = Field(default=None, description="Adam-family epsilon")
+    optimizer_kwargs: Optional[Dict[str, Any]] = Field(default=None, description="Optimizer-specific kwargs")
+
+
+class LoRARuntimeConfig(BaseModel):
+    """Normalized LoRA runtime config returned by the API."""
+
+    lora_rank: int = Field(..., description="LoRA rank")
+    lora_alpha: int = Field(..., description="LoRA alpha")
+
+
+class OptimizerRuntimeConfig(BaseModel):
+    """Normalized optimizer runtime config returned by the API."""
+
+    type: Literal["adamw", "anyprecision_adamw", "sgd", "signsgd", "muon"] = Field(..., description="Optimizer type")
+    learning_rate: float = Field(..., description="Default learning rate for the session")
+    weight_decay: float = Field(..., description="Weight decay")
+    optimizer_dtype: Literal["fp32", "bf16"] = Field(..., description="Optimizer state dtype")
+    betas: Optional[List[float]] = Field(default=None, description="Adam-family beta coefficients")
+    eps: Optional[float] = Field(default=None, description="Adam-family epsilon")
+    optimizer_kwargs: Dict[str, Any] = Field(default_factory=dict, description="Optimizer-specific kwargs")
 
 
 # ============================================================================
@@ -265,14 +322,37 @@ class OptimStepRequest(BaseModel):
         default=None,
         description="Sequence ID for request ordering (ensures forward_backward executes before optim_step)",
     )
-    adam_params: AdamParams = Field(default_factory=AdamParams, description="AdamW optimizer parameters")
+    learning_rate: Optional[float] = Field(default=None, description="Optional per-step learning rate override")
     gradient_clip: Optional[float] = Field(default=None, description="Gradient clipping value")
+    adam_params: Optional[AdamParams] = Field(
+        default=None,
+        description="Legacy Tinker AdamW optimizer parameters. learning_rate/gradient_clip take precedence.",
+    )
 
     @model_validator(mode="before")
     @classmethod
-    def _map_tinker_fields(cls, data):
-        """Map tinker's session_id to model_id."""
-        return _map_session_id_to_model_id(data)
+    def _map_legacy_optimizer_fields(cls, data):
+        """Map legacy optimizer payloads onto the generic per-step LR field."""
+        if isinstance(data, dict):
+            if "session_id" in data and "model_id" not in data:
+                data["model_id"] = data["session_id"]
+            if "lr" in data and "learning_rate" not in data:
+                data["learning_rate"] = data["lr"]
+            if "adam_params" in data:
+                adam_params = data.get("adam_params") or {}
+                if isinstance(adam_params, dict):
+                    if "learning_rate" in adam_params and "learning_rate" not in data:
+                        data["learning_rate"] = adam_params["learning_rate"]
+                    if "grad_clip_norm" in adam_params and "gradient_clip" not in data:
+                        data["gradient_clip"] = adam_params["grad_clip_norm"]
+                else:
+                    learning_rate = getattr(adam_params, "learning_rate", None)
+                    if learning_rate is not None and "learning_rate" not in data:
+                        data["learning_rate"] = learning_rate
+                    gradient_clip = getattr(adam_params, "grad_clip_norm", None)
+                    if gradient_clip is not None and "gradient_clip" not in data:
+                        data["gradient_clip"] = gradient_clip
+        return data
 
 
 class OptimStepResponse(BaseModel):
@@ -371,6 +451,19 @@ class WeightsInfoResponse(BaseModel):
     base_model: str = Field(..., description="Base model name (e.g., 'Qwen/Qwen2.5-3B-Instruct')")
     is_lora: bool = Field(default=True, description="Whether this is a LoRA checkpoint")
     lora_rank: Optional[int] = Field(default=None, description="LoRA rank (if is_lora=True)")
+    lora_config: Optional[LoRARuntimeConfig] = Field(
+        default=None, description="Normalized LoRA runtime config for LoRA checkpoints"
+    )
+    optimizer_config: Optional[OptimizerRuntimeConfig] = Field(
+        default=None, description="Normalized optimizer runtime config for LoRA checkpoints"
+    )
+
+    @model_validator(mode="after")
+    def _mirror_lora_rank(self):
+        """Keep Tinker's flat lora_rank field in sync with the richer metadata."""
+        if self.lora_rank is None and self.lora_config is not None:
+            self.lora_rank = self.lora_config.lora_rank
+        return self
 
 
 class CreateModelRequest(BaseModel):
@@ -380,19 +473,16 @@ class CreateModelRequest(BaseModel):
 
     model_id: str = Field(default="default", description="Model identifier")
     base_model: str = Field(..., description="Base model name (e.g., 'Qwen/Qwen2.5-3B-Instruct')")
-    lora_config: Dict[str, Any] = Field(default_factory=dict, description="LoRA configuration (rank, alpha, etc.)")
+    lora_config: Optional[LoRAConfigRequest] = Field(default=None, description="Per-session LoRA overrides")
+    optimizer_config: Optional[OptimizerConfigRequest] = Field(
+        default=None, description="Per-session optimizer configuration"
+    )
 
     @model_validator(mode="before")
     @classmethod
     def _map_tinker_fields(cls, data):
         """Map tinker's session_id to model_id if model_id not provided."""
-        data = _map_session_id_to_model_id(data)
-        if isinstance(data, dict):
-            # Tinker sends lora_config with "rank" key; normalize to also include lora_rank
-            lora_cfg = data.get("lora_config")
-            if isinstance(lora_cfg, dict) and "rank" in lora_cfg and "lora_rank" not in lora_cfg:
-                lora_cfg["lora_rank"] = lora_cfg["rank"]
-        return data
+        return _map_session_id_to_model_id(data)
 
 
 class CreateModelResponse(BaseModel):
@@ -412,18 +502,15 @@ class CreateSessionRequest(BaseModel):
 
     session_id: Optional[str] = Field(default=None, description="Optional session identifier to register")
     base_model: Optional[str] = Field(default=None, description="Optional base model metadata for this session")
-    lora_config: Dict[str, Any] = Field(default_factory=dict, description="Optional LoRA metadata for this session")
+    lora_config: Optional[LoRAConfigRequest] = Field(
+        default=None, description="Optional LoRA metadata for this session"
+    )
 
     @model_validator(mode="before")
     @classmethod
     def _normalize_lora_config(cls, data):
         """Normalize optional LoRA metadata for parity with create_model."""
-        data = _map_model_id_to_session_id(data)
-        if isinstance(data, dict):
-            lora_cfg = data.get("lora_config")
-            if isinstance(lora_cfg, dict) and "rank" in lora_cfg and "lora_rank" not in lora_cfg:
-                lora_cfg["lora_rank"] = lora_cfg["rank"]
-        return data
+        return _map_model_id_to_session_id(data)
 
 
 class CreateSessionResponse(BaseModel):
@@ -652,11 +739,11 @@ class DeleteCheckpointResponse(BaseModel):
 
 
 class KillSessionRequest(BaseModel):
-    """API request for killing a full-weights training session.
+    """API request for killing a training session.
 
-    In full-weights training mode (enable_lora=False), the server operates in
-    single-tenant mode. This endpoint allows killing the active session to
-    start a new one.
+    In full-weight training mode, the server operates in single-tenant mode and
+    this endpoint clears the active session. In LoRA mode, it removes a
+    non-default tenant session from the worker and API registries.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -673,7 +760,7 @@ class KillSessionRequest(BaseModel):
 
 
 class KillSessionResponse(BaseModel):
-    """API response for killing a full-weights training session."""
+    """API response for killing a training session."""
 
     success: bool = Field(..., description="Whether the session was killed successfully")
     message: str = Field(..., description="Status message")
@@ -732,6 +819,9 @@ class InferenceEndpoint(BaseModel):
 
     host: str = Field(..., description="Hostname or IP address of the inference endpoint")
     port: int = Field(..., description="Port number of the inference endpoint")
+    worker_port: Optional[int] = Field(
+        default=None, description="Port number of the inference worker endpoint, if different from port"
+    )
     world_size: int = Field(default=1, description="Number of workers at this endpoint")
     healthy: bool = Field(default=True, description="Whether the endpoint is healthy")
     server_info: Optional[InferenceEndpointServerInfo] = Field(
@@ -744,6 +834,10 @@ class AddInferenceEndpointRequest(BaseModel):
 
     host: str = Field(..., description="Hostname or IP address of the inference endpoint")
     port: int = Field(..., description="Port number of the inference endpoint")
+    worker_port: Optional[int] = Field(
+        default=None,
+        description="Port number of the inference worker endpoint. Defaults to port when omitted.",
+    )
     world_size: int = Field(default=1, description="Number of workers at this endpoint")
     # Auto-sync configuration
     sync_weights: bool = Field(
@@ -809,7 +903,7 @@ class SyncInferenceWeightsRequest(BaseModel):
         "so stale KV entries from previous weights are evicted naturally.",
     )
     pause_mode: Literal["retract", "abort", "in_place"] = Field(
-        default="retract",
+        default="in_place",
         description="How to pause inference during weight sync. "
         "'retract' (default): retract running requests to waiting queue, re-execute after resume. "
         "'abort': abort and return all in-flight requests. "
@@ -844,6 +938,14 @@ class SyncInferenceWeightsResponse(BaseModel):
     total_bytes: int = Field(default=0, description="Total bytes transferred")
     num_parameters: int = Field(default=0, description="Number of parameters transferred")
     num_buckets: int = Field(default=0, description="Number of transfer buckets used")
+    timing_breakdown: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Optional phase timing breakdown from the trainer handler, in seconds",
+    )
+    p2p_rank_summaries: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Optional per-rank P2P transport timing summaries for tail-latency diagnosis",
+    )
     endpoints_synced: List[EndpointSyncResult] = Field(
         default_factory=list, description="Sync results for each endpoint"
     )
@@ -888,10 +990,18 @@ class CreateSamplingSessionRequest(BaseModel):
 
     This loads the specified LoRA adapter on all inference workers.
     The model_path can be:
+    - 'xorl://model_id/sampler_weights/adapter_name'
     - 'sampler_weights/adapter_name'
     - 'adapter_name' (just the name)
     """
 
+    model_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Training session to attribute the sampling adapter to for cleanup and LRU tracking. "
+            "When omitted, xorl:// model_id is used if present, otherwise 'default'."
+        ),
+    )
     model_path: str = Field(
         ...,
         description="Path to the LoRA adapter (e.g., 'sampler_weights/adapter-001' or just 'adapter-001')",

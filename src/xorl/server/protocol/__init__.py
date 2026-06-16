@@ -43,6 +43,7 @@ from xorl.server.protocol.operations import (  # noqa: F401
     OperationPayload,
     OptimStepData,
     RegisterAdapterData,
+    RegisterSessionData,
     SaveFullWeightsData,
     SaveLoraOnlyData,
     SaveStateData,

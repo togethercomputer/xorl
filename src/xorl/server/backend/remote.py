@@ -20,6 +20,7 @@ from xorl.server.protocol.operations import (
     ModelPassData,
     OptimStepData,
     RegisterAdapterData,
+    RegisterSessionData,
     SaveFullWeightsData,
     SaveLoraOnlyData,
     SaveStateData,
@@ -225,7 +226,14 @@ class RemoteBackend(Backend):
         return result
 
     async def forward_backward(
-        self, batches, loss_fn="causallm_loss", loss_fn_params=None, model_id=None, routed_experts=None, request_id=None
+        self,
+        batches,
+        loss_fn="causallm_loss",
+        loss_fn_params=None,
+        model_id=None,
+        routed_experts=None,
+        routed_expert_logits=None,
+        request_id=None,
     ):
         return await self._execute(
             "forward_backward",
@@ -235,11 +243,21 @@ class RemoteBackend(Backend):
                 loss_fn_params=loss_fn_params,
                 model_id=model_id,
                 routed_experts=routed_experts,
+                routed_expert_logits=routed_expert_logits,
             ),
             request_id=request_id,
         )
 
-    async def forward(self, batches, loss_fn="causallm_loss", loss_fn_params=None, model_id=None, request_id=None):
+    async def forward(
+        self,
+        batches,
+        loss_fn="causallm_loss",
+        loss_fn_params=None,
+        model_id=None,
+        routed_experts=None,
+        routed_expert_logits=None,
+        request_id=None,
+    ):
         return await self._execute(
             "forward",
             ModelPassData(
@@ -247,6 +265,8 @@ class RemoteBackend(Backend):
                 loss_fn=loss_fn,
                 loss_fn_params=loss_fn_params,
                 model_id=model_id,
+                routed_experts=routed_experts,
+                routed_expert_logits=routed_expert_logits,
             ),
             request_id=request_id,
         )
@@ -335,7 +355,7 @@ class RemoteBackend(Backend):
         buffer_size_mb=1024,
         sync_method="nccl_broadcast",
         flush_cache=False,
-        pause_mode="retract",
+        pause_mode="in_place",
         weight_version=None,
         quantization=None,
         request_id=None,
@@ -355,7 +375,19 @@ class RemoteBackend(Backend):
                 quantization=quantization,
             ),
             request_id=request_id,
-            timeout=600.0,
+            timeout=self.operation_timeout,
+        )
+
+    async def register_session(self, model_id="default", session_spec=None, materialize=False, request_id=None):
+        return await self._execute(
+            "register_session",
+            RegisterSessionData(
+                model_id=model_id,
+                session_spec=session_spec or {},
+                materialize=materialize,
+            ),
+            request_id=request_id,
+            timeout=60.0,
         )
 
     async def register_adapter(self, model_id="default", lr=1e-5, request_id=None):

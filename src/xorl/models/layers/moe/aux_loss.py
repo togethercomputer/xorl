@@ -48,6 +48,10 @@ def global_load_balancing_loss_func(
     if gate_logits is None or not isinstance(gate_logits, tuple):
         return 0
 
+    gate_logits = tuple(layer_gate for layer_gate in gate_logits if layer_gate is not None)
+    if not gate_logits:
+        return 0
+
     compute_device = gate_logits[0].device
     concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
 

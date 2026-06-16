@@ -512,8 +512,12 @@ def try_load_from_hub(args: Arguments, dataset_hash: str, split: str) -> Dataset
             token=args.data.hf_use_auth_token,
         )
         return dataset[split]
-    except Exception:
-        LOG.info_rank0("Unable to find prepared dataset in HuggingFace Hub")
+    except Exception as e:
+        # `datasets.load_dataset` raises a wide variety of exception types
+        # (FileNotFoundError, requests.HTTPError, datasets.exceptions.*, etc.)
+        # so this remains a broad catch — but log the cause so failures are
+        # debuggable instead of silently turning into "not found".
+        LOG.info_rank0(f"Unable to find prepared dataset in HuggingFace Hub: {type(e).__name__}: {e}")
         return None
 
 

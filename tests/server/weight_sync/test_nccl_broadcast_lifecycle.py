@@ -33,7 +33,7 @@ class _StickyTCPStore:
     open_ports = set()
     next_ephemeral_port = 31000
 
-    def __init__(self, host_name, port, world_size, is_master, timeout):
+    def __init__(self, host_name, port, world_size, is_master, timeout, **_kwargs):
         del host_name, world_size, is_master, timeout
         if port == 0:
             port = self.next_ephemeral_port

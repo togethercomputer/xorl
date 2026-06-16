@@ -12,13 +12,16 @@ import tempfile
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import HTTPException
 from fastapi.exceptions import HTTPException
 
 from xorl.server.api_server.api_types import (
+    CreateSamplingSessionRequest,
     DeleteCheckpointRequest,
+    InferenceEndpoint,
     ListCheckpointsRequest,
     LoadWeightsRequest,
+    RemoveInferenceEndpointRequest,
+    SaveWeightsForSamplerRequest,
     SaveWeightsRequest,
 )
 from xorl.server.api_server.server import APIServer
@@ -361,10 +364,12 @@ class TestSamplerWeightsAndAdapterTracking:
         # --- Path resolution ---
         ap = os.path.join(self.temp_dir, "sampler_weights", "a-001")
         os.makedirs(ap, exist_ok=True)
-        name, path = self.server._resolve_model_path("sampler_weights/a-001")
-        assert name == "a-001" and path == ap
-        name, path = self.server._resolve_model_path("a-001")
-        assert name == "a-001"
+        model_id, name, path = self.server._resolve_model_path("sampler_weights/a-001")
+        assert model_id is None and name == "a-001" and path == ap
+        model_id, name, path = self.server._resolve_model_path("a-001")
+        assert model_id is None and name == "a-001"
+        model_id, name, path = self.server._resolve_model_path("xorl://session-a/sampler_weights/a-001")
+        assert model_id == "session-a" and name == "a-001" and path == ap
 
         with pytest.raises(HTTPException) as exc_info:
             self.server._resolve_model_path("nonexistent")
@@ -377,6 +382,147 @@ class TestSamplerWeightsAndAdapterTracking:
         assert self.server._track_adapter("adapter-001", "/path/1") is True
         assert self.server.loaded_sampling_loras["default"][-1] == ("adapter-001", "/path/1")
         assert len(self.server.loaded_sampling_loras) == 1
+
+    def test_save_weights_for_sampler_uses_normalized_lora_session_spec(self):
+        """Normalized session specs should still export adapter-only sampler weights."""
+        self.server._running = True
+        self.server.orchestrator_client = MagicMock()
+        self.server.orchestrator_client.send_request = AsyncMock(return_value=AsyncMock())
+        self.server.model_configs["adapter-run"] = {
+            "base_model": "Qwen/Qwen3-8B",
+            "is_lora": True,
+            "lora_config": {"lora_rank": 8, "lora_alpha": 16},
+            "optimizer_config": {
+                "type": "signsgd",
+                "learning_rate": 2e-4,
+                "weight_decay": 0.0,
+                "optimizer_dtype": "bf16",
+                "betas": None,
+                "eps": None,
+                "optimizer_kwargs": {},
+            },
+        }
+
+        mock_output = MagicMock()
+        mock_output.outputs = [{"lora_path": os.path.join(self.temp_dir, "sampler_weights", "adapter-export")}]
+
+        with patch.object(self.server, "_wait_for_response", return_value=mock_output):
+            response = asyncio.run(
+                self.server.save_weights_for_sampler(
+                    SaveWeightsForSamplerRequest(model_id="adapter-run", name="adapter-export")
+                )
+            )
+
+        request = self.server.orchestrator_client.send_request.await_args.args[0]
+        assert request.operation == "save_lora_only"
+        assert request.payload.lora_path.endswith("sampler_weights/adapter-export")
+        assert response.path == "xorl://adapter-run/sampler_weights/adapter-export"
+
+    def test_create_sampling_session_prunes_stale_tracking_before_eviction(self):
+        """Stale tracked adapters should not force a bogus unload before loading a fresh adapter."""
+        fresh_path = os.path.join(self.temp_dir, "sampler_weights", "fresh-001")
+        os.makedirs(fresh_path, exist_ok=True)
+
+        self.server.inference_endpoints = [MagicMock()]
+        self.server.max_adapters_per_model = 1
+        self.server.loaded_sampling_loras["default"] = [("stale-001", "/stale/path")]
+        self.server._get_loaded_adapters_from_endpoint = AsyncMock(return_value=[])
+        self.server._load_lora_on_inference_endpoints = AsyncMock(return_value=True)
+        self.server._unload_lora_on_inference_endpoints = AsyncMock(return_value=True)
+
+        response = asyncio.run(
+            self.server.create_sampling_session(CreateSamplingSessionRequest(model_path="fresh-001"))
+        )
+
+        assert response.lora_name == "fresh-001"
+        self.server._unload_lora_on_inference_endpoints.assert_not_awaited()
+        self.server._load_lora_on_inference_endpoints.assert_awaited_once_with("fresh-001", fresh_path)
+        assert self.server.loaded_sampling_loras["default"] == [("fresh-001", fresh_path)]
+
+    def test_reconcile_preserves_tracking_when_loaded_adapter_query_fails(self):
+        """A transient endpoint introspection failure should not erase tracked sampler adapters."""
+        self.server.inference_endpoints = [MagicMock()]
+        self.server.loaded_sampling_loras["default"] = [("tracked-001", "/tracked/path")]
+        self.server._get_loaded_adapters_from_endpoint = AsyncMock(return_value=None)
+
+        loaded_by_endpoint = asyncio.run(self.server._reconcile_tracked_adapters("default"))
+
+        assert loaded_by_endpoint == [set()]
+        assert self.server.loaded_sampling_loras["default"] == [("tracked-001", "/tracked/path")]
+
+    def test_create_sampling_session_tracks_xorl_uri_under_uri_model_id(self):
+        """xorl:// sampler URIs should keep the embedded model_id for cleanup tracking."""
+        uri_path = os.path.join(self.temp_dir, "sampler_weights", "session-a-adapter")
+        os.makedirs(uri_path, exist_ok=True)
+
+        self.server.inference_endpoints = [MagicMock()]
+        self.server._get_loaded_adapters_from_endpoint = AsyncMock(return_value=[])
+        self.server._load_lora_on_inference_endpoints = AsyncMock(return_value=True)
+
+        response = asyncio.run(
+            self.server.create_sampling_session(
+                CreateSamplingSessionRequest(model_path="xorl://session-a/sampler_weights/session-a-adapter")
+            )
+        )
+
+        assert response.lora_name == "session-a-adapter"
+        assert self.server.loaded_sampling_loras["session-a"] == [("session-a-adapter", uri_path)]
+        assert self.server.loaded_sampling_loras.get("default", []) == []
+
+    def test_create_sampling_session_tracks_plain_path_under_request_model_id(self):
+        """Explicit model_id should control tracking for plain sampler paths."""
+        session_path = os.path.join(self.temp_dir, "sampler_weights", "shared-adapter")
+        os.makedirs(session_path, exist_ok=True)
+
+        self.server.inference_endpoints = [MagicMock()]
+        self.server._get_loaded_adapters_from_endpoint = AsyncMock(return_value=[])
+        self.server._load_lora_on_inference_endpoints = AsyncMock(return_value=True)
+
+        response = asyncio.run(
+            self.server.create_sampling_session(
+                CreateSamplingSessionRequest(model_id="session-b", model_path="shared-adapter")
+            )
+        )
+
+        assert response.lora_name == "shared-adapter"
+        assert self.server.loaded_sampling_loras["session-b"] == [("shared-adapter", session_path)]
+        assert self.server.loaded_sampling_loras.get("default", []) == []
+
+    def test_create_sampling_session_does_not_track_failed_loads(self):
+        """A failed sampling-session load should not leave a stale adapter in the tracking list."""
+        failing_path = os.path.join(self.temp_dir, "sampler_weights", "failing-001")
+        os.makedirs(failing_path, exist_ok=True)
+
+        self.server.inference_endpoints = [MagicMock()]
+        self.server._get_loaded_adapters_from_endpoint = AsyncMock(return_value=[])
+        self.server._load_lora_on_inference_endpoints = AsyncMock(
+            side_effect=HTTPException(status_code=500, detail="load failed")
+        )
+
+        with pytest.raises(HTTPException):
+            asyncio.run(self.server.create_sampling_session(CreateSamplingSessionRequest(model_path="failing-001")))
+
+        assert self.server.loaded_sampling_loras.get("default", []) == []
+
+    def test_remove_last_inference_endpoint_clears_tracking(self):
+        """Dropping the last inference endpoint should also clear sampler tracking state."""
+        self.server.inference_endpoints = [
+            InferenceEndpoint(
+                host="sgl.local",
+                port=30000,
+                worker_port=29999,
+                world_size=1,
+                healthy=True,
+                server_info=None,
+            )
+        ]
+        self.server.loaded_sampling_loras["default"] = [("adapter-001", "/path/1")]
+
+        response = self.server.remove_inference_endpoint(RemoveInferenceEndpointRequest(host="sgl.local", port=30000))
+
+        assert response.success is True
+        assert self.server.inference_endpoints == []
+        assert self.server.loaded_sampling_loras == {}
 
 
 if __name__ == "__main__":

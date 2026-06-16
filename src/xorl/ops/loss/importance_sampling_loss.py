@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import torch
 import torch.distributed as dist
 
 from xorl.ops.loss.loss_output import LossOutput
 from xorl.ops.loss.per_token_ce import compute_per_token_ce
+from xorl.ops.loss.reducers import Reducer, TokenPartial
 
 
 def importance_sampling_loss_function(
@@ -22,6 +23,8 @@ def importance_sampling_loss_function(
     tp_group: Optional[dist.ProcessGroup] = None,
     compute_kl_stats: bool = False,
     lm_head_fp32: bool = False,
+    loss_reducer: Optional[Reducer] = None,
+    metric_reducer: Optional[Reducer] = None,
 ) -> "LossOutput":
     """
     Compute importance sampling loss for GRPO/RL training.
@@ -50,6 +53,13 @@ def importance_sampling_loss_function(
                            where log_ratio = new_logprobs - old_logprobs. Non-negative, unbiased, lower variance.
                          - entropy_sample: -mean(old_logprobs) over valid tokens
                          - valid_tokens: Count of valid tokens
+        loss_reducer: Reduces per-token loss to a scalar partial share. None =>
+            ``TokenPartial(scale=valid_mask.sum())`` (legacy local token-mean; does
+            not compose across micro-batches/ranks). Pass a shared global-scale
+            reducer to make summed partial shares recover the global loss.
+        metric_reducer: Reduces per-token /mean metrics (ratio_mean,
+            kl_sample_train_k3, entropy_sample). ratio_min/ratio_max stay local
+            scalars and bypass it.
 
     Returns:
         LossOutput with loss, per_token_logprobs, per_token_loss, and metrics.
@@ -65,7 +75,13 @@ def importance_sampling_loss_function(
 
     # Valid/action mask
     valid_mask = labels_flat != ignore_index
-    n_valid = valid_mask.sum().clamp(min=1).float()
+    valid_mask_f = valid_mask.float()
+    valid_count = valid_mask.sum()
+
+    if loss_reducer is None:
+        loss_reducer = TokenPartial(scale=valid_count.float())
+    if metric_reducer is None:
+        metric_reducer = TokenPartial(scale=valid_count.float())
 
     # ---- Cross-entropy computation ----
     per_token_ce = compute_per_token_ce(
@@ -93,42 +109,34 @@ def importance_sampling_loss_function(
     per_token_pg = per_token_pg.masked_fill(~valid_mask, 0.0)
 
     # ---- Option B: value from true PG, grad from weighted CE surrogate ----
-    true_pg = per_token_pg.sum() / n_valid
+    true_pg = loss_reducer(per_token_pg, valid_mask_f)
 
     w = (ratio.detach() * advantages_flat).masked_fill(~valid_mask, 0.0)
-    surrogate = (w * per_token_ce).sum() / n_valid
+    surrogate = loss_reducer(w * per_token_ce, valid_mask_f)
 
     loss = true_pg.detach() + surrogate - surrogate.detach()
 
-    # Compute metrics for logging (convert to Python floats for JSON serialization)
-    valid_ratio = ratio[valid_mask] if valid_mask.any() else ratio
-    metrics = {
-        "ratio_mean": valid_ratio.mean().detach().item(),
-        "ratio_min": valid_ratio.min().detach().item(),
-        "ratio_max": valid_ratio.max().detach().item(),
+    # ±inf identity on empty ranks lets cross-rank MIN/MAX-allreduce ignore empty contributors.
+    if valid_mask.any():
+        ratio_min = ratio.masked_fill(~valid_mask, float("inf")).min()
+        ratio_max = ratio.masked_fill(~valid_mask, float("-inf")).max()
+    else:
+        ratio_min = ratio.new_tensor(float("inf"))
+        ratio_max = ratio.new_tensor(float("-inf"))
+    metrics: Dict[str, Any] = {
+        "ratio_mean": metric_reducer(ratio, valid_mask_f).detach(),
+        "ratio_min": ratio_min.detach(),
+        "ratio_max": ratio_max.detach(),
     }
 
-    # Optionally compute KL statistics
     if compute_kl_stats:
         with torch.no_grad():
-            _n_valid_kl = valid_mask.sum().item()  # TRUE count, no clamp
-            if valid_mask.any():
-                valid_old = old_logprobs_flat[valid_mask]
-                valid_new = new_logprobs_flat[valid_mask]
-                log_ratio = valid_new - valid_old
-
-                # K3 estimator (Schulman): exp(log_ratio) - log_ratio - 1
-                # Non-negative, unbiased, lower variance than K1/K2
-                k3 = (torch.exp(log_ratio) - log_ratio - 1.0).mean().item()
-                metrics["kl_sample_train_k3"] = k3
-                metrics["entropy_sample"] = -valid_old.mean().item()
-                metrics["valid_tokens"] = _n_valid_kl
-                metrics["_n_valid_kl"] = _n_valid_kl
-            else:
-                metrics["kl_sample_train_k3"] = 0.0
-                metrics["entropy_sample"] = 0.0
-                metrics["valid_tokens"] = 0
-                metrics["_n_valid_kl"] = 0
+            log_ratio_full = (new_logprobs_flat - old_logprobs_flat).masked_fill(~valid_mask, 0.0)
+            ratio_full = torch.exp(log_ratio_full)
+            per_token_k3 = ratio_full - log_ratio_full - 1.0
+            metrics["kl_sample_train_k3"] = metric_reducer(per_token_k3, valid_mask_f)
+            metrics["entropy_sample"] = metric_reducer(-old_logprobs_flat, valid_mask_f)
+            metrics["valid_tokens"] = valid_count.item()
 
     # Reshape per-token outputs
     per_token_logprobs = new_logprobs_flat.view(original_shape)
@@ -139,4 +147,5 @@ def importance_sampling_loss_function(
         per_token_logprobs=per_token_logprobs,
         per_token_loss=per_token_loss,
         metrics=metrics,
+        metric_ops={"ratio_min": "min", "ratio_max": "max"},
     )

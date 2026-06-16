@@ -44,6 +44,7 @@ from typing import Any, Dict, List, Optional
 import uvicorn
 from fastapi import FastAPI, HTTPException, status
 
+import xorl.server.api_server._state as _state
 from xorl.server.api_server.api_types import (
     InferenceEndpoint,
     LossFnOutput,
@@ -61,6 +62,7 @@ from xorl.server.api_server.utils import (
 from xorl.server.api_server.weights import WeightsMixin
 from xorl.server.protocol.api_orchestrator import OrchestratorRequest
 from xorl.server.protocol.operations import KillSessionData
+from xorl.server.session_spec import normalize_session_spec
 
 
 logger = logging.getLogger(__name__)
@@ -86,18 +88,23 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
         default_timeout: float = 120.0,
         output_dir: str = "outputs",
         base_model: Optional[str] = None,
+        default_session_spec: Optional[Dict[str, Any]] = None,
+        server_lora_config: Optional[Dict[str, Any]] = None,
+        max_lora_rank: Optional[int] = None,
         storage_limit: str = "10TB",
         max_sampling_loras: int = 3,
         idle_session_timeout: float = 7200.0,
         skip_initial_checkpoint: bool = False,
         sync_inference_method: str = "nccl_broadcast",
+        train_config: Optional[Dict[str, Any]] = None,
+        lora_config: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize Unified API Server.
 
         Args:
             engine_input_addr: Engine input address (ROUTER binds here)
-            engine_output_addr: Engine output address (PULL connects here)
+            engine_output_addr: Engine output address (PULL binds here)
             default_timeout: Default timeout for engine operations
             output_dir: Output directory for checkpoints and sampler weights (must be on shared filesystem)
             base_model: Base model name that this server is configured for (e.g., 'Qwen/Qwen2.5-3B-Instruct').
@@ -112,15 +119,25 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
                                     This is useful for full-weight mode to avoid memory issues during save.
             sync_inference_method: Method for syncing weights to inference endpoints.
                                Currently only 'nccl_broadcast' is supported.
+            train_config: Server train config used as defaults for per-session optimizer specs.
+            lora_config: Server LoRA config used as defaults and limits for per-session LoRA specs.
         """
         self.engine_input_addr = engine_input_addr
         self.engine_output_addr = engine_output_addr
         self.default_timeout = default_timeout
         self.output_dir = output_dir
         self.base_model = base_model
+        self.default_session_spec = default_session_spec
+        self.server_lora_config = server_lora_config or {}
+        self.max_lora_rank = max_lora_rank or self.server_lora_config.get(
+            "max_lora_rank",
+            self.default_session_spec["lora_config"]["lora_rank"] if self.default_session_spec is not None else None,
+        )
         self.storage_limit = storage_limit
         self.max_sampling_loras = max_sampling_loras
         self.sync_inference_method = sync_inference_method
+        self.train_config = dict(train_config or {})
+        self.lora_config = dict(lora_config or {})
 
         # OrchestratorClient
         self.orchestrator_client: Optional[OrchestratorClient] = None
@@ -143,18 +160,22 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
         # "default" is pre-registered to allow direct API usage without create_model
         self.registered_model_ids: set = {"default"}
 
-        # Model config registry for storing LoRA configs
-        # Maps model_id -> {"base_model": str, "lora_config": dict}
-        # Used by /api/v1/weights_info to return checkpoint metadata
+        # Normalized session-spec registry
+        # Maps model_id -> {"base_model", "lora_config", "optimizer_config", ...}
         self.model_configs: Dict[str, Dict[str, Any]] = {}
+        if default_session_spec is not None:
+            self.model_configs["default"] = default_session_spec
 
         # Sampling session LoRA tracking (per-model_id, LRU order - oldest first)
         # Maps model_id -> List of (lora_name, model_path) tuples for loaded adapters
         # Each model_id has its own set of tracked adapters to support parallel training runs
         self.loaded_sampling_loras: Dict[str, List[tuple]] = {}
 
-        # Maximum number of adapters per model_id for sampling
-        self.max_adapters_per_model: int = 3
+        # Maximum number of adapters per model_id for sampling. Default is intentionally
+        # generous (was 3) because SGLang's /unload_lora_adapter has been observed to
+        # hang on 30B-class hosts, so eviction during a multi-step OPD run wedges the
+        # session. Override via XORL_MAX_ADAPTERS_PER_MODEL when needed.
+        self.max_adapters_per_model: int = int(os.environ.get("XORL_MAX_ADAPTERS_PER_MODEL", "32"))
 
         # Session activity tracking for idle cleanup
         # Maps model_id -> last activity timestamp (time.time())
@@ -171,16 +192,41 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
         # Organized by model_id for session-based cleanup
         self.future_store: Optional[FutureStore] = None
 
-        # Flag to track if initial checkpoint "000000" has been saved
-        # This should only happen once when the first model is created after server start
-        # Set to True if skip_initial_checkpoint is True to prevent auto-save in create_model
-        self._initial_checkpoint_saved: bool = skip_initial_checkpoint
+        # Whether create_model should skip auto-saving the reserved initial
+        # checkpoint "000000" for each training session.
+        self._skip_initial_checkpoint: bool = skip_initial_checkpoint
 
         logger.info(
             f"APIServer initialized: "
             f"engine_input={engine_input_addr}, engine_output={engine_output_addr}, "
             f"base_model={base_model}, storage_limit={storage_limit}, "
             f"idle_session_timeout={self.idle_session_timeout}s"
+        )
+
+    def build_lora_session_spec(
+        self,
+        *,
+        base_model: str,
+        raw_lora_config: Optional[Dict[str, Any]] = None,
+        raw_optimizer_config: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Build the normalized worker session spec for a create_model request."""
+        server_lora_config = dict(self.lora_config or {})
+        default_rank = int(server_lora_config.get("lora_rank", 32))
+        max_lora_rank = int(server_lora_config.get("max_lora_rank", default_rank))
+        return normalize_session_spec(
+            base_model=base_model,
+            raw_lora_config=raw_lora_config,
+            raw_optimizer_config=raw_optimizer_config,
+            default_rank=default_rank,
+            default_alpha=int(server_lora_config.get("lora_alpha", 16)),
+            max_lora_rank=max_lora_rank,
+            default_optimizer_type=self.train_config.get("optimizer", "adamw"),
+            default_learning_rate=float(self.train_config.get("lr", 1e-5)),
+            default_weight_decay=float(self.train_config.get("weight_decay", 0.01)),
+            default_optimizer_dtype=self.train_config.get("optimizer_dtype", "bf16"),
+            default_optimizer_kwargs=self.train_config.get("optimizer_kwargs", {}),
+            server_lora_config=server_lora_config,
         )
 
     def validate_model_id(self, model_id: str) -> None:
@@ -265,11 +311,15 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
     @staticmethod
     def _build_info(result: Dict[str, Any]) -> Dict[str, Any]:
         """Extract auto-load info from engine result."""
+        info: Dict[str, Any] = {}
         if result.get("auto_loaded"):
-            return {"auto_loaded": True, "auto_load_path": result.get("auto_load_path")}
-        return {}
+            info["auto_loaded"] = True
+            info["auto_load_path"] = result.get("auto_load_path")
+        if "teacher_hidden_cache" in result:
+            info["teacher_hidden_cache"] = result["teacher_hidden_cache"]
+        return info
 
-    async def _cleanup_session(self, model_id: str) -> None:
+    async def _cleanup_session(self, model_id: str, *, notify_workers: bool = True) -> None:
         """
         Clean up all server-side state for a session.
 
@@ -279,37 +329,41 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
 
         Args:
             model_id: The model identifier to clean up
+            notify_workers: Whether to send a kill_session command to workers first
         """
         logger.info(f"Cleaning up session: {model_id}")
+        preserve_default_registration = model_id == "default"
 
-        # For full-weights training mode, send kill_session to workers to reset their state
-        # This ensures workers don't reject new sessions due to stale active session
-        try:
-            engine_request = OrchestratorRequest(
-                operation="kill_session",
-                payload=KillSessionData(
-                    model_id=model_id,
-                    save_checkpoint=False,  # Don't save checkpoint on idle cleanup
-                ),
-            )
+        if notify_workers:
+            # Send kill_session to workers before dropping local state.
+            try:
+                engine_request = OrchestratorRequest(
+                    operation="kill_session",
+                    payload=KillSessionData(
+                        model_id=model_id,
+                        save_checkpoint=False,  # Don't save checkpoint on idle cleanup
+                    ),
+                )
 
-            response_future = await self.orchestrator_client.send_request(engine_request)
-            output = await self._wait_for_response(
-                response_future,
-                engine_request.request_id,
-                timeout=60.0,  # Shorter timeout for cleanup
-                timeout_message=f"Kill session timeout during cleanup for {model_id}",
-            )
+                response_future = await self.orchestrator_client.send_request(engine_request)
+                output = await self._wait_for_response(
+                    response_future,
+                    engine_request.request_id,
+                    timeout=60.0,  # Shorter timeout for cleanup
+                    timeout_message=f"Kill session timeout during cleanup for {model_id}",
+                )
 
-            result = output.outputs[0] if output.outputs else {}
-            if result.get("success"):
-                logger.info(f"Workers acknowledged session cleanup for {model_id}")
-            else:
-                logger.warning(f"Workers returned non-success for session cleanup: {result.get('message', 'unknown')}")
+                result = output.outputs[0] if output.outputs else {}
+                if result.get("success"):
+                    logger.info(f"Workers acknowledged session cleanup for {model_id}")
+                else:
+                    logger.warning(
+                        f"Workers returned non-success for session cleanup: {result.get('message', 'unknown')}"
+                    )
 
-        except Exception as e:
-            # Log but don't fail - we still want to clean up local state
-            logger.warning(f"Failed to notify workers of session cleanup for {model_id}: {e}")
+            except Exception as e:
+                # Log but don't fail - we still want to clean up local state
+                logger.warning(f"Failed to notify workers of session cleanup for {model_id}: {e}")
 
         # Unload sampling adapters from SGL inference endpoints BEFORE removing tracking
         # This ensures we actually send unload requests to SGL
@@ -323,8 +377,9 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
         # Remove from tracking structures
         # Note: _unload_adapters_for_model clears loaded_sampling_loras[model_id] to [],
         # so we pop to fully remove the entry
-        self.registered_model_ids.discard(model_id)
-        self.model_configs.pop(model_id, None)
+        if not preserve_default_registration:
+            self.registered_model_ids.discard(model_id)
+            self.model_configs.pop(model_id, None)
         self.session_last_activity.pop(model_id, None)
         self.loaded_sampling_loras.pop(model_id, None)
 
@@ -333,9 +388,6 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
             deleted_count = await self.future_store.delete_by_model(model_id)
             if deleted_count > 0:
                 logger.info(f"Cleaned up {deleted_count} futures for session {model_id}")
-
-        # Training adapters on workers are managed via LRU eviction
-        # No explicit unload needed - workers will evict when memory pressure occurs
 
         logger.info(f"Session {model_id} cleaned up successfully")
 
@@ -357,6 +409,7 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
                     (model_id, last_activity)
                     for model_id, last_activity in list(self.session_last_activity.items())
                     if current_time - last_activity > self.idle_session_timeout
+                    and not (self.default_session_spec is not None and model_id == "default")
                 ]
 
                 for model_id, last_activity in idle_model_ids:
@@ -460,13 +513,6 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
 
         self._running = False
         logger.info("APIServer stopped")
-
-
-# ============================================================================
-# Global API Server Instance
-# ============================================================================
-
-import xorl.server.api_server._state as _state
 
 
 @asynccontextmanager

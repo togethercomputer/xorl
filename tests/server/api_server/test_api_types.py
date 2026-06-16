@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from xorl.server.api_server.api_types import (
     AdamParams,
     CreateModelRequest,
+    CreateSessionRequest,
     Datum,
     DatumInput,
     ErrorResponse,
@@ -18,13 +19,16 @@ from xorl.server.api_server.api_types import (
     HealthCheckResponse,
     LoadWeightsRequest,
     LoadWeightsResponse,
+    LoRAConfigRequest,
     LossFnOutput,
+    OptimizerConfigRequest,
     OptimStepRequest,
     OptimStepResponse,
     SaveWeightsForSamplerRequest,
     SaveWeightsForSamplerResponse,
     SaveWeightsRequest,
     SaveWeightsResponse,
+    WeightsInfoResponse,
 )
 
 
@@ -137,29 +141,66 @@ class TestOptimWeightsHealthAndSerialization:
     """Test OptimStep, Weights, Health, Error types and serialization."""
 
     def test_optim_step_types(self):
-        """Test AdamParams, OptimStepRequest and OptimStepResponse."""
-        params = AdamParams(learning_rate=0.001, beta1=0.9, beta2=0.999, eps=1e-8)
-        assert params.learning_rate == 0.001
+        """Test optimizer/session request types and OptimStepRequest/Response."""
+        optimizer = OptimizerConfigRequest(
+            type="adamw",
+            learning_rate=0.001,
+            betas=[0.9, 0.999],
+            eps=1e-8,
+        )
+        assert optimizer.learning_rate == 0.001
+        assert optimizer.betas == [0.9, 0.999]
 
-        defaults = AdamParams()
-        assert defaults.learning_rate == 0.0001
-        assert defaults.beta1 == 0.9
-        assert defaults.beta2 == 0.95
-        assert defaults.eps == 1e-12
+        lora = LoRAConfigRequest(rank=8, alpha=16)
+        assert lora.lora_rank == 8
+        assert lora.lora_alpha == 16
+        assert lora.model_dump(exclude_none=True) == {"lora_rank": 8, "lora_alpha": 16}
+        assert set(LoRAConfigRequest.model_json_schema()["properties"]) == {"lora_rank", "lora_alpha"}
+
+        create_request = CreateModelRequest(
+            model_id="session-a",
+            base_model="Qwen/Qwen3-8B",
+            lora_config=LoRAConfigRequest(rank=8, alpha=16),
+            optimizer_config=OptimizerConfigRequest(type="signsgd", learning_rate=2e-4),
+        )
+        assert create_request.lora_config is not None
+        assert create_request.lora_config.lora_rank == 8
+        assert create_request.optimizer_config is not None
+        assert create_request.optimizer_config.type == "signsgd"
+
+        create_session_request = CreateSessionRequest(lora_config={"rank": 4, "alpha": 10})
+        assert create_session_request.lora_config is not None
+        assert create_session_request.lora_config.model_dump(exclude_none=True) == {
+            "lora_rank": 4,
+            "lora_alpha": 10,
+        }
 
         request = OptimStepRequest(
             model_id="test-model",
-            adam_params=AdamParams(learning_rate=1e-4),
+            learning_rate=1e-4,
             gradient_clip=1.0,
         )
         assert request.model_id == "test-model"
-        assert request.adam_params.learning_rate == 1e-4
+        assert request.learning_rate == 1e-4
         assert request.gradient_clip == 1.0
 
         request = OptimStepRequest()
         assert request.model_id == "default"
-        assert request.adam_params.learning_rate == 0.0001
+        assert request.learning_rate is None
         assert request.gradient_clip is None
+        assert request.adam_params is None
+
+        legacy_request = OptimStepRequest(
+            **{
+                "session_id": "legacy-session",
+                "adam_params": {"learning_rate": 2e-4, "grad_clip_norm": 1.5},
+            }
+        )
+        assert legacy_request.model_id == "legacy-session"
+        assert legacy_request.learning_rate == pytest.approx(2e-4)
+        assert legacy_request.gradient_clip == pytest.approx(1.5)
+        assert isinstance(legacy_request.adam_params, AdamParams)
+        assert legacy_request.adam_params.learning_rate == pytest.approx(2e-4)
 
         response = OptimStepResponse(
             metrics={"grad_norm": 1.234, "learning_rate": 1e-4, "step": 100},
@@ -168,6 +209,45 @@ class TestOptimWeightsHealthAndSerialization:
         assert response.metrics["grad_norm"] == 1.234
         response = OptimStepResponse(metrics={}, info={})
         assert len(response.metrics) == 0
+
+        weights_info = WeightsInfoResponse(
+            base_model="Qwen/Qwen3-8B",
+            is_lora=True,
+            lora_config={"lora_rank": 8, "lora_alpha": 16},
+            optimizer_config={
+                "type": "adamw",
+                "learning_rate": 1e-4,
+                "weight_decay": 0.01,
+                "optimizer_dtype": "bf16",
+                "betas": [0.9, 0.95],
+                "eps": 1e-8,
+                "optimizer_kwargs": {},
+            },
+        )
+        assert weights_info.lora_config.lora_rank == 8
+        assert weights_info.lora_rank == 8
+        assert weights_info.optimizer_config.type == "adamw"
+
+        legacy_weights_info = WeightsInfoResponse(
+            base_model="Qwen/Qwen3-8B",
+            is_lora=True,
+            lora_rank=8,
+        )
+        assert legacy_weights_info.lora_rank == 8
+        assert legacy_weights_info.lora_config is None
+
+        full_weight_info = WeightsInfoResponse(
+            base_model="Qwen/Qwen3-8B",
+            is_lora=False,
+        )
+        assert full_weight_info.lora_config is None
+        assert full_weight_info.optimizer_config is None
+
+        partial_lora_info = WeightsInfoResponse(
+            base_model="Qwen/Qwen3-8B",
+            is_lora=True,
+        )
+        assert partial_lora_info.lora_rank is None
 
     def test_weights_health_error_and_serialization(self):
         """Test save/load/sampler types, health, error, and roundtrip serialization."""
@@ -205,7 +285,9 @@ class TestOptimWeightsHealthAndSerialization:
             lora_config={"rank": 64},
         )
         assert request.model_id == "session-123"
-        assert request.lora_config["lora_rank"] == 64
+        assert request.lora_config is not None
+        assert request.lora_config.lora_rank == 64
+        assert "rank" not in request.lora_config.model_dump(exclude_none=True)
 
         # LoadWeightsResponse
         response = LoadWeightsResponse(path="xorl://default/weights/checkpoint-001")
@@ -266,11 +348,23 @@ class TestOptimWeightsHealthAndSerialization:
         assert len(request2.forward_backward_input.data) == len(request.forward_backward_input.data)
 
         # OptimStepRequest
-        request = OptimStepRequest(adam_params=AdamParams(learning_rate=0.001), gradient_clip=1.0)
+        request = OptimStepRequest(learning_rate=0.001, gradient_clip=1.0)
         data = request.model_dump()
-        assert data["adam_params"]["learning_rate"] == 0.001
+        assert data["learning_rate"] == 0.001
         request2 = OptimStepRequest(**data)
-        assert request2.adam_params.learning_rate == request.adam_params.learning_rate
+        assert request2.learning_rate == request.learning_rate
+
+        legacy_data = {"session_id": "legacy-session", "adam_params": {"learning_rate": 3e-4}}
+        request3 = OptimStepRequest(**legacy_data)
+        assert request3.model_id == "legacy-session"
+        assert request3.learning_rate == pytest.approx(3e-4)
+
+        legacy_data_with_clip = {
+            "session_id": "legacy-session",
+            "adam_params": {"learning_rate": 3e-4, "grad_clip_norm": 0.75},
+        }
+        request4 = OptimStepRequest(**legacy_data_with_clip)
+        assert request4.gradient_clip == pytest.approx(0.75)
 
         # HealthCheckResponse
         response = HealthCheckResponse(

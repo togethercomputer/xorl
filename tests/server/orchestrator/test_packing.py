@@ -4,9 +4,6 @@ import numpy as np
 import pytest
 import torch
 
-
-pytestmark = [pytest.mark.cpu, pytest.mark.server]
-
 from xorl.server.orchestrator.packing import (
     Packer,
     SequentialPacker,
@@ -14,6 +11,9 @@ from xorl.server.orchestrator.packing import (
     unpack_per_token_outputs,
     validate_micro_batches,
 )
+
+
+pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
 
 # ============================================================================
@@ -63,6 +63,80 @@ def test_packing_enabled(simple_data):
     assert batch["position_ids"] == [[0, 1, 2, 0, 0, 1]]
 
 
+def test_opd_metadata_packs_as_token_aligned_fields():
+    """OPD teacher ids, cache refs, and weights survive packed dispatch."""
+    data = [
+        {
+            "input_ids": [1, 2, 3],
+            "target_tokens": [2, 3, 4],
+            "teacher_ids": [0, 0, 0],
+            "teacher_cache_indices": [10, 11, 12],
+            "teacher_weights": [1.0, 1.0, 0.5],
+        },
+        {
+            "input_ids": [5, 6],
+            "target_tokens": [6, 7],
+            "teacher_id": 2,
+            "teacher_cache_indices": [20, 21],
+            "teacher_weight": 0.25,
+        },
+    ]
+    packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=1)
+    batches = packer.pack(data, max_seq_len=100, request_id="opd")
+
+    assert len(batches) == 1
+    batch = batches[0]
+    assert batch["labels"] == [[2, 3, 4, 6, 7]]
+    assert batch["teacher_ids"] == [[0, 0, 0, 2, 2]]
+    assert batch["teacher_cache_indices"] == [[10, 11, 12, 20, 21]]
+    assert batch["teacher_weights"] == [[1.0, 1.0, 0.5, 0.25, 0.25]]
+
+
+def test_opd_metadata_shifts_with_hf_style_labels():
+    """OPD per-token fields stay aligned when packing shifts HF-style labels."""
+    data = [
+        {
+            "input_ids": [1, 2, 3, 4],
+            "labels": [10, 20, 30, 40],
+            "teacher_ids": [0, 0, 1, 1],
+            "teacher_cache_indices": [100, 101, 102, 103],
+            "teacher_weights": [1.0, 0.5, 0.25, 0.125],
+            "teacher_hidden_states": [
+                [1.0, 1.5],
+                [2.0, 2.5],
+                [3.0, 3.5],
+                [4.0, 4.5],
+            ],
+        }
+    ]
+    packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=1)
+    batches = packer.pack(data, max_seq_len=100, request_id="opd-hf")
+
+    assert len(batches) == 1
+    batch = batches[0]
+    assert batch["input_ids"] == [[1, 2, 3]]
+    assert batch["labels"] == [[20, 30, 40]]
+    assert batch["teacher_ids"] == [[0, 0, 1]]
+    assert batch["teacher_cache_indices"] == [[100, 101, 102]]
+    assert batch["teacher_weights"] == [[1.0, 0.5, 0.25]]
+    assert batch["teacher_hidden_states"] == [[[1.0, 1.5], [2.0, 2.5], [3.0, 3.5]]]
+
+
+def test_opd_teacher_hidden_states_pad_as_vectors():
+    data = [
+        {
+            "input_ids": [1, 2, 3],
+            "target_tokens": [2, 3, 4],
+            "teacher_hidden_states": [[1.0, 1.5], [2.0, 2.5], [3.0, 3.5]],
+        }
+    ]
+    packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=4)
+    batches = packer.pack(data, max_seq_len=100, request_id="opd-pad")
+
+    assert len(batches) == 1
+    assert batches[0]["teacher_hidden_states"] == [[[1.0, 1.5], [2.0, 2.5], [3.0, 3.5], [0.0, 0.0]]]
+
+
 def test_packing_exceeds_capacity(simple_data):
     """Samples overflow one batch -> split into multiple batches."""
     packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=1)
@@ -77,7 +151,7 @@ def test_packing_exceeds_capacity(simple_data):
 
 
 def test_packing_disabled(simple_data):
-    """Packing OFF: one batch per sample."""
+    """Packing OFF: one batch per sample, but HF-format datums are still shifted."""
     packer = SequentialPacker(enable_packing=False, log_stats=False, pad_to_multiple_of=1)
     batches = packer.pack(simple_data, max_seq_len=1000, request_id="test-003")
 
@@ -86,6 +160,79 @@ def test_packing_disabled(simple_data):
         assert batch["batch_id"] == i
         assert batch["request_id"] == "test-003"
         assert len(batch["input_ids"]) == 1
+        assert len(batch["input_ids"][0]) == len(batch["labels"][0]) == len(batch["position_ids"][0])
+
+    assert batches[0]["input_ids"] == [[1, 2, 3]]
+    assert batches[0]["labels"] == [[3, 4, 5]]
+    assert batches[0]["position_ids"] == [[0, 1, 2]]
+    assert batches[1]["input_ids"] == [[10]]
+    assert batches[1]["labels"] == [[30]]
+    assert batches[1]["position_ids"] == [[0]]
+    assert batches[2]["input_ids"] == [[100, 200]]
+    assert batches[2]["labels"] == [[300, 400]]
+    assert batches[2]["position_ids"] == [[0, 1]]
+
+
+def test_packing_disabled_preserves_shifted_target_tokens():
+    """Packing OFF should leave already-shifted xorl_client-format datums unchanged."""
+    packer = SequentialPacker(enable_packing=False, log_stats=False, pad_to_multiple_of=1)
+    datum = {
+        "model_input": {"input_ids": [11, 22, 33]},
+        "loss_fn_inputs": {
+            "target_tokens": [22, 33, 44],
+            "logprobs": [0.0, 0.0, 0.0],
+            "advantages": [1.0, 1.0, 1.0],
+        },
+    }
+
+    batches = packer.pack([datum], max_seq_len=1000, request_id="test-shifted")
+
+    assert len(batches) == 1
+    batch = batches[0]
+    assert batch["input_ids"] == [[11, 22, 33]]
+    assert batch["labels"] == [[22, 33, 44]]
+    assert batch["target_tokens"] == [[22, 33, 44]]
+    assert batch["logprobs"] == [[0.0, 0.0, 0.0]]
+    assert batch["advantages"] == [[1.0, 1.0, 1.0]]
+
+
+def test_packing_disabled_warns_on_hf_shift(monkeypatch):
+    """HF labels should warn when shifted in the non-packed path."""
+    packer = SequentialPacker(enable_packing=False, log_stats=False, pad_to_multiple_of=1)
+    warnings = []
+
+    def _capture_warning(message, *args, **_kwargs):
+        warnings.append(message % args)
+
+    monkeypatch.setattr("xorl.server.orchestrator.packing.logger.warning", _capture_warning)
+    datum = {
+        "input_ids": [1, 2, 3],
+        "labels": [10, 20, 30],
+    }
+
+    batches = packer.pack([datum], max_seq_len=1000, request_id="test-shift-warning")
+
+    batch = batches[0]
+    assert batch["input_ids"] == [[1, 2]]
+    assert batch["labels"] == [[20, 30]]
+    assert any("treating it as HF-format data" in warning for warning in warnings)
+
+
+def test_packing_disabled_does_not_overwrite_target_tokens_when_labels_are_present():
+    """Preserved target_tokens should not be replaced by labels during non-packed processing."""
+    packer = SequentialPacker(enable_packing=False, log_stats=False, pad_to_multiple_of=1)
+    datum = {
+        "input_ids": [1, 2, 3],
+        "labels": [10, 20, 30],
+        "target_tokens": [101, 102, 103],
+    }
+
+    batches = packer.pack([datum], max_seq_len=1000, request_id="test-target-preserve")
+
+    batch = batches[0]
+    assert batch["input_ids"] == [[1, 2, 3]]
+    assert batch["labels"] == [[10, 20, 30]]
+    assert batch["target_tokens"] == [[101, 102, 103]]
 
 
 def test_position_ids_and_labels():

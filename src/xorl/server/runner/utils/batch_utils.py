@@ -17,6 +17,31 @@ from xorl.distributed.parallel_state import get_parallel_state
 logger = logging.getLogger(__name__)
 
 
+def _pad_teacher_hidden_states(value: list[Any]) -> torch.Tensor:
+    max_len = max(len(seq) for seq in value)
+    hidden_dim = None
+
+    normalized = []
+    for seq in value:
+        if hasattr(seq, "tolist"):
+            seq = seq.tolist()
+        normalized_seq = []
+        for hidden in seq:
+            if hasattr(hidden, "tolist"):
+                hidden = hidden.tolist()
+            normalized_seq.append(hidden)
+            if hidden_dim is None and isinstance(hidden, list):
+                hidden_dim = len(hidden)
+        normalized.append(normalized_seq)
+
+    if hidden_dim is None:
+        raise ValueError("teacher_hidden_states must be a nested sequence of hidden vectors")
+
+    pad_vector = [0.0] * hidden_dim
+    padded = [seq + [pad_vector] * (max_len - len(seq)) for seq in normalized]
+    return torch.tensor(padded, dtype=torch.float)
+
+
 def convert_batch_to_tensors(batch: Dict[str, Any], rank: int = 0) -> Dict[str, Any]:
     """
     Convert batch data from lists to torch tensors, with padding if needed.
@@ -31,7 +56,16 @@ def convert_batch_to_tensors(batch: Dict[str, Any], rank: int = 0) -> Dict[str, 
     converted_batch = {}
 
     # Fields that should be float tensors (probabilities, advantages, etc.)
-    float_fields = {"logprobs", "advantages", "old_logprobs", "values", "returns"}
+    float_fields = {
+        "logprobs",
+        "advantages",
+        "old_logprobs",
+        "values",
+        "returns",
+        "teacher_weights",
+        "teacher_hidden_states",
+    }
+    long_fields = {"teacher_ids", "teacher_cache_indices"}
     # Fields that must be int32 (flash attention requires cu_seqlens as int32)
     int32_fields = {"cu_seq_lens_q", "cu_seq_lens_k"}
 
@@ -43,6 +77,8 @@ def convert_batch_to_tensors(batch: Dict[str, Any], rank: int = 0) -> Dict[str, 
                     dtype = torch.float
                 elif key in int32_fields:
                     dtype = torch.int32
+                elif key in long_fields:
+                    dtype = torch.long
                 else:
                     dtype = torch.long
 
@@ -56,18 +92,23 @@ def convert_batch_to_tensors(batch: Dict[str, Any], rank: int = 0) -> Dict[str, 
                 # If conversion failed (likely due to ragged sequences), try padding
                 if isinstance(value[0], list):
                     # This is a list of sequences - pad them
-                    max_len = max(len(seq) for seq in value)
-                    pad_value = (
-                        -100 if key in ("labels", "target_tokens") else 0
-                    )  # Use -100 for labels/target_tokens (IGNORE_INDEX)
-                    padded = []
-                    for seq in value:
-                        padded_seq = seq + [pad_value] * (max_len - len(seq))
-                        padded.append(padded_seq)
                     try:
-                        # Determine dtype for padded sequences
-                        dtype = torch.float if key in float_fields else torch.long
-                        tensor = torch.tensor(padded, dtype=dtype)
+                        if key == "teacher_hidden_states":
+                            tensor = _pad_teacher_hidden_states(value)
+                            max_len = tensor.shape[1]
+                            dtype = torch.float
+                        else:
+                            max_len = max(len(seq) for seq in value)
+                            pad_value = (
+                                -100 if key in ("labels", "target_tokens") else 0
+                            )  # Use -100 for labels/target_tokens (IGNORE_INDEX)
+                            padded = []
+                            for seq in value:
+                                padded_seq = seq + [pad_value] * (max_len - len(seq))
+                                padded.append(padded_seq)
+                            # Determine dtype for padded sequences
+                            dtype = torch.float if key in float_fields else torch.long
+                            tensor = torch.tensor(padded, dtype=dtype)
                         converted_batch[key] = tensor
                         logger.debug(
                             f"Rank {rank}: Padded and converted {key}: {len(value)} sequences, max_len={max_len}, dtype={dtype}"
@@ -169,23 +210,25 @@ def simple_sequence_shard(batch: Dict[str, Any], rank: int = 0) -> Dict[str, Any
     pad_len = cp_chunk_size * cp_size - seq_len
 
     # Helper to pad and slice tensors
-    def pad_and_slice(tensor, pad_value=0):
+    def pad_and_slice(tensor, pad_value=0, seq_dim=-1):
         if tensor is None:
             return None
         if not isinstance(tensor, torch.Tensor):
             tensor = torch.tensor(tensor, dtype=torch.long)
 
+        if seq_dim < 0:
+            seq_dim = tensor.ndim + seq_dim
+
         # Pad if needed
         if pad_len > 0:
             pad_shape = list(tensor.shape)
-            pad_shape[-1] = pad_len
+            pad_shape[seq_dim] = pad_len
             pad_tensor = torch.full(pad_shape, pad_value, dtype=tensor.dtype, device=tensor.device)
-            tensor = torch.cat([tensor, pad_tensor], dim=-1)
+            tensor = torch.cat([tensor, pad_tensor], dim=seq_dim)
 
         # Slice for this cp_rank
         start_idx = cp_rank * cp_chunk_size
-        end_idx = start_idx + cp_chunk_size
-        return tensor[..., start_idx:end_idx]
+        return tensor.narrow(seq_dim, start_idx, cp_chunk_size)
 
     # Apply to all sequence tensors
     sharded_batch = {}
@@ -212,6 +255,14 @@ def simple_sequence_shard(batch: Dict[str, Any], rank: int = 0) -> Dict[str, Any
                 sharded_batch[key] = torch.cat([value, pad_tensor], dim=-1)
             else:
                 sharded_batch[key] = value
+        elif key == "teacher_hidden_states":
+            if not isinstance(value, torch.Tensor):
+                value = torch.tensor(value, dtype=torch.float)
+            elif not torch.is_floating_point(value):
+                value = value.float()
+            if value.dim() == 2:
+                value = value.unsqueeze(0)
+            sharded_batch[key] = pad_and_slice(value, pad_value=0.0, seq_dim=1)
         elif isinstance(value, torch.Tensor) and value.dim() >= 1 and value.size(-1) == seq_len:
             # Other tensors with matching sequence length
             # Use appropriate pad value based on field type

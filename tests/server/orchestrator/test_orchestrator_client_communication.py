@@ -43,7 +43,7 @@ class MockEngine:
 
     This mock implements the same socket pattern as the real engine:
     - INPUT socket (DEALER): connects to API server's ROUTER to receive requests
-    - OUTPUT socket (PUSH): binds for API server's PULL to receive outputs
+    - OUTPUT socket (PUSH): connects to API server's PULL to send outputs
     """
 
     def __init__(self, input_addr, output_addr, engine_identity=b"engine-0", response_delay=0.0):
@@ -69,7 +69,7 @@ class MockEngine:
         self.input_socket.connect(self.input_addr)
         self.output_socket = self.context.socket(zmq.PUSH)
         self.output_socket.setsockopt(zmq.LINGER, 0)
-        self.output_socket.bind(self.output_addr)
+        self.output_socket.connect(self.output_addr)
         await asyncio.sleep(0.2)
         self._running = True
         self._task = asyncio.create_task(self._process_requests())

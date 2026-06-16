@@ -62,6 +62,7 @@ class MessageType(str, Enum):
     WAKE_UP = "wake_up"
     HEALTH_CHECK = "health_check"
     SYNC_INFERENCE_WEIGHTS = "sync_inference_weights"
+    REGISTER_SESSION = "register_session"
     REGISTER_ADAPTER = "register_adapter"
     SAVE_ADAPTER_STATE = "save_adapter_state"
     LOAD_ADAPTER_STATE = "load_adapter_state"

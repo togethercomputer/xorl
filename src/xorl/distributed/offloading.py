@@ -1,6 +1,6 @@
 import enum
 from contextlib import nullcontext
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 from torch.autograd.graph import saved_tensors_hooks
@@ -56,9 +56,10 @@ class custom_save_on_cpu(saved_tensors_hooks):
 def build_activation_offloading_context(
     enable_activation_offload: bool = False,
     enable_gradient_checkpointing: bool = False,
-    activation_gpu_limit: float = 0.0,
+    activation_gpu_limit: Optional[float] = 0.0,
 ) -> Tuple[Union["saved_tensors_hooks", "nullcontext"], Union["saved_tensors_hooks", "nullcontext"]]:
     model_fwd_context, model_bwd_context = nullcontext(), nullcontext()
+    activation_gpu_limit = 0.0 if activation_gpu_limit is None else activation_gpu_limit
     if enable_activation_offload:
         # pin_memory=False since CachingHostAllocator caches pinned memory aggressively.
         # torch._C._host_emptyCache() can be used after version 2.5.

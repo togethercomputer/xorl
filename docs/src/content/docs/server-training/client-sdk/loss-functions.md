@@ -27,7 +27,7 @@ fwd = client.forward_backward(data, loss_fn="causallm_loss")
 
 ## PPO Policy Loss (`policy_loss`)
 
-Full PPO-style clipped policy gradient loss ([source](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/ops/loss/policy_loss.py)):
+Full PPO-style clipped policy gradient loss ([source](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/loss/policy_loss.py)):
 
 ```
 ratio = exp(new_logprobs - old_logprobs)
@@ -65,7 +65,7 @@ fwd = client.forward_backward(data, loss_fn="policy_loss", loss_fn_params={
 
 ## GRPO / Importance Sampling (`importance_sampling`)
 
-Simpler importance-sampling loss ([source](https://github.com/togethercomputer/xorl-internal/blob/main/src/xorl/ops/loss/importance_sampling_loss.py)):
+Simpler importance-sampling loss ([source](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/loss/importance_sampling_loss.py)):
 
 ```
 ratio = exp(new_logprobs - old_logprobs)

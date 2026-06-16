@@ -8,14 +8,21 @@ This module provides various loss functions for language model training:
 - drgrpo_loss_function: DR-GRPO loss with PPO clipping and KL penalty
 """
 
-from typing import Callable, Dict
+from typing import Callable, Dict, Literal
 
 from xorl.ops.loss.causallm_loss import causallm_loss_function
 from xorl.ops.loss.grpo_loss import drgrpo_loss_function
 from xorl.ops.loss.importance_sampling_loss import importance_sampling_loss_function
 from xorl.ops.loss.loss_output import LossOutput
+from xorl.ops.loss.opd_loss import OPDLossMetrics, opd_loss_function
 from xorl.ops.loss.policy_loss import policy_loss_function
+from xorl.ops.loss.reducers import Reducer, SequencePartial, TokenPartial
 from xorl.ops.loss.vocab_parallel_cross_entropy import vocab_parallel_cross_entropy
+
+
+# Cross-entropy computation mode shared by the local-trainer (TrainingArguments)
+# and server-runner (ServerArguments) entry points so the Literal stays in sync.
+CrossEntropyMode = Literal["eager", "compiled"]
 
 
 # ---------------------------------------------------------------------------
@@ -27,6 +34,7 @@ LOSS_REGISTRY: Dict[str, Callable] = {
     "importance_sampling": importance_sampling_loss_function,
     "policy_loss": policy_loss_function,
     "drgrpo": drgrpo_loss_function,
+    "opd_loss": opd_loss_function,
 }
 
 
@@ -43,13 +51,19 @@ def register_loss_function(name: str, fn: Callable) -> None:
 
 
 __all__ = [
+    "CrossEntropyMode",
     "LossOutput",
+    "OPDLossMetrics",
     "LOSS_REGISTRY",
+    "Reducer",
+    "SequencePartial",
+    "TokenPartial",
     "get_loss_function",
     "register_loss_function",
     "causallm_loss_function",
     "drgrpo_loss_function",
     "importance_sampling_loss_function",
+    "opd_loss_function",
     "policy_loss_function",
     "vocab_parallel_cross_entropy",
 ]

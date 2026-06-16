@@ -4,7 +4,7 @@
 
 1. **Branch** off `main` with a descriptive name: `feature/my-feature`, `fix/bug-description`
 2. **Commit** early and often on your branch — commit messages don't matter much here
-3. **Open a PR** against `main` when ready for review
+3. **Open a PR** against `main` when ready for review. The PR title must follow [Conventional Commits](https://www.conventionalcommits.org/) (see below), since it becomes the squash-merge commit message and drives automated release versioning.
 4. **Squash merge** — all PRs are merged as a single squash commit; write a clean PR title and description since that becomes the commit message
 
 ## PR Guidelines
@@ -12,7 +12,8 @@
 - Keep PRs focused — one feature or fix per PR
 - Add tests for new behavior; existing tests must pass
 - Update relevant docs if behavior changes
-- PR title should be imperative and descriptive: `Add chunked cross-entropy loss` not `chunked ce`
+- PR title must follow Conventional Commits: `type: description` or `type(scope): description`. Allowed types: `feat`, `fix`, `perf`, `revert` (trigger releases); `chore`, `docs`, `test`, `refactor`, `ci`, `build` (no release). Append `!` for breaking changes (`feat!: ...` → major bump). An optional `[TICKET-123]` ticket prefix is allowed before the type. Examples: `feat: add chunked cross-entropy loss`, `fix(moe): correct expert routing`, `feat!: drop Python 3.9 support`.
+- A CI check enforces this on every PR and comments the detected version bump.
 
 ## Commit Message (Squash Merge)
 

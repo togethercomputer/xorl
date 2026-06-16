@@ -13,14 +13,11 @@ Test Strategy:
 - Tests focus on Orchestrator's scheduling, routing, and output formatting
 """
 
-import msgpack
-import pytest
-
-
-pytestmark = [pytest.mark.cpu, pytest.mark.server]
 import socket
 import time
 
+import msgpack
+import pytest
 import zmq
 
 from xorl.server.backend import DummyBackend
@@ -37,6 +34,9 @@ from xorl.server.protocol.operations import (
     ModelPassData,
     OptimStepData,
 )
+
+
+pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
 
 # ============================================================================
@@ -93,7 +93,7 @@ def output_socket(addresses):
     context = zmq.Context()
     sock = context.socket(zmq.PULL)
     sock.setsockopt(zmq.LINGER, 0)
-    sock.connect(addresses["output"])
+    sock.bind(addresses["output"])
 
     yield sock
 

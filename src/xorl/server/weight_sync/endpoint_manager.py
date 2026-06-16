@@ -16,6 +16,10 @@ logger = logging.getLogger(__name__)
 
 # Reusable session for HTTP connection pooling
 _http_session: Optional[requests.Session] = None
+# SGLang's /health handler can take ~1s even when the server is healthy.
+# /model_info is the weight-sync-relevant readiness check and returns quickly;
+# keep /health as the last fallback for non-SGLang endpoints.
+_HEALTH_PATHS = ("/model_info", "/v1/models", "/health")
 
 
 def _get_http_session() -> requests.Session:
@@ -47,13 +51,19 @@ class EndpointManager:
         """Check all endpoints are healthy.  Raises on failure."""
         session = _get_http_session()
         for ep in self.endpoints:
-            url = f"http://{ep['host']}:{ep['port']}/health"
-            try:
-                resp = session.get(url, timeout=10)
-                resp.raise_for_status()
-                logger.info(f"[EndpointMgr] {ep['host']}:{ep['port']} healthy")
-            except Exception as e:
-                raise RuntimeError(f"Inference endpoint {ep['host']}:{ep['port']} health check failed: {e}")
+            label = f"{ep['host']}:{ep['port']}"
+            errors: list[str] = []
+            for path in _HEALTH_PATHS:
+                url = f"http://{label}{path}"
+                try:
+                    resp = session.get(url, timeout=60)
+                    resp.raise_for_status()
+                    logger.info(f"[EndpointMgr] {label} healthy via {path}")
+                    break
+                except Exception as e:
+                    errors.append(f"{path}: {e}")
+            else:
+                raise RuntimeError(f"Inference endpoint {label} health check failed: {'; '.join(errors)}")
 
     def pause(
         self,

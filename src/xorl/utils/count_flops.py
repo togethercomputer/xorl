@@ -114,6 +114,7 @@ class XorlFlopsCounter:
             "qwen3": self._estimate_qwen2_flops,
             "xorl_qwen3_5": self._estimate_qwen3_5_flops,
             "xorl_qwen3_5_moe": self._estimate_qwen3_5_moe_flops,
+            "glm4_moe": self._estimate_glm4_moe_flops,
         }
 
         self.config = config
@@ -344,6 +345,68 @@ class XorlFlopsCounter:
 
         attn_score_elements = _attention_score_elements(batch_seqlens, causal=True)
         attn_qkv_flops = m["attn_qkv"] * attn_score_elements * head_dim * num_attention_heads * full_attn_layers
+
+        return (dense_N_flops + attn_qkv_flops) / delta_time / 1e12
+
+    def _estimate_glm4_moe_flops(self, tokens_sum, batch_seqlens, delta_time):
+        """FLOPs estimate for GLM-4 MoE (e.g. GLM-4.7).
+
+        Architecture: GQA attention + MoE FFN with shared experts.
+        First ``first_k_dense_replace`` layers use a dense MLP; the remaining
+        layers use routed experts plus a shared expert.
+        """
+        hidden_size = self.config.hidden_size
+        vocab_size = self.config.vocab_size
+        num_hidden_layers = self.config.num_hidden_layers
+        num_attention_heads = self.config.num_attention_heads
+        num_key_value_heads = self.config.num_key_value_heads
+        moe_intermediate_size = self.config.moe_intermediate_size
+        moe_num_expert = self.config.n_routed_experts
+        moe_topk = self.config.num_experts_per_tok
+        n_shared_experts = getattr(self.config, "n_shared_experts", 0)
+        first_k_dense_replace = getattr(self.config, "first_k_dense_replace", 0)
+        dense_intermediate_size = self.config.intermediate_size  # MLP dim for dense layers
+
+        m = self._m
+        head_dim = getattr(self.config, "head_dim", hidden_size // num_attention_heads)
+        q_size = num_attention_heads * head_dim
+        k_size = num_key_value_heads * head_dim
+        v_size = num_key_value_heads * head_dim
+
+        # Attention linear projections (Q, K, V, O) — same for all layers
+        attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
+
+        # MoE layer FLOPs: router + routed experts (top-k) + shared expert(s)
+        router_N = hidden_size * moe_num_expert
+        gate_up_N = hidden_size * moe_intermediate_size * moe_topk * 2  # gate_proj + up_proj
+        down_N = hidden_size * moe_intermediate_size * moe_topk  # down_proj
+        # Shared expert uses moe_intermediate_size (fused gate_up + down)
+        shared_gate_up_N = hidden_size * moe_intermediate_size * n_shared_experts * 2
+        shared_down_N = hidden_size * moe_intermediate_size * n_shared_experts
+
+        moe_layer_flops = (
+            m["attn_linear"] * attn_linear_N * tokens_sum
+            + m["router"] * router_N * tokens_sum
+            + m["gate"] * gate_up_N * tokens_sum
+            + m["down"] * down_N * tokens_sum
+            + m["gate"] * shared_gate_up_N * tokens_sum
+            + m["down"] * shared_down_N * tokens_sum
+        )
+
+        # Dense layer FLOPs (first K layers): standard SwiGLU MLP (gate_up_proj + down_proj = 3× H×I)
+        dense_mlp_N = hidden_size * dense_intermediate_size * 3
+        dense_layer_flops = m["attn_linear"] * attn_linear_N * tokens_sum + m["dense_mlp"] * dense_mlp_N * tokens_sum
+
+        num_moe_layers = num_hidden_layers - first_k_dense_replace
+        embed_lm_N = vocab_size * hidden_size  # lm_head only; embedding is a lookup
+
+        dense_N_flops = (
+            moe_layer_flops * num_moe_layers + dense_layer_flops * first_k_dense_replace + 6 * embed_lm_N * tokens_sum
+        )
+
+        # Attention QKV FLOPs (quadratic in sequence length)
+        seqlen_square_sum = sum(s * s for s in batch_seqlens)
+        attn_qkv_flops = m["attn_qkv"] * seqlen_square_sum * head_dim * num_attention_heads * num_hidden_layers
 
         return (dense_N_flops + attn_qkv_flops) / delta_time / 1e12
 

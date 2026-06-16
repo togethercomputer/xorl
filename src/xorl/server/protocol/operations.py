@@ -104,7 +104,7 @@ class SyncWeightsData:
     buffer_size_mb: int = 1024
     sync_method: str = "nccl_broadcast"
     flush_cache: bool = False
-    pause_mode: str = "retract"
+    pause_mode: str = "in_place"
     weight_version: Optional[str] = None
     quantization: Optional[Dict[str, Any]] = None
 
@@ -115,6 +115,15 @@ class RegisterAdapterData:
 
     model_id: str = "default"
     lr: float = 1e-5
+
+
+@dataclass
+class RegisterSessionData:
+    """Payload for register_session operations."""
+
+    model_id: str = "default"
+    session_spec: Dict[str, Any] = field(default_factory=dict)
+    materialize: bool = False
 
 
 @dataclass
@@ -164,6 +173,7 @@ OperationPayload = Union[
     SaveFullWeightsData,
     SyncWeightsData,
     RegisterAdapterData,
+    RegisterSessionData,
     AdapterStateData,
     KillSessionData,
     AbortData,
@@ -182,6 +192,7 @@ _PAYLOAD_TYPE_MAP: Dict[str, type] = {
     "save_full_weights": SaveFullWeightsData,
     "sync_inference_weights": SyncWeightsData,
     "register_adapter": RegisterAdapterData,
+    "register_session": RegisterSessionData,
     "save_adapter_state": AdapterStateData,
     "load_adapter_state": AdapterStateData,
     "kill_session": KillSessionData,

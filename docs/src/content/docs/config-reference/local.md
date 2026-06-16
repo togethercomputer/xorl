@@ -35,7 +35,7 @@ torchrun --nproc_per_node=8 -m xorl.cli.train config.yaml \
 | `ep_dispatch` | `alltoall` | Expert-parallel dispatch: `alltoall` or `deepep` (NVLink-optimized). |
 | `deepep_buffer_size_gb` | `2.0` | DeepEP NVLink buffer size per GPU in GB. Only active when `ep_dispatch: deepep`. |
 | `deepep_num_sms` | `20` | SMs assigned to DeepEP communication kernels. Must be even. Lower values leave more SMs for overlapped compute. |
-| `deepep_async_combine` | `false` | Overlap DeepEP combine with the next layer's compute (experimental). |
+| `deepep_async_combine` | `false` | Overlap DeepEP combine with the next layer's compute (experimental, unsafe). Forced to `false` in code unless `XORL_DEEPEP_UNSAFE_ASYNC_COMBINE=1` is exported; without that env var, deferring the comm-stream sync races the transformer block's read of the combined tensor on the default stream. |
 | `merge_qkv` | `true` | Keep Q/K/V projections fused as `qkv_proj`. Set `false` for tensor parallelism or per-projection LoRA. |
 | `basic_modules` | `[]` | Additional module names (beyond `_no_split_modules`) to shard as separate FSDP units. |
 | `foundation` | `{}` | Extra foundation model config (dict). |
@@ -167,7 +167,7 @@ Each entry in `datasets` (or `test_datasets`) is a dict:
 | `activation_gpu_limit` | `0.0` | GB of activations to keep on GPU when offloading. `0.0` = offload all. |
 | `enable_compile` | `false` | `torch.compile` for model forward pass. |
 | `init_device` | `cuda` | Device for weight initialization: `cpu` (rank 0 only), `cuda`, `meta` (required for FSDP2), `npu`. |
-| `load_weights_mode` | `broadcast` | `broadcast`: rank 0 reads weights, broadcasts to other ranks (reduces disk I/O). `all_ranks`: every rank reads from disk. |
+| `load_weights_mode` | `grouped` | `grouped`: one reader per node for dense/shared weights plus one reader per EP-FSDP group for expert weights, with rank-0 fallback when grouped fanout groups are unavailable. `all_ranks`: every rank reads from disk. `skip`: skip HuggingFace weight loading and materialize model weights from `load_checkpoint_path` (DCP). |
 | `enable_full_determinism` | `false` | Full determinism mode. Requires `allow_cuda_launch_blocking: true`. Degrades performance. |
 | `allow_cuda_launch_blocking` | `false` | Allow `CUDA_LAUNCH_BLOCKING=1`. Off by default to prevent accidental performance degradation. |
 | `empty_cache_steps` | `500` | Call `torch.cuda.empty_cache()` every N steps. |

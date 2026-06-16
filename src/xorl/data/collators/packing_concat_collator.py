@@ -1,4 +1,3 @@
-import logging
 from dataclasses import dataclass
 from typing import Dict, Sequence, Tuple
 
@@ -8,9 +7,6 @@ from torch.utils.data._utils.collate import default_collate
 from ...distributed.parallel_state import get_parallel_state
 from ...utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 from .base_collator import DataCollator
-
-
-logger = logging.getLogger(__name__)
 
 
 def add_flash_attention_kwargs_from_position_ids(
@@ -73,8 +69,6 @@ class PackingConcatCollator(DataCollator):
         if not features:
             raise ValueError("PackingConcatCollator received empty features list")
 
-        logger = logging.getLogger(__name__)
-
         # Input should be a flat list of dicts from FlattenCollator
         assert isinstance(features[0], dict), (
             f"Expected dict from FlattenCollator, but got {type(features[0]).__name__}"
@@ -82,7 +76,8 @@ class PackingConcatCollator(DataCollator):
 
         batch = {}
         for input_name in features[0].keys():
-            # Handle 1D tensors (input_ids, labels, etc.) and 2D tensors (hidden_states, hidden_states_scale)
+            # Handle 1D tensors (input_ids, labels, etc.) and 2D tensors
+            # (hidden_states, teacher_hidden_states, hidden_states_scale)
             # IMPORTANT: loss_fn_inputs fields (target_tokens, logprobs, advantages) must be concatenated, not batched!
             if input_name in (
                 "input_ids",
@@ -92,6 +87,10 @@ class PackingConcatCollator(DataCollator):
                 "target_tokens",
                 "logprobs",
                 "advantages",
+                "rollout_logprobs",
+                "teacher_ids",
+                "teacher_cache_indices",
+                "teacher_weights",
             ):
                 # 1D tensors: concatenate along sequence dimension
                 tensors = [feature[input_name] for feature in features]
@@ -108,7 +107,7 @@ class PackingConcatCollator(DataCollator):
                 # Concatenate and add batch dimension of 1: (total_seq_len,) -> (1, total_seq_len)
                 batch[input_name] = torch.cat(tensors, dim=0).unsqueeze(0)
 
-            elif input_name in ("hidden_states", "hidden_states_scale"):
+            elif input_name in ("hidden_states", "teacher_hidden_states", "hidden_states_scale"):
                 # 2D tensors: concatenate along sequence dimension (dim 0)
                 tensors = [feature[input_name] for feature in features]
 
@@ -172,15 +171,23 @@ class PackingConcatCollator(DataCollator):
                     )
                     batch["position_ids"] = torch.cat([batch["position_ids"], pad_positions.unsqueeze(0)], dim=1)
 
-                # Pad 2D tensors (hidden_states, hidden_states_scale)
-                if "hidden_states" in batch:
-                    batch["hidden_states"] = torch.nn.functional.pad(
-                        batch["hidden_states"], (0, 0, 0, pad_length), value=0.0
-                    )
-                if "hidden_states_scale" in batch:
-                    batch["hidden_states_scale"] = torch.nn.functional.pad(
-                        batch["hidden_states_scale"], (0, 0, 0, pad_length), value=0.0
-                    )
+                for key in (
+                    "target_tokens",
+                    "logprobs",
+                    "advantages",
+                    "rollout_logprobs",
+                    "teacher_ids",
+                    "teacher_cache_indices",
+                    "teacher_weights",
+                ):
+                    if key in batch and batch[key].shape[-1] == seq_len:
+                        pad_value = -100 if key == "target_tokens" else 0
+                        batch[key] = torch.nn.functional.pad(batch[key], (0, pad_length), value=pad_value)
+
+                # Pad 2D sequence-aligned tensors.
+                for key in ("hidden_states", "teacher_hidden_states", "hidden_states_scale"):
+                    if key in batch:
+                        batch[key] = torch.nn.functional.pad(batch[key], (0, 0, 0, pad_length), value=0.0)
 
         # cu_seq_lens_q should equal to cu_seq_lens_k and max_length_q should equal to max_length_k
         if "position_ids" in batch:

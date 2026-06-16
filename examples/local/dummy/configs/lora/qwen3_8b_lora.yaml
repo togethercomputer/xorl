@@ -39,7 +39,7 @@ train:
   enable_gradient_checkpointing: true
   enable_full_shard: true
   init_device: meta
-  load_weights_mode: broadcast
+  load_weights_mode: grouped
   ckpt_manager: dcp
   save_steps: 0
   save_hf_weights: false

@@ -1,8 +1,39 @@
 """Token-choice top-k router for MoE layers."""
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+_SYNTHETIC_ROUTING_ENV = "XORL_MOE_SYNTHETIC_ROUTING"
+
+
+def _get_synthetic_routing_mode() -> str:
+    mode = os.environ.get(_SYNTHETIC_ROUTING_ENV, "").strip().lower()
+    if mode in {"", "none", "default"}:
+        return ""
+    if mode == "balanced":
+        return mode
+    raise ValueError(f"Unsupported {_SYNTHETIC_ROUTING_ENV}={mode!r}; expected 'balanced'.")
+
+
+def balanced_synthetic_routing(
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if top_k > num_experts:
+        raise ValueError(f"top_k ({top_k}) must be <= num_experts ({num_experts})")
+
+    token_offsets = torch.arange(num_tokens, device=device, dtype=torch.long).unsqueeze(1) * top_k
+    topk_offsets = torch.arange(top_k, device=device, dtype=torch.long).unsqueeze(0)
+    selected_experts = (token_offsets + topk_offsets) % num_experts
+    routing_weights = torch.full((num_tokens, top_k), 1.0 / top_k, device=device, dtype=dtype)
+    return routing_weights, selected_experts
 
 
 class TopKRouter(nn.Module):
@@ -28,6 +59,7 @@ class TopKRouter(nn.Module):
         self.num_experts = num_experts
         self.top_k = top_k
         self.norm_topk_prob = norm_topk_prob
+        self.synthetic_routing_mode = _get_synthetic_routing_mode()
 
     def forward(
         self,
@@ -44,6 +76,15 @@ class TopKRouter(nn.Module):
             routing_weights: ``(num_tokens, top_k)`` weights per selected expert.
             selected_experts: ``(num_tokens, top_k)`` expert indices.
         """
+        if self.synthetic_routing_mode == "balanced":
+            return balanced_synthetic_routing(
+                router_logits.size(0),
+                self.num_experts,
+                self.top_k,
+                router_logits.device,
+                input_dtype,
+            )
+
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         if self.norm_topk_prob:

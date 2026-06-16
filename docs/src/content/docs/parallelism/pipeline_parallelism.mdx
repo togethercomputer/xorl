@@ -696,7 +696,7 @@ train:
   enable_gradient_checkpointing: true
   enable_full_shard: true
   init_device: meta
-  load_weights_mode: broadcast
+  load_weights_mode: grouped
 ```
 
 **Process group layout** (8 GPUs, ranks 0–7):

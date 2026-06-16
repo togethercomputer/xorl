@@ -30,7 +30,7 @@ Architecture Overview:
 │  ┌─────────────────────────────────────────────────────────────────────┐  │
 │  │               API Server Communication                              │  │
 │  │                                                                     │  │
-│  │  INPUT Socket (DEALER connect)    OUTPUT Socket (PUSH bind)         │  │
+│  │  INPUT Socket (DEALER connect)    OUTPUT Socket (PUSH connect)      │  │
 │  │       ↓                                  ↑                          │  │
 │  │  input_queue (Queue)             output_queue (Queue)               │  │
 │  │       ↓                                  ↑                          │  │
@@ -107,7 +107,7 @@ Message Flow:
 
 4. **Response:**
    ```
-   output_queue → output_socket (PUSH) → API Server
+   output_queue → output_socket (PUSH connect) → API Server PULL
    Scheduler.mark_completed() [processing → completed]
    ```
 
@@ -227,7 +227,7 @@ class Orchestrator:
 
         Args:
             input_addr: ZMQ address for input DEALER socket (API server requests)
-            output_addr: ZMQ address for output PUSH socket (API server responses)
+            output_addr: ZMQ address for output PUSH socket (connects to API server response endpoint)
             engine_identity: Identity for DEALER socket
             rank0_worker_address: ZMQ address of rank 0 worker (PAIR socket)
             num_workers: Number of workers for distributed execution
@@ -498,7 +498,7 @@ class Orchestrator:
         logger.info("Starting output socket thread...")
 
         self.output_channel = SyncPushChannel(self.output_addr)
-        self.output_channel.bind()
+        self.output_channel.connect()
 
         while self._running:
             try:
@@ -657,6 +657,7 @@ class Orchestrator:
         "sleep": "execute_sleep",
         "wake_up": "execute_wake_up",
         "sync_inference_weights": "execute_sync_inference_weights",
+        "register_session": "execute_register_session",
         "register_adapter": "execute_register_adapter",
         "save_adapter_state": "execute_save_adapter_state",
         "load_adapter_state": "execute_load_adapter_state",

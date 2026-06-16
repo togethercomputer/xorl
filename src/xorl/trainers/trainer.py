@@ -38,6 +38,10 @@ from xorl.models.checkpoint_handlers.buffers import get_prequantized_exclude_mod
 from xorl.models.layers.moe.aux_loss import global_load_balancing_loss_func
 from xorl.models.layers.moe.routing_replay import RoutingReplay, set_replay_stage
 from xorl.models.module_utils import compute_loss
+from xorl.models.transformers.deepseek_v3.support import (
+    freeze_deepseek_v3_router_parameters,
+    validate_deepseek_v3_training_mode,
+)
 from xorl.optim import build_lr_scheduler, build_optimizer
 from xorl.qlora import (
     detect_prequantized_block_fp8,
@@ -55,12 +59,16 @@ from xorl.trainers.model_builder import (
 )
 from xorl.trainers.training_utils import (
     clip_gradients,
+    count_active_microbatches,
     count_valid_tokens,
     forward_backward_pp,
+    get_distsign_grad_scale_factor,
+    get_effective_grad_clip_value,
+    make_pp_loss_fn,
     maybe_merge_lora,
     negotiate_pp_seq_len,
     pad_micro_batches_for_pp,
-    pp_loss_fn,
+    scale_model_gradients,
     sync_sp_gradients,
 )
 from xorl.utils import helper
@@ -70,6 +78,13 @@ from xorl.utils.dist_utils import all_reduce
 
 logger = helper.create_logger(__name__)
 _trainer_cpu_group: Optional[dist.ProcessGroup] = None
+_HOST_INVENTORY_MAX_WORLD_SIZE = int(os.environ.get("XORL_HOST_INVENTORY_MAX_WORLD_SIZE", "64"))
+_HOST_INVENTORY_DISABLED = os.environ.get("XORL_DISABLE_HOST_INVENTORY", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def _get_trainer_cpu_group() -> Optional[dist.ProcessGroup]:
@@ -80,6 +95,12 @@ def _get_trainer_cpu_group() -> Optional[dist.ProcessGroup]:
     if _trainer_cpu_group is None:
         _trainer_cpu_group = dist.new_group(backend="gloo")
     return _trainer_cpu_group
+
+
+def _should_collect_host_inventory(world_size: int) -> bool:
+    if _HOST_INVENTORY_DISABLED:
+        return False
+    return world_size <= _HOST_INVENTORY_MAX_WORLD_SIZE
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +182,7 @@ class Trainer:
     def _bootstrap(self) -> None:
         """Initialize distributed, device, seed, parallel state."""
         args = self.args
-        from datetime import timedelta
+        from datetime import timedelta  # noqa: PLC0415
 
         dist.init_process_group(backend=get_nccl_backend(), timeout=timedelta(minutes=60))
         logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
@@ -231,6 +252,16 @@ class Trainer:
         # Routing replay is only needed with EP when MoE forward is recomputed
         self._use_routing_replay = self.ps.ep_size > 1 and args.train.moe_recomputed
 
+        # Loss-function kwargs forwarded to causallm_loss_function each step.
+        self._causallm_loss_params: Dict[str, Any] = {"ce_mode": args.train.ce_mode}
+        if args.train.softmax_auxiliary_loss:
+            if args.train.pipeline_parallel_size > 1:
+                raise NotImplementedError(
+                    "softmax_auxiliary_loss (Z-loss) is not yet supported with pipeline parallelism. "
+                    "PP uses a separate compiled CE loss path (pp_loss_fn) that does not compute logsumexp."
+                )
+            self._causallm_loss_params["z_loss_coef"] = args.train.auxiliary_loss_multiplier
+
     def _maybe_log_startup_metrics(self, metrics: Dict[str, Any], commit: bool = False) -> None:
         """Log startup metrics to wandb once rank 0 has initialized it."""
         if not metrics:
@@ -267,6 +298,8 @@ class Trainer:
         }
         if not dist.is_available() or not dist.is_initialized() or self.args.train.world_size <= 1:
             return [payload]
+        if not _should_collect_host_inventory(self.args.train.world_size):
+            return [payload]
         gathered: List[Optional[Dict[str, Any]]] = [None] * self.args.train.world_size
         dist.all_gather_object(gathered, payload, group=_get_trainer_cpu_group())
         return [item for item in gathered if item is not None]
@@ -275,6 +308,22 @@ class Trainer:
         """Emit host inventory to stdout and wandb config on rank 0."""
         inventory = self._collect_host_inventory()
         if self.args.train.global_rank != 0:
+            return
+
+        if self.args.train.world_size > 1 and not _should_collect_host_inventory(self.args.train.world_size):
+            logger.info_rank0(
+                "Skipping host inventory gather for world_size=%s; "
+                "set XORL_HOST_INVENTORY_MAX_WORLD_SIZE or XORL_DISABLE_HOST_INVENTORY to override.",
+                self.args.train.world_size,
+            )
+            self._startup_metrics.update(
+                {
+                    "startup/master_addr": os.environ.get("MASTER_ADDR"),
+                    "startup/master_port": os.environ.get("MASTER_PORT"),
+                    "startup/host_inventory_skipped": True,
+                    "startup/host_inventory_world_size": self.args.train.world_size,
+                }
+            )
             return
 
         unique_hostnames = sorted({item["hostname"] for item in inventory})
@@ -392,13 +441,24 @@ class Trainer:
             moe_implementation=args.model.moe_implementation,
             ep_dispatch=args.model.ep_dispatch,
             train_router=args.model.train_router,
+            record_routing_weights=args.model.record_routing_weights,
             deepep_buffer_size_gb=args.model.deepep_buffer_size_gb,
             deepep_num_sms=args.model.deepep_num_sms,
             deepep_async_combine=args.model.deepep_async_combine,
             rmsnorm_mode=args.model.rmsnorm_mode,
+            flash_attention_deterministic=args.model.flash_attention_deterministic,
             init_device=args.train.init_device,
         )
         self.model_config = self.model.config
+        # Normalize _no_split_modules to list — some HF models (e.g. GPT-OSS) define it as a set
+        if isinstance(getattr(self.model, "_no_split_modules", None), set):
+            self.model._no_split_modules = list(self.model._no_split_modules)
+        validate_deepseek_v3_training_mode(
+            self.model_config,
+            enable_qlora=args.lora.enable_qlora,
+            freeze_router=args.model.freeze_router,
+            merge_qkv=args.model.merge_qkv,
+        )
         helper.print_device_mem_info("VRAM usage after building model")
 
         # Unfuse QKV for tensor parallelism
@@ -480,7 +540,7 @@ class Trainer:
         is_moe_model = getattr(self.model.config, "num_experts", 0) > 0
 
         if is_moe_model and args.lora.moe_hybrid_shared_lora:
-            from xorl.lora.utils import inject_lora_into_model_with_moe
+            from xorl.lora.utils import inject_lora_into_model_with_moe  # noqa: PLC0415
 
             logger.info_rank0(f"MoE-aware LoRA injection (hybrid_shared={args.lora.moe_hybrid_shared_lora})")
             inject_lora_into_model_with_moe(
@@ -491,7 +551,7 @@ class Trainer:
                 moe_hybrid_shared_lora=args.lora.moe_hybrid_shared_lora,
             )
         else:
-            from xorl.lora.utils import inject_lora_into_model
+            from xorl.lora.utils import inject_lora_into_model  # noqa: PLC0415
 
             inject_lora_into_model(
                 self.model,
@@ -523,6 +583,7 @@ class Trainer:
             load_weights_mode=args.train.load_weights_mode,
             pp_schedule=args.train.pipeline_parallel_schedule if args.train.pipeline_parallel_size > 1 else None,
             reshard_after_forward=args.train.reshard_after_forward,
+            moe_grad_reduce_mode=args.train.moe_grad_reduce_mode,
             skip_param_upcast=should_skip_generic_param_upcast(
                 enable_lora=args.lora.enable_lora,
                 enable_qlora=args.lora.enable_qlora,
@@ -556,6 +617,16 @@ class Trainer:
             for name, param in self.model.named_parameters():
                 if "lora_A" not in name and "lora_B" not in name:
                     param.requires_grad = False
+
+        if args.model.freeze_router:
+            frozen = freeze_deepseek_v3_router_parameters(self.model)
+            if frozen == 0:
+                for name, param in self.model.named_parameters():
+                    if ".gate.weight" in name:
+                        param.requires_grad = False
+                        frozen += 1
+            if frozen > 0:
+                logger.info_rank0(f"Froze {frozen} MoE router (gate) parameters")
 
     def _deferred_qlora_quantize(self) -> None:
         """After FSDP loads weights, quantize them into uint8 buffers."""
@@ -591,6 +662,7 @@ class Trainer:
     def _build_optimizer(self) -> None:
         """Build optimizer and LR scheduler."""
         args = self.args
+        self._use_distsignsgd = args.train.optimizer == "distsignsgd"
         self.optimizer = build_optimizer(
             self.model,
             lr=args.train.lr,
@@ -599,6 +671,7 @@ class Trainer:
             optimizer_type=args.train.optimizer,
             optimizer_dtype=args.train.optimizer_dtype,
             optimizer_kwargs=args.train.optimizer_kwargs,
+            cautious_weight_decay=args.train.cautious_weight_decay,
         )
         if self._optimizer_pre_hook_fn is not None:
             hook = self._optimizer_pre_hook_fn(self.model, self.model_config, args.train.data_parallel_mode)
@@ -658,7 +731,27 @@ class Trainer:
         if not args.train.load_checkpoint_path:
             return
 
-        state = {"model": self.model, "optimizer": self.optimizer, "extra_state": {}}
+        # When load_weights_mode=skip, parameters are meta-device DTensors after FSDP wrapping.
+        # Use to_empty() to materialize them to real CUDA tensors while preserving the DTensor
+        # wrapper (unlike manual setattr which would break FSDP2's internal state).
+        if args.train.load_weights_mode == "skip":
+            logger.info_rank0("Materializing meta parameters to CUDA via to_empty()...")
+            self.model.to_empty(device=f"cuda:{args.train.local_rank}")
+            logger.info_rank0("Meta parameters materialized.")
+
+        state = {"model": self.model, "extra_state": {}}
+        # Only include optimizer if the checkpoint has optimizer state (i.e., resuming training).
+        # Model-only DCP checkpoints (from convert_checkpoint.py) won't have optimizer state.
+        ckpt_has_optimizer = os.path.exists(os.path.join(args.train.load_checkpoint_path, ".metadata"))
+        if ckpt_has_optimizer:
+            import torch.distributed.checkpoint as dcp_meta  # noqa: PLC0415
+
+            try:
+                metadata = dcp_meta.FileSystemReader(args.train.load_checkpoint_path).read_metadata()
+                if any(k.startswith("optimizer") for k in metadata.state_dict_metadata.keys()):
+                    state["optimizer"] = self.optimizer
+            except Exception:
+                pass
         self.Checkpointer.load(args.train.load_checkpoint_path, state)
 
         extra = state.get("extra_state", {})
@@ -702,7 +795,7 @@ class Trainer:
             self._pp_schedule_cache[seq_len] = build_pipeline_schedule(
                 stages=[stage],
                 n_microbatches=self.args.train.gradient_accumulation_steps,
-                loss_fn=pp_loss_fn,
+                loss_fn=make_pp_loss_fn(self.args.train.ce_mode),
                 schedule_name=self.args.train.pipeline_parallel_schedule,
             )
         return self._pp_schedule_cache[seq_len]
@@ -829,6 +922,10 @@ class Trainer:
             (total_loss, grad_norm) — all-reduced across DP for logging.
         """
         global_valid_tokens = self._count_valid_tokens(micro_batches)
+        if self._use_distsignsgd:
+            active_microbatches, active_voter_total = self._count_active_microbatches(micro_batches)
+        else:
+            active_microbatches, active_voter_total = 0, 0
         self.optimizer.zero_grad()
 
         for mb in micro_batches:
@@ -848,7 +945,11 @@ class Trainer:
             RoutingReplay.clear_all()
 
         self._sync_sp_gradients()
-
+        if self._use_distsignsgd and active_microbatches > 0:
+            scale_model_gradients(
+                self.model,
+                get_distsign_grad_scale_factor(active_voter_total),
+            )
         grad_norm = self._clip_and_step()
         self._maybe_merge_lora()
         total_loss, grad_norm = self._reduce_metrics(total_loss, grad_norm)
@@ -866,6 +967,13 @@ class Trainer:
             group=self.ps.fsdp_group if self.pp_enabled else None,
         )
 
+    def _count_active_microbatches(self, micro_batches: List[Dict[str, Any]]) -> tuple[int, int]:
+        """Return ``(active_microbatches, active_voter_total)`` over the DP group."""
+        return count_active_microbatches(
+            micro_batches,
+            group=self.ps.fsdp_group if self.pp_enabled else None,
+        )
+
     def _pad_micro_batches_for_pp(self, micro_batches: List[Dict[str, Any]]) -> None:
         pad_micro_batches_for_pp(
             micro_batches,
@@ -876,7 +984,11 @@ class Trainer:
 
     def _sync_sp_gradients(self) -> None:
         """All-reduce gradients for CP/Ulysses dims not folded into FSDP."""
-        sync_sp_gradients(self.model, self.ps.sp_grad_sync_group)
+        sync_sp_gradients(
+            self.model,
+            self.ps.sp_grad_sync_group,
+            skip_dtensor_grads=self._use_distsignsgd,
+        )
 
     def _reduce_metrics(self, total_loss: float, grad_norm: float) -> Tuple[float, float]:
         """All-reduce loss and grad_norm across DP for logging."""
@@ -921,7 +1033,7 @@ class Trainer:
                     outputs.last_hidden_state,
                     loss_fn_name=None,
                     loss_fn_inputs={"labels": labels},
-                    loss_fn_params=None,
+                    loss_fn_params=self._causallm_loss_params,
                     logits_to_keep=0,
                 )
                 loss = result.loss
@@ -984,12 +1096,8 @@ class Trainer:
             pp_group=self.ps.pp_group,
         )
         gvt = global_valid_tokens.item()
-        if gvt > 0:
-            scale = 1.0 / gvt
-            for model_part in self.model_parts:
-                for p in model_part.parameters():
-                    if p.grad is not None:
-                        p.grad.mul_(scale)
+        if gvt > 0 and not self._use_distsignsgd:
+            scale_model_gradients(self.model_parts, 1.0 / float(gvt))
         return raw_loss / gvt if gvt > 0 else 0.0
 
     def _clip_and_step(self) -> float:
@@ -997,9 +1105,13 @@ class Trainer:
 
         Returns grad_norm (scalar).
         """
+        clip_value = get_effective_grad_clip_value(
+            self.args.train.max_grad_norm,
+            use_distsignsgd=self._use_distsignsgd,
+        )
         grad_norm = clip_gradients(
             self.model,
-            self.args.train.max_grad_norm,
+            clip_value,
             pp_enabled=self.pp_enabled,
             pp_group=self.ps.pp_group if self.pp_enabled else None,
         )
@@ -1138,6 +1250,15 @@ class Trainer:
         state = self.state
 
         synchronize()
+
+        # Report peak GPU memory on rank 0 — parseable by benchmark scripts.
+        if logger.isEnabledFor(10):  # DEBUG
+            device = get_torch_device()
+            peak_alloc_gb = device.max_memory_allocated() / (1024**3)
+            peak_reserved_gb = device.max_memory_reserved() / (1024**3)
+            logger.debug_rank0(
+                f"[PEAK_MEMORY] peak_alloc_gb={peak_alloc_gb:.3f} peak_reserved_gb={peak_reserved_gb:.3f}"
+            )
 
         # Gather full model state for HF save
         is_lora_training = args.lora.enable_lora or args.lora.enable_qlora

@@ -12,7 +12,6 @@ import json
 import math
 import os
 import random
-import socket
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -25,6 +24,8 @@ from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import AutoConfig, AutoModelForCausalLM
+
+from .server_utils import _get_free_port
 
 
 try:
@@ -416,17 +417,6 @@ def generate_training_config(
         yaml.dump(config, f, default_flow_style=False)
 
     return yaml_path
-
-
-# ---------------------------------------------------------------------------
-# Training launcher
-# ---------------------------------------------------------------------------
-
-
-def _get_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
 
 
 def run_training(

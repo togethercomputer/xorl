@@ -1,0 +1,75 @@
+# Server-side configuration for XORL Training Server
+# Qwen3-30B-A3B routed-expert multi-LoRA RL (bf16 base + LoRA rank 16)
+#
+# Smallest clean Qwen MoE (128 experts, 8 active/token, gated SwiGLU experts,
+# full softmax attention). Minimal reference for RL training with multi-LoRA over
+# routed experts.
+#
+# 1 node (8× H100): EP=8 (16 experts/rank), Ulysses SP=1, FSDP shard=1.
+# This is the TRAINER config; pair it with a multiLoRA-enabled rollout engine.
+
+# ============================================================================
+# Model Configuration
+# ============================================================================
+model_path: Qwen/Qwen3-30B-A3B
+tokenizer_path: Qwen/Qwen3-30B-A3B
+attn_implementation: flash_attention_3  # eager, sdpa, native, flash_attention_3, flash_attention_4
+moe_implementation: triton  # eager, triton, native, quack
+
+# ============================================================================
+# Parallelism Configuration
+# ============================================================================
+data_parallel_mode: fsdp2  # ddp, fsdp, fsdp2
+expert_parallel_size: 8
+ulysses_parallel_size: 1
+data_parallel_replicate_size: 1
+data_parallel_shard_size: 1  # REQUIRED for LoRA + EP: LoRA expert modules assert ep_fsdp_size == 1
+
+# ============================================================================
+# Memory & Performance
+# ============================================================================
+enable_mixed_precision: true
+enable_gradient_checkpointing: true
+enable_full_shard: true
+enable_activation_offload: false
+init_device: meta  # cpu, meta, cuda
+
+# ============================================================================
+# Checkpointing
+# ============================================================================
+output_dir: outputs/Qwen3-30B-A3B-server-lora-rl
+load_checkpoint_path: ""
+ckpt_manager: dcp  # torch, dcp
+
+# ============================================================================
+# Logging
+# ============================================================================
+log_level: INFO
+
+# ============================================================================
+# Worker Configuration
+# ============================================================================
+worker_connection_timeout: 60.0
+worker_max_retries: 3
+
+# ============================================================================
+# Data Processing Configuration
+# ============================================================================
+sample_packing_sequence_len: 32768
+enable_packing: true
+
+# ============================================================================
+# LoRA Configuration
+# ============================================================================
+enable_lora: true
+lora_rank: 16
+lora_alpha: 16
+# Attention (q/k/v/o) + routed-expert (gate/up/down) projections.
+# The last three target the MoE experts — this is what makes it routed-expert multiLoRA.
+lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+# max_lora_rank defaults to lora_rank; raise it if fleet adapters use higher ranks.
+# moe_hybrid_shared_lora: false   # set true (+ lora_export_format: sglang_shared_outer) for the shared_outer layout
+
+# Skip initial checkpoint
+skip_initial_checkpoint: true
+ce_mode: compiled

@@ -2,7 +2,7 @@
 title: "SFT on No Robots"
 ---
 
-[`examples/server/no_robot_sft/`](https://github.com/togethercomputer/xorl-internal/tree/main/examples/server/no_robot_sft) — Supervised fine-tuning on the [No Robots](https://huggingface.co/datasets/HuggingFaceH4/no_robots) dataset.
+[`examples/server/no_robot_sft/`](https://github.com/togethercomputer/xorl/tree/main/examples/server/no_robot_sft) — Supervised fine-tuning on the [No Robots](https://huggingface.co/datasets/HuggingFaceH4/no_robots) dataset.
 
 **What it demonstrates:**
 - LoRA SFT training loop driven by `xorl_client.TrainingClient`

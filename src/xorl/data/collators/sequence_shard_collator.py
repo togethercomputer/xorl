@@ -239,34 +239,54 @@ class TextSequenceShardCollator(DataCollator):
         batch["labels"] = self.sp_slice(labels, dim=-1)
         batch["position_ids"] = position_ids  # Keep full, not sliced
 
-        # Handle RL fields (target_tokens, logprobs, advantages) for importance_sampling
-        # These need to be padded and sliced the same way as labels
-        rl_fields = ["target_tokens", "logprobs", "advantages", "rollout_logprobs"]
-        for field in rl_fields:
+        # Handle loss side-channel fields. These need to be padded and sliced
+        # the same way as labels because they are token-aligned.
+        rl_field_dtypes = {
+            "target_tokens": torch.long,
+            "logprobs": torch.float,
+            "advantages": torch.float,
+            "rollout_logprobs": torch.float,
+            "teacher_ids": torch.long,
+            "teacher_cache_indices": torch.long,
+            "teacher_weights": torch.float,
+            "teacher_hidden_states": torch.float,
+        }
+        for field, dtype in rl_field_dtypes.items():
             if field in batch:
                 field_tensor = batch[field]
                 if not isinstance(field_tensor, torch.Tensor):
-                    # Determine dtype: logprobs/advantages are float, target_tokens is long
-                    dtype = torch.float if field in ("logprobs", "advantages", "rollout_logprobs") else torch.long
                     if isinstance(field_tensor, list):
-                        if field_tensor and isinstance(field_tensor[0], list):
-                            # Nested list
-                            field_tensor = torch.tensor(field_tensor[0], dtype=dtype).unsqueeze(0)
-                        else:
-                            field_tensor = torch.tensor(field_tensor, dtype=dtype).unsqueeze(0)
+                        field_tensor = torch.tensor(field_tensor, dtype=dtype)
                     else:
-                        field_tensor = torch.tensor(field_tensor, dtype=dtype).unsqueeze(0)
+                        field_tensor = torch.tensor(field_tensor, dtype=dtype)
+                elif field == "teacher_hidden_states" and not torch.is_floating_point(field_tensor):
+                    field_tensor = field_tensor.float()
+
+                if field == "teacher_hidden_states":
+                    if field_tensor.ndim == 2:
+                        field_tensor = field_tensor.unsqueeze(0)
+                    if field_tensor.ndim != 3:
+                        raise ValueError(
+                            f"teacher_hidden_states must have shape [batch, seq, hidden], got {field_tensor.shape}"
+                        )
+                    seq_dim = 1
+                elif field_tensor.ndim == 0:
+                    field_tensor = field_tensor.unsqueeze(0)
+                    seq_dim = -1
                 elif field_tensor.ndim == 1:
                     field_tensor = field_tensor.unsqueeze(0)
+                    seq_dim = -1
+                else:
+                    seq_dim = -1
 
                 # Determine pad value: IGNORE_INDEX for target_tokens, 0 for others
                 pad_value = IGNORE_INDEX if field == "target_tokens" else 0.0
-                field_tensor = self.sp_padding(field_tensor, dim=-1, pad_value=pad_value, pad_length=pad_length)
+                field_tensor = self.sp_padding(field_tensor, dim=seq_dim, pad_value=pad_value, pad_length=pad_length)
                 if self.ringattn_size > 1:
                     field_tensor = zigzag_reorder_packed_sequence(
-                        field_tensor, original_position_ids, self.ringattn_size, dim=-1
+                        field_tensor, original_position_ids, self.ringattn_size, dim=seq_dim
                     )
-                batch[field] = self.sp_slice(field_tensor, dim=-1)
+                batch[field] = self.sp_slice(field_tensor, dim=seq_dim)
 
         # (Re)compute cu_seq_lens for flash attention.
         # For ring attention, position_ids has been zigzag-reordered: it has

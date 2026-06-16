@@ -24,6 +24,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from safetensors.torch import save_file
 from torch.distributed._tensor import DTensor
+from torch.distributed.checkpoint import FileSystemReader
 from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
 
 from xorl.checkpoint import ckpt_to_state_dict
@@ -31,7 +32,9 @@ from xorl.checkpoint.checkpointer import ModelState
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.lora.utils import get_lora_state_dict, save_lora_checkpoint
 from xorl.models import save_model_weights
+from xorl.server.session_spec import write_session_spec
 from xorl.utils import helper
+from xorl.utils.device import get_device_type
 
 
 logger = logging.getLogger(__name__)
@@ -107,9 +110,113 @@ class CheckpointManager:
 
         return target_modules, lora_alpha
 
+    def _tensor_is_meta(self, tensor: torch.Tensor) -> bool:
+        raw_tensor = tensor.data if hasattr(tensor, "data") else tensor
+        if isinstance(raw_tensor, DTensor):
+            local_tensor = raw_tensor.to_local()
+            if hasattr(local_tensor, "wait"):
+                local_tensor = local_tensor.wait()
+            return getattr(local_tensor, "is_meta", False)
+        return getattr(raw_tensor, "is_meta", False)
+
+    def _model_has_meta_tensors(self) -> bool:
+        for parameter in self.model.parameters():
+            if self._tensor_is_meta(parameter):
+                return True
+        for buffer in self.model.buffers():
+            if self._tensor_is_meta(buffer):
+                return True
+        return False
+
+    def _materialize_meta_tensors_for_dcp_load(self) -> bool:
+        if self.train_config.get("load_weights_mode") != "skip":
+            return False
+        if not self._model_has_meta_tensors():
+            return False
+
+        device_type = get_device_type()
+        target_device = "cpu" if device_type == "cpu" else f"{device_type}:{self.local_rank}"
+        logger.info("Materializing meta parameters before DCP load via to_empty(device=%s)", target_device)
+        self.model.to_empty(device=target_device)
+        return True
+
+    def _checkpoint_has_optimizer(self, checkpoint_path: str) -> bool:
+        if not os.path.exists(os.path.join(checkpoint_path, ".metadata")):
+            return False
+        try:
+            metadata = FileSystemReader(checkpoint_path).read_metadata()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not inspect DCP metadata at %s for optimizer state: %s", checkpoint_path, exc)
+            return False
+        return any(key.startswith("optimizer") for key in metadata.state_dict_metadata.keys())
+
+    def _build_dcp_load_state(self, checkpoint_path: str, load_optimizer: bool) -> Dict[str, Any]:
+        self._materialize_meta_tensors_for_dcp_load()
+
+        state: Dict[str, Any] = {"model": self.model, "extra_state": {}}
+        if load_optimizer:
+            if self.optimizer is not None and self._checkpoint_has_optimizer(checkpoint_path):
+                state["optimizer"] = self.optimizer
+            else:
+                logger.info("DCP checkpoint has no optimizer state; loading model weights only.")
+        return state
+
     # ------------------------------------------------------------------
     # Adapter save / load (multi-tenancy LoRA)
     # ------------------------------------------------------------------
+
+    def _sync_collective_error(self, local_error: Optional[str]) -> Optional[str]:
+        """Synchronize save failures across ranks before any barrier."""
+        if not dist.is_available() or not dist.is_initialized():
+            return local_error
+
+        world_size = dist.get_world_size()
+        if world_size <= 1:
+            return local_error
+
+        backend = dist.get_backend()
+        device = (
+            torch.device(f"cuda:{self.local_rank}")
+            if backend == "nccl" and torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+        has_error = torch.tensor([1 if local_error else 0], dtype=torch.int64, device=device)
+        dist.all_reduce(has_error, op=dist.ReduceOp.MAX)
+
+        if has_error.item() == 0:
+            return None
+
+        error_strings = [None] * world_size
+        dist.all_gather_object(error_strings, local_error or "")
+        errors = {i: msg for i, msg in enumerate(error_strings) if msg}
+        if errors:
+            return "; ".join(f"rank {i}: {msg}" for i, msg in errors.items())
+        return local_error
+
+    def _write_adapter_training_artifacts(
+        self,
+        path: str,
+        model_id: str,
+        adapter_state: Any,
+        save_optimizer: bool,
+    ) -> None:
+        """Write adapter-specific optimizer state and training metadata on rank 0."""
+        if save_optimizer:
+            optimizer_path = os.path.join(path, "optimizer.pt")
+            torch.save(adapter_state.optimizer.state_dict(), optimizer_path)
+
+        metadata = {
+            "model_id": model_id,
+            "global_step": adapter_state.global_step,
+            "global_forward_backward_step": adapter_state.global_forward_backward_step,
+            "lr": adapter_state.lr,
+            "timestamp": time.time(),
+            "save_optimizer": save_optimizer,
+            "optimizer": adapter_state.session_spec["optimizer_config"],
+        }
+        metadata_path = os.path.join(path, "metadata.json")
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
 
     def _gather_adapter_lora_params(self, model_id: str) -> Dict[str, torch.Tensor]:
         """Gather LoRA params from adapter manager with EP support.
@@ -132,7 +239,46 @@ class CheckpointManager:
 
         return lora_state_dict
 
-    def _save_lora_weights(self, save_path: str, model_id: str) -> None:
+    @staticmethod
+    def _infer_lora_rank_dim(name: str, tensor: torch.Tensor) -> Optional[int]:
+        """Infer which tensor dimension stores LoRA rank for dense and MoE LoRA params."""
+        if "lora_A" in name:
+            if tensor.dim() == 3:
+                return 2
+            if tensor.dim() >= 2:
+                return 0
+        if "lora_B" in name:
+            if tensor.dim() >= 2:
+                return 1
+        return None
+
+    @classmethod
+    def _slice_lora_state_dict_to_rank(
+        cls,
+        lora_state_dict: Dict[str, torch.Tensor],
+        active_rank: int,
+    ) -> Dict[str, torch.Tensor]:
+        """Slice gathered max-rank LoRA tensors down to the active session rank."""
+        sliced_state_dict: Dict[str, torch.Tensor] = {}
+        for name, tensor in lora_state_dict.items():
+            rank_dim = cls._infer_lora_rank_dim(name, tensor)
+            if rank_dim is None:
+                sliced_state_dict[name] = tensor
+                continue
+
+            if tensor.shape[rank_dim] < active_rank:
+                raise ValueError(
+                    f"LoRA tensor {name!r} rank dimension {rank_dim} has size {tensor.shape[rank_dim]}, "
+                    f"which is smaller than requested active_rank={active_rank}."
+                )
+            if tensor.shape[rank_dim] == active_rank:
+                sliced_state_dict[name] = tensor
+                continue
+
+            sliced_state_dict[name] = tensor.narrow(rank_dim, 0, active_rank).contiguous()
+        return sliced_state_dict
+
+    def _save_lora_weights(self, save_path: str, model_id: str, *, preserve_lora_dtype: bool = False) -> None:
         """
         Core LoRA saving logic: activate adapter, gather weights, write PEFT checkpoint.
 
@@ -148,27 +294,58 @@ class CheckpointManager:
         if self._adapter_manager is not None:
             self._adapter_manager.switch_adapter(model_id, auto_register=True)
 
-        # Use fast adapter-manager path when available (avoids FSDP unshard)
-        if self._adapter_manager is not None and model_id in self._adapter_manager.adapters:
+        # Use fast adapter-manager path when available (avoids FSDP unshard).
+        # Skip the fast path for MoE LoRA: adapter-manager params are rank-local
+        # under EP, so exporting them directly would drop non-local experts.
+        configured_target_modules = self.lora_config.get("lora_target_modules")
+        lora_target_modules = getattr(self, "lora_target_modules", None) or configured_target_modules or []
+        has_moe_targets = any(module in lora_target_modules for module in ("gate_proj", "up_proj", "down_proj"))
+        has_stacked_moe_lora_params = any(
+            "_lora_" in name and ".experts." in name for name, _param in self.model.named_parameters()
+        )
+        is_moe_lora = bool(self.lora_config.get("moe_hybrid_shared_lora", False)) or (
+            has_moe_targets and (has_stacked_moe_lora_params or configured_target_modules is not None)
+        )
+        if self._adapter_manager is not None and model_id in self._adapter_manager.adapters and not is_moe_lora:
             logger.info(f"Rank {self.rank}: Using fast adapter-manager LoRA save path")
             lora_state_dict = self._gather_adapter_lora_params(model_id)
         else:
             # Fallback: EP+FSDP2-aware LoRA weight gathering (collective operation)
+            logger.info(
+                f"Rank {self.rank}: Using collective (EP+FSDP2-aware) LoRA save path (is_moe_lora={is_moe_lora})"
+            )
             lora_state_dict = get_lora_state_dict(self.model)
 
         # Only rank 0 writes files
         if self.rank == 0:
             target_modules, lora_alpha = self._get_lora_save_config()
+            adapter_session_spec = None
+            adapter_rank = self.lora_config.get("lora_rank", 32)
+            lora_export_format = self.lora_config.get("lora_export_format", "peft")
+            if self._adapter_manager is not None and model_id in self._adapter_manager.adapters:
+                adapter_session_spec = self._adapter_manager.get_adapter_session_spec(model_id)
+                adapter_rank = adapter_session_spec["lora_config"]["lora_rank"]
+                lora_alpha = adapter_session_spec["lora_config"]["lora_alpha"]
+                # Persist the actual live adapter structure, not the broader
+                # requested target set from config. Some models expose fused
+                # projections, so the injected/exported tensors can be a strict
+                # subset of the requested names.
+                target_modules = None
+                lora_state_dict = self._slice_lora_state_dict_to_rank(lora_state_dict, int(adapter_rank))
             save_lora_checkpoint(
                 model=self.model,
                 save_path=save_path,
                 base_model_name=self.model_config.get("model_path"),
                 target_modules=target_modules,
-                r=self.lora_config.get("lora_rank", 32),
+                r=adapter_rank,
                 lora_alpha=lora_alpha,
                 moe_hybrid_shared_lora=self.lora_config.get("moe_hybrid_shared_lora", False),
                 lora_state_dict=lora_state_dict,
+                lora_export_format=lora_export_format,
+                preserve_lora_dtype=preserve_lora_dtype,
             )
+            if adapter_session_spec is not None:
+                write_session_spec(save_path, adapter_session_spec)
 
         # Cleanup
         del lora_state_dict
@@ -206,35 +383,27 @@ class CheckpointManager:
         if path is None:
             path = os.path.join(self._adapter_manager.checkpoint_dir, model_id)
 
-        # Save LoRA weights (collective operation)
-        self._save_lora_weights(path, model_id)
+        local_error = None
+        try:
+            # Save LoRA weights (collective operation)
+            self._save_lora_weights(path, model_id, preserve_lora_dtype=True)
 
-        # Only rank 0 writes optimizer and metadata
-        if self.rank == 0:
-            # Save optimizer state (adapter-specific)
-            if save_optimizer:
-                optimizer_path = os.path.join(path, "optimizer.pt")
-                torch.save(adapter_state.optimizer.state_dict(), optimizer_path)
+            if self.rank == 0:
+                self._write_adapter_training_artifacts(path, model_id, adapter_state, save_optimizer)
+                logger.info(
+                    f"Saved adapter state for model_id={model_id} to {path} "
+                    f"(step={adapter_state.global_step}, save_optimizer={save_optimizer})"
+                )
+        except Exception as e:
+            logger.error(f"Failed to save adapter state for model_id={model_id}: {e}", exc_info=True)
+            local_error = str(e)
 
-            # Save metadata (adapter-specific)
-            metadata = {
-                "model_id": model_id,
-                "global_step": adapter_state.global_step,
-                "global_forward_backward_step": adapter_state.global_forward_backward_step,
-                "lr": adapter_state.lr,
-                "timestamp": time.time(),
-                "save_optimizer": save_optimizer,
-            }
-            metadata_path = os.path.join(path, "metadata.json")
-            with open(metadata_path, "w") as f:
-                json.dump(metadata, f, indent=2)
+        synced_error = self._sync_collective_error(local_error)
+        if synced_error:
+            raise RuntimeError(f"Adapter state save failed: {synced_error}")
 
-            logger.info(
-                f"Saved adapter state for model_id={model_id} to {path} "
-                f"(step={adapter_state.global_step}, save_optimizer={save_optimizer})"
-            )
-
-        dist.barrier()
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            dist.barrier()
 
         return {
             "path": path,
@@ -550,15 +719,13 @@ class CheckpointManager:
             model_state = ModelState(self.model)
             state_dict_meta = model_state.state_dict()
         else:
-            state_dict_meta = {name: param for name, param in self.model.named_parameters()}
+            state_dict_meta = dict(self.model.named_parameters())
 
         # Compute tensor sizes and shard assignments (all ranks compute same assignment)
         tensor_infos = []  # [(name, estimated_size, is_dtensor), ...]
         for name, tensor in state_dict_meta.items():
             if isinstance(tensor, DTensor):
-                # For DTensor, compute full size from local shape and mesh
-                local_shape = tensor.to_local().shape
-                # Get the sharding spec to compute full shape
+                # DTensor.shape returns the full logical shape.
                 full_shape = tensor.shape  # DTensor.shape returns full logical shape
                 numel = 1
                 for dim in full_shape:
@@ -877,10 +1044,20 @@ class CheckpointManager:
 
         start_time = time.time()
 
-        # Save LoRA weights (collective operation)
-        self._save_lora_weights(lora_path, model_id)
+        local_error = None
+        try:
+            # Save LoRA weights (collective operation)
+            self._save_lora_weights(lora_path, model_id)
+        except Exception as e:
+            logger.error(f"Failed to save LoRA-only checkpoint for model_id={model_id}: {e}", exc_info=True)
+            local_error = str(e)
 
-        dist.barrier()
+        synced_error = self._sync_collective_error(local_error)
+        if synced_error:
+            raise RuntimeError(f"LoRA-only save failed: {synced_error}")
+
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            dist.barrier()
 
         # Get step from adapter manager if available
         if self._adapter_manager is not None:
@@ -930,7 +1107,7 @@ class CheckpointManager:
         # For non-LoRA or single-adapter mode, use original DCP approach
         start_time = time.time()
 
-        state = {"model": self.model, "optimizer": self.optimizer if load_optimizer else None, "extra_state": {}}
+        state = self._build_dcp_load_state(checkpoint_path, load_optimizer=load_optimizer)
 
         self.Checkpointer.load(checkpoint_path, state)
 
@@ -939,12 +1116,13 @@ class CheckpointManager:
         self.global_forward_backward_step = state["extra_state"].get("global_forward_backward_step", 0)
         torch.set_rng_state(state["extra_state"].get("torch_rng_state", torch.get_rng_state()))
 
-        dist.barrier()
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
 
         result = {
             "checkpoint_path": checkpoint_path,
             "step": self.global_step,
-            "load_optimizer": load_optimizer,
+            "load_optimizer": "optimizer" in state,
             "load_time": time.time() - start_time,
             "success": True,
         }

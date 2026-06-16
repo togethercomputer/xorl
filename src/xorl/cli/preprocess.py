@@ -64,12 +64,12 @@ def load_config_without_validation(config_path: str) -> Arguments:
 def main():
     """Preprocess datasets and save them to disk for later use in training."""
     if len(sys.argv) < 2:
-        print("Usage: python -m xorl.cli.preprocess <config.yaml>")
+        sys.stderr.write("Usage: python -m xorl.cli.preprocess <config.yaml>\n")
         sys.exit(1)
 
     config_path = sys.argv[1]
     if not os.path.exists(config_path):
-        print(f"Error: Config file not found: {config_path}")
+        sys.stderr.write(f"Error: Config file not found: {config_path}\n")
         sys.exit(1)
 
     # Load config without triggering distributed validation

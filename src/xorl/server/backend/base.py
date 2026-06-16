@@ -28,6 +28,7 @@ class Backend(ABC):
         loss_fn_params: Optional[Dict[str, Any]] = None,
         model_id: Optional[str] = None,
         routed_experts: Optional[List[Any]] = None,
+        routed_expert_logits: Optional[List[Any]] = None,
         request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run forward + backward pass. Returns {total_loss, global_valid_tokens, ...}."""
@@ -39,6 +40,8 @@ class Backend(ABC):
         loss_fn: str = "causallm_loss",
         loss_fn_params: Optional[Dict[str, Any]] = None,
         model_id: Optional[str] = None,
+        routed_experts: Optional[List[Any]] = None,
+        routed_expert_logits: Optional[List[Any]] = None,
         request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forward-only pass (no gradients). Returns {total_loss, global_valid_tokens, ...}."""
@@ -135,6 +138,16 @@ class Backend(ABC):
     # ========================================================================
     # Adapter Operations
     # ========================================================================
+
+    @abstractmethod
+    async def register_session(
+        self,
+        model_id: str = "default",
+        session_spec: Optional[Dict[str, Any]] = None,
+        materialize: bool = False,
+        request_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Register a session runtime spec on workers."""
 
     @abstractmethod
     async def register_adapter(

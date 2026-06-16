@@ -105,11 +105,9 @@ def main(config: Config):
         start_time = time.time()
         metrics = {}
 
-        adam_params = xorl_client.AdamParams(learning_rate=config.learning_rate, beta1=0.9, beta2=0.95, eps=1e-8)
-
         # Training step
         fwd_bwd_future = training_client.forward_backward(datums, loss_fn="cross_entropy")
-        optim_step_future = training_client.optim_step(adam_params)
+        optim_step_future = training_client.optim_step(learning_rate=config.learning_rate)
 
         fwd_bwd_result = fwd_bwd_future.result()
         optim_result = optim_step_future.result()

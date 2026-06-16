@@ -34,7 +34,7 @@ import time
 from contextlib import asynccontextmanager, closing
 from dataclasses import fields
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import uvicorn
@@ -43,6 +43,7 @@ import yaml
 from xorl.server.api_server.server import APIServer
 from xorl.server.orchestrator.orchestrator import Orchestrator
 from xorl.server.server_arguments import ServerArguments
+from xorl.server.session_spec import build_default_session_spec
 from xorl.server.utils.network import read_address_file
 
 
@@ -126,15 +127,24 @@ def find_free_ports(count: int, start_port: int = 50000) -> List[int]:
     Returns:
         List of free port numbers
     """
+    end_port = 60000
+    candidates = list(range(start_port, end_port))
+    random.shuffle(candidates)
+
     ports = []
-    current_start = start_port
+    for port in candidates:
+        with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
+            try:
+                sock.bind(("", port))
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            except OSError:
+                continue
 
-    for _ in range(count):
-        port = find_free_port(current_start)
         ports.append(port)
-        current_start = port + 1
+        if len(ports) == count:
+            return ports
 
-    return ports
+    raise RuntimeError(f"Could not find {count} free ports in range {start_port}-{end_port}")
 
 
 # ============================================================================
@@ -245,10 +255,15 @@ def run_api_server(
     default_timeout: float = 120.0,
     output_dir: str = "outputs",
     base_model: Optional[str] = None,
+    default_session_spec: Optional[Dict[str, Any]] = None,
+    server_lora_config: Optional[Dict[str, Any]] = None,
+    max_lora_rank: Optional[int] = None,
     storage_limit: str = "10TB",
     idle_session_timeout: float = 7200.0,
     skip_initial_checkpoint: bool = False,
     sync_inference_method: str = "nccl_broadcast",
+    train_config: Optional[Dict[str, Any]] = None,
+    lora_config: Optional[Dict[str, Any]] = None,
 ):
     """
     Run the API Server in a separate process.
@@ -266,6 +281,8 @@ def run_api_server(
         idle_session_timeout: Idle session timeout in seconds. Default: 7200.0 (2 hours).
         skip_initial_checkpoint: Skip auto-saving initial checkpoint on first create_model.
         sync_inference_method: Method for syncing weights to inference endpoints. Default: 'nccl_broadcast'.
+        train_config: Train config defaults for per-session optimizer specs.
+        lora_config: LoRA config defaults and limits for per-session adapter specs.
     """
 
     # Setup logging for this process
@@ -306,10 +323,15 @@ def run_api_server(
                 default_timeout=default_timeout,
                 output_dir=output_dir,
                 base_model=base_model,
+                default_session_spec=default_session_spec,
+                server_lora_config=server_lora_config,
+                max_lora_rank=max_lora_rank,
                 storage_limit=storage_limit,
                 idle_session_timeout=idle_session_timeout,
                 skip_initial_checkpoint=skip_initial_checkpoint,
                 sync_inference_method=sync_inference_method,
+                train_config=train_config,
+                lora_config=lora_config,
             )
             await _state_module.api_server.start()
             yield
@@ -658,6 +680,29 @@ class Launcher:
             self.base_model = None
             logger.info("No base_model configured (will not validate create_model requests)")
 
+        self.server_lora_config: Dict[str, Any] = {}
+        self.default_session_spec: Optional[Dict[str, Any]] = None
+        self.max_lora_rank: Optional[int] = None
+        if self.server_args:
+            config_dict = self.server_args.to_config_dict()
+            self.server_lora_config = config_dict.get("lora", {})
+            self.max_lora_rank = self.server_lora_config.get(
+                "max_lora_rank",
+                self.server_lora_config.get("lora_rank"),
+            )
+            if self.server_lora_config.get("enable_lora", False):
+                self.default_session_spec = build_default_session_spec(
+                    base_model=self.base_model or self.server_args.model_path,
+                    train_config=config_dict.get("train", {}),
+                    lora_config=self.server_lora_config,
+                )
+                logger.info(
+                    "Using default multi-adapter session spec: "
+                    f"rank={self.default_session_spec['lora_config']['lora_rank']}, "
+                    f"alpha={self.default_session_spec['lora_config']['lora_alpha']}, "
+                    f"optimizer={self.default_session_spec['optimizer_config']['type']}"
+                )
+
         # Storage limit - prefer from ServerArguments if available
         if self.server_args:
             self.storage_limit = self.server_args.storage_limit
@@ -878,10 +923,14 @@ class Launcher:
             stale_address_file.unlink()
             logger.info(f"Removed stale address file: {stale_address_file}")
 
-        # Build torchrun command — use the same Python environment as the launcher
-        torchrun_bin = os.path.join(os.path.dirname(sys.executable), "torchrun")
+        # Build torchrun command through the active Python executable. In
+        # mounted worktrees the torchrun console script can have a host-path
+        # shebang that does not exist inside the container, while
+        # ``python -m torch.distributed.run`` remains relocatable.
         cmd = [
-            torchrun_bin,
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
             f"--nnodes={self.nnodes}",
             f"--nproc-per-node={self.nproc_per_node}",
             f"--master-addr={self.master_addr}",
@@ -1034,6 +1083,12 @@ class Launcher:
             logger.info("✓ Engine Core process started, waiting for full initialization...")
 
             # Start API Server (connects to engine)
+            server_config = self.server_args.to_config_dict() if self.server_args else {}
+            api_train_config = server_config.get("train", {})
+            api_lora_config = server_config.get("lora", {})
+            skip_initial_checkpoint = self.server_args.skip_initial_checkpoint if self.server_args else False
+            sync_inference_method = self.server_args.sync_inference_method if self.server_args else "nccl_broadcast"
+
             logger.info("Starting API Server...")
             logger.info(f"  output_dir: {self.output_dir}")
             logger.info(f"  base_model: {self.base_model}")
@@ -1050,10 +1105,15 @@ class Launcher:
                     self.operation_timeout,
                     self.output_dir,
                     self.base_model,
+                    self.default_session_spec,
+                    self.server_lora_config,
+                    self.max_lora_rank,
                     self.storage_limit,
                     self.idle_session_timeout,
-                    self.server_args.skip_initial_checkpoint,
-                    self.server_args.sync_inference_method,
+                    skip_initial_checkpoint,
+                    sync_inference_method,
+                    api_train_config,
+                    api_lora_config,
                 ),
                 name="APIServer",
             )
@@ -1078,7 +1138,7 @@ class Launcher:
                 raise RuntimeError(f"Engine Core failed during initialization (exit code: {exit_code})")
 
             # Save initial checkpoint (000) to capture the model state before any training
-            if not self.server_args.skip_initial_checkpoint:
+            if not skip_initial_checkpoint:
                 self._save_initial_checkpoint()
             else:
                 logger.info("Skipping initial checkpoint save (skip_initial_checkpoint=true)")

@@ -3,7 +3,7 @@ Muon optimizer: Momentum + Orthogonalization Updates for Neurons.
 
 Extends ``torch.optim.Muon`` with:
   - Mixed param groups: ``use_muon=True`` (Newton-Schulz) / ``False`` (AdamW fallback)
-  - FSDP2/EP DTensor support (shard-local Newton-Schulz)
+  - FSDP2/EP DTensor support (shard-local or full-gradient Newton-Schulz)
   - 3D+ MoE expert tensor support (preserve leading dims as matrix batches)
 
 The core Muon algorithm is aligned with PyTorch's implementation:
@@ -24,21 +24,102 @@ References:
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Iterable, Optional, Tuple
+from typing import TYPE_CHECKING, Iterable, Optional, Tuple
 
 import torch
 from torch.distributed._tensor import DTensor
+from torch.distributed.tensor import Shard
 from torch.optim import Muon as TorchMuon
 from torch.optim._muon import _adjust_lr, _zeropower_via_newtonschulz
 from torch.optim.optimizer import Optimizer
 
+
+if TYPE_CHECKING:
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.tensor.placement_types import Placement
+
 from ..utils import logging
+from .cautious import apply_cautious_decay_
 from .gram_newton_schulz import GramNewtonSchulzOrthogonalizer, expand_ns_coefficients, find_best_restarts
 
 
 logger = logging.get_logger(__name__)
 
-GROUPED_GRAM_NS_FP32_BYTE_LIMIT = 2 * 1024**3
+GROUPED_GRAM_NS_FP32_BYTE_LIMIT = 512 * 1024**2
+
+
+def _batched_zeropower_via_newtonschulz(
+    grad: torch.Tensor,
+    ns_coefficients: Tuple[float, float, float],
+    ns_steps: int,
+    eps: float,
+) -> torch.Tensor:
+    """Batched Newton-Schulz on a stack of matrices ``[B, H, I]``.
+
+    Equivalent to looping the upstream 2D ``_zeropower_via_newtonschulz`` over
+    the leading batch dim, but emits one bmm/baddbmm per NS step instead of one
+    matmul per (batch, step). On Qwen3.5-35B-A3B (40 MoE layers × 8 local
+    experts × 5 NS steps) this collapses ~14k kernel launches per optimizer
+    step into ~600, recovering the per-expert-Python-loop regression while
+    keeping the per-matrix math identical.
+    """
+    if ns_steps >= 100:
+        raise ValueError("Number of steps must be less than 100 for computational efficiency")
+    if grad.ndim != 3:
+        raise ValueError(f"Batched NS expects a 3D tensor, got shape {tuple(grad.shape)}")
+    if len(ns_coefficients) != 3:
+        raise ValueError("Coefficients must be a tuple of exactly 3 values")
+
+    a, b, c = ns_coefficients
+
+    # Match upstream behavior: cast to bf16, optionally transpose so H <= I.
+    ortho = grad.bfloat16()
+    transposed = ortho.size(-2) > ortho.size(-1)
+    if transposed:
+        ortho = ortho.transpose(-2, -1).contiguous()
+
+    # Per-matrix spectral-norm normalisation: divide each batch element by its
+    # own Frobenius norm (upper bound on spectral norm). Matches the upstream
+    # ``ortho_grad.div_(ortho_grad.norm().clamp(min=eps))``.
+    norms = ortho.flatten(start_dim=1).norm(dim=1).clamp(min=eps).reshape(-1, 1, 1)
+    ortho = ortho / norms
+
+    for _ in range(ns_steps):
+        # gram_matrix[i] = ortho[i] @ ortho[i].T
+        gram_matrix = torch.bmm(ortho, ortho.transpose(-2, -1))
+        # gram_update[i] = b * gram_matrix[i] + c * gram_matrix[i] @ gram_matrix[i]
+        gram_update = torch.baddbmm(gram_matrix, gram_matrix, gram_matrix, beta=b, alpha=c)
+        # ortho[i] = a * ortho[i] + gram_update[i] @ ortho[i]
+        ortho = torch.baddbmm(ortho, gram_update, ortho, beta=a)
+
+    if transposed:
+        ortho = ortho.transpose(-2, -1)
+    return ortho
+
+
+def _shard_full_to_local(full: torch.Tensor, mesh, placements) -> torch.Tensor:
+    """Slice a globally-replicated tensor down to its local shard for ``placements``.
+
+    Mirrors DTensor's chunk-based ``Shard.split_tensor`` semantics: along each
+    sharded mesh dim, split with ``torch.chunk`` and select the local rank's
+    chunk. Trailing ranks may receive an empty chunk when the dim is not
+    evenly divisible (matching ``DTensor._local_tensor`` shape conventions).
+    Replicate placements pass through unchanged.
+    """
+    out = full
+    for mesh_dim, placement in enumerate(placements):
+        if isinstance(placement, Shard):
+            dim = placement.dim
+            world = mesh.size(mesh_dim)
+            rank = mesh.get_local_rank(mesh_dim)
+            chunks = list(torch.chunk(out, world, dim=dim))
+            if rank < len(chunks):
+                out = chunks[rank].contiguous()
+            else:
+                shape = list(out.shape)
+                shape[dim] = 0
+                out = torch.empty(shape, dtype=out.dtype, device=out.device)
+    return out
 
 
 @dataclass
@@ -47,6 +128,8 @@ class _MuonUpdatePlan:
     adjusted_lr: float
     orig_shape: Optional[torch.Size]
     pieces: list[Optional[torch.Tensor]]
+    placements: Optional[Tuple["Placement", ...]] = None
+    device_mesh: Optional["DeviceMesh"] = None
 
 
 @dataclass
@@ -104,10 +187,23 @@ class Muon(TorchMuon):
         gram_newton_schulz_restart_iterations: Explicit Gram Newton-Schulz
             restart iteration indices. A value of ``2`` means restart after
             finishing the second iteration.
+        grouped_gram_ns_fp32_byte_limit: Maximum fp32 scratch bytes per grouped
+            Gram Newton-Schulz batch before splitting it into smaller chunks.
         adamw_state_dtype: If set, force AdamW fallback optimizer states
             (``exp_avg``, ``exp_avg_sq``) to this dtype (e.g.
             ``torch.bfloat16``).  Default ``None`` inherits dtype from
             the parameter.
+        distributed_mode: How to handle Newton-Schulz on FSDP2/EP-sharded
+            DTensor params. ``"shard_local"`` (default) runs NS on each
+            rank's local shard — cheap but only an approximation of full
+            Muon. ``"full_gradient"`` all-gathers the post-momentum update
+            to the full matrix, runs NS on the full matrix on every rank
+            in the param's mesh (redundantly), and slices the
+            orthogonalized update back to the local shard. This recovers
+            the exact Muon update direction at the cost of a per-step
+            all-gather and replicated NS compute. Implements the dense
+            path of DeepSeek V4 §3.5.1 (without knapsack bucket assignment;
+            see followup work). Non-DTensor params are unaffected.
     """
 
     def __init__(
@@ -125,11 +221,14 @@ class Muon(TorchMuon):
         grad_dtype: Optional[torch.dtype] = None,
         update_dtype: Optional[torch.dtype] = None,
         force_momentum_path: bool = False,
-        ns_algorithm: str = "standard_newton_schulz",
+        ns_algorithm: str = "gram_newton_schulz",
         ns_use_quack_kernels: bool = True,
         gram_newton_schulz_num_restarts: int = 1,
         gram_newton_schulz_restart_iterations: Optional[Iterable[int]] = None,
+        grouped_gram_ns_fp32_byte_limit: int = GROUPED_GRAM_NS_FP32_BYTE_LIMIT,
         adamw_state_dtype: Optional[torch.dtype] = None,
+        cautious: bool = False,
+        distributed_mode: str = "shard_local",
     ):
         if ns_algorithm not in {"standard_newton_schulz", "gram_newton_schulz"}:
             raise ValueError(
@@ -140,12 +239,19 @@ class Muon(TorchMuon):
             raise ValueError(
                 f"gram_newton_schulz_num_restarts must be non-negative, got {gram_newton_schulz_num_restarts}"
             )
+        if distributed_mode not in {"shard_local", "full_gradient"}:
+            raise ValueError(
+                f"Unsupported Muon distributed_mode: {distributed_mode!r}. Expected 'shard_local' or 'full_gradient'."
+            )
+        if grouped_gram_ns_fp32_byte_limit <= 0:
+            raise ValueError(f"grouped_gram_ns_fp32_byte_limit must be positive, got {grouped_gram_ns_fp32_byte_limit}")
 
         self._momentum_dtype = momentum_dtype
         self._grad_dtype = grad_dtype
         self._update_dtype = update_dtype
         self._force_momentum_path = force_momentum_path
         self._adamw_state_dtype = adamw_state_dtype
+        self._distributed_mode = distributed_mode
         self._logged_dtypes = False
         self._gram_ns_orthogonalizers = {}
         # Skip TorchMuon.__init__ (which enforces 2D-only) and call
@@ -168,9 +274,11 @@ class Muon(TorchMuon):
                 if gram_newton_schulz_restart_iterations is not None
                 else None
             ),
+            grouped_gram_ns_fp32_byte_limit=grouped_gram_ns_fp32_byte_limit,
             use_muon=True,
             adamw_betas=adamw_betas,
             adamw_eps=adamw_eps,
+            cautious=cautious,
         )
         Optimizer.__init__(self, params, defaults)
 
@@ -201,8 +309,15 @@ class Muon(TorchMuon):
           5. Weight decay:   param *= 1 - lr * wd
           6. Update:         param -= adjusted_lr * update
 
-        For FSDP2/EP DTensors, operates on the local shard directly
-        (shard-local Newton-Schulz) to avoid DTensor reshape/matmul issues.
+        For FSDP2/EP DTensors, ``distributed_mode`` selects between two paths:
+          - ``"shard_local"`` (default): NS is applied to each rank's local
+            shard. Cheap; an approximation of full Muon.
+          - ``"full_gradient"``: post-momentum update is all-gathered to the
+            full matrix, NS is applied on the full matrix on every rank in
+            the param's mesh, and the orthogonalized update is sliced back
+            to the local shard before being written to ``p._local_tensor``.
+            Recovers exact Muon at the cost of a per-step all-gather and
+            replicated NS compute.
         """
         lr = group["lr"]
         momentum = group["momentum"]
@@ -212,6 +327,7 @@ class Muon(TorchMuon):
         eps = group["eps"]
         weight_decay = group["weight_decay"]
         adjust_lr_fn = group["adjust_lr_fn"]
+        cautious = group.get("cautious", False)
         uses_grouped_gram_ns = group["ns_algorithm"] == "gram_newton_schulz"
         grouped_updates: dict[tuple[tuple[int, int], torch.dtype, torch.device], list[_GroupedOrthogonalizationEntry]]
         grouped_updates = defaultdict(list)
@@ -224,6 +340,11 @@ class Muon(TorchMuon):
             # Extract local tensors from DTensors (FSDP2/EP sharded params).
             grad = p.grad
             is_dtensor = isinstance(grad, DTensor)
+            use_full_gradient = (
+                self._distributed_mode == "full_gradient"
+                and is_dtensor
+                and any(isinstance(pl, Shard) for pl in grad.placements)
+            )
             if is_dtensor:
                 grad_local = grad._local_tensor
                 p_local = p._local_tensor
@@ -236,9 +357,12 @@ class Muon(TorchMuon):
 
             # Handle 3D+ tensors as batches of matrices: [..., hidden, intermediate].
             # For fused gate_up_proj [E, H, 2I], split into two [..., H, I] halves.
+            # In shard_local mode this runs on the local shard; in full_gradient
+            # mode we defer the reshape until after the post-momentum all-gather
+            # so the reshape and LR adjustment see the full matrix shape.
             orig_shape = None
             fused_split = None
-            if grad_local.ndim >= 3:
+            if not use_full_gradient and grad_local.ndim >= 3:
                 orig_shape = grad_local.shape
                 fused_gate_up_ids = group.get("_fused_gate_up_ids", set())
                 if id(p) in fused_gate_up_ids:
@@ -285,10 +409,30 @@ class Muon(TorchMuon):
                     )
                     self._logged_dtypes = True
 
+            # Full-gradient mode: all-gather the post-momentum update to the
+            # full matrix shape on every rank in the param's mesh, then run
+            # NS on the full matrix. Momentum/Nesterov are linear in the
+            # gradient and commute with sharding, so doing them on the local
+            # shard before gather is mathematically identical to doing them
+            # post-gather but uses only local-shard buffer memory.
+            plan_placements = None
+            plan_mesh = None
+            if use_full_gradient:
+                plan_placements = grad.placements
+                plan_mesh = grad.device_mesh
+                update_dtensor = DTensor.from_local(update, plan_mesh, plan_placements, run_check=False)
+                update = update_dtensor.full_tensor()
+                if update.ndim >= 3:
+                    orig_shape = update.shape
+                    fused_gate_up_ids = group.get("_fused_gate_up_ids", set())
+                    if id(p) in fused_gate_up_ids:
+                        fused_split = update.shape[-1] // 2
+                    update = update.reshape(-1, *update.shape[-2:])
+
             adjusted_lr = _adjust_lr(
                 lr,
                 adjust_lr_fn,
-                grad_local.shape[-2:] if grad_local.ndim > 2 else grad_local.shape,
+                update.shape[-2:] if update.ndim > 2 else update.shape,
             )
             pieces = [update[..., :fused_split], update[..., fused_split:]] if fused_split is not None else [update]
             plan = _MuonUpdatePlan(
@@ -296,6 +440,8 @@ class Muon(TorchMuon):
                 adjusted_lr=adjusted_lr,
                 orig_shape=orig_shape,
                 pieces=[None] * len(pieces),
+                placements=plan_placements,
+                device_mesh=plan_mesh,
             )
             update_plans.append(plan)
 
@@ -320,7 +466,11 @@ class Muon(TorchMuon):
 
         if uses_grouped_gram_ns and grouped_updates:
             orthogonalizer = self._get_gram_ns_orthogonalizer(group)
-            self._orthogonalize_grouped_gram_ns_updates(grouped_updates, orthogonalizer)
+            self._orthogonalize_grouped_gram_ns_updates(
+                grouped_updates,
+                orthogonalizer,
+                group["grouped_gram_ns_fp32_byte_limit"],
+            )
 
         for plan in update_plans:
             update_pieces = plan.pieces
@@ -335,11 +485,23 @@ class Muon(TorchMuon):
             if plan.orig_shape is not None:
                 update = update.reshape(plan.orig_shape)
 
+            # Slice the orthogonalized full-tensor update back to the local
+            # shard for full_gradient mode. This is purely local (no comm).
+            if plan.placements is not None:
+                update = _shard_full_to_local(update, plan.device_mesh, plan.placements)
+
             # Cast back to param dtype
             update = update.to(plan.param.dtype)
 
-            # Decoupled weight decay
-            plan.param.mul_(1 - lr * weight_decay)
+            # Decoupled weight decay (cautious mask uses the post-NS update,
+            # which is the actual u_t direction for Muon).
+            apply_cautious_decay_(
+                plan.param,
+                update_sign_proxy=update,
+                lr=lr,
+                weight_decay=weight_decay,
+                cautious=cautious,
+            )
 
             # Parameter update
             plan.param.add_(update, alpha=-plan.adjusted_lr)
@@ -358,10 +520,9 @@ class Muon(TorchMuon):
 
             original_shape = update.shape
             flat_update = update.reshape(-1, *update.shape[-2:])
-            orthogonalized = [
-                _zeropower_via_newtonschulz(matrix, ns_coefficients, ns_steps, eps) for matrix in flat_update.unbind(0)
-            ]
-            return torch.stack(orthogonalized, dim=0).reshape(original_shape)
+            return _batched_zeropower_via_newtonschulz(flat_update, ns_coefficients, ns_steps, eps).reshape(
+                original_shape
+            )
         if group["ns_algorithm"] == "gram_newton_schulz":
             return self._get_gram_ns_orthogonalizer(group).orthogonalize(update)
         raise ValueError(
@@ -373,9 +534,10 @@ class Muon(TorchMuon):
         self,
         grouped_updates: dict[tuple[tuple[int, int], torch.dtype, torch.device], list[_GroupedOrthogonalizationEntry]],
         orthogonalizer: GramNewtonSchulzOrthogonalizer,
+        fp32_byte_limit: int,
     ) -> None:
         for batch_entries in grouped_updates.values():
-            for chunk in self._iter_grouped_gram_ns_chunks(batch_entries):
+            for chunk in self._iter_grouped_gram_ns_chunks(batch_entries, fp32_byte_limit):
                 if len(chunk) == 1 and chunk[0].batched_tensor.shape[0] == 1 and chunk[0].tensor.ndim == 2:
                     entry = chunk[0]
                     entry.plan.pieces[entry.piece_index] = orthogonalizer.orthogonalize(entry.tensor)
@@ -398,9 +560,10 @@ class Muon(TorchMuon):
     def _iter_grouped_gram_ns_chunks(
         self,
         batch_entries: list[_GroupedOrthogonalizationEntry],
+        fp32_byte_limit: int,
     ):
         per_matrix_numel = batch_entries[0].batched_tensor.shape[-2] * batch_entries[0].batched_tensor.shape[-1]
-        max_matrix_batch = max(1, GROUPED_GRAM_NS_FP32_BYTE_LIMIT // (per_matrix_numel * 4))
+        max_matrix_batch = max(1, fp32_byte_limit // (per_matrix_numel * 4))
         chunk: list[_GroupedOrthogonalizationEntry] = []
         chunk_matrix_batch = 0
 
@@ -457,6 +620,7 @@ class Muon(TorchMuon):
         beta1, beta2 = group["adamw_betas"]
         eps = group["adamw_eps"]
         weight_decay = group["weight_decay"]
+        cautious = group.get("cautious", False)
 
         for p in group["params"]:
             if p.grad is None:
@@ -478,13 +642,19 @@ class Muon(TorchMuon):
             exp_avg = state["exp_avg"]
             exp_avg_sq = state["exp_avg_sq"]
 
-            # Decoupled weight decay
-            if weight_decay > 0:
-                p.data.mul_(1.0 - lr * weight_decay)
-
             # Update biased first and second moment estimates
             exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
             exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+
+            # Decoupled weight decay (cautious mask uses sign(exp_avg) which
+            # matches sign(u_t) since the Adam denominator is positive).
+            apply_cautious_decay_(
+                p.data,
+                update_sign_proxy=exp_avg,
+                lr=lr,
+                weight_decay=weight_decay,
+                cautious=cautious,
+            )
 
             # Bias correction
             bias_correction1 = 1.0 - beta1**step

@@ -156,3 +156,35 @@ class TestCollatorCall:
         r_single = collator_fa(batch_single)
         assert r_single["input_ids"].shape[-1] == 5
         assert r_single["labels"].shape[-1] == 5
+
+    @patch("xorl.data.collators.sequence_shard_collator.get_parallel_state")
+    def test_teacher_hidden_states_are_sharded_with_token_fields(self, mock_parallel_state):
+        mock_parallel_state.return_value = _make_mock_ps(cp_size=2, cp_rank=1)
+        collator = TextSequenceShardCollator(pad_token_id=0)
+        teacher_hidden_states = torch.tensor(
+            [
+                [
+                    [0.25, 0.5],
+                    [1.25, 1.5],
+                    [2.25, 2.5],
+                    [3.25, 3.5],
+                    [4.25, 4.5],
+                ]
+            ]
+        )
+        batch = {
+            "input_ids": torch.tensor([[1, 2, 3, 4, 5]]),
+            "attention_mask": torch.tensor([[1, 1, 1, 1, 1]]),
+            "labels": torch.tensor([[2, 3, 4, 5, IGNORE_INDEX]]),
+            "position_ids": torch.tensor([[0, 1, 2, 3, 4]]),
+            "teacher_hidden_states": teacher_hidden_states,
+        }
+
+        result = collator(batch)
+
+        assert result["input_ids"].shape[-1] == 3
+        assert result["teacher_hidden_states"].shape == (1, 3, 2)
+        torch.testing.assert_close(
+            result["teacher_hidden_states"],
+            torch.tensor([[[3.25, 3.5], [4.25, 4.5], [0.0, 0.0]]]),
+        )

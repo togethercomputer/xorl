@@ -2,7 +2,7 @@
 title: "Password Memorization"
 ---
 
-[`examples/server/password_memorization/`](https://github.com/togethercomputer/xorl-internal/tree/main/examples/server/password_memorization) — End-to-end test for the full **training → weight sync → inference** pipeline. Trains a model to memorize 3 secret project codes via SFT, syncs weights to a running xorl-sglang instance, and queries inference to verify recall.
+[`examples/server/password_memorization/`](https://github.com/togethercomputer/xorl/tree/main/examples/server/password_memorization) — End-to-end test for the full **training → weight sync → inference** pipeline. Trains a model to memorize 3 secret project codes via SFT, syncs weights to a running xorl-sglang instance, and queries inference to verify recall.
 
 **Run:**
 
@@ -70,4 +70,4 @@ python examples/server/password_memorization/run_password_test.py \
 | QLoRA nvfp4 | EP=8, SP=8 | 128 | 5e-4 | cosine | 3/3 |
 | QLoRA nf4 | EP=8, SP=8 | 128 | 5e-4 | cosine | 3/3 |
 
-See the [example README](https://github.com/togethercomputer/xorl-internal/tree/main/examples/server/password_memorization/README.md) for the full test matrix and detailed setup instructions.
+See the [example README](https://github.com/togethercomputer/xorl/tree/main/examples/server/password_memorization/README.md) for the full test matrix and detailed setup instructions.

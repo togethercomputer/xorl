@@ -39,6 +39,19 @@ from xorl.server.utils.storage import (
 logger = logging.getLogger(__name__)
 
 
+def _model_config_is_lora(model_config: dict, *, default: bool = False) -> bool:
+    """Infer whether a stored model config represents a LoRA session."""
+    if "is_lora" in model_config:
+        return bool(model_config["is_lora"])
+
+    lora_config = model_config.get("lora_config") or {}
+    if lora_config.get("enable_lora", False):
+        return True
+    if "lora_rank" in lora_config or "rank" in lora_config:
+        return True
+    return default
+
+
 class WeightsMixin:
     """Mixin for weight I/O and checkpoint management."""
 
@@ -517,6 +530,7 @@ class WeightsMixin:
             base_model = model_config.get("base_model", self.base_model or "unknown")
             lora_config = model_config.get("lora_config", {})
             lora_rank = lora_config.get("lora_rank")
+            is_lora = _model_config_is_lora(model_config, default=self.default_session_spec is not None)
 
             # Get last checkpoint info
             last_checkpoint = None
@@ -537,7 +551,7 @@ class WeightsMixin:
                 training_run_id=model_id,
                 base_model=base_model,
                 model_owner="local",
-                is_lora=True,
+                is_lora=is_lora,
                 corrupted=False,
                 lora_rank=lora_rank,
                 last_request_time=datetime.now().isoformat(),
@@ -700,9 +714,18 @@ class WeightsMixin:
 
             # Determine training mode from model config
             model_config = self.model_configs.get(request.model_id, {})
-            lora_config = model_config.get("lora_config", {})
-            is_lora = lora_config.get("enable_lora", False) or "rank" in lora_config
-            merge_lora_interval = lora_config.get("merge_lora_interval", 0)
+            lora_config = model_config.get("lora_config") or {}
+            is_lora = _model_config_is_lora(model_config, default=self.default_session_spec is not None)
+            if is_lora:
+                merge_lora_interval = int(
+                    (getattr(self, "server_lora_config", {}) or {}).get(
+                        "merge_lora_interval",
+                        lora_config.get("merge_lora_interval", 0),
+                    )
+                    or 0
+                )
+            else:
+                merge_lora_interval = 0
 
             if is_lora and merge_lora_interval == 0:
                 # LoRA with no merge: base weights unchanged, save adapter only

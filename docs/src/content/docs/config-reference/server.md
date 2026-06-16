@@ -33,7 +33,7 @@ python -m xorl.server.launcher --mode auto --config config.yaml \
 | `ep_dispatch` | `alltoall` | Expert-parallel dispatch: `alltoall` or `deepep` (NVLink-optimized). |
 | `deepep_buffer_size_gb` | `2.0` | DeepEP NVLink buffer size per GPU in GB. Only active when `ep_dispatch: deepep`. |
 | `deepep_num_sms` | `20` | SMs assigned to DeepEP communication kernels. Must be even. |
-| `deepep_async_combine` | `false` | Overlap DeepEP combine with the next layer's compute (experimental). |
+| `deepep_async_combine` | `false` | Overlap DeepEP combine with the next layer's compute (experimental, unsafe). Forced to `false` in code unless `XORL_DEEPEP_UNSAFE_ASYNC_COMBINE=1` is exported; without that env var, deferring the comm-stream sync races the transformer block's read of the combined tensor on the default stream. |
 | `merge_qkv` | `true` | Keep Q/K/V projections fused. Set `false` for tensor parallelism. |
 | `basic_modules` | `[]` | Additional module names to shard as separate FSDP units. |
 | `foundation` | `{}` | Foundation model extra config (dict). |
@@ -86,7 +86,7 @@ These flags align the training model's numerics with the inference engine (SGLan
 | `enable_reentrant` | `false` | Use reentrant gradient checkpointing. |
 | `enable_forward_prefetch` | `false` | FSDP forward prefetch. |
 | `init_device` | `meta` | Model initialization device: `cpu`, `meta`, `cuda`. |
-| `load_weights_mode` | `auto` | Weight loading: `auto`, `safetensors`, `dcp`. |
+| `load_weights_mode` | `grouped` | Weight loading mode: `grouped` (default, with rank-0 fallback), `all_ranks`, or `skip`. |
 | `ce_mode` | `compiled` | Cross-entropy implementation: `compiled` (recommended, `torch.compile`) or `eager` (may OOM at 32K+ seq len). |
 
 ---
@@ -170,6 +170,7 @@ ZMQ communication between the launcher, workers, and API server.
 | `qlora_exclude_modules` | `null` | Modules to exclude from quantization (e.g., `[lm_head]`). |
 | `merge_lora_interval` | `0` | Merge LoRA into base weights every N steps. `0` = never. |
 | `reset_optimizer_on_merge` | `false` | ReLoRA optimizer reset after merge. |
+| `adapter_state_load_mode` | `all_ranks` | How to restore multi-adapter checkpoints: `all_ranks` loads on every rank; `rank0_broadcast` loads on rank 0 and broadcasts weights, metadata, and optimizer state. |
 
 ---
 

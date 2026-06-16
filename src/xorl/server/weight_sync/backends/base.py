@@ -108,10 +108,16 @@ class WeightTransportBackend(ABC):
         """
 
     @abstractmethod
-    def destroy(self) -> None:
+    def destroy(self, *, complete_receiver: bool = True) -> None:
         """Tear down connections and free resources.
 
         Safe to call even if :meth:`initialize` was not called or failed.
+
+        Args:
+            complete_receiver: If ``False``, skip any receiver-side "sync
+                complete" action and only clean up local transport resources.
+                Failure/abort paths use this to avoid marking a partial sync as
+                complete.
         """
 
     # ------------------------------------------------------------------
@@ -141,6 +147,20 @@ class WeightTransportBackend(ABC):
                 endpoint after this bucket is loaded. Handlers should only set
                 this on the final bucket of a sync.
         """
+
+    def flush_pending_transfers(self) -> None:
+        """Block until any in-flight async transfers complete.
+
+        For backends that issue ``transfer_bucket`` synchronously (e.g.
+        the NCCL broadcaster), this is a no-op — by the time
+        ``transfer_bucket`` returns, the bytes have landed.
+
+        For async backends (P2P/Mooncake), bucket calls return after
+        staging and submitting work to a worker thread; the handler
+        must call this before resuming inference, otherwise generation
+        can resume on partially-updated weights.
+        """
+        return None
 
     # ------------------------------------------------------------------
     # Topology hints (read by the handler to decide who prepares data)

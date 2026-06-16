@@ -83,6 +83,8 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         self.hidden_dim = hidden_size  # alias for compatibility with MoEExpertsLoRA
         self.r = r
         self.lora_alpha = lora_alpha
+        self.active_r = r
+        self.active_lora_alpha = lora_alpha
         self.scaling = compute_lora_scaling(lora_alpha, r, use_rslora)
         self.quant_format = quant_format
         self.quant_group_size = quant_group_size
@@ -194,14 +196,28 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
                 nn.init.kaiming_uniform_(lora_A.data[i], a=math.sqrt(5))
             nn.init.zeros_(lora_B.data)
 
+    def set_runtime_lora_config(self, lora_rank: int, lora_alpha: int) -> None:
+        """Update the active LoRA slice used during forward/merge/export."""
+        if lora_rank <= 0 or lora_rank > self.r:
+            raise ValueError(f"Active LoRA rank must be in [1, {self.r}], got {lora_rank}")
+        self.active_r = lora_rank
+        self.active_lora_alpha = lora_alpha
+
+    def _active_scaling(self) -> float:
+        return compute_lora_scaling(self.active_lora_alpha, self.active_r, self.use_rslora)
+
+    def _active_lora_views(self, proj_name: str) -> tuple[Tensor, Tensor]:
+        lora_A = getattr(self, f"{proj_name}_lora_A")[..., : self.active_r].contiguous()
+        lora_B = getattr(self, f"{proj_name}_lora_B")[:, : self.active_r, ...].contiguous()
+        return lora_A, lora_B
+
     def _compute_proj_delta(self, proj_name: str) -> torch.Tensor:
         """Compute LoRA delta for one projection. Returns [E, K, N] in GKN format."""
-        lora_A = getattr(self, f"{proj_name}_lora_A")  # [1 or E, in, r]
-        lora_B = getattr(self, f"{proj_name}_lora_B")  # [E or 1, r, out]
+        lora_A, lora_B = self._active_lora_views(proj_name)
         E = max(lora_A.shape[0], lora_B.shape[0])
         A = lora_A.expand(E, -1, -1)  # [E, in, r]
         B = lora_B.expand(E, -1, -1)  # [E, r, out]
-        return torch.bmm(A, B) * self.scaling  # [E, in, out] = [E, K, N]
+        return torch.bmm(A, B) * self._active_scaling()  # [E, in, out] = [E, K, N]
 
     # ------------------------------------------------------------------
     # Abstract methods (subclasses must implement)
@@ -475,13 +491,13 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
             gate_proj=self.gate_proj.to(compute_dtype),
             up_proj=self.up_proj.to(compute_dtype),
             down_proj=self.down_proj.to(compute_dtype),
-            gate_proj_lora_A=self.gate_proj_lora_A,
-            gate_proj_lora_B=self.gate_proj_lora_B,
-            up_proj_lora_A=self.up_proj_lora_A,
-            up_proj_lora_B=self.up_proj_lora_B,
-            down_proj_lora_A=self.down_proj_lora_A,
-            down_proj_lora_B=self.down_proj_lora_B,
-            scaling=self.scaling,
+            gate_proj_lora_A=self._active_lora_views("gate_proj")[0],
+            gate_proj_lora_B=self._active_lora_views("gate_proj")[1],
+            up_proj_lora_A=self._active_lora_views("up_proj")[0],
+            up_proj_lora_B=self._active_lora_views("up_proj")[1],
+            down_proj_lora_A=self._active_lora_views("down_proj")[0],
+            down_proj_lora_B=self._active_lora_views("down_proj")[1],
+            scaling=self._active_scaling(),
         )
 
     @torch.compiler.disable
@@ -519,20 +535,27 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
 
         # Step 2: Expert computation with dequantized base + LoRA
         compute_dtype = permute_tokens.dtype
+        gate_proj_lora_A, gate_proj_lora_B = self._active_lora_views("gate_proj")
+        up_proj_lora_A, up_proj_lora_B = self._active_lora_views("up_proj")
+        down_proj_lora_A, down_proj_lora_B = self._active_lora_views("down_proj")
         expert_output = compute_fn(
             permute_tokens,
             cumsum,
             self.gate_proj.to(compute_dtype),
             self.up_proj.to(compute_dtype),
             self.down_proj.to(compute_dtype),
-            self.gate_proj_lora_A,
-            self.gate_proj_lora_B,
-            self.up_proj_lora_A,
-            self.up_proj_lora_B,
-            self.down_proj_lora_A,
-            self.down_proj_lora_B,
-            self.scaling,
+            gate_proj_lora_A,
+            gate_proj_lora_B,
+            up_proj_lora_A,
+            up_proj_lora_B,
+            down_proj_lora_A,
+            down_proj_lora_B,
+            self._active_scaling(),
         )
+
+        expert_scores = getattr(ctx, "expert_scores", getattr(ctx, "permuted_scores", None))
+        if expert_scores is not None:
+            expert_output = expert_output * expert_scores.unsqueeze(1).to(expert_output.dtype)
 
         # Step 3: Combine expert outputs back to original ranks
         combine_kwargs = self._build_combine_kwargs(expert_output, ctx, dispatch_kwargs, parallel_state)
@@ -584,24 +607,28 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
             return torch.zeros_like(hidden_states[:, : self.hidden_size])
 
         compute_dtype = hidden_states.dtype
+        active_scaling = self._active_scaling()
+        gate_A, gate_B = self._active_lora_views("gate_proj")
+        up_A, up_B = self._active_lora_views("up_proj")
+        down_A, down_B = self._active_lora_views("down_proj")
 
         # gate_proj: x @ W (no transpose with G,K,N)
         gate_w = self.dequantize_expert("gate", local_idx, self.hidden_size, self.intermediate_size)
         gate_out = torch.matmul(hidden_states, gate_w.to(compute_dtype))
 
         # gate LoRA: (x @ A) @ B * scaling -- hybrid shared via min()
-        A = self.gate_proj_lora_A[min(local_idx, self.gate_proj_lora_A.shape[0] - 1)].to(compute_dtype)
-        B = self.gate_proj_lora_B[local_idx].to(compute_dtype)
-        gate_out = gate_out + torch.matmul(torch.matmul(hidden_states, A), B) * self.scaling
+        A = gate_A[min(local_idx, gate_A.shape[0] - 1)].to(compute_dtype)
+        B = gate_B[local_idx].to(compute_dtype)
+        gate_out = gate_out + torch.matmul(torch.matmul(hidden_states, A), B) * active_scaling
 
         # up_proj: x @ W
         up_w = self.dequantize_expert("up", local_idx, self.hidden_size, self.intermediate_size)
         up_out = torch.matmul(hidden_states, up_w.to(compute_dtype))
 
         # up LoRA
-        A = self.up_proj_lora_A[min(local_idx, self.up_proj_lora_A.shape[0] - 1)].to(compute_dtype)
-        B = self.up_proj_lora_B[local_idx].to(compute_dtype)
-        up_out = up_out + torch.matmul(torch.matmul(hidden_states, A), B) * self.scaling
+        A = up_A[min(local_idx, up_A.shape[0] - 1)].to(compute_dtype)
+        B = up_B[local_idx].to(compute_dtype)
+        up_out = up_out + torch.matmul(torch.matmul(hidden_states, A), B) * active_scaling
 
         # Activation
         out = self.act_fn(gate_out) * up_out
@@ -611,9 +638,9 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         down_out = torch.matmul(out, down_w.to(compute_dtype))
 
         # down LoRA
-        A = self.down_proj_lora_A[local_idx].to(compute_dtype)
-        B = self.down_proj_lora_B[min(local_idx, self.down_proj_lora_B.shape[0] - 1)].to(compute_dtype)
-        down_out = down_out + torch.matmul(torch.matmul(out, A), B) * self.scaling
+        A = down_A[local_idx].to(compute_dtype)
+        B = down_B[min(local_idx, down_B.shape[0] - 1)].to(compute_dtype)
+        down_out = down_out + torch.matmul(torch.matmul(out, A), B) * active_scaling
 
         return down_out
 
@@ -624,7 +651,7 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
             f"expert_offset={self.expert_offset}, "
             f"intermediate_size={self.intermediate_size}, "
             f"hidden_size={self.hidden_size}, "
-            f"r={self.r}, quant_format={self.quant_format}, "
+            f"r={self.active_r}, max_r={self.r}, quant_format={self.quant_format}, "
             f"moe_implementation={self.moe_implementation}, "
             f"hybrid_shared={self.hybrid_shared}, "
             f"ep_dispatch={self.ep_dispatch}"

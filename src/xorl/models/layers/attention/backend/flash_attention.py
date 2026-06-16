@@ -27,6 +27,7 @@ except ImportError:
 
 # Environment variable to disable FA4 even when available
 XORL_DISABLE_FA4 = os.environ.get("XORL_DISABLE_FA4", "0") == "1"
+XORL_FLASH_ATTN_DETERMINISTIC = os.environ.get("XORL_FLASH_ATTN_DETERMINISTIC", "0") == "1"
 
 logger = logging.get_logger(__name__)
 
@@ -66,6 +67,13 @@ def flash_attention_forward(
     position_ids = kwargs.pop("position_ids", None)
     if position_ids is not None and position_ids.dim() == 3:
         position_ids = position_ids[0]
+    deterministic = bool(
+        kwargs.pop(
+            "deterministic",
+            XORL_FLASH_ATTN_DETERMINISTIC
+            or getattr(getattr(module, "config", None), "_flash_attention_deterministic", False),
+        )
+    )
 
     # FA4 (CUTE) path
     if _should_use_fa4(use_fa4):
@@ -160,6 +168,7 @@ def flash_attention_forward(
                 causal=causal,
                 window_size=window_size_fa3,
                 softcap=softcap if softcap is not None else 0.0,
+                deterministic=deterministic,
             )
             # Restore batch dimension
             attn_output = attn_output.unsqueeze(0)
@@ -174,6 +183,7 @@ def flash_attention_forward(
                 causal=causal,
                 window_size=window_size_fa3,
                 softcap=softcap if softcap is not None else 0.0,
+                deterministic=deterministic,
             )
 
     return attn_output, None

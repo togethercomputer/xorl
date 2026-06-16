@@ -205,7 +205,7 @@ train:
   enable_full_shard: true
   enable_mixed_precision: true
   init_device: meta               # required for FSDP2
-  load_weights_mode: broadcast    # rank0 loads, broadcasts to all ranks
+  load_weights_mode: grouped      # grouped fanout, with rank-0 fallback
 ```
 
 `init_device: meta` is **required** for FSDP2. Parameters are initially created on the meta device (zero-cost), then materialized by FSDP2 after `fully_shard` is applied.
@@ -267,7 +267,7 @@ train:
   enable_full_shard: true
   enable_mixed_precision: true
   init_device: meta
-  load_weights_mode: broadcast
+  load_weights_mode: grouped
 ```
 
 The constraint that must hold: `data_parallel_shard_size × data_parallel_replicate_size == data_parallel_size` (where `data_parallel_size = world_size / (TP × PP × CP)`). xorl validates this in `TrainingArguments.__post_init__`.
@@ -478,7 +478,7 @@ train:
   enable_gradient_checkpointing: true
   enable_full_shard: true
   init_device: meta
-  load_weights_mode: broadcast
+  load_weights_mode: grouped
 ```
 
 **Memory profile (Qwen3-8B, ~8B params):**
@@ -505,7 +505,7 @@ train:
   enable_gradient_checkpointing: true
   enable_full_shard: true
   init_device: meta
-  load_weights_mode: broadcast
+  load_weights_mode: grouped
 ```
 
 Here `world_size = dp_shard × ulysses = 2 × 4 = 8`. Each 2-GPU FSDP shard group uses 4-way Ulysses to handle long sequences that would not fit on 2 GPUs individually.
@@ -522,7 +522,7 @@ train:
   enable_gradient_checkpointing: true
   enable_full_shard: true
   init_device: meta
-  load_weights_mode: broadcast
+  load_weights_mode: grouped
 ```
 
 Cross-node IB traffic is limited to the all-reduce of *averaged gradients* (not full shard all-gathers), which is typically 4–8x less than pure FSDP2 would require across nodes.
@@ -578,7 +578,7 @@ train:
   enable_full_shard: true
   reshard_after_forward: false    # PP: keep params gathered between fwd micro-batches
   init_device: meta
-  load_weights_mode: broadcast
+  load_weights_mode: grouped
 ```
 
 `world_size = PP × dp_shard = 2 × 4 = 8`. Each PP stage has 4 GPUs running FSDP2 over non-expert params and EP=4 over expert params.
@@ -643,15 +643,16 @@ When EP is enabled, xorl replaces FSDP2's automatic prefetching with explicit pe
 |-------|-------------|-----------------|
 | `meta` | Parameters on meta device; materialized lazily by FSDP2 | FSDP2 only (required) |
 | `cuda` | Parameters initialized directly on GPU | DDP, or FSDP2 debugging |
-| `cpu` | Parameters on CPU (rank 0 only for broadcast) | DDP only; not supported with EP |
+| `cpu` | Parameters on CPU (rank 0 only for rank-0 fallback) | DDP only; not supported with EP |
 | `npu` | Ascend NPU device | DDP, FSDP2 |
 
 ### `load_weights_mode`
 
 | Value | Description | When to use |
 |-------|-------------|-------------|
-| `broadcast` (default) | Rank 0 reads checkpoint from disk, broadcasts shards to all ranks | Default; avoids N-way disk I/O bottleneck |
+| `grouped` (default) | Dense/shared tensors are read once per node and expert tensors once per EP-FSDP group, then replicated/scattered within those groups | Default; best for large MoE/EP loads and falls back to rank-0 loading when grouped fanout groups are unavailable |
 | `all_ranks` | Every rank reads the checkpoint independently | Fast parallel storage (e.g., Lustre, object storage), or when EP requires each rank to load its own expert shard |
+| `skip` | Skip HuggingFace checkpoint loading and load model weights later from `load_checkpoint_path` | Model-only DCP checkpoints created by `scripts/convert_checkpoint.py --save-format dcp` |
 
 ---
 
@@ -665,9 +666,9 @@ Meta-device initialization creates parameter tensors with zero CPU/GPU memory co
 init_device: meta
 ```
 
-### Use `load_weights_mode: broadcast` by default
+### Use `load_weights_mode: grouped` by default
 
-`broadcast` mode has rank 0 load the checkpoint from disk and distribute shards. This is the safest option when the storage system cannot handle parallel reads from all ranks simultaneously. Switch to `all_ranks` only on parallel filesystems with guaranteed per-rank I/O performance, or when loading EP shards that differ per rank.
+`grouped` mode uses grouped fanout for large MoE checkpoints so dense/shared weights are read once per node and expert weights are read once per EP-FSDP group. When grouped fanout groups are unavailable, it falls back to rank-0 loading. Switch to `all_ranks` only on parallel filesystems with guaranteed per-rank I/O performance.
 
 ### Set `reshard_after_forward: false` for pipeline parallelism
 

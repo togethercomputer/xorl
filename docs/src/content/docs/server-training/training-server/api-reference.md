@@ -24,9 +24,9 @@ All endpoints are served at `http://<host>:<port>/`. Training operations use a t
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/v1/create_model` | Create and register a new model session (LoRA or full-weight). |
+| `POST` | `/api/v1/create_model` | Create and register a new training session. LoRA mode supports multi-tenant sessions; full-weight mode only supports the reserved `model_id="default"` session. |
 | `POST` | `/api/v1/unload_model` | Unload a session, freeing associated adapter state. |
-| `POST` | `/api/v1/kill_session` | Kill an active session; optionally reload weights from checkpoint. |
+| `POST` | `/api/v1/kill_session` | Kill an active session. In LoRA mode, non-default tenant sessions are removed; in full-weight mode, the single active session is reset. |
 | `GET` | `/api/v1/session_info` | List active sessions and their state. |
 | `POST` | `/api/v1/create_session` | Create and register a Tinker-compatible session ID for follow-up calls. |
 | `POST` | `/api/v1/session_heartbeat` | Refresh a session's last-activity timestamp for idle cleanup. |

@@ -8,7 +8,8 @@ import socket
 import subprocess
 import sys
 import time
-from typing import List, Optional
+from pathlib import Path
+from typing import Any, List, Optional
 
 import pytest
 import requests
@@ -190,6 +191,53 @@ def _wait_for_server(url: str, timeout: float = 120.0, poll_interval: float = 2.
     return False
 
 
+def wait_for_future(base_url: str, request_id: str, timeout: float = 240.0) -> dict:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        response = requests.post(f"{base_url}/api/v1/retrieve_future", json={"request_id": request_id}, timeout=60)
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("type") == "try_again":
+            time.sleep(0.5)
+            continue
+        if payload.get("type") == "request_failed" or payload.get("error"):
+            raise AssertionError(f"Future {request_id} failed: {payload}")
+        return payload
+    raise TimeoutError(f"Future {request_id} timed out after {timeout}s")
+
+
+def post_and_wait_for_future(
+    base_url: str,
+    endpoint: str,
+    payload: dict[str, Any],
+    *,
+    request_timeout: float = 30.0,
+    future_timeout: float = 240.0,
+) -> dict:
+    response = requests.post(f"{base_url}{endpoint}", json=payload, timeout=request_timeout)
+    response.raise_for_status()
+    return wait_for_future(base_url, response.json()["request_id"], timeout=future_timeout)
+
+
+def scalar(value: Any) -> float:
+    if isinstance(value, dict) and "data" in value:
+        return float(value["data"][0])
+    if hasattr(value, "data"):
+        return float(value.data[0])
+    return float(value)
+
+
+def get_sglang_paths() -> tuple[Path | None, Path | None]:
+    internal_dir = os.environ.get("XORL_SGLANG_INTERNAL_DIR")
+    python_path = os.environ.get("XORL_SGLANG_PYTHON")
+    source_dir = os.environ.get("XORL_SGLANG_SOURCE_DIR")
+    if internal_dir:
+        root = Path(internal_dir)
+        python_path = python_path or str(root / ".venv" / "bin" / "python")
+        source_dir = source_dir or str(root / "python")
+    return (Path(python_path) if python_path else None, Path(source_dir) if source_dir else None)
+
+
 _PORT_RETRY_ATTEMPTS = 3
 
 
@@ -369,14 +417,12 @@ def extract_loss(fwd_bwd_result) -> float:
 
 def run_sft_steps(training_client, data, num_steps=5, lr=1e-3) -> list:
     """Run SFT training steps and return loss history."""
-    xorl_client = _require_xorl_client()
-
-    adam_params = xorl_client.AdamParams(learning_rate=lr, beta1=0.9, beta2=0.95, eps=1e-8)
+    _require_xorl_client()
     losses = []
 
     for step in range(num_steps):
         fwd_bwd = training_client.forward_backward(data, loss_fn="causallm_loss")
-        optim = training_client.optim_step(adam_params)
+        optim = training_client.optim_step(learning_rate=lr)
         result = fwd_bwd.result()
         optim.result()
 

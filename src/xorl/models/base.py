@@ -8,6 +8,7 @@ from torch import nn
 from ..utils import logging
 from .layers.moe.moe_block import MoEBlock
 from .layers.moe.routing_replay import RoutingReplay
+from .module_utils import DEFAULT_GRADIENT_CHECKPOINTING_METHOD, GradientCheckpointingMethod
 
 
 logger = logging.get_logger(__name__)
@@ -36,6 +37,7 @@ class XorlPreTrainedModel(nn.Module):
         super().__init__()
         self.config = config
         self.gradient_checkpointing = False
+        self._gradient_checkpointing_method: GradientCheckpointingMethod | None = None
 
     # ------------------------------------------------------------------
     # Weight initialisation
@@ -91,8 +93,13 @@ class XorlPreTrainedModel(nn.Module):
         if gradient_checkpointing_kwargs is None:
             gradient_checkpointing_kwargs = {"use_reentrant": False}
 
-        # Pop selective checkpoint config before passing to torch checkpoint
-        grad_ckpt_method = gradient_checkpointing_kwargs.pop("gradient_checkpointing_method", None)
+        # Pop selective checkpoint config before passing to torch checkpoint.
+        # The default must be a valid method string — writing `None` here
+        # poisons every gate's equality check and silently disables
+        # checkpointing (see scratch/rl/debug_log/xorl-rebase-root-cause.md).
+        grad_ckpt_method = gradient_checkpointing_kwargs.pop(
+            "gradient_checkpointing_method", DEFAULT_GRADIENT_CHECKPOINTING_METHOD
+        )
 
         grad_ckpt_func = partial(torch.utils.checkpoint.checkpoint, **gradient_checkpointing_kwargs)
 
@@ -102,7 +109,7 @@ class XorlPreTrainedModel(nn.Module):
                 module._gradient_checkpointing_func = grad_ckpt_func
                 module._gradient_checkpointing_method = grad_ckpt_method
 
-        if grad_ckpt_method is not None:
+        if grad_ckpt_method != DEFAULT_GRADIENT_CHECKPOINTING_METHOD:
             logger.info(f"Selective checkpointing enabled: gradient_checkpointing_method={grad_ckpt_method}")
 
         # Create routing replay instances for MoE blocks

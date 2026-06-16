@@ -13,6 +13,8 @@ def quack_expert_forward(
     up_proj: torch.Tensor,
     down_proj: torch.Tensor,
     num_experts: int,
+    hidden_act: str = "silu",
+    gate_up_proj: torch.Tensor | None = None,
     **kwargs,
 ) -> torch.Tensor:
     """Forward pass using quack group GEMM kernels.
@@ -27,11 +29,15 @@ def quack_expert_forward(
         up_proj: Up projection weights ``[num_experts, hidden, intermediate]``.
         down_proj: Down projection weights ``[num_experts, intermediate, hidden]``.
         num_experts: Total number of experts.
-        **kwargs: Extra arguments (ignored).
+        hidden_act: Activation kind ("silu" or "gelu_tanh").
+        gate_up_proj: Optional pre-fused ``[num_experts, hidden, 2*intermediate]`` weight
+            (currently unused by the quack local path; accepted for interface parity).
+        **kwargs: Forwarded for forward compatibility; currently unused.
 
     Returns:
         Output tensor ``(num_tokens, hidden_dim)``.
     """
+    del kwargs
     return quack_moe_forward(
         module=None,
         num_experts=num_experts,
@@ -41,4 +47,6 @@ def quack_expert_forward(
         gate_proj=gate_proj,
         up_proj=up_proj,
         down_proj=down_proj,
+        gate_up_proj=gate_up_proj,
+        hidden_act=hidden_act,
     )

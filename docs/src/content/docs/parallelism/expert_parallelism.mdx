@@ -176,7 +176,7 @@ parameters, matches each expert parameter against the EP plan, then either:
 - **Redistributes** the full tensor into a local shard using `DTensor.redistribute()` with
   a `Shard(0)` placement on the EP mesh (normal path when loading from a checkpoint).
 - **Annotates** already-local tensors with a `spec_info` attribute (fast path when weights
-  were loaded EP-aware, e.g. with `load_weights_mode: all_ranks`).
+  were loaded EP-aware, e.g. with `load_weights_mode: all_ranks` or `grouped`).
 
 After sharding, each rank's expert parameter has shape `[num_local_experts, ...]`.  The
 `spec_info` attribute records the `ep_fsdp_mesh`, the shard placement, and the FQN for
@@ -357,9 +357,20 @@ The forward dispatch is a single `torch.autograd.Function` boundary:
 
 ### Async combine overlap
 
-Setting `deepep_async_combine: true` enables the async combine path.  The combine
-communication for layer `L` overlaps with the attention/dense-FFN computation of layer
-`L+1`.  The pending event is synchronized at the start of the next layer's dispatch.
+Setting `deepep_async_combine: true` requests the async combine path, where the
+combine communication for layer `L` would overlap with the attention/dense-FFN
+computation of layer `L+1` and the pending event would be synchronized at the
+start of the next layer's dispatch.
+
+:::caution
+This path is currently **disabled at the kernel boundary** because the combined
+tensor is read by the rest of the transformer block (residual add, norm, attention)
+on the default stream **before** the next `token_pre_dispatch()` runs, so deferring
+the `current_stream_wait` races those consumers.  `tokens_post_combine` forces
+`async_combine=False` unless `XORL_DEEPEP_UNSAFE_ASYNC_COMBINE=1` is exported.
+Setting the config flag alone is a no-op (with a one-time warning); set the env
+var only if you have separately guaranteed the consumer waits on the combine event.
+:::
 
 ### Supported EP sizes
 
@@ -826,7 +837,7 @@ ranks.
 | `ep_dispatch` | `str` | `"alltoall"` | EP token dispatch strategy: `"alltoall"` or `"deepep"`. |
 | `deepep_buffer_size_gb` | `float` | `2.0` | NVLink staging buffer size in GB for DeepEP. |
 | `deepep_num_sms` | `int` | `20` | SMs allocated to DeepEP communication kernels (must be even). Lower values leave more for expert compute. |
-| `deepep_async_combine` | `bool` | `False` | Overlap DeepEP combine with next layer's compute. |
+| `deepep_async_combine` | `bool` | `False` | Overlap DeepEP combine with next layer's compute. Currently gated off in code; requires `XORL_DEEPEP_UNSAFE_ASYNC_COMBINE=1` (see [Async combine overlap](#async-combine-overlap)). |
 
 ### Train config block
 
@@ -837,7 +848,7 @@ ranks.
 | `data_parallel_shard_size` | `int` | `-1` | FSDP shard size. Together with `expert_parallel_size`, determines `ep_fsdp_size = ranks_per_stage / ep_size`. |
 | `pipeline_parallel_size` | `int` | `1` | PP degree. EP groups are confined within each PP stage. |
 | `ringattn_parallel_size` | `int` | `1` | Ring attention CP size. Can be folded into EP-FSDP axis via `ep_fsdp_size`. |
-| `load_weights_mode` | `str` | `"broadcast"` | `"all_ranks"` lets every rank read its local expert shard directly without a broadcast. Preferred for EP. |
+| `load_weights_mode` | `str` | `"grouped"` | Default grouped fanout: one dense/shared reader per node and one expert reader per EP-FSDP group, with rank-0 fallback when grouped fanout groups are unavailable. Use `"all_ranks"` on storage that can handle one checkpoint read per rank, or `"skip"` with `load_checkpoint_path` to load model weights from a converted DCP checkpoint. |
 
 ### Environment variables
 

@@ -57,6 +57,41 @@ from xorl.utils.seqlen_pos_transform_utils import pos2culen
 logger = logging.getLogger(__name__)
 
 
+OPD_TOKEN_ALIGNED_FIELDS = ("teacher_ids", "teacher_cache_indices", "teacher_weights", "teacher_hidden_states")
+
+
+def shift_opd_token_aligned_fields(
+    flattened_datum: Dict[str, Any],
+    original_seq_len: int,
+    shifted_seq_len: int,
+    sample_idx: int,
+) -> None:
+    """Trim OPD per-token fields when HF-style causal shifting trims input_ids.
+
+    OPD compares the student's hidden state at each retained input position with
+    the teacher hidden state for the same context position. Therefore fields that
+    index or carry teacher context activations drop the final token when
+    input_ids becomes input_ids[:-1].
+    """
+    for key in OPD_TOKEN_ALIGNED_FIELDS:
+        if key not in flattened_datum:
+            continue
+        value = flattened_datum[key]
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if not isinstance(value, list):
+            continue
+        if len(value) == shifted_seq_len:
+            flattened_datum[key] = value
+            continue
+        if len(value) != original_seq_len:
+            raise ValueError(
+                f"Sample {sample_idx}: {key} length ({len(value)}) must match either shifted length "
+                f"({shifted_seq_len}) or original length ({original_seq_len})"
+            )
+        flattened_datum[key] = value[:-1]
+
+
 def apply_weights_to_labels(
     labels: List[int],
     weights: Optional[List[float]],
@@ -580,6 +615,12 @@ class SequentialPacker(Packer):
                 f"Sample {sample_idx}: Applying token shifting (HF format detected). "
                 f"Original len={len(input_ids)}, shifted len={len(input_ids) - 1}"
             )
+            shift_opd_token_aligned_fields(
+                flattened_datum,
+                original_seq_len=len(input_ids),
+                shifted_seq_len=len(input_ids) - 1,
+                sample_idx=sample_idx,
+            )
             input_ids = input_ids[:-1]
             labels = labels[1:]
             if weights is not None:
@@ -618,9 +659,19 @@ class SequentialPacker(Packer):
 
         batch["labels"].extend(labels)
 
+        # OPD convenience fields: allow sample-level teacher metadata and expand
+        # it to token-aligned sequence fields before generic field preservation.
+        teacher_id = flattened_datum.get("teacher_id")
+        if teacher_id is not None and "teacher_ids" not in flattened_datum:
+            batch.setdefault("teacher_ids", []).extend([int(teacher_id)] * seq_len)
+
+        teacher_weight = flattened_datum.get("teacher_weight")
+        if teacher_weight is not None and "teacher_weights" not in flattened_datum:
+            batch.setdefault("teacher_weights", []).extend([float(teacher_weight)] * seq_len)
+
         # Handle other sequence fields (logprobs, advantages, etc.)
         for key, value in flattened_datum.items():
-            if key not in ["input_ids", "position_ids", "labels", "weights"]:
+            if key not in ["input_ids", "position_ids", "labels", "weights", "teacher_id", "teacher_weight"]:
                 if key not in batch:
                     batch[key] = []
                 if hasattr(value, "tolist"):
@@ -688,7 +739,13 @@ class SequentialPacker(Packer):
                         continue
                     if isinstance(value, list) and len(value) == 1 and isinstance(value[0], list):
                         if len(value[0]) == seq_len:
-                            value[0].extend([0] * pad_length)
+                            if key == "teacher_hidden_states":
+                                if not value[0] or not isinstance(value[0][0], list):
+                                    raise ValueError("teacher_hidden_states must be a sequence of hidden vectors")
+                                hidden_dim = len(value[0][0])
+                                value[0].extend([[0.0] * hidden_dim for _ in range(pad_length)])
+                            else:
+                                value[0].extend([0] * pad_length)
 
         # For non-SP cases, pre-compute Flash Attention kwargs from position_ids.
         # (SP cases handle this in TextSequenceShardCollator after SP padding.)
@@ -716,7 +773,14 @@ class SequentialPacker(Packer):
         datum: Dict[str, Any],
         sample_idx: int,
     ) -> None:
-        """Add a sample to a micro-batch."""
+        """Add a sample to a non-packed micro-batch.
+
+        This mirrors the packed path's token-shifting semantics:
+        - HF-format datums (`input_ids` + full-length `labels`) are shifted to
+          next-token prediction with `input_ids[:-1]` and `labels[1:]`.
+        - xorl_client/RL datums (`input_ids` + `target_tokens`) are already
+          shifted and are used as-is.
+        """
         # Handle nested datum structure: flatten model_input and loss_fn_inputs
         flattened_datum = {}
         if "model_input" in datum:
@@ -739,19 +803,13 @@ class SequentialPacker(Packer):
         if not isinstance(input_ids, list):
             input_ids = input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
 
-        seq_len = len(input_ids)
-        batch["input_ids"].append(input_ids)
-
         # Extract or generate position_ids
         if "position_ids" in flattened_datum:
             position_ids = flattened_datum["position_ids"]
             if not isinstance(position_ids, list):
                 position_ids = position_ids.tolist() if hasattr(position_ids, "tolist") else list(position_ids)
         else:
-            # Auto-generate position_ids: [0, 1, 2, ..., seq_len-1]
-            position_ids = list(range(seq_len))
-
-        batch["position_ids"].append(position_ids)
+            position_ids = list(range(len(input_ids)))
 
         # Extract labels if present (or use target_tokens for RL)
         if "labels" in flattened_datum:
@@ -767,31 +825,66 @@ class SequentialPacker(Packer):
             # No labels for this sample
             labels = []
 
+        weights = flattened_datum.get("weights")
+        if weights is not None and not isinstance(weights, list):
+            weights = weights.tolist() if hasattr(weights, "tolist") else list(weights)
+
+        advantages = flattened_datum.get("advantages")
+        if advantages is not None and not isinstance(advantages, list):
+            advantages = advantages.tolist() if hasattr(advantages, "tolist") else list(advantages)
+
+        # Detect if tokens are already shifted (xorl_client API format)
+        is_already_shifted = "target_tokens" in flattened_datum and len(input_ids) == len(labels)
+        if labels and not is_already_shifted and len(input_ids) == len(labels):
+            logger.warning(
+                "Sample %s has labels with the same length as input_ids; treating it as HF-format data "
+                "and shifting for next-token prediction. Use target_tokens for already shifted targets.",
+                sample_idx,
+            )
+            input_ids = input_ids[:-1]
+            position_ids = position_ids[:-1]
+            labels = labels[1:]
+            if weights is not None:
+                weights = weights[1:]
+            if advantages is not None:
+                advantages = advantages[1:]
+
+        if advantages is not None:
+            flattened_datum["advantages"] = advantages
+
+        batch["input_ids"].append(input_ids)
+        batch["position_ids"].append(position_ids)
+
         # Apply weights mask to labels if weights field is present
         # weights=0 -> labels=-100 (IGNORE_INDEX), weights=1 -> labels unchanged
         if labels:  # Only apply if we have labels
-            weights = flattened_datum.get("weights")
             if weights is not None:
-                if not isinstance(weights, list):
-                    weights = weights.tolist() if hasattr(weights, "tolist") else list(weights)
                 labels = apply_weights_to_labels(labels, weights, sample_idx)
 
             # Apply advantages mask to labels if advantages field is present
             # For RL losses, advantages=0 indicates prompt tokens where we don't compute loss
             # advantages=0 -> labels=-100 (IGNORE_INDEX)
-            advantages = flattened_datum.get("advantages")
             if advantages is not None:
-                if not isinstance(advantages, list):
-                    advantages = advantages.tolist() if hasattr(advantages, "tolist") else list(advantages)
                 labels = apply_advantages_to_labels(labels, advantages, sample_idx)
 
         batch["labels"].append(labels)
+
+        # OPD convenience fields: expand sample-level metadata to token-aligned
+        # sequences so downstream tensor conversion/sharding can treat them like
+        # labels and logprobs.
+        teacher_id = flattened_datum.get("teacher_id")
+        if teacher_id is not None and "teacher_ids" not in flattened_datum:
+            batch.setdefault("teacher_ids", []).append([int(teacher_id)] * seq_len)
+
+        teacher_weight = flattened_datum.get("teacher_weight")
+        if teacher_weight is not None and "teacher_weights" not in flattened_datum:
+            batch.setdefault("teacher_weights", []).append([float(teacher_weight)] * seq_len)
 
         # Preserve all other fields from loss_fn_inputs (logprobs, advantages, target_tokens, etc.)
         # Note: Keep target_tokens separate even if we used it as labels
         # Note: Exclude weights as it has been applied to labels
         for key, value in flattened_datum.items():
-            if key not in ["input_ids", "position_ids", "labels", "weights"]:
+            if key not in ["input_ids", "position_ids", "labels", "weights", "teacher_id", "teacher_weight"]:
                 # Initialize list for this field if not present
                 if key not in batch:
                     batch[key] = []

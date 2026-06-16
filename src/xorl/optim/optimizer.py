@@ -12,8 +12,9 @@ from torch.optim.optimizer import Optimizer
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from .anyprecision_adamw import AnyPrecisionAdamW
+from .distsignsgd import DistSignSGD, configure_distsignsgd
 from .multi_optimizer import MultiOptimizer
-from .muon import Muon
+from .muon import GROUPED_GRAM_NS_FP32_BYTE_LIMIT, Muon
 from .signsgd import SignSGD
 
 
@@ -114,11 +115,42 @@ def _get_optimizer_cls_and_kwargs(
     fused: bool = False,
     optimizer_dtype: str = "bf16",
     optimizer_kwargs: Optional[Dict[str, Any]] = None,
+    cautious_weight_decay: bool = False,
 ) -> Tuple[type, Dict[str, Any]]:
     """Return (optimizer_class, constructor_kwargs) without instantiating."""
     kwargs = optimizer_kwargs or {}
 
     if optimizer_type == "adamw":
+        if cautious_weight_decay:
+            # torch.optim.AdamW has no cautious-decay hook; route to our
+            # AnyPrecisionAdamW (fp32 state -> mathematically equivalent to
+            # torch AdamW) which supports the mask.
+            logger.info_rank0(
+                "cautious_weight_decay=True with optimizer=adamw: routing to AnyPrecisionAdamW (fp32 state)."
+            )
+            # Reject torch.optim.AdamW-only kwargs up-front: forwarding them
+            # to AnyPrecisionAdamW yields a confusing TypeError naming a class
+            # the user did not request.
+            _ANYPRECISION_ACCEPTED = {"use_kahan_summation"}
+            unsupported = [k for k in kwargs if k not in _ANYPRECISION_ACCEPTED]
+            if unsupported:
+                raise ValueError(
+                    f"cautious_weight_decay=True with optimizer='adamw' routes to AnyPrecisionAdamW, "
+                    f"which does not accept these optimizer_kwargs: {unsupported}. "
+                    f"Either drop them, set optimizer='anyprecision_adamw' explicitly, or disable cautious."
+                )
+            ctor_kwargs = dict(
+                lr=lr,
+                betas=betas,
+                eps=eps,
+                weight_decay=weight_decay,
+                momentum_dtype=torch.float32,
+                variance_dtype=torch.float32,
+                compensation_buffer_dtype=torch.float32,
+                cautious=True,
+                **kwargs,
+            )
+            return AnyPrecisionAdamW, ctor_kwargs
         foreach = not fused
         ctor_kwargs = dict(
             lr=lr,
@@ -140,17 +172,27 @@ def _get_optimizer_cls_and_kwargs(
             momentum_dtype=state_dtype,
             variance_dtype=state_dtype,
             compensation_buffer_dtype=state_dtype,
+            cautious=cautious_weight_decay,
             **kwargs,
         )
         return AnyPrecisionAdamW, ctor_kwargs
     elif optimizer_type == "sgd":
+        if cautious_weight_decay:
+            raise ValueError(
+                "cautious_weight_decay is not supported with optimizer='sgd' "
+                "(torch.optim.SGD has no per-coordinate decay hook). "
+                "Use 'anyprecision_adamw', 'signsgd', or 'muon' instead."
+            )
         sgd_defaults = {"momentum": 0.0, "nesterov": False}
         sgd_defaults.update(kwargs)
         ctor_kwargs = dict(lr=lr, weight_decay=weight_decay, **sgd_defaults)
         return torch.optim.SGD, ctor_kwargs
     elif optimizer_type == "signsgd":
-        ctor_kwargs = dict(lr=lr, weight_decay=weight_decay, **kwargs)
+        ctor_kwargs = dict(lr=lr, weight_decay=weight_decay, cautious=cautious_weight_decay, **kwargs)
         return SignSGD, ctor_kwargs
+    elif optimizer_type == "distsignsgd":
+        ctor_kwargs = dict(lr=lr, weight_decay=weight_decay, **kwargs)
+        return DistSignSGD, ctor_kwargs
     elif optimizer_type == "muon":
         adamw_state_dtype = _ANYPRECISION_STATE_DTYPES.get(optimizer_dtype)
         momentum_dtype = kwargs.get("muon_momentum_dtype")
@@ -163,10 +205,14 @@ def _get_optimizer_cls_and_kwargs(
             ns_steps=kwargs.get("muon_ns_steps", 5),
             weight_decay=weight_decay,
             adjust_lr_fn=kwargs.get("muon_adjust_lr_fn"),
-            ns_algorithm=kwargs.get("muon_ns_algorithm", "standard_newton_schulz"),
+            ns_algorithm=kwargs.get("muon_ns_algorithm", "gram_newton_schulz"),
             ns_use_quack_kernels=kwargs.get("muon_ns_use_quack_kernels", True),
             gram_newton_schulz_num_restarts=kwargs.get("muon_gram_ns_num_restarts", 1),
             gram_newton_schulz_restart_iterations=kwargs.get("muon_gram_ns_restart_iterations"),
+            grouped_gram_ns_fp32_byte_limit=kwargs.get(
+                "muon_grouped_gram_ns_fp32_byte_limit",
+                GROUPED_GRAM_NS_FP32_BYTE_LIMIT,
+            ),
             adamw_betas=betas,
             adamw_eps=eps,
             momentum_dtype=_normalize_optional_dtype(momentum_dtype, field_name="muon_momentum_dtype"),
@@ -174,11 +220,13 @@ def _get_optimizer_cls_and_kwargs(
             update_dtype=_normalize_optional_dtype(kwargs.get("muon_update_dtype"), field_name="muon_update_dtype"),
             force_momentum_path=kwargs.get("muon_force_momentum_path", False),
             adamw_state_dtype=adamw_state_dtype,
+            cautious=cautious_weight_decay,
+            distributed_mode=kwargs.get("muon_distributed_mode", "shard_local"),
         )
         return Muon, ctor_kwargs
     else:
         raise ValueError(
-            f"Unsupported optimizer type: '{optimizer_type}'. Supported: adamw, anyprecision_adamw, sgd, signsgd, muon."
+            f"Unsupported optimizer type: '{optimizer_type}'. Supported: adamw, anyprecision_adamw, sgd, signsgd, distsignsgd, muon."
         )
 
 
@@ -193,6 +241,7 @@ def _create_optimizer(
     fused: bool = False,
     optimizer_dtype: str = "bf16",
     optimizer_kwargs: Optional[Dict[str, Any]] = None,
+    cautious_weight_decay: bool = False,
 ) -> Optimizer:
     """
     Single factory for all optimizer types.
@@ -201,6 +250,7 @@ def _create_optimizer(
     Optimizer-specific args are passed via optimizer_kwargs:
       - sgd: {"momentum": 0.9, "nesterov": True}
       - signsgd: no optimizer-specific kwargs
+      - distsignsgd: no optimizer-specific kwargs
       - muon: {"muon_lr": 0.02, "muon_momentum": 0.95, ...}
       - adamw/anyprecision_adamw: any extra kwargs forwarded to constructor
     """
@@ -213,6 +263,7 @@ def _create_optimizer(
         fused=fused,
         optimizer_dtype=optimizer_dtype,
         optimizer_kwargs=optimizer_kwargs,
+        cautious_weight_decay=cautious_weight_decay,
     )
     return cls(param_groups, **ctor_kwargs)
 
@@ -332,6 +383,7 @@ def build_optimizer(
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
     optimizer_kwargs: Optional[Dict[str, Any]] = None,
+    cautious_weight_decay: bool = False,
 ) -> "torch.optim.Optimizer":
     """
     Build an optimizer for the given model.
@@ -343,7 +395,7 @@ def build_optimizer(
         eps: AdamW epsilon.
         weight_decay: Weight decay coefficient.
         fused: Use fused AdamW kernel (mutually exclusive with foreach).
-        optimizer_type: One of "adamw", "anyprecision_adamw", "sgd", "signsgd", "muon".
+        optimizer_type: One of "adamw", "anyprecision_adamw", "sgd", "signsgd", "distsignsgd", "muon".
         optimizer_dtype: State dtype for anyprecision_adamw / muon ("fp32" or "bf16").
         param_groups: Custom param groups. If None, auto-built with weight decay splitting.
         no_decay_modules: Module class names to exclude from weight decay.
@@ -351,17 +403,28 @@ def build_optimizer(
         optimizer_kwargs: Optimizer-specific keyword arguments passed to the constructor.
             - sgd: {"momentum": 0.9, "nesterov": True}
             - signsgd: no optimizer-specific kwargs
+            - distsignsgd: no optimizer-specific kwargs
             - muon: {"muon_lr": 0.02, "muon_momentum": 0.95, "muon_nesterov": True,
                       "muon_ns_steps": 5, "muon_adjust_lr_fn": None,
-                      "muon_ns_algorithm": "standard_newton_schulz",
+                      "muon_ns_algorithm": "gram_newton_schulz",
                       "muon_ns_use_quack_kernels": True, "muon_gram_ns_num_restarts": 1,
                       "muon_gram_ns_restart_iterations": None, "muon_momentum_dtype": None,
-                      "muon_grad_dtype": None, "muon_update_dtype": None, "muon_force_momentum_path": False}
+                      "muon_grad_dtype": None, "muon_update_dtype": None, "muon_force_momentum_path": False,
+                      "muon_distributed_mode": "shard_local"}
             - adamw/anyprecision_adamw: any extra kwargs forwarded to constructor
+        cautious_weight_decay: If True, apply Cautious Weight Decay (CWD) per
+            Chen et al. (arXiv:2510.12402): mask the decoupled decay term by
+            ``I(u_t * x_t >= 0)``. Supported for adamw, anyprecision_adamw,
+            signsgd, and muon. With ``optimizer_type='adamw'`` this routes to
+            AnyPrecisionAdamW with fp32 state (no fused kernel).
     """
+    ps = get_parallel_state()
+    if optimizer_type == "distsignsgd" and ps.dp_mode != "fsdp2":
+        raise ValueError("DistSignSGD requires data_parallel_mode='fsdp2'.")
+
     # EP-aware routing: for FSDP2+EP, split params into EP and non-EP groups and build two optimizers.
     if _should_build_ep_aware(model, param_groups):
-        return build_ep_fsdp2_optimizer(
+        optimizer = build_ep_fsdp2_optimizer(
             model,
             lr,
             betas,
@@ -374,7 +437,11 @@ def build_optimizer(
             no_decay_modules,
             no_decay_params,
             optimizer_kwargs=optimizer_kwargs,
+            cautious_weight_decay=cautious_weight_decay,
         )
+        if optimizer_type == "distsignsgd":
+            configure_distsignsgd(model)
+        return optimizer
 
     kwargs = optimizer_kwargs or {}
 
@@ -415,7 +482,7 @@ def build_optimizer(
             logger.info_rank0(f"Parameters without weight decay: {no_decay_parameter_names}")
             param_groups.append({"params": no_decay_parameters, "weight_decay": 0.0})
 
-    return _create_optimizer(
+    optimizer = _create_optimizer(
         optimizer_type,
         param_groups,
         lr=lr,
@@ -425,7 +492,11 @@ def build_optimizer(
         fused=fused,
         optimizer_dtype=optimizer_dtype,
         optimizer_kwargs=optimizer_kwargs,
+        cautious_weight_decay=cautious_weight_decay,
     )
+    if optimizer_type == "distsignsgd":
+        configure_distsignsgd(model)
+    return optimizer
 
 
 def build_ep_fsdp2_optimizer(
@@ -441,6 +512,7 @@ def build_ep_fsdp2_optimizer(
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
     optimizer_kwargs: Optional[Dict[str, Any]] = None,
+    cautious_weight_decay: bool = False,
 ):
     """
     Build a MultiOptimizer instance when model is parallelized with EP+FSDP2
@@ -524,6 +596,7 @@ def build_ep_fsdp2_optimizer(
             fused=fused,
             optimizer_dtype=optimizer_dtype,
             optimizer_kwargs=optimizer_kwargs,
+            cautious_weight_decay=cautious_weight_decay,
         )
 
     optimizer_dict: Dict[str, Optimizer] = {}
