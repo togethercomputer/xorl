@@ -1904,6 +1904,7 @@ class ModelRunner:
                 ce_mode=self.ce_mode,
                 compute_kl_stats=compute_kl_stats,
                 lm_head_fp32=self.lm_head_fp32,
+                loss_reducer=token_sum_reducer,
                 metric_reducer=token_sum_reducer,
             )
             local_loss_sum = _result.loss
@@ -2010,6 +2011,7 @@ class ModelRunner:
                 compute_kl_stats=compute_kl_stats,
                 lm_head_fp32=self.lm_head_fp32,
                 icepop_beta=icepop_beta,
+                loss_reducer=token_sum_reducer,
                 metric_reducer=token_sum_reducer,
             )
             local_loss_sum = _result.loss
