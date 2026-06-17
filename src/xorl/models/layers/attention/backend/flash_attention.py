@@ -14,16 +14,18 @@ from flash_attn_interface import flash_attn_func, flash_attn_varlen_func
 from .....utils import logging
 
 
-# FA4 (CUTE) import with fallback
+# FA4 (CUTE) — routed through dynamo-opaque torch.library custom ops so torch.compile
+# sees a single opaque node (no graph break, no per-step recompile). See fa4_custom_op.
 try:
-    from flash_attn.cute import flash_attn_func as fa4_flash_attn_func
-    from flash_attn.cute import flash_attn_varlen_func as fa4_flash_attn_varlen_func
+    from flash_attn.cute import flash_attn_func as _fa4_probe  # noqa: F401
 
-    FA4_AVAILABLE = True
+    from .fa4_custom_op import FA4_CUSTOM_OP_AVAILABLE, fa4_attn, fa4_varlen_attn
+
+    FA4_AVAILABLE = FA4_CUSTOM_OP_AVAILABLE
 except ImportError:
     FA4_AVAILABLE = False
-    fa4_flash_attn_func = None
-    fa4_flash_attn_varlen_func = None
+    fa4_attn = None
+    fa4_varlen_attn = None
 
 # Environment variable to disable FA4 even when available
 XORL_DISABLE_FA4 = os.environ.get("XORL_DISABLE_FA4", "0") == "1"
@@ -32,6 +34,14 @@ XORL_FLASH_ATTN_DETERMINISTIC = os.environ.get("XORL_FLASH_ATTN_DETERMINISTIC", 
 logger = logging.get_logger(__name__)
 
 
+# FA4's CuTeDSL dispatch (cutlass/cutlass_dsl/tvm_ffi_provider.py) builds a FRESH Python
+# wrapper function — exec'd from a string, so a brand-new ``__code__`` object — on every
+# call, which Dynamo cannot trace and re-guards every step. The PROPER fix (mirroring FA3
+# in flash_attn_interface.py) is to register the FA4 fwd/bwd as ``torch.library`` custom
+# ops with ``register_fake`` + ``register_autograd`` (see ``fa4_custom_op``). Dynamo and
+# AOTAutograd then treat the FA4 call as a single opaque node — ZERO graph break in fwd OR
+# bwd, no recompile storm — so it can be called directly from inside a compiled region.
+# FA3 is unaffected (separate path).
 def _should_use_fa4(use_fa4: bool) -> bool:
     """Check if FA4 should be used based on request and availability."""
     if XORL_DISABLE_FA4:
@@ -106,7 +116,7 @@ def flash_attention_forward(
             k_varlen = key.squeeze(0) if key.size(0) == 1 else key.reshape(-1, key.size(-2), key.size(-1))
             v_varlen = value.squeeze(0) if value.size(0) == 1 else value.reshape(-1, value.size(-2), value.size(-1))
 
-            attn_output, _ = fa4_flash_attn_varlen_func(
+            attn_output = fa4_varlen_attn(
                 q_varlen,
                 k_varlen,
                 v_varlen,
@@ -123,7 +133,7 @@ def flash_attention_forward(
         else:
             # Non-varlen path: use flash_attn_func
             # FA4 expects shape (batch, seqlen, num_heads, head_dim) - same as current
-            attn_output, _ = fa4_flash_attn_func(
+            attn_output = fa4_attn(
                 query,
                 key,
                 value,

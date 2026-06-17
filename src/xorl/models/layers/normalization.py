@@ -33,6 +33,13 @@ def eager_rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor, variance_e
 
 
 def native_rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor, variance_epsilon: float) -> torch.Tensor:
+    # Match the weight dtype to the input so F.rms_norm can use its fused kernel. Under
+    # torch.autocast the input is bf16 while an fp32 master weight stays fp32, which makes
+    # aten fall back to a slow non-fused path ("Cannot dispatch to fused implementation").
+    # The RMS reduction is still accumulated in fp32 inside F.rms_norm; only the affine gamma
+    # is cast. No-op when weight already matches input (FSDP bf16 compute / bf16 params).
+    if weight.dtype != hidden_states.dtype:
+        weight = weight.to(hidden_states.dtype)
     return F.rms_norm(hidden_states, (weight.shape[0],), weight, eps=variance_epsilon)
 
 

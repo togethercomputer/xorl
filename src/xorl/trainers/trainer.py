@@ -819,6 +819,24 @@ class Trainer:
         self._model_fwd_context = model_fwd_context
         self._model_bwd_context = model_bwd_context
 
+        # Mixed precision for the non-FSDP path. FSDP2 casts fp32 master params -> bf16
+        # for compute via its MixedPrecisionPolicy; for data_parallel_mode in {none, ddp}
+        # there is no such policy, so without this the model would compute in fp32 (and
+        # flash-attn would reject fp32 inputs). torch.autocast keeps the fp32 master params
+        # and casts to bf16 inside the ops — and under torch.compile those casts fuse into
+        # the matmul kernels instead of becoming separate full-param copies.
+        autocast_enabled = args.train.enable_mixed_precision and args.train.data_parallel_mode != "fsdp2"
+        self._autocast_ctx = torch.autocast(
+            device_type=get_device_type(),
+            dtype=torch.bfloat16,
+            enabled=autocast_enabled,
+        )
+        if autocast_enabled:
+            logger.info_rank0(
+                f"Mixed precision via torch.autocast(bfloat16) for data_parallel_mode="
+                f"{args.train.data_parallel_mode} (fp32 master params preserved)."
+            )
+
         self.model.train()
         logger.info(
             f"rank{args.train.local_rank} Start training, "
@@ -1026,7 +1044,7 @@ class Trainer:
 
             if self._use_routing_replay:
                 set_replay_stage("record")
-            with self._model_fwd_context:
+            with self._autocast_ctx, self._model_fwd_context:
                 outputs = self.model(**micro_batch, use_cache=False, output_hidden_states=False)
                 result = compute_loss(
                     self.model.lm_head,

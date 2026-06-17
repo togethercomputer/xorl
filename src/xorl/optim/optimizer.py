@@ -13,6 +13,7 @@ from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
 from .anyprecision_adamw import AnyPrecisionAdamW
 from .distsignsgd import DistSignSGD, configure_distsignsgd
+from .master_weight_adamw import MasterWeightAdamW
 from .multi_optimizer import MultiOptimizer
 from .muon import GROUPED_GRAM_NS_FP32_BYTE_LIMIT, Muon
 from .signsgd import SignSGD
@@ -162,6 +163,23 @@ def _get_optimizer_cls_and_kwargs(
             **kwargs,
         )
         return AdamW, ctor_kwargs
+    elif optimizer_type == "master_adamw":
+        # bf16 model params + fp32 master weights held inside the optimizer
+        # (Megatron / slime "main_param"). Forward reads bf16 params directly (no
+        # per-forward cast); the optimizer keeps a true fp32 master + fp32 states.
+        if cautious_weight_decay:
+            raise ValueError(
+                "cautious_weight_decay is not supported with optimizer='master_adamw'. "
+                "Use 'anyprecision_adamw' or 'adamw' (which routes to AnyPrecisionAdamW)."
+            )
+        ctor_kwargs = dict(
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            **kwargs,
+        )
+        return MasterWeightAdamW, ctor_kwargs
     elif optimizer_type == "anyprecision_adamw":
         state_dtype = _ANYPRECISION_STATE_DTYPES[optimizer_dtype]
         ctor_kwargs = dict(
@@ -226,7 +244,7 @@ def _get_optimizer_cls_and_kwargs(
         return Muon, ctor_kwargs
     else:
         raise ValueError(
-            f"Unsupported optimizer type: '{optimizer_type}'. Supported: adamw, anyprecision_adamw, sgd, signsgd, distsignsgd, muon."
+            f"Unsupported optimizer type: '{optimizer_type}'. Supported: adamw, master_adamw, anyprecision_adamw, sgd, signsgd, distsignsgd, muon."
         )
 
 

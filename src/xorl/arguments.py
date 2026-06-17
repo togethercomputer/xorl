@@ -576,12 +576,17 @@ class TrainingArguments:
         metadata={"help": "Parameters without weight decay, for example, bias."},
     )
 
-    optimizer: Literal["adamw", "anyprecision_adamw", "sgd", "signsgd", "distsignsgd", "muon"] = field(
+    optimizer: Literal[
+        "adamw", "master_adamw", "anyprecision_adamw", "sgd", "signsgd", "distsignsgd", "muon"
+    ] = field(
         default="adamw",
         metadata={
-            "help": "Optimizer type. 'signsgd' is a local state-free sign update; "
-            "'distsignsgd' signs gradients before FSDP2 reduction; 'muon' uses "
-            "Newton-Schulz orthogonalization for 2D+ weight matrices."
+            "help": "Optimizer type. 'master_adamw' keeps an fp32 master copy of (bf16) "
+            "model params inside the optimizer (Megatron/slime 'main_param') so the "
+            "forward reads bf16 directly while the fp32 master is updated each step; "
+            "'signsgd' is a local state-free sign update; 'distsignsgd' signs gradients "
+            "before FSDP2 reduction; 'muon' uses Newton-Schulz orthogonalization for "
+            "2D+ weight matrices."
         },
     )
     optimizer_dtype: Literal["fp32", "bf16"] = field(
