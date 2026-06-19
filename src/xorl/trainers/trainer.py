@@ -838,6 +838,29 @@ class Trainer:
             )
 
         self.model.train()
+
+        # Experimental: compile the WHOLE backbone (self.model.model) as ONE region instead of per-layer
+        # (run with enable_compile=false so the per-layer path is skipped). With mode="reduce-overhead" +
+        # static shapes this lets torch.compile capture the full backbone fwd+bwd as CUDA graphs (~2 launches);
+        # lm_head/CE/optimizer stay eager. Single-GPU / data_parallel_mode=none only (FSDP per-layer all-gather
+        # hooks would otherwise fragment the single region). Gated by env, off by default.
+        if os.environ.get("XORL_COMPILE_WHOLE_BACKBONE") == "1" and hasattr(self.model, "model"):
+            _wb_mode = "reduce-overhead" if os.environ.get("XORL_COMPILE_REDUCE_OVERHEAD") == "1" else None
+            _wb_dynamic = os.environ.get("XORL_COMPILE_DYNAMIC", "0") == "1"
+            self.model.model = torch.compile(self.model.model, mode=_wb_mode, dynamic=_wb_dynamic)
+            logger.info_rank0(f"WHOLE-BACKBONE torch.compile applied (mode={_wb_mode}, dynamic={_wb_dynamic})")
+
+        # Experimental: fold EVERYTHING (backbone + lm_head + cross-entropy) into ONE compiled region
+        # (vs whole-backbone, which leaves lm_head+CE eager). Materializes the [N, vocab] logits inside the
+        # graph (no chunking) — tests whether a single monolithic fwd+loss graph compiles / cudagraph-captures
+        # and at what memory/throughput cost. Run with enable_compile=false + whole-backbone off. Gated by env.
+        self._whole_step = None
+        if os.environ.get("XORL_COMPILE_WHOLE_STEP") == "1":
+            _ws_mode = "reduce-overhead" if os.environ.get("XORL_COMPILE_REDUCE_OVERHEAD") == "1" else None
+            _ws_dynamic = os.environ.get("XORL_COMPILE_DYNAMIC", "0") == "1"
+            self._whole_step = torch.compile(self._whole_step_impl, mode=_ws_mode, dynamic=_ws_dynamic)
+            logger.info_rank0(f"WHOLE-STEP torch.compile (backbone+lm_head+CE one region, mode={_ws_mode})")
+
         logger.info(
             f"rank{args.train.local_rank} Start training, "
             f"train_steps_per_epoch: {self.train_steps_per_epoch}, "
@@ -1025,6 +1048,27 @@ class Trainer:
     # Forward-backward: non-PP and PP paths
     # ===================================================================
 
+    def _whole_step_impl(
+        self,
+        micro_batch: Dict[str, Any],
+        labels: torch.Tensor,
+        global_valid_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Backbone + lm_head + cross-entropy in one callable (for whole-step torch.compile).
+
+        Full (non-chunked) CE: materializes the [N, vocab] logits. Used only by the experimental
+        XORL_COMPILE_WHOLE_STEP path to fold the entire fwd+loss into a single compiled graph.
+        """
+        outputs = self.model(**micro_batch, use_cache=False, output_hidden_states=False)
+        logits = self.model.lm_head(outputs.last_hidden_state)
+        loss = torch.nn.functional.cross_entropy(
+            logits.float().reshape(-1, logits.size(-1)),
+            labels.reshape(-1),
+            ignore_index=IGNORE_INDEX,
+            reduction="sum",
+        )
+        return loss / global_valid_tokens
+
     def _forward_backward(
         self,
         micro_batches: List[Dict[str, Any]],
@@ -1041,6 +1085,16 @@ class Trainer:
 
             # Pop labels before forward (model only outputs last_hidden_state)
             labels = micro_batch.pop("labels")
+
+            # Experimental: fold the entire fwd+loss into one compiled (+ optionally cudagraph'd)
+            # region instead of the per-op path below. Gated by XORL_COMPILE_WHOLE_STEP.
+            if getattr(self, "_whole_step", None) is not None:
+                ga_loss = self._whole_step(micro_batch, labels, global_valid_tokens)
+                with self._model_bwd_context:
+                    ga_loss.backward()
+                total_loss += ga_loss.item()
+                del micro_batch, labels, ga_loss
+                continue
 
             if self._use_routing_replay:
                 set_replay_stage("record")
