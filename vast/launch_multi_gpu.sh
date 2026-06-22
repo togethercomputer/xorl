@@ -33,6 +33,9 @@
 #                (default: examples/local/dummy/configs/full/qwen3_8b_tp4_compile.yaml)
 #   Env knobs:
 #     NUM_GPUS     GPUs on the single node = torchrun --nproc_per_node (default 8)
+#     ATTN_IMPL    --model.attn_implementation override (default flash_attention_4;
+#                  REQUIRED on Blackwell since the config's flash_attention_3 is Hopper-only.
+#                  "" = honor the config's value; sdpa = arch-agnostic non-flash fallback)
 #     PROFILE      set =1 to also run XoRL's built-in torch.profiler + fetch traces
 #     IMAGE        docker image (default NGC pytorch)
 #     DISK_GB      instance disk (default 150; 8B weights + uv venv + cache)
@@ -53,6 +56,13 @@ CONFIG="${1:-examples/local/dummy/configs/full/qwen3_8b_tp4_compile.yaml}"; shif
 [[ "${1:-}" == "--" ]] && shift || true
 CONFIG_STEM="$(basename "${CONFIG%.*}")"
 NUM_GPUS="${NUM_GPUS:-8}"
+# Attention backend override (-> --model.attn_implementation). Default flash_attention_4
+# (the cute/FA4 stack): REQUIRED for Blackwell (RTX PRO 5000/6000, sm_120) because the
+# config's flash_attention_3 ships only Hopper sm_90 kernels ("no kernel image is available
+# for execution on the device" on Blackwell). FA4/cute covers Hopper AND Blackwell, so it
+# is safe across the whole GPU pool. Set ATTN_IMPL="" to honor the config's own value, or
+# e.g. ATTN_IMPL=sdpa for an arch-agnostic (non-flash) fallback.
+ATTN_IMPL="${ATTN_IMPL:-flash_attention_4}"
 IMAGE="${IMAGE:-nvcr.io/nvidia/pytorch:25.01-py3}"
 DISK_GB="${DISK_GB:-150}"
 # 8xH100_SXM single nodes are SCARCE on Vast (often just one in the whole marketplace,
@@ -217,6 +227,9 @@ done
 # traces to /workspace/out/trace). Default is a plain training run.
 PROFILE_ARGS=""
 [[ "${PROFILE:-0}" == "1" ]] && PROFILE_ARGS="--train.enable_profiling true --train.profile_trace_dir /workspace/out/trace"
+# Attention backend override (see ATTN_IMPL above): empty = use the config's own value.
+ATTN_ARGS=""
+[[ -n "$ATTN_IMPL" ]] && ATTN_ARGS="--model.attn_implementation $ATTN_IMPL"
 
 echo ">> installing XoRL (repo-recommended 'uv sync') + training $CONFIG on $NUM_GPUS H100s ..."
 "${SSH[@]}" bash -s <<EOF
@@ -243,6 +256,7 @@ echo "=== train ($NUM_GPUS-way torchrun) ==="
 # the device mesh from the config's parallel sizes); --standalone gives a single-node
 # rendezvous on a free port. nproc_per_node=$NUM_GPUS launches one rank per GPU.
 torchrun --standalone --nproc_per_node=$NUM_GPUS -m xorl.cli.train "$CONFIG" \
+  $ATTN_ARGS \
   $PROFILE_ARGS \
   ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 2>&1 | tee /workspace/out/train.log | tail -60 || true
 ls -lhR /workspace/out
