@@ -36,7 +36,11 @@
 #     PROFILE      set =1 to also run XoRL's built-in torch.profiler + fetch traces
 #     IMAGE        docker image (default NGC pytorch)
 #     DISK_GB      instance disk (default 150; 8B weights + uv venv + cache)
-#     MAX_DPH      max $/hr to accept (default 20.0; an 8xH100_SXM box is ~$8-20/hr)
+#     MAX_DPH      max $/hr to accept (default 26.0; picks the CHEAPEST node clearing the
+#                  thresholds — Blackwell RTX PRO nodes run ~$5-14/hr, H100_SXM ~$23/hr)
+#     GPU_NAMES    comma-sep Vast gpu_name tokens to accept (default: H100 SXM/NVL/PCIE +
+#                  RTX_PRO_6000_WS/_S + RTX_PRO_5000)
+#     MIN_RELIABILITY min host reliability (default 0.98)
 #     MIN_CUDA     min host-driver CUDA via cuda_max_good (default 12.6)
 #     KEEP         set =1 to `stop` (keep disk) instead of `destroy` at the end
 #     KEY_FILE     ssh private key (default ~/.ssh/id_ed25519)
@@ -51,11 +55,22 @@ CONFIG_STEM="$(basename "${CONFIG%.*}")"
 NUM_GPUS="${NUM_GPUS:-8}"
 IMAGE="${IMAGE:-nvcr.io/nvidia/pytorch:25.01-py3}"
 DISK_GB="${DISK_GB:-150}"
-MAX_DPH="${MAX_DPH:-20.0}"
+# 8xH100_SXM single nodes are SCARCE on Vast (often just one in the whole marketplace,
+# ~$23/hr) — far rarer/pricier than the 1xH100 the sibling launch.sh targets. Cap higher.
+MAX_DPH="${MAX_DPH:-26.0}"
+# Min reliability. Floor at 0.98 (not 0.99): the few 8-GPU nodes that exist can sit just
+# under 0.99, and there is no cheaper alternative to fall back to.
+MIN_RELIABILITY="${MIN_RELIABILITY:-0.98}"
 # Minimum host-driver CUDA (nvidia-smi "CUDA Version") via Vast's cuda_max_good. The
 # cute stack (nvidia-cutlass-dsl / flash-attn-4 / quack) JIT-compiles at runtime, so a
 # host whose driver caps below the toolkit risks the cute JIT failing. Floor to 12.6.
 MIN_CUDA="${MIN_CUDA:-12.6}"
+# GPU types to accept (Vast gpu_name query tokens, comma-separated). Spans datacenter
+# H100 (SXM/NVL/PCIE) and the much cheaper Blackwell workstation cards: RTX PRO 6000
+# (WS/S, 96GB) and RTX PRO 5000 (48GB). Qwen3-8B (TP=4 x FSDP-shard=2) fits in 48GB, so
+# any of these work; SXM H100 is fastest for TP (NVLink all-to-all) but the Blackwell
+# nodes are ~1/3-1/5 the price. We pick the CHEAPEST node that passes the thresholds below.
+GPU_NAMES="${GPU_NAMES:-H100_SXM,H100_NVL,H100_PCIE,RTX_PRO_6000_WS,RTX_PRO_6000_S,RTX_PRO_5000}"
 # results/ is gitignored (large binary logs/outputs). Fetch into the MAIN
 # worktree's results/ regardless of which worktree we launch from (porcelain lists it first).
 MAIN_WT="$(git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')"
@@ -81,17 +96,39 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo ">> searching for a single x86_64 node with $NUM_GPUS H100_SXM GPUs under \$$MAX_DPH/hr (cuda_max_good>=$MIN_CUDA) ..."
+echo ">> searching for a single x86_64 node: $NUM_GPUS x {$GPU_NAMES} under \$$MAX_DPH/hr ..."
 # Each Vast offer is from ONE physical machine, so num_gpus=$NUM_GPUS returns a single
-# node that has all $NUM_GPUS GPUs (NVLink/NVSwitch intra-node) — there is no multi-machine
-# offer to accidentally match. cpu_arch=amd64 is REQUIRED: the repo's pinned wheels
-# (torch cu129, flash-attn-3, triton manylinux_x86_64) are x86_64-only and won't install
-# on arm64 hosts (e.g. GH200), so `uv sync` would fail there. Filter ARM out at search time.
-OFFER=$(vastai search offers \
-  "gpu_name=H100_SXM cpu_arch=amd64 num_gpus=$NUM_GPUS rentable=true verified=true reliability>0.99 inet_down>1000 disk_space>$DISK_GB direct_port_count>=1 cuda_max_good>=$MIN_CUDA dph_total<$MAX_DPH" \
-  -o 'dph' --raw | jqpy "[0]['id']")
-[[ -z "$OFFER" || "$OFFER" == "None" ]] && { echo "!! no $NUM_GPUS-GPU H100_SXM offer matched (try lowering MIN_CUDA=$MIN_CUDA or raising MAX_DPH=$MAX_DPH)"; exit 1; }
-echo ">> selected offer $OFFER"
+# node that has all $NUM_GPUS GPUs on one box — there is no multi-machine offer to match.
+#
+# Two-stage selection: a BROAD vast query (gpu_name list + count + rentable + price), then
+# filter & rank in PYTHON. We deliberately keep reliability / cuda / inet / disk / cpu_arch
+# OUT of the vast query: its server-side numeric filters SILENTLY DROP otherwise-valid
+# Blackwell nodes (empirically `cuda_max_good>=12.6` excludes cuda-13.0 cards, and
+# `inet_down>1000` drops nodes whose --raw inet_down is well over 1000). Applying those
+# thresholds locally is transparent and debuggable. cpu_arch=amd64 is REQUIRED — the
+# pinned wheels (torch cu129, flash-attn-3, triton manylinux_x86_64) are x86_64-only, so
+# `uv sync` fails on arm64. No `verified=true`: the raw `verified` flag is often null on
+# these nodes even when the UI shows "verified", and requiring it drops valid offers.
+OFFERS_JSON=$(vastai search offers \
+  "gpu_name in [$GPU_NAMES] num_gpus=$NUM_GPUS rentable=true dph_total<$MAX_DPH" \
+  -o 'dph' --raw)
+# Emit "<id> <gpu_name> <dph>" for the cheapest offer clearing every threshold, else nothing.
+read -r OFFER OFFER_GPU OFFER_DPH < <(printf '%s' "$OFFERS_JSON" | python3 -c "
+import sys, json
+o = json.loads(sys.stdin.read(), strict=False)
+def ok(x):
+    return (x.get('cpu_arch') == 'amd64'
+            and (x.get('reliability2') or 0) >= $MIN_RELIABILITY
+            and (x.get('cuda_max_good') or 0) >= $MIN_CUDA
+            and (x.get('disk_space') or 0) >= $DISK_GB
+            and (x.get('inet_down') or 0) >= 1000
+            and (x.get('direct_port_count') or 0) >= 1)
+c = sorted((x for x in o if ok(x)), key=lambda d: d.get('dph_total', 9e9))
+if c:
+    print(c[0]['id'], (c[0].get('gpu_name') or '?').replace(' ', '_'), round(c[0]['dph_total'], 3))
+") || true
+[[ -z "${OFFER:-}" || "$OFFER" == "None" ]] && { echo "!! no $NUM_GPUS-GPU offer in {$GPU_NAMES} cleared the thresholds under \$$MAX_DPH/hr (reliability>=$MIN_RELIABILITY, cuda>=$MIN_CUDA, disk>=$DISK_GB). Raise MAX_DPH / widen GPU_NAMES / retry later."; exit 1; }
+echo ">> selected offer $OFFER  ($OFFER_GPU @ \$$OFFER_DPH/hr)"
 
 # Keyed onstart: inject our pubkey so DIRECT SSH authenticates even when Vast's proxy
 # key is broken account-wide and/or Vast never populates authorized_keys.
