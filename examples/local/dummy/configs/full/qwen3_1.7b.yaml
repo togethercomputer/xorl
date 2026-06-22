@@ -1,0 +1,84 @@
+# Qwen3-1.7B single-GPU run — XoRL full-weight AMP regime (logical match of
+# training-megakernels `python -m megakernels.train --variant modded`):
+#   fp32 model params kept as the master + torch.autocast(bf16) compute + plain fused
+#   AdamW directly on the fp32 params (no separate optimizer master copy),
+#   FlashAttention-4 (attn_implementation: flash_attention_4, routed through the
+#   compile-safe xorl_fa4 custom op), and torch.compile of the decoder layers.
+#
+# Run (torchrun; xorl.cli.train inits torch.distributed from the elastic env):
+#   torchrun --standalone --nproc_per_node=1 -m xorl.cli.train examples/local/dummy/configs/full/qwen3_1.7b.yaml
+# Profile: built-in torch.profiler (PROFILER=torch ./vast/launch.sh ...) or nsys
+#   (profiling/run_nsys.sh examples/local/dummy/configs/full/qwen3_1.7b.yaml results/timeline-qwen3-1.7b).
+model:
+  model_path: Qwen/Qwen3-1.7B            # HF config drives dims: hidden 2048, 28 layers,
+  attn_implementation: flash_attention_4 # 16 q / 8 kv heads, head_dim 128, tie_word_embeddings
+  # FA4's cute kernel rejects fp32. RoPE runs autocast-disabled and the naive rotary
+  # fallback promotes q/k to fp32, so cast q/k back to bf16 right after RoPE.
+  attention_cast_bf16: true
+
+data:
+  datasets:
+    - path: dummy
+      type: tokenized
+      max_seq_len: 2048                  # seq_len = 2048 (megakernels default)
+  select_columns: [input_ids, labels]
+  dataset_prepared_path: last_prepared_dataset
+  sample_packing_method: sequential
+  sample_packing_sequence_len: 2048
+  dataloader_num_workers: 2
+  dataloader_prefetch_factor: 2
+  dataloader_pin_memory: true
+
+train:
+  output_dir: outputs/Qwen3-1.7B-modded
+  seed: 0
+
+  # Single GPU: no FSDP/TP/PP/EP. data_parallel_mode=none routes through the
+  # torch.autocast(bf16) path added for non-FSDP training (fp32 master preserved).
+  data_parallel_mode: none
+  ulysses_parallel_size: 1
+  ringattn_parallel_size: 1
+  data_parallel_replicate_size: 1
+  data_parallel_shard_size: 1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  expert_parallel_size: 1
+
+  # batch: 4 x 2048 = 8192 tokens/step (megakernels batch_size=4, seq_len=2048)
+  micro_batch_size: 4
+  gradient_accumulation_steps: 1
+  num_train_epochs: 1
+  max_steps: 64                          # megakernels max_steps
+
+  # Plain fused AdamW directly on the fp32 params (params ARE the master). betas default
+  # (0.9, 0.95) and eps 1e-8 already match megakernels, so no override needed.
+  optimizer: adamw
+  lr: 3.0e-4
+  weight_decay: 0.1
+  lr_decay_style: constant               # megakernels uses a flat LR (no schedule)
+  lr_warmup_ratio: 0.0
+
+  # megakernels does no gradient clipping; .inf disables scaling while still
+  # reporting the true grad norm for logging (xorl's no-clip convention).
+  max_grad_norm: .inf
+
+  enable_mixed_precision: true           # fp32 params kept as master; bf16 compute per-op via autocast
+  enable_compile: true                   # torch.compile the decoder layers
+  enable_gradient_checkpointing: false   # megakernels does not checkpoint activations
+  enable_activation_offload: false
+  init_device: cuda                      # meta-init is for the FSDP path
+  enable_full_determinism: false
+
+  ckpt_manager: dcp
+  save_steps: 0
+  save_hf_weights: false
+
+  # nsys profiling window (steady-state, past the compile spike). Used by
+  # profiling/run_nsys.sh via XORL_NSYS_RANGE=1 + nsys --capture-range=cudaProfilerApi.
+  enable_profiling: false
+  profile_start_step: 15
+  profile_end_step: 20
+
+  use_wandb: false
+  wandb_project: local-training
+  wandb_name: Qwen3-1.7B-modded
