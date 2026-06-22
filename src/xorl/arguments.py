@@ -510,6 +510,15 @@ class ModelArguments:
             "'eager' uses the plain eager implementation."
         },
     )
+    attention_cast_bf16: bool = field(
+        default=False,
+        metadata={
+            "help": "Cast q/k to bfloat16 right after RoPE, before the attention backend. "
+            "Needed on the full-weight AMP path (fp32 params + torch.autocast): RoPE runs "
+            "autocast-disabled and the naive rotary fallback promotes q/k back to fp32, which "
+            "FlashAttention (esp. FA4 cute) rejects. Set true for flash_attention_4 runs."
+        },
+    )
 
     def __post_init__(self):
         if self.config_path is None and self.model_path is None:

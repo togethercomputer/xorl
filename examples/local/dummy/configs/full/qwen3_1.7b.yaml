@@ -12,12 +12,12 @@
 model:
   model_path: Qwen/Qwen3-1.7B            # HF config drives dims: hidden 2048, 28 layers,
   attn_implementation: flash_attention_4 # 16 q / 8 kv heads, head_dim 128, tie_word_embeddings
-  # NOTE: dev carries `attention_cast_bf16: true` here to cast q/k back to bf16 after RoPE
-  # (its rope path promotes to fp32, which FA4's cute kernel rejects). This branch has no
-  # such config field (ModelArguments doesn't define it; the parser rejects it), and it
-  # isn't needed: this branch's RoPE — both the flash fused kernel and the naive fallback
-  # in src/xorl/models/layers/rope.py — keeps q/k in bf16 under autocast, so FA4 is already
-  # satisfied. (This matches the regime the upstream commit validated Qwen3-1.7B under.)
+  # FA4's cute kernel rejects fp32 q/k. On this full-weight AMP path the naive rotary
+  # fallback (flash_attn.layers.rotary.apply_rotary_emb isn't taken in this env) promotes
+  # q/k to fp32, so cast them back to bf16 right after RoPE. Verified empirically: without
+  # this, FA4 asserts "inputs must be float16, bfloat16, fp8...". The field + its trainer
+  # plumbing are ported from dev (this branch's upstream base had dropped them).
+  attention_cast_bf16: true
 
 data:
   datasets:
