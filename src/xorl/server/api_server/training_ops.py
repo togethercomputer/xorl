@@ -326,6 +326,12 @@ class TrainingOpsMixin:
                 if key.startswith(("is_", "opd_")):
                     # Ensure colon format for tinker compatibility
                     metrics[key if ":" in key else f"{key}:mean"] = value
+                elif key in (
+                    "teacher_prefill_tokens",
+                    "teacher_prefill_forward_compute_s",
+                    "teacher_hidden_cache_write_s",
+                ):
+                    metrics[key] = value
 
             # Pass through expert load summary for MoE models
             if "expert_load_summary" in result:
@@ -420,6 +426,13 @@ class TrainingOpsMixin:
                     "teacher_hidden_cache_write_s",
                 ):
                     metrics[key] = value
+            for key in (
+                "teacher_prefill_tokens",
+                "teacher_prefill_forward_compute_s",
+                "teacher_hidden_cache_write_s",
+            ):
+                if key in result:
+                    metrics[key] = result[key]
 
             return ForwardResponse(
                 loss_fn_output_type=loss_fn_output_type,
@@ -471,6 +484,7 @@ class TrainingOpsMixin:
                     beta2=adam_params.beta2 if adam_params is not None else None,
                     eps=adam_params.eps if adam_params is not None else None,
                     model_id=request.model_id,
+                    sparse_delta_capture=request.sparse_delta_capture,
                 ),
                 seq_id=request.seq_id,
             )
@@ -511,6 +525,7 @@ class TrainingOpsMixin:
                 metrics={
                     "grad_norm": grad_norm,
                     "learning_rate": response_learning_rate,
+                    "step": result.get("step", 0),
                 },
                 info=info,
             )

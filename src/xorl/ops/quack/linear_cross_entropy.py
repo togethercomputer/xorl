@@ -1,11 +1,11 @@
 # Copyright (c) 2025, Tri Dao
-from typing import Literal, Optional
+from typing import Optional, Literal
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch.amp import custom_bwd, custom_fwd
+from torch.amp import custom_fwd, custom_bwd
 
 from .cross_entropy import cross_entropy, cross_entropy_fwd_out
 from .gemm_interface import gemm, gemm_add, gemm_add_inplace
@@ -22,7 +22,9 @@ def linear_cross_entropy_func(
     inplace_backward: bool = False,
 ) -> Tensor:
     y = F.linear(x, weight, bias)  # (..., V)
-    return cross_entropy(y, target, ignore_index=ignore_index, reduction=reduction, inplace_backward=inplace_backward)
+    return cross_entropy(
+        y, target, ignore_index=ignore_index, reduction=reduction, inplace_backward=inplace_backward
+    )
 
 
 def linear_cross_entropy_func_ref(
@@ -171,7 +173,9 @@ class ChunkedLinearCrossEntropyFunction(torch.autograd.Function):
             # dw = dloss * dw + dloss * (last_dlogits_chunk.T @ last_x_chunk)
             # We use alpha=dloss, beta=dloss
             if ctx.weight_dtype == dw.dtype:
-                gemm_add_inplace(last_dlogits_chunk.T, last_x_chunk, dw, alpha=dloss, beta=dloss, tuned=tuned)
+                gemm_add_inplace(
+                    last_dlogits_chunk.T, last_x_chunk, dw, alpha=dloss, beta=dloss, tuned=tuned
+                )
             else:
                 dw = gemm_add(
                     last_dlogits_chunk.T,
@@ -211,7 +215,9 @@ def chunked_linear_cross_entropy(
     """
     if reduction not in ["mean", "sum"]:
         raise ValueError(f"Invalid reduction: {reduction}")
-    loss = ChunkedLinearCrossEntropyFunction.apply(x, weight, target, ignore_index, reduction, chunk_size, tuned)
+    loss = ChunkedLinearCrossEntropyFunction.apply(
+        x, weight, target, ignore_index, reduction, chunk_size, tuned
+    )
     return loss
 
 

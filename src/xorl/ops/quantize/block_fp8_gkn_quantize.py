@@ -2,6 +2,8 @@
 
 Autotuned Triton kernels for 2D block-based FP8 quantization of weight tensors
 with shape [K, N]. Each block_size x block_size tile gets its own scale factor.
+Rowwise helpers are also provided for trainable dense FP8 GEMMs, where each
+output row and K-block gets a separate scale.
 
 Autotuning covers num_warps and num_stages only — BLOCK_SIZE is fixed to the
 user's block_size (default 128) since it determines quantization granularity.
@@ -42,6 +44,7 @@ def _block_fp8_quantize_gkn_kernel(
     M,
     N,
     BLOCK_SIZE: tl.constexpr,
+    AMAX_SCALE: tl.constexpr,
 ):
     """2D block-based quantization kernel for weight matrices.
 
@@ -58,9 +61,10 @@ def _block_fp8_quantize_gkn_kernel(
     offs = offs_m[:, None] * N + offs_n[None, :]
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    s = tl.max(tl.abs(x)) / 448.0
+    s = tl.max(tl.abs(x)) * AMAX_SCALE / 448.0
     s = tl.maximum(s, 1e-12)
     y = x / s
+    y = tl.minimum(tl.maximum(y, -448.0), 448.0)
     y = y.to(y_ptr.dtype.element_ty)
     tl.store(y_ptr + offs, y, mask=mask)
     tl.store(s_ptr + pid_m * n_blocks + pid_n, s)
@@ -69,6 +73,7 @@ def _block_fp8_quantize_gkn_kernel(
 def block_fp8_quantize_gkn(
     x: torch.Tensor,
     block_size: int = 128,
+    amax_scale: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize a 2D weight matrix to FP8 using 2D block-based quantization.
 
@@ -78,6 +83,9 @@ def block_fp8_quantize_gkn(
     Args:
         x: Weight matrix of shape (K, N), any float dtype. Must be contiguous.
         block_size: Tile size for both dimensions (default: 128).
+        amax_scale: Multiplier applied to the per-tile absolute max before
+            deriving the FP8 scale. Values below 1.0 clip outliers; values
+            above 1.0 add headroom. Defaults to exact absmax scaling.
 
     Returns:
         Tuple of (y, s):
@@ -85,6 +93,8 @@ def block_fp8_quantize_gkn(
             s: Per-tile scale factors, shape (ceil(K/block_size), ceil(N/block_size)) float32.
     """
     assert x.is_contiguous() and x.dim() == 2
+    if amax_scale <= 0.0:
+        raise ValueError(f"amax_scale must be positive, got {amax_scale}")
     M, N = x.size()
     y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     s = torch.empty(
@@ -92,10 +102,12 @@ def block_fp8_quantize_gkn(
         dtype=torch.float32,
         device=x.device,
     )
-    grid = lambda meta: (
-        triton.cdiv(M, block_size),
-        triton.cdiv(N, block_size),
-    )
+    def grid(meta):
+        return (
+            triton.cdiv(M, block_size),
+            triton.cdiv(N, block_size),
+        )
+
     _block_fp8_quantize_gkn_kernel[grid](
         x,
         y,
@@ -103,6 +115,7 @@ def block_fp8_quantize_gkn(
         M,
         N,
         BLOCK_SIZE=block_size,
+        AMAX_SCALE=float(amax_scale),
     )
     return y, s
 
@@ -155,11 +168,148 @@ def block_fp8_dequantize_gkn(x: torch.Tensor, s: torch.Tensor, block_size: int =
     assert x.dim() == 2 and s.dim() == 2
     M, N = x.size()
     y = torch.empty_like(x, dtype=torch.get_default_dtype())
-    grid = lambda meta: (
-        triton.cdiv(M, block_size),
-        triton.cdiv(N, block_size),
-    )
+    def grid(meta):
+        return (
+            triton.cdiv(M, block_size),
+            triton.cdiv(N, block_size),
+        )
+
     _block_fp8_dequantize_gkn_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
+    return y
+
+
+# ---------------------------------------------------------------------------
+# Rowwise weight quantization/dequantization for dense training GEMMs
+# ---------------------------------------------------------------------------
+
+
+@triton.autotune(configs=_quant_configs, key=["M", "N"])
+@triton.jit
+def _block_fp8_quantize_gkn_rowwise_kernel(
+    x_ptr,
+    y_ptr,
+    s_ptr,
+    M,
+    N,
+    BLOCK_SIZE: tl.constexpr,
+    AMAX_SCALE: tl.constexpr,
+):
+    """Rowwise quantization for weight matrices.
+
+    Each program processes one row and one BLOCK_SIZE-wide K block. This keeps
+    the K-block scale local to a single output channel instead of sharing it
+    across an output-channel tile.
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    n_blocks = tl.cdiv(N, BLOCK_SIZE)
+    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offs = pid_m * N + offs_n
+    mask = (pid_m < M) & (offs_n < N)
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    s = tl.max(tl.abs(x)) * AMAX_SCALE / 448.0
+    s = tl.maximum(s, 1e-12)
+    y = x / s
+    y = tl.minimum(tl.maximum(y, -448.0), 448.0)
+    y = y.to(y_ptr.dtype.element_ty)
+    tl.store(y_ptr + offs, y, mask=mask)
+    tl.store(s_ptr + pid_m * n_blocks + pid_n, s)
+
+
+def block_fp8_quantize_gkn_rowwise(
+    x: torch.Tensor,
+    block_size: int = 128,
+    amax_scale: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a 2D weight matrix with per-row, per-K-block scales.
+
+    Args:
+        x: Weight matrix of shape (N, K), any float dtype. Must be contiguous.
+        block_size: Number of K elements per quantization block.
+        amax_scale: Multiplier applied to the per-row K-block absolute max
+            before deriving the FP8 scale. Values below 1.0 clip outliers;
+            values above 1.0 add headroom.
+
+    Returns:
+        Tuple of (y, s):
+            y: Quantized weight in FP8 E4M3 format, shape (N, K).
+            s: Per-row K-block scale factors, shape (N, ceil(K/block_size)) float32.
+    """
+    assert x.is_contiguous() and x.dim() == 2
+    if amax_scale <= 0.0:
+        raise ValueError(f"amax_scale must be positive, got {amax_scale}")
+    M, N = x.size()
+    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    s = torch.empty((M, triton.cdiv(N, block_size)), dtype=torch.float32, device=x.device)
+
+    def grid(meta):
+        return (
+            M,
+            triton.cdiv(N, block_size),
+        )
+
+    _block_fp8_quantize_gkn_rowwise_kernel[grid](
+        x,
+        y,
+        s,
+        M,
+        N,
+        BLOCK_SIZE=block_size,
+        AMAX_SCALE=float(amax_scale),
+    )
+    return y, s
+
+
+@triton.autotune(configs=_dequant_configs, key=["M", "N"])
+@triton.jit
+def _block_fp8_dequantize_gkn_rowwise_kernel(
+    x_ptr,
+    s_ptr,
+    y_ptr,
+    M,
+    N,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Rowwise dequantization for weight matrices."""
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    n_blocks = tl.cdiv(N, BLOCK_SIZE)
+    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offs = pid_m * N + offs_n
+    mask = (pid_m < M) & (offs_n < N)
+    x = tl.load(x_ptr + offs, mask=mask).to(tl.float32)
+    s = tl.load(s_ptr + pid_m * n_blocks + pid_n)
+    y = x * s
+    tl.store(y_ptr + offs, y, mask=mask)
+
+
+def block_fp8_dequantize_gkn_rowwise(
+    x: torch.Tensor,
+    s: torch.Tensor,
+    block_size: int = 128,
+) -> torch.Tensor:
+    """Dequantize a rowwise block-FP8 weight matrix.
+
+    Args:
+        x: Quantized weight matrix of shape (N, K).
+        s: Rowwise scale tensor of shape (N, ceil(K/block_size)).
+        block_size: Number of K elements per quantization block.
+
+    Returns:
+        Dequantized weight matrix in default dtype.
+    """
+    assert x.is_contiguous() and s.is_contiguous()
+    assert x.dim() == 2 and s.dim() == 2
+    M, N = x.size()
+    assert s.shape == (M, triton.cdiv(N, block_size))
+    y = torch.empty_like(x, dtype=torch.get_default_dtype())
+    def grid(meta):
+        return (
+            M,
+            triton.cdiv(N, block_size),
+        )
+
+    _block_fp8_dequantize_gkn_rowwise_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
     return y
 
 

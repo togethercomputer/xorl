@@ -1,4 +1,4 @@
-"""End-to-end OPD coverage with a real xorl-sglang teacher."""
+"""End-to-end OPD coverage with a real xorl-sglang-internal teacher."""
 
 import json
 import math
@@ -146,7 +146,7 @@ def _run_sglang_teacher_cache(
     )
     if result.returncode != 0:
         raise AssertionError(
-            "xorl-sglang teacher cache generation failed\n"
+            "xorl-sglang-internal teacher cache generation failed\n"
             f"--- stdout ---\n{result.stdout[-4000:]}\n"
             f"--- stderr ---\n{result.stderr[-4000:]}"
         )

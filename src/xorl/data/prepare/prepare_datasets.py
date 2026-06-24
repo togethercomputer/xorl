@@ -23,6 +23,7 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 from ...arguments import Arguments, DatasetConfig
 from ...data.prepare.utils import retry_on_request_exceptions
 from ...utils import logging
+from ...utils.dist_utils import distributed_barrier
 from .hash import generate_dataset_hash_from_config
 from .packing import PackingDataset, process_datasets_for_packing
 from .shared import (
@@ -97,8 +98,14 @@ def prepare_datasets(
     datasets_configs = args.data.datasets
     if datasets_configs and all(dc.path == "dummy" for dc in datasets_configs):
         seq_len = datasets_configs[0].max_seq_len or args.data.sample_packing_sequence_len
-        logger.info_rank0(f"Creating dummy dataset: {4096} samples x {seq_len} tokens")
-        dataset = _create_dummy_dataset(seq_len=seq_len, seed=args.train.seed, vocab_size=len(tokenizer))
+        num_samples = datasets_configs[0].num_samples or 4096
+        logger.info_rank0(f"Creating dummy dataset: {num_samples} samples x {seq_len} tokens")
+        dataset = _create_dummy_dataset(
+            seq_len=seq_len,
+            num_samples=num_samples,
+            seed=args.train.seed,
+            vocab_size=len(tokenizer),
+        )
 
         def _build_train_dataset():
             if args.data.sample_packing_method and args.data.sample_packing_method != "none":
@@ -115,7 +122,7 @@ def prepare_datasets(
             train_dataset = _build_train_dataset()
 
         if is_distributed:
-            dist.barrier()
+            distributed_barrier()
 
         if is_distributed and not is_rank_zero:
             train_dataset = _build_train_dataset()
@@ -153,7 +160,7 @@ def prepare_datasets(
 
     # Synchronize all ranks - rank 0 has finished processing
     if is_distributed:
-        dist.barrier()
+        distributed_barrier()
         logger.info(f"Rank {dist.get_rank()}: Dataset processing synchronized")
 
     # Non-rank-0 processes load from the prepared path

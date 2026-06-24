@@ -68,7 +68,7 @@ class Qwen3_5MoeMLP(nn.Module):
         self.gate_up_proj = nn.Linear(self.hidden_size, 2 * self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self._use_fused_silu = config.hidden_act == "silu"
+        self._use_fused_silu = config.hidden_act == "silu" and not getattr(config, "_activation_native", False)
 
     def unfuse_for_tp(self):
         device = self.gate_up_proj.weight.device
@@ -168,10 +168,13 @@ class Qwen3_5MoeAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape)
 
         cos, sin = position_embeddings
-        # `mrope_interleaved` controls T/H/W frequency mixing in cos/sin
-        # construction upstream, not the q/k rotation convention. q/k always
-        # use the standard half-rotate convention (HF/SGLang).
-        query_states, key_states = qwen3_5_apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = qwen3_5_apply_rotary_pos_emb(
+            query_states,
+            key_states,
+            cos,
+            sin,
+            interleaved=getattr(self.config, "mrope_interleaved", False),
+        )
         return query_states, key_states, value_states
 
     def _project_output(self, attn_output: torch.Tensor) -> torch.Tensor:
@@ -223,12 +226,14 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
             norm_topk_prob=config.norm_topk_prob,
             moe_implementation=moe_implementation,
             train_router=getattr(config, "train_router", False),
+            activation_native=getattr(config, "_activation_native", False),
         )
         self.config = config
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
         self.experts.deepep_buffer_size_gb = getattr(config, "_deepep_buffer_size_gb", 2.0)
         self.experts.deepep_num_sms = getattr(config, "_deepep_num_sms", 20)
         self.experts.deepep_async_combine = getattr(config, "_deepep_async_combine", False)
+        self.experts.alltoall_combine_hidden_chunk_size = getattr(config, "_alltoall_combine_hidden_chunk_size", 0)
         self.shared_expert = Qwen3_5MoeMLP(config, intermediate_size=config.shared_expert_intermediate_size)
         self.shared_expert_gate = nn.Linear(config.hidden_size, 1, bias=False)
 
@@ -305,24 +310,25 @@ class Qwen3_5MoeDecoderLayer(MoEGradientCheckpointingLayer):
         hidden_states = self.input_layernorm(hidden_states)
 
         if self.linear_attn is not None:
-            linear_kwargs = {}
-            if kwargs.get("cu_seq_lens_q") is not None:
-                linear_kwargs["cu_seqlens"] = kwargs.get("cu_seq_lens_q")
+            cu_seqlens = kwargs.get("cu_seq_lens_q")
             cp_context = build_linear_attention_cp_context(
-                kwargs.get("cu_seq_lens_q"),
+                cu_seqlens,
                 conv1d_kernel_size=self.linear_attn.conv_size if self.linear_attn.use_short_conv else None,
             )
-            if cp_context is not None:
-                linear_kwargs["cp_context"] = cp_context
             linear_mask = attention_mask if attention_mask is not None and attention_mask.dim() == 2 else None
             if cp_context is not None:
                 linear_mask = None
+            # Pass cu_seqlens/cp_context as EXPLICIT kwargs (not a **dict splat) so torch.compile/dynamo can
+            # trace through this call. The `**linear_kwargs` splat here was a CALL_FUNCTION_EX graph break at
+            # the GatedDeltaNet boundary that fragmented the compiled graph. GatedDeltaNet.forward reads both
+            # via kwargs.get() (None-safe), so explicit None is identical to the old conditional omission.
             hidden_states, _, _ = self.linear_attn(
                 hidden_states=hidden_states,
                 attention_mask=linear_mask,
                 past_key_values=past_key_values,
                 use_cache=False,
-                **linear_kwargs,
+                cu_seqlens=cu_seqlens,
+                cp_context=cp_context,
             )
         else:
             hidden_states, _ = self.self_attn(
@@ -406,7 +412,7 @@ class Qwen3_5MoePreTrainedModel(XorlPreTrainedModel):
         head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
         skip_expert_loading = False
         if not is_prequantized:
-            from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
+            from xorl.qlora.modules.moe_experts import QLoRAMoeExperts  # noqa: PLC0415
 
             skip_expert_loading = any(
                 isinstance(module, QLoRAMoeExperts) and not getattr(module, "_weights_loaded", False)
@@ -467,6 +473,9 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
         output_router_logits = (
             output_router_logits if output_router_logits is not None else self.config.output_router_logits
         )
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
 
         if self.embed_tokens is not None:
             if (input_ids is None) ^ (inputs_embeds is not None):
@@ -510,6 +519,13 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
 
         all_self_attns = () if output_attentions else None
         all_router_logits = () if output_router_logits else None
+        # Per-layer residual-stream hiddens for all-layer OPRD (post-decoder-layer,
+        # pre-final-norm). Student and teacher use the SAME convention here, so they
+        # align 1:1 per layer; KL still uses the post-norm last_hidden_state below.
+        # NB: we append the OUTPUT of each decoder layer (index i == layer i output,
+        # 40 entries total) — NOT the standard-HF embedding+inputs convention — so the
+        # OPRD layer-index resolution in model_runner indexes hidden_states[i] directly.
+        all_hidden_states = () if output_hidden_states else None
         for decoder_layer in self.layers:
             if decoder_layer is None:
                 continue
@@ -547,6 +563,8 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
                     **kwargs,
                 )
             hidden_states = layer_outputs[0]
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
             if output_attentions:
                 # _moe_forward does not produce attention weights; use None placeholder.
                 all_self_attns += (None,)
@@ -555,7 +573,10 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
 
         hidden_states = self.norm(hidden_states) if self.norm is not None else hidden_states
         return MoeModelOutput(
-            last_hidden_state=hidden_states, attentions=all_self_attns, router_logits=all_router_logits
+            last_hidden_state=hidden_states,
+            attentions=all_self_attns,
+            router_logits=all_router_logits,
+            hidden_states=all_hidden_states,
         )
 
 
@@ -622,7 +643,11 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel):
             output_router_logits=output_router_logits,
             **kwargs,
         )
-        return MoeCausalLMOutput(last_hidden_state=outputs.last_hidden_state, router_logits=outputs.router_logits)
+        return MoeCausalLMOutput(
+            last_hidden_state=outputs.last_hidden_state,
+            router_logits=outputs.router_logits,
+            hidden_states=outputs.hidden_states,
+        )
 
 
 class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoeForCausalLM):

@@ -198,10 +198,24 @@ class _Gather(torch.autograd.Function):
     @staticmethod
     def backward(ctx: Any, grad_output: Tensor) -> Tuple[None, Tensor]:
         if ctx.grad_scale:
-            grad_output = grad_output * ctx.seq_world_size
+            chunks = [chunk.contiguous() for chunk in grad_output.split(ctx.dim_size_list, dim=ctx.dim)]
+            local_shape = chunks[ctx.rank].shape
+            if all(chunk.numel() == chunks[0].numel() for chunk in chunks):
+                reduce_input = torch.cat([chunk.reshape(-1) for chunk in chunks], dim=0)
+                reduce_output = torch.empty(
+                    chunks[ctx.rank].numel(), dtype=grad_output.dtype, device=grad_output.device
+                )
+                dist.reduce_scatter_tensor(reduce_output, reduce_input, op=dist.ReduceOp.SUM, group=ctx.group)
+                grad_input = reduce_output.view(local_shape)
+            else:
+                for chunk in chunks:
+                    dist.all_reduce(chunk, op=dist.ReduceOp.SUM, group=ctx.group)
+                grad_input = chunks[ctx.rank]
+        else:
+            grad_input = grad_output.split(ctx.dim_size_list, dim=ctx.dim)[ctx.rank].contiguous()
         return (
             None,
-            grad_output.split(ctx.dim_size_list, dim=ctx.dim)[ctx.rank].contiguous(),
+            grad_input,
             None,
             None,
         )

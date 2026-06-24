@@ -58,10 +58,12 @@ Note: Only rank 0 communicates with Executor via ZMQ.
 
 import asyncio
 import datetime
+import json
 import logging
 import os
 import sys
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -89,11 +91,17 @@ from xorl.server.runner.model_runner import ModelRunner
 from xorl.server.runner.utils import (
     Rank0Protocol,
     apply_sequence_sharding,
+    batch_slice_rank_and_size,
     convert_batch_to_tensors,
     simple_sequence_shard,
     validate_batch_shapes,
 )
 from xorl.server.weight_sync.handler import WeightSyncHandler
+from xorl.server.weight_sync.source_delta_capture import (
+    sparse_delta_capture_enabled,
+    write_sparse_source_delta_global_manifest,
+)
+from xorl.trainers.training_utils import count_valid_tokens
 
 
 logger = logging.getLogger(__name__)
@@ -567,7 +575,8 @@ class RunnerDispatcher:
         p: ModelPassData = command_dict.get("payload", ModelPassData())
         batches = p.batches or []
         loss_fn = p.loss_fn
-        loss_fn_params = p.loss_fn_params
+        loss_fn_params = dict(p.loss_fn_params or {})
+        loss_fn_params.setdefault("diagnostic_microbatch_request_id", command_dict.get("request_id"))
         routed_experts = p.routed_experts
         routed_expert_logits = p.routed_expert_logits
         model_id = p.model_id or "default"
@@ -622,7 +631,8 @@ class RunnerDispatcher:
         p: ModelPassData = command_dict.get("payload", ModelPassData())
         batches = p.batches or []
         loss_fn = p.loss_fn
-        loss_fn_params = p.loss_fn_params
+        loss_fn_params = dict(p.loss_fn_params or {})
+        loss_fn_params.setdefault("diagnostic_microbatch_request_id", command_dict.get("request_id"))
         routed_experts = p.routed_experts
         routed_expert_logits = p.routed_expert_logits
         model_id = p.model_id or "default"
@@ -672,19 +682,217 @@ class RunnerDispatcher:
         my_batches, routed_experts = self._shard_and_slice_batches(
             my_batches, routed_experts, cp_enabled, parallel_state
         )
-
-        result = self._execute_compute(
+        self._maybe_dump_microbatch_diagnostic(
             my_batches,
-            loss_fn,
-            loss_fn_params,
-            routed_experts,
+            loss_fn=loss_fn,
+            loss_fn_params=loss_fn_params,
+            parallel_state=parallel_state,
             with_backward=with_backward,
             model_id=model_id,
-            routed_expert_logits=routed_expert_logits,
         )
+
+        if self._microbatch_diagnostic_summary_only(loss_fn_params):
+            result = self._microbatch_diagnostic_only_result(my_batches, parallel_state)
+        else:
+            result = self._execute_compute(
+                my_batches,
+                loss_fn,
+                loss_fn_params,
+                routed_experts,
+                with_backward=with_backward,
+                model_id=model_id,
+                routed_expert_logits=routed_expert_logits,
+            )
         del my_batches
         self._gather_is_metrics(result, cp_enabled, is_rank0=is_rank0)
         return result
+
+    @staticmethod
+    def _microbatch_diagnostic_summary_only(loss_fn_params: Optional[Dict[str, Any]]) -> bool:
+        params = loss_fn_params or {}
+        return bool(params.get("diagnostic_microbatch_summary_only", False))
+
+    @staticmethod
+    def _microbatch_diagnostic_only_result(
+        micro_batches: List[Dict[str, Any]],
+        parallel_state: Any,
+    ) -> Dict[str, Any]:
+        group = getattr(parallel_state, "fsdp_group", None) if bool(getattr(parallel_state, "pp_enabled", False)) else None
+        global_valid_tokens = count_valid_tokens(micro_batches, group=group)
+        return {
+            "total_loss": 0.0,
+            "global_valid_tokens": int(global_valid_tokens.item()),
+            "execution_time": 0.0,
+            "microbatch_diagnostic_summary_only": True,
+        }
+
+    @staticmethod
+    def _safe_request_fragment(value: Any) -> str:
+        text = str(value or "unknown")
+        return "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in text)[:160]
+
+    @staticmethod
+    def _position_summary(tensor: torch.Tensor) -> Dict[str, Any]:
+        flat = tensor.detach().reshape(-1).to(dtype=torch.long, device="cpu")
+        if flat.numel() == 0:
+            return {"segments": 0, "max_segment_len": 0}
+        resets = torch.zeros(flat.numel(), dtype=torch.bool)
+        resets[0] = True
+        if flat.numel() > 1:
+            resets[1:] = flat[1:] <= flat[:-1]
+        starts = torch.nonzero(resets, as_tuple=False).flatten()
+        ends = torch.cat([starts[1:], torch.tensor([flat.numel()], dtype=torch.long)])
+        lengths = ends - starts
+        return {
+            "segments": int(lengths.numel()),
+            "max_segment_len": int(lengths.max().item()) if lengths.numel() else 0,
+            "min_segment_len": int(lengths.min().item()) if lengths.numel() else 0,
+            "total_positions": int(flat.numel()),
+        }
+
+    @staticmethod
+    def _tensor_summary(key: str, tensor: torch.Tensor) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "shape": list(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "device": str(tensor.device),
+            "numel": int(tensor.numel()),
+        }
+        if key in {"labels", "target_tokens"}:
+            out["valid_tokens"] = int((tensor != -100).sum().item())
+        elif key == "attention_mask":
+            out["nonzero"] = int((tensor != 0).sum().item())
+        elif key in {"position_ids", "_original_position_ids"}:
+            out.update(RunnerDispatcher._position_summary(tensor))
+        return out
+
+    @staticmethod
+    def _cpu_payload(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu()
+        if isinstance(value, dict):
+            return {k: RunnerDispatcher._cpu_payload(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [RunnerDispatcher._cpu_payload(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(RunnerDispatcher._cpu_payload(v) for v in value)
+        return value
+
+    @staticmethod
+    def _json_payload(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return RunnerDispatcher._tensor_summary("value", value)
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {str(k): RunnerDispatcher._json_payload(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [RunnerDispatcher._json_payload(v) for v in value]
+        if isinstance(value, tuple):
+            return [RunnerDispatcher._json_payload(v) for v in value]
+        try:
+            json.dumps(value)
+        except TypeError:
+            return str(value)
+        return value
+
+    def _maybe_dump_microbatch_diagnostic(
+        self,
+        micro_batches: List[Dict[str, Any]],
+        *,
+        loss_fn: str,
+        loss_fn_params: Optional[Dict[str, Any]],
+        parallel_state: Any,
+        with_backward: bool,
+        model_id: str,
+    ) -> None:
+        params = loss_fn_params or {}
+        dump_dir = params.get("diagnostic_microbatch_dump_dir") or os.getenv("XORL_MICROBATCH_DIAGNOSTIC_DIR")
+        if not dump_dir:
+            return
+
+        request_id = params.get("diagnostic_microbatch_request_id") or params.get("request_id") or "unknown"
+        safe_request_id = self._safe_request_fragment(request_id)
+        out_dir = Path(str(dump_dir))
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        batch_summaries = []
+        total_valid_tokens = 0
+        total_input_tokens = 0
+        real_micro_batches = 0
+        for batch_idx, batch in enumerate(micro_batches):
+            tensors = {
+                key: self._tensor_summary(key, value)
+                for key, value in batch.items()
+                if isinstance(value, torch.Tensor)
+                and key
+                in {
+                    "input_ids",
+                    "labels",
+                    "target_tokens",
+                    "position_ids",
+                    "_original_position_ids",
+                    "attention_mask",
+                    "logprobs",
+                    "teacher_cache_indices",
+                    "teacher_cache_local_indices",
+                    "teacher_ids",
+                    "teacher_weights",
+                }
+            }
+            valid_tokens = int(tensors.get("labels", tensors.get("target_tokens", {})).get("valid_tokens", 0))
+            input_tokens = int(tensors.get("input_ids", {}).get("numel", 0))
+            num_samples = int(batch.get("num_samples", 1) or 0)
+            total_valid_tokens += valid_tokens
+            total_input_tokens += input_tokens
+            if num_samples > 0 and valid_tokens > 0:
+                real_micro_batches += 1
+            batch_summaries.append(
+                {
+                    "batch_idx": batch_idx,
+                    "num_samples": num_samples,
+                    "valid_tokens": valid_tokens,
+                    "input_tokens": input_tokens,
+                    "is_dummy": num_samples == 0 or valid_tokens == 0,
+                    "tensors": tensors,
+                }
+            )
+
+        summary = {
+            "request_id": str(request_id),
+            "rank": self.rank,
+            "world_size": self.world_size,
+            "model_id": model_id,
+            "loss_fn": loss_fn,
+            "loss_fn_params": self._json_payload(loss_fn_params or {}),
+            "with_backward": bool(with_backward),
+            "num_micro_batches": len(micro_batches),
+            "real_micro_batches": real_micro_batches,
+            "total_valid_tokens_local": total_valid_tokens,
+            "total_input_tokens_local": total_input_tokens,
+            "parallel": {
+                "ep_enabled": bool(getattr(parallel_state, "ep_enabled", False)),
+                "ep_size": int(getattr(parallel_state, "ep_size", 1)),
+                "dp_size": int(getattr(parallel_state, "dp_size", 1)),
+                "cp_size": int(getattr(parallel_state, "cp_size", 1)),
+                "pp_size": int(getattr(parallel_state, "pp_size", 1)),
+            },
+            "batches": batch_summaries,
+        }
+
+        summary_path = out_dir / f"microbatch_{safe_request_id}_rank{self.rank:05d}.json"
+        summary_path.write_text(json.dumps(summary, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+
+        if bool(params.get("diagnostic_microbatch_dump_tensors", False)):
+            tensor_path = out_dir / f"microbatch_{safe_request_id}_rank{self.rank:05d}.pt"
+            torch.save(
+                {
+                    "summary": summary,
+                    "loss_fn_params": self._cpu_payload(loss_fn_params or {}),
+                    "micro_batches": self._cpu_payload(micro_batches),
+                },
+                tensor_path,
+            )
 
     @staticmethod
     def _create_dummy_batch(src_batch: Dict[str, Any]) -> Dict[str, Any]:
@@ -695,6 +903,19 @@ class RunnerDispatcher:
         target_tokens are set to -100 (IGNORE_INDEX) so cross-entropy loss = 0 and
         gradient_accumulate_loss produces grad_scale = 0 (local_valid_tokens = 0).
         """
+        min_tokens_raw = os.getenv("XORL_SERVER_MINIMAL_DUMMY_BATCH_TOKENS", "").strip()
+        if min_tokens_raw:
+            try:
+                min_tokens = int(min_tokens_raw)
+            except ValueError:
+                min_tokens = 0
+            if min_tokens > 0:
+                return RunnerDispatcher._create_minimal_dummy_batch(src_batch, min_tokens)
+
+        return RunnerDispatcher._create_legacy_dummy_batch(src_batch)
+
+    @staticmethod
+    def _create_legacy_dummy_batch(src_batch: Dict[str, Any]) -> Dict[str, Any]:
         _LABEL_KEYS = {"labels", "target_tokens"}
         dummy_batch = {}
         for key, value in src_batch.items():
@@ -713,6 +934,66 @@ class RunnerDispatcher:
         return dummy_batch
 
     @staticmethod
+    def _create_minimal_dummy_batch(src_batch: Dict[str, Any], min_tokens: int) -> Dict[str, Any]:
+        """Create a short zero-loss dummy batch for empty data-slice ranks.
+
+        This keeps collective participation uniform while avoiding cloned full
+        OPRD rows on ranks that have no real samples. The OPRD trainer-side
+        teacher forward falls back to this short student sequence when
+        teacher_input_ids/teacher_kept_indices are absent.
+        """
+        input_ids = src_batch.get("input_ids")
+        if not isinstance(input_ids, torch.Tensor) or input_ids.dim() < 1:
+            return RunnerDispatcher._create_legacy_dummy_batch(src_batch)
+
+        seq_len = int(input_ids.shape[-1])
+        if seq_len <= 0:
+            return RunnerDispatcher._create_legacy_dummy_batch(src_batch)
+        keep = max(1, min(int(min_tokens), seq_len))
+
+        label_keys = {"labels", "target_tokens"}
+        drop_keys = {
+            "cu_seq_lens_q",
+            "cu_seq_lens_k",
+            "max_length_q",
+            "max_length_k",
+            "_original_position_ids",
+            "teacher_input_ids",
+            "teacher_kept_indices",
+            "teacher_position_ids",
+            "teacher_cache_indices",
+            "teacher_cache_local_indices",
+            "teacher_cache_base",
+        }
+
+        dummy_batch: Dict[str, Any] = {}
+        for key, value in src_batch.items():
+            if key in drop_keys:
+                continue
+            if isinstance(value, torch.Tensor):
+                if key in label_keys:
+                    if value.dim() >= 1 and int(value.shape[-1]) == seq_len:
+                        dummy_batch[key] = torch.full_like(value[..., :keep], -100)
+                    else:
+                        dummy_batch[key] = torch.full_like(value, -100)
+                elif key == "position_ids" and value.dim() >= 1 and int(value.shape[-1]) == seq_len:
+                    shape = value.shape[:-1] + (keep,)
+                    pos = torch.arange(keep, dtype=value.dtype, device=value.device)
+                    dummy_batch[key] = pos.reshape((1,) * (len(shape) - 1) + (keep,)).expand(shape).clone()
+                elif key == "attention_mask" and value.dim() >= 1 and int(value.shape[-1]) == seq_len:
+                    dummy_batch[key] = torch.ones_like(value[..., :keep])
+                elif value.dim() >= 1 and int(value.shape[-1]) == seq_len:
+                    dummy_batch[key] = value[..., :keep].clone()
+                else:
+                    dummy_batch[key] = value.clone()
+            else:
+                dummy_batch[key] = value
+
+        dummy_batch["num_samples"] = 0
+        dummy_batch["_r3_sample_lengths"] = []
+        return dummy_batch
+
+    @staticmethod
     def _dp_batch_range(dp_rank: int, base_count: int, remainder: int):
         """Return (start_idx, count) for a DP rank under balanced distribution.
 
@@ -727,34 +1008,12 @@ class RunnerDispatcher:
     def _batch_parallel_rank_and_size(self, parallel_state, cp_size: int, pp_size: int) -> tuple[int, int]:
         """Return the logical data slice rank/size for request batch dispatch.
 
-        Expert-parallel ranks cooperate on one logical batch slice.  The
-        ep_fsdp coordinate identifies which EP group receives a distinct slice;
-        ranks within that group must all see the same packed batch so MoE/FSDP
-        collectives and OPD full-vocab KL work stay aligned.
+        Every rank gets a distinct slice (CP/SP ranks share one); EP groups no
+        longer duplicate a slice across their ranks unless the legacy
+        XORL_SERVER_EP_DUPLICATE_BATCHES rollback switch is set — see
+        batch_slice_rank_and_size for the correctness argument.
         """
-        if getattr(parallel_state, "ep_enabled", False):
-            ep_size = max(1, int(getattr(parallel_state, "ep_size", 1)))
-            ep_fsdp_size = max(1, int(getattr(parallel_state, "dp_shard_in_ep_size", 1)))
-            ep_mesh = getattr(parallel_state, "ep_fsdp_device_mesh", None)
-            if ep_mesh is not None:
-                try:
-                    ep_fsdp_rank = int(ep_mesh.get_local_rank("ep_fsdp"))
-                    return min(ep_fsdp_rank, ep_fsdp_size - 1), ep_fsdp_size
-                except Exception as exc:
-                    logger.debug(
-                        "Rank %s: could not read ep_fsdp local rank from EP mesh (%s); falling back to rank arithmetic",
-                        self.rank,
-                        exc,
-                    )
-
-            ranks_per_pp_stage = max(1, self.world_size // max(1, pp_size))
-            local_stage_rank = self.rank % ranks_per_pp_stage
-            ep_fsdp_rank = min(local_stage_rank // ep_size, ep_fsdp_size - 1)
-            return ep_fsdp_rank, ep_fsdp_size
-
-        dp_size = max(1, self.world_size // max(1, cp_size * pp_size))
-        dp_rank = min(self.rank // max(1, cp_size * pp_size), dp_size - 1)
-        return dp_rank, dp_size
+        return batch_slice_rank_and_size(self.rank, self.world_size, parallel_state, cp_size, pp_size)
 
     def _select_and_prepare_batches(self, raw_batches, routed_experts=None, routed_expert_logits=None):
         """Each rank locally selects its own batches from the full broadcast data.
@@ -962,6 +1221,7 @@ class RunnerDispatcher:
         gradient_clip = p.gradient_clip
         lr = p.lr
         model_id = p.model_id or "default"
+        capture_requested = sparse_delta_capture_enabled(p.sparse_delta_capture)
 
         # Auto-load adapter if it was evicted (all ranks must call this together)
         # This can happen if forward_backward was done on this adapter, then another adapter
@@ -969,7 +1229,22 @@ class RunnerDispatcher:
         was_auto_loaded, auto_load_path = self._adapter_coordinator.auto_load_if_evicted(model_id)
 
         # All ranks execute optim_step (synchronized via DDP)
-        result = self.trainer.optim_step(gradient_clip=gradient_clip, lr=lr, model_id=model_id)
+        result = self.trainer.optim_step(
+            gradient_clip=gradient_clip,
+            lr=lr,
+            model_id=model_id,
+            sparse_delta_capture=p.sparse_delta_capture,
+        )
+
+        if capture_requested:
+            rank_capture = result.get("sparse_delta_capture")
+            if self.world_size > 1 and dist.is_available() and dist.is_initialized():
+                all_rank_captures = [None] * self.world_size
+                dist.all_gather_object(all_rank_captures, rank_capture)
+            else:
+                all_rank_captures = [rank_capture]
+            if self.rank == 0:
+                result["sparse_delta_capture"] = write_sparse_source_delta_global_manifest(all_rank_captures)
 
         # Add auto-load info to result if adapter was loaded from checkpoint
         if was_auto_loaded and self.rank == 0:

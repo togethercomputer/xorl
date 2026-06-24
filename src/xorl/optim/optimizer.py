@@ -22,8 +22,14 @@ logger = logging.get_logger(__name__)
 
 # Module class names and parameter name patterns that should NOT use Muon
 # (i.e., they should always use AdamW even when optimizer_type="muon").
+# - "embeddings" covers nemotron_h's ``model.embeddings`` (other models use
+#   "embed_tokens").
+# - "mixer.conv1d" covers the Mamba2 depthwise conv ``[conv_dim, 1, k]``:
+#   Newton-Schulz on a stack of [1, k] matrices is meaningless. Deliberately
+#   NOT a bare "conv1d" pattern: qwen3.5/3.6 GDN ``*_conv1d`` params already
+#   train through Muon and their behavior must stay unchanged.
 _MUON_EXCLUDE_MODULE_TYPES = {"Embedding"}
-_MUON_EXCLUDE_PARAM_PATTERNS = {"embed_tokens", "lm_head", "norm", "gate.weight"}
+_MUON_EXCLUDE_PARAM_PATTERNS = {"embed_tokens", "embeddings", "lm_head", "norm", "gate.weight", "mixer.conv1d"}
 
 
 def _should_build_ep_aware(model: "nn.Module", param_groups: Optional[Sequence[Dict[str, Any]]]) -> bool:
@@ -131,7 +137,12 @@ def _get_optimizer_cls_and_kwargs(
             # Reject torch.optim.AdamW-only kwargs up-front: forwarding them
             # to AnyPrecisionAdamW yields a confusing TypeError naming a class
             # the user did not request.
-            _ANYPRECISION_ACCEPTED = {"use_kahan_summation"}
+            _ANYPRECISION_ACCEPTED = {
+                "use_kahan_summation",
+                "denominator_chunk_size",
+                "reuse_grad_for_momentum",
+                "state_offload_device",
+            }
             unsupported = [k for k in kwargs if k not in _ANYPRECISION_ACCEPTED]
             if unsupported:
                 raise ValueError(
@@ -213,6 +224,7 @@ def _get_optimizer_cls_and_kwargs(
                 "muon_grouped_gram_ns_fp32_byte_limit",
                 GROUPED_GRAM_NS_FP32_BYTE_LIMIT,
             ),
+            fallback_optimizer=kwargs.get("muon_fallback_optimizer", "adamw"),
             adamw_betas=betas,
             adamw_eps=eps,
             momentum_dtype=_normalize_optional_dtype(momentum_dtype, field_name="muon_momentum_dtype"),
@@ -307,6 +319,34 @@ def _classify_muon_params(
     return muon_params, muon_names, adamw_params, adamw_names
 
 
+def _collect_fused_gate_up_ids(model: "nn.Module") -> set:
+    """Collect ids of params whose last dim is a fused ``[gate | up]`` concat.
+
+    Muon's Newton-Schulz step splits these tensors in half along the last dim
+    so each projection is orthogonalized as its own matrix.
+
+    Detection is attribute-first: gated expert modules tag the parameter with
+    ``param._fused_gate_up = True`` (see ``MoEExperts``). The attribute alone
+    is not sufficient because FSDP2's ``fully_shard`` replaces parameters with
+    fresh DTensor parameters — dropping python attributes — and both the local
+    trainer and the server runner build the optimizer after parallelization.
+    Modules survive sharding, so for untagged params we fall back to the
+    historical ``gate_up_proj`` name match, excluding params whose owning
+    module explicitly declares ``gated=False``: non-gated experts (e.g.
+    Nemotron-3-Ultra) keep the ``gate_up_proj`` name at half width
+    ``[E, in_dim, intermediate]``, where the halving split would silently
+    corrupt the update.
+    """
+    fused_ids: set = set()
+    for module in model.modules():
+        for param_name, param in module.named_parameters(recurse=False):
+            if getattr(param, "_fused_gate_up", False) or (
+                "gate_up_proj" in param_name and getattr(module, "gated", True)
+            ):
+                fused_ids.add(id(param))
+    return fused_ids
+
+
 def _make_muon_param_groups(
     model: "nn.Module",
     muon_params: List[torch.nn.Parameter],
@@ -314,6 +354,7 @@ def _make_muon_param_groups(
     muon_lr: float,
     adamw_lr: float,
     weight_decay: float,
+    fallback_optimizer: str = "adamw",
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
@@ -322,16 +363,12 @@ def _make_muon_param_groups(
 
     Creates up to 4 groups:
       - muon + decay, muon + no_decay
-      - adamw + decay, adamw + no_decay
+      - fallback + decay, fallback + no_decay
     """
     decay_param_names = set(get_parameter_names(model, no_decay_modules, no_decay_params))
     name_by_param = {p: n for n, p in model.named_parameters()}
 
-    fused_gate_up_ids = {
-        id(p)
-        for p, n in zip(model.parameters(), (name_by_param.get(p, "") for p in model.parameters()))
-        if "gate_up_proj" in name_by_param.get(p, "")
-    }
+    fused_gate_up_ids = _collect_fused_gate_up_ids(model)
 
     groups: List[Dict[str, Any]] = []
 
@@ -359,13 +396,29 @@ def _make_muon_param_groups(
             }
         )
 
-    # AdamW groups
+    # Non-Muon fallback groups
     adamw_decay = [p for p in adamw_params if name_by_param.get(p) in decay_param_names]
     adamw_no_decay = [p for p in adamw_params if name_by_param.get(p) not in decay_param_names]
     if adamw_decay:
-        groups.append({"params": adamw_decay, "lr": adamw_lr, "weight_decay": weight_decay, "use_muon": False})
+        groups.append(
+            {
+                "params": adamw_decay,
+                "lr": adamw_lr,
+                "weight_decay": weight_decay,
+                "use_muon": False,
+                "fallback_optimizer": fallback_optimizer,
+            }
+        )
     if adamw_no_decay:
-        groups.append({"params": adamw_no_decay, "lr": adamw_lr, "weight_decay": 0.0, "use_muon": False})
+        groups.append(
+            {
+                "params": adamw_no_decay,
+                "lr": adamw_lr,
+                "weight_decay": 0.0,
+                "use_muon": False,
+                "fallback_optimizer": fallback_optimizer,
+            }
+        )
 
     return groups
 
@@ -408,8 +461,11 @@ def build_optimizer(
                       "muon_ns_steps": 5, "muon_adjust_lr_fn": None,
                       "muon_ns_algorithm": "gram_newton_schulz",
                       "muon_ns_use_quack_kernels": True, "muon_gram_ns_num_restarts": 1,
-                      "muon_gram_ns_restart_iterations": None, "muon_momentum_dtype": None,
-                      "muon_grad_dtype": None, "muon_update_dtype": None, "muon_force_momentum_path": False,
+                      "muon_gram_ns_restart_iterations": None,
+                      "muon_grouped_gram_ns_fp32_byte_limit": 536870912,
+                      "muon_fallback_optimizer": "adamw",
+                      "muon_momentum_dtype": None, "muon_grad_dtype": None,
+                      "muon_update_dtype": None, "muon_force_momentum_path": False,
                       "muon_distributed_mode": "shard_local"}
             - adamw/anyprecision_adamw: any extra kwargs forwarded to constructor
         cautious_weight_decay: If True, apply Cautious Weight Decay (CWD) per
@@ -453,6 +509,7 @@ def build_optimizer(
         logger.info_rank0(f"AdamW params: {adamw_names}")
 
         muon_lr = kwargs.get("muon_lr", 0.02)
+        fallback_optimizer = kwargs.get("muon_fallback_optimizer", "adamw")
         param_groups = _make_muon_param_groups(
             model,
             muon_params,
@@ -460,6 +517,7 @@ def build_optimizer(
             muon_lr=muon_lr,
             adamw_lr=lr,
             weight_decay=weight_decay,
+            fallback_optimizer=fallback_optimizer,
             no_decay_modules=no_decay_modules,
             no_decay_params=no_decay_params,
         )
@@ -559,6 +617,7 @@ def build_ep_fsdp2_optimizer(
         non_ep_adamw = [p for p in all_adamw if id(p) in non_ep_param_set]
 
         muon_lr = kwargs.get("muon_lr", 0.02)
+        fallback_optimizer = kwargs.get("muon_fallback_optimizer", "adamw")
         ep_groups = _make_muon_param_groups(
             model,
             ep_muon,
@@ -566,6 +625,7 @@ def build_ep_fsdp2_optimizer(
             muon_lr=muon_lr,
             adamw_lr=lr,
             weight_decay=weight_decay,
+            fallback_optimizer=fallback_optimizer,
             no_decay_modules=no_decay_modules,
             no_decay_params=no_decay_params,
         )
@@ -576,6 +636,7 @@ def build_ep_fsdp2_optimizer(
             muon_lr=muon_lr,
             adamw_lr=lr,
             weight_decay=weight_decay,
+            fallback_optimizer=fallback_optimizer,
             no_decay_modules=no_decay_modules,
             no_decay_params=no_decay_params,
         )

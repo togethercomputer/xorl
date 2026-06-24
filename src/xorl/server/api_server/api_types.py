@@ -154,6 +154,10 @@ class LossFnOutput(BaseModel):
     logprobs: Optional[TensorData] = Field(default=None, description="Per-token log probabilities")
     elementwise_loss: Optional[TensorData] = Field(default=None, description="Per-token cross entropy loss")
     k3: Optional[float] = Field(default=None, description="Per-sample K3 KL divergence estimate")
+    token_diagnostics: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional per-token diagnostic payload, e.g. target rank and top-k logprobs",
+    )
 
     @field_serializer("loss")
     def _serialize_loss_as_tensor_data(self, v, _info):
@@ -324,6 +328,10 @@ class OptimStepRequest(BaseModel):
     )
     learning_rate: Optional[float] = Field(default=None, description="Optional per-step learning rate override")
     gradient_clip: Optional[float] = Field(default=None, description="Gradient clipping value")
+    sparse_delta_capture: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional trainer-side source sparse-delta capture config for this optimizer step.",
+    )
     adam_params: Optional[AdamParams] = Field(
         default=None,
         description="Legacy Tinker AdamW optimizer parameters. learning_rate/gradient_clip take precedence.",
@@ -806,9 +814,21 @@ class InferenceEndpointServerInfo(BaseModel):
     )
     quantization_config: Optional[Dict[str, Any]] = Field(
         default=None,
-        description="Full HF quantization_config dict auto-detected from model's config.json",
+        description="Sync-compatible HF quantization_config dict auto-detected from model's config.json",
     )
     dtype: Optional[str] = Field(default=None, description="Model dtype (e.g., 'auto', 'bfloat16')")
+    kv_cache_dtype: Optional[str] = Field(default=None, description="KV-cache dtype reported by the inference server")
+    fp8_kv_cache_enabled: Optional[bool] = Field(
+        default=None, description="Whether the registered SGLang endpoint reports FP8 KV cache"
+    )
+    fp8_kv_cache_requires_postprocess: Optional[bool] = Field(
+        default=None,
+        description="Whether the endpoint needs a postprocess hook after weight updates when FP8 KV cache is enabled",
+    )
+    fp8_kv_cache_static_scales: Optional[bool] = Field(
+        default=None, description="Whether the endpoint reports static FP8 KV-cache scale state"
+    )
+    cache_epoch: Optional[Any] = Field(default=None, description="Receiver cache epoch/version, if reported")
     enable_lora: Optional[bool] = Field(default=None, description="Whether LoRA is enabled")
     max_lora_rank: Optional[int] = Field(default=None, description="Maximum LoRA rank supported")
     version: Optional[str] = Field(default=None, description="SGLang version")
@@ -824,6 +844,14 @@ class InferenceEndpoint(BaseModel):
     )
     world_size: int = Field(default=1, description="Number of workers at this endpoint")
     healthy: bool = Field(default=True, description="Whether the endpoint is healthy")
+    pool: str = Field(
+        default="default",
+        description=(
+            "Endpoint pool tag. Syncs can be restricted to a subset of pools via "
+            "SyncInferenceWeightsRequest.pools (e.g. a dedicated 'eval' pool synced "
+            "only at eval steps so background evals read frozen weights)."
+        ),
+    )
     server_info: Optional[InferenceEndpointServerInfo] = Field(
         default=None, description="Server info from the inference endpoint"
     )
@@ -839,6 +867,17 @@ class AddInferenceEndpointRequest(BaseModel):
         description="Port number of the inference worker endpoint. Defaults to port when omitted.",
     )
     world_size: int = Field(default=1, description="Number of workers at this endpoint")
+    pool: str = Field(
+        default="default",
+        description="Endpoint pool tag (see InferenceEndpoint.pool). Defaults to the training pool.",
+    )
+    receiver_kv_cache_dtype: Optional[Literal["auto", "fp8", "fp8_e4m3"]] = Field(
+        default=None,
+        description=(
+            "Optional expected SGLang KV-cache dtype for this endpoint. "
+            "Use fp8/fp8_e4m3 to require receiver /server_info to report FP8 KV cache."
+        ),
+    )
     # Auto-sync configuration
     sync_weights: bool = Field(
         default=False, description="Whether to automatically sync weights to this endpoint after adding"
@@ -890,6 +929,13 @@ class RemoveInferenceEndpointResponse(BaseModel):
 class SyncInferenceWeightsRequest(BaseModel):
     """API request for synchronizing full model weights to inference endpoints."""
 
+    model_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional training model/session ID whose current weights should be synced. "
+            "In LoRA/QLoRA server mode this selects the adapter to materialize before extracting merged weights."
+        ),
+    )
     master_address: str = Field(
         default="", description="Master address for NCCL rendezvous (training server address). Auto-detected if empty."
     )
@@ -898,12 +944,23 @@ class SyncInferenceWeightsRequest(BaseModel):
     buffer_size_mb: int = Field(default=1024, description="Size of each transfer bucket in MB (to avoid OOM)")
     flush_cache: bool = Field(
         default=False,
-        description="Whether to flush inference KV cache after weight sync. "
-        "Usually not needed: the radix cache is keyed on token sequences, "
-        "so stale KV entries from previous weights are evicted naturally.",
+        description=(
+            "Whether to flush inference KV/prefix cache after weight sync. "
+            "Set this for online weight updates when later requests may reuse prefixes scored under older weights; "
+            "token-keyed radix caches are not weight-version aware unless the receiver adds a separate invalidation "
+            "contract."
+        ),
+    )
+    cache_invalidation_mode: Literal["auto", "flush", "none"] = Field(
+        default="auto",
+        description=(
+            "How XoRL should handle inference KV/prefix cache invalidation for this sync. "
+            "'auto' flushes when registered endpoint metadata reports FP8 KV cache and FP8 weight sync is active; "
+            "'flush' always flushes; 'none' relies on receiver-side versioning and does not add an automatic flush."
+        ),
     )
     pause_mode: Literal["retract", "abort", "in_place"] = Field(
-        default="in_place",
+        default="retract",
         description="How to pause inference during weight sync. "
         "'retract' (default): retract running requests to waiting queue, re-execute after resume. "
         "'abort': abort and return all in-flight requests. "
@@ -918,6 +975,31 @@ class SyncInferenceWeightsRequest(BaseModel):
         description="HF quantization_config dict for weight sync. "
         "If None, uses the default set via set_sync_quantization or auto-detected from endpoint.",
     )
+    sparse_delta_paths: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Prepacked sparse-delta file paths visible to the inference endpoint. "
+            "Only valid with sync_inference_method='sparse_delta'. A single path is "
+            "replicated to every TP rank; otherwise the path count must match endpoint world_size."
+        ),
+    )
+    sparse_delta_config: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Optional sparse-delta backend overrides for this sync request, such as "
+            "prime_baseline, baseline_scope, output_dir, keep_files, base_weight_version, "
+            "run_post_process_weights, and prepacked_only."
+        ),
+    )
+    pools: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Restrict this sync to endpoints whose pool tag is in this list. None (default) "
+            "syncs every registered endpoint (backward compatible). Use ['default'] for the "
+            "per-step training-sampler sync and ['eval'] to refresh a dedicated eval pool "
+            "only at eval steps."
+        ),
+    )
 
 
 class EndpointSyncResult(BaseModel):
@@ -927,6 +1009,13 @@ class EndpointSyncResult(BaseModel):
     port: int = Field(..., description="Endpoint port")
     success: bool = Field(..., description="Whether sync succeeded")
     message: str = Field(default="", description="Status or error message")
+    cache_epoch: Optional[Any] = Field(default=None, description="Receiver cache epoch/version after sync, if reported")
+    fp8_kv_cache_postprocess_ran: Optional[bool] = Field(
+        default=None, description="Whether receiver reported running FP8 KV-cache postprocess"
+    )
+    fp8_kv_cache_static_scales_updated: Optional[bool] = Field(
+        default=None, description="Whether receiver reported updating static FP8 KV-cache scales"
+    )
 
 
 class SyncInferenceWeightsResponse(BaseModel):
@@ -946,6 +1035,20 @@ class SyncInferenceWeightsResponse(BaseModel):
         default_factory=list,
         description="Optional per-rank P2P transport timing summaries for tail-latency diagnosis",
     )
+    cache_invalidation_mode: Literal["auto", "flush", "none"] = Field(
+        default="auto", description="Requested cache invalidation mode for this sync"
+    )
+    flush_cache: bool = Field(default=False, description="Effective flush_cache value forwarded to the trainer")
+    fp8_kv_cache_enabled: bool = Field(
+        default=False, description="Whether any registered endpoint reported FP8 KV cache for this sync"
+    )
+    fp8_kv_cache_postprocess_requested: bool = Field(
+        default=False, description="Whether XoRL requested receiver postprocess for FP8 KV-cache/static-scale refresh"
+    )
+    fp8_kv_cache_static_scales: bool = Field(
+        default=False, description="Whether any registered endpoint reported static FP8 KV-cache scale state"
+    )
+    cache_epoch: Optional[Any] = Field(default=None, description="Receiver cache epoch/version after sync, if reported")
     endpoints_synced: List[EndpointSyncResult] = Field(
         default_factory=list, description="Sync results for each endpoint"
     )
@@ -968,7 +1071,7 @@ class SetSyncQuantizationRequest(BaseModel):
         description="HF quantization_config dict. Must contain 'quant_method' (e.g. 'fp8'). "
         "Optional fields: 'weight_block_size' (default [128, 128]), "
         "'modules_to_not_convert' (list of module name prefixes to skip), "
-        "'fmt' (e.g. 'e4m3'), 'activation_scheme'. "
+        "'fmt' (must be 'e4m3' for online FP8 sync), 'activation_scheme'. "
         "Set to null for bf16 (no quantization).",
     )
 

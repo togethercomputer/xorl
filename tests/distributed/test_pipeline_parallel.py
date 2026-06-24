@@ -9,7 +9,7 @@ import pytest
 from xorl.distributed.pipeline_parallel import generate_llm_fqn_per_model_part
 
 
-pytestmark = [pytest.mark.distributed]
+pytestmark = [pytest.mark.distributed, pytest.mark.gpu]
 
 
 class TestFQNGeneration:

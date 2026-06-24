@@ -44,25 +44,19 @@ from xorl.optim.stochastic_round import stochastic_round_to_bf16
 
 
 def _canonical_reduce_op(op: _ReduceOp) -> ReduceOp.RedOpType:
-    """Return the underlying RedOpType for FSDP's wrapped or raw reduce op.
-
-    Unknown ops are returned unchanged so the caller can reject them.
-    """
+    """Return the underlying RedOpType for FSDP's wrapped or raw reduce op."""
     op_type = getattr(op, "op", op)
     op_name = getattr(op_type, "name", None)
+    if op_name is None:
+        op_name = str(op_type).rsplit(".", maxsplit=1)[-1]
     if op_name == "SUM":
         return ReduceOp.SUM
     if op_name == "AVG":
         return ReduceOp.AVG
     if op_name == "PREMUL_SUM":
         # FSDP emits _make_nccl_premul_sum(1 / gradient_divide_factor) when a
-        # gradient_divide_factor is set. PREMUL_SUM is only equivalent to SUM
-        # when that factor is 1.0; the install-time check in
-        # ``parallelize_model_fsdp2`` (see ``torch_parallelize.py``) that
-        # rejects gradient_divide_factor != 1.0 is load-bearing — without it,
-        # this branch silently drops the premultiply scalar and under-weights
-        # gradients. Do not relax that check without also inspecting the
-        # premul factor here.
+        # custom divide factor is set. The installer requires factor=1.0 for
+        # this hook, so PREMUL_SUM is equivalent to SUM here.
         return ReduceOp.SUM
     return op_type
 

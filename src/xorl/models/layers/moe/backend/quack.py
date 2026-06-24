@@ -15,6 +15,14 @@ def quack_expert_forward(
     num_experts: int,
     hidden_act: str = "silu",
     gate_up_proj: torch.Tensor | None = None,
+    activation_native: bool = False,
+    gate_up_bias: torch.Tensor | None = None,
+    down_bias: torch.Tensor | None = None,
+    fp8_compute: bool = False,
+    fp8_grouped_backend: str = "triton_grouped",
+    fp8_block_size: int = 128,
+    swiglu_limit: float = 0.0,
+    gated: bool = True,
     **kwargs,
 ) -> torch.Tensor:
     """Forward pass using quack group GEMM kernels.
@@ -29,15 +37,22 @@ def quack_expert_forward(
         up_proj: Up projection weights ``[num_experts, hidden, intermediate]``.
         down_proj: Down projection weights ``[num_experts, intermediate, hidden]``.
         num_experts: Total number of experts.
-        hidden_act: Activation kind ("silu" or "gelu_tanh").
+        hidden_act: Activation kind ("silu", "gelu_tanh", or "clamped_swiglu").
         gate_up_proj: Optional pre-fused ``[num_experts, hidden, 2*intermediate]`` weight
-            (currently unused by the quack local path; accepted for interface parity).
+            used by the fused Quack local path.
+        gate_up_bias: Optional per-expert fused gate/up bias.
+        down_bias: Optional per-expert down projection bias.
+        fp8_compute: Use the experimental FP8 grouped GEMM path.
+        fp8_grouped_backend: FP8 grouped GEMM backend name.
+        fp8_block_size: FP8 quantization block size.
         **kwargs: Forwarded for forward compatibility; currently unused.
 
     Returns:
         Output tensor ``(num_tokens, hidden_dim)``.
     """
     del kwargs
+    if not gated:
+        raise NotImplementedError("quack backend does not support non-gated experts")
     return quack_moe_forward(
         module=None,
         num_experts=num_experts,
@@ -49,4 +64,11 @@ def quack_expert_forward(
         down_proj=down_proj,
         gate_up_proj=gate_up_proj,
         hidden_act=hidden_act,
+        activation_native=activation_native,
+        fp8_compute=fp8_compute,
+        fp8_grouped_backend=fp8_grouped_backend,
+        fp8_block_size=fp8_block_size,
+        gate_up_bias=gate_up_bias,
+        down_bias=down_bias,
+        swiglu_limit=swiglu_limit,
     )

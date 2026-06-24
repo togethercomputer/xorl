@@ -14,7 +14,7 @@ from xorl.ops.quantize.fp4_codec import FP4_E2M1_MAX, FP8_E4M3_MAX
 from xorl.qlora.modules.moe_experts import BlockFP8QLoRAMoeExperts, NvFP4QLoRAMoeExperts
 
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = [pytest.mark.gpu, pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")]
 
 DEVICE = torch.device("cuda")
 

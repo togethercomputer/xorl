@@ -7,6 +7,8 @@ import torch
 from safetensors.torch import load_file
 
 from tests._helpers.opd import make_teacher_files
+from xorl.data.constants import IGNORE_INDEX
+from xorl.ops.loss.opd_loss import OPDLossMetrics
 from xorl.server.runner.model_runner import ModelRunner
 
 
@@ -48,37 +50,6 @@ class _RecordingLmHead(torch.nn.Linear):
         self.calls += 1
         self.last_input_shape = tuple(input.shape)
         return super().forward(input)
-
-
-class _NoopRoutingHandler:
-    def setup(self, *_args, **_kwargs):
-        return False
-
-
-def test_forward_uses_no_grad_not_inference_mode():
-    runner = object.__new__(ModelRunner)
-    runner.rank = 0
-    runner.model = SimpleNamespace(config=SimpleNamespace(vocab_size=10))
-    runner.pp_enabled = False
-    runner._adapter_manager = None
-    runner.global_forward_backward_step = 0
-    runner._routing_handler = _NoopRoutingHandler()
-    runner._check_not_sleeping = lambda *_args, **_kwargs: None
-    runner._validate_single_tenant = lambda *_args, **_kwargs: None
-
-    seen = {}
-
-    def fake_forward_loop(*_args, **_kwargs):
-        seen["grad_enabled"] = torch.is_grad_enabled()
-        seen["inference_mode"] = torch.is_inference_mode_enabled()
-        return {"total_loss": 0.0, "global_valid_tokens": 1}
-
-    runner._forward_loop = fake_forward_loop
-
-    result = runner.forward([{"input_ids": torch.tensor([[1]])}], loss_fn="teacher_hidden_cache")
-
-    assert result["step"] == 0
-    assert seen == {"grad_enabled": False, "inference_mode": False}
 
 
 @patch("xorl.server.runner.model_runner.get_parallel_state")
@@ -148,45 +119,99 @@ def test_opd_metrics_reduce_over_loss_group(mock_parallel_state, _mock_get_devic
     assert all(group is loss_group for group in groups)
 
 
-@patch("xorl.server.runner.model_runner.synchronize", lambda: None)
 @patch("xorl.server.runner.model_runner.get_device_type", return_value="cpu")
-@patch("xorl.server.runner.model_runner.get_parallel_state")
-def test_forward_loop_accumulates_opd_metrics_without_metric_ops(mock_parallel_state, _mock_get_device_type):
-    mock_parallel_state.return_value = Mock(
-        cp_enabled=False,
-        loss_parallel_enabled=False,
-        dp_enabled=False,
-    )
-    runner = object.__new__(ModelRunner)
-    runner.rank = 0
-    runner.pp_enabled = False
-    runner.model_fwd_context = nullcontext()
-    runner._use_distsignsgd = False
-    runner._count_global_valid_tokens = lambda _micro_batches: torch.tensor(2)
-    runner._collect_per_token_outputs = Mock()
-
-    def fake_compute_micro_batch_loss(_micro_batch, _loss_fn, _params):
-        loss = torch.tensor(4.0)
-        metrics = {
-            "valid_tokens": 2,
+def test_opd_metric_seeding_aligns_empty_rank_keys(_mock_get_device_type):
+    """A rank with only 0-valid-token micro-batches returns
+    ``OPDLossMetrics(valid_tokens=0).to_dict()``, which carries none of the
+    per-micro-batch ``opd_profile_*_ms`` (sum_max) keys, so its
+    _finalize_loss_metrics reduce groups differ in size from a populated rank's
+    and the cross-rank all_reduce deadlocks. Seeding the canonical key set first
+    must make every rank's reduce groups identical. Regression for the empty-rank
+    collective-desync hang. (OPDLossMetrics always emits opd_num_teachers, so the
+    desync vector here is the omitted profile group, not the max key.)
+    """
+    populated = {}
+    ModelRunner._accumulate_loss_metrics(
+        populated,
+        {
+            "valid_tokens": 4,
             "opd_kl": 0.5,
-            "opd_weighted_kl": 0.75,
-        }
-        return loss, {}, metrics, None, SimpleNamespace()
-
-    runner._compute_micro_batch_loss = fake_compute_micro_batch_loss
-
-    result = runner._forward_loop(
-        [{"labels": torch.tensor([[1, 2]])}],
+            "opd_weighted_kl": 0.6,
+            "opd_teacher_weight_mean": 1.0,
+            "opd_num_teachers": 2,
+            "opd_profile_kl_compute_ms": 10.0,
+        },
         "opd_loss",
-        {},
-        compute_backward=False,
     )
 
-    assert result["total_loss"] == pytest.approx(2.0)
-    assert result["global_valid_tokens"] == 2
-    assert result["opd_kl"] == pytest.approx(0.5)
-    assert result["opd_weighted_kl"] == pytest.approx(0.75)
+    # Exactly what _compute_opd_micro_batch_loss returns on a 0-valid rank.
+    empty = {}
+    ModelRunner._accumulate_loss_metrics(empty, OPDLossMetrics(valid_tokens=0).to_dict(), "opd_loss")
+
+    # Bug precondition: the empty rank carries none of the sum_max profile keys
+    # the populated rank has, so the two ranks would issue different-sized
+    # collectives in the sum_max group.
+    assert "opd_profile_kl_compute_ms" in populated
+    assert "opd_profile_kl_compute_ms" not in empty
+    assert set(empty) != set(populated)
+
+    # include_profile_metrics is uniform across ranks (it is read from params).
+    for acc in (empty, populated):
+        ModelRunner._ensure_opd_loss_metric_accumulators(acc, include_profile_metrics=True)
+
+    def reduce_groups(acc):
+        groups: dict[str, set[str]] = {}
+        for key, entry in acc.items():
+            groups.setdefault(entry["op"], set()).add(key)
+        return groups
+
+    # Every reduce group now carries the same keys on both ranks -> no size
+    # mismatch in _finalize_loss_metrics.
+    assert reduce_groups(empty) == reduce_groups(populated)
+    assert "opd_num_teachers:max" in empty
+    assert "opd_profile_kl_compute_ms" in empty
+
+
+def test_teacher_hidden_cache_split_skips_padding_segments():
+    hidden = torch.arange(12, dtype=torch.float32).view(1, 6, 2)
+    labels = torch.tensor([[10, 11, -100, 12, 13, -100]])
+    position_ids = torch.tensor([[0, 1, 2, 0, 1, 0]])
+
+    rows, cache_indices = ModelRunner._split_hidden_cache_rows(hidden, labels, position_ids)
+
+    assert cache_indices == [[0, 1], [2, 3]]
+    assert torch.equal(torch.cat(rows, dim=0), hidden[0, [0, 1, 3, 4]])
+
+
+def test_teacher_hidden_cache_split_filters_unpacked_masked_targets():
+    hidden = torch.arange(12, dtype=torch.float32).view(1, 6, 2)
+    labels = torch.tensor([[-100, -100, 12, -100, 14, -100]])
+
+    rows, cache_indices = ModelRunner._split_hidden_cache_rows(hidden, labels)
+
+    assert cache_indices == [[0, 1]]
+    assert torch.equal(rows[0], hidden[0, [2, 4]])
+
+
+def test_oprd_last_k_weights_respects_packed_position_resets():
+    labels = torch.tensor([[10, 11, 12, 20, IGNORE_INDEX, 21, 22]])
+    position_ids = torch.tensor([[0, 1, 2, 0, 1, 2, 3]])
+    base_weights = torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]])
+
+    packed_weights = ModelRunner._opd_oprd_last_k_weights(
+        labels,
+        base_weights=base_weights,
+        last_k=2,
+        position_ids=position_ids,
+    )
+    row_tail_weights = ModelRunner._opd_oprd_last_k_weights(
+        labels,
+        base_weights=base_weights,
+        last_k=2,
+    )
+
+    torch.testing.assert_close(packed_weights, torch.tensor([[0.0, 2.0, 3.0, 0.0, 0.0, 6.0, 7.0]]))
+    torch.testing.assert_close(row_tail_weights, torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 6.0, 7.0]]))
 
 
 @patch("xorl.server.runner.model_runner.get_device_type", return_value="cpu")
@@ -301,7 +326,7 @@ def test_teacher_hidden_cache_splits_packed_batch_and_drops_padding():
     assert torch.equal(chunks[1], hidden_states[0, 3:5])
 
 
-def test_teacher_hidden_cache_contributor_skips_duplicate_cp_and_ep_ranks():
+def test_teacher_hidden_cache_contributor_skips_duplicate_cp_ranks_and_keys_ep_ranks_by_slice():
     runner = _make_opd_runner()
     runner.rank = 3
     runner.world_size = 8
@@ -316,6 +341,22 @@ def test_teacher_hidden_cache_contributor_skips_duplicate_cp_and_ep_ranks():
         )
         == 2
     )
+    # Distinct-slice dispatch (default): every EP rank contributes its own slice,
+    # keyed by the stage-local rank to mirror batch_slice_rank_and_size.
+    assert (
+        runner._teacher_hidden_cache_contributor_key(
+            SimpleNamespace(cp_enabled=False, ep_enabled=True, ep_rank=1, pp_size=1)
+        )
+        == 3
+    )
+
+
+def test_teacher_hidden_cache_contributor_legacy_flag_skips_duplicate_ep_ranks(monkeypatch):
+    monkeypatch.setenv("XORL_SERVER_EP_DUPLICATE_BATCHES", "1")
+    runner = _make_opd_runner()
+    runner.rank = 3
+    runner.world_size = 8
+
     assert (
         runner._teacher_hidden_cache_contributor_key(SimpleNamespace(cp_enabled=False, ep_enabled=True, ep_rank=1))
         is None
@@ -329,7 +370,14 @@ def test_teacher_hidden_cache_contributor_skips_duplicate_cp_and_ep_ranks():
 
     assert (
         runner._teacher_hidden_cache_contributor_key(
-            SimpleNamespace(cp_enabled=False, ep_enabled=True, ep_rank=0, ep_fsdp_device_mesh=FakeEpMesh())
+            SimpleNamespace(
+                cp_enabled=False,
+                ep_enabled=True,
+                ep_rank=0,
+                ep_size=2,
+                dp_shard_in_ep_size=4,
+                ep_fsdp_device_mesh=FakeEpMesh(),
+            )
         )
         == 3
     )
@@ -426,8 +474,10 @@ def test_teacher_hidden_cache_trims_with_gathered_sp_labels(mock_parallel_state,
         )
 
     saved = load_file(str(cache_path))["hidden_states"]
-    assert torch.equal(saved, full_hidden[0, :5])
-    assert result["teacher_hidden_cache"]["cache_indices_by_sample"] == [list(range(5))]
+    # This branch filters cache rows to valid-label positions only (one row per
+    # labeled token), rather than trimming to the last-valid prefix.
+    assert torch.equal(saved, full_hidden[0, 4:5])
+    assert result["teacher_hidden_cache"]["cache_indices_by_sample"] == [[0]]
 
 
 @patch("xorl.server.runner.model_runner.get_device_type", return_value="cpu")

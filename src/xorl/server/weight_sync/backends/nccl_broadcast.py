@@ -16,7 +16,7 @@ import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from threading import Thread
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple
@@ -35,8 +35,110 @@ from torch.distributed.distributed_c10d import (
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_FP8_CPU_H2D_CHUNK_BYTES = 8 * 1024 * 1024
+
 # Reusable session for HTTP connection pooling
 _http_session: Optional[requests.Session] = None
+
+
+def _nccl_broadcast_chunk_bytes() -> int:
+    value = os.environ.get("XORL_WEIGHT_SYNC_NCCL_CHUNK_BYTES")
+    if value is None or value == "":
+        return 0
+    try:
+        return max(0, int(value))
+    except ValueError:
+        logger.warning("Invalid XORL_WEIGHT_SYNC_NCCL_CHUNK_BYTES=%r; disabling NCCL chunking", value)
+        return 0
+
+
+def _fp8_cpu_h2d_chunk_bytes() -> int:
+    value = os.environ.get("XORL_WEIGHT_SYNC_FP8_CPU_H2D_CHUNK_BYTES")
+    if value is None or value == "":
+        return _DEFAULT_FP8_CPU_H2D_CHUNK_BYTES
+    try:
+        return max(0, int(value))
+    except ValueError:
+        logger.warning(
+            "Invalid XORL_WEIGHT_SYNC_FP8_CPU_H2D_CHUNK_BYTES=%r; using default %d",
+            value,
+            _DEFAULT_FP8_CPU_H2D_CHUNK_BYTES,
+        )
+        return _DEFAULT_FP8_CPU_H2D_CHUNK_BYTES
+
+
+def _sglang_load_format() -> str | None:
+    value = os.environ.get("XORL_WEIGHT_SYNC_SGLANG_LOAD_FORMAT")
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _receiver_load_format(load_format: str | None) -> str | None:
+    chunk_bytes = _nccl_broadcast_chunk_bytes()
+    if load_format == "direct" and chunk_bytes > 0:
+        return f"direct_chunked:{chunk_bytes}"
+    if load_format == "flattened_bucket" and chunk_bytes > 0:
+        return f"flattened_bucket_chunked:{chunk_bytes}"
+    return load_format
+
+
+def _is_direct_load_format(load_format: str | None) -> bool:
+    return load_format == "direct" or (load_format is not None and load_format.startswith("direct_chunked:"))
+
+
+def _is_flattened_bucket_load_format(load_format: str | None) -> bool:
+    return load_format == "flattened_bucket" or (
+        load_format is not None and load_format.startswith("flattened_bucket_chunked:")
+    )
+
+
+def _is_hybrid_flattened_load_format(load_format: str | None) -> bool:
+    return load_format == "hybrid_flattened"
+
+
+def _requires_stacked_qwen_loader(name: str) -> bool:
+    return any(
+        marker in name
+        for marker in (
+            ".self_attn.q_proj.",
+            ".self_attn.k_proj.",
+            ".self_attn.v_proj.",
+            ".mlp.gate_proj.",
+            ".mlp.up_proj.",
+        )
+    )
+
+
+def _reinit_per_bucket() -> bool:
+    return os.environ.get("XORL_WEIGHT_SYNC_REINIT_PER_BUCKET", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _wait_after_receiver() -> bool:
+    return os.environ.get("XORL_WEIGHT_SYNC_WAIT_AFTER_RECEIVER", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _use_two_phase_update() -> bool:
+    return os.environ.get("XORL_WEIGHT_SYNC_NCCL_TWO_PHASE", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _sync_after_waited_broadcast() -> bool:
+    return os.environ.get("XORL_WEIGHT_SYNC_NCCL_SYNC_AFTER_WAIT", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _hold_receiver_fenced_refs() -> bool:
+    return os.environ.get("XORL_WEIGHT_SYNC_HOLD_RECEIVER_FENCED_REFS", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _get_http_session() -> requests.Session:
@@ -55,19 +157,6 @@ def _get_http_session() -> requests.Session:
     return _http_session
 
 
-def _ws_port(endpoint: "EndpointInfo") -> int:
-    """Weight-sync receiver port for an endpoint.
-
-    XORL_WEIGHT_SYNC_PORT overrides the endpoint's serving port so the
-    init/update/destroy HTTP calls can target a sidecar receiver process
-    (which receives the NCCL broadcast and hands tensors to the inference
-    server via /update_weights_from_tensor) while generation traffic and
-    pause/resume keep using the real serving port.
-    """
-    override = os.environ.get("XORL_WEIGHT_SYNC_PORT")
-    return int(override) if override else endpoint.port
-
-
 @dataclass
 class EndpointInfo:
     """Information about an inference endpoint."""
@@ -75,6 +164,23 @@ class EndpointInfo:
     host: str
     port: int
     world_size: int  # tensor_parallel_size for this endpoint
+
+
+def _endpoint_update_result(endpoint: EndpointInfo, body: Dict[str, Any]) -> Dict[str, Any]:
+    result = {
+        "host": endpoint.host,
+        "port": endpoint.port,
+        "endpoint": f"{endpoint.host}:{endpoint.port}",
+        "success": body.get("success", False),
+        "message": body.get("message", ""),
+    }
+    cache_epoch = body["cache_epoch"] if "cache_epoch" in body else body.get("cache_version")
+    if cache_epoch is not None:
+        result["cache_epoch"] = cache_epoch
+    for key in ("fp8_kv_cache_postprocess_ran", "fp8_kv_cache_static_scales_updated"):
+        if key in body:
+            result[key] = body[key]
+    return result
 
 
 @dataclass
@@ -112,6 +218,10 @@ class NCCLWeightSynchronizer:
         group_name: str = "weight_sync_group",
         buffer_size_mb: int = 1024,
         device: str = "cuda:0",
+        run_post_process_weights: bool = False,
+        fp8_kv_cache_enabled: bool = False,
+        fp8_kv_cache_postprocess_required: bool = False,
+        fp8_kv_cache_static_scales: bool = False,
     ):
         """
         Initialize the weight synchronizer.
@@ -130,6 +240,10 @@ class NCCLWeightSynchronizer:
         self.group_name = group_name
         self.buffer_size_bytes = buffer_size_mb * 1024 * 1024
         self.device = device
+        self.run_post_process_weights = run_post_process_weights
+        self.fp8_kv_cache_enabled = fp8_kv_cache_enabled
+        self.fp8_kv_cache_postprocess_required = fp8_kv_cache_postprocess_required
+        self.fp8_kv_cache_static_scales = fp8_kv_cache_static_scales
 
         # Calculate world size: 1 (training) + sum of all endpoint world_sizes
         self.world_size = 1 + sum(ep.world_size for ep in endpoints)
@@ -139,11 +253,12 @@ class NCCLWeightSynchronizer:
         self._training_raw_store = None
         self._training_prefix_store = None
         self._active_master_port = master_port
+        self._receiver_fenced_refs: list[tuple[Any, torch.Tensor, torch.Tensor | None]] = []
 
         logger.info(
             f"NCCLWeightSynchronizer initialized: "
             f"endpoints={len(endpoints)}, world_size={self.world_size}, "
-            f"master={master_address}:{master_port}"
+            f"master={master_address}:{master_port}, two_phase={_use_two_phase_update()}"
         )
 
     # ========================================================================
@@ -249,10 +364,7 @@ class NCCLWeightSynchronizer:
         else:
             pg_options_param_name = "pg_options"
 
-        # Use eager NCCL init (device_id). This works correctly for 2-node
-        # cross-node setup (IB network, no CUDA visibility issues).
-        # Was broken on same-node split CUDA_VISIBLE_DEVICES due to sglang's
-        # internal TP broadcast deadlock; 2-node avoids that entirely.
+        # Set CUDA device and pass device_id for proper NCCL comm initialization
         torch.cuda.set_device(self.device)
         device_id = torch.device(self.device)
 
@@ -398,6 +510,10 @@ class NCCLWeightSynchronizer:
             self.process_group = None
 
         self._cleanup_training_store()
+        held_refs = len(self._receiver_fenced_refs)
+        self._receiver_fenced_refs.clear()
+        if held_refs:
+            logger.info("[Training] Released %d receiver-fenced broadcast reference(s)", held_refs)
 
     # ========================================================================
     # Inference endpoint management
@@ -415,7 +531,7 @@ class NCCLWeightSynchronizer:
         session = _get_http_session()
 
         def init_single(rank_offset: int, endpoint: EndpointInfo) -> Dict[str, Any]:
-            url = f"http://{endpoint.host}:{_ws_port(endpoint)}/init_weights_update_group"
+            url = f"http://{endpoint.host}:{endpoint.port}/init_weights_update_group"
             payload = {
                 "master_address": self.master_address,
                 "master_port": self._active_master_port,
@@ -471,7 +587,7 @@ class NCCLWeightSynchronizer:
         session = _get_http_session()
 
         def destroy_single(endpoint: EndpointInfo) -> Dict[str, Any]:
-            url = f"http://{endpoint.host}:{_ws_port(endpoint)}/destroy_weights_update_group"
+            url = f"http://{endpoint.host}:{endpoint.port}/destroy_weights_update_group"
             payload = {"group_name": self.group_name}
             try:
                 response = session.post(url, json=payload, timeout=30)
@@ -556,7 +672,7 @@ class NCCLWeightSynchronizer:
 
     def pause_inference_endpoints(
         self,
-        pause_mode: str = "in_place",
+        pause_mode: str = "retract",
         max_retries: int = 3,
         retry_delay_seconds: float = 1.0,
     ) -> Tuple[List[Dict[str, Any]], bool]:
@@ -657,92 +773,240 @@ class NCCLWeightSynchronizer:
         dtypes = [str(param.dtype).replace("torch.", "") for _, param in bucket]
         shapes = [list(param.shape) for _, param in bucket]
         logger.info(f"[Training] Bucket param names: {names[:5]}{'...' if len(names) > 5 else ''}")
+        load_format = _sglang_load_format()
+        receiver_load_format = _receiver_load_format(load_format)
+        if _is_direct_load_format(receiver_load_format) and any(
+            endpoint.world_size != 1 for endpoint in self.endpoints
+        ):
+            raise RuntimeError("XORL_WEIGHT_SYNC_SGLANG_LOAD_FORMAT=direct requires SGLang world_size=1")
+        if receiver_load_format is not None:
+            logger.info("[Training] Receiver load_format=%s", receiver_load_format)
 
         # Results container - use list for thread-safe appends
         update_errors = []
         update_results = []
         session = _get_http_session()
+        two_phase = _use_two_phase_update()
+        if two_phase and _is_hybrid_flattened_load_format(receiver_load_format):
+            raise RuntimeError("XORL_WEIGHT_SYNC_NCCL_TWO_PHASE=1 does not support hybrid_flattened load_format")
+        if two_phase and _is_direct_load_format(receiver_load_format) and _nccl_broadcast_chunk_bytes() > 0:
+            raise RuntimeError("XORL_WEIGHT_SYNC_NCCL_TWO_PHASE=1 does not support direct_chunked load_format")
+
+        def prepare_single_endpoint(endpoint: EndpointInfo) -> Dict[str, Any]:
+            """Ask one endpoint to start its background NCCL recv thread."""
+            payload = {
+                "names": names,
+                "dtypes": dtypes,
+                "shapes": shapes,
+                "group_name": self.group_name,
+                "transport": "nccl_broadcast",
+            }
+            if receiver_load_format is not None:
+                payload["load_format"] = receiver_load_format
+            url = f"http://{endpoint.host}:{endpoint.port}/prepare_weights_update"
+            try:
+                response = session.post(url, json=payload, timeout=600)
+                result = response.json()
+                return _endpoint_update_result(endpoint, result)
+            except Exception as e:
+                return {
+                    "host": endpoint.host,
+                    "port": endpoint.port,
+                    "endpoint": f"{endpoint.host}:{endpoint.port}",
+                    "success": False,
+                    "message": str(e),
+                }
+
+        def complete_single_endpoint(endpoint: EndpointInfo) -> Dict[str, Any]:
+            """Ask one endpoint to apply the weights received by the background thread."""
+            payload = {
+                "group_name": self.group_name,
+                "flush_cache": flush_cache,
+                "weight_version": weight_version,
+                "transport": "nccl_broadcast",
+                "run_post_process_weights": self.run_post_process_weights,
+            }
+            for key, value in (
+                ("fp8_kv_cache_enabled", self.fp8_kv_cache_enabled),
+                ("fp8_kv_cache_postprocess_required", self.fp8_kv_cache_postprocess_required),
+                ("fp8_kv_cache_static_scales", self.fp8_kv_cache_static_scales),
+            ):
+                if value:
+                    payload[key] = True
+            if receiver_load_format is not None:
+                payload["load_format"] = receiver_load_format
+            url = f"http://{endpoint.host}:{endpoint.port}/complete_weights_update"
+            try:
+                response = session.post(url, json=payload, timeout=600)
+                result = response.json()
+                return _endpoint_update_result(endpoint, result)
+            except Exception as e:
+                return {
+                    "host": endpoint.host,
+                    "port": endpoint.port,
+                    "endpoint": f"{endpoint.host}:{endpoint.port}",
+                    "success": False,
+                    "message": str(e),
+                }
 
         def call_single_endpoint(endpoint: EndpointInfo, endpoint_idx: int):
             """Call update_weights_from_distributed on a single endpoint."""
             try:
-                logger.info(f"[Training] HTTP thread: posting update_weights to {endpoint.host}:{endpoint.port}")
+                payload = {
+                    "names": names,
+                    "dtypes": dtypes,
+                    "shapes": shapes,
+                    "group_name": self.group_name,
+                    "flush_cache": flush_cache,
+                    "weight_version": weight_version,
+                }
+                if receiver_load_format is not None:
+                    payload["load_format"] = receiver_load_format
                 response = session.post(
-                    f"http://{endpoint.host}:{_ws_port(endpoint)}/update_weights_from_distributed",
-                    json={
-                        "names": names,
-                        "dtypes": dtypes,
-                        "shapes": shapes,
-                        "group_name": self.group_name,
-                        "flush_cache": flush_cache,
-                        "weight_version": weight_version,
-                    },
+                    f"http://{endpoint.host}:{endpoint.port}/update_weights_from_distributed",
+                    json=payload,
                     timeout=600,
                 )
                 result = response.json()
-                update_results.append(
-                    {
-                        "endpoint": f"{endpoint.host}:{endpoint.port}",
-                        "success": result.get("success", False),
-                        "message": result.get("message", ""),
-                    }
-                )
+                update_results.append(_endpoint_update_result(endpoint, result))
                 if not result.get("success"):
                     update_errors.append(f"API failed on {endpoint.host}:{endpoint.port}: {result}")
             except Exception as e:
-                logger.error(f"[Training] HTTP thread failed for {endpoint.host}:{endpoint.port}: {e}")
                 update_errors.append(f"Exception calling {endpoint.host}:{endpoint.port}: {e}")
 
-        # Start API calls in parallel threads (one per endpoint)
-        api_threads = []
-        for i, endpoint in enumerate(self.endpoints):
-            t = Thread(target=call_single_endpoint, args=(endpoint, i))
-            t.start()
-            api_threads.append(t)
+        if two_phase:
+            logger.info("[Training] Preparing two-phase NCCL receiver update...")
+            with ThreadPoolExecutor(max_workers=len(self.endpoints)) as executor:
+                prepare_results = list(executor.map(prepare_single_endpoint, self.endpoints))
+            update_results.extend(prepare_results)
+            update_errors.extend(
+                f"Prepare failed on {result['endpoint']}: {result}"
+                for result in prepare_results
+                if not result["success"]
+            )
+            if update_errors:
+                raise RuntimeError(f"Weight update prepare failed: {update_errors}")
 
-        # Fail fast if the HTTP request errored immediately (connection
-        # refused etc.). Without this check, dist.broadcast below blocks
-        # forever waiting for receivers that were never notified.
-        time.sleep(0.5)
-        if update_errors:
-            for t in api_threads:
-                t.join(timeout=5)
-            raise RuntimeError(f"update_weights HTTP failed before broadcast: {update_errors}")
+        # Start API calls in parallel threads (one per endpoint) for the legacy
+        # single-phase path. The two-phase path has already prepared receiver
+        # background threads above and will call /complete_weights_update after
+        # the sender broadcasts.
+        api_threads = []
+        if not two_phase:
+            for i, endpoint in enumerate(self.endpoints):
+                t = Thread(target=call_single_endpoint, args=(endpoint, i))
+                t.start()
+                api_threads.append(t)
 
         # Set device once for all operations
         torch.cuda.set_device(self.device)
 
-        # Broadcast each tensor synchronously.
-        # dist.broadcast blocks until ALL ranks in the group participate,
-        # so this naturally waits for SGLang to start its NCCL recv
-        # (no sleep/timing hacks needed).
-        for i, (name, param) in enumerate(bucket):
-            if i == 0:
+        # Broadcast each tensor. Direct receivers must fence the sender while
+        # the peer is still executing the matching HTTP update call. Deferring
+        # sender Work.wait() until after the receiver response can hang in NCCL,
+        # while skipping the sender fence can leave corrupted receiver weights
+        # when the group is aborted.
+        deferred_broadcast_refs: list[tuple[Any, torch.Tensor, torch.Tensor | None]] = []
+        flattened_refs: list[torch.Tensor | None] = []
+        if _is_hybrid_flattened_load_format(receiver_load_format):
+            direct_bucket = [(name, param) for name, param in bucket if not _requires_stacked_qwen_loader(name)]
+            flattened_bucket_items = [(name, param) for name, param in bucket if _requires_stacked_qwen_loader(name)]
+            logger.info(
+                "[Training] Hybrid flattened bucket: direct=%d flattened=%d",
+                len(direct_bucket),
+                len(flattened_bucket_items),
+            )
+            for name, param in direct_bucket:
+                staging_ref = None
+                if param.device.type == "cpu":
+                    param_data, staging_ref = self._stage_cpu_tensor_for_broadcast(param)
+                else:
+                    param_data = param.to(self.device).contiguous()
                 logger.info(
-                    f"[Training] First param: name={name}, shape={param.shape}, "
-                    f"dtype={param.dtype}, device={param.device}"
+                    "[Training] Hybrid direct tensor start: name=%s shape=%s dtype=%s nbytes=%d",
+                    name,
+                    list(param_data.shape),
+                    param_data.dtype,
+                    param_data.nbytes,
                 )
-            # Ensure tensor is on the right device and contiguous
-            if param.device.type == "cpu":
-                param_data = param.to(self.device, non_blocking=True).contiguous()
-            else:
-                param_data = param.to(self.device).contiguous()
+                deferred_works = self._broadcast_tensor(name, param_data, wait=True)
+                if deferred_works:
+                    deferred_broadcast_refs.extend((work, param_data, staging_ref) for work in deferred_works)
+                    logger.info("[Training] Hybrid direct tensor enqueued: name=%s", name)
+                else:
+                    logger.info("[Training] Hybrid direct tensor done: name=%s", name)
+                    del staging_ref
+            if flattened_bucket_items:
+                flattened_bucket, flattened_refs = self._flatten_bucket_for_broadcast(flattened_bucket_items)
+                logger.info(
+                    "[Training] Hybrid flattened fallback broadcast start: params=%d nbytes=%d",
+                    len(flattened_bucket_items),
+                    flattened_bucket.nbytes,
+                )
+                deferred_works = self._broadcast_tensor("hybrid_flattened_fallback", flattened_bucket, wait=False)
+                if deferred_works:
+                    deferred_broadcast_refs.extend((work, flattened_bucket, None) for work in deferred_works)
+                    logger.info(
+                        "[Training] Hybrid flattened fallback broadcast enqueued: params=%d",
+                        len(flattened_bucket_items),
+                    )
+                else:
+                    logger.info(
+                        "[Training] Hybrid flattened fallback broadcast done: params=%d",
+                        len(flattened_bucket_items),
+                    )
+        elif _is_flattened_bucket_load_format(receiver_load_format):
+            flattened_bucket, flattened_refs = self._flatten_bucket_for_broadcast(bucket)
+            logger.info(
+                "[Training] Flattened bucket broadcast start: params=%d nbytes=%d",
+                len(bucket),
+                flattened_bucket.nbytes,
+            )
+            self._broadcast_tensor("flattened_bucket", flattened_bucket, wait=True)
+            logger.info("[Training] Flattened bucket broadcast done: params=%d", len(bucket))
+        else:
+            for i, (name, param) in enumerate(bucket):
+                if i == 0:
+                    logger.info(
+                        f"[Training] First param: name={name}, shape={param.shape}, "
+                        f"dtype={param.dtype}, device={param.device}"
+                    )
+                # Ensure tensor is on the right device and contiguous
+                staging_ref = None
+                if param.device.type == "cpu":
+                    param_data, staging_ref = self._stage_cpu_tensor_for_broadcast(param)
+                else:
+                    param_data = param.to(self.device).contiguous()
 
-            dist.broadcast(param_data, src=0, group=self.process_group)
+                logger.info(
+                    "[Training] Broadcast tensor start: name=%s shape=%s dtype=%s nbytes=%d",
+                    name,
+                    list(param_data.shape),
+                    param_data.dtype,
+                    param_data.nbytes,
+                )
+                deferred_works = self._broadcast_tensor(name, param_data, wait=True)
+                if deferred_works:
+                    deferred_broadcast_refs.extend((work, param_data, staging_ref) for work in deferred_works)
+                    logger.info("[Training] Broadcast tensor enqueued: name=%s", name)
+                else:
+                    logger.info("[Training] Broadcast tensor done: name=%s", name)
+                    del staging_ref
 
-        # Force CUDA stream to finish so receiver-side handle.wait() can
-        # actually progress; without this, dist.broadcast can return at the
-        # Python level while the NCCL kernel is still queued on the stream,
-        # which leaves sglang blocked in update_weights_from_distributed and
-        # the api_threads below hung waiting for the 200 OK.
-        if (isinstance(self.device, torch.device) and self.device.type == "cuda") or (
-            isinstance(self.device, str) and self.device.startswith("cuda")
-        ):
-            torch.cuda.synchronize(self.device)
-
-        # Wait for all API calls to complete
-        for t in api_threads:
-            t.join()
+        if two_phase:
+            logger.info("[Training] Completing two-phase NCCL receiver update...")
+            with ThreadPoolExecutor(max_workers=len(self.endpoints)) as executor:
+                complete_results = list(executor.map(complete_single_endpoint, self.endpoints))
+            update_results = complete_results
+            update_errors.extend(
+                f"Complete failed on {result['endpoint']}: {result}"
+                for result in complete_results
+                if not result["success"]
+            )
+        else:
+            # Wait for all API calls to complete
+            for t in api_threads:
+                t.join()
 
         # Check for errors
         if update_errors:
@@ -753,7 +1017,143 @@ class NCCLWeightSynchronizer:
             if not r["success"]:
                 raise RuntimeError(f"Weight update failed: {r}")
 
+        if deferred_broadcast_refs:
+            if _wait_after_receiver():
+                logger.info(
+                    "[Training] Waiting on %d receiver-fenced broadcast work handle(s) after receiver completion",
+                    len(deferred_broadcast_refs),
+                )
+                for work, _, _ in deferred_broadcast_refs:
+                    work.wait()
+            elif _hold_receiver_fenced_refs():
+                logger.info(
+                    "[Training] Holding %d receiver-fenced broadcast reference(s) until NCCL group teardown",
+                    len(deferred_broadcast_refs),
+                )
+                self._receiver_fenced_refs.extend(deferred_broadcast_refs)
+            logger.info(
+                "[Training] Receiver completed %d receiver-fenced broadcast(s)",
+                len(deferred_broadcast_refs),
+            )
+            deferred_broadcast_refs.clear()
+        flattened_refs.clear()
+
         return update_results
+
+    def _flatten_bucket_for_broadcast(
+        self,
+        bucket: List[Tuple[str, torch.Tensor]],
+    ) -> tuple[torch.Tensor, list[torch.Tensor | None]]:
+        flattened_parts: list[torch.Tensor] = []
+        refs: list[torch.Tensor | None] = []
+        for name, param in bucket:
+            if param.device.type == "cpu":
+                param_data, staging_ref = self._stage_cpu_tensor_for_broadcast(param)
+            else:
+                param_data = param.to(self.device).contiguous()
+                staging_ref = None
+            logger.info(
+                "[Training] Flatten part: name=%s shape=%s dtype=%s nbytes=%d",
+                name,
+                list(param_data.shape),
+                param_data.dtype,
+                param_data.nbytes,
+            )
+            flattened_parts.append(param_data.flatten().view(torch.uint8))
+            refs.extend((param_data, staging_ref))
+
+        return torch.cat(flattened_parts, dim=0), refs
+
+    def _broadcast_tensor(self, name: str, tensor: torch.Tensor, *, wait: bool = True) -> list[Any]:
+        transfer_tensor = tensor
+        if tensor.dtype in {torch.float8_e4m3fn, torch.float8_e5m2}:
+            transfer_tensor = tensor.view(torch.uint8).reshape(-1)
+            logger.info("[Training] Broadcasting FP8 tensor as uint8 payload: name=%s", name)
+
+        chunk_bytes = _nccl_broadcast_chunk_bytes()
+        if chunk_bytes <= 0 or transfer_tensor.nbytes <= chunk_bytes:
+            work = dist.broadcast(transfer_tensor, src=0, group=self.process_group, async_op=True)
+            if wait:
+                work.wait()
+                self._synchronize_waited_broadcast(name)
+                return []
+            return [work]
+
+        if not transfer_tensor.is_contiguous():
+            raise RuntimeError("NCCL chunked broadcast requires a contiguous tensor")
+        tensor_flat = transfer_tensor.reshape(-1)
+        chunk_elems = max(1, chunk_bytes // transfer_tensor.element_size())
+        chunks = (tensor_flat.numel() + chunk_elems - 1) // chunk_elems
+        logger.info(
+            "[Training] Chunked NCCL broadcast: name=%s nbytes=%d chunk_bytes=%d chunks=%d",
+            name,
+            transfer_tensor.nbytes,
+            chunk_bytes,
+            chunks,
+        )
+        deferred_works = []
+        for start in range(0, tensor_flat.numel(), chunk_elems):
+            end = min(start + chunk_elems, tensor_flat.numel())
+            work = dist.broadcast(tensor_flat[start:end], src=0, group=self.process_group, async_op=True)
+            if wait:
+                work.wait()
+            else:
+                deferred_works.append(work)
+        if wait:
+            self._synchronize_waited_broadcast(name)
+        return deferred_works
+
+    def _synchronize_waited_broadcast(self, name: str) -> None:
+        device = torch.device(self.device)
+        if not _sync_after_waited_broadcast() or device.type != "cuda":
+            return
+        logger.debug("[Training] CUDA synchronize after waited NCCL broadcast start: name=%s", name)
+        torch.cuda.synchronize(device)
+        logger.debug("[Training] CUDA synchronize after waited NCCL broadcast done: name=%s", name)
+
+    def _stage_cpu_tensor_for_broadcast(self, param: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Move a CPU tensor to the NCCL device.
+
+        FP8 tensors are staged as raw bytes so the exact payload is preserved.
+        Other CPU tensors use the same async staging discipline to avoid host
+        synchronizations between long FP8 transfer streams.
+        """
+        contiguous = param.contiguous()
+        async_h2d = os.environ.get("XORL_WEIGHT_SYNC_FP8_CPU_H2D_ASYNC", "1") != "0"
+        copy_stream = torch.cuda.Stream(device=self.device) if async_h2d else None
+        stream_context = torch.cuda.stream(copy_stream) if copy_stream is not None else nullcontext()
+
+        if param.dtype in {torch.float8_e4m3fn, torch.float8_e5m2}:
+            cpu_source = contiguous.view(torch.uint8).reshape(-1)
+            if torch.cuda.is_available() and os.environ.get("XORL_WEIGHT_SYNC_PIN_FP8_CPU_BYTES", "1") != "0":
+                cpu_source = cpu_source.pin_memory()
+
+            cuda_bytes = torch.empty(cpu_source.numel(), dtype=torch.uint8, device=self.device)
+            chunk_bytes = _fp8_cpu_h2d_chunk_bytes()
+            with stream_context:
+                if chunk_bytes == 0 or cpu_source.numel() <= chunk_bytes:
+                    cuda_bytes.copy_(cpu_source, non_blocking=async_h2d)
+                else:
+                    for start in range(0, cpu_source.numel(), chunk_bytes):
+                        end = min(start + chunk_bytes, cpu_source.numel())
+                        cuda_bytes[start:end].copy_(cpu_source[start:end], non_blocking=async_h2d)
+            cuda_tensor = cuda_bytes.view(param.dtype).reshape(contiguous.shape)
+        else:
+            cpu_source = contiguous
+            if async_h2d and torch.cuda.is_available():
+                cpu_source = cpu_source.pin_memory()
+
+            cuda_tensor = torch.empty_like(contiguous, device=self.device)
+            with stream_context:
+                cuda_tensor.copy_(cpu_source, non_blocking=async_h2d)
+
+        if copy_stream is not None:
+            event = torch.cuda.Event()
+            event.record(copy_stream)
+            torch.cuda.current_stream(self.device).wait_event(event)
+            return cuda_tensor, cpu_source
+
+        return cuda_tensor, None
 
     def sync_weights(
         self,
@@ -919,17 +1319,28 @@ class NCCLBroadcastBackend(WeightTransportBackend):
         super().__init__(config)
         self._synchronizer: Optional[NCCLWeightSynchronizer] = None
         self._process_group = None
+        self._reinit_generation = 0
 
     def initialize(self) -> bool:
         cfg = self.config
+        group_name = cfg.group_name
+        if _reinit_per_bucket():
+            self._reinit_generation += 1
+            group_name = f"{cfg.group_name}_rb{self._reinit_generation}"
         ep_infos = [EndpointInfo(host=e.host, port=e.port, world_size=e.world_size) for e in cfg.endpoints]
         self._synchronizer = NCCLWeightSynchronizer(
             endpoints=ep_infos,
             master_address=cfg.master_address,
             master_port=cfg.master_port,
-            group_name=cfg.group_name,
+            group_name=group_name,
             buffer_size_mb=cfg.buffer_size_mb,
             device=cfg.device,
+            run_post_process_weights=bool(cfg.backend_config.get("run_post_process_weights", False)),
+            fp8_kv_cache_enabled=bool(cfg.backend_config.get("fp8_kv_cache_enabled", False)),
+            fp8_kv_cache_postprocess_required=bool(
+                cfg.backend_config.get("fp8_kv_cache_postprocess_required", False)
+            ),
+            fp8_kv_cache_static_scales=bool(cfg.backend_config.get("fp8_kv_cache_static_scales", False)),
         )
         logger.info(f"[NCCLBroadcast] Initializing NCCL sync group ({len(ep_infos)} endpoints, device={cfg.device})")
         ok = self._synchronizer.init_nccl_group()
@@ -958,12 +1369,20 @@ class NCCLBroadcastBackend(WeightTransportBackend):
         if src_rank != 0:
             raise ValueError(f"NCCLBroadcastBackend only supports src_rank=0, got {src_rank}")
         if self._synchronizer is None:
-            raise RuntimeError("Backend not initialized — call initialize() first")
-        self._synchronizer._transfer_single_bucket(
-            bucket,
-            flush_cache=flush_cache,
-            weight_version=weight_version,
-        )
+            if not _reinit_per_bucket():
+                raise RuntimeError("Backend not initialized — call initialize() first")
+            if not self.initialize():
+                raise RuntimeError("Failed to initialize NCCL backend for transfer bucket")
+        try:
+            self.endpoint_results = self._synchronizer._transfer_single_bucket(
+                bucket,
+                flush_cache=flush_cache,
+                weight_version=weight_version,
+            )
+        finally:
+            if _reinit_per_bucket():
+                logger.info("[NCCLBroadcast] Reinitializing per bucket: destroying NCCL sync group after transfer")
+                self.destroy()
 
     @property
     def sender_ranks(self) -> FrozenSet[int]:

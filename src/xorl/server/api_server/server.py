@@ -297,6 +297,7 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
                             data=elementwise_loss, dtype="float32", shape=[len(elementwise_loss)]
                         ),
                         k3=k3_val,
+                        token_diagnostics=sample.get("token_diagnostics"),
                     )
                 )
             return outputs, "CrossEntropyLossReturn"
@@ -310,13 +311,14 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
 
     @staticmethod
     def _build_info(result: Dict[str, Any]) -> Dict[str, Any]:
-        """Extract auto-load info from engine result."""
+        """Extract non-loss metadata from engine result."""
         info: Dict[str, Any] = {}
         if result.get("auto_loaded"):
-            info["auto_loaded"] = True
-            info["auto_load_path"] = result.get("auto_load_path")
-        if "teacher_hidden_cache" in result:
+            info.update({"auto_loaded": True, "auto_load_path": result.get("auto_load_path")})
+        if result.get("teacher_hidden_cache"):
             info["teacher_hidden_cache"] = result["teacher_hidden_cache"]
+        if result.get("sparse_delta_capture"):
+            info["sparse_delta_capture"] = result["sparse_delta_capture"]
         return info
 
     async def _cleanup_session(self, model_id: str, *, notify_workers: bool = True) -> None:
@@ -513,6 +515,11 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
 
         self._running = False
         logger.info("APIServer stopped")
+
+
+# ============================================================================
+# Global API Server Instance
+# ============================================================================
 
 
 @asynccontextmanager

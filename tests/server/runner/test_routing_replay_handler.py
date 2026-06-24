@@ -1,5 +1,7 @@
+import base64
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 
 from xorl.server.runner.utils import routing_replay_handler as rrh
@@ -137,3 +139,48 @@ def test_routing_truncates_excess_to_micro_batch_size(monkeypatch):
 
     assert per_mb[0].shape == (3, 1, 2)
     assert per_mb[0][:, 0, 0].tolist() == [0, 1, 2]
+
+
+# --- SGLang routed_experts decode contract (Lever 2 shared-selection K3) ---
+# These lock the exact wire format the K3 harness now relies on: SGLang exports
+# return_routed_experts as base64 int32 with shape (tokens, layers, top_k), and
+# RoutingReplayHandler must decode it without corruption before record(). A
+# silent decode mismatch here would make a shared-selection K3 replay garbage
+# expert selections, so this is validated on CPU before spending GPU capacity.
+
+
+def test_decode_routed_experts_sglang_dict_base64_int32_format():
+    handler = _handler()
+    arr = np.arange(3 * 2 * 8, dtype=np.int32).reshape(3, 2, 8)
+    item = {"data": base64.b64encode(arr.tobytes()).decode("ascii"), "shape": [3, 2, 8]}
+
+    decoded = handler.decode_routed_experts_item(item, num_moe_layers=2)
+
+    assert decoded == arr.tolist()
+
+
+def test_decode_routed_experts_base64_string_infers_shape_from_model_topk():
+    model = SimpleNamespace(config=SimpleNamespace(num_experts_per_tok=8))
+    handler = rrh.RoutingReplayHandler(model)
+    assert handler._model_topk == 8
+    arr = np.arange(4 * 2 * 8, dtype=np.int32).reshape(4, 2, 8)
+    b64 = base64.b64encode(arr.tobytes()).decode("ascii")
+
+    decoded = handler.decode_routed_experts_item(b64, num_moe_layers=2)
+
+    assert decoded == arr.tolist()
+
+
+def test_decode_routed_experts_nested_list_passthrough():
+    handler = _handler()
+    nested = [[[1, 2], [3, 4]], [[5, 6], [7, 8]]]
+
+    assert handler.decode_routed_experts_item(nested, num_moe_layers=2) == nested
+
+
+def test_decode_routed_experts_topk_extracted_from_nested_text_config():
+    # Qwen3.6 nests num_experts_per_tok under text_config; the handler must read
+    # it there so shape inference does not mispick top-k from row 0.
+    model = SimpleNamespace(config=SimpleNamespace(text_config=SimpleNamespace(num_experts_per_tok=8)))
+
+    assert rrh.RoutingReplayHandler(model)._model_topk == 8

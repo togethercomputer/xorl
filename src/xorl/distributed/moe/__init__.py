@@ -33,6 +33,7 @@ def __getattr__(name):
         "DeepEPBuffer",
         "DEEPEP_AVAILABLE",
         "token_pre_dispatch",
+        "token_pre_dispatch_no_permute",
         "tokens_post_combine",
         "get_default_buffer",
         "destroy_default_buffer",
@@ -43,6 +44,7 @@ def __getattr__(name):
             destroy_default_buffer,
             get_default_buffer,
             token_pre_dispatch,
+            token_pre_dispatch_no_permute,
             tokens_post_combine,
         )
 
@@ -51,6 +53,7 @@ def __getattr__(name):
                 "DeepEPBuffer": DeepEPBuffer,
                 "DEEPEP_AVAILABLE": DEEPEP_AVAILABLE,
                 "token_pre_dispatch": token_pre_dispatch,
+                "token_pre_dispatch_no_permute": token_pre_dispatch_no_permute,
                 "tokens_post_combine": tokens_post_combine,
                 "get_default_buffer": get_default_buffer,
                 "destroy_default_buffer": destroy_default_buffer,
@@ -72,6 +75,7 @@ __all__ = [
     "DeepEPBuffer",
     "DEEPEP_AVAILABLE",
     "token_pre_dispatch",
+    "token_pre_dispatch_no_permute",
     "tokens_post_combine",
     "get_default_buffer",
     "destroy_default_buffer",

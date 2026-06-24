@@ -18,7 +18,7 @@ from xorl.models.layers.moe import MoEExpertsLoRA, MoELoRAConfig
 from xorl.models.transformers.qwen3_moe.parallelize import get_ep_plan
 
 
-pytestmark = [pytest.mark.distributed]
+pytestmark = [pytest.mark.distributed, pytest.mark.gpu]
 
 
 class MockConfig:

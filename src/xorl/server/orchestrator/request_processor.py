@@ -66,6 +66,9 @@ from xorl.server.protocol.operations import (
 logger = logging.getLogger(__name__)
 
 
+FORWARD_BACKWARD_RESULT_PREFIXES = ("forward_backward_",)
+
+
 # ============================================================================
 # RequestProcessor Class
 # ============================================================================
@@ -87,6 +90,9 @@ class RequestProcessor:
         enable_packing: bool = True,
         pad_to_multiple_of: int = 128,
         cp_size: int = 1,
+        packing_strategy: str = "sequential",
+        on_oversized: str = "error",
+        dp_size: int = 1,
     ):
         """
         Initialize RequestProcessor.
@@ -99,12 +105,20 @@ class RequestProcessor:
             cp_size: Sequence parallel size. Padded length must be divisible
                 by cp_size for Ulysses sequence parallelism. The effective
                 padding multiple is lcm(pad_to_multiple_of, cp_size).
+            packing_strategy: Bin-packing strategy (see packing.PACKING_STRATEGIES).
+            on_oversized: How to handle samples longer than the pack length
+                (see packing.ON_OVERSIZED_MODES). Default "error" (no silent drop).
+            dp_size: Number of distinct dispatcher batch slices
+                (world_size // (cp_size·pp_size)); used by the "balanced_dp" strategy.
         """
         self.backend = backend
         self.sample_packing_sequence_len = sample_packing_sequence_len
         self.enable_packing = enable_packing
         # Sequence must be divisible by both pad_to_multiple_of and cp_size
         self.pad_to_multiple_of = math.lcm(pad_to_multiple_of, cp_size)
+        self.packing_strategy = packing_strategy
+        self.on_oversized = on_oversized
+        self.dp_size = max(1, int(dp_size))
 
         # Statistics
         self.total_operations = 0
@@ -114,7 +128,8 @@ class RequestProcessor:
         logger.info(
             f"RequestProcessor initialized: "
             f"sample_packing_sequence_len={sample_packing_sequence_len}, packing={'enabled' if enable_packing else 'disabled'}, "
-            f"pad_to_multiple_of={self.pad_to_multiple_of} (base={pad_to_multiple_of}, cp_size={cp_size})"
+            f"pad_to_multiple_of={self.pad_to_multiple_of} (base={pad_to_multiple_of}, cp_size={cp_size}), "
+            f"strategy={packing_strategy}, on_oversized={on_oversized}, dp_size={self.dp_size}"
         )
 
     # ========================================================================
@@ -180,13 +195,29 @@ class RequestProcessor:
 
             # Pack samples into batches
             logger.debug(f"Packing {len(data)} datum into batches for {op_name} request {request.request_id}")
-            batches = pack_samples(
+            batches, datum_order = pack_samples(
                 datum_list=data,
                 max_seq_len=self.sample_packing_sequence_len,
                 enable_packing=self.enable_packing,
                 request_id=request.request_id,
                 pad_to_multiple_of=self.pad_to_multiple_of,
+                strategy=self.packing_strategy,
+                on_oversized=self.on_oversized,
+                dp_size=self.dp_size,
+                return_datum_order=True,
             )
+
+            # Realign per-datum side arrays to the order samples appear in the
+            # emitted micro-batches. The dispatcher slices routed_experts /
+            # routed_expert_logits by cumulative num_samples in batch order, so
+            # any packer reordering (or dropped samples) must be mirrored here.
+            if (routed_experts is not None or routed_expert_logits is not None) and datum_order != list(
+                range(len(data))
+            ):
+                if routed_experts is not None:
+                    routed_experts = [routed_experts[i] for i in datum_order]
+                if routed_expert_logits is not None:
+                    routed_expert_logits = [routed_expert_logits[i] for i in datum_order]
 
             if not batches:
                 raise ValueError(
@@ -226,11 +257,19 @@ class RequestProcessor:
                 "execution_time": result.get(
                     "execution_time", result.get("forward_backward_time", result.get("forward_time", 0.0))
                 ),
+                "executor_pack_s": t_packed - t0,
+                "executor_backend_s": t_backend - t_packed,
+                "executor_build_output_s": 0.0,  # Filled after output construction.
+                "executor_total_s": 0.0,  # Filled after output construction.
+                "executor_batches": len(batches),
+                "executor_samples": len(data),
             }
 
             # Add loss-specific metrics (IS/KL divergence, OPD KL stats, ratio stats, etc.)
             for key in result:
                 if key.startswith(("is_", "opd_")):
+                    output_dict[key] = result[key]
+                elif key.startswith(FORWARD_BACKWARD_RESULT_PREFIXES):
                     output_dict[key] = result[key]
 
             # Pass through expert load summary for MoE models
@@ -266,6 +305,8 @@ class RequestProcessor:
 
             self.successful_operations += 1
             t_done = time.perf_counter()
+            output_dict["executor_build_output_s"] = t_done - t_backend
+            output_dict["executor_total_s"] = t_done - t0
             logger.info(
                 f"[TIMING] executor {op_name}: "
                 f"pack={t_packed - t0:.4f}s "
@@ -322,6 +363,7 @@ class RequestProcessor:
         packed_logprobs = result["packed_logprobs"]
         packed_losses = result.get("packed_losses")
         packed_position_ids = result["packed_position_ids"]
+        packed_token_diagnostics = result.get("packed_token_diagnostics")
         per_sample_outputs = []
 
         for i, (logprobs, pos_ids) in enumerate(zip(packed_logprobs, packed_position_ids)):
@@ -329,25 +371,91 @@ class RequestProcessor:
             pos_ids_tensor = torch.tensor(pos_ids)
 
             sample_logprobs = unpack_per_token_outputs(logprobs_tensor, pos_ids_tensor)
+            sample_token_diagnostics = (
+                RequestProcessor._unpack_token_diagnostics(packed_token_diagnostics[i], pos_ids_tensor)
+                if packed_token_diagnostics is not None and i < len(packed_token_diagnostics)
+                else None
+            )
 
             # Limit to real samples: padding tokens create a spurious sequence boundary
             num_real = batches[i].get("num_samples") if i < len(batches) else None
             if num_real is not None:
                 sample_logprobs = sample_logprobs[:num_real]
+                if sample_token_diagnostics is not None:
+                    sample_token_diagnostics = sample_token_diagnostics[:num_real]
 
             if packed_losses is not None:
                 losses_tensor = torch.tensor(packed_losses[i])
                 sample_losses = unpack_per_token_outputs(losses_tensor, pos_ids_tensor)
                 if num_real is not None:
                     sample_losses = sample_losses[:num_real]
-                for lp, el in zip(sample_logprobs, sample_losses):
-                    per_sample_outputs.append({"logprobs": lp, "elementwise_loss": el})
+                for sample_idx, (lp, el) in enumerate(zip(sample_logprobs, sample_losses)):
+                    output = {"logprobs": lp, "elementwise_loss": el}
+                    if sample_token_diagnostics is not None and sample_idx < len(sample_token_diagnostics):
+                        output["token_diagnostics"] = sample_token_diagnostics[sample_idx]
+                    per_sample_outputs.append(output)
             else:
-                for lp in sample_logprobs:
-                    per_sample_outputs.append({"logprobs": lp})
+                for sample_idx, lp in enumerate(sample_logprobs):
+                    output = {"logprobs": lp}
+                    if sample_token_diagnostics is not None and sample_idx < len(sample_token_diagnostics):
+                        output["token_diagnostics"] = sample_token_diagnostics[sample_idx]
+                    per_sample_outputs.append(output)
 
         logger.debug(f"Unpacked {len(per_sample_outputs)} per-sample outputs")
         return per_sample_outputs
+
+    @staticmethod
+    def _unpack_token_diagnostics(diagnostics: Dict, position_ids: torch.Tensor) -> list[Dict]:
+        """Split packed top-k/rank diagnostics by sample boundaries."""
+        if not diagnostics:
+            return []
+
+        pos = position_ids.reshape(-1).to(dtype=torch.long)
+        if pos.numel() == 0:
+            return []
+        starts = [0]
+        for idx in range(1, pos.numel()):
+            if pos[idx].item() <= pos[idx - 1].item():
+                starts.append(idx)
+        starts.append(pos.numel())
+
+        fields = (
+            "target_ids",
+            "target_logprobs",
+            "target_ranks",
+            "topk_ids",
+            "topk_logprobs",
+            "loss_logprobs",
+            "loss_logprob_deltas",
+            "reference_target_logprobs",
+            "reference_target_ranks",
+            "reference_logprob_deltas",
+            "hidden_state_summaries",
+            "hidden_component_summaries",
+        )
+        valid_positions = [int(item) for item in diagnostics.get("valid_positions", [])]
+        # Verify all per-token fields agree on length with valid_positions so
+        # boundary slices stay aligned. A mismatch is a producer-side bug.
+        n = len(valid_positions)
+        for field in fields:
+            values = diagnostics.get(field, [])
+            if values and len(values) != n:
+                raise ValueError(
+                    f"token_diagnostics field '{field}' has length {len(values)} but valid_positions has length {n}"
+                )
+
+        if n == 0:
+            return []
+
+        out = []
+        for start, end in zip(starts[:-1], starts[1:], strict=False):
+            selected = [idx for idx, value in enumerate(valid_positions) if start <= value < end]
+            item = {"valid_positions": [valid_positions[idx] - start for idx in selected]}
+            for field in fields:
+                values = diagnostics.get(field, [])
+                item[field] = [values[idx] for idx in selected if idx < len(values)]
+            out.append(item)
+        return out
 
     async def execute_forward_backward(self, request: OrchestratorRequest) -> OrchestratorOutputs:
         """Execute forward-backward pass on workers."""
@@ -417,6 +525,7 @@ class RequestProcessor:
         def build_output(result):
             output_dict = {
                 "grad_norm": result.get("grad_norm", 0.0),
+                "lr": result.get("lr", result.get("learning_rate", lr)),
                 "learning_rate": lr,
                 "step": result.get("step", 0),
                 "execution_time": result.get("execution_time", 0.0),
@@ -424,6 +533,8 @@ class RequestProcessor:
             if result.get("auto_loaded"):
                 output_dict["auto_loaded"] = True
                 output_dict["auto_load_path"] = result.get("auto_load_path")
+            if result.get("sparse_delta_capture"):
+                output_dict["sparse_delta_capture"] = result.get("sparse_delta_capture")
             return [output_dict]
 
         return await self._execute_operation(
@@ -436,6 +547,7 @@ class RequestProcessor:
                 beta2=p.beta2,
                 eps=p.eps,
                 model_id=p.model_id,
+                sparse_delta_capture=p.sparse_delta_capture,
                 request_id=request.request_id,
             ),
             OutputType.OPTIM_STEP,
@@ -656,6 +768,9 @@ class RequestProcessor:
                 pause_mode=p.pause_mode,
                 weight_version=p.weight_version,
                 quantization=p.quantization,
+                sparse_delta_paths=p.sparse_delta_paths,
+                sparse_delta_config=p.sparse_delta_config,
+                model_id=p.model_id,
                 request_id=request.request_id,
             ),
             OutputType.SYNC_INFERENCE_WEIGHTS,

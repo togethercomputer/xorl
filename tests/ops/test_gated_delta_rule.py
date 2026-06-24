@@ -1,7 +1,8 @@
 import pytest
 import torch
 import torch.nn.functional as F
-from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+
+from xorl.ops.linear_attention.ops.gated_delta_rule import chunk_gated_delta_rule
 
 
 pytestmark = [

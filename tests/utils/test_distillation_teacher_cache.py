@@ -1,5 +1,8 @@
+import json
+
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from tests._helpers.opd import save_tensor_file
 from xorl.distillation import (
@@ -72,6 +75,36 @@ def test_teacher_store_round_trips_lm_head_shards(tmp_path):
     assert [shard.rows for shard in store.head_spec(3).shards] == [4, 4, 3]
 
 
+def test_load_lm_head_weight_uses_tied_embedding_from_indexed_model_dir(tmp_path):
+    weight = torch.randn(11, 7)
+    model_dir = tmp_path / "teacher_model"
+    model_dir.mkdir()
+    save_file(
+        {
+            "model.embed_tokens.weight": weight,
+            "model.layers.0.input_layernorm.weight": torch.ones(7),
+        },
+        str(model_dir / "model-00001-of-00001.safetensors"),
+    )
+    (model_dir / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {},
+                "weight_map": {
+                    "model.embed_tokens.weight": "model-00001-of-00001.safetensors",
+                    "model.layers.0.input_layernorm.weight": "model-00001-of-00001.safetensors",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (model_dir / "config.json").write_text(json.dumps({"tie_word_embeddings": True}), encoding="utf-8")
+
+    loaded = load_lm_head_weight(str(model_dir))
+
+    torch.testing.assert_close(loaded, weight)
+
+
 def test_teacher_head_manager_prefetches_teacher_store(tmp_path):
     weight = torch.randn(5, 3)
     model_dir = tmp_path / "teacher_model"
@@ -98,6 +131,20 @@ def test_teacher_activation_cache_gathers_indices(tmp_path):
     gathered = cache.get(3, indices, device="cpu")
 
     torch.testing.assert_close(gathered, hidden[indices])
+
+
+def test_teacher_activation_cache_gathers_rank3_token_axis(tmp_path):
+    hidden = torch.arange(2 * 6 * 4, dtype=torch.float32).reshape(2, 6, 4)
+    path = tmp_path / "hidden_layers.safetensors"
+    save_tensor_file(path, "hidden_states", hidden)
+
+    cache = TeacherActivationCache({"3": str(path)})
+    indices = torch.tensor([[0, 2], [5, 1]])
+
+    gathered = cache.get(3, indices, device="cpu")
+
+    expected = hidden.index_select(1, indices.reshape(-1)).permute(1, 0, 2).reshape(2, 2, 2, 4)
+    torch.testing.assert_close(gathered, expected)
 
 
 def test_teacher_activation_cache_prefetches(tmp_path):

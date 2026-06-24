@@ -1,13 +1,13 @@
 # Copyright (c) 2025, Tri Dao.
 
-from dataclasses import dataclass
 from typing import Tuple
+from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.cutlass_dsl import Boolean, const_expr, Int32
+from cutlass.utils import TensorMapUpdateMode, TensorMapManager
 from cutlass._mlir.dialects import llvm
-from cutlass.cutlass_dsl import Boolean, Int32, const_expr
-from cutlass.utils import TensorMapManager, TensorMapUpdateMode
 
 
 @dataclass(frozen=True)
@@ -41,7 +41,9 @@ class TensorMapManagerSm90(TensorMapManager):
         # updates before touching tensormap in global memory
         if is_manager_warp:
             if const_expr(self.tensormap_update_mode == TensorMapUpdateMode.SMEM):
-                for copy_atom, tensor, smem_ptr in zip(tma_copy_atom, tensor_gmem, tensormap_smem_ptr):
+                for copy_atom, tensor, smem_ptr in zip(
+                    tma_copy_atom, tensor_gmem, tensormap_smem_ptr
+                ):
                     cute.nvgpu.cpasync.update_tma_descriptor(copy_atom, tensor, smem_ptr)
             # wait until it's safe to update tensormap in global memory
             with cute.arch.elect_one():
@@ -53,7 +55,9 @@ class TensorMapManagerSm90(TensorMapManager):
                 for gmem_ptr, smem_ptr in zip(tensormap_gmem_ptr, tensormap_smem_ptr):
                     cute.nvgpu.cpasync.cp_fence_tma_desc_release(gmem_ptr, smem_ptr)
             else:
-                for copy_atom, tensor, gmem_ptr in zip(tma_copy_atom, tensor_gmem, tensormap_gmem_ptr):
+                for copy_atom, tensor, gmem_ptr in zip(
+                    tma_copy_atom, tensor_gmem, tensormap_gmem_ptr
+                ):
                     cute.nvgpu.cpasync.update_tma_descriptor(copy_atom, tensor, gmem_ptr)
                 cute.arch.sync_warp()
                 cute.nvgpu.cpasync.fence_tma_desc_release()
@@ -74,7 +78,7 @@ class TensorMapManagerSm90(TensorMapManager):
                     smem_ptr_i32 = smem_ptr.toint().ir_value()
                     llvm.inline_asm(
                         None,
-                        [smem_ptr_i32, Int32(shape).ir_value(), Int32(order).ir_value()],
+                        [smem_ptr_i32, Int32(shape).ir_value()],
                         "{\n\t"
                         ".reg .b64 smem_ptr_i64;\n\t"
                         "cvt.u64.u32 smem_ptr_i64, $0;\n\t"
@@ -83,7 +87,6 @@ class TensorMapManagerSm90(TensorMapManager):
                         "r,r",
                         has_side_effects=True,
                         is_align_stack=False,
-                        asm_dialect=llvm.AsmDialect.AD_ATT,
                     )
             # wait until it's safe to update tensormap in global memory
             with cute.arch.elect_one():
@@ -100,12 +103,11 @@ class TensorMapManagerSm90(TensorMapManager):
                     gmem_ptr_i64 = gmem_ptr.toint().ir_value()
                     llvm.inline_asm(
                         None,
-                        [gmem_ptr_i64, Int32(shape).ir_value(), Int32(order).ir_value()],
+                        [gmem_ptr_i64, Int32(shape).ir_value()],
                         f"tensormap.replace.tile.global_dim.global.b1024.b32 [$0], {order}, $1;",
                         "l,r",
                         has_side_effects=True,
                         is_align_stack=False,
-                        asm_dialect=llvm.AsmDialect.AD_ATT,
                     )
                 cute.arch.sync_warp()
                 cute.nvgpu.cpasync.fence_tma_desc_release()

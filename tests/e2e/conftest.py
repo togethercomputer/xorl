@@ -28,6 +28,18 @@ def tiny_dense_model_dir_with_weights(tmp_workspace):
 
 
 @pytest.fixture
+def tiny_long_context_dense_model_dir_with_weights(tmp_workspace):
+    """Tiny Qwen3 dense model with saved weights and larger RoPE context."""
+    return create_tiny_model_dir(tmp_workspace, model_type="dense_long_context", save_weights=True)
+
+
+@pytest.fixture
+def tiny_agent_context_dense_model_dir_with_weights(tmp_workspace):
+    """Tiny Qwen3 dense model with saved weights and 4096-token RoPE context."""
+    return create_tiny_model_dir(tmp_workspace, model_type="dense_agent_context", save_weights=True)
+
+
+@pytest.fixture
 def tiny_moe_model_dir(tmp_workspace):
     """Tiny Qwen3-MoE model directory (random init, no download)."""
     return create_tiny_model_dir(tmp_workspace, model_type="moe")
@@ -37,6 +49,12 @@ def tiny_moe_model_dir(tmp_workspace):
 def tiny_moe_model_dir_with_weights(tmp_workspace):
     """Tiny Qwen3-MoE model directory with saved weights."""
     return create_tiny_model_dir(tmp_workspace, model_type="moe", save_weights=True)
+
+
+@pytest.fixture
+def tiny_nemotron_h_model_dir(tmp_workspace):
+    """Tiny nemotron_h hybrid model directory (random init, no download)."""
+    return create_tiny_model_dir(tmp_workspace, model_type="nemotron_h")
 
 
 @pytest.fixture

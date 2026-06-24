@@ -149,12 +149,17 @@ class TrainingResult:
     def assert_success(self, msg: str = ""):
         """Assert training completed successfully with useful diagnostics."""
         if not self.success:
-            stderr_tail = "\n".join(self.stderr.splitlines()[-50:])
-            stdout_tail = "\n".join(self.stdout.splitlines()[-80:])
+            stdout_log = os.path.join(self.output_dir, "training_stdout.log")
+            stderr_log = os.path.join(self.output_dir, "training_stderr.log")
+            log_hint = ""
+            if os.path.exists(stdout_log) or os.path.exists(stderr_log):
+                log_hint = f"\nFull logs: stdout={stdout_log} stderr={stderr_log}"
+            stderr_tail = "\n".join(self.stderr.splitlines()[-120:])
+            stdout_tail = "\n".join(self.stdout.splitlines()[-160:])
             raise AssertionError(
-                f"Training failed (exit_code={self.exit_code}){': ' + msg if msg else ''}\n"
-                f"--- stdout (last 80 lines) ---\n{stdout_tail}\n"
-                f"--- stderr (last 50 lines) ---\n{stderr_tail}"
+                f"Training failed (exit_code={self.exit_code}){': ' + msg if msg else ''}{log_hint}\n"
+                f"--- stdout (last 160 lines) ---\n{stdout_tail}\n"
+                f"--- stderr (last 120 lines) ---\n{stderr_tail}"
             )
         assert self.metrics is not None, f"Training exited 0 but no training_metrics.json found in {self.output_dir}"
 
@@ -216,10 +221,62 @@ SMALL_QWEN3_CONFIG = {
     "head_dim": 64,
 }
 
+TINY_QWEN3_LONG_CONTEXT_CONFIG = {
+    **TINY_QWEN3_CONFIG,
+    "max_position_embeddings": 2048,
+}
+
+TINY_QWEN3_AGENT_CONTEXT_CONFIG = {
+    **TINY_QWEN3_CONFIG,
+    "max_position_embeddings": 4096,
+}
+
 # MoE config with larger moe_intermediate_size (>= 64) for NF4 group_size compatibility
 SMALL_QWEN3_MOE_CONFIG = {
     **TINY_QWEN3_MOE_CONFIG,
     "moe_intermediate_size": 64,
+}
+
+# Tiny hybrid Mamba2 / attention / latent-MoE model covering all three
+# nemotron_h block types (multi-chunk SSD: chunk_size < seq len).
+TINY_NEMOTRON_H_CONFIG = {
+    "model_type": "nemotron_h",
+    "architectures": ["NemotronHForCausalLM"],
+    "vocab_size": 2048,
+    "hidden_size": 64,
+    "layers_block_type": ["mamba", "attention", "moe", "mamba", "moe"],
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 16,
+    "max_position_embeddings": 512,
+    "attention_bias": False,
+    "attention_dropout": 0.0,
+    "intermediate_size": 96,
+    "mlp_hidden_act": "relu2",
+    "mlp_bias": False,
+    "ssm_state_size": 16,
+    "mamba_num_heads": 8,
+    "mamba_head_dim": 16,
+    "n_groups": 2,
+    "conv_kernel": 4,
+    "expand": 2,
+    "chunk_size": 32,
+    "n_routed_experts": 8,
+    "n_shared_experts": 1,
+    "moe_intermediate_size": 32,
+    "moe_shared_expert_intermediate_size": 48,
+    "moe_latent_size": 32,
+    "num_experts_per_tok": 2,
+    "routed_scaling_factor": 1.0,
+    "n_group": 1,
+    "topk_group": 1,
+    "norm_topk_prob": True,
+    "time_step_limit": [0.001, 100.0],
+    "use_cache": False,
+    "tie_word_embeddings": False,
+    "pad_token_id": 0,
+    "bos_token_id": 1,
+    "eos_token_id": 2,
 }
 
 
@@ -231,9 +288,12 @@ def create_tiny_model_dir(
     """Create a temp directory with model config + tokenizer files."""
     configs = {
         "dense": TINY_QWEN3_CONFIG,
+        "dense_long_context": TINY_QWEN3_LONG_CONTEXT_CONFIG,
+        "dense_agent_context": TINY_QWEN3_AGENT_CONTEXT_CONFIG,
         "dense_large": SMALL_QWEN3_CONFIG,
         "moe": TINY_QWEN3_MOE_CONFIG,
         "moe_large": SMALL_QWEN3_MOE_CONFIG,
+        "nemotron_h": TINY_NEMOTRON_H_CONFIG,
     }
     model_config = configs[model_type]
     model_dir = os.path.join(base_dir, f"tiny_{model_type}_model")
@@ -317,6 +377,8 @@ def generate_training_config(
     lora_rank: int = 8,
     lora_alpha: int = 8,
     lora_target_modules: Optional[List[str]] = None,
+    extra_data: Optional[Dict[str, Any]] = None,
+    extra_model: Optional[Dict[str, Any]] = None,
     extra_train: Optional[Dict[str, Any]] = None,
     extra_lora: Optional[Dict[str, Any]] = None,
 ) -> str:
@@ -382,6 +444,12 @@ def generate_training_config(
 
     if moe_implementation:
         config["model"]["moe_implementation"] = moe_implementation
+
+    if extra_data:
+        config["data"].update(extra_data)
+
+    if extra_model:
+        config["model"].update(extra_model)
 
     if extra_train:
         config["train"].update(extra_train)
@@ -458,14 +526,19 @@ def run_training(
                 return v.decode(errors="replace")
             return v or fallback
 
+        output_dir = _read_output_dir(config_path)
+        stdout = _to_str(e.stdout, "")
+        stderr = _to_str(e.stderr, f"Timeout after {timeout}s")
+        _write_subprocess_logs(output_dir, stdout, stderr)
         return TrainingResult(
             exit_code=-1,
-            stdout=_to_str(e.stdout, ""),
-            stderr=_to_str(e.stderr, f"Timeout after {timeout}s"),
-            output_dir=_read_output_dir(config_path),
+            stdout=stdout,
+            stderr=stderr,
+            output_dir=output_dir,
         )
 
     output_dir = _read_output_dir(config_path)
+    _write_subprocess_logs(output_dir, result.stdout, result.stderr)
     metrics = _read_metrics(output_dir)
 
     return TrainingResult(
@@ -481,6 +554,17 @@ def _read_output_dir(config_path: str) -> str:
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
     return cfg["train"]["output_dir"]
+
+
+def _write_subprocess_logs(output_dir: str, stdout: str, stderr: str) -> None:
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        with open(os.path.join(output_dir, "training_stdout.log"), "w", encoding="utf-8") as f:
+            f.write(stdout or "")
+        with open(os.path.join(output_dir, "training_stderr.log"), "w", encoding="utf-8") as f:
+            f.write(stderr or "")
+    except OSError:
+        return
 
 
 def _read_metrics(output_dir: str) -> Optional[Dict[str, Any]]:

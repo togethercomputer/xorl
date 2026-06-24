@@ -127,6 +127,10 @@ class DatasetConfig:
         default=None,
         metadata={"help": "Max sequence length. Samples with input_ids longer than this are filtered out."},
     )
+    num_samples: Optional[int | None] = field(
+        default=None,
+        metadata={"help": "Number of synthetic samples to create when path='dummy'."},
+    )
 
     # Distillation fields
     activations_path: Optional[str | None] = field(
@@ -315,6 +319,12 @@ class DataArguments:
             "help": "The number of samples packed at a time. Increasing this value helps with packing, but usually only slightly (<%1)."
         },
     )
+    sample_packing_bin_size: Optional[int] = field(
+        default=100000,
+        metadata={
+            "help": "The maximum number of samples allowed in one packed bin. This mainly bounds multipack bins with many short samples."
+        },
+    )
     sample_packing_sequentially: Optional[bool] = field(
         default=None,
         metadata={"help": "Whether to pack samples sequentially."},
@@ -359,6 +369,17 @@ class DataArguments:
         default=128,
         metadata={
             "help": "Pad packed sequences to a multiple of this value. Defaults to 128 for optimal GPU performance."
+        },
+    )
+    fa_max_length_bucket: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "If > 0, round the flash-attention max_length (longest doc segment per pack) UP to a "
+                "multiple of this value. It is only an upper bound for the FA kernel's tiling (correctness "
+                "comes from cu_seqlens), so rounding up is safe. Bucketing this python-int prevents "
+                "torch.compile/dynamo from recompiling on every ragged pack. 0 = off (exact, default)."
+            )
         },
     )
 
@@ -490,6 +511,13 @@ class ModelArguments:
         default=False,
         metadata={"help": "Enable async combine for DeepEP (overlap combine with next layer's compute)."},
     )
+    alltoall_combine_hidden_chunk_size: int = field(
+        default=0,
+        metadata={
+            "help": "Hidden-dimension chunk size for alltoall EP combine. 0 disables chunking. "
+            "Useful for long-context MoE runs where the full combine tensor is a memory peak."
+        },
+    )
     basic_modules: Optional[List[str]] = field(
         default_factory=list,
         metadata={"help": "Basic modules beyond model._no_split_modules to be sharded in FSDP."},
@@ -508,6 +536,44 @@ class ModelArguments:
             "help": "RMSNorm implementation mode. 'native' uses torch.nn.functional.rms_norm "
             "and is the default. 'compile' runs that native path through torch.compile. "
             "'eager' uses the plain eager implementation."
+        },
+    )
+    router_fp32: bool = field(
+        default=True, metadata={"help": "Upcast MoE router gate computation to float32 for numerical stability."}
+    )
+    lm_head_fp32: bool = field(
+        default=True, metadata={"help": "Upcast LM head logits computation to float32 for numerical stability."}
+    )
+    activation_native: bool = field(
+        default=False, metadata={"help": "Use native SiLU instead of fused Triton kernel for SGLang alignment."}
+    )
+    rope_native: bool = field(
+        default=False, metadata={"help": "Use naive RoPE implementation instead of flash_attn fused kernel."}
+    )
+    attention_cast_bf16: bool = field(
+        default=False, metadata={"help": "Explicitly cast Q/K to bfloat16 after RoPE for SGLang alignment."}
+    )
+    sparse_mla_enabled: bool = field(
+        default=False,
+        metadata={
+            "help": "GLM-5 only: route attention through the absorb-form sparse-MLA path "
+            "that uses the DSA indexer's top-k indices via the tilelang kernel "
+            "(or its torch fallback). Default-False means the dense MLA + DSA mask "
+            "path runs instead — same algebra, fewer optimisations."
+        },
+    )
+    sparse_mla_backend: Literal["auto", "torch", "tilelang"] = field(
+        default="auto",
+        metadata={
+            "help": "Backend for sparse-MLA dispatch when `sparse_mla_enabled=True`. "
+            "'auto' (default) picks tilelang on CUDA + bf16 when the kernel's shape "
+            "constraints hold (`dim_plus_tail_dim == 576`, `topk % 64 == 0`), else "
+            "the torch reference. 'torch' is the dense-gather reference, correct but "
+            "slow; useful for CPU/CI and as a fallback. 'tilelang' forces the "
+            "vendored kernel. The earlier BWD NaN was caused by "
+            "TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE in pass_configs aliasing "
+            "acc_dkv_shared onto a buffer the dq gemm was still reading — dropping "
+            "that flag restored correctness."
         },
     )
 
@@ -588,6 +654,33 @@ class TrainingArguments:
         default="bf16",
         metadata={"help": "Dtype for optimizer states (momentum/variance) in anyprecision_adamw/muon."},
     )
+    anyprecision_adamw_denominator_chunk_size: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Maximum number of elements per temporary denominator chunk in AnyPrecisionAdamW. "
+                "Set >0 to reduce optimizer-step peak memory for very large parameters."
+            )
+        },
+    )
+    anyprecision_adamw_reuse_grad_for_momentum: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Let AnyPrecisionAdamW reuse each gradient tensor as the first-moment buffer after the "
+                "optimizer has consumed it. This lowers step-time peak memory for full-weight FSDP runs."
+            )
+        },
+    )
+    anyprecision_adamw_state_cpu_offload: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Offload AnyPrecisionAdamW moment tensors to CPU between optimizer steps. This trades step "
+                "latency for lower GPU memory during the next forward/backward pass."
+            )
+        },
+    )
     muon_lr: float = field(
         default=0.02,
         metadata={
@@ -651,6 +744,14 @@ class TrainingArguments:
             "Lower values reduce peak optimizer scratch memory at the cost of more launches."
         },
     )
+    muon_fallback_optimizer: Literal["adamw", "sgd"] = field(
+        default="adamw",
+        metadata={
+            "help": "Optimizer used for parameters that are excluded from Muon. "
+            "'adamw' preserves the default mixed Muon/AdamW behavior; 'sgd' is state-free and useful "
+            "for memory-constrained no-momentum Muon throughput smoke tests."
+        },
+    )
     muon_grad_dtype: Optional[Literal["fp32", "bf16"]] = field(
         default=None,
         metadata={
@@ -688,6 +789,18 @@ class TrainingArguments:
     def optimizer_kwargs(self) -> Dict[str, Any]:
         """Collect optimizer-specific kwargs from flat fields into a dict for build_optimizer."""
         kwargs: Dict[str, Any] = {}
+        if self.anyprecision_adamw_denominator_chunk_size > 0 and (
+            self.optimizer == "anyprecision_adamw" or (self.optimizer == "adamw" and self.cautious_weight_decay)
+        ):
+            kwargs["denominator_chunk_size"] = self.anyprecision_adamw_denominator_chunk_size
+        if self.anyprecision_adamw_reuse_grad_for_momentum and (
+            self.optimizer == "anyprecision_adamw" or (self.optimizer == "adamw" and self.cautious_weight_decay)
+        ):
+            kwargs["reuse_grad_for_momentum"] = self.anyprecision_adamw_reuse_grad_for_momentum
+        if self.anyprecision_adamw_state_cpu_offload and (
+            self.optimizer == "anyprecision_adamw" or (self.optimizer == "adamw" and self.cautious_weight_decay)
+        ):
+            kwargs["state_offload_device"] = "cpu"
         if self.optimizer == "muon":
             kwargs["muon_lr"] = self.muon_lr
             kwargs["muon_momentum"] = self.muon_momentum
@@ -698,6 +811,7 @@ class TrainingArguments:
             kwargs["muon_ns_use_quack_kernels"] = self.muon_ns_use_quack_kernels
             kwargs["muon_gram_ns_num_restarts"] = self.muon_gram_ns_num_restarts
             kwargs["muon_grouped_gram_ns_fp32_byte_limit"] = self.muon_grouped_gram_ns_fp32_byte_limit
+            kwargs["muon_fallback_optimizer"] = self.muon_fallback_optimizer
             if self.muon_gram_ns_restart_iterations is not None:
                 kwargs["muon_gram_ns_restart_iterations"] = self.muon_gram_ns_restart_iterations
             # Wire optimizer_dtype -> muon_momentum_dtype so "bf16" sets bf16 Muon momentum
@@ -719,7 +833,7 @@ class TrainingArguments:
 
     max_grad_norm: float = field(
         default=1.0,
-        metadata={"help": "Clip value for gradient norm."},
+        metadata={"help": "Clip value for gradient norm. Set <= 0 to skip gradient norm computation and clipping."},
     )
     softmax_auxiliary_loss: bool = field(
         default=False,
@@ -734,14 +848,37 @@ class TrainingArguments:
         default=1e-5,
         metadata={"help": "Coefficient for the softmax auxiliary (Z-)loss when softmax_auxiliary_loss is enabled."},
     )
+    moe_global_load_balancing: bool = field(
+        default=False,
+        metadata={
+            "help": "Compute the MoE router load-balancing loss over the global batch "
+            "instead of per micro-batch. Accumulates synchronized expert-selection "
+            "frequencies (f_i) across the gradient-accumulation window and the DP group "
+            "via a per-step buffer, while the routing probability (P_i) stays local so "
+            "gradients still flow to the gate. Approximates global-batch balancing per "
+            "Qiu et al. 2025 (https://arxiv.org/abs/2501.11873, Alg. 1); relaxes the "
+            "overly strict per-micro-batch (~sequence-level) constraint and improves "
+            "expert specialization. No effect under pipeline parallelism (the PP path "
+            "does not compute the load-balancing loss)."
+        },
+    )
     ce_mode: CrossEntropyMode = field(
         default="compiled",
         metadata={
             "help": "Cross-entropy computation mode for the local-trainer path. "
             "'compiled' (default): torch.compile + auto_chunker, avoids materializing "
-            "the full [batch*seq, vocab] logits tensor. 'eager': F.cross_entropy that "
-            "materializes logits. The server path uses ServerArguments.ce_mode "
-            "(same semantics, separate flow)."
+            "the full [batch*seq, vocab] logits tensor. 'quack_linear': Quack chunked "
+            "linear + cross-entropy scalar training loss; return_per_token routes through "
+            "fused selected-logprob CE. 'eager': F.cross_entropy that materializes logits. "
+            "The server path uses ServerArguments.ce_mode (same semantics, separate flow)."
+        },
+    )
+    ce_num_chunks: int = field(
+        default=8,
+        metadata={
+            "help": "Number of token chunks for chunked/compiled cross-entropy. "
+            "For ce_mode='compiled', this is forwarded to torch.compile auto_chunker. "
+            "For ce_mode='quack_linear', it determines the chunk size from local token count."
         },
     )
     micro_batch_size: int = field(
@@ -752,6 +889,19 @@ class TrainingArguments:
         default=1,
         metadata={
             "help": "Number of gradient accumulation steps. The effective batch size per device is micro_batch_size * gradient_accumulation_steps."
+        },
+    )
+    defer_grad_sync_in_accumulation: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "HSDP only. Defer the cross-node replicate-dim all-reduce (set_requires_all_reduce) to "
+                "the LAST gradient-accumulation microbatch, batching ~gradient_accumulation_steps cross-"
+                "node syncs into one. Reduce-scatter still runs every microbatch, so gradients stay "
+                "SHARDED (no unsharded-grad OOM) — mathematically equivalent. Helps multi-node throughput "
+                "when the cross-node reduce / its barrier is exposed. No-op unless "
+                "data_parallel_replicate_size>1 and gradient_accumulation_steps>1."
+            )
         },
     )
     num_train_epochs: int = field(
@@ -773,6 +923,221 @@ class TrainingArguments:
     enable_mixed_precision: bool = field(
         default=True,
         metadata={"help": "Enable mixed precision training."},
+    )
+    fsdp_reduce_dtype: Literal["fp32", "bf16"] = field(
+        default="fp32",
+        metadata={
+            "help": (
+                "FSDP2 gradient reduce-scatter buffer dtype when mixed precision is enabled. "
+                "'fp32' preserves the existing accumulation behavior; 'bf16' lowers reduce-scatter "
+                "memory and bandwidth at the cost of lower-precision gradient reduction."
+            )
+        },
+    )
+    skip_param_upcast: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Skip the generic full-model fp32 parameter upcast before FSDP wrapping. "
+                "This keeps checkpoint-native bf16 parameters as the original optimizer dtype, "
+                "reducing memory for full-weight mixed-precision runs."
+            )
+        },
+    )
+    fp8_cfg: Optional[Dict[str, Any]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional compatibility alias for NeMo-style FP8 configs. Supported values are "
+                "{enabled: true, fp8: e4m3, fp8_recipe: blockwise, fp8_param: false}; "
+                "TransformerEngine-only recipes are rejected."
+            )
+        },
+    )
+    enable_fp8_training: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable experimental full-weight block-FP8 compute training. This keeps normal BF16/FP32 master "
+                "parameters for optimizer/checkpoint compatibility and replaces selected nn.Linear compute paths "
+                "with FP8 GEMMs."
+            )
+        },
+    )
+    enable_qarl: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable experimental dense full-weight QARL fake quantization. Initial support uses dynamic "
+                "E4M3 fake quantization with full-precision master parameters and STE gradients."
+            )
+        },
+    )
+    qarl_quant_cfg: Optional[Union[str, Dict[str, Any]]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "QARL quantization config or alias. Initial support accepts null, 'FP8_DEFAULT_CFG', 'fp8', "
+                "or a dict with format/quant_method=e4m3/fp8_e4m3 plus optional weight/activation booleans."
+            )
+        },
+    )
+    qarl_calib_data: Optional[str] = field(
+        default=None,
+        metadata={"help": "Reserved path for future static QARL calibration data. Dynamic QARL leaves this unset."},
+    )
+    qarl_calib_size: int = field(
+        default=0,
+        metadata={"help": "Reserved sample count for future static QARL calibration. Dynamic QARL uses 0."},
+    )
+    qarl_quant_sequence_length: Optional[int] = field(
+        default=None,
+        metadata={"help": "Reserved sequence length for future static QARL calibration."},
+    )
+    qarl_sync_format: Literal["fp8"] = field(
+        default="fp8",
+        metadata={"help": "Target rollout/export sync format for QARL. Initial support is 'fp8' only."},
+    )
+    qarl_target_modules: Optional[List[str]] = field(
+        default=None,
+        metadata={"help": "Optional short nn.Linear module names to wrap with QARL fake quantization."},
+    )
+    qarl_exclude_modules: Optional[List[str]] = field(
+        default=None,
+        metadata={"help": "Optional short names, FQNs, or globs to keep out of QARL fake quantization."},
+    )
+    fp8_training_num_first_layers_bf16: int = field(
+        default=0,
+        metadata={"help": "Number of initial decoder layers to keep in BF16 when FP8 training is enabled."},
+    )
+    fp8_training_num_last_layers_bf16: int = field(
+        default=0,
+        metadata={"help": "Number of final decoder layers to keep in BF16 when FP8 training is enabled."},
+    )
+    fp8_training_allow_blackwell: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Allow native XoRL FP8 training on Blackwell/GB200. Defaults to false; BF16 training plus FP8 "
+                "sync/generation is the default policy until a native FP8 recipe is validated on that hardware."
+            )
+        },
+    )
+    fp8_training_blackwell_validation_artifact: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Required path or identifier for the validation artifact when enabling native FP8 training "
+                "on Blackwell with fp8_training_allow_blackwell=true."
+            )
+        },
+    )
+    fp8_training_block_size: int = field(
+        default=128,
+        metadata={"help": "Block size for full-weight FP8 training quantization."},
+    )
+    fp8_training_backward: Literal["bf16", "fp8"] = field(
+        default="fp8",
+        metadata={
+            "help": (
+                "Backward compute mode for full-weight FP8 training. 'fp8' uses FP8 GEMMs for linear backward "
+                "matmuls where possible; 'bf16' uses high-precision backward matmuls."
+            )
+        },
+    )
+    fp8_training_smoothquant_alpha: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional SmoothQuant alpha for dense full-weight FP8 training matmuls. When set in [0, 1], "
+                "activation and weight columns are dynamically balanced before FP8 quantization."
+            )
+        },
+    )
+    fp8_training_lm_head_smoothquant_alpha: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional SmoothQuant alpha override for an FP8 lm_head. "
+                "If unset, fp8_training_smoothquant_alpha is used."
+            )
+        },
+    )
+    fp8_training_activation_amax_scale: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Multiplier applied to dense FP8 activation block absmax before deriving scales. "
+                "Values below 1.0 clip activation outliers; values above 1.0 add headroom."
+            )
+        },
+    )
+    fp8_training_weight_amax_scale: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Multiplier applied to dense FP8 weight block absmax before deriving scales. "
+                "Values below 1.0 clip weight outliers; values above 1.0 add headroom."
+            )
+        },
+    )
+    fp8_training_correction_mode: Literal["none", "activation", "activation2", "weight", "first_order", "full"] = field(
+        default="none",
+        metadata={
+            "help": (
+                "Optional dense FP8 residual-correction mode. 'none' uses one FP8 GEMM, while activation, "
+                "activation2, weight, first_order, and full add extra FP8 GEMMs for quantization residuals."
+            )
+        },
+    )
+    fp8_training_module_overrides: Optional[Dict[str, Dict[str, Any]]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional FQN/short-name glob pattern overrides for dense FP8Linear recipes. "
+                "Supported per-pattern keys are block_size, backward_mode, smoothquant_alpha, "
+                "activation_amax_scale, weight_amax_scale, and correction_mode."
+            )
+        },
+    )
+    fp8_training_moe_grouped_backend: Literal["triton_grouped", "block_loop", "deep_gemm", "scalar_quack"] = field(
+        default="triton_grouped",
+        metadata={
+            "help": (
+                "Grouped GEMM backend for FP8 MoE expert compute. 'triton_grouped' is the default grouped "
+                "block-FP8 same-NK and same-MN path, 'block_loop' uses per-expert block-FP8 matmuls, "
+                "'deep_gemm' opts into DeepGEMM same-NK kernels, and 'scalar_quack' keeps the legacy scalar-scaled "
+                "Quack bridge."
+            )
+        },
+    )
+    fp8_training_target_modules: Optional[List[str]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional short nn.Linear module names to replace for FP8 training. None replaces all ordinary "
+                "linear modules unless fp8_training_exclude_modules is set."
+            )
+        },
+    )
+    fp8_training_exclude_modules: Optional[List[str]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional short names, FQNs, or glob patterns to keep out of FP8 training compute. If unset, "
+                "every matched dense Linear uses FP8 compute, including router gates and output heads."
+            )
+        },
+    )
+    fp8_training_allow_bf16_fallback: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Allow FP8Linear to fall back to regular F.linear when FP8 kernels cannot run, e.g. CPU tests. "
+                "The training default is false so enabled full-weight FP8 runs fail fast if a selected module "
+                "does not execute with FP8 compute."
+            )
+        },
     )
     enable_gradient_checkpointing: bool = field(
         default=True,
@@ -796,6 +1161,15 @@ class TrainingArguments:
                 "                                more memory than recompute_full_layer.\n"
                 "  'no_recompute'              — no recomputation, max throughput. +34% speed\n"
                 "                                but highest memory, only fits short seq.\n"
+            )
+        },
+    )
+    moe_checkpoint_method: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Deprecated compatibility alias. Use gradient_checkpointing_method instead. "
+                "The legacy value 'moe_act' maps to 'recompute_before_dispatch'."
             )
         },
     )
@@ -827,6 +1201,13 @@ class TrainingArguments:
             "help": "When enabling activation offload, `activation_gpu_limit` GB activations are allowed to reserve on GPU."
         },
     )
+    activation_offload_prefetch_count: int = field(
+        default=2,
+        metadata={
+            "help": "Number of activations to prefetch from CPU to GPU ahead of time during backward. "
+            "Higher values improve overlap at the cost of temporarily higher GPU memory."
+        },
+    )
     init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
         default="cuda",
         metadata={
@@ -854,6 +1235,13 @@ class TrainingArguments:
         default=False,
         metadata={
             "help": "Setting CUDA_LAUNCH_BLOCKING=1 would degrade performance significantly. Leave this as False to prevent CUDA_LAUNCH_BLOCKING from being accidentally enabled. DO NOT enable this unless you are debugging something."
+        },
+    )
+    prewarm_cuda_blas: bool = field(
+        default=False,
+        metadata={
+            "help": "Run a tiny checkpointed CUDA linear backward during startup to initialize cuBLAS handles "
+            "on the autograd recompute path before memory-heavy training begins."
         },
     )
     empty_cache_steps: int = field(
@@ -884,6 +1272,14 @@ class TrainingArguments:
         default=True,
         metadata={"help": "Place EP all-to-all within the node (NVLink). When False, EP spans across nodes."},
     )
+    ep_outside: Optional[bool] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Deprecated compatibility alias for ep_intranode. When set, ep_intranode is resolved to not ep_outside."
+            )
+        },
+    )
     ulysses_parallel_size: int = field(
         default=1,
         metadata={"help": "Ulysses sequence parallel size."},
@@ -891,6 +1287,15 @@ class TrainingArguments:
     tensor_parallel_size: int = field(
         default=1,
         metadata={"help": "Tensor parallel size. Shards model weights across GPUs within a node."},
+    )
+    lm_head_tensor_parallel_size: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Vocabulary tensor-parallel degree for only the LM head/loss. "
+                "Unlike tensor_parallel_size, this does not shard decoder layers or enter the main topology equation."
+            )
+        },
     )
     ringattn_parallel_size: int = field(
         default=1,
@@ -930,6 +1335,26 @@ class TrainingArguments:
         default="all",
         metadata={"help": "How to fold SP into FSDP: 'all' (ulysses+ring), 'ulysses_only', 'ring_only', or 'none'."},
     )
+    fsdp_sharded_lm_head_loss: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Keep lm_head as a separate FSDP unit and compute cross-entropy against "
+                "its local FSDP shard using vocab-parallel CE over the FSDP group. This "
+                "avoids all-gathering very large vocab heads at long context lengths."
+            )
+        },
+    )
+    fsdp_sharded_lm_head_loss_num_chunks: int = field(
+        default=8,
+        metadata={
+            "help": (
+                "Number of local sequence chunks to use for fsdp_sharded_lm_head_loss. "
+                "Higher values reduce the peak gathered hidden/logit/all-reduce footprint "
+                "at the cost of more small loss-kernel launches."
+            )
+        },
+    )
     moe_grad_reduce_mode: Literal["reduce_scatter", "bf16_a2a_fp32_sum"] = field(
         default="reduce_scatter",
         metadata={
@@ -953,6 +1378,14 @@ class TrainingArguments:
         default=None,
         metadata={"help": "Path to checkpoint to resume from."},
     )
+    load_optimizer: bool = field(
+        default=True,
+        metadata={
+            "help": "When resuming from load_checkpoint_path, also load optimizer state. Set False for a "
+            "weights-only resume (optimizer re-initialized fresh) — required to resume across a different "
+            "expert_parallel_size, since legacy optimizer state may not be reshardable."
+        },
+    )
     save_steps: int = field(
         default=0,
         metadata={"help": "Number of steps between two checkpoint saves."},
@@ -975,10 +1408,51 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Enable torch compile."},
     )
+    compile_dynamic_shapes: bool = field(
+        default=False,
+        metadata={"help": "Pass dynamic=True to torch.compile. Default keeps torch.compile's standard shape behavior."},
+    )
     log_format: Literal["progress_bar", "structured"] = field(
         default="progress_bar",
         metadata={
             "help": "Logging format. 'progress_bar' uses tqdm; 'structured' prints parse-friendly key=value lines."
+        },
+    )
+    enable_step_phase_timing: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Emit per-step phase timings for forward, backward, optimizer, gradient sync, and metric reduction. "
+                "Intended for short performance smoke tests; disabled for normal training."
+            )
+        },
+    )
+    step_phase_timing_sync_cuda: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Synchronize the accelerator before and after each measured step phase. "
+                "This gives accurate phase attribution but adds overhead, so enable it only for timing runs."
+            )
+        },
+    )
+    enable_per_component_timing: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Break down model forward/backward into per-component phases via module hooks. "
+                "Requires enable_step_phase_timing=True and is intended for short benchmark runs only."
+            )
+        },
+    )
+    enable_step_memory_profiling: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "When step phase timing is enabled, record CUDA allocated/reserved memory before and after each "
+                "timed phase plus that phase's local peak. This resets CUDA peak stats per phase, so use only for "
+                "short memory attribution runs."
+            )
         },
     )
     use_wandb: bool = field(
@@ -1047,15 +1521,54 @@ class TrainingArguments:
     )
 
     def __post_init__(self):
+        from xorl.fp8_training.config_compat import normalize_fp8_training_config  # noqa: PLC0415
+        from xorl.qarl import normalize_qarl_quant_cfg  # noqa: PLC0415
+
+        normalized_fp8_config = normalize_fp8_training_config(vars(self), context="train")
+        self.enable_fp8_training = bool(normalized_fp8_config.get("enable_fp8_training", self.enable_fp8_training))
+        if self.enable_qarl:
+            if self.enable_fp8_training:
+                raise ValueError(
+                    "enable_qarl cannot be combined with enable_fp8_training; choose one low-precision train path"
+                )
+            if self.qarl_calib_size < 0:
+                raise ValueError("qarl_calib_size must be non-negative")
+            if self.qarl_quant_sequence_length is not None and self.qarl_quant_sequence_length <= 0:
+                raise ValueError("qarl_quant_sequence_length must be positive when set")
+            if self.qarl_calib_data is None and (self.qarl_calib_size or self.qarl_quant_sequence_length is not None):
+                raise ValueError("qarl_calib_size and qarl_quant_sequence_length require qarl_calib_data")
+            self.qarl_quant_cfg = normalize_qarl_quant_cfg(self.qarl_quant_cfg)
+
+        if self.ep_outside is not None:
+            self.ep_intranode = not self.ep_outside
+
+        if self.moe_checkpoint_method is not None:
+            if self.moe_checkpoint_method != "moe_act":
+                raise ValueError(
+                    f"Unknown moe_checkpoint_method: {self.moe_checkpoint_method!r}. "
+                    "The only supported legacy value is 'moe_act'."
+                )
+            if self.gradient_checkpointing_method not in (None, "recompute_before_dispatch"):
+                raise ValueError(
+                    "moe_checkpoint_method='moe_act' is a legacy alias for "
+                    "gradient_checkpointing_method='recompute_before_dispatch'; "
+                    f"got gradient_checkpointing_method={self.gradient_checkpointing_method!r}."
+                )
+            self.gradient_checkpointing_method = "recompute_before_dispatch"
+
         # Resolve gradient_checkpointing_method into internal fields used by
         # the model and parallelization code.
         gcm = self.gradient_checkpointing_method or "recompute_full_layer"
         self.gradient_checkpointing_method = gcm
-        if gcm not in ("recompute_full_layer", "recompute_before_dispatch", "no_recompute"):
+        if gcm not in ("recompute_full_layer", "recompute_before_dispatch", "no_recompute", "moe_act"):
             raise ValueError(
                 f"Unknown gradient_checkpointing_method: {gcm!r}. "
-                f"Choose from: recompute_full_layer, recompute_before_dispatch, no_recompute"
+                f"Choose from: recompute_full_layer, recompute_before_dispatch, no_recompute, moe_act"
             )
+        if self.enable_per_component_timing and not self.enable_step_phase_timing:
+            raise ValueError("enable_per_component_timing requires enable_step_phase_timing=True")
+        if self.enable_step_memory_profiling and not self.enable_step_phase_timing:
+            raise ValueError("enable_step_memory_profiling requires enable_step_phase_timing=True")
 
         if self.repo_commit is None:
             self.repo_commit = _detect_repo_commit()
@@ -1360,6 +1873,11 @@ def _convert_str_dict(input_dict: Dict[str, Any]) -> Dict[str, Any]:
     return input_dict
 
 
+def _is_dict_type(type_hint: Any) -> bool:
+    origin_type = getattr(type_hint, "__origin__", type_hint)
+    return isclass(origin_type) and issubclass(origin_type, dict)
+
+
 def _make_choice_type_function(choices: List[Any]) -> Callable[[str], Any]:
     """
     Creates a mapping function from each choices string representation to the actual value. Used to support multiple
@@ -1401,6 +1919,7 @@ def parse_args(rootclass: T) -> T:
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     base_to_subclass = {}
     dict_fields = set()
+    string_or_dict_fields = set()
 
     # First pass: build field information and dict_fields set
     for subclass in fields(rootclass):
@@ -1420,11 +1939,13 @@ def parse_args(rootclass: T) -> T:
 
             # Handle Optional types first
             if origin_type is Union or (hasattr(types, "UnionType") and isinstance(origin_type, types.UnionType)):
-                if len(attr_type.__args__) == 2 and type(None) in attr_type.__args__:  # Optional[X]
+                non_none_args = tuple(arg for arg in attr_type.__args__ if arg is not type(None))
+                if str in non_none_args and any(_is_dict_type(arg) for arg in non_none_args):
+                    string_or_dict_fields.add(f"{base}.{attr.name}")
+                    continue
+                if len(non_none_args) == 1 and type(None) in attr_type.__args__:  # Optional[X]
                     # Extract the non-None type
-                    attr_type = (
-                        attr_type.__args__[0] if isinstance(None, attr_type.__args__[1]) else attr_type.__args__[1]
-                    )
+                    attr_type = non_none_args[0]
                     origin_type = getattr(attr_type, "__origin__", attr_type)
 
             # Mark dict and list-of-dict fields
@@ -1467,12 +1988,24 @@ def parse_args(rootclass: T) -> T:
                 #     )
 
                 if bool not in attr_type.__args__:  # except for `Union[bool, NoneType]`
+                    non_none_args = tuple(arg for arg in attr_type.__args__ if arg is not type(None))
+                    if str in non_none_args and any(_is_dict_type(arg) for arg in non_none_args):
+                        parser_kwargs = attr.metadata.copy()
+                        parser_kwargs["type"] = str
+                        if attr.default is not MISSING:
+                            parser_kwargs["default"] = attr.default
+                        elif attr.default_factory is not MISSING:
+                            parser_kwargs["default"] = attr.default_factory()
+                        elif type(None) not in attr_type.__args__:
+                            parser_kwargs["required"] = True
+                        parser.add_argument(f"--{base}.{attr.name}", **parser_kwargs)
+                        continue
+
                     # Track if this is Optional[X] (Union with None)
                     is_optional = type(None) in attr_type.__args__
-                    attr_type = (
-                        attr_type.__args__[0] if isinstance(None, attr_type.__args__[1]) else attr_type.__args__[1]
-                    )
-                    origin_type = getattr(attr_type, "__origin__", attr_type)
+                    if len(non_none_args) == 1:
+                        attr_type = non_none_args[0]
+                        origin_type = getattr(attr_type, "__origin__", attr_type)
 
             parser_kwargs = attr.metadata.copy()
             if origin_type is Literal or (isinstance(attr_type, type) and issubclass(attr_type, Enum)):
@@ -1547,6 +2080,7 @@ def parse_args(rootclass: T) -> T:
     cmd_args = sys.argv[1:]
     cmd_args_string = "=".join(cmd_args)  # use `=` to mark the end of arg name
     input_data = {}
+    input_path = None
     if cmd_args[0].endswith(".yaml") or cmd_args[0].endswith(".yml"):
         input_path = cmd_args.pop(0)
         with open(os.path.abspath(input_path), encoding="utf-8") as f:
@@ -1556,6 +2090,23 @@ def parse_args(rootclass: T) -> T:
         input_path = cmd_args.pop(0)
         with open(os.path.abspath(input_path), encoding="utf-8") as f:
             input_data: Dict[str, Dict[str, Any]] = json.load(f)
+
+    if input_data:
+        from xorl.fp8_training.config_compat import (  # noqa: PLC0415
+            extract_nemo_fp8_cfg,
+            validate_external_fp8_runtime_config,
+        )
+
+        validate_external_fp8_runtime_config(input_data, context=input_path or "config")
+        nemo_fp8_cfg = extract_nemo_fp8_cfg(input_data)
+        if nemo_fp8_cfg is not None:
+            train_data = input_data.setdefault("train", {})
+            if not isinstance(train_data, dict):
+                raise ValueError("train config section must be a mapping")
+            train_data.setdefault("fp8_cfg", nemo_fp8_cfg)
+            policy_data = input_data.get("policy")
+            if isinstance(policy_data, dict) and set(policy_data) == {"megatron_cfg"}:
+                input_data.pop("policy")
 
     for base, arg_dict in input_data.items():
         for arg_name, arg_value in arg_dict.items():
@@ -1583,8 +2134,23 @@ def parse_args(rootclass: T) -> T:
 
     parse_result = defaultdict(dict)
     for key, value in vars(args).items():
-        if key in dict_fields:
-            if isinstance(value, str):
+        if key in string_or_dict_fields:
+            if value is None:
+                pass
+            elif isinstance(value, str):
+                stripped_value = value.strip()
+                if stripped_value.startswith("{"):
+                    value = _convert_str_dict(json.loads(stripped_value))
+                elif stripped_value == "null":
+                    value = None
+                else:
+                    value = stripped_value
+            else:
+                raise ValueError(f"Expect a string or JSON object for argument {key}, but got {value}")
+        elif key in dict_fields:
+            if value is None:
+                pass
+            elif isinstance(value, str):
                 if value.startswith("{"):
                     # Handle regular dict
                     value = _convert_str_dict(json.loads(value))
@@ -1595,6 +2161,8 @@ def parse_args(rootclass: T) -> T:
                         value = [_convert_str_dict(item) if isinstance(item, dict) else item for item in parsed_list]
                     else:
                         raise ValueError(f"Expected a JSON array for {key}, but got {value}")
+                elif value == "null":
+                    value = None
                 else:
                     raise ValueError(f"Expect a JSON string (dict or array) for {key}, but got {value}")
             else:
@@ -1633,3 +2201,22 @@ class Arguments:
     train: "TrainingArguments" = field(default_factory=TrainingArguments)
     distill: "DistillationArguments" = field(default_factory=DistillationArguments)
     lora: "LoRAArguments" = field(default_factory=LoRAArguments)
+
+    def __post_init__(self):
+        from xorl.qarl import qarl_unsupported_scope_reason  # noqa: PLC0415
+
+        if self.train.enable_fp8_training and (self.lora.enable_lora or self.lora.enable_qlora):
+            raise ValueError("enable_fp8_training is a full-weight mode and cannot be combined with LoRA or QLoRA")
+        if self.train.enable_qarl and (self.lora.enable_lora or self.lora.enable_qlora):
+            raise ValueError("enable_qarl is a full-weight mode and cannot be combined with LoRA or QLoRA")
+        if self.train.enable_qarl:
+            unsupported_reason = qarl_unsupported_scope_reason(
+                model_config=self.model.foundation,
+                config_path=self.model.config_path,
+                module_names=[
+                    *(self.train.qarl_target_modules or []),
+                    *(self.train.qarl_exclude_modules or []),
+                ],
+            )
+            if unsupported_reason is not None:
+                raise ValueError(unsupported_reason)

@@ -72,6 +72,11 @@ def _import_quack_gemm_interface():
         raise ImportError("Muon Gram Newton-Schulz requires the upstream `quack-kernels` package") from exc
 
 
+def _muon_quack_tuned_enabled() -> bool:
+    value = os.getenv("XORL_MUON_QUACK_TUNED", "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 @lru_cache(maxsize=1)
 def _make_quack_backend():
     _ensure_cutlass_arch_for_current_device()
@@ -79,12 +84,13 @@ def _make_quack_backend():
     gemm = gemm_interface.gemm
     gemm_add = gemm_interface.gemm_add
     gemm_symmetric = gemm_interface.gemm_symmetric
+    tuned = _muon_quack_tuned_enabled()
 
     return SimpleNamespace(
         sym_mm=lambda A, B: gemm_symmetric(A, B),
         sym_baddbmm=lambda A, B, C, alpha=1.0, beta=1.0: gemm_symmetric(A, B, C=C, alpha=alpha, beta=beta),
-        mm=lambda A, B: gemm(A, B),
-        mm_add=lambda A, B, C, beta=1.0: gemm_add(A, B, C=C, beta=beta),
+        mm=lambda A, B: gemm(A, B, tuned=tuned),
+        mm_add=lambda A, B, C, beta=1.0: gemm_add(A, B, C=C, beta=beta, tuned=tuned),
     )
 
 

@@ -24,7 +24,7 @@ if str(THIS_DIR) not in sys.path:
 from distributed_utils import run_distributed_script, skip_if_gpu_count_less_than
 
 
-pytestmark = [pytest.mark.distributed]
+pytestmark = [pytest.mark.distributed, pytest.mark.gpu]
 
 
 def _build_tiny_qwen35_config(*, layer_types: list[str]) -> Qwen3_5Config:

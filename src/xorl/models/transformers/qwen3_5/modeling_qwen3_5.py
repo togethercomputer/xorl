@@ -70,7 +70,7 @@ class Qwen3_5MLP(nn.Module):
         self.gate_up_proj = nn.Linear(self.hidden_size, 2 * self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self._use_fused_silu = config.hidden_act == "silu"
+        self._use_fused_silu = config.hidden_act == "silu" and not getattr(config, "_activation_native", False)
 
     def unfuse_for_tp(self):
         """Replace fused gate_up_proj with separate gate_proj and up_proj for tensor parallelism."""
@@ -169,10 +169,13 @@ class Qwen3_5Attention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape)
 
         cos, sin = position_embeddings
-        # `mrope_interleaved` controls T/H/W frequency mixing in cos/sin
-        # construction upstream, not the q/k rotation convention. q/k always
-        # use the standard half-rotate convention (HF/SGLang).
-        query_states, key_states = qwen3_5_apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = qwen3_5_apply_rotary_pos_emb(
+            query_states,
+            key_states,
+            cos,
+            sin,
+            interleaved=getattr(self.config, "mrope_interleaved", False),
+        )
         return query_states.contiguous(), key_states.contiguous(), value_states.contiguous()
 
     def _project_output(self, attn_output: torch.Tensor) -> torch.Tensor:
@@ -433,6 +436,10 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         )
 
         all_self_attns = () if output_attentions else None
+        # output_hidden_states collects the per-layer residual-stream hidden states
+        # (pre-final-norm), one entry per decoder layer in layer order. Used by the
+        # multi-layer OPRD path; off by default (no collection, no extra memory).
+        all_hidden_states = () if output_hidden_states else None
 
         for decoder_layer in self.layers:
             if decoder_layer is None:
@@ -449,6 +456,9 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
 
             hidden_states = layer_outputs[0]
 
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
@@ -456,6 +466,7 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
 
         return BaseModelOutput(
             last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
 
@@ -528,7 +539,10 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel):
 
         last_hidden_state = outputs.last_hidden_state
 
-        return CausalLMOutput(last_hidden_state=last_hidden_state)
+        return CausalLMOutput(
+            last_hidden_state=last_hidden_state,
+            hidden_states=outputs.hidden_states,
+        )
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3_5ForCausalLM):

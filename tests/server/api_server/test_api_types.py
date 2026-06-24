@@ -183,6 +183,10 @@ class TestOptimWeightsHealthAndSerialization:
         assert request.model_id == "test-model"
         assert request.learning_rate == 1e-4
         assert request.gradient_clip == 1.0
+        assert request.sparse_delta_capture is None
+
+        request = OptimStepRequest(sparse_delta_capture={"enabled": True, "output_dir": "/tmp/source-delta"})
+        assert request.sparse_delta_capture == {"enabled": True, "output_dir": "/tmp/source-delta"}
 
         request = OptimStepRequest()
         assert request.model_id == "default"
@@ -376,7 +380,3 @@ class TestOptimWeightsHealthAndSerialization:
         data = response.model_dump()
         response2 = HealthCheckResponse(**data)
         assert response2.status == response.status
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

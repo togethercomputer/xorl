@@ -272,7 +272,15 @@ class RemoteBackend(Backend):
         )
 
     async def optim_step(
-        self, lr, gradient_clip=None, beta1=None, beta2=None, eps=None, model_id=None, request_id=None
+        self,
+        lr,
+        gradient_clip=None,
+        beta1=None,
+        beta2=None,
+        eps=None,
+        model_id=None,
+        sparse_delta_capture=None,
+        request_id=None,
     ):
         return await self._execute(
             "optim_step",
@@ -283,6 +291,7 @@ class RemoteBackend(Backend):
                 beta2=beta2,
                 eps=eps,
                 model_id=model_id,
+                sparse_delta_capture=sparse_delta_capture,
             ),
             request_id=request_id,
         )
@@ -355,14 +364,18 @@ class RemoteBackend(Backend):
         buffer_size_mb=1024,
         sync_method="nccl_broadcast",
         flush_cache=False,
-        pause_mode="in_place",
+        pause_mode="retract",
         weight_version=None,
         quantization=None,
+        sparse_delta_paths=None,
+        sparse_delta_config=None,
+        model_id=None,
         request_id=None,
     ):
         return await self._execute(
             "sync_inference_weights",
             SyncWeightsData(
+                model_id=model_id,
                 endpoints=endpoints,
                 master_address=master_address,
                 master_port=master_port,
@@ -373,6 +386,8 @@ class RemoteBackend(Backend):
                 pause_mode=pause_mode,
                 weight_version=weight_version,
                 quantization=quantization,
+                sparse_delta_paths=sparse_delta_paths,
+                sparse_delta_config=sparse_delta_config,
             ),
             request_id=request_id,
             timeout=self.operation_timeout,

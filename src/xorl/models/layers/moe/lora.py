@@ -72,6 +72,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         moe_implementation: str = "triton",
         lora_config: Optional[MoELoRAConfig] = None,
         num_local_experts: Optional[int] = None,
+        swiglu_limit: float = 0.0,
     ):
         super().__init__()
         self.num_experts = num_local_experts if num_local_experts is not None else num_experts
@@ -81,9 +82,11 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         self.lora_config = lora_config or MoELoRAConfig()
         self.r = self.lora_config.r
         self.lora_alpha = self.lora_config.lora_alpha
+        self.swiglu_limit = float(swiglu_limit)
         self.active_r = self.r
         self.active_lora_alpha = self.lora_alpha
         self.use_rslora = self.lora_config.use_rslora
+        self.swiglu_limit = float(swiglu_limit)
 
         # Base weights (frozen) in (G, K, N) format
         self.gate_up_proj = nn.Parameter(
@@ -125,6 +128,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         self.deepep_buffer_size_gb: float = 2.0
         self.deepep_num_sms: int = 20
         self.deepep_async_combine: bool = False
+        self.alltoall_combine_hidden_chunk_size: int = 0
 
     @property
     def gate_proj(self) -> torch.Tensor:
@@ -213,20 +217,19 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
     ) -> torch.Tensor:
         """Forward pass with LoRA.
 
-        For **eager**: called per-expert with ``expert_idx``.
-        For **triton/quack/native**: checks EP first, falls back to local path.
+        For **eager**: called per-expert with ``expert_idx`` when EP is disabled.
+        For all implementations: checks EP first, falls back to local path.
         """
-        if self.moe_implementation == "eager":
-            assert expert_idx is not None
-            return self._eager_lora_forward(hidden_states, expert_idx)
-
-        # Check EP — use unified dispatch/compute/combine path
         from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
 
         parallel_state = get_parallel_state()
 
         if parallel_state.ep_enabled:
             return self._ep_forward(hidden_states, routing_weights, selected_experts, parallel_state)
+
+        if self.moe_implementation == "eager":
+            assert expert_idx is not None
+            return self._eager_lora_forward(hidden_states, expert_idx)
 
         # Local path — registry-based
 
@@ -251,6 +254,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
             down_proj_lora_A=down_proj_lora_A,
             down_proj_lora_B=down_proj_lora_B,
             scaling=self._active_scaling(),
+            swiglu_limit=self.swiglu_limit,
         )
 
     def _ep_forward(
@@ -303,6 +307,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
             down_proj_lora_A,
             down_proj_lora_B,
             self._active_scaling(),
+            self.swiglu_limit,
         )
 
         expert_scores = getattr(ctx, "expert_scores", getattr(ctx, "permuted_scores", None))
@@ -337,7 +342,12 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
     def _build_combine_kwargs(self, expert_output, ctx, dispatch_kwargs, parallel_state):
         """Build combine kwargs based on ep_dispatch strategy."""
         if self.ep_dispatch == "alltoall":
-            return dict(expert_output=expert_output, ctx=ctx, ep_group=parallel_state.ep_group)
+            return dict(
+                expert_output=expert_output,
+                ctx=ctx,
+                ep_group=parallel_state.ep_group,
+                hidden_chunk_size=self.alltoall_combine_hidden_chunk_size,
+            )
         elif self.ep_dispatch == "deepep":
             return dict(
                 buffer=dispatch_kwargs["buffer"],
@@ -364,6 +374,9 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
             B = gate_B[expert_idx].to(compute_dtype)
             gate_proj_out = gate_proj_out + torch.matmul(torch.matmul(hidden_states, A), B) * active_scaling
 
+        if self.swiglu_limit > 0:
+            gate_proj_out = gate_proj_out.clamp(-self.swiglu_limit, self.swiglu_limit)
+
         if "up_proj" in self.lora_config.target_modules:
             up_A, up_B = self._active_lora_views("up_proj")
             A = up_A[min(expert_idx, up_A.shape[0] - 1)].to(compute_dtype)
@@ -386,7 +399,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
             f"num_experts={self.num_experts}, hidden_dim={self.hidden_dim}, "
             f"intermediate_size={self.intermediate_size}, r={self.active_r}, max_r={self.r}, "
             f"lora_alpha={self.active_lora_alpha}, "
-            f"target_modules={self.lora_config.target_modules}"
+            f"target_modules={self.lora_config.target_modules}, swiglu_limit={self.swiglu_limit}"
         )
 
     @classmethod
@@ -417,12 +430,15 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
             moe_implementation=moe_implementation,
             lora_config=lora_config,
             num_local_experts=num_exp,
+            swiglu_limit=float(getattr(module, "swiglu_limit", 0.0)),
         )
         lora_experts.act_fn = module.act_fn
         lora_experts.ep_dispatch = getattr(module, "ep_dispatch", "alltoall")
         lora_experts.deepep_buffer_size_gb = getattr(module, "deepep_buffer_size_gb", 2.0)
         lora_experts.deepep_num_sms = getattr(module, "deepep_num_sms", 20)
         lora_experts.deepep_async_combine = getattr(module, "deepep_async_combine", False)
+        lora_experts.alltoall_combine_hidden_chunk_size = getattr(module, "alltoall_combine_hidden_chunk_size", 0)
+        lora_experts.swiglu_limit = float(getattr(module, "swiglu_limit", 0.0))
 
         base_weight = base_gate_up if base_gate_up is not None else module.gate_proj
         lora_experts = lora_experts.to(
@@ -472,12 +488,15 @@ def inject_lora_into_experts(
         moe_implementation=moe_implementation,
         lora_config=lora_config,
         num_local_experts=num_local_experts,
+        swiglu_limit=float(getattr(block.experts, "swiglu_limit", 0.0)),
     )
     lora_experts.act_fn = block.experts.act_fn
     lora_experts.ep_dispatch = getattr(block.experts, "ep_dispatch", "alltoall")
     lora_experts.deepep_buffer_size_gb = getattr(block.experts, "deepep_buffer_size_gb", 2.0)
     lora_experts.deepep_num_sms = getattr(block.experts, "deepep_num_sms", 20)
     lora_experts.deepep_async_combine = getattr(block.experts, "deepep_async_combine", False)
+    lora_experts.alltoall_combine_hidden_chunk_size = getattr(block.experts, "alltoall_combine_hidden_chunk_size", 0)
+    lora_experts.swiglu_limit = float(getattr(block.experts, "swiglu_limit", 0.0))
 
     base_weight = gate_up_proj if gate_up_proj is not None else block.experts.gate_proj
     lora_experts = lora_experts.to(

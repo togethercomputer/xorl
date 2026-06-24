@@ -25,7 +25,7 @@ from xorl.ops.quantize import (
 from xorl.ops.quantize.nvfp4_gkn_quantize import nvfp4_dequantize_gkn, nvfp4_quantize_gkn
 
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = [pytest.mark.gpu, pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")]
 
 
 # =========================================================================

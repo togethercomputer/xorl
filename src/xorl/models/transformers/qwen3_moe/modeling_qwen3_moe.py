@@ -88,6 +88,7 @@ class Qwen3MoeSparseExperts(MoEExperts):
             intermediate_size=config.moe_intermediate_size,
             hidden_act=config.hidden_act,
             moe_implementation="eager",
+            activation_native=getattr(config, "_activation_native", False),
         )
 
 
@@ -101,6 +102,7 @@ class Qwen3MoeTritonExperts(MoEExperts):
             intermediate_size=config.moe_intermediate_size,
             hidden_act=config.hidden_act,
             moe_implementation="triton",
+            activation_native=getattr(config, "_activation_native", False),
         )
 
 
@@ -114,6 +116,7 @@ class Qwen3MoeQuackExperts(MoEExperts):
             intermediate_size=config.moe_intermediate_size,
             hidden_act=config.hidden_act,
             moe_implementation="quack",
+            activation_native=getattr(config, "_activation_native", False),
         )
 
 
@@ -136,12 +139,14 @@ class Qwen3MoeSparseMoeBlock(MoEBlock):
             norm_topk_prob=config.norm_topk_prob,
             moe_implementation="eager",
             train_router=getattr(config, "train_router", False),
+            activation_native=getattr(config, "_activation_native", False),
         )
         self.config = config
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
         self.experts.deepep_buffer_size_gb = getattr(config, "_deepep_buffer_size_gb", 2.0)
         self.experts.deepep_num_sms = getattr(config, "_deepep_num_sms", 20)
         self.experts.deepep_async_combine = getattr(config, "_deepep_async_combine", False)
+        self.experts.alltoall_combine_hidden_chunk_size = getattr(config, "_alltoall_combine_hidden_chunk_size", 0)
 
 
 class Qwen3MoeSparseTritonMoeBlock(MoEBlock):
@@ -157,12 +162,14 @@ class Qwen3MoeSparseTritonMoeBlock(MoEBlock):
             norm_topk_prob=config.norm_topk_prob,
             moe_implementation="triton",
             train_router=getattr(config, "train_router", False),
+            activation_native=getattr(config, "_activation_native", False),
         )
         self.config = config
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
         self.experts.deepep_buffer_size_gb = getattr(config, "_deepep_buffer_size_gb", 2.0)
         self.experts.deepep_num_sms = getattr(config, "_deepep_num_sms", 20)
         self.experts.deepep_async_combine = getattr(config, "_deepep_async_combine", False)
+        self.experts.alltoall_combine_hidden_chunk_size = getattr(config, "_alltoall_combine_hidden_chunk_size", 0)
 
 
 class Qwen3MoeSparseQuackMoeBlock(MoEBlock):
@@ -178,12 +185,14 @@ class Qwen3MoeSparseQuackMoeBlock(MoEBlock):
             norm_topk_prob=config.norm_topk_prob,
             moe_implementation="quack",
             train_router=getattr(config, "train_router", False),
+            activation_native=getattr(config, "_activation_native", False),
         )
         self.config = config
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
         self.experts.deepep_buffer_size_gb = getattr(config, "_deepep_buffer_size_gb", 2.0)
         self.experts.deepep_num_sms = getattr(config, "_deepep_num_sms", 20)
         self.experts.deepep_async_combine = getattr(config, "_deepep_async_combine", False)
+        self.experts.alltoall_combine_hidden_chunk_size = getattr(config, "_alltoall_combine_hidden_chunk_size", 0)
 
 
 class Qwen3MoeSparseNativeMoeBlock(MoEBlock):
@@ -199,12 +208,14 @@ class Qwen3MoeSparseNativeMoeBlock(MoEBlock):
             norm_topk_prob=config.norm_topk_prob,
             moe_implementation="native",
             train_router=getattr(config, "train_router", False),
+            activation_native=getattr(config, "_activation_native", False),
         )
         self.config = config
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
         self.experts.deepep_buffer_size_gb = getattr(config, "_deepep_buffer_size_gb", 2.0)
         self.experts.deepep_num_sms = getattr(config, "_deepep_num_sms", 20)
         self.experts.deepep_async_combine = getattr(config, "_deepep_async_combine", False)
+        self.experts.alltoall_combine_hidden_chunk_size = getattr(config, "_alltoall_combine_hidden_chunk_size", 0)
 
 
 QWEN3_MOE_CLASSES = {
@@ -317,7 +328,7 @@ class Qwen3MoePreTrainedModel(XorlPreTrainedModel):
         unfused = getattr(self, "_unfused_for_tp", False)
         skip_expert_loading = False
         if not is_prequantized:
-            from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
+            from xorl.qlora.modules.moe_experts import QLoRAMoeExperts  # noqa: PLC0415
 
             skip_expert_loading = any(
                 isinstance(module, QLoRAMoeExperts) and not getattr(module, "_weights_loaded", False)
@@ -437,6 +448,9 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         # decoder layers
         all_self_attns = () if output_attentions else None
         all_router_logits = () if output_router_logits else None
+        # Preserve the standard HF hidden_states convention here. qwen3_5_moe
+        # intentionally returns OPRD post-layer hiddens instead; keep consumers model-specific.
+        all_hidden_states = () if output_hidden_states else None
 
         _grad_ckpt_active = self.gradient_checkpointing and self.training
         _grad_ckpt_method = self._gradient_checkpointing_method if _grad_ckpt_active else None
@@ -444,6 +458,8 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         for decoder_layer in self.layers:
             if decoder_layer is None:  # PP: pruned layer
                 continue
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
 
             if _grad_ckpt_method == "recompute_full_layer":
                 # Recompute entire layer in backward (including dispatch + combine)
@@ -492,9 +508,12 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
 
         # PP support: norm may be None on non-last stages
         hidden_states = self.norm(hidden_states) if self.norm is not None else hidden_states
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
 
         return MoeModelOutput(
             last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
             attentions=all_self_attns,
             router_logits=all_router_logits,
         )
@@ -574,6 +593,7 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel):
 
         return MoeCausalLMOutput(
             last_hidden_state=outputs.last_hidden_state,
+            hidden_states=outputs.hidden_states,
             router_logits=outputs.router_logits,
         )
 

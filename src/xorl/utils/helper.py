@@ -146,6 +146,9 @@ class EnvironMeter:
         else:
             flops_achieved, flops_promised = self.estimate_flops(self.batch_seqlens, delta_time)
 
+        if self.empty_cache_steps > 0 and global_step % self.empty_cache_steps == 0:
+            empty_cache()
+
         flops_achieved, batch_tokens, real_global_batch_size = all_reduce(
             (flops_achieved, sum(self.batch_seqlens), len(self.batch_seqlens)),
             op="sum",
@@ -185,9 +188,6 @@ class EnvironMeter:
             "memory/cpu_usage(%)": cpu_memory_info.percent,
             "memory/num_alloc_retries": num_alloc_retries,
         }
-
-        if self.empty_cache_steps > 0 and global_step % self.empty_cache_steps == 0:
-            empty_cache()
 
         if self.gc_steps > 0 and global_step % self.gc_steps == 0:
             gc.collect()

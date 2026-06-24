@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+import torch
 
 from xorl.server.backend import DummyBackend
 from xorl.server.orchestrator.request_processor import RequestProcessor
@@ -111,6 +112,28 @@ async def test_forward_backward_operations(processor):
     output = await processor.execute_forward(request)
     assert output.output_type == OutputType.FORWARD
     assert "loss" in output.outputs[0]
+
+
+@pytest.mark.asyncio
+async def test_forward_backward_preserves_runner_result_fields(processor):
+    result = {
+        "total_loss": 0.5,
+        "global_valid_tokens": 2,
+        "forward_backward_time": 1.25,
+    }
+    processor.backend.forward_backward = AsyncMock(return_value=result)
+
+    request = OrchestratorRequest(
+        request_id="req-fb-result",
+        request_type=RequestType.ADD,
+        operation="forward_backward",
+        payload=ModelPassData(data=[{"input_ids": [1, 2], "labels": [2, 3]}], loss_fn="causallm_loss"),
+    )
+
+    output = await processor.execute_forward_backward(request)
+
+    assert output.output_type == OutputType.FORWARD_BACKWARD
+    assert output.outputs[0]["forward_backward_time"] == pytest.approx(1.25)
 
 
 def test_teacher_sort_key_reads_nested_loss_inputs():
@@ -328,6 +351,19 @@ async def test_optim_and_checkpoint_operations(processor):
     assert "grad_norm" in output.outputs[0]
     assert output.outputs[0]["learning_rate"] == 0.001
 
+    request = OrchestratorRequest(
+        request_id="req-004-capture",
+        request_type=RequestType.ADD,
+        operation="optim_step",
+        payload=OptimStepData(
+            lr=0.001,
+            gradient_clip=1.0,
+            sparse_delta_capture={"enabled": True, "output_dir": "/tmp/source-delta"},
+        ),
+    )
+    output = await processor.execute_optim_step(request)
+    assert output.outputs[0]["sparse_delta_capture"] == {"enabled": True, "dummy": True}
+
     # Save state
     request = OrchestratorRequest(
         request_id="req-save",
@@ -502,3 +538,96 @@ async def test_error_handling(processor):
 
     assert processor.total_operations >= 5
     assert processor.successful_operations >= 5
+
+
+# ============================================================================
+# _unpack_token_diagnostics
+# ============================================================================
+
+
+def test_unpack_token_diagnostics_splits_two_samples():
+    """Two packed samples with a position-id reset between them: diagnostics
+    split correctly, valid_positions rebased per sample, fields aligned."""
+    # Packed sequence: sample A spans positions 0..3, sample B spans 0..2.
+    position_ids = torch.tensor([[0, 1, 2, 3, 0, 1, 2]])
+    # Valid (non-IGNORE) positions in micro-batch coords: A has 1,3; B has 4,6.
+    diagnostics = {
+        "valid_positions": [1, 3, 4, 6],
+        "target_ids": [11, 13, 24, 26],
+        "target_logprobs": [-1.0, -1.5, -2.0, -2.5],
+        "target_ranks": [1, 2, 3, 4],
+        "topk_ids": [[11, 12], [13, 14], [24, 25], [26, 27]],
+        "topk_logprobs": [[-1.0, -1.1], [-1.5, -1.6], [-2.0, -2.1], [-2.5, -2.6]],
+        "loss_logprobs": [-1.0, -1.5, -2.0, -2.5],
+        "loss_logprob_deltas": [0.0, 0.0, 0.0, 0.0],
+        "reference_target_logprobs": [-0.9, -1.4, -1.9, -2.4],
+        "reference_target_ranks": [1, 2, 2, 3],
+        "reference_logprob_deltas": [-0.1, -0.1, -0.1, -0.1],
+        "hidden_state_summaries": [
+            {"layer_count": 2, "layers": [{"index": 0, "rms": 1.0}]},
+            {"layer_count": 2, "layers": [{"index": 0, "rms": 1.3}]},
+            {"layer_count": 2, "layers": [{"index": 0, "rms": 2.4}]},
+            {"layer_count": 2, "layers": [{"index": 0, "rms": 2.6}]},
+        ],
+        "hidden_component_summaries": [
+            {"component_count": 2, "components": [{"layer": 34, "name": "layer_input", "rms": 1.0}]},
+            {"component_count": 2, "components": [{"layer": 34, "name": "mlp", "rms": 1.3}]},
+            {"component_count": 2, "components": [{"layer": 38, "name": "layer_input", "rms": 2.4}]},
+            {"component_count": 2, "components": [{"layer": 38, "name": "mlp", "rms": 2.6}]},
+        ],
+    }
+    samples = RequestProcessor._unpack_token_diagnostics(diagnostics, position_ids)
+    assert len(samples) == 2
+
+    a, b = samples
+    # Sample A: positions 1,3 → rebased identical (sample starts at 0)
+    assert a["valid_positions"] == [1, 3]
+    assert a["target_ids"] == [11, 13]
+    assert a["target_ranks"] == [1, 2]
+    assert a["topk_ids"] == [[11, 12], [13, 14]]
+    assert a["loss_logprobs"] == [-1.0, -1.5]
+    assert a["reference_target_logprobs"] == [-0.9, -1.4]
+    assert a["reference_target_ranks"] == [1, 2]
+    assert a["hidden_state_summaries"][1]["layers"][0]["rms"] == 1.3
+    assert a["hidden_component_summaries"][1]["components"][0]["name"] == "mlp"
+
+    # Sample B: positions 4,6 → rebased to 0,2 (sample starts at 4)
+    assert b["valid_positions"] == [0, 2]
+    assert b["target_ids"] == [24, 26]
+    assert b["target_ranks"] == [3, 4]
+    assert b["topk_ids"] == [[24, 25], [26, 27]]
+    assert b["loss_logprob_deltas"] == [0.0, 0.0]
+    assert b["reference_logprob_deltas"] == [-0.1, -0.1]
+    assert b["hidden_state_summaries"][0]["layers"][0]["rms"] == 2.4
+    assert b["hidden_component_summaries"][0]["components"][0]["layer"] == 38
+
+
+def test_unpack_token_diagnostics_empty_diagnostics_returns_empty():
+    """Empty/falsy diagnostics short-circuits to []."""
+    assert RequestProcessor._unpack_token_diagnostics({}, torch.tensor([[0, 1, 2]])) == []
+    assert RequestProcessor._unpack_token_diagnostics(None, torch.tensor([[0, 1, 2]])) == []
+    # Has shape but no valid positions
+    empty_diag = {
+        "valid_positions": [],
+        "target_ids": [],
+        "target_logprobs": [],
+        "target_ranks": [],
+        "topk_ids": [],
+        "topk_logprobs": [],
+    }
+    assert RequestProcessor._unpack_token_diagnostics(empty_diag, torch.tensor([[0, 1, 2]])) == []
+
+
+def test_unpack_token_diagnostics_field_length_mismatch_raises():
+    """A producer-side bug (field shorter than valid_positions) raises rather than
+    silently truncating."""
+    diagnostics = {
+        "valid_positions": [0, 1, 2],
+        "target_ids": [10, 11],  # one short
+        "target_logprobs": [-1.0, -1.1, -1.2],
+        "target_ranks": [1, 1, 1],
+        "topk_ids": [[10], [11], [12]],
+        "topk_logprobs": [[-1.0], [-1.1], [-1.2]],
+    }
+    with pytest.raises(ValueError, match="target_ids"):
+        RequestProcessor._unpack_token_diagnostics(diagnostics, torch.tensor([[0, 1, 2]]))

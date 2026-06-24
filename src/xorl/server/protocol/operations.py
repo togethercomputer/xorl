@@ -54,6 +54,7 @@ class OptimStepData:
     beta2: Optional[float] = None
     eps: Optional[float] = None
     model_id: Optional[str] = None
+    sparse_delta_capture: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -97,6 +98,7 @@ class SaveFullWeightsData:
 class SyncWeightsData:
     """Payload for sync_inference_weights operations."""
 
+    model_id: Optional[str] = None
     endpoints: List[Dict[str, Any]] = field(default_factory=list)
     master_address: str = "localhost"
     master_port: int = 0
@@ -104,9 +106,15 @@ class SyncWeightsData:
     buffer_size_mb: int = 1024
     sync_method: str = "nccl_broadcast"
     flush_cache: bool = False
-    pause_mode: str = "in_place"
+    cache_invalidation_mode: str = "auto"
+    fp8_kv_cache_enabled: bool = False
+    fp8_kv_cache_postprocess_required: bool = False
+    fp8_kv_cache_static_scales: bool = False
+    pause_mode: str = "retract"
     weight_version: Optional[str] = None
     quantization: Optional[Dict[str, Any]] = None
+    sparse_delta_paths: Optional[List[str]] = None
+    sparse_delta_config: Optional[Dict[str, Any]] = None
 
 
 @dataclass

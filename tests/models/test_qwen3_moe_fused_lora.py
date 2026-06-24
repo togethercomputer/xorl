@@ -13,6 +13,9 @@ from xorl.models.transformers.qwen3_moe.modeling_qwen3_moe import (
 )
 
 
+pytestmark = [pytest.mark.gpu]
+
+
 class MockConfig:
     """Mock config for testing."""
 

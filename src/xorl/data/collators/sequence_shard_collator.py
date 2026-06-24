@@ -89,9 +89,13 @@ class TextSequenceShardCollator(DataCollator):
 
     Args:
         pad_token_id: The id of the padding token.
+        fa_max_length_bucket: If > 0, round the flash-attn max_length up to a multiple of this value
+            (upper bound only; correctness via cu_seqlens) to avoid torch.compile recompiling on ragged
+            packs. 0 = off.
     """
 
     pad_token_id: int = 0
+    fa_max_length_bucket: int = 0
 
     def __post_init__(self):
         self.cp_size = get_parallel_state().cp_size
@@ -248,7 +252,9 @@ class TextSequenceShardCollator(DataCollator):
             "rollout_logprobs": torch.float,
             "teacher_ids": torch.long,
             "teacher_cache_indices": torch.long,
+            "teacher_cache_local_indices": torch.long,
             "teacher_weights": torch.float,
+            "hidden_match_weights": torch.float,
             "teacher_hidden_states": torch.float,
         }
         for field, dtype in rl_field_dtypes.items():
@@ -298,12 +304,14 @@ class TextSequenceShardCollator(DataCollator):
         # _scale_cu_seqlens_for_ringattn then scales these per-rank.
         if self.ringattn_size > 1 and "_original_position_ids" in batch:
             orig_pos = batch["_original_position_ids"]
-            (cu_q, cu_k), (max_q, max_k) = prepare_fa_kwargs_from_position_ids(orig_pos)
+            (cu_q, cu_k), (max_q, max_k) = prepare_fa_kwargs_from_position_ids(
+                orig_pos, max_length_bucket=self.fa_max_length_bucket
+            )
             batch["cu_seq_lens_q"] = cu_q
             batch["cu_seq_lens_k"] = cu_k
             batch["max_length_q"] = max_q
             batch["max_length_k"] = max_k
         else:
-            add_flash_attention_kwargs_from_position_ids(batch)
+            add_flash_attention_kwargs_from_position_ids(batch, max_length_bucket=self.fa_max_length_bucket)
 
         return batch

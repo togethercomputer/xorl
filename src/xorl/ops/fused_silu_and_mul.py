@@ -5,8 +5,15 @@ Used by both dense MLP (SwiGLU) and MoE expert layers.
 """
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
+
+
+def _native_silu_and_mul(input_tensor: torch.Tensor) -> torch.Tensor:
+    assert input_tensor.shape[-1] % 2 == 0, "Last dimension must be even"
+    gate, up = input_tensor.chunk(2, dim=-1)
+    return F.silu(gate) * up
 
 
 @triton.jit
@@ -63,6 +70,8 @@ def silu_and_mul(input_tensor: torch.Tensor) -> torch.Tensor:
         Output tensor of shape [..., N]
     """
     assert input_tensor.shape[-1] % 2 == 0, "Last dimension must be even"
+    if not input_tensor.is_cuda:
+        return _native_silu_and_mul(input_tensor)
 
     original_shape = input_tensor.shape
     input_2d = input_tensor.view(-1, original_shape[-1])
@@ -148,6 +157,13 @@ def silu_and_mul_backward(grad_output: torch.Tensor, input_tensor: torch.Tensor)
     Returns:
         Gradient of input, shape [..., 2*N]
     """
+    if not input_tensor.is_cuda:
+        gate, up = input_tensor.chunk(2, dim=-1)
+        sigmoid_gate = torch.sigmoid(gate)
+        silu_gate = gate * sigmoid_gate
+        silu_grad = sigmoid_gate + gate * sigmoid_gate * (1.0 - sigmoid_gate)
+        return torch.cat([grad_output * up * silu_grad, grad_output * silu_gate], dim=-1)
+
     original_shape = input_tensor.shape
     input_2d = input_tensor.view(-1, original_shape[-1])
     grad_output_2d = grad_output.view(-1, grad_output.shape[-1])
@@ -194,4 +210,6 @@ def fused_silu_and_mul(input_tensor: torch.Tensor) -> torch.Tensor:
     Returns:
         Output tensor of shape [..., N]
     """
+    if not input_tensor.is_cuda:
+        return _native_silu_and_mul(input_tensor)
     return SiluAndMulFunction.apply(input_tensor)

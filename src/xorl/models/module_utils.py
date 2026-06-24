@@ -35,7 +35,7 @@ from xorl.models.checkpoint_handlers.buffers import (  # noqa: F401
     parse_expert_full_key,
     parse_expert_key,
 )
-from xorl.ops.loss import get_loss_function
+from xorl.ops.loss import fsdp_sharded_causallm_loss_function, get_loss_function
 from xorl.utils import logging
 from xorl.utils.device import get_device_id, get_device_type, synchronize
 from xorl.utils.helper import empty_cache, get_dtype_size
@@ -970,6 +970,8 @@ class _MultiStreamDMA:
             stream.synchronize()
             orig_tensor = module._parameters[local_name].data
             if dtensor_factory is not None and hasattr(orig_tensor, "device_mesh"):
+                if _copy_into_existing_dtensor_shard(orig_tensor, gpu_temp):
+                    continue
                 device_mesh = getattr(orig_tensor, "device_mesh")
                 placements = getattr(orig_tensor, "placements")
                 module._parameters[local_name].data.copy_(dtensor_factory(gpu_temp, device_mesh, placements))
@@ -1294,6 +1296,31 @@ def all_ranks_load_weights(
     If the model provides a CheckpointHandler (via get_checkpoint_handler()),
     weight transforms (e.g., expert merging, gate/up merging) are delegated to it.
     """
+    # Validate that every rank reached this call with the SAME weights_path
+    # AND the same `os.path.isdir(weights_path)` result. `_try_load_state_dict`
+    # branches on `os.path.isdir`: True → no broadcast, False → broadcast.
+    # If ranks disagree on the path (e.g., master configured with the HF model
+    # name "Qwen/..." while workers received the resolved snapshot path), the
+    # broadcast collective is only entered on a subset of ranks and the load
+    # deadlocks for the full PG timeout at `_broadcast_object_list_weight_load`
+    # on the world pgroup. This check turns that footgun into a fast, descriptive
+    # error.
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        local_is_dir = os.path.isdir(weights_path)
+        gathered = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered, (weights_path, local_is_dir))
+        unique = set(gathered)
+        if len(unique) != 1:
+            samples = sorted(unique)[:4]
+            raise RuntimeError(
+                "all_ranks_load_weights: ranks disagree on (weights_path, os.path.isdir) — "
+                "loading would deadlock at the rank-0 path broadcast in "
+                "_broadcast_object_list_weight_load. Ensure every rank's launcher "
+                "passes the same model_path (e.g., --server.model_path on the master "
+                "matches the worker's --model_path). "
+                f"Distinct values seen across {dist.get_world_size()} ranks: {samples}"
+            )
+
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
     parameter_names_to_load = {name for name, _ in model.named_parameters()}
 
@@ -1440,7 +1467,7 @@ def all_ranks_load_weights(
     # for ~2x throughput.  Uses ~1 shard of extra VRAM for temp GPU tensors,
     # freed per shard via flush().
     global _active_dma_scheduler
-    dma_scheduler = _MultiStreamDMA(num_streams=2)
+    dma_scheduler = _MultiStreamDMA(num_streams=2) if init_device == "cuda" else None
     _active_dma_scheduler = dma_scheduler
 
     try:
@@ -1467,7 +1494,8 @@ def all_ranks_load_weights(
                     _dispatch_results(results)
 
                 # Flush deferred DMA copies before freeing shard memory
-                dma_scheduler.flush()
+                if dma_scheduler is not None:
+                    dma_scheduler.flush()
                 del state_dict
                 empty_cache()
         else:
@@ -1491,7 +1519,8 @@ def all_ranks_load_weights(
                     _dispatch_results(results)
 
                 # Flush deferred DMA copies before freeing shard memory
-                dma_scheduler.flush()
+                if dma_scheduler is not None:
+                    dma_scheduler.flush()
                 del state_dict
                 empty_cache()
 
@@ -1502,7 +1531,8 @@ def all_ranks_load_weights(
                     parameter_names_to_load.remove(param_name)
                     _dispatch_parameter(model, param_name, param_tensor, dtensor_factory, parallel_plan)
             # Final flush for any handler-emitted tensors
-            dma_scheduler.flush()
+            if dma_scheduler is not None:
+                dma_scheduler.flush()
     finally:
         _active_dma_scheduler = None
 
@@ -1804,6 +1834,42 @@ def grouped_load_weights(
         return all_ranks_load_weights(model, weights_path, init_device, dtensor_factory)
 
     _ps = get_parallel_state()
+
+    # Fast-fail on cross-rank divergence in the values that determine the number
+    # and membership of the dist.new_group() subgroup collectives below (the
+    # per-EP-FSDP fanout group and the per-node dense group) and the os.path.isdir
+    # branch in _try_load_state_dict. A mismatch — e.g. the head's auto-launched
+    # workers seeing the HF model name (isdir False) while sibling-pod workers see
+    # the resolved snapshot dir (isdir True), or a skewed LOCAL_WORLD_SIZE / EP
+    # mesh shape — otherwise hangs new_group / the metadata broadcast on the world
+    # process group for the full PG timeout (the 30-min stall after "NCCL version").
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        ep_mesh_shape = None
+        if getattr(_ps, "ep_enabled", False) and getattr(_ps, "ep_fsdp_device_mesh", None) is not None:
+            ep_mesh_shape = tuple(_ps.ep_fsdp_device_mesh.mesh.shape)
+        local_world_size = max(1, int(os.environ.get("LOCAL_WORLD_SIZE", "1")))
+        signature = (
+            weights_path,
+            os.path.isdir(weights_path),
+            bool(getattr(_ps, "ep_enabled", False)),
+            ep_mesh_shape,
+            local_world_size,
+            dist.get_world_size(),
+        )
+        gathered = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered, signature)
+        if len(set(gathered)) != 1:
+            samples = sorted({repr(s) for s in gathered})[:4]
+            raise RuntimeError(
+                "grouped_load_weights: ranks disagree on the load collective signature "
+                "(weights_path, os.path.isdir, ep_enabled, ep_mesh_shape, LOCAL_WORLD_SIZE, world_size) — "
+                "the per-EP-FSDP-group / per-node dist.new_group() subgroup collectives (and the rank-0 "
+                "metadata broadcast) would deadlock on the world process group. Ensure every rank's "
+                "launcher passes the same resolved model_path (the head's auto-launched workers must "
+                "receive the same --model_path as the sibling-pod workers) and a uniform LOCAL_WORLD_SIZE. "
+                f"Distinct signatures across {dist.get_world_size()} ranks: {samples}"
+            )
+
     fanout_group = _get_grouped_weight_load_group(_ps)
     if fanout_group is None:
         logger.info_rank0("Grouped weight loading requires EP/FSDP groups; using rank-0 load fallback.")
@@ -2642,8 +2708,10 @@ def save_model_assets(output_dir: Union[str, "os.PathLike"], model_assets: Seque
             logger.warning(f"Model asset {model_asset} should implement `save_pretrained`.")
 
 
-def get_lm_head_weight(lm_head: nn.Module) -> torch.Tensor:
+def get_lm_head_weight(lm_head: nn.Module, *, fsdp_sharded_loss: bool = False) -> torch.Tensor:
     """Get lm_head weight, merging LoRA delta if applicable."""
+    if fsdp_sharded_loss and isinstance(lm_head, LoraLinear):
+        raise NotImplementedError("fsdp_sharded_lm_head_loss is not supported with LoRA lm_head adapters.")
     if isinstance(lm_head, LoraLinear):
         return lm_head.weight + lm_head.get_delta_weight().to(lm_head.weight.dtype)
     return lm_head.weight
@@ -2659,8 +2727,11 @@ def compute_loss(
 ):
     """Compute loss given lm_head module and hidden states.
 
-    Called externally (e.g. from the training loop). FSDP2 keeps lm_head.weight
-    all-gathered via reshard_after_forward=False on the norm + lm_head unit.
+    Called externally (e.g. from the training loop). By default, FSDP2 keeps
+    lm_head.weight all-gathered via reshard_after_forward=False on the
+    norm + lm_head unit. For very large vocab heads, the FSDP policy can mark
+    lm_head for sharded loss; in that case, cross-entropy runs over the local
+    FSDP shard with vocab-parallel reductions over the FSDP group.
 
     All tensor inputs (labels, old_logprobs, advantages, etc.) should be passed
     via ``loss_fn_inputs``.  Scalar hyper-parameters (eps_clip, compute_kl_stats,
@@ -2671,16 +2742,92 @@ def compute_loss(
     """
     fn_name = loss_fn_name or "causallm_loss"
     loss_fn = get_loss_function(fn_name)
-    weight = get_lm_head_weight(lm_head)
+    fsdp_sharded_loss = bool(getattr(lm_head, "_xorl_fsdp_sharded_lm_head_loss", False))
+    if fsdp_sharded_loss and fn_name not in {"causallm_loss", "cross_entropy"}:
+        raise NotImplementedError(f"fsdp_sharded_lm_head_loss is not supported for loss function {fn_name!r}.")
+    weight = get_lm_head_weight(lm_head, fsdp_sharded_loss=fsdp_sharded_loss)
 
     slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
     hidden_states = last_hidden_state[:, slice_indices, :]
+
+    ps = get_parallel_state()
+    if fsdp_sharded_loss:
+        if ps.tp_enabled:
+            raise NotImplementedError("fsdp_sharded_lm_head_loss is not supported together with tensor parallelism.")
+        if loss_fn_inputs is None or "labels" not in loss_fn_inputs:
+            raise ValueError("fsdp_sharded_lm_head_loss requires labels in loss_fn_inputs.")
+        if any(k != "labels" for k in loss_fn_inputs):
+            raise NotImplementedError("fsdp_sharded_lm_head_loss currently supports only label-based CE inputs.")
+
+        labels = loss_fn_inputs["labels"][:, slice_indices]
+        loss_params = dict(loss_fn_params or {})
+        num_chunks = int(loss_params.pop("fsdp_sharded_lm_head_loss_num_chunks", 8))
+        global_valid_tokens = loss_params.pop("fsdp_sharded_lm_head_loss_global_valid_tokens", None)
+        if loss_params.pop("z_loss_coef", 0.0) > 0.0:
+            raise NotImplementedError("fsdp_sharded_lm_head_loss does not support Z-loss yet.")
+        if loss_params.pop("return_per_token", False):
+            raise NotImplementedError("fsdp_sharded_lm_head_loss does not support per-token loss outputs.")
+        loss_params.pop("ce_mode", None)
+        loss_params.pop("num_chunks", None)
+        use_compile = loss_params.pop("use_compile", False)
+        if use_compile:
+            raise NotImplementedError("fsdp_sharded_lm_head_loss does not support compiled vocab CE kernels yet.")
+        ignore_index = int(loss_params.pop("ignore_index", -100))
+        lm_head_fp32 = bool(loss_params.pop("lm_head_fp32", False))
+        empty_cache_before = bool(loss_params.pop("empty_cache_before_sharded_lm_head_loss", True))
+        if loss_params:
+            raise NotImplementedError(f"Unsupported fsdp_sharded_lm_head_loss parameters: {sorted(loss_params.keys())}")
+
+        # lm-head-only TP: the vocab is split over a dedicated lm_head_tp_group
+        # (a sub-group of the sequence-parallel ranks) while every other module
+        # keeps its scheme. Each lm_head_tp_group computes the CE over its own
+        # sequence shard; summing over the replica dim (cp_replica x DP, the ranks
+        # holding the *same* vocab rows but distinct sequence shards) reconstructs
+        # the full-sequence loss with no duplication, so divisor=1. This reduction
+        # is non-differentiable; the matching weight-gradient sum over the same
+        # replica dim is done by sync_lm_head_tp_gradient (FSDP's reduce hook does
+        # not fire because the vocab-parallel CE reads lm_head.weight directly).
+        # Regular fsdp_sharded_lm_head_loss (lm_head_tp_size == 1) leaves these
+        # None -> sp_group/fsdp_group.
+        if getattr(ps, "lm_head_tp_size", 1) > 1:
+            sequence_group = ps.lm_head_tp_group
+            vocab_group = ps.lm_head_tp_group
+            loss_reduce_group = ps.lm_head_tp_replica_group
+            loss_reduce_divisor = 1.0
+        else:
+            sequence_group = None
+            vocab_group = None
+            loss_reduce_group = None
+            loss_reduce_divisor = 1.0
+
+        if empty_cache_before:
+            empty_cache()
+        return fsdp_sharded_causallm_loss_function(
+            hidden_states=hidden_states,
+            weight=weight,
+            labels=labels,
+            sp_group=ps.sp_group,
+            fsdp_group=ps.fsdp_group,
+            num_chunks=num_chunks,
+            ignore_index=ignore_index,
+            lm_head_fp32=lm_head_fp32,
+            global_valid_tokens=global_valid_tokens,
+            sequence_group=sequence_group,
+            vocab_group=vocab_group,
+            loss_reduce_group=loss_reduce_group,
+            loss_reduce_divisor=loss_reduce_divisor,
+        )
 
     loss_kwargs = {
         "hidden_states": hidden_states,
         "weight": weight,
     }
-    ps = get_parallel_state()
+    try:
+        from xorl.fp8_training import FP8Linear  # noqa: PLC0415
+    except ImportError:  # pragma: no cover - optional in lightweight import contexts.
+        FP8Linear = None
+    if FP8Linear is not None and isinstance(lm_head, FP8Linear) and fn_name in {"causallm_loss", "cross_entropy"}:
+        loss_kwargs["lm_head"] = lm_head
     if ps.tp_enabled:
         loss_kwargs["tp_group"] = ps.tp_group
     if loss_fn_inputs:
@@ -2695,6 +2842,7 @@ GradientCheckpointingMethod = Literal[
     "recompute_full_layer",
     "recompute_before_dispatch",
     "no_recompute",
+    "moe_act",
 ]
 DEFAULT_GRADIENT_CHECKPOINTING_METHOD: GradientCheckpointingMethod = "recompute_full_layer"
 
@@ -2733,6 +2881,33 @@ class GradientCheckpointingLayer(nn.Module):
         ):
             return self._gradient_checkpointing_func(partial(super().__call__, **kwargs), *args)
         return super().__call__(*args, **kwargs)
+
+
+def _dynamo_stable_checkpoint_fn(fn):
+    """Run a checkpointed segment with dynamo disabled so the backward recompute is
+    bit-identical to the forward.
+
+    With ``rmsnorm_mode: compile`` (or any torch.compile'd op inside the segment),
+    dynamo's GLOBAL recompile-limit state can flip between a micro-batch's forward
+    and its backward recompute under varlen packed shapes: the forward runs the
+    inductor graph (saves bf16 intermediates) while the recompute hits the limit
+    and falls back to eager (saves fp32 upcasts) → non-reentrant checkpoint fails
+    with ``Recomputed values ... different metadata`` AND the numeric drift flips
+    router near-ties (routed-token count ±1), hanging the other EP ranks in
+    collectives to the fb timeout. Observed at ≥5 packed rows/rank on the OPD
+    server path (probes D4/E, 2026-06-12); the dynamo log shows
+    ``native_zero_centered_rms_norm ... hit config.recompile_limit`` immediately
+    before each failure.
+
+    Disabling dynamo for the segment makes BOTH passes run the same uncompiled
+    code: consistent saved-tensor dtypes and a bit-identical router decision. The
+    fp32 eager-norm saves only materialize transiently during the recompute (the
+    checkpoint discards forward-pass intermediates), so there is no persistent
+    memory cost. Opt out with XORL_CHECKPOINT_KEEP_DYNAMO=1.
+    """
+    if os.environ.get("XORL_CHECKPOINT_KEEP_DYNAMO", "0").strip().lower() in {"1", "true", "yes", "on"}:
+        return fn
+    return torch._dynamo.disable(fn)
 
 
 class MoEGradientCheckpointingLayer(nn.Module):
@@ -2800,11 +2975,13 @@ class MoEGradientCheckpointingLayer(nn.Module):
 
         if _selective and _is_moe:
             moe_input, residual, routing_weights, selected_experts, router_logits = self._gradient_checkpointing_func(
-                self._pre_dispatch_forward, hidden_states, **kwargs
+                _dynamo_stable_checkpoint_fn(self._pre_dispatch_forward), hidden_states, **kwargs
             )
             hidden_states = self.mlp.forward_experts_only(moe_input, routing_weights, selected_experts)
         elif _selective:
-            hidden_states, residual = self._gradient_checkpointing_func(self._pre_mlp_forward, hidden_states, **kwargs)
+            hidden_states, residual = self._gradient_checkpointing_func(
+                _dynamo_stable_checkpoint_fn(self._pre_mlp_forward), hidden_states, **kwargs
+            )
             hidden_states = self.mlp(hidden_states)
             router_logits = None
         else:

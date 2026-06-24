@@ -40,6 +40,7 @@ import requests
 import uvicorn
 import yaml
 
+from xorl.fp8_training.config_compat import extract_nemo_fp8_cfg, validate_external_fp8_runtime_config
 from xorl.server.api_server.server import APIServer
 from xorl.server.orchestrator.orchestrator import Orchestrator
 from xorl.server.server_arguments import ServerArguments
@@ -164,6 +165,9 @@ def run_orchestrator(
     enable_packing: bool = True,
     ready_event: Optional[mp.Event] = None,
     output_dir: str = "outputs",
+    packing_strategy: str = "sequential",
+    on_oversized: str = "error",
+    dp_size: int = 1,
 ):
     """
     Run the Orchestrator in a separate process.
@@ -215,8 +219,14 @@ def run_orchestrator(
             ack_timeout=300.0,  # 5 min — weight sync can block workers for 40s+ on large MoE models
             sample_packing_sequence_len=sample_packing_sequence_len,
             enable_packing=enable_packing,
+            packing_strategy=packing_strategy,
+            on_oversized=on_oversized,
+            dp_size=dp_size,
         )
-        logger.info(f"Orchestrator initialized successfully (operation_timeout={operation_timeout}s)")
+        logger.info(
+            f"Orchestrator initialized successfully (operation_timeout={operation_timeout}s, "
+            f"packing_strategy={packing_strategy}, on_oversized={on_oversized}, dp_size={dp_size})"
+        )
 
         logger.info("Starting Orchestrator...")
         engine.start()
@@ -367,6 +377,19 @@ def run_api_server(
 # ============================================================================
 
 
+def _is_flat_server_args_config(config_path: str) -> bool:
+    """
+    True if the YAML is the flat ServerArguments format (vs. legacy nested
+    model/train/data/worker sections). Mirrors runner.setup._is_server_args_config
+    but inlined here to avoid importing the runner module (which pulls in torch).
+    """
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f) or {}
+    if "model" in config and isinstance(config["model"], dict):
+        return False
+    return bool({"model_path", "worker_bind_address", "data_parallel_mode"} & set(config.keys()))
+
+
 def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] = None) -> ServerArguments:
     """
     Load ServerArguments from a YAML configuration file.
@@ -388,6 +411,9 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
     if not config:
         raise ValueError(f"Empty config file: {config_path}")
 
+    validate_external_fp8_runtime_config(config, context=config_path)
+    nemo_fp8_cfg = extract_nemo_fp8_cfg(config)
+
     valid_fields = {f.name for f in fields(ServerArguments)}
 
     # Check if this is a nested config (has model/train/worker sections)
@@ -404,6 +430,8 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
         for section in ("model", "train"):
             for k, v in config.get(section, {}).items():
                 flat_config[k] = v
+        if nemo_fp8_cfg is not None and "fp8_cfg" not in flat_config:
+            flat_config["fp8_cfg"] = nemo_fp8_cfg
 
         # lora.* keys also map 1:1 except exclude_modules → qlora_exclude_modules
         for k, v in config.get("lora", {}).items():
@@ -418,6 +446,10 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
             flat_config["sample_packing_sequence_len"] = data_config.get("sample_packing_sequence_len", 32000)
         if "enable_packing" not in flat_config:
             flat_config["enable_packing"] = data_config.get("enable_packing", True)
+        if "sample_packing_strategy" not in flat_config and "sample_packing_strategy" in data_config:
+            flat_config["sample_packing_strategy"] = data_config["sample_packing_strategy"]
+        if "sample_packing_on_oversized" not in flat_config and "sample_packing_on_oversized" in data_config:
+            flat_config["sample_packing_on_oversized"] = data_config["sample_packing_on_oversized"]
 
         # worker.* keys are prefixed with worker_ in ServerArguments
         worker_config = config.get("worker", {})
@@ -441,7 +473,10 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
         filtered_config = {k: v for k, v in flat_config.items() if k in valid_fields and v is not None}
     else:
         # Flat config (ServerArguments style)
-        filtered_config = {k: v for k, v in config.items() if k in valid_fields}
+        flat_config = dict(config)
+        if nemo_fp8_cfg is not None and "fp8_cfg" not in flat_config:
+            flat_config["fp8_cfg"] = nemo_fp8_cfg
+        filtered_config = {k: v for k, v in flat_config.items() if k in valid_fields}
 
         # Handle None values for Optional fields
         for key, value in list(filtered_config.items()):
@@ -572,7 +607,16 @@ class Launcher:
         self.operation_timeout = operation_timeout
         self.sample_packing_sequence_len = sample_packing_sequence_len
         self.enable_packing = enable_packing
+        # Packing strategy / oversized policy / dp fan-out. Populated from
+        # ServerArguments in _setup_addresses(); defaults keep behavior unchanged
+        # (greedy sequential packing, fail-loud on oversized samples).
+        self.packing_strategy = "sequential"
+        self.on_oversized = "error"
+        self.packing_dp_size = 1
         self.server_overrides = server_overrides or {}
+        # Belt-and-suspenders: even when callers bypass main() (tests, embedders),
+        # any override we propagate must be a valid ServerArguments field.
+        validate_server_overrides(self.server_overrides)
 
         # Validate mode
         if mode not in ["auto", "connect"]:
@@ -581,6 +625,18 @@ class Launcher:
         # Validate config for auto mode
         if mode == "auto" and not config_path:
             raise ValueError("--config is required for auto-launch mode")
+
+        # --server.* overrides target the flat ServerArguments worker parser.
+        # The legacy nested-Arguments worker uses strict argparse on a different
+        # schema; the launcher would apply the override to its own ServerArguments
+        # but the worker would silently use the bare YAML value, leaving the two
+        # halves of the system disagreeing on configuration. Fail loud instead.
+        if config_path and self.server_overrides and not _is_flat_server_args_config(config_path):
+            raise ValueError(
+                "--server.* CLI overrides are only supported with the flat ServerArguments "
+                f"YAML format. Config {config_path!r} is in the legacy nested format. "
+                "Either convert the config to the flat schema or edit the YAML directly."
+            )
 
         # Load ServerArguments from config if provided
         self.server_args: Optional[ServerArguments] = None
@@ -659,8 +715,22 @@ class Launcher:
         if self.server_args:
             self.sample_packing_sequence_len = self.server_args.sample_packing_sequence_len
             self.enable_packing = self.server_args.enable_packing
+            self.packing_strategy = self.server_args.sample_packing_strategy
+            self.on_oversized = self.server_args.sample_packing_on_oversized
+            # Number of distinct batch slices the dispatcher will produce. This is
+            # the effective data-parallel fan-out: total GPUs divided by the
+            # per-sequence (CP = ulysses x ring) and pipeline degrees. The
+            # "balanced_dp" packer targets N = k * dp_size rows so the dispatcher
+            # needs zero dummy batches. (EP shares the same world, so the slice
+            # count is the same formula.)
+            cp_size = max(1, self.server_args.ulysses_parallel_size * self.server_args.ringattn_parallel_size)
+            pp_size = max(1, self.server_args.pipeline_parallel_size)
+            total_gpus = self.server_args.get_total_gpus()
+            self.packing_dp_size = max(1, total_gpus // (cp_size * pp_size))
             logger.info(
-                f"Using packing config: seq_len={self.sample_packing_sequence_len}, enabled={self.enable_packing}"
+                f"Using packing config: seq_len={self.sample_packing_sequence_len}, enabled={self.enable_packing}, "
+                f"strategy={self.packing_strategy}, on_oversized={self.on_oversized}, "
+                f"dp_size={self.packing_dp_size} (total_gpus={total_gpus}, cp_size={cp_size}, pp_size={pp_size})"
             )
 
         # Output directory - prefer from ServerArguments if available
@@ -764,6 +834,27 @@ class Launcher:
 
         # Priority 2: File-based discovery (for multi-node)
         if self.nnodes > 1:
+            # Master-pod optimization: when --master-addr resolves to a local
+            # interface on THIS pod, rank 0 of torchrun is spawned in-pod —
+            # the launcher's own `_launch_workers_with_torchrun` will write
+            # the rank-0 address file to this pod's `output_dir` directly.
+            # There is no inter-pod discovery to wait for. Skipping the
+            # file-wait avoids a 5-minute startup stall in k8s setups where
+            # each pod's `output_dir` is per-hostname (so a sibling pod has
+            # nothing to read from the master's output_dir either). In that
+            # setup the master falls back after `worker_connection_timeout`
+            # (default 300s) — but by then any sibling-node worker's NCCL
+            # TCPStore wait (default 600s) is racing toward its deadline.
+            if self._master_addr_is_local():
+                address = self._build_local_worker_address()
+                if address:
+                    logger.info(
+                        "Multi-node master pod detected (master-addr "
+                        f"{self.master_addr!r} is local) — skipping rank-0 file wait, "
+                        f"using {address}"
+                    )
+                    return address
+
             logger.info(f"Multi-node setup (nnodes={self.nnodes}), waiting for rank 0 address file...")
 
             # Wait for address file with extended timeout for multi-node
@@ -803,6 +894,48 @@ class Launcher:
         # Final fallback: use already-resolved worker_address
         logger.info(f"Using pre-resolved worker address: {self.worker_address}")
         return self.worker_address
+
+    def _master_addr_is_local(self) -> bool:
+        """Return True when `self.master_addr` resolves to an interface on THIS pod.
+
+        Used by `_get_rank0_worker_address` to detect "I am the master pod, so
+        rank 0 of torchrun will be spawned in-pod and the rank-0 address file
+        will be written locally; no inter-pod discovery to wait for".
+
+        Loopback (`127.x.x.x`, `localhost`) and the host's own routable IP are
+        considered local. Resolution failures fall through to False so the
+        legacy file-wait path stays as a safety net.
+        """
+        if not self.master_addr:
+            return False
+        addr = str(self.master_addr).strip()
+        if addr in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}:
+            return True
+        try:
+            from xorl.server.utils.network import get_local_ip  # noqa: PLC0415
+
+            resolved = socket.gethostbyname(addr)
+            return resolved == get_local_ip() or resolved.startswith("127.")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"_master_addr_is_local: resolve {addr!r} failed: {exc}")
+            return False
+
+    def _build_local_worker_address(self) -> Optional[str]:
+        """Build the loopback ZMQ address for rank 0 worker on this pod.
+
+        Mirrors the single-node "Priority 3" fallback in
+        `_get_rank0_worker_address`, but exposed separately so the master-pod
+        fast path can reuse it without falling through the legacy file wait.
+        """
+        if not self.server_args:
+            return None
+        bind_address = self.server_args.worker_bind_address
+        if bind_address and bind_address != "auto":
+            return bind_address.replace("0.0.0.0", "127.0.0.1") if "0.0.0.0" in bind_address else bind_address
+        host = self.server_args.worker_bind_host
+        port = self.server_args.worker_bind_port
+        connect_host = "127.0.0.1" if host == "0.0.0.0" else host
+        return f"tcp://{connect_host}:{port}"
 
     def _poll_future(self, request_id: str, timeout: float = 300.0, poll_interval: float = 2.0):
         """Poll /api/v1/retrieve_future until the async operation completes.
@@ -897,6 +1030,35 @@ class Launcher:
         logger.warning("You can manually save the initial state by calling /api/v1/save_weights with path='000000'")
         return False
 
+    def _wait_for_engine_ready(self, timeout: float) -> None:
+        """Wait for engine readiness while surfacing child-process failures."""
+
+        assert self.engine_ready_event is not None
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.engine_ready_event.wait(timeout=1.0):
+                logger.info("✓ Engine Core fully initialized")
+                return
+
+            if self.worker_process is not None:
+                ret = self.worker_process.poll()
+                if ret is not None:
+                    logger.error(f"✗ Worker process exited during engine initialization (exit code: {ret})")
+                    raise RuntimeError(f"Worker process exited during engine initialization (exit code: {ret})")
+
+            if self.engine_process is not None and not self.engine_process.is_alive():
+                exit_code = self.engine_process.exitcode
+                logger.error(f"✗ Engine Core process died during initialization (exit code: {exit_code})")
+                raise RuntimeError(f"Engine Core failed during initialization (exit code: {exit_code})")
+
+            if self.api_process is not None and not self.api_process.is_alive():
+                exit_code = self.api_process.exitcode
+                logger.error(f"✗ API Server process died during initialization (exit code: {exit_code})")
+                raise RuntimeError(f"API Server failed during initialization (exit code: {exit_code})")
+
+        logger.error(f"✗ Engine Core did not signal ready within {timeout}s")
+        raise RuntimeError("Engine Core initialization timeout")
+
     @staticmethod
     def _find_free_port() -> int:
         """Find and return a free TCP port."""
@@ -940,14 +1102,50 @@ class Launcher:
             self.config_path,
             f"--worker.bind_address={self.worker_address}",
         ]
+        if rdzv_conf := os.environ.get("XORL_TORCHRUN_RDZV_CONF"):
+            # Keep the head's rendezvous config identical to the sibling-pod
+            # torchrun invocations (which pass --rdzv-conf explicitly); a skew
+            # here breaks multi-node static rendezvous. Insert at index 7 — right
+            # after --master-port (index 6) and before the `-m` (index 7) — so the
+            # flag lands as `... --master-port=P --rdzv-conf=X -m runner_dispatcher`,
+            # not wedged between `-m` and the module name.
+            cmd[7:7] = [f"--rdzv-conf={rdzv_conf}"]
+            logger.info(f"  RDZV Conf:   {rdzv_conf}")
 
-        # Pass server overrides to worker as CLI arguments
-        # The worker's parse_server_args() will apply these on top of YAML config
-        for key, value in self.server_overrides.items():
-            if isinstance(value, bool):
-                cmd.append(f"--{key}={str(value).lower()}")
-            else:
-                cmd.append(f"--{key}={value}")
+        # Forward --server.* overrides to the worker only when the worker will use
+        # the permissive ServerArguments parser (flat config). The nested-Arguments
+        # worker (parse_args(WorkerConfig)) uses strict argparse on a different
+        # schema, so we never forward on that path — and Launcher.__init__ has
+        # already raised if the operator passed --server.* alongside a nested
+        # config. All keys in self.server_overrides have been schema-validated by
+        # validate_server_overrides(), so the worker's parse_server_args() will
+        # accept every key we forward.
+        #
+        # Always also forward the launcher's *resolved* model_path / tokenizer_path
+        # so every rank loads from the same on-disk snapshot. Without this the
+        # head's auto-launched workers use the YAML value verbatim (e.g. the HF
+        # name "Qwen/Qwen3.6-35B-A3B" — os.path.isdir() == False) while sibling-pod
+        # workers receive the resolved snapshot dir via their own --model_path arg
+        # (os.path.isdir() == True). _try_load_state_dict branches on os.path.isdir,
+        # so grouped/broadcast loads then deadlock on the world process group (only
+        # the isdir==False ranks enter the rank-0 metadata broadcast). An
+        # operator-supplied --server.model_path / --server.tokenizer_path already in
+        # server_overrides wins; this covers the case where neither was passed.
+        if _is_flat_server_args_config(self.config_path):
+            forwarded = dict(self.server_overrides)
+            for key in ("model_path", "tokenizer_path"):
+                if key in forwarded or not self.server_args:
+                    continue
+                value = getattr(self.server_args, key, None)
+                if value:
+                    forwarded[key] = value
+                    logger.info(f"Auto-forwarding --{key}={value} to worker subprocess")
+
+            for key, value in forwarded.items():
+                if isinstance(value, bool):
+                    cmd.append(f"--{key}={str(value).lower()}")
+                else:
+                    cmd.append(f"--{key}={value}")
 
         logger.info(f"Running: {' '.join(cmd)}")
         logger.info("")
@@ -1043,6 +1241,9 @@ class Launcher:
                         self.enable_packing,
                         self.engine_ready_event,
                         self.output_dir,
+                        self.packing_strategy,
+                        self.on_oversized,
+                        self.packing_dp_size,
                     ),
                     name="Orchestrator",
                 )
@@ -1124,12 +1325,11 @@ class Launcher:
             # Wait for engine to signal it's fully ready (after worker connection and startup tests)
             logger.info("")
             logger.info("Waiting for Engine Core to complete initialization...")
-            engine_ready_timeout = 1800.0  # 30 minutes timeout for engine initialization (large models need time)
-            if self.engine_ready_event.wait(timeout=engine_ready_timeout):
-                logger.info("✓ Engine Core fully initialized")
-            else:
-                logger.error(f"✗ Engine Core did not signal ready within {engine_ready_timeout}s")
-                raise RuntimeError("Engine Core initialization timeout")
+            # 90 min default (env-overridable): all_ranks HF base + DCP overwrite over a
+            # contended /shared with 32 concurrent readers can take well past 30 min; the old
+            # 1800s killed slow loads before the first collective. 2026-06-07.
+            engine_ready_timeout = float(os.environ.get("XORL_ENGINE_READY_TIMEOUT_S", "5400"))
+            self._wait_for_engine_ready(engine_ready_timeout)
 
             # Check if engine process is still alive
             if not self.engine_process.is_alive():
@@ -1267,6 +1467,29 @@ class Launcher:
 # ============================================================================
 # CLI
 # ============================================================================
+
+
+def validate_server_overrides(server_overrides: Dict[str, any]) -> None:
+    """
+    Raise if any ``--server.<key>`` override is not a ``ServerArguments`` field.
+
+    Centralising the schema check here means every downstream consumer
+    (launcher init, worker forwarding, ``load_server_arguments``) can trust
+    that every key in ``server_overrides`` corresponds to a real
+    ``ServerArguments`` field. The previous implementation silently dropped
+    unknown keys (typo in ``--server.outputt_dir`` → no error, YAML value
+    silently used), and required a hand-maintained "launcher-only key" set
+    that had to be kept in sync with the schema by reviewers.
+    """
+    valid_fields = {f.name for f in fields(ServerArguments)}
+    unknown = sorted(k for k in server_overrides if k not in valid_fields)
+    if unknown:
+        raise ValueError(
+            "Unknown --server.* override key(s): "
+            + ", ".join(unknown)
+            + f". Valid keys are ServerArguments fields ({len(valid_fields)} total); "
+            "check for typos or stale flags."
+        )
 
 
 def parse_server_overrides(argv: List[str]) -> Tuple[List[str], Dict[str, any]]:

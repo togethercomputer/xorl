@@ -10,7 +10,8 @@ This module provides various loss functions for language model training:
 
 from typing import Callable, Dict, Literal
 
-from xorl.ops.loss.causallm_loss import causallm_loss_function
+from xorl.ops.loss.causallm_loss import causallm_loss_function, fsdp_sharded_causallm_loss_function
+from xorl.ops.loss.fused_linear_logprob import fused_selected_logprob_ce
 from xorl.ops.loss.grpo_loss import drgrpo_loss_function
 from xorl.ops.loss.importance_sampling_loss import importance_sampling_loss_function
 from xorl.ops.loss.loss_output import LossOutput
@@ -22,7 +23,9 @@ from xorl.ops.loss.vocab_parallel_cross_entropy import vocab_parallel_cross_entr
 
 # Cross-entropy computation mode shared by the local-trainer (TrainingArguments)
 # and server-runner (ServerArguments) entry points so the Literal stays in sync.
-CrossEntropyMode = Literal["eager", "compiled"]
+# "fused_quack" routes selected-token log-prob through chunked cuBLAS matmul +
+# a fused CuTeDSL cross-entropy reduction (chunk-sized logits, scalar TP reductions).
+CrossEntropyMode = Literal["eager", "compiled", "quack_linear", "fused_quack"]
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +65,8 @@ __all__ = [
     "register_loss_function",
     "causallm_loss_function",
     "drgrpo_loss_function",
+    "fsdp_sharded_causallm_loss_function",
+    "fused_selected_logprob_ce",
     "importance_sampling_loss_function",
     "opd_loss_function",
     "policy_loss_function",

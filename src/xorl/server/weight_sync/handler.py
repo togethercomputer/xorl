@@ -27,10 +27,12 @@ This keeps GPU memory to ~1-2 layers (one unsharding + one broadcasting).
 """
 
 import atexit
+import hashlib
 import logging
 import os
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from fnmatch import fnmatch
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -39,20 +41,29 @@ from torch.distributed._tensor import DTensor
 from torch.distributed.fsdp._fully_shard import FSDPModule
 
 from xorl.distributed.parallel_state import get_parallel_state
+from xorl.fp8_training.config_compat import enrich_sync_quantization_with_fp8_bf16_islands
 from xorl.lora.modules.base import LoraModule
 from xorl.lora.modules.linear import LoraLinear
 from xorl.models.layers.moe.experts import MoEExperts
 from xorl.models.layers.moe.lora import MoEExpertsLoRA
+from xorl.models.transformers.nemotron_h.checkpoint_handler import (
+    denormalize_param_name as nemotron_h_denormalize_param_name,
+)
 from xorl.models.transformers.qwen3_5_shared import (
     has_linear_attention_layers,
     remap_linear_attention_params_for_inference,
 )
+from xorl.qarl import qarl_sync_quantization_config
 from xorl.qlora.modules.linear import QLoRALinear
 from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
 from xorl.server.protocol.operations import SyncWeightsData
 from xorl.server.weight_sync.backends import TransportConfig, create_backend
 from xorl.server.weight_sync.backends.base import EndpointConfig
 from xorl.server.weight_sync.endpoint_manager import EndpointManager
+from xorl.server.weight_sync.quantization_config import (
+    UnsupportedSyncQuantizationError,
+    normalize_sync_quantization_config,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -82,6 +93,44 @@ def _moe_bucket_size_bytes(sync_method: str) -> int:
     if "XORL_WEIGHT_SYNC_MOE_BUCKET_BYTES" in os.environ:
         return _env_int("XORL_WEIGHT_SYNC_MOE_BUCKET_BYTES", default)
     return _env_int("XORL_WEIGHT_SYNC_BUCKET_BYTES", default)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _skip_param_patterns() -> Tuple[str, ...]:
+    """Return the parameter-name patterns to skip during weight sync (diagnostic)."""
+    raw = os.environ.get("XORL_P2P_SKIP_PARAM_PATTERNS") or os.environ.get(
+        "XORL_WEIGHT_SYNC_SKIP_PARAM_PATTERNS",
+        "",
+    )
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
+def _param_matches_skip_patterns(name: str, patterns: Tuple[str, ...]) -> bool:
+    """Return whether a parameter name matches one of the skip patterns.
+
+    Patterns containing glob metacharacters (``*?[``) use :func:`fnmatch`;
+    plain patterns match as a case-sensitive substring.
+    """
+    for pattern in patterns:
+        if any(ch in pattern for ch in "*?["):
+            if fnmatch(name, pattern):
+                return True
+        elif pattern in name:
+            return True
+    return False
+
+
+def _inference_param_name(name: str) -> str:
+    """Strip training-only wrapper modules from receiver-facing names."""
+    if "_orig_mod" not in name:
+        return name
+    return ".".join(part for part in name.split(".") if part != "_orig_mod")
 
 
 def _prod(shape) -> int:
@@ -214,20 +263,9 @@ _cached_backend_key: Optional[Tuple[Any, ...]] = None
 _cached_p2p_sender_group: Optional[Any] = None
 _cached_p2p_sender_group_ranks: Optional[Tuple[int, ...]] = None
 
-# nccl_broadcast backend cache — same motivation as P2P cache: the NCCL
-# communicator init (TCPStore rendezvous + ncclCommInitRankConfig) is
-# expensive and must happen exactly once. Without caching, each call to
-# sync_inference_weights creates a new backend and re-sends
-# /init_weights_update_group to sglang, which causes sglang to attempt a
-# second ncclCommInitRankConfig on the same group name — deadlocking the
-# first communicator.  Caching ensures initialize() is called only once per
-# (endpoint, group_name, world_size) tuple.
-_cached_nccl_backend: Optional[Any] = None
-_cached_nccl_backend_key: Optional[Tuple[Any, ...]] = None
-
 
 def _atexit_destroy_cached_backend() -> None:
-    global _cached_p2p_backend, _cached_backend_key, _cached_nccl_backend, _cached_nccl_backend_key
+    global _cached_p2p_backend, _cached_backend_key
     if _cached_p2p_backend is not None:
         try:
             _cached_p2p_backend.destroy(complete_receiver=False)
@@ -235,13 +273,6 @@ def _atexit_destroy_cached_backend() -> None:
             pass
         _cached_p2p_backend = None
         _cached_backend_key = None
-    if _cached_nccl_backend is not None:
-        try:
-            _cached_nccl_backend.destroy(complete_receiver=False)
-        except Exception:
-            pass
-        _cached_nccl_backend = None
-        _cached_nccl_backend_key = None
 
 
 atexit.register(_atexit_destroy_cached_backend)
@@ -366,6 +397,47 @@ class WeightSyncHandler:
         self._fp8_cpu_workspaces: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
         self._p2p_tied_weight_aliases: Dict[str, str] = {}
 
+    @staticmethod
+    def _endpoint_results_from_backend(endpoints: List[Dict[str, Any]], backend: Any) -> List[Dict[str, Any]]:
+        raw_results = getattr(backend, "endpoint_results", None) or []
+        if raw_results:
+            normalized = []
+            for idx, result in enumerate(raw_results):
+                endpoint = endpoints[idx] if idx < len(endpoints) else {}
+                host = result.get("host", endpoint.get("host", ""))
+                port = result.get("port", endpoint.get("port", 0))
+                normalized.append(
+                    {
+                        key: value
+                        for key, value in {
+                            "host": host,
+                            "port": port,
+                            "success": result.get("success", False),
+                            "message": result.get("message", ""),
+                            "cache_epoch": WeightSyncHandler._cache_epoch_from_mapping(result),
+                            "fp8_kv_cache_postprocess_ran": result.get("fp8_kv_cache_postprocess_ran"),
+                            "fp8_kv_cache_static_scales_updated": result.get("fp8_kv_cache_static_scales_updated"),
+                        }.items()
+                        if value is not None
+                    }
+                )
+            return normalized
+        return [{"host": ep["host"], "port": ep["port"], "success": True} for ep in endpoints]
+
+    @staticmethod
+    def _cache_epoch_from_mapping(data: Dict[str, Any]) -> Any:
+        if "cache_epoch" in data:
+            return data["cache_epoch"]
+        return data.get("cache_version")
+
+    @staticmethod
+    def _first_endpoint_cache_epoch(endpoint_results: List[Dict[str, Any]]) -> Any:
+        for result in endpoint_results:
+            cache_epoch = WeightSyncHandler._cache_epoch_from_mapping(result)
+            if cache_epoch is not None:
+                return cache_epoch
+        return None
+
     def _sync_abort_path(self, group_name: str, weight_version: Optional[str]) -> str:
         abort_dir = os.environ.get("XORL_WEIGHT_SYNC_ABORT_DIR", "").strip()
         if not abort_dir:
@@ -386,6 +458,26 @@ class WeightSyncHandler:
             pass
         except Exception as e:
             logger.debug("Rank %d: [WeightSync] failed to clear abort marker %s: %s", self.rank, abort_path, e)
+
+    def _prepare_lora_adapter_for_sync(self, model_id: Optional[str]) -> Optional[str]:
+        adapter_manager = getattr(self.trainer, "adapter_manager", None)
+        if adapter_manager is None:
+            return None
+
+        resolved_model_id = model_id or getattr(adapter_manager, "current_adapter_id", None) or "default"
+        if not adapter_manager.has_adapter(resolved_model_id):
+            register_adapter = getattr(self.trainer, "register_lora_adapter", None)
+            if register_adapter is None:
+                raise KeyError(f"LoRA adapter for model_id={resolved_model_id!r} is not registered")
+            register_adapter(resolved_model_id, lr=None)
+
+        adapter_manager.sync_weights_to_model(resolved_model_id)
+        logger.info(
+            "Rank %s: [WeightSync] Prepared LoRA adapter model_id=%s for merged weight extraction",
+            self.rank,
+            resolved_model_id,
+        )
+        return resolved_model_id
 
     def _mark_sync_abort(self, abort_path: str, err: Exception) -> None:
         try:
@@ -480,6 +572,13 @@ class WeightSyncHandler:
             return int(value)
         except (TypeError, ValueError, OverflowError):
             return 0
+
+    @staticmethod
+    def _strip_compile_orig_mod(name: str) -> str:
+        """Return the checkpoint/SGLang name for a torch.compile-wrapped module."""
+        if name.startswith("_orig_mod."):
+            name = name[len("_orig_mod.") :]
+        return name.replace("._orig_mod.", ".")
 
     @classmethod
     def _aggregate_p2p_transfer_totals(
@@ -598,9 +697,10 @@ class WeightSyncHandler:
         Handle sync inference weights request (all ranks participate).
 
         The ``sync_method`` field selects the transport backend.  Currently
-        supported: ``"nccl_broadcast"`` and ``"p2p"``.  New backends (RDMA, multi-rank NCCL,
-        etc.) can be added by implementing :class:`WeightTransportBackend` and
-        registering in :func:`backends.create_backend`.
+        supported: ``"nccl_broadcast"``, ``"p2p"``, and experimental
+        ``"sparse_delta"``. New backends (RDMA, multi-rank NCCL, etc.) can be
+        added by implementing :class:`WeightTransportBackend` and registering
+        in :func:`backends.create_backend`.
         """
         logger.info(f"Rank {self.rank}: [WeightSync] Starting sync_inference_weights")
 
@@ -613,17 +713,88 @@ class WeightSyncHandler:
         buffer_size_mb = p.buffer_size_mb
         sync_method = p.sync_method
         flush_cache = p.flush_cache
+        cache_invalidation_mode = p.cache_invalidation_mode
+        fp8_kv_cache_enabled = p.fp8_kv_cache_enabled
+        fp8_kv_cache_postprocess_required = p.fp8_kv_cache_postprocess_required
+        fp8_kv_cache_static_scales = p.fp8_kv_cache_static_scales
         pause_mode = p.pause_mode
         weight_version = p.weight_version
-        quantization = p.quantization
+        model_id = p.model_id
+        try:
+            quantization = normalize_sync_quantization_config(
+                p.quantization,
+                context="sync_inference_weights.quantization",
+            )
+        except UnsupportedSyncQuantizationError as exc:
+            return {"success": False, "message": str(exc)}
+        train_config = getattr(self.trainer, "train_config", {}) or {}
+        if self.trainer is not None and getattr(self.trainer, "model", None) is not None:
+            try:
+                qarl_quantization = qarl_sync_quantization_config(self.trainer.model, quantization)
+            except Exception as exc:
+                return {"success": False, "message": f"Failed to resolve QARL sync quantization: {exc}"}
+            if qarl_quantization is not None:
+                quantization = qarl_quantization
+        if quantization is not None and isinstance(train_config, dict):
+            try:
+                quantization = enrich_sync_quantization_with_fp8_bf16_islands(
+                    self.trainer.model,
+                    quantization,
+                    num_first_layers_bf16=int(train_config.get("fp8_training_num_first_layers_bf16", 0) or 0),
+                    num_last_layers_bf16=int(train_config.get("fp8_training_num_last_layers_bf16", 0) or 0),
+                )
+            except Exception as exc:
+                return {"success": False, "message": f"Failed to resolve FP8 BF16 sync islands: {exc}"}
+        sparse_delta_paths = p.sparse_delta_paths
+        sparse_delta_config = p.sparse_delta_config
 
         logger.info(
             f"Rank {self.rank}: [WeightSync] sync_method={sync_method}, "
             f"endpoints={len(endpoints)}, flush_cache={flush_cache}, "
-            f"weight_version={weight_version}, quantization={quantization}"
+            f"cache_invalidation_mode={cache_invalidation_mode}, "
+            f"fp8_kv_cache_enabled={fp8_kv_cache_enabled}, "
+            f"fp8_kv_cache_postprocess_required={fp8_kv_cache_postprocess_required}, "
+            f"fp8_kv_cache_static_scales={fp8_kv_cache_static_scales}, "
+            f"weight_version={weight_version}, model_id={model_id}, quantization={quantization}, "
+            f"sparse_delta_paths={len(sparse_delta_paths or [])}, "
+            f"sparse_delta_config={sparse_delta_config}"
         )
 
         try:
+            synced_model_id = self._prepare_lora_adapter_for_sync(model_id)
+            if synced_model_id is not None:
+                logger.info(
+                    "Rank %s: [WeightSync] Syncing merged LoRA weights for model_id=%s", self.rank, synced_model_id
+                )
+            if sparse_delta_paths:
+                if sync_method != "sparse_delta":
+                    return {
+                        "success": False,
+                        "message": "sparse_delta_paths requires sync_method='sparse_delta'",
+                    }
+                return self._sync_sparse_delta_paths(
+                    endpoints=endpoints,
+                    group_name=group_name,
+                    flush_cache=flush_cache,
+                    cache_invalidation_mode=cache_invalidation_mode,
+                    fp8_kv_cache_enabled=fp8_kv_cache_enabled,
+                    fp8_kv_cache_postprocess_required=fp8_kv_cache_postprocess_required,
+                    fp8_kv_cache_static_scales=fp8_kv_cache_static_scales,
+                    pause_mode=pause_mode,
+                    weight_version=weight_version,
+                    sparse_delta_paths=sparse_delta_paths,
+                    sparse_delta_config=sparse_delta_config,
+                )
+            if (
+                sync_method == "sparse_delta"
+                and sparse_delta_config
+                and bool(sparse_delta_config.get("prepacked_only", False))
+            ):
+                return {
+                    "success": False,
+                    "message": "sparse_delta_config.prepacked_only requires sparse_delta_paths; refusing dense streaming sparse-delta sync",
+                }
+
             result = self._sync_weights(
                 endpoints=endpoints,
                 master_address=master_address,
@@ -632,9 +803,14 @@ class WeightSyncHandler:
                 buffer_size_mb=buffer_size_mb,
                 sync_method=sync_method,
                 flush_cache=flush_cache,
+                cache_invalidation_mode=cache_invalidation_mode,
+                fp8_kv_cache_enabled=fp8_kv_cache_enabled,
+                fp8_kv_cache_postprocess_required=fp8_kv_cache_postprocess_required,
+                fp8_kv_cache_static_scales=fp8_kv_cache_static_scales,
                 pause_mode=pause_mode,
                 weight_version=weight_version,
                 quantization=quantization,
+                sparse_delta_config=sparse_delta_config,
             )
 
             return result
@@ -642,6 +818,163 @@ class WeightSyncHandler:
         except Exception as e:
             logger.error(f"Rank {self.rank}: sync_inference_weights failed: {e}", exc_info=True)
             return {"success": False, "message": f"Weight sync failed: {str(e)}"}
+
+    # ========================================================================
+    # Prepacked sparse-delta sync
+    # ========================================================================
+
+    def _sync_sparse_delta_paths(
+        self,
+        *,
+        endpoints: List[Dict[str, Any]],
+        group_name: str,
+        flush_cache: bool,
+        pause_mode: str,
+        weight_version: Optional[str],
+        sparse_delta_paths: List[str],
+        sparse_delta_config: Optional[Dict[str, Any]] = None,
+        cache_invalidation_mode: str = "auto",
+        fp8_kv_cache_enabled: bool = False,
+        fp8_kv_cache_postprocess_required: bool = False,
+        fp8_kv_cache_static_scales: bool = False,
+    ) -> Dict[str, Any]:
+        """POST already-packed sparse deltas through the normal xorl API path.
+
+        This bypasses trainer-side FSDP extraction and is the intended fast
+        path when ``delta-encoding`` has already emitted inference-coordinate
+        packed files.
+        """
+        if self.rank != 0:
+            return {
+                "success": True,
+                "message": "Sparse-delta path sync is coordinated by rank 0",
+                "transfer_time": 0.0,
+                "total_bytes": 0,
+                "num_parameters": 0,
+                "num_buckets": 0,
+                "timing_breakdown": {},
+                "p2p_rank_summaries": [],
+                "cache_invalidation_mode": cache_invalidation_mode,
+                "flush_cache": flush_cache,
+                "fp8_kv_cache_enabled": fp8_kv_cache_enabled,
+                "fp8_kv_cache_postprocess_requested": fp8_kv_cache_postprocess_required,
+                "fp8_kv_cache_static_scales": fp8_kv_cache_static_scales,
+                "cache_epoch": None,
+                "endpoint_results": [],
+            }
+
+        sync_start_time = time.perf_counter()
+        timing_breakdown: Dict[str, float] = {}
+        if not endpoints:
+            return {"success": False, "message": "No endpoints provided"}
+
+        endpoint_mgr = EndpointManager(endpoints)
+        backend = None
+        paused = False
+        try:
+            t_health = time.perf_counter()
+            endpoint_mgr.health_check()
+            timing_breakdown["health_check_s"] = time.perf_counter() - t_health
+
+            sparse_backend_config = {**(sparse_delta_config or {}), "post_only": True}
+            if fp8_kv_cache_enabled:
+                sparse_backend_config["fp8_kv_cache_enabled"] = True
+            if fp8_kv_cache_postprocess_required:
+                sparse_backend_config["fp8_kv_cache_postprocess_required"] = True
+                sparse_backend_config["run_post_process_weights"] = True
+            if fp8_kv_cache_static_scales:
+                sparse_backend_config["fp8_kv_cache_static_scales"] = True
+
+            transport_cfg = TransportConfig(
+                endpoints=[
+                    EndpointConfig(
+                        host=ep["host"],
+                        port=ep["port"],
+                        world_size=ep.get("world_size", 1),
+                    )
+                    for ep in endpoints
+                ],
+                group_name=group_name,
+                training_world_size=self.world_size,
+                training_rank=self.rank,
+                backend_config=sparse_backend_config,
+            )
+            backend = create_backend("sparse_delta", transport_cfg)
+
+            t_init = time.perf_counter()
+            if not backend.initialize():
+                return {"success": False, "message": "Failed to initialize sparse_delta backend"}
+            timing_breakdown["backend_init_s"] = time.perf_counter() - t_init
+
+            t_pause = time.perf_counter()
+            pause_results, all_paused = endpoint_mgr.pause(pause_mode)
+            timing_breakdown["pause_s"] = time.perf_counter() - t_pause
+            if not all_paused:
+                endpoint_mgr.resume()
+                backend.destroy(complete_receiver=False)
+                return {
+                    "success": False,
+                    "message": f"Failed to pause inference endpoints: {pause_results}",
+                }
+            paused = True
+
+            if not hasattr(backend, "post_packed_delta_paths"):
+                raise RuntimeError("sparse_delta backend does not support prepacked sparse-delta paths")
+
+            t_transfer = time.perf_counter()
+            backend.post_packed_delta_paths(
+                sparse_delta_paths,
+                flush_cache=flush_cache,
+                weight_version=weight_version,
+            )
+            transfer_time = time.perf_counter() - t_transfer
+            timing_breakdown["transfer_s"] = transfer_time
+            for key, value in backend.stats_summary().items():
+                timing_breakdown[f"sparse_delta_{key}"] = float(value)
+            endpoint_results = self._endpoint_results_from_backend(endpoints, backend)
+            cache_epoch = self._first_endpoint_cache_epoch(endpoint_results)
+
+            t_destroy = time.perf_counter()
+            backend.destroy()
+            timing_breakdown["backend_destroy_s"] = time.perf_counter() - t_destroy
+            backend = None
+
+            t_resume = time.perf_counter()
+            endpoint_mgr.resume()
+            timing_breakdown["resume_s"] = time.perf_counter() - t_resume
+            paused = False
+
+            timing_breakdown["total_handler_s"] = time.perf_counter() - sync_start_time
+            total_bytes = int(timing_breakdown.get("sparse_delta_total_packed_bytes", 0.0))
+            return {
+                "success": True,
+                "message": f"Posted {len(set(sparse_delta_paths))} sparse-delta file(s) to {len(endpoints)} endpoint(s)",
+                "transfer_time": transfer_time,
+                "total_bytes": total_bytes,
+                "num_parameters": 0,
+                "num_buckets": 1,
+                "timing_breakdown": timing_breakdown,
+                "p2p_rank_summaries": [],
+                "cache_invalidation_mode": cache_invalidation_mode,
+                "flush_cache": flush_cache,
+                "fp8_kv_cache_enabled": fp8_kv_cache_enabled,
+                "fp8_kv_cache_postprocess_requested": fp8_kv_cache_postprocess_required,
+                "fp8_kv_cache_static_scales": fp8_kv_cache_static_scales,
+                "cache_epoch": cache_epoch,
+                "endpoint_results": endpoint_results,
+            }
+        except Exception:
+            if paused:
+                try:
+                    endpoint_mgr.resume()
+                except Exception as resume_err:
+                    logger.warning(f"Rank 0: [WeightSync] Failed to resume inference during cleanup: {resume_err}")
+            if backend is not None:
+                try:
+                    backend.destroy(complete_receiver=False)
+                except Exception as destroy_err:
+                    logger.warning(f"Rank 0: [WeightSync] Failed to destroy sparse_delta backend: {destroy_err}")
+            raise
 
     # ========================================================================
     # Streaming per-layer weight sync (backend-agnostic)
@@ -659,6 +992,11 @@ class WeightSyncHandler:
         pause_mode: str,
         weight_version: Optional[str],
         quantization: Optional[Dict[str, Any]] = None,
+        sparse_delta_config: Optional[Dict[str, Any]] = None,
+        cache_invalidation_mode: str = "auto",
+        fp8_kv_cache_enabled: bool = False,
+        fp8_kv_cache_postprocess_required: bool = False,
+        fp8_kv_cache_static_scales: bool = False,
     ) -> Dict[str, Any]:
         """
         Streaming per-layer weight sync using a pluggable transport backend.
@@ -715,14 +1053,71 @@ class WeightSyncHandler:
         # ignores backend_config and stays single-sender.
         _ps_for_cfg = get_parallel_state()
         _backend_config: Dict[str, Any] = {}
+        if (
+            quantization
+            and quantization.get("quant_method") == "fp8"
+            and sync_method
+            in {
+                "nccl_broadcast",
+                "p2p",
+                "sparse_delta",
+            }
+        ):
+            run_post_process_weights = self._should_run_receiver_post_process_after_fp8_sync(
+                sync_method,
+                quantization,
+                fp8_kv_cache_postprocess_required=fp8_kv_cache_postprocess_required,
+            )
+            _backend_config["run_post_process_weights"] = run_post_process_weights
+            _backend_config["fp8_kv_cache_enabled"] = fp8_kv_cache_enabled
+            _backend_config["fp8_kv_cache_postprocess_required"] = fp8_kv_cache_postprocess_required
+            _backend_config["fp8_kv_cache_static_scales"] = fp8_kv_cache_static_scales
+            logger.info(
+                "Rank %d: [WeightSync] receiver post-process after FP8 %s sync: %s (fp8_kv_cache_required=%s)",
+                self.rank,
+                sync_method,
+                run_post_process_weights,
+                fp8_kv_cache_postprocess_required,
+            )
         if sync_method == "p2p":
             local_rank = _p2p_local_rank(self.rank)
             _backend_config["gpu_id"] = local_rank
             _backend_config["flush_cache"] = flush_cache
-            if self._p2p_requires_post_process_weights(quantization):
+            # The fp8 branch above already decided run_post_process_weights with the
+            # gated logic (kv-cache requirement / env override). Only fall back to the
+            # unconditional "quantized sync requires post-process" default for quant
+            # methods that branch did not handle (e.g. block_fp8); never clobber it.
+            if "run_post_process_weights" not in _backend_config and self._p2p_requires_post_process_weights(
+                quantization
+            ):
                 _backend_config["run_post_process_weights"] = True
+                quant_method = quantization.get("quant_method") if isinstance(quantization, dict) else None
+                logger.info(
+                    "Rank %d: [WeightSync] Enabling receiver post-process for quantized sync: %s",
+                    self.rank,
+                    quant_method,
+                )
             if weight_version is not None:
                 _backend_config["weight_version"] = weight_version
+            if has_linear_attention_layers(model.config):
+                linear_num_key_heads = getattr(model.config, "linear_num_key_heads", None)
+                linear_key_head_dim = getattr(model.config, "linear_key_head_dim", None)
+                linear_num_value_heads = getattr(model.config, "linear_num_value_heads", None)
+                linear_value_head_dim = getattr(model.config, "linear_value_head_dim", None)
+                if all(
+                    value is not None
+                    for value in (
+                        linear_num_key_heads,
+                        linear_key_head_dim,
+                        linear_num_value_heads,
+                        linear_value_head_dim,
+                    )
+                ):
+                    _backend_config["qwen_linear_attention_dims"] = {
+                        "key_dim": int(linear_num_key_heads) * int(linear_key_head_dim),
+                        "value_dim": int(linear_num_value_heads) * int(linear_value_head_dim),
+                        "tp_size": max(int(ep.get("world_size", 1) or 1) for ep in endpoints) if endpoints else 1,
+                    }
             ib_device = _select_p2p_ib_device(self.rank, self.world_size)
             if ib_device:
                 _backend_config["ib_device"] = ib_device
@@ -732,7 +1127,13 @@ class WeightSyncHandler:
                 local_rank,
                 ib_device or "<auto>",
             )
-        if sync_method == "p2p" and _ps_for_cfg.ep_enabled and _ps_for_cfg.ep_size > 1:
+        disable_direct_ep = os.environ.get("XORL_P2P_DISABLE_DIRECT_EP", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if sync_method == "p2p" and _ps_for_cfg.ep_enabled and _ps_for_cfg.ep_size > 1 and not disable_direct_ep:
             _backend_config["direct_ep_transfer"] = True
             # The P2P backend reads world_size out of backend_config; if
             # we don't pass it, it defaults to 1 and sender_ranks
@@ -759,6 +1160,22 @@ class WeightSyncHandler:
                 direct_ep_sender_ranks,
                 sender_ep_ranks,
             )
+        if sync_method == "sparse_delta" and sparse_delta_config:
+            _backend_config.update(sparse_delta_config)
+        elif sync_method == "p2p" and _ps_for_cfg.ep_enabled and _ps_for_cfg.ep_size > 1 and disable_direct_ep:
+            logger.info(
+                "Rank %d: [WeightSync] P2P direct-EP disabled by XORL_P2P_DISABLE_DIRECT_EP; "
+                "using gather-and-send MoE sync path",
+                self.rank,
+            )
+        if sync_method == "sparse_delta":
+            if fp8_kv_cache_enabled:
+                _backend_config["fp8_kv_cache_enabled"] = True
+            if fp8_kv_cache_postprocess_required:
+                _backend_config["fp8_kv_cache_postprocess_required"] = True
+                _backend_config["run_post_process_weights"] = True
+            if fp8_kv_cache_static_scales:
+                _backend_config["fp8_kv_cache_static_scales"] = True
 
         transport_cfg = TransportConfig(
             endpoints=[
@@ -785,13 +1202,8 @@ class WeightSyncHandler:
         # group_name, master addr) all match the prior call's. The cache
         # is module-level so it survives across handler instances within
         # the same process.
-        global _cached_p2p_backend, _cached_backend_key, _cached_nccl_backend, _cached_nccl_backend_key
-        cache_enabled_p2p = os.environ.get("XORL_P2P_BACKEND_CACHE", "1") == "1" and sync_method == "p2p"
-        cache_enabled_nccl = os.environ.get("XORL_NCCL_BACKEND_CACHE", "1") == "1" and sync_method in (
-            "nccl_broadcast",
-            "nccl_simple",
-        )
-        cache_enabled = cache_enabled_p2p or cache_enabled_nccl
+        global _cached_p2p_backend, _cached_backend_key
+        cache_enabled = os.environ.get("XORL_P2P_BACKEND_CACHE", "1") == "1" and sync_method == "p2p"
         backend_key: Optional[Tuple[Any, ...]] = None
         if cache_enabled:
             backend_key = (
@@ -813,14 +1225,8 @@ class WeightSyncHandler:
                     )
                 ),
             )
-
-        # Check nccl_broadcast cache first
-        if cache_enabled_nccl and _cached_nccl_backend is not None and _cached_nccl_backend_key == backend_key:
-            backend = _cached_nccl_backend
-            backend.config = transport_cfg
-            logger.info(f"Rank {self.rank}: [WeightSync] Reusing cached NCCL backend (skips NCCL group re-init)")
-        elif (
-            cache_enabled_p2p
+        if (
+            cache_enabled
             and _cached_p2p_backend is not None
             and _cached_backend_key == backend_key
             and getattr(_cached_p2p_backend, "is_alive", False)
@@ -840,13 +1246,6 @@ class WeightSyncHandler:
                     logger.warning(f"[WeightSync] failed to destroy stale cached backend: {e}")
                 _cached_p2p_backend = None
                 _cached_backend_key = None
-            if _cached_nccl_backend is not None:
-                try:
-                    _cached_nccl_backend.destroy(complete_receiver=False)
-                except Exception as e:
-                    logger.warning(f"[WeightSync] failed to destroy stale cached nccl backend: {e}")
-                _cached_nccl_backend = None
-                _cached_nccl_backend_key = None
             backend = create_backend(sync_method, transport_cfg)
         _is_sender = self.rank in backend.sender_ranks
 
@@ -862,16 +1261,7 @@ class WeightSyncHandler:
             timing_breakdown["health_check_s"] = time.perf_counter() - t_health
 
         # Backend init: all sender ranks participate (collective for NCCL).
-        # For cached backends (nccl_broadcast), initialize() is skipped (already done).
-        if _is_sender and not (
-            (cache_enabled_nccl and _cached_nccl_backend is not None and _cached_nccl_backend_key == backend_key)
-            or (
-                cache_enabled_p2p
-                and _cached_p2p_backend is not None
-                and _cached_backend_key == backend_key
-                and getattr(_cached_p2p_backend, "is_alive", False)
-            )
-        ):
+        if _is_sender:
             logger.info(f"Rank {self.rank}: [WeightSync] Initializing {sync_method} backend...")
             t_init = time.perf_counter()
             if not backend.initialize():
@@ -881,14 +1271,6 @@ class WeightSyncHandler:
                 }
             timing_breakdown["backend_init_s"] = time.perf_counter() - t_init
             logger.info(f"Rank {self.rank}: [WeightSync] Backend initialized")
-            # Store in cache after successful init (only on rank 0 to avoid races)
-            if self.rank == 0:
-                if cache_enabled_nccl:
-                    _cached_nccl_backend = backend
-                    _cached_nccl_backend_key = backend_key
-                elif cache_enabled_p2p:
-                    _cached_p2p_backend = backend
-                    _cached_backend_key = backend_key
 
         # Pause inference: coordinator only (after backend init).
         if self.rank == 0:
@@ -933,6 +1315,21 @@ class WeightSyncHandler:
         self._pending_moe_bucket_bytes = 0
         self._p2p_tied_weight_aliases = {}
         self._reset_fp8_cpu_workspace_usage()
+        skip_patterns = _skip_param_patterns()
+        skip_moe_experts = _env_bool("XORL_P2P_SKIP_MOE_EXPERTS") or _env_bool(
+            "XORL_WEIGHT_SYNC_SKIP_MOE_EXPERTS",
+        )
+        if skip_patterns:
+            logger.info(
+                "Rank %d: [WeightSync] Skipping parameter patterns for diagnostic sync: %s",
+                self.rank,
+                skip_patterns,
+            )
+        if skip_moe_experts:
+            logger.info(
+                "Rank %d: [WeightSync] Skipping MoE expert transfers for diagnostic sync",
+                self.rank,
+            )
 
         # Build ordered list of FSDP modules to process
         modules_to_sync: List[Tuple[str, FSDPModule]] = []
@@ -943,6 +1340,9 @@ class WeightSyncHandler:
         # Detect EP mode
         _ps = get_parallel_state()
         _ep_enabled = _ps.ep_enabled and _ps.ep_size > 1
+        # Model-specific MoE prefix remap (e.g. NemotronH model.* → backbone.*)
+        # applied to MoE contexts before transfer-side name construction.
+        _moe_prefix_remap = self._moe_inference_prefix_remap(model)
         _collect_ep_moe_tensors = _should_collect_ep_moe_tensors(
             sync_method,
             backend,
@@ -968,6 +1368,13 @@ class WeightSyncHandler:
         _pp_enabled = _ps.pp_enabled
         _pp_rank = _ps.pp_rank if _pp_enabled else 0
         _pp_size = _ps.pp_size if _pp_enabled else 1
+
+        # Tracks whether this rank has participated in the collective P2P
+        # transfer-status all_gather below. If a transfer fails before we
+        # reach it, the except handler re-runs the gather so peer ranks that
+        # already reached it don't wedge until the orchestrator request
+        # timeout.
+        p2p_status_gathered = False
 
         try:
             for pp_stage in range(_pp_size):
@@ -1026,6 +1433,10 @@ class WeightSyncHandler:
                 # extract / unfuse / broadcast / direct_ep). Pinpoints
                 # which trainer-side phase dominates the streaming wall.
                 _ws_timings = os.environ.get("XORL_WEIGHT_SYNC_TIMINGS", "0") == "1"
+                sync_after_unshard_default = "0"
+                _sync_after_unshard = os.environ.get(
+                    "XORL_WEIGHT_SYNC_SYNC_AFTER_UNSHARD", sync_after_unshard_default
+                ).strip().lower() in {"1", "true", "yes", "on"}
 
                 for mod_idx in range(num_stage_modules):
                     if abort_path:
@@ -1046,6 +1457,8 @@ class WeightSyncHandler:
                         if not _pre_unshard:
                             t_phase = time.perf_counter()
                             fsdp_mod.unshard()
+                            if _sync_after_unshard and torch.cuda.is_available():
+                                torch.cuda.synchronize()
                             _add_rank_phase("unshard_s", t_phase)
 
                         if _ws_timings:
@@ -1093,15 +1506,23 @@ class WeightSyncHandler:
                                     f"Rank {self.rank}: [WeightSync] ep_moe_prefixes={ep_moe_prefixes} for {mod_name}"
                                 )
                             include_dense_param: Optional[Callable[[str], bool]] = None
+                            should_send_dense_param: Optional[Callable[[str, int], bool]] = None
                             if _extract_dense_on_sender:
                                 should_send_dense_param = getattr(
                                     backend,
                                     "should_send_dense_param",
                                     lambda _name, _rank: True,
                                 )
+                            else:
+                                should_send_dense_param = None
+                            if skip_patterns or should_send_dense_param is not None:
 
                                 def include_dense_param(name: str, _rank: int = self.rank) -> bool:
-                                    return bool(should_send_dense_param(name, _rank))
+                                    if skip_patterns and _param_matches_skip_patterns(name, skip_patterns):
+                                        return False
+                                    if should_send_dense_param is not None:
+                                        return bool(should_send_dense_param(name, _rank))
+                                    return True
 
                             current_buffer = self._extract_params_for_sync(
                                 fsdp_mod,
@@ -1115,6 +1536,12 @@ class WeightSyncHandler:
                                 tied_weight_aliases=self._p2p_tied_weight_aliases,
                                 include_param=include_dense_param,
                             )
+                            if skip_patterns and qlora_linear_buffer:
+                                qlora_linear_buffer = [
+                                    (name, tensor)
+                                    for name, tensor in qlora_linear_buffer
+                                    if not _param_matches_skip_patterns(name, skip_patterns)
+                                ]
                             current_buffer.extend(qlora_linear_buffer)
                             _add_rank_phase("extract_s", t_phase)
                         del qlora_linear_buffer
@@ -1126,15 +1553,42 @@ class WeightSyncHandler:
                             fsdp_mod.reshard()
                             _add_rank_phase("reshard_s", t_phase)
 
+                    if skip_moe_experts and (moe_contexts or ep_moe_contexts):
+                        for ctx in moe_contexts + ep_moe_contexts:
+                            if ctx.get("type") == "full_weight":
+                                ctx["local_experts"] = None
+                            else:
+                                ctx["lora_params"] = None
+                        if self.rank == 0:
+                            logger.info(
+                                "Rank 0: [WeightSync] Diagnostic skip: dropping %d MoE context(s) for module %s",
+                                len(moe_contexts) + len(ep_moe_contexts),
+                                mod_name if _is_my_stage else "(remote)",
+                            )
+                        moe_contexts = []
+                        ep_moe_contexts = []
+
+                    # Remap MoE prefixes to inference names. Must happen AFTER
+                    # ep_moe_prefixes is computed (extraction skipping needs the
+                    # training-module path) and BEFORE any transfer path builds
+                    # per-expert names from ctx["prefix"].
+                    if _moe_prefix_remap is not None:
+                        for ctx in moe_contexts + ep_moe_contexts:
+                            ctx["prefix"] = _moe_prefix_remap(self._strip_compile_orig_mod(ctx["prefix"]))
+
                     # ── Transfer / broadcast to SGLang ───────────────────
                     if not _is_remote:
                         # Stage 0: sender rank(s) broadcast directly to SGLang
                         if _is_sender and current_buffer:
                             t_phase = time.perf_counter()
+                            fp8_target_device = None
+                            if quantization and quantization.get("quant_method") == "fp8":
+                                fp8_target_device = self._fp8_quantization_target_device(backend)
                             if current_buffer:
                                 current_buffer = self._unfuse_for_inference(
                                     current_buffer,
                                     model,
+                                    clone_slices=not bool(quantization and quantization.get("quant_method") == "fp8"),
                                 )
                                 current_buffer = getattr(
                                     backend,
@@ -1146,7 +1600,7 @@ class WeightSyncHandler:
                                     current_buffer = self._quantize_buffer_for_fp8(
                                         current_buffer,
                                         quantization_config=quantization,
-                                        target_device=self._fp8_quantization_target_device(backend),
+                                        target_device=fp8_target_device,
                                         phase_s=rank_phase_s,
                                         phase_prefix="dense_fp8",
                                     )
@@ -1162,6 +1616,8 @@ class WeightSyncHandler:
                             if current_buffer:
                                 logger.info(
                                     f"Rank {self.rank}: [WeightSync] Module {mod_name}: {len(current_buffer)} params"
+                                    f"Rank {self.rank}: [WeightSync] Module {mod_name}: "
+                                    f"{len(current_buffer)} params"
                                 )
                                 t_phase = time.perf_counter()
                                 b, p = self._broadcast_buffer(
@@ -1370,6 +1826,7 @@ class WeightSyncHandler:
                     _add_rank_phase("flush_pending_s", t_phase)
 
             if sync_method == "p2p":
+                p2p_status_gathered = True
                 transfer_statuses = self._gather_p2p_transfer_statuses(pending_transfer_error)
                 failed_statuses = [status for status in transfer_statuses if not status.get("ok", False)]
                 if failed_statuses:
@@ -1410,6 +1867,9 @@ class WeightSyncHandler:
                 if self.rank == 0:
                     timing_breakdown["rank_summary_gather_s"] = time.perf_counter() - t_rank_summary
                     self._add_rank_timing_breakdown(timing_breakdown, p2p_rank_summaries)
+            elif sync_method == "sparse_delta" and self.rank == 0 and hasattr(backend, "stats_summary"):
+                for key, value in backend.stats_summary().items():
+                    timing_breakdown[f"sparse_delta_{key}"] = float(value)
 
             # ------------------------------------------------------------------
             # Step 5: Resume inference, cleanup
@@ -1463,6 +1923,8 @@ class WeightSyncHandler:
                 ordered = ", ".join(f"{k}={v:.3f}s" for k, v in timing_breakdown.items())
                 logger.info(f"Rank {self.rank}: [WeightSync] Timing breakdown: {ordered}")
 
+            endpoint_results = self._endpoint_results_from_backend(endpoints, backend)
+            cache_epoch = self._first_endpoint_cache_epoch(endpoint_results)
             return {
                 "success": True,
                 "message": f"Synced {total_params} params to {len(endpoints)} endpoint(s)",
@@ -1472,12 +1934,40 @@ class WeightSyncHandler:
                 "num_buckets": num_buckets,
                 "timing_breakdown": timing_breakdown,
                 "p2p_rank_summaries": p2p_rank_summaries,
-                "endpoint_results": [{"host": ep["host"], "port": ep["port"], "success": True} for ep in endpoints],
+                "cache_invalidation_mode": cache_invalidation_mode,
+                "flush_cache": flush_cache,
+                "fp8_kv_cache_enabled": fp8_kv_cache_enabled,
+                "fp8_kv_cache_postprocess_requested": fp8_kv_cache_postprocess_required,
+                "fp8_kv_cache_static_scales": fp8_kv_cache_static_scales,
+                "cache_epoch": cache_epoch,
+                "endpoint_results": endpoint_results,
             }
 
         except Exception as sync_err:
             if abort_path:
                 self._mark_sync_abort(abort_path, sync_err)
+            # Collective safety: a P2P transfer that fails before the status
+            # all_gather above leaves peer ranks that already reached it
+            # blocked in all_gather_object until the orchestrator's request
+            # timeout (~30 min) — then the whole run crashes (observed
+            # 2026-06-05: one rank's Mooncake batch_transfer_sync ret=-1 wedged
+            # the sync for 1800s -> 504 -> trainer rc=6). Participate once,
+            # best-effort, so the collective completes and every rank raises
+            # together promptly instead of wedging.
+            if (
+                sync_method == "p2p"
+                and not p2p_status_gathered
+                and dist.is_available()
+                and dist.is_initialized()
+                and self.world_size > 1
+            ):
+                p2p_status_gathered = True
+                try:
+                    self._gather_p2p_transfer_statuses(sync_err)
+                except Exception as gather_err:
+                    logger.warning(
+                        f"Rank {self.rank}: [WeightSync] post-failure P2P status gather failed: {gather_err}"
+                    )
             if endpoint_mgr is not None:
                 if sync_method == "p2p":
                     logger.warning(
@@ -1677,6 +2167,12 @@ class WeightSyncHandler:
                     continue
                 E_local = gate.shape[0]
 
+            # Non-gated experts (e.g. NemotronH latent MoE) have no gate
+            # projection: ``gate_up_proj`` holds only the up projection.
+            # Accessing ``gate_proj`` on such a module raises AttributeError.
+            gated = getattr(mod, "gated", True)
+            proj_names = ("gate_proj", "up_proj", "down_proj") if gated else ("up_proj", "down_proj")
+
             if mname:
                 full_prefix = f"{mod_name}.{mname}" if mod_name != "(root)" else mname
             else:
@@ -1689,6 +2185,7 @@ class WeightSyncHandler:
                         "prefix": full_prefix,
                         "local_experts": None,
                         "num_local_experts": E_local,
+                        "projections": proj_names,
                     }
                 )
                 continue
@@ -1696,7 +2193,7 @@ class WeightSyncHandler:
             # Clone local expert data for each projection.
             # With EP, each rank's module already holds only local experts [E_local, K, N].
             local_experts = {}
-            for proj_name in ("gate_proj", "up_proj", "down_proj"):
+            for proj_name in proj_names:
                 param = getattr(mod, proj_name)
                 if isinstance(param.data, DTensor):
                     local = param.to_local()
@@ -1737,6 +2234,7 @@ class WeightSyncHandler:
                     "prefix": full_prefix,
                     "local_experts": local_experts,  # {proj: [E_local, K, N]}
                     "num_local_experts": E_local,
+                    "projections": proj_names,
                 }
             )
 
@@ -1815,14 +2313,15 @@ class WeightSyncHandler:
                 ctx["local_experts"] = None
                 return 0, 0, 0
 
-        full_prefix = ctx["prefix"]
+        full_prefix = self._strip_compile_orig_mod(ctx["prefix"])
+        sync_prefix = _inference_param_name(full_prefix)
         ep_size = ps.ep_size
         ep_rank = ps.ep_rank
         local_experts = ctx["local_experts"]
         E_local = ctx["num_local_experts"]
 
         logger.info(
-            f"Rank {self.rank}: [Direct-EP] prefix={full_prefix}, E_local={E_local}, E_total={E_local * ep_size}"
+            f"Rank {self.rank}: [Direct-EP] prefix={sync_prefix}, E_local={E_local}, E_total={E_local * ep_size}"
         )
 
         total_bytes = 0
@@ -1874,14 +2373,16 @@ class WeightSyncHandler:
 
         # local_experts[proj] is [E_local, K, N] (input-major). HF
         # convention is [N, K] per-expert (output-major) — same permute
-        # the gather path does before broadcast.
-        for proj_name in ("gate_proj", "up_proj", "down_proj"):
+        # the gather path does before broadcast. Non-gated experts (e.g.
+        # NemotronH) have no gate projection — the context carries only
+        # the projections the module actually owns.
+        for proj_name in ctx.get("projections", ("gate_proj", "up_proj", "down_proj")):
             logger.debug(f"Rank {self.rank}: [Direct-EP] {full_prefix}.{proj_name} stage=before_permute")
             local_data = local_experts[proj_name]  # [E_local, K, N]
             if fp8_gpu_quantization and local_data.device.type == "cuda":
                 entries, original_bytes = self._quantize_ep_expert_projection_for_fp8_gpu_to_cpu(
                     local_data,
-                    full_prefix=full_prefix,
+                    full_prefix=sync_prefix,
                     proj_name=proj_name,
                     ep_rank=ep_rank,
                     quantization_config=quantization,
@@ -1911,7 +2412,7 @@ class WeightSyncHandler:
             if fp8_cpu_workspace:
                 records, original_bytes = self._stage_ep_expert_projection_for_fp8_cpu_workspace(
                     local_data,
-                    full_prefix=full_prefix,
+                    full_prefix=sync_prefix,
                     proj_name=proj_name,
                     ep_rank=ep_rank,
                     quantization_config=quantization,
@@ -1939,7 +2440,7 @@ class WeightSyncHandler:
             if fp8_cpu_quantization:
                 entries, original_bytes = self._quantize_ep_expert_projection_for_fp8_cpu(
                     local_data,
-                    full_prefix=full_prefix,
+                    full_prefix=sync_prefix,
                     proj_name=proj_name,
                     ep_rank=ep_rank,
                     quantization_config=quantization,
@@ -1975,7 +2476,7 @@ class WeightSyncHandler:
             )
             for i in range(E_local):
                 global_idx = ep_rank * E_local + i
-                hf_name = f"{full_prefix}.{global_idx}.{proj_name}.weight"
+                hf_name = f"{sync_prefix}.{global_idx}.{proj_name}.weight"
                 tensor = local_stack[i]
                 tensor_bytes = tensor.numel() * tensor.element_size()
                 flush_bucket_before_append(tensor_bytes)
@@ -2278,7 +2779,8 @@ class WeightSyncHandler:
 
         ALL ranks must call this (collective gather).
         """
-        full_prefix = ctx["prefix"]
+        full_prefix = self._strip_compile_orig_mod(ctx["prefix"])
+        sync_prefix = _inference_param_name(full_prefix)
         ep_group = ps.ep_group
         ep_size = ps.ep_size
         device = f"cuda:{self.rank % torch.cuda.device_count()}"
@@ -2316,10 +2818,10 @@ class WeightSyncHandler:
         else:
             local_experts = ctx["local_experts"]
             E_local = ctx["num_local_experts"]
+            # Non-gated experts (e.g. NemotronH) carry only up/down projections.
             projections = [
-                ("gate", "gate_proj", None, None),
-                ("up", "up_proj", None, None),
-                ("down", "down_proj", None, None),
+                (proj.removesuffix("_proj"), proj, None, None)
+                for proj in ctx.get("projections", ("gate_proj", "up_proj", "down_proj"))
             ]
 
         E_total = E_local * ep_size
@@ -2362,14 +2864,14 @@ class WeightSyncHandler:
             # Rank 0: split into per-expert (name, tensor) pairs and bucket
             if self.rank == 0:
                 all_experts = torch.cat(gathered, dim=0)  # [E_total, N, K]
-                if hf_proj == "gate_proj":
+                if hf_proj == projections[0][1]:
                     logger.info(
                         f"Rank 0: [EP-Gather] {full_prefix}: all_experts={list(all_experts.shape)}, "
                         f"E_local={E_local}, E_total={E_total}, bucket_len={len(bucket)}"
                     )
                 del gathered
                 for global_idx in range(E_total):
-                    hf_name = f"{full_prefix}.{global_idx}.{hf_proj}.weight"
+                    hf_name = f"{sync_prefix}.{global_idx}.{hf_proj}.weight"
                     expert_weight = all_experts[global_idx]
                     weight_bytes = expert_weight.numel() * expert_weight.element_size()
                     bucket.append((hf_name, expert_weight))
@@ -2455,7 +2957,8 @@ class WeightSyncHandler:
             (total_bytes, total_params, num_buckets)
         """
         mod = ctx["module"]
-        full_prefix = ctx["prefix"]
+        full_prefix = self._strip_compile_orig_mod(ctx["prefix"])
+        sync_prefix = _inference_param_name(full_prefix)
         lora_params = ctx["lora_params"]
 
         total_bytes = 0
@@ -2487,7 +2990,7 @@ class WeightSyncHandler:
                 del base_w, delta
 
                 # HF format: [N, K] (transpose from GKN)
-                hf_name = f"{full_prefix}.{expert_idx}.{hf_proj}.weight"
+                hf_name = f"{sync_prefix}.{expert_idx}.{hf_proj}.weight"
                 expert_weight = merged.t().contiguous()
                 del merged
 
@@ -2616,7 +3119,8 @@ class WeightSyncHandler:
             list of (name, bf16_gpu_tensor) pairs
         """
         mod = ctx["module"]
-        full_prefix = ctx["prefix"]
+        full_prefix = self._strip_compile_orig_mod(ctx["prefix"])
+        sync_prefix = _inference_param_name(full_prefix)
         lora_params = ctx["lora_params"]
         E = mod.num_local_experts
 
@@ -2635,7 +3139,7 @@ class WeightSyncHandler:
                 delta = self._compute_moe_lora_delta(mod, lora_A, lora_B, expert_idx=expert_idx)
                 merged = (base_w.to(torch.bfloat16) + delta.to(torch.bfloat16)).t().contiguous()
                 del base_w, delta
-                hf_name = f"{full_prefix}.{expert_idx}.{hf_proj}.weight"
+                hf_name = f"{sync_prefix}.{expert_idx}.{hf_proj}.weight"
                 items.append((hf_name, merged))
 
         logger.info(f"Rank {self.rank}: [WeightSync] MoE {full_prefix}: {len(items)} experts")
@@ -2652,8 +3156,18 @@ class WeightSyncHandler:
 
     @staticmethod
     def _fp8_quantization_target_device(backend) -> Optional[str]:
-        """Use CPU quantization for P2P, preserving NCCL's device-local path."""
-        if backend.__class__.__name__ == "P2PTransportBackend":
+        """Use CPU output for backends that consume trainer-side CPU tensors."""
+        override = os.environ.get("XORL_WEIGHT_SYNC_FP8_TARGET_DEVICE", "").strip().lower()
+        if override:
+            if override in {"cpu", "cuda"}:
+                return override
+            if override == "gpu":
+                return "cuda"
+            logger.warning(
+                "Ignoring unsupported XORL_WEIGHT_SYNC_FP8_TARGET_DEVICE=%r; expected cpu, cuda, or gpu",
+                override,
+            )
+        if backend.__class__.__name__ in {"P2PTransportBackend", "SparseDeltaTransportBackend"}:
             return "cpu"
         return None
 
@@ -2678,8 +3192,41 @@ class WeightSyncHandler:
         return os.environ.get("XORL_P2P_FP8_CPU_WORKSPACE_STREAMING", "1") != "0"
 
     @staticmethod
+    def _p2p_should_run_post_process_weights(quantization: Optional[Dict[str, Any]]) -> bool:
+        if not (quantization and quantization.get("quant_method") == "fp8"):
+            return False
+        if "XORL_P2P_RUN_POST_PROCESS_WEIGHTS" in os.environ:
+            return _env_bool("XORL_P2P_RUN_POST_PROCESS_WEIGHTS")
+        if "XORL_WEIGHT_SYNC_RUN_POST_PROCESS_WEIGHTS" in os.environ:
+            return _env_bool("XORL_WEIGHT_SYNC_RUN_POST_PROCESS_WEIGHTS")
+        return False
+
+    @staticmethod
+    def _should_run_receiver_post_process_after_fp8_sync(
+        sync_method: str,
+        quantization: Optional[Dict[str, Any]],
+        *,
+        fp8_kv_cache_postprocess_required: bool = False,
+    ) -> bool:
+        if not (quantization and quantization.get("quant_method") == "fp8"):
+            return False
+        if sync_method not in {"nccl_broadcast", "p2p", "sparse_delta"}:
+            return False
+        if sync_method == "sparse_delta":
+            return bool(fp8_kv_cache_postprocess_required)
+        if sync_method == "p2p":
+            return bool(
+                fp8_kv_cache_postprocess_required
+                or WeightSyncHandler._p2p_should_run_post_process_weights(quantization)
+            )
+        return True
+
+    @staticmethod
     def _p2p_requires_post_process_weights(quantization: Optional[Dict[str, Any]]) -> bool:
-        return bool(quantization and quantization.get("quant_method") == "fp8")
+        if not quantization:
+            return False
+        quant_method = str(quantization.get("quant_method") or "").lower()
+        return quant_method in {"fp8", "block_fp8"}
 
     @staticmethod
     def _fp8_dtype_and_max(quantization_config: Dict[str, Any]) -> Tuple[torch.dtype, float]:
@@ -2734,8 +3281,15 @@ class WeightSyncHandler:
             return False
 
         if modules_to_not_convert:
+            normalized_prefixes = [
+                prefix[: -len(".weight")] if prefix.endswith(".weight") else prefix for prefix in modules_to_not_convert
+            ]
             return not any(
-                name == prefix + ".weight" or name.startswith(prefix + ".") for prefix in modules_to_not_convert
+                name == prefix + ".weight"
+                or name.startswith(prefix + ".")
+                or fnmatch(name, prefix)
+                or fnmatch(name, f"{prefix}.weight")
+                for prefix in normalized_prefixes
             )
 
         if "_proj.weight" in name or name.endswith("fused_qkv_a_proj_with_mqa.weight"):
@@ -2778,10 +3332,11 @@ class WeightSyncHandler:
         )
 
     @staticmethod
-    def _quantize_fp8_stack_on_gpu_to_cpu(
+    def _quantize_fp8_stack_on_gpu(
         stack: torch.Tensor,
         *,
         block_size: int,
+        target_device: Optional[str],
         phase_s: Optional[Dict[str, float]],
         phase_prefix: str,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -2797,12 +3352,14 @@ class WeightSyncHandler:
         work = stack.detach().contiguous()
         flat = work.reshape(count * rows, cols)
         quantized_flat, scale_flat = block_fp8_quantize_gkn(flat, block_size=block_size)
-        torch.cuda.current_stream(stack.device).synchronize()
         WeightSyncHandler._add_phase_time(phase_s, f"{phase_prefix}_gpu_quant_s", time.perf_counter() - t_quant)
 
         scale_cols = (cols + block_size - 1) // block_size
         quantized = quantized_flat.reshape(count, rows, cols)
         scale_inv = scale_flat.reshape(count, rows // block_size, scale_cols)
+
+        if target_device is None or torch.device(target_device).type != "cpu":
+            return quantized, scale_inv
 
         t_copy = time.perf_counter()
         quantized_cpu = WeightSyncHandler._copy_tensor_to_cpu_for_fp8(quantized)
@@ -2813,6 +3370,22 @@ class WeightSyncHandler:
             time.perf_counter() - t_copy,
         )
         return quantized_cpu, scale_cpu
+
+    @staticmethod
+    def _quantize_fp8_stack_on_gpu_to_cpu(
+        stack: torch.Tensor,
+        *,
+        block_size: int,
+        phase_s: Optional[Dict[str, float]],
+        phase_prefix: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return WeightSyncHandler._quantize_fp8_stack_on_gpu(
+            stack,
+            block_size=block_size,
+            target_device="cpu",
+            phase_s=phase_s,
+            phase_prefix=phase_prefix,
+        )
 
     @staticmethod
     def _quantize_fp8_stack(
@@ -2830,22 +3403,21 @@ class WeightSyncHandler:
         if stack.ndim != 3:
             raise ValueError(f"Expected a 3D FP8 quantization stack, got shape={tuple(stack.shape)}")
 
-        if (
-            target_device is not None
-            and torch.device(target_device).type == "cpu"
-            and WeightSyncHandler._can_quantize_fp8_stack_on_gpu(
-                stack,
-                fp8_dtype=fp8_dtype,
-                block_size_row=block_size_row,
-                block_size_col=block_size_col,
-            )
+        if WeightSyncHandler._can_quantize_fp8_stack_on_gpu(
+            stack,
+            fp8_dtype=fp8_dtype,
+            block_size_row=block_size_row,
+            block_size_col=block_size_col,
         ):
-            return WeightSyncHandler._quantize_fp8_stack_on_gpu_to_cpu(
-                stack,
-                block_size=block_size_row,
-                phase_s=phase_s,
-                phase_prefix=phase_prefix,
-            )
+            target_type = stack.device.type if target_device is None else torch.device(target_device).type
+            if target_type in {"cpu", "cuda"}:
+                return WeightSyncHandler._quantize_fp8_stack_on_gpu(
+                    stack,
+                    block_size=block_size_row,
+                    target_device=target_device,
+                    phase_s=phase_s,
+                    phase_prefix=phase_prefix,
+                )
 
         work = stack.detach()
         if target_device is not None:
@@ -2982,7 +3554,8 @@ class WeightSyncHandler:
         del cpu_data
 
         e_local = hf_stack.shape[0]
-        names = [f"{full_prefix}.{ep_rank * e_local + expert_idx}.{proj_name}.weight" for expert_idx in range(e_local)]
+        sync_prefix = _inference_param_name(full_prefix)
+        names = [f"{sync_prefix}.{ep_rank * e_local + expert_idx}.{proj_name}.weight" for expert_idx in range(e_local)]
         return [(name, hf_stack[idx]) for idx, name in enumerate(names)], original_bytes
 
     def _ensure_fp8_cpu_workspace(
@@ -3090,8 +3663,9 @@ class WeightSyncHandler:
         self._add_phase_time(phase_s, "direct_ep_fp8_workspace_copy_s", time.perf_counter() - t_copy)
 
         workspace["used"] = end_idx
+        sync_prefix = _inference_param_name(full_prefix)
         records = [
-            (f"{full_prefix}.{ep_rank * e_local + expert_idx}.{proj_name}.weight", key, start_idx + expert_idx)
+            (f"{sync_prefix}.{ep_rank * e_local + expert_idx}.{proj_name}.weight", key, start_idx + expert_idx)
             for expert_idx in range(e_local)
         ]
         return records, original_bytes
@@ -3316,7 +3890,8 @@ class WeightSyncHandler:
 
         e_local = hf_stack.shape[0]
         modules_to_not_convert = quantization_config.get("modules_to_not_convert", [])
-        names = [f"{full_prefix}.{ep_rank * e_local + idx}.{proj_name}.weight" for idx in range(e_local)]
+        sync_prefix = _inference_param_name(full_prefix)
+        names = [f"{sync_prefix}.{ep_rank * e_local + idx}.{proj_name}.weight" for idx in range(e_local)]
         if not all(
             WeightSyncHandler._should_quantize_fp8_weight(name, hf_stack[idx], modules_to_not_convert)
             for idx, name in enumerate(names)
@@ -3368,7 +3943,7 @@ class WeightSyncHandler:
         - (name_scale_inv, scale_inv): per-block scale_inv in float32
 
         Uses quantization_config (HF format) for:
-        - fmt: "e4m3" (default) or "e5m2" → torch.float8_e4m3fn or torch.float8_e5m2
+        - fmt: "e4m3" (default public online-sync contract)
         - weight_block_size: [row_block, col_block], default [128, 128]
         - modules_to_not_convert: list of module name prefixes to skip quantization
 
@@ -3380,7 +3955,7 @@ class WeightSyncHandler:
         if quantization_config is None:
             quantization_config = {}
 
-        # FP8 format: e4m3 (default, higher precision) or e5m2 (wider range)
+        # Public online sync is E4M3; the helper keeps E5M2 handling for low-level dtype tests/transport utilities.
         fp8_dtype, fp8_max = WeightSyncHandler._fp8_dtype_and_max(quantization_config)
         block_size_row, block_size_col = WeightSyncHandler._fp8_block_size(quantization_config)
         modules_to_not_convert = quantization_config.get("modules_to_not_convert", [])
@@ -3587,6 +4162,12 @@ class WeightSyncHandler:
                     continue
                 elif isinstance(lora_mod, MoEExpertsLoRA):
                     if param_leaf == "gate_up_proj":
+                        if not getattr(lora_mod, "gated", True):
+                            # Non-gated experts hold only the up projection in
+                            # gate_up_proj; the midpoint split below would
+                            # corrupt them. No non-gated MoE LoRA module exists
+                            # today — fail loud if one appears.
+                            raise NotImplementedError("Weight sync does not support non-gated MoE LoRA experts")
                         merged = param.data.to(dtype=torch.bfloat16).clone()
                         half = merged.shape[2] // 2
                         if "gate_proj" in lora_mod.lora_config.target_modules:
@@ -3639,16 +4220,19 @@ class WeightSyncHandler:
                 if full_tied not in buffer_names and full_source in buffer_names:
                     for buf_name, buf_tensor in buffer:
                         if buf_name == full_source:
-                            if emit_tied_weight_duplicates:
-                                logger.info(
-                                    f"Rank 0: [WeightSync] Tied weight: emitting {full_tied} (clone of {full_source})"
-                                )
-                                buffer.append((full_tied, buf_tensor.clone()))
-                            elif WeightSyncHandler._module_paths_share_parameter(
+                            paths_share_parameter = WeightSyncHandler._module_paths_share_parameter(
                                 fsdp_mod,
                                 tied_name,
                                 source_name,
-                            ):
+                            )
+                            if emit_tied_weight_duplicates and paths_share_parameter:
+                                logger.info(
+                                    f"Rank 0: [WeightSync] Tied weight: emitting {full_tied} (clone of {full_source})"
+                                    f"Rank 0: [WeightSync] Tied weight: emitting {full_tied} "
+                                    f"(clone of {full_source})"
+                                )
+                                buffer.append((full_tied, buf_tensor.clone()))
+                            elif paths_share_parameter:
                                 if tied_weight_aliases is not None:
                                     tied_weight_aliases[full_tied] = full_source
                                 logger.info(
@@ -3668,6 +4252,8 @@ class WeightSyncHandler:
     def _unfuse_for_inference(
         buffer: List[Tuple[str, torch.Tensor]],
         model,
+        *,
+        clone_slices: bool = True,
     ) -> List[Tuple[str, torch.Tensor]]:
         """Convert training parameter names to HF/SGLang inference names.
 
@@ -3679,9 +4265,14 @@ class WeightSyncHandler:
           fused_qkv_a_proj_with_mqa to match SGLang's inference module
         - Qwen3.5 linear attention: remap split GatedDeltaNet params back to
           HF fused names (q_proj/k_proj/v_proj → in_proj_qkv, etc.)
+        - NemotronH: delegate to the model's checkpoint handler (per-expert
+          ``backbone.*`` HF layout; experts are non-gated, no gate/up split)
         """
 
         config = model.config
+        if getattr(config, "model_type", None) == "nemotron_h":
+            return WeightSyncHandler._remap_nemotron_h_params_for_inference(buffer, model)
+
         num_heads = config.num_attention_heads
         num_kv_heads = getattr(config, "num_key_value_heads", num_heads)
         head_dim = getattr(config, "head_dim", config.hidden_size // num_heads)
@@ -3690,11 +4281,13 @@ class WeightSyncHandler:
 
         result = []
         for name, tensor in buffer:
+            name = WeightSyncHandler._strip_compile_orig_mod(name)
+            name = _inference_param_name(name)
             if ".qkv_proj." in name:
                 prefix, suffix = name.rsplit(".qkv_proj.", 1)
-                q = tensor[:q_size].clone()
-                k = tensor[q_size : q_size + kv_size].clone()
-                v = tensor[q_size + kv_size :].clone()
+                q = WeightSyncHandler._materialize_unfused_slice(tensor[:q_size], clone_slices)
+                k = WeightSyncHandler._materialize_unfused_slice(tensor[q_size : q_size + kv_size], clone_slices)
+                v = WeightSyncHandler._materialize_unfused_slice(tensor[q_size + kv_size :], clone_slices)
                 result.append((f"{prefix}.q_proj.{suffix}", q))
                 result.append((f"{prefix}.k_proj.{suffix}", k))
                 result.append((f"{prefix}.v_proj.{suffix}", v))
@@ -3714,8 +4307,8 @@ class WeightSyncHandler:
             elif ".gate_up_proj." in name:
                 prefix, suffix = name.rsplit(".gate_up_proj.", 1)
                 half = tensor.shape[0] // 2
-                gate = tensor[:half].clone()
-                up = tensor[half:].clone()
+                gate = WeightSyncHandler._materialize_unfused_slice(tensor[:half], clone_slices)
+                up = WeightSyncHandler._materialize_unfused_slice(tensor[half:], clone_slices)
                 result.append((f"{prefix}.gate_proj.{suffix}", gate))
                 result.append((f"{prefix}.up_proj.{suffix}", up))
             else:
@@ -3727,6 +4320,62 @@ class WeightSyncHandler:
             result = remap_linear_attention_params_for_inference(result)
 
         return result
+
+    @staticmethod
+    def _remap_nemotron_h_params_for_inference(
+        buffer: List[Tuple[str, torch.Tensor]],
+        model,
+    ) -> List[Tuple[str, torch.Tensor]]:
+        """Convert NemotronH training params to the published HF layout.
+
+        NemotronH experts live under ``.mixer.experts.`` and are NON-gated
+        (``gate_up_proj`` holds only the up projection at half width), so the
+        generic transforms in ``_unfuse_for_inference`` would either miss them
+        (``.mlp.experts.`` pattern) or corrupt them (gate/up midpoint split).
+        The model's checkpoint handler ``on_save_weight`` already emits the
+        exact HF checkpoint layout: ``model.*`` → ``backbone.*`` rename plus
+        per-expert ``experts.{e}.up_proj/down_proj.weight`` with the GKN
+        ``[E, in, out]`` → HF ``[out, in]`` transpose. Route through it.
+        """
+        if not hasattr(model, "get_checkpoint_handler"):
+            raise RuntimeError(
+                "nemotron_h weight sync requires model.get_checkpoint_handler() to map "
+                "training param names to the HF backbone.* layout"
+            )
+        ckpt_handler = model.get_checkpoint_handler(is_broadcast=True)
+        result: List[Tuple[str, torch.Tensor]] = []
+        for name, tensor in buffer:
+            name = WeightSyncHandler._strip_compile_orig_mod(name)
+            if ".qkv_proj." in name or ".gate_up_proj." in name:
+                # NemotronH keeps separate q/k/v and non-gated dense MLPs; a
+                # fused dense param here would need an unfuse on_save_weight
+                # does not perform. Fail loud instead of shipping it fused.
+                raise ValueError(f"Unexpected fused dense param in nemotron_h weight sync: {name}")
+            result.extend(ckpt_handler.on_save_weight(name, tensor))
+        return result
+
+    @staticmethod
+    def _moe_inference_prefix_remap(model) -> Optional[Callable[[str], str]]:
+        """Per-model remap of MoE expert context prefixes to inference names.
+
+        The EP/QLoRA MoE transfer paths build per-expert names from the
+        training module path (``ctx["prefix"]``), bypassing
+        ``_unfuse_for_inference``. NemotronH publishes its module tree under
+        ``backbone.*`` while xorl trains under ``model.*``, so expert prefixes
+        need the same rename the dense path gets from the checkpoint handler.
+        Returns None for models whose training names already match inference.
+        """
+        if getattr(model.config, "model_type", None) == "nemotron_h":
+            return nemotron_h_denormalize_param_name
+        return None
+
+    @staticmethod
+    def _materialize_unfused_slice(tensor: torch.Tensor, clone_slices: bool) -> torch.Tensor:
+        if clone_slices:
+            return tensor.clone()
+        if tensor.is_contiguous():
+            return tensor
+        return tensor.contiguous()
 
     @staticmethod
     def _remap_deepseek_mla_params_for_inference(
@@ -3788,8 +4437,10 @@ class WeightSyncHandler:
         if not buffer:
             return 0, 0
 
+        buffer = [(_inference_param_name(self._strip_compile_orig_mod(name)), tensor) for name, tensor in buffer]
         bucket_bytes = sum(t.numel() * t.element_size() for _, t in buffer)
         logger.info(f"Rank {self.rank}: [WeightSync] Broadcasting {len(buffer)} params, {bucket_bytes / 1e6:.1f} MB")
+        self._log_debug_tensor_stats(buffer)
 
         dense_bucket_bytes = _env_int("XORL_WEIGHT_SYNC_DENSE_BUCKET_BYTES", 0, minimum=0)
         if dense_bucket_bytes <= 0 or bucket_bytes <= dense_bucket_bytes:
@@ -3813,6 +4464,54 @@ class WeightSyncHandler:
                 weight_version=weight_version if is_last else None,
             )
         return bucket_bytes, len(buffer)
+
+    def _log_debug_tensor_stats(self, buffer: List[Tuple[str, torch.Tensor]]) -> None:
+        patterns = [
+            pattern.strip()
+            for pattern in os.environ.get("XORL_WEIGHT_SYNC_DEBUG_TENSOR_STATS", "").split(",")
+            if pattern.strip()
+        ]
+        if not patterns:
+            return
+
+        for name, tensor in buffer:
+            if not any(pattern in name for pattern in patterns):
+                continue
+            try:
+                detached = tensor.detach()
+                flat = detached.reshape(-1)
+                sample_count = min(4096, flat.numel())
+                if sample_count == 0:
+                    logger.info("Rank %d: [WeightSync debug] %s empty tensor", self.rank, name)
+                    continue
+                sample = flat[:sample_count]
+                stats = sample.float()
+                sample_raw = sample.contiguous().view(torch.uint8).cpu().numpy().tobytes()
+                sample_checksum = hashlib.sha256(sample_raw).hexdigest()[:16]
+                finite = torch.isfinite(stats)
+                if finite.all():
+                    sample_min = float(stats.min().item())
+                    sample_max = float(stats.max().item())
+                    sample_mean = float(stats.mean().item())
+                else:
+                    sample_min = sample_max = sample_mean = None
+                logger.info(
+                    "Rank %d: [WeightSync debug] %s shape=%s dtype=%s device=%s sample_count=%d "
+                    "all_finite=%s sample_min=%s sample_max=%s sample_mean=%s sample_checksum=%s",
+                    self.rank,
+                    name,
+                    list(detached.shape),
+                    detached.dtype,
+                    detached.device,
+                    sample_count,
+                    bool(finite.all().item()),
+                    sample_min,
+                    sample_max,
+                    sample_mean,
+                    sample_checksum,
+                )
+            except Exception as exc:
+                logger.warning("Rank %d: [WeightSync debug] failed to stat %s: %s", self.rank, name, exc)
 
     @staticmethod
     def _chunk_buffer_by_bytes(

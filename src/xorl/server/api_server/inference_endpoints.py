@@ -34,6 +34,11 @@ from xorl.server.api_server.api_types import (
 from xorl.server.api_server.utils import validate_model_id
 from xorl.server.protocol.api_orchestrator import OrchestratorRequest
 from xorl.server.protocol.operations import SyncWeightsData
+from xorl.server.weight_sync.quantization_config import (
+    SYNC_QUANTIZATION_UNSUPPORTED_REASON_KEY,
+    UnsupportedSyncQuantizationError,
+    normalize_sync_quantization_config,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -62,14 +67,201 @@ class InferenceEndpointsMixin:
         return False
 
     @staticmethod
-    def _detect_quantization_from_hf_config(model_path: str) -> dict | None:
+    def _normalize_modules_to_not_convert(entries: List[str]) -> List[str]:
+        """Translate receiver-side module names into trainer-side names.
+
+        Multimodal HF checkpoints (e.g. Qwen3.6-35B-A3B-FP8) wrap the language
+        model under `model.language_model.*`, while the xorl trainer loads only
+        the text submodel and exposes its tensors as `model.*`. We strip that
+        `language_model.` infix so the prefix-based skip-match in
+        ``_should_quantize_fp8_weight`` actually fires on trainer tensor names.
+        Vision-only entries (`model.visual.*`, `visual.*`) are dropped because
+        they have no trainer-side counterpart.
+        """
+        out: List[str] = []
+        seen: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, str) or not entry:
+                continue
+            # Drop vision-only entries — trainer doesn't have these tensors.
+            if entry.startswith("visual.") or ".visual." in entry or entry.startswith("model.visual."):
+                continue
+            # Strip the multimodal language_model nesting.
+            normalized = entry.replace("model.language_model.", "model.", 1)
+            if normalized.startswith("language_model."):
+                normalized = normalized[len("language_model.") :]
+            if normalized not in seen:
+                seen.add(normalized)
+                out.append(normalized)
+        return out
+
+    @staticmethod
+    def _positive_int_config_value(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+    @staticmethod
+    def _truthy_server_info_value(value: Any) -> bool | None:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "off"}:
+                return False
+        return None
+
+    @classmethod
+    def _server_info_bool(cls, info_data: Dict[str, Any], *keys: str) -> bool | None:
+        for key in keys:
+            if key not in info_data:
+                continue
+            parsed = cls._truthy_server_info_value(info_data.get(key))
+            if parsed is not None:
+                return parsed
+        return None
+
+    @classmethod
+    def _server_info_kv_cache_dtype(cls, info_data: Dict[str, Any]) -> str | None:
+        value = info_data.get("kv_cache_dtype")
+        if value is None:
+            value = info_data.get("kv_cache_dtype_str")
+        if value is None:
+            return None
+        return str(value).strip().lower()
+
+    @classmethod
+    def _server_info_fp8_kv_cache_enabled(cls, info_data: Dict[str, Any]) -> bool | None:
+        explicit = cls._server_info_bool(info_data, "fp8_kv_cache_enabled", "enable_fp8_kv_cache")
+        if explicit is not None:
+            return explicit
+        dtype = cls._server_info_kv_cache_dtype(info_data)
+        if dtype is None:
+            return None
+        return dtype in {"fp8", "fp8_e4m3", "e4m3", "float8_e4m3fn"}
+
+    @staticmethod
+    def _normalize_receiver_kv_cache_dtype(value: Any) -> str | None:
+        if value is None:
+            return None
+        normalized = str(value).strip().lower()
+        if normalized in {"", "none", "null"}:
+            return None
+        if normalized not in {"auto", "fp8", "fp8_e4m3"}:
+            raise ValueError(f"receiver_kv_cache_dtype must be one of auto, fp8, fp8_e4m3; got {value!r}")
+        return normalized
+
+    @staticmethod
+    def _is_fp8_kv_cache_dtype(value: str | None) -> bool:
+        return value in {"fp8", "fp8_e4m3", "e4m3", "float8_e4m3fn"}
+
+    @staticmethod
+    def _cache_epoch_from_mapping(data: Dict[str, Any]) -> Any:
+        if "cache_epoch" in data:
+            return data["cache_epoch"]
+        return data.get("cache_version")
+
+    def _resolve_receiver_kv_cache_dtype_requirement(
+        self,
+        request: AddInferenceEndpointRequest,
+    ) -> tuple[str | None, str | None]:
+        try:
+            train_config = getattr(self, "train_config", {}) or {}
+            server_expected = self._normalize_receiver_kv_cache_dtype(
+                train_config.get("receiver_kv_cache_dtype")
+            )
+            request_expected = self._normalize_receiver_kv_cache_dtype(request.receiver_kv_cache_dtype)
+        except ValueError as exc:
+            return None, str(exc)
+
+        expectations = [value for value in (server_expected, request_expected) if value is not None]
+        if not expectations:
+            return None, None
+        fp8_expectations = [value for value in expectations if value in {"fp8", "fp8_e4m3"}]
+        if fp8_expectations:
+            return fp8_expectations[0], None
+        return "auto", None
+
+    def _receiver_kv_cache_dtype_error(
+        self,
+        server_info: InferenceEndpointServerInfo | None,
+        expected: str | None,
+        endpoint_url: str,
+    ) -> str | None:
+        if expected is None or expected == "auto":
+            return None
+        if not self._is_fp8_kv_cache_dtype(expected):
+            return None
+        if server_info is None:
+            return (
+                f"Endpoint {endpoint_url} must report FP8 KV cache for receiver_kv_cache_dtype={expected!r}, "
+                "but /server_info was unavailable."
+            )
+        if server_info.fp8_kv_cache_enabled is True or self._is_fp8_kv_cache_dtype(server_info.kv_cache_dtype):
+            return None
+        return (
+            f"Endpoint {endpoint_url} does not match receiver_kv_cache_dtype={expected!r}: "
+            f"/server_info kv_cache_dtype={server_info.kv_cache_dtype!r}, "
+            f"fp8_kv_cache_enabled={server_info.fp8_kv_cache_enabled!r}."
+        )
+
+    @staticmethod
+    def _looks_like_mtp_module_name(entry: str) -> bool:
+        parts = entry.split(".")
+        return any(part == "mtp" or part.startswith("mtp_") for part in parts)
+
+    @classmethod
+    def _unsupported_mtp_low_precision_reason(
+        cls, config_dict: dict[str, Any], quant_config: dict[str, Any]
+    ) -> str | None:
+        """Return an explicit unsupported reason when an HF FP8 receiver config advertises MTP.
+
+        This guard is intentionally scoped to auto-detected FP8 receiver configs. BF16
+        base configs can still be used with explicit SGLang runtime FP8 modes while the
+        MTP/speculative tensor contract remains undefined.
+        """
+        evidence: list[str] = []
+        mtp_count_fields = ("mtp_num_hidden_layers", "mtp_num_layers", "num_nextn_predict_layers")
+        for prefix, section in (("config", config_dict), ("text_config", config_dict.get("text_config"))):
+            if not isinstance(section, dict):
+                continue
+            for key in mtp_count_fields:
+                value = section.get(key)
+                if cls._positive_int_config_value(value):
+                    evidence.append(f"{prefix}.{key}={value}")
+
+        modules_to_not_convert = quant_config.get("modules_to_not_convert")
+        if isinstance(modules_to_not_convert, list):
+            mtp_entries = [
+                entry
+                for entry in modules_to_not_convert
+                if isinstance(entry, str) and cls._looks_like_mtp_module_name(entry)
+            ]
+            if mtp_entries:
+                preview = ", ".join(mtp_entries[:3])
+                suffix = ", ..." if len(mtp_entries) > 3 else ""
+                evidence.append(f"modules_to_not_convert includes {preview}{suffix}")
+
+        if not evidence:
+            return None
+        return (
+            "MTP/speculative low-precision sync is not implemented. "
+            f"Detected {evidence[0]}. Enumerate the receiver-visible MTP tensors and add a same-weight "
+            "speculative SGLang validation gate before enabling this receiver."
+        )
+
+    @classmethod
+    def _detect_quantization_from_hf_config(cls, model_path: str) -> dict | None:
         """Detect quantization config from HF model's config.json.
 
         SGLang /server_info returns quantization=None for auto-detected FP8 models.
         Reads the full quantization_config dict from config.json.
         Supports both local paths and HuggingFace repo IDs.
 
-        Returns the full HF quantization_config dict, or None.
+        Returns the sync-compatible HF quantization_config dict, or None. Any
+        `modules_to_not_convert` list is normalized to trainer-side tensor names,
+        and supported FP8 receiver configs are normalized to XoRL's sender-side
+        sync contract.
         """
 
         # Try local path first
@@ -94,6 +286,31 @@ class InferenceEndpointsMixin:
 
         quant_config = config_dict.get("quantization_config")
         if quant_config and quant_config.get("quant_method") == "fp8":
+            mtnc = quant_config.get("modules_to_not_convert")
+            if isinstance(mtnc, list):
+                quant_config = {
+                    **quant_config,
+                    "modules_to_not_convert": cls._normalize_modules_to_not_convert(mtnc),
+                }
+            try:
+                normalized_config = normalize_sync_quantization_config(
+                    quant_config,
+                    context="auto-detected FP8 receiver quantization",
+                )
+            except UnsupportedSyncQuantizationError as exc:
+                normalized_config = {
+                    **quant_config,
+                    SYNC_QUANTIZATION_UNSUPPORTED_REASON_KEY: str(exc),
+                }
+            assert normalized_config is not None
+            quant_config = normalized_config
+
+            reason = cls._unsupported_mtp_low_precision_reason(config_dict, quant_config)
+            if reason is not None:
+                quant_config = {
+                    **quant_config,
+                    SYNC_QUANTIZATION_UNSUPPORTED_REASON_KEY: reason,
+                }
             return quant_config
         return None
 
@@ -107,14 +324,53 @@ class InferenceEndpointsMixin:
                 return ep.server_info.quantization_config
         return None
 
+    def _auto_detected_endpoint_quantization(self) -> dict | None:
+        """Return the auto-detected receiver quantization config, ignoring the
+        user-set default. Used to enrich a user-supplied per-call config that
+        omits `modules_to_not_convert`.
+        """
+        for ep in self.inference_endpoints:
+            if ep.server_info and ep.server_info.quantization_config:
+                return ep.server_info.quantization_config
+        return None
+
+    def _enrich_quantization_with_receiver_skip_list(self, quantization: dict | None) -> dict | None:
+        """If the caller passes an FP8 quant config without `modules_to_not_convert`,
+        fall back to the receiver's auto-detected skip list (already normalized
+        to trainer-side names by `_detect_quantization_from_hf_config`). This is
+        what saves clients from having to hard-code per-model skip lists for
+        block-FP8 receivers.
+        """
+        if not quantization or quantization.get("quant_method") != "fp8":
+            return quantization
+        detected = self._auto_detected_endpoint_quantization()
+        if not detected or detected.get("quant_method") != "fp8":
+            return quantization
+        unsupported_reason = detected.get(SYNC_QUANTIZATION_UNSUPPORTED_REASON_KEY)
+        if isinstance(unsupported_reason, str) and unsupported_reason.strip():
+            quantization = {
+                **quantization,
+                SYNC_QUANTIZATION_UNSUPPORTED_REASON_KEY: unsupported_reason,
+            }
+        if "modules_to_not_convert" in quantization:
+            return quantization
+        detected_skip = detected.get("modules_to_not_convert")
+        if not isinstance(detected_skip, list) or not detected_skip:
+            return quantization
+        return {**quantization, "modules_to_not_convert": list(detected_skip)}
+
     def set_sync_quantization(self, request: SetSyncQuantizationRequest) -> SetSyncQuantizationResponse:
         """Set the default quantization format for weight sync."""
-        config = request.quantization
-        if config is not None and "quant_method" not in config:
+        try:
+            config = normalize_sync_quantization_config(
+                request.quantization,
+                context="set_sync_quantization.quantization",
+            )
+        except UnsupportedSyncQuantizationError as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="quantization config must contain 'quant_method' (e.g. 'fp8')",
-            )
+                detail=str(exc),
+            ) from exc
         self._default_sync_quantization = config
         if config is not None:
             fmt = f"{config.get('quant_method')} (block_size={config.get('weight_block_size', [128, 128])})"
@@ -125,6 +381,51 @@ class InferenceEndpointsMixin:
             quantization=config,
             message=f"Sync quantization set to {fmt}",
         )
+
+    def _resolve_sync_cache_behavior(
+        self,
+        request: SyncInferenceWeightsRequest,
+        quantization: dict | None,
+    ) -> Dict[str, Any]:
+        fp8_weight_sync = bool(quantization and quantization.get("quant_method") == "fp8")
+        fp8_kv_cache_enabled = False
+        fp8_kv_cache_requires_postprocess = False
+        fp8_kv_cache_static_scales = False
+        cache_epoch = None
+
+        for ep in self.inference_endpoints:
+            info = ep.server_info
+            if info is None:
+                continue
+            if info.fp8_kv_cache_enabled is True or self._is_fp8_kv_cache_dtype(info.kv_cache_dtype):
+                fp8_kv_cache_enabled = True
+            if info.fp8_kv_cache_requires_postprocess is True:
+                fp8_kv_cache_requires_postprocess = True
+            if info.fp8_kv_cache_static_scales is True:
+                fp8_kv_cache_static_scales = True
+            if cache_epoch is None and info.cache_epoch is not None:
+                cache_epoch = info.cache_epoch
+
+        mode = request.cache_invalidation_mode
+        flush_cache = bool(request.flush_cache)
+        if mode == "flush":
+            flush_cache = True
+        elif mode == "auto" and fp8_weight_sync and fp8_kv_cache_enabled:
+            flush_cache = True
+
+        postprocess_required = bool(
+            fp8_weight_sync
+            and fp8_kv_cache_enabled
+            and (fp8_kv_cache_requires_postprocess or fp8_kv_cache_static_scales)
+        )
+        return {
+            "cache_invalidation_mode": mode,
+            "flush_cache": flush_cache,
+            "fp8_kv_cache_enabled": fp8_kv_cache_enabled,
+            "fp8_kv_cache_postprocess_required": postprocess_required,
+            "fp8_kv_cache_static_scales": fp8_kv_cache_static_scales,
+            "cache_epoch": cache_epoch,
+        }
 
     async def _sync_weights_to_endpoints(
         self,
@@ -149,6 +450,10 @@ class InferenceEndpointsMixin:
         Returns:
             Dict with success status and details
         """
+        quantization = normalize_sync_quantization_config(
+            quantization,
+            context="_sync_weights_to_endpoints.quantization",
+        )
         engine_request = OrchestratorRequest(
             operation="sync_inference_weights",
             payload=SyncWeightsData(
@@ -249,6 +554,21 @@ class InferenceEndpointsMixin:
                     tp_size=info_data.get("tp_size"),
                     quantization=info_data.get("quantization"),
                     dtype=info_data.get("dtype"),
+                    kv_cache_dtype=self._server_info_kv_cache_dtype(info_data),
+                    fp8_kv_cache_enabled=self._server_info_fp8_kv_cache_enabled(info_data),
+                    fp8_kv_cache_requires_postprocess=self._server_info_bool(
+                        info_data,
+                        "fp8_kv_cache_requires_postprocess",
+                        "requires_fp8_kv_cache_postprocess",
+                        "kv_cache_requires_postprocess",
+                    ),
+                    fp8_kv_cache_static_scales=self._server_info_bool(
+                        info_data,
+                        "fp8_kv_cache_static_scales",
+                        "has_fp8_kv_cache_static_scales",
+                        "kv_cache_static_scales",
+                    ),
+                    cache_epoch=self._cache_epoch_from_mapping(info_data),
                     enable_lora=info_data.get("enable_lora"),
                     max_lora_rank=info_data.get("max_lora_rank"),
                     version=info_data.get("version"),
@@ -259,7 +579,10 @@ class InferenceEndpointsMixin:
                     f"model={server_info.model_path}, "
                     f"quantization={server_info.quantization}, "
                     f"dtype={server_info.dtype}, "
-                    f"tp_size={server_info.tp_size}"
+                    f"tp_size={server_info.tp_size}, "
+                    f"kv_cache_dtype={server_info.kv_cache_dtype}, "
+                    f"fp8_kv_cache_enabled={server_info.fp8_kv_cache_enabled}, "
+                    f"cache_epoch={server_info.cache_epoch}"
                 )
 
         except Exception as e:
@@ -278,6 +601,21 @@ class InferenceEndpointsMixin:
                     f"block_size={detected_config.get('weight_block_size')}, "
                     f"modules_to_not_convert={'yes' if detected_config.get('modules_to_not_convert') else 'no'}"
                 )
+
+        expected_kv_cache_dtype, expected_kv_cache_error = self._resolve_receiver_kv_cache_dtype_requirement(request)
+        if expected_kv_cache_error is not None:
+            return AddInferenceEndpointResponse(
+                success=False,
+                message=expected_kv_cache_error,
+                endpoint=None,
+            )
+        kv_cache_error = self._receiver_kv_cache_dtype_error(server_info, expected_kv_cache_dtype, endpoint_url)
+        if kv_cache_error is not None:
+            return AddInferenceEndpointResponse(
+                success=False,
+                message=kv_cache_error,
+                endpoint=None,
+            )
 
         # Validate endpoint consistency (model_path, quantization, tp_size must match)
         if server_info is not None and self.inference_endpoints:
@@ -314,11 +652,12 @@ class InferenceEndpointsMixin:
             worker_port=worker_port,
             world_size=world_size,
             healthy=is_healthy,
+            pool=request.pool,
             server_info=server_info,
         )
         self.inference_endpoints.append(endpoint)
 
-        logger.info(f"Added inference endpoint: {endpoint_url} (world_size={world_size})")
+        logger.info(f"Added inference endpoint: {endpoint_url} (world_size={world_size}, pool={request.pool})")
 
         # Auto-sync weights if requested
         weights_synced = False
@@ -497,13 +836,24 @@ class InferenceEndpointsMixin:
             # Deduplicate by (host, port) to avoid inflating world_size when
             # the same endpoint is registered more than once (e.g. via
             # add_inference_endpoint called from multiple paths).
+            # request.pools (None = all) restricts the sync to matching pool
+            # tags, so a dedicated eval pool can stay on frozen weights while
+            # the per-step sync covers only the training samplers.
             seen: set[tuple[str, int]] = set()
             endpoints_data = []
             for ep in self.inference_endpoints:
+                if request.pools is not None and ep.pool not in request.pools:
+                    continue
                 key = (ep.host, ep.port)
                 if key not in seen:
                     seen.add(key)
                     endpoints_data.append({"host": ep.host, "port": ep.port, "world_size": ep.world_size})
+            if not endpoints_data:
+                return SyncInferenceWeightsResponse(
+                    success=False,
+                    message=f"No registered endpoints match pools={request.pools}.",
+                    endpoints_synced=[],
+                )
 
             # Auto-detect master_address if localhost or empty (for cross-node NCCL)
             master_address = request.master_address
@@ -511,19 +861,40 @@ class InferenceEndpointsMixin:
                 master_address = socket.getfqdn()
                 logger.info(f"Auto-detected master_address: {master_address}")
 
+            if "quantization" in request.model_fields_set:
+                requested_quantization = request.quantization
+            else:
+                requested_quantization = self._get_endpoint_quantization()
+
+            try:
+                quantization = normalize_sync_quantization_config(
+                    self._enrich_quantization_with_receiver_skip_list(requested_quantization),
+                    context="sync_inference_weights.quantization",
+                )
+            except UnsupportedSyncQuantizationError as exc:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+            cache_behavior = self._resolve_sync_cache_behavior(request, quantization)
+
             engine_request = OrchestratorRequest(
                 operation="sync_inference_weights",
                 payload=SyncWeightsData(
+                    model_id=request.model_id,
                     endpoints=endpoints_data,
                     master_address=master_address,
                     master_port=request.master_port,
                     group_name=request.group_name,
                     buffer_size_mb=request.buffer_size_mb,
                     sync_method=self.sync_inference_method,
-                    flush_cache=request.flush_cache,
+                    flush_cache=cache_behavior["flush_cache"],
+                    cache_invalidation_mode=cache_behavior["cache_invalidation_mode"],
+                    fp8_kv_cache_enabled=cache_behavior["fp8_kv_cache_enabled"],
+                    fp8_kv_cache_postprocess_required=cache_behavior["fp8_kv_cache_postprocess_required"],
+                    fp8_kv_cache_static_scales=cache_behavior["fp8_kv_cache_static_scales"],
                     pause_mode=request.pause_mode,
                     weight_version=request.weight_version,
-                    quantization=request.quantization or self._get_endpoint_quantization(),
+                    quantization=quantization,
+                    sparse_delta_paths=request.sparse_delta_paths,
+                    sparse_delta_config=request.sparse_delta_config,
                 ),
             )
 
@@ -556,8 +927,21 @@ class InferenceEndpointsMixin:
                         port=ep_result.get("port", 0),
                         success=ep_result.get("success", False),
                         message=ep_result.get("message", ""),
+                        cache_epoch=self._cache_epoch_from_mapping(ep_result),
+                        fp8_kv_cache_postprocess_ran=ep_result.get("fp8_kv_cache_postprocess_ran"),
+                        fp8_kv_cache_static_scales_updated=ep_result.get(
+                            "fp8_kv_cache_static_scales_updated"
+                        ),
                     )
                 )
+            result_cache_epoch = self._cache_epoch_from_mapping(result)
+            if result_cache_epoch is None:
+                for ep_result in endpoint_results:
+                    if ep_result.cache_epoch is not None:
+                        result_cache_epoch = ep_result.cache_epoch
+                        break
+            if result_cache_epoch is None:
+                result_cache_epoch = cache_behavior["cache_epoch"]
 
             return SyncInferenceWeightsResponse(
                 success=result.get("success", False),
@@ -568,6 +952,21 @@ class InferenceEndpointsMixin:
                 num_buckets=result.get("num_buckets", 0),
                 timing_breakdown=result.get("timing_breakdown", {}),
                 p2p_rank_summaries=result.get("p2p_rank_summaries", []),
+                cache_invalidation_mode=result.get(
+                    "cache_invalidation_mode", cache_behavior["cache_invalidation_mode"]
+                ),
+                flush_cache=result.get("flush_cache", cache_behavior["flush_cache"]),
+                fp8_kv_cache_enabled=result.get(
+                    "fp8_kv_cache_enabled", cache_behavior["fp8_kv_cache_enabled"]
+                ),
+                fp8_kv_cache_postprocess_requested=result.get(
+                    "fp8_kv_cache_postprocess_requested",
+                    cache_behavior["fp8_kv_cache_postprocess_required"],
+                ),
+                fp8_kv_cache_static_scales=result.get(
+                    "fp8_kv_cache_static_scales", cache_behavior["fp8_kv_cache_static_scales"]
+                ),
+                cache_epoch=result_cache_epoch,
                 endpoints_synced=endpoint_results,
             )
 

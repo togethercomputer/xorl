@@ -23,6 +23,7 @@ from xorl.distributed.parallel_state import get_parallel_state
 from xorl.distributed.sequence_parallel.strategy import get_cp_strategy
 from xorl.models.base import XorlPreTrainedModel
 from xorl.models.layers.attention import AttentionKwargs, update_causal_mask
+from xorl.models.layers.attention.backend import ATTENTION_FUNCTIONS
 from xorl.models.layers.moe import MoEBlock
 from xorl.models.layers.normalization import RMSNorm
 from xorl.models.outputs import MoeCausalLMOutput, MoeModelOutput
@@ -309,7 +310,7 @@ class GptOssAttention(nn.Module):
         sinks are fused by a custom autograd wrapper (FA3 fwd + manual bwd).
         Supports both batched 4D and packed-varlen 3D paths.
         """
-        from xorl.models.transformers.gpt_oss.flash_sink_attention import (
+        from xorl.models.transformers.gpt_oss.flash_sink_attention import (  # noqa: PLC0415
             flash_attn_varlen_with_sink,
             flash_attn_with_sink,
         )
@@ -498,6 +499,7 @@ class GptOssMoEBlock(MoEBlock):
             norm_topk_prob=config.norm_topk_prob,
             moe_implementation=moe_implementation,
             train_router=getattr(config, "train_router", False),
+            activation_native=getattr(config, "_activation_native", False),
         )
         self.config = config
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")

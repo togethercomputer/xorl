@@ -31,7 +31,6 @@ from distributed_utils import run_distributed_script, skip_if_gpu_count_less_tha
 pytestmark = [pytest.mark.distributed]
 
 
-@pytest.mark.cpu
 def test_canonical_reduce_op_accepts_fsdp_wrapped_ops():
     assert _canonical_reduce_op(ReduceOp(ReduceOp.SUM)) == dist.ReduceOp.SUM
     assert _canonical_reduce_op(ReduceOp(ReduceOp.AVG)) == dist.ReduceOp.AVG

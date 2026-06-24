@@ -39,6 +39,60 @@ if is_torch_version_greater_than("2.4"):
 logger = logging.get_logger(__name__)
 
 
+def _compile_module(mod: "nn.Module", *, dynamic_shapes: bool) -> "nn.Module":
+    if dynamic_shapes:
+        return torch.compile(mod, dynamic=True)
+    return torch.compile(mod)
+
+
+def _get_reduce_scatter_group_size(fsdp_module: FSDPModule) -> Optional[int]:
+    state = fsdp_module._get_fsdp_state()
+    param_group = state._fsdp_param_group
+    if param_group is None:
+        return None
+    try:
+        return param_group._reduce_scatter_process_group.size()
+    except Exception:
+        return None
+
+
+def _set_sum_gradient_divide_factor(fsdp_module: FSDPModule) -> None:
+    state = fsdp_module._get_fsdp_state()
+    param_group = state._fsdp_param_group
+    if param_group is None:
+        return
+    if _get_reduce_scatter_group_size(fsdp_module) == 1:
+        # For singleton eFSDP expert meshes there is no reduction to average.
+        # Leaving the factor unset avoids FSDP materializing `input / 1.0`.
+        param_group.gradient_divide_factor = None
+    else:
+        fsdp_module.set_gradient_divide_factor(1.0)
+
+
+def _bf16_mixed_precision_policy(reduce_dtype: torch.dtype = torch.float32):
+    return MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=reduce_dtype,
+    )
+
+
+def _resolve_fsdp_reduce_dtype(name: str) -> torch.dtype:
+    if name == "fp32":
+        return torch.float32
+    if name == "bf16":
+        return torch.bfloat16
+    raise ValueError(f"Unsupported fsdp_reduce_dtype: {name!r}. Expected 'fp32' or 'bf16'.")
+
+
+def _expert_mixed_precision_policy(ep_fsdp_mesh_size: int, reduce_dtype: torch.dtype = torch.float32):
+    # Singleton eFSDP expert meshes do not reduce-scatter across ranks. Keeping
+    # reduce_dtype=fp32 only materializes a large unsharded accumulated-grad
+    # copy during gradient accumulation, which is enough to OOM GLM full-weight
+    # PP smoke runs.
+    reduce_dtype = torch.bfloat16 if ep_fsdp_mesh_size == 1 else reduce_dtype
+    return _bf16_mixed_precision_policy(reduce_dtype=reduce_dtype)
+
+
 def _load_model_weights(
     model: "nn.Module",
     weights_path: str,
@@ -126,6 +180,19 @@ def _resolve_tp_style(style):
         raise ValueError(f"Unknown TP style: {style}")
 
 
+def _validate_model_tensor_parallelism(model: "nn.Module") -> None:
+    validate_deepseek_v3_tensor_parallelism(getattr(model, "config", None))
+    if not getattr(model, "supports_tensor_parallelism", True):
+        raise NotImplementedError(f"{type(model).__name__} does not support tensor parallelism yet.")
+
+
+def _sequence_parallel_fully_folded_into_fsdp(parallel_state) -> bool:
+    """Return whether every active sequence-parallel dim is in the FSDP mesh."""
+    return (not parallel_state.ulysses_enabled or parallel_state.cp_fsdp_mode in ("all", "ulysses_only")) and (
+        not parallel_state.ringattn_enabled or parallel_state.cp_fsdp_mode in ("all", "ring_only")
+    )
+
+
 def parallelize_model_fsdp2(
     model: "nn.Module",
     weights_path: Optional[str] = None,
@@ -134,6 +201,7 @@ def parallelize_model_fsdp2(
     pp_enabled: bool = False,
     reshard_after_forward: Optional[bool] = None,
     moe_grad_reduce_mode: str = "reduce_scatter",
+    fsdp_reduce_dtype: str = "fp32",
     **kwargs,
 ) -> "nn.Module":
     """
@@ -146,6 +214,7 @@ def parallelize_model_fsdp2(
     4. Result: Expert params [32,H/fsdp_size,I], regular params use standard FSDP2
     """
     parallel_state = get_parallel_state()
+    enable_manual_prefetch = bool(kwargs.pop("enable_forward_prefetch", True))
 
     # Step 0: Get target classes to shard later
     target_classes = set((getattr(model, "_no_split_modules", []) or []) + (basic_modules or []))
@@ -209,10 +278,8 @@ def parallelize_model_fsdp2(
         fsdp_kwargs["reshard_after_forward"] = False
     # mp_policy kwargs
     if enable_mixed_precision:
-        mp_policy = MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
-        )
+        reduce_dtype = _resolve_fsdp_reduce_dtype(fsdp_reduce_dtype)
+        mp_policy = _bf16_mixed_precision_policy(reduce_dtype=reduce_dtype)
         fsdp_kwargs["mp_policy"] = mp_policy
 
     if hasattr(model, "get_ignore_modules_in_mixed_precision"):
@@ -243,6 +310,8 @@ def parallelize_model_fsdp2(
         # since the only cost is a cheap dtype cast during backward recomputation.
         if ep_fsdp_mesh.size() == 1:
             expert_fsdp_kwargs.pop("reshard_after_forward", None)
+            if enable_mixed_precision:
+                expert_fsdp_kwargs["mp_policy"] = _expert_mixed_precision_policy(ep_fsdp_mesh.size())
 
         # Prefer dim-1 sharding for expert weights when composing with EP shard on dim-0
         def _experts_shard_placement_fn(param):
@@ -314,10 +383,68 @@ def parallelize_model_fsdp2(
     # the base model, FSDP all-gathers both norm and lm_head weights.
     # They stay gathered so external compute_loss() can access lm_head.weight
     # without a redundant all-gather.
-    if not pp_enabled and fsdp_kwargs.get("reshard_after_forward", True) is not False:
-        base_model = getattr(model, "model", None)
-        norm_mod = getattr(base_model, "norm", None) if base_model else None
-        lm_head_mod = getattr(model, "lm_head", None)
+    fsdp_sharded_lm_head_loss = bool(kwargs.get("fsdp_sharded_lm_head_loss", False))
+    base_model = getattr(model, "model", None)
+    norm_mod = getattr(base_model, "norm", None) if base_model else None
+    if norm_mod is None and base_model is not None:
+        # Mamba-style backbones (e.g. nemotron_h) name the final norm `norm_f`.
+        norm_mod = getattr(base_model, "norm_f", None)
+    lm_head_mod = getattr(model, "lm_head", None)
+    lm_head_tp = getattr(parallel_state, "lm_head_tp_size", 1) > 1
+    if fsdp_sharded_lm_head_loss:
+        if pp_enabled:
+            raise NotImplementedError("fsdp_sharded_lm_head_loss is not supported with pipeline parallelism.")
+        if parallel_state.tp_enabled:
+            raise NotImplementedError("fsdp_sharded_lm_head_loss is not supported with tensor parallelism.")
+        if not parallel_state.cp_enabled:
+            raise NotImplementedError("fsdp_sharded_lm_head_loss currently requires sequence parallelism.")
+        if parallel_state.dp_size != 1 and not lm_head_tp:
+            # Without lm-head-only TP the vocab shard == FSDP shard, so DP ranks
+            # (different tokens) cannot share a vocab-parallel CE. With lm-head TP
+            # the lm_head lives on its own mesh where DP is a replica axis, so DP is
+            # allowed.
+            raise NotImplementedError(
+                "fsdp_sharded_lm_head_loss requires data_parallel_size=1 unless lm_head_tensor_parallel_size>1."
+            )
+        if not _sequence_parallel_fully_folded_into_fsdp(parallel_state):
+            raise NotImplementedError(
+                "fsdp_sharded_lm_head_loss requires every active sequence-parallel dimension to be folded into "
+                "the FSDP mesh. Use cp_fsdp_mode='all' for hybrid SP, 'ulysses_only' for Ulysses-only SP, "
+                "or 'ring_only' for ring-only SP."
+            )
+        if lm_head_tp and parallel_state.sp_grad_sync_group is not None:
+            # lm-head TP reduces the lm_head grad over its own replica dim
+            # (sync_lm_head_tp_gradient). The external SP grad sync would also touch
+            # that grad over a different group -> double / wrong reduction. Require
+            # cp_fsdp_mode='all' (sp_grad_sync_group is None) for now.
+            raise NotImplementedError(
+                "lm_head_tensor_parallel_size>1 currently requires cp_fsdp_mode='all' so the external SP "
+                "gradient sync does not conflict with the lm_head replica reduction."
+            )
+        if lm_head_mod is None:
+            raise ValueError("fsdp_sharded_lm_head_loss requires model.lm_head.")
+        if norm_mod is not None:
+            fully_shard(norm_mod, **fsdp_kwargs)
+        setattr(lm_head_mod, "_xorl_fsdp_sharded_lm_head_loss", True)
+        if lm_head_tp:
+            # lm-head-only TP: shard the lm_head over its dedicated per-module mesh
+            # (Shard(0) over lm_head_tp vocab rows, replicate over DP x cp_replica),
+            # NOT the model's FSDP mesh. The body keeps the normal fsdp_mesh.
+            lm_head_fsdp_kwargs = dict(fsdp_kwargs)
+            lm_head_fsdp_kwargs["mesh"] = parallel_state.lm_head_mesh
+            fully_shard(lm_head_mod, **lm_head_fsdp_kwargs)
+            # Sum (not average) the lm_head grad over its replica dim (DP x cp_replica):
+            # the loss is normalized by global valid tokens, and cp_replica grads are
+            # distinct sequence shards of the same vocab slice that must be summed.
+            _set_sum_gradient_divide_factor(lm_head_mod)
+            logger.info_rank0(
+                f"Using lm-head-only TP (size {parallel_state.lm_head_tp_size}): lm_head sharded over its "
+                "dedicated mesh; rest of the model keeps its scheme."
+            )
+        else:
+            fully_shard(lm_head_mod, **fsdp_kwargs)
+            logger.info_rank0("Using FSDP-sharded lm_head loss over the FSDP group.")
+    elif not pp_enabled and fsdp_kwargs.get("reshard_after_forward", True) is not False:
         last_modules = [m for m in [norm_mod, lm_head_mod] if m is not None]
         if last_modules:
             last_fsdp_kwargs = dict(fsdp_kwargs)
@@ -341,7 +468,7 @@ def parallelize_model_fsdp2(
 
     # configure manual prefetching when needed
     need_manual_prefetch = parallel_state.ep_enabled or mp_ignored_classes is not None
-    if need_manual_prefetch:
+    if need_manual_prefetch and enable_manual_prefetch:
         blocks = [pair[1] for pair in layer_pairs]
         next_blocks = blocks[1:] + [None]
         for current_block, next_block in zip(blocks, next_blocks):
@@ -357,6 +484,8 @@ def parallelize_model_fsdp2(
             if prev_block is not None:
                 prefetch_modules = prev_block._fsdp_modules
                 current_block.set_modules_to_backward_prefetch(list(reversed(prefetch_modules)))
+    elif need_manual_prefetch:
+        logger.info_rank0("Manual FSDP module prefetch disabled by enable_forward_prefetch=False.")
 
     # Disable FSDP's automatic gradient averaging for ALL modules (including EP experts).
     # Gradient normalisation is handled uniformly by the loss (gradient_accumulate_loss
@@ -371,7 +500,7 @@ def parallelize_model_fsdp2(
 
     for module in model.modules():
         if isinstance(module, FSDPModule):
-            module.set_gradient_divide_factor(1.0)
+            _set_sum_gradient_divide_factor(module)
 
     # Install custom reduce-scatter for MoE expert FSDP units.
     # Native FSDP reduce-scatter performs accumulation in the buffer dtype during transit,
@@ -402,7 +531,7 @@ def parallelize_model_fsdp2(
                         "Either keep enable_mixed_precision=True (which sets reduce_dtype=fp32) "
                         "or pass an explicit MixedPrecisionPolicy with reduce_dtype=torch.float32."
                     )
-                if pg.gradient_divide_factor != 1.0:
+                if pg.gradient_divide_factor != 1.0 and _get_reduce_scatter_group_size(experts_mod) != 1:
                     raise ValueError(
                         "moe_grad_reduce_mode='bf16_a2a_fp32_sum' requires "
                         "gradient_divide_factor=1.0 on every expert FSDP unit "
@@ -533,10 +662,12 @@ def build_parallelize_model(
     enable_mixed_precision: bool = True,
     enable_gradient_checkpointing: bool = True,
     enable_compile: bool = False,
+    compile_dynamic_shapes: bool = False,
     basic_modules: Optional[List[str]] = None,
     pp_schedule: Optional[str] = None,
     reshard_after_forward: Optional[bool] = None,
     moe_grad_reduce_mode: str = "reduce_scatter",
+    fsdp_reduce_dtype: str = "fp32",
     **kwargs,
 ) -> "nn.Module":
     """
@@ -622,14 +753,14 @@ def build_parallelize_model(
 
             # TP (if enabled)
             if ps.tp_enabled:
-                validate_deepseek_v3_tensor_parallelism(model_part.config)
+                _validate_model_tensor_parallelism(model_part)
                 # TP + LoRA is not currently supported
                 if i == 0:
                     if any(isinstance(m, LoraLinear) for m in model_part.modules()):
                         raise NotImplementedError("Tensor parallelism + LoRA is not currently supported.")
 
                 # Unfuse fused projections (qkv_proj, gate_up_proj) for TP compatibility
-                if hasattr(model_part, "unfuse_for_tp"):
+                if hasattr(model_part, "unfuse_for_tp") and not getattr(model_part, "_unfused_for_tp", False):
                     if i == 0:
                         logger.info_rank0("Unfusing projections for tensor parallelism...")
                     model_part.unfuse_for_tp()
@@ -667,11 +798,14 @@ def build_parallelize_model(
                     if mod.__class__.__name__ in target_classes:
                         parent_fqn, _, child_name = fqn.rpartition(".")
                         parent = model_part.get_submodule(parent_fqn) if parent_fqn else model_part
-                        compiled_mod = torch.compile(mod)
+                        compiled_mod = _compile_module(mod, dynamic_shapes=compile_dynamic_shapes)
                         setattr(parent, child_name, compiled_mod)
                         compiled_count += 1
                 if i == 0:
-                    logger.info_rank0(f"torch.compile applied to {compiled_count} decoder layers")
+                    logger.info_rank0(
+                        f"torch.compile applied to {compiled_count} decoder layers "
+                        f"(dynamic_shapes={compile_dynamic_shapes})"
+                    )
 
                 # Enable compiled vocab-parallel cross-entropy kernels
                 if hasattr(model_part, "loss_function"):
@@ -693,6 +827,7 @@ def build_parallelize_model(
                         pp_enabled=True,
                         reshard_after_forward=reshard_after_forward,
                         moe_grad_reduce_mode=moe_grad_reduce_mode,
+                        fsdp_reduce_dtype=fsdp_reduce_dtype,
                         **kwargs,
                     )
                 elif ps.dp_mode == "ddp":
@@ -768,13 +903,13 @@ def build_parallelize_model(
                     module._gradient_checkpointing_func = _make_wrapper(_orig)
 
     if parallel_state.tp_enabled:
-        validate_deepseek_v3_tensor_parallelism(model.config)
+        _validate_model_tensor_parallelism(model)
         # TP + LoRA is not currently supported
         if any(isinstance(m, LoraLinear) for m in model.modules()):
             raise NotImplementedError("Tensor parallelism + LoRA is not currently supported.")
 
         # Unfuse fused projections (qkv_proj, gate_up_proj) for TP compatibility
-        if hasattr(model, "unfuse_for_tp"):
+        if hasattr(model, "unfuse_for_tp") and not getattr(model, "_unfused_for_tp", False):
             logger.info_rank0("Unfusing projections for tensor parallelism...")
             model.unfuse_for_tp()
 
@@ -813,10 +948,12 @@ def build_parallelize_model(
             if mod.__class__.__name__ in target_classes:
                 parent_fqn, _, child_name = fqn.rpartition(".")
                 parent = model.get_submodule(parent_fqn) if parent_fqn else model
-                compiled_mod = torch.compile(mod)
+                compiled_mod = _compile_module(mod, dynamic_shapes=compile_dynamic_shapes)
                 setattr(parent, child_name, compiled_mod)
                 compiled_count += 1
-        logger.info_rank0(f"torch.compile applied to {compiled_count} decoder layers")
+        logger.info_rank0(
+            f"torch.compile applied to {compiled_count} decoder layers (dynamic_shapes={compile_dynamic_shapes})"
+        )
 
         # Enable compiled vocab-parallel cross-entropy kernels
         if hasattr(model, "loss_function"):
@@ -834,6 +971,7 @@ def build_parallelize_model(
                 basic_modules=basic_modules,
                 reshard_after_forward=reshard_after_forward,
                 moe_grad_reduce_mode=moe_grad_reduce_mode,
+                fsdp_reduce_dtype=fsdp_reduce_dtype,
                 **kwargs,
             )
         elif parallel_state.dp_mode == "ddp":

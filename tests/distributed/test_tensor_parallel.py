@@ -50,6 +50,7 @@ class TestUnfuseForTP:
         assert mlp.gate_proj.out_features == 512
         assert mlp.up_proj.out_features == 512
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="MLP forward requires CUDA")
     def test_unfused_forward_shape_and_model_level(self):
         """Unfused MLP forward produces same shape; model-level unfuse covers all layers."""
 

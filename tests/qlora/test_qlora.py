@@ -14,7 +14,7 @@ from xorl.qlora.utils import inject_qlora_into_model, maybe_requant_qlora
 from xorl.trainers.training_utils import maybe_merge_lora, reset_lora_optimizer_states
 
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = [pytest.mark.gpu, pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")]
 
 
 # ---------------------------------------------------------------------------

@@ -2,6 +2,7 @@
 
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 from xorl.server.weight_sync.backends.base import EndpointConfig, TransportConfig
@@ -9,11 +10,15 @@ from xorl.server.weight_sync.backends.nccl_broadcast import NCCLBroadcastBackend
 from xorl.server.weight_sync.handler import WeightSyncHandler
 
 
+pytestmark = [pytest.mark.gpu]
+
+
 class TestWeightVersionForwarding:
     def test_handler_broadcast_buffer_forwards_weight_version(self):
         handler = MagicMock()
         handler.rank = 0
         handler._broadcast_buffer = WeightSyncHandler._broadcast_buffer.__get__(handler)
+        handler._strip_compile_orig_mod = WeightSyncHandler._strip_compile_orig_mod
 
         backend = MagicMock()
         buffer = [("layer.weight", torch.ones(2, 3, dtype=torch.bfloat16))]

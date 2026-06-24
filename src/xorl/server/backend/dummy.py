@@ -75,15 +75,26 @@ class DummyBackend(Backend):
         }
 
     async def optim_step(
-        self, lr, gradient_clip=None, beta1=None, beta2=None, eps=None, model_id=None, request_id=None
+        self,
+        lr,
+        gradient_clip=None,
+        beta1=None,
+        beta2=None,
+        eps=None,
+        model_id=None,
+        sparse_delta_capture=None,
+        request_id=None,
     ):
         self._maybe_fail("optim_step")
         self._step += 1
-        return {
+        result = {
             "grad_norm": random.uniform(0.1, 2.0),
             "step": self._step,
             "learning_rate": lr,
         }
+        if sparse_delta_capture:
+            result["sparse_delta_capture"] = {"enabled": True, "dummy": True}
+        return result
 
     async def save_state(
         self, checkpoint_path=None, save_optimizer=True, use_timestamp=False, model_id=None, request_id=None

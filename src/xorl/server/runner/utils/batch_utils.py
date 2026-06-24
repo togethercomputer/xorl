@@ -7,6 +7,7 @@ on communication and command dispatch.
 """
 
 import logging
+import os
 from typing import Any, Callable, Dict, Optional
 
 import torch
@@ -15,6 +16,65 @@ from xorl.distributed.parallel_state import get_parallel_state
 
 
 logger = logging.getLogger(__name__)
+
+
+def ep_duplicate_batches_enabled() -> bool:
+    """Whether EP groups receive one duplicated batch slice (legacy dispatch).
+
+    Legacy dispatch keyed the batch slice on the ep_fsdp coordinate, so all
+    ep_size ranks of an EP group computed the same packed batch — ep_size-times
+    redundant compute. Per-rank-distinct slices are correct: the MoE all-to-all
+    routes per-rank-distinct tokens (the local-training path always runs this
+    way) and the OPD full-vocab KL is rank-local; loss normalization by global
+    valid tokens makes both regimes produce identical gradients. The duplication
+    is kept only as a rollback switch: XORL_SERVER_EP_DUPLICATE_BATCHES=1.
+    """
+    return os.getenv("XORL_SERVER_EP_DUPLICATE_BATCHES", "0").strip().lower() in {"1", "true", "yes"}
+
+
+def batch_slice_rank_and_size(
+    rank: int,
+    world_size: int,
+    parallel_state: Any,
+    cp_size: int,
+    pp_size: int,
+) -> tuple[int, int]:
+    """Return (slice_rank, slice_count) for request batch dispatch.
+
+    Every rank gets a distinct batch slice; ranks that shard the same sequence
+    (CP/SP) or the same pipeline stage share one. With EP enabled the slice is
+    derived from the stage-local rank, so ranks within an EP group also see
+    distinct data. Set XORL_SERVER_EP_DUPLICATE_BATCHES=1 to restore the legacy
+    one-duplicated-slice-per-EP-group dispatch (see ep_duplicate_batches_enabled).
+    """
+    if getattr(parallel_state, "ep_enabled", False):
+        ranks_per_pp_stage = max(1, world_size // max(1, pp_size))
+        local_stage_rank = rank % ranks_per_pp_stage
+
+        if ep_duplicate_batches_enabled():
+            ep_size = max(1, int(getattr(parallel_state, "ep_size", 1)))
+            ep_fsdp_size = max(1, int(getattr(parallel_state, "dp_shard_in_ep_size", 1)))
+            ep_mesh = getattr(parallel_state, "ep_fsdp_device_mesh", None)
+            if ep_mesh is not None:
+                try:
+                    ep_fsdp_rank = int(ep_mesh.get_local_rank("ep_fsdp"))
+                    return min(ep_fsdp_rank, ep_fsdp_size - 1), ep_fsdp_size
+                except Exception as exc:
+                    logger.debug(
+                        "Rank %s: could not read ep_fsdp local rank from EP mesh (%s); falling back to rank arithmetic",
+                        rank,
+                        exc,
+                    )
+            ep_fsdp_rank = min(local_stage_rank // ep_size, ep_fsdp_size - 1)
+            return ep_fsdp_rank, ep_fsdp_size
+
+        denom = max(1, cp_size)
+        slice_count = max(1, ranks_per_pp_stage // denom)
+        return min(local_stage_rank // denom, slice_count - 1), slice_count
+
+    dp_size = max(1, world_size // max(1, cp_size * pp_size))
+    dp_rank = min(rank // max(1, cp_size * pp_size), dp_size - 1)
+    return dp_rank, dp_size
 
 
 def _pad_teacher_hidden_states(value: list[Any]) -> torch.Tensor:
@@ -63,9 +123,10 @@ def convert_batch_to_tensors(batch: Dict[str, Any], rank: int = 0) -> Dict[str, 
         "values",
         "returns",
         "teacher_weights",
+        "hidden_match_weights",
         "teacher_hidden_states",
     }
-    long_fields = {"teacher_ids", "teacher_cache_indices"}
+    long_fields = {"teacher_ids", "teacher_cache_indices", "teacher_cache_local_indices"}
     # Fields that must be int32 (flash attention requires cu_seqlens as int32)
     int32_fields = {"cu_seq_lens_q", "cu_seq_lens_k"}
 

@@ -17,28 +17,31 @@ stage leaders still funnel through rank 0 in the handler.
 """
 
 import dataclasses
+import faulthandler
 import ipaddress
 import logging
 import os
 import socket
+import sys
 import time
 import zlib
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 import requests
 import torch
 import torch.distributed as dist
 
-from .base import TransportConfig, WeightTransportBackend
+from .base import EndpointConfig, TransportConfig, WeightTransportBackend
 
 
 @dataclasses.dataclass
 class _PendingTransfer:
     """One per-locator transfer pending a stage+coalesce pass in
     ``transfer_bucket``. Held just long enough to sort by peer_ptr, copy
-    the src_view into the CPU pinned scratch pool, and coalesce
-    contiguous neighbors before issuing the Mooncake call.
+    large src_views into the CPU pinned scratch pool or register small
+    CUDA src_views directly before issuing the Mooncake call.
     """
 
     peer_ptr: int
@@ -228,10 +231,10 @@ def _align_up(value: int, alignment: int) -> int:
 _CPU_SCRATCH_POOL_BYTES = int(os.environ.get("XORL_P2P_CPU_SCRATCH_POOL_BYTES", str(4 * 1024 * 1024 * 1024)))
 
 # Mooncake's CPU-source RDMA path on our cluster fails (ret=-1) for
-# very small transfers — observed at 8 KB on a layernorm weight. Small
+# very small transfers - observed at 8 KB on a layernorm weight. Small
 # entries take the GPU-direct path (per-bucket register/dereg); large
 # entries take the CPU pool path. 64 KB threshold matches typical
-# layernorm weight size (2048 BF16 = 4 KB; 4× headroom). Setting this
+# layernorm weight size (2048 BF16 = 4 KB; 4x headroom). Setting this
 # to 0 forces tiny entries through CPU scratch; that was safe in smoke
 # tests, but slower than the default GPU-direct threshold.
 _CPU_POOL_MIN_BYTES = int(os.environ.get("XORL_P2P_CPU_POOL_MIN_BYTES", str(64 * 1024)))
@@ -253,6 +256,31 @@ class _DirectMooncakeTransferEngine:
         gpu_id: int,
         ib_device: Optional[str],
     ) -> None:
+        # Pin the Mooncake P2PHANDSHAKE port so this rank's session id (host:port) is
+        # STABLE across trainer restarts. The default auto-assigns a fresh ephemeral port
+        # every restart, which leaves the SGLang receiver's Mooncake peer registry stale
+        # -> recurring "Peer nic not found" / ret=-1 sync bursts (see
+        # experiments/opd_profile/P2P_CRASH_DIAGNOSIS.md). Per-rank (base + gpu_id) so the
+        # ranks sharing a pod/host don't collide on one port. Opt-in via
+        # XORL_P2P_HANDSHAKE_BASE_PORT (unset = current auto-assign behavior). MUST be set
+        # before the engine is constructed, since Mooncake reads MC_HANDSHAKE_PORT at init.
+        _base = os.environ.get("XORL_P2P_HANDSHAKE_BASE_PORT", "").strip()
+        if _base:
+            try:
+                _pinned = int(_base) + int(gpu_id)
+                os.environ["MC_HANDSHAKE_PORT"] = str(_pinned)
+                logging.getLogger(__name__).info(
+                    "[P2P] pinning Mooncake handshake port to %d (base=%s + gpu_id=%d) "
+                    "for a stable session id across restarts",
+                    _pinned,
+                    _base,
+                    gpu_id,
+                )
+            except (TypeError, ValueError):
+                logging.getLogger(__name__).warning(
+                    "[P2P] XORL_P2P_HANDSHAKE_BASE_PORT=%r is not an int; using auto-assigned port",
+                    _base,
+                )
         self.engine = transfer_engine_cls()
         self.hostname = hostname
         self.gpu_id = gpu_id
@@ -378,6 +406,13 @@ def _format_transfer_debug(debug_entries: Any) -> str:
     if total_entries > len(debug_entries):
         parts.append(f"... {total_entries - len(debug_entries)} more")
     return "transfer_debug=[" + "; ".join(parts) + "]"
+
+
+def _receiver_lookup_name(name: str) -> str:
+    """Strip training-only wrapper modules before tensor_map lookup."""
+    if "_orig_mod" not in name:
+        return name
+    return ".".join(part for part in name.split(".") if part != "_orig_mod")
 
 
 def _chunk_sizes(
@@ -608,6 +643,9 @@ def _do_async_transfer(
     source memory alive while the caller reshards the FSDP module.
     """
     copy_done_event.synchronize()
+    small_session_data = small_session_data or {}
+    small_register_ptrs = small_register_ptrs or []
+    small_register_lens = small_register_lens or []
 
     t0 = time.perf_counter()
     bucket_bytes = 0
@@ -696,6 +734,22 @@ def _do_async_transfer(
         )
 
 
+def _endpoint_completion_result(endpoint: EndpointConfig, body: Dict[str, Any]) -> Dict[str, Any]:
+    result = {
+        "host": endpoint.host,
+        "port": endpoint.port,
+        "success": body.get("success", False),
+        "message": body.get("message", ""),
+    }
+    cache_epoch = body["cache_epoch"] if "cache_epoch" in body else body.get("cache_version")
+    if cache_epoch is not None:
+        result["cache_epoch"] = cache_epoch
+    for key in ("fp8_kv_cache_postprocess_ran", "fp8_kv_cache_static_scales_updated"):
+        if key in body:
+            result[key] = body[key]
+    return result
+
+
 class P2PTransportBackend(WeightTransportBackend):
     """RDMA P2P weight transport via the Mooncake TransferEngine.
 
@@ -712,6 +766,7 @@ class P2PTransportBackend(WeightTransportBackend):
         super().__init__(config)
         # backend_config carries optional Mooncake engine setup overrides.
         be_cfg = config.backend_config or {}
+        self._qwen_linear_attention_dims: Dict[str, Any] = dict(be_cfg.get("qwen_linear_attention_dims") or {})
         self._engine = None  # MooncakeTransferEngine (lazy-imported)
         # tensor_map[name] -> list of receiver locator dicts.
         self._tensor_map: Dict[str, List[Dict[str, Any]]] = {}
@@ -1310,6 +1365,17 @@ class P2PTransportBackend(WeightTransportBackend):
         if not (self._direct_ep_transfer and self._world_size > 1):
             self._prefer_cached_prepare = has_cached_prepare_state
         request_cached_prepare = self._prefer_cached_prepare and has_cached_prepare_state
+        # On a COLD prepare (not reusing cached receiver state), tell the receiver
+        # to drop any stale Mooncake registration and re-arm its RDMA buffers.
+        # The glm5/fp8 merge stack silently dropped this signal; without it a cold
+        # sync leaves the receiver mis-armed, so the sender's batch_transfer_sync_write
+        # blocks with no completion and no ret=-1 — a silent data-plane wedge that runs
+        # to the orchestrator's 1800s timeout. The /prepare call is load-bearing for
+        # re-arming the receiver's Mooncake buffers (the receiver honors p2p_invalidate_cache
+        # via _invalidate_p2p_cache()). Restored from the pre-merge baseline (baf6dcce).
+        invalidate_receiver_cache = not request_cached_prepare and _env_flag(
+            "XORL_P2P_INVALIDATE_RECEIVER_CACHE_ON_COLD_PREPARE", True
+        )
         self._last_prepare_returned_tensor_map = False
         self._last_prepare_tensor_map_endpoint_indices = set()
         num_endpoints = len(cfg.endpoints)
@@ -1327,6 +1393,8 @@ class P2PTransportBackend(WeightTransportBackend):
                 "transport": "p2p",
                 "sender_transfer_engine_info": sender_info,
             }
+            if invalidate_receiver_cache:
+                payload["p2p_invalidate_cache"] = True
             if cached_prepare:
                 payload["p2p_return_tensor_map"] = False
             try:
@@ -1518,20 +1586,41 @@ class P2PTransportBackend(WeightTransportBackend):
         if n_workers > 1:
             logger.info(f"[P2P] using {n_workers} concurrent Mooncake workers")
 
-    def _wait_all_pending(self) -> None:
+    def _wait_all_pending(self, timeout_s: Optional[float] = None) -> None:
         """Block until every outstanding async transfer completes.
 
         Must be called before reading ``stats_summary`` or tearing down
         the engine — timings and bucket_bytes are only valid after the
         worker has populated them.
+
+        Bounded by ``XORL_P2P_PENDING_TRANSFER_TIMEOUT_S`` (default 300s): a
+        worker future that never completes (silent RDMA data-plane stall) must
+        raise, not hang. This drain runs sender-only inside the per-module
+        streaming loop, so a permanent block here wedges the all-rank FSDP
+        ``unshard()`` collective for the whole step (the orchestrator's 1800s
+        timeout becomes the only exit). Raising on timeout lets the handler's
+        ``_gather_p2p_transfer_statuses`` except-path surface the failure
+        symmetrically on every rank.
         """
+        if timeout_s is None:
+            timeout_s = max(0.001, _env_float("XORL_P2P_PENDING_TRANSFER_TIMEOUT_S", 300.0))
+        deadline = time.perf_counter() + timeout_s
         first_error: Optional[Exception] = None
         for i in range(len(self._cpu_pool_pending_futures)):
             fut = self._cpu_pool_pending_futures[i]
             if fut is None:
                 continue
             try:
-                fut.result()
+                remaining_s = max(0.001, deadline - time.perf_counter())
+                fut.result(timeout=remaining_s)
+            except FutureTimeoutError:
+                if not fut.cancel():
+                    logger.error(
+                        f"[P2P] async transfer on pool {i} did not finish within "
+                        f"{timeout_s:.1f}s; continuing teardown with a live worker future"
+                    )
+                if first_error is None:
+                    first_error = TimeoutError(f"[P2P] async transfer on pool {i} timed out after {timeout_s:.1f}s")
             except Exception as e:
                 logger.error(f"[P2P] async transfer on pool {i} raised: {e}")
                 if first_error is None:
@@ -1564,6 +1653,7 @@ class P2PTransportBackend(WeightTransportBackend):
         # in cache-reuse mode because pending futures hold references to
         # CPU pool slots that the next sync will overwrite.
         self._wait_all_pending()
+        self.endpoint_results = []
 
         # In multi-sender mode (direct_ep_transfer + world_size>1), only
         # rank 0 drives the HTTP /complete_weights_update — the receiver
@@ -1576,6 +1666,7 @@ class P2PTransportBackend(WeightTransportBackend):
             weight_version = be_cfg.get("weight_version")
             tied_weight_aliases = be_cfg.get("p2p_tied_weight_aliases") or {}
             complete_errors = []
+            endpoint_results = []
             for ep in cfg.endpoints:
                 url = f"http://{ep.host}:{ep.port}/complete_weights_update"
                 payload = {
@@ -1584,6 +1675,13 @@ class P2PTransportBackend(WeightTransportBackend):
                     "transport": "p2p",
                     "run_post_process_weights": self._run_post_process_weights,
                 }
+                for key in (
+                    "fp8_kv_cache_enabled",
+                    "fp8_kv_cache_postprocess_required",
+                    "fp8_kv_cache_static_scales",
+                ):
+                    if key in be_cfg:
+                        payload[key] = bool(be_cfg[key])
                 if weight_version is not None:
                     payload["weight_version"] = weight_version
                 if tied_weight_aliases:
@@ -1601,10 +1699,20 @@ class P2PTransportBackend(WeightTransportBackend):
                         complete_errors.append(
                             f"{ep.host}:{ep.port} returned success=false: {body.get('message', body)}"
                         )
+                    endpoint_results.append(_endpoint_completion_result(ep, body or {"success": True}))
                 except requests.RequestException as e:
                     complete_errors.append(f"{ep.host}:{ep.port} request failed: {e}")
+                    endpoint_results.append(
+                        {
+                            "host": ep.host,
+                            "port": ep.port,
+                            "success": False,
+                            "message": str(e),
+                        }
+                    )
             if complete_errors:
                 raise RuntimeError("[P2P] /complete_weights_update failed: " + "; ".join(complete_errors))
+            self.endpoint_results = endpoint_results
 
         # Keep the receiver tensor_map/session ids with the cached backend.
         # The next sync can ask a warm SGLang receiver to skip returning the
@@ -1679,6 +1787,40 @@ class P2PTransportBackend(WeightTransportBackend):
         flush_cache: bool = False,
         weight_version: Optional[str] = None,
     ) -> None:
+        # Wall-clock stall watchdog. A bucket's per-module work involves blocking
+        # Mooncake C++ calls (batch_register_memory on the main thread, and
+        # batch_transfer_sync_write on the worker) that can hang silently with no
+        # ret=-1 if a peer/source region isn't registered — neither the async-drain
+        # timeout nor the slot-reuse timeout fires because the main thread blocks
+        # before submitting any future. If a single bucket exceeds the watchdog
+        # budget, dump EVERY thread's stack to stderr (→ server.log) so the exact
+        # blocking call (register vs transfer vs staging) is pinned instead of a
+        # 30-min silent hang → orchestrator timeout. By default it only DUMPS and
+        # repeats; set XORL_P2P_BUCKET_WATCHDOG_EXIT=1 to abort after the first dump
+        # (fail-fast — the dead rank tears down the collective). Disable with
+        # XORL_P2P_BUCKET_WATCHDOG_S=0.
+        watchdog_s = _env_float("XORL_P2P_BUCKET_WATCHDOG_S", 180.0)
+        if watchdog_s <= 0:
+            return self._transfer_bucket_impl(
+                bucket, src_rank=src_rank, flush_cache=flush_cache, weight_version=weight_version
+            )
+        watchdog_exit = _env_flag("XORL_P2P_BUCKET_WATCHDOG_EXIT", False)
+        faulthandler.dump_traceback_later(watchdog_s, repeat=not watchdog_exit, exit=watchdog_exit, file=sys.stderr)
+        try:
+            return self._transfer_bucket_impl(
+                bucket, src_rank=src_rank, flush_cache=flush_cache, weight_version=weight_version
+            )
+        finally:
+            faulthandler.cancel_dump_traceback_later()
+
+    def _transfer_bucket_impl(
+        self,
+        bucket: List[Tuple[str, torch.Tensor]],
+        *,
+        src_rank: int = 0,
+        flush_cache: bool = False,
+        weight_version: Optional[str] = None,
+    ) -> None:
         if not self._direct_ep_transfer and src_rank != 0:
             raise ValueError(
                 f"P2PTransportBackend rejects src_rank={src_rank} when "
@@ -1734,7 +1876,7 @@ class P2PTransportBackend(WeightTransportBackend):
                 if self._rank_filter is not None and not self._rank_filter(loc):
                     continue
                 locators_for_rank += 1
-                src_view = self._slice_source_for_locator(name, tensor, loc)
+                src_view = self._slice_source_for_locator(name, tensor, loc, self._qwen_linear_attention_dims)
                 if src_view is None:
                     skipped_errors.append(f"{name!r}: receiver locator is incompatible with source tensor")
                     continue
@@ -1815,7 +1957,28 @@ class P2PTransportBackend(WeightTransportBackend):
         prior_future = self._cpu_pool_pending_futures[pool_idx]
         t_pool_wait = time.perf_counter()
         if prior_future is not None:
-            prior_future.result()  # surface worker exceptions
+            # Bound this wait — never block the per-module loop forever. This
+            # slot-reuse barrier runs on the main thread BEFORE the end-of-sync
+            # _wait_all_pending drain, so an unbounded result() here is the exact
+            # path that turns a stalled Mooncake worker (an RDMA write that never
+            # completes — stale/un-rearmed receiver region, fabric, expandable-
+            # segment remap, ...) into the orchestrator's 1800s all-rank wedge.
+            # Fail loud and bounded instead; the handler's
+            # _gather_p2p_transfer_statuses except-path then fails every rank.
+            slot_timeout_s = max(0.001, _env_float("XORL_P2P_PENDING_TRANSFER_TIMEOUT_S", 300.0))
+            try:
+                prior_future.result(timeout=slot_timeout_s)  # surface worker exceptions
+            except FutureTimeoutError as e:
+                prior_future.cancel()
+                self._cpu_pool_pending_futures[pool_idx] = None
+                sample = ", ".join(n for n, _ in bucket[:3]) or "<none>"
+                raise TimeoutError(
+                    f"[P2P] prior async transfer on CPU pool slot {pool_idx} did not "
+                    f"complete within {slot_timeout_s:.1f}s — the Mooncake RDMA write is "
+                    f"wedged (likely a receiver region that was not re-armed, or a fabric "
+                    f"stall). Failing the sync instead of blocking the per-module loop. "
+                    f"Next bucket params: {sample}"
+                ) from e
             self._cpu_pool_pending_futures[pool_idx] = None
         timing.pool_wait_s = time.perf_counter() - t_pool_wait
         pool = self._cpu_scratch_pools[pool_idx] if pending else None
@@ -1939,11 +2102,10 @@ class P2PTransportBackend(WeightTransportBackend):
                 (unique_staged_bytes + reused_staged_bytes) / 1e6,
             )
 
-        # Build small-entries metadata on the main thread — Mooncake's
-        # batch_register doesn't enqueue CUDA work but
-        # _intervals_per_cuda_segment calls torch.cuda.memory_snapshot()
-        # which we keep on main as a precaution. The actual transfer
-        # work happens in the worker.
+        # Build small-entries metadata on the main thread. Mooncake's
+        # batch_register does not enqueue CUDA work, but
+        # _intervals_per_cuda_segment calls torch.cuda.memory_snapshot(), so keep
+        # that part out of the transfer worker.
         small_session_data: Dict[str, List[Tuple[int, int, int, Optional[_TransferDebugEntry]]]] = {}
         small_register_ptrs: List[int] = []
         small_register_lens: List[int] = []
@@ -1984,10 +2146,10 @@ class P2PTransportBackend(WeightTransportBackend):
                 small_register_lens = [iv[1] - iv[0] for iv in small_segs]
         timing.stage_s = time.perf_counter() - t_stage
 
-        # The CPU pool is permanently registered; small entries
-        # register/dereg in the worker. Both register_s and
-        # deregister_s stay zero on the main-thread accounting because
-        # all that work moves into transfer_s on the worker.
+        # The CPU pool is permanently registered; small entries register/dereg
+        # in the worker. Both register_s and deregister_s stay zero on the
+        # main-thread accounting because all that work moves into transfer_s on
+        # the worker.
         timing.register_s = 0.0
         timing.deregister_s = 0.0
 
@@ -2190,7 +2352,7 @@ class P2PTransportBackend(WeightTransportBackend):
         in PyTorch's caching allocator (those virtual addresses are reserved but not
         backed by physical memory the IB driver can pin).
 
-        Mirrors SGLang's ``register_memory_region_v2`` — walks the
+        Mirrors SGLang's ``register_memory_region_v2`` - walks the
         ``memory_snapshot`` per-segment and within each segment accumulates
         runs of contiguous ``active_allocated`` blocks that overlap the
         candidate intervals, emitting one merged range per run.
@@ -2235,6 +2397,20 @@ class P2PTransportBackend(WeightTransportBackend):
                 if not _overlaps_any(addr, addr + size):
                     continue
                 out.append((addr, addr + size))
+        if not out:
+            # memory_snapshot returned no active_allocated block overlapping the
+            # candidate intervals. Returning [] would register NOTHING for these
+            # buffers, so the later batch_transfer_sync writes to/from unregistered
+            # memory and the RDMA completion never arrives (silent data-plane hang,
+            # no ret=-1). Fall back to the raw intervals (same behavior as the
+            # memory_snapshot-failure path above) so the regions are at least
+            # registered. 2026-06-08: restored from pre-merge baf6dcce.
+            logger.warning(
+                "[P2P] torch.cuda.memory.memory_snapshot returned no active blocks "
+                "for small CUDA registration intervals; falling back to raw intervals "
+                "(may EFAULT on registration)."
+            )
+            return intervals
         return out
 
     def _merge_against_registered(
@@ -2254,33 +2430,31 @@ class P2PTransportBackend(WeightTransportBackend):
         def merge(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
             sorted_iv = sorted(iv for iv in intervals if iv[1] > iv[0])
             merged: List[Tuple[int, int]] = []
-            for s, e in sorted_iv:
-                if merged and s <= merged[-1][1]:
-                    merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+            for start, end in sorted_iv:
+                if merged and start <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
                 else:
-                    merged.append((s, e))
+                    merged.append((start, end))
             return merged
 
         cand_merged = merge(candidates)
         registered = merge(self._registered_intervals)
         new: List[Tuple[int, int]] = []
 
-        for s, e in cand_merged:
-            cur_s = s
-            for rs, re in registered:
-                if re <= cur_s:
+        for start, end in cand_merged:
+            cur_start = start
+            for reg_start, reg_end in registered:
+                if reg_end <= cur_start:
                     continue
-                if rs >= e:
+                if reg_start >= end:
                     break
-                # rs..re overlaps cur_s..e in some way; carve off the part
-                # before this registered range.
-                if rs > cur_s:
-                    new.append((cur_s, rs))
-                cur_s = max(cur_s, re)
-                if cur_s >= e:
+                if reg_start > cur_start:
+                    new.append((cur_start, reg_start))
+                cur_start = max(cur_start, reg_end)
+                if cur_start >= end:
                     break
-            if cur_s < e:
-                new.append((cur_s, e))
+            if cur_start < end:
+                new.append((cur_start, end))
         return merge(new)
 
     def _register_persistent_source_intervals(
@@ -2302,6 +2476,23 @@ class P2PTransportBackend(WeightTransportBackend):
             return
 
         segments = self._intervals_per_cuda_segment(raw_new)
+        if not segments:
+            # raw_new was non-empty but resolved to zero active_allocated CUDA
+            # segments. The source storage is not backed by pinnable allocator
+            # blocks (freed, or an expandable_segments virtual range with no
+            # physical backing). Fail loud: registering nothing here would
+            # silently leave the GPU-direct source unregistered and wedge the
+            # NIC read with no ret=-1 — exactly the silent-hang class this guard
+            # exists to prevent. Route these tensors through the registered CPU
+            # scratch pool instead (set XORL_P2P_CPU_POOL_MIN_BYTES=0).
+            raise RuntimeError(
+                "[P2P] GPU-direct source registration resolved to zero active CUDA "
+                f"segments for {len(raw_new)} requested interval(s) (bucket {bucket_idx}); "
+                "the source memory is not backed by active allocator blocks. Refusing to "
+                "register an empty range that would silently hang the RDMA read. If "
+                "PYTORCH_CUDA_ALLOC_CONF=expandable_segments is set, route small tensors "
+                "through the CPU scratch pool via XORL_P2P_CPU_POOL_MIN_BYTES=0."
+            )
         new_segments = self._merge_against_registered(segments)
         if not new_segments:
             return
@@ -2319,11 +2510,18 @@ class P2PTransportBackend(WeightTransportBackend):
 
     def _locators_for_source_name(self, name: str) -> Optional[List[Dict[str, Any]]]:
         locators = self._tensor_map.get(name)
-        if locators or name.startswith("language_model."):
+        if locators:
             return locators
+        lookup_name = _receiver_lookup_name(name)
+        if lookup_name != name:
+            locators = self._tensor_map.get(lookup_name)
+            if locators:
+                return locators
+        if lookup_name.startswith("language_model."):
+            return None
         # Kimi-K2.5 SGLang wrappers expose language model tensors under
         # language_model.*, while XORL trains the unwrapped text model.
-        return self._tensor_map.get(f"language_model.{name}")
+        return self._tensor_map.get(f"language_model.{lookup_name}")
 
     def _should_skip_missing_tied_locator(self, name: str) -> bool:
         if name != "lm_head.weight":
@@ -2342,6 +2540,7 @@ class P2PTransportBackend(WeightTransportBackend):
         name: str,
         full_tensor: torch.Tensor,
         loc: Dict[str, Any],
+        qwen_linear_attention_dims: Optional[Dict[str, Any]] = None,
     ) -> Optional[torch.Tensor]:
         """Extract the sub-region of the trainer's full HF tensor that
         corresponds to a single receiver locator.
@@ -2358,6 +2557,17 @@ class P2PTransportBackend(WeightTransportBackend):
             return P2PTransportBackend._normalize_sliced_source_for_locator(name, full_tensor, loc)
 
         full_shape = loc.get("full_shape")
+        fused_linear_view = P2PTransportBackend._slice_qwen_linear_attention_fused_param(
+            name,
+            full_tensor,
+            loc,
+            full_shape,
+            slc,
+            qwen_linear_attention_dims,
+        )
+        if fused_linear_view is not None:
+            return P2PTransportBackend._normalize_sliced_source_for_locator(name, fused_linear_view, loc)
+
         if full_shape is not None and list(full_tensor.shape) != list(full_shape):
             local_view = P2PTransportBackend._slice_qwen35_linear_attention_local_param(
                 name,
@@ -2377,6 +2587,85 @@ class P2PTransportBackend(WeightTransportBackend):
 
         index: Tuple[slice, ...] = tuple(slice(int(s[0]), int(s[1])) for s in slc)
         return P2PTransportBackend._normalize_sliced_source_for_locator(name, full_tensor[index], loc)
+
+    @staticmethod
+    def _slice_qwen_linear_attention_fused_param(
+        name: str,
+        full_tensor: torch.Tensor,
+        loc: Dict[str, Any],
+        full_shape: Any,
+        slc: Any,
+        qwen_linear_attention_dims: Optional[Dict[str, Any]],
+    ) -> Optional[torch.Tensor]:
+        # This combined Q|K|V cat has no matching receiver locator. SGLang's
+        # p2p_qwen35_linear_attn_qkvz_locators emits SEPARATE contiguous Q/K/V
+        # locators for in_proj_qkv.weight (and conv1d.weight), each a plain
+        # contiguous row-range that the generic full_tensor[slc] path in
+        # _slice_source_for_locator matches exactly. The fused-cat path is an
+        # orphaned trainer-side divergence from the glm5 rebase (955191dd) with
+        # no receiver counterpart — when it fires its output is the wrong shape
+        # for a per-Q/K/V locator. Bypassed by default; returning None makes the
+        # caller fall through to the canonical contiguous slice. Set
+        # XORL_P2P_DISABLE_QWEN_LINEAR_ATTN_FUSED_SLICE=0 only for a receiver that
+        # genuinely expects the fused combined layout.
+        if _env_flag("XORL_P2P_DISABLE_QWEN_LINEAR_ATTN_FUSED_SLICE", True):
+            return None
+        if not (
+            ".linear_attn." in name
+            and (name.endswith(".in_proj_qkv.weight") or name.endswith(".conv1d.weight"))
+            and full_shape is not None
+            and list(full_tensor.shape) == list(full_shape)
+            and isinstance(qwen_linear_attention_dims, dict)
+        ):
+            return None
+
+        try:
+            key_dim = int(qwen_linear_attention_dims["key_dim"])
+            value_dim = int(qwen_linear_attention_dims["value_dim"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if key_dim <= 0 or value_dim <= 0:
+            return None
+
+        total_rows = 2 * key_dim + value_dim
+        if full_tensor.ndim < 1 or int(full_tensor.shape[0]) != total_rows:
+            return None
+
+        try:
+            tp_rank = int(loc.get("tp_rank", 0))
+        except (TypeError, ValueError):
+            return None
+
+        tp_size = 0
+        try:
+            tp_size = int(qwen_linear_attention_dims.get("tp_size") or 0)
+        except (TypeError, ValueError):
+            tp_size = 0
+        if tp_size <= 0 and slc:
+            try:
+                local_rows = int(slc[0][1]) - int(slc[0][0])
+            except (TypeError, ValueError, IndexError):
+                local_rows = 0
+            if local_rows > 0 and total_rows % local_rows == 0:
+                tp_size = total_rows // local_rows
+        if tp_size <= 0 or tp_rank < 0 or tp_rank >= tp_size:
+            return None
+        if key_dim % tp_size != 0 or value_dim % tp_size != 0:
+            return None
+
+        key_chunk = key_dim // tp_size
+        value_chunk = value_dim // tp_size
+        q_start = tp_rank * key_chunk
+        k_start = key_dim + tp_rank * key_chunk
+        v_start = 2 * key_dim + tp_rank * value_chunk
+        return torch.cat(
+            [
+                full_tensor.narrow(0, q_start, key_chunk),
+                full_tensor.narrow(0, k_start, key_chunk),
+                full_tensor.narrow(0, v_start, value_chunk),
+            ],
+            dim=0,
+        ).contiguous()
 
     @staticmethod
     def _normalize_source_for_locator(

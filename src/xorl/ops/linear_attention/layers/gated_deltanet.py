@@ -9,17 +9,21 @@ from typing import Any
 import torch
 import torch.nn as nn
 from einops import rearrange, repeat
-from fla.modules import FusedRMSNormGated, RMSNorm
-from fla.ops.gated_delta_rule import (
+from torch.nn import functional as F
+
+from xorl.ops.linear_attention.layers.utils import get_unpad_data, index_first_axis, pad_input
+from xorl.ops.linear_attention.modules import FusedRMSNormGated, RMSNorm, ShortConvolution
+from xorl.ops.linear_attention.ops.gated_delta_rule import (
     chunk_gated_delta_rule,
     fused_recurrent_gated_delta_rule,
 )
-from torch.nn import functional as F
 
-# `ShortConvolution` is kept local (not `fla.modules`): the xorl version carries the
-# Ulysses conv-prefix halo exchange (`cp_context`) that upstream FLA does not implement.
-from xorl.ops.linear_attention.layers.utils import get_unpad_data, index_first_axis, pad_input
-from xorl.ops.linear_attention.modules import ShortConvolution
+
+def _sglang_compatible_beta_gate(b_input: torch.Tensor) -> torch.Tensor:
+    beta = b_input.float().sigmoid()
+    if beta.dtype != b_input.dtype:
+        beta = beta.to(dtype=b_input.dtype).float()
+    return beta
 
 
 class GatedDeltaNet(nn.Module):
@@ -129,6 +133,19 @@ class GatedDeltaNet(nn.Module):
             self.o_norm = RMSNorm(self.head_v_dim, eps=norm_eps, dtype=torch.float32)
         self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
 
+    def _apply(self, fn, recurse: bool = True):
+        module = super()._apply(fn, recurse=recurse)
+        # Match SGLang's Qwen3.5/GDN contract: decay/time-step parameters stay fp32
+        # even when the rest of the model is moved to bf16/fp16.
+        for name in ("A_log", "dt_bias"):
+            param = getattr(self, name, None)
+            if isinstance(param, nn.Parameter) and param.is_floating_point() and param.dtype != torch.float32:
+                with torch.no_grad():
+                    param.data = param.data.float()
+                if param.grad is not None:
+                    param.grad.data = param.grad.data.float()
+        return module
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -218,14 +235,14 @@ class GatedDeltaNet(nn.Module):
             v = F.silu(v_input)
             conv_state_q = conv_state_k = conv_state_v = None
 
-        q, k = map(lambda x: rearrange(x, "... (h d) -> ... h d", d=self.head_k_dim), (q, k))
+        q, k = (rearrange(x, "... (h d) -> ... h d", d=self.head_k_dim) for x in (q, k))
         v = rearrange(v, "... (h d) -> ... h d", d=self.head_v_dim)
 
         if self.num_v_heads > self.num_heads:
             repeat_factor = self.num_v_heads // self.num_heads
-            q, k = map(lambda x: repeat(x, "... h d -> ... (h g) d", g=repeat_factor), (q, k))
+            q, k = (repeat(x, "... h d -> ... (h g) d", g=repeat_factor) for x in (q, k))
 
-        beta = b_input.sigmoid()
+        beta = _sglang_compatible_beta_gate(b_input)
         if self.allow_neg_eigval:
             beta = beta * 2.0
 

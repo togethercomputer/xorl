@@ -266,10 +266,13 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         # decoder layers
         all_self_attns = () if output_attentions else None
+        all_hidden_states = () if output_hidden_states else None
 
         for decoder_layer in self.layers:
             if decoder_layer is None:  # PP: pruned layer
                 continue
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
             layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
@@ -286,9 +289,12 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         # PP support: norm may be None on non-last stages
         hidden_states = self.norm(hidden_states) if self.norm is not None else hidden_states
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
 
         return BaseModelOutput(
             last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
 
@@ -361,7 +367,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel):
 
         last_hidden_state = outputs.last_hidden_state
 
-        return CausalLMOutput(last_hidden_state=last_hidden_state)
+        return CausalLMOutput(last_hidden_state=last_hidden_state, hidden_states=outputs.hidden_states)
 
 
 ModelClass = Qwen3ForCausalLM

@@ -146,6 +146,7 @@ def policy_loss_function(
     icepop_beta: Optional[float] = None,
     loss_reducer: Optional[Reducer] = None,
     metric_reducer: Optional[Reducer] = None,
+    lm_head: Optional[torch.nn.Module] = None,
 ) -> "LossOutput":
     """
     Policy loss with PPO clipping, optional IcePop masking, and optional TIS correction.
@@ -221,6 +222,7 @@ def policy_loss_function(
         num_chunks,
         tp_group=tp_group,
         lm_head_fp32=lm_head_fp32,
+        lm_head=lm_head,
     )
 
     new_logprobs_flat = -per_token_ce.detach()

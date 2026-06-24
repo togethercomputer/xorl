@@ -7,9 +7,13 @@ requiring a full distributed environment.
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from xorl.server.weight_sync.handler import WeightSyncHandler, _prod
+
+
+pytestmark = [pytest.mark.gpu]
 
 
 class TestProd:

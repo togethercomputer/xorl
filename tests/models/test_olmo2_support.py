@@ -72,7 +72,7 @@ def test_olmo2_tp_plan_uses_local_axis_qk_norm():
     # hidden-sharded and a full-hidden weight can't be applied directly.
     # LocalAxisRMSNormShard shards the 1-D weight on dim 0 so each rank's
     # slice matches its local q/k slice. This is the actual root cause of
-    # what was originally reported (the issue thought it was post-norm; the trace
+    # what was filed as #198 (the issue thought it was post-norm; the trace
     # was at q_norm in _project_qkv).
     assert isinstance(TP_PLAN["layers.*.self_attn.q_norm"], LocalAxisRMSNormShard)
     assert isinstance(TP_PLAN["layers.*.self_attn.k_norm"], LocalAxisRMSNormShard)
@@ -178,3 +178,6 @@ def test_olmo2_checkpoint_handler_loads_hf_weights_into_fused_model():
 
     torch.testing.assert_close(xorl_hidden_states, hf_hidden_states, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(xorl_logits, hf_logits, atol=2e-4, rtol=5e-4)
+    torch.testing.assert_close(xorl_hidden_states, hf_hidden_states, atol=5e-5, rtol=5e-5)
+    # CPU torch 2.11 can drift just under 1e-4 after the final lm_head matmul.
+    torch.testing.assert_close(xorl_logits, hf_logits, atol=1e-4, rtol=1e-4)

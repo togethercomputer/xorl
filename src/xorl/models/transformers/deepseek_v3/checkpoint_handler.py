@@ -220,13 +220,13 @@ class DeepseekV3CheckpointHandler(CheckpointHandler):
     ) -> Optional[List[Tuple[str, torch.Tensor]]]:
         gate_up_match = self._FUSED_EXPERT_GATE_UP_PATTERN.match(key)
         if gate_up_match is not None:
-            # xorl checkpoints already store fused expert weights in native
+            # xorl-internal checkpoints already store fused expert weights in native
             # [experts, hidden, 2 * intermediate] layout. Only EP slicing is needed.
             return [(key, self._slice_expert_tensor_for_ep(tensor))]
 
         down_match = self._FUSED_EXPERT_DOWN_PATTERN.match(key)
         if down_match is not None:
-            # xorl checkpoints already store fused expert weights in native
+            # xorl-internal checkpoints already store fused expert weights in native
             # [experts, intermediate, hidden] layout. Only EP slicing is needed.
             return [(key, self._slice_expert_tensor_for_ep(tensor))]
 

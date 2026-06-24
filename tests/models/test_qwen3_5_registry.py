@@ -1,8 +1,13 @@
 from types import SimpleNamespace
 
+import pytest
+
 from xorl.models.registry import get_registry
 from xorl.models.transformers.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 from xorl.models.transformers.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
+
+
+pytestmark = [pytest.mark.gpu]
 
 
 def test_qwen3_5_conditional_generation_registered():

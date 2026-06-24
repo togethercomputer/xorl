@@ -45,9 +45,14 @@ def unpermute(
 
     expanded_mapping = permutation_mapping.unsqueeze(1).expand(-1, hidden_dim)
 
-    # FP32 accumulation to reduce non-determinism from BF16 atomic scatter_add_
+    # FP32 accumulation to reduce non-determinism from BF16 atomic scatter_add_.
+    # Cast the source in chunks so long-context EP combine does not allocate a
+    # second full-size FP32 copy of the expert outputs.
     unpermuted_fp32 = torch.zeros(hidden_states_shape, device=tokens.device, dtype=torch.float32)
-    unpermuted_fp32.scatter_add_(0, expanded_mapping, tokens.float())
+    chunk_size = 4096
+    for start in range(0, tokens.shape[0], chunk_size):
+        end = min(start + chunk_size, tokens.shape[0])
+        unpermuted_fp32.scatter_add_(0, expanded_mapping[start:end], tokens[start:end].float())
     return unpermuted_fp32.to(tokens.dtype)
 
 

@@ -24,6 +24,9 @@ from xorl.models.transformers.qwen3_moe.modeling_qwen3_moe import (
 )
 
 
+pytestmark = [pytest.mark.gpu]
+
+
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
 

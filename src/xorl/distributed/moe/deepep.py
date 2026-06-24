@@ -17,11 +17,6 @@ from typing import List, Optional, Tuple
 import torch
 import torch.distributed as dist
 
-from ...utils import logging
-
-
-logger = logging.get_logger(__name__)
-
 
 try:
     import deep_ep
@@ -54,7 +49,9 @@ def get_hidden_bytes(x: torch.Tensor) -> int:
 # ---------------------------------------------------------------------------
 _pending_combine_event: Optional["EventOverlap"] = None
 
-_ALLOW_UNSAFE_ASYNC_COMBINE: bool = _os.environ.get("XORL_DEEPEP_UNSAFE_ASYNC_COMBINE", "0") == "1"
+
+def _allow_unsafe_async_combine() -> bool:
+    return _os.environ.get("XORL_DEEPEP_UNSAFE_ASYNC_COMBINE", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def sync_pending_combine():
@@ -201,12 +198,37 @@ def permute_for_experts(
         permuted_indices: Original token indices for unpermute ``[num_valid]``.
         num_valid: Number of valid (token, expert) pairs.
     """
-    device = recv_x.device
+    permuted_scores, permuted_indices, num_valid = permutation_metadata_for_experts(
+        recv_topk_idx,
+        recv_topk_weights,
+        num_valid=num_valid,
+    )
+
+    if num_valid == 0:
+        return recv_x[:0], permuted_scores, permuted_indices, 0
+
+    # Gather tokens and scores in expert-sorted order
+    permuted_x = recv_x.index_select(0, permuted_indices)
+
+    return permuted_x, permuted_scores, permuted_indices, num_valid
+
+
+def permutation_metadata_for_experts(
+    recv_topk_idx: torch.Tensor,
+    recv_topk_weights: torch.Tensor,
+    num_valid: int = None,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """Return expert-order metadata without gathering ``recv_x``.
+
+    This is used by memory-constrained fused expert paths that can gather
+    hidden chunks directly from ``recv_x`` instead of materializing the full
+    expert-order token matrix.
+    """
+    device = recv_topk_idx.device
     topk = recv_topk_idx.shape[1]
 
     if num_valid is not None and num_valid == 0:
         return (
-            recv_x[:0],
             torch.empty(0, dtype=recv_topk_weights.dtype, device=device),
             torch.empty(0, dtype=torch.long, device=device),
             0,
@@ -231,12 +253,103 @@ def permute_for_experts(
 
     # Token indices via integer division (no repeat_interleave needed)
     permuted_indices = sort_order // topk
-
-    # Gather tokens and scores in expert-sorted order
-    permuted_x = recv_x.index_select(0, permuted_indices)
     permuted_scores = flat_scores[sort_order]
 
-    return permuted_x, permuted_scores, permuted_indices, num_valid
+    return permuted_scores, permuted_indices, num_valid
+
+
+def _deepep_grad_scatter_accum_dtype(input_dtype: torch.dtype) -> torch.dtype:
+    """Return the accumulation dtype for DeepEP grad scatter.
+
+    FP32 is the default to preserve existing numerics. Large bf16 full-weight
+    runs can opt into input-dtype accumulation to avoid a short-lived fp32
+    receive-gradient buffer in DeepEP backward.
+    """
+    mode = _os.environ.get("XORL_DEEPEP_GRAD_SCATTER_ACCUM_DTYPE", "fp32").strip().lower()
+    if mode in {"fp32", "float32"}:
+        return torch.float32
+    if mode in {"input", "input_dtype", "same", "same_dtype"}:
+        return input_dtype
+    raise ValueError(
+        "XORL_DEEPEP_GRAD_SCATTER_ACCUM_DTYPE must be one of "
+        "'fp32', 'float32', 'input', 'input_dtype', 'same', or 'same_dtype'"
+    )
+
+
+def _deepep_combine_scatter_accum_dtype(input_dtype: torch.dtype) -> torch.dtype:
+    """Return the accumulation dtype for DeepEP forward combine scatter.
+
+    FP32 preserves existing numerics. Large full-weight runs can opt into
+    input-dtype accumulation to avoid materializing both fp32 and bf16 combine
+    buffers during the forward pass.
+    """
+    mode = _os.environ.get("XORL_DEEPEP_COMBINE_SCATTER_ACCUM_DTYPE", "fp32").strip().lower()
+    if mode in {"fp32", "float32"}:
+        return torch.float32
+    if mode in {"input", "input_dtype", "same", "same_dtype"}:
+        return input_dtype
+    raise ValueError(
+        "XORL_DEEPEP_COMBINE_SCATTER_ACCUM_DTYPE must be one of "
+        "'fp32', 'float32', 'input', 'input_dtype', 'same', or 'same_dtype'"
+    )
+
+
+def _cast_if_needed(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    if tensor.dtype == dtype:
+        return tensor
+    return tensor.to(dtype)
+
+
+def _zeros_grad_recv_x(
+    num_recv_tokens: int,
+    hidden_dim: int,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    try:
+        return torch.zeros(num_recv_tokens, hidden_dim, dtype=dtype, device=device)
+    except torch.OutOfMemoryError:
+        retry = _os.environ.get("XORL_DEEPEP_GRAD_SCATTER_EMPTY_CACHE_ON_OOM", "0").strip().lower()
+        if device.type != "cuda" or retry not in {"1", "true", "yes"}:
+            raise
+        torch.cuda.empty_cache()
+        return torch.zeros(num_recv_tokens, hidden_dim, dtype=dtype, device=device)
+
+
+def _scatter_expert_grad_to_recv(
+    grad_expert_input: torch.Tensor,
+    permuted_indices: torch.Tensor,
+    num_recv_tokens: int,
+    hidden_dim: int,
+    *,
+    chunk_tokens: int | None = None,
+) -> torch.Tensor:
+    """Scatter expert-order gradients back to recv order with bounded cast memory."""
+    accum_dtype = _deepep_grad_scatter_accum_dtype(grad_expert_input.dtype)
+    grad_recv_x = _zeros_grad_recv_x(
+        num_recv_tokens,
+        hidden_dim,
+        dtype=accum_dtype,
+        device=grad_expert_input.device,
+    )
+    if grad_expert_input.numel() == 0:
+        return _cast_if_needed(grad_recv_x, grad_expert_input.dtype)
+
+    if chunk_tokens is None:
+        chunk_tokens = int(_os.environ.get("XORL_DEEPEP_GRAD_INDEX_ADD_CHUNK_TOKENS", "2048"))
+    chunk_tokens = max(1, chunk_tokens)
+
+    if grad_expert_input.dtype == grad_recv_x.dtype:
+        grad_recv_x.index_add_(0, permuted_indices, grad_expert_input)
+    else:
+        for start in range(0, grad_expert_input.shape[0], chunk_tokens):
+            end = min(start + chunk_tokens, grad_expert_input.shape[0])
+            grad_chunk = grad_expert_input[start:end].float()
+            grad_recv_x.index_add_(0, permuted_indices[start:end], grad_chunk)
+            del grad_chunk
+
+    return _cast_if_needed(grad_recv_x, grad_expert_input.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +400,13 @@ class _FusedDispatchAndPermute(torch.autograd.Function):
             allocate_on_comm_stream=True,
         )
         event.current_stream_wait()
+        # Comm-stream-owned outputs consumed on the compute stream: without
+        # record_stream, a freed block returns to the comm-stream pool and a
+        # later collective can overwrite it while a compute-stream read is
+        # still in flight (see _deepep_combine_chunk in ops/moe/quack.py).
+        recv_x.record_stream(torch.cuda.current_stream())
+        recv_topk_idx.record_stream(torch.cuda.current_stream())
+        recv_topk_weights.record_stream(torch.cuda.current_stream())
 
         num_recv_tokens = recv_x.shape[0]
         recv_counts_tensor = torch.tensor(recv_counts, dtype=torch.int32, device=x.device)
@@ -332,15 +452,13 @@ class _FusedDispatchAndPermute(torch.autograd.Function):
         buffer = ctx.buffer
         handle = ctx.handle
 
-        # Step 1: Scatter gradient from expert order → recv order (FP32 for precision)
-        grad_recv_x = torch.zeros(
+        # Step 1: Scatter gradient from expert order → recv order.
+        grad_recv_x = _scatter_expert_grad_to_recv(
+            grad_expert_input,
+            permuted_indices,
             ctx.num_recv_tokens,
             ctx.hidden_dim,
-            dtype=torch.float32,
-            device=grad_expert_input.device,
         )
-        grad_recv_x.index_add_(0, permuted_indices, grad_expert_input.float())
-        grad_recv_x = grad_recv_x.to(grad_expert_input.dtype)
 
         # Step 2: Combine to reverse dispatch
         previous_event = EventOverlap(EventHandle())
@@ -353,6 +471,106 @@ class _FusedDispatchAndPermute(torch.autograd.Function):
             allocate_on_comm_stream=True,
         )
         event.current_stream_wait()
+        grad_x.record_stream(torch.cuda.current_stream())
+
+        if grad_x.dtype != ctx.input_dtype:
+            grad_x = grad_x.to(ctx.input_dtype)
+        return grad_x, None, None, None, None
+
+
+class _FusedDispatchNoPermute(torch.autograd.Function):
+    """DeepEP dispatch that returns recv-order tokens plus expert-order metadata.
+
+    The regular path immediately gathers ``recv_x`` into expert order.  Large
+    128K MoE runs can make that gather several GiB, so Quack's fused DeepEP
+    path consumes ``recv_x`` directly and gathers hidden chunks as needed.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        buffer: "DeepEPBuffer",
+        num_experts: int,
+    ):
+        buffer.init_buffer(hidden_bytes=get_hidden_bytes(x))
+        topk_idx_deepep = topk_idx.to(deep_ep.topk_idx_t)
+        topk_weights_f32 = topk_weights.to(torch.float32)
+
+        num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, _ = (
+            buffer.buffer.get_dispatch_layout(topk_idx_deepep, num_experts)
+        )
+        previous_event = EventOverlap(EventHandle())
+        recv_x, recv_topk_idx, recv_topk_weights, recv_counts, handle, event = buffer.buffer.dispatch(
+            x=x.contiguous(),
+            num_tokens_per_rank=num_tokens_per_rank,
+            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+            is_token_in_rank=is_token_in_rank,
+            num_tokens_per_expert=num_tokens_per_expert,
+            topk_idx=topk_idx_deepep,
+            topk_weights=topk_weights_f32,
+            config=buffer.dispatch_config,
+            previous_event=previous_event,
+            async_finish=True,
+            allocate_on_comm_stream=True,
+        )
+        event.current_stream_wait()
+        # Comm-stream-owned outputs consumed on the compute stream: without
+        # record_stream, a freed block returns to the comm-stream pool and a
+        # later collective can overwrite it while a compute-stream read is
+        # still in flight (see _deepep_combine_chunk in ops/moe/quack.py).
+        recv_x.record_stream(torch.cuda.current_stream())
+        recv_topk_idx.record_stream(torch.cuda.current_stream())
+        recv_topk_weights.record_stream(torch.cuda.current_stream())
+
+        num_recv_tokens = recv_x.shape[0]
+        recv_counts_tensor = torch.tensor(recv_counts, dtype=torch.int32, device=x.device)
+        cumsum = torch.cumsum(recv_counts_tensor, dim=0)
+        total_valid_count = sum(recv_counts)
+
+        permuted_scores, permuted_indices, num_valid = permutation_metadata_for_experts(
+            recv_topk_idx,
+            recv_topk_weights,
+            num_valid=total_valid_count,
+        )
+
+        ctx.buffer = buffer
+        ctx.handle = handle
+        ctx.input_dtype = x.dtype
+
+        dispatch_ctx = DispatchContext(
+            handle=handle,
+            permuted_scores=permuted_scores,
+            permuted_indices=permuted_indices,
+            num_recv_tokens=num_recv_tokens,
+            num_valid=num_valid,
+            dtype=x.dtype,
+            device=x.device,
+            hidden_dim=x.shape[1],
+        )
+        return recv_x, cumsum, dispatch_ctx
+
+    @staticmethod
+    def backward(ctx, grad_recv_x, grad_cumsum, grad_dispatch_ctx):
+        del grad_cumsum, grad_dispatch_ctx
+        if grad_recv_x is None:
+            return None, None, None, None, None
+
+        buffer = ctx.buffer
+        handle = ctx.handle
+        previous_event = EventOverlap(EventHandle())
+        grad_x, _, event = buffer.buffer.combine(
+            x=grad_recv_x.contiguous(),
+            handle=handle,
+            config=buffer.combine_config,
+            previous_event=previous_event,
+            async_finish=True,
+            allocate_on_comm_stream=True,
+        )
+        event.current_stream_wait()
+        grad_x.record_stream(torch.cuda.current_stream())
 
         if grad_x.dtype != ctx.input_dtype:
             grad_x = grad_x.to(ctx.input_dtype)
@@ -396,18 +614,27 @@ class _FusedUnpermuteAndCombine(torch.autograd.Function):
             # Scores are already applied by the expert compute function
             # (triton/native backends multiply by expert_scores). Do NOT
             # re-apply here — that would double-count router weights.
+            # re-apply here, because that would double-count router weights.
+            accum_dtype = _deepep_combine_scatter_accum_dtype(dtype)
             gather_output = torch.zeros(
                 dispatch_ctx.num_recv_tokens,
                 hidden_dim,
-                dtype=torch.float32,
+                dtype=accum_dtype,
                 device=device,
             )
             idx_2d = dispatch_ctx.permuted_indices.unsqueeze(1).expand(-1, hidden_dim)
             _CHUNK = 4096
-            for _i in range(0, expert_output.shape[0], _CHUNK):
-                _end = min(_i + _CHUNK, expert_output.shape[0])
-                gather_output.scatter_add_(0, idx_2d[_i:_end], expert_output[_i:_end].float())
-            gather_output = gather_output.to(dtype)
+            if expert_output.dtype == gather_output.dtype:
+                for _i in range(0, expert_output.shape[0], _CHUNK):
+                    _end = min(_i + _CHUNK, expert_output.shape[0])
+                    gather_output.scatter_add_(0, idx_2d[_i:_end], expert_output[_i:_end])
+            else:
+                for _i in range(0, expert_output.shape[0], _CHUNK):
+                    _end = min(_i + _CHUNK, expert_output.shape[0])
+                    expert_chunk = expert_output[_i:_end].float()
+                    gather_output.scatter_add_(0, idx_2d[_i:_end], expert_chunk)
+                    del expert_chunk
+            gather_output = _cast_if_needed(gather_output, dtype)
 
         # Step 2: Combine
         previous_event = EventOverlap(EventHandle())
@@ -556,6 +783,31 @@ def token_pre_dispatch(
     return expert_input, cumsum, ctx
 
 
+def token_pre_dispatch_no_permute(
+    buffer: DeepEPBuffer,
+    hidden_states: torch.Tensor,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    num_experts: int,
+    num_local_experts: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor, DispatchContext]:
+    """Dispatch tokens with DeepEP but leave them in recv order.
+
+    ``DispatchContext`` still carries expert-order indices and scores.  Fused
+    expert implementations can use that metadata to gather bounded chunks.
+    """
+    del num_local_experts
+    sync_pending_combine()
+    recv_x, cumsum, ctx = _FusedDispatchNoPermute.apply(
+        hidden_states,
+        selected_experts,
+        routing_weights,
+        buffer,
+        num_experts,
+    )
+    return recv_x, cumsum, ctx
+
+
 def tokens_post_combine(
     buffer: DeepEPBuffer,
     expert_output: torch.Tensor,
@@ -565,21 +817,16 @@ def tokens_post_combine(
     """Unpermute expert outputs and combine back to original ranks.
 
     Args:
-        async_combine: Request asynchronous combine on the comm stream so the
-            wait can overlap with the next layer's compute.  Honored only when
-            ``XORL_DEEPEP_UNSAFE_ASYNC_COMBINE=1`` is set; otherwise forced to
-            False because the combined tensor is consumed by the rest of the
-            transformer block on the default stream before the next dispatch,
-            and skipping ``event.current_stream_wait()`` here races that
-            consumer.
+        async_combine: If True, combine runs asynchronously on the comm stream.
+            The output tensor data is NOT valid on the default stream until
+            ``sync_pending_combine()`` is called.  The next call to
+            ``token_pre_dispatch()`` automatically syncs.
     """
-    if async_combine and not _ALLOW_UNSAFE_ASYNC_COMBINE:
-        logger.warning_once(
-            "deepep_async_combine=True ignored: the combined tensor is consumed by the "
-            "transformer block on the default stream before the next DeepEP dispatch, so "
-            "deferring the sync races downstream compute. Set "
-            "XORL_DEEPEP_UNSAFE_ASYNC_COMBINE=1 to opt in anyway."
-        )
+    # The returned MoE output is consumed immediately by the transformer block
+    # before the next DeepEP dispatch. Deferring the wait until the next dispatch
+    # lets downstream compute read incomplete combine data. Keep the API flag for
+    # provenance, but require an explicit unsafe opt-in before honoring it.
+    if async_combine and not _allow_unsafe_async_combine():
         async_combine = False
 
     if _DEEPEP_PROFILE:

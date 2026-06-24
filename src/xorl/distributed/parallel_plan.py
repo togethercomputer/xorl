@@ -36,13 +36,30 @@ class ParallelPlan:
     def apply(self, model: nn.Module, ep_fsdp_mesh: DeviceMesh, already_local: bool = False):
         """Apply EP sharding to model parameters.
 
+        Three dispatch paths per matched expert param:
+
+        - **Meta tensor** (``param.is_meta``): replace the meta param with a
+          new meta param whose shape is sliced to the EP-local size along
+          ``shard.dim``. ``to_empty()`` later allocates only the EP-local
+          slice; DCP load consumes the stamped ``spec_info`` to slice the
+          saved (full-shape) tensor on the way in. This is the path the
+          ``skip_weight_loading=True`` + ``init_device="meta"`` flow needs:
+          the legacy ``already_local=True`` annotate-only path leaves the
+          meta tensor at its full shape, so ``to_empty()`` materializes
+          ``[num_experts, H, I]`` per rank and OOMs at scale.
+        - **Real tensor with EP-local shape** (``already_local=True``): the
+          caller already did EP-aware weight loading (e.g. xorl's TP-aware
+          HF loader), so we just stamp ``spec_info`` and leave the param
+          alone.
+        - **Real tensor with full shape** (default): ``DTensor.from_local
+          → redistribute → to_local`` actually slices ``param.data``.
+
         Args:
             model: The model whose expert parameters will be sharded.
             ep_fsdp_mesh: DeviceMesh with ``["ep", "ep_fsdp"]`` dimensions.
-            already_local: When ``True``, expert parameters are already at
-                EP-local shapes (e.g. loaded with EP-aware weight loading
-                before FSDP wrapping).  Skip the DTensor redistribute but
-                still annotate every parameter with ``spec_info``.
+            already_local: Hint that real-tensor params are already at
+                EP-local shapes. Has no effect on meta tensors (they are
+                always sliced via the meta path).
         """
         ep_mesh = ep_fsdp_mesh["ep"]
         # ep_plan
@@ -58,6 +75,30 @@ class ParallelPlan:
                             param.spec_info = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=Replicate(), fqn=fqn)
                             fqn2spec_info[fqn] = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=Replicate(), fqn=fqn)
                             logger.debug_rank0(f"EP replicated (shared): {fqn} {list(param.shape)}")
+                            break
+
+                        # Meta-tensor path: slice the SHAPE (no data), swap the
+                        # param, stamp spec_info. Dispatched first so the
+                        # ``already_local`` branch below doesn't accidentally
+                        # leave a meta param at its full shape.
+                        if param.is_meta:
+                            assert param.size(shard.dim) % ep_size == 0, (
+                                f"EP sharding failed for {fqn}: dim {shard.dim} size {param.size(shard.dim)} "
+                                f"not divisible by ep_size {ep_size}"
+                            )
+                            new_shape = list(param.shape)
+                            new_shape[shard.dim] = new_shape[shard.dim] // ep_size
+                            local_chunk = torch.nn.Parameter(
+                                torch.empty(new_shape, device="meta", dtype=param.dtype),
+                                requires_grad=param.requires_grad,
+                            )
+                            local_chunk.spec_info = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=shard, fqn=fqn)
+                            set_module_from_path(model, fqn, local_chunk)
+                            fqn2spec_info[fqn] = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=shard, fqn=fqn)
+                            logger.debug_rank0(
+                                f"EP meta-sliced: {fqn} {list(param.shape)} -> {list(local_chunk.shape)} "
+                                f"(dim={shard.dim}, ep_size={ep_size})"
+                            )
                             break
 
                         if already_local:

@@ -76,6 +76,10 @@ class ParallelState:
     cp_fsdp_mode: Literal["all", "ulysses_only", "ring_only", "none"] = "all"
     device_mesh: Optional["DeviceMesh"] = None
     ep_fsdp_device_mesh: Optional["DeviceMesh"] = None
+    lm_head_tp_size: int = 1
+    lm_head_tp_group: "Optional[dist.ProcessGroup]" = field(default=None, repr=False, compare=False)
+    lm_head_tp_replica_group: "Optional[dist.ProcessGroup]" = field(default=None, repr=False, compare=False)
+    lm_head_mesh: Optional["DeviceMesh"] = field(default=None, repr=False, compare=False)
     _mesh_aliases: dict = field(default_factory=dict, repr=False)
 
     def _resolve_mesh_name(self, name: str) -> str:
@@ -572,6 +576,7 @@ def init_parallel_state(
     pp_size: int = 1,
     ringattn_size: int = 1,
     ulysses_size: int = 1,
+    lm_head_tp_size: int = 1,
     dp_mode: Literal["none", "ddp", "fsdp2"] = "fsdp2",
     device_type: str = None,
     cp_fsdp_mode: Literal["all", "ulysses_only", "ring_only", "none"] = "all",
@@ -706,6 +711,64 @@ def init_parallel_state(
         logger.info_rank0(f"Device mesh: {device_mesh}")
         logger.info_rank0(f"EP FSDP device mesh: {ep_fsdp_device_mesh}")
 
+    # lm-head-only tensor parallelism uses a SEPARATE per-module device mesh. The
+    # CP axis is factored cp_replica x lm_head_tp; the lm_head is FSDP-sharded over
+    # a 2-D mesh [replica, lm_head_tp] where the shard dim is lm_head_tp (vocab
+    # rows) and the replica dim is every other axis in the PP stage (DP-replicate,
+    # DP-shard and cp_replica). The model body keeps its own dp/fsdp/cp scheme;
+    # only the lm_head sees this mesh. Opt-in (lm_head_tp_size == 1 -> no-op).
+    # dp_shard is NEVER a vocab-shard axis (DP ranks own different tokens, which
+    # would make vocab-parallel CE wrong) -- it becomes a replica axis here.
+    lm_head_mesh = None
+    lm_head_tp_group = None
+    lm_head_tp_replica_group = None
+    if lm_head_tp_size > 1:
+        if not dist.is_initialized() or device_mesh is None:
+            raise RuntimeError("lm_head_tp_size>1 requires an initialized process group and device mesh.")
+        cp_size = ringattn_size * ulysses_size
+        if cp_size <= 1:
+            raise NotImplementedError(
+                "lm_head_tp_size>1 requires context/sequence parallelism (ringattn or ulysses); it carves the "
+                "lm-head TP group from the CP axis and must not steal DP ranks."
+            )
+        if cp_size % lm_head_tp_size != 0 or lm_head_tp_size > cp_size:
+            raise ValueError(f"lm_head_tp_size ({lm_head_tp_size}) must be a divisor of the CP size ({cp_size}).")
+        if tp_size != 1 or pp_size != 1:
+            raise NotImplementedError(
+                "lm_head_tp_size>1 currently supports data + context + expert parallelism "
+                "(tp_size=pp_size=1); combining it with tensor/pipeline parallelism is a separate design."
+            )
+        # EP is allowed: it is a SEPARATE re-grouping (ep_fsdp_device_mesh) of the
+        # same ranks for the *experts* only, and does not appear in the main
+        # device_mesh (pp/dp_replicate/dp_shard/ringattn/ulysses/tp). The lm_head is a
+        # dense param: it FSDP-shards over lm_head_mesh below while experts stay
+        # EP-sharded and the body keeps fsdp_mesh -- three independent meshes. The
+        # lm_head's CP-sharded hidden input is also unaffected by EP (which is
+        # internal to the MoE layers). So the lm_head_mesh construction is identical
+        # whether or not ep>1.
+        world = dist.get_world_size()
+        cp_replica = cp_size // lm_head_tp_size
+        num_replica = world // lm_head_tp_size
+        # CP is the innermost contiguous block of the row-major device mesh when
+        # tp=pp=1 (EP is not a main-mesh axis), so within each CP group the inner
+        # lm_head_tp_size ranks form a TP (vocab-shard) group and the outer cp_replica
+        # index -- together with all DP ranks across CP groups -- form the replica axis.
+        mesh_tensor = torch.empty((num_replica, lm_head_tp_size), dtype=torch.int)
+        for r in range(world):
+            pos = r % cp_size
+            replica_idx = (r // cp_size) * cp_replica + pos // lm_head_tp_size
+            mesh_tensor[replica_idx, pos % lm_head_tp_size] = r
+        lm_head_mesh = DeviceMesh(
+            device_type=device_type,
+            mesh=mesh_tensor,
+            mesh_dim_names=("replica", "lm_head_tp"),
+        )
+        lm_head_tp_group = lm_head_mesh.get_group("lm_head_tp")
+        lm_head_tp_replica_group = lm_head_mesh.get_group("replica")
+        logger.info_rank0(
+            f"lm-head TP: lm_head_tp_size={lm_head_tp_size}, cp_replica={cp_replica}, mesh={tuple(mesh_tensor.shape)}"
+        )
+
     _PARALLEL_STATE = ParallelState(
         dp_size=dp_size,
         dp_replicate_size=dp_replicate_size,
@@ -715,11 +778,15 @@ def init_parallel_state(
         pp_size=pp_size,
         ringattn_size=ringattn_size,
         ulysses_size=ulysses_size,
+        lm_head_tp_size=lm_head_tp_size,
         dp_mode=dp_mode,
         device_type=device_type,
         cp_fsdp_mode=cp_fsdp_mode,
         device_mesh=device_mesh,
         ep_fsdp_device_mesh=ep_fsdp_device_mesh,
+        lm_head_tp_group=lm_head_tp_group,
+        lm_head_tp_replica_group=lm_head_tp_replica_group,
+        lm_head_mesh=lm_head_mesh,
         _mesh_aliases=_mesh_aliases if device_mesh is not None else {},
     )
 

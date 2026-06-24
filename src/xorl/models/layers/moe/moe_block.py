@@ -51,6 +51,8 @@ class MoEBlock(nn.Module):
         moe_implementation: str = "triton",
         train_router: bool = True,
         record_routing_weights: bool = True,
+        activation_native: bool = False,
+        swiglu_limit: float = 0.0,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -60,6 +62,7 @@ class MoEBlock(nn.Module):
         self.moe_implementation = moe_implementation
         self.train_router = train_router
         self.record_routing_weights = record_routing_weights
+        self.swiglu_limit = float(swiglu_limit)
 
         # Gate linear — directly on this module for checkpoint path ``mlp.gate.weight``
         self.gate = nn.Linear(hidden_size, num_experts, bias=False)
@@ -74,6 +77,8 @@ class MoEBlock(nn.Module):
             intermediate_size=intermediate_size,
             hidden_act=hidden_act,
             moe_implementation=moe_implementation,
+            activation_native=activation_native,
+            swiglu_limit=self.swiglu_limit,
         )
 
         # LoRA adapter tracking (None until inject_lora is called)
@@ -117,12 +122,33 @@ class MoEBlock(nn.Module):
         self.lora_adapter = "injected"
 
     def _regather_routing(self, router_logits, cached_experts, input_dtype):
-        """Re-gather routing weights from softmax using cached expert indices.
+        """Re-gather routing weights from logits using cached expert indices.
 
-        Megatron/SLIME approach: always compute fresh softmax (creates autograd
+        Megatron/SLIME approach: always recompute fresh scores (creates autograd
         graph for gate gradients), then gather with cached indices.  Gradients
-        flow through softmax -> gate naturally, no straight-through hack needed.
+        flow through the score function -> gate naturally, no straight-through hack.
+
+        Dispatches on ``self.router.scoring_func``:
+
+        - ``"softmax"`` — recompute via ``F.softmax(logits)``; renormalize when
+          ``router.norm_topk_prob``.
+        - ``"sqrtsoftplus"`` — recompute via ``sqrt(softplus(logits))``;
+          renormalize unconditionally (V4 always renormalizes); apply
+          ``routed_scaling_factor`` when set. Matches
+          :meth:`TopKRouter._forward_sqrtsoftplus` for graph-structure parity
+          between replay-record and replay-recompute under non-reentrant
+          checkpointing.
         """
+        if self.router.scoring_func == "sqrtsoftplus":
+            scores = F.softplus(router_logits.float()).sqrt().type_as(router_logits)
+            routing_weights = torch.gather(scores, 1, cached_experts)
+            # V4 always renormalizes (matches TopKRouter._forward_sqrtsoftplus).
+            routing_weights = routing_weights / (routing_weights.sum(dim=-1, keepdim=True) + 1e-20)
+            if self.router.routed_scaling_factor is not None:
+                routing_weights = routing_weights * self.router.routed_scaling_factor
+            routing_weights = routing_weights.to(input_dtype)
+            return cached_experts, routing_weights
+
         if self.router.synthetic_routing_mode == "balanced":
             routing_weights, _ = balanced_synthetic_routing(
                 cached_experts.size(0),
@@ -133,6 +159,7 @@ class MoEBlock(nn.Module):
             )
             return cached_experts, routing_weights
 
+        # softmax (default) path
         softmax_probs = F.softmax(router_logits, dim=1, dtype=torch.float)
         routing_weights = torch.gather(softmax_probs, 1, cached_experts)
         if self.router.norm_topk_prob:
@@ -157,7 +184,8 @@ class MoEBlock(nn.Module):
             - router_logits: ``(num_tokens, num_experts)``
         """
         # Route (optionally upcast to fp32 for numerical alignment with SGLang)
-        if getattr(self, "config", None) is not None and getattr(self.config, "_router_fp32", False):
+        router_fp32 = getattr(self, "config", None) is not None and getattr(self.config, "_router_fp32", False)
+        if router_fp32 and not hasattr(self.gate, "fp8_block_size"):
             router_logits = F.linear(hidden_states.float(), self.gate.weight.float())
         else:
             router_logits = self.gate(hidden_states)
@@ -261,8 +289,12 @@ class MoEBlock(nn.Module):
 
         routing_weights, selected_experts, router_logits = self.route(flat_hidden_states)
 
-        # Expert computation (already flat — call experts directly to avoid extra reshape)
-        if self.moe_implementation == "eager":
+        # Expert computation (already flat — call experts directly to avoid extra reshape).
+        # Under EP, even eager compute must use the dispatch/combine path: the
+        # router returns global expert ids while local expert weights are sharded.
+        from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+
+        if self.moe_implementation == "eager" and not get_parallel_state().ep_enabled:
             final_hidden_states = self._eager_forward(flat_hidden_states, routing_weights, selected_experts)
         else:
             final_hidden_states = self.experts(flat_hidden_states, routing_weights, selected_experts)
@@ -306,4 +338,6 @@ class MoEBlock(nn.Module):
             moe_implementation=moe_implementation,
             train_router=getattr(config, "train_router", False),
             record_routing_weights=getattr(config, "record_routing_weights", True),
+            activation_native=getattr(config, "_activation_native", False),
+            swiglu_limit=float(getattr(config, "swiglu_limit", 0.0)),
         )

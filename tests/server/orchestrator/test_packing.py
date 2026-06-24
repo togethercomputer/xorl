@@ -7,6 +7,7 @@ import torch
 from xorl.server.orchestrator.packing import (
     Packer,
     SequentialPacker,
+    _resolve_teacher_cache_base,
     pack_samples,
     unpack_per_token_outputs,
     validate_micro_batches,
@@ -61,6 +62,7 @@ def test_packing_enabled(simple_data):
     assert batch["input_ids"] == [[1, 2, 3, 10, 100, 200]]
     assert batch["labels"] == [[3, 4, 5, 30, 300, 400]]
     assert batch["position_ids"] == [[0, 1, 2, 0, 0, 1]]
+    assert batch["_r3_sample_lengths"] == [3, 1, 2]
 
 
 def test_opd_metadata_packs_as_token_aligned_fields():
@@ -135,6 +137,45 @@ def test_opd_teacher_hidden_states_pad_as_vectors():
 
     assert len(batches) == 1
     assert batches[0]["teacher_hidden_states"] == [[[1.0, 1.5], [2.0, 2.5], [3.0, 3.5], [0.0, 0.0]]]
+
+
+def test_oprd_packing_keeps_global_and_local_teacher_cache_views():
+    data = [
+        {
+            "input_ids": [11, 12, 13],
+            "target_tokens": [12, 13, 14],
+            "teacher_input_ids": [101, 102, 103, 104],
+            "teacher_kept_indices": [1, 2, 3],
+            "teacher_cache_indices": [50, 51, 52],
+            "teacher_cache_base": [50],
+        },
+        {
+            "input_ids": [21, 22],
+            "target_tokens": [22, 23],
+            "teacher_input_ids": [201, 202, 203],
+            "teacher_kept_indices": [0, 2],
+            "teacher_cache_indices": [90, 91],
+            "teacher_cache_base": torch.tensor([90]),
+        },
+    ]
+    packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=1)
+
+    batches = packer.pack(data, max_seq_len=100, request_id="oprd")
+
+    assert len(batches) == 1
+    batch = batches[0]
+    assert batch["teacher_input_ids"] == [101, 102, 103, 104, 201, 202, 203]
+    assert batch["teacher_kept_indices"] == [[1, 2, 3, 4, 6]]
+    assert batch["teacher_position_ids"] == [0, 1, 2, 3, 0, 1, 2]
+    assert batch["teacher_cache_indices"] == [[50, 51, 52, 90, 91]]
+    assert batch["teacher_cache_local_indices"] == [[0, 1, 2, 3, 4]]
+
+
+def test_resolve_teacher_cache_base_accepts_schema_list_tensor_and_legacy_fallback():
+    assert _resolve_teacher_cache_base([17], [17, 18]) == 17
+    assert _resolve_teacher_cache_base(torch.tensor([23]), [23, 24]) == 23
+    assert _resolve_teacher_cache_base(None, [5, 7]) == 5
+    assert _resolve_teacher_cache_base([], []) == 0
 
 
 def test_packing_exceeds_capacity(simple_data):
@@ -256,7 +297,7 @@ def test_position_ids_and_labels():
 
 
 def test_edge_cases():
-    """Empty list, single sample, oversized samples, missing input_ids."""
+    """Empty list, single sample, oversized samples (skip mode), missing input_ids."""
     packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=1)
 
     # Empty
@@ -266,20 +307,21 @@ def test_edge_cases():
     batches = packer.pack([{"input_ids": [1, 2, 3], "labels": [2, 3, 4]}], max_seq_len=100)
     assert len(batches) == 1 and batches[0]["input_ids"][0] == [1, 2]
 
-    # Oversized samples skipped, valid ones packed
+    # Oversized samples skipped (legacy behavior, now opt-in), valid ones packed
+    skip_packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=1, on_oversized="skip")
     data = [
         {"input_ids": [1, 2, 3], "labels": [2, 3, 4]},
         {"input_ids": [1] * 100, "labels": [1] * 100},
         {"input_ids": [4, 5], "labels": [5, 6]},
     ]
-    batches = packer.pack(data, max_seq_len=10)
+    batches = skip_packer.pack(data, max_seq_len=10)
     assert batches[0]["num_samples"] == 2
 
-    # All oversized -> ValueError
+    # All oversized -> ValueError (skip mode: nothing survives)
     with pytest.raises(ValueError, match="All 2 samples were skipped"):
-        packer.pack([{"input_ids": [1] * 100}, {"input_ids": [2] * 200}], max_seq_len=10)
+        skip_packer.pack([{"input_ids": [1] * 100}, {"input_ids": [2] * 200}], max_seq_len=10)
 
-    # Missing input_ids -> skipped
+    # Missing input_ids -> skipped (independent of on_oversized)
     data2 = [
         {"input_ids": [1, 2, 3], "labels": [2, 3, 4]},
         {"labels": [5, 6, 7]},
@@ -432,7 +474,16 @@ def test_batch_structure_and_invariants(simple_data):
     packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=1)
     batches = packer.pack(simple_data, max_seq_len=5)
 
-    required_keys = {"input_ids", "labels", "position_ids", "request_id", "batch_id", "num_samples", "_shifted"}
+    required_keys = {
+        "input_ids",
+        "labels",
+        "position_ids",
+        "request_id",
+        "batch_id",
+        "num_samples",
+        "_shifted",
+        "_r3_sample_lengths",
+    }
     optional_keys = {"cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"}
 
     for batch in batches:

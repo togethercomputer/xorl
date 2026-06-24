@@ -185,6 +185,146 @@ def test_opd_request_processor_to_backend_e2e(tmp_path):
     assert result["loss"] == pytest.approx(expected.item(), rel=1e-5, abs=1e-6)
 
 
+class _GlobalNormOPDBackend(DummyBackend):
+    """OPD backend that normalizes the KL loss by GLOBAL valid tokens.
+
+    This mirrors the production normalization ("by global valid tokens across all
+    ranks", per CLAUDE.md), unlike the per-row normalization in OPDCPUBackend. With
+    global normalization the loss is a function of the document multiset only, so it
+    must be invariant to how the packer groups documents into rows.
+    """
+
+    def __init__(self, student_hidden_table, student_head, teacher_hidden_caches, teacher_heads):
+        super().__init__()
+        self.student_hidden_table = student_hidden_table
+        self.student_head = student_head
+        self.teacher_hidden_caches = teacher_hidden_caches
+        self.teacher_heads = teacher_heads
+        self.row_sample_counts = None
+
+    async def forward_backward(
+        self,
+        batches,
+        loss_fn="causallm_loss",
+        loss_fn_params=None,
+        model_id=None,
+        routed_experts=None,
+        routed_expert_logits=None,
+        request_id=None,
+    ):
+        numerator = torch.tensor(0.0)
+        global_valid = 0
+        self.row_sample_counts = [b.get("num_samples") for b in batches]
+        for raw_batch in batches:
+            labels = torch.tensor(raw_batch["labels"], dtype=torch.long)
+            row_valid = int((labels != -100).sum().item())
+            if row_valid == 0:
+                continue
+            # reference_grouped_opd_loss returns (Σ token_kl) / row_valid; multiply
+            # back to recover the raw per-row numerator, then normalize globally.
+            row_mean = reference_grouped_opd_loss(
+                raw_batch,
+                self.student_hidden_table,
+                self.student_head,
+                self.teacher_hidden_caches,
+                self.teacher_heads,
+            )
+            numerator = numerator + row_mean * row_valid
+            global_valid += row_valid
+        loss = float((numerator / max(global_valid, 1)).item())
+        return {"total_loss": loss, "global_valid_tokens": global_valid, "execution_time": 0.0}
+
+
+def _opd_equivalence_request(data, teacher_files, strategy):
+    return OrchestratorRequest(
+        operation="forward_backward",
+        payload=ModelPassData(
+            data=[dict(d) for d in data],
+            loss_fn="opd_loss",
+            loss_fn_params={
+                "teacher_heads": teacher_files.heads,
+                "teacher_hidden_caches": teacher_files.hidden_caches,
+                # Disable teacher pre-sort so the packing strategy fully controls order.
+                "opd_sort_by_teacher": False,
+            },
+            model_id="opd-e2e",
+        ),
+    )
+
+
+def test_opd_loss_is_invariant_to_packing_strategy(tmp_path):
+    """Real forward-backward loss-equivalence across strategies (CPU analog of K3).
+
+    Reordering documents into different rows must not change the globally-normalized
+    OPD loss — only the float reduction order, which is far below any meaningful
+    tolerance. This exercises the actual packing path + OPD loss, not just metadata.
+    """
+    torch.manual_seed(7)
+    vocab_size, hidden_size, cache_size = 19, 6, 40
+    student_hidden_table = torch.randn(vocab_size, hidden_size) / hidden_size**0.5
+    student_head = torch.randn(vocab_size, hidden_size) / hidden_size**0.5
+    teacher_heads = {
+        "0": torch.randn(vocab_size, hidden_size) / hidden_size**0.5,
+        "1": torch.randn(vocab_size, hidden_size) / hidden_size**0.5,
+    }
+    teacher_hidden_caches = {
+        "0": torch.randn(cache_size, hidden_size) / hidden_size**0.5,
+        "1": torch.randn(cache_size, hidden_size) / hidden_size**0.5,
+    }
+    teacher_files = make_teacher_files(tmp_path, teacher_heads, teacher_hidden_caches)
+
+    # 12 varied-length samples across two teachers; lengths chosen so the three
+    # strategies produce genuinely different row groupings at pack_len=12, dp_size=4.
+    rng = torch.Generator().manual_seed(11)
+    data = []
+    cache_cursor = {"0": 0, "1": 0}
+    for i in range(12):
+        length = int(torch.randint(2, 8, (1,), generator=rng).item())
+        teacher = str(i % 2)
+        start = cache_cursor[teacher]
+        cache_cursor[teacher] = start + length
+        data.append(
+            {
+                "input_ids": [int(torch.randint(0, vocab_size, (1,), generator=rng).item()) for _ in range(length)],
+                "target_tokens": [int(torch.randint(0, vocab_size, (1,), generator=rng).item()) for _ in range(length)],
+                "teacher_id": int(teacher),
+                "teacher_weight": 1.0,
+                "teacher_cache_indices": list(range(start, start + length)),
+            }
+        )
+
+    results = {}
+    layouts = {}
+    for strategy in ("sequential", "best_fit", "balanced_dp"):
+        backend = _GlobalNormOPDBackend(student_hidden_table, student_head, teacher_hidden_caches, teacher_heads)
+        processor = RequestProcessor(
+            backend=backend,
+            sample_packing_sequence_len=12,
+            enable_packing=True,
+            pad_to_multiple_of=1,
+            cp_size=1,
+            packing_strategy=strategy,
+            on_oversized="error",
+            dp_size=4,
+        )
+        output = asyncio.run(
+            processor.execute_forward_backward(_opd_equivalence_request(data, teacher_files, strategy))
+        )
+        result = output.outputs[0]
+        assert result["success"] is True
+        results[strategy] = (result["loss"], result["valid_tokens"])
+        layouts[strategy] = backend.row_sample_counts
+
+    # The strategies must genuinely differ in layout (otherwise the test is vacuous).
+    assert layouts["sequential"] != layouts["balanced_dp"] or layouts["sequential"] != layouts["best_fit"]
+
+    # Same total valid tokens, and the globally-normalized loss matches to float tol.
+    seq_loss, seq_valid = results["sequential"]
+    for strategy, (loss, valid) in results.items():
+        assert valid == seq_valid, f"{strategy} valid_tokens {valid} != {seq_valid}"
+        assert loss == pytest.approx(seq_loss, rel=1e-6, abs=1e-7), f"{strategy} loss {loss} != {seq_loss}"
+
+
 class TeacherCacheCPUBackend(DummyBackend):
     async def forward(
         self,

@@ -13,6 +13,7 @@ from .moe.triton_lora import (
     TritonMoeExpertsLoRAFunction,
     triton_moe_lora_forward,
 )
+from .ssm import Mamba2Mixer, ssd_chunked
 
 
 __all__ = [
@@ -27,4 +28,6 @@ __all__ = [
     "GatedDeltaNet",
     "chunk_gated_delta_rule",
     "fused_recurrent_gated_delta_rule",
+    "Mamba2Mixer",
+    "ssd_chunked",
 ]

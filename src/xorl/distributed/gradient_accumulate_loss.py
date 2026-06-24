@@ -26,6 +26,7 @@ class GradientAccumulateLoss(torch.autograd.Function):
         loss: torch.Tensor,
         local_valid_tokens: torch.Tensor,
         global_valid_tokens: torch.Tensor,
+        group: Optional[dist.ProcessGroup] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Handle edge case where no valid tokens exist on this rank.
         # Use zeros_like (not loss * 0.0, since NaN * 0.0 = NaN in IEEE 754).
@@ -36,7 +37,7 @@ class GradientAccumulateLoss(torch.autograd.Function):
         loss_sum = loss * local_valid_tokens
 
         # Sum across all ranks (synchronous all-reduce)
-        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM, group=group)
 
         # Save tensors for backward
         ctx.save_for_backward(local_valid_tokens, global_valid_tokens)
@@ -49,7 +50,7 @@ class GradientAccumulateLoss(torch.autograd.Function):
         ctx: torch.autograd.Function,
         grad_output: torch.Tensor,
         grad_loss_sum: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, None, None]:
+    ) -> Tuple[torch.Tensor, None, None, None]:
         local_valid_tokens, global_valid_tokens = ctx.saved_tensors
 
         # Gradient from first output (normalized loss)
@@ -60,13 +61,14 @@ class GradientAccumulateLoss(torch.autograd.Function):
             grad_loss_sum * local_valid_tokens if grad_loss_sum is not None else torch.zeros_like(grad_output)
         )
 
-        return grad_from_normalized + grad_from_sum, None, None
+        return grad_from_normalized + grad_from_sum, None, None, None
 
 
 def gradient_accumulate_loss(
     loss: torch.Tensor,
     local_valid_tokens: torch.Tensor,
     global_valid_tokens: torch.Tensor,
+    group: Optional[dist.ProcessGroup] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """User-facing helper function to apply GradientAccumulateLoss."""
-    return GradientAccumulateLoss.apply(loss, local_valid_tokens, global_valid_tokens)
+    return GradientAccumulateLoss.apply(loss, local_valid_tokens, global_valid_tokens, group)

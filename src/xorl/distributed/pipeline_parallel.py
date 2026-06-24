@@ -262,6 +262,12 @@ def _pp_forward(self, x):
     hidden_states = outputs.last_hidden_state
 
     if self._pp_is_last:
+        # When the loss fn applies lm_head (fused quack_linear CE), return HIDDEN
+        # so the last stage never materializes the full [mbs, seq, 248k] logits
+        # (which OOMs). Otherwise project to logits here for the logit-based
+        # (compiled/eager) PP loss fns.
+        if getattr(self, "_pp_lm_head_in_loss", False):
+            return hidden_states
         logits = self.lm_head(hidden_states)
         return logits
     else:
@@ -401,14 +407,31 @@ def build_pp_stage(
     num_stages: int,
     device: torch.device,
     pp_group,
+    input_args=None,
+    output_args=None,
 ) -> PipelineStage:
     """Build a PipelineStage from an existing model chunk (no deepcopy).
 
     Used to cheaply create a new stage when the sequence length changes
     (pp_variable_seq_lengths=True), since PipelineStage allocates P2P
     buffers based on the first input shape it sees.
+
+    When ``input_args`` AND ``output_args`` (example/meta tensors) are both
+    provided, PipelineStage SKIPS its init-time ``_shape_inference`` forward.
+    This is required for sequence-parallel (Ulysses) models: the shape-inference
+    dummy forward would otherwise run the intra-stage CP collectives, which
+    deadlock against the cross-stage shape-exchange P2P. Output shapes are
+    derivable from (mbs, seq_len, hidden/vocab), so the forward is unnecessary.
     """
-    return PipelineStage(model_part, pp_rank, num_stages, device, group=pp_group)
+    return PipelineStage(
+        model_part,
+        pp_rank,
+        num_stages,
+        device,
+        input_args=input_args,
+        output_args=output_args,
+        group=pp_group,
+    )
 
 
 _SUPPORTED_PP_SCHEDULES = {"gpipe", "1f1b"}

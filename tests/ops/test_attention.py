@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from xorl.models.layers.attention.backend import ATTENTION_FUNCTIONS, is_flash_attention
 from xorl.models.layers.attention.backend.eager import eager_attention_forward
 from xorl.models.layers.attention.utils import repeat_kv
 
@@ -19,6 +20,13 @@ except ImportError as exc:
 
 
 pytestmark = pytest.mark.cpu
+
+
+class TestAttentionBackendRegistry:
+    def test_flash_attention_2_registry_and_mask_detection_are_consistent(self):
+        assert is_flash_attention("flash_attention_2") == ("flash_attention_2" in ATTENTION_FUNCTIONS)
+        if "flash_attention_2" in ATTENTION_FUNCTIONS:
+            assert ATTENTION_FUNCTIONS["flash_attention_2"] is ATTENTION_FUNCTIONS["flash_attention_3"]
 
 
 class TestRepeatKV:

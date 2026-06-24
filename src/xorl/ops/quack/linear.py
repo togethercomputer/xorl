@@ -5,9 +5,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch.amp import custom_bwd, custom_fwd
 
-from .gemm_interface import gemm, gemm_act, gemm_add_inplace, gemm_dact, gemm_dgated, gemm_gated
+
+from .gemm_interface import gemm, gemm_add_inplace, gemm_act, gemm_dact
+from .gemm_interface import gemm_gated, gemm_dgated
+from .gemm_interface import act_to_pytorch_fn_map, gated_to_pytorch_fn_map
+
+
+def _ensure_contiguous(t):
+    """Ensure last-dim stride is 1. Under torch.compile use unconditional .contiguous()
+    (dynamo can't inspect strides on fake tensors); otherwise check first to avoid copies.
+    """
+    if torch.compiler.is_compiling():
+        return t.contiguous()
+    return t if t.stride(-1) == 1 else t.contiguous()
 
 
 def linear_fwd_convert_type(*tensors):
@@ -37,7 +48,7 @@ def linear_bwd_compute_input_grad(ctx, dout, weight, matmul_fn):
 def linear_bwd_compute_weight_grad(ctx, dout, x, weight_og, matmul_fn, matmul_inplace_fn):
     if ctx.needs_input_grad[1]:
         assert x is not None
-        x = x.reshape(-1, x.shape[-1])
+        x = x.flatten(0, -2)
         # fuse_grad_accum is not compatible with torch.compile
         if not ctx.fuse_grad_accum or weight_og.grad is None or torch.compiler.is_compiling():
             dweight = matmul_fn(dout.T, x, out_dtype=ctx.weight_dtype)
@@ -51,71 +62,148 @@ def linear_bwd_compute_weight_grad(ctx, dout, x, weight_og, matmul_fn, matmul_in
     return dweight
 
 
-class LinearFunc(torch.autograd.Function):
+def _recompute_act_postact(preact, activation):
+    """Recompute postact from preact using the activation function (no GEMM)."""
+    return act_to_pytorch_fn_map[activation](preact)
+
+
+def _recompute_gated_postact(preact, activation):
+    """Recompute gated postact from interleaved preact (no GEMM)."""
+    return gated_to_pytorch_fn_map[activation](preact[..., ::2], preact[..., 1::2])
+
+
+# --- Ops bundles: matmul function configurations ---
+# Each ops class is a namespace holding the matmul functions for a specific variant
+# (tuned/untuned, act/gated, etc.). Passed as a non-tensor arg to apply() and stored on ctx.
+
+
+class _LinearOps:
     matmul_fwd_fn = gemm
     matmul_bwd_dx = partial(gemm, dynamic_scheduler=True)
     matmul_bwd_dw = partial(gemm, dynamic_scheduler=True)
     matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True)
 
-    # Use classmethod instead of staticmethod to allow inheritance
-    @classmethod
-    @custom_fwd(device_type="cuda")
-    def forward(cls, ctx, x, weight, bias=None, fuse_grad_accum=False):
+
+class _LinearUntunedOps(_LinearOps):
+    matmul_fwd_fn = partial(gemm, tuned=False)
+    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False)
+    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
+    matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True, tuned=False)
+
+
+class _LinearActOps(_LinearOps):
+    matmul_fwd_fn = gemm_act
+
+
+class _LinearActUntunedOps(_LinearUntunedOps):
+    matmul_fwd_fn = partial(gemm_act, tuned=False)
+
+
+class _LinearGatedOps(_LinearOps):
+    matmul_fwd_fn = gemm_gated
+
+
+class _LinearGatedUntunedOps:
+    matmul_fwd_fn = partial(gemm_gated, tuned=False)
+    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False)
+    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
+    matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True, tuned=False)
+
+
+class _LinearGatedConcatOps(_LinearGatedOps):
+    matmul_fwd_fn = partial(gemm_gated, concat_layout=("B", "bias"))
+    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, concat_layout=("B",))
+    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, concat_layout=("out",))
+    matmul_bwd_dw_inplace = partial(
+        gemm_add_inplace, dynamic_scheduler=True, concat_layout=("C", "out")
+    )
+
+
+class _LinearGatedConcatUntunedOps(_LinearGatedUntunedOps):
+    matmul_fwd_fn = partial(gemm_gated, tuned=False, concat_layout=("B", "bias"))
+    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False, concat_layout=("B",))
+    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False, concat_layout=("out",))
+    matmul_bwd_dw_inplace = partial(
+        gemm_add_inplace, dynamic_scheduler=True, tuned=False, concat_layout=("C", "out")
+    )
+
+
+class _DActLinearOps(_LinearOps):
+    matmul_bwd_dx = partial(gemm_dact, dynamic_scheduler=True)
+    recompute_postact = staticmethod(_recompute_act_postact)
+
+
+class _DActLinearUntunedOps(_LinearUntunedOps):
+    matmul_bwd_dx = partial(gemm_dact, dynamic_scheduler=True, tuned=False)
+    recompute_postact = staticmethod(_recompute_act_postact)
+
+
+class _DGatedLinearOps(_LinearOps):
+    matmul_bwd_dx = partial(gemm_dgated, dynamic_scheduler=True)
+    recompute_postact = staticmethod(_recompute_gated_postact)
+
+
+class _DGatedLinearUntunedOps(_LinearUntunedOps):
+    matmul_bwd_dx = partial(gemm_dgated, dynamic_scheduler=True, tuned=False)
+    recompute_postact = staticmethod(_recompute_gated_postact)
+
+
+# --- Autograd Functions (all @staticmethod, torch.compile-compatible) ---
+
+
+class LinearFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, bias, fuse_grad_accum, ops):
         """
         x: (..., in_features)
         weight: (out_features, in_features)
         bias: (out_features,) or None
         out: (..., out_features)
         """
-        ctx.weight_dtype = weight.dtype
-        ctx.fuse_grad_accum = fuse_grad_accum
-        weight_og = weight
+        # Convert types while autocast is still enabled, then disable it for the body.
         x, weight = linear_fwd_convert_type(x, weight)
-        batch_shape = x.shape[:-1]
-        x = x.reshape(-1, x.shape[-1])
-        # out = F.linear(x, weight)
-        out = cls.matmul_fwd_fn(x, weight.T, bias=bias)
-        linear_fwd_postprocess(ctx, x, weight, weight_og, needs_x_w_grad=ctx.needs_input_grad[:2])
-        ctx.bias_dtype = bias.dtype if bias is not None else None
-        return out.reshape(*batch_shape, out.shape[-1])
+        with torch.amp.autocast("cuda", enabled=False):
+            ctx.weight_dtype = weight.dtype
+            ctx.fuse_grad_accum = fuse_grad_accum
+            ctx.ops = ops
+            weight_og = weight
+            batch_shape = x.shape[:-1]
+            x = x.flatten(0, -2)
+            out = ops.matmul_fwd_fn(x, weight.T, bias=bias)
+            linear_fwd_postprocess(
+                ctx, x, weight, weight_og, needs_x_w_grad=ctx.needs_input_grad[:2]
+            )
+            ctx.bias_dtype = bias.dtype if bias is not None else None
+            ctx.compute_dbias = bias is not None and ctx.needs_input_grad[2]
+            return out.reshape(*batch_shape, out.shape[-1])
 
-    @classmethod
-    @custom_bwd(device_type="cuda")
-    def backward(cls, ctx, dout, *args):
+    @staticmethod
+    def backward(ctx, dout):
         """
         dout: (..., out_features)
         """
-        x, weight, weight_og = ctx.saved_tensors  # weight_og is None if not ctx.fuse_grad_accum
-        batch_shape = dout.shape[:-1]
-        dout = dout.reshape(-1, dout.shape[-1])
-        dbias = dout.sum(0, dtype=ctx.bias_dtype) if ctx.bias_dtype is not None and ctx.needs_input_grad[2] else None
-        dx = linear_bwd_compute_input_grad(ctx, dout, weight, cls.matmul_bwd_dx)
-        dx = dx.reshape(*batch_shape, dx.shape[-1]) if dx is not None else None
-        dweight = linear_bwd_compute_weight_grad(ctx, dout, x, weight_og, cls.matmul_bwd_dw, cls.matmul_bwd_dw_inplace)
-        # return extra Nones for other classes that inherit from LinearFunc
-        return dx, dweight, dbias, *([None] * 10)
-
-
-class LinearUntunedFunc(LinearFunc):
-    # Passing in tuned=False to disable tuning at runtime
-    matmul_fwd_fn = partial(gemm, tuned=False)
-    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False)
-    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
-    matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True)
+        with torch.amp.autocast("cuda", enabled=False):
+            ops = ctx.ops
+            x, weight, weight_og = ctx.saved_tensors  # weight_og is None if not ctx.fuse_grad_accum
+            batch_shape = dout.shape[:-1]
+            dout = _ensure_contiguous(dout.flatten(0, -2))
+            dbias = dout.sum(0, dtype=ctx.bias_dtype) if ctx.compute_dbias else None
+            dx = linear_bwd_compute_input_grad(ctx, dout, weight, ops.matmul_bwd_dx)
+            dx = dx.reshape(*batch_shape, dx.shape[-1]) if dx is not None else None
+            dweight = linear_bwd_compute_weight_grad(
+                ctx, dout, x, weight_og, ops.matmul_bwd_dw, ops.matmul_bwd_dw_inplace
+            )
+            return dx, dweight, dbias, None, None
 
 
 def linear_func(x, weight, bias=None, fuse_grad_accum=False, tuned=True):
-    fn_cls = LinearFunc if tuned else LinearUntunedFunc
-    return fn_cls.apply(x, weight, bias, fuse_grad_accum)
+    ops = _LinearOps if tuned else _LinearUntunedOps
+    return LinearFunc.apply(x, weight, bias, fuse_grad_accum, ops)
 
 
-class LinearActFunc(LinearFunc):
-    matmul_fwd_fn = gemm_act
-
-    # Use classmethod instead of staticmethod to allow inheritance
-    @classmethod
-    @custom_fwd(device_type="cuda")
-    def forward(cls, ctx, x, weight, activation, bias=None, store_preact=True, fuse_grad_accum=False):
+class LinearActFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, activation, bias, store_preact, fuse_grad_accum, ops):
         """
         x: (..., in_features)
         weight: (out_features, in_features)
@@ -123,126 +211,142 @@ class LinearActFunc(LinearFunc):
         out: (..., out_features)
         Return both out and post-activation, but only out is differentiable.
         """
-        ctx.weight_dtype = weight.dtype
-        ctx.fuse_grad_accum = fuse_grad_accum
-        weight_og = weight
         x, weight = linear_fwd_convert_type(x, weight)
-        batch_shape = x.shape[:-1]
-        x = x.reshape(-1, x.shape[-1])
-        out, postact = cls.matmul_fwd_fn(x, weight.T, bias=bias, activation=activation, store_preact=store_preact)
-        linear_fwd_postprocess(ctx, x, weight, weight_og, needs_x_w_grad=ctx.needs_input_grad[:2])
-        if out is not None:
-            out = out.reshape(*batch_shape, out.shape[-1])
-        ctx.bias_dtype = bias.dtype if bias is not None else None
-        ctx.mark_non_differentiable(postact)
-        ctx.set_materialize_grads(False)  # We don't want to materialize grads for postact
-        return out, postact.reshape(*batch_shape, postact.shape[-1])
+        with torch.amp.autocast("cuda", enabled=False):
+            ctx.weight_dtype = weight.dtype
+            ctx.fuse_grad_accum = fuse_grad_accum
+            ctx.ops = ops
+            weight_og = weight
+            batch_shape = x.shape[:-1]
+            x = x.flatten(0, -2)
+            out, postact = ops.matmul_fwd_fn(
+                x, weight.T, bias=bias, activation=activation, store_preact=store_preact
+            )
+            linear_fwd_postprocess(
+                ctx, x, weight, weight_og, needs_x_w_grad=ctx.needs_input_grad[:2]
+            )
+            if out is not None:
+                out = out.reshape(*batch_shape, out.shape[-1])
+            ctx.bias_dtype = bias.dtype if bias is not None else None
+            ctx.compute_dbias = bias is not None and ctx.needs_input_grad[3]
+            ctx.mark_non_differentiable(postact)
+            ctx.set_materialize_grads(False)  # We don't want to materialize grads for postact
+            return out, postact.reshape(*batch_shape, postact.shape[-1])
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        with torch.amp.autocast("cuda", enabled=False):
+            ops = ctx.ops
+            x, weight, weight_og = ctx.saved_tensors
+            batch_shape = dout.shape[:-1]
+            dout = _ensure_contiguous(dout.flatten(0, -2))
+            dbias = dout.sum(0, dtype=ctx.bias_dtype) if ctx.compute_dbias else None
+            dx = linear_bwd_compute_input_grad(ctx, dout, weight, ops.matmul_bwd_dx)
+            dx = dx.reshape(*batch_shape, dx.shape[-1]) if dx is not None else None
+            dweight = linear_bwd_compute_weight_grad(
+                ctx, dout, x, weight_og, ops.matmul_bwd_dw, ops.matmul_bwd_dw_inplace
+            )
+            return dx, dweight, None, dbias, None, None, None
 
 
-class LinearActUntunedFunc(LinearActFunc):
-    # Passing in tuned=False to disable tuning at runtime
-    matmul_fwd_fn = partial(gemm_act, tuned=False)
-    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False)
-    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
-    matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True)
+def linear_act_func(
+    x, weight, activation, bias=None, store_preact=True, fuse_grad_accum=False, tuned=True
+):
+    ops = _LinearActOps if tuned else _LinearActUntunedOps
+    return LinearActFunc.apply(x, weight, activation, bias, store_preact, fuse_grad_accum, ops)
 
 
-def linear_act_func(x, weight, activation, bias=None, store_preact=True, fuse_grad_accum=False, tuned=True):
-    fn_cls = LinearActFunc if tuned else LinearActUntunedFunc
-    return fn_cls.apply(x, weight, activation, bias, store_preact, fuse_grad_accum)
+def linear_gated_func(
+    x,
+    weight,
+    activation,
+    bias=None,
+    store_preact=True,
+    fuse_grad_accum=False,
+    tuned=True,
+    concat_layout=False,
+):
+    if concat_layout:
+        ops = _LinearGatedConcatOps if tuned else _LinearGatedConcatUntunedOps
+    else:
+        ops = _LinearGatedOps if tuned else _LinearGatedUntunedOps
+    return LinearActFunc.apply(x, weight, activation, bias, store_preact, fuse_grad_accum, ops)
 
 
-class DActLinearFunc(LinearFunc):
-    matmul_bwd_dx = partial(gemm_dact, dynamic_scheduler=True)
-
-    # Use classmethod instead of staticmethod to allow inheritance
-    @classmethod
-    @custom_fwd(device_type="cuda")
-    def forward(cls, ctx, preact, weight, x, activation, fuse_grad_accum=False):
+class DActLinearFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, preact, weight, x, activation, bias, fuse_grad_accum, ops):
         """
         x: (..., in_features)
         weight: (out_features, in_features)
+        bias: (out_features,) or None
         out: (..., out_features)
         Takes in an extra preact argument which is the pre-activation, to be used in the backward pass.
         """
-        ctx.weight_dtype = weight.dtype
-        ctx.fuse_grad_accum = fuse_grad_accum
-        weight_og = weight
         x, weight = linear_fwd_convert_type(x, weight)
-        batch_shape = x.shape[:-1]
-        x = x.reshape(-1, x.shape[-1])
-        out = cls.matmul_fwd_fn(x, weight.T)
-        # Store preact instead of x, we will recompute x in the backward pass
-        linear_fwd_postprocess(ctx, preact, weight, weight_og, needs_x_w_grad=ctx.needs_input_grad[:2])
-        ctx.activation = activation
-        return out.reshape(*batch_shape, out.shape[-1])
+        with torch.amp.autocast("cuda", enabled=False):
+            ctx.weight_dtype = weight.dtype
+            ctx.fuse_grad_accum = fuse_grad_accum
+            ctx.ops = ops
+            weight_og = weight
+            batch_shape = x.shape[:-1]
+            x = x.flatten(0, -2)
+            out = ops.matmul_fwd_fn(x, weight.T, bias=bias)
+            # Store preact instead of x, we will recompute x (postact) in backward.
+            # dpreact needs gemm_dact(dout, weight, preact) → needs both weight and preact.
+            # dweight needs postact: if dpreact is also needed, postact comes from gemm_dact;
+            # otherwise we can recompute postact = act(preact) cheaply without weight.
+            need_preact = ctx.needs_input_grad[0] or ctx.needs_input_grad[1]
+            need_weight = ctx.needs_input_grad[0]  # only gemm_dact needs weight
+            linear_fwd_postprocess(
+                ctx, preact, weight, weight_og, needs_x_w_grad=(need_weight, need_preact)
+            )
+            ctx.activation = activation
+            ctx.bias_dtype = bias.dtype if bias is not None else None
+            ctx.compute_dbias = bias is not None and ctx.needs_input_grad[4]
+            return out.reshape(*batch_shape, out.shape[-1])
 
-    @classmethod
-    @custom_bwd(device_type="cuda")
-    def backward(cls, ctx, dout):
+    @staticmethod
+    def backward(ctx, dout):
         """
         dout: (..., out_features)
         """
-        # weight_og is None if not ctx.fuse_grad_accum
-        preact, weight, weight_og = ctx.saved_tensors
-        batch_shape = dout.shape[:-1]
-        dout = dout.reshape(-1, dout.shape[-1])
-        preact = preact.reshape(-1, preact.shape[-1])
-        if ctx.needs_input_grad[0]:
-            assert weight is not None
-            dpreact, x = cls.matmul_bwd_dx(dout, weight, preact, activation=ctx.activation)
-        else:
-            dpreact, x = None, None
-        dpreact = dpreact.reshape(*batch_shape, dpreact.shape[-1]) if dpreact is not None else None
-        dweight = linear_bwd_compute_weight_grad(ctx, dout, x, weight_og, cls.matmul_bwd_dw, cls.matmul_bwd_dw_inplace)
-        return dpreact, dweight, *([None] * 3)
+        with torch.amp.autocast("cuda", enabled=False):
+            ops = ctx.ops
+            # weight_og is None if not ctx.fuse_grad_accum
+            preact, weight, weight_og = ctx.saved_tensors
+            batch_shape = dout.shape[:-1]
+            dout = _ensure_contiguous(dout.flatten(0, -2))
+            dbias = dout.sum(0, dtype=ctx.bias_dtype) if ctx.compute_dbias else None
+            if ctx.needs_input_grad[0]:
+                # Need dpreact: gemm_dact(dout, weight, preact) → (dpreact, postact)
+                preact = preact.flatten(0, -2)
+                assert weight is not None
+                dpreact, x = ops.matmul_bwd_dx(dout, weight, preact, activation=ctx.activation)
+            elif ctx.needs_input_grad[1]:
+                # Only need dweight: recompute postact from preact cheaply (no GEMM needed)
+                preact = preact.flatten(0, -2)
+                x = ops.recompute_postact(preact, ctx.activation)
+                dpreact = None
+            else:
+                dpreact, x = None, None
+            dpreact = (
+                dpreact.reshape(*batch_shape, dpreact.shape[-1]) if dpreact is not None else None
+            )
+            dweight = linear_bwd_compute_weight_grad(
+                ctx, dout, x, weight_og, ops.matmul_bwd_dw, ops.matmul_bwd_dw_inplace
+            )
+            return dpreact, dweight, None, None, dbias, None, None
 
 
-class DActLinearUntunedFunc(DActLinearFunc):
-    # Passing in tuned=False to disable tuning at runtime
-    matmul_fwd_fn = partial(gemm, tuned=False)
-    matmul_bwd_dx = partial(gemm_dact, dynamic_scheduler=True, tuned=False)
-    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
-    matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True)
+def act_linear_func(preact, weight, x, activation, bias=None, fuse_grad_accum=False, tuned=True):
+    ops = _DActLinearOps if tuned else _DActLinearUntunedOps
+    return DActLinearFunc.apply(preact, weight, x, activation, bias, fuse_grad_accum, ops)
 
 
-def act_linear_func(preact, weight, x, activation, fuse_grad_accum=False, tuned=True):
-    fn_cls = DActLinearFunc if tuned else DActLinearUntunedFunc
-    return fn_cls.apply(preact, weight, x, activation, fuse_grad_accum)
-
-
-class LinearGatedFunc(LinearActFunc):
-    matmul_fwd_fn = gemm_gated
-
-
-class LinearGatedUntunedFunc(LinearActFunc):
-    # Passing in tuned=False to disable tuning at runtime
-    matmul_fwd_fn = partial(gemm_gated, tuned=False)
-    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False)
-    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
-    matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True, tuned=False)
-
-
-def linear_gated_func(x, weight, activation, bias=None, store_preact=True, fuse_grad_accum=False, tuned=True):
-    fn_cls = LinearGatedFunc if tuned else LinearGatedUntunedFunc
-    return fn_cls.apply(x, weight, activation, bias, store_preact, fuse_grad_accum)
-
-
-class DGatedLinearFunc(DActLinearFunc):
-    matmul_bwd_dx = partial(gemm_dgated, dynamic_scheduler=True)
-
-
-class DGatedLinearUntunedFunc(DActLinearFunc):
-    # Passing in tuned=False to disable tuning at runtime
-    matmul_fwd_fn = partial(gemm, tuned=False)
-    matmul_bwd_dx = partial(gemm_dgated, dynamic_scheduler=True, tuned=False)
-    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
-    matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True, tuned=False)
-
-
-def gated_linear_func(preact, weight, x, activation, fuse_grad_accum=False, tuned=True):
-    fn_cls = DGatedLinearFunc if tuned else DGatedLinearUntunedFunc
-    return fn_cls.apply(preact, weight, x, activation, fuse_grad_accum)
+def gated_linear_func(preact, weight, x, activation, bias=None, fuse_grad_accum=False, tuned=True):
+    ops = _DGatedLinearOps if tuned else _DGatedLinearUntunedOps
+    return DActLinearFunc.apply(preact, weight, x, activation, bias, fuse_grad_accum, ops)
 
 
 class Linear(nn.Linear):

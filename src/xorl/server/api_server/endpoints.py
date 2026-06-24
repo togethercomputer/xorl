@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -82,6 +83,22 @@ def _first_output_result(output: Any) -> Dict[str, Any]:
     return output.outputs or {}
 
 
+def _canon_base_model(model: Optional[str]) -> Optional[str]:
+    """Canonicalize a base-model reference for identity comparison.
+
+    An HF cache path (".../models--ORG--NAME/snapshots/HASH") and the bare repo
+    id ("ORG/NAME") name the same base model. Normalize so the LoRA create_model
+    handshake doesn't reject HF-name (client) vs resolved-path (server) —
+    full-weight runs never hit this (they use the default session).
+    """
+    if not model:
+        return model
+    match = re.search(r"models--([^/]+?)--(.+?)/snapshots/", model)
+    if match:
+        return f"{match.group(1)}/{match.group(2)}"
+    return model
+
+
 async def _register_runtime_session(
     server,
     *,
@@ -91,7 +108,7 @@ async def _register_runtime_session(
     raw_optimizer_config: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """Normalize and register a session runtime spec with workers and API state."""
-    if server.base_model is not None and base_model != server.base_model:
+    if server.base_model is not None and _canon_base_model(base_model) != _canon_base_model(server.base_model):
         raise ValueError(
             f"create_model base_model must match the server base model. "
             f"requested={base_model!r}, server={server.base_model!r}"

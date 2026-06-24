@@ -129,7 +129,21 @@ def tokens_post_all2all(
     local_input_permutation_mapping: torch.Tensor,
     org_hidden_states_shape: torch.Size,
     ep_group: Optional[dist.ProcessGroup] = None,
+    hidden_chunk_size: int = 0,
 ) -> torch.Tensor:
+    if hidden_chunk_size and hidden_chunk_size < expert_outputs.size(1):
+        return _tokens_post_all2all_hidden_chunked(
+            expert_outputs=expert_outputs,
+            num_experts=num_experts,
+            input_splits=input_splits,
+            output_splits=output_splits,
+            num_global_tokens_per_local_expert=num_global_tokens_per_local_expert,
+            local_input_permutation_mapping=local_input_permutation_mapping,
+            org_hidden_states_shape=org_hidden_states_shape,
+            ep_group=ep_group,
+            hidden_chunk_size=hidden_chunk_size,
+        )
+
     # group tokens together by expert
     expert_outputs = sort_chunks_by_idxs(
         expert_outputs,
@@ -146,6 +160,55 @@ def tokens_post_all2all(
     )
 
     return unpermute_outputs
+
+
+def _tokens_post_all2all_hidden_chunked(
+    expert_outputs: torch.Tensor,
+    num_experts: int,
+    input_splits: torch.Tensor,
+    output_splits: torch.Tensor,
+    num_global_tokens_per_local_expert: torch.Tensor,
+    local_input_permutation_mapping: torch.Tensor,
+    org_hidden_states_shape: torch.Size,
+    ep_group: Optional[dist.ProcessGroup],
+    hidden_chunk_size: int,
+) -> torch.Tensor:
+    """All-to-all combine with hidden-dimension chunks.
+
+    Long-context EP can make the full combine tensor large enough to OOM after
+    expert GEMM. Chunking keeps the all-to-all output and fp32 scatter-add
+    accumulation bounded by ``hidden_chunk_size`` while returning the same
+    output tensor as the unchunked path.
+    """
+    output = expert_outputs.new_empty(org_hidden_states_shape)
+    split_sizes = num_global_tokens_per_local_expert.T.ravel()
+    sorted_idxs = _expert_chunk_unpermute_order(num_experts, ep_group.size())
+
+    for start in range(0, expert_outputs.size(1), hidden_chunk_size):
+        end = min(start + hidden_chunk_size, expert_outputs.size(1))
+        expert_chunk = sort_chunks_by_idxs(expert_outputs[:, start:end], split_sizes, sorted_idxs)
+        unpermute_chunk = all_to_all(ep_group, expert_chunk, input_splits, output_splits)
+        del expert_chunk
+
+        mapping = local_input_permutation_mapping.unsqueeze(1).expand(-1, end - start)
+        chunk_fp32 = torch.zeros(
+            (*org_hidden_states_shape[:-1], end - start),
+            device=expert_outputs.device,
+            dtype=torch.float32,
+        )
+        row_chunk_size = 4096
+        for row_start in range(0, unpermute_chunk.shape[0], row_chunk_size):
+            row_end = min(row_start + row_chunk_size, unpermute_chunk.shape[0])
+            chunk_fp32.scatter_add_(
+                0,
+                mapping[row_start:row_end],
+                unpermute_chunk[row_start:row_end].float(),
+            )
+        del unpermute_chunk
+        output[:, start:end].copy_(chunk_fp32.to(output.dtype))
+        del chunk_fp32
+
+    return output
 
 
 # =============================================================================
@@ -246,6 +309,7 @@ def alltoall_post_combine(
     expert_output: torch.Tensor,
     ctx: AllToAllDispatchContext,
     ep_group: dist.ProcessGroup,
+    hidden_chunk_size: int = 0,
 ) -> torch.Tensor:
     """Combine expert outputs back to original ranks.
 
@@ -270,4 +334,5 @@ def alltoall_post_combine(
         local_input_permutation_mapping=ctx.perm_mapping,
         org_hidden_states_shape=ctx.orig_shape,
         ep_group=ep_group,
+        hidden_chunk_size=hidden_chunk_size,
     )

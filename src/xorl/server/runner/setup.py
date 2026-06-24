@@ -22,7 +22,7 @@ from xorl.server.runner.model_runner import ModelRunner
 from xorl.server.runner.runner_dispatcher import RunnerDispatcher
 from xorl.server.server_arguments import ServerArguments, parse_server_args
 from xorl.utils.compile_cache import configure_rank_local_compile_caches
-from xorl.utils.device import get_nccl_backend
+from xorl.utils.device import get_nccl_backend, get_process_group_timeout
 
 
 logger = logging.getLogger(__name__)
@@ -76,7 +76,15 @@ def setup_distributed():
     # Initialize process group
     if world_size > 1:
         backend = get_nccl_backend()
-        dist.init_process_group(backend=backend)
+        # Use a generous, configurable timeout (vs torch's 600s NCCL default): the
+        # head's engine starts several minutes after the workers (config-write +
+        # API/orchestrator setup), then must load the model before the first
+        # collective. With the 600s default, workers time out on store->get('0')
+        # waiting for rank 0 (DistBackendError) before rank 0 reaches NCCL init.
+        # 2026-06-07: caused repeated 4-node hangs. Shared default (60 min) with the
+        # trainer; override via XORL_PROCESS_GROUP_TIMEOUT_MINUTES.
+        pg_timeout = get_process_group_timeout()
+        dist.init_process_group(backend=backend, timeout=pg_timeout)
         logger.info(f"Initialized process group: rank={rank}, world_size={world_size}, local_rank={local_rank}")
 
         # Create a separate Gloo process group for CPU-based communication.

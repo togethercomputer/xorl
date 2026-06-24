@@ -166,10 +166,18 @@ class ToTensorCollator(DataCollator):
             PyTorch dtype
         """
         # These fields should be long (int64) for model compatibility
-        if key in ["input_ids", "labels", "attention_mask", "position_ids", "teacher_ids", "teacher_cache_indices"]:
+        if key in [
+            "input_ids",
+            "labels",
+            "attention_mask",
+            "position_ids",
+            "teacher_ids",
+            "teacher_cache_indices",
+            "teacher_cache_local_indices",
+        ]:
             return torch.long
 
-        if key in ["teacher_weights"]:
+        if key in ["teacher_weights", "hidden_match_weights"]:
             return torch.float
 
         # Let PyTorch infer for other fields

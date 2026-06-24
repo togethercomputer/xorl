@@ -130,6 +130,7 @@ def drgrpo_loss_function(
     lm_head_fp32: bool = False,
     loss_reducer: Reducer | None = None,
     metric_reducer: Reducer | None = None,
+    lm_head: torch.nn.Module | None = None,
 ) -> LossOutput:
     """DR-GRPO loss for RL training.
 
@@ -180,6 +181,7 @@ def drgrpo_loss_function(
         num_chunks,
         tp_group=tp_group,
         lm_head_fp32=lm_head_fp32,
+        lm_head=lm_head,
     )
     logprobs = -per_token_ce.view(B, S)
 

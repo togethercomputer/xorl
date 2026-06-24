@@ -11,7 +11,7 @@ from typing import Callable, Dict
 MOE_EXPERT_BACKENDS: Dict[str, Callable] = {}
 
 # Eager is always available (no kernel deps)
-from .eager import eager_expert_forward
+from .eager import eager_ep_compute, eager_ep_compute_lora, eager_expert_forward
 
 
 MOE_EXPERT_BACKENDS["eager"] = eager_expert_forward
@@ -47,10 +47,12 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 EP_EXPERT_COMPUTE: Dict[str, Callable] = {}
+EP_EXPERT_COMPUTE["eager"] = eager_ep_compute
+EP_EXPERT_COMPUTE_MOE_ACT: Dict[str, Callable] = {}
 
 # Triton EP compute (fused gate+up GEMM with autograd)
 try:
-    from xorl.ops.moe.triton import TritonEPGroupGemm
+    from xorl.ops.moe.triton import TritonEPGroupGemm, TritonEPGroupGemmMoeAct
 
     def _triton_ep_apply(
         permute_tokens,
@@ -60,18 +62,75 @@ try:
         intermediate_size,
         expert_scores=None,
         hidden_act="silu",
+        activation_native=False,
+        fp8_compute=False,
+        fp8_grouped_backend="triton_grouped",
+        fp8_block_size=128,
+        swiglu_limit=0.0,
+        gated=True,
         **_extras,  # GPT-OSS extras (gate_up_bias, down_bias) — triton doesn't support them
     ):
-        if any(v is not None for v in _extras.values()) or hidden_act == "clamped_swiglu":
+        del activation_native, fp8_grouped_backend, fp8_block_size
+        if fp8_compute:
+            raise NotImplementedError(
+                "triton EP backend does not support FP8 expert compute. "
+                "Use moe_implementation='quack' for FP8 grouped expert compute."
+            )
+        unsupported_extras = {key: value for key, value in _extras.items() if value is not None}
+        if unsupported_extras or hidden_act == "clamped_swiglu":
             raise NotImplementedError(
                 "triton EP backend does not support per-expert biases or clamped_swiglu "
                 "activation (required by GPT-OSS). Use moe_implementation='native' instead."
             )
         return TritonEPGroupGemm.apply(
-            permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores, hidden_act
+            permute_tokens,
+            cumsum,
+            gate_up_proj,
+            down_proj,
+            intermediate_size,
+            expert_scores,
+            hidden_act,
+            swiglu_limit,
+            gated,
         )
 
     EP_EXPERT_COMPUTE["triton"] = _triton_ep_apply
+
+    def _triton_ep_moe_act_apply(
+        permute_tokens,
+        cumsum,
+        gate_up_proj,
+        down_proj,
+        intermediate_size,
+        expert_scores=None,
+        hidden_act="silu",
+        activation_native=False,
+        fp8_compute=False,
+        fp8_grouped_backend="triton_grouped",
+        fp8_block_size=128,
+        swiglu_limit=0.0,
+        gated=True,
+        **_extras,  # GPT-OSS extras (gate_up_bias, down_bias) — triton doesn't support them
+    ):
+        del activation_native, fp8_grouped_backend, fp8_block_size
+        if fp8_compute:
+            raise NotImplementedError(
+                "triton moe_act EP backend does not support FP8 expert compute. "
+                "Use moe_implementation='quack' for FP8 grouped expert compute."
+            )
+        unsupported_extras = {key: value for key, value in _extras.items() if value is not None}
+        if unsupported_extras or hidden_act == "clamped_swiglu" or swiglu_limit:
+            raise NotImplementedError(
+                "triton moe_act EP backend does not support per-expert biases, clamped_swiglu, "
+                "or swiglu_limit. Use a different checkpointing method or moe_implementation='native'."
+            )
+        if not gated:
+            raise NotImplementedError("triton moe_act EP backend does not support non-gated experts")
+        return TritonEPGroupGemmMoeAct.apply(
+            permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores, hidden_act
+        )
+
+    EP_EXPERT_COMPUTE_MOE_ACT["triton"] = _triton_ep_moe_act_apply
 except ImportError:
     pass
 
@@ -87,18 +146,64 @@ try:
         intermediate_size,
         expert_scores=None,
         hidden_act="silu",
-        **_extras,  # GPT-OSS extras (gate_up_bias, down_bias) — quack doesn't support them
+        activation_native=False,
+        fp8_compute=False,
+        fp8_grouped_backend="triton_grouped",
+        fp8_block_size=128,
+        swiglu_limit=0.0,
+        gated=True,
+        **extras,  # GPT-OSS extras (gate_up_bias, down_bias)
     ):
-        if any(v is not None for v in _extras.values()) or hidden_act == "clamped_swiglu":
-            raise NotImplementedError(
-                "quack EP backend does not support per-expert biases or clamped_swiglu "
-                "activation (required by GPT-OSS). Use moe_implementation='native' instead."
-            )
+        if not gated:
+            raise NotImplementedError("quack backend does not support non-gated experts")
+        unknown_extras = {
+            key: value
+            for key, value in extras.items()
+            if key not in {"gate_up_bias", "down_bias"} and value is not None
+        }
+        if unknown_extras:
+            raise NotImplementedError(f"quack EP backend received unsupported expert extras: {sorted(unknown_extras)}")
         return _QuackEPGroupGemm.apply(
-            permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores, hidden_act
+            permute_tokens,
+            cumsum,
+            gate_up_proj,
+            down_proj,
+            intermediate_size,
+            expert_scores,
+            hidden_act,
+            activation_native,
+            fp8_compute,
+            fp8_grouped_backend,
+            fp8_block_size,
+            extras.get("gate_up_bias"),
+            extras.get("down_bias"),
+            swiglu_limit,
         )
 
     EP_EXPERT_COMPUTE["quack"] = _quack_ep_fused
+except ImportError:
+    pass
+
+try:
+    from xorl.ops.moe.quack import QuackEPGroupGemmMoeAct as _QuackEPGroupGemmMoeAct
+
+    def _quack_ep_moe_act_fused(
+        permute_tokens,
+        cumsum,
+        gate_up_proj,
+        down_proj,
+        intermediate_size,
+        expert_scores=None,
+        hidden_act="silu",
+        gated=True,
+    ):
+        if not gated:
+            raise NotImplementedError("quack backend does not support non-gated experts")
+        return _QuackEPGroupGemmMoeAct.apply(
+            permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores, hidden_act
+        )
+
+    EP_EXPERT_COMPUTE_MOE_ACT["quack"] = _quack_ep_moe_act_fused
 except ImportError:
     pass
 
@@ -114,9 +219,26 @@ try:
         intermediate_size,
         expert_scores=None,
         hidden_act="silu",
+        activation_native=False,
+        fp8_compute=False,
+        fp8_grouped_backend="triton_grouped",
+        fp8_block_size=128,
+        swiglu_limit=0.0,
+        gated=True,
         **extras,  # gate_up_bias, down_bias — optional, used for GPT-OSS
     ):
-        del intermediate_size
+        del intermediate_size, activation_native, fp8_grouped_backend, fp8_block_size
+        if fp8_compute:
+            raise NotImplementedError(
+                "native EP backend does not support FP8 expert compute. "
+                "Use moe_implementation='quack' for FP8 grouped expert compute."
+            )
+        supported_extras = {"gate_up_bias", "down_bias"}
+        unknown_extras = {
+            key: value for key, value in extras.items() if key not in supported_extras and value is not None
+        }
+        if unknown_extras:
+            raise NotImplementedError(f"native EP backend received unsupported expert extras: {sorted(unknown_extras)}")
         return _native_ep_compute(
             permute_tokens,
             cumsum,
@@ -124,7 +246,10 @@ try:
             down_proj,
             expert_scores,
             hidden_act=hidden_act,
-            **extras,
+            swiglu_limit=swiglu_limit,
+            gate_up_bias=extras.get("gate_up_bias"),
+            down_bias=extras.get("down_bias"),
+            gated=gated,
         )
 
     EP_EXPERT_COMPUTE["native"] = _native_ep_fused
@@ -174,6 +299,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 EP_EXPERT_COMPUTE_LORA: Dict[str, Callable] = {}
+EP_EXPERT_COMPUTE_LORA["eager"] = eager_ep_compute_lora
 
 # Triton EP LoRA compute (custom Triton group GEMM with autograd)
 try:
@@ -238,6 +364,7 @@ except ImportError:
 __all__ = [
     "MOE_EXPERT_BACKENDS",
     "EP_EXPERT_COMPUTE",
+    "EP_EXPERT_COMPUTE_MOE_ACT",
     "EP_DISPATCH",
     "EP_COMBINE",
     "EP_EXPERT_COMPUTE_LORA",

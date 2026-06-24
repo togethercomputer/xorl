@@ -179,6 +179,7 @@ class Glm4MoeSparseMoeBlock(MoEBlock):
         self.experts.deepep_buffer_size_gb = getattr(config, "_deepep_buffer_size_gb", 2.0)
         self.experts.deepep_num_sms = getattr(config, "_deepep_num_sms", 20)
         self.experts.deepep_async_combine = getattr(config, "_deepep_async_combine", False)
+        self.experts.alltoall_combine_hidden_chunk_size = getattr(config, "_alltoall_combine_hidden_chunk_size", 0)
 
     def _route_tokens(self, router_logits: torch.Tensor, input_dtype: torch.dtype):
         """Sigmoid-based grouped top-k routing.

@@ -1,4 +1,9 @@
-from .block_fp8_gkn_quantize import block_fp8_dequantize_gkn, block_fp8_quantize_gkn
+from .block_fp8_gkn_quantize import (
+    block_fp8_dequantize_gkn,
+    block_fp8_dequantize_gkn_rowwise,
+    block_fp8_quantize_gkn,
+    block_fp8_quantize_gkn_rowwise,
+)
 from .block_fp8_quantize import block_fp8_dequantize, block_fp8_gemm, block_fp8_quantize
 from .fp4_codec import FP4_E2M1_MAX, FP8_E4M3_MAX
 from .int4_gkn_quantize import int4_dequantize_gkn, int4_quantize_gkn
@@ -39,4 +44,6 @@ __all__ = [
     "block_fp8_gemm",
     "block_fp8_quantize_gkn",
     "block_fp8_dequantize_gkn",
+    "block_fp8_quantize_gkn_rowwise",
+    "block_fp8_dequantize_gkn_rowwise",
 ]

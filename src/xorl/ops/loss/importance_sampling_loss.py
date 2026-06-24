@@ -25,6 +25,7 @@ def importance_sampling_loss_function(
     lm_head_fp32: bool = False,
     loss_reducer: Optional[Reducer] = None,
     metric_reducer: Optional[Reducer] = None,
+    lm_head: Optional[torch.nn.Module] = None,
 ) -> "LossOutput":
     """
     Compute importance sampling loss for GRPO/RL training.
@@ -93,6 +94,7 @@ def importance_sampling_loss_function(
         num_chunks,
         tp_group=tp_group,
         lm_head_fp32=lm_head_fp32,
+        lm_head=lm_head,
     )
 
     # new logprobs = log p(target) = -CE

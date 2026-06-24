@@ -21,7 +21,10 @@ from .loader import ModelLoader, get_loader
 from .transformers.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from .transformers.deepseek_v3.support import validate_deepseek_v3_router_settings
 from .transformers.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
+from .transformers.glm5.configuration_glm5 import Glm5Config
+from .transformers.glm5.support import validate_glm5_router_settings, validate_glm5_sequence_parallel
 from .transformers.gpt_oss.configuration_gpt_oss import GptOssConfig
+from .transformers.nemotron_h.configuration_nemotron_h import NemotronHConfig
 from .transformers.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 from .transformers.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
 from .transformers.qwen3_5_shared import (
@@ -78,6 +81,9 @@ def _load_local_xorl_config(
     config_dict, _ = PretrainedConfig.get_config_dict(config_path, **config_kwargs)
     model_type = config_dict.get("model_type")
 
+    if model_type == "glm_moe_dsa":
+        return Glm5Config.from_hf_config(_namespace_from_dict(config_dict))
+
     if model_type == "glm4_moe":
         return Glm4MoeConfig.from_dict(config_dict)
 
@@ -89,6 +95,9 @@ def _load_local_xorl_config(
 
     if model_type in {"deepseek_v3", "kimi_k2", "kimi_k25"}:
         return DeepseekV3Config.from_hf_config(_namespace_from_dict(config_dict))
+
+    if model_type == "nemotron_h":
+        return NemotronHConfig.from_hf_config(_namespace_from_dict(config_dict))
 
     if model_type == "qwen2":
         from .transformers.qwen2.configuration_qwen2 import Qwen2Config  # noqa: PLC0415
@@ -176,12 +185,15 @@ def build_foundation_model(
     deepep_buffer_size_gb: float = 2.0,
     deepep_num_sms: int = 20,
     deepep_async_combine: bool = False,
+    alltoall_combine_hidden_chunk_size: int = 0,
     router_fp32: bool = True,
     lm_head_fp32: bool = True,
     rmsnorm_mode: Literal["eager", "native", "compile"] = "native",
     activation_native: bool = False,
     rope_native: bool = False,
     attention_cast_bf16: bool = False,
+    sparse_mla_enabled: bool = False,
+    sparse_mla_backend: str = "auto",
     flash_attention_deterministic: bool = False,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
@@ -208,6 +220,7 @@ def build_foundation_model(
         logger.info_rank0(f"Moe implementation: {moe_implementation}")
 
     validate_deepseek_v3_router_settings(config, train_router=train_router)
+    validate_glm5_router_settings(config, train_router=train_router)
 
     if ep_dispatch == "deepep" and train_router:
         raise ValueError(
@@ -221,6 +234,7 @@ def build_foundation_model(
     config._deepep_buffer_size_gb = deepep_buffer_size_gb
     config._deepep_num_sms = deepep_num_sms
     config._deepep_async_combine = deepep_async_combine
+    config._alltoall_combine_hidden_chunk_size = alltoall_combine_hidden_chunk_size
     config._router_fp32 = router_fp32
     config._lm_head_fp32 = lm_head_fp32
     set_rmsnorm_mode(rmsnorm_mode)
@@ -228,6 +242,8 @@ def build_foundation_model(
     config._activation_native = activation_native
     config._rope_native = rope_native
     config._attention_cast_bf16 = attention_cast_bf16
+    config._sparse_mla_enabled = sparse_mla_enabled
+    config._sparse_mla_backend = sparse_mla_backend
     config._flash_attention_deterministic = flash_attention_deterministic
 
     if ep_dispatch == "deepep":
@@ -247,6 +263,7 @@ def build_foundation_model(
     if ps.ringattn_size > 1 and has_linear_attention_layers(config):
         logger.warning_once(LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE)
         raise ValueError(LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE)
+    validate_glm5_sequence_parallel(config, parallel_state=ps)
 
     if _is_gpt_oss_config(config) and attn_implementation not in ("eager", "flash_attention_3"):
         raise ValueError(

@@ -79,14 +79,32 @@ class MultiOptimizer(Optimizer, Stateful):
 
         return merged
 
-    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+    def load_state_dict(self, state_dict: Dict[str, Any], strict: bool = True) -> None:
         for name in self.key_names:
             opt = self.optimizers_dict.get(name)
+            if opt is None:
+                continue
+            target_sd = get_optimizer_state_dict(
+                self.model,
+                opt,
+                options=StateDictOptions(flatten_optimizer_state_dict=True),
+            )
+            loaded_state_dict = {key: state_dict[key] for key in target_sd if key in state_dict}
+            missing = len(target_sd) - len(loaded_state_dict)
+            if missing > 0:
+                logger.info_rank0(
+                    f"MultiOptimizer loading '{name}' optimizer state with {len(loaded_state_dict)} checkpoint key(s), "
+                    f"using freshly initialized state for {missing} key(s) absent from checkpoint."
+                )
+                opt_state_dict = dict(target_sd)
+                opt_state_dict.update(loaded_state_dict)
+            else:
+                opt_state_dict = loaded_state_dict
             set_optimizer_state_dict(
                 self.model,
                 opt,
-                optim_state_dict=state_dict,
-                options=StateDictOptions(flatten_optimizer_state_dict=True),
+                optim_state_dict=opt_state_dict,
+                options=StateDictOptions(flatten_optimizer_state_dict=True, strict=strict and missing == 0),
             )
 
     def register_step_pre_hook(self, hook):

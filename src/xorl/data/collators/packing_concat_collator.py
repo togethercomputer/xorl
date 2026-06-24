@@ -11,6 +11,7 @@ from .base_collator import DataCollator
 
 def add_flash_attention_kwargs_from_position_ids(
     batch: Dict[str, "torch.Tensor"],
+    max_length_bucket: int = 0,
 ) -> Tuple["torch.Tensor", "torch.Tensor", "torch.Tensor", "torch.Tensor"]:
     """
     Calculate and add Flash Attention kwargs (cu_seq_lens and max_length) from position_ids.
@@ -29,7 +30,7 @@ def add_flash_attention_kwargs_from_position_ids(
         Tuple of (cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k) for additional use.
     """
     (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(
-        batch["position_ids"]
+        batch["position_ids"], max_length_bucket=max_length_bucket
     )
 
     batch["cu_seq_lens_q"] = cu_seq_lens_q
@@ -47,9 +48,13 @@ class PackingConcatCollator(DataCollator):
 
     Args:
         pad_to_multiple_of: Pad packed sequences to a multiple of this value for optimal GPU performance.
+        fa_max_length_bucket: If > 0, round the flash-attn max_length_q/k up to a multiple of this value
+            (an upper bound only; correctness via cu_seqlens) to avoid torch.compile recompiling on every
+            ragged pack. 0 = off.
     """
 
     pad_to_multiple_of: int = 128
+    fa_max_length_bucket: int = 0
 
     def __call__(self, features: Sequence[Dict[str, "torch.Tensor"]]) -> Dict[str, "torch.Tensor"]:
         """
@@ -90,7 +95,9 @@ class PackingConcatCollator(DataCollator):
                 "rollout_logprobs",
                 "teacher_ids",
                 "teacher_cache_indices",
+                "teacher_cache_local_indices",
                 "teacher_weights",
+                "hidden_match_weights",
             ):
                 # 1D tensors: concatenate along sequence dimension
                 tensors = [feature[input_name] for feature in features]
@@ -178,6 +185,7 @@ class PackingConcatCollator(DataCollator):
                     "rollout_logprobs",
                     "teacher_ids",
                     "teacher_cache_indices",
+                    "teacher_cache_local_indices",
                     "teacher_weights",
                 ):
                     if key in batch and batch[key].shape[-1] == seq_len:
@@ -194,7 +202,9 @@ class PackingConcatCollator(DataCollator):
             if not get_parallel_state().cp_enabled:
                 # We only enter here to pass down cu_seqlens and max_length when sequence parallelism is not enabled.
                 # When cp_enabled is True, position_ids will be padded later, so we calculate them after padding
-                cu_seq_lens_q, _, _, _ = add_flash_attention_kwargs_from_position_ids(batch)
+                cu_seq_lens_q, _, _, _ = add_flash_attention_kwargs_from_position_ids(
+                    batch, max_length_bucket=self.fa_max_length_bucket
+                )
             else:
                 # Still need cu_seq_lens_q for label masking even when cp_enabled
                 (cu_seq_lens_q, _), (_, _) = prepare_fa_kwargs_from_position_ids(batch["position_ids"])

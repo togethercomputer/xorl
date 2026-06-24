@@ -1,10 +1,4 @@
-"""Regression test for inject_lora_into_model_with_moe attention partition.
-
-Locks in the fix for the case where the function silently dropped DeepSeek-V3 /
-Kimi MLA attention projections (q_a_proj, q_b_proj, kv_a_proj_with_mqa,
-kv_b_proj) because the attention vs. expert split was hardcoded to a
-Llama/Qwen-shaped allowlist (q_proj/k_proj/v_proj/o_proj/lm_head).
-"""
+"""Regression test for inject_lora_into_model_with_moe attention partition."""
 
 import pytest
 import torch.nn as nn
@@ -22,8 +16,6 @@ class _StubConfig:
 
 
 class _MLALikeBlock(nn.Module):
-    """Single attention block with DeepSeek-V3 / Kimi MLA projection names."""
-
     def __init__(self, hidden_size: int = 32, q_lora_rank: int = 16, kv_lora_rank: int = 16):
         super().__init__()
         self.q_a_proj = nn.Linear(hidden_size, q_lora_rank, bias=False)
@@ -33,15 +25,15 @@ class _MLALikeBlock(nn.Module):
         self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
 
-class _DeepSeekLikeModel(nn.Module):
+class _GlmLikeModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.config = _StubConfig("deepseek_v3")
+        self.config = _StubConfig("xorl_glm5")
         self.self_attn = _MLALikeBlock()
 
 
-def test_default_targets_cover_all_mla_projections_for_deepseek_v3():
-    model = _DeepSeekLikeModel()
+def test_default_targets_cover_all_mla_projections_for_glm5():
+    model = _GlmLikeModel()
 
     inject_lora_into_model_with_moe(model, r=4, lora_alpha=8, target_modules=None)
 
@@ -53,7 +45,7 @@ def test_default_targets_cover_all_mla_projections_for_deepseek_v3():
 
 
 def test_explicit_mla_targets_are_not_filtered_out():
-    model = _DeepSeekLikeModel()
+    model = _GlmLikeModel()
 
     inject_lora_into_model_with_moe(
         model,

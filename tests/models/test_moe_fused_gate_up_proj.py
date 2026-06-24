@@ -134,6 +134,45 @@ def test_qwen3_5_moe_checkpoint_handler_round_trips_fused_experts():
     torch.testing.assert_close(saved["model.layers.0.mlp.experts.1.down_proj.weight"], down_weight[1])
 
 
+def test_qwen3_5_moe_checkpoint_handler_round_trips_shared_expert_gate_up():
+    hidden_size = 4
+    intermediate_size = 3
+    gate = torch.arange(0, 12, dtype=torch.float32).view(intermediate_size, hidden_size)
+    up = torch.arange(12, 24, dtype=torch.float32).view(intermediate_size, hidden_size)
+    down = torch.arange(24, 36, dtype=torch.float32).view(hidden_size, intermediate_size)
+
+    handler = Qwen3_5MoeCheckpointHandler(
+        num_experts=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=2,
+        linear_key_dim=2,
+        linear_value_dim=2,
+    )
+
+    prefix = "model.layers.0.mlp.shared_expert"
+    loaded = dict(
+        handler.on_load_weight(f"{prefix}.gate_proj.weight", gate)
+        + handler.on_load_weight(f"{prefix}.up_proj.weight", up)
+        + handler.on_load_weight(f"{prefix}.down_proj.weight", down)
+    )
+
+    expected_gate_up = torch.cat([gate, up], dim=0)
+    assert set(loaded) == {
+        f"{prefix}.gate_up_proj.weight",
+        f"{prefix}.down_proj.weight",
+    }
+    torch.testing.assert_close(loaded[f"{prefix}.gate_up_proj.weight"], expected_gate_up)
+    torch.testing.assert_close(loaded[f"{prefix}.down_proj.weight"], down)
+
+    saved = dict(handler.on_save_weight(f"{prefix}.gate_up_proj.weight", expected_gate_up))
+    saved.update(handler.on_save_weight(f"{prefix}.down_proj.weight", down))
+
+    torch.testing.assert_close(saved[f"{prefix}.gate_proj.weight"], gate)
+    torch.testing.assert_close(saved[f"{prefix}.up_proj.weight"], up)
+    torch.testing.assert_close(saved[f"{prefix}.down_proj.weight"], down)
+
+
 def test_qwen3_moe_checkpoint_handler_skips_deferred_qlora_expert_loading():
     handler = Qwen3MoeCheckpointHandler(
         num_experts=2,

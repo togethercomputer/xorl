@@ -3,10 +3,12 @@
 #
 # Smallest clean Qwen MoE (128 experts, 8 active/token, gated SwiGLU experts,
 # full softmax attention). Minimal reference for RL training with multi-LoRA over
-# routed experts.
+# routed experts. See docs/notes/multilora_rl_recipe.md.
 #
 # 1 node (8× H100): EP=8 (16 experts/rank), Ulysses SP=1, FSDP shard=1.
-# This is the TRAINER config; pair it with a multiLoRA-enabled rollout engine.
+# This is the TRAINER config; pair it with a multiLoRA-enabled rollout engine
+# (SGLang today; TRT-LLM under evaluation — see
+# docs/notes/trtllm_multilora_inference_engine_spec.md).
 
 # ============================================================================
 # Model Configuration

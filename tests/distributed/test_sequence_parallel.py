@@ -1,14 +1,16 @@
-"""Tests for sequence parallel utilities (non-distributed).
+"""Tests for sequence parallel utilities."""
 
-Distributed tests removed -- run with torchrun separately.
-"""
+import os
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from xorl.distributed.sequence_parallel import (
     slice_position_embedding,
 )
+from xorl.distributed.sequence_parallel.ulysses import _Gather
 from xorl.distributed.sequence_parallel.utils import pad_tensor, unpad_tensor
 
 
@@ -56,6 +58,34 @@ class TestSlicePositionEmbedding:
         result_cos, result_sin = slice_position_embedding((cos, sin), dim=1, sp_group=None)
         assert torch.equal(result_cos, cos)
         assert torch.equal(result_sin, sin)
+
+
+def _run_gather_backward_worker(rank: int, port: int) -> None:
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group("gloo", rank=rank, world_size=2)
+    try:
+        local = torch.tensor([[rank * 10.0 + 1.0, rank * 10.0 + 2.0]], requires_grad=True)
+        gathered = _Gather.apply(dist.group.WORLD, local, 1, True)
+        weights = [
+            torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
+            torch.tensor([[5.0, 6.0, 7.0, 8.0]]),
+        ][rank]
+        (gathered * weights).sum().backward()
+
+        expected = torch.tensor([[6.0, 8.0]]) if rank == 0 else torch.tensor([[10.0, 12.0]])
+        assert torch.allclose(local.grad, expected)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_gather_outputs_scale_grad_reduce_scatters_chunks(unused_tcp_port):
+    mp.start_processes(
+        _run_gather_backward_worker,
+        args=(unused_tcp_port,),
+        nprocs=2,
+        start_method="spawn",
+    )
 
 
 if __name__ == "__main__":

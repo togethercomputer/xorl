@@ -20,6 +20,11 @@ from xorl.distillation.teacher_store import (
 
 DEFAULT_LM_HEAD_KEY = "lm_head.weight"
 DEFAULT_HIDDEN_KEY = "hidden_states"
+TIED_EMBEDDING_LM_HEAD_KEYS = (
+    "model.embed_tokens.weight",
+    "language_model.model.embed_tokens.weight",
+    "transformer.wte.weight",
+)
 
 
 def _load_safetensors_tensor(path: str, key: str) -> torch.Tensor:
@@ -33,20 +38,56 @@ def _load_safetensors_tensor(path: str, key: str) -> torch.Tensor:
 
 
 def _load_from_model_dir(path: str, key: str) -> torch.Tensor:
+    def tied_lm_head_fallback(available_keys: set[str]) -> str | None:
+        if key != DEFAULT_LM_HEAD_KEY or not _model_dir_ties_word_embeddings(path):
+            return None
+        for candidate in TIED_EMBEDDING_LM_HEAD_KEYS:
+            if candidate in available_keys:
+                return candidate
+        return None
+
     index_path = os.path.join(path, "model.safetensors.index.json")
     if os.path.exists(index_path):
         with open(index_path) as f:
             index = json.load(f)
-        shard_name = index.get("weight_map", {}).get(key)
+        weight_map = index.get("weight_map", {})
+        load_key = key
+        shard_name = weight_map.get(load_key)
         if shard_name is None:
-            raise KeyError(f"Could not find tensor key '{key}' in {index_path}")
-        return _load_safetensors_tensor(os.path.join(path, shard_name), key)
+            fallback_key = tied_lm_head_fallback(set(weight_map))
+            if fallback_key is None:
+                raise KeyError(f"Could not find tensor key '{key}' in {index_path}")
+            load_key = fallback_key
+            shard_name = weight_map[load_key]
+        return _load_safetensors_tensor(os.path.join(path, shard_name), load_key)
 
     safetensors_path = os.path.join(path, "model.safetensors")
     if os.path.exists(safetensors_path):
-        return _load_safetensors_tensor(safetensors_path, key)
+        try:
+            return _load_safetensors_tensor(safetensors_path, key)
+        except KeyError:
+            with safe_open(safetensors_path, framework="pt", device="cpu") as f:
+                fallback_key = tied_lm_head_fallback(set(f.keys()))
+            if fallback_key is None:
+                raise
+            return _load_safetensors_tensor(safetensors_path, fallback_key)
 
     raise FileNotFoundError(f"No model.safetensors or model.safetensors.index.json found in {path}")
+
+
+def _model_dir_ties_word_embeddings(path: str) -> bool:
+    config_path = os.path.join(path, "config.json")
+    if not os.path.exists(config_path):
+        return False
+    with open(config_path) as f:
+        config = json.load(f)
+    if bool(config.get("tie_word_embeddings", False)):
+        return True
+    for nested_key in ("text_config", "llm_config"):
+        nested = config.get(nested_key)
+        if isinstance(nested, Mapping) and bool(nested.get("tie_word_embeddings", False)):
+            return True
+    return False
 
 
 def _normalize_entry(entry: str | Mapping[str, Any], default_key: str) -> tuple[str, str]:
@@ -90,8 +131,11 @@ def load_hidden_state_cache(entry: str | Mapping[str, Any], tensor_key: str = DE
         tensor = _load_safetensors_tensor(path, key)
     else:
         raise ValueError(f"Teacher hidden cache must be a safetensors file or directory: {path}")
-    if tensor.ndim != 2:
-        raise ValueError(f"Teacher hidden cache must be rank 2 [tokens, hidden_dim], got shape {tuple(tensor.shape)}")
+    if tensor.ndim not in (2, 3):
+        raise ValueError(
+            "Teacher hidden cache must be rank 2 [tokens, hidden_dim] or rank 3 "
+            f"[layers, tokens, hidden_dim] (multi-layer OPRD), got shape {tuple(tensor.shape)}"
+        )
     return tensor.contiguous()
 
 
@@ -271,6 +315,11 @@ class TeacherActivationCache:
         cache = self._cpu_tensor(key, entry)
 
         flat_indices = indices.reshape(-1).to(device="cpu", dtype=torch.long)
+        # rank-2 [tokens, d] (output-space OPD / last-layer hidden-match) gathers along
+        # dim 0; rank-3 [layers, tokens, d] (multi-layer OPRD) gathers along the token
+        # axis (dim 1) and returns [*indices.shape, layers, d].
+        token_dim = 0 if cache.ndim == 2 else 1
+        num_tokens = cache.shape[token_dim]
         if flat_indices.numel() > 0:
             min_idx = flat_indices.min().item()
             if min_idx < 0:
@@ -282,13 +331,18 @@ class TeacherActivationCache:
                     f"(teacher_id={key}); producer must emit non-negative indices"
                 )
             max_idx = flat_indices.max().item()
-            if max_idx >= cache.shape[0]:
+            if max_idx >= num_tokens:
                 raise IndexError(
                     f"teacher_cache_indices contain {max_idx}, "
-                    f"but teacher_id={key} cache only has {cache.shape[0]} rows"
+                    f"but teacher_id={key} cache only has {num_tokens} rows"
                 )
-        gathered = cache.index_select(0, flat_indices)
-        gathered = gathered.view(*indices.shape, cache.shape[-1])
+        gathered = cache.index_select(token_dim, flat_indices)
+        if cache.ndim == 2:
+            gathered = gathered.view(*indices.shape, cache.shape[-1])
+        else:
+            # [layers, n, d] -> [n, layers, d] -> [*indices.shape, layers, d]
+            layers, _, hidden = gathered.shape
+            gathered = gathered.permute(1, 0, 2).reshape(*indices.shape, layers, hidden)
         # CPU cache is unpinned, so non_blocking=True would be a no-op. Drop the
         # flag rather than misleading future readers.
         return gathered.to(device=device, dtype=dtype)

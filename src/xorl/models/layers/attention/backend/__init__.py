@@ -47,6 +47,7 @@ FlashAttentionKwargs = AttentionKwargs
 # ------------------------------------------------------------------ #
 
 FLASH_ATTENTION_IMPLEMENTATIONS: Set[str] = {
+    "flash_attention_2",
     "native",
     "flash_attention_3",
     "flash_attention_4",
@@ -55,7 +56,7 @@ FLASH_ATTENTION_IMPLEMENTATIONS: Set[str] = {
 
 def is_flash_attention(attn_implementation: str) -> bool:
     """Return True if *attn_implementation* handles causal masking internally."""
-    return attn_implementation in FLASH_ATTENTION_IMPLEMENTATIONS
+    return attn_implementation in FLASH_ATTENTION_IMPLEMENTATIONS and attn_implementation in ATTENTION_FUNCTIONS
 
 
 # ------------------------------------------------------------------ #
@@ -71,6 +72,7 @@ ATTENTION_FUNCTIONS: Dict[str, Callable] = {
 try:
     from .flash_attention import FA4_AVAILABLE, flash_attention_forward
 
+    ATTENTION_FUNCTIONS["flash_attention_2"] = flash_attention_forward
     ATTENTION_FUNCTIONS["flash_attention_3"] = flash_attention_forward
 
     if FA4_AVAILABLE:
@@ -94,7 +96,8 @@ try:
     from .flash_attention import prepare_causal_mask as flash_prepare_causal_mask
 
     for _key in FLASH_ATTENTION_IMPLEMENTATIONS:
-        CAUSAL_MASK_FUNCTIONS[_key] = flash_prepare_causal_mask
+        if _key in ATTENTION_FUNCTIONS:
+            CAUSAL_MASK_FUNCTIONS[_key] = flash_prepare_causal_mask
 except ImportError:
     pass
 
@@ -126,6 +129,8 @@ def update_causal_mask(
     Dispatches to the registered prepare_causal_mask function for the backend.
     """
     prepare_fn = CAUSAL_MASK_FUNCTIONS.get(attn_implementation)
+    if prepare_fn is None and attn_implementation in FLASH_ATTENTION_IMPLEMENTATIONS:
+        prepare_fn = eager_prepare_causal_mask
     if prepare_fn is not None:
         return prepare_fn(
             attention_mask,

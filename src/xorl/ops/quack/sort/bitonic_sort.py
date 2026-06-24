@@ -5,11 +5,11 @@ from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, const_expr
+from cutlass import Int32, Float32, const_expr
 
-from .. import utils
-from .sorting_networks import optimal_sort
-from .utils import compare_and_swap
+from .. import utils as utils
+from ..sort.utils import compare_and_swap
+from ..sort.sorting_networks import optimal_sort
 
 
 @cute.jit

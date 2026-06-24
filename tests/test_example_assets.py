@@ -10,8 +10,10 @@ pytestmark = [pytest.mark.cpu]
 
 TRACKED_TEXT_SUFFIXES = {".md", ".mdx", ".sh", ".yaml", ".yml"}
 FORBIDDEN_PATTERNS = {
-    "home_dir": re.compile(r"(?<![A-Za-z0-9._-])/(?:home|Users)/[A-Za-z0-9._-]+/"),
+    "home_dir": re.compile(r"(?<![A-Za-z0-9._-])/(?:home|Users)/[A-Za-z0-9._-]+(?:/|(?=$|[\s\"']))"),
+    "codex_worktree": re.compile(r"\.claude/worktrees"),
     "data_workspace": re.compile(r"(?<![A-Za-z0-9._-])/data/[A-Za-z0-9._-]+/(?:WorkingProjects|outputs|miniconda3)/"),
+    "personal_home_pvc": re.compile(r"\bhome-[A-Za-z0-9._-]+\b"),
 }
 
 
@@ -39,6 +41,8 @@ def test_examples_and_experiments_avoid_personal_absolute_paths():
     violations: list[str] = []
 
     for path in _tracked_example_and_experiment_files(repo_root):
+        if not path.exists():
+            continue
         text = path.read_text(encoding="utf-8")
         for pattern_name, pattern in FORBIDDEN_PATTERNS.items():
             if match := pattern.search(text):

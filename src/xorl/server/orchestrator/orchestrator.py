@@ -217,6 +217,9 @@ class Orchestrator:
         enable_packing: bool = True,
         pad_to_multiple_of: int = 128,
         cp_size: int = 1,
+        packing_strategy: str = "sequential",
+        on_oversized: str = "error",
+        dp_size: int = 1,
         input_queue_maxsize: int = 1000,
         output_queue_maxsize: int = 1000,
         train_config: Optional[Dict[str, Any]] = None,
@@ -238,6 +241,9 @@ class Orchestrator:
             enable_packing: Enable sample packing (default: True)
             pad_to_multiple_of: Base padding alignment (default: 128)
             cp_size: Sequence parallel size for Ulysses SP (default: 1)
+            packing_strategy: Bin-packing strategy (see packing.PACKING_STRATEGIES).
+            on_oversized: Oversized-sample policy (see packing.ON_OVERSIZED_MODES).
+            dp_size: Distinct dispatcher batch slices, used by "balanced_dp".
             input_queue_maxsize: Maximum size of input queue
             output_queue_maxsize: Maximum size of output queue
             train_config: Training configuration for data processing
@@ -273,6 +279,9 @@ class Orchestrator:
             enable_packing=enable_packing,
             pad_to_multiple_of=pad_to_multiple_of,
             cp_size=cp_size,
+            packing_strategy=packing_strategy,
+            on_oversized=on_oversized,
+            dp_size=dp_size,
         )
 
         # Threading queues
@@ -606,7 +615,25 @@ class Orchestrator:
 
     def _abort_request(self, request: OrchestratorRequest):
         """Abort an existing request."""
-        target_id = request.payload.target_request_id
+        # When an ABORT request is created via the generic OrchestratorRequest
+        # path without a typed AbortRequestData payload (e.g. from a client
+        # cancellation that the API server forwards as EmptyData), the payload
+        # has no `target_request_id`. The previous code crashed with an
+        # AttributeError, polluting the log and short-circuiting downstream
+        # cancellation handling. Be defensive: try the attribute, fall back to
+        # the request's own message_id, and log the unusual case once.
+        payload = request.payload
+        target_id = getattr(payload, "target_request_id", None)
+        if not target_id:
+            target_id = getattr(request, "message_id", None) or getattr(request, "request_id", None)
+            logger.warning(
+                "ABORT request payload missing target_request_id (type=%s); falling back to request_id=%s",
+                type(payload).__name__,
+                target_id,
+            )
+        if not target_id:
+            logger.error("ABORT request has no target_request_id and no fallback id; dropping")
+            return
 
         # Try to abort via scheduler
         if self.scheduler.abort_request(target_id):

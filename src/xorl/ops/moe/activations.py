@@ -56,6 +56,15 @@ def clamped_swiglu(gate_out: torch.Tensor, up_out: torch.Tensor) -> torch.Tensor
     return (gate_out * torch.sigmoid(CLAMPED_SWIGLU_ALPHA * gate_out)) * (up_out + 1)
 
 
+def relu2(gate_out: torch.Tensor, up_out: torch.Tensor) -> torch.Tensor:
+    """Squared ReLU in gated form: ``relu(gate) * up``.
+
+    Non-gated experts (e.g. Nemotron-3-Ultra) pass the same GEMM output as
+    both arguments, which yields ``relu(x) ** 2`` since ``relu2(x) == relu(x) * x``.
+    """
+    return F.relu(gate_out) * up_out
+
+
 # ---------------------------------------------------------------------------
 # Registry & dispatch
 # ---------------------------------------------------------------------------
@@ -64,9 +73,14 @@ MOE_ACTIVATIONS: Dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]]
     "silu": silu_swiglu,
     "gelu_tanh": gelu_tanh_glu,
     "clamped_swiglu": clamped_swiglu,
+    "relu2": relu2,
 }
 
 SUPPORTED_HIDDEN_ACTS: frozenset[str] = frozenset(MOE_ACTIVATIONS.keys())
+
+# Activations valid for non-gated experts (single first GEMM; backends apply
+# the activation by passing that output as both gate and up).
+UNGATED_HIDDEN_ACTS: frozenset[str] = frozenset({"relu2"})
 
 
 def normalize_hidden_act(hidden_act: str | None) -> str:
@@ -77,6 +91,8 @@ def normalize_hidden_act(hidden_act: str | None) -> str:
         return "gelu_tanh"
     if hidden_act == "clamped_swiglu":
         return "clamped_swiglu"
+    if hidden_act == "relu2":
+        return "relu2"
     raise ValueError(f"Unsupported hidden_act={hidden_act!r}. Supported: {sorted(SUPPORTED_HIDDEN_ACTS)}")
 
 
@@ -104,4 +120,6 @@ def apply_moe_activation(
         return gelu_tanh_glu(gate_out, up_out)
     if hidden_act == "clamped_swiglu":
         return clamped_swiglu(gate_out, up_out)
+    if hidden_act == "relu2":
+        return relu2(gate_out, up_out)
     raise ValueError(f"Unknown hidden_act={hidden_act!r}. Supported: {sorted(SUPPORTED_HIDDEN_ACTS)}")
