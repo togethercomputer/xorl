@@ -62,6 +62,16 @@ NUM_GPUS="${NUM_GPUS:-8}"
 # for execution on the device" on Blackwell). FA4/cute covers Hopper AND Blackwell, so it
 # is safe across the whole GPU pool. Set ATTN_IMPL="" to honor the config's own value, or
 # e.g. ATTN_IMPL=sdpa for an arch-agnostic (non-flash) fallback.
+#
+# FA4 + GQA on Blackwell sm_12x: FA4's GQA query-head packing (pack_gqa) forward epilogue
+# fails to JIT-compile on sm_12x (a CuTeDSL crd2idx rank mismatch in pack_gqa.store_LSE);
+# this bites every GQA model, including Qwen3 (32 q / 8 kv heads). xorl's FA4 custom op
+# (src/xorl/models/layers/attention/backend/fa4_custom_op.py) auto-disables pack_gqa on
+# sm_12x (passing pack_gqa=False, mirroring the still-unmerged upstream fix
+# Dao-AILab/flash-attention#2484); Hopper/B200 keep FA4's auto heuristic. The non-packed
+# path is functionally identical and ~free for training (pack_gqa only speeds memory-bound
+# decode; the FA4 backward never packs anyway). Override with XORL_FA4_PACK_GQA=1/0 to
+# force packing on/off regardless of GPU arch.
 ATTN_IMPL="${ATTN_IMPL:-flash_attention_4}"
 IMAGE="${IMAGE:-nvcr.io/nvidia/pytorch:25.01-py3}"
 DISK_GB="${DISK_GB:-150}"

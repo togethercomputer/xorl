@@ -19,6 +19,7 @@ This module is FA4-only; FA3 is unaffected (separate path in
 ``flash_attention.py``).
 """
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -27,6 +28,41 @@ from .....utils import logging
 
 
 logger = logging.get_logger(__name__)
+
+
+# --------------------------------------------------------------------------- #
+# pack_gqa (GQA query-head packing) gate                                      #
+# --------------------------------------------------------------------------- #
+# FA4's pack_gqa forward epilogue (``pack_gqa.store_LSE`` -> ``compute_ptr``) fails to
+# JIT-compile on Blackwell sm_12x (RTX PRO / GeForce / DGX Spark) in this pinned
+# flash-attn-4 commit: a CuTeDSL ``crd2idx`` rank mismatch
+# (``cute.layout<"(?):(1)">`` vs ``cute.coord<"((?,?))">``) when storing LSE for the
+# packed-head layout. Upstream's fix is the still-UNMERGED PR Dao-AILab/flash-attention#2484,
+# which simply forces ``pack_gqa=False`` on the ``FlashAttentionForwardSm120`` subclass.
+# We do the same thing here at the call site so the fix is arch-targeted and does NOT
+# depend on pinning an unmerged commit.
+#
+# Cost: ~none for training. pack_gqa only meaningfully helps the *memory-bound decode*
+# phase (small seqlen_q); our forward is long-seqlen / compute-bound, and the FA4 backward
+# ALREADY hard-forces pack_gqa off ("pack_gqa backward not yet supported"). Hopper (sm_90)
+# and B200 (sm_100) keep FA4's auto heuristic (``pack_gqa=None``) since packing compiles
+# fine there. Override with XORL_FA4_PACK_GQA=1/0 to force on/off regardless of arch.
+def _resolve_pack_gqa() -> Optional[bool]:
+    """Return the ``pack_gqa`` value to pass to FA4 fwd: False on sm_12x, else None (auto)."""
+    override = os.environ.get("XORL_FA4_PACK_GQA")
+    if override is not None:
+        return override == "1"
+    try:
+        if torch.cuda.is_available():
+            major, _minor = torch.cuda.get_device_capability()
+            if major == 12:  # sm_12x Blackwell (sm_120 RTX PRO / sm_121 GB10): pack_gqa JIT-broken
+                return False
+    except Exception:  # pragma: no cover - never let a device probe break import
+        pass
+    return None  # Hopper / B200 / unknown: let FA4 auto-decide
+
+
+_FA4_PACK_GQA = _resolve_pack_gqa()
 
 
 # Lower-level FA4 CuTe entry points. These bypass FA4's own
@@ -77,6 +113,10 @@ def _fa4_fwd_op(
         window_size_left=window_size_left,
         window_size_right=window_size_right,
         return_lse=True,
+        # Disable GQA query-head packing on sm_12x Blackwell (its fwd LSE-store epilogue
+        # fails to JIT-compile); None elsewhere keeps FA4's auto heuristic. See
+        # _resolve_pack_gqa above.
+        pack_gqa=_FA4_PACK_GQA,
     )
     return out, lse
 
