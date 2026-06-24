@@ -90,12 +90,14 @@ MIN_RELIABILITY="${MIN_RELIABILITY:-0.98}"
 # cute stack (nvidia-cutlass-dsl / flash-attn-4 / quack) JIT-compiles at runtime, so a
 # host whose driver caps below the toolkit risks the cute JIT failing. Floor to 12.6.
 MIN_CUDA="${MIN_CUDA:-12.6}"
-# GPU types to accept (Vast gpu_name query tokens, comma-separated). Spans datacenter
-# H100 (SXM/NVL/PCIE) and the much cheaper Blackwell workstation cards: RTX PRO 6000
-# (WS/S, 96GB) and RTX PRO 5000 (48GB). Qwen3-8B (TP=4 x FSDP-shard=2) fits in 48GB, so
-# any of these work; SXM H100 is fastest for TP (NVLink all-to-all) but the Blackwell
-# nodes are ~1/3-1/5 the price. We pick the CHEAPEST node that passes the thresholds below.
-GPU_NAMES="${GPU_NAMES:-H100_SXM,H100_NVL,H100_PCIE,RTX_PRO_6000_WS,RTX_PRO_6000_S,RTX_PRO_5000}"
+# GPU types to accept (Vast gpu_name query tokens, comma-separated). Restricted to
+# datacenter H100 (SXM/NVL/PCIE). We deliberately DROP the cheaper Blackwell workstation
+# cards (RTX PRO 6000 WS/S, RTX PRO 5000): even with the FA4 sm_12x compile-time
+# monkeypatch above, FA4 still RUNTIME-IMAs on sm_120 for this config, so those nodes
+# aren't viable for the FA4 path — use H100 (sm_90) instead. Qwen3-8B (TP=4 x
+# FSDP-shard=2) fits comfortably on 80GB H100; we pick the CHEAPEST H100 node that passes
+# the thresholds below. (Override GPU_NAMES to re-include Blackwell e.g. for an sdpa run.)
+GPU_NAMES="${GPU_NAMES:-H100_SXM,H100_NVL,H100_PCIE}"
 # results/ is gitignored (large binary logs/outputs). Fetch into the MAIN
 # worktree's results/ regardless of which worktree we launch from (porcelain lists it first).
 MAIN_WT="$(git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')"
