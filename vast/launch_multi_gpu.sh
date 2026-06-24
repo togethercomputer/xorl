@@ -63,15 +63,20 @@ NUM_GPUS="${NUM_GPUS:-8}"
 # is safe across the whole GPU pool. Set ATTN_IMPL="" to honor the config's own value, or
 # e.g. ATTN_IMPL=sdpa for an arch-agnostic (non-flash) fallback.
 #
-# FA4 + GQA on Blackwell sm_12x: FA4's GQA query-head packing (pack_gqa) forward epilogue
-# fails to JIT-compile on sm_12x (a CuTeDSL crd2idx rank mismatch in pack_gqa.store_LSE);
-# this bites every GQA model, including Qwen3 (32 q / 8 kv heads). xorl's FA4 custom op
-# (src/xorl/models/layers/attention/backend/fa4_custom_op.py) auto-disables pack_gqa on
-# sm_12x (passing pack_gqa=False, mirroring the still-unmerged upstream fix
-# Dao-AILab/flash-attention#2484); Hopper/B200 keep FA4's auto heuristic. The non-packed
-# path is functionally identical and ~free for training (pack_gqa only speeds memory-bound
-# decode; the FA4 backward never packs anyway). Override with XORL_FA4_PACK_GQA=1/0 to
-# force packing on/off regardless of GPU arch.
+# FA4 on Blackwell sm_12x: FA4's FlashAttentionForwardSm120 kernel has CuTeDSL codegen
+# bugs that crash the JIT *compile* at step 0 on sm_12x (RTX PRO 6000/5000, GB10) for our
+# packed/varlen GQA config (Qwen3 = 32 q / 8 kv heads). xorl's FA4 custom op
+# (src/xorl/models/layers/attention/backend/fa4_custom_op.py) monkeypatches the Sm120
+# forward class on sm_12x ONLY (gated on compute-capability major==12; Hopper sm_90 and
+# B200 sm_100 use different kernel classes and are untouched), replicating the still-
+# unmerged upstream fix Dao-AILab/flash-attention#2484's three __init__ overrides:
+#   1. arch = sm_80      -> CpAsync output store (no TMA-O on sm_12x); fixes the ragged
+#                           O-store "weakly congruent" error in the fwd epilogue
+#   2. is_split_kv=False -> attribute the shared Sm80 __call__ reads but Sm80 never sets
+#   3. pack_gqa = False  -> non-packed path; fixes the pack_gqa.store_LSE crd2idx crash
+# All three are ~free for training (pack_gqa only speeds memory-bound decode; the FA4
+# backward never packs anyway; CpAsync-vs-TMA O-store is a minor epilogue difference).
+# Override pack_gqa alone with XORL_FA4_PACK_GQA=1/0 if needed.
 ATTN_IMPL="${ATTN_IMPL:-flash_attention_4}"
 IMAGE="${IMAGE:-nvcr.io/nvidia/pytorch:25.01-py3}"
 DISK_GB="${DISK_GB:-150}"

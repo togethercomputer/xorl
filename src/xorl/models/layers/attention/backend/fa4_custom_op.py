@@ -31,38 +31,91 @@ logger = logging.get_logger(__name__)
 
 
 # --------------------------------------------------------------------------- #
-# pack_gqa (GQA query-head packing) gate                                      #
+# Blackwell sm_12x (RTX PRO / GeForce / DGX Spark) FA4 forward workarounds      #
 # --------------------------------------------------------------------------- #
-# FA4's pack_gqa forward epilogue (``pack_gqa.store_LSE`` -> ``compute_ptr``) fails to
-# JIT-compile on Blackwell sm_12x (RTX PRO / GeForce / DGX Spark) in this pinned
-# flash-attn-4 commit: a CuTeDSL ``crd2idx`` rank mismatch
-# (``cute.layout<"(?):(1)">`` vs ``cute.coord<"((?,?))">``) when storing LSE for the
-# packed-head layout. Upstream's fix is the still-UNMERGED PR Dao-AILab/flash-attention#2484,
-# which simply forces ``pack_gqa=False`` on the ``FlashAttentionForwardSm120`` subclass.
-# We do the same thing here at the call site so the fix is arch-targeted and does NOT
-# depend on pinning an unmerged commit.
+# In this pinned flash-attn-4 commit, FA4's ``FlashAttentionForwardSm120`` forward
+# kernel (a thin subclass of the Sm80 kernel) has CuTeDSL codegen bugs that crash the
+# JIT *compile* at step 0 on sm_12x. Two surface here with our packed/varlen GQA config:
+#   1. pack_gqa LSE-store epilogue (``pack_gqa.store_LSE`` -> ``compute_ptr``):
+#      ``crd2idx`` rank mismatch (``layout<"(?):(1)">`` vs ``coord<"((?,?))">``).
+#   2. TMA-O output store epilogue (``flash_fwd.py`` ``offset_batch_Q(..., ragged=True)``):
+#      ``layout<"(?,?):(?,1)">`` vs ``coord<"(_,_,?)">`` "weakly congruent" error.
+# Upstream's (still-UNMERGED) PR Dao-AILab/flash-attention#2484 fixes BOTH by overriding
+# three things in ``FlashAttentionForwardSm120.__init__``:
+#   - ``self.arch = Arch.sm_80``   -> routes O through the CpAsync path (no TMA-O on sm_12x); fixes (2)
+#   - ``self.is_split_kv = False`` -> attr the shared Sm80 ``__call__`` reads but Sm80 never sets
+#   - ``self.pack_gqa = False``    -> non-packed path; fixes (1)
+# We replicate that override in-process via a monkeypatch (``_patch_fa4_sm120_forward``)
+# rather than re-pinning to an unmerged branch. The patch is GATED to sm_12x only
+# (``_IS_SM12X``); Hopper (sm_90, FlashAttentionForwardSm90) and B200 (sm_100, ...Sm100)
+# never instantiate the Sm120 class and are completely untouched.
 #
-# Cost: ~none for training. pack_gqa only meaningfully helps the *memory-bound decode*
-# phase (small seqlen_q); our forward is long-seqlen / compute-bound, and the FA4 backward
-# ALREADY hard-forces pack_gqa off ("pack_gqa backward not yet supported"). Hopper (sm_90)
-# and B200 (sm_100) keep FA4's auto heuristic (``pack_gqa=None``) since packing compiles
-# fine there. Override with XORL_FA4_PACK_GQA=1/0 to force on/off regardless of arch.
+# Cost: ~none for training. pack_gqa only helps memory-bound *decode* (small seqlen_q);
+# our forward is long-seqlen / compute-bound, and the FA4 backward already hard-forces
+# pack_gqa off ("pack_gqa backward not yet supported"). CpAsync-O vs TMA-O is a minor
+# epilogue store difference. Override pack_gqa with XORL_FA4_PACK_GQA=1/0 if ever needed.
+def _device_is_sm12x() -> bool:
+    """True on Blackwell sm_12x (sm_120 RTX PRO / sm_121 GB10), where FA4's Sm120
+    forward kernel has the JIT-compile bugs the workarounds below address."""
+    try:
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_capability()[0] == 12
+    except Exception:  # pragma: no cover - never let a device probe break import
+        pass
+    return False
+
+
+_IS_SM12X = _device_is_sm12x()
+
+
 def _resolve_pack_gqa() -> Optional[bool]:
-    """Return the ``pack_gqa`` value to pass to FA4 fwd: False on sm_12x, else None (auto)."""
+    """``pack_gqa`` value to pass to FA4 fwd: False on sm_12x, else None (FA4 auto)."""
     override = os.environ.get("XORL_FA4_PACK_GQA")
     if override is not None:
         return override == "1"
-    try:
-        if torch.cuda.is_available():
-            major, _minor = torch.cuda.get_device_capability()
-            if major == 12:  # sm_12x Blackwell (sm_120 RTX PRO / sm_121 GB10): pack_gqa JIT-broken
-                return False
-    except Exception:  # pragma: no cover - never let a device probe break import
-        pass
-    return None  # Hopper / B200 / unknown: let FA4 auto-decide
+    return False if _IS_SM12X else None  # Hopper / B200 / unknown: let FA4 auto-decide
 
 
 _FA4_PACK_GQA = _resolve_pack_gqa()
+
+
+def _patch_fa4_sm120_forward() -> bool:
+    """Apply PR #2484's ``FlashAttentionForwardSm120.__init__`` overrides in-process.
+
+    Wraps the class ``__init__`` to force ``arch=sm_80`` (CpAsync output path),
+    ``is_split_kv=False``, and ``pack_gqa=False`` after the base init runs — exactly
+    what the unmerged upstream fix does — without re-pinning the dependency. Idempotent;
+    only the caller gates it to sm_12x. Returns True if it patched, else False.
+    """
+    try:
+        from cutlass.base_dsl.arch import Arch
+        from flash_attn.cute import flash_fwd_sm120
+    except Exception:  # pragma: no cover - FA4/cute overlay not present
+        return False
+    cls = getattr(flash_fwd_sm120, "FlashAttentionForwardSm120", None)
+    if cls is None or getattr(cls, "_xorl_sm120_patched", False):
+        return False
+    _orig_init = cls.__init__
+
+    def _patched_init(self, *args, **kwargs):
+        _orig_init(self, *args, **kwargs)
+        # Base Sm80 __init__ sets self.arch to the real GPU enum (sm_121a >= sm_90),
+        # which selects the TMA-O store path that fails to compile on sm_12x. Force
+        # sm_80 so use_tma_O resolves False (CpAsync output path).
+        self.arch = Arch.sm_80
+        self.is_split_kv = False  # Sm80 base never sets it; shared __call__ reads it
+        self.pack_gqa = False  # packed-GQA LSE-store epilogue is sm_12x JIT-broken
+
+    cls.__init__ = _patched_init
+    cls._xorl_sm120_patched = True
+    logger.info("Applied FA4 FlashAttentionForwardSm120 sm_12x compile workarounds (PR #2484).")
+    return True
+
+
+# Apply the sm_12x forward workarounds at import, BEFORE any kernel is built. Gated to
+# sm_12x so Hopper/B200 are untouched.
+if _IS_SM12X:
+    _patch_fa4_sm120_forward()
 
 
 # Lower-level FA4 CuTe entry points. These bypass FA4's own
