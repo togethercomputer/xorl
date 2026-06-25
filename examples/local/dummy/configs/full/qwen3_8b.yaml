@@ -27,6 +27,7 @@ train:
   tensor_parallel_size: 1
 
   num_train_epochs: 5
+  max_steps: 25                  # bound the dummy-data perf run (profiling, not real training)
 
   # batch size
   micro_batch_size: 1
@@ -52,6 +53,12 @@ train:
   ckpt_manager: dcp
   save_steps: 1000
   save_hf_weights: true
+
+  # torch.profiler steady-state window (launch_multi_gpu.sh PROFILE=1 passes
+  # --train.enable_profiling true + --train.profile_trace_dir). 15..20 sits past the
+  # first-iteration FSDP all-gather / allocator warmup so the capture is steady-state.
+  profile_start_step: 15
+  profile_end_step: 20
 
   # wandb
   use_wandb: false

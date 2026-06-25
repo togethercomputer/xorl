@@ -13,8 +13,8 @@
 #     marketplace search.
 #   - torchrun runs --nproc_per_node=$NUM_GPUS (8 ranks, one per GPU). XoRL's Trainer
 #     inits torch.distributed from the elastic env and builds the device mesh from the
-#     config's parallel sizes (the default config is TP=4 x FSDP-shard=2 => world_size 8,
-#     with enable_compile=true so decoder layers are per-layer torch.compile'd).
+#     config's parallel sizes (the default config is pure FSDP2 shard=8 => world_size 8,
+#     no TP/EP; the branch default for measuring FSDP all-gather/reduce-scatter overlap).
 #   - XORL_COMPILE_WHOLE_BACKBONE=0 is exported: do NOT fold the whole fwd/bwd backbone
 #     into one CUDA-graph region. Whole-backbone capture is single-GPU only (FSDP/SP
 #     per-layer all-gather + collective hooks fragment the region), so it is disabled
@@ -30,7 +30,7 @@
 #
 # Usage:  ./launch_multi_gpu.sh <config.yaml> [-- extra args forwarded to xorl.cli.train]
 #   config.yaml: the XoRL run to train
-#                (default: examples/local/dummy/configs/full/qwen3_8b_tp4_compile.yaml)
+#                (default: examples/local/dummy/configs/full/qwen3_8b.yaml — pure FSDP2 shard=8)
 #   Env knobs:
 #     NUM_GPUS     GPUs on the single node = torchrun --nproc_per_node (default 8)
 #     ATTN_IMPL    --model.attn_implementation override (default flash_attention_4;
@@ -39,10 +39,10 @@
 #     PROFILE      set =1 to also run XoRL's built-in torch.profiler + fetch traces
 #     IMAGE        docker image (default NGC pytorch)
 #     DISK_GB      instance disk (default 150; 8B weights + uv venv + cache)
-#     MAX_DPH      max $/hr to accept (default 26.0; picks the CHEAPEST node clearing the
-#                  thresholds — Blackwell RTX PRO nodes run ~$5-14/hr, H100_SXM ~$23/hr)
-#     GPU_NAMES    comma-sep Vast gpu_name tokens to accept (default: H100 SXM/NVL/PCIE +
-#                  RTX_PRO_6000_WS/_S + RTX_PRO_5000)
+#     MAX_DPH      max $/hr to accept (default 30.0; picks the CHEAPEST node clearing the
+#                  thresholds — H100_SXM ~$19-23/hr, H200 ~$27-30/hr)
+#     GPU_NAMES    comma-sep Vast gpu_name tokens to accept (default: H100 SXM/NVL/PCIE
+#                  + H200 — all Hopper sm_90, NVLink, FA3/FA4 both work)
 #     MIN_RELIABILITY min host reliability (default 0.98)
 #     MIN_CUDA     min host-driver CUDA via cuda_max_good (default 12.6)
 #     KEEP         set =1 to `stop` (keep disk) instead of `destroy` at the end
@@ -52,7 +52,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 REPO_ROOT="$(cd .. && pwd)"
 
-CONFIG="${1:-examples/local/dummy/configs/full/qwen3_8b_tp4_compile.yaml}"; shift || true
+CONFIG="${1:-examples/local/dummy/configs/full/qwen3_8b.yaml}"; shift || true
 [[ "${1:-}" == "--" ]] && shift || true
 CONFIG_STEM="$(basename "${CONFIG%.*}")"
 NUM_GPUS="${NUM_GPUS:-8}"
@@ -81,8 +81,9 @@ ATTN_IMPL="${ATTN_IMPL:-flash_attention_4}"
 IMAGE="${IMAGE:-nvcr.io/nvidia/pytorch:25.01-py3}"
 DISK_GB="${DISK_GB:-150}"
 # 8xH100_SXM single nodes are SCARCE on Vast (often just one in the whole marketplace,
-# ~$23/hr) — far rarer/pricier than the 1xH100 the sibling launch.sh targets. Cap higher.
-MAX_DPH="${MAX_DPH:-26.0}"
+# ~$19-23/hr, and sometimes only on too-old drivers) — far rarer than the 1xH100 the sibling
+# launch.sh targets. Cap at 30 so the H200 fallback (~$27-30/hr) is reachable by default.
+MAX_DPH="${MAX_DPH:-30.0}"
 # Min reliability. Floor at 0.98 (not 0.99): the few 8-GPU nodes that exist can sit just
 # under 0.99, and there is no cheaper alternative to fall back to.
 MIN_RELIABILITY="${MIN_RELIABILITY:-0.98}"
@@ -91,13 +92,17 @@ MIN_RELIABILITY="${MIN_RELIABILITY:-0.98}"
 # host whose driver caps below the toolkit risks the cute JIT failing. Floor to 12.6.
 MIN_CUDA="${MIN_CUDA:-12.6}"
 # GPU types to accept (Vast gpu_name query tokens, comma-separated). Restricted to
-# datacenter H100 (SXM/NVL/PCIE). We deliberately DROP the cheaper Blackwell workstation
-# cards (RTX PRO 6000 WS/S, RTX PRO 5000): even with the FA4 sm_12x compile-time
-# monkeypatch above, FA4 still RUNTIME-IMAs on sm_120 for this config, so those nodes
-# aren't viable for the FA4 path — use H100 (sm_90) instead. Qwen3-8B (TP=4 x
-# FSDP-shard=2) fits comfortably on 80GB H100; we pick the CHEAPEST H100 node that passes
-# the thresholds below. (Override GPU_NAMES to re-include Blackwell e.g. for an sdpa run.)
-GPU_NAMES="${GPU_NAMES:-H100_SXM,H100_NVL,H100_PCIE}"
+# datacenter Hopper: H100 (SXM/NVL/PCIE) + H200 — all sm_90 with NVLink, where the config's
+# flash_attention_3 (and FA4) run natively. H200 is included because 8xH100_SXM single nodes
+# are scarce on Vast (often none, or stuck on too-old drivers); H200 is the same Hopper arch
+# with NVLink, so the FSDP all-gather/reduce-scatter comm-overlap profile transfers directly.
+# We deliberately DROP the cheaper Blackwell workstation cards (RTX PRO 6000 WS/S, RTX PRO
+# 5000): even with the FA4 sm_12x compile-time monkeypatch above, FA4 still RUNTIME-IMAs on
+# sm_120 for this config, and those are PCIe (no NVLink) so their comm profile is
+# unrepresentative. Qwen3-8B (pure FSDP2 shard=8) fits comfortably on 80GB H100 / 141GB H200;
+# we pick the CHEAPEST qualifying node. (Override GPU_NAMES to re-include Blackwell, e.g. for
+# an sdpa run.)
+GPU_NAMES="${GPU_NAMES:-H100_SXM,H100_NVL,H100_PCIE,H200}"
 # results/ is gitignored (large binary logs/outputs). Fetch into the MAIN
 # worktree's results/ regardless of which worktree we launch from (porcelain lists it first).
 MAIN_WT="$(git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')"
