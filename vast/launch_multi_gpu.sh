@@ -33,7 +33,12 @@
 #                (default: examples/local/dummy/configs/full/qwen3_8b.yaml — pure FSDP2 shard=8)
 #   Env knobs:
 #     NUM_GPUS     GPUs on the single node = torchrun --nproc_per_node (default 8)
-#     PROFILE      set =1 to also run XoRL's built-in torch.profiler + fetch traces
+#     PROFILE      set =1 to also run XoRL's built-in torch.profiler + fetch traces (DEFAULT profiler)
+#     NSYS         set =1 to profile with Nsight Systems INSTEAD of torch.profiler — needed for the
+#                  genuine whole-step cudagraph path, which torch.profiler crashes (cudagraph-trees
+#                  setCheckpointPoolState, pytorch#75504). NSYS=1 forces torch.profiler OFF and fetches
+#                  a .nsys-rep + nsys-stats summaries. Reports are large; use a small max_steps
+#                  (e.g. `-- --train.max_steps 12`) for the capture.
 #     IMAGE        docker image (default NGC pytorch)
 #     DISK_GB      instance disk (default 150; 8B weights + uv venv + cache)
 #     MAX_DPH      max $/hr to accept (default 30.0; picks the CHEAPEST node clearing the
@@ -236,6 +241,18 @@ done
 PROFILE_ARGS=""
 [[ "${PROFILE:-0}" == "1" ]] && PROFILE_ARGS="--train.enable_profiling true --train.profile_trace_dir /workspace/out/trace --train.profile_profile_memory false"
 
+# NSYS=1: profile with Nsight Systems INSTEAD of torch.profiler. torch.profiler is the DEFAULT, but it
+# cannot trace the GENUINE whole-step cudagraph path — its in-process CUPTI/Kineto perturbs the
+# cudagraph-trees allocator pool checkpoint and crashes (setCheckpointPoolState / curr_block->next,
+# pytorch#75504) once the whole step actually cudagraph-captures. nsys traces the GPU timeline
+# externally, so it survives. NSYS=1 therefore forces torch.profiler OFF (clears PROFILE_ARGS) to keep
+# the cudagraph path clean; the heredoc below wraps torchrun in `nsys profile` and runs `nsys stats`.
+NSYS_MODE="${NSYS:-0}"
+if [[ "$NSYS_MODE" == "1" ]]; then
+  PROFILE_ARGS=""
+  echo ">> NSYS=1: Nsight Systems profiling (torch.profiler disabled for this run — cudagraph path)"
+fi
+
 # Resolve the torch.compile flags from THIS launcher's env so a run can opt in without editing
 # this script (they're baked into the remote heredoc below). Whole-model paths take their
 # multi-GPU defaults; reduce-overhead (CUDA-graph capture) auto-enables whenever either
@@ -280,17 +297,36 @@ source .venv/bin/activate
 export XORL_COMPILE_WHOLE_BACKBONE=$COMPILE_WHOLE_BACKBONE
 export XORL_COMPILE_WHOLE_STEP=$COMPILE_WHOLE_STEP
 export XORL_COMPILE_REDUCE_OVERHEAD=$COMPILE_REDUCE_OVERHEAD
-echo "compile flags: WHOLE_BACKBONE=\$XORL_COMPILE_WHOLE_BACKBONE WHOLE_STEP=\$XORL_COMPILE_WHOLE_STEP REDUCE_OVERHEAD=\$XORL_COMPILE_REDUCE_OVERHEAD"
+# Diagnostic passthrough: set TORCH_LOGS locally (e.g. TORCH_LOGS=graph_breaks,recompiles) to
+# dump Dynamo graph-break / recompile reasons into train.log at compile time. Empty = no logging.
+export TORCH_LOGS="$TORCH_LOGS"
+echo "compile flags: WHOLE_BACKBONE=\$XORL_COMPILE_WHOLE_BACKBONE WHOLE_STEP=\$XORL_COMPILE_WHOLE_STEP REDUCE_OVERHEAD=\$XORL_COMPILE_REDUCE_OVERHEAD TORCH_LOGS=\$TORCH_LOGS"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv || true
 python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), 'device_count', torch.cuda.device_count())"
 echo "=== train ($NUM_GPUS-way torchrun) ==="
 # XoRL is torchrun-based (Trainer inits torch.distributed from the elastic env and builds
 # the device mesh from the config's parallel sizes); --standalone gives a single-node
 # rendezvous on a free port. nproc_per_node=$NUM_GPUS launches one rank per GPU.
-torchrun --standalone --nproc_per_node=$NUM_GPUS -m xorl.cli.train "$CONFIG" \
-  $PROFILE_ARGS \
-  ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 2>&1 | tee /workspace/out/train.log | tail -60 || true
-ls -lhR /workspace/out
+if [[ "$NSYS_MODE" == "1" ]]; then
+  # nsys path (torch.profiler OFF; PROFILE_ARGS empty). nsys traces the cudagraph GPU timeline
+  # externally — no --train.enable_profiling, so the cudagraph-trees pool checkpoint isn't perturbed.
+  # The NGC image ships Nsight Systems; resolve the binary remotely (PATH or /opt/nvidia/...).
+  NSYS=\$(command -v nsys || ls /opt/nvidia/nsight-systems*/*/bin/nsys /opt/nvidia/nsight-systems*/bin/nsys 2>/dev/null | head -1)
+  echo "nsys = \$NSYS"; "\$NSYS" --version || true
+  "\$NSYS" profile --trace-fork-before-exec=true -t cuda,nvtx -s none --force-overwrite=true \
+    -o /workspace/out/${CONFIG_STEM}_nsys \
+    torchrun --standalone --nproc_per_node=$NUM_GPUS -m xorl.cli.train "$CONFIG" \
+    ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 2>&1 | tee /workspace/out/train.log | tail -60 || true
+  echo "=== nsys stats: CUDA API summary (cudaGraphLaunch vs cudaLaunchKernel) ==="
+  "\$NSYS" stats --report cuda_api_sum /workspace/out/${CONFIG_STEM}_nsys.nsys-rep 2>&1 | tee /workspace/out/nsys_api_sum.txt | head -35 || true
+  echo "=== nsys stats: GPU kernel summary (compute + NCCL/comm) ==="
+  "\$NSYS" stats --report cuda_gpu_kern_sum /workspace/out/${CONFIG_STEM}_nsys.nsys-rep 2>&1 | tee /workspace/out/nsys_kern_sum.txt | head -45 || true
+else
+  torchrun --standalone --nproc_per_node=$NUM_GPUS -m xorl.cli.train "$CONFIG" \
+    $PROFILE_ARGS \
+    ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 2>&1 | tee /workspace/out/train.log | tail -60 || true
+fi
+ls -lhR /workspace/out | head -25
 EOF
 
 echo ">> fetching logs/outputs to $RESULTS_DIR ..."
