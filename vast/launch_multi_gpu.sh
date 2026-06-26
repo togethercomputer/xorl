@@ -289,9 +289,9 @@ source .venv/bin/activate
 #                                  rather than ~2 — that fragmentation is expected, not a bug.
 #   XORL_COMPILE_WHOLE_STEP=1      additionally folds lm_head+CE into the loss callable and flips
 #                                  torch._dynamo.config.skip_fsdp_hooks=False (Traceable FSDP2).
-#                                  WARNING: this path uses NON-chunked CE and materializes the full
-#                                  [N, vocab] fp32 logits, so it OOMs at large packing on the 8B
-#                                  model — use a SMALL sample_packing_sequence_len (~8k, not 32k).
+#                                  The CE is a traceable chunked unroll (no full [N, vocab] logits;
+#                                  peak = one chunk), so large packing no longer OOMs. Tune the
+#                                  token-chunk count with XORL_WHOLE_STEP_CE_CHUNKS (default 8).
 #   XORL_COMPILE_REDUCE_OVERHEAD   mode=reduce-overhead (CUDA-graph capture). Auto-set to 1 above
 #                                  whenever WHOLE_BACKBONE or WHOLE_STEP is 1; override by exporting.
 export XORL_COMPILE_WHOLE_BACKBONE=$COMPILE_WHOLE_BACKBONE

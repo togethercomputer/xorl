@@ -9,6 +9,7 @@ from typing import Callable, Dict
 
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 # Cache for compiled cross-entropy functions
@@ -245,3 +246,77 @@ def _get_compiled_reverse_kl_fn(num_chunks: int) -> Callable:
         else:
             _compiled_reverse_kl_cache[cache_key] = torch.compile(_compute_reverse_kl)
     return _compiled_reverse_kl_cache[cache_key]
+
+
+def traceable_chunked_cross_entropy(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    labels: torch.Tensor,
+    ignore_index: int = -100,
+    num_chunks: int = 8,
+    reduction: str = "sum",
+) -> torch.Tensor:
+    """Chunked linear cross-entropy with **no inner torch.compile**.
+
+    Unlike ``compiled_cross_entropy_function`` (which wraps an ``auto_chunker`` inductor
+    pass in its own ``torch.compile`` and therefore can't be nested inside another compiled
+    region), this is plain, traceable PyTorch: a **static Python unroll** over ``num_chunks``
+    token chunks. Each chunk computes ``logits = (hidden_chunk @ weightᵀ).float()`` →
+    ``F.cross_entropy`` and is wrapped in activation checkpointing so the backward
+    **recomputes** the chunk's logits instead of stashing them (matching what ``auto_chunker``
+    does internally). Peak logits stay at one chunk — ``[ceil(N/num_chunks), vocab]`` — in
+    *both* forward and backward.
+
+    Because there is no inner ``torch.compile`` and (under static shapes) the loop unrolls at
+    trace time, Dynamo folds this into an enclosing compiled region — e.g. the whole-step
+    graph (backbone + lm_head + CE) — so the chunked CE no longer has to live in a separate
+    graph the way the ``auto_chunker`` path does.
+
+    Args:
+        hidden_states: Flattened hidden states, shape ``[N, hidden]`` (``N = batch * seq``).
+        weight: LM-head weight, shape ``[vocab, hidden]``.
+        labels: Flattened next-token labels, shape ``[N]``.
+        ignore_index: Label value excluded from the loss (default -100).
+        num_chunks: Number of token chunks to unroll over. ``<= 1`` means no chunking.
+        reduction: ``"sum"`` (default) or ``"mean"`` → scalar; ``"none"`` → per-token ``[N]``.
+            ``"mean"`` divides by the number of valid (non-ignored) tokens, matching
+            ``F.cross_entropy(reduction="mean")``.
+
+    Returns:
+        Scalar loss for ``"sum"``/``"mean"``, or per-token loss ``[N]`` for ``"none"``.
+    """
+    n = int(hidden_states.shape[0])
+    chunks = max(1, num_chunks)
+    # ceil division → static Python int so the loop below unrolls under torch.compile.
+    chunk_size = (n + chunks - 1) // chunks
+
+    def _chunk_loss(h_chunk: torch.Tensor, l_chunk: torch.Tensor) -> torch.Tensor:
+        logits = (h_chunk @ weight.t()).float()
+        return F.cross_entropy(logits, l_chunk, reduction="none", ignore_index=ignore_index)
+
+    # Recompute per chunk in backward (instead of saving every chunk's logits) only when there
+    # is a grad to compute; in inference there's nothing to recompute, so skip the overhead.
+    use_checkpoint = torch.is_grad_enabled() and (
+        hidden_states.requires_grad or weight.requires_grad
+    )
+
+    parts = []
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        h_chunk = hidden_states[start:end]
+        l_chunk = labels[start:end]
+        if use_checkpoint:
+            ce_chunk = checkpoint(_chunk_loss, h_chunk, l_chunk, use_reentrant=False)
+        else:
+            ce_chunk = _chunk_loss(h_chunk, l_chunk)
+        parts.append(ce_chunk)
+
+    per_token = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+    if reduction == "none":
+        return per_token
+    if reduction == "sum":
+        return per_token.sum()
+    if reduction == "mean":
+        valid = (labels != ignore_index).sum().clamp(min=1)
+        return per_token.sum() / valid
+    raise ValueError(f"reduction must be 'none', 'sum', or 'mean', got {reduction!r}")
