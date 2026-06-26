@@ -226,8 +226,15 @@ done
 
 # Optional profiling: PROFILE=1 adds XoRL's built-in torch.profiler (Chrome/TensorBoard
 # traces to /workspace/out/trace). Default is a plain training run.
+#
+# profile_memory is forced OFF under the whole-step reduce-overhead (cudagraph-trees) path:
+# torch.profiler's profile_memory hooks the CUDA caching allocator, which perturbs the
+# cudagraph-trees pool checkpoint and re-trips the `curr_block->next == nullptr` /
+# setCheckpointPoolState crash at step 2 (documented: pytorch/pytorch#75504). record_shapes
+# is kept so the trace still carries shape info. Override by editing here if you ever profile
+# without reduce-overhead.
 PROFILE_ARGS=""
-[[ "${PROFILE:-0}" == "1" ]] && PROFILE_ARGS="--train.enable_profiling true --train.profile_trace_dir /workspace/out/trace"
+[[ "${PROFILE:-0}" == "1" ]] && PROFILE_ARGS="--train.enable_profiling true --train.profile_trace_dir /workspace/out/trace --train.profile_profile_memory false"
 
 # Resolve the torch.compile flags from THIS launcher's env so a run can opt in without editing
 # this script (they're baked into the remote heredoc below). Whole-model paths take their
