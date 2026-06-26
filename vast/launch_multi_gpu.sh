@@ -253,7 +253,20 @@ PROFILE_ARGS=""
 ATTN_ARGS=""
 [[ -n "$ATTN_IMPL" ]] && ATTN_ARGS="--model.attn_implementation $ATTN_IMPL"
 
+# Resolve the torch.compile flags from THIS launcher's env so a run can opt in without editing
+# this script (they're baked into the remote heredoc below). Whole-model paths take their
+# multi-GPU defaults; reduce-overhead (CUDA-graph capture) auto-enables whenever either
+# whole-model path is on — so you don't have to set it per run — unless you export it explicitly.
+COMPILE_WHOLE_BACKBONE="${XORL_COMPILE_WHOLE_BACKBONE:-0}"
+COMPILE_WHOLE_STEP="${XORL_COMPILE_WHOLE_STEP:-1}"
+if [[ "$COMPILE_WHOLE_BACKBONE" == "1" || "$COMPILE_WHOLE_STEP" == "1" ]]; then
+  COMPILE_REDUCE_OVERHEAD="${XORL_COMPILE_REDUCE_OVERHEAD:-1}"
+else
+  COMPILE_REDUCE_OVERHEAD="${XORL_COMPILE_REDUCE_OVERHEAD:-0}"
+fi
+
 echo ">> installing XoRL (repo-recommended 'uv sync') + training $CONFIG on $NUM_GPUS H100s ..."
+echo ">> compile flags (forwarded to remote): WHOLE_BACKBONE=$COMPILE_WHOLE_BACKBONE WHOLE_STEP=$COMPILE_WHOLE_STEP REDUCE_OVERHEAD=$COMPILE_REDUCE_OVERHEAD"
 "${SSH[@]}" bash -s <<EOF
 set -e
 cd /workspace/repo
@@ -268,9 +281,8 @@ echo "=== uv sync (pulls flash-attn-4 / cute stack) ==="
 uv sync 2>&1 | tee /workspace/out/install.log | tail -25
 # Activate the .venv so bare 'python'/'torchrun' resolve to the uv-managed env.
 source .venv/bin/activate
-# Compile flags are forwarded from the LOCAL launcher env (this is an unquoted heredoc, so the
-# ${VAR:-default} below expand HERE on the launcher) so a run can opt in per-run without editing
-# this script; the torchrun children on the box inherit them.
+# torch.compile flags, baked in from the launcher's local env (resolved above); the torchrun
+# children on the box inherit them.
 #   XORL_COMPILE_WHOLE_BACKBONE=1  wraps self.model.model in ONE torch.compile region. Under FSDP
 #                                  the per-layer all-gather/collective hooks break that region at
 #                                  every comm boundary, so Inductor emits MANY cudagraphs/step
@@ -280,10 +292,11 @@ source .venv/bin/activate
 #                                  WARNING: this path uses NON-chunked CE and materializes the full
 #                                  [N, vocab] fp32 logits, so it OOMs at large packing on the 8B
 #                                  model — use a SMALL sample_packing_sequence_len (~8k, not 32k).
-#   XORL_COMPILE_REDUCE_OVERHEAD=1 mode=reduce-overhead (CUDA-graph capture).
-export XORL_COMPILE_WHOLE_BACKBONE=${XORL_COMPILE_WHOLE_BACKBONE:-0}
-export XORL_COMPILE_WHOLE_STEP=${XORL_COMPILE_WHOLE_STEP:-1}
-export XORL_COMPILE_REDUCE_OVERHEAD=${XORL_COMPILE_REDUCE_OVERHEAD:-0}
+#   XORL_COMPILE_REDUCE_OVERHEAD   mode=reduce-overhead (CUDA-graph capture). Auto-set to 1 above
+#                                  whenever WHOLE_BACKBONE or WHOLE_STEP is 1; override by exporting.
+export XORL_COMPILE_WHOLE_BACKBONE=$COMPILE_WHOLE_BACKBONE
+export XORL_COMPILE_WHOLE_STEP=$COMPILE_WHOLE_STEP
+export XORL_COMPILE_REDUCE_OVERHEAD=$COMPILE_REDUCE_OVERHEAD
 echo "compile flags: WHOLE_BACKBONE=\$XORL_COMPILE_WHOLE_BACKBONE WHOLE_STEP=\$XORL_COMPILE_WHOLE_STEP REDUCE_OVERHEAD=\$XORL_COMPILE_REDUCE_OVERHEAD"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv || true
 python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), 'device_count', torch.cuda.device_count())"
