@@ -43,7 +43,7 @@ from xorl.models.transformers.deepseek_v3.support import (
     freeze_deepseek_v3_router_parameters,
     validate_deepseek_v3_training_mode,
 )
-from xorl.ops.loss.compiled_cross_entropy import DEFAULT_NUM_CHUNKS, traceable_chunked_cross_entropy
+from xorl.ops.loss.compiled_cross_entropy import traceable_full_cross_entropy
 from xorl.optim import build_lr_scheduler, build_optimizer
 from xorl.qlora import (
     detect_prequantized_block_fp8,
@@ -925,16 +925,15 @@ class Trainer:
         if _whole_step:
             _ws_mode = "reduce-overhead" if os.environ.get("XORL_COMPILE_REDUCE_OVERHEAD") == "1" else None
             _ws_dynamic = os.environ.get("XORL_COMPILE_DYNAMIC", "0") == "1"
-            # Token-dim chunks for the in-graph CE unroll (more chunks = less peak logits memory,
-            # more matmuls). Use the SAME num_chunks the regular loss path feeds
-            # causallm_loss_function — whatever's in _causallm_loss_params, else the shared
-            # default — so both CE paths chunk identically. Captured here at setup; the whole-step
-            # graph compiles once and bakes this value in (changing it later has no effect).
-            self._whole_step_ce_chunks = self._causallm_loss_params.get("num_chunks", DEFAULT_NUM_CHUNKS)
+            # Whole-step CE materializes the full [N, vocab] logits ONCE (non-chunked). Chunking did
+            # per-chunk dynamic alloc/free inside the captured region, which corrupted the
+            # cudagraph-trees static pool and crashed (setCheckpointPoolState) — reproduced with no
+            # profiler at all, so it was inherent to the capture. A single static logits allocation is
+            # cudagraph-safe and, under cudagraph, no worse on memory (the pool pinned the union of
+            # chunk buffers anyway). See traceable_full_cross_entropy.
             self._whole_step = torch.compile(self._whole_step_impl, mode=_ws_mode, dynamic=_ws_dynamic)
             logger.info_rank0(
-                f"WHOLE-STEP torch.compile (backbone+lm_head+chunked-CE one region, mode={_ws_mode}, "
-                f"ce_chunks={self._whole_step_ce_chunks})"
+                f"WHOLE-STEP torch.compile (backbone+lm_head+full-logits-CE one region, mode={_ws_mode})"
             )
 
         logger.info(
@@ -1141,20 +1140,20 @@ class Trainer:
     ) -> torch.Tensor:
         """Backbone + lm_head + cross-entropy in one callable (for whole-step torch.compile).
 
-        Uses the traceable chunked CE (``traceable_chunked_cross_entropy``) rather than a vanilla
-        full-logits ``F.cross_entropy``: it unrolls over token chunks with per-chunk checkpointing
-        and NO inner ``torch.compile``, so it folds into this single compiled graph WITHOUT
-        materializing the full [N, vocab] logits (peak logits = one chunk, fwd and bwd). Used only
-        by the experimental XORL_COMPILE_WHOLE_STEP path.
+        Uses ``traceable_full_cross_entropy`` (non-chunked: the full ``[N, vocab]`` logits are
+        materialized ONCE) rather than a chunked unroll. Chunking did per-chunk dynamic alloc/free
+        that corrupted the cudagraph-trees static pool and crashed (``setCheckpointPoolState``,
+        reproduced with no profiler); a single static logits allocation is cudagraph-safe and no
+        worse on memory under capture. No inner ``torch.compile``, so it folds into this one compiled
+        graph. Used only by the experimental XORL_COMPILE_WHOLE_STEP path.
         """
         outputs = self.model(**micro_batch, use_cache=False, output_hidden_states=False)
         hidden = outputs.last_hidden_state
-        loss = traceable_chunked_cross_entropy(
+        loss = traceable_full_cross_entropy(
             hidden.reshape(-1, hidden.size(-1)),
             get_lm_head_weight(self.model.lm_head),
             labels.reshape(-1),
             ignore_index=IGNORE_INDEX,
-            num_chunks=self._whole_step_ce_chunks,
             reduction="sum",
         )
         return loss / global_valid_tokens

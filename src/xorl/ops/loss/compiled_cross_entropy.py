@@ -321,3 +321,32 @@ def traceable_chunked_cross_entropy(
         valid = (labels != ignore_index).sum().clamp(min=1)
         return per_token.sum() / valid
     raise ValueError(f"reduction must be 'none', 'sum', or 'mean', got {reduction!r}")
+
+
+def traceable_full_cross_entropy(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    labels: torch.Tensor,
+    ignore_index: int = -100,
+    reduction: str = "sum",
+) -> torch.Tensor:
+    """Non-chunked linear cross-entropy: materialize the FULL ``[N, vocab]`` logits ONCE.
+
+    For the whole-step reduce-overhead (cudagraph-trees) path. The chunked variant
+    (``traceable_chunked_cross_entropy``) allocates and frees a logits tensor PER chunk inside the
+    captured region — a dynamic alloc/free pattern that corrupts Inductor's cudagraph-trees static
+    memory pool and crashes in ``_cuda_setCheckpointPoolState`` ("curr_block->next"). That crash
+    reproduces with NO profiler and NO nsys, so it is inherent to the capture, not a profiler
+    artifact. Doing the matmul once yields a SINGLE, fixed-size logits allocation per iteration — a
+    static pattern the cudagraph pool can reserve.
+
+    Memory note: peak logits = full ``[N, vocab]``, but this is NOT worse than the chunked path under
+    cudagraph — cudagraph already pinned the union of all chunk buffers (≈ the full ``[N, vocab]``),
+    so chunking bought no memory win once captured. ``.float()`` upcasts logits to fp32 (same as the
+    chunked path). No inner ``torch.compile``, so it folds into the enclosing whole-step graph.
+
+    Args mirror ``traceable_chunked_cross_entropy`` minus ``num_chunks``. ``reduction`` is forwarded
+    to ``F.cross_entropy`` (``"sum"``/``"mean"``/``"none"``); ``"mean"`` divides by valid tokens.
+    """
+    logits = (hidden_states @ weight.t()).float()  # [N, vocab] — one static allocation, no chunk loop
+    return F.cross_entropy(logits, labels, reduction=reduction, ignore_index=ignore_index)
