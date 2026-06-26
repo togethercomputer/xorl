@@ -268,16 +268,23 @@ echo "=== uv sync (pulls flash-attn-4 / cute stack) ==="
 uv sync 2>&1 | tee /workspace/out/install.log | tail -25
 # Activate the .venv so bare 'python'/'torchrun' resolve to the uv-managed env.
 source .venv/bin/activate
-# MULTI-GPU: do NOT cudagraph the whole fwd/bwd backbone (single-GPU only). Per-layer
-# compile still applies if the config enables it; the torchrun children inherit this.
-export XORL_COMPILE_WHOLE_BACKBONE=0
-# Whole-step compile: fold backbone + lm_head + cross-entropy into ONE compiled region so the
-# loss is computed INSIDE the model. With XORL_COMPILE_WHOLE_STEP=1 the trainer also flips
-# torch._dynamo.config.skip_fsdp_hooks=False (Traceable FSDP2 — trace FSDP collectives into the
-# graph). WARNING: this path uses NON-chunked CE and materializes the full [N, vocab] fp32
-# logits, so it OOMs at large packing on the 8B model — use a SMALL sample_packing_sequence_len
-# (~8k, not the config's 32k). The torchrun children inherit this.
-export XORL_COMPILE_WHOLE_STEP=1
+# Compile flags are forwarded from the LOCAL launcher env (this is an unquoted heredoc, so the
+# ${VAR:-default} below expand HERE on the launcher) so a run can opt in per-run without editing
+# this script; the torchrun children on the box inherit them.
+#   XORL_COMPILE_WHOLE_BACKBONE=1  wraps self.model.model in ONE torch.compile region. Under FSDP
+#                                  the per-layer all-gather/collective hooks break that region at
+#                                  every comm boundary, so Inductor emits MANY cudagraphs/step
+#                                  rather than ~2 — that fragmentation is expected, not a bug.
+#   XORL_COMPILE_WHOLE_STEP=1      additionally folds lm_head+CE into the loss callable and flips
+#                                  torch._dynamo.config.skip_fsdp_hooks=False (Traceable FSDP2).
+#                                  WARNING: this path uses NON-chunked CE and materializes the full
+#                                  [N, vocab] fp32 logits, so it OOMs at large packing on the 8B
+#                                  model — use a SMALL sample_packing_sequence_len (~8k, not 32k).
+#   XORL_COMPILE_REDUCE_OVERHEAD=1 mode=reduce-overhead (CUDA-graph capture).
+export XORL_COMPILE_WHOLE_BACKBONE=${XORL_COMPILE_WHOLE_BACKBONE:-0}
+export XORL_COMPILE_WHOLE_STEP=${XORL_COMPILE_WHOLE_STEP:-1}
+export XORL_COMPILE_REDUCE_OVERHEAD=${XORL_COMPILE_REDUCE_OVERHEAD:-0}
+echo "compile flags: WHOLE_BACKBONE=\$XORL_COMPILE_WHOLE_BACKBONE WHOLE_STEP=\$XORL_COMPILE_WHOLE_STEP REDUCE_OVERHEAD=\$XORL_COMPILE_REDUCE_OVERHEAD"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv || true
 python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), 'device_count', torch.cuda.device_count())"
 echo "=== train ($NUM_GPUS-way torchrun) ==="
