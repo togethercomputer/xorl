@@ -11,6 +11,11 @@ import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+# Default token-dim chunk count for the compiled/chunked CE. Shared so every path that chunks
+# CE uses the same value: the auto_chunker loss path (causallm_loss_function's num_chunks
+# default) and the whole-step traceable unroll (traceable_chunked_cross_entropy).
+DEFAULT_NUM_CHUNKS = 8
+
 
 # Cache for compiled cross-entropy functions
 _compiled_ce_cache: Dict[int, Callable] = {}
@@ -253,7 +258,7 @@ def traceable_chunked_cross_entropy(
     weight: torch.Tensor,
     labels: torch.Tensor,
     ignore_index: int = -100,
-    num_chunks: int = 8,
+    num_chunks: int = DEFAULT_NUM_CHUNKS,
     reduction: str = "sum",
 ) -> torch.Tensor:
     """Chunked linear cross-entropy with **no inner torch.compile**.

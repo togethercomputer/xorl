@@ -42,7 +42,7 @@ from xorl.models.transformers.deepseek_v3.support import (
     freeze_deepseek_v3_router_parameters,
     validate_deepseek_v3_training_mode,
 )
-from xorl.ops.loss.compiled_cross_entropy import traceable_chunked_cross_entropy
+from xorl.ops.loss.compiled_cross_entropy import DEFAULT_NUM_CHUNKS, traceable_chunked_cross_entropy
 from xorl.optim import build_lr_scheduler, build_optimizer
 from xorl.qlora import (
     detect_prequantized_block_fp8,
@@ -897,8 +897,11 @@ class Trainer:
             _ws_mode = "reduce-overhead" if os.environ.get("XORL_COMPILE_REDUCE_OVERHEAD") == "1" else None
             _ws_dynamic = os.environ.get("XORL_COMPILE_DYNAMIC", "0") == "1"
             # Token-dim chunks for the in-graph CE unroll (more chunks = less peak logits memory,
-            # more matmuls). Tunable per run; defaults to the loss path's own default (8).
-            self._whole_step_ce_chunks = int(os.environ.get("XORL_WHOLE_STEP_CE_CHUNKS", "8"))
+            # more matmuls). Use the SAME num_chunks the regular loss path feeds
+            # causallm_loss_function — whatever's in _causallm_loss_params, else the shared
+            # default — so both CE paths chunk identically. Captured here at setup; the whole-step
+            # graph compiles once and bakes this value in (changing it later has no effect).
+            self._whole_step_ce_chunks = self._causallm_loss_params.get("num_chunks", DEFAULT_NUM_CHUNKS)
             self._whole_step = torch.compile(self._whole_step_impl, mode=_ws_mode, dynamic=_ws_dynamic)
             logger.info_rank0(
                 f"WHOLE-STEP torch.compile (backbone+lm_head+chunked-CE one region, mode={_ws_mode}, "

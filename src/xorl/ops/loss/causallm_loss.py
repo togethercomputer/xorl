@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 
 from xorl.ops.loss.compiled_cross_entropy import (
+    DEFAULT_NUM_CHUNKS,
     compiled_ce_and_lse_sq_function,
     compiled_cross_entropy_function,
 )
@@ -19,7 +20,7 @@ def causallm_loss_function(
     ignore_index: int = -100,
     return_per_token: bool = False,
     ce_mode: str = "compiled",
-    num_chunks: int = 8,
+    num_chunks: int = DEFAULT_NUM_CHUNKS,
     tp_group=None,
     use_compile: bool = False,
     lm_head_fp32: bool = False,
