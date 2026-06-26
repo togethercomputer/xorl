@@ -33,9 +33,6 @@
 #                (default: examples/local/dummy/configs/full/qwen3_8b.yaml — pure FSDP2 shard=8)
 #   Env knobs:
 #     NUM_GPUS     GPUs on the single node = torchrun --nproc_per_node (default 8)
-#     ATTN_IMPL    --model.attn_implementation override (default flash_attention_4;
-#                  REQUIRED on Blackwell since the config's flash_attention_3 is Hopper-only.
-#                  "" = honor the config's value; sdpa = arch-agnostic non-flash fallback)
 #     PROFILE      set =1 to also run XoRL's built-in torch.profiler + fetch traces
 #     IMAGE        docker image (default NGC pytorch)
 #     DISK_GB      instance disk (default 150; 8B weights + uv venv + cache)
@@ -56,28 +53,10 @@ CONFIG="${1:-examples/local/dummy/configs/full/qwen3_8b.yaml}"; shift || true
 [[ "${1:-}" == "--" ]] && shift || true
 CONFIG_STEM="$(basename "${CONFIG%.*}")"
 NUM_GPUS="${NUM_GPUS:-8}"
-# Attention backend override (-> --model.attn_implementation). Default flash_attention_4
-# (the cute/FA4 stack): REQUIRED for Blackwell (RTX PRO 5000/6000, sm_120) because the
-# config's flash_attention_3 ships only Hopper sm_90 kernels ("no kernel image is available
-# for execution on the device" on Blackwell). FA4/cute covers Hopper AND Blackwell, so it
-# is safe across the whole GPU pool. Set ATTN_IMPL="" to honor the config's own value, or
-# e.g. ATTN_IMPL=sdpa for an arch-agnostic (non-flash) fallback.
-#
-# FA4 on Blackwell sm_12x: FA4's FlashAttentionForwardSm120 kernel has CuTeDSL codegen
-# bugs that crash the JIT *compile* at step 0 on sm_12x (RTX PRO 6000/5000, GB10) for our
-# packed/varlen GQA config (Qwen3 = 32 q / 8 kv heads). xorl's FA4 custom op
-# (src/xorl/models/layers/attention/backend/fa4_custom_op.py) monkeypatches the Sm120
-# forward class on sm_12x ONLY (gated on compute-capability major==12; Hopper sm_90 and
-# B200 sm_100 use different kernel classes and are untouched), replicating the still-
-# unmerged upstream fix Dao-AILab/flash-attention#2484's three __init__ overrides:
-#   1. arch = sm_80      -> CpAsync output store (no TMA-O on sm_12x); fixes the ragged
-#                           O-store "weakly congruent" error in the fwd epilogue
-#   2. is_split_kv=False -> attribute the shared Sm80 __call__ reads but Sm80 never sets
-#   3. pack_gqa = False  -> non-packed path; fixes the pack_gqa.store_LSE crd2idx crash
-# All three are ~free for training (pack_gqa only speeds memory-bound decode; the FA4
-# backward never packs anyway; CpAsync-vs-TMA O-store is a minor epilogue difference).
-# Override pack_gqa alone with XORL_FA4_PACK_GQA=1/0 if needed.
-ATTN_IMPL="${ATTN_IMPL:-flash_attention_4}"
+# The run uses whatever attn_implementation the CONFIG specifies (e.g. qwen3_8b_sp1.yaml's
+# flash_attention_3) — no launcher override. The GPU pool is Hopper-only (GPU_NAMES below),
+# where the config's FA3 runs natively, so there is nothing to override. (If you ever target
+# Blackwell sm_12x, set the backend in the config itself, not here.)
 IMAGE="${IMAGE:-nvcr.io/nvidia/pytorch:25.01-py3}"
 DISK_GB="${DISK_GB:-150}"
 # 8xH100_SXM single nodes are SCARCE on Vast (often just one in the whole marketplace,
@@ -249,9 +228,6 @@ done
 # traces to /workspace/out/trace). Default is a plain training run.
 PROFILE_ARGS=""
 [[ "${PROFILE:-0}" == "1" ]] && PROFILE_ARGS="--train.enable_profiling true --train.profile_trace_dir /workspace/out/trace"
-# Attention backend override (see ATTN_IMPL above): empty = use the config's own value.
-ATTN_ARGS=""
-[[ -n "$ATTN_IMPL" ]] && ATTN_ARGS="--model.attn_implementation $ATTN_IMPL"
 
 # Resolve the torch.compile flags from THIS launcher's env so a run can opt in without editing
 # this script (they're baked into the remote heredoc below). Whole-model paths take their
@@ -305,7 +281,6 @@ echo "=== train ($NUM_GPUS-way torchrun) ==="
 # the device mesh from the config's parallel sizes); --standalone gives a single-node
 # rendezvous on a free port. nproc_per_node=$NUM_GPUS launches one rank per GPU.
 torchrun --standalone --nproc_per_node=$NUM_GPUS -m xorl.cli.train "$CONFIG" \
-  $ATTN_ARGS \
   $PROFILE_ARGS \
   ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 2>&1 | tee /workspace/out/train.log | tail -60 || true
 ls -lhR /workspace/out

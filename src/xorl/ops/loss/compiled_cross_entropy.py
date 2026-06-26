@@ -9,7 +9,6 @@ from typing import Callable, Dict
 
 import torch
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 
 # Default token-dim chunk count for the compiled/chunked CE. Shared so every path that chunks
 # CE uses the same value: the auto_chunker loss path (causallm_loss_function's num_chunks
@@ -267,15 +266,18 @@ def traceable_chunked_cross_entropy(
     pass in its own ``torch.compile`` and therefore can't be nested inside another compiled
     region), this is plain, traceable PyTorch: a **static Python unroll** over ``num_chunks``
     token chunks. Each chunk computes ``logits = (hidden_chunk @ weightᵀ).float()`` →
-    ``F.cross_entropy`` and is wrapped in activation checkpointing so the backward
-    **recomputes** the chunk's logits instead of stashing them (matching what ``auto_chunker``
-    does internally). Peak logits stay at one chunk — ``[ceil(N/num_chunks), vocab]`` — in
-    *both* forward and backward.
+    ``F.cross_entropy``.
 
-    Because there is no inner ``torch.compile`` and (under static shapes) the loop unrolls at
-    trace time, Dynamo folds this into an enclosing compiled region — e.g. the whole-step
-    graph (backbone + lm_head + CE) — so the chunked CE no longer has to live in a separate
-    graph the way the ``auto_chunker`` path does.
+    The chunk logits are **saved** for backward, NOT recomputed: ``torch.utils.checkpoint``
+    recompute is incompatible with reduce-overhead CUDA-graph capture — its dynamic backward
+    allocation corrupts Inductor's cudagraph-trees allocator pool and crashes in
+    ``_cuda_setCheckpointPoolState`` ("curr_block->next"), isolated empirically (dropping the
+    recompute survives; ``cudagraph_trees=0`` does not). So backward retains all chunk logits
+    (peak ≈ ``[N, vocab]``). The benefit kept here is that, with no inner ``torch.compile`` and
+    a static-shape unroll, Dynamo folds this into the enclosing whole-step compiled graph
+    (backbone + lm_head + CE). A memory-efficient *and* cudagraph-safe recompute would require a
+    custom ``autograd.Function`` (the quack ``ChunkedLinearCrossEntropyFunction`` pattern), not
+    ``torch.utils.checkpoint``.
 
     Args:
         hidden_states: Flattened hidden states, shape ``[N, hidden]`` (``N = batch * seq``).
@@ -299,31 +301,16 @@ def traceable_chunked_cross_entropy(
         logits = (h_chunk @ weight.t()).float()
         return F.cross_entropy(logits, l_chunk, reduction="none", ignore_index=ignore_index)
 
-    # Recompute per chunk in backward (instead of saving every chunk's logits) only when there
-    # is a grad to compute; in inference there's nothing to recompute, so skip the overhead.
-    use_checkpoint = torch.is_grad_enabled() and (
-        hidden_states.requires_grad or weight.requires_grad
-    )
-
+    # No activation checkpointing: each chunk's logits are saved for backward, not recomputed.
+    # torch.utils.checkpoint recompute (even use_reentrant=False, preserve_rng_state=False) breaks
+    # reduce-overhead CUDA-graph capture — the dynamic backward allocation corrupts the cudagraph
+    # allocator pool and crashes in _cuda_setCheckpointPoolState. See the docstring / memory
+    # whole-step-cudagraph-checkpoint-incompat. A cudagraph-safe + memory-efficient recompute would
+    # need a custom autograd.Function (quack ChunkedLinearCrossEntropyFunction), not checkpoint().
     parts = []
     for start in range(0, n, chunk_size):
         end = min(start + chunk_size, n)
-        h_chunk = hidden_states[start:end]
-        l_chunk = labels[start:end]
-        if use_checkpoint:
-            # preserve_rng_state=False: _chunk_loss has no randomness (matmul + cross_entropy),
-            # so RNG preservation is pure overhead — and it's the primary CUDA-graph blocker. The
-            # default (True) wraps the backward recompute in fork_rng + get/set_rng_state, which are
-            # host-side RNG reads/writes plus a device sync that can't be captured/replayed in a CUDA
-            # graph (under torch.compile they ride into the tag_activation_checkpoint recompute
-            # partition, making Inductor "skip cudagraphs"). Disabling it makes the recompute
-            # deterministic with no host RNG ops — the same property auto_chunker's in-graph
-            # recompute has — so the whole-step region stays cudagraph-capturable. Numerically
-            # identical here because there is nothing random to preserve.
-            ce_chunk = checkpoint(_chunk_loss, h_chunk, l_chunk, use_reentrant=False, preserve_rng_state=False)
-        else:
-            ce_chunk = _chunk_loss(h_chunk, l_chunk)
-        parts.append(ce_chunk)
+        parts.append(_chunk_loss(hidden_states[start:end], labels[start:end]))
 
     per_token = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
     if reduction == "none":

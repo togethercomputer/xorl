@@ -513,7 +513,6 @@ class Glm4MoeModel(Glm4MoePreTrainedModel):
         self.rotary_emb = RotaryEmbedding(config=config)
 
         self.gradient_checkpointing = False
-        self._skip_causal_mask = is_flash_attention(config._attn_implementation)
 
         self.post_init()
 
@@ -560,7 +559,11 @@ class Glm4MoeModel(Glm4MoePreTrainedModel):
         if position_ids is None:
             position_ids = torch.arange(hidden_states.shape[1], device=hidden_states.device).unsqueeze(0)
 
-        if self._skip_causal_mask:
+        # Flash/SDPA mask internally — skip building one. Read the impl LAZILY (not cached in
+        # __init__): build_foundation_model inits HF as flash_attention_2 and only restores the
+        # real FA3/FA4 name on the config AFTER construction, so an __init__-time cache would be
+        # wrongly False for flash backends (and re-enable the .item() causal-mask graph break).
+        if is_flash_attention(self.config._attn_implementation):
             causal_mask = None
         else:
             cache_position = torch.arange(hidden_states.shape[1], device=hidden_states.device)
