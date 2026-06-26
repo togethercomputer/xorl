@@ -867,10 +867,31 @@ class Trainer:
             # torch._dynamo is imported at module level (a local `import torch._dynamo` here
             # would make `torch` a function-local and UnboundLocalError the earlier torch.autocast).
             torch._dynamo.config.skip_fsdp_hooks = False
+            # FSDP2's own hooks call logging.Logger methods (e.g. logger.debug in
+            # detect_compiled_autograd during _root_pre_forward, and the per-param-group
+            # pre_forward debug log). Dynamo can't trace Logger methods, so each one graph-breaks
+            # — and the one in _root_pre_forward is UNRESUMABLE, which makes Dynamo skip the whole
+            # _whole_step_impl frame and run it eager (so lm_head+CE never compile, and the backbone
+            # re-fragments per layer). Empirically (TORCH_LOGS=graph_breaks) these FSDP logger
+            # breaks, not the collectives, were the dominant fragmenter. No-op the logger methods
+            # during tracing so the region actually compiles.
+            #
+            # NB: ignore_logger_methods is set[Callable] — it matches the unbound logging.Logger
+            # METHOD OBJECTS (logging.Logger.debug), NOT the string names "debug". (A local
+            # `import logging` is safe; only a local `import torch*` would shadow the module-level
+            # `torch` and UnboundLocalError the earlier torch.autocast — see skip_fsdp_hooks note.)
+            import logging
+
+            torch._dynamo.config.ignore_logger_methods |= {
+                logging.Logger.debug,
+                logging.Logger.info,
+                logging.Logger.warning,
+            }
             logger.info_rank0(
                 "Whole-model compile: Traceable FSDP2 enabled "
                 "(torch._dynamo.config.skip_fsdp_hooks=False) — FSDP2 collectives are traced into "
-                "the compiled graph rather than broken on at each fully_shard() unit."
+                "the compiled graph rather than broken on at each fully_shard() unit. "
+                "ignore_logger_methods += {debug,info,warning} so FSDP hook logging doesn't graph-break."
             )
 
         # Whole-backbone: compile self.model.model (embeddings + all decoder layers + norm) as ONE
