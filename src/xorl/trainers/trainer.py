@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
+import torch._dynamo  # noqa: F401
 import torch.distributed as dist
 import torch.distributed.tensor._random
 from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
@@ -863,8 +864,8 @@ class Trainer:
         _whole_backbone = os.environ.get("XORL_COMPILE_WHOLE_BACKBONE") == "1"
         _whole_step = os.environ.get("XORL_COMPILE_WHOLE_STEP") == "1"
         if _whole_backbone or _whole_step:
-            import torch._dynamo  # noqa: PLC0415
-
+            # torch._dynamo is imported at module level (a local `import torch._dynamo` here
+            # would make `torch` a function-local and UnboundLocalError the earlier torch.autocast).
             torch._dynamo.config.skip_fsdp_hooks = False
             logger.info_rank0(
                 "Whole-model compile: Traceable FSDP2 enabled "

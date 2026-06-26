@@ -311,7 +311,16 @@ def traceable_chunked_cross_entropy(
         h_chunk = hidden_states[start:end]
         l_chunk = labels[start:end]
         if use_checkpoint:
-            ce_chunk = checkpoint(_chunk_loss, h_chunk, l_chunk, use_reentrant=False)
+            # preserve_rng_state=False: _chunk_loss has no randomness (matmul + cross_entropy),
+            # so RNG preservation is pure overhead — and it's the primary CUDA-graph blocker. The
+            # default (True) wraps the backward recompute in fork_rng + get/set_rng_state, which are
+            # host-side RNG reads/writes plus a device sync that can't be captured/replayed in a CUDA
+            # graph (under torch.compile they ride into the tag_activation_checkpoint recompute
+            # partition, making Inductor "skip cudagraphs"). Disabling it makes the recompute
+            # deterministic with no host RNG ops — the same property auto_chunker's in-graph
+            # recompute has — so the whole-step region stays cudagraph-capturable. Numerically
+            # identical here because there is nothing random to preserve.
+            ce_chunk = checkpoint(_chunk_loss, h_chunk, l_chunk, use_reentrant=False, preserve_rng_state=False)
         else:
             ce_chunk = _chunk_loss(h_chunk, l_chunk)
         parts.append(ce_chunk)

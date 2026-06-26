@@ -257,6 +257,11 @@ ATTN_ARGS=""
 # this script (they're baked into the remote heredoc below). Whole-model paths take their
 # multi-GPU defaults; reduce-overhead (CUDA-graph capture) auto-enables whenever either
 # whole-model path is on — so you don't have to set it per run — unless you export it explicitly.
+# RUN_CE_TEST=1 runs the traceable_chunked_cross_entropy numerical-equivalence pytest
+# (tests/ops/loss/test_traceable_chunked_ce.py) on the box, in the same uv-synced venv,
+# BEFORE the training run — co-locating both deliverables on one rental. Output ->
+# /workspace/out/pytest.log (fetched alongside train.log). Default 0 (train only).
+RUN_CE_TEST="${RUN_CE_TEST:-0}"
 COMPILE_WHOLE_BACKBONE="${XORL_COMPILE_WHOLE_BACKBONE:-0}"
 COMPILE_WHOLE_STEP="${XORL_COMPILE_WHOLE_STEP:-1}"
 if [[ "$COMPILE_WHOLE_BACKBONE" == "1" || "$COMPILE_WHOLE_STEP" == "1" ]]; then
@@ -281,6 +286,14 @@ echo "=== uv sync (pulls flash-attn-4 / cute stack) ==="
 uv sync 2>&1 | tee /workspace/out/install.log | tail -25
 # Activate the .venv so bare 'python'/'torchrun' resolve to the uv-managed env.
 source .venv/bin/activate
+# Optional: prove the whole-step path's CE (traceable_chunked_cross_entropy) is numerically
+# equivalent (value + gradient) to a full-logits F.cross_entropy, in the SAME env, before
+# trusting the profiling run. Pure-CPU test; runs in seconds. Gated by RUN_CE_TEST.
+if [[ "$RUN_CE_TEST" == "1" ]]; then
+  echo "=== pytest: traceable_chunked_cross_entropy numerical equivalence ==="
+  python -m pytest tests/ops/loss/test_traceable_chunked_ce.py -v 2>&1 \
+    | tee /workspace/out/pytest.log | tail -40 || true
+fi
 # torch.compile flags, baked in from the launcher's local env (resolved above); the torchrun
 # children on the box inherit them.
 #   XORL_COMPILE_WHOLE_BACKBONE=1  wraps self.model.model in ONE torch.compile region. Under FSDP
