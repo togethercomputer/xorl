@@ -915,6 +915,13 @@ class Trainer:
         # Traceable FSDP2 (above) so the in-region FSDP collectives are traced rather than broken
         # on. Gated by env.
         self._whole_step = None
+        # The first whole-step call runs EAGER (warmup) to let FSDP2's one-time _lazy_init /
+        # detect_compiled_autograd (in _root_pre_forward) complete OUTSIDE the compiled region.
+        # Otherwise Dynamo traces _lazy_init on the first compiled call and hits an unresumable
+        # graph break that skips _whole_step_impl to eager for the entire run (see the
+        # ignore_logger_methods note above — that fixed the logger break but _lazy_init still ran
+        # in-graph). Flipped True after the first eager forward in _forward_backward.
+        self._whole_step_warmed_up = False
         if _whole_step:
             _ws_mode = "reduce-overhead" if os.environ.get("XORL_COMPILE_REDUCE_OVERHEAD") == "1" else None
             _ws_dynamic = os.environ.get("XORL_COMPILE_DYNAMIC", "0") == "1"
@@ -1174,7 +1181,16 @@ class Trainer:
             # Experimental: fold the entire fwd+loss into one compiled (+ optionally cudagraph'd)
             # region instead of the per-op path below. Gated by XORL_COMPILE_WHOLE_STEP.
             if getattr(self, "_whole_step", None) is not None:
-                ga_loss = self._whole_step(micro_batch, labels, global_valid_tokens)
+                # Warmup: the FIRST forward runs the EAGER _whole_step_impl so FSDP2's one-time
+                # _lazy_init / detect_compiled_autograd completes outside the compiled region (an
+                # in-graph _lazy_init is an unresumable graph break that skips this frame to eager
+                # for the whole run). After warmup, use the compiled callable. The warmup micro-batch
+                # is a real grad-accumulation step — its forward+backward count, nothing is wasted.
+                if not self._whole_step_warmed_up:
+                    ga_loss = self._whole_step_impl(micro_batch, labels, global_valid_tokens)
+                    self._whole_step_warmed_up = True
+                else:
+                    ga_loss = self._whole_step(micro_batch, labels, global_valid_tokens)
                 with self._model_bwd_context:
                     ga_loss.backward()
                 # Whole-step computes CE+lm_head INSIDE the compiled (cudagraphable) region, so
