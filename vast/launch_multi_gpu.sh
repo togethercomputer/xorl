@@ -271,6 +271,13 @@ source .venv/bin/activate
 # MULTI-GPU: do NOT cudagraph the whole fwd/bwd backbone (single-GPU only). Per-layer
 # compile still applies if the config enables it; the torchrun children inherit this.
 export XORL_COMPILE_WHOLE_BACKBONE=0
+# Whole-step compile: fold backbone + lm_head + cross-entropy into ONE compiled region so the
+# loss is computed INSIDE the model. With XORL_COMPILE_WHOLE_STEP=1 the trainer also flips
+# torch._dynamo.config.skip_fsdp_hooks=False (Traceable FSDP2 — trace FSDP collectives into the
+# graph). WARNING: this path uses NON-chunked CE and materializes the full [N, vocab] fp32
+# logits, so it OOMs at large packing on the 8B model — use a SMALL sample_packing_sequence_len
+# (~8k, not the config's 32k). The torchrun children inherit this.
+export XORL_COMPILE_WHOLE_STEP=1
 nvidia-smi --query-gpu=index,name,memory.total --format=csv || true
 python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), 'device_count', torch.cuda.device_count())"
 echo "=== train ($NUM_GPUS-way torchrun) ==="

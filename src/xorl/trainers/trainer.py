@@ -13,7 +13,7 @@ import os
 import socket
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -840,23 +840,58 @@ class Trainer:
 
         self.model.train()
 
-        # Experimental: compile the WHOLE backbone (self.model.model) as ONE region instead of per-layer
-        # (run with enable_compile=false so the per-layer path is skipped). With mode="reduce-overhead" +
-        # static shapes this lets torch.compile capture the full backbone fwd+bwd as CUDA graphs (~2 launches);
-        # lm_head/CE/optimizer stay eager. Single-GPU / data_parallel_mode=none only (FSDP per-layer all-gather
-        # hooks would otherwise fragment the single region). Gated by env, off by default.
-        if os.environ.get("XORL_COMPILE_WHOLE_BACKBONE") == "1" and hasattr(self.model, "model"):
+        # Whole-model compile under FSDP2: first enable Traceable FSDP2, then (for the
+        # whole-backbone path) compile the backbone as ONE region.
+        #
+        # By default Dynamo sets skip_fsdp_hooks=True, which leaves FSDP2's per-layer all-gather
+        # (forward-pre-hook) and reduce-scatter (post-backward hook) running eagerly on side
+        # streams and forces a graph break at every fully_shard() unit. That is exactly why the
+        # original whole-backbone capture fragmented into a few useless static cudagraph islands
+        # while the comm-bracketed matmuls stayed eager (see results/tables/sp1-cudagraph-vs-eager.md).
+        #
+        # Setting skip_fsdp_hooks=False raises the collectives into the AOT/Inductor graph as
+        # functional collectives, so they no longer split the region — the whole backbone can be
+        # traced+captured as one graph (CUDAGraph Trees natively support nccl ops). This is the
+        # missing piece that makes torch.compile(self.model.model) actually work across FSDP
+        # boundaries, instead of the per-layer (regional) compile which always has a region
+        # boundary at every decoder layer. Caveat: only clean when nothing ELSE in the backbone
+        # breaks — true for pure-FSDP sp1 (no Ulysses a2a; FA is a custom op; the causal-mask
+        # `.item()` probe is dead under flash). Ulysses/ring SP all-to-all would still graph-break
+        # at every layer (their collectives are eager c10d in autograd.Function, not traceable),
+        # so for those layouts whole-backbone re-fragments and per-layer compile is no worse.
+        _whole_backbone = os.environ.get("XORL_COMPILE_WHOLE_BACKBONE") == "1"
+        _whole_step = os.environ.get("XORL_COMPILE_WHOLE_STEP") == "1"
+        if _whole_backbone or _whole_step:
+            import torch._dynamo  # noqa: PLC0415
+
+            torch._dynamo.config.skip_fsdp_hooks = False
+            logger.info_rank0(
+                "Whole-model compile: Traceable FSDP2 enabled "
+                "(torch._dynamo.config.skip_fsdp_hooks=False) — FSDP2 collectives are traced into "
+                "the compiled graph rather than broken on at each fully_shard() unit."
+            )
+
+        # Whole-backbone: compile self.model.model (embeddings + all decoder layers + norm) as ONE
+        # region so Dynamo traces the full layer loop into a single graph — no per-layer boundary.
+        # With Traceable FSDP2 (above) the FSDP collectives stay in-graph, so this captures as ~1
+        # graph (mode="reduce-overhead" → CUDA-graph). Enabled for BOTH the whole-backbone and the
+        # whole-step flags: whole-step additionally folds lm_head+CE into the loss callable below,
+        # but the backbone itself is still compiled here as one region. Run with enable_compile=false
+        # so the per-layer path is skipped (otherwise the layers get double-compiled). Gated by env.
+        if (_whole_backbone or _whole_step) and hasattr(self.model, "model"):
             _wb_mode = "reduce-overhead" if os.environ.get("XORL_COMPILE_REDUCE_OVERHEAD") == "1" else None
             _wb_dynamic = os.environ.get("XORL_COMPILE_DYNAMIC", "0") == "1"
             self.model.model = torch.compile(self.model.model, mode=_wb_mode, dynamic=_wb_dynamic)
             logger.info_rank0(f"WHOLE-BACKBONE torch.compile applied (mode={_wb_mode}, dynamic={_wb_dynamic})")
 
-        # Experimental: fold EVERYTHING (backbone + lm_head + cross-entropy) into ONE compiled region
-        # (vs whole-backbone, which leaves lm_head+CE eager). Materializes the [N, vocab] logits inside the
-        # graph (no chunking) — tests whether a single monolithic fwd+loss graph compiles / cudagraph-captures
-        # and at what memory/throughput cost. Run with enable_compile=false + whole-backbone off. Gated by env.
+        # Keep the LOSS in the model: fold backbone + lm_head + cross-entropy into ONE callable
+        # (_whole_step_impl) and compile it, instead of the eager per-op chunked-CE path. This
+        # materializes the [N, vocab] logits inside the graph (no chunking) so the whole fwd+loss
+        # is a single compiled (and, with reduce-overhead, cudagraph-captured) region. Combine with
+        # Traceable FSDP2 (above) so the in-region FSDP collectives are traced rather than broken on.
+        # Gated by env.
         self._whole_step = None
-        if os.environ.get("XORL_COMPILE_WHOLE_STEP") == "1":
+        if _whole_step:
             _ws_mode = "reduce-overhead" if os.environ.get("XORL_COMPILE_REDUCE_OVERHEAD") == "1" else None
             _ws_dynamic = os.environ.get("XORL_COMPILE_DYNAMIC", "0") == "1"
             self._whole_step = torch.compile(self._whole_step_impl, mode=_ws_mode, dynamic=_ws_dynamic)
@@ -1032,8 +1067,14 @@ class Trainer:
             skip_dtensor_grads=self._use_distsignsgd,
         )
 
-    def _reduce_metrics(self, total_loss: float, grad_norm: float) -> Tuple[float, float]:
-        """All-reduce loss and grad_norm across DP for logging."""
+    def _reduce_metrics(
+        self, total_loss: Union[float, torch.Tensor], grad_norm: float
+    ) -> Tuple[float, float]:
+        """All-reduce loss and grad_norm across DP for logging.
+
+        `total_loss` may be a 0-dim GPU tensor (non-PP path accumulates it on-device to avoid
+        per-micro-batch `.item()` syncs); `all_reduce` does the single `.item()` here.
+        """
         if self.pp_enabled:
             # PP: the MAX all-reduce in forward_backward_pp syncs loss only across
             # pp_group (stages), not across fsdp_group (DP replicas). Different DP
@@ -1042,7 +1083,10 @@ class Trainer:
             total_loss = all_reduce(total_loss, op="sum", group=self.ps.fsdp_group)
             grad_norm = all_reduce(grad_norm, op="mean", group=self.ps.fsdp_group)
         else:
-            total_loss, grad_norm = all_reduce((total_loss, grad_norm), group=self.ps.fsdp_group)
+            # Reduce separately (not as a tuple) so the on-GPU tensor loss is handled directly;
+            # mean-of-each is numerically identical to the old combined tuple all-reduce.
+            total_loss = all_reduce(total_loss, op="mean", group=self.ps.fsdp_group)
+            grad_norm = all_reduce(grad_norm, op="mean", group=self.ps.fsdp_group)
         return total_loss, grad_norm
 
     # ===================================================================
@@ -1074,9 +1118,11 @@ class Trainer:
         self,
         micro_batches: List[Dict[str, Any]],
         global_valid_tokens: torch.Tensor,
-    ) -> float:
+    ) -> Union[float, torch.Tensor]:
         """Standard gradient accumulation loop (non-PP)."""
-        total_loss = 0.0
+        # float for the eager per-op path below; the whole-step branch instead accumulates an
+        # on-GPU tensor (see its comment) and returns that, so the type is a union.
+        total_loss: Union[float, torch.Tensor] = 0.0
 
         for micro_batch in micro_batches:
             micro_batch = {
@@ -1093,7 +1139,17 @@ class Trainer:
                 ga_loss = self._whole_step(micro_batch, labels, global_valid_tokens)
                 with self._model_bwd_context:
                     ga_loss.backward()
-                total_loss += ga_loss.item()
+                # Whole-step computes CE+lm_head INSIDE the compiled (cudagraphable) region, so
+                # accumulate the logged loss on-GPU and sync it ONCE per step (in _reduce_metrics'
+                # DP all-reduce). A per-micro-batch `.item()` here would be a D2H sync stalling the
+                # CPU until each backward finishes, defeating the CUDA-graph / reduce-overhead
+                # overlap this path exists for. Loss is logging-only (never used for gradients), so
+                # this changes no training numerics — only how the displayed scalar is summed.
+                total_loss = (
+                    ga_loss.detach()
+                    if not isinstance(total_loss, torch.Tensor)
+                    else total_loss + ga_loss.detach()
+                )
                 del micro_batch, labels, ga_loss
                 continue
 
