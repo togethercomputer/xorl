@@ -86,3 +86,5 @@ experiments/local_benchmark/sweeps/
 
 # Multi-adapter LoRA E2E artifacts can contain full per-rank logs and copied checkpoints.
 experiments/multi_adapter_lora/results/
+
+results/
