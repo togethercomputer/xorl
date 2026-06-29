@@ -1,4 +1,5 @@
 import functools
+import os
 import types
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -149,11 +150,27 @@ def parallelize_model_fsdp2(
 
     # Step 0: Get target classes to shard later
     target_classes = set((getattr(model, "_no_split_modules", []) or []) + (basic_modules or []))
-    # Make a list of tuples that contains layer's name and module
-    decoder_blocks: List[Tuple[str, nn.Module]] = [
-        (fqn, mod) for fqn, mod in model.named_modules() if mod.__class__.__name__ in target_classes
-    ]
-    logger.info_rank0(f"target classes to shard: {target_classes}")
+    # Make a list of tuples that contains layer's name and module.
+    #
+    # If a decoder layer was already torch.compile'd (enable_compile, applied BEFORE this), it is now
+    # wrapped in an OptimizedModule (`._orig_mod` is the real layer). We must fully_shard the WRAPPER,
+    # not the inner layer: FSDP installs forward-pre/post hooks (fsdp_hook_wrapper → torch._dynamo.disable)
+    # on whatever we shard. If we shard the inner layer, those hooks live INSIDE the compiled forward
+    # and Dynamo traces into torch._dynamo.disable — a hard error under fullgraph=True, and a graph break
+    # otherwise. Sharding the OptimizedModule keeps the all-gather/reduce-scatter hooks OUTSIDE the
+    # compiled region → 0 graph breaks (the supported FSDP2+compile pattern). Dedupe by inner id so we
+    # never collect both the wrapper and its inner layer.
+    compiled_inner_ids: set = set()
+    decoder_blocks: List[Tuple[str, nn.Module]] = []
+    for fqn, mod in model.named_modules():
+        inner = getattr(mod, "_orig_mod", None)
+        if inner is not None and inner.__class__.__name__ in target_classes:
+            decoder_blocks.append((fqn, mod))  # OptimizedModule wrapping a decoder layer → shard the wrapper
+            compiled_inner_ids.add(id(inner))
+    for fqn, mod in model.named_modules():
+        if mod.__class__.__name__ in target_classes and id(mod) not in compiled_inner_ids:
+            decoder_blocks.append((fqn, mod))  # uncompiled decoder layer
+    logger.info_rank0(f"target classes to shard: {target_classes} ({len(decoder_blocks)} layers)")
 
     # Step 1: Apply expert parallelism (slice expert tensors [128,H,I] -> [16,H,I])
     # When skip_weight_loading is set (TP pre-loaded weights with EP-local expert params),
@@ -659,19 +676,20 @@ def build_parallelize_model(
                     )
                     kwargs["skip_weight_loading"] = True
 
-            # torch.compile (if enabled)
+            # torch.compile (if enabled) — applied BEFORE FSDP below (supported FSDP2+compile order).
             if enable_compile:
+                _fullgraph = os.environ.get("XORL_COMPILE_FULLGRAPH") == "1"
                 target_classes = set((getattr(model_part, "_no_split_modules", []) or []) + (basic_modules or []))
                 compiled_count = 0
                 for fqn, mod in model_part.named_modules():
                     if mod.__class__.__name__ in target_classes:
                         parent_fqn, _, child_name = fqn.rpartition(".")
                         parent = model_part.get_submodule(parent_fqn) if parent_fqn else model_part
-                        compiled_mod = torch.compile(mod)
+                        compiled_mod = torch.compile(mod, fullgraph=_fullgraph)
                         setattr(parent, child_name, compiled_mod)
                         compiled_count += 1
                 if i == 0:
-                    logger.info_rank0(f"torch.compile applied to {compiled_count} decoder layers")
+                    logger.info_rank0(f"torch.compile applied to {compiled_count} decoder layers (fullgraph={_fullgraph})")
 
                 # Enable compiled vocab-parallel cross-entropy kernels
                 if hasattr(model_part, "loss_function"):
@@ -806,17 +824,32 @@ def build_parallelize_model(
 
     if enable_compile:
         # Compile each decoder layer for torch.compile + FSDP2 compatibility.
-        # Must happen BEFORE fully_shard so FSDP wraps the compiled modules.
+        # Must happen BEFORE fully_shard so FSDP wraps the compiled modules. This is the
+        # SUPPORTED FSDP2+compile pattern (PyTorch 2.12 deprecated compiling THROUGH FSDP2 hooks
+        # into one graph, PRs #174863/#174906): compile the compute regions first, then fully_shard;
+        # the all-gather/reduce-scatter run as eager hooks OUTSIDE these compiled regions.
+        # XORL_COMPILE_FULLGRAPH=1 sets fullgraph=True so any residual graph break becomes a hard
+        # error instead of silent fragmentation — i.e. it PROVES 0 breaks per region (verified on a
+        # 2-GPU Qwen3 FSDP2 run). Off by default so models with an unavoidable break still run.
+        _fullgraph = os.environ.get("XORL_COMPILE_FULLGRAPH") == "1"
+        # mode=reduce-overhead → per-layer CUDA-graph capture. Off by default: under FSDP2 with
+        # reshard_after_forward the per-layer all-gather hands out fresh unsharded-param buffer
+        # addresses each step, forcing cudagraph re-record (~9x slower on 2-GPU Qwen3-1.7B). Exposed
+        # as a knob (XORL_COMPILE_REDUCE_OVERHEAD=1) for research — pair with reshard_after_forward
+        # to study whether stable buffers stop the re-record.
+        _mode = "reduce-overhead" if os.environ.get("XORL_COMPILE_REDUCE_OVERHEAD") == "1" else None
         target_classes = set((getattr(model, "_no_split_modules", []) or []) + (basic_modules or []))
         compiled_count = 0
         for fqn, mod in model.named_modules():
             if mod.__class__.__name__ in target_classes:
                 parent_fqn, _, child_name = fqn.rpartition(".")
                 parent = model.get_submodule(parent_fqn) if parent_fqn else model
-                compiled_mod = torch.compile(mod)
+                compiled_mod = torch.compile(mod, fullgraph=_fullgraph, mode=_mode)
                 setattr(parent, child_name, compiled_mod)
                 compiled_count += 1
-        logger.info_rank0(f"torch.compile applied to {compiled_count} decoder layers")
+        logger.info_rank0(
+            f"torch.compile applied to {compiled_count} decoder layers (fullgraph={_fullgraph}, mode={_mode})"
+        )
 
         # Enable compiled vocab-parallel cross-entropy kernels
         if hasattr(model, "loss_function"):

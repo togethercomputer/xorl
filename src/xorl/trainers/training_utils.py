@@ -58,6 +58,7 @@ def clip_gradients(
     max_grad_norm: float,
     pp_enabled: bool = False,
     pp_group=None,
+    as_tensor: bool = False,
 ) -> float:
     """Clip gradients and return grad_norm. Handles PP all-reduce.
 
@@ -66,26 +67,30 @@ def clip_gradients(
         max_grad_norm: Maximum gradient norm for clipping.
         pp_enabled: Whether pipeline parallelism is active.
         pp_group: Process group for PP all-reduce of grad norms.
+        as_tensor: If True, return the grad_norm as a 0-dim GPU tensor WITHOUT the ``.item()``
+            device→host sync. Clipping (the coefficient) is applied on-device by
+            ``clip_grad_norm_`` either way — the ``.item()`` only materializes the value for
+            logging, so deferring it lets the async-metrics loop avoid a per-step D2H stall.
 
     Returns:
-        Scalar grad_norm value.
+        Scalar grad_norm value (float), or a 0-dim GPU tensor if ``as_tensor=True``.
     """
     if hasattr(model, "clip_grad_norm_"):
         _gn = model.clip_grad_norm_(max_grad_norm)
-        grad_norm = _gn.item() if hasattr(_gn, "item") else float(_gn)
+        grad_norm = _gn if isinstance(_gn, torch.Tensor) else torch.as_tensor(float(_gn), device=get_device_type())
+        if hasattr(grad_norm, "full_tensor"):  # DTensor → replicate to a plain tensor
+            grad_norm = grad_norm.full_tensor()
     else:
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
         if hasattr(grad_norm, "full_tensor"):
-            grad_norm = grad_norm.full_tensor().item()
-        elif hasattr(grad_norm, "item"):
-            grad_norm = grad_norm.item()
+            grad_norm = grad_norm.full_tensor()
 
     if pp_enabled and pp_group is not None:
-        grad_norm_tensor = torch.tensor([grad_norm], device=get_device_type())
-        dist.all_reduce(grad_norm_tensor, op=dist.ReduceOp.MAX, group=pp_group)
-        grad_norm = grad_norm_tensor.item()
+        grad_norm = grad_norm.detach().reshape(()).clone()
+        dist.all_reduce(grad_norm, op=dist.ReduceOp.MAX, group=pp_group)
 
-    return grad_norm
+    grad_norm = grad_norm.detach().reshape(())
+    return grad_norm if as_tensor else grad_norm.item()
 
 
 def get_effective_grad_clip_value(max_grad_norm: float, *, use_distsignsgd: bool) -> float:

@@ -943,6 +943,28 @@ class Trainer:
             f"epochs: {args.train.num_train_epochs}"
         )
 
+        # Async metrics: keep per-step loss/grad_norm/timing OFF the critical path so there is no
+        # per-step device→host (.item()) sync stall. Metrics are logged one step stale — at the top
+        # of each iteration we wait only on the PREVIOUS step's CUDA end-event (which has already
+        # finished), then materialize its loss/grad_norm/elapsed with non-blocking reads. Default ON
+        # for non-PP; XORL_ASYNC_METRICS=0 forces the old blocking path. PP keeps the blocking path
+        # (its loss/gvt handling already syncs).
+        self._async_metrics = (not self.pp_enabled) and os.environ.get("XORL_ASYNC_METRICS", "1") == "1"
+        self._pending_metrics = None
+        self._last_metrics = (0.0, 0.0, args.train.lr)
+        # CUDAGraph Trees (reduce-overhead) need a per-iteration mark to reuse the static pool and
+        # avoid re-recording every step ("pending uninvoked backwards"). XORL_CUDAGRAPH_MARK_STEP
+        # controls WHERE we call torch.compiler.cudagraph_mark_step_begin(): "step" = once per
+        # optimizer step (train_step top), "mb" = before each micro-batch forward (per the
+        # "before each model invocation" guidance), "off" = never (default unless reduce-overhead).
+        _ro = os.environ.get("XORL_COMPILE_REDUCE_OVERHEAD") == "1"
+        self._cudagraph_mark = os.environ.get("XORL_CUDAGRAPH_MARK_STEP", "step" if _ro else "off")
+        if self._async_metrics:
+            logger.info_rank0(
+                "Async metrics ON: per-step loss/grad_norm/tok-s logged one step stale (no per-step "
+                "D2H sync stall). Set XORL_ASYNC_METRICS=0 for the blocking path."
+            )
+
         # Per-step ephemeral state for logging in _finalize
         total_loss = 0.0
         grad_norm = 0.0
@@ -996,40 +1018,87 @@ class Trainer:
                     helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
 
                 # --- One optimizer step ---
-                synchronize()
-                start_time = time.time()
-
-                total_loss, grad_norm = self.train_step(micro_batches)
-
-                synchronize()
-                delta_time = time.time() - start_time
-                lr = max(self.lr_scheduler.get_last_lr())
-                train_metrics = self.environ_meter.step(delta_time, global_step=state.global_step)
-                state.loss_history.append(total_loss)
-
-                # Logging
-                self._maybe_log(
-                    total_loss,
-                    grad_norm,
-                    lr,
-                    train_metrics,
-                    delta_time,
-                    use_tqdm,
-                    data_loader_tqdm if use_tqdm else None,
-                )
+                if self._async_metrics:
+                    # Flush the PREVIOUS step's metrics first (one step stale): this waits only on
+                    # that step's end-event — already complete — so the materialization is a free,
+                    # non-blocking read. Then dispatch THIS step with no synchronize()/.item() on
+                    # the critical path. CUDA events time the step without a host sync.
+                    self._flush_pending_metrics(use_tqdm, data_loader_tqdm if use_tqdm else None)
+                    start_evt = get_torch_device().Event(enable_timing=True)
+                    end_evt = get_torch_device().Event(enable_timing=True)
+                    start_evt.record()
+                    total_loss, grad_norm = self.train_step(micro_batches)
+                    end_evt.record()
+                    # Snapshot + clear this step's throughput accounting so the deferred
+                    # environ_meter.step() (run at the next flush) sees exactly this step's seqlens.
+                    seqlens = list(self.environ_meter.batch_seqlens)
+                    image_seqlens = list(self.environ_meter.image_seqlens)
+                    self.environ_meter.batch_seqlens.clear()
+                    self.environ_meter.image_seqlens.clear()
+                    lr = max(self.lr_scheduler.get_last_lr())
+                    self._pending_metrics = (
+                        total_loss, grad_norm, start_evt, end_evt, seqlens, image_seqlens, state.global_step, lr
+                    )
+                else:
+                    synchronize()
+                    start_time = time.time()
+                    total_loss, grad_norm = self.train_step(micro_batches)
+                    synchronize()
+                    delta_time = time.time() - start_time
+                    lr = max(self.lr_scheduler.get_last_lr())
+                    train_metrics = self.environ_meter.step(delta_time, global_step=state.global_step)
+                    state.loss_history.append(total_loss)
+                    self._maybe_log(
+                        total_loss, grad_norm, lr, train_metrics, delta_time, use_tqdm,
+                        data_loader_tqdm if use_tqdm else None,
+                    )
                 self._maybe_profile()
                 self._maybe_save_checkpoint()
 
+            # Flush the last step's pending (stale) metrics before closing the bar / next epoch.
+            if self._async_metrics:
+                self._flush_pending_metrics(use_tqdm, data_loader_tqdm if use_tqdm else None)
             if use_tqdm:
                 data_loader_tqdm.close()
             state.start_step = 0
             helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
 
+        # On the async path total_loss/grad_norm are GPU tensors; use the last materialized floats.
+        if self._async_metrics:
+            total_loss, grad_norm, lr = self._last_metrics
         self._finalize(total_loss, grad_norm, lr)
 
     # ===================================================================
     # train_step — one gradient accumulation step
     # ===================================================================
+
+    def _flush_pending_metrics(self, use_tqdm: bool, tqdm_bar: Optional[Any]) -> None:
+        """Materialize + log the previous step's metrics, one step stale (async-metrics path).
+
+        Called at the TOP of the next iteration (before that step is dispatched), so the staged
+        step's GPU work is already complete: waiting on its end-event returns immediately, and the
+        loss/grad_norm ``.item()`` + ``environ_meter.step`` collective run against an idle stream —
+        no waiting on fresh compute, hence no per-step D2H stall. The end-event wait also bounds CPU
+        lookahead to a single step.
+        """
+        if self._pending_metrics is None:
+            return
+        loss_t, gn_t, start_evt, end_evt, seqlens, image_seqlens, gstep, lr = self._pending_metrics
+        self._pending_metrics = None
+        end_evt.synchronize()
+        delta_time = start_evt.elapsed_time(end_evt) / 1e3  # ms → s
+        loss_v = float(loss_t.item())
+        gn_v = float(gn_t.item())
+        # Restore exactly this step's throughput accounting for the deferred environ_meter.step(),
+        # then reset so the next step's environ_meter.add() starts clean.
+        self.environ_meter.batch_seqlens = seqlens
+        self.environ_meter.image_seqlens = image_seqlens
+        train_metrics = self.environ_meter.step(delta_time, global_step=gstep)
+        self.environ_meter.batch_seqlens = []
+        self.environ_meter.image_seqlens = []
+        self.state.loss_history.append(loss_v)
+        self._last_metrics = (loss_v, gn_v, lr)
+        self._maybe_log(loss_v, gn_v, lr, train_metrics, delta_time, use_tqdm, tqdm_bar)
 
     def train_step(self, micro_batches: List[Dict[str, Any]]) -> Tuple[float, float]:
         """One complete gradient-accumulation step.
@@ -1037,6 +1106,9 @@ class Trainer:
         Returns:
             (total_loss, grad_norm) — all-reduced across DP for logging.
         """
+        # New CUDAGraph Trees generation for this optimizer step (reuse static pool, no re-record).
+        if getattr(self, "_cudagraph_mark", "off") == "step":
+            torch.compiler.cudagraph_mark_step_begin()
         global_valid_tokens = self._count_valid_tokens(micro_batches)
         if self._use_distsignsgd:
             active_microbatches, active_voter_total = self._count_active_microbatches(micro_batches)
@@ -1114,6 +1186,21 @@ class Trainer:
         `total_loss` may be a 0-dim GPU tensor (non-PP path accumulates it on-device to avoid
         per-micro-batch `.item()` syncs); `all_reduce` does the single `.item()` here.
         """
+        if self._async_metrics and not self.pp_enabled:
+            # Async path: reduce loss & grad_norm as GPU TENSORS (no .item()/tolist D2H). The
+            # collectives are enqueued here; the train loop materializes the scalars one-step-stale.
+            loss_t = total_loss if isinstance(total_loss, torch.Tensor) else torch.as_tensor(
+                float(total_loss), device=get_device_type()
+            )
+            gn_t = grad_norm if isinstance(grad_norm, torch.Tensor) else torch.as_tensor(
+                float(grad_norm), device=get_device_type()
+            )
+            loss_t = loss_t.detach().reshape(()).clone()
+            gn_t = gn_t.detach().reshape(()).clone()
+            ws = dist.get_world_size(group=self.ps.fsdp_group)
+            dist.all_reduce(loss_t, op=dist.ReduceOp.SUM, group=self.ps.fsdp_group)
+            dist.all_reduce(gn_t, op=dist.ReduceOp.SUM, group=self.ps.fsdp_group)
+            return loss_t / ws, gn_t / ws  # mean across DP; materialized later, no sync here
         if self.pp_enabled:
             # PP: the MAX all-reduce in forward_backward_pp syncs loss only across
             # pp_group (stages), not across fsdp_group (DP replicas). Different DP
@@ -1206,6 +1293,8 @@ class Trainer:
                 del micro_batch, labels, ga_loss
                 continue
 
+            if self._cudagraph_mark == "mb":
+                torch.compiler.cudagraph_mark_step_begin()
             if self._use_routing_replay:
                 set_replay_stage("record")
             with self._autocast_ctx, self._model_fwd_context:
@@ -1238,8 +1327,12 @@ class Trainer:
             with self._model_bwd_context:
                 ga_loss.backward()
 
-            total_loss += ga_loss.item()
-            del micro_batch, loss, outputs, ga_loss
+            # Accumulate the logged loss on-GPU (no per-micro-batch `.item()` D2H stall). Loss is
+            # logging-only — never used for gradients — so this changes no numerics. _reduce_metrics
+            # handles a 0-dim tensor; the async-metrics loop materializes it one-step-stale.
+            ga_detached = ga_loss.detach()
+            total_loss = ga_detached if not isinstance(total_loss, torch.Tensor) else total_loss + ga_detached
+            del micro_batch, loss, outputs, ga_loss, ga_detached
 
         return total_loss
 
@@ -1296,6 +1389,7 @@ class Trainer:
             clip_value,
             pp_enabled=self.pp_enabled,
             pp_group=self.ps.pp_group if self.pp_enabled else None,
+            as_tensor=self._async_metrics,  # keep on GPU; the loop materializes one-step-stale
         )
 
         self.optimizer.step()

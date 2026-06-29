@@ -1,0 +1,59 @@
+# Qwen3-1.7B 2-GPU FSDP2 — SUPPORTED FSDP2+compile pattern: per-layer torch.compile applied
+# BEFORE fully_shard (see torch_parallelize.py), fullgraph via XORL_COMPILE_FULLGRAPH=1. No
+# whole-step single-graph (that path is deprecated upstream, PyTorch 2.12 #174863/#174906).
+# FSDP all-gather/reduce-scatter run as eager hooks outside the compiled decoder-layer regions.
+model:
+  model_path: Qwen/Qwen3-1.7B
+  attn_implementation: flash_attention_3
+
+data:
+  datasets:
+    - path: dummy
+      type: tokenized
+      max_seq_len: 4096
+  select_columns: [input_ids, labels]
+  dataset_prepared_path: last_prepared_dataset
+  sample_packing_method: sequential
+  sample_packing_sequence_len: 4096
+  dataloader_num_workers: 2
+  dataloader_prefetch_factor: 2
+  dataloader_pin_memory: true
+
+train:
+  output_dir: outputs/Qwen3-1.7B-percompile
+  data_parallel_mode: fsdp2
+  ulysses_parallel_size: 1
+  data_parallel_replicate_size: 1
+  data_parallel_shard_size: 2
+  expert_parallel_size: 1
+  tensor_parallel_size: 1
+
+  num_train_epochs: 1
+  max_steps: 3
+
+  micro_batch_size: 1
+  gradient_accumulation_steps: 2
+
+  optimizer: adamw
+  lr: 1.0e-5
+  lr_warmup_ratio: 0.0
+  lr_decay_style: constant
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+  enable_mixed_precision: true
+  enable_compile: true             # per-layer compile, applied before fully_shard
+  enable_gradient_checkpointing: false
+  enable_full_shard: true
+  enable_activation_offload: false
+  init_device: meta
+  load_weights_mode: grouped
+  enable_full_determinism: false
+  ckpt_manager: dcp
+  save_steps: 0
+  save_hf_weights: false
+
+  enable_profiling: false
+  use_wandb: false
+  wandb_project: local-training
+  wandb_name: Qwen3-1.7B-percompile
