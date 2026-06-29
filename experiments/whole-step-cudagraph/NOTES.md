@@ -11,6 +11,10 @@ measured levers below.
   on the **compiled** model gives **+30%** throughput.
   - Qwen3-1.7B, 2×H100, FA4, AdamW: per-layer compile **37.5k tok/s** → compile **+ manual capture
     48.7k tok/s** (MFU 22% → 26% → 33%).
+  - **The win is launch-bound-regime-specific.** Qwen3-**8B** is compute-bound, so capture gives
+    **~0** (8×H100/S=2048: 63.4k eager → 62.9k capture, 42% MFU). Per-layer compile alone already
+    gets 8B near-peak; the megakernel/capture pays off for small / low-per-GPU-work / launch-bound
+    cases, not large compute-bound training. See the Qwen3-8B section.
 - **Inductor's per-layer `reduce-overhead` cudagraph is the wrong tool under FSDP** — it re-records
   every step (~240 graph re-records/step) and is **~9× SLOWER** (57k → 6.5k tok/s). Not fixable via
   `reshard_after_forward`, `cudagraph_mark_step_begin`, or `TORCHINDUCTOR_CUDAGRAPH_TREES=0` (all
@@ -86,6 +90,28 @@ launch-bound toy.
 
 Remaining gap to the xorl ~64k: HF full-vocab CE (no chunking) + FA4 wrapper transposes + small
 batch + lm_head/CE not compiled. Closing it: bigger S, `fullgraph=True`, chunked/compiled CE.
+
+## Qwen3-8B (the megakernel direction at scale)
+
+The capture's payoff scales with **launch-bound-ness**, and 8B is **compute-bound** — so whole-step
+capture works but gives **~0** (this matches the original 8B-sp1 profile: 98.8% compute-busy):
+
+| 8B config (compile, FA4, FSDP2) | eager | + manual capture | Δ |
+|---|---|---|---|
+| **8×H100, S=2048, AdamW** | **63.4k tok/s, 42.2% MFU** | 62.9k, 42.0% (cap ok) | **−0.6%** |
+| 4×H100, S=1024, AdamW | 19.9k, 25.6% | 19.5k, 25.2% (cap ok) | −2% |
+| 4×H100, S=1024, Muon | 12.8k | 12.8k (cap ok) | ~0% |
+
+- **8B compile+AdamW on 8×H100/S=2048 reproduces ~64k (63.4k / 42% MFU)** — and capture is a wash
+  (slightly negative from the static-buffer copy). Capture is numerically correct (loss matches).
+- Contrast with **1.7B small-batch: +30%** (launch-bound). So the megakernel/whole-step capture is a
+  **launch-bound-regime win** (small models / low per-GPU work / inference-shaped), not a large
+  compute-bound training win. For 8B, **per-layer compile alone already gets near-peak**; capture
+  adds nothing.
+- **Memory gotchas at 8B**: the CUDAGraph private pool roughly doubles transient memory, so capture
+  **OOMs at S=2048 on 4 GPUs** (eager fits at 22k). And **Muon OOMs at S=2048 on 8 GPUs** — its
+  gram-NS workspace pushes past 80 GB where lean fused AdamW fit. For 8B + capture + Muon: use a
+  smaller S, gradient checkpointing, or more GPUs.
 
 ## Reproduce
 
