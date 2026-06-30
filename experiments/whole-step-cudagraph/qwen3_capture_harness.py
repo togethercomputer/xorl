@@ -4,10 +4,13 @@ Measures eager vs manual-capture throughput/MFU for the real model on N GPUs. Us
 (flash_attn.cute) registered into HF's attention dispatch, Muon (lighter states so 8B fits on fewer
 GPUs), FSDP2 reshard_after_forward=False (static buffers for capture).
 
-Env: MODEL=1.7b|8b  MODE=eager|manualgraph  S=<seqlen>  STEPS=<n>
-Run: torchrun --standalone --nproc_per_node=N scratch_qwen3_capture.py
+Env knobs:
+  MODEL=1.7b|8b   MODE=eager|manualgraph   OPT=muon|adamw   COMPILE=0|1   FULLGRAPH=0|1
+  S=<seqlen>      STEPS=<n>
+Needs PYTHONPATH=<repo>/src for the xorl Muon import (OPT=muon).
+Run: PYTHONPATH=$PWD/src torchrun --standalone --nproc_per_node=N qwen3_capture_harness.py
 """
-import os, time, math, traceback
+import os, time, traceback
 import torch, torch.nn as nn, torch.distributed as dist
 from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
 from transformers import Qwen3Config
@@ -45,41 +48,6 @@ def build_muon_groups(model):
         else:
             adamw.append(p)
     return muon, adamw
-
-@torch.no_grad()
-def zeropower_via_newtonschulz5(G, steps=5):
-    a, b, c = 3.4445, -4.7750, 2.0315
-    X = G.bfloat16()
-    X = X / (X.norm() + 1e-7)
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-    for _ in range(steps):
-        A = X @ X.mT
-        B = b * A + c * A @ A
-        X = a * X + B @ X
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-    return X
-
-class Muon(torch.optim.Optimizer):
-    """Minimal Muon: momentum + Newton-Schulz orthogonalization (2D params)."""
-    def __init__(self, params, lr=0.02, momentum=0.95):
-        super().__init__(params, dict(lr=lr, momentum=momentum))
-    @torch.no_grad()
-    def step(self):
-        for g in self.param_groups:
-            for p in g["params"]:
-                if p.grad is None:
-                    continue
-                st = self.state[p]
-                buf = st.get("m")
-                if buf is None:
-                    buf = st["m"] = torch.zeros_like(p)
-                buf.mul_(g["momentum"]).add_(p.grad)
-                gr = p.grad.add(buf, alpha=g["momentum"])  # nesterov
-                u = zeropower_via_newtonschulz5(gr.float()).to(p.dtype)
-                scale = max(1.0, p.size(-2) / p.size(-1)) ** 0.5
-                p.add_(u, alpha=-g["lr"] * scale)
 
 def main():
     dist.init_process_group("nccl")

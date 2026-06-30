@@ -119,11 +119,10 @@ GPU pod on the `research-common-h100` k8s cluster (`runtimeClassName: nvidia`, m
 + `shared-data` + shm). The `.venv-fa4` lives on the home PVC, so any pod that mounts it is ready.
 
 ```bash
-# 1.7B, 2 GPU, per-layer compile + manual capture, Muon
-PYTHONPATH=$PWD/src COMPILE=1 OPT=muon MODE=manualgraph MODEL=1.7b S=2048 \
-  .venv-fa4/bin/torchrun --standalone --nproc_per_node=2 \
-  experiments/whole-step-cudagraph/qwen3_capture_harness.py
-# MODE=eager for the baseline; MODEL=8b; OPT=adamw to isolate fwd+bwd; vary --nproc_per_node.
+# 1.7B, 2 GPU, per-layer compile + manual capture, Muon (set VENV to the cu130+FA4 env)
+GPUS=2 MODEL=1.7b COMPILE=1 MODE=manualgraph OPT=muon S=2048 \
+  experiments/whole-step-cudagraph/runners/run.sh
+# MODE=eager for the baseline; MODEL=8b; OPT=adamw to isolate fwd+bwd; vary GPUS.
 ```
 
 ## Files
@@ -136,8 +135,9 @@ PYTHONPATH=$PWD/src COMPILE=1 OPT=muon MODE=manualgraph MODEL=1.7b S=2048 \
 - `graphbreak_compiled_autograd_repro.py` — the (deprecated) compile-through-hooks + compiled-autograd
   path that gets the forward to 0 breaks but whose backward is blocked.
 - `compile_before_fully_shard_repro.py` — the supported 0-break pattern, minimal.
-- `runners/` — the sweep/measurement shell scripts used during the investigation (lever sweep,
-  mark_step sweep, packing sweep, the full grid, etc.).
+- `runners/run.sh` — portable launcher (set `VENV`; pass `MODEL/MODE/OPT/COMPILE/FULLGRAPH/GPUS/S/STEPS`
+  as env). The one-off investigation sweeps (lever/mark_step/packing/grid) aren't kept — their
+  findings are tabulated above.
 
 ## Code changes (in `src/`)
 
