@@ -15,10 +15,8 @@
 #     inits torch.distributed from the elastic env and builds the device mesh from the
 #     config's parallel sizes (the default config is pure FSDP2 shard=8 => world_size 8,
 #     no TP/EP; the branch default for measuring FSDP all-gather/reduce-scatter overlap).
-#   - XORL_COMPILE_WHOLE_BACKBONE=0 is exported: do NOT fold the whole fwd/bwd backbone
-#     into one CUDA-graph region. Whole-backbone capture is single-GPU only (FSDP/SP
-#     per-layer all-gather + collective hooks fragment the region), so it is disabled
-#     for multi-GPU. Per-layer compile still applies if the config sets enable_compile.
+#   - per-layer torch.compile applies if the config sets enable_compile (the supported
+#     FSDP2+compile path; FSDP all-gather/reduce-scatter stay eager outside the regions).
 #   - this TRAINS (no --train.enable_profiling); set PROFILE=1 to also capture traces.
 #   - MAX_DPH / DISK_GB / MAX_LIFETIME defaults are bumped for an 8-GPU box + 8B weights.
 #
@@ -34,11 +32,10 @@
 #   Env knobs:
 #     NUM_GPUS     GPUs on the single node = torchrun --nproc_per_node (default 8)
 #     PROFILE      set =1 to also run XoRL's built-in torch.profiler + fetch traces (DEFAULT profiler)
-#     NSYS         set =1 to profile with Nsight Systems INSTEAD of torch.profiler — needed for the
-#                  genuine whole-step cudagraph path, which torch.profiler crashes (cudagraph-trees
-#                  setCheckpointPoolState, pytorch#75504). NSYS=1 forces torch.profiler OFF and fetches
-#                  a .nsys-rep + nsys-stats summaries. Reports are large; use a small max_steps
-#                  (e.g. `-- --train.max_steps 12`) for the capture.
+#     NSYS         set =1 to profile with Nsight Systems INSTEAD of torch.profiler — an external GPU
+#                  timeline that survives runs where in-process torch.profiler perturbs the run.
+#                  NSYS=1 forces torch.profiler OFF and fetches a .nsys-rep + nsys-stats summaries.
+#                  Reports are large; use a small max_steps (e.g. `-- --train.max_steps 12`).
 #     IMAGE        docker image (default NGC pytorch)
 #     DISK_GB      instance disk (default 150; 8B weights + uv venv + cache)
 #     MAX_DPH      max $/hr to accept (default 30.0; picks the CHEAPEST node clearing the
@@ -231,42 +228,20 @@ done
 
 # Optional profiling: PROFILE=1 adds XoRL's built-in torch.profiler (Chrome/TensorBoard
 # traces to /workspace/out/trace). Default is a plain training run.
-#
-# profile_memory is forced OFF under the whole-step reduce-overhead (cudagraph-trees) path:
-# torch.profiler's profile_memory hooks the CUDA caching allocator, which perturbs the
-# cudagraph-trees pool checkpoint and re-trips the `curr_block->next == nullptr` /
-# setCheckpointPoolState crash at step 2 (documented: pytorch/pytorch#75504). record_shapes
-# is kept so the trace still carries shape info. Override by editing here if you ever profile
-# without reduce-overhead.
 PROFILE_ARGS=""
-[[ "${PROFILE:-0}" == "1" ]] && PROFILE_ARGS="--train.enable_profiling true --train.profile_trace_dir /workspace/out/trace --train.profile_profile_memory false"
+[[ "${PROFILE:-0}" == "1" ]] && PROFILE_ARGS="--train.enable_profiling true --train.profile_trace_dir /workspace/out/trace"
 
-# NSYS=1: profile with Nsight Systems INSTEAD of torch.profiler. torch.profiler is the DEFAULT, but it
-# cannot trace the GENUINE whole-step cudagraph path — its in-process CUPTI/Kineto perturbs the
-# cudagraph-trees allocator pool checkpoint and crashes (setCheckpointPoolState / curr_block->next,
-# pytorch#75504) once the whole step actually cudagraph-captures. nsys traces the GPU timeline
-# externally, so it survives. NSYS=1 therefore forces torch.profiler OFF (clears PROFILE_ARGS) to keep
-# the cudagraph path clean; the heredoc below wraps torchrun in `nsys profile` and runs `nsys stats`.
+# NSYS=1: profile with Nsight Systems INSTEAD of torch.profiler. torch.profiler is the DEFAULT, but
+# its in-process CUPTI/Kineto can perturb runs sensitive to the CUDA allocator; nsys traces the GPU
+# timeline externally, so it survives those. NSYS=1 forces torch.profiler OFF (clears PROFILE_ARGS);
+# the heredoc below wraps torchrun in `nsys profile` and runs `nsys stats`.
 NSYS_MODE="${NSYS:-0}"
 if [[ "$NSYS_MODE" == "1" ]]; then
   PROFILE_ARGS=""
   echo ">> NSYS=1: Nsight Systems profiling (torch.profiler disabled for this run — cudagraph path)"
 fi
 
-# Resolve the torch.compile flags from THIS launcher's env so a run can opt in without editing
-# this script (they're baked into the remote heredoc below). Whole-model paths take their
-# multi-GPU defaults; reduce-overhead (CUDA-graph capture) auto-enables whenever either
-# whole-model path is on — so you don't have to set it per run — unless you export it explicitly.
-COMPILE_WHOLE_BACKBONE="${XORL_COMPILE_WHOLE_BACKBONE:-0}"
-COMPILE_WHOLE_STEP="${XORL_COMPILE_WHOLE_STEP:-1}"
-if [[ "$COMPILE_WHOLE_BACKBONE" == "1" || "$COMPILE_WHOLE_STEP" == "1" ]]; then
-  COMPILE_REDUCE_OVERHEAD="${XORL_COMPILE_REDUCE_OVERHEAD:-1}"
-else
-  COMPILE_REDUCE_OVERHEAD="${XORL_COMPILE_REDUCE_OVERHEAD:-0}"
-fi
-
 echo ">> installing XoRL (repo-recommended 'uv sync') + training $CONFIG on $NUM_GPUS H100s ..."
-echo ">> compile flags (forwarded to remote): WHOLE_BACKBONE=$COMPILE_WHOLE_BACKBONE WHOLE_STEP=$COMPILE_WHOLE_STEP REDUCE_OVERHEAD=$COMPILE_REDUCE_OVERHEAD"
 "${SSH[@]}" bash -s <<EOF
 set -e
 cd /workspace/repo
@@ -281,26 +256,10 @@ echo "=== uv sync (pulls flash-attn-4 / cute stack) ==="
 uv sync 2>&1 | tee /workspace/out/install.log | tail -25
 # Activate the .venv so bare 'python'/'torchrun' resolve to the uv-managed env.
 source .venv/bin/activate
-# torch.compile flags, baked in from the launcher's local env (resolved above); the torchrun
-# children on the box inherit them.
-#   XORL_COMPILE_WHOLE_BACKBONE=1  wraps self.model.model in ONE torch.compile region. Under FSDP
-#                                  the per-layer all-gather/collective hooks break that region at
-#                                  every comm boundary, so Inductor emits MANY cudagraphs/step
-#                                  rather than ~2 — that fragmentation is expected, not a bug.
-#   XORL_COMPILE_WHOLE_STEP=1      additionally folds lm_head+CE into the loss callable and flips
-#                                  torch._dynamo.config.skip_fsdp_hooks=False (Traceable FSDP2).
-#                                  The CE is a traceable chunked unroll (no full [N, vocab] logits;
-#                                  peak = one chunk), so large packing no longer OOMs. It uses the
-#                                  same num_chunks as the regular loss path (DEFAULT_NUM_CHUNKS).
-#   XORL_COMPILE_REDUCE_OVERHEAD   mode=reduce-overhead (CUDA-graph capture). Auto-set to 1 above
-#                                  whenever WHOLE_BACKBONE or WHOLE_STEP is 1; override by exporting.
-export XORL_COMPILE_WHOLE_BACKBONE=$COMPILE_WHOLE_BACKBONE
-export XORL_COMPILE_WHOLE_STEP=$COMPILE_WHOLE_STEP
-export XORL_COMPILE_REDUCE_OVERHEAD=$COMPILE_REDUCE_OVERHEAD
 # Diagnostic passthrough: set TORCH_LOGS locally (e.g. TORCH_LOGS=graph_breaks,recompiles) to
 # dump Dynamo graph-break / recompile reasons into train.log at compile time. Empty = no logging.
 export TORCH_LOGS="$TORCH_LOGS"
-echo "compile flags: WHOLE_BACKBONE=\$XORL_COMPILE_WHOLE_BACKBONE WHOLE_STEP=\$XORL_COMPILE_WHOLE_STEP REDUCE_OVERHEAD=\$XORL_COMPILE_REDUCE_OVERHEAD TORCH_LOGS=\$TORCH_LOGS"
+echo "TORCH_LOGS=\$TORCH_LOGS"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv || true
 python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), 'device_count', torch.cuda.device_count())"
 echo "=== train ($NUM_GPUS-way torchrun) ==="

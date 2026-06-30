@@ -142,8 +142,12 @@ GPUS=2 MODEL=1.7b COMPILE=1 MODE=manualgraph OPT=muon S=2048 \
 ## Code changes (in `src/`)
 
 - `distributed/torch_parallelize.py`: `XORL_COMPILE_FULLGRAPH` (opt-in fullgraph per layer, proves 0
-  breaks); `decoder_blocks` now shards the compiled `OptimizedModule` wrapper; `XORL_COMPILE_REDUCE_OVERHEAD`
-  knob (documented as a footgun under FSDP — 9× slower).
+  breaks); `decoder_blocks` now shards the compiled `OptimizedModule` wrapper.
 - `trainers/trainer.py` + `trainers/training_utils.py`: async metrics (remove the per-step
   `.item()`/`synchronize()` D2H stall; metrics one step stale; `clip_gradients(as_tensor=...)`),
   gated by `XORL_ASYNC_METRICS` (default on, non-PP).
+- The superseded whole-step / whole-backbone / Inductor `reduce-overhead` machinery (the deprecated
+  compile-through-FSDP2-hooks path, plus its `XORL_COMPILE_WHOLE_STEP` / `WHOLE_BACKBONE` /
+  `REDUCE_OVERHEAD` / `CUDAGRAPH_MARK_STEP` knobs and the `ws2` config + plan docs) was removed — see
+  git history. The manual `CUDAGraph` capture above (in `qwen3_capture_harness.py`) is the working
+  replacement.

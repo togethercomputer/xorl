@@ -38,12 +38,11 @@ from xorl.models import build_foundation_model, build_tokenizer, save_model_asse
 from xorl.models.checkpoint_handlers.buffers import get_prequantized_exclude_modules
 from xorl.models.layers.moe.aux_loss import global_load_balancing_loss_func
 from xorl.models.layers.moe.routing_replay import RoutingReplay, set_replay_stage
-from xorl.models.module_utils import compute_loss, get_lm_head_weight
+from xorl.models.module_utils import compute_loss
 from xorl.models.transformers.deepseek_v3.support import (
     freeze_deepseek_v3_router_parameters,
     validate_deepseek_v3_training_mode,
 )
-from xorl.ops.loss.compiled_cross_entropy import traceable_full_cross_entropy
 from xorl.optim import build_lr_scheduler, build_optimizer
 from xorl.qlora import (
     detect_prequantized_block_fp8,
@@ -842,100 +841,6 @@ class Trainer:
 
         self.model.train()
 
-        # Whole-model compile under FSDP2: first enable Traceable FSDP2, then (for the
-        # whole-backbone path) compile the backbone as ONE region.
-        #
-        # By default Dynamo sets skip_fsdp_hooks=True, which leaves FSDP2's per-layer all-gather
-        # (forward-pre-hook) and reduce-scatter (post-backward hook) running eagerly on side
-        # streams and forces a graph break at every fully_shard() unit. That is exactly why the
-        # original whole-backbone capture fragmented into a few useless static cudagraph islands
-        # while the comm-bracketed matmuls stayed eager (see results/tables/sp1-cudagraph-vs-eager.md).
-        #
-        # Setting skip_fsdp_hooks=False raises the collectives into the AOT/Inductor graph as
-        # functional collectives, so they no longer split the region — the whole backbone can be
-        # traced+captured as one graph (CUDAGraph Trees natively support nccl ops). This is the
-        # missing piece that makes torch.compile(self.model.model) actually work across FSDP
-        # boundaries, instead of the per-layer (regional) compile which always has a region
-        # boundary at every decoder layer. Caveat: only clean when nothing ELSE in the backbone
-        # breaks — true for pure-FSDP sp1 (no Ulysses a2a; FA is a custom op; the causal-mask
-        # `.item()` probe is dead under flash). Ulysses/ring SP all-to-all would still graph-break
-        # at every layer (their collectives are eager c10d in autograd.Function, not traceable),
-        # so for those layouts whole-backbone re-fragments and per-layer compile is no worse.
-        _whole_backbone = os.environ.get("XORL_COMPILE_WHOLE_BACKBONE") == "1"
-        _whole_step = os.environ.get("XORL_COMPILE_WHOLE_STEP") == "1"
-        if _whole_backbone or _whole_step:
-            # torch._dynamo is imported at module level (a local `import torch._dynamo` here
-            # would make `torch` a function-local and UnboundLocalError the earlier torch.autocast).
-            torch._dynamo.config.skip_fsdp_hooks = False
-            # FSDP2's own hooks call logging.Logger methods (e.g. logger.debug in
-            # detect_compiled_autograd during _root_pre_forward, and the per-param-group
-            # pre_forward debug log). Dynamo can't trace Logger methods, so each one graph-breaks
-            # — and the one in _root_pre_forward is UNRESUMABLE, which makes Dynamo skip the whole
-            # _whole_step_impl frame and run it eager (so lm_head+CE never compile, and the backbone
-            # re-fragments per layer). Empirically (TORCH_LOGS=graph_breaks) these FSDP logger
-            # breaks, not the collectives, were the dominant fragmenter. No-op the logger methods
-            # during tracing so the region actually compiles.
-            #
-            # NB: ignore_logger_methods is set[Callable] — it matches the unbound logging.Logger
-            # METHOD OBJECTS (logging.Logger.debug), NOT the string names "debug". (A local
-            # `import logging` is safe; only a local `import torch*` would shadow the module-level
-            # `torch` and UnboundLocalError the earlier torch.autocast — see skip_fsdp_hooks note.)
-            import logging
-
-            torch._dynamo.config.ignore_logger_methods |= {
-                logging.Logger.debug,
-                logging.Logger.info,
-                logging.Logger.warning,
-            }
-            logger.info_rank0(
-                "Whole-model compile: Traceable FSDP2 enabled "
-                "(torch._dynamo.config.skip_fsdp_hooks=False) — FSDP2 collectives are traced into "
-                "the compiled graph rather than broken on at each fully_shard() unit. "
-                "ignore_logger_methods += {debug,info,warning} so FSDP hook logging doesn't graph-break."
-            )
-
-        # Whole-backbone: compile self.model.model (embeddings + all decoder layers + norm) as ONE
-        # region so Dynamo traces the full layer loop into a single graph — no per-layer boundary.
-        # With Traceable FSDP2 (above) the FSDP collectives stay in-graph, so this captures as ~1
-        # graph (mode="reduce-overhead" → CUDA-graph). Enabled for BOTH the whole-backbone and the
-        # whole-step flags: whole-step additionally folds lm_head+CE into the loss callable below,
-        # but the backbone itself is still compiled here as one region. Run with enable_compile=false
-        # so the per-layer path is skipped (otherwise the layers get double-compiled). Gated by env.
-        if (_whole_backbone or _whole_step) and hasattr(self.model, "model"):
-            _wb_mode = "reduce-overhead" if os.environ.get("XORL_COMPILE_REDUCE_OVERHEAD") == "1" else None
-            _wb_dynamic = os.environ.get("XORL_COMPILE_DYNAMIC", "0") == "1"
-            self.model.model = torch.compile(self.model.model, mode=_wb_mode, dynamic=_wb_dynamic)
-            logger.info_rank0(f"WHOLE-BACKBONE torch.compile applied (mode={_wb_mode}, dynamic={_wb_dynamic})")
-
-        # Keep the LOSS in the model: fold backbone + lm_head + cross-entropy into ONE callable
-        # (_whole_step_impl) and compile it, instead of the eager per-op chunked-CE path. The CE
-        # uses a traceable chunked unroll (see _whole_step_impl), so the [N, vocab] logits are
-        # NOT materialized: peak logits stay at one chunk while the whole fwd+loss is still a
-        # single compiled (and, with reduce-overhead, cudagraph-captured) region. Combine with
-        # Traceable FSDP2 (above) so the in-region FSDP collectives are traced rather than broken
-        # on. Gated by env.
-        self._whole_step = None
-        # The first whole-step call runs EAGER (warmup) to let FSDP2's one-time _lazy_init /
-        # detect_compiled_autograd (in _root_pre_forward) complete OUTSIDE the compiled region.
-        # Otherwise Dynamo traces _lazy_init on the first compiled call and hits an unresumable
-        # graph break that skips _whole_step_impl to eager for the entire run (see the
-        # ignore_logger_methods note above — that fixed the logger break but _lazy_init still ran
-        # in-graph). Flipped True after the first eager forward in _forward_backward.
-        self._whole_step_warmed_up = False
-        if _whole_step:
-            _ws_mode = "reduce-overhead" if os.environ.get("XORL_COMPILE_REDUCE_OVERHEAD") == "1" else None
-            _ws_dynamic = os.environ.get("XORL_COMPILE_DYNAMIC", "0") == "1"
-            # Whole-step CE materializes the full [N, vocab] logits ONCE (non-chunked). Chunking did
-            # per-chunk dynamic alloc/free inside the captured region, which corrupted the
-            # cudagraph-trees static pool and crashed (setCheckpointPoolState) — reproduced with no
-            # profiler at all, so it was inherent to the capture. A single static logits allocation is
-            # cudagraph-safe and, under cudagraph, no worse on memory (the pool pinned the union of
-            # chunk buffers anyway). See traceable_full_cross_entropy.
-            self._whole_step = torch.compile(self._whole_step_impl, mode=_ws_mode, dynamic=_ws_dynamic)
-            logger.info_rank0(
-                f"WHOLE-STEP torch.compile (backbone+lm_head+full-logits-CE one region, mode={_ws_mode})"
-            )
-
         logger.info(
             f"rank{args.train.local_rank} Start training, "
             f"train_steps_per_epoch: {self.train_steps_per_epoch}, "
@@ -952,13 +857,6 @@ class Trainer:
         self._async_metrics = (not self.pp_enabled) and os.environ.get("XORL_ASYNC_METRICS", "1") == "1"
         self._pending_metrics = None
         self._last_metrics = (0.0, 0.0, args.train.lr)
-        # CUDAGraph Trees (reduce-overhead) need a per-iteration mark to reuse the static pool and
-        # avoid re-recording every step ("pending uninvoked backwards"). XORL_CUDAGRAPH_MARK_STEP
-        # controls WHERE we call torch.compiler.cudagraph_mark_step_begin(): "step" = once per
-        # optimizer step (train_step top), "mb" = before each micro-batch forward (per the
-        # "before each model invocation" guidance), "off" = never (default unless reduce-overhead).
-        _ro = os.environ.get("XORL_COMPILE_REDUCE_OVERHEAD") == "1"
-        self._cudagraph_mark = os.environ.get("XORL_CUDAGRAPH_MARK_STEP", "step" if _ro else "off")
         if self._async_metrics:
             logger.info_rank0(
                 "Async metrics ON: per-step loss/grad_norm/tok-s logged one step stale (no per-step "
@@ -1106,9 +1004,6 @@ class Trainer:
         Returns:
             (total_loss, grad_norm) — all-reduced across DP for logging.
         """
-        # New CUDAGraph Trees generation for this optimizer step (reuse static pool, no re-record).
-        if getattr(self, "_cudagraph_mark", "off") == "step":
-            torch.compiler.cudagraph_mark_step_begin()
         global_valid_tokens = self._count_valid_tokens(micro_batches)
         if self._use_distsignsgd:
             active_microbatches, active_voter_total = self._count_active_microbatches(micro_batches)
@@ -1219,40 +1114,14 @@ class Trainer:
     # Forward-backward: non-PP and PP paths
     # ===================================================================
 
-    def _whole_step_impl(
-        self,
-        micro_batch: Dict[str, Any],
-        labels: torch.Tensor,
-        global_valid_tokens: torch.Tensor,
-    ) -> torch.Tensor:
-        """Backbone + lm_head + cross-entropy in one callable (for whole-step torch.compile).
-
-        Uses ``traceable_full_cross_entropy`` (non-chunked: the full ``[N, vocab]`` logits are
-        materialized ONCE) rather than a chunked unroll. Chunking did per-chunk dynamic alloc/free
-        that corrupted the cudagraph-trees static pool and crashed (``setCheckpointPoolState``,
-        reproduced with no profiler); a single static logits allocation is cudagraph-safe and no
-        worse on memory under capture. No inner ``torch.compile``, so it folds into this one compiled
-        graph. Used only by the experimental XORL_COMPILE_WHOLE_STEP path.
-        """
-        outputs = self.model(**micro_batch, use_cache=False, output_hidden_states=False)
-        hidden = outputs.last_hidden_state
-        loss = traceable_full_cross_entropy(
-            hidden.reshape(-1, hidden.size(-1)),
-            get_lm_head_weight(self.model.lm_head),
-            labels.reshape(-1),
-            ignore_index=IGNORE_INDEX,
-            reduction="sum",
-        )
-        return loss / global_valid_tokens
-
     def _forward_backward(
         self,
         micro_batches: List[Dict[str, Any]],
         global_valid_tokens: torch.Tensor,
     ) -> Union[float, torch.Tensor]:
         """Standard gradient accumulation loop (non-PP)."""
-        # float for the eager per-op path below; the whole-step branch instead accumulates an
-        # on-GPU tensor (see its comment) and returns that, so the type is a union.
+        # Starts as float; the loop accumulates the logged loss as an on-GPU tensor (see below) to
+        # avoid a per-micro-batch `.item()` D2H stall, so the running type is a union.
         total_loss: Union[float, torch.Tensor] = 0.0
 
         for micro_batch in micro_batches:
@@ -1264,37 +1133,6 @@ class Trainer:
             # Pop labels before forward (model only outputs last_hidden_state)
             labels = micro_batch.pop("labels")
 
-            # Experimental: fold the entire fwd+loss into one compiled (+ optionally cudagraph'd)
-            # region instead of the per-op path below. Gated by XORL_COMPILE_WHOLE_STEP.
-            if getattr(self, "_whole_step", None) is not None:
-                # Warmup: the FIRST forward runs the EAGER _whole_step_impl so FSDP2's one-time
-                # _lazy_init / detect_compiled_autograd completes outside the compiled region (an
-                # in-graph _lazy_init is an unresumable graph break that skips this frame to eager
-                # for the whole run). After warmup, use the compiled callable. The warmup micro-batch
-                # is a real grad-accumulation step — its forward+backward count, nothing is wasted.
-                if not self._whole_step_warmed_up:
-                    ga_loss = self._whole_step_impl(micro_batch, labels, global_valid_tokens)
-                    self._whole_step_warmed_up = True
-                else:
-                    ga_loss = self._whole_step(micro_batch, labels, global_valid_tokens)
-                with self._model_bwd_context:
-                    ga_loss.backward()
-                # Whole-step computes CE+lm_head INSIDE the compiled (cudagraphable) region, so
-                # accumulate the logged loss on-GPU and sync it ONCE per step (in _reduce_metrics'
-                # DP all-reduce). A per-micro-batch `.item()` here would be a D2H sync stalling the
-                # CPU until each backward finishes, defeating the CUDA-graph / reduce-overhead
-                # overlap this path exists for. Loss is logging-only (never used for gradients), so
-                # this changes no training numerics — only how the displayed scalar is summed.
-                total_loss = (
-                    ga_loss.detach()
-                    if not isinstance(total_loss, torch.Tensor)
-                    else total_loss + ga_loss.detach()
-                )
-                del micro_batch, labels, ga_loss
-                continue
-
-            if self._cudagraph_mark == "mb":
-                torch.compiler.cudagraph_mark_step_begin()
             if self._use_routing_replay:
                 set_replay_stage("record")
             with self._autocast_ctx, self._model_fwd_context:

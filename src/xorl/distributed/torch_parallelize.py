@@ -832,23 +832,17 @@ def build_parallelize_model(
         # error instead of silent fragmentation — i.e. it PROVES 0 breaks per region (verified on a
         # 2-GPU Qwen3 FSDP2 run). Off by default so models with an unavoidable break still run.
         _fullgraph = os.environ.get("XORL_COMPILE_FULLGRAPH") == "1"
-        # mode=reduce-overhead → per-layer CUDA-graph capture. Off by default: under FSDP2 with
-        # reshard_after_forward the per-layer all-gather hands out fresh unsharded-param buffer
-        # addresses each step, forcing cudagraph re-record (~9x slower on 2-GPU Qwen3-1.7B). Exposed
-        # as a knob (XORL_COMPILE_REDUCE_OVERHEAD=1) for research — pair with reshard_after_forward
-        # to study whether stable buffers stop the re-record.
-        _mode = "reduce-overhead" if os.environ.get("XORL_COMPILE_REDUCE_OVERHEAD") == "1" else None
         target_classes = set((getattr(model, "_no_split_modules", []) or []) + (basic_modules or []))
         compiled_count = 0
         for fqn, mod in model.named_modules():
             if mod.__class__.__name__ in target_classes:
                 parent_fqn, _, child_name = fqn.rpartition(".")
                 parent = model.get_submodule(parent_fqn) if parent_fqn else model
-                compiled_mod = torch.compile(mod, fullgraph=_fullgraph, mode=_mode)
+                compiled_mod = torch.compile(mod, fullgraph=_fullgraph)
                 setattr(parent, child_name, compiled_mod)
                 compiled_count += 1
         logger.info_rank0(
-            f"torch.compile applied to {compiled_count} decoder layers (fullgraph={_fullgraph}, mode={_mode})"
+            f"torch.compile applied to {compiled_count} decoder layers (fullgraph={_fullgraph})"
         )
 
         # Enable compiled vocab-parallel cross-entropy kernels

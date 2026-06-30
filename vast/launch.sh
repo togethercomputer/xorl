@@ -175,9 +175,6 @@ echo "=== uv sync (pulls flash-attn-4 / cute stack) ==="
 uv sync 2>&1 | tee /workspace/out/install.log | tail -25
 # Activate the .venv so bare 'python'/'torchrun' resolve to the uv-managed env.
 source .venv/bin/activate
-# Request CUDA-graph capture (mode="reduce-overhead") for compiled decoder layers; the
-# torchrun child below inherits this env var.
-export XORL_COMPILE_REDUCE_OVERHEAD=1
 python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
 echo "=== train with built-in torch.profiler (torchrun) ==="
 # XoRL is torchrun-based (Trainer inits torch.distributed from the elastic env);
