@@ -69,6 +69,13 @@ def main():
     model = model.to(torch.bfloat16)
     model.train()
 
+    # GRADCKPT=1: activation checkpointing — recompute activations in backward instead of storing
+    # them. Shrinks the transient working set that the capture private pool must pin a copy of.
+    if os.environ.get("GRADCKPT", "0") == "1":
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        if rank == 0:
+            print("GRADCKPT on (use_reentrant=False)", flush=True)
+
     # Per-layer compile BEFORE fully_shard (0-break pattern): fused kernels, hooks stay outside.
     if os.environ.get("COMPILE", "0") == "1":
         fg = os.environ.get("FULLGRAPH", "0") == "1"
@@ -147,7 +154,16 @@ def main():
         # Untimed warmup so FA4/cute JIT + any first-step costs are excluded from steady-state.
         for _ in range(5):
             run(mk_batch())
-        torch.cuda.synchronize(); dist.barrier(); t0 = time.time(); last = None
+        torch.cuda.synchronize()
+        # Capture-time peak reserved (cumulative-max so far): default-pool warmup residue + the graph
+        # private pool — the momentary spike that gates OOM-at-setup.
+        capture_peak = torch.cuda.max_memory_reserved() / 1e9
+        # EMPTY_CACHE_AFTER=1: after capture, replay only touches the PRIVATE pool, so the default
+        # pool's warmup-transient blocks sit reserved-but-idle. Free them to reclaim that slack.
+        if os.environ.get("EMPTY_CACHE_AFTER", "0") == "1":
+            torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()  # from here, measure STEADY-STATE reserved/alloc
+        dist.barrier(); t0 = time.time(); last = None
         for i in range(STEPS):
             last = run(mk_batch())
         torch.cuda.synchronize()
@@ -159,12 +175,13 @@ def main():
             L, h = cfg.num_hidden_layers, cfg.hidden_size
             flops_per_tok = 6 * N + 12 * L * h * S
             mfu = flops_per_tok * toks / (world * 989.5e12)
-            # max_memory_reserved is the cumulative-max since start, so it includes the capture-time
-            # peak (default pool + graph private pool) — the number that determines whether we OOM.
-            mem = torch.cuda.max_memory_reserved() / 1e9
+            # capture_peak = the momentary setup spike (measured above); steady_* = the ongoing
+            # footprint over the timed loop (after the optional post-capture empty_cache).
+            steady = torch.cuda.max_memory_reserved() / 1e9
+            alloc = torch.cuda.max_memory_allocated() / 1e9
             print(f"MODEL={name} MODE={mode} world={world} S={S} reshard={reshard}  per-step={dt*1e3:.1f}ms  "
                   f"tok/s={toks/1e3:.1f}k  MFU={mfu*100:.1f}%  loss={float(last.item()):.3f}  "
-                  f"peak_reserved={mem:.1f}GB", flush=True)
+                  f"capture_peak={capture_peak:.1f}GB steady_reserved={steady:.1f}GB peak_alloc={alloc:.1f}GB", flush=True)
     except Exception:
         if rank == 0:
             print(f"MODEL={name} MODE={mode} FAILED", flush=True); traceback.print_exc()

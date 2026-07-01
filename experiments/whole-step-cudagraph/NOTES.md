@@ -111,17 +111,43 @@ capture works but gives **~0** (this matches the original 8B-sp1 profile: 98.8% 
   **launch-bound-regime win** (small models / low per-GPU work / inference-shaped), not a large
   compute-bound training win. For 8B, **per-layer compile alone already gets near-peak**; capture
   adds nothing.
-- **Memory levers at 8B (S=2048, compiled, measured)**: the CUDAGraph private pool adds ~+20 GB over
-  eager (eager 47.5 GB → capture 67.5 GB reserved). Two levers were tested; only one helps:
-  - **`reshard_after_forward=True` cuts ~13 GB and fixes the OOMs** (8-GPU AdamW 81.1→67.5 GB;
-    Muon 81.9→67.5; 4-GPU 78.5→70.5) at ~−8% throughput. Without it, 4-GPU AdamW capture teeters at
-    the allocator's edge (78.5 GB, emits `memory allocation failed with OOM` retry warnings) and
-    Muon-8-GPU sits near the 80 GB limit; with it, both have comfortable headroom. Capture survives
-    the per-region re-gather and loss is bit-identical.
-  - **`torch.cuda.empty_cache()` between warmup and capture: NO effect** (81.9→81.9 GB, exact). The
-    peak is set during capture regardless of the default pool's warmup residue.
-  - Note the tradeoff: on compute-bound 8B, reshard=True capture (57.6k) is *slower than plain eager*
-    (63.4k) — you'd only pay it to make capture FIT, and 8B capture buys no throughput anyway.
+### Memory: root cause of the capture overhead
+
+The scary cumulative-reserved numbers (8B: capture 67.5 vs eager 47.5 GB) are **not extra live
+memory** — capture's *steady-state allocated* during replay is ~5 GB (replay reuses the pinned graph
+pool and allocates ~nothing new; the old "capture doubles transient memory" claim is wrong). The
+overhead is **reserved** memory and splits in two — measured clean on **1.7B / S=4096 / 4-GPU /
+reshard=True** (small model chosen so total reserved sits well under the shared-cluster co-tenant
+ceiling that otherwise confounds 8B reserved via OOM-retries):
+
+| config | capture-time spike | steady reserved | steady alloc |
+|---|---|---|---|
+| eager | 30.7 | 30.7 | 26.8 |
+| capture | 38.1 | 32.9 | 4.8 |
+| capture + `expandable_segments` | 35.4 | **30.3 ≈ eager** | 4.8 |
+
+- **One-time capture-time SPIKE** (+7.4 GB over eager): during warmup+capture the default allocator
+  pool (holding the step's working set from warmup) and the graph's **private pool** coexist — the
+  private pool cannot share the default pool's free blocks, so it `cudaMalloc`s a fresh copy of the
+  captured transient. **This spike is what OOMs at setup.**
+- **Small steady-state overhead** (+2.2 GB) during replay — the ongoing training footprint.
+
+### Memory: what fixes it (measured)
+
+- **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** — VMM-backed segments let the private pool
+  reuse freed physical pages, so **steady-state reserved drops to ≈ eager** (30.3 vs 30.7) and the
+  setup spike shrinks ~2.7 GB. Works with capture, loss bit-identical. The fix for the ongoing
+  footprint; the residual setup spike is momentary and inherent to the two-pool capture idiom.
+- **`reshard_after_forward=True`** cuts ~13 GB at 8B (unsharded params no longer resident) at ~−8%
+  throughput — pair with expandable_segments to fit the setup spike. 8B/4-GPU AdamW capture goes from
+  teetering at the OOM edge (78.5 GB, `memory allocation failed with OOM` retry warnings) to
+  comfortable (70.5); Muon-8-GPU 81.9→67.5.
+- **No effect:** `torch.cuda.empty_cache()` before OR after capture (peak identical — the default
+  pool's warmup blocks are already reused by replay, nothing to reclaim); `garbage_collection_threshold`.
+  **Hurts:** `max_split_size_mb:128` (+4 GB, more fragmentation). **Red herring:** gradient
+  checkpointing (didn't move `alloc` — at B=1 stored activations aren't the dominant term).
+- Tradeoff reminder: on compute-bound 8B, reshard=True capture (57.6k) is *slower than plain eager*
+  (63.4k) — you'd only pay the memory levers to make capture FIT, and 8B capture buys no throughput.
 
 ## Reproduce
 
