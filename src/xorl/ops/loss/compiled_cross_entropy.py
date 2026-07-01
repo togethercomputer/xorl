@@ -10,6 +10,7 @@ from typing import Callable, Dict
 import torch
 import torch.nn.functional as F
 
+
 # Default token-dim chunk count for the compiled/chunked CE. Shared so every path that chunks
 # CE uses the same value: the auto_chunker loss path (causallm_loss_function's num_chunks
 # default) and the whole-step traceable unroll (traceable_chunked_cross_entropy).
