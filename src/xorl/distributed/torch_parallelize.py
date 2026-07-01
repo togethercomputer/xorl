@@ -689,7 +689,9 @@ def build_parallelize_model(
                         setattr(parent, child_name, compiled_mod)
                         compiled_count += 1
                 if i == 0:
-                    logger.info_rank0(f"torch.compile applied to {compiled_count} decoder layers (fullgraph={_fullgraph})")
+                    logger.info_rank0(
+                        f"torch.compile applied to {compiled_count} decoder layers (fullgraph={_fullgraph})"
+                    )
 
                 # Enable compiled vocab-parallel cross-entropy kernels
                 if hasattr(model_part, "loss_function"):
@@ -841,9 +843,7 @@ def build_parallelize_model(
                 compiled_mod = torch.compile(mod, fullgraph=_fullgraph)
                 setattr(parent, child_name, compiled_mod)
                 compiled_count += 1
-        logger.info_rank0(
-            f"torch.compile applied to {compiled_count} decoder layers (fullgraph={_fullgraph})"
-        )
+        logger.info_rank0(f"torch.compile applied to {compiled_count} decoder layers (fullgraph={_fullgraph})")
 
         # Enable compiled vocab-parallel cross-entropy kernels
         if hasattr(model, "loss_function"):

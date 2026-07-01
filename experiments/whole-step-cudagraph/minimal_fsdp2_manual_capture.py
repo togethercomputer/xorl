@@ -18,6 +18,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
 
+
 H = int(os.environ.get("H", "2048"))
 B = int(os.environ.get("B", "8"))
 S = int(os.environ.get("S", "512"))
@@ -105,6 +106,7 @@ def main():
                 opt.step()
                 return static_loss
         else:
+
             def run(x):
                 opt.zero_grad(set_to_none=True)
                 static_in.copy_(x)
@@ -114,7 +116,9 @@ def main():
 
         # Correctness: loss trajectory. Timing: steady-state per-step.
         losses = []
-        torch.cuda.synchronize(); dist.barrier(); t0 = time.time()
+        torch.cuda.synchronize()
+        dist.barrier()
+        t0 = time.time()
         for i in range(NSTEPS):
             loss = run(inputs[i])
             if i in (0, 1, NSTEPS // 2, NSTEPS - 1):

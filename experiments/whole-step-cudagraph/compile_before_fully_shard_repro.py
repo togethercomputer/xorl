@@ -11,13 +11,13 @@ This checks: do the compiled compute regions hit 0 graph breaks, and does fwd+bw
 Run: torchrun --standalone --nproc_per_node=2 scratch_fsdp_pre_compile.py
 """
 
-import os
 import traceback
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
+
 
 H = 2048
 
@@ -64,7 +64,7 @@ def main():
     fully_shard(model.head, mp_policy=mp)
     fully_shard(model, mp_policy=mp)
 
-    from torch._dynamo.utils import counters
+    from torch._dynamo.utils import counters  # noqa: PLC0415  (lazy: only for the break census)
 
     if rank == 0:
         print(f"torch {torch.__version__} | pattern=compile-before-fully_shard fullgraph=True", flush=True)

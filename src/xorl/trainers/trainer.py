@@ -935,7 +935,14 @@ class Trainer:
                     self.environ_meter.image_seqlens.clear()
                     lr = max(self.lr_scheduler.get_last_lr())
                     self._pending_metrics = (
-                        total_loss, grad_norm, start_evt, end_evt, seqlens, image_seqlens, state.global_step, lr
+                        total_loss,
+                        grad_norm,
+                        start_evt,
+                        end_evt,
+                        seqlens,
+                        image_seqlens,
+                        state.global_step,
+                        lr,
                     )
                 else:
                     synchronize()
@@ -947,7 +954,12 @@ class Trainer:
                     train_metrics = self.environ_meter.step(delta_time, global_step=state.global_step)
                     state.loss_history.append(total_loss)
                     self._maybe_log(
-                        total_loss, grad_norm, lr, train_metrics, delta_time, use_tqdm,
+                        total_loss,
+                        grad_norm,
+                        lr,
+                        train_metrics,
+                        delta_time,
+                        use_tqdm,
                         data_loader_tqdm if use_tqdm else None,
                     )
                 self._maybe_profile()
@@ -1073,9 +1085,7 @@ class Trainer:
             skip_dtensor_grads=self._use_distsignsgd,
         )
 
-    def _reduce_metrics(
-        self, total_loss: Union[float, torch.Tensor], grad_norm: float
-    ) -> Tuple[float, float]:
+    def _reduce_metrics(self, total_loss: Union[float, torch.Tensor], grad_norm: float) -> Tuple[float, float]:
         """All-reduce loss and grad_norm across DP for logging.
 
         `total_loss` may be a 0-dim GPU tensor (non-PP path accumulates it on-device to avoid
@@ -1084,11 +1094,15 @@ class Trainer:
         if self._async_metrics and not self.pp_enabled:
             # Async path: reduce loss & grad_norm as GPU TENSORS (no .item()/tolist D2H). The
             # collectives are enqueued here; the train loop materializes the scalars one-step-stale.
-            loss_t = total_loss if isinstance(total_loss, torch.Tensor) else torch.as_tensor(
-                float(total_loss), device=get_device_type()
+            loss_t = (
+                total_loss
+                if isinstance(total_loss, torch.Tensor)
+                else torch.as_tensor(float(total_loss), device=get_device_type())
             )
-            gn_t = grad_norm if isinstance(grad_norm, torch.Tensor) else torch.as_tensor(
-                float(grad_norm), device=get_device_type()
+            gn_t = (
+                grad_norm
+                if isinstance(grad_norm, torch.Tensor)
+                else torch.as_tensor(float(grad_norm), device=get_device_type())
             )
             loss_t = loss_t.detach().reshape(()).clone()
             gn_t = gn_t.detach().reshape(()).clone()

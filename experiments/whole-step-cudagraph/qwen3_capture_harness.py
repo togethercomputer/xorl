@@ -12,15 +12,22 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True — it keeps the capture pool's
 Reports capture_peak (one-time setup spike) vs steady_reserved (ongoing) vs peak_alloc.
 Run: PYTHONPATH=$PWD/src torchrun --standalone --nproc_per_node=N qwen3_capture_harness.py
 """
-import os, sys, time, traceback
-import torch, torch.nn as nn, torch.distributed as dist
-from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
-from transformers import Qwen3Config
-from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+import os
+import sys
+import time
+import traceback
+
+import torch
+import torch.distributed as dist
 
 # ---- FA4 attention registered into HF's dispatch -------------------------------------------------
-from flash_attn.cute import flash_attn_func as _fa4
+from flash_attn.cute import flash_attn_func as _fa4  # noqa: TID253  (standalone script; needed at import to register)
+from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
+from transformers import Qwen3Config
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
+
 
 def fa4_attention(module, query, key, value, attention_mask=None, scaling=None, dropout=0.0, **kwargs):
     # HF passes (B, n_heads, S, D); FA4 wants (B, S, n_heads, D), causal.
@@ -32,14 +39,30 @@ def fa4_attention(module, query, key, value, attention_mask=None, scaling=None, 
         out = out[0]
     return out, None  # (attn_output[B,S,H,D], attn_weights)
 
+
 ALL_ATTENTION_FUNCTIONS["fa4"] = fa4_attention
 
 CONFIGS = {
-    "1.7b": dict(hidden_size=2048, intermediate_size=6144, num_hidden_layers=28,
-                 num_attention_heads=16, num_key_value_heads=8, head_dim=128, vocab_size=151936),
-    "8b": dict(hidden_size=4096, intermediate_size=12288, num_hidden_layers=36,
-               num_attention_heads=32, num_key_value_heads=8, head_dim=128, vocab_size=151936),
+    "1.7b": dict(
+        hidden_size=2048,
+        intermediate_size=6144,
+        num_hidden_layers=28,
+        num_attention_heads=16,
+        num_key_value_heads=8,
+        head_dim=128,
+        vocab_size=151936,
+    ),
+    "8b": dict(
+        hidden_size=4096,
+        intermediate_size=12288,
+        num_hidden_layers=36,
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        head_dim=128,
+        vocab_size=151936,
+    ),
 }
+
 
 def build_muon_groups(model):
     # Muon for 2D weight matrices; AdamW for everything else (norms, embeddings, lm_head).
@@ -51,6 +74,7 @@ def build_muon_groups(model):
             adamw.append(p)
     return muon, adamw
 
+
 def main():
     dist.init_process_group("nccl")
     rank, world = dist.get_rank(), dist.get_world_size()
@@ -60,8 +84,13 @@ def main():
     mode = os.environ.get("MODE", "manualgraph")
     S = int(os.environ.get("S", "2048"))
     STEPS = int(os.environ.get("STEPS", "20"))
-    cfg = Qwen3Config(**CONFIGS[name], max_position_embeddings=max(S, 4096),
-                      attn_implementation="fa4", use_cache=False, tie_word_embeddings=(name == "1.7b"))
+    cfg = Qwen3Config(
+        **CONFIGS[name],
+        max_position_embeddings=max(S, 4096),
+        attn_implementation="fa4",
+        use_cache=False,
+        tie_word_embeddings=(name == "1.7b"),
+    )
     torch.manual_seed(0)
     with torch.device("meta"):
         model = Qwen3ForCausalLM(cfg)
@@ -101,22 +130,34 @@ def main():
     if os.environ.get("OPT", "muon") == "adamw":
         opts = [torch.optim.AdamW(model.parameters(), lr=3e-4, fused=True)]  # fast opt to isolate fwd+bwd
     else:
-        from xorl.optim.muon import Muon as XorlMuon  # fast Muon: gram-NS + quack kernels, FSDP2-aware
+        from xorl.optim.muon import Muon as XorlMuon  # noqa: PLC0415  (lazy: only when OPT=muon)
+
         muon_p, adamw_p = build_muon_groups(model)
-        opts = [XorlMuon([
-            {"params": muon_p, "use_muon": True, "lr": 0.02},
-            {"params": adamw_p, "use_muon": False, "lr": 3e-4},
-        ], distributed_mode="shard_local")]
+        opts = [
+            XorlMuon(
+                [
+                    {"params": muon_p, "use_muon": True, "lr": 0.02},
+                    {"params": adamw_p, "use_muon": False, "lr": 3e-4},
+                ],
+                distributed_mode="shard_local",
+            )
+        ]
+
     def opt_step():
-        for o in opts: o.step()
+        for o in opts:
+            o.step()
+
     def opt_zero():
-        for o in opts: o.zero_grad(set_to_none=(mode != "manualgraph"))
+        for o in opts:
+            o.zero_grad(set_to_none=(mode != "manualgraph"))
 
     B = 1
     g = torch.Generator(device=dev).manual_seed(1234 + rank)
+
     def mk_batch():
         ids = torch.randint(0, cfg.vocab_size, (B, S), device=dev, generator=g)
         return ids
+
     static_ids = torch.zeros(B, S, dtype=torch.long, device=dev)
 
     def fwd_bwd():
@@ -128,24 +169,37 @@ def main():
     try:
         if mode == "manualgraph":
             static_ids.copy_(mk_batch())
-            s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(s):
                 for _ in range(4):
-                    opt_zero(); fwd_bwd()
-            torch.cuda.current_stream().wait_stream(s); dist.barrier()
+                    opt_zero()
+                    fwd_bwd()
+            torch.cuda.current_stream().wait_stream(s)
+            dist.barrier()
             opt_zero()  # set_to_none False -> static grads
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 static_loss = fwd_bwd()
-            if rank == 0: print("CAPTURE OK", flush=True)
+            if rank == 0:
+                print("CAPTURE OK", flush=True)
+
             def run(ids):
                 static_ids.copy_(ids)
                 for p in model.parameters():
-                    if p.grad is not None: p.grad.zero_()
-                graph.replay(); opt_step(); return static_loss
+                    if p.grad is not None:
+                        p.grad.zero_()
+                graph.replay()
+                opt_step()
+                return static_loss
         else:
+
             def run(ids):
-                opt_zero(); static_ids.copy_(ids); loss = fwd_bwd(); opt_step(); return loss
+                opt_zero()
+                static_ids.copy_(ids)
+                loss = fwd_bwd()
+                opt_step()
+                return loss
 
         # Untimed warmup so FA4/cute JIT + any first-step costs are excluded from steady-state.
         for _ in range(5):
@@ -155,7 +209,9 @@ def main():
         # private pool — the one-time spike that gates OOM-at-setup.
         capture_peak = torch.cuda.max_memory_reserved() / 1e9
         torch.cuda.reset_peak_memory_stats()  # from here, measure STEADY-STATE reserved/alloc
-        dist.barrier(); t0 = time.time(); last = None
+        dist.barrier()
+        t0 = time.time()
+        last = None
         for i in range(STEPS):
             last = run(mk_batch())
         torch.cuda.synchronize()
@@ -171,18 +227,24 @@ def main():
             # footprint over the timed loop (after the optional post-capture empty_cache).
             steady = torch.cuda.max_memory_reserved() / 1e9
             alloc = torch.cuda.max_memory_allocated() / 1e9
-            print(f"MODEL={name} MODE={mode} world={world} S={S} reshard={reshard}  per-step={dt*1e3:.1f}ms  "
-                  f"tok/s={toks/1e3:.1f}k  MFU={mfu*100:.1f}%  loss={float(last.item()):.3f}  "
-                  f"capture_peak={capture_peak:.1f}GB steady_reserved={steady:.1f}GB peak_alloc={alloc:.1f}GB", flush=True)
+            print(
+                f"MODEL={name} MODE={mode} world={world} S={S} reshard={reshard}  per-step={dt * 1e3:.1f}ms  "
+                f"tok/s={toks / 1e3:.1f}k  MFU={mfu * 100:.1f}%  loss={float(last.item()):.3f}  "
+                f"capture_peak={capture_peak:.1f}GB steady_reserved={steady:.1f}GB peak_alloc={alloc:.1f}GB",
+                flush=True,
+            )
     except Exception:
         if rank == 0:
-            print(f"MODEL={name} MODE={mode} FAILED", flush=True); traceback.print_exc()
-        sys.stdout.flush(); sys.stderr.flush()
+            print(f"MODEL={name} MODE={mode} FAILED", flush=True)
+            traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
         os._exit(1)
     # destroy_process_group() hangs when a captured CUDA graph still holds NCCL comm refs; the
     # measurement is already printed, so exit hard to release GPUs cleanly for the next run.
     sys.stdout.flush()
     os._exit(0)
+
 
 if __name__ == "__main__":
     main()

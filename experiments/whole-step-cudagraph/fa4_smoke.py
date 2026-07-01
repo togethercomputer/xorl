@@ -1,9 +1,12 @@
 """Smoke test: does FA4 (flash_attn.cute) JIT-compile and run under torch nightly 2.14 / cu130?"""
+
 import torch
+
 
 print("torch", torch.__version__)
 try:
     from flash_attn.cute import flash_attn_func
+
     print("import flash_attn.cute OK")
 except Exception as e:
     print("IMPORT FAILED:", type(e).__name__, e)
@@ -22,6 +25,7 @@ try:
     print(f"FA4 FORWARD OK  out.shape={tuple(out.shape)} dtype={out.dtype} mean={out.float().mean().item():.4f}")
 except Exception as e:
     import traceback
+
     print("FA4 FORWARD FAILED:", type(e).__name__)
     traceback.print_exc()
     raise

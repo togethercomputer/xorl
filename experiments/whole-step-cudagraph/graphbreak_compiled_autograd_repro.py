@@ -13,11 +13,11 @@ import os
 import traceback
 
 import torch
+import torch._dynamo.compiled_autograd as ca
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
 
-import torch._dynamo.compiled_autograd as ca
 
 H = 2048  # matches the failing mm: (·,2048) @ (2048, 6144=3H)
 
@@ -74,12 +74,14 @@ def main():
     ca_enable = getattr(ca, "_enable", None) or getattr(ca, "enable")
 
     fwd_only = os.environ.get("FWD_ONLY") == "1"
-    from torch._dynamo.utils import counters
+    from torch._dynamo.utils import counters  # noqa: PLC0415  (lazy: only for the break census)
 
     if rank == 0:
-        print(f"torch {torch.__version__} | FWD_ONLY={fwd_only} "
-              f"skip_fsdp_hooks={torch._dynamo.config.skip_fsdp_hooks} RESHARD={os.environ.get('RESHARD','default')}",
-              flush=True)
+        print(
+            f"torch {torch.__version__} | FWD_ONLY={fwd_only} "
+            f"skip_fsdp_hooks={torch._dynamo.config.skip_fsdp_hooks} RESHARD={os.environ.get('RESHARD', 'default')}",
+            flush=True,
+        )
     for it in range(3):
         x = torch.randn(8, 512, H, device=dev, dtype=torch.bfloat16)
         try:
