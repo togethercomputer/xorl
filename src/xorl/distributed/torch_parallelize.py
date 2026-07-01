@@ -1,5 +1,4 @@
 import functools
-import os
 import types
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -678,20 +677,17 @@ def build_parallelize_model(
 
             # torch.compile (if enabled) — applied BEFORE FSDP below (supported FSDP2+compile order).
             if enable_compile:
-                _fullgraph = os.environ.get("XORL_COMPILE_FULLGRAPH") == "1"
                 target_classes = set((getattr(model_part, "_no_split_modules", []) or []) + (basic_modules or []))
                 compiled_count = 0
                 for fqn, mod in model_part.named_modules():
                     if mod.__class__.__name__ in target_classes:
                         parent_fqn, _, child_name = fqn.rpartition(".")
                         parent = model_part.get_submodule(parent_fqn) if parent_fqn else model_part
-                        compiled_mod = torch.compile(mod, fullgraph=_fullgraph)
+                        compiled_mod = torch.compile(mod)
                         setattr(parent, child_name, compiled_mod)
                         compiled_count += 1
                 if i == 0:
-                    logger.info_rank0(
-                        f"torch.compile applied to {compiled_count} decoder layers (fullgraph={_fullgraph})"
-                    )
+                    logger.info_rank0(f"torch.compile applied to {compiled_count} decoder layers")
 
                 # Enable compiled vocab-parallel cross-entropy kernels
                 if hasattr(model_part, "loss_function"):
@@ -830,20 +826,16 @@ def build_parallelize_model(
         # SUPPORTED FSDP2+compile pattern (PyTorch 2.12 deprecated compiling THROUGH FSDP2 hooks
         # into one graph, PRs #174863/#174906): compile the compute regions first, then fully_shard;
         # the all-gather/reduce-scatter run as eager hooks OUTSIDE these compiled regions.
-        # XORL_COMPILE_FULLGRAPH=1 sets fullgraph=True so any residual graph break becomes a hard
-        # error instead of silent fragmentation — i.e. it PROVES 0 breaks per region (verified on a
-        # 2-GPU Qwen3 FSDP2 run). Off by default so models with an unavoidable break still run.
-        _fullgraph = os.environ.get("XORL_COMPILE_FULLGRAPH") == "1"
         target_classes = set((getattr(model, "_no_split_modules", []) or []) + (basic_modules or []))
         compiled_count = 0
         for fqn, mod in model.named_modules():
             if mod.__class__.__name__ in target_classes:
                 parent_fqn, _, child_name = fqn.rpartition(".")
                 parent = model.get_submodule(parent_fqn) if parent_fqn else model
-                compiled_mod = torch.compile(mod, fullgraph=_fullgraph)
+                compiled_mod = torch.compile(mod)
                 setattr(parent, child_name, compiled_mod)
                 compiled_count += 1
-        logger.info_rank0(f"torch.compile applied to {compiled_count} decoder layers (fullgraph={_fullgraph})")
+        logger.info_rank0(f"torch.compile applied to {compiled_count} decoder layers")
 
         # Enable compiled vocab-parallel cross-entropy kernels
         if hasattr(model, "loss_function"):

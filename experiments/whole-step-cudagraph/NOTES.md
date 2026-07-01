@@ -33,7 +33,7 @@ measured levers below.
 ## The supported recipe (what to actually use)
 
 1. **Per-layer `torch.compile` BEFORE `fully_shard`** (the 0-graph-break pattern; see
-   `src/xorl/distributed/torch_parallelize.py`, `XORL_COMPILE_FULLGRAPH=1`). FSDP all-gather /
+   `src/xorl/distributed/torch_parallelize.py`). FSDP all-gather /
    reduce-scatter run as eager hooks *outside* the compiled regions. Shard the **compiled
    OptimizedModule wrapper**, not the inner layer (else the FSDP `_dynamo.disable` hook lands inside
    the traced region and breaks/errors). NB: compiling *through* FSDP2 hooks into one graph +
@@ -84,7 +84,7 @@ with `fa4_bwd.py` before anything else.
 | **per-layer compile + manual capture**, AdamW | **48.7k** | **33.4%** | **+30% from capture** |
 | per-layer + Inductor reduce-overhead (cudagraph) | ~6k | — | **9× slower** (re-records) |
 
-Graph-break census (compile-only path, `XORL_COMPILE_FULLGRAPH=1`): **0 breaks** on the whole
+Graph-break census (compile-only path, harness `FULLGRAPH=1`): **0 breaks** on the whole
 28-layer model (the earlier "≈40 FSDP breaks, impossible" claim was wrong). The Inductor-cudagraph
 9× regression is robust across `reshard_after_forward`, `cudagraph_mark_step_begin` (per-step &
 per-microbatch), and `TORCHINDUCTOR_CUDAGRAPH_TREES=0`. Minimal pure-torch FSDP2 capture
@@ -181,11 +181,12 @@ GPUS=2 MODEL=1.7b COMPILE=1 MODE=manualgraph OPT=muon S=2048 \
 
 ## Code changes (in `src/`)
 
-- `distributed/torch_parallelize.py`: `XORL_COMPILE_FULLGRAPH` (opt-in fullgraph per layer, proves 0
-  breaks); `decoder_blocks` now shards the compiled `OptimizedModule` wrapper.
-- `trainers/trainer.py` + `trainers/training_utils.py`: async metrics (remove the per-step
-  `.item()`/`synchronize()` D2H stall; metrics one step stale; `clip_gradients(as_tensor=...)`),
-  gated by `XORL_ASYNC_METRICS` (default on, non-PP).
+- `distributed/torch_parallelize.py`: `decoder_blocks` now shards the compiled `OptimizedModule`
+  wrapper (keeps FSDP hooks outside the compiled region → 0 breaks). (The 0-break proof used the
+  harness `FULLGRAPH=1`; production just uses the default `torch.compile`.)
+- `trainers/trainer.py` + `trainers/training_utils.py`: async metrics — remove the per-step
+  `.item()`/`synchronize()` D2H stall (metrics one step stale; `clip_gradients(as_tensor=...)`).
+  The default (and only) non-PP path; PP keeps the blocking path.
 - The superseded whole-step / whole-backbone / Inductor `reduce-overhead` machinery (the deprecated
   compile-through-FSDP2-hooks path, plus its `XORL_COMPILE_WHOLE_STEP` / `WHOLE_BACKBONE` /
   `REDUCE_OVERHEAD` / `CUDAGRAPH_MARK_STEP` knobs and the `ws2` config + plan docs) was removed — see

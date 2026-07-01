@@ -1,6 +1,6 @@
 # Qwen3-1.7B 2-GPU FSDP2 — SUPPORTED FSDP2+compile pattern: per-layer torch.compile applied
-# BEFORE fully_shard (see torch_parallelize.py), fullgraph via XORL_COMPILE_FULLGRAPH=1. No
-# whole-step single-graph (that path is deprecated upstream, PyTorch 2.12 #174863/#174906).
+# BEFORE fully_shard (see torch_parallelize.py). No whole-step single-graph (that path is
+# deprecated upstream, PyTorch 2.12 #174863/#174906).
 # FSDP all-gather/reduce-scatter run as eager hooks outside the compiled decoder-layer regions.
 model:
   model_path: Qwen/Qwen3-1.7B

@@ -851,17 +851,11 @@ class Trainer:
         # Async metrics: keep per-step loss/grad_norm/timing OFF the critical path so there is no
         # per-step device→host (.item()) sync stall. Metrics are logged one step stale — at the top
         # of each iteration we wait only on the PREVIOUS step's CUDA end-event (which has already
-        # finished), then materialize its loss/grad_norm/elapsed with non-blocking reads. Default ON
-        # for non-PP; XORL_ASYNC_METRICS=0 forces the old blocking path. PP keeps the blocking path
-        # (its loss/gvt handling already syncs).
-        self._async_metrics = (not self.pp_enabled) and os.environ.get("XORL_ASYNC_METRICS", "1") == "1"
+        # finished), then materialize its loss/grad_norm/elapsed with non-blocking reads. Used for
+        # every non-PP run; PP keeps the blocking path (its loss/gvt handling already syncs).
+        self._async_metrics = not self.pp_enabled
         self._pending_metrics = None
         self._last_metrics = (0.0, 0.0, args.train.lr)
-        if self._async_metrics:
-            logger.info_rank0(
-                "Async metrics ON: per-step loss/grad_norm/tok-s logged one step stale (no per-step "
-                "D2H sync stall). Set XORL_ASYNC_METRICS=0 for the blocking path."
-            )
 
         # Per-step ephemeral state for logging in _finalize
         total_loss = 0.0
