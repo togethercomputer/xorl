@@ -41,8 +41,11 @@ measured levers below.
 2. **Manual `torch.cuda.CUDAGraph`** over the compiled fwd+bwd (warmup on a side stream → capture →
    replay; static input/grad buffers; optimizer step *outside* the graph). See
    `qwen3_capture_harness.py`.
-3. **`reshard_after_forward=False`** (static param buffers for capture; also +5.5% on its own by
-   skipping the backward re-all-gather — costs resident-param memory).
+3. **`reshard_after_forward` is a memory/speed lever — both settings work under capture** (the old
+   "static buffers ⇒ reshard=False required" assumption is wrong; see the memory-levers table below).
+   `False`: unsharded params stay resident → highest peak, ~+8% throughput. `True`: params re-gathered
+   per region and captured into the graph pool → **−13 GB peak** at ~−8% throughput. Use `True` when
+   memory-bound (it fixes the 8B OOMs), `False` when you have headroom and want the speed.
 4. **Muon** keeps optimizer state small (1 momentum buffer vs AdamW's 2 + fp32 master) so 8B fits on
    fewer GPUs; use xorl's `xorl.optim.muon.Muon` (gram-NS + quack kernels, FSDP2 `shard_local`), not
    a naive Python NS (which was ~6× slower).
@@ -108,10 +111,17 @@ capture works but gives **~0** (this matches the original 8B-sp1 profile: 98.8% 
   **launch-bound-regime win** (small models / low per-GPU work / inference-shaped), not a large
   compute-bound training win. For 8B, **per-layer compile alone already gets near-peak**; capture
   adds nothing.
-- **Memory gotchas at 8B**: the CUDAGraph private pool roughly doubles transient memory, so capture
-  **OOMs at S=2048 on 4 GPUs** (eager fits at 22k). And **Muon OOMs at S=2048 on 8 GPUs** — its
-  gram-NS workspace pushes past 80 GB where lean fused AdamW fit. For 8B + capture + Muon: use a
-  smaller S, gradient checkpointing, or more GPUs.
+- **Memory levers at 8B (S=2048, compiled, measured)**: the CUDAGraph private pool adds ~+20 GB over
+  eager (eager 47.5 GB → capture 67.5 GB reserved). Two levers were tested; only one helps:
+  - **`reshard_after_forward=True` cuts ~13 GB and fixes the OOMs** (8-GPU AdamW 81.1→67.5 GB;
+    Muon 81.9→67.5; 4-GPU 78.5→70.5) at ~−8% throughput. Without it, 4-GPU AdamW capture teeters at
+    the allocator's edge (78.5 GB, emits `memory allocation failed with OOM` retry warnings) and
+    Muon-8-GPU sits near the 80 GB limit; with it, both have comfortable headroom. Capture survives
+    the per-region re-gather and loss is bit-identical.
+  - **`torch.cuda.empty_cache()` between warmup and capture: NO effect** (81.9→81.9 GB, exact). The
+    peak is set during capture regardless of the default pool's warmup residue.
+  - Note the tradeoff: on compute-bound 8B, reshard=True capture (57.6k) is *slower than plain eager*
+    (63.4k) — you'd only pay it to make capture FIT, and 8B capture buys no throughput anyway.
 
 ## Reproduce
 

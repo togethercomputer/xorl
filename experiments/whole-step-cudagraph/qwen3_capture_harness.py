@@ -10,7 +10,7 @@ Env knobs:
 Needs PYTHONPATH=<repo>/src for the xorl Muon import (OPT=muon).
 Run: PYTHONPATH=$PWD/src torchrun --standalone --nproc_per_node=N qwen3_capture_harness.py
 """
-import os, time, traceback
+import os, sys, time, traceback
 import torch, torch.nn as nn, torch.distributed as dist
 from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
 from transformers import Qwen3Config
@@ -78,9 +78,16 @@ def main():
             print(f"COMPILE per-layer (fullgraph={fg})", flush=True)
 
     mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+    # RESHARD=1: reshard params after forward (only sharded params resident between fwd/bwd; the
+    # unsharded buffer is re-gathered per region and captured into the graph's private pool) — far
+    # lower persistent param memory. RESHARD=0 (default): keep params unsharded/resident (static
+    # addresses), the original capture-friendly but memory-heavy choice.
+    reshard = os.environ.get("RESHARD", "0") == "1"
     for layer in model.model.layers:
-        fully_shard(layer, mp_policy=mp, reshard_after_forward=False)
-    fully_shard(model, mp_policy=mp, reshard_after_forward=False)
+        fully_shard(layer, mp_policy=mp, reshard_after_forward=reshard)
+    fully_shard(model, mp_policy=mp, reshard_after_forward=False)  # root stays resident (idiomatic)
+    if rank == 0:
+        print(f"RESHARD after_forward={reshard} (layers)", flush=True)
 
     if os.environ.get("OPT", "muon") == "adamw":
         opts = [torch.optim.AdamW(model.parameters(), lr=3e-4, fused=True)]  # fast opt to isolate fwd+bwd
@@ -117,6 +124,12 @@ def main():
                 for _ in range(4):
                     opt_zero(); fwd_bwd()
             torch.cuda.current_stream().wait_stream(s); dist.barrier()
+            # Release warmup's freed-but-cached blocks from the DEFAULT pool so they don't stack
+            # under the graph's PRIVATE pool (which pins the captured step's allocations for replay).
+            # Live tensors (params, static grads, static_ids) are referenced, so this can't free them.
+            # EMPTY_CACHE=0 disables it (to A/B the lever). Default on.
+            if os.environ.get("EMPTY_CACHE", "1") == "1":
+                torch.cuda.synchronize(); torch.cuda.empty_cache()
             opt_zero()  # set_to_none False -> static grads
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
@@ -146,13 +159,21 @@ def main():
             L, h = cfg.num_hidden_layers, cfg.hidden_size
             flops_per_tok = 6 * N + 12 * L * h * S
             mfu = flops_per_tok * toks / (world * 989.5e12)
-            print(f"MODEL={name} MODE={mode} world={world} S={S}  per-step={dt*1e3:.1f}ms  "
-                  f"tok/s={toks/1e3:.1f}k  MFU={mfu*100:.1f}%  loss={float(last.item()):.3f}", flush=True)
+            # max_memory_reserved is the cumulative-max since start, so it includes the capture-time
+            # peak (default pool + graph private pool) — the number that determines whether we OOM.
+            mem = torch.cuda.max_memory_reserved() / 1e9
+            print(f"MODEL={name} MODE={mode} world={world} S={S} reshard={reshard}  per-step={dt*1e3:.1f}ms  "
+                  f"tok/s={toks/1e3:.1f}k  MFU={mfu*100:.1f}%  loss={float(last.item()):.3f}  "
+                  f"peak_reserved={mem:.1f}GB", flush=True)
     except Exception:
         if rank == 0:
             print(f"MODEL={name} MODE={mode} FAILED", flush=True); traceback.print_exc()
-        dist.destroy_process_group(); raise
-    dist.destroy_process_group()
+        sys.stdout.flush(); sys.stderr.flush()
+        os._exit(1)
+    # destroy_process_group() hangs when a captured CUDA graph still holds NCCL comm refs; the
+    # measurement is already printed, so exit hard to release GPUs cleanly for the next run.
+    sys.stdout.flush()
+    os._exit(0)
 
 if __name__ == "__main__":
     main()
