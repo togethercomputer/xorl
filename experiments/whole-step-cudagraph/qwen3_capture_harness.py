@@ -1,13 +1,15 @@
 """Real Qwen3 (HF) + FA4 + Muon + FSDP2 + manual CUDAGraph capture of the whole fwd+bwd step.
 
 Measures eager vs manual-capture throughput/MFU for the real model on N GPUs. Uses sdpa-shaped FA4
-(flash_attn.cute) registered into HF's attention dispatch, Muon (lighter states so 8B fits on fewer
-GPUs), FSDP2 reshard_after_forward=False (static buffers for capture).
+(flash_attn.cute) registered into HF's attention dispatch, Muon (lighter optimizer state), FSDP2
+(reshard_after_forward toggled by RESHARD — both settings work under capture).
 
 Env knobs:
   MODEL=1.7b|8b   MODE=eager|manualgraph   OPT=muon|adamw   COMPILE=0|1   FULLGRAPH=0|1
-  S=<seqlen>      STEPS=<n>
-Needs PYTHONPATH=<repo>/src for the xorl Muon import (OPT=muon).
+  RESHARD=0|1     GRADCKPT=0|1             S=<seqlen>        STEPS=<n>
+Needs PYTHONPATH=<repo>/src for the xorl Muon import (OPT=muon). For manual capture, run with
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True — it keeps the capture pool's steady reserved ~= eager.
+Reports capture_peak (one-time setup spike) vs steady_reserved (ongoing) vs peak_alloc.
 Run: PYTHONPATH=$PWD/src torchrun --standalone --nproc_per_node=N qwen3_capture_harness.py
 """
 import os, sys, time, traceback
@@ -131,12 +133,6 @@ def main():
                 for _ in range(4):
                     opt_zero(); fwd_bwd()
             torch.cuda.current_stream().wait_stream(s); dist.barrier()
-            # Release warmup's freed-but-cached blocks from the DEFAULT pool so they don't stack
-            # under the graph's PRIVATE pool (which pins the captured step's allocations for replay).
-            # Live tensors (params, static grads, static_ids) are referenced, so this can't free them.
-            # EMPTY_CACHE=0 disables it (to A/B the lever). Default on.
-            if os.environ.get("EMPTY_CACHE", "1") == "1":
-                torch.cuda.synchronize(); torch.cuda.empty_cache()
             opt_zero()  # set_to_none False -> static grads
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
@@ -156,12 +152,8 @@ def main():
             run(mk_batch())
         torch.cuda.synchronize()
         # Capture-time peak reserved (cumulative-max so far): default-pool warmup residue + the graph
-        # private pool — the momentary spike that gates OOM-at-setup.
+        # private pool — the one-time spike that gates OOM-at-setup.
         capture_peak = torch.cuda.max_memory_reserved() / 1e9
-        # EMPTY_CACHE_AFTER=1: after capture, replay only touches the PRIVATE pool, so the default
-        # pool's warmup-transient blocks sit reserved-but-idle. Free them to reclaim that slack.
-        if os.environ.get("EMPTY_CACHE_AFTER", "0") == "1":
-            torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()  # from here, measure STEADY-STATE reserved/alloc
         dist.barrier(); t0 = time.time(); last = None
         for i in range(STEPS):

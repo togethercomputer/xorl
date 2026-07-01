@@ -138,6 +138,10 @@ ceiling that otherwise confounds 8B reserved via OOM-retries):
   reuse freed physical pages, so **steady-state reserved drops to ≈ eager** (30.3 vs 30.7) and the
   setup spike shrinks ~2.7 GB. Works with capture, loss bit-identical. The fix for the ongoing
   footprint; the residual setup spike is momentary and inherent to the two-pool capture idiom.
+- **Clean 8B/8-GPU/S=2048 confirmation** (expandable on, exclusive node): capture steady_reserved
+  44.5 GB ≈ eager 44.1 (+0.4) — the ongoing footprint is identical; expandable cut the setup spike
+  81→71 GB, and reshard=True cuts it to 57.5 (steady 30.9). Throughput: eager 63.4k vs capture 62.8k
+  (−1%, compute-bound wash); the same capture at 1.7B/2-GPU is 39.9k→49.4k (**+24%**, launch-bound).
 - **`reshard_after_forward=True`** cuts ~13 GB at 8B (unsharded params no longer resident) at ~−8%
   throughput — pair with expandable_segments to fit the setup spike. 8B/4-GPU AdamW capture goes from
   teetering at the OOM edge (78.5 GB, `memory allocation failed with OOM` retry warnings) to
