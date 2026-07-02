@@ -1,0 +1,21 @@
+{
+  "throughput": {
+    "config": "Qwen3-1.7B · 2×H100 · seq 2048 · bf16 · FA4 · AdamW",
+    "eager":   {"toks_k": 39.9, "mfu": 27.4, "step_ms": 102.7},
+    "capture": {"toks_k": 49.4, "mfu": 34.0, "step_ms": 82.9},
+    "delta_pct": 24
+  },
+  "memory_gb": {
+    "config": "Qwen3-1.7B · 2×H100 · seq 2048 · expandable_segments",
+    "eager":   {"spike": 24.2, "steady": 24.2, "live": 19.4},
+    "capture": {"spike": 26.8, "steady": 24.8, "live_replay": 8.9}
+  },
+  "memory_8b": {
+    "note": "at 8B the reserved slack is larger; expandable_segments cut the setup spike 81→71 GB, steady ≈ eager",
+    "spike_no_expand": 81.1, "spike_expand": 71.2, "steady_capture": 44.5, "steady_eager": 44.1
+  },
+  "regime": {
+    "launch_bound": {"model": "Qwen3-1.7B", "gpus": 2, "eager_k": 39.9, "capture_k": 49.4, "delta_pct": 24},
+    "compute_bound": {"model": "Qwen3-8B", "gpus": 8, "eager_k": 63.4, "capture_k": 62.8, "delta_pct": -1}
+  }
+}

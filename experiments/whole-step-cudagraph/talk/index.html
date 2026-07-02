@@ -1,0 +1,748 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Training Megakernel — whole-step CUDA-graph capture under FSDP2</title>
+<style>
+/* ---------- tokens (dark palette, validated against surface #1a1a19) ---------- */
+:root {
+  --page:          #0d0d0d;
+  --surface:       #1a1a19;
+  --ink:           #ffffff;
+  --ink-2:         #c3c2b7;
+  --ink-muted:     #898781;
+  --grid:          #2c2c2a;
+  --baseline:      #383835;
+  --border:        rgba(255,255,255,0.10);
+  --series-1:      #3987e5;   /* blue   */
+  --series-2:      #199e70;   /* aqua   */
+  --series-3:      #c98500;   /* yellow */
+  --series-4:      #9085e9;   /* violet */
+  --blue-150:      #b7d3f6;
+  --status-good:   #0ca30c;
+  --status-crit:   #d03b3b;
+  --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --math: "STIX Two Math", "Cambria Math", "Latin Modern Math", Georgia, serif;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html { scroll-snap-type: y mandatory; scroll-behavior: smooth; }
+body {
+  background: var(--page);
+  color: var(--ink-2);
+  font-family: var(--sans);
+  font-size: 17px;
+  line-height: 1.55;
+}
+
+/* ---------- sections ---------- */
+section.slide {
+  min-height: 100vh;
+  scroll-snap-align: start;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 56px max(7vw, 48px);
+  position: relative;
+}
+.slide-inner { max-width: 1180px; width: 100%; margin: 0 auto; }
+
+.eyebrow {
+  font-size: 13px; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--ink-muted); margin-bottom: 14px; font-weight: 600;
+}
+.eyebrow .k { color: var(--series-1); }
+h1 { color: var(--ink); font-size: clamp(52px, 6.4vw, 88px); line-height: 1.02; letter-spacing: -0.02em; font-weight: 700; }
+h1 .grad {
+  background: linear-gradient(100deg, var(--series-1) 0%, var(--series-4) 55%, var(--series-2) 100%);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.subtitle { color: var(--ink-2); font-size: clamp(19px, 2.1vw, 28px); font-weight: 400; margin-top: 12px; letter-spacing: -0.01em; }
+h2 { color: var(--ink); font-size: clamp(26px, 3vw, 40px); line-height: 1.12; letter-spacing: -0.012em; font-weight: 700; margin-bottom: 18px; }
+h3 { color: var(--ink); font-size: 18px; font-weight: 650; margin-bottom: 8px; }
+p.lede { font-size: clamp(17px, 1.5vw, 21px); color: var(--ink-2); max-width: 68ch; }
+strong { color: var(--ink); font-weight: 650; }
+em { color: var(--ink-2); }
+code { font-family: var(--mono); font-size: 0.92em; color: var(--blue-150); background: rgba(57,135,229,0.10); padding: 1px 5px; border-radius: 4px; }
+
+/* staged entrance */
+[data-step] { opacity: 0; transform: translateY(14px); transition: opacity .55s ease, transform .55s ease; }
+section.in-view [data-step] { opacity: 1; transform: none; }
+section.in-view [data-step="1"] { transition-delay: .05s; }
+section.in-view [data-step="2"] { transition-delay: .22s; }
+section.in-view [data-step="3"] { transition-delay: .40s; }
+section.in-view [data-step="4"] { transition-delay: .58s; }
+
+/* ---------- title ---------- */
+.title-viz { position: absolute; inset: 0; overflow: hidden; pointer-events: none; z-index: -1; }
+.title-viz svg { position: absolute; right: -1vw; top: 50%; transform: translateY(-50%); opacity: 0.9; }
+.scroll-hint { position: absolute; bottom: 34px; left: 0; right: 0; text-align: center; color: var(--ink-muted); font-size: 14px; }
+.kbd { font-family: var(--mono); font-size: 12px; border: 1px solid var(--border); border-radius: 5px; padding: 1px 7px; color: var(--ink-2); background: var(--surface); }
+
+/* ---------- cards / tiles ---------- */
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; margin-top: 26px; }
+.cards.two { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+.card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  padding: 20px 22px 18px;
+}
+.card h3 { font-size: 16.5px; }
+.card p { font-size: 14.5px; color: var(--ink-2); margin-top: 6px; }
+.card .num { font-family: var(--mono); color: var(--series-1); font-size: 13px; margin-bottom: 6px; }
+.card .big { font-size: 27px; font-weight: 700; color: var(--ink); line-height: 1.15; }
+
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-top: 24px; }
+.tile { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px 16px; }
+.tile .label { font-size: 13.5px; color: var(--ink-muted); }
+.tile .value { font-size: 32px; font-weight: 700; color: var(--ink); margin-top: 4px; line-height: 1.05; }
+.tile .detail { font-size: 13px; color: var(--ink-2); margin-top: 7px; }
+.tile.accent .value { color: var(--series-1); }
+.tile.crit .value { color: var(--status-crit); }
+.tile .value .ok { color: var(--series-2); }
+
+/* task chips */
+.chips { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
+.chip { background: var(--surface); border: 1px solid var(--border); border-radius: 999px; padding: 6px 14px; font-size: 13px; color: var(--ink-2); }
+.chip b { color: var(--ink); font-weight: 650; }
+
+/* big statement */
+.punchline { font-size: clamp(34px, 4.4vw, 60px); color: var(--ink); font-weight: 700; line-height: 1.12; letter-spacing: -0.015em; max-width: 24ch; }
+.punchline .hl { color: var(--series-1); }
+
+/* go-deeper panels */
+details.deeper { margin-top: 18px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+details.deeper summary { cursor: pointer; padding: 11px 18px; color: var(--ink-muted); font-size: 14px; list-style: none; user-select: none; }
+details.deeper summary::before { content: "▸ "; color: var(--series-1); }
+details.deeper[open] summary::before { content: "▾ "; }
+details.deeper .body { padding: 2px 20px 16px; font-size: 14px; color: var(--ink-2); }
+details.deeper .body ul { margin: 6px 0 0 18px; }
+details.deeper .body li { margin-top: 6px; }
+details.deeper .body .diagram { margin-top: 12px; }
+
+/* chart & diagram blocks */
+.chart-block { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px 24px 14px; margin-top: 22px; }
+.chart-host { position: relative; }
+.chart-host svg { display: block; width: 100%; height: auto; }
+.diagram { margin-top: 22px; }
+.diagram svg { width: 100%; height: auto; display: block; }
+.legend { display: flex; gap: 22px; margin: 10px 2px 2px; flex-wrap: wrap; }
+.legend .li { display: flex; align-items: center; gap: 8px; font-size: 13.5px; color: var(--ink-2); }
+.legend .key { width: 18px; height: 12px; border-radius: 3px; flex: none; }
+
+.viz-tooltip {
+  position: fixed; pointer-events: none; z-index: 50; display: none;
+  background: #232322; border: 1px solid var(--border); border-radius: 8px;
+  padding: 9px 12px; font-size: 13px; color: var(--ink-2); box-shadow: 0 6px 24px rgba(0,0,0,.5);
+  min-width: 150px;
+}
+.viz-tooltip .tt-x { color: var(--ink-muted); font-size: 12px; margin-bottom: 5px; }
+.viz-tooltip .tt-row { display: flex; align-items: center; gap: 8px; margin-top: 3px; }
+.viz-tooltip .tt-key { width: 12px; height: 0; border-top: 3px solid; border-radius: 2px; flex: none; }
+.viz-tooltip .tt-val { color: var(--ink); font-weight: 650; margin-left: auto; font-variant-numeric: tabular-nums; }
+
+/* diagram SVG text classes */
+.d-box   { fill: var(--surface); stroke: var(--border); }
+.d-title { fill: var(--ink); font: 650 15px var(--sans); }
+.d-label { fill: var(--ink-2); font: 13px var(--sans); }
+.d-note  { fill: var(--ink-muted); font: 12px var(--sans); }
+.d-mono  { fill: var(--blue-150); font: 12.5px var(--mono); }
+.d-flow-label { font: 600 12.5px var(--mono); }
+
+.src { font-size: 12.5px; color: var(--ink-muted); font-family: var(--mono); }
+.caption { font-size: 14px; color: var(--ink-muted); margin-top: 14px; max-width: 78ch; }
+.caption strong { color: var(--ink-2); }
+
+/* progress rail */
+#rail {
+  position: fixed; right: 22px; top: 50%; transform: translateY(-50%);
+  display: flex; flex-direction: column; gap: 7px; z-index: 40; align-items: center;
+}
+#rail .dot {
+  width: 8px; height: 8px; border-radius: 50%; background: var(--baseline);
+  cursor: pointer; border: none; padding: 0; transition: background .2s, transform .2s;
+}
+#rail .dot:hover { background: var(--ink-muted); }
+#rail .dot.active { background: var(--series-1); transform: scale(1.45); }
+#act-label {
+  position: fixed; left: 26px; bottom: 22px; z-index: 40;
+  font-size: 12.5px; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--ink-muted); font-weight: 600;
+}
+#act-label .k { color: var(--series-1); }
+@media (max-width: 780px) { #rail, #act-label { display: none; } }
+
+@media print {
+  html { scroll-snap-type: none; }
+  section.slide { min-height: auto; page-break-inside: avoid; }
+  [data-step] { opacity: 1 !important; transform: none !important; }
+  #rail, #act-label, .scroll-hint { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  [data-step] { transition: none; opacity: 1; transform: none; }
+}
+</style>
+</head>
+<body>
+
+<nav id="rail" aria-label="Slide progress"></nav>
+<div id="act-label" aria-hidden="true"></div>
+<div class="viz-tooltip" id="tooltip" role="status"></div>
+
+<!-- ================= TITLE ================= -->
+<section class="slide" id="title" data-act="Megakernel">
+  <div class="title-viz" aria-hidden="true">
+    <svg id="mk-hero" width="660" height="640" viewBox="0 0 660 640"></svg>
+  </div>
+  <div class="slide-inner">
+    <div class="eyebrow" data-step="1">Together AI · Research</div>
+    <h1 data-step="1"><span class="grad">Training Megakernel</span></h1>
+    <div class="subtitle" data-step="2">The whole training step — forward, backward, all collectives — captured into one replayable CUDA graph, under FSDP2.</div>
+  </div>
+  <div class="scroll-hint" data-step="3"><span class="kbd">→</span> <span class="kbd">space</span> to advance · <span class="kbd">←</span> back</div>
+</section>
+
+<!-- ================= 1 · PROBLEM ================= -->
+<section class="slide" data-act="1 · Problem">
+  <div class="slide-inner">
+    <div class="eyebrow"><span class="k">01</span> · The wall</div>
+    <h2 data-step="1">A small step is launch-bound</h2>
+    <div class="cards" data-step="1">
+      <div class="card"><div class="num">problem 1</div><div class="big">Launch-bound</div></div>
+      <div class="card"><div class="num">problem 2</div><div class="big">Per-region overhead</div></div>
+      <div class="card"><div class="num">problem 3</div><div class="big">“Impossible” under FSDP2</div></div>
+    </div>
+    <div class="diagram" data-step="2" id="mk-viz-launch"></div>
+    <div class="tiles" data-step="3">
+      <div class="tile crit"><div class="label">GPU utilization, eager</div><div class="value">27%</div><div class="detail">MFU on the 1.7B step — the GPU waits on the CPU between launches</div></div>
+      <div class="tile crit"><div class="label">Claimed graph breaks</div><div class="value">≈ 40</div><div class="detail">the prior diagnosis: whole-step capture is structurally impossible under FSDP2</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 2 · METHOD ================= -->
+<section class="slide" data-act="2 · Method">
+  <div class="slide-inner">
+    <div class="eyebrow"><span class="k">02</span> · The idea</div>
+    <h2 data-step="1">One graph for the whole step</h2>
+    <div class="diagram" data-step="2" id="mk-viz-capture"></div>
+    <p class="caption" data-step="3">Warm up on a side stream, record the entire fwd+bwd kernel stream once, then <strong>replay</strong> it every step. Hundreds of per-kernel <code>cudaLaunchKernel</code> calls collapse to a single <code>cudaGraphLaunch</code> — the CPU stops gating the GPU. The optimizer step stays outside the graph.</p>
+  </div>
+</section>
+
+<!-- ================= 3 · ENABLER ================= -->
+<section class="slide" data-act="3 · Enabler">
+  <div class="slide-inner">
+    <div class="eyebrow"><span class="k">03</span> · Why it was thought impossible — and isn't</div>
+    <h2 data-step="1">Zero graph breaks under FSDP2</h2>
+    <div class="diagram" data-step="2" id="mk-viz-breaks"></div>
+    <p class="caption" data-step="3">Per-layer <code>torch.compile</code> before <code>fully_shard</code>, then shard the <strong>compiled wrapper</strong>, not the inner layer. FSDP's all-gather / reduce-scatter run as eager hooks <em>outside</em> the compiled regions — so nothing splits the graph, and the collectives are still capturable in the recorded stream. The “≈40 breaks” become <strong>0</strong>.</p>
+  </div>
+</section>
+
+<!-- ================= 4 · RESULTS ================= -->
+<section class="slide" data-act="4 · Results">
+  <div class="slide-inner">
+    <div class="eyebrow"><span class="k">04</span> · The result</div>
+    <h2 data-step="1">+24% on the launch-bound step</h2>
+    <div class="chips" data-step="1" id="mk-chips"></div>
+    <div class="chart-block" data-step="2" id="mk-chart-throughput"><div class="chart-host"></div></div>
+    <div class="tiles" data-step="3">
+      <div class="tile accent"><div class="label">Utilization</div><div class="value">27% → 34%</div><div class="detail">MFU — the recovered idle is exactly the launch overhead</div></div>
+      <div class="tile"><div class="label">Per step</div><div class="value">102.7 → 82.9 ms</div><div class="detail">same math, same result — loss is bit-identical</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 5 · MEMORY ================= -->
+<section class="slide" data-act="5 · Memory">
+  <div class="slide-inner">
+    <div class="eyebrow"><span class="k">05</span> · The obvious objection</div>
+    <h2 data-step="1">Reserved, not live</h2>
+    <div class="chart-block" data-step="2" id="mk-chart-memory"><div class="chart-host"></div></div>
+    <div class="legend" data-step="2" id="mk-mem-legend"></div>
+    <p class="caption" data-step="3">Capture’s ongoing footprint matches eager: <strong>live memory is unchanged</strong>. The only elevated number is a one-time setup spike while the warm-up pool and the graph’s private pool briefly coexist — and <code>expandable_segments</code> reclaims most of it.</p>
+    <details class="deeper" data-step="4"><summary>root cause + the fix at 8B scale</summary>
+      <div class="body">
+        <ul>
+          <li>The scary reserved numbers were never extra <em>live</em> memory — replay reuses the pinned graph pool and allocates ~nothing. The overhead is <strong>reserved slack</strong>: a private CUDA-graph pool that can’t share free blocks with the default pool.</li>
+          <li><code>PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True</code> lets the private pool reuse freed physical pages → steady reserved ≈ eager. Works with capture; loss bit-identical.</li>
+          <li>At <strong>8B</strong> (where the slack is largest) it cut the setup spike <strong>81 → 71 GB</strong>, and steady reserved was <strong>44.5</strong> vs eager <strong>44.1 GB</strong>. <code>reshard_after_forward=True</code> trims the spike further (unsharded params no longer resident).</li>
+          <li>No effect: <code>empty_cache</code> (before or after). Red herring: gradient checkpointing (activations aren’t the dominant term at this shape).</li>
+        </ul>
+      </div>
+    </details>
+  </div>
+</section>
+
+<!-- ================= 6 · THE POINT ================= -->
+<section class="slide" data-act="6 · The point">
+  <div class="slide-inner">
+    <div class="eyebrow"><span class="k">06</span> · Where it pays</div>
+    <div class="punchline" data-step="1">Capture pays exactly when the step is <span class="hl">launch-bound</span>.</div>
+    <p class="lede" data-step="2" style="margin-top:20px;">The megakernel collapses launch overhead. Where there is none — a large, compute-saturated step — there is nothing to collapse.</p>
+    <div class="tiles" data-step="3">
+      <div class="tile accent"><div class="label">Launch-bound — 1.7B, 2×H100</div><div class="value">+24%</div><div class="detail">39.9k → 49.4k tok/s</div></div>
+      <div class="tile"><div class="label">Compute-bound — 8B, 8×H100</div><div class="value">~0%</div><div class="detail">63.4k → 62.8k tok/s — already ~99% compute-busy</div></div>
+    </div>
+    <details class="deeper" data-step="4"><summary>code map</summary>
+      <div class="body"><ul>
+        <li><span class="src">xorl-oss · distributed/torch_parallelize.py</span> — per-layer compile before <code>fully_shard</code>; shard the compiled wrapper (0-break pattern)</li>
+        <li><span class="src">xorl-oss · experiments/whole-step-cudagraph/qwen3_capture_harness.py</span> — the manual whole-step capture harness (HF Qwen3 + FA4 + Muon/AdamW + FSDP2)</li>
+        <li>Source of record: <span class="src">experiments/whole-step-cudagraph/NOTES.md</span></li>
+      </ul></div>
+    </details>
+  </div>
+</section>
+
+<!-- ================= data ================= -->
+<script id="facts-data" type="application/json">{"throughput":{"config":"Qwen3-1.7B \u00b7 2\u00d7H100 \u00b7 seq 2048 \u00b7 bf16 \u00b7 FA4 \u00b7 AdamW","eager":{"toks_k":39.9,"mfu":27.4,"step_ms":102.7},"capture":{"toks_k":49.4,"mfu":34.0,"step_ms":82.9},"delta_pct":24},"memory_gb":{"config":"Qwen3-1.7B \u00b7 2\u00d7H100 \u00b7 seq 2048 \u00b7 expandable_segments","eager":{"spike":24.2,"steady":24.2,"live":19.4},"capture":{"spike":26.8,"steady":24.8,"live_replay":8.9}},"memory_8b":{"note":"at 8B the reserved slack is larger; expandable_segments cut the setup spike 81\u219271 GB, steady \u2248 eager","spike_no_expand":81.1,"spike_expand":71.2,"steady_capture":44.5,"steady_eager":44.1},"regime":{"launch_bound":{"model":"Qwen3-1.7B","gpus":2,"eager_k":39.9,"capture_k":49.4,"delta_pct":24},"compute_bound":{"model":"Qwen3-8B","gpus":8,"eager_k":63.4,"capture_k":62.8,"delta_pct":-1}}}</script>
+
+<script>
+"use strict";
+(function () {
+/* ============================================================
+   Training-megakernel talk — diagrams, charts, nav. Single file,
+   no network. All content ids prefixed mk-; JS scoped in this IIFE.
+   ============================================================ */
+
+const C = {
+  s1: "#3987e5", s2: "#199e70", s3: "#c98500", s4: "#9085e9",
+  ink: "#ffffff", ink2: "#c3c2b7", muted: "#898781",
+  grid: "#2c2c2a", baseline: "#383835", surface: "#1a1a19",
+  crit: "#d03b3b", good: "#0ca30c", blue150: "#b7d3f6",
+};
+
+const FALLBACK = {
+  throughput: { config: "Qwen3-1.7B · 2×H100 · seq 2048 · bf16 · FA4 · AdamW",
+    eager: { toks_k: 39.9, mfu: 27.4, step_ms: 102.7 }, capture: { toks_k: 49.4, mfu: 34.0, step_ms: 82.9 }, delta_pct: 24 },
+  memory_gb: { config: "Qwen3-1.7B · 2×H100 · seq 2048 · expandable_segments",
+    eager: { spike: 24.2, steady: 24.2, live: 19.4 }, capture: { spike: 26.8, steady: 24.8, live_replay: 8.9 } },
+  regime: { launch_bound: { model: "Qwen3-1.7B", gpus: 2, eager_k: 39.9, capture_k: 49.4, delta_pct: 24 },
+    compute_bound: { model: "Qwen3-8B", gpus: 8, eager_k: 63.4, capture_k: 62.8, delta_pct: -1 } },
+};
+let F;
+try { F = JSON.parse(document.getElementById("facts-data").textContent) || FALLBACK; }
+catch (e) { F = FALLBACK; }
+
+const REDUCED = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+/* ---------- SVG helpers ---------- */
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, parent) {
+  const n = document.createElementNS(NS, tag);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(n);
+  return n;
+}
+function txt(node, s) { node.textContent = s; return node; }
+function svgRoot(host, w, h, aria) {
+  const svg = el("svg", { viewBox: `0 0 ${w} ${h}`, role: "img", "aria-label": aria });
+  host.appendChild(svg);
+  return svg;
+}
+function arrowDef(svg, id, color) {
+  const defs = svg.querySelector("defs") || el("defs", {}, svg);
+  el("marker", { id, markerWidth: 9, markerHeight: 9, refX: 7, refY: 4.5, orient: "auto" }, defs)
+    .appendChild(el("path", { d: "M0,0 L9,4.5 L0,9 z", fill: color }));
+  return `url(#${id})`;
+}
+function flow(svg, d, color, marker) {
+  return el("path", { d, stroke: color, "stroke-width": 2, fill: "none", "marker-end": marker }, svg);
+}
+function label(svg, x, y, s, cls = "d-label", anchor = "middle") {
+  return txt(el("text", { x, y, "text-anchor": anchor, class: cls }, svg), s);
+}
+
+const tooltip = document.getElementById("tooltip");
+function showTooltip(x, y, xLabel, rows) {
+  tooltip.replaceChildren();
+  const tx = document.createElement("div"); tx.className = "tt-x"; tx.textContent = xLabel;
+  tooltip.appendChild(tx);
+  for (const r of rows) {
+    const row = document.createElement("div"); row.className = "tt-row";
+    const key = document.createElement("span"); key.className = "tt-key"; key.style.borderTopColor = r.color;
+    const name = document.createElement("span"); name.textContent = r.name;
+    const val = document.createElement("span"); val.className = "tt-val"; val.textContent = r.value;
+    row.append(key, name, val); tooltip.appendChild(row);
+  }
+  tooltip.style.display = "block";
+  const w = tooltip.offsetWidth, h = tooltip.offsetHeight;
+  const px = Math.min(x + 16, window.innerWidth - w - 12);
+  const py = Math.max(12, Math.min(y - h - 12, window.innerHeight - h - 12));
+  tooltip.style.left = px + "px"; tooltip.style.top = py + "px";
+}
+function hideTooltip() { tooltip.style.display = "none"; }
+
+/* ============================================================
+   Title hero — a launch-bound eager step (many launches, GPU
+   gaps) collapsing into one replayed graph (GPU packed).
+   ============================================================ */
+function mkHero() {
+  const svg = document.getElementById("mk-hero");
+  if (!svg) return;
+  const X0 = 70, W = 520, N = 16;
+  const bw = W / N;
+  const rowY = { eagerCpu: 150, eagerGpu: 210, repCpu: 430, repGpu: 490 };
+  const rh = 30;
+
+  function lane(y, txtLabel) {
+    el("line", { x1: X0, x2: X0 + W, y1: y + rh + 6, y2: y + rh + 6, stroke: C.grid, "stroke-width": 1 }, svg);
+    label(svg, X0, y - 8, txtLabel, "d-note", "start");
+  }
+  lane(rowY.eagerCpu, "eager · CPU issues each kernel");
+  lane(rowY.eagerGpu, "eager · GPU (idle between launches)");
+  lane(rowY.repCpu, "replay · one cudaGraphLaunch");
+  lane(rowY.repGpu, "replay · GPU (packed)");
+
+  label(svg, X0, 120, "EAGER", "d-title", "start");
+  label(svg, X0, 400, "CAPTURED → REPLAY", "d-title", "start");
+
+  // static (final) render for reduced motion / fallback
+  const eagerKernels = [];
+  for (let i = 0; i < N; i++) {
+    const gap = 5;
+    // CPU: a launch tick precedes each kernel
+    eagerKernels.push(el("rect", { x: X0 + i * bw + gap, y: rowY.eagerCpu, width: bw - 2 * gap, height: rh,
+      rx: 3, fill: C.muted, opacity: 0 }, svg));
+    // GPU: compute block, offset right (waited on the launch) → visible gaps
+    el("rect", { x: X0 + i * bw + gap + 6, y: rowY.eagerGpu, width: bw - 2 * gap - 6, height: rh,
+      rx: 3, fill: C.s3, opacity: 0.85 }, svg);
+  }
+  // replay: one CPU block, GPU fully packed
+  const repCpu = el("rect", { x: X0, y: rowY.repCpu, width: bw * 1.4, height: rh, rx: 4, fill: C.s1, opacity: 0 }, svg);
+  label(svg, X0 + bw * 1.4 + 10, rowY.repCpu + rh - 8, "1 launch", "d-mono", "start");
+  const repGpu = el("rect", { x: X0, y: rowY.repGpu, width: W, height: rh, rx: 4, fill: C.s2, opacity: 0 }, svg);
+
+  // capture bracket
+  const brY = 270;
+  el("path", { d: `M ${X0} ${brY} L ${X0} ${brY + 14} L ${X0 + W} ${brY + 14} L ${X0 + W} ${brY}`,
+    fill: "none", stroke: C.s4, "stroke-width": 2 }, svg);
+  const capLabel = label(svg, X0 + W / 2, brY + 36, "capture once", "d-flow-label", "middle");
+  capLabel.setAttribute("fill", C.s4);
+  const capArrow = arrowDef(svg, "mk-cap-a", C.s4);
+  el("path", { d: `M ${X0 + W / 2} ${brY + 46} L ${X0 + W / 2} ${rowY.repCpu - 12}`, fill: "none",
+    stroke: C.s4, "stroke-width": 2, "marker-end": capArrow }, svg);
+
+  if (REDUCED) {
+    eagerKernels.forEach(k => k.setAttribute("opacity", 0.7));
+    repCpu.setAttribute("opacity", 0.95); repGpu.setAttribute("opacity", 0.9);
+    return;
+  }
+  // animation loop
+  let step = 0;
+  function reset() {
+    eagerKernels.forEach(k => k.setAttribute("opacity", 0));
+    repCpu.setAttribute("opacity", 0); repGpu.setAttribute("opacity", 0);
+  }
+  reset();
+  function tick() {
+    if (step < N) {
+      eagerKernels[step].setAttribute("opacity", 0.85);   // CPU issues one kernel at a time (slow)
+      step++;
+      setTimeout(tick, 150);
+    } else if (step === N) {
+      step++;
+      setTimeout(() => { repCpu.setAttribute("opacity", 0.95); repGpu.setAttribute("opacity", 0.9); tick(); }, 500);
+    } else {
+      setTimeout(() => { step = 0; reset(); tick(); }, 2600);   // hold, then loop
+    }
+  }
+  tick();
+}
+
+/* ============================================================
+   Problem — the launch-bound timeline: compiled per-region
+   kernels, GPU idling in the gaps waiting on CPU launches.
+   ============================================================ */
+function vizLaunch(host) {
+  const W = 1080, H = 190;
+  const svg = svgRoot(host, W, H,
+    "Schematic step timeline: per-region compiled kernels leave the GPU idle in the launch gaps between them.");
+  const x0 = 60, w = 720, n = 9, cell = w / n;
+  const cpuY = 44, gpuY = 104, bh = 34;
+  label(svg, x0, cpuY - 12, "CPU  ·  launch each compiled region", "d-note", "start");
+  label(svg, x0, gpuY - 12, "GPU  ·  compute", "d-note", "start");
+  el("line", { x1: x0, x2: x0 + w, y1: cpuY + bh + 4, y2: cpuY + bh + 4, stroke: C.grid, "stroke-width": 1 }, svg);
+  el("line", { x1: x0, x2: x0 + w, y1: gpuY + bh + 4, y2: gpuY + bh + 4, stroke: C.grid, "stroke-width": 1 }, svg);
+  for (let i = 0; i < n; i++) {
+    const lx = x0 + i * cell;
+    // small CPU launch tick
+    el("rect", { x: lx + 3, y: cpuY, width: 12, height: bh, rx: 2, fill: C.muted, opacity: 0.9 }, svg);
+    // GPU compute block starts after the launch → idle gap before it
+    el("rect", { x: lx + 22, y: gpuY, width: cell - 30, height: bh, rx: 3, fill: C.s3, opacity: 0.85 }, svg);
+    // idle-gap shading on the GPU lane
+    el("rect", { x: lx + (i ? -8 : 0), y: gpuY, width: i ? 30 : 22, height: bh, rx: 2, fill: C.crit, opacity: 0.16 }, svg);
+  }
+  // brace over one gap
+  label(svg, x0 + w + 24, gpuY + bh / 2 + 4, "idle = launch overhead", "d-label", "start")
+    .style.fill = C.crit;   // inline style beats the .d-label class fill
+  el("line", { x1: x0 + w + 8, x2: x0 + w + 20, y1: gpuY + bh / 2, y2: gpuY + bh / 2, stroke: C.crit, "stroke-width": 2 }, svg);
+}
+
+/* ============================================================
+   Method — many cudaLaunchKernel calls (eager) captured once
+   and replayed as a single cudaGraphLaunch.
+   ============================================================ */
+function vizCapture(host) {
+  const W = 1080, H = 300;
+  const svg = svgRoot(host, W, H,
+    "Eager: many per-kernel launches with GPU gaps. Capture the whole fwd+bwd once, then replay it as a single graph launch with the GPU fully packed.");
+  const mMuted = arrowDef(svg, "mk-cap-m", C.muted);
+  const mBlue = arrowDef(svg, "mk-cap-b", C.s1);
+
+  // ---- eager side ----
+  const ex = 40, ew = 400;
+  el("rect", { x: ex, y: 40, width: ew, height: 210, rx: 12, class: "d-box" }, svg);
+  label(svg, ex + ew / 2, 66, "eager step", "d-title");
+  const n = 12, cw = (ew - 40) / n;
+  for (let i = 0; i < n; i++) {
+    const lx = ex + 20 + i * cw;
+    el("rect", { x: lx + 2, y: 92, width: 10, height: 26, rx: 2, fill: C.muted, opacity: 0.9 }, svg);       // launch
+    el("rect", { x: lx + 15, y: 150, width: cw - 20, height: 26, rx: 3, fill: C.s3, opacity: 0.85 }, svg);  // compute (gapped)
+  }
+  label(svg, ex + ew / 2, 132, "cudaLaunchKernel  ×  hundreds", "d-mono");
+  label(svg, ex + ew / 2, 214, "GPU idles between launches", "d-note").style.fill = C.crit;
+  label(svg, ex + ew / 2, 234, "CPU-bound", "d-note");
+
+  // ---- capture arrow ----
+  flow(svg, `M ${ex + ew + 10} 145 L ${ex + ew + 120} 145`, C.s4, arrowDef(svg, "mk-cap-v", C.s4));
+  txt(el("text", { x: ex + ew + 65, y: 132, "text-anchor": "middle", class: "d-flow-label", fill: C.s4 }, svg), "capture");
+  txt(el("text", { x: ex + ew + 65, y: 164, "text-anchor": "middle", class: "d-note", fill: C.muted }, svg), "record once");
+
+  // ---- replay side ----
+  const rx = ex + ew + 130, rw = 420;
+  el("rect", { x: rx, y: 40, width: rw, height: 210, rx: 12, class: "d-box", stroke: C.s1 }, svg);
+  label(svg, rx + rw / 2, 66, "replay", "d-title");
+  el("rect", { x: rx + 24, y: 92, width: 70, height: 26, rx: 4, fill: C.s1, opacity: 0.95 }, svg);          // single launch
+  label(svg, rx + 104, 110, "1 × cudaGraphLaunch", "d-mono", "start");
+  el("rect", { x: rx + 24, y: 150, width: rw - 48, height: 26, rx: 4, fill: C.s2, opacity: 0.9 }, svg);     // packed GPU
+  label(svg, rx + rw / 2, 214, "GPU packed — CPU no longer gates it", "d-note").style.fill = C.s2;
+  label(svg, rx + rw / 2, 234, "optimizer step stays outside the graph", "d-note");
+}
+
+/* ============================================================
+   Enabler — shard the inner layer (hook inside the compiled
+   region → break) vs shard the compiled wrapper (hooks outside
+   → 0 breaks).
+   ============================================================ */
+function vizBreaks(host) {
+  const W = 1080, H = 330;
+  const svg = svgRoot(host, W, H,
+    "Sharding the inner layer puts the FSDP all-gather hook inside the compiled region, breaking the graph. Sharding the compiled wrapper keeps the hooks outside, so the region compiles to zero graph breaks.");
+
+  function row(y, title, hookInside, statusColor, statusText, note) {
+    label(svg, 40, y - 18, title, "d-title", "start");
+    // FSDP unit outer box
+    el("rect", { x: 40, y: y, width: 700, height: 78, rx: 12, class: "d-box", stroke: statusColor }, svg);
+    label(svg, 60, y + 22, "FSDP2 unit", "d-note", "start");
+    // all-gather hook (pre) and reduce-scatter (post)
+    const hookY = y + 26;
+    // compiled region
+    const crX = hookInside ? 150 : 210, crW = hookInside ? 520 : 400;
+    el("rect", { x: crX, y: y + 14, width: crW, height: 50, rx: 8, fill: "rgba(57,135,229,0.10)", stroke: C.s1 }, svg);
+    label(svg, crX + crW / 2, y + 33, "compiled region (decoder layer)", "d-mono");
+    label(svg, crX + crW / 2, y + 52, "torch.compile", "d-note");
+    // hooks: draw all-gather + reduce-scatter chips
+    const agX = hookInside ? crX + 16 : 70, rsX = hookInside ? crX + crW - 96 : 640;
+    [["all-gather", agX], ["reduce-scatter", rsX]].forEach(([t, hx]) => {
+      el("rect", { x: hx, y: hookY, width: 84, height: 26, rx: 5, fill: C.surface,
+        stroke: statusColor, style: `stroke:${statusColor}` }, svg);
+      label(svg, hx + 42, hookY + 17, t, "d-note").style.fill = statusColor;   // inline style beats .d-note
+    });
+    // status marker (inline style fill — the .d-title class fill would otherwise override it)
+    const sMark = hookInside ? "✗" : "✓";
+    txt(el("text", { x: 790, y: y + 34, class: "d-title", style: `font-size:26px;fill:${statusColor}` }, svg), sMark);
+    txt(el("text", { x: 822, y: y + 30, class: "d-title", style: `font-size:19px;fill:${statusColor}` }, svg), statusText);
+    txt(el("text", { x: 822, y: y + 52, class: "d-note" }, svg), note);
+  }
+  row(50, "shard the inner layer", true, C.crit, "graph breaks",
+    "region splits at the hook");
+  row(210, "shard the compiled wrapper", false, C.s2, "0 breaks",
+    "hooks stay eager, outside");
+}
+
+/* ============================================================
+   Bar chart — vertical bars, direct value labels, hover tooltip.
+   cfg: { bars:[{label,value,color,opacity,detail}], yLabel, unit,
+          yMax, height, aria, annot }
+   ============================================================ */
+function barChart(host, cfg) {
+  const W = cfg.width || 960, H = cfg.height || 340;
+  const m = { t: 30, r: 24, b: 52, l: 56 };
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": cfg.aria || "bar chart" });
+  host.appendChild(svg);
+  const y1 = cfg.yMax || Math.max(...cfg.bars.map(b => b.value)) * 1.18;
+  const Y = v => m.t + (1 - v / y1) * (H - m.t - m.b);
+  const plotW = W - m.l - m.r;
+
+  // y grid
+  const step = y1 > 80 ? 20 : y1 > 40 ? 10 : y1 > 20 ? 5 : 2;
+  for (let v = 0; v <= y1 + 1e-9; v += step) {
+    el("line", { x1: m.l, x2: W - m.r, y1: Y(v), y2: Y(v), stroke: C.grid, "stroke-width": 1 }, svg);
+    txt(el("text", { x: m.l - 8, y: Y(v) + 4, "text-anchor": "end", fill: C.muted,
+      style: "font:11.5px var(--sans); font-variant-numeric:tabular-nums" }, svg), v);
+  }
+  el("line", { x1: m.l, x2: W - m.r, y1: Y(0), y2: Y(0), stroke: C.baseline, "stroke-width": 1 }, svg);
+  if (cfg.yLabel) txt(el("text", { x: m.l - 44, y: 14, "text-anchor": "start", fill: C.muted,
+    style: "font:11.5px var(--sans)" }, svg), cfg.yLabel);
+
+  const nb = cfg.bars.length, slot = plotW / nb, bw = Math.min(slot * 0.5, 130);
+  cfg.bars.forEach((b, i) => {
+    const cx = m.l + slot * (i + 0.5);
+    const x = cx - bw / 2;
+    const g = el("g", {}, svg);
+    el("rect", { x, y: Y(b.value), width: bw, height: Y(0) - Y(b.value), rx: 5,
+      fill: b.color, opacity: b.opacity ?? 0.92 }, g);
+    // value label on top
+    txt(el("text", { x: cx, y: Y(b.value) - 9, "text-anchor": "middle", fill: C.ink,
+      style: "font:700 17px var(--sans); font-variant-numeric:tabular-nums" }, g),
+      (cfg.fmt ? cfg.fmt(b.value) : b.value) + (cfg.unit || ""));
+    // x label (may be two lines)
+    const lines = String(b.label).split("\n");
+    lines.forEach((ln, k) => {
+      txt(el("text", { x: cx, y: H - m.b + 20 + k * 15, "text-anchor": "middle",
+        fill: b.emph ? C.ink : C.ink2, style: `font:${b.emph ? 650 : 400} 13px var(--sans)` }, g), ln);
+    });
+    if (b.detail) txt(el("text", { x: cx, y: H - m.b + 20 + lines.length * 15, "text-anchor": "middle",
+      fill: C.muted, style: "font:11.5px var(--sans)" }, g), b.detail);
+    g.addEventListener("pointermove", ev => showTooltip(ev.clientX, ev.clientY, b.label.replace("\n", " "),
+      [{ name: cfg.ttName || "value", color: b.color, value: (cfg.fmt ? cfg.fmt(b.value) : b.value) + (cfg.unit || "") }]));
+    g.addEventListener("pointerleave", hideTooltip);
+  });
+
+  // optional annotation between two bars (e.g. +24%)
+  if (cfg.annot) {
+    const a = cfg.annot;
+    const cxA = m.l + slot * (a.from + 0.5), cxB = m.l + slot * (a.to + 0.5);
+    const yTop = Y(Math.max(cfg.bars[a.from].value, cfg.bars[a.to].value)) - 34;
+    const mk = arrowDef(svg, "mk-bar-a", C.s1);
+    el("path", { d: `M ${cxA} ${yTop} L ${cxB} ${yTop}`, stroke: C.s1, "stroke-width": 2, fill: "none", "marker-end": mk }, svg);
+    txt(el("text", { x: (cxA + cxB) / 2, y: yTop - 8, "text-anchor": "middle", fill: C.s1,
+      style: "font:700 16px var(--sans)" }, svg), a.text);
+  }
+}
+
+/* ---------- content rendering ---------- */
+function renderChips() {
+  const host = document.getElementById("mk-chips");
+  if (!host) return;
+  F.throughput.config.split(" · ").forEach(part => {
+    const c = document.createElement("span"); c.className = "chip";
+    const b = document.createElement("b"); b.textContent = part;
+    c.appendChild(b); host.appendChild(c);
+  });
+}
+
+function renderThroughput() {
+  const host = document.querySelector("#mk-chart-throughput .chart-host");
+  if (!host) return;
+  const t = F.throughput;
+  barChart(host, {
+    bars: [
+      { label: "eager", value: t.eager.toks_k, color: C.muted },
+      { label: "megakernel", value: t.capture.toks_k, color: C.s1, emph: true },
+    ],
+    yLabel: "throughput  (k tok/s)", unit: "k", yMax: 60, height: 360,
+    fmt: v => v.toFixed(1), ttName: "tok/s",
+    annot: { from: 0, to: 1, text: "+" + t.delta_pct + "%" },
+    aria: `throughput: eager ${t.eager.toks_k}k versus megakernel ${t.capture.toks_k}k tokens per second, a ${t.delta_pct} percent gain`,
+  });
+}
+
+function renderMemory() {
+  const host = document.querySelector("#mk-chart-memory .chart-host");
+  if (!host) return;
+  const g = F.memory_gb;
+  barChart(host, {
+    bars: [
+      { label: "eager", value: g.eager.steady, color: C.muted },
+      { label: "megakernel\nsteady", value: g.capture.steady, color: C.s2, emph: true },
+      { label: "megakernel\nsetup spike", value: g.capture.spike, color: C.s1, opacity: 0.4 },
+    ],
+    yLabel: "reserved memory  (GB)", unit: "", yMax: 32, height: 340,
+    fmt: v => v.toFixed(1), ttName: "GB",
+    aria: `reserved memory: eager ${g.eager.steady} GB, megakernel steady ${g.capture.steady} GB, one-time setup spike ${g.capture.spike} GB`,
+  });
+  const lg = document.getElementById("mk-mem-legend");
+  if (lg) {
+    [["steady / eager — ongoing footprint", C.s2, 0.92], ["setup spike — one-time", C.s1, 0.4],
+     ["live (allocated) unchanged ≈ " + g.eager.live + " GB", C.muted, 0.92]].forEach(([name, color, op]) => {
+      const li = document.createElement("div"); li.className = "li";
+      const key = document.createElement("span"); key.className = "key";
+      key.style.background = color; key.style.opacity = op;
+      const t = document.createElement("span"); t.textContent = name;
+      li.append(key, t); lg.appendChild(li);
+    });
+  }
+}
+
+function renderAll() {
+  mkHero();
+  const L = document.getElementById("mk-viz-launch"); if (L) vizLaunch(L);
+  const M = document.getElementById("mk-viz-capture"); if (M) vizCapture(M);
+  const B = document.getElementById("mk-viz-breaks"); if (B) vizBreaks(B);
+  renderChips();
+  renderThroughput();
+  renderMemory();
+}
+
+/* ---------- sections: reveal, rail, keyboard ---------- */
+const slides = [...document.querySelectorAll("section.slide")];
+const rail = document.getElementById("rail");
+const actLabel = document.getElementById("act-label");
+
+const io = new IntersectionObserver(entries => {
+  for (const e of entries) {
+    if (e.isIntersecting) {
+      e.target.classList.add("in-view");
+      const i = slides.indexOf(e.target);
+      rail.querySelectorAll(".dot").forEach((d, j) => d.classList.toggle("active", j === i));
+      actLabel.replaceChildren();
+      const no = document.createElement("span"); no.className = "k"; no.textContent = e.target.dataset.act || "";
+      actLabel.appendChild(no);
+    }
+  }
+}, { threshold: 0.55 });
+
+slides.forEach((s, i) => {
+  io.observe(s);
+  const dot = document.createElement("button");
+  dot.className = "dot"; dot.title = s.dataset.act || `slide ${i + 1}`;
+  dot.setAttribute("aria-label", `Go to ${s.dataset.act || "slide " + (i + 1)}`);
+  dot.addEventListener("click", () => s.scrollIntoView({ behavior: "smooth" }));
+  rail.appendChild(dot);
+});
+
+function currentIndex() {
+  const y = window.scrollY + window.innerHeight / 2;
+  let best = 0, bd = Infinity;
+  slides.forEach((s, i) => {
+    const c = s.offsetTop + s.offsetHeight / 2;
+    if (Math.abs(c - y) < bd) { bd = Math.abs(c - y); best = i; }
+  });
+  return best;
+}
+document.addEventListener("keydown", ev => {
+  if (ev.target.closest("input, textarea, [contenteditable]")) return;
+  const i = currentIndex();
+  const next = () => slides[Math.min(i + 1, slides.length - 1)].scrollIntoView({ behavior: "smooth" });
+  const prev = () => slides[Math.max(i - 1, 0)].scrollIntoView({ behavior: "smooth" });
+  switch (ev.key) {
+    case "ArrowRight": case "ArrowDown": case "PageDown": case " ":
+      ev.preventDefault(); next(); break;
+    case "ArrowLeft": case "ArrowUp": case "PageUp":
+      ev.preventDefault(); prev(); break;
+    case "Home": ev.preventDefault(); slides[0].scrollIntoView(); break;
+    case "End": ev.preventDefault(); slides[slides.length - 1].scrollIntoView(); break;
+  }
+});
+
+renderAll();
+})();
+</script>
+</body>
+</html>
