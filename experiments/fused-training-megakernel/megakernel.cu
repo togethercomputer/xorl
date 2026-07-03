@@ -69,7 +69,10 @@ __device__ __forceinline__ void dispatch(const Instr& I, int tile, void** bufs,
       op_axpy_f32(I, tile, bufs);
       break;
     case OP_GEMM:
-      op_gemm(I, tile, bufs, smem);
+      if (I.args[6] & 128)
+        op_gemm_wgmma(I, tile, bufs, smem);
+      else
+        op_gemm(I, tile, bufs, smem);
       break;
     case OP_RMSNORM_FWD:
       op_rmsnorm_fwd(I, tile, bufs, smem);

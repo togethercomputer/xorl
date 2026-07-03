@@ -47,6 +47,15 @@ def gemm_tiles(M, N):
     return ((M + GEMM_BM - 1) // GEMM_BM) * ((N + GEMM_BN - 1) // GEMM_BN)
 
 
+def wgmma_ok(M, N, K, flags):
+    """NT gemms with wgmma-friendly shapes route to the 128x128 warpgroup path."""
+    return (flags & 2) and not (flags & 1) and not (flags & 32) and M % 128 == 0 and N % 128 == 0 and K % 64 == 0
+
+
+def gemm_tiles_wgmma(M, N):
+    return (M // 128) * (N // 128)
+
+
 def gemm_split_k(M, N, K, target_tiles=512):
     """K-slice count that lifts a small-M*N GEMM to ~target_tiles work items."""
     mn = gemm_tiles(M, N)
@@ -64,7 +73,8 @@ def load_ext(verbose=False):
         sources=[os.path.join(_DIR, "megakernel.cu")],
         extra_cuda_cflags=[
             "-O3",
-            "-gencode=arch=compute_90,code=sm_90",
+            "-arch=sm_90a",  # wgmma needs the 90a feature set
+            "-I/home/apanda/xorl-internal/.venv/lib/python3.12/site-packages/deep_gemm/include",
             "--expt-relaxed-constexpr",
             "-lineinfo",
         ],

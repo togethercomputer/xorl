@@ -87,6 +87,32 @@ Launch-bound sweep (does the megakernel win somewhere?): nano at S=256 -> 1.49 v
 CUDA-graph replay's per-node tax also shrinks with size, and the megakernel's chain
 floor (~13us per critical-path op at S=128) tracks it.
 
+## v2 round 1: wgmma (Hopper) GEMM path
+
+`wgmma_probe.py` validates a from-scratch wgmma m64n128k16 setup against torch —
+hand-built GmmaDescriptors over a no-swizzle K-major INTER smem arrangement (8x8-bf16
+core matrices, SBO=256B, LBO=128B; descriptor bitfields from the CUTE headers bundled
+with deep_gemm, which also provide the fma wrappers; build needs `-arch=sm_90a`).
+Two hard-won facts:
+- A data-dependent `ScaleOut` ternary between `warpgroup_arrive` and `commit` makes
+  ptxas SERIALIZE every wgmma (~2.5us each, 60x slow). Branch-free accumulate
+  (always ScaleOut::One over explicitly zeroed registers) reaches ~39ns per
+  m64n128k16 = ~94% of per-SM tensor peak in the probe.
+- The NT (Linear-fwd) gemms route through a 128x128 two-warpgroup tile with 2-stage
+  cp.async feeds (`op_gemm_wgmma`, flags bit7; host: `mk.wgmma_ok`). Model parity
+  holds. BUT model-level gains are ~nil at nano and ~4% at small: the 64 fp32
+  accumulators push the whole interpreter kernel to 255 regs -> 1 block/SM (132
+  persistent blocks, halving overlap capacity), and per-instr fixed costs (scattered
+  register-direct epilogue, claim, pipeline prologue) dominate at chain-gemm sizes
+  (~20us/instr vs ~140ns of actual mma). Also tried and dropped: direct successor
+  handoff in the scheduler (+14% step time, mechanism unclear).
+
+Current: nano 2.00ms, small 9.5ms vs compile+CUDAGraph 0.82/3.0ms. The wgmma
+infrastructure is correct and peak-capable; converting that into step-time wins needs
+the fixed-cost/occupancy engineering: m64n64 variant (32 accumulators) to restore
+2 blocks/SM, smem-staged vectorized epilogues, warp-specialized producer/consumer
+structure, and the fusion round — the full multi-week program.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.3x faster. The measured structural gap, in order:

@@ -128,6 +128,8 @@ class MKQwen3:
             if flags & 8 and flags & 4:  # fp32 accumulating dW: split-K for occupancy
                 sk = mk.gemm_split_k(M, N, K)
                 p.instr(mk.OP_GEMM, mk.gemm_tiles(M, N) * sk, [a, b, out, M, N, K, (flags | 32) & ~4, res, sk])
+            elif mk.wgmma_ok(M, N, K, flags):  # Hopper warpgroup path
+                p.instr(mk.OP_GEMM, mk.gemm_tiles_wgmma(M, N), [a, b, out, M, N, K, flags | 128, res])
             else:
                 p.instr(mk.OP_GEMM, mk.gemm_tiles(M, N), [a, b, out, M, N, K, flags, res])
 

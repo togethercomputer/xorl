@@ -13,6 +13,9 @@
 #include <cuda_pipeline.h>
 #include <mma.h>
 
+#include <cute/arch/mma_sm90_desc.hpp>
+#include <cute/arch/mma_sm90_gmma.hpp>
+
 using bf16 = __nv_bfloat16;
 namespace wmma = nvcuda::wmma;
 
@@ -232,6 +235,129 @@ __device__ void op_gemm(const Instr& I, int tile, void** bufs, char* smem_raw) {
       C[idx] = f2bf(acc_c ? bf2f(C[idx]) + v : v);
     }
   }
+}
+
+// ---- wgmma GEMM (Hopper): NT layouts (A [M,K], B [N,K], both K-major) ---------------
+// Tile 128x128 (two warpgroups of 64 rows), BK=64 (4 wgmma k16 steps), 2-stage cp.async.
+// smem per stage: A = 2 halves x 4 steps x 2KB, B = 4 steps x 4KB. Descriptor layout is
+// the canonical no-swizzle INTER K-major arrangement validated by wgmma_probe.py.
+// flags bit7 (128): selects this path (host guarantees M%128==0, N%128==0, K%64==0).
+
+#define WG_BM 128
+#define WG_BN 128
+#define WG_BK 64
+
+struct WgmmaSmem {
+  bf16 A[2][2][4][1024];  // [stage][row-half][k16-step][64x16 INTER block]
+  bf16 B[2][4][2048];     // [stage][k16-step][128x16 INTER block]
+};
+
+__device__ __forceinline__ int wg_koff(int r, int k) {  // bytes within a 64/128-row block
+  return ((r >> 3) << 8) + ((k >> 3) << 7) + ((r & 7) << 4) + ((k & 7) << 1);
+}
+
+__device__ __forceinline__ uint64_t wg_desc(const void* smem_ptr) {
+  const uint32_t addr = (uint32_t)__cvta_generic_to_shared(smem_ptr);
+  cute::GmmaDescriptor d;
+  d.desc_ = 0;
+  d.bitfield.start_address_ = (addr >> 4);
+  d.bitfield.leading_byte_offset_ = (128 >> 4);
+  d.bitfield.stride_byte_offset_ = (256 >> 4);
+  d.bitfield.layout_type_ = 0;
+  return d.desc_;
+}
+
+__device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_raw) {
+  namespace SG = cute::SM90::GMMA;
+  const bf16* A = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
+  const bf16* B = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
+  void* Cp = bufs[I.args[2]];
+  const int M = I.args[3], N = I.args[4], K = I.args[5], flags = I.args[6];
+  const bool acc_c = flags & 4, c_f32 = flags & 8;
+  const bf16* Res = (flags & 16) ? reinterpret_cast<const bf16*>(bufs[I.args[7]]) : nullptr;
+
+  WgmmaSmem& S = *reinterpret_cast<WgmmaSmem*>(smem_raw);
+  const int n_tiles = N / WG_BN;
+  const int m0 = (tile / n_tiles) * WG_BM;
+  const int n0 = (tile % n_tiles) * WG_BN;
+  const int tid = threadIdx.x;
+  const int wg = tid / 128;         // warpgroup (row half)
+  const int wtid = tid % 128;
+
+  // cp.async a K-tile into stage: A 128rx64k = 1024 16B vecs, B 128rx64k = 1024
+  auto issue_stage = [&](int k0, int st) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int v = tid + i * 256;
+      const int r = v / 8, k8 = (v % 8) * 8;
+      __pipeline_memcpy_async(
+          reinterpret_cast<char*>(S.A[st][r / 64][k8 / 16]) + wg_koff(r % 64, k8 % 16),
+          &A[(int64_t)(m0 + r) * K + k0 + k8], 16);
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int v = tid + i * 256;
+      const int r = v / 8, k8 = (v % 8) * 8;
+      __pipeline_memcpy_async(
+          reinterpret_cast<char*>(S.B[st][k8 / 16]) + wg_koff(r, k8 % 16),
+          &B[(int64_t)(n0 + r) * K + k0 + k8], 16);
+    }
+    __pipeline_commit();
+  };
+
+  // Accumulate with an unbroken wgmma chain: always ScaleOut::One over explicitly
+  // zeroed registers, no branches between arrive and commit — a data-dependent scale
+  // ternary made ptxas serialize every wgmma (~60x slower; see wgmma_probe.py).
+  float d[64];
+#pragma unroll
+  for (int i = 0; i < 64; ++i) d[i] = 0.0f;
+#define MK_FMA_ARGS d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], \
+      d[11], d[12], d[13], d[14], d[15], d[16], d[17], d[18], d[19], d[20], d[21], \
+      d[22], d[23], d[24], d[25], d[26], d[27], d[28], d[29], d[30], d[31], d[32], \
+      d[33], d[34], d[35], d[36], d[37], d[38], d[39], d[40], d[41], d[42], d[43], \
+      d[44], d[45], d[46], d[47], d[48], d[49], d[50], d[51], d[52], d[53], d[54], \
+      d[55], d[56], d[57], d[58], d[59], d[60], d[61], d[62], d[63]
+  using MMA = SG::MMA_64x128x16_F32BF16BF16_SS<SG::Major::K, SG::Major::K>;
+  const int iters = K / WG_BK;
+  issue_stage(0, 0);
+  for (int t = 0; t < iters; ++t) {
+    if (t + 1 < iters) issue_stage((t + 1) * WG_BK, (t + 1) & 1);
+    __pipeline_wait_prior(t + 1 < iters ? 1 : 0);
+    __syncthreads();
+    cute::warpgroup_arrive();
+#pragma unroll
+    for (int s = 0; s < 4; ++s)
+      MMA::fma(wg_desc(S.A[t & 1][wg][s]), wg_desc(S.B[t & 1][s]), MK_FMA_ARGS,
+               SG::ScaleOut::One);
+    cute::warpgroup_commit_batch();
+    cute::warpgroup_wait<0>();
+    __syncthreads();  // both warpgroups done reading before the buffer is refilled
+  }
+#undef MK_FMA_ARGS
+
+  // register-direct epilogue: d[n8*4 + i*2 + j] -> C[m0 + wg*64 + w*16 + l/4 + 8i][n0 + n8*8 + (l%4)*2 + j]
+  const int w = (wtid / 32), l = wtid % 32;
+  const int rbase = m0 + wg * 64 + w * 16 + l / 4;
+  const int cbase = n0 + (l % 4) * 2;
+#pragma unroll
+  for (int n8 = 0; n8 < 16; ++n8)
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        const int gm = rbase + 8 * i;
+        const int gn = cbase + n8 * 8 + j;
+        float v = d[n8 * 4 + i * 2 + j];
+        const int64_t idx = (int64_t)gm * N + gn;
+        if (Res) v += bf2f(Res[idx]);
+        if (c_f32) {
+          float* C = reinterpret_cast<float*>(Cp);
+          C[idx] = acc_c ? C[idx] + v : v;
+        } else {
+          bf16* C = reinterpret_cast<bf16*>(Cp);
+          C[idx] = f2bf(acc_c ? bf2f(C[idx]) + v : v);
+        }
+      }
 }
 
 // ---- fp32 -> bf16 convert (drains split/atomic fp32 workspaces) -------------------------
