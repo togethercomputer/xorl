@@ -121,6 +121,28 @@ def bench_cfg(cfg: Cfg):
         tmg(tokens, labels).backward()
     results["compile+cudagraph"] = time_fn(graph.replay)
 
+    # hardened baseline (the honest goalpost): foreach grad zeroing instead of one
+    # zero_() node per param, max-autotune inductor kernels, same manual whole-step graph
+    tmh = torch.compile(TorchQwen3(cfg, mk_model.params).cuda(), mode="max-autotune-no-cudagraphs")
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):  # ALL warmup off the default stream: a default-stream
+        for _ in range(5):  # backward leaves AccumulateGrad stream refs that break capture
+            for p in tmh.parameters():
+                p.grad = None
+            tmh(tokens, labels).backward()
+        hgrads = [p.grad for p in tmh.parameters()]
+        for _ in range(3):
+            torch._foreach_zero_(hgrads)
+            tmh(tokens, labels).backward()
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    hgraph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(hgraph):
+        torch._foreach_zero_(hgrads)
+        tmh(tokens, labels).backward()
+    results["compile+cudagraph+"] = time_fn(hgraph.replay)
+
     base = results["eager"]
     for name, ms in results.items():
         print(f"  {name:20s} {ms * 1e3:9.1f} us/step   {base / ms:5.2f}x vs eager")
@@ -128,6 +150,11 @@ def bench_cfg(cfg: Cfg):
 
 
 if __name__ == "__main__":
+    import sys
+
+    which = sys.argv[1] if len(sys.argv) > 1 else "both"
     torch.cuda.set_device(0)
-    bench_cfg(Cfg())  # nano: H256 L4 S512
-    bench_cfg(Cfg(H=512, L=8, nq=8, nkv=4, D=64, I=1536, V=16384, S=1024))  # small
+    if which in ("nano", "both"):
+        bench_cfg(Cfg())  # nano: H256 L4 S512
+    if which in ("small", "both"):
+        bench_cfg(Cfg(H=512, L=8, nq=8, nkv=4, D=64, I=1536, V=16384, S=1024))  # small

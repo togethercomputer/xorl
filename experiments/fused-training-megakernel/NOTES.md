@@ -196,6 +196,34 @@ nano ~1.85-1.89ms, small ~9.3-9.4ms vs compile+CUDAGraph 0.83/3.0ms. The remaini
 is the structural floor; the only remaining levers are the multi-week ones (warp
 specialization, tile-granular dependencies, FA-class attention tiles).
 
+## v3 Phase 0: measurement round — the gap model, corrected
+
+Plan: gated phases P0 measure → P1 fusions → P2 warp-spec prototype (go/no-go) → P3
+region-watermark tile deps → P4 full warp-spec port → P5 FA-class attention → P6
+negative re-runs. New meters: `profile_df.py` (consumes the per-instr %globaltimer
+stamps; realized-critical-path walk splits every hop into wait vs span), `hop_bench.py`
+(serial chains over distinct buffers), `trace_baseline.py` (nsys per-kernel gap
+analysis — needs `--cuda-graph-trace=node`, the default traces graphs opaquely).
+
+THE CORRECTION: the residual gap is NOT "per-instr fixed cost x chain depth". Measured:
+- nano 1.79 ms = 243 us on-path wait (13.6%) + 1542 us on-path SPAN (86.4%); small
+  9.4 ms = 16.1% / 83.9%. The scheduler hop is cheap (axpy chain 3.1 us/hop = 1.7 gap
+  + 1.4 span; wgmma chain 5.6; wmma chain 9.0). An 85-hop chain at clean-chain cost
+  would be ~0.4 ms — the rest is intrinsic op latency (serial kv-loops / k-loops /
+  row loops), inflated by co-scheduling contention.
+- Attention is the #1 lever at BOTH configs: megakernel ~650 us at nano vs baseline
+  flash 169 us; small ~5.9 ms vs ~935 us (inductor even uses a partly math-path bwd).
+- Baseline decomposition (median replay): nano 263 kernels, 737 us active / 133 us gap
+  (15.3%, 0.51 us/kernel); small 507 kernels, 2833/264 (8.5%). Advantage pool at nano
+  (gap + elementwise round-trip overhead + gemm shape inefficiency) ≈ 480-530 us ≥ the
+  0.35x stop-rule threshold (291) -> the win is arithmetically OPEN, slack ~150-250 us.
+- HARDENED baseline (foreach grad zeroing + max-autotune-no-cudagraphs, manual capture;
+  all warmup must run on a side stream or AccumulateGrad stream refs break capture):
+  nano 828 -> 711 us, small 2987 -> 2730 us. These are the goalposts now.
+- Phase-1 addendum found by the profiler: the 5 on-path CVT hops (112 us nano / 346 us
+  small) are deletable — QKNORM_ROPE_BWD and head RMSNORM_BWD read the fp32 atomic
+  workspaces directly (dy_f32 flag); no dtype constraint on elementwise consumers.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.3x faster. The measured structural gap, in order:
