@@ -48,8 +48,18 @@ def gemm_tiles(M, N):
 
 
 def wgmma_ok(M, N, K, flags):
-    """NT gemms with wgmma-friendly shapes route to the 128x64 warpgroup path."""
+    """NT gemms with wgmma-friendly shapes route to the 128x64 warpgroup path.
+
+    The kernel supports all four storage majors (validated), but routing NN/TN through
+    wgmma measured SLOWER in-model than the WMMA path (fixed costs dominate at these
+    tile counts) — so only the NT (Linear-forward) pattern routes here."""
     return (flags & 2) and not (flags & 1) and not (flags & 32) and M % 128 == 0 and N % 64 == 0 and K % 64 == 0
+
+
+def wgmma_split_k(M, N, K, target_tiles=512):
+    """K-slices for a wgmma split-K gemm (64-aligned chunks)."""
+    mnt = gemm_tiles_wgmma(M, N)
+    return max(1, min(target_tiles // max(mnt, 1), K // 64))
 
 
 def gemm_tiles_wgmma(M, N):

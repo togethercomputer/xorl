@@ -126,8 +126,16 @@ class MKQwen3:
 
         def gemm(a, b, out, M, N, K, flags, res=0):
             if flags & 8 and flags & 4:  # fp32 accumulating dW: split-K for occupancy
-                sk = mk.gemm_split_k(M, N, K)
-                p.instr(mk.OP_GEMM, mk.gemm_tiles(M, N) * sk, [a, b, out, M, N, K, (flags | 32) & ~4, res, sk])
+                if mk.wgmma_ok(M, N, K, flags):
+                    sk = mk.wgmma_split_k(M, N, K)
+                    p.instr(
+                        mk.OP_GEMM,
+                        mk.gemm_tiles_wgmma(M, N) * sk,
+                        [a, b, out, M, N, K, ((flags | 32 | 128) & ~4), res, sk],
+                    )
+                else:
+                    sk = mk.gemm_split_k(M, N, K)
+                    p.instr(mk.OP_GEMM, mk.gemm_tiles(M, N) * sk, [a, b, out, M, N, K, (flags | 32) & ~4, res, sk])
             elif mk.wgmma_ok(M, N, K, flags):  # Hopper warpgroup path
                 p.instr(mk.OP_GEMM, mk.gemm_tiles_wgmma(M, N), [a, b, out, M, N, K, flags | 128, res])
             else:
@@ -238,12 +246,20 @@ class MKQwen3:
         # workspace (atomic accumulate), then convert. dWlm splits via the gemm helper.
         fill_zero(W["dXN_f32"])
         p.wave()
-        sk_head = mk.gemm_split_k(c.S, c.H, c.V)
-        p.instr(
-            mk.OP_GEMM,
-            mk.gemm_tiles(c.S, c.H) * sk_head,
-            [B(A["logits"]), B(self.params["wlm"]), B(W["dXN_f32"]), c.S, c.H, c.V, 32 | 8, 0, sk_head],
-        )
+        if mk.wgmma_ok(c.S, c.H, c.V, 0):
+            sk_head = mk.wgmma_split_k(c.S, c.H, c.V)
+            p.instr(
+                mk.OP_GEMM,
+                mk.gemm_tiles_wgmma(c.S, c.H) * sk_head,
+                [B(A["logits"]), B(self.params["wlm"]), B(W["dXN_f32"]), c.S, c.H, c.V, 32 | 8 | 128, 0, sk_head],
+            )
+        else:
+            sk_head = mk.gemm_split_k(c.S, c.H, c.V)
+            p.instr(
+                mk.OP_GEMM,
+                mk.gemm_tiles(c.S, c.H) * sk_head,
+                [B(A["logits"]), B(self.params["wlm"]), B(W["dXN_f32"]), c.S, c.H, c.V, 32 | 8, 0, sk_head],
+            )
         gemm(B(A["logits"]), B(A["xnf"]), B(self.grads["wlm"]), c.V, c.H, c.S, 1 | 4 | 8)
         p.wave()
         p.instr(mk.OP_CVT_F32BF16, mk.chunk_tiles(c.S * c.H), [B(W["dXN_f32"]), B(W["dXN"]), c.S * c.H])

@@ -158,6 +158,28 @@ remaining measured gap sits in (a) the WMMA-path bwd gemms (NN/TN need MN-major 
 variants), (b) attention op quality, (c) warp specialization to escape the
 occupancy/registers dilemma, (d) the rest of the fusion list.
 
+## v2 round 3: MN-major wgmma — validated, and a decisive negative result
+
+wgmma_probe.py now also validates the MN-major INTER descriptor (canonical layout from
+mma_traits_sm90_gmma.hpp: SBO = 128B mn-group stride, LBO = k-group stride — the reverse
+of K-major's assignment; first guess faulted with "out-of-range shared address" and the
+header's canonical-layout doc gave the exact form). op_gemm_wgmma now supports all four
+storage-major combinations (NN/NT/TN/TT, per-operand descriptor + template dispatch)
+plus split-K with fp32-atomic epilogues, all parity-tested.
+
+THE FINDING: routing the backward NN/TN gemms through wgmma is SLOWER in-model
+(nano 1.85 -> 2.05ms, small 9.3 -> 10.3ms) despite near-peak mma throughput — at these
+tile counts the per-instruction fixed costs (claim, prologue fill, epilogue, scheduler
+handoff) dominate so completely that tensor-core quality is irrelevant. Routing reverted
+to NT-only (capability retained in the kernel). Combined with the earlier rounds, this
+empirically closes the "roadmap arithmetic": no remaining math-unit conversion pays.
+The residual 2.2x vs compile+CUDAGraph lives in the structural floor — the ~85-deep
+serial chain times per-instruction overhead — whose remedies are warp-specialized
+producer/consumer ops, tile-granular dependencies, and FA-class attention tiles: the
+multi-week core, now with direct measurements behind that scoping.
+
+Scoreboard: nano 1.85ms / small 9.28ms vs compile+CUDAGraph 0.83 / 3.0ms.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.3x faster. The measured structural gap, in order:

@@ -271,6 +271,38 @@ __device__ __forceinline__ uint64_t wg_desc(const void* smem_ptr) {
   return d.desc_;
 }
 
+// MN-major INTER arrangement for operands stored MN-contiguous (NN's B, TN's A):
+// canonical ((T,1,m),(8,k)):((1,T,SBO),(1T,LBO)) -> SBO = 128B mn-group stride,
+// LBO = 1024B k-group stride for our 64-row step blocks. Validated by wgmma_probe.py.
+__device__ __forceinline__ int wg_mnoff(int mn, int k) {  // bytes in a 64-row block
+  return ((mn >> 3) << 7) + ((k >> 3) << 10) + ((mn & 7) << 1) + ((k & 7) << 4);
+}
+
+__device__ __forceinline__ uint64_t wg_desc_mn(const void* smem_ptr) {
+  const uint32_t addr = (uint32_t)__cvta_generic_to_shared(smem_ptr);
+  cute::GmmaDescriptor d;
+  d.desc_ = 0;
+  d.bitfield.start_address_ = (addr >> 4);
+  d.bitfield.leading_byte_offset_ = (1024 >> 4);
+  d.bitfield.stride_byte_offset_ = (128 >> 4);
+  d.bitfield.layout_type_ = 0;
+  return d.desc_;
+}
+
+template <class MMA>
+__device__ __forceinline__ void wg_mma_ktile(const uint64_t (&da)[4], const uint64_t (&db)[4],
+                                             float (&d)[32]) {
+  cute::warpgroup_arrive();
+#pragma unroll
+  for (int s = 0; s < 4; ++s)
+    MMA::fma(da[s], db[s], d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9],
+             d[10], d[11], d[12], d[13], d[14], d[15], d[16], d[17], d[18], d[19], d[20],
+             d[21], d[22], d[23], d[24], d[25], d[26], d[27], d[28], d[29], d[30], d[31],
+             cute::SM90::GMMA::ScaleOut::One);
+  cute::warpgroup_commit_batch();
+  cute::warpgroup_wait<0>();
+}
+
 __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_raw) {
   namespace SG = cute::SM90::GMMA;
   const bf16* A = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
@@ -281,29 +313,52 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
   const bf16* Res = (flags & 16) ? reinterpret_cast<const bf16*>(bufs[I.args[7]]) : nullptr;
 
   WgmmaSmem& S = *reinterpret_cast<WgmmaSmem*>(smem_raw);
+  const bool a_t = flags & 1, b_t = flags & 2;  // storage: a_t -> A[K,M]; b_t -> B[N,K]
+  const int sk = (flags & 32) ? I.args[8] : 1;
+  const int slice = tile % sk;
+  const int mn = tile / sk;
   const int n_tiles = N / WG_BN;
-  const int m0 = (tile / n_tiles) * WG_BM;
-  const int n0 = (tile % n_tiles) * WG_BN;
+  const int m0 = (mn / n_tiles) * WG_BM;
+  const int n0 = (mn % n_tiles) * WG_BN;
+  const int kchunk = ((K + sk * WG_BK - 1) / (sk * WG_BK)) * WG_BK;
+  const int k_lo = slice * kchunk;
+  const int k_hi = min(K, k_lo + kchunk);
   const int tid = threadIdx.x;
   const int wg = tid / 128;  // warpgroup = row half
   const int wtid = tid % 128;
+  if (k_lo >= K) return;
 
   auto issue_stage = [&](int k0, int st) {
 #pragma unroll
     for (int i = 0; i < 4; ++i) {  // A: 128r x 64k = 1024 16B vectors
       const int v = tid + i * 256;
-      const int r = v / 8, k8 = (v % 8) * 8;
-      __pipeline_memcpy_async(
-          reinterpret_cast<char*>(S.A[st][r / 64][k8 / 16]) + wg_koff(r % 64, k8 % 16),
-          &A[(int64_t)(m0 + r) * K + k0 + k8], 16);
+      if (!a_t) {  // A[M,K], K-contiguous
+        const int r = v / 8, k8 = (v % 8) * 8;
+        __pipeline_memcpy_async(
+            reinterpret_cast<char*>(S.A[st][r / 64][k8 / 16]) + wg_koff(r % 64, k8 % 16),
+            &A[(int64_t)(m0 + r) * K + k0 + k8], 16);
+      } else {  // A[K,M], M-contiguous -> MN-major blocks
+        const int h = v / 512, w_ = v % 512;
+        const int k = w_ / 8, m8 = (w_ % 8) * 8;
+        __pipeline_memcpy_async(
+            reinterpret_cast<char*>(S.A[st][h][k / 16]) + wg_mnoff(m8, k % 16),
+            &A[(int64_t)(k0 + k) * M + m0 + h * 64 + m8], 16);
+      }
     }
 #pragma unroll
     for (int i = 0; i < 2; ++i) {  // B: 64r x 64k = 512 16B vectors
       const int v = tid + i * 256;
-      const int r = v / 8, k8 = (v % 8) * 8;
-      __pipeline_memcpy_async(
-          reinterpret_cast<char*>(S.B[st][k8 / 16]) + wg_koff(r, k8 % 16),
-          &B[(int64_t)(n0 + r) * K + k0 + k8], 16);
+      if (b_t) {  // B[N,K], K-contiguous
+        const int r = v / 8, k8 = (v % 8) * 8;
+        __pipeline_memcpy_async(
+            reinterpret_cast<char*>(S.B[st][k8 / 16]) + wg_koff(r, k8 % 16),
+            &B[(int64_t)(n0 + r) * K + k0 + k8], 16);
+      } else {  // B[K,N], N-contiguous -> MN-major blocks
+        const int k = v / 8, n8 = (v % 8) * 8;
+        __pipeline_memcpy_async(
+            reinterpret_cast<char*>(S.B[st][k / 16]) + wg_mnoff(n8, k % 16),
+            &B[(int64_t)(k0 + k) * N + n0 + n8], 16);
+      }
     }
     __pipeline_commit();
   };
@@ -313,26 +368,28 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
   float d[32];
 #pragma unroll
   for (int i = 0; i < 32; ++i) d[i] = 0.0f;
-#define MK_FMA32 d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], \
-      d[11], d[12], d[13], d[14], d[15], d[16], d[17], d[18], d[19], d[20], d[21], \
-      d[22], d[23], d[24], d[25], d[26], d[27], d[28], d[29], d[30], d[31]
-  using MMA = SG::MMA_64x64x16_F32BF16BF16_SS<SG::Major::K, SG::Major::K>;
-  const int iters = K / WG_BK;
-  issue_stage(0, 0);
+  const int iters = (k_hi - k_lo) / WG_BK;
+  issue_stage(k_lo, 0);
   for (int t = 0; t < iters; ++t) {
-    if (t + 1 < iters) issue_stage((t + 1) * WG_BK, (t + 1) & 1);
+    if (t + 1 < iters) issue_stage(k_lo + (t + 1) * WG_BK, (t + 1) & 1);
     __pipeline_wait_prior(t + 1 < iters ? 1 : 0);
     __syncthreads();
-    cute::warpgroup_arrive();
+    uint64_t da[4], db[4];
 #pragma unroll
-    for (int s = 0; s < 4; ++s)
-      MMA::fma(wg_desc(S.A[t & 1][wg][s]), wg_desc(S.B[t & 1][s]), MK_FMA32,
-               SG::ScaleOut::One);
-    cute::warpgroup_commit_batch();
-    cute::warpgroup_wait<0>();
+    for (int s = 0; s < 4; ++s) {
+      da[s] = a_t ? wg_desc_mn(S.A[t & 1][wg][s]) : wg_desc(S.A[t & 1][wg][s]);
+      db[s] = b_t ? wg_desc(S.B[t & 1][s]) : wg_desc_mn(S.B[t & 1][s]);
+    }
+    if (!a_t && b_t)
+      wg_mma_ktile<SG::MMA_64x64x16_F32BF16BF16_SS<SG::Major::K, SG::Major::K>>(da, db, d);
+    else if (!a_t && !b_t)
+      wg_mma_ktile<SG::MMA_64x64x16_F32BF16BF16_SS<SG::Major::K, SG::Major::MN>>(da, db, d);
+    else if (a_t && b_t)
+      wg_mma_ktile<SG::MMA_64x64x16_F32BF16BF16_SS<SG::Major::MN, SG::Major::K>>(da, db, d);
+    else
+      wg_mma_ktile<SG::MMA_64x64x16_F32BF16BF16_SS<SG::Major::MN, SG::Major::MN>>(da, db, d);
     __syncthreads();  // both warpgroups done reading before the buffer is refilled
   }
-#undef MK_FMA32
 
   // stage accumulators to smem (over the dead A/B buffers), then coalesced epilogue
   float* Cs = reinterpret_cast<float*>(smem_raw);
@@ -365,7 +422,11 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
 #pragma unroll
       for (int e = 0; e < 8; ++e) v[e] += bf2f(re[e]);
     }
-    if (c_f32) {
+    if (flags & 32) {  // split-K: concurrent slices accumulate with fp32 atomics
+      float* C = reinterpret_cast<float*>(Cp);
+#pragma unroll
+      for (int e = 0; e < 8; ++e) atomicAdd(&C[idx + e], v[e]);
+    } else if (c_f32) {
       float* C = reinterpret_cast<float*>(Cp);
       if (acc_c) {
 #pragma unroll
