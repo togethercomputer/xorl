@@ -103,6 +103,12 @@ class MKQwen3:
         W["dGU"] = torch.empty(c.S, 2 * c.I, device=dev, dtype=bf)
         W["dHs"] = torch.empty(c.S, c.I, device=dev, dtype=bf)
         W["drow"] = torch.empty(c.nq, c.S, device=dev, dtype=f32)
+        # fp32 atomic-accumulation workspaces (attention bwd splits; big split-K gemms).
+        # dQKV_f32 is per layer so its zero-fill runs up front with no inter-layer
+        # dependency (a shared one chains layer N's fill behind layer N+1's convert).
+        for l in range(c.L):
+            W[f"dQKV_f32.{l}"] = torch.empty(c.S, QD, device=dev, dtype=f32)
+        W["dXN_f32"] = torch.empty(c.S, c.H, device=dev, dtype=f32)
         self.ws = W
 
         self.cos, self.sin = rope_tables(c, dev)
@@ -127,7 +133,7 @@ class MKQwen3:
 
         def fill_zero(t):
             n = t.numel()
-            p.instr(mk.OP_FILL_F32, (n + 4095) // 4096, [B(t), n, mk.f2i(0.0)])
+            p.instr(mk.OP_FILL_F32, mk.chunk_tiles(n), [B(t), n, mk.f2i(0.0)])
 
         X = [B(A["X"][l]) for l in range(c.L + 1)]
         n_qt = (c.S + 31) // 32
@@ -137,8 +143,10 @@ class MKQwen3:
         for g in self.grads.values():
             fill_zero(g)
         fill_zero(self.loss)
+        for lz in range(c.L):
+            fill_zero(W[f"dQKV_f32.{lz}"])
         # dX is bf16; zero via fp32 fill over half the elements (bf16 pair = one f32 zero)
-        p.instr(mk.OP_FILL_F32, (W["dX"].numel() // 2 + 4095) // 4096, [B(W["dX"]), W["dX"].numel() // 2, mk.f2i(0.0)])
+        p.instr(mk.OP_FILL_F32, mk.chunk_tiles(W["dX"].numel() // 2), [B(W["dX"]), W["dX"].numel() // 2, mk.f2i(0.0)])
         p.wave()
 
         # ---- forward layers ----
@@ -194,8 +202,19 @@ class MKQwen3:
         # ---- backward ----
         p.instr(mk.OP_CE_BWD, c.S, [B(A["logits"]), B(self.labels), B(A["lse_ce"]), B(self.inv_valid), c.V])
         p.wave()
-        gemm(B(A["logits"]), B(self.params["wlm"]), B(W["dXN"]), c.S, c.H, c.V, 0)
+        # dXN = dlogits @ Wlm has K=V (huge) but few output tiles: split-K into the fp32
+        # workspace (atomic accumulate), then convert. dWlm splits via the gemm helper.
+        fill_zero(W["dXN_f32"])
+        p.wave()
+        sk_head = mk.gemm_split_k(c.S, c.H, c.V)
+        p.instr(
+            mk.OP_GEMM,
+            mk.gemm_tiles(c.S, c.H) * sk_head,
+            [B(A["logits"]), B(self.params["wlm"]), B(W["dXN_f32"]), c.S, c.H, c.V, 32 | 8, 0, sk_head],
+        )
         gemm(B(A["logits"]), B(A["xnf"]), B(self.grads["wlm"]), c.V, c.H, c.S, 1 | 4 | 8)
+        p.wave()
+        p.instr(mk.OP_CVT_F32BF16, mk.chunk_tiles(c.S * c.H), [B(W["dXN_f32"]), B(W["dXN"]), c.S * c.H])
         p.wave()
         p.instr(
             mk.OP_RMSNORM_BWD,
@@ -225,16 +244,48 @@ class MKQwen3:
             p.wave()
             p.instr(mk.OP_ATTN_DPRE, c.S, [B(W["dOatt"]), a("oatt"), B(W["drow"]), c.S, c.nq, c.D])
             p.wave()
+            # attention bwd: dkv splits the GQA loop (one group member per tile), dq
+            # chunks its kv loop; both accumulate into the fp32 workspace with atomics
+            # (pre-zeroed), then one convert drains it to bf16. Alias slots keep the
+            # disjoint q/kv writes parallel in the dependency analysis.
+            G = c.nq // c.nkv
+            Cq = 4 if n_qt >= 8 else 2
             p.instr(
                 mk.OP_ATTN_DKV,
-                c.nkv * n_qt,
-                [a("qkvr"), B(W["dOatt"]), a("lse"), B(W["drow"]), B(W["dQKVr"]), c.S, c.nq, c.nkv, c.D, scale],
+                c.nkv * n_qt * G,
+                [
+                    a("qkvr"),
+                    B(W["dOatt"]),
+                    a("lse"),
+                    B(W["drow"]),
+                    p.buf(W[f"dQKV_f32.{l}"], slot="kv"),
+                    c.S,
+                    c.nq,
+                    c.nkv,
+                    c.D,
+                    scale,
+                ],
             )
             p.instr(
                 mk.OP_ATTN_DQ,
-                c.nq * n_qt,
-                [a("qkvr"), B(W["dOatt"]), a("lse"), B(W["drow"]), B(W["dQKVr"]), c.S, c.nq, c.nkv, c.D, scale],
+                c.nq * n_qt * Cq,
+                [
+                    a("qkvr"),
+                    B(W["dOatt"]),
+                    a("lse"),
+                    B(W["drow"]),
+                    p.buf(W[f"dQKV_f32.{l}"], slot="q"),
+                    c.S,
+                    c.nq,
+                    c.nkv,
+                    c.D,
+                    scale,
+                    Cq,
+                ],
             )
+            p.wave()
+            QD_ = (c.nq + 2 * c.nkv) * c.D
+            p.instr(mk.OP_CVT_F32BF16, mk.chunk_tiles(c.S * QD_), [B(W[f"dQKV_f32.{l}"]), B(W["dQKVr"]), c.S * QD_])
             p.wave()
             p.instr(
                 mk.OP_QKNORM_ROPE_BWD,
@@ -270,10 +321,10 @@ class MKQwen3:
         self.n_waves = len(p.waves)
 
     # ------------------------------------------------------------------ #
-    def step(self, tokens: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    def step(self, tokens: torch.Tensor, labels: torch.Tensor, mode="df") -> torch.Tensor:
         """One fused fwd+bwd. Returns the (device) loss scalar; grads are in self.grads."""
         self.tokens.copy_(tokens)
         self.labels.copy_(labels)
         self.inv_valid.copy_(1.0 / (labels >= 0).sum().clamp(min=1).float().reshape(1))
-        self.prog.run(self.ext)
+        self.prog.run(self.ext, mode=mode)
         return self.loss

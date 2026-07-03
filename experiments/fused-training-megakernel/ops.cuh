@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cuda_bf16.h>
+#include <cuda_pipeline.h>
 #include <mma.h>
 
 using bf16 = __nv_bfloat16;
@@ -20,13 +21,20 @@ __device__ __forceinline__ bf16 f2bf(float v) { return __float2bfloat16(v); }
 
 // ---- trivial ops (skeleton validation) ------------------------------------------------
 
-// args: {buf, n, value_bits}; tile = 4096-element chunk index.
+#define MK_CHUNK 16384  // elements per fill/cvt work item (mirrored in mk.py)
+
+// args: {buf, n, value_bits}; tile = MK_CHUNK-element chunk index.
 __device__ __forceinline__ void op_fill_f32(const Instr& I, int tile, void** bufs) {
   float* p = reinterpret_cast<float*>(bufs[I.args[0]]);
   const int n = I.args[1];
   const float v = __int_as_float(I.args[2]);
-  const int base = tile * 4096;
-  for (int i = base + threadIdx.x; i < min(base + 4096, n); i += blockDim.x) p[i] = v;
+  const int base = tile * MK_CHUNK, end = min(base + MK_CHUNK, n);
+  // vectorized main body + scalar tail (base is 16B-aligned: MK_CHUNK % 4 == 0)
+  float4* p4 = reinterpret_cast<float4*>(p + base);
+  const int quads = (end - base) / 4;
+  const float4 v4 = make_float4(v, v, v, v);
+  for (int i = threadIdx.x; i < quads; i += blockDim.x) p4[i] = v4;
+  for (int i = base + quads * 4 + threadIdx.x; i < end; i += blockDim.x) p[i] = v;
 }
 
 // args: {y, x, n, alpha_bits}; tile = 4096-element chunk index. y += alpha * x
@@ -224,6 +232,17 @@ __device__ void op_gemm(const Instr& I, int tile, void** bufs, char* smem_raw) {
       C[idx] = f2bf(acc_c ? bf2f(C[idx]) + v : v);
     }
   }
+}
+
+// ---- fp32 -> bf16 convert (drains split/atomic fp32 workspaces) -------------------------
+// args: {src_f32, dst_bf16, n}; tile = MK_CHUNK-element chunk.
+__device__ __forceinline__ void op_cvt_f32_bf16(const Instr& I, int tile, void** bufs) {
+  const float* src = reinterpret_cast<const float*>(bufs[I.args[0]]);
+  bf16* dst = reinterpret_cast<bf16*>(bufs[I.args[1]]);
+  const int n = I.args[2];
+  const int base = tile * MK_CHUNK;
+  for (int i = base + threadIdx.x; i < min(base + MK_CHUNK, n); i += blockDim.x)
+    dst[i] = f2bf(src[i]);
 }
 
 // ---- block-wide row reduction helper ---------------------------------------------------
@@ -474,23 +493,46 @@ __device__ void op_ce_fwd(const Instr& I, int tile, void** bufs, char* smem_raw)
   const float inv_valid = *reinterpret_cast<const float*>(bufs[I.args[4]]);
   float* scratch = reinterpret_cast<float*>(smem_raw);
 
-  float mx = -INFINITY;
-  for (int i = threadIdx.x; i < V; i += blockDim.x) mx = fmaxf(mx, bf2f(z[i]));
-  for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, off));
-  if ((threadIdx.x & 31) == 0) scratch[threadIdx.x >> 5] = mx;
+  // single-pass online (m, s) accumulation: one read of the logits row instead of two
+  float mx = -INFINITY, se = 0.0f;
+  for (int i = threadIdx.x; i < V; i += blockDim.x) {
+    const float zv = bf2f(z[i]);
+    if (zv > mx) {
+      se = se * expf(mx - zv) + 1.0f;
+      mx = zv;
+    } else {
+      se += expf(zv - mx);
+    }
+  }
+  // merge (m, s) pairs across the warp, then across warps via smem
+  for (int off = 16; off > 0; off >>= 1) {
+    const float om = __shfl_xor_sync(0xffffffff, mx, off);
+    const float os = __shfl_xor_sync(0xffffffff, se, off);
+    const float M = fmaxf(mx, om);
+    se = (mx == -INFINITY && om == -INFINITY) ? 0.0f : se * expf(mx - M) + os * expf(om - M);
+    mx = M;
+  }
+  if ((threadIdx.x & 31) == 0) {
+    scratch[(threadIdx.x >> 5) * 2] = mx;
+    scratch[(threadIdx.x >> 5) * 2 + 1] = se;
+  }
   __syncthreads();
-  if (threadIdx.x < 32) {
-    float v = (threadIdx.x < blockDim.x / 32) ? scratch[threadIdx.x] : -INFINITY;
-    for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, off));
-    scratch[0] = v;
+  if (threadIdx.x == 0) {
+    mx = scratch[0];
+    se = scratch[1];
+    for (int w = 1; w < blockDim.x / 32; ++w) {
+      const float om = scratch[w * 2], os = scratch[w * 2 + 1];
+      const float M = fmaxf(mx, om);
+      se = se * expf(mx - M) + os * expf(om - M);
+      mx = M;
+    }
+    scratch[0] = mx;
+    scratch[1] = se;
   }
   __syncthreads();
   mx = scratch[0];
+  se = scratch[1];
   __syncthreads();
-
-  float se = 0.0f;
-  for (int i = threadIdx.x; i < V; i += blockDim.x) se += expf(bf2f(z[i]) - mx);
-  se = block_sum(se, scratch);
   const float lse = mx + logf(se);
   if (threadIdx.x == 0) {
     lse_out[tile] = lse;

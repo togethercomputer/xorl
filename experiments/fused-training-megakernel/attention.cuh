@@ -115,6 +115,7 @@ __device__ void op_attn_fwd(const Instr& I, int tile, void** bufs, char* smem_ra
 
   load_tile(sm.Qs, qkv, q0, S, qh * D, stride, D);
   for (int i = tid; i < AT_T * D; i += blockDim.x) sm.Acc1[i / D][i % D] = 0.0f;
+  for (int i = tid; i < AT_T * AT_T; i += blockDim.x) sm.Ps[i / AT_T][i % AT_T] = f2bf(0.0f);
   if (tid < AT_T) {
     sm.row_m[tid] = -INFINITY;
     sm.row_l[tid] = 0.0f;
@@ -127,31 +128,33 @@ __device__ void op_attn_fwd(const Instr& I, int tile, void** bufs, char* smem_ra
     __syncthreads();
     mma_ab_t(sm, sm.Qs, sm.Ks, D);  // Ss = Q K^T
 
-    // rowwise online softmax update (thread t < 32 owns row t)
-    if (tid < AT_T) {
-      const int qr = q0 + tid;
-      float m_new = sm.row_m[tid];
-      for (int j = 0; j < AT_T; ++j) {
-        const int kr = k0 + j;
-        float s = (kr <= qr && qr < S && kr < S) ? sm.Ss[tid][j] * scale : -INFINITY;
-        sm.Ss[tid][j] = s;
-        m_new = fmaxf(m_new, s);
+    // rowwise online softmax update: warp w owns rows 4w..4w+3, lanes = the 32 columns
+    {
+      const int lane = tid % 32, warp = tid / 32;
+      for (int r = warp * 4; r < warp * 4 + 4; ++r) {
+        const int qr = q0 + r;
+        if (qr >= S) continue;  // OOB q rows: never stored, keep state clean
+        const int kr = k0 + lane;
+        float sc = (kr <= qr && kr < S) ? sm.Ss[r][lane] * scale : -INFINITY;
+        float mx = sc;
+        for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+        const float m_new = fmaxf(sm.row_m[r], mx);
+        const float pv = (sc == -INFINITY) ? 0.0f : expf(sc - m_new);
+        float lsum = pv;
+        for (int o = 16; o > 0; o >>= 1) lsum += __shfl_xor_sync(0xffffffff, lsum, o);
+        sm.Ps[r][lane] = f2bf(pv);
+        if (lane == 0) {
+          const float alpha = expf(sm.row_m[r] - m_new);
+          sm.row_alpha[r] = alpha;
+          sm.row_m[r] = m_new;
+          sm.row_l[r] = sm.row_l[r] * alpha + lsum;
+        }
       }
-      const float alpha = expf(sm.row_m[tid] - m_new);
-      float lsum = 0.0f;
-      for (int j = 0; j < AT_T; ++j) {
-        const float p = expf(sm.Ss[tid][j] - m_new);
-        sm.Ps[tid][j] = f2bf(p);
-        lsum += p;
-      }
-      sm.row_m[tid] = m_new;
-      sm.row_l[tid] = sm.row_l[tid] * alpha + lsum;
-      sm.row_alpha[tid] = alpha;
     }
     __syncthreads();
     // rescale O rows by alpha, then O += P @ V
     for (int i = tid; i < AT_T * D; i += blockDim.x)
-      sm.Acc1[i / D][i % D] *= sm.row_alpha[i / D];
+      if (q0 + i / D < S) sm.Acc1[i / D][i % D] *= sm.row_alpha[i / D];
     __syncthreads();
     mma_acc<false>(sm.Acc1, sm.Ps, sm.Vs, D);
   }
@@ -189,24 +192,21 @@ __device__ __forceinline__ void recompute_p_ds(AttnSmem& sm, const float* LSE,
                                                int S, float scale, int D) {
   mma_ab_t(sm, sm.Qs, sm.Ks, D);  // Ss = Q K^T
   const int tid = threadIdx.x;
-  if (tid < AT_T) {
-    const int qr = q0 + tid;
+  const int lane = tid % 32, warp = tid / 32;
+  for (int r = warp * 4; r < warp * 4 + 4; ++r) {
+    const int qr = q0 + r;
     const float lse = (qr < S) ? LSE[(int64_t)qh * S + qr] : 0.0f;
-    for (int j = 0; j < AT_T; ++j) {
-      const int kr = k0 + j;
-      const bool ok = (kr <= qr && qr < S && kr < S);
-      sm.Ps[tid][j] = f2bf(ok ? expf(sm.Ss[tid][j] * scale - lse) : 0.0f);
-    }
+    const int kr = k0 + lane;
+    const bool ok = (kr <= qr && qr < S && kr < S);
+    sm.Ps[r][lane] = f2bf(ok ? expf(sm.Ss[r][lane] * scale - lse) : 0.0f);
   }
   __syncthreads();
   mma_ab_t(sm, sm.Ds, sm.Vs, D);  // Ss = dO V^T   (dP)
-  if (tid < AT_T) {
-    const int qr = q0 + tid;
+  for (int r = warp * 4; r < warp * 4 + 4; ++r) {
+    const int qr = q0 + r;
     const float dr = (qr < S) ? Drow[(int64_t)qh * S + qr] : 0.0f;
-    for (int j = 0; j < AT_T; ++j) {
-      const float p = bf2f(sm.Ps[tid][j]);
-      sm.dSs[tid][j] = f2bf(p * (sm.Ss[tid][j] - dr) * scale);
-    }
+    const float p = bf2f(sm.Ps[r][lane]);
+    sm.dSs[r][lane] = f2bf(p * (sm.Ss[r][lane] - dr) * scale);
   }
   __syncthreads();
 }
@@ -225,10 +225,14 @@ __device__ void op_attn_dkv(const Instr& I, int tile, void** bufs, char* smem_ra
   AttnSmem& sm = *reinterpret_cast<AttnSmem*>(smem_raw);
 
   const int n_kvt = (S + AT_T - 1) / AT_T;
-  const int kvh = tile / n_kvt, k0 = (tile % n_kvt) * AT_T;
   const int G = nq / nkv;
+  const int kvh = tile / (n_kvt * G);
+  const int rem = tile % (n_kvt * G);
+  const int k0 = (rem / G) * AT_T;
+  const int g = rem % G;  // one GQA group member per tile (parallel, fp32-atomic reduce)
   const int stride = (nq + 2 * nkv) * D;
   const int tid = threadIdx.x;
+  float* ws = reinterpret_cast<float*>(dqkv);  // fp32 [S, stride] workspace (pre-zeroed)
 
   load_tile(sm.Ks, qkv, k0, S, (nq + kvh) * D, stride, D);
   load_tile(sm.Vs, qkv, k0, S, (nq + nkv + kvh) * D, stride, D);
@@ -238,24 +242,22 @@ __device__ void op_attn_dkv(const Instr& I, int tile, void** bufs, char* smem_ra
   }
   __syncthreads();
 
-  for (int g = 0; g < G; ++g) {
-    const int qh = kvh * G + g;
-    for (int q0 = k0; q0 < S; q0 += AT_T) {
-      load_tile(sm.Qs, qkv, q0, S, qh * D, stride, D);
-      load_tile(sm.Ds, dO, q0, S, qh * D, nq * D, D);
-      __syncthreads();
-      recompute_p_ds(sm, LSE, Drow, qh, q0, k0, S, scale, D);
-      mma_acc<true>(sm.Acc2, sm.Ps, sm.Ds, D);   // dV += P^T dO
-      mma_acc<true>(sm.Acc1, sm.dSs, sm.Qs, D);  // dK += dS^T Q
-    }
+  const int qh = kvh * G + g;
+  for (int q0 = k0; q0 < S; q0 += AT_T) {
+    load_tile(sm.Qs, qkv, q0, S, qh * D, stride, D);
+    load_tile(sm.Ds, dO, q0, S, qh * D, nq * D, D);
+    __syncthreads();
+    recompute_p_ds(sm, LSE, Drow, qh, q0, k0, S, scale, D);
+    mma_acc<true>(sm.Acc2, sm.Ps, sm.Ds, D);   // dV += P^T dO
+    mma_acc<true>(sm.Acc1, sm.dSs, sm.Qs, D);  // dK += dS^T Q
   }
 
   for (int i = tid; i < AT_T * D; i += blockDim.x) {
     const int r = i / D, c = i % D;
     const int gr = k0 + r;
     if (gr < S) {
-      dqkv[(int64_t)gr * stride + (nq + kvh) * D + c] = f2bf(sm.Acc1[r][c]);
-      dqkv[(int64_t)gr * stride + (nq + nkv + kvh) * D + c] = f2bf(sm.Acc2[r][c]);
+      atomicAdd(&ws[(int64_t)gr * stride + (nq + kvh) * D + c], sm.Acc1[r][c]);
+      atomicAdd(&ws[(int64_t)gr * stride + (nq + nkv + kvh) * D + c], sm.Acc2[r][c]);
     }
   }
 }
@@ -273,18 +275,23 @@ __device__ void op_attn_dq(const Instr& I, int tile, void** bufs, char* smem_raw
   bf16* dqkv = reinterpret_cast<bf16*>(bufs[I.args[4]]);
   AttnSmem& sm = *reinterpret_cast<AttnSmem*>(smem_raw);
 
+  const int C = I.args[10];  // kv-chunk parallelism
   const int n_qt = (S + AT_T - 1) / AT_T;
-  const int qh = tile / n_qt, q0 = (tile % n_qt) * AT_T;
+  const int qh = tile / (n_qt * C);
+  const int rem = tile % (n_qt * C);
+  const int q0 = (rem / C) * AT_T;
+  const int chunk = rem % C;  // this tile handles kv tiles chunk, chunk+C, ...
   const int kvh = qh / (nq / nkv);
   const int stride = (nq + 2 * nkv) * D;
   const int tid = threadIdx.x;
+  float* ws = reinterpret_cast<float*>(dqkv);  // fp32 [S, stride] workspace (pre-zeroed)
 
   load_tile(sm.Qs, qkv, q0, S, qh * D, stride, D);
   load_tile(sm.Ds, dO, q0, S, qh * D, nq * D, D);
   for (int i = tid; i < AT_T * D; i += blockDim.x) sm.Acc1[i / D][i % D] = 0.0f;  // dQ
   __syncthreads();
 
-  for (int k0 = 0; k0 <= q0; k0 += AT_T) {
+  for (int k0 = chunk * AT_T; k0 <= q0; k0 += C * AT_T) {
     load_tile(sm.Ks, qkv, k0, S, (nq + kvh) * D, stride, D);
     load_tile(sm.Vs, qkv, k0, S, (nq + nkv + kvh) * D, stride, D);
     __syncthreads();
@@ -295,6 +302,6 @@ __device__ void op_attn_dq(const Instr& I, int tile, void** bufs, char* smem_raw
   for (int i = tid; i < AT_T * D; i += blockDim.x) {
     const int r = i / D, c = i % D;
     const int gr = q0 + r;
-    if (gr < S) dqkv[(int64_t)gr * stride + qh * D + c] = f2bf(sm.Acc1[r][c]);
+    if (gr < S) atomicAdd(&ws[(int64_t)gr * stride + qh * D + c], sm.Acc1[r][c]);
   }
 }

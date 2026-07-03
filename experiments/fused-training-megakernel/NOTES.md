@@ -57,7 +57,51 @@ the in-kernel per-wave clock64 attribution, `profile_waves.py`):
 6. register-prefetch pipelining in the GEMM K-loop (single-buffered loads were
    latency-bound at ~33us/wave).
 
-## Honest assessment + v1 roadmap
+## v1: dataflow scheduling + latency round (this section supersedes the v0 numbers)
+
+The wave barriers are gone: instructions carry dependency counts derived from per-op
+read/write signatures (RAW/WAR/WAW over the buffer table, with alias "slots" declaring
+disjoint regions like the q/kv halves of dqkv); ready instructions enter a ring; blocks
+claim (instr, tile-batch) work via atomic cursors with a sticky-instruction fast path
+and a global consumed-head (naive ring scanning was SLOWER than waves). Both executors
+remain available (`mode="waves"|"df"`) and are cross-checked by the tests.
+
+Latency round, guided by per-instruction %globaltimer stamps (clock64 is per-SM and
+useless across blocks): attention bwd split over GQA members and kv-chunks with fp32
+atomic workspaces + a convert op (dKV worst-instr 190us -> 47us); warp-parallel
+softmax rows in attention fwd/bwd-recompute; split-K-to-fp32-scratch for the K=8192
+dlogits@Wlm gemm (145us -> ~40us); single-pass online CE; 16K vectorized fill/convert
+chunks; per-layer fp32 attention workspaces (a shared one chained layers through its
+zero-fill). A cp.async BK=64 gemm rewrite with layout-matched col_major fragments was
+tried and REVERTED: in-model it lost ~10% to the 1-deep register-prefetch BK=32 gemm
+(microbench: ~1.6us/K-iter and no improvement; suspect LDSM patterns on the col_major
+ld=72 paths — a real Hopper wgmma/TMA kernel is the actual answer, not WMMA surgery).
+
+| config | v0 megakernel | v1 megakernel | compile+CUDAGraph |
+|---|---|---|---|
+| nano  (H256 L4 S512)  | 2.53 ms | **1.93-1.99 ms** | 0.83 ms |
+| small (H512 L8 S1024) | 12.0 ms | **9.8 ms**       | 3.0 ms  |
+
+Launch-bound sweep (does the megakernel win somewhere?): nano at S=256 -> 1.49 vs
+0.72 ms; S=128 -> 1.20 vs 0.62 ms; deep-narrow L=12 -> 4.07 vs 2.08 ms. No crossover:
+CUDA-graph replay's per-node tax also shrinks with size, and the megakernel's chain
+floor (~13us per critical-path op at S=128) tracks it.
+
+## Honest assessment + v2 roadmap
+
+compile+CUDAGraph remains ~2.3x faster. The measured structural gap, in order:
+1. **Per-op kernel quality**: our WMMA gemm is 40-100 TF where cuBLAS gets 200+; FA
+   does attention tiles ~3x faster. The fix is Hopper-native kernels (wgmma + TMA,
+   proper multi-stage pipelines) inside the interpreter ops — the single biggest item.
+2. **Critical-path length**: ~89 chain instructions; each pays claim + prologue +
+   epilogue (~2-4us). Fusing rowops into gemm prologues/epilogues (norm stats in the
+   producing gemm's epilogue, rope/qk-norm in the qkv epilogue, swiglu in the gu
+   epilogue) would cut the chain to ~50.
+3. **Tile-level dependencies**: instruction-level deps only overlap off-path work
+   (the dW gemms); tile-granular counters would let dependent ops start on partially
+   complete producers (true MPK-style pipelining).
+
+## Superseded: v0 assessment
 
 The megakernel beats eager (4.1x) and matches plain torch.compile at nano scale, but
 compile+CUDAGraph is still ~3x faster. Remaining structural gaps, in order:

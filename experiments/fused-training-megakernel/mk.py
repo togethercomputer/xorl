@@ -33,8 +33,14 @@ OP_ATTN_FWD = 14
 OP_ATTN_DPRE = 15
 OP_ATTN_DKV = 16
 OP_ATTN_DQ = 17
+OP_CVT_F32BF16 = 18
 
 GEMM_BM, GEMM_BN = 64, 128  # keep in sync with ops.cuh
+FILL_CHUNK = 16384  # elements per fill/cvt work item (MK_CHUNK in ops.cuh)
+
+
+def chunk_tiles(n):
+    return (n + FILL_CHUNK - 1) // FILL_CHUNK
 
 
 def gemm_tiles(M, N):
@@ -71,19 +77,75 @@ def f2i(x: float) -> int:
     return struct.unpack("<i", struct.pack("<f", float(x)))[0]
 
 
+def _access_sets(op, args):
+    """(read_arg_positions, write_arg_positions) for dependency analysis.
+
+    Writes are treated as read+write (covers accumulation/atomics). Positions index
+    into `args`; each named position must hold a buffer-table id.
+    """
+    if op == OP_NOP:
+        return [], []
+    if op == OP_FILL_F32:
+        return [], [0]
+    if op == OP_AXPY_F32:
+        return [1], [0]
+    if op == OP_GEMM:
+        flags = args[6]
+        r, w = [0, 1], [2]
+        if flags & 16:
+            r.append(7)
+        return r, w
+    if op == OP_RMSNORM_FWD:
+        return [0, 1], [2, 3]
+    if op == OP_RMSNORM_BWD:
+        return [0, 1, 2, 5], [3, 4]
+    if op == OP_SWIGLU_FWD:
+        return [0], [1]
+    if op == OP_SWIGLU_BWD:
+        return [0, 1], [2]
+    if op == OP_QKNORM_ROPE_FWD:
+        return [0, 2, 3, 6, 7], [1, 4, 5]
+    if op == OP_QKNORM_ROPE_BWD:
+        return [0, 1, 3, 4, 7, 8, 9, 10], [2, 5, 6]
+    if op == OP_EMBED_FWD:
+        return [0, 1], [2]
+    if op == OP_EMBED_BWD:
+        return [0, 1], [2]
+    if op == OP_CE_FWD:
+        return [0, 1, 4], [2, 3]
+    if op == OP_CE_BWD:
+        return [1, 2, 3], [0]
+    if op == OP_ATTN_FWD:
+        return [0], [1, 2]
+    if op == OP_ATTN_DPRE:
+        return [0, 1], [2]
+    if op in (OP_ATTN_DKV, OP_ATTN_DQ):
+        return [0, 1, 2, 3], [4]
+    if op == OP_CVT_F32BF16:
+        return [0], [1]
+    raise ValueError(f"no access signature for op {op}")
+
+
 class Program:
     def __init__(self):
         self.bufs = []
         self._buf_ids = {}
+        self._buf_meta = []  # (root_ptr, slot) per buffer-table entry
         self.waves = [[]]  # list of waves; each wave = list of (op, ntiles, args)
 
-    def buf(self, t: torch.Tensor) -> int:
-        """Register a CUDA tensor; returns its buffer-table index."""
+    def buf(self, t: torch.Tensor, slot=None) -> int:
+        """Register a CUDA tensor; returns its buffer-table index.
+
+        `slot` declares a named disjoint region of the tensor (e.g. the q vs kv halves
+        of the packed dqkv buffer): entries of the SAME tensor with two different
+        non-None slots are treated as non-conflicting by the dependency analysis.
+        """
         assert t.is_cuda and t.is_contiguous()
-        key = t.data_ptr()
+        key = (t.data_ptr(), slot)
         if key not in self._buf_ids:
             self._buf_ids[key] = len(self.bufs)
             self.bufs.append(t)
+            self._buf_meta.append((t.data_ptr(), slot))
         return self._buf_ids[key]
 
     def instr(self, op: int, ntiles: int, args):
@@ -91,13 +153,37 @@ class Program:
         self.waves[-1].append((op, ntiles, list(args)))
 
     def wave(self):
-        """Close the current wave (a grid.sync boundary)."""
+        """Close the current wave (a grid.sync boundary; ignored in dataflow mode)."""
         if self.waves[-1]:
             self.waves.append([])
+
+    def _build_deps(self, flat):
+        """RAW/WAR/WAW dependency DAG from per-op access signatures."""
+        history = {}  # root_ptr -> list of (instr_idx, is_write, slot)
+        deps = [set() for _ in flat]
+        for idx, (op, _ntiles, args) in enumerate(flat):
+            r_pos, w_pos = _access_sets(op, args)
+            accesses = [(args[p], False) for p in r_pos] + [(args[p], True) for p in w_pos]
+            for buf_id, is_write in accesses:
+                root, slot = self._buf_meta[buf_id]
+                for prior_idx, prior_write, prior_slot in history.get(root, ()):
+                    if not (is_write or prior_write):
+                        continue  # read-read never conflicts
+                    if slot is not None and prior_slot is not None and slot != prior_slot:
+                        continue  # declared-disjoint regions
+                    if prior_idx != idx:
+                        deps[idx].add(prior_idx)
+            for buf_id, is_write in accesses:
+                root, _ = self._buf_meta[buf_id]
+                history.setdefault(root, []).append((idx, is_write, self._buf_meta[buf_id][1]))
+        return deps
 
     def finalize(self, device="cuda"):
         if not self.waves[-1]:
             self.waves.pop()
+        flat = [ins for wave in self.waves for ins in wave]
+
+        # wave-mode arrays
         instrs, wave_start, wave_tiles = [], [0], []
         for wave in self.waves:
             off = 0
@@ -111,10 +197,51 @@ class Program:
         self._wave_start = torch.tensor(wave_start, dtype=torch.int32, device=device)
         self._wave_tiles = torch.tensor(wave_tiles, dtype=torch.int32, device=device)
         self._buftab = torch.tensor([t.data_ptr() for t in self.bufs], dtype=torch.int64, device=device)
+
+        # dataflow-mode arrays: same instruction order, dependency DAG instead of waves
+        deps = self._build_deps(flat)
+        n = len(flat)
+        dep_cnt = [len(d) for d in deps]
+        dependents = [[] for _ in range(n)]  # forward edges
+        for i, d in enumerate(deps):
+            for j in d:
+                dependents[j].append(i)
+        adj_off, adj = [0], []
+        for i in range(n):
+            adj.extend(sorted(dependents[i]))
+            adj_off.append(len(adj))
+        claim = [max(1, min(8, (ntiles + 263) // 264)) for _, ntiles, _ in flat]
+        self.n_instr = n
+        self._dep_cnt = torch.tensor(dep_cnt, dtype=torch.int32, device=device)
+        self._adj_off = torch.tensor(adj_off, dtype=torch.int32, device=device)
+        self._adj = torch.tensor(adj if adj else [0], dtype=torch.int32, device=device)
+        self._claim = torch.tensor(claim, dtype=torch.int32, device=device)
+        # state: pending[n] | cursor[n] | done[n] | ready[n] | ctrl[4]
+        self._state = torch.empty(4 * n + 4, dtype=torch.int32, device=device)
+        self.critical_path = self._critical_path(deps, flat)
         return self
 
-    def run(self, ext, smem_bytes=100 * 1024, wave_clk=None):
-        ext.run(self._instrs, self._wave_start, self._wave_tiles, self._buftab, smem_bytes, wave_clk)
+    def _critical_path(self, deps, flat):
+        depth = [0] * len(flat)
+        for i, d in enumerate(deps):  # instruction order is a topological order
+            depth[i] = 1 + max((depth[j] for j in d), default=0)
+        return max(depth, default=0)
+
+    def run(self, ext, smem_bytes=100 * 1024, wave_clk=None, mode="df"):
+        if mode == "waves":
+            ext.run(self._instrs, self._wave_start, self._wave_tiles, self._buftab, smem_bytes, wave_clk)
+        else:
+            ext.run_df(
+                self._instrs,
+                self._dep_cnt,
+                self._adj_off,
+                self._adj,
+                self._claim,
+                self._state,
+                self._buftab,
+                smem_bytes,
+                wave_clk,
+            )
 
 
 if __name__ == "__main__":

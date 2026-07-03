@@ -273,21 +273,24 @@ def test_attention():
     dO = (torch.randn(S, nq * D, device=DEV) * 0.5).to(torch.bfloat16)
     Drow = torch.empty(nq, S, device=DEV, dtype=torch.float32)
     dqkv = torch.zeros_like(qkv)
+    ws = torch.zeros(S, stride, device=DEV, dtype=torch.float32)  # fp32 atomic workspace
+    G, Cq = nq // nkv, 2
     run1(lambda p: p.instr(mk.OP_ATTN_DPRE, S, [p.buf(dO), p.buf(O), p.buf(Drow), S, nq, D]))
     run1(
         lambda p: p.instr(
             mk.OP_ATTN_DKV,
-            nkv * n_qt,
-            [p.buf(qkv), p.buf(dO), p.buf(LSE), p.buf(Drow), p.buf(dqkv), S, nq, nkv, D, mk.f2i(scale)],
+            nkv * n_qt * G,
+            [p.buf(qkv), p.buf(dO), p.buf(LSE), p.buf(Drow), p.buf(ws), S, nq, nkv, D, mk.f2i(scale)],
         )
     )
     run1(
         lambda p: p.instr(
             mk.OP_ATTN_DQ,
-            nq * n_qt,
-            [p.buf(qkv), p.buf(dO), p.buf(LSE), p.buf(Drow), p.buf(dqkv), S, nq, nkv, D, mk.f2i(scale)],
+            nq * n_qt * Cq,
+            [p.buf(qkv), p.buf(dO), p.buf(LSE), p.buf(Drow), p.buf(ws), S, nq, nkv, D, mk.f2i(scale), Cq],
         )
     )
+    run1(lambda p: p.instr(mk.OP_CVT_F32BF16, (S * stride + 4095) // 4096, [p.buf(ws), p.buf(dqkv), S * stride]))
 
     qkvr = qkv.float().detach().requires_grad_(True)
     x = qkvr.view(S, nq + 2 * nkv, D)
