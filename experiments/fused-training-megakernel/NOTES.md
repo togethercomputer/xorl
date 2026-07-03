@@ -113,6 +113,29 @@ the fixed-cost/occupancy engineering: m64n64 variant (32 accumulators) to restor
 2 blocks/SM, smem-staged vectorized epilogues, warp-specialized producer/consumer
 structure, and the fusion round — the full multi-week program.
 
+## CODA (~/coda-kernels) findings — blueprint for the fusion round
+
+CODA (Guo et al., arXiv:2605.19269) expresses transformer ops as GEMM-plus-epilogue
+programs over quack's CuTeDSL GemmSm90 — exactly the epilogue-fusion direction, already
+engineered. What transfers to the megakernel (designs, not code — CuTeDSL kernels are
+whole-kernel JIT artifacts, same transplant boundary as cuBLAS):
+- gemm_swiglu pairs the gate/up COLUMN HALVES within one CTA's epilogue -> our gemm
+  tiles can claim paired (n, n + N/2) column blocks and apply swiglu tile-locally,
+  no weight-interleave, no backward layout changes.
+- lse.py / ColVecStore: tile-local row-reduction epilogues (LSE for fusing CE into the
+  lm_head gemm; row sum-of-squares for producing the NEXT rmsnorm's rstd in the
+  producing gemm's epilogue).
+- Even CODA keeps swiglu-BACKWARD as a standalone elementwise op (dswiglu_backward)
+  with plain gemms for dx/dW — our backward structure is not the anomaly.
+Calibration caveat: CODA standalone calls carry ~50-100us CuTeDSL host dispatch at
+small shapes (amortized only under CUDA graphs), so per-op comparisons must use
+in-graph event timing, not wall clock.
+
+Also answered along the way: hand-written SASS would not unlock reusing cuBLAS —
+disassembled kernels are frozen whole-kernel images (baked constant-bank argument
+reads, block-shape-tied register/barrier allocation, internal schedulers) and cuBLAS
+is a per-shape kernel-selection library besides. SASS remains a read/audit tool here.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.3x faster. The measured structural gap, in order:
