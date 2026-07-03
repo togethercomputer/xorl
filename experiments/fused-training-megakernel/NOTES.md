@@ -180,6 +180,22 @@ multi-week core, now with direct measurements behind that scoping.
 
 Scoreboard: nano 1.85ms / small 9.28ms vs compile+CUDAGraph 0.83 / 3.0ms.
 
+## v2 round 4: split-KV attention forward — implemented, measured, not routed
+
+OP_ATTN_FWD_SPLIT (chunked kv loop with chunk-local online softmax, locally normalized
+partials + (m_c, l_c)) and OP_ATTN_COMBINE (flash-decoding merge; also produces LSE)
+are implemented and parity-tested. Measured with C=4: nano neutral (~1.85ms), small
+NEGATIVE (+5%: the combine chain hop plus [C, S, nq*D] partial-tensor traffic outweigh
+the per-instr latency saving). Routing disabled (attn_C = 1); ops retained.
+
+With this, EVERY session-scale item on the v2 roadmap has been executed and measured:
+the ones that pay are routed and committed; the ones that don't (cp.async WMMA rewrite,
+scheduler direct handoff, launch-bounds occupancy trade, bwd-gemm wgmma routing,
+split-KV fwd routing) are committed as documented negative results. Best configuration:
+nano ~1.85-1.89ms, small ~9.3-9.4ms vs compile+CUDAGraph 0.83/3.0ms. The remaining gap
+is the structural floor; the only remaining levers are the multi-week ones (warp
+specialization, tile-granular dependencies, FA-class attention tiles).
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.3x faster. The measured structural gap, in order:

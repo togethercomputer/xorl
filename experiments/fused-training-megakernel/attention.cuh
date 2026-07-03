@@ -169,6 +169,128 @@ __device__ void op_attn_fwd(const Instr& I, int tile, void** bufs, char* smem_ra
     LSE[(int64_t)qh * S + q0 + tid] = sm.row_m[tid] + logf(sm.row_l[tid]);
 }
 
+// ---- split-KV forward (flash-decoding style) ----------------------------------------
+// tile = (qh, qtile, chunk c of C): partial attention over kv tiles c, c+C, ... <= qtile
+// with chunk-local online softmax; writes O_c (locally normalized), m_c, l_c. A combine
+// op merges the C partials. Empty chunks (c > qtile) write zero-weight partials.
+// args: {qkv_r, Opart, Mpart, Lpart, S, nq, nkv, D, scale_bits, C}
+// Opart: [C, S, nq*D] bf16; Mpart/Lpart: [C, nq, S] fp32.
+__device__ void op_attn_fwd_split(const Instr& I, int tile, void** bufs, char* smem_raw) {
+  const int S = I.args[4], nq = I.args[5], nkv = I.args[6], D = I.args[7];
+  const float scale = __int_as_float(I.args[8]);
+  const int C = I.args[9];
+  const bf16* qkv = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
+  bf16* Opart = reinterpret_cast<bf16*>(bufs[I.args[1]]);
+  float* Mpart = reinterpret_cast<float*>(bufs[I.args[2]]);
+  float* Lpart = reinterpret_cast<float*>(bufs[I.args[3]]);
+  AttnSmem& sm = *reinterpret_cast<AttnSmem*>(smem_raw);
+
+  const int n_qt = (S + AT_T - 1) / AT_T;
+  const int qh = tile / (n_qt * C);
+  const int rem = tile % (n_qt * C);
+  const int q0 = (rem / C) * AT_T;
+  const int chunk = rem % C;
+  const int kvh = qh / (nq / nkv);
+  const int stride = (nq + 2 * nkv) * D;
+  const int tid = threadIdx.x;
+
+  load_tile(sm.Qs, qkv, q0, S, qh * D, stride, D);
+  for (int i = tid; i < AT_T * D; i += blockDim.x) sm.Acc1[i / D][i % D] = 0.0f;
+  for (int i = tid; i < AT_T * AT_T; i += blockDim.x) sm.Ps[i / AT_T][i % AT_T] = f2bf(0.0f);
+  if (tid < AT_T) {
+    sm.row_m[tid] = -INFINITY;
+    sm.row_l[tid] = 0.0f;
+  }
+  __syncthreads();
+
+  for (int k0 = chunk * AT_T; k0 <= q0; k0 += C * AT_T) {
+    load_tile(sm.Ks, qkv, k0, S, (nq + kvh) * D, stride, D);
+    load_tile(sm.Vs, qkv, k0, S, (nq + nkv + kvh) * D, stride, D);
+    __syncthreads();
+    mma_ab_t(sm, sm.Qs, sm.Ks, D);
+    {
+      const int lane = tid % 32, warp = tid / 32;
+      for (int r = warp * 4; r < warp * 4 + 4; ++r) {
+        const int qr = q0 + r;
+        if (qr >= S) continue;
+        const int kr = k0 + lane;
+        float sc = (kr <= qr && kr < S) ? sm.Ss[r][lane] * scale : -INFINITY;
+        float mx = sc;
+        for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+        const float m_new = fmaxf(sm.row_m[r], mx);
+        const float pv = (sc == -INFINITY) ? 0.0f : expf(sc - m_new);
+        float lsum = pv;
+        for (int o = 16; o > 0; o >>= 1) lsum += __shfl_xor_sync(0xffffffff, lsum, o);
+        sm.Ps[r][lane] = f2bf(pv);
+        if (lane == 0) {
+          const float alpha = expf(sm.row_m[r] - m_new);
+          sm.row_alpha[r] = alpha;
+          sm.row_m[r] = m_new;
+          sm.row_l[r] = sm.row_l[r] * alpha + lsum;
+        }
+      }
+    }
+    __syncthreads();
+    for (int i = tid; i < AT_T * D; i += blockDim.x)
+      if (q0 + i / D < S) sm.Acc1[i / D][i % D] *= sm.row_alpha[i / D];
+    __syncthreads();
+    mma_acc<false>(sm.Acc1, sm.Ps, sm.Vs, D);
+  }
+
+  // write locally-normalized partial + (m_c, l_c); empty chunks yield l=0, m=-inf
+  for (int i = tid; i < AT_T * D; i += blockDim.x) {
+    const int r = i / D, c = i % D;
+    const int gr = q0 + r;
+    if (gr < S) {
+      const float l = sm.row_l[r];
+      Opart[(int64_t)chunk * S * nq * D + (int64_t)gr * (nq * D) + qh * D + c] =
+          f2bf(l > 0.0f ? sm.Acc1[r][c] / l : 0.0f);
+    }
+  }
+  if (tid < AT_T && q0 + tid < S) {
+    Mpart[((int64_t)chunk * nq + qh) * S + q0 + tid] = sm.row_m[tid];
+    Lpart[((int64_t)chunk * nq + qh) * S + q0 + tid] = sm.row_l[tid];
+  }
+}
+
+// combine: O[s,qh,:] = sum_c w_c O_c, w_c = l_c exp(m_c - m*) / l*; LSE = m* + ln l*.
+// args: {Opart, Mpart, Lpart, O, LSE, S, nq, D, C}; tile = s; warp w handles head w, w+8...
+__device__ void op_attn_combine(const Instr& I, int tile, void** bufs) {
+  const int S = I.args[5], nq = I.args[6], D = I.args[7], C = I.args[8];
+  const bf16* Opart = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
+  const float* Mpart = reinterpret_cast<const float*>(bufs[I.args[1]]);
+  const float* Lpart = reinterpret_cast<const float*>(bufs[I.args[2]]);
+  bf16* O = reinterpret_cast<bf16*>(bufs[I.args[3]]);
+  float* LSE = reinterpret_cast<float*>(bufs[I.args[4]]);
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const int s = tile;
+  for (int h = warp; h < nq; h += blockDim.x / 32) {
+    float mstar = -INFINITY;
+    for (int c = 0; c < C; ++c)
+      mstar = fmaxf(mstar, Mpart[((int64_t)c * nq + h) * S + s]);
+    float w[8];  // C <= 8
+    float lstar = 0.0f;
+    for (int c = 0; c < C; ++c) {
+      const float lc = Lpart[((int64_t)c * nq + h) * S + s];
+      const float mc = Mpart[((int64_t)c * nq + h) * S + s];
+      w[c] = (lc > 0.0f) ? lc * expf(mc - mstar) : 0.0f;
+      lstar += w[c];
+    }
+    for (int d0 = lane * 2; d0 < D; d0 += 64) {  // lanes cover D in float2 steps
+      float acc0 = 0.0f, acc1 = 0.0f;
+      for (int c = 0; c < C; ++c) {
+        if (w[c] == 0.0f) continue;
+        const int64_t base = (int64_t)c * S * nq * D + (int64_t)s * (nq * D) + h * D + d0;
+        acc0 += w[c] * bf2f(Opart[base]);
+        acc1 += w[c] * bf2f(Opart[base + 1]);
+      }
+      O[(int64_t)s * (nq * D) + h * D + d0] = f2bf(acc0 / lstar);
+      O[(int64_t)s * (nq * D) + h * D + d0 + 1] = f2bf(acc1 / lstar);
+    }
+    if (lane == 0) LSE[(int64_t)h * S + s] = mstar + logf(lstar);
+  }
+}
+
 // ---- backward preprocess: Drow[qh,s] = sum_d dO[s,qh,d] * O[s,qh,d] ------------------------
 // args: {dO, O, Drow, S, nq, D}; tile = s. Warp w handles heads w, w+8, ...
 __device__ void op_attn_dpre(const Instr& I, int tile, void** bufs) {

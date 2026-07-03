@@ -103,6 +103,14 @@ class MKQwen3:
         W["dGU"] = torch.empty(c.S, 2 * c.I, device=dev, dtype=bf)
         W["dHs"] = torch.empty(c.S, c.I, device=dev, dtype=bf)
         W["drow"] = torch.empty(c.nq, c.S, device=dev, dtype=f32)
+        # split-KV attention fwd partials (flash-decoding style combine). Measured
+        # neutral at nano and NEGATIVE at small (combine hop + partial traffic outweigh
+        # the chain-latency saving) -> routing disabled; ops retained for future tuning.
+        self.attn_C = 1
+        if self.attn_C > 1:
+            W["opart"] = torch.empty(self.attn_C, c.S, c.nq * c.D, device=dev, dtype=bf)
+            W["mpart"] = torch.empty(self.attn_C, c.nq, c.S, device=dev, dtype=f32)
+            W["lpart"] = torch.empty(self.attn_C, c.nq, c.S, device=dev, dtype=f32)
         # fp32 atomic-accumulation workspaces (attention bwd splits; big split-K gemms).
         # dQKV_f32 is per layer so its zero-fill runs up front with no inter-layer
         # dependency (a shared one chains layer N's fill behind layer N+1's convert).
@@ -216,8 +224,23 @@ class MKQwen3:
                     ],
                 )
                 p.wave()
-            p.instr(mk.OP_ATTN_FWD, c.nq * n_qt, [a("qkvr"), a("oatt"), a("lse"), c.S, c.nq, c.nkv, c.D, scale])
-            p.wave()
+            if self.attn_C > 1:
+                Ca = self.attn_C
+                p.instr(
+                    mk.OP_ATTN_FWD_SPLIT,
+                    c.nq * n_qt * Ca,
+                    [a("qkvr"), B(W["opart"]), B(W["mpart"]), B(W["lpart"]), c.S, c.nq, c.nkv, c.D, scale, Ca],
+                )
+                p.wave()
+                p.instr(
+                    mk.OP_ATTN_COMBINE,
+                    c.S,
+                    [B(W["opart"]), B(W["mpart"]), B(W["lpart"]), a("oatt"), a("lse"), c.S, c.nq, c.D, Ca],
+                )
+                p.wave()
+            else:
+                p.instr(mk.OP_ATTN_FWD, c.nq * n_qt, [a("qkvr"), a("oatt"), a("lse"), c.S, c.nq, c.nkv, c.D, scale])
+                p.wave()
             gemm(a("oatt"), pr("wo"), a("x2"), c.S, c.H, c.nq * c.D, 2 | 16, X[l])
             p.wave()
             p.instr(mk.OP_RMSNORM_FWD, c.S, [a("x2"), pr("w2"), a("xn2"), a("rstd2"), c.H, eps])

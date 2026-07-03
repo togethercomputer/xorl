@@ -34,6 +34,8 @@ OP_ATTN_DPRE = 15
 OP_ATTN_DKV = 16
 OP_ATTN_DQ = 17
 OP_CVT_F32BF16 = 18
+OP_ATTN_FWD_SPLIT = 19
+OP_ATTN_COMBINE = 20
 
 GEMM_BM, GEMM_BN = 64, 128  # keep in sync with ops.cuh
 FILL_CHUNK = 16384  # elements per fill/cvt work item (MK_CHUNK in ops.cuh)
@@ -146,6 +148,10 @@ def _access_sets(op, args):
         return [0, 1, 2, 3], [4]
     if op == OP_CVT_F32BF16:
         return [0], [1]
+    if op == OP_ATTN_FWD_SPLIT:
+        return [0], [1, 2, 3]
+    if op == OP_ATTN_COMBINE:
+        return [0, 1, 2], [3, 4]
     raise ValueError(f"no access signature for op {op}")
 
 

@@ -45,6 +45,8 @@ enum Op : int {
   OP_ATTN_DKV = 16,
   OP_ATTN_DQ = 17,
   OP_CVT_F32BF16 = 18,
+  OP_ATTN_FWD_SPLIT = 19,
+  OP_ATTN_COMBINE = 20,
 };
 
 __device__ __forceinline__ long long mk_globaltimer() {
@@ -118,6 +120,12 @@ __device__ __forceinline__ void dispatch(const Instr& I, int tile, void** bufs,
       break;
     case OP_CVT_F32BF16:
       op_cvt_f32_bf16(I, tile, bufs);
+      break;
+    case OP_ATTN_FWD_SPLIT:
+      op_attn_fwd_split(I, tile, bufs, smem);
+      break;
+    case OP_ATTN_COMBINE:
+      op_attn_combine(I, tile, bufs);
       break;
     default:
       break;
