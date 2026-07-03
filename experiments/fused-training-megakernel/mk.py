@@ -119,6 +119,9 @@ def _access_sets(op, args):
         if flags & 256:  # fused qk-norm+rope epilogue
             r += [9, 10, 13, 14]
             w += [11, 12, 15]
+        if flags & 1024:  # fused Drow epilogue (dOatt gemm)
+            r.append(9)
+            w.append(10)
         return r, w
     if op == OP_RMSNORM_FWD:
         return [0, 1], [2, 3]
@@ -137,7 +140,10 @@ def _access_sets(op, args):
     if op == OP_EMBED_BWD:
         return [0, 1], [2]
     if op == OP_CE_FWD:
-        return [0, 1, 4], [2, 3]
+        r = [0, 1, 4]
+        if len(args) > 6:  # fused lm_head-epilogue lse partials
+            r.append(6)
+        return r, [2, 3]
     if op == OP_CE_BWD:
         return [1, 2, 3], [0]
     if op == OP_ATTN_FWD:

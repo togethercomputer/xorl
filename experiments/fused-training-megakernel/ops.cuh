@@ -235,6 +235,29 @@ __device__ void op_gemm(const Instr& I, int tile, void** bufs, char* smem_raw) {
       C[idx] = f2bf(acc_c ? bf2f(C[idx]) + v : v);
     }
   }
+
+  // Fused Drow epilogue (flags bit10, dOatt = dX @ Wo): drow[qh, s] += sum_d dO*O over
+  // this tile's columns (fp32 atomics; drow pre-zeroed). Replaces OP_ATTN_DPRE — one
+  // chain hop per layer. D divides GEMM_BN, so a tile covers whole heads. Values are
+  // re-rounded through bf16 to match what the standalone op read from the dOatt buffer.
+  // args: 9 = oatt, 10 = drow, 11 = D. Host guarantees no residual/split-K/acc co-use.
+  if (flags & 1024) {
+    const bf16* Oatt = reinterpret_cast<const bf16*>(bufs[I.args[9]]);
+    float* drow = reinterpret_cast<float*>(bufs[I.args[10]]);
+    const int D = I.args[11];
+    const int lane = tid % 32;
+    for (int m = warp; m < GEMM_BM; m += 8) {  // warp per row, striding
+      const int gm = m0 + m;
+      if (gm >= M) break;
+      for (int hb = 0; hb < GEMM_BN && n0 + hb < N; hb += D) {
+        float s = 0.0f;
+        for (int d = lane; d < D; d += 32)
+          s += bf2f(f2bf(S.Cs[m][hb + d])) * bf2f(Oatt[(int64_t)gm * N + n0 + hb + d]);
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffff, s, o);
+        if (lane == 0) atomicAdd(&drow[(int64_t)((n0 + hb) / D) * M + gm], s);
+      }
+    }
+  }
 }
 
 // ---- wgmma GEMM (Hopper): NT layouts (A [M,K], B [N,K], both K-major) ---------------
@@ -453,6 +476,45 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
     }
   }
 
+  // Fused CE/LSE partials (flags bit11, lm_head gemm): per-row online (max, sumexp)
+  // over this tile's 64 columns, computed from the bf16-ROUNDED staged values so the
+  // reduction sees exactly what OP_CE_FWD would have read back from the logits buffer.
+  // args: 9 = partials [M, N/64, 2] fp32, 10 = nparts (= N/64). OP_CE_FWD then reduces
+  // nparts pairs per row instead of rescanning V logits.
+  if (flags & 2048) {
+    float* parts = reinterpret_cast<float*>(bufs[I.args[9]]);
+    const int nparts = I.args[10];
+    const int nb = n0 / WG_BN;
+    const int warp = tid / 32, lane = tid % 32;
+    for (int r = warp; r < WG_BM; r += 8) {
+      float mx = -INFINITY, se = 0.0f;
+      for (int cc = lane; cc < WG_BN; cc += 32) {
+        const float zv = bf2f(f2bf(Cs[r * WG_LDC + cc]));
+        // __expf: register-lean SFU intrinsic — this runs inside the gemm's register
+        // context, where libm expf spills the whole interpreter past 128 regs/thread
+        // (1 block/SM). Precision loss is far below bf16 logit noise.
+        if (zv > mx) {
+          se = se * __expf(mx - zv) + 1.0f;
+          mx = zv;
+        } else {
+          se += __expf(zv - mx);
+        }
+      }
+      for (int o = 16; o > 0; o >>= 1) {
+        const float om = __shfl_xor_sync(0xffffffff, mx, o);
+        const float os = __shfl_xor_sync(0xffffffff, se, o);
+        const float Mx = fmaxf(mx, om);
+        se = (mx == -INFINITY && om == -INFINITY) ? 0.0f : se * __expf(mx - Mx) + os * __expf(om - Mx);
+        mx = Mx;
+      }
+      if (lane == 0) {
+        const int64_t o = ((int64_t)(m0 + r) * nparts + nb) * 2;
+        parts[o] = mx;
+        parts[o + 1] = se;
+      }
+    }
+  }
+
   // Fused per-head qk-RMSNorm + RoPE epilogue (flags bit8): with WG_BN == 64 == D each
   // tile covers exactly one head, so the norm is tile-local over the fp32 staging.
   // args: 9=qw 10=kw 11=rstd_q 12=rstd_k 13=cos 14=sin 15=qkvr 16=nq 17=nkv 18=D 19=eps
@@ -553,28 +615,32 @@ __device__ void op_rmsnorm_fwd(const Instr& I, int tile, void** bufs, char* smem
 // bwd: with xhat = x*rstd, g = dy*w:
 //   dx += rstd * (g - xhat * mean(g * xhat))       (accumulates into dx: residual stream)
 //   dw += dy * xhat                                 (fp32 atomics)
-// args: {x, w, dy, dx, dw, rstd, H}; tile = row.
+// args: {x, w, dy, dx, dw, rstd, H, dy_f32}; tile = row. dy_f32 != 0 reads dy as fp32
+// (an atomic-accumulation workspace consumed directly — no CVT chain hop).
 __device__ void op_rmsnorm_bwd(const Instr& I, int tile, void** bufs, char* smem_raw) {
   const int H = I.args[6];
   const bf16* x = reinterpret_cast<const bf16*>(bufs[I.args[0]]) + (int64_t)tile * H;
   const bf16* w = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
-  const bf16* dy = reinterpret_cast<const bf16*>(bufs[I.args[2]]) + (int64_t)tile * H;
+  const bf16* dyb = reinterpret_cast<const bf16*>(bufs[I.args[2]]) + (int64_t)tile * H;
+  const float* dyf = reinterpret_cast<const float*>(bufs[I.args[2]]) + (int64_t)tile * H;
+  const bool dy_f32 = I.args[7] != 0;
   bf16* dx = reinterpret_cast<bf16*>(bufs[I.args[3]]) + (int64_t)tile * H;
   float* dw = reinterpret_cast<float*>(bufs[I.args[4]]);
   const float r = reinterpret_cast<const float*>(bufs[I.args[5]])[tile];
   float* scratch = reinterpret_cast<float*>(smem_raw);
+  auto dy = [&](int i) { return dy_f32 ? dyf[i] : bf2f(dyb[i]); };
 
   float dot = 0.0f;
   for (int i = threadIdx.x; i < H; i += blockDim.x) {
     const float xhat = bf2f(x[i]) * r;
-    dot += bf2f(dy[i]) * bf2f(w[i]) * xhat;
+    dot += dy(i) * bf2f(w[i]) * xhat;
   }
   dot = block_sum(dot, scratch) / H;
   for (int i = threadIdx.x; i < H; i += blockDim.x) {
     const float xhat = bf2f(x[i]) * r;
-    const float g = bf2f(dy[i]) * bf2f(w[i]);
+    const float g = dy(i) * bf2f(w[i]);
     dx[i] = f2bf(bf2f(dx[i]) + r * (g - xhat * dot));
-    atomicAdd(&dw[i], bf2f(dy[i]) * xhat);
+    atomicAdd(&dw[i], dy(i) * xhat);
   }
 }
 
@@ -658,16 +724,20 @@ __device__ void op_qknorm_rope_fwd(const Instr& I, int tile, void** bufs, char* 
 // bwd: input d(qkv_r) (from attention bwd, v grad included), output d(qkv_raw).
 // rope bwd = rotate by -theta; then per-head rmsnorm bwd (dw via fp32 atomics).
 // v grads pass through. Writes dqkv_raw (bf16), OVERWRITING (not accumulating).
-// args: {qkv_raw, dqkv_r, dqkv_raw, qw, kw, dqw, dkw, rstd_q, rstd_k, cos, sin, nq, nkv, D}
+// args: {qkv_raw, dqkv_r, dqkv_raw, qw, kw, dqw, dkw, rstd_q, rstd_k, cos, sin, nq, nkv, D,
+//        dy_f32}
 // tile = row; warp w handles heads w, w+8, ... Per-block dqw/dkw partials accumulate in
 // smem (fast atomics), then ONE global atomicAdd per element per row — instead of one
-// per (row, head), which serialized on the tiny [D] grad buffers.
+// per (row, head), which serialized on the tiny [D] grad buffers. dy_f32 != 0 reads the
+// incoming grad as fp32 (the attention-bwd atomic workspace, no CVT chain hop).
 __device__ void op_qknorm_rope_bwd(const Instr& I, int tile, void** bufs, char* smem_raw) {
   const int nq = I.args[11], nkv = I.args[12], D = I.args[13];
+  const bool dy_f32 = I.args[14] != 0;
   const int row = tile;
   const int stride = (nq + 2 * nkv) * D;
   const bf16* x_row = reinterpret_cast<const bf16*>(bufs[I.args[0]]) + (int64_t)row * stride;
-  const bf16* dy_row = reinterpret_cast<const bf16*>(bufs[I.args[1]]) + (int64_t)row * stride;
+  const bf16* dyb_row = reinterpret_cast<const bf16*>(bufs[I.args[1]]) + (int64_t)row * stride;
+  const float* dyf_row = reinterpret_cast<const float*>(bufs[I.args[1]]) + (int64_t)row * stride;
   bf16* dx_row = reinterpret_cast<bf16*>(bufs[I.args[2]]) + (int64_t)row * stride;
   const float* cosr = reinterpret_cast<const float*>(bufs[I.args[9]]) + (int64_t)row * (D / 2);
   const float* sinr = reinterpret_cast<const float*>(bufs[I.args[10]]) + (int64_t)row * (D / 2);
@@ -680,10 +750,12 @@ __device__ void op_qknorm_rope_bwd(const Instr& I, int tile, void** bufs, char* 
 
   for (int h = warp; h < nq + 2 * nkv; h += nwarp) {
     const bf16* xr = x_row + h * D;
-    const bf16* dyr = dy_row + h * D;
+    const bf16* dyb = dyb_row + h * D;
+    const float* dyf = dyf_row + h * D;
+    auto dyr = [&](int i) { return dy_f32 ? dyf[i] : bf2f(dyb[i]); };
     bf16* dxr = dx_row + h * D;
     if (h >= nq + nkv) {  // v grads pass through
-      for (int i = lane; i < D; i += 32) dxr[i] = dyr[i];
+      for (int i = lane; i < D; i += 32) dxr[i] = f2bf(dyr(i));
       continue;
     }
     const bool is_q = h < nq;
@@ -697,7 +769,7 @@ __device__ void op_qknorm_rope_bwd(const Instr& I, int tile, void** bufs, char* 
     float dot = 0.0f;
     for (int i = lane; i < D / 2; i += 32) {
       const float c = cosr[i], s = sinr[i];
-      const float dy1 = bf2f(dyr[i]), dy2 = bf2f(dyr[i + D / 2]);
+      const float dy1 = dyr(i), dy2 = dyr(i + D / 2);
       const float da = dy1 * c + dy2 * s;
       const float db = -dy1 * s + dy2 * c;
       dot += da * bf2f(w[i]) * bf2f(xr[i]) * r + db * bf2f(w[i + D / 2]) * bf2f(xr[i + D / 2]) * r;
@@ -706,7 +778,7 @@ __device__ void op_qknorm_rope_bwd(const Instr& I, int tile, void** bufs, char* 
     dot /= D;
     for (int i = lane; i < D / 2; i += 32) {
       const float c = cosr[i], s = sinr[i];
-      const float dy1 = bf2f(dyr[i]), dy2 = bf2f(dyr[i + D / 2]);
+      const float dy1 = dyr(i), dy2 = dyr(i + D / 2);
       const float da = dy1 * c + dy2 * s;
       const float db = -dy1 * s + dy2 * c;
       const float xh1 = bf2f(xr[i]) * r, xh2 = bf2f(xr[i + D / 2]) * r;
@@ -747,7 +819,9 @@ __device__ void op_embed_bwd(const Instr& I, int tile, void** bufs) {
 // ---- cross entropy ----------------------------------------------------------------------
 // fwd over materialized logits [S, V]: per row lse; loss_sum += (lse - z_t) for valid rows.
 // inv_valid is a device fp32 scalar (1/num_valid). loss is a device fp32 scalar (pre-zeroed).
-// args: {logits, labels, lse, loss, inv_valid, V}; tile = row. labels int32, -100 = ignore.
+// args: {logits, labels, lse, loss, inv_valid, V, parts, nparts}; tile = row. labels int32,
+// -100 = ignore. nparts > 0: reduce the fused lm_head-epilogue (max, sumexp) partial pairs
+// (args[6], [S, nparts, 2] fp32) instead of rescanning the V-wide logits row.
 __device__ void op_ce_fwd(const Instr& I, int tile, void** bufs, char* smem_raw) {
   const int V = I.args[5];
   const bf16* z = reinterpret_cast<const bf16*>(bufs[I.args[0]]) + (int64_t)tile * V;
@@ -755,17 +829,28 @@ __device__ void op_ce_fwd(const Instr& I, int tile, void** bufs, char* smem_raw)
   float* lse_out = reinterpret_cast<float*>(bufs[I.args[2]]);
   float* loss = reinterpret_cast<float*>(bufs[I.args[3]]);
   const float inv_valid = *reinterpret_cast<const float*>(bufs[I.args[4]]);
+  const int nparts = I.args[7];
   float* scratch = reinterpret_cast<float*>(smem_raw);
 
   // single-pass online (m, s) accumulation: one read of the logits row instead of two
   float mx = -INFINITY, se = 0.0f;
-  for (int i = threadIdx.x; i < V; i += blockDim.x) {
-    const float zv = bf2f(z[i]);
-    if (zv > mx) {
-      se = se * expf(mx - zv) + 1.0f;
-      mx = zv;
-    } else {
-      se += expf(zv - mx);
+  if (nparts > 0) {
+    const float* parts = reinterpret_cast<const float*>(bufs[I.args[6]]) + (int64_t)tile * nparts * 2;
+    for (int i = threadIdx.x; i < nparts; i += blockDim.x) {
+      const float om = parts[i * 2], os = parts[i * 2 + 1];
+      const float M = fmaxf(mx, om);
+      se = (mx == -INFINITY && om == -INFINITY) ? 0.0f : se * expf(mx - M) + os * expf(om - M);
+      mx = M;
+    }
+  } else {
+    for (int i = threadIdx.x; i < V; i += blockDim.x) {
+      const float zv = bf2f(z[i]);
+      if (zv > mx) {
+        se = se * expf(mx - zv) + 1.0f;
+        mx = zv;
+      } else {
+        se += expf(zv - mx);
+      }
     }
   }
   // merge (m, s) pairs across the warp, then across warps via smem

@@ -224,6 +224,43 @@ THE CORRECTION: the residual gap is NOT "per-instr fixed cost x chain depth". Me
   small) are deletable — QKNORM_ROPE_BWD and head RMSNORM_BWD read the fp32 atomic
   workspaces directly (dy_f32 flag); no dtype constraint on elementwise consumers.
 
+## v3 Phase 1: fusion round — two keepers, two negatives, one discovery
+
+Measured on GPU-matched runs (hardened goalposts 711/2730 us):
+
+| change | nano | small | verdict |
+|---|---|---|---|
+| v2 tip | 1888 | 9391 | — |
+| CVT deletion (dy_f32: qknorm-bwd + head rmsnorm-bwd read fp32 workspaces) | 1833 | 9275 | KEEP |
+| Drow fused into dOatt gemm epilogue (bit10, per-layer drow buffers) | 1841 | 9230 | KEEP |
+| swiglu paired-column tiles (bit9) | +88 | +297 | REMOVED |
+| CE/lse partials in lm_head epilogue (bit11) | ±noise (A/B: on 1865/9275, off 1861/9317) | | KEEP ON (cheapens the CE hop ~5x for free) |
+
+Phase-1 end state: **nano ~1860, small ~9280; chain 85→76 / 161→144.**
+(Run-to-run noise on these timings is ±20-40us — single-fusion deltas below that are
+calls made on direction consistency across both configs, not on one number.)
+
+Why the fusion estimates missed (this is the durable lesson): with waits at only ~2-7us
+per hop, deleting a chain hop pays only its SPAN, and only if that span isn't re-added
+to an on-path producer. bit9 halved the gu tiles → doubled per-tile serial span
+(parallelism traded for fusion — needs tile-granular deps first); bit11 added SFU
+reductions to 512 on-path lm-gemm tiles that cost more than the CE scan they saved.
+rstd-producer fusion (bit12) NOT attempted — same class as bit11, predicted negative
+by two data points. Fusion at instruction granularity is now exhausted; the remaining
+wins are op latency (attention, gemm pipelines) and span overlap (tile-granular deps).
+
+TOOLING RULE learned the hard way: check `cuobjdump -res-usage` on every device-code
+change. The bit9 pass-loop restructure spilled 320B of stack in the wgmma hot path and
+silently slowed EVERYTHING ~8% — invisible in tests, only visible in the spill count.
+
+DISCOVERY: the interpreter kernel is REG:255 → **1 block/SM → 132 blocks, including at
+the committed v2 tip** (probably since round 3's four-major wgmma dispatch). The
+"264 blocks / 2 per SM" claims in earlier sections and the mk.py claim heuristic are
+stale; all round-3/4 numbers were measured at 132 blocks. Consequences: Phase 4's
+1-block/SM warp-spec design gives up nothing; `claim_sz`'s hardcoded 264 is a cheap
+tuning knob; and there may be a free win in getting register pressure back under 128
+(worth one bounded attempt before the prototype).
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.3x faster. The measured structural gap, in order:

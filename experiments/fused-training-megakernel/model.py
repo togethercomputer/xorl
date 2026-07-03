@@ -97,12 +97,14 @@ class MKQwen3:
         W = {}
         W["dX"] = torch.empty(c.S, c.H, device=dev, dtype=bf)
         W["dXN"] = torch.empty(c.S, c.H, device=dev, dtype=bf)
-        W["dQKVr"] = torch.empty(c.S, QD, device=dev, dtype=bf)
         W["dQKVraw"] = torch.empty(c.S, QD, device=dev, dtype=bf)
         W["dOatt"] = torch.empty(c.S, c.nq * c.D, device=dev, dtype=bf)
         W["dGU"] = torch.empty(c.S, 2 * c.I, device=dev, dtype=bf)
         W["dHs"] = torch.empty(c.S, c.I, device=dev, dtype=bf)
-        W["drow"] = torch.empty(c.nq, c.S, device=dev, dtype=f32)
+        # per layer (like dQKV_f32): Drow is atomically accumulated by the fused dOatt
+        # gemm epilogue, so its zero-fill must be a dependency root, not chained
+        for l in range(c.L):
+            W[f"drow.{l}"] = torch.empty(c.nq, c.S, device=dev, dtype=f32)
         # split-KV attention fwd partials (flash-decoding style combine). Measured
         # neutral at nano and NEGATIVE at small (combine hop + partial traffic outweigh
         # the chain-latency saving) -> routing disabled; ops retained for future tuning.
@@ -117,6 +119,9 @@ class MKQwen3:
         for l in range(c.L):
             W[f"dQKV_f32.{l}"] = torch.empty(c.S, QD, device=dev, dtype=f32)
         W["dXN_f32"] = torch.empty(c.S, c.H, device=dev, dtype=f32)
+        # per-row (max, sumexp) partials from the lm_head gemm epilogue (bit11)
+        if c.V % 64 == 0:
+            W["lse_parts"] = torch.empty(c.S, c.V // 64, 2, device=dev, dtype=f32)
         self.ws = W
 
         self.cos, self.sin = rope_tables(c, dev)
@@ -163,6 +168,7 @@ class MKQwen3:
         fill_zero(self.loss)
         for lz in range(c.L):
             fill_zero(W[f"dQKV_f32.{lz}"])
+            fill_zero(W[f"drow.{lz}"])
         # dX is bf16; zero via fp32 fill over half the elements (bf16 pair = one f32 zero)
         p.instr(mk.OP_FILL_F32, mk.chunk_tiles(W["dX"].numel() // 2), [B(W["dX"]), W["dX"].numel() // 2, mk.f2i(0.0)])
         p.wave()
@@ -245,6 +251,10 @@ class MKQwen3:
             p.wave()
             p.instr(mk.OP_RMSNORM_FWD, c.S, [a("x2"), pr("w2"), a("xn2"), a("rstd2"), c.H, eps])
             p.wave()
+            # Paired-column swiglu fusion (gate/up in one tile, two k-loops) was TRIED
+            # AND REMOVED: halving the gu tiles doubles per-tile serial span (nano +88us,
+            # small +297us) AND the pass-loop restructure blew the interpreter to
+            # 255 regs -> 1 block/SM. Revisit only on top of tile-granular deps.
             gemm(a("xn2"), pr("wgu"), a("gu"), c.S, 2 * c.I, c.H, 2)
             p.wave()
             p.instr(mk.OP_SWIGLU_FWD, c.S, [a("gu"), a("hs"), c.S, c.I])
@@ -255,11 +265,32 @@ class MKQwen3:
         # ---- head + loss ----
         p.instr(mk.OP_RMSNORM_FWD, c.S, [X[c.L], B(self.params["wf"]), B(A["xnf"]), B(A["rstdf"]), c.H, eps])
         p.wave()
-        gemm(B(A["xnf"]), B(self.params["wlm"]), B(A["logits"]), c.S, c.V, c.H, 2)
-        p.wave()
-        p.instr(
-            mk.OP_CE_FWD, c.S, [B(A["logits"]), B(self.labels), B(A["lse_ce"]), B(self.loss), B(self.inv_valid), c.V]
-        )
+        # bit11 (lse partials in the lm_head epilogue): A/B measured NEUTRAL within
+        # noise (on: 1865/9275, off: 1861/9317). Kept ON — cheapens the CE hop ~5x
+        # for free and the partials become useful once tile-granular deps land.
+        self.fuse_ce = True
+        if self.fuse_ce and mk.wgmma_ok(c.S, c.V, c.H, 2):
+            # lm_head gemm with per-row lse partials in the epilogue (bit11): CE fwd
+            # reduces V/64 (max, sumexp) pairs instead of rescanning the V-wide row
+            p.instr(
+                mk.OP_GEMM,
+                mk.gemm_tiles_wgmma(c.S, c.V),
+                [B(A["xnf"]), B(self.params["wlm"]), B(A["logits"]), c.S, c.V, c.H,
+                 2 | 128 | 2048, 0, 0, B(W["lse_parts"]), c.V // 64],
+            )
+            p.wave()
+            p.instr(
+                mk.OP_CE_FWD,
+                c.S,
+                [B(A["logits"]), B(self.labels), B(A["lse_ce"]), B(self.loss), B(self.inv_valid), c.V,
+                 B(W["lse_parts"]), c.V // 64],
+            )
+        else:
+            gemm(B(A["xnf"]), B(self.params["wlm"]), B(A["logits"]), c.S, c.V, c.H, 2)
+            p.wave()
+            p.instr(
+                mk.OP_CE_FWD, c.S, [B(A["logits"]), B(self.labels), B(A["lse_ce"]), B(self.loss), B(self.inv_valid), c.V]
+            )
         p.wave()
 
         # ---- backward ----
@@ -285,12 +316,11 @@ class MKQwen3:
             )
         gemm(B(A["logits"]), B(A["xnf"]), B(self.grads["wlm"]), c.V, c.H, c.S, 1 | 4 | 8)
         p.wave()
-        p.instr(mk.OP_CVT_F32BF16, mk.chunk_tiles(c.S * c.H), [B(W["dXN_f32"]), B(W["dXN"]), c.S * c.H])
-        p.wave()
+        # final-norm bwd reads the split-K fp32 workspace directly (dy_f32; no CVT hop)
         p.instr(
             mk.OP_RMSNORM_BWD,
             c.S,
-            [X[c.L], B(self.params["wf"]), B(W["dXN"]), B(W["dX"]), B(self.grads["wf"]), B(A["rstdf"]), c.H],
+            [X[c.L], B(self.params["wf"]), B(W["dXN_f32"]), B(W["dX"]), B(self.grads["wf"]), B(A["rstdf"]), c.H, 1],
         )
         p.wave()
 
@@ -309,11 +339,16 @@ class MKQwen3:
             p.wave()
             p.instr(mk.OP_RMSNORM_BWD, c.S, [a("x2"), pr("w2"), B(W["dXN"]), B(W["dX"]), gr("w2"), a("rstd2"), c.H])
             p.wave()
-            # o proj: dOatt = dX @ Wo ; dWo += dX^T Oatt
-            gemm(B(W["dX"]), pr("wo"), B(W["dOatt"]), c.S, c.nq * c.D, c.H, 0)
+            # o proj: dOatt = dX @ Wo with the Drow reduction fused into the epilogue
+            # (flags bit10; replaces OP_ATTN_DPRE — one chain hop less per layer);
+            # dWo += dX^T Oatt
+            p.instr(
+                mk.OP_GEMM,
+                mk.gemm_tiles(c.S, c.nq * c.D),
+                [B(W["dX"]), pr("wo"), B(W["dOatt"]), c.S, c.nq * c.D, c.H, 1024, 0, 0,
+                 a("oatt"), B(W[f"drow.{l}"]), c.D],
+            )
             gemm(B(W["dX"]), a("oatt"), gr("wo"), c.H, c.nq * c.D, c.S, 1 | 4 | 8)
-            p.wave()
-            p.instr(mk.OP_ATTN_DPRE, c.S, [B(W["dOatt"]), a("oatt"), B(W["drow"]), c.S, c.nq, c.D])
             p.wave()
             # attention bwd: dkv splits the GQA loop (one group member per tile), dq
             # chunks its kv loop; both accumulate into the fp32 workspace with atomics
@@ -328,7 +363,7 @@ class MKQwen3:
                     a("qkvr"),
                     B(W["dOatt"]),
                     a("lse"),
-                    B(W["drow"]),
+                    B(W[f"drow.{l}"]),
                     p.buf(W[f"dQKV_f32.{l}"], slot="kv"),
                     c.S,
                     c.nq,
@@ -344,7 +379,7 @@ class MKQwen3:
                     a("qkvr"),
                     B(W["dOatt"]),
                     a("lse"),
-                    B(W["drow"]),
+                    B(W[f"drow.{l}"]),
                     p.buf(W[f"dQKV_f32.{l}"], slot="q"),
                     c.S,
                     c.nq,
@@ -355,15 +390,14 @@ class MKQwen3:
                 ],
             )
             p.wave()
-            QD_ = (c.nq + 2 * c.nkv) * c.D
-            p.instr(mk.OP_CVT_F32BF16, mk.chunk_tiles(c.S * QD_), [B(W[f"dQKV_f32.{l}"]), B(W["dQKVr"]), c.S * QD_])
-            p.wave()
+            # qk-norm+rope bwd reads the attention-bwd fp32 atomic workspace DIRECTLY
+            # (dy_f32) — the former per-layer CVT chain hop is gone (v3 P1).
             p.instr(
                 mk.OP_QKNORM_ROPE_BWD,
                 c.S,
                 [
                     a("qkvraw"),
-                    B(W["dQKVr"]),
+                    B(W[f"dQKV_f32.{l}"]),
                     B(W["dQKVraw"]),
                     pr("qn"),
                     pr("kn"),
@@ -376,6 +410,7 @@ class MKQwen3:
                     c.nq,
                     c.nkv,
                     c.D,
+                    1,  # dy_f32
                 ],
             )
             p.wave()
