@@ -129,6 +129,7 @@ def test_parse_args_accepts_model_numeric_alignment_flags_from_yaml(tmp_path, mo
                     "model_path": "Qwen/Qwen3-8B",
                     "router_fp32": False,
                     "lm_head_fp32": False,
+                    "rmsnorm_mode": "sglang",
                     "activation_native": True,
                     "rope_native": True,
                     "attention_cast_bf16": True,
@@ -156,6 +157,7 @@ def test_parse_args_accepts_model_numeric_alignment_flags_from_yaml(tmp_path, mo
 
     assert args.model.router_fp32 is False
     assert args.model.lm_head_fp32 is False
+    assert args.model.rmsnorm_mode == "sglang"
     assert args.model.activation_native is True
     assert args.model.rope_native is True
     assert args.model.attention_cast_bf16 is True

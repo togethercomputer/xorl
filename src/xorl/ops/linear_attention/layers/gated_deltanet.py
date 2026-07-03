@@ -3,6 +3,7 @@ from __future__ import annotations
 # Adapted from flash-linear-attention/fla/layers/gated_deltanet.py.
 # Portions of this file are adapted from flash-linear-attention, Copyright (c) 2023-2025 Songlin Yang, licensed under the MIT License.
 import math
+import os
 import warnings
 from typing import Any
 
@@ -11,6 +12,12 @@ import torch.nn as nn
 from einops import rearrange, repeat
 from torch.nn import functional as F
 
+from xorl.ops.linear_attention.backend import (
+    flashqla_chunk_gated_delta_rule,
+    flashqla_chunk_gated_delta_rule_cp,
+    get_gdn_backend,
+    warn_cp_fallback_once,
+)
 from xorl.ops.linear_attention.layers.utils import get_unpad_data, index_first_axis, pad_input
 from xorl.ops.linear_attention.modules import FusedRMSNormGated, RMSNorm, ShortConvolution
 from xorl.ops.linear_attention.ops.gated_delta_rule import (
@@ -24,6 +31,14 @@ def _sglang_compatible_beta_gate(b_input: torch.Tensor) -> torch.Tensor:
     if beta.dtype != b_input.dtype:
         beta = beta.to(dtype=b_input.dtype).float()
     return beta
+
+
+def _packed_segment_loop_enabled() -> bool:
+    return os.getenv("XORL_GDN_PACKED_SEGMENT_LOOP", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _fused_projection_enabled() -> bool:
+    return os.getenv("XORL_GDN_FUSED_PROJECTIONS", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 class GatedDeltaNet(nn.Module):
@@ -197,12 +212,37 @@ class GatedDeltaNet(nn.Module):
             indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
             hidden_states = index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices).unsqueeze(0)
 
-        q_input = self.q_proj(hidden_states)
-        k_input = self.k_proj(hidden_states)
-        v_input = self.v_proj(hidden_states)
-        a_input = self.a_proj(hidden_states).float()
-        b_input = self.b_proj(hidden_states)
-        gate_input = self.g_proj(hidden_states) if self.use_gate else None
+        if _fused_projection_enabled() and self.use_gate:
+            qkvz_weight = torch.cat(
+                (
+                    self.q_proj.weight,
+                    self.k_proj.weight,
+                    self.v_proj.weight,
+                    self.g_proj.weight,
+                ),
+                dim=0,
+            )
+            qkvz = F.linear(hidden_states, qkvz_weight)
+            q_input, k_input, v_input, gate_input = qkvz.split(
+                (self.key_dim, self.key_dim, self.value_dim, self.value_dim),
+                dim=-1,
+            )
+            ba_weight = torch.cat(
+                (self.b_proj.weight, self.a_proj.weight),
+                dim=0,
+            )
+            b_input, a_input = F.linear(hidden_states, ba_weight).split(
+                (self.num_v_heads, self.num_v_heads),
+                dim=-1,
+            )
+            a_input = a_input.float()
+        else:
+            q_input = self.q_proj(hidden_states)
+            k_input = self.k_proj(hidden_states)
+            v_input = self.v_proj(hidden_states)
+            a_input = self.a_proj(hidden_states).float()
+            b_input = self.b_proj(hidden_states)
+            gate_input = self.g_proj(hidden_states) if self.use_gate else None
 
         if self.use_short_conv:
             conv_state_q = conv_state_k = conv_state_v = None
@@ -251,18 +291,55 @@ class GatedDeltaNet(nn.Module):
         recurrent_state = last_state["recurrent_state"] if last_state is not None else None
 
         if mode == "chunk":
-            o, recurrent_state = chunk_gated_delta_rule(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                initial_state=recurrent_state,
-                output_final_state=bool(use_cache),
-                cu_seqlens=cu_seqlens,
-                use_qk_l2norm_in_kernel=True,
-                cp_context=cp_context,
-            )
+            backend = get_gdn_backend()
+            chunk_fn = chunk_gated_delta_rule
+            if backend == "flashqla":
+                if self.head_k_dim != 128 or self.head_v_dim != 128:
+                    warn_cp_fallback_once()
+                elif cp_context is not None:
+                    chunk_fn = flashqla_chunk_gated_delta_rule_cp
+                else:
+                    chunk_fn = flashqla_chunk_gated_delta_rule
+
+            if (
+                _packed_segment_loop_enabled()
+                and cu_seqlens is not None
+                and cp_context is None
+                and recurrent_state is None
+                and not use_cache
+            ):
+                outputs: list[torch.Tensor] = []
+                for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist(), strict=False):
+                    if end <= start:
+                        continue
+                    seg_o, _ = chunk_fn(
+                        q=q[:, start:end],
+                        k=k[:, start:end],
+                        v=v[:, start:end],
+                        g=g[:, start:end],
+                        beta=beta[:, start:end],
+                        initial_state=None,
+                        output_final_state=False,
+                        cu_seqlens=None,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                    outputs.append(seg_o)
+                o = torch.cat(outputs, dim=1) if outputs else v.new_zeros(v.shape)
+            else:
+                chunk_kwargs = dict(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    initial_state=recurrent_state,
+                    output_final_state=bool(use_cache),
+                    cu_seqlens=cu_seqlens,
+                    use_qk_l2norm_in_kernel=True,
+                )
+                if cp_context is not None:
+                    chunk_kwargs["cp_context"] = cp_context
+                o, recurrent_state = chunk_fn(**chunk_kwargs)
         elif mode == "fused_recurrent":
             o, recurrent_state = fused_recurrent_gated_delta_rule(
                 q=q,

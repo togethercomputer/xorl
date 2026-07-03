@@ -80,6 +80,29 @@ def test_eager_z_loss_matches_reference(inputs):
     assert_close(out.loss, ce_ref + coef * z_ref)
 
 
+def test_causallm_logprob_temperature_matches_scaled_logits(inputs):
+    hidden_states, weight, labels = inputs
+    temperature = 0.7
+
+    out = causallm_loss_function(
+        hidden_states=hidden_states,
+        weight=weight,
+        labels=labels,
+        ce_mode="eager",
+        return_per_token=True,
+        logprob_temperature=temperature,
+    )
+
+    logits = (hidden_states.reshape(-1, hidden_states.size(-1)) @ weight.t()).float() / temperature
+    expected_ce = torch.nn.functional.cross_entropy(
+        logits,
+        labels.reshape(-1),
+        reduction="none",
+        ignore_index=-100,
+    ).view_as(labels)
+    assert_close(out.per_token_logprobs, -expected_ce)
+
+
 def test_eager_no_z_loss_when_coef_zero(inputs):
     hidden_states, weight, labels = inputs
     ce_ref = _reference_ce_loss(hidden_states, weight, labels)

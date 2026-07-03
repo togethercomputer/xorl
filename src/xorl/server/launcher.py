@@ -169,6 +169,10 @@ def run_orchestrator(
     packing_strategy: str = "sequential",
     on_oversized: str = "error",
     dp_size: int = 1,
+    r3_payload_transport: str = "inline",
+    r3_payload_dir: Optional[str] = None,
+    r3_payload_keep: bool = False,
+    r3_payload_namespace_prefix: Optional[str] = None,
 ):
     """
     Run the Orchestrator in a separate process.
@@ -224,11 +228,17 @@ def run_orchestrator(
             packing_strategy=packing_strategy,
             on_oversized=on_oversized,
             dp_size=dp_size,
+            output_dir=output_dir,
+            r3_payload_transport=r3_payload_transport,
+            r3_payload_dir=r3_payload_dir,
+            r3_payload_keep=r3_payload_keep,
+            r3_payload_namespace_prefix=r3_payload_namespace_prefix,
         )
         logger.info(
             f"Orchestrator initialized successfully (operation_timeout={operation_timeout}s, "
             f"packing_strategy={packing_strategy}, on_oversized={on_oversized}, "
-            f"pad_to_multiple_of={pad_to_multiple_of}, dp_size={dp_size})"
+            f"pad_to_multiple_of={pad_to_multiple_of}, dp_size={dp_size}, "
+            f"r3_payload_transport={r3_payload_transport})"
         )
 
         logger.info("Starting Orchestrator...")
@@ -443,6 +453,20 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
             else:
                 flat_config[k] = v
 
+        # zorl.* keys use a prefixed flat representation in ServerArguments
+        _zorl_key_map = {
+            "enabled": "enable_zorl",
+            "b_sigma": "zorl_b_sigma",
+            "num_perturbation_pairs": "zorl_num_perturbation_pairs",
+            "a_refresh_interval": "zorl_a_refresh_interval",
+            "antithetic_sampling": "zorl_antithetic_sampling",
+            "a_init": "zorl_a_init",
+            "seed": "zorl_seed",
+        }
+        for nested_key, flat_key in _zorl_key_map.items():
+            if nested_key in config.get("zorl", {}):
+                flat_config[flat_key] = config["zorl"][nested_key]
+
         # data.* — only a few fields are relevant for the server
         data_config = config.get("data", {})
         if "sample_packing_sequence_len" not in flat_config:
@@ -620,6 +644,10 @@ class Launcher:
         self.packing_strategy = "sequential"
         self.on_oversized = "error"
         self.packing_dp_size = 1
+        self.r3_payload_transport = "inline"
+        self.r3_payload_dir: Optional[str] = None
+        self.r3_payload_keep = False
+        self.r3_payload_namespace_prefix: Optional[str] = None
         self.server_overrides = server_overrides or {}
         # Belt-and-suspenders: even when callers bypass main() (tests, embedders),
         # any override we propagate must be a valid ServerArguments field.
@@ -735,12 +763,24 @@ class Launcher:
             pp_size = max(1, self.server_args.pipeline_parallel_size)
             total_gpus = self.server_args.get_total_gpus()
             self.packing_dp_size = max(1, total_gpus // (cp_size * pp_size))
+            self.r3_payload_transport = self.server_args.r3_payload_transport
+            self.r3_payload_dir = self.server_args.r3_payload_dir
+            self.r3_payload_keep = self.server_args.r3_payload_keep
+            self.r3_payload_namespace_prefix = self.server_args.r3_payload_namespace_prefix
             logger.info(
                 f"Using packing config: seq_len={self.sample_packing_sequence_len}, enabled={self.enable_packing}, "
                 f"strategy={self.packing_strategy}, on_oversized={self.on_oversized}, "
                 f"pad_to_multiple_of={self.pad_to_multiple_of}, "
                 f"dp_size={self.packing_dp_size} (total_gpus={total_gpus}, cp_size={cp_size}, pp_size={pp_size})"
             )
+            if self.r3_payload_transport != "inline":
+                logger.info(
+                    "External R3 payload transport enabled: transport=%s dir=%s keep_payloads=%s namespace_prefix=%s",
+                    self.r3_payload_transport,
+                    self.r3_payload_dir,
+                    self.r3_payload_keep,
+                    self.r3_payload_namespace_prefix,
+                )
 
         # Output directory - prefer from ServerArguments if available
         if self.server_args:
@@ -774,6 +814,7 @@ class Launcher:
                     base_model=self.base_model or self.server_args.model_path,
                     train_config=config_dict.get("train", {}),
                     lora_config=self.server_lora_config,
+                    zorl_config=config_dict.get("zorl", {}),
                 )
                 logger.info(
                     "Using default multi-adapter session spec: "
@@ -1254,6 +1295,10 @@ class Launcher:
                         self.packing_strategy,
                         self.on_oversized,
                         self.packing_dp_size,
+                        self.r3_payload_transport,
+                        self.r3_payload_dir,
+                        self.r3_payload_keep,
+                        self.r3_payload_namespace_prefix,
                     ),
                     name="Orchestrator",
                 )

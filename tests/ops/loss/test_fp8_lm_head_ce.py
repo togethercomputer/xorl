@@ -77,6 +77,55 @@ def test_compute_per_token_ce_lm_head_fp32_bypasses_module():
     torch.testing.assert_close(got, expected)
 
 
+def test_compute_per_token_ce_applies_logprob_temperature():
+    torch.manual_seed(2)
+    hidden = torch.randn(5, 4)
+    labels = torch.tensor([0, 1, -100, 2, 3])
+    weight = torch.randn(6, 4)
+
+    got = compute_per_token_ce(
+        hidden,
+        weight,
+        labels,
+        ignore_index=-100,
+        ce_mode="eager",
+        logprob_temperature=0.7,
+    )
+    expected = F.cross_entropy(
+        (hidden @ weight.t()).float() / 0.7,
+        labels,
+        reduction="none",
+        ignore_index=-100,
+    )
+
+    torch.testing.assert_close(got, expected)
+
+
+def test_causallm_loss_applies_logprob_temperature_to_per_token_logprobs():
+    torch.manual_seed(3)
+    hidden = torch.randn(1, 5, 4)
+    labels = torch.tensor([[0, 1, -100, 2, 3]])
+    weight = torch.randn(6, 4)
+
+    result = causallm_loss_function(
+        hidden,
+        weight,
+        labels,
+        ignore_index=-100,
+        ce_mode="eager",
+        return_per_token=True,
+        logprob_temperature=0.7,
+    )
+    expected_ce = F.cross_entropy(
+        (hidden.reshape(-1, 4) @ weight.t()).float() / 0.7,
+        labels.reshape(-1),
+        reduction="none",
+        ignore_index=-100,
+    )
+
+    torch.testing.assert_close(result.per_token_logprobs, -expected_ce.view_as(labels))
+
+
 def test_compute_per_token_ce_lm_head_fp32_bypasses_module_with_tp_group(monkeypatch):
     _patch_identity_tp_collectives(monkeypatch)
     torch.manual_seed(4)

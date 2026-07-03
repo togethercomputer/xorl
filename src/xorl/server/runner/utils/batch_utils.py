@@ -13,9 +13,243 @@ from typing import Any, Callable, Dict, Optional
 import torch
 
 from xorl.distributed.parallel_state import get_parallel_state
+from xorl.utils.seqlen_pos_transform_utils import pos2culen
 
 
 logger = logging.getLogger(__name__)
+
+
+PACKED_ROW_BATCH_METADATA_KEYS = {
+    "request_id",
+    "batch_id",
+    "num_samples",
+    "packed_row_source_batch_ids",
+    "packed_row_source_group_size",
+    "packed_row_source_num_samples",
+    "packed_row_source_request_ids",
+    "packed_row_source_token_spans",
+    "_r3_sample_lengths",
+    "_shifted",
+    "cu_seq_lens_q",
+    "cu_seq_lens_k",
+    "max_length_q",
+    "max_length_k",
+}
+
+
+def positive_int_param(value: Any, *, name: str, default: int = 1) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer >= 1, not a bool")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer >= 1, got {value!r}") from exc
+    if parsed < 1:
+        raise ValueError(f"{name} must be >= 1, got {parsed}")
+    return parsed
+
+
+def _is_sequence_row(value: Any, row_len: int) -> bool:
+    return isinstance(value, list) and len(value) == 1 and isinstance(value[0], list) and len(value[0]) == row_len
+
+
+def packed_row_sequence_keys(batch: Dict[str, Any]) -> set[str] | None:
+    input_rows = batch.get("input_ids")
+    if not isinstance(input_rows, list) or len(input_rows) != 1 or not isinstance(input_rows[0], list):
+        return None
+    row_len = len(input_rows[0])
+    sequence_keys: set[str] = set()
+    for key, value in batch.items():
+        if key in PACKED_ROW_BATCH_METADATA_KEYS:
+            continue
+        if _is_sequence_row(value, row_len):
+            sequence_keys.add(key)
+            continue
+        if isinstance(value, (str, int, float, bool, type(None))):
+            continue
+        return None
+    required = {"input_ids", "labels", "position_ids"}
+    if not required.issubset(sequence_keys):
+        return None
+    return sequence_keys
+
+
+def can_batch_packed_rows(rows: list[Dict[str, Any]]) -> tuple[bool, set[str]]:
+    if not rows:
+        return False, set()
+    first_keys = packed_row_sequence_keys(rows[0])
+    if first_keys is None:
+        return False, set()
+    scalar_keys = set(rows[0]) - first_keys - PACKED_ROW_BATCH_METADATA_KEYS
+    for row in rows[1:]:
+        row_keys = packed_row_sequence_keys(row)
+        if row_keys != first_keys:
+            return False, set()
+        if set(row) - row_keys - PACKED_ROW_BATCH_METADATA_KEYS != scalar_keys:
+            return False, set()
+        for key in scalar_keys:
+            if row.get(key) != rows[0].get(key):
+                return False, set()
+    return True, first_keys
+
+
+def _coerce_int(value: Any, default: int) -> int:
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            return default
+        value = value.detach().reshape(-1)[0].item()
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_source_list(value: Any) -> list[Any] | None:
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().tolist()
+    if not isinstance(value, list):
+        return None
+    return value
+
+
+def _row_token_len(row: Dict[str, Any]) -> int:
+    input_rows = row.get("input_ids")
+    if isinstance(input_rows, torch.Tensor):
+        if input_rows.ndim == 0:
+            return int(input_rows.numel())
+        return int(input_rows.shape[-1])
+    if isinstance(input_rows, list) and input_rows:
+        first_row = input_rows[0]
+        if isinstance(first_row, list):
+            return len(first_row)
+        return len(input_rows)
+    return 0
+
+
+def _source_token_spans(row: Dict[str, Any], token_offset: int) -> list[list[int]]:
+    existing = _coerce_source_list(row.get("packed_row_source_token_spans"))
+    if existing is None:
+        row_len = _row_token_len(row)
+        return [[token_offset, token_offset + row_len]]
+
+    spans: list[list[int]] = []
+    for span in existing:
+        if not isinstance(span, list) or len(span) != 2:
+            continue
+        start = _coerce_int(span[0], 0)
+        end = _coerce_int(span[1], start)
+        spans.append([token_offset + start, token_offset + end])
+    return spans
+
+
+def packed_row_source_provenance(row: Dict[str, Any], *, fallback_batch_id: int, token_offset: int = 0) -> Dict[str, Any]:
+    existing_batch_ids = _coerce_source_list(row.get("packed_row_source_batch_ids"))
+    source_batch_ids = (
+        [_coerce_int(value, fallback_batch_id) for value in existing_batch_ids]
+        if existing_batch_ids is not None
+        else [_coerce_int(row.get("batch_id"), fallback_batch_id)]
+    )
+
+    existing_request_ids = _coerce_source_list(row.get("packed_row_source_request_ids"))
+    source_request_ids = (
+        [str(value) for value in existing_request_ids]
+        if existing_request_ids is not None
+        else [str(row.get("request_id", ""))]
+    )
+
+    existing_num_samples = _coerce_source_list(row.get("packed_row_source_num_samples"))
+    source_num_samples = (
+        [_coerce_int(value, 0) for value in existing_num_samples]
+        if existing_num_samples is not None
+        else [_coerce_int(row.get("num_samples"), 0)]
+    )
+
+    return {
+        "packed_row_source_batch_ids": source_batch_ids,
+        "packed_row_source_request_ids": source_request_ids,
+        "packed_row_source_num_samples": source_num_samples,
+        "packed_row_source_token_spans": _source_token_spans(row, token_offset),
+        "packed_row_source_group_size": len(source_batch_ids),
+    }
+
+
+def merge_packed_row_group(rows: list[Dict[str, Any]], batch_id: int, sequence_keys: set[str]) -> Dict[str, Any]:
+    source_batch_ids: list[int] = []
+    source_request_ids: list[str] = []
+    source_num_samples: list[int] = []
+    source_token_spans: list[list[int]] = []
+    token_offset = 0
+    for fallback_batch_id, row in enumerate(rows):
+        provenance = packed_row_source_provenance(
+            row,
+            fallback_batch_id=_coerce_int(row.get("batch_id"), fallback_batch_id),
+            token_offset=token_offset,
+        )
+        source_batch_ids.extend(provenance["packed_row_source_batch_ids"])
+        source_request_ids.extend(provenance["packed_row_source_request_ids"])
+        source_num_samples.extend(provenance["packed_row_source_num_samples"])
+        source_token_spans.extend(provenance["packed_row_source_token_spans"])
+        token_offset += _row_token_len(row)
+
+    merged: Dict[str, Any] = {
+        "request_id": rows[0]["request_id"],
+        "batch_id": batch_id,
+        "num_samples": sum(int(row.get("num_samples", 0)) for row in rows),
+        "packed_row_source_batch_ids": source_batch_ids,
+        "packed_row_source_request_ids": source_request_ids,
+        "packed_row_source_num_samples": source_num_samples,
+        "packed_row_source_token_spans": source_token_spans,
+        "packed_row_source_group_size": len(source_batch_ids),
+        "_r3_sample_lengths": [length for row in rows for length in row.get("_r3_sample_lengths", [])],
+    }
+    if "_shifted" in rows[0]:
+        merged["_shifted"] = all(bool(row.get("_shifted", False)) for row in rows)
+
+    for key in sorted(sequence_keys):
+        merged[key] = [[item for row in rows for item in row[key][0]]]
+
+    for key in set(rows[0]) - sequence_keys - PACKED_ROW_BATCH_METADATA_KEYS:
+        merged[key] = rows[0][key]
+
+    if "position_ids" in merged:
+        position_ids_tensor = torch.tensor(merged["position_ids"], dtype=torch.long)
+        cu_seqlens = pos2culen(position_ids_tensor)
+        merged["cu_seq_lens_q"] = cu_seqlens.tolist()
+        merged["cu_seq_lens_k"] = cu_seqlens.tolist()
+        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_length = int(lengths.max().item()) if lengths.numel() else 0
+        merged["max_length_q"] = max_length
+        merged["max_length_k"] = max_length
+
+    return merged
+
+
+def batch_packed_rows(batches: list[Dict[str, Any]], row_batch_size: int) -> list[Dict[str, Any]]:
+    if row_batch_size <= 1 or len(batches) <= 1:
+        return batches
+
+    grouped: list[Dict[str, Any]] = []
+    idx = 0
+    while idx < len(batches):
+        rows = batches[idx : idx + row_batch_size]
+        can_batch, sequence_keys = can_batch_packed_rows(rows)
+        if can_batch:
+            grouped.append(merge_packed_row_group(rows, len(grouped), sequence_keys))
+            idx += len(rows)
+        else:
+            row = dict(batches[idx])
+            row["batch_id"] = len(grouped)
+            row.update(
+                packed_row_source_provenance(
+                    batches[idx],
+                    fallback_batch_id=_coerce_int(batches[idx].get("batch_id"), idx),
+                )
+            )
+            grouped.append(row)
+            idx += 1
+    return grouped
 
 
 def ep_duplicate_batches_enabled() -> bool:
@@ -41,12 +275,14 @@ def batch_slice_rank_and_size(
 ) -> tuple[int, int]:
     """Return (slice_rank, slice_count) for request batch dispatch.
 
-    Every rank gets a distinct batch slice; ranks that shard the same sequence
-    (CP/SP) or the same pipeline stage share one. With EP enabled the slice is
-    derived from the stage-local rank, so ranks within an EP group also see
-    distinct data. Set XORL_SERVER_EP_DUPLICATE_BATCHES=1 to restore the legacy
-    one-duplicated-slice-per-EP-group dispatch (see ep_duplicate_batches_enabled).
+    Every logical data replica gets a distinct batch slice; ranks that shard
+    the same sample via FSDP, CP/SP, TP, or the same pipeline stage share one.
+    With EP enabled the slice is derived from the stage-local rank, so ranks
+    within an EP group also see distinct data. Set
+    XORL_SERVER_EP_DUPLICATE_BATCHES=1 to restore the legacy one-duplicated-
+    slice-per-EP-group dispatch (see ep_duplicate_batches_enabled).
     """
+    tp_size = max(1, int(getattr(parallel_state, "tp_size", 1)))
     if getattr(parallel_state, "ep_enabled", False):
         ranks_per_pp_stage = max(1, world_size // max(1, pp_size))
         local_stage_rank = rank % ranks_per_pp_stage
@@ -68,12 +304,27 @@ def batch_slice_rank_and_size(
             ep_fsdp_rank = min(local_stage_rank // ep_size, ep_fsdp_size - 1)
             return ep_fsdp_rank, ep_fsdp_size
 
-        denom = max(1, cp_size)
+        denom = max(1, cp_size * tp_size)
         slice_count = max(1, ranks_per_pp_stage // denom)
         return min(local_stage_rank // denom, slice_count - 1), slice_count
 
-    dp_size = max(1, world_size // max(1, cp_size * pp_size))
-    dp_rank = min(rank // max(1, cp_size * pp_size), dp_size - 1)
+    if hasattr(parallel_state, "dp_replicate_size"):
+        try:
+            replicate_size = max(1, int(getattr(parallel_state, "dp_replicate_size")))
+            if replicate_size == 1:
+                return 0, 1
+            return int(getattr(parallel_state, "dp_replicate_rank")), replicate_size
+        except Exception:
+            logger.debug("Could not read dp_replicate rank/size; falling back to dp rank/size", exc_info=True)
+
+    try:
+        return int(parallel_state.dp_rank), max(1, int(parallel_state.dp_size))
+    except Exception:
+        ranks_per_pp_stage = max(1, world_size // max(1, pp_size))
+        local_stage_rank = rank % ranks_per_pp_stage
+        denom = max(1, cp_size * tp_size)
+        dp_size = max(1, ranks_per_pp_stage // denom)
+        dp_rank = min(local_stage_rank // denom, dp_size - 1)
     return dp_rank, dp_size
 
 
@@ -131,6 +382,15 @@ def convert_batch_to_tensors(batch: Dict[str, Any], rank: int = 0) -> Dict[str, 
     int32_fields = {"cu_seq_lens_q", "cu_seq_lens_k"}
 
     for key, value in batch.items():
+        if key in {
+            "packed_row_source_batch_ids",
+            "packed_row_source_group_size",
+            "packed_row_source_num_samples",
+            "packed_row_source_request_ids",
+            "packed_row_source_token_spans",
+        }:
+            converted_batch[key] = value
+            continue
         if isinstance(value, list):
             try:
                 # Determine dtype based on field name

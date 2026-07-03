@@ -282,9 +282,7 @@ class GptOssAttention(nn.Module):
         if impl == "flash_attention_3":
             return self._flash_attention_3_with_sinks
         if impl == "flash_attention_4":
-            raise NotImplementedError(
-                "GPT-OSS attention sinks are not wired through the FA4 (CUTE) backend. Use flash_attention_3 or eager."
-            )
+            return self._flash_attention_4_with_sinks
         if impl in ATTENTION_FUNCTIONS:
             raise NotImplementedError(
                 f"GPT-OSS attention sinks are not wired through the {impl!r} backend. Use flash_attention_3 or eager."
@@ -364,6 +362,65 @@ class GptOssAttention(nn.Module):
                 softmax_scale=scaling,
                 softcap=softcap if softcap is not None else 0.0,
             )
+        return out, None
+
+    def _flash_attention_4_with_sinks(
+        self,
+        module: nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        dropout: float = 0.0,
+        scaling: Optional[float] = None,
+        sliding_window: Optional[int] = None,
+        softcap: Optional[float] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, None]:
+        """FA4 forward using the native learned-sink kernel argument."""
+        from flash_attn.cute import (  # noqa: PLC0415
+            flash_attn_func as fa4_flash_attn_func,
+        )
+        from flash_attn.cute import (
+            flash_attn_varlen_func as fa4_flash_attn_varlen_func,
+        )
+
+        causal = getattr(module, "is_causal", True)
+        if sliding_window is not None:
+            window_size = (sliding_window, 0 if causal else sliding_window)
+        else:
+            window_size = (None, None)
+
+        common = dict(
+            softmax_scale=scaling,
+            causal=causal,
+            window_size=window_size,
+            learnable_sink=self._local_sinks().to(device=query.device, dtype=query.dtype),
+            softcap=softcap if softcap is not None else 0.0,
+        )
+        cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)
+        cu_seq_lens_k = kwargs.get("cu_seq_lens_k", None)
+
+        if cu_seq_lens_q is not None and cu_seq_lens_k is not None:
+            cu_seq_lens_q = cu_seq_lens_q.to(torch.int32)
+            cu_seq_lens_k = cu_seq_lens_k.to(torch.int32)
+
+            def _flatten(x):
+                return x.squeeze(0) if x.size(0) == 1 else x.reshape(-1, x.size(-2), x.size(-1))
+
+            out, _ = fa4_flash_attn_varlen_func(
+                _flatten(query),
+                _flatten(key),
+                _flatten(value),
+                cu_seqlens_q=cu_seq_lens_q,
+                cu_seqlens_k=cu_seq_lens_k,
+                max_seqlen_q=kwargs.get("max_length_q"),
+                max_seqlen_k=kwargs.get("max_length_k"),
+                **common,
+            )
+            out = out.unsqueeze(0)
+        else:
+            out, _ = fa4_flash_attn_func(query, key, value, **common)
         return out, None
 
     def _attention_kwargs(self) -> dict:

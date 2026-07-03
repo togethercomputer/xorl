@@ -41,6 +41,17 @@ def silu_swiglu(gate_out: torch.Tensor, up_out: torch.Tensor) -> torch.Tensor:
     return F.silu(gate_out) * up_out
 
 
+def sglang_silu_swiglu(gate_out: torch.Tensor, up_out: torch.Tensor) -> torch.Tensor:
+    """SGLang/FlashInfer BF16 SiLU-and-mul contract.
+
+    SGLang's CUDA kernel loads BF16 operands as fp32, computes SiLU and the
+    multiply in fp32, then casts once at the output.
+    """
+    output_dtype = gate_out.dtype
+    gate_f32 = gate_out.to(torch.float32)
+    return ((gate_f32 * torch.sigmoid(gate_f32)) * up_out.to(torch.float32)).to(output_dtype)
+
+
 def gelu_tanh_glu(gate_out: torch.Tensor, up_out: torch.Tensor) -> torch.Tensor:
     """GeGLU (tanh approx): ``gelu_tanh(gate) * up``."""
     return F.gelu(gate_out, approximate="tanh") * up_out
@@ -123,3 +134,14 @@ def apply_moe_activation(
     if hidden_act == "relu2":
         return relu2(gate_out, up_out)
     raise ValueError(f"Unknown hidden_act={hidden_act!r}. Supported: {sorted(SUPPORTED_HIDDEN_ACTS)}")
+
+
+def apply_sglang_moe_activation(
+    hidden_act: str,
+    gate_out: torch.Tensor,
+    up_out: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the SGLang fused-MoE activation contract for parity diagnostics."""
+    if hidden_act == "silu":
+        return sglang_silu_swiglu(gate_out, up_out)
+    return apply_moe_activation(hidden_act, gate_out, up_out)

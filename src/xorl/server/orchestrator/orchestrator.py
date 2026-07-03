@@ -166,6 +166,7 @@ Key Design Principles:
 
 import asyncio
 import logging
+import os
 import queue
 import threading
 import time
@@ -220,6 +221,11 @@ class Orchestrator:
         packing_strategy: str = "sequential",
         on_oversized: str = "error",
         dp_size: int = 1,
+        output_dir: str = "outputs",
+        r3_payload_transport: str = "inline",
+        r3_payload_dir: Optional[str] = None,
+        r3_payload_keep: bool = False,
+        r3_payload_namespace_prefix: Optional[str] = None,
         input_queue_maxsize: int = 1000,
         output_queue_maxsize: int = 1000,
         train_config: Optional[Dict[str, Any]] = None,
@@ -244,6 +250,11 @@ class Orchestrator:
             packing_strategy: Bin-packing strategy (see packing.PACKING_STRATEGIES).
             on_oversized: Oversized-sample policy (see packing.ON_OVERSIZED_MODES).
             dp_size: Distinct dispatcher batch slices, used by "balanced_dp".
+            output_dir: Output directory for logs/checkpoints.
+            r3_payload_transport: "inline", "mooncake", or explicit "filesystem" fallback.
+            r3_payload_dir: Shared directory for filesystem fallback payload refs.
+            r3_payload_keep: Retain external R3 payloads after backend completion.
+            r3_payload_namespace_prefix: Optional Mooncake key namespace prefix.
             input_queue_maxsize: Maximum size of input queue
             output_queue_maxsize: Maximum size of output queue
             train_config: Training configuration for data processing
@@ -282,6 +293,11 @@ class Orchestrator:
             packing_strategy=packing_strategy,
             on_oversized=on_oversized,
             dp_size=dp_size,
+            r3_payload_transport=r3_payload_transport,
+            r3_payload_dir=r3_payload_dir
+            or (os.path.join(output_dir, "routing_payloads") if r3_payload_transport == "filesystem" else None),
+            r3_payload_keep=r3_payload_keep,
+            r3_payload_namespace_prefix=r3_payload_namespace_prefix,
         )
 
         # Threading queues
@@ -690,6 +706,9 @@ class Orchestrator:
         "load_adapter_state": "execute_load_adapter_state",
         "get_adapter_info": "execute_get_adapter_info",
         "kill_session": "execute_kill_session",
+        "start_zorl_generation": "execute_start_zorl_generation",
+        "apply_zorl_rewards": "execute_apply_zorl_rewards",
+        "abort_zorl_generation": "execute_abort_zorl_generation",
     }
 
     def _process_engine_step(self) -> bool:

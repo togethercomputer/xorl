@@ -40,11 +40,17 @@ await executor.stop()
 
 import logging
 import math
+import os
+import pickle
+import shutil
 import time
-from typing import Any, Callable, Dict, Union
+import uuid
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
 
+from xorl.data.constants import IGNORE_INDEX
 from xorl.server.backend import Backend
 from xorl.server.orchestrator.packing import pack_samples, unpack_per_token_outputs, validate_micro_batches
 from xorl.server.protocol.api_orchestrator import OrchestratorOutputs, OrchestratorRequest, OutputType
@@ -60,13 +66,83 @@ from xorl.server.protocol.operations import (
     SaveLoraOnlyData,
     SaveStateData,
     SyncWeightsData,
+    ZORLAbortGenerationData,
+    ZORLApplyRewardsData,
+    ZORLStartGenerationData,
 )
+from xorl.server.side_payloads import (
+    MooncakeSidePayloadStore,
+    R3PayloadCleanup,
+    cleanup_r3_mooncake_payloads,
+    put_r3_mooncake_payload_refs,
+)
+from xorl.server.runner.utils import batch_packed_rows
+from xorl.utils.seqlen_pos_transform_utils import pos2culen
 
 
 logger = logging.getLogger(__name__)
 
 
-FORWARD_BACKWARD_RESULT_PREFIXES = ("forward_backward_",)
+FORWARD_BACKWARD_RESULT_PREFIXES = ("forward_backward_", "server_profile_")
+FORWARD_BACKWARD_RESULT_KEYS = {
+    "backward_compute_time",
+    "forward_compute_time",
+}
+ROUTING_PAYLOAD_REF_KEY = "__xorl_routing_payload_ref__"
+
+
+def _truthy_env(name: str) -> bool:
+    return os.getenv(name, "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _r3_verbose_logging_enabled() -> bool:
+    return _truthy_env("XORL_R3_VERBOSE_LOGGING")
+
+# Metadata and precomputed attention fields that should not be stacked as
+# sequence-aligned lists when grouping packed rows.
+_ROW_BATCH_METADATA_KEYS = {
+    "request_id",
+    "batch_id",
+    "num_samples",
+    "_r3_sample_lengths",
+    "_shifted",
+    "cu_seq_lens_q",
+    "cu_seq_lens_k",
+    "max_length_q",
+    "max_length_k",
+}
+
+
+def _positive_int_param(value: Any, *, name: str, default: int = 1) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer >= 1, not a bool")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer >= 1, got {value!r}") from exc
+    if parsed < 1:
+        raise ValueError(f"{name} must be >= 1, got {parsed}")
+    return parsed
+
+
+def _is_sequence_row(value: Any, row_len: int) -> bool:
+    return isinstance(value, list) and len(value) == 1 and isinstance(value[0], list) and len(value[0]) == row_len
+
+
+def _pad_sequence_value(key: str, seq: list[Any], target_len: int) -> list[Any]:
+    pad_len = target_len - len(seq)
+    if pad_len <= 0:
+        return list(seq)
+    if key == "labels":
+        return list(seq) + [IGNORE_INDEX] * pad_len
+    if key == "position_ids":
+        return list(seq) + list(range(pad_len))
+    if seq and isinstance(seq[0], list):
+        width = len(seq[0])
+        return list(seq) + [[0.0] * width for _ in range(pad_len)]
+    return list(seq) + [0] * pad_len
 
 
 # ============================================================================
@@ -93,6 +169,13 @@ class RequestProcessor:
         packing_strategy: str = "sequential",
         on_oversized: str = "error",
         dp_size: int = 1,
+        r3_payload_transport: str = "inline",
+        r3_payload_dir: Optional[str] = None,
+        r3_payload_keep: bool = False,
+        r3_payload_namespace_prefix: Optional[str] = None,
+        routing_payload_dir: Optional[str] = None,
+        keep_routing_payloads: Optional[bool] = None,
+        routing_payload_store: Optional[MooncakeSidePayloadStore] = None,
     ):
         """
         Initialize RequestProcessor.
@@ -110,6 +193,13 @@ class RequestProcessor:
                 (see packing.ON_OVERSIZED_MODES). Default "error" (no silent drop).
             dp_size: Number of distinct dispatcher batch slices
                 (world_size // (cp_size·pp_size)); used by the "balanced_dp" strategy.
+            r3_payload_transport: "inline", "mooncake", or explicit "filesystem" fallback.
+            r3_payload_dir: Shared directory used only by the explicit filesystem fallback.
+            r3_payload_keep: If True, do not delete side payloads after the backend call.
+            r3_payload_namespace_prefix: Optional Mooncake namespace prefix for R3 payload keys.
+            routing_payload_dir: Backward-compatible alias for filesystem transport.
+            keep_routing_payloads: Backward-compatible alias for r3_payload_keep.
+            routing_payload_store: Optional injected Mooncake side-payload store for tests.
         """
         self.backend = backend
         self.sample_packing_sequence_len = sample_packing_sequence_len
@@ -119,6 +209,26 @@ class RequestProcessor:
         self.packing_strategy = packing_strategy
         self.on_oversized = on_oversized
         self.dp_size = max(1, int(dp_size))
+        if routing_payload_dir is not None:
+            if r3_payload_transport != "inline":
+                raise ValueError("routing_payload_dir alias cannot be combined with r3_payload_transport")
+            r3_payload_transport = "filesystem"
+            r3_payload_dir = routing_payload_dir
+        if keep_routing_payloads is not None:
+            r3_payload_keep = bool(keep_routing_payloads)
+        if r3_payload_transport not in {"inline", "mooncake", "filesystem"}:
+            raise ValueError(f"Unsupported r3_payload_transport {r3_payload_transport!r}")
+        if r3_payload_transport == "inline" and r3_payload_keep:
+            raise ValueError("r3_payload_keep requires r3_payload_transport != 'inline'")
+        if r3_payload_transport != "filesystem" and r3_payload_dir:
+            raise ValueError("r3_payload_dir is only valid with r3_payload_transport='filesystem'")
+        if r3_payload_transport != "mooncake" and r3_payload_namespace_prefix:
+            raise ValueError("r3_payload_namespace_prefix is only valid with r3_payload_transport='mooncake'")
+        self.r3_payload_transport = r3_payload_transport
+        self.r3_payload_dir = Path(r3_payload_dir) if r3_payload_dir else None
+        self.r3_payload_keep = bool(r3_payload_keep)
+        self.r3_payload_namespace_prefix = r3_payload_namespace_prefix
+        self._routing_payload_store = routing_payload_store
 
         # Statistics
         self.total_operations = 0
@@ -131,6 +241,205 @@ class RequestProcessor:
             f"pad_to_multiple_of={self.pad_to_multiple_of} (base={pad_to_multiple_of}, cp_size={cp_size}), "
             f"strategy={packing_strategy}, on_oversized={on_oversized}, dp_size={self.dp_size}"
         )
+        if self.r3_payload_transport != "inline":
+            logger.info(
+                "External R3 routing payload transport enabled: transport=%s keep_payloads=%s",
+                self.r3_payload_transport,
+                self.r3_payload_keep,
+            )
+
+    @staticmethod
+    def _safe_request_id(request_id: str) -> str:
+        return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(request_id))
+
+    def _externalize_routing_payloads(
+        self,
+        request_id: str,
+        routed_experts: Optional[List[Any]],
+        routed_expert_logits: Optional[List[Any]],
+    ) -> tuple[Optional[Any], Optional[Any], Optional[Union[Path, R3PayloadCleanup]]]:
+        if self.r3_payload_transport == "inline" or (routed_experts is None and routed_expert_logits is None):
+            return routed_experts, routed_expert_logits, None
+        if self.r3_payload_transport == "mooncake":
+            if self._routing_payload_store is None:
+                self._routing_payload_store = MooncakeSidePayloadStore()
+            store = self._routing_payload_store
+            refs = put_r3_mooncake_payload_refs(
+                request_id=request_id,
+                routed_experts=routed_experts,
+                routed_expert_logits=routed_expert_logits,
+                store=store,
+                namespace_prefix=self.r3_payload_namespace_prefix,
+            )
+            log_fn = logger.info if _r3_verbose_logging_enabled() else logger.debug
+            log_fn(
+                "Externalized R3 routing payload request=%s transport=mooncake routed=%s routed_weights=%s",
+                request_id,
+                len(routed_experts or []),
+                len(routed_expert_logits or []),
+            )
+            return refs
+
+        return self._externalize_routing_payloads_filesystem(request_id, routed_experts, routed_expert_logits)
+
+    def _externalize_routing_payloads_filesystem(
+        self,
+        request_id: str,
+        routed_experts: Optional[List[Any]],
+        routed_expert_logits: Optional[List[Any]],
+    ) -> tuple[Optional[Any], Optional[Any], Optional[Path]]:
+        if self.r3_payload_dir is None:
+            raise ValueError("r3_payload_dir is required for r3_payload_transport='filesystem'")
+        safe_request_id = self._safe_request_id(request_id) or "request"
+        unique_request_id = f"{safe_request_id}.{uuid.uuid4().hex[:12]}"
+        root = self.r3_payload_dir / unique_request_id
+        tmp_root = self.r3_payload_dir / f".{unique_request_id}.tmp.{os.getpid()}"
+
+        try:
+            if tmp_root.exists():
+                shutil.rmtree(tmp_root)
+            tmp_root.mkdir(parents=True, exist_ok=True)
+
+            def _write_items(kind: str, items: Optional[List[Any]]) -> Optional[Dict[str, Any]]:
+                if items is None:
+                    return None
+                item_dir = tmp_root / kind
+                item_dir.mkdir(parents=True, exist_ok=True)
+                for idx, item in enumerate(items):
+                    with (item_dir / f"{idx:06d}.pkl").open("wb") as f:
+                        pickle.dump(item, f, protocol=pickle.HIGHEST_PROTOCOL)
+                return {"dir": str(root / kind), "count": len(items)}
+
+            manifest = {
+                "version": 1,
+                "request_id": str(request_id),
+                "root": str(root),
+                "routed_experts": _write_items("routed_experts", routed_experts),
+                "routed_expert_logits": _write_items("routed_expert_logits", routed_expert_logits),
+            }
+            with (tmp_root / "manifest.pkl").open("wb") as f:
+                pickle.dump(manifest, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+            tmp_root.rename(root)
+        except Exception:
+            shutil.rmtree(tmp_root, ignore_errors=True)
+            raise
+
+        def _ref(kind: str, items: Optional[List[Any]]) -> Optional[Dict[str, Any]]:
+            if items is None:
+                return None
+            return {
+                ROUTING_PAYLOAD_REF_KEY: True,
+                "manifest": str(root / "manifest.pkl"),
+                "kind": kind,
+                "count": len(items),
+            }
+
+        log_fn = logger.info if _r3_verbose_logging_enabled() else logger.debug
+        log_fn(
+            "Externalized R3 routing payload request=%s dir=%s routed=%s routed_weights=%s",
+            request_id,
+            root,
+            len(routed_experts or []),
+            len(routed_expert_logits or []),
+        )
+        return _ref("routed_experts", routed_experts), _ref("routed_expert_logits", routed_expert_logits), root
+
+    def _cleanup_routing_payloads(self, cleanup: Optional[Union[Path, R3PayloadCleanup]]) -> None:
+        if cleanup is None or self.r3_payload_keep:
+            return
+        if isinstance(cleanup, R3PayloadCleanup):
+            cleanup_r3_mooncake_payloads(cleanup)
+            log_fn = logger.info if _r3_verbose_logging_enabled() else logger.debug
+            log_fn("Cleaned external R3 Mooncake routing payload keys")
+            return
+        self._cleanup_routing_payload_dir(cleanup)
+
+    def _cleanup_routing_payload_dir(self, root: Path) -> None:
+        try:
+            shutil.rmtree(root)
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            logger.warning("Failed to clean external R3 routing payload dir %s: %s", root, exc)
+            return
+        log_fn = logger.info if _r3_verbose_logging_enabled() else logger.debug
+        log_fn("Cleaned external R3 routing payload dir %s", root)
+
+    @staticmethod
+    def _packed_row_sequence_keys(batch: Dict[str, Any]) -> set[str] | None:
+        input_rows = batch.get("input_ids")
+        if not isinstance(input_rows, list) or len(input_rows) != 1 or not isinstance(input_rows[0], list):
+            return None
+        row_len = len(input_rows[0])
+        sequence_keys: set[str] = set()
+        for key, value in batch.items():
+            if key in _ROW_BATCH_METADATA_KEYS:
+                continue
+            if _is_sequence_row(value, row_len):
+                sequence_keys.add(key)
+                continue
+            if isinstance(value, (str, int, float, bool, type(None))):
+                continue
+            return None
+        required = {"input_ids", "labels", "position_ids"}
+        if not required.issubset(sequence_keys):
+            return None
+        return sequence_keys
+
+    @classmethod
+    def _can_batch_packed_rows(cls, rows: list[Dict[str, Any]]) -> tuple[bool, set[str]]:
+        if not rows:
+            return False, set()
+        first_keys = cls._packed_row_sequence_keys(rows[0])
+        if first_keys is None:
+            return False, set()
+        scalar_keys = set(rows[0]) - first_keys - _ROW_BATCH_METADATA_KEYS
+        for row in rows[1:]:
+            row_keys = cls._packed_row_sequence_keys(row)
+            if row_keys != first_keys:
+                return False, set()
+            if set(row) - row_keys - _ROW_BATCH_METADATA_KEYS != scalar_keys:
+                return False, set()
+            for key in scalar_keys:
+                if row.get(key) != rows[0].get(key):
+                    return False, set()
+        return True, first_keys
+
+    @classmethod
+    def _merge_packed_row_group(cls, rows: list[Dict[str, Any]], batch_id: int, sequence_keys: set[str]) -> Dict[str, Any]:
+        merged: Dict[str, Any] = {
+            "request_id": rows[0]["request_id"],
+            "batch_id": batch_id,
+            "num_samples": sum(int(row.get("num_samples", 0)) for row in rows),
+            "_r3_sample_lengths": [
+                length for row in rows for length in row.get("_r3_sample_lengths", [])
+            ],
+        }
+        if "_shifted" in rows[0]:
+            merged["_shifted"] = all(bool(row.get("_shifted", False)) for row in rows)
+
+        for key in sorted(sequence_keys):
+            merged[key] = [[item for row in rows for item in row[key][0]]]
+
+        for key in set(rows[0]) - sequence_keys - _ROW_BATCH_METADATA_KEYS:
+            merged[key] = rows[0][key]
+
+        if "position_ids" in merged:
+            position_ids_tensor = torch.tensor(merged["position_ids"], dtype=torch.long)
+            cu_seqlens = pos2culen(position_ids_tensor)
+            merged["cu_seq_lens_q"] = cu_seqlens.tolist()
+            merged["cu_seq_lens_k"] = cu_seqlens.tolist()
+            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            max_length = int(lengths.max().item()) if lengths.numel() else 0
+            merged["max_length_q"] = max_length
+            merged["max_length_k"] = max_length
+
+        return merged
+
+    @classmethod
+    def _batch_packed_rows(cls, batches: list[Dict[str, Any]], row_batch_size: int) -> list[Dict[str, Any]]:
+        return batch_packed_rows(batches, row_batch_size)
 
     # ========================================================================
     # Lifecycle Management
@@ -146,6 +455,8 @@ class RequestProcessor:
         """Stop the executor and its backend."""
         logger.info("Stopping RequestProcessor...")
         await self.backend.stop()
+        if self._routing_payload_store is not None:
+            self._routing_payload_store.close()
         logger.info("RequestProcessor stopped")
 
     def is_ready(self) -> bool:
@@ -185,6 +496,13 @@ class RequestProcessor:
             if not data:
                 raise ValueError("data or datum_list must be provided")
 
+            self._validate_routing_payload_counts(
+                len(data),
+                routed_experts,
+                routed_expert_logits,
+                context="input data",
+            )
+
             if loss_fn == "opd_loss" and loss_fn_params.get("opd_sort_by_teacher", True):
                 order = sorted(range(len(data)), key=lambda i: self._teacher_sort_key(data[i]))
                 data = [data[i] for i in order]
@@ -219,6 +537,7 @@ class RequestProcessor:
                 if routed_expert_logits is not None:
                     routed_expert_logits = [routed_expert_logits[i] for i in datum_order]
 
+            routing_payload_root = None
             if not batches:
                 raise ValueError(
                     f"No batches created from {len(data)} samples. The packer did not produce any valid batches."
@@ -226,6 +545,60 @@ class RequestProcessor:
 
             if not validate_micro_batches(batches):
                 raise ValueError("Invalid batch structure after packing. This may indicate a bug in the packing logic.")
+
+            packed_sample_count = sum(int(batch.get("num_samples", 1)) for batch in batches)
+            self._validate_routing_payload_counts(
+                packed_sample_count,
+                routed_experts,
+                routed_expert_logits,
+                context="packed batches",
+            )
+
+            original_batch_count = len(batches)
+            row_batch_size = _positive_int_param(
+                loss_fn_params.get("opd_packed_row_batch_size", loss_fn_params.get("packed_row_batch_size")),
+                name="opd_packed_row_batch_size",
+                default=1,
+            )
+            if row_batch_size > 1 and (routed_experts is not None or routed_expert_logits is not None):
+                raise ValueError("opd_packed_row_batch_size is not supported with routed_experts replay")
+
+            routed_experts, routed_expert_logits, routing_payload_root = self._externalize_routing_payloads(
+                request.request_id,
+                routed_experts,
+                routed_expert_logits,
+            )
+
+            if row_batch_size > 1:
+                row_batch_scope = str(loss_fn_params.get("opd_packed_row_batch_scope", "rank_local")).lower()
+                if row_batch_scope in {"global", "executor", "orchestrator"}:
+                    batches = self._batch_packed_rows(batches, row_batch_size)
+                    if not validate_micro_batches(batches):
+                        raise ValueError("Invalid batch structure after packed-row batching.")
+                    logger.info(
+                        "Executor-global packed-row batching enabled for %s request %s: %d -> %d backend batches "
+                        "(row_batch_size=%d)",
+                        op_name,
+                        request.request_id,
+                        original_batch_count,
+                        len(batches),
+                        row_batch_size,
+                    )
+                elif row_batch_scope in {"rank_local", "rank-local", "local", "per_rank", "per-rank"}:
+                    logger.info(
+                        "Deferring packed-row batching to rank-local runner slices for %s request %s "
+                        "(executor batches=%d, row_batch_size=%d)",
+                        op_name,
+                        request.request_id,
+                        original_batch_count,
+                        row_batch_size,
+                    )
+                else:
+                    raise ValueError(
+                        "opd_packed_row_batch_scope must be one of "
+                        "rank_local, global, executor, or orchestrator; "
+                        f"got {row_batch_scope!r}"
+                    )
 
             t_packed = time.perf_counter()
             logger.debug(f"Packed {len(data)} samples into {len(batches)} batches")
@@ -242,7 +615,10 @@ class RequestProcessor:
                 request_id=request.request_id,
             )
 
-            result = await backend_method(**kwargs)
+            try:
+                result = await backend_method(**kwargs)
+            finally:
+                self._cleanup_routing_payloads(routing_payload_root)
 
             t_backend = time.perf_counter()
 
@@ -262,6 +638,8 @@ class RequestProcessor:
                 "executor_build_output_s": 0.0,  # Filled after output construction.
                 "executor_total_s": 0.0,  # Filled after output construction.
                 "executor_batches": len(batches),
+                "executor_original_batches": original_batch_count,
+                "executor_packed_row_batch_size": row_batch_size,
                 "executor_samples": len(data),
             }
 
@@ -270,6 +648,8 @@ class RequestProcessor:
                 if key.startswith(("is_", "opd_")):
                     output_dict[key] = result[key]
                 elif key.startswith(FORWARD_BACKWARD_RESULT_PREFIXES):
+                    output_dict[key] = result[key]
+                elif key in FORWARD_BACKWARD_RESULT_KEYS:
                     output_dict[key] = result[key]
 
             # Pass through expert load summary for MoE models
@@ -330,6 +710,33 @@ class RequestProcessor:
                 output_type=OutputType.ERROR,
                 finished=True,
                 error=error_msg,
+            )
+
+    @staticmethod
+    def _validate_routing_payload_counts(
+        expected_count: int,
+        routed_experts: Optional[List[Any]],
+        routed_expert_logits: Optional[List[Any]],
+        *,
+        context: str,
+    ) -> None:
+        if routed_experts is not None and len(routed_experts) != expected_count:
+            raise ValueError(
+                f"R3 routed_experts count mismatch for {context}: expected {expected_count}, got {len(routed_experts)}"
+            )
+        if routed_expert_logits is not None and len(routed_expert_logits) != expected_count:
+            raise ValueError(
+                f"R3 routed_expert_logits count mismatch for {context}: "
+                f"expected {expected_count}, got {len(routed_expert_logits)}"
+            )
+        if (
+            routed_experts is not None
+            and routed_expert_logits is not None
+            and len(routed_experts) != len(routed_expert_logits)
+        ):
+            raise ValueError(
+                "R3 routed_experts and routed_expert_logits count mismatch: "
+                f"{len(routed_experts)} != {len(routed_expert_logits)}"
             )
 
     @staticmethod
@@ -530,6 +937,9 @@ class RequestProcessor:
                 "step": result.get("step", 0),
                 "execution_time": result.get("execution_time", 0.0),
             }
+            for key in ("optim_step_time", "optim_empty_cache_skipped"):
+                if key in result:
+                    output_dict[key] = result[key]
             if result.get("auto_loaded"):
                 output_dict["auto_loaded"] = True
                 output_dict["auto_load_path"] = result.get("auto_load_path")
@@ -765,6 +1175,7 @@ class RequestProcessor:
                 buffer_size_mb=p.buffer_size_mb,
                 sync_method=p.sync_method,
                 flush_cache=p.flush_cache,
+                cache_invalidation_mode=p.cache_invalidation_mode,
                 pause_mode=p.pause_mode,
                 weight_version=p.weight_version,
                 quantization=p.quantization,
@@ -897,6 +1308,58 @@ class RequestProcessor:
             ),
             OutputType.KILL_SESSION,
             build_output,
+        )
+
+    async def execute_start_zorl_generation(self, request: OrchestratorRequest) -> OrchestratorOutputs:
+        """Execute ZORL generation planning on workers."""
+        p: ZORLStartGenerationData = request.payload
+
+        return await self._execute_operation(
+            request,
+            "start_zorl_generation",
+            self.backend.start_zorl_generation(
+                model_id=p.model_id,
+                num_pairs=p.num_pairs,
+                materialization=p.materialization,
+                owner_url=p.owner_url,
+                request_id=request.request_id,
+            ),
+            OutputType.START_ZORL_GENERATION,
+            lambda result: [result],
+        )
+
+    async def execute_apply_zorl_rewards(self, request: OrchestratorRequest) -> OrchestratorOutputs:
+        """Execute ZORL reward application on workers."""
+        p: ZORLApplyRewardsData = request.payload
+
+        return await self._execute_operation(
+            request,
+            "apply_zorl_rewards",
+            self.backend.apply_zorl_rewards(
+                model_id=p.model_id,
+                generation_id=p.generation_id,
+                candidate_rewards=p.candidate_rewards,
+                learning_rate=p.learning_rate,
+                request_id=request.request_id,
+            ),
+            OutputType.APPLY_ZORL_REWARDS,
+            lambda result: [result],
+        )
+
+    async def execute_abort_zorl_generation(self, request: OrchestratorRequest) -> OrchestratorOutputs:
+        """Execute ZORL generation abort on workers."""
+        p: ZORLAbortGenerationData = request.payload
+
+        return await self._execute_operation(
+            request,
+            "abort_zorl_generation",
+            self.backend.abort_zorl_generation(
+                model_id=p.model_id,
+                generation_id=p.generation_id,
+                request_id=request.request_id,
+            ),
+            OutputType.ABORT_ZORL_GENERATION,
+            lambda result: [result],
         )
 
     # ========================================================================

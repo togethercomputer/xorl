@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from xorl.ops.loss.compiled_cross_entropy import (
@@ -22,6 +23,7 @@ from xorl.ops.loss.opd_streaming_kl import (
     streaming_reverse_kl_lowmem_function,
 )
 from xorl.ops.loss.reducers import Reducer, TokenPartial
+from xorl.ops.loss.vocab_parallel_reverse_kl import vocab_parallel_reverse_kl_gathered
 
 
 # OPD loss modes.
@@ -159,6 +161,14 @@ class OPDLossMetrics:
     opd_oprd_loss: float = 0.0
     opd_oprd_raw_loss: float = 0.0
     opd_oprd_num_layers: int = 0
+    # ---- Vocab-parallel OPD debugging ----
+    # These are raw numerator/count diagnostics from the vocab-parallel group,
+    # not values used by normal metric aggregation. They stay in the fixed
+    # metric key set so optional debug consumers do not introduce rank-skewed
+    # metric dictionaries.
+    opd_vocab_parallel_group_tokens: int = 0
+    opd_vocab_parallel_kl_sum: float = 0.0
+    opd_vocab_parallel_weighted_kl_sum: float = 0.0
     # ---- PG-mode (use_policy_gradient=True) ----
     opd_pg_clipfrac: float = 0.0
     opd_pg_clipfrac_lower: float = 0.0
@@ -206,6 +216,9 @@ class OPDLossMetrics:
             "opd_oprd_loss": self.opd_oprd_loss,
             "opd_oprd_raw_loss": self.opd_oprd_raw_loss,
             "opd_oprd_num_layers": self.opd_oprd_num_layers,
+            "opd_vocab_parallel_group_tokens": self.opd_vocab_parallel_group_tokens,
+            "opd_vocab_parallel_kl_sum": self.opd_vocab_parallel_kl_sum,
+            "opd_vocab_parallel_weighted_kl_sum": self.opd_vocab_parallel_weighted_kl_sum,
             "opd_pg_clipfrac": self.opd_pg_clipfrac,
             "opd_pg_clipfrac_lower": self.opd_pg_clipfrac_lower,
             "opd_ppo_kl": self.opd_ppo_kl,
@@ -253,6 +266,401 @@ def _denominator_tensor(
     return torch.tensor(float(denominator), device=device, dtype=torch.float32)
 
 
+def _gather_1d_nograd(local_values: torch.Tensor, *, group) -> torch.Tensor:
+    if local_values.ndim != 1:
+        raise ValueError(f"expected rank-1 tensor, got shape {tuple(local_values.shape)}")
+    if not dist.is_available() or not dist.is_initialized():
+        return local_values.detach()
+    world = dist.get_world_size(group)
+    if world == 1:
+        return local_values.detach()
+
+    local_count = torch.tensor([local_values.shape[0]], dtype=torch.long, device=local_values.device)
+    counts = torch.empty(world, dtype=torch.long, device=local_values.device)
+    dist.all_gather_into_tensor(counts, local_count, group=group)
+    max_count = int(counts.max().item()) if counts.numel() else 0
+    if max_count == 0:
+        return local_values.detach().new_empty((0,))
+
+    padded = local_values.detach().new_zeros((max_count,))
+    if local_values.numel():
+        padded[: local_values.shape[0]].copy_(local_values.detach().contiguous())
+    gathered = local_values.detach().new_empty((world * max_count,))
+    dist.all_gather_into_tensor(gathered, padded.contiguous(), group=group)
+    pieces = []
+    for rank, n_rows in enumerate(int(x) for x in counts.detach().cpu().tolist()):
+        if n_rows:
+            start = rank * max_count
+            pieces.append(gathered[start : start + n_rows])
+    if not pieces:
+        return local_values.detach().new_empty((0,))
+    return torch.cat(pieces, dim=0)
+
+
+def _gathered_local_bounds(n_local: int, *, device: torch.device, group) -> tuple[int, int]:
+    """Return this rank's [start, end) slice in the gathered 1-D token order."""
+    if not dist.is_available() or not dist.is_initialized():
+        return 0, int(n_local)
+    world = dist.get_world_size(group)
+    if world == 1:
+        return 0, int(n_local)
+
+    rank = dist.get_rank(group)
+    local_count = torch.tensor([int(n_local)], dtype=torch.long, device=device)
+    counts = torch.empty(world, dtype=torch.long, device=device)
+    dist.all_gather_into_tensor(counts, local_count, group=group)
+    start = int(counts[:rank].sum().item())
+    return start, start + int(n_local)
+
+
+def _value_divided_without_grad_scale(loss: torch.Tensor, divisor: int) -> torch.Tensor:
+    if divisor <= 1:
+        return loss
+    reported = loss / float(divisor)
+    return loss + (reported - loss).detach()
+
+
+def _oprd_hidden_distance(
+    student_layer_hidden_states: torch.Tensor,
+    teacher_layer_hidden_states: torch.Tensor,
+    expected_rows: int,
+    *,
+    layer_chunk_size: int = 4,
+) -> tuple[torch.Tensor, int]:
+    """Return per-token all-layer OPRD MSE without materializing all layers as fp32."""
+    if student_layer_hidden_states.shape != teacher_layer_hidden_states.shape:
+        raise ValueError(
+            "OPRD requires matching student/teacher layer shapes, got "
+            f"student={tuple(student_layer_hidden_states.shape)} teacher={tuple(teacher_layer_hidden_states.shape)}"
+        )
+    if student_layer_hidden_states.ndim != 3:
+        raise ValueError(
+            "OPRD layer tensors must be rank-3 [valid_tokens, layers, hidden], got "
+            f"{tuple(student_layer_hidden_states.shape)}"
+        )
+    if student_layer_hidden_states.shape[0] != expected_rows:
+        raise ValueError(
+            f"OPRD layer tensors must have {expected_rows} rows, got {student_layer_hidden_states.shape[0]}"
+        )
+
+    return _oprd_hidden_distance_from_fetcher(
+        student_layer_hidden_states,
+        teacher_layer_fetcher=lambda start, end: teacher_layer_hidden_states.detach()[:, start:end, :],
+        expected_rows=expected_rows,
+        num_layers=int(student_layer_hidden_states.shape[1]),
+        layer_chunk_size=layer_chunk_size,
+    )
+
+
+def _oprd_hidden_distance_from_fetcher(
+    student_layer_hidden_states: torch.Tensor,
+    *,
+    teacher_layer_fetcher: Callable[[int, int], torch.Tensor],
+    expected_rows: int,
+    num_layers: int,
+    layer_chunk_size: int = 4,
+) -> tuple[torch.Tensor, int]:
+    """Return per-token all-layer OPRD MSE while fetching teacher layers by chunk."""
+    if student_layer_hidden_states.ndim != 3:
+        raise ValueError(
+            "OPRD layer tensors must be rank-3 [valid_tokens, layers, hidden], got "
+            f"{tuple(student_layer_hidden_states.shape)}"
+        )
+    if student_layer_hidden_states.shape[0] != expected_rows:
+        raise ValueError(
+            f"OPRD layer tensors must have {expected_rows} rows, got {student_layer_hidden_states.shape[0]}"
+        )
+    if int(student_layer_hidden_states.shape[1]) != int(num_layers):
+        raise ValueError(
+            f"OPRD student layer count {student_layer_hidden_states.shape[1]} "
+            f"does not match teacher layer count {num_layers}"
+        )
+    if expected_rows == 0:
+        return torch.empty(0, dtype=torch.float32, device=student_layer_hidden_states.device), num_layers
+    if num_layers <= 0:
+        raise ValueError("OPRD layer tensors must include at least one layer")
+
+    chunk_size = max(1, int(layer_chunk_size))
+    hidden_distance_sum = None
+    for start in range(0, num_layers, chunk_size):
+        end = min(start + chunk_size, num_layers)
+        student_chunk = student_layer_hidden_states[:, start:end, :].float()
+        teacher_chunk = teacher_layer_fetcher(start, end).detach()
+        expected_shape = student_layer_hidden_states.shape[0], end - start, student_layer_hidden_states.shape[2]
+        if tuple(teacher_chunk.shape) != tuple(expected_shape):
+            raise ValueError(
+                "OPRD teacher layer fetcher returned wrong shape: "
+                f"got {tuple(teacher_chunk.shape)}, expected {tuple(expected_shape)}"
+            )
+        teacher_chunk = teacher_chunk.float()
+        chunk_distance = (student_chunk - teacher_chunk).square().mean(dim=-1).sum(dim=-1)
+        hidden_distance_sum = chunk_distance if hidden_distance_sum is None else hidden_distance_sum + chunk_distance
+    return hidden_distance_sum / float(num_layers), num_layers
+
+
+def opd_vocab_parallel_loss_function(
+    student_hidden_flat: torch.Tensor,
+    student_weight_local: torch.Tensor,
+    labels: torch.Tensor,
+    teacher_hidden_flat: torch.Tensor,
+    teacher_weight_local: torch.Tensor,
+    teacher_weights: Optional[torch.Tensor] = None,
+    hidden_match_weights: Optional[torch.Tensor] = None,
+    ignore_index: int = -100,
+    lm_head_fp32: bool = False,
+    teacher_lm_head_fp32: bool = True,
+    loss_reducer: Optional[Reducer] = None,
+    metric_reducer: Optional[Reducer] = None,
+    loss_mode: str = LOSS_MODE_REVERSE_KL_FULL,
+    loss_max_clamp: Optional[float] = None,
+    use_task_rewards: bool = False,
+    distillation_loss_coef: float = 1.0,
+    hidden_match_coef: float = 0.0,
+    kl_loss_weight: float = 1.0,
+    hidden_match_mode: str = "cosine",
+    teacher_layer_hidden_states: Optional[torch.Tensor] = None,
+    teacher_layer_fetcher: Optional[Callable[[int, int], torch.Tensor]] = None,
+    teacher_layer_num_layers: Optional[int] = None,
+    oprd_layer_chunk_size: int = 4,
+    student_layer_hidden_states: Optional[torch.Tensor] = None,
+    group=None,
+    debug_token_outputs: bool = False,
+) -> LossOutput:
+    """OPD reverse-KL over vocab-sharded student/teacher LM heads.
+
+    Inputs are already restricted to this rank's valid tokens for one teacher.
+    The vocab-parallel KL gathers token activations across ``group`` and returns
+    a replicated full-token KL vector. Its loss value is divided by the group
+    size for detached reporting only; gradients remain the full global-token sum
+    and are normalized later by the trainer's global-valid-token scale.
+    """
+    if loss_mode != LOSS_MODE_REVERSE_KL_FULL:
+        raise ValueError("vocab-parallel OPD currently supports only loss_mode='reverse_kl_full'")
+    if labels.ndim != 1:
+        raise ValueError(f"vocab-parallel OPD labels must be rank-1, got {tuple(labels.shape)}")
+    if student_hidden_flat.ndim != 2 or teacher_hidden_flat.ndim != 2:
+        raise ValueError(
+            "vocab-parallel OPD hidden tensors must be rank-2, got "
+            f"student={tuple(student_hidden_flat.shape)} teacher={tuple(teacher_hidden_flat.shape)}"
+        )
+    if student_hidden_flat.shape[0] != labels.shape[0] or teacher_hidden_flat.shape[0] != labels.shape[0]:
+        raise ValueError(
+            "vocab-parallel OPD token counts must match, got "
+            f"student={student_hidden_flat.shape[0]} teacher={teacher_hidden_flat.shape[0]} labels={labels.shape[0]}"
+        )
+    if student_hidden_flat.shape[-1] != student_weight_local.shape[-1]:
+        raise ValueError(
+            "student hidden size "
+            f"({student_hidden_flat.shape[-1]}) must match local student head width "
+            f"({student_weight_local.shape[-1]})"
+        )
+    if teacher_hidden_flat.shape[-1] != teacher_weight_local.shape[-1]:
+        raise ValueError(
+            "teacher hidden size "
+            f"({teacher_hidden_flat.shape[-1]}) must match local teacher head width "
+            f"({teacher_weight_local.shape[-1]})"
+        )
+    if teacher_weight_local.shape[0] != student_weight_local.shape[0]:
+        raise ValueError(
+            "local student and teacher vocab shards must have the same rows, got "
+            f"{student_weight_local.shape[0]} and {teacher_weight_local.shape[0]}"
+        )
+
+    local_tokens = int(labels.shape[0])
+    device = student_hidden_flat.device
+    if teacher_weights is None:
+        local_token_weights = torch.ones(local_tokens, dtype=torch.float32, device=device)
+    else:
+        if teacher_weights.shape[0] != local_tokens:
+            raise ValueError(f"teacher_weights must have {local_tokens} rows, got {tuple(teacher_weights.shape)}")
+        local_token_weights = teacher_weights.to(device=device, dtype=torch.float32)
+    if hidden_match_weights is None:
+        local_hidden_weights = local_token_weights
+    else:
+        if hidden_match_weights.shape[0] != local_tokens:
+            raise ValueError(
+                f"hidden_match_weights must have {local_tokens} rows, got {tuple(hidden_match_weights.shape)}"
+            )
+        local_hidden_weights = hidden_match_weights.to(device=device, dtype=torch.float32)
+
+    if lm_head_fp32:
+        student_hidden_for_kl = student_hidden_flat.float()
+        student_weight_for_kl = student_weight_local.float()
+    else:
+        student_hidden_for_kl = student_hidden_flat
+        student_weight_for_kl = student_weight_local
+    if teacher_lm_head_fp32:
+        teacher_hidden_for_kl = teacher_hidden_flat.float()
+        teacher_weight_for_kl = teacher_weight_local.float()
+    else:
+        teacher_hidden_for_kl = teacher_hidden_flat
+        teacher_weight_for_kl = teacher_weight_local
+
+    token_kl = vocab_parallel_reverse_kl_gathered(
+        local_student_hidden=student_hidden_for_kl,
+        student_weight_local=student_weight_for_kl,
+        local_teacher_hidden=teacher_hidden_for_kl.detach(),
+        teacher_weight_local=teacher_weight_for_kl.detach(),
+        local_labels=labels.to(device=device),
+        ignore_index=ignore_index,
+        group=group,
+    )
+    full_token_weights = _gather_1d_nograd(local_token_weights.to(token_kl.device), group=group)
+    if full_token_weights.shape[0] != token_kl.shape[0]:
+        raise ValueError(
+            f"gathered teacher_weights rows {full_token_weights.shape[0]} do not match KL rows {token_kl.shape[0]}"
+        )
+
+    clamp_frac = 0.0
+    if loss_max_clamp is not None and token_kl.numel():
+        clamp_frac = (token_kl.detach().abs() >= float(loss_max_clamp)).float().mean().item()
+        token_kl = token_kl.clamp(min=-loss_max_clamp, max=loss_max_clamp)
+
+    if loss_reducer is None:
+        scale = torch.tensor(max(int(token_kl.numel()), 1), dtype=torch.float32, device=token_kl.device)
+        loss_reducer = TokenPartial(scale=scale)
+    if metric_reducer is None:
+        scale = torch.tensor(max(local_tokens, 1), dtype=torch.float32, device=device)
+        metric_reducer = TokenPartial(scale=scale)
+
+    weighted_token_kl = token_kl * full_token_weights.to(token_kl.device)
+    valid_full = torch.ones_like(weighted_token_kl, dtype=torch.float32)
+    raw_kl_loss = loss_reducer(weighted_token_kl, valid_full)
+    if float(kl_loss_weight) == 0.0:
+        loss = raw_kl_loss.detach() * 0.0
+    else:
+        scaled_kl_loss = float(kl_loss_weight) * raw_kl_loss
+        world = dist.get_world_size(group) if dist.is_available() and dist.is_initialized() else 1
+        loss = _value_divided_without_grad_scale(scaled_kl_loss, world)
+
+    hidden_match_metric = 0.0
+    hidden_match_raw_metric = 0.0
+    hidden_match_weight_mean = local_hidden_weights.mean().item() if local_tokens else 0.0
+    hidden_match_pos_metric = 0.0
+    hidden_match_neg_metric = 0.0
+    hidden_match_pos_raw_metric = 0.0
+    hidden_match_neg_raw_metric = 0.0
+    hidden_match_neg_minus_pos_raw = 0.0
+    hidden_match_pos_weight_mean = 0.0
+    hidden_match_neg_weight_mean = 0.0
+    oprd_metric = 0.0
+    oprd_raw_metric = 0.0
+    oprd_num_layers = 0
+
+    hidden_match_coef = float(hidden_match_coef or 0.0)
+    local_valid = torch.ones(local_tokens, dtype=torch.float32, device=device)
+    use_oprd = (
+        hidden_match_coef
+        and student_layer_hidden_states is not None
+        and (teacher_layer_hidden_states is not None or teacher_layer_fetcher is not None)
+    )
+    if use_oprd and local_tokens:
+        if teacher_layer_fetcher is not None:
+            hidden_distance, oprd_num_layers = _oprd_hidden_distance_from_fetcher(
+                student_layer_hidden_states,
+                teacher_layer_fetcher=teacher_layer_fetcher,
+                expected_rows=local_tokens,
+                num_layers=teacher_layer_num_layers
+                if teacher_layer_num_layers is not None
+                else int(student_layer_hidden_states.shape[1]),
+                layer_chunk_size=oprd_layer_chunk_size,
+            )
+        else:
+            hidden_distance, oprd_num_layers = _oprd_hidden_distance(
+                student_layer_hidden_states,
+                teacher_layer_hidden_states,
+                local_tokens,
+                layer_chunk_size=oprd_layer_chunk_size,
+            )
+        weighted_hidden_match = hidden_distance * local_hidden_weights.to(hidden_distance.device)
+        hidden_match_loss = loss_reducer(weighted_hidden_match, local_valid.to(hidden_distance.device))
+        loss = loss + hidden_match_coef * hidden_match_loss
+        oprd_metric = metric_reducer(weighted_hidden_match.detach(), local_valid.to(hidden_distance.device)).item()
+        oprd_raw_metric = metric_reducer(hidden_distance.detach(), local_valid.to(hidden_distance.device)).item()
+        hidden_match_metric = oprd_metric
+        hidden_match_raw_metric = oprd_raw_metric
+    elif hidden_match_coef and local_tokens:
+        if student_hidden_flat.shape[-1] != teacher_hidden_flat.shape[-1]:
+            raise ValueError(
+                "hidden_match requires matching hidden sizes, got "
+                f"student={student_hidden_flat.shape[-1]} teacher={teacher_hidden_flat.shape[-1]}"
+            )
+        if str(hidden_match_mode).lower() == "mse":
+            hidden_distance = ((student_hidden_flat.float() - teacher_hidden_flat.float()) ** 2).mean(dim=-1)
+        else:
+            hidden_distance = 1.0 - F.cosine_similarity(
+                student_hidden_flat.float(),
+                teacher_hidden_flat.float(),
+                dim=-1,
+                eps=1e-6,
+            )
+        hidden_weights_on_device = local_hidden_weights.to(hidden_distance.device)
+        weighted_hidden_match = hidden_distance * hidden_weights_on_device
+        hidden_match_loss = loss_reducer(weighted_hidden_match, local_valid.to(hidden_distance.device))
+        loss = loss + hidden_match_coef * hidden_match_loss
+        hidden_match_metric = metric_reducer(
+            weighted_hidden_match.detach(), local_valid.to(hidden_distance.device)
+        ).item()
+        hidden_match_raw_metric = metric_reducer(
+            hidden_distance.detach(), local_valid.to(hidden_distance.device)
+        ).item()
+        pos_weights = torch.clamp(hidden_weights_on_device, min=0.0)
+        neg_weights = torch.clamp(-hidden_weights_on_device, min=0.0)
+        hidden_match_pos_metric = metric_reducer((hidden_distance * pos_weights).detach(), local_valid).item()
+        hidden_match_neg_metric = metric_reducer((hidden_distance * neg_weights).detach(), local_valid).item()
+        pos_weight_sum = pos_weights.sum()
+        neg_weight_sum = neg_weights.sum()
+        if pos_weight_sum.item() > 0:
+            hidden_match_pos_raw_metric = ((hidden_distance.detach() * pos_weights).sum() / pos_weight_sum).item()
+        if neg_weight_sum.item() > 0:
+            hidden_match_neg_raw_metric = ((hidden_distance.detach() * neg_weights).sum() / neg_weight_sum).item()
+        hidden_match_neg_minus_pos_raw = hidden_match_neg_raw_metric - hidden_match_pos_raw_metric
+        hidden_match_pos_weight_mean = pos_weights.mean().item()
+        hidden_match_neg_weight_mean = neg_weights.mean().item()
+
+    if use_task_rewards:
+        loss = loss * float(distillation_loss_coef)
+
+    detached_token_kl = token_kl.detach()
+    full_valid_count = max(float(detached_token_kl.numel()), 1.0)
+    metrics_kwargs: dict = {
+        "valid_tokens": local_tokens,
+        "opd_kl": detached_token_kl.sum().item() / full_valid_count,
+        "opd_weighted_kl": weighted_token_kl.detach().sum().item() / full_valid_count,
+        "opd_vocab_parallel_group_tokens": int(detached_token_kl.numel()),
+        "opd_vocab_parallel_kl_sum": detached_token_kl.sum().item(),
+        "opd_vocab_parallel_weighted_kl_sum": weighted_token_kl.detach().sum().item(),
+        "opd_hidden_match_loss": hidden_match_metric,
+        "opd_hidden_match_raw_loss": hidden_match_raw_metric,
+        "opd_hidden_match_weight_mean": hidden_match_weight_mean,
+        "opd_hidden_match_pos_loss": hidden_match_pos_metric,
+        "opd_hidden_match_neg_loss": hidden_match_neg_metric,
+        "opd_hidden_match_pos_raw_loss": hidden_match_pos_raw_metric,
+        "opd_hidden_match_neg_raw_loss": hidden_match_neg_raw_metric,
+        "opd_hidden_match_neg_minus_pos_raw": hidden_match_neg_minus_pos_raw,
+        "opd_hidden_match_pos_weight_mean": hidden_match_pos_weight_mean,
+        "opd_hidden_match_neg_weight_mean": hidden_match_neg_weight_mean,
+        "opd_teacher_weight_mean": full_token_weights.mean().item() if full_token_weights.numel() else 0.0,
+        "opd_loss_clamp_frac": clamp_frac,
+        "opd_oprd_loss": oprd_metric,
+        "opd_oprd_raw_loss": oprd_raw_metric,
+        "opd_oprd_num_layers": oprd_num_layers,
+    }
+    if detached_token_kl.numel():
+        metrics_kwargs["opd_loss_min"] = detached_token_kl.min().item()
+        metrics_kwargs["opd_loss_max"] = detached_token_kl.max().item()
+        metrics_kwargs["opd_loss_abs_mean"] = detached_token_kl.abs().mean().item()
+
+    metrics = OPDLossMetrics(**metrics_kwargs).to_dict()
+    if debug_token_outputs:
+        local_start, local_end = _gathered_local_bounds(local_tokens, device=token_kl.device, group=group)
+        metrics["_opd_debug_local_token_kl"] = detached_token_kl[local_start:local_end].detach()
+        metrics["_opd_debug_local_weighted_token_kl"] = weighted_token_kl.detach()[local_start:local_end]
+        metrics["_opd_debug_local_token_weight"] = full_token_weights.detach()[local_start:local_end]
+
+    return LossOutput(loss=loss, metrics=metrics)
+
+
 def opd_loss_function(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
@@ -286,6 +694,9 @@ def opd_loss_function(
     kl_loss_weight: float = 1.0,
     hidden_match_mode: str = "cosine",
     teacher_layer_hidden_states: Optional[torch.Tensor] = None,
+    teacher_layer_fetcher: Optional[Callable[[int, int], torch.Tensor]] = None,
+    teacher_layer_num_layers: Optional[int] = None,
+    oprd_layer_chunk_size: int = 4,
     student_layer_hidden_states: Optional[torch.Tensor] = None,
     diag_region_ids: Optional[torch.Tensor] = None,
     diag_sample_ok: Optional[torch.Tensor] = None,
@@ -750,24 +1161,29 @@ def opd_loss_function(
     # single-layer hidden term below (the `else` branch) so the same coefficient
     # isn't applied twice. Layer tensors arrive [valid_tokens, L, d] already
     # restricted to the valid positions in valid_mask order.
-    use_oprd = hidden_match_coef and teacher_layer_hidden_states is not None and student_layer_hidden_states is not None
+    use_oprd = (
+        hidden_match_coef
+        and student_layer_hidden_states is not None
+        and (teacher_layer_hidden_states is not None or teacher_layer_fetcher is not None)
+    )
     if use_oprd:
-        student_layers = student_layer_hidden_states.float()
-        teacher_layers = teacher_layer_hidden_states.float().detach()
-        if student_layers.shape != teacher_layers.shape:
-            raise ValueError(
-                "OPRD requires matching student/teacher layer shapes, got "
-                f"student={tuple(student_layers.shape)} teacher={tuple(teacher_layers.shape)}"
+        if teacher_layer_fetcher is not None:
+            hidden_distance, oprd_num_layers = _oprd_hidden_distance_from_fetcher(
+                student_layer_hidden_states,
+                teacher_layer_fetcher=teacher_layer_fetcher,
+                expected_rows=int(student_hidden_flat.shape[0]),
+                num_layers=teacher_layer_num_layers
+                if teacher_layer_num_layers is not None
+                else int(student_layer_hidden_states.shape[1]),
+                layer_chunk_size=oprd_layer_chunk_size,
             )
-        if student_layers.shape[0] != student_hidden_flat.shape[0]:
-            raise ValueError(
-                "OPRD layer tensors must have one row per valid token "
-                f"({student_hidden_flat.shape[0]}), got {student_layers.shape[0]}"
+        else:
+            hidden_distance, oprd_num_layers = _oprd_hidden_distance(
+                student_layer_hidden_states,
+                teacher_layer_hidden_states,
+                int(student_hidden_flat.shape[0]),
+                layer_chunk_size=oprd_layer_chunk_size,
             )
-        oprd_num_layers = int(student_layers.shape[1])
-        # mean over hidden dim d -> [valid, L]; mean over layers L -> [valid].
-        per_layer_mse = ((student_layers - teacher_layers) ** 2).mean(dim=-1)
-        hidden_distance = per_layer_mse.mean(dim=-1)
         hidden_weights_on_device = hidden_weights.to(hidden_distance.device)
         weighted_hidden_match = hidden_distance * hidden_weights_on_device
         hidden_match_loss = loss_reducer(weighted_hidden_match, valid_ones)

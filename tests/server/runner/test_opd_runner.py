@@ -1,3 +1,4 @@
+import json
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -18,6 +19,7 @@ pytestmark = [pytest.mark.cpu, pytest.mark.server]
 def _make_opd_runner() -> ModelRunner:
     runner = object.__new__(ModelRunner)
     runner.rank = 0
+    runner.local_rank = 0
     runner.world_size = 1
     runner.train_config = {}
     runner.lm_head_fp32 = True
@@ -31,6 +33,9 @@ def _make_opd_runner() -> ModelRunner:
     runner._opd_layer_config = None
     runner._teacher_hidden_cache_store = None
     runner._teacher_hidden_cache_store_config = None
+    runner._opd_lm_head_debug_written = set()
+    runner._opd_vocab_parallel_loss_debug_written = set()
+    runner._opd_packed_sample_debug_written = set()
     return runner
 
 
@@ -69,6 +74,7 @@ def test_opd_metrics_keep_opd_namespace(mock_parallel_state):
             "opd_weighted_kl": 0.6,
             "opd_num_teachers": 2,
             "opd_profile_kl_compute_ms": 10.0,
+            "_opd_debug_local_token_kl": torch.tensor([1.0, 2.0]),
         },
         "opd_loss",
     )
@@ -91,7 +97,46 @@ def test_opd_metrics_keep_opd_namespace(mock_parallel_state):
     assert result["opd_weighted_kl"] == pytest.approx((0.6 * 4 + 0.3 * 2) / 6)
     assert result["opd_num_teachers:max"] == 2
     assert result["opd_profile_kl_compute_ms"] == pytest.approx(30.0)
+    assert not any(key.startswith("_opd_debug_") for key in result)
     assert not any(key.startswith("is_opd") for key in result)
+
+
+@patch("xorl.server.runner.model_runner.get_device_type", return_value="cpu")
+@patch("xorl.server.runner.model_runner.get_parallel_state")
+def test_loss_metric_extrema_ignore_zero_valid_microbatches(mock_parallel_state, _mock_get_device_type):
+    mock_parallel_state.return_value = Mock(dp_enabled=False, loss_parallel_enabled=False)
+    accumulated = {}
+    metric_ops = {
+        "kl_k3_debug_max": "max",
+        "kl_k3_debug_logratio_min": "min",
+    }
+
+    ModelRunner._accumulate_loss_metrics(
+        accumulated,
+        {
+            "valid_tokens": 0,
+            "kl_k3_debug_max": 1.0,
+            "kl_k3_debug_logratio_min": -1.0,
+        },
+        "importance_sampling",
+        metric_ops,
+    )
+    ModelRunner._accumulate_loss_metrics(
+        accumulated,
+        {
+            "valid_tokens": 4,
+            "kl_k3_debug_max": 0.25,
+            "kl_k3_debug_logratio_min": -0.1,
+        },
+        "importance_sampling",
+        metric_ops,
+    )
+
+    result = {}
+    ModelRunner._finalize_loss_metrics(accumulated, result, "importance_sampling")
+
+    assert result["is_kl_k3_debug_max"] == pytest.approx(0.25)
+    assert result["is_kl_k3_debug_logratio_min"] == pytest.approx(-0.1)
 
 
 @patch("xorl.server.runner.model_runner.get_device_type", return_value="cpu")
@@ -349,7 +394,7 @@ def test_teacher_hidden_cache_contributor_skips_duplicate_cp_ranks_and_keys_ep_r
     )
     assert (
         runner._teacher_hidden_cache_contributor_key(
-            SimpleNamespace(cp_enabled=True, cp_rank=0, ep_enabled=False, dp_rank=2)
+            SimpleNamespace(cp_enabled=True, cp_rank=0, ep_enabled=False, dp_rank=2, dp_size=8)
         )
         == 2
     )
@@ -461,9 +506,12 @@ def test_teacher_hidden_cache_trims_with_gathered_sp_labels(mock_parallel_state,
         cp_enabled=True,
         cp_rank=0,
         cp_size=2,
+        tp_size=1,
+        pp_size=1,
         ulysses_group=object(),
         ep_enabled=False,
         dp_rank=0,
+        dp_size=1,
     )
 
     full_hidden = torch.arange(6, dtype=torch.float32).reshape(1, 6, 1)
@@ -503,7 +551,9 @@ def test_teacher_hidden_cache_writer_gathers_all_batch_ranks(
     runner = _make_opd_runner()
     runner.world_size = 2
     runner.model = _InputIdHiddenModel()
-    mock_parallel_state.return_value = Mock(cp_enabled=False, ep_enabled=False, dp_rank=0)
+    mock_parallel_state.return_value = Mock(
+        cp_enabled=False, ep_enabled=False, dp_rank=0, dp_size=2, tp_size=1, pp_size=1
+    )
 
     remote_chunk = torch.tensor([[10.0], [11.0], [12.0]])
 
@@ -562,7 +612,9 @@ class _FakeMooncakeClient:
 def test_teacher_hidden_cache_mooncake_backend_writes_to_store(mock_parallel_state, _mock_device):
     runner = _make_opd_runner()
     runner.model = _InputIdHiddenModel()
-    mock_parallel_state.return_value = Mock(cp_enabled=False, ep_enabled=False, dp_rank=0)
+    mock_parallel_state.return_value = Mock(
+        cp_enabled=False, ep_enabled=False, dp_rank=0, dp_size=1, tp_size=1, pp_size=1
+    )
 
     store = MooncakeHiddenStore(client=_FakeMooncakeClient(), get_retry_max_wait_s=0.0)
     # The forward path fetches the store via _get_teacher_hidden_cache_store;
@@ -603,7 +655,9 @@ def test_teacher_hidden_cache_mooncake_roundtrips_through_activation_cache(mock_
     """Producer metadata -> TeacherActivationCache.get returns the right rows."""
     runner = _make_opd_runner()
     runner.model = _InputIdHiddenModel()
-    mock_parallel_state.return_value = Mock(cp_enabled=False, ep_enabled=False, dp_rank=0)
+    mock_parallel_state.return_value = Mock(
+        cp_enabled=False, ep_enabled=False, dp_rank=0, dp_size=1, tp_size=1, pp_size=1
+    )
 
     store = MooncakeHiddenStore(client=_FakeMooncakeClient(), get_retry_max_wait_s=0.0)
     runner._get_teacher_hidden_cache_store = lambda params: store
@@ -621,3 +675,216 @@ def test_teacher_hidden_cache_mooncake_roundtrips_through_activation_cache(mock_
         assert torch.equal(out[0], torch.tensor([[4.0], [6.0], [7.0]]))
     finally:
         tac.close()
+
+
+def test_vocab_parallel_loss_debug_writer_records_local_contribution(tmp_path):
+    runner = _make_opd_runner()
+    debug_path = tmp_path / "vp_loss.jsonl"
+
+    runner._maybe_write_opd_vocab_parallel_loss_debug(
+        {"opd_debug_vocab_parallel_loss_path": str(debug_path)},
+        teacher_id=7,
+        metrics={
+            "opd_kl": 0.25,
+            "opd_weighted_kl": 0.5,
+            "opd_vocab_parallel_group_tokens": 11,
+            "opd_vocab_parallel_kl_sum": 2.75,
+            "opd_vocab_parallel_weighted_kl_sum": 5.5,
+            "opd_oprd_loss": 0.125,
+            "opd_hidden_match_loss": 0.125,
+            "opd_teacher_weight_mean": 1.0,
+        },
+        loss=torch.tensor(1.25, requires_grad=True),
+        local_valid_tokens=3,
+        vocab_start=128,
+        vocab_end=256,
+    )
+
+    rows = [json.loads(line) for line in (tmp_path / "vp_loss.rank00000.jsonl").read_text().splitlines()]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["teacher_id"] == 7
+    assert row["vocab_start"] == 128
+    assert row["vocab_end"] == 256
+    assert row["local_valid_tokens"] == 3
+    assert row["group_valid_tokens"] == 11
+    assert row["opd_vocab_parallel_kl_sum"] == pytest.approx(2.75)
+    assert row["opd_vocab_parallel_weighted_kl_sum"] == pytest.approx(5.5)
+    assert row["model_runner_local_kl_contribution"] == pytest.approx(0.75)
+    assert row["model_runner_local_weighted_kl_contribution"] == pytest.approx(1.5)
+    assert row["loss_detached"] == pytest.approx(1.25)
+    assert row["loss_requires_grad"] is True
+
+
+def test_packed_sample_debug_writer_records_teacher_segments(tmp_path):
+    runner = _make_opd_runner()
+    debug_path = tmp_path / "packed_samples.jsonl"
+    micro_batch = {
+        "batch_id": 13,
+        "num_samples": 3,
+        "position_ids": torch.tensor([[0, 1, 2, 0, 1, 0, 1, 2]], dtype=torch.long),
+        "labels": torch.tensor([[IGNORE_INDEX, 5, 6, IGNORE_INDEX, 7, IGNORE_INDEX, IGNORE_INDEX, 8]]),
+        "target_tokens": torch.tensor([[99, 5, 6, 98, 7, 97, 96, 8]], dtype=torch.long),
+        "teacher_ids": torch.tensor([[0, 0, 0, 0, 0, 1, 1, 1]], dtype=torch.long),
+        "teacher_cache_indices": torch.tensor([[10, 11, 12, 20, 21, 30, 31, 32]], dtype=torch.long),
+        "teacher_weights": torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]]),
+        "input_ids": torch.tensor([[100, 101, 102, 200, 201, 300, 301, 302]], dtype=torch.long),
+        "opd_region_ids": torch.tensor([[0, 1, 1, 2, 2, 3, 3, 3]], dtype=torch.long),
+        "opd_sample_ok": torch.tensor([[1, 1, 1, 0, 0, 1, 1, 1]], dtype=torch.long),
+        "packed_row_source_batch_ids": [10, 20, 30],
+        "packed_row_source_request_ids": ["req-a", "req-b", "req-c"],
+        "packed_row_source_num_samples": [1, 1, 1],
+        "packed_row_source_token_spans": [[0, 3], [3, 5], [5, 8]],
+        "packed_row_source_group_size": 3,
+    }
+    component_tensor = torch.tensor(
+        [[[10.0, 11.0], [12.0, 13.0], [14.0, 15.0], [20.0, 21.0], [22.0, 23.0], [30.0, 31.0], [32.0, 33.0], [34.0, 35.0]]]
+    )
+    student_component_debug = [
+        {"layer": 2, "name": "mlp", "order": 10, "tensor": component_tensor + 100.0},
+        {"layer": 2, "name": "layer_input", "order": 0, "tensor": component_tensor},
+    ]
+
+    for teacher_id in (0, 1):
+        student_hidden_debug = (
+            torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+            if teacher_id == 0
+            else torch.tensor([[7.0, 8.0]])
+        )
+        runner._maybe_write_opd_packed_sample_debug(
+            {"opd_debug_packed_sample_path": str(debug_path)},
+            teacher_id=teacher_id,
+            micro_batch=micro_batch,
+            metrics={
+                "opd_kl": 0.25,
+                "opd_weighted_kl": 0.5,
+                "opd_vocab_parallel_group_tokens": 4,
+                "_opd_debug_local_token_kl": torch.tensor([0.1, 0.2, 0.3])
+                if teacher_id == 0
+                else torch.tensor([0.4]),
+                "_opd_debug_local_weighted_token_kl": torch.tensor([1.0, 2.0, 3.0])
+                if teacher_id == 0
+                else torch.tensor([4.0]),
+                "_opd_debug_local_token_weight": torch.tensor([2.0, 3.0, 5.0])
+                if teacher_id == 0
+                else torch.tensor([8.0]),
+            },
+            loss=torch.tensor(1.5),
+            local_valid_tokens=4,
+            vocab_start=128,
+            vocab_end=256,
+            backend="vocab_parallel",
+            student_hidden_debug=student_hidden_debug,
+            student_component_debug=student_component_debug,
+        )
+
+    rows = [json.loads(line) for line in (tmp_path / "packed_samples.rank00000.jsonl").read_text().splitlines()]
+    assert [(row["teacher_id"], row["segment_index"]) for row in rows] == [(0, 0), (0, 1), (1, 2)]
+
+    first = rows[0]
+    assert first["segment_start"] == 0
+    assert first["segment_end"] == 3
+    assert first["segment_teacher_valid_tokens"] == 2
+    assert first["teacher_cache_valid"] == {
+        "count": 2,
+        "first": 11,
+        "last": 12,
+        "max": 12,
+        "min": 11,
+        "sum": 23,
+    }
+    assert first["labels_teacher_valid"]["sum"] == 11
+    assert first["input_ids_segment"]["sum"] == 303
+    assert first["position_ids_segment_sha256"] == ModelRunner._opd_debug_tensor_sha256(
+        torch.tensor([0, 1, 2], dtype=torch.long),
+        dtype=torch.long,
+    )
+    assert first["teacher_cache_valid_sha256"] == ModelRunner._opd_debug_tensor_sha256(
+        torch.tensor([11, 12], dtype=torch.long),
+        dtype=torch.long,
+    )
+    assert first["input_ids_segment_sha256"] == ModelRunner._opd_debug_tensor_sha256(
+        torch.tensor([100, 101, 102], dtype=torch.long),
+        dtype=torch.long,
+    )
+    assert first["labels_segment_sha256"] == ModelRunner._opd_debug_tensor_sha256(
+        torch.tensor([IGNORE_INDEX, 5, 6], dtype=torch.long),
+        dtype=torch.long,
+    )
+    assert first["labels_teacher_valid_sha256"] == ModelRunner._opd_debug_tensor_sha256(
+        torch.tensor([5, 6], dtype=torch.long),
+        dtype=torch.long,
+    )
+    assert first["target_tokens_segment_sha256"] == ModelRunner._opd_debug_tensor_sha256(
+        torch.tensor([99, 5, 6], dtype=torch.long),
+        dtype=torch.long,
+    )
+    assert first["teacher_weights_valid_sha256"] == ModelRunner._opd_debug_tensor_sha256(
+        torch.tensor([2.0, 3.0], dtype=torch.float32),
+        dtype=torch.float32,
+    )
+    assert first["teacher_weight_valid_sum"] == pytest.approx(5.0)
+    assert first["segment_debug_token_offset_start"] == 0
+    assert first["segment_debug_token_offset_end"] == 2
+    assert first["segment_debug_token_count"] == 2
+    assert first["segment_debug_missing_tokens"] == 0
+    assert first["packed_row_source_batch_ids"] == [10, 20, 30]
+    assert first["packed_row_source_request_ids"] == ["req-a", "req-b", "req-c"]
+    assert first["packed_row_source_num_samples"] == [1, 1, 1]
+    assert first["packed_row_source_token_spans"] == [[0, 3], [3, 5], [5, 8]]
+    assert first["packed_row_source_group_size"] == 3
+    assert first["segment_source_overlaps"] == [
+        {
+            "source_batch_id": 10,
+            "source_index": 0,
+            "source_num_samples": 1,
+            "source_request_id": "req-a",
+            "source_token_end": 3,
+            "source_token_start": 0,
+            "overlap_end": 3,
+            "overlap_start": 0,
+            "overlap_tokens": 3,
+        }
+    ]
+    assert first["segment_kl_sum_local"] == pytest.approx(0.3)
+    assert first["segment_kl_mean_local"] == pytest.approx(0.15)
+    assert first["segment_weighted_kl_sum_local"] == pytest.approx(3.0)
+    assert first["segment_token_weight_sum_local"] == pytest.approx(5.0)
+    assert first["segment_student_hidden"]["shape"] == [2, 2]
+    assert first["segment_student_hidden"]["count"] == 4
+    assert first["segment_student_hidden"]["sample_sum"] == pytest.approx(10.0)
+    assert first["segment_student_hidden"]["sample_sq_sum"] == pytest.approx(30.0)
+    assert first["segment_student_hidden"]["sample_first_values"] == [1.0, 2.0, 3.0, 4.0]
+    assert first["segment_student_hidden"]["sample_sha256"]
+    assert [component["name"] for component in first["segment_student_components"]] == ["layer_input", "mlp"]
+    assert first["segment_student_components"][0]["summary"]["shape"] == [2, 2]
+    assert first["segment_student_components"][0]["summary"]["sample_sum"] == pytest.approx(54.0)
+    assert first["segment_student_components"][0]["summary"]["sample_first_values"] == [12.0, 13.0, 14.0, 15.0]
+    assert first["segment_student_components"][1]["summary"]["sample_sum"] == pytest.approx(454.0)
+    assert first["opd_region_id_counts"] == {"1": 2}
+    assert first["opd_sample_ok_counts"] == {"1": 3}
+
+    second = rows[1]
+    assert second["segment_debug_token_offset_start"] == 2
+    assert second["segment_debug_token_offset_end"] == 3
+    assert second["segment_source_overlaps"][0]["source_batch_id"] == 20
+    assert second["segment_source_overlaps"][0]["overlap_tokens"] == 2
+    assert second["segment_kl_sum_local"] == pytest.approx(0.3)
+    assert second["segment_student_hidden"]["shape"] == [1, 2]
+    assert second["segment_student_hidden"]["sample_sum"] == pytest.approx(11.0)
+
+    third = rows[2]
+    assert third["teacher_id"] == 1
+    assert third["segment_start"] == 5
+    assert third["segment_teacher_valid_tokens"] == 1
+    assert third["segment_source_overlaps"][0]["source_batch_id"] == 30
+    assert third["segment_source_overlaps"][0]["overlap_tokens"] == 3
+    assert third["teacher_cache_valid"]["first"] == 32
+    assert third["teacher_weight_valid_mean"] == pytest.approx(8.0)
+    assert third["segment_debug_token_offset_start"] == 0
+    assert third["segment_debug_token_offset_end"] == 1
+    assert third["segment_kl_sum_local"] == pytest.approx(0.4)
+    assert third["segment_weighted_kl_sum_local"] == pytest.approx(4.0)
+    assert third["segment_token_weight_sum_local"] == pytest.approx(8.0)
+    assert third["segment_student_hidden"]["shape"] == [1, 2]
+    assert third["segment_student_hidden"]["sample_sum"] == pytest.approx(15.0)

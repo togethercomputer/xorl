@@ -15,7 +15,7 @@ from xorl.ops.loss.fused_linear_logprob import fused_selected_logprob_ce
 from xorl.ops.loss.grpo_loss import drgrpo_loss_function
 from xorl.ops.loss.importance_sampling_loss import importance_sampling_loss_function
 from xorl.ops.loss.loss_output import LossOutput
-from xorl.ops.loss.opd_loss import OPDLossMetrics, opd_loss_function
+from xorl.ops.loss.opd_loss import OPDLossMetrics, opd_loss_function, opd_vocab_parallel_loss_function
 from xorl.ops.loss.policy_loss import policy_loss_function
 from xorl.ops.loss.reducers import Reducer, SequencePartial, TokenPartial
 from xorl.ops.loss.vocab_parallel_cross_entropy import vocab_parallel_cross_entropy
@@ -69,6 +69,7 @@ __all__ = [
     "fused_selected_logprob_ce",
     "importance_sampling_loss_function",
     "opd_loss_function",
+    "opd_vocab_parallel_loss_function",
     "policy_loss_function",
     "vocab_parallel_cross_entropy",
 ]

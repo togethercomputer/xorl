@@ -917,6 +917,44 @@ class TestP2PInitializeHandshake:
         assert body["group_name"] == "weight_sync_group"
         assert "p2p_return_tensor_map" not in body
 
+    def test_prepare_payload_does_not_invalidate_receiver_cache_when_cache_mode_none(self, monkeypatch):
+        monkeypatch.setenv("XORL_P2P_INVALIDATE_RECEIVER_CACHE_ON_COLD_PREPARE", "1")
+        backend, _ = _make_backend(num_endpoints=1)
+        backend.config.backend_config["cache_invalidation_mode"] = "none"
+
+        prepare_response = _FakeResponse(
+            200,
+            {
+                "success": True,
+                "message": "ok",
+                "tensor_map": {
+                    "model.layers.0.self_attn.q_proj.weight": [
+                        {
+                            **_hf_locator(
+                                tp_rank=0,
+                                full_shape=[128, 64],
+                                slc=[[0, 64], [0, 64]],
+                                ptr=0xDEAD0000,
+                                nbytes=64 * 64 * 2,
+                                session_id="recv-0:7000",
+                            ),
+                            "hf_name": "model.layers.0.self_attn.q_proj.weight",
+                        },
+                    ]
+                },
+                "receiver_transfer_engine_infos": [
+                    {"tp_rank": 0, "session_id": "recv-0:7000"},
+                ],
+            },
+        )
+
+        with patch("requests.post", return_value=prepare_response) as posted:
+            ok = backend.initialize()
+
+        assert ok is True
+        body = posted.call_args.kwargs["json"]
+        assert "p2p_invalidate_cache" not in body
+
     def test_initialize_aggregates_tensor_map_across_endpoints(self, monkeypatch):
         monkeypatch.setenv("XORL_P2P_PREPARE_WORKERS", "1")
         backend, _ = _make_backend(num_endpoints=2)
@@ -989,6 +1027,56 @@ class TestP2PInitializeHandshake:
             return_value=_FakeResponse(200, {"success": False, "message": "no engine"}),
         ):
             assert backend.initialize() is False
+
+    def test_initialize_cleans_up_prepared_receivers_after_fanout_failure(self, monkeypatch):
+        monkeypatch.setenv("XORL_P2P_PREPARE_WORKERS", "1")
+        backend, _ = _make_backend(num_endpoints=2)
+        complete_calls: List[Tuple[str, Dict[str, Any]]] = []
+
+        def fake_post(url: str, *, json: Dict[str, Any], timeout: float) -> _FakeResponse:
+            del timeout
+            if url.endswith("/prepare_weights_update") and "infer-0" in url:
+                return _FakeResponse(
+                    200,
+                    {
+                        "success": True,
+                        "message": "ok",
+                        "tensor_map": {
+                            "model.layers.0.self_attn.q_proj.weight": [
+                                {
+                                    **_hf_locator(
+                                        tp_rank=0,
+                                        full_shape=[128, 64],
+                                        slc=[[0, 64], [0, 64]],
+                                        ptr=0x1000,
+                                        nbytes=64 * 64 * 2,
+                                        session_id="recv0a:7000",
+                                    ),
+                                    "hf_name": "model.layers.0.self_attn.q_proj.weight",
+                                },
+                            ],
+                        },
+                        "receiver_transfer_engine_infos": [{"tp_rank": 0, "session_id": "recv0a:7000"}],
+                    },
+                )
+            if url.endswith("/prepare_weights_update"):
+                return _FakeResponse(400, {"success": False, "message": "receiver registration failed"})
+            if url.endswith("/complete_weights_update"):
+                complete_calls.append((url, dict(json)))
+                return _FakeResponse(200, {"success": True, "message": "cleared"})
+            raise AssertionError(f"unexpected url {url}")
+
+        with patch("requests.post", side_effect=fake_post):
+            assert backend.initialize() is False
+
+        assert [url for url, _ in complete_calls] == [
+            "http://infer-0:5000/complete_weights_update",
+            "http://infer-1:5001/complete_weights_update",
+        ]
+        for _, body in complete_calls:
+            assert body["group_name"] == "weight_sync_group"
+            assert body["transport"] == "p2p"
+            assert body["flush_cache"] is False
 
     def test_cached_prepare_can_reuse_existing_tensor_map(self):
         backend, _ = _make_backend()

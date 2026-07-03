@@ -712,13 +712,20 @@ def init_parallel_state(
         logger.info_rank0(f"EP FSDP device mesh: {ep_fsdp_device_mesh}")
 
     # lm-head-only tensor parallelism uses a SEPARATE per-module device mesh. The
-    # CP axis is factored cp_replica x lm_head_tp; the lm_head is FSDP-sharded over
-    # a 2-D mesh [replica, lm_head_tp] where the shard dim is lm_head_tp (vocab
-    # rows) and the replica dim is every other axis in the PP stage (DP-replicate,
-    # DP-shard and cp_replica). The model body keeps its own dp/fsdp/cp scheme;
-    # only the lm_head sees this mesh. Opt-in (lm_head_tp_size == 1 -> no-op).
-    # dp_shard is NEVER a vocab-shard axis (DP ranks own different tokens, which
-    # would make vocab-parallel CE wrong) -- it becomes a replica axis here.
+    # lm_head is FSDP-sharded over a 2-D mesh [replica, lm_head_tp] where the shard
+    # dim is lm_head_tp (vocab rows) and the replica dim is every other axis in the
+    # PP stage. The model body keeps its own dp/fsdp/cp scheme; only the lm_head
+    # sees this mesh. Opt-in (lm_head_tp_size == 1 -> no-op).
+    #
+    # Two layouts are supported:
+    # - CP-sourced: factor CP as cp_replica x lm_head_tp. This keeps TP groups
+    #   inside sequence-parallel cells.
+    # - DP-sourced (no CP): factor the innermost DP shard axis as
+    #   dp_replica x lm_head_tp. The loss gathers hidden states over the
+    #   lm_head_tp group before vocab-parallel CE, so DP ranks in the TP group
+    #   may own different tokens while still computing correct local hidden grads
+    #   and vocab-shard weight grads. Replica reductions then sum the same vocab
+    #   shard across every non-TP axis, including HSDP's dp_replicate axis.
     lm_head_mesh = None
     lm_head_tp_group = None
     lm_head_tp_replica_group = None
@@ -726,13 +733,6 @@ def init_parallel_state(
         if not dist.is_initialized() or device_mesh is None:
             raise RuntimeError("lm_head_tp_size>1 requires an initialized process group and device mesh.")
         cp_size = ringattn_size * ulysses_size
-        if cp_size <= 1:
-            raise NotImplementedError(
-                "lm_head_tp_size>1 requires context/sequence parallelism (ringattn or ulysses); it carves the "
-                "lm-head TP group from the CP axis and must not steal DP ranks."
-            )
-        if cp_size % lm_head_tp_size != 0 or lm_head_tp_size > cp_size:
-            raise ValueError(f"lm_head_tp_size ({lm_head_tp_size}) must be a divisor of the CP size ({cp_size}).")
         if tp_size != 1 or pp_size != 1:
             raise NotImplementedError(
                 "lm_head_tp_size>1 currently supports data + context + expert parallelism "
@@ -746,17 +746,32 @@ def init_parallel_state(
         # lm_head's CP-sharded hidden input is also unaffected by EP (which is
         # internal to the MoE layers). So the lm_head_mesh construction is identical
         # whether or not ep>1.
+        if cp_size > 1:
+            if cp_size % lm_head_tp_size != 0 or lm_head_tp_size > cp_size:
+                raise ValueError(f"lm_head_tp_size ({lm_head_tp_size}) must be a divisor of the CP size ({cp_size}).")
+            source_axis_size = cp_size
+            source_replica = cp_size // lm_head_tp_size
+            source_axis = "cp"
+        else:
+            if dp_shard_size % lm_head_tp_size != 0 or lm_head_tp_size > dp_shard_size:
+                raise ValueError(
+                    f"lm_head_tp_size ({lm_head_tp_size}) must be a divisor of "
+                    f"data_parallel_shard_size ({dp_shard_size}) when CP is disabled."
+                )
+            source_axis_size = dp_shard_size
+            source_replica = dp_shard_size // lm_head_tp_size
+            source_axis = "dp_shard" if dp_replicate_size > 1 else "dp"
         world = dist.get_world_size()
-        cp_replica = cp_size // lm_head_tp_size
         num_replica = world // lm_head_tp_size
-        # CP is the innermost contiguous block of the row-major device mesh when
-        # tp=pp=1 (EP is not a main-mesh axis), so within each CP group the inner
-        # lm_head_tp_size ranks form a TP (vocab-shard) group and the outer cp_replica
-        # index -- together with all DP ranks across CP groups -- form the replica axis.
+        # With tp=pp=1, EP is not a main-mesh axis and ranks are row-major over
+        # the main mesh. For CP-sourced TP, CP is the innermost contiguous block.
+        # For no-CP DP-sourced TP, each DP-shard row is the contiguous block. In
+        # both cases, consecutive lm_head_tp_size ranks form a TP group and the
+        # outer source_replica index contributes to the replica axis.
         mesh_tensor = torch.empty((num_replica, lm_head_tp_size), dtype=torch.int)
         for r in range(world):
-            pos = r % cp_size
-            replica_idx = (r // cp_size) * cp_replica + pos // lm_head_tp_size
+            pos = r % source_axis_size
+            replica_idx = (r // source_axis_size) * source_replica + pos // lm_head_tp_size
             mesh_tensor[replica_idx, pos % lm_head_tp_size] = r
         lm_head_mesh = DeviceMesh(
             device_type=device_type,
@@ -766,7 +781,8 @@ def init_parallel_state(
         lm_head_tp_group = lm_head_mesh.get_group("lm_head_tp")
         lm_head_tp_replica_group = lm_head_mesh.get_group("replica")
         logger.info_rank0(
-            f"lm-head TP: lm_head_tp_size={lm_head_tp_size}, cp_replica={cp_replica}, mesh={tuple(mesh_tensor.shape)}"
+            f"lm-head TP: lm_head_tp_size={lm_head_tp_size}, source_axis={source_axis}, "
+            f"source_replica={source_replica}, mesh={tuple(mesh_tensor.shape)}"
         )
 
     _PARALLEL_STATE = ParallelState(

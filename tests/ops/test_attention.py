@@ -1,20 +1,26 @@
 """Tests for attention backend functions."""
 
+import importlib
+import sys
+import types
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
+import xorl.models.layers.attention.backend as backend_module
+import xorl.models.layers.attention.backend.flash_attention as flash_module
 from xorl.models.layers.attention.backend import ATTENTION_FUNCTIONS, is_flash_attention
 from xorl.models.layers.attention.backend.eager import eager_attention_forward
 from xorl.models.layers.attention.utils import repeat_kv
 
 
 try:
-    from xorl.models.layers.attention.backend.flash_attention import flash_attention_forward
+    from xorl.models.layers.attention.backend.flash_attention import FA3_AVAILABLE, flash_attention_forward
 
     _FLASH_ATTN_IMPORT_ERROR = None
 except ImportError as exc:
+    FA3_AVAILABLE = False
     flash_attention_forward = None
     _FLASH_ATTN_IMPORT_ERROR = exc
 
@@ -27,6 +33,30 @@ class TestAttentionBackendRegistry:
         assert is_flash_attention("flash_attention_2") == ("flash_attention_2" in ATTENTION_FUNCTIONS)
         if "flash_attention_2" in ATTENTION_FUNCTIONS:
             assert ATTENTION_FUNCTIONS["flash_attention_2"] is ATTENTION_FUNCTIONS["flash_attention_3"]
+
+    def test_flash_attention_4_can_register_without_flash_attention_3_dependency(self, monkeypatch):
+        fake_flash_attn = types.ModuleType("flash_attn")
+        fake_flash_attn.__path__ = []
+        fake_cute = types.ModuleType("flash_attn.cute")
+        fake_cute.flash_attn_func = Mock()
+        fake_cute.flash_attn_varlen_func = Mock()
+
+        monkeypatch.setitem(sys.modules, "flash_attn_interface", None)
+        monkeypatch.setitem(sys.modules, "flash_attn", fake_flash_attn)
+        monkeypatch.setitem(sys.modules, "flash_attn.cute", fake_cute)
+
+        try:
+            reloaded_flash = importlib.reload(flash_module)
+            reloaded_backend = importlib.reload(backend_module)
+
+            assert not reloaded_flash.FA3_AVAILABLE
+            assert reloaded_flash.FA4_AVAILABLE
+            assert "flash_attention_3" not in reloaded_backend.ATTENTION_FUNCTIONS
+            assert "flash_attention_4" in reloaded_backend.ATTENTION_FUNCTIONS
+        finally:
+            monkeypatch.undo()
+            importlib.reload(flash_module)
+            importlib.reload(backend_module)
 
 
 class TestRepeatKV:
@@ -72,6 +102,8 @@ class TestFlashAttentionForward:
     def _skip_when_flash_attention_unavailable(self):
         if _FLASH_ATTN_IMPORT_ERROR is not None:
             pytest.skip(f"flash attention backend unavailable: {_FLASH_ATTN_IMPORT_ERROR}")
+        if not FA3_AVAILABLE:
+            pytest.skip("flash attention 3 backend unavailable")
 
     def test_flash_attention_api_behavior(self):
         """Warnings, is_causal handling, return values, scaling, sliding window."""
@@ -122,7 +154,7 @@ class TestFlashAttentionForward:
                 attention_mask=None,
                 is_causal=True,
             )
-            assert mock_fa.call_args[1]["causal"] == False
+            assert mock_fa.call_args[1]["causal"] is False
 
             # Returns None attention weights
             module.is_causal = True

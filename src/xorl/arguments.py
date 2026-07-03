@@ -530,13 +530,20 @@ class ModelArguments:
             "(e.g., tensor parallelism, independent LoRA per projection)."
         },
     )
-    rmsnorm_mode: Literal["eager", "native", "compile"] = field(
-        default="native",
-        metadata={
-            "help": "RMSNorm implementation mode. 'native' uses torch.nn.functional.rms_norm "
-            "and is the default. 'compile' runs that native path through torch.compile. "
-            "'eager' uses the plain eager implementation."
-        },
+    rmsnorm_mode: Literal["eager", "native", "compile", "sglang", "sglang_fused", "sglang_jit", "sglang_kernel"] = (
+        field(
+            default="native",
+            metadata={
+                "help": "RMSNorm implementation mode. 'native' uses torch.nn.functional.rms_norm "
+                "and is the default. 'compile' runs that native path through torch.compile. "
+                "'eager' uses the plain eager implementation. 'sglang' uses native RMSNorm for "
+                "no-residual calls and SGLang's native residual RMSNorm reduction order. "
+                "'sglang_fused' matches 'sglang' bit-for-bit but replaces its eager residual-style "
+                "norms with fused batch-invariant Triton kernels (faster training, K3 preserved). "
+                "'sglang_jit' uses SGLang's JIT CUDA RMSNorm kernels for forward parity diagnostics. "
+                "'sglang_kernel' uses SGLang's production sgl_kernel RMSNorm kernels for diagnostics."
+            },
+        )
     )
     router_fp32: bool = field(
         default=True, metadata={"help": "Upcast MoE router gate computation to float32 for numerical stability."}
@@ -1191,6 +1198,15 @@ class TrainingArguments:
         default=True,
         metadata={"help": "Enable forward prefetch in FSDP."},
     )
+    enable_backward_prefetch: Optional[bool] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Enable backward prefetch in FSDP. Defaults to the value of enable_forward_prefetch for "
+                "backward compatibility; set explicitly to test forward/backward prefetch independently."
+            )
+        },
+    )
     enable_activation_offload: bool = field(
         default=False,
         metadata={"help": "Enable activation offload to CPU."},
@@ -1230,6 +1246,16 @@ class TrainingArguments:
     enable_full_determinism: bool = field(
         default=False,
         metadata={"help": "Enable full determinism."},
+    )
+    high_precision_bf16: bool = field(
+        default=False,
+        metadata={
+            "help": "Disable TF32 and BF16 reduced-precision reductions in matmuls for consistent numerics "
+            "across parallelism strategies. Mirrors the server forward path (model_runner) so "
+            "trainer-recomputed logprobs match the values measured by the K3 harness against the server. "
+            "Costs matmul throughput on non-K3 workloads; leave disabled unless train/serve logprob "
+            "parity is required."
+        },
     )
     allow_cuda_launch_blocking: bool = field(
         default=False,

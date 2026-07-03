@@ -110,6 +110,42 @@ class TestDRGRPOLoss:
         # active tokens of 8 → 2× the previous numel-scaled value.
         assert_close(output.loss, torch.tensor(0.727356))
 
+    def test_logprob_temperature_changes_behavior_k3(self):
+        hidden_states = torch.tensor([[[1.0, -0.5], [0.25, 0.75]]])
+        weight = torch.tensor([[0.5, -1.0], [-0.25, 0.75], [1.0, 0.5]])
+        labels = torch.tensor([[0, 2]])
+        advantages = torch.zeros_like(labels, dtype=torch.float32)
+        raw_logprobs = torch.log_softmax(hidden_states @ weight.T, dim=-1)
+        old_logprobs = raw_logprobs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+
+        raw = drgrpo_loss_function(
+            hidden_states=hidden_states,
+            weight=weight,
+            labels=labels,
+            old_logprobs=old_logprobs,
+            advantages=advantages,
+            beta=0.0,
+            ce_mode="eager",
+        )
+        behavior = drgrpo_loss_function(
+            hidden_states=hidden_states,
+            weight=weight,
+            labels=labels,
+            old_logprobs=old_logprobs,
+            advantages=advantages,
+            beta=0.0,
+            ce_mode="eager",
+            logprob_temperature=0.7,
+        )
+
+        expected_behavior_logprobs = torch.log_softmax((hidden_states @ weight.T) / 0.7, dim=-1)
+        expected_behavior_logprobs = expected_behavior_logprobs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+
+        torch.testing.assert_close(raw.per_token_logprobs, old_logprobs)
+        torch.testing.assert_close(behavior.per_token_logprobs, expected_behavior_logprobs)
+        torch.testing.assert_close(raw.metrics["loss/kl_policy/mean"], torch.tensor(0.0), atol=1e-6, rtol=0.0)
+        assert behavior.metrics["loss/kl_policy/mean"].abs() > 1e-6
+
     def test_backward(self, inputs):
         """Backward pass produces expected gradient norm (regression test)."""
         d = inputs

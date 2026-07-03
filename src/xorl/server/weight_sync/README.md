@@ -612,7 +612,7 @@ Example:
 
 ```bash
 python scripts/weight_sync_delta_probe.py \
-  --delta-encoding-path /path/to/delta-encoding \
+  --delta-encoding-path /home/apanda/delta-encoding \
   --shape 4096x4096 \
   --dtype uint8 \
   --density 0.001 \

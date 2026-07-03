@@ -131,13 +131,18 @@ class ServerArguments:
         default=True, metadata={"help": "Upcast LM head logits computation to float32 for numerical stability."}
     )
 
-    rmsnorm_mode: Literal["eager", "native", "compile"] = field(
-        default="native",
-        metadata={
-            "help": "RMSNorm implementation mode. 'native' uses torch.nn.functional.rms_norm "
-            "and is the default. 'compile' runs that native path through torch.compile. "
-            "'eager' uses the plain eager implementation."
-        },
+    rmsnorm_mode: Literal["eager", "native", "compile", "sglang", "sglang_fused", "sglang_jit", "sglang_kernel"] = (
+        field(
+            default="native",
+            metadata={
+                "help": "RMSNorm implementation mode. 'native' uses torch.nn.functional.rms_norm "
+                "and is the default. 'compile' runs that native path through torch.compile. "
+                "'eager' uses the plain eager implementation. 'sglang' uses native RMSNorm for "
+                "no-residual calls and SGLang's native residual RMSNorm reduction order. "
+                "'sglang_jit' uses SGLang's JIT CUDA RMSNorm kernels for forward parity diagnostics. "
+                "'sglang_kernel' uses SGLang's production sgl_kernel RMSNorm kernels for diagnostics."
+            },
+        )
     )
 
     activation_native: bool = field(
@@ -211,10 +216,40 @@ class ServerArguments:
 
     tensor_parallel_size: int = field(default=1, metadata={"help": "Tensor parallelism size"})
 
+    lm_head_tensor_parallel_size: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Vocabulary tensor-parallel degree for only the LM head/loss. "
+                "Unlike tensor_parallel_size, this does not shard decoder layers or enter the main topology equation."
+            )
+        },
+    )
+
     ringattn_parallel_size: int = field(default=1, metadata={"help": "Ring attention parallel size"})
 
     cp_fsdp_mode: str = field(
         default="all", metadata={"help": "Sequence parallel FSDP mode: 'all', 'ulysses_only', 'ring_only', 'none'"}
+    )
+
+    fsdp_sharded_lm_head_loss: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Keep lm_head as a separate FSDP unit and compute cross-entropy against its local FSDP shard "
+                "using vocab-parallel CE over the FSDP group."
+            )
+        },
+    )
+
+    fsdp_sharded_lm_head_loss_num_chunks: int = field(
+        default=8,
+        metadata={
+            "help": (
+                "Number of local sequence chunks to use for fsdp_sharded_lm_head_loss. Higher values reduce "
+                "peak hidden/logit/all-reduce footprint at the cost of more small loss-kernel launches."
+            )
+        },
     )
 
     basic_modules: Optional[List[str]] = field(
@@ -234,6 +269,16 @@ class ServerArguments:
     enable_full_determinism: bool = field(default=False, metadata={"help": "Enable full deterministic execution."})
 
     enable_mixed_precision: bool = field(default=True, metadata={"help": "Enable mixed precision training"})
+
+    skip_param_upcast: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Skip the generic fp32 parameter upcast before parallelization. Useful for memory-constrained "
+                "TP/FSDP server bringup when bf16 serving-weight numerics are desired."
+            )
+        },
+    )
 
     enable_fp8_training: bool = field(
         default=False,
@@ -487,6 +532,16 @@ class ServerArguments:
         default=False, metadata={"help": "Enable FSDP forward prefetch for overlapping compute and communication"}
     )
 
+    enable_backward_prefetch: Optional[bool] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Enable FSDP backward prefetch. Defaults to enable_forward_prefetch for compatibility; "
+                "set explicitly to evaluate forward/backward prefetch independently."
+            )
+        },
+    )
+
     reshard_after_forward: bool = field(
         default=True, metadata={"help": "Reshard parameters after forward pass in FSDP2"}
     )
@@ -686,6 +741,59 @@ class ServerArguments:
         },
     )
 
+    r3_payload_transport: Literal["inline", "mooncake", "filesystem"] = field(
+        default="inline",
+        metadata={
+            "help": (
+                "Transport for large R3 routed_experts/routing-weight side payloads. 'inline' keeps the default "
+                "worker command broadcast behavior. 'mooncake' writes raw tensor bytes to Mooncake and broadcasts "
+                "metadata refs. 'filesystem' is an explicit fallback/debug path, not recommended for normal runs."
+            )
+        },
+    )
+
+    r3_payload_dir: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Shared directory for the explicit filesystem R3 payload fallback. Only valid when "
+                "r3_payload_transport='filesystem'."
+            )
+        },
+    )
+
+    r3_payload_keep: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Retain externalized R3 payloads after a request completes. Intended only for replay/debugging; "
+                "default cleanup removes Mooncake keys or filesystem fallback files."
+            )
+        },
+    )
+
+    r3_payload_namespace_prefix: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional Mooncake key namespace prefix for R3 side payloads. Only valid when "
+                "r3_payload_transport='mooncake'. Defaults to xorl/r3."
+            )
+        },
+    )
+
+    externalize_r3_payloads: bool = field(
+        default=False,
+        metadata={
+            "help": ("Deprecated alias for r3_payload_transport='mooncake'. Kept only for PR-426 compatibility.")
+        },
+    )
+
+    keep_r3_payloads: bool = field(
+        default=False,
+        metadata={"help": "Deprecated alias for r3_payload_keep."},
+    )
+
     storage_limit: str = field(
         default="10TB",
         metadata={
@@ -882,6 +990,45 @@ class ServerArguments:
     )
 
     # ========================================================================
+    # ZORL Configuration
+    # ========================================================================
+
+    enable_zorl: bool = field(
+        default=False,
+        metadata={"help": "Enable zeroth-order LoRA search metadata and session defaults for server training."},
+    )
+
+    zorl_b_sigma: float = field(
+        default=0.01,
+        metadata={"help": "Perturbation scale applied to LoRA-B when planning ZORL candidates."},
+    )
+
+    zorl_num_perturbation_pairs: int = field(
+        default=8,
+        metadata={"help": "Number of perturbation seeds per ZORL generation before antithetic expansion."},
+    )
+
+    zorl_a_refresh_interval: int = field(
+        default=16,
+        metadata={"help": "Generations between fresh LoRA-A family refreshes. 0 disables auto-refresh."},
+    )
+
+    zorl_antithetic_sampling: bool = field(
+        default=True,
+        metadata={"help": "Emit both positive and negative LoRA-B perturbations for each ZORL seed."},
+    )
+
+    zorl_a_init: Literal["gaussian_jl"] = field(
+        default="gaussian_jl",
+        metadata={"help": "Initialization scheme used for fresh ZORL LoRA-A families."},
+    )
+
+    zorl_seed: Optional[int] = field(
+        default=None,
+        metadata={"help": "Optional base RNG seed for ZORL family refresh and perturbation planning."},
+    )
+
+    # ========================================================================
     # MoE Training Configuration
     # ========================================================================
 
@@ -959,11 +1106,39 @@ class ServerArguments:
             )
         if self.pad_to_multiple_of < 1:
             raise ValueError(f"pad_to_multiple_of must be >= 1, got {self.pad_to_multiple_of}")
+        if self.externalize_r3_payloads:
+            if self.r3_payload_transport not in {"inline", "mooncake"}:
+                raise ValueError(
+                    "externalize_r3_payloads=True is a deprecated alias for "
+                    "r3_payload_transport='mooncake' and cannot be combined with filesystem transport"
+                )
+            self.r3_payload_transport = "mooncake"
+        if self.keep_r3_payloads:
+            self.r3_payload_keep = True
+        if self.r3_payload_transport == "inline":
+            if self.r3_payload_dir:
+                raise ValueError("r3_payload_dir requires r3_payload_transport='filesystem'")
+            if self.r3_payload_keep:
+                raise ValueError("r3_payload_keep requires r3_payload_transport != 'inline'")
+            if self.r3_payload_namespace_prefix:
+                raise ValueError("r3_payload_namespace_prefix requires r3_payload_transport='mooncake'")
+        elif self.r3_payload_transport == "mooncake":
+            if self.r3_payload_dir:
+                raise ValueError("r3_payload_dir is only valid with r3_payload_transport='filesystem'")
+        elif self.r3_payload_transport == "filesystem":
+            if self.r3_payload_namespace_prefix:
+                raise ValueError("r3_payload_namespace_prefix is only valid with r3_payload_transport='mooncake'")
+        else:
+            raise ValueError(
+                f"r3_payload_transport must be one of: inline, mooncake, filesystem; got {self.r3_payload_transport!r}"
+            )
 
         normalized_fp8_config = normalize_fp8_training_config(vars(self), context="server.train")
         self.enable_fp8_training = bool(normalized_fp8_config.get("enable_fp8_training", self.enable_fp8_training))
         if self.enable_qarl and self.enable_fp8_training:
-            raise ValueError("enable_qarl cannot be combined with enable_fp8_training; choose one low-precision train path")
+            raise ValueError(
+                "enable_qarl cannot be combined with enable_fp8_training; choose one low-precision train path"
+            )
         if self.enable_fp8_training and (self.enable_lora or self.enable_qlora):
             raise ValueError("enable_fp8_training is a full-weight mode and cannot be combined with LoRA or QLoRA")
         if self.enable_qarl and (self.enable_lora or self.enable_qlora):
@@ -1038,14 +1213,15 @@ class ServerArguments:
                 "load_checkpoint_path to materialize parameters from a DCP checkpoint. "
                 "Set load_checkpoint_path or choose a different load_weights_mode."
             )
+        if self.enable_zorl and not self.enable_lora:
+            raise ValueError("enable_zorl requires enable_lora=True")
         if self.receiver_kv_cache_dtype is not None:
             receiver_kv_cache_dtype = str(self.receiver_kv_cache_dtype).strip().lower()
             if receiver_kv_cache_dtype in {"", "none", "null"}:
                 self.receiver_kv_cache_dtype = None
             elif receiver_kv_cache_dtype not in {"auto", "fp8", "fp8_e4m3"}:
                 raise ValueError(
-                    "receiver_kv_cache_dtype must be one of: auto, fp8, fp8_e4m3; "
-                    f"got {self.receiver_kv_cache_dtype!r}"
+                    f"receiver_kv_cache_dtype must be one of: auto, fp8, fp8_e4m3; got {self.receiver_kv_cache_dtype!r}"
                 )
             else:
                 self.receiver_kv_cache_dtype = receiver_kv_cache_dtype
@@ -1086,6 +1262,10 @@ class ServerArguments:
             },
             "train": {
                 "output_dir": self.output_dir,
+                "r3_payload_transport": self.r3_payload_transport,
+                "r3_payload_dir": self.r3_payload_dir,
+                "r3_payload_keep": self.r3_payload_keep,
+                "r3_payload_namespace_prefix": self.r3_payload_namespace_prefix,
                 "seed": self.seed,
                 "enable_full_determinism": self.enable_full_determinism,
                 "data_parallel_mode": self.data_parallel_mode,
@@ -1094,9 +1274,13 @@ class ServerArguments:
                 "data_parallel_replicate_size": self.data_parallel_replicate_size,
                 "data_parallel_shard_size": self.data_parallel_shard_size,
                 "tensor_parallel_size": self.tensor_parallel_size,
+                "lm_head_tensor_parallel_size": self.lm_head_tensor_parallel_size,
                 "ringattn_parallel_size": self.ringattn_parallel_size,
                 "cp_fsdp_mode": self.cp_fsdp_mode,
+                "fsdp_sharded_lm_head_loss": self.fsdp_sharded_lm_head_loss,
+                "fsdp_sharded_lm_head_loss_num_chunks": self.fsdp_sharded_lm_head_loss_num_chunks,
                 "enable_mixed_precision": self.enable_mixed_precision,
+                "skip_param_upcast": self.skip_param_upcast,
                 "enable_fp8_training": self.enable_fp8_training,
                 "enable_qarl": self.enable_qarl,
                 "qarl_quant_cfg": self.qarl_quant_cfg,
@@ -1134,6 +1318,7 @@ class ServerArguments:
                 "compile_dynamic_shapes": self.compile_dynamic_shapes,
                 "enable_reentrant": self.enable_reentrant,
                 "enable_forward_prefetch": self.enable_forward_prefetch,
+                "enable_backward_prefetch": self.enable_backward_prefetch,
                 "reshard_after_forward": self.reshard_after_forward,
                 "load_weights_mode": self.load_weights_mode,
                 "init_device": self.init_device,
@@ -1196,6 +1381,15 @@ class ServerArguments:
                 "merge_lora_interval": self.merge_lora_interval,
                 "reset_optimizer_on_merge": self.reset_optimizer_on_merge,
                 "adapter_state_load_mode": self.adapter_state_load_mode,
+            },
+            "zorl": {
+                "enabled": self.enable_zorl,
+                "b_sigma": self.zorl_b_sigma,
+                "num_perturbation_pairs": self.zorl_num_perturbation_pairs,
+                "a_refresh_interval": self.zorl_a_refresh_interval,
+                "antithetic_sampling": self.zorl_antithetic_sampling,
+                "a_init": self.zorl_a_init,
+                "seed": self.zorl_seed,
             },
         }
         return config

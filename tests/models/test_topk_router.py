@@ -14,7 +14,10 @@ Covers:
 import pytest
 import torch
 import torch.nn.functional as F
+from torch import nn
 
+from xorl.models.layers.moe import moe_block as moe_block_module
+from xorl.models.layers.moe.moe_block import MoEBlock, _router_fp32_layers_enabled
 from xorl.models.layers.moe.router import TopKRouter
 
 
@@ -90,6 +93,112 @@ def test_synthetic_balanced_routing_overrides_softmax_selection(monkeypatch):
 
     expected_weights = torch.full((num_tokens, top_k), 1.0 / top_k)
     torch.testing.assert_close(weights, expected_weights)
+
+
+@pytest.mark.parametrize(
+    ("policy", "expected_experts"),
+    [
+        ("stable_low_id", [[0, 1], [0, 1]]),
+        ("tie_low_id", [[0, 1], [0, 1]]),
+        ("tie_high_id", [[2, 1], [3, 1]]),
+    ],
+)
+def test_softmax_topk_diagnostic_policy_breaks_ties_without_changing_weights(
+    monkeypatch,
+    policy,
+    expected_experts,
+):
+    monkeypatch.setenv("XORL_MOE_ROUTER_TOPK_POLICY", policy)
+    logits = torch.tensor(
+        [
+            [1.0, 1.0, 1.0, 0.0],
+            [0.5, 0.5, 0.0, 0.5],
+        ]
+    )
+    router = TopKRouter(num_experts=4, top_k=2, norm_topk_prob=True)
+
+    weights, experts = router(logits, input_dtype=torch.float32)
+
+    expected_experts = torch.tensor(expected_experts, dtype=torch.long)
+    assert torch.equal(experts, expected_experts)
+    probs = F.softmax(logits, dim=1, dtype=torch.float32)
+    expected_weights = torch.gather(probs, dim=1, index=expected_experts)
+    expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
+    torch.testing.assert_close(weights, expected_weights)
+
+
+def test_softmax_topk_logits_policy_selects_from_logits_and_gathers_softmax(monkeypatch):
+    monkeypatch.setenv("XORL_MOE_ROUTER_TOPK_POLICY", "logits")
+    logits = torch.tensor([[0.0, 1.0, 3.0, 2.0]])
+    router = TopKRouter(num_experts=4, top_k=2, norm_topk_prob=False)
+
+    weights, experts = router(logits, input_dtype=torch.float32)
+
+    expected_experts = torch.tensor([[2, 3]])
+    assert torch.equal(experts, expected_experts)
+    probs = F.softmax(logits, dim=1, dtype=torch.float32)
+    torch.testing.assert_close(weights, torch.gather(probs, dim=1, index=expected_experts))
+
+
+def test_invalid_softmax_topk_diagnostic_policy_raises(monkeypatch):
+    monkeypatch.setenv("XORL_MOE_ROUTER_TOPK_POLICY", "surprise")
+    router = TopKRouter(num_experts=4, top_k=2)
+
+    with pytest.raises(ValueError, match="XORL_MOE_ROUTER_TOPK_POLICY"):
+        router(torch.randn(2, 4), input_dtype=torch.float32)
+
+
+def test_router_fp32_layers_selector(monkeypatch):
+    monkeypatch.delenv("XORL_MOE_ROUTER_FP32_LAYERS", raising=False)
+    assert not _router_fp32_layers_enabled(15)
+
+    monkeypatch.setenv("XORL_MOE_ROUTER_FP32_LAYERS", "14,15-16")
+    assert not _router_fp32_layers_enabled(13)
+    assert _router_fp32_layers_enabled(14)
+    assert _router_fp32_layers_enabled(15)
+    assert _router_fp32_layers_enabled(16)
+    assert not _router_fp32_layers_enabled(17)
+
+    monkeypatch.setenv("XORL_MOE_ROUTER_FP32_LAYERS", "all")
+    assert _router_fp32_layers_enabled(None)
+
+
+def test_moe_block_uses_layer_scoped_router_fp32(monkeypatch):
+    class RecordingGate(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(2, 2, dtype=torch.bfloat16))
+            self.called = False
+
+        def forward(self, hidden_states):
+            self.called = True
+            return torch.zeros(hidden_states.shape[0], 2, dtype=hidden_states.dtype)
+
+    block = MoEBlock(
+        hidden_size=2,
+        num_experts=2,
+        top_k=1,
+        intermediate_size=4,
+        moe_implementation="eager",
+        train_router=False,
+    )
+    block.layer_idx = 15
+    block.gate = RecordingGate()
+    calls = []
+
+    def fake_linear(hidden_states, weight, bias=None):
+        calls.append((hidden_states.dtype, weight.dtype, bias))
+        return torch.tensor([[0.0, 1.0], [1.0, 0.0]], dtype=torch.float32)
+
+    monkeypatch.setenv("XORL_MOE_ROUTER_FP32_LAYERS", "15")
+    monkeypatch.setattr(moe_block_module.F, "linear", fake_linear)
+
+    _, selected_experts, router_logits = block.route(torch.ones(2, 2, dtype=torch.bfloat16))
+
+    assert calls == [(torch.float32, torch.float32, None)]
+    assert not block.gate.called
+    assert router_logits.dtype == torch.float32
+    assert torch.equal(selected_experts, torch.tensor([[1], [0]]))
 
 
 # ---------------------------------------------------------------------------

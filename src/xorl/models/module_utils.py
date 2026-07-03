@@ -2478,6 +2478,16 @@ def _distributed_save_barrier(
         dist.barrier(group=group)
 
 
+def _is_qarl_state_name(name: str) -> bool:
+    """True for QARLLinear observer/scale buffers (``qarl_*``).
+
+    QAT (qarl) registers per-module buffers (``qarl_input_amax``, ``qarl_weight_scale_inv``,
+    ``qarl_forward_count`` ...) that are training state, not model weights, so they must be
+    excluded from saved HF checkpoints.
+    """
+    return name.rsplit(".", 1)[-1].startswith("qarl_")
+
+
 @torch.no_grad()
 def save_model_weights(
     output_dir: Union[str, "os.PathLike"],
@@ -2496,6 +2506,13 @@ def save_model_weights(
     If checkpoint_handler is given, applies save transforms (e.g., splitting
     gate_up_proj back into gate_proj + up_proj for HF checkpoint compatibility).
     """
+    # Drop QARL fake-quant observer/scale buffers (qarl_*): they are training state, not
+    # model weights. Besides not belonging in an HF checkpoint, checkpoint handlers match
+    # fused projections by substring and would route these buffers through the qkv/gate_up
+    # unfuse-split -> crash on the 0-dim scalars (or mis-split the 2-D scale buffer).
+    if any(_is_qarl_state_name(name) for name in state_dict):
+        state_dict = OrderedDict((n, t) for n, t in state_dict.items() if not _is_qarl_state_name(n))
+
     # Apply checkpoint handler save transforms before computing shard info
     if checkpoint_handler is not None:
         transformed = OrderedDict()
@@ -2787,14 +2804,15 @@ def compute_loss(
             raise NotImplementedError(f"Unsupported fsdp_sharded_lm_head_loss parameters: {sorted(loss_params.keys())}")
 
         # lm-head-only TP: the vocab is split over a dedicated lm_head_tp_group
-        # (a sub-group of the sequence-parallel ranks) while every other module
-        # keeps its scheme. Each lm_head_tp_group computes the CE over its own
-        # sequence shard; summing over the replica dim (cp_replica x DP, the ranks
-        # holding the *same* vocab rows but distinct sequence shards) reconstructs
-        # the full-sequence loss with no duplication, so divisor=1. This reduction
-        # is non-differentiable; the matching weight-gradient sum over the same
-        # replica dim is done by sync_lm_head_tp_gradient (FSDP's reduce hook does
-        # not fire because the vocab-parallel CE reads lm_head.weight directly).
+        # while every other module keeps its scheme. In CP-sourced mode the group
+        # is carved from sequence-parallel ranks; in no-CP mode it is carved from
+        # DP ranks and this loss gathers distinct DP hidden states before
+        # vocab-parallel CE. Summing over the replica dim (ranks holding the same
+        # vocab rows but distinct token groups) reconstructs the full loss with no
+        # duplication, so divisor=1. This reduction is non-differentiable; the
+        # matching weight-gradient sum over the same replica dim is done by
+        # sync_lm_head_tp_gradient (FSDP's reduce hook does not fire because the
+        # vocab-parallel CE reads lm_head.weight directly).
         # Regular fsdp_sharded_lm_head_loss (lm_head_tp_size == 1) leaves these
         # None -> sp_group/fsdp_group.
         if getattr(ps, "lm_head_tp_size", 1) > 1:

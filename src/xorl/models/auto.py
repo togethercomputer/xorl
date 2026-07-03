@@ -199,7 +199,9 @@ def build_foundation_model(
     alltoall_combine_hidden_chunk_size: int = 0,
     router_fp32: bool = True,
     lm_head_fp32: bool = True,
-    rmsnorm_mode: Literal["eager", "native", "compile"] = "native",
+    rmsnorm_mode: Literal[
+        "eager", "native", "compile", "sglang", "sglang_fused", "sglang_jit", "sglang_kernel"
+    ] = "native",
     activation_native: bool = False,
     rope_native: bool = False,
     attention_cast_bf16: bool = False,

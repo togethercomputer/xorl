@@ -22,6 +22,7 @@ from xorl.models.layers.normalization import (
     eager_zero_centered_rms_norm,
     get_rmsnorm_mode,
     native_zero_centered_rms_norm,
+    native_zero_centered_rms_norm_without_batch_invariant,
 )
 from xorl.models.module_utils import MoEGradientCheckpointingLayer
 from xorl.models.outputs import MoeCausalLMOutput, MoeModelOutput
@@ -101,6 +102,7 @@ class Qwen3_5MoeRMSNorm(nn.Module):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         prenorm: bool = False,
+        force_sglang_residual: bool = False,
     ):
         residual_out: Optional[torch.Tensor] = None
         norm_input = x
@@ -114,6 +116,11 @@ class Qwen3_5MoeRMSNorm(nn.Module):
             out = native_zero_centered_rms_norm(norm_input, self.weight, self.eps)
         elif self.mode == "compile":
             out = compiled_zero_centered_rms_norm(norm_input, self.weight, self.eps)
+        elif self.mode == "sglang":
+            if residual_out is not None or force_sglang_residual:
+                out = native_zero_centered_rms_norm_without_batch_invariant(norm_input, self.weight, self.eps)
+            else:
+                out = native_zero_centered_rms_norm(norm_input, self.weight, self.eps)
         else:
             raise NotImplementedError(f"Unsupported rmsnorm_mode for Qwen3.5 MoE RMSNorm: {self.mode}")
 
@@ -216,7 +223,7 @@ class Qwen3_5MoeAttention(nn.Module):
 
 
 class Qwen3_5MoeSparseMoeBlock(MoEBlock):
-    def __init__(self, config, moe_implementation="triton"):
+    def __init__(self, config, moe_implementation="triton", layer_idx: int | None = None):
         super().__init__(
             hidden_size=config.hidden_size,
             num_experts=config.num_experts,
@@ -229,6 +236,7 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
             activation_native=getattr(config, "_activation_native", False),
         )
         self.config = config
+        self.layer_idx = layer_idx
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
         self.experts.deepep_buffer_size_gb = getattr(config, "_deepep_buffer_size_gb", 2.0)
         self.experts.deepep_num_sms = getattr(config, "_deepep_num_sms", 20)
@@ -265,6 +273,7 @@ QWEN3_5_MOE_CLASSES = {
 class Qwen3_5MoeDecoderLayer(MoEGradientCheckpointingLayer):
     def __init__(self, config: Qwen3_5MoeConfig, layer_idx: int):
         super().__init__()
+        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.layer_type = config.layer_types[layer_idx] if layer_idx < len(config.layer_types) else "full_attention"
         self.self_attn = None
@@ -292,7 +301,7 @@ class Qwen3_5MoeDecoderLayer(MoEGradientCheckpointingLayer):
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
             moe_implementation = getattr(config, "_moe_implementation", "triton")
-            self.mlp = QWEN3_5_MOE_CLASSES[moe_implementation](config)
+            self.mlp = QWEN3_5_MOE_CLASSES[moe_implementation](config, layer_idx=layer_idx)
         else:
             self.mlp = Qwen3_5MoeMLP(config, intermediate_size=config.intermediate_size)
 
@@ -307,7 +316,10 @@ class Qwen3_5MoeDecoderLayer(MoEGradientCheckpointingLayer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Layernorm → attention → layernorm."""
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.input_layernorm(
+            hidden_states,
+            force_sglang_residual=self.layer_idx > 0 and self.input_layernorm.mode == "sglang",
+        )
 
         if self.linear_attn is not None:
             cu_seqlens = kwargs.get("cu_seq_lens_q")
@@ -571,7 +583,11 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
             if output_router_logits:
                 all_router_logits += (layer_outputs[-1],)
 
-        hidden_states = self.norm(hidden_states) if self.norm is not None else hidden_states
+        if self.norm is not None:
+            hidden_states = self.norm(
+                hidden_states,
+                force_sglang_residual=getattr(self.norm, "mode", None) == "sglang",
+            )
         return MoeModelOutput(
             last_hidden_state=hidden_states,
             attentions=all_self_attns,

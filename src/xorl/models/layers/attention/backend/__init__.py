@@ -70,14 +70,16 @@ ATTENTION_FUNCTIONS: Dict[str, Callable] = {
 
 # Register flash attention implementations at import time.
 try:
-    from .flash_attention import FA4_AVAILABLE, flash_attention_forward
+    from .flash_attention import FA3_AVAILABLE, FA4_AVAILABLE, flash_attention_forward
 
-    ATTENTION_FUNCTIONS["flash_attention_2"] = flash_attention_forward
-    ATTENTION_FUNCTIONS["flash_attention_3"] = flash_attention_forward
+    if FA3_AVAILABLE:
+        ATTENTION_FUNCTIONS["flash_attention_2"] = flash_attention_forward
+        ATTENTION_FUNCTIONS["flash_attention_3"] = flash_attention_forward
 
     if FA4_AVAILABLE:
         ATTENTION_FUNCTIONS["flash_attention_4"] = partial(flash_attention_forward, use_fa4=True)
 except ImportError:
+    FA3_AVAILABLE = False
     FA4_AVAILABLE = False
 
 

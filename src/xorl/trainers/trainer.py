@@ -79,6 +79,7 @@ from xorl.trainers.training_utils import (
     pad_micro_batches_for_pp,
     scale_model_gradients,
     sync_lm_head_tp_gradient,
+    sync_lm_head_tp_parameters,
     sync_sp_gradients,
 )
 from xorl.utils import helper
@@ -375,8 +376,23 @@ class Trainer:
 
         helper.set_seed(args.train.seed, args.train.enable_full_determinism)
 
+        if args.train.high_precision_bf16:
+            # Disable TF32 and BF16 reduced-precision accumulation for consistent
+            # numerics across parallelism strategies. Mirrors the server forward
+            # path (model_runner) so trainer-recomputed logprobs match the values
+            # measured by the K3 harness against the server.
+            helper.enable_high_precision_for_bf16()
+
         if args.train.local_rank == 0:
             helper.enable_third_party_logging()
+
+        if os.environ.get("XORL_BATCH_INVARIANT_MATMUL", "0") == "1":
+            from xorl.ops.batch_invariant_ops import enable_batch_invariant_mode  # noqa: PLC0415
+
+            enable_batch_invariant_mode()
+            logger.info_rank0(
+                "XORL_BATCH_INVARIANT_MATMUL=1: enabled SGLang-compatible batch-invariant ops"
+            )
 
         if args.train.global_rank == 0:
             save_args(args, args.train.output_dir)
@@ -444,6 +460,8 @@ class Trainer:
             "ce_mode": args.train.ce_mode,
             "num_chunks": args.train.ce_num_chunks,
         }
+        if args.train.ce_mode != "quack_linear":
+            self._causallm_loss_params["lm_head_fp32"] = args.model.lm_head_fp32
         if args.train.fsdp_sharded_lm_head_loss:
             self._causallm_loss_params["fsdp_sharded_lm_head_loss_num_chunks"] = (
                 args.train.fsdp_sharded_lm_head_loss_num_chunks
@@ -897,6 +915,7 @@ class Trainer:
             enable_reentrant=args.train.enable_reentrant,
             gradient_checkpointing_method=args.train.gradient_checkpointing_method,
             enable_forward_prefetch=args.train.enable_forward_prefetch,
+            enable_backward_prefetch=args.train.enable_backward_prefetch,
             load_weights_mode=args.train.load_weights_mode,
             pp_schedule=args.train.pipeline_parallel_schedule if args.train.pipeline_parallel_size > 1 else None,
             reshard_after_forward=args.train.reshard_after_forward,
@@ -1078,6 +1097,8 @@ class Trainer:
             except Exception:
                 pass
         self.Checkpointer.load(args.train.load_checkpoint_path, state)
+        if getattr(self.ps, "lm_head_tp_size", 1) > 1:
+            sync_lm_head_tp_parameters(self.model, self.ps.lm_head_tp_replica_group)
 
         extra = state.get("extra_state", {})
         self.state.global_step = extra.get("global_step", 0)

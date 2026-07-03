@@ -6,6 +6,7 @@ from tests._helpers.opd import reference_opd_loss
 from tests.ops.loss.conftest import assert_close
 from xorl.distillation.teacher_store import TeacherHeadShardView, TeacherHeadStore, prepare_lm_head_teacher_store
 from xorl.ops.loss import TokenPartial, opd_loss_function
+from xorl.ops.loss.opd_loss import _oprd_hidden_distance, _oprd_hidden_distance_from_fetcher
 
 
 pytestmark = pytest.mark.cpu
@@ -312,3 +313,47 @@ def test_opd_loss_hidden_only_mse_with_zero_kl_weight_returns_hidden_term():
     assert weight.grad is None
     # The KL forward still runs, so the diagnostic metric is preserved for monitoring.
     assert "opd_kl" in out.metrics
+
+
+def test_oprd_hidden_distance_matches_full_materialization_and_detaches_teacher():
+    torch.manual_seed(23)
+    student = torch.randn(3, 5, 7, dtype=torch.bfloat16).requires_grad_(True)
+    teacher = torch.randn(3, 5, 7, dtype=torch.bfloat16).requires_grad_(True)
+
+    distance, num_layers = _oprd_hidden_distance(student, teacher, expected_rows=3, layer_chunk_size=2)
+
+    expected = (student.float() - teacher.float()).square().mean(dim=-1).mean(dim=-1)
+    torch.testing.assert_close(distance, expected)
+    assert num_layers == 5
+
+    distance.sum().backward()
+    assert student.grad is not None and student.grad.isfinite().all()
+    assert teacher.grad is None
+
+
+def test_oprd_hidden_distance_from_fetcher_matches_full_materialization():
+    torch.manual_seed(24)
+    student = torch.randn(3, 5, 7, dtype=torch.bfloat16).requires_grad_(True)
+    teacher = torch.randn(3, 5, 7, dtype=torch.bfloat16).requires_grad_(True)
+    fetched_slices = []
+
+    def fetcher(start: int, end: int) -> torch.Tensor:
+        fetched_slices.append((start, end))
+        return teacher[:, start:end, :]
+
+    distance, num_layers = _oprd_hidden_distance_from_fetcher(
+        student,
+        teacher_layer_fetcher=fetcher,
+        expected_rows=3,
+        num_layers=5,
+        layer_chunk_size=2,
+    )
+
+    expected = (student.float() - teacher.float()).square().mean(dim=-1).mean(dim=-1)
+    torch.testing.assert_close(distance, expected)
+    assert num_layers == 5
+    assert fetched_slices == [(0, 2), (2, 4), (4, 5)]
+
+    distance.sum().backward()
+    assert student.grad is not None and student.grad.isfinite().all()
+    assert teacher.grad is None

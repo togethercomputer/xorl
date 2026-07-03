@@ -56,6 +56,14 @@ def _get_reduce_scatter_group_size(fsdp_module: FSDPModule) -> Optional[int]:
         return None
 
 
+def _mesh_summary(mesh) -> str:
+    if mesh is None:
+        return "None"
+    names = tuple(getattr(mesh, "mesh_dim_names", ()) or ())
+    shape = tuple(mesh.mesh.shape)
+    return f"shape={shape} names={names} size={mesh.size()}"
+
+
 def _set_sum_gradient_divide_factor(fsdp_module: FSDPModule) -> None:
     state = fsdp_module._get_fsdp_state()
     param_group = state._fsdp_param_group
@@ -193,6 +201,53 @@ def _sequence_parallel_fully_folded_into_fsdp(parallel_state) -> bool:
     )
 
 
+def _coerce_optional_bool_config(value: Any, *, name: str) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    raise ValueError(f"{name} must be a boolean value, got {value!r}.")
+
+
+def _configure_manual_fsdp_prefetch(
+    blocks: List["nn.Module"],
+    *,
+    need_manual_prefetch: bool,
+    enable_forward_prefetch: bool,
+    enable_backward_prefetch: bool,
+) -> None:
+    if not need_manual_prefetch:
+        return
+
+    if enable_forward_prefetch:
+        next_blocks = blocks[1:] + [None]
+        for current_block, next_block in zip(blocks, next_blocks):
+            if next_block is not None:
+                prefetch_modules = next_block._fsdp_modules
+                # prefetch in order of attn, gate, experts
+                current_block.set_modules_to_forward_prefetch(list(reversed(prefetch_modules)))
+    else:
+        logger.info_rank0("Manual FSDP forward module prefetch disabled by enable_forward_prefetch=False.")
+
+    if enable_backward_prefetch:
+        rev_blocks = list(reversed(blocks))
+        prev_blocks = rev_blocks[1:] + [None]
+        for current_block, prev_block in zip(rev_blocks, prev_blocks):
+            if prev_block is not None:
+                prefetch_modules = prev_block._fsdp_modules
+                current_block.set_modules_to_backward_prefetch(list(reversed(prefetch_modules)))
+    else:
+        logger.info_rank0("Manual FSDP backward module prefetch disabled.")
+
+
 def parallelize_model_fsdp2(
     model: "nn.Module",
     weights_path: Optional[str] = None,
@@ -214,7 +269,22 @@ def parallelize_model_fsdp2(
     4. Result: Expert params [32,H/fsdp_size,I], regular params use standard FSDP2
     """
     parallel_state = get_parallel_state()
-    enable_manual_prefetch = bool(kwargs.pop("enable_forward_prefetch", True))
+    enable_manual_forward_prefetch = _coerce_optional_bool_config(
+        kwargs.pop("enable_forward_prefetch", True),
+        name="enable_forward_prefetch",
+    )
+    if enable_manual_forward_prefetch is None:
+        enable_manual_forward_prefetch = True
+    enable_manual_backward_prefetch_arg = kwargs.pop("enable_backward_prefetch", None)
+    enable_manual_backward_prefetch_arg = _coerce_optional_bool_config(
+        enable_manual_backward_prefetch_arg,
+        name="enable_backward_prefetch",
+    )
+    enable_manual_backward_prefetch = (
+        enable_manual_forward_prefetch
+        if enable_manual_backward_prefetch_arg is None
+        else bool(enable_manual_backward_prefetch_arg)
+    )
 
     # Step 0: Get target classes to shard later
     target_classes = set((getattr(model, "_no_split_modules", []) or []) + (basic_modules or []))
@@ -271,6 +341,14 @@ def parallelize_model_fsdp2(
 
     # Step 2: Update fsdp2 kwargs
     fsdp_kwargs = {"mesh": parallel_state.fsdp_mesh}
+    logger.info_rank0(
+        "FSDP topology: "
+        f"body_fsdp_mesh={_mesh_summary(parallel_state.fsdp_mesh)} "
+        f"dp_replicate_mesh={_mesh_summary(parallel_state.dp_replicate_mesh if parallel_state.dp_replicate_enabled else None)} "
+        f"dp_shard_mesh={_mesh_summary(parallel_state.dp_shard_mesh if parallel_state.dp_shard_enabled else None)} "
+        f"ep_fsdp_mesh={_mesh_summary(parallel_state.ep_fsdp_device_mesh['ep_fsdp'] if parallel_state.ep_enabled else None)} "
+        f"lm_head_mesh={_mesh_summary(parallel_state.lm_head_mesh)}"
+    )
     # reshard_after_forward: None = auto (False for PP, True/default for non-PP)
     if reshard_after_forward is not None:
         fsdp_kwargs["reshard_after_forward"] = reshard_after_forward
@@ -396,8 +474,11 @@ def parallelize_model_fsdp2(
             raise NotImplementedError("fsdp_sharded_lm_head_loss is not supported with pipeline parallelism.")
         if parallel_state.tp_enabled:
             raise NotImplementedError("fsdp_sharded_lm_head_loss is not supported with tensor parallelism.")
-        if not parallel_state.cp_enabled:
-            raise NotImplementedError("fsdp_sharded_lm_head_loss currently requires sequence parallelism.")
+        if not parallel_state.cp_enabled and not lm_head_tp:
+            raise NotImplementedError(
+                "fsdp_sharded_lm_head_loss currently requires sequence parallelism unless "
+                "lm_head_tensor_parallel_size>1 supplies a dedicated vocab TP group."
+            )
         if parallel_state.dp_size != 1 and not lm_head_tp:
             # Without lm-head-only TP the vocab shard == FSDP shard, so DP ranks
             # (different tokens) cannot share a vocab-parallel CE. With lm-head TP
@@ -468,24 +549,13 @@ def parallelize_model_fsdp2(
 
     # configure manual prefetching when needed
     need_manual_prefetch = parallel_state.ep_enabled or mp_ignored_classes is not None
-    if need_manual_prefetch and enable_manual_prefetch:
-        blocks = [pair[1] for pair in layer_pairs]
-        next_blocks = blocks[1:] + [None]
-        for current_block, next_block in zip(blocks, next_blocks):
-            if next_block is not None:
-                prefetch_modules = next_block._fsdp_modules
-                # prefetch in order of attn, gate, experts
-                current_block.set_modules_to_forward_prefetch(list(reversed(prefetch_modules)))
-
-        # configure backward prefetch
-        rev_blocks = list(reversed(blocks))
-        prev_blocks = rev_blocks[1:] + [None]
-        for current_block, prev_block in zip(rev_blocks, prev_blocks):
-            if prev_block is not None:
-                prefetch_modules = prev_block._fsdp_modules
-                current_block.set_modules_to_backward_prefetch(list(reversed(prefetch_modules)))
-    elif need_manual_prefetch:
-        logger.info_rank0("Manual FSDP module prefetch disabled by enable_forward_prefetch=False.")
+    blocks = [pair[1] for pair in layer_pairs]
+    _configure_manual_fsdp_prefetch(
+        blocks,
+        need_manual_prefetch=need_manual_prefetch,
+        enable_forward_prefetch=enable_manual_forward_prefetch,
+        enable_backward_prefetch=enable_manual_backward_prefetch,
+    )
 
     # Disable FSDP's automatic gradient averaging for ALL modules (including EP experts).
     # Gradient normalisation is handled uniformly by the loss (gradient_accumulate_loss

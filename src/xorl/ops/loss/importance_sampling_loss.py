@@ -10,6 +10,16 @@ from xorl.ops.loss.per_token_ce import compute_per_token_ce
 from xorl.ops.loss.reducers import Reducer, TokenPartial
 
 
+K3_DEBUG_THRESHOLDS = (
+    ("1e_minus_6", 1e-6),
+    ("1e_minus_4", 1e-4),
+    ("1e_minus_3", 1e-3),
+    ("1e_minus_2", 1e-2),
+    ("1e_minus_1", 1e-1),
+    ("1", 1.0),
+)
+
+
 def importance_sampling_loss_function(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
@@ -26,6 +36,7 @@ def importance_sampling_loss_function(
     loss_reducer: Optional[Reducer] = None,
     metric_reducer: Optional[Reducer] = None,
     lm_head: Optional[torch.nn.Module] = None,
+    logprob_temperature: float = 1.0,
 ) -> "LossOutput":
     """
     Compute importance sampling loss for GRPO/RL training.
@@ -61,6 +72,10 @@ def importance_sampling_loss_function(
         metric_reducer: Reduces per-token /mean metrics (ratio_mean,
             kl_sample_train_k3, entropy_sample). ratio_min/ratio_max stay local
             scalars and bypass it.
+        logprob_temperature: Temperature applied to trainer logits before
+            selected-token logprob calculation. ``1.0`` is raw policy logprobs;
+            setting this to the rollout temperature yields behavior-policy
+            semantics for the sampled-token ratio.
 
     Returns:
         LossOutput with loss, per_token_logprobs, per_token_loss, and metrics.
@@ -95,6 +110,7 @@ def importance_sampling_loss_function(
         tp_group=tp_group,
         lm_head_fp32=lm_head_fp32,
         lm_head=lm_head,
+        logprob_temperature=logprob_temperature,
     )
 
     # new logprobs = log p(target) = -CE
@@ -136,7 +152,29 @@ def importance_sampling_loss_function(
             log_ratio_full = (new_logprobs_flat - old_logprobs_flat).masked_fill(~valid_mask, 0.0)
             ratio_full = torch.exp(log_ratio_full)
             per_token_k3 = ratio_full - log_ratio_full - 1.0
+            if valid_mask.any():
+                k3_max = per_token_k3.masked_fill(~valid_mask, float("-inf")).max()
+                logratio_min = log_ratio_full.masked_fill(~valid_mask, float("inf")).min()
+                logratio_max = log_ratio_full.masked_fill(~valid_mask, float("-inf")).max()
+                abs_logratio_max = log_ratio_full.abs().masked_fill(~valid_mask, float("-inf")).max()
+            else:
+                k3_max = per_token_k3.new_tensor(float("-inf"))
+                logratio_min = log_ratio_full.new_tensor(float("inf"))
+                logratio_max = log_ratio_full.new_tensor(float("-inf"))
+                abs_logratio_max = log_ratio_full.new_tensor(float("-inf"))
             metrics["kl_sample_train_k3"] = metric_reducer(per_token_k3, valid_mask_f)
+            metrics["kl_k3_debug_mean"] = metric_reducer(per_token_k3, valid_mask_f)
+            metrics["kl_k3_debug_max"] = k3_max
+            metrics["kl_k3_debug_abs_logratio_mean"] = metric_reducer(log_ratio_full.abs(), valid_mask_f)
+            metrics["kl_k3_debug_abs_logratio_max"] = abs_logratio_max
+            metrics["kl_k3_debug_logratio_mean"] = metric_reducer(log_ratio_full, valid_mask_f)
+            metrics["kl_k3_debug_logratio_min"] = logratio_min
+            metrics["kl_k3_debug_logratio_max"] = logratio_max
+            metrics["kl_k3_debug_frac_logratio_positive"] = metric_reducer((log_ratio_full > 0).float(), valid_mask_f)
+            for suffix, threshold in K3_DEBUG_THRESHOLDS:
+                metrics[f"kl_k3_debug_frac_gt_{suffix}"] = metric_reducer(
+                    (per_token_k3 > threshold).float(), valid_mask_f
+                )
             metrics["entropy_sample"] = metric_reducer(-old_logprobs_flat, valid_mask_f)
             metrics["valid_tokens"] = valid_count.item()
 
@@ -144,10 +182,21 @@ def importance_sampling_loss_function(
     per_token_logprobs = new_logprobs_flat.view(original_shape)
     per_token_loss = per_token_pg.view(original_shape)
 
+    metric_ops = {"ratio_min": "min", "ratio_max": "max"}
+    if compute_kl_stats:
+        metric_ops.update(
+            {
+                "kl_k3_debug_max": "max",
+                "kl_k3_debug_abs_logratio_max": "max",
+                "kl_k3_debug_logratio_min": "min",
+                "kl_k3_debug_logratio_max": "max",
+            }
+        )
+
     return LossOutput(
         loss=loss,
         per_token_logprobs=per_token_logprobs,
         per_token_loss=per_token_loss,
         metrics=metrics,
-        metric_ops={"ratio_min": "min", "ratio_max": "max"},
+        metric_ops=metric_ops,
     )

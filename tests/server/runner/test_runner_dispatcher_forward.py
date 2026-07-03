@@ -36,7 +36,12 @@ def test_handle_compute_rank0_scatter_uses_model_id_for_forward(monkeypatch):
 
     captured = {}
 
-    def fake_select_and_prepare_batches(batches, routed_experts=None, routed_expert_logits=None):
+    def fake_select_and_prepare_batches(
+        batches,
+        loss_fn_params=None,
+        routed_experts=None,
+        routed_expert_logits=None,
+    ):
         return batches, routed_experts, routed_expert_logits
 
     def fake_execute_and_gather(

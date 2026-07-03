@@ -20,6 +20,7 @@ async def test_sync_inference_weights_uses_backend_operation_timeout(monkeypatch
     await backend.sync_inference_weights(
         endpoints=[{"host": "inference.example", "port": 30000, "world_size": 4}],
         master_address="trainer.example",
+        cache_invalidation_mode="none",
         sparse_delta_paths=["/shared/delta.packed"],
         request_id="sync-req",
     )
@@ -27,6 +28,7 @@ async def test_sync_inference_weights_uses_backend_operation_timeout(monkeypatch
     assert captured["operation"] == "sync_inference_weights"
     assert captured["request_id"] == "sync-req"
     assert captured["timeout"] == 2400.0
+    assert captured["payload"].cache_invalidation_mode == "none"
     assert captured["payload"].sparse_delta_paths == ["/shared/delta.packed"]
 
 

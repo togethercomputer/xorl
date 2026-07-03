@@ -69,6 +69,8 @@ def sync_lm_head_tp_gradient(model: torch.nn.Module, lm_head_tp_replica_group) -
     """
     if lm_head_tp_replica_group is None:
         return
+    if dist.get_world_size(lm_head_tp_replica_group) <= 1:
+        return
     for module in model.modules():
         if not getattr(module, "_xorl_fsdp_sharded_lm_head_loss", False):
             continue
@@ -77,6 +79,35 @@ def sync_lm_head_tp_gradient(model: torch.nn.Module, lm_head_tp_replica_group) -
                 continue
             grad = p.grad.to_local() if DTensor is not None and isinstance(p.grad, DTensor) else p.grad
             dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=lm_head_tp_replica_group)
+
+
+def _group_root_rank(group) -> int:
+    if hasattr(dist, "get_global_rank"):
+        return int(dist.get_global_rank(group, 0))
+    return int(dist.get_process_group_ranks(group)[0])
+
+
+def sync_lm_head_tp_parameters(model: torch.nn.Module, lm_head_tp_replica_group) -> None:
+    """Broadcast lm-head-TP parameter shards over the replica dim after load.
+
+    The lm-head-only TP mesh shards vocab rows over ``lm_head_tp`` and replicates
+    each local vocab shard over DP/cp_replica. Gradients are summed over that
+    replica dim before optimizer step, so replicas stay identical once they start
+    identical. This post-load sync makes that invariant explicit for DCP loads
+    and model-only replay loads.
+    """
+    if lm_head_tp_replica_group is None:
+        return
+    if dist.get_world_size(lm_head_tp_replica_group) <= 1:
+        return
+    src = _group_root_rank(lm_head_tp_replica_group)
+    with torch.no_grad():
+        for module in model.modules():
+            if not getattr(module, "_xorl_fsdp_sharded_lm_head_loss", False):
+                continue
+            for p in module.parameters(recurse=False):
+                param = p.data.to_local() if DTensor is not None and isinstance(p.data, DTensor) else p.data
+                dist.broadcast(param, src=src, group=lm_head_tp_replica_group)
 
 
 def clip_gradients(
@@ -160,11 +191,12 @@ def count_valid_tokens(
     """Count valid (non-IGNORE_INDEX) tokens and all-reduce across group.
 
     Supports both "labels" and "target_tokens" keys for compatibility
-    with Trainer and ModelRunner respectively.
+    with Trainer and ModelRunner respectively. When both exist, prefer
+    target_tokens because RL losses use it as the actual selected-token mask.
     """
     global_valid_tokens = torch.tensor(0, device="cpu", dtype=torch.int64)
     for mb in micro_batches:
-        labels = mb.get("labels", mb.get("target_tokens"))
+        labels = mb.get("target_tokens", mb.get("labels"))
         if labels is not None:
             global_valid_tokens += (labels != IGNORE_INDEX).sum().to(device="cpu", dtype=torch.int64)
     return all_reduce_metadata_tensor(
@@ -199,7 +231,7 @@ def count_active_microbatches(
 
     flags = torch.zeros(len(micro_batches), device="cpu", dtype=torch.int64)
     for i, mb in enumerate(micro_batches):
-        labels = mb.get("labels", mb.get("target_tokens"))
+        labels = mb.get("target_tokens", mb.get("labels"))
         if labels is None:
             continue
         flags[i] = int((labels != IGNORE_INDEX).any().item())

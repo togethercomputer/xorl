@@ -87,7 +87,7 @@ def minimax_msa_attention_forward(
     try:
         from fmha_sm100 import fmha_sm100, fmha_sm100_plan, sparse_topk_select  # noqa: PLC0415
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeError("MiniMax MSA package fmha_sm100 is not importable; install the MSA package.") from exc
+        raise RuntimeError("MiniMax MSA package fmha_sm100 is not importable; install /home/apanda/MSA.") from exc
 
     q = query.reshape(-1, query.shape[2], query.shape[3]).contiguous()
     iq = index_query.reshape(-1, index_query.shape[2], index_query.shape[3]).contiguous()

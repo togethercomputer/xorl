@@ -97,6 +97,59 @@ def test_load_server_arguments_threads_signsgd_through_nested_config(tmp_path):
     assert args.to_config_dict()["train"]["load_weights_mode"] == "grouped"
 
 
+def test_load_server_arguments_threads_load_optimizer_through_nested_config(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "model_path": "Qwen/Qwen3-8B",
+                },
+                "train": {
+                    "output_dir": str(tmp_path / "outputs"),
+                    "load_checkpoint_path": "/tmp/initial-dcp",
+                    "load_optimizer": False,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = load_server_arguments(str(config_path))
+    train_config = args.to_config_dict()["train"]
+
+    assert args.load_optimizer is False
+    assert train_config["load_checkpoint_path"] == "/tmp/initial-dcp"
+    assert train_config["load_optimizer"] is False
+
+
+def test_load_server_arguments_threads_backward_prefetch_override(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "model_path": "Qwen/Qwen3-8B",
+                },
+                "train": {
+                    "output_dir": str(tmp_path / "outputs"),
+                    "enable_forward_prefetch": False,
+                    "enable_backward_prefetch": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = load_server_arguments(str(config_path))
+    train_config = args.to_config_dict()["train"]
+
+    assert args.enable_forward_prefetch is False
+    assert args.enable_backward_prefetch is True
+    assert train_config["enable_forward_prefetch"] is False
+    assert train_config["enable_backward_prefetch"] is True
+
+
 def test_load_server_arguments_threads_distsignsgd_through_nested_config(tmp_path):
     config_path = tmp_path / "server_config.yaml"
     config_path.write_text(
@@ -149,6 +202,101 @@ def test_server_arguments_threads_hsdp_deferral_and_packing_pad(tmp_path):
     assert args.pad_to_multiple_of == 4096
     assert train_config["defer_grad_sync_in_accumulation"] is True
     assert train_config["pad_to_multiple_of"] == 4096
+
+
+def test_server_arguments_r3_payload_mooncake_transport_is_opt_in(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "model_path": "Qwen/Qwen3-8B",
+                },
+                "train": {
+                    "r3_payload_transport": "mooncake",
+                    "r3_payload_keep": True,
+                    "r3_payload_namespace_prefix": "tests/r3",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = load_server_arguments(str(config_path))
+
+    assert args.r3_payload_transport == "mooncake"
+    assert args.r3_payload_keep is True
+    assert args.r3_payload_namespace_prefix == "tests/r3"
+    assert args.to_config_dict()["train"]["r3_payload_transport"] == "mooncake"
+
+
+def test_server_arguments_legacy_externalize_alias_selects_mooncake(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "model_path": "Qwen/Qwen3-8B",
+                },
+                "train": {
+                    "externalize_r3_payloads": True,
+                    "keep_r3_payloads": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = load_server_arguments(str(config_path))
+
+    assert args.r3_payload_transport == "mooncake"
+    assert args.r3_payload_keep is True
+
+
+def test_server_arguments_r3_payload_dir_requires_filesystem_transport(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "model_path": "Qwen/Qwen3-8B",
+                },
+                "train": {
+                    "r3_payload_dir": str(tmp_path / "r3-payloads"),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="r3_payload_dir requires r3_payload_transport='filesystem'"):
+        load_server_arguments(str(config_path))
+
+
+def test_server_arguments_r3_payload_filesystem_fallback_is_explicit(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    payload_dir = tmp_path / "r3-payloads"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "model_path": "Qwen/Qwen3-8B",
+                },
+                "train": {
+                    "r3_payload_transport": "filesystem",
+                    "r3_payload_dir": str(payload_dir),
+                    "r3_payload_keep": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = load_server_arguments(str(config_path))
+
+    assert args.r3_payload_transport == "filesystem"
+    assert args.r3_payload_dir == str(payload_dir)
+    assert args.r3_payload_keep is True
 
 
 def test_load_server_arguments_threads_adapter_state_load_mode_into_lora_config(tmp_path):
@@ -593,6 +741,36 @@ def test_load_server_arguments_threads_receiver_kv_cache_dtype(tmp_path):
 
     assert args.receiver_kv_cache_dtype == "fp8_e4m3"
     assert args.to_config_dict()["train"]["receiver_kv_cache_dtype"] == "fp8_e4m3"
+
+
+def test_load_server_arguments_threads_lm_head_tp_loss_fields(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "model_path": "Qwen/Qwen3-8B",
+                },
+                "train": {
+                    "ulysses_parallel_size": 8,
+                    "lm_head_tensor_parallel_size": 8,
+                    "fsdp_sharded_lm_head_loss": True,
+                    "fsdp_sharded_lm_head_loss_num_chunks": 4,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = load_server_arguments(str(config_path))
+    train_config = args.to_config_dict()["train"]
+
+    assert args.lm_head_tensor_parallel_size == 8
+    assert args.fsdp_sharded_lm_head_loss is True
+    assert args.fsdp_sharded_lm_head_loss_num_chunks == 4
+    assert train_config["lm_head_tensor_parallel_size"] == 8
+    assert train_config["fsdp_sharded_lm_head_loss"] is True
+    assert train_config["fsdp_sharded_lm_head_loss_num_chunks"] == 4
 
 
 def test_qwen3_8b_fp8_bf16_islands_example_config_loads():
@@ -1631,6 +1809,7 @@ def test_load_server_arguments_preserves_runner_compatibility_fields(tmp_path):
                 "model": {
                     "model_path": "Qwen/Qwen3-8B",
                     "record_routing_weights": False,
+                    "rmsnorm_mode": "sglang",
                 },
                 "train": {
                     "enable_full_determinism": True,
@@ -1652,6 +1831,7 @@ def test_load_server_arguments_preserves_runner_compatibility_fields(tmp_path):
     config = args.to_config_dict()
 
     assert config["model"]["record_routing_weights"] is False
+    assert config["model"]["rmsnorm_mode"] == "sglang"
     assert config["train"]["enable_full_determinism"] is True
     assert config["train"]["cautious_weight_decay"] is True
     assert config["train"]["muon_distributed_mode"] == "full_gradient"

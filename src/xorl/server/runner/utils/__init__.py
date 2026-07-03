@@ -1,8 +1,10 @@
 from xorl.server.runner.utils.batch_utils import (
     apply_sequence_sharding,
+    batch_packed_rows,
     batch_slice_rank_and_size,
     convert_batch_to_tensors,
     ep_duplicate_batches_enabled,
+    positive_int_param,
     simple_sequence_shard,
     validate_batch_shapes,
 )
@@ -14,9 +16,11 @@ from xorl.server.runner.utils.validation import run_self_test, validate_token_id
 
 __all__ = [
     "apply_sequence_sharding",
+    "batch_packed_rows",
     "batch_slice_rank_and_size",
     "convert_batch_to_tensors",
     "ep_duplicate_batches_enabled",
+    "positive_int_param",
     "simple_sequence_shard",
     "validate_batch_shapes",
     "run_self_test",

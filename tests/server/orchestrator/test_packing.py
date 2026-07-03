@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 import torch
 
+from xorl.data.constants import IGNORE_INDEX
 from xorl.server.orchestrator.packing import (
     Packer,
     SequentialPacker,
@@ -137,6 +138,26 @@ def test_opd_teacher_hidden_states_pad_as_vectors():
 
     assert len(batches) == 1
     assert batches[0]["teacher_hidden_states"] == [[[1.0, 1.5], [2.0, 2.5], [3.0, 3.5], [0.0, 0.0]]]
+
+
+def test_packed_target_tokens_pad_with_ignore_index():
+    data = [
+        {
+            "input_ids": [1, 2, 3],
+            "target_tokens": [2, 3, 4],
+            "logprobs": [-0.1, -0.2, -0.3],
+            "advantages": [1.0, 0.0, 1.0],
+        }
+    ]
+    packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=4)
+    batches = packer.pack(data, max_seq_len=100, request_id="rl-pad")
+
+    assert len(batches) == 1
+    batch = batches[0]
+    assert batch["labels"] == [[2, -100, 4, -100]]
+    assert batch["target_tokens"] == [[2, -100, 4, -100]]
+    assert batch["logprobs"] == [[-0.1, -0.2, -0.3, 0]]
+    assert batch["advantages"] == [[1.0, 0.0, 1.0, 0]]
 
 
 def test_oprd_packing_keeps_global_and_local_teacher_cache_views():
@@ -274,6 +295,54 @@ def test_packing_disabled_does_not_overwrite_target_tokens_when_labels_are_prese
     assert batch["input_ids"] == [[1, 2, 3]]
     assert batch["labels"] == [[10, 20, 30]]
     assert batch["target_tokens"] == [[101, 102, 103]]
+
+
+def test_packing_disabled_applies_loss_masks_to_preserved_target_tokens():
+    packer = SequentialPacker(enable_packing=False, log_stats=False, pad_to_multiple_of=1)
+    datum = {
+        "input_ids": [1, 2, 3],
+        "labels": [10, 20, 30],
+        "target_tokens": [101, 102, 103],
+        "advantages": [1.0, 0.0, 1.0],
+    }
+
+    batches = packer.pack([datum], max_seq_len=1000, request_id="test-target-mask")
+
+    batch = batches[0]
+    assert batch["labels"] == [[10, -100, 30]]
+    assert batch["target_tokens"] == [[101, -100, 103]]
+
+
+def test_packing_pads_target_tokens_as_ignore_index():
+    """Packed RL datums must not count padding as valid DR-GRPO target tokens."""
+    packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=8)
+    data = [
+        {
+            "model_input": {"input_ids": [11, 22, 33]},
+            "loss_fn_inputs": {
+                "target_tokens": [22, 33, 44],
+                "logprobs": [-0.1, -0.2, -0.3],
+                "advantages": [1.0, 1.0, 1.0],
+            },
+        },
+        {
+            "model_input": {"input_ids": [55, 66]},
+            "loss_fn_inputs": {
+                "target_tokens": [66, 77],
+                "logprobs": [-0.4, -0.5],
+                "advantages": [-1.0, -1.0],
+            },
+        },
+    ]
+
+    batches = packer.pack(data, max_seq_len=1000, request_id="test-target-pad")
+
+    assert len(batches) == 1
+    batch = batches[0]
+    assert batch["target_tokens"] == [[22, 33, 44, 66, 77, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX]]
+    assert batch["labels"] == [[22, 33, 44, 66, 77, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX]]
+    assert batch["logprobs"] == [[-0.1, -0.2, -0.3, -0.4, -0.5, 0, 0, 0]]
+    assert batch["advantages"] == [[1.0, 1.0, 1.0, -1.0, -1.0, 0, 0, 0]]
 
 
 def test_position_ids_and_labels():

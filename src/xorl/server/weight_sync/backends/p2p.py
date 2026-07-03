@@ -1373,8 +1373,11 @@ class P2PTransportBackend(WeightTransportBackend):
         # to the orchestrator's 1800s timeout. The /prepare call is load-bearing for
         # re-arming the receiver's Mooncake buffers (the receiver honors p2p_invalidate_cache
         # via _invalidate_p2p_cache()). Restored from the pre-merge baseline (baf6dcce).
-        invalidate_receiver_cache = not request_cached_prepare and _env_flag(
-            "XORL_P2P_INVALIDATE_RECEIVER_CACHE_ON_COLD_PREPARE", True
+        cache_invalidation_mode = str(cfg.backend_config.get("cache_invalidation_mode", "auto") or "auto").lower()
+        invalidate_receiver_cache = (
+            cache_invalidation_mode != "none"
+            and not request_cached_prepare
+            and _env_flag("XORL_P2P_INVALIDATE_RECEIVER_CACHE_ON_COLD_PREPARE", True)
         )
         self._last_prepare_returned_tensor_map = False
         self._last_prepare_tensor_map_endpoint_indices = set()
@@ -1449,20 +1452,31 @@ class P2PTransportBackend(WeightTransportBackend):
 
             restart_full_prepare = False
             tensor_map_endpoint_indices = set()
-            try:
-                if prepare_workers == 1:
-                    endpoint_results = [
-                        _prepare_endpoint(ep_idx, ep, request_cached_prepare) for ep_idx, ep in enumerate(cfg.endpoints)
-                    ]
-                else:
-                    with ThreadPoolExecutor(max_workers=prepare_workers, thread_name_prefix="p2p-prepare") as executor:
-                        futures = [
-                            executor.submit(_prepare_endpoint, ep_idx, ep, request_cached_prepare)
-                            for ep_idx, ep in enumerate(cfg.endpoints)
-                        ]
-                        endpoint_results = [future.result() for future in as_completed(futures)]
-            except Exception as e:
-                logger.error(f"[P2P] prepare fanout failed: {e}")
+            endpoint_results = []
+            prepare_errors: List[str] = []
+            if prepare_workers == 1:
+                for ep_idx, ep in enumerate(cfg.endpoints):
+                    try:
+                        endpoint_results.append(_prepare_endpoint(ep_idx, ep, request_cached_prepare))
+                    except Exception as e:
+                        prepare_errors.append(str(e))
+                        break
+            else:
+                with ThreadPoolExecutor(max_workers=prepare_workers, thread_name_prefix="p2p-prepare") as executor:
+                    futures = {
+                        executor.submit(_prepare_endpoint, ep_idx, ep, request_cached_prepare): ep
+                        for ep_idx, ep in enumerate(cfg.endpoints)
+                    }
+                    for future in as_completed(futures):
+                        try:
+                            endpoint_results.append(future.result())
+                        except Exception as e:
+                            ep = futures[future]
+                            prepare_errors.append(f"{ep.host}:{ep.port}: {e}")
+            if prepare_errors:
+                message = "; ".join(prepare_errors)
+                logger.error(f"[P2P] prepare fanout failed: {message}")
+                self._complete_prepared_receivers_after_prepare_failure(message)
                 return False
 
             for ep_idx, ep, body in sorted(endpoint_results, key=lambda item: item[0]):
@@ -1537,6 +1551,58 @@ class P2PTransportBackend(WeightTransportBackend):
             f"tensor_map_endpoints={len(tensor_map_endpoint_indices)}/{num_endpoints})"
         )
         return True
+
+    def _complete_prepared_receivers_after_prepare_failure(self, reason: str) -> None:
+        """Best-effort abort for a failed P2P prepare fanout.
+
+        SGLang marks a P2P update pending as soon as an endpoint successfully
+        prepares. If another endpoint then fails registration, the trainer
+        never writes bytes or calls the normal completion path, so those
+        already-prepared receivers reject the next sync as "already in
+        progress". Completing with flush_cache=False clears only that pending
+        prepare window and preserves the KV cache.
+        """
+        cfg = self.config
+        payload = {
+            "group_name": cfg.group_name,
+            "flush_cache": False,
+            "transport": "p2p",
+            "run_post_process_weights": False,
+        }
+        for ep in cfg.endpoints:
+            url = f"http://{ep.host}:{ep.port}/complete_weights_update"
+            try:
+                resp = requests.post(url, json=payload, timeout=_HTTP_TIMEOUT_SECONDS)
+            except requests.RequestException as e:
+                logger.warning(
+                    "[P2P] prepare-failure cleanup request failed for %s:%s after %s: %s",
+                    ep.host,
+                    ep.port,
+                    reason,
+                    e,
+                )
+                continue
+            if resp.status_code != 200:
+                logger.warning(
+                    "[P2P] prepare-failure cleanup returned HTTP %s from %s:%s after %s: %s",
+                    resp.status_code,
+                    ep.host,
+                    ep.port,
+                    reason,
+                    resp.text,
+                )
+                continue
+            try:
+                body = resp.json()
+            except ValueError:
+                body = {}
+            if body and body.get("success") is False:
+                logger.info(
+                    "[P2P] prepare-failure cleanup found no pending update at %s:%s: %s",
+                    ep.host,
+                    ep.port,
+                    body.get("message", body),
+                )
 
     def _ensure_cpu_scratch_pool(self) -> None:
         """Lazy-init the CPU pinned scratch pools.

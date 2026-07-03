@@ -77,6 +77,7 @@ class Qwen3Attention(MultiHeadAttention):
 class Qwen3DecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
+        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx)
         self.mlp = Qwen3MLP(config)
@@ -101,7 +102,10 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
 
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.input_layernorm(
+            hidden_states,
+            force_sglang_residual=self.layer_idx > 0 and self.input_layernorm.mode in ("sglang", "sglang_fused"),
+        )
 
         # Self Attention
         hidden_states, self_attn_weights = self.self_attn(
@@ -288,7 +292,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 all_self_attns += (layer_outputs[1],)
 
         # PP support: norm may be None on non-last stages
-        hidden_states = self.norm(hidden_states) if self.norm is not None else hidden_states
+        if self.norm is not None:
+            hidden_states = self.norm(
+                hidden_states,
+                force_sglang_residual=getattr(self.norm, "mode", None) in ("sglang", "sglang_fused"),
+            )
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 

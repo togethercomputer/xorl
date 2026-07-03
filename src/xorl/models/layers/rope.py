@@ -145,18 +145,19 @@ def _compute_default_rope_parameters(
     else:
         base = None
 
+    if base is None and hasattr(config, "rope_scaling") and config.rope_scaling is not None:
+        base = config.rope_scaling.get("rope_theta", None)
+    if base is None and hasattr(config, "rope_theta") and config.rope_theta is not None:
+        base = config.rope_theta
     if base is None:
-        if hasattr(config, "rope_theta") and config.rope_theta is not None:
-            base = config.rope_theta
-        elif hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-            base = config.rope_scaling.get("rope_theta", 10000.0)
-        else:
-            base = 10000.0
+        base = 10000.0
 
     partial_rotary_factor = rope_parameters_dict.get(
         "partial_rotary_factor",
         getattr(config, "partial_rotary_factor", 1.0),
     )
+    if partial_rotary_factor is None:
+        partial_rotary_factor = 1.0
     head_dim = getattr(config, "head_dim", None) or (config.hidden_size // config.num_attention_heads)
     dim = int(head_dim * partial_rotary_factor)
 
@@ -444,10 +445,56 @@ class RotaryEmbedding(nn.Module):
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
+        self._sglang_default_cache = None
+        self._use_sglang_default_cache = bool(getattr(config, "_rope_native", False) and self.rope_type == "default")
+        if self._use_sglang_default_cache:
+            self._sglang_default_cache = self._build_sglang_default_cache(self.max_seq_len_cached)
+
+    def _default_rope_base_and_dim(self) -> tuple[float, int]:
+        rope_parameters_dict = getattr(self.config, "rope_parameters", None) or {}
+        base = rope_parameters_dict.get("rope_theta") if rope_parameters_dict else None
+        if base is None and getattr(self.config, "rope_scaling", None) is not None:
+            base = self.config.rope_scaling.get("rope_theta")
+        if base is None:
+            base = getattr(self.config, "rope_theta", None)
+        if base is None:
+            base = 10000.0
+
+        partial_rotary_factor = rope_parameters_dict.get(
+            "partial_rotary_factor",
+            getattr(self.config, "partial_rotary_factor", 1.0),
+        )
+        if partial_rotary_factor is None:
+            partial_rotary_factor = 1.0
+        head_dim = getattr(self.config, "head_dim", None) or (
+            self.config.hidden_size // self.config.num_attention_heads
+        )
+        return float(base), int(head_dim * partial_rotary_factor)
+
+    def _build_sglang_default_cache(self, seq_len: int) -> torch.Tensor:
+        base, dim = self._default_rope_base_and_dim()
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        positions = torch.arange(seq_len, dtype=torch.float32)
+        freqs = torch.einsum("i,j->ij", positions, inv_freq)
+        return torch.cat((freqs.cos(), freqs.sin()), dim=-1)
+
+    def _ensure_sglang_default_cache(self, needed_max_pos: int) -> None:
+        if self._sglang_default_cache is None or needed_max_pos >= self._sglang_default_cache.shape[0]:
+            self._sglang_default_cache = self._build_sglang_default_cache(needed_max_pos + 1)
 
     @torch.no_grad()
     @dynamic_rope_update
     def forward(self, x, position_ids):
+        if self._use_sglang_default_cache:
+            needed_max_pos = int(position_ids.max().item())
+            self._ensure_sglang_default_cache(needed_max_pos)
+            flat_positions = position_ids.reshape(-1).to(device="cpu", dtype=torch.long)
+            cos_sin = self._sglang_default_cache.index_select(0, flat_positions)
+            cos_half, sin_half = cos_sin.chunk(2, dim=-1)
+            cos = torch.cat((cos_half, cos_half), dim=-1).view(*position_ids.shape, -1)
+            sin = torch.cat((sin_half, sin_half), dim=-1).view(*position_ids.shape, -1)
+            return cos.to(device=x.device, dtype=x.dtype), sin.to(device=x.device, dtype=x.dtype)
+
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
 
@@ -502,7 +549,7 @@ def set_rope_native(enabled: bool):
     _rope_native = enabled
 
 
-def apply_rotary_pos_emb(q, k, cos, sin):
+def apply_rotary_pos_emb(q, k, cos, sin, *, force_native: bool = False):
     """Applies Rotary Position Embedding to the query and key tensors.
 
     Uses flash_attn's fused CUDA kernel when available for better performance
@@ -517,7 +564,7 @@ def apply_rotary_pos_emb(q, k, cos, sin):
         cos: The cosine part from RotaryEmbedding, shape [batch, seq_len, head_dim].
         sin: The sine part from RotaryEmbedding, shape [batch, seq_len, head_dim].
     """
-    if _flash_apply_rotary_emb is not None and q.is_cuda and not _rope_native:
+    if _flash_apply_rotary_emb is not None and q.is_cuda and not (_rope_native or force_native):
         # flash_attn expects x: [B, S, H, D], cos/sin: [S, D//2]
         # Our cos/sin are [B, S, D] with doubled freqs — take first batch, first half
         half_dim = cos.shape[-1] // 2

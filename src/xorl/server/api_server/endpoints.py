@@ -52,6 +52,9 @@ from xorl.server.api_server.api_types import (
     UntypedAPIFuture,
     WeightsInfoRequest,
     WeightsInfoResponse,
+    ZORLAbortGenerationRequest,
+    ZORLApplyRewardsRequest,
+    ZORLStartGenerationRequest,
 )
 from xorl.server.api_server.utils import validate_model_id
 from xorl.server.protocol.api_orchestrator import OrchestratorRequest
@@ -106,6 +109,7 @@ async def _register_runtime_session(
     base_model: str,
     raw_lora_config: Optional[Dict[str, Any]],
     raw_optimizer_config: Optional[Dict[str, Any]],
+    raw_zorl_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Normalize and register a session runtime spec with workers and API state."""
     if server.base_model is not None and _canon_base_model(base_model) != _canon_base_model(server.base_model):
@@ -119,7 +123,7 @@ async def _register_runtime_session(
             raise ValueError(
                 "Full-weight server multi-tenancy is not supported yet. Use the reserved model_id='default' session."
             )
-        if raw_lora_config or raw_optimizer_config:
+        if raw_lora_config or raw_optimizer_config or raw_zorl_config:
             raise ValueError("Per-session LoRA or optimizer overrides are not supported in full-weight server mode.")
         normalized_spec = {
             "base_model": base_model,
@@ -131,6 +135,7 @@ async def _register_runtime_session(
             base_model=base_model,
             raw_lora_config=raw_lora_config,
             raw_optimizer_config=raw_optimizer_config,
+            raw_zorl_config=raw_zorl_config,
             default_rank=server.default_session_spec["lora_config"]["lora_rank"],
             default_alpha=server.default_session_spec["lora_config"]["lora_alpha"],
             max_lora_rank=server.max_lora_rank or server.default_session_spec["lora_config"]["lora_rank"],
@@ -140,6 +145,7 @@ async def _register_runtime_session(
             default_optimizer_dtype=server.default_session_spec["optimizer_config"]["optimizer_dtype"],
             default_optimizer_kwargs=server.default_session_spec["optimizer_config"].get("optimizer_kwargs", {}),
             server_lora_config=server.server_lora_config,
+            default_zorl_config=server.default_session_spec.get("zorl_config"),
             default_betas=tuple(server.default_session_spec["optimizer_config"].get("betas") or (0.9, 0.95)),
             default_eps=float(server.default_session_spec["optimizer_config"].get("eps") or 1e-8),
         )
@@ -265,6 +271,48 @@ async def optim_step_endpoint(request: OptimStepRequest, server=Depends(require_
     the OptimStepResponse result.
     """
     return await server.submit_optim_step_async(request)
+
+
+@router.post(
+    "/api/v1/zorl/start_generation",
+    response_model=UntypedAPIFuture,
+    responses={
+        500: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
+    tags=["ZORL"],
+)
+async def start_zorl_generation_endpoint(request: ZORLStartGenerationRequest, server=Depends(require_api_server)):
+    """Plan and export one ZORL generation (two-phase pattern)."""
+    return await server.submit_start_zorl_generation_async(request)
+
+
+@router.post(
+    "/api/v1/zorl/apply_rewards",
+    response_model=UntypedAPIFuture,
+    responses={
+        500: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
+    tags=["ZORL"],
+)
+async def apply_zorl_rewards_endpoint(request: ZORLApplyRewardsRequest, server=Depends(require_api_server)):
+    """Apply externally aggregated rewards for the active ZORL generation (two-phase pattern)."""
+    return await server.submit_apply_zorl_rewards_async(request)
+
+
+@router.post(
+    "/api/v1/zorl/abort_generation",
+    response_model=UntypedAPIFuture,
+    responses={
+        500: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
+    tags=["ZORL"],
+)
+async def abort_zorl_generation_endpoint(request: ZORLAbortGenerationRequest, server=Depends(require_api_server)):
+    """Abort the active ZORL generation without updating the parent adapter (two-phase pattern)."""
+    return await server.submit_abort_zorl_generation_async(request)
 
 
 @router.post(
@@ -513,6 +561,7 @@ async def create_model_endpoint(request: CreateModelRequest, server=Depends(requ
             base_model=req.base_model,
             raw_lora_config=_dump_optional_config(req.lora_config),
             raw_optimizer_config=_dump_optional_config(req.optimizer_config),
+            raw_zorl_config=_dump_optional_config(req.zorl_config),
         )
 
         logger.info(f"Registered model_id: {req.model_id} with session_spec: {normalized_spec}")

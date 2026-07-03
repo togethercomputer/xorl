@@ -79,20 +79,36 @@ class MultiHeadAttention(nn.Module):
 
         if hasattr(self, "qkv_proj"):
             qkv = self.qkv_proj(hidden_states)
+            self._capture_diagnostic_component("qkv", qkv)
             q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
         else:
             q = self.q_proj(hidden_states)
             k = self.k_proj(hidden_states)
             v = self.v_proj(hidden_states)
+        self._capture_diagnostic_component("q_pre_qk_norm", q)
+        self._capture_diagnostic_component("k_pre_qk_norm", k)
+        self._capture_diagnostic_component("v", v)
         q = q.view(hidden_shape)
         k = k.view(hidden_shape)
         if self._use_qk_norm:
             q = self.q_norm(q)
             k = self.k_norm(k)
+        self._capture_diagnostic_component("q_post_qk_norm", self._flatten_heads_for_diagnostics(q))
+        self._capture_diagnostic_component("k_post_qk_norm", self._flatten_heads_for_diagnostics(k))
         v = v.view(hidden_shape)
 
         cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        self._capture_diagnostic_component("rope_cos", cos)
+        self._capture_diagnostic_component("rope_sin", sin)
+        q, k = apply_rotary_pos_emb(
+            q,
+            k,
+            cos,
+            sin,
+            force_native=getattr(self.config, "_rope_native", False),
+        )
+        self._capture_diagnostic_component("q", self._flatten_heads_for_diagnostics(q))
+        self._capture_diagnostic_component("k", self._flatten_heads_for_diagnostics(k))
 
         # Optionally cast to bfloat16 after RoPE for SGLang numerical alignment
         if getattr(self.config, "_attention_cast_bf16", False):
@@ -107,7 +123,18 @@ class MultiHeadAttention(nn.Module):
         Override for different attention variants (e.g. Multi-head Latent Attention).
         """
         attn_output = attn_output.reshape(*attn_output.shape[:-2], -1).contiguous()
-        return self.o_proj(attn_output)
+        output = self.o_proj(attn_output)
+        self._capture_diagnostic_component("o_proj_output", output)
+        return output
+
+    @staticmethod
+    def _flatten_heads_for_diagnostics(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.reshape(*tensor.shape[:-2], -1) if tensor.ndim >= 4 else tensor
+
+    def _capture_diagnostic_component(self, name: str, tensor: torch.Tensor) -> None:
+        capture = getattr(self, "_diagnostic_capture_component", None)
+        if callable(capture):
+            capture(name, tensor)
 
     # ------------------------------------------------------------------ #
     # Attention function helpers
@@ -137,12 +164,17 @@ class MultiHeadAttention(nn.Module):
         **kwargs: Unpack[AttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         attn_strategy = get_cp_strategy(num_kv_heads=self.config.num_key_value_heads)
+        self._capture_diagnostic_component("attention_input", hidden_states)
 
         # Phase 1: QKV projection + norm + RoPE (+ pre-attention SP communication)
         q, k, v = attn_strategy.project_qkv(self, hidden_states, position_embeddings)
+        self._capture_diagnostic_component("q_attn_input", self._flatten_heads_for_diagnostics(q))
+        self._capture_diagnostic_component("k_attn_input", self._flatten_heads_for_diagnostics(k))
+        self._capture_diagnostic_component("v_attn_input", self._flatten_heads_for_diagnostics(v))
 
         # Phase 2: Attention (ring attention puts P2P communication here)
         attn_output = attn_strategy.compute_attention(self, q, k, v, attention_mask, **kwargs)
+        self._capture_diagnostic_component("attn_output", self._flatten_heads_for_diagnostics(attn_output))
 
         # Phase 3: Output projection (+ post-attention SP communication)
         attn_output = attn_strategy.project_output(self, attn_output)

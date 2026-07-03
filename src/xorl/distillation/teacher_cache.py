@@ -249,7 +249,8 @@ class TeacherActivationCache:
     forward (``backend == "mooncake"`` plus key/shape/dtype; see
     :mod:`xorl.distillation.mooncake_hidden_store`). The cache fetches the tensor
     from Mooncake and exposes it to the OPD loss through :meth:`get` as a CPU
-    ``[tokens, d]`` / ``[layers, tokens, d]`` tensor.
+    ``[tokens, d]`` / ``[layers, tokens, d]`` tensor; optionally one full cache
+    is kept resident on device (``cache_device=True``) for repeated gathers.
     """
 
     hidden_caches: Mapping[str, Any] | str
@@ -268,6 +269,8 @@ class TeacherActivationCache:
             if self.enable_async
             else None
         )
+        self._device_teacher_id: Optional[str] = None
+        self._device_tensor: Optional[torch.Tensor] = None
 
     def _entry_for_teacher(self, teacher_id: int | str) -> tuple[str, Any]:
         key = str(int(teacher_id)) if isinstance(teacher_id, torch.Tensor) else str(teacher_id)
@@ -325,49 +328,160 @@ class TeacherActivationCache:
         self._cpu_cache[key] = self._load_cpu(key, entry)
         return self._cpu_cache[key]
 
+    @staticmethod
+    def _target_device(device: torch.device | str) -> torch.device:
+        target_device = torch.device(device)
+        if target_device.type == "cuda" and target_device.index is None and torch.cuda.is_available():
+            target_device = torch.device("cuda", torch.cuda.current_device())
+        return target_device
+
+    @staticmethod
+    def _validate_flat_indices(key: str, flat_indices: torch.Tensor, num_tokens: int) -> None:
+        if flat_indices.numel() == 0:
+            return
+        min_idx = flat_indices.min().item()
+        if min_idx < 0:
+            # Negative indices used to be silently clamped to 0, which masked
+            # producer bugs (off-by-one in teacher_cache_indices construction
+            # was found this way during the Countdown run). Fail loudly instead.
+            raise IndexError(
+                f"teacher_cache_indices contain negative value {min_idx} "
+                f"(teacher_id={key}); producer must emit non-negative indices"
+            )
+        max_idx = flat_indices.max().item()
+        if max_idx >= num_tokens:
+            raise IndexError(
+                f"teacher_cache_indices contain {max_idx}, "
+                f"but teacher_id={key} cache only has {num_tokens} rows"
+            )
+
+    def _cache_for_access(
+        self,
+        key: str,
+        cpu_cache: torch.Tensor,
+        *,
+        target_device: torch.device,
+        dtype: Optional[torch.dtype],
+        cache_device: bool,
+    ) -> torch.Tensor:
+        if not cache_device:
+            return cpu_cache
+        target_dtype = dtype if dtype is not None else cpu_cache.dtype
+        needs_upload = (
+            self._device_teacher_id != key
+            or self._device_tensor is None
+            or self._device_tensor.device != target_device
+            or self._device_tensor.dtype != target_dtype
+        )
+        if needs_upload:
+            self._device_tensor = None
+            self._device_teacher_id = key
+            self._device_tensor = cpu_cache.to(device=target_device, dtype=target_dtype, non_blocking=True)
+        return self._device_tensor
+
+    def shape(self, teacher_id: int | str) -> tuple[int, ...]:
+        key, entry = self._entry_for_teacher(teacher_id)
+        return tuple(int(dim) for dim in self._cpu_tensor(key, entry).shape)
+
     def get(
         self,
         teacher_id: int | str,
         indices: torch.Tensor,
         device: torch.device | str,
         dtype: Optional[torch.dtype] = None,
+        cache_device: bool = False,
     ) -> torch.Tensor:
         key, entry = self._entry_for_teacher(teacher_id)
-        cache = self._cpu_tensor(key, entry)
+        cpu_cache = self._cpu_tensor(key, entry)
 
         flat_indices = indices.reshape(-1).to(device="cpu", dtype=torch.long)
         # rank-2 [tokens, d] (output-space OPD / last-layer hidden-match) gathers along
         # dim 0; rank-3 [layers, tokens, d] (multi-layer OPRD) gathers along the token
         # axis (dim 1) and returns [*indices.shape, layers, d].
-        token_dim = 0 if cache.ndim == 2 else 1
-        num_tokens = cache.shape[token_dim]
-        if flat_indices.numel() > 0:
-            min_idx = flat_indices.min().item()
-            if min_idx < 0:
-                # Negative indices used to be silently clamped to 0, which masked
-                # producer bugs (off-by-one in teacher_cache_indices construction
-                # was found this way during the Countdown run). Fail loudly instead.
-                raise IndexError(
-                    f"teacher_cache_indices contain negative value {min_idx} "
-                    f"(teacher_id={key}); producer must emit non-negative indices"
-                )
-            max_idx = flat_indices.max().item()
-            if max_idx >= num_tokens:
-                raise IndexError(
-                    f"teacher_cache_indices contain {max_idx}, but teacher_id={key} cache only has {num_tokens} rows"
-                )
+        token_dim = 0 if cpu_cache.ndim == 2 else 1
+        num_tokens = cpu_cache.shape[token_dim]
+        self._validate_flat_indices(key, flat_indices, num_tokens)
+
+        target_device = self._target_device(device)
+        if cache_device:
+            cache = self._cache_for_access(
+                key,
+                cpu_cache,
+                target_device=target_device,
+                dtype=dtype,
+                cache_device=True,
+            )
+            flat_indices = flat_indices.to(device=target_device, non_blocking=True)
+        else:
+            cache = cpu_cache
+
         gathered = cache.index_select(token_dim, flat_indices)
-        if cache.ndim == 2:
-            gathered = gathered.view(*indices.shape, cache.shape[-1])
+        if cpu_cache.ndim == 2:
+            gathered = gathered.view(*indices.shape, cpu_cache.shape[-1])
         else:
             # [layers, n, d] -> [n, layers, d] -> [*indices.shape, layers, d]
             layers, _, hidden = gathered.shape
             gathered = gathered.permute(1, 0, 2).reshape(*indices.shape, layers, hidden)
+        if cache_device:
+            return gathered
         # CPU cache is unpinned, so non_blocking=True would be a no-op. Drop the
         # flag rather than misleading future readers.
-        return gathered.to(device=device, dtype=dtype)
+        return gathered.to(device=target_device, dtype=dtype)
+
+    def get_layer_slice(
+        self,
+        teacher_id: int | str,
+        indices: torch.Tensor,
+        layer_start: int,
+        layer_end: int,
+        device: torch.device | str,
+        dtype: Optional[torch.dtype] = None,
+        cache_device: bool = False,
+    ) -> torch.Tensor:
+        """Gather a rank-3 layer-cache slice as ``[*indices.shape, layers, hidden]``."""
+        key, entry = self._entry_for_teacher(teacher_id)
+        cpu_cache = self._cpu_tensor(key, entry)
+        if cpu_cache.ndim != 3:
+            raise ValueError(
+                f"teacher layer cache for teacher_id={key} must be rank-3 [layers, tokens, hidden], "
+                f"got shape {tuple(cpu_cache.shape)}"
+            )
+
+        num_layers, num_tokens, hidden = cpu_cache.shape
+        start = max(0, int(layer_start))
+        end = min(int(layer_end), int(num_layers))
+        if start >= end:
+            raise ValueError(
+                f"invalid teacher layer slice [{layer_start}, {layer_end}) for teacher_id={key} "
+                f"with {num_layers} layers"
+            )
+
+        flat_indices = indices.reshape(-1).to(device="cpu", dtype=torch.long)
+        self._validate_flat_indices(key, flat_indices, int(num_tokens))
+        target_device = self._target_device(device)
+        cache = self._cache_for_access(
+            key,
+            cpu_cache,
+            target_device=target_device,
+            dtype=dtype,
+            cache_device=cache_device,
+        )
+        if cache_device:
+            flat_indices = flat_indices.to(device=target_device, non_blocking=True)
+        layer_slice = cache[start:end]
+        gathered = layer_slice.index_select(1, flat_indices)
+        layers = int(end - start)
+        gathered = gathered.permute(1, 0, 2).reshape(*indices.shape, layers, int(hidden))
+        if cache_device:
+            return gathered
+        return gathered.to(device=target_device, dtype=dtype)
+
+    def clear_device_cache(self) -> None:
+        self._device_teacher_id = None
+        self._device_tensor = None
 
     def close(self) -> None:
+        self.clear_device_cache()
         if self._executor is not None:
             self._executor.shutdown(wait=False, cancel_futures=True)
             self._executor = None

@@ -1,5 +1,6 @@
 """MoE block: composes gate + router + experts."""
 
+import os
 from typing import Optional
 
 import torch
@@ -9,6 +10,33 @@ import torch.nn.functional as F
 from .experts import MoEExperts
 from .router import TopKRouter, balanced_synthetic_routing
 from .routing_replay import RoutingReplay, get_replay_stage
+
+
+_ROUTER_FP32_LAYERS_ENV = "XORL_MOE_ROUTER_FP32_LAYERS"
+
+
+def _router_fp32_layers_enabled(layer_idx: int | None) -> bool:
+    value = os.environ.get(_ROUTER_FP32_LAYERS_ENV, "").strip().lower()
+    if value in {"", "0", "false", "no", "off", "none"}:
+        return False
+    if value in {"all", "*"}:
+        return True
+    if layer_idx is None:
+        return False
+
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_raw, end_raw = part.split("-", 1)
+            start = int(start_raw)
+            end = int(end_raw)
+            if start <= layer_idx <= end or end <= layer_idx <= start:
+                return True
+        elif int(part) == layer_idx:
+            return True
+    return False
 
 
 class MoEBlock(nn.Module):
@@ -87,6 +115,11 @@ class MoEBlock(nn.Module):
         # Routing replay for gradient checkpointing determinism.
         # Set by XorlPreTrainedModel.enable_routing_replay().
         self._routing_replay: Optional[RoutingReplay] = None
+
+    def _capture_diagnostic_component(self, name: str, tensor: torch.Tensor) -> None:
+        capture = getattr(self, "_diagnostic_capture_component", None)
+        if callable(capture):
+            capture(name, tensor)
 
     def inject_lora(
         self,
@@ -184,7 +217,11 @@ class MoEBlock(nn.Module):
             - router_logits: ``(num_tokens, num_experts)``
         """
         # Route (optionally upcast to fp32 for numerical alignment with SGLang)
-        router_fp32 = getattr(self, "config", None) is not None and getattr(self.config, "_router_fp32", False)
+        router_fp32 = (
+            getattr(self, "config", None) is not None
+            and getattr(self.config, "_router_fp32", False)
+            or _router_fp32_layers_enabled(getattr(self, "layer_idx", None))
+        )
         if router_fp32 and not hasattr(self.gate, "fp8_block_size"):
             router_logits = F.linear(hidden_states.float(), self.gate.weight.float())
         else:
@@ -244,6 +281,35 @@ class MoEBlock(nn.Module):
             # No replay active: use standard router
             routing_weights, selected_experts = self.router(router_logits, hidden_states.dtype)
 
+        forced_selected_experts = getattr(self, "_diagnostic_forced_selected_experts", None)
+        if forced_selected_experts is not None:
+            forced_selected_experts = forced_selected_experts.to(
+                device=selected_experts.device,
+                dtype=selected_experts.dtype,
+            )
+            if forced_selected_experts.shape != selected_experts.shape:
+                raise ValueError(
+                    "diagnostic forced routing shape mismatch: "
+                    f"expected {tuple(selected_experts.shape)}, got {tuple(forced_selected_experts.shape)}"
+                )
+            selected_experts = forced_selected_experts
+            forced_routing_weights = getattr(self, "_diagnostic_forced_routing_weights", None)
+            if forced_routing_weights is not None:
+                forced_routing_weights = forced_routing_weights.to(
+                    device=routing_weights.device,
+                    dtype=hidden_states.dtype,
+                )
+                if forced_routing_weights.shape != routing_weights.shape:
+                    raise ValueError(
+                        "diagnostic forced routing weight shape mismatch: "
+                        f"expected {tuple(routing_weights.shape)}, got {tuple(forced_routing_weights.shape)}"
+                    )
+                routing_weights = forced_routing_weights
+            else:
+                selected_experts, routing_weights = self._regather_routing(
+                    router_logits, selected_experts, hidden_states.dtype
+                )
+
         ep_dispatch = getattr(self.experts, "ep_dispatch", "alltoall")
         if self.train_router and ep_dispatch == "deepep":
             raise AssertionError(
@@ -253,6 +319,16 @@ class MoEBlock(nn.Module):
             )
         if not self.train_router:
             routing_weights = routing_weights.detach()
+
+        self._capture_diagnostic_component("moe_router_logits", router_logits)
+        self._capture_diagnostic_component("moe_topk_ids", selected_experts)
+        self._capture_diagnostic_component("moe_topk_weights", routing_weights)
+        if getattr(self, "_diagnostic_capture_routing", False):
+            self._diagnostic_last_routing = {
+                "router_routing_weights": routing_weights.detach(),
+                "router_selected_experts": selected_experts.detach(),
+                "router_logits": router_logits.detach(),
+            }
 
         return routing_weights, selected_experts, router_logits
 
@@ -286,6 +362,7 @@ class MoEBlock(nn.Module):
         """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         flat_hidden_states = hidden_states.view(-1, hidden_dim)
+        self._capture_diagnostic_component("moe_input", flat_hidden_states)
 
         routing_weights, selected_experts, router_logits = self.route(flat_hidden_states)
 
@@ -294,10 +371,16 @@ class MoEBlock(nn.Module):
         # router returns global expert ids while local expert weights are sharded.
         from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
 
-        if self.moe_implementation == "eager" and not get_parallel_state().ep_enabled:
+        parallel_state = get_parallel_state()
+        if (
+            self.moe_implementation == "eager"
+            and not parallel_state.ep_enabled
+            and not self.experts.sglang_moe_tp_sim_enabled(parallel_state)
+        ):
             final_hidden_states = self._eager_forward(flat_hidden_states, routing_weights, selected_experts)
         else:
             final_hidden_states = self.experts(flat_hidden_states, routing_weights, selected_experts)
+        self._capture_diagnostic_component("moe_experts_output", final_hidden_states)
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
 
         return final_hidden_states, router_logits

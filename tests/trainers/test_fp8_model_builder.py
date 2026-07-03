@@ -122,6 +122,31 @@ def test_build_training_model_applies_full_model_fp8_training(monkeypatch):
     assert all(param.requires_grad for param in result.model.parameters())
 
 
+def test_build_training_model_threads_sharded_lm_head_loss_to_parallelize(monkeypatch):
+    captured = {}
+
+    def fake_build_foundation_model(**_kwargs):
+        return TinyDenseOnlyModel()
+
+    def fake_parallelize(model, **kwargs):
+        captured.update(kwargs)
+        return model
+
+    monkeypatch.setattr("xorl.trainers.model_builder.build_foundation_model", fake_build_foundation_model)
+    monkeypatch.setattr("xorl.trainers.model_builder._parallelize", fake_parallelize)
+    monkeypatch.setattr("xorl.trainers.model_builder.helper.print_device_mem_info", lambda *args, **kwargs: None)
+
+    build_training_model(
+        config_path="unused",
+        weights_path="unused",
+        fsdp_sharded_lm_head_loss=True,
+        enable_mixed_precision=False,
+        enable_gradient_checkpointing=False,
+    )
+
+    assert captured["fsdp_sharded_lm_head_loss"] is True
+
+
 def test_build_training_model_rejects_fp8_with_adapters(monkeypatch):
     monkeypatch.setattr("xorl.trainers.model_builder.build_foundation_model", lambda **_kwargs: TinyDenseMoEModel())
     monkeypatch.setattr("xorl.trainers.model_builder.helper.print_device_mem_info", lambda *args, **kwargs: None)

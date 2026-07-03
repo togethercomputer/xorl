@@ -1,20 +1,33 @@
+import importlib
+import os
 from typing import Callable, Literal, Optional, Union
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from xorl.ops.batch_invariant_ops import (
+    fused_add_rms_norm_batch_invariant,
+    fused_rms_norm_backward,
+    is_batch_invariant_mode_enabled,
+    is_batch_invariant_op_enabled,
+    set_batch_invariant_mode,
+    sglang_rms_norm_batch_invariant,
+)
 
-RMSNormMode = Literal["eager", "native", "compile"]
+
+RMSNormMode = Literal["eager", "native", "compile", "sglang", "sglang_fused", "sglang_jit", "sglang_kernel"]
 _RMSNORM_MODE: RMSNormMode = "native"
 _COMPILED_NATIVE_RMS_NORM: Optional[Callable[[torch.Tensor, torch.Tensor, float], torch.Tensor]] = None
 _COMPILED_EAGER_RMS_NORM: Optional[Callable[[torch.Tensor, torch.Tensor, float], torch.Tensor]] = None
 _COMPILED_ZERO_CENTERED_RMS_NORM: Optional[Callable[[torch.Tensor, torch.Tensor, float], torch.Tensor]] = None
+_SGLANG_JIT_NORM = None
+_SGLANG_KERNEL_NORM = None
 
 
 def set_rmsnorm_mode(mode: RMSNormMode) -> None:
     global _RMSNORM_MODE
-    if mode not in {"eager", "native", "compile"}:
+    if mode not in {"eager", "native", "compile", "sglang", "sglang_fused", "sglang_jit", "sglang_kernel"}:
         raise ValueError(f"Unsupported rmsnorm_mode: {mode}")
     _RMSNORM_MODE = mode
 
@@ -34,6 +47,202 @@ def eager_rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor, variance_e
 
 def native_rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor, variance_epsilon: float) -> torch.Tensor:
     return F.rms_norm(hidden_states, (weight.shape[0],), weight, eps=variance_epsilon)
+
+
+def sglang_residual_rms_norm(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+) -> torch.Tensor:
+    input_dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(torch.float32)
+    variance = hidden_states.pow(2).mean(dim=-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + variance_epsilon)
+    return (hidden_states * weight.to(torch.float32)).to(input_dtype)
+
+
+class _FusedSglangRMSNorm(torch.autograd.Function):
+    """Differentiable wrapper for :func:`sglang_rms_norm_batch_invariant`.
+
+    Forward runs the fused batch-invariant Triton kernel (bit-exact to
+    ``sglang_residual_rms_norm``); backward uses the closed-form RMSNorm
+    gradient.
+    """
+
+    @staticmethod
+    def forward(ctx, hidden_states, weight, variance_epsilon):
+        out = sglang_rms_norm_batch_invariant(hidden_states, weight, variance_epsilon)
+        ctx.save_for_backward(hidden_states, weight)
+        ctx.variance_epsilon = variance_epsilon
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        hidden_states, weight = ctx.saved_tensors
+        grad_normed, grad_weight = fused_rms_norm_backward(hidden_states, weight, ctx.variance_epsilon, grad_output)
+        return grad_normed.to(hidden_states.dtype), grad_weight.to(weight.dtype), None
+
+
+class _FusedSglangResidualRMSNorm(torch.autograd.Function):
+    """Differentiable wrapper for :func:`fused_add_rms_norm_batch_invariant`.
+
+    Forward fuses ``residual_out = hidden_states + residual`` and the RMSNorm in
+    Triton (bit-exact to the eager add + ``sglang_residual_rms_norm``). Backward
+    sums the norm gradient and the downstream residual gradient (``residual_out``
+    feeds both the normalization and the next layer's residual stream).
+    """
+
+    @staticmethod
+    def forward(ctx, hidden_states, residual, weight, variance_epsilon):
+        out, residual_out = fused_add_rms_norm_batch_invariant(hidden_states, residual, weight, variance_epsilon)
+        ctx.save_for_backward(residual_out, weight)
+        ctx.variance_epsilon = variance_epsilon
+        ctx.input_dtype = hidden_states.dtype
+        ctx.residual_dtype = residual.dtype
+        return out, residual_out
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_residual_out):
+        residual_out, weight = ctx.saved_tensors
+        grad_total, grad_weight = fused_rms_norm_backward(
+            residual_out,
+            weight,
+            ctx.variance_epsilon,
+            grad_output,
+            grad_residual_out=grad_residual_out,
+        )
+        return (
+            grad_total.to(ctx.input_dtype),
+            grad_total.to(ctx.residual_dtype),
+            grad_weight.to(weight.dtype),
+            None,
+        )
+
+
+def fast_sglang_rms_norm(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+) -> torch.Tensor:
+    """Fast, differentiable, bit-exact replacement for the no-residual eager
+    ``sglang_residual_rms_norm``. Falls back to the eager path off CUDA."""
+    if not hidden_states.is_cuda:
+        return sglang_residual_rms_norm(hidden_states, weight, variance_epsilon)
+    return _FusedSglangRMSNorm.apply(hidden_states, weight, variance_epsilon)
+
+
+def fast_sglang_residual_rms_norm(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fast, differentiable, bit-exact replacement for the eager
+    ``residual_out = hidden_states + residual`` followed by
+    ``sglang_residual_rms_norm(residual_out)``. Returns ``(out, residual_out)``.
+    Falls back to the eager path off CUDA."""
+    if not hidden_states.is_cuda:
+        residual_out = hidden_states + residual
+        return (
+            sglang_residual_rms_norm(residual_out, weight, variance_epsilon),
+            residual_out,
+        )
+    return _FusedSglangResidualRMSNorm.apply(hidden_states, residual, weight, variance_epsilon)
+
+
+def _get_sglang_jit_norm():
+    global _SGLANG_JIT_NORM
+    if _SGLANG_JIT_NORM is None:
+        try:
+            sglang_jit_norm = importlib.import_module("sglang.jit_kernel.norm")
+        except Exception as exc:
+            raise RuntimeError(
+                "rmsnorm_mode='sglang_jit' requires sglang.jit_kernel.norm on PYTHONPATH "
+                "(for example via SGLANG_REPO=/path/to/sglang/python)."
+            ) from exc
+        _SGLANG_JIT_NORM = sglang_jit_norm
+    return _SGLANG_JIT_NORM
+
+
+def _get_sglang_kernel_norm():
+    global _SGLANG_KERNEL_NORM
+    if _SGLANG_KERNEL_NORM is None:
+        try:
+            _SGLANG_KERNEL_NORM = importlib.import_module("sgl_kernel")
+        except Exception as exc:
+            raise RuntimeError(
+                "rmsnorm_mode='sglang_kernel' requires sgl_kernel on PYTHONPATH "
+                "(for example via an SGLang-capable xorl diagnostic venv)."
+            ) from exc
+    return _SGLANG_KERNEL_NORM
+
+
+def _as_2d_token_hidden(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.ndim == 2:
+        return tensor
+    return tensor.reshape(-1, tensor.shape[-1])
+
+
+def sglang_jit_rms_norm(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+    residual: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    """Use SGLang's JIT RMSNorm kernels for forward-only parity diagnostics.
+
+    The CUDA residual path mirrors SGLang's in-place fused_add_rmsnorm: the
+    returned first tensor is normalized output and the second is the residual
+    sum. CPU falls back to the native implementation so unit tests can exercise
+    the mode without requiring the JIT CUDA extension.
+    """
+    if not hidden_states.is_cuda:
+        if residual is None:
+            return native_rms_norm(hidden_states, weight, variance_epsilon)
+        residual_out = hidden_states + residual
+        return native_rms_norm(residual_out, weight, variance_epsilon), residual_out
+
+    sglang_jit_norm = _get_sglang_jit_norm()
+    out = hidden_states.contiguous().clone()
+    out_2d = _as_2d_token_hidden(out)
+    kernel_weight = weight.to(out.dtype).contiguous()
+    if residual is None:
+        sglang_jit_norm.rmsnorm(out_2d, kernel_weight, out=out_2d, eps=variance_epsilon)
+        return out
+
+    residual_out = residual.contiguous().clone()
+    residual_out_2d = _as_2d_token_hidden(residual_out)
+    sglang_jit_norm.fused_add_rmsnorm(out_2d, residual_out_2d, kernel_weight, variance_epsilon)
+    return out, residual_out
+
+
+def sglang_kernel_rms_norm(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+    residual: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    """Use SGLang's production sgl_kernel RMSNorm ops for forward-only diagnostics."""
+    if not hidden_states.is_cuda:
+        if residual is None:
+            return native_rms_norm(hidden_states, weight, variance_epsilon)
+        residual_out = hidden_states + residual
+        return native_rms_norm(residual_out, weight, variance_epsilon), residual_out
+
+    sgl_kernel = _get_sglang_kernel_norm()
+    out = hidden_states.contiguous().clone()
+    out_2d = _as_2d_token_hidden(out)
+    kernel_weight = weight.to(out.dtype).contiguous()
+    if residual is None:
+        normed = sgl_kernel.rmsnorm(out_2d, kernel_weight, variance_epsilon)
+        if normed is not None:
+            return normed.reshape_as(out)
+        return out
+
+    residual_out = residual.contiguous().clone()
+    residual_out_2d = _as_2d_token_hidden(residual_out)
+    sgl_kernel.fused_add_rmsnorm(out_2d, residual_out_2d, kernel_weight, variance_epsilon)
+    return out, residual_out
 
 
 def compiled_rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor, variance_epsilon: float) -> torch.Tensor:
@@ -77,6 +286,18 @@ def native_zero_centered_rms_norm(
     return output.type_as(hidden_states)
 
 
+def native_zero_centered_rms_norm_without_batch_invariant(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+) -> torch.Tensor:
+    if hidden_states.is_cuda:
+        if is_batch_invariant_mode_enabled() and is_batch_invariant_op_enabled("rms_norm"):
+            with set_batch_invariant_mode(False):
+                return native_zero_centered_rms_norm(hidden_states, weight, variance_epsilon)
+    return native_zero_centered_rms_norm(hidden_states, weight, variance_epsilon)
+
+
 def compiled_zero_centered_rms_norm(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
@@ -102,19 +323,91 @@ class RMSNorm(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         prenorm: bool = False,
+        force_sglang_residual: bool = False,
+        force_sglang_residual_kernel: bool = False,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        diag_add_cast_bf16 = os.environ.get("XORL_DIAGNOSTIC_RESIDUAL_ADD_CAST_BF16", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        # The fused sglang path performs the residual add inside its kernel
+        # (bit-exact to torch's fp32-accumulated bf16 add), so skip the eager
+        # add when it applies. The diagnostic bf16 recast is not modelled by the
+        # kernel, so fall back to the eager add if it is requested.
+        use_fused_residual = (
+            self.mode == "sglang_fused"
+            and residual is not None
+            and not force_sglang_residual
+            and not force_sglang_residual_kernel
+            and not diag_add_cast_bf16
+        )
+
         residual_out: Optional[torch.Tensor] = None
         norm_input = hidden_states
-        if residual is not None:
+        if residual is not None and not use_fused_residual:
             residual_out = hidden_states + residual
+            if diag_add_cast_bf16:
+                residual_out = residual_out.to(torch.bfloat16)
             norm_input = residual_out
 
-        if self.mode == "eager":
+        if force_sglang_residual_kernel:
+            if residual is not None:
+                out, residual_out = sglang_kernel_rms_norm(
+                    hidden_states,
+                    self.weight,
+                    self.variance_epsilon,
+                    residual=residual,
+                )
+            else:
+                out = sglang_kernel_rms_norm(norm_input, self.weight, self.variance_epsilon)
+        elif force_sglang_residual:
+            if self.mode == "sglang_fused":
+                out = fast_sglang_rms_norm(norm_input, self.weight, self.variance_epsilon)
+            else:
+                out = sglang_residual_rms_norm(norm_input, self.weight, self.variance_epsilon)
+        elif self.mode == "eager":
             out = eager_rms_norm(norm_input, self.weight, self.variance_epsilon)
         elif self.mode == "native":
             out = native_rms_norm(norm_input, self.weight, self.variance_epsilon)
         elif self.mode == "compile":
             out = compiled_rms_norm(norm_input, self.weight, self.variance_epsilon)
+        elif self.mode == "sglang":
+            if residual_out is not None or force_sglang_residual:
+                out = sglang_residual_rms_norm(norm_input, self.weight, self.variance_epsilon)
+            else:
+                out = native_rms_norm(norm_input, self.weight, self.variance_epsilon)
+        elif self.mode == "sglang_fused":
+            if use_fused_residual:
+                out, residual_out = fast_sglang_residual_rms_norm(
+                    hidden_states, residual, self.weight, self.variance_epsilon
+                )
+            elif residual is not None:
+                # Diagnostic bf16 recast path: residual already added above.
+                out = fast_sglang_rms_norm(norm_input, self.weight, self.variance_epsilon)
+            else:
+                out = native_rms_norm(norm_input, self.weight, self.variance_epsilon)
+        elif self.mode == "sglang_jit":
+            if residual is not None:
+                out, residual_out = sglang_jit_rms_norm(
+                    hidden_states,
+                    self.weight,
+                    self.variance_epsilon,
+                    residual=residual,
+                )
+            else:
+                out = sglang_jit_rms_norm(norm_input, self.weight, self.variance_epsilon)
+        elif self.mode == "sglang_kernel":
+            if residual is not None:
+                out, residual_out = sglang_kernel_rms_norm(
+                    hidden_states,
+                    self.weight,
+                    self.variance_epsilon,
+                    residual=residual,
+                )
+            else:
+                out = sglang_kernel_rms_norm(norm_input, self.weight, self.variance_epsilon)
         else:
             raise ValueError(f"Unsupported rmsnorm_mode: {self.mode}")
 

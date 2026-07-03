@@ -243,6 +243,33 @@ def apply_advantages_to_labels(
     return labels_tensor.tolist()
 
 
+def apply_loss_masks_to_target_tokens(
+    target_tokens: Any,
+    *,
+    weights: Optional[List[float]],
+    advantages: Optional[List[float]],
+    seq_len: int,
+    sample_idx: int,
+) -> Optional[List[int]]:
+    """Apply the same loss masks to preserved RL target_tokens as to labels."""
+    if target_tokens is None:
+        return None
+    if hasattr(target_tokens, "tolist"):
+        target_tokens = target_tokens.tolist()
+    if not isinstance(target_tokens, list):
+        target_tokens = list(target_tokens)
+    if len(target_tokens) != seq_len:
+        raise ValueError(
+            f"Sample {sample_idx}: target_tokens length ({len(target_tokens)}) must match "
+            f"shifted input length ({seq_len})"
+        )
+    if weights is not None:
+        target_tokens = apply_weights_to_labels(target_tokens, weights, sample_idx)
+    if advantages is not None:
+        target_tokens = apply_advantages_to_labels(target_tokens, advantages, sample_idx)
+    return target_tokens
+
+
 def unpack_per_token_outputs(
     packed_output: Union[torch.Tensor, List[float]],
     position_ids: Union[torch.Tensor, List[int]],
@@ -968,6 +995,16 @@ class SequentialPacker(Packer):
         if advantages is not None:
             labels = apply_advantages_to_labels(labels, advantages, sample_idx)
 
+        masked_target_tokens = apply_loss_masks_to_target_tokens(
+            flattened_datum.get("target_tokens"),
+            weights=weights,
+            advantages=advantages,
+            seq_len=seq_len,
+            sample_idx=sample_idx,
+        )
+        if masked_target_tokens is not None:
+            flattened_datum["target_tokens"] = masked_target_tokens
+
         batch["labels"].extend(labels)
 
         # OPRD trainer-side teacher forward: teacher_input_ids/teacher_kept_indices form
@@ -1143,7 +1180,8 @@ class SequentialPacker(Packer):
                                 hidden_dim = len(value[0][0])
                                 value[0].extend([[0.0] * hidden_dim for _ in range(pad_length)])
                             else:
-                                value[0].extend([0] * pad_length)
+                                pad_value = IGNORE_INDEX if key == "target_tokens" else 0
+                                value[0].extend([pad_value] * pad_length)
 
         # For non-SP cases, pre-compute Flash Attention kwargs from position_ids.
         # (SP cases handle this in TextSequenceShardCollator after SP padding.)
@@ -1265,6 +1303,16 @@ class SequentialPacker(Packer):
             # advantages=0 -> labels=-100 (IGNORE_INDEX)
             if advantages is not None:
                 labels = apply_advantages_to_labels(labels, advantages, sample_idx)
+
+        masked_target_tokens = apply_loss_masks_to_target_tokens(
+            flattened_datum.get("target_tokens"),
+            weights=weights,
+            advantages=advantages,
+            seq_len=seq_len,
+            sample_idx=sample_idx,
+        )
+        if masked_target_tokens is not None:
+            flattened_datum["target_tokens"] = masked_target_tokens
 
         batch["labels"].append(labels)
 

@@ -11,6 +11,7 @@ from xorl.ops.loss.compiled_cross_entropy import (
     compiled_cross_entropy_function,
 )
 from xorl.ops.loss.loss_output import LossOutput
+from xorl.ops.loss.per_token_ce import compute_per_token_ce
 from xorl.ops.loss.reducers import Reducer, TokenPartial
 from xorl.ops.loss.vocab_parallel_cross_entropy import (
     _backward_kernel as _vocab_parallel_ce_backward_kernel,
@@ -424,6 +425,7 @@ def causallm_loss_function(
     loss_reducer: Reducer | None = None,
     z_loss_coef: float = 0.0,
     lm_head: torch.nn.Module | None = None,
+    logprob_temperature: float = 1.0,
 ) -> "LossOutput":
     """
     Compute causal language modeling loss.
@@ -457,6 +459,10 @@ def causallm_loss_function(
                      ``batch_size_in_tokens``. Encourages log(Z) to stay near zero,
                      stabilizing training at large vocab / high LR. Not supported
                      in the TP path.
+        logprob_temperature: Temperature for selected-token logprobs. ``1.0``
+                     returns raw model logprobs; a rollout temperature such as
+                     ``0.7`` returns behavior-policy logprobs using
+                     ``log_softmax(logits / temperature)``.
 
     Returns:
         LossOutput with loss, and optionally per_token_logprobs/per_token_loss.
@@ -475,6 +481,33 @@ def causallm_loss_function(
         loss_reducer = TokenPartial(scale=valid_mask.sum().float())
 
     mask_flat = valid_mask.float()
+    logprob_temperature = float(logprob_temperature)
+    if logprob_temperature <= 0.0:
+        raise ValueError(f"logprob_temperature must be > 0, got {logprob_temperature}")
+    if logprob_temperature != 1.0:
+        if z_loss_coef > 0.0:
+            raise NotImplementedError("logprob_temperature is not supported with softmax_auxiliary_loss")
+        per_token_ce = compute_per_token_ce(
+            hidden_states_flat,
+            weight,
+            labels_flat,
+            ignore_index,
+            ce_mode,
+            num_chunks,
+            tp_group=tp_group,
+            use_compile=use_compile,
+            lm_head_fp32=lm_head_fp32,
+            lm_head=lm_head,
+            logprob_temperature=logprob_temperature,
+        )
+        loss = loss_reducer(per_token_ce, mask_flat)
+        if return_per_token:
+            return LossOutput(
+                loss=loss,
+                per_token_logprobs=-per_token_ce.detach().view(original_shape),
+                per_token_loss=per_token_ce.view(original_shape),
+            )
+        return LossOutput(loss=loss)
 
     # Vocab-parallel cross-entropy for tensor parallelism
     if tp_group is not None:

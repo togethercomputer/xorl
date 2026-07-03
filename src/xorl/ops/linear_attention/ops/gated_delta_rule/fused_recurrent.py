@@ -148,6 +148,8 @@ def fused_recurrent_gated_delta_rule_fwd(
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
+    if scale is None:
+        scale = K**-0.5
     BK = triton.next_power_of_2(K)
     BV = min(8, triton.next_power_of_2(V)) if gv is None else triton.next_power_of_2(V)
     NV = triton.cdiv(V, BV)

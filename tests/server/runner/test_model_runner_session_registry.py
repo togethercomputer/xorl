@@ -184,3 +184,41 @@ def test_optim_step_preserves_distsignsgd_scaling_and_clip(monkeypatch):
     assert runner.optimizer.zero_grad_calls == 1
     assert result["step"] == 1
     assert result["grad_norm"] == pytest.approx(7.0)
+    assert result["optim_empty_cache_skipped"] is False
+
+
+def test_optim_step_can_skip_empty_cache_after_optimizer_step(monkeypatch):
+    runner = object.__new__(ModelRunner)
+    runner.rank = 0
+    runner.is_sleeping = False
+    runner._adapter_manager = None
+    runner._use_distsignsgd = False
+    runner._accumulated_valid_tokens = {"default": 100}
+    runner._accumulated_active_microbatches = {"default": 2}
+    runner._accumulated_active_voter_total = {"default": 4}
+    runner.train_config = {"max_grad_norm": 1.0}
+    runner.lora_config = {"enable_lora": False, "merge_lora_interval": 0}
+    runner.model = _TinyModule()
+    runner.model.param.grad = torch.tensor([4.0])
+    runner.optimizer = _FakeOptimizer()
+    runner.pp_enabled = False
+    runner.global_step = 0
+
+    empty_cache_calls = []
+
+    monkeypatch.setenv("XORL_SKIP_EMPTY_CACHE_AFTER_OPTIM_STEP", "1")
+    monkeypatch.setattr(
+        _MODULE,
+        "get_parallel_state",
+        lambda: type("ParallelState", (), {"fsdp_group": None, "pp_group": None})(),
+    )
+    monkeypatch.setattr(_MODULE, "clip_gradients", lambda *args, **kwargs: 7.0)
+    monkeypatch.setattr(_MODULE, "all_reduce", lambda value, group=None: value)
+    monkeypatch.setattr(_MODULE, "synchronize", lambda: None)
+    monkeypatch.setattr(_MODULE, "_maybe_merge_lora_util", lambda *args, **kwargs: None)
+    monkeypatch.setattr(_MODULE.torch.cuda, "empty_cache", lambda: empty_cache_calls.append("empty_cache"))
+
+    result = ModelRunner.optim_step(runner, model_id="default")
+
+    assert empty_cache_calls == []
+    assert result["optim_empty_cache_skipped"] is True

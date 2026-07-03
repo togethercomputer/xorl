@@ -1083,6 +1083,7 @@ class WeightSyncHandler:
             local_rank = _p2p_local_rank(self.rank)
             _backend_config["gpu_id"] = local_rank
             _backend_config["flush_cache"] = flush_cache
+            _backend_config["cache_invalidation_mode"] = cache_invalidation_mode
             # The fp8 branch above already decided run_post_process_weights with the
             # gated logic (kv-cache requirement / env override). Only fall back to the
             # unconditional "quantized sync requires post-process" default for quant

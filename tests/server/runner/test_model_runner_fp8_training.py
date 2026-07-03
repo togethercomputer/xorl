@@ -101,6 +101,45 @@ def test_model_runner_threads_qarl_config_to_model_builder(monkeypatch):
     assert captured["qarl_exclude_modules"] == ["lm_head"]
 
 
+def test_model_runner_threads_sharded_lm_head_loss_to_model_builder(monkeypatch):
+    captured = {}
+
+    def fake_build_training_model(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            model=nn.Linear(1, 1),
+            model_config=object(),
+            pp_enabled=False,
+            pp_stages=None,
+            model_parts=None,
+            has_first_stage=True,
+            has_last_stage=True,
+            optimizer_pre_hook_fn=None,
+            is_prequantized=False,
+            checkpoint_quant_format=None,
+            exclude_modules=set(),
+        )
+
+    monkeypatch.setattr("xorl.server.runner.model_runner.build_training_model", fake_build_training_model)
+
+    runner = object.__new__(ModelRunner)
+    runner.rank = 0
+    runner.model_config = {
+        "model_path": "Qwen/Qwen3-8B",
+        "config_path": "Qwen/Qwen3-8B",
+    }
+    runner.train_config = {
+        "fsdp_sharded_lm_head_loss": True,
+        "enable_mixed_precision": False,
+        "init_device": "cpu",
+    }
+    runner.lora_config = {}
+
+    ModelRunner._initialize_model(runner)
+
+    assert captured["fsdp_sharded_lm_head_loss"] is True
+
+
 def test_model_runner_causallm_loss_returns_raw_token_sum():
     class TinyCausalModel(nn.Module):
         def __init__(self):

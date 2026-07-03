@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 
 _SYNTHETIC_ROUTING_ENV = "XORL_MOE_SYNTHETIC_ROUTING"
+_ROUTER_TOPK_POLICY_ENV = "XORL_MOE_ROUTER_TOPK_POLICY"
 
 
 def balanced_synthetic_routing(
@@ -34,6 +35,36 @@ def _synthetic_routing_mode() -> str | None:
     if mode in {"balanced", "round_robin"}:
         return "balanced"
     raise ValueError(f"{_SYNTHETIC_ROUTING_ENV} must be unset or 'balanced', got {mode!r}")
+
+
+def _router_topk_policy() -> str:
+    policy = os.environ.get(_ROUTER_TOPK_POLICY_ENV, "").strip().lower()
+    if policy in {"", "0", "false", "no", "off", "default", "softmax"}:
+        return "default"
+    if policy in {"logits", "stable_low_id", "tie_low_id", "tie_high_id"}:
+        return policy
+    raise ValueError(
+        f"{_ROUTER_TOPK_POLICY_ENV} must be unset/default, logits, stable_low_id, "
+        f"tie_low_id, or tie_high_id; got {policy!r}"
+    )
+
+
+def _topk_indices_with_policy(scores: torch.Tensor, top_k: int) -> torch.Tensor:
+    policy = _router_topk_policy()
+    if policy == "default":
+        return torch.topk(scores, top_k, dim=-1).indices
+    if policy == "stable_low_id":
+        return torch.argsort(scores.float(), dim=-1, descending=True, stable=True)[:, :top_k]
+
+    if policy == "tie_low_id":
+        expert_id = torch.arange(scores.shape[-1], dtype=torch.float32, device=scores.device)
+        scores = scores.float() - expert_id * 1e-7
+    elif policy == "tie_high_id":
+        expert_id = torch.arange(scores.shape[-1], dtype=torch.float32, device=scores.device)
+        scores = scores.float() + expert_id * 1e-7
+    else:
+        scores = scores.float()
+    return torch.topk(scores, top_k, dim=-1).indices
 
 
 def _balanced_selected_experts(router_logits: torch.Tensor, num_experts: int, top_k: int) -> torch.Tensor:
@@ -201,7 +232,12 @@ class TopKRouter(nn.Module):
                 input_dtype,
             )
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        topk_policy = _router_topk_policy()
+        if topk_policy == "default":
+            routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        else:
+            selected_experts = _topk_indices_with_policy(router_logits, self.top_k)
+            routing_weights = torch.gather(routing_weights, 1, selected_experts)
         if self.norm_topk_prob:
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         routing_weights = routing_weights.to(input_dtype)
@@ -242,7 +278,7 @@ class TopKRouter(nn.Module):
                 scores_for_routing = scores + expert_bias
             else:
                 scores_for_routing = scores
-            _, selected_experts = torch.topk(scores_for_routing, self.top_k, dim=-1)
+            selected_experts = _topk_indices_with_policy(scores_for_routing, self.top_k)
 
         routing_weights = torch.gather(scores, dim=1, index=selected_experts)
         # V4 paths always renormalize.

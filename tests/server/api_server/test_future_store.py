@@ -4,19 +4,18 @@ Tests for FutureStore in xorl.
 
 import asyncio
 import time
+from typing import Any, Dict, Optional
 
 import pytest
-
-
-pytestmark = [pytest.mark.cpu, pytest.mark.server]
-
-from typing import Any, Dict, Optional
 
 from xorl.server.api_server.future_store import (
     FutureEntry,
     FutureStatus,
     FutureStore,
 )
+
+
+pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
 
 def make_try_again_response(

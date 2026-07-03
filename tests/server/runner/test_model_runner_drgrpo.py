@@ -93,6 +93,81 @@ def test_compute_micro_batch_loss_drgrpo_accepts_legacy_logprobs_key():
     assert metrics["valid_tokens"] == 2
 
 
+def test_compute_micro_batch_loss_drgrpo_forwards_logprob_temperature():
+    runner = object.__new__(ModelRunner)
+    runner.model = _TinyModel()
+    runner.ce_mode = "eager"
+    runner.lm_head_fp32 = False
+
+    micro_batch = {
+        "input_ids": torch.tensor([[1, 2]]),
+        "target_tokens": torch.tensor([[2, 3]]),
+        "logprobs": torch.tensor([[-2.0, -2.1]]),
+        "advantages": torch.zeros((1, 2)),
+    }
+
+    _loss, raw_outputs, _raw_metrics, _metric_ops, _outputs = runner._compute_micro_batch_loss(
+        micro_batch,
+        "drgrpo",
+        {"beta": 0.0},
+    )
+    _loss, temp_outputs, _temp_metrics, _metric_ops, _outputs = runner._compute_micro_batch_loss(
+        micro_batch,
+        "drgrpo",
+        {"beta": 0.0, "logprob_temperature": 0.7},
+    )
+
+    assert not torch.allclose(raw_outputs["logprobs"], temp_outputs["logprobs"])
+
+
+def test_compute_micro_batch_loss_drgrpo_skips_returned_logprobs_when_disabled():
+    runner = object.__new__(ModelRunner)
+    runner.model = _TinyModel()
+    runner.ce_mode = "eager"
+    runner.lm_head_fp32 = False
+
+    micro_batch = {
+        "input_ids": torch.tensor([[1, 2]]),
+        "target_tokens": torch.tensor([[2, 3]]),
+        "logprobs": torch.tensor([[-2.0, -2.1]]),
+        "advantages": torch.tensor([[1.0, 1.0]]),
+    }
+
+    loss, per_token_outputs, metrics, _metric_ops, _outputs = runner._compute_micro_batch_loss(
+        micro_batch,
+        "drgrpo",
+        {"beta": 0.0, "return_per_token": False},
+    )
+
+    assert loss.isfinite()
+    assert per_token_outputs == {}
+    assert metrics["valid_tokens"] == 2
+
+
+def test_compute_micro_batch_loss_drgrpo_keeps_logprobs_for_per_sample_k3():
+    runner = object.__new__(ModelRunner)
+    runner.model = _TinyModel()
+    runner.ce_mode = "eager"
+    runner.lm_head_fp32 = False
+
+    micro_batch = {
+        "input_ids": torch.tensor([[1, 2]]),
+        "target_tokens": torch.tensor([[2, 3]]),
+        "logprobs": torch.tensor([[-2.0, -2.1]]),
+        "advantages": torch.tensor([[1.0, 1.0]]),
+    }
+
+    loss, per_token_outputs, metrics, _metric_ops, _outputs = runner._compute_micro_batch_loss(
+        micro_batch,
+        "drgrpo",
+        {"beta": 0.0, "return_per_token": False, "compute_per_sample_k3": True},
+    )
+
+    assert loss.isfinite()
+    assert per_token_outputs["logprobs"].shape == micro_batch["target_tokens"].shape
+    assert metrics["valid_tokens"] == 2
+
+
 def test_forward_backward_dispatches_drgrpo_through_standard_loop(monkeypatch):
     monkeypatch.setattr("xorl.server.runner.model_runner.synchronize", lambda: None)
 
