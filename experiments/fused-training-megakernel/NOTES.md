@@ -136,6 +136,28 @@ disassembled kernels are frozen whole-kernel images (baked constant-bank argumen
 reads, block-shape-tied register/barrier allocation, internal schedulers) and cuBLAS
 is a per-shape kernel-selection library besides. SASS remains a read/audit tool here.
 
+## v2 round 2: occupancy, staged epilogue, first fused epilogue
+
+- **m64n64 wgmma retile** (128x64 tiles, two warpgroups sharing B loads, 32 accumulators)
+  + **smem-staged vectorized epilogue** (accumulators staged over the dead cp.async
+  buffers, fully coalesced uint4 stores): nano 1.93 -> 1.85ms, small ~9.3ms.
+- `__launch_bounds__(256, 2)` A/B on identical hardware: forces 128 regs -> 2 blocks/SM
+  but spills 360B of stack; nano WORSE by 16% (latency chain pays for spills), small
+  BETTER by 7% (throughput pays for occupancy). Kept unbounded (nano-optimal); the real
+  resolution is setmaxnreg warp specialization.
+- **First fused epilogue** (CODA pattern): per-head qk-RMSNorm + RoPE fused into the
+  qkv gemm epilogue — with WG_BN == 64 == head_dim each tile is exactly one head, so
+  the norm reduction is tile-local over the fp32 staging (flags bit8; D=64 only,
+  D=128 falls back to the separate op). Kills 1 chain instr/layer; parity holds.
+  Remaining fusions from the same blueprint: swiglu paired-column tiles, Drow into
+  o-proj bwd, rstd producers, CE/lse into lm_head.
+
+Scoreboard (GPU-matched runs): nano megakernel 1.85ms vs compile+CUDAGraph 0.84ms
+(2.2x); small 9.3ms vs 3.0ms (3.1x). The goal (megakernel faster) remains unmet; the
+remaining measured gap sits in (a) the WMMA-path bwd gemms (NN/TN need MN-major wgmma
+variants), (b) attention op quality, (c) warp specialization to escape the
+occupancy/registers dilemma, (d) the rest of the fusion list.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.3x faster. The measured structural gap, in order:

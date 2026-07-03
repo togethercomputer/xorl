@@ -238,21 +238,25 @@ __device__ void op_gemm(const Instr& I, int tile, void** bufs, char* smem_raw) {
 }
 
 // ---- wgmma GEMM (Hopper): NT layouts (A [M,K], B [N,K], both K-major) ---------------
-// Tile 128x128 (two warpgroups of 64 rows), BK=64 (4 wgmma k16 steps), 2-stage cp.async.
-// smem per stage: A = 2 halves x 4 steps x 2KB, B = 4 steps x 4KB. Descriptor layout is
-// the canonical no-swizzle INTER K-major arrangement validated by wgmma_probe.py.
-// flags bit7 (128): selects this path (host guarantees M%128==0, N%128==0, K%64==0).
+// Tile 128x64: two warpgroups own 64-row halves of the SAME 64 output columns
+// (B loads shared), m64n64k16 wgmma = 32 fp32 accumulators/thread so the interpreter
+// keeps 2 blocks/SM. 2-stage cp.async feeds; epilogue stages through smem for fully
+// coalesced vectorized stores. Descriptor layout = the no-swizzle INTER K-major
+// arrangement validated by wgmma_probe.py. flags bit7 selects this path
+// (host guarantees M%128==0, N%64==0, K%64==0).
 
 #define WG_BM 128
-#define WG_BN 128
+#define WG_BN 64
 #define WG_BK 64
 
 struct WgmmaSmem {
-  bf16 A[2][2][4][1024];  // [stage][row-half][k16-step][64x16 INTER block]
-  bf16 B[2][4][2048];     // [stage][k16-step][128x16 INTER block]
+  bf16 A[2][2][4][1024];  // [stage][row-half][k16-step][64x16 INTER block] = 32KB
+  bf16 B[2][4][1024];     // [stage][k16-step][64x16 INTER block]           = 16KB
 };
+// epilogue staging overlays the (dead-by-then) stage buffers: 128 x 68 fp32 = 34.8KB
+#define WG_LDC 68
 
-__device__ __forceinline__ int wg_koff(int r, int k) {  // bytes within a 64/128-row block
+__device__ __forceinline__ int wg_koff(int r, int k) {  // bytes within a 64-row block
   return ((r >> 3) << 8) + ((k >> 3) << 7) + ((r & 7) << 4) + ((k & 7) << 1);
 }
 
@@ -281,13 +285,12 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
   const int m0 = (tile / n_tiles) * WG_BM;
   const int n0 = (tile % n_tiles) * WG_BN;
   const int tid = threadIdx.x;
-  const int wg = tid / 128;         // warpgroup (row half)
+  const int wg = tid / 128;  // warpgroup = row half
   const int wtid = tid % 128;
 
-  // cp.async a K-tile into stage: A 128rx64k = 1024 16B vecs, B 128rx64k = 1024
   auto issue_stage = [&](int k0, int st) {
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 4; ++i) {  // A: 128r x 64k = 1024 16B vectors
       const int v = tid + i * 256;
       const int r = v / 8, k8 = (v % 8) * 8;
       __pipeline_memcpy_async(
@@ -295,7 +298,7 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
           &A[(int64_t)(m0 + r) * K + k0 + k8], 16);
     }
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 2; ++i) {  // B: 64r x 64k = 512 16B vectors
       const int v = tid + i * 256;
       const int r = v / 8, k8 = (v % 8) * 8;
       __pipeline_memcpy_async(
@@ -305,19 +308,15 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
     __pipeline_commit();
   };
 
-  // Accumulate with an unbroken wgmma chain: always ScaleOut::One over explicitly
-  // zeroed registers, no branches between arrive and commit — a data-dependent scale
-  // ternary made ptxas serialize every wgmma (~60x slower; see wgmma_probe.py).
-  float d[64];
+  // Branch-free wgmma accumulate chain (ScaleOut::One over zeroed regs; a data-
+  // dependent scale made ptxas serialize every wgmma — see wgmma_probe.py).
+  float d[32];
 #pragma unroll
-  for (int i = 0; i < 64; ++i) d[i] = 0.0f;
-#define MK_FMA_ARGS d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], \
+  for (int i = 0; i < 32; ++i) d[i] = 0.0f;
+#define MK_FMA32 d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], \
       d[11], d[12], d[13], d[14], d[15], d[16], d[17], d[18], d[19], d[20], d[21], \
-      d[22], d[23], d[24], d[25], d[26], d[27], d[28], d[29], d[30], d[31], d[32], \
-      d[33], d[34], d[35], d[36], d[37], d[38], d[39], d[40], d[41], d[42], d[43], \
-      d[44], d[45], d[46], d[47], d[48], d[49], d[50], d[51], d[52], d[53], d[54], \
-      d[55], d[56], d[57], d[58], d[59], d[60], d[61], d[62], d[63]
-  using MMA = SG::MMA_64x128x16_F32BF16BF16_SS<SG::Major::K, SG::Major::K>;
+      d[22], d[23], d[24], d[25], d[26], d[27], d[28], d[29], d[30], d[31]
+  using MMA = SG::MMA_64x64x16_F32BF16BF16_SS<SG::Major::K, SG::Major::K>;
   const int iters = K / WG_BK;
   issue_stage(0, 0);
   for (int t = 0; t < iters; ++t) {
@@ -327,37 +326,115 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
     cute::warpgroup_arrive();
 #pragma unroll
     for (int s = 0; s < 4; ++s)
-      MMA::fma(wg_desc(S.A[t & 1][wg][s]), wg_desc(S.B[t & 1][s]), MK_FMA_ARGS,
+      MMA::fma(wg_desc(S.A[t & 1][wg][s]), wg_desc(S.B[t & 1][s]), MK_FMA32,
                SG::ScaleOut::One);
     cute::warpgroup_commit_batch();
     cute::warpgroup_wait<0>();
     __syncthreads();  // both warpgroups done reading before the buffer is refilled
   }
-#undef MK_FMA_ARGS
+#undef MK_FMA32
 
-  // register-direct epilogue: d[n8*4 + i*2 + j] -> C[m0 + wg*64 + w*16 + l/4 + 8i][n0 + n8*8 + (l%4)*2 + j]
-  const int w = (wtid / 32), l = wtid % 32;
-  const int rbase = m0 + wg * 64 + w * 16 + l / 4;
-  const int cbase = n0 + (l % 4) * 2;
+  // stage accumulators to smem (over the dead A/B buffers), then coalesced epilogue
+  float* Cs = reinterpret_cast<float*>(smem_raw);
+  const int w = wtid / 32, l = wtid % 32;
+  {
+    const int r = wg * 64 + w * 16 + l / 4;
+    const int cb = (l % 4) * 2;
 #pragma unroll
-  for (int n8 = 0; n8 < 16; ++n8)
+    for (int n8 = 0; n8 < 8; ++n8)
 #pragma unroll
-    for (int i = 0; i < 2; ++i)
+      for (int i = 0; i < 2; ++i)
 #pragma unroll
-      for (int j = 0; j < 2; ++j) {
-        const int gm = rbase + 8 * i;
-        const int gn = cbase + n8 * 8 + j;
-        float v = d[n8 * 4 + i * 2 + j];
-        const int64_t idx = (int64_t)gm * N + gn;
-        if (Res) v += bf2f(Res[idx]);
-        if (c_f32) {
-          float* C = reinterpret_cast<float*>(Cp);
-          C[idx] = acc_c ? C[idx] + v : v;
-        } else {
-          bf16* C = reinterpret_cast<bf16*>(Cp);
-          C[idx] = f2bf(acc_c ? bf2f(C[idx]) + v : v);
-        }
+        for (int j = 0; j < 2; ++j)
+          Cs[(r + 8 * i) * WG_LDC + n8 * 8 + cb + j] = d[n8 * 4 + i * 2 + j];
+  }
+  __syncthreads();
+  // 128x64 outputs as 8-element groups: 1024 groups, 4 per thread, fully coalesced
+#pragma unroll
+  for (int g = 0; g < 4; ++g) {
+    const int gid = tid + g * 256;
+    const int m = gid / 8, c8 = (gid % 8) * 8;
+    const int gm = m0 + m, gn = n0 + c8;
+    const int64_t idx = (int64_t)gm * N + gn;
+    float v[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) v[e] = Cs[m * WG_LDC + c8 + e];
+    if (Res) {
+      const uint4 rv = *reinterpret_cast<const uint4*>(&Res[idx]);
+      const bf16* re = reinterpret_cast<const bf16*>(&rv);
+#pragma unroll
+      for (int e = 0; e < 8; ++e) v[e] += bf2f(re[e]);
+    }
+    if (c_f32) {
+      float* C = reinterpret_cast<float*>(Cp);
+      if (acc_c) {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) C[idx + e] += v[e];
+      } else {
+        float4 o0 = make_float4(v[0], v[1], v[2], v[3]);
+        float4 o1 = make_float4(v[4], v[5], v[6], v[7]);
+        *reinterpret_cast<float4*>(&C[idx]) = o0;
+        *reinterpret_cast<float4*>(&C[idx + 4]) = o1;
       }
+    } else {
+      bf16* C = reinterpret_cast<bf16*>(Cp);
+      if (acc_c) {
+        const uint4 cv = *reinterpret_cast<const uint4*>(&C[idx]);
+        const bf16* ce = reinterpret_cast<const bf16*>(&cv);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) v[e] += bf2f(ce[e]);
+      }
+      uint4 out;
+      bf16* oe = reinterpret_cast<bf16*>(&out);
+#pragma unroll
+      for (int e = 0; e < 8; ++e) oe[e] = f2bf(v[e]);
+      *reinterpret_cast<uint4*>(&C[idx]) = out;
+    }
+  }
+
+  // Fused per-head qk-RMSNorm + RoPE epilogue (flags bit8): with WG_BN == 64 == D each
+  // tile covers exactly one head, so the norm is tile-local over the fp32 staging.
+  // args: 9=qw 10=kw 11=rstd_q 12=rstd_k 13=cos 14=sin 15=qkvr 16=nq 17=nkv 18=D 19=eps
+  if (flags & 256) {
+    const int nq_ = I.args[16], nkv_ = I.args[17], D_ = I.args[18];
+    const float eps = __int_as_float(I.args[19]);
+    bf16* qkvr = reinterpret_cast<bf16*>(bufs[I.args[15]]);
+    const int head = n0 / D_;
+    const int warp = tid / 32, lane = tid % 32;
+    if (head >= nq_ + nkv_) {  // v head: pass through
+#pragma unroll
+      for (int g = 0; g < 4; ++g) {
+        const int gid = tid + g * 256;
+        const int m = gid / 8, c8 = (gid % 8) * 8;
+        uint4 out;
+        bf16* oe = reinterpret_cast<bf16*>(&out);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) oe[e] = f2bf(Cs[m * WG_LDC + c8 + e]);
+        *reinterpret_cast<uint4*>(&qkvr[(int64_t)(m0 + m) * N + n0 + c8]) = out;
+      }
+    } else {
+      const bool is_q = head < nq_;
+      const bf16* w_ = reinterpret_cast<const bf16*>(bufs[is_q ? I.args[9] : I.args[10]]);
+      float* rstd = reinterpret_cast<float*>(bufs[is_q ? I.args[11] : I.args[12]]);
+      const float* cosr = reinterpret_cast<const float*>(bufs[I.args[13]]);
+      const float* sinr = reinterpret_cast<const float*>(bufs[I.args[14]]);
+      const int hd = is_q ? head : head - nq_;
+      for (int r = warp; r < WG_BM; r += 8) {  // warp per row; lane = rope pair (l, l+32)
+        const int gm = m0 + r;
+        const float x0 = Cs[r * WG_LDC + lane];
+        const float x1 = Cs[r * WG_LDC + lane + 32];
+        float ss = x0 * x0 + x1 * x1;
+        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, o);
+        const float rs = rsqrtf(ss / D_ + eps);
+        if (lane == 0) rstd[(int64_t)gm * (is_q ? nq_ : nkv_) + hd] = rs;
+        const float a = x0 * rs * bf2f(w_[lane]);
+        const float b = x1 * rs * bf2f(w_[lane + 32]);
+        const float cv = cosr[(int64_t)gm * 32 + lane], sv = sinr[(int64_t)gm * 32 + lane];
+        qkvr[(int64_t)gm * N + n0 + lane] = f2bf(a * cv - b * sv);
+        qkvr[(int64_t)gm * N + n0 + lane + 32] = f2bf(b * cv + a * sv);
+      }
+    }
+  }
 }
 
 // ---- fp32 -> bf16 convert (drains split/atomic fp32 workspaces) -------------------------

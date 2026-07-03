@@ -157,27 +157,57 @@ class MKQwen3:
             a = lambda n: B(A[f"{n}.{l}"])  # noqa: E731
             p.instr(mk.OP_RMSNORM_FWD, c.S, [X[l], pr("w1"), a("xn1"), a("rstd1"), c.H, eps])
             p.wave()
-            gemm(a("xn1"), pr("wqkv"), a("qkvraw"), c.S, QD, c.H, 2)
-            p.wave()
-            p.instr(
-                mk.OP_QKNORM_ROPE_FWD,
-                c.S,
-                [
-                    a("qkvraw"),
-                    a("qkvr"),
-                    pr("qn"),
-                    pr("kn"),
-                    a("rq"),
-                    a("rk"),
-                    B(self.cos),
-                    B(self.sin),
-                    c.nq,
-                    c.nkv,
-                    c.D,
-                    eps,
-                ],
-            )
-            p.wave()
+            if c.D == 64 and mk.wgmma_ok(c.S, QD, c.H, 2):
+                # qk-norm + rope fused into the qkv gemm epilogue (one head per tile)
+                p.instr(
+                    mk.OP_GEMM,
+                    mk.gemm_tiles_wgmma(c.S, QD),
+                    [
+                        a("xn1"),
+                        pr("wqkv"),
+                        a("qkvraw"),
+                        c.S,
+                        QD,
+                        c.H,
+                        2 | 128 | 256,
+                        0,
+                        0,
+                        pr("qn"),
+                        pr("kn"),
+                        a("rq"),
+                        a("rk"),
+                        B(self.cos),
+                        B(self.sin),
+                        a("qkvr"),
+                        c.nq,
+                        c.nkv,
+                        c.D,
+                        eps,
+                    ],
+                )
+                p.wave()
+            else:
+                gemm(a("xn1"), pr("wqkv"), a("qkvraw"), c.S, QD, c.H, 2)
+                p.wave()
+                p.instr(
+                    mk.OP_QKNORM_ROPE_FWD,
+                    c.S,
+                    [
+                        a("qkvraw"),
+                        a("qkvr"),
+                        pr("qn"),
+                        pr("kn"),
+                        a("rq"),
+                        a("rk"),
+                        B(self.cos),
+                        B(self.sin),
+                        c.nq,
+                        c.nkv,
+                        c.D,
+                        eps,
+                    ],
+                )
+                p.wave()
             p.instr(mk.OP_ATTN_FWD, c.nq * n_qt, [a("qkvr"), a("oatt"), a("lse"), c.S, c.nq, c.nkv, c.D, scale])
             p.wave()
             gemm(a("oatt"), pr("wo"), a("x2"), c.S, c.H, c.nq * c.D, 2 | 16, X[l])
