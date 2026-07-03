@@ -24,6 +24,7 @@ from .transformers.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
 from .transformers.glm5.configuration_glm5 import Glm5Config
 from .transformers.glm5.support import validate_glm5_router_settings, validate_glm5_sequence_parallel
 from .transformers.gpt_oss.configuration_gpt_oss import GptOssConfig
+from .transformers.minimax_m3.configuration_minimax_m3 import MiniMaxM3Config
 from .transformers.nemotron_h.configuration_nemotron_h import NemotronHConfig
 from .transformers.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 from .transformers.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
@@ -106,6 +107,10 @@ def _load_local_xorl_config(
 
     if model_type == "gpt_oss":
         return GptOssConfig.from_hf_config(_namespace_from_dict(config_dict))
+
+    if model_type in {"minimax_m3_vl", "xorl_minimax_m3"}:
+        return MiniMaxM3Config.from_hf_config(_namespace_from_dict(config_dict))
+
     if model_type == "olmo2":
         from .transformers.olmo2.configuration_olmo2 import Olmo2Config  # noqa: PLC0415
 
@@ -125,6 +130,12 @@ def _get_architectures(config: "PretrainedConfig") -> set[str]:
 
 def _is_gpt_oss_config(config: "PretrainedConfig") -> bool:
     return getattr(config, "model_type", None) == "gpt_oss" or "GptOssForCausalLM" in _get_architectures(config)
+
+
+def _is_minimax_m3_config(config: "PretrainedConfig") -> bool:
+    return getattr(config, "model_type", None) == "xorl_minimax_m3" or bool(
+        _get_architectures(config) & {"MiniMaxM3SparseForConditionalGeneration", "MiniMaxM3SparseForCausalLM"}
+    )
 
 
 def build_tokenizer(tokenizer_path: str) -> "PreTrainedTokenizer":
@@ -176,7 +187,7 @@ def build_foundation_model(
     weights_path: Optional[str] = None,
     torch_dtype: Literal["float16", "bfloat16", "float32"] = "bfloat16",
     attn_implementation: Optional[
-        Literal["eager", "sdpa", "native", "flash_attention_3", "flash_attention_4"]
+        Literal["eager", "sdpa", "native", "flash_attention_3", "flash_attention_4", "minimax_msa"]
     ] = "flash_attention_3",
     moe_implementation: Optional[Literal["eager", "triton", "native", "quack"]] = None,
     ep_dispatch: str = "alltoall",
@@ -273,6 +284,20 @@ def build_foundation_model(
             "sink logits and change model outputs."
         )
 
+    if _is_minimax_m3_config(config):
+        unsupported = (
+            ps.tp_size > 1
+            or ps.pp_size > 1
+            or ps.ringattn_size > 1
+            or ps.ulysses_size > 1
+            or getattr(ps, "lm_head_tp_size", 1) > 1
+        )
+        if unsupported:
+            raise ValueError(
+                "MiniMax M3 xorl support currently supports data/FSDP2 and expert parallelism only; "
+                "tensor parallelism, pipeline parallelism, Ulysses, Ring, and lm-head TP are not supported yet."
+            )
+
     loader: ModelLoader = get_loader(config)
 
     # Validate FA4 availability early
@@ -289,6 +314,8 @@ def build_foundation_model(
     hf_attn_implementation = attn_implementation
     if attn_implementation in ("flash_attention_3", "flash_attention_4"):
         hf_attn_implementation = "flash_attention_2"
+    elif attn_implementation == "minimax_msa":
+        hf_attn_implementation = "eager"
 
     init_kwargs = {
         "config": config,

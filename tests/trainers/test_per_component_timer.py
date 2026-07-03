@@ -123,10 +123,6 @@ def test_disabled_timer_is_a_noop():
     assert timer.end_step() == {}
 
 
-@pytest.mark.skip(
-    reason="PerComponentTimer.end_step raises on unrecorded CUDA event pairs upstream rather than "
-    "skipping them; the skip-unrecorded behavior this test asserts is not implemented yet"
-)
 def test_end_step_skips_unrecorded_cuda_event_pairs(monkeypatch):
     timer = PerComponentTimer(enabled=False)
     timer.enabled = True
@@ -147,6 +143,7 @@ def test_end_step_skips_unrecorded_cuda_event_pairs(monkeypatch):
 
     assert result["fwd_ok"] == pytest.approx(0.0025)
     assert "fwd_unrecorded" not in result
+    assert timer.last_skipped_event_pair_count == 1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for event-based timing")

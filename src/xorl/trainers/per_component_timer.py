@@ -54,6 +54,7 @@ class PerComponentTimer:
         self._fwd_pairs: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = defaultdict(list)
         self._bwd_pairs: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = defaultdict(list)
         self._recompute_pairs: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = defaultdict(list)
+        self.last_skipped_event_pair_count = 0
 
     def attach(self, model: nn.Module) -> int:
         """Register hooks on decoder layers. Returns the number of layers found."""
@@ -92,15 +93,23 @@ class PerComponentTimer:
         if not self.enabled:
             return {}
         self._mode = "idle"
+        self.last_skipped_event_pair_count = 0
         torch.cuda.synchronize()
         result: dict[str, float] = {}
 
         def _accumulate(pairs: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]]) -> None:
             for phase, events in pairs.items():
                 total_ms = 0.0
+                valid_count = 0
                 for start, end in events:
-                    total_ms += start.elapsed_time(end)
-                result[phase] = total_ms / 1000.0
+                    try:
+                        total_ms += start.elapsed_time(end)
+                    except (RuntimeError, ValueError):
+                        self.last_skipped_event_pair_count += 1
+                        continue
+                    valid_count += 1
+                if valid_count:
+                    result[phase] = total_ms / 1000.0
 
         _accumulate(self._fwd_pairs)
         _accumulate(self._bwd_pairs)

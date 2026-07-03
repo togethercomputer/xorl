@@ -836,9 +836,14 @@ class MoEExperts(nn.Module):
             torch.cuda.synchronize()
 
         # Warmup: pre-compile the selected group-GEMM backend variants to avoid
-        # first-use compilation memory spikes during training.
+        # first-use compilation memory spikes during training. "triton_w4a4" (the QARL
+        # W4A4 down-quant shadow) runs the identical triton group-GEMM kernels, so it
+        # must warm up too — otherwise the first W4A4 step pays the compile-memory spike
+        # this warmup exists to prevent.
         warmup_attr = f"_kernel_warmed_up_{self.moe_implementation}_{'fp8' if self.fp8_training_enabled else 'bf16'}"
-        if self.moe_implementation in {"triton", "quack"} and not getattr(type(self), warmup_attr, False):
+        if self.moe_implementation in {"triton", "triton_w4a4", "quack"} and not getattr(
+            type(self), warmup_attr, False
+        ):
             if self.moe_implementation == "quack":
                 if self.fp8_training_enabled:
                     from xorl.fp8_training import grouped as _fp8_grouped  # noqa: PLC0415

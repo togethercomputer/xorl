@@ -92,9 +92,55 @@ try:
             hidden_act,
             swiglu_limit,
             gated,
+            0,  # act_quant_group_size: off -> bf16 down input. MUST be passed so autograd
+            # tracks the same input count (10) as the triton_w4a4 path -> backward returns 10.
         )
 
     EP_EXPERT_COMPUTE["triton"] = _triton_ep_apply
+
+    def _triton_ep_w4a4_apply(
+        permute_tokens,
+        cumsum,
+        gate_up_proj,
+        down_proj,
+        intermediate_size,
+        expert_scores=None,
+        hidden_act="silu",
+        activation_native=False,
+        fp8_compute=False,
+        fp8_grouped_backend="triton_grouped",
+        fp8_block_size=128,
+        swiglu_limit=0.0,
+        gated=True,
+        **_extras,
+    ):
+        """W4A4 triton EP compute: identical to ``triton`` but NVFP4-fake-quantizes the
+        down-GEMM input (the SwiGLU intermediate) with STE. Selected by ``QARLMoEExperts``
+        (which shadows ``moe_implementation`` -> ``triton_w4a4``) when activation quant is on.
+        NVFP4 block size is fixed at 16 by the format."""
+        del activation_native, fp8_grouped_backend, fp8_block_size
+        if fp8_compute:
+            raise NotImplementedError(
+                "triton_w4a4 EP backend does not support FP8 expert compute. "
+                "Use moe_implementation='quack' for FP8 grouped expert compute."
+            )
+        unsupported_extras = {key: value for key, value in _extras.items() if value is not None}
+        if unsupported_extras or hidden_act == "clamped_swiglu":
+            raise NotImplementedError("triton_w4a4 EP backend does not support per-expert biases or clamped_swiglu.")
+        return TritonEPGroupGemm.apply(
+            permute_tokens,
+            cumsum,
+            gate_up_proj,
+            down_proj,
+            intermediate_size,
+            expert_scores,
+            hidden_act,
+            swiglu_limit,
+            gated,
+            16,  # act_quant_group_size: NVFP4 block size -> fake-quant the down input
+        )
+
+    EP_EXPERT_COMPUTE["triton_w4a4"] = _triton_ep_w4a4_apply
 
     def _triton_ep_moe_act_apply(
         permute_tokens,

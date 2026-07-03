@@ -5,6 +5,7 @@ from xorl.qarl.fake_quant import (
     QARLLinear,
     inject_qarl_into_model,
     normalize_qarl_quant_cfg,
+    qarl_activation_quant_override,
     qarl_unsupported_scope_reason,
     summarize_qarl_model,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "inject_qarl_into_model",
     "load_qarl_calibration_batches",
     "normalize_qarl_quant_cfg",
+    "qarl_activation_quant_override",
     "qarl_sync_quantization_config",
     "qarl_unsupported_scope_reason",
     "summarize_qarl_model",

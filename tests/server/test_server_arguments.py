@@ -120,6 +120,37 @@ def test_load_server_arguments_threads_distsignsgd_through_nested_config(tmp_pat
     assert args.to_config_dict()["train"]["optimizer"] == "distsignsgd"
 
 
+def test_server_arguments_threads_hsdp_deferral_and_packing_pad(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "model_path": "Qwen/Qwen3-8B",
+                },
+                "train": {
+                    "data_parallel_replicate_size": 2,
+                    "data_parallel_shard_size": 4,
+                    "defer_grad_sync_in_accumulation": True,
+                },
+                "data": {
+                    "sample_packing_sequence_len": 16384,
+                    "pad_to_multiple_of": 4096,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = load_server_arguments(str(config_path))
+    train_config = args.to_config_dict()["train"]
+
+    assert args.defer_grad_sync_in_accumulation is True
+    assert args.pad_to_multiple_of == 4096
+    assert train_config["defer_grad_sync_in_accumulation"] is True
+    assert train_config["pad_to_multiple_of"] == 4096
+
+
 def test_load_server_arguments_threads_adapter_state_load_mode_into_lora_config(tmp_path):
     config_path = tmp_path / "server_config.yaml"
     config_path.write_text(

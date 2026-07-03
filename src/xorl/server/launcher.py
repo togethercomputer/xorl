@@ -163,6 +163,7 @@ def run_orchestrator(
     log_level: str = "INFO",
     sample_packing_sequence_len: int = 32000,
     enable_packing: bool = True,
+    pad_to_multiple_of: int = 128,
     ready_event: Optional[mp.Event] = None,
     output_dir: str = "outputs",
     packing_strategy: str = "sequential",
@@ -219,13 +220,15 @@ def run_orchestrator(
             ack_timeout=300.0,  # 5 min — weight sync can block workers for 40s+ on large MoE models
             sample_packing_sequence_len=sample_packing_sequence_len,
             enable_packing=enable_packing,
+            pad_to_multiple_of=pad_to_multiple_of,
             packing_strategy=packing_strategy,
             on_oversized=on_oversized,
             dp_size=dp_size,
         )
         logger.info(
             f"Orchestrator initialized successfully (operation_timeout={operation_timeout}s, "
-            f"packing_strategy={packing_strategy}, on_oversized={on_oversized}, dp_size={dp_size})"
+            f"packing_strategy={packing_strategy}, on_oversized={on_oversized}, "
+            f"pad_to_multiple_of={pad_to_multiple_of}, dp_size={dp_size})"
         )
 
         logger.info("Starting Orchestrator...")
@@ -446,6 +449,8 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
             flat_config["sample_packing_sequence_len"] = data_config.get("sample_packing_sequence_len", 32000)
         if "enable_packing" not in flat_config:
             flat_config["enable_packing"] = data_config.get("enable_packing", True)
+        if "pad_to_multiple_of" not in flat_config and "pad_to_multiple_of" in data_config:
+            flat_config["pad_to_multiple_of"] = data_config["pad_to_multiple_of"]
         if "sample_packing_strategy" not in flat_config and "sample_packing_strategy" in data_config:
             flat_config["sample_packing_strategy"] = data_config["sample_packing_strategy"]
         if "sample_packing_on_oversized" not in flat_config and "sample_packing_on_oversized" in data_config:
@@ -578,6 +583,7 @@ class Launcher:
         # Data processing parameters
         sample_packing_sequence_len: int = 32000,
         enable_packing: bool = True,
+        pad_to_multiple_of: int = 128,
         # Server config overrides (from --server.* CLI args)
         server_overrides: Optional[Dict[str, any]] = None,
     ):
@@ -607,6 +613,7 @@ class Launcher:
         self.operation_timeout = operation_timeout
         self.sample_packing_sequence_len = sample_packing_sequence_len
         self.enable_packing = enable_packing
+        self.pad_to_multiple_of = pad_to_multiple_of
         # Packing strategy / oversized policy / dp fan-out. Populated from
         # ServerArguments in _setup_addresses(); defaults keep behavior unchanged
         # (greedy sequential packing, fail-loud on oversized samples).
@@ -715,6 +722,7 @@ class Launcher:
         if self.server_args:
             self.sample_packing_sequence_len = self.server_args.sample_packing_sequence_len
             self.enable_packing = self.server_args.enable_packing
+            self.pad_to_multiple_of = self.server_args.pad_to_multiple_of
             self.packing_strategy = self.server_args.sample_packing_strategy
             self.on_oversized = self.server_args.sample_packing_on_oversized
             # Number of distinct batch slices the dispatcher will produce. This is
@@ -730,6 +738,7 @@ class Launcher:
             logger.info(
                 f"Using packing config: seq_len={self.sample_packing_sequence_len}, enabled={self.enable_packing}, "
                 f"strategy={self.packing_strategy}, on_oversized={self.on_oversized}, "
+                f"pad_to_multiple_of={self.pad_to_multiple_of}, "
                 f"dp_size={self.packing_dp_size} (total_gpus={total_gpus}, cp_size={cp_size}, pp_size={pp_size})"
             )
 
@@ -1239,6 +1248,7 @@ class Launcher:
                         self.log_level,
                         self.sample_packing_sequence_len,
                         self.enable_packing,
+                        self.pad_to_multiple_of,
                         self.engine_ready_event,
                         self.output_dir,
                         self.packing_strategy,

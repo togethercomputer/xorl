@@ -9,6 +9,12 @@ from typing import Any, Dict, Mapping, Optional
 import torch
 from safetensors import safe_open
 
+from xorl.distillation.mooncake_hidden_store import (
+    MooncakeHiddenStore,
+    MooncakeStoreConfig,
+    is_mooncake_entry,
+    parse_mooncake_metadata,
+)
 from xorl.distillation.teacher_store import (
     TeacherHeadShardView,
     TeacherHeadStore,
@@ -19,7 +25,6 @@ from xorl.distillation.teacher_store import (
 
 
 DEFAULT_LM_HEAD_KEY = "lm_head.weight"
-DEFAULT_HIDDEN_KEY = "hidden_states"
 TIED_EMBEDDING_LM_HEAD_KEYS = (
     "model.embed_tokens.weight",
     "language_model.model.embed_tokens.weight",
@@ -115,27 +120,6 @@ def load_lm_head_weight(
         tensor = _load_safetensors_tensor(path, key)
     else:
         raise ValueError(f"Teacher LM head must be a safetensors file or model directory: {path}")
-    return tensor.contiguous()
-
-
-def load_hidden_state_cache(entry: str | Mapping[str, Any], tensor_key: str = DEFAULT_HIDDEN_KEY) -> torch.Tensor:
-    """Load a teacher hidden-state cache tensor of shape [num_cached_tokens, hidden_dim]."""
-    path, key = _normalize_entry(entry, tensor_key)
-    if os.path.isdir(path):
-        safetensors_path = os.path.join(path, "hidden_states.safetensors")
-        if os.path.exists(safetensors_path):
-            tensor = _load_safetensors_tensor(safetensors_path, key)
-        else:
-            raise FileNotFoundError(f"No hidden_states.safetensors found in {path}")
-    elif path.endswith(".safetensors"):
-        tensor = _load_safetensors_tensor(path, key)
-    else:
-        raise ValueError(f"Teacher hidden cache must be a safetensors file or directory: {path}")
-    if tensor.ndim not in (2, 3):
-        raise ValueError(
-            "Teacher hidden cache must be rank 2 [tokens, hidden_dim] or rank 3 "
-            f"[layers, tokens, hidden_dim] (multi-layer OPRD), got shape {tuple(tensor.shape)}"
-        )
     return tensor.contiguous()
 
 
@@ -259,15 +243,26 @@ class TeacherHeadManager:
 
 @dataclass
 class TeacherActivationCache:
+    """Teacher hidden-state cache backed by the keyed Mooncake transport.
+
+    Each per-teacher entry is the Mooncake metadata dict produced by the teacher
+    forward (``backend == "mooncake"`` plus key/shape/dtype; see
+    :mod:`xorl.distillation.mooncake_hidden_store`). The cache fetches the tensor
+    from Mooncake and exposes it to the OPD loss through :meth:`get` as a CPU
+    ``[tokens, d]`` / ``[layers, tokens, d]`` tensor.
+    """
+
     hidden_caches: Mapping[str, Any] | str
     enable_async: bool = True
     max_workers: int = 2
+    mooncake_store: Optional[MooncakeHiddenStore] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.hidden_caches, str):
             self.hidden_caches = {str(k): v for k, v in self.hidden_caches.items()}
         self._cpu_cache: Dict[str, torch.Tensor] = {}
         self._cpu_futures: Dict[str, Future] = {}
+        self._mooncake_stores: Dict[tuple, MooncakeHiddenStore] = {}
         self._executor: Optional[ThreadPoolExecutor] = (
             ThreadPoolExecutor(max_workers=max(1, int(self.max_workers)), thread_name_prefix="opd-teacher-hidden")
             if self.enable_async
@@ -282,8 +277,34 @@ class TeacherActivationCache:
             raise KeyError(f"No teacher hidden cache configured for teacher_id={key}")
         return key, self.hidden_caches[key]
 
+    def _store_for_entry(self, entry: Mapping[str, Any]) -> MooncakeHiddenStore:
+        # An injected store (tests / shared producer store) always wins.
+        if self.mooncake_store is not None:
+            return self.mooncake_store
+        overrides = entry.get("mooncake") or {}
+        store_key = tuple(sorted((str(k), str(v)) for k, v in overrides.items()))
+        if store_key not in self._mooncake_stores:
+            config = MooncakeStoreConfig.from_env(overrides=overrides)
+            self._mooncake_stores[store_key] = MooncakeHiddenStore(config)
+        return self._mooncake_stores[store_key]
+
     def _load_cpu(self, key: str, entry: Any) -> torch.Tensor:
-        return load_hidden_state_cache(entry)
+        if not is_mooncake_entry(entry):
+            raise ValueError(
+                "Teacher hidden cache must be a Mooncake metadata dict "
+                "(backend='mooncake' with key/tensor_shapes/tensor_dtypes); "
+                f"got {type(entry).__name__} for teacher_id={key}. The file-backed "
+                "safetensors cache path has been removed."
+            )
+        store = self._store_for_entry(entry)
+        base_key, tensor_key, shape, dtype = parse_mooncake_metadata(entry)
+        tensor = store.get_hidden(base_key, shape, dtype, device="cpu", tensor_key=tensor_key)
+        if tensor.ndim not in (2, 3):
+            raise ValueError(
+                "Mooncake teacher hidden cache must be rank 2 [tokens, hidden_dim] or rank 3 "
+                f"[layers, tokens, hidden_dim], got shape {tuple(tensor.shape)}"
+            )
+        return tensor.contiguous()
 
     def prefetch(self, teacher_id: int | str | torch.Tensor) -> None:
         """Start loading a teacher hidden-state cache into CPU memory."""
@@ -333,8 +354,7 @@ class TeacherActivationCache:
             max_idx = flat_indices.max().item()
             if max_idx >= num_tokens:
                 raise IndexError(
-                    f"teacher_cache_indices contain {max_idx}, "
-                    f"but teacher_id={key} cache only has {num_tokens} rows"
+                    f"teacher_cache_indices contain {max_idx}, but teacher_id={key} cache only has {num_tokens} rows"
                 )
         gathered = cache.index_select(token_dim, flat_indices)
         if cache.ndim == 2:
@@ -351,3 +371,8 @@ class TeacherActivationCache:
         if self._executor is not None:
             self._executor.shutdown(wait=False, cancel_futures=True)
             self._executor = None
+        # Only close stores this cache opened itself; an injected store is owned
+        # by the caller.
+        for store in self._mooncake_stores.values():
+            store.close()
+        self._mooncake_stores = {}

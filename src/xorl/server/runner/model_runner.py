@@ -13,12 +13,14 @@ Usage:
     See xorl.server.runner.runner_dispatcher for the entry point.
 """
 
+import contextlib
 import gc
 import logging
 import math
 import os
 import shutil
 import time
+import uuid
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -26,12 +28,16 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from safetensors.torch import save_file
 from transformers import AutoTokenizer, PretrainedConfig
 
 from xorl.checkpoint import build_checkpointer
 from xorl.data.constants import IGNORE_INDEX
-from xorl.distillation import TeacherActivationCache, TeacherHeadManager
+from xorl.distillation import (
+    MooncakeHiddenStore,
+    MooncakeStoreConfig,
+    TeacherActivationCache,
+    TeacherHeadManager,
+)
 from xorl.distributed.offloading import build_activation_offloading_context
 from xorl.distributed.parallel_state import get_parallel_state, init_parallel_state
 from xorl.distributed.pipeline_parallel import build_pipeline_schedule, build_pp_stage
@@ -52,6 +58,7 @@ from xorl.ops.loss import (
 from xorl.optim import build_optimizer
 from xorl.server.runner.adapters import LoRAAdapterManager
 from xorl.server.runner.checkpoint import CheckpointManager
+from xorl.server.runner.grad_sync import hsdp_all_reduce_microbatch_context, should_defer_hsdp_all_reduce
 from xorl.server.runner.utils import (
     MoeMetricsTracker,
     RoutingReplayHandler,
@@ -342,6 +349,10 @@ class ModelRunner:
         # Multi-layer OPRD: separate rank-3 [layers, tokens, d] teacher cache.
         self._opd_layer_cache: Optional[TeacherActivationCache] = None
         self._opd_layer_config: Optional[Any] = None
+        # Producer-side Mooncake store for the teacher_hidden_cache forward path
+        # (built lazily when the mooncake backend is selected).
+        self._teacher_hidden_cache_store: Optional[MooncakeHiddenStore] = None
+        self._teacher_hidden_cache_store_config: Optional[Any] = None
 
         # Multi-adapter support (initialized later if LoRA is enabled)
         self._adapter_manager: Optional[LoRAAdapterManager] = None
@@ -1848,39 +1859,50 @@ class ModelRunner:
         dist.gather_object(payload, gathered, dst=write_rank)
         return [item for item in gathered if item is not None] if self.rank == write_rank else None
 
-    def _write_teacher_hidden_cache(
+    def _get_teacher_hidden_cache_store(self, params: Dict[str, Any]) -> MooncakeHiddenStore:
+        """Lazily build (and cache) the producer-side Mooncake store.
+
+        Connection overrides may be passed under ``teacher_hidden_cache_mooncake``
+        (a dict of master_server_address/metadata_server/protocol/device_name);
+        anything unset falls back to the ``MOONCAKE_*`` environment. Tests inject
+        a store directly via ``self._teacher_hidden_cache_store``.
+        """
+        overrides = params.get("teacher_hidden_cache_mooncake") or {}
+        config_key = repr(sorted((str(k), str(v)) for k, v in overrides.items()))
+        if self._teacher_hidden_cache_store is None or self._teacher_hidden_cache_store_config != config_key:
+            config = MooncakeStoreConfig.from_env(overrides=overrides)
+            self._teacher_hidden_cache_store = MooncakeHiddenStore(config)
+            self._teacher_hidden_cache_store_config = config_key
+        return self._teacher_hidden_cache_store
+
+    def _write_teacher_hidden_cache_mooncake(
         self,
         gathered_payloads: List[Dict[str, Any]],
         *,
-        cache_path: str,
         cache_key: str,
+        tensor_key: str,
         cache_dtype: torch.dtype,
+        store: MooncakeHiddenStore,
         now,
     ) -> tuple[Dict[str, Any], float]:
-        chunks, cache_indices_by_sample = self._merge_teacher_hidden_cache_payloads(gathered_payloads)
+        """Concatenate gathered chunks and store them under a Mooncake key.
 
+        Merges the per-rank teacher-cache chunks in logical data-slice order and
+        writes the concatenated tensor to the keyed Mooncake transport. Returns
+        the producer metadata (backend/key/tensor_shapes/tensor_dtypes/num_tokens/
+        cache_indices_by_sample) plus the write duration.
+        """
+        chunks, cache_indices_by_sample = self._merge_teacher_hidden_cache_payloads(gathered_payloads)
         if not chunks:
             raise ValueError("teacher_hidden_cache produced no hidden-state chunks to write")
 
+        hidden_cache = torch.cat(chunks, dim=0).to(dtype=cache_dtype).contiguous()
         t_write = now()
-        os.makedirs(os.path.dirname(os.path.abspath(cache_path)) or ".", exist_ok=True)
-        hidden_cache = torch.cat(chunks, dim=0).contiguous()
-        tmp_path = f"{cache_path}.tmp-rank{self.rank}"
-        save_file({cache_key: hidden_cache}, tmp_path)
-        os.replace(tmp_path, cache_path)
+        metadata = store.put_hidden(cache_key, hidden_cache, tensor_key=tensor_key)
         write_s = now() - t_write
 
-        return (
-            {
-                "path": cache_path,
-                "tensor_key": cache_key,
-                "dtype": str(cache_dtype).removeprefix("torch."),
-                "num_tokens": int(hidden_cache.shape[0]),
-                "hidden_size": int(hidden_cache.shape[1]),
-                "cache_indices_by_sample": cache_indices_by_sample,
-            },
-            write_s,
-        )
+        metadata["cache_indices_by_sample"] = cache_indices_by_sample
+        return metadata, write_s
 
     def _teacher_hidden_chunks_from_batch(
         self,
@@ -1952,18 +1974,24 @@ class ModelRunner:
         if self.pp_enabled:
             raise NotImplementedError("teacher_hidden_cache does not yet support pipeline parallelism")
 
-        cache_path = (
-            params.get("teacher_hidden_cache_path") or params.get("hidden_cache_path") or params.get("output_path")
-        )
-        if not cache_path:
-            raise ValueError(
-                "teacher_hidden_cache requires loss_fn_params.teacher_hidden_cache_path "
-                "(or hidden_cache_path/output_path)"
-            )
-
+        # Teacher hidden-state caches are transported only through the keyed
+        # Mooncake store. ``teacher_hidden_cache_key`` names the logical tensor.
         cache_key = params.get("teacher_hidden_cache_key", "hidden_states")
         cache_dtype = self._teacher_cache_dtype(params.get("teacher_hidden_cache_dtype", "bfloat16"))
         write_rank = int(params.get("teacher_hidden_cache_write_rank", 0))
+
+        # The Mooncake base key is built only on the writer rank and broadcast with
+        # the metadata, so every consumer indexes the same object.
+        mooncake_base_key = None
+        if self.rank == write_rank:
+            explicit_key = params.get("teacher_hidden_cache_mooncake_key") or params.get(
+                "teacher_hidden_cache_key_base"
+            )
+            if explicit_key:
+                mooncake_base_key = str(explicit_key)
+            else:
+                prefix = str(params.get("teacher_hidden_cache_key_prefix", "opd")).strip("/")
+                mooncake_base_key = f"{prefix}/{uuid.uuid4().hex}/teacher/{write_rank}/hidden"
         world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else self.world_size
         if write_rank < 0 or write_rank >= world_size:
             raise ValueError(f"teacher_hidden_cache_write_rank={write_rank} is outside world_size={world_size}")
@@ -2021,11 +2049,13 @@ class ModelRunner:
         cache_metadata = None
         write_s = 0.0
         if self.rank == write_rank:
-            cache_metadata, write_s = self._write_teacher_hidden_cache(
+            store = self._get_teacher_hidden_cache_store(params)
+            cache_metadata, write_s = self._write_teacher_hidden_cache_mooncake(
                 gathered_payloads or [],
-                cache_path=cache_path,
-                cache_key=cache_key,
+                cache_key=mooncake_base_key,
+                tensor_key=cache_key,
                 cache_dtype=cache_dtype,
+                store=store,
                 now=_now,
             )
 
@@ -2372,6 +2402,10 @@ class ModelRunner:
             )
         config_key = repr(hidden_caches)
         if self._opd_hidden_cache is None or self._opd_hidden_config != config_key:
+            if self._opd_hidden_cache is not None:
+                # Release the previous cache's resources (executor + any Mooncake
+                # store connection) before swapping in the new config.
+                self._opd_hidden_cache.close()
             self._opd_hidden_cache = TeacherActivationCache(hidden_caches)
             self._opd_hidden_config = config_key
         return self._opd_hidden_cache
@@ -2394,6 +2428,8 @@ class ModelRunner:
             return None
         config_key = repr(layer_caches)
         if self._opd_layer_cache is None or self._opd_layer_config != config_key:
+            if self._opd_layer_cache is not None:
+                self._opd_layer_cache.close()
             self._opd_layer_cache = TeacherActivationCache(layer_caches)
             self._opd_layer_config = config_key
         return self._opd_layer_cache
@@ -3183,17 +3219,34 @@ class ModelRunner:
                 diagnostic_hidden_component_layers
             )
 
+        # Dual-regime eval toggle (W4 vs W4A4): when loss_fn_params carries
+        # ``eval_quantize_activations`` (not None), force activation fake-quant on/off
+        # across every QARL module for THIS forward only, then restore. Eval is
+        # forward-only / no-grad, so this changes only the inference precision (which
+        # activations are fp4-fake-quantized), not training dynamics. Absent the param,
+        # behavior is unchanged (default training/eval path untouched).
+        eval_quantize_activations = params.get("eval_quantize_activations")
+        if eval_quantize_activations is not None:
+            from xorl.qarl import qarl_activation_quant_override  # noqa: PLC0415
+
+            _act_quant_ctx = qarl_activation_quant_override(self.model, bool(eval_quantize_activations))
+        else:
+            _act_quant_ctx = contextlib.nullcontext()
+
         profile_model_start = _profile_now() if profile_timings else 0.0
         try:
             # OPRD can capture just supervised rows via hooks. The legacy
             # output_hidden_states path remains available for A/Bs and diagnostics.
-            outputs = self.model(
-                **model_inputs,
-                use_cache=False,
-                output_hidden_states=(
-                    diagnostic_hidden_states or (capture_student_layers and not use_opd_selected_layer_hooks)
-                ),
-            )
+            # The activation-quant override wraps the FORWARD so the W4/W4A4 fake-quant
+            # happens inside the model's QARL modules that produce hidden_states.
+            with _act_quant_ctx:
+                outputs = self.model(
+                    **model_inputs,
+                    use_cache=False,
+                    output_hidden_states=(
+                        diagnostic_hidden_states or (capture_student_layers and not use_opd_selected_layer_hooks)
+                    ),
+                )
         finally:
             for handle in opd_selected_layer_handles:
                 handle.remove()
@@ -3524,6 +3577,11 @@ class ModelRunner:
         # Per-sample K3 deferred computation
         compute_per_sample_k3 = params.get("compute_per_sample_k3", False)
         deferred_k3: List[Dict] = []  # each entry: {k3_values, valid_mask, position_ids}
+        defer_hsdp_all_reduce = compute_backward and should_defer_hsdp_all_reduce(
+            self.model,
+            self.train_config,
+            len(micro_batches),
+        )
 
         for batch_idx, micro_batch in enumerate(micro_batches):
             if abort_callback and abort_callback():
@@ -3621,8 +3679,13 @@ class ModelRunner:
                     set_replay_stage("replay_backward")
 
                 profile_start = _profile_phase_now() if profile_phase_timings else 0.0
-                with self.model_bwd_context:
-                    local_loss_sum.backward()
+                with hsdp_all_reduce_microbatch_context(
+                    self.model,
+                    defer_hsdp_all_reduce,
+                    is_last_micro_batch=batch_idx == len(micro_batches) - 1,
+                ):
+                    with self.model_bwd_context:
+                        local_loss_sum.backward()
                 if profile_phase_timings:
                     backward_compute_time += _profile_phase_elapsed(profile_start)
 

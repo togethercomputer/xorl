@@ -31,6 +31,21 @@ if is_fused_moe_available():
 _ROUTING_WEIGHTS_BEFORE_DOWN = os.environ.get("XORL_MOE_ROUTING_WEIGHTS_BEFORE_DOWN", "0") == "1"
 
 
+def _maybe_fake_quant_down_input(tensor: torch.Tensor, act_quant_group_size: int) -> torch.Tensor:
+    """STE-fake-quantize the down-GEMM input (the SwiGLU intermediate) for W4A4.
+
+    No-op when ``act_quant_group_size`` is 0 (the default bf16 down input). Used by
+    both ``TritonEPGroupGemm.forward`` and its backward so the down_proj weight
+    gradient is taken against the exact same quantized intermediate that forward fed
+    to the down GEMM, under either routing order.
+    """
+    if not act_quant_group_size:
+        return tensor
+    from xorl.ops.quantize.nvfp4_fake_quant import fake_quantize_activation_nvfp4  # noqa: PLC0415
+
+    return fake_quantize_activation_nvfp4(tensor, act_quant_group_size)
+
+
 def _moe_gate_activation(gate_output: torch.Tensor, hidden_act: str = "silu") -> torch.Tensor:
     """Apply gate activation by kind."""
     if hidden_act == "gelu_tanh":
@@ -107,6 +122,7 @@ class TritonEPGroupGemm(torch.autograd.Function):
         hidden_act="silu",
         swiglu_limit=0.0,
         gated=True,
+        act_quant_group_size=0,
     ):
         if gated:
             check_hidden_act_supported(hidden_act, "triton", TritonEPGroupGemm.SUPPORTED_HIDDEN_ACTS)
@@ -118,6 +134,7 @@ class TritonEPGroupGemm(torch.autograd.Function):
         ctx.hidden_act = hidden_act
         ctx.swiglu_limit = float(swiglu_limit or 0.0)
         ctx.gated = gated
+        ctx.act_quant_group_size = int(act_quant_group_size or 0)
 
         gate_up_output = group_gemm_same_nk(
             a=permute_tokens,
@@ -139,6 +156,14 @@ class TritonEPGroupGemm(torch.autograd.Function):
         if _ROUTING_WEIGHTS_BEFORE_DOWN and expert_scores is not None:
             gated_output.mul_(expert_scores.to(gated_output.dtype).unsqueeze(-1))
         del gate_activation, gate_for_activation
+
+        # W4A4: fake-quantize the down-GEMM input (the SwiGLU intermediate) with NVFP4
+        # STE. Sits right before the down GEMM so it covers the exact down input under
+        # both routing orders (expert_scores already folded in above when routing-before-
+        # down). The backward treats the quant as identity for the upstream activation
+        # gradient and re-quantizes the recomputed intermediate for the down_proj weight
+        # gradient. Default off (act_quant_group_size=0) -> bf16 down input.
+        gated_output = _maybe_fake_quant_down_input(gated_output, ctx.act_quant_group_size)
 
         # Down projection (NO expert_scores inside GEMM — apply after)
         down_output = group_gemm_same_nk(
@@ -175,6 +200,13 @@ class TritonEPGroupGemm(torch.autograd.Function):
         gate_for_activation = _maybe_clamp_swiglu_gate(gate_output, getattr(ctx, "swiglu_limit", 0.0))
         gate_activation = _moe_gate_activation(gate_for_activation, getattr(ctx, "hidden_act", "silu"))
         gated_output = gate_activation * up_output
+        # W4A4: the forward fed quant(<down-GEMM input>) to the down GEMM, so the down_proj
+        # weight gradient must be taken against the SAME quantized intermediate (true STE
+        # wgrad). The exact down input differs by routing order — quant(gated_output) when
+        # routing-after-down (else branch), quant(gated_output * expert_scores) when
+        # routing-before-down — so re-quantize per branch below. The upstream activation
+        # gradient (grad_gated_output) flows as identity (no quant). No-op when act-quant off.
+        act_quant_gs = getattr(ctx, "act_quant_group_size", 0)
         expert_scores_dtype = expert_scores.dtype
         expert_scores = expert_scores.to(gated_output.dtype)
         routing_weights_before_down = getattr(ctx, "routing_weights_before_down", False)
@@ -200,14 +232,19 @@ class TritonEPGroupGemm(torch.autograd.Function):
 
             if down_proj.requires_grad:
                 grad_down_proj = torch.empty_like(down_proj)
+                # Forward fed quant(gated_output * expert_scores) to the down GEMM, so the
+                # wgrad is taken against the quantized score-folded intermediate (STE wgrad).
+                gated_for_down_wgrad = _maybe_fake_quant_down_input(gated_for_down, act_quant_gs)
                 group_gemm_same_mn(
-                    a=gated_for_down,
+                    a=gated_for_down_wgrad,
                     b=grad_output,
                     c=grad_down_proj,
                     cumsum_K=cumsum,
                     max_K=max_M,
                     transpose_a=True,
                 )
+                if gated_for_down_wgrad is not gated_for_down:
+                    del gated_for_down_wgrad
             if gated_for_down is not gated_output:
                 del gated_for_down
 
@@ -220,10 +257,12 @@ class TritonEPGroupGemm(torch.autograd.Function):
             )
             del grad_gated_for_down
         else:
-            # Forward was: out = down_GEMM(gated_output) * expert_scores.
+            # Forward was: out = down_GEMM(quant(gated_output)) * expert_scores.
+            # Re-quantize the (un-scaled) intermediate the down GEMM consumed (STE wgrad).
+            gated_output_for_wgrad = _maybe_fake_quant_down_input(gated_output, act_quant_gs)
             # Skip the extra down-GEMM when expert_scores doesn't require a gradient.
             if ctx.has_expert_scores and ctx.needs_input_grad[5]:
-                down_output = group_gemm_same_nk(a=gated_output, b=down_proj, cumsum_M=cumsum, max_M=max_M)
+                down_output = group_gemm_same_nk(a=gated_output_for_wgrad, b=down_proj, cumsum_M=cumsum, max_M=max_M)
                 grad_expert_scores = (down_output * grad_output).sum(dim=-1).to(expert_scores_dtype)
                 del down_output
 
@@ -240,13 +279,15 @@ class TritonEPGroupGemm(torch.autograd.Function):
             if down_proj.requires_grad:
                 grad_down_proj = torch.empty_like(down_proj)
                 group_gemm_same_mn(
-                    a=gated_output,
+                    a=gated_output_for_wgrad,
                     b=grad_scaled,
                     c=grad_down_proj,
                     cumsum_K=cumsum,
                     max_K=max_M,
                     transpose_a=True,
                 )
+            if gated_output_for_wgrad is not gated_output:
+                del gated_output_for_wgrad
             del gated_output, grad_scaled
 
         # Activation backward
@@ -302,6 +343,7 @@ class TritonEPGroupGemm(torch.autograd.Function):
             None,  # hidden_act
             None,  # swiglu_limit
             None,  # gated
+            None,  # act_quant_group_size
         )
 
 

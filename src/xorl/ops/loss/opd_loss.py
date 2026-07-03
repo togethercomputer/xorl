@@ -15,6 +15,8 @@ from xorl.ops.loss.compiled_cross_entropy import (
 )
 from xorl.ops.loss.loss_output import LossOutput
 from xorl.ops.loss.opd_streaming_kl import (
+    streaming_forward_kl_function,
+    streaming_forward_kl_lowmem_function,
     streaming_full_vocab_diagnostics,
     streaming_reverse_kl_function,
     streaming_reverse_kl_lowmem_function,
@@ -407,12 +409,17 @@ def opd_loss_function(
     is_streaming_backend = backend in {"streaming", "tilelang"}
 
     # Full-vocab diagnostics: the compile backend has fused *_with_diag kernels;
-    # the streaming backend covers reverse_kl_full via a separate no-grad
+    # the streaming backend covers the full-vocab KL modes via a separate no-grad
     # streaming pass (same chunked-vocab shape, never materializes full logits).
-    streaming_diag_supported = is_streaming_backend and loss_mode == LOSS_MODE_REVERSE_KL_FULL
+    streaming_diag_supported = is_streaming_backend and loss_mode in (
+        LOSS_MODE_REVERSE_KL_FULL,
+        LOSS_MODE_FORWARD_KL_FULL,
+    )
     diag_enabled = bool(emit_full_vocab_diagnostics) and (is_compile_backend or streaming_diag_supported)
-    if loss_mode == LOSS_MODE_FORWARD_KL_FULL and not is_compile_backend:
-        raise ValueError("loss_mode='forward_kl_full' requires kl_backend='torch_compile'")
+    if loss_mode == LOSS_MODE_FORWARD_KL_FULL and not (is_compile_backend or is_streaming_backend):
+        raise ValueError(
+            "loss_mode='forward_kl_full' requires kl_backend in {'torch_compile', 'streaming', 'tilelang'}"
+        )
 
     teacher_entropy_per_tok = None
     student_entropy_per_tok = None
@@ -529,38 +536,102 @@ def opd_loss_function(
                 f"Unsupported OPD KL backend '{kl_backend}'. Expected 'torch_compile', 'streaming', or 'tilelang'."
             )
     elif loss_mode == LOSS_MODE_FORWARD_KL_FULL:
-        if not torch.is_tensor(teacher_lm_head_weight):
-            raise ValueError("forward_kl_full requires a materialized teacher LM head tensor")
-        if diag_enabled:
-            (
-                token_kl,
-                teacher_entropy_per_tok,
-                student_entropy_per_tok,
-                top1_agreement_per_tok,
-            ) = compiled_forward_kl_full_with_diag_function(
-                student_hidden_states=student_hidden_flat,
-                student_weight=weight,
-                teacher_hidden_states=teacher_hidden_flat,
-                teacher_weight=teacher_lm_head_weight,
-                labels=labels_valid,
-                ignore_index=ignore_index,
-                log_prob_min_clamp=log_prob_min_clamp,
-                num_chunks=num_chunks,
-                lm_head_fp32=lm_head_fp32,
-                teacher_lm_head_fp32=teacher_lm_head_fp32,
-            )
+        if is_compile_backend:
+            if not torch.is_tensor(teacher_lm_head_weight):
+                raise ValueError("forward_kl_full requires a materialized teacher LM head tensor")
+            if diag_enabled:
+                (
+                    token_kl,
+                    teacher_entropy_per_tok,
+                    student_entropy_per_tok,
+                    top1_agreement_per_tok,
+                ) = compiled_forward_kl_full_with_diag_function(
+                    student_hidden_states=student_hidden_flat,
+                    student_weight=weight,
+                    teacher_hidden_states=teacher_hidden_flat,
+                    teacher_weight=teacher_lm_head_weight,
+                    labels=labels_valid,
+                    ignore_index=ignore_index,
+                    log_prob_min_clamp=log_prob_min_clamp,
+                    num_chunks=num_chunks,
+                    lm_head_fp32=lm_head_fp32,
+                    teacher_lm_head_fp32=teacher_lm_head_fp32,
+                )
+            else:
+                token_kl = compiled_forward_kl_full_function(
+                    student_hidden_states=student_hidden_flat,
+                    student_weight=weight,
+                    teacher_hidden_states=teacher_hidden_flat,
+                    teacher_weight=teacher_lm_head_weight,
+                    labels=labels_valid,
+                    ignore_index=ignore_index,
+                    log_prob_min_clamp=log_prob_min_clamp,
+                    num_chunks=num_chunks,
+                    lm_head_fp32=lm_head_fp32,
+                    teacher_lm_head_fp32=teacher_lm_head_fp32,
+                )
+        elif is_streaming_backend:
+            # Streaming forward-KL: never materializes the full-vocab fp32 logits
+            # (~9.27 GiB at 151936 vocab), unblocking the large-microbatch OOM that
+            # forces forward_kl_full onto the compile backend. The streaming kernel
+            # accumulates the teacher-weighted log-ratio online over vocab chunks;
+            # it has no student-log-prob materialization, so `log_prob_min_clamp`
+            # (a clamp on log p_S) is unsupported here -- fail loud rather than
+            # silently ignore it.
+            if log_prob_min_clamp is not None:
+                raise ValueError(
+                    "log_prob_min_clamp is not supported by the streaming forward_kl_full backend "
+                    "(it never materializes student log-probs); use kl_backend='torch_compile' to clamp."
+                )
+            if streaming_lowmem:
+                if lm_head_fp32:
+                    student_hidden_flat = student_hidden_flat.float()
+                if teacher_lm_head_fp32:
+                    teacher_hidden_flat = teacher_hidden_flat.float()
+                compute_dtype = torch.float32 if (lm_head_fp32 or teacher_lm_head_fp32) else weight.dtype
+                token_kl = streaming_forward_kl_lowmem_function(
+                    student_hidden_states=student_hidden_flat,
+                    student_weight=weight,
+                    teacher_hidden_states=teacher_hidden_flat,
+                    teacher_weight=teacher_lm_head_weight,
+                    labels=labels_valid,
+                    ignore_index=ignore_index,
+                    vocab_chunk_size=vocab_chunk_size,
+                    compute_dtype=compute_dtype,
+                    inplace_weight_grad=False,
+                )
+            else:
+                if lm_head_fp32:
+                    student_hidden_flat = student_hidden_flat.float()
+                    weight = weight.float()
+                if teacher_lm_head_fp32:
+                    teacher_hidden_flat = teacher_hidden_flat.float()
+                    if torch.is_tensor(teacher_lm_head_weight):
+                        teacher_lm_head_weight = teacher_lm_head_weight.float()
+                token_kl = streaming_forward_kl_function(
+                    student_hidden_states=student_hidden_flat,
+                    student_weight=weight,
+                    teacher_hidden_states=teacher_hidden_flat,
+                    teacher_weight=teacher_lm_head_weight,
+                    labels=labels_valid,
+                    ignore_index=ignore_index,
+                    vocab_chunk_size=vocab_chunk_size,
+                )
+            if diag_enabled:
+                (
+                    teacher_entropy_per_tok,
+                    student_entropy_per_tok,
+                    top1_agreement_per_tok,
+                ) = streaming_full_vocab_diagnostics(
+                    student_hidden_states=student_hidden_flat.detach(),
+                    student_weight=weight.detach(),
+                    teacher_hidden_states=teacher_hidden_flat,
+                    teacher_weight=teacher_lm_head_weight,
+                    vocab_chunk_size=vocab_chunk_size,
+                )
         else:
-            token_kl = compiled_forward_kl_full_function(
-                student_hidden_states=student_hidden_flat,
-                student_weight=weight,
-                teacher_hidden_states=teacher_hidden_flat,
-                teacher_weight=teacher_lm_head_weight,
-                labels=labels_valid,
-                ignore_index=ignore_index,
-                log_prob_min_clamp=log_prob_min_clamp,
-                num_chunks=num_chunks,
-                lm_head_fp32=lm_head_fp32,
-                teacher_lm_head_fp32=teacher_lm_head_fp32,
+            raise ValueError(
+                f"Unsupported OPD KL backend '{kl_backend}'. Expected 'torch_compile', 'streaming', or 'tilelang'."
             )
     elif is_estimator_loss_mode(loss_mode):
         if not torch.is_tensor(teacher_lm_head_weight):
@@ -679,11 +750,7 @@ def opd_loss_function(
     # single-layer hidden term below (the `else` branch) so the same coefficient
     # isn't applied twice. Layer tensors arrive [valid_tokens, L, d] already
     # restricted to the valid positions in valid_mask order.
-    use_oprd = (
-        hidden_match_coef
-        and teacher_layer_hidden_states is not None
-        and student_layer_hidden_states is not None
-    )
+    use_oprd = hidden_match_coef and teacher_layer_hidden_states is not None and student_layer_hidden_states is not None
     if use_oprd:
         student_layers = student_layer_hidden_states.float()
         teacher_layers = teacher_layer_hidden_states.float().detach()
@@ -721,9 +788,7 @@ def opd_loss_function(
             # self-distillation (shared LM head) the logits match too. Cosine alone
             # matches only direction (ignores magnitude) and decouples from generation
             # (eval accuracy collapses while cosine-distance keeps falling).
-            hidden_distance = (
-                (student_hidden_flat.float() - teacher_hidden_flat.float()) ** 2
-            ).mean(dim=-1)
+            hidden_distance = ((student_hidden_flat.float() - teacher_hidden_flat.float()) ** 2).mean(dim=-1)
         else:
             hidden_distance = 1.0 - F.cosine_similarity(
                 student_hidden_flat.float(),
@@ -745,13 +810,9 @@ def opd_loss_function(
         pos_weight_sum = pos_weights.sum()
         neg_weight_sum = neg_weights.sum()
         if pos_weight_sum.item() > 0:
-            hidden_match_pos_raw_metric = (
-                (hidden_distance.detach() * pos_weights).sum() / pos_weight_sum
-            ).item()
+            hidden_match_pos_raw_metric = ((hidden_distance.detach() * pos_weights).sum() / pos_weight_sum).item()
         if neg_weight_sum.item() > 0:
-            hidden_match_neg_raw_metric = (
-                (hidden_distance.detach() * neg_weights).sum() / neg_weight_sum
-            ).item()
+            hidden_match_neg_raw_metric = ((hidden_distance.detach() * neg_weights).sum() / neg_weight_sum).item()
         hidden_match_neg_minus_pos_raw = hidden_match_neg_raw_metric - hidden_match_pos_raw_metric
         hidden_match_pos_weight_mean = pos_weights.mean().item()
         hidden_match_neg_weight_mean = neg_weights.mean().item()

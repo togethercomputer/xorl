@@ -342,8 +342,11 @@ class TeacherCacheCPUBackend(DummyBackend):
             "total_loss": 0.0,
             "global_valid_tokens": 5,
             "teacher_hidden_cache": {
-                "path": "/tmp/teacher_hidden.safetensors",
+                "backend": "mooncake",
+                "key": "opd/test/teacher/0/hidden",
                 "tensor_key": "hidden_states",
+                "tensor_shapes": {"hidden_states": [5, 6]},
+                "tensor_dtypes": {"hidden_states": "bfloat16"},
                 "num_tokens": 5,
                 "hidden_size": 6,
                 "cache_indices_by_sample": [[0, 1, 2], [3, 4]],
@@ -372,7 +375,7 @@ def test_teacher_hidden_cache_metadata_passes_through_request_processor():
                 {"input_ids": [4, 5], "target_tokens": [4, 5]},
             ],
             loss_fn="teacher_hidden_cache",
-            loss_fn_params={"teacher_hidden_cache_path": "/tmp/teacher_hidden.safetensors"},
+            loss_fn_params={"teacher_hidden_cache_dtype": "bfloat16"},
             model_id="teacher",
         ),
     )

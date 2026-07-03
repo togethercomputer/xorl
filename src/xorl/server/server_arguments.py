@@ -197,6 +197,17 @@ class ServerArguments:
             )
         },
     )
+    defer_grad_sync_in_accumulation: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "HSDP only. During one server forward_backward request, defer the cross-replicate "
+                "FSDP all-reduce until the last packed micro-batch. Reduce-scatter still runs for "
+                "each micro-batch, so gradients remain sharded. No-op unless "
+                "data_parallel_replicate_size>1 and the request contains multiple micro-batches."
+            )
+        },
+    )
 
     tensor_parallel_size: int = field(default=1, metadata={"help": "Tensor parallelism size"})
 
@@ -765,6 +776,16 @@ class ServerArguments:
         default=True, metadata={"help": "Enable sample packing to combine multiple samples into one sequence"}
     )
 
+    pad_to_multiple_of: int = field(
+        default=128,
+        metadata={
+            "help": (
+                "Pad server-packed sequences to a multiple of this value. Increase this to bucket "
+                "ragged packed-row shapes for compiled or shape-sensitive attention paths."
+            )
+        },
+    )
+
     sample_packing_strategy: str = field(
         default="sequential",
         metadata={
@@ -936,6 +957,8 @@ class ServerArguments:
                 f"sample_packing_on_oversized must be one of {ON_OVERSIZED_MODES}, "
                 f"got {self.sample_packing_on_oversized!r}"
             )
+        if self.pad_to_multiple_of < 1:
+            raise ValueError(f"pad_to_multiple_of must be >= 1, got {self.pad_to_multiple_of}")
 
         normalized_fp8_config = normalize_fp8_training_config(vars(self), context="server.train")
         self.enable_fp8_training = bool(normalized_fp8_config.get("enable_fp8_training", self.enable_fp8_training))
@@ -1149,6 +1172,8 @@ class ServerArguments:
                 "pipeline_parallel_size": self.pipeline_parallel_size,
                 "pipeline_parallel_schedule": self.pipeline_parallel_schedule,
                 "pp_variable_seq_lengths": self.pp_variable_seq_lengths,
+                "defer_grad_sync_in_accumulation": self.defer_grad_sync_in_accumulation,
+                "pad_to_multiple_of": self.pad_to_multiple_of,
                 "log_level": self.log_level,
                 "sync_inference_method": self.sync_inference_method,
                 "receiver_kv_cache_dtype": self.receiver_kv_cache_dtype,

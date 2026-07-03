@@ -341,6 +341,10 @@ def _normalize_checkpoint_key_for_filter(key: str) -> Optional[str]:
     """Normalize raw checkpoint keys for lightweight load-time filtering."""
     if key.startswith("vision_tower.") or key.startswith("mm_projector."):
         return None
+    if key.startswith("model.language_model.model."):
+        return "model." + key.removeprefix("model.language_model.model.")
+    if key.startswith("model.language_model.lm_head."):
+        return "lm_head." + key.removeprefix("model.language_model.lm_head.")
     if key.startswith("model.language_model."):
         return "model." + key.removeprefix("model.language_model.")
     if key.startswith("language_model."):
@@ -358,6 +362,9 @@ def _matches_checkpoint_skip_key_pattern(key: str, model: object) -> bool:
 
 _FUSED_EXPERT_CHECKPOINT_PATTERN = re.compile(r"^model\.layers\.\d+\.mlp\.experts\.(gate_up|down)_proj(?:\..+)?$")
 _FFN_EXPERT_CHECKPOINT_PATTERN = re.compile(r"^(?:model\.)?layers\.\d+\.ffn\.experts\.\d+\.w[123]\.(?:weight|scale)$")
+_MINIMAX_M3_EXPERT_CHECKPOINT_PATTERN = re.compile(
+    r"^model\.layers\.\d+\.block_sparse_moe\.experts\.\d+\.w[123]\.weight$"
+)
 
 
 def _is_checkpoint_expert_key(key: str) -> bool:
@@ -370,6 +377,7 @@ def _is_checkpoint_expert_key(key: str) -> bool:
         or FUSED_EXPERT_PATTERN.match(normalized) is not None
         or _FUSED_EXPERT_CHECKPOINT_PATTERN.match(normalized) is not None
         or _FFN_EXPERT_CHECKPOINT_PATTERN.match(normalized) is not None
+        or _MINIMAX_M3_EXPERT_CHECKPOINT_PATTERN.match(normalized) is not None
     )
 
 

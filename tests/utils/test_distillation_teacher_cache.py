@@ -4,14 +4,23 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from tests._helpers.opd import save_tensor_file
+from tests._helpers.opd import FakeMooncakeClient, save_tensor_file
 from xorl.distillation import (
+    MooncakeHiddenStore,
     TeacherActivationCache,
     TeacherHeadManager,
     TeacherHeadStore,
     load_lm_head_weight,
     prepare_lm_head_teacher_store,
 )
+
+
+def _mooncake_cache(hidden, teacher_id="3", *, enable_async=False):
+    """Build a TeacherActivationCache backed by an in-memory Mooncake store."""
+    store = MooncakeHiddenStore(client=FakeMooncakeClient(), get_retry_max_wait_s=0.0)
+    meta = store.put_hidden(f"opd/test/teacher/{teacher_id}/hidden", hidden)
+    cache = TeacherActivationCache({teacher_id: meta}, mooncake_store=store, enable_async=enable_async)
+    return cache
 
 
 def test_load_lm_head_weight_from_safetensors_file(tmp_path):
@@ -120,12 +129,9 @@ def test_teacher_head_manager_prefetches_teacher_store(tmp_path):
     torch.testing.assert_close(loaded, weight)
 
 
-def test_teacher_activation_cache_gathers_indices(tmp_path):
+def test_teacher_activation_cache_gathers_indices():
     hidden = torch.randn(6, 4)
-    path = tmp_path / "hidden_states.safetensors"
-    save_tensor_file(path, "hidden_states", hidden)
-
-    cache = TeacherActivationCache({"3": str(path)})
+    cache = _mooncake_cache(hidden)
     indices = torch.tensor([[0, 2, 5], [1, 4, 3]])
 
     gathered = cache.get(3, indices, device="cpu")
@@ -133,12 +139,9 @@ def test_teacher_activation_cache_gathers_indices(tmp_path):
     torch.testing.assert_close(gathered, hidden[indices])
 
 
-def test_teacher_activation_cache_gathers_rank3_token_axis(tmp_path):
+def test_teacher_activation_cache_gathers_rank3_token_axis():
     hidden = torch.arange(2 * 6 * 4, dtype=torch.float32).reshape(2, 6, 4)
-    path = tmp_path / "hidden_layers.safetensors"
-    save_tensor_file(path, "hidden_states", hidden)
-
-    cache = TeacherActivationCache({"3": str(path)})
+    cache = _mooncake_cache(hidden)
     indices = torch.tensor([[0, 2], [5, 1]])
 
     gathered = cache.get(3, indices, device="cpu")
@@ -147,37 +150,28 @@ def test_teacher_activation_cache_gathers_rank3_token_axis(tmp_path):
     torch.testing.assert_close(gathered, expected)
 
 
-def test_teacher_activation_cache_prefetches(tmp_path):
+def test_teacher_activation_cache_prefetches():
     hidden = torch.randn(6, 4)
-    path = tmp_path / "hidden_states.safetensors"
-    save_tensor_file(path, "hidden_states", hidden)
-
-    cache = TeacherActivationCache({"3": str(path)})
+    cache = _mooncake_cache(hidden, enable_async=True)
     cache.prefetch(3)
     gathered = cache.get(3, torch.tensor([0, 5]), device="cpu")
 
     torch.testing.assert_close(gathered, hidden[[0, 5]])
 
 
-def test_teacher_activation_cache_rejects_negative_indices(tmp_path):
+def test_teacher_activation_cache_rejects_negative_indices():
     """Negative indices used to be silently clamped to 0, masking producer bugs."""
     hidden = torch.randn(6, 4)
-    path = tmp_path / "hidden_states.safetensors"
-    save_tensor_file(path, "hidden_states", hidden)
-
-    cache = TeacherActivationCache({"3": str(path)})
+    cache = _mooncake_cache(hidden)
     bad_indices = torch.tensor([[0, 2, -1], [1, 4, 3]])
 
     with pytest.raises(IndexError, match="negative"):
         cache.get(3, bad_indices, device="cpu")
 
 
-def test_teacher_activation_cache_rejects_out_of_range_indices(tmp_path):
+def test_teacher_activation_cache_rejects_out_of_range_indices():
     hidden = torch.randn(6, 4)
-    path = tmp_path / "hidden_states.safetensors"
-    save_tensor_file(path, "hidden_states", hidden)
-
-    cache = TeacherActivationCache({"3": str(path)})
+    cache = _mooncake_cache(hidden)
     bad_indices = torch.tensor([0, 2, 6])
 
     with pytest.raises(IndexError, match="cache only has 6 rows"):

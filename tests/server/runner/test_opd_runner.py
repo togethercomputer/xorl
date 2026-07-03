@@ -4,10 +4,10 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from safetensors.torch import load_file
 
 from tests._helpers.opd import make_teacher_files
 from xorl.data.constants import IGNORE_INDEX
+from xorl.distillation import MooncakeHiddenStore, TeacherActivationCache
 from xorl.ops.loss.opd_loss import OPDLossMetrics
 from xorl.server.runner.model_runner import ModelRunner
 
@@ -27,6 +27,10 @@ def _make_opd_runner() -> ModelRunner:
     runner._opd_head_config = None
     runner._opd_hidden_cache = None
     runner._opd_hidden_config = None
+    runner._opd_layer_cache = None
+    runner._opd_layer_config = None
+    runner._teacher_hidden_cache_store = None
+    runner._teacher_hidden_cache_store_config = None
     return runner
 
 
@@ -230,8 +234,12 @@ def test_opd_runner_masks_cache_indices_per_teacher(_mock_get_device_type, tmp_p
         "1": torch.randn(12, hidden_size) / hidden_size**0.5,
     }
     teacher_files = make_teacher_files(tmp_path, teacher_heads, teacher_caches)
+    store = MooncakeHiddenStore(client=_FakeMooncakeClient(), get_retry_max_wait_s=0.0)
+    hidden_caches = {tid: store.put_hidden(f"opd/test/teacher/{tid}/hidden", t) for tid, t in teacher_caches.items()}
 
     runner = _make_opd_runner()
+    runner._opd_hidden_cache = TeacherActivationCache(hidden_caches, mooncake_store=store, enable_async=False)
+    runner._opd_hidden_config = repr(hidden_caches)
     hidden_states = (torch.randn(1, seq_len, hidden_size) / hidden_size**0.5).requires_grad_(True)
     student_weight = (torch.randn(vocab_size, hidden_size) / hidden_size**0.5).requires_grad_(True)
     micro_batch = {
@@ -242,7 +250,7 @@ def test_opd_runner_masks_cache_indices_per_teacher(_mock_get_device_type, tmp_p
     }
     params = {
         "teacher_heads": teacher_files.heads,
-        "teacher_hidden_caches": teacher_files.hidden_caches,
+        "teacher_hidden_caches": hidden_caches,
         "num_chunks": 2,
         "opd_kl_backend": "streaming",
         "opd_vocab_chunk_size": 5,
@@ -278,8 +286,12 @@ def test_opd_runner_runs_lm_head_anchor_for_fsdp(_mock_get_device_type, tmp_path
     teacher_heads = {"0": torch.randn(vocab_size, teacher_hidden_size) / teacher_hidden_size**0.5}
     teacher_caches = {"0": torch.randn(seq_len, teacher_hidden_size) / teacher_hidden_size**0.5}
     teacher_files = make_teacher_files(tmp_path, teacher_heads, teacher_caches)
+    store = MooncakeHiddenStore(client=_FakeMooncakeClient(), get_retry_max_wait_s=0.0)
+    hidden_caches = {tid: store.put_hidden(f"opd/test/teacher/{tid}/hidden", t) for tid, t in teacher_caches.items()}
 
     runner = _make_opd_runner()
+    runner._opd_hidden_cache = TeacherActivationCache(hidden_caches, mooncake_store=store, enable_async=False)
+    runner._opd_hidden_config = repr(hidden_caches)
     hidden_states = (torch.randn(1, seq_len, hidden_size) / hidden_size**0.5).requires_grad_(True)
     lm_head = _RecordingLmHead(hidden_size, vocab_size)
     micro_batch = {
@@ -289,7 +301,7 @@ def test_opd_runner_runs_lm_head_anchor_for_fsdp(_mock_get_device_type, tmp_path
     }
     params = {
         "teacher_heads": teacher_files.heads,
-        "teacher_hidden_caches": teacher_files.hidden_caches,
+        "teacher_hidden_caches": hidden_caches,
         "opd_kl_backend": "streaming",
         "opd_vocab_chunk_size": 4,
     }
@@ -399,7 +411,7 @@ def test_teacher_hidden_cache_merge_preserves_logical_slice_order():
 @patch("xorl.server.runner.model_runner.get_device_type", return_value="cpu")
 @patch("xorl.server.runner.model_runner.gather_outputs")
 @patch("xorl.server.runner.model_runner.get_parallel_state")
-def test_teacher_hidden_cache_gathers_with_unified_sp_group(mock_parallel_state, mock_gather, _mock_device, tmp_path):
+def test_teacher_hidden_cache_gathers_with_unified_sp_group(mock_parallel_state, mock_gather, _mock_device):
     runner = _make_opd_runner()
     runner.rank = 0
     runner.world_size = 1
@@ -421,6 +433,8 @@ def test_teacher_hidden_cache_gathers_with_unified_sp_group(mock_parallel_state,
     gathered = torch.arange(1 * 8 * 2, dtype=torch.float32).reshape(1, 8, 2)
     mock_gather.return_value = gathered
 
+    store = MooncakeHiddenStore(client=_FakeMooncakeClient(), get_retry_max_wait_s=0.0)
+    runner._get_teacher_hidden_cache_store = lambda params: store
     result = runner._forward_teacher_hidden_cache(
         [
             {
@@ -428,12 +442,13 @@ def test_teacher_hidden_cache_gathers_with_unified_sp_group(mock_parallel_state,
                 "_original_position_ids": torch.arange(8, dtype=torch.long).view(1, 8),
             }
         ],
-        {"teacher_hidden_cache_path": str(tmp_path / "teacher.safetensors")},
+        {},
     )
 
     mock_gather.assert_called_once()
     assert mock_gather.call_args.kwargs["group"] == "full-sp-group"
     assert mock_gather.call_args.kwargs["unpad_dim_size"] == 8
+    assert result["teacher_hidden_cache"]["backend"] == "mooncake"
     assert result["teacher_hidden_cache"]["cache_indices_by_sample"] == [list(range(8))]
 
 
@@ -457,7 +472,8 @@ def test_teacher_hidden_cache_trims_with_gathered_sp_labels(mock_parallel_state,
     def fake_gather_outputs(tensor, **_kwargs):
         return full_hidden if torch.is_floating_point(tensor) else full_labels
 
-    cache_path = tmp_path / "teacher_hidden.safetensors"
+    store = MooncakeHiddenStore(client=_FakeMooncakeClient(), get_retry_max_wait_s=0.0)
+    runner._get_teacher_hidden_cache_store = lambda params: store
     with patch("xorl.server.runner.model_runner.gather_outputs", side_effect=fake_gather_outputs):
         result = runner._forward_teacher_hidden_cache(
             [
@@ -467,13 +483,10 @@ def test_teacher_hidden_cache_trims_with_gathered_sp_labels(mock_parallel_state,
                     "_original_position_ids": torch.arange(6, dtype=torch.long).unsqueeze(0),
                 }
             ],
-            {
-                "teacher_hidden_cache_path": str(cache_path),
-                "teacher_hidden_cache_dtype": "float32",
-            },
+            {"teacher_hidden_cache_dtype": "float32"},
         )
 
-    saved = load_file(str(cache_path))["hidden_states"]
+    saved = store.get_hidden_from_metadata(result["teacher_hidden_cache"])
     # This branch filters cache rows to valid-label positions only (one row per
     # labeled token), rather than trimming to the last-valid prefix.
     assert torch.equal(saved, full_hidden[0, 4:5])
@@ -498,7 +511,8 @@ def test_teacher_hidden_cache_writer_gathers_all_batch_ranks(
         assert dst == 0
         object_gather_list[:] = [payload, {"rank": 1, "slice_key": 1, "chunks": [remote_chunk]}]
 
-    cache_path = tmp_path / "teacher_hidden.safetensors"
+    store = MooncakeHiddenStore(client=_FakeMooncakeClient(), get_retry_max_wait_s=0.0)
+    runner._get_teacher_hidden_cache_store = lambda params: store
     with (
         patch("xorl.server.runner.model_runner.dist.is_available", return_value=True),
         patch("xorl.server.runner.model_runner.dist.is_initialized", return_value=True),
@@ -513,13 +527,97 @@ def test_teacher_hidden_cache_writer_gathers_all_batch_ranks(
                     "labels": torch.tensor([[1, 2, -100]]),
                 }
             ],
-            {
-                "teacher_hidden_cache_path": str(cache_path),
-                "teacher_hidden_cache_dtype": "float32",
-            },
+            {"teacher_hidden_cache_dtype": "float32"},
         )
 
-    saved = load_file(str(cache_path))["hidden_states"]
+    saved = store.get_hidden_from_metadata(result["teacher_hidden_cache"])
     assert torch.equal(saved, torch.tensor([[1.0], [2.0], [10.0], [11.0], [12.0]]))
     assert result["teacher_hidden_cache"]["num_tokens"] == 5
     assert result["teacher_hidden_cache"]["cache_indices_by_sample"] == [[0, 1], [2, 3, 4]]
+
+
+class _FakeMooncakeClient:
+    """In-memory stand-in for the Mooncake distributed store."""
+
+    def __init__(self):
+        self.objects = {}
+
+    def put(self, key, value):
+        self.objects[key] = bytes(value)
+        return 0
+
+    def get(self, key):
+        return self.objects.get(key, b"")
+
+    def is_exist(self, key):
+        return 1 if key in self.objects else 0
+
+    def remove(self, key):
+        self.objects.pop(key, None)
+        return 0
+
+
+@patch("xorl.server.runner.model_runner.get_device_type", return_value="cpu")
+@patch("xorl.server.runner.model_runner.get_parallel_state")
+def test_teacher_hidden_cache_mooncake_backend_writes_to_store(mock_parallel_state, _mock_device):
+    runner = _make_opd_runner()
+    runner.model = _InputIdHiddenModel()
+    mock_parallel_state.return_value = Mock(cp_enabled=False, ep_enabled=False, dp_rank=0)
+
+    store = MooncakeHiddenStore(client=_FakeMooncakeClient(), get_retry_max_wait_s=0.0)
+    # The forward path fetches the store via _get_teacher_hidden_cache_store;
+    # shadow it with the injected fake so no live Mooncake master is needed.
+    runner._get_teacher_hidden_cache_store = lambda params: store
+
+    result = runner._forward_teacher_hidden_cache(
+        [
+            {
+                "input_ids": torch.tensor([[1, 2, 3]]),
+                "labels": torch.tensor([[1, 2, -100]]),
+            }
+        ],
+        {"teacher_hidden_cache_dtype": "float32"},
+    )
+
+    meta = result["teacher_hidden_cache"]
+    # No safetensors path is required and none is produced.
+    assert "path" not in meta
+    assert meta["backend"] == "mooncake"
+    assert meta["key"]
+    assert meta["tensor_key"] == "hidden_states"
+    assert meta["tensor_shapes"] == {"hidden_states": [2, 1]}
+    assert meta["tensor_dtypes"] == {"hidden_states": "float32"}
+    assert meta["num_tokens"] == 2
+    assert meta["cache_indices_by_sample"] == [[0, 1]]
+    assert result["teacher_prefill_tokens"] == 2
+    assert "teacher_hidden_cache_write_s" in result
+
+    # The stored bytes round-trip to the real valid-label hidden rows.
+    fetched = store.get_hidden_from_metadata(meta)
+    assert torch.equal(fetched, torch.tensor([[1.0], [2.0]]))
+
+
+@patch("xorl.server.runner.model_runner.get_device_type", return_value="cpu")
+@patch("xorl.server.runner.model_runner.get_parallel_state")
+def test_teacher_hidden_cache_mooncake_roundtrips_through_activation_cache(mock_parallel_state, _mock_device):
+    """Producer metadata -> TeacherActivationCache.get returns the right rows."""
+    runner = _make_opd_runner()
+    runner.model = _InputIdHiddenModel()
+    mock_parallel_state.return_value = Mock(cp_enabled=False, ep_enabled=False, dp_rank=0)
+
+    store = MooncakeHiddenStore(client=_FakeMooncakeClient(), get_retry_max_wait_s=0.0)
+    runner._get_teacher_hidden_cache_store = lambda params: store
+
+    result = runner._forward_teacher_hidden_cache(
+        [{"input_ids": torch.tensor([[4, 5, 6, 7]]), "labels": torch.tensor([[4, 5, 6, 7]])}],
+        {"teacher_hidden_cache_dtype": "float32"},
+    )
+    meta = result["teacher_hidden_cache"]
+
+    # Consumer indexes the cache by teacher_cache_indices via the Mooncake backend.
+    tac = TeacherActivationCache({"0": meta}, mooncake_store=store, enable_async=False)
+    try:
+        out = tac.get("0", torch.tensor([[0, 2, 3]]), device="cpu", dtype=torch.float32)
+        assert torch.equal(out[0], torch.tensor([[4.0], [6.0], [7.0]]))
+    finally:
+        tac.close()
