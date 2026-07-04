@@ -780,6 +780,16 @@ small apparent `Ckv=3,Cq=1` edge, but the alternating A/B was not stable: defaul
 `results/mkv3-p4b-after-headtarget-attn-nano-ckv3-ab.log`). No attention env default
 change was promoted.
 
+Post-headtarget DKV first-pair batching recheck: a macro-gated branch
+`MK_ATTN_DKV_X2_SD=1` batched the first two independent DKV wgmma groups
+(`S=QK^T` and `dP=dO V^T`) into one `wga_mma64_x2` call. This was correctness-clean
+(`mkv3-p4b-attn-dkv-x2-testattention.log`) but a profile A/B on GPU 3 was negative:
+control nano/small totals 1145.0us / 4325.4us, variant 1169.1us / 4510.8us
+(`mkv3-p4b-attn-dkv-x2-control-prof.log`,
+`mkv3-p4b-attn-dkv-x2-variant-prof.log`). DKV span itself was flat/noisy (nano
+115.9us -> 114.5us, small 551.9us -> 556.9us), while other spans worsened. Do not
+merge the branch; this is another instance of the register-lifetime law.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
