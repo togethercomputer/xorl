@@ -213,7 +213,7 @@ class MKQwen3:
         for l in range(c.L):
             pr = lambda n: B(self.params[f"{n}.{l}"])  # noqa: E731
             a = lambda n: B(A[f"{n}.{l}"])  # noqa: E731
-            p.instr(mk.OP_RMSNORM_FWD, mk.rowop_tiles(c.S), [X[l], pr("w1"), a("xn1"), a("rstd1"), c.H, eps, c.S])
+            p.instr(mk.OP_RMSNORM_FWD, mk.rowop_tiles(c.S, mk.ROWOP_R2), [X[l], pr("w1"), a("xn1"), a("rstd1"), c.H, eps, c.S])
             p.wave()
             if c.D == 64 and mk.wgmma_ok(c.S, QD, c.H, 2):
                 # qk-norm + rope fused into the qkv gemm epilogue (one head per tile)
@@ -292,7 +292,7 @@ class MKQwen3:
                 p.wave()
             gemm(a("oatt"), pr("wo"), a("x2"), c.S, c.H, c.nq * c.D, 2 | 16, X[l])
             p.wave()
-            p.instr(mk.OP_RMSNORM_FWD, mk.rowop_tiles(c.S), [a("x2"), pr("w2"), a("xn2"), a("rstd2"), c.H, eps, c.S])
+            p.instr(mk.OP_RMSNORM_FWD, mk.rowop_tiles(c.S, mk.ROWOP_R2), [a("x2"), pr("w2"), a("xn2"), a("rstd2"), c.H, eps, c.S])
             p.wave()
             # Paired-column swiglu fusion (gate/up in one tile, two k-loops) was TRIED
             # AND REMOVED: halving the gu tiles doubles per-tile serial span (nano +88us,
@@ -306,7 +306,7 @@ class MKQwen3:
             p.wave()
 
         # ---- head + loss ----
-        p.instr(mk.OP_RMSNORM_FWD, mk.rowop_tiles(c.S), [X[c.L], B(self.params["wf"]), B(A["xnf"]), B(A["rstdf"]), c.H, eps, c.S])
+        p.instr(mk.OP_RMSNORM_FWD, mk.rowop_tiles(c.S, mk.ROWOP_R2), [X[c.L], B(self.params["wf"]), B(A["xnf"]), B(A["rstdf"]), c.H, eps, c.S])
         p.wave()
         # bit11 (lse partials in the lm_head epilogue): A/B measured NEUTRAL within
         # noise (on: 1865/9275, off: 1861/9317). Kept ON — cheapens the CE hop ~5x
@@ -366,7 +366,7 @@ class MKQwen3:
         # final-norm bwd reads the split-K fp32 workspace directly (dy_f32; no CVT hop)
         p.instr(
             mk.OP_RMSNORM_BWD,
-            mk.rowop_tiles(c.S),
+            mk.rowop_tiles(c.S, mk.ROWOP_R2),
             [X[c.L], B(self.params["wf"]), B(W["dXN_f32"]), B(W["dX"]), B(self.grads["wf"]), B(A["rstdf"]), c.H, 1, c.S],
         )
         p.wave()
@@ -384,7 +384,7 @@ class MKQwen3:
             dxn, dxn_f32 = gemm_dx(B(W["dGU"]), pr("wgu"), B(W["dXN"]), lambda: B(W[f"dXN2_f32.{l}"]), c.S, c.H, 2 * c.I)
             gemm(B(W["dGU"]), a("xn2"), gr("wgu"), 2 * c.I, c.H, c.S, 1 | 4 | 8)
             p.wave()
-            p.instr(mk.OP_RMSNORM_BWD, mk.rowop_tiles(c.S), [a("x2"), pr("w2"), dxn, B(W["dX"]), gr("w2"), a("rstd2"), c.H, dxn_f32, c.S])
+            p.instr(mk.OP_RMSNORM_BWD, mk.rowop_tiles(c.S, mk.ROWOP_R2), [a("x2"), pr("w2"), dxn, B(W["dX"]), gr("w2"), a("rstd2"), c.H, dxn_f32, c.S])
             p.wave()
             # o proj: dOatt = dX @ Wo with the Drow reduction fused into the epilogue
             # (flags bit10; replaces OP_ATTN_DPRE — one chain hop less per layer);
@@ -469,7 +469,7 @@ class MKQwen3:
             dxn1, dxn1_f32 = gemm_dx(B(W["dQKVraw"]), pr("wqkv"), B(W["dXN"]), lambda: B(W[f"dXN1_f32.{l}"]), c.S, c.H, QD)
             gemm(B(W["dQKVraw"]), a("xn1"), gr("wqkv"), QD, c.H, c.S, 1 | 4 | 8)
             p.wave()
-            p.instr(mk.OP_RMSNORM_BWD, mk.rowop_tiles(c.S), [X[l], pr("w1"), dxn1, B(W["dX"]), gr("w1"), a("rstd1"), c.H, dxn1_f32, c.S])
+            p.instr(mk.OP_RMSNORM_BWD, mk.rowop_tiles(c.S, mk.ROWOP_R2), [X[l], pr("w1"), dxn1, B(W["dX"]), gr("w1"), a("rstd1"), c.H, dxn1_f32, c.S])
             p.wave()
 
         p.instr(mk.OP_EMBED_BWD, c.S, [B(self.tokens), B(W["dX"]), B(self.grads["emb"]), c.H])

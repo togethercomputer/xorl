@@ -194,20 +194,24 @@ def _access_sets(op, args):
 
 REGION_ROWS = 128  # producer progress granularity for df2 region watermarks
 
-ROWOP_R = 8  # rows per batched-rowop tile (one warp per row; mirrors ops.cuh MK_ROW_R)
+ROWOP_R = 8    # swiglu/qknorm rows per tile (ops.cuh MK_ROW_R)
+ROWOP_R2 = 16  # rmsnorm rows per tile, 2 rows/warp interleaved (ops.cuh MK_ROW_R2)
+# measured split (v3 P4b): interleave pays only where per-row MLP is starved
+# (rmsnorm's H<=512 rows = 2 load iterations); swiglu's 6-iteration rows are
+# already saturated and qknorm's per-warp task chain doubles serially (+142us).
 
 # batched row ops: tile = ROWOP_R rows (all other row-tiled ops remain 1 row/tile)
 _ROW_TILE_R = {
-    OP_RMSNORM_FWD: ROWOP_R,
-    OP_RMSNORM_BWD: ROWOP_R,
+    OP_RMSNORM_FWD: ROWOP_R2,
+    OP_RMSNORM_BWD: ROWOP_R2,
     OP_SWIGLU_FWD: ROWOP_R,
     OP_SWIGLU_BWD: ROWOP_R,
     OP_QKNORM_ROPE_BWD: ROWOP_R,
 }
 
 
-def rowop_tiles(S):
-    return (S + ROWOP_R - 1) // ROWOP_R
+def rowop_tiles(S, R=ROWOP_R):
+    return (S + R - 1) // R
 
 # write positions whose output is row-linear in the instr's m-major tile order
 # (tile t covers rows [t*rows_per_tile, ...) — the requirement for region gating)
