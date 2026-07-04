@@ -861,6 +861,14 @@ small apparent `Ckv=3,Cq=1` edge, but the alternating A/B was not stable: defaul
 `results/mkv3-p4b-after-headtarget-attn-nano-ckv3-ab.log`). No attention env default
 change was promoted.
 
+Long-S attention chunk recheck after the fixed flash-baseline correction: an env-only
+S=4096 sweep initially suggested `Ckv=2,Cq=1` might beat the default (4368.5us vs
+4409.9us; `mkv3-p4b-longS-attn-chunk-sweep-s4096.log`), but alternating A/B refuted
+it. S=4096 default won all three repeats (4373.2/4325.7/4345.2us vs
+4417.8/4413.0/4416.3us for `Ckv=2,Cq=1`), and S=8192 also kept `Ckv=1,Cq=1`
+(10408.1us vs 10509.7us for Ckv=2 and 10726.3us for Ckv=4;
+`mkv3-p4b-longS-attn-chunk-ab.log`). Keep routed attention chunk defaults unchanged.
+
 Post-headtarget DKV first-pair batching recheck: a macro-gated branch
 `MK_ATTN_DKV_X2_SD=1` batched the first two independent DKV wgmma groups
 (`S=QK^T` and `dP=dO V^T`) into one `wga_mma64_x2` call. This was correctness-clean
