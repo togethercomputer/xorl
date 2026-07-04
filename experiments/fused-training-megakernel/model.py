@@ -181,13 +181,22 @@ class MKQwen3:
         # one sink instruction per norm but lets dX consumers run before dw finishes.
         split_rms_bwd = bool(int(os.environ.get("MK_RMS_BWD_SPLIT_DW", "1")))
 
+        rms_dx_r4_env = os.environ.get("MK_RMS_DX_R4")
+        if rms_dx_r4_env is None:
+            # A/B: S2048 wins repeatably; S1024/S3072/S4096 are neutral and H512 regresses.
+            rms_dx_r4 = c.H == 256 and c.S == 2048
+        else:
+            rms_dx_r4 = bool(int(rms_dx_r4_env))
+
         def rmsnorm_bwd(args):
-            ntiles = mk.rowop_tiles(args[-1], mk.ROWOP_R2)
             if split_rms_bwd:
-                p.instr(mk.OP_RMSNORM_BWD_DX, ntiles, args)
-                p.instr(mk.OP_RMSNORM_BWD_DW, ntiles, args)
+                if rms_dx_r4:
+                    p.instr(mk.OP_RMSNORM_BWD_DX_R4, mk.rowop_tiles(args[-1], mk.ROWOP_R4), args)
+                else:
+                    p.instr(mk.OP_RMSNORM_BWD_DX, mk.rowop_tiles(args[-1], mk.ROWOP_R2), args)
+                p.instr(mk.OP_RMSNORM_BWD_DW, mk.rowop_tiles(args[-1], mk.ROWOP_R2), args)
             else:
-                p.instr(mk.OP_RMSNORM_BWD, ntiles, args)
+                p.instr(mk.OP_RMSNORM_BWD, mk.rowop_tiles(args[-1], mk.ROWOP_R2), args)
 
         def gemm_dx(a, b, out_bf, out_f32, M, N, K):
             """On-path NN dX gemm; parallelism-starved shapes (< 32 MN tiles) route via

@@ -41,6 +41,7 @@ OP_ATTN_DKV_WG = 22  # args as OP_ATTN_DKV + trailing q-chunk count C
 OP_ATTN_DQ_WG = 23  # args as OP_ATTN_DQ (incl. kv-chunk count C)
 OP_RMSNORM_BWD_DX = 24  # dx-only half of env-gated split RMSNorm backward
 OP_RMSNORM_BWD_DW = 25  # dw-only cold sink half of env-gated split RMSNorm backward
+OP_RMSNORM_BWD_DX_R4 = 26  # dx-only four-row fold for H256 long-S shapes
 
 GEMM_BM, GEMM_BN = 64, 128  # keep in sync with ops.cuh
 FILL_CHUNK = 16384  # elements per fill/cvt work item (MK_CHUNK in ops.cuh)
@@ -197,7 +198,7 @@ def _access_sets(op, args):
         return [0, 1], [2, 3]
     if op == OP_RMSNORM_BWD:
         return [0, 1, 2, 5], [3, 4]
-    if op == OP_RMSNORM_BWD_DX:
+    if op in (OP_RMSNORM_BWD_DX, OP_RMSNORM_BWD_DX_R4):
         return [0, 1, 2, 5], [3]
     if op == OP_RMSNORM_BWD_DW:
         return [0, 2, 5], [4]
@@ -239,6 +240,7 @@ REGION_ROWS = 128  # producer progress granularity for df2 region watermarks
 
 ROWOP_R = 8    # swiglu/qknorm rows per tile (ops.cuh MK_ROW_R)
 ROWOP_R2 = 16  # rmsnorm rows per tile, 2 rows/warp interleaved (ops.cuh MK_ROW_R2)
+ROWOP_R4 = 32  # dx-only RMSNorm long-S fold, 4 rows/warp interleaved
 # measured split (v3 P4b): interleave pays only where per-row MLP is starved
 # (rmsnorm's H<=512 rows = 2 load iterations); swiglu's 6-iteration rows are
 # already saturated and qknorm's per-warp task chain doubles serially (+142us).
@@ -249,6 +251,7 @@ _ROW_TILE_R = {
     OP_RMSNORM_BWD: ROWOP_R2,
     OP_RMSNORM_BWD_DX: ROWOP_R2,
     OP_RMSNORM_BWD_DW: ROWOP_R2,
+    OP_RMSNORM_BWD_DX_R4: ROWOP_R4,
     OP_SWIGLU_FWD: ROWOP_R,
     OP_SWIGLU_BWD: ROWOP_R,
     OP_QKNORM_ROPE_BWD: ROWOP_R,
@@ -264,6 +267,7 @@ _ROW_WRITE_POS = {
     OP_RMSNORM_FWD: (2, 3),
     OP_RMSNORM_BWD: (3,),  # dx only; dw is a cross-row atomic scatter
     OP_RMSNORM_BWD_DX: (3,),
+    OP_RMSNORM_BWD_DX_R4: (3,),
     OP_SWIGLU_FWD: (1,),
     OP_SWIGLU_BWD: (2,),
     OP_QKNORM_ROPE_FWD: (1, 4, 5),
@@ -279,6 +283,7 @@ _ROW_READ_POS = {
     OP_RMSNORM_BWD: (0, 2, 5),
     OP_RMSNORM_BWD_DX: (0, 2, 5),
     OP_RMSNORM_BWD_DW: (0, 2, 5),
+    OP_RMSNORM_BWD_DX_R4: (0, 2, 5),
     OP_SWIGLU_FWD: (0,),
     OP_SWIGLU_BWD: (0, 1),
     OP_QKNORM_ROPE_FWD: (0,),
@@ -547,7 +552,8 @@ class Program:
         # MK_ROWOP_CLAIM re-runs the experiment.
         rc = int(os.environ.get("MK_ROWOP_CLAIM", "1"))
         _rowops = (OP_RMSNORM_FWD, OP_RMSNORM_BWD, OP_RMSNORM_BWD_DX, OP_RMSNORM_BWD_DW,
-                   OP_SWIGLU_FWD, OP_SWIGLU_BWD, OP_QKNORM_ROPE_FWD, OP_QKNORM_ROPE_BWD)
+                   OP_RMSNORM_BWD_DX_R4, OP_SWIGLU_FWD, OP_SWIGLU_BWD,
+                   OP_QKNORM_ROPE_FWD, OP_QKNORM_ROPE_BWD)
         claim = [max(c, rc) if op in _rowops else c
                  for c, (op, ntiles, _) in zip(claim, flat)]
         self.n_instr = n

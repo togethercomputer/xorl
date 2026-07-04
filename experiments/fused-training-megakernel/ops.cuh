@@ -1052,6 +1052,159 @@ __device__ void op_rmsnorm_bwd(const Instr& I, int tile, void** bufs, char* smem
   }
 }
 
+// Four-row dx-only fold for long H256 shapes: fewer row tiles without touching the
+// cold dw sink. The normal two-row op remains the default for wider H shapes.
+__device__ void op_rmsnorm_bwd_dx_r4(const Instr& I, int tile, void** bufs, char* smem_raw) {
+  const int H = I.args[6], S = I.args[8];
+  const bool dy_f32 = I.args[7] != 0;
+  const int warp = mk_tid() >> 5, lane = mk_tid() & 31;
+  const int row0 = tile * 32 + warp;
+  if (row0 >= S) return;  // barrier-free op: early exit is safe
+  const bool has1 = row0 + 8 < S;
+  const bool has2 = row0 + 16 < S;
+  const bool has3 = row0 + 24 < S;
+  const int row1 = row0 + 8;
+  const int row2 = row0 + 16;
+  const int row3 = row0 + 24;
+  const bf16* xb = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
+  const bf16* x0 = xb + (int64_t)row0 * H;
+  const bf16* x1 = xb + (int64_t)(has1 ? row1 : row0) * H;
+  const bf16* x2 = xb + (int64_t)(has2 ? row2 : row0) * H;
+  const bf16* x3 = xb + (int64_t)(has3 ? row3 : row0) * H;
+  const bf16* w = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
+  const bf16* dyb0 = reinterpret_cast<const bf16*>(bufs[I.args[2]]) + (int64_t)row0 * H;
+  const bf16* dyb1 = reinterpret_cast<const bf16*>(bufs[I.args[2]]) + (int64_t)(has1 ? row1 : row0) * H;
+  const bf16* dyb2 = reinterpret_cast<const bf16*>(bufs[I.args[2]]) + (int64_t)(has2 ? row2 : row0) * H;
+  const bf16* dyb3 = reinterpret_cast<const bf16*>(bufs[I.args[2]]) + (int64_t)(has3 ? row3 : row0) * H;
+  const float* dyf0 = reinterpret_cast<const float*>(bufs[I.args[2]]) + (int64_t)row0 * H;
+  const float* dyf1 = reinterpret_cast<const float*>(bufs[I.args[2]]) + (int64_t)(has1 ? row1 : row0) * H;
+  const float* dyf2 = reinterpret_cast<const float*>(bufs[I.args[2]]) + (int64_t)(has2 ? row2 : row0) * H;
+  const float* dyf3 = reinterpret_cast<const float*>(bufs[I.args[2]]) + (int64_t)(has3 ? row3 : row0) * H;
+  bf16* dxb = reinterpret_cast<bf16*>(bufs[I.args[3]]);
+  bf16* dx0 = dxb + (int64_t)row0 * H;
+  bf16* dx1 = dxb + (int64_t)(has1 ? row1 : row0) * H;
+  bf16* dx2 = dxb + (int64_t)(has2 ? row2 : row0) * H;
+  bf16* dx3 = dxb + (int64_t)(has3 ? row3 : row0) * H;
+  const float* rstd = reinterpret_cast<const float*>(bufs[I.args[5]]);
+  const float r0 = rstd[row0];
+  const float r1 = has1 ? rstd[row1] : 0.0f;
+  const float r2 = has2 ? rstd[row2] : 0.0f;
+  const float r3 = has3 ? rstd[row3] : 0.0f;
+  if ((H & 7) == 0) {
+    float dot0 = 0.0f, dot1 = 0.0f, dot2 = 0.0f, dot3 = 0.0f;
+    for (int i = lane * 8; i < H; i += 32 * 8) {
+      float x[8], d[8], wv[8];
+      ld8bf(w + i, wv);
+      ld8bf(x0 + i, x);
+      ld8dy(dyb0, dyf0, dy_f32, i, d);
+#pragma unroll
+      for (int j = 0; j < 8; j++) dot0 += d[j] * wv[j] * x[j];
+      if (has1) {
+        ld8bf(x1 + i, x);
+        ld8dy(dyb1, dyf1, dy_f32, i, d);
+#pragma unroll
+        for (int j = 0; j < 8; j++) dot1 += d[j] * wv[j] * x[j];
+      }
+      if (has2) {
+        ld8bf(x2 + i, x);
+        ld8dy(dyb2, dyf2, dy_f32, i, d);
+#pragma unroll
+        for (int j = 0; j < 8; j++) dot2 += d[j] * wv[j] * x[j];
+      }
+      if (has3) {
+        ld8bf(x3 + i, x);
+        ld8dy(dyb3, dyf3, dy_f32, i, d);
+#pragma unroll
+        for (int j = 0; j < 8; j++) dot3 += d[j] * wv[j] * x[j];
+      }
+    }
+    const float m0 = warp_sum(dot0) * r0 / H;
+    const float m1 = warp_sum(dot1) * r1 / H;
+    const float m2 = warp_sum(dot2) * r2 / H;
+    const float m3 = warp_sum(dot3) * r3 / H;
+    for (int i = lane * 8; i < H; i += 32 * 8) {
+      float x[8], d[8], wv[8], dxv[8];
+      ld8bf(w + i, wv);
+      ld8bf(x0 + i, x);
+      ld8dy(dyb0, dyf0, dy_f32, i, d);
+      ld8bf(dx0 + i, dxv);
+#pragma unroll
+      for (int j = 0; j < 8; j++) {
+        const float xh = x[j] * r0;
+        dxv[j] += r0 * (d[j] * wv[j] - xh * m0);
+      }
+      st8bf(dx0 + i, dxv);
+      if (has1) {
+        ld8bf(x1 + i, x);
+        ld8dy(dyb1, dyf1, dy_f32, i, d);
+        ld8bf(dx1 + i, dxv);
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+          const float xh = x[j] * r1;
+          dxv[j] += r1 * (d[j] * wv[j] - xh * m1);
+        }
+        st8bf(dx1 + i, dxv);
+      }
+      if (has2) {
+        ld8bf(x2 + i, x);
+        ld8dy(dyb2, dyf2, dy_f32, i, d);
+        ld8bf(dx2 + i, dxv);
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+          const float xh = x[j] * r2;
+          dxv[j] += r2 * (d[j] * wv[j] - xh * m2);
+        }
+        st8bf(dx2 + i, dxv);
+      }
+      if (has3) {
+        ld8bf(x3 + i, x);
+        ld8dy(dyb3, dyf3, dy_f32, i, d);
+        ld8bf(dx3 + i, dxv);
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+          const float xh = x[j] * r3;
+          dxv[j] += r3 * (d[j] * wv[j] - xh * m3);
+        }
+        st8bf(dx3 + i, dxv);
+      }
+    }
+  } else {
+    auto dy0 = [&](int i) { return dy_f32 ? dyf0[i] : bf2f(dyb0[i]); };
+    auto dy1 = [&](int i) { return dy_f32 ? dyf1[i] : bf2f(dyb1[i]); };
+    auto dy2 = [&](int i) { return dy_f32 ? dyf2[i] : bf2f(dyb2[i]); };
+    auto dy3 = [&](int i) { return dy_f32 ? dyf3[i] : bf2f(dyb3[i]); };
+    float dot0 = 0.0f, dot1 = 0.0f, dot2 = 0.0f, dot3 = 0.0f;
+    for (int i = lane; i < H; i += 32) {
+      const float wi = bf2f(w[i]);
+      dot0 += dy0(i) * wi * bf2f(x0[i]);
+      if (has1) dot1 += dy1(i) * wi * bf2f(x1[i]);
+      if (has2) dot2 += dy2(i) * wi * bf2f(x2[i]);
+      if (has3) dot3 += dy3(i) * wi * bf2f(x3[i]);
+    }
+    const float m0 = warp_sum(dot0) * r0 / H;
+    const float m1 = warp_sum(dot1) * r1 / H;
+    const float m2 = warp_sum(dot2) * r2 / H;
+    const float m3 = warp_sum(dot3) * r3 / H;
+    for (int i = lane; i < H; i += 32) {
+      const float wi = bf2f(w[i]);
+      const float xh0 = bf2f(x0[i]) * r0;
+      dx0[i] = f2bf(bf2f(dx0[i]) + r0 * (dy0(i) * wi - xh0 * m0));
+      if (has1) {
+        const float xh1 = bf2f(x1[i]) * r1;
+        dx1[i] = f2bf(bf2f(dx1[i]) + r1 * (dy1(i) * wi - xh1 * m1));
+      }
+      if (has2) {
+        const float xh2 = bf2f(x2[i]) * r2;
+        dx2[i] = f2bf(bf2f(dx2[i]) + r2 * (dy2(i) * wi - xh2 * m2));
+      }
+      if (has3) {
+        const float xh3 = bf2f(x3[i]) * r3;
+        dx3[i] = f2bf(bf2f(dx3[i]) + r3 * (dy3(i) * wi - xh3 * m3));
+      }
+    }
+  }
+}
+
 // Split variant: dx-only half. This keeps the residual-gradient chain from waiting on
 // the weight-gradient atomic drain; the dw-only half is emitted as a cold sink.
 __device__ void op_rmsnorm_bwd_dx(const Instr& I, int tile, void** bufs, char* smem_raw) {
