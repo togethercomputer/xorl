@@ -358,12 +358,16 @@ extern "C" __global__ void MK_LB megakernel_df(const Instr* __restrict__ instrs,
       const int d = atomicAdd(&done[ins], t1 - t0) + (t1 - t0);
       if (d == s_I.ntiles) {  // last tile: enable dependents
         if (iclk) iclk[2 * ins + 1] = mk_globaltimer();
+        int hint = -1;  // completion hint (v3 P4b, the ws lesson): the finisher
+        // adopts a hot dependent it just enabled as its own sticky claim — the
+        // chain's next hop skips ring rediscovery on a warm block.
         for (int e = adj_off[ins]; e < adj_off[ins + 1]; ++e) {
           const int dep = adj[e];
           if (atomicSub(&pending[dep], 1) == 1) {
             if (crit[dep]) {
               const int t = atomicAdd(&ctrl[0], 1);
               atomicExch(&ready_hot[t], dep);
+              if (hint < 0) hint = dep;
             } else {
               const int t = atomicAdd(&ctrl[3], 1);
               atomicExch(&ready_cold[t], dep);
@@ -371,6 +375,11 @@ extern "C" __global__ void MK_LB megakernel_df(const Instr* __restrict__ instrs,
           }
         }
         atomicAdd(&ctrl[1], 1);
+        if (hint >= 0) {
+          if (last_cold) atomicSub(&ctrl[5], 1);  // leaving a cold sticky: free the slot
+          last_ins = hint;
+          last_cold = 0;
+        }
       }
     }
     __syncthreads();
