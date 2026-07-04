@@ -90,8 +90,15 @@ def wgmma_n128_ok(M, N, K, flags):
     mode = int(os.environ.get("MK_WGMMA_N128", "1"))
     if mode == 0:
         return False
-    if not (flags & 2) or (flags & (1 | 4 | 8 | 32 | 256 | 1024)):
+    if flags & (1 | 4 | 8 | 32 | 256 | 1024):
         return False
+    if not (flags & 2):  # NN (dX): MN-major 128-wide B; tile-gated like the m64n64
+        # NN route (halved tile count needs co-scheduling headroom). MK_WGMMA_N128_NN
+        # gates it separately; threshold in n128 tiles.
+        if not int(os.environ.get("MK_WGMMA_N128_NN", "1")):
+            return False
+        if gemm_tiles_wgmma_n128(M, N) < int(os.environ.get("MK_WGMMA_N128_NN_MIN", "32")):
+            return False
     if mode == 2 and not (flags & 2048):
         return False
     return M % 128 == 0 and N % 128 == 0 and K % 64 == 0

@@ -367,6 +367,20 @@ __device__ __forceinline__ uint64_t wg_desc_ksw(const void* slab, int s) {
   d.bitfield.layout_type_ = 1;  // B128
   return d.desc_;
 }
+// MN-major SW128 descriptor for a 128-wide operand (n128 NN tiles): two 64-mn
+// slabs stacked 8KB apart; canonical B128 MN layout ((T,8,n),(8,k)) uses LBO as
+// the 64-mn group stride. k16-atom s = 16 k-rows = 2KB step within each slab.
+__device__ __forceinline__ uint64_t wg_desc_mnsw128(const void* slab, int s) {
+  const uint32_t addr = (uint32_t)__cvta_generic_to_shared(slab) + s * 2048;
+  cute::GmmaDescriptor d;
+  d.desc_ = 0;
+  d.bitfield.start_address_ = (addr >> 4);
+  d.bitfield.leading_byte_offset_ = (8192 >> 4);  // 64-mn group (slab) stride
+  d.bitfield.stride_byte_offset_ = (1024 >> 4);   // 8-k-row group stride
+  d.bitfield.layout_type_ = 1;  // B128
+  return d.desc_;
+}
+
 // MN-major SW128 descriptor: k16-atom s = 16 k-rows = 2KB step; SBO = 8-row group.
 __device__ __forceinline__ uint64_t wg_desc_mnsw(const void* slab, int s) {
   const uint32_t addr = (uint32_t)__cvta_generic_to_shared(slab) + s * 2048;
@@ -435,6 +449,7 @@ __device__ __noinline__ void op_gemm_wgmma_n128(const Instr& I, int tile, void**
   const int wg = tid / 128;
   const int wtid = tid % 128;
 
+  const bool b_t = flags & 2;  // NT: B[N,K] K-contig; NN: B[K,N] N-contig (MN slabs)
   auto issue_stage = [&](int k0, int st) {
 #pragma unroll
     for (int i = 0; i < 4; ++i) {  // A: 128r x 64k
@@ -445,11 +460,18 @@ __device__ __noinline__ void op_gemm_wgmma_n128(const Instr& I, int tile, void**
           &A[(int64_t)(m0 + r) * K + k0 + k8], 16);
     }
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {  // B: 128r x 64k
+    for (int i = 0; i < 4; ++i) {  // B: 128 x 64
       const int v = tid + i * 256;
-      const int r = v / 8, k8 = (v % 8) * 8;
-      __pipeline_memcpy_async(reinterpret_cast<char*>(S.B[st]) + wg_koff_sw(r, k8),
-                              &B[(int64_t)(n0 + r) * K + k0 + k8], 16);
+      if (b_t) {
+        const int r = v / 8, k8 = (v % 8) * 8;
+        __pipeline_memcpy_async(reinterpret_cast<char*>(S.B[st]) + wg_koff_sw(r, k8),
+                                &B[(int64_t)(n0 + r) * K + k0 + k8], 16);
+      } else {  // [K,N] N-contig: two 64-mn MN-major slabs, 8KB apart
+        const int k = v / 16, n8 = (v % 16) * 8;
+        __pipeline_memcpy_async(reinterpret_cast<char*>(S.B[st]) + (n8 / 64) * 8192 +
+                                    wg_mnoff_sw(k, n8 % 64),
+                                &B[(int64_t)(k0 + k) * N + n0 + n8], 16);
+      }
     }
     __pipeline_commit();
   };
@@ -467,9 +489,12 @@ __device__ __noinline__ void op_gemm_wgmma_n128(const Instr& I, int tile, void**
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
       da[s] = wg_desc_ksw(S.A[t & 1][wg], s);
-      db[s] = wg_desc_ksw(S.B[t & 1], s);
+      db[s] = b_t ? wg_desc_ksw(S.B[t & 1], s) : wg_desc_mnsw128(S.B[t & 1], s);
     }
-    wg_mma_ktile_n128<SG::MMA_64x128x16_F32BF16BF16_SS<SG::Major::K, SG::Major::K>>(da, db, d);
+    if (b_t)
+      wg_mma_ktile_n128<SG::MMA_64x128x16_F32BF16BF16_SS<SG::Major::K, SG::Major::K>>(da, db, d);
+    else
+      wg_mma_ktile_n128<SG::MMA_64x128x16_F32BF16BF16_SS<SG::Major::K, SG::Major::MN>>(da, db, d);
     consumer_sync();
   }
 
