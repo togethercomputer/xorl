@@ -36,6 +36,9 @@ OP_ATTN_DQ = 17
 OP_CVT_F32BF16 = 18
 OP_ATTN_FWD_SPLIT = 19
 OP_ATTN_COMBINE = 20
+OP_ATTN_FWD_WG = 21  # wgmma attention (D=64, S%128==0): 128-row tiles, qt-outer
+OP_ATTN_DKV_WG = 22  # args as OP_ATTN_DKV + trailing q-chunk count C
+OP_ATTN_DQ_WG = 23  # args as OP_ATTN_DQ (incl. kv-chunk count C)
 
 GEMM_BM, GEMM_BN = 64, 128  # keep in sync with ops.cuh
 FILL_CHUNK = 16384  # elements per fill/cvt work item (MK_CHUNK in ops.cuh)
@@ -149,11 +152,11 @@ def _access_sets(op, args):
         return r, [2, 3]
     if op == OP_CE_BWD:
         return [1, 2, 3], [0]
-    if op == OP_ATTN_FWD:
+    if op in (OP_ATTN_FWD, OP_ATTN_FWD_WG):
         return [0], [1, 2]
     if op == OP_ATTN_DPRE:
         return [0, 1], [2]
-    if op in (OP_ATTN_DKV, OP_ATTN_DQ):
+    if op in (OP_ATTN_DKV, OP_ATTN_DQ, OP_ATTN_DKV_WG, OP_ATTN_DQ_WG):
         return [0, 1, 2, 3], [4]
     if op == OP_CVT_F32BF16:
         return [0], [1]
@@ -218,6 +221,11 @@ def _producer_row_info(op, ntiles, args, root, root_of):
         if root_of(args[1]) == root and S % REGION_ROWS == 0:
             return S, nq * (REGION_ROWS // 32)
         return None
+    if op == OP_ATTN_FWD_WG:  # same qt-outer order, 128-row tiles: band = nq
+        S, nq = args[3], args[4]
+        if root_of(args[1]) == root and S % REGION_ROWS == 0:
+            return S, nq * (REGION_ROWS // 128)
+        return None
     for pos in _ROW_WRITE_POS.get(op, ()):
         if root_of(args[pos]) == root:
             return (ntiles, REGION_ROWS) if ntiles % REGION_ROWS == 0 else None
@@ -238,6 +246,12 @@ def _consumer_gate_k(op, ntiles, args, pos, prod_rows):
         S, nq = args[3], args[4]
         if S == prod_rows and S % REGION_ROWS == 0:
             return nq * (REGION_ROWS // 32)
+        return None
+    if op == OP_ATTN_FWD_WG and pos == 0:
+        # qt-outer + causal, 128-row tiles: tile t needs qkvr rows < (t/nq + 1)*128
+        S, nq = args[3], args[4]
+        if S == prod_rows and S % REGION_ROWS == 0:
+            return nq * (REGION_ROWS // 128)
         return None
     if pos in _ROW_READ_POS.get(op, ()) and ntiles == prod_rows:
         return REGION_ROWS

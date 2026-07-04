@@ -47,6 +47,9 @@ enum Op : int {
   OP_CVT_F32BF16 = 18,
   OP_ATTN_FWD_SPLIT = 19,
   OP_ATTN_COMBINE = 20,
+  OP_ATTN_FWD_WG = 21,
+  OP_ATTN_DKV_WG = 22,
+  OP_ATTN_DQ_WG = 23,
 };
 
 __device__ __forceinline__ long long mk_globaltimer() {
@@ -57,6 +60,7 @@ __device__ __forceinline__ long long mk_globaltimer() {
 
 #include "ops.cuh"
 #include "attention.cuh"
+#include "wgmma_attention.cuh"
 
 // ---- interpreter --------------------------------------------------------------------
 __device__ __forceinline__ void dispatch(const Instr& I, int tile, void** bufs,
@@ -126,6 +130,15 @@ __device__ __forceinline__ void dispatch(const Instr& I, int tile, void** bufs,
       break;
     case OP_ATTN_COMBINE:
       op_attn_combine(I, tile, bufs);
+      break;
+    case OP_ATTN_FWD_WG:
+      op_attn_fwd_wg(I, tile, bufs, smem);
+      break;
+    case OP_ATTN_DKV_WG:
+      op_attn_dkv_wg(I, tile, bufs, smem);
+      break;
+    case OP_ATTN_DQ_WG:
+      op_attn_dq_wg(I, tile, bufs, smem);
       break;
     default:
       break;

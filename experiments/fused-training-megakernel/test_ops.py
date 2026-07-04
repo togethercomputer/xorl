@@ -301,6 +301,50 @@ def test_attention():
     o.permute(1, 0, 2).reshape(S, nq * D).backward(dO.float())
     check("bwd dqkv", dqkv, qkvr.grad, atol=0.08)
 
+    # wgmma (Hopper) attention ops: the D=64, S%128==0 model-shape fast path
+    Sw, nqw, nkvw = 512, 4, 2
+    stw = (nqw + 2 * nkvw) * 64
+    scw = mk.f2i(64**-0.5)
+    qkvw = (torch.randn(Sw, stw, device=DEV) * 0.5).to(torch.bfloat16)
+    Ow = torch.empty(Sw, nqw * 64, device=DEV, dtype=torch.bfloat16)
+    LSEw = torch.empty(nqw, Sw, device=DEV, dtype=torch.float32)
+    run1(
+        lambda p: p.instr(
+            mk.OP_ATTN_FWD_WG, nqw * (Sw // 128), [p.buf(qkvw), p.buf(Ow), p.buf(LSEw), Sw, nqw, nkvw, 64, scw]
+        )
+    )
+    check("fwd O (wgmma)", Ow, _attn_ref(qkvw, nqw, nkvw, 64, Sw), atol=0.06)
+
+    dOw = (torch.randn(Sw, nqw * 64, device=DEV) * 0.5).to(torch.bfloat16)
+    Droww = torch.empty(nqw, Sw, device=DEV, dtype=torch.float32)
+    dqkvw = torch.zeros_like(qkvw)
+    wsw = torch.zeros(Sw, stw, device=DEV, dtype=torch.float32)
+    Gw, Ckvw, Cqw = nqw // nkvw, 2, 4
+    run1(lambda p: p.instr(mk.OP_ATTN_DPRE, Sw, [p.buf(dOw), p.buf(Ow), p.buf(Droww), Sw, nqw, 64]))
+    run1(
+        lambda p: p.instr(
+            mk.OP_ATTN_DKV_WG,
+            nkvw * (Sw // 128) * Gw * Ckvw,
+            [p.buf(qkvw), p.buf(dOw), p.buf(LSEw), p.buf(Droww), p.buf(wsw), Sw, nqw, nkvw, 64, scw, Ckvw],
+        )
+    )
+    run1(
+        lambda p: p.instr(
+            mk.OP_ATTN_DQ_WG,
+            nqw * (Sw // 128) * Cqw,
+            [p.buf(qkvw), p.buf(dOw), p.buf(LSEw), p.buf(Droww), p.buf(wsw), Sw, nqw, nkvw, 64, scw, Cqw],
+        )
+    )
+    run1(lambda p: p.instr(mk.OP_CVT_F32BF16, (Sw * stw + 4095) // 4096, [p.buf(wsw), p.buf(dqkvw), Sw * stw]))
+    qkvwr = qkvw.float().detach().requires_grad_(True)
+    xw = qkvwr.view(Sw, nqw + 2 * nkvw, 64)
+    qw = xw[:, :nqw].permute(1, 0, 2)
+    kw = xw[:, nqw : nqw + nkvw].permute(1, 0, 2).repeat_interleave(nqw // nkvw, dim=0)
+    vw = xw[:, nqw + nkvw :].permute(1, 0, 2).repeat_interleave(nqw // nkvw, dim=0)
+    ow = torch.nn.functional.scaled_dot_product_attention(qw, kw, vw, is_causal=True)
+    ow.permute(1, 0, 2).reshape(Sw, nqw * 64).backward(dOw.float())
+    check("bwd dqkv (wgmma)", dqkvw, qkvwr.grad, atol=0.08)
+
     # D=128 variant (real Qwen3 head_dim)
     S2, nq2, nkv2, D2 = 96, 2, 1, 128
     stride2 = (nq2 + 2 * nkv2) * D2

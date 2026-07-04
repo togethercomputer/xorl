@@ -134,6 +134,10 @@ class MKQwen3:
         QD = (c.nq + 2 * c.nkv) * c.D
         scale = mk.f2i(c.D**-0.5)
         eps = mk.f2i(c.eps)
+        # wgmma attention ops (v3 P5): fwd 3.3x/5.6x, dkv 2.1x/3.3x, dq 2.2x/4.9x vs
+        # the WMMA ops at nano/small (results/mkv3-p5-attnprobe.md). D=128 or ragged S
+        # falls back to the WMMA path.
+        wg_attn = c.D == 64 and c.S % 128 == 0
         p = mk.Program()
         B = p.buf
 
@@ -230,7 +234,14 @@ class MKQwen3:
                     ],
                 )
                 p.wave()
-            if self.attn_C > 1:
+            if wg_attn:
+                p.instr(
+                    mk.OP_ATTN_FWD_WG,
+                    c.nq * (c.S // 128),
+                    [a("qkvr"), a("oatt"), a("lse"), c.S, c.nq, c.nkv, c.D, scale],
+                )
+                p.wave()
+            elif self.attn_C > 1:
                 Ca = self.attn_C
                 p.instr(
                     mk.OP_ATTN_FWD_SPLIT,
@@ -355,40 +366,42 @@ class MKQwen3:
             # (pre-zeroed), then one convert drains it to bf16. Alias slots keep the
             # disjoint q/kv writes parallel in the dependency analysis.
             G = c.nq // c.nkv
-            Cq = 4 if n_qt >= 8 else 2
-            p.instr(
-                mk.OP_ATTN_DKV,
-                c.nkv * n_qt * G,
-                [
-                    a("qkvr"),
-                    B(W["dOatt"]),
-                    a("lse"),
-                    B(W[f"drow.{l}"]),
-                    p.buf(W[f"dQKV_f32.{l}"], slot="kv"),
-                    c.S,
-                    c.nq,
-                    c.nkv,
-                    c.D,
-                    scale,
-                ],
-            )
-            p.instr(
-                mk.OP_ATTN_DQ,
-                c.nq * n_qt * Cq,
-                [
-                    a("qkvr"),
-                    B(W["dOatt"]),
-                    a("lse"),
-                    B(W[f"drow.{l}"]),
-                    p.buf(W[f"dQKV_f32.{l}"], slot="q"),
-                    c.S,
-                    c.nq,
-                    c.nkv,
-                    c.D,
-                    scale,
-                    Cq,
-                ],
-            )
+            dkv_args = lambda: [  # noqa: E731
+                a("qkvr"),
+                B(W["dOatt"]),
+                a("lse"),
+                B(W[f"drow.{l}"]),
+                p.buf(W[f"dQKV_f32.{l}"], slot="kv"),
+                c.S,
+                c.nq,
+                c.nkv,
+                c.D,
+                scale,
+            ]
+            dq_args = lambda: [  # noqa: E731
+                a("qkvr"),
+                B(W["dOatt"]),
+                a("lse"),
+                B(W[f"drow.{l}"]),
+                p.buf(W[f"dQKV_f32.{l}"], slot="q"),
+                c.S,
+                c.nq,
+                c.nkv,
+                c.D,
+                scale,
+            ]
+            if wg_attn:
+                # measured chunk picks (P5 probe): dKV C=2 both configs; dQ C=4 at
+                # S=512 (n_qt<=16), C=2 at S=1024 (fixed cost x C beats latency there)
+                n_qt128 = c.S // 128
+                Ckv = 2
+                Cq = 4 if n_qt <= 16 else 2
+                p.instr(mk.OP_ATTN_DKV_WG, c.nkv * n_qt128 * G * Ckv, dkv_args() + [Ckv])
+                p.instr(mk.OP_ATTN_DQ_WG, c.nq * n_qt128 * Cq, dq_args() + [Cq])
+            else:
+                Cq = 4 if n_qt >= 8 else 2
+                p.instr(mk.OP_ATTN_DKV, c.nkv * n_qt * G, dkv_args())
+                p.instr(mk.OP_ATTN_DQ, c.nq * n_qt * Cq, dq_args() + [Cq])
             p.wave()
             # qk-norm+rope bwd reads the attention-bwd fp32 atomic workspace DIRECTLY
             # (dy_f32) — the former per-layer CVT chain hop is gone (v3 P1).

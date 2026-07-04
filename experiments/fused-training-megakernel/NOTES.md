@@ -370,6 +370,44 @@ part of the win), or shrink the WMMA/attention op register footprints under 224 
 consumers stop paying the ceiling — the natural companion of the Phase-5 attention
 rewrite. Full log: results/mkv3-p4a.md.
 
+## v3 Phase 5: FA-class wgmma attention — the big lever lands
+
+`wgmma_attention.cuh` (OP_ATTN_{FWD,DKV,DQ}_WG, routed when D==64 and S%128==0; WMMA
+ops remain the fallback and the D=128 ragged-S test config exercises it): block tile =
+(head, 128 q-rows), two consumer warpgroups on 64-row halves, 2-stage K/V streaming,
+REGISTER online softmax on the wgmma accumulator layout (2 shfl_xor per row), P via
+bf16 smem, second accumulator bank for O += P@V; bwd keeps the validated two-pass
+structure (dqkv_f32 atomics, P from LSE, Drow input) with chunked streaming (DKV C=2;
+DQ C=4 at S=512, C=2 at S=1024 — C=1 is latency-bound at nano, C=4 tail-bound at
+small, same lesson as the claim quantum).
+
+Standalone: fwd 3.34x/5.63x, dkv 2.1x/3.3x, dq 2.2x/4.9x vs the WMMA ops (nano/small
+shapes); parity vs SDPA/autograd everywhere; REG 109-168, zero spill, dkv 96KB smem
+(the new smem-max op; 4KB headroom).
+
+**Scoreboard: nano 1853 -> 1775 (df); small 9028 -> 7118 (df) / 7024 (ws) — mode=ws
+beats df for the first time**, confirming Phase 4a's prediction that ops ≤224 regs let
+the scheduler-offload protocol win surface. df remains default (nano still prefers it).
+Attention on-path at small: ~5.9ms -> ~1.6ms; attention is NO LONGER the #1 lever —
+small DQ is now co-scheduling-bound (76us in-model vs 31 standalone), and the top
+remaining items are the NN/TN bwd gemm latency, the dispatch-spill tax (below), and
+per-hop costs.
+
+KEY LAYOUT DISCOVERY: a single no-swizzle 64x64 smem arrangement
+off64(r,c) = ((r>>3)<<10)+((c>>3)<<7)+((r&7)<<4)+((c&7)<<1) is readable under BOTH
+wgmma majors — K-view LBO=128B/SBO=1024B (k-tile step +256B) and MN-view
+LBO=1024B/SBO=128B (k-tile +2048B, = wg_desc_mn) — so every operand loads once
+row-major and every bwd transpose is a descriptor change, zero data movement. Also:
+generic smem stores feeding wgmma need `fence.proxy.async.shared::cta`.
+
+COST SURPRISE (open, P6 candidate): integrating the new ops grew the shared interpreter
+switch's max pressure — df STACK 272 -> 528 with a ~6% uniform tax on the OLD path
+(spills at the dispatch call sites, none in op bodies; __noinline__ made it worse; a
+register diet on the bwd ops — P parked in smem bf16 across the dP gemm — recovered
+part). The residual is structural to the one-255-reg-switch design; fixes are
+executor-level (ABI-isolated dispatch or setmaxnreg partitioning). Net integration
+effect decisively positive despite it. Full log: results/mkv3-p5-attnprobe.md.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.3x faster. The measured structural gap, in order:
