@@ -639,17 +639,114 @@ looked positive in one noisy run, but clean same-GPU A/B showed old gate, defaul
 forced `MK_DX_SPLIT_MAX_TILES=64` within noise for small while forced 64 hurt nano
 (`results/mkv3-p6-r4-dxsplit-ab-gpu5.log`). Keep the existing `<32` split-K gate.
 
+## v3 P4b round 2 (session 0b544181): the latency-bound verdict + protocol/rowop harvest
+
+Context: ran concurrently with a peer session (coordination:
+results/AGENT-COORDINATION.md); the SW128 + NN-gating work is documented in the
+section above (6fe8fcb). This section covers everything after it.
+
+**THE measurement of the round** — nsys gpu-metrics sampled inside the megakernel
+window (small, 5 steps, clean GPU): **SM issue 19%, compute warps in flight 12%
+(= the single 256-thread block), unallocated warp slots 87%, DRAM read+write
+UNDER 10% combined.** The interpreter is latency-bound at 1/8 occupancy;
+the P6-era "bandwidth contention" framing is dead. Every subsequent experiment
+was interpreted against this.
+
+Shipped (each measured on idle GPUs with before/after util guards):
+- **Drow (bit10) on the wgmma epilogue** (-43us small): warp-per-row reduction over
+  Cs; qh = n0/D so D=128 half-head tiles accumulate correctly; falls under the NN
+  >=64-tile gate (small routes, nano's 16-tile dOatt stays WMMA).
+- **Rowop MLP split** (nano -12, small -30): rmsnorm fwd/bwd take TWO rows per warp
+  with interleaved load streams (MK_ROW_R2=16; RMSNORM_BWD span 565->467 small);
+  swiglu keeps single-row (its 6-iteration rows are already MLP-saturated) but
+  gains __expf (SFU) over libm expf; qknorm stays R=8 (R=16 doubled its serial
+  per-warp task chain, +142us). dw partials fold both rows into one smem slot.
+- **op_ce_bwd uint4 IO** (CE_BWD 79 -> 46us small): the V=16384 dlogits pass was
+  2-byte scalar accesses; libm expf kept deliberately (peer measured __expf here
+  and reverted).
+- **df completion-hint stickiness** (~-20us both): the block whose accounting
+  enables a HOT dependent adopts it as its own sticky claim — the chain's next hop
+  starts on a warm block without ring rediscovery (the ws scheduler's hint path,
+  ported).
+- **ws hot/cold rings + consumer-owned Instr snapshot**: ws STACK 544->304, nano ws
+  1633->1399; ws still trails df, stays non-default.
+
+Measured negatives (documented, reverted or default-off):
+- **MK_OCC2** (__launch_bounds__(256,2) -> 2 blocks/SM at 128 regs): REG:128
+  STACK:944, nano +32% / small +40%. Occupancy-via-spill loses; more blocks is not
+  the path.
+- **REGISTER-LIFETIME LAW (measured twice, now a design rule)**: register-resident
+  value reuse LOSES to re-reading in the 8-warp regime — rmsnorm_bwd single-pass
+  (hold x/dy/w across the dot; +240us small) and qknorm register-dw accumulation
+  (+58us small) both reverted. Long register lifetimes block the scoreboard's load
+  overlap; the winning shape is short-lived registers + more independent streams
+  (the interleave). Corollary for future op work: prefer re-reads and extra load
+  streams over caching values in registers.
+- Rowop claim floor (MK_ROWOP_CLAIM 2/4): +275/+838 small — tail balance beats
+  claim amortization (Stream-K physics, again).
+- Attention loader lane remap (conflict-free stores under INTER): NEUTRAL — kept
+  (strictly fewer smem port cycles; attention stage fills hide under mma+softmax,
+  unlike the bare gemm loop).
+- TN dW wgmma routing re-run under SW128: STILL +226/+570 — dW gemms are sinks;
+  2x more BW-hungry sinks steal from the chain.
+- Attention chunk re-sweeps: DKV C=1 / DQ C=2 confirmed optimal in-model (probe
+  standalone prefers C=2/C=4 — the in-model optimum is a scheduling optimum, not
+  an op optimum).
+
+Attention verdict: the WG ops are FA-CLASS STANDALONE (attention_probe: fwd 35us,
+dKV 45, dQ 30 at small shapes ~= baseline flash parity); the +30-50% in-model
+instr tax is the global latency environment. Attention-internal work is not the
+next lever.
+
+ws race postmortem: the "la=1 stall" reported mid-session was GPU CO-TENANCY (an
+sglang server landed on the measurement GPU; context time-slicing makes one batch
+span ~2.5ms — a perfect fake stall signature). Retracted with clean-GPU evidence
+(ws small 4890, no dribble). One REAL protocol bug found by inspection (la=2
+only): the flip fast path stages without the k < acct+lookahead bound, so at
+ds-acct=2 it overwrites slot (ds&1)'s q_ins bookkeeping while batch acct (same
+parity) is un-accounted -> done[] corruption -> lost dependents. Likely the
+historical la=2 hang; FIXED this round (ds - acct < 2 guard on the flip fast
+path, a no-op at la=1): la=2 stress 200 small steps clean (previously hung ~1 in
+40-120). la=2 remains SLOWER in-model (small 5494 vs 4826, nano 1377 vs 1269 —
+the P4a tail-imbalance mechanism), so la=1 stays default; the guard is a
+correctness fix.
+
+Operational lessons (multi-agent, now standing practice):
+- Per-session TORCH_EXTENSIONS_DIR: concurrent rebuilds of the name-keyed torch
+  extension cache race and one process can load a mid-edit .so (flaky asserts).
+- Guard every timed run with before/after nvidia-smi util checks; local GPUs churn
+  (an inference server arrived mid-session and invalidated 30 minutes of numbers).
+- Claim board + small frequent commits + never committing the peer's in-flight
+  files kept two sessions productive in one tree.
+
+SCOREBOARD (median-of-50, fresh process per config, hardened baseline):
+| config | megakernel | hardened | gap |
+|---|---|---|---|
+| nano  (H256 L4 S512)  | 1250 | 711 | 1.76x |
+| small (H512 L8 S1024) | 4426 | 2732 | 1.62x |
+| deep-narrow (L12)     | 3138 | 1984 | 1.58x |
+| S=128                 | 922  | 538  | 1.72x |
+| S=256                 | 1070 | 610  | 1.75x |
+| S=1024 (nano width)   | 1643 | 959  | 1.71x |
+(v3 start 2.65x/3.44x; post-P6 2.06x/2.06x; post-SW128 1.79x/1.65x.)
+
+Remaining structural items, in measured order: (1) the uniform in-model latency
+tax (8 warps/SM) — the only true fixes are protocol-level (producer-fed loads /
+cross-instr prefetch, i.e. the original P4b endgame, on a stabilized ws) or
+per-op MLP where load streams are still starved; (2) head-dX target retune (below;
+lm_head n128 was rechecked separately and not promoted); (3) waits ~410us small
+(144 hops x ~2.9us).
+
 P4b current-base head dX retune: after the committed ws/checkpoint verdicts, the
-`dlogits @ Wlm` split-K target was rechecked without n128 on a clean GPU from the
-`2a5bc25` base. `MK_HEAD_DX_TARGET_TILES=256` beat the old 512 target in repeated
-direct timings: nano 512=1246.6/1235.4us vs 256=1225.3/1222.8us; small
-512=4392.9/4390.8us vs 256=4362.5/4363.5us
-(`results/mkv3-p4b-wsbase-headtarget-256-ab.log`). After merging CE_BWD vectorization
-(`91b7f74`), the same A/B still favors 256: nano 512=1250.7/1227.9us vs
-256=1221.6/1217.8us; small 512=4374.3/4367.8us vs 256=4335.6/4336.2us
+`dlogits @ Wlm` split-K target was rechecked without n128 on clean GPU 3. The old
+512 target lost consistently to `MK_HEAD_DX_TARGET_TILES=256`: on `2a5bc25`, nano
+512=1246.6/1235.4us vs 256=1225.3/1222.8us and small 512=4392.9/4390.8us vs
+256=4362.5/4363.5us (`results/mkv3-p4b-wsbase-headtarget-256-ab.log`). After
+CE_BWD vectorization (`91b7f74`), 256 still won: nano 512=1250.7/1227.9us vs
+256=1221.6/1217.8us and small 512=4374.3/4367.8us vs 256=4335.6/4336.2us
 (`results/mkv3-p4b-headtarget256-after-cebwd-ab.log`). After the df scheduler
 completion-hint commit (`eba44d5`), the win held again: nano 512=1249.6/1229.7us vs
-256=1220.2/1217.1us; small 512=4370.0/4368.5us vs 256=4338.8/4338.1us
+256=1220.2/1217.1us and small 512=4370.0/4368.5us vs 256=4338.8/4338.1us
 (`results/mkv3-p4b-headtarget256-after-hint-ab.log`). The default is now 256; the env
 knob stays for reruns.
 
