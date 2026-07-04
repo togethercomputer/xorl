@@ -1299,6 +1299,203 @@ def sglang_rms_norm_batch_invariant(
     return output.reshape(original_shape)
 
 
+# --------------------------------------------------------------------------- #
+# Batch-invariant fused LM-head selected-token log-probability
+#
+# The K3 lm-head contract, vendored identically in xorl and SGLang
+# (python/sglang/srt/batch_invariant_ops/batch_invariant_ops.py). Both engines
+# compute per-token logprobs of given token ids from bit-exact bf16 hidden
+# states and the bf16 lm-head weight through the SAME reduction trees, so the
+# results are bitwise identical cross-engine:
+#   1. chunk GEMM — ``matmul_kernel_persistent`` with the family's fixed bf16
+#      tile config and an fp32 output buffer. bf16xbf16 products are exact in
+#      fp32, so reading the weight in bf16 with tensor-core fp32 accumulation
+#      equals a GEMM over materialized fp32 upcasts with the same tree (and
+#      deletes the fp32 weight copy the eager paths materialize).
+#   2. chunk stats — per-row max and sum(exp(x - chunk_max)) in a fixed
+#      sequential BLOCK loop (same discipline as ``_rms_norm_kernel``), plus
+#      the selected-token logit gather.
+#   3. merge — global max over chunk maxima (exact), then the rescaled sumexp
+#      accumulated in pinned chunk order; lse = gmax + log(acc).
+# All transcendentals stay inside these kernels: tl.exp/tl.log measured
+# bit-identical across triton 3.5.1 (serving venv) and 3.7.1 (trainer venv),
+# as is the fixed-tile tl.dot fp32 accumulator. Contract constants below are
+# part of the contract — changing any of them changes the bits.
+# Forward-only; the trainer wraps it in an autograd.Function (ops/loss).
+# --------------------------------------------------------------------------- #
+
+BI_LM_HEAD_VOCAB_CHUNK = 8192
+_BI_LM_HEAD_STATS_BLOCK = 1024
+_BI_LM_HEAD_GEMM_CONFIG = {
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 64,
+    "GROUP_SIZE_M": 8,
+    "num_stages": 3,
+    "num_warps": 8,
+}
+
+
+@triton.jit
+def _lm_head_chunk_stats_kernel(
+    logits_ptr,
+    token_ids_ptr,
+    sel_ptr,
+    m_ptr,
+    s_ptr,
+    logits_row_stride,
+    n_cols,
+    col_offset,
+    chunk_idx,
+    n_chunks,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Per-row chunk statistics over an fp32 logits tile [N, n_cols]:
+    chunk max, sum(exp(x - chunk_max)) in a fixed sequential block loop, and
+    the selected-token logit when ``token_ids[row]`` falls in this chunk."""
+    row = tl.program_id(0).to(tl.int64)
+    row_ptr = logits_ptr + row * logits_row_stride
+
+    row_max = float("-inf")
+    for col_start in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_start + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+        vals = tl.load(row_ptr + col_idx, mask=mask, other=float("-inf"))
+        row_max = tl.maximum(row_max, tl.max(vals))
+
+    sum_exp = 0.0
+    for col_start in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_start + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+        vals = tl.load(row_ptr + col_idx, mask=mask, other=float("-inf"))
+        e = tl.exp(vals - row_max)
+        sum_exp += tl.sum(tl.where(mask, e, 0.0))
+
+    tl.store(m_ptr + row * n_chunks + chunk_idx, row_max)
+    tl.store(s_ptr + row * n_chunks + chunk_idx, sum_exp)
+
+    tok = tl.load(token_ids_ptr + row)
+    local = tok - col_offset
+    in_chunk = (local >= 0) & (local < n_cols)
+    sel = tl.load(row_ptr + local, mask=in_chunk, other=0.0)
+    tl.store(sel_ptr + row, sel, mask=in_chunk)
+
+
+@triton.jit
+def _lm_head_lse_merge_kernel(
+    m_ptr,
+    s_ptr,
+    lse_ptr,
+    n_chunks,
+):
+    """lse[row] = gmax + log(sum_c s_c * exp(m_c - gmax)), chunks in pinned order."""
+    row = tl.program_id(0).to(tl.int64)
+    base = row * n_chunks
+    gmax = float("-inf")
+    for c in range(n_chunks):
+        gmax = tl.maximum(gmax, tl.load(m_ptr + base + c))
+    acc = 0.0
+    for c in range(n_chunks):
+        acc += tl.load(s_ptr + base + c) * tl.exp(tl.load(m_ptr + base + c) - gmax)
+    tl.store(lse_ptr + row, gmax + tl.log(acc))
+
+
+def _bi_lm_head_chunk_gemm_fp32(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
+    """Launch the family's persistent matmul with the pinned bf16 config and an
+    fp32 output buffer (the fp32 store path keeps the raw accumulator bits)."""
+    NUM_SMS = torch.cuda.get_device_properties(a.device).multi_processor_count
+    M, K = a.shape
+    _, N = b.shape
+
+    def grid(META):
+        return (min(NUM_SMS, triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])),)
+
+    matmul_kernel_persistent[grid](
+        a,
+        b,
+        out,
+        None,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        out.stride(0),
+        out.stride(1),
+        NUM_SMS=NUM_SMS,
+        A_LARGE=a.numel() > 2**31,
+        B_LARGE=b.numel() > 2**31,
+        C_LARGE=out.numel() > 2**31,
+        HAS_BIAS=False,
+        **_BI_LM_HEAD_GEMM_CONFIG,
+    )
+
+
+def bi_lm_head_selected_logprob(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    token_ids: torch.Tensor,
+    vocab_chunk: int = BI_LM_HEAD_VOCAB_CHUNK,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-token ``log p(token_ids)`` for the LM head, batch-invariant and
+    cross-engine bit-exact (the K3 lm-head contract).
+
+    Args:
+        hidden: ``[N, H]`` bf16 hidden states (pre lm-head).
+        weight: ``[V, H]`` bf16 lm-head weight (kept resident in bf16; no fp32
+            copy is materialized).
+        token_ids: ``[N]`` integer token ids to score (callers must pre-clamp
+            ignored positions to a valid id and mask outputs downstream).
+
+    Returns:
+        ``(logprob, lse, selected)`` — all ``[N]`` fp32; ``logprob = selected - lse``.
+    """
+    assert hidden.ndim == 2 and weight.ndim == 2, "hidden and weight must be 2D"
+    assert hidden.shape[1] == weight.shape[1], "hidden dim mismatch"
+    assert hidden.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16, (
+        "the lm-head contract takes bf16 hidden/weight (fp32 upcast is exact inside the GEMM)"
+    )
+    assert hidden.is_cuda, "CUDA only"
+
+    hidden = hidden.contiguous()
+    token_ids = token_ids.contiguous().to(device=hidden.device, dtype=torch.int64)
+    n_tokens = hidden.shape[0]
+    vocab = weight.shape[0]
+    n_chunks = (vocab + vocab_chunk - 1) // vocab_chunk
+
+    chunk_max = torch.empty((n_tokens, n_chunks), dtype=torch.float32, device=hidden.device)
+    chunk_sumexp = torch.empty_like(chunk_max)
+    selected = torch.zeros(n_tokens, dtype=torch.float32, device=hidden.device)
+    lse = torch.empty(n_tokens, dtype=torch.float32, device=hidden.device)
+    logits_buf = torch.empty((n_tokens, vocab_chunk), dtype=torch.float32, device=hidden.device)
+
+    for chunk_idx, col_start in enumerate(range(0, vocab, vocab_chunk)):
+        col_end = min(col_start + vocab_chunk, vocab)
+        n_cols = col_end - col_start
+        logits_c = logits_buf[:, :n_cols]
+        # [H, C] transposed view of the resident bf16 weight — the persistent
+        # kernel takes explicit strides, so no copy is made.
+        _bi_lm_head_chunk_gemm_fp32(hidden, weight[col_start:col_end].t(), logits_c)
+        _lm_head_chunk_stats_kernel[(n_tokens,)](
+            logits_c,
+            token_ids,
+            selected,
+            chunk_max,
+            chunk_sumexp,
+            logits_c.stride(0),
+            n_cols,
+            col_start,
+            chunk_idx,
+            n_chunks,
+            BLOCK_SIZE=_BI_LM_HEAD_STATS_BLOCK,
+        )
+
+    _lm_head_lse_merge_kernel[(n_tokens,)](chunk_max, chunk_sumexp, lse, n_chunks)
+    return selected - lse, lse, selected
+
+
 _ONES_CACHE: Dict[Tuple[str, int | None, torch.dtype, int], torch.Tensor] = {}
 
 
