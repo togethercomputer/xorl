@@ -1112,6 +1112,17 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   auto leaves nano/small/S4096 unchanged and emits S2048 head dX as 64 tiles, sk=1
   (`mkv3-p4b-headdx-s2048-route-20260704T2325HEADDX.log`). Full model parity passed
   (`mkv3-p4b-headdx-s2048-testmodel-20260704T2325HEADDX.log`).
+- Cold dW split-K retune: the old implicit target 512 over-parallelized off-path TN
+  weight-gradient GEMMs and stole issue/memory bandwidth from the hot chain. The new
+  implicit target is 192 for `K < 2048` and 128 for `K >= 2048`; explicit split targets
+  such as head dX and nano dX are unchanged, and `MK_DW_TARGET_TILES=512` restores the
+  old behavior. Broad and paired sweeps
+  (`mkv3-p4b-dw-split-target-sweep-20260704T2342DWSK.log`,
+  `mkv3-p4b-dw-split-target-paired-20260704T2343DWSK.log`) plus direct env
+  default-vs-old timing (`mkv3-p4b-dw-split-target-default-ab-20260704T2344DWSK.log`)
+  confirmed old-vs-new deltas: nano -57.3/-62.1us, small -232.2/-230.4us, S2048
+  -109.6/-101.6us, and S4096 -170.6/-167.9us. Long-S also prefers 128 over 192
+  (S2048 -20us, S4096 -43..45us).
 
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across

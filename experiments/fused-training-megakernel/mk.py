@@ -114,8 +114,17 @@ def gemm_tiles_wgmma_n128(M, N):
     return (M // 128) * (N // 128)
 
 
-def wgmma_split_k(M, N, K, target_tiles=512):
+def _default_split_k_target(K):
+    env = os.environ.get("MK_DW_TARGET_TILES")
+    if env is not None:
+        return int(env)
+    return 128 if K >= 2048 else 192
+
+
+def wgmma_split_k(M, N, K, target_tiles=0):
     """K-slices for a wgmma split-K gemm (64-aligned chunks)."""
+    if target_tiles == 0:
+        target_tiles = _default_split_k_target(K)
     mnt = gemm_tiles_wgmma(M, N)
     return max(1, min(target_tiles // max(mnt, 1), K // 64))
 
@@ -124,8 +133,10 @@ def gemm_tiles_wgmma(M, N):
     return (M // 128) * (N // 64)
 
 
-def gemm_split_k(M, N, K, target_tiles=512):
+def gemm_split_k(M, N, K, target_tiles=0):
     """K-slice count that lifts a small-M*N GEMM to ~target_tiles work items."""
+    if target_tiles == 0:
+        target_tiles = _default_split_k_target(K)
     mn = gemm_tiles(M, N)
     sk = max(1, min(target_tiles // mn, (K + 31) // 32))
     return sk
