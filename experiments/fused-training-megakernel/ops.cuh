@@ -5,7 +5,8 @@
 // Ops read operand buffer indices + shape ints from Instr.args.
 //
 // Conventions: activations/params bf16 row-major; every accumulation fp32; weight
-// grads fp32. GEMM tiles are 64x64; row ops use one row per work item.
+// grads fp32. GEMM tiles are 64x64; batched row ops use MK_ROW_R rows per work item
+// (one warp per row); CE/embed row ops use one row per work item.
 
 #pragma once
 
@@ -583,106 +584,224 @@ __device__ __forceinline__ void op_cvt_f32_bf16(const Instr& I, int tile, void**
     dst[i] = f2bf(src[i]);
 }
 
-// ---- block-wide row reduction helper ---------------------------------------------------
-// Sums `val` across the block (256 threads). Uses 32 floats of scratch.
-__device__ __forceinline__ float block_sum(float val, float* scratch) {
-  for (int off = 16; off > 0; off >>= 1) val += __shfl_down_sync(0xffffffff, val, off);
-  if ((threadIdx.x & 31) == 0) scratch[threadIdx.x >> 5] = val;
-  consumer_sync();
-  float total = 0.0f;
-  if (threadIdx.x < MK_CONSUMERS / 32) total = scratch[threadIdx.x];
-  for (int off = 16; off > 0; off >>= 1) total += __shfl_down_sync(0xffffffff, total, off);
-  total = __shfl_sync(0xffffffff, total, 0);
-  if (threadIdx.x == 0) scratch[0] = total;
-  consumer_sync();
-  total = scratch[0];
-  consumer_sync();
-  return total;
+// ---- batched row ops (v3 P6) -----------------------------------------------------------
+// Row ops process MK_ROW_R rows per work item, one warp per row: warp-shuffle reductions
+// (block_sum's 3 block barriers per row are gone), uint4-vectorized bf16 IO (8 elems per
+// lane per iteration) for memory-level parallelism — at 1 block/SM the old 1-row tiles
+// were latency-bound (256 threads striding a 256..512-element row, serial row-to-row).
+#define MK_ROW_R 8  // rows per rowop tile = MK_CONSUMERS/32 warps (mirrored: mk.ROWOP_R)
+
+__device__ __forceinline__ void ld8bf(const bf16* p, float* f) {
+  const uint4 u = *reinterpret_cast<const uint4*>(p);
+  const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&u);
+#pragma unroll
+  for (int j = 0; j < 4; j++) {
+    const float2 v = __bfloat1622float2(h[j]);
+    f[2 * j] = v.x;
+    f[2 * j + 1] = v.y;
+  }
+}
+
+__device__ __forceinline__ void st8bf(bf16* p, const float* f) {
+  uint4 u;
+  __nv_bfloat162* h = reinterpret_cast<__nv_bfloat162*>(&u);
+#pragma unroll
+  for (int j = 0; j < 4; j++) h[j] = __float22bfloat162_rn(make_float2(f[2 * j], f[2 * j + 1]));
+  *reinterpret_cast<uint4*>(p) = u;
+}
+
+// 8-elem dy loader: bf16 activations or the fp32 atomic-workspace view (dy_f32 paths)
+__device__ __forceinline__ void ld8dy(const bf16* pb, const float* pf, bool f32, int i,
+                                      float* f) {
+  if (f32) {
+    const float4 a = *reinterpret_cast<const float4*>(pf + i);
+    const float4 b = *reinterpret_cast<const float4*>(pf + i + 4);
+    f[0] = a.x; f[1] = a.y; f[2] = a.z; f[3] = a.w;
+    f[4] = b.x; f[5] = b.y; f[6] = b.z; f[7] = b.w;
+  } else {
+    ld8bf(pb + i, f);
+  }
+}
+
+__device__ __forceinline__ float warp_sum(float v) {
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+  return v;
 }
 
 // ---- RMSNorm ---------------------------------------------------------------------------
 // fwd: y[r,:] = x[r,:] * rstd * w ; rstd = 1/sqrt(mean(x^2)+eps). Saves rstd (fp32).
-// args: {x, w, y, rstd, H, eps_bits}; tile = row.
+// args: {x, w, y, rstd, H, eps_bits, S}; tile = MK_ROW_R-row group, one warp per row.
 __device__ void op_rmsnorm_fwd(const Instr& I, int tile, void** bufs, char* smem_raw) {
-  const bf16* x = reinterpret_cast<const bf16*>(bufs[I.args[0]]) + (int64_t)tile * I.args[4];
-  const bf16* w = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
-  bf16* y = reinterpret_cast<bf16*>(bufs[I.args[2]]) + (int64_t)tile * I.args[4];
-  float* rstd = reinterpret_cast<float*>(bufs[I.args[3]]);
-  const int H = I.args[4];
+  const int H = I.args[4], S = I.args[6];
   const float eps = __int_as_float(I.args[5]);
-  float* scratch = reinterpret_cast<float*>(smem_raw);
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int row = tile * MK_ROW_R + warp;
+  if (row >= S) return;  // barrier-free op: early exit is safe
+  const bf16* x = reinterpret_cast<const bf16*>(bufs[I.args[0]]) + (int64_t)row * H;
+  const bf16* w = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
+  bf16* y = reinterpret_cast<bf16*>(bufs[I.args[2]]) + (int64_t)row * H;
+  float* rstd = reinterpret_cast<float*>(bufs[I.args[3]]);
 
   float ss = 0.0f;
-  for (int i = threadIdx.x; i < H; i += MK_CONSUMERS) {
-    const float v = bf2f(x[i]);
-    ss += v * v;
+  if ((H & 7) == 0) {
+    for (int i = lane * 8; i < H; i += 32 * 8) {
+      float xv[8];
+      ld8bf(x + i, xv);
+#pragma unroll
+      for (int j = 0; j < 8; j++) ss += xv[j] * xv[j];
+    }
+  } else {
+    for (int i = lane; i < H; i += 32) {
+      const float v = bf2f(x[i]);
+      ss += v * v;
+    }
   }
-  ss = block_sum(ss, scratch);
-  const float r = rsqrtf(ss / H + eps);
-  if (threadIdx.x == 0) rstd[tile] = r;
-  for (int i = threadIdx.x; i < H; i += MK_CONSUMERS)
-    y[i] = f2bf(bf2f(x[i]) * r * bf2f(w[i]));
+  const float r = rsqrtf(warp_sum(ss) / H + eps);
+  if (lane == 0) rstd[row] = r;
+  if ((H & 7) == 0) {
+    for (int i = lane * 8; i < H; i += 32 * 8) {
+      float xv[8], wv[8], yv[8];
+      ld8bf(x + i, xv);
+      ld8bf(w + i, wv);
+#pragma unroll
+      for (int j = 0; j < 8; j++) yv[j] = xv[j] * r * wv[j];
+      st8bf(y + i, yv);
+    }
+  } else {
+    for (int i = lane; i < H; i += 32) y[i] = f2bf(bf2f(x[i]) * r * bf2f(w[i]));
+  }
 }
 
 // bwd: with xhat = x*rstd, g = dy*w:
 //   dx += rstd * (g - xhat * mean(g * xhat))       (accumulates into dx: residual stream)
-//   dw += dy * xhat                                 (fp32 atomics)
-// args: {x, w, dy, dx, dw, rstd, H, dy_f32}; tile = row. dy_f32 != 0 reads dy as fp32
-// (an atomic-accumulation workspace consumed directly — no CVT chain hop).
+//   dw += dy * xhat — staged in smem per tile, ONE global atomic per element per
+//   MK_ROW_R rows (per-row global atomics serialize on the tiny [H] grad buffer: every
+//   row hits the same addresses, so S atomic updates per address bound the op's span).
+// args: {x, w, dy, dx, dw, rstd, H, dy_f32, S}; tile = MK_ROW_R-row group, warp per row.
+// dy_f32 != 0 reads dy as fp32 (an atomic-accumulation workspace — no CVT chain hop).
 __device__ void op_rmsnorm_bwd(const Instr& I, int tile, void** bufs, char* smem_raw) {
-  const int H = I.args[6];
-  const bf16* x = reinterpret_cast<const bf16*>(bufs[I.args[0]]) + (int64_t)tile * H;
-  const bf16* w = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
-  const bf16* dyb = reinterpret_cast<const bf16*>(bufs[I.args[2]]) + (int64_t)tile * H;
-  const float* dyf = reinterpret_cast<const float*>(bufs[I.args[2]]) + (int64_t)tile * H;
+  const int H = I.args[6], S = I.args[8];
   const bool dy_f32 = I.args[7] != 0;
-  bf16* dx = reinterpret_cast<bf16*>(bufs[I.args[3]]) + (int64_t)tile * H;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int row = tile * MK_ROW_R + warp;
+  float* dw_s = reinterpret_cast<float*>(smem_raw);  // [H] fp32 per-tile dw partials
+  for (int i = threadIdx.x; i < H; i += MK_CONSUMERS) dw_s[i] = 0.0f;
+  consumer_sync();
+  if (row < S) {
+    const bf16* x = reinterpret_cast<const bf16*>(bufs[I.args[0]]) + (int64_t)row * H;
+    const bf16* w = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
+    const bf16* dyb = reinterpret_cast<const bf16*>(bufs[I.args[2]]) + (int64_t)row * H;
+    const float* dyf = reinterpret_cast<const float*>(bufs[I.args[2]]) + (int64_t)row * H;
+    bf16* dx = reinterpret_cast<bf16*>(bufs[I.args[3]]) + (int64_t)row * H;
+    const float r = reinterpret_cast<const float*>(bufs[I.args[5]])[row];
+    if ((H & 7) == 0) {
+      float dot = 0.0f;
+      for (int i = lane * 8; i < H; i += 32 * 8) {
+        float xv[8], dyv[8], wv[8];
+        ld8bf(x + i, xv);
+        ld8dy(dyb, dyf, dy_f32, i, dyv);
+        ld8bf(w + i, wv);
+#pragma unroll
+        for (int j = 0; j < 8; j++) dot += dyv[j] * wv[j] * xv[j];
+      }
+      const float m = warp_sum(dot) * r / H;  // = mean(g * xhat)
+      for (int i = lane * 8; i < H; i += 32 * 8) {
+        float xv[8], dyv[8], wv[8], dxv[8];
+        ld8bf(x + i, xv);
+        ld8dy(dyb, dyf, dy_f32, i, dyv);
+        ld8bf(w + i, wv);
+        ld8bf(dx + i, dxv);
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+          const float xhat = xv[j] * r;
+          dxv[j] += r * (dyv[j] * wv[j] - xhat * m);
+          atomicAdd(&dw_s[i + j], dyv[j] * xhat);
+        }
+        st8bf(dx + i, dxv);
+      }
+    } else {
+      auto dy = [&](int i) { return dy_f32 ? dyf[i] : bf2f(dyb[i]); };
+      float dot = 0.0f;
+      for (int i = lane; i < H; i += 32) dot += dy(i) * bf2f(w[i]) * bf2f(x[i]);
+      const float m = warp_sum(dot) * r / H;
+      for (int i = lane; i < H; i += 32) {
+        const float xhat = bf2f(x[i]) * r;
+        dx[i] = f2bf(bf2f(dx[i]) + r * (dy(i) * bf2f(w[i]) - xhat * m));
+        atomicAdd(&dw_s[i], dy(i) * xhat);
+      }
+    }
+  }
+  consumer_sync();
   float* dw = reinterpret_cast<float*>(bufs[I.args[4]]);
-  const float r = reinterpret_cast<const float*>(bufs[I.args[5]])[tile];
-  float* scratch = reinterpret_cast<float*>(smem_raw);
-  auto dy = [&](int i) { return dy_f32 ? dyf[i] : bf2f(dyb[i]); };
-
-  float dot = 0.0f;
-  for (int i = threadIdx.x; i < H; i += MK_CONSUMERS) {
-    const float xhat = bf2f(x[i]) * r;
-    dot += dy(i) * bf2f(w[i]) * xhat;
-  }
-  dot = block_sum(dot, scratch) / H;
-  for (int i = threadIdx.x; i < H; i += MK_CONSUMERS) {
-    const float xhat = bf2f(x[i]) * r;
-    const float g = dy(i) * bf2f(w[i]);
-    dx[i] = f2bf(bf2f(dx[i]) + r * (g - xhat * dot));
-    atomicAdd(&dw[i], dy(i) * xhat);
-  }
+  for (int i = threadIdx.x; i < H; i += MK_CONSUMERS) atomicAdd(&dw[i], dw_s[i]);
 }
 
 // ---- SwiGLU ----------------------------------------------------------------------------
 // fwd: h[r,i] = silu(gate[r,i]) * up[r,i], gate/up = halves of gu[r, 2I] (gate first).
-// args: {gu, h, S, Iw}; tile = row.
+// args: {gu, h, S, Iw}; tile = MK_ROW_R-row group, one warp per row.
 __device__ void op_swiglu_fwd(const Instr& I, int tile, void** bufs) {
-  const int Iw = I.args[3];
-  const bf16* gu = reinterpret_cast<const bf16*>(bufs[I.args[0]]) + (int64_t)tile * 2 * Iw;
-  bf16* h = reinterpret_cast<bf16*>(bufs[I.args[1]]) + (int64_t)tile * Iw;
-  for (int i = threadIdx.x; i < Iw; i += MK_CONSUMERS) {
-    const float g = bf2f(gu[i]), u = bf2f(gu[Iw + i]);
-    const float sg = g / (1.0f + expf(-g));
-    h[i] = f2bf(sg * u);
+  const int S = I.args[2], Iw = I.args[3];
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int row = tile * MK_ROW_R + warp;
+  if (row >= S) return;  // barrier-free op: early exit is safe
+  const bf16* gu = reinterpret_cast<const bf16*>(bufs[I.args[0]]) + (int64_t)row * 2 * Iw;
+  bf16* h = reinterpret_cast<bf16*>(bufs[I.args[1]]) + (int64_t)row * Iw;
+  if ((Iw & 7) == 0) {
+    for (int i = lane * 8; i < Iw; i += 32 * 8) {
+      float g[8], u[8], hv[8];
+      ld8bf(gu + i, g);
+      ld8bf(gu + Iw + i, u);
+#pragma unroll
+      for (int j = 0; j < 8; j++) hv[j] = g[j] / (1.0f + expf(-g[j])) * u[j];
+      st8bf(h + i, hv);
+    }
+  } else {
+    for (int i = lane; i < Iw; i += 32) {
+      const float g = bf2f(gu[i]), u = bf2f(gu[Iw + i]);
+      h[i] = f2bf(g / (1.0f + expf(-g)) * u);
+    }
   }
 }
 
 // bwd: dgate = dh * u * dsilu(g); dup = dh * silu(g). Writes dgu (bf16).
-// args: {gu, dh, dgu, S, Iw}; tile = row.
+// args: {gu, dh, dgu, S, Iw, dy_f32}; tile = MK_ROW_R-row group, one warp per row.
+// dy_f32 != 0 reads dh as fp32 (a split-K atomic workspace consumed directly).
 __device__ void op_swiglu_bwd(const Instr& I, int tile, void** bufs) {
-  const int Iw = I.args[4];
-  const bf16* gu = reinterpret_cast<const bf16*>(bufs[I.args[0]]) + (int64_t)tile * 2 * Iw;
-  const bf16* dh = reinterpret_cast<const bf16*>(bufs[I.args[1]]) + (int64_t)tile * Iw;
-  bf16* dgu = reinterpret_cast<bf16*>(bufs[I.args[2]]) + (int64_t)tile * 2 * Iw;
-  for (int i = threadIdx.x; i < Iw; i += MK_CONSUMERS) {
-    const float g = bf2f(gu[i]), u = bf2f(gu[Iw + i]), d = bf2f(dh[i]);
-    const float sig = 1.0f / (1.0f + expf(-g));
-    const float sg = g * sig;
-    dgu[i] = f2bf(d * u * (sig + sg * (1.0f - sig)));  // dsilu = sig + silu*(1-sig)
-    dgu[Iw + i] = f2bf(d * sg);
+  const int S = I.args[3], Iw = I.args[4];
+  const bool dy_f32 = I.args[5] != 0;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int row = tile * MK_ROW_R + warp;
+  if (row >= S) return;  // barrier-free op: early exit is safe
+  const bf16* gu = reinterpret_cast<const bf16*>(bufs[I.args[0]]) + (int64_t)row * 2 * Iw;
+  const bf16* dhb = reinterpret_cast<const bf16*>(bufs[I.args[1]]) + (int64_t)row * Iw;
+  const float* dhf = reinterpret_cast<const float*>(bufs[I.args[1]]) + (int64_t)row * Iw;
+  bf16* dgu = reinterpret_cast<bf16*>(bufs[I.args[2]]) + (int64_t)row * 2 * Iw;
+  if ((Iw & 7) == 0) {
+    for (int i = lane * 8; i < Iw; i += 32 * 8) {
+      float g[8], u[8], d[8], dg[8], du[8];
+      ld8bf(gu + i, g);
+      ld8bf(gu + Iw + i, u);
+      ld8dy(dhb, dhf, dy_f32, i, d);
+#pragma unroll
+      for (int j = 0; j < 8; j++) {
+        const float sig = 1.0f / (1.0f + expf(-g[j]));
+        const float sg = g[j] * sig;
+        dg[j] = d[j] * u[j] * (sig + sg * (1.0f - sig));  // dsilu = sig + silu*(1-sig)
+        du[j] = d[j] * sg;
+      }
+      st8bf(dgu + i, dg);
+      st8bf(dgu + Iw + i, du);
+    }
+  } else {
+    for (int i = lane; i < Iw; i += 32) {
+      const float g = bf2f(gu[i]), u = bf2f(gu[Iw + i]);
+      const float d = dy_f32 ? dhf[i] : bf2f(dhb[i]);
+      const float sig = 1.0f / (1.0f + expf(-g));
+      const float sg = g * sig;
+      dgu[i] = f2bf(d * u * (sig + sg * (1.0f - sig)));
+      dgu[Iw + i] = f2bf(d * sg);
+    }
   }
 }
 
@@ -737,22 +856,17 @@ __device__ void op_qknorm_rope_fwd(const Instr& I, int tile, void** bufs, char* 
 // rope bwd = rotate by -theta; then per-head rmsnorm bwd (dw via fp32 atomics).
 // v grads pass through. Writes dqkv_raw (bf16), OVERWRITING (not accumulating).
 // args: {qkv_raw, dqkv_r, dqkv_raw, qw, kw, dqw, dkw, rstd_q, rstd_k, cos, sin, nq, nkv, D,
-//        dy_f32}
-// tile = row; warp w handles heads w, w+8, ... Per-block dqw/dkw partials accumulate in
-// smem (fast atomics), then ONE global atomicAdd per element per row — instead of one
-// per (row, head), which serialized on the tiny [D] grad buffers. dy_f32 != 0 reads the
-// incoming grad as fp32 (the attention-bwd atomic workspace, no CVT chain hop).
+//        dy_f32, S}
+// tile = MK_ROW_R-row group; warp w sweeps (head, row) tasks h = w mod nh (weight-vector
+// locality). Per-tile dqw/dkw partials accumulate in smem (fast atomics), then ONE global
+// atomicAdd per element per MK_ROW_R rows — the smem zero/flush and its two barriers are
+// amortized over the row group. dy_f32 != 0 reads the incoming grad as fp32 (the
+// attention-bwd atomic workspace, no CVT chain hop).
 __device__ void op_qknorm_rope_bwd(const Instr& I, int tile, void** bufs, char* smem_raw) {
   const int nq = I.args[11], nkv = I.args[12], D = I.args[13];
   const bool dy_f32 = I.args[14] != 0;
-  const int row = tile;
-  const int stride = (nq + 2 * nkv) * D;
-  const bf16* x_row = reinterpret_cast<const bf16*>(bufs[I.args[0]]) + (int64_t)row * stride;
-  const bf16* dyb_row = reinterpret_cast<const bf16*>(bufs[I.args[1]]) + (int64_t)row * stride;
-  const float* dyf_row = reinterpret_cast<const float*>(bufs[I.args[1]]) + (int64_t)row * stride;
-  bf16* dx_row = reinterpret_cast<bf16*>(bufs[I.args[2]]) + (int64_t)row * stride;
-  const float* cosr = reinterpret_cast<const float*>(bufs[I.args[9]]) + (int64_t)row * (D / 2);
-  const float* sinr = reinterpret_cast<const float*>(bufs[I.args[10]]) + (int64_t)row * (D / 2);
+  const int S = I.args[15];
+  const int stride = (nq + 2 * nkv) * D, nh = nq + 2 * nkv;
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, nwarp = MK_CONSUMERS / 32;
 
   float* dwq_s = reinterpret_cast<float*>(smem_raw);  // [D] + [D] fp32 partials
@@ -760,7 +874,17 @@ __device__ void op_qknorm_rope_bwd(const Instr& I, int tile, void** bufs, char* 
   for (int i = threadIdx.x; i < 2 * D; i += MK_CONSUMERS) dwq_s[i] = 0.0f;
   consumer_sync();
 
-  for (int h = warp; h < nq + 2 * nkv; h += nwarp) {
+  for (int t = warp; t < MK_ROW_R * nh; t += nwarp) {
+    const int h = t % nh, rr = t / nh;
+    const int row = tile * MK_ROW_R + rr;
+    if (row >= S) continue;  // no barriers inside the task loop
+    const bf16* x_row = reinterpret_cast<const bf16*>(bufs[I.args[0]]) + (int64_t)row * stride;
+    const bf16* dyb_row = reinterpret_cast<const bf16*>(bufs[I.args[1]]) + (int64_t)row * stride;
+    const float* dyf_row =
+        reinterpret_cast<const float*>(bufs[I.args[1]]) + (int64_t)row * stride;
+    bf16* dx_row = reinterpret_cast<bf16*>(bufs[I.args[2]]) + (int64_t)row * stride;
+    const float* cosr = reinterpret_cast<const float*>(bufs[I.args[9]]) + (int64_t)row * (D / 2);
+    const float* sinr = reinterpret_cast<const float*>(bufs[I.args[10]]) + (int64_t)row * (D / 2);
     const bf16* xr = x_row + h * D;
     const bf16* dyb = dyb_row + h * D;
     const float* dyf = dyf_row + h * D;

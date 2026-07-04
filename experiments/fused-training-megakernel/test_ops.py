@@ -66,7 +66,7 @@ def test_rmsnorm():
     w = torch.randn(H, device=DEV, dtype=torch.bfloat16)
     y = torch.empty_like(x)
     rstd = torch.empty(S, device=DEV, dtype=torch.float32)
-    run1(lambda p: p.instr(mk.OP_RMSNORM_FWD, S, [p.buf(x), p.buf(w), p.buf(y), p.buf(rstd), H, mk.f2i(eps)]))
+    run1(lambda p: p.instr(mk.OP_RMSNORM_FWD, mk.rowop_tiles(S), [p.buf(x), p.buf(w), p.buf(y), p.buf(rstd), H, mk.f2i(eps), S]))
     xf = x.float()
     ref_rstd = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
     check("fwd", y, xf * ref_rstd * w.float(), atol=0.05)
@@ -76,7 +76,7 @@ def test_rmsnorm():
     dx = torch.randn(S, H, device=DEV, dtype=torch.bfloat16)  # pre-existing (residual stream)
     dx0 = dx.clone()
     dw = torch.zeros(H, device=DEV, dtype=torch.float32)
-    run1(lambda p: p.instr(mk.OP_RMSNORM_BWD, S, [p.buf(x), p.buf(w), p.buf(dy), p.buf(dx), p.buf(dw), p.buf(rstd), H]))
+    run1(lambda p: p.instr(mk.OP_RMSNORM_BWD, mk.rowop_tiles(S), [p.buf(x), p.buf(w), p.buf(dy), p.buf(dx), p.buf(dw), p.buf(rstd), H, 0, S]))
     xr = xf.detach().requires_grad_(True)
     wr = w.float().detach().requires_grad_(True)
     yr = xr * torch.rsqrt(xr.pow(2).mean(-1, keepdim=True) + eps) * wr
@@ -90,13 +90,13 @@ def test_swiglu():
     S, I = 64, 160
     gu = torch.randn(S, 2 * I, device=DEV, dtype=torch.bfloat16)
     h = torch.empty(S, I, device=DEV, dtype=torch.bfloat16)
-    run1(lambda p: p.instr(mk.OP_SWIGLU_FWD, S, [p.buf(gu), p.buf(h), S, I]))
+    run1(lambda p: p.instr(mk.OP_SWIGLU_FWD, mk.rowop_tiles(S), [p.buf(gu), p.buf(h), S, I]))
     g, u = gu.float().chunk(2, dim=-1)
     check("fwd", h, torch.nn.functional.silu(g) * u, atol=0.05)
 
     dh = torch.randn(S, I, device=DEV, dtype=torch.bfloat16)
     dgu = torch.empty(S, 2 * I, device=DEV, dtype=torch.bfloat16)
-    run1(lambda p: p.instr(mk.OP_SWIGLU_BWD, S, [p.buf(gu), p.buf(dh), p.buf(dgu), S, I]))
+    run1(lambda p: p.instr(mk.OP_SWIGLU_BWD, mk.rowop_tiles(S), [p.buf(gu), p.buf(dh), p.buf(dgu), S, I]))
     gur = gu.float().detach().requires_grad_(True)
     gr, ur = gur.chunk(2, dim=-1)
     (torch.nn.functional.silu(gr) * ur).backward(dh.float())
@@ -167,7 +167,7 @@ def test_qknorm_rope():
     run1(
         lambda p: p.instr(
             mk.OP_QKNORM_ROPE_BWD,
-            S,
+            mk.rowop_tiles(S),
             [
                 p.buf(qkv),
                 p.buf(dout),
@@ -183,6 +183,8 @@ def test_qknorm_rope():
                 nq,
                 nkv,
                 D,
+                0,  # dy_f32
+                S,
             ],
         )
     )

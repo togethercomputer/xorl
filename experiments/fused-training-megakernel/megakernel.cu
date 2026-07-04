@@ -187,16 +187,22 @@ extern "C" __global__ void megakernel_df(const Instr* __restrict__ instrs, int n
                                          const int* __restrict__ dep_cnt,
                                          const int* __restrict__ adj_off,
                                          const int* __restrict__ adj,
-                                         const int* __restrict__ claim_sz, int* state,
-                                         void** bufs,
+                                         const int* __restrict__ claim_sz,
+                                         const int* __restrict__ crit, int cold_cap,
+                                         int* state, void** bufs,
                                          long long* iclk /* nullable [2*n] */) {
   extern __shared__ char smem[];
   cg::grid_group grid = cg::this_grid();
   int* pending = state;
   int* cursor = state + n_instr;
   int* done = state + 2 * n_instr;
-  int* ready = state + 3 * n_instr;
-  int* ctrl = state + 4 * n_instr;
+  // two-class ready rings (v3 P6, the Whippletree/MPK lesson): HOT = instrs something
+  // depends on (the chain); COLD = sinks (dW gemms, embed_bwd) + wave-0 fills. Idle
+  // blocks drain hot first, so chain consumers start within ~a claim batch of their
+  // producer finishing instead of behind hundreds of sticky off-path tile claims.
+  int* ready_hot = state + 3 * n_instr;
+  int* ready_cold = state + 4 * n_instr;
+  int* ctrl = state + 5 * n_instr;
 
   // init, then one sync, then seed roots (visible before anyone consumes: the tail
   // increment in the seeding phase publishes them).
@@ -205,32 +211,46 @@ extern "C" __global__ void megakernel_df(const Instr* __restrict__ instrs, int n
     pending[i] = dep_cnt[i];
     cursor[i] = 0;
     done[i] = 0;
-    ready[i] = -1;
+    ready_hot[i] = -1;
+    ready_cold[i] = -1;
   }
   if (blockIdx.x == 0 && threadIdx.x == 0) {
-    ctrl[0] = 0;  // ready tail
+    ctrl[0] = 0;  // hot ready tail
     ctrl[1] = 0;  // finished count
-    ctrl[2] = 0;  // consumed head
+    ctrl[2] = 0;  // hot consumed head
+    ctrl[3] = 0;  // cold ready tail
+    ctrl[4] = 0;  // cold consumed head
+    ctrl[5] = 0;  // blocks currently working cold entries (cold_cap limiter)
   }
   grid.sync();
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_instr;
        i += gridDim.x * blockDim.x) {
     if (dep_cnt[i] == 0) {
-      const int t = atomicAdd(&ctrl[0], 1);
-      atomicExch(&ready[t], i);
+      if (crit[i]) {
+        const int t = atomicAdd(&ctrl[0], 1);
+        atomicExch(&ready_hot[t], i);
+      } else {
+        const int t = atomicAdd(&ctrl[3], 1);
+        atomicExch(&ready_cold[t], i);
+      }
     }
   }
   grid.sync();
 
   __shared__ int s_ins, s_t0, s_t1;
-  int last_ins = -1;  // sticky: retry the previous instruction before scanning
-  volatile int* vready = ready;
+  int last_ins = -1;   // sticky: retry the previous instruction before scanning
+  int last_cold = 0;   // sticky instr's class: cold stickiness yields to fresh hot work
+  int seen_hot = 0;    // hot tail at the last failed hot scan (held back at invisible
+                       // slots so a not-yet-published push still forces a rescan)
+  volatile int* vhot = ready_hot;
+  volatile int* vcold = ready_cold;
   volatile int* vctrl = ctrl;
   for (;;) {
     if (threadIdx.x == 0) {
       s_ins = -1;
-      // fast path: most blocks keep pulling tiles from the same big instruction
-      if (last_ins >= 0) {
+      // fast path: most blocks keep pulling tiles from the same big instruction —
+      // unless it is cold work and the hot ring has news
+      if (last_ins >= 0 && !(last_cold && vctrl[0] != seen_hot)) {
         const int nt = instrs[last_ins].ntiles;
         if (cursor[last_ins] < nt) {
           const int bs = claim_sz[last_ins];
@@ -243,12 +263,15 @@ extern "C" __global__ void megakernel_df(const Instr* __restrict__ instrs, int n
         }
       }
       while (s_ins < 0 && vctrl[1] < n_instr) {
-        // ctrl[2] = global consumed head: ring entries below it are fully claimed
-        const int gq0 = vctrl[2];
-        const int tail = vctrl[0];
-        for (int q = gq0; q < tail; ++q) {
-          const int ins = vready[q];
-          if (ins < 0) continue;  // slot reserved, payload not yet visible
+        // hot ring first; ctrl[2] = consumed head (entries below are fully claimed)
+        const int htail = vctrl[0];
+        int hvis = htail;
+        for (int q = vctrl[2]; q < htail; ++q) {
+          const int ins = vhot[q];
+          if (ins < 0) {  // slot reserved, payload not yet visible
+            if (q < hvis) hvis = q;
+            continue;
+          }
           const int nt = instrs[ins].ntiles;
           if (cursor[ins] >= nt) {
             if (q == vctrl[2]) atomicCAS(&ctrl[2], q, q + 1);  // advance consumed head
@@ -260,12 +283,42 @@ extern "C" __global__ void megakernel_df(const Instr* __restrict__ instrs, int n
             s_ins = ins;
             s_t0 = t0;
             s_t1 = min(t0 + bs, nt);
+            if (last_cold) atomicSub(&ctrl[5], 1);
+            last_cold = 0;
             break;
+          }
+        }
+        if (s_ins >= 0) break;
+        seen_hot = hvis;
+        // cold_cap bounds how many blocks work cold entries concurrently (bandwidth
+        // headroom for the chain); a block already on cold keeps its slot — the cap
+        // must not lock out every worker or capped cold work could never finish.
+        if (last_cold || vctrl[5] < cold_cap) {
+          const int ctail = vctrl[3];
+          for (int q = vctrl[4]; q < ctail; ++q) {
+            const int ins = vcold[q];
+            if (ins < 0) continue;
+            const int nt = instrs[ins].ntiles;
+            if (cursor[ins] >= nt) {
+              if (q == vctrl[4]) atomicCAS(&ctrl[4], q, q + 1);
+              continue;
+            }
+            const int bs = claim_sz[ins];
+            const int t0 = atomicAdd(&cursor[ins], bs);
+            if (t0 < nt) {
+              s_ins = ins;
+              s_t0 = t0;
+              s_t1 = min(t0 + bs, nt);
+              if (!last_cold) atomicAdd(&ctrl[5], 1);
+              last_cold = 1;
+              break;
+            }
           }
         }
         if (s_ins >= 0) break;
         __nanosleep(256);
       }
+      if (s_ins < 0 && last_cold) atomicSub(&ctrl[5], 1);  // exiting: release the slot
       last_ins = s_ins;
     }
     __syncthreads();
@@ -287,8 +340,13 @@ extern "C" __global__ void megakernel_df(const Instr* __restrict__ instrs, int n
         for (int e = adj_off[ins]; e < adj_off[ins + 1]; ++e) {
           const int dep = adj[e];
           if (atomicSub(&pending[dep], 1) == 1) {
-            const int t = atomicAdd(&ctrl[0], 1);
-            atomicExch(&ready[t], dep);
+            if (crit[dep]) {
+              const int t = atomicAdd(&ctrl[0], 1);
+              atomicExch(&ready_hot[t], dep);
+            } else {
+              const int t = atomicAdd(&ctrl[3], 1);
+              atomicExch(&ready_cold[t], dep);
+            }
           }
         }
         atomicAdd(&ctrl[1], 1);
@@ -837,11 +895,12 @@ void mk_run(torch::Tensor instrs, torch::Tensor wave_start, torch::Tensor wave_t
 int64_t mk_nblocks() { return g_nblocks; }
 
 void mk_run_df(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_off,
-               torch::Tensor adj, torch::Tensor claim_sz, torch::Tensor state,
-               torch::Tensor bufs, int64_t smem_bytes,
-               c10::optional<torch::Tensor> iclk) {
+               torch::Tensor adj, torch::Tensor claim_sz, torch::Tensor crit,
+               int64_t cold_cap64, torch::Tensor state, torch::Tensor bufs,
+               int64_t smem_bytes, c10::optional<torch::Tensor> iclk) {
   TORCH_CHECK(instrs.is_cuda() && instrs.dtype() == torch::kInt32);
   const int n_instr = (int)(instrs.numel() / (3 + MK_MAX_ARGS));
+  TORCH_CHECK(state.numel() >= 5 * (int64_t)n_instr + 8, "df state tensor too small");
 
   static bool df_configured = false;
   if (!df_configured) {
@@ -866,13 +925,16 @@ void mk_run_df(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_of
   const int* d_ao = adj_off.data_ptr<int>();
   const int* d_ad = adj.data_ptr<int>();
   const int* d_cs = claim_sz.data_ptr<int>();
+  const int* d_cr = crit.data_ptr<int>();
+  int cold_cap = (int)cold_cap64;
+  if (cold_cap <= 0) cold_cap = df_nblocks;  // 0 = uncapped
   int* d_state = state.data_ptr<int>();
   void** d_bufs = reinterpret_cast<void**>(bufs.data_ptr<int64_t>());
   long long* d_clk =
       iclk.has_value() ? reinterpret_cast<long long*>(iclk->data_ptr<int64_t>()) : nullptr;
-  void* args[] = {(void*)&d_instrs, (void*)&n_instr, (void*)&d_dc, (void*)&d_ao,
-                  (void*)&d_ad,     (void*)&d_cs,    (void*)&d_state, (void*)&d_bufs,
-                  (void*)&d_clk};
+  void* args[] = {(void*)&d_instrs, (void*)&n_instr, (void*)&d_dc,    (void*)&d_ao,
+                  (void*)&d_ad,     (void*)&d_cs,    (void*)&d_cr,    (void*)&cold_cap,
+                  (void*)&d_state,  (void*)&d_bufs,  (void*)&d_clk};
   auto stream = at::cuda::getCurrentCUDAStream();
   C10_CUDA_CHECK(cudaLaunchCooperativeKernel((void*)megakernel_df, dim3(df_nblocks),
                                              dim3(256), args, (size_t)smem_bytes,

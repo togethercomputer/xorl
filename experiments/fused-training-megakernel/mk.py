@@ -57,8 +57,15 @@ def wgmma_ok(M, N, K, flags):
 
     The kernel supports all four storage majors (validated), but routing NN/TN through
     wgmma measured SLOWER in-model than the WMMA path (fixed costs dominate at these
-    tile counts) — so only the NT (Linear-forward) pattern routes here."""
-    return (flags & 2) and not (flags & 1) and not (flags & 32) and M % 128 == 0 and N % 64 == 0 and K % 64 == 0
+    tile counts) — so only the NT (Linear-forward) pattern routes here.
+    MK_WGMMA_NN=1 additionally routes plain NN (bwd dX pattern; bit10 Drow stays WMMA —
+    that epilogue is not implemented on the wgmma path) — the round-3 negative kept
+    re-runnable as the executor's fixed costs change."""
+    if flags & (1 | 32 | 1024):
+        return False
+    if not (flags & 2) and not int(os.environ.get("MK_WGMMA_NN", "0")):
+        return False
+    return M % 128 == 0 and N % 64 == 0 and K % 64 == 0
 
 
 def wgmma_split_k(M, N, K, target_tiles=512):
@@ -169,6 +176,21 @@ def _access_sets(op, args):
 
 REGION_ROWS = 128  # producer progress granularity for df2 region watermarks
 
+ROWOP_R = 8  # rows per batched-rowop tile (one warp per row; mirrors ops.cuh MK_ROW_R)
+
+# batched row ops: tile = ROWOP_R rows (all other row-tiled ops remain 1 row/tile)
+_ROW_TILE_R = {
+    OP_RMSNORM_FWD: ROWOP_R,
+    OP_RMSNORM_BWD: ROWOP_R,
+    OP_SWIGLU_FWD: ROWOP_R,
+    OP_SWIGLU_BWD: ROWOP_R,
+    OP_QKNORM_ROPE_BWD: ROWOP_R,
+}
+
+
+def rowop_tiles(S):
+    return (S + ROWOP_R - 1) // ROWOP_R
+
 # write positions whose output is row-linear in the instr's m-major tile order
 # (tile t covers rows [t*rows_per_tile, ...) — the requirement for region gating)
 _ROW_WRITE_POS = {
@@ -228,7 +250,9 @@ def _producer_row_info(op, ntiles, args, root, root_of):
         return None
     for pos in _ROW_WRITE_POS.get(op, ()):
         if root_of(args[pos]) == root:
-            return (ntiles, REGION_ROWS) if ntiles % REGION_ROWS == 0 else None
+            R = _ROW_TILE_R.get(op, 1)
+            rows = ntiles * R  # exact only when S % R == 0; else falls through to ungated
+            return (rows, REGION_ROWS // R) if rows % REGION_ROWS == 0 else None
     return None
 
 
@@ -253,8 +277,9 @@ def _consumer_gate_k(op, ntiles, args, pos, prod_rows):
         if S == prod_rows and S % REGION_ROWS == 0:
             return nq * (REGION_ROWS // 128)
         return None
-    if pos in _ROW_READ_POS.get(op, ()) and ntiles == prod_rows:
-        return REGION_ROWS
+    R = _ROW_TILE_R.get(op, 1)
+    if pos in _ROW_READ_POS.get(op, ()) and ntiles * R == prod_rows:
+        return REGION_ROWS // R
     return None
 
 
@@ -447,8 +472,17 @@ class Program:
         self._adj_off = torch.tensor(adj_off, dtype=torch.int32, device=device)
         self._adj = torch.tensor(adj if adj else [0], dtype=torch.int32, device=device)
         self._claim = torch.tensor(claim, dtype=torch.int32, device=device)
-        # state: pending[n] | cursor[n] | done[n] | ready[n] | ctrl[4]
-        self._state = torch.empty(4 * n + 4, dtype=torch.int32, device=device)
+        # criticality class for the df hot/cold ready rings (v3 P6): COLD (0) when
+        # nothing in the step depends on the instr (dW/sink gemms, embed_bwd) or it is
+        # a fill; HOT (1) otherwise. Idle blocks drain hot first, so chain consumers
+        # start within ~a claim batch instead of behind sticky off-path tile claims.
+        crit = [
+            0 if (adj_off[i + 1] == adj_off[i] or flat[i][0] == OP_FILL_F32) else 1
+            for i in range(n)
+        ]
+        self._crit = torch.tensor(crit, dtype=torch.int32, device=device)
+        # state: pending[n] | cursor[n] | done[n] | ready_hot[n] | ready_cold[n] | ctrl[8]
+        self._state = torch.empty(5 * n + 8, dtype=torch.int32, device=device)
         # ws executor state: cursor[n*pad] | done[n*pad] | pending[n*pad] | ready[n]
         # | ctrl[4*pad], pad = ints per entry. Allocated at pad=32 (one 128B line per
         # instr) so any runtime pad fits, but the DEFAULT is pad=1: the 128B stride
@@ -547,6 +581,8 @@ class Program:
                 self._adj_off,
                 self._adj,
                 self._claim,
+                self._crit,
+                int(os.environ.get("MK_COLD_CAP", "0")),  # 0 = uncapped
                 self._state,
                 self._buftab,
                 smem_bytes,

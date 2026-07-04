@@ -99,7 +99,7 @@ def rmsnorm_chain(n=256, S=128, H=64):
     eps = mk.f2i(1e-6)
     for i in range(n):
         cur, ir = p.buf(xs[i]), p.buf(rs[i])
-        p.instr(mk.OP_RMSNORM_FWD, S, [prev, iw, cur, ir, H, eps])
+        p.instr(mk.OP_RMSNORM_FWD, mk.rowop_tiles(S), [prev, iw, cur, ir, H, eps, S])
         prev = cur
     return p.finalize(), n
 
@@ -121,7 +121,7 @@ def layer_chain(n=128, S=128, H=64):
         cnt += 1
         z = p.buf(torch.empty(S, H, device="cuda", dtype=torch.bfloat16))
         ir = p.buf(torch.empty(S, device="cuda", dtype=torch.float32))
-        p.instr(mk.OP_RMSNORM_FWD, S, [y, iwn, z, ir, H, eps])
+        p.instr(mk.OP_RMSNORM_FWD, mk.rowop_tiles(S), [y, iwn, z, ir, H, eps, S])
         cnt += 1
         prev = z
     return p.finalize(), cnt

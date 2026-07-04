@@ -408,6 +408,51 @@ part). The residual is structural to the one-255-reg-switch design; fixes are
 executor-level (ABI-isolated dispatch or setmaxnreg partitioning). Net integration
 effect decisively positive despite it. Full log: results/mkv3-p5-attnprobe.md.
 
+## v3 Phase 6 round 1: rowop batching + criticality rings — the post-attention levers
+
+Plan + historical-megakernel survey (Laine 2013, Diamos persistent RNNs, Whippletree,
+stream-K, Hazy no-bubbles, MPK): results/mkv3-p6-plan.md. P6.0 re-profile OVERTURNED
+the P5 "top remaining items" list: with attention fixed, ROW OPS were the #1 on-path
+span at both configs (RMSNORM_BWD 132/842us nano/small — ~50us per instr for a ~3MB-
+traffic op), NN bwd-dX gemms #2 (~426/1515us, 10 TF, 16-tile latency-bound).
+
+**Shipped (parity-green everywhere, both test suites):**
+1. **Batched row ops** (`MK_ROW_R=8` rows/tile, one warp per row): warp-shuffle
+   reductions (block_sum + its 3 block barriers deleted), uint4 8xbf16 vectorized IO,
+   rmsnorm_bwd/qknorm_bwd stage dw in smem — ONE global atomic per element per 8 rows
+   (the per-row atomics serialized on the tiny [H]/[D] grad buffers were the span).
+   mk.py `_ROW_TILE_R`/`rowop_tiles` keep df2 gates R-aware; swiglu_bwd gained dy_f32.
+   Scalar fallback for H%8!=0. nano -117us, small -722us — biggest single round since
+   P5. Rowop spans: RMSNORM_FWD 3.3x, SWIGLU_BWD 2.1x, RMSNORM_BWD 1.35x (residual is
+   bandwidth contention with co-running cold work, NOT op quality — see 3).
+2. **Hot/cold criticality ready rings in df** (the Whippletree/MPK lesson): COLD =
+   sinks (dW gemms, embed_bwd) + fills, HOT = everything else; idle blocks drain hot
+   first; cold-sticky blocks yield when the hot tail moves (invisible-slot guard for
+   the push race). Host computes crit[] in finalize (adj_off + FILL check). WAITS
+   COLLAPSED: EMBED_FWD 91->0, RMSNORM_BWD worst-hop 140->4.4us wait; step only
+   -7/-38us direct (waits became contended spans) BUT it flipped experiment 3:
+3. **Split-K fp32 dX routing, tile-gated** (`model.dx_split_k`, gate: < 32 MN tiles):
+   the 16-tile dXN gemms route via split-K atomics into per-layer fp32 workspaces,
+   consumers read them dy_f32 (no CVT). Under the OLD single ring: +127/+467
+   (claim contention ate it). On hot/cold rings: nano -27us, small ~0 (its gemms
+   have >= 64 tiles — gated off). Order-of-experiments mattered.
+
+**Measured negatives (documented, keep off):**
+- cold_cap (bound blocks on cold work, MK_COLD_CAP): +/-20us wash both configs —
+  bandwidth contention trades ~1:1 against tail serialization at these sizes.
+- wgmma NN routing re-run (MK_WGMMA_NN=1, bit10 excluded): STILL +58/+69 — the
+  round-3 verdict survives the new fixed-cost regime.
+- DQ/DKV "co-scheduling overhead" (76 vs 31us standalone) diagnosed BENIGN: the pair
+  runs concurrently in the same window (concurrent max ~= sequential sum) — stop
+  chasing it.
+- ws mode now LOSES to df at both configs (1686/6616 vs 1627/6356) — the P6 wins are
+  df-only; a ws port of the hot/cold rings is the obvious (deferred) follow-up.
+
+**Scoreboard: nano 1622 / small 6356 (df)** vs hardened 712/2735 — gap 2.28x/2.32x
+(from 2.5x/2.6x after P5; v3 started at 2.65x/3.44x). STACK note: df 528 -> 608 after
+the rowop integration (same dispatch-call-site spill class as P5; the executor-level
+fix is still open, now ~the last uniform tax).
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.3x faster. The measured structural gap, in order:

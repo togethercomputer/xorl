@@ -119,6 +119,17 @@ class MKQwen3:
         for l in range(c.L):
             W[f"dQKV_f32.{l}"] = torch.empty(c.S, QD, device=dev, dtype=f32)
         W["dXN_f32"] = torch.empty(c.S, c.H, device=dev, dtype=f32)
+        # per-layer fp32 workspaces for the parallelism-starved bwd dX gemms
+        # (dx_split_k routing; see gemm_dx below); allocated only for the shapes the
+        # tile gate will actually split
+        self.dx_split_k = True
+        if self.dx_split_k:
+            for l in range(c.L):
+                if mk.gemm_tiles(c.S, c.H) < 32:
+                    W[f"dXN2_f32.{l}"] = torch.empty(c.S, c.H, device=dev, dtype=f32)
+                    W[f"dXN1_f32.{l}"] = torch.empty(c.S, c.H, device=dev, dtype=f32)
+                if mk.gemm_tiles(c.S, c.I) < 32:
+                    W[f"dHs_f32.{l}"] = torch.empty(c.S, c.I, device=dev, dtype=f32)
         # per-row (max, sumexp) partials from the lm_head gemm epilogue (bit11)
         if c.V % 64 == 0:
             W["lse_parts"] = torch.empty(c.S, c.V // 64, 2, device=dev, dtype=f32)
@@ -162,6 +173,23 @@ class MKQwen3:
             n = t.numel()
             p.instr(mk.OP_FILL_F32, mk.chunk_tiles(n), [B(t), n, mk.f2i(0.0)])
 
+        def gemm_dx(a, b, out_bf, out_f32, M, N, K):
+            """On-path NN dX gemm; parallelism-starved shapes (< 32 MN tiles) route via
+            split-K fp32 atomics into a pre-zeroed workspace and the rowop consumer
+            reads it directly (dy_f32, no CVT hop).
+
+            History (v3 P6): under the single FIFO ready ring this was NEGATIVE at any
+            shape/target (claim contention turned the span saving into consumer wait,
+            +120/+460us step). The hot/cold criticality rings flipped it: gated re-run
+            measured nano -26us (its dXN gemms are 16-tile), small +82us where the
+            plain gemms already have >= 64 tiles — hence the tile gate."""
+            if self.dx_split_k and mk.gemm_tiles(M, N) < 32:
+                sk = mk.gemm_split_k(M, N, K, target_tiles=128)
+                p.instr(mk.OP_GEMM, mk.gemm_tiles(M, N) * sk, [a, b, out_f32(), M, N, K, 8 | 32, 0, sk])
+                return out_f32(), 1
+            gemm(a, b, out_bf, M, N, K, 0)  # via the helper: participates in routing flips
+            return out_bf, 0
+
         X = [B(A["X"][l]) for l in range(c.L + 1)]
         n_qt = (c.S + 31) // 32
 
@@ -173,6 +201,9 @@ class MKQwen3:
         for lz in range(c.L):
             fill_zero(W[f"dQKV_f32.{lz}"])
             fill_zero(W[f"drow.{lz}"])
+            for nm in (f"dXN2_f32.{lz}", f"dXN1_f32.{lz}", f"dHs_f32.{lz}"):
+                if nm in W:
+                    fill_zero(W[nm])
         # dX is bf16; zero via fp32 fill over half the elements (bf16 pair = one f32 zero)
         p.instr(mk.OP_FILL_F32, mk.chunk_tiles(W["dX"].numel() // 2), [B(W["dX"]), W["dX"].numel() // 2, mk.f2i(0.0)])
         p.wave()
@@ -181,7 +212,7 @@ class MKQwen3:
         for l in range(c.L):
             pr = lambda n: B(self.params[f"{n}.{l}"])  # noqa: E731
             a = lambda n: B(A[f"{n}.{l}"])  # noqa: E731
-            p.instr(mk.OP_RMSNORM_FWD, c.S, [X[l], pr("w1"), a("xn1"), a("rstd1"), c.H, eps])
+            p.instr(mk.OP_RMSNORM_FWD, mk.rowop_tiles(c.S), [X[l], pr("w1"), a("xn1"), a("rstd1"), c.H, eps, c.S])
             p.wave()
             if c.D == 64 and mk.wgmma_ok(c.S, QD, c.H, 2):
                 # qk-norm + rope fused into the qkv gemm epilogue (one head per tile)
@@ -260,7 +291,7 @@ class MKQwen3:
                 p.wave()
             gemm(a("oatt"), pr("wo"), a("x2"), c.S, c.H, c.nq * c.D, 2 | 16, X[l])
             p.wave()
-            p.instr(mk.OP_RMSNORM_FWD, c.S, [a("x2"), pr("w2"), a("xn2"), a("rstd2"), c.H, eps])
+            p.instr(mk.OP_RMSNORM_FWD, mk.rowop_tiles(c.S), [a("x2"), pr("w2"), a("xn2"), a("rstd2"), c.H, eps, c.S])
             p.wave()
             # Paired-column swiglu fusion (gate/up in one tile, two k-loops) was TRIED
             # AND REMOVED: halving the gu tiles doubles per-tile serial span (nano +88us,
@@ -268,13 +299,13 @@ class MKQwen3:
             # 255 regs -> 1 block/SM. Revisit only on top of tile-granular deps.
             gemm(a("xn2"), pr("wgu"), a("gu"), c.S, 2 * c.I, c.H, 2)
             p.wave()
-            p.instr(mk.OP_SWIGLU_FWD, c.S, [a("gu"), a("hs"), c.S, c.I])
+            p.instr(mk.OP_SWIGLU_FWD, mk.rowop_tiles(c.S), [a("gu"), a("hs"), c.S, c.I])
             p.wave()
             gemm(a("hs"), pr("wd"), X[l + 1], c.S, c.H, c.I, 2 | 16, a("x2"))
             p.wave()
 
         # ---- head + loss ----
-        p.instr(mk.OP_RMSNORM_FWD, c.S, [X[c.L], B(self.params["wf"]), B(A["xnf"]), B(A["rstdf"]), c.H, eps])
+        p.instr(mk.OP_RMSNORM_FWD, mk.rowop_tiles(c.S), [X[c.L], B(self.params["wf"]), B(A["xnf"]), B(A["rstdf"]), c.H, eps, c.S])
         p.wave()
         # bit11 (lse partials in the lm_head epilogue): A/B measured NEUTRAL within
         # noise (on: 1865/9275, off: 1861/9317). Kept ON — cheapens the CE hop ~5x
@@ -330,8 +361,8 @@ class MKQwen3:
         # final-norm bwd reads the split-K fp32 workspace directly (dy_f32; no CVT hop)
         p.instr(
             mk.OP_RMSNORM_BWD,
-            c.S,
-            [X[c.L], B(self.params["wf"]), B(W["dXN_f32"]), B(W["dX"]), B(self.grads["wf"]), B(A["rstdf"]), c.H, 1],
+            mk.rowop_tiles(c.S),
+            [X[c.L], B(self.params["wf"]), B(W["dXN_f32"]), B(W["dX"]), B(self.grads["wf"]), B(A["rstdf"]), c.H, 1, c.S],
         )
         p.wave()
 
@@ -340,15 +371,15 @@ class MKQwen3:
             gr = lambda n: B(self.grads[f"{n}.{l}"])  # noqa: E731
             a = lambda n: B(A[f"{n}.{l}"])  # noqa: E731
             # down proj: dHs = dX @ Wd ; dWd += dX^T Hs
-            gemm(B(W["dX"]), pr("wd"), B(W["dHs"]), c.S, c.I, c.H, 0)
+            dhs, dhs_f32 = gemm_dx(B(W["dX"]), pr("wd"), B(W["dHs"]), lambda: B(W[f"dHs_f32.{l}"]), c.S, c.I, c.H)
             gemm(B(W["dX"]), a("hs"), gr("wd"), c.H, c.I, c.S, 1 | 4 | 8)
             p.wave()
-            p.instr(mk.OP_SWIGLU_BWD, c.S, [a("gu"), B(W["dHs"]), B(W["dGU"]), c.S, c.I])
+            p.instr(mk.OP_SWIGLU_BWD, mk.rowop_tiles(c.S), [a("gu"), dhs, B(W["dGU"]), c.S, c.I, dhs_f32])
             p.wave()
-            gemm(B(W["dGU"]), pr("wgu"), B(W["dXN"]), c.S, c.H, 2 * c.I, 0)
+            dxn, dxn_f32 = gemm_dx(B(W["dGU"]), pr("wgu"), B(W["dXN"]), lambda: B(W[f"dXN2_f32.{l}"]), c.S, c.H, 2 * c.I)
             gemm(B(W["dGU"]), a("xn2"), gr("wgu"), 2 * c.I, c.H, c.S, 1 | 4 | 8)
             p.wave()
-            p.instr(mk.OP_RMSNORM_BWD, c.S, [a("x2"), pr("w2"), B(W["dXN"]), B(W["dX"]), gr("w2"), a("rstd2"), c.H])
+            p.instr(mk.OP_RMSNORM_BWD, mk.rowop_tiles(c.S), [a("x2"), pr("w2"), dxn, B(W["dX"]), gr("w2"), a("rstd2"), c.H, dxn_f32, c.S])
             p.wave()
             # o proj: dOatt = dX @ Wo with the Drow reduction fused into the epilogue
             # (flags bit10; replaces OP_ATTN_DPRE — one chain hop less per layer);
@@ -407,7 +438,7 @@ class MKQwen3:
             # (dy_f32) — the former per-layer CVT chain hop is gone (v3 P1).
             p.instr(
                 mk.OP_QKNORM_ROPE_BWD,
-                c.S,
+                mk.rowop_tiles(c.S),
                 [
                     a("qkvraw"),
                     B(W[f"dQKV_f32.{l}"]),
@@ -424,13 +455,14 @@ class MKQwen3:
                     c.nkv,
                     c.D,
                     1,  # dy_f32
+                    c.S,
                 ],
             )
             p.wave()
-            gemm(B(W["dQKVraw"]), pr("wqkv"), B(W["dXN"]), c.S, c.H, QD, 0)
+            dxn1, dxn1_f32 = gemm_dx(B(W["dQKVraw"]), pr("wqkv"), B(W["dXN"]), lambda: B(W[f"dXN1_f32.{l}"]), c.S, c.H, QD)
             gemm(B(W["dQKVraw"]), a("xn1"), gr("wqkv"), QD, c.H, c.S, 1 | 4 | 8)
             p.wave()
-            p.instr(mk.OP_RMSNORM_BWD, c.S, [X[l], pr("w1"), B(W["dXN"]), B(W["dX"]), gr("w1"), a("rstd1"), c.H])
+            p.instr(mk.OP_RMSNORM_BWD, mk.rowop_tiles(c.S), [X[l], pr("w1"), dxn1, B(W["dX"]), gr("w1"), a("rstd1"), c.H, dxn1_f32, c.S])
             p.wave()
 
         p.instr(mk.OP_EMBED_BWD, c.S, [B(self.tokens), B(W["dX"]), B(self.grads["emb"]), c.H])
