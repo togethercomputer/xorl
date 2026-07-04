@@ -1068,6 +1068,17 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   (`mkv3-p4b-smem-default-rev-*-20260704T220819Z-mkonly.log`) confirmed the
   short-shape direction: variant/control nano 1192.1/1196.6us, small
   4060.4/4073.0us, S4096 neutral 3922.3/3920.4us.
+- Mid-S cold_cap retune: keep cap16 for S<1024, move 1024<=S<2048 to cap33, and keep
+  S>=2048 uncapped. Current-head broad sweep
+  (`mkv3-p4b-coldcap-current-sweep-20260704T2227COLDCAP.log`) kept nano at cap16 and
+  S4096 at cap0, while small favored cap24/33. Alternating repeat
+  (`mkv3-p4b-coldcap-current-alt-20260704T2230COLDCAPALT.log`) confirmed small cap33
+  over cap16 by -9.3us median with 15/20 wins; nano cap24 was negative by +7.0us.
+  The final-bench S1024 guard was weakly positive for cap33
+  (`mkv3-p4b-coldcap-s1024-alt-20260704T2231COLDCAPS1024.log`: -2.0us median,
+  16/24 wins). Default-path side-worktree validation passed full model parity
+  (`mkv3-p4b-coldcap-midS-testmodel-20260704T2232COLDCAPMIDS.log`) and selected
+  caps 16/33/33/0 for nano/small/S1024/S4096.
 
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
