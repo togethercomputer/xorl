@@ -751,6 +751,18 @@ grads ~3%):
 | S=8192 (nano width)   | ~10440| **3120** | **3.35x** | "1.68x faster" |
 (measured twice each; the megakernel column is unchanged and stands.)
 
+Full honest gauntlet vs the fixed flash baseline (median-of-50, fresh process
+per config, util-guarded):
+
+| config | megakernel | flash-baseline | gap |
+|---|---|---|---|
+| nano  (H256 L4 S512)  | 1244 | 631  | 1.97x |
+| small (H512 L8 S1024) | 4413 | 1750 | 2.52x |
+| deep-narrow (L12)     | 3146 | 1569 | 2.01x |
+| S=128                 | 919  | 493  | 1.86x |
+| S=256                 | 1056 | 550  | 1.92x |
+| S=1024 (nano width)   | 1636 | 777  | 2.11x |
+
 Consequences, honestly:
 - The long-S crossover is RETRACTED — an artifact of the baseline's quadratic
   math-attention. Against real flash the megakernel falls FURTHER behind as S
