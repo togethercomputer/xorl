@@ -174,6 +174,18 @@ class MKQwen3:
             n = t.numel()
             p.instr(mk.OP_FILL_F32, mk.chunk_tiles(n), [B(t), n, mk.f2i(0.0)])
 
+        # Split RMSNorm backward's on-path dx from its cold dw atomic drain. This adds
+        # one sink instruction per norm but lets dX consumers run before dw finishes.
+        split_rms_bwd = bool(int(os.environ.get("MK_RMS_BWD_SPLIT_DW", "1")))
+
+        def rmsnorm_bwd(args):
+            ntiles = mk.rowop_tiles(args[-1], mk.ROWOP_R2)
+            if split_rms_bwd:
+                p.instr(mk.OP_RMSNORM_BWD_DX, ntiles, args)
+                p.instr(mk.OP_RMSNORM_BWD_DW, ntiles, args)
+            else:
+                p.instr(mk.OP_RMSNORM_BWD, ntiles, args)
+
         def gemm_dx(a, b, out_bf, out_f32, M, N, K):
             """On-path NN dX gemm; parallelism-starved shapes (< 32 MN tiles) route via
             split-K fp32 atomics into a pre-zeroed workspace and the rowop consumer
@@ -364,11 +376,7 @@ class MKQwen3:
         gemm(B(A["logits"]), B(A["xnf"]), B(self.grads["wlm"]), c.V, c.H, c.S, 1 | 4 | 8)
         p.wave()
         # final-norm bwd reads the split-K fp32 workspace directly (dy_f32; no CVT hop)
-        p.instr(
-            mk.OP_RMSNORM_BWD,
-            mk.rowop_tiles(c.S, mk.ROWOP_R2),
-            [X[c.L], B(self.params["wf"]), B(W["dXN_f32"]), B(W["dX"]), B(self.grads["wf"]), B(A["rstdf"]), c.H, 1, c.S],
-        )
+        rmsnorm_bwd([X[c.L], B(self.params["wf"]), B(W["dXN_f32"]), B(W["dX"]), B(self.grads["wf"]), B(A["rstdf"]), c.H, 1, c.S])
         p.wave()
 
         for l in reversed(range(c.L)):
@@ -384,7 +392,7 @@ class MKQwen3:
             dxn, dxn_f32 = gemm_dx(B(W["dGU"]), pr("wgu"), B(W["dXN"]), lambda: B(W[f"dXN2_f32.{l}"]), c.S, c.H, 2 * c.I)
             gemm(B(W["dGU"]), a("xn2"), gr("wgu"), 2 * c.I, c.H, c.S, 1 | 4 | 8)
             p.wave()
-            p.instr(mk.OP_RMSNORM_BWD, mk.rowop_tiles(c.S, mk.ROWOP_R2), [a("x2"), pr("w2"), dxn, B(W["dX"]), gr("w2"), a("rstd2"), c.H, dxn_f32, c.S])
+            rmsnorm_bwd([a("x2"), pr("w2"), dxn, B(W["dX"]), gr("w2"), a("rstd2"), c.H, dxn_f32, c.S])
             p.wave()
             # o proj: dOatt = dX @ Wo with the Drow reduction fused into the epilogue
             # (flags bit10; replaces OP_ATTN_DPRE — one chain hop less per layer);
@@ -470,7 +478,7 @@ class MKQwen3:
             dxn1, dxn1_f32 = gemm_dx(B(W["dQKVraw"]), pr("wqkv"), B(W["dXN"]), lambda: B(W[f"dXN1_f32.{l}"]), c.S, c.H, QD)
             gemm(B(W["dQKVraw"]), a("xn1"), gr("wqkv"), QD, c.H, c.S, 1 | 4 | 8)
             p.wave()
-            p.instr(mk.OP_RMSNORM_BWD, mk.rowop_tiles(c.S, mk.ROWOP_R2), [X[l], pr("w1"), dxn1, B(W["dX"]), gr("w1"), a("rstd1"), c.H, dxn1_f32, c.S])
+            rmsnorm_bwd([X[l], pr("w1"), dxn1, B(W["dX"]), gr("w1"), a("rstd1"), c.H, dxn1_f32, c.S])
             p.wave()
 
         p.instr(mk.OP_EMBED_BWD, c.S, [B(self.tokens), B(W["dX"]), B(self.grads["emb"]), c.H])

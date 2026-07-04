@@ -861,6 +861,135 @@ __device__ void op_rmsnorm_bwd(const Instr& I, int tile, void** bufs, char* smem
   }
 }
 
+// Split variant: dx-only half. This keeps the residual-gradient chain from waiting on
+// the weight-gradient atomic drain; the dw-only half is emitted as a cold sink.
+__device__ void op_rmsnorm_bwd_dx(const Instr& I, int tile, void** bufs, char* smem_raw) {
+  const int H = I.args[6], S = I.args[8];
+  const bool dy_f32 = I.args[7] != 0;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int rowA = tile * MK_ROW_R2 + warp;
+  if (rowA >= S) return;  // barrier-free op: early exit is safe
+  const bool hasB = rowA + 8 < S;
+  const int rowB = hasB ? rowA + 8 : rowA;
+  const bf16* xb = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
+  const bf16* xA = xb + (int64_t)rowA * H;
+  const bf16* xB = xb + (int64_t)rowB * H;
+  const bf16* w = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
+  const bf16* dybA = reinterpret_cast<const bf16*>(bufs[I.args[2]]) + (int64_t)rowA * H;
+  const float* dyfA = reinterpret_cast<const float*>(bufs[I.args[2]]) + (int64_t)rowA * H;
+  const bf16* dybB = reinterpret_cast<const bf16*>(bufs[I.args[2]]) + (int64_t)rowB * H;
+  const float* dyfB = reinterpret_cast<const float*>(bufs[I.args[2]]) + (int64_t)rowB * H;
+  bf16* dxb = reinterpret_cast<bf16*>(bufs[I.args[3]]);
+  bf16* dxA = dxb + (int64_t)rowA * H;
+  bf16* dxB = dxb + (int64_t)rowB * H;
+  const float rA = reinterpret_cast<const float*>(bufs[I.args[5]])[rowA];
+  const float rB = reinterpret_cast<const float*>(bufs[I.args[5]])[rowB];
+  if ((H & 7) == 0) {
+    float dotA = 0.0f, dotB = 0.0f;
+    for (int i = lane * 8; i < H; i += 32 * 8) {
+      float xa[8], xv[8], da[8], db[8], wv[8];
+      ld8bf(xA + i, xa);
+      ld8bf(xB + i, xv);
+      ld8dy(dybA, dyfA, dy_f32, i, da);
+      ld8dy(dybB, dyfB, dy_f32, i, db);
+      ld8bf(w + i, wv);
+#pragma unroll
+      for (int j = 0; j < 8; j++) {
+        dotA += da[j] * wv[j] * xa[j];
+        dotB += db[j] * wv[j] * xv[j];
+      }
+    }
+    const float mA = warp_sum(dotA) * rA / H;
+    const float mB = warp_sum(dotB) * rB / H;
+    for (int i = lane * 8; i < H; i += 32 * 8) {
+      float xa[8], xv[8], da[8], db[8], wv[8], dxa[8], dxv[8];
+      ld8bf(xA + i, xa);
+      ld8bf(xB + i, xv);
+      ld8dy(dybA, dyfA, dy_f32, i, da);
+      ld8dy(dybB, dyfB, dy_f32, i, db);
+      ld8bf(w + i, wv);
+      ld8bf(dxA + i, dxa);
+      ld8bf(dxB + i, dxv);
+#pragma unroll
+      for (int j = 0; j < 8; j++) {
+        const float xhA = xa[j] * rA, xhB = xv[j] * rB;
+        dxa[j] += rA * (da[j] * wv[j] - xhA * mA);
+        dxv[j] += rB * (db[j] * wv[j] - xhB * mB);
+      }
+      st8bf(dxA + i, dxa);
+      if (hasB) st8bf(dxB + i, dxv);
+    }
+  } else {
+    auto dyA = [&](int i) { return dy_f32 ? dyfA[i] : bf2f(dybA[i]); };
+    auto dyB = [&](int i) { return dy_f32 ? dyfB[i] : bf2f(dybB[i]); };
+    float dotA = 0.0f, dotB = 0.0f;
+    for (int i = lane; i < H; i += 32) {
+      dotA += dyA(i) * bf2f(w[i]) * bf2f(xA[i]);
+      dotB += dyB(i) * bf2f(w[i]) * bf2f(xB[i]);
+    }
+    const float mA = warp_sum(dotA) * rA / H;
+    const float mB = warp_sum(dotB) * rB / H;
+    for (int i = lane; i < H; i += 32) {
+      const float xhA = bf2f(xA[i]) * rA, xhB = bf2f(xB[i]) * rB;
+      dxA[i] = f2bf(bf2f(dxA[i]) + rA * (dyA(i) * bf2f(w[i]) - xhA * mA));
+      if (hasB) dxB[i] = f2bf(bf2f(dxB[i]) + rB * (dyB(i) * bf2f(w[i]) - xhB * mB));
+    }
+  }
+}
+
+// Split variant: dw-only half. Same reduction/atomic policy as the combined op, but
+// no dx math and no dependency on the residual-gradient buffer.
+__device__ void op_rmsnorm_bwd_dw(const Instr& I, int tile, void** bufs, char* smem_raw) {
+  const int H = I.args[6], S = I.args[8];
+  const bool dy_f32 = I.args[7] != 0;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int rowA = tile * MK_ROW_R2 + warp;
+  float* dw_rows = reinterpret_cast<float*>(smem_raw);
+  float* dw_row = dw_rows + (int64_t)warp * H;
+  if (rowA < S) {
+    const bool hasB = rowA + 8 < S;
+    const int rowB = hasB ? rowA + 8 : rowA;
+    const bf16* xb = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
+    const bf16* xA = xb + (int64_t)rowA * H;
+    const bf16* xB = xb + (int64_t)rowB * H;
+    const bf16* dybA = reinterpret_cast<const bf16*>(bufs[I.args[2]]) + (int64_t)rowA * H;
+    const float* dyfA = reinterpret_cast<const float*>(bufs[I.args[2]]) + (int64_t)rowA * H;
+    const bf16* dybB = reinterpret_cast<const bf16*>(bufs[I.args[2]]) + (int64_t)rowB * H;
+    const float* dyfB = reinterpret_cast<const float*>(bufs[I.args[2]]) + (int64_t)rowB * H;
+    const float rA = reinterpret_cast<const float*>(bufs[I.args[5]])[rowA];
+    const float rB = reinterpret_cast<const float*>(bufs[I.args[5]])[rowB];
+    const float foldB = hasB ? 1.0f : 0.0f;
+    if ((H & 7) == 0) {
+      for (int i = lane * 8; i < H; i += 32 * 8) {
+        float xa[8], xv[8], da[8], db[8];
+        ld8bf(xA + i, xa);
+        ld8bf(xB + i, xv);
+        ld8dy(dybA, dyfA, dy_f32, i, da);
+        ld8dy(dybB, dyfB, dy_f32, i, db);
+#pragma unroll
+        for (int j = 0; j < 8; j++) dw_row[i + j] = da[j] * (xa[j] * rA) + foldB * (db[j] * (xv[j] * rB));
+      }
+    } else {
+      auto dyA = [&](int i) { return dy_f32 ? dyfA[i] : bf2f(dybA[i]); };
+      auto dyB = [&](int i) { return dy_f32 ? dyfB[i] : bf2f(dybB[i]); };
+      for (int i = lane; i < H; i += 32) {
+        const float xhA = bf2f(xA[i]) * rA, xhB = bf2f(xB[i]) * rB;
+        dw_row[i] = dyA(i) * xhA + foldB * (dyB(i) * xhB);
+      }
+    }
+  } else {
+    for (int i = lane; i < H; i += 32) dw_row[i] = 0.0f;
+  }
+  consumer_sync();
+  float* dw = reinterpret_cast<float*>(bufs[I.args[4]]);
+  for (int i = threadIdx.x; i < H; i += MK_CONSUMERS) {
+    float s = 0.0f;
+#pragma unroll
+    for (int r = 0; r < 8; ++r) s += dw_rows[(int64_t)r * H + i];
+    atomicAdd(&dw[i], s);
+  }
+}
+
 // ---- SwiGLU ----------------------------------------------------------------------------
 // fwd: h[r,i] = silu(gate[r,i]) * up[r,i], gate/up = halves of gu[r, 2I] (gate first).
 // args: {gu, h, S, Iw}; tile = MK_ROW_R-row group, one warp per row.

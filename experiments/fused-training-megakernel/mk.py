@@ -39,6 +39,8 @@ OP_ATTN_COMBINE = 20
 OP_ATTN_FWD_WG = 21  # wgmma attention (D=64, S%128==0): 128-row tiles, qt-outer
 OP_ATTN_DKV_WG = 22  # args as OP_ATTN_DKV + trailing q-chunk count C
 OP_ATTN_DQ_WG = 23  # args as OP_ATTN_DQ (incl. kv-chunk count C)
+OP_RMSNORM_BWD_DX = 24  # dx-only half of env-gated split RMSNorm backward
+OP_RMSNORM_BWD_DW = 25  # dw-only cold sink half of env-gated split RMSNorm backward
 
 GEMM_BM, GEMM_BN = 64, 128  # keep in sync with ops.cuh
 FILL_CHUNK = 16384  # elements per fill/cvt work item (MK_CHUNK in ops.cuh)
@@ -160,6 +162,10 @@ def _access_sets(op, args):
         return [0, 1], [2, 3]
     if op == OP_RMSNORM_BWD:
         return [0, 1, 2, 5], [3, 4]
+    if op == OP_RMSNORM_BWD_DX:
+        return [0, 1, 2, 5], [3]
+    if op == OP_RMSNORM_BWD_DW:
+        return [0, 2, 5], [4]
     if op == OP_SWIGLU_FWD:
         return [0], [1]
     if op == OP_SWIGLU_BWD:
@@ -206,6 +212,8 @@ ROWOP_R2 = 16  # rmsnorm rows per tile, 2 rows/warp interleaved (ops.cuh MK_ROW_
 _ROW_TILE_R = {
     OP_RMSNORM_FWD: ROWOP_R2,
     OP_RMSNORM_BWD: ROWOP_R2,
+    OP_RMSNORM_BWD_DX: ROWOP_R2,
+    OP_RMSNORM_BWD_DW: ROWOP_R2,
     OP_SWIGLU_FWD: ROWOP_R,
     OP_SWIGLU_BWD: ROWOP_R,
     OP_QKNORM_ROPE_BWD: ROWOP_R,
@@ -220,6 +228,7 @@ def rowop_tiles(S, R=ROWOP_R):
 _ROW_WRITE_POS = {
     OP_RMSNORM_FWD: (2, 3),
     OP_RMSNORM_BWD: (3,),  # dx only; dw is a cross-row atomic scatter
+    OP_RMSNORM_BWD_DX: (3,),
     OP_SWIGLU_FWD: (1,),
     OP_SWIGLU_BWD: (2,),
     OP_QKNORM_ROPE_FWD: (1, 4, 5),
@@ -233,6 +242,8 @@ _ROW_WRITE_POS = {
 _ROW_READ_POS = {
     OP_RMSNORM_FWD: (0,),
     OP_RMSNORM_BWD: (0, 2, 5),
+    OP_RMSNORM_BWD_DX: (0, 2, 5),
+    OP_RMSNORM_BWD_DW: (0, 2, 5),
     OP_SWIGLU_FWD: (0,),
     OP_SWIGLU_BWD: (0, 1),
     OP_QKNORM_ROPE_FWD: (0,),
@@ -499,8 +510,8 @@ class Program:
         # lose the tail balance (the Stream-K physics, again). Default 1 = no-op;
         # MK_ROWOP_CLAIM re-runs the experiment.
         rc = int(os.environ.get("MK_ROWOP_CLAIM", "1"))
-        _rowops = (OP_RMSNORM_FWD, OP_RMSNORM_BWD, OP_SWIGLU_FWD, OP_SWIGLU_BWD,
-                   OP_QKNORM_ROPE_FWD, OP_QKNORM_ROPE_BWD)
+        _rowops = (OP_RMSNORM_FWD, OP_RMSNORM_BWD, OP_RMSNORM_BWD_DX, OP_RMSNORM_BWD_DW,
+                   OP_SWIGLU_FWD, OP_SWIGLU_BWD, OP_QKNORM_ROPE_FWD, OP_QKNORM_ROPE_BWD)
         claim = [max(c, rc) if op in _rowops else c
                  for c, (op, ntiles, _) in zip(claim, flat)]
         self.n_instr = n

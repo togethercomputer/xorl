@@ -925,6 +925,19 @@ not promote: control nano/small 1244.2us / 4344.0us, variant 1241.2us / 4370.6us
 (`mkv3-p4b-rmsbwd-r4-control-mkonly.log`,
 `mkv3-p4b-rmsbwd-r4-variant-fixedtiles-mkonly.log`). Keep the two-row default.
 
+Post-DQ-reg RMSNorm-bwd dx/dw split: `RMSNORM_BWD` now emits default-on split ops
+(`MK_RMS_BWD_SPLIT_DW=0` restores the old combined instruction). The dx-only op remains
+on the residual-gradient chain; the dw-only op is a cold sink, so dX consumers no longer
+wait for the weight-gradient atomic drain. Correctness is green
+(`mkv3-p4b-rmsbwd-splitdw-testmodel-20260704T212233Z.log`). Same-source A/B with the
+split env toggled promoted the change twice. GPU2 control/split medians were nano
+1266.8/1260.7us, small 4507.1/4498.3us, S4096 4403.9/4403.1us
+(`mkv3-p4b-rmsbwd-splitdw-mkonly-20260704T212708Z.log`). Variant-first GPU3
+confirmation remained positive: nano 1274.7/1269.9us, small 4510.9/4503.7us, S4096
+4406.5/4397.7us (`mkv3-p4b-rmsbwd-splitdw-confirm-20260704T213139Z.log`). This is a
+small structural win, not a local RMS kernel-quality win: it adds one cold instruction per
+norm but removes the dw drain from the critical dependency.
+
 Post-headtarget Drow-WGMMA route recheck: the fused `dOatt = dX @ Wo` + Drow
 epilogue path still builds as WMMA on current `model.py`, despite the WGMMA epilogue
 support. A narrow route branch was correctness-clean (`mkv3-p4b-drow-wg-route-testmodel.log`)
