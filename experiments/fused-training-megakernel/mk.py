@@ -492,6 +492,15 @@ class Program:
         # (-27/-237us vs 264). MK_CLAIM overrides for sweeps.
         cq = int(os.environ.get("MK_CLAIM", "132"))
         claim = [max(1, min(8, (ntiles + cq - 1) // cq)) for _, ntiles, _ in flat]
+        # rowop claim floor: measured NEGATIVE at small (floor 2: +275us, floor 4:
+        # +838us on idle GPU 0) — bigger rowop claims serialize rows per block and
+        # lose the tail balance (the Stream-K physics, again). Default 1 = no-op;
+        # MK_ROWOP_CLAIM re-runs the experiment.
+        rc = int(os.environ.get("MK_ROWOP_CLAIM", "1"))
+        _rowops = (OP_RMSNORM_FWD, OP_RMSNORM_BWD, OP_SWIGLU_FWD, OP_SWIGLU_BWD,
+                   OP_QKNORM_ROPE_FWD, OP_QKNORM_ROPE_BWD)
+        claim = [max(c, rc) if op in _rowops else c
+                 for c, (op, ntiles, _) in zip(claim, flat)]
         self.n_instr = n
         self._dep_cnt = torch.tensor(dep_cnt, dtype=torch.int32, device=device)
         self._adj_off = torch.tensor(adj_off, dtype=torch.int32, device=device)
