@@ -644,8 +644,11 @@ P4b current-base head dX retune: after the committed ws/checkpoint verdicts, the
 `2a5bc25` base. `MK_HEAD_DX_TARGET_TILES=256` beat the old 512 target in repeated
 direct timings: nano 512=1246.6/1235.4us vs 256=1225.3/1222.8us; small
 512=4392.9/4390.8us vs 256=4362.5/4363.5us
-(`results/mkv3-p4b-wsbase-headtarget-256-ab.log`). The default is now 256; the env knob
-stays for reruns.
+(`results/mkv3-p4b-wsbase-headtarget-256-ab.log`). After merging CE_BWD vectorization
+(`91b7f74`), the same A/B still favors 256: nano 512=1250.7/1227.9us vs
+256=1221.6/1217.8us; small 512=4374.3/4367.8us vs 256=4335.6/4336.2us
+(`results/mkv3-p4b-headtarget256-after-cebwd-ab.log`). The default is now 256; the env
+knob stays for reruns.
 
 ## Honest assessment + v2 roadmap
 
