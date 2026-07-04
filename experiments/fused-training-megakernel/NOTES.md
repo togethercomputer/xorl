@@ -833,6 +833,16 @@ not promote: control nano/small 1244.2us / 4344.0us, variant 1241.2us / 4370.6us
 (`mkv3-p4b-rmsbwd-r4-control-mkonly.log`,
 `mkv3-p4b-rmsbwd-r4-variant-fixedtiles-mkonly.log`). Keep the two-row default.
 
+Post-headtarget Drow-WGMMA route recheck: the fused `dOatt = dX @ Wo` + Drow
+epilogue path still builds as WMMA on current `model.py`, despite the WGMMA epilogue
+support. A narrow route branch was correctness-clean (`mkv3-p4b-drow-wg-route-testmodel.log`)
+and changed small's profile label from `GEMMNN 1024x512x512` to
+`GEMMNN 1024x512x512.wg`, cutting that span to 213.8us. The profile total still lost
+because `ATTN_DKV_WG` grew in the same run (small total 4373.5us;
+`mkv3-p4b-drow-wg-route-prof.log`), and 80-step medians were only noise-level positive
+versus recent control (route 1242.6us / 4341.0us vs control 1244.2us / 4344.0us;
+`mkv3-p4b-drow-wg-route-mkonly.log`). Do not merge without a repeatable step-level win.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
