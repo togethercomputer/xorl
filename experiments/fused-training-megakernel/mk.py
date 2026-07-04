@@ -354,6 +354,7 @@ class Program:
         self._buf_ids = {}
         self._buf_meta = []  # (root_ptr, slot) per buffer-table entry
         self.waves = [[]]  # list of waves; each wave = list of (op, ntiles, args)
+        self.default_cold_cap = 16
 
     def buf(self, t: torch.Tensor, slot=None) -> int:
         """Register a CUDA tensor; returns its buffer-table index.
@@ -670,11 +671,10 @@ class Program:
                 self._adj,
                 self._claim,
                 self._crit,
-                # cold_cap default 16 (v3 P4b r3): a wash pre-SW128, but with the faster
-            # ops the cold dW work turned net-contentious — capping cold-working
-            # blocks at 8-33 measures -60..-80us at small, -10 at nano (flat across
-            # that band; 66+ decays back). MK_COLD_CAP overrides; 0 = uncapped.
-            int(os.environ.get("MK_COLD_CAP", "16")),
+                # MK_COLD_CAP overrides. Default is shape-set by the model builder:
+                # cap short shapes where cold dW work is net-contentious; leave long S
+                # uncapped where the cap delays useful tail work.
+                int(os.environ.get("MK_COLD_CAP", str(self.default_cold_cap))),
                 self._state,
                 self._buftab,
                 smem_bytes,

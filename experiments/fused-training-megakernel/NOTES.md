@@ -1012,7 +1012,15 @@ tile-gated at >=32 n128 tiles (nano's 24-tile dX stays m64n64/WMMA).
 Measured (df, clean GPU): small 4252 -> 4095 (NT -146, NN -28), nano ~flat
 (1093-1115 band). lm_head span 280 -> 194; gu 185 -> 138.
 
-Knob re-sweeps post-n128: MK_CLAIM=132 and DKV C=1 still optimal.
+Knob re-sweeps post-n128: MK_CLAIM=132 and DKV C=1 still optimal. Cold-cap needs
+shape gating: the peer default cap16 is right for short shapes, but S4096 regresses
+hard unless cold work is uncapped. Broad c742 sweep
+(`mkv3-p4b-c742-coldcap-shape-sweep-20260704T215225Z.log`) and focused repeat
+(`mkv3-p4b-c742-coldcap-shape-alt-20260704T215407Z.log`) confirmed the robust part:
+S4096 cap16/cap0/cap0/cap16/cap33/cap0 was
+4009.8/3917.8/3916.9/4009.5/3934.1/3916.1us. Short-shape cap33 was not strong enough
+to retune, so the default is cap16 for S < 2048 and uncapped for S >= 2048; `MK_COLD_CAP`
+still overrides.
 
 SCOREBOARD (fixed flash baseline, median-of-50, fresh process per config):
 | config | megakernel | flash-baseline | gap |
