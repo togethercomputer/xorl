@@ -588,6 +588,52 @@ Profile (`results/mkv3-p6-r4-attnretune-prof.log`): nano improves locally by tri
 ~100us. The next real work is still op quality for GEMMNN/head and attention kernels,
 not another instruction-level fusion pass.
 
+## v3 P4b SW128 + gated NN routing: the GEMM limiter was smem bank conflict
+
+The parallel P4b branch found the missing GEMM lever: the old no-swizzle INTER smem
+layout made the cp.async stores 8-way bank-conflicted. Generic 3/4-stage mainloops did
+not help because the limiter was the stage fill itself. `op_gemm_wgmma` now uses the
+Hopper SW128/B128 layout for both K-major and MN-major operand slabs, with 1024B-aligned
+stage bases so the absolute-address swizzle phase matches the descriptor. Attention
+keeps its INTER layout because its descriptor-swap trick relies on the no-swizzle
+symmetry.
+
+Routing update: SW128 also flips the old NN verdict for sufficiently tiled dX GEMMs.
+NN now routes when `gemm_tiles_wgmma(M, N) >= MK_WGMMA_NN_MIN` (default 64). This
+routes small's 64+ tile dX GEMMs but keeps nano's 16-48 tile dX GEMMs on WMMA/split-K.
+TN/dW routing remains OFF by default (`MK_WGMMA_TN=1` is only a re-run knob): direct
+A/B showed dW sinks get faster locally but steal bandwidth from the on-path chain
+(`results/mkv3-p4b-sw128-route-ab.log`).
+
+Validation:
+- `test_ops.py`, `test_model.py` green (`results/mkv3-p4b-sw128-testops.log`,
+  `results/mkv3-p4b-sw128-route-testmodel.log`).
+- Direct large NT GEMM checks for the routed model shapes pass, including
+  512x8192x256, 1024x3072x512, 1024x16384x512, and residual 1024x512x1536
+  (`results/mkv3-p4b-sw128-large-gemm-check.log`).
+- Direct routed NN and TN/split-K checks pass (`results/mkv3-p4b-sw128-route-gemm-check.log`).
+- `cuobjdump -res-usage`: df stays `REG:255 STACK:144`; no new spill cliff
+  (`results/mkv3-p4b-sw128-cuobjdump.log`).
+
+Clean hardened benchmark (`results/mkv3-p4b-sw128-nngate-bench-clean2.log`):
+
+| config | megakernel | hardened compile+CUDAGraph+ | gap |
+|---|---:|---:|---:|
+| nano  (H256 L4 S512) | 1274us | 710us | 1.79x |
+| small (H512 L8 S1024) | 4510us | 2737us | 1.65x |
+
+Clean profile (`results/mkv3-p4b-sw128-route-prof.log`): SW128 makes the big NT spans
+real progress instead of probe-only throughput, and gated NN removes most of the small
+dX GEMM tax. Small `GEMMNN 1024x512x3072` drops ~516us -> ~254us, `GEMMNN
+1024x1536x512` ~427us -> ~216us, and head dX ~190us -> ~146us. Remaining small top
+items are now `RMSNORM_BWD`, `ATTN_DKV_WG`, `SWIGLU_BWD`, and the large NT lm_head
+fwd. Nano remains split across `RMSNORM_BWD`, `ATTN_DKV_WG`, and small WMMA `GEMMNN`.
+
+Follow-up checked and NOT promoted: widening `dx_split_k` to include 64-tile dX GEMMs
+looked positive in one noisy run, but clean same-GPU A/B showed old gate, default, and
+forced `MK_DX_SPLIT_MAX_TILES=64` within noise for small while forced 64 hurt nano
+(`results/mkv3-p6-r4-dxsplit-ab-gpu5.log`). Keep the existing `<32` split-K gate.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

@@ -325,6 +325,48 @@ __device__ __forceinline__ uint64_t wg_desc_mn(const void* smem_ptr) {
   return d.desc_;
 }
 
+// ---- SW128 (128B-swizzle) canonical layouts (v3 P4b) ----------------------------------
+// The INTER arrangements above have an 8-way smem WRITE bank conflict: a warp's 16B
+// cp.async stores hit only 4 bank-quads (bank index depends only on r&7), costing
+// ~1.1us per 24KB stage — THE gemm limiter (probe: pipe_probe.py; 40-79TF -> 60-150TF
+// from the swizzle alone, pipeline depth immaterial). SW128 spreads each 8-lane phase
+// across all 32 banks. The swizzle phase is derived from ABSOLUTE smem address bits
+// [7,10): slab bases MUST be 1024B-aligned (op_gemm_wgmma aligns its smem base;
+// misalignment = silent garbage) and the store-side XOR uses the slab-relative row,
+// identical mod 8. K-major slab: [64 rows][64 k-elts]; 128B row = 8 x 16B chunks;
+// chunk c of row r stored at c ^ (r&7). MN-major slab: [64 k-rows][64 mn-elts], roles
+// flipped. Attention keeps INTER: its one-arrangement-both-majors descriptor-swap
+// trick has no SW128 analogue (the XOR breaks the symmetry).
+__device__ __forceinline__ int wg_koff_sw(int r, int k8) {  // bytes; k8 = k in elts (x8)
+  return r * 128 + ((((k8 >> 3) ^ (r & 7)) << 4));
+}
+__device__ __forceinline__ int wg_mnoff_sw(int k, int mn8) {
+  return k * 128 + ((((mn8 >> 3) ^ (k & 7)) << 4));
+}
+// K-major SW128 descriptor for k16-atom s of a 64-row slab (deep_gemm recipe: B128,
+// LBO=0, SBO=1024B; atom start = base + s*32B — mid-row advance is legal).
+__device__ __forceinline__ uint64_t wg_desc_ksw(const void* slab, int s) {
+  const uint32_t addr = (uint32_t)__cvta_generic_to_shared(slab) + s * 32;
+  cute::GmmaDescriptor d;
+  d.desc_ = 0;
+  d.bitfield.start_address_ = (addr >> 4);
+  d.bitfield.leading_byte_offset_ = 0;
+  d.bitfield.stride_byte_offset_ = (1024 >> 4);
+  d.bitfield.layout_type_ = 1;  // B128
+  return d.desc_;
+}
+// MN-major SW128 descriptor: k16-atom s = 16 k-rows = 2KB step; SBO = 8-row group.
+__device__ __forceinline__ uint64_t wg_desc_mnsw(const void* slab, int s) {
+  const uint32_t addr = (uint32_t)__cvta_generic_to_shared(slab) + s * 2048;
+  cute::GmmaDescriptor d;
+  d.desc_ = 0;
+  d.bitfield.start_address_ = (addr >> 4);
+  d.bitfield.leading_byte_offset_ = 0;
+  d.bitfield.stride_byte_offset_ = (1024 >> 4);
+  d.bitfield.layout_type_ = 1;  // B128
+  return d.desc_;
+}
+
 template <class MMA>
 __device__ __forceinline__ void wg_mma_ktile(const uint64_t (&da)[4], const uint64_t (&db)[4],
                                              float (&d)[32]) {
@@ -348,6 +390,10 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
   const bool acc_c = flags & 4, c_f32 = flags & 8;
   const bf16* Res = (flags & 16) ? reinterpret_cast<const bf16*>(bufs[I.args[7]]) : nullptr;
 
+  // SW128 swizzle phase = absolute smem address bits [7,10): slab bases must be
+  // 1024B-aligned (ws mode offsets opsmem by MK_WS_CTRL_BYTES; df base is unpadded).
+  smem_raw = reinterpret_cast<char*>(
+      (reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
   WgmmaSmem& S = *reinterpret_cast<WgmmaSmem*>(smem_raw);
   const bool a_t = flags & 1, b_t = flags & 2;  // storage: a_t -> A[K,M]; b_t -> B[N,K]
   const int sk = (flags & 32) ? I.args[8] : 1;
@@ -368,32 +414,30 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
 #pragma unroll
     for (int i = 0; i < 4; ++i) {  // A: 128r x 64k = 1024 16B vectors
       const int v = tid + i * 256;
-      if (!a_t) {  // A[M,K], K-contiguous
+      if (!a_t) {  // A[M,K], K-contiguous -> SW128 K-major slab per 64-row half
         const int r = v / 8, k8 = (v % 8) * 8;
         __pipeline_memcpy_async(
-            reinterpret_cast<char*>(S.A[st][r / 64][k8 / 16]) + wg_koff(r % 64, k8 % 16),
+            reinterpret_cast<char*>(S.A[st][r / 64]) + wg_koff_sw(r % 64, k8),
             &A[(int64_t)(m0 + r) * K + k0 + k8], 16);
-      } else {  // A[K,M], M-contiguous -> MN-major blocks
+      } else {  // A[K,M], M-contiguous -> SW128 MN-major slab
         const int h = v / 512, w_ = v % 512;
         const int k = w_ / 8, m8 = (w_ % 8) * 8;
         __pipeline_memcpy_async(
-            reinterpret_cast<char*>(S.A[st][h][k / 16]) + wg_mnoff(m8, k % 16),
+            reinterpret_cast<char*>(S.A[st][h]) + wg_mnoff_sw(k, m8),
             &A[(int64_t)(k0 + k) * M + m0 + h * 64 + m8], 16);
       }
     }
 #pragma unroll
     for (int i = 0; i < 2; ++i) {  // B: 64r x 64k = 512 16B vectors
       const int v = tid + i * 256;
-      if (b_t) {  // B[N,K], K-contiguous
+      if (b_t) {  // B[N,K], K-contiguous -> SW128 K-major slab
         const int r = v / 8, k8 = (v % 8) * 8;
-        __pipeline_memcpy_async(
-            reinterpret_cast<char*>(S.B[st][k8 / 16]) + wg_koff(r, k8 % 16),
-            &B[(int64_t)(n0 + r) * K + k0 + k8], 16);
-      } else {  // B[K,N], N-contiguous -> MN-major blocks
+        __pipeline_memcpy_async(reinterpret_cast<char*>(S.B[st]) + wg_koff_sw(r, k8),
+                                &B[(int64_t)(n0 + r) * K + k0 + k8], 16);
+      } else {  // B[K,N], N-contiguous -> SW128 MN-major slab
         const int k = v / 8, n8 = (v % 8) * 8;
-        __pipeline_memcpy_async(
-            reinterpret_cast<char*>(S.B[st][k / 16]) + wg_mnoff(n8, k % 16),
-            &B[(int64_t)(k0 + k) * N + n0 + n8], 16);
+        __pipeline_memcpy_async(reinterpret_cast<char*>(S.B[st]) + wg_mnoff_sw(k, n8),
+                                &B[(int64_t)(k0 + k) * N + n0 + n8], 16);
       }
     }
     __pipeline_commit();
@@ -413,8 +457,8 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
     uint64_t da[4], db[4];
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
-      da[s] = a_t ? wg_desc_mn(S.A[t & 1][wg][s]) : wg_desc(S.A[t & 1][wg][s]);
-      db[s] = b_t ? wg_desc(S.B[t & 1][s]) : wg_desc_mn(S.B[t & 1][s]);
+      da[s] = a_t ? wg_desc_mnsw(S.A[t & 1][wg], s) : wg_desc_ksw(S.A[t & 1][wg], s);
+      db[s] = b_t ? wg_desc_ksw(S.B[t & 1], s) : wg_desc_mnsw(S.B[t & 1], s);
     }
     if (!a_t && b_t)
       wg_mma_ktile<SG::MMA_64x64x16_F32BF16BF16_SS<SG::Major::K, SG::Major::K>>(da, db, d);

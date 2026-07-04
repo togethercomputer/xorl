@@ -53,19 +53,30 @@ def gemm_tiles(M, N):
 
 
 def wgmma_ok(M, N, K, flags):
-    """NT gemms with wgmma-friendly shapes route to the 128x64 warpgroup path.
+    """Gemms with wgmma-friendly shapes route to the 128x64 warpgroup path.
 
-    The kernel supports all four storage majors (validated), but routing NN/TN through
-    wgmma measured SLOWER in-model than the WMMA path (fixed costs dominate at these
-    tile counts) — so only the NT (Linear-forward) pattern routes here.
-    MK_WGMMA_NN=1 additionally routes plain NN (bwd dX pattern; bit10 Drow stays WMMA —
-    that epilogue is not implemented on the wgmma path) — the round-3 negative kept
-    re-runnable as the executor's fixed costs change."""
-    if flags & (1 | 32 | 1024):
+    History: with the INTER (no-swizzle) smem layout, NN/TN routing measured SLOWER
+    in-model twice (round 3, P6) and only NT routed. The SW128 layout (P4b) doubled
+    the wgmma path's throughput (probe: pipe_probe.py) and flipped NN decisively at
+    small (-285us); occupancy — not majors — is now the binding constraint, so NN
+    routes when the instr exposes enough 128x64 tiles (MK_WGMMA_NN_MIN, default 64;
+    nano's 16-48-tile dX gemms stay WMMA/split-K: measured +30us if routed). TN (dW,
+    fp32 split-K) routes via MK_WGMMA_TN. bit10 (Drow epilogue) stays WMMA — not
+    implemented on the wgmma path."""
+    if flags & (32 | 1024):
         return False
-    if not (flags & 2) and not int(os.environ.get("MK_WGMMA_NN", "0")):
+    if M % 128 or N % 64 or K % 64:
         return False
-    return M % 128 == 0 and N % 64 == 0 and K % 64 == 0
+    if flags & 1:  # TN (dW split-K pattern): measured NEGATIVE at both configs even
+        # with SW128 (+226 nano / +570 small): dW gemms are SINKS — making them 2x
+        # more BW-hungry steals bandwidth from the on-path chain without shortening
+        # the step. Keep WMMA; MK_WGMMA_TN=1 re-runs the experiment.
+        return bool(int(os.environ.get("MK_WGMMA_TN", "0")))
+    if not (flags & 2):  # NN (dX pattern): tile-gated
+        if not int(os.environ.get("MK_WGMMA_NN", "1")):
+            return False
+        return gemm_tiles_wgmma(M, N) >= int(os.environ.get("MK_WGMMA_NN_MIN", "64"))
+    return True  # NT
 
 
 def wgmma_split_k(M, N, K, target_tiles=512):
