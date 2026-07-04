@@ -878,6 +878,17 @@ because `ATTN_DKV_WG` grew in the same run (small total 4373.5us;
 versus recent control (route 1242.6us / 4341.0us vs control 1244.2us / 4344.0us;
 `mkv3-p4b-drow-wg-route-mkonly.log`). Do not merge without a repeatable step-level win.
 
+Post-headtarget SWIGLU_BWD two-row fold recheck: `MK_SWIGLU_BWD_R2=1` made each warp
+handle rows `r` and `r+8` under a 16-row tile, matching the RMSNorm two-row tile
+plumbing but keeping the per-row register lifetime short. Correctness was green
+(`mkv3-p4b-swiglu-r2-testops.log`, `mkv3-p4b-swiglu-r2-testmodel.log`). Profile A/B was
+not promotable: control totals were 1145.7us / 4375.4us and variant totals were
+1152.9us / 4358.8us, but the SWIGLU_BWD span itself worsened (nano 38.2us -> 51.4us,
+small 323.5us -> 347.4us; `mkv3-p4b-swiglu-r2-control-prof.log`,
+`mkv3-p4b-swiglu-r2-variant-prof.log`). The direct 80-step medians were clearly
+negative: control nano/small 1240.1us / 4352.0us, variant 1250.0us / 4391.4us
+(`mkv3-p4b-swiglu-r2-mkonly.log`). Keep SWIGLU_BWD at one row/warp.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
