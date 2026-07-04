@@ -647,7 +647,10 @@ direct timings: nano 512=1246.6/1235.4us vs 256=1225.3/1222.8us; small
 (`results/mkv3-p4b-wsbase-headtarget-256-ab.log`). After merging CE_BWD vectorization
 (`91b7f74`), the same A/B still favors 256: nano 512=1250.7/1227.9us vs
 256=1221.6/1217.8us; small 512=4374.3/4367.8us vs 256=4335.6/4336.2us
-(`results/mkv3-p4b-headtarget256-after-cebwd-ab.log`). The default is now 256; the env
+(`results/mkv3-p4b-headtarget256-after-cebwd-ab.log`). After the df scheduler
+completion-hint commit (`eba44d5`), the win held again: nano 512=1249.6/1229.7us vs
+256=1220.2/1217.1us; small 512=4370.0/4368.5us vs 256=4338.8/4338.1us
+(`results/mkv3-p4b-headtarget256-after-hint-ab.log`). The default is now 256; the env
 knob stays for reruns.
 
 ## Honest assessment + v2 roadmap
