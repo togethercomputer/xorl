@@ -1040,6 +1040,22 @@ own optimum. The remaining ~2x is the price of that constraint at these model
 sizes — future rounds should either attack per-op quality within the 255-reg
 point (TMA, deeper attention pipelining) or accept the flag-planting scope.
 
+## v3 P4b r3 coda: cold_cap flip + the attention-pipelining strike-three
+
+- cold_cap default 0 -> 16: the pre-SW128 wash flipped positive once the ops got
+  faster (cold dW work turned net-contentious): small ~4110 -> ~4042, nano ~1102
+  -> ~1092. Flat across 8-33.
+- FA2-style software-pipelined attention fwd (MK_ATTN_PIPE build): parity-green,
+  in-model NEGATIVE (fwd span 245 -> 297, step +245 at small). With the pipe_probe
+  stage sweep and the MPK prefetch, that's three independent measurements saying
+  the same thing: in this 8-warp latency-bound regime, overlap/depth machinery
+  costs more than it hides. The megakernel's ops are as fast as this architecture
+  lets them be; the residual vs the baseline is the one-register-point constraint,
+  not op micro-structure.
+
+End-of-session state (df, defaults): small ~4048, nano ~1092 profile /
+~4105/1205 bench vs flash baseline 1766/631 -> 2.3x/1.9x.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
