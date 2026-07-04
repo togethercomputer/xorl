@@ -38,6 +38,13 @@ __device__ __forceinline__ int wga_off64(int r, int c) {
   return ((r >> 3) << 10) + ((c >> 3) << 7) + ((r & 7) << 4) + ((c & 7) << 1);
 }
 
+// Loader lane mapping (v3 P4b): off64's bank quad depends only on r&7, so the old
+// v -> (r = v/8, c8 = v%8*8) assignment put each 8-lane store phase on ONE row =
+// one bank quad = 8-way conflict (the same pathology SW128 fixed in the gemm; here
+// the dual-view trick pins the byte layout, so fix the ASSIGNMENT instead):
+// v -> (r = v%8 | (v/64)*8, c8 = (v/8)%8*8) spans 8 rows per phase — all 32 banks —
+// while each row still reads 64B contiguous gmem per warp (same 16 L2 sectors).
+
 __device__ __forceinline__ uint64_t wga_desc_k(const void* p) {
   const uint32_t addr = (uint32_t)__cvta_generic_to_shared(p);
   cute::GmmaDescriptor d;
@@ -155,14 +162,14 @@ __device__ void op_attn_fwd_wg(const Instr& I, int tile, void** bufs, char* smem
 #pragma unroll
     for (int i = 0; i < 2; ++i) {  // K: 512 16B vectors over the 256 consumers
       const int v = tid + i * MK_CONSUMERS;
-      const int r = v >> 3, c8 = (v & 7) << 3;
+      const int r = ((v >> 6) << 3) | (v & 7), c8 = ((v >> 3) & 7) << 3;
       __pipeline_memcpy_async((char*)sm.K[st] + wga_off64(r, c8),
                               &qkv[(int64_t)(k0 + r) * stride + (nq + kvh) * D + c8], 16);
     }
 #pragma unroll
     for (int i = 0; i < 2; ++i) {  // V
       const int v = tid + i * MK_CONSUMERS;
-      const int r = v >> 3, c8 = (v & 7) << 3;
+      const int r = ((v >> 6) << 3) | (v & 7), c8 = ((v >> 3) & 7) << 3;
       __pipeline_memcpy_async(
           (char*)sm.V[st] + wga_off64(r, c8),
           &qkv[(int64_t)(k0 + r) * stride + (nq + nkv + kvh) * D + c8], 16);
@@ -175,7 +182,7 @@ __device__ void op_attn_fwd_wg(const Instr& I, int tile, void** bufs, char* smem
   for (int i = 0; i < 4; ++i) {
     const int v = tid + i * MK_CONSUMERS;
     const int h = v >> 9;
-    const int r = (v >> 3) & 63, c8 = (v & 7) << 3;
+    const int r = (((v >> 6) & 7) << 3) | (v & 7), c8 = ((v >> 3) & 7) << 3;
     __pipeline_memcpy_async((char*)sm.Q[h] + wga_off64(r, c8),
                             &qkv[(int64_t)(q0 + h * 64 + r) * stride + qh * D + c8], 16);
   }
@@ -335,14 +342,14 @@ __device__ void op_attn_dkv_wg(const Instr& I, int tile, void** bufs, char* smem
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
       const int v = tid + i * MK_CONSUMERS;
-      const int r = v >> 3, c8 = (v & 7) << 3;
+      const int r = ((v >> 6) << 3) | (v & 7), c8 = ((v >> 3) & 7) << 3;
       __pipeline_memcpy_async((char*)sm.Q[st] + wga_off64(r, c8),
                               &qkv[(int64_t)(q0s + r) * stride + qh * D + c8], 16);
     }
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
       const int v = tid + i * MK_CONSUMERS;
-      const int r = v >> 3, c8 = (v & 7) << 3;
+      const int r = ((v >> 6) << 3) | (v & 7), c8 = ((v >> 3) & 7) << 3;
       __pipeline_memcpy_async((char*)sm.dO[st] + wga_off64(r, c8),
                               &dOg[(int64_t)(q0s + r) * (nq * D) + qh * D + c8], 16);
     }
@@ -354,7 +361,7 @@ __device__ void op_attn_dkv_wg(const Instr& I, int tile, void** bufs, char* smem
   for (int i = 0; i < 4; ++i) {
     const int v = tid + i * MK_CONSUMERS;
     const int h = v >> 9;
-    const int r = (v >> 3) & 63, c8 = (v & 7) << 3;
+    const int r = (((v >> 6) & 7) << 3) | (v & 7), c8 = ((v >> 3) & 7) << 3;
     __pipeline_memcpy_async(
         (char*)sm.K[h] + wga_off64(r, c8),
         &qkv[(int64_t)(kv0 + h * 64 + r) * stride + (nq + kvh) * D + c8], 16);
@@ -363,7 +370,7 @@ __device__ void op_attn_dkv_wg(const Instr& I, int tile, void** bufs, char* smem
   for (int i = 0; i < 4; ++i) {
     const int v = tid + i * MK_CONSUMERS;
     const int h = v >> 9;
-    const int r = (v >> 3) & 63, c8 = (v & 7) << 3;
+    const int r = (((v >> 6) & 7) << 3) | (v & 7), c8 = ((v >> 3) & 7) << 3;
     __pipeline_memcpy_async(
         (char*)sm.V[h] + wga_off64(r, c8),
         &qkv[(int64_t)(kv0 + h * 64 + r) * stride + (nq + nkv + kvh) * D + c8], 16);
@@ -509,14 +516,14 @@ __device__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs, char* smem_
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
       const int v = tid + i * MK_CONSUMERS;
-      const int r = v >> 3, c8 = (v & 7) << 3;
+      const int r = ((v >> 6) << 3) | (v & 7), c8 = ((v >> 3) & 7) << 3;
       __pipeline_memcpy_async((char*)sm.K[st] + wga_off64(r, c8),
                               &qkv[(int64_t)(k0 + r) * stride + (nq + kvh) * D + c8], 16);
     }
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
       const int v = tid + i * MK_CONSUMERS;
-      const int r = v >> 3, c8 = (v & 7) << 3;
+      const int r = ((v >> 6) << 3) | (v & 7), c8 = ((v >> 3) & 7) << 3;
       __pipeline_memcpy_async(
           (char*)sm.V[st] + wga_off64(r, c8),
           &qkv[(int64_t)(k0 + r) * stride + (nq + nkv + kvh) * D + c8], 16);
@@ -529,7 +536,7 @@ __device__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs, char* smem_
   for (int i = 0; i < 4; ++i) {
     const int v = tid + i * MK_CONSUMERS;
     const int h = v >> 9;
-    const int r = (v >> 3) & 63, c8 = (v & 7) << 3;
+    const int r = (((v >> 6) & 7) << 3) | (v & 7), c8 = ((v >> 3) & 7) << 3;
     __pipeline_memcpy_async((char*)sm.Q[h] + wga_off64(r, c8),
                             &qkv[(int64_t)(q0 + h * 64 + r) * stride + qh * D + c8], 16);
   }
@@ -537,7 +544,7 @@ __device__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs, char* smem_
   for (int i = 0; i < 4; ++i) {
     const int v = tid + i * MK_CONSUMERS;
     const int h = v >> 9;
-    const int r = (v >> 3) & 63, c8 = (v & 7) << 3;
+    const int r = (((v >> 6) & 7) << 3) | (v & 7), c8 = ((v >> 3) & 7) << 3;
     __pipeline_memcpy_async((char*)sm.dO[h] + wga_off64(r, c8),
                             &dOg[(int64_t)(q0 + h * 64 + r) * (nq * D) + qh * D + c8], 16);
   }
