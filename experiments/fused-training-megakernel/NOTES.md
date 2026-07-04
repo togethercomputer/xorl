@@ -978,6 +978,68 @@ small 323.5us -> 347.4us; `mkv3-p4b-swiglu-r2-control-prof.log`,
 negative: control nano/small 1240.1us / 4352.0us, variant 1250.0us / 4391.4us
 (`mkv3-p4b-swiglu-r2-mkonly.log`). Keep SWIGLU_BWD at one row/warp.
 
+## v3 P4b round 3 (session 0b544181): the register-file accounting + n128 tiles
+
+Direction set by the user mid-session: keep pushing, rethink bottlenecks.
+
+**The dual-stream executor — built, then refuted by first principles.** The nsys
+verdict (81% of issue slots empty) begged for more warps. Design: 512 threads =
+two independent 256-thread df claim loops per block, asymmetric registers (fat
+half 192: gemms/attention off the hot+cold rings; lean half 64: barrier-free
+streaming ops off a third LEAN ring). Enabler shipped and kept: the op library
+now indexes mk_tid() (= threadIdx.x & 255) with a group-derived barrier id, so
+ops run unchanged in any multiple-of-256 block shape — side effect, df STACK
+144 -> 32. The executor itself died at the compiler: ptxas gives setmaxnreg
+regions NO extra budget — the whole kernel compiles at the __maxnreg__(128)
+entry cap (REG:128 STACK:848 = the OCC2 spill signature). The general
+accounting, now stated once for all future rounds: 256 threads x 255 regs =
+the 64K register file EXACTLY; every add-warps design (ws 224, occ2 128, dual
+192/64, two-block splits) pays fat-path registers, and the measured spill/
+register tax (5-40%) always exceeds what the added warps can hide (~10-15% of
+step). Eight 255-reg warps is the architecture's Pareto point.
+
+**What the accounting DOES allow: bigger tiles at full registers.** m64n128 NT
+wgmma tiles (64 fp32 accs/thread ~= 200 regs, fits 255): double mma work per
+sync, half the B-traffic per FLOP — the dependent chain per FLOP shortens,
+which is the one lever the register-lifetime law permits. Generalized from the
+peer session's lm_head-only route (branch commit 8008126; their 'not promoted'
+verdict was correct for the narrow scope — the win needed every NT gemm to
+clear absorption), plus residual (bit16) support and an NN variant: B[K,N]
+loads into two 64-mn MN-major SW128 slabs with the canonical B128 MN
+descriptor using LBO=8192B as the 64-mn group stride (validated by grad
+parity). Routing: flags bit12, MK_WGMMA_N128 / _NN / _NN_MIN knobs; NN
+tile-gated at >=32 n128 tiles (nano's 24-tile dX stays m64n64/WMMA).
+Measured (df, clean GPU): small 4252 -> 4095 (NT -146, NN -28), nano ~flat
+(1093-1115 band). lm_head span 280 -> 194; gu 185 -> 138.
+
+Knob re-sweeps post-n128: MK_CLAIM=132 and DKV C=1 still optimal.
+
+SCOREBOARD (fixed flash baseline, median-of-50, fresh process per config):
+| config | megakernel | flash-baseline | gap |
+|---|---|---|---|
+| nano  (H256 L4 S512)  | 1205 | 631 | 1.91x |
+| small (H512 L8 S1024) | 4105 | 1766 | 2.32x |
+| deep-narrow (L12)     | 3088 | 1770 | 1.74x |
+| S=128                 | 919 | 484 | 1.90x |
+| S=256                 | 1046 | 482 | 2.17x |
+| S=1024 (nano width)   | 1544 | 711 | 2.17x |
+Long-S (separate processes): S=4096 4010/1568 = 2.56x, S=8192 9503/3156 =
+3.01x — n128 pays more at long S too (mk S=8192 was 10434 this morning).
+(Morning honest reset: nano 1.97x / small 2.52x; the day's compounded work —
+both sessions — moved small ~14% and nano ~3%. Baseline medians wobble ±5%
+run-to-run from inductor autotune variance; gaps quoted per-run.)
+
+Residual decomposition at small (~4100 vs 1900): the uniform in-model tax
+(25-50% on every op class vs standalone — co-resident instrs sharing the SM's
+issue/memory pipes; this IS the overlap working), per-op gaps vs vendor
+kernels (gemms ~140TF vs cuBLAS 200+, attention ~1.3x off FA3), waits ~445us
+(144 hops x ~3.1us), fills/CE/embeds. No remaining single item measures
+>~150us. The honest framing stands: a one-kernel design must pick one
+register/occupancy point for all ops; the baseline runs every kernel at its
+own optimum. The remaining ~2x is the price of that constraint at these model
+sizes — future rounds should either attack per-op quality within the 255-reg
+point (TMA, deeper attention pipelining) or accept the flag-planting scope.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
