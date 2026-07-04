@@ -1060,6 +1060,14 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   costs more than it hides. The megakernel's ops are as fast as this architecture
   lets them be; the residual vs the baseline is the one-register-point constraint,
   not op micro-structure.
+- Dynamic-smem default corrected after the pipe artifact: the default build only
+  needs the old 100KB carveout; 120KB is now selected only when `MK_ATTN_PIPE=1`.
+  Same-root A/B (`mkv3-p4b-smem-default-*-20260704T220504Z-mkonly.log`) was a small
+  win or neutral: control/variant nano 1192.7/1185.6us, small 4084.6/4079.7us,
+  S4096 3921.8/3919.3us. Reverse-order GPU3
+  (`mkv3-p4b-smem-default-rev-*-20260704T220819Z-mkonly.log`) confirmed the
+  short-shape direction: variant/control nano 1192.1/1196.6us, small
+  4060.4/4073.0us, S4096 neutral 3922.3/3920.4us.
 
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across

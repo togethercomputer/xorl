@@ -623,9 +623,11 @@ class Program:
             depth[i] = 1 + max((depth[j] for j in d), default=0)
         return max(depth, default=0)
 
-    def run(self, ext, smem_bytes=120 * 1024, wave_clk=None, mode="df"):
-        # 120KB default (was 100): the MK_ATTN_PIPE fwd needs 112KB (P ping-pong +
-        # 4-ring K/V); still 1 block/SM either way on H100 (227KB max opt-in).
+    def run(self, ext, smem_bytes=None, wave_clk=None, mode="df"):
+        if smem_bytes is None:
+            # Default ops fit in 100KB. The measured-negative MK_ATTN_PIPE artifact
+            # needs 112KB, so only that opt-in build takes the larger carveout.
+            smem_bytes = (120 if int(os.environ.get("MK_ATTN_PIPE", "0")) else 100) * 1024
         if mode == "waves":
             ext.run(self._instrs, self._wave_start, self._wave_tiles, self._buftab, smem_bytes, wave_clk)
         elif mode == "ws":
