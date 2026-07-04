@@ -528,8 +528,8 @@ is therefore `Ckv=3 if S == 512 else 2`, with env overrides for future sweeps.
 `MK_HEAD_DX_TARGET_TILES` around the `dlogits @ Wlm` split-K target because the
 post-row-reduction profile exposed it as a worst hop at small. Sweeping 256..2048
 showed no robust default improvement: 384 tiles was slightly best in one small run, but
-512 stayed better at nano/deep/S1024 and remains the default. Keep the knob for P4b
-or per-shape studies; do not promote 384 globally.
+512 stayed better at nano/deep/S1024. This older verdict was superseded by the P4b
+current-base retune below, which promotes 256 after later scheduler/op changes.
 
 Remaining measured top items after this round (`results/mkv3-p6-rmsrow-ckv3-prof.log`):
 small is led by ATTN_DQ_WG, head dX/lm_head GEMMs, and GEMMNN MLP dX spans; nano is
@@ -570,8 +570,9 @@ the cheapest remaining attention lever was the routed chunk count. A fresh sweep
 - `ATTN_DKV_WG` now uses `Ckv=1` only when `nq * (S/128) >= 64` (small has enough
   natural chunks), otherwise `Ckv=2` preserves tail parallelism for nano/S1024-H256.
 
-The head split-K target sweep again showed only small/noisy wins, so
-`MK_HEAD_DX_TARGET_TILES` stays override-only at the 512 default.
+The head split-K target sweep again showed only small/noisy wins at this checkpoint;
+this older verdict was superseded by the P4b current-base retune below, which promotes
+`MK_HEAD_DX_TARGET_TILES=256` after later scheduler/op changes.
 
 Correctness: `test_ops.py` and `test_model.py` are green. Hardened headline benchmark
 (`results/mkv3-p6-r4-attnretune-bench.log`):
