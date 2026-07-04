@@ -946,6 +946,7 @@ extern "C" __global__ void __maxnreg__(168) megakernel_ws(
   }
 }
 
+
 // ---- host launcher ------------------------------------------------------------------
 static int g_nblocks = -1;
 

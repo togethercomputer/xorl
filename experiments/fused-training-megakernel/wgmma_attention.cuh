@@ -154,7 +154,7 @@ __device__ void op_attn_fwd_wg(const Instr& I, int tile, void** bufs, char* smem
   const int q0 = (tile / nq) * 128;
   const int kvh = qh / (nq / nkv);
   const int stride = (nq + 2 * nkv) * D;
-  const int tid = threadIdx.x;
+  const int tid = mk_tid();
   const int wg = tid >> 7, wtid = tid & 127;
   const int q0wg = q0 + wg * 64;
 
@@ -332,7 +332,7 @@ __device__ void op_attn_dkv_wg(const Instr& I, int tile, void** bufs, char* smem
   const int g = rem % G;
   const int qh = kvh * G + g;
   const int stride = (nq + 2 * nkv) * D;
-  const int tid = threadIdx.x;
+  const int tid = mk_tid();
   const int wg = tid >> 7, wtid = tid & 127;
   const int kv0wg = kv0 + wg * 64;
   const int n_stages = ((S - kv0) / 64 - c + C - 1) / C;
@@ -506,7 +506,7 @@ __device__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs, char* smem_
   const int q0 = (t128 / nq) * 128;
   const int kvh = qh / (nq / nkv);
   const int stride = (nq + 2 * nkv) * D;
-  const int tid = threadIdx.x;
+  const int tid = mk_tid();
   const int wg = tid >> 7, wtid = tid & 127;
   const int q0wg = q0 + wg * 64;
   const int n_stages = (q0 / 64 + 2 - c + C - 1) / C;

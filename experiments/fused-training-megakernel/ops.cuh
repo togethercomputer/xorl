@@ -23,13 +23,19 @@ namespace wmma = nvcuda::wmma;
 // Ops are executed by a 256-thread consumer group. Under the wave/df/df2 executors that
 // group IS the whole block, so bar.sync 1,256 is exactly __syncthreads and
 // MK_CONSUMERS equals the block width. Under megakernel_ws the block is 288 threads (warps 0-7 =
-// consumers with unchanged threadIdx.x semantics, warp 8 = scheduler): op code must
+// consumers with unchanged mk_tid() semantics, warp 8 = scheduler): op code must
 // NEVER use __syncthreads (the scheduler warp does not participate — instant hang) nor
 // MK_CONSUMERS (wrong stride). consumer_sync() is a named barrier counting exactly the
 // 256 arriving consumer threads.
 #define MK_CONSUMERS 256
+// mk_tid(): the op-local thread index. Ops are written against a 256-thread group;
+// under the dual executor (v3 P4b round 3) a block carries TWO such groups (fat
+// half threads 0-255, lean half 256-511), so ops index mk_tid() and sync on a
+// half-specific named barrier. For the 256-thread executors both collapse to the
+// old mk_tid() / bar.sync 1 exactly.
+__device__ __forceinline__ int mk_tid() { return threadIdx.x & (MK_CONSUMERS - 1); }
 __device__ __forceinline__ void consumer_sync() {
-  asm volatile("bar.sync 1, 256;" ::: "memory");
+  asm volatile("bar.sync %0, 256;" ::"r"(1 + (threadIdx.x >> 8)) : "memory");
 }
 
 __device__ __forceinline__ float bf2f(bf16 v) { return __bfloat162float(v); }
@@ -49,8 +55,8 @@ __device__ __forceinline__ void op_fill_f32(const Instr& I, int tile, void** buf
   float4* p4 = reinterpret_cast<float4*>(p + base);
   const int quads = (end - base) / 4;
   const float4 v4 = make_float4(v, v, v, v);
-  for (int i = threadIdx.x; i < quads; i += MK_CONSUMERS) p4[i] = v4;
-  for (int i = base + quads * 4 + threadIdx.x; i < end; i += MK_CONSUMERS) p[i] = v;
+  for (int i = mk_tid(); i < quads; i += MK_CONSUMERS) p4[i] = v4;
+  for (int i = base + quads * 4 + mk_tid(); i < end; i += MK_CONSUMERS) p[i] = v;
 }
 
 // args: {y, x, n, alpha_bits}; tile = 4096-element chunk index. y += alpha * x
@@ -60,7 +66,7 @@ __device__ __forceinline__ void op_axpy_f32(const Instr& I, int tile, void** buf
   const int n = I.args[2];
   const float a = __int_as_float(I.args[3]);
   const int base = tile * 4096;
-  for (int i = base + threadIdx.x; i < min(base + 4096, n); i += MK_CONSUMERS)
+  for (int i = base + mk_tid(); i < min(base + 4096, n); i += MK_CONSUMERS)
     y[i] += a * x[i];
 }
 
@@ -113,7 +119,7 @@ __device__ void op_gemm(const Instr& I, int tile, void** bufs, char* smem_raw) {
   const int kchunk = ((K + sk * GEMM_BK - 1) / (sk * GEMM_BK)) * GEMM_BK;
   const int k_lo = slice * kchunk;
   const int k_hi = min(K, k_lo + kchunk);
-  const int tid = threadIdx.x;
+  const int tid = mk_tid();
   if (k_lo >= K) return;
   // Fast path: whole tile in bounds and every vectorized load 16B-aligned.
   const bool fast = (m0 + GEMM_BM <= M) && (n0 + GEMM_BN <= N) && (K % 8 == 0) &&
@@ -405,7 +411,7 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
   const int kchunk = ((K + sk * WG_BK - 1) / (sk * WG_BK)) * WG_BK;
   const int k_lo = slice * kchunk;
   const int k_hi = min(K, k_lo + kchunk);
-  const int tid = threadIdx.x;
+  const int tid = mk_tid();
   const int wg = tid / 128;  // warpgroup = row half
   const int wtid = tid % 128;
   if (k_lo >= K) return;
@@ -643,7 +649,7 @@ __device__ __forceinline__ void op_cvt_f32_bf16(const Instr& I, int tile, void**
   bf16* dst = reinterpret_cast<bf16*>(bufs[I.args[1]]);
   const int n = I.args[2];
   const int base = tile * MK_CHUNK;
-  for (int i = base + threadIdx.x; i < min(base + MK_CHUNK, n); i += MK_CONSUMERS)
+  for (int i = base + mk_tid(); i < min(base + MK_CHUNK, n); i += MK_CONSUMERS)
     dst[i] = f2bf(src[i]);
 }
 
@@ -703,7 +709,7 @@ __device__ __forceinline__ float warp_sum(float v) {
 __device__ void op_rmsnorm_fwd(const Instr& I, int tile, void** bufs, char* smem_raw) {
   const int H = I.args[4], S = I.args[6];
   const float eps = __int_as_float(I.args[5]);
-  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int warp = mk_tid() >> 5, lane = mk_tid() & 31;
   const int rowA = tile * MK_ROW_R2 + warp;
   if (rowA >= S) return;  // barrier-free op: early exit is safe
   const bool hasB = rowA + 8 < S;
@@ -774,7 +780,7 @@ __device__ void op_rmsnorm_fwd(const Instr& I, int tile, void** bufs, char* smem
 __device__ void op_rmsnorm_bwd(const Instr& I, int tile, void** bufs, char* smem_raw) {
   const int H = I.args[6], S = I.args[8];
   const bool dy_f32 = I.args[7] != 0;
-  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int warp = mk_tid() >> 5, lane = mk_tid() & 31;
   const int rowA = tile * MK_ROW_R2 + warp;
   float* dw_rows = reinterpret_cast<float*>(smem_raw);  // [8, H] fp32 partials (A+B folded)
   float* dw_row = dw_rows + (int64_t)warp * H;
@@ -853,7 +859,7 @@ __device__ void op_rmsnorm_bwd(const Instr& I, int tile, void** bufs, char* smem
   }
   consumer_sync();
   float* dw = reinterpret_cast<float*>(bufs[I.args[4]]);
-  for (int i = threadIdx.x; i < H; i += MK_CONSUMERS) {
+  for (int i = mk_tid(); i < H; i += MK_CONSUMERS) {
     float s = 0.0f;
 #pragma unroll
     for (int r = 0; r < 8; ++r) s += dw_rows[(int64_t)r * H + i];
@@ -866,7 +872,7 @@ __device__ void op_rmsnorm_bwd(const Instr& I, int tile, void** bufs, char* smem
 __device__ void op_rmsnorm_bwd_dx(const Instr& I, int tile, void** bufs, char* smem_raw) {
   const int H = I.args[6], S = I.args[8];
   const bool dy_f32 = I.args[7] != 0;
-  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int warp = mk_tid() >> 5, lane = mk_tid() & 31;
   const int rowA = tile * MK_ROW_R2 + warp;
   if (rowA >= S) return;  // barrier-free op: early exit is safe
   const bool hasB = rowA + 8 < S;
@@ -942,7 +948,7 @@ __device__ void op_rmsnorm_bwd_dx(const Instr& I, int tile, void** bufs, char* s
 __device__ void op_rmsnorm_bwd_dw(const Instr& I, int tile, void** bufs, char* smem_raw) {
   const int H = I.args[6], S = I.args[8];
   const bool dy_f32 = I.args[7] != 0;
-  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int warp = mk_tid() >> 5, lane = mk_tid() & 31;
   const int rowA = tile * MK_ROW_R2 + warp;
   float* dw_rows = reinterpret_cast<float*>(smem_raw);
   float* dw_row = dw_rows + (int64_t)warp * H;
@@ -982,7 +988,7 @@ __device__ void op_rmsnorm_bwd_dw(const Instr& I, int tile, void** bufs, char* s
   }
   consumer_sync();
   float* dw = reinterpret_cast<float*>(bufs[I.args[4]]);
-  for (int i = threadIdx.x; i < H; i += MK_CONSUMERS) {
+  for (int i = mk_tid(); i < H; i += MK_CONSUMERS) {
     float s = 0.0f;
 #pragma unroll
     for (int r = 0; r < 8; ++r) s += dw_rows[(int64_t)r * H + i];
@@ -995,7 +1001,7 @@ __device__ void op_rmsnorm_bwd_dw(const Instr& I, int tile, void** bufs, char* s
 // args: {gu, h, S, Iw}; tile = MK_ROW_R-row group, one warp per row.
 __device__ void op_swiglu_fwd(const Instr& I, int tile, void** bufs) {
   const int S = I.args[2], Iw = I.args[3];
-  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int warp = mk_tid() >> 5, lane = mk_tid() & 31;
   const int row = tile * MK_ROW_R + warp;
   if (row >= S) return;  // barrier-free op: early exit is safe
   const bf16* gu = reinterpret_cast<const bf16*>(bufs[I.args[0]]) + (int64_t)row * 2 * Iw;
@@ -1026,7 +1032,7 @@ __device__ void op_swiglu_fwd(const Instr& I, int tile, void** bufs) {
 __device__ void op_swiglu_bwd(const Instr& I, int tile, void** bufs) {
   const int S = I.args[3], Iw = I.args[4];
   const bool dy_f32 = I.args[5] != 0;
-  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int warp = mk_tid() >> 5, lane = mk_tid() & 31;
   const int row = tile * MK_ROW_R + warp;
   if (row >= S) return;  // barrier-free op: early exit is safe
   const bf16* gu = reinterpret_cast<const bf16*>(bufs[I.args[0]]) + (int64_t)row * 2 * Iw;
@@ -1077,7 +1083,7 @@ __device__ void op_qknorm_rope_fwd(const Instr& I, int tile, void** bufs, char* 
   bf16* dst_row = reinterpret_cast<bf16*>(bufs[I.args[1]]) + (int64_t)row * stride;
   const float* cosr = reinterpret_cast<const float*>(bufs[I.args[6]]) + (int64_t)row * (D / 2);
   const float* sinr = reinterpret_cast<const float*>(bufs[I.args[7]]) + (int64_t)row * (D / 2);
-  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, nwarp = MK_CONSUMERS / 32;
+  const int warp = mk_tid() / 32, lane = mk_tid() % 32, nwarp = MK_CONSUMERS / 32;
 
   for (int h = warp; h < nq + 2 * nkv; h += nwarp) {
     const bf16* src = src_row + h * D;
@@ -1123,11 +1129,11 @@ __device__ void op_qknorm_rope_bwd(const Instr& I, int tile, void** bufs, char* 
   const bool dy_f32 = I.args[14] != 0;
   const int S = I.args[15];
   const int stride = (nq + 2 * nkv) * D, nh = nq + 2 * nkv;
-  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, nwarp = MK_CONSUMERS / 32;
+  const int warp = mk_tid() / 32, lane = mk_tid() % 32, nwarp = MK_CONSUMERS / 32;
 
   float* dwq_s = reinterpret_cast<float*>(smem_raw);  // [D] + [D] fp32 partials
   float* dwk_s = dwq_s + D;
-  for (int i = threadIdx.x; i < 2 * D; i += MK_CONSUMERS) dwq_s[i] = 0.0f;
+  for (int i = mk_tid(); i < 2 * D; i += MK_CONSUMERS) dwq_s[i] = 0.0f;
   consumer_sync();
 
   for (int t = warp; t < MK_ROW_R * nh; t += nwarp) {
@@ -1183,7 +1189,7 @@ __device__ void op_qknorm_rope_bwd(const Instr& I, int tile, void** bufs, char* 
   consumer_sync();
   float* dqw = reinterpret_cast<float*>(bufs[I.args[5]]);
   float* dkw = reinterpret_cast<float*>(bufs[I.args[6]]);
-  for (int i = threadIdx.x; i < D; i += MK_CONSUMERS) {
+  for (int i = mk_tid(); i < D; i += MK_CONSUMERS) {
     atomicAdd(&dqw[i], dwq_s[i]);
     atomicAdd(&dkw[i], dwk_s[i]);
   }
@@ -1196,7 +1202,7 @@ __device__ void op_embed_fwd(const Instr& I, int tile, void** bufs) {
   const int t = reinterpret_cast<const int*>(bufs[I.args[0]])[tile];
   const bf16* e = reinterpret_cast<const bf16*>(bufs[I.args[1]]) + (int64_t)t * H;
   bf16* x = reinterpret_cast<bf16*>(bufs[I.args[2]]) + (int64_t)tile * H;
-  for (int i = threadIdx.x; i < H; i += MK_CONSUMERS) x[i] = e[i];
+  for (int i = mk_tid(); i < H; i += MK_CONSUMERS) x[i] = e[i];
 }
 
 // bwd scatter-add: demb[tok[r],:] += dx[r,:] (fp32 atomics). args: {tok, dx, demb, H}.
@@ -1205,7 +1211,7 @@ __device__ void op_embed_bwd(const Instr& I, int tile, void** bufs) {
   const int t = reinterpret_cast<const int*>(bufs[I.args[0]])[tile];
   const bf16* dx = reinterpret_cast<const bf16*>(bufs[I.args[1]]) + (int64_t)tile * H;
   float* de = reinterpret_cast<float*>(bufs[I.args[2]]) + (int64_t)t * H;
-  for (int i = threadIdx.x; i < H; i += MK_CONSUMERS) atomicAdd(&de[i], bf2f(dx[i]));
+  for (int i = mk_tid(); i < H; i += MK_CONSUMERS) atomicAdd(&de[i], bf2f(dx[i]));
 }
 
 // ---- cross entropy ----------------------------------------------------------------------
@@ -1228,14 +1234,14 @@ __device__ void op_ce_fwd(const Instr& I, int tile, void** bufs, char* smem_raw)
   float mx = -INFINITY, se = 0.0f;
   if (nparts > 0) {
     const float* parts = reinterpret_cast<const float*>(bufs[I.args[6]]) + (int64_t)tile * nparts * 2;
-    for (int i = threadIdx.x; i < nparts; i += MK_CONSUMERS) {
+    for (int i = mk_tid(); i < nparts; i += MK_CONSUMERS) {
       const float om = parts[i * 2], os = parts[i * 2 + 1];
       const float M = fmaxf(mx, om);
       se = (mx == -INFINITY && om == -INFINITY) ? 0.0f : se * expf(mx - M) + os * expf(om - M);
       mx = M;
     }
   } else {
-    for (int i = threadIdx.x; i < V; i += MK_CONSUMERS) {
+    for (int i = mk_tid(); i < V; i += MK_CONSUMERS) {
       const float zv = bf2f(z[i]);
       if (zv > mx) {
         se = se * expf(mx - zv) + 1.0f;
@@ -1253,12 +1259,12 @@ __device__ void op_ce_fwd(const Instr& I, int tile, void** bufs, char* smem_raw)
     se = (mx == -INFINITY && om == -INFINITY) ? 0.0f : se * expf(mx - M) + os * expf(om - M);
     mx = M;
   }
-  if ((threadIdx.x & 31) == 0) {
-    scratch[(threadIdx.x >> 5) * 2] = mx;
-    scratch[(threadIdx.x >> 5) * 2 + 1] = se;
+  if ((mk_tid() & 31) == 0) {
+    scratch[(mk_tid() >> 5) * 2] = mx;
+    scratch[(mk_tid() >> 5) * 2 + 1] = se;
   }
   consumer_sync();
-  if (threadIdx.x == 0) {
+  if (mk_tid() == 0) {
     mx = scratch[0];
     se = scratch[1];
     for (int w = 1; w < MK_CONSUMERS / 32; ++w) {
@@ -1275,7 +1281,7 @@ __device__ void op_ce_fwd(const Instr& I, int tile, void** bufs, char* smem_raw)
   se = scratch[1];
   consumer_sync();
   const float lse = mx + logf(se);
-  if (threadIdx.x == 0) {
+  if (mk_tid() == 0) {
     lse_out[tile] = lse;
     if (label >= 0) atomicAdd(loss, (lse - bf2f(z[label])) * inv_valid);
   }
@@ -1294,7 +1300,7 @@ __device__ void op_ce_bwd(const Instr& I, int tile, void** bufs) {
     // 2-byte accesses on the fattest activation buffer — latency-bound at 8 warps.
     // libm expf kept: bitwise-identical dlogits vs the reference path (the peer
     // session measured __expf here and reverted it).
-    for (int i = threadIdx.x * 8; i < V; i += MK_CONSUMERS * 8) {
+    for (int i = mk_tid() * 8; i < V; i += MK_CONSUMERS * 8) {
       float zv[8];
       ld8bf(z + i, zv);
 #pragma unroll
@@ -1305,7 +1311,7 @@ __device__ void op_ce_bwd(const Instr& I, int tile, void** bufs) {
       st8bf(z + i, zv);
     }
   } else {
-    for (int i = threadIdx.x; i < V; i += MK_CONSUMERS) {
+    for (int i = mk_tid(); i < V; i += MK_CONSUMERS) {
       const float p = expf(bf2f(z[i]) - lse);
       z[i] = f2bf(scale * (p - (i == label ? 1.0f : 0.0f)));
     }

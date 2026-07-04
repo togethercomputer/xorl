@@ -33,7 +33,7 @@ struct AttnSmem {
 // Warps 0..3 compute the four 16x16 output tiles.
 __device__ __forceinline__ void mma_ab_t(AttnSmem& S, const bf16 (*A)[136],
                                          const bf16 (*B)[136], int D) {
-  const int warp = threadIdx.x / 32;
+  const int warp = mk_tid() / 32;
   if (warp < 4) {
     const int wm = warp / 2, wn = warp % 2;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
@@ -56,7 +56,7 @@ __device__ __forceinline__ void mma_ab_t(AttnSmem& S, const bf16 (*A)[136],
 template <bool A_COL>
 __device__ __forceinline__ void mma_acc(float (*Acc)[132], const bf16 (*A)[40],
                                         const bf16 (*B)[136], int D) {
-  const int warp = threadIdx.x / 32;
+  const int warp = mk_tid() / 32;
   const int wm = warp / 4, wn = warp % 4;  // 2 x 4
   const int nfr = D / 64;                  // 16-col frags per warp
   for (int f = 0; f < nfr; ++f) {
@@ -87,7 +87,7 @@ __device__ __forceinline__ void load_tile(bf16 (*dst)[136], const bf16* base, in
                                           int D) {
   // D and all row/col offsets are multiples of 8 -> 16B-vectorized loads. OOB rows zero.
   const int vpr = D / 8;  // uint4 vectors per row
-  for (int v = threadIdx.x; v < AT_T * vpr; v += MK_CONSUMERS) {
+  for (int v = mk_tid(); v < AT_T * vpr; v += MK_CONSUMERS) {
     const int r = v / vpr, c = (v % vpr) * 8;
     const int gr = r0 + r;
     uint4 val = make_uint4(0, 0, 0, 0);
@@ -113,7 +113,7 @@ __device__ void op_attn_fwd(const Instr& I, int tile, void** bufs, char* smem_ra
   const int qh = tile % nq, q0 = (tile / nq) * AT_T;
   const int kvh = qh / (nq / nkv);
   const int stride = (nq + 2 * nkv) * D;
-  const int tid = threadIdx.x;
+  const int tid = mk_tid();
 
   load_tile(sm.Qs, qkv, q0, S, qh * D, stride, D);
   for (int i = tid; i < AT_T * D; i += MK_CONSUMERS) sm.Acc1[i / D][i % D] = 0.0f;
@@ -194,7 +194,7 @@ __device__ void op_attn_fwd_split(const Instr& I, int tile, void** bufs, char* s
   const int chunk = rem % C;
   const int kvh = qh / (nq / nkv);
   const int stride = (nq + 2 * nkv) * D;
-  const int tid = threadIdx.x;
+  const int tid = mk_tid();
 
   load_tile(sm.Qs, qkv, q0, S, qh * D, stride, D);
   for (int i = tid; i < AT_T * D; i += MK_CONSUMERS) sm.Acc1[i / D][i % D] = 0.0f;
@@ -264,7 +264,7 @@ __device__ void op_attn_combine(const Instr& I, int tile, void** bufs) {
   const float* Lpart = reinterpret_cast<const float*>(bufs[I.args[2]]);
   bf16* O = reinterpret_cast<bf16*>(bufs[I.args[3]]);
   float* LSE = reinterpret_cast<float*>(bufs[I.args[4]]);
-  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const int warp = mk_tid() / 32, lane = mk_tid() % 32;
   const int s = tile;
   for (int h = warp; h < nq; h += MK_CONSUMERS / 32) {
     float mstar = -INFINITY;
@@ -300,7 +300,7 @@ __device__ void op_attn_dpre(const Instr& I, int tile, void** bufs) {
   const bf16* dO = reinterpret_cast<const bf16*>(bufs[I.args[0]]) + (int64_t)tile * nq * D;
   const bf16* O = reinterpret_cast<const bf16*>(bufs[I.args[1]]) + (int64_t)tile * nq * D;
   float* Drow = reinterpret_cast<float*>(bufs[I.args[2]]);
-  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const int warp = mk_tid() / 32, lane = mk_tid() % 32;
   for (int h = warp; h < nq; h += MK_CONSUMERS / 32) {
     float acc = 0.0f;
     for (int d = lane; d < D; d += 32) acc += bf2f(dO[h * D + d]) * bf2f(O[h * D + d]);
@@ -315,7 +315,7 @@ __device__ __forceinline__ void recompute_p_ds(AttnSmem& sm, const float* LSE,
                                                const float* Drow, int qh, int q0, int k0,
                                                int S, float scale, int D) {
   mma_ab_t(sm, sm.Qs, sm.Ks, D);  // Ss = Q K^T
-  const int tid = threadIdx.x;
+  const int tid = mk_tid();
   const int lane = tid % 32, warp = tid / 32;
   for (int r = warp * 4; r < warp * 4 + 4; ++r) {
     const int qr = q0 + r;
@@ -355,7 +355,7 @@ __device__ void op_attn_dkv(const Instr& I, int tile, void** bufs, char* smem_ra
   const int k0 = (rem / G) * AT_T;
   const int g = rem % G;  // one GQA group member per tile (parallel, fp32-atomic reduce)
   const int stride = (nq + 2 * nkv) * D;
-  const int tid = threadIdx.x;
+  const int tid = mk_tid();
   float* ws = reinterpret_cast<float*>(dqkv);  // fp32 [S, stride] workspace (pre-zeroed)
 
   load_tile(sm.Ks, qkv, k0, S, (nq + kvh) * D, stride, D);
@@ -407,7 +407,7 @@ __device__ void op_attn_dq(const Instr& I, int tile, void** bufs, char* smem_raw
   const int chunk = rem % C;  // this tile handles kv tiles chunk, chunk+C, ...
   const int kvh = qh / (nq / nkv);
   const int stride = (nq + 2 * nkv) * D;
-  const int tid = threadIdx.x;
+  const int tid = mk_tid();
   float* ws = reinterpret_cast<float*>(dqkv);  // fp32 [S, stride] workspace (pre-zeroed)
 
   load_tile(sm.Qs, qkv, q0, S, qh * D, stride, D);
