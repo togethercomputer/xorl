@@ -751,6 +751,17 @@ completion-hint commit (`eba44d5`), the win held again: nano 512=1249.6/1229.7us
 (`results/mkv3-p4b-headtarget256-after-hint-ab.log`). The default is now 256; the env
 knob stays for reruns.
 
+Post-headtarget attention chunk recheck: with the current defaults at `431ed91`, a
+fresh env-only sweep kept the routed WG attention chunk defaults unchanged. Small is
+best at the existing `Ckv=1,Cq=1` (4350us vs >=4378us for the nearest alternates;
+`results/mkv3-p4b-after-headtarget-attn-small-sweep.log`). Nano's broad sweep showed a
+small apparent `Ckv=3,Cq=1` edge, but the alternating A/B was not stable: default
+`Ckv=2,Cq=1` ran 1227.1/1214.9us, while `Ckv=3,Cq=1` ran 1216.3/1216.3us and
+`Ckv=2,Cq=2` ran 1221.6/1221.8us
+(`results/mkv3-p4b-after-headtarget-attn-nano-sweep.log`,
+`results/mkv3-p4b-after-headtarget-attn-nano-ckv3-ab.log`). No attention env default
+change was promoted.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
