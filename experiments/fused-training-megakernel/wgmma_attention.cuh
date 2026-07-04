@@ -617,8 +617,22 @@ __device__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs, char* smem_
     consumer_sync();  // both WGs done reading K/V stage t before refill
   }
 
-  // epilogue: stage dQ, then drain into the q columns. C=1 has one writer per
-  // q slice; chunked C>1 routes use atomic accumulation.
+  // epilogue: C=1 has one writer per q slice, so write the accumulator layout directly
+  // to the fp32 workspace and skip the smem stage/drain used by chunked atomics.
+  if (C == 1) {
+#pragma unroll
+    for (int n8 = 0; n8 < 8; ++n8)
+#pragma unroll
+      for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 2; ++j)
+          ws[(int64_t)qr[i] * stride + qh * D + n8 * 8 + cb + j] =
+              dq[n8 * 4 + i * 2 + j];
+    return;
+  }
+
+  // Chunked C>1 routes have multiple writers per q slice, so stage dQ then drain with
+  // coalesced fp32 atomics.
   float* Cs = reinterpret_cast<float*>(smem_raw);  // [128][68] overlay
 #pragma unroll
   for (int n8 = 0; n8 < 8; ++n8)
@@ -628,23 +642,12 @@ __device__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs, char* smem_
       for (int j = 0; j < 2; ++j)
         Cs[(wg * 64 + r0 + 8 * i) * 68 + n8 * 8 + cb + j] = dq[n8 * 4 + i * 2 + j];
   consumer_sync();
-  if (C == 1) {
 #pragma unroll
-    for (int gq = 0; gq < 4; ++gq) {
-      const int gid = tid + gq * MK_CONSUMERS;
-      const int r = gid >> 3, c8 = (gid & 7) << 3;
+  for (int gq = 0; gq < 4; ++gq) {
+    const int gid = tid + gq * MK_CONSUMERS;
+    const int r = gid >> 3, c8 = (gid & 7) << 3;
 #pragma unroll
-      for (int e = 0; e < 8; ++e)
-        ws[(int64_t)(q0 + r) * stride + qh * D + c8 + e] = Cs[r * 68 + c8 + e];
-    }
-  } else {
-#pragma unroll
-    for (int gq = 0; gq < 4; ++gq) {
-      const int gid = tid + gq * MK_CONSUMERS;
-      const int r = gid >> 3, c8 = (gid & 7) << 3;
-#pragma unroll
-      for (int e = 0; e < 8; ++e)
-        atomicAdd(&ws[(int64_t)(q0 + r) * stride + qh * D + c8 + e], Cs[r * 68 + c8 + e]);
-    }
+    for (int e = 0; e < 8; ++e)
+      atomicAdd(&ws[(int64_t)(q0 + r) * stride + qh * D + c8 + e], Cs[r * 68 + c8 + e]);
   }
 }
