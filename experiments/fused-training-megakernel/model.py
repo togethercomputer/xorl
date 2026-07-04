@@ -397,12 +397,23 @@ class MKQwen3:
             # o proj: dOatt = dX @ Wo with the Drow reduction fused into the epilogue
             # (flags bit10; replaces OP_ATTN_DPRE — one chain hop less per layer);
             # dWo += dX^T Oatt
-            p.instr(
-                mk.OP_GEMM,
-                mk.gemm_tiles(c.S, c.nq * c.D),
-                [B(W["dX"]), pr("wo"), B(W["dOatt"]), c.S, c.nq * c.D, c.H, 1024, 0, 0,
-                 a("oatt"), B(W[f"drow.{l}"]), c.D],
-            )
+            drow_flags = 1024
+            drow_wg_default = "1" if c.S >= 2048 else "0"
+            drow_wg = bool(int(os.environ.get("MK_DROW_WG_LONGONLY", drow_wg_default)))
+            if drow_wg and mk.wgmma_ok(c.S, c.nq * c.D, c.H, drow_flags):
+                p.instr(
+                    mk.OP_GEMM,
+                    mk.gemm_tiles_wgmma(c.S, c.nq * c.D),
+                    [B(W["dX"]), pr("wo"), B(W["dOatt"]), c.S, c.nq * c.D, c.H,
+                     drow_flags | 128, 0, 0, a("oatt"), B(W[f"drow.{l}"]), c.D],
+                )
+            else:
+                p.instr(
+                    mk.OP_GEMM,
+                    mk.gemm_tiles(c.S, c.nq * c.D),
+                    [B(W["dX"]), pr("wo"), B(W["dOatt"]), c.S, c.nq * c.D, c.H,
+                     drow_flags, 0, 0, a("oatt"), B(W[f"drow.{l}"]), c.D],
+                )
             gemm(B(W["dX"]), a("oatt"), gr("wo"), c.H, c.nq * c.D, c.S, 1 | 4 | 8)
             p.wave()
             # attention bwd: dkv splits the GQA loop (one group member per tile), dq

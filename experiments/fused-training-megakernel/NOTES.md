@@ -955,6 +955,18 @@ and small regressed. Same-GPU direct medians were control/variant nano
 (`mkv3-p4b-drow-wg-current-ab-20260704T191524Z.log`). The tiny S4096 win is not worth
 the short-S loss; leave this route isolated.
 
+Post-RMS-split long-S Drow-WGMMA route: the prior route's short-shape loss is avoided by
+gating the fused `dOatt = dX @ Wo` + Drow epilogue WGMMA path to `S >= 2048` only
+(`MK_DROW_WG_LONGONLY=0` restores the WMMA route, `=1` forces the WGMMA route where
+`wgmma_ok` allows it). A forced-route model test with `MK_WGMMA_NN_MIN=1` exercised the
+bit10 WGMMA epilogue and passed (`mkv3-p4b-drow-wg-longonly-forced-testmodel-20260704T221753Z.log`).
+S4096 timing promoted the long-only gate: GPU2 control/variant medians were
+4428.1/4398.3us with 19/20 paired wins
+(`mkv3-p4b-drow-wg-longonly-s4096-20260704T220831Z.log`); variant-first GPU3 confirmed
+4443.7/4438.5us with 18/20 paired wins
+(`mkv3-p4b-drow-wg-longonly-s4096-confirm-20260704T221402Z.log`). This remains off for
+nano/small by default because the earlier small regression was real.
+
 Post-headtarget SWIGLU_BWD two-row fold recheck: `MK_SWIGLU_BWD_R2=1` made each warp
 handle rows `r` and `r+8` under a 16-row tile, matching the RMSNorm two-row tile
 plumbing but keeping the per-row register lifetime short. Correctness was green
