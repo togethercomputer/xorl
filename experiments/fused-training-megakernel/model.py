@@ -165,6 +165,8 @@ class MKQwen3:
                 else:
                     sk = mk.gemm_split_k(M, N, K)
                     p.instr(mk.OP_GEMM, mk.gemm_tiles(M, N) * sk, [a, b, out, M, N, K, (flags | 32) & ~4, res, sk])
+            elif mk.wgmma_n128_ok(M, N, K, flags):  # m64n128 NT tile (P4b r3)
+                p.instr(mk.OP_GEMM, mk.gemm_tiles_wgmma_n128(M, N), [a, b, out, M, N, K, flags | 128 | 4096, res])
             elif mk.wgmma_ok(M, N, K, flags):  # Hopper warpgroup path
                 p.instr(mk.OP_GEMM, mk.gemm_tiles_wgmma(M, N), [a, b, out, M, N, K, flags | 128, res])
             else:
@@ -327,11 +329,12 @@ class MKQwen3:
         if self.fuse_ce and mk.wgmma_ok(c.S, c.V, c.H, 2):
             # lm_head gemm with per-row lse partials in the epilogue (bit11): CE fwd
             # reduces V/64 (max, sumexp) pairs instead of rescanning the V-wide row
+            n128 = mk.wgmma_n128_ok(c.S, c.V, c.H, 2 | 2048)
             p.instr(
                 mk.OP_GEMM,
-                mk.gemm_tiles_wgmma(c.S, c.V),
+                mk.gemm_tiles_wgmma_n128(c.S, c.V) if n128 else mk.gemm_tiles_wgmma(c.S, c.V),
                 [B(A["xnf"]), B(self.params["wlm"]), B(A["logits"]), c.S, c.V, c.H,
-                 2 | 128 | 2048, 0, 0, B(W["lse_parts"]), c.V // 64],
+                 2 | 128 | 2048 | (4096 if n128 else 0), 0, 0, B(W["lse_parts"]), c.V // 64],
             )
             p.wave()
             p.instr(

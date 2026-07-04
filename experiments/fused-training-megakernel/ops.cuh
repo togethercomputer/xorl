@@ -295,8 +295,14 @@ struct WgmmaSmem {
   bf16 A[2][2][4][1024];  // [stage][row-half][k16-step][64x16 INTER block] = 32KB
   bf16 B[2][4][1024];     // [stage][k16-step][64x16 INTER block]           = 16KB
 };
+struct WgmmaSmemN128 {
+  bf16 A[2][2][4][1024];  // [stage][row-half][k16-step][64x64 SW128 slab] = 32KB
+  bf16 B[2][8192];        // [stage][128 rows x 64 k elts SW128]           = 32KB
+};
 // epilogue staging overlays the (dead-by-then) stage buffers: 128 x 68 fp32 = 34.8KB
+// (n128: 128 x 128 fp32 = 64KB over the 64KB n128 stages)
 #define WG_LDC 68
+#define WG_LDC_N128 128
 
 __device__ __forceinline__ int wg_koff(int r, int k) {  // bytes within a 64-row block
   return ((r >> 3) << 8) + ((k >> 3) << 7) + ((r & 7) << 4) + ((k & 7) << 1);
@@ -387,12 +393,166 @@ __device__ __forceinline__ void wg_mma_ktile(const uint64_t (&da)[4], const uint
   cute::warpgroup_wait<0>();
 }
 
+
+template <class MMA>
+__device__ __forceinline__ void wg_mma_ktile_n128(const uint64_t (&da)[4], const uint64_t (&db)[4],
+                                                  float (&d)[64]) {
+  cute::warpgroup_arrive();
+#pragma unroll
+  for (int s = 0; s < 4; ++s)
+    MMA::fma(da[s], db[s], d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9],
+             d[10], d[11], d[12], d[13], d[14], d[15], d[16], d[17], d[18], d[19],
+             d[20], d[21], d[22], d[23], d[24], d[25], d[26], d[27], d[28], d[29],
+             d[30], d[31], d[32], d[33], d[34], d[35], d[36], d[37], d[38], d[39],
+             d[40], d[41], d[42], d[43], d[44], d[45], d[46], d[47], d[48], d[49],
+             d[50], d[51], d[52], d[53], d[54], d[55], d[56], d[57], d[58], d[59],
+             d[60], d[61], d[62], d[63], cute::SM90::GMMA::ScaleOut::One);
+  cute::warpgroup_commit_batch();
+  cute::warpgroup_wait<0>();
+}
+
+// m64n128 NT tile (v3 P4b r3, generalized from the peer session's lm_head route):
+// 64 fp32 accumulators/thread double the mma work per sync and halve B-traffic per
+// FLOP — the dependent chain per FLOP shortens (the one lever the register-lifetime
+// law allows). REG ~200 fits the 255 df budget; __noinline__ isolates the fat
+// accumulator frame from the dispatch switch. Supports NT + residual (bit16) + CE
+// partials (bit11); routing (flags bit12) excludes split-K/acc/f32/qkrope/Drow.
+__device__ __noinline__ void op_gemm_wgmma_n128(const Instr& I, int tile, void** bufs, char* smem_raw) {
+  namespace SG = cute::SM90::GMMA;
+  const bf16* A = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
+  const bf16* B = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
+  bf16* C = reinterpret_cast<bf16*>(bufs[I.args[2]]);
+  const int M = I.args[3], N = I.args[4], K = I.args[5], flags = I.args[6];
+  const bf16* Res = (flags & 16) ? reinterpret_cast<const bf16*>(bufs[I.args[7]]) : nullptr;
+
+  smem_raw = reinterpret_cast<char*>(
+      (reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
+  WgmmaSmemN128& S = *reinterpret_cast<WgmmaSmemN128*>(smem_raw);
+  const int n_tiles = N / 128;
+  const int m0 = (tile / n_tiles) * WG_BM;
+  const int n0 = (tile % n_tiles) * 128;
+  const int tid = mk_tid();
+  const int wg = tid / 128;
+  const int wtid = tid % 128;
+
+  auto issue_stage = [&](int k0, int st) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {  // A: 128r x 64k
+      const int v = tid + i * 256;
+      const int r = v / 8, k8 = (v % 8) * 8;
+      __pipeline_memcpy_async(
+          reinterpret_cast<char*>(S.A[st][r / 64]) + wg_koff_sw(r % 64, k8),
+          &A[(int64_t)(m0 + r) * K + k0 + k8], 16);
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {  // B: 128r x 64k
+      const int v = tid + i * 256;
+      const int r = v / 8, k8 = (v % 8) * 8;
+      __pipeline_memcpy_async(reinterpret_cast<char*>(S.B[st]) + wg_koff_sw(r, k8),
+                              &B[(int64_t)(n0 + r) * K + k0 + k8], 16);
+    }
+    __pipeline_commit();
+  };
+
+  float d[64];
+#pragma unroll
+  for (int i = 0; i < 64; ++i) d[i] = 0.0f;
+  const int iters = K / WG_BK;
+  issue_stage(0, 0);
+  for (int t = 0; t < iters; ++t) {
+    if (t + 1 < iters) issue_stage((t + 1) * WG_BK, (t + 1) & 1);
+    __pipeline_wait_prior(t + 1 < iters ? 1 : 0);
+    consumer_sync();
+    uint64_t da[4], db[4];
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      da[s] = wg_desc_ksw(S.A[t & 1][wg], s);
+      db[s] = wg_desc_ksw(S.B[t & 1], s);
+    }
+    wg_mma_ktile_n128<SG::MMA_64x128x16_F32BF16BF16_SS<SG::Major::K, SG::Major::K>>(da, db, d);
+    consumer_sync();
+  }
+
+  float* Cs = reinterpret_cast<float*>(smem_raw);
+  const int w = wtid / 32, l = wtid % 32;
+  {
+    const int r = wg * 64 + w * 16 + l / 4;
+    const int cb = (l % 4) * 2;
+#pragma unroll
+    for (int n8 = 0; n8 < 16; ++n8)
+#pragma unroll
+      for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 2; ++j)
+          Cs[(r + 8 * i) * WG_LDC_N128 + n8 * 8 + cb + j] = d[n8 * 4 + i * 2 + j];
+  }
+  consumer_sync();
+#pragma unroll
+  for (int g = 0; g < 8; ++g) {
+    const int gid = tid + g * 256;
+    const int m = gid / 16, c8 = (gid % 16) * 8;
+    const int64_t idx = (int64_t)(m0 + m) * N + n0 + c8;
+    float v[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) v[e] = Cs[m * WG_LDC_N128 + c8 + e];
+    if (Res) {
+      const uint4 rv = *reinterpret_cast<const uint4*>(&Res[idx]);
+      const bf16* re = reinterpret_cast<const bf16*>(&rv);
+#pragma unroll
+      for (int e = 0; e < 8; ++e) v[e] += bf2f(re[e]);
+    }
+    uint4 out;
+    bf16* oe = reinterpret_cast<bf16*>(&out);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) oe[e] = f2bf(v[e]);
+    *reinterpret_cast<uint4*>(&C[idx]) = out;
+  }
+
+  if (flags & 2048) {  // CE/LSE partials over both 64-col halves (see m64n64 version)
+    float* parts = reinterpret_cast<float*>(bufs[I.args[9]]);
+    const int nparts = I.args[10];
+    const int nb = n0 / WG_BN;
+    const int warp = tid / 32, lane = tid % 32;
+    for (int r = warp; r < WG_BM; r += 8) {
+#pragma unroll
+      for (int half = 0; half < 2; ++half) {
+        float mx = -INFINITY, se = 0.0f;
+        for (int cc = lane; cc < WG_BN; cc += 32) {
+          const float zv = bf2f(f2bf(Cs[r * WG_LDC_N128 + half * WG_BN + cc]));
+          if (zv > mx) {
+            se = se * __expf(mx - zv) + 1.0f;
+            mx = zv;
+          } else {
+            se += __expf(zv - mx);
+          }
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+          const float om = __shfl_xor_sync(0xffffffff, mx, o);
+          const float os = __shfl_xor_sync(0xffffffff, se, o);
+          const float Mx = fmaxf(mx, om);
+          se = (mx == -INFINITY && om == -INFINITY) ? 0.0f : se * __expf(mx - Mx) + os * __expf(om - Mx);
+          mx = Mx;
+        }
+        if (lane == 0) {
+          const int64_t o = ((int64_t)(m0 + r) * nparts + nb + half) * 2;
+          parts[o] = mx;
+          parts[o + 1] = se;
+        }
+      }
+    }
+  }
+}
+
 __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_raw) {
   namespace SG = cute::SM90::GMMA;
   const bf16* A = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
   const bf16* B = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
   void* Cp = bufs[I.args[2]];
   const int M = I.args[3], N = I.args[4], K = I.args[5], flags = I.args[6];
+  if (flags & 4096) {
+    op_gemm_wgmma_n128(I, tile, bufs, smem_raw);
+    return;
+  }
   const bool acc_c = flags & 4, c_f32 = flags & 8;
   const bf16* Res = (flags & 16) ? reinterpret_cast<const bf16*>(bufs[I.args[7]]) : nullptr;
 

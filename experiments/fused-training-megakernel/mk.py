@@ -81,6 +81,26 @@ def wgmma_ok(M, N, K, flags):
     return True  # NT
 
 
+def wgmma_n128_ok(M, N, K, flags):
+    """NT gemms eligible for the m64n128 tile (flags bit12): 64 accs/thread double
+    the mma work per sync and halve B-traffic per FLOP at the full 255-reg df
+    budget. Excludes split-K/acc/f32-out/qkrope/Drow (epilogues not implemented
+    at 128 cols; CE partials bit11 and residual bit16 ARE supported).
+    MK_WGMMA_N128: 0=off, 1=all eligible (default), 2=lm_head(bit11)-only."""
+    mode = int(os.environ.get("MK_WGMMA_N128", "1"))
+    if mode == 0:
+        return False
+    if not (flags & 2) or (flags & (1 | 4 | 8 | 32 | 256 | 1024)):
+        return False
+    if mode == 2 and not (flags & 2048):
+        return False
+    return M % 128 == 0 and N % 128 == 0 and K % 64 == 0
+
+
+def gemm_tiles_wgmma_n128(M, N):
+    return (M // 128) * (N // 128)
+
+
 def wgmma_split_k(M, N, K, target_tiles=512):
     """K-slices for a wgmma split-K gemm (64-aligned chunks)."""
     mnt = gemm_tiles_wgmma(M, N)
