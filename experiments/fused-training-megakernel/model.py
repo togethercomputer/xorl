@@ -398,9 +398,10 @@ class MKQwen3:
             gemm(B(W["dX"]), a("oatt"), gr("wo"), c.H, c.nq * c.D, c.S, 1 | 4 | 8)
             p.wave()
             # attention bwd: dkv splits the GQA loop (one group member per tile), dq
-            # chunks its kv loop; both accumulate into the fp32 workspace with atomics
-            # (pre-zeroed), then one convert drains it to bf16. Alias slots keep the
-            # disjoint q/kv writes parallel in the dependency analysis.
+            # chunks its kv loop, then one convert drains the fp32 workspace to bf16.
+            # DQ's C=1 kernel path has one writer per q slice and stores directly;
+            # DQ C>1 and DKV use atomics. Alias slots keep disjoint q/kv writes
+            # parallel in the dependency analysis.
             G = c.nq // c.nkv
             dkv_args = lambda: [  # noqa: E731
                 a("qkvr"),
