@@ -724,6 +724,13 @@ extern "C" __global__ void __maxnreg__(168) megakernel_ws(
       // copy; every thread has done its own acquire, so the slot bytes are visible).
       // Slot reuse needs batch seen+1 ACCOUNTED, which needs it FINISHED — no writer
       // can touch C->ins[slot] while this batch executes, and dispatch reads sQI.
+      // MK_WS_REGCOPY rebuilds with the old per-thread register copy (A/B: barrier
+      // cost per batch vs the 104B copy's spill; STACK 304 vs 544).
+#ifdef MK_WS_REGCOPY
+      const Instr I = C->ins[slot];  // ordered after the acquire
+      const int t0 = C->t0[slot], t1 = C->t1[slot];
+      if (I.op < 0) break;  // halt sentinel
+#else
       if (threadIdx.x < 3 + MK_MAX_ARGS)
         reinterpret_cast<int*>(&sQI[slot])[threadIdx.x] =
             reinterpret_cast<const int*>(&C->ins[slot])[threadIdx.x];
@@ -731,6 +738,7 @@ extern "C" __global__ void __maxnreg__(168) megakernel_ws(
       consumer_sync();  // snapshot complete before first dispatch
       const Instr& I = sQI[slot];
       if (I.op < 0) break;  // halt sentinel
+#endif
       for (int t = t0; t < t1; ++t) {
         dispatch(I, t, bufs, opsmem);
         consumer_sync();  // smem reuse safety + orders all consumer writes

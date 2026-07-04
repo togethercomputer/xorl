@@ -107,8 +107,9 @@ def load_ext(verbose=False):
     # the interpreter is LATENCY-bound at 1 block/SM, not bandwidth-bound. Separate
     # extension name per value: the torch build cache is name-keyed.
     occ2 = int(os.environ.get("MK_OCC2", "0"))
+    regcopy = int(os.environ.get("MK_WS_REGCOPY", "0"))
     return load(
-        name="xorl_megakernel" + ("_occ2" if occ2 else ""),
+        name="xorl_megakernel" + ("_occ2" if occ2 else "") + ("_wsrc" if regcopy else ""),
         sources=[os.path.join(_DIR, "megakernel.cu")],
         extra_cuda_cflags=[
             "-O3",
@@ -120,7 +121,8 @@ def load_ext(verbose=False):
             "--expt-relaxed-constexpr",
             "-lineinfo",
         ]
-        + (["-DMK_OCC2"] if occ2 else []),
+        + (["-DMK_OCC2"] if occ2 else [])
+        + (["-DMK_WS_REGCOPY"] if regcopy else []),
         verbose=verbose,
     )
 
