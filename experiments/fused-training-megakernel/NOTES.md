@@ -822,6 +822,15 @@ control nano/small totals 1145.0us / 4325.4us, variant 1169.1us / 4510.8us
 115.9us -> 114.5us, small 551.9us -> 556.9us), while other spans worsened. Do not
 merge the branch; this is another instance of the register-lifetime law.
 
+Post-headtarget RMSNorm-bwd four-row fold recheck: `MK_RMS_BWD_R4=1` made each warp
+fold four rows into one smem `dw` slot (32 rows/tile) instead of the default two-row
+fold. Correctness was green (`mkv3-p4b-rmsbwd-r4-testrmsnorm.log`,
+`mkv3-p4b-rmsbwd-r4-testmodel-fixedtiles.log`) and the RMSNorm-bwd span improved
+(nano 146.3us -> 126.3us, small 466.3us -> 443.9us), but the whole-step medians did
+not promote: control nano/small 1244.2us / 4344.0us, variant 1241.2us / 4370.6us
+(`mkv3-p4b-rmsbwd-r4-control-mkonly.log`,
+`mkv3-p4b-rmsbwd-r4-variant-fixedtiles-mkonly.log`). Keep the two-row default.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
