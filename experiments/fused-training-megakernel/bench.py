@@ -39,13 +39,16 @@ class TorchQwen3(torch.nn.Module):
             xn = rms(x, P[f"w1_{l}"])
             qkv = (xn @ P[f"wqkv_{l}"].T).view(c.S, c.nq + 2 * c.nkv, c.D)
             q, k, v = qkv[:, : c.nq], qkv[:, c.nq : c.nq + c.nkv], qkv[:, c.nq + c.nkv :]
-            q = rope(rms(q, P[f"qn_{l}"])).permute(1, 0, 2)
-            k = rope(rms(k, P[f"kn_{l}"])).permute(1, 0, 2)
-            v = v.permute(1, 0, 2)
-            k = k.repeat_interleave(c.nq // c.nkv, dim=0)
-            v = v.repeat_interleave(c.nq // c.nkv, dim=0)
-            o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-            x = x + o.permute(1, 0, 2).reshape(c.S, c.nq * c.D) @ P[f"wo_{l}"].T
+            # 4-D [1,H,S,D] + enable_gqa: flash-eligible SDPA. The original 3-D call
+            # SILENTLY math-decomposed (materialized S x S softmax + tf32 gemms) at
+            # every S — flash requires 4-D inputs — making every baseline number in
+            # the v3 program soft (nano 711 -> 633, small 2733 -> 1910 when fixed)
+            # and manufacturing a fake long-S crossover (see NOTES P4b retraction).
+            q = rope(rms(q, P[f"qn_{l}"])).permute(1, 0, 2).unsqueeze(0)
+            k = rope(rms(k, P[f"kn_{l}"])).permute(1, 0, 2).unsqueeze(0)
+            v = v.permute(1, 0, 2).unsqueeze(0)
+            o = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+            x = x + o.squeeze(0).permute(1, 0, 2).reshape(c.S, c.nq * c.D) @ P[f"wo_{l}"].T
             g, u = (rms(x, P[f"w2_{l}"]) @ P[f"wgu_{l}"].T).chunk(2, dim=-1)
             x = x + (F.silu(g) * u) @ P[f"wd_{l}"].T
         logits = rms(x, P["wf"]) @ P["wlm"].T

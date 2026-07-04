@@ -731,6 +731,41 @@ SCOREBOARD (median-of-50, fresh process per config, hardened baseline):
 | S=1024 (nano width)   | 1643 | 959  | 1.71x |
 (v3 start 2.65x/3.44x; post-P6 2.06x/2.06x; post-SW128 1.79x/1.65x.)
 
+## v3 P4b: RETRACTION + baseline correction — the crossover was a baseline bug
+
+The section below reported a long-S crossover. Chasing its mechanism exposed a
+BASELINE BUG present since bench.py was written: TorchQwen3 called
+F.scaled_dot_product_attention with 3-D [H,S,D] tensors, which the flash backend
+rejects — SDPA silently math-decomposed (materialized S x S softmax, tf32 gemms)
+at EVERY S, in every v3 measurement. torch.profiler on the baseline shows
+safe_softmax + xmma_f32f32_tf32f32 kernels, no flash, at S=1024 and S=4096 alike.
+
+With the fixed baseline (4-D + enable_gqa; parity vs the math twin verified,
+grads ~3%):
+
+| config | megakernel | flash-baseline | honest gap | (old soft gap) |
+|---|---|---|---|---|
+| nano  (H256 L4 S512)  | ~1235 | **633**  | **1.95x** | 1.76x |
+| small (H512 L8 S1024) | ~4370 | **1905** | **2.29x** | 1.62x |
+| S=4096 (nano width)   | ~4365 | **1560** | **2.80x** | "1.19x faster" |
+| S=8192 (nano width)   | ~10440| **3120** | **3.35x** | "1.68x faster" |
+(measured twice each; the megakernel column is unchanged and stands.)
+
+Consequences, honestly:
+- The long-S crossover is RETRACTED — an artifact of the baseline's quadratic
+  math-attention. Against real flash the megakernel falls FURTHER behind as S
+  grows (our attention ops are FA-class per-instr at S~1024 shapes but scale
+  worse than FA at long S).
+- Every "hardened baseline" number in the v3 program (711/2733 goalposts, all
+  gap ratios) was soft. The honest current gaps: nano 1.95x, small 2.29x.
+- The chunked-CE test in the section below remains valid methodology; its
+  conclusion ("CE was not the baseline's problem") is unchanged — the problem
+  was attention all along.
+- bench.py is fixed at the source (4-D + enable_gqa) so every future number is
+  against the real baseline. The v3 win gates restated: nano <= ~0.63ms,
+  small <= ~1.9ms — i.e., the true remaining program is ~2x, at its hardest
+  precisely where the megakernel thesis (boundary overheads) was weakest.
+
 ## v3 P4b: CROSSOVER — the megakernel BEATS compile+CUDAGraph at S >= ~3k
 
 Extending the S-sweep past the flag-planting configs (nano width H256 L4, then
