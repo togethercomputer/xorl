@@ -639,6 +639,14 @@ looked positive in one noisy run, but clean same-GPU A/B showed old gate, defaul
 forced `MK_DX_SPLIT_MAX_TILES=64` within noise for small while forced 64 hurt nano
 (`results/mkv3-p6-r4-dxsplit-ab-gpu5.log`). Keep the existing `<32` split-K gate.
 
+P4b current-base head dX retune: after the committed ws/checkpoint verdicts, the
+`dlogits @ Wlm` split-K target was rechecked without n128 on a clean GPU from the
+`2a5bc25` base. `MK_HEAD_DX_TARGET_TILES=256` beat the old 512 target in repeated
+direct timings: nano 512=1246.6/1235.4us vs 256=1225.3/1222.8us; small
+512=4392.9/4390.8us vs 256=4362.5/4363.5us
+(`results/mkv3-p4b-wsbase-headtarget-256-ab.log`). The default is now 256; the env knob
+stays for reruns.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
