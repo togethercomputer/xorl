@@ -98,7 +98,10 @@ __device__ __forceinline__ void load_tile(bf16 (*dst)[136], const bf16* base, in
 }
 
 // ---- forward ------------------------------------------------------------------------------
-// args: {qkv_r, O, LSE, S, nq, nkv, D, scale_bits}; tile = qh * n_qtiles + qtile
+// args: {qkv_r, O, LSE, S, nq, nkv, D, scale_bits}; tile = qtile * nq + qh.
+// qt-OUTER tile order: with causal masking, tile t only reads qkvr rows < (qt+1)*AT_T,
+// so the df2 region gate on qkvr is plain row-linear (k = nq * REGION_ROWS/AT_T), and
+// O/LSE complete in row order, making attention a row-linear PRODUCER for o-proj.
 __device__ void op_attn_fwd(const Instr& I, int tile, void** bufs, char* smem_raw) {
   const int S = I.args[3], nq = I.args[4], nkv = I.args[5], D = I.args[6];
   const float scale = __int_as_float(I.args[7]);
@@ -107,8 +110,7 @@ __device__ void op_attn_fwd(const Instr& I, int tile, void** bufs, char* smem_ra
   float* LSE = reinterpret_cast<float*>(bufs[I.args[2]]);
   AttnSmem& sm = *reinterpret_cast<AttnSmem*>(smem_raw);
 
-  const int n_qt = (S + AT_T - 1) / AT_T;
-  const int qh = tile / n_qt, q0 = (tile % n_qt) * AT_T;
+  const int qh = tile % nq, q0 = (tile / nq) * AT_T;
   const int kvh = qh / (nq / nkv);
   const int stride = (nq + 2 * nkv) * D;
   const int tid = threadIdx.x;

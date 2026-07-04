@@ -298,6 +298,46 @@ Implication for the plan: Phase 4's projected chain overhead at ~2.8us/hop over 
 ~76-hop chain is ~215us — the port is GO. An independent replication (second harness)
 is running to confirm the headline number.
 
+## v3 Phase 3: region-watermark tile deps (df2) — built, correct, and PARKED (negative)
+
+`megakernel_df2` + host gate emission (mk.py `_build_gates`): producers publish
+completed 128-row REGIONS (per-region tile counters → frontier); each gated consumer's
+claim cursor is bounded by watermark = frontier × k_edge (host-precomputed tiles-per-
+region). ≤1 gated in-edge per consumer (latest row-linear producer); everything else
+stays instruction-granular. Parity: full test_model agreement (66/143 nano, 126/271
+small instrs gated), rerun-stable, losses bit-identical to df.
+
+Protocol lessons (hard-won, in order):
+1. NEVER route unbounded claims through a CAS loop — with ~all blocks claiming from one
+   big instr it degrades quadratically (df2 first cut: 2.5x slower; fetch-add fast path
+   for bound==ntiles recovered half).
+2. Parked-in-ring gated instrs pin the consumed head and every idle block rescans them
+   continuously (memory-system saturation). Fix: event-driven wakeup — exhausted gated
+   instrs are KILLED out of the ring (slot -> -3) and re-pushed by the producer's
+   watermark raise (queued[] dedupe flag + Dekker-style re-check with __threadfence for
+   the lost-wakeup race; ring sized n + Σ(regions+1) per gate).
+3. Volatile reads are mandatory on the region-counter prefix scan (stale L1 would
+   strand the frontier); a final unbounded watermark publish on producer completion
+   removes all residual deadlock risk.
+
+THE VERDICT: after all fixes, df2 = df + 300-400us at BOTH configs (nano 1853 vs 2158,
+small 9028 vs 9440). Region overlap cannot pay here because op spans are INTRINSIC-
+LATENCY-bound (long serial kv/k loops per tile; 64-256 tiles on 132 blocks = no queue
+backlog) — tile-granular deps eat the QUEUEING component of span, and there is none.
+The machinery (wakeups, bounded claims, region accounting, longer ring scans) is pure
+overhead at this scale. Parked per the plan's kill rule; executor + emission retained
+(mode="df2"), df remains default. Would bind for throughput-bound programs (tiles >>
+blocks) — not this regime.
+
+KEEPERS from the round:
+- **qt-outer attention tile order** (tile = qt*nq + qh, attention.cuh): small df
+  9268 -> 9028 (-240us) — short causal tiles first lets blocks pick up off-path work
+  while the long tiles run. Kept unconditionally (also what any prefix gating needs).
+- claim quantum: 264 beats the "true" 132 at small (bigger batches worsen tail balance
+  on multi-round instrs; nano mildly prefers 132). Left at 264; per-config knob for P6.
+
+Scoreboard after Phase 3: **nano 1853 / small 9028 (df)** vs hardened 711/2730.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.3x faster. The measured structural gap, in order:

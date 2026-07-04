@@ -41,7 +41,7 @@ def instr_label(op, args):
     return OP_NAMES.get(op, f"op{op}")
 
 
-def profile(m, runs=5):
+def profile(m, runs=5, mode="df"):
     prog = m.prog
     n = prog.n_instr
     flat = [ins for wave in prog.waves for ins in wave]
@@ -51,13 +51,13 @@ def profile(m, runs=5):
     labels = torch.roll(tokens, -1).to(torch.int32)
     labels[-1] = -100
     for _ in range(5):  # warmup / jit settle
-        m.step(tokens, labels)
+        m.step(tokens, labels, mode=mode)
     torch.cuda.synchronize()
 
     best = None
     for _ in range(runs):
         iclk = torch.zeros(2 * n, dtype=torch.int64, device="cuda")
-        prog.run(m.ext, wave_clk=iclk)
+        prog.run(m.ext, wave_clk=iclk, mode=mode)
         torch.cuda.synchronize()
         clk = iclk.cpu()
         starts, ends = clk[0::2].numpy(), clk[1::2].numpy()
@@ -86,10 +86,12 @@ def profile(m, runs=5):
     covered = sum(w + s for _, w, s in path) + (0 if not path else starts[path[0][0]] - t0)
     print(f"step total {total / 1e3:9.1f} us   chain hops {len(path)}   "
           f"attribution {covered / total * 100:5.1f}%")
-    W = sum(w for _, w, _ in path)
+    W = sum(w for _, w, _ in path if w > 0)
+    O = -sum(w for _, w, _ in path if w < 0)  # negative wait = region-gated overlap (df2)
     E = sum(s for _, _, s in path)
     print(f"  on-path wait {W / 1e3:8.1f} us ({W / total * 100:4.1f}%)   "
-          f"on-path span {E / 1e3:8.1f} us ({E / total * 100:4.1f}%)")
+          f"on-path span {E / 1e3:8.1f} us ({E / total * 100:4.1f}%)   "
+          f"overlap {O / 1e3:8.1f} us")
 
     # per-label aggregation along the path
     agg = {}
@@ -126,14 +128,15 @@ def profile(m, runs=5):
 
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "both"
+    mode = sys.argv[2] if len(sys.argv) > 2 else "df"
     torch.cuda.set_device(0)
     if which in ("nano", "both"):
-        print("=== nano ===")
+        print(f"=== nano ({mode}) ===")
         m = MKQwen3(Cfg(), seed=0)
-        print(f"n_instr={m.prog.n_instr} critical_path={m.prog.critical_path}")
-        profile(m)
+        print(f"n_instr={m.prog.n_instr} critical_path={m.prog.critical_path} gated={m.prog.n_gated}")
+        profile(m, mode=mode)
     if which in ("small", "both"):
-        print("=== small ===")
+        print(f"=== small ({mode}) ===")
         m = MKQwen3(Cfg(H=512, L=8, nq=8, nkv=4, D=64, I=1536, V=16384, S=1024), seed=0)
-        print(f"n_instr={m.prog.n_instr} critical_path={m.prog.critical_path}")
-        profile(m)
+        print(f"n_instr={m.prog.n_instr} critical_path={m.prog.critical_path} gated={m.prog.n_gated}")
+        profile(m, mode=mode)

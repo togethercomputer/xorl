@@ -161,6 +161,86 @@ def _access_sets(op, args):
     raise ValueError(f"no access signature for op {op}")
 
 
+REGION_ROWS = 128  # producer progress granularity for df2 region watermarks
+
+# write positions whose output is row-linear in the instr's m-major tile order
+# (tile t covers rows [t*rows_per_tile, ...) — the requirement for region gating)
+_ROW_WRITE_POS = {
+    OP_RMSNORM_FWD: (2, 3),
+    OP_RMSNORM_BWD: (3,),  # dx only; dw is a cross-row atomic scatter
+    OP_SWIGLU_FWD: (1,),
+    OP_SWIGLU_BWD: (2,),
+    OP_QKNORM_ROPE_FWD: (1, 4, 5),
+    OP_QKNORM_ROPE_BWD: (2,),
+    OP_CE_FWD: (2,),  # lse; loss is a scalar atomic
+    OP_CE_BWD: (0,),
+    OP_EMBED_FWD: (2,),
+}
+
+# read positions that consume a buffer row-linearly (consumer tile = row)
+_ROW_READ_POS = {
+    OP_RMSNORM_FWD: (0,),
+    OP_RMSNORM_BWD: (0, 2, 5),
+    OP_SWIGLU_FWD: (0,),
+    OP_SWIGLU_BWD: (0, 1),
+    OP_QKNORM_ROPE_FWD: (0,),
+    OP_QKNORM_ROPE_BWD: (0, 1, 7, 8),
+    OP_CE_FWD: (0, 2, 6),
+    OP_CE_BWD: (0, 2),
+    OP_EMBED_BWD: (1,),
+}
+
+
+def _gemm_row_info(args):
+    """(rows, tiles_per_region) for a gemm's OUTPUT, or None if not 128-row-band linear."""
+    flags, M, N = args[6], args[3], args[4]
+    if M % REGION_ROWS:
+        return None
+    sk = args[8] if flags & 32 else 1
+    if flags & 128:
+        return M, (N // 64) * sk
+    return M, ((N + GEMM_BN - 1) // GEMM_BN) * 2 * sk
+
+
+def _producer_row_info(op, ntiles, args, root, root_of):
+    """(rows, band_tiles) if `root` is written row-linearly by this instr."""
+    if op == OP_GEMM:
+        if root_of(args[2]) == root:
+            return _gemm_row_info(args)
+        if args[6] & 256 and root_of(args[15]) == root:  # fused qkrope: qkvr rows = C rows
+            return _gemm_row_info(args)
+        return None
+    if op == OP_ATTN_FWD:  # qt-outer tile order: O completes in row order
+        S, nq = args[3], args[4]
+        if root_of(args[1]) == root and S % REGION_ROWS == 0:
+            return S, nq * (REGION_ROWS // 32)
+        return None
+    for pos in _ROW_WRITE_POS.get(op, ()):
+        if root_of(args[pos]) == root:
+            return (ntiles, REGION_ROWS) if ntiles % REGION_ROWS == 0 else None
+    return None
+
+
+def _consumer_gate_k(op, ntiles, args, pos, prod_rows):
+    """Consumer tiles enabled per completed producer region, or None if not gateable."""
+    if op == OP_GEMM:
+        flags = args[6]
+        ok = (pos == 0 and not (flags & 1)) or (pos == 7 and (flags & 16))
+        if not ok:
+            return None  # B operand / transposed A: tile needs ALL producer rows
+        info = _gemm_row_info(args)  # consumer's own M-band structure
+        return info[1] if info is not None and args[3] == prod_rows else None
+    if op == OP_ATTN_FWD and pos == 0:
+        # qt-outer + causal: tile t needs qkvr rows < (t/nq + 1)*32 — a row prefix
+        S, nq = args[3], args[4]
+        if S == prod_rows and S % REGION_ROWS == 0:
+            return nq * (REGION_ROWS // 32)
+        return None
+    if pos in _ROW_READ_POS.get(op, ()) and ntiles == prod_rows:
+        return REGION_ROWS
+    return None
+
+
 class Program:
     def __init__(self):
         self.bufs = []
@@ -213,6 +293,103 @@ class Program:
                 history.setdefault(root, []).append((idx, is_write, self._buf_meta[buf_id][1]))
         return deps
 
+    def _build_gates(self, flat, deps):
+        """Region-watermark gating for df2: pick ≤1 gated in-edge per consumer.
+
+        A RAW edge P→C on buffer X is gateable when P writes X row-linearly in m-major
+        128-row bands and C's tiles consume X row-linearly (rowop input, gemm A operand
+        non-transposed, or gemm residual) — then C may claim tiles as P's row regions
+        complete instead of waiting for P's last tile. The gated edge leaves C's pending
+        count; every other dependency stays instruction-granular. Safe because any
+        interleaved writer Q of X orders after P instruction-granularly, and the
+        producer publishes an unbounded watermark on full completion.
+        """
+        n = len(flat)
+        root_of = lambda b: self._buf_meta[b][0]  # noqa: E731
+        # per-read-access dependency contributions (same conflict rules as _build_deps)
+        history = {}
+        read_contrib = [dict() for _ in range(n)]  # pos -> set of prior writers
+        for idx, (op, _ntiles, args) in enumerate(flat):
+            r_pos, w_pos = _access_sets(op, args)
+            for pos in r_pos:
+                root, slot = self._buf_meta[args[pos]]
+                s = set()
+                for prior_idx, prior_write, prior_slot in history.get(root, ()):
+                    if not prior_write:
+                        continue
+                    if slot is not None and prior_slot is not None and slot != prior_slot:
+                        continue
+                    if prior_idx != idx:
+                        s.add(prior_idx)
+                read_contrib[idx][pos] = s
+            accesses = [(args[p], False) for p in r_pos] + [(args[p], True) for p in w_pos]
+            for buf_id, is_write in accesses:
+                root, _ = self._buf_meta[buf_id]
+                history.setdefault(root, []).append((idx, is_write, self._buf_meta[buf_id][1]))
+
+        deps2 = [set(d) for d in deps]
+        gated_in = [0] * n
+        prod_info = {}  # producer idx -> (rows, band_tiles)
+        gates = [[] for _ in range(n)]  # producer idx -> [(consumer, k)]
+        for idx, (op, ntiles, args) in enumerate(flat):
+            best = None  # (producer idx, k, rows, band_tiles)
+            candidates = {max(s) for s in read_contrib[idx].values() if s}
+            for P in sorted(candidates, reverse=True):
+                if P not in deps[idx]:
+                    continue
+                op_p, ntiles_p, args_p = flat[P]
+                # EVERY read position touching P must be row-linear against P's output
+                # (min k across them bounds the claim); any non-gateable one keeps the
+                # edge instruction-granular.
+                k = None
+                ok = True
+                rows_p = band_p = 0
+                for pos, writers in read_contrib[idx].items():
+                    if P not in writers:
+                        continue
+                    root = self._buf_meta[args[pos]][0]
+                    info = _producer_row_info(op_p, ntiles_p, args_p, root, root_of)
+                    kp = None if info is None else _consumer_gate_k(op, ntiles, args, pos, info[0])
+                    if kp is None:
+                        ok = False
+                        break
+                    rows_p, band_p = info
+                    k = kp if k is None else min(k, kp)
+                if not ok or k is None:
+                    continue
+                # our writes must not touch anything P touches (WAR/WAW stay granular)
+                r_p, w_p = _access_sets(op_p, args_p)
+                p_roots = {root_of(args_p[q]) for q in r_p + w_p}
+                _, w_pos = _access_sets(op, args)
+                if any(root_of(args[q]) in p_roots for q in w_pos):
+                    continue
+                best = (P, k, rows_p, band_p)
+                break  # latest qualifying producer wins
+            if best is None:
+                continue
+            P, k, rows_p, band_p = best
+            gated_in[idx] = 1
+            deps2[idx].discard(P)
+            gates[P].append((idx, k))
+            prod_info[P] = (rows_p, band_p)
+
+        band = [0] * n
+        region_off, region_cnt0 = [0], []
+        gate_off, gate_cons, gate_k = [0], [], []
+        for i, (op, ntiles, args) in enumerate(flat):
+            if i in prod_info:
+                rows, bt = prod_info[i]
+                band[i] = bt
+                nr = (rows + REGION_ROWS - 1) // REGION_ROWS
+                for r in range(nr):
+                    region_cnt0.append(min(ntiles - r * bt, bt))
+            region_off.append(len(region_cnt0))
+            for cons, k in gates[i]:
+                gate_cons.append(cons)
+                gate_k.append(k)
+            gate_off.append(len(gate_cons))
+        return deps2, gated_in, band, region_off, region_cnt0, gate_off, gate_cons, gate_k
+
     def finalize(self, device="cuda"):
         if not self.waves[-1]:
             self.waves.pop()
@@ -245,6 +422,8 @@ class Program:
         for i in range(n):
             adj.extend(sorted(dependents[i]))
             adj_off.append(len(adj))
+        # claim quantum: 264 measured better than the "true" 132 block count at small
+        # (bigger batches worsen tail balance on multi-round instrs)
         claim = [max(1, min(8, (ntiles + 263) // 264)) for _, ntiles, _ in flat]
         self.n_instr = n
         self._dep_cnt = torch.tensor(dep_cnt, dtype=torch.int32, device=device)
@@ -254,6 +433,42 @@ class Program:
         # state: pending[n] | cursor[n] | done[n] | ready[n] | ctrl[4]
         self._state = torch.empty(4 * n + 4, dtype=torch.int32, device=device)
         self.critical_path = self._critical_path(deps, flat)
+
+        # df2 arrays: region-watermark gating (dep DAG minus gated edges + gate CSR)
+        deps2, gated_in, band, region_off, region_cnt0, gate_off, gate_cons, gate_k = (
+            self._build_gates(flat, deps)
+        )
+        dep_cnt2 = [len(d) for d in deps2]
+        dependents2 = [[] for _ in range(n)]
+        for i, d in enumerate(deps2):
+            for j in d:
+                dependents2[j].append(i)
+        adj_off2, adj2 = [0], []
+        for i in range(n):
+            adj2.extend(sorted(dependents2[i]))
+            adj_off2.append(len(adj2))
+        t32 = lambda v: torch.tensor(v if v else [0], dtype=torch.int32, device=device)  # noqa: E731
+        self._dep_cnt2 = torch.tensor(dep_cnt2, dtype=torch.int32, device=device)
+        self._adj_off2 = torch.tensor(adj_off2, dtype=torch.int32, device=device)
+        self._adj2 = t32(adj2)
+        self._gated_in = torch.tensor(gated_in, dtype=torch.int32, device=device)
+        self._band = torch.tensor(band, dtype=torch.int32, device=device)
+        self._region_off = torch.tensor(region_off, dtype=torch.int32, device=device)
+        self._region_cnt0 = t32(region_cnt0)
+        self._gate_off = torch.tensor(gate_off, dtype=torch.int32, device=device)
+        self._gate_cons = t32(gate_cons)
+        self._gate_k = t32(gate_k)
+        # ring capacity: every gated consumer may be parked + re-pushed once per
+        # producer region publish plus the final publish
+        ring_cap = n
+        for i in range(n):
+            nr = region_off[i + 1] - region_off[i]
+            ring_cap += (nr + 1) * (gate_off[i + 1] - gate_off[i])
+        self._ring_cap = ring_cap
+        # state2: pending|cursor|done|queued|watermark|frontier (n each)
+        #         | ready[ring_cap] | ctrl[4] | rcnt[R]
+        self._state2 = torch.empty(6 * n + ring_cap + 4 + len(region_cnt0), dtype=torch.int32, device=device)
+        self.n_gated = sum(gated_in)
         return self
 
     def _critical_path(self, deps, flat):
@@ -265,6 +480,26 @@ class Program:
     def run(self, ext, smem_bytes=100 * 1024, wave_clk=None, mode="df"):
         if mode == "waves":
             ext.run(self._instrs, self._wave_start, self._wave_tiles, self._buftab, smem_bytes, wave_clk)
+        elif mode == "df2":
+            ext.run_df2(
+                self._instrs,
+                self._dep_cnt2,
+                self._adj_off2,
+                self._adj2,
+                self._claim,
+                self._gated_in,
+                self._band,
+                self._region_off,
+                self._region_cnt0,
+                self._gate_off,
+                self._gate_cons,
+                self._gate_k,
+                self._ring_cap,
+                self._state2,
+                self._buftab,
+                smem_bytes,
+                wave_clk,
+            )
         else:
             ext.run_df(
                 self._instrs,

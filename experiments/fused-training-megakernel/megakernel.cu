@@ -285,6 +285,215 @@ extern "C" __global__ void megakernel_df(const Instr* __restrict__ instrs, int n
   }
 }
 
+// ---- dataflow executor v2: region watermarks (tile-granular producer/consumer) -------
+// Like megakernel_df, plus: producers with gated out-edges count completed tiles per
+// 128-row REGION (band_tiles[i] tiles each, m-major tile order required); a completed
+// region prefix advances frontier[i]; each gated edge publishes watermark[consumer] =
+// frontier * gate_k (precomputed: consumer tiles enabled per producer region) via
+// atomicMax. Gated consumers enter the ready ring when their REDUCED pending (gated
+// in-edge removed) hits zero, but tile claims are BOUNDED by the watermark (CAS loop
+// instead of the unconditional atomicAdd). On full completion the producer also
+// publishes an unbounded watermark — belt-and-suspenders against any frontier race.
+__global__ void megakernel_df2(const Instr* __restrict__ instrs, const int n_instr,
+                               const int ring_cap, const int* __restrict__ dep_cnt,
+                               const int* __restrict__ adj_off, const int* __restrict__ adj,
+                               const int* __restrict__ claim_sz, const int* __restrict__ gated_in,
+                               const int* __restrict__ band_tiles, const int* __restrict__ region_off,
+                               const int* __restrict__ region_cnt0, const int* __restrict__ gate_off,
+                               const int* __restrict__ gate_cons, const int* __restrict__ gate_k,
+                               int* __restrict__ state, void** __restrict__ bufs,
+                               long long* __restrict__ iclk) {
+  extern __shared__ char smem[];
+  // state: pending|cursor|done|queued|watermark|frontier (n each) | ready[ring_cap]
+  //        | ctrl[4] | region_cnt[R]
+  int* pending = state;
+  int* cursor = state + n_instr;
+  int* done = state + 2 * n_instr;
+  int* queued = state + 3 * n_instr;  // instr has a live ring slot (wakeup dedupe)
+  int* wmark = state + 4 * n_instr;
+  int* frontier = state + 5 * n_instr;
+  int* ready = state + 6 * n_instr;
+  int* ctrl = state + 6 * n_instr + ring_cap;
+  int* rcnt = ctrl + 4;
+  const int R = region_off[n_instr];
+
+  cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_instr;
+       i += gridDim.x * blockDim.x) {
+    pending[i] = dep_cnt[i];
+    cursor[i] = 0;
+    done[i] = 0;
+    queued[i] = dep_cnt[i] == 0 ? 1 : 0;
+    wmark[i] = gated_in[i] ? 0 : instrs[i].ntiles;
+    frontier[i] = 0;
+  }
+  for (int r = blockIdx.x * blockDim.x + threadIdx.x; r < ring_cap;
+       r += gridDim.x * blockDim.x)
+    ready[r] = -1;
+  for (int r = blockIdx.x * blockDim.x + threadIdx.x; r < R; r += gridDim.x * blockDim.x)
+    rcnt[r] = region_cnt0[r];
+  if (blockIdx.x == 0 && threadIdx.x < 4) ctrl[threadIdx.x] = 0;
+  grid.sync();
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_instr;
+       i += gridDim.x * blockDim.x) {
+    if (dep_cnt[i] == 0) {
+      const int t = atomicAdd(&ctrl[0], 1);
+      atomicExch(&ready[t], i);
+    }
+  }
+  grid.sync();
+
+  __shared__ int s_ins, s_t0, s_t1;
+  int last_ins = -1;  // sticky: retry the previous instruction before scanning
+  volatile int* vready = ready;
+  volatile int* vctrl = ctrl;
+  volatile int* vwmark = wmark;
+  volatile int* vrcnt = rcnt;
+  volatile int* vfrontier = frontier;
+  volatile int* vpending = pending;
+
+  auto push = [&](int i) {
+    const int t = atomicAdd(&ctrl[0], 1);
+    atomicExch(&ready[t], i);
+  };
+
+  // watermark-bounded claim (thread 0). Returns true and fills s_* on success.
+  auto try_claim = [&](int ins) -> bool {
+    const int nt = instrs[ins].ntiles;
+    const int bound = gated_in[ins] ? min(vwmark[ins], nt) : nt;
+    const int bs = claim_sz[ins];
+    if (bound == nt) {
+      // unbounded (ungated, or gated fully published): one-shot fetch-add — a CAS
+      // loop here degrades quadratically when ~all blocks claim from one big instr
+      const int t0 = atomicAdd(&cursor[ins], bs);
+      if (t0 < nt) {
+        s_ins = ins;
+        s_t0 = t0;
+        s_t1 = min(t0 + bs, nt);
+        return true;
+      }
+      return false;
+    }
+    int c = cursor[ins];
+    while (c < bound) {
+      const int t1 = min(c + bs, bound);
+      const int prev = atomicCAS(&cursor[ins], c, t1);
+      if (prev == c) {
+        s_ins = ins;
+        s_t0 = c;
+        s_t1 = t1;
+        return true;
+      }
+      c = prev;
+    }
+    return false;
+  };
+
+  for (;;) {
+    if (threadIdx.x == 0) {
+      s_ins = -1;
+      if (last_ins >= 0 && cursor[last_ins] < instrs[last_ins].ntiles) try_claim(last_ins);
+      while (s_ins < 0 && vctrl[1] < n_instr) {
+        const int gq0 = vctrl[2];
+        const int tail = vctrl[0];
+        for (int q = gq0; q < tail; ++q) {
+          const int ins = vready[q];
+          if (ins == -1) continue;  // slot reserved, payload not yet visible
+          if (ins == -3 || cursor[ins] >= instrs[ins].ntiles) {
+            if (q == vctrl[2]) atomicCAS(&ctrl[2], q, q + 1);  // dead/drained: advance head
+            continue;
+          }
+          if (try_claim(ins)) break;
+          // gated instr exhausted below its watermark: PARK it — kill the slot and
+          // transfer re-push duty to the watermark raisers (a parked entry would
+          // otherwise pin the consumed head and every idle block would rescan it)
+          if (gated_in[ins] && atomicExch(&queued[ins], 0) == 1) {
+            __threadfence();
+            const int nt = instrs[ins].ntiles;
+            if (cursor[ins] < min(vwmark[ins], nt)) {
+              // became claimable while parking: re-arm (lost-wakeup guard)
+              if (atomicExch(&queued[ins], 1) == 1)
+                atomicExch(&ready[q], -3);  // a raiser re-armed + pushed a fresh slot
+              // else our slot stays live; claim succeeds on a later pass
+            } else {
+              atomicExch(&ready[q], -3);
+            }
+          }
+        }
+        if (s_ins >= 0) break;
+        __nanosleep(256);
+      }
+      last_ins = s_ins;
+    }
+    __syncthreads();
+    const int ins = s_ins;
+    if (ins < 0) break;  // everything finished
+    const int t0 = s_t0, t1 = s_t1;
+    __syncthreads();
+    if (iclk && threadIdx.x == 0 && t0 == 0) iclk[2 * ins] = mk_globaltimer();
+    const Instr I = instrs[ins];
+    for (int t = t0; t < t1; ++t) {
+      dispatch(I, t, bufs, smem);
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      __threadfence();  // publish this batch's writes before any watermark/dep signal
+      const int ro = region_off[ins];
+      const int nr = region_off[ins + 1] - ro;
+      if (nr > 0) {  // producer with gated out-edges: per-region accounting
+        const int bt = band_tiles[ins];
+        bool raised = false;
+        for (int r = t0 / bt; r <= (t1 - 1) / bt; ++r) {
+          const int take = min(t1, (r + 1) * bt) - max(t0, r * bt);
+          if (atomicSub(&rcnt[ro + r], take) == take) {  // this batch zeroed region r
+            // advance frontier over the completed prefix (volatile reads: atomicSub
+            // results live in L2; a stale L1 read here could strand the frontier)
+            int f = vfrontier[ins];
+            while (f < nr && vrcnt[ro + f] == 0) {
+              atomicCAS(&frontier[ins], f, f + 1);
+              f = vfrontier[ins];
+            }
+            for (int e = gate_off[ins]; e < gate_off[ins + 1]; ++e)
+              atomicMax(&wmark[gate_cons[e]], f * gate_k[e]);
+            raised = true;
+          }
+        }
+        if (raised) {  // wake parked consumers (after ALL publishes; fence orders them)
+          __threadfence();
+          for (int e = gate_off[ins]; e < gate_off[ins + 1]; ++e) {
+            const int cons = gate_cons[e];
+            if (vpending[cons] == 0 && cursor[cons] < instrs[cons].ntiles &&
+                atomicExch(&queued[cons], 1) == 0)
+              push(cons);
+          }
+        }
+      }
+      const int d = atomicAdd(&done[ins], t1 - t0) + (t1 - t0);
+      if (d == I.ntiles) {  // last tile: enable dependents
+        if (iclk) iclk[2 * ins + 1] = mk_globaltimer();
+        for (int e = gate_off[ins]; e < gate_off[ins + 1]; ++e)
+          atomicMax(&wmark[gate_cons[e]], 0x3fffffff);  // final: everything enabled
+        __threadfence();
+        for (int e = gate_off[ins]; e < gate_off[ins + 1]; ++e) {
+          const int cons = gate_cons[e];
+          if (vpending[cons] == 0 && cursor[cons] < instrs[cons].ntiles &&
+              atomicExch(&queued[cons], 1) == 0)
+            push(cons);
+        }
+        for (int e = adj_off[ins]; e < adj_off[ins + 1]; ++e) {
+          const int dep = adj[e];
+          if (atomicSub(&pending[dep], 1) == 1) {
+            atomicExch(&queued[dep], 1);
+            push(dep);
+          }
+        }
+        atomicAdd(&ctrl[1], 1);
+      }
+    }
+    __syncthreads();
+  }
+}
+
 // ---- host launcher ------------------------------------------------------------------
 static int g_nblocks = -1;
 
@@ -372,8 +581,64 @@ void mk_run_df(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_of
                                              stream.stream()));
 }
 
+void mk_run_df2(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_off,
+                torch::Tensor adj, torch::Tensor claim_sz, torch::Tensor gated_in,
+                torch::Tensor band_tiles, torch::Tensor region_off, torch::Tensor region_cnt0,
+                torch::Tensor gate_off, torch::Tensor gate_cons, torch::Tensor gate_k,
+                int64_t ring_cap64, torch::Tensor state, torch::Tensor bufs,
+                int64_t smem_bytes, c10::optional<torch::Tensor> iclk) {
+  TORCH_CHECK(instrs.is_cuda() && instrs.dtype() == torch::kInt32);
+  const int n_instr = (int)(instrs.numel() / (3 + MK_MAX_ARGS));
+  const int ring_cap = (int)ring_cap64;
+
+  static bool df2_configured = false;
+  if (!df2_configured) {
+    C10_CUDA_CHECK(cudaFuncSetAttribute((void*)megakernel_df2,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        (int)smem_bytes));
+    df2_configured = true;
+  }
+  static int df2_nblocks = -1;
+  if (df2_nblocks < 0) {
+    int dev, sms, per_sm;
+    C10_CUDA_CHECK(cudaGetDevice(&dev));
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &per_sm, (void*)megakernel_df2, 256, (int)smem_bytes));
+    TORCH_CHECK(per_sm >= 1, "megakernel_df2 does not fit an SM with smem=", smem_bytes);
+    df2_nblocks = sms * per_sm;
+  }
+
+  const Instr* d_instrs = reinterpret_cast<const Instr*>(instrs.data_ptr<int>());
+  const int* d_dc = dep_cnt.data_ptr<int>();
+  const int* d_ao = adj_off.data_ptr<int>();
+  const int* d_ad = adj.data_ptr<int>();
+  const int* d_cs = claim_sz.data_ptr<int>();
+  const int* d_gi = gated_in.data_ptr<int>();
+  const int* d_bt = band_tiles.data_ptr<int>();
+  const int* d_ro = region_off.data_ptr<int>();
+  const int* d_rc = region_cnt0.data_ptr<int>();
+  const int* d_go = gate_off.data_ptr<int>();
+  const int* d_gc = gate_cons.data_ptr<int>();
+  const int* d_gk = gate_k.data_ptr<int>();
+  int* d_state = state.data_ptr<int>();
+  void** d_bufs = reinterpret_cast<void**>(bufs.data_ptr<int64_t>());
+  long long* d_clk =
+      iclk.has_value() ? reinterpret_cast<long long*>(iclk->data_ptr<int64_t>()) : nullptr;
+  void* args[] = {(void*)&d_instrs, (void*)&n_instr, (void*)&ring_cap, (void*)&d_dc,
+                  (void*)&d_ao,     (void*)&d_ad,    (void*)&d_cs,     (void*)&d_gi,
+                  (void*)&d_bt,     (void*)&d_ro,    (void*)&d_rc,     (void*)&d_go,
+                  (void*)&d_gc,     (void*)&d_gk,    (void*)&d_state,  (void*)&d_bufs,
+                  (void*)&d_clk};
+  auto stream = at::cuda::getCurrentCUDAStream();
+  C10_CUDA_CHECK(cudaLaunchCooperativeKernel((void*)megakernel_df2, dim3(df2_nblocks),
+                                             dim3(256), args, (size_t)smem_bytes,
+                                             stream.stream()));
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("run", &mk_run, "run megakernel program (wave mode)");
   m.def("run_df", &mk_run_df, "run megakernel program (dataflow mode)");
+  m.def("run_df2", &mk_run_df2, "run megakernel program (region-watermark dataflow mode)");
   m.def("nblocks", &mk_nblocks, "resolved persistent block count");
 }

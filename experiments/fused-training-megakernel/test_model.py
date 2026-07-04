@@ -110,6 +110,15 @@ def main():
             assert (g0[k] - m.grads[k]).abs().max().item() < 2e-2 * ref, f"waves-vs-df grad: {k}"
         print(f"waves-vs-df agreement OK (critical path {m.prog.critical_path} of {m.prog.n_instr} instrs)")
 
+        # region-watermark executor (df2) must agree too
+        loss4 = m.step(tokens, labels, mode="df2")
+        torch.cuda.synchronize()
+        assert abs(loss4.item() - loss1) < 1e-4 * abs(loss1), "df2 loss drifted"
+        for k in g0:
+            ref = g0[k].abs().max().item() + 1e-8
+            assert (g0[k] - m.grads[k]).abs().max().item() < 2e-2 * ref, f"df2 grad: {k}"
+        print(f"df2 agreement OK ({m.prog.n_gated} of {m.prog.n_instr} instrs region-gated)")
+
     # ---- learning sanity: SGD on megakernel grads must drive loss down ----
     cfg = Cfg()
     m = MKQwen3(cfg, seed=0)
