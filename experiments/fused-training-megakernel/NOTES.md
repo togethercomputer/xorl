@@ -745,10 +745,11 @@ GPU with util guards):
 | 2048  | 2452  | 1928  | 1.27x slower |
 | 3072  | 3386  | 3445  | **1.02x FASTER** |
 | 4096  | 4387  | 5232  | **1.19x FASTER** (reproduced twice) |
+| 8192  | 10398 | 17418 | **1.68x FASTER** |
 | 4096 @ small width (H512 L8) | 16358 | 19433 | **1.19x FASTER** |
 
-Parity verified at S=4096 (loss matches the bf16 eager twin to 4dp; worst grad
-max-rel 2.0%). The megakernel's step time scales near-linearly in S over this
+Parity verified at S=4096 AND S=8192 (loss matches the bf16 eager twin to 4dp;
+worst grad max-rel 2.0%/2.4%). The win WIDENS with S (1.19x at 4096, 1.68x at 8192). The megakernel's step time scales near-linearly in S over this
 range (1250 -> 4387 for 8x S) while the baseline turns superlinear past S=2048
 (711 -> 5232). Attribution hypothesis (not yet decomposed): the baseline's CE
 materializes fp32 logits [S,V] for cross_entropy (134MB at nano-4096, 537MB at
