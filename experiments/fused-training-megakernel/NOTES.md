@@ -537,6 +537,27 @@ now split across RMSNorm_BWD, ATTN_DKV_WG, and small GEMMNN spans. This reinforc
 existing P4b direction: producer-fed multi-stage GEMM/attention pipelines, not more
 instruction-level fusion.
 
+## v3 P4b gate recheck: deeper wgmma mainloops do not clear the gate
+
+The parallel P4b probe (`pipe_probe.py`, uncommitted as of this note) tested the next
+registered hypothesis: replacing `op_gemm_wgmma`'s current 2-stage/drained mainloop
+with 3/4-stage and one-in-flight GMMA variants. Gate was >=1.5x over current on small
+NT shapes. Measured result (`results/mkv3-p4b-pipe-quick.log` and
+`results/mkv3-p4b-pipe-full.log`): no gate. The small NT heavy hitters were flat:
+
+| shape | current | best deeper/in-flight |
+|---|---:|---:|
+| small NT gu 1024x3072x512 | ~50us / 64TF | ~50us / 64TF |
+| small NT lm_head 1024x16384x512 | ~225us / 76TF | ~223-224us / 77TF |
+| small NT down 1024x512x1536 | ~46us / 35TF | slower or noise |
+
+The full probe currently fails correctness on the first NN shape (`S2W0(cur)` rel
+~0.095), so use it as an NT gate result only until the NN path is fixed. A current
+`MK_WGMMA_NN=1` recheck was also non-promotable: nano lost slightly and small was
+neutral, despite the small profile showing the head split-K hop itself can shrink.
+The cost reappears as wait/other-op span. Do not spend the next round on generic
+pipeline-depth or broad NN routing unless a new probe changes this evidence.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
