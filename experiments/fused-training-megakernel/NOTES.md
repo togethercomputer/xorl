@@ -891,6 +891,20 @@ S4096 4325.7/4315.4us
 medians were nano 1248.3/1243.7us, small 4340.3/4326.9us, S4096 4318.1/4308.5us
 (`mkv3-p4b-dq-c1-reverse-*-mkonly.log`). The earlier
 `mkv3-p4b-dq-c1-outer-ab.log` was contaminated by an SGLang server and is ignored.
+Follow-up DQ C=1 register-direct epilogue: once C=1 used plain stores, the shared-memory
+stage/drain was no longer required on that path. The final route now stores each
+thread's accumulator fragments directly to `dQKV_f32` for `C==1`; chunked `C>1` still
+uses the old staged atomic path. Correctness is green (`mkv3-p4b-dq-reg-epilogue-testattention-20260704T194449Z.log`,
+`mkv3-p4b-dq-reg-epilogue-testmodel-20260704T195504Z.log`). The first same-GPU A/B was
+mixed (control/variant medians: nano 1234.3/1232.7us, small 4311.8/4312.0us, S4096
+4288.3/4292.6us; `mkv3-p4b-dq-reg-epilogue-ab-20260704T194629Z.log`), so a reverse and
+cache-warm repeat were required. Reverse-order GPU3 favored the variant strongly:
+small 4304.9us vs 4326.8us, S4096 4248.1us vs 4314.5us
+(`mkv3-p4b-dq-reg-epilogue-reverse-20260704T194944Z.log`). Cache-warm alternating GPU3
+confirmed the win: control A/B small 4317.9/4324.2us and S4096 4293.0/4292.6us;
+variant A/B small 4308.0/4314.2us and S4096 4251.9/4261.1us
+(`mkv3-p4b-dq-reg-epilogue-warm-alt-20260704T195326Z.log`). This is a real long-S
+attention win with a smaller short-S gain.
 
 Post-headtarget DKV first-pair batching recheck: a macro-gated branch
 `MK_ATTN_DKV_X2_SD=1` batched the first two independent DKV wgmma groups
