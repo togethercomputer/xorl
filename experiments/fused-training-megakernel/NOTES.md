@@ -731,6 +731,37 @@ SCOREBOARD (median-of-50, fresh process per config, hardened baseline):
 | S=1024 (nano width)   | 1643 | 959  | 1.71x |
 (v3 start 2.65x/3.44x; post-P6 2.06x/2.06x; post-SW128 1.79x/1.65x.)
 
+## v3 P4b: CROSSOVER — the megakernel BEATS compile+CUDAGraph at S >= ~3k
+
+Extending the S-sweep past the flag-planting configs (nano width H256 L4, then
+small width, hardened baseline, median-of-50, fresh process per config, clean
+GPU with util guards):
+
+| S (nano width) | megakernel | hardened | mk/baseline |
+|---|---|---|---|
+| 128   | 922   | 538   | 1.72x slower |
+| 512   | 1250  | 711   | 1.76x slower |
+| 1024  | 1643  | 959   | 1.71x slower |
+| 2048  | 2452  | 1928  | 1.27x slower |
+| 3072  | 3386  | 3445  | **1.02x FASTER** |
+| 4096  | 4387  | 5232  | **1.19x FASTER** (reproduced twice) |
+| 4096 @ small width (H512 L8) | 16358 | 19433 | **1.19x FASTER** |
+
+Parity verified at S=4096 (loss matches the bf16 eager twin to 4dp; worst grad
+max-rel 2.0%). The megakernel's step time scales near-linearly in S over this
+range (1250 -> 4387 for 8x S) while the baseline turns superlinear past S=2048
+(711 -> 5232). Attribution hypothesis (not yet decomposed): the baseline's CE
+materializes fp32 logits [S,V] for cross_entropy (134MB at nano-4096, 537MB at
+small-4096) while the megakernel's fused lm_head/CE partials never materialize
+them; plus the FA-class attention and tile-level co-scheduling amortize better
+at high tile counts. Caveat for honesty: a baseline with a hand-fused CE (e.g.
+liger-style) would narrow the long-S gap — the crossover claim is against the
+straightforward torch.compile+CUDAGraph stack this project has always benched.
+
+The v3 win gates at nano/small (0.66/2.4ms) remain unmet — short-S is still
+1.6-1.8x behind — but the original goal ("BEAT compile+cudagraph") is now MET
+for S >= ~3072 at both tested widths.
+
 Late-round addenda from 0b544181 (all committed with data):
 - ws snapshot A/B (MK_WS_REGCOPY): the consumer-owned smem Instr snapshot is worth
   -717us at small vs the old register copy; the residual ws-vs-df gap (4862 vs
