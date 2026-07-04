@@ -558,6 +558,36 @@ neutral, despite the small profile showing the head split-K hop itself can shrin
 The cost reappears as wait/other-op span. Do not spend the next round on generic
 pipeline-depth or broad NN routing unless a new probe changes this evidence.
 
+## v3 Phase 6 round 4: attention-bwd chunk retune after the P4b miss
+
+**Attention chunk defaults retuned (KEEP):** after generic P4b pipeline-depth failed,
+the cheapest remaining attention lever was the routed chunk count. A fresh sweep
+(`results/mkv3-p6-r4-retune-sweep.log`,
+`results/mkv3-p6-r4-retune-combos.log`) found two stable changes:
+
+- `ATTN_DQ_WG` now defaults to `Cq=2` for the wgmma path. The old S=512 default
+  (`Cq=4`) over-split: nano/deep improved by ~60-100us in megakernel-only medians.
+- `ATTN_DKV_WG` now uses `Ckv=1` only when `nq * (S/128) >= 64` (small has enough
+  natural chunks), otherwise `Ckv=2` preserves tail parallelism for nano/S1024-H256.
+
+The head split-K target sweep again showed only small/noisy wins, so
+`MK_HEAD_DX_TARGET_TILES` stays override-only at the 512 default.
+
+Correctness: `test_ops.py` and `test_model.py` are green. Hardened headline benchmark
+(`results/mkv3-p6-r4-attnretune-bench.log`):
+
+| config | megakernel | hardened compile+CUDAGraph+ | gap |
+|---|---:|---:|---:|
+| nano  (H256 L4 S512) | 1406us | 708us | 1.99x |
+| small (H512 L8 S1024) | 5510us | 2731us | 2.02x |
+
+Profile (`results/mkv3-p6-r4-attnretune-prof.log`): nano improves locally by trimming
+`ATTN_DKV_WG` chunks from 48 to 32 tiles per layer (on-path `ATTN_DKV_WG` span ~137us
+-> ~121us). Small trades the old high-wait `ATTN_DQ_WG` path for fewer longer
+`ATTN_DKV_WG` chunks; on-path wait drops (~618us -> ~425us) and the benchmark wins
+~100us. The next real work is still op quality for GEMMNN/head and attention kernels,
+not another instruction-level fusion pass.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

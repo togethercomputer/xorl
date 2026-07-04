@@ -427,12 +427,13 @@ class MKQwen3:
                 scale,
             ]
             if wg_attn:
-                # P6 retune: dKV C=3 wins at S=512 (nano/deep) but loses at S=256 and
-                # S=1024, so keep the original C=2 elsewhere. dQ remains C=4 at S=512
-                # and C=2 at S=1024. Env overrides keep future sweeps edit-free.
+                # P6 retune, refreshed after the P4b gate recheck: keep dQ at C=2.
+                # dKV wants C=1 once nq * (S/128) already exposes >=64 chunks (small),
+                # otherwise C=2 keeps enough tail parallelism (nano/S1024-H256).
                 n_qt128 = c.S // 128
-                Ckv = max(1, int(os.environ.get("MK_ATTN_DKV_C", str(3 if c.S == 512 else 2))))
-                Cq = max(1, int(os.environ.get("MK_ATTN_DQ_C", str(4 if n_qt <= 16 else 2))))
+                default_Ckv = 1 if c.nq * n_qt128 >= 64 else 2
+                Ckv = max(1, int(os.environ.get("MK_ATTN_DKV_C", str(default_Ckv))))
+                Cq = max(1, int(os.environ.get("MK_ATTN_DQ_C", "2")))
                 p.instr(mk.OP_ATTN_DKV_WG, c.nkv * n_qt128 * G * Ckv, dkv_args() + [Ckv])
                 p.instr(mk.OP_ATTN_DQ_WG, c.nq * n_qt128 * Cq, dq_args() + [Cq])
             else:
