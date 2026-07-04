@@ -847,8 +847,17 @@ CE_BWD vectorization (`91b7f74`), 256 still won: nano 512=1250.7/1227.9us vs
 (`results/mkv3-p4b-headtarget256-after-cebwd-ab.log`). After the df scheduler
 completion-hint commit (`eba44d5`), the win held again: nano 512=1249.6/1229.7us vs
 256=1220.2/1217.1us and small 512=4370.0/4368.5us vs 256=4338.8/4338.1us
-(`results/mkv3-p4b-headtarget256-after-hint-ab.log`). The default is now 256; the env
+(`results/mkv3-p4b-headtarget256-after-hint-ab.log`). The default moved to 256; the env
 knob stays for reruns.
+Post-DQ retune moved the default to `MK_HEAD_DX_TARGET_TILES=192`. A broad GPU2 sweep
+suggested 192 over 256 (`mkv3-p4b-postdq-headtarget-sweep-20260704T192304Z.log`), but
+its alternating repeat had drift
+(`mkv3-p4b-postdq-headtarget-192-ab-20260704T192444Z.log`). The decisive GPU3 repeat
+kept 192 ahead for the configs where head dX is material: small 4315.7/4313.9us vs
+4332.8/4333.2us for 256, and S4096 4297.5/4293.4us vs 4315.2/4311.6us
+(`mkv3-p4b-postdq-headtarget-192-gpu3-repeat-20260704T192636Z.log`). Nano was
+effectively neutral after warmup (second-pass 192 1215.2us vs 256 1214.0us;
+`mkv3-p4b-postdq-headtarget-192-nano-gpu3-20260704T192814Z.log`). The env knob stays.
 
 Post-headtarget attention chunk recheck: with the current defaults at `431ed91`, a
 fresh env-only sweep kept the routed WG attention chunk defaults unchanged. Small is

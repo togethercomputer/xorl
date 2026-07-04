@@ -345,7 +345,7 @@ class MKQwen3:
         p.wave()
         if mk.wgmma_ok(c.S, c.H, c.V, 0):
             sk_head = mk.wgmma_split_k(
-                c.S, c.H, c.V, target_tiles=int(os.environ.get("MK_HEAD_DX_TARGET_TILES", "256"))
+                c.S, c.H, c.V, target_tiles=int(os.environ.get("MK_HEAD_DX_TARGET_TILES", "192"))
             )
             p.instr(
                 mk.OP_GEMM,
@@ -354,7 +354,7 @@ class MKQwen3:
             )
         else:
             sk_head = mk.gemm_split_k(
-                c.S, c.H, c.V, target_tiles=int(os.environ.get("MK_HEAD_DX_TARGET_TILES", "256"))
+                c.S, c.H, c.V, target_tiles=int(os.environ.get("MK_HEAD_DX_TARGET_TILES", "192"))
             )
             p.instr(
                 mk.OP_GEMM,
