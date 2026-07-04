@@ -731,6 +731,24 @@ SCOREBOARD (median-of-50, fresh process per config, hardened baseline):
 | S=1024 (nano width)   | 1643 | 959  | 1.71x |
 (v3 start 2.65x/3.44x; post-P6 2.06x/2.06x; post-SW128 1.79x/1.65x.)
 
+Late-round addenda from 0b544181 (all committed with data):
+- ws snapshot A/B (MK_WS_REGCOPY): the consumer-owned smem Instr snapshot is worth
+  -717us at small vs the old register copy; the residual ws-vs-df gap (4862 vs
+  ~4400) is a UNIFORM ~8-20% per-op span tax = the 224-reg consumer ceiling
+  (P4a's register-tax verdict re-confirmed with per-op evidence).
+- MPK-topology probe (mpk_probe.py): dedicated scheduler block + 131 full-register
+  consumer blocks over gmem mailboxes = 5.09us/hop (vs df ~3.0) — two cross-SM
+  signals lose to df's self-claiming; scheduler-issued prefetch.global.L2 made it
+  WORSE (9.86 — the issue loop starves done-polling). The register-tax escape is
+  NO-GO at chain-hop granularity; both protocol escapes from the latency tax are
+  now measured and closed. What remains: per-op MLP where streams are starved,
+  honest acceptance of the ~1.6-1.8x floor at this architecture, or the Diamos
+  weight-stationary v4 option (P6 survey).
+- compute-sanitizer: df racecheck + synccheck CLEAN (covers the completion-hint
+  and claim changes); ws racecheck reports are the by-design lock-free
+  release/acquire handoff (racecheck cannot model PTX acquire/release).
+- MK_CLAIM re-sweep post-SW128: 132 still optimal (66: +366 small, 264: +162).
+
 Remaining structural items, in measured order: (1) the uniform in-model latency
 tax (8 warps/SM) — the only true fixes are protocol-level (producer-fed loads /
 cross-instr prefetch, i.e. the original P4b endgame, on a stabilized ws) or
