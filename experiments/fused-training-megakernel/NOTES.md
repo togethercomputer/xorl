@@ -915,6 +915,16 @@ control nano/small totals 1145.0us / 4325.4us, variant 1169.1us / 4510.8us
 `mkv3-p4b-attn-dkv-x2-variant-prof.log`). DKV span itself was flat/noisy (nano
 115.9us -> 114.5us, small 551.9us -> 556.9us), while other spans worsened. Do not
 merge the branch; this is another instance of the register-lifetime law.
+Post-S2048-headtarget DKV G2 fusion recheck: for `G==2,Ckv==1`, an env-gated branch
+`MK_ATTN_DKV_G2_FUSE=1` fused the two GQA group-member DKV tiles for each KV tile,
+accumulated both into one register pair, and drained dK/dV with plain stores instead
+of two atomic epilogues. Correctness was green
+(`mkv3-p4b-dkv-g2-testattention-20260704T2336DKVG2.log`,
+`mkv3-p4b-dkv-g2-modelparity-20260704T2336DKVG2.log`), but the route was decisively
+negative despite halving DKV tiles: variant-control deltas were +221us small, +323us
+S2048, and +455us S4096, with control winning 80/80 paired samples in every direction
+(`mkv3-p4b-dkv-g2-ab-20260704T2336DKVG2.log`). Lost G-parallelism dominates removed
+K/V reloads and atomic drains; keep separate G-member DKV tiles.
 
 Post-headtarget RMSNorm-bwd four-row fold recheck: `MK_RMS_BWD_R4=1` made each warp
 fold four rows into one smem `dw` slot (32 rows/tile) instead of the default two-row
