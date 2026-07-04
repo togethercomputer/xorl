@@ -1161,8 +1161,24 @@ __device__ void op_ce_bwd(const Instr& I, int tile, void** bufs) {
   const float lse = reinterpret_cast<const float*>(bufs[I.args[2]])[tile];
   const float inv_valid = *reinterpret_cast<const float*>(bufs[I.args[3]]);
   const float scale = (label >= 0) ? inv_valid : 0.0f;
-  for (int i = threadIdx.x; i < V; i += MK_CONSUMERS) {
-    const float p = expf(bf2f(z[i]) - lse);
-    z[i] = f2bf(scale * (p - (i == label ? 1.0f : 0.0f)));
+  if ((V & 7) == 0) {  // uint4 IO (v3 P4b): the scalar loop was ~2KB/row/thread of
+    // 2-byte accesses on the fattest activation buffer — latency-bound at 8 warps.
+    // libm expf kept: bitwise-identical dlogits vs the reference path (the peer
+    // session measured __expf here and reverted it).
+    for (int i = threadIdx.x * 8; i < V; i += MK_CONSUMERS * 8) {
+      float zv[8];
+      ld8bf(z + i, zv);
+#pragma unroll
+      for (int j = 0; j < 8; j++) {
+        const float p = expf(zv[j] - lse);
+        zv[j] = scale * (p - (i + j == label ? 1.0f : 0.0f));
+      }
+      st8bf(z + i, zv);
+    }
+  } else {
+    for (int i = threadIdx.x; i < V; i += MK_CONSUMERS) {
+      const float p = expf(bf2f(z[i]) - lse);
+      z[i] = f2bf(scale * (p - (i == label ? 1.0f : 0.0f)));
+    }
   }
 }
