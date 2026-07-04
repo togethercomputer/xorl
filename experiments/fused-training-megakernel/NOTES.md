@@ -1123,6 +1123,16 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   confirmed old-vs-new deltas: nano -57.3/-62.1us, small -232.2/-230.4us, S2048
   -109.6/-101.6us, and S4096 -170.6/-167.9us. Long-S also prefers 128 over 192
   (S2048 -20us, S4096 -43..45us).
+- S2048 attention-bwd C=2 gate: post-dW profile put S2048 back on `ATTN_DKV_WG`
+  span, but broad env sweep rejected larger attention C for nano/small/S4096
+  (`mkv3-p4b-attn-c-sweep-580db4d-20260704T2351ATTNC.log`). The one surviving shape
+  is H256/S2048 with both `MK_ATTN_DKV_C=2` and `MK_ATTN_DQ_C=2`: paired/reverse env
+  A/B (`mkv3-p4b-attn-c-s2048-paired-580db4d-20260704T2352ATTNC.log`) measured
+  -42.4us, +29.7us, -30.8us, and +28.8us old-vs-new across four construction orders,
+  with the C=2 combo winning 135-138/140 samples each block. Patched default vs forced
+  old `C=1/1` (`mkv3-p4b-attn-s2048-c2-default-ab-20260704T2354ATTNC.log`) confirmed
+  -39.8/+26.1/-25.6/+35.4us with 135-140/140 wins. Keep the gate S2048/H256 only;
+  individual `DKV_C=2` or `DQ_C=2` and S4096 C=2 regressed.
 
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across

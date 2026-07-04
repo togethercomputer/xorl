@@ -468,13 +468,17 @@ class MKQwen3:
                 scale,
             ]
             if wg_attn:
-                # P4b retune after SW128/NN routing: dQ now wants one kv chunk.
-                # dKV wants C=1 once nq * (S/128) already exposes >=64 chunks (small),
-                # otherwise C=2 keeps enough tail parallelism (nano/S1024-H256).
+                # P4b retune after SW128/NN routing: dQ usually wants one kv chunk.
+                # S2048/H256 is the exception after the cold-dW retune: paired dQ+dKV
+                # C=2 trims the attention-bwd critical path, while small/S4096 regress.
+                # dKV otherwise wants C=1 once nq * (S/128) already exposes >=64 chunks,
+                # else C=2 keeps enough tail parallelism (nano/S1024-H256).
                 n_qt128 = c.S // 128
-                default_Ckv = 1 if c.nq * n_qt128 >= 64 else 2
+                attn_c2_s2048 = c.H == 256 and c.S == 2048
+                default_Ckv = 2 if attn_c2_s2048 else (1 if c.nq * n_qt128 >= 64 else 2)
+                default_Cq = 2 if attn_c2_s2048 else 1
                 Ckv = max(1, int(os.environ.get("MK_ATTN_DKV_C", str(default_Ckv))))
-                Cq = max(1, int(os.environ.get("MK_ATTN_DQ_C", "1")))
+                Cq = max(1, int(os.environ.get("MK_ATTN_DQ_C", str(default_Cq))))
                 p.instr(mk.OP_ATTN_DKV_WG, c.nkv * n_qt128 * G * Ckv, dkv_args() + [Ckv])
                 p.instr(mk.OP_ATTN_DQ_WG, c.nq * n_qt128 * Cq, dq_args() + [Cq])
             else:
