@@ -338,6 +338,38 @@ KEEPERS from the round:
 
 Scoreboard after Phase 3: **nano 1853 / small 9028 (df)** vs hardened 711/2730.
 
+## v3 Phase 4a: warp-spec scheduler offload (megakernel_ws) — protocol works, register
+## tax eats it; shipped as capability, df stays default
+
+`megakernel_ws` (mode="ws", parity-green in test_model): 384 threads (see below why not
+288), scheduler warpgroup owns claim + completion accounting off the consumer path,
+double work slots with eager pre-claim; ops now use `consumer_sync()` (bar.sync 1,256)
+and `MK_CONSUMERS` instead of __syncthreads/blockDim.x (equivalent for all executors;
+conversion validated green everywhere).
+
+Best result: nano 1938 / small 9198 vs df 1907/8994 same-run — **gate not met**. The
+decisive diagnostic: df recompiled at 224 regs runs 2002/9388, i.e. the REGISTER TAX
+alone is +97/+385; at equal budget the ws protocol WINS by −64/−190 (on-path wait at
+small: 1495 -> 587us). The protocol is right; the hardware charges for it.
+
+CRITICAL HARDWARE FACT (cost us the phase): **H100 allocates registers at 4-WARP
+granularity — any block >256 threads is charged 12 warps**, so 288 threads has the
+same 168-reg entry ceiling as 384 (65536/(12x32x4)); `__maxnreg__(224)` at 288 threads
+fails occupancy. The first 288-thread build spilled the op path (STACK 544) and lost
+14% uniformly. Consequences: (a) warp-spec on this op library REQUIRES setmaxnreg
+(224 consumers / 56 scheduler measured best; 232/40 and 240/24 worse — scheduler spill
+slows cross-block completion publication), plus the explicit
+-gencode=arch=compute_90a,code=sm_90a (now in mk.py; CUDA 13.1's -arch=sm_90a emits
+compute_90 PTX that silently rejects setmaxnreg); (b) probe findings that did NOT
+transfer to the full executor: setmaxnreg-is-negative, 128B state padding (+10..30
+here: scans touch 32x more L2 lines).
+
+Path to harvest the standing −64/−190 protocol win (deferred, not abandoned):
+either port claim-before-account + overlapped accounting into 256-thread df (no tax,
+part of the win), or shrink the WMMA/attention op register footprints under 224 so the
+consumers stop paying the ceiling — the natural companion of the Phase-5 attention
+rewrite. Full log: results/mkv3-p4a.md.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.3x faster. The measured structural gap, in order:

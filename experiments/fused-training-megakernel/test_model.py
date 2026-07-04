@@ -119,6 +119,15 @@ def main():
             assert (g0[k] - m.grads[k]).abs().max().item() < 2e-2 * ref, f"df2 grad: {k}"
         print(f"df2 agreement OK ({m.prog.n_gated} of {m.prog.n_instr} instrs region-gated)")
 
+        # warp-specialized executor (ws) must agree too
+        loss5 = m.step(tokens, labels, mode="ws")
+        torch.cuda.synchronize()
+        assert abs(loss5.item() - loss1) < 1e-4 * abs(loss1), "ws loss drifted"
+        for k in g0:
+            ref = g0[k].abs().max().item() + 1e-8
+            assert (g0[k] - m.grads[k]).abs().max().item() < 2e-2 * ref, f"ws grad: {k}"
+        print("ws agreement OK (warp-specialized scheduler)")
+
     # ---- learning sanity: SGD on megakernel grads must drive loss down ----
     cfg = Cfg()
     m = MKQwen3(cfg, seed=0)

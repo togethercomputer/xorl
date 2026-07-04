@@ -85,7 +85,10 @@ def load_ext(verbose=False):
         sources=[os.path.join(_DIR, "megakernel.cu")],
         extra_cuda_cflags=[
             "-O3",
-            "-arch=sm_90a",  # wgmma needs the 90a feature set
+            # wgmma + setmaxnreg need the 90a feature set. Explicit -gencode, NOT
+            # -arch=sm_90a: CUDA 13.1's -arch=sm_90a also runs a compute_90 PTX embed
+            # pass that rejects the megakernel_ws setmaxnreg asm (see mkv3-p2 notes).
+            "-gencode=arch=compute_90a,code=sm_90a",
             "-I/home/apanda/xorl-internal/.venv/lib/python3.12/site-packages/deep_gemm/include",
             "--expt-relaxed-constexpr",
             "-lineinfo",
@@ -432,6 +435,15 @@ class Program:
         self._claim = torch.tensor(claim, dtype=torch.int32, device=device)
         # state: pending[n] | cursor[n] | done[n] | ready[n] | ctrl[4]
         self._state = torch.empty(4 * n + 4, dtype=torch.int32, device=device)
+        # ws executor state: cursor[n*pad] | done[n*pad] | pending[n*pad] | ready[n]
+        # | ctrl[4*pad], pad = ints per entry. Allocated at pad=32 (one 128B line per
+        # instr) so any runtime pad fits, but the DEFAULT is pad=1: the 128B stride
+        # measured consistently +10..+30us SLOWER in-model (ring scans touch 32x more
+        # L2 lines; the wspec-probe false-sharing win does not transfer). lookahead 2 =
+        # eager slot-B pre-claim (measured best); 1 = commit-late (A/B attribution).
+        self._ws_pad = 1
+        self._ws_lookahead = 2
+        self._state_ws = torch.empty(3 * n * 32 + n + 4 * 32, dtype=torch.int32, device=device)
         self.critical_path = self._critical_path(deps, flat)
 
         # df2 arrays: region-watermark gating (dep DAG minus gated edges + gate CSR)
@@ -480,6 +492,20 @@ class Program:
     def run(self, ext, smem_bytes=100 * 1024, wave_clk=None, mode="df"):
         if mode == "waves":
             ext.run(self._instrs, self._wave_start, self._wave_tiles, self._buftab, smem_bytes, wave_clk)
+        elif mode == "ws":
+            ext.run_ws(
+                self._instrs,
+                self._dep_cnt,
+                self._adj_off,
+                self._adj,
+                self._claim,
+                self._state_ws,
+                self._ws_pad,
+                self._ws_lookahead,
+                self._buftab,
+                smem_bytes,
+                wave_clk,
+            )
         elif mode == "df2":
             ext.run_df2(
                 self._instrs,
@@ -537,6 +563,15 @@ if __name__ == "__main__":
     torch.cuda.synchronize()
     assert torch.all(y == 7.5), y.unique()
     print(f"scheduling OK (nblocks={ext.nblocks()})")
+
+    # warp-specialized executor on the same tiny program (hang canary)
+    for lookahead in (1, 2):
+        y.zero_()
+        p._ws_lookahead = lookahead
+        p.run(ext, mode="ws")
+        torch.cuda.synchronize()
+        assert torch.all(y == 7.5), y.unique()
+    print("ws scheduling OK")
 
     # grid.sync overhead: 2000 waves of trivial work
     q = Program()

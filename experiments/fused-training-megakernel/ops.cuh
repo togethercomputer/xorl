@@ -19,6 +19,18 @@
 using bf16 = __nv_bfloat16;
 namespace wmma = nvcuda::wmma;
 
+// Ops are executed by a 256-thread consumer group. Under the wave/df/df2 executors that
+// group IS the whole block, so bar.sync 1,256 is exactly __syncthreads and
+// MK_CONSUMERS equals the block width. Under megakernel_ws the block is 288 threads (warps 0-7 =
+// consumers with unchanged threadIdx.x semantics, warp 8 = scheduler): op code must
+// NEVER use __syncthreads (the scheduler warp does not participate — instant hang) nor
+// MK_CONSUMERS (wrong stride). consumer_sync() is a named barrier counting exactly the
+// 256 arriving consumer threads.
+#define MK_CONSUMERS 256
+__device__ __forceinline__ void consumer_sync() {
+  asm volatile("bar.sync 1, 256;" ::: "memory");
+}
+
 __device__ __forceinline__ float bf2f(bf16 v) { return __bfloat162float(v); }
 __device__ __forceinline__ bf16 f2bf(float v) { return __float2bfloat16(v); }
 
@@ -36,8 +48,8 @@ __device__ __forceinline__ void op_fill_f32(const Instr& I, int tile, void** buf
   float4* p4 = reinterpret_cast<float4*>(p + base);
   const int quads = (end - base) / 4;
   const float4 v4 = make_float4(v, v, v, v);
-  for (int i = threadIdx.x; i < quads; i += blockDim.x) p4[i] = v4;
-  for (int i = base + quads * 4 + threadIdx.x; i < end; i += blockDim.x) p[i] = v;
+  for (int i = threadIdx.x; i < quads; i += MK_CONSUMERS) p4[i] = v4;
+  for (int i = base + quads * 4 + threadIdx.x; i < end; i += MK_CONSUMERS) p[i] = v;
 }
 
 // args: {y, x, n, alpha_bits}; tile = 4096-element chunk index. y += alpha * x
@@ -47,7 +59,7 @@ __device__ __forceinline__ void op_axpy_f32(const Instr& I, int tile, void** buf
   const int n = I.args[2];
   const float a = __int_as_float(I.args[3]);
   const int base = tile * 4096;
-  for (int i = base + threadIdx.x; i < min(base + 4096, n); i += blockDim.x)
+  for (int i = base + threadIdx.x; i < min(base + 4096, n); i += MK_CONSUMERS)
     y[i] += a * x[i];
 }
 
@@ -172,14 +184,14 @@ __device__ void op_gemm(const Instr& I, int tile, void** bufs, char* smem_raw) {
     }
   };
   auto load_slow = [&](int k0) {
-    for (int i = tid; i < GEMM_BM * GEMM_BK; i += blockDim.x) {
+    for (int i = tid; i < GEMM_BM * GEMM_BK; i += MK_CONSUMERS) {
       const int m = i / GEMM_BK, k = i % GEMM_BK;
       const int gm = m0 + m, gk = k0 + k;
       bf16 v = f2bf(0.0f);
       if (gm < M && gk < K) v = a_t ? A[(int64_t)gk * M + gm] : A[(int64_t)gm * K + gk];
       S.As[m][k] = v;
     }
-    for (int i = tid; i < GEMM_BK * GEMM_BN; i += blockDim.x) {
+    for (int i = tid; i < GEMM_BK * GEMM_BN; i += MK_CONSUMERS) {
       const int k = i / GEMM_BN, n = i % GEMM_BN;
       const int gk = k0 + k, gn = n0 + n;
       bf16 v = f2bf(0.0f);
@@ -196,17 +208,17 @@ __device__ void op_gemm(const Instr& I, int tile, void** bufs, char* smem_raw) {
     for (int k0 = k_lo; k0 < k_fast_end; k0 += GEMM_BK) {
       stage_smem(pa, pb0, pb1);
       const int k_next = k0 + GEMM_BK;
-      __syncthreads();  // smem staged for everyone
+      consumer_sync();  // smem staged for everyone
       if (k_next < k_fast_end) issue_loads(k_next, pa, pb0, pb1);  // overlap with mma
       mma_tile();
-      __syncthreads();  // everyone done reading smem before next stage
+      consumer_sync();  // everyone done reading smem before next stage
     }
   }
   for (int k0 = k_fast_end; k0 < k_hi; k0 += GEMM_BK) {  // guarded tail
     load_slow(k0);
-    __syncthreads();
+    consumer_sync();
     mma_tile();
-    __syncthreads();
+    consumer_sync();
   }
 
   // stage fp32 result, then epilogue with bounds guards
@@ -216,9 +228,9 @@ __device__ void op_gemm(const Instr& I, int tile, void** bufs, char* smem_raw) {
     for (int j = 0; j < 2; ++j)
       wmma::store_matrix_sync(&S.Cs[wm * 32 + i * 16][wn * 32 + j * 16], c_frag[i][j],
                               GEMM_LDC, wmma::mem_row_major);
-  __syncthreads();
+  consumer_sync();
 
-  for (int i = tid; i < GEMM_BM * GEMM_BN; i += blockDim.x) {
+  for (int i = tid; i < GEMM_BM * GEMM_BN; i += MK_CONSUMERS) {
     const int m = i / GEMM_BN, n = i % GEMM_BN;
     const int gm = m0 + m, gn = n0 + n;
     if (gm >= M || gn >= N) continue;
@@ -396,7 +408,7 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
   for (int t = 0; t < iters; ++t) {
     if (t + 1 < iters) issue_stage(k_lo + (t + 1) * WG_BK, (t + 1) & 1);
     __pipeline_wait_prior(t + 1 < iters ? 1 : 0);
-    __syncthreads();
+    consumer_sync();
     uint64_t da[4], db[4];
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
@@ -411,7 +423,7 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
       wg_mma_ktile<SG::MMA_64x64x16_F32BF16BF16_SS<SG::Major::MN, SG::Major::K>>(da, db, d);
     else
       wg_mma_ktile<SG::MMA_64x64x16_F32BF16BF16_SS<SG::Major::MN, SG::Major::MN>>(da, db, d);
-    __syncthreads();  // both warpgroups done reading before the buffer is refilled
+    consumer_sync();  // both warpgroups done reading before the buffer is refilled
   }
 
   // stage accumulators to smem (over the dead A/B buffers), then coalesced epilogue
@@ -428,7 +440,7 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
         for (int j = 0; j < 2; ++j)
           Cs[(r + 8 * i) * WG_LDC + n8 * 8 + cb + j] = d[n8 * 4 + i * 2 + j];
   }
-  __syncthreads();
+  consumer_sync();
   // 128x64 outputs as 8-element groups: 1024 groups, 4 per thread, fully coalesced
 #pragma unroll
   for (int g = 0; g < 4; ++g) {
@@ -567,7 +579,7 @@ __device__ __forceinline__ void op_cvt_f32_bf16(const Instr& I, int tile, void**
   bf16* dst = reinterpret_cast<bf16*>(bufs[I.args[1]]);
   const int n = I.args[2];
   const int base = tile * MK_CHUNK;
-  for (int i = base + threadIdx.x; i < min(base + MK_CHUNK, n); i += blockDim.x)
+  for (int i = base + threadIdx.x; i < min(base + MK_CHUNK, n); i += MK_CONSUMERS)
     dst[i] = f2bf(src[i]);
 }
 
@@ -576,15 +588,15 @@ __device__ __forceinline__ void op_cvt_f32_bf16(const Instr& I, int tile, void**
 __device__ __forceinline__ float block_sum(float val, float* scratch) {
   for (int off = 16; off > 0; off >>= 1) val += __shfl_down_sync(0xffffffff, val, off);
   if ((threadIdx.x & 31) == 0) scratch[threadIdx.x >> 5] = val;
-  __syncthreads();
+  consumer_sync();
   float total = 0.0f;
-  if (threadIdx.x < blockDim.x / 32) total = scratch[threadIdx.x];
+  if (threadIdx.x < MK_CONSUMERS / 32) total = scratch[threadIdx.x];
   for (int off = 16; off > 0; off >>= 1) total += __shfl_down_sync(0xffffffff, total, off);
   total = __shfl_sync(0xffffffff, total, 0);
   if (threadIdx.x == 0) scratch[0] = total;
-  __syncthreads();
+  consumer_sync();
   total = scratch[0];
-  __syncthreads();
+  consumer_sync();
   return total;
 }
 
@@ -601,14 +613,14 @@ __device__ void op_rmsnorm_fwd(const Instr& I, int tile, void** bufs, char* smem
   float* scratch = reinterpret_cast<float*>(smem_raw);
 
   float ss = 0.0f;
-  for (int i = threadIdx.x; i < H; i += blockDim.x) {
+  for (int i = threadIdx.x; i < H; i += MK_CONSUMERS) {
     const float v = bf2f(x[i]);
     ss += v * v;
   }
   ss = block_sum(ss, scratch);
   const float r = rsqrtf(ss / H + eps);
   if (threadIdx.x == 0) rstd[tile] = r;
-  for (int i = threadIdx.x; i < H; i += blockDim.x)
+  for (int i = threadIdx.x; i < H; i += MK_CONSUMERS)
     y[i] = f2bf(bf2f(x[i]) * r * bf2f(w[i]));
 }
 
@@ -631,12 +643,12 @@ __device__ void op_rmsnorm_bwd(const Instr& I, int tile, void** bufs, char* smem
   auto dy = [&](int i) { return dy_f32 ? dyf[i] : bf2f(dyb[i]); };
 
   float dot = 0.0f;
-  for (int i = threadIdx.x; i < H; i += blockDim.x) {
+  for (int i = threadIdx.x; i < H; i += MK_CONSUMERS) {
     const float xhat = bf2f(x[i]) * r;
     dot += dy(i) * bf2f(w[i]) * xhat;
   }
   dot = block_sum(dot, scratch) / H;
-  for (int i = threadIdx.x; i < H; i += blockDim.x) {
+  for (int i = threadIdx.x; i < H; i += MK_CONSUMERS) {
     const float xhat = bf2f(x[i]) * r;
     const float g = dy(i) * bf2f(w[i]);
     dx[i] = f2bf(bf2f(dx[i]) + r * (g - xhat * dot));
@@ -651,7 +663,7 @@ __device__ void op_swiglu_fwd(const Instr& I, int tile, void** bufs) {
   const int Iw = I.args[3];
   const bf16* gu = reinterpret_cast<const bf16*>(bufs[I.args[0]]) + (int64_t)tile * 2 * Iw;
   bf16* h = reinterpret_cast<bf16*>(bufs[I.args[1]]) + (int64_t)tile * Iw;
-  for (int i = threadIdx.x; i < Iw; i += blockDim.x) {
+  for (int i = threadIdx.x; i < Iw; i += MK_CONSUMERS) {
     const float g = bf2f(gu[i]), u = bf2f(gu[Iw + i]);
     const float sg = g / (1.0f + expf(-g));
     h[i] = f2bf(sg * u);
@@ -665,7 +677,7 @@ __device__ void op_swiglu_bwd(const Instr& I, int tile, void** bufs) {
   const bf16* gu = reinterpret_cast<const bf16*>(bufs[I.args[0]]) + (int64_t)tile * 2 * Iw;
   const bf16* dh = reinterpret_cast<const bf16*>(bufs[I.args[1]]) + (int64_t)tile * Iw;
   bf16* dgu = reinterpret_cast<bf16*>(bufs[I.args[2]]) + (int64_t)tile * 2 * Iw;
-  for (int i = threadIdx.x; i < Iw; i += blockDim.x) {
+  for (int i = threadIdx.x; i < Iw; i += MK_CONSUMERS) {
     const float g = bf2f(gu[i]), u = bf2f(gu[Iw + i]), d = bf2f(dh[i]);
     const float sig = 1.0f / (1.0f + expf(-g));
     const float sg = g * sig;
@@ -690,7 +702,7 @@ __device__ void op_qknorm_rope_fwd(const Instr& I, int tile, void** bufs, char* 
   bf16* dst_row = reinterpret_cast<bf16*>(bufs[I.args[1]]) + (int64_t)row * stride;
   const float* cosr = reinterpret_cast<const float*>(bufs[I.args[6]]) + (int64_t)row * (D / 2);
   const float* sinr = reinterpret_cast<const float*>(bufs[I.args[7]]) + (int64_t)row * (D / 2);
-  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, nwarp = blockDim.x / 32;
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, nwarp = MK_CONSUMERS / 32;
 
   for (int h = warp; h < nq + 2 * nkv; h += nwarp) {
     const bf16* src = src_row + h * D;
@@ -741,12 +753,12 @@ __device__ void op_qknorm_rope_bwd(const Instr& I, int tile, void** bufs, char* 
   bf16* dx_row = reinterpret_cast<bf16*>(bufs[I.args[2]]) + (int64_t)row * stride;
   const float* cosr = reinterpret_cast<const float*>(bufs[I.args[9]]) + (int64_t)row * (D / 2);
   const float* sinr = reinterpret_cast<const float*>(bufs[I.args[10]]) + (int64_t)row * (D / 2);
-  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, nwarp = blockDim.x / 32;
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, nwarp = MK_CONSUMERS / 32;
 
   float* dwq_s = reinterpret_cast<float*>(smem_raw);  // [D] + [D] fp32 partials
   float* dwk_s = dwq_s + D;
-  for (int i = threadIdx.x; i < 2 * D; i += blockDim.x) dwq_s[i] = 0.0f;
-  __syncthreads();
+  for (int i = threadIdx.x; i < 2 * D; i += MK_CONSUMERS) dwq_s[i] = 0.0f;
+  consumer_sync();
 
   for (int h = warp; h < nq + 2 * nkv; h += nwarp) {
     const bf16* xr = x_row + h * D;
@@ -788,10 +800,10 @@ __device__ void op_qknorm_rope_bwd(const Instr& I, int tile, void** bufs, char* 
       atomicAdd(&dw_s[i + D / 2], db * xh2);
     }
   }
-  __syncthreads();
+  consumer_sync();
   float* dqw = reinterpret_cast<float*>(bufs[I.args[5]]);
   float* dkw = reinterpret_cast<float*>(bufs[I.args[6]]);
-  for (int i = threadIdx.x; i < D; i += blockDim.x) {
+  for (int i = threadIdx.x; i < D; i += MK_CONSUMERS) {
     atomicAdd(&dqw[i], dwq_s[i]);
     atomicAdd(&dkw[i], dwk_s[i]);
   }
@@ -804,7 +816,7 @@ __device__ void op_embed_fwd(const Instr& I, int tile, void** bufs) {
   const int t = reinterpret_cast<const int*>(bufs[I.args[0]])[tile];
   const bf16* e = reinterpret_cast<const bf16*>(bufs[I.args[1]]) + (int64_t)t * H;
   bf16* x = reinterpret_cast<bf16*>(bufs[I.args[2]]) + (int64_t)tile * H;
-  for (int i = threadIdx.x; i < H; i += blockDim.x) x[i] = e[i];
+  for (int i = threadIdx.x; i < H; i += MK_CONSUMERS) x[i] = e[i];
 }
 
 // bwd scatter-add: demb[tok[r],:] += dx[r,:] (fp32 atomics). args: {tok, dx, demb, H}.
@@ -813,7 +825,7 @@ __device__ void op_embed_bwd(const Instr& I, int tile, void** bufs) {
   const int t = reinterpret_cast<const int*>(bufs[I.args[0]])[tile];
   const bf16* dx = reinterpret_cast<const bf16*>(bufs[I.args[1]]) + (int64_t)tile * H;
   float* de = reinterpret_cast<float*>(bufs[I.args[2]]) + (int64_t)t * H;
-  for (int i = threadIdx.x; i < H; i += blockDim.x) atomicAdd(&de[i], bf2f(dx[i]));
+  for (int i = threadIdx.x; i < H; i += MK_CONSUMERS) atomicAdd(&de[i], bf2f(dx[i]));
 }
 
 // ---- cross entropy ----------------------------------------------------------------------
@@ -836,14 +848,14 @@ __device__ void op_ce_fwd(const Instr& I, int tile, void** bufs, char* smem_raw)
   float mx = -INFINITY, se = 0.0f;
   if (nparts > 0) {
     const float* parts = reinterpret_cast<const float*>(bufs[I.args[6]]) + (int64_t)tile * nparts * 2;
-    for (int i = threadIdx.x; i < nparts; i += blockDim.x) {
+    for (int i = threadIdx.x; i < nparts; i += MK_CONSUMERS) {
       const float om = parts[i * 2], os = parts[i * 2 + 1];
       const float M = fmaxf(mx, om);
       se = (mx == -INFINITY && om == -INFINITY) ? 0.0f : se * expf(mx - M) + os * expf(om - M);
       mx = M;
     }
   } else {
-    for (int i = threadIdx.x; i < V; i += blockDim.x) {
+    for (int i = threadIdx.x; i < V; i += MK_CONSUMERS) {
       const float zv = bf2f(z[i]);
       if (zv > mx) {
         se = se * expf(mx - zv) + 1.0f;
@@ -865,11 +877,11 @@ __device__ void op_ce_fwd(const Instr& I, int tile, void** bufs, char* smem_raw)
     scratch[(threadIdx.x >> 5) * 2] = mx;
     scratch[(threadIdx.x >> 5) * 2 + 1] = se;
   }
-  __syncthreads();
+  consumer_sync();
   if (threadIdx.x == 0) {
     mx = scratch[0];
     se = scratch[1];
-    for (int w = 1; w < blockDim.x / 32; ++w) {
+    for (int w = 1; w < MK_CONSUMERS / 32; ++w) {
       const float om = scratch[w * 2], os = scratch[w * 2 + 1];
       const float M = fmaxf(mx, om);
       se = se * expf(mx - M) + os * expf(om - M);
@@ -878,10 +890,10 @@ __device__ void op_ce_fwd(const Instr& I, int tile, void** bufs, char* smem_raw)
     scratch[0] = mx;
     scratch[1] = se;
   }
-  __syncthreads();
+  consumer_sync();
   mx = scratch[0];
   se = scratch[1];
-  __syncthreads();
+  consumer_sync();
   const float lse = mx + logf(se);
   if (threadIdx.x == 0) {
     lse_out[tile] = lse;
@@ -898,7 +910,7 @@ __device__ void op_ce_bwd(const Instr& I, int tile, void** bufs) {
   const float lse = reinterpret_cast<const float*>(bufs[I.args[2]])[tile];
   const float inv_valid = *reinterpret_cast<const float*>(bufs[I.args[3]]);
   const float scale = (label >= 0) ? inv_valid : 0.0f;
-  for (int i = threadIdx.x; i < V; i += blockDim.x) {
+  for (int i = threadIdx.x; i < V; i += MK_CONSUMERS) {
     const float p = expf(bf2f(z[i]) - lse);
     z[i] = f2bf(scale * (p - (i == label ? 1.0f : 0.0f)));
   }

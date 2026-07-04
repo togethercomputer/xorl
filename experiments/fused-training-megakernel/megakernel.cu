@@ -494,6 +494,291 @@ __global__ void megakernel_df2(const Instr* __restrict__ instrs, const int n_ins
   }
 }
 
+// ---- warp-specialized dataflow executor (ws) ------------------------------------------
+// Scheduling comes COMPLETELY off the consumer critical path. 384 threads: threads
+// 0-255 (warpgroups 0-1) are the consumer group running ops EXACTLY as the other
+// executors (threadIdx.x semantics unchanged; ops stride by MK_CONSUMERS and sync on
+// bar.sync 1,256). Warpgroup 2 lane 0 (threadIdx.x == 256) is the scheduler: it
+// pre-claims the NEXT (instr, tile-range) batch into a second smem control slot while
+// consumers execute the current one, and does ALL completion accounting
+// (__threadfence, done atomicAdd, dependent decrements, ready-ring pushes, iclk
+// stamps) while consumers immediately start the pre-claimed batch. Threads 257-383
+// exit after init (no full-block barrier exists after specialization). NEVER
+// __syncthreads below the grid.syncs: warpgroup 2 does not participate in op
+// execution.
+//
+// Register plumbing (measured, do not "simplify"): H100 allocates registers at 4-WARP
+// granularity, so ANY block over 256 threads is charged 12 warps' worth -> a hard
+// 65536/384 = 168-reg ceiling. The plan's original 288-thread shape compiled to
+// REG:168 STACK:544 (ptxas spilled the op hot paths) and ran a uniform +14% on BOTH
+// configs. Fix = the ws_probe recipe: entry __maxnreg__(168) (also required for ptxas
+// to honor setmaxnreg at all, C7508), then per-warpgroup setmaxnreg — scheduler
+// warpgroup dec->56, consumer warpgroups inc->224 (feasible: 128*(168-56) ==
+// 256*(224-168); 256*224 + 128*56 = 64512 <= 64K). The 240/24 split was ALSO measured
+// and is WORSE at both configs: the dec-24 scheduler spills its claim/accounting path
+// and the slower handoff costs more than 16 extra consumer registers recover, even
+// though the register-fat WMMA/attention ops profile +4-12% over df's 255-reg build at
+// 224 (the ~126-reg wgmma path is unaffected). Requires the explicit
+// -gencode=arch=compute_90a,code=sm_90a flag in mk.py (CUDA 13.1's -arch=sm_90a
+// silently also emits compute_90 PTX where setmaxnreg is rejected).
+//
+// Handoff: monotone smem sequence counters. full_seq = batches staged (st.release.cta
+// by the scheduler after writing the slot); done_seq = batches finished (st.release.cta
+// by consumer thread 0 after the batch's last consumer_sync — which CTA-orders all 256
+// consumers' writes before the flag; the scheduler's __threadfence then publishes them
+// device-wide by cumulativity, the producer-side-completion pattern the wsprobe
+// measured 13% faster than consumer-side). Slot of batch k = k&1; staging batch k
+// requires k < acct + lookahead, and accounting always drains first, so a slot's
+// previous occupant is finished AND accounted before reuse. Halt = staged Instr with
+// op < 0.
+//
+// state layout (pad = ints per entry; 32 = one 128B line per instr to kill the false
+// sharing the wspec replication identified; ready ring stays packed for cheap scans):
+//   cursor[n*pad] | done[n*pad] | pending[n*pad] | ready[n] | ctrl[4*pad]
+#define MK_WS_CTRL_BYTES 256  // control carve-out at the base of dynamic smem
+
+struct WsCtrl {
+  Instr ins[2];  // staged instruction per slot
+  int t0[2], t1[2];
+  int full_seq;
+  int done_seq;
+};
+static_assert(sizeof(WsCtrl) <= MK_WS_CTRL_BYTES, "ws control region overflow");
+
+__device__ __forceinline__ void mk_st_release_cta(int* p, int v) {
+  const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
+  asm volatile("st.release.cta.shared.b32 [%0], %1;" ::"r"(a), "r"(v) : "memory");
+}
+__device__ __forceinline__ int mk_ld_acquire_cta(const int* p) {
+  const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
+  int v;
+  asm volatile("ld.acquire.cta.shared.b32 %0, [%1];" : "=r"(v) : "r"(a) : "memory");
+  return v;
+}
+
+#define MK_WS_THREADS 384
+
+extern "C" __global__ void __maxnreg__(168) megakernel_ws(
+    const Instr* __restrict__ instrs, int n_instr, const int* __restrict__ dep_cnt,
+    const int* __restrict__ adj_off, const int* __restrict__ adj,
+    const int* __restrict__ claim_sz, int* state, int pad, int lookahead, void** bufs,
+    long long* iclk /* nullable [2*n] */) {
+  extern __shared__ char smem[];
+  WsCtrl* C = reinterpret_cast<WsCtrl*>(smem);
+  char* opsmem = smem + MK_WS_CTRL_BYTES;  // ops get the rest (16B-aligned)
+  cg::grid_group grid = cg::this_grid();
+  int* cursor = state;
+  int* done = state + n_instr * pad;
+  int* pending = state + 2 * n_instr * pad;
+  int* ready = state + 3 * n_instr * pad;
+  int* ctrl = state + 3 * n_instr * pad + n_instr;
+
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_instr;
+       i += gridDim.x * blockDim.x) {
+    cursor[i * pad] = 0;
+    done[i * pad] = 0;
+    pending[i * pad] = dep_cnt[i];
+    ready[i] = -1;
+  }
+  if (blockIdx.x == 0 && threadIdx.x < 4) ctrl[threadIdx.x * pad] = 0;
+  if (threadIdx.x == 0) {
+    C->full_seq = 0;
+    C->done_seq = 0;
+  }
+  grid.sync();
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_instr;
+       i += gridDim.x * blockDim.x) {
+    if (dep_cnt[i] == 0) {
+      const int t = atomicAdd(&ctrl[0], 1);
+      atomicExch(&ready[t], i);
+    }
+  }
+  grid.sync();
+
+  if (threadIdx.x < MK_CONSUMERS) {
+    // ---------------- consumer group (threads 0-255) ----------------
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 224;");  // blocks until WG2's dec frees them
+    for (int seen = 0;; ++seen) {
+      while (mk_ld_acquire_cta(&C->full_seq) <= seen) __nanosleep(32);
+      const int slot = seen & 1;
+      const Instr I = C->ins[slot];  // ordered after the acquire
+      if (I.op < 0) break;           // halt sentinel
+      const int t0 = C->t0[slot], t1 = C->t1[slot];
+      for (int t = t0; t < t1; ++t) {
+        dispatch(I, t, bufs, opsmem);
+        consumer_sync();  // smem reuse safety + orders all consumer writes
+      }
+      if (threadIdx.x == 0) mk_st_release_cta(&C->done_seq, seen + 1);
+    }
+    return;
+  }
+  asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");  // whole warpgroup 2, converged here
+  if (threadIdx.x != MK_CONSUMERS) return;  // scheduler warpgroup: only thread 256 stays
+
+  // ---------------- scheduler (thread 256) ----------------
+  // Claim discipline (each rule measured — see results/mkv3-p4a.md):
+  //  * COMMIT LATE, DISCOVER EARLY (lookahead=1): while consumers compute, the
+  //    scheduler only CACHES a ring candidate (no cursor atomicAdd). At the done_seq
+  //    flip it claims sticky/candidate with one atomic, stages, and releases full_seq
+  //    BEFORE doing the completion accounting — consumers restart in ~one L2 round
+  //    trip, and the fence + done/pending/ring atomics overlap the next op. Eagerly
+  //    pre-COMMITTING a batch into slot B (lookahead=2) measured NET NEGATIVE: a
+  //    committed long batch (attn-dq quantum ~40us) rides out the current op on THIS
+  //    block while other blocks idle at the instr tail (ATTN_DQ span +740us at small);
+  //    gating pre-claims by abundance also measured negative (lost pre-claims cost
+  //    more than the tail imbalance they avoid).
+  //  * While consumers are busy the ring is rescanned ONLY when its tail moved: 132
+  //    schedulers continuously rescanning (cursor probes = L2 round trips) contend
+  //    with the latency-bound ops (the df2 lesson). New claimable work for a busy
+  //    block can only appear via a push (cursors only grow), so the tail check is
+  //    exact. When consumers are idle, scan every pass like df.
+  //  * Completion accounting that drops a dependent's pending to 0 claims THAT instr
+  //    directly (hint) — the successor of a chain hop skips ring rediscovery.
+  volatile int* vready = ready;
+  volatile int* vctrl = ctrl;
+  int last_ins = -1;   // sticky: retry the previous instruction before scanning
+  int cand = -1;       // pre-discovered ring candidate (uncommitted)
+  int staged = 0, acct = 0;
+  int seen_tail = -1;  // ring tail at the last completed scan (busy-rescan gate)
+  int q_ins0 = -1, q_t00 = 0, q_t10 = 0;  // outstanding batch info per slot (registers,
+  int q_ins1 = -1, q_t01 = 0, q_t11 = 0;  // not an array: dynamic indexing would spill)
+  unsigned lazy = 0;  // busy-side discovery runs every 32nd pass (~1us cadence): 132
+                      // schedulers probing cursors/tail at the 32ns poll cadence is
+                      // measurable L2 contention against the latency-bound ops
+
+  int c_ins = -1, c_t0 = 0, c_t1 = 0;  // out-params of try_claim
+  // NOTE: gating slot-B pre-claims by tile abundance (skip work whose remaining tiles
+  // <= nblocks*bs, or <= nblocks) was measured repeatedly and always NET NEGATIVE
+  // (+90..+140 vs ungated): the tail imbalance a committed batch causes costs less
+  // than the pre-claims the gate forfeits. `gated` retained for documentation; unused.
+  auto try_claim = [&](int i, bool /*gated*/) {
+    const int nt = instrs[i].ntiles;
+    const int cur = cursor[i * pad];
+    if (cur >= nt) return false;
+    const int bs = claim_sz[i];
+    const int c0 = atomicAdd(&cursor[i * pad], bs);
+    if (c0 >= nt) return false;
+    c_ins = i;
+    c_t0 = c0;
+    c_t1 = min(c0 + bs, nt);
+    return true;
+  };
+  auto stage = [&]() {
+    const bool s = staged & 1;
+    C->ins[s] = instrs[c_ins];
+    C->t0[s] = c_t0;
+    C->t1[s] = c_t1;
+    if (s) {
+      q_ins1 = c_ins, q_t01 = c_t0, q_t11 = c_t1;
+    } else {
+      q_ins0 = c_ins, q_t00 = c_t0, q_t10 = c_t1;
+    }
+    if (iclk && c_t0 == 0) iclk[2 * c_ins] = mk_globaltimer();
+    mk_st_release_cta(&C->full_seq, staged + 1);
+    ++staged;
+    last_ins = c_ins;
+  };
+
+  for (;;) {
+    const int ds = mk_ld_acquire_cta(&C->done_seq);
+    bool progress = false;
+    // 1) FAST PATH at the flip: consumers drained everything staged — restage from
+    //    sticky/candidate BEFORE accounting (safe: ready-ring entries and same-instr
+    //    tiles never read the just-finished batch's output).
+    if (ds > acct && staged == ds) {
+      c_ins = -1;
+      if (last_ins >= 0) try_claim(last_ins, false);
+      if (c_ins < 0 && cand >= 0) {
+        try_claim(cand, false);
+        cand = -1;
+      }
+      if (c_ins >= 0) {
+        stage();
+        progress = true;
+      }
+    }
+    // 2) completion accounting for every batch consumers have finished
+    int hint = -1;
+    while (acct < ds) {
+      const bool s = acct & 1;
+      const int ins = s ? q_ins1 : q_ins0;
+      const int t0 = s ? q_t01 : q_t00;
+      const int t1 = s ? q_t11 : q_t10;
+      __threadfence();  // publish the consumers' writes before enabling dependents
+      const int d = atomicAdd(&done[ins * pad], t1 - t0) + (t1 - t0);
+      if (d == instrs[ins].ntiles) {  // last tile anywhere: enable dependents
+        if (iclk) iclk[2 * ins + 1] = mk_globaltimer();
+        for (int e = adj_off[ins]; e < adj_off[ins + 1]; ++e) {
+          const int dep = adj[e];
+          if (atomicSub(&pending[dep * pad], 1) == 1) {
+            const int t = atomicAdd(&ctrl[0], 1);
+            atomicExch(&ready[t], dep);
+            if (hint < 0) hint = dep;  // chain fast path: claim it ourselves too
+          }
+        }
+        atomicAdd(&ctrl[1 * pad], 1);
+      }
+      ++acct;
+      progress = true;
+    }
+    ++lazy;
+    // 3) stage (JIT when consumers wait; eager slot-B pre-claim only if lookahead=2)
+    if (staged < acct + lookahead) {
+      const bool pre = staged > acct;
+      c_ins = -1;
+      if (hint >= 0) try_claim(hint, pre);
+      if (c_ins < 0 && last_ins >= 0) try_claim(last_ins, pre);
+      if (c_ins < 0 && cand >= 0) {
+        try_claim(cand, pre);
+        cand = -1;
+      }
+      const int tail = vctrl[0];
+      if (c_ins < 0 && (!pre || tail != seen_tail)) {  // ring pass (gated while busy)
+        const int gq0 = vctrl[2 * pad];
+        for (int q = gq0; q < tail; ++q) {
+          const int r = vready[q];
+          if (r < 0) continue;  // slot reserved, payload not yet visible
+          if (cursor[r * pad] >= instrs[r].ntiles) {
+            if (q == vctrl[2 * pad]) atomicCAS(&ctrl[2 * pad], q, q + 1);
+            continue;
+          }
+          if (try_claim(r, pre)) break;
+        }
+        if (c_ins < 0) seen_tail = tail;  // empty pass: only a push can change it
+      }
+      if (c_ins >= 0) {
+        stage();
+        progress = true;
+      } else if (acct == staged && vctrl[1 * pad] >= n_instr) {  // all finished: halt
+        C->ins[staged & 1].op = -1;
+        mk_st_release_cta(&C->full_seq, staged + 1);
+        break;
+      }
+    } else if (staged > acct && cand < 0 && (lazy & 31u) == 0) {
+      // 4) busy + nothing committed ahead: DISCOVER the next candidate (no atomics on
+      //    the claim path at the flip). Sticky covers the same-instr case; the ring is
+      //    scanned only when its tail moved.
+      const bool sticky_live = last_ins >= 0 && cursor[last_ins * pad] < instrs[last_ins].ntiles;
+      const int tail = vctrl[0];
+      if (!sticky_live && tail != seen_tail) {
+        const int gq0 = vctrl[2 * pad];
+        for (int q = gq0; q < tail; ++q) {
+          const int r = vready[q];
+          if (r < 0) continue;
+          if (cursor[r * pad] >= instrs[r].ntiles) {
+            if (q == vctrl[2 * pad]) atomicCAS(&ctrl[2 * pad], q, q + 1);
+            continue;
+          }
+          cand = r;
+          break;
+        }
+        if (cand < 0) seen_tail = tail;
+      }
+    }
+    if (!progress) __nanosleep(staged > acct ? 32 : 256);
+  }
+}
+
 // ---- host launcher ------------------------------------------------------------------
 static int g_nblocks = -1;
 
@@ -581,6 +866,54 @@ void mk_run_df(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_of
                                              stream.stream()));
 }
 
+void mk_run_ws(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_off,
+               torch::Tensor adj, torch::Tensor claim_sz, torch::Tensor state,
+               int64_t pad64, int64_t lookahead64, torch::Tensor bufs,
+               int64_t smem_bytes, c10::optional<torch::Tensor> iclk) {
+  TORCH_CHECK(instrs.is_cuda() && instrs.dtype() == torch::kInt32);
+  const int n_instr = (int)(instrs.numel() / (3 + MK_MAX_ARGS));
+  const int pad = (int)pad64;
+  const int lookahead = (int)lookahead64;
+  TORCH_CHECK(pad >= 1 && lookahead >= 1 && lookahead <= 2);
+  TORCH_CHECK(state.numel() >= 3 * (int64_t)n_instr * pad + n_instr + 4 * pad,
+              "ws state tensor too small for pad=", pad);
+
+  static bool ws_configured = false;
+  if (!ws_configured) {
+    C10_CUDA_CHECK(cudaFuncSetAttribute((void*)megakernel_ws,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        (int)smem_bytes));
+    ws_configured = true;
+  }
+  static int ws_nblocks = -1;
+  if (ws_nblocks < 0) {
+    int dev, sms, per_sm;
+    C10_CUDA_CHECK(cudaGetDevice(&dev));
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &per_sm, (void*)megakernel_ws, MK_WS_THREADS, (int)smem_bytes));
+    TORCH_CHECK(per_sm >= 1, "megakernel_ws does not fit an SM with smem=", smem_bytes);
+    ws_nblocks = sms;  // 1 block/SM by design (384 threads at entry 168 regs, ~100KB smem)
+  }
+
+  const Instr* d_instrs = reinterpret_cast<const Instr*>(instrs.data_ptr<int>());
+  const int* d_dc = dep_cnt.data_ptr<int>();
+  const int* d_ao = adj_off.data_ptr<int>();
+  const int* d_ad = adj.data_ptr<int>();
+  const int* d_cs = claim_sz.data_ptr<int>();
+  int* d_state = state.data_ptr<int>();
+  void** d_bufs = reinterpret_cast<void**>(bufs.data_ptr<int64_t>());
+  long long* d_clk =
+      iclk.has_value() ? reinterpret_cast<long long*>(iclk->data_ptr<int64_t>()) : nullptr;
+  void* args[] = {(void*)&d_instrs, (void*)&n_instr,   (void*)&d_dc,    (void*)&d_ao,
+                  (void*)&d_ad,     (void*)&d_cs,      (void*)&d_state, (void*)&pad,
+                  (void*)&lookahead, (void*)&d_bufs,   (void*)&d_clk};
+  auto stream = at::cuda::getCurrentCUDAStream();
+  C10_CUDA_CHECK(cudaLaunchCooperativeKernel((void*)megakernel_ws, dim3(ws_nblocks),
+                                             dim3(MK_WS_THREADS), args,
+                                             (size_t)smem_bytes, stream.stream()));
+}
+
 void mk_run_df2(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_off,
                 torch::Tensor adj, torch::Tensor claim_sz, torch::Tensor gated_in,
                 torch::Tensor band_tiles, torch::Tensor region_off, torch::Tensor region_cnt0,
@@ -639,6 +972,7 @@ void mk_run_df2(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_o
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("run", &mk_run, "run megakernel program (wave mode)");
   m.def("run_df", &mk_run_df, "run megakernel program (dataflow mode)");
+  m.def("run_ws", &mk_run_ws, "run megakernel program (warp-specialized dataflow mode)");
   m.def("run_df2", &mk_run_df2, "run megakernel program (region-watermark dataflow mode)");
   m.def("nblocks", &mk_nblocks, "resolved persistent block count");
 }
