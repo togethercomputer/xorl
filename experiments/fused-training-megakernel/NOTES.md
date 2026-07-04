@@ -1053,8 +1053,18 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   lets them be; the residual vs the baseline is the one-register-point constraint,
   not op micro-structure.
 
-End-of-session state (df, defaults): small ~4048, nano ~1092 profile /
-~4105/1205 bench vs flash baseline 1766/631 -> 2.3x/1.9x.
+End-of-session certified gauntlet (df defaults, clean-GPU util guards,
+median-of-50, fresh process per config; baseline medians wobble +-5-8% across
+runs from inductor autotune variance):
+| config | megakernel | flash-baseline | gap |
+|---|---|---|---|
+| nano | 1200 | 631 | 1.90x |
+| small | 4114 | 1904 | 2.16x |
+| deep-L12 | 3067 | 1562 | 1.96x |
+| S=128 | 928 | 491 | 1.89x |
+| S=256 | 1029 | 548 | 1.88x |
+| S=1024 | 1545 | 775 | 1.99x |
+(Morning honest reset: nano 1.97x / small 2.52x.)
 
 ## Honest assessment + v2 roadmap
 
