@@ -869,6 +869,20 @@ it. S=4096 default won all three repeats (4373.2/4325.7/4345.2us vs
 (10408.1us vs 10509.7us for Ckv=2 and 10726.3us for Ckv=4;
 `mkv3-p4b-longS-attn-chunk-ab.log`). Keep routed attention chunk defaults unchanged.
 
+Post-fixed-baseline DQ C=1 epilogue cleanup: the current S=4096 profile showed
+`ATTN_DQ_WG` as the largest on-path span (~1000us across four layers;
+`mkv3-p4b-s4096-default-profile.log`). Since the default `Cq=1` has exactly one writer
+per q slice, the dQ epilogue can store directly into the fp32 workspace instead of
+using `atomicAdd`; `Cq>1` still uses atomics. Correctness is green post-merge
+(`mkv3-p4b-dq-c1-postmerge-testattention.log`,
+`mkv3-p4b-dq-c1-postmerge-testmodel.log`). Two clean same-GPU A/B runs promoted the
+change: GPU5 control/variant medians were nano 1242.6/1231.9us, small 4351.5/4328.0us,
+S4096 4325.7/4315.4us
+(`mkv3-p4b-dq-c1-{control,variant}-20260704T190138Z-mkonly.log`); reverse-order GPU3
+medians were nano 1248.3/1243.7us, small 4340.3/4326.9us, S4096 4318.1/4308.5us
+(`mkv3-p4b-dq-c1-reverse-*-mkonly.log`). The earlier
+`mkv3-p4b-dq-c1-outer-ab.log` was contaminated by an SGLang server and is ignored.
+
 Post-headtarget DKV first-pair batching recheck: a macro-gated branch
 `MK_ATTN_DKV_X2_SD=1` batched the first two independent DKV wgmma groups
 (`S=QK^T` and `dP=dO V^T`) into one `wga_mma64_x2` call. This was correctness-clean
