@@ -751,13 +751,15 @@ GPU with util guards):
 Parity verified at S=4096 AND S=8192 (loss matches the bf16 eager twin to 4dp;
 worst grad max-rel 2.0%/2.4%). The win WIDENS with S (1.19x at 4096, 1.68x at 8192). The megakernel's step time scales near-linearly in S over this
 range (1250 -> 4387 for 8x S) while the baseline turns superlinear past S=2048
-(711 -> 5232). Attribution hypothesis (not yet decomposed): the baseline's CE
-materializes fp32 logits [S,V] for cross_entropy (134MB at nano-4096, 537MB at
-small-4096) while the megakernel's fused lm_head/CE partials never materialize
-them; plus the FA-class attention and tile-level co-scheduling amortize better
-at high tile counts. Caveat for honesty: a baseline with a hand-fused CE (e.g.
-liger-style) would narrow the long-S gap — the crossover claim is against the
-straightforward torch.compile+CUDAGraph stack this project has always benched.
+(711 -> 5232). The obvious objection — "the baseline's fp32 [S,V] CE
+materialization is the handicap" — was TESTED AND REFUTED: a chunked-CE
+hardened baseline (per-1024-row lm_head + CE, no logits materialization,
+compiled + CUDAGraphed identically) measures 5238us at S=4096 and 17620 at
+S=8192 — within noise of the plain baseline. The megakernel's long-S advantage
+comes from its attention/gemm/tile-co-scheduling scaling, not from CE; the
+crossover claim survives the fused-CE honesty check (ratios 1.19x/1.69x
+unchanged). Per-kernel decomposition of WHERE the baseline goes superlinear is
+an open item (nsys --cuda-graph-trace=node, per the P0 method).
 
 The v3 win gates at nano/small (0.66/2.4ms) remain unmet — short-S is still
 1.6-1.8x behind — but the original goal ("BEAT compile+cudagraph") is now MET
