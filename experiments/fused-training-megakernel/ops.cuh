@@ -533,6 +533,25 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
     }
   }
 
+  // Fused Drow epilogue (flags bit10, dOatt = dX @ Wo): drow[qh, s] += sum_d dO*O over
+  // this tile's 64 columns (fp32 atomics; drow pre-zeroed). WG_BN == 64 covers one
+  // whole head at D=64 (a half-head partial at D=128 — the atomics accumulate both).
+  // Values re-rounded through bf16 to match what the standalone op read back from the
+  // dOatt buffer. args: 9 = oatt, 10 = drow, 11 = D. No residual/split-K/acc co-use.
+  if (flags & 1024) {
+    const bf16* Oatt = reinterpret_cast<const bf16*>(bufs[I.args[9]]);
+    float* drow = reinterpret_cast<float*>(bufs[I.args[10]]);
+    const int D = I.args[11];
+    const int warp = tid / 32, lane = tid % 32;
+    for (int r = warp; r < WG_BM; r += 8) {  // warp per row, block-wide
+      float s = 0.0f;
+      for (int d = lane; d < WG_BN; d += 32)
+        s += bf2f(f2bf(Cs[r * WG_LDC + d])) * bf2f(Oatt[(int64_t)(m0 + r) * N + n0 + d]);
+      for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffff, s, o);
+      if (lane == 0) atomicAdd(&drow[(int64_t)(n0 / D) * M + m0 + r], s);
+    }
+  }
+
   // Fused CE/LSE partials (flags bit11, lm_head gemm): per-row online (max, sumexp)
   // over this tile's 64 columns, computed from the bf16-ROUNDED staged values so the
   // reduction sees exactly what OP_CE_FWD would have read back from the logits buffer.

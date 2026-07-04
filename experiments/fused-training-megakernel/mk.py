@@ -61,9 +61,9 @@ def wgmma_ok(M, N, K, flags):
     small (-285us); occupancy — not majors — is now the binding constraint, so NN
     routes when the instr exposes enough 128x64 tiles (MK_WGMMA_NN_MIN, default 64;
     nano's 16-48-tile dX gemms stay WMMA/split-K: measured +30us if routed). TN (dW,
-    fp32 split-K) routes via MK_WGMMA_TN. bit10 (Drow epilogue) stays WMMA — not
-    implemented on the wgmma path."""
-    if flags & (32 | 1024):
+    fp32 split-K) routes via MK_WGMMA_TN. bit10 (Drow epilogue) is implemented on
+    both paths and falls under the NN tile gate like its siblings."""
+    if flags & 32:
         return False
     if M % 128 or N % 64 or K % 64:
         return False
