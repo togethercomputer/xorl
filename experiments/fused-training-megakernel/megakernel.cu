@@ -151,6 +151,7 @@ extern "C" __global__ void megakernel(const Instr* __restrict__ instrs,
                                       int nwaves, void** bufs,
                                       long long* wave_clk /* nullable [nwaves+1] */) {
   extern __shared__ char smem[];
+  __shared__ Instr s_I;  // owner instr staged in smem (dispatch spill tax)
   cg::grid_group grid = cg::this_grid();
   const int nblocks = gridDim.x;
 
@@ -160,11 +161,15 @@ extern "C" __global__ void megakernel(const Instr* __restrict__ instrs,
     const int total = wave_tiles[w];
     for (int work = blockIdx.x; work < total; work += nblocks) {
       // locate the instruction owning this work item: scan offsets only (2 ints),
-      // copy the full Instr struct just for the owner.
+      // stage the full Instr in smem just for the owner (every thread scans the same
+      // globals, so the branch is block-uniform).
       for (int i = i0; i < i1; ++i) {
         if (work < instrs[i].tile_off + instrs[i].ntiles) {
-          const Instr I = instrs[i];
-          dispatch(I, work - I.tile_off, bufs, smem);
+          if (threadIdx.x < 3 + MK_MAX_ARGS)
+            reinterpret_cast<int*>(&s_I)[threadIdx.x] =
+                reinterpret_cast<const int*>(instrs + i)[threadIdx.x];
+          __syncthreads();
+          dispatch(s_I, work - s_I.tile_off, bufs, smem);
           break;
         }
       }
@@ -238,6 +243,7 @@ extern "C" __global__ void megakernel_df(const Instr* __restrict__ instrs, int n
   grid.sync();
 
   __shared__ int s_ins, s_t0, s_t1;
+  __shared__ Instr s_I;  // claimed instr staged in smem (see the dispatch-loop note)
   int last_ins = -1;   // sticky: retry the previous instruction before scanning
   int last_cold = 0;   // sticky instr's class: cold stickiness yields to fresh hot work
   int seen_hot = 0;    // hot tail at the last failed hot scan (held back at invisible
@@ -325,17 +331,22 @@ extern "C" __global__ void megakernel_df(const Instr* __restrict__ instrs, int n
     const int ins = s_ins;
     if (ins < 0) break;  // everything finished
     const int t0 = s_t0, t1 = s_t1;
+    // stage the claimed Instr in static smem: a register/stack copy of the 104-byte
+    // struct is live across every dispatch call site — exactly where the P5/P6
+    // spill-tax STL/LDL sit (ptxas spills caller state around the inlined switch)
+    if (threadIdx.x < 3 + MK_MAX_ARGS)
+      reinterpret_cast<int*>(&s_I)[threadIdx.x] =
+          reinterpret_cast<const int*>(instrs + ins)[threadIdx.x];
     __syncthreads();
     if (iclk && threadIdx.x == 0 && t0 == 0) iclk[2 * ins] = mk_globaltimer();
-    const Instr I = instrs[ins];
     for (int t = t0; t < t1; ++t) {
-      dispatch(I, t, bufs, smem);
+      dispatch(s_I, t, bufs, smem);
       __syncthreads();
     }
     if (threadIdx.x == 0) {
       __threadfence();  // publish this instr's writes before enabling dependents
       const int d = atomicAdd(&done[ins], t1 - t0) + (t1 - t0);
-      if (d == I.ntiles) {  // last tile: enable dependents
+      if (d == s_I.ntiles) {  // last tile: enable dependents
         if (iclk) iclk[2 * ins + 1] = mk_globaltimer();
         for (int e = adj_off[ins]; e < adj_off[ins + 1]; ++e) {
           const int dep = adj[e];
@@ -415,6 +426,7 @@ __global__ void megakernel_df2(const Instr* __restrict__ instrs, const int n_ins
   grid.sync();
 
   __shared__ int s_ins, s_t0, s_t1;
+  __shared__ Instr s_I;  // claimed instr staged in smem (dispatch spill tax)
   int last_ins = -1;  // sticky: retry the previous instruction before scanning
   volatile int* vready = ready;
   volatile int* vctrl = ctrl;
@@ -500,11 +512,13 @@ __global__ void megakernel_df2(const Instr* __restrict__ instrs, const int n_ins
     const int ins = s_ins;
     if (ins < 0) break;  // everything finished
     const int t0 = s_t0, t1 = s_t1;
+    if (threadIdx.x < 3 + MK_MAX_ARGS)  // smem-stage the Instr (dispatch spill tax)
+      reinterpret_cast<int*>(&s_I)[threadIdx.x] =
+          reinterpret_cast<const int*>(instrs + ins)[threadIdx.x];
     __syncthreads();
     if (iclk && threadIdx.x == 0 && t0 == 0) iclk[2 * ins] = mk_globaltimer();
-    const Instr I = instrs[ins];
     for (int t = t0; t < t1; ++t) {
-      dispatch(I, t, bufs, smem);
+      dispatch(s_I, t, bufs, smem);
       __syncthreads();
     }
     if (threadIdx.x == 0) {
@@ -540,7 +554,7 @@ __global__ void megakernel_df2(const Instr* __restrict__ instrs, const int n_ins
         }
       }
       const int d = atomicAdd(&done[ins], t1 - t0) + (t1 - t0);
-      if (d == I.ntiles) {  // last tile: enable dependents
+      if (d == s_I.ntiles) {  // last tile: enable dependents
         if (iclk) iclk[2 * ins + 1] = mk_globaltimer();
         for (int e = gate_off[ins]; e < gate_off[ins + 1]; ++e)
           atomicMax(&wmark[gate_cons[e]], 0x3fffffff);  // final: everything enabled
@@ -672,6 +686,10 @@ extern "C" __global__ void __maxnreg__(168) megakernel_ws(
     for (int seen = 0;; ++seen) {
       while (mk_ld_acquire_cta(&C->full_seq) <= seen) __nanosleep(32);
       const int slot = seen & 1;
+      // NOTE: this must stay a register COPY. Reading the Instr through a reference
+      // into the control slot (to dodge the dispatch spill tax like the df executors)
+      // HANGS at the small config within ~15 timed steps — the lazily-read slot races
+      // the scheduler's eager slot reuse in a way the up-front snapshot cannot.
       const Instr I = C->ins[slot];  // ordered after the acquire
       if (I.op < 0) break;           // halt sentinel
       const int t0 = C->t0[slot], t1 = C->t1[slot];

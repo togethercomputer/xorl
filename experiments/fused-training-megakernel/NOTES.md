@@ -448,10 +448,52 @@ traffic op), NN bwd-dX gemms #2 (~426/1515us, 10 TF, 16-tile latency-bound).
 - ws mode now LOSES to df at both configs (1686/6616 vs 1627/6356) — the P6 wins are
   df-only; a ws port of the hot/cold rings is the obvious (deferred) follow-up.
 
-**Scoreboard: nano 1622 / small 6356 (df)** vs hardened 712/2735 — gap 2.28x/2.32x
-(from 2.5x/2.6x after P5; v3 started at 2.65x/3.44x). STACK note: df 528 -> 608 after
-the rowop integration (same dispatch-call-site spill class as P5; the executor-level
-fix is still open, now ~the last uniform tax).
+**Round-1 scoreboard: nano 1622 / small 6356 (df)** vs hardened 712/2735.
+
+## v3 Phase 6 round 2: the spill-tax kill + claim retune — 2.05x
+
+1. **Dispatch spill tax SOLVED** (the P5 open item, and Laine-2013's canonical
+   megakernel pathology): the spilled caller state was dominated by the 104-byte
+   `const Instr I = instrs[ins]` register copy live across every dispatch call.
+   Fix: stage the claimed Instr into STATIC smem once per claim (26-int parallel
+   copy + the already-present barrier) and dispatch a reference to it. df STACK
+   624 -> 336; **nano -125us, small -484us (~8% uniform, both configs)** — the
+   highest value-per-line change of the phase. Applied to df/df2/waves.
+   **ws consumers MUST keep the register copy**: the same trick there (reference
+   into the control slot) hangs intermittently at small — see 3.
+2. **Claim quantum default 264 -> 132**: the old "264 beats 132" optimum was an
+   artifact of expensive claims; after the rings + spill fix, finer batches' tail
+   balance wins (-27/-237us). MK_CLAIM env knob for sweeps.
+3. **ws lookahead=2 pre-claim race, mitigated**: with the new (8x shorter) rowop
+   batches, the eager slot-B pre-claim hangs ~1 in 2-6 rounds of 20 small steps
+   (pre-P6 commit clean at the old cadence; df clean everywhere; every new op clean
+   200x in ws isolation; la=1 clean 160 steps). The race predates P6 — the cadence
+   change widened its window. Default is now lookahead=1 (MK_WS_LOOKAHEAD to
+   override); root-cause fix belongs to the deferred ws round. ws (la=1, stable):
+   1633/6291 — still behind df.
+
+**Final flag-planting scoreboard** (df megakernel vs hardened compile+cudagraph+,
+median-of-50, FRESH PROCESS PER CONFIG — benching multiple sequence lengths in one
+process poisons torch.compile with dynamic-shape recompiles: the in-process S=256
+"baseline" was 2121us vs the honest 608):
+| config                  | megakernel | hardened | gap  |
+|-------------------------|-----------|----------|------|
+| nano  (H256 L4 S512)    | 1468      | 711      | 2.06x |
+| small (H512 L8 S1024)   | 5626      | 2730     | 2.06x |
+| deep-narrow (L12 S512)  | 3638      | 1985     | 1.83x |
+| S=128 (nano width)      | 1046      | 459      | 2.28x |
+| S=256                   | 1233      | 608      | 2.03x |
+| S=1024                  | 1937      | 961      | 2.02x |
+(v3 start: 2.65x/3.44x; post-P5: 2.5x/2.6x.) Phase-6 total: -307us nano (-17%),
+-1480us small (-21%), all parity-green + racecheck/synccheck clean on the new df
+protocol. Full logs: results/mkv3-p6-*.
+
+Remaining structural items, in measured order: (1) per-op math throughput (wgmma NT
+gemms ~40TF in-model, NN dX gemms ~10TF WMMA — needs producer-fed multi-stage
+pipelines, i.e. P4b, now unblocked since ops fit 224 regs and the spill tax is gone);
+(2) bandwidth contention between the chain and cold dW work (cold_cap was a wash, but
+op-level BW efficiency isn't); (3) deferred retunes (attention C, m64n128 tiles);
+(4) the ws pre-claim race + hot/cold port, if ws is to matter again.
 
 ## Honest assessment + v2 roadmap
 

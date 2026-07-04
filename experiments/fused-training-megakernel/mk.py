@@ -464,9 +464,12 @@ class Program:
         for i in range(n):
             adj.extend(sorted(dependents[i]))
             adj_off.append(len(adj))
-        # claim quantum: 264 measured better than the "true" 132 block count at small
-        # (bigger batches worsen tail balance on multi-round instrs)
-        claim = [max(1, min(8, (ntiles + 263) // 264)) for _, ntiles, _ in flat]
+        # claim quantum: 132 (the true block count). 264 was better pre-P6 (its bigger
+        # batches amortized the expensive claim path); the hot/cold rings + smem-staged
+        # dispatch made claims cheap enough that finer batches' tail balance wins
+        # (-27/-237us vs 264). MK_CLAIM overrides for sweeps.
+        cq = int(os.environ.get("MK_CLAIM", "132"))
+        claim = [max(1, min(8, (ntiles + cq - 1) // cq)) for _, ntiles, _ in flat]
         self.n_instr = n
         self._dep_cnt = torch.tensor(dep_cnt, dtype=torch.int32, device=device)
         self._adj_off = torch.tensor(adj_off, dtype=torch.int32, device=device)
@@ -489,8 +492,13 @@ class Program:
         # measured consistently +10..+30us SLOWER in-model (ring scans touch 32x more
         # L2 lines; the wspec-probe false-sharing win does not transfer). lookahead 2 =
         # eager slot-B pre-claim (measured best); 1 = commit-late (A/B attribution).
+        # lookahead DEFAULT MOVED 2 -> 1 (v3 P6): with the batched rowops' much shorter
+        # tile batches, lookahead=2's eager slot-B pre-claim HANGS intermittently at the
+        # small config (~1 in 2-6 rounds of 20 steps; old ops never hit it — the race
+        # predates P6 but its window was cadence-narrow). la=1 stressed clean 160 steps.
+        # Race is in the pre-claim path (unidentified); revisit in a dedicated ws round.
         self._ws_pad = 1
-        self._ws_lookahead = 2
+        self._ws_lookahead = int(os.environ.get("MK_WS_LOOKAHEAD", "1"))
         self._state_ws = torch.empty(3 * n * 32 + n + 4 * 32, dtype=torch.int32, device=device)
         self.critical_path = self._critical_path(deps, flat)
 
