@@ -505,6 +505,8 @@ class Program:
             0 if (adj_off[i + 1] == adj_off[i] or flat[i][0] == OP_FILL_F32) else 1
             for i in range(n)
         ]
+        if os.environ.get("MK_ALLHOT"):  # bisect knob: single-ring behavior
+            crit = [1] * n
         self._crit = torch.tensor(crit, dtype=torch.int32, device=device)
         # state: pending[n] | cursor[n] | done[n] | ready_hot[n] | ready_cold[n] | ctrl[8]
         self._state = torch.empty(5 * n + 8, dtype=torch.int32, device=device)
@@ -521,7 +523,8 @@ class Program:
         # Race is in the pre-claim path (unidentified); revisit in a dedicated ws round.
         self._ws_pad = 1
         self._ws_lookahead = int(os.environ.get("MK_WS_LOOKAHEAD", "1"))
-        self._state_ws = torch.empty(3 * n * 32 + n + 4 * 32, dtype=torch.int32, device=device)
+        # + 2n rings (hot + cold, v3 P4b port) + 6*pad ctrl
+        self._state_ws = torch.empty(3 * n * 32 + 2 * n + 6 * 32, dtype=torch.int32, device=device)
         self.critical_path = self._critical_path(deps, flat)
 
         # df2 arrays: region-watermark gating (dep DAG minus gated edges + gate CSR)
@@ -577,6 +580,7 @@ class Program:
                 self._adj_off,
                 self._adj,
                 self._claim,
+                self._crit,
                 self._state_ws,
                 self._ws_pad,
                 self._ws_lookahead,

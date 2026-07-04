@@ -628,8 +628,11 @@ __global__ void megakernel_df2(const Instr* __restrict__ instrs, const int n_ins
 // op < 0.
 //
 // state layout (pad = ints per entry; 32 = one 128B line per instr to kill the false
-// sharing the wspec replication identified; ready ring stays packed for cheap scans):
-//   cursor[n*pad] | done[n*pad] | pending[n*pad] | ready[n] | ctrl[4*pad]
+// sharing the wspec replication identified; ready rings stay packed for cheap scans):
+//   cursor[n*pad] | done[n*pad] | pending[n*pad] | ready_hot[n] | ready_cold[n]
+//   | ctrl[6*pad]  (0=hot tail, 1=finished, 2=hot head, 3=cold tail, 4=cold head)
+// v3 P4b: hot/cold criticality rings ported from df (the P6 win that made ws lose
+// its P5 lead): idle schedulers drain chain work before sink/fill work.
 #define MK_WS_CTRL_BYTES 256  // control carve-out at the base of dynamic smem
 
 struct WsCtrl {
@@ -656,26 +659,33 @@ __device__ __forceinline__ int mk_ld_acquire_cta(const int* p) {
 extern "C" __global__ void __maxnreg__(168) megakernel_ws(
     const Instr* __restrict__ instrs, int n_instr, const int* __restrict__ dep_cnt,
     const int* __restrict__ adj_off, const int* __restrict__ adj,
-    const int* __restrict__ claim_sz, int* state, int pad, int lookahead, void** bufs,
-    long long* iclk /* nullable [2*n] */) {
+    const int* __restrict__ claim_sz, const int* __restrict__ crit, int* state, int pad,
+    int lookahead, void** bufs, long long* iclk /* nullable [2*n] */) {
   extern __shared__ char smem[];
+  __shared__ Instr sQI[2];  // consumer-owned Instr snapshots (dispatch spill tax: the
+  // 104B register copy live across dispatch was df's biggest P6 single win; the
+  // earlier ws attempt read through a reference INTO THE CONTROL SLOT and hung —
+  // this snapshot is consumer-owned, complete behind a consumer_sync before any
+  // dispatch, and the slot itself is never read during execution).
   WsCtrl* C = reinterpret_cast<WsCtrl*>(smem);
   char* opsmem = smem + MK_WS_CTRL_BYTES;  // ops get the rest (16B-aligned)
   cg::grid_group grid = cg::this_grid();
   int* cursor = state;
   int* done = state + n_instr * pad;
   int* pending = state + 2 * n_instr * pad;
-  int* ready = state + 3 * n_instr * pad;
-  int* ctrl = state + 3 * n_instr * pad + n_instr;
+  int* ready_hot = state + 3 * n_instr * pad;
+  int* ready_cold = ready_hot + n_instr;
+  int* ctrl = ready_cold + n_instr;
 
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_instr;
        i += gridDim.x * blockDim.x) {
     cursor[i * pad] = 0;
     done[i * pad] = 0;
     pending[i * pad] = dep_cnt[i];
-    ready[i] = -1;
+    ready_hot[i] = -1;
+    ready_cold[i] = -1;
   }
-  if (blockIdx.x == 0 && threadIdx.x < 4) ctrl[threadIdx.x * pad] = 0;
+  if (blockIdx.x == 0 && threadIdx.x < 6) ctrl[threadIdx.x * pad] = 0;
   if (threadIdx.x == 0) {
     C->full_seq = 0;
     C->done_seq = 0;
@@ -684,8 +694,13 @@ extern "C" __global__ void __maxnreg__(168) megakernel_ws(
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_instr;
        i += gridDim.x * blockDim.x) {
     if (dep_cnt[i] == 0) {
-      const int t = atomicAdd(&ctrl[0], 1);
-      atomicExch(&ready[t], i);
+      if (crit[i]) {
+        const int t = atomicAdd(&ctrl[0], 1);
+        atomicExch(&ready_hot[t], i);
+      } else {
+        const int t = atomicAdd(&ctrl[3 * pad], 1);
+        atomicExch(&ready_cold[t], i);
+      }
     }
   }
   grid.sync();
@@ -696,13 +711,17 @@ extern "C" __global__ void __maxnreg__(168) megakernel_ws(
     for (int seen = 0;; ++seen) {
       while (mk_ld_acquire_cta(&C->full_seq) <= seen) __nanosleep(32);
       const int slot = seen & 1;
-      // NOTE: this must stay a register COPY. Reading the Instr through a reference
-      // into the control slot (to dodge the dispatch spill tax like the df executors)
-      // HANGS at the small config within ~15 timed steps — the lazily-read slot races
-      // the scheduler's eager slot reuse in a way the up-front snapshot cannot.
-      const Instr I = C->ins[slot];  // ordered after the acquire
-      if (I.op < 0) break;           // halt sentinel
+      // snapshot the staged Instr into consumer-owned static smem (26-int parallel
+      // copy; every thread has done its own acquire, so the slot bytes are visible).
+      // Slot reuse needs batch seen+1 ACCOUNTED, which needs it FINISHED — no writer
+      // can touch C->ins[slot] while this batch executes, and dispatch reads sQI.
+      if (threadIdx.x < 3 + MK_MAX_ARGS)
+        reinterpret_cast<int*>(&sQI[slot])[threadIdx.x] =
+            reinterpret_cast<const int*>(&C->ins[slot])[threadIdx.x];
       const int t0 = C->t0[slot], t1 = C->t1[slot];
+      consumer_sync();  // snapshot complete before first dispatch
+      const Instr& I = sQI[slot];
+      if (I.op < 0) break;  // halt sentinel
       for (int t = t0; t < t1; ++t) {
         dispatch(I, t, bufs, opsmem);
         consumer_sync();  // smem reuse safety + orders all consumer writes
@@ -733,12 +752,14 @@ extern "C" __global__ void __maxnreg__(168) megakernel_ws(
   //    exact. When consumers are idle, scan every pass like df.
   //  * Completion accounting that drops a dependent's pending to 0 claims THAT instr
   //    directly (hint) — the successor of a chain hop skips ring rediscovery.
-  volatile int* vready = ready;
+  volatile int* vhot = ready_hot;
+  volatile int* vcold = ready_cold;
   volatile int* vctrl = ctrl;
   int last_ins = -1;   // sticky: retry the previous instruction before scanning
   int cand = -1;       // pre-discovered ring candidate (uncommitted)
   int staged = 0, acct = 0;
-  int seen_tail = -1;  // ring tail at the last completed scan (busy-rescan gate)
+  int seen_hot = -1, seen_cold = -1;  // ring tails at the last completed scan (held
+                                      // back at invisible slots; busy-rescan gate)
   int q_ins0 = -1, q_t00 = 0, q_t10 = 0;  // outstanding batch info per slot (registers,
   int q_ins1 = -1, q_t01 = 0, q_t11 = 0;  // not an array: dynamic indexing would spill)
   unsigned lazy = 0;  // busy-side discovery runs every 32nd pass (~1us cadence): 132
@@ -777,6 +798,42 @@ extern "C" __global__ void __maxnreg__(168) megakernel_ws(
     ++staged;
     last_ins = c_ins;
   };
+  // hot-first two-ring pass (P6 criticality rings): claim (do_claim) or discover a
+  // candidate. Sets c_ins / cand respectively; advances the consumed heads past
+  // drained entries; updates seen_* (held back at invisible slots so a mid-push
+  // entry still forces a rescan).
+  auto ring_pass = [&](bool pre, bool do_claim) {
+    const int htail = vctrl[0];
+    int vis = htail;
+    for (int q = vctrl[2 * pad]; q < htail; ++q) {
+      const int r = vhot[q];
+      if (r < 0) {  // slot reserved, payload not yet visible
+        if (q < vis) vis = q;
+        continue;
+      }
+      if (cursor[r * pad] >= instrs[r].ntiles) {
+        if (q == vctrl[2 * pad]) atomicCAS(&ctrl[2 * pad], q, q + 1);
+        continue;
+      }
+      if (do_claim ? try_claim(r, pre) : (cand = r) >= 0) return;
+    }
+    seen_hot = vis;
+    const int ctail = vctrl[3 * pad];
+    vis = ctail;
+    for (int q = vctrl[4 * pad]; q < ctail; ++q) {
+      const int r = vcold[q];
+      if (r < 0) {
+        if (q < vis) vis = q;
+        continue;
+      }
+      if (cursor[r * pad] >= instrs[r].ntiles) {
+        if (q == vctrl[4 * pad]) atomicCAS(&ctrl[4 * pad], q, q + 1);
+        continue;
+      }
+      if (do_claim ? try_claim(r, pre) : (cand = r) >= 0) return;
+    }
+    seen_cold = vis;
+  };
 
   for (;;) {
     const int ds = mk_ld_acquire_cta(&C->done_seq);
@@ -810,8 +867,13 @@ extern "C" __global__ void __maxnreg__(168) megakernel_ws(
         for (int e = adj_off[ins]; e < adj_off[ins + 1]; ++e) {
           const int dep = adj[e];
           if (atomicSub(&pending[dep * pad], 1) == 1) {
-            const int t = atomicAdd(&ctrl[0], 1);
-            atomicExch(&ready[t], dep);
+            if (crit[dep]) {
+              const int t = atomicAdd(&ctrl[0], 1);
+              atomicExch(&ready_hot[t], dep);
+            } else {
+              const int t = atomicAdd(&ctrl[3 * pad], 1);
+              atomicExch(&ready_cold[t], dep);
+            }
             if (hint < 0) hint = dep;  // chain fast path: claim it ourselves too
           }
         }
@@ -831,20 +893,9 @@ extern "C" __global__ void __maxnreg__(168) megakernel_ws(
         try_claim(cand, pre);
         cand = -1;
       }
-      const int tail = vctrl[0];
-      if (c_ins < 0 && (!pre || tail != seen_tail)) {  // ring pass (gated while busy)
-        const int gq0 = vctrl[2 * pad];
-        for (int q = gq0; q < tail; ++q) {
-          const int r = vready[q];
-          if (r < 0) continue;  // slot reserved, payload not yet visible
-          if (cursor[r * pad] >= instrs[r].ntiles) {
-            if (q == vctrl[2 * pad]) atomicCAS(&ctrl[2 * pad], q, q + 1);
-            continue;
-          }
-          if (try_claim(r, pre)) break;
-        }
-        if (c_ins < 0) seen_tail = tail;  // empty pass: only a push can change it
-      }
+      if (c_ins < 0 &&
+          (!pre || vctrl[0] != seen_hot || vctrl[3 * pad] != seen_cold))  // busy-gated
+        ring_pass(pre, /*do_claim=*/true);
       if (c_ins >= 0) {
         stage();
         progress = true;
@@ -855,24 +906,11 @@ extern "C" __global__ void __maxnreg__(168) megakernel_ws(
       }
     } else if (staged > acct && cand < 0 && (lazy & 31u) == 0) {
       // 4) busy + nothing committed ahead: DISCOVER the next candidate (no atomics on
-      //    the claim path at the flip). Sticky covers the same-instr case; the ring is
-      //    scanned only when its tail moved.
+      //    the claim path at the flip). Sticky covers the same-instr case; the rings
+      //    are scanned only when a tail moved.
       const bool sticky_live = last_ins >= 0 && cursor[last_ins * pad] < instrs[last_ins].ntiles;
-      const int tail = vctrl[0];
-      if (!sticky_live && tail != seen_tail) {
-        const int gq0 = vctrl[2 * pad];
-        for (int q = gq0; q < tail; ++q) {
-          const int r = vready[q];
-          if (r < 0) continue;
-          if (cursor[r * pad] >= instrs[r].ntiles) {
-            if (q == vctrl[2 * pad]) atomicCAS(&ctrl[2 * pad], q, q + 1);
-            continue;
-          }
-          cand = r;
-          break;
-        }
-        if (cand < 0) seen_tail = tail;
-      }
+      if (!sticky_live && (vctrl[0] != seen_hot || vctrl[3 * pad] != seen_cold))
+        ring_pass(/*pre=*/true, /*do_claim=*/false);
     }
     if (!progress) __nanosleep(staged > acct ? 32 : 256);
   }
@@ -970,15 +1008,16 @@ void mk_run_df(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_of
 }
 
 void mk_run_ws(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_off,
-               torch::Tensor adj, torch::Tensor claim_sz, torch::Tensor state,
-               int64_t pad64, int64_t lookahead64, torch::Tensor bufs,
-               int64_t smem_bytes, c10::optional<torch::Tensor> iclk) {
+               torch::Tensor adj, torch::Tensor claim_sz, torch::Tensor crit,
+               torch::Tensor state, int64_t pad64, int64_t lookahead64,
+               torch::Tensor bufs, int64_t smem_bytes,
+               c10::optional<torch::Tensor> iclk) {
   TORCH_CHECK(instrs.is_cuda() && instrs.dtype() == torch::kInt32);
   const int n_instr = (int)(instrs.numel() / (3 + MK_MAX_ARGS));
   const int pad = (int)pad64;
   const int lookahead = (int)lookahead64;
   TORCH_CHECK(pad >= 1 && lookahead >= 1 && lookahead <= 2);
-  TORCH_CHECK(state.numel() >= 3 * (int64_t)n_instr * pad + n_instr + 4 * pad,
+  TORCH_CHECK(state.numel() >= 3 * (int64_t)n_instr * pad + 2 * n_instr + 6 * pad,
               "ws state tensor too small for pad=", pad);
 
   static bool ws_configured = false;
@@ -1004,13 +1043,14 @@ void mk_run_ws(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_of
   const int* d_ao = adj_off.data_ptr<int>();
   const int* d_ad = adj.data_ptr<int>();
   const int* d_cs = claim_sz.data_ptr<int>();
+  const int* d_cr = crit.data_ptr<int>();
   int* d_state = state.data_ptr<int>();
   void** d_bufs = reinterpret_cast<void**>(bufs.data_ptr<int64_t>());
   long long* d_clk =
       iclk.has_value() ? reinterpret_cast<long long*>(iclk->data_ptr<int64_t>()) : nullptr;
   void* args[] = {(void*)&d_instrs, (void*)&n_instr,   (void*)&d_dc,    (void*)&d_ao,
-                  (void*)&d_ad,     (void*)&d_cs,      (void*)&d_state, (void*)&pad,
-                  (void*)&lookahead, (void*)&d_bufs,   (void*)&d_clk};
+                  (void*)&d_ad,     (void*)&d_cs,      (void*)&d_cr,    (void*)&d_state,
+                  (void*)&pad,      (void*)&lookahead, (void*)&d_bufs,  (void*)&d_clk};
   auto stream = at::cuda::getCurrentCUDAStream();
   C10_CUDA_CHECK(cudaLaunchCooperativeKernel((void*)megakernel_ws, dim3(ws_nblocks),
                                              dim3(MK_WS_THREADS), args,
