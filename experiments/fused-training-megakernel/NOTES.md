@@ -911,6 +911,13 @@ because `ATTN_DKV_WG` grew in the same run (small total 4373.5us;
 `mkv3-p4b-drow-wg-route-prof.log`), and 80-step medians were only noise-level positive
 versus recent control (route 1242.6us / 4341.0us vs control 1244.2us / 4344.0us;
 `mkv3-p4b-drow-wg-route-mkonly.log`). Do not merge without a repeatable step-level win.
+Post-DQ C=1 re-gate on a fresh current-base worktree kept the no-go. Correctness stayed
+green (`mkv3-p4b-drow-wg-current-testmodel-20260704T191524Z.log`) and the target span
+again shrank (`GEMMNN 1024x512x512.wg` at 214.1us), but `ATTN_DKV_WG` grew to 613.2us
+and small regressed. Same-GPU direct medians were control/variant nano
+1232.5/1235.2us, small 4328.3/4367.3us, S4096 4310.8/4302.6us
+(`mkv3-p4b-drow-wg-current-ab-20260704T191524Z.log`). The tiny S4096 win is not worth
+the short-S loss; leave this route isolated.
 
 Post-headtarget SWIGLU_BWD two-row fold recheck: `MK_SWIGLU_BWD_R2=1` made each warp
 handle rows `r` and `r+8` under a 16-row tile, matching the RMSNorm two-row tile
