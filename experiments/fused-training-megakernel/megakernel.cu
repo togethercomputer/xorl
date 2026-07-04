@@ -62,6 +62,16 @@ __device__ __forceinline__ long long mk_globaltimer() {
 #include "attention.cuh"
 #include "wgmma_attention.cuh"
 
+// MK_OCC2 (mk.py MK_OCC2=1): cap the 256-thread executors at 128 regs so 2 blocks
+// co-reside per SM. The P4b nsys counters showed the 1-block interpreter is
+// latency-bound (SM issue 19%, 8 warps in flight, DRAM <10%): doubling resident
+// warps buys latency-hiding at the price of ptxas spilling the fat op paths.
+#ifdef MK_OCC2
+#define MK_LB __launch_bounds__(256, 2)
+#else
+#define MK_LB
+#endif
+
 // ---- interpreter --------------------------------------------------------------------
 __device__ __forceinline__ void dispatch(const Instr& I, int tile, void** bufs,
                                          char* smem) {
@@ -188,7 +198,7 @@ extern "C" __global__ void megakernel(const Instr* __restrict__ instrs,
 //
 // state layout: pending[n] | cursor[n] | done[n] | ready[n] | ctrl[4]
 //   ctrl[0]=ready tail, ctrl[1]=finished instr count.
-extern "C" __global__ void megakernel_df(const Instr* __restrict__ instrs, int n_instr,
+extern "C" __global__ void MK_LB megakernel_df(const Instr* __restrict__ instrs, int n_instr,
                                          const int* __restrict__ dep_cnt,
                                          const int* __restrict__ adj_off,
                                          const int* __restrict__ adj,

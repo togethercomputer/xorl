@@ -101,8 +101,14 @@ INSTR_INTS = 3 + MAX_ARGS  # op, tile_off, ntiles, args[23]
 
 
 def load_ext(verbose=False):
+    # MK_OCC2=1 builds the 256-thread executors with __launch_bounds__(256, 2):
+    # 2 blocks/SM (128-reg ceiling, ptxas spills the fat op paths). Motivated by the
+    # P4b nsys counters — in-kernel SM issue 19%, warps-in-flight 12%, DRAM <10%:
+    # the interpreter is LATENCY-bound at 1 block/SM, not bandwidth-bound. Separate
+    # extension name per value: the torch build cache is name-keyed.
+    occ2 = int(os.environ.get("MK_OCC2", "0"))
     return load(
-        name="xorl_megakernel",
+        name="xorl_megakernel" + ("_occ2" if occ2 else ""),
         sources=[os.path.join(_DIR, "megakernel.cu")],
         extra_cuda_cflags=[
             "-O3",
@@ -113,7 +119,8 @@ def load_ext(verbose=False):
             "-I/home/apanda/xorl-internal/.venv/lib/python3.12/site-packages/deep_gemm/include",
             "--expt-relaxed-constexpr",
             "-lineinfo",
-        ],
+        ]
+        + (["-DMK_OCC2"] if occ2 else []),
         verbose=verbose,
     )
 
