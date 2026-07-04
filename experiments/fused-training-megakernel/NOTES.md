@@ -1090,6 +1090,18 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   (19/20), with S1024 unchanged in route count
   (`mkv3-p4b-n128-auto-paired-20260704T2247N128AUTO.log`). Full model parity passed
   (`mkv3-p4b-n128-auto-testmodel-20260704T2247N128AUTO.log`).
+- S2048 head-dX target gate: after the S2048 RMS dx R4 route, the global
+  `MK_HEAD_DX_TARGET_TILES=192` default still protects small, but S2048 wins by
+  reducing the `dlogits @ Wlm` split-K from 3 to 1. Broad current-head sweep
+  (`mkv3-p4b-headdx-post-rmsdx-sweep-20260704T2325HEADDX.log`) kept small best at
+  192 and showed S2048 target 96 at 2215.6us vs 2232.0us for 192. Paired repeats
+  confirmed the S2048-only default: env 96 beat env 192 by -39.0us and -14.4us
+  (`mkv3-p4b-headdx-s2048-96-ab-20260704T2325HEADDX.log`), and patched auto beat
+  forced old 192 by -35.8us and -10.4us
+  (`mkv3-p4b-headdx-s2048-default-ab-20260704T2325HEADDX.log`). Route guard:
+  auto leaves nano/small/S4096 unchanged and emits S2048 head dX as 64 tiles, sk=1
+  (`mkv3-p4b-headdx-s2048-route-20260704T2325HEADDX.log`). Full model parity passed
+  (`mkv3-p4b-headdx-s2048-testmodel-20260704T2325HEADDX.log`).
 
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
