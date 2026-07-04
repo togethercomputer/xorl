@@ -685,9 +685,8 @@ __device__ void op_rmsnorm_bwd(const Instr& I, int tile, void** bufs, char* smem
   const bool dy_f32 = I.args[7] != 0;
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int row = tile * MK_ROW_R + warp;
-  float* dw_s = reinterpret_cast<float*>(smem_raw);  // [H] fp32 per-tile dw partials
-  for (int i = threadIdx.x; i < H; i += MK_CONSUMERS) dw_s[i] = 0.0f;
-  consumer_sync();
+  float* dw_rows = reinterpret_cast<float*>(smem_raw);  // [MK_ROW_R, H] fp32 partials
+  float* dw_row = dw_rows + (int64_t)warp * H;
   if (row < S) {
     const bf16* x = reinterpret_cast<const bf16*>(bufs[I.args[0]]) + (int64_t)row * H;
     const bf16* w = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
@@ -716,7 +715,7 @@ __device__ void op_rmsnorm_bwd(const Instr& I, int tile, void** bufs, char* smem
         for (int j = 0; j < 8; j++) {
           const float xhat = xv[j] * r;
           dxv[j] += r * (dyv[j] * wv[j] - xhat * m);
-          atomicAdd(&dw_s[i + j], dyv[j] * xhat);
+          dw_row[i + j] = dyv[j] * xhat;
         }
         st8bf(dx + i, dxv);
       }
@@ -728,13 +727,20 @@ __device__ void op_rmsnorm_bwd(const Instr& I, int tile, void** bufs, char* smem
       for (int i = lane; i < H; i += 32) {
         const float xhat = bf2f(x[i]) * r;
         dx[i] = f2bf(bf2f(dx[i]) + r * (dy(i) * bf2f(w[i]) - xhat * m));
-        atomicAdd(&dw_s[i], dy(i) * xhat);
+        dw_row[i] = dy(i) * xhat;
       }
     }
+  } else {
+    for (int i = lane; i < H; i += 32) dw_row[i] = 0.0f;
   }
   consumer_sync();
   float* dw = reinterpret_cast<float*>(bufs[I.args[4]]);
-  for (int i = threadIdx.x; i < H; i += MK_CONSUMERS) atomicAdd(&dw[i], dw_s[i]);
+  for (int i = threadIdx.x; i < H; i += MK_CONSUMERS) {
+    float s = 0.0f;
+#pragma unroll
+    for (int r = 0; r < MK_ROW_R; ++r) s += dw_rows[(int64_t)r * H + i];
+    atomicAdd(&dw[i], s);
+  }
 }
 
 // ---- SwiGLU ----------------------------------------------------------------------------

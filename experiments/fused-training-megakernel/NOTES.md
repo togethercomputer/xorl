@@ -495,9 +495,52 @@ pipelines, i.e. P4b, now unblocked since ops fit 224 regs and the spill tax is g
 op-level BW efficiency isn't); (3) deferred retunes (attention C, m64n128 tiles);
 (4) the ws pre-claim race + hot/cold port, if ws is to matter again.
 
+## v3 Phase 6 round 3: row-gradient reduction + post-P6 retunes
+
+**RMSNorm backward row-gradient reduction (KEEP):** `op_rmsnorm_bwd` no longer has all
+8 row warps atomically contending on one shared `[H]` weight-gradient buffer. Each row
+now writes a private `[row,H]` partial in smem, then the block reduces the 8 rows once
+before the global `dw` atomic. This is the exact contention pattern P6.1 identified in
+the remaining row-op spans. Correctness is green (`test_ops.py`, `test_model.py`; DF,
+waves, df2, and ws all agree). Profile effect is local and real:
+
+| metric | before | after |
+|---|---:|---:|
+| nano RMSNORM_BWD on-path span | ~199us | ~159us |
+| small RMSNORM_BWD on-path span | ~674-682us | ~224us |
+
+The step-time win is smaller than the local span win because the realized critical path
+moved into head/attention/GEMM work once RMSNorm stopped dominating. Final same-run
+headline benchmark (`results/mkv3-p6-rmsrow-ckv3-bench.log`):
+
+| config | megakernel | hardened compile+CUDAGraph+ | gap |
+|---|---:|---:|---:|
+| nano  (H256 L4 S512) | 1421us | 709us | 2.00x |
+| small (H512 L8 S1024) | 5612us | 2740us | 2.05x |
+
+**Attention backward chunk retune (KEEP, shape-gated):** added `MK_ATTN_DKV_C` and
+`MK_ATTN_DQ_C` overrides and retuned defaults after the row-op change. dQ stays at
+the old picks (C=4 for S=512, C=2 for S=1024). dKV changes to C=3 only for S=512:
+it improves the S=512 nano/deep family, but hurts S=256 and S=1024. The baked default
+is therefore `Ckv=3 if S == 512 else 2`, with env overrides for future sweeps.
+
+**Head dX split-K target retune (MEASURED, left override-only):** added
+`MK_HEAD_DX_TARGET_TILES` around the `dlogits @ Wlm` split-K target because the
+post-row-reduction profile exposed it as a worst hop at small. Sweeping 256..2048
+showed no robust default improvement: 384 tiles was slightly best in one small run, but
+512 stayed better at nano/deep/S1024 and remains the default. Keep the knob for P4b
+or per-shape studies; do not promote 384 globally.
+
+Remaining measured top items after this round (`results/mkv3-p6-rmsrow-ckv3-prof.log`):
+small is led by ATTN_DQ_WG, head dX/lm_head GEMMs, and GEMMNN MLP dX spans; nano is
+now split across RMSNorm_BWD, ATTN_DKV_WG, and small GEMMNN spans. This reinforces the
+existing P4b direction: producer-fed multi-stage GEMM/attention pipelines, not more
+instruction-level fusion.
+
 ## Honest assessment + v2 roadmap
 
-compile+CUDAGraph remains ~2.3x faster. The measured structural gap, in order:
+compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
+measured structural gap, in order:
 1. **Per-op kernel quality**: our WMMA gemm is 40-100 TF where cuBLAS gets 200+; FA
    does attention tiles ~3x faster. The fix is Hopper-native kernels (wgmma + TMA,
    proper multi-stage pipelines) inside the interpreter ops — the single biggest item.

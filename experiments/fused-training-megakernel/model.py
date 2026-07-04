@@ -6,6 +6,7 @@ lm_head -> CE -> full backward -> embedding grad). `step(tokens, labels)` runs t
 cooperative kernel launch and returns the loss buffer. The optimizer stays outside.
 """
 
+import os
 from dataclasses import dataclass
 
 import mk
@@ -343,14 +344,18 @@ class MKQwen3:
         fill_zero(W["dXN_f32"])
         p.wave()
         if mk.wgmma_ok(c.S, c.H, c.V, 0):
-            sk_head = mk.wgmma_split_k(c.S, c.H, c.V)
+            sk_head = mk.wgmma_split_k(
+                c.S, c.H, c.V, target_tiles=int(os.environ.get("MK_HEAD_DX_TARGET_TILES", "512"))
+            )
             p.instr(
                 mk.OP_GEMM,
                 mk.gemm_tiles_wgmma(c.S, c.H) * sk_head,
                 [B(A["logits"]), B(self.params["wlm"]), B(W["dXN_f32"]), c.S, c.H, c.V, 32 | 8 | 128, 0, sk_head],
             )
         else:
-            sk_head = mk.gemm_split_k(c.S, c.H, c.V)
+            sk_head = mk.gemm_split_k(
+                c.S, c.H, c.V, target_tiles=int(os.environ.get("MK_HEAD_DX_TARGET_TILES", "512"))
+            )
             p.instr(
                 mk.OP_GEMM,
                 mk.gemm_tiles(c.S, c.H) * sk_head,
@@ -422,11 +427,12 @@ class MKQwen3:
                 scale,
             ]
             if wg_attn:
-                # measured chunk picks (P5 probe): dKV C=2 both configs; dQ C=4 at
-                # S=512 (n_qt<=16), C=2 at S=1024 (fixed cost x C beats latency there)
+                # P6 retune: dKV C=3 wins at S=512 (nano/deep) but loses at S=256 and
+                # S=1024, so keep the original C=2 elsewhere. dQ remains C=4 at S=512
+                # and C=2 at S=1024. Env overrides keep future sweeps edit-free.
                 n_qt128 = c.S // 128
-                Ckv = 2
-                Cq = 4 if n_qt <= 16 else 2
+                Ckv = max(1, int(os.environ.get("MK_ATTN_DKV_C", str(3 if c.S == 512 else 2))))
+                Cq = max(1, int(os.environ.get("MK_ATTN_DQ_C", str(4 if n_qt <= 16 else 2))))
                 p.instr(mk.OP_ATTN_DKV_WG, c.nkv * n_qt128 * G * Ckv, dkv_args() + [Ckv])
                 p.instr(mk.OP_ATTN_DQ_WG, c.nq * n_qt128 * Cq, dq_args() + [Cq])
             else:
