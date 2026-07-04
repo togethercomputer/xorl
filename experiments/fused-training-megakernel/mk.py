@@ -137,8 +137,10 @@ def load_ext(verbose=False):
     # extension name per value: the torch build cache is name-keyed.
     occ2 = int(os.environ.get("MK_OCC2", "0"))
     regcopy = int(os.environ.get("MK_WS_REGCOPY", "0"))
+    attnpipe = int(os.environ.get("MK_ATTN_PIPE", "0"))
     return load(
-        name="xorl_megakernel" + ("_occ2" if occ2 else "") + ("_wsrc" if regcopy else ""),
+        name="xorl_megakernel" + ("_occ2" if occ2 else "") + ("_wsrc" if regcopy else "")
+        + ("_apipe" if attnpipe else ""),
         sources=[os.path.join(_DIR, "megakernel.cu")],
         extra_cuda_cflags=[
             "-O3",
@@ -151,7 +153,8 @@ def load_ext(verbose=False):
             "-lineinfo",
         ]
         + (["-DMK_OCC2"] if occ2 else [])
-        + (["-DMK_WS_REGCOPY"] if regcopy else []),
+        + (["-DMK_WS_REGCOPY"] if regcopy else [])
+        + (["-DMK_ATTN_PIPE"] if attnpipe else []),
         verbose=verbose,
     )
 
@@ -619,7 +622,9 @@ class Program:
             depth[i] = 1 + max((depth[j] for j in d), default=0)
         return max(depth, default=0)
 
-    def run(self, ext, smem_bytes=100 * 1024, wave_clk=None, mode="df"):
+    def run(self, ext, smem_bytes=120 * 1024, wave_clk=None, mode="df"):
+        # 120KB default (was 100): the MK_ATTN_PIPE fwd needs 112KB (P ping-pong +
+        # 4-ring K/V); still 1 block/SM either way on H100 (227KB max opt-in).
         if mode == "waves":
             ext.run(self._instrs, self._wave_start, self._wave_tiles, self._buftab, smem_bytes, wave_clk)
         elif mode == "ws":
