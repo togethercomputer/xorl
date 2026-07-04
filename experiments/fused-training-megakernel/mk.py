@@ -86,8 +86,13 @@ def wgmma_n128_ok(M, N, K, flags):
     the mma work per sync and halve B-traffic per FLOP at the full 255-reg df
     budget. Excludes split-K/acc/f32-out/qkrope/Drow (epilogues not implemented
     at 128 cols; CE partials bit11 and residual bit16 ARE supported).
-    MK_WGMMA_N128: 0=off, 1=all eligible (default), 2=lm_head(bit11)-only."""
-    mode = int(os.environ.get("MK_WGMMA_N128", "1"))
+    MK_WGMMA_N128: 0=off, 1=all eligible, 2=lm_head(bit11)-only. The default is
+    shape-gated: short-row GEMMs cannot amortize the larger tile, while M>=1024 can."""
+    mode_env = os.environ.get("MK_WGMMA_N128")
+    if mode_env is None:
+        mode = 0 if M < 256 else (2 if M < 1024 else 1)
+    else:
+        mode = int(mode_env)
     if mode == 0:
         return False
     if flags & (1 | 4 | 8 | 32 | 256 | 1024):

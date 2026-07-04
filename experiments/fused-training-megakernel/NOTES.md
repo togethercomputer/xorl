@@ -1079,6 +1079,17 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   16/24 wins). Default-path side-worktree validation passed full model parity
   (`mkv3-p4b-coldcap-midS-testmodel-20260704T2232COLDCAPMIDS.log`) and selected
   caps 16/33/33/0 for nano/small/S1024/S4096.
+- n128 short-row auto-gate: keep all-eligible m64n128 only when the GEMM row count is
+  at least 1024; below that, default to off for M<256 and lm-head-only for
+  256<=M<1024. The current-head mode sweep showed all-eligible n128 still necessary
+  for small and S4096, but expensive on short rows
+  (`mkv3-p4b-n128-mode-current-20260704T2238N128MODE.log`,
+  `mkv3-p4b-n128-short-current-20260704T2241N128SHORT.log`). Side-worktree paired
+  A/B against old mode=1 confirmed default wins on the affected configs:
+  S128 -49.8us (23/24 wins), S256 -19.1us (22/24), nano -9.1us (20/24), deep -38.1us
+  (19/20), with S1024 unchanged in route count
+  (`mkv3-p4b-n128-auto-paired-20260704T2247N128AUTO.log`). Full model parity passed
+  (`mkv3-p4b-n128-auto-testmodel-20260704T2247N128AUTO.log`).
 
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
