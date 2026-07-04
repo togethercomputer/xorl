@@ -261,6 +261,43 @@ stale; all round-3/4 numbers were measured at 132 blocks. Consequences: Phase 4'
 tuning knob; and there may be a free win in getting register pressure back under 128
 (worth one bounded attempt before the prototype).
 
+## v3 Phase 2: warp-specialization prototype — GATE PASSED (GO)
+
+`ws_probe.py` (standalone, torch load_inline, ext xorl_ws_probe): a persistent
+132-block kernel where each block = 3 warpgroups — WG0 scheduler/producer, WG1+2 the
+256-thread consumer op — with 2 smem pages and flag handoff, executing the same serial
+256-link wgmma chain hop_bench.py measures at 5.69us/hop on the flat interpreter.
+
+**Result: 2.77-2.80us/hop NT, 3.69 alternating-major (vs flat 5.69 / WMMA 10.38
+same-GPU). The ≤4us gate PASSED; the "structural floor" does not survive warp
+specialization — the warp-spec gemm hop is cheaper than the flat TRIVIAL-op hop (3.1).**
+
+Config that wins (adopt for the Phase 4 port): producer prefetches B before polling
+the predecessor-done flag; PRODUCER-side completion (consumers arrive empty
+immediately; the __threadfence + release sits on the otherwise-idle producer — worth
+13% vs consumer-side); plain __pipeline_wait_prior handoff (cp.async.mbarrier.arrive
+neutral at these page sizes); 2 pages x 24KB; NO setmaxnreg.
+
+Hard-won specifics (full log: results/mkv3-p2-wsprobe.md):
+- setmaxnreg WORKS but is perf-negative here: consumers already fit in 126 regs and
+  dec-to-40/56 spills the producer (REG 168 / STACK 80-144). Compile recipe if ever
+  needed: explicit -gencode=arch=compute_90a,code=sm_90a (CUDA 13's -arch=sm_90a also
+  runs a compute_90 PTX pass that rejects unguarded setmaxnreg) AND __maxnreg__ on the
+  kernel (else ptxas ignores it with C7508).
+- The remaining 2.8us hop = 0.64us cross-SM signal (st.release.gpu -> ld.acquire.gpu)
+  + ~2us span dominated by the A-tile gmem round trip (predecessor C -> L2 -> cp.async)
+  and epilogue. Tile-granular deps (consumer starts on partial predecessor) and
+  same-block chaining (C stays in smem) attack exactly these — Phase 3/4 material.
+- Named barriers (bar.sync 1,256) for consumer-only sync; __syncthreads would hang WG0.
+- globaltimer footgun: subtract stamps in int64 BEFORE any float conversion (fp32
+  granularity at ~1e14ns is 16ms — diffs read as exactly 0).
+- Parity method: per-link one-step checks vs torch with an orthogonal B (max 7.8e-3);
+  chain-end drift after 256 links is rounding-order walk, not error.
+
+Implication for the plan: Phase 4's projected chain overhead at ~2.8us/hop over a
+~76-hop chain is ~215us — the port is GO. An independent replication (second harness)
+is running to confirm the headline number.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.3x faster. The measured structural gap, in order:
