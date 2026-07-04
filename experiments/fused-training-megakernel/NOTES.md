@@ -605,6 +605,11 @@ TN/dW routing remains OFF by default (`MK_WGMMA_TN=1` is only a re-run knob): di
 A/B showed dW sinks get faster locally but steal bandwidth from the on-path chain
 (`results/mkv3-p4b-sw128-route-ab.log`).
 
+Post-SW128 attention retune: `ATTN_DQ_WG` now defaults to `Cq=1` (env override
+`MK_ATTN_DQ_C`). The earlier Cq=2 default over-splits once NN dX is no longer the main
+small bottleneck. `DKV_C` keeps the prior shape gate (`Ckv=1` only when
+`nq * (S/128) >= 64`).
+
 Validation:
 - `test_ops.py`, `test_model.py` green (`results/mkv3-p4b-sw128-testops.log`,
   `results/mkv3-p4b-sw128-route-testmodel.log`).
@@ -615,14 +620,14 @@ Validation:
 - `cuobjdump -res-usage`: df stays `REG:255 STACK:144`; no new spill cliff
   (`results/mkv3-p4b-sw128-cuobjdump.log`).
 
-Clean hardened benchmark (`results/mkv3-p4b-sw128-nngate-bench-clean2.log`):
+Clean hardened benchmark (`results/mkv3-p4b-dq1-default-bench.log`):
 
 | config | megakernel | hardened compile+CUDAGraph+ | gap |
 |---|---:|---:|---:|
-| nano  (H256 L4 S512) | 1274us | 710us | 1.79x |
-| small (H512 L8 S1024) | 4510us | 2737us | 1.65x |
+| nano  (H256 L4 S512) | 1260us | 710us | 1.77x |
+| small (H512 L8 S1024) | 4465us | 2731us | 1.64x |
 
-Clean profile (`results/mkv3-p4b-sw128-route-prof.log`): SW128 makes the big NT spans
+Clean profile (`results/mkv3-p4b-dq1-prof.log`): SW128 makes the big NT spans
 real progress instead of probe-only throughput, and gated NN removes most of the small
 dX GEMM tax. Small `GEMMNN 1024x512x3072` drops ~516us -> ~254us, `GEMMNN
 1024x1536x512` ~427us -> ~216us, and head dX ~190us -> ~146us. Remaining small top
