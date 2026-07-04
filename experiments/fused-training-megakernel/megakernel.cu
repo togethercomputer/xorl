@@ -849,8 +849,13 @@ extern "C" __global__ void __maxnreg__(168) megakernel_ws(
     bool progress = false;
     // 1) FAST PATH at the flip: consumers drained everything staged — restage from
     //    sticky/candidate BEFORE accounting (safe: ready-ring entries and same-instr
-    //    tiles never read the just-finished batch's output).
-    if (ds > acct && staged == ds) {
+    //    tiles never read the just-finished batch's output). ds - acct < 2 guard
+    //    (v3 P4b): at lookahead=2 the flip can find TWO finished un-accounted
+    //    batches; staging here would overwrite slot (ds&1)'s q_ins* bookkeeping
+    //    while batch acct (same parity) still needs it for accounting -> done[]
+    //    corruption -> lost dependents (the likely historical la=2 hang). At
+    //    lookahead=1 the guard is always true (no behavior change).
+    if (ds > acct && staged == ds && ds - acct < 2) {
       c_ins = -1;
       if (last_ins >= 0) try_claim(last_ins, false);
       if (c_ins < 0 && cand >= 0) {
