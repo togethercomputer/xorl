@@ -665,7 +665,11 @@ class Program:
                 self._adj,
                 self._claim,
                 self._crit,
-                int(os.environ.get("MK_COLD_CAP", "0")),  # 0 = uncapped
+                # cold_cap default 16 (v3 P4b r3): a wash pre-SW128, but with the faster
+            # ops the cold dW work turned net-contentious — capping cold-working
+            # blocks at 8-33 measures -60..-80us at small, -10 at nano (flat across
+            # that band; 66+ decays back). MK_COLD_CAP overrides; 0 = uncapped.
+            int(os.environ.get("MK_COLD_CAP", "16")),
                 self._state,
                 self._buftab,
                 smem_bytes,
