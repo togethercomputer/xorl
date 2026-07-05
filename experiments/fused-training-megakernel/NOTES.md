@@ -3429,6 +3429,29 @@ neutral-to-slightly-worse in the initial A/B (+6.08us/+1.36us). The source probe
 was reverted; keep the existing cached 2W defaults and do not re-add a 3W route
 without a new post-composition reason.
 
+H256/S256+S512 Drow zero-fill skip: the D=64/S<2048 direct-store Drow epilogue
+overwrites each `drow[qh,row]` once, so the upfront `drow` zero-fill is
+unnecessary only when that compile-time direct-store route is actually selected.
+Route checks (`mkv3-p4b-drow-zeroskip-route-20260705T2141Z.log`,
+`mkv3-p4b-drow-zeroskip-route2-20260705T2141Z.log`) showed the intended
+instruction deltas: nano and H256/S1024 remove four Drow fill instructions,
+small removes eight, while S2048/D128 keep the fill. Validation
+(`mkv3-p4b-drow-zeroskip-validation-control-20260705T2141Z.log`) showed the
+small worst-grad envelope was identical with and without the skip, so the route
+is correctness-clean. Paired timing rejected a broad gate: small preferred the
+old zero-fill by 13.74us and 7.47us, and H256/S1024 was order-mixed (+2.06us,
+-6.54us zero-minus-skip). S128 was also order-mixed (-1.23us, +4.96us). The
+promoted exact default is therefore H256/L4/D64 at S256 and S512 only: S256 won
+by +7.89us/+1.82us zero-minus-skip, and nano/S512 won by +0.93us/+2.16us
+(`mkv3-p4b-drow-zeroskip-short-ab-20260705T2141Z.log`,
+`mkv3-p4b-drow-zeroskip-ab-20260705T2141Z.log`). `MK_DROW_ZERO_FILL=1` restores
+the old zero-fill on direct-store overwrite shapes for A/B; atomic Drow shapes
+keep the fill even if the env is set to 0. Post-promotion route/ref validation
+passed (`mkv3-p4b-drow-zeroskip-promoted-route-validate-20260705T2158Z.log`:
+S256 rel loss 9e-6, worst grad rel 0.023252), and full `test_model.py` passed
+(`mkv3-p4b-drow-zeroskip-promoted-testmodel-20260705T2158Z.log`: nano worst
+0.0281, D128-ragged 0.0208, rerun/waves/df2/ws and SGD sanity clean).
+
 ## v3 P4b knob consolidation (session 2853e0de): one tuning table, routes verified
 
 The secondary lane from the /goal: model.py's ~12 scattered per-shape gate

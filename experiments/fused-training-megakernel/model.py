@@ -69,6 +69,7 @@ _H256_IDLE32_S = (2048, 3072, 4096, 8192)  # H==256: scheduler idle poll 32ns (e
 _H256_DQ_FLOAT2_S = (3072, 4096, 8192)     # H==256: attention-dQ float2 direct store
 _H256_D64_DKV_ROW_BCAST_S = (8192,)        # H==256/D==64: attention-dKV row scalar shuffles
 _H256_RMS_DX_H256_S = (8192,)              # H==256: fixed-width RMS bwd-dx opcode
+_H256_D64_DROW_ZERO_SKIP_S = (256, 512)    # H==256/D==64: direct-store drow overwrites
 _ATTN_BWD_BAND_T = {2048: 12, 3072: 16, 4096: 29, 8192: 40}  # H==256/D==64; 0 elsewhere
 _ATTN_FWD_BAND_T = {2048: 16, 3072: 32, 4096: 22, 8192: 64}  # H==256/D==64; 0 elsewhere
 _ATTN_BAND_DQ_FIRST_S = (8192,)  # H==256/D==64: dq-first band emission (else lpt)
@@ -233,6 +234,25 @@ class MKQwen3:
         self.cos, self.sin = rope_tables(c, dev)
         self.swiglu_bwd_2w_default = (c.H, c.S, c.I) in _SWIGLU_CACHED_2W
         self.drow_direct_store_default = c.D == 64 and c.S < 2048
+        drow_direct_store_env = os.environ.get("MK_DROW_DIRECT_STORE")
+        self.drow_direct_store_enabled = (
+            self.drow_direct_store_default
+            if drow_direct_store_env is None
+            else bool(int(drow_direct_store_env))
+        )
+        self.drow_direct_store_overwrites = (
+            self.drow_direct_store_enabled and c.D == 64 and c.S < 2048
+        )
+        drow_zero_fill_env = os.environ.get("MK_DROW_ZERO_FILL")
+        self.drow_zero_fill_default = not (
+            self.drow_direct_store_overwrites
+            and c.H == 256 and c.L == 4 and c.S in _H256_D64_DROW_ZERO_SKIP_S
+        )
+        self.drow_zero_fill_enabled = (
+            self.drow_zero_fill_default
+            if drow_zero_fill_env is None
+            else bool(int(drow_zero_fill_env)) or not self.drow_direct_store_overwrites
+        )
         self.attn_exp2_approx_default = c.D == 64 and c.S >= 512 and c.S % 128 == 0
         self.lmhead_exp2_approx_default = c.V >= 8192 and c.V % 64 == 0 and c.S >= 256
         self.ce_bwd_exp2_approx_default = c.S >= 1024 and c.V >= 8192 and c.V % 8 == 0
@@ -247,7 +267,7 @@ class MKQwen3:
         self.ext = mk.load_ext(
             swiglu_bwd_2w=self.swiglu_bwd_2w_default,
             swiglu_cache_sig=self.swiglu_cache_sig_enabled,
-            drow_direct_store=self.drow_direct_store_default,
+            drow_direct_store=self.drow_direct_store_enabled,
             attn_exp2_approx=self.attn_exp2_approx_default,
             lmhead_exp2_approx=self.lmhead_exp2_approx_default,
             ce_bwd_exp2_approx=self.ce_bwd_exp2_approx_default,
@@ -405,7 +425,8 @@ class MKQwen3:
         fill_zero(self.loss)
         for lz in range(c.L):
             fill_zero(W[f"dQKV_f32.{lz}"])
-            fill_zero(W[f"drow.{lz}"])
+            if self.drow_zero_fill_enabled:
+                fill_zero(W[f"drow.{lz}"])
             for nm in (f"dXN2_f32.{lz}", f"dXN1_f32.{lz}", f"dHs_f32.{lz}"):
                 if nm in W:
                     fill_zero(W[nm])
