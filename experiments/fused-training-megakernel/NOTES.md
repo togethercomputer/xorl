@@ -2480,6 +2480,27 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   (`mkv3-p4b-df2hc-nohint-cap0-small-repeat-20260705T1431Z.log`). Treat the hot/cold
   `df2` port as a scheduler-race no-go; leave the sibling dirty and keep `df2` parked.
 
+- H256/S1024 1W SwiGLU sigmoid-cache promotion: the earlier small-only cache wrote a
+  bf16 sigmoid cache only when the 2-warps-per-row small backward route was active,
+  but the normal 1W `OP_SWIGLU_BWD` already had optional cache support. The isolated
+  branch `/home/apanda/xorl-oss-swiglu-cache-1w-probe` wired the cache through the 1W
+  route and forced it for non-small shapes. Route/parity passed for nano and H256/S1024
+  (`mkv3-p4b-swcache1w-route-parity-20260705T1433Z.log`): both cached 4 SwiGLU fwd and
+  4 normal 1W bwd ops with zero `OP_SWIGLU_BWD_2W`, with worst grad rel 0.006326 nano
+  and 0.008897 H256/S1024. Timing kept nano as no-default-change/order-biased
+  (`mkv3-p4b-swcache1w-step-ab-20260705T1440Z.log`: +3.44us when control constructed
+  first, -4.38us in reverse, combined -1.26us with 176/320 wins), but H256/S1024 was a
+  clean win (same log: -18.90us and -21.57us across construction orders, combined
+  -20.24us with 319/320 wins). H256/S2048 was rejected
+  (`mkv3-p4b-swcache1w-s2048-20260705T1441Z.log`: combined +16.56us with 6/192 wins).
+  Main promotion gates the sigmoid cache for `H=256,S=1024,I=768` in addition to the
+  existing `H=512,S=1024,I=1536` small route, and passes the optional cache arg to both
+  2W and 1W SwiGLU backward bodies. Promoted validation
+  (`mkv3-p4b-swcache1w-promote-h256s1024-20260705T1448Z.log`) confirmed default route
+  `4 fwd/4 1W bwd cached`, forced-old route uncached, parity worst 0.009197, and
+  default-vs-old timing at -20.13us / -5.76us by construction order, combined -12.32us
+  with 286/320 wins. Use `MK_SWIGLU_CACHE_SIG=0` to force the old uncached route.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

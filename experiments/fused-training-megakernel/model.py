@@ -42,7 +42,10 @@ class MKQwen3:
         QD = (c.nq + 2 * c.nkv) * c.D
         bf, f32 = torch.bfloat16, torch.float32
         swiglu_cache_sig_env = os.environ.get("MK_SWIGLU_CACHE_SIG")
-        self.swiglu_cache_sig_default = c.H == 512 and c.S == 1024 and c.I == 1536
+        self.swiglu_cache_sig_default = (
+            (c.H == 512 and c.S == 1024 and c.I == 1536)
+            or (c.H == 256 and c.S == 1024 and c.I == 768)
+        )
         self.swiglu_cache_sig_enabled = (
             self.swiglu_cache_sig_default
             if swiglu_cache_sig_env is None
@@ -252,7 +255,7 @@ class MKQwen3:
             swiglu_bwd_2w = self.swiglu_bwd_2w_default
         else:
             swiglu_bwd_2w = bool(int(swiglu_bwd_2w_env))
-        swiglu_cache_sig = self.swiglu_cache_sig_enabled and swiglu_bwd_2w
+        swiglu_cache_sig = self.swiglu_cache_sig_enabled
 
         def head_dx_target_tiles():
             env = os.environ.get("MK_HEAD_DX_TARGET_TILES")
@@ -564,7 +567,10 @@ class MKQwen3:
                     swiglu_bwd_args,
                 )
             else:
-                p.instr(mk.OP_SWIGLU_BWD, mk.rowop_tiles(c.S), [a("gu"), dhs, B(W["dGU"]), c.S, c.I, dhs_f32])
+                swiglu_bwd_args = [a("gu"), dhs, B(W["dGU"]), c.S, c.I, dhs_f32]
+                if swiglu_cache_sig:
+                    swiglu_bwd_args.append(a("swsig"))
+                p.instr(mk.OP_SWIGLU_BWD, mk.rowop_tiles(c.S), swiglu_bwd_args)
             p.wave()
             dxn, dxn_f32 = gemm_dx(B(W["dGU"]), pr("wgu"), B(W["dXN"]), lambda: B(W[f"dXN2_f32.{l}"]), c.S, c.H, 2 * c.I)
             gemm(B(W["dGU"]), a("xn2"), gr("wgu"), 2 * c.I, c.H, c.S, 1 | 4 | 8)
