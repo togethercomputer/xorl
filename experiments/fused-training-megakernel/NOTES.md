@@ -1330,6 +1330,24 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   `mkv3-p4b-score-s1024-cap48-20260705T0246SCORE.log`). `MK_COLD_CAP` still overrides
   the model-selected default.
 
+- Post-cap48 attention chunk retune: keep small at `DKV_C=1/DQ_C=1`, but move the
+  H256/S512 WG attention shape to `DKV_C=3/DQ_C=2`. Current-profile refresh
+  (`mkv3-p4b-profile-cap48-d6bbf0d-20260705T0245PROFILE.log`) still had nano led by
+  `ATTN_DQ_WG` and small led by `ATTN_DKV_WG`, so an env-only resweep tested nearby
+  chunk counts. The broad pass (`mkv3-p4b-attn-c-resweep-d6bbf0d-20260705T0246ATTNC.log`)
+  rejected small changes hard (small `2/1` +66.6us, `1/2` +27.1us) but found nano
+  `3/2` at -7.7us vs default. Focused confirmations kept the narrow H256/S512 gate:
+  nano `3/2` beat `2/1` by -4.8us median with 128/180 wins, and deep-L12 beat by
+  -6.3us median with 84/120 wins
+  (`mkv3-p4b-attn-c-nano-confirm-d6bbf0d-20260705T0247ATTNC.log`). Route check and
+  model validation passed
+  (`mkv3-p4b-attn-c32-route-20260705T0248ATTNC.log`,
+  `mkv3-p4b-attn-c32-testmodel-20260705T0248ATTNC.log`), and affected score refreshes
+  landed at nano 1053.0us vs graph+ 630.9us and deep 2638.4us vs graph+ 1765.5us
+  (`mkv3-p4b-score-nano-attnc32-20260705T0249SCORE.log`,
+  `mkv3-p4b-score-deep-attnc32-20260705T0249SCORE.log`). Env overrides
+  `MK_ATTN_DKV_C` and `MK_ATTN_DQ_C` still force the chunk counts for sweeps.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
