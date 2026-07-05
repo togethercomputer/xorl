@@ -2792,6 +2792,40 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   reference worst grad rel was 0.0281, below the existing 0.03 gate, and the D=128
   ragged fallback plus executor-mode checks still passed.
 
+- S128/S256 boundary check for the broad dKV `float2` gate: because `c.D == 64 and
+  c.S % 128 == 0` also covers the shortest WGMMA attention routes, a post-commit
+  boundary run `mkv3-p4b-attndkv-float2-atomic-s128-s256-boundary-20260705T1656Z.log`
+  checked default vs forced-old. S128 was neutral-positive (-0.85us median, 94/160
+  wins; worst grad rel 0.00562), while S256 was clearly positive (-15.15us, 119/120
+  wins; worst grad rel 0.00651). Keep the broad D=64/S%128 default.
+
+- Post-attention-dKV-float2 profile/score refresh at `1568829`: `profile_df.py both df`
+  in `mkv3-p4b-profile-both-post-dkvf2-1568829-20260705T1705Z.log` measured nano
+  887.9us total (76 hops, 203.0us wait, 685.0us span) and small 3448.2us total
+  (144 hops, 376.7us wait, 3071.5us span). Nano's path is now led by attention-dQ
+  85.6us, attention-fwd 74.7us, RMS dx 66.1us, and qkrope GEMM 65.4us; dKV is
+  off-path at 70.3us total. Small is led by `ATTN_DKV_WG` 412.2us, MLP dX
+  `GEMMNN 1024x512x3072.wg` 386.7us, attention-fwd 254.4us, and cached
+  `SWIGLU_BWD_2W` 242.2us.
+
+- Long-shape profile `mkv3-p4b-profile-long-post-dkvf2-1568829-20260705T1706Z.log`
+  measured S3072 2578.5us total, S4096 3325.0us, and S8192 8415.5us. On S3072/S4096,
+  the realized path no longer includes dKV; attention-dQ dominates (S3072 546.0us,
+  S4096 902.4us), followed by attention-fwd and lm-head/RMS rowops. S8192 is still an
+  attention-quality problem: attention-dQ is 3345.9us and attention-fwd 1520.4us on
+  path, while dKV is off-path at 2627.3us span.
+
+- Fresh-process score refresh:
+  `mkv3-p4b-score-final-fresh-post-dkvf2-1568829-20260705T1709Z.log` measured
+  nano 912.8us vs compile+CUDAGraph+ 631.4us (1.45x gap), small 3457.7us vs 1904.0us
+  (1.82x), deep 2382.7us vs 1785.8us (1.33x), S128 736.0us vs 428.1us (1.72x),
+  S256 812.8us vs 547.4us (1.49x), and S1024 1217.7us vs 780.4us (1.56x). The
+  same-process `final_bench.py all` log hit TorchDynamo's recompile limit after S128,
+  so use the fresh-process log for compile/CUDAGraph baselines. Long fresh-process score
+  `mkv3-p4b-score-long-fresh-post-dkvf2-1568829-20260705T1711Z.log` measured S3072
+  2593.8us vs graph+ 1340.5us (1.93x), S4096 3323.2us vs 1569.4us (2.12x), and S8192
+  8221.0us vs 3123.3us (2.63x).
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
