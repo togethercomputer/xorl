@@ -288,15 +288,19 @@ class MKQwen3:
             attn_dkv_row_bcast=self.attn_dkv_row_bcast_default,
             attn_dq_float2_store=self.attn_dq_float2_store_default,
         )
-        # D=128 WGMMA attention route (env probe): its DKV op needs a 112KB smem
-        # struct and ws mode offsets ops by 256B of control smem, so take the 120KB
-        # carveout (precedent: MK_ATTN_PIPE used 120KB, measured neutral)
-        self._smem_bytes = (
-            120 * 1024
-            if (c.D == 128 and c.S % 64 == 0
-                and bool(int(os.environ.get("MK_ATTN_D128_WG", "0"))))
-            else None
+        # D=128 WGMMA attention route (default ON for D==128, S%64==0; the opgap
+        # FA4-C trio spec's fallback replacement): MK_ATTN_D128_WG=0 restores the
+        # generic WMMA ops. qwen4b-l1 in-model: -1586/-1846us, 12/12 both orders.
+        # Its DKV op needs a 112KB smem struct and ws mode offsets ops by 256B of
+        # control smem, so the route takes the 120KB carveout (MK_ATTN_PIPE
+        # precedent, measured neutral).
+        d128_env = os.environ.get("MK_ATTN_D128_WG")
+        self.attn_d128_wg_enabled = (
+            (c.D == 128 and c.S % 64 == 0)
+            if d128_env is None
+            else (bool(int(d128_env)) and c.D == 128 and c.S % 64 == 0)
         )
+        self._smem_bytes = 120 * 1024 if self.attn_d128_wg_enabled else None
         self.in_kernel_inv_valid = bool(int(os.environ.get("MK_INV_VALID_IN_KERNEL", "1")))
         self.bind_inputs = bool(int(os.environ.get("MK_BIND_INPUTS", "1")))
         self._inputs_bound_external = False
@@ -598,10 +602,9 @@ class MKQwen3:
                     [a("qkvr"), a("oatt"), a("lse"), c.S, c.nq, c.nkv, c.D, scale],
                 )
                 p.wave()
-            elif (c.D == 128 and c.S % 64 == 0
-                  and bool(int(os.environ.get("MK_ATTN_D128_WG", "0")))):
-                # D=128 WGMMA fwd (env probe, default off): 64-row q tiles,
-                # redundant-S both-WG softmax + split-D output halves.
+            elif self.attn_d128_wg_enabled:
+                # D=128 WGMMA fwd: 64-row q tiles, redundant-S both-WG softmax +
+                # split-D output halves.
                 p.instr(
                     mk.OP_ATTN_FWD_WG128,
                     c.nq * (c.S // 64),
@@ -950,10 +953,9 @@ class MKQwen3:
                 else:
                     p.instr(mk.OP_ATTN_DKV_WG, c.nkv * n_qt128 * G * Ckv, dkv_args() + [Ckv])
                     p.instr(mk.OP_ATTN_DQ_WG, c.nq * n_qt128 * Cq, dq_args() + [Cq])
-            elif (c.D == 128 and c.S % 64 == 0
-                  and bool(int(os.environ.get("MK_ATTN_D128_WG", "0")))):
-                # D=128 WGMMA bwd (env probe, default off): 64-row kv/q tiles,
-                # redundant-S + split-D-half accumulators, C=1.
+            elif self.attn_d128_wg_enabled:
+                # D=128 WGMMA bwd: 64-row kv/q tiles, redundant-S + split-D-half
+                # accumulators, C=1.
                 n_t64 = c.S // 64
                 p.instr(mk.OP_ATTN_DKV_WG128, c.nkv * n_t64 * G, dkv_args() + [1])
                 p.instr(mk.OP_ATTN_DQ_WG128, c.nq * n_t64, dq_args() + [1])
