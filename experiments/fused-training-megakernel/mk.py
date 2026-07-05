@@ -122,7 +122,7 @@ def _default_split_k_target(K):
     env = os.environ.get("MK_DW_TARGET_TILES")
     if env is not None:
         return int(env)
-    return 128 if K >= 2048 else 192
+    return 96 if K == 1024 else 64
 
 
 def wgmma_split_k(M, N, K, target_tiles=0):

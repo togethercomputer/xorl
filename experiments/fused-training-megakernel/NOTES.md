@@ -1348,17 +1348,51 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   `mkv3-p4b-score-deep-attnc32-20260705T0249SCORE.log`). Env overrides
   `MK_ATTN_DKV_C` and `MK_ATTN_DQ_C` still force the chunk counts for sweeps.
 
+- Post-attn-chunk cold dW split-K retune: lower off-path dW split targets again after
+  cap48 and nano attention chunking. Current profile
+  (`mkv3-p4b-profile-attnc32-00c5aff-20260705T0249PROFILE.log`) still had large
+  overlapped dW volume, and the env resweep
+  (`mkv3-p4b-dw-target-resweep-00c5aff-20260705T0253DWSK.log`) showed lower targets
+  winning broadly. Paired confirmations vs current defaults were decisive: target64
+  beat default by -27.4us nano, -14.0us S1024, -15.3us S2048, -75.2us S4096, and also
+  won the short scoreboard shapes by -15.6us S128 and -27.5us S256
+  (`mkv3-p4b-dw-target-confirm-00c5aff-20260705T0254DWSK.log`,
+  `mkv3-p4b-dw-target-short-confirm-00c5aff-20260705T0256DWSK.log`). Small prefers the
+  slightly wider target96 over target64 by ~4us, and target96 beat the old default by
+  -16.5us; S1024 target96 vs target64 was noise-level
+  (`mkv3-p4b-dw-target-s1024-96v64-00c5aff-20260705T0255DWSK.log`). Default split-K
+  target is therefore 96 for `K == 1024` and 64 otherwise; explicit head-dX targets are
+  unchanged, and `MK_DW_TARGET_TILES` still force-overrides for sweeps. Route inspection
+  and default-path model validation passed
+  (`mkv3-p4b-dw-target-route2-20260705T0257DWSK.log`,
+  `mkv3-p4b-dw-target-testmodel-20260705T0257DWSK.log`). Score refreshes after the
+  retune are in the gauntlet below
+  (`mkv3-p4b-score-nano-dwtarget-20260705T0258SCORE.log`,
+  `mkv3-p4b-score-small-dwtarget-20260705T0259SCORE.log`,
+  `mkv3-p4b-score-deep-dwtarget-20260705T0259SCORE.log`,
+  `mkv3-p4b-score-s128-dwtarget-20260705T0300SCORE.log`,
+  `mkv3-p4b-score-s256-dwtarget-20260705T0300SCORE.log`,
+  `mkv3-p4b-score-s1024-dwtarget-20260705T0301SCORE.log`).
+
+- Post-attn-chunk rejected rechecks: H256/S512 `MK_RMS_DX_R4=1` remains negative
+  (`mkv3-p4b-rmsdx-r4-nano-recheck-00c5aff-20260705T0250RMS.log`: nano +9.2us
+  median, deep +9.1us), and the apparent deep-L12 head-dX target48 signal from the
+  broad sweep was noise (`mkv3-p4b-headdx-target-recheck-00c5aff-20260705T0251HEADDX.log`,
+  `mkv3-p4b-headdx48-deep-confirm-00c5aff-20260705T0252HEADDX.log`: deep target48
+  +13.2us paired median on confirmation). Keep nano/deep RMS dx on R2 and head-dX
+  target96.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
 | config | megakernel | flash-baseline | gap |
 |---|---|---|---|
-| nano | 1200 | 631 | 1.90x |
-| small | 4114 | 1904 | 2.16x |
-| deep-L12 | 3067 | 1562 | 1.96x |
-| S=128 | 928 | 491 | 1.89x |
-| S=256 | 1029 | 548 | 1.88x |
-| S=1024 | 1545 | 775 | 1.99x |
+| nano | 1026 | 631 | 1.63x |
+| small | 3725 | 1891 | 1.97x |
+| deep-L12 | 2522 | 1765 | 1.43x |
+| S=128 | 850 | 426 | 2.00x |
+| S=256 | 934 | 558 | 1.67x |
+| S=1024 | 1454 | 778 | 1.87x |
 (Morning honest reset: nano 1.97x / small 2.52x.)
 
 ## Honest assessment + v2 roadmap
