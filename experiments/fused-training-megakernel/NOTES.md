@@ -2657,6 +2657,18 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   (26/80 wins) and +4.37us (15/64 wins), respectively. Keep `rms_dx_r4` gated only for
   H256/S2048; `MK_RMS_DX_R4` remains just a sweep override elsewhere.
 
+- Current-head H256/S3072 profile/score refresh: after the cached-SwiGLU promotion and
+  follow-on no-go probes, S3072 now measures
+  (`mkv3-p4b-profile-s3072-current-8058040-20260705T1528Z.log`) 2640.6us total with 76
+  chain hops, 210.0us wait, and 2430.6us span. The path is attention-dQ led:
+  `ATTN_DQ_WG` 569.3us, `ATTN_FWD_WG` 336.9us, lm-head forward
+  `GEMMNT 3072x8192x256.wg` 222.7us, RMS dx 144.4us, QKNORM/ROPE bwd 141.7us, cached
+  `SWIGLU_BWD_2W` 137.8us, qkv+qkrope 119.3us, and head-dX 105.5us. The matching
+  hardened score (`mkv3-p4b-score-s3072-current-8058040-20260705T1528Z.log`) measured
+  megakernel 2651.2us vs compile+CUDAGraph+ 1327.3us (2.00x gap). The same attention
+  chunk/RMS/source-batching knobs just rechecked for S2048/S4096 do not change this
+  route map.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
