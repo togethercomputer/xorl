@@ -2636,6 +2636,18 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   +125.12us with 0/80 wins, `2/2` lost +100.21us with 0/80 wins, and `2/1` still lost
   +21.63us with only 1/80 wins. Keep H256/S4096 attention chunks at `DKV_C=1/DQ_C=1`.
 
+- Isolated `OP_ATTN_DQ_WG` S/dP WGMMA batching no-go: because S2048/S4096 remain
+  attention-dQ led after the route knobs were exhausted, sibling worktree
+  `/home/apanda/xorl-oss-attn-dq-x2-probe` added a default-off `MK_ATTN_DQ_X2_SD=1`
+  probe that batches the independent `S=QK^T` and `dP=dO V^T` groups through
+  `wga_mma64_x2`. The variant compiled and passed default-vs-variant parity
+  (`/home/apanda/xorl-oss-attn-dq-x2-probe/results/mkv3-p4b-attn-dq-x2-current-20260705T1521Z.log`:
+  H256/S2048 worst grad rel 0.003925; H256/S4096 worst grad rel 0.000001), but timing
+  rejected it. S2048 was construction-order biased and negative overall (+3.87us
+  combined with 28/80 wins), while S4096 regressed in both orders (+14.11us combined
+  with 4/64 wins). Do not promote the x2 DQ source path; the dirty sibling remains
+  no-go evidence only.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
