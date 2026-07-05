@@ -2251,6 +2251,18 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   noise-close to the post-TN number but directionally consistent with the paired
   default-vs-old microbench; no further route knob is implied by this profile.
 
+- Fused Drow/dOatt n128 route no-go: a default-off `MK_DROW_N128=1` probe in
+  `/home/apanda/xorl-oss-drow-n128-probe` added Drow epilogue support to the m64n128
+  WGMMA body and routed only the fused dOatt/Drow GEMM through it. Route smoke
+  (`mkv3-p4b-drow-n128-route-20260705T1502Z.log`) showed the intended tile-count
+  halving: nano Drow rows 16 -> 8 tiles and small rows 64 -> 32 tiles with
+  `flags=5248`. Default-vs-n128 parity passed
+  (`mkv3-p4b-drow-n128-parity-20260705T1510Z.log`: nano worst grad rel 0.005917,
+  small worst rel 0.000001), but paired step timing rejected it decisively
+  (`mkv3-p4b-drow-n128-step-ab-20260705T1512Z.log`): nano regressed +44.51us median /
+  +45.98us mean with 0/24 wins, and small regressed +61.31us median / +66.87us mean
+  with 0/24 wins. Do not route Drow/Drow-direct-store through n128.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
