@@ -2212,6 +2212,15 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   `MK_HEAD_DX_NO_ATOMIC_SK1=0` to force the old split atomic route, or `=1` to force the
   no-atomic `sk=1` route for A/B.
 
+- QKNORM/ROPE-bwd D=64 FMA dx no-go: a default-off `MK_QKBWD_D64_FMA_DX` probe rewrote
+  the cached D=64 q/k norm backward dx expression from `da*w - xh*dot` to
+  `fmaf(-xh, dot, da*w)`. Nano and small default-vs-variant parity passed
+  (`mkv3-p4b-qkbwdfma-parity-20260705T1402Z.log`: nano worst rel 0.004982, small worst
+  rel 0.000001), but paired timing rejected promotion
+  (`mkv3-p4b-qkbwdfma-step-ab-20260705T1408Z.log`). Nano was only noise-level
+  (-0.99us median, -0.49us mean, 15/24 FMA wins), while small regressed (+2.78us
+  median, +2.18us mean, 6/24 FMA wins). Keep the existing multiply/subtract expression.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
