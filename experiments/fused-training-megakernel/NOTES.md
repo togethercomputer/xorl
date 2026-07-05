@@ -1630,6 +1630,16 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   timing confirmed nano cap0 over forced old cap16 by -7.2us paired median with 146/200
   default wins (`mkv3-p4b-coldcap-nano-default-vs-old-20260705T0422COLD.log`).
 
+- Post-nano-cap profile and S512 attention chunk no-go: current-head profile at
+  `0a4560a` (`mkv3-p4b-profile-current-0a4560a-20260705T0423PROFILE.log`) has nano
+  at 920.2us with cap0, small at 3640.7us, and H256/S1024 at 1225.3us. Nano's cap0
+  profile made `ATTN_DQ_WG` more visible on the hot path, but a focused S512 chunk
+  resweep (`mkv3-p4b-attn-c-nano-cap0-0a4560a-20260705T0423ATTNC.log`) found no
+  repeatable improvement over the current `DKV_C=3/DQ_C=2` default. Nearby `2/1`,
+  `3/1`, `4/2`, and `2/2` were all noise-level (-1.0us to +0.4us paired medians with
+  39-43/80 wins), while `DQ_C=3` variants regressed and `DKV_C=1/DQ_C=2` lost hard
+  (+32.3us, 2/80 wins). Keep the S512 attention chunk gate unchanged.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
