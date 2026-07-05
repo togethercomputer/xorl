@@ -1145,6 +1145,16 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   -54.2/+52.1us, S4096 -106.8/+105.8us, and S8192 -332.8/+337.7us, while S2048 kept
   zero TN-WG routes. Default TN WGMMA is therefore gated to implicit `K >= 3072`;
   `MK_WGMMA_TN=0/1` still force-disables/enables it.
+- Drow WGMMA default broadening: the old `S >= 2048` gate was stale after the later
+  N128, dW, and long-S TN retunes. Current-head paired recheck
+  (`mkv3-p4b-current-knob-paired-f687ef5-20260705T0007KNOBS.log`) showed small
+  `MK_DROW_WG_LONGONLY=1` winning -24.8/+31.4us across order reversals with
+  113/120 and 117/120 wins, while nano does not route Drow WGMMA and long-S shapes
+  already default to it. Patched default vs forced old
+  (`mkv3-p4b-drow-wg-default-ab-20260705T0009DROW.log`) confirmed small
+  -21.4/+19.9us with 131/150 and 134/150 wins for the new default. Default now attempts
+  Drow WGMMA whenever `mk.wgmma_ok` accepts the Drow epilogue GEMM;
+  `MK_DROW_WG_LONGONLY=0` restores the old WMMA route.
 
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across

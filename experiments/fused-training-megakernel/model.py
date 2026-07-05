@@ -419,7 +419,9 @@ class MKQwen3:
             # (flags bit10; replaces OP_ATTN_DPRE — one chain hop less per layer);
             # dWo += dX^T Oatt
             drow_flags = 1024
-            drow_wg_default = "1" if c.S >= 2048 else "0"
+            # Historical env name kept for compatibility: unset now means "route Drow
+            # through WGMMA whenever the GEMM gate accepts the shape"; =0 restores WMMA.
+            drow_wg_default = "1"
             drow_wg = bool(int(os.environ.get("MK_DROW_WG_LONGONLY", drow_wg_default)))
             if drow_wg and mk.wgmma_ok(c.S, c.nq * c.D, c.H, drow_flags):
                 p.instr(
