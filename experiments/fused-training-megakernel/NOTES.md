@@ -3580,6 +3580,35 @@ focused max-abs grad diffs at numerical-noise scale, and paired timing wins of
 `mkv3-p4b-qwen4b-generic-dq-c1-testmodel-20260705T2244Z.log`, including the
 existing D=128 ragged fallback guard and SGD sanity.
 
+## v3 P4b lm-head fat-tile standalone probe: staged wins, cooperative page blocks
+
+`fat_gemm_probe.py` adds a standalone NT-only WGMMA probe for the lm-head forward
+tile-count problem: current-style 128x128 n128 control, a staged 128x256 tile using
+m64n256 GMMA, and a 100KB-compatible 128x256 direct-store epilogue. The first attempt
+(`mkv3-p4b-fat-gemm-probe-20260705T2247Z.log`) faulted because the standalone smem
+arrays were sized in bytes-as-elements; fixed in the probe only.
+
+Validated retry `mkv3-p4b-fat-gemm-probe-retry-20260705T2250Z.log` showed the staged
+128x256 tile is a real standalone win: small lm_head 73.9us -> 60.7us, S8192 lm_head
+182.8us -> 154.6us. Qwen prefix log
+`mkv3-p4b-fat-gemm-probe-qwen-20260705T2251Z.log` showed
+`1024x151808x2560` 2791.5us -> 2459.0us. But the staged epilogue needs a 160KB
+dynamic-smem page, and unchanged-model launch control
+`mkv3-p4b-smem160-tax-20260705T2252Z.log` failed immediately at 160KB with
+`cudaErrorCooperativeLaunchTooLarge` for the 132-block cooperative launch. Do not
+integrate the staged 128x256 route into the current single cooperative kernel.
+
+The 100KB direct-store 128x256 variant avoids the cooperative page limit but is not a
+broad route: `mkv3-p4b-fat-gemm-probe-direct-20260705T2254Z.log` measured small
+lm_head 73.1us control vs 72.2us direct (noise) and S8192 182.8us control vs 193.2us
+direct (regression). It does win the qwen-like high-K/high-V prefix:
+`mkv3-p4b-fat-gemm-probe-direct-qwen-20260705T2255Z.log` measured
+`1024x151808x2560` 2784.7us control vs 2490.9us direct. A production attempt should
+therefore be qwen-specific, direct-store only, and must add the missing pieces before
+route promotion: CE/lse partials from registers, a guarded 128-column tail for
+`V=151936`, and focused old-vs-new gradient/timing validation. Do not widen the
+general lm-head route from these standalone numbers.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
