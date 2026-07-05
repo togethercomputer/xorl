@@ -1560,6 +1560,26 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   score after the patch was S1024 1283.3us vs graph+ 776.7us
   (`mkv3-p4b-score-s1024-headdx64-20260705T0346SCORE.log`).
 
+- Current-head S1024 attention dQ chunk retune: after the S1024 head-dX route shortened,
+  a focused S1024 attention chunk sweep kept `DKV_C=2` but moved `DQ_C` from 1 to 2.
+  The broad pass (`mkv3-p4b-attn-c-s1024-current-8248cbe-20260705T0348ATTNC.log`)
+  rejected `1/1`, `1/2`, `3/2`, and `4/1` hard, while `2/2` beat current `2/1` by
+  -8.1us with 92/100 wins. Longer confirmation
+  (`mkv3-p4b-attn-c-s1024-c22-confirm-8248cbe-20260705T0349ATTNC.log`) measured -13.0us
+  with 139/180 wins. Route guard (`mkv3-p4b-attn-c-s1024-c22-route-20260705T0350ATTNC.log`)
+  shows only S1024 changes to `DKV_C=2/DQ_C=2`; nano, S2048, S4096, and small are
+  unchanged. Full model validation passed
+  (`mkv3-p4b-attn-c-s1024-c22-testmodel-20260705T0351ATTNC.log`), patched default-vs-old
+  timing confirmed -10.9us with 141/180 wins
+  (`mkv3-p4b-attn-c-s1024-c22-default-vs-old-20260705T0352ATTNC.log`), and the
+  construction-order check was clean (`mkv3-p4b-attn-c-s1024-c22-ordercheck-20260705T0355ATTNC.log`:
+  -13.3us and -14.1us with 158/160 and 159/160 wins). Fresh score rows after this
+  second S1024 change were noisy/worse than the paired delta would imply: 1332.2us and
+  1352.3us vs graph+ ~778us
+  (`mkv3-p4b-score-s1024-attnc22-20260705T0353SCORE.log`,
+  `mkv3-p4b-score-s1024-attnc22-repeat-20260705T0354SCORE.log`); use the paired A/B for
+  the route decision.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
@@ -1570,7 +1590,7 @@ runs from inductor autotune variance):
 | deep-L12 | 2522 | 1765 | 1.43x |
 | S=128 | 867 | 485 | 1.79x |
 | S=256 | 935 | 560 | 1.67x |
-| S=1024 | 1283 | 777 | 1.65x |
+| S=1024 | 1332 | 778 | 1.71x |
 (Morning honest reset: nano 1.97x / small 2.52x.)
 
 ## Honest assessment + v2 roadmap
