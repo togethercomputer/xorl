@@ -2627,6 +2627,15 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   and `1/3` regressed +46.82us with 0/160 wins. Keep H256/S2048 attention chunks at
   `DKV_C=2/DQ_C=2`.
 
+- Current-head H256/S4096 attention chunk no-change: S4096's post-SwiGLU profile is
+  even more attention-dQ led, but the current `DKV_C=1/DQ_C=1` default is still the
+  best route. Env-only route/parity/timing
+  (`mkv3-p4b-s4096-attn-dqsplit-current-20260705T1516Z.log`) tried `1/2`, `1/3`,
+  `2/2`, and `2/1`; all variants passed default-vs-variant parity (worst rel <=0.007247)
+  but regressed in paired timing. `1/2` lost +77.57us with 0/80 wins, `1/3` lost
+  +125.12us with 0/80 wins, `2/2` lost +100.21us with 0/80 wins, and `2/1` still lost
+  +21.63us with only 1/80 wins. Keep H256/S4096 attention chunks at `DKV_C=1/DQ_C=1`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
