@@ -2844,6 +2844,45 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   gradient checks but lost decisively. `DKV_C=2` was +59.58us median with 0/80 wins,
   and `DKV_C=3` was +55.68us with 0/80 wins. Keep small at `DKV_C=1/DQ_C=1`.
 
+## v3 P4b long-S scaling round (session 2853e0de): the C=1 straggler diagnosis
+
+Standalone per-op measurement of WHY WG attention scales worse than FA3 with S
+(single-instruction df programs on a clean GPU 3, median-of-50, fresh process per S,
+H256 long config nq=4/nkv=2/D=64; flash side = CUDA-graph-captured SDPA 4-D+gqa,
+double-measured to within 3%). Logs: `mkv3-p4b-attn-scaling-probe-20260705T164743Z.log`,
+`mkv3-p4b-flash-graph-probe-*.log`, `mkv3-p4b-flash-graph-rerun-*.log`, plus the v1
+eager-autograd flash numbers retracted inside the first log (CPU autograd overhead
+polluted them; only the graph-captured flash numbers are valid).
+
+| S | mk fwd | fl fwd | mk dkv | mk dq | mk bwd sum | fl bwd | bwd ratio |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 1024 (C=2/2) | 42.7 | 16.3 | 40.0 | 38.5 | 78.5 | 69.1 | 1.14x |
+| 2048 (C=2/2) | 64.5 | 28.4 | 62.7 | 54.6 | 117.3 | 107.8 | 1.09x |
+| 3072 (C=1/1) | 88.1 | 41.2 | 142.7 | 104.8 | 247.5 | 152.1 | 1.63x |
+| 4096 (C=1/1) | 111.8 | 75.2 | 186.4 | 134.5 | 320.9 | 199.1 | 1.61x |
+| 8192 (C=1/1) | 390.9 | 233.2 | 669.2 | 481.2 | 1150.4 | 520.8 | 2.21x |
+
+Findings (all per layer, standalone):
+- The bwd ops are COMPETITIVE with graph-captured flash at the chunked shapes
+  (S<=2048: 1.09-1.14x). The long-S collapse is specific to the C=1 regime.
+- At C=1 the ops are STRAGGLER-BOUND: makespan == the longest causal tile's serial
+  stage chain. Marginal cost is 2.7us per 64-row stage for dkv and 1.9us for dq —
+  S3072->S4096 dkv grew +43.7us for exactly +16 stages while the tile count grew
+  96->128 and absorbed nothing (SMs idle around the straggler). fwd matches the same
+  model (111.8us ~= 64 stages x 1.5us + fill at S4096).
+- The S2048->S3072 dkv discontinuity (+127% time for +50% S) is the Ckv=2->1 default
+  flip tripling the longest chain, not a bandwidth or wave effect.
+- Uniform C=2 at S4096 (the earlier measured no-go, +77us) fails because it doubles
+  fill/atomic cost on ALL tiles, including the short tail tiles where the fill
+  dominates. The measurement-supported fix is BANDED chunking — chunk count
+  proportional to per-tile stage count (split only the long tiles) — in progress in
+  `/home/apanda/xorl-oss-attn-band` (kernel decode packs C | kv/q-tile-off<<8 |
+  band-width<<16 into the existing C arg; per-band ws slots keep the disjoint row
+  ranges parallel in the dep analysis; bands emitted longest-first).
+- Re-run knobs: `results/attn_scaling_probe_2853e0de.py <S>` (megakernel ops +
+  per-stage fits) and `results/flash_graph_probe_2853e0de.py <S>` (flash side),
+  driver `results/run_attn_scaling_probe_2853e0de.sh <gpu>`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
