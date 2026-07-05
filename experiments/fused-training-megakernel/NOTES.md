@@ -1456,6 +1456,26 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   small 3714.4us vs graph+ 1898.8us
   (`mkv3-p4b-score-small-rmsr2-20260705T0316SCORE.log`).
 
+- Post-RMS-retune small no-go rechecks: refreshed small profile at `1ea7e4f`
+  (`mkv3-p4b-profile-small-rmsr2-1ea7e4f-20260705T0317PROFILE.log`) still leads with
+  `ATTN_DKV_WG`, WGMMA NN dX, `SWIGLU_BWD`, `ATTN_FWD_WG`, and RMS dx. Focused
+  current-head rechecks did not expose a second safe default change: disabling all NN
+  n128 regressed +27.4us and lm-head-only n128 regressed +40.0us
+  (`mkv3-p4b-n128-nn-current-1ea7e4f-20260705T0318N128.log`); selective NN n128
+  thresholds 48/64/96/128 all regressed
+  (`mkv3-p4b-n128-nn-thresh-small-1ea7e4f-20260705T0325N128.log`); head-dX targets
+  128/192/256 regressed and target64 was the same effective split as default/noise
+  (`mkv3-p4b-headdx-small-current-1ea7e4f-20260705T0319HEADDX.log`); cap16 was only a
+  weak -3.9us with 112/180 wins after confirmation, so keep small cap48
+  (`mkv3-p4b-coldcap-small-rmsr2-1ea7e4f-20260705T0320COLD.log`,
+  `mkv3-p4b-coldcap16-small-confirm-1ea7e4f-20260705T0321COLD.log`); dW target64/80
+  stayed noise and target128 regressed
+  (`mkv3-p4b-dwtarget-small-rmsr2-1ea7e4f-20260705T0322DWSK.log`); attention bwd chunk
+  variants all regressed by +35us to +96us
+  (`mkv3-p4b-attn-c-small-rmsr2-1ea7e4f-20260705T0323ATTNC.log`); and forcing the old
+  Drow WMMA route lost +31.4us with 1/140 wins
+  (`mkv3-p4b-drow-small-rmsr2-1ea7e4f-20260705T0324DROW.log`).
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
