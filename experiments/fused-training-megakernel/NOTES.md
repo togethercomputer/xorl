@@ -1654,6 +1654,13 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   H256/S1024 by +28.9us with 0/100 wins. Keep the hot/cold criticality split; uncapped
   nano cold work is not equivalent to single-ring scheduling.
 
+- Current-head `MK_CLAIM` resweep after nano cap0: keep the scheduler claim quantum at
+  132 (`mkv3-p4b-claim-current-f7d70c6-20260705T0427CLAIM.log`). Nano claim160 was only
+  a weak isolated -2.4us paired median with 53/80 wins, while claim64/96/112 regressed
+  by +56us to +111us, claim192 regressed +9.6us, and claim264 regressed +4.9us. The
+  likely alternate claim160 is not shape-safe: small regressed +189.2us with 0/60 wins
+  and H256/S1024 regressed +17.2us with 7/70 wins. No source route change.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
