@@ -1176,6 +1176,13 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   -19.8us and -15.5us paired medians across order reversals, with 112/120 and 106/120
   wins. Default head dX target is now 96 for H256/S2048 and H256/S3072; the env
   `MK_HEAD_DX_TARGET_TILES=192` restores the old route.
+- Small head-dX target gate: after the qknorm-bwd cache and S3072 retune, the H512/S1024
+  small profile still had `dlogits @ Wlm` on path at target 192 (split-K=3, 192 tiles).
+  Current-head A/B (`mkv3-p4b-small-headdx-target-post-f0888dc-20260705T0045HEADDX.log`)
+  showed target 96 emits split-K=1 (64 tiles) and wins -15.7us/-11.8us paired medians
+  across order reversals, with 98/100 and 92/100 wins. Targets 128 and 256 regressed.
+  Default head dX target is now 96 for H512/S1024 too; `MK_HEAD_DX_TARGET_TILES=192`
+  restores the old route.
 
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
