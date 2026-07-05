@@ -3402,6 +3402,26 @@ old R2 (`h256=0 r2=9`) while S8192 uses the new opcode (`h256=9 r2=0`), and
 forced-old `MK_RMS_DX_H256=0` was slower by +23.33us/+26.99us old-minus-new with
 parity clean. Do not widen to S4096 without a fresh post-composition recheck.
 
+H256/S512+S1024 RMSNorm bwd-dx fixed-width route promotion: after the short-shape
+profile refresh (`mkv3-p4b-profile-short-post-drowzero-06f3101-20260705T2203Z.log`)
+put `RMSNORM_BWD_DX` at 64-65us on-path for S256/nano, an env-only
+`MK_RMS_DX_H256=1` A/B rechecked short H256 shapes. S256 is **not** promoted:
+default-first was neutral/slightly negative (+0.58us variant-minus-default in the
+focused repeat), despite a variant-first win
+(`mkv3-p4b-rmsdx-h256-short-confirm-20260705T2207Z.log`). Nano/S512 and H256/S1024
+were promoted after the balanced-order confirmation removed second-call bias:
+nano old-minus-new +2.42us/+6.40us with 196/300 and 260/300 default wins, and
+S1024 +15.28us/+5.89us with 236/240 and 197/240 default wins
+(`mkv3-p4b-rmsdx-h256-short-balanced-20260705T2207Z.log`). Promoted-default route
+guard (`mkv3-p4b-rmsdx-h256-short-promoted-default-20260705T2207Z.log`) proved
+S128 stays on the FMA route, S256 and S4096 stay on R2, and nano/S1024 use nine
+H256 dx opcodes. Final route/ref validation passed
+(`mkv3-p4b-rmsdx-h256-short-route-validate-20260705T2207Z.log`: S1024 rel loss
+4e-6, worst grad rel 0.020981), and full `test_model.py` passed
+(`mkv3-p4b-rmsdx-h256-short-testmodel-20260705T2207Z.log`: nano worst 0.0281,
+D128-ragged 0.0195, rerun/waves/df2/ws and SGD sanity clean). The exact default
+gate is now H256/S512, H256/S1024, and H256/S8192.
+
 Post-RMS S8192 profile/score refresh:
 `mkv3-p4b-profile-score-s8192-post-rmsdx-9eb4c2e-20260705T2205Z.log` measured
 profile total 7233.5us with `n_instr=188`, `critical_path=80`, `gated=63`.
