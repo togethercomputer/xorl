@@ -1296,6 +1296,15 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   (`mkv3-p4b-swrcp-gated-ab-20260705T0229SWRCP.log`: nano +2.98us, small -4.11us,
   S2048 +3.18us, S4096 +18.02us). Keep SWIGLU's division form.
 
+- ATTN_FWD_WG output reciprocal no-go: a default-off `MK_ATTN_FAST_INV` probe changed
+  only the two WGMMA fwd output-normalization reciprocals (`1.0f / l[...]`) to
+  `__frcp_rn`. Focused attention correctness passed
+  (`mkv3-p4b-afinv-testattention-20260705T0233AFINV.log`), but the full model gate
+  failed before timing: `test_model.py` kept per-step gradient parity within tolerance,
+  then failed the 40-step learning sanity (`9.0496 -> 7.1534`, less than the required
+  2.0 loss drop; `mkv3-p4b-afinv-testmodel-20260705T0235AFINV.log`). Keep WGMMA
+  attention output normalization on division.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
