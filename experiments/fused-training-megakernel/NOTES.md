@@ -1542,6 +1542,24 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   `mkv3-p4b-dxsplit-s128-profile-default-vs-old-20260705T0340DXSK.log`). Keep
   `gemm_dx` split target128.
 
+- Current-head S1024 head-dX split retune: fresh post-S128 profile at `b919f9f`
+  (`mkv3-p4b-profile-current-b919f9f-20260705T0341PROFILE.log`) showed S1024 now has the
+  WGMMA NN route active, with remaining leaders `ATTN_DQ_WG`, `ATTN_FWD_WG`, the lm-head
+  NT gemm, and head dX still at target192 (`sk=6`, 192 tiles). Current-head sweep
+  (`mkv3-p4b-headdx-s1024-current-b919f9f-20260705T0342HEADDX.log`) selected target64:
+  target64 beat target192 by -20.2us paired median with 96/100 wins; target96 was also
+  positive (-14.9us), while target32 and target256 regressed. Longer confirmation kept
+  target64 at -11.7us with 164/180 wins
+  (`mkv3-p4b-headdx-s1024-target64-confirm-b919f9f-20260705T0343HEADDX.log`). Default
+  route now emits H256/S1024 head dX as 64 WGMMA split-K tiles (`sk=2`) while S128,
+  S256, nano, S2048, S3072, and H512/S1024 small routes are unchanged
+  (`mkv3-p4b-headdx-s1024-target64-route-20260705T0344HEADDX.log`). Full model
+  validation passed (`mkv3-p4b-headdx-s1024-target64-testmodel-20260705T0345HEADDX.log`),
+  patched default-vs-forced-old timing confirmed -12.3us with 168/180 wins
+  (`mkv3-p4b-headdx-s1024-target64-default-vs-old-20260705T0345HEADDX.log`), and fresh
+  score after the patch was S1024 1283.3us vs graph+ 776.7us
+  (`mkv3-p4b-score-s1024-headdx64-20260705T0346SCORE.log`).
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
@@ -1552,7 +1570,7 @@ runs from inductor autotune variance):
 | deep-L12 | 2522 | 1765 | 1.43x |
 | S=128 | 867 | 485 | 1.79x |
 | S=256 | 935 | 560 | 1.67x |
-| S=1024 | 1349 | 783 | 1.72x |
+| S=1024 | 1283 | 777 | 1.65x |
 (Morning honest reset: nano 1.97x / small 2.52x.)
 
 ## Honest assessment + v2 roadmap
