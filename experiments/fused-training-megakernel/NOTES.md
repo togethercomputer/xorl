@@ -3167,6 +3167,13 @@ Promoted-default validation
 old `MK_QKBWD_SPLIT_V=0` by +9.17us/+15.81us old-minus-new, with old wins 5/40
 and 2/40 and parity clean (`worst_grad_rel` <= 0.003898). Default
 `MK_QKBWD_SPLIT_V` now covers exact H256/D64/S3072/S4096/S8192.
+H256/D64/S2048 remains a no-change boundary:
+`mkv3-p4b-qkbwd-splitv-s2048-current-20260705T2046Z.log` was parity-clean but
+construction-order mixed, with default-first neutral/slower (+0.22us, 20/40
+wins) and split-first positive (-12.85us, 38/40 wins). Cached confirmation
+`mkv3-p4b-qkbwd-splitv-s2048-confirm-20260705T2048Z.log` repeated the split-first
+win (-11.98us, 40/40) but default-first stayed too weak/noisy (-1.26us, 17/40).
+Keep the default gate at S3072+.
 
 Post-T29 follow-up no-gos: current default `lpt` order remains best. A
 pre-combine env-only retest at `77346e2`
