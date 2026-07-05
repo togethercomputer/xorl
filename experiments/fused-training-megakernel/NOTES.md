@@ -3372,6 +3372,19 @@ old-minus-new with parity clean
 exact H256/D64/S8192 only in the consolidated tuning table; the env override
 still forces old/new for A/B.
 
+Post-row-broadcast S8192 profile/score refresh:
+`mkv3-p4b-profile-score-s8192-post-rowbcast-d3581ed-20260705T2145Z.log` (first
+attempt failed before CUDA due to a relative venv path; retry completed with GPU5
+pre/post guards clean). Score is megakernel 7016.6us, eager 8413.0us, compile
+3593.3us, compile+CUDAGraph 3293.9us, and compile+CUDAGraph+ 3123.3us, so the
+long-S gap is 2.25x vs the hardened graph baseline. The profile total is
+7092.3us with `n_instr=188`, `critical_path=80`, `gated=63`; on-path leaders are
+still `ATTN_DKV_WG` 2584.4us (2073.0us wait + 511.4us span across four hops),
+`ATTN_FWD_WG` 1092.6us, RMSNorm bwd-dx 462.7us, lm-head NT 435.8us, qknorm/rope
+bwd 279.8us, and swiglu bwd 278.8us. Conclusion: the row-broadcast win is real
+but small; the next long-S work should attack DKV dependency/wait structure or
+attention-rowop fusion, not scalar-load cleanup.
+
 ## v3 P4b knob consolidation (session 2853e0de): one tuning table, routes verified
 
 The secondary lane from the /goal: model.py's ~12 scattered per-shape gate
