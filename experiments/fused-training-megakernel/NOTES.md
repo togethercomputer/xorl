@@ -2241,6 +2241,16 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   Use `MK_HEAD_DX_N128_F32=0` to force the old small split-atomic route, or
   `MK_HEAD_DX_N128_F32=1` with `MK_HEAD_DX_NO_ATOMIC_SK1=1` for forced A/B.
 
+- Post-head-dX-n128 scoreboard/profile at `e5e641d`: `profile_df.py both df`
+  (`mkv3-p4b-profile-current-e5e641d-20260705T1450Z.log`) measured nano 890.6us and
+  small 3439.1us. Small now has `n_instr=288`; the promoted head-dX row is
+  `GEMMNN 1024x512x16384.wg` with 32 tiles. `bench.py both`
+  (`mkv3-p4b-score-both-e5e641d-20260705T1452Z.log`) measured nano 917.8us
+  megakernel vs 628.3us compile+CUDAGraph+ (1.46x gap), and small 3435.0us
+  megakernel vs 1914.1us compile+CUDAGraph+ (1.79x gap). The small scoreboard row is
+  noise-close to the post-TN number but directionally consistent with the paired
+  default-vs-old microbench; no further route knob is implied by this profile.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
