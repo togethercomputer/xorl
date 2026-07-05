@@ -2837,6 +2837,13 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   2593.8us vs graph+ 1340.5us (1.93x), S4096 3323.2us vs 1569.4us (2.12x), and S8192
   8221.0us vs 3123.3us (2.63x).
 
+- Small DKV chunk retune after DKV/DQ `float2` no-change: even with the cheaper dKV
+  `float2` atomics, H512/S1024 small still rejects over-splitting the DKV backward.
+  `mkv3-p4b-small-dkv-c-retune-post-float2-20260705T1732Z.log` compared current
+  `DKV_C=1/DQ_C=1` against `DKV_C=2/DQ_C=1` and `DKV_C=3/DQ_C=1`; both passed
+  gradient checks but lost decisively. `DKV_C=2` was +59.58us median with 0/80 wins,
+  and `DKV_C=3` was +55.68us with 0/80 wins. Keep small at `DKV_C=1/DQ_C=1`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
