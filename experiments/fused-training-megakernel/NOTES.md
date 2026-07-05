@@ -1668,6 +1668,19 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   47/80 wins. Target32/128/192 regressed, and deep-L12 did not provide a clean guard
   for lower targets. Keep the current target96 for H256/S512 and deep-L12.
 
+- Current-head short cold-cap retune: extend the shallow cap0 gate to H256/L4/S128
+  only. A clean-GPU longer confirmation
+  (`mkv3-p4b-coldcap-short-confirm-0482227-20260705T0430COLD.log`) measured S128 cap0
+  over cap16 at -6.2us paired median with 165/240 wins, while S256 stayed too weak
+  (-2.4us, 138/240 wins) and remains cap16. Route guard
+  (`mkv3-p4b-coldcap-s128-route-20260705T0430COLD.log`) shows S128 and nano S512 at
+  cap0, S256/deep at cap16, H256/S1024 at cap64, and small at cap48. Focused S128
+  parity passed (`mkv3-p4b-coldcap-s128-parity-20260705T0430COLD.log`), full model
+  validation passed (`mkv3-p4b-coldcap-s128-testmodel-20260705T0431COLD.log`), and
+  patched default-vs-old timing confirmed S128 cap0 over forced old cap16 by -8.2us
+  paired median with 189/220 default wins
+  (`mkv3-p4b-coldcap-s128-default-vs-old-20260705T0431COLD.log`).
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
