@@ -2541,6 +2541,15 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   n128-default by construction order, combined +24.37us with 2/320 n128 wins. Keep the
   current m64n64 WGMMA NN threshold for H256/S1024.
 
+- Current-head H256/S1024 attention chunk recheck no-change: the post-2W profile put
+  attention back at the top, so an env-only sweep rechecked nearby `MK_ATTN_DKV_C` /
+  `MK_ATTN_DQ_C` values against the current `2/2` default. Route/parity/timing
+  (`mkv3-p4b-s1024-attn-chunk-current-20260705T1515Z.log`) confirmed all tested
+  variants were correctness-clean but slower: `1/2` regressed +62.19us with 0/240
+  wins, `2/1` regressed +14.67us with 16/240 wins, `1/1` regressed +61.12us with 0/240
+  wins, and `3/2` regressed +49.47us with 0/240 wins. Keep `DKV_C=2/DQ_C=2` for
+  H256/S1024.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
