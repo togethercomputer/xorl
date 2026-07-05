@@ -1879,6 +1879,28 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   show `ATTN_DKV_WG`, large WGMMA/n128 GEMMs, `SWIGLU_BWD`, Drow, and RMS dx as the
   largest repeated spans.
 
+- SWIGLU exp2 sigmoid no-go: replacing the SwiGLU sigmoid's `__expf(-g)` with inline
+  `ex2.approx.ftz.f32(-log2(e)*g)` was correctness-clean
+  (`mkv3-p4b-swex2-ptx2-testswiglu-20260705T062457Z.log`,
+  `mkv3-p4b-swex2-ptx2-testmodel-20260705T062457Z.log`), but all-shape timing was
+  mixed and not promotable (`mkv3-p4b-swex2-ptx2-step-ab-20260705T062457Z.log`):
+  S128 improved by -16.08us, while small regressed by +5.62us and H256/S1024 by
+  +9.42us. Runtime S128 gating avoided the math on other shapes but added enough
+  branch/code cost to regress fallbacks (`mkv3-p4b-swex2-s128-gpu5-step-ab-20260705T063639Z.log`:
+  S128 -10.11us, S256 +4.53us, nano +3.41us, small +20.43us, H256/S1024 +6.43us,
+  H256/S2048 +17.42us). A templated S128-only body was also correctness-clean
+  (`mkv3-p4b-swex2-s128tmpl-testswiglu-20260705T063639Z.log`,
+  `mkv3-p4b-swex2-s128tmpl-testmodel-20260705T063639Z.log`,
+  `mkv3-p4b-swex2-promoted-s128-testmodel-20260705T063639Z.log`) and looked positive
+  in co-resident A/B (`mkv3-p4b-swex2-s128tmpl-gpu5-step-ab-20260705T063639Z.log`:
+  S128 -12.43us), but reverse construction order inverted the apparent win
+  (`mkv3-p4b-swex2-promoted-default-ab-20260705T063639Z.log` vs
+  `mkv3-p4b-swex2-promoted-s128-reverse-ab-20260705T063639Z.log`). Fresh single-model
+  process medians removed that bias and were neutral
+  (`mkv3-p4b-swex2-s128-freshproc-ab-20260705T063639Z.log`: median default-old
+  +0.29us, mean -0.33us, 3/6 default wins). The temporary source route was removed;
+  keep SwiGLU on `__expf` plus the promoted FMA derivative.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
