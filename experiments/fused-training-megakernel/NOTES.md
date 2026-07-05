@@ -1212,6 +1212,20 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   `mkv3-p4b-nano-nnmin16-testmodel-20260705T005850Z.log`). Patched default vs forced
   old timing (`mkv3-p4b-nano-nnmin16-default-ab-clean-20260705T005906Z.log`) measured
   combined paired median -19.76us with 479/480 wins.
+- Nano head-dX target gate: after nano's M=512 NN path switched to WGMMA, the old
+  head-dX split-K target 192 over-parallelized `(512,256,8192)` (192 tiles, sk=12).
+  Current sweep (`mkv3-p4b-nano-headdx-target-post-59d68b0-20260705T010139Z.log`) showed
+  targets 48/64/96 all beating 192, with target 96 best in the quick pass (96 tiles,
+  sk=6). Paired confirmation
+  (`mkv3-p4b-nano-headdx96-confirm-post-59d68b0-20260705T010154Z.log`) measured combined
+  paired median -14.64us with 492/520 wins. Nano RMS dx R4 and attention chunk retunes
+  were rejected in the same post-`59d68b0` pass, so the only new nano default is head-dX
+  target 96; `MK_HEAD_DX_TARGET_TILES=192` restores the old route. Patched route guard
+  and full model parity passed
+  (`mkv3-p4b-nano-headdx96-route-20260705T010223Z.log`,
+  `mkv3-p4b-nano-headdx96-testmodel-20260705T010232Z.log`). Patched default vs forced
+  old timing (`mkv3-p4b-nano-headdx96-default-ab-clean-20260705T010245Z.log`) measured
+  combined paired median -17.06us with 445/480 wins.
 
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across

@@ -192,9 +192,9 @@ class MKQwen3:
             env = os.environ.get("MK_HEAD_DX_TARGET_TILES")
             if env is not None:
                 return int(env)
-            # S2048/S3072 and the H512/S1024 small config want less head dX split-K
-            # after the long-S/qknorm route retunes; keep 192 elsewhere.
-            if (c.H == 256 and c.S in (2048, 3072)) or (c.H == 512 and c.S == 1024):
+            # Nano, S2048/S3072, and H512/S1024 small want less head dX split-K
+            # after the route retunes; keep 192 elsewhere.
+            if (c.H == 256 and c.S in (512, 2048, 3072)) or (c.H == 512 and c.S == 1024):
                 return 96
             return 192
 
