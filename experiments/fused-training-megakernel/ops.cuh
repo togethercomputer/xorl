@@ -888,6 +888,15 @@ __device__ __forceinline__ float warp_sum(float v) {
   return v;
 }
 
+template <bool UseFma>
+__device__ __forceinline__ float rms_dx_acc(float dx, float r, float g, float xh,
+                                            float m) {
+  if constexpr (UseFma) {
+    return fmaf(r, fmaf(-xh, m, g), dx);
+  }
+  return dx + r * (g - xh * m);
+}
+
 // ---- RMSNorm ---------------------------------------------------------------------------
 // fwd: y[r,:] = x[r,:] * rstd * w ; rstd = 1/sqrt(mean(x^2)+eps). Saves rstd (fp32).
 // args: {x, w, y, rstd, H, eps_bits, S}; tile = MK_ROW_R-row group, one warp per row.
@@ -1207,7 +1216,9 @@ __device__ void op_rmsnorm_bwd_dx_r4(const Instr& I, int tile, void** bufs, char
 
 // Split variant: dx-only half. This keeps the residual-gradient chain from waiting on
 // the weight-gradient atomic drain; the dw-only half is emitted as a cold sink.
-__device__ void op_rmsnorm_bwd_dx(const Instr& I, int tile, void** bufs, char* smem_raw) {
+template <bool UseFma>
+__device__ void op_rmsnorm_bwd_dx_impl(const Instr& I, int tile, void** bufs,
+                                       char* smem_raw) {
   const int H = I.args[6], S = I.args[8];
   const bool dy_f32 = I.args[7] != 0;
   const int warp = mk_tid() >> 5, lane = mk_tid() & 31;
@@ -1257,8 +1268,8 @@ __device__ void op_rmsnorm_bwd_dx(const Instr& I, int tile, void** bufs, char* s
 #pragma unroll
       for (int j = 0; j < 8; j++) {
         const float xhA = xa[j] * rA, xhB = xv[j] * rB;
-        dxa[j] += rA * (da[j] * wv[j] - xhA * mA);
-        dxv[j] += rB * (db[j] * wv[j] - xhB * mB);
+        dxa[j] = rms_dx_acc<UseFma>(dxa[j], rA, da[j] * wv[j], xhA, mA);
+        dxv[j] = rms_dx_acc<UseFma>(dxv[j], rB, db[j] * wv[j], xhB, mB);
       }
       st8bf(dxA + i, dxa);
       if (hasB) st8bf(dxB + i, dxv);
@@ -1275,10 +1286,20 @@ __device__ void op_rmsnorm_bwd_dx(const Instr& I, int tile, void** bufs, char* s
     const float mB = warp_sum(dotB) * rB / H;
     for (int i = lane; i < H; i += 32) {
       const float xhA = bf2f(xA[i]) * rA, xhB = bf2f(xB[i]) * rB;
-      dxA[i] = f2bf(bf2f(dxA[i]) + rA * (dyA(i) * bf2f(w[i]) - xhA * mA));
-      if (hasB) dxB[i] = f2bf(bf2f(dxB[i]) + rB * (dyB(i) * bf2f(w[i]) - xhB * mB));
+      dxA[i] = f2bf(rms_dx_acc<UseFma>(bf2f(dxA[i]), rA, dyA(i) * bf2f(w[i]), xhA, mA));
+      if (hasB) dxB[i] = f2bf(rms_dx_acc<UseFma>(bf2f(dxB[i]), rB, dyB(i) * bf2f(w[i]), xhB, mB));
     }
   }
+}
+
+__device__ void op_rmsnorm_bwd_dx(const Instr& I, int tile, void** bufs,
+                                  char* smem_raw) {
+  op_rmsnorm_bwd_dx_impl<false>(I, tile, bufs, smem_raw);
+}
+
+__device__ void op_rmsnorm_bwd_dx_fma(const Instr& I, int tile, void** bufs,
+                                      char* smem_raw) {
+  op_rmsnorm_bwd_dx_impl<true>(I, tile, bufs, smem_raw);
 }
 
 // Split variant: dw-only half. Same reduction/atomic policy as the combined op, but

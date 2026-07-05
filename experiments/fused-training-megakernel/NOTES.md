@@ -1814,6 +1814,23 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   S128 -14.37us, small -8.10us, S256 +8.24us, nano +8.34us, H256/S1024 +5.63us).
   Keep the original `(dP-Drow)*scale` expression; the FMA form is not a safe default.
 
+- RMSNorm split-dx FMA route promotion: the broad `MK_RMS_DX_FMA` arithmetic rewrite
+  passed focused RMS/full-model validation but was mixed enough to reject as an
+  all-shape default (`mkv3-p4b-rmsxfma-step-ab-20260705T0613RMSX.log`: S128 -14.45us,
+  S256 +5.49us, nano +3.39us, H256/S2048 +9.73us). The promoted route uses a separate
+  `OP_RMSNORM_BWD_DX_FMA` opcode only for H256/S128 split RMSNorm dx; other shapes keep
+  the old opcode. Routed H256/S128 full-model validation passed with nine emitted route
+  opcodes (`mkv3-p4b-rmsxfma-route-s128-testmodel-20260705T0626RMSX.log`), default
+  validation passed (`mkv3-p4b-rmsxfma-route-default-testmodel-20260705T0627RMSX.log`;
+  no-env H256/S128 default validation:
+  `mkv3-p4b-rmsxfma-default-s128-testmodel-20260705T0636RMSX.log`), and route
+  inspection confirmed S256/nano/small/H256S1024 emit zero route opcodes with identical
+  instruction and claim tensors. Paired route-off/route-on timing
+  (`mkv3-p4b-rmsxfma-route-step-ab-20260705T0629RMSX.log`) measured H256/S128 at
+  -5.60us median with 167/200 route wins. Post-promotion default-vs-forced-old timing
+  (`mkv3-p4b-rmsxfma-default-vs-old-s128-20260705T0637RMSX.log`) confirmed -5.98us
+  median with 161/200 default wins. `MK_RMS_DX_FMA_ROUTE=0` forces the old path for A/B.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

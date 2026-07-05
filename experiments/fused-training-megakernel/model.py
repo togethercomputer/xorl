@@ -201,6 +201,12 @@ class MKQwen3:
         else:
             rms_dx_r4 = bool(int(rms_dx_r4_env))
 
+        rms_dx_fma_route_env = os.environ.get("MK_RMS_DX_FMA_ROUTE")
+        if rms_dx_fma_route_env is None:
+            rms_dx_fma_route = c.H == 256 and c.S == 128
+        else:
+            rms_dx_fma_route = bool(int(rms_dx_fma_route_env)) and c.H == 256 and c.S == 128
+
         def head_dx_target_tiles():
             env = os.environ.get("MK_HEAD_DX_TARGET_TILES")
             if env is not None:
@@ -219,6 +225,8 @@ class MKQwen3:
             if split_rms_bwd:
                 if rms_dx_r4:
                     p.instr(mk.OP_RMSNORM_BWD_DX_R4, mk.rowop_tiles(args[-1], mk.ROWOP_R4), args)
+                elif rms_dx_fma_route:
+                    p.instr(mk.OP_RMSNORM_BWD_DX_FMA, mk.rowop_tiles(args[-1], mk.ROWOP_R2), args)
                 else:
                     p.instr(mk.OP_RMSNORM_BWD_DX, mk.rowop_tiles(args[-1], mk.ROWOP_R2), args)
                 p.instr(mk.OP_RMSNORM_BWD_DW, mk.rowop_tiles(args[-1], mk.ROWOP_R2), args)
