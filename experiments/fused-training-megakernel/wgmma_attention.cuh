@@ -38,6 +38,14 @@ __device__ __forceinline__ int wga_off64(int r, int c) {
   return ((r >> 3) << 10) + ((c >> 3) << 7) + ((r & 7) << 4) + ((c & 7) << 1);
 }
 
+__device__ __forceinline__ float wga_lse_log(float x) {
+#ifdef MK_ATTN_FAST_LOG
+  return __logf(x);
+#else
+  return logf(x);
+#endif
+}
+
 // Loader lane mapping (v3 P4b): off64's bank quad depends only on r&7, so the old
 // v -> (r = v/8, c8 = v%8*8) assignment put each 8-lane store phase on ONE row =
 // one bank quad = 8-way conflict (the same pathology SW128 fixed in the gemm; here
@@ -332,8 +340,8 @@ __device__ void op_attn_fwd_wg_pipe(const Instr& I, int tile, void** bufs,
 
   const float inv[2] = {1.0f / l[0], 1.0f / l[1]};
   if ((ln & 3) == 0) {
-    LSE[(int64_t)qh * S + q0wg + r0] = m[0] + logf(l[0]);
-    LSE[(int64_t)qh * S + q0wg + r0 + 8] = m[1] + logf(l[1]);
+    LSE[(int64_t)qh * S + q0wg + r0] = m[0] + wga_lse_log(l[0]);
+    LSE[(int64_t)qh * S + q0wg + r0 + 8] = m[1] + wga_lse_log(l[1]);
   }
   float* Cs = reinterpret_cast<float*>(smem_raw);
   consumer_sync();  // all wgmma reads of Q/P/K/V done before the overlay
@@ -491,8 +499,8 @@ __device__ void op_attn_fwd_wg(const Instr& I, int tile, void** bufs, char* smem
   // epilogue: LSE + O from registers; O staged through smem for coalesced stores
   const float inv[2] = {1.0f / l[0], 1.0f / l[1]};
   if ((ln & 3) == 0) {
-    LSE[(int64_t)qh * S + q0wg + r0] = m[0] + logf(l[0]);
-    LSE[(int64_t)qh * S + q0wg + r0 + 8] = m[1] + logf(l[1]);
+    LSE[(int64_t)qh * S + q0wg + r0] = m[0] + wga_lse_log(l[0]);
+    LSE[(int64_t)qh * S + q0wg + r0 + 8] = m[1] + wga_lse_log(l[1]);
   }
   float* Cs = reinterpret_cast<float*>(smem_raw);  // overlay [128][68] over dead tiles
 #pragma unroll

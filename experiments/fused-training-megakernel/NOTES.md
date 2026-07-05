@@ -1252,6 +1252,22 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   were rejected after long-S regressions
   (`mkv3-p4b-attnfwd-direct-ab-85ec29f-20260705T011027Z.log`).
 
+- ATTN_FWD_WG LSE fast-log: WGMMA forward stores now use `__logf` for the LSE epilogue
+  by default; `MK_ATTN_FAST_LOG=0` restores precise `logf`. The blast radius is only the
+  WGMMA attention fwd LSE sites; generic attention and CE stay on `logf`. Focused
+  attention and full-model parity passed
+  (`mkv3-p4b-aflog-testattention-20260705T0208AFLOG.log`,
+  `mkv3-p4b-aflog-testmodel-20260705T0209AFLOG.log`,
+  `mkv3-p4b-aflog-default-testmodel-20260705T0212AFLOG.log`). Opt-in paired timing
+  (`mkv3-p4b-aflog-ab-20260705T0212AFLOG.log`) was neutral on nano (+0.40us median
+  variant-control, 175/360 wins) and positive on small (-13.92us, 219/240 wins), S2048
+  (-12.21us, 150/180 wins), and S4096 (-11.28us, 106/120 wins). Patched default-vs-old
+  timing (`mkv3-p4b-aflog-default-vs-old-20260705T0212AFLOG.log`) confirmed smaller but
+  still favorable medians: nano -5.84us, small -7.58us, S2048 -8.34us, S4096 -4.75us.
+  End-to-end final-score refresh is noise-level at nano and modestly favorable at small
+  (`mkv3-p4b-score-nano-aflog-20260705T0213SCORE.log`: 1060.7us vs graph+ 561.2us;
+  `mkv3-p4b-score-small-aflog-20260705T0213SCORE.log`: 3738.7us vs graph+ 1908.5us).
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):

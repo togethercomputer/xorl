@@ -162,13 +162,15 @@ def load_ext(verbose=False):
     # Direct register-layout atomics for ATTN_DKV_WG avoid staging dK/dV through smem.
     # MK_ATTN_DKV_DIRECT_ATOMIC=0 restores the old coalesced smem-drain epilogue.
     attn_dkv_direct_atomic = int(os.environ.get("MK_ATTN_DKV_DIRECT_ATOMIC", "1"))
+    # MK_ATTN_FAST_LOG=0 restores precise logf for WGMMA fwd LSE.
+    attn_fast_log = int(os.environ.get("MK_ATTN_FAST_LOG", "1"))
     # D=64 qknorm-bwd fast path; MK_QKBWD_D64_CACHE=0 keeps the old generic loop for
     # A/B and bisects. Separate extension name because torch's cache is name-keyed.
     qkbc = int(os.environ.get("MK_QKBWD_D64_CACHE", "1"))
     return load(
         name="xorl_megakernel" + ("_occ2" if occ2 else "") + ("_wsrc" if regcopy else "")
         + ("_apipe" if attnpipe else "") + ("_adkva" if attn_dkv_direct_atomic else "")
-        + ("_qkbc" if qkbc else ""),
+        + ("_aflog" if attn_fast_log else "") + ("_qkbc" if qkbc else ""),
         sources=[os.path.join(_DIR, "megakernel.cu")],
         extra_cuda_cflags=[
             "-O3",
@@ -184,6 +186,7 @@ def load_ext(verbose=False):
         + (["-DMK_WS_REGCOPY"] if regcopy else [])
         + (["-DMK_ATTN_PIPE"] if attnpipe else [])
         + (["-DMK_ATTN_DKV_DIRECT_ATOMIC"] if attn_dkv_direct_atomic else [])
+        + (["-DMK_ATTN_FAST_LOG"] if attn_fast_log else [])
         + (["-DMK_QKBWD_D64_CACHE"] if qkbc else []),
         verbose=verbose,
     )
