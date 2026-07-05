@@ -261,7 +261,8 @@ __device__ void op_attn_fwd_split(const Instr& I, int tile, void** bufs, char* s
 }
 
 // combine: O[s,qh,:] = sum_c w_c O_c, w_c = l_c exp(m_c - m*) / l*; LSE = m* + ln l*.
-// args: {Opart, Mpart, Lpart, O, LSE, S, nq, D, C}; tile = s; warp w handles head w, w+8...
+// args: {Opart, Mpart, Lpart, O, LSE, S, nq, D, C, row_off}; tile = s - row_off
+// (row_off pads to 0 for pre-band callers); warp w handles head w, w+8...
 __device__ void op_attn_combine(const Instr& I, int tile, void** bufs) {
   const int S = I.args[5], nq = I.args[6], D = I.args[7], C = I.args[8];
   const bf16* Opart = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
@@ -270,7 +271,7 @@ __device__ void op_attn_combine(const Instr& I, int tile, void** bufs) {
   bf16* O = reinterpret_cast<bf16*>(bufs[I.args[3]]);
   float* LSE = reinterpret_cast<float*>(bufs[I.args[4]]);
   const int warp = mk_tid() / 32, lane = mk_tid() % 32;
-  const int s = tile;
+  const int s = I.args[9] + tile;
   for (int h = warp; h < nq; h += MK_CONSUMERS / 32) {
     float mstar = -INFINITY;
     for (int c = 0; c < C; ++c)

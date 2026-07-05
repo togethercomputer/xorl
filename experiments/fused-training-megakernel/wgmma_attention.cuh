@@ -384,13 +384,23 @@ __device__ void op_attn_fwd_wg(const Instr& I, int tile, void** bufs, char* smem
   constexpr int D = 64;  // host routes D!=64 to op_attn_fwd
   const int S = I.args[3], nq = I.args[4], nkv = I.args[5];
   const float scale = __int_as_float(I.args[7]);
+  // args[8] packs C | band_q_tile_off<<8 (args pad to 0 for pre-band callers ->
+  // C=1, off=0). C > 1 tiles are flash-decoding kv chunks: the same online
+  // softmax runs over stages k0 = (c + t*C)*64 and the epilogue writes
+  // locally-normalized partials + (m, l) to args[9..11] for OP_ATTN_COMBINE
+  // instead of O/LSE.
+  const int Craw = I.args[8];
+  const int C = (Craw & 0xff) ? (Craw & 0xff) : 1;
+  const int boff = (Craw >> 8) & 0xff;
   const bf16* qkv = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
   bf16* O = reinterpret_cast<bf16*>(bufs[I.args[1]]);
   float* LSE = reinterpret_cast<float*>(bufs[I.args[2]]);
   AttnWgFwdSmem& sm = *reinterpret_cast<AttnWgFwdSmem*>(smem_raw);
 
-  const int qh = tile % nq;
-  const int q0 = (tile / nq) * 128;
+  const int c = tile % C;
+  const int t128 = tile / C;
+  const int qh = t128 % nq;
+  const int q0 = (boff + t128 / nq) * 128;
   const int kvh = qh / (nq / nkv);
   const int stride = (nq + 2 * nkv) * D;
   const int tid = mk_tid();
@@ -425,7 +435,7 @@ __device__ void op_attn_fwd_wg(const Instr& I, int tile, void** bufs, char* smem
     __pipeline_memcpy_async((char*)sm.Q[h] + wga_off64(r, c8),
                             &qkv[(int64_t)(q0 + h * 64 + r) * stride + qh * D + c8], 16);
   }
-  issue_kv_stage(0, 0);
+  issue_kv_stage(c * 64, 0);
 
   float o[32];
 #pragma unroll
@@ -435,10 +445,10 @@ __device__ void op_attn_fwd_wg(const Instr& I, int tile, void** bufs, char* smem
   const int r0 = w * 16 + (ln >> 2);  // local row (+8 for i=1)
   const int cb = (ln & 3) * 2;        // col base within an 8-col group
 
-  const int n_stages = q0 / 64 + 2;
+  const int n_stages = (q0 / 64 + 2 - c + C - 1) / C;
   for (int t = 0; t < n_stages; ++t) {
-    const int k0 = t * 64;
-    if (t + 1 < n_stages) issue_kv_stage((t + 1) * 64, (t + 1) & 1);
+    const int k0 = (c + t * C) * 64;
+    if (t + 1 < n_stages) issue_kv_stage((c + (t + 1) * C) * 64, (t + 1) & 1);
     __pipeline_wait_prior(t + 1 < n_stages ? 1 : 0);
     consumer_sync();
     const bool skip = k0 > q0wg + 63;  // WG0's tail stage: fully masked
@@ -506,11 +516,29 @@ __device__ void op_attn_fwd_wg(const Instr& I, int tile, void** bufs, char* smem
     consumer_sync();  // both WGs done reading K/V stage t before refill
   }
 
-  // epilogue: LSE + O from registers; O staged through smem for coalesced stores
-  const float inv[2] = {1.0f / l[0], 1.0f / l[1]};
-  if ((ln & 3) == 0) {
-    LSE[(int64_t)qh * S + q0wg + r0] = m[0] + wga_lse_log(l[0]);
-    LSE[(int64_t)qh * S + q0wg + r0 + 8] = m[1] + wga_lse_log(l[1]);
+  // epilogue: LSE + O from registers; O staged through smem for coalesced stores.
+  // C > 1 chunks write the flash-decoding partial instead: locally-normalized O_c
+  // (empty/fully-masked chunk -> l == 0 -> zeros with m = -inf, which the combine
+  // treats as weight 0), plus per-row (m_c, l_c).
+  const float inv[2] = {l[0] > 0.0f ? 1.0f / l[0] : 0.0f,
+                        l[1] > 0.0f ? 1.0f / l[1] : 0.0f};
+  bf16* Odst = O;
+  if (C == 1) {
+    if ((ln & 3) == 0) {
+      LSE[(int64_t)qh * S + q0wg + r0] = m[0] + wga_lse_log(l[0]);
+      LSE[(int64_t)qh * S + q0wg + r0 + 8] = m[1] + wga_lse_log(l[1]);
+    }
+  } else {
+    bf16* Opart = reinterpret_cast<bf16*>(bufs[I.args[9]]);
+    float* Mpart = reinterpret_cast<float*>(bufs[I.args[10]]);
+    float* Lpart = reinterpret_cast<float*>(bufs[I.args[11]]);
+    Odst = Opart + (int64_t)c * S * nq * D;
+    if ((ln & 3) == 0) {
+      Mpart[((int64_t)c * nq + qh) * S + q0wg + r0] = m[0];
+      Mpart[((int64_t)c * nq + qh) * S + q0wg + r0 + 8] = m[1];
+      Lpart[((int64_t)c * nq + qh) * S + q0wg + r0] = l[0];
+      Lpart[((int64_t)c * nq + qh) * S + q0wg + r0 + 8] = l[1];
+    }
   }
   float* Cs = reinterpret_cast<float*>(smem_raw);  // overlay [128][68] over dead tiles
 #pragma unroll
@@ -529,7 +557,7 @@ __device__ void op_attn_fwd_wg(const Instr& I, int tile, void** bufs, char* smem
     bf16* oe = reinterpret_cast<bf16*>(&out);
 #pragma unroll
     for (int e = 0; e < 8; ++e) oe[e] = f2bf(Cs[r * 68 + c8 + e]);
-    *reinterpret_cast<uint4*>(&O[(int64_t)(q0 + r) * (nq * D) + qh * D + c8]) = out;
+    *reinterpret_cast<uint4*>(&Odst[(int64_t)(q0 + r) * (nq * D) + qh * D + c8]) = out;
   }
 #endif  // MK_ATTN_PIPE
 }

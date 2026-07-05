@@ -347,7 +347,10 @@ def _access_sets(op, args):
     if op == OP_CE_BWD:
         return [1, 2, 3], [0]
     if op in (OP_ATTN_FWD, OP_ATTN_FWD_WG):
-        return [0], [1, 2]
+        # banded WG fwd chunks (12-arg form) write flash-decoding partials at
+        # 9..11 instead of O/LSE; keeping 1/2 marked written is conservative-safe
+        # (per-band slots make it non-serializing)
+        return [0], ([1, 2, 9, 10, 11] if len(args) > 9 else [1, 2])
     if op == OP_ATTN_DPRE:
         return [0, 1], [2]
     if op in (OP_ATTN_DKV, OP_ATTN_DQ, OP_ATTN_DKV_WG, OP_ATTN_DQ_WG):
@@ -452,6 +455,8 @@ def _producer_row_info(op, ntiles, args, root, root_of):
         return None
     if op == OP_ATTN_FWD_WG:  # same qt-outer order, 128-row tiles: band = nq
         S, nq = args[3], args[4]
+        if len(args) > 8 and args[8]:  # banded chunk: not row-linear over full S
+            return None
         if root_of(args[1]) == root and S % REGION_ROWS == 0:
             return S, nq * (REGION_ROWS // 128)
         return None
@@ -483,6 +488,8 @@ def _consumer_gate_k(op, ntiles, args, pos, prod_rows):
     if op == OP_ATTN_FWD_WG and pos == 0:
         # qt-outer + causal, 128-row tiles: tile t needs qkvr rows < (t/nq + 1)*128
         S, nq = args[3], args[4]
+        if len(args) > 8 and args[8]:  # banded chunk: tile->row prefix mapping differs
+            return None
         if S == prod_rows and S % REGION_ROWS == 0:
             return nq * (REGION_ROWS // 128)
         return None

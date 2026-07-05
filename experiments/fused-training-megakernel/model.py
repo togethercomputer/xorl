@@ -33,6 +33,23 @@ def rope_tables(cfg, dev):
     return freqs.cos().contiguous(), freqs.sin().contiguous()
 
 
+def attn_bands(n_qt128, stages_of, T):
+    """Contiguous 128-row-tile bands with chunk count C = ceil(stages/T).
+
+    Returns [(tile_off, width, C)]; consecutive tiles with equal C share a band.
+    Used by the attention bwd banding (promoted) and the fwd split banding.
+    """
+    out, j = [], 0
+    while j < n_qt128:
+        Cj = max(1, -(-stages_of(j) // T))
+        k = j
+        while k < n_qt128 and max(1, -(-stages_of(k) // T)) == Cj:
+            k += 1
+        out.append((j, k - j, Cj))
+        j = k
+    return out
+
+
 class MKQwen3:
     def __init__(self, cfg: Cfg, dev="cuda", seed=0):
         self.cfg = cfg
@@ -154,6 +171,19 @@ class MKQwen3:
         # per-row (max, sumexp) partials from the lm_head gemm epilogue (bit11)
         if c.V % 64 == 0:
             W["lse_parts"] = torch.empty(c.S, c.V // 64, 2, device=dev, dtype=f32)
+        # fwd split-band partials (env-only probe, MK_ATTN_FWD_BAND = target stages
+        # per chunk): straggler q-tiles run as flash-decoding kv chunks writing
+        # locally-normalized partials; a range-limited OP_ATTN_COMBINE merges them
+        self.attn_fwd_band_T = int(os.environ.get("MK_ATTN_FWD_BAND", "0"))
+        self.attn_fwd_bands = None
+        if self.attn_fwd_band_T > 0 and c.D == 64 and c.S % 128 == 0:
+            fb = attn_bands(c.S // 128, lambda i: i * 2 + 2, self.attn_fwd_band_T)
+            if max(cb for _, _, cb in fb) > 1:
+                self.attn_fwd_bands = fb
+                cmax = max(cb for _, _, cb in fb)
+                W["fopart"] = torch.empty(cmax, c.S, c.nq * c.D, device=dev, dtype=bf)
+                W["fmpart"] = torch.empty(cmax, c.nq, c.S, device=dev, dtype=f32)
+                W["flpart"] = torch.empty(cmax, c.nq, c.S, device=dev, dtype=f32)
         self.ws = W
 
         self.cos, self.sin = rope_tables(c, dev)
@@ -399,7 +429,51 @@ class MKQwen3:
                     ],
                 )
                 p.wave()
-            if wg_attn:
+            if wg_attn and self.attn_fwd_bands is not None:
+                # fwd split banding: straggler q-tiles run as C flash-decoding kv
+                # chunks writing locally-normalized partials; a range-limited
+                # combine merges each split band. C=1 bands keep the direct O/LSE
+                # epilogue. Per-band slots on O/LSE/parts keep bands and combines
+                # concurrent (row-disjoint); downstream readers register slot=None
+                # and so conflict with every writer. Longest chunks emit first.
+                for bi, (off, w, Cb) in enumerate(
+                        sorted(self.attn_fwd_bands, key=lambda e: -e[2])):
+                    if Cb == 1:
+                        p.instr(
+                            mk.OP_ATTN_FWD_WG,
+                            c.nq * w,
+                            [a("qkvr"),
+                             p.buf(A[f"oatt.{l}"], slot=f"fo{bi}"),
+                             p.buf(A[f"lse.{l}"], slot=f"fl{bi}"),
+                             c.S, c.nq, c.nkv, c.D, scale, 1 | (off << 8)],
+                        )
+                    else:
+                        p.instr(
+                            mk.OP_ATTN_FWD_WG,
+                            c.nq * w * Cb,
+                            [a("qkvr"),
+                             p.buf(A[f"oatt.{l}"], slot=f"fo{bi}"),
+                             p.buf(A[f"lse.{l}"], slot=f"fl{bi}"),
+                             c.S, c.nq, c.nkv, c.D, scale, Cb | (off << 8),
+                             p.buf(W["fopart"], slot=f"fp{bi}"),
+                             p.buf(W["fmpart"], slot=f"fp{bi}"),
+                             p.buf(W["flpart"], slot=f"fp{bi}")],
+                        )
+                for bi, (off, w, Cb) in enumerate(
+                        sorted(self.attn_fwd_bands, key=lambda e: -e[2])):
+                    if Cb > 1:
+                        p.instr(
+                            mk.OP_ATTN_COMBINE,
+                            w * 128,
+                            [p.buf(W["fopart"], slot=f"fp{bi}"),
+                             p.buf(W["fmpart"], slot=f"fp{bi}"),
+                             p.buf(W["flpart"], slot=f"fp{bi}"),
+                             p.buf(A[f"oatt.{l}"], slot=f"foc{bi}"),
+                             p.buf(A[f"lse.{l}"], slot=f"flc{bi}"),
+                             c.S, c.nq, c.D, Cb, off * 128],
+                        )
+                p.wave()
+            elif wg_attn:
                 p.instr(
                     mk.OP_ATTN_FWD_WG,
                     c.nq * (c.S // 128),
