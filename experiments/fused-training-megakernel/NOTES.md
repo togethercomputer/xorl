@@ -2311,6 +2311,24 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   noisier than the paired default-vs-old timing; use the paired A/B above for route
   attribution and this row as the current end-to-end snapshot.
 
+- Nano MLP/qkv dX n128 split-K no-go: after adding n128 split-K support for head-dX,
+  an isolated `MK_DX_N128_SPLIT=1` probe in
+  `/home/apanda/xorl-oss-dx-n128split-probe` tried the same tile shape for the remaining
+  nano `gemm_dx` fp32 workspaces. Corrected route inspection
+  (`mkv3-p4b-dx-n128split-route-corrected-20260705T1638Z.log`) showed the intended
+  changes: `512x256x1536` rows moved from 128 WMMA split-K tiles to 48/64/96/128 n128
+  tiles by target, while `512x256x512` rows bottomed out at 64 n128 tiles for targets
+  64+. Default-vs-variant parity passed for targets 48/64/96/128
+  (`mkv3-p4b-dx-n128split-parity-20260705T1640Z.log`; worst grad rel <=0.007736). The
+  first paired timing run rejected every target
+  (`mkv3-p4b-dx-n128split-step-ab-20260705T1642Z.log`): target 48 regressed +110.69us
+  median / +110.84us mean with 0/16 wins, target 64 regressed +160.30us, target 96
+  regressed +187.81us, and target 128 regressed +183.49us. A later pmon check found
+  another Claude session resident on GPU 3, so treat those timings as no-promote
+  evidence rather than final clean attribution. Keep nano MLP/qkv dX on the existing
+  WMMA split-K route unless a future clean repeat overturns this large negative result;
+  n128 split-K is only promoted for head-dX.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
