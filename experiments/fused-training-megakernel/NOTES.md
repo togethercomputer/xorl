@@ -3191,6 +3191,13 @@ Promoted-default validation
 and parity clean (`worst_grad_rel` <= 0.008040). Default `MK_SSQ_FUSE` is now
 off only for exact H256/D64/S3072; force `MK_SSQ_FUSE=1` for the old fused-SSQ
 route.
+Post-SSQ S3072 profile/score
+`mkv3-p4b-profile-score-s3072-post-ssq-637102c-20260705T2100Z.log` measured
+megakernel 2468.5us; compile+CUDAGraph+ was 1339.9us in that fresh process
+(higher than the previous 1273.2us graph+ row, so keep paired A/B as the SSQ
+delta authority). Profile total was 2488.5us (`n_instr=180`, critical path 80,
+gated 71), led by attention-dQ 516.5us, lm-head NT 223.6us, attention-fwd
+185.1us, SwiGLU-BWD 2W 139.9us, RMS dx 139.6us, and `QKNORM_ROPE_BWD` 131.4us.
 
 Post-T29 follow-up no-gos: current default `lpt` order remains best. A
 pre-combine env-only retest at `77346e2`
