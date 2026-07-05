@@ -2501,6 +2501,18 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   default-vs-old timing at -20.13us / -5.76us by construction order, combined -12.32us
   with 286/320 wins. Use `MK_SWIGLU_CACHE_SIG=0` to force the old uncached route.
 
+- Post-H256/S1024 sigmoid-cache profile/score refresh at `77603c1`: targeted
+  `Cfg(S=1024)` attribution
+  (`mkv3-p4b-profile-s1024-post-swcache1w-77603c1-20260705T1450Z.log`) measured
+  1218.9us total, 76 chain hops, 193.3us on-path wait, and 1025.6us on-path span.
+  The top H256/S1024 path totals remain op-quality bound: `ATTN_DKV_WG` 141.5us,
+  `ATTN_FWD_WG` 120.6us, MLP dX `GEMMNN 1024x256x1536.wg` 90.2us, RMS dx 76.7us,
+  qkv+qkrope `GEMMNT 1024x512x256.wg.+qkrope` 71.3us, GU/down GEMMs, lm-head,
+  QKNORM/ROPE bwd, and cached 1W `SWIGLU_BWD` 55.7us. The matching hardened benchmark
+  row (`mkv3-p4b-score-s1024-post-swcache1w-77603c1-20260705T1455Z.log`) measured
+  megakernel 1237.7us vs compile+CUDAGraph+ 778.0us (1.59x gap). No new route knob is
+  implied; this points back to attention/GEMM/RMS kernel quality and dependency length.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
