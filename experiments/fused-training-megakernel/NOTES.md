@@ -2180,6 +2180,18 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   overall +14.6us median with reciprocal winning only 1/24 pairs. Keep the exact
   division form in `SWIGLU_BWD_2W`.
 
+- Current-head small-only attention dS-FMA retest no-go: the older
+  `MK_ATTN_DS_FMA` arithmetic rewrite helped small weakly before but was rejected as an
+  S-only gate because protected H256/S1024 and nano shapes regressed. A new isolated
+  compile-flag probe in `/home/apanda/xorl-oss-attndsfma-small-probe` retested it as a
+  possible H512/S1024-only extension default. Small parity passed
+  (`mkv3-p4b-attndsfma-small-parity-20260705T1302Z.log`: 8 `ATTN_DKV_WG` and 8
+  `ATTN_DQ_WG` ops in both routes, loss delta 9.54e-07, worst grad rel 0.000001), but
+  paired timing was noise/negative (`mkv3-p4b-attndsfma-small-step-ab-20260705T1308Z.log`):
+  default-then-FMA median -0.74us, reverse construction order +4.53us, overall +2.05us
+  median / +0.49us mean with FMA winning 10/24 pairs. Do not revive the dS-FMA route
+  on the current head.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
