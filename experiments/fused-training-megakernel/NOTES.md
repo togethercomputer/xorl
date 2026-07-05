@@ -2000,6 +2000,16 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   median; the S128 and D128 entries are same-extension controls, not changed code
   paths.
 
+- Post-attention-exp2 scoreboard: `mkv3-p4b-score-both-9746ccd-20260705T0822Z.log`
+  measured nano at 926.3us megakernel vs 635.2us compile+CUDAGraph+ (1.46x gap).
+  The same both-shape run had a contaminated small megakernel row (4008.9us), so small
+  was rerun separately: `mkv3-p4b-score-small-rerun-9746ccd-20260705T0826Z.log`
+  measured 3586.4us megakernel vs 1901.5us compile+CUDAGraph+ (1.89x gap), with a
+  megakernel-only sanity rerun at 3529.8us median
+  (`mkv3-p4b-score-small-megakernel-rerun-9746ccd-20260705T0822Z.log`). Relative to
+  the post-Drow scoreboard, the committed `_aex2` default trims about 6us nano and
+  about 21us small on the standard bench path.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
