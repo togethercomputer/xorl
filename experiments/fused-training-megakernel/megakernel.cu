@@ -1010,12 +1010,15 @@ void mk_run(torch::Tensor instrs, torch::Tensor wave_start, torch::Tensor wave_t
   TORCH_CHECK(bufs.dtype() == torch::kInt64);
   const int nwaves = (int)wave_tiles.numel();
 
-  static bool smem_configured = false;
-  if (!smem_configured) {
+  // Re-configure when a larger carveout is requested (mixed-carveout processes:
+  // e.g. a 100KB default model and a 112KB D=128-attention model side by side).
+  static int smem_configured = 0;
+  if ((int)smem_bytes > smem_configured) {
     C10_CUDA_CHECK(cudaFuncSetAttribute((void*)megakernel,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         (int)smem_bytes));
-    smem_configured = true;
+    smem_configured = (int)smem_bytes;
+    g_nblocks = -1;
   }
   if (g_nblocks < 0) {
     int dev, sms, per_sm;
@@ -1052,14 +1055,15 @@ void mk_run_df(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_of
   const int n_instr = (int)(instrs.numel() / (3 + MK_MAX_ARGS));
   TORCH_CHECK(state.numel() >= 5 * (int64_t)n_instr + 8, "df state tensor too small");
 
-  static bool df_configured = false;
-  if (!df_configured) {
+  static int df_configured = 0;
+  static int df_nblocks = -1;
+  if ((int)smem_bytes > df_configured) {
     C10_CUDA_CHECK(cudaFuncSetAttribute((void*)megakernel_df,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         (int)smem_bytes));
-    df_configured = true;
+    df_configured = (int)smem_bytes;
+    df_nblocks = -1;
   }
-  static int df_nblocks = -1;
   if (df_nblocks < 0) {
     int dev, sms, per_sm;
     C10_CUDA_CHECK(cudaGetDevice(&dev));
@@ -1109,14 +1113,15 @@ void mk_run_ws(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_of
   TORCH_CHECK(state.numel() >= 3 * (int64_t)n_instr * pad + 2 * n_instr + 6 * pad,
               "ws state tensor too small for pad=", pad);
 
-  static bool ws_configured = false;
-  if (!ws_configured) {
+  static int ws_configured = 0;
+  static int ws_nblocks = -1;
+  if ((int)smem_bytes > ws_configured) {
     C10_CUDA_CHECK(cudaFuncSetAttribute((void*)megakernel_ws,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         (int)smem_bytes));
-    ws_configured = true;
+    ws_configured = (int)smem_bytes;
+    ws_nblocks = -1;
   }
-  static int ws_nblocks = -1;
   if (ws_nblocks < 0) {
     int dev, sms, per_sm;
     C10_CUDA_CHECK(cudaGetDevice(&dev));
@@ -1156,14 +1161,15 @@ void mk_run_df2(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_o
   const int n_instr = (int)(instrs.numel() / (3 + MK_MAX_ARGS));
   const int ring_cap = (int)ring_cap64;
 
-  static bool df2_configured = false;
-  if (!df2_configured) {
+  static int df2_configured = 0;
+  static int df2_nblocks = -1;
+  if ((int)smem_bytes > df2_configured) {
     C10_CUDA_CHECK(cudaFuncSetAttribute((void*)megakernel_df2,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         (int)smem_bytes));
-    df2_configured = true;
+    df2_configured = (int)smem_bytes;
+    df2_nblocks = -1;
   }
-  static int df2_nblocks = -1;
   if (df2_nblocks < 0) {
     int dev, sms, per_sm;
     C10_CUDA_CHECK(cudaGetDevice(&dev));
