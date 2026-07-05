@@ -88,6 +88,8 @@ def _cold_cap(c):
         return 0
     if c.S >= 2048:
         return 0
+    if c.L == 1 and c.H >= 1024 and c.V >= 32768:
+        return 0
     if c.H == 256 and c.S == 1024:
         return 64
     if c.S >= 1024:

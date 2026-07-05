@@ -3540,6 +3540,23 @@ executor grows a per-op big-smem page, a separate deep-GEMM kernel, or a
 warp-specialized producer/consumer variant that can amortize the page without
 changing the whole step.
 
+## v3 P4b qwen4b-l1 scheduler retune: uncap cold sinks for giant L1 shapes
+
+The operator-gap qwen4b-l1 addendum exposed an L=1 scheduling regime that the
+small-shape cold-cap rule actively hurts: with one layer, there is little later hot
+work to overlap with giant dW sinks, so cap48 leaves the enormous lm-head dW work
+unfinished at the end of the step. Env-only sweep
+`mkv3-p4b-qwen4b-coldcap-sweep-20260705T2229Z.log` on
+`Cfg(H=2560, L=1, nq=32, nkv=8, D=128, I=9728, V=151936, S=1024)` found cap0
+decisively best: cap48 29432.9us, cap0 22094.0us, cap64 23021.5us; smaller caps
+starved the sinks (cap4 215.8ms, cap8 62.9ms, cap16 41.0ms).
+
+Focused repeat `mkv3-p4b-qwen4b-coldcap-confirm-20260705T2234Z.log` confirmed both
+orders: cap48 29390.4/29438.5us, cap0 22062.3/22096.4us, cap64
+23087.2/23047.4us. Default `_cold_cap()` now returns 0 only for conservative
+single-layer giant-vocab shapes (`L==1`, `H>=1024`, `V>=32768`). Existing gauntlet
+defaults are unchanged; `MK_COLD_CAP=48` restores the old qwen4b-l1 behavior for A/B.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
