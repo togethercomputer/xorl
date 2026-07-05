@@ -77,6 +77,8 @@ _H256_D64_QKBWD_SPLIT_V_S = (3072, 4096, 8192)  # H==256/D==64: split qkrope v-b
 # H==256 uniform attention chunks (Ckv, Cq) when bands are off; other shapes use the
 # formula fallback (Ckv = 1 once nq*(S/128) >= 64 else 2, Cq = 1) at the use site.
 _H256_ATTN_CHUNKS = {512: (2, 2), 1024: (2, 2), 2048: (2, 2)}
+# non-WGMMA D=128 fallback DQ chunks; exact attention-shape gate from qwen4b-l1.
+_D128_GENERIC_DQ_C1 = {(2560, 1024, 32, 8)}  # (H, S, nq, nkv); D==128
 # dlogits @ Wlm split-K tile targets: {H: {S: target}}, 192 elsewhere.
 _HEAD_DX_TARGET = {256: {128: 32, 256: 64, 1024: 64, 512: 96, 2048: 96, 3072: 96},
                    512: {1024: 96}}
@@ -881,7 +883,14 @@ class MKQwen3:
                     p.instr(mk.OP_ATTN_DKV_WG, c.nkv * n_qt128 * G * Ckv, dkv_args() + [Ckv])
                     p.instr(mk.OP_ATTN_DQ_WG, c.nq * n_qt128 * Cq, dq_args() + [Cq])
             else:
-                Cq = 4 if n_qt >= 8 else 2
+                generic_dq_c_env = os.environ.get("MK_ATTN_DQ_C")
+                if generic_dq_c_env is None:
+                    if c.D == 128 and (c.H, c.S, c.nq, c.nkv) in _D128_GENERIC_DQ_C1:
+                        Cq = 1
+                    else:
+                        Cq = 4 if n_qt >= 8 else 2
+                else:
+                    Cq = max(1, int(generic_dq_c_env))
                 p.instr(mk.OP_ATTN_DKV, c.nkv * n_qt * G, dkv_args())
                 p.instr(mk.OP_ATTN_DQ, c.nq * n_qt * Cq, dq_args() + [Cq])
             p.wave()

@@ -3557,6 +3557,29 @@ orders: cap48 29390.4/29438.5us, cap0 22062.3/22096.4us, cap64
 single-layer giant-vocab shapes (`L==1`, `H>=1024`, `V>=32768`). Existing gauntlet
 defaults are unchanged; `MK_COLD_CAP=48` restores the old qwen4b-l1 behavior for A/B.
 
+Post-cap qwen4b-l1 profile
+`mkv3-p4b-qwen4b-profile-post-coldcap-0578594-20260705T2238Z.log` confirms the
+sink starvation was removed, but the shape is still far from the baseline: 22118.5us,
+26 chain hops, 6883.5us wait, 15235.0us span. On-path leaders are giant lm-head
+fwd/dX (`GEMMNN 1024x2560x151936.wg.splitK` 4440.0us and
+`GEMMNT 1024x151936x2560.wg` 3553.3us), then the generic D=128 attention fallback
+(`ATTN_FWD` 1813.3us, `ATTN_DQ` 1503.3us). The D=128 WGMMA/FA4-C route remains
+the real attention fix; the following is only a narrow fallback cleanup.
+
+Generic D=128 attention dQ Cq retune: the non-WGMMA path had a hardcoded `Cq=4`
+whenever `n_qt>=8`. A no-source instruction-stream sweep on the qwen4b-l1 shape
+(`mkv3-p4b-qwen4b-generic-dq-cq-sweep-20260705T2240Z.log`) found lower chunking
+better: Cq1 medians 21948.0/21935.2us, Cq2 21970.8/21975.4us, Cq3
+21996.6/22029.3us, old Cq4 22089.3/22100.9us; Cq6/8 regressed. Promoted an
+exact attention-shape default gate `(H,S,nq,nkv,D)=(2560,1024,32,8,128)` to Cq1;
+`MK_ATTN_DQ_C=4` restores the old generic fallback. Promoted A/B log
+`mkv3-p4b-qwen4b-generic-dq-c1-promoted-20260705T2243Z.log` verified route emission
+(`OP_ATTN_DQ` 1024 tiles/Cq1 default vs 4096 tiles/Cq4 forced old), identical loss,
+focused max-abs grad diffs at numerical-noise scale, and paired timing wins of
+85.1us and 94.8us old-minus-new. Full `test_model.py` passed in
+`mkv3-p4b-qwen4b-generic-dq-c1-testmodel-20260705T2244Z.log`, including the
+existing D=128 ragged fallback guard and SGD sanity.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
