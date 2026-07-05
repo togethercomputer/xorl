@@ -208,10 +208,9 @@ class MKQwen3:
         self.attn_exp2_approx_default = c.D == 64 and c.S >= 512 and c.S % 128 == 0
         self.lmhead_exp2_approx_default = c.V >= 8192 and c.V % 64 == 0 and c.S >= 256
         self.ce_bwd_exp2_approx_default = c.S >= 1024 and c.V >= 8192 and c.V % 8 == 0
-        # S8192 joined post-band (rejected pre-band +13.2us; post-band 8/8 paired
-        # runs negative, pooled median -11.2us, wins 100/128 — same flip pattern
-        # as the S8192 SwiGLU 2W gate; see the post-band knob recheck NOTES).
-        self.idle_ns_default = 32 if c.H == 256 and c.S in (3072, 4096, 8192) else 256
+        # S2048/S8192 joined post-band; the full long-S H256 bucket now wins 32ns
+        # polling after the banding/row-batching scheduling changes.
+        self.idle_ns_default = 32 if c.H == 256 and c.S in (2048, 3072, 4096, 8192) else 256
         self.attn_dkv_float2_atomic_default = c.D == 64 and c.S % 128 == 0
         self.attn_dq_float2_store_default = c.H == 256 and c.S in (3072, 4096, 8192)
         self.ext = mk.load_ext(

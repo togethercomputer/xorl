@@ -3175,8 +3175,17 @@ gated shapes were already re-tuned post-band by the concurrent sessions.
   everywhere — the TN dW gate is load-bearing post-band, strongly confirmed.
 - `MK_DW_TARGET_TILES=192`: +166.9/+167.7 (S3072) and +169.2/+172.0 (S4096),
   0/40 — the K>=2048 -> 128 dW split target likewise.
-The post-band resweep vein is now mined at the long shapes; the two S8192
-flips (cached SwiGLU 2W, idle32) were the yield.
+Follow-on S2048 idle-poll sweep (separate GPU5 lane,
+`mkv3-p4b-idle-ns-s2048-postband-20260705T1915Z.log`) found one more cheap
+scheduler flip outside the batch-2 matrix: `MK_IDLE_NS=32` beat the old S2048
+256ns default by -12.13us/-14.74us with 40/40 and 38/40 wins, parity clean
+(`worst_grad_rel` <= 0.005891). `MK_IDLE_NS=64` also won (-8.66/-13.14us) and
+128 was weaker (-4.35/-8.16us), so promote S2048 into the idle32 bucket.
+Promoted-default validation `mkv3-p4b-idle32-s2048-promote-20260705T1920Z.log`
+beat forced old 256ns by +15.04us/+11.34us old-minus-new (old wins only 1/40
+and 2/40), parity clean. The post-band resweep vein is otherwise mined at the
+long shapes; the yielded flips are cached SwiGLU 2W at S8192 plus idle32 at
+S2048/S8192.
 
 ## Honest assessment + v2 roadmap
 
