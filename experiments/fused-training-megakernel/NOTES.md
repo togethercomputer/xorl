@@ -2351,6 +2351,16 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   construction order (+8.02us median). Keep nano uncapped, small cap48, H256/S1024
   cap64, and long-S uncapped.
 
+- Current-head dW split-target resweep no-change: an env-only GPU 5 sweep rechecked
+  `MK_DW_TARGET_TILES` after the head-dX n128 promotions
+  (`mkv3-p4b-dwtarget-current-992a6a7-20260705T1730Z.log`). Nano target32 regressed
+  (+4.06us median), target96 regressed hard (+24.26us), and target48 was only
+  order-biased/neutral (-0.66us median, 7/12 wins). Small target64 and target80 showed
+  apparent wins only when built second, then reversed or went neutral when built first
+  (overall -7.20us and +0.81us medians); target128 and target160 regressed hard
+  (+60.94us and +62.88us). Keep the current split target policy:
+  `K == 1024 -> 96`, otherwise 64.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
