@@ -2766,6 +2766,32 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   S4096 +45.98us with 0/36 wins. The source probe was reverted; keep the compact
   single-loop predicate form.
 
+- Attention-dKV direct-atomic `float2` promotion: the `OP_ATTN_DKV_WG` direct-atomic
+  epilogue now atomically adds each adjacent accumulator pair as a `float2` for all
+  D=64 WGMMA attention shapes (`c.D == 64 and c.S % 128 == 0`). The env override
+  `MK_ATTN_DKV_FLOAT2_ATOMIC=0` restores the old scalar direct-atomic epilogue for A/B.
+  Initial default-off timing was strongly positive on H256/S3072 (-12.70us, 40/40
+  wins) and H256/S4096 (-25.47us, 36/36 wins), then on H256/S2048 (-16.02us, 36/36)
+  and H256/S8192 (-55.49us, 16/16) in
+  `mkv3-p4b-attndkv-float2-atomic-probe-20260705T1611Z.log` and
+  `mkv3-p4b-attndkv-float2-atomic-boundary-20260705T1616Z.log`. The short/small
+  extension `mkv3-p4b-attndkv-float2-atomic-short-20260705T1622Z.log` also supported a
+  broad gate: nano -10.48us (46/48 wins), H256/S1024 -21.33us (40/40), and H512/S1024
+  small -38.18us (32/32).
+
+- Clean promoted-default vs forced-old timing
+  `mkv3-p4b-attndkv-float2-atomic-promote-20260705T1635Z.log` confirmed the broad
+  route and printed the intended `_adkvf2` suffix only on the default path: nano
+  -5.70us (42/48 wins), H256/S1024 -7.78us (34/40), H512/S1024 small -39.86us
+  (32/32), H256/S2048 -10.26us (29/32), H256/S3072 -7.20us (26/32), H256/S4096
+  -23.44us (24/24), and H256/S8192 -47.39us (11/12). Gradient comparison
+  `mkv3-p4b-attndkv-float2-atomic-gradcheck-20260705T1645Z.log` stayed inside the
+  existing model tolerance, with worst rel 0.00610 on H256/S1024 and long shapes around
+  1e-6. Full `test_model.py` passed in
+  `mkv3-p4b-attndkv-float2-atomic-testmodel-20260705T1646Z.log`; nano's PyTorch
+  reference worst grad rel was 0.0281, below the existing 0.03 gate, and the D=128
+  ragged fallback plus executor-mode checks still passed.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

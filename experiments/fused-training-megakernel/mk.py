@@ -174,6 +174,7 @@ def load_ext(
     lmhead_exp2_approx=None,
     ce_bwd_exp2_approx=None,
     idle_ns=None,
+    attn_dkv_float2_atomic=None,
     attn_dq_float2_store=None,
 ):
     # MK_OCC2=1 builds the 256-thread executors with __launch_bounds__(256, 2):
@@ -187,6 +188,13 @@ def load_ext(
     # Direct register-layout atomics for ATTN_DKV_WG avoid staging dK/dV through smem.
     # MK_ATTN_DKV_DIRECT_ATOMIC=0 restores the old coalesced smem-drain epilogue.
     attn_dkv_direct_atomic = int(os.environ.get("MK_ATTN_DKV_DIRECT_ATOMIC", "1"))
+    # MK_ATTN_DKV_FLOAT2_ATOMIC=0 restores the scalar direct-atomic epilogue for A/B.
+    attn_dkv_float2_atomic_env = os.environ.get("MK_ATTN_DKV_FLOAT2_ATOMIC")
+    if attn_dkv_float2_atomic_env is not None:
+        attn_dkv_float2_atomic = int(attn_dkv_float2_atomic_env)
+    else:
+        attn_dkv_float2_atomic = int(bool(attn_dkv_float2_atomic))
+    attn_dkv_float2_atomic = int(bool(attn_dkv_float2_atomic and attn_dkv_direct_atomic))
     attn_dq_float2_store_env = os.environ.get("MK_ATTN_DQ_FLOAT2_STORE")
     if attn_dq_float2_store_env is not None:
         attn_dq_float2_store = int(attn_dq_float2_store_env)
@@ -234,6 +242,7 @@ def load_ext(
     return load(
         name="xorl_megakernel" + ("_occ2" if occ2 else "") + ("_wsrc" if regcopy else "")
         + ("_apipe" if attnpipe else "") + ("_adkva" if attn_dkv_direct_atomic else "")
+        + ("_adkvf2" if attn_dkv_float2_atomic else "")
         + ("_adqf2" if attn_dq_float2_store else "")
         + ("_drowst" if drow_direct_store else "")
         + ("_aflog" if attn_fast_log else "") + ("_aex2" if attn_exp2_approx else "")
@@ -258,6 +267,7 @@ def load_ext(
         + (["-DMK_WS_REGCOPY"] if regcopy else [])
         + (["-DMK_ATTN_PIPE"] if attnpipe else [])
         + (["-DMK_ATTN_DKV_DIRECT_ATOMIC"] if attn_dkv_direct_atomic else [])
+        + (["-DMK_ATTN_DKV_FLOAT2_ATOMIC"] if attn_dkv_float2_atomic else [])
         + (["-DMK_ATTN_DQ_FLOAT2_STORE"] if attn_dq_float2_store else [])
         + (["-DMK_DROW_DIRECT_STORE"] if drow_direct_store else [])
         + (["-DMK_ATTN_FAST_LOG"] if attn_fast_log else [])

@@ -698,10 +698,16 @@ __device__ void op_attn_dkv_wg(const Instr& I, int tile, void** bufs, char* smem
     for (int n8 = 0; n8 < 8; ++n8)
 #pragma unroll
       for (int i = 0; i < 2; ++i)
+#ifdef MK_ATTN_DKV_FLOAT2_ATOMIC
+        atomicAdd(reinterpret_cast<float2*>(
+                      &ws[(int64_t)(kv0wg + r0 + 8 * i) * stride + col0 + n8 * 8 + cb]),
+                  make_float2(acc[n8 * 4 + i * 2], acc[n8 * 4 + i * 2 + 1]));
+#else
 #pragma unroll
         for (int j = 0; j < 2; ++j)
           atomicAdd(&ws[(int64_t)(kv0wg + r0 + 8 * i) * stride + col0 + n8 * 8 + cb + j],
                     acc[n8 * 4 + i * 2 + j]);
+#endif
   }
 #else
   float* Cs = reinterpret_cast<float*>(smem_raw);  // [128][68] overlay (K/V/P dead)
