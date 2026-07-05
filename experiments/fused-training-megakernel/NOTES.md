@@ -1695,6 +1695,15 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   rejected `1/1` and `1/2` hard, with `2/2` weakly negative. Keep the current S128/S256
   `DKV_C=2/DQ_C=1` default.
 
+- Post-S128-cap short n128 no-go: current-head route recheck
+  (`mkv3-p4b-n128-s128-current-08e773c-20260705T0435N128.log`) kept the earlier short
+  n128 verdict. S128 default has zero n128 GEMMs; forcing `MK_WGMMA_N128=1` routed 13
+  NT GEMMs through n128 and regressed by +19.3us paired median with 1/80 wins. The
+  lm-head-only mode was noise (+0.4us, 37/80 wins), and forcing lower n128 NN thresholds
+  did not add NN n128 routes for the current flagged/split paths. S256 mode1 also
+  regressed by +21.9us with 12/60 wins. Keep short-row n128 disabled except the existing
+  lm-head route where the default gate already selects it.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
