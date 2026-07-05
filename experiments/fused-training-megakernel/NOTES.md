@@ -1647,6 +1647,13 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   H256/S1024 by +8.9us with 12/100 wins. Keep the default R2 dx path for these shapes;
   only the existing H256/S2048 R4 gate remains.
 
+- Current-head `MK_ALLHOT` scheduler-policy recheck: after nano moved to cap0, forcing
+  every instruction into the hot ready ring was still decisively negative
+  (`mkv3-p4b-allhot-current-8e66b13-20260705T0426HOT.log`). All-hot regressed nano by
+  +34.5us paired median with 1/100 wins, small by +64.7us with 1/80 wins, and
+  H256/S1024 by +28.9us with 0/100 wins. Keep the hot/cold criticality split; uncapped
+  nano cold work is not equivalent to single-ring scheduling.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
