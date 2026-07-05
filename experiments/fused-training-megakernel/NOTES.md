@@ -2740,6 +2740,22 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   comparison `mkv3-p4b-attndq-float2-store-gradcheck-20260705T1559Z.log` matched the
   old path to fp32-noise: worst grad rel was 7.61e-7 for S3072 and 1.20e-6 for S4096.
 
+- Post-attention-dQ-float2 profile/score refresh at `665d8cc`: profile
+  `mkv3-p4b-profile-long-post-dqf2-665d8cc-20260705T1602Z.log` confirms S3072/S4096
+  use both `_idle32` and `_adqf2`. S3072 measured 2608.1us total (76 hops, 203.6us
+  wait, 2404.4us span); the realized path now splits attention backward across
+  `ATTN_DQ_WG` 276.6us and `ATTN_DKV_WG` 275.0us, with attention fwd 339.8us and
+  lm-head forward 222.3us. S4096 measured 3362.9us total (76 hops, 282.1us wait,
+  3080.8us span), still led by `ATTN_DQ_WG` 916.5us, attention fwd 442.7us, RMS dx
+  251.3us, lm-head forward 223.0us, and QKNORM/ROPE bwd 180.3us. Combined score
+  `mkv3-p4b-score-long-post-dqf2-665d8cc-20260705T1603Z.log` measured S4096
+  megakernel 3300.2us vs compile+CUDAGraph+ 1586.8us (2.08x gap). Its S3072 row was
+  an outlier at 3007.4us despite the profile and paired timings, so use the clean
+  rerun `mkv3-p4b-score-s3072-post-dqf2-rerun-665d8cc-20260705T1604Z.log`: S3072
+  megakernel 2610.5us vs compile+CUDAGraph+ 1324.5us (1.97x gap). S4096 still needs a
+  real attention-DQ kernel-quality improvement; S3072's path has become more balanced
+  across attention fwd/dQ/dKV and lm-head forward.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
