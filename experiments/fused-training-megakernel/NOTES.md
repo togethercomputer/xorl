@@ -3135,6 +3135,21 @@ Lesson worth keeping: re-run the cheap env knob sweeps after every structural
 scheduling change — this flip was worth 11x the average recent promotion and
 cost two A/B runs to find.
 
+Resweep batch 1 (S8192, `mkv3-p4b-postband-resweep1-*.log` +
+`mkv3-p4b-idle32-s8192-decide-*.log`):
+- **idle32 at S8192 FLIPPED and is PROMOTED** (commit after `21e9f86`): rejected
+  pre-band (+13.2us, 1/16), post-band 8/8 paired runs negative (deltas -1.4 to
+  -15.4, pooled median -11.2us, wins 100/128). Promoted-default vs forced-256
+  validation (`mkv3-p4b-idle32-s8192-promote-20260705T191108Z.log`):
+  +14.2 (3/16 for old) / +2.3 (6/16), parity clean. `idle_ns_default` map is now
+  `{3072, 4096, 8192} -> 32`.
+- cold_cap {16, 33} at S8192: order-mixed wash (+7.4/-4.0 and +8.9/-4.0) — keep
+  uncapped.
+- head-dx target {96, 384} at S8192: neutral-to-mixed (+0.3/-2.0 and
+  +4.0/-11.9) — keep 192.
+Remaining resweep batch 2 for whoever picks it up: cold_cap + dW targets + TN
+gate + n128 modes at S3072/S4096, and the same matrix at S2048.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
