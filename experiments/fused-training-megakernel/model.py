@@ -154,7 +154,10 @@ class MKQwen3:
         self.ws = W
 
         self.cos, self.sin = rope_tables(c, dev)
-        self.swiglu_bwd_2w_default = c.H == 512 and c.S == 1024 and c.I == 1536
+        self.swiglu_bwd_2w_default = (
+            (c.H == 512 and c.S == 1024 and c.I == 1536)
+            or (c.H == 256 and c.S == 1024 and c.I == 768)
+        )
         self.drow_direct_store_default = c.D == 64 and c.S < 2048
         self.attn_exp2_approx_default = c.D == 64 and c.S >= 512 and c.S % 128 == 0
         self.lmhead_exp2_approx_default = c.V >= 8192 and c.V % 64 == 0 and c.S >= 256

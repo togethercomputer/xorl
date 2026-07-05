@@ -2513,6 +2513,20 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   megakernel 1237.7us vs compile+CUDAGraph+ 778.0us (1.59x gap). No new route knob is
   implied; this points back to attention/GEMM/RMS kernel quality and dependency length.
 
+- H256/S1024 cached SwiGLU-BWD 2W promotion: after the 1W sigmoid-cache route became
+  default for `H=256,S=1024,I=768`, an env-only check retested the existing
+  two-warps-per-row backward body with the cache enabled. Forced cached 2W vs forced
+  cached 1W (`mkv3-p4b-sw2w-cache-s1024-20260705T1456Z.log`) passed route/parity
+  (`4 fwd/0 1W/4 2W` vs `4 fwd/4 1W/0 2W`, worst grad rel 0.008834) and won both
+  construction orders: -11.39us and -4.78us, combined -7.92us with 278/320 2W wins.
+  Main promotion widens `swiglu_bwd_2w_default` only to the same H256/S1024 shape
+  already gated for sigmoid-cache. Final default-vs-forced-old validation
+  (`mkv3-p4b-sw2w-cache-s1024-promote-20260705T1505Z.log`) confirmed default route
+  `4 fwd/0 1W/4 2W`, forced-old cached 1W route, parity worst 0.007067, and
+  default-old timing -2.67us / -14.10us by construction order, combined -8.46us with
+  262/320 default wins. `MK_SWIGLU_BWD_2W=0` restores the cached 1W route for A/B;
+  nano and H256/S2048 remain off per the earlier broad and S2048 no-go evidence.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
