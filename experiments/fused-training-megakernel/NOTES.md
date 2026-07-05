@@ -1859,6 +1859,18 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   and H256/S2048 +34.30us. The temporary source route was removed; keep Drow on the
   existing m64n64 WGMMA epilogue.
 
+- Post-fast-log attention chunk resweep: current-head env sweep after `05de747`
+  (`mkv3-p4b-attn-c-resweep-05de747-20260705T0617ATTNC.log`) kept the existing small,
+  H256/S1024, and H256/S2048 defaults, but H256/S512 nano flipped from `DKV_C=3,DQ_C=2`
+  to `DKV_C=2,DQ_C=2`. Direct confirmation
+  (`mkv3-p4b-attn-c-nano-c22-confirm-05de747-20260705T0621ATTNC.log`) measured -4.72us
+  with 193/240 C22 wins. Route inspection confirmed only nano changes while small and
+  long-S retain their defaults, full default model validation passed
+  (`mkv3-p4b-attn-c-nano-c22-testmodel-20260705T0624ATTNC.log`), and post-promotion
+  default-vs-forced-old timing
+  (`mkv3-p4b-attn-c-nano-c22-default-vs-old-20260705T0625ATTNC.log`) confirmed -4.99us
+  with 195/240 default wins. `MK_ATTN_DKV_C`/`MK_ATTN_DQ_C` still force the chunk counts.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

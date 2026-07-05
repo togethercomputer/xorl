@@ -507,7 +507,8 @@ class MKQwen3:
                 # S2048/H256 is the exception after the cold-dW retune: paired dQ+dKV
                 # C=2 trims the attention-bwd critical path, while small/S4096 regress.
                 # S1024/H256 later joined the same dQ C=2 bucket after the head-dX retune.
-                # H256/S512 wants a little more q/k-v chunking after the cap48 retune.
+                # H256/S512 wants dQ chunking, but DKV moved back to C=2 after the
+                # fast-log/current-head resweep; C=3 over-splits the DKV path now.
                 # dKV otherwise wants C=1 once nq * (S/128) already exposes >=64 chunks,
                 # else C=2 keeps enough tail parallelism (nano/S1024-H256).
                 n_qt128 = c.S // 128
@@ -515,7 +516,7 @@ class MKQwen3:
                 attn_c2_s2048 = c.H == 256 and c.S == 2048
                 attn_c32_s512 = c.H == 256 and c.S == 512
                 if attn_c32_s512:
-                    default_Ckv = 3
+                    default_Ckv = 2
                 elif attn_c2_s2048:
                     default_Ckv = 2
                 else:
