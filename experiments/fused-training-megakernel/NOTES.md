@@ -2275,6 +2275,31 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   +34.90us mean with 0/24 wins, and small regressed +25.01us median / +25.10us mean
   with 1/24 wins. Do not route the fused qkv qkrope epilogue through n128.
 
+- Nano head-dX n128 split-K promotion: the m64n128 WGMMA body now supports fp32
+  split-K atomics for the explicit head-dX path. Generic `wgmma_n128_ok` still rejects
+  split-K/fp32 routes; only `dlogits @ Wlm` opts in. An isolated probe
+  `/home/apanda/xorl-oss-headdx-n128split-probe` showed target 48 is the only useful
+  n128 split point for nano: route smoke
+  (`mkv3-p4b-headdx-n128split-route-20260705T1542Z.log`) changed the nano head-dX row
+  from `[(92, 96, 168, 6)]` to target-48 `[(92, 48, 4264, 6)]`, while H512/S1024 small
+  stayed on the promoted no-atomic row `[(155, 32, 4232, None)]`. Default-vs-variant
+  parity passed for targets 48/64/96
+  (`mkv3-p4b-headdx-n128split-parity-20260705T1548Z.log`; target-48 loss delta
+  -3.81e-06, worst grad rel 0.006172). Timing selected target 48:
+  `mkv3-p4b-headdx-n128split-step-ab-20260705T1550Z.log` measured target 48 at
+  -4.04us median / -3.58us mean with 14/16 wins, target 64 neutral, and target 96
+  regressed; the stronger target-48 repeat
+  (`mkv3-p4b-headdx-n128split-target48-repeat-20260705T1555Z.log`) measured
+  -4.19us median / -3.73us mean with 30/32 wins. Promoted main route/parity passed
+  (`mkv3-p4b-headdx-n128split-promote-route-parity-20260705T1600Z.log`): nano default
+  is now `[(92, 48, 4264, 6)]`, `MK_HEAD_DX_N128_SPLIT=0` restores old
+  `[(92, 96, 168, 6)]`, and small remains unchanged. Standard `test_model.py` passed
+  (`mkv3-p4b-headdx-n128split-testmodel-20260705T1605Z.log`). Final promoted
+  default-vs-old timing confirmed -4.87us median / -4.36us mean with 27/32 wins
+  (`mkv3-p4b-headdx-n128split-default-vs-old-20260705T1610Z.log`). Use
+  `MK_HEAD_DX_N128_SPLIT=0` to force the old nano split-K route or
+  `MK_HEAD_DX_N128_SPLIT_TARGET=<tiles>` for target sweeps.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

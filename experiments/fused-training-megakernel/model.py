@@ -457,6 +457,7 @@ class MKQwen3:
         # sk=1, where a normal fp32-output WGMMA avoids one zero-fill plus atomics.
         head_dx_no_atomic_sk1_env = os.environ.get("MK_HEAD_DX_NO_ATOMIC_SK1")
         head_dx_n128_f32_env = os.environ.get("MK_HEAD_DX_N128_F32")
+        head_dx_n128_split_env = os.environ.get("MK_HEAD_DX_N128_SPLIT")
         if head_dx_n128_f32_env is None:
             head_dx_n128_f32 = c.H == 512 and c.S == 1024 and c.V % 64 == 0
         else:
@@ -465,6 +466,10 @@ class MKQwen3:
             head_dx_no_atomic_sk1 = (c.H == 256 and c.S == 2048) or head_dx_n128_f32
         else:
             head_dx_no_atomic_sk1 = bool(int(head_dx_no_atomic_sk1_env))
+        if head_dx_n128_split_env is None:
+            head_dx_n128_split = c.H == 256 and c.S == 512 and c.V % 64 == 0
+        else:
+            head_dx_n128_split = bool(int(head_dx_n128_split_env))
         if mk.wgmma_ok(c.S, c.H, c.V, 0):
             sk_head = mk.wgmma_split_k(
                 c.S, c.H, c.V, target_tiles=head_dx_target_tiles()
@@ -495,11 +500,32 @@ class MKQwen3:
         else:
             fill_zero(W["dXN_f32"])
             p.wave()
-            p.instr(
-                mk.OP_GEMM,
-                head_dx_tiles * sk_head,
-                head_dx_args + [head_dx_flags | 32, 0, sk_head],
-            )
+            if (
+                head_dx_n128_split
+                and (head_dx_flags & 128)
+                and c.S % 128 == 0
+                and c.H % 128 == 0
+                and c.V % 64 == 0
+            ):
+                n128_tiles = mk.gemm_tiles_wgmma_n128(c.S, c.H)
+                n128_target = int(
+                    os.environ.get(
+                        "MK_HEAD_DX_N128_SPLIT_TARGET",
+                        48 if c.H == 256 and c.S == 512 else head_dx_target_tiles(),
+                    )
+                )
+                sk_n128 = max(1, min(n128_target // max(n128_tiles, 1), c.V // 64))
+                p.instr(
+                    mk.OP_GEMM,
+                    n128_tiles * sk_n128,
+                    head_dx_args + [head_dx_flags | 32 | 4096, 0, sk_n128],
+                )
+            else:
+                p.instr(
+                    mk.OP_GEMM,
+                    head_dx_tiles * sk_head,
+                    head_dx_args + [head_dx_flags | 32, 0, sk_head],
+                )
         gemm(B(A["logits"]), B(A["xnf"]), B(self.grads["wlm"]), c.V, c.H, c.S, 1 | 4 | 8)
         p.wave()
         # final-norm bwd reads the split-K fp32 workspace directly (dy_f32; no CVT hop)

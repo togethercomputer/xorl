@@ -457,8 +457,9 @@ __device__ __forceinline__ void wg_mma_ktile_n128(const uint64_t (&da)[4], const
 // FLOP — the dependent chain per FLOP shortens (the one lever the register-lifetime
 // law allows). REG ~200 fits the 255 df budget; __noinline__ isolates the fat
 // accumulator frame from the dispatch switch. Supports NT/NN + residual (bit16), fp32
-// stores (bit3), and CE partials (bit11); generic routing (flags bit12) still excludes
-// split-K/acc/f32/qkrope/Drow except the explicit head-dX no-atomic route.
+// stores (bit3), fp32 split-K atomics (bits3+5), and CE partials (bit11); generic
+// routing (flags bit12) still excludes split-K/acc/f32/qkrope/Drow except explicit
+// head-dX routes.
 __device__ __noinline__ void op_gemm_wgmma_n128(const Instr& I, int tile, void** bufs, char* smem_raw) {
   namespace SG = cute::SM90::GMMA;
   const bf16* A = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
@@ -470,12 +471,19 @@ __device__ __noinline__ void op_gemm_wgmma_n128(const Instr& I, int tile, void**
   smem_raw = reinterpret_cast<char*>(
       (reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
   WgmmaSmemN128& S = *reinterpret_cast<WgmmaSmemN128*>(smem_raw);
+  const int sk = (flags & 32) ? I.args[8] : 1;
+  const int slice = tile % sk;
+  const int mn = tile / sk;
   const int n_tiles = N / 128;
-  const int m0 = (tile / n_tiles) * WG_BM;
-  const int n0 = (tile % n_tiles) * 128;
+  const int m0 = (mn / n_tiles) * WG_BM;
+  const int n0 = (mn % n_tiles) * 128;
+  const int kchunk = ((K + sk * WG_BK - 1) / (sk * WG_BK)) * WG_BK;
+  const int k_lo = slice * kchunk;
+  const int k_hi = min(K, k_lo + kchunk);
   const int tid = mk_tid();
   const int wg = tid / 128;
   const int wtid = tid % 128;
+  if (k_lo >= K) return;
 
   const bool b_t = flags & 2;  // NT: B[N,K] K-contig; NN: B[K,N] N-contig (MN slabs)
   const bool c_f32 = flags & 8;
@@ -508,10 +516,10 @@ __device__ __noinline__ void op_gemm_wgmma_n128(const Instr& I, int tile, void**
   float d[64];
 #pragma unroll
   for (int i = 0; i < 64; ++i) d[i] = 0.0f;
-  const int iters = K / WG_BK;
-  issue_stage(0, 0);
+  const int iters = (k_hi - k_lo) / WG_BK;
+  issue_stage(k_lo, 0);
   for (int t = 0; t < iters; ++t) {
-    if (t + 1 < iters) issue_stage((t + 1) * WG_BK, (t + 1) & 1);
+    if (t + 1 < iters) issue_stage(k_lo + (t + 1) * WG_BK, (t + 1) & 1);
     __pipeline_wait_prior(t + 1 < iters ? 1 : 0);
     consumer_sync();
     uint64_t da[4], db[4];
@@ -557,10 +565,15 @@ __device__ __noinline__ void op_gemm_wgmma_n128(const Instr& I, int tile, void**
     }
     if (c_f32) {
       float* C = reinterpret_cast<float*>(Cp);
-      float4 o0 = make_float4(v[0], v[1], v[2], v[3]);
-      float4 o1 = make_float4(v[4], v[5], v[6], v[7]);
-      *reinterpret_cast<float4*>(&C[idx]) = o0;
-      *reinterpret_cast<float4*>(&C[idx + 4]) = o1;
+      if (flags & 32) {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) atomicAdd(&C[idx + e], v[e]);
+      } else {
+        float4 o0 = make_float4(v[0], v[1], v[2], v[3]);
+        float4 o1 = make_float4(v[4], v[5], v[6], v[7]);
+        *reinterpret_cast<float4*>(&C[idx]) = o0;
+        *reinterpret_cast<float4*>(&C[idx + 4]) = o1;
+      }
     } else {
       bf16* C = reinterpret_cast<bf16*>(Cp);
       uint4 out;
