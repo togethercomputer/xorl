@@ -1716,17 +1716,20 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   each with 160/160 new-path wins. This does not shorten `prog.run()` profiles; it
   removes prelaunch work from the user-visible step path and the final scoreboard.
 
-End-of-session certified gauntlet (df defaults, clean-GPU util guards,
-median-of-50, fresh process per config; baseline medians wobble +-5-8% across
-runs from inductor autotune variance):
+Post-inv_valid focused scoreboard (df defaults, median-of-50, fresh process per config;
+GPU 5 had no visible pmon process but retained an opaque allocation; baseline medians
+wobble +-5-8% across runs from inductor autotune variance). Logs:
+`mkv3-p4b-score-nano-invvalid-d375129-20260705T0445SCORE.log`,
+`mkv3-p4b-score-small-invvalid-d375129-20260705T0446SCORE.log`, and
+`mkv3-p4b-score-{s128,s256,s1024,deep}-invvalid-d375129-20260705T0447SCORE.log`.
 | config | megakernel | flash-baseline | gap |
 |---|---|---|---|
-| nano | 1026 | 631 | 1.63x |
-| small | 3714 | 1899 | 1.96x |
-| deep-L12 | 2522 | 1765 | 1.43x |
-| S=128 | 867 | 485 | 1.79x |
-| S=256 | 935 | 560 | 1.67x |
-| S=1024 | 1332 | 778 | 1.71x |
+| nano | 964 | 629 | 1.53x |
+| small | 3668 | 1899 | 1.93x |
+| deep-L12 | 2478 | 1789 | 1.39x |
+| S=128 | 774 | 492 | 1.57x |
+| S=256 | 844 | 549 | 1.54x |
+| S=1024 | 1254 | 778 | 1.61x |
 (Morning honest reset: nano 1.97x / small 2.52x.)
 
 ## Honest assessment + v2 roadmap
