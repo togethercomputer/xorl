@@ -1983,6 +1983,23 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   16us nano and 31us small while the hardened graph baseline moved within normal
   compile-run variance.
 
+- WGMMA attention `exp2.approx` promotion: `MK_ATTN_EXP2_APPROX=1` swaps WGMMA
+  attention's exp calls to `ex2.approx.ftz.f32` with a log2(e) scale. Focused opcode
+  validation passed full `test_ops.py`, including WGMMA attention forward/backward
+  (`mkv3-p4b-aex2-testops-20260705T0757Z.log`), forced-on model parity passed
+  (`mkv3-p4b-aex2-testmodel-20260705T0757Z.log`), and the final gated default model
+  test passed (`mkv3-p4b-aex2-gated-default-testmodel-20260705T0819Z.log`). The first
+  default gate covered all D=64 WGMMA attention shapes, but short-S timing was not
+  robust enough (S128 regressed, S256 was neutral), so the promoted default is D=64,
+  S>=512, and S%128==0. Route checks confirmed S128/S256 and D128 keep the old
+  extension by default, while nano/S512, small/S1024, and H256/S2048 use `_aex2`;
+  `MK_ATTN_EXP2_APPROX=0/1` remains an explicit A/B override
+  (`mkv3-p4b-aex2-gated-route-20260705T0811Z.log`). Final gated default-vs-old timing
+  (`mkv3-p4b-aex2-gated-default-vs-old-20260705T0819Z.log`) measured nano/S512
+  -4.93us, small/H512/S1024 -37.70us, H256/S1024 -16.83us, and H256/S2048 -20.10us
+  median; the S128 and D128 entries are same-extension controls, not changed code
+  paths.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

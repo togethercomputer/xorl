@@ -46,6 +46,16 @@ __device__ __forceinline__ float wga_lse_log(float x) {
 #endif
 }
 
+__device__ __forceinline__ float wga_exp(float x) {
+#ifdef MK_ATTN_EXP2_APPROX
+  float y;
+  asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x * 1.4426950408889634f));
+  return y;
+#else
+  return __expf(x);
+#endif
+}
+
 // Loader lane mapping (v3 P4b): off64's bank quad depends only on r&7, so the old
 // v -> (r = v/8, c8 = v%8*8) assignment put each 8-lane store phase on ONE row =
 // one bank quad = 8-way conflict (the same pathology SW128 fixed in the gemm; here
@@ -264,7 +274,7 @@ __device__ void op_attn_fwd_wg_pipe(const Instr& I, int tile, void** bufs,
       rmax[i] = fmaxf(rmax[i], __shfl_xor_sync(0xffffffffu, rmax[i], 1));
       rmax[i] = fmaxf(rmax[i], __shfl_xor_sync(0xffffffffu, rmax[i], 2));
       const float mnew = fmaxf(m[i], rmax[i]);
-      a_out[i] = __expf(m[i] - mnew);
+      a_out[i] = wga_exp(m[i] - mnew);
       m[i] = mnew;
     }
     float rsum[2] = {0.0f, 0.0f};
@@ -273,8 +283,8 @@ __device__ void op_attn_fwd_wg_pipe(const Instr& I, int tile, void** bufs,
 #pragma unroll
       for (int n8 = 0; n8 < 8; ++n8) {
         const int idx = n8 * 4 + i * 2;
-        const float p0 = __expf(sv[idx] - m[i]);
-        const float p1 = __expf(sv[idx + 1] - m[i]);
+        const float p0 = wga_exp(sv[idx] - m[i]);
+        const float p1 = wga_exp(sv[idx + 1] - m[i]);
         rsum[i] += p0 + p1;
         __nv_bfloat162 pv;
         pv.x = f2bf(p0);
@@ -459,7 +469,7 @@ __device__ void op_attn_fwd_wg(const Instr& I, int tile, void** bufs, char* smem
         rmax[i] = fmaxf(rmax[i], __shfl_xor_sync(0xffffffffu, rmax[i], 1));
         rmax[i] = fmaxf(rmax[i], __shfl_xor_sync(0xffffffffu, rmax[i], 2));
         const float mnew = fmaxf(m[i], rmax[i]);
-        alpha[i] = __expf(m[i] - mnew);  // m=-inf only at stage 0, where mnew is finite
+        alpha[i] = wga_exp(m[i] - mnew);  // m=-inf only at stage 0, where mnew is finite
         m[i] = mnew;
       }
       float rsum[2] = {0.0f, 0.0f};
@@ -468,8 +478,8 @@ __device__ void op_attn_fwd_wg(const Instr& I, int tile, void** bufs, char* smem
 #pragma unroll
         for (int n8 = 0; n8 < 8; ++n8) {
           const int idx = n8 * 4 + i * 2;
-          const float p0 = __expf(s[idx] - m[i]);  // masked: exp(-inf)=0
-          const float p1 = __expf(s[idx + 1] - m[i]);
+          const float p0 = wga_exp(s[idx] - m[i]);  // masked: exp(-inf)=0
+          const float p1 = wga_exp(s[idx + 1] - m[i]);
           rsum[i] += p0 + p1;
           __nv_bfloat162 pv;
           pv.x = f2bf(p0);
@@ -640,8 +650,8 @@ __device__ void op_attn_dkv_wg(const Instr& I, int tile, void** bufs, char* smem
         for (int n8 = 0; n8 < 8; ++n8) {
           const int idx = n8 * 4 + i * 2;
           const int kr = kv0wg + n8 * 8 + cb;
-          float p0 = __expf(s[idx] * scale - lse);
-          float p1 = __expf(s[idx + 1] * scale - lse);
+          float p0 = wga_exp(s[idx] * scale - lse);
+          float p1 = wga_exp(s[idx + 1] * scale - lse);
           if (masked && kr > qr) p0 = 0.0f;
           if (masked && kr + 1 > qr) p1 = 0.0f;
           __nv_bfloat162 pv;
@@ -827,8 +837,8 @@ __device__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs, char* smem_
         for (int n8 = 0; n8 < 8; ++n8) {
           const int idx = n8 * 4 + i * 2;
           const int kr = k0 + n8 * 8 + cb;
-          float p0 = __expf(s[idx] * scale - lse[i]);
-          float p1 = __expf(s[idx + 1] * scale - lse[i]);
+          float p0 = wga_exp(s[idx] * scale - lse[i]);
+          float p1 = wga_exp(s[idx + 1] * scale - lse[i]);
           if (masked && kr > qr[i]) p0 = 0.0f;
           if (masked && kr + 1 > qr[i]) p1 = 0.0f;
           __nv_bfloat162 pv;

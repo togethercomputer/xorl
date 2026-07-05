@@ -139,9 +139,11 @@ class MKQwen3:
         self.cos, self.sin = rope_tables(c, dev)
         self.swiglu_bwd_2w_default = c.H == 512 and c.S == 1024 and c.I == 1536
         self.drow_direct_store_default = c.D == 64 and c.S < 2048
+        self.attn_exp2_approx_default = c.D == 64 and c.S >= 512 and c.S % 128 == 0
         self.ext = mk.load_ext(
             swiglu_bwd_2w=self.swiglu_bwd_2w_default,
             drow_direct_store=self.drow_direct_store_default,
+            attn_exp2_approx=self.attn_exp2_approx_default,
         )
         self.in_kernel_inv_valid = bool(int(os.environ.get("MK_INV_VALID_IN_KERNEL", "1")))
         self.bind_inputs = bool(int(os.environ.get("MK_BIND_INPUTS", "1")))

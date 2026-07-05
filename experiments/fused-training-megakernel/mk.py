@@ -164,7 +164,7 @@ MAX_ARGS = 23
 INSTR_INTS = 3 + MAX_ARGS  # op, tile_off, ntiles, args[23]
 
 
-def load_ext(verbose=False, swiglu_bwd_2w=None, drow_direct_store=None):
+def load_ext(verbose=False, swiglu_bwd_2w=None, drow_direct_store=None, attn_exp2_approx=None):
     # MK_OCC2=1 builds the 256-thread executors with __launch_bounds__(256, 2):
     # 2 blocks/SM (128-reg ceiling, ptxas spills the fat op paths). Motivated by the
     # P4b nsys counters — in-kernel SM issue 19%, warps-in-flight 12%, DRAM <10%:
@@ -183,6 +183,11 @@ def load_ext(verbose=False, swiglu_bwd_2w=None, drow_direct_store=None):
         drow_direct_store = int(bool(drow_direct_store))
     # MK_ATTN_FAST_LOG=0 restores precise logf for WGMMA fwd LSE.
     attn_fast_log = int(os.environ.get("MK_ATTN_FAST_LOG", "1"))
+    attn_exp2_approx_env = os.environ.get("MK_ATTN_EXP2_APPROX")
+    if attn_exp2_approx_env is not None:
+        attn_exp2_approx = int(attn_exp2_approx_env)
+    else:
+        attn_exp2_approx = int(bool(attn_exp2_approx))
     # D=64 qknorm-bwd fast path; MK_QKBWD_D64_CACHE=0 keeps the old generic loop for
     # A/B and bisects. Separate extension name because torch's cache is name-keyed.
     qkbc = int(os.environ.get("MK_QKBWD_D64_CACHE", "1"))
@@ -200,7 +205,8 @@ def load_ext(verbose=False, swiglu_bwd_2w=None, drow_direct_store=None):
         name="xorl_megakernel" + ("_occ2" if occ2 else "") + ("_wsrc" if regcopy else "")
         + ("_apipe" if attnpipe else "") + ("_adkva" if attn_dkv_direct_atomic else "")
         + ("_drowst" if drow_direct_store else "")
-        + ("_aflog" if attn_fast_log else "") + ("_qkbc" if qkbc else "")
+        + ("_aflog" if attn_fast_log else "") + ("_aex2" if attn_exp2_approx else "")
+        + ("_qkbc" if qkbc else "")
         + ("_swfma" if swiglu_fma_deriv else "") + ("_swb2w" if swiglu_bwd_2w else ""),
         sources=[os.path.join(_DIR, "megakernel.cu")],
         extra_cuda_cflags=[
@@ -219,6 +225,7 @@ def load_ext(verbose=False, swiglu_bwd_2w=None, drow_direct_store=None):
         + (["-DMK_ATTN_DKV_DIRECT_ATOMIC"] if attn_dkv_direct_atomic else [])
         + (["-DMK_DROW_DIRECT_STORE"] if drow_direct_store else [])
         + (["-DMK_ATTN_FAST_LOG"] if attn_fast_log else [])
+        + (["-DMK_ATTN_EXP2_APPROX"] if attn_exp2_approx else [])
         + (["-DMK_QKBWD_D64_CACHE"] if qkbc else [])
         + (["-DMK_SWIGLU_FMA_DERIV"] if swiglu_fma_deriv else [])
         + (["-DMK_SWIGLU_BWD_2W"] if swiglu_bwd_2w else []),
