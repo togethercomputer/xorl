@@ -2948,12 +2948,23 @@ shape, GPU 6, guards clean; `mkv3-p4b-score-long-post-band-20260705T173446Z.log`
 | S4096 | 3206.0 | 1589.1 | **2.02x** | 2.08-2.13x |
 | S8192 | 7782.2 | 3044.8 | **2.56x** | 2.63-2.69x |
 
+Short-S banding is a measured NO-GO (env-only sweep on the merged tree, both
+construction orders, all parity-clean;
+`mkv3-p4b-attn-band-short-sweep-20260705T173930Z.log` and
+`mkv3-p4b-attn-band-s512-t4-20260705T174635Z.log`): S1024 T=8 is neutral
+(-0.2us 21/40, then +4.5us 12/40), S512 T=4 is negative (+15.2us 2/40, +4.1us
+9/40), and the degenerate T>=8 points at S512 / T=16 at S1024 collapse to
+uniform C=1 and lose outright (+22 to +70us, ~0/40). Banding pays only where
+the straggler chain is long (>= 32 stages, i.e. S >= 2048); below that the
+extra fills/atomics have nothing to amortize against. Keep the short-S uniform
+C defaults. Re-run knobs: `results/attn_band_model_ab_main.py <S> <T> <order>`
+with `MK_ATTN_BAND` env override.
+
 Follow-on candidates this opens (unclaimed): (a) ATTN_FWD_WG banding — fwd is
 also straggler-bound (64st x 1.5us of its 111.8us at S4096) but needs the
 split+combine (opart/mpart/lpart) machinery ported to the WG path; (b) a
 tile-budgeted band chooser (split-to-budget instead of ceil(stages/T)) to
-recover the standalone dq wave-quantization loss at S4096; (c) revisiting the
-S512/S1024 uniform-C defaults as bands (short-S T sweep not measured).
+recover the standalone dq wave-quantization loss at S4096.
 
 ## Honest assessment + v2 roadmap
 
