@@ -489,7 +489,7 @@ class MKQwen3:
         else:
             head_dx_n128_f32 = bool(int(head_dx_n128_f32_env))
         if head_dx_no_atomic_sk1_env is None:
-            head_dx_no_atomic_sk1 = (c.H == 256 and c.S == 2048) or head_dx_n128_f32
+            head_dx_no_atomic_sk1 = (c.H == 256 and c.S >= 2048) or head_dx_n128_f32
         else:
             head_dx_no_atomic_sk1 = bool(int(head_dx_no_atomic_sk1_env))
         if head_dx_n128_split_env is None:

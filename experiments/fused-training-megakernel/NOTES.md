@@ -2669,6 +2669,20 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   chunk/RMS/source-batching knobs just rechecked for S2048/S4096 do not change this
   route map.
 
+- H256/S>=3072 head-dX `sk=1` no-atomic promotion: the S3072 profile exposed a
+  head-dX row with split count one still paying the split-K zero-fill and fp32 atomic
+  route. Env-only probe `mkv3-p4b-headdx-sk1-long-current-20260705T1530Z.log` moved
+  H256/S3072 and H256/S4096 from `(flags 168, sk=1)` to the existing no-zero/no-atomic
+  route `(flags 136, sk=None)`, passed parity, and improved S3072 by -7.39us
+  (75/96 wins) and S4096 by -9.47us (71/80 wins). Boundary probe
+  `mkv3-p4b-headdx-sk1-s8192-current-20260705T1530Z.log` also passed parity and
+  improved S8192 by -21.92us (37/40 wins). After widening the default from H256/S2048
+  to H256/S>=2048, clean promoted-default vs forced-old validation
+  `mkv3-p4b-headdx-sk1-long-promote-20260705T1531Z.log` passed with worst grad rel
+  <= 0.000001 and measured S3072 -6.48us (66/96 wins), S4096 -10.38us (74/80 wins),
+  and S8192 -16.22us (33/40 wins). Keep the gate tied to `sk_head==1`; force the old
+  split-K/atomic route with `MK_HEAD_DX_NO_ATOMIC_SK1=0`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
