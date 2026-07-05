@@ -3279,6 +3279,12 @@ absolutes — delta +286.7 corroborates but is flagged), `_NN=0` +96.4/+71.6
 (<=1/16). GPU-2 lane note: that GPU reads 1.6-1.8x-high absolutes under
 clean-looking guards (invisible out-of-container tenant) — do not time there.
 
+Combine-R sweep (session 2853e0de, `mkv3-p4b-combine-r-sweep-*.log`): the R=8
+default (promoted vs R=1 only) is CONFIRMED against its neighbors. R=4 loses
+(S4096 +5.4/+8.0 with <=9/40; S8192 +15.7/+0.6), R=16 is order-mixed neutral
+(S4096 -2.5/-0.2 at 31/40 and 24/40; S8192 +4.3/-10.8) — under the promotion
+bar; keep `MK_ATTN_COMBINE_R=8`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
