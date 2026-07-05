@@ -3150,6 +3150,13 @@ Promoted-default validation
 old `MK_QKBWD_SPLIT_V=0` by +28.61us/+17.62us old-minus-new, with old wins 8/40
 and 3/40 and parity clean (`worst_grad_rel` <= 0.005769). Default
 `MK_QKBWD_SPLIT_V` now covers exact H256/D64/S4096 and S8192 only.
+Post-promotion S4096 profile/score
+`mkv3-p4b-profile-score-s4096-post-qkbv-63f4f11-20260705T2038Z.log` measured
+megakernel 3126.1us vs compile+CUDAGraph+ 1585.0us (1.97x gap). Profile total
+was 3133.1us (`n_instr=188`, critical path 80, gated 63); on-path leaders are
+attention-dQ 762.6us, attention-fwd 303.9us, RMS dx 252.4us, lm-head NT 225.2us,
+SwiGLU-BWD 2W 172.6us, and `QKNORM_ROPE_BWD` 162.4us. The split-V target is now
+below the attention and RMS/lm-head bottlenecks at S4096.
 
 Post-T29 follow-up no-gos: current default `lpt` order remains best. A
 pre-combine env-only retest at `77346e2`
