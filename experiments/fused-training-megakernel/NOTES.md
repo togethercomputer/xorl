@@ -2938,6 +2938,16 @@ shape still wins -80us). Logs: `mkv3-p4b-attn-band-probe-20260705T170354Z.log`,
 results/ (repro: `results/attn_band_probe.py <S> <T>`,
 `results/attn_band_model_ab.py <S> <T|0> <order>`).
 
+Post-merge long-S scoreboard at `1b4e194` (hardened bench_cfg, fresh process per
+shape, GPU 6, guards clean; `mkv3-p4b-score-long-post-band-20260705T173446Z.log`):
+
+| shape | megakernel | compile+CUDAGraph+ | gap | pre-band gap |
+|---|---:|---:|---:|---:|
+| S2048 | 1843.9 | 1043.3 | **1.77x** | 1.83x |
+| S3072 | 2526.9 | 1336.1 | **1.89x** | 1.97x |
+| S4096 | 3206.0 | 1589.1 | **2.02x** | 2.08-2.13x |
+| S8192 | 7782.2 | 3044.8 | **2.56x** | 2.63-2.69x |
+
 Follow-on candidates this opens (unclaimed): (a) ATTN_FWD_WG banding — fwd is
 also straggler-bound (64st x 1.5us of its 111.8us at S4096) but needs the
 split+combine (opart/mpart/lpart) machinery ported to the WG path; (b) a
