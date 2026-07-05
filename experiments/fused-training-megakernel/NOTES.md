@@ -2143,6 +2143,25 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   default-vs-old CE-BWD timing attributed roughly 30-35us of small-step savings to the
   `_ceb2` route; the scoreboard sees the same improvement class.
 
+- Current-head TN-WGMMA dW gate broadening: the earlier long-S-only TN gate became
+  stale after the late n128/lm-head/CE-BWD route changes. A small route resweep
+  (`mkv3-p4b-small-route-resweep-3994aa1-20260705T1150Z.log`) rejected nearby attention
+  chunk, head-dX, dW-target, and n128 changes, but forced `MK_WGMMA_TN=1` routed 33
+  H512/S1024 dW instructions and beat the default by -95.7us/-70.7us across
+  construction orders. The follow-up guard
+  (`mkv3-p4b-tnwg-current-guard-3994aa1-20260705T1155Z.log`) passed default-vs-forced-TN
+  parity for nano, H256/S1024, and small, then set the new boundary: forced TN regressed
+  S128 (+4.6/+34.3us), S256 (+44.0/+38.5us), nano (+40.4/+43.2us), and H256/S1024
+  (+40.4/+55.7us), but won H512/S1024 small (-128.2/-56.6us) and H256/S2048
+  (-61.5/-32.4us). The default gate is now `K >= 2048` plus the H512-style K=1024 dW
+  shapes with `min(M, N) >= 512`; `MK_WGMMA_TN=0/1` still force-disables/enables it for
+  A/B. Route check (`mkv3-p4b-tnwg-gated-route-20260705T1202Z.log`) confirmed S128,
+  S256, nano, and H256/S1024 keep zero TN routes by default while small, H256/S2048,
+  and H256/S3072 route TN. Final default-vs-forced-old validation
+  (`mkv3-p4b-tnwg-gated-default-vs-old-20260705T1205Z.log`) passed small and
+  H256/S2048 gradient parity, then measured default-minus-old at -77.4us/-87.4us for
+  small and -28.6us/-63.7us for H256/S2048 across construction orders.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

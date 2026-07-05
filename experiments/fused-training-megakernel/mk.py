@@ -74,12 +74,13 @@ def wgmma_ok(M, N, K, flags):
     if M % 128 or N % 64 or K % 64:
         return False
     if flags & 1:  # TN (dW split-K pattern): short-S sinks still prefer WMMA, but
-        # after the cold dW split-target retune, long-S has enough K to amortize the
-        # WGMMA route and reduce total step time. MK_WGMMA_TN force-overrides this gate.
+        # after the later route retunes, S2048+ has enough K to amortize the WGMMA route.
+        # H512/S1024 also wins because its K=1024 dW shapes have no skinny 256-wide side;
+        # keep H256/S1024 and shorter shapes on WMMA. MK_WGMMA_TN force-overrides this gate.
         tn_env = os.environ.get("MK_WGMMA_TN")
         if tn_env is not None:
             return bool(int(tn_env))
-        return K >= 3072
+        return K >= 2048 or (K == 1024 and min(M, N) >= 512)
     if not (flags & 2):  # NN (dX pattern): tile-gated
         if not int(os.environ.get("MK_WGMMA_NN", "1")):
             return False
