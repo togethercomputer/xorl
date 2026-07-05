@@ -62,10 +62,10 @@ def wgmma_ok(M, N, K, flags):
     in-model twice (round 3, P6) and only NT routed. The SW128 layout (P4b) doubled
     the wgmma path's throughput (probe: pipe_probe.py) and flipped NN decisively at
     small (-285us); occupancy — not majors — is now the binding constraint, so NN
-    routes when the instr exposes enough 128x64 tiles (MK_WGMMA_NN_MIN, default 64;
-    nano's 16-48-tile dX gemms stay WMMA/split-K: measured +30us if routed). TN (dW,
-    fp32 split-K) routes via MK_WGMMA_TN. bit10 (Drow epilogue) is implemented on
-    both paths and falls under the NN tile gate like its siblings."""
+    routes when the instr exposes enough 128x64 tiles (MK_WGMMA_NN_MIN override; default
+    16 for M=512 nano NN gemms after the later route retunes, 64 elsewhere). TN (dW,
+    fp32 split-K) routes via MK_WGMMA_TN. bit10 (Drow epilogue) is implemented on both
+    paths and falls under the NN tile gate like its siblings."""
     if flags & 32:
         return False
     if M % 128 or N % 64 or K % 64:
@@ -80,7 +80,9 @@ def wgmma_ok(M, N, K, flags):
     if not (flags & 2):  # NN (dX pattern): tile-gated
         if not int(os.environ.get("MK_WGMMA_NN", "1")):
             return False
-        return gemm_tiles_wgmma(M, N) >= int(os.environ.get("MK_WGMMA_NN_MIN", "64"))
+        nn_min_env = os.environ.get("MK_WGMMA_NN_MIN")
+        nn_min = int(nn_min_env) if nn_min_env is not None else (16 if M == 512 else 64)
+        return gemm_tiles_wgmma(M, N) >= nn_min
     return True  # NT
 
 

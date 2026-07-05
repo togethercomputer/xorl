@@ -1197,6 +1197,22 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   forced-old timing (`mkv3-p4b-small-rmsdx-r4-default-ab-clean-20260705T005339Z.log`)
   measured combined paired median -5.23us with 310/440 wins.
 
+- Nano NN WGMMA threshold gate: the older "nano dX WGMMA loses" result became stale after
+  the qknorm/head-dX/RMS route retunes. Current route check with `MK_WGMMA_NN_MIN=16`
+  sends nano's M=512 NN shapes `(512,256,256)`, `(512,768,256)`, and split-K head-dX
+  `(512,256,8192)` through WGMMA while leaving the split-K `(512,256,512)` path WMMA.
+  Paired confirmation
+  (`mkv3-p4b-nano-nnmin16-confirm-post-33646d6-20260705T005643Z.log`) measured combined
+  paired median -18.59us with 435/480 wins. Broad paired check
+  (`mkv3-p4b-nnmin16-broad-paired-post-33646d6-20260705T005710Z.log`) kept small and
+  long shapes neutral/noise-level, so the default threshold is now 16 only for M=512 NN
+  gemms and remains 64 elsewhere; `MK_WGMMA_NN_MIN=64` restores the old nano route.
+  Patched route guard and full model parity passed
+  (`mkv3-p4b-nano-nnmin16-route-20260705T005841Z.log`,
+  `mkv3-p4b-nano-nnmin16-testmodel-20260705T005850Z.log`). Patched default vs forced
+  old timing (`mkv3-p4b-nano-nnmin16-default-ab-clean-20260705T005906Z.log`) measured
+  combined paired median -19.76us with 479/480 wins.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
