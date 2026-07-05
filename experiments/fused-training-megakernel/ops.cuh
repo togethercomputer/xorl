@@ -1664,7 +1664,7 @@ __device__ void op_qknorm_rope_fwd(const Instr& I, int tile, void** bufs, char* 
 // rope bwd = rotate by -theta; then per-head rmsnorm bwd (dw via fp32 atomics).
 // v grads pass through. Writes dqkv_raw (bf16), OVERWRITING (not accumulating).
 // args: {qkv_raw, dqkv_r, dqkv_raw, qw, kw, dqw, dkw, rstd_q, rstd_k, cos, sin, nq, nkv, D,
-//        dy_f32, S}
+//        dy_f32, S, split_v}
 // tile = MK_ROW_R-row group; warp w sweeps (head, row) tasks h = w mod nh (weight-vector
 // locality). Per-tile dqw/dkw partials accumulate in smem (fast atomics), then ONE global
 // atomicAdd per element per MK_ROW_R rows — the smem zero/flush and its two barriers are
@@ -1674,7 +1674,8 @@ __device__ void op_qknorm_rope_bwd(const Instr& I, int tile, void** bufs, char* 
   const int nq = I.args[11], nkv = I.args[12], D = I.args[13];
   const bool dy_f32 = I.args[14] != 0;
   const int S = I.args[15];
-  const int stride = (nq + 2 * nkv) * D, nh = nq + 2 * nkv;
+  const bool split_v = I.args[16] != 0;
+  const int stride = (nq + 2 * nkv) * D, nh = nq + (split_v ? nkv : 2 * nkv);
   const int warp = mk_tid() / 32, lane = mk_tid() % 32, nwarp = MK_CONSUMERS / 32;
 
   float* dwq_s = reinterpret_cast<float*>(smem_raw);  // [D] + [D] fp32 partials
@@ -1761,6 +1762,39 @@ __device__ void op_qknorm_rope_bwd(const Instr& I, int tile, void** bufs, char* 
   for (int i = mk_tid(); i < D; i += MK_CONSUMERS) {
     atomicAdd(&dqw[i], dwq_s[i]);
     atomicAdd(&dkw[i], dwk_s[i]);
+  }
+}
+
+// V heads do not need qk-norm or rope backward; they only convert the attention-bwd
+// fp32 workspace into the packed bf16 qkv_raw gradient consumed by the next GEMM.
+// args: {dqkv_f32, dqkv_raw, nq, nkv, D, S}; tile = MK_ROW_R rows.
+__device__ void op_qkv_v_bwd(const Instr& I, int tile, void** bufs) {
+  const int nq = I.args[2], nkv = I.args[3], D = I.args[4], S = I.args[5];
+  const int stride = (nq + 2 * nkv) * D;
+  const int rows0 = tile * MK_ROW_R;
+  const int cols = nkv * D;
+  const float* src = reinterpret_cast<const float*>(bufs[I.args[0]]);
+  bf16* dst = reinterpret_cast<bf16*>(bufs[I.args[1]]);
+  const int total = min(MK_ROW_R, max(0, S - rows0)) * cols;
+  const int v_off = (nq + nkv) * D;
+  for (int i = mk_tid() * 8; i < total; i += MK_CONSUMERS * 8) {
+    const int rr = i / cols;
+    const int cc = i - rr * cols;
+    float f[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int c = cc + j;
+      f[j] = c < cols ? src[(int64_t)(rows0 + rr) * stride + v_off + c] : 0.0f;
+    }
+    if (cc + 7 < cols) {
+      st8bf(dst + (int64_t)(rows0 + rr) * stride + v_off + cc, f);
+    } else {
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int c = cc + j;
+        if (c < cols) dst[(int64_t)(rows0 + rr) * stride + v_off + c] = f2bf(f[j]);
+      }
+    }
   }
 }
 

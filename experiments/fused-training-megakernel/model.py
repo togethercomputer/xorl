@@ -313,6 +313,11 @@ class MKQwen3:
         else:
             swiglu_bwd_2w = bool(int(swiglu_bwd_2w_env))
         swiglu_cache_sig = self.swiglu_cache_sig_enabled
+        qkbwd_split_v_env = os.environ.get("MK_QKBWD_SPLIT_V")
+        if qkbwd_split_v_env is None:
+            qkbwd_split_v = c.H == 256 and c.D == 64 and c.S == 8192
+        else:
+            qkbwd_split_v = bool(int(qkbwd_split_v_env))
 
         def head_dx_target_tiles():
             env = os.environ.get("MK_HEAD_DX_TARGET_TILES")
@@ -834,13 +839,27 @@ class MKQwen3:
             p.wave()
             # qk-norm+rope bwd reads the attention-bwd fp32 atomic workspace DIRECTLY
             # (dy_f32) — the former per-layer CVT chain hop is gone (v3 P1).
+            qkvraw_bwd = p.buf(W["dQKVraw"], slot="qk") if qkbwd_split_v else B(W["dQKVraw"])
+            if qkbwd_split_v:
+                p.instr(
+                    mk.OP_QKV_V_BWD,
+                    mk.rowop_tiles(c.S),
+                    [
+                        B(W[f"dQKV_f32.{l}"]),
+                        p.buf(W["dQKVraw"], slot="v"),
+                        c.nq,
+                        c.nkv,
+                        c.D,
+                        c.S,
+                    ],
+                )
             p.instr(
                 mk.OP_QKNORM_ROPE_BWD,
                 mk.rowop_tiles(c.S),
                 [
                     a("qkvraw"),
                     B(W[f"dQKV_f32.{l}"]),
-                    B(W["dQKVraw"]),
+                    qkvraw_bwd,
                     pr("qn"),
                     pr("kn"),
                     gr("qn"),
@@ -854,6 +873,7 @@ class MKQwen3:
                     c.D,
                     1,  # dy_f32
                     c.S,
+                    int(qkbwd_split_v),
                 ],
             )
             p.wave()

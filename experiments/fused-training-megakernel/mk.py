@@ -45,6 +45,7 @@ OP_RMSNORM_BWD_DX_R4 = 26  # dx-only four-row fold for H256 long-S shapes
 OP_INV_VALID = 27  # one-tile valid-label count, writes reciprocal for CE
 OP_RMSNORM_BWD_DX_FMA = 28  # H256/S128 RMSNorm dx arithmetic route
 OP_SWIGLU_BWD_2W = 29  # opt-in two-warps-per-row SwiGLU backward route
+OP_QKV_V_BWD = 30  # V-head fp32 workspace -> bf16 raw-grad pass-through
 
 GEMM_BM, GEMM_BN = 64, 128  # keep in sync with ops.cuh
 FILL_CHUNK = 16384  # elements per fill/cvt work item (MK_CHUNK in ops.cuh)
@@ -333,6 +334,8 @@ def _access_sets(op, args):
         return [0, 2, 3, 6, 7], [1, 4, 5]
     if op == OP_QKNORM_ROPE_BWD:
         return [0, 1, 3, 4, 7, 8, 9, 10], [2, 5, 6]
+    if op == OP_QKV_V_BWD:
+        return [0], [1]
     if op == OP_EMBED_FWD:
         return [0, 1], [2]
     if op == OP_EMBED_BWD:
@@ -386,6 +389,7 @@ _ROW_TILE_R = {
     OP_SWIGLU_BWD: ROWOP_R,
     OP_SWIGLU_BWD_2W: SWIGLU_BWD_2W_R,
     OP_QKNORM_ROPE_BWD: ROWOP_R,
+    OP_QKV_V_BWD: ROWOP_R,
 }
 
 
@@ -405,6 +409,7 @@ _ROW_WRITE_POS = {
     OP_SWIGLU_BWD_2W: (2,),
     OP_QKNORM_ROPE_FWD: (1, 4, 5),
     OP_QKNORM_ROPE_BWD: (2,),
+    OP_QKV_V_BWD: (1,),
     OP_CE_FWD: (2,),  # lse; loss is a scalar atomic
     OP_CE_BWD: (0,),
     OP_EMBED_FWD: (2,),
@@ -423,6 +428,7 @@ _ROW_READ_POS = {
     OP_SWIGLU_BWD_2W: (0, 1, 6),
     OP_QKNORM_ROPE_FWD: (0,),
     OP_QKNORM_ROPE_BWD: (0, 1, 7, 8),
+    OP_QKV_V_BWD: (0,),
     OP_CE_FWD: (0, 2, 6),
     OP_CE_BWD: (0, 2),
     OP_EMBED_BWD: (1,),
@@ -695,7 +701,7 @@ class Program:
         _rowops = (OP_RMSNORM_FWD, OP_RMSNORM_BWD, OP_RMSNORM_BWD_DX,
                    OP_RMSNORM_BWD_DX_FMA, OP_RMSNORM_BWD_DW, OP_RMSNORM_BWD_DX_R4,
                    OP_SWIGLU_FWD, OP_SWIGLU_BWD, OP_SWIGLU_BWD_2W,
-                   OP_QKNORM_ROPE_FWD, OP_QKNORM_ROPE_BWD)
+                   OP_QKNORM_ROPE_FWD, OP_QKNORM_ROPE_BWD, OP_QKV_V_BWD)
         claim = [max(c, rc) if op in _rowops else c
                  for c, (op, ntiles, _) in zip(claim, flat)]
         self.n_instr = n

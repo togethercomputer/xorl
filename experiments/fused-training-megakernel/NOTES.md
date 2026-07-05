@@ -3124,6 +3124,23 @@ parity clean (`worst_grad_rel` <= 0.005753). Promote H256/D64/S8192
 `MK_ATTN_BAND` from T32 to T40; current H256/D64 band defaults are now
 `{2048:12, 3072:16, 4096:29, 8192:40}`.
 
+H256/D64/S8192 QKNORM/ROPE-bwd split-V follow-up after the T40 retune: the
+old `MK_QKBWD_SPLIT_V=1` probe was a nano/small no-go because its extra V
+pass-through row op added dependency wait, but the post-T40 S8192 profile
+(`mkv3-p4b-profile-score-s8192-post-t40-a8f137c-20260705T2012Z.log`) puts
+`QKNORM_ROPE_BWD` at `349.2us` on path. Current-base port
+`/home/apanda/xorl-oss-qkbwd-splitv-s8192` first exposed a correctness hazard:
+the V pass-through reader must use the unslotted `dQKV_f32` root so it depends on
+all current banded-attention `kv0/kv1/...` writers; reading a stale `kv` slot
+matched loss but broke downstream grads (`w1.3` rel err ~1.03). With that fixed,
+env-only S8192 timing `mkv3-p4b-qkbwd-splitv-s8192-current-20260705T2018Z.log`
+was parity-clean and positive (-34.59us/-63.47us, 15/16 and 16/16 wins).
+Promoted-default validation
+`mkv3-p4b-qkbwd-splitv-s8192-promoted-default-20260705T2020Z.log` beat forced
+old `MK_QKBWD_SPLIT_V=0` by +42.88us/+31.78us old-minus-new, with old wins
+2/16 and 1/16 and parity clean (`worst_grad_rel` <= 0.004937). Default only the
+exact H256/D64/S8192 shape; earlier nano/small no-go evidence still stands.
+
 Post-T29 follow-up no-gos: current default `lpt` order remains best. A
 pre-combine env-only retest at `77346e2`
 (`mkv3-p4b-s4096-t29-band-order-retest-20260705T1852Z.log`) forced
