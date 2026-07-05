@@ -2950,7 +2950,7 @@ shape, GPU 6, guards clean; `mkv3-p4b-score-long-post-band-20260705T173446Z.log`
 
 Short-S banding is a measured NO-GO (env-only sweep on the merged tree, both
 construction orders, all parity-clean;
-`mkv3-p4b-attn-band-short-sweep-20260705T173930Z.log` and
+`mkv3-p4b-attn-band-short-sweep-20260705T174217Z.log` and
 `mkv3-p4b-attn-band-s512-t4-20260705T174635Z.log`): S1024 T=8 is neutral
 (-0.2us 21/40, then +4.5us 12/40), S512 T=4 is negative (+15.2us 2/40, +4.1us
 9/40), and the degenerate T>=8 points at S512 / T=16 at S1024 collapse to
