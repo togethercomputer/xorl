@@ -3609,6 +3609,31 @@ route promotion: CE/lse partials from registers, a guarded 128-column tail for
 `V=151936`, and focused old-vs-new gradient/timing validation. Do not widen the
 general lm-head route from these standalone numbers.
 
+## v3 P4b qwen lm-head direct n256 route: exact-shape promotion
+
+Promoted the production follow-up as an exact qwen4b-l1 lm-head gate, not a general
+route. `ops.cuh` flag bit14 selects a 100KB m64n256 NT WGMMA direct-store path with
+register CE/LSE partials and a guarded final 128-column tail; `mk.py` defaults it only
+for `(M,N,K)=(1024,151936,2560)` with lm-head CE flags. `MK_WGMMA_N256_DIRECT=0`
+restores the old n128 route; `=1` force-enables all structurally eligible lm-head CE
+shapes for future probes.
+
+Build/route log `mkv3-p4b-qwen-lmhead-n256d-prod-20260705T2257Z.log` verified the
+qwen head emits one route-changed instruction: old n128 `ntiles=9496, flags=6274`;
+new n256d `ntiles=4752, flags=18562`, with `nparts=2374` unchanged. Focused A/B log
+`mkv3-p4b-qwen-lmhead-n256d-ab-20260705T2301Z.log` used identical params/tokens and
+found loss rel-diff `3.0e-7`; selected gradient rel diffs stayed below `5.6e-3`.
+Paired timings were decisive: old median `22051.4us`, new median `21142.3us`,
+old-minus-new `+909.1us`.
+
+Attribution log `mkv3-p4b-qwen-lmhead-n256d-profile-20260705T2301Z.log` confirms the
+win lands on the intended hop: qwen `GEMMNT 1024x151936x2560.wg` span dropped
+`3528.9us -> 2675.1us`, and step total dropped `21991.8us -> 21062.8us`. Full
+`test_model.py` passed in `mkv3-p4b-qwen-lmhead-n256d-testmodel-20260705T2301Z.log`
+(nano, D=128 ragged fallback, df/waves/df2/ws agreement, and SGD sanity). Keep the
+standalone verdict intact: staged n256 remains blocked by cooperative smem, and broad
+direct n256 remains rejected.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

@@ -107,6 +107,8 @@ __device__ __forceinline__ void op_axpy_f32(const Instr& I, int tile, void** buf
 //   flags bit5: split-K (requires fp32 C, pre-zeroed): args[8] = #slices, each slice
 //               computes a K-range and accumulates via fp32 atomicAdd. Rescues SM
 //               occupancy for small dW matrices (few M*N tiles, large K).
+//   flags bit14: direct m64n256 WGMMA NT lm-head tile with CE/LSE partials (bit11);
+//                qwen-specific path, supports a final 128-column tail.
 // args: {A, B, C, M, N, K, flags, res, sk}
 // tile id = (m_tile * n_tiles + n_tile) * sk + k_slice.
 
@@ -326,6 +328,10 @@ struct WgmmaSmemN128 {
   bf16 A[2][2][4][1024];  // [stage][row-half][k16-step][64x64 SW128 slab] = 32KB
   bf16 B[2][8192];        // [stage][128 rows x 64 k elts SW128]           = 32KB
 };
+struct WgmmaSmemN256 {
+  bf16 A[2][2][4][1024];  // [stage][row-half][k16-step][64x64 SW128 slab] = 32KB
+  bf16 B[2][16384];       // [stage][256 rows x 64 k elts SW128]           = 64KB
+};
 // epilogue staging overlays the (dead-by-then) stage buffers: 128 x 68 fp32 = 34.8KB
 // (n128: 128 x 128 fp32 = 64KB over the 64KB n128 stages)
 #define WG_LDC 68
@@ -450,6 +456,153 @@ __device__ __forceinline__ void wg_mma_ktile_n128(const uint64_t (&da)[4], const
              d[60], d[61], d[62], d[63], cute::SM90::GMMA::ScaleOut::One);
   cute::warpgroup_commit_batch();
   cute::warpgroup_wait<0>();
+}
+
+#define WG_D4(i) d[(i) + 0], d[(i) + 1], d[(i) + 2], d[(i) + 3]
+#define WG_D16(i) WG_D4(i), WG_D4((i) + 4), WG_D4((i) + 8), WG_D4((i) + 12)
+#define WG_D64 WG_D16(0), WG_D16(16), WG_D16(32), WG_D16(48)
+#define WG_D128 WG_D64, WG_D16(64), WG_D16(80), WG_D16(96), WG_D16(112)
+template <class MMA>
+__device__ __forceinline__ void wg_mma_ktile_n256(const uint64_t (&da)[4], const uint64_t (&db)[4],
+                                                  float (&d)[128]) {
+  cute::warpgroup_arrive();
+#pragma unroll
+  for (int s = 0; s < 4; ++s)
+    MMA::fma(da[s], db[s], WG_D128, cute::SM90::GMMA::ScaleOut::One);
+  cute::warpgroup_commit_batch();
+  cute::warpgroup_wait<0>();
+}
+#undef WG_D128
+#undef WG_D64
+#undef WG_D16
+#undef WG_D4
+
+// m64n256 NT direct-store lm-head tile (qwen giant-vocab follow-up to fat_gemm_probe.py).
+// The staged 128x256 route needs 160KB and fails the current cooperative launch at 132
+// blocks; this variant keeps the 100KB page by skipping the coalesced fp32 epilogue slab.
+// It is deliberately narrow: NT only, bf16 logits only, CE/LSE partials only, and a
+// final 128-column tail. Broad direct-store use regressed in the standalone probe.
+__device__ __noinline__ void op_gemm_wgmma_n256_direct(const Instr& I, int tile, void** bufs,
+                                                       char* smem_raw) {
+  namespace SG = cute::SM90::GMMA;
+  const bf16* A = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
+  const bf16* B = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
+  bf16* C = reinterpret_cast<bf16*>(bufs[I.args[2]]);
+  const int N = I.args[4], K = I.args[5], flags = I.args[6];
+  if (!(flags & 2) || !(flags & 2048)) return;
+
+  smem_raw = reinterpret_cast<char*>(
+      (reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
+  WgmmaSmemN256& S = *reinterpret_cast<WgmmaSmemN256*>(smem_raw);
+  const int n_tiles = (N + 255) / 256;
+  const int m0 = (tile / n_tiles) * WG_BM;
+  const int n0 = (tile % n_tiles) * 256;
+  const int valid_cols = min(256, N - n0);
+  if (valid_cols <= 0) return;
+
+  const int tid = mk_tid();
+  const int wg = tid / 128;
+  const int wtid = tid % 128;
+  auto issue_stage = [&](int k0, int st) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {  // A: 128r x 64k
+      const int v = tid + i * 256;
+      const int r = v / 8, k8 = (v % 8) * 8;
+      __pipeline_memcpy_async(
+          reinterpret_cast<char*>(S.A[st][r / 64]) + wg_koff_sw(r % 64, k8),
+          &A[(int64_t)(m0 + r) * K + k0 + k8], 16);
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {  // B: 256 x 64, K-major; invalid tail rows are ignored
+      const int v = tid + i * 256;
+      const int r = v / 8, k8 = (v % 8) * 8;
+      const int br = (r < valid_cols) ? (n0 + r) : (N - 1);
+      __pipeline_memcpy_async(reinterpret_cast<char*>(S.B[st]) + wg_koff_sw(r, k8),
+                              &B[(int64_t)br * K + k0 + k8], 16);
+    }
+    __pipeline_commit();
+  };
+
+  float d[128];
+#pragma unroll
+  for (int i = 0; i < 128; ++i) d[i] = 0.0f;
+  const int iters = K / WG_BK;
+  issue_stage(0, 0);
+  for (int t = 0; t < iters; ++t) {
+    if (t + 1 < iters) issue_stage((t + 1) * WG_BK, (t + 1) & 1);
+    __pipeline_wait_prior(t + 1 < iters ? 1 : 0);
+    consumer_sync();
+    uint64_t da[4], db[4];
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      da[s] = wg_desc_ksw(S.A[t & 1][wg], s);
+      db[s] = wg_desc_ksw(S.B[t & 1], s);
+    }
+    wg_mma_ktile_n256<SG::MMA_64x256x16_F32BF16BF16_SS<SG::Major::K, SG::Major::K>>(
+        da, db, d);
+    consumer_sync();
+  }
+
+  const int w = wtid / 32, l = wtid % 32;
+  const int cb = (l & 3) * 2;
+#pragma unroll
+  for (int n8 = 0; n8 < 32; ++n8) {
+    const int c = n8 * 8 + cb;
+    if (c < valid_cols) {
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const int r = wg * 64 + w * 16 + l / 4 + 8 * i;
+        __nv_bfloat162 out;
+        out.x = f2bf(d[n8 * 4 + i * 2 + 0]);
+        out.y = f2bf(d[n8 * 4 + i * 2 + 1]);
+        *reinterpret_cast<__nv_bfloat162*>(&C[(int64_t)(m0 + r) * N + n0 + c]) = out;
+      }
+    }
+  }
+
+  float* parts = reinterpret_cast<float*>(bufs[I.args[9]]);
+  const int nparts = I.args[10];
+  const int warp = tid / 32, lane = tid % 32;
+  const int row_base = (warp / 4) * 64 + (warp & 3) * 16;
+  const int lane_row = lane / 4;
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    const int r = row_base + lane_row + 8 * i;
+#pragma unroll
+    for (int half = 0; half < 4; ++half) {
+      if (half * WG_BN >= valid_cols) continue;
+      float mx = -INFINITY, se = 0.0f;
+#pragma unroll
+      for (int n8 = half * 8; n8 < half * 8 + 8; ++n8) {
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+          const float zv = bf2f(f2bf(d[n8 * 4 + i * 2 + j]));
+          if (zv > mx) {
+            se = se * lmhead_exp(mx - zv) + 1.0f;
+            mx = zv;
+          } else {
+            se += lmhead_exp(zv - mx);
+          }
+        }
+      }
+#pragma unroll
+      for (int o = 1; o < 4; o <<= 1) {
+        const float om = __shfl_xor_sync(0xffffffff, mx, o);
+        const float os = __shfl_xor_sync(0xffffffff, se, o);
+        const float Mx = fmaxf(mx, om);
+        se = (mx == -INFINITY && om == -INFINITY) ? 0.0f
+                                                  : se * lmhead_exp(mx - Mx) +
+                                                        os * lmhead_exp(om - Mx);
+        mx = Mx;
+      }
+      const int part = n0 / WG_BN + half;
+      if ((lane & 3) == 0 && part < nparts) {
+        const int64_t o = ((int64_t)(m0 + r) * nparts + part) * 2;
+        parts[o] = mx;
+        parts[o + 1] = se;
+      }
+    }
+  }
 }
 
 // m64n128 NT tile (v3 P4b r3, generalized from the peer session's lm_head route):
@@ -640,6 +793,10 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
   const bf16* B = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
   void* Cp = bufs[I.args[2]];
   const int M = I.args[3], N = I.args[4], K = I.args[5], flags = I.args[6];
+  if (flags & 16384) {
+    op_gemm_wgmma_n256_direct(I, tile, bufs, smem_raw);
+    return;
+  }
   if (flags & 4096) {
     op_gemm_wgmma_n128(I, tile, bufs, smem_raw);
     return;

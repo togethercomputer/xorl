@@ -135,6 +135,32 @@ def gemm_tiles_wgmma_n128(M, N):
     return (M // 128) * (N // 128)
 
 
+def wgmma_n256_direct_ok(M, N, K, flags):
+    """Qwen giant-vocab lm_head-only direct m64n256 route.
+
+    The staged 128x256 tile wins standalone but needs 160KB smem, which does not fit the
+    current cooperative launch. The 100KB direct-store variant only looked promising for
+    the qwen high-K/high-V shape, so the default is an exact shape gate. Set
+    MK_WGMMA_N256_DIRECT=0 to force the old n128 route, or =1 to force all eligible
+    lm_head CE shapes for probing.
+    """
+    mode_env = os.environ.get("MK_WGMMA_N256_DIRECT")
+    mode = -1 if mode_env is None else int(mode_env)
+    if mode == 0:
+        return False
+    if flags != (2 | 2048):
+        return False
+    if M % 128 or N % 128 or K % 64:
+        return False
+    if mode == 1:
+        return True
+    return (M, N, K) == (1024, 151936, 2560)
+
+
+def gemm_tiles_wgmma_n256_direct(M, N):
+    return (M // 128) * ((N + 255) // 256)
+
+
 def _default_split_k_target(K):
     env = os.environ.get("MK_DW_TARGET_TILES")
     if env is not None:

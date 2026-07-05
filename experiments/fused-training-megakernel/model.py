@@ -605,12 +605,15 @@ class MKQwen3:
         if self.fuse_ce and mk.wgmma_ok(c.S, c.V, c.H, 2):
             # lm_head gemm with per-row lse partials in the epilogue (bit11): CE fwd
             # reduces V/64 (max, sumexp) pairs instead of rescanning the V-wide row
-            n128 = mk.wgmma_n128_ok(c.S, c.V, c.H, 2 | 2048)
+            n256d = mk.wgmma_n256_direct_ok(c.S, c.V, c.H, 2 | 2048)
+            n128 = (not n256d) and mk.wgmma_n128_ok(c.S, c.V, c.H, 2 | 2048)
             p.instr(
                 mk.OP_GEMM,
-                mk.gemm_tiles_wgmma_n128(c.S, c.V) if n128 else mk.gemm_tiles_wgmma(c.S, c.V),
+                (mk.gemm_tiles_wgmma_n256_direct(c.S, c.V) if n256d else
+                 mk.gemm_tiles_wgmma_n128(c.S, c.V) if n128 else mk.gemm_tiles_wgmma(c.S, c.V)),
                 [B(A["xnf"]), B(self.params["wlm"]), B(A["logits"]), c.S, c.V, c.H,
-                 2 | 128 | 2048 | (4096 if n128 else 0), 0, 0, B(W["lse_parts"]), c.V // 64],
+                 2 | 128 | 2048 | (16384 if n256d else 4096 if n128 else 0), 0, 0,
+                 B(W["lse_parts"]), c.V // 64],
             )
             p.wave()
             p.instr(
