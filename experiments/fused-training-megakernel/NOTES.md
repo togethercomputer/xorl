@@ -2420,6 +2420,19 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   small spans; current small leaders are `ATTN_DKV_WG`, MLP dX
   `GEMMNN 1024x512x3072.wg`, and `ATTN_FWD_WG`.
 
+- SwiGLU DSSG cache no-go: the follow-up default-off branch
+  `/home/apanda/xorl-oss-swiglu-dssg-cache-probe` tested
+  `MK_SWIGLU_CACHE_DSSG=1`, writing bf16 `silu(g)` plus bf16 `dsilu(g)` from
+  `OP_SWIGLU_FWD` so `OP_SWIGLU_BWD_2W` can skip the gate-half load and sigmoid
+  derivative arithmetic. Correctness passed for H512/S1024 small
+  (`mkv3-p4b-swdssg-small-parity-20260705T1355Z.log`: 8 cached fwd ops, 8 cached
+  2W bwd ops, loss 9.79777 vs 9.79781, worst grad rel 0.025717), but paired timing
+  against the current sigmoid-cache default was clearly negative
+  (`mkv3-p4b-swdssg-vs-sig-small-step-ab-20260705T1355Z.log`): `sig_first`
+  dssg-sig +65.15us median with only 1/200 DSSG wins, `dssg_first` +38.22us with
+  2/200 wins, combined +53.15us with 3/400 wins. Do not promote the doubled cache;
+  keep the smaller bf16 sigmoid cache as the default small route.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
