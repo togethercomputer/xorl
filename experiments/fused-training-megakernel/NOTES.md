@@ -1661,6 +1661,13 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   likely alternate claim160 is not shape-safe: small regressed +189.2us with 0/60 wins
   and H256/S1024 regressed +17.2us with 7/70 wins. No source route change.
 
+- Current-head nano/deep head-dX target resweep after cap0: no change
+  (`mkv3-p4b-headdx-nano-cap0-9cd0a88-20260705T0428HEADDX.log`). Nano target48/64 had
+  superficially negative medians (-10.1us and -8.8us), but the paired distributions
+  were heavily contaminated/noisy (p25/p75 roughly -55us/+40us) with only 51/80 and
+  47/80 wins. Target32/128/192 regressed, and deep-L12 did not provide a clean guard
+  for lower targets. Keep the current target96 for H256/S512 and deep-L12.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
