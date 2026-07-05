@@ -83,7 +83,9 @@ def wgmma_ok(M, N, K, flags):
         nn_min_env = os.environ.get("MK_WGMMA_NN_MIN")
         if nn_min_env is not None:
             nn_min = int(nn_min_env)
-        elif M in (128, 256) and N == 256:
+        elif M == 128 and N == 256:
+            nn_min = 4
+        elif M == 256 and N == 256:
             nn_min = 8
         elif M == 512:
             nn_min = 16

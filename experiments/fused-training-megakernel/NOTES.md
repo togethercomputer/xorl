@@ -1498,6 +1498,20 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   stronger evidence because both megakernel and graph+ medians wobble between fresh
   processes.
 
+- Current-head S128 WGMMA NN threshold gate: S128 profile
+  (`mkv3-p4b-profile-s128-current-8d8f95b-20260705T0336PROFILE.log`) showed the
+  `GEMMNN 128x256x256` Drow hops as the top on-path bucket and still on WMMA because
+  the short-row gate required 8 m64n64 tiles while this shape has 4. A current-head
+  threshold sweep (`mkv3-p4b-wg-nn-s128-current-8d8f95b-20260705T0337N128.log`) measured
+  `MK_WGMMA_NN_MIN=4` at -12.4us median with 100/160 wins; route inspection confirmed
+  the intended `128x256` head-dX and Drow WGMMA routes while leaving S256/nano routes
+  unchanged (`mkv3-p4b-wg-nn-s128-route-20260705T0338N128.log`,
+  `mkv3-p4b-wg4-s128-route-20260705T0339N128.log`). Focused S128 parity and default
+  model validation passed (`mkv3-p4b-wg4-s128-parity-20260705T0339N128.log`,
+  `mkv3-p4b-wg4-s128-testmodel-20260705T0340N128.log`). Fresh score after the patch:
+  S128 874.7us vs graph+ 495.4us (`mkv3-p4b-score-s128-wg4-20260705T0340SCORE.log`);
+  use the paired A/B for the small route delta.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
@@ -1506,7 +1520,7 @@ runs from inductor autotune variance):
 | nano | 1026 | 631 | 1.63x |
 | small | 3714 | 1899 | 1.96x |
 | deep-L12 | 2522 | 1765 | 1.43x |
-| S=128 | 853 | 486 | 1.76x |
+| S=128 | 875 | 495 | 1.77x |
 | S=256 | 935 | 560 | 1.67x |
 | S=1024 | 1349 | 783 | 1.72x |
 (Morning honest reset: nano 1.97x / small 2.52x.)
