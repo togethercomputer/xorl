@@ -2135,6 +2135,14 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   passed (`mkv3-p4b-ceb2-small-old-vs-default-grads-20260705T1049Z.log`; worst rel err
   0.009625).
 
+- Post-CE-backward-exp2 scoreboard: `mkv3-p4b-score-both-4129b84-20260705T1130Z.log`
+  measured nano at 917.6us megakernel vs 631.2us compile+CUDAGraph+ (1.45x gap), as
+  expected unchanged by the default gate because S512 keeps the old CE-BWD route. Small
+  measured 3511.9us megakernel vs 1906.1us compile+CUDAGraph+ (1.84x gap), improving
+  from the overnight 3570/1904 row and the post-lm-head 3542.8/1912.9 row. The paired
+  default-vs-old CE-BWD timing attributed roughly 30-35us of small-step savings to the
+  `_ceb2` route; the scoreboard sees the same improvement class.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
