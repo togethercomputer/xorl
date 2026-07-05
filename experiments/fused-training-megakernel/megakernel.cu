@@ -78,6 +78,12 @@ __device__ __forceinline__ long long mk_globaltimer() {
 #define MK_LB
 #endif
 
+// idle ready-ring poll cadence (ns). 256 was tuned pre-P4b when spans dominated;
+// with waits now ~20% of nano, faster discovery may pay. MK_IDLE_NS build knob.
+#ifndef MK_IDLE_NS
+#define MK_IDLE_NS 256
+#endif
+
 // ---- interpreter --------------------------------------------------------------------
 __device__ __forceinline__ void dispatch(const Instr& I, int tile, void** bufs,
                                          char* smem) {
@@ -366,7 +372,7 @@ extern "C" __global__ void MK_LB megakernel_df(const Instr* __restrict__ instrs,
           }
         }
         if (s_ins >= 0) break;
-        __nanosleep(256);
+        __nanosleep(MK_IDLE_NS);
       }
       if (s_ins < 0 && last_cold) atomicSub(&ctrl[5], 1);  // exiting: release the slot
       last_ins = s_ins;
@@ -557,7 +563,7 @@ __global__ void megakernel_df2(const Instr* __restrict__ instrs, const int n_ins
           }
         }
         if (s_ins >= 0) break;
-        __nanosleep(256);
+        __nanosleep(MK_IDLE_NS);
       }
       last_ins = s_ins;
     }
