@@ -1500,6 +1500,29 @@ __device__ void op_qknorm_rope_bwd(const Instr& I, int tile, void** bufs, char* 
     const float r = reinterpret_cast<const float*>(
         bufs[is_q ? I.args[7] : I.args[8]])[(int64_t)row * (is_q ? nq : nkv) + (is_q ? h : h - nq)];
 
+#ifdef MK_QKBWD_D64_CACHE
+    if (D == 64) {
+      // D=64 model path: each lane owns one rope pair. Keep the intermediates live
+      // across the dot reduction instead of reloading/recomputing them below.
+      const int i = lane;
+      const float c = cosr[i], s = sinr[i];
+      const float dy1 = dyr(i), dy2 = dyr(i + 32);
+      const float da = dy1 * c + dy2 * s;
+      const float db = -dy1 * s + dy2 * c;
+      const float w1 = bf2f(w[i]), w2 = bf2f(w[i + 32]);
+      const float xh1 = bf2f(xr[i]) * r, xh2 = bf2f(xr[i + 32]) * r;
+      float dot = da * w1 * xh1 + db * w2 * xh2;
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffff, dot, o);
+      dot *= 1.0f / 64.0f;
+      dxr[i] = f2bf(r * (da * w1 - xh1 * dot));
+      dxr[i + 32] = f2bf(r * (db * w2 - xh2 * dot));
+      atomicAdd(&dw_s[i], da * xh1);
+      atomicAdd(&dw_s[i + 32], db * xh2);
+      continue;
+    }
+#endif
+
     // rope^-1 on the incoming grad: da = dy1*c + dy2*s ; db = -dy1*s + dy2*c;
     // then per-head rmsnorm bwd with x = raw.
     float dot = 0.0f;

@@ -1155,6 +1155,19 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   -21.4/+19.9us with 131/150 and 134/150 wins for the new default. Default now attempts
   Drow WGMMA whenever `mk.wgmma_ok` accepts the Drow epilogue GEMM;
   `MK_DROW_WG_LONGONLY=0` restores the old WMMA route.
+- QKNORM_ROPE_BWD D=64 cache fast path: the D=64 model path has one rope pair per lane,
+  so `op_qknorm_rope_bwd` now keeps `da/db`, weights, and normalized `x` live across the
+  dot-product reduction instead of reloading/recomputing them for dx/dw. The generic
+  D!=64 loop is unchanged, and `MK_QKBWD_D64_CACHE=0` keeps the old loop for A/B/bisects.
+  Correctness passed full op and model suites
+  (`mkv3-p4b-qknorm-d64-cache-flag-testops-20260705T0034QKBWD.log`,
+  `mkv3-p4b-qknorm-d64-cache-flag-testmodel-20260705T0036QKBWD.log`,
+  `mkv3-p4b-qknorm-d64-cache-default-testmodel-20260705T0040QKBWD.log`). Fresh-cache
+  same-process A/B (`mkv3-p4b-qknorm-d64-cache-ab-20260705T0036QKBWD.log`) measured
+  paired-diff medians: nano -6.7us (175/240 wins), small -26.6us (175/180), S2048
+  -17.7us (167/180), S4096 -30.5us (126/128). `cuobjdump -res-usage` was unchanged
+  for `megakernel_df`/`df2`/`ws`, so there is no spill/regression tax
+  (`mkv3-p4b-qknorm-d64-cache-resusage-20260705T0040QKBWD.log`).
 
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across

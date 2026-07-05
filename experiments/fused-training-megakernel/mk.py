@@ -157,9 +157,12 @@ def load_ext(verbose=False):
     occ2 = int(os.environ.get("MK_OCC2", "0"))
     regcopy = int(os.environ.get("MK_WS_REGCOPY", "0"))
     attnpipe = int(os.environ.get("MK_ATTN_PIPE", "0"))
+    # D=64 qknorm-bwd fast path; MK_QKBWD_D64_CACHE=0 keeps the old generic loop for
+    # A/B and bisects. Separate extension name because torch's cache is name-keyed.
+    qkbc = int(os.environ.get("MK_QKBWD_D64_CACHE", "1"))
     return load(
         name="xorl_megakernel" + ("_occ2" if occ2 else "") + ("_wsrc" if regcopy else "")
-        + ("_apipe" if attnpipe else ""),
+        + ("_apipe" if attnpipe else "") + ("_qkbc" if qkbc else ""),
         sources=[os.path.join(_DIR, "megakernel.cu")],
         extra_cuda_cflags=[
             "-O3",
@@ -173,7 +176,8 @@ def load_ext(verbose=False):
         ]
         + (["-DMK_OCC2"] if occ2 else [])
         + (["-DMK_WS_REGCOPY"] if regcopy else [])
-        + (["-DMK_ATTN_PIPE"] if attnpipe else []),
+        + (["-DMK_ATTN_PIPE"] if attnpipe else [])
+        + (["-DMK_QKBWD_D64_CACHE"] if qkbc else []),
         verbose=verbose,
     )
 
