@@ -2604,6 +2604,14 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   order control; `MK_SWIGLU_CACHE_SIG=0 MK_SWIGLU_BWD_2W=0` restores the old route for
   A/B.
 
+- H256/S8192 cached SwiGLU-BWD 2W boundary no-change: the same combined route was
+  tested at S8192 and should not be defaulted. Forced `MK_SWIGLU_CACHE_SIG=1
+  MK_SWIGLU_BWD_2W=1` vs current default
+  (`mkv3-p4b-sw2w-cache-s8192-current-20260705T1608Z.log`) routed `4 fwd/0 1W/4 2W`
+  and passed parity (worst rel 0.007589), but timing regressed in both construction
+  orders: +50.88us and +45.22us variant-default, combined +47.47us with only 10/40
+  variant wins. Keep the cached-2W default capped at H256/S4096.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
