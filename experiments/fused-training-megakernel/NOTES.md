@@ -1227,6 +1227,31 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   old timing (`mkv3-p4b-nano-headdx96-default-ab-clean-20260705T010245Z.log`) measured
   combined paired median -17.06us with 445/480 wins.
 
+- ATTN_DKV_WG direct-atomic epilogue: after the route toggles were exhausted, the
+  staged-smem dK/dV epilogue remained inside the top attention bucket. A compile-flagged
+  direct-atomic variant writes the existing accumulator lane layout straight to
+  `dQKV_f32`, skipping the smem stage and drain loop. Focused attention and full-model
+  correctness passed
+  (`mkv3-p4b-attndkv-directatomic-flag-testattention-20260705T011304Z.log`,
+  `mkv3-p4b-attndkv-directatomic-flag-testmodel-20260705T011640Z.log`). Paired timing
+  (`mkv3-p4b-attndkv-directatomic-ab-85ec29f-20260705T011444Z.log`) won on every tracked
+  shape: nano -17.81us, small -49.39us, S2048 -40.51us, S3072 -7.30us, S4096 -19.23us
+  combined paired. Default now compiles this direct-atomic DKV epilogue; set
+  `MK_ATTN_DKV_DIRECT_ATOMIC=0` to restore the old staged-smem atomic route. Default-on
+  full op/model suites passed
+  (`mkv3-p4b-attndkv-directatomic-default-testops-20260705T011720Z.log`,
+  `mkv3-p4b-attndkv-directatomic-default-testmodel-20260705T011720Z.log`), and patched
+  default-vs-old timing (`mkv3-p4b-attndkv-directatomic-default-ab-clean-20260705T011741Z.log`)
+  confirmed wins on all tracked shapes: nano -19.26us, small -47.94us, S2048 -41.76us,
+  S3072 -8.83us, S4096 -20.90us combined paired. `cuobjdump -res-usage` showed no
+  `megakernel_df`/`df2` register or stack change versus the old route
+  (`mkv3-p4b-attndkv-directatomic-resusage-20260705T011825Z.log`,
+  `mkv3-p4b-attndkv-old-resusage-20260705T011830Z.log`). Rechecked no-go side paths in
+  the same pass: `MK_ATTN_PIPE=1` remained strongly negative
+  (`mkv3-p4b-attn-pipe-recheck-85ec29f-20260705T010542Z.log`), and direct fwd WG stores
+  were rejected after long-S regressions
+  (`mkv3-p4b-attnfwd-direct-ab-85ec29f-20260705T011027Z.log`).
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):

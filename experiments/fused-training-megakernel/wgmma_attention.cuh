@@ -671,6 +671,21 @@ __device__ void op_attn_dkv_wg(const Instr& I, int tile, void** bufs, char* smem
   }
 
   // epilogue: stage each 128x64 accumulator to smem, coalesced fp32 atomics
+#ifdef MK_ATTN_DKV_DIRECT_ATOMIC
+#pragma unroll
+  for (int round = 0; round < 2; ++round) {
+    const float(&acc)[32] = round == 0 ? dk : dv;
+    const int col0 = (round == 0 ? (nq + kvh) : (nq + nkv + kvh)) * D;
+#pragma unroll
+    for (int n8 = 0; n8 < 8; ++n8)
+#pragma unroll
+      for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 2; ++j)
+          atomicAdd(&ws[(int64_t)(kv0wg + r0 + 8 * i) * stride + col0 + n8 * 8 + cb + j],
+                    acc[n8 * 4 + i * 2 + j]);
+  }
+#else
   float* Cs = reinterpret_cast<float*>(smem_raw);  // [128][68] overlay (K/V/P dead)
 #pragma unroll
   for (int round = 0; round < 2; ++round) {
@@ -694,6 +709,7 @@ __device__ void op_attn_dkv_wg(const Instr& I, int tile, void** bufs, char* smem
     }
     consumer_sync();  // Cs reuse between rounds
   }
+#endif
 }
 
 // ---- backward dQ pass ----------------------------------------------------------------------
