@@ -1387,7 +1387,13 @@ __device__ void op_swiglu_bwd(const Instr& I, int tile, void** bufs) {
       for (int j = 0; j < 8; j++) {
         const float sig = 1.0f / (1.0f + __expf(-g[j]));  // SFU, see swiglu_fwd note
         const float sg = g[j] * sig;
-        dg[j] = d[j] * u[j] * (sig + sg * (1.0f - sig));  // dsilu = sig + silu*(1-sig)
+        // dsilu = sig + silu*(1-sig) = sig + sg - sg*sig.
+#ifdef MK_SWIGLU_FMA_DERIV
+        const float ds = fmaf(-sg, sig, sig + sg);
+#else
+        const float ds = sig + sg * (1.0f - sig);
+#endif
+        dg[j] = d[j] * u[j] * ds;
         du[j] = d[j] * sg;
       }
       st8bf(dgu + i, dg);
@@ -1399,7 +1405,12 @@ __device__ void op_swiglu_bwd(const Instr& I, int tile, void** bufs) {
       const float d = dy_f32 ? dhf[i] : bf2f(dhb[i]);
       const float sig = 1.0f / (1.0f + __expf(-g));
       const float sg = g * sig;
-      dgu[i] = f2bf(d * u * (sig + sg * (1.0f - sig)));
+#ifdef MK_SWIGLU_FMA_DERIV
+      const float ds = fmaf(-sg, sig, sig + sg);
+#else
+      const float ds = sig + sg * (1.0f - sig);
+#endif
+      dgu[i] = f2bf(d * u * ds);
       dgu[Iw + i] = f2bf(d * sg);
     }
   }

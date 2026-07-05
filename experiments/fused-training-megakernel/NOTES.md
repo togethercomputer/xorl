@@ -1773,6 +1773,17 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   mechanism; the known route knobs around attention chunks, n128, cold cap, claim, CE
   skip, and rowop folds have been rechecked and are no-go or already promoted.
 
+- SWIGLU_BWD FMA derivative promotion: `MK_SWIGLU_FMA_DERIV` is now default-on and
+  rewrites `dsilu` from `sig + sg * (1-sig)` to `fmaf(-sg, sig, sig + sg)`, with
+  `MK_SWIGLU_FMA_DERIV=0` restoring the old expression for A/B. Focused SwiGLU and
+  full-model correctness passed
+  (`mkv3-p4b-swfma-testswiglu-20260705T0527SWFMA.log`,
+  `mkv3-p4b-swfma-testmodel-20260705T0528SWFMA.log`). Paired same-process timing
+  (`mkv3-p4b-swfma-step-ab-20260705T0529SWFMA.log`) was order-stable: nano -8.19us
+  (189/200 wins), small -16.80us (194/200 wins), and H256/S1024 -10.67us (184/200
+  wins). This is a narrow op-quality win; it does not change the remaining bottleneck
+  ordering.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
