@@ -1640,6 +1640,13 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   39-43/80 wins), while `DQ_C=3` variants regressed and `DKV_C=1/DQ_C=2` lost hard
   (+32.3us, 2/80 wins). Keep the S512 attention chunk gate unchanged.
 
+- Post-nano-cap RMS dx R4 recheck: the cap0 scheduler change did not flip the prior
+  H256/S512 R4 no-go. Forced `MK_RMS_DX_R4=1`
+  (`mkv3-p4b-rmsdx-r4-current-7bb4905-20260705T0424RMS.log`) regressed nano by +9.9us
+  paired median with only 1/120 R4 wins, deep-L12 by +33.4us with 2/100 wins, and
+  H256/S1024 by +8.9us with 12/100 wins. Keep the default R2 dx path for these shapes;
+  only the existing H256/S2048 R4 gate remains.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
