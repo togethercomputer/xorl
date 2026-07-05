@@ -1976,6 +1976,13 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   median; H256/S2048 default compiles the old no-`_drowst` extension. Set
   `MK_DROW_DIRECT_STORE=0` to force the old atomic Drow path for A/B.
 
+- Post-Drow-direct-store scoreboard: `mkv3-p4b-score-both-e71d706-20260705T0749Z.log`
+  measured nano at 932.3us megakernel vs 632.1us compile+CUDAGraph+ (1.47x gap) and
+  small at 3607.3us megakernel vs 1904.6us compile+CUDAGraph+ (1.89x gap). Compared
+  with the pre-Drow scoreboard at `cfc2fb3`, this trims the megakernel side by about
+  16us nano and 31us small while the hardened graph baseline moved within normal
+  compile-run variance.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
