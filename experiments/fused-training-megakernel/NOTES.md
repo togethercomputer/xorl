@@ -2960,6 +2960,22 @@ extra fills/atomics have nothing to amortize against. Keep the short-S uniform
 C defaults. Re-run knobs: `results/attn_band_model_ab_main.py <S> <T> <order>`
 with `MK_ATTN_BAND` env override.
 
+Band emission order follow-on: the post-band S8192 profile showed the critical DQ
+bands were wait-dominated behind same-wave DKV work. `MK_ATTN_BAND_ORDER` now accepts
+`lpt` (the original longest-stage-first order) and `dq_first` (DQ bands first, largest
+chunk count first). The default is `dq_first` only for H256/D64/S8192; all shorter
+gated shapes keep `lpt`, and `MK_ATTN_BAND_ORDER=lpt` restores the old S8192 route.
+Validation in `/home/apanda/xorl-oss-attn-band-order-probe`: default route hashes for
+S4096 still match the shared tree exactly, while S8192 default changes to
+`DQ C4/C3/C2/C1, DKV C4/C3/C2/C1`. S8192 env A/B on the old default won
+-88.4us/-105.0us (16/16, 16/16); promoted-default vs forced `lpt` confirmed
+-103.2us (16/16) and -74.2us (15/16). All parity checks passed
+(`worst_grad_rel` <= 0.006477). Do NOT broaden the default: S2048 regressed
++8.9/+22.1us, S3072 +52.7/+62.9us, and S4096 +47.3/+51.8us. Logs:
+`mkv3-p4b-attn-band-order-s8192-20260705T1801Z.log`,
+`mkv3-p4b-attn-band-order-long-sweep-20260705T1804Z.log`, and
+`mkv3-p4b-attn-band-order-s8192-promoted-default-20260705T1808Z.log`.
+
 Follow-on candidates this opens (unclaimed): (a) ATTN_FWD_WG banding — fwd is
 also straggler-bound (64st x 1.5us of its 111.8us at S4096) but needs the
 split+combine (opart/mpart/lpart) machinery ported to the WG path; (b) a

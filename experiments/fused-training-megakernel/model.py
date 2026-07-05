@@ -690,6 +690,10 @@ class MKQwen3:
                 )
                 band_T = int(os.environ.get("MK_ATTN_BAND", str(default_band_T)))
                 if band_T > 0:
+                    # Only S8192 wins when DQ bands lead; shorter gated shapes regress.
+                    default_band_order = "dq_first" if c.H == 256 and c.D == 64 and c.S == 8192 else "lpt"
+                    band_order = os.environ.get("MK_ATTN_BAND_ORDER", default_band_order)
+
                     def bands(stages_of):
                         out, j = [], 0
                         while j < n_qt128:
@@ -700,20 +704,33 @@ class MKQwen3:
                             out.append((j, k - j, Cj))
                             j = k
                         return out
-                    emit = []  # (chunk_stages, op, ntiles, args) -> LPT emission order
+                    # (chunk_stages, seq, kind, off, width, chunks, op, ntiles, args)
+                    # LPT order matches the pre-order-probe promoted route exactly. The
+                    # dq_first probe tests whether the post-band DQ wait path is
+                    # sensitive to same-wave emission order.
+                    emit = []
                     for bi, (off, w, Cb) in enumerate(bands(lambda j: (c.S - j * 128) // 64)):
                         st = -(-((c.S - off * 128) // 64) // Cb)
-                        emit.append((st, mk.OP_ATTN_DKV_WG, c.nkv * w * G * Cb,
+                        emit.append((st, len(emit), "dkv", off, w, Cb, mk.OP_ATTN_DKV_WG, c.nkv * w * G * Cb,
                                      dkv_args()[:4]
                                      + [p.buf(W[f"dQKV_f32.{l}"], slot=f"kv{bi}")]
                                      + dkv_args()[5:] + [Cb | (off << 8) | (w << 16)]))
                     for bi, (off, w, Cb) in enumerate(bands(lambda i: i * 2 + 2)):
                         st = -(-((off + w - 1) * 2 + 2) // Cb)
-                        emit.append((st, mk.OP_ATTN_DQ_WG, c.nq * w * Cb,
+                        emit.append((st, len(emit), "dq", off, w, Cb, mk.OP_ATTN_DQ_WG, c.nq * w * Cb,
                                      dq_args()[:4]
                                      + [p.buf(W[f"dQKV_f32.{l}"], slot=f"q{bi}")]
                                      + dq_args()[5:] + [Cb | (off << 8) | (w << 16)]))
-                    for _, op_id, nt, ag in sorted(emit, key=lambda e: -e[0]):
+                    if band_order == "dq_first":
+                        ordered_emit = sorted(
+                            emit,
+                            key=lambda e: (0 if e[2] == "dq" else 1, -e[0], -e[5], -e[3], e[1]),
+                        )
+                    elif band_order == "lpt":
+                        ordered_emit = sorted(emit, key=lambda e: (-e[0], e[1]))
+                    else:
+                        raise ValueError(f"unknown MK_ATTN_BAND_ORDER={band_order!r}")
+                    for _, _, _, _, _, _, op_id, nt, ag in ordered_emit:
                         p.instr(op_id, nt, ag)
                 else:
                     p.instr(mk.OP_ATTN_DKV_WG, c.nkv * n_qt128 * G * Ckv, dkv_args() + [Ckv])
