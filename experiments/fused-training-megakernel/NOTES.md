@@ -2361,6 +2361,14 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   (+60.94us and +62.88us). Keep the current split target policy:
   `K == 1024 -> 96`, otherwise 64.
 
+- Current-head claim-quantum resweep no-change: an env-only GPU 5 sweep rechecked
+  `MK_CLAIM` after the latest route changes
+  (`mkv3-p4b-claim-current-906f272-20260705T1740Z.log`). Nano claim96/112 regressed
+  by +56.22us/+55.38us median, claim192 regressed +12.30us, and claim160 was only
+  order-biased/neutral (+0.39us median, 6/12 wins). Small rejected every non-default
+  claim decisively: claim96 +267.50us, claim112 +273.32us, claim160 +131.69us, and
+  claim192 +102.34us median. Keep the global claim quantum at 132.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
