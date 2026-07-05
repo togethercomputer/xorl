@@ -3120,7 +3120,7 @@ the banding round (`mkv3-p4b-postband-knob-recheck-20260705T185629Z.log`):
   pre-band it was rejected (+47.5us, 20260705T1608Z); post-band it wins
   -111.9/-128.3us with 16/16 both construction orders (parity worst rel 0.0087).
   Promoted-default vs forced-old validation
-  (`mkv3-p4b-sw2w-s8192-promote-20260705T190224Z-class.log`): +128.8/+116.0us
+  (`mkv3-p4b-sw2w-s8192-promote-20260705T190241Z.log`): +128.8/+116.0us
   for the default, 0/16 for old, test_model green. The banding round rebalanced
   SM occupancy in exactly the window where the S8192 SwiGLU bwd sits (300.9us
   on-path in the post-compose profile). S8192 megakernel is now ~7246us
