@@ -3214,6 +3214,10 @@ megakernel 1780.9us vs compile+CUDAGraph+ 1044.8us (1.70x gap). Profile total
 was 1763.3us (`n_instr=176`, critical path 80, gated 71), led by attention-dQ
 274.9us, attention-fwd 131.0us, lm-head NT 114.1us, SwiGLU-BWD 2W 103.5us,
 head-dX/lm-head-bwd 101.3us, and `QKNORM_ROPE_BWD` 99.1us.
+Post-SSQ S2048 split-V recheck
+`mkv3-p4b-qkbwd-splitv-s2048-post-ssq-20260705T2115Z.log` stayed no-change:
+default-first was a wash (-0.70us, 19/40 wins) even though split-first was
+positive (-12.75us, 40/40). Keep default `MK_QKBWD_SPLIT_V` at S3072+.
 
 Post-T29 follow-up no-gos: current default `lpt` order remains best. A
 pre-combine env-only retest at `77346e2`
