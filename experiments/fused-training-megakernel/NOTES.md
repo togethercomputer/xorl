@@ -2737,8 +2737,13 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   (45/48 wins) and S4096 -15.95us (39/40 wins). Clean promoted-default vs forced-old
   timing `mkv3-p4b-attndq-float2-store-promote-20260705T1558Z.log` remained positive:
   S3072 -11.46us (36/40 wins) and S4096 -7.17us (30/36 wins). Long-shape gradient
-  comparison `mkv3-p4b-attndq-float2-store-gradcheck-20260705T1559Z.log` matched the
-  old path to fp32-noise: worst grad rel was 7.61e-7 for S3072 and 1.20e-6 for S4096.
+comparison `mkv3-p4b-attndq-float2-store-gradcheck-20260705T1559Z.log` matched the
+old path to fp32-noise: worst grad rel was 7.61e-7 for S3072 and 1.20e-6 for S4096.
+After S2048 later joined idle32 and retuned bwd banding to T12, rechecking forced
+`MK_ATTN_DQ_FLOAT2_STORE=1`
+(`mkv3-p4b-s2048-attndq-float2-post-t12-20260705T1953Z.log`) was still only
+noise/order-mixed (+1.10us then -1.86us, weak win counts), so S2048 remains
+outside the `_adqf2` build bucket.
 
 - H256/S8192 attention-dQ `float2` direct-store promotion, but no broad Cq=1 widening:
   after DKV-float2 made S8192 even more dQ-led, env-only expansion
