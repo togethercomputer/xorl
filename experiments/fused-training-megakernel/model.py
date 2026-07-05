@@ -183,8 +183,8 @@ class MKQwen3:
 
         rms_dx_r4_env = os.environ.get("MK_RMS_DX_R4")
         if rms_dx_r4_env is None:
-            # A/B: S2048 wins repeatably; S1024/S3072/S4096 are neutral and H512 regresses.
-            rms_dx_r4 = c.H == 256 and c.S == 2048
+            # Post-route retunes: S2048 and H512/S1024 small win; longer S stays R2.
+            rms_dx_r4 = (c.H == 256 and c.S == 2048) or (c.H == 512 and c.S == 1024)
         else:
             rms_dx_r4 = bool(int(rms_dx_r4_env))
 

@@ -1183,6 +1183,19 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   across order reversals, with 98/100 and 92/100 wins. Targets 128 and 256 regressed.
   Default head dX target is now 96 for H512/S1024 too; `MK_HEAD_DX_TARGET_TILES=192`
   restores the old route.
+- Small RMS dx R4 gate: the earlier H512 R4 no-go flipped only after the qknorm-bwd cache
+  and head-dX target retunes moved the small critical path. Post-`d23c38a` recheck kept
+  S3072/S4096 as no-go (+2..6us), but H512/S1024 small was repeatably positive
+  (`mkv3-p4b-rmsdx-r4-post-headdx-d23c38a-20260705T0049RMSDX.log`). The longer small-only
+  confirmation (`mkv3-p4b-small-rmsdx-r4-confirm-d23c38a-20260705T0050RMSDX.log`)
+  measured combined paired median -9.23us with 326/440 wins. Default `rms_dx_r4` now
+  covers H512/S1024 small in addition to H256/S2048; `MK_RMS_DX_R4=0` restores the old
+  R2 route. Route guard and parity passed
+  (`mkv3-p4b-small-rmsdx-r4-route-20260705T005116Z.log`,
+  `mkv3-p4b-small-rmsdx-r4-testmodel-20260705T005248Z.log`,
+  `mkv3-p4b-small-rmsdx-r4-small-parity-20260705T005307Z.log`). Patched default vs
+  forced-old timing (`mkv3-p4b-small-rmsdx-r4-default-ab-clean-20260705T005339Z.log`)
+  measured combined paired median -5.23us with 310/440 wins.
 
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
