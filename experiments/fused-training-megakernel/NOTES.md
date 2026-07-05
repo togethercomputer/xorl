@@ -1944,6 +1944,19 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   mean, 94/240 route wins). The temporary source relaxation was reverted; keep the FMA
   route limited to H256/S128.
 
+- Small SwiGLU-BWD four-warp split no-go: extending the promoted small 2W route to an
+  opt-in 4W route (four warps per I=1536 row, two rows per block) was correctness-clean
+  but slower. Focused opcode validation passed for S64/I160, S128/I768, S128/I1536, and
+  S1024/I1536, including both bf16 and fp32 `dh` inputs
+  (`mkv3-p4b-swb4w-testops-20260705T0716Z.log`). Small model route inspection under
+  `MK_SWIGLU_BWD_4W=1` emitted 8 `OP_SWIGLU_BWD_4W` instructions and passed one-step
+  gradient parity with worst rel err 0.0229
+  (`mkv3-p4b-swb4w-small-testmodel-20260705T0716Z.log`). Paired timing against the
+  current 2W default lost decisively
+  (`mkv3-p4b-swb4w-small-step-ab-20260705T0716Z.log`: 2W 3653.41us median, 4W
+  3663.52us median, delta +10.46us median / +10.26us mean, 36/240 4W wins). The
+  temporary 4W source route was reverted; keep `OP_SWIGLU_BWD_2W` as the small default.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
