@@ -2433,6 +2433,18 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   2/200 wins, combined +53.15us with 3/400 wins. Do not promote the doubled cache;
   keep the smaller bf16 sigmoid cache as the default small route.
 
+- N128 direct bf16-store no-go: the default-off branch
+  `/home/apanda/xorl-oss-n128-direct-probe` tested `MK_N128_DIRECT_BF16=1`, bypassing
+  the n128 WGMMA shared-memory accumulator drain for plain bf16-output tiles only.
+  Correctness passed for H512/S1024 small
+  (`mkv3-p4b-n128ds-small-parity-20260705T1403Z.log`: extension `_n128ds`, 50 n128
+  GEMM rows, 32 plain direct-store candidates, loss 9.79777 vs 9.79781, worst grad rel
+  0.025832). Paired timing was not promotable
+  (`mkv3-p4b-n128ds-vs-default-small-step-ab-20260705T1403Z.log`): default-first
+  regressed by +31.94us median with only 5/200 variant wins; variant-first was neutral
+  at +0.98us median with 98/200 wins; combined regressed by +16.77us with 103/400
+  wins. Keep the current coalesced shared-memory epilogue for n128 GEMMs.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
