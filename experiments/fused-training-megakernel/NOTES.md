@@ -3003,6 +3003,22 @@ S8192 DQ-first. Long scoreboard at `d86b5ce`
 vs compile+CUDAGraph+ `3137.1us` (2.34x); shorter-shape scoreboard medians were
 noisy and should be interpreted through the paired A/B above.
 
+S4096 fwd-band retune after the S4096 bwd-band T29 default and combine row
+batching: isolated worktree `/home/apanda/xorl-oss-attn-fwdband-retune` retested
+nearby `MK_ATTN_FWD_BAND` budgets against committed current head `98591ae`.
+Broad log `mkv3-p4b-fwdband-retune-broad-20260705T1905Z.log` showed T24 as the
+only positive broad candidate (-17.0/-11.6us, 23/24 and 24/24 wins); T28/T29/T30/
+T36/T40 lost, and S8192 stayed on T64 because T48/T56/T72/T80 all lost. Narrow
+S4096 log `mkv3-p4b-fwdband-retune-s4096-narrow-20260705T1912Z.log` picked T22:
+current T32 vs forced T22 was -23.26us/-22.64us with 40/40 wins in both
+construction orders, parity clean (`worst_grad_rel` <= 0.010605). T24 also won
+but less (-16.56/-15.87us), and T26 was neutral/bad. Promote H256/D64/S4096 fwd
+banding from T32 to T22; promoted-default confirmation
+`mkv3-p4b-fwdband-retune-s4096-promoted-default-20260705T1917Z.log` beat forced
+old T32 by +20.77us/+21.71us old-minus-new (old wins only 2/40 and 1/40), with
+parity clean (`worst_grad_rel` <= 0.010257). Keep S2048 T16, S3072 T32, and
+S8192 T64 unchanged.
+
 ## v3 P4b fused one-pass attention bwd (session 2853e0de): NO-GO, and why
 
 FA2-style fusion of dQ into `OP_ATTN_DKV_WG` (per stage: x3 wgmma commit batch

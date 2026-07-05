@@ -179,7 +179,7 @@ class MKQwen3:
         # off): straggler q-tiles run as flash-decoding kv chunks writing
         # locally-normalized partials; a range-limited OP_ATTN_COMBINE merges them.
         default_attn_fwd_band_T = (
-            {2048: 16, 3072: 32, 4096: 32, 8192: 64}.get(c.S, 0)
+            {2048: 16, 3072: 32, 4096: 22, 8192: 64}.get(c.S, 0)
             if c.H == 256 and c.D == 64
             else 0
         )
