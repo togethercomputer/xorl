@@ -167,8 +167,13 @@ __device__ void op_attn_fwd(const Instr& I, int tile, void** bufs, char* smem_ra
     const int gr = q0 + r;
     if (gr < S) O[(int64_t)gr * (nq * D) + qh * D + c] = f2bf(sm.Acc1[r][c] / sm.row_l[r]);
   }
-  if (tid < AT_T && q0 + tid < S)
+  if (tid < AT_T && q0 + tid < S) {
+#ifdef MK_ATTN_FAST_LOG
+    LSE[(int64_t)qh * S + q0 + tid] = sm.row_m[tid] + __logf(sm.row_l[tid]);
+#else
     LSE[(int64_t)qh * S + q0 + tid] = sm.row_m[tid] + logf(sm.row_l[tid]);
+#endif
+  }
 }
 
 // ---- split-KV forward (flash-decoding style) ----------------------------------------

@@ -1831,6 +1831,20 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   (`mkv3-p4b-rmsxfma-default-vs-old-s128-20260705T0637RMSX.log`) confirmed -5.98us
   median with 161/200 default wins. `MK_RMS_DX_FMA_ROUTE=0` forces the old path for A/B.
 
+- ATTN_FWD_WG fast-log restoration: current-head profiling after `d2f4db7`
+  (`mkv3-p4b-profile-current-d2f4db7-20260705T0602PROFILE.log`,
+  `mkv3-p4b-profile-s1024-d2f4db7-20260705T0608PROFILE.log`) showed attention fwd/dkv
+  still dominating small and H256/S1024, and source inspection found the existing
+  `MK_ATTN_FAST_LOG` compile flag no longer affected `attention.cuh`. The WGMMA forward
+  LSE write again uses `__logf` by default, with `MK_ATTN_FAST_LOG=0` restoring precise
+  `logf` for A/B. Focused attention and full-model validation passed
+  (`mkv3-p4b-aflogrestore-testattention-20260705T0611AFLOG.log`,
+  `mkv3-p4b-aflogrestore-testmodel-20260705T0614AFLOG.log`). Paired default-vs-precise
+  timing (`mkv3-p4b-aflogrestore-step-ab-20260705T0615AFLOG.log`) confirmed S128
+  -9.66us (153/160 fast wins), S256 neutral -0.38us (85/160), nano -9.41us (193/200),
+  small -20.08us (160/160), H256/S1024 -6.08us (126/160), and H256/S2048 -15.15us
+  (120/120).
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
