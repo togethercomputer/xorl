@@ -49,6 +49,15 @@ __device__ __forceinline__ float lmhead_exp(float x) {
   return __expf(x);
 #endif
 }
+__device__ __forceinline__ float ce_exp(float x) {
+#ifdef MK_CE_EXP2_APPROX
+  float y;
+  asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x * 1.4426950408889634f));
+  return y;
+#else
+  return expf(x);
+#endif
+}
 
 // ---- trivial ops (skeleton validation) ------------------------------------------------
 
@@ -540,6 +549,19 @@ __device__ __noinline__ void op_gemm_wgmma_n128(const Instr& I, int tile, void**
 #pragma unroll
     for (int e = 0; e < 8; ++e) oe[e] = f2bf(v[e]);
     *reinterpret_cast<uint4*>(&C[idx]) = out;
+    if (flags & 8192) {  // ssq partials from post-residual v[] (see m64n64 version)
+      float* parts = reinterpret_cast<float*>(bufs[I.args[9]]);
+      const int nparts = I.args[10];
+      float ss = 0.0f;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const float zv = bf2f(f2bf(v[e]));
+        ss += zv * zv;
+      }
+#pragma unroll
+      for (int o = 4; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+      if ((gid & 7) == 0) parts[(int64_t)(m0 + m) * nparts + n0 / WG_BN + (c8 >= 64)] = ss;
+    }
   }
 
   if (flags & 2048) {  // CE/LSE partials over both 64-col halves (see m64n64 version)
@@ -732,6 +754,24 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
 #pragma unroll
       for (int e = 0; e < 8; ++e) oe[e] = f2bf(v[e]);
       *reinterpret_cast<uint4*>(&C[idx]) = out;
+    }
+    if (flags & 8192) {
+      // Fused ssq partials (bit13, wo/down gemms feeding rmsnorm): per-row sum of
+      // squares of the bf16-ROUNDED POST-RESIDUAL values (= exactly what
+      // rmsnorm_fwd would read back). 8 consecutive lanes share a row: butterfly
+      // octet reduce, one plain store per (row, 64-col block).
+      // args: 9 = ssq partials fp32 [M, nparts], 10 = nparts (= N/64).
+      float* parts = reinterpret_cast<float*>(bufs[I.args[9]]);
+      const int nparts = I.args[10];
+      float ss = 0.0f;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const float zv = bf2f(f2bf(v[e]));
+        ss += zv * zv;
+      }
+#pragma unroll
+      for (int o = 4; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+      if ((gid & 7) == 0) parts[(int64_t)gm * nparts + n0 / WG_BN] = ss;
     }
   }
 
@@ -938,7 +978,16 @@ __device__ void op_rmsnorm_fwd(const Instr& I, int tile, void** bufs, char* smem
   float* rstd = reinterpret_cast<float*>(bufs[I.args[3]]);
 
   float ssA = 0.0f, ssB = 0.0f;
-  if ((H & 7) == 0) {
+  const int nparts = I.args[8];  // > 0: producer-gemm ssq partials (bit13 epilogue)
+  if (nparts > 0) {
+    // variance pass from partials: nparts (= H/64 <= 8ish) floats per row instead
+    // of re-reading the H-wide row — half the op's loads and no long dot chain.
+    const float* parts = reinterpret_cast<const float*>(bufs[I.args[7]]);
+    if (lane < nparts) {
+      ssA = parts[(int64_t)rowA * nparts + lane];
+      ssB = parts[(int64_t)rowB * nparts + lane];
+    }
+  } else if ((H & 7) == 0) {
     for (int i = lane * 8; i < H; i += 32 * 8) {
       float a[8], b[8];
       ld8bf(xA + i, a);
@@ -1727,17 +1776,18 @@ __device__ void op_ce_fwd(const Instr& I, int tile, void** bufs, char* smem_raw)
     for (int i = mk_tid(); i < nparts; i += MK_CONSUMERS) {
       const float om = parts[i * 2], os = parts[i * 2 + 1];
       const float M = fmaxf(mx, om);
-      se = (mx == -INFINITY && om == -INFINITY) ? 0.0f : se * expf(mx - M) + os * expf(om - M);
+      se = (mx == -INFINITY && om == -INFINITY) ? 0.0f
+                                                 : se * ce_exp(mx - M) + os * ce_exp(om - M);
       mx = M;
     }
   } else {
     for (int i = mk_tid(); i < V; i += MK_CONSUMERS) {
       const float zv = bf2f(z[i]);
       if (zv > mx) {
-        se = se * expf(mx - zv) + 1.0f;
+        se = se * ce_exp(mx - zv) + 1.0f;
         mx = zv;
       } else {
-        se += expf(zv - mx);
+        se += ce_exp(zv - mx);
       }
     }
   }
@@ -1746,7 +1796,8 @@ __device__ void op_ce_fwd(const Instr& I, int tile, void** bufs, char* smem_raw)
     const float om = __shfl_xor_sync(0xffffffff, mx, off);
     const float os = __shfl_xor_sync(0xffffffff, se, off);
     const float M = fmaxf(mx, om);
-    se = (mx == -INFINITY && om == -INFINITY) ? 0.0f : se * expf(mx - M) + os * expf(om - M);
+    se = (mx == -INFINITY && om == -INFINITY) ? 0.0f
+                                              : se * ce_exp(mx - M) + os * ce_exp(om - M);
     mx = M;
   }
   if ((mk_tid() & 31) == 0) {
@@ -1760,7 +1811,7 @@ __device__ void op_ce_fwd(const Instr& I, int tile, void** bufs, char* smem_raw)
     for (int w = 1; w < MK_CONSUMERS / 32; ++w) {
       const float om = scratch[w * 2], os = scratch[w * 2 + 1];
       const float M = fmaxf(mx, om);
-      se = se * expf(mx - M) + os * expf(om - M);
+      se = se * ce_exp(mx - M) + os * ce_exp(om - M);
       mx = M;
     }
     scratch[0] = mx;

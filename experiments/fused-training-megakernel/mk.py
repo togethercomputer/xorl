@@ -278,9 +278,14 @@ def _access_sets(op, args):
         if flags & 1024:  # fused Drow epilogue (dOatt gemm)
             r.append(9)
             w.append(10)
+        if flags & 8192:  # fused ssq partials (rmsnorm variance pass skip)
+            w.append(9)
         return r, w
     if op == OP_RMSNORM_FWD:
-        return [0, 1], [2, 3]
+        r = [0, 1]
+        if len(args) > 8 and args[8]:  # ssq partials from the producing gemm
+            r.append(7)
+        return r, [2, 3]
     if op == OP_RMSNORM_BWD:
         return [0, 1, 2, 5], [3, 4]
     if op in (OP_RMSNORM_BWD_DX, OP_RMSNORM_BWD_DX_R4, OP_RMSNORM_BWD_DX_FMA):

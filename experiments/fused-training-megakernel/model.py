@@ -84,6 +84,11 @@ class MKQwen3:
             A[f"xn2.{l}"] = torch.empty(c.S, c.H, device=dev, dtype=bf)
             A[f"gu.{l}"] = torch.empty(c.S, 2 * c.I, device=dev, dtype=bf)
             A[f"hs.{l}"] = torch.empty(c.S, c.I, device=dev, dtype=bf)
+        if c.H % 64 == 0:  # ssq partials for the bit13 fusion (tiny: S x H/64 fp32)
+            for l in range(c.L):
+                A[f"x2ssq.{l}"] = torch.empty(c.S, c.H // 64, device=dev, dtype=f32)
+            for l in range(1, c.L + 1):
+                A[f"Xssq.{l}"] = torch.empty(c.S, c.H // 64, device=dev, dtype=f32)
         A["rstdf"] = torch.empty(c.S, device=dev, dtype=f32)
         A["xnf"] = torch.empty(c.S, c.H, device=dev, dtype=bf)
         A["logits"] = torch.empty(c.S, c.V, device=dev, dtype=bf)
@@ -175,7 +180,12 @@ class MKQwen3:
             p.default_cold_cap = 16
         B = p.buf
 
-        def gemm(a, b, out, M, N, K, flags, res=0):
+        def gemm(a, b, out, M, N, K, flags, res=0, ssq=0, ssq_nparts=0):
+            # ssq/ssq_nparts (bit13, v3 P4b r4): the wgmma epilogues emit per-64-col
+            # sum-of-squares partials of the bf16-rounded output — free math on values
+            # already in registers — so the consuming rmsnorm_fwd skips its variance
+            # pass. Returns True when fused (the WMMA fallback has no such epilogue;
+            # the rmsnorm call site must then use the classic path).
             if flags & 8 and flags & 4:  # fp32 accumulating dW: split-K for occupancy
                 if mk.wgmma_ok(M, N, K, flags):
                     sk = mk.wgmma_split_k(M, N, K)
@@ -187,12 +197,22 @@ class MKQwen3:
                 else:
                     sk = mk.gemm_split_k(M, N, K)
                     p.instr(mk.OP_GEMM, mk.gemm_tiles(M, N) * sk, [a, b, out, M, N, K, (flags | 32) & ~4, res, sk])
-            elif mk.wgmma_n128_ok(M, N, K, flags):  # m64n128 NT tile (P4b r3)
-                p.instr(mk.OP_GEMM, mk.gemm_tiles_wgmma_n128(M, N), [a, b, out, M, N, K, flags | 128 | 4096, res])
-            elif mk.wgmma_ok(M, N, K, flags):  # Hopper warpgroup path
-                p.instr(mk.OP_GEMM, mk.gemm_tiles_wgmma(M, N), [a, b, out, M, N, K, flags | 128, res])
-            else:
-                p.instr(mk.OP_GEMM, mk.gemm_tiles(M, N), [a, b, out, M, N, K, flags, res])
+                return False
+            do_ssq = ssq_nparts > 0 and int(os.environ.get("MK_SSQ_FUSE", "1"))
+            if mk.wgmma_n128_ok(M, N, K, flags):  # m64n128 NT tile (P4b r3)
+                f = flags | 128 | 4096 | (8192 if do_ssq else 0)
+                p.instr(mk.OP_GEMM, mk.gemm_tiles_wgmma_n128(M, N),
+                        [a, b, out, M, N, K, f, res, 0, ssq, ssq_nparts] if do_ssq
+                        else [a, b, out, M, N, K, f, res])
+                return do_ssq
+            if mk.wgmma_ok(M, N, K, flags):  # Hopper warpgroup path
+                f = flags | 128 | (8192 if do_ssq else 0)
+                p.instr(mk.OP_GEMM, mk.gemm_tiles_wgmma(M, N),
+                        [a, b, out, M, N, K, f, res, 0, ssq, ssq_nparts] if do_ssq
+                        else [a, b, out, M, N, K, f, res])
+                return do_ssq
+            p.instr(mk.OP_GEMM, mk.gemm_tiles(M, N), [a, b, out, M, N, K, flags, res])
+            return False
 
         def fill_zero(t):
             n = t.numel()
@@ -265,6 +285,7 @@ class MKQwen3:
             return out_bf, 0
 
         X = [B(A["X"][l]) for l in range(c.L + 1)]
+        X_fused = {}  # X[l] ssq partials available (down-gemm bit13 fused)
         n_qt = (c.S + 31) // 32
         tokens_buf = B(self.tokens)
         labels_buf = B(self.labels)
@@ -292,7 +313,9 @@ class MKQwen3:
         for l in range(c.L):
             pr = lambda n: B(self.params[f"{n}.{l}"])  # noqa: E731
             a = lambda n: B(A[f"{n}.{l}"])  # noqa: E731
-            p.instr(mk.OP_RMSNORM_FWD, mk.rowop_tiles(c.S, mk.ROWOP_R2), [X[l], pr("w1"), a("xn1"), a("rstd1"), c.H, eps, c.S])
+            p.instr(mk.OP_RMSNORM_FWD, mk.rowop_tiles(c.S, mk.ROWOP_R2),
+                    [X[l], pr("w1"), a("xn1"), a("rstd1"), c.H, eps, c.S]
+                    + ([B(A[f"Xssq.{l}"]), c.H // 64] if X_fused.get(l) else []))
             p.wave()
             if c.D == 64 and mk.wgmma_ok(c.S, QD, c.H, 2):
                 # qk-norm + rope fused into the qkv gemm epilogue (one head per tile)
@@ -369,9 +392,13 @@ class MKQwen3:
             else:
                 p.instr(mk.OP_ATTN_FWD, c.nq * n_qt, [a("qkvr"), a("oatt"), a("lse"), c.S, c.nq, c.nkv, c.D, scale])
                 p.wave()
-            gemm(a("oatt"), pr("wo"), a("x2"), c.S, c.H, c.nq * c.D, 2 | 16, X[l])
+            x2_fused = gemm(a("oatt"), pr("wo"), a("x2"), c.S, c.H, c.nq * c.D, 2 | 16, X[l],
+                            ssq=(B(A[f"x2ssq.{l}"]) if c.H % 64 == 0 else 0),
+                            ssq_nparts=(c.H // 64 if c.H % 64 == 0 else 0))
             p.wave()
-            p.instr(mk.OP_RMSNORM_FWD, mk.rowop_tiles(c.S, mk.ROWOP_R2), [a("x2"), pr("w2"), a("xn2"), a("rstd2"), c.H, eps, c.S])
+            p.instr(mk.OP_RMSNORM_FWD, mk.rowop_tiles(c.S, mk.ROWOP_R2),
+                    [a("x2"), pr("w2"), a("xn2"), a("rstd2"), c.H, eps, c.S]
+                    + ([B(A[f"x2ssq.{l}"]), c.H // 64] if x2_fused else []))
             p.wave()
             # Paired-column swiglu fusion (gate/up in one tile, two k-loops) was TRIED
             # AND REMOVED: halving the gu tiles doubles per-tile serial span (nano +88us,
@@ -381,11 +408,15 @@ class MKQwen3:
             p.wave()
             p.instr(mk.OP_SWIGLU_FWD, mk.rowop_tiles(c.S), [a("gu"), a("hs"), c.S, c.I])
             p.wave()
-            gemm(a("hs"), pr("wd"), X[l + 1], c.S, c.H, c.I, 2 | 16, a("x2"))
+            X_fused[l + 1] = gemm(a("hs"), pr("wd"), X[l + 1], c.S, c.H, c.I, 2 | 16, a("x2"),
+                                  ssq=(B(A[f"Xssq.{l + 1}"]) if c.H % 64 == 0 else 0),
+                                  ssq_nparts=(c.H // 64 if c.H % 64 == 0 else 0))
             p.wave()
 
         # ---- head + loss ----
-        p.instr(mk.OP_RMSNORM_FWD, mk.rowop_tiles(c.S, mk.ROWOP_R2), [X[c.L], B(self.params["wf"]), B(A["xnf"]), B(A["rstdf"]), c.H, eps, c.S])
+        p.instr(mk.OP_RMSNORM_FWD, mk.rowop_tiles(c.S, mk.ROWOP_R2),
+                [X[c.L], B(self.params["wf"]), B(A["xnf"]), B(A["rstdf"]), c.H, eps, c.S]
+                + ([B(A[f"Xssq.{c.L}"]), c.H // 64] if X_fused.get(c.L) else []))
         p.wave()
         # bit11 (lse partials in the lm_head epilogue): A/B measured NEUTRAL within
         # noise (on: 1865/9275, off: 1861/9317). Kept ON — cheapens the CE hop ~5x
