@@ -3634,6 +3634,30 @@ win lands on the intended hop: qwen `GEMMNT 1024x151936x2560.wg` span dropped
 standalone verdict intact: staged n256 remains blocked by cooperative smem, and broad
 direct n256 remains rejected.
 
+## v3 P4b qwen lm-head dX n128 no-atomic route: exact-shape promotion
+
+After the qwen lm-head forward fix, the remaining largest on-path GEMM was
+`dlogits @ Wlm`: default qwen emitted `GEMMNN 1024x2560x151936.wg.splitK` as
+`ntiles=320, flags=168, sk=1`, still paying the split-K zero-fill/atomic route even
+though the split count was one. Existing head-dX n128 support already had the needed
+implementation, so this was an env-only qwen check before source promotion.
+
+Initial three-arm log `mkv3-p4b-qwen-headdx-n128split-20260705T2306Z.log` proved route
+emission but OOMed while comparing giant gradients across three resident qwen models.
+The memory-safe rerun `mkv3-p4b-qwen-headdx-n128split-rerun-20260705T2309Z.log`
+compared one candidate at a time with chunked gradient diffs. Forced n128 split-atomic
+(`MK_HEAD_DX_N128_SPLIT=1`) changed the row to `ntiles=160, flags=4264, sk=1` and won
+`21235.3us -> 19674.4us` (`+1560.9us`). Forced n128 fp32/no-atomic
+(`MK_HEAD_DX_N128_F32=1`, `MK_HEAD_DX_NO_ATOMIC_SK1=1`) changed it to
+`ntiles=160, flags=4232` and was better: `21204.1us -> 19576.0us`
+(`+1628.1us`). Loss rel-diff was `-1.5e-7`; selected gradient rel diffs were below
+`3.7e-7`.
+
+Promoted only the exact qwen4b-l1 shape `(H,S,V,nq,nkv,D,L) =
+(2560,1024,151936,32,8,128,1)` into the existing `MK_HEAD_DX_N128_F32` default.
+`MK_HEAD_DX_N128_F32=0` restores the old split-atomic route. This does not broaden the
+earlier n128 split verdicts for nano/small/general MLP dX.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

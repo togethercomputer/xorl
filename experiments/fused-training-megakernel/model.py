@@ -79,6 +79,7 @@ _H256_D64_QKBWD_SPLIT_V_S = (3072, 4096, 8192)  # H==256/D==64: split qkrope v-b
 _H256_ATTN_CHUNKS = {512: (2, 2), 1024: (2, 2), 2048: (2, 2)}
 # non-WGMMA D=128 fallback DQ chunks; exact attention-shape gate from qwen4b-l1.
 _D128_GENERIC_DQ_C1 = {(2560, 1024, 32, 8)}  # (H, S, nq, nkv); D==128
+_QWEN_L1_HEAD_DX_N128_F32 = {(2560, 1024, 151936, 32, 8, 128, 1)}  # H,S,V,nq,nkv,D,L
 # dlogits @ Wlm split-K tile targets: {H: {S: target}}, 192 elsewhere.
 _HEAD_DX_TARGET = {256: {128: 32, 256: 64, 1024: 64, 512: 96, 2048: 96, 3072: 96},
                    512: {1024: 96}}
@@ -640,7 +641,10 @@ class MKQwen3:
         head_dx_n128_f32_env = os.environ.get("MK_HEAD_DX_N128_F32")
         head_dx_n128_split_env = os.environ.get("MK_HEAD_DX_N128_SPLIT")
         if head_dx_n128_f32_env is None:
-            head_dx_n128_f32 = c.H == 512 and c.S == 1024 and c.V % 64 == 0
+            head_dx_n128_f32 = (
+                (c.H == 512 and c.S == 1024 and c.V % 64 == 0)
+                or (c.H, c.S, c.V, c.nq, c.nkv, c.D, c.L) in _QWEN_L1_HEAD_DX_N128_F32
+            )
         else:
             head_dx_n128_f32 = bool(int(head_dx_n128_f32_env))
         if head_dx_no_atomic_sk1_env is None:
