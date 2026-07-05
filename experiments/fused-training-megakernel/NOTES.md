@@ -3075,6 +3075,28 @@ medians but still paired -66.8us). Confirmation log
 `{2048:16, 3072:16, 4096:29, 8192:32}`; `MK_ATTN_BAND=32` restores the old
 S4096 route for A/B and `MK_ATTN_BAND=0` still restores the uniform C route.
 
+## v3 P4b attention-combine row batching (session 2853e0de): PROMOTED
+
+The post-compose profile showed `OP_ATTN_COMBINE` (the fwd-band merge op) fat on
+the realized path — S3072 100.1us, S4096 181.0us, S8192 301.3us — because its
+tile was ONE ROW, so a long-S combine instruction was 2-4k tiny claim-ring
+transactions. `op_attn_combine` now takes R rows per tile (new trailing arg,
+zero-pads to R=1 for stale callers) with work unit = (row, head) so all 8 warps
+stay busy at nq < 8; the fwd-band emission defaults `MK_ATTN_COMBINE_R=8`.
+Paired default-vs-forced-R1, both construction orders, parity clean (worst grad
+rel <= 0.0053): S3072 -33.1/-27.9us (old wins 0/40 both), S4096 -28.5/-23.6us
+(1/40, 2/40), S8192 -69.5/-46.2us (0/16 both). test_ops + test_model green.
+Merged as `fe39656`. Log
+`mkv3-p4b-attn-combine-r-ab-*.log` in the attn-combine-r worktree.
+
+Precision note discovered during validation (pre-existing, NOT from this
+change; identical on main to 4 decimals): forcing fwd bands at nano with tiny T
+(`MK_ATTN_FWD_BAND=4` at S512) overshoots the test_model PyTorch-reference grad
+bar marginally (kn.3 0.0365 vs 0.03) — the bf16 locally-normalized partial
+round-trip costs ~2x error on the tiny qk-norm grads. The default gates
+(S >= 2048) avoid the config; if fwd bands are ever gated at short S, budget
+tolerance or store partials fp32.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
