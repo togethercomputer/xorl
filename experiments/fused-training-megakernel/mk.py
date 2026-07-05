@@ -170,7 +170,6 @@ def load_ext(
     drow_direct_store=None,
     attn_exp2_approx=None,
     lmhead_exp2_approx=None,
-    ce_exp2_approx=None,
 ):
     # MK_OCC2=1 builds the 256-thread executors with __launch_bounds__(256, 2):
     # 2 blocks/SM (128-reg ceiling, ptxas spills the fat op paths). Motivated by the
@@ -198,9 +197,6 @@ def load_ext(
     lmhead_exp2_approx = int(
         os.environ.get("MK_LMHEAD_EXP2_APPROX", int(bool(lmhead_exp2_approx)))
     )
-    ce_exp2_approx = int(
-        os.environ.get("MK_CE_EXP2_APPROX", int(bool(ce_exp2_approx)))
-    )
     # D=64 qknorm-bwd fast path; MK_QKBWD_D64_CACHE=0 keeps the old generic loop for
     # A/B and bisects. Separate extension name because torch's cache is name-keyed.
     qkbc = int(os.environ.get("MK_QKBWD_D64_CACHE", "1"))
@@ -220,7 +216,6 @@ def load_ext(
         + ("_drowst" if drow_direct_store else "")
         + ("_aflog" if attn_fast_log else "") + ("_aex2" if attn_exp2_approx else "")
         + ("_lex2" if lmhead_exp2_approx else "")
-        + ("_cex2" if ce_exp2_approx else "")
         + ("_qkbc" if qkbc else "")
         + ("_swfma" if swiglu_fma_deriv else "") + ("_swb2w" if swiglu_bwd_2w else ""),
         sources=[os.path.join(_DIR, "megakernel.cu")],
@@ -242,7 +237,6 @@ def load_ext(
         + (["-DMK_ATTN_FAST_LOG"] if attn_fast_log else [])
         + (["-DMK_ATTN_EXP2_APPROX"] if attn_exp2_approx else [])
         + (["-DMK_LMHEAD_EXP2_APPROX"] if lmhead_exp2_approx else [])
-        + (["-DMK_CE_EXP2_APPROX"] if ce_exp2_approx else [])
         + (["-DMK_QKBWD_D64_CACHE"] if qkbc else [])
         + (["-DMK_SWIGLU_FMA_DERIV"] if swiglu_fma_deriv else [])
         + (["-DMK_SWIGLU_BWD_2W"] if swiglu_bwd_2w else []),

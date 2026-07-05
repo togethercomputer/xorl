@@ -2046,6 +2046,25 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   in those kernels or a scheduler/dependency mechanism, not another CE/lm-head epilogue
   cleanup.
 
+- CE forward `exp2.approx` no-go: a default-off `MK_CE_EXP2_APPROX=1` probe swapped
+  only `OP_CE_FWD`'s online sumexp/merge exponentials from `expf` to
+  `ex2.approx.ftz.f32`; CE backward kept libm `expf` per the earlier measured revert.
+  The first shared-checkout timing attempt was invalidated by overlapping SSQ/RMS WIP,
+  so the decision moved to clean sibling worktree `/home/apanda/xorl-oss-cex2-probe`.
+  Forced-on full model validation passed
+  (`mkv3-p4b-cex2-clean-testmodel-20260705T0908Z.log`; training sanity 9.0496 ->
+  6.0712). The first GPU 5 paired A/B built old first and looked positive
+  (`mkv3-p4b-cex2-gpu5-step-ab-20260705T0917Z.log`: S128 -15.94us, S256 -12.22us,
+  nano/S512 -13.55us, small -7.33us, H256/S1024 -4.05us, H256/S2048 -37.10us,
+  D128/ragged -10.03us median). But the actual promoted-default check reversed the
+  construction order and refuted the change
+  (`mkv3-p4b-cex2-gated-default-vs-old-20260705T0937Z.log`): default `_cex2`
+  regressed S128 +18.19us, S256 +8.58us, nano/S512 +7.26us, small +7.73us, and
+  H256/S2048 +9.74us median; only H256/S1024 (-0.53us) and D128/ragged (-0.78us) were
+  neutral/tiny positive. Source experiment reverted, including the inert `mk.py`
+  `MK_CE_EXP2_APPROX` plumbing that had slipped into the idle-poll commit; keep
+  `OP_CE_FWD` precise.
+
 ## Overnight-state certified scoreboard (2026-07-05 ~10:00Z, both sessions' work)
 
 Clean-GPU util guards, median-of-50, fresh process per config, flash baseline:
