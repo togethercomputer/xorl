@@ -3174,6 +3174,12 @@ wins) and split-first positive (-12.85us, 38/40 wins). Cached confirmation
 `mkv3-p4b-qkbwd-splitv-s2048-confirm-20260705T2048Z.log` repeated the split-first
 win (-11.98us, 40/40) but default-first stayed too weak/noisy (-1.26us, 17/40).
 Keep the default gate at S3072+.
+Post-promotion S3072 profile/score
+`mkv3-p4b-profile-score-s3072-post-qkbv-ed18a16-20260705T2050Z.log` measured
+megakernel 2485.3us vs compile+CUDAGraph+ 1273.2us (1.95x gap). Profile total
+was 2485.9us (`n_instr=180`, critical path 80, gated 63); on-path leaders are
+attention-dQ 516.8us, lm-head NT 223.9us, attention-fwd 183.4us, SwiGLU-BWD 2W
+143.6us, RMS dx 139.9us, and `QKNORM_ROPE_BWD` 131.4us.
 
 Post-T29 follow-up no-gos: current default `lpt` order remains best. A
 pre-combine env-only retest at `77346e2`
