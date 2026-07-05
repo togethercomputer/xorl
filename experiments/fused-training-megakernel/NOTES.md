@@ -2530,6 +2530,9 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   (`mkv3-p4b-profile-s1024-post-sw2w-2e4a5cb-20260705T1508Z.log`) measured 1208.2us
   total; the top path is still attention/GEMM led (`ATTN_DKV_WG` 136.0us,
   `ATTN_FWD_WG` 128.9us, MLP dX 90.5us), with cached `SWIGLU_BWD_2W` at 75.9us.
+  The matching score refresh
+  (`mkv3-p4b-score-s1024-post-sw2w-2e4a5cb-20260705T1520Z.log`) measured megakernel
+  1228.4us vs compile+CUDAGraph+ 778.0us (1.58x gap).
 
 - Current-head H256/S1024 n128 NN recheck no-change: because the post-2W profile still
   had `GEMMNN 1024x256x1536.wg` on the path, an env-only `MK_WGMMA_N128_NN_MIN=16`
