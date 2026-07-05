@@ -1935,6 +1935,15 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   the next small leaders are `ATTN_DKV_WG`, `GEMMNN 1024x512x3072.wg`,
   `SWIGLU_BWD_2W`, Drow `GEMMNN 1024x512x512.wg`, `ATTN_FWD_WG`, and RMS dx.
 
+- Post-SwiGLU-2W small RMS dx FMA recheck: because RMS dx remains on path after the
+  small SwiGLU win, `MK_RMS_DX_FMA_ROUTE=1` was temporarily loosened to force
+  `OP_RMSNORM_BWD_DX_FMA` on H512/S1024 small. The route emitted 17 FMA dx ops and
+  passed small gradient parity (`mkv3-p4b-rmsxfma-small-testmodel-20260705T071005Z.log`),
+  but paired timing was negative/noise-level
+  (`mkv3-p4b-rmsxfma-small-step-ab-20260705T071005Z.log`: +2.40us median, +1.86us
+  mean, 94/240 route wins). The temporary source relaxation was reverted; keep the FMA
+  route limited to H256/S128.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
