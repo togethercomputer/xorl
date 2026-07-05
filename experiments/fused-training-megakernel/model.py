@@ -171,10 +171,15 @@ class MKQwen3:
         # per-row (max, sumexp) partials from the lm_head gemm epilogue (bit11)
         if c.V % 64 == 0:
             W["lse_parts"] = torch.empty(c.S, c.V // 64, 2, device=dev, dtype=f32)
-        # fwd split-band partials (env-only probe, MK_ATTN_FWD_BAND = target stages
-        # per chunk): straggler q-tiles run as flash-decoding kv chunks writing
-        # locally-normalized partials; a range-limited OP_ATTN_COMBINE merges them
-        self.attn_fwd_band_T = int(os.environ.get("MK_ATTN_FWD_BAND", "0"))
+        # fwd split-band partials (MK_ATTN_FWD_BAND = target stages per chunk, 0 =
+        # off): straggler q-tiles run as flash-decoding kv chunks writing
+        # locally-normalized partials; a range-limited OP_ATTN_COMBINE merges them.
+        default_attn_fwd_band_T = (
+            {2048: 16, 3072: 32, 4096: 32, 8192: 64}.get(c.S, 0)
+            if c.H == 256 and c.D == 64
+            else 0
+        )
+        self.attn_fwd_band_T = int(os.environ.get("MK_ATTN_FWD_BAND", str(default_attn_fwd_band_T)))
         self.attn_fwd_bands = None
         if self.attn_fwd_band_T > 0 and c.D == 64 and c.S % 128 == 0:
             fb = attn_bands(c.S // 128, lambda i: i * 2 + 2, self.attn_fwd_band_T)

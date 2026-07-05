@@ -11,10 +11,12 @@ flag), so there is no build-cache race and no cross-build noise.
 import os
 import statistics
 import sys
+from pathlib import Path
 
 import torch
 
-EXPDIR = "/home/apanda/xorl-oss-attn-fwdband/experiments/fused-training-megakernel"
+
+EXPDIR = str(Path(__file__).resolve().parents[1] / "experiments/fused-training-megakernel")
 sys.path.insert(0, EXPDIR)
 
 

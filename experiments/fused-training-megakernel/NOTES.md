@@ -2976,11 +2976,23 @@ S4096 still match the shared tree exactly, while S8192 default changes to
 `mkv3-p4b-attn-band-order-long-sweep-20260705T1804Z.log`, and
 `mkv3-p4b-attn-band-order-s8192-promoted-default-20260705T1808Z.log`.
 
-Follow-on candidates this opens (unclaimed): (a) ATTN_FWD_WG banding — fwd is
-also straggler-bound (64st x 1.5us of its 111.8us at S4096) but needs the
-split+combine (opart/mpart/lpart) machinery ported to the WG path; (b) a
-tile-budgeted band chooser (split-to-budget instead of ceil(stages/T)) to
-recover the standalone dq wave-quantization loss at S4096.
+ATTN_FWD_WG banding follow-on (session 2853e0de implementation, current-head
+validation by the band-order session) is promoted for H256/D64 long shapes. The WG
+fwd path now supports `MK_ATTN_FWD_BAND=<T>`: split q bands run as flash-decoding
+kv chunks that write locally-normalized `fopart/fmpart/flpart`, then a range-limited
+`OP_ATTN_COMBINE` merges only the split rows; C=1 bands keep the direct O/LSE
+epilogue. Default gate: `{2048:16, 3072:32, 4096:32, 8192:64}` for H256/D64, and
+`MK_ATTN_FWD_BAND=0` restores the old direct fwd route. The S8192 validation is
+against current `94c1a2a` after the DQ-first bwd band-order merge, not the older
+`cfeaaf4` baseline. Current-head paired A/B log:
+`/home/apanda/xorl-oss-attn-fwdband-current-eval/results/mkv3-p4b-attn-fwdband-current-eval-20260705T1822Z.log`.
+Results: S2048/T16 -19.7/-15.7us (39/40, 39/40), S3072/T32 -45.7/-43.9us
+(40/40, 40/40), S4096/T32 -4.4/-11.1us (30/40, 40/40), S8192/T64
+-452.2/-481.5us (16/16, 16/16). All parity checks passed (`worst_grad_rel`
+<= 0.013994). Keep rejected fwd-band variants out of the default: S4096 T16 and
+T48 lose, T64 is neutral; S3072 T16 is neutral/negative. Open follow-on: profile
+the promoted default and revisit tile-budgeted band choice only if the new path
+shows combine/wait imbalance.
 
 ## v3 P4b fused one-pass attention bwd (session 2853e0de): NO-GO, and why
 
