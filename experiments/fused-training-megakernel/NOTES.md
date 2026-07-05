@@ -2169,6 +2169,17 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   megakernel-side reduction from the post-CE-BWD scoreboard's 3511.9us row and matching
   the final default-vs-old TN timing class.
 
+- Current small `SWIGLU_BWD_2W` reciprocal no-go: re-testing the old sigmoid
+  reciprocal idea only inside the current two-warps-per-row body was correctness-clean
+  but slower. The isolated `MK_SWIGLU_BWD_2W_RCP_RN` probe in
+  `/home/apanda/xorl-oss-swrcp2w-probe` passed small default-vs-variant parity
+  (`mkv3-p4b-swrcp2w-small-parity-20260705T1238Z.log`: both routes emit 8
+  `OP_SWIGLU_BWD_2W` instructions, loss delta 9.54e-07, worst grad rel effectively 0),
+  but paired timing rejected it (`mkv3-p4b-swrcp2w-small-step-ab-20260705T1240Z.log`):
+  default-then-variant median +13.4us, reverse construction order median +16.7us, and
+  overall +14.6us median with reciprocal winning only 1/24 pairs. Keep the exact
+  division form in `SWIGLU_BWD_2W`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
