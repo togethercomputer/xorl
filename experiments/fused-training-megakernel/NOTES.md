@@ -1434,13 +1434,35 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   132; S256 had claim192 only -2.9us, too small and isolated to justify regressing the
   rest. Keep `MK_CLAIM=132`.
 
+- Current-head executor-mode rechecks no-change: fresh profile at `0536d5f`
+  (`mkv3-p4b-profile-current-0536d5f-20260705T0308PROFILE.log`) measured nano 918.2us
+  and small 3644.4us, with small still led by `ATTN_DKV_WG`, WGMMA NN dX GEMMs,
+  `SWIGLU_BWD`, `ATTN_FWD_WG`, and RMS dx. Paired current-mode checks kept df as the
+  default: `ws` lost by +78.4us on nano and +227.4us on small with zero paired wins
+  (`mkv3-p4b-mode-ws-current-0536d5f-20260705T0311MODE.log`), and `df2` lost by
+  +229.5us on nano and +458.0us on small with zero paired wins
+  (`mkv3-p4b-mode-df2-current-0536d5f-20260705T0312MODE.log`).
+
+- Current-head H512/S1024 RMS dx retune: after the dW/WGMMA route changes, small moved
+  back from `RMSNORM_BWD_DX_R4` to the normal two-row `RMSNORM_BWD_DX`. The broad
+  current-head check (`mkv3-p4b-rmsdx-r4-current-0536d5f-20260705T0313RMS.log`)
+  rejected R4 for nano (+13.2us) and H256/S1024 (+15.1us), while small R2 beat R4 by
+  -6.2us. Longer small confirmation
+  (`mkv3-p4b-rmsdx-r4-small-confirm-0536d5f-20260705T0314RMS.log`) measured R2-R4 at
+  -9.6us paired median with 142/180 wins. Route and validation passed
+  (`mkv3-p4b-rmsdx-r2-small-route-20260705T0315RMS.log`,
+  `mkv3-p4b-rmsdx-r2-small-testmodel-20260705T0315RMS.log`); H256/S2048 still uses the
+  R4 fold, and `MK_RMS_DX_R4` still force-overrides for sweeps. Affected score refresh:
+  small 3714.4us vs graph+ 1898.8us
+  (`mkv3-p4b-score-small-rmsr2-20260705T0316SCORE.log`).
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
 | config | megakernel | flash-baseline | gap |
 |---|---|---|---|
 | nano | 1026 | 631 | 1.63x |
-| small | 3725 | 1891 | 1.97x |
+| small | 3714 | 1899 | 1.96x |
 | deep-L12 | 2522 | 1765 | 1.43x |
 | S=128 | 853 | 486 | 1.76x |
 | S=256 | 915 | 550 | 1.66x |
