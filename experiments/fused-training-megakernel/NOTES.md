@@ -3722,6 +3722,26 @@ uncapped default still wins: cap64 lost `2661.7us`, cap96 lost `1082.2us`, and e
 cap128 lost `50.2us` with only `1/12` wins. Keep qwen4b-l1 `default_cold_cap=0`; the
 new `EMBED_BWD` wait is the remaining giant vocab dW drain, not a profitable cap target.
 
+Follow-up TN fat-tile probe `mkv3-p4b-qwen-dwtn-fat-probe-20260705T2335Z.log`
+validated a direct m64n256 fp32 TN tile for qwen dW: vocab dW `151936x2560x1024`
+measured n64 `3480.7us`, n128 `2505.5us`, n256 `2112.3us`; wqkv dW
+`6144x2560x1024` measured n64 `161.2us`, n256 `98.3us`. The production route reuses
+the bit14 direct fp32 path with an A-transposed MN-major loader and is exact-gated by
+`MK_DW_N256_TN_F32`: unset promotes only the five qwen dW shapes, `=0` restores the
+current n64 no-atomic route, and `=1` force-enables structurally eligible TN probes.
+
+Focused qwen A/B `mkv3-p4b-qwen-dwtn-n256-prod-ab-20260705T2338Z.log` used old arm
+`MK_DW_N256_TN_F32=0`: old dW routes were five `flags=137` rows, new routes were five
+`flags=16521` rows with tile counts quartered, loss rel-diff was `-1.5e-7`, selected
+gradient rel diffs were below `5.9e-7`, and paired medians were
+`16151.7us -> 12973.8us` (`+3178.0us` old-minus-new). Profile
+`mkv3-p4b-qwen-dwtn-n256-prod-profile-20260705T2341Z.log` showed current total
+`13047.0us` and on-path wait only `331.9us`; the remaining leaders are head-dX
+`2924.8us`, lm-head forward `2684.8us`, and generic D=128 attention. Full
+`test_model.py` and `test_ops.py` passed in
+`mkv3-p4b-qwen-dwtn-n256-prod-testmodel-20260705T2342Z.log` and
+`mkv3-p4b-qwen-dwtn-n256-prod-testops-20260705T2344Z.log`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

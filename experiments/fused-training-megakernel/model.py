@@ -322,10 +322,18 @@ class MKQwen3:
                     else:
                         no_atomic_sk1 = bool(int(no_atomic_env))
                     if no_atomic_sk1 and sk == 1:
+                        f = ((flags | 128) & ~(4 | 32))
+                        if mk.wgmma_n256_dw_tn_ok(M, N, K, f):
+                            p.instr(
+                                mk.OP_GEMM,
+                                mk.gemm_tiles_wgmma_n256_direct(M, N),
+                                [a, b, out, M, N, K, f | 16384, res],
+                            )
+                            return False
                         p.instr(
                             mk.OP_GEMM,
                             mk.gemm_tiles_wgmma(M, N),
-                            [a, b, out, M, N, K, ((flags | 128) & ~(4 | 32)), res],
+                            [a, b, out, M, N, K, f, res],
                         )
                         return False
                     p.instr(

@@ -605,9 +605,9 @@ __device__ __noinline__ void op_gemm_wgmma_n256_direct(const Instr& I, int tile,
   }
 }
 
-// m64n256 NN direct-store fp32 head-dX tile (qwen giant-vocab follow-up to
-// fat_gemm_nn_probe.py). This keeps the 100KB page by skipping the fp32 epilogue slab.
-// It is deliberately narrow: NN only, fp32 output only, no split-K/acc/residual.
+// m64n256 direct-store fp32 tile for exact qwen giant-vocab NN head-dX and TN dW
+// follow-ups. This keeps the 100KB page by skipping the fp32 epilogue slab. It is
+// deliberately narrow: fp32 output only, no split-K/acc/residual.
 __device__ __noinline__ void op_gemm_wgmma_n256_nn_f32(const Instr& I, int tile, void** bufs,
                                                        char* smem_raw) {
   namespace SG = cute::SM90::GMMA;
@@ -615,7 +615,7 @@ __device__ __noinline__ void op_gemm_wgmma_n256_nn_f32(const Instr& I, int tile,
   const bf16* B = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
   float* C = reinterpret_cast<float*>(bufs[I.args[2]]);
   const int M = I.args[3], N = I.args[4], K = I.args[5], flags = I.args[6];
-  if ((flags & 2) || !(flags & 8) || (flags & (1 | 4 | 16 | 32 | 256 | 1024 | 2048 | 8192))) {
+  if ((flags & 2) || !(flags & 8) || (flags & (4 | 16 | 32 | 256 | 1024 | 2048 | 8192))) {
     return;
   }
 
@@ -628,16 +628,25 @@ __device__ __noinline__ void op_gemm_wgmma_n256_nn_f32(const Instr& I, int tile,
   const int tid = mk_tid();
   const int wg = tid / 128;
   const int wtid = tid % 128;
+  const bool a_t = flags & 1;
   if (m0 >= M) return;
 
   auto issue_stage = [&](int k0, int st) {
 #pragma unroll
     for (int i = 0; i < 4; ++i) {  // A: 128r x 64k
       const int v = tid + i * 256;
-      const int r = v / 8, k8 = (v % 8) * 8;
-      __pipeline_memcpy_async(
-          reinterpret_cast<char*>(S.A[st][r / 64]) + wg_koff_sw(r % 64, k8),
-          &A[(int64_t)(m0 + r) * K + k0 + k8], 16);
+      if (a_t) {
+        const int h = v / 512, w_ = v % 512;
+        const int k = w_ / 8, m8 = (w_ % 8) * 8;
+        __pipeline_memcpy_async(
+            reinterpret_cast<char*>(S.A[st][h]) + wg_mnoff_sw(k, m8),
+            &A[(int64_t)(k0 + k) * M + m0 + h * 64 + m8], 16);
+      } else {
+        const int r = v / 8, k8 = (v % 8) * 8;
+        __pipeline_memcpy_async(
+            reinterpret_cast<char*>(S.A[st][r / 64]) + wg_koff_sw(r % 64, k8),
+            &A[(int64_t)(m0 + r) * K + k0 + k8], 16);
+      }
     }
 #pragma unroll
     for (int i = 0; i < 8; ++i) {  // B[K,N] N-contiguous, 256 columns
@@ -662,11 +671,15 @@ __device__ __noinline__ void op_gemm_wgmma_n256_nn_f32(const Instr& I, int tile,
     uint64_t da[4], db[4];
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
-      da[s] = wg_desc_ksw(S.A[t & 1][wg], s);
+      da[s] = a_t ? wg_desc_mnsw(S.A[t & 1][wg], s) : wg_desc_ksw(S.A[t & 1][wg], s);
       db[s] = wg_desc_mnsw128(S.B[t & 1], s);
     }
-    wg_mma_ktile_n256<SG::MMA_64x256x16_F32BF16BF16_SS<SG::Major::K, SG::Major::MN>>(
-        da, db, d);
+    if (a_t)
+      wg_mma_ktile_n256<SG::MMA_64x256x16_F32BF16BF16_SS<SG::Major::MN, SG::Major::MN>>(
+          da, db, d);
+    else
+      wg_mma_ktile_n256<SG::MMA_64x256x16_F32BF16BF16_SS<SG::Major::K, SG::Major::MN>>(
+          da, db, d);
     consumer_sync();
   }
 

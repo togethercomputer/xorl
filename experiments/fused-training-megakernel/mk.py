@@ -182,6 +182,33 @@ def wgmma_n256_head_dx_ok(M, N, K, flags):
     return (M, N, K) == (1024, 2560, 151936)
 
 
+def wgmma_n256_dw_tn_ok(M, N, K, flags):
+    """Qwen dW-only direct m64n256 TN fp32 route.
+
+    The standalone TN probe showed the wider tile is a clear win for qwen dW, but this
+    path is exact-gated because other dW shapes have different scheduler tradeoffs. Set
+    MK_DW_N256_TN_F32=0 to restore the current n64 no-atomic route, or =1 to force all
+    structurally eligible TN dW fp32 shapes for probing.
+    """
+    mode_env = os.environ.get("MK_DW_N256_TN_F32")
+    mode = -1 if mode_env is None else int(mode_env)
+    if mode == 0:
+        return False
+    if flags != (1 | 8 | 128):
+        return False
+    if M % 128 or N % 256 or K % 64:
+        return False
+    if mode == 1:
+        return True
+    return (M, N, K) in {
+        (151936, 2560, 1024),
+        (2560, 9728, 1024),
+        (19456, 2560, 1024),
+        (2560, 4096, 1024),
+        (6144, 2560, 1024),
+    }
+
+
 def _default_split_k_target(K):
     env = os.environ.get("MK_DW_TARGET_TILES")
     if env is not None:
