@@ -315,7 +315,7 @@ class MKQwen3:
         swiglu_cache_sig = self.swiglu_cache_sig_enabled
         qkbwd_split_v_env = os.environ.get("MK_QKBWD_SPLIT_V")
         if qkbwd_split_v_env is None:
-            qkbwd_split_v = c.H == 256 and c.D == 64 and c.S == 8192
+            qkbwd_split_v = c.H == 256 and c.D == 64 and c.S in (4096, 8192)
         else:
             qkbwd_split_v = bool(int(qkbwd_split_v_env))
 

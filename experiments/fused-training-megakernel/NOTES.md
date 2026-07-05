@@ -3139,7 +3139,17 @@ Promoted-default validation
 `mkv3-p4b-qkbwd-splitv-s8192-promoted-default-20260705T2020Z.log` beat forced
 old `MK_QKBWD_SPLIT_V=0` by +42.88us/+31.78us old-minus-new, with old wins
 2/16 and 1/16 and parity clean (`worst_grad_rel` <= 0.004937). Default only the
-exact H256/D64/S8192 shape; earlier nano/small no-go evidence still stands.
+exact H256/D64/S8192 shape first; earlier nano/small no-go evidence still stands.
+Boundary check at H256/D64/S4096 after that promotion found the same split-V route
+positive: `mkv3-p4b-qkbwd-splitv-s4096-current-20260705T2031Z.log` measured
+-16.59us and -3.52us (40/40 and 36/40 wins), then fresh-process confirmation
+`mkv3-p4b-qkbwd-splitv-s4096-confirm-20260705T2033Z.log` measured -9.60us and
+-12.38us (36/40 and 40/40 wins), all parity-clean (`worst_grad_rel` <= 0.005769).
+Promoted-default validation
+`mkv3-p4b-qkbwd-splitv-s4096-promoted-default-20260705T2035Z.log` beat forced
+old `MK_QKBWD_SPLIT_V=0` by +28.61us/+17.62us old-minus-new, with old wins 8/40
+and 3/40 and parity clean (`worst_grad_rel` <= 0.005769). Default
+`MK_QKBWD_SPLIT_V` now covers exact H256/D64/S4096 and S8192 only.
 
 Post-T29 follow-up no-gos: current default `lpt` order remains best. A
 pre-combine env-only retest at `77346e2`
