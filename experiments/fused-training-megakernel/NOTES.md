@@ -2369,6 +2369,22 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   claim decisively: claim96 +267.50us, claim112 +273.32us, claim160 +131.69us, and
   claim192 +102.34us median. Keep the global claim quantum at 132.
 
+- Current-head CE ignore-row skip recheck no-go: the old compile-flag branch that
+  skipped CE math for ignored rows was re-probed from sibling worktree
+  `/home/apanda/xorl-oss-ceskip-current-probe` as `MK_CE_IGNORE_SKIP=1`. Forced-on
+  full-model validation passed (`mkv3-p4b-ceskip-current-testmodel-20260705T1825Z.log`).
+  Current-head paired timing first rejected protected shapes but showed an apparent
+  H512/S1024 small win (`mkv3-p4b-ceskip-current-step-ab-20260705T1830Z.log`: nano
+  +3.02us, H256/S1024 +8.91us, small -18.72us). A guarded main-tree promotion attempt
+  also passed standard plus small parity
+  (`mkv3-p4b-ceskip-promote-validation-20260705T1845Z.log`) and a first small
+  default-vs-old A/B was weakly positive
+  (`mkv3-p4b-ceskip-default-vs-old-small-20260705T1855Z.log`: -2.56us median,
+  141/240 wins). The construction-order repeat refuted the route decisively
+  (`mkv3-p4b-ceskip-default-vs-old-small-repeat-20260705T1900Z.log`: +19.39us median,
+  only 34/320 wins). The temporary main-tree promotion was reverted; keep the current
+  CE fwd/bwd opcodes unchanged.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
