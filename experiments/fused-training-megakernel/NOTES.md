@@ -2990,9 +2990,18 @@ Results: S2048/T16 -19.7/-15.7us (39/40, 39/40), S3072/T32 -45.7/-43.9us
 (40/40, 40/40), S4096/T32 -4.4/-11.1us (30/40, 40/40), S8192/T64
 -452.2/-481.5us (16/16, 16/16). All parity checks passed (`worst_grad_rel`
 <= 0.013994). Keep rejected fwd-band variants out of the default: S4096 T16 and
-T48 lose, T64 is neutral; S3072 T16 is neutral/negative. Open follow-on: profile
-the promoted default and revisit tile-budgeted band choice only if the new path
-shows combine/wait imbalance.
+T48 lose, T64 is neutral; S3072 T16 is neutral/negative. Promoted-default vs forced
+old confirmed the env gate itself: S2048 -23.9us, S3072 -39.8us, S4096 -6.6us,
+S8192 -481.9us (`mkv3-p4b-attn-fwdband-promoted-default-20260705T1828Z.log`).
+Post-promotion S8192 profile (`mkv3-p4b-profile-s8192-post-fwdband-d86b5ce-20260705T1830Z.log`)
+is `7345.8us` total. Fwd is no longer the lead span (`ATTN_FWD_WG` fell to
+`849.1us`, plus `ATTN_COMBINE` `306.7us`); the path is back to bwd DKV wait:
+`ATTN_DKV_WG` `2662.3us` total with `2304.7us` wait. Retesting
+`MK_ATTN_BAND_ORDER=lpt` after fwd-band was still a no-go (+114/+105us), so keep
+S8192 DQ-first. Long scoreboard at `d86b5ce`
+(`mkv3-p4b-score-long-post-band-20260705T183210Z.log`) gives S8192 `7327.2us`
+vs compile+CUDAGraph+ `3137.1us` (2.34x); shorter-shape scoreboard medians were
+noisy and should be interpreted through the paired A/B above.
 
 ## v3 P4b fused one-pass attention bwd (session 2853e0de): NO-GO, and why
 
@@ -3015,6 +3024,39 @@ disjoint by construction). Code stays default-off on branch
 `megakernel-attn-fusedbwd` (`/home/apanda/xorl-oss-attn-fusedbwd`,
 `MK_ATTN_FUSED_BWD=1` + `_afb` build); repro
 `results/attn_fused_model_ab.py <S> 1 <order>` in that worktree.
+
+## v3 P4b long-S day close: composed scoreboard (2026-07-05 ~18:35Z)
+
+Certified composed state at `d86b5ce` (bwd banding + dq_first order + fwd
+banding + the day's dkv/dq float2 promotions), hardened bench_cfg, fresh
+process per shape, GPU 6, guards clean
+(`mkv3-p4b-score-long-post-band-20260705T183210Z.log`):
+
+| shape | megakernel | compile+CUDAGraph+ | gap | day start |
+|---|---:|---:|---:|---:|
+| S2048 | 1865.3 | 1050.2 | 1.78x | 1.83x |
+| S3072 | 2532.2 | 1341.6 | 1.89x | 1.97x |
+| S4096 | 3245.2 | 1575.6 | 2.06x | 2.08-2.13x |
+| S8192 | **7327.2** | 3137.1 | **2.34x** | 2.63-2.69x |
+
+Instrument note: the S2048/S3072/S4096 megakernel columns read ~20-40us above
+the paired-A/B instrument on the same head (paired absolutes: ~1848 / ~2504 /
+~3221 — single bench_cfg runs bounce at that scale; see the S3072 3007-outlier
+precedent). The S8192 row agrees with the paired instrument to 0.2us. Total
+S8192 movement today: 8395 -> 7327 megakernel-side (-12.7%), gap 2.69x -> 2.34x.
+
+Long-S lane state after this round: the causal-straggler family of fixes is
+mined (bwd bands, fwd bands, band order); the fused one-pass bwd is refuted
+with mechanism. At S4096 the residual attention deficit is mostly the band
+quantization awkwardness (any split exceeds 132 tiles) plus the DQ
+SM-contention wait; the larger residual at ALL long shapes is now the flat
+non-attention deficit (RMS dx 253.9us, lm-head 224.4us, QKNORM 181.3us,
+SWIGLU_BWD 176.0us on-path at S4096 per
+`mkv3-p4b-profile-long-post-band-20260705T175128Z.log`). Next lanes in
+measured-value order: (1) a post-composition profile refresh to re-rank; (2)
+the S4096 tile-budget band chooser; (3) the non-attention long-S scaling items
+(RMS dx grows superlinearly 144.6 -> 251.3us from S3072 -> S4096 — unexplained
+and worth a probe); (4) knob consolidation (the gate maps are now ~11 deep).
 
 ## Honest assessment + v2 roadmap
 
