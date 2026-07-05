@@ -2603,6 +2603,13 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   This is a weaker long-S win than S2048/S3072 but still positive under construction
   order control; `MK_SWIGLU_CACHE_SIG=0 MK_SWIGLU_BWD_2W=0` restores the old route for
   A/B.
+  Post-promotion H256/S4096 profile
+  (`mkv3-p4b-profile-s4096-post-sw2w-ffb835f-20260705T1620Z.log`) measured 3397.8us
+  total and is strongly attention-dQ led: `ATTN_DQ_WG` 922.8us, `ATTN_FWD_WG` 439.6us,
+  RMS dx 253.7us, lm-head 224.2us, QKNORM/ROPE bwd 181.6us, and cached
+  `SWIGLU_BWD_2W` 174.5us. The matching score refresh
+  (`mkv3-p4b-score-s4096-post-sw2w-ffb835f-20260705T1622Z.log`) measured megakernel
+  3370.2us vs compile+CUDAGraph+ 1584.1us (2.13x gap).
 
 - H256/S8192 cached SwiGLU-BWD 2W boundary no-change: the same combined route was
   tested at S8192 and should not be defaulted. Forced `MK_SWIGLU_CACHE_SIG=1
