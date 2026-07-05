@@ -3357,6 +3357,21 @@ default (promoted vs R=1 only) is CONFIRMED against its neighbors. R=4 loses
 (S4096 -2.5/-0.2 at 31/40 and 24/40; S8192 +4.3/-10.8) — under the promotion
 bar; keep `MK_ATTN_COMBINE_R=8`.
 
+S8192 attention-dKV row-scalar broadcast: the prior default-off row-broadcast
+probe had only tested nano/small pre-long-S retunes, so the current S8192
+DKV-heavy profile reopened it. `MK_ATTN_DKV_ROW_BCAST=1` makes each 4-lane
+column group load one `LSE`/`Drow` scalar and distribute it with a warp shuffle.
+Flagged WGMMA attention parity passed
+(`mkv3-p4b-rowbcast-s8192-current-20260705T2128Z.log`, WGMMA bwd dqkv
+max_abs_err `6.958e-03`). S8192 env A/B won both orders by -10.90us and
+-9.02us; same-cache confirmation strengthened to -16.85us and -13.97us
+(`mkv3-p4b-rowbcast-s8192-confirm-20260705T2135Z.log`). Promoted-default vs
+forced old `MK_ATTN_DKV_ROW_BCAST=0` favored the new default by +10.61us/+7.60us
+old-minus-new with parity clean
+(`mkv3-p4b-rowbcast-s8192-promoted-default-20260705T2140Z.log`). The default is
+exact H256/D64/S8192 only in the consolidated tuning table; the env override
+still forces old/new for A/B.
+
 ## v3 P4b knob consolidation (session 2853e0de): one tuning table, routes verified
 
 The secondary lane from the /goal: model.py's ~12 scattered per-shape gate
