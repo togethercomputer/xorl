@@ -3053,10 +3053,27 @@ SM-contention wait; the larger residual at ALL long shapes is now the flat
 non-attention deficit (RMS dx 253.9us, lm-head 224.4us, QKNORM 181.3us,
 SWIGLU_BWD 176.0us on-path at S4096 per
 `mkv3-p4b-profile-long-post-band-20260705T175128Z.log`). Next lanes in
-measured-value order: (1) a post-composition profile refresh to re-rank; (2)
-the S4096 tile-budget band chooser; (3) the non-attention long-S scaling items
-(RMS dx grows superlinearly 144.6 -> 251.3us from S3072 -> S4096 — unexplained
-and worth a probe); (4) knob consolidation (the gate maps are now ~11 deep).
+measured-value order after the S4096 retune below: (1) a post-composition
+profile refresh to re-rank; (2) the non-attention long-S scaling items (RMS dx
+grows superlinearly 144.6 -> 251.3us from S3072 -> S4096 - unexplained and
+worth a probe); (3) knob consolidation (the gate maps are now ~11 deep).
+
+S4096 attention-bwd band-budget retune: after fwd-band composition, an env-only
+GPU 5 sweep around the current `MK_ATTN_BAND=32` default found that the
+three-band split near the boundary is better than the two-band default. Broad
+sweep log `mkv3-p4b-s4096-band-budget-sweep-20260705T1841Z.log`: T24 was
+noise/negative (+5.6us then -5.6us, low wins), T28 won -53.9/-59.4us (40/40
+both), T32 same-route control was -3.3/-0.5us noise, T36 was neutral/negative,
+T40 lost +29.5/+20.1us, and T48 was a smaller win (-8.2/-15.4us). Narrow log
+`mkv3-p4b-s4096-band-budget-narrow-20260705T1845Z.log`: T26 lost +7.7/+7.3us,
+T27 won -31.6/-35.2us, T28 repeated -52.1/-53.4us, T29 won -60.3/-60.4us, and
+T30 won -57.4us in the clean order (the other order had contaminated absolute
+medians but still paired -66.8us). Confirmation log
+`mkv3-p4b-s4096-band-budget-confirm-20260705T1847Z.log`: T29 repeated
+-62.9/-60.4us with 40/40 wins in both construction orders, while T31 shrank to
+-16.9/-15.7us. Current H256/D64 band defaults are now
+`{2048:16, 3072:16, 4096:29, 8192:32}`; `MK_ATTN_BAND=32` restores the old
+S4096 route for A/B and `MK_ATTN_BAND=0` still restores the uniform C route.
 
 ## Honest assessment + v2 roadmap
 
