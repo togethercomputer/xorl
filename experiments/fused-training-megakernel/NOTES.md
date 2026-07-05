@@ -1268,6 +1268,16 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   (`mkv3-p4b-score-nano-aflog-20260705T0213SCORE.log`: 1060.7us vs graph+ 561.2us;
   `mkv3-p4b-score-small-aflog-20260705T0213SCORE.log`: 3738.7us vs graph+ 1908.5us).
 
+- CE_FWD LSE fast-log no-go: a default-off `MK_CE_FAST_LOG` probe changed only
+  `op_ce_fwd`'s final `logf(se)` to `__logf(se)` and kept CE backward `expf` untouched.
+  Correctness was fine (`mkv3-p4b-ceflog-testce-20260705T0215CEFLOG.log`,
+  `mkv3-p4b-ceflog-testmodel-20260705T0217CEFLOG.log`), but paired timing was mixed
+  (`mkv3-p4b-ceflog-ab-20260705T0219CEFLOG.log`): nano regressed (+1.55us median,
+  158/360 wins), small was order/noise-level (+1.26us paired median, 116/240 wins),
+  S2048 was tiny positive (-2.91us, 105/180 wins), and S4096 was positive (-8.37us,
+  86/120 wins). Keep CE on precise `logf`; the current CE op does not have enough
+  shape information to split nano from S4096 safely.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
