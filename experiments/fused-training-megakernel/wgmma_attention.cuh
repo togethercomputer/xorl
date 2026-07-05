@@ -974,3 +974,199 @@ __device__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs, char* smem_
       atomicAdd(&ws[(int64_t)(q0 + r) * stride + qh * D + c8 + e], Cs[r * 68 + c8 + e]);
   }
 }
+
+// ---- D=128 forward (v3 P4b D128 port) ------------------------------------------------
+// args: {qkv_r, O, LSE, S, nq, nkv, D(=128), scale_bits}; tile = qt*nq + qh over
+// 64-ROW q tiles (S % 64 == 0). Design: BOTH warpgroups compute S = Q K^T (m64 n64
+// k128, two 64x64 subtile walks in one commit batch) and the online softmax
+// REDUNDANTLY — redundant tensor/SFU work is free in the latency-bound regime and
+// removes every cross-WG serialization except the single P publication. Each WG then
+// produces its own 64-wide HALF of the D=128 output (m64 n64 k64, 32-reg
+// accumulator), dodging the 64-reg accumulator wall that blocks a naive D=128 port.
+// 64-row tiles also kill the beyond-diagonal skip stage: n_stages = q0/64 + 1 and
+// only the last stage is masked. A 64x128 operand is two consecutive off64 subtiles
+// (d-half stride 4096 elements = 8KB).
+
+struct __align__(16) AttnWgFwd128Smem {  // 88KB
+  bf16 Q[8192];      // 64 q rows x 128 D: [d-half][off64]
+  bf16 P[4096];      // [q64, kv64], K-view A of O += P V (WG0 publishes)
+  bf16 K[2][8192];   // [stage] 64 kv rows x 128 D
+  bf16 V[2][8192];   // [stage]
+};
+
+// d += A(K-view) @ B(K-view) over k=128: both operands are dual 64x64 subtiles at
+// +8KB; 8 fmas in one commit batch, one wait.
+__device__ __forceinline__ void wga_mma64_kk_k128(const bf16* A, const bf16* B,
+                                                  float (&d)[32]) {
+  cute::warpgroup_arrive();
+#pragma unroll
+  for (int h = 0; h < 2; ++h)
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      const uint64_t da = wga_desc_k((const char*)(A + h * 4096) + s * 256);
+      const uint64_t db = wga_desc_k((const char*)(B + h * 4096) + s * 256);
+      WGA_MMA_KK::fma(da, db, WGA_FMA32, cute::SM90::GMMA::ScaleOut::One);
+    }
+  cute::warpgroup_commit_batch();
+  cute::warpgroup_wait<0>();
+}
+
+__device__ void op_attn_fwd_wg128(const Instr& I, int tile, void** bufs,
+                                  char* smem_raw) {
+  constexpr int D = 128;
+  const int S = I.args[3], nq = I.args[4], nkv = I.args[5];
+  const float scale = __int_as_float(I.args[7]);
+  const bf16* qkv = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
+  bf16* O = reinterpret_cast<bf16*>(bufs[I.args[1]]);
+  float* LSE = reinterpret_cast<float*>(bufs[I.args[2]]);
+  AttnWgFwd128Smem& sm = *reinterpret_cast<AttnWgFwd128Smem*>(smem_raw);
+
+  const int qh = tile % nq;
+  const int q0 = (tile / nq) * 64;
+  const int kvh = qh / (nq / nkv);
+  const int stride = (nq + 2 * nkv) * D;
+  const int tid = mk_tid();
+  const int wg = tid >> 7, wtid = tid & 127;
+
+  // 64x128 loaders: vector v in [0,1024) -> d-half = v>>9, then the conflict-free
+  // 64x64 mapping on v&511 (same bank-quad-spanning assignment as the D=64 ops)
+  auto issue_kv_stage = [&](int k0, int st) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int v = tid + i * MK_CONSUMERS;
+      const int h = v >> 9, w9 = v & 511;
+      const int r = ((w9 >> 6) << 3) | (w9 & 7), c8 = ((w9 >> 3) & 7) << 3;
+      __pipeline_memcpy_async(
+          (char*)(sm.K[st] + h * 4096) + wga_off64(r, c8),
+          &qkv[(int64_t)(k0 + r) * stride + (nq + kvh) * D + h * 64 + c8], 16);
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int v = tid + i * MK_CONSUMERS;
+      const int h = v >> 9, w9 = v & 511;
+      const int r = ((w9 >> 6) << 3) | (w9 & 7), c8 = ((w9 >> 3) & 7) << 3;
+      __pipeline_memcpy_async(
+          (char*)(sm.V[st] + h * 4096) + wga_off64(r, c8),
+          &qkv[(int64_t)(k0 + r) * stride + (nq + nkv + kvh) * D + h * 64 + c8], 16);
+    }
+    __pipeline_commit();
+  };
+
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {  // Q joins stage 0's commit group
+    const int v = tid + i * MK_CONSUMERS;
+    const int h = v >> 9, w9 = v & 511;
+    const int r = ((w9 >> 6) << 3) | (w9 & 7), c8 = ((w9 >> 3) & 7) << 3;
+    __pipeline_memcpy_async(
+        (char*)(sm.Q + h * 4096) + wga_off64(r, c8),
+        &qkv[(int64_t)(q0 + r) * stride + qh * D + h * 64 + c8], 16);
+  }
+  issue_kv_stage(0, 0);
+
+  float o[32];
+#pragma unroll
+  for (int i = 0; i < 32; ++i) o[i] = 0.0f;
+  float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
+  const int w = wtid >> 5, ln = wtid & 31;
+  const int r0 = w * 16 + (ln >> 2);
+  const int cb = (ln & 3) * 2;
+
+  const int n_stages = q0 / 64 + 1;
+  for (int t = 0; t < n_stages; ++t) {
+    const int k0 = t * 64;
+    if (t + 1 < n_stages) issue_kv_stage((t + 1) * 64, (t + 1) & 1);
+    __pipeline_wait_prior(t + 1 < n_stages ? 1 : 0);
+    consumer_sync();
+    float s[32];
+#pragma unroll
+    for (int i = 0; i < 32; ++i) s[i] = 0.0f;
+    wga_mma64_kk_k128(sm.Q, sm.K[t & 1], s);  // S = Q K^T, k=128, both WGs redundant
+    const bool masked = t == n_stages - 1;    // diagonal stage
+    float alpha[2];
+    float rmax[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const int qr = q0 + r0 + 8 * i;
+#pragma unroll
+      for (int n8 = 0; n8 < 8; ++n8)
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+          const int idx = n8 * 4 + i * 2 + j;
+          float sc = s[idx] * scale;
+          if (masked && k0 + n8 * 8 + cb + j > qr) sc = -INFINITY;
+          s[idx] = sc;
+          rmax[i] = fmaxf(rmax[i], sc);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      rmax[i] = fmaxf(rmax[i], __shfl_xor_sync(0xffffffffu, rmax[i], 1));
+      rmax[i] = fmaxf(rmax[i], __shfl_xor_sync(0xffffffffu, rmax[i], 2));
+      const float mnew = fmaxf(m[i], rmax[i]);
+      alpha[i] = wga_exp(m[i] - mnew);
+      m[i] = mnew;
+    }
+    float rsum[2] = {0.0f, 0.0f};
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+#pragma unroll
+      for (int n8 = 0; n8 < 8; ++n8) {
+        const int idx = n8 * 4 + i * 2;
+        const float p0 = wga_exp(s[idx] - m[i]);
+        const float p1 = wga_exp(s[idx + 1] - m[i]);
+        rsum[i] += p0 + p1;
+        if (wg == 0) {  // single publication; WG1's values are identical
+          __nv_bfloat162 pv;
+          pv.x = f2bf(p0);
+          pv.y = f2bf(p1);
+          *reinterpret_cast<__nv_bfloat162*>((char*)sm.P +
+                                             wga_off64(r0 + 8 * i, n8 * 8 + cb)) = pv;
+        }
+      }
+      rsum[i] += __shfl_xor_sync(0xffffffffu, rsum[i], 1);
+      rsum[i] += __shfl_xor_sync(0xffffffffu, rsum[i], 2);
+      l[i] = l[i] * alpha[i] + rsum[i];
+    }
+    wga_fence_smem_to_async();
+    consumer_sync();  // P visible to both WGs; V stage ready
+#pragma unroll
+    for (int n8 = 0; n8 < 8; ++n8)
+#pragma unroll
+      for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 2; ++j) o[n8 * 4 + i * 2 + j] *= alpha[i];
+    // O half: this WG's 64 D columns via the V d-half subtile's MN-view
+    wga_mma64<WGA_MMA_KMN, false, true>(sm.P, sm.V[t & 1] + wg * 4096, o);
+    consumer_sync();  // both WGs done reading K/V stage t before refill
+  }
+
+  // epilogue: LSE once (WG0), O halves staged through disjoint smem overlays
+  const float inv[2] = {l[0] > 0.0f ? 1.0f / l[0] : 0.0f,
+                        l[1] > 0.0f ? 1.0f / l[1] : 0.0f};
+  if (wg == 0 && (ln & 3) == 0) {
+    LSE[(int64_t)qh * S + q0 + r0] = m[0] + wga_lse_log(l[0]);
+    LSE[(int64_t)qh * S + q0 + r0 + 8] = m[1] + wga_lse_log(l[1]);
+  }
+  float* Cs = reinterpret_cast<float*>(smem_raw) + wg * 64 * 68;  // [64][68] per WG
+  consumer_sync();  // all wgmma reads of Q/P/K/V done before the overlay
+#pragma unroll
+  for (int n8 = 0; n8 < 8; ++n8)
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+      for (int j = 0; j < 2; ++j)
+        Cs[(r0 + 8 * i) * 68 + n8 * 8 + cb + j] = o[n8 * 4 + i * 2 + j] * inv[i];
+  consumer_sync();
+#pragma unroll
+  for (int g = 0; g < 4; ++g) {  // 512 uint4 per WG half: 64 rows x 8 col-groups
+    const int gid = wtid + g * 128;
+    const int r = gid >> 3, c8 = (gid & 7) << 3;
+    uint4 out;
+    bf16* oe = reinterpret_cast<bf16*>(&out);
+    float* Csrc = reinterpret_cast<float*>(smem_raw) + wg * 64 * 68;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) oe[e] = f2bf(Csrc[r * 68 + c8 + e]);
+    *reinterpret_cast<uint4*>(&O[(int64_t)(q0 + r) * (nq * D) + qh * D + wg * 64 + c8]) =
+        out;
+  }
+}

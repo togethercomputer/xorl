@@ -589,6 +589,16 @@ class MKQwen3:
                     [a("qkvr"), a("oatt"), a("lse"), c.S, c.nq, c.nkv, c.D, scale],
                 )
                 p.wave()
+            elif (c.D == 128 and c.S % 64 == 0
+                  and bool(int(os.environ.get("MK_ATTN_D128_WG", "0")))):
+                # D=128 WGMMA fwd (env probe, default off): 64-row q tiles,
+                # redundant-S both-WG softmax + split-D output halves.
+                p.instr(
+                    mk.OP_ATTN_FWD_WG128,
+                    c.nq * (c.S // 64),
+                    [a("qkvr"), a("oatt"), a("lse"), c.S, c.nq, c.nkv, c.D, scale],
+                )
+                p.wave()
             elif self.attn_C > 1:
                 Ca = self.attn_C
                 p.instr(
