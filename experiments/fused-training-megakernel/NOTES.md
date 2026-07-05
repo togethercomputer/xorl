@@ -2575,6 +2575,20 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   (`mkv3-p4b-score-s2048-post-sw2w-250838c-20260705T1542Z.log`) measured megakernel
   1908.9us vs compile+CUDAGraph+ 1043.3us (1.83x gap).
 
+- H256/S3072 combined cached SwiGLU-BWD 2W promotion: after the S2048 win, the same
+  combined route was rechecked at the next long-S shape. Forced `MK_SWIGLU_CACHE_SIG=1
+  MK_SWIGLU_BWD_2W=1` vs current default
+  (`mkv3-p4b-sw2w-cache-s3072-current-20260705T1548Z.log`) routed `4 fwd/0 1W/4 2W`
+  instead of uncached `4 fwd/4 1W/0 2W`, passed parity (worst rel 0.010763), and won
+  both construction orders: -13.73us and -8.48us variant-default, combined -10.99us
+  with 113/128 variant wins. Main promotion widens both `swiglu_cache_sig_default` and
+  `swiglu_bwd_2w_default` to `H=256,S=3072,I=768`. Final default-vs-forced-old
+  validation (`mkv3-p4b-sw2w-cache-s3072-promote-20260705T1552Z.log`) confirmed default
+  cached 2W route, forced-old uncached 1W route, parity worst 0.010763, and
+  default-old timing -16.37us / -13.15us by construction order, combined -15.38us with
+  124/128 default wins. `MK_SWIGLU_CACHE_SIG=0 MK_SWIGLU_BWD_2W=0` restores the old
+  route for A/B.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

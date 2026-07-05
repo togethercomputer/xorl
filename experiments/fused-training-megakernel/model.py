@@ -46,6 +46,7 @@ class MKQwen3:
             (c.H == 512 and c.S == 1024 and c.I == 1536)
             or (c.H == 256 and c.S == 1024 and c.I == 768)
             or (c.H == 256 and c.S == 2048 and c.I == 768)
+            or (c.H == 256 and c.S == 3072 and c.I == 768)
         )
         self.swiglu_cache_sig_enabled = (
             self.swiglu_cache_sig_default
@@ -159,6 +160,7 @@ class MKQwen3:
             (c.H == 512 and c.S == 1024 and c.I == 1536)
             or (c.H == 256 and c.S == 1024 and c.I == 768)
             or (c.H == 256 and c.S == 2048 and c.I == 768)
+            or (c.H == 256 and c.S == 3072 and c.I == 768)
         )
         self.drow_direct_store_default = c.D == 64 and c.S < 2048
         self.attn_exp2_approx_default = c.D == 64 and c.S >= 512 and c.S % 128 == 0
