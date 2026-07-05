@@ -2966,6 +2966,28 @@ split+combine (opart/mpart/lpart) machinery ported to the WG path; (b) a
 tile-budgeted band chooser (split-to-budget instead of ceil(stages/T)) to
 recover the standalone dq wave-quantization loss at S4096.
 
+## v3 P4b fused one-pass attention bwd (session 2853e0de): NO-GO, and why
+
+FA2-style fusion of dQ into `OP_ATTN_DKV_WG` (per stage: x3 wgmma commit batch
+adding dQp = dS @ K_wg via dS's K-view against owned K's MN-view, dqp reusing
+the dead s-bank lifetime, then 16 float2 atomicAdds into the workspace q slot;
+host drops `OP_ATTN_DQ_WG` entirely) is **correctness-clean but decisively
+slower**: S4096 in-model +118.98us (0/40 wins), loss identical, worst grad rel
+0.005769 (`mkv3-p4b-attn-fusedbwd-smoke-20260705T175625Z.log` in the
+attn-fusedbwd worktree). Mechanism: fusion multiplies dQ WRITE traffic by
+n_kvt x 2WG — every q row receives (S/128)x2 fp32 atomic contributions
+(~135MB/layer of atomics at S4096) instead of one direct store, and atomic
+writes serialize at L2/DRAM, while the two-pass structure's extra K/V re-reads
+(the cost fusion tries to save) are L2-RESIDENT at these shapes (whole qkv
+buffer ~4MB << 50MB L2). The pass split converts store-amplification into
+cache-absorbed load-amplification; keep the two-pass bwd. The amplification
+scales with S, so longer shapes lose harder — do not revisit without a
+mechanism that accumulates dQ before the atomic (none exists: stage q-rows are
+disjoint by construction). Code stays default-off on branch
+`megakernel-attn-fusedbwd` (`/home/apanda/xorl-oss-attn-fusedbwd`,
+`MK_ATTN_FUSED_BWD=1` + `_afb` build); repro
+`results/attn_fused_model_ab.py <S> 1 <order>` in that worktree.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
