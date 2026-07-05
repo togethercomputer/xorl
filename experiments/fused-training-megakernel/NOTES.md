@@ -2589,6 +2589,21 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   124/128 default wins. `MK_SWIGLU_CACHE_SIG=0 MK_SWIGLU_BWD_2W=0` restores the old
   route for A/B.
 
+- H256/S4096 combined cached SwiGLU-BWD 2W promotion: the same route was checked as a
+  long-S boundary with fewer paired samples. Forced `MK_SWIGLU_CACHE_SIG=1
+  MK_SWIGLU_BWD_2W=1` vs current default
+  (`mkv3-p4b-sw2w-cache-s4096-current-20260705T1558Z.log`) routed `4 fwd/0 1W/4 2W`,
+  passed parity (worst rel 0.007641), and was a smaller win: -3.71us and -5.07us
+  variant-default by construction order, combined -4.21us with 59/80 variant wins.
+  Main promotion widens both default gates to `H=256,S=4096,I=768`. Final
+  default-vs-forced-old validation
+  (`mkv3-p4b-sw2w-cache-s4096-promote-20260705T1602Z.log`) confirmed default cached 2W
+  route, forced-old uncached 1W route, parity worst 0.007642, and default-old timing
+  -6.61us / -0.54us by construction order, combined -5.23us with 52/80 default wins.
+  This is a weaker long-S win than S2048/S3072 but still positive under construction
+  order control; `MK_SWIGLU_CACHE_SIG=0 MK_SWIGLU_BWD_2W=0` restores the old route for
+  A/B.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
