@@ -1930,7 +1930,10 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   (`mkv3-p4b-swb2w-route-20260705T065511Z.log`), and final default-vs-forced-old timing
   measured -12.22us median with 193/240 default wins
   (`mkv3-p4b-swb2w-default-vs-old-20260705T065511Z.log`). `MK_SWIGLU_BWD_2W=0`
-  restores the old route for A/B.
+  restores the old route for A/B. Post-promotion small profile
+  (`mkv3-p4b-post-swb2w-small-profile-20260705T070715Z.log`) measured 3648.0us total;
+  the next small leaders are `ATTN_DKV_WG`, `GEMMNN 1024x512x3072.wg`,
+  `SWIGLU_BWD_2W`, Drow `GEMMNN 1024x512x512.wg`, `ATTN_FWD_WG`, and RMS dx.
 
 ## Honest assessment + v2 roadmap
 
