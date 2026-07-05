@@ -2086,6 +2086,26 @@ attention-scaling-bound vs FA3. Note the "24h ago" column is vs the SOFT (math-
 attention) baseline; the honest morning reset was nano 1.97x / small 2.52x, so
 the true 24h movement is 1.97->1.45 and 2.52->1.88.
 
+- QKNORM/ROPE-bwd V split no-go: current-head profile after the SSQ/scoreboard/CE
+  cleanup (`mkv3-p4b-profile-current-1ef905d-20260705T1003Z.log`) still showed
+  QKNORM/ROPE bwd at 54.2us nano and 188.0us small, so an isolated worktree
+  `/home/apanda/xorl-oss-qkbwd-splitv` tested `MK_QKBWD_SPLIT_V=1`: V-head
+  fp32->bf16 pass-through moved out of `OP_QKNORM_ROPE_BWD` into a separate disjoint-slot
+  row op while Q/K norm+rope wrote only the q/k slot of `dQKVraw`. Focused QKNORM op
+  correctness and full model validation passed
+  (`mkv3-p4b-qkbwd-splitv-testqk-20260705T1014Z.log`,
+  `mkv3-p4b-qkbwd-splitv-testmodel-20260705T1014Z.log`; training sanity 9.0496 ->
+  5.9191), but timing did not promote. Paired step timing
+  (`mkv3-p4b-qkbwd-splitv-step-ab-20260705T1014Z.log`) was order-sensitive: nano
+  measured -1.15us/-4.30us split-minus-control across construction orders, while small
+  flipped +3.58us/-3.76us. Profile A/B showed why this is not a safe default: QKNORM
+  span dropped locally (nano 43.7->35.6us, small 163.0->157.5us), but on-path wait
+  rose (nano 9.6->13.7us, small 20.6->32.3us) and total profiles regressed/flattened
+  (nano 889.3->891.4us, small 3556.8->3575.5us;
+  `mkv3-p4b-qkbwd-splitv-control-prof-20260705T1014Z.log`,
+  `mkv3-p4b-qkbwd-splitv-variant-prof-20260705T1014Z.log`). Leave the implementation
+  unmerged; the dependency/gating cost of the extra row op eats the local V-copy saving.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
