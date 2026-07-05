@@ -146,11 +146,13 @@ class MKQwen3:
         self.drow_direct_store_default = c.D == 64 and c.S < 2048
         self.attn_exp2_approx_default = c.D == 64 and c.S >= 512 and c.S % 128 == 0
         self.lmhead_exp2_approx_default = c.V >= 8192 and c.V % 64 == 0 and c.S >= 256
+        self.ce_bwd_exp2_approx_default = c.S >= 1024 and c.V >= 8192 and c.V % 8 == 0
         self.ext = mk.load_ext(
             swiglu_bwd_2w=self.swiglu_bwd_2w_default,
             drow_direct_store=self.drow_direct_store_default,
             attn_exp2_approx=self.attn_exp2_approx_default,
             lmhead_exp2_approx=self.lmhead_exp2_approx_default,
+            ce_bwd_exp2_approx=self.ce_bwd_exp2_approx_default,
         )
         self.in_kernel_inv_valid = bool(int(os.environ.get("MK_INV_VALID_IN_KERNEL", "1")))
         self.bind_inputs = bool(int(os.environ.get("MK_BIND_INPUTS", "1")))

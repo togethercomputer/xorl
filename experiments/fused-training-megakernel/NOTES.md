@@ -2114,6 +2114,27 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   cap16-cap48 measured -7.47us with cap48 built first, then +4.19us with cap16 built
   first. Keep the H512/S1024 small default at cap48.
 
+- CE backward `ex2.approx` promotion: `MK_CE_BWD_EXP2_APPROX=1` changes only
+  `OP_CE_BWD`'s softmax exponentials from libm `expf` to the inline
+  `ex2.approx.ftz.f32` helper; CE_FWD stays on the existing `MK_CE_EXP2_APPROX` path and
+  is not touched by the default. The earlier broad `MK_CE_EXP2_APPROX` validation was
+  treated as exploratory because it also affected CE_FWD, then the corrected
+  CE-BWD-only route passed focused and full validation
+  (`mkv3-p4b-ceb2-isolated-testce-20260705T1049Z.log`,
+  `mkv3-p4b-ceb2-isolated-wide-ce-20260705T1049Z.log`,
+  `mkv3-p4b-ceb2-isolated-testmodel-20260705T1049Z.log`; training sanity 9.0496 ->
+  5.6440). Broad forced timing was cleanly positive for S>=1024 but mixed/order-sensitive
+  for short/nano/D128 (`mkv3-p4b-ceb2-isolated-broad-ab-20260705T1049Z.log`), so the
+  default gate is `S >= 1024`, `V >= 8192`, and `V % 8 == 0`; env
+  `MK_CE_BWD_EXP2_APPROX=0/1` force-overrides for A/B. Route check
+  (`mkv3-p4b-ceb2-route-20260705T1049Z.log`) confirmed S128/S256/nano/D128 stay old by
+  default while H256/S1024, H512/S1024 small, and H256/S2048 use `_ceb2`. Final
+  default-vs-forced-old timing (`mkv3-p4b-ceb2-default-vs-old-20260705T1049Z.log`)
+  measured H256/S1024 -6.27us/-5.58us, small -35.65us/-34.35us, and H256/S2048
+  -16.53us/-21.95us across construction orders. Small default-vs-old gradient diff also
+  passed (`mkv3-p4b-ceb2-small-old-vs-default-grads-20260705T1049Z.log`; worst rel err
+  0.009625).
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
