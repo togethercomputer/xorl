@@ -3157,6 +3157,16 @@ was 3133.1us (`n_instr=188`, critical path 80, gated 63); on-path leaders are
 attention-dQ 762.6us, attention-fwd 303.9us, RMS dx 252.4us, lm-head NT 225.2us,
 SwiGLU-BWD 2W 172.6us, and `QKNORM_ROPE_BWD` 162.4us. The split-V target is now
 below the attention and RMS/lm-head bottlenecks at S4096.
+Boundary check at H256/D64/S3072 also held:
+`mkv3-p4b-qkbwd-splitv-s3072-current-20260705T2041Z.log` measured -14.67us and
+-8.99us (40/40 and 37/40 wins), and cached fresh-process confirmation
+`mkv3-p4b-qkbwd-splitv-s3072-confirm-20260705T2043Z.log` measured -11.28us and
+-12.85us (38/40 and 40/40 wins), all parity-clean (`worst_grad_rel` <= 0.005486).
+Promoted-default validation
+`mkv3-p4b-qkbwd-splitv-s3072-promoted-default-20260705T2044Z.log` beat forced
+old `MK_QKBWD_SPLIT_V=0` by +9.17us/+15.81us old-minus-new, with old wins 5/40
+and 2/40 and parity clean (`worst_grad_rel` <= 0.003898). Default
+`MK_QKBWD_SPLIT_V` now covers exact H256/D64/S3072/S4096/S8192.
 
 Post-T29 follow-up no-gos: current default `lpt` order remains best. A
 pre-combine env-only retest at `77346e2`
