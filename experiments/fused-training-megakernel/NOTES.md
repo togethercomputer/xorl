@@ -1305,6 +1305,13 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   2.0 loss drop; `mkv3-p4b-afinv-testmodel-20260705T0235AFINV.log`). Keep WGMMA
   attention output normalization on division.
 
+- Post-fast-log `MK_CLAIM` sweep no-change: current-tip env sweep
+  (`mkv3-p4b-claim-sweep-f9cc513-20260705T0237CLAIM.log`) tested 64/96/132/160/192/264
+  with randomized ordering. Default 132 remains the only safe scheduler claim quantum:
+  nano saw 160 only -1.44us vs 132 while small, S2048, and S4096 regressed for every
+  non-132 value (small nearest 264 was +37.28us; S2048 nearest 264 was +25.01us;
+  S4096 nearest 160 was +3.92us and 264 was +115.86us). Keep `MK_CLAIM=132`.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
