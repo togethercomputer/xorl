@@ -2567,6 +2567,13 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   default-old timing -6.10us / -5.34us by construction order, combined -5.62us with
   145/192 default wins. `MK_SWIGLU_CACHE_SIG=0 MK_SWIGLU_BWD_2W=0` restores the old
   route for A/B.
+  Post-promotion H256/S2048 profile
+  (`mkv3-p4b-profile-s2048-post-sw2w-250838c-20260705T1540Z.log`) measured 1895.5us
+  total; the path is attention-dQ led (`ATTN_DQ_WG` 335.3us, `ATTN_FWD_WG` 236.1us),
+  with lm-head 114.6us, cached `SWIGLU_BWD_2W` 102.0us, head-dX 101.0us, QKNORM/ROPE
+  bwd 99.9us, and MLP dX 98.1us next. The matching score refresh
+  (`mkv3-p4b-score-s2048-post-sw2w-250838c-20260705T1542Z.log`) measured megakernel
+  1908.9us vs compile+CUDAGraph+ 1043.3us (1.83x gap).
 
 ## Honest assessment + v2 roadmap
 
