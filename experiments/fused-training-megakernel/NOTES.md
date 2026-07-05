@@ -2341,6 +2341,16 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   had no pmon/compute-app process before and after, but did have resident memory; since
   no candidate was positive, no repeat is needed.
 
+- Current-head cold-cap resweep no-change: an env-only GPU 5 sweep after the head-dX
+  n128 promotions rechecked `MK_COLD_CAP` around nano's cap0 default and small's cap48
+  default (`mkv3-p4b-coldcap-current-e5b5a9f-20260705T1720Z.log`). Nano cap8/16/32/48
+  were pure construction-order bias: built second lost and built first won, with
+  overall medians between +0.52us and +1.10us except cap8 at +1.01us. Small cap0/64/80
+  were also order-biased/neutral (overall -0.88us, -1.63us, +0.26us medians), cap32
+  regressed (+5.40us), and cap16's weak overall -6.70us median was refuted by reverse
+  construction order (+8.02us median). Keep nano uncapped, small cap48, H256/S1024
+  cap64, and long-S uncapped.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
