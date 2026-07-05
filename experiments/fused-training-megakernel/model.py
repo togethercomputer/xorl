@@ -67,6 +67,7 @@ _SWIGLU_CACHED_2W = {
 }
 _H256_IDLE32_S = (2048, 3072, 4096, 8192)  # H==256: scheduler idle poll 32ns (else 256)
 _H256_DQ_FLOAT2_S = (3072, 4096, 8192)     # H==256: attention-dQ float2 direct store
+_H256_D64_DKV_ROW_BCAST_S = (8192,)        # H==256/D==64: attention-dKV row scalar shuffles
 _ATTN_BWD_BAND_T = {2048: 12, 3072: 16, 4096: 29, 8192: 40}  # H==256/D==64; 0 elsewhere
 _ATTN_FWD_BAND_T = {2048: 16, 3072: 32, 4096: 22, 8192: 64}  # H==256/D==64; 0 elsewhere
 _ATTN_BAND_DQ_FIRST_S = (8192,)  # H==256/D==64: dq-first band emission (else lpt)
@@ -238,6 +239,9 @@ class MKQwen3:
         # polling after the banding/row-batching scheduling changes.
         self.idle_ns_default = 32 if c.H == 256 and c.S in _H256_IDLE32_S else 256
         self.attn_dkv_float2_atomic_default = c.D == 64 and c.S % 128 == 0
+        self.attn_dkv_row_bcast_default = (
+            c.H == 256 and c.D == 64 and c.S in _H256_D64_DKV_ROW_BCAST_S
+        )
         self.attn_dq_float2_store_default = c.H == 256 and c.S in _H256_DQ_FLOAT2_S
         self.ext = mk.load_ext(
             swiglu_bwd_2w=self.swiglu_bwd_2w_default,
@@ -248,6 +252,7 @@ class MKQwen3:
             ce_bwd_exp2_approx=self.ce_bwd_exp2_approx_default,
             idle_ns=self.idle_ns_default,
             attn_dkv_float2_atomic=self.attn_dkv_float2_atomic_default,
+            attn_dkv_row_bcast=self.attn_dkv_row_bcast_default,
             attn_dq_float2_store=self.attn_dq_float2_store_default,
         )
         self.in_kernel_inv_valid = bool(int(os.environ.get("MK_INV_VALID_IN_KERNEL", "1")))

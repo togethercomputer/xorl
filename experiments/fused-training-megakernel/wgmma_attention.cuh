@@ -681,7 +681,12 @@ __device__ void op_attn_dkv_wg(const Instr& I, int tile, void** bufs, char* smem
 #pragma unroll
       for (int i = 0; i < 2; ++i) {
         const int qr = q0s + r0 + 8 * i;
+#ifdef MK_ATTN_DKV_ROW_BCAST
+        float lse = ((ln & 3) == 0) ? LSE[(int64_t)qh * S + qr] : 0.0f;
+        lse = __shfl_sync(0xffffffffu, lse, ln & ~3);
+#else
         const float lse = LSE[(int64_t)qh * S + qr];
+#endif
 #pragma unroll
         for (int n8 = 0; n8 < 8; ++n8) {
           const int idx = n8 * 4 + i * 2;
@@ -702,7 +707,13 @@ __device__ void op_attn_dkv_wg(const Instr& I, int tile, void** bufs, char* smem
       wga_mma64<WGA_MMA_KK, false, false>(sm.dO[t & 1], sm.V[wg], s);  // dP = dO V^T
 #pragma unroll
       for (int i = 0; i < 2; ++i) {
-        const float dr = Drow[(int64_t)qh * S + q0s + r0 + 8 * i];
+        const int qr = q0s + r0 + 8 * i;
+#ifdef MK_ATTN_DKV_ROW_BCAST
+        float dr = ((ln & 3) == 0) ? Drow[(int64_t)qh * S + qr] : 0.0f;
+        dr = __shfl_sync(0xffffffffu, dr, ln & ~3);
+#else
+        const float dr = Drow[(int64_t)qh * S + qr];
+#endif
 #pragma unroll
         for (int n8 = 0; n8 < 8; ++n8) {
           const int idx = n8 * 4 + i * 2;

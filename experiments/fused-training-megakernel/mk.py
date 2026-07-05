@@ -177,6 +177,7 @@ def load_ext(
     idle_ns=None,
     attn_dkv_float2_atomic=None,
     attn_dq_float2_store=None,
+    attn_dkv_row_bcast=None,
 ):
     # MK_OCC2=1 builds the 256-thread executors with __launch_bounds__(256, 2):
     # 2 blocks/SM (128-reg ceiling, ptxas spills the fat op paths). Motivated by the
@@ -186,6 +187,11 @@ def load_ext(
     occ2 = int(os.environ.get("MK_OCC2", "0"))
     regcopy = int(os.environ.get("MK_WS_REGCOPY", "0"))
     attnpipe = int(os.environ.get("MK_ATTN_PIPE", "0"))
+    attn_dkv_row_bcast_env = os.environ.get("MK_ATTN_DKV_ROW_BCAST")
+    if attn_dkv_row_bcast_env is not None:
+        attn_dkv_row_bcast = int(attn_dkv_row_bcast_env)
+    else:
+        attn_dkv_row_bcast = int(bool(attn_dkv_row_bcast))
     # Direct register-layout atomics for ATTN_DKV_WG avoid staging dK/dV through smem.
     # MK_ATTN_DKV_DIRECT_ATOMIC=0 restores the old coalesced smem-drain epilogue.
     attn_dkv_direct_atomic = int(os.environ.get("MK_ATTN_DKV_DIRECT_ATOMIC", "1"))
@@ -243,6 +249,7 @@ def load_ext(
     return load(
         name="xorl_megakernel" + ("_occ2" if occ2 else "") + ("_wsrc" if regcopy else "")
         + ("_apipe" if attnpipe else "") + ("_adkva" if attn_dkv_direct_atomic else "")
+        + ("_adkvbc" if attn_dkv_row_bcast else "")
         + ("_adkvf2" if attn_dkv_float2_atomic else "")
         + ("_adqf2" if attn_dq_float2_store else "")
         + ("_drowst" if drow_direct_store else "")
@@ -267,6 +274,7 @@ def load_ext(
         + (["-DMK_OCC2"] if occ2 else [])
         + (["-DMK_WS_REGCOPY"] if regcopy else [])
         + (["-DMK_ATTN_PIPE"] if attnpipe else [])
+        + (["-DMK_ATTN_DKV_ROW_BCAST"] if attn_dkv_row_bcast else [])
         + (["-DMK_ATTN_DKV_DIRECT_ATOMIC"] if attn_dkv_direct_atomic else [])
         + (["-DMK_ATTN_DKV_FLOAT2_ATOMIC"] if attn_dkv_float2_atomic else [])
         + (["-DMK_ATTN_DQ_FLOAT2_STORE"] if attn_dq_float2_store else [])
