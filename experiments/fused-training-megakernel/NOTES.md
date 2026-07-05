@@ -1133,6 +1133,18 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   old `C=1/1` (`mkv3-p4b-attn-s2048-c2-default-ab-20260704T2354ATTNC.log`) confirmed
   -39.8/+26.1/-25.6/+35.4us with 135-140/140 wins. Keep the gate S2048/H256 only;
   individual `DKV_C=2` or `DQ_C=2` and S4096 C=2 regressed.
+- Long-S TN WGMMA dW gate: the old global `MK_WGMMA_TN=1` no-go became stale after the
+  cold dW split-target retune. Current-head resweep
+  (`mkv3-p4b-current-knob-resweep-65d9f1e-20260705T0000KNOBS.log`) still regressed
+  nano/small/S2048, but S4096 improved. Paired long-S A/B
+  (`mkv3-p4b-tnwg-long-paired-65d9f1e-20260705T0001TNWG.log`) set the boundary:
+  S2048 loses (+22.1/+19.6us for TN), while S3072 wins -61.4/+55.5us, S4096 wins
+  -93.8/+105.8us, and S8192 wins -335.2/+340.1us, with all long-S samples favoring
+  TN. Patched default vs forced old
+  (`mkv3-p4b-tnwg-long-default-ab-20260705T0003TNWG.log`) confirmed S3072
+  -54.2/+52.1us, S4096 -106.8/+105.8us, and S8192 -332.8/+337.7us, while S2048 kept
+  zero TN-WG routes. Default TN WGMMA is therefore gated to implicit `K >= 3072`;
+  `MK_WGMMA_TN=0/1` still force-disables/enables it.
 
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across

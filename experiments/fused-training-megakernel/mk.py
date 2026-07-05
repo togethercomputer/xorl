@@ -70,11 +70,13 @@ def wgmma_ok(M, N, K, flags):
         return False
     if M % 128 or N % 64 or K % 64:
         return False
-    if flags & 1:  # TN (dW split-K pattern): measured NEGATIVE at both configs even
-        # with SW128 (+226 nano / +570 small): dW gemms are SINKS — making them 2x
-        # more BW-hungry steals bandwidth from the on-path chain without shortening
-        # the step. Keep WMMA; MK_WGMMA_TN=1 re-runs the experiment.
-        return bool(int(os.environ.get("MK_WGMMA_TN", "0")))
+    if flags & 1:  # TN (dW split-K pattern): short-S sinks still prefer WMMA, but
+        # after the cold dW split-target retune, long-S has enough K to amortize the
+        # WGMMA route and reduce total step time. MK_WGMMA_TN force-overrides this gate.
+        tn_env = os.environ.get("MK_WGMMA_TN")
+        if tn_env is not None:
+            return bool(int(tn_env))
+        return K >= 3072
     if not (flags & 2):  # NN (dX pattern): tile-gated
         if not int(os.environ.get("MK_WGMMA_NN", "1")):
             return False
