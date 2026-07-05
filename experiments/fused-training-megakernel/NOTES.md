@@ -2263,6 +2263,18 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   +45.98us mean with 0/24 wins, and small regressed +61.31us median / +66.87us mean
   with 0/24 wins. Do not route Drow/Drow-direct-store through n128.
 
+- Fused qkv qk-norm/RoPE n128 route no-go: a default-off `MK_QKROPE_N128=1` probe in
+  `/home/apanda/xorl-oss-qkrope-n128-probe` added q/k RMSNorm+RoPE epilogue support to
+  the m64n128 WGMMA body and routed only the fused qkv projection through it. Route
+  smoke (`mkv3-p4b-qkrope-n128-route-20260705T1523Z.log`) confirmed the intended
+  tile-count halving: nano qkv+qkrope rows 32 -> 16 tiles and small rows 128 -> 64
+  tiles with `flags=4482`. Default-vs-n128 parity passed
+  (`mkv3-p4b-qkrope-n128-parity-20260705T1530Z.log`: nano worst grad rel 0.005032,
+  small worst rel 0.000001), but timing rejected the route
+  (`mkv3-p4b-qkrope-n128-step-ab-20260705T1532Z.log`): nano regressed +34.34us median /
+  +34.90us mean with 0/24 wins, and small regressed +25.01us median / +25.10us mean
+  with 1/24 wins. Do not route the fused qkv qkrope epilogue through n128.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
