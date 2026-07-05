@@ -2221,6 +2221,26 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   (-0.99us median, -0.49us mean, 15/24 FMA wins), while small regressed (+2.78us
   median, +2.18us mean, 6/24 FMA wins). Keep the existing multiply/subtract expression.
 
+- H512/S1024 small head-dX n128/fp32 promotion: the m64n128 WGMMA body now supports
+  fp32 stores for the explicit head-dX no-atomic route. Generic `wgmma_n128_ok` still
+  excludes fp32/split-K/accumulating routes; only `dlogits @ Wlm` with `sk_head==1`
+  can opt into `flags=4232`. An isolated probe
+  `/home/apanda/xorl-oss-headdx-n128f32-probe` passed default-vs-variant parity for
+  small and H256/S2048 (`mkv3-p4b-headdx-n128f32-parity-20260705T1425Z.log`), then
+  paired timing promoted small only
+  (`mkv3-p4b-headdx-n128f32-step-ab-20260705T1426Z.log`: small -17.57us median /
+  -18.84us mean, 20/24 wins; S2048 +7.17us median / +6.41us mean, 5/24 wins).
+  Promoted route/parity on main passed
+  (`mkv3-p4b-headdx-n128f32-promote-route-parity-20260705T1430Z.log`): small default
+  is `[(155, 32, 4232, None)]`, `MK_HEAD_DX_N128_F32=0` restores old
+  `[(156, 64, 168, 1)]`, while S2048 default remains the prior m64 no-atomic
+  `[(83, 64, 136, None)]`. Final promoted default-vs-old small timing confirmed
+  -10.61us median / -12.68us mean with 24/32 wins
+  (`mkv3-p4b-headdx-n128f32-default-vs-old-small-20260705T1438Z.log`). Standard
+  `test_model.py` passed (`mkv3-p4b-headdx-n128f32-testmodel-20260705T1440Z.log`).
+  Use `MK_HEAD_DX_N128_F32=0` to force the old small split-atomic route, or
+  `MK_HEAD_DX_N128_F32=1` with `MK_HEAD_DX_NO_ATOMIC_SK1=1` for forced A/B.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

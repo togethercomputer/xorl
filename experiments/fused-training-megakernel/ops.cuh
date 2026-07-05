@@ -456,13 +456,14 @@ __device__ __forceinline__ void wg_mma_ktile_n128(const uint64_t (&da)[4], const
 // 64 fp32 accumulators/thread double the mma work per sync and halve B-traffic per
 // FLOP — the dependent chain per FLOP shortens (the one lever the register-lifetime
 // law allows). REG ~200 fits the 255 df budget; __noinline__ isolates the fat
-// accumulator frame from the dispatch switch. Supports NT + residual (bit16) + CE
-// partials (bit11); routing (flags bit12) excludes split-K/acc/f32/qkrope/Drow.
+// accumulator frame from the dispatch switch. Supports NT/NN + residual (bit16), fp32
+// stores (bit3), and CE partials (bit11); generic routing (flags bit12) still excludes
+// split-K/acc/f32/qkrope/Drow except the explicit head-dX no-atomic route.
 __device__ __noinline__ void op_gemm_wgmma_n128(const Instr& I, int tile, void** bufs, char* smem_raw) {
   namespace SG = cute::SM90::GMMA;
   const bf16* A = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
   const bf16* B = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
-  bf16* C = reinterpret_cast<bf16*>(bufs[I.args[2]]);
+  void* Cp = bufs[I.args[2]];
   const int M = I.args[3], N = I.args[4], K = I.args[5], flags = I.args[6];
   const bf16* Res = (flags & 16) ? reinterpret_cast<const bf16*>(bufs[I.args[7]]) : nullptr;
 
@@ -477,6 +478,7 @@ __device__ __noinline__ void op_gemm_wgmma_n128(const Instr& I, int tile, void**
   const int wtid = tid % 128;
 
   const bool b_t = flags & 2;  // NT: B[N,K] K-contig; NN: B[K,N] N-contig (MN slabs)
+  const bool c_f32 = flags & 8;
   auto issue_stage = [&](int k0, int st) {
 #pragma unroll
     for (int i = 0; i < 4; ++i) {  // A: 128r x 64k
@@ -553,11 +555,20 @@ __device__ __noinline__ void op_gemm_wgmma_n128(const Instr& I, int tile, void**
 #pragma unroll
       for (int e = 0; e < 8; ++e) v[e] += bf2f(re[e]);
     }
-    uint4 out;
-    bf16* oe = reinterpret_cast<bf16*>(&out);
+    if (c_f32) {
+      float* C = reinterpret_cast<float*>(Cp);
+      float4 o0 = make_float4(v[0], v[1], v[2], v[3]);
+      float4 o1 = make_float4(v[4], v[5], v[6], v[7]);
+      *reinterpret_cast<float4*>(&C[idx]) = o0;
+      *reinterpret_cast<float4*>(&C[idx + 4]) = o1;
+    } else {
+      bf16* C = reinterpret_cast<bf16*>(Cp);
+      uint4 out;
+      bf16* oe = reinterpret_cast<bf16*>(&out);
 #pragma unroll
-    for (int e = 0; e < 8; ++e) oe[e] = f2bf(v[e]);
-    *reinterpret_cast<uint4*>(&C[idx]) = out;
+      for (int e = 0; e < 8; ++e) oe[e] = f2bf(v[e]);
+      *reinterpret_cast<uint4*>(&C[idx]) = out;
+    }
     if (flags & 8192) {  // ssq partials from post-residual v[] (see m64n64 version)
       float* parts = reinterpret_cast<float*>(bufs[I.args[9]]);
       const int nparts = I.args[10];

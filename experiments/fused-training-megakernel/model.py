@@ -456,8 +456,13 @@ class MKQwen3:
         # workspace (atomic accumulate), then convert. H256/S2048 currently chooses
         # sk=1, where a normal fp32-output WGMMA avoids one zero-fill plus atomics.
         head_dx_no_atomic_sk1_env = os.environ.get("MK_HEAD_DX_NO_ATOMIC_SK1")
+        head_dx_n128_f32_env = os.environ.get("MK_HEAD_DX_N128_F32")
+        if head_dx_n128_f32_env is None:
+            head_dx_n128_f32 = c.H == 512 and c.S == 1024 and c.V % 64 == 0
+        else:
+            head_dx_n128_f32 = bool(int(head_dx_n128_f32_env))
         if head_dx_no_atomic_sk1_env is None:
-            head_dx_no_atomic_sk1 = c.H == 256 and c.S == 2048
+            head_dx_no_atomic_sk1 = (c.H == 256 and c.S == 2048) or head_dx_n128_f32
         else:
             head_dx_no_atomic_sk1 = bool(int(head_dx_no_atomic_sk1_env))
         if mk.wgmma_ok(c.S, c.H, c.V, 0):
@@ -475,11 +480,18 @@ class MKQwen3:
             head_dx_flags = 8
             head_dx_args = [B(A["logits"]), B(self.params["wlm"]), B(W["dXN_f32"]), c.S, c.H, c.V]
         if head_dx_no_atomic_sk1 and sk_head == 1:
-            p.instr(
-                mk.OP_GEMM,
-                head_dx_tiles,
-                head_dx_args + [head_dx_flags, 0],
-            )
+            if head_dx_n128_f32 and c.S % 128 == 0 and c.H % 128 == 0 and c.V % 64 == 0:
+                p.instr(
+                    mk.OP_GEMM,
+                    mk.gemm_tiles_wgmma_n128(c.S, c.H),
+                    head_dx_args + [head_dx_flags | 4096, 0],
+                )
+            else:
+                p.instr(
+                    mk.OP_GEMM,
+                    head_dx_tiles,
+                    head_dx_args + [head_dx_flags, 0],
+                )
         else:
             fill_zero(W["dXN_f32"])
             p.wave()
