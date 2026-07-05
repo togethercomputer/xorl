@@ -50,6 +50,48 @@ def attn_bands(n_qt128, stages_of, T):
     return out
 
 
+# ---- measured per-shape tuning (v3 P4b program) ---------------------------------------
+# Every EXACT-SHAPE tuned constant lives here; formula gates (drow direct store, the
+# exp2 gates, dkv float2 — derivable from shape math) stay inline in __init__. Keys
+# deliberately differ per knob: each keeps the gate dimensionality it was measured
+# under, so these are exact relocations of the previously scattered expressions
+# (routes byte-identical; verified by results/route_snapshot.py gauntlet equality in
+# the knob-consol worktree). Env overrides are unchanged and noted per knob at the
+# use sites. Measurement logs: NOTES.md P4b sections.
+
+# cached-sigmoid SwiGLU fwd + two-warp bwd; keys (H, S, I). One set drives BOTH
+# MK_SWIGLU_CACHE_SIG and MK_SWIGLU_BWD_2W defaults (independently overridable).
+_SWIGLU_CACHED_2W = {
+    (512, 1024, 1536), (256, 1024, 768), (256, 2048, 768),
+    (256, 3072, 768), (256, 4096, 768), (256, 8192, 768),
+}
+_H256_IDLE32_S = (2048, 3072, 4096, 8192)  # H==256: scheduler idle poll 32ns (else 256)
+_H256_DQ_FLOAT2_S = (3072, 4096, 8192)     # H==256: attention-dQ float2 direct store
+_ATTN_BWD_BAND_T = {2048: 12, 3072: 16, 4096: 29, 8192: 40}  # H==256/D==64; 0 elsewhere
+_ATTN_FWD_BAND_T = {2048: 16, 3072: 32, 4096: 22, 8192: 64}  # H==256/D==64; 0 elsewhere
+_ATTN_BAND_DQ_FIRST_S = (8192,)  # H==256/D==64: dq-first band emission (else lpt)
+_H256_D64_QKBWD_SPLIT_V_S = (3072, 4096, 8192)  # H==256/D==64: split qkrope v-bwd
+# H==256 uniform attention chunks (Ckv, Cq) when bands are off; other shapes use the
+# formula fallback (Ckv = 1 once nq*(S/128) >= 64 else 2, Cq = 1) at the use site.
+_H256_ATTN_CHUNKS = {512: (2, 2), 1024: (2, 2), 2048: (2, 2)}
+# dlogits @ Wlm split-K tile targets: {H: {S: target}}, 192 elsewhere.
+_HEAD_DX_TARGET = {256: {128: 32, 256: 64, 1024: 64, 512: 96, 2048: 96, 3072: 96},
+                   512: {1024: 96}}
+
+
+def _cold_cap(c):
+    """Hot/cold ring cold-work cap (v3 P6/P4b retunes; 0 = uncapped)."""
+    if c.H == 256 and c.L == 4 and c.S in (128, 512):
+        return 0
+    if c.S >= 2048:
+        return 0
+    if c.H == 256 and c.S == 1024:
+        return 64
+    if c.S >= 1024:
+        return 48
+    return 16
+
+
 class MKQwen3:
     def __init__(self, cfg: Cfg, dev="cuda", seed=0):
         self.cfg = cfg
@@ -62,14 +104,7 @@ class MKQwen3:
         # S8192 joined post-band: the pre-band recheck rejected it (+47.5us), but
         # the banded-attention scheduling regime flipped it to -112/-128us (16/16
         # both construction orders; mkv3-p4b-postband-knob-recheck-20260705T185629Z).
-        self.swiglu_cache_sig_default = (
-            (c.H == 512 and c.S == 1024 and c.I == 1536)
-            or (c.H == 256 and c.S == 1024 and c.I == 768)
-            or (c.H == 256 and c.S == 2048 and c.I == 768)
-            or (c.H == 256 and c.S == 3072 and c.I == 768)
-            or (c.H == 256 and c.S == 4096 and c.I == 768)
-            or (c.H == 256 and c.S == 8192 and c.I == 768)
-        )
+        self.swiglu_cache_sig_default = (c.H, c.S, c.I) in _SWIGLU_CACHED_2W
         self.swiglu_cache_sig_enabled = (
             self.swiglu_cache_sig_default
             if swiglu_cache_sig_env is None
@@ -179,9 +214,7 @@ class MKQwen3:
         # off): straggler q-tiles run as flash-decoding kv chunks writing
         # locally-normalized partials; a range-limited OP_ATTN_COMBINE merges them.
         default_attn_fwd_band_T = (
-            {2048: 16, 3072: 32, 4096: 22, 8192: 64}.get(c.S, 0)
-            if c.H == 256 and c.D == 64
-            else 0
+            _ATTN_FWD_BAND_T.get(c.S, 0) if c.H == 256 and c.D == 64 else 0
         )
         self.attn_fwd_band_T = int(os.environ.get("MK_ATTN_FWD_BAND", str(default_attn_fwd_band_T)))
         self.attn_fwd_bands = None
@@ -196,23 +229,16 @@ class MKQwen3:
         self.ws = W
 
         self.cos, self.sin = rope_tables(c, dev)
-        self.swiglu_bwd_2w_default = (
-            (c.H == 512 and c.S == 1024 and c.I == 1536)
-            or (c.H == 256 and c.S == 1024 and c.I == 768)
-            or (c.H == 256 and c.S == 2048 and c.I == 768)
-            or (c.H == 256 and c.S == 3072 and c.I == 768)
-            or (c.H == 256 and c.S == 4096 and c.I == 768)
-            or (c.H == 256 and c.S == 8192 and c.I == 768)
-        )
+        self.swiglu_bwd_2w_default = (c.H, c.S, c.I) in _SWIGLU_CACHED_2W
         self.drow_direct_store_default = c.D == 64 and c.S < 2048
         self.attn_exp2_approx_default = c.D == 64 and c.S >= 512 and c.S % 128 == 0
         self.lmhead_exp2_approx_default = c.V >= 8192 and c.V % 64 == 0 and c.S >= 256
         self.ce_bwd_exp2_approx_default = c.S >= 1024 and c.V >= 8192 and c.V % 8 == 0
         # S2048/S8192 joined post-band; the full long-S H256 bucket now wins 32ns
         # polling after the banding/row-batching scheduling changes.
-        self.idle_ns_default = 32 if c.H == 256 and c.S in (2048, 3072, 4096, 8192) else 256
+        self.idle_ns_default = 32 if c.H == 256 and c.S in _H256_IDLE32_S else 256
         self.attn_dkv_float2_atomic_default = c.D == 64 and c.S % 128 == 0
-        self.attn_dq_float2_store_default = c.H == 256 and c.S in (3072, 4096, 8192)
+        self.attn_dq_float2_store_default = c.H == 256 and c.S in _H256_DQ_FLOAT2_S
         self.ext = mk.load_ext(
             swiglu_bwd_2w=self.swiglu_bwd_2w_default,
             swiglu_cache_sig=self.swiglu_cache_sig_enabled,
@@ -240,16 +266,7 @@ class MKQwen3:
         # falls back to the WMMA path.
         wg_attn = c.D == 64 and c.S % 128 == 0
         p = mk.Program()
-        if c.H == 256 and c.L == 4 and c.S in (128, 512):
-            p.default_cold_cap = 0
-        elif c.S >= 2048:
-            p.default_cold_cap = 0
-        elif c.H == 256 and c.S == 1024:
-            p.default_cold_cap = 64
-        elif c.S >= 1024:
-            p.default_cold_cap = 48
-        else:
-            p.default_cold_cap = 16
+        p.default_cold_cap = _cold_cap(c)
         B = p.buf
 
         def gemm(a, b, out, M, N, K, flags, res=0, ssq=0, ssq_nparts=0):
@@ -318,7 +335,7 @@ class MKQwen3:
         swiglu_cache_sig = self.swiglu_cache_sig_enabled
         qkbwd_split_v_env = os.environ.get("MK_QKBWD_SPLIT_V")
         if qkbwd_split_v_env is None:
-            qkbwd_split_v = c.H == 256 and c.D == 64 and c.S in (3072, 4096, 8192)
+            qkbwd_split_v = c.H == 256 and c.D == 64 and c.S in _H256_D64_QKBWD_SPLIT_V_S
         else:
             qkbwd_split_v = bool(int(qkbwd_split_v_env))
 
@@ -326,15 +343,8 @@ class MKQwen3:
             env = os.environ.get("MK_HEAD_DX_TARGET_TILES")
             if env is not None:
                 return int(env)
-            # Nano, short S256/S1024, S2048/S3072, and H512/S1024 small want less head dX
-            # split-K after the route retunes; keep 192 elsewhere.
-            if c.H == 256 and c.S == 128:
-                return 32
-            if c.H == 256 and c.S in (256, 1024):
-                return 64
-            if (c.H == 256 and c.S in (512, 2048, 3072)) or (c.H == 512 and c.S == 1024):
-                return 96
-            return 192
+            # per-shape retuned targets in _HEAD_DX_TARGET; 192 elsewhere
+            return _HEAD_DX_TARGET.get(c.H, {}).get(c.S, 192)
 
         def rmsnorm_bwd(args):
             if split_rms_bwd:
@@ -754,16 +764,13 @@ class MKQwen3:
                 # dKV otherwise wants C=1 once nq * (S/128) already exposes >=64 chunks,
                 # else C=2 keeps enough tail parallelism (nano/S1024-H256).
                 n_qt128 = c.S // 128
-                attn_c2_s1024 = c.H == 256 and c.S == 1024
-                attn_c2_s2048 = c.H == 256 and c.S == 2048
-                attn_c32_s512 = c.H == 256 and c.S == 512
-                if attn_c32_s512:
-                    default_Ckv = 2
-                elif attn_c2_s2048:
-                    default_Ckv = 2
+                if c.H == 256 and c.S in _H256_ATTN_CHUNKS:
+                    default_Ckv, default_Cq = _H256_ATTN_CHUNKS[c.S]
                 else:
+                    # dKV wants C=1 once nq * (S/128) already exposes >=64 chunks,
+                    # else C=2 keeps enough tail parallelism; dQ wants one kv chunk.
                     default_Ckv = 1 if c.nq * n_qt128 >= 64 else 2
-                default_Cq = 2 if (attn_c2_s1024 or attn_c2_s2048 or attn_c32_s512) else 1
+                    default_Cq = 1
                 Ckv = max(1, int(os.environ.get("MK_ATTN_DKV_C", str(default_Ckv))))
                 Cq = max(1, int(os.environ.get("MK_ATTN_DQ_C", str(default_Cq))))
                 # Banded chunking (MK_ATTN_BAND = target stages per chunk, 0 = off):
@@ -784,14 +791,16 @@ class MKQwen3:
                 # cached-SwiGLU composition (-88/-110us vs T=32). Standalone +
                 # in-model logs in the attn-band worktree and shared results/.
                 default_band_T = (
-                    {2048: 12, 3072: 16, 4096: 29, 8192: 40}.get(c.S, 0)
-                    if c.H == 256 and c.D == 64
-                    else 0
+                    _ATTN_BWD_BAND_T.get(c.S, 0) if c.H == 256 and c.D == 64 else 0
                 )
                 band_T = int(os.environ.get("MK_ATTN_BAND", str(default_band_T)))
                 if band_T > 0:
                     # Only S8192 wins when DQ bands lead; shorter gated shapes regress.
-                    default_band_order = "dq_first" if c.H == 256 and c.D == 64 and c.S == 8192 else "lpt"
+                    default_band_order = (
+                        "dq_first"
+                        if c.H == 256 and c.D == 64 and c.S in _ATTN_BAND_DQ_FIRST_S
+                        else "lpt"
+                    )
                     band_order = os.environ.get("MK_ATTN_BAND_ORDER", default_band_order)
 
                     def bands(stages_of):
