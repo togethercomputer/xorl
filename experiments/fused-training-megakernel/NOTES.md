@@ -3075,6 +3075,20 @@ medians but still paired -66.8us). Confirmation log
 `{2048:16, 3072:16, 4096:29, 8192:32}`; `MK_ATTN_BAND=32` restores the old
 S4096 route for A/B and `MK_ATTN_BAND=0` still restores the uniform C route.
 
+Post-T29 follow-up no-gos: current default `lpt` order remains best. A
+pre-combine env-only retest at `77346e2`
+(`mkv3-p4b-s4096-t29-band-order-retest-20260705T1852Z.log`) forced
+`MK_ATTN_BAND_ORDER=dq_first` under the new T29 geometry; it was parity-clean
+but slower by +51.7/+48.1us with 0/40 wins in both construction orders. A
+post-combine worktree probe at `fe39656`
+(`/home/apanda/xorl-oss-attn-t29-tiebreak-probe/results/mkv3-p4b-s4096-t29-lpt-dq-tie-20260705T1855Z.log`)
+tried only the narrower equal-stage DQ-before-DKV tie-break
+(`MK_ATTN_BAND_ORDER=lpt_dq_tie`); it was also parity-clean but slower by
++11.9/+10.3us with only 2/40 and 6/40 wins. Keep S4096 T29 on `lpt`; do not
+promote either DQ-first ordering. The pre-combine `MK_RMS_DX_R4=1` recheck
+(`mkv3-p4b-s4096-rmsdx-r4-post-t29-20260705T1854Z.log`) still lost
++5.4/+5.2us, so S4096 remains on RMS dx R2.
+
 ## v3 P4b attention-combine row batching (session 2853e0de): PROMOTED
 
 The post-compose profile showed `OP_ATTN_COMBINE` (the fwd-band merge op) fat on
