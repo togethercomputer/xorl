@@ -42,6 +42,7 @@ OP_ATTN_DQ_WG = 23  # args as OP_ATTN_DQ (incl. kv-chunk count C)
 OP_RMSNORM_BWD_DX = 24  # dx-only half of env-gated split RMSNorm backward
 OP_RMSNORM_BWD_DW = 25  # dw-only cold sink half of env-gated split RMSNorm backward
 OP_RMSNORM_BWD_DX_R4 = 26  # dx-only four-row fold for H256 long-S shapes
+OP_INV_VALID = 27  # one-tile valid-label count, writes reciprocal for CE
 
 GEMM_BM, GEMM_BN = 64, 128  # keep in sync with ops.cuh
 FILL_CHUNK = 16384  # elements per fill/cvt work item (MK_CHUNK in ops.cuh)
@@ -252,6 +253,8 @@ def _access_sets(op, args):
         return [0, 1], [2]
     if op == OP_EMBED_BWD:
         return [0, 1], [2]
+    if op == OP_INV_VALID:
+        return [0], [1]
     if op == OP_CE_FWD:
         r = [0, 1, 4]
         if len(args) > 6:  # fused lm_head-epilogue lse partials

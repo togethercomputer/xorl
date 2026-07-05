@@ -1704,6 +1704,18 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   regressed by +21.9us with 12/60 wins. Keep short-row n128 disabled except the existing
   lm-head route where the default gate already selects it.
 
+- In-kernel valid-label reciprocal: remove the host-side PyTorch `labels >= 0` sum from
+  the timed `MKQwen3.step()` path by adding a one-tile `OP_INV_VALID` root instruction
+  that writes the same `inv_valid = 1 / max(valid_count, 1)` scalar consumed by CE
+  forward/backward. The old behavior remains available with `MK_INV_VALID_IN_KERNEL=0`.
+  Full model validation passed under the default path
+  (`mkv3-p4b-invvalid-testmodel-20260705T0440INV.log`). Direct old-host-count vs
+  new-in-kernel-count paired `step()` timing
+  (`mkv3-p4b-invvalid-step-ab-20260705T0442INV.log`) was decisive on every flag shape:
+  nano -75.3us, small -93.0us, S128 -71.5us, S256 -69.8us, and H256/S1024 -79.8us,
+  each with 160/160 new-path wins. This does not shorten `prog.run()` profiles; it
+  removes prelaunch work from the user-visible step path and the final scoreboard.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):

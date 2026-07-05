@@ -1575,6 +1575,30 @@ __device__ void op_embed_bwd(const Instr& I, int tile, void** bufs) {
   for (int i = mk_tid(); i < H; i += MK_CONSUMERS) atomicAdd(&de[i], bf2f(dx[i]));
 }
 
+// Valid-label reciprocal for CE. Keeping this inside the cooperative launch avoids a
+// handful of host-side PyTorch kernels in MKQwen3.step(), while CE_FWD/BWD still read
+// the same scalar contract: inv_valid = 1 / max(count(labels >= 0), 1).
+// args: {labels, inv_valid, S}; tile = 0.
+__device__ void op_inv_valid(const Instr& I, int tile, void** bufs, char* smem_raw) {
+  const int S = I.args[2];
+  const int* labels = reinterpret_cast<const int*>(bufs[I.args[0]]);
+  float* inv_valid = reinterpret_cast<float*>(bufs[I.args[1]]);
+  int count = 0;
+  for (int i = mk_tid(); i < S; i += MK_CONSUMERS) count += labels[i] >= 0;
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    count += __shfl_xor_sync(0xffffffffu, count, off);
+  int* warp_counts = reinterpret_cast<int*>(smem_raw);
+  if ((mk_tid() & 31) == 0) warp_counts[mk_tid() >> 5] = count;
+  consumer_sync();
+  if (mk_tid() == 0) {
+    int total = 0;
+#pragma unroll
+    for (int w = 0; w < MK_CONSUMERS / 32; ++w) total += warp_counts[w];
+    inv_valid[0] = 1.0f / float(max(total, 1));
+  }
+}
+
 // ---- cross entropy ----------------------------------------------------------------------
 // fwd over materialized logits [S, V]: per row lse; loss_sum += (lse - z_t) for valid rows.
 // inv_valid is a device fp32 scalar (1/num_valid). loss is a device fp32 scalar (pre-zeroed).

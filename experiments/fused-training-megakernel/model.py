@@ -138,6 +138,7 @@ class MKQwen3:
 
         self.cos, self.sin = rope_tables(c, dev)
         self.ext = mk.load_ext()
+        self.in_kernel_inv_valid = bool(int(os.environ.get("MK_INV_VALID_IN_KERNEL", "1")))
         self._build_program()
 
     # ------------------------------------------------------------------ #
@@ -244,6 +245,8 @@ class MKQwen3:
 
         # ---- wave 0: embedding gather + zero every fp32 grad / loss / dX stream ----
         p.instr(mk.OP_EMBED_FWD, c.S, [B(self.tokens), B(self.params["emb"]), X[0], c.H])
+        if self.in_kernel_inv_valid:
+            p.instr(mk.OP_INV_VALID, 1, [B(self.labels), B(self.inv_valid), c.S])
         for g in self.grads.values():
             fill_zero(g)
         fill_zero(self.loss)
@@ -555,6 +558,7 @@ class MKQwen3:
         """One fused fwd+bwd. Returns the (device) loss scalar; grads are in self.grads."""
         self.tokens.copy_(tokens)
         self.labels.copy_(labels)
-        self.inv_valid.copy_(1.0 / (labels >= 0).sum().clamp(min=1).float().reshape(1))
+        if not self.in_kernel_inv_valid:
+            self.inv_valid.copy_(1.0 / (labels >= 0).sum().clamp(min=1).float().reshape(1))
         self.prog.run(self.ext, mode=mode)
         return self.loss
