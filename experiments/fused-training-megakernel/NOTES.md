@@ -1278,6 +1278,24 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   86/120 wins). Keep CE on precise `logf`; the current CE op does not have enough
   shape information to split nano from S4096 safely.
 
+- Post-fast-log profile + SWIGLU reciprocal no-go: current profile
+  (`mkv3-p4b-post-aflog-profile-34d6635-20260705T0221PROFILE.log`) has nano 958.5us
+  and small 3644.0us; small's top spans are still `ATTN_DKV_WG` 363.6us,
+  `GEMMNN 1024x512x3072.wg` 311.8us, `SWIGLU_BWD` 261.9us, and `ATTN_FWD_WG`
+  242.8us. A default-off `MK_SWIGLU_RCP_RN` probe replaced the sigmoid division with
+  `__frcp_rn`. Global reciprocal correctness passed
+  (`mkv3-p4b-swrcp-testswiglu-20260705T0223SWRCP.log`,
+  `mkv3-p4b-swrcp-testmodel-20260705T0225SWRCP.log`) and helped small
+  (`mkv3-p4b-swrcp-ab-20260705T0225SWRCP.log`: -16.22us median, 210/240 wins), but
+  regressed nano (+6.74us, 90/360 wins), S2048 (+0.30us, 87/180 wins), and S4096
+  badly (+20.16us, 2/120 wins). A shape-gated S=1024/I=1536 version passed the actual
+  small-shape op test and model fallback checks
+  (`mkv3-p4b-swrcp-gated-testswiglu-20260705T0227SWRCP.log`,
+  `mkv3-p4b-swrcp-gated-testmodel-20260705T0229SWRCP.log`), but still regressed fallback
+  shapes and left only a weak small win
+  (`mkv3-p4b-swrcp-gated-ab-20260705T0229SWRCP.log`: nano +2.98us, small -4.11us,
+  S2048 +3.18us, S4096 +18.02us). Keep SWIGLU's division form.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
