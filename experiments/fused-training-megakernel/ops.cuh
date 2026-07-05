@@ -739,7 +739,14 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
       for (int d = lane; d < WG_BN; d += 32)
         s += bf2f(f2bf(Cs[r * WG_LDC + d])) * bf2f(Oatt[(int64_t)(m0 + r) * N + n0 + d]);
       for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffff, s, o);
-      if (lane == 0) atomicAdd(&drow[(int64_t)(n0 / D) * M + m0 + r], s);
+      if (lane == 0) {
+#ifdef MK_DROW_DIRECT_STORE
+        if (D == WG_BN && M < 2048)
+          drow[(int64_t)(n0 / D) * M + m0 + r] = s;
+        else
+#endif
+          atomicAdd(&drow[(int64_t)(n0 / D) * M + m0 + r], s);
+      }
     }
   }
 

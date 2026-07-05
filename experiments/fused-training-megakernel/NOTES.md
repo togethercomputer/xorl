@@ -1957,6 +1957,25 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   3663.52us median, delta +10.46us median / +10.26us mean, 36/240 4W wins). The
   temporary 4W source route was reverted; keep `OP_SWIGLU_BWD_2W` as the small default.
 
+- WGMMA Drow direct-store promotion: the fused Drow epilogue in `dOatt = dX @ Wo`
+  used `atomicAdd` even when D=64 makes each WGMMA tile own a complete head and every
+  `drow[qh,row]` element has a single writer. `MK_DROW_DIRECT_STORE=1` compiles a
+  direct assignment for that safe case. Small one-step gradient parity passed with all
+  8 Drow GEMMs on WGMMA (`mkv3-p4b-drowstore-small-testmodel-20260705T0726Z.log`).
+  Broad env A/B was positive for S128 (-26.45us), S256 (-15.30us), nano/S512
+  (-17.47us), small (-20.67us), and H256/S1024 (-16.66us), but H256/S2048 regressed
+  slightly (`mkv3-p4b-drowstore-broad-step-ab-20260705T0726Z.log`). A runtime branch
+  inside the `_drowst` extension still hurt S2048
+  (`mkv3-p4b-drowstore-guard-step-ab-20260705T0735Z.log`), so the default gate is at
+  extension selection: D=64 and S<2048 build `_drowst`; S2048 and D=128 keep the old
+  atomic extension. Route checks confirmed the gate and env override
+  (`mkv3-p4b-drowstore-route-20260705T0735Z.log`), and default model validation passed
+  (`mkv3-p4b-drowstore-default-testmodel-20260705T0735Z.log`). Final default-vs-old
+  timing (`mkv3-p4b-drowstore-default-vs-old-20260705T0735Z.log`) measured S128
+  -1.52us, S256 -14.62us, nano/S512 -12.18us, small -31.62us, and H256/S1024 -4.51us
+  median; H256/S2048 default compiles the old no-`_drowst` extension. Set
+  `MK_DROW_DIRECT_STORE=0` to force the old atomic Drow path for A/B.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
