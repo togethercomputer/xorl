@@ -2531,6 +2531,16 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   total; the top path is still attention/GEMM led (`ATTN_DKV_WG` 136.0us,
   `ATTN_FWD_WG` 128.9us, MLP dX 90.5us), with cached `SWIGLU_BWD_2W` at 75.9us.
 
+- Current-head H256/S1024 n128 NN recheck no-change: because the post-2W profile still
+  had `GEMMNN 1024x256x1536.wg` on the path, an env-only `MK_WGMMA_N128_NN_MIN=16`
+  recheck retested the earlier n128 NN alternative at current head. Route inspection
+  (`mkv3-p4b-s1024-n128nn-current-20260705T1510Z.log`) flipped 8 `1024x256` NN rows
+  through n128 (tile count 32 -> 16 for the K=1536/512 rows) while keeping lm-head
+  split-K and qkrope rows on their existing routes. Parity passed (worst rel 0.006850),
+  but paired timing rejected the route decisively: +22.24us and +26.98us
+  n128-default by construction order, combined +24.37us with 2/320 n128 wins. Keep the
+  current m64n64 WGMMA NN threshold for H256/S1024.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
