@@ -3232,6 +3232,16 @@ and 2/40), parity clean. The post-band resweep vein is otherwise mined at the
 long shapes; the yielded flips are cached SwiGLU 2W at S8192 plus idle32 at
 S2048/S8192.
 
+S8192 fwd-band retune on the new T40-bwd base (session 2853e0de,
+`mkv3-p4b-s8192-fwdband-retune-20260705T195210Z.log`): **fwd T=64 is a
+sharp optimum, confirmed** — T48 +105.3/+90.2us (0/16 both orders), T56
++40.9/+27.7 (1/16), and the coarse side falls off the unsplit-straggler cliff:
+T72 +398.8/+387.5, T80 +510.3/+476.1 (T>64 leaves a >64-stage q-tile at C=1;
+T=64 splits exactly everything above one 64-stage chunk). idle_ns fine sweep on
+the same base: idle16 +8.7/-11.0 and idle64 +9.9/-3.8 — order-mixed washes,
+keep idle32. S8192 defaults after the combined day: bwd band T40, fwd band
+T64, idle32, cached SwiGLU 2W; absolute ~7120-7150us in the resweep harness.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
