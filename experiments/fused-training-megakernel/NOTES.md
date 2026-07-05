@@ -3242,6 +3242,16 @@ the same base: idle16 +8.7/-11.0 and idle64 +9.9/-3.8 — order-mixed washes,
 keep idle32. S8192 defaults after the combined day: bwd band T40, fwd band
 T64, idle32, cached SwiGLU 2W; absolute ~7120-7150us in the resweep harness.
 
+Post-band n128 recheck (session 2853e0de, GPU 6,
+`mkv3-p4b-n128-postband-recheck-gpu6-*.log`): all n128 routing defaults are
+CONFIRMED load-bearing post-band, no flips. S4096: `MK_WGMMA_N128=0`
++132.4/+123.7us (0/40 both), `=2` (lm-head-only) +65.7/+54.4 (0/40), `_NN=0`
++33.2/+27.1 (<=2/40). S8192: `=0` +423.0/+400.0 (0/16), `=2` +268.0 clean
+order (its default_first window had a transient co-tenant spike to 14.7ms
+absolutes — delta +286.7 corroborates but is flagged), `_NN=0` +96.4/+71.6
+(<=1/16). GPU-2 lane note: that GPU reads 1.6-1.8x-high absolutes under
+clean-looking guards (invisible out-of-container tenant) — do not time there.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
