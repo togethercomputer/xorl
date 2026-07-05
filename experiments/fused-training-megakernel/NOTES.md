@@ -1910,6 +1910,28 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   H256/S1024 -47.76us, and H256/S2048 -49.46us for default minus old-smem. Keep
   `MK_ATTN_DKV_DIRECT_ATOMIC=1`.
 
+- Small SwiGLU-BWD two-warp route: the rejected `MK_SWIGLU_BWD_R2=1` probe folded two
+  rows into one warp and lost. The opposite split, two warps per row, is now a narrow
+  H512/S1024 small default. `OP_SWIGLU_BWD_2W` maps each 8-warp block to four rows and
+  splits the feature dimension across a row-local warp pair, reducing the six serial
+  vector chunks per I=1536 row to three. Focused op correctness passed
+  (`mkv3-p4b-swb2w-testops-20260705T065511Z.log`), as did full-model checks with the
+  route forced on and with the promoted default
+  (`mkv3-p4b-swb2w-testmodel-20260705T065511Z.log`,
+  `mkv3-p4b-swb2w-small-testmodel-20260705T065511Z.log`,
+  `mkv3-p4b-swb2w-default-testmodel-20260705T065511Z.log`). Broad timing was mixed
+  (`mkv3-p4b-swb2w-step-ab-20260705T065511Z.log`): S128 looked positive but reversed
+  under construction-order control, S256 was neutral, nano/H256-S1024/H256-S2048
+  regressed, and small was weakly positive. Reverse-order timing confirmed only small
+  (`mkv3-p4b-swb2w-short-reverse-ab-20260705T065511Z.log`), and fresh single-model
+  process medians kept the small win in 6/6 pairs
+  (`mkv3-p4b-swb2w-small-freshproc-ab-20260705T065511Z.log`: median -5.76us,
+  mean -6.80us). Route inspection confirmed only small emits the new op by default
+  (`mkv3-p4b-swb2w-route-20260705T065511Z.log`), and final default-vs-forced-old timing
+  measured -12.22us median with 193/240 default wins
+  (`mkv3-p4b-swb2w-default-vs-old-20260705T065511Z.log`). `MK_SWIGLU_BWD_2W=0`
+  restores the old route for A/B.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

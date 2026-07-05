@@ -137,7 +137,8 @@ class MKQwen3:
         self.ws = W
 
         self.cos, self.sin = rope_tables(c, dev)
-        self.ext = mk.load_ext()
+        self.swiglu_bwd_2w_default = c.H == 512 and c.S == 1024 and c.I == 1536
+        self.ext = mk.load_ext(swiglu_bwd_2w=self.swiglu_bwd_2w_default)
         self.in_kernel_inv_valid = bool(int(os.environ.get("MK_INV_VALID_IN_KERNEL", "1")))
         self.bind_inputs = bool(int(os.environ.get("MK_BIND_INPUTS", "1")))
         self._inputs_bound_external = False
@@ -206,6 +207,11 @@ class MKQwen3:
             rms_dx_fma_route = c.H == 256 and c.S == 128
         else:
             rms_dx_fma_route = bool(int(rms_dx_fma_route_env)) and c.H == 256 and c.S == 128
+        swiglu_bwd_2w_env = os.environ.get("MK_SWIGLU_BWD_2W")
+        if swiglu_bwd_2w_env is None:
+            swiglu_bwd_2w = self.swiglu_bwd_2w_default
+        else:
+            swiglu_bwd_2w = bool(int(swiglu_bwd_2w_env))
 
         def head_dx_target_tiles():
             env = os.environ.get("MK_HEAD_DX_TARGET_TILES")
@@ -441,7 +447,14 @@ class MKQwen3:
             dhs, dhs_f32 = gemm_dx(B(W["dX"]), pr("wd"), B(W["dHs"]), lambda: B(W[f"dHs_f32.{l}"]), c.S, c.I, c.H)
             gemm(B(W["dX"]), a("hs"), gr("wd"), c.H, c.I, c.S, 1 | 4 | 8)
             p.wave()
-            p.instr(mk.OP_SWIGLU_BWD, mk.rowop_tiles(c.S), [a("gu"), dhs, B(W["dGU"]), c.S, c.I, dhs_f32])
+            if swiglu_bwd_2w:
+                p.instr(
+                    mk.OP_SWIGLU_BWD_2W,
+                    mk.rowop_tiles(c.S, mk.SWIGLU_BWD_2W_R),
+                    [a("gu"), dhs, B(W["dGU"]), c.S, c.I, dhs_f32],
+                )
+            else:
+                p.instr(mk.OP_SWIGLU_BWD, mk.rowop_tiles(c.S), [a("gu"), dhs, B(W["dGU"]), c.S, c.I, dhs_f32])
             p.wave()
             dxn, dxn_f32 = gemm_dx(B(W["dGU"]), pr("wgu"), B(W["dXN"]), lambda: B(W[f"dXN2_f32.{l}"]), c.S, c.H, 2 * c.I)
             gemm(B(W["dGU"]), a("xn2"), gr("wgu"), 2 * c.I, c.H, c.S, 1 | 4 | 8)

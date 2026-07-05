@@ -44,6 +44,7 @@ OP_RMSNORM_BWD_DW = 25  # dw-only cold sink half of env-gated split RMSNorm back
 OP_RMSNORM_BWD_DX_R4 = 26  # dx-only four-row fold for H256 long-S shapes
 OP_INV_VALID = 27  # one-tile valid-label count, writes reciprocal for CE
 OP_RMSNORM_BWD_DX_FMA = 28  # H256/S128 RMSNorm dx arithmetic route
+OP_SWIGLU_BWD_2W = 29  # opt-in two-warps-per-row SwiGLU backward route
 
 GEMM_BM, GEMM_BN = 64, 128  # keep in sync with ops.cuh
 FILL_CHUNK = 16384  # elements per fill/cvt work item (MK_CHUNK in ops.cuh)
@@ -163,7 +164,7 @@ MAX_ARGS = 23
 INSTR_INTS = 3 + MAX_ARGS  # op, tile_off, ntiles, args[23]
 
 
-def load_ext(verbose=False):
+def load_ext(verbose=False, swiglu_bwd_2w=None):
     # MK_OCC2=1 builds the 256-thread executors with __launch_bounds__(256, 2):
     # 2 blocks/SM (128-reg ceiling, ptxas spills the fat op paths). Motivated by the
     # P4b nsys counters — in-kernel SM issue 19%, warps-in-flight 12%, DRAM <10%:
@@ -183,11 +184,18 @@ def load_ext(verbose=False):
     # SWIGLU_BWD derivative algebra: fmaf(-sg, sig, sig+sg) avoids the explicit
     # (1-sig) dependency. MK_SWIGLU_FMA_DERIV=0 restores the old form for A/B.
     swiglu_fma_deriv = int(os.environ.get("MK_SWIGLU_FMA_DERIV", "1"))
+    # H512/S1024 small uses a two-warps-per-row SwiGLU backward body by default.
+    # MK_SWIGLU_BWD_2W=0/1 force-overrides the model's shape default for A/B.
+    swiglu_bwd_2w_env = os.environ.get("MK_SWIGLU_BWD_2W")
+    if swiglu_bwd_2w_env is not None:
+        swiglu_bwd_2w = int(swiglu_bwd_2w_env)
+    else:
+        swiglu_bwd_2w = int(bool(swiglu_bwd_2w))
     return load(
         name="xorl_megakernel" + ("_occ2" if occ2 else "") + ("_wsrc" if regcopy else "")
         + ("_apipe" if attnpipe else "") + ("_adkva" if attn_dkv_direct_atomic else "")
         + ("_aflog" if attn_fast_log else "") + ("_qkbc" if qkbc else "")
-        + ("_swfma" if swiglu_fma_deriv else ""),
+        + ("_swfma" if swiglu_fma_deriv else "") + ("_swb2w" if swiglu_bwd_2w else ""),
         sources=[os.path.join(_DIR, "megakernel.cu")],
         extra_cuda_cflags=[
             "-O3",
@@ -205,7 +213,8 @@ def load_ext(verbose=False):
         + (["-DMK_ATTN_DKV_DIRECT_ATOMIC"] if attn_dkv_direct_atomic else [])
         + (["-DMK_ATTN_FAST_LOG"] if attn_fast_log else [])
         + (["-DMK_QKBWD_D64_CACHE"] if qkbc else [])
-        + (["-DMK_SWIGLU_FMA_DERIV"] if swiglu_fma_deriv else []),
+        + (["-DMK_SWIGLU_FMA_DERIV"] if swiglu_fma_deriv else [])
+        + (["-DMK_SWIGLU_BWD_2W"] if swiglu_bwd_2w else []),
         verbose=verbose,
     )
 
@@ -249,7 +258,7 @@ def _access_sets(op, args):
         return [0, 2, 5], [4]
     if op == OP_SWIGLU_FWD:
         return [0], [1]
-    if op == OP_SWIGLU_BWD:
+    if op in (OP_SWIGLU_BWD, OP_SWIGLU_BWD_2W):
         return [0, 1], [2]
     if op == OP_QKNORM_ROPE_FWD:
         return [0, 2, 3, 6, 7], [1, 4, 5]
@@ -288,6 +297,7 @@ REGION_ROWS = 128  # producer progress granularity for df2 region watermarks
 ROWOP_R = 8    # swiglu/qknorm rows per tile (ops.cuh MK_ROW_R)
 ROWOP_R2 = 16  # rmsnorm rows per tile, 2 rows/warp interleaved (ops.cuh MK_ROW_R2)
 ROWOP_R4 = 32  # dx-only RMSNorm long-S fold, 4 rows/warp interleaved
+SWIGLU_BWD_2W_R = 4  # two warps per row, four rows per 8-warp block
 # measured split (v3 P4b): interleave pays only where per-row MLP is starved
 # (rmsnorm's H<=512 rows = 2 load iterations); swiglu's 6-iteration rows are
 # already saturated and qknorm's per-warp task chain doubles serially (+142us).
@@ -302,6 +312,7 @@ _ROW_TILE_R = {
     OP_RMSNORM_BWD_DX_R4: ROWOP_R4,
     OP_SWIGLU_FWD: ROWOP_R,
     OP_SWIGLU_BWD: ROWOP_R,
+    OP_SWIGLU_BWD_2W: SWIGLU_BWD_2W_R,
     OP_QKNORM_ROPE_BWD: ROWOP_R,
 }
 
@@ -319,6 +330,7 @@ _ROW_WRITE_POS = {
     OP_RMSNORM_BWD_DX_FMA: (3,),
     OP_SWIGLU_FWD: (1,),
     OP_SWIGLU_BWD: (2,),
+    OP_SWIGLU_BWD_2W: (2,),
     OP_QKNORM_ROPE_FWD: (1, 4, 5),
     OP_QKNORM_ROPE_BWD: (2,),
     OP_CE_FWD: (2,),  # lse; loss is a scalar atomic
@@ -336,6 +348,7 @@ _ROW_READ_POS = {
     OP_RMSNORM_BWD_DX_R4: (0, 2, 5),
     OP_SWIGLU_FWD: (0,),
     OP_SWIGLU_BWD: (0, 1),
+    OP_SWIGLU_BWD_2W: (0, 1),
     OP_QKNORM_ROPE_FWD: (0,),
     OP_QKNORM_ROPE_BWD: (0, 1, 7, 8),
     OP_CE_FWD: (0, 2, 6),
@@ -603,7 +616,7 @@ class Program:
         rc = int(os.environ.get("MK_ROWOP_CLAIM", "1"))
         _rowops = (OP_RMSNORM_FWD, OP_RMSNORM_BWD, OP_RMSNORM_BWD_DX,
                    OP_RMSNORM_BWD_DX_FMA, OP_RMSNORM_BWD_DW, OP_RMSNORM_BWD_DX_R4,
-                   OP_SWIGLU_FWD, OP_SWIGLU_BWD,
+                   OP_SWIGLU_FWD, OP_SWIGLU_BWD, OP_SWIGLU_BWD_2W,
                    OP_QKNORM_ROPE_FWD, OP_QKNORM_ROPE_BWD)
         claim = [max(c, rc) if op in _rowops else c
                  for c, (op, ntiles, _) in zip(claim, flat)]

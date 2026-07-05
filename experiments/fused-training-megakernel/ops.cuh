@@ -1437,6 +1437,59 @@ __device__ void op_swiglu_bwd(const Instr& I, int tile, void** bufs) {
   }
 }
 
+#ifdef MK_SWIGLU_BWD_2W
+// Two warps per row for wide SwiGLU backward rows. Each row-local warp pair splits
+// the feature dimension, so writes are disjoint and no inter-warp sync is required.
+__device__ void op_swiglu_bwd_2w(const Instr& I, int tile, void** bufs) {
+  const int S = I.args[3], Iw = I.args[4];
+  const bool dy_f32 = I.args[5] != 0;
+  const int warp = mk_tid() >> 5, lane = mk_tid() & 31;
+  const int row = tile * 4 + (warp >> 1);
+  const int lane64 = ((warp & 1) << 5) + lane;
+  if (row >= S) return;  // barrier-free op: early exit is safe
+  const bf16* gu = reinterpret_cast<const bf16*>(bufs[I.args[0]]) + (int64_t)row * 2 * Iw;
+  const bf16* dhb = reinterpret_cast<const bf16*>(bufs[I.args[1]]) + (int64_t)row * Iw;
+  const float* dhf = reinterpret_cast<const float*>(bufs[I.args[1]]) + (int64_t)row * Iw;
+  bf16* dgu = reinterpret_cast<bf16*>(bufs[I.args[2]]) + (int64_t)row * 2 * Iw;
+  if ((Iw & 7) == 0) {
+    for (int i = lane64 * 8; i < Iw; i += 64 * 8) {
+      float g[8], u[8], d[8], dg[8], du[8];
+      ld8bf(gu + i, g);
+      ld8bf(gu + Iw + i, u);
+      ld8dy(dhb, dhf, dy_f32, i, d);
+#pragma unroll
+      for (int j = 0; j < 8; j++) {
+        const float sig = 1.0f / (1.0f + __expf(-g[j]));
+        const float sg = g[j] * sig;
+#ifdef MK_SWIGLU_FMA_DERIV
+        const float ds = fmaf(-sg, sig, sig + sg);
+#else
+        const float ds = sig + sg * (1.0f - sig);
+#endif
+        dg[j] = d[j] * u[j] * ds;
+        du[j] = d[j] * sg;
+      }
+      st8bf(dgu + i, dg);
+      st8bf(dgu + Iw + i, du);
+    }
+  } else {
+    for (int i = lane64; i < Iw; i += 64) {
+      const float g = bf2f(gu[i]), u = bf2f(gu[Iw + i]);
+      const float d = dy_f32 ? dhf[i] : bf2f(dhb[i]);
+      const float sig = 1.0f / (1.0f + __expf(-g));
+      const float sg = g * sig;
+#ifdef MK_SWIGLU_FMA_DERIV
+      const float ds = fmaf(-sg, sig, sig + sg);
+#else
+      const float ds = sig + sg * (1.0f - sig);
+#endif
+      dgu[i] = f2bf(d * u * ds);
+      dgu[Iw + i] = f2bf(d * sg);
+    }
+  }
+}
+#endif
+
 // ---- per-head RMSNorm (Qwen3 qk-norm) + RoPE, fused ------------------------------------
 // Operates on the packed qkv buffer [S, (nq+2*nkv)*D]: normalizes+ropes q and k heads
 // in place is NOT possible (bwd needs raw input), so reads qkv_raw and writes qkv_r.
