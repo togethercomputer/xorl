@@ -2037,6 +2037,15 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   small on the standard bench path; the remaining small gap is still mostly
   attention/GEMM/SwiGLU/RMS op quality rather than CE materialization.
 
+- Post-lm-head-exp2 profile: `mkv3-p4b-profile-post-lex2-bd76802-20260705T0854Z.log`
+  measured nano at 882.2us and small at 3541.7us. The lm-head forward hop dropped to
+  130.2us small / 38.7us nano, so it is no longer the near-top small item. Current
+  small leaders are `ATTN_DKV_WG` 372.4us, MLP dX `GEMMNN 1024x512x3072.wg` 333.6us,
+  `SWIGLU_BWD_2W` 287.6us, `ATTN_FWD_WG` 257.2us, RMS dx 245.2us, and Drow
+  `GEMMNN 1024x512x512.wg` 216.9us. The remaining high-value work is true op quality
+  in those kernels or a scheduler/dependency mechanism, not another CE/lm-head epilogue
+  cleanup.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
