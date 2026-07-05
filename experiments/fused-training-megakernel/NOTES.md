@@ -1750,6 +1750,17 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   (185/200), and small -22.5us (198/200). This is a user-visible `step()` win only;
   `prog.run()` profiles are unchanged.
 
+- CE ignore-row skip no-go: skipping CE forward/backward work for `ignore_index` rows is
+  not worth a route. A compile-flag branch version passed validation
+  (`mkv3-p4b-ceskip-testmodel-20260705T0505CESKIP.log`) and looked strongly positive
+  on small (`mkv3-p4b-ceskip-step-ab-20260705T0507CESKIP.log`: -31.9us, 200/200 wins),
+  but the same branch was noise/slightly negative on nano. A later separate-opcode route
+  kept V8192 on the old CE kernels and passed validation
+  (`mkv3-p4b-ceopskip-testmodel-20260705T0512CESKIP.log`), but timing
+  (`mkv3-p4b-ceopskip-step-ab-20260705T0514CESKIP.log`) erased the small win (-1.8us,
+  121/200 wins) and regressed H256/S1024 by +9.5us with only 22/200 wins. Keep the
+  current CE opcodes unchanged.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
