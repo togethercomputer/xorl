@@ -1413,6 +1413,21 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   (`mkv3-p4b-score-s1024-wg32-20260705T0304SCORE.log`). `MK_WGMMA_NN_MIN` still
   force-overrides the threshold for sweeps.
 
+- Short-row WGMMA NN threshold gate: after the S1024 route, S128/S256 were still led by
+  tiny WMMA `GEMMNN {128,256}x256x256` hops. Env sweep
+  (`mkv3-p4b-short-wg-nn-threshold-692ae50-20260705T0304N128.log`) found threshold8
+  modestly positive on S128/S256 while nano's existing threshold16 stayed best. Direct
+  confirmation (`mkv3-p4b-short-wg8-confirm-692ae50-20260705T0305N128.log`) measured
+  S128 -6.4us median with 113/180 wins and S256 -7.3us median with 145/180 wins. Default
+  NN threshold is therefore 8 for `M in {128,256}, N=256`; M512 stays 16, M1024/N256
+  stays 32, and the generic threshold stays 64. Route check and model validation passed
+  (`mkv3-p4b-short-wg8-route-20260705T0306N128.log`,
+  `mkv3-p4b-short-wg8-testmodel-20260705T0306N128.log`). Score refreshes landed at
+  S128 853.1us vs graph+ 485.8us and S256 914.7us vs graph+ 549.9us
+  (`mkv3-p4b-score-s128-wg8-20260705T0307SCORE.log`,
+  `mkv3-p4b-score-s256-wg8-20260705T0307SCORE.log`); as usual, use the paired A/B for
+  the small S128/S256 route delta because graph+ moves between fresh processes.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
@@ -1421,8 +1436,8 @@ runs from inductor autotune variance):
 | nano | 1026 | 631 | 1.63x |
 | small | 3725 | 1891 | 1.97x |
 | deep-L12 | 2522 | 1765 | 1.43x |
-| S=128 | 850 | 426 | 2.00x |
-| S=256 | 934 | 558 | 1.67x |
+| S=128 | 853 | 486 | 1.76x |
+| S=256 | 915 | 550 | 1.66x |
 | S=1024 | 1338 | 775 | 1.73x |
 (Morning honest reset: nano 1.97x / small 2.52x.)
 
