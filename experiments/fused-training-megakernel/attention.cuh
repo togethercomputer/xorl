@@ -261,18 +261,24 @@ __device__ void op_attn_fwd_split(const Instr& I, int tile, void** bufs, char* s
 }
 
 // combine: O[s,qh,:] = sum_c w_c O_c, w_c = l_c exp(m_c - m*) / l*; LSE = m* + ln l*.
-// args: {Opart, Mpart, Lpart, O, LSE, S, nq, D, C, row_off}; tile = s - row_off
-// (row_off pads to 0 for pre-band callers); warp w handles head w, w+8...
+// args: {Opart, Mpart, Lpart, O, LSE, S, nq, D, C, row_off, R}; tile covers rows
+// row_off + tile*R .. +R-1 (row_off/R pad to 0/1 for pre-batch callers). Work
+// unit = (row, head) so all 8 warps stay busy at nq < 8; one-row tiles at long S
+// were claim-overhead-bound (2-4k tiny tiles per instr).
 __device__ void op_attn_combine(const Instr& I, int tile, void** bufs) {
   const int S = I.args[5], nq = I.args[6], D = I.args[7], C = I.args[8];
+  const int R = I.args[10] ? I.args[10] : 1;
   const bf16* Opart = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
   const float* Mpart = reinterpret_cast<const float*>(bufs[I.args[1]]);
   const float* Lpart = reinterpret_cast<const float*>(bufs[I.args[2]]);
   bf16* O = reinterpret_cast<bf16*>(bufs[I.args[3]]);
   float* LSE = reinterpret_cast<float*>(bufs[I.args[4]]);
   const int warp = mk_tid() / 32, lane = mk_tid() % 32;
-  const int s = I.args[9] + tile;
-  for (int h = warp; h < nq; h += MK_CONSUMERS / 32) {
+  const int s0 = I.args[9] + tile * R;
+  for (int u = warp; u < R * nq; u += MK_CONSUMERS / 32) {
+    const int s = s0 + u / nq;
+    const int h = u % nq;
+    if (s >= S) continue;
     float mstar = -INFINITY;
     for (int c = 0; c < C; ++c)
       mstar = fmaxf(mstar, Mpart[((int64_t)c * nq + h) * S + s]);

@@ -464,18 +464,22 @@ class MKQwen3:
                              p.buf(W["fmpart"], slot=f"fp{bi}"),
                              p.buf(W["flpart"], slot=f"fp{bi}")],
                         )
+                # combine rows are batched R=8 per tile (MK_ATTN_COMBINE_R=1 for
+                # the old one-row tiles): at long S the one-row tiling made the
+                # combine claim-overhead-bound (2-4k tiny tiles per instruction).
+                comb_R = max(1, int(os.environ.get("MK_ATTN_COMBINE_R", "8")))
                 for bi, (off, w, Cb) in enumerate(
                         sorted(self.attn_fwd_bands, key=lambda e: -e[2])):
                     if Cb > 1:
                         p.instr(
                             mk.OP_ATTN_COMBINE,
-                            w * 128,
+                            (w * 128 + comb_R - 1) // comb_R,
                             [p.buf(W["fopart"], slot=f"fp{bi}"),
                              p.buf(W["fmpart"], slot=f"fp{bi}"),
                              p.buf(W["flpart"], slot=f"fp{bi}"),
                              p.buf(A[f"oatt.{l}"], slot=f"foc{bi}"),
                              p.buf(A[f"lse.{l}"], slot=f"flc{bi}"),
-                             c.S, c.nq, c.D, Cb, off * 128],
+                             c.S, c.nq, c.D, Cb, off * 128, comb_R],
                         )
                 p.wave()
             elif wg_attn:
