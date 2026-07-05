@@ -2046,6 +2046,27 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   in those kernels or a scheduler/dependency mechanism, not another CE/lm-head epilogue
   cleanup.
 
+## Overnight-state certified scoreboard (2026-07-05 ~10:00Z, both sessions' work)
+
+Clean-GPU util guards, median-of-50, fresh process per config, flash baseline:
+
+| config | megakernel | baseline | gap | (24h ago) |
+|---|---|---|---|---|
+| nano  (H256 L4 S512)  | 917  | 634  | 1.45x | 2.06x-soft |
+| small (H512 L8 S1024) | 3570 | 1904 | 1.88x | 2.06x-soft |
+| deep-narrow (L12)     | 2400 | 1762 | **1.36x** | 1.83x-soft |
+| S=128                 | 750  | 485  | 1.55x | 2.28x-soft |
+| S=256                 | 815  | 554  | 1.47x | 2.03x-soft |
+| S=1024 (nano width)   | 1209 | 780  | 1.55x | 2.02x-soft |
+| S=4096                | 3349 | 1569 | 2.13x | — |
+| S=8192                | 8395 | 3125 | 2.69x | — |
+
+The short-S / deep-chain regime — the megakernel's original thesis territory —
+is where the gap is closing fastest (deep-L12 1.36x). The long-S regime remains
+attention-scaling-bound vs FA3. Note the "24h ago" column is vs the SOFT (math-
+attention) baseline; the honest morning reset was nano 1.97x / small 2.52x, so
+the true 24h movement is 1.97->1.45 and 2.52->1.88.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
