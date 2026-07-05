@@ -3166,6 +3166,18 @@ Resweep batch 1 (S8192, `mkv3-p4b-postband-resweep1-*.log` +
 Remaining resweep batch 2 for whoever picks it up: cold_cap + dW targets + TN
 gate + n128 modes at S3072/S4096, and the same matrix at S2048.
 
+Resweep batch 2 (S2048/S3072/S4096, `mkv3-p4b-postband-resweep2-*.log`): NO
+flips — the batch-1 flips were both S8192 scheduler-timing knobs; the shorter
+gated shapes were already re-tuned post-band by the concurrent sessions.
+- cold_cap {16, 33}: order-mixed washes at all three shapes (|delta| <= 3.4us,
+  13-30/40 wins either way) — keep current caps.
+- `MK_WGMMA_TN=0`: +161.5/+165.3 (S3072) and +169.2/+173.9 (S4096), 0/40
+  everywhere — the TN dW gate is load-bearing post-band, strongly confirmed.
+- `MK_DW_TARGET_TILES=192`: +166.9/+167.7 (S3072) and +169.2/+172.0 (S4096),
+  0/40 — the K>=2048 -> 128 dW split target likewise.
+The post-band resweep vein is now mined at the long shapes; the two S8192
+flips (cached SwiGLU 2W, idle32) were the yield.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
