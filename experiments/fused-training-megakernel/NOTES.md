@@ -3218,6 +3218,10 @@ Post-SSQ S2048 split-V recheck
 `mkv3-p4b-qkbwd-splitv-s2048-post-ssq-20260705T2115Z.log` stayed no-change:
 default-first was a wash (-0.70us, 19/40 wins) even though split-first was
 positive (-12.75us, 40/40). Keep default `MK_QKBWD_SPLIT_V` at S3072+.
+Current-head S2048 Drow direct-store recheck
+`mkv3-p4b-drowstore-s2048-current-20260705T2120Z.log` kept the old decision:
+forced `MK_DROW_DIRECT_STORE=1` was parity-clean but slower in both construction
+orders (+13.58us and +3.22us). Keep S2048 on the atomic Drow epilogue.
 
 Post-T29 follow-up no-gos: current default `lpt` order remains best. A
 pre-combine env-only retest at `77346e2`
