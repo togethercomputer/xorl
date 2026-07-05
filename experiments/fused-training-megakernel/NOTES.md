@@ -1761,6 +1761,18 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   121/200 wins) and regressed H256/S1024 by +9.5us with only 22/200 wins. Keep the
   current CE opcodes unchanged.
 
+- Current post-step-path profile refresh: `%globaltimer` profiles at `e771105`
+  (`mkv3-p4b-profile-current-e771105-20260705T0520PROFILE.log`,
+  `mkv3-p4b-profile-ssweep-e771105-20260705T0521PROFILE.log`) show the kernel-side
+  bottleneck map is unchanged by the `inv_valid` and input-bind wins. Small is still led
+  by `ATTN_DKV_WG` 394us, `GEMMNN 1024x512x3072.wg` 331us, `SWIGLU_BWD` 279us, and
+  `ATTN_FWD_WG` 262us on path. H256/S1024 is led by `ATTN_DKV_WG` 146us,
+  `ATTN_FWD_WG` 130us, lm-head forward 93us, and MLP dX 86us. Short S128/S256 remain
+  dominated by small WGMMA NN dX/head/attention spans plus fixed wait. The remaining
+  high-value work is true op quality (attention/GEMM/SwiGLU/RMS) or a new scheduler
+  mechanism; the known route knobs around attention chunks, n128, cold cap, claim, CE
+  skip, and rowop folds have been rechecked and are no-go or already promoted.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
