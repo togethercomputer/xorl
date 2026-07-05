@@ -1512,6 +1512,36 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   S128 874.7us vs graph+ 495.4us (`mkv3-p4b-score-s128-wg4-20260705T0340SCORE.log`);
   use the paired A/B for the small route delta.
 
+- Current-head S128 head-dX split retune: after the S128 WGMMA NN gate, `dlogits @ Wlm`
+  now routes through WGMMA, and the old target192 over-parallelized this short shape.
+  Broad current-head sweep (`mkv3-p4b-headdx-s128-post-wg4-a21b7a8-20260705T0341HEADDX.log`)
+  measured target32 at -29.8us paired median, target64 at -23.8us, target96 at -15.9us,
+  and target128 at -12.9us versus the current default. The target32 signal held when
+  isolated from the rejected dX split side probe: target32 beat target192 by -20.0us
+  with 157/180 wins while both models forced the old dX split target128
+  (`mkv3-p4b-headdx-s128-target32-isolated-20260705T0342HEADDX.log`). Default route now
+  emits S128 head dX as 32 WGMMA split-K tiles (`sk=8`) while S256/nano/S1024 routes are
+  unchanged (`mkv3-p4b-headdx-s128-target32-route-20260705T0343HEADDX.log`). Full model
+  validation passed (`mkv3-p4b-headdx-s128-target32-testmodel-20260705T0344HEADDX.log`),
+  and patched default-vs-forced-old timing confirmed -14.2us paired median with 137/180
+  wins (`mkv3-p4b-headdx-s128-target32-default-vs-old-20260705T0345HEADDX.log`). Fresh
+  score after the patch: S128 867.2us vs graph+ 484.7us
+  (`mkv3-p4b-score-s128-headdx32-20260705T0346SCORE.log`).
+
+- Rejected S128 dX split side probes: opt-in WGMMA split-K inside `gemm_dx` was a clear
+  no-go despite halving tile counts, regressing S128 by +80.1us, S256 by +119.4us, and
+  nano by +122.1us with zero variant wins
+  (`mkv3-p4b-dxwg-splitk-current-a21b7a8-20260705T0333DXWG.log`). Lowering the existing
+  WMMA split-K target to 64 was initially positive on S128 but construction-position
+  checks exposed allocator/order bias; patched default-vs-old was only -2.4us with
+  90/160 wins and profile attribution showed only a ~2.8us total difference, while S256
+  was noise and nano slightly lost (`mkv3-p4b-dxsplit-target-current-a21b7a8-20260705T0334DXSK.log`,
+  `mkv3-p4b-dxsplit-s128-target64-confirm-a21b7a8-20260705T0335DXSK.log`,
+  `mkv3-p4b-dxsplit-s128-default-vs-old-20260705T0338DXSK.log`,
+  `mkv3-p4b-dxsplit-s128-default-vs-old-reverse-20260705T0339DXSK.log`,
+  `mkv3-p4b-dxsplit-s128-profile-default-vs-old-20260705T0340DXSK.log`). Keep
+  `gemm_dx` split target128.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
@@ -1520,7 +1550,7 @@ runs from inductor autotune variance):
 | nano | 1026 | 631 | 1.63x |
 | small | 3714 | 1899 | 1.96x |
 | deep-L12 | 2522 | 1765 | 1.43x |
-| S=128 | 875 | 495 | 1.77x |
+| S=128 | 867 | 485 | 1.79x |
 | S=256 | 935 | 560 | 1.67x |
 | S=1024 | 1349 | 783 | 1.72x |
 (Morning honest reset: nano 1.97x / small 2.52x.)
