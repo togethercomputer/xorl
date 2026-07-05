@@ -151,7 +151,14 @@ class MKQwen3:
         # falls back to the WMMA path.
         wg_attn = c.D == 64 and c.S % 128 == 0
         p = mk.Program()
-        p.default_cold_cap = 0 if c.S >= 2048 else (48 if c.S >= 1024 else 16)
+        if c.S >= 2048:
+            p.default_cold_cap = 0
+        elif c.H == 256 and c.S == 1024:
+            p.default_cold_cap = 64
+        elif c.S >= 1024:
+            p.default_cold_cap = 48
+        else:
+            p.default_cold_cap = 16
         B = p.buf
 
         def gemm(a, b, out, M, N, K, flags, res=0):

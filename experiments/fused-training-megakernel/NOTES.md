@@ -1382,6 +1382,21 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   +13.2us paired median on confirmation). Keep nano/deep RMS dx on R2 and head-dX
   target96.
 
+- Post-dW cold-cap retune: keep nano at cap16, small at cap48, and long S uncapped, but
+  move H256/S1024 from cap48 to cap64. The broad current-head sweep
+  (`mkv3-p4b-coldcap-resweep-postdw-0ee579e-20260705T0300COLD.log`) kept nano best at
+  cap16 and S2048 uncapped; S4096 cap96 was only -2.8us noise. S1024 cap64 was the only
+  repeatable change, confirmed at -5.4us paired median with 93/140 wins
+  (`mkv3-p4b-coldcap-s1024-confirm-postdw-0ee579e-20260705T0301COLD.log`). Small cap33
+  over cap48 was only -1.4us with 66/120 wins, so keep H512/S1024 small at cap48.
+  Route check and default-path validation passed
+  (`mkv3-p4b-coldcap-s1024-route-20260705T0302COLD.log`,
+  `mkv3-p4b-coldcap-s1024-testmodel-20260705T0302COLD.log`). The affected score refresh
+  landed at S1024 1461.2us vs graph+ 713.2us
+  (`mkv3-p4b-score-s1024-coldcap64-20260705T0303SCORE.log`); the pairwise cap A/B is
+  the stronger signal here because the graph+ baseline moved substantially in this
+  fresh process. `MK_COLD_CAP` still force-overrides for sweeps.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
@@ -1392,7 +1407,7 @@ runs from inductor autotune variance):
 | deep-L12 | 2522 | 1765 | 1.43x |
 | S=128 | 850 | 426 | 2.00x |
 | S=256 | 934 | 558 | 1.67x |
-| S=1024 | 1454 | 778 | 1.87x |
+| S=1024 | 1461 | 713 | 2.05x |
 (Morning honest reset: nano 1.97x / small 2.52x.)
 
 ## Honest assessment + v2 roadmap
