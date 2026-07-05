@@ -2683,6 +2683,20 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   and S8192 -16.22us (33/40 wins). Keep the gate tied to `sk_head==1`; force the old
   split-K/atomic route with `MK_HEAD_DX_NO_ATOMIC_SK1=0`.
 
+- Post-head-dX-sk1 long-shape profile/score refresh at `e1606c5`: profile
+  `mkv3-p4b-profile-long-post-headdx-e1606c5-20260705T1533Z.log` confirms both
+  H256/S3072 and H256/S4096 now emit the head-dX row as `GEMMNN ...x256x8192.wg`
+  without `.splitK`, reducing `n_instr` to 152. S3072 measured 2642.2us total
+  (76 hops, 226.9us wait, 2415.3us span); head-dX fell to 94.9us on path from the
+  pre-promotion 105.5us row, but attention-dQ still dominates at 568.2us. S4096
+  measured 3332.4us total (76 hops, 286.9us wait, 3045.5us span), led by attention-dQ
+  906.9us, attention fwd 432.4us, RMS dx 248.9us, lm-head forward 218.4us, and
+  head-dX 93.6us. Hardened score
+  `mkv3-p4b-score-long-post-headdx-e1606c5-20260705T1533Z.log` measured S3072
+  megakernel 2627.4us vs compile+CUDAGraph+ 1329.4us (1.98x gap) and S4096
+  megakernel 3341.7us vs compile+CUDAGraph+ 1569.5us (2.13x gap). The next long-shape
+  bottleneck remains attention-dQ, not head-dX.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
