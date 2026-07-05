@@ -3208,6 +3208,12 @@ all parity-clean (`worst_grad_rel` <= 0.005908). Promoted-default validation
 `MK_SSQ_FUSE=1` by +8.37us/+3.02us old-minus-new, with old wins 8/40 and 11/40
 and parity clean (`worst_grad_rel` <= 0.007364). Together with the S4096 mixed
 result, the SSQ-off default now covers exact H256/D64/S2048 and S3072 only.
+Post-SSQ S2048 profile/score
+`mkv3-p4b-profile-score-s2048-post-ssq-def4cbb-20260705T2112Z.log` measured
+megakernel 1780.9us vs compile+CUDAGraph+ 1044.8us (1.70x gap). Profile total
+was 1763.3us (`n_instr=176`, critical path 80, gated 71), led by attention-dQ
+274.9us, attention-fwd 131.0us, lm-head NT 114.1us, SwiGLU-BWD 2W 103.5us,
+head-dX/lm-head-bwd 101.3us, and `QKNORM_ROPE_BWD` 99.1us.
 
 Post-T29 follow-up no-gos: current default `lpt` order remains best. A
 pre-combine env-only retest at `77346e2`
