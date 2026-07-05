@@ -2466,6 +2466,20 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   regressed +460.51us and `ws-df` +335.46us, again both 0/160 wins. Combined:
   `df2-df` +482.78us and `ws-df` +314.10us with 0/320 wins each. Keep `mode="df"`.
 
+- `megakernel_df2` hot/cold ready-ring port correctness no-go: the isolated branch
+  `/home/apanda/xorl-oss-df2-hotcold-probe` tested whether the full region-watermark
+  executor only looked bad because it lacked the current `df` hot/cold ready rings and
+  cold-cap policy. The CUDA/host patch built and the loss stayed close, but executor
+  agreement was intermittently outside the repo tolerance on H512/S1024 small, so no
+  timing was trusted. Initial hot/cold+completion-hint correctness matched loss
+  (9.797764 vs 9.797768) but drifted `w2.5` by 0.0825 rel vs `df`
+  (`mkv3-p4b-df2hc-small-correctness-20260705T1425Z.log`). Removing the completion
+  hint still drifted up to 0.1121 rel across alternating `df`/`df2` runs
+  (`mkv3-p4b-df2hc-nohint-small-repeat-20260705T1429Z.log`), and uncapping cold work
+  with `MK_COLD_CAP=0` still drifted up to 0.0711 rel
+  (`mkv3-p4b-df2hc-nohint-cap0-small-repeat-20260705T1431Z.log`). Treat the hot/cold
+  `df2` port as a scheduler-race no-go; leave the sibling dirty and keep `df2` parked.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
