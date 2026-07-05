@@ -2756,6 +2756,16 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   real attention-DQ kernel-quality improvement; S3072's path has become more balanced
   across attention fwd/dQ/dKV and lm-head forward.
 
+- Attention-dQ split-mask loop no-go: a default-off source probe
+  `MK_ATTN_DQ_SPLIT_MASK=1` tested splitting the dQ probability-store loop into a
+  no-mask path for fully unmasked K stages and the existing masked path for the
+  diagonal stage. Unlike the earlier `MK_ATTN_MASKED_EXP_SKIP` no-go, this kept the
+  same `wga_exp` math and only tried to remove per-element mask predicates from the
+  common unmasked stages. Timing `mkv3-p4b-attndq-splitmask-probe-20260705T1605Z.log`
+  passed loss checks but regressed decisively: S3072 +41.98us with 0/40 wins and
+  S4096 +45.98us with 0/36 wins. The source probe was reverted; keep the compact
+  single-loop predicate form.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
