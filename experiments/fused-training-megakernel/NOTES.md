@@ -2162,6 +2162,13 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   H256/S2048 gradient parity, then measured default-minus-old at -77.4us/-87.4us for
   small and -28.6us/-63.7us for H256/S2048 across construction orders.
 
+- Post-TN-WGMMA-dW scoreboard: `mkv3-p4b-score-both-40887f3-20260705T1210Z.log`
+  measured nano at 916.8us megakernel vs 628.4us compile+CUDAGraph+ (1.46x gap),
+  effectively unchanged because nano keeps zero TN dW routes by default. Small measured
+  3428.4us megakernel vs 1890.8us compile+CUDAGraph+ (1.81x gap), an 83.5us
+  megakernel-side reduction from the post-CE-BWD scoreboard's 3511.9us row and matching
+  the final default-vs-old TN timing class.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
