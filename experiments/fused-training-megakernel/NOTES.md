@@ -2883,6 +2883,68 @@ Findings (all per layer, standalone):
   per-stage fits) and `results/flash_graph_probe_2853e0de.py <S>` (flash side),
   driver `results/run_attn_scaling_probe_2853e0de.sh <gpu>`.
 
+## v3 P4b banded attention-bwd chunking (session 2853e0de): the straggler fix lands
+
+**PROMOTED (commits `06ab5b6` + `8508a7d`), the largest single long-S win of the
+P4b program**: `OP_ATTN_DKV_WG` / `OP_ATTN_DQ_WG` now support banded chunking —
+the host splits each op into contiguous kv/q-tile bands whose chunk count is
+proportional to the band's causal stage count (`C = ceil(stages / T)`), so only
+the long triangle tiles get split and the short tail tiles keep their cheap
+single fill. This is the fix the C=1 straggler diagnosis (section above)
+predicted: at S>=3072 the bwd ops were makespan-bound on the longest tile's
+serial chain while most SMs idled, and uniform C>1 (the old no-go) paid
+fill/atomic overhead on every tile to fix only the one straggler.
+
+Mechanics: the band spec packs into the existing C arg (`C | kv_or_q_tile_off<<8
+| band_width<<16`), so stale callers passing a bare C decode unchanged (off=0,
+width=full). DQ bands emitted with C==1 keep the direct-store epilogue (bands are
+q-disjoint, still one writer per slice); C>1 bands use the existing atomic drain
+into the pre-zeroed workspace. Per-band `dQKV_f32` slots (`kv0/kv1/...`,
+`q0/q1/...`) declare the bands' truly disjoint row ranges to the dependency
+analysis so they schedule in parallel. Bands are emitted longest-chunk-first.
+`MK_ATTN_BAND=<T>` overrides; `MK_ATTN_BAND=0` restores the uniform Ckv/Cq path
+(where `MK_ATTN_DKV_C`/`MK_ATTN_DQ_C` still apply).
+
+Default gate (H256/D64): `{2048: 16, 3072: 16, 4096: 32, 8192: 32}`; all other
+shapes keep the uniform path. Env-on-vs-off in-model paired A/B, both
+construction orders, every config parity-clean (losses equal, worst grad rel
+<= 0.0063):
+
+| shape | T | delta (order1 / order2) | wins |
+|---|---|---|---|
+| H256/S2048 | 16 | -20.6 / -16.0us | 40/40, 40/40 |
+| H256/S3072 | 16 | -37.0 / -42.4us | 40/40, 40/40 |
+| H256/S4096 | 32 | -80.7 / -78.7us | 40/40, 40/40 |
+| H256/S8192 | 32 | -531.7 / -524.6us | 16/16, 16/16 |
+
+Promoted-default vs forced-old (`MK_ATTN_BAND=0`) on the merged tree (which
+includes the peer's dq-float2-s8192) confirmed: S2048 +12.5/+14.4us, S3072
++35.1/+36.4us, S4096 +70.4/+76.1us, S8192 +505.0us (0/16, clean guard) and
++515.0us (1/16; an sglang server landed memory-parked on the GPU during this
+last reverse-order rep — treat it as corroborating-only; the three clean
+measurements agree). Route check: S512/S1024 instruction streams unchanged;
+S2048/S3072/S4096/S8192 gain exactly the predicted +2/+4/+2/+6 instrs per layer.
+`test_ops.py`, `test_model.py` (default), and `test_model.py` with
+`MK_ATTN_BAND=16` forced all passed.
+
+Rejected variants: S2048 T=32 degenerates to uniform C=1 and loses (+41/+48us,
+0/40 both orders); S8192 T=16 over-splits (-321/-332us, worse than T=32).
+Standalone op-level A/B agrees (S8192 dkv 675->420us, dq 485->327us at T=32;
+S4096 banded dq ALONE is flat from wave quantization — 192+ tiles on a 132-SM
+machine — but the in-model window absorbs it via cross-op work stealing, so the
+shape still wins -80us). Logs: `mkv3-p4b-attn-band-probe-20260705T170354Z.log`,
+`mkv3-p4b-attn-band-model-ab-20260705T170925Z.log`,
+`mkv3-p4b-attn-band-validate-20260705T171650Z.log` in the attn-band worktree
+results/ (repro: `results/attn_band_probe.py <S> <T>`,
+`results/attn_band_model_ab.py <S> <T|0> <order>`).
+
+Follow-on candidates this opens (unclaimed): (a) ATTN_FWD_WG banding — fwd is
+also straggler-bound (64st x 1.5us of its 111.8us at S4096) but needs the
+split+combine (opart/mpart/lpart) machinery ported to the WG path; (b) a
+tile-budgeted band chooser (split-to-budget instead of ceil(stages/T)) to
+recover the standalone dq wave-quantization loss at S4096; (c) revisiting the
+S512/S1024 uniform-C defaults as bands (short-S T sweep not measured).
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
