@@ -2192,6 +2192,26 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   median / +0.49us mean with FMA winning 10/24 pairs. Do not revive the dS-FMA route
   on the current head.
 
+- H256/S2048 head-dX `sk=1` no-atomic promotion: route inspection showed the small and
+  H256/S2048 `dlogits @ Wlm` head-dX GEMMs both used the split-K/fp32 atomic path with
+  `sk_head=1`, which pays a zero-fill plus atomics without actually splitting K. An
+  isolated program-construction probe removed the split-K flag only when
+  `MK_HEAD_DX_NO_ATOMIC_SK1=1` and `sk_head==1`. Small parity passed
+  (`mkv3-p4b-headdx-sk1-small-parity-20260705T1318Z.log`) but timing was neutral
+  (`mkv3-p4b-headdx-sk1-small-step-ab-20260705T1322Z.log`: overall -0.64us median,
+  +0.45us mean, 12/24 wins), so small remains on the old default. H256/S2048 parity
+  passed (`mkv3-p4b-headdx-sk1-s2048-parity-20260705T1329Z.log`: old head row
+  `flags=168, sk=1`, new `flags=136`, one fewer fill/instruction, worst grad rel
+  0.005997), and paired timing won decisively
+  (`mkv3-p4b-headdx-sk1-s2048-step-ab-20260705T1330Z.log`: -7.70us median, -7.46us
+  mean, 19/20 wins). The default is therefore enabled only for H256/S2048; route/parity
+  on the promoted main branch passed
+  (`mkv3-p4b-headdx-sk1-promote-route-parity-20260705T1334Z.log`) and final
+  default-vs-forced-old timing confirmed -8.06us median / -7.30us mean with 19/20 wins
+  (`mkv3-p4b-headdx-sk1-default-vs-old-s2048-20260705T1340Z.log`). Set
+  `MK_HEAD_DX_NO_ATOMIC_SK1=0` to force the old split atomic route, or `=1` to force the
+  no-atomic `sk=1` route for A/B.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

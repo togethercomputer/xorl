@@ -453,26 +453,40 @@ class MKQwen3:
         p.instr(mk.OP_CE_BWD, c.S, [B(A["logits"]), labels_buf, B(A["lse_ce"]), B(self.inv_valid), c.V])
         p.wave()
         # dXN = dlogits @ Wlm has K=V (huge) but few output tiles: split-K into the fp32
-        # workspace (atomic accumulate), then convert. dWlm splits via the gemm helper.
-        fill_zero(W["dXN_f32"])
-        p.wave()
+        # workspace (atomic accumulate), then convert. H256/S2048 currently chooses
+        # sk=1, where a normal fp32-output WGMMA avoids one zero-fill plus atomics.
+        head_dx_no_atomic_sk1_env = os.environ.get("MK_HEAD_DX_NO_ATOMIC_SK1")
+        if head_dx_no_atomic_sk1_env is None:
+            head_dx_no_atomic_sk1 = c.H == 256 and c.S == 2048
+        else:
+            head_dx_no_atomic_sk1 = bool(int(head_dx_no_atomic_sk1_env))
         if mk.wgmma_ok(c.S, c.H, c.V, 0):
             sk_head = mk.wgmma_split_k(
                 c.S, c.H, c.V, target_tiles=head_dx_target_tiles()
             )
-            p.instr(
-                mk.OP_GEMM,
-                mk.gemm_tiles_wgmma(c.S, c.H) * sk_head,
-                [B(A["logits"]), B(self.params["wlm"]), B(W["dXN_f32"]), c.S, c.H, c.V, 32 | 8 | 128, 0, sk_head],
-            )
+            head_dx_tiles = mk.gemm_tiles_wgmma(c.S, c.H)
+            head_dx_flags = 8 | 128
+            head_dx_args = [B(A["logits"]), B(self.params["wlm"]), B(W["dXN_f32"]), c.S, c.H, c.V]
         else:
             sk_head = mk.gemm_split_k(
                 c.S, c.H, c.V, target_tiles=head_dx_target_tiles()
             )
+            head_dx_tiles = mk.gemm_tiles(c.S, c.H)
+            head_dx_flags = 8
+            head_dx_args = [B(A["logits"]), B(self.params["wlm"]), B(W["dXN_f32"]), c.S, c.H, c.V]
+        if head_dx_no_atomic_sk1 and sk_head == 1:
             p.instr(
                 mk.OP_GEMM,
-                mk.gemm_tiles(c.S, c.H) * sk_head,
-                [B(A["logits"]), B(self.params["wlm"]), B(W["dXN_f32"]), c.S, c.H, c.V, 32 | 8, 0, sk_head],
+                head_dx_tiles,
+                head_dx_args + [head_dx_flags, 0],
+            )
+        else:
+            fill_zero(W["dXN_f32"])
+            p.wave()
+            p.instr(
+                mk.OP_GEMM,
+                head_dx_tiles * sk_head,
+                head_dx_args + [head_dx_flags | 32, 0, sk_head],
             )
         gemm(B(A["logits"]), B(A["xnf"]), B(self.grads["wlm"]), c.V, c.H, c.S, 1 | 4 | 8)
         p.wave()
