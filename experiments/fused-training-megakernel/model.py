@@ -270,7 +270,10 @@ class MKQwen3:
                     sk = mk.gemm_split_k(M, N, K)
                     p.instr(mk.OP_GEMM, mk.gemm_tiles(M, N) * sk, [a, b, out, M, N, K, (flags | 32) & ~4, res, sk])
                 return False
-            do_ssq = ssq_nparts > 0 and int(os.environ.get("MK_SSQ_FUSE", "1"))
+            ssq_fuse_env = os.environ.get("MK_SSQ_FUSE")
+            ssq_fuse_default = not (c.H == 256 and c.D == 64 and c.S == 3072)
+            ssq_fuse = ssq_fuse_default if ssq_fuse_env is None else bool(int(ssq_fuse_env))
+            do_ssq = ssq_nparts > 0 and ssq_fuse
             if mk.wgmma_n128_ok(M, N, K, flags):  # m64n128 NT tile (P4b r3)
                 f = flags | 128 | 4096 | (8192 if do_ssq else 0)
                 p.instr(mk.OP_GEMM, mk.gemm_tiles_wgmma_n128(M, N),

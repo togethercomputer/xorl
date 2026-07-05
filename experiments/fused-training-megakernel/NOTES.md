@@ -3180,6 +3180,17 @@ megakernel 2485.3us vs compile+CUDAGraph+ 1273.2us (1.95x gap). Profile total
 was 2485.9us (`n_instr=180`, critical path 80, gated 63); on-path leaders are
 attention-dQ 516.8us, lm-head NT 223.9us, attention-fwd 183.4us, SwiGLU-BWD 2W
 143.6us, RMS dx 139.9us, and `QKNORM_ROPE_BWD` 131.4us.
+Long-shape SSQ-fusion recheck after the split-V promotions:
+`mkv3-p4b-ssq-long-current-20260705T2054Z.log` rejected S4096 SSQ-off as
+construction-order mixed (-7.60us then +4.18us), but S3072 was weakly positive
+in both orders (-5.39us and -2.06us). Cached S3072 confirmation
+`mkv3-p4b-ssq-s3072-confirm-20260705T2056Z.log` held (-4.85us and -3.38us).
+Promoted-default validation
+`mkv3-p4b-ssq-s3072-promoted-default-20260705T2058Z.log` beat forced old
+`MK_SSQ_FUSE=1` by +3.38us/+7.73us old-minus-new, with old wins 11/40 and 9/40
+and parity clean (`worst_grad_rel` <= 0.008040). Default `MK_SSQ_FUSE` is now
+off only for exact H256/D64/S3072; force `MK_SSQ_FUSE=1` for the old fused-SSQ
+route.
 
 Post-T29 follow-up no-gos: current default `lpt` order remains best. A
 pre-combine env-only retest at `77346e2`
