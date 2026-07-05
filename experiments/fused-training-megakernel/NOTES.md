@@ -2713,6 +2713,21 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   S3072/S4096 pick `_idle32`; `mkv3-p4b-idle32-testmodel-20260705T1546Z.log` passed
   full `test_model.py`.
 
+- Post-idle32 long-shape profile/score refresh at `ed57b25`: profile
+  `mkv3-p4b-profile-long-post-idle32-ed57b25-20260705T1552Z.log` confirms the promoted
+  shapes use `_idle32`. S3072 measured 2614.2us total (76 hops, 210.1us wait,
+  2404.2us span), led by attention-dQ 563.9us, attention fwd 335.0us, lm-head forward
+  221.9us, RMS dx 144.6us, QKNORM/ROPE bwd 139.8us, cached `SWIGLU_BWD_2W` 139.3us,
+  and head-dX 95.3us. S4096 measured 3343.3us total (76 hops, 284.9us wait,
+  3058.4us span), led by attention-dQ 914.5us, attention fwd 435.5us, RMS dx 256.0us,
+  lm-head forward 220.6us, QKNORM/ROPE bwd 179.0us, cached `SWIGLU_BWD_2W` 174.0us,
+  and head-dX 93.9us. Hardened score
+  `mkv3-p4b-score-long-post-idle32-ed57b25-20260705T1553Z.log` measured S3072
+  megakernel 2647.5us vs compile+CUDAGraph+ 1341.6us (1.97x gap) and S4096
+  megakernel 3331.1us vs compile+CUDAGraph+ 1581.2us (2.11x gap). The next useful
+  long-shape work remains attention kernel quality or a new attention-DQ mechanism;
+  scheduler poll cadence is now exhausted for the tested exact shapes.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
