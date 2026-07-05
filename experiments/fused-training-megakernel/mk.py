@@ -161,6 +161,27 @@ def gemm_tiles_wgmma_n256_direct(M, N):
     return (M // 128) * ((N + 255) // 256)
 
 
+def wgmma_n256_head_dx_ok(M, N, K, flags):
+    """Qwen giant-vocab head-dX-only direct m64n256 NN fp32 route.
+
+    This reuses bit14 after the qwen lm-head forward path, but only for no-split
+    WGMMA NN fp32 head-dX shapes. The default is exact because broader MLP/qkv dX n128
+    expansions have mixed history. Set MK_HEAD_DX_N256_F32=0 to force the current n128
+    route, or =1 to force all structurally eligible head-dX shapes for probing.
+    """
+    mode_env = os.environ.get("MK_HEAD_DX_N256_F32")
+    mode = -1 if mode_env is None else int(mode_env)
+    if mode == 0:
+        return False
+    if flags != (8 | 128):
+        return False
+    if M % 128 or N % 256 or K % 64:
+        return False
+    if mode == 1:
+        return True
+    return (M, N, K) == (1024, 2560, 151936)
+
+
 def _default_split_k_target(K):
     env = os.environ.get("MK_DW_TARGET_TILES")
     if env is not None:

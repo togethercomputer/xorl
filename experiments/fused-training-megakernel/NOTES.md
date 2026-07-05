@@ -3658,6 +3658,38 @@ Promoted only the exact qwen4b-l1 shape `(H,S,V,nq,nkv,D,L) =
 `MK_HEAD_DX_N128_F32=0` restores the old split-atomic route. This does not broaden the
 earlier n128 split verdicts for nano/small/general MLP dX.
 
+## v3 P4b qwen lm-head dX n256 no-atomic route: exact-shape promotion
+
+The post-head-route profile `mkv3-p4b-qwen-post-headroutes-profile-20260705T2312Z.log`
+showed the qwen head-dX row was still a top non-attention leader even after the n128
+promotion: `GEMMNN 1024x2560x151936.wg` emitted `ntiles=160, flags=4232` and took
+`3609.3us` on path. This is orthogonal to the peer D=128 attention lane.
+
+`fat_gemm_nn_probe.py` is the standalone guardrail for this route. It compares the
+current m64n128 NN fp32 path against a 100KB-compatible m64n256 NN direct-store path
+using the same SW128 descriptor patterns as the production op. Probe log
+`mkv3-p4b-qwen-headdx-fat-nn-probe-20260705T2313Z.log` passed correctness
+(`rel=1.24e-5`) and measured qwen head-dX `1024x2560x151936` at n128 `2740.9us`
+(160 tiles, 290.6 TF) versus n256 `2126.1us` (80 tiles, 374.7 TF).
+
+Promoted only exact qwen4b-l1 head-dX `(M,N,K)=(1024,2560,151936)` into a new
+`MK_HEAD_DX_N256_F32` default gate. It reuses bit14 for a direct m64n256 NN fp32
+path; `MK_HEAD_DX_N256_F32=0` restores the previous n128/no-atomic default, and `=1`
+force-enables structurally eligible head-dX shapes for future probes. Route log
+`mkv3-p4b-qwen-headdx-n256-prod-route-20260705T2315Z.log` verified default emission:
+head-dX changed from n128 `160` tiles to n256 `80` tiles with flags `16520`.
+
+Focused A/B `mkv3-p4b-qwen-headdx-n256-prod-ab-20260705T2318Z.log` used identical
+params/tokens and old arm `MK_HEAD_DX_N256_F32=0`: old route
+`[(30, 160, 4232, None, False, True)]`, new route
+`[(30, 80, 16520, None, True, False)]`, loss rel-diff `-2.3e-7`, selected gradient
+rel diffs below `4.9e-7`, and paired medians `19587.0us -> 18990.3us`
+(`+596.7us` old-minus-new). Profile
+`mkv3-p4b-qwen-headdx-n256-prod-profile-20260705T2319Z.log` showed current default
+total `18839.3us`, with head-dX span `2465.5us`, lm-head fwd `2684.4us`, and generic
+D=128 attention still large (`ATTN_FWD` `1822.1us`, `ATTN_DQ` `1542.2us`). Full
+`test_model.py` passed in `mkv3-p4b-qwen-headdx-n256-prod-testmodel-20260705T2319Z.log`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

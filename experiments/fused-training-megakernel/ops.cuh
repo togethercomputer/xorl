@@ -107,8 +107,8 @@ __device__ __forceinline__ void op_axpy_f32(const Instr& I, int tile, void** buf
 //   flags bit5: split-K (requires fp32 C, pre-zeroed): args[8] = #slices, each slice
 //               computes a K-range and accumulates via fp32 atomicAdd. Rescues SM
 //               occupancy for small dW matrices (few M*N tiles, large K).
-//   flags bit14: direct m64n256 WGMMA NT lm-head tile with CE/LSE partials (bit11);
-//                qwen-specific path, supports a final 128-column tail.
+//   flags bit14: direct m64n256 WGMMA tile; qwen-specific paths for NT lm-head with
+//                CE/LSE partials (bit11) and NN fp32 head-dX.
 // args: {A, B, C, M, N, K, flags, res, sk}
 // tile id = (m_tile * n_tiles + n_tile) * sk + k_slice.
 
@@ -605,6 +605,84 @@ __device__ __noinline__ void op_gemm_wgmma_n256_direct(const Instr& I, int tile,
   }
 }
 
+// m64n256 NN direct-store fp32 head-dX tile (qwen giant-vocab follow-up to
+// fat_gemm_nn_probe.py). This keeps the 100KB page by skipping the fp32 epilogue slab.
+// It is deliberately narrow: NN only, fp32 output only, no split-K/acc/residual.
+__device__ __noinline__ void op_gemm_wgmma_n256_nn_f32(const Instr& I, int tile, void** bufs,
+                                                       char* smem_raw) {
+  namespace SG = cute::SM90::GMMA;
+  const bf16* A = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
+  const bf16* B = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
+  float* C = reinterpret_cast<float*>(bufs[I.args[2]]);
+  const int M = I.args[3], N = I.args[4], K = I.args[5], flags = I.args[6];
+  if ((flags & 2) || !(flags & 8) || (flags & (1 | 4 | 16 | 32 | 256 | 1024 | 2048 | 8192))) {
+    return;
+  }
+
+  smem_raw = reinterpret_cast<char*>(
+      (reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
+  WgmmaSmemN256& S = *reinterpret_cast<WgmmaSmemN256*>(smem_raw);
+  const int n_tiles = N / 256;
+  const int m0 = (tile / n_tiles) * WG_BM;
+  const int n0 = (tile % n_tiles) * 256;
+  const int tid = mk_tid();
+  const int wg = tid / 128;
+  const int wtid = tid % 128;
+  if (m0 >= M) return;
+
+  auto issue_stage = [&](int k0, int st) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {  // A: 128r x 64k
+      const int v = tid + i * 256;
+      const int r = v / 8, k8 = (v % 8) * 8;
+      __pipeline_memcpy_async(
+          reinterpret_cast<char*>(S.A[st][r / 64]) + wg_koff_sw(r % 64, k8),
+          &A[(int64_t)(m0 + r) * K + k0 + k8], 16);
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {  // B[K,N] N-contiguous, 256 columns
+      const int v = tid + i * 256;
+      const int k = v / 32, n8 = (v % 32) * 8;
+      __pipeline_memcpy_async(reinterpret_cast<char*>(S.B[st]) + (n8 / 64) * 8192 +
+                                  wg_mnoff_sw(k, n8 % 64),
+                              &B[(int64_t)(k0 + k) * N + n0 + n8], 16);
+    }
+    __pipeline_commit();
+  };
+
+  float d[128];
+#pragma unroll
+  for (int i = 0; i < 128; ++i) d[i] = 0.0f;
+  const int iters = K / WG_BK;
+  issue_stage(0, 0);
+  for (int t = 0; t < iters; ++t) {
+    if (t + 1 < iters) issue_stage((t + 1) * WG_BK, (t + 1) & 1);
+    __pipeline_wait_prior(t + 1 < iters ? 1 : 0);
+    consumer_sync();
+    uint64_t da[4], db[4];
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      da[s] = wg_desc_ksw(S.A[t & 1][wg], s);
+      db[s] = wg_desc_mnsw128(S.B[t & 1], s);
+    }
+    wg_mma_ktile_n256<SG::MMA_64x256x16_F32BF16BF16_SS<SG::Major::K, SG::Major::MN>>(
+        da, db, d);
+    consumer_sync();
+  }
+
+  const int w = wtid / 32, l = wtid % 32;
+  const int cb = (l & 3) * 2;
+#pragma unroll
+  for (int n8 = 0; n8 < 32; ++n8) {
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const int r = wg * 64 + w * 16 + l / 4 + 8 * i;
+      float2 out = make_float2(d[n8 * 4 + i * 2 + 0], d[n8 * 4 + i * 2 + 1]);
+      *reinterpret_cast<float2*>(&C[(int64_t)(m0 + r) * N + n0 + n8 * 8 + cb]) = out;
+    }
+  }
+}
+
 // m64n128 NT tile (v3 P4b r3, generalized from the peer session's lm_head route):
 // 64 fp32 accumulators/thread double the mma work per sync and halve B-traffic per
 // FLOP — the dependent chain per FLOP shortens (the one lever the register-lifetime
@@ -794,7 +872,10 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
   void* Cp = bufs[I.args[2]];
   const int M = I.args[3], N = I.args[4], K = I.args[5], flags = I.args[6];
   if (flags & 16384) {
-    op_gemm_wgmma_n256_direct(I, tile, bufs, smem_raw);
+    if ((flags & 2) && (flags & 2048))
+      op_gemm_wgmma_n256_direct(I, tile, bufs, smem_raw);
+    else
+      op_gemm_wgmma_n256_nn_f32(I, tile, bufs, smem_raw);
     return;
   }
   if (flags & 4096) {

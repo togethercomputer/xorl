@@ -670,7 +670,13 @@ class MKQwen3:
             head_dx_flags = 8
             head_dx_args = [B(A["logits"]), B(self.params["wlm"]), B(W["dXN_f32"]), c.S, c.H, c.V]
         if head_dx_no_atomic_sk1 and sk_head == 1:
-            if head_dx_n128_f32 and c.S % 128 == 0 and c.H % 128 == 0 and c.V % 64 == 0:
+            if mk.wgmma_n256_head_dx_ok(c.S, c.H, c.V, head_dx_flags):
+                p.instr(
+                    mk.OP_GEMM,
+                    mk.gemm_tiles_wgmma_n256_direct(c.S, c.H),
+                    head_dx_args + [head_dx_flags | 16384, 0],
+                )
+            elif head_dx_n128_f32 and c.S % 128 == 0 and c.H % 128 == 0 and c.V % 64 == 0:
                 p.instr(
                     mk.OP_GEMM,
                     mk.gemm_tiles_wgmma_n128(c.S, c.H),
