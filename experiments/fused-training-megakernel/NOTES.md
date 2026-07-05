@@ -3477,6 +3477,17 @@ Operational note for the snapshot harness: a killed extension build leaves a
 stale `<extdir>/<name>/lock` that silently wedges the NEXT build — the
 symptom is a snapshot process alive with zero output; delete the lock file.
 
+S8192 post-specialization resweep (session 2853e0de, after rowbcast-dkv
+`b54d322` + rms-dx-H256 `f54b4dd`;
+`mkv3-p4b-s8192-postspec-resweep-*.log`): ALL current S8192 defaults hold under
+the newly specialized ops — bwd band T40 confirmed (T36 +102.0/+104.1 with
+0/16 both orders, T44 +10.7/+22.6 with <=2/16), fwd band T64 confirmed (T56
++26.1 clean order 0/16 — its reverse window hit the transient co-tenant, 14.9ms
+absolutes, delta +9.0 corroborating-only; T72 +413.3/+417.7, the unsplit-
+straggler cliff again), idle32 confirmed (idle64 +1.6/+5.8, 7-8/16). The two
+op-specializations changed spans but not the band/idle optima; the resweep law
+is satisfied for this regime shift with no changes.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
