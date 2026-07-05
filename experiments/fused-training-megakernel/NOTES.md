@@ -2300,6 +2300,17 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   `MK_HEAD_DX_N128_SPLIT=0` to force the old nano split-K route or
   `MK_HEAD_DX_N128_SPLIT_TARGET=<tiles>` for target sweeps.
 
+- Post-head-dX-n128-split scoreboard/profile at `d3276f1`: `profile_df.py both df`
+  (`mkv3-p4b-profile-current-d3276f1-20260705T1620Z.log`) measured nano 894.0us and
+  small 3473.2us. Nano now shows the promoted head-dX row as
+  `GEMMNN 512x256x8192.wg.splitK` with 48 tiles and 37.6us span; small remains the
+  unchanged 32-tile no-atomic `GEMMNN 1024x512x16384.wg`. `bench.py both`
+  (`mkv3-p4b-score-both-d3276f1-20260705T1622Z.log`) measured nano at 921.0us
+  megakernel vs 637.1us compile+CUDAGraph+ (1.45x gap), and small at 3454.7us
+  megakernel vs 1915.5us compile+CUDAGraph+ (1.80x gap). The scoreboard run is
+  noisier than the paired default-vs-old timing; use the paired A/B above for route
+  attribution and this row as the current end-to-end snapshot.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
