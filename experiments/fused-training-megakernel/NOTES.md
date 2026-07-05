@@ -1845,6 +1845,20 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   small -20.08us (160/160), H256/S1024 -6.08us (126/160), and H256/S2048 -15.15us
   (120/120).
 
+- Drow n128 WGMMA no-go: after the post-fast-log profile still showed the Drow-fused
+  `dOatt = dX @ Wo` hop as a visible small/S1024 cost
+  (`mkv3-p4b-profile-current-966990a-20260705T0610PROFILE.log`,
+  `mkv3-p4b-profile-s1024-966990a-20260705T0614PROFILE.log`), a default-off
+  `MK_DROW_WG_N128=1` probe added n128 Drow epilogue support and halved Drow tile
+  counts on every tested shape. Focused epilogue correctness passed for small and
+  H256/S1024 dimensions (`mkv3-p4b-drown128-focused-gemm-20260705T0620DROWN128.log`),
+  and full-model validation passed
+  (`mkv3-p4b-drown128-testmodel-20260705T0621DROWN128.log`), but paired timing
+  (`mkv3-p4b-drown128-step-ab-20260705T0622DROWN128.log`) was a decisive regression:
+  S128 +57.79us, S256 +62.86us, nano +62.78us, small +54.42us, H256/S1024 +64.37us,
+  and H256/S2048 +34.30us. The temporary source route was removed; keep Drow on the
+  existing m64n64 WGMMA epilogue.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
