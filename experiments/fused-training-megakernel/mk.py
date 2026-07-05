@@ -48,6 +48,8 @@ OP_SWIGLU_BWD_2W = 29  # opt-in two-warps-per-row SwiGLU backward route
 OP_QKV_V_BWD = 30  # V-head fp32 workspace -> bf16 raw-grad pass-through
 OP_RMSNORM_BWD_DX_H256 = 31  # H==256 fixed-width dx-only route (env probe)
 OP_ATTN_FWD_WG128 = 32  # D=128 wgmma attention fwd: 64-row tiles, redundant-S + split-D halves
+OP_ATTN_DKV_WG128 = 33  # D=128 wgmma attention dK/dV (same pattern)
+OP_ATTN_DQ_WG128 = 34  # D=128 wgmma attention dQ (same pattern)
 
 GEMM_BM, GEMM_BN = 64, 128  # keep in sync with ops.cuh
 FILL_CHUNK = 16384  # elements per fill/cvt work item (MK_CHUNK in ops.cuh)
@@ -436,6 +438,8 @@ def _access_sets(op, args):
         return [1, 2, 3], [0]
     if op == OP_ATTN_FWD_WG128:
         return [0], [1, 2]
+    if op in (OP_ATTN_DKV_WG128, OP_ATTN_DQ_WG128):
+        return [0, 1, 2, 3], [4]
     if op in (OP_ATTN_FWD, OP_ATTN_FWD_WG):
         # banded WG fwd chunks (12-arg form) write flash-decoding partials at
         # 9..11 instead of O/LSE; keeping 1/2 marked written is conservative-safe

@@ -288,6 +288,14 @@ class MKQwen3:
             attn_dkv_row_bcast=self.attn_dkv_row_bcast_default,
             attn_dq_float2_store=self.attn_dq_float2_store_default,
         )
+        # D=128 WGMMA attention route (env probe): its DQ op needs a 104KB smem
+        # struct, above the 100KB default carveout (precedent: MK_ATTN_PIPE at 120KB)
+        self._smem_bytes = (
+            112 * 1024
+            if (c.D == 128 and c.S % 64 == 0
+                and bool(int(os.environ.get("MK_ATTN_D128_WG", "0"))))
+            else None
+        )
         self.in_kernel_inv_valid = bool(int(os.environ.get("MK_INV_VALID_IN_KERNEL", "1")))
         self.bind_inputs = bool(int(os.environ.get("MK_BIND_INPUTS", "1")))
         self._inputs_bound_external = False
@@ -941,6 +949,13 @@ class MKQwen3:
                 else:
                     p.instr(mk.OP_ATTN_DKV_WG, c.nkv * n_qt128 * G * Ckv, dkv_args() + [Ckv])
                     p.instr(mk.OP_ATTN_DQ_WG, c.nq * n_qt128 * Cq, dq_args() + [Cq])
+            elif (c.D == 128 and c.S % 64 == 0
+                  and bool(int(os.environ.get("MK_ATTN_D128_WG", "0")))):
+                # D=128 WGMMA bwd (env probe, default off): 64-row kv/q tiles,
+                # redundant-S + split-D-half accumulators, C=1.
+                n_t64 = c.S // 64
+                p.instr(mk.OP_ATTN_DKV_WG128, c.nkv * n_t64 * G, dkv_args() + [1])
+                p.instr(mk.OP_ATTN_DQ_WG128, c.nq * n_t64, dq_args() + [1])
             else:
                 generic_dq_c_env = os.environ.get("MK_ATTN_DQ_C")
                 if generic_dq_c_env is None:
@@ -1027,6 +1042,7 @@ class MKQwen3:
                 self.inv_valid.copy_(1.0 / (labels >= 0).sum().clamp(min=1).float().reshape(1))
             self.prog.run(
                 self.ext,
+                smem_bytes=self._smem_bytes,
                 mode=mode,
                 bind_bufs=((self._tokens_buf, tokens), (self._labels_buf, labels)),
             )
@@ -1045,5 +1061,5 @@ class MKQwen3:
             self.labels.copy_(labels)
             if not self.in_kernel_inv_valid:
                 self.inv_valid.copy_(1.0 / (labels >= 0).sum().clamp(min=1).float().reshape(1))
-            self.prog.run(self.ext, mode=mode)
+            self.prog.run(self.ext, smem_bytes=self._smem_bytes, mode=mode)
         return self.loss

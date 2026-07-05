@@ -1170,3 +1170,336 @@ __device__ void op_attn_fwd_wg128(const Instr& I, int tile, void** bufs,
         out;
   }
 }
+
+// ---- D=128 backward dK/dV ------------------------------------------------------------
+// args: {qkv_r, dO, LSE, Drow, dqkv_f32, S, nq, nkv, D(=128), scale_bits, C}.
+// tile = ((kvh*n_kvt + kvt)*G + g)*C + c over 64-ROW kv tiles. Same redundant-S +
+// split-D pattern as the fwd: both WGs own the SAME 64 kv rows and redundantly
+// compute S = Q K^T and dP = dO V^T (k=128 dual-subtile) plus the P/dS algebra
+// (published once by WG0); each WG register-accumulates its own 64-wide D-half of
+// dK and dV (32-reg banks) and drains it with float2 atomics.
+
+struct __align__(16) AttnWgDkv128Smem {  // 96KB
+  bf16 K[8192];      // owned 64 kv rows x 128 D
+  bf16 V[8192];      // owned
+  bf16 P[4096];      // [q64, kv64] (WG0 publishes); MN-view A = P^T
+  bf16 dS[4096];     // [q64, kv64]; MN-view A = dS^T
+  bf16 Q[2][8192];   // [stage] 64 q rows x 128 D
+  bf16 dO[2][8192];  // [stage]
+};
+
+__device__ void op_attn_dkv_wg128(const Instr& I, int tile, void** bufs,
+                                  char* smem_raw) {
+  constexpr int D = 128;
+  const int S = I.args[5], nq = I.args[6], nkv = I.args[7];
+  const float scale = __int_as_float(I.args[9]);
+  const int Craw = I.args[10];
+  const int C = (Craw & 0xff) ? (Craw & 0xff) : 1;
+  const bf16* qkv = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
+  const bf16* dOg = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
+  const float* LSE = reinterpret_cast<const float*>(bufs[I.args[2]]);
+  const float* Drow = reinterpret_cast<const float*>(bufs[I.args[3]]);
+  float* ws = reinterpret_cast<float*>(bufs[I.args[4]]);
+  AttnWgDkv128Smem& sm = *reinterpret_cast<AttnWgDkv128Smem*>(smem_raw);
+
+  const int G = nq / nkv;
+  const int n_kvt = S / 64;
+  const int c = tile % C;
+  const int t128 = tile / C;
+  const int kvh = t128 / (n_kvt * G);
+  const int rem = t128 % (n_kvt * G);
+  const int kv0 = (rem / G) * 64;
+  const int g = rem % G;
+  const int qh = kvh * G + g;
+  const int stride = (nq + 2 * nkv) * D;
+  const int tid = mk_tid();
+  const int wg = tid >> 7, wtid = tid & 127;
+  // causal: q stages start at the diagonal (kv0) — 64-row tiles need no skip stage
+  const int n_stages = ((S - kv0) / 64 - c + C - 1) / C;
+  if (n_stages <= 0) return;
+
+  auto load_owned = [&](bf16* dst, int col0) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int v = tid + i * MK_CONSUMERS;
+      const int h = v >> 9, w9 = v & 511;
+      const int r = ((w9 >> 6) << 3) | (w9 & 7), c8 = ((w9 >> 3) & 7) << 3;
+      __pipeline_memcpy_async(
+          (char*)(dst + h * 4096) + wga_off64(r, c8),
+          &qkv[(int64_t)(kv0 + r) * stride + col0 + h * 64 + c8], 16);
+    }
+  };
+  auto issue_qdo_stage = [&](int q0s, int st) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int v = tid + i * MK_CONSUMERS;
+      const int h = v >> 9, w9 = v & 511;
+      const int r = ((w9 >> 6) << 3) | (w9 & 7), c8 = ((w9 >> 3) & 7) << 3;
+      __pipeline_memcpy_async(
+          (char*)(sm.Q[st] + h * 4096) + wga_off64(r, c8),
+          &qkv[(int64_t)(q0s + r) * stride + qh * D + h * 64 + c8], 16);
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int v = tid + i * MK_CONSUMERS;
+      const int h = v >> 9, w9 = v & 511;
+      const int r = ((w9 >> 6) << 3) | (w9 & 7), c8 = ((w9 >> 3) & 7) << 3;
+      __pipeline_memcpy_async(
+          (char*)(sm.dO[st] + h * 4096) + wga_off64(r, c8),
+          &dOg[(int64_t)(q0s + r) * (nq * D) + qh * D + h * 64 + c8], 16);
+    }
+    __pipeline_commit();
+  };
+
+  load_owned(sm.K, (nq + kvh) * D);
+  load_owned(sm.V, (nq + nkv + kvh) * D);
+  issue_qdo_stage(kv0 + c * 64, 0);
+
+  float dk[32], dv[32];
+#pragma unroll
+  for (int i = 0; i < 32; ++i) dk[i] = dv[i] = 0.0f;
+  const int w = wtid >> 5, ln = wtid & 31;
+  const int r0 = w * 16 + (ln >> 2);
+  const int cb = (ln & 3) * 2;
+
+  for (int t = 0; t < n_stages; ++t) {
+    const int q0s = kv0 + (c + t * C) * 64;
+    if (t + 1 < n_stages) issue_qdo_stage(kv0 + (c + (t + 1) * C) * 64, (t + 1) & 1);
+    __pipeline_wait_prior(t + 1 < n_stages ? 1 : 0);
+    consumer_sync();
+    // rows of s = q stage rows; cols = the owned 64 kv rows; redundant per WG
+    float s[32];
+#pragma unroll
+    for (int i = 0; i < 32; ++i) s[i] = 0.0f;
+    wga_mma64_kk_k128(sm.Q[t & 1], sm.K, s);  // S = Q K^T
+    const bool masked = q0s == kv0;           // diagonal stage
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const int qr = q0s + r0 + 8 * i;
+      const float lse = LSE[(int64_t)qh * S + qr];
+#pragma unroll
+      for (int n8 = 0; n8 < 8; ++n8) {
+        const int idx = n8 * 4 + i * 2;
+        const int kr = kv0 + n8 * 8 + cb;
+        float p0 = wga_exp(s[idx] * scale - lse);
+        float p1 = wga_exp(s[idx + 1] * scale - lse);
+        if (masked && kr > qr) p0 = 0.0f;
+        if (masked && kr + 1 > qr) p1 = 0.0f;
+        if (wg == 0) {
+          __nv_bfloat162 pv;
+          pv.x = f2bf(p0);
+          pv.y = f2bf(p1);
+          *reinterpret_cast<__nv_bfloat162*>(
+              (char*)sm.P + wga_off64(r0 + 8 * i, n8 * 8 + cb)) = pv;
+        }
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < 32; ++i) s[i] = 0.0f;
+    wga_mma64_kk_k128(sm.dO[t & 1], sm.V, s);  // dP = dO V^T, redundant per WG
+    if (wg == 0) {
+      wga_fence_smem_to_async();  // P visible before its own read-back below
+    }
+    consumer_sync();  // P published to both WGs
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const float dr = Drow[(int64_t)qh * S + q0s + r0 + 8 * i];
+#pragma unroll
+      for (int n8 = 0; n8 < 8; ++n8) {
+        const int idx = n8 * 4 + i * 2;
+        const int off = wga_off64(r0 + 8 * i, n8 * 8 + cb);
+        const __nv_bfloat162 pv =
+            *reinterpret_cast<const __nv_bfloat162*>((char*)sm.P + off);
+        if (wg == 0) {
+          __nv_bfloat162 dsv;
+          dsv.x = f2bf(bf2f(pv.x) * (s[idx] - dr) * scale);
+          dsv.y = f2bf(bf2f(pv.y) * (s[idx + 1] - dr) * scale);
+          *reinterpret_cast<__nv_bfloat162*>((char*)sm.dS + off) = dsv;
+        }
+      }
+    }
+    wga_fence_smem_to_async();
+    consumer_sync();  // P/dS visible; Q/dO stage still valid
+    wga_mma64_x2<WGA_MMA_MNMN, true, true>(
+        sm.P, sm.dO[t & 1] + wg * 4096, dv,   // dV_half += P^T dO_half
+        sm.dS, sm.Q[t & 1] + wg * 4096, dk);  // dK_half += dS^T Q_half
+    consumer_sync();  // both WGs done reading Q/dO stage t before refill
+  }
+
+  // drain: float2 atomics, each WG its own D-half of the owned 64 kv rows
+#pragma unroll
+  for (int round = 0; round < 2; ++round) {
+    const float(&acc)[32] = round == 0 ? dk : dv;
+    const int col0 = (round == 0 ? (nq + kvh) : (nq + nkv + kvh)) * D + wg * 64;
+#pragma unroll
+    for (int n8 = 0; n8 < 8; ++n8)
+#pragma unroll
+      for (int i = 0; i < 2; ++i)
+        atomicAdd(reinterpret_cast<float2*>(
+                      &ws[(int64_t)(kv0 + r0 + 8 * i) * stride + col0 + n8 * 8 + cb]),
+                  make_float2(acc[n8 * 4 + i * 2], acc[n8 * 4 + i * 2 + 1]));
+  }
+}
+
+// ---- D=128 backward dQ ---------------------------------------------------------------
+// args: {qkv_r, dO, LSE, Drow, dqkv_f32, S, nq, nkv, D(=128), scale_bits, C}.
+// tile = (qt*nq + qh)*C + c over 64-ROW q tiles; streams 64-row K/V stages. Same
+// redundant-S + split-D pattern; dQ_half accumulates in 32 regs per WG and C==1
+// stores directly (one writer per q slice per half). Needs a 112KB smem carveout
+// (Q + dO owned, dS, K/V ping-pong at 128 wide = 104KB).
+
+struct __align__(16) AttnWgDq128Smem {  // 104KB
+  bf16 Q[8192];      // owned 64 q rows x 128 D
+  bf16 dO[8192];     // owned
+  bf16 dS[4096];     // [q64, kv64] (WG0 publishes; P parks here across the dP gemm)
+  bf16 K[2][8192];   // [stage]
+  bf16 V[2][8192];   // [stage]
+};
+
+__device__ void op_attn_dq_wg128(const Instr& I, int tile, void** bufs,
+                                 char* smem_raw) {
+  constexpr int D = 128;
+  const int S = I.args[5], nq = I.args[6], nkv = I.args[7];
+  const float scale = __int_as_float(I.args[9]);
+  const int Craw = I.args[10];
+  const int C = (Craw & 0xff) ? (Craw & 0xff) : 1;
+  const bf16* qkv = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
+  const bf16* dOg = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
+  const float* LSE = reinterpret_cast<const float*>(bufs[I.args[2]]);
+  const float* Drow = reinterpret_cast<const float*>(bufs[I.args[3]]);
+  float* ws = reinterpret_cast<float*>(bufs[I.args[4]]);
+  AttnWgDq128Smem& sm = *reinterpret_cast<AttnWgDq128Smem*>(smem_raw);
+
+  const int c = tile % C;
+  const int t128 = tile / C;
+  const int qh = t128 % nq;
+  const int q0 = (t128 / nq) * 64;
+  const int kvh = qh / (nq / nkv);
+  const int stride = (nq + 2 * nkv) * D;
+  const int tid = mk_tid();
+  const int wg = tid >> 7, wtid = tid & 127;
+  const int n_stages = (q0 / 64 + 1 - c + C - 1) / C;
+  if (n_stages <= 0) return;
+
+  auto load_owned = [&](bf16* dst, const bf16* src, int rowstride, int col0) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int v = tid + i * MK_CONSUMERS;
+      const int h = v >> 9, w9 = v & 511;
+      const int r = ((w9 >> 6) << 3) | (w9 & 7), c8 = ((w9 >> 3) & 7) << 3;
+      __pipeline_memcpy_async(
+          (char*)(dst + h * 4096) + wga_off64(r, c8),
+          &src[(int64_t)(q0 + r) * rowstride + col0 + h * 64 + c8], 16);
+    }
+  };
+  auto issue_kv_stage = [&](int k0, int st) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int v = tid + i * MK_CONSUMERS;
+      const int h = v >> 9, w9 = v & 511;
+      const int r = ((w9 >> 6) << 3) | (w9 & 7), c8 = ((w9 >> 3) & 7) << 3;
+      __pipeline_memcpy_async(
+          (char*)(sm.K[st] + h * 4096) + wga_off64(r, c8),
+          &qkv[(int64_t)(k0 + r) * stride + (nq + kvh) * D + h * 64 + c8], 16);
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int v = tid + i * MK_CONSUMERS;
+      const int h = v >> 9, w9 = v & 511;
+      const int r = ((w9 >> 6) << 3) | (w9 & 7), c8 = ((w9 >> 3) & 7) << 3;
+      __pipeline_memcpy_async(
+          (char*)(sm.V[st] + h * 4096) + wga_off64(r, c8),
+          &qkv[(int64_t)(k0 + r) * stride + (nq + nkv + kvh) * D + h * 64 + c8], 16);
+    }
+    __pipeline_commit();
+  };
+
+  load_owned(sm.Q, qkv, stride, qh * D);
+  load_owned(sm.dO, dOg, nq * D, qh * D);
+  issue_kv_stage(c * 64, 0);
+
+  float dq[32];
+#pragma unroll
+  for (int i = 0; i < 32; ++i) dq[i] = 0.0f;
+  const int w = wtid >> 5, ln = wtid & 31;
+  const int r0 = w * 16 + (ln >> 2);
+  const int cb = (ln & 3) * 2;
+  const int qr[2] = {q0 + r0, q0 + r0 + 8};
+  const float lse[2] = {LSE[(int64_t)qh * S + qr[0]], LSE[(int64_t)qh * S + qr[1]]};
+  const float dr[2] = {Drow[(int64_t)qh * S + qr[0]], Drow[(int64_t)qh * S + qr[1]]};
+
+  for (int t = 0; t < n_stages; ++t) {
+    const int k0 = (c + t * C) * 64;
+    if (t + 1 < n_stages) issue_kv_stage((c + (t + 1) * C) * 64, (t + 1) & 1);
+    __pipeline_wait_prior(t + 1 < n_stages ? 1 : 0);
+    consumer_sync();
+    float s[32];
+#pragma unroll
+    for (int i = 0; i < 32; ++i) s[i] = 0.0f;
+    wga_mma64_kk_k128(sm.Q, sm.K[t & 1], s);  // S = Q K^T, redundant per WG
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+#pragma unroll
+      for (int n8 = 0; n8 < 8; ++n8) {
+        const int idx = n8 * 4 + i * 2;
+        const int kr = k0 + n8 * 8 + cb;
+        float p0 = wga_exp(s[idx] * scale - lse[i]);
+        float p1 = wga_exp(s[idx + 1] * scale - lse[i]);
+        if (kr > qr[i]) p0 = 0.0f;
+        if (kr + 1 > qr[i]) p1 = 0.0f;
+        if (wg == 0) {
+          __nv_bfloat162 pv;
+          pv.x = f2bf(p0);
+          pv.y = f2bf(p1);
+          *reinterpret_cast<__nv_bfloat162*>(
+              (char*)sm.dS + wga_off64(r0 + 8 * i, n8 * 8 + cb)) = pv;
+        }
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < 32; ++i) s[i] = 0.0f;
+    wga_mma64_kk_k128(sm.dO, sm.V[t & 1], s);  // dP = dO V^T, redundant per WG
+    if (wg == 0) wga_fence_smem_to_async();
+    consumer_sync();  // P (parked in dS) visible
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+#pragma unroll
+      for (int n8 = 0; n8 < 8; ++n8) {
+        const int idx = n8 * 4 + i * 2;
+        const int off = wga_off64(r0 + 8 * i, n8 * 8 + cb);
+        const __nv_bfloat162 pv =
+            *reinterpret_cast<const __nv_bfloat162*>((char*)sm.dS + off);
+        if (wg == 0) {
+          __nv_bfloat162 dsv;
+          dsv.x = f2bf(bf2f(pv.x) * (s[idx] - dr[i]) * scale);
+          dsv.y = f2bf(bf2f(pv.y) * (s[idx + 1] - dr[i]) * scale);
+          *reinterpret_cast<__nv_bfloat162*>((char*)sm.dS + off) = dsv;
+        }
+      }
+    }
+    wga_fence_smem_to_async();
+    consumer_sync();  // dS visible; K stage still valid
+    // dQ_half += dS @ K_half (K d-half subtile via its MN-view)
+    wga_mma64<WGA_MMA_KMN, false, true>(sm.dS, sm.K[t & 1] + wg * 4096, dq);
+    consumer_sync();  // both WGs done reading K/V stage t before refill
+  }
+
+  // C==1: one writer per (q slice, D-half) -> direct float2 stores
+  if (C == 1) {
+#pragma unroll
+    for (int n8 = 0; n8 < 8; ++n8)
+#pragma unroll
+      for (int i = 0; i < 2; ++i)
+        *reinterpret_cast<float2*>(
+            &ws[(int64_t)qr[i] * stride + qh * D + wg * 64 + n8 * 8 + cb]) =
+            make_float2(dq[n8 * 4 + i * 2], dq[n8 * 4 + i * 2 + 1]);
+    return;
+  }
+#pragma unroll
+  for (int n8 = 0; n8 < 8; ++n8)
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+      atomicAdd(reinterpret_cast<float2*>(
+                    &ws[(int64_t)qr[i] * stride + qh * D + wg * 64 + n8 * 8 + cb]),
+                make_float2(dq[n8 * 4 + i * 2], dq[n8 * 4 + i * 2 + 1]));
+}
