@@ -2445,6 +2445,19 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   at +0.98us median with 98/200 wins; combined regressed by +16.77us with 103/400
   wins. Keep the current coalesced shared-memory epilogue for n128 GEMMs.
 
+- N128 three-stage feed no-go: the default-off branch
+  `/home/apanda/xorl-oss-n128-stage3-probe` tested `MK_N128_STAGE3=1`, changing only
+  the m64n128 WGMMA GEMM body from the current two-stage cp.async feed to a three-stage
+  two-tile lead. The first schedule was caught by parity as a stage-reuse bug
+  (`mkv3-p4b-n128s3-small-parity-20260705T1411Z.log`: loss 9.83752 vs 9.79781);
+  the fixed schedule passed H512/S1024 small parity
+  (`mkv3-p4b-n128s3-small-parity-20260705T1415Z.log`: extension `_n128s3`, 50 n128
+  rows, loss 9.79776 vs 9.79781, worst grad rel 0.025832). Paired timing was a
+  decisive no-go (`mkv3-p4b-n128s3-vs-default-small-step-ab-20260705T1415Z.log`):
+  default-first regressed +82.40us with 0/200 stage3 wins, stage3-first regressed
+  +51.38us with 0/200 wins, combined +66.62us with 0/400 wins. Keep the current
+  two-stage n128 feed.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
