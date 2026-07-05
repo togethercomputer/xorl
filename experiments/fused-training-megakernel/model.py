@@ -59,12 +59,16 @@ class MKQwen3:
         QD = (c.nq + 2 * c.nkv) * c.D
         bf, f32 = torch.bfloat16, torch.float32
         swiglu_cache_sig_env = os.environ.get("MK_SWIGLU_CACHE_SIG")
+        # S8192 joined post-band: the pre-band recheck rejected it (+47.5us), but
+        # the banded-attention scheduling regime flipped it to -112/-128us (16/16
+        # both construction orders; mkv3-p4b-postband-knob-recheck-20260705T185629Z).
         self.swiglu_cache_sig_default = (
             (c.H == 512 and c.S == 1024 and c.I == 1536)
             or (c.H == 256 and c.S == 1024 and c.I == 768)
             or (c.H == 256 and c.S == 2048 and c.I == 768)
             or (c.H == 256 and c.S == 3072 and c.I == 768)
             or (c.H == 256 and c.S == 4096 and c.I == 768)
+            or (c.H == 256 and c.S == 8192 and c.I == 768)
         )
         self.swiglu_cache_sig_enabled = (
             self.swiglu_cache_sig_default
@@ -198,6 +202,7 @@ class MKQwen3:
             or (c.H == 256 and c.S == 2048 and c.I == 768)
             or (c.H == 256 and c.S == 3072 and c.I == 768)
             or (c.H == 256 and c.S == 4096 and c.I == 768)
+            or (c.H == 256 and c.S == 8192 and c.I == 768)
         )
         self.drow_direct_store_default = c.D == 64 and c.S < 2048
         self.attn_exp2_approx_default = c.D == 64 and c.S >= 512 and c.S % 128 == 0
