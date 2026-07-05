@@ -2106,6 +2106,14 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   `mkv3-p4b-qkbwd-splitv-variant-prof-20260705T1014Z.log`). Leave the implementation
   unmerged; the dependency/gating cost of the extra row op eats the local V-copy saving.
 
+- Current-head small cold-cap recheck: after the late op changes, an env-only sweep
+  retested H512/S1024 `MK_COLD_CAP` around the current cap48 default. The broad pass
+  (`mkv3-p4b-coldcap-current-eae531e-20260705T1030Z.log`) made cap16 look best
+  (3507.49us vs cap48 3516.03us), but paired confirmation refuted it as
+  construction-order noise (`mkv3-p4b-coldcap16-confirm-eae531e-20260705T1030Z.log`):
+  cap16-cap48 measured -7.47us with cap48 built first, then +4.19us with cap16 built
+  first. Keep the H512/S1024 small default at cap48.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
