@@ -1732,6 +1732,14 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
 | S=1024 | 1254 | 778 | 1.61x |
 (Morning honest reset: nano 1.97x / small 2.52x.)
 
+- Input-binding probe no-go: after moving `inv_valid` into the kernel, the remaining
+  `step()` input-copy overhead looked tempting, but directly patching the device buftab
+  entries to external token/label pointers was slower than the normal device copies
+  (`mkv3-p4b-input-bind-probe-4aaf11a-20260705T0450BIND.log`). The pointer-bound path
+  matched losses, but event timing regressed S128 by +15.0us, nano by +19.1us, and small
+  by +8.8us, with wall-time medians also positive. Keep the simple token/label copies
+  unless a C++ launcher-side pointer override is implemented and remeasured.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
