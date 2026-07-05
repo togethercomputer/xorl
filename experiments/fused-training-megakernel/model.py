@@ -288,10 +288,11 @@ class MKQwen3:
             attn_dkv_row_bcast=self.attn_dkv_row_bcast_default,
             attn_dq_float2_store=self.attn_dq_float2_store_default,
         )
-        # D=128 WGMMA attention route (env probe): its DQ op needs a 104KB smem
-        # struct, above the 100KB default carveout (precedent: MK_ATTN_PIPE at 120KB)
+        # D=128 WGMMA attention route (env probe): its DKV op needs a 112KB smem
+        # struct and ws mode offsets ops by 256B of control smem, so take the 120KB
+        # carveout (precedent: MK_ATTN_PIPE used 120KB, measured neutral)
         self._smem_bytes = (
-            112 * 1024
+            120 * 1024
             if (c.D == 128 and c.S % 64 == 0
                 and bool(int(os.environ.get("MK_ATTN_D128_WG", "0"))))
             else None

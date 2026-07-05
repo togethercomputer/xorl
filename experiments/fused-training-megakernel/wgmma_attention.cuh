@@ -1179,7 +1179,8 @@ __device__ void op_attn_fwd_wg128(const Instr& I, int tile, void** bufs,
 // (published once by WG0); each WG register-accumulates its own 64-wide D-half of
 // dK and dV (32-reg banks) and drains it with float2 atomics.
 
-struct __align__(16) AttnWgDkv128Smem {  // 96KB
+struct __align__(16) AttnWgDkv128Smem {  // 112KB (needs the 120KB carveout:
+// ws mode offsets ops by 256B of control smem, so a 112KB carveout is 256B short)
   bf16 K[8192];      // owned 64 kv rows x 128 D
   bf16 V[8192];      // owned
   bf16 P[4096];      // [q64, kv64] (WG0 publishes); MN-view A = P^T
