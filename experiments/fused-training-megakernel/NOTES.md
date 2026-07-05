@@ -1428,6 +1428,12 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   `mkv3-p4b-score-s256-wg8-20260705T0307SCORE.log`); as usual, use the paired A/B for
   the small S128/S256 route delta because graph+ moves between fresh processes.
 
+- Post-route `MK_CLAIM` resweep no-change: after the dW and WGMMA route retunes,
+  current-head claim sweep (`mkv3-p4b-claim-resweep-48e9ff3-20260705T0306CLAIM.log`)
+  kept 132 as the only safe scheduler quantum. S128, nano, S1024, and small all favored
+  132; S256 had claim192 only -2.9us, too small and isolated to justify regressing the
+  rest. Keep `MK_CLAIM=132`.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
