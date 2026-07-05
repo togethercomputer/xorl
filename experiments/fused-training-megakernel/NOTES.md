@@ -1901,6 +1901,15 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   +0.29us, mean -0.33us, 3/6 default wins). The temporary source route was removed;
   keep SwiGLU on `__expf` plus the promoted FMA derivative.
 
+- ATTN_DKV old smem-drain epilogue recheck no-go: with `ATTN_DKV_WG` still a top
+  repeated span, the pre-direct-atomic epilogue was revalidated via
+  `MK_ATTN_DKV_DIRECT_ATOMIC=0`. Full-model correctness passed
+  (`mkv3-p4b-adkvoff-testmodel-20260705T064840Z.log`), but paired timing
+  (`mkv3-p4b-adkvoff-step-ab-20260705T064840Z.log`) strongly kept the current
+  direct-atomic default: S128 -6.43us, S256 -21.52us, nano -29.34us, small -49.23us,
+  H256/S1024 -47.76us, and H256/S2048 -49.46us for default minus old-smem. Keep
+  `MK_ATTN_DKV_DIRECT_ATOMIC=1`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
