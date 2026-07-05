@@ -1397,6 +1397,22 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   the stronger signal here because the graph+ baseline moved substantially in this
   fresh process. `MK_COLD_CAP` still force-overrides for sweeps.
 
+- S1024 WGMMA NN threshold gate: the S-sweep profile showed H256/S1024 still running
+  several `GEMMNN 1024x256x...` hops on WMMA because the generic NN threshold was 64
+  tiles (`mkv3-p4b-profile-ssweep-4a1cf3e-20260705T0300PROFILE.log`). Lowering only the
+  `M=1024,N=256` NN threshold to 32 routes those hops through m64n64 WGMMA while leaving
+  small's already-routed `1024x512` shapes unchanged. Env sweep
+  (`mkv3-p4b-s1024-wg-nn-threshold-4a1cf3e-20260705T0301N128.log`) measured S1024
+  `MK_WGMMA_NN_MIN=32` at -102.3us versus default; the n128 min16 route was weaker
+  (-74.3us). Direct confirmation
+  (`mkv3-p4b-s1024-wg32-confirm-4a1cf3e-20260705T0302N128.log`) measured -108.1us
+  paired median with 180/180 wins. Route check and model validation passed
+  (`mkv3-p4b-s1024-wg32-route-20260705T0303N128.log`,
+  `mkv3-p4b-s1024-wg32-testmodel-20260705T0303N128.log`), and the affected score
+  refresh landed at S1024 1338.0us vs graph+ 774.8us
+  (`mkv3-p4b-score-s1024-wg32-20260705T0304SCORE.log`). `MK_WGMMA_NN_MIN` still
+  force-overrides the threshold for sweeps.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
@@ -1407,7 +1423,7 @@ runs from inductor autotune variance):
 | deep-L12 | 2522 | 1765 | 1.43x |
 | S=128 | 850 | 426 | 2.00x |
 | S=256 | 934 | 558 | 1.67x |
-| S=1024 | 1461 | 713 | 2.05x |
+| S=1024 | 1338 | 775 | 1.73x |
 (Morning honest reset: nano 1.97x / small 2.52x.)
 
 ## Honest assessment + v2 roadmap

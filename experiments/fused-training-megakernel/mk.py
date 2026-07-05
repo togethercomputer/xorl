@@ -81,7 +81,14 @@ def wgmma_ok(M, N, K, flags):
         if not int(os.environ.get("MK_WGMMA_NN", "1")):
             return False
         nn_min_env = os.environ.get("MK_WGMMA_NN_MIN")
-        nn_min = int(nn_min_env) if nn_min_env is not None else (16 if M == 512 else 64)
+        if nn_min_env is not None:
+            nn_min = int(nn_min_env)
+        elif M == 512:
+            nn_min = 16
+        elif M == 1024 and N == 256:
+            nn_min = 32
+        else:
+            nn_min = 64
         return gemm_tiles_wgmma(M, N) >= nn_min
     return True  # NT
 
