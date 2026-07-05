@@ -1312,6 +1312,24 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   non-132 value (small nearest 264 was +37.28us; S2048 nearest 264 was +25.01us;
   S4096 nearest 160 was +3.92us and 264 was +115.86us). Keep `MK_CLAIM=132`.
 
+- Post-fast-log `MK_COLD_CAP` retune: keep nano/short at cap16, move
+  `1024 <= S < 2048` from cap33 to cap48, and keep `S >= 2048` uncapped. Broad
+  current-tip sweep (`mkv3-p4b-coldcap-sweep-3babb35-20260705T0242COLD.log`) kept
+  nano best at cap16; small had cap48 only -0.4us vs cap33, while S2048/S4096
+  alternates were all noise-level. Focused paired repeats made the defensible part
+  narrow: small cap48 beat cap33 by -2.7us median with 60/100 wins, and nano-width
+  S1024 cap48 beat cap33 by -1.9us median with 67/120 wins
+  (`mkv3-p4b-coldcap-confirm-3babb35-20260705T0243COLD.log`,
+  `mkv3-p4b-coldcap-s1024-confirm-3babb35-20260705T0244COLD.log`). Long-S stays
+  uncapped: S2048 cap64 was a 48/90 coin flip, S4096 cap8 lost by paired median, and
+  S4096 cap132's -3.9us median was too small/noisy to undo the prior uncapped choice.
+  Default-path model validation passed
+  (`mkv3-p4b-coldcap-cap48-testmodel-20260705T0245COLD.log`), and affected score
+  refreshes landed at small 3757.8us vs graph+ 1887.1us and S1024 1456.3us vs graph+
+  778.1us (`mkv3-p4b-score-small-cap48-20260705T0245SCORE.log`,
+  `mkv3-p4b-score-s1024-cap48-20260705T0246SCORE.log`). `MK_COLD_CAP` still overrides
+  the model-selected default.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
