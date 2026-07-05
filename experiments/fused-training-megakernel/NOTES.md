@@ -1580,6 +1580,23 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   `mkv3-p4b-score-s1024-attnc22-repeat-20260705T0354SCORE.log`); use the paired A/B for
   the route decision.
 
+- Post-S1024-retune profile and compile-flag guard checks: current-head profile at
+  `7beef96` shows nano 924.6us, small 3620.4us, and H256/S1024 1223.5us in the
+  `%globaltimer` critical-path meter (`mkv3-p4b-profile-current-7beef96-20260705T0349PROFILE.log`,
+  `mkv3-p4b-profile-s1024-current-7beef96-20260705T0352PROFILE.log`). S1024 is now led by
+  `ATTN_DKV_WG` 149.1us, `ATTN_FWD_WG` 134.2us, lm-head NT 92.0us, MLP dX 86.0us, Drow
+  74.7us, and RMS dx 70.4us. The DKV direct-atomic epilogue was not part of the original
+  S1024 coverage, so a forced-old staged-smem check confirmed the current default
+  decisively: old-minus-default +50.5us combined paired median with 200/200 default wins
+  (`mkv3-p4b-attndkv-directatomic-s1024-current-7beef96-20260705T0353DKVA.log`). WGMMA
+  attention fast-log remains safe but not an S1024 win: precise-minus-fastlog was -0.2us
+  combined paired median with order-sensitive 97/200 fast-log wins
+  (`mkv3-p4b-attnfwd-fastlog-s1024-current-7beef96-20260705T0402AFLOG.log`). QKNORM
+  D=64 cache, also previously unmeasured at H256/S1024, is weakly positive and stays
+  default-on: old-minus-qkbc +4.7us combined paired median with 134/200 qkbc wins
+  (`mkv3-p4b-qknorm-d64-cache-s1024-current-7beef96-20260705T0404QKBWD.log`). No source
+  route change from this guard pass.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
