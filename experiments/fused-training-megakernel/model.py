@@ -151,7 +151,9 @@ class MKQwen3:
         # falls back to the WMMA path.
         wg_attn = c.D == 64 and c.S % 128 == 0
         p = mk.Program()
-        if c.S >= 2048:
+        if c.H == 256 and c.L == 4 and c.S == 512:
+            p.default_cold_cap = 0
+        elif c.S >= 2048:
             p.default_cold_cap = 0
         elif c.H == 256 and c.S == 1024:
             p.default_cold_cap = 64

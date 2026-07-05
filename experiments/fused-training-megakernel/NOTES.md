@@ -1615,6 +1615,21 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   +2.8us with 29/80 wins, and small's -2.2us median with 50/80 wins was too weak and
   isolated to gate. Keep the late zero plus its wave boundary; no source route change.
 
+- Current-head cold-cap resweep after the S1024 route retunes: move only the shallow
+  nano-width S512 default from cap16 to uncapped cold work. The broad env resweep at
+  `61f455f` (`mkv3-p4b-coldcap-current-61f455f-20260705T0420COLD.log`) found cap0
+  positive on nano (-7.1us paired median, 53/70 wins) while small and H256/S1024 were
+  noise. Longer guards (`mkv3-p4b-coldcap-cap0-confirm-61f455f-20260705T0421COLD.log`)
+  confirmed nano cap0 at -6.6us with 129/180 wins, but rejected a broad S512 rule
+  because deep-L12 regressed +10.5us with only 25/140 cap0 wins. S128/S256 cap0 were
+  weak positives, so leave them at cap16. Route guard
+  (`mkv3-p4b-coldcap-nano-route-20260705T0422COLD.log`) shows only nano changes to
+  default cap0; deep/S128/S256 stay cap16, H256/S1024 stays cap64, small stays cap48,
+  and long S stays uncapped. Full model validation passed
+  (`mkv3-p4b-coldcap-nano-testmodel-20260705T0422COLD.log`), and patched default-vs-old
+  timing confirmed nano cap0 over forced old cap16 by -7.2us paired median with 146/200
+  default wins (`mkv3-p4b-coldcap-nano-default-vs-old-20260705T0422COLD.log`).
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
