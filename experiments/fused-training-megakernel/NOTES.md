@@ -1606,6 +1606,15 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   candidates were noise or regressions. Keep the dW split target at K==1024 -> 96 and
   otherwise 64; no source route change.
 
+- Early `dXN_f32` zero-fill no-go: moving the final head-dX fp32 workspace fill from the
+  CE-bwd boundary into wave 0 passed full model parity under the temporary
+  `MK_EARLY_DXN_ZERO` toggle
+  (`mkv3-p4b-early-dxnzero-testmodel-20260705T0419DXNZ.log`), but paired timing rejected
+  the schedule (`mkv3-p4b-early-dxnzero-ab-8cae8a5-20260705T0419DXNZ.log`). Nano
+  regressed by +3.1us paired median with 32/80 early wins, H256/S1024 regressed by
+  +2.8us with 29/80 wins, and small's -2.2us median with 50/80 wins was too weak and
+  isolated to gate. Keep the late zero plus its wave boundary; no source route change.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
