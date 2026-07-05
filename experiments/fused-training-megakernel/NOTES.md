@@ -1597,6 +1597,15 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   (`mkv3-p4b-qknorm-d64-cache-s1024-current-7beef96-20260705T0404QKBWD.log`). No source
   route change from this guard pass.
 
+- Current-head dW split-target resweep after the S1024/S128 retunes: no change. The
+  low-memory paired sweep at `0277b86`
+  (`mkv3-p4b-dwtarget-current-0277b86-20260705T0416DWSK.log`) found nano target48 only
+  weakly positive (-5.7us paired median, 52/80 wins), while target32 and target96 lost.
+  Small and S1024 did not support a new default either: small target64 was +3.6us with
+  38/80 wins, and S1024 target64 was +3.8us with 37/80 wins; the other small/S1024
+  candidates were noise or regressions. Keep the dW split target at K==1024 -> 96 and
+  otherwise 64; no source route change.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
