@@ -2413,6 +2413,12 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   (`mkv3-p4b-swcache-default-vs-old-small-20260705T2020Z.log`) confirmed the promoted
   default: -16.10us when default built first, -2.72us when old built first, combined
   -8.37us with 279/400 default wins.
+  Post-promotion profile/score refresh at `674d0ad`
+  (`mkv3-p4b-profile-small-post-swcache-674d0ad-20260705T2030Z.log`,
+  `mkv3-p4b-score-small-post-swcache-674d0ad-20260705T2035Z.log`) measured small at
+  3509.7us vs compile+CUDAGraph+ 1897.8us. `SWIGLU_BWD_2W` is now below the top three
+  small spans; current small leaders are `ATTN_DKV_WG`, MLP dX
+  `GEMMNN 1024x512x3072.wg`, and `ATTN_FWD_WG`.
 
 ## Honest assessment + v2 roadmap
 
