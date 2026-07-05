@@ -3119,6 +3119,18 @@ promote either DQ-first ordering. The pre-combine `MK_RMS_DX_R4=1` recheck
 (`mkv3-p4b-s4096-rmsdx-r4-post-t29-20260705T1854Z.log`) still lost
 +5.4/+5.2us, so S4096 remains on RMS dx R2.
 
+S3072 post-composition retune no-gos after the S2048/S4096/S8192 promotions:
+current profile `mkv3-p4b-profile-s3072-current-1b9cb20-20260705T1941Z.log`
+shows S3072 at `2493.9us`, led by `ATTN_DQ_WG` `518.4us`, lm-head NT `224.6us`,
+and `ATTN_FWD_WG` `183.7us`. Retesting attention-bwd bands around the T16
+default (`mkv3-p4b-attnband-retune-s3072-current-20260705T1943Z.log`) found no
+promotion: T10/T12/T14/T18/T28 lost both construction orders, T20 was order-mixed
+(-6.64us then +0.86us), and T24 was noise-level (-2.72/-0.32us). Retesting fwd
+bands around the T32 default (`mkv3-p4b-fwdband-retune-s3072-current-20260705T1948Z.log`)
+also found no promotion: T20/T24/T36/T40/T48 lost both construction orders, and
+T28 was order-mixed/noise (-1.44us then +9.01us). Keep S3072 on bwd T16 and fwd
+T32.
+
 ## v3 P4b attention-combine row batching (session 2853e0de): PROMOTED
 
 The post-compose profile showed `OP_ATTN_COMBINE` (the fwd-band merge op) fat on
