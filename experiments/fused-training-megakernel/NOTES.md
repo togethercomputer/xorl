@@ -3100,7 +3100,10 @@ neutral/mixed. Promoted-default validation
 `mkv3-p4b-attnband-s2048-promoted-default-20260705T1936Z.log` beat forced old
 T16 by +34.85us/+32.27us old-minus-new, with old wins 0/40 in both orders.
 Promote H256/D64/S2048 `MK_ATTN_BAND` from T16 to T12; keep S3072 T16, S4096
-T29, and S8192 T32 unchanged.
+T29, and S8192 T32 unchanged. Rechecking `MK_ATTN_BAND_ORDER=dq_first` under the
+new S2048 T12 geometry (`mkv3-p4b-s2048-t12-band-order-recheck-20260705T1939Z.log`)
+still lost +18.50us/+21.31us with only 1/40 wins in both construction orders, so
+keep S2048 on default `lpt` order.
 
 Post-T29 follow-up no-gos: current default `lpt` order remains best. A
 pre-combine env-only retest at `77346e2`
