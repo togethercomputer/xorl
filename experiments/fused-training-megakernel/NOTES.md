@@ -2458,6 +2458,14 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   +51.38us with 0/200 wins, combined +66.62us with 0/400 wins. Keep the current
   two-stage n128 feed.
 
+- Current-head executor-mode recheck no-change: after the small SwiGLU cache and n128
+  no-go probes, a same-model H512/S1024 timing rechecked `df`, `df2`, and `ws`
+  (`mkv3-p4b-mode-current-359a231-small-20260705T1420Z.log`). Current `df` remains
+  decisively best. In order `df->df2->ws`, `df2-df` regressed +497.90us median and
+  `ws-df` regressed +295.89us, both with 0/160 wins. In reverse order, `df2-df`
+  regressed +460.51us and `ws-df` +335.46us, again both 0/160 wins. Combined:
+  `df2-df` +482.78us and `ws-df` +314.10us with 0/320 wins each. Keep `mode="df"`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
