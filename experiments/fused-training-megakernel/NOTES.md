@@ -3402,6 +3402,17 @@ old R2 (`h256=0 r2=9`) while S8192 uses the new opcode (`h256=9 r2=0`), and
 forced-old `MK_RMS_DX_H256=0` was slower by +23.33us/+26.99us old-minus-new with
 parity clean. Do not widen to S4096 without a fresh post-composition recheck.
 
+Post-RMS S8192 profile/score refresh:
+`mkv3-p4b-profile-score-s8192-post-rmsdx-9eb4c2e-20260705T2205Z.log` measured
+profile total 7233.5us with `n_instr=188`, `critical_path=80`, `gated=63`.
+`RMSNORM_BWD_DX_H256` is now on path at 428.4us, but the structural leaders are
+still `ATTN_DKV_WG` 2649.7us (2112.1us wait + 537.6us span), `ATTN_FWD_WG`
+1132.5us, lm-head NT 440.0us, qknorm/rope bwd 312.1us, and MLP dx 308.4us.
+The refreshed score was megakernel 7156.9us vs compile+CUDAGraph+ 3119.0us
+(2.29x gap). Absolute S8192 medians remain noisy; use the paired default-vs-old
+logs above as promotion evidence. For next work, DKV wait/dependency structure is
+still a larger target than local row-op scalar cleanup.
+
 ## v3 P4b knob consolidation (session 2853e0de): one tuning table, routes verified
 
 The secondary lane from the /goal: model.py's ~12 scattered per-shape gate
