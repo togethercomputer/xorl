@@ -668,8 +668,45 @@ class MKQwen3:
                 default_Cq = 2 if (attn_c2_s1024 or attn_c2_s2048 or attn_c32_s512) else 1
                 Ckv = max(1, int(os.environ.get("MK_ATTN_DKV_C", str(default_Ckv))))
                 Cq = max(1, int(os.environ.get("MK_ATTN_DQ_C", str(default_Cq))))
-                p.instr(mk.OP_ATTN_DKV_WG, c.nkv * n_qt128 * G * Ckv, dkv_args() + [Ckv])
-                p.instr(mk.OP_ATTN_DQ_WG, c.nq * n_qt128 * Cq, dq_args() + [Cq])
+                # Banded chunking (MK_ATTN_BAND = target stages per chunk, 0 = off):
+                # at C=1 long-S the bwd ops are STRAGGLER-BOUND — makespan equals the
+                # longest causal tile's serial stage chain (measured 2.7us/stage dkv,
+                # 1.9us/stage dq), while uniform C>1 pays fill/atomic overhead on ALL
+                # tiles (the measured S4096 no-go). Bands split only the long tiles:
+                # per-tile chunks = ceil(stages/T), consecutive equal-C tiles grouped
+                # into one instruction with its kv/q-tile offset+width packed into the
+                # C arg (C | off<<8 | width<<16). Per-band ws slots keep the bands'
+                # disjoint row ranges parallel in the dependency analysis.
+                band_T = int(os.environ.get("MK_ATTN_BAND", "0"))
+                if band_T > 0:
+                    def bands(stages_of):
+                        out, j = [], 0
+                        while j < n_qt128:
+                            Cj = max(1, -(-stages_of(j) // band_T))
+                            k = j
+                            while k < n_qt128 and max(1, -(-stages_of(k) // band_T)) == Cj:
+                                k += 1
+                            out.append((j, k - j, Cj))
+                            j = k
+                        return out
+                    emit = []  # (chunk_stages, op, ntiles, args) -> LPT emission order
+                    for bi, (off, w, Cb) in enumerate(bands(lambda j: (c.S - j * 128) // 64)):
+                        st = -(-((c.S - off * 128) // 64) // Cb)
+                        emit.append((st, mk.OP_ATTN_DKV_WG, c.nkv * w * G * Cb,
+                                     dkv_args()[:4]
+                                     + [p.buf(W[f"dQKV_f32.{l}"], slot=f"kv{bi}")]
+                                     + dkv_args()[5:] + [Cb | (off << 8) | (w << 16)]))
+                    for bi, (off, w, Cb) in enumerate(bands(lambda i: i * 2 + 2)):
+                        st = -(-((off + w - 1) * 2 + 2) // Cb)
+                        emit.append((st, mk.OP_ATTN_DQ_WG, c.nq * w * Cb,
+                                     dq_args()[:4]
+                                     + [p.buf(W[f"dQKV_f32.{l}"], slot=f"q{bi}")]
+                                     + dq_args()[5:] + [Cb | (off << 8) | (w << 16)]))
+                    for _, op_id, nt, ag in sorted(emit, key=lambda e: -e[0]):
+                        p.instr(op_id, nt, ag)
+                else:
+                    p.instr(mk.OP_ATTN_DKV_WG, c.nkv * n_qt128 * G * Ckv, dkv_args() + [Ckv])
+                    p.instr(mk.OP_ATTN_DQ_WG, c.nq * n_qt128 * Cq, dq_args() + [Cq])
             else:
                 Cq = 4 if n_qt >= 8 else 2
                 p.instr(mk.OP_ATTN_DKV, c.nkv * n_qt * G, dkv_args())

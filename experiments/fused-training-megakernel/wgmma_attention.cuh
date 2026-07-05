@@ -554,7 +554,15 @@ __device__ void op_attn_dkv_wg(const Instr& I, int tile, void** bufs, char* smem
   constexpr int D = 64;
   const int S = I.args[5], nq = I.args[6], nkv = I.args[7];
   const float scale = __int_as_float(I.args[9]);
-  const int C = I.args[10];
+  // args[10] packs C | band_kv_tile_off<<8 | band_width<<16 (off/width 0 = full
+  // range, so pre-band callers passing a bare C decode unchanged). Banded emission
+  // gives the causal-triangle straggler tiles more chunks than the tail tiles: at
+  // C=1 long-S the op makespan == the longest tile's serial stage chain (measured
+  // 2.7us/64-row stage — see NOTES P4b long-S scaling round).
+  const int Craw = I.args[10];
+  const int C = Craw & 0xff;
+  const int boff = (Craw >> 8) & 0xff;
+  const int bw = (Craw >> 16) & 0xff;
   const bf16* qkv = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
   const bf16* dOg = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
   const float* LSE = reinterpret_cast<const float*>(bufs[I.args[2]]);
@@ -563,12 +571,12 @@ __device__ void op_attn_dkv_wg(const Instr& I, int tile, void** bufs, char* smem
   AttnWgDkvSmem& sm = *reinterpret_cast<AttnWgDkvSmem*>(smem_raw);
 
   const int G = nq / nkv;
-  const int n_kvt = S / 128;
+  const int n_kvt = bw ? bw : S / 128;
   const int c = tile % C;
   const int t128 = tile / C;
   const int kvh = t128 / (n_kvt * G);
   const int rem = t128 % (n_kvt * G);
-  const int kv0 = (rem / G) * 128;
+  const int kv0 = (boff + rem / G) * 128;
   const int g = rem % G;
   const int qh = kvh * G + g;
   const int stride = (nq + 2 * nkv) * D;
@@ -754,7 +762,12 @@ __device__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs, char* smem_
   constexpr int D = 64;
   const int S = I.args[5], nq = I.args[6], nkv = I.args[7];
   const float scale = __int_as_float(I.args[9]);
-  const int C = I.args[10];
+  // args[10] packs C | band_q_tile_off<<8 | band_width<<16, as in op_attn_dkv_wg.
+  // A band emitted with C==1 still has one writer per q slice (bands are q-disjoint),
+  // so the direct-store epilogue below stays valid per band.
+  const int Craw = I.args[10];
+  const int C = Craw & 0xff;
+  const int boff = (Craw >> 8) & 0xff;
   const bf16* qkv = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
   const bf16* dOg = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
   const float* LSE = reinterpret_cast<const float*>(bufs[I.args[2]]);
@@ -765,7 +778,7 @@ __device__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs, char* smem_
   const int c = tile % C;
   const int t128 = tile / C;
   const int qh = t128 % nq;
-  const int q0 = (t128 / nq) * 128;
+  const int q0 = (boff + t128 / nq) * 128;
   const int kvh = qh / (nq / nkv);
   const int stride = (nq + 2 * nkv) * D;
   const int tid = mk_tid();
