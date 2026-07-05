@@ -3200,8 +3200,14 @@ gated 71), led by attention-dQ 516.5us, lm-head NT 223.6us, attention-fwd
 185.1us, SwiGLU-BWD 2W 139.9us, RMS dx 139.6us, and `QKNORM_ROPE_BWD` 131.4us.
 S8192 endpoint check `mkv3-p4b-ssq-s8192-current-20260705T2103Z.log` was a
 parity-clean order-mixed wash (-2.27us then +2.34us), so keep SSQ fused at
-S8192. Together with the S4096 mixed result, the SSQ-off default stays exact
-H256/D64/S3072 only.
+S8192. S2048 boundary check `mkv3-p4b-ssq-s2048-current-20260705T2106Z.log`
+was positive (-3.02us and -7.63us), and cached confirmation
+`mkv3-p4b-ssq-s2048-confirm-20260705T2108Z.log` held (-10.66us and -3.66us),
+all parity-clean (`worst_grad_rel` <= 0.005908). Promoted-default validation
+`mkv3-p4b-ssq-s2048-promoted-default-20260705T2110Z.log` beat forced old
+`MK_SSQ_FUSE=1` by +8.37us/+3.02us old-minus-new, with old wins 8/40 and 11/40
+and parity clean (`worst_grad_rel` <= 0.007364). Together with the S4096 mixed
+result, the SSQ-off default now covers exact H256/D64/S2048 and S3072 only.
 
 Post-T29 follow-up no-gos: current default `lpt` order remains best. A
 pre-combine env-only retest at `77346e2`
