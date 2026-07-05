@@ -41,6 +41,13 @@ class MKQwen3:
         c = cfg
         QD = (c.nq + 2 * c.nkv) * c.D
         bf, f32 = torch.bfloat16, torch.float32
+        swiglu_cache_sig_env = os.environ.get("MK_SWIGLU_CACHE_SIG")
+        self.swiglu_cache_sig_default = c.H == 512 and c.S == 1024 and c.I == 1536
+        self.swiglu_cache_sig_enabled = (
+            self.swiglu_cache_sig_default
+            if swiglu_cache_sig_env is None
+            else bool(int(swiglu_cache_sig_env))
+        )
 
         def P(*shape, std=0.02):
             return (torch.randn(*shape, device=dev) * std).to(bf).contiguous()
@@ -84,6 +91,8 @@ class MKQwen3:
             A[f"xn2.{l}"] = torch.empty(c.S, c.H, device=dev, dtype=bf)
             A[f"gu.{l}"] = torch.empty(c.S, 2 * c.I, device=dev, dtype=bf)
             A[f"hs.{l}"] = torch.empty(c.S, c.I, device=dev, dtype=bf)
+            if self.swiglu_cache_sig_enabled:
+                A[f"swsig.{l}"] = torch.empty(c.S, c.I, device=dev, dtype=bf)
         if c.H % 64 == 0:  # ssq partials for the bit13 fusion (tiny: S x H/64 fp32)
             for l in range(c.L):
                 A[f"x2ssq.{l}"] = torch.empty(c.S, c.H // 64, device=dev, dtype=f32)
@@ -149,6 +158,7 @@ class MKQwen3:
         self.ce_bwd_exp2_approx_default = c.S >= 1024 and c.V >= 8192 and c.V % 8 == 0
         self.ext = mk.load_ext(
             swiglu_bwd_2w=self.swiglu_bwd_2w_default,
+            swiglu_cache_sig=self.swiglu_cache_sig_enabled,
             drow_direct_store=self.drow_direct_store_default,
             attn_exp2_approx=self.attn_exp2_approx_default,
             lmhead_exp2_approx=self.lmhead_exp2_approx_default,
@@ -242,6 +252,7 @@ class MKQwen3:
             swiglu_bwd_2w = self.swiglu_bwd_2w_default
         else:
             swiglu_bwd_2w = bool(int(swiglu_bwd_2w_env))
+        swiglu_cache_sig = self.swiglu_cache_sig_enabled and swiglu_bwd_2w
 
         def head_dx_target_tiles():
             env = os.environ.get("MK_HEAD_DX_TARGET_TILES")
@@ -408,7 +419,10 @@ class MKQwen3:
             # 255 regs -> 1 block/SM. Revisit only on top of tile-granular deps.
             gemm(a("xn2"), pr("wgu"), a("gu"), c.S, 2 * c.I, c.H, 2)
             p.wave()
-            p.instr(mk.OP_SWIGLU_FWD, mk.rowop_tiles(c.S), [a("gu"), a("hs"), c.S, c.I])
+            swiglu_fwd_args = [a("gu"), a("hs"), c.S, c.I]
+            if swiglu_cache_sig:
+                swiglu_fwd_args.append(a("swsig"))
+            p.instr(mk.OP_SWIGLU_FWD, mk.rowop_tiles(c.S), swiglu_fwd_args)
             p.wave()
             X_fused[l + 1] = gemm(a("hs"), pr("wd"), X[l + 1], c.S, c.H, c.I, 2 | 16, a("x2"),
                                   ssq=(B(A[f"Xssq.{l + 1}"]) if c.H % 64 == 0 else 0),
@@ -541,10 +555,13 @@ class MKQwen3:
             gemm(B(W["dX"]), a("hs"), gr("wd"), c.H, c.I, c.S, 1 | 4 | 8)
             p.wave()
             if swiglu_bwd_2w:
+                swiglu_bwd_args = [a("gu"), dhs, B(W["dGU"]), c.S, c.I, dhs_f32]
+                if swiglu_cache_sig:
+                    swiglu_bwd_args.append(a("swsig"))
                 p.instr(
                     mk.OP_SWIGLU_BWD_2W,
                     mk.rowop_tiles(c.S, mk.SWIGLU_BWD_2W_R),
-                    [a("gu"), dhs, B(W["dGU"]), c.S, c.I, dhs_f32],
+                    swiglu_bwd_args,
                 )
             else:
                 p.instr(mk.OP_SWIGLU_BWD, mk.rowop_tiles(c.S), [a("gu"), dhs, B(W["dGU"]), c.S, c.I, dhs_f32])

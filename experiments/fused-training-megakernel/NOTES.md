@@ -2396,6 +2396,24 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   SSQ-off by -11.81us while off-first reversed to +12.48us, combined +1.97us with only
   191/400 off wins. Keep `MK_SSQ_FUSE=1` default-on.
 
+- Small SwiGLU sigmoid-cache promotion: H512/S1024 small now writes a bf16 sigmoid cache
+  from `OP_SWIGLU_FWD` and feeds it to the existing `OP_SWIGLU_BWD_2W` route, removing
+  the backward `__expf` recompute on the hot small SwiGLU backward path. The route is
+  small-only by default (`H=512/S=1024/I=1536`) and `MK_SWIGLU_CACHE_SIG=0` restores the
+  old recompute path for A/B. The isolated probe in
+  `/home/apanda/xorl-oss-swiglu-cache-probe` passed explicit small validation
+  (`mkv3-p4b-swcache-small-parity-20260705T1945Z.log`: 8 cached fwd ops, 8 cached 2W
+  bwd ops, loss 9.79777 vs 9.79781, worst grad rel 0.025832) and paired timing
+  (`mkv3-p4b-swcache-small-step-ab-20260705T1955Z.log`) measured cache-control
+  -17.57us when control built first and -10.58us when cache built first, combined
+  -13.44us with 264/320 cache wins. Main-tree validation passed explicit small parity
+  (`mkv3-p4b-swcache-main-small-parity-20260705T2005Z.log`) and full default
+  `test_model.py` coverage (`mkv3-p4b-swcache-main-testmodel-20260705T2010Z.log`).
+  Final main default-vs-forced-old timing
+  (`mkv3-p4b-swcache-default-vs-old-small-20260705T2020Z.log`) confirmed the promoted
+  default: -16.10us when default built first, -2.72us when old built first, combined
+  -8.37us with 279/400 default wins.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

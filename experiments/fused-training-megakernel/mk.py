@@ -168,6 +168,7 @@ INSTR_INTS = 3 + MAX_ARGS  # op, tile_off, ntiles, args[23]
 def load_ext(
     verbose=False,
     swiglu_bwd_2w=None,
+    swiglu_cache_sig=None,
     drow_direct_store=None,
     attn_exp2_approx=None,
     lmhead_exp2_approx=None,
@@ -215,6 +216,9 @@ def load_ext(
         swiglu_bwd_2w = int(swiglu_bwd_2w_env)
     else:
         swiglu_bwd_2w = int(bool(swiglu_bwd_2w))
+    swiglu_cache_sig = int(
+        os.environ.get("MK_SWIGLU_CACHE_SIG", int(bool(swiglu_cache_sig)))
+    )
     return load(
         name="xorl_megakernel" + ("_occ2" if occ2 else "") + ("_wsrc" if regcopy else "")
         + ("_apipe" if attnpipe else "") + ("_adkva" if attn_dkv_direct_atomic else "")
@@ -223,7 +227,8 @@ def load_ext(
         + ("_lex2" if lmhead_exp2_approx else "")
         + ("_ceb2" if ce_bwd_exp2_approx else "")
         + ("_qkbc" if qkbc else "")
-        + ("_swfma" if swiglu_fma_deriv else "") + ("_swb2w" if swiglu_bwd_2w else ""),
+        + ("_swfma" if swiglu_fma_deriv else "") + ("_swb2w" if swiglu_bwd_2w else "")
+        + ("_swcsig" if swiglu_cache_sig else ""),
         sources=[os.path.join(_DIR, "megakernel.cu")],
         extra_cuda_cflags=[
             "-O3",
@@ -246,7 +251,8 @@ def load_ext(
         + (["-DMK_CE_BWD_EXP2_APPROX"] if ce_bwd_exp2_approx else [])
         + (["-DMK_QKBWD_D64_CACHE"] if qkbc else [])
         + (["-DMK_SWIGLU_FMA_DERIV"] if swiglu_fma_deriv else [])
-        + (["-DMK_SWIGLU_BWD_2W"] if swiglu_bwd_2w else []),
+        + (["-DMK_SWIGLU_BWD_2W"] if swiglu_bwd_2w else [])
+        + (["-DMK_SWIGLU_CACHE_SIG"] if swiglu_cache_sig else []),
         verbose=verbose,
     )
 
@@ -294,9 +300,9 @@ def _access_sets(op, args):
     if op == OP_RMSNORM_BWD_DW:
         return [0, 2, 5], [4]
     if op == OP_SWIGLU_FWD:
-        return [0], [1]
+        return [0], ([1, 4] if len(args) > 4 else [1])
     if op in (OP_SWIGLU_BWD, OP_SWIGLU_BWD_2W):
-        return [0, 1], [2]
+        return ([0, 1, 6] if len(args) > 6 else [0, 1]), [2]
     if op == OP_QKNORM_ROPE_FWD:
         return [0, 2, 3, 6, 7], [1, 4, 5]
     if op == OP_QKNORM_ROPE_BWD:
@@ -365,7 +371,7 @@ _ROW_WRITE_POS = {
     OP_RMSNORM_BWD_DX: (3,),
     OP_RMSNORM_BWD_DX_R4: (3,),
     OP_RMSNORM_BWD_DX_FMA: (3,),
-    OP_SWIGLU_FWD: (1,),
+    OP_SWIGLU_FWD: (1, 4),
     OP_SWIGLU_BWD: (2,),
     OP_SWIGLU_BWD_2W: (2,),
     OP_QKNORM_ROPE_FWD: (1, 4, 5),
@@ -384,8 +390,8 @@ _ROW_READ_POS = {
     OP_RMSNORM_BWD_DW: (0, 2, 5),
     OP_RMSNORM_BWD_DX_R4: (0, 2, 5),
     OP_SWIGLU_FWD: (0,),
-    OP_SWIGLU_BWD: (0, 1),
-    OP_SWIGLU_BWD_2W: (0, 1),
+    OP_SWIGLU_BWD: (0, 1, 6),
+    OP_SWIGLU_BWD_2W: (0, 1, 6),
     OP_QKNORM_ROPE_FWD: (0,),
     OP_QKNORM_ROPE_BWD: (0, 1, 7, 8),
     OP_CE_FWD: (0, 2, 6),
@@ -424,6 +430,8 @@ def _producer_row_info(op, ntiles, args, root, root_of):
             return S, nq * (REGION_ROWS // 128)
         return None
     for pos in _ROW_WRITE_POS.get(op, ()):
+        if pos >= len(args):
+            continue
         if root_of(args[pos]) == root:
             R = _ROW_TILE_R.get(op, 1)
             rows = ntiles * R  # exact only when S % R == 0; else falls through to ungated

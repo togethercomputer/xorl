@@ -1467,22 +1467,33 @@ __device__ void op_swiglu_fwd(const Instr& I, int tile, void** bufs) {
   if (row >= S) return;  // barrier-free op: early exit is safe
   const bf16* gu = reinterpret_cast<const bf16*>(bufs[I.args[0]]) + (int64_t)row * 2 * Iw;
   bf16* h = reinterpret_cast<bf16*>(bufs[I.args[1]]) + (int64_t)row * Iw;
+  bf16* sig_cache = nullptr;
+#ifdef MK_SWIGLU_CACHE_SIG
+  if (I.args[4] != 0) sig_cache = reinterpret_cast<bf16*>(bufs[I.args[4]]) + (int64_t)row * Iw;
+#endif
   if ((Iw & 7) == 0) {
     for (int i = lane * 8; i < Iw; i += 32 * 8) {
-      float g[8], u[8], hv[8];
+      float g[8], u[8], hv[8], sv[8];
       ld8bf(gu + i, g);
       ld8bf(gu + Iw + i, u);
 #pragma unroll
       // __expf (SFU): libm expf is a multi-instruction software path that both
       // serializes the lane and bloats register pressure (see the CE epilogue note);
       // error is ~2 ulp, far below bf16 output rounding.
-      for (int j = 0; j < 8; j++) hv[j] = g[j] / (1.0f + __expf(-g[j])) * u[j];
+      for (int j = 0; j < 8; j++) {
+        const float sig = 1.0f / (1.0f + __expf(-g[j]));
+        sv[j] = sig;
+        hv[j] = g[j] * sig * u[j];
+      }
       st8bf(h + i, hv);
+      if (sig_cache) st8bf(sig_cache + i, sv);
     }
   } else {
     for (int i = lane; i < Iw; i += 32) {
       const float g = bf2f(gu[i]), u = bf2f(gu[Iw + i]);
-      h[i] = f2bf(g / (1.0f + __expf(-g)) * u);
+      const float sig = 1.0f / (1.0f + __expf(-g));
+      h[i] = f2bf(g * sig * u);
+      if (sig_cache) sig_cache[i] = f2bf(sig);
     }
   }
 }
@@ -1500,15 +1511,20 @@ __device__ void op_swiglu_bwd(const Instr& I, int tile, void** bufs) {
   const bf16* dhb = reinterpret_cast<const bf16*>(bufs[I.args[1]]) + (int64_t)row * Iw;
   const float* dhf = reinterpret_cast<const float*>(bufs[I.args[1]]) + (int64_t)row * Iw;
   bf16* dgu = reinterpret_cast<bf16*>(bufs[I.args[2]]) + (int64_t)row * 2 * Iw;
+  const bf16* sig_cache = nullptr;
+#ifdef MK_SWIGLU_CACHE_SIG
+  if (I.args[6] != 0) sig_cache = reinterpret_cast<const bf16*>(bufs[I.args[6]]) + (int64_t)row * Iw;
+#endif
   if ((Iw & 7) == 0) {
     for (int i = lane * 8; i < Iw; i += 32 * 8) {
-      float g[8], u[8], d[8], dg[8], du[8];
+      float g[8], u[8], d[8], dg[8], du[8], sc[8];
       ld8bf(gu + i, g);
       ld8bf(gu + Iw + i, u);
       ld8dy(dhb, dhf, dy_f32, i, d);
+      if (sig_cache) ld8bf(sig_cache + i, sc);
 #pragma unroll
       for (int j = 0; j < 8; j++) {
-        const float sig = 1.0f / (1.0f + __expf(-g[j]));  // SFU, see swiglu_fwd note
+        const float sig = sig_cache ? sc[j] : 1.0f / (1.0f + __expf(-g[j]));
         const float sg = g[j] * sig;
         // dsilu = sig + silu*(1-sig) = sig + sg - sg*sig.
 #ifdef MK_SWIGLU_FMA_DERIV
@@ -1526,7 +1542,7 @@ __device__ void op_swiglu_bwd(const Instr& I, int tile, void** bufs) {
     for (int i = lane; i < Iw; i += 32) {
       const float g = bf2f(gu[i]), u = bf2f(gu[Iw + i]);
       const float d = dy_f32 ? dhf[i] : bf2f(dhb[i]);
-      const float sig = 1.0f / (1.0f + __expf(-g));
+      const float sig = sig_cache ? bf2f(sig_cache[i]) : 1.0f / (1.0f + __expf(-g));
       const float sg = g * sig;
 #ifdef MK_SWIGLU_FMA_DERIV
       const float ds = fmaf(-sg, sig, sig + sg);
@@ -1553,15 +1569,20 @@ __device__ void op_swiglu_bwd_2w(const Instr& I, int tile, void** bufs) {
   const bf16* dhb = reinterpret_cast<const bf16*>(bufs[I.args[1]]) + (int64_t)row * Iw;
   const float* dhf = reinterpret_cast<const float*>(bufs[I.args[1]]) + (int64_t)row * Iw;
   bf16* dgu = reinterpret_cast<bf16*>(bufs[I.args[2]]) + (int64_t)row * 2 * Iw;
+  const bf16* sig_cache = nullptr;
+#ifdef MK_SWIGLU_CACHE_SIG
+  if (I.args[6] != 0) sig_cache = reinterpret_cast<const bf16*>(bufs[I.args[6]]) + (int64_t)row * Iw;
+#endif
   if ((Iw & 7) == 0) {
     for (int i = lane64 * 8; i < Iw; i += 64 * 8) {
-      float g[8], u[8], d[8], dg[8], du[8];
+      float g[8], u[8], d[8], dg[8], du[8], sc[8];
       ld8bf(gu + i, g);
       ld8bf(gu + Iw + i, u);
       ld8dy(dhb, dhf, dy_f32, i, d);
+      if (sig_cache) ld8bf(sig_cache + i, sc);
 #pragma unroll
       for (int j = 0; j < 8; j++) {
-        const float sig = 1.0f / (1.0f + __expf(-g[j]));
+        const float sig = sig_cache ? sc[j] : 1.0f / (1.0f + __expf(-g[j]));
         const float sg = g[j] * sig;
 #ifdef MK_SWIGLU_FMA_DERIV
         const float ds = fmaf(-sg, sig, sig + sg);
@@ -1578,7 +1599,7 @@ __device__ void op_swiglu_bwd_2w(const Instr& I, int tile, void** bufs) {
     for (int i = lane64; i < Iw; i += 64) {
       const float g = bf2f(gu[i]), u = bf2f(gu[Iw + i]);
       const float d = dy_f32 ? dhf[i] : bf2f(dhb[i]);
-      const float sig = 1.0f / (1.0f + __expf(-g));
+      const float sig = sig_cache ? bf2f(sig_cache[i]) : 1.0f / (1.0f + __expf(-g));
       const float sg = g * sig;
 #ifdef MK_SWIGLU_FMA_DERIV
       const float ds = fmaf(-sg, sig, sig + sg);
