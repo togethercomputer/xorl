@@ -3092,8 +3092,8 @@ T30 won -57.4us in the clean order (the other order had contaminated absolute
 medians but still paired -66.8us). Confirmation log
 `mkv3-p4b-s4096-band-budget-confirm-20260705T1847Z.log`: T29 repeated
 -62.9/-60.4us with 40/40 wins in both construction orders, while T31 shrank to
--16.9/-15.7us. Current H256/D64 band defaults after the S2048 retune below are
-`{2048:12, 3072:16, 4096:29, 8192:32}`; `MK_ATTN_BAND=32` restores the old
+-16.9/-15.7us. Current H256/D64 band defaults after the S2048/S8192 retunes below
+are `{2048:12, 3072:16, 4096:29, 8192:40}`; `MK_ATTN_BAND=32` restores the old
 S4096 route for A/B and `MK_ATTN_BAND=0` still restores the uniform C route.
 
 S2048 attention-bwd band-budget retune after the idle32/row-batching composition:
@@ -3104,11 +3104,25 @@ found that the old T16 default is no longer best. T12 beat T16 by -29.94us and
 neutral/mixed. Promoted-default validation
 `mkv3-p4b-attnband-s2048-promoted-default-20260705T1936Z.log` beat forced old
 T16 by +34.85us/+32.27us old-minus-new, with old wins 0/40 in both orders.
-Promote H256/D64/S2048 `MK_ATTN_BAND` from T16 to T12; keep S3072 T16, S4096
-T29, and S8192 T32 unchanged. Rechecking `MK_ATTN_BAND_ORDER=dq_first` under the
+Promote H256/D64/S2048 `MK_ATTN_BAND` from T16 to T12; keep S3072 T16 and S4096
+T29 unchanged, with the S8192 retune below applied later. Rechecking
+`MK_ATTN_BAND_ORDER=dq_first` under the
 new S2048 T12 geometry (`mkv3-p4b-s2048-t12-band-order-recheck-20260705T1939Z.log`)
 still lost +18.50us/+21.31us with only 1/40 wins in both construction orders, so
 keep S2048 on default `lpt` order.
+
+S8192 attention-bwd band-budget retune after the idle32 and cached-SwiGLU
+composition: GPU5 broad log `mkv3-p4b-attnband-retune-s8192-current-20260705T1956Z.log`
+found T24/T28/T36 negative, T34 positive (-35.8/-28.5us), and T40 best in the
+broad pass (-85.8/-77.3us, 8/8 wins both orders). Focused confirmation
+`mkv3-p4b-attnband-retune-s8192-focused-20260705T2002Z.log` kept T40 best:
+-88.48us/-109.62us with 12/12 wins in both construction orders, parity clean
+(`worst_grad_rel` <= 0.004956). Promoted-default validation
+`mkv3-p4b-attnband-s8192-promoted-default-20260705T2006Z.log` beat forced old
+T32 by +75.81us/+80.37us old-minus-new, with old wins 0/16 in both orders and
+parity clean (`worst_grad_rel` <= 0.005753). Promote H256/D64/S8192
+`MK_ATTN_BAND` from T32 to T40; current H256/D64 band defaults are now
+`{2048:12, 3072:16, 4096:29, 8192:40}`.
 
 Post-T29 follow-up no-gos: current default `lpt` order remains best. A
 pre-combine env-only retest at `77346e2`
