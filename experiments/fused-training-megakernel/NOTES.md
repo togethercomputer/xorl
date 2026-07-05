@@ -3716,6 +3716,12 @@ params/tokens and old arm `MK_DW_NO_ATOMIC_SK1=0`: old dW routes were five
 remaining off-path giant vocab dW. Full `test_model.py` passed in
 `mkv3-p4b-qwen-dw-noatomic-testmodel-20260705T2332Z.log`.
 
+Post-promotion cold-cap resweep
+`mkv3-p4b-qwen-coldcap-post-dwnoatomic-20260705T2334Z.log` was a no-go. The current
+uncapped default still wins: cap64 lost `2661.7us`, cap96 lost `1082.2us`, and even
+cap128 lost `50.2us` with only `1/12` wins. Keep qwen4b-l1 `default_cold_cap=0`; the
+new `EMBED_BWD` wait is the remaining giant vocab dW drain, not a profitable cap target.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
