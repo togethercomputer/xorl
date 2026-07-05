@@ -1871,6 +1871,14 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   (`mkv3-p4b-attn-c-nano-c22-default-vs-old-20260705T0625ATTNC.log`) confirmed -4.99us
   with 195/240 default wins. `MK_ATTN_DKV_C`/`MK_ATTN_DQ_C` still force the chunk counts.
 
+- Current scoreboard after the fast-log/RMS/nano-attention wins:
+  `mkv3-p4b-score-both-cfc2fb3-20260705T0627SCORE.log` measured nano at 948.6us
+  megakernel vs 634.6us compile+CUDAGraph+ (1.49x gap) and small at 3638.2us
+  megakernel vs 1895.1us compile+CUDAGraph+ (1.92x gap). The remaining small gap is
+  still dominated by op quality rather than obvious route knobs: post-fast-log profiles
+  show `ATTN_DKV_WG`, large WGMMA/n128 GEMMs, `SWIGLU_BWD`, Drow, and RMS dx as the
+  largest repeated spans.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
