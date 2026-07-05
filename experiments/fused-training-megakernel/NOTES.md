@@ -1800,6 +1800,20 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   +223.23us, and H256/S1024 +65.73us. Keep masked attention probabilities on the
   existing `exp(-inf) -> 0` path; the branch/predicate cost overwhelms saved SFU work.
 
+- Attention dS FMA no-go: a default-off `MK_ATTN_DS_FMA` probe rewrote WGMMA attention
+  backward `dS = P * (dP-Drow) * scale` as `P * fmaf(dP, scale, -Drow*scale)` in both
+  dKV and dQ. Focused attention and full-model correctness passed
+  (`mkv3-p4b-attndsfma-testattention-20260705T0550DSFMA.log`,
+  `mkv3-p4b-attndsfma-testmodel-20260705T0552DSFMA.log`). All-shape timing
+  (`mkv3-p4b-attndsfma-step-ab-20260705T0553DSFMA.log`) was mixed: S128 -14.24us,
+  small -12.24us, and H256/S1024 -4.75us, but S256 regressed +4.62us and nano
+  regressed +2.11us. A shape-gated version for `S==128 || S==1024` also passed
+  correctness (`mkv3-p4b-attndsfma-gated-testattention-20260705T0557DSFMA.log`,
+  `mkv3-p4b-attndsfma-gated-testmodel-20260705T0600DSFMA.log`) but still regressed
+  protected shapes and lost H256/S1024 (`mkv3-p4b-attndsfma-gated-step-ab-20260705T0601DSFMA.log`:
+  S128 -14.37us, small -8.10us, S256 +8.24us, nano +8.34us, H256/S1024 +5.63us).
+  Keep the original `(dP-Drow)*scale` expression; the FMA form is not a safe default.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
