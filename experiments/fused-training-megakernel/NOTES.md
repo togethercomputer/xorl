@@ -1681,6 +1681,20 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   paired median with 189/220 default wins
   (`mkv3-p4b-coldcap-s128-default-vs-old-20260705T0431COLD.log`).
 
+- Post-S128-cap profile and S128 attention chunk no-go: refreshed short profiles
+  (`mkv3-p4b-profile-short-966add6-20260705T0432PROFILE.log`) show S128 at 725.5us
+  with cap0 and S256 at 809.1us with cap16. S128 is now led by tiny WGMMA NN dX,
+  `ATTN_DKV_WG`, RMS dx, and qk/MLP NT hops, so a focused attention chunk sweep tested
+  nearby `DKV_C/DQ_C` pairs
+  (`mkv3-p4b-attn-c-s128-current-966add6-20260705T0433ATTNC.log`). The broad pass made
+  `4/1` look best (-10.6us, 75/90 wins), but longer confirmation weakened it to -4.2us
+  with p75 above zero and 134/220 wins
+  (`mkv3-p4b-attn-c-s128-c41-confirm-966add6-20260705T0434ATTNC.log`). The conservative
+  `2/2` alternative regressed on confirmation (+7.0us, 66/220 wins:
+  `mkv3-p4b-attn-c-s128-c22-confirm-966add6-20260705T0435ATTNC.log`). S256 guards also
+  rejected `1/1` and `1/2` hard, with `2/2` weakly negative. Keep the current S128/S256
+  `DKV_C=2/DQ_C=1` default.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
