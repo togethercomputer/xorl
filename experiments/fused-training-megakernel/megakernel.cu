@@ -57,6 +57,7 @@ enum Op : int {
   OP_RMSNORM_BWD_DX_FMA = 28,
   OP_SWIGLU_BWD_2W = 29,
   OP_QKV_V_BWD = 30,
+  OP_RMSNORM_BWD_DX_H256 = 31,
 };
 
 __device__ __forceinline__ long long mk_globaltimer() {
@@ -114,6 +115,9 @@ __device__ __forceinline__ void dispatch(const Instr& I, int tile, void** bufs,
       break;
     case OP_RMSNORM_BWD_DX_FMA:
       op_rmsnorm_bwd_dx_fma(I, tile, bufs, smem);
+      break;
+    case OP_RMSNORM_BWD_DX_H256:
+      op_rmsnorm_bwd_dx_h256(I, tile, bufs, smem);
       break;
     case OP_RMSNORM_BWD_DW:
       op_rmsnorm_bwd_dw(I, tile, bufs, smem);

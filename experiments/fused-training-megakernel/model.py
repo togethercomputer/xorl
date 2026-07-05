@@ -68,6 +68,7 @@ _SWIGLU_CACHED_2W = {
 _H256_IDLE32_S = (2048, 3072, 4096, 8192)  # H==256: scheduler idle poll 32ns (else 256)
 _H256_DQ_FLOAT2_S = (3072, 4096, 8192)     # H==256: attention-dQ float2 direct store
 _H256_D64_DKV_ROW_BCAST_S = (8192,)        # H==256/D==64: attention-dKV row scalar shuffles
+_H256_RMS_DX_H256_S = (8192,)              # H==256: fixed-width RMS bwd-dx opcode
 _ATTN_BWD_BAND_T = {2048: 12, 3072: 16, 4096: 29, 8192: 40}  # H==256/D==64; 0 elsewhere
 _ATTN_FWD_BAND_T = {2048: 16, 3072: 32, 4096: 22, 8192: 64}  # H==256/D==64; 0 elsewhere
 _ATTN_BAND_DQ_FIRST_S = (8192,)  # H==256/D==64: dq-first band emission (else lpt)
@@ -332,6 +333,11 @@ class MKQwen3:
             rms_dx_fma_route = c.H == 256 and c.S == 128
         else:
             rms_dx_fma_route = bool(int(rms_dx_fma_route_env)) and c.H == 256 and c.S == 128
+        rms_dx_h256_route_env = os.environ.get("MK_RMS_DX_H256")
+        if rms_dx_h256_route_env is None:
+            rms_dx_h256_route = c.H == 256 and c.S in _H256_RMS_DX_H256_S
+        else:
+            rms_dx_h256_route = bool(int(rms_dx_h256_route_env)) and c.H == 256
         swiglu_bwd_2w_env = os.environ.get("MK_SWIGLU_BWD_2W")
         if swiglu_bwd_2w_env is None:
             swiglu_bwd_2w = self.swiglu_bwd_2w_default
@@ -353,7 +359,9 @@ class MKQwen3:
 
         def rmsnorm_bwd(args):
             if split_rms_bwd:
-                if rms_dx_r4:
+                if rms_dx_h256_route:
+                    p.instr(mk.OP_RMSNORM_BWD_DX_H256, mk.rowop_tiles(args[-1], mk.ROWOP_R2), args)
+                elif rms_dx_r4:
                     p.instr(mk.OP_RMSNORM_BWD_DX_R4, mk.rowop_tiles(args[-1], mk.ROWOP_R4), args)
                 elif rms_dx_fma_route:
                     p.instr(mk.OP_RMSNORM_BWD_DX_FMA, mk.rowop_tiles(args[-1], mk.ROWOP_R2), args)

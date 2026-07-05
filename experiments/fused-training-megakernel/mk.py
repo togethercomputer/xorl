@@ -46,6 +46,7 @@ OP_INV_VALID = 27  # one-tile valid-label count, writes reciprocal for CE
 OP_RMSNORM_BWD_DX_FMA = 28  # H256/S128 RMSNorm dx arithmetic route
 OP_SWIGLU_BWD_2W = 29  # opt-in two-warps-per-row SwiGLU backward route
 OP_QKV_V_BWD = 30  # V-head fp32 workspace -> bf16 raw-grad pass-through
+OP_RMSNORM_BWD_DX_H256 = 31  # H==256 fixed-width dx-only route (env probe)
 
 GEMM_BM, GEMM_BN = 64, 128  # keep in sync with ops.cuh
 FILL_CHUNK = 16384  # elements per fill/cvt work item (MK_CHUNK in ops.cuh)
@@ -330,7 +331,8 @@ def _access_sets(op, args):
         return r, [2, 3]
     if op == OP_RMSNORM_BWD:
         return [0, 1, 2, 5], [3, 4]
-    if op in (OP_RMSNORM_BWD_DX, OP_RMSNORM_BWD_DX_R4, OP_RMSNORM_BWD_DX_FMA):
+    if op in (OP_RMSNORM_BWD_DX, OP_RMSNORM_BWD_DX_R4, OP_RMSNORM_BWD_DX_FMA,
+              OP_RMSNORM_BWD_DX_H256):
         return [0, 1, 2, 5], [3]
     if op == OP_RMSNORM_BWD_DW:
         return [0, 2, 5], [4]
@@ -391,6 +393,7 @@ _ROW_TILE_R = {
     OP_RMSNORM_BWD: ROWOP_R2,
     OP_RMSNORM_BWD_DX: ROWOP_R2,
     OP_RMSNORM_BWD_DX_FMA: ROWOP_R2,
+    OP_RMSNORM_BWD_DX_H256: ROWOP_R2,
     OP_RMSNORM_BWD_DW: ROWOP_R2,
     OP_RMSNORM_BWD_DX_R4: ROWOP_R4,
     OP_SWIGLU_FWD: ROWOP_R,
@@ -412,6 +415,7 @@ _ROW_WRITE_POS = {
     OP_RMSNORM_BWD_DX: (3,),
     OP_RMSNORM_BWD_DX_R4: (3,),
     OP_RMSNORM_BWD_DX_FMA: (3,),
+    OP_RMSNORM_BWD_DX_H256: (3,),
     OP_SWIGLU_FWD: (1, 4),
     OP_SWIGLU_BWD: (2,),
     OP_SWIGLU_BWD_2W: (2,),
@@ -429,6 +433,7 @@ _ROW_READ_POS = {
     OP_RMSNORM_BWD: (0, 2, 5),
     OP_RMSNORM_BWD_DX: (0, 2, 5),
     OP_RMSNORM_BWD_DX_FMA: (0, 2, 5),
+    OP_RMSNORM_BWD_DX_H256: (0, 2, 5),
     OP_RMSNORM_BWD_DW: (0, 2, 5),
     OP_RMSNORM_BWD_DX_R4: (0, 2, 5),
     OP_SWIGLU_FWD: (0,),
@@ -707,7 +712,8 @@ class Program:
         # MK_ROWOP_CLAIM re-runs the experiment.
         rc = int(os.environ.get("MK_ROWOP_CLAIM", "1"))
         _rowops = (OP_RMSNORM_FWD, OP_RMSNORM_BWD, OP_RMSNORM_BWD_DX,
-                   OP_RMSNORM_BWD_DX_FMA, OP_RMSNORM_BWD_DW, OP_RMSNORM_BWD_DX_R4,
+                   OP_RMSNORM_BWD_DX_FMA, OP_RMSNORM_BWD_DX_H256,
+                   OP_RMSNORM_BWD_DW, OP_RMSNORM_BWD_DX_R4,
                    OP_SWIGLU_FWD, OP_SWIGLU_BWD, OP_SWIGLU_BWD_2W,
                    OP_QKNORM_ROPE_FWD, OP_QKNORM_ROPE_BWD, OP_QKV_V_BWD)
         claim = [max(c, rc) if op in _rowops else c

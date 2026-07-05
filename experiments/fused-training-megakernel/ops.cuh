@@ -1404,6 +1404,60 @@ __device__ void op_rmsnorm_bwd_dx_fma(const Instr& I, int tile, void** bufs,
   op_rmsnorm_bwd_dx_impl<true>(I, tile, bufs, smem_raw);
 }
 
+__device__ void op_rmsnorm_bwd_dx_h256(const Instr& I, int tile, void** bufs,
+                                       char* smem_raw) {
+  const int S = I.args[8];
+  const bool dy_f32 = I.args[7] != 0;
+  const int warp = mk_tid() >> 5, lane = mk_tid() & 31;
+  const int rowA = tile * MK_ROW_R2 + warp;
+  if (rowA >= S) return;  // barrier-free op: early exit is safe
+  const bool hasB = rowA + 8 < S;
+  const int rowB = hasB ? rowA + 8 : rowA;
+  constexpr int H = 256;
+  constexpr float invH = 1.0f / H;
+  const int i = lane * 8;
+  const bf16* xb = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
+  const bf16* xA = xb + (int64_t)rowA * H;
+  const bf16* xB = xb + (int64_t)rowB * H;
+  const bf16* w = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
+  const bf16* dybA = reinterpret_cast<const bf16*>(bufs[I.args[2]]) + (int64_t)rowA * H;
+  const float* dyfA = reinterpret_cast<const float*>(bufs[I.args[2]]) + (int64_t)rowA * H;
+  const bf16* dybB = reinterpret_cast<const bf16*>(bufs[I.args[2]]) + (int64_t)rowB * H;
+  const float* dyfB = reinterpret_cast<const float*>(bufs[I.args[2]]) + (int64_t)rowB * H;
+  bf16* dxb = reinterpret_cast<bf16*>(bufs[I.args[3]]);
+  bf16* dxA = dxb + (int64_t)rowA * H;
+  bf16* dxB = dxb + (int64_t)rowB * H;
+  const float rA = reinterpret_cast<const float*>(bufs[I.args[5]])[rowA];
+  const float rB = reinterpret_cast<const float*>(bufs[I.args[5]])[rowB];
+
+  float xa[8], xv[8], da[8], db[8], wv[8];
+  ld8bf(xA + i, xa);
+  ld8bf(xB + i, xv);
+  ld8dy(dybA, dyfA, dy_f32, i, da);
+  ld8dy(dybB, dyfB, dy_f32, i, db);
+  ld8bf(w + i, wv);
+  float dotA = 0.0f, dotB = 0.0f;
+#pragma unroll
+  for (int j = 0; j < 8; j++) {
+    dotA += da[j] * wv[j] * xa[j];
+    dotB += db[j] * wv[j] * xv[j];
+  }
+  const float mA = warp_sum(dotA) * rA * invH;
+  const float mB = warp_sum(dotB) * rB * invH;
+
+  float dxa[8], dxv[8];
+  ld8bf(dxA + i, dxa);
+  ld8bf(dxB + i, dxv);
+#pragma unroll
+  for (int j = 0; j < 8; j++) {
+    const float xhA = xa[j] * rA, xhB = xv[j] * rB;
+    dxa[j] += rA * (da[j] * wv[j] - xhA * mA);
+    dxv[j] += rB * (db[j] * wv[j] - xhB * mB);
+  }
+  st8bf(dxA + i, dxa);
+  if (hasB) st8bf(dxB + i, dxv);
+}
+
 // Split variant: dw-only half. Same reduction/atomic policy as the combined op, but
 // no dx math and no dependency on the residual-gradient buffer.
 __device__ void op_rmsnorm_bwd_dw(const Instr& I, int tile, void** bufs, char* smem_raw) {
