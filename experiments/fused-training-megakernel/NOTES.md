@@ -2526,6 +2526,10 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   default-old timing -2.67us / -14.10us by construction order, combined -8.46us with
   262/320 default wins. `MK_SWIGLU_BWD_2W=0` restores the cached 1W route for A/B;
   nano and H256/S2048 remain off per the earlier broad and S2048 no-go evidence.
+  Post-promotion H256/S1024 profile
+  (`mkv3-p4b-profile-s1024-post-sw2w-2e4a5cb-20260705T1508Z.log`) measured 1208.2us
+  total; the top path is still attention/GEMM led (`ATTN_DKV_WG` 136.0us,
+  `ATTN_FWD_WG` 128.9us, MLP dX 90.5us), with cached `SWIGLU_BWD_2W` at 75.9us.
 
 ## Honest assessment + v2 roadmap
 
