@@ -1476,6 +1476,28 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   Drow WMMA route lost +31.4us with 1/140 wins
   (`mkv3-p4b-drow-small-rmsr2-1ea7e4f-20260705T0324DROW.log`).
 
+- Current-head S256 head-dX split retune: the all-in-one gauntlet
+  (`mkv3-p4b-score-all-current-cf137d6-20260705T0320SCORE.log`) reproduced the old
+  Torch compile recompile-limit pitfall for later S-sweep baseline rows, so use
+  fresh-process rows (`mkv3-p4b-score-s256-current-cf137d6-20260705T0327SCORE.log`,
+  `mkv3-p4b-score-s1024-current-cf137d6-20260705T0327SCORE.log`) and paired A/B for
+  small route deltas. S256 profile
+  (`mkv3-p4b-profile-s256-current-cf137d6-20260705T0329PROFILE.log`) put the
+  split-K `dlogits @ Wlm` hop at the top of the worst-hop list. Smaller
+  `MK_HEAD_DX_TARGET_TILES` values beat the old target192 decisively
+  (`mkv3-p4b-headdx-s256-current-cf137d6-20260705T0332HEADDX.log`: target32/48/64 all
+  about -17us; target256 regressed). Confirmation selected target64 for H256/S256 only:
+  -16.5us paired median with 167/180 wins; S128 target64 was too weak to promote
+  (-4.6us, 68/120), and target64 was slightly better than target32 in direct A/B
+  (`mkv3-p4b-headdx-s256-confirm-cf137d6-20260705T0333HEADDX.log`). Route and
+  correctness passed (`mkv3-p4b-headdx-s256-route-20260705T0334HEADDX.log`,
+  `mkv3-p4b-headdx-s256-parity-20260705T0334HEADDX.log`,
+  `mkv3-p4b-headdx-s256-testmodel-20260705T0334HEADDX.log`). A fresh score row after
+  the change landed at S256 934.5us vs graph+ 559.5us
+  (`mkv3-p4b-score-s256-headdx64-20260705T0335SCORE.log`), but the paired A/B is the
+  stronger evidence because both megakernel and graph+ medians wobble between fresh
+  processes.
+
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
 runs from inductor autotune variance):
@@ -1485,8 +1507,8 @@ runs from inductor autotune variance):
 | small | 3714 | 1899 | 1.96x |
 | deep-L12 | 2522 | 1765 | 1.43x |
 | S=128 | 853 | 486 | 1.76x |
-| S=256 | 915 | 550 | 1.66x |
-| S=1024 | 1338 | 775 | 1.73x |
+| S=256 | 935 | 560 | 1.67x |
+| S=1024 | 1349 | 783 | 1.72x |
 (Morning honest reset: nano 1.97x / small 2.52x.)
 
 ## Honest assessment + v2 roadmap
