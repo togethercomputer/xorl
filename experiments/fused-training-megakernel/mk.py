@@ -675,7 +675,7 @@ class Program:
             depth[i] = 1 + max((depth[j] for j in d), default=0)
         return max(depth, default=0)
 
-    def run(self, ext, smem_bytes=None, wave_clk=None, mode="df"):
+    def run(self, ext, smem_bytes=None, wave_clk=None, mode="df", bind_bufs=None):
         if smem_bytes is None:
             # Default ops fit in 100KB. The measured-negative MK_ATTN_PIPE artifact
             # needs 112KB, so only that opt-in build takes the larger carveout.
@@ -718,6 +718,11 @@ class Program:
                 wave_clk,
             )
         else:
+            if bind_bufs:
+                (bind0, tensor0), (bind1, tensor1) = bind_bufs
+                bind_args = (bind0, tensor0.data_ptr(), bind1, tensor1.data_ptr())
+            else:
+                bind_args = (-1, 0, -1, 0)
             ext.run_df(
                 self._instrs,
                 self._dep_cnt,
@@ -733,6 +738,7 @@ class Program:
                 self._buftab,
                 smem_bytes,
                 wave_clk,
+                *bind_args,
             )
 
 

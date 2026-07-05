@@ -1740,6 +1740,18 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   by +8.8us, with wall-time medians also positive. Keep the simple token/label copies
   unless a C++ launcher-side pointer override is implemented and remeasured.
 
+- Launcher-side input binding: the C++/kernel-side version of the previous idea is
+  promoted. `megakernel_df` now accepts two optional buftab pointer overrides and writes
+  them before the existing initialization sync; default `MKQwen3.step()` binds canonical
+  CUDA int32 token/label inputs in df mode, records their stream lifetime, and falls
+  back to the internal-copy path for alternate executors or non-canonical inputs
+  (`MK_BIND_INPUTS=0` restores the old copy path). Full model validation passed
+  (`mkv3-p4b-bindinputs-testmodel-final-20260705T0458BIND.log`). Fixed old-copy vs
+  new-bind paired timing (`mkv3-p4b-bindinputs-step-ab-fixed-20260705T0457BIND.log`)
+  measured S128 -12.6us (199/200 wins), nano -11.7us (197/200), H256/S1024 -12.3us
+  (185/200), and small -22.5us (198/200). This is a user-visible `step()` win only;
+  `prog.run()` profiles are unchanged.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

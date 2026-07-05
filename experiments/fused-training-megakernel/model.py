@@ -139,6 +139,8 @@ class MKQwen3:
         self.cos, self.sin = rope_tables(c, dev)
         self.ext = mk.load_ext()
         self.in_kernel_inv_valid = bool(int(os.environ.get("MK_INV_VALID_IN_KERNEL", "1")))
+        self.bind_inputs = bool(int(os.environ.get("MK_BIND_INPUTS", "1")))
+        self._inputs_bound_external = False
         self._build_program()
 
     # ------------------------------------------------------------------ #
@@ -242,11 +244,15 @@ class MKQwen3:
 
         X = [B(A["X"][l]) for l in range(c.L + 1)]
         n_qt = (c.S + 31) // 32
+        tokens_buf = B(self.tokens)
+        labels_buf = B(self.labels)
+        self._tokens_buf = tokens_buf
+        self._labels_buf = labels_buf
 
         # ---- wave 0: embedding gather + zero every fp32 grad / loss / dX stream ----
-        p.instr(mk.OP_EMBED_FWD, c.S, [B(self.tokens), B(self.params["emb"]), X[0], c.H])
+        p.instr(mk.OP_EMBED_FWD, c.S, [tokens_buf, B(self.params["emb"]), X[0], c.H])
         if self.in_kernel_inv_valid:
-            p.instr(mk.OP_INV_VALID, 1, [B(self.labels), B(self.inv_valid), c.S])
+            p.instr(mk.OP_INV_VALID, 1, [labels_buf, B(self.inv_valid), c.S])
         for g in self.grads.values():
             fill_zero(g)
         fill_zero(self.loss)
@@ -377,19 +383,19 @@ class MKQwen3:
             p.instr(
                 mk.OP_CE_FWD,
                 c.S,
-                [B(A["logits"]), B(self.labels), B(A["lse_ce"]), B(self.loss), B(self.inv_valid), c.V,
+                [B(A["logits"]), labels_buf, B(A["lse_ce"]), B(self.loss), B(self.inv_valid), c.V,
                  B(W["lse_parts"]), c.V // 64],
             )
         else:
             gemm(B(A["xnf"]), B(self.params["wlm"]), B(A["logits"]), c.S, c.V, c.H, 2)
             p.wave()
             p.instr(
-                mk.OP_CE_FWD, c.S, [B(A["logits"]), B(self.labels), B(A["lse_ce"]), B(self.loss), B(self.inv_valid), c.V]
+                mk.OP_CE_FWD, c.S, [B(A["logits"]), labels_buf, B(A["lse_ce"]), B(self.loss), B(self.inv_valid), c.V]
             )
         p.wave()
 
         # ---- backward ----
-        p.instr(mk.OP_CE_BWD, c.S, [B(A["logits"]), B(self.labels), B(A["lse_ce"]), B(self.inv_valid), c.V])
+        p.instr(mk.OP_CE_BWD, c.S, [B(A["logits"]), labels_buf, B(A["lse_ce"]), B(self.inv_valid), c.V])
         p.wave()
         # dXN = dlogits @ Wlm has K=V (huge) but few output tiles: split-K into the fp32
         # workspace (atomic accumulate), then convert. dWlm splits via the gemm helper.
@@ -556,9 +562,42 @@ class MKQwen3:
     # ------------------------------------------------------------------ #
     def step(self, tokens: torch.Tensor, labels: torch.Tensor, mode="df") -> torch.Tensor:
         """One fused fwd+bwd. Returns the (device) loss scalar; grads are in self.grads."""
-        self.tokens.copy_(tokens)
-        self.labels.copy_(labels)
-        if not self.in_kernel_inv_valid:
-            self.inv_valid.copy_(1.0 / (labels >= 0).sum().clamp(min=1).float().reshape(1))
-        self.prog.run(self.ext, mode=mode)
+        bind_inputs = (
+            self.bind_inputs
+            and mode == "df"
+            and tokens.is_cuda
+            and labels.is_cuda
+            and tokens.device == self.tokens.device
+            and labels.device == self.labels.device
+            and tokens.is_contiguous()
+            and labels.is_contiguous()
+            and tokens.dtype == torch.int32
+            and labels.dtype == torch.int32
+            and tuple(tokens.shape) == (self.cfg.S,)
+            and tuple(labels.shape) == (self.cfg.S,)
+        )
+        if bind_inputs:
+            if not self.in_kernel_inv_valid:
+                self.inv_valid.copy_(1.0 / (labels >= 0).sum().clamp(min=1).float().reshape(1))
+            self.prog.run(
+                self.ext,
+                mode=mode,
+                bind_bufs=((self._tokens_buf, tokens), (self._labels_buf, labels)),
+            )
+            stream = torch.cuda.current_stream(tokens.device)
+            tokens.record_stream(stream)
+            labels.record_stream(stream)
+            self._inputs_bound_external = True
+        else:
+            # Alternate executors and non-canonical inputs use the original internal
+            # buffers. Restore their buftab entries in case a prior df bind changed them.
+            if self._inputs_bound_external:
+                self.prog._buftab[self._tokens_buf] = self.tokens.data_ptr()
+                self.prog._buftab[self._labels_buf] = self.labels.data_ptr()
+                self._inputs_bound_external = False
+            self.tokens.copy_(tokens)
+            self.labels.copy_(labels)
+            if not self.in_kernel_inv_valid:
+                self.inv_valid.copy_(1.0 / (labels >= 0).sum().clamp(min=1).float().reshape(1))
+            self.prog.run(self.ext, mode=mode)
         return self.loss

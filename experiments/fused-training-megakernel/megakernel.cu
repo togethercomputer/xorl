@@ -221,9 +221,15 @@ extern "C" __global__ void MK_LB megakernel_df(const Instr* __restrict__ instrs,
                                          const int* __restrict__ claim_sz,
                                          const int* __restrict__ crit, int cold_cap,
                                          int* state, void** bufs,
-                                         long long* iclk /* nullable [2*n] */) {
+                                         long long* iclk /* nullable [2*n] */,
+                                         int bind0, unsigned long long ptr0,
+                                         int bind1, unsigned long long ptr1) {
   extern __shared__ char smem[];
   cg::grid_group grid = cg::this_grid();
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    if (bind0 >= 0) bufs[bind0] = reinterpret_cast<void*>(ptr0);
+    if (bind1 >= 0) bufs[bind1] = reinterpret_cast<void*>(ptr1);
+  }
   int* pending = state;
   int* cursor = state + n_instr;
   int* done = state + 2 * n_instr;
@@ -1002,7 +1008,8 @@ int64_t mk_nblocks() { return g_nblocks; }
 void mk_run_df(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_off,
                torch::Tensor adj, torch::Tensor claim_sz, torch::Tensor crit,
                int64_t cold_cap64, torch::Tensor state, torch::Tensor bufs,
-               int64_t smem_bytes, c10::optional<torch::Tensor> iclk) {
+               int64_t smem_bytes, c10::optional<torch::Tensor> iclk,
+               int64_t bind0_64, int64_t ptr0_64, int64_t bind1_64, int64_t ptr1_64) {
   TORCH_CHECK(instrs.is_cuda() && instrs.dtype() == torch::kInt32);
   const int n_instr = (int)(instrs.numel() / (3 + MK_MAX_ARGS));
   TORCH_CHECK(state.numel() >= 5 * (int64_t)n_instr + 8, "df state tensor too small");
@@ -1037,9 +1044,14 @@ void mk_run_df(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_of
   void** d_bufs = reinterpret_cast<void**>(bufs.data_ptr<int64_t>());
   long long* d_clk =
       iclk.has_value() ? reinterpret_cast<long long*>(iclk->data_ptr<int64_t>()) : nullptr;
+  int bind0 = (int)bind0_64;
+  int bind1 = (int)bind1_64;
+  unsigned long long ptr0 = (unsigned long long)ptr0_64;
+  unsigned long long ptr1 = (unsigned long long)ptr1_64;
   void* args[] = {(void*)&d_instrs, (void*)&n_instr, (void*)&d_dc,    (void*)&d_ao,
                   (void*)&d_ad,     (void*)&d_cs,    (void*)&d_cr,    (void*)&cold_cap,
-                  (void*)&d_state,  (void*)&d_bufs,  (void*)&d_clk};
+                  (void*)&d_state,  (void*)&d_bufs,  (void*)&d_clk,   (void*)&bind0,
+                  (void*)&ptr0,     (void*)&bind1,   (void*)&ptr1};
   auto stream = at::cuda::getCurrentCUDAStream();
   C10_CUDA_CHECK(cudaLaunchCooperativeKernel((void*)megakernel_df, dim3(df_nblocks),
                                              dim3(256), args, (size_t)smem_bytes,
