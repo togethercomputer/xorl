@@ -2030,6 +2030,13 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   -36.00us, and H256/S2048 -65.95us median. S128 and D128 in that final matrix are
   same-extension controls, not changed code paths.
 
+- Post-lm-head-exp2 scoreboard: `mkv3-p4b-score-both-400dc74-20260705T0849Z.log`
+  measured nano at 905.2us megakernel vs 632.2us compile+CUDAGraph+ (1.43x gap) and
+  small at 3542.8us megakernel vs 1912.9us compile+CUDAGraph+ (1.85x gap). Relative to
+  the clean post-attention-exp2 rows, `_lex2` trims about 21us nano and about 44us
+  small on the standard bench path; the remaining small gap is still mostly
+  attention/GEMM/SwiGLU/RMS op quality rather than CE materialization.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
