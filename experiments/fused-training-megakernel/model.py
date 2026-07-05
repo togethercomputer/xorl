@@ -170,7 +170,7 @@ class MKQwen3:
         self.ce_bwd_exp2_approx_default = c.S >= 1024 and c.V >= 8192 and c.V % 8 == 0
         self.idle_ns_default = 32 if c.H == 256 and c.S in (3072, 4096) else 256
         self.attn_dkv_float2_atomic_default = c.D == 64 and c.S % 128 == 0
-        self.attn_dq_float2_store_default = c.H == 256 and c.S in (3072, 4096)
+        self.attn_dq_float2_store_default = c.H == 256 and c.S in (3072, 4096, 8192)
         self.ext = mk.load_ext(
             swiglu_bwd_2w=self.swiglu_bwd_2w_default,
             swiglu_cache_sig=self.swiglu_cache_sig_enabled,

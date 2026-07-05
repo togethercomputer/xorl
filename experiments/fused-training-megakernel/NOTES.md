@@ -2740,6 +2740,17 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   comparison `mkv3-p4b-attndq-float2-store-gradcheck-20260705T1559Z.log` matched the
   old path to fp32-noise: worst grad rel was 7.61e-7 for S3072 and 1.20e-6 for S4096.
 
+- H256/S8192 attention-dQ `float2` direct-store promotion, but no broad Cq=1 widening:
+  after DKV-float2 made S8192 even more dQ-led, env-only expansion
+  `mkv3-p4b-attndq-float2-cq1-expand-probe-20260705T1717Z.log` tested Cq=1 shapes.
+  S8192 was strongly positive (-32.53us, 12/12 wins; worst grad rel 9.2e-7), but S256
+  rejected (+3.90us, 28/120 wins) and small was too weak (-5.33us, 29/48). S128 looked
+  positive in the env probe (-12.06us, 158/160), but the clean promoted-default repeat
+  `mkv3-p4b-attndq-float2-cq1-promote-20260705T1725Z.log` refuted it (+1.18us, 66/160
+  wins). The same clean repeat kept S8192 positive (-29.92us, 10/12 wins). Final route
+  `mkv3-p4b-attndq-float2-cq1-final-route-20260705T1727Z.log` confirms `_adqf2` only
+  for H256/S3072, S4096, and S8192; S128/S256/small stay on the scalar dQ store.
+
 - Post-attention-dQ-float2 profile/score refresh at `665d8cc`: profile
   `mkv3-p4b-profile-long-post-dqf2-665d8cc-20260705T1602Z.log` confirms S3072/S4096
   use both `_idle32` and `_adqf2`. S3072 measured 2608.1us total (76 hops, 203.6us
