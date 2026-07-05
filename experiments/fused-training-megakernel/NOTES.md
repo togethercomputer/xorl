@@ -2385,6 +2385,17 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   only 34/320 wins). The temporary main-tree promotion was reverted; keep the current
   CE fwd/bwd opcodes unchanged.
 
+- Current-head SSQ epilogue recheck no-change: an env-only `MK_SSQ_FUSE=0` recheck on
+  GPU 5 tested whether disabling WGMMA sum-of-squares epilogues still helps after the
+  late route retunes (`mkv3-p4b-ssq-current-bf2934c-20260705T1915Z.log`). Nano was
+  noise-level (-0.85us off-default median, 83/160 off wins), and small was
+  construction-order-sensitive/no-promote (default-first -13.36us, off-first +5.31us,
+  combined -2.64us with 64/120 off wins). H256/S1024 initially looked consistent
+  (-4.96us, 110/140 off wins), but the focused confirmation refuted it
+  (`mkv3-p4b-ssq-s1024-confirm-bf2934c-20260705T1930Z.log`): default-first favored
+  SSQ-off by -11.81us while off-first reversed to +12.48us, combined +1.97us with only
+  191/400 off wins. Keep `MK_SSQ_FUSE=1` default-on.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
