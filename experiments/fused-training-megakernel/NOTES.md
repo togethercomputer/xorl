@@ -3111,6 +3111,30 @@ round-trip costs ~2x error on the tiny qk-norm grads. The default gates
 (S >= 2048) avoid the config; if fwd bands are ever gated at short S, budget
 tolerance or store partials fp32.
 
+## v3 P4b post-band knob rechecks (session 2853e0de): one flip, one hold
+
+Structural changes invalidate old knob verdicts — two env-only rechecks after
+the banding round (`mkv3-p4b-postband-knob-recheck-20260705T185629Z.log`):
+
+- **SwiGLU cached 2W at H256/S8192 FLIPPED and is PROMOTED** (commit `da7e525`):
+  pre-band it was rejected (+47.5us, 20260705T1608Z); post-band it wins
+  -111.9/-128.3us with 16/16 both construction orders (parity worst rel 0.0087).
+  Promoted-default vs forced-old validation
+  (`mkv3-p4b-sw2w-s8192-promote-20260705T190224Z-class.log`): +128.8/+116.0us
+  for the default, 0/16 for old, test_model green. The banding round rebalanced
+  SM occupancy in exactly the window where the S8192 SwiGLU bwd sits (300.9us
+  on-path in the post-compose profile). S8192 megakernel is now ~7246us
+  (day start 8395: -13.7%). Gates: `swiglu_cache_sig_default` and
+  `swiglu_bwd_2w_default` each gained the exact H256/S8192/I768 shape.
+- **RMS dx R4 at H256/S4096 HOLDS negative** post-band: +5.6/+8.1us with the R4
+  variant winning only 11/40 in each order (parity clean). The 1.94-wave R2
+  quantization hypothesis did not pay; keep R2. (S4096 absolutes in this
+  recheck: ~3151us after the peer's T=29 band-budget retune.)
+
+Lesson worth keeping: re-run the cheap env knob sweeps after every structural
+scheduling change — this flip was worth 11x the average recent promotion and
+cost two A/B runs to find.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
