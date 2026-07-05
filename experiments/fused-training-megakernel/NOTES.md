@@ -3385,6 +3385,23 @@ bwd 279.8us, and swiglu bwd 278.8us. Conclusion: the row-broadcast win is real
 but small; the next long-S work should attack DKV dependency/wait structure or
 attention-rowop fusion, not scalar-load cleanup.
 
+S8192 H256 RMSNorm bwd-dx fixed-width route: commit `f54b4dd` adds
+`OP_RMSNORM_BWD_DX_H256`, a two-row-per-warp dx-only body specialized for H=256
+(no runtime H loop/divide), and gates it only for exact H256/S8192 via
+`_H256_RMS_DX_H256_S`. `MK_RMS_DX_H256=1/0` still force-enables/restores the old
+route for A/B. Route/parity
+(`mkv3-p4b-rmsdx-h256-route-parity-20260705T2152Z.log`) passed: forced route
+emits nine H256 dx instructions and zero old dx-route opcodes at S512/S4096/S8192;
+`test_model` passed under the forced route (S512 worst grad rel 0.0281,
+D128-ragged 0.0201, rerun/waves/df2/ws and SGD sanity clean). Timing
+(`mkv3-p4b-rmsdx-h256-ab-20260705T2158Z.log`) rejected S4096 as order-mixed
+(-16.45us default-first, +1.23us variant-first) but promoted S8192 (-25.10us and
+-43.33us, 16/16 wins both orders). Promoted-default confirmation
+(`mkv3-p4b-rmsdx-h256-promoted-default-20260705T2201Z.log`) proved S4096 remains
+old R2 (`h256=0 r2=9`) while S8192 uses the new opcode (`h256=9 r2=0`), and
+forced-old `MK_RMS_DX_H256=0` was slower by +23.33us/+26.99us old-minus-new with
+parity clean. Do not widen to S4096 without a fresh post-composition recheck.
+
 ## v3 P4b knob consolidation (session 2853e0de): one tuning table, routes verified
 
 The secondary lane from the /goal: model.py's ~12 scattered per-shape gate
