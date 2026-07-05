@@ -2612,6 +2612,14 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   orders: +50.88us and +45.22us variant-default, combined +47.47us with only 10/40
   variant wins. Keep the cached-2W default capped at H256/S4096.
 
+- Current-head H256/S2048 attention DQ over-split no-change: after the cached-2W
+  promotion, S2048's profile was attention-dQ led, so an env-only retest tried higher
+  `MK_ATTN_DQ_C` around the current `DKV_C=2/DQ_C=2` default. Route/parity/timing
+  (`mkv3-p4b-s2048-attn-dqsplit-current-20260705T1615Z.log`) kept the existing gate:
+  `2/3` regressed +67.41us with 0/160 wins, `2/4` regressed +62.40us with 0/160 wins,
+  and `1/3` regressed +46.82us with 0/160 wins. Keep H256/S2048 attention chunks at
+  `DKV_C=2/DQ_C=2`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
