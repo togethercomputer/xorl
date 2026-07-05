@@ -168,6 +168,7 @@ class MKQwen3:
         self.attn_exp2_approx_default = c.D == 64 and c.S >= 512 and c.S % 128 == 0
         self.lmhead_exp2_approx_default = c.V >= 8192 and c.V % 64 == 0 and c.S >= 256
         self.ce_bwd_exp2_approx_default = c.S >= 1024 and c.V >= 8192 and c.V % 8 == 0
+        self.idle_ns_default = 32 if c.H == 256 and c.S in (3072, 4096) else 256
         self.ext = mk.load_ext(
             swiglu_bwd_2w=self.swiglu_bwd_2w_default,
             swiglu_cache_sig=self.swiglu_cache_sig_enabled,
@@ -175,6 +176,7 @@ class MKQwen3:
             attn_exp2_approx=self.attn_exp2_approx_default,
             lmhead_exp2_approx=self.lmhead_exp2_approx_default,
             ce_bwd_exp2_approx=self.ce_bwd_exp2_approx_default,
+            idle_ns=self.idle_ns_default,
         )
         self.in_kernel_inv_valid = bool(int(os.environ.get("MK_INV_VALID_IN_KERNEL", "1")))
         self.bind_inputs = bool(int(os.environ.get("MK_BIND_INPUTS", "1")))

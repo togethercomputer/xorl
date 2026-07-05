@@ -2697,6 +2697,22 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   megakernel 3341.7us vs compile+CUDAGraph+ 1569.5us (2.13x gap). The next long-shape
   bottleneck remains attention-dQ, not head-dX.
 
+- H256/S3072 and H256/S4096 scheduler idle-poll cadence promotion: the existing
+  `MK_IDLE_NS` constant is now exposed as an extension build knob, with the model
+  default set to 32ns only for H256/S3072 and H256/S4096; `MK_IDLE_NS=256` forces the
+  old cadence. Paired env sweep
+  `mkv3-p4b-idle-ns-long-probe-20260705T1537Z.log` tested 128/64/32ns against the old
+  256ns. S3072 favored faster polling, with idle64 -12.32us (46/48 wins) and idle32
+  -11.06us (45/48 wins). S4096 favored idle32, -11.20us with 40/40 wins. The S8192
+  boundary is explicitly not promoted: `mkv3-p4b-idle-ns-s8192-boundary-20260705T1543Z.log`
+  was only weakly positive for env idle32 (-10.14us, 20/24 wins), and clean
+  promoted-default validation `mkv3-p4b-idle32-long-promote-20260705T1545Z.log`
+  rejected it (+13.22us default-old median, 1/16 wins). That same clean validation
+  kept the exact promoted shapes positive: S3072 -6.93us (33/40 wins) and S4096
+  -5.89us (28/36 wins). Route checks confirmed S2048/S8192 stay on the old build and
+  S3072/S4096 pick `_idle32`; `mkv3-p4b-idle32-testmodel-20260705T1546Z.log` passed
+  full `test_model.py`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
