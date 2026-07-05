@@ -3508,6 +3508,38 @@ straggler cliff again), idle32 confirmed (idle64 +1.6/+5.8, 7-8/16). The two
 op-specializations changed spans but not the band/idle optima; the resweep law
 is satisfied for this regime shift with no changes.
 
+## v3 P4b operator-gap GEMM lane: deep SW128 stages are a no-go under global smem
+
+The operator-gap report's first GEMM recommendation was tested by extending
+`pipe_probe.py` with SW128 S6/S8/S9 long-K variants and a `longdx` mode. The
+standalone result is real but too small for the current executor's global smem
+page. Repeat log `mkv3-p4b-pipe-longdx-deepstage-repeat-20260705T2218Z.log`
+showed S8 as the best deep variant versus current S2 SW128:
+
+- `8192x256x8192` NN: 187.4us -> 175.8us.
+- `8192x256x1536` NN: 44.3us -> 42.9us.
+- `1024x512x3072` NN: 43.1us -> 41.5us, but production small uses the n128
+  route for this shape, so this is only a m64n64 reference point.
+
+Focused head-dX slice/full-shape probes
+(`mkv3-p4b-pipe-headdx-deepstage-20260705T2224Z.log`) found similar small wins:
+S1024 split slice `1024x256x4096` 53.6us -> 51.7us, S2048
+`2048x256x8192` 95.8us -> 91.2us, S4096 `4096x256x8192` 96.2us -> 91.8us, and
+nano slice `512x256x4096` 53.6us -> 51.3us. S9 was consistently slower than S8.
+
+The integration blocker is that an S8 128x64 ring needs a 208KB dynamic-smem
+request for the whole cooperative megakernel launch. Current-code smem controls
+with no deep route measured the cost directly:
+`mkv3-p4b-smem208-control-20260705T2220Z.log` gave nano +6.1us, H256/S1024
++11.9us, and small +42.2us; `mkv3-p4b-smem208-long-control-20260705T2225Z.log`
+gave S2048 +2.4us, S4096 +67.2us, and S8192 +94.9us. Those costs dominate the
+per-GEMM S8 win at every candidate shape, especially the long shapes where the
+global page perturbation is largest. Do not promote a default route by simply
+setting a new WGMMA flag and bumping `Program.run()` smem. Revisit only if the
+executor grows a per-op big-smem page, a separate deep-GEMM kernel, or a
+warp-specialized producer/consumer variant that can amortize the page without
+changing the whole step.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

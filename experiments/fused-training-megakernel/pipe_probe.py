@@ -11,6 +11,7 @@ standalone persistent kernel and parametrizes <STAGES, MMAS_IN_FLIGHT>:
   B4 (4,0)  = deepest feed (96KB smem), draining mma
   P3 (3,1)  = 1 mma batch in flight across the sync, lead 1
   P4 (4,1)  = 1 mma batch in flight, lead 2  <- the cutlass sm90 mainloop shape
+  D6/D8/D9  = SW128 long-K probes with 6/8/9 cp.async stages (large smem page)
 
 Load lead L = STAGES-1-W (max safe: stage reuse needs mma[t+L-S] retired, wait<W>
 retires mma[t-W] at end of iter t). All variants: 132 blocks x 256 threads, 1
@@ -18,7 +19,7 @@ block/SM (smem-forced), in-model claim quantum, NT and NN majors, bf16 store
 epilogue staged through smem. Gate for the round: >=1.5x variant A on the small
 NT shapes.
 
-Run: CUDA_VISIBLE_DEVICES=<idle> .venv-fa4/bin/python pipe_probe.py [quick|full]
+Run: CUDA_VISIBLE_DEVICES=<idle> .venv-fa4/bin/python pipe_probe.py [quick|full|longdx] [iters]
 """
 
 import statistics
@@ -26,6 +27,7 @@ import sys
 
 import torch
 from torch.utils.cpp_extension import load_inline
+
 
 CUTE_INC = "/home/apanda/xorl-internal/.venv/lib/python3.12/site-packages/deep_gemm/include"
 
@@ -278,7 +280,10 @@ void run_gemm(torch::Tensor A, torch::Tensor B, torch::Tensor C, int64_t M, int6
   const bf16* b = reinterpret_cast<const bf16*>(B.data_ptr());
   bf16* c = reinterpret_cast<bf16*>(C.data_ptr());
   int* cur = cursor.data_ptr<int>();
-  const int smem = 100 * 1024;  // force 1 block/SM for every variant (in-model regime)
+  int smem = 100 * 1024;  // old variants keep the in-model smem regime
+  if (variant == 8) smem = 160 * 1024;
+  if (variant == 9) smem = 208 * 1024;
+  if (variant == 10) smem = 224 * 1024;
   auto launch = [&](auto kern) {
     static_assert(sizeof(Stage) == 24 * 1024, "stage layout");
     cudaFuncSetAttribute((const void*)kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
@@ -294,6 +299,9 @@ void run_gemm(torch::Tensor A, torch::Tensor B, torch::Tensor C, int64_t M, int6
     case 5: launch(gemm_pipe<2, 0, 1>); break;
     case 6: launch(gemm_pipe<3, 1, 1>); break;
     case 7: launch(gemm_pipe<4, 1, 1>); break;
+    case 8: launch(gemm_pipe<6, 1, 1>); break;
+    case 9: launch(gemm_pipe<8, 1, 1>); break;
+    case 10: launch(gemm_pipe<9, 1, 1>); break;
     default: TORCH_CHECK(false, "bad variant");
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -302,7 +310,10 @@ void run_gemm(torch::Tensor A, torch::Tensor B, torch::Tensor C, int64_t M, int6
 
 cpp_src = "void run_gemm(torch::Tensor A, torch::Tensor B, torch::Tensor C, int64_t M, int64_t N, int64_t K, int64_t flags, int64_t claim_sz, torch::Tensor cursor, int64_t variant, int64_t nblocks);"
 
-VARIANTS = ["S2W0(cur)", "S3W0", "S4W0", "S3W1", "S4W1", "S2W0-sw", "S3W1-sw", "S4W1-sw"]
+VARIANTS = [
+    "S2W0(cur)", "S3W0", "S4W0", "S3W1", "S4W1", "S2W0-sw", "S3W1-sw", "S4W1-sw",
+    "S6W1-sw", "S8W1-sw", "S9W1-sw",
+]
 
 
 def build():
@@ -361,6 +372,7 @@ def bench_shape(ext, M, N, K, a_t, b_t, iters=30, nblocks=132):
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "full"
+    iters = int(sys.argv[2]) if len(sys.argv) > 2 else (16 if mode == "longdx" else 30)
     torch.cuda.set_device(0)
     ext = build()
     print("built ok")
@@ -378,11 +390,17 @@ if __name__ == "__main__":
     ]
     if mode == "quick":
         shapes = shapes[:2]
+    elif mode == "longdx":
+        shapes = [
+            ("s8192 NN lm_head_dx 8192x256x8192", 8192, 256, 8192, False, False),
+            ("s8192 NN mlp_dx     8192x256x1536", 8192, 256, 1536, False, False),
+            ("small NN mlp_dx     1024x512x3072", 1024, 512, 3072, False, False),
+        ]
 
     hdr = "shape".ljust(34) + "".join(v.rjust(18) for v in VARIANTS)
     print(hdr)
     for label, M, N, K, a_t, b_t in shapes:
-        r = bench_shape(ext, M, N, K, a_t, b_t)
+        r = bench_shape(ext, M, N, K, a_t, b_t, iters=iters)
         row = label.ljust(34)
         for v in VARIANTS:
             us, tf = r[v]
