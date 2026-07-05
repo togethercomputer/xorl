@@ -2329,6 +2329,18 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   WMMA split-K route unless a future clean repeat overturns this large negative result;
   n128 split-K is only promoted for head-dX.
 
+- Current-head attention chunk resweep no-change: after the nano head-dX n128 split
+  promotion, an env-only GPU 5 sweep rechecked nearby `MK_ATTN_DKV_C` /
+  `MK_ATTN_DQ_C` values on the current head
+  (`mkv3-p4b-attn-c-current-53f8233-20260705T1710Z.log`). Route inspection confirmed
+  nano default remains `DKV_C=2/DQ_C=2` and small default remains `DKV_C=1/DQ_C=1`.
+  Nano `C=1/1` and `1/2` lost hard (+29.32us and +33.26us median), while `2/1` and
+  `3/2` were construction-order-biased/neutral (+2.00us and +0.30us overall median).
+  Small over-split variants all regressed: `2/1` +63.72us median, `1/2` +20.32us,
+  `2/2` +63.90us, and `3/1` +63.66us. Keep the current attention chunk gates. GPU 5
+  had no pmon/compute-app process before and after, but did have resident memory; since
+  no candidate was positive, no repeat is needed.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
