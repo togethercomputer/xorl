@@ -3742,6 +3742,14 @@ gradient rel diffs were below `5.9e-7`, and paired medians were
 `mkv3-p4b-qwen-dwtn-n256-prod-testmodel-20260705T2342Z.log` and
 `mkv3-p4b-qwen-dwtn-n256-prod-testops-20260705T2344Z.log`.
 
+Post-dW route interaction resweep kept the existing qwen n256 head routes. Head-dX
+n256 still beat forced old `MK_HEAD_DX_N256_F32=0` by `504.5us` median with `16/16`
+wins (`mkv3-p4b-qwen-post-dwtn-route-interactions-20260706T0000Z.log`). The first
+process OOMed before the lm-head half due to resident qwen model count, so the fresh
+lm-head rerun `mkv3-p4b-qwen-post-dwtn-lmhead-route-20260706T0001Z.log` checked
+`MK_WGMMA_N256_DIRECT=0` separately and kept default n256 by `862.0us` median with
+`16/16` wins.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
