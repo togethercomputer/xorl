@@ -3357,6 +3357,31 @@ default (promoted vs R=1 only) is CONFIRMED against its neighbors. R=4 loses
 (S4096 -2.5/-0.2 at 31/40 and 24/40; S8192 +4.3/-10.8) — under the promotion
 bar; keep `MK_ATTN_COMBINE_R=8`.
 
+## v3 P4b knob consolidation (session 2853e0de): one tuning table, routes verified
+
+The secondary lane from the /goal: model.py's ~12 scattered per-shape gate
+expressions are consolidated (commit `56ab960`) into one module-level "measured
+per-shape tuning" section: `_SWIGLU_CACHED_2W` (drives both cache-sig and 2W
+defaults), `_H256_IDLE32_S`, `_H256_DQ_FLOAT2_S`, `_ATTN_BWD_BAND_T`,
+`_ATTN_FWD_BAND_T`, `_ATTN_BAND_DQ_FIRST_S`, `_H256_D64_QKBWD_SPLIT_V_S`,
+`_H256_ATTN_CHUNKS`, `_HEAD_DX_TARGET`, and `_cold_cap()`. Each knob keeps the
+exact gate dimensionality it was measured under (keys deliberately differ —
+collapsing them onto one (H, S) key would change semantics off-gauntlet), so
+this is a pure relocation. Formula gates (drow direct store, the exp2 family,
+dkv float2, dx_split_k tile gates) stay inline: they are shape math, not tuned
+constants. Env overrides unchanged.
+
+VERIFIED route-preserving: `results/route_snapshot.py` (knob-consol worktree)
+hashes the instruction stream, claim/crit vectors, dep counts, adjacency, and
+cold cap per shape; old-vs-new model.py compared IDENTICAL on all 11 gauntlet
+shapes (nano, deep-L12, S128, S256, S1024, S2048, S3072, S4096, S8192, small,
+D128-ragged) — `results/mkv3-p4b-knob-consol-verify-20260705T204708Z.log`.
+Retunes now edit one table line instead of a scattered expression, which also
+cuts the cross-session model.py merge conflicts that recurred all day.
+Operational note for the snapshot harness: a killed extension build leaves a
+stale `<extdir>/<name>/lock` that silently wedges the NEXT build — the
+symptom is a snapshot process alive with zero output; delete the lock file.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
