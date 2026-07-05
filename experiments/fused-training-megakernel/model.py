@@ -80,6 +80,13 @@ _H256_ATTN_CHUNKS = {512: (2, 2), 1024: (2, 2), 2048: (2, 2)}
 # non-WGMMA D=128 fallback DQ chunks; exact attention-shape gate from qwen4b-l1.
 _D128_GENERIC_DQ_C1 = {(2560, 1024, 32, 8)}  # (H, S, nq, nkv); D==128
 _QWEN_L1_HEAD_DX_N128_F32 = {(2560, 1024, 151936, 32, 8, 128, 1)}  # H,S,V,nq,nkv,D,L
+_QWEN_L1_DW_NO_ATOMIC_SK1 = {  # M,N,K for qwen4b-l1 dW GEMMs that split-K computes as sk=1
+    (151936, 2560, 1024),  # wlm
+    (2560, 9728, 1024),    # wd
+    (19456, 2560, 1024),   # wgu
+    (2560, 4096, 1024),    # wo
+    (6144, 2560, 1024),    # wqkv
+}
 # dlogits @ Wlm split-K tile targets: {H: {S: target}}, 192 elsewhere.
 _HEAD_DX_TARGET = {256: {128: 32, 256: 64, 1024: 64, 512: 96, 2048: 96, 3072: 96},
                    512: {1024: 96}}
@@ -309,6 +316,18 @@ class MKQwen3:
             if flags & 8 and flags & 4:  # fp32 accumulating dW: split-K for occupancy
                 if mk.wgmma_ok(M, N, K, flags):
                     sk = mk.wgmma_split_k(M, N, K)
+                    no_atomic_env = os.environ.get("MK_DW_NO_ATOMIC_SK1")
+                    if no_atomic_env is None:
+                        no_atomic_sk1 = (M, N, K) in _QWEN_L1_DW_NO_ATOMIC_SK1
+                    else:
+                        no_atomic_sk1 = bool(int(no_atomic_env))
+                    if no_atomic_sk1 and sk == 1:
+                        p.instr(
+                            mk.OP_GEMM,
+                            mk.gemm_tiles_wgmma(M, N),
+                            [a, b, out, M, N, K, ((flags | 128) & ~(4 | 32)), res],
+                        )
+                        return False
                     p.instr(
                         mk.OP_GEMM,
                         mk.gemm_tiles_wgmma(M, N) * sk,
@@ -316,6 +335,15 @@ class MKQwen3:
                     )
                 else:
                     sk = mk.gemm_split_k(M, N, K)
+                    no_atomic_env = os.environ.get("MK_DW_NO_ATOMIC_SK1")
+                    no_atomic_sk1 = bool(int(no_atomic_env)) if no_atomic_env is not None else False
+                    if no_atomic_sk1 and sk == 1:
+                        p.instr(
+                            mk.OP_GEMM,
+                            mk.gemm_tiles(M, N),
+                            [a, b, out, M, N, K, (flags & ~(4 | 32)), res],
+                        )
+                        return False
                     p.instr(mk.OP_GEMM, mk.gemm_tiles(M, N) * sk, [a, b, out, M, N, K, (flags | 32) & ~4, res, sk])
                 return False
             ssq_fuse_env = os.environ.get("MK_SSQ_FUSE")

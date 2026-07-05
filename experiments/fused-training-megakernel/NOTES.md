@@ -3690,6 +3690,32 @@ total `18839.3us`, with head-dX span `2465.5us`, lm-head fwd `2684.4us`, and gen
 D=128 attention still large (`ATTN_FWD` `1822.1us`, `ATTN_DQ` `1542.2us`). Full
 `test_model.py` passed in `mkv3-p4b-qwen-headdx-n256-prod-testmodel-20260705T2319Z.log`.
 
+## v3 P4b qwen dW sk1 no-atomic route: exact-shape promotion
+
+After the lm-head/head-dX promotions, the qwen4b-l1 profile
+`mkv3-p4b-qwen-headdx-n256-prod-profile-20260705T2319Z.log` exposed a remaining dW
+scheduler artifact: `GEMMTN 6144x2560x1024.wg.splitK` was on path with `5854.2us`
+wait even though every qwen dW GEMM computed `sk=1`. Route inspection
+`mkv3-p4b-qwen-dw-noatomic-route-20260705T2324Z.log` confirmed all five dW rows used
+`flags=169, sk=1` and could structurally use the plain fp32 WGMMA TN store path.
+
+Promoted only exact qwen4b-l1 dW shapes `(M,N,K)`:
+`(151936,2560,1024)`, `(2560,9728,1024)`, `(19456,2560,1024)`,
+`(2560,4096,1024)`, and `(6144,2560,1024)`. The new default emits `flags=137`
+without split-K or atomics. `MK_DW_NO_ATOMIC_SK1=0` restores the prior split-K route;
+`=1` force-enables other structurally eligible `sk=1` dW shapes for future probes.
+
+Focused qwen A/B `mkv3-p4b-qwen-dw-noatomic-ab-20260705T2328Z.log` used identical
+params/tokens and old arm `MK_DW_NO_ATOMIC_SK1=0`: old dW routes were five
+`flags=169, sk=1` rows, new routes were five `flags=137` rows, loss rel-diff was
+`-1.5e-7`, selected gradient rel diffs were below `5.0e-7`, and paired medians were
+`19017.4us -> 15897.3us` (`+3120.0us` old-minus-new). Profile
+`mkv3-p4b-qwen-dw-noatomic-profile-20260705T2331Z.log` showed current default total
+`15843.5us`; the former on-path `GEMMTN 6144x2560x1024` is now off-path with a
+`236.6us` span, and the visible wait moved to `EMBED_BWD` (`3561.7us`) behind the
+remaining off-path giant vocab dW. Full `test_model.py` passed in
+`mkv3-p4b-qwen-dw-noatomic-testmodel-20260705T2332Z.log`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
