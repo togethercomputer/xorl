@@ -2010,6 +2010,26 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   the post-Drow scoreboard, the committed `_aex2` default trims about 6us nano and
   about 21us small on the standard bench path.
 
+- Post-attention-exp2 profile and lm-head CE partial `exp2.approx` promotion: the
+  current post-`91a8fb7` profile (`mkv3-p4b-profile-post-aex2-91a8fb7-20260705T0827Z.log`)
+  measured nano at 909.6us and small at 3606.1us. Small is still led by `ATTN_DKV_WG`
+  376.3us, MLP dX `GEMMNN 1024x512x3072.wg` 326.1us, `SWIGLU_BWD_2W` 289.1us,
+  `ATTN_FWD_WG` 254.9us, RMS dx 244.6us, Drow 226.2us, and lm-head forward 200.2us.
+  `MK_LMHEAD_EXP2_APPROX=1` changes only the fused lm-head GEMM CE/LSE partial
+  epilogue's online sumexp from `__expf` to `ex2.approx.ftz.f32`; CE backward and the
+  standalone CE reduction are unchanged. Forced-on full model validation passed
+  (`mkv3-p4b-lex2-testmodel-20260705T0828Z.log`), and default gated validation passed
+  (`mkv3-p4b-lex2-default-testmodel-20260705T0846Z.log`). The final default gate is
+  V>=8192, V%64==0, and S>=256: route checks confirmed S128 and D128/V4096 keep the
+  old extension by default, while S256, nano/S512, small/S1024, and H256/S2048 use
+  `_lex2`; `MK_LMHEAD_EXP2_APPROX=0/1` remains an explicit A/B override
+  (`mkv3-p4b-lex2-gated-route-20260705T0847Z.log`). Broad forced timing was positive
+  on the main shapes (`mkv3-p4b-lex2-step-ab-20260705T0832Z.log`), and final gated
+  default-vs-old timing (`mkv3-p4b-lex2-gated-default-vs-old-20260705T0847Z.log`)
+  measured S256 -8.32us, nano/S512 -19.58us, small/H512/S1024 -56.99us, H256/S1024
+  -36.00us, and H256/S2048 -65.95us median. S128 and D128 in that final matrix are
+  same-extension controls, not changed code paths.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

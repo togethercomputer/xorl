@@ -40,6 +40,15 @@ __device__ __forceinline__ void consumer_sync() {
 
 __device__ __forceinline__ float bf2f(bf16 v) { return __bfloat162float(v); }
 __device__ __forceinline__ bf16 f2bf(float v) { return __float2bfloat16(v); }
+__device__ __forceinline__ float lmhead_exp(float x) {
+#ifdef MK_LMHEAD_EXP2_APPROX
+  float y;
+  asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x * 1.4426950408889634f));
+  return y;
+#else
+  return __expf(x);
+#endif
+}
 
 // ---- trivial ops (skeleton validation) ------------------------------------------------
 
@@ -545,17 +554,19 @@ __device__ __noinline__ void op_gemm_wgmma_n128(const Instr& I, int tile, void**
         for (int cc = lane; cc < WG_BN; cc += 32) {
           const float zv = bf2f(f2bf(Cs[r * WG_LDC_N128 + half * WG_BN + cc]));
           if (zv > mx) {
-            se = se * __expf(mx - zv) + 1.0f;
+            se = se * lmhead_exp(mx - zv) + 1.0f;
             mx = zv;
           } else {
-            se += __expf(zv - mx);
+            se += lmhead_exp(zv - mx);
           }
         }
         for (int o = 16; o > 0; o >>= 1) {
           const float om = __shfl_xor_sync(0xffffffff, mx, o);
           const float os = __shfl_xor_sync(0xffffffff, se, o);
           const float Mx = fmaxf(mx, om);
-          se = (mx == -INFINITY && om == -INFINITY) ? 0.0f : se * __expf(mx - Mx) + os * __expf(om - Mx);
+          se = (mx == -INFINITY && om == -INFINITY) ? 0.0f
+                                                     : se * lmhead_exp(mx - Mx) +
+                                                           os * lmhead_exp(om - Mx);
           mx = Mx;
         }
         if (lane == 0) {
@@ -768,17 +779,19 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
         // context, where libm expf spills the whole interpreter past 128 regs/thread
         // (1 block/SM). Precision loss is far below bf16 logit noise.
         if (zv > mx) {
-          se = se * __expf(mx - zv) + 1.0f;
+          se = se * lmhead_exp(mx - zv) + 1.0f;
           mx = zv;
         } else {
-          se += __expf(zv - mx);
+          se += lmhead_exp(zv - mx);
         }
       }
       for (int o = 16; o > 0; o >>= 1) {
         const float om = __shfl_xor_sync(0xffffffff, mx, o);
         const float os = __shfl_xor_sync(0xffffffff, se, o);
         const float Mx = fmaxf(mx, om);
-        se = (mx == -INFINITY && om == -INFINITY) ? 0.0f : se * __expf(mx - Mx) + os * __expf(om - Mx);
+        se = (mx == -INFINITY && om == -INFINITY) ? 0.0f
+                                                  : se * lmhead_exp(mx - Mx) +
+                                                        os * lmhead_exp(om - Mx);
         mx = Mx;
       }
       if (lane == 0) {
