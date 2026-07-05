@@ -2728,6 +2728,18 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   long-shape work remains attention kernel quality or a new attention-DQ mechanism;
   scheduler poll cadence is now exhausted for the tested exact shapes.
 
+- H256/S3072 and H256/S4096 attention-dQ C=1 `float2` direct-store promotion: the
+  `OP_ATTN_DQ_WG` C=1 epilogue now vector-stores the adjacent accumulator pair via
+  `float2` for the exact same shapes that use idle32; `MK_ATTN_DQ_FLOAT2_STORE=0`
+  forces the old scalar-store epilogue. Route checks confirmed S2048/S8192 stay on
+  the old build while S3072/S4096 pick `_adqf2`. Initial default-off probe
+  `mkv3-p4b-attndq-float2-store-probe-20260705T1554Z.log` measured S3072 -9.68us
+  (45/48 wins) and S4096 -15.95us (39/40 wins). Clean promoted-default vs forced-old
+  timing `mkv3-p4b-attndq-float2-store-promote-20260705T1558Z.log` remained positive:
+  S3072 -11.46us (36/40 wins) and S4096 -7.17us (30/36 wins). Long-shape gradient
+  comparison `mkv3-p4b-attndq-float2-store-gradcheck-20260705T1559Z.log` matched the
+  old path to fp32-noise: worst grad rel was 7.61e-7 for S3072 and 1.20e-6 for S4096.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

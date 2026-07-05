@@ -876,6 +876,14 @@ __device__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs, char* smem_
   // epilogue: C=1 has one writer per q slice, so write the accumulator layout directly
   // to the fp32 workspace and skip the smem stage/drain used by chunked atomics.
   if (C == 1) {
+#ifdef MK_ATTN_DQ_FLOAT2_STORE
+#pragma unroll
+    for (int n8 = 0; n8 < 8; ++n8)
+#pragma unroll
+      for (int i = 0; i < 2; ++i)
+        *reinterpret_cast<float2*>(&ws[(int64_t)qr[i] * stride + qh * D + n8 * 8 + cb]) =
+            make_float2(dq[n8 * 4 + i * 2], dq[n8 * 4 + i * 2 + 1]);
+#else
 #pragma unroll
     for (int n8 = 0; n8 < 8; ++n8)
 #pragma unroll
@@ -884,6 +892,7 @@ __device__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs, char* smem_
         for (int j = 0; j < 2; ++j)
           ws[(int64_t)qr[i] * stride + qh * D + n8 * 8 + cb + j] =
               dq[n8 * 4 + i * 2 + j];
+#endif
     return;
   }
 
