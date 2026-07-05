@@ -1784,6 +1784,22 @@ wobble +-5-8% across runs from inductor autotune variance). Logs:
   wins). This is a narrow op-quality win; it does not change the remaining bottleneck
   ordering.
 
+- Post-SWIGLU-FMA profile + attention masked-exp no-go: current-head profiles at
+  `38c762f` (`mkv3-p4b-profile-post-swfma-38c762f-20260705T0535PROFILE.log`,
+  `mkv3-p4b-profile-s1024-post-swfma-38c762f-20260705T0538PROFILE.log`) show the same
+  op-quality bottleneck order after the SWIGLU arithmetic win. Small is led by
+  `ATTN_DKV_WG` 397us, `GEMMNN 1024x512x3072.wg` 336us, `SWIGLU_BWD` 277us,
+  `GEMMNN 1024x512x512.wg` 257us, and `ATTN_FWD_WG` 245us. H256/S1024 is led by
+  `ATTN_DKV_WG` 140us, `ATTN_FWD_WG` 122us, lm-head forward 93us, and MLP dX 88us.
+  A default-off `MK_ATTN_MASKED_EXP_SKIP` probe skipped `__expf(-inf)` for causal-masked
+  diagonal entries inside the WGMMA attention fwd/dKV/dQ loops. Correctness passed
+  (`mkv3-p4b-attnmask-testattention-20260705T0541MASK.log`,
+  `mkv3-p4b-attnmask-testmodel-20260705T0543MASK.log`), but paired timing was a
+  decisive regression (`mkv3-p4b-attnmask-step-ab-20260705T0544MASK.log`): S128 was
+  only a weak/noisy -2.58us, while S256 regressed +32.02us, nano +31.30us, small
+  +223.23us, and H256/S1024 +65.73us. Keep masked attention probabilities on the
+  existing `exp(-inf) -> 0` path; the branch/predicate cost overwhelms saved SFU work.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
