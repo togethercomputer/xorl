@@ -3413,6 +3413,22 @@ The refreshed score was megakernel 7156.9us vs compile+CUDAGraph+ 3119.0us
 logs above as promotion evidence. For next work, DKV wait/dependency structure is
 still a larger target than local row-op scalar cleanup.
 
+S4096 H256/I768 SwiGLU-BWD 3W source probe no-go: a temporary
+`MK_SWIGLU_BWD_3W=1` route mapped each row across three warps and emitted four
+3W instructions for H256 long shapes. Forced-route validation passed
+(`mkv3-p4b-swiglu-3w-route-parity-20260705T2212Z.log`: S512 worst grad rel
+0.0281, D128-ragged 0.0211, rerun/waves/df2/ws and SGD sanity clean), and the
+initial S4096 A/B looked positive after a noisy first window
+(`mkv3-p4b-swiglu-3w-ab-20260705T2218Z.log`, then focused confirmation
+`mkv3-p4b-swiglu-3w-s4096-confirm-20260705T2224Z.log`: about -50us both
+orders). Promoted-default confirmation invalidated the change: with 3W selected
+as the unset default at S4096, forced old `MK_SWIGLU_BWD_3W=0` was -6.42us
+faster in default-first and neutral (+0.38us old-minus-new) in variant-first
+(`mkv3-p4b-swiglu-3w-promoted-default-20260705T2228Z.log`). S8192 was also
+neutral-to-slightly-worse in the initial A/B (+6.08us/+1.36us). The source probe
+was reverted; keep the existing cached 2W defaults and do not re-add a 3W route
+without a new post-composition reason.
+
 ## v3 P4b knob consolidation (session 2853e0de): one tuning table, routes verified
 
 The secondary lane from the /goal: model.py's ~12 scattered per-shape gate
