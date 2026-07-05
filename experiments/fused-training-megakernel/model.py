@@ -768,14 +768,15 @@ class MKQwen3:
                 # C arg (C | off<<8 | width<<16). Per-band ws slots keep the bands'
                 # disjoint row ranges parallel in the dependency analysis.
                 # Measured defaults (in-model paired A/B, both construction orders,
-                # 40/40 or 16/16 wins each): S2048 T=16 (-21/-16us vs the uniform
-                # C=2/2 default; T=32 degenerates to uniform C=1 and loses +41/+48),
+                # 40/40 or 16/16 wins each): S2048 retuned to T=12 after idle32
+                # composition (-30/-37us vs T=16), T=32 degenerates to uniform C=1
+                # and loses +41/+48,
                 # S3072 T=16 (-37/-42us), S4096 retuned to T=29 after fwd-band
                 # composition (-60us vs T=32), S8192 T=32 (-532/-525us; T=16 only
                 # -321/-332). Standalone + in-model logs in the attn-band worktree
                 # and shared results/.
                 default_band_T = (
-                    {2048: 16, 3072: 16, 4096: 29, 8192: 32}.get(c.S, 0)
+                    {2048: 12, 3072: 16, 4096: 29, 8192: 32}.get(c.S, 0)
                     if c.H == 256 and c.D == 64
                     else 0
                 )

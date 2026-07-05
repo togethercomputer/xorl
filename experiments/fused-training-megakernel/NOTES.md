@@ -3087,9 +3087,20 @@ T30 won -57.4us in the clean order (the other order had contaminated absolute
 medians but still paired -66.8us). Confirmation log
 `mkv3-p4b-s4096-band-budget-confirm-20260705T1847Z.log`: T29 repeated
 -62.9/-60.4us with 40/40 wins in both construction orders, while T31 shrank to
--16.9/-15.7us. Current H256/D64 band defaults are now
-`{2048:16, 3072:16, 4096:29, 8192:32}`; `MK_ATTN_BAND=32` restores the old
+-16.9/-15.7us. Current H256/D64 band defaults after the S2048 retune below are
+`{2048:12, 3072:16, 4096:29, 8192:32}`; `MK_ATTN_BAND=32` restores the old
 S4096 route for A/B and `MK_ATTN_BAND=0` still restores the uniform C route.
+
+S2048 attention-bwd band-budget retune after the idle32/row-batching composition:
+GPU5 env-only log `mkv3-p4b-attnband-retune-s2048-post-resweep-20260705T1929Z.log`
+found that the old T16 default is no longer best. T12 beat T16 by -29.94us and
+-36.69us with 40/40 wins in both construction orders, parity clean
+(`worst_grad_rel` <= 0.007364). T10/T14/T24 also won but less; T18/T20 were
+neutral/mixed. Promoted-default validation
+`mkv3-p4b-attnband-s2048-promoted-default-20260705T1936Z.log` beat forced old
+T16 by +34.85us/+32.27us old-minus-new, with old wins 0/40 in both orders.
+Promote H256/D64/S2048 `MK_ATTN_BAND` from T16 to T12; keep S3072 T16, S4096
+T29, and S8192 T32 unchanged.
 
 Post-T29 follow-up no-gos: current default `lpt` order remains best. A
 pre-combine env-only retest at `77346e2`
