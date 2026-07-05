@@ -2648,6 +2648,15 @@ the true 24h movement is 1.97->1.45 and 2.52->1.88.
   with 4/64 wins). Do not promote the x2 DQ source path; the dirty sibling remains
   no-go evidence only.
 
+- Current-head long-shape RMS dx R4 recheck no-change: with S4096 still showing a large
+  RMS dx span after cached-SwiGLU, an env-only `MK_RMS_DX_R4` sweep rechecked the long
+  H256 defaults (`mkv3-p4b-rmsdx-r4-long-current-20260705T1526Z.log`). All routes passed
+  default-vs-variant parity. H256/S2048 still keeps default R4; forced R2 was
+  construction-order biased and negative overall (+6.51us variant-control with 26/80
+  wins). H256/S3072 and H256/S4096 still keep default R2; forced R4 lost +3.74us
+  (26/80 wins) and +4.37us (15/64 wins), respectively. Keep `rms_dx_r4` gated only for
+  H256/S2048; `MK_RMS_DX_R4` remains just a sweep override elsewhere.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
