@@ -192,9 +192,9 @@ class MKQwen3:
             env = os.environ.get("MK_HEAD_DX_TARGET_TILES")
             if env is not None:
                 return int(env)
-            # S2048 wants less head dX split-K after the S2048 RMS dx route; keep the
-            # established 192 target for other shapes, especially H512 small.
-            return 96 if c.H == 256 and c.S == 2048 else 192
+            # S2048/S3072 want less head dX split-K after the long-S route retunes;
+            # keep the established 192 target for other shapes, especially H512 small.
+            return 96 if c.H == 256 and c.S in (2048, 3072) else 192
 
         def rmsnorm_bwd(args):
             if split_rms_bwd:

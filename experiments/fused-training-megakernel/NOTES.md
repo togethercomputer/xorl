@@ -1168,6 +1168,14 @@ point (TMA, deeper attention pipelining) or accept the flag-planting scope.
   -17.7us (167/180), S4096 -30.5us (126/128). `cuobjdump -res-usage` was unchanged
   for `megakernel_df`/`df2`/`ws`, so there is no spill/regression tax
   (`mkv3-p4b-qknorm-d64-cache-resusage-20260705T0040QKBWD.log`).
+- S3072 head-dX target gate: after the qknorm-bwd cache, the S3072 profile showed
+  `dlogits @ Wlm` still using target 192 (split-K=2, 192 tiles), while S2048 already
+  used target 96. Current-head A/B
+  (`mkv3-p4b-s3072-headdx-target-post-qknorm-86a174b-20260705T0042HEADDX.log`) showed
+  target 96/128 both emit split-K=1 (96 tiles) and beat the default. Target 96 measured
+  -19.8us and -15.5us paired medians across order reversals, with 112/120 and 106/120
+  wins. Default head dX target is now 96 for H256/S2048 and H256/S3072; the env
+  `MK_HEAD_DX_TARGET_TILES=192` restores the old route.
 
 End-of-session certified gauntlet (df defaults, clean-GPU util guards,
 median-of-50, fresh process per config; baseline medians wobble +-5-8% across
