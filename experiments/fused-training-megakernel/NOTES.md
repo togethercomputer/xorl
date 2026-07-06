@@ -4449,12 +4449,13 @@ wins in reverse (`mkv3-p4b-qwen-allhot-postclaim1-ab-20260706T040318Z.log`).
 Keep hot/cold criticality; the remaining qwen gap is structural n256/rowop work,
 not ready-ring policy.
 
-Qwen SwiGLU cached-sigmoid + two-warp backward: PROMOTED. The post-claim1
-profile showed qwen's one-warp `SWIGLU_BWD` still on path at `5.8us` wait plus
-`227.9us` span (`mkv3-p4b-qwen-d128claim1-profile-20260706T035905Z.log`), so a
-source-free `MK_SWIGLU_CACHE_SIG=1 MK_SWIGLU_BWD_2W=1` A/B checked whether the
-existing H256/H512 route transfers to the H2560 qwen MLP. Route/parity were
-clean: the forced route kept `n_instr=47`, `critical_path=26`, `gated=14`,
+Qwen SwiGLU two-warp backward: PROMOTED; sigmoid cache rejected for qwen. The
+post-claim1 profile showed qwen's one-warp `SWIGLU_BWD` still on path at
+`5.8us` wait plus `227.9us` span
+(`mkv3-p4b-qwen-d128claim1-profile-20260706T035905Z.log`), so a source-free
+`MK_SWIGLU_CACHE_SIG=1 MK_SWIGLU_BWD_2W=1` A/B first checked whether the
+existing H256/H512 combined route transfers to the H2560 qwen MLP. Route/parity
+were clean: the forced route kept `n_instr=47`, `critical_path=26`, `gated=14`,
 `waves=26`, changed `swsig=False`/`SWIGLU_BWD=1/128` to
 `swsig=True`/`SWIGLU_BWD_2W=1/256`, kept D128 attention claims at `1/1/1`, and
 kept loss diffs within `2.86e-06` with worst selected-gradient rel
@@ -4463,21 +4464,34 @@ default-minus-forced-new was `+302.45us` median / `+305.85us` paired with
 `32/32` wins, then `+314.83us` median / `+300.90us` paired with `32/32` wins
 in reverse (`mkv3-p4b-qwen-swiglu-cache2w-ab-20260706T040611Z.log`).
 
-The production gate is exact qwen4b-l1
+Follow-up decomposition found the qwen win comes from two-warp backward, not
+from storing the sigmoid cache. Against the cached+2W default,
+`MK_SWIGLU_CACHE_SIG=0 MK_SWIGLU_BWD_2W=1` kept the same `SWIGLU_BWD_2W=1/256`
+route but removed `swsig`; parity stayed clean (loss diffs `+9.54e-07` and
+`0`, worst selected-gradient rel `6.25e-03` on `grad:emb`) and 2W-only won by
+`+95.54us` and `+94.21us` medians with `31/32` and `29/32` wins
+(`mkv3-p4b-qwen-swiglu-2wonly-ab-20260706T041818Z.log`). Cache-only
+(`MK_SWIGLU_CACHE_SIG=1 MK_SWIGLU_BWD_2W=0`) lost by `251.36us` and `280.80us`
+medians with `0/32` wins in both construction orders
+(`mkv3-p4b-qwen-swiglu-cacheonly-ab-20260706T041818Z.log`).
+
+The final production gate is exact qwen4b-l1
 `(H,S,I,V,nq,nkv,D,L)=(2560,1024,9728,151936,32,8,128,1)` via
-`_QWEN_L1_SWIGLU_CACHED_2W`; `MK_SWIGLU_CACHE_SIG=0 MK_SWIGLU_BWD_2W=0` restores
-the old one-warp route for A/B. Patched-default vs forced-old timing kept the
-win: default was the cached/2W route, forced-old was `SWIGLU_BWD=1/128`, parity
-was clean (loss diffs `+3.81e-06`, worst selected-gradient rel `6.25e-03` on
-`grad:emb`), and default beat old by `304.50us` and `313.41us` medians with
+`_QWEN_L1_SWIGLU_BWD_2W`: qwen defaults to `MK_SWIGLU_BWD_2W=1` while leaving
+`MK_SWIGLU_CACHE_SIG=0`. `MK_SWIGLU_BWD_2W=0` restores the old one-warp route;
+`MK_SWIGLU_CACHE_SIG=1` remains an A/B-only override for qwen. Final
+patched-default vs forced-old timing showed the intended default route
+(`swsig=False`, `SWIGLU_BWD_2W=1/256`) and kept parity clean (loss diffs
+`-9.54e-07` and `+1.91e-06`, worst selected-gradient rel `3.14e-03` on
+`grad:emb`). Default beat old by `399.79us` and `386.42us` medians with
 forced-old winning `0/32` in both orders
-(`mkv3-p4b-qwen-swiglu-cache2w-default-ab-20260706T041135Z.log`). Validation:
-`py_compile`, `git diff --check`, and `test_model.py` passed
-(`mkv3-p4b-qwen-swiglu-cache2w-testmodel-20260706T041135Z.log`). Fresh qwen
-profile after promotion measured total `9865.4us`, with `SWIGLU_BWD_2W`
-down to `5.2us` wait plus `114.2us` span; the remaining qwen leaders are still
-the giant n256 head-dX/lm-head rows and MLP GEMMs
-(`mkv3-p4b-qwen-swiglu-cache2w-profile-20260706T041135Z.log`).
+(`mkv3-p4b-qwen-swiglu-2wonly-default-ab-20260706T042404Z.log`). Validation for
+the final source path: `py_compile`, `ruff`, `git diff --check`, and
+`test_model.py` passed (`mkv3-p4b-qwen-swiglu-2wonly-testmodel-20260706T042404Z.log`).
+Fresh qwen profile after the final 2W-only gate measured total `9735.6us`, with
+`SWIGLU_BWD_2W` at `5.2us` wait plus `120.1us` span. The remaining qwen leaders
+are still giant n256 head-dX/lm-head rows, MLP GEMMs, D128 dQ wait, and
+qk-norm/CE rowops (`mkv3-p4b-qwen-swiglu-2wonly-profile-20260706T042404Z.log`).
 
 Qwen head-dX n256 split-K probe: NO-GO, source reverted. The top current qwen
 hop is still the 80-tile n256 direct `dlogits @ Wlm` row
