@@ -319,8 +319,16 @@ class MKQwen3:
         self.lmhead_exp2_approx_default = c.V >= 8192 and c.V % 64 == 0 and c.S >= 256
         self.ce_bwd_exp2_approx_default = c.S >= 1024 and c.V >= 8192 and c.V % 8 == 0
         # S2048/S8192 joined post-band; the full long-S H256 bucket now wins 32ns
-        # polling after the banding/row-batching scheduling changes.
-        self.idle_ns_default = 32 if c.H == 256 and c.S in _H256_IDLE32_S else 256
+        # polling after the banding/row-batching scheduling changes. Exact small
+        # joined at 64ns post-SKR/n256 (32/64/128 all beat 256 in 10 paired runs;
+        # 64 = plateau center, -37.3 40/40 / -6.4 34/40 both orders —
+        # mkv3-p4b-small-idle{,-postskr,64-check,128-rev}-*.log).
+        if c.H == 256 and c.S in _H256_IDLE32_S:
+            self.idle_ns_default = 32
+        elif (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) == (512, 1024, 1536, 16384, 8, 4, 64, 8):
+            self.idle_ns_default = 64
+        else:
+            self.idle_ns_default = 256
         self.attn_dkv_float2_atomic_default = c.D == 64 and c.S % 128 == 0
         self.attn_dkv_row_bcast_default = (
             c.H == 256 and c.D == 64 and c.S in _H256_D64_DKV_ROW_BCAST_S

@@ -6124,6 +6124,18 @@ gemm amortizes ONE reduce). Parity clean everywhere. Logs:
 mkv3-p4b-headdx-skr-shortS{,2}-*.log, mkv3-p4b-small-dxskr-probe-*.log,
 mkv3-p4b-nano-deep-skr-promote-check-*.log.
 
+Small idle_ns=64 promotion (resweep round 4): post-SKR/n256, exact small's
+scheduler poll cadence flipped from the 256ns default — 32/64/128ns ALL beat
+256 across 10 paired runs (32: -19.2/-13.3; 64: -37.3 40/40 / -6.4 34/40;
+128: -37.1 39/40 / -7.7 93/120); promoted 64 as the plateau center; forced-256
+loses both orders after promotion (+2.9 15/40, +30.4 2/40). The same batch
+recorded no-gos: nano/deep lm_head n256 (+2.9/-2.7 noise — their heads are
+too small for the giant-N tile even post-SKR), small DKV_C=2 (+71.8 0/40) and
+DQ_C=2 (+32.8 2/40) reconfirmed post-SKR. Small's paired arm now ~3220-3235us
+vs graph+ ~1892 (was ~3400/1.80x this morning; ~1.71x now). Logs:
+mkv3-p4b-postskr-resweep3-*, mkv3-p4b-small-idle{-postskr,64-check,128-rev,
+64-promote-check}-*.log.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
