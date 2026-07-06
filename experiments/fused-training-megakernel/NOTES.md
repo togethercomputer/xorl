@@ -5666,6 +5666,21 @@ N-major and stage3 default-on under `_gmbar_n256ntold`. Logs:
 `mkv3-p4b-qwen-stage3-post-ntmbar-variant-first-20260706T1900Z.log`.
 Detail note: `results/operator-gap/qwen-n256-route-post-ntmbar-keep.md`.
 
+S8192 backward-attention band-size recheck after combine-unroll: with the exact
+H256/D64/S8192 default still dominated by on-path `ATTN_DKV_WG` wait, rechecked
+nearby `MK_ATTN_BAND` targets against the current T40 default. T36 lost
+decisively in default-first (`+81.82us`, 1/16 candidate wins), T48 also lost in
+default-first (`+59.65us`, 2/16 wins), and the adjacent T44 signal was
+order-mixed (`-2.24us`, 11/16 wins, then `+11.34us`, 3/16 wins). Loss and
+selected-gradient parity were clean in all sampled runs. Keep S8192 bwd band
+target at T40; the remaining DKV wait is not fixed by a small band-size retune.
+Logs:
+`mkv3-p4b-s8192-bwdband-postcombine-t36-default-first-20260706T1902Z.log`,
+`mkv3-p4b-s8192-bwdband-postcombine-t44-default-first-20260706T1902Z.log`,
+`mkv3-p4b-s8192-bwdband-postcombine-t44-variant-first-20260706T1902Z.log`, and
+`mkv3-p4b-s8192-bwdband-postcombine-t48-default-first-20260706T1902Z.log`.
+Detail note: `results/operator-gap/s8192-bwdband-postcombine-retune-nogo.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
