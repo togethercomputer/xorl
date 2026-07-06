@@ -5399,6 +5399,17 @@ current-stack margin is smaller than the original promotion check, but remains
 order-stable. Log: `mkv3-p4b-small-ceb2-post-adkva-20260706T1734Z.log`. Detail
 note: `results/operator-gap/small-ceb2-post-adkva-keep.md`.
 
+Post-ceb2 small SwiGLU cache recheck: forced cached sigmoid back on with
+`MK_SWIGLU_CACHE_SIG=1` while keeping the current `SWIGLU_BWD_4W` route. The
+forced-cache extension correctly added `_swcsig`, changed only `swsig=False` to
+`swsig=True`, kept route shape unchanged (`n_instr=288`, `critical_path=144`,
+`gated=127`, `SWIGLU_FWD=8/1024`, `SWIGLU_BWD_4W=8/4096`), and parity stayed
+clean (worst selected grad `kn.0` rel around `1.38e-02`). Cache-on lost both
+construction orders: default-minus-cache `-17.70us` and `-18.00us`, cache wins
+`5/80` and `4/80`. Keep sigmoid cache off for H512/S1024 small. Log:
+`mkv3-p4b-small-swcache-post-ceb2-20260706T1737Z.log`. Detail note:
+`results/operator-gap/small-swcache-post-ceb2-keep.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
