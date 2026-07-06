@@ -5497,6 +5497,31 @@ gate for H512/S1024 small; the temporary source probe was reverted. Log:
 `mkv3-p4b-small-swb4v4-sourceprobe-20260706T1758Z.log`. Detail note:
 `results/operator-gap/small-swb4v4-sourceprobe-nogo.md`.
 
+S8192 attention-combine unroll promotion: the long-S local-LD trace had found
+that `op_attn_combine`'s dynamically indexed `float w[8]` weight array produced
+local loads only in fwd-banded long shapes. A default-off
+`MK_ATTN_COMBINE_UNROLL=1` source probe scalarized the `C <= 8` combine weights
+while preserving the old dynamic loop as the fallback. Route shape was unchanged
+(`n_instr=188`, `critical_path=80`, `gated=63`, `ATTN_COMBINE=4/2048` at
+S8192), and S8192 parity stayed clean (worst selected grad rel `<5.6e-03`).
+Forced unroll won S8192 both initial orders (`+41.09us` and `+25.41us`,
+`16/16` wins) and both 48-rep repeat orders (`+37.94us`, `48/48`; `+23.39us`,
+`46/48`). Boundary checks keep the default exact: S4096 was positive but too
+weak in reverse order (`+10.51us`, `146/160`; `+1.78us`, `94/160`), and S3072
+regressed (`-2.53us`, `18/40`; `-5.70us`, `8/40`). The default gate now enables
+`MK_ATTN_COMBINE_UNROLL` only for exact
+`(H,L,S,nq,nkv,D,I,V)=(256,4,8192,4,2,64,768,8192)`, with
+`MK_ATTN_COMBINE_UNROLL=0` forcing the old loop. Promoted-default S8192 beat
+forced old both orders: default-minus-old `-29.30us` and `-44.29us`, old wins
+`2/48` and `1/48`. Validation passed `py_compile`, `git diff --check`,
+`test_model.py`, and `test_ops.py`. Logs:
+`mkv3-p4b-s8192-combine-unroll-sourceprobe-20260706T1808Z.log`,
+`mkv3-p4b-s8192-combine-unroll-sourceprobe-repeat-20260706T1808Z.log`,
+`mkv3-p4b-s4096-combine-unroll-sourceprobe-repeat-20260706T1808Z.log`,
+`mkv3-p4b-s3072-combine-unroll-sourceprobe-20260706T1808Z.log`, and
+`mkv3-p4b-s8192-combine-unroll-promoted-20260706T1808Z.log`. Detail note:
+`results/operator-gap/s8192-combine-unroll-promote.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

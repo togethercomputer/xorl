@@ -411,6 +411,7 @@ def load_ext(
     attn_dkv_float2_atomic=None,
     attn_dq_float2_store=None,
     attn_dkv_row_bcast=None,
+    attn_combine_unroll=None,
     gemm_mbar_ring=None,
     gemm_direct_bf16_epilogue=None,
 ):
@@ -458,6 +459,9 @@ def load_ext(
         attn_exp2_approx = int(attn_exp2_approx_env)
     else:
         attn_exp2_approx = int(bool(attn_exp2_approx))
+    attn_combine_unroll = int(
+        os.environ.get("MK_ATTN_COMBINE_UNROLL", int(bool(attn_combine_unroll)))
+    )
     lmhead_exp2_approx = int(
         os.environ.get("MK_LMHEAD_EXP2_APPROX", int(bool(lmhead_exp2_approx)))
     )
@@ -511,6 +515,7 @@ def load_ext(
         + ("_adqf2" if attn_dq_float2_store else "")
         + ("_drowst" if drow_direct_store else "")
         + ("_aflog" if attn_fast_log else "") + ("_aex2" if attn_exp2_approx else "")
+        + ("_acur" if attn_combine_unroll else "")
         + ("_lex2" if lmhead_exp2_approx else "")
         + ("_ceb2" if ce_bwd_exp2_approx else "")
         + (f"_idle{idle_ns}" if idle_ns != 256 else "")
@@ -542,6 +547,7 @@ def load_ext(
         + (["-DMK_DROW_DIRECT_STORE"] if drow_direct_store else [])
         + (["-DMK_ATTN_FAST_LOG"] if attn_fast_log else [])
         + (["-DMK_ATTN_EXP2_APPROX"] if attn_exp2_approx else [])
+        + (["-DMK_ATTN_COMBINE_UNROLL"] if attn_combine_unroll else [])
         + (["-DMK_LMHEAD_EXP2_APPROX"] if lmhead_exp2_approx else [])
         + (["-DMK_CE_BWD_EXP2_APPROX"] if ce_bwd_exp2_approx else [])
         + ([f"-DMK_IDLE_NS={idle_ns}"] if idle_ns != 256 else [])

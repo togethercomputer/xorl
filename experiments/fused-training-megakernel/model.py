@@ -308,6 +308,10 @@ class MKQwen3:
         self.gemm_direct_bf16_epilogue_default = c.D == 64 and (
             c.S == 128 or (c.H, c.L, c.S, c.nq, c.nkv, c.I) == (512, 8, 1024, 8, 4, 1536)
         )
+        self.attn_combine_unroll_default = (
+            (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
+            == (256, 4, 8192, 4, 2, 64, 768, 8192)
+        )
         self.ext = mk.load_ext(
             swiglu_bwd_2w=self.swiglu_bwd_2w_default,
             swiglu_bwd_4w=self.swiglu_bwd_4w_default,
@@ -321,6 +325,7 @@ class MKQwen3:
             attn_dkv_float2_atomic=self.attn_dkv_float2_atomic_default,
             attn_dkv_row_bcast=self.attn_dkv_row_bcast_default,
             attn_dq_float2_store=self.attn_dq_float2_store_default,
+            attn_combine_unroll=self.attn_combine_unroll_default,
             gemm_mbar_ring=self.gemm_mbar_ring_default,
             gemm_direct_bf16_epilogue=self.gemm_direct_bf16_epilogue_default,
         )

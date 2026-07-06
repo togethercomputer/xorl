@@ -279,6 +279,64 @@ __device__ void op_attn_combine(const Instr& I, int tile, void** bufs) {
     const int s = s0 + u / nq;
     const int h = u % nq;
     if (s >= S) continue;
+#ifdef MK_ATTN_COMBINE_UNROLL
+    if (C <= 8) {
+      float mstar = -INFINITY;
+#define MK_COMB_M(CI)                                                                 \
+      if (C > (CI)) mstar = fmaxf(mstar, Mpart[((int64_t)(CI) * nq + h) * S + s])
+      MK_COMB_M(0);
+      MK_COMB_M(1);
+      MK_COMB_M(2);
+      MK_COMB_M(3);
+      MK_COMB_M(4);
+      MK_COMB_M(5);
+      MK_COMB_M(6);
+      MK_COMB_M(7);
+#undef MK_COMB_M
+      float w0 = 0.0f, w1 = 0.0f, w2 = 0.0f, w3 = 0.0f;
+      float w4 = 0.0f, w5 = 0.0f, w6 = 0.0f, w7 = 0.0f;
+      float lstar = 0.0f;
+#define MK_COMB_W(CI, W)                                                              \
+      if (C > (CI)) {                                                                 \
+        const float lc = Lpart[((int64_t)(CI) * nq + h) * S + s];                     \
+        const float mc = Mpart[((int64_t)(CI) * nq + h) * S + s];                     \
+        (W) = (lc > 0.0f) ? lc * expf(mc - mstar) : 0.0f;                             \
+        lstar += (W);                                                                 \
+      }
+      MK_COMB_W(0, w0);
+      MK_COMB_W(1, w1);
+      MK_COMB_W(2, w2);
+      MK_COMB_W(3, w3);
+      MK_COMB_W(4, w4);
+      MK_COMB_W(5, w5);
+      MK_COMB_W(6, w6);
+      MK_COMB_W(7, w7);
+#undef MK_COMB_W
+      for (int d0 = lane * 2; d0 < D; d0 += 64) {
+        float acc0 = 0.0f, acc1 = 0.0f;
+#define MK_COMB_ACC(CI, W)                                                            \
+        if (C > (CI) && (W) != 0.0f) {                                                \
+          const int64_t base =                                                        \
+              (int64_t)(CI) * S * nq * D + (int64_t)s * (nq * D) + h * D + d0;        \
+          acc0 += (W) * bf2f(Opart[base]);                                            \
+          acc1 += (W) * bf2f(Opart[base + 1]);                                        \
+        }
+        MK_COMB_ACC(0, w0);
+        MK_COMB_ACC(1, w1);
+        MK_COMB_ACC(2, w2);
+        MK_COMB_ACC(3, w3);
+        MK_COMB_ACC(4, w4);
+        MK_COMB_ACC(5, w5);
+        MK_COMB_ACC(6, w6);
+        MK_COMB_ACC(7, w7);
+#undef MK_COMB_ACC
+        O[(int64_t)s * (nq * D) + h * D + d0] = f2bf(acc0 / lstar);
+        O[(int64_t)s * (nq * D) + h * D + d0 + 1] = f2bf(acc1 / lstar);
+      }
+      if (lane == 0) LSE[(int64_t)h * S + s] = mstar + logf(lstar);
+      continue;
+    }
+#endif
     float mstar = -INFINITY;
     for (int c = 0; c < C; ++c)
       mstar = fmaxf(mstar, Mpart[((int64_t)c * nq + h) * S + s]);
