@@ -4725,6 +4725,24 @@ completion signaling) or if the bwd-side xn2 buffer deletion (phase 2,
 different mechanism: memory traffic) carries it. Re-run knob:
 `MK_EPIFUSE_MLP=1` in wt-epifuse @c9d77d5.
 
+## Long-S head block routed through n256 direct (session 2853e0de, 20260706T0945Z)
+
+Fresh S8192 profile at 3c08fc3 (`mkv3-p4b-profile-s8192-3c08fc3-*.log`) showed
+the head block on-path: lm-head fwd GEMMNT 8192x8192x256 at 442.5us span
+(78 TF/s effective) + head-dX 156.6us — the qwen n256 direct-store routes were
+exact-gated to qwen shapes and never fired on the gauntlet. Extended
+`wgmma_n256_direct_ok` / `wgmma_n256_head_dx_ok` exact sets with the
+(3072|4096|8192, 8192, 256) head triples (and dX companions). Paired A/B both
+orders, patched-default vs forced-old
+(`mkv3-p4b-n256head-promo-20260706T093701Z.log`): S3072 2439.4/2452.4 vs
+2497.2/2498.7; S4096 3084.4/3102.6 vs 3138.0/3144.3; **S8192 6853.3/6858.7 vs
+7100.6/7101.5 (-245us)**. Losses bit-identical per shape. Gate excludes
+small/S2048 (triage regressions +99/+66) and leaves nano/deep neutral —
+verified unchanged (929.2/3440.3;
+`mkv3-p4b-n256head-gauntlet-20260706T092847Z.log`). test_ops + test_model
+green. Arms compose additively (lm -165, dx -82 at S8192). Next structural
+S8192 target per the same profile: ATTN_DKV_WG on-path 2565us at 80% wait.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

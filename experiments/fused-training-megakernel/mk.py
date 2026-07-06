@@ -161,7 +161,11 @@ def wgmma_n256_direct_ok(M, N, K, flags):
         return False
     if mode == 1:
         return True
-    return (M, N, K) == (1024, 151936, 2560)
+    # long-S gauntlet head (H256/V8192): giant-N tile pays only at M>=3072
+    # (S3072 -59us, S4096 -39, S8192 -255; S<=2048/small regress — measured
+    # mkv3-p4b-n256head-gauntlet-20260706T092847Z.log)
+    return (M, N, K) in {(1024, 151936, 2560),
+                         (3072, 8192, 256), (4096, 8192, 256), (8192, 8192, 256)}
 
 
 def wgmma_n256_nt_bf16_ok(M, N, K, flags):
@@ -253,7 +257,9 @@ def wgmma_n256_head_dx_ok(M, N, K, flags):
         return False
     if mode == 1:
         return True
-    return (M, N, K) == (1024, 2560, 151936)
+    # long-S gauntlet head-dX companions of the lm-head gate above
+    return (M, N, K) in {(1024, 2560, 151936),
+                         (3072, 256, 8192), (4096, 256, 8192), (8192, 256, 8192)}
 
 
 def wgmma_n256_dw_tn_ok(M, N, K, flags):
