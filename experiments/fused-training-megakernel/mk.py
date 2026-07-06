@@ -327,6 +327,7 @@ def load_ext(
     attn_dkv_float2_atomic=None,
     attn_dq_float2_store=None,
     attn_dkv_row_bcast=None,
+    gemm_mbar_ring=None,
 ):
     # MK_OCC2=1 builds the 256-thread executors with __launch_bounds__(256, 2):
     # 2 blocks/SM (128-reg ceiling, ptxas spills the fat op paths). Motivated by the
@@ -395,6 +396,11 @@ def load_ext(
     swiglu_cache_sig = int(
         os.environ.get("MK_SWIGLU_CACHE_SIG", int(bool(swiglu_cache_sig)))
     )
+    gemm_mbar_ring_env = os.environ.get("MK_GEMM_MBAR_RING")
+    if gemm_mbar_ring_env is not None:
+        gemm_mbar_ring = int(gemm_mbar_ring_env)
+    else:
+        gemm_mbar_ring = int(bool(gemm_mbar_ring))
     return load(
         name="xorl_megakernel" + ("_occ2" if occ2 else "") + ("_wsrc" if regcopy else "")
         + ("_apipe" if attnpipe else "") + ("_adkva" if attn_dkv_direct_atomic else "")
@@ -408,7 +414,8 @@ def load_ext(
         + (f"_idle{idle_ns}" if idle_ns != 256 else "")
         + ("_qkbc" if qkbc else "")
         + ("_swfma" if swiglu_fma_deriv else "") + ("_swb2w" if swiglu_bwd_2w else "")
-        + ("_swcsig" if swiglu_cache_sig else ""),
+        + ("_swcsig" if swiglu_cache_sig else "")
+        + ("_gmbar" if gemm_mbar_ring else ""),
         sources=[os.path.join(_DIR, "megakernel.cu")],
         extra_cuda_cflags=[
             "-O3",
@@ -436,7 +443,8 @@ def load_ext(
         + (["-DMK_QKBWD_D64_CACHE"] if qkbc else [])
         + (["-DMK_SWIGLU_FMA_DERIV"] if swiglu_fma_deriv else [])
         + (["-DMK_SWIGLU_BWD_2W"] if swiglu_bwd_2w else [])
-        + (["-DMK_SWIGLU_CACHE_SIG"] if swiglu_cache_sig else []),
+        + (["-DMK_SWIGLU_CACHE_SIG"] if swiglu_cache_sig else [])
+        + (["-DMK_GEMM_MBAR_RING"] if gemm_mbar_ring else []),
         verbose=verbose,
     )
 

@@ -287,6 +287,7 @@ class MKQwen3:
             c.H == 256 and c.D == 64 and c.S in _H256_D64_DKV_ROW_BCAST_S
         )
         self.attn_dq_float2_store_default = c.H == 256 and c.S in _H256_DQ_FLOAT2_S
+        self.gemm_mbar_ring_default = c.D == 64 and c.S >= 1024 and c.S % 128 == 0
         self.ext = mk.load_ext(
             swiglu_bwd_2w=self.swiglu_bwd_2w_default,
             swiglu_cache_sig=self.swiglu_cache_sig_enabled,
@@ -298,6 +299,7 @@ class MKQwen3:
             attn_dkv_float2_atomic=self.attn_dkv_float2_atomic_default,
             attn_dkv_row_bcast=self.attn_dkv_row_bcast_default,
             attn_dq_float2_store=self.attn_dq_float2_store_default,
+            gemm_mbar_ring=self.gemm_mbar_ring_default,
         )
         # D=128 WGMMA attention route (default ON for D==128, S%64==0; the opgap
         # FA4-C trio spec's fallback replacement): MK_ATTN_D128_WG=0 restores the

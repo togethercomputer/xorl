@@ -326,14 +326,18 @@ __device__ void op_gemm(const Instr& I, int tile, void** bufs, char* smem_raw) {
 #define GEMM_N256_STAGE3_FLAG (1 << 25)
 #define GEMM_N256_NMAJOR_FLAG (1 << 26)
 
-struct WgmmaSmem {
-  bf16 A[2][2][4][1024];  // [stage][row-half][k16-step][64x16 INTER block] = 32KB
-  bf16 B[2][4][1024];     // [stage][k16-step][64x16 INTER block]           = 16KB
+template <int STAGES>
+struct WgmmaSmemT {
+  bf16 A[STAGES][2][4][1024];  // [stage][row-half][k16-step][64x16 block]
+  bf16 B[STAGES][4][1024];     // [stage][k16-step][64x16 block]
 };
-struct WgmmaSmemN128 {
-  bf16 A[2][2][4][1024];  // [stage][row-half][k16-step][64x64 SW128 slab] = 32KB
-  bf16 B[2][8192];        // [stage][128 rows x 64 k elts SW128]           = 32KB
+using WgmmaSmem = WgmmaSmemT<2>;
+template <int STAGES>
+struct WgmmaSmemN128T {
+  bf16 A[STAGES][2][4][1024];  // [stage][row-half][k16-step][64x64 SW128 slab]
+  bf16 B[STAGES][8192];        // [stage][128 rows x 64 k elts SW128]
 };
+using WgmmaSmemN128 = WgmmaSmemN128T<2>;
 template <int STAGES>
 struct WgmmaSmemN256T {
   bf16 A[STAGES][2][4][1024];  // per stage: A 16KB
@@ -432,6 +436,34 @@ __device__ __forceinline__ uint64_t wg_desc_mnsw(const void* slab, int s) {
   d.bitfield.stride_byte_offset_ = (1024 >> 4);
   d.bitfield.layout_type_ = 1;  // B128
   return d.desc_;
+}
+
+__device__ __forceinline__ void wg_mbar_init(uint64_t* bar, uint32_t count) {
+  const uint32_t a = (uint32_t)__cvta_generic_to_shared(bar);
+  asm volatile("mbarrier.init.shared.b64 [%0], %1;" ::"r"(a), "r"(count));
+}
+
+__device__ __forceinline__ void wg_mbar_arrive(uint64_t* bar) {
+  const uint32_t a = (uint32_t)__cvta_generic_to_shared(bar);
+  asm volatile("{.reg .b64 t; mbarrier.arrive.shared.b64 t, [%0];}" ::"r"(a));
+}
+
+__device__ __forceinline__ void wg_mbar_arrive_cpasync(uint64_t* bar) {
+  const uint32_t a = (uint32_t)__cvta_generic_to_shared(bar);
+  asm volatile("cp.async.mbarrier.arrive.noinc.shared.b64 [%0];" ::"r"(a));
+}
+
+__device__ __forceinline__ void wg_mbar_wait(uint64_t* bar, uint32_t phase) {
+  const uint32_t a = (uint32_t)__cvta_generic_to_shared(bar);
+  uint32_t done = 0;
+  while (!done) {
+    asm volatile(
+        "{.reg .pred p; mbarrier.try_wait.parity.shared.b64 p, [%1], %2; "
+        "selp.u32 %0, 1, 0, p;}"
+        : "=r"(done)
+        : "r"(a), "r"(phase)
+        : "memory");
+  }
 }
 
 template <class MMA>
@@ -782,7 +814,13 @@ __device__ __noinline__ void op_gemm_wgmma_n128(const Instr& I, int tile, void**
 
   smem_raw = reinterpret_cast<char*>(
       (reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
+#ifdef MK_GEMM_MBAR_RING
+  constexpr int WG_N128_STAGES = 3;
+  WgmmaSmemN128T<WG_N128_STAGES>& S =
+      *reinterpret_cast<WgmmaSmemN128T<WG_N128_STAGES>*>(smem_raw);
+#else
   WgmmaSmemN128& S = *reinterpret_cast<WgmmaSmemN128*>(smem_raw);
+#endif
   const int sk = (flags & 32) ? I.args[8] : 1;
   const int slice = tile % sk;
   const int mn = tile / sk;
@@ -829,6 +867,56 @@ __device__ __noinline__ void op_gemm_wgmma_n128(const Instr& I, int tile, void**
 #pragma unroll
   for (int i = 0; i < 64; ++i) d[i] = 0.0f;
   const int iters = (k_hi - k_lo) / WG_BK;
+#ifdef MK_GEMM_MBAR_RING
+  constexpr int WG_N128_LEAD = WG_N128_STAGES - 2;
+  uint64_t* bfull = reinterpret_cast<uint64_t*>(smem_raw + sizeof(S));
+  uint64_t* bempty = bfull + WG_N128_STAGES;
+  if (tid == 0) {
+#pragma unroll
+    for (int s = 0; s < WG_N128_STAGES; ++s) {
+      wg_mbar_init(&bfull[s], 256);
+      wg_mbar_init(&bempty[s], 256);
+    }
+  }
+  consumer_sync();
+  auto issue_stage_mb = [&](int t) {
+    const int st = t % WG_N128_STAGES;
+    issue_stage(k_lo + t * WG_BK, st);
+    wg_mbar_arrive_cpasync(&bfull[st]);
+  };
+  for (int p = 0; p < min(WG_N128_LEAD + 1, iters); ++p) issue_stage_mb(p);
+  for (int t = 0; t < iters; ++t) {
+    const int st = t % WG_N128_STAGES;
+    wg_mbar_wait(&bfull[st], (t / WG_N128_STAGES) & 1);
+    uint64_t da[4], db[4];
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      da[s] = wg_desc_ksw(S.A[st][wg], s);
+      db[s] = b_t ? wg_desc_ksw(S.B[st], s) : wg_desc_mnsw128(S.B[st], s);
+    }
+    if (b_t)
+      wg_mma_ktile_n128<SG::MMA_64x128x16_F32BF16BF16_SS<SG::Major::K, SG::Major::K>>(da, db, d);
+    else
+      wg_mma_ktile_n128<SG::MMA_64x128x16_F32BF16BF16_SS<SG::Major::K, SG::Major::MN>>(da, db, d);
+    wg_mbar_arrive(&bempty[st]);
+    const int tn = t + WG_N128_LEAD + 1;
+    if (tn < iters) {
+      if (tn >= WG_N128_STAGES)
+        wg_mbar_wait(&bempty[tn % WG_N128_STAGES], (tn / WG_N128_STAGES - 1) & 1);
+      issue_stage_mb(tn);
+    }
+  }
+  cute::warpgroup_wait<0>();
+  consumer_sync();
+  if (tid == 0) {
+#pragma unroll
+    for (int s = 0; s < WG_N128_STAGES; ++s) {
+      wg_mbar_init(&bfull[s], 256);
+      wg_mbar_init(&bempty[s], 256);
+    }
+  }
+  consumer_sync();
+#else
   issue_stage(k_lo, 0);
   for (int t = 0; t < iters; ++t) {
     if (t + 1 < iters) issue_stage(k_lo + (t + 1) * WG_BK, (t + 1) & 1);
@@ -846,6 +934,7 @@ __device__ __noinline__ void op_gemm_wgmma_n128(const Instr& I, int tile, void**
       wg_mma_ktile_n128<SG::MMA_64x128x16_F32BF16BF16_SS<SG::Major::K, SG::Major::MN>>(da, db, d);
     consumer_sync();
   }
+#endif
 
   float* Cs = reinterpret_cast<float*>(smem_raw);
   const int w = wtid / 32, l = wtid % 32;
@@ -977,7 +1066,13 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
   // 1024B-aligned (ws mode offsets opsmem by MK_WS_CTRL_BYTES; df base is unpadded).
   smem_raw = reinterpret_cast<char*>(
       (reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
+#ifdef MK_GEMM_MBAR_RING
+  constexpr int WG_MBAR_STAGES = 4;
+  WgmmaSmemT<WG_MBAR_STAGES>& S =
+      *reinterpret_cast<WgmmaSmemT<WG_MBAR_STAGES>*>(smem_raw);
+#else
   WgmmaSmem& S = *reinterpret_cast<WgmmaSmem*>(smem_raw);
+#endif
   const bool a_t = flags & 1, b_t = flags & 2;  // storage: a_t -> A[K,M]; b_t -> B[N,K]
   const int sk = (flags & 32) ? I.args[8] : 1;
   const int slice = tile % sk;
@@ -1032,6 +1127,60 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
 #pragma unroll
   for (int i = 0; i < 32; ++i) d[i] = 0.0f;
   const int iters = (k_hi - k_lo) / WG_BK;
+#ifdef MK_GEMM_MBAR_RING
+  constexpr int WG_MBAR_LEAD = WG_MBAR_STAGES - 2;
+  uint64_t* bfull = reinterpret_cast<uint64_t*>(smem_raw + sizeof(S));
+  uint64_t* bempty = bfull + WG_MBAR_STAGES;
+  if (tid == 0) {
+#pragma unroll
+    for (int s = 0; s < WG_MBAR_STAGES; ++s) {
+      wg_mbar_init(&bfull[s], 256);
+      wg_mbar_init(&bempty[s], 256);
+    }
+  }
+  consumer_sync();
+  auto issue_stage_mb = [&](int t) {
+    const int st = t % WG_MBAR_STAGES;
+    issue_stage(k_lo + t * WG_BK, st);
+    wg_mbar_arrive_cpasync(&bfull[st]);
+  };
+  for (int p = 0; p < min(WG_MBAR_LEAD + 1, iters); ++p) issue_stage_mb(p);
+  for (int t = 0; t < iters; ++t) {
+    const int st = t % WG_MBAR_STAGES;
+    wg_mbar_wait(&bfull[st], (t / WG_MBAR_STAGES) & 1);
+    uint64_t da[4], db[4];
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      da[s] = a_t ? wg_desc_mnsw(S.A[st][wg], s) : wg_desc_ksw(S.A[st][wg], s);
+      db[s] = b_t ? wg_desc_ksw(S.B[st], s) : wg_desc_mnsw(S.B[st], s);
+    }
+    if (!a_t && b_t)
+      wg_mma_ktile<SG::MMA_64x64x16_F32BF16BF16_SS<SG::Major::K, SG::Major::K>>(da, db, d);
+    else if (!a_t && !b_t)
+      wg_mma_ktile<SG::MMA_64x64x16_F32BF16BF16_SS<SG::Major::K, SG::Major::MN>>(da, db, d);
+    else if (a_t && b_t)
+      wg_mma_ktile<SG::MMA_64x64x16_F32BF16BF16_SS<SG::Major::MN, SG::Major::K>>(da, db, d);
+    else
+      wg_mma_ktile<SG::MMA_64x64x16_F32BF16BF16_SS<SG::Major::MN, SG::Major::MN>>(da, db, d);
+    wg_mbar_arrive(&bempty[st]);
+    const int tn = t + WG_MBAR_LEAD + 1;
+    if (tn < iters) {
+      if (tn >= WG_MBAR_STAGES)
+        wg_mbar_wait(&bempty[tn % WG_MBAR_STAGES], (tn / WG_MBAR_STAGES - 1) & 1);
+      issue_stage_mb(tn);
+    }
+  }
+  cute::warpgroup_wait<0>();
+  consumer_sync();
+  if (tid == 0) {
+#pragma unroll
+    for (int s = 0; s < WG_MBAR_STAGES; ++s) {
+      wg_mbar_init(&bfull[s], 256);
+      wg_mbar_init(&bempty[s], 256);
+    }
+  }
+  consumer_sync();
+#else
   issue_stage(k_lo, 0);
   for (int t = 0; t < iters; ++t) {
     if (t + 1 < iters) issue_stage(k_lo + (t + 1) * WG_BK, (t + 1) & 1);
@@ -1053,6 +1202,7 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
       wg_mma_ktile<SG::MMA_64x64x16_F32BF16BF16_SS<SG::Major::MN, SG::Major::MN>>(da, db, d);
     consumer_sync();  // both warpgroups done reading before the buffer is refilled
   }
+#endif
 
   // stage accumulators to smem (over the dead A/B buffers), then coalesced epilogue
   float* Cs = reinterpret_cast<float*>(smem_raw);
