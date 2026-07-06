@@ -5340,6 +5340,21 @@ orders: default-minus-old `-29.25us` and `-26.21us`, old wins `2/80` and
 `mkv3-p4b-small-qkbc-post-aflog-20260706T1715Z.log`. Detail note:
 `results/operator-gap/small-qkbc-post-aflog-keep.md`.
 
+Post-qkbc small SwiGLU derivative FMA recheck: because the original FMA win
+predated the later `SWIGLU_BWD_4W` and cache-off route, forced the old
+derivative expression with `MK_SWIGLU_FMA_DERIV=0`. The forced-old extension
+correctly dropped `_swfma`, kept route shape unchanged (`n_instr=288`,
+`critical_path=144`, `gated=127`, `SWIGLU_FWD=8/1024`,
+`SWIGLU_BWD_4W=8/4096`, `swsig=False`), and parity stayed clean (worst
+selected grad `kn.0` rel around `1.01e-02`). The first 80-rep pass only weakly
+favored old (`+0.30us` and `+2.24us`, old wins `43/80` and `46/80`), and the
+240-rep repeat split by construction order (`+1.28us`, then `-1.30us`; old wins
+`127/240` and `109/240`). Keep `_swfma` enabled: the forced-old derivative did
+not survive the both-order repeat gate with a meaningful margin. Logs:
+`mkv3-p4b-small-swfma-post-qkbc-20260706T1719Z.log` and
+`mkv3-p4b-small-swfma-post-qkbc-repeat-20260706T1724Z.log`. Detail note:
+`results/operator-gap/small-swfma-post-qkbc-keep.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
