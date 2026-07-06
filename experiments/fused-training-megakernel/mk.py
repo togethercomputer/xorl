@@ -525,6 +525,9 @@ def load_ext(
     # slab stores + OP_SKR_REDUCE. Model shape defaults flow in via the kwarg;
     # MK_HEAD_DX_SKR=<slices> force-overrides for A/B (0 restores the old route).
     head_dx_skr = int(os.environ.get("MK_HEAD_DX_SKR", int(head_dx_skr)))
+    # 240/24 producer-df study, phase 1: entry register ceiling on megakernel_df
+    # (MK_DF_MAXNREG=240 etc.; 0/unset = plain 255). Probe-only knob.
+    df_maxnreg = int(os.environ.get("MK_DF_MAXNREG", "0"))
     # D=64 qknorm-bwd fast path; MK_QKBWD_D64_CACHE=0 keeps the old generic loop for
     # A/B and bisects. Separate extension name because torch's cache is name-keyed.
     qkbc = int(os.environ.get("MK_QKBWD_D64_CACHE", "1"))
@@ -591,6 +594,7 @@ def load_ext(
         + ("_ceb2" if ce_bwd_exp2_approx else "")
         + ("_cefix" if ce_bwd_label_fixup else "")
         + (f"_idle{idle_ns}" if idle_ns != 256 else "")
+        + (f"_dfnr{df_maxnreg}" if df_maxnreg else "")
         + ("_qkbc" if qkbc else "")
         + ("_qkbc128" if qkbc128 else "")
         + ("_swfma" if swiglu_fma_deriv else "") + ("_swb2w" if swiglu_bwd_2w else "")
@@ -628,6 +632,7 @@ def load_ext(
         + (["-DMK_CE_BWD_EXP2_APPROX"] if ce_bwd_exp2_approx else [])
         + (["-DMK_CE_BWD_LABEL_FIXUP"] if ce_bwd_label_fixup else [])
         + ([f"-DMK_IDLE_NS={idle_ns}"] if idle_ns != 256 else [])
+        + ([f"-DMK_DF_MAXNREG={df_maxnreg}"] if df_maxnreg else [])
         + (["-DMK_QKBWD_D64_CACHE"] if qkbc else [])
         + (["-DMK_QKBWD_D128_CACHE"] if qkbc128 else [])
         + (["-DMK_SWIGLU_FMA_DERIV"] if swiglu_fma_deriv else [])

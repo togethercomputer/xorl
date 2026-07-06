@@ -280,7 +280,14 @@ extern "C" __global__ void megakernel(const Instr* __restrict__ instrs,
 //
 // state layout: pending[n] | cursor[n] | done[n] | ready[n] | ctrl[4]
 //   ctrl[0]=ready tail, ctrl[1]=finished instr count.
-extern "C" __global__ void MK_LB megakernel_df(const Instr* __restrict__ instrs, int n_instr,
+// MK_DF_MAXNREG (build knob): entry register ceiling for the 240/24 producer-df
+// study — phase 1 measures the consumer-ceiling tax alone (no producer WG).
+#ifdef MK_DF_MAXNREG
+#define MK_DF_NR __maxnreg__(MK_DF_MAXNREG)
+#else
+#define MK_DF_NR
+#endif
+extern "C" __global__ void MK_LB MK_DF_NR megakernel_df(const Instr* __restrict__ instrs, int n_instr,
                                          const int* __restrict__ dep_cnt,
                                          const int* __restrict__ adj_off,
                                          const int* __restrict__ adj,
