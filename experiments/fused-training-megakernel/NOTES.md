@@ -3967,6 +3967,44 @@ Validation:
 - `py_compile`, `ruff check` (system `/home/apanda/.local/bin/ruff`), and
   `git diff --check` passed.
 
+## v3 P4b D=128 fwd mbarrier ring: exact-shape qwen promotion
+
+The operator-gap round-3 D=128 forward ring is now in-model for the exact
+qwen4b-l1 shape. Unlike the rejected generic GEMM ring, this path removes the
+forward attention stage boundary that remained visible after composition, and
+it fits inside the existing high-smem qwen launch envelope.
+
+Implementation:
+- `OP_ATTN_FWD_WG128` reuses a high bit in its D argument (`1 << 24`) to select
+  the mbarrier body; `MK_ATTN_D128_FWD_MB=0` restores the old forward route,
+  `=1` forces the ring for eligible `D==128 && S%128==0` configs.
+- The ring uses 128-row q tiles, each WG owns 64 rows and accumulates both D
+  halves, with a two-stage K/V mbarrier ring (`cp.async.mbarrier.arrive.noinc`)
+  and per-WG P visibility barriers. It uses `consumer_sync()`, not
+  `__syncthreads()`, so ws mode remains valid.
+- Default gate is exact qwen4b-l1: `(H,S,I,V,nq,nkv,D,L) =
+  (2560,1024,9728,151936,32,8,128,1)`. It composes with the qwen dQ row-split
+  route and keeps the 148KB launch carveout already needed by dQ row-split.
+
+Evidence:
+- Promoted-default A/B vs forced old (`mkv3-p4b-d128-fwdmb-promoted-ab-20260706T0130Z.log`):
+  unset default routes forward `[(256, 16777344)]`; forced old routes
+  `[(512, 128)]`, both at 148KB because dQ row-split remains active. Parity is
+  clean in both construction orders (loss diff <= `9.6e-07`, worst grad rel
+  printed as `0.000000`). Paired timing over 64 pairs: old-minus-default
+  `+38.13us` / `+31.73us` medians, `58/64` and `52/64` wins.
+- Instruction profile (`mkv3-p4b-d128-fwdmb-profile-20260706T0129Z.log`):
+  forward span drops `225.4us -> 131.5us`; best profiled step total drops
+  `10813.8us -> 10742.8us`, median `10842.3us -> 10770.4us`.
+
+Validation:
+- Route/default checks: unset env fwd ring enabled, `MK_ATTN_D128_FWD_MB=0`
+  old forward route, `=1` forced ring.
+- qwen one-step smoke with the private extension build passed.
+- `test_model.py` PASS (`mkv3-p4b-d128-fwdmb-testmodel-20260706T0131Z.log`).
+- `test_ops.py` PASS (`mkv3-p4b-d128-fwdmb-testops-20260706T0131Z.log`).
+- `py_compile`, `ruff check`, and `git diff --check` passed.
+
 ## v3 P4b fwd KV-widening in-model (session 2853e0de): NO-GO — absorption
 
 The FA4-B w128 fwd port (OP_ATTN_FWD_WGW128, `megakernel-attn-w128` worktree,

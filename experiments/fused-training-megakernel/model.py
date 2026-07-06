@@ -79,7 +79,9 @@ _H256_D64_QKBWD_SPLIT_V_S = (3072, 4096, 8192)  # H==256/D==64: split qkrope v-b
 _H256_ATTN_CHUNKS = {512: (2, 2), 1024: (2, 2), 2048: (2, 2)}
 # non-WGMMA D=128 fallback DQ chunks; exact attention-shape gate from qwen4b-l1.
 _D128_GENERIC_DQ_C1 = {(2560, 1024, 32, 8)}  # (H, S, nq, nkv); D==128
+_ATTN_D128_FWD_MB_FLAG = 1 << 24
 _ATTN_D128_DQ_RS_FLAG = 1 << 24
+_D128_FWD_MBAR = {(2560, 1024, 9728, 151936, 32, 8, 128, 1)}  # H,S,I,V,nq,nkv,D,L
 _D128_DQ_ROWSPLIT = {(2560, 1024, 9728, 151936, 32, 8, 128, 1)}  # H,S,I,V,nq,nkv,D,L
 _QWEN_L1_HEAD_DX_N128_F32 = {(2560, 1024, 151936, 32, 8, 128, 1)}  # H,S,V,nq,nkv,D,L
 _QWEN_L1_DW_NO_ATOMIC_SK1 = {  # M,N,K for qwen4b-l1 dW GEMMs that split-K computes as sk=1
@@ -308,6 +310,13 @@ class MKQwen3:
             self.attn_d128_wg_enabled
             and c.S % 128 == 0
             and (dq_rs_default if dq_rs_env is None else bool(int(dq_rs_env)))
+        )
+        fwd_mb_env = os.environ.get("MK_ATTN_D128_FWD_MB")
+        fwd_mb_default = (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) in _D128_FWD_MBAR
+        self.attn_d128_fwd_mbar_enabled = (
+            self.attn_d128_wg_enabled
+            and c.S % 128 == 0
+            and (fwd_mb_default if fwd_mb_env is None else bool(int(fwd_mb_env)))
         )
         if self.attn_d128_dq_rowsplit_enabled:
             self._smem_bytes = 148 * 1024
@@ -626,10 +635,12 @@ class MKQwen3:
             elif self.attn_d128_wg_enabled:
                 # D=128 WGMMA fwd: 64-row q tiles, redundant-S both-WG softmax +
                 # split-D output halves.
+                fwd_tiles = c.nq * (c.S // (128 if self.attn_d128_fwd_mbar_enabled else 64))
+                fwd_D = c.D | (_ATTN_D128_FWD_MB_FLAG if self.attn_d128_fwd_mbar_enabled else 0)
                 p.instr(
                     mk.OP_ATTN_FWD_WG128,
-                    c.nq * (c.S // 64),
-                    [a("qkvr"), a("oatt"), a("lse"), c.S, c.nq, c.nkv, c.D, scale],
+                    fwd_tiles,
+                    [a("qkvr"), a("oatt"), a("lse"), c.S, c.nq, c.nkv, fwd_D, scale],
                 )
                 p.wave()
             elif self.attn_C > 1:

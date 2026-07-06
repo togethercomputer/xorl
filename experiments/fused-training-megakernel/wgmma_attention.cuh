@@ -56,6 +56,38 @@ __device__ __forceinline__ float wga_exp(float x) {
 #endif
 }
 
+__device__ __forceinline__ void wga_mbar_init(uint64_t* bar, uint32_t count) {
+  const uint32_t a = (uint32_t)__cvta_generic_to_shared(bar);
+  asm volatile("mbarrier.init.shared.b64 [%0], %1;" ::"r"(a), "r"(count));
+}
+
+__device__ __forceinline__ void wga_mbar_arrive(uint64_t* bar) {
+  const uint32_t a = (uint32_t)__cvta_generic_to_shared(bar);
+  asm volatile("{.reg .b64 t; mbarrier.arrive.shared.b64 t, [%0];}" ::"r"(a));
+}
+
+__device__ __forceinline__ void wga_mbar_arrive_cpasync(uint64_t* bar) {
+  const uint32_t a = (uint32_t)__cvta_generic_to_shared(bar);
+  asm volatile("cp.async.mbarrier.arrive.noinc.shared.b64 [%0];" ::"r"(a));
+}
+
+__device__ __forceinline__ void wga_mbar_wait(uint64_t* bar, uint32_t phase) {
+  const uint32_t a = (uint32_t)__cvta_generic_to_shared(bar);
+  uint32_t done = 0;
+  while (!done) {
+    asm volatile(
+        "{.reg .pred p; mbarrier.try_wait.parity.shared.b64 p, [%1], %2; "
+        "selp.u32 %0, 1, 0, p;}"
+        : "=r"(done)
+        : "r"(a), "r"(phase)
+        : "memory");
+  }
+}
+
+__device__ __forceinline__ void wga_wg_sync(int wg) {
+  asm volatile("bar.sync %0, 128;" ::"r"(2 + wg) : "memory");
+}
+
 // Loader lane mapping (v3 P4b): off64's bank quad depends only on r&7, so the old
 // v -> (r = v/8, c8 = v%8*8) assignment put each 8-lane store phase on ONE row =
 // one bank quad = 8-way conflict (the same pathology SW128 fixed in the gemm; here
@@ -1042,11 +1074,214 @@ __device__ __forceinline__ void wga_mma64_kk_k128_x2(const bf16* A1, const bf16*
   cute::warpgroup_wait<0>();
 }
 
+constexpr int WGA_FWD128_MBAR_FLAG = 1 << 24;
+#define WGA_FWD_D128_MB_S 2
+struct __align__(16) AttnWgFwd128MbSmem {  // 112KB + barriers
+  bf16 Q[2][8192];                     // [wg] 64 q rows x 128 D
+  bf16 P[2][4096];                     // [wg] [q64, kv64]
+  bf16 K[WGA_FWD_D128_MB_S][8192];     // ring stages
+  bf16 V[WGA_FWD_D128_MB_S][8192];
+  uint64_t bfull[WGA_FWD_D128_MB_S];
+  uint64_t bempty[WGA_FWD_D128_MB_S];
+};
+
+__device__ void op_attn_fwd_wg128_mbar(const Instr& I, int tile, void** bufs,
+                                       char* smem_raw) {
+  constexpr int D = 128;
+  constexpr int NS = WGA_FWD_D128_MB_S;
+  constexpr int L = NS - 2;
+  const int S = I.args[3], nq = I.args[4], nkv = I.args[5];
+  const float scale = __int_as_float(I.args[7]);
+  const bf16* qkv = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
+  bf16* O = reinterpret_cast<bf16*>(bufs[I.args[1]]);
+  float* LSE = reinterpret_cast<float*>(bufs[I.args[2]]);
+  AttnWgFwd128MbSmem& sm = *reinterpret_cast<AttnWgFwd128MbSmem*>(smem_raw);
+
+  const int qh = tile % nq;
+  const int q0 = (tile / nq) * 128;
+  const int kvh = qh / (nq / nkv);
+  const int stride = (nq + 2 * nkv) * D;
+  const int tid = mk_tid();
+  const int wg = tid >> 7, wtid = tid & 127;
+  const int q0wg = q0 + wg * 64;
+
+  if (tid == 0) {
+#pragma unroll
+    for (int s = 0; s < NS; ++s) {
+      wga_mbar_init(&sm.bfull[s], MK_CONSUMERS);
+      wga_mbar_init(&sm.bempty[s], MK_CONSUMERS);
+    }
+  }
+
+  auto issue_kv_stage = [&](int t) {
+    const int st = t % NS;
+    const int k0 = t * 64;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int v = tid + i * MK_CONSUMERS;
+      const int h = v >> 9, w9 = v & 511;
+      const int r = ((w9 >> 6) << 3) | (w9 & 7), c8 = ((w9 >> 3) & 7) << 3;
+      __pipeline_memcpy_async(
+          (char*)(sm.K[st] + h * 4096) + wga_off64(r, c8),
+          &qkv[(int64_t)(k0 + r) * stride + (nq + kvh) * D + h * 64 + c8], 16);
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int v = tid + i * MK_CONSUMERS;
+      const int h = v >> 9, w9 = v & 511;
+      const int r = ((w9 >> 6) << 3) | (w9 & 7), c8 = ((w9 >> 3) & 7) << 3;
+      __pipeline_memcpy_async(
+          (char*)(sm.V[st] + h * 4096) + wga_off64(r, c8),
+          &qkv[(int64_t)(k0 + r) * stride + (nq + nkv + kvh) * D + h * 64 + c8], 16);
+    }
+    __pipeline_commit();
+    wga_mbar_arrive_cpasync(&sm.bfull[st]);
+  };
+
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int v = tid + i * MK_CONSUMERS;
+    const int qg = v >> 10, rem = v & 1023;
+    const int h = rem >> 9, w9 = rem & 511;
+    const int r = ((w9 >> 6) << 3) | (w9 & 7), c8 = ((w9 >> 3) & 7) << 3;
+    __pipeline_memcpy_async(
+        (char*)(sm.Q[qg] + h * 4096) + wga_off64(r, c8),
+        &qkv[(int64_t)(q0 + qg * 64 + r) * stride + qh * D + h * 64 + c8], 16);
+  }
+  consumer_sync();  // barriers initialized; Q rides stage 0's commit group
+
+  const int n_stages = q0 / 64 + 2;
+#pragma unroll
+  for (int p = 0; p < (L + 1 < n_stages ? L + 1 : n_stages); ++p) issue_kv_stage(p);
+
+  float o0[32], o1[32];
+#pragma unroll
+  for (int i = 0; i < 32; ++i) o0[i] = o1[i] = 0.0f;
+  float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
+  const int w = wtid >> 5, ln = wtid & 31;
+  const int r0 = w * 16 + (ln >> 2);
+  const int cb = (ln & 3) * 2;
+
+  for (int t = 0; t < n_stages; ++t) {
+    const int st = t % NS;
+    const int k0 = t * 64;
+    wga_mbar_wait(&sm.bfull[st], (t / NS) & 1);
+    const int tn = t + L + 1;
+    if (tn < n_stages) {
+      if (tn >= NS) wga_mbar_wait(&sm.bempty[tn % NS], (tn / NS - 1) & 1);
+      issue_kv_stage(tn);
+    }
+    const bool skip = k0 > q0wg + 63;
+    float alpha[2];
+    if (!skip) {
+      float s[32];
+#pragma unroll
+      for (int i = 0; i < 32; ++i) s[i] = 0.0f;
+      wga_mma64_kk_k128(sm.Q[wg], sm.K[st], s);
+      const bool masked = k0 + 63 > q0wg;
+      float rmax[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const int qr = q0wg + r0 + 8 * i;
+#pragma unroll
+        for (int n8 = 0; n8 < 8; ++n8)
+#pragma unroll
+          for (int j = 0; j < 2; ++j) {
+            const int idx = n8 * 4 + i * 2 + j;
+            float sc = s[idx] * scale;
+            if (masked && k0 + n8 * 8 + cb + j > qr) sc = -INFINITY;
+            s[idx] = sc;
+            rmax[i] = fmaxf(rmax[i], sc);
+          }
+      }
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        rmax[i] = fmaxf(rmax[i], __shfl_xor_sync(0xffffffffu, rmax[i], 1));
+        rmax[i] = fmaxf(rmax[i], __shfl_xor_sync(0xffffffffu, rmax[i], 2));
+        const float mnew = fmaxf(m[i], rmax[i]);
+        alpha[i] = wga_exp(m[i] - mnew);
+        m[i] = mnew;
+      }
+      float rsum[2] = {0.0f, 0.0f};
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+#pragma unroll
+        for (int n8 = 0; n8 < 8; ++n8) {
+          const int idx = n8 * 4 + i * 2;
+          const float p0 = wga_exp(s[idx] - m[i]);
+          const float p1 = wga_exp(s[idx + 1] - m[i]);
+          rsum[i] += p0 + p1;
+          __nv_bfloat162 pv;
+          pv.x = f2bf(p0);
+          pv.y = f2bf(p1);
+          *reinterpret_cast<__nv_bfloat162*>(
+              (char*)sm.P[wg] + wga_off64(r0 + 8 * i, n8 * 8 + cb)) = pv;
+        }
+        rsum[i] += __shfl_xor_sync(0xffffffffu, rsum[i], 1);
+        rsum[i] += __shfl_xor_sync(0xffffffffu, rsum[i], 2);
+        l[i] = l[i] * alpha[i] + rsum[i];
+      }
+      wga_fence_smem_to_async();
+      wga_wg_sync(wg);
+#pragma unroll
+      for (int n8 = 0; n8 < 8; ++n8)
+#pragma unroll
+        for (int i = 0; i < 2; ++i)
+#pragma unroll
+          for (int j = 0; j < 2; ++j) {
+            o0[n8 * 4 + i * 2 + j] *= alpha[i];
+            o1[n8 * 4 + i * 2 + j] *= alpha[i];
+          }
+      wga_mma64_x2<WGA_MMA_KMN, false, true>(
+          sm.P[wg], sm.V[st], o0,
+          sm.P[wg], sm.V[st] + 4096, o1);
+    }
+    wga_mbar_arrive(&sm.bempty[st]);
+  }
+
+  const float inv[2] = {1.0f / l[0], 1.0f / l[1]};
+  if ((ln & 3) == 0) {
+    LSE[(int64_t)qh * S + q0wg + r0] = m[0] + wga_lse_log(l[0]);
+    LSE[(int64_t)qh * S + q0wg + r0 + 8] = m[1] + wga_lse_log(l[1]);
+  }
+  float* Cs = reinterpret_cast<float*>(smem_raw);
+  consumer_sync();  // all wgmma reads done before Cs overlays the ring
+#pragma unroll
+  for (int half = 0; half < 2; ++half) {
+    const float(&oc)[32] = half == 0 ? o0 : o1;
+#pragma unroll
+    for (int n8 = 0; n8 < 8; ++n8)
+#pragma unroll
+      for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 2; ++j)
+          Cs[(wg * 64 + r0 + 8 * i) * 68 + n8 * 8 + cb + j] =
+              oc[n8 * 4 + i * 2 + j] * inv[i];
+    consumer_sync();
+#pragma unroll
+    for (int g = 0; g < 4; ++g) {
+      const int gid = tid + g * MK_CONSUMERS;
+      const int r = gid >> 3, c8 = (gid & 7) << 3;
+      uint4 out;
+      bf16* oe = reinterpret_cast<bf16*>(&out);
+#pragma unroll
+      for (int e = 0; e < 8; ++e) oe[e] = f2bf(Cs[r * 68 + c8 + e]);
+      *reinterpret_cast<uint4*>(
+          &O[(int64_t)(q0 + r) * (nq * D) + qh * D + half * 64 + c8]) = out;
+    }
+    consumer_sync();
+  }
+}
+
 __device__ void op_attn_fwd_wg128(const Instr& I, int tile, void** bufs,
                                   char* smem_raw) {
   constexpr int D = 128;
   const int S = I.args[3], nq = I.args[4], nkv = I.args[5];
   const float scale = __int_as_float(I.args[7]);
+  if (I.args[6] & WGA_FWD128_MBAR_FLAG) {
+    op_attn_fwd_wg128_mbar(I, tile, bufs, smem_raw);
+    return;
+  }
   const bf16* qkv = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
   bf16* O = reinterpret_cast<bf16*>(bufs[I.args[1]]);
   float* LSE = reinterpret_cast<float*>(bufs[I.args[2]]);
