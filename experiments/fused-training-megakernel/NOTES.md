@@ -4449,6 +4449,39 @@ need re-tuning). Given five absorption strikes, treat as low-prior. The op
 stays default-off as a building block; the standalone win in the opgap ledger
 stands — this entry records only its in-model fate.
 
+## v3 P4b rowop long-S gap decomposition (session 2853e0de): bodies are FINE
+
+The last undecomposed on-path bucket is settled. In-model, the rowop family
+reads 540/740/1330us on-path at S3072/4096/8192 vs the baseline's triton-fused
+170-337us (opgap baseline CSVs) — a deficit that GROWS to ~1ms at S8192. The
+standalone probe (`results/rowop_scaling_probe_2853e0de.py <S>`, single-instr
+programs, GPU 6, `mkv3-p4b-rowop-scaling-v2-20260706T033903Z.log`) shows
+the OP BODIES ARE AT BASELINE PARITY — the deficit is entirely critical-path
+span stretch:
+
+| S | rms_dx | rms_dw | qknorm_bwd | swiglu_bwd_2w | (launch floor) |
+|---|---:|---:|---:|---:|---:|
+| 2048 | 19.3 | 19.4 | 32.5 | 20.9 | 16.8 |
+| 4096 | 22.6 | 21.9 | 48.4 | 24.3 | 16.6 |
+| 8192 | 26.2 | 27.1 | 107.3 | 40.0 | 16.6 |
+
+Launch-floor-subtracted per-model-pass op cost at S4096: rms_dx ~54 (9 instrs)
++ qknorm ~127 (4) + swiglu ~31 (4) + rms_dw ~48 (9) ≈ 260us vs the baseline's
+254us — PARITY. The in-model per-instance span (e.g. rms_dx 29.1us vs ~6us
+op-only) is tile spread across a window where co-scheduled gemm/attention work
+holds the SMs: the rowops are serially chained between gemms, so their
+realized span absorbs the surrounding contention. Exception: QKNORM_ROPE_BWD
+at S8192 is genuinely op-body-bound (~91us/instr standalone == its in-model
+span; it moves ~24MB/instr of L2-resident fp32 workspace — bandwidth-class,
+little headroom).
+
+CONSEQUENCE for the roadmap: there is NO rowop op-quality lane. The only lever
+that moves this bucket is the v2-roadmap STRUCTURAL item — fusing rowops into
+the producing gemm epilogues (the ssq/bit13 fusion already killed the variance
+pass; the dx-side and swiglu-side fusions are unexplored). That is a major
+multi-session arc: each fused epilogue deletes a chain hop AND removes the
+rowop's exposure to co-scheduling stretch. Flagged unclaimed on the board.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
