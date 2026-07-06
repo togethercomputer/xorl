@@ -6136,6 +6136,30 @@ vs graph+ ~1892 (was ~3400/1.80x this morning; ~1.71x now). Logs:
 mkv3-p4b-postskr-resweep3-*, mkv3-p4b-small-idle{-postskr,64-check,128-rev,
 64-promote-check}-*.log.
 
+S3072 n256 TMA boundary promotion + S4096/S8192 no-go: after the qwen NN+TN
+TMA integration was owner-validated at head (forced-old +685.36/+695.44us,
+0/16 both orders — larger than at the 005ad84 base; the SKR/lm-head-n256/
+qkbwd-dw landings composed positively), the same `MK_GEMM_N256_TMA=1` was
+probed source-free across the H256/D64 n256 shapes. S8192 is NO-GO
+(+27.28/+33.58us, 2/16 both orders): 12 of its 13 eligible rows are short-K
+(K=256-1536, 4-24 ring iters) where the elected-thread fence+expect_tx
+serialization does not amortize — the win class is long-K/giant-hop (the
+probe also proved the STAGES=2 TMA template arm parity-clean). S4096 is
+NO-GO (+6.13/+11.94us, <=7/40). S3072 — whose ONLY eligible row is the
+long-K head-dX `3072x256x8192` (128 iters) — WINS both orders: -7.12us
+(35/40) and -10.16us (39/40), and was promoted:
+`gemm_n256_tma_default = exact_qwen4b_l1 or exact_s3072`. Promoted-default
+route shows exactly one tma row (`3072x256x8192.f136`, ext `..._gmbar_gtma`);
+forced-old `MK_GEMM_N256_TMA=0` lost both orders (+11.18us 4/40, +8.06us
+6/40); parity clean; no device-code change (paths/res-usage from the qwen
+promotion). test_model passed. Logs:
+`mkv3-p4b-qwen-n256tma-head-ae6dca2-*-20260706T2226Z.log`,
+`mkv3-p4b-s8192-n256tma-*-20260706T2241Z.log`,
+`mkv3-p4b-s{3072,4096}-n256tma-*-20260706T2256Z.log`,
+`mkv3-p4b-s3072-n256tma-promoted-20260706T2325Z.log`. Detail notes:
+`results/operator-gap/s8192-n256tma-nogo.md`,
+`results/operator-gap/s3072-n256tma-promote.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

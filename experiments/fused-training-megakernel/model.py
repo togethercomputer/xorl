@@ -363,10 +363,19 @@ class MKQwen3:
         # cp.async.bulk.tensor + expect_tx from a global tensormap table).
         # Promoted exact-qwen: -340.40/-335.25us, 16/16 both construction
         # orders, parity clean (mkv3-p4b-qwen-n256tma-*-20260706T2145Z.log).
+        # Also exact H256/D64/S3072, whose only eligible row is the long-K
+        # head-dX 3072x256x8192: -7.12us (35/40) / -10.16us (39/40) both
+        # orders. S4096 (+6.1/+11.9, <=7/40) and S8192 (+27.3/+33.6, 2/16 —
+        # 12 of 13 rows short-K, fence/expect_tx does not amortize) are
+        # NO-GO; see results/operator-gap/s8192-n256tma-nogo.md.
         # MK_GEMM_N256_TMA=0 restores the per-thread cp.async ring feed;
         # =1 force-enables for probing; TN rows stay off (order-mixed
-        # standalone) behind MK_GEMM_N256_TMA_TN.
-        self.gemm_n256_tma_default = exact_qwen4b_l1
+        # standalone) behind MK_GEMM_N256_TMA_TN except at exact qwen.
+        exact_s3072 = (
+            (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
+            == (256, 4, 3072, 4, 2, 64, 768, 8192)
+        )
+        self.gemm_n256_tma_default = exact_qwen4b_l1 or exact_s3072
         self.gemm_direct_bf16_epilogue_default = c.D == 64 and (
             c.S == 128 or (c.H, c.L, c.S, c.nq, c.nkv, c.I) == (512, 8, 1024, 8, 4, 1536)
         )
