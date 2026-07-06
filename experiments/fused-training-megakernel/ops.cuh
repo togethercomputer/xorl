@@ -936,6 +936,28 @@ __device__ __noinline__ void op_gemm_wgmma_n128(const Instr& I, int tile, void**
   }
 #endif
 
+#ifdef MK_GEMM_DIRECT_BF16_EPILOGUE
+  if (!(flags & (4 | 8 | 16 | 32 | 256 | 1024 | 2048 | 8192))) {
+    bf16* C = reinterpret_cast<bf16*>(Cp);
+    const int w = wtid / 32, l = wtid & 31;
+    const int cb = (l & 3) * 2;
+#pragma unroll
+    for (int n8 = 0; n8 < 16; ++n8) {
+      const int c = n8 * 8 + cb;
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const int r = wg * 64 + w * 16 + l / 4 + 8 * i;
+        const int64_t idx = (int64_t)(m0 + r) * N + n0 + c;
+        __nv_bfloat162 out;
+        out.x = f2bf(d[n8 * 4 + i * 2 + 0]);
+        out.y = f2bf(d[n8 * 4 + i * 2 + 1]);
+        *reinterpret_cast<__nv_bfloat162*>(&C[idx]) = out;
+      }
+    }
+    return;
+  }
+#endif
+
   float* Cs = reinterpret_cast<float*>(smem_raw);
   const int w = wtid / 32, l = wtid % 32;
   {
@@ -1201,6 +1223,28 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
     else
       wg_mma_ktile<SG::MMA_64x64x16_F32BF16BF16_SS<SG::Major::MN, SG::Major::MN>>(da, db, d);
     consumer_sync();  // both warpgroups done reading before the buffer is refilled
+  }
+#endif
+
+#ifdef MK_GEMM_DIRECT_BF16_EPILOGUE
+  if (!(flags & (4 | 8 | 16 | 32 | 256 | 1024 | 2048 | 8192))) {
+    bf16* C = reinterpret_cast<bf16*>(Cp);
+    const int w = wtid / 32, l = wtid & 31;
+    const int cb = (l & 3) * 2;
+#pragma unroll
+    for (int n8 = 0; n8 < 8; ++n8) {
+      const int c = n8 * 8 + cb;
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const int r = wg * 64 + w * 16 + l / 4 + 8 * i;
+        const int64_t idx = (int64_t)(m0 + r) * N + n0 + c;
+        __nv_bfloat162 out;
+        out.x = f2bf(d[n8 * 4 + i * 2 + 0]);
+        out.y = f2bf(d[n8 * 4 + i * 2 + 1]);
+        *reinterpret_cast<__nv_bfloat162*>(&C[idx]) = out;
+      }
+    }
+    return;
   }
 #endif
 
