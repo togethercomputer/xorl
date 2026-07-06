@@ -4160,6 +4160,41 @@ GEMM body that uses cluster DSMEM/TMA multicast for the shared B operand. The
 existing scheduler still claims one tile at a time from a global cursor, so
 cluster launch alone cannot reduce the qwen giant-vocab spans.
 
+## v3 P4b qwen n256 N-major tile order: exact-route promotion
+
+The cluster multicast lane wants adjacent M bands to work on the same 256-column
+B tile at the same time. The existing n256 tile order was M-major
+(`m_tile * n_tiles + n_tile`), which schedules all columns for one M band before
+the next M band. Bit26 now selects an N-major decode for the exact qwen n256
+direct routes: `n_tile * m_tiles + m_tile`. This keeps the same tile count,
+math, smem page, and epilogues, but groups all M bands for a B tile. It is also
+the natural precondition for a later cluster-2 B-multicast body.
+
+Route/control:
+- `MK_WGMMA_N256_NMAJOR=0` restores the old M-major tile order.
+- Unset default and `MK_WGMMA_N256_NMAJOR=1` set bit26 on all 11 exact qwen
+  n256 rows; route log `mkv3-p4b-qwen-n256-nmajor-route-20260706T0242Z.log`.
+- df2 region-watermark gating treats bit26 GEMMs as non-row-linear, because the
+  old watermark proof depends on M-major producer tile order.
+
+Evidence:
+- Old-vs-new qwen smoke
+  (`mkv3-p4b-qwen-n256-nmajor-smoke-20260706T0239Z.log`) was clean: loss diff
+  `-1.90734863e-06`, worst full-gradient relative diff `4.488093e-07`.
+- Paired qwen timing (`mkv3-p4b-qwen-n256-nmajor-ab-20260706T0242Z.log`) won in
+  both construction orders: old-minus-new medians `+39.87us` and `+29.97us`,
+  overall `+35.36us` with `64/96` wins.
+- Profile (`mkv3-p4b-qwen-n256-nmajor-profile-20260706T0242Z.log`) showed the
+  intended local movement despite noisy total attribution: lm-head fwd
+  `2558.7us -> 2514.7us` against the pre-nmajor HEAD profile, and off-path vocab
+  dW `5517.6us -> 5049.1us`.
+
+Validation:
+- Expanded `test_ops.py` includes bit26 NT-tail, NN, and TN n256 stage3 cases
+  with `M=256` so the remap is actually exercised; PASS
+  (`mkv3-p4b-n256-nmajor-testops-20260706T0243Z.log`).
+- `test_model.py` PASS (`mkv3-p4b-n256-nmajor-testmodel-20260706T0245Z.log`).
+
 ## v3 P4b D=128 dQ register-A feed: NO-GO in-model
 
 The operator-gap standalone `attn_dq_d128_rf` result was ported narrowly onto

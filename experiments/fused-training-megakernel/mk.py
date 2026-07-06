@@ -53,6 +53,7 @@ OP_ATTN_DQ_WG128 = 34  # D=128 wgmma attention dQ (same pattern)
 
 GEMM_BM, GEMM_BN = 64, 128  # keep in sync with ops.cuh
 GEMM_N256_STAGE3_FLAG = 1 << 25
+GEMM_N256_NMAJOR_FLAG = 1 << 26
 FILL_CHUNK = 16384  # elements per fill/cvt work item (MK_CHUNK in ops.cuh)
 
 
@@ -218,6 +219,18 @@ def wgmma_n256_stage3_flag(M, N, K):
     if M % 128 or K % 64:
         return 0
     return GEMM_N256_STAGE3_FLAG if (M, N, K) in _QWEN_N256_STAGE3_SHAPES else 0
+
+
+def wgmma_n256_nmajor_flag(M, N, K):
+    """Opt-in n-major tile order for exact qwen n256 direct routes.
+
+    This preserves the same tile count and math but groups all M bands for a 256-column
+    B tile together. It is a probe for B-cache reuse and the future cluster-2 B-multicast
+    scheduler/body, so it remains env-gated by the model builder.
+    """
+    if M % 128 or K % 64:
+        return 0
+    return GEMM_N256_NMAJOR_FLAG if (M, N, K) in _QWEN_N256_STAGE3_SHAPES else 0
 
 
 def wgmma_n256_head_dx_ok(M, N, K, flags):
@@ -588,6 +601,8 @@ _ROW_READ_POS = {
 def _gemm_row_info(args):
     """(rows, tiles_per_region) for a gemm's OUTPUT, or None if not 128-row-band linear."""
     flags, M, N = args[6], args[3], args[4]
+    if flags & GEMM_N256_NMAJOR_FLAG:
+        return None
     if M % REGION_ROWS:
         return None
     sk = args[8] if flags & 32 else 1

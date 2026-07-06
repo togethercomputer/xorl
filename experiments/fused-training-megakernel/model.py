@@ -324,6 +324,12 @@ class MKQwen3:
             n256_stage3_default if n256_stage3_env is None else
             (bool(int(n256_stage3_env)) and n256_stage3_default)
         )
+        n256_nmajor_env = os.environ.get("MK_WGMMA_N256_NMAJOR")
+        n256_nmajor_default = n256_stage3_default
+        self.n256_nmajor_enabled = (
+            n256_nmajor_default if n256_nmajor_env is None else
+            (bool(int(n256_nmajor_env)) and n256_nmajor_default)
+        )
         if self.attn_d128_dq_rowsplit_enabled or self.n256_stage3_enabled:
             self._smem_bytes = 148 * 1024
         else:
@@ -362,6 +368,9 @@ class MKQwen3:
         def n256_stage3_flag(M, N, K):
             return mk.wgmma_n256_stage3_flag(M, N, K) if self.n256_stage3_enabled else 0
 
+        def n256_nmajor_flag(M, N, K):
+            return mk.wgmma_n256_nmajor_flag(M, N, K) if self.n256_nmajor_enabled else 0
+
         def gemm(a, b, out, M, N, K, flags, res=0, ssq=0, ssq_nparts=0):
             # ssq/ssq_nparts (bit13, v3 P4b r4): the wgmma epilogues emit per-64-col
             # sum-of-squares partials of the bf16-rounded output — free math on values
@@ -376,10 +385,11 @@ class MKQwen3:
                         f = ((flags | 128) & ~(4 | 32))
                         if mk.wgmma_n256_dw_tn_ok(M, N, K, f):
                             stage3 = n256_stage3_flag(M, N, K)
+                            nmajor = n256_nmajor_flag(M, N, K)
                             p.instr(
                                 mk.OP_GEMM,
                                 mk.gemm_tiles_wgmma_n256_direct(M, N),
-                                [a, b, out, M, N, K, f | 16384 | stage3, res],
+                                [a, b, out, M, N, K, f | 16384 | stage3 | nmajor, res],
                             )
                             return False
                         p.instr(
@@ -411,13 +421,14 @@ class MKQwen3:
             do_ssq = ssq_nparts > 0 and ssq_fuse
             if mk.wgmma_n256_nt_bf16_ok(M, N, K, flags):
                 stage3 = n256_stage3_flag(M, N, K)
+                nmajor = n256_nmajor_flag(M, N, K)
                 p.instr(
                     mk.OP_GEMM,
                     mk.gemm_tiles_wgmma_n256_direct(M, N),
                     [a, b, out, M, N, K,
-                     flags | 128 | 16384 | stage3 | (8192 if do_ssq else 0),
+                     flags | 128 | 16384 | stage3 | nmajor | (8192 if do_ssq else 0),
                      res, 0, ssq, ssq_nparts] if do_ssq
-                    else [a, b, out, M, N, K, flags | 128 | 16384 | stage3, res],
+                    else [a, b, out, M, N, K, flags | 128 | 16384 | stage3 | nmajor, res],
                 )
                 return do_ssq
             if mk.wgmma_n128_ok(M, N, K, flags):  # m64n128 NT tile (P4b r3)
@@ -734,12 +745,14 @@ class MKQwen3:
             n256d = mk.wgmma_n256_direct_ok(c.S, c.V, c.H, 2 | 2048)
             n128 = (not n256d) and mk.wgmma_n128_ok(c.S, c.V, c.H, 2 | 2048)
             n256_stage3_bits = n256_stage3_flag(c.S, c.V, c.H) if n256d else 0
+            n256_nmajor_bits = n256_nmajor_flag(c.S, c.V, c.H) if n256d else 0
             p.instr(
                 mk.OP_GEMM,
                 (mk.gemm_tiles_wgmma_n256_direct(c.S, c.V) if n256d else
                  mk.gemm_tiles_wgmma_n128(c.S, c.V) if n128 else mk.gemm_tiles_wgmma(c.S, c.V)),
                 [B(A["xnf"]), B(self.params["wlm"]), B(A["logits"]), c.S, c.V, c.H,
-                 2 | 128 | 2048 | n256_stage3_bits | (16384 if n256d else 4096 if n128 else 0), 0, 0,
+                 2 | 128 | 2048 | n256_stage3_bits | n256_nmajor_bits |
+                 (16384 if n256d else 4096 if n128 else 0), 0, 0,
                  B(W["lse_parts"]), c.V // 64],
             )
             p.wave()
@@ -798,10 +811,11 @@ class MKQwen3:
         if head_dx_no_atomic_sk1 and sk_head == 1:
             if mk.wgmma_n256_head_dx_ok(c.S, c.H, c.V, head_dx_flags):
                 stage3 = n256_stage3_flag(c.S, c.H, c.V)
+                nmajor = n256_nmajor_flag(c.S, c.H, c.V)
                 p.instr(
                     mk.OP_GEMM,
                     mk.gemm_tiles_wgmma_n256_direct(c.S, c.H),
-                    head_dx_args + [head_dx_flags | 16384 | stage3, 0],
+                    head_dx_args + [head_dx_flags | 16384 | stage3 | nmajor, 0],
                 )
             elif head_dx_n128_f32 and c.S % 128 == 0 and c.H % 128 == 0 and c.V % 64 == 0:
                 p.instr(

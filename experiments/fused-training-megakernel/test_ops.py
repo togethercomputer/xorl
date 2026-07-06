@@ -67,7 +67,7 @@ def test_gemm():
     )
     check("NT n256 bf16", C2n, A2.float() @ Wt2.float().T, atol=0.35)
 
-    M3, N3, K3 = 128, 384, 64  # includes a 128-column n256 tail
+    M3, N3, K3 = 256, 384, 64  # includes a 128-column n256 tail and >1 M tile
     A3 = torch.randn(M3, K3, device=DEV, dtype=torch.bfloat16)
     Wt3 = torch.randn(N3, K3, device=DEV, dtype=torch.bfloat16)
     C3s = torch.empty(M3, N3, device=DEV, dtype=torch.bfloat16)
@@ -90,6 +90,26 @@ def test_gemm():
     )
     check("NT n256 stage3 bf16", C3s, A3.float() @ Wt3.float().T, atol=0.35)
 
+    C3sn = torch.empty(M3, N3, device=DEV, dtype=torch.bfloat16)
+    run1(
+        lambda p: p.instr(
+            mk.OP_GEMM,
+            mk.gemm_tiles_wgmma_n256_direct(M3, N3),
+            [
+                p.buf(A3),
+                p.buf(Wt3),
+                p.buf(C3sn),
+                M3,
+                N3,
+                K3,
+                2 | 128 | 16384 | mk.GEMM_N256_STAGE3_FLAG | mk.GEMM_N256_NMAJOR_FLAG,
+                0,
+            ],
+        ),
+        smem_bytes=148 * 1024,
+    )
+    check("NT n256 nmajor bf16", C3sn, A3.float() @ Wt3.float().T, atol=0.35)
+
     B3 = torch.randn(K3, 256, device=DEV, dtype=torch.bfloat16)
     C3nn = torch.empty(M3, 256, device=DEV, dtype=torch.float32)
     run1(
@@ -111,6 +131,26 @@ def test_gemm():
     )
     check("NN n256 stage3 fp32", C3nn, A3.float() @ B3.float(), atol=0.35)
 
+    C3nnn = torch.empty(M3, 256, device=DEV, dtype=torch.float32)
+    run1(
+        lambda p: p.instr(
+            mk.OP_GEMM,
+            mk.gemm_tiles_wgmma_n256_direct(M3, 256),
+            [
+                p.buf(A3),
+                p.buf(B3),
+                p.buf(C3nnn),
+                M3,
+                256,
+                K3,
+                8 | 128 | 16384 | mk.GEMM_N256_STAGE3_FLAG | mk.GEMM_N256_NMAJOR_FLAG,
+                0,
+            ],
+        ),
+        smem_bytes=148 * 1024,
+    )
+    check("NN n256 nmajor fp32", C3nnn, A3.float() @ B3.float(), atol=0.35)
+
     At3 = torch.randn(K3, M3, device=DEV, dtype=torch.bfloat16)
     C3tn = torch.empty(M3, 256, device=DEV, dtype=torch.float32)
     run1(
@@ -131,6 +171,26 @@ def test_gemm():
         smem_bytes=148 * 1024,
     )
     check("TN n256 stage3 fp32", C3tn, At3.float().T @ B3.float(), atol=0.35)
+
+    C3tnn = torch.empty(M3, 256, device=DEV, dtype=torch.float32)
+    run1(
+        lambda p: p.instr(
+            mk.OP_GEMM,
+            mk.gemm_tiles_wgmma_n256_direct(M3, 256),
+            [
+                p.buf(At3),
+                p.buf(B3),
+                p.buf(C3tnn),
+                M3,
+                256,
+                K3,
+                1 | 8 | 128 | 16384 | mk.GEMM_N256_STAGE3_FLAG | mk.GEMM_N256_NMAJOR_FLAG,
+                0,
+            ],
+        ),
+        smem_bytes=148 * 1024,
+    )
+    check("TN n256 nmajor fp32", C3tnn, At3.float().T @ B3.float(), atol=0.35)
 
     Res2 = torch.randn(M2, N2, device=DEV, dtype=torch.bfloat16)
     C2r = torch.empty(M2, N2, device=DEV, dtype=torch.bfloat16)

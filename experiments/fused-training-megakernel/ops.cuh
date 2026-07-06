@@ -111,6 +111,8 @@ __device__ __forceinline__ void op_axpy_f32(const Instr& I, int tile, void** buf
 //                CE/LSE partials (bit11) and NN fp32 head-dX.
 //   flags bit25: opt-in 3-stage operand ring for the direct m64n256 tile. This needs
 //                the qwen 148KB launch page and is never emitted by generic routes.
+//   flags bit26: opt-in N-major tile order for exact qwen n256 routes. This groups
+//                adjacent M bands for a shared 256-column B tile.
 // args: {A, B, C, M, N, K, flags, res, sk}
 // tile id = (m_tile * n_tiles + n_tile) * sk + k_slice.
 
@@ -322,6 +324,7 @@ __device__ void op_gemm(const Instr& I, int tile, void** bufs, char* smem_raw) {
 #define WG_BN 64
 #define WG_BK 64
 #define GEMM_N256_STAGE3_FLAG (1 << 25)
+#define GEMM_N256_NMAJOR_FLAG (1 << 26)
 
 struct WgmmaSmem {
   bf16 A[2][2][4][1024];  // [stage][row-half][k16-step][64x16 INTER block] = 32KB
@@ -502,8 +505,12 @@ __device__ __noinline__ void op_gemm_wgmma_n256_direct_impl(const Instr& I, int 
       (reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
   WgmmaSmemN256T<STAGES>& S = *reinterpret_cast<WgmmaSmemN256T<STAGES>*>(smem_raw);
   const int n_tiles = (N + 255) / 256;
-  const int m0 = (tile / n_tiles) * WG_BM;
-  const int n0 = (tile % n_tiles) * 256;
+  const int m_tiles = I.args[3] / WG_BM;
+  const bool nmajor = flags & GEMM_N256_NMAJOR_FLAG;
+  const int mt = nmajor ? (tile % m_tiles) : (tile / n_tiles);
+  const int nt = nmajor ? (tile / m_tiles) : (tile % n_tiles);
+  const int m0 = mt * WG_BM;
+  const int n0 = nt * 256;
   const int valid_cols = min(256, N - n0);
   if (valid_cols <= 0) return;
 
@@ -677,8 +684,12 @@ __device__ __noinline__ void op_gemm_wgmma_n256_nn_f32_impl(const Instr& I, int 
       (reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
   WgmmaSmemN256T<STAGES>& S = *reinterpret_cast<WgmmaSmemN256T<STAGES>*>(smem_raw);
   const int n_tiles = N / 256;
-  const int m0 = (tile / n_tiles) * WG_BM;
-  const int n0 = (tile % n_tiles) * 256;
+  const int m_tiles = M / WG_BM;
+  const bool nmajor = flags & GEMM_N256_NMAJOR_FLAG;
+  const int mt = nmajor ? (tile % m_tiles) : (tile / n_tiles);
+  const int nt = nmajor ? (tile / m_tiles) : (tile % n_tiles);
+  const int m0 = mt * WG_BM;
+  const int n0 = nt * 256;
   const int tid = mk_tid();
   const int wg = tid / 128;
   const int wtid = tid % 128;
