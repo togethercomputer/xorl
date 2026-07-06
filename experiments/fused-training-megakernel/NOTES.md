@@ -5450,6 +5450,27 @@ drain onto the dX chain. Log:
 `mkv3-p4b-small-rmssplit-current-20260706T1750Z.log`. Detail note:
 `results/operator-gap/small-rmssplit-current-keep.md`.
 
+Current-head small lm-head dX route recheck: because
+`GEMMNN 1024x512x16384.wg` remains a top on-path hop, rechecked the explicit
+head-dX route family against the current n128 fp32/no-atomic default
+(`head_dx=[(155, 32, 4232, None)]`). Forced old split-atomic via
+`MK_HEAD_DX_N128_F32=0 MK_HEAD_DX_NO_ATOMIC_SK1=0` changed the route to
+`head_dx=[(156, 64, 168, 1)]`, added one fill/wave, stayed parity-clean, and
+lost both 80-rep orders: default-minus-oldsplit `-5.14us` and `-3.87us`.
+The m64 no-atomic variant
+(`MK_HEAD_DX_N128_F32=0 MK_HEAD_DX_NO_ATOMIC_SK1=1`) changed only the head row to
+`head_dx=[(155, 64, 136, None)]` and stayed parity-clean. Its first 80-rep run
+was order-mixed (`+2.08us`, then `-0.26us`); repeats were weakly positive but
+below promotion quality in reverse order: 240 reps `+5.50us` / `+1.26us`, and
+480 reps `+3.92us` / `+0.40us` with reverse wins only `250/480`. Keep the
+current n128 fp32/no-atomic default; do not add another exact head-dX gate for a
+sub-microsecond reverse-order effect. Logs:
+`mkv3-p4b-small-headdx-oldsplit-current-20260706T1754Z.log`,
+`mkv3-p4b-small-headdx-noatomic64-current-20260706T1754Z.log`,
+`mkv3-p4b-small-headdx-noatomic64-current-repeat-20260706T1754Z.log`, and
+`mkv3-p4b-small-headdx-noatomic64-current-repeat2-20260706T1754Z.log`. Detail
+note: `results/operator-gap/small-headdx-current-route-keep.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
