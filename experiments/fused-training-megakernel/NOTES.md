@@ -6090,6 +6090,24 @@ Promoted default: exact qwen4b-L1 only. Logs:
 `mkv3-p4b-qwen-n256tma-racecheck-20260706T2233Z.log`. Detail note:
 `results/operator-gap/qwen-n256-tma-promote.md`.
 
+Post-promotion R4 resweep (the resweep law fired again): stage3 and N-major
+stay confirmed under the TMA feed (forced stage2 +2592.9/+2617.8us 0/16;
+forced M-major +44.9/+52.2us 2-3/16), the NT lm-head mbar split stays
+(forced `MK_GEMM_N256_NT_MBAR=1` +102.0/+112.1us 0/16) — but the TN dW rows,
+order-mixed STANDALONE, are a decisive additional in-model win on top of the
+NN promotion: forced `MK_GEMM_N256_TMA_TN=1` **-294.6us/-333.8us, 16/16 both
+orders** (in-model-only composition win — the off-path dW sinks stop burning
+issue slots the co-scheduled chain needs; absorption-predictor R1-exception
+class). TN is therefore promoted for exact qwen too
+(`Program.gemm_n256_tma_tn_default`, env `MK_GEMM_N256_TMA_TN` overrides both
+ways): 10 rows now carry tmap args (5 NN dX + 5 TN dW). Qwen step:
+9148-9182us (pre) -> 8863-8905us (NN TMA) -> ~8534-8586us (NN+TN TMA), vs
+compile+CUDAGraph+ ~7.19ms-class baseline. Resweep logs:
+`mkv3-p4b-qwen-n256tma-resweep-*-20260706T2310Z.log`; TN promoted-default
+confirmation + NN+TN racecheck/synccheck:
+`mkv3-p4b-qwen-n256tma-tn-promoted-*-20260706T2330Z.log`,
+`mkv3-p4b-qwen-n256tma-tn-racecheck-20260706T2330Z.log`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

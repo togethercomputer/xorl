@@ -457,6 +457,9 @@ class MKQwen3:
                    else self.gemm_n256_tma_default)
         if _ring_on and _tma_on:
             p.gemm_n256_tma_ext = self.ext
+            # TN dW rows: promoted for exact qwen on the R4 resweep evidence
+            # (-294.6/-333.8us, 16/16 both orders; see mk.gemm_n256_tma_eligible).
+            p.gemm_n256_tma_tn_default = self.gemm_n256_tma_default
         B = p.buf
         dw_no_atomic_env = os.environ.get("MK_DW_NO_ATOMIC_SK1")
 

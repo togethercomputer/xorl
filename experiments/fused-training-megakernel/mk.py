@@ -379,13 +379,15 @@ def wgmma_n256_dw_tn_ok(M, N, K, flags):
     }
 
 
-def gemm_n256_tma_eligible(args):
+def gemm_n256_tma_eligible(args, tn_default=False):
     """Per-instruction gate for the round-4 TMA feed (MK_GEMM_N256_TMA).
 
-    Only the n256 NN/TN fp32-body ring rows (bit14, not bit2) qualify. NN only
-    by default: the standalone ring probe (n256_tma_ring_probe.py) measured the
-    dX family at -7..-9% but the TN dW rows order-mixed/neutral; set
-    MK_GEMM_N256_TMA_TN=1 to include the TN rows for probing. Geometry must be
+    Only the n256 NN/TN fp32-body ring rows (bit14, not bit2) qualify. The TN
+    dW rows measured order-mixed/neutral STANDALONE (n256_tma_ring_probe.py)
+    but -294.6/-333.8us 16/16 both orders IN-MODEL on top of the NN promotion
+    (in-model-only composition win: the sinks stop burning issue slots the
+    co-scheduled chain needs), so the model builder passes tn_default=True for
+    exact qwen; MK_GEMM_N256_TMA_TN overrides both ways. Geometry must be
     tile-exact (the tensormap boxes have no tail handling).
     """
     flags = args[6]
@@ -393,8 +395,11 @@ def gemm_n256_tma_eligible(args):
         return False
     if flags & (4 | 16 | 32 | 256 | 2048 | 8192):
         return False
-    if (flags & 1) and not int(os.environ.get("MK_GEMM_N256_TMA_TN", "0")):
-        return False
+    if flags & 1:
+        tn_env = os.environ.get("MK_GEMM_N256_TMA_TN")
+        tn_on = bool(int(tn_env)) if tn_env is not None else bool(tn_default)
+        if not tn_on:
+            return False
     M, N, K = args[3], args[4], args[5]
     if M % 128 or N % 256 or K % 64:
         return False
@@ -889,6 +894,7 @@ class Program:
         # set to the loaded extension by the model builder when the n256 TMA
         # feed is enabled; finalize() then encodes per-instruction tensormaps.
         self.gemm_n256_tma_ext = None
+        self.gemm_n256_tma_tn_default = False
 
     def buf(self, t: torch.Tensor, slot=None) -> int:
         """Register a CUDA tensor; returns its buffer-table index.
@@ -1060,7 +1066,7 @@ class Program:
             for op, _ntiles, args in wave:
                 if op != OP_GEMM or len(args) <= 6:
                     continue
-                if not gemm_n256_tma_eligible(args):
+                if not gemm_n256_tma_eligible(args, self.gemm_n256_tma_tn_default):
                     continue
                 ta, tb = self.bufs[args[0]], self.bufs[args[1]]
                 if ta.dtype != torch.bfloat16 or tb.dtype != torch.bfloat16:
