@@ -5859,6 +5859,17 @@ passed. Logs:
 `mkv3-p4b-s8192-n256nnbf16-test-model-20260706T2014Z.log`. Detail note:
 `results/operator-gap/s8192-n256nnbf16-exact-promote.md`.
 
+Post-n256-NN S8192 attention-bwd T44 recheck: after the exact n256 NN BF16
+promotion changed downstream long-S route timing, rechecked the only previously
+order-mixed nearby S8192 band budget, `MK_ATTN_BAND=44`, against the current
+T40 default. Full-gradient parity stayed clean, but T44 now lost both
+construction orders: `+7.98us` and `+10.50us` candidate-minus-default, with
+`7/16` and `4/16` candidate wins. Keep `_ATTN_BWD_BAND_T[8192] = 40`; no source
+change. Logs:
+`mkv3-p4b-s8192-bwdband-postn256nn-t44-default-first-20260706T2025Z.log` and
+`mkv3-p4b-s8192-bwdband-postn256nn-t44-variant-first-20260706T2025Z.log`.
+Detail note: `results/operator-gap/s8192-bwdband-postn256nn-t44-nogo.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
