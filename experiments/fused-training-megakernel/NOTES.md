@@ -5410,6 +5410,18 @@ construction orders: default-minus-cache `-17.70us` and `-18.00us`, cache wins
 `mkv3-p4b-small-swcache-post-ceb2-20260706T1737Z.log`. Detail note:
 `results/operator-gap/small-swcache-post-ceb2-keep.md`.
 
+Current-head small profile/score refresh after the source-free default
+confirmations: at `581278a`, `%globaltimer` profile measured `3300.9us` total
+with 144 chain hops, `430.8us` on-path wait, and `2870.1us` on-path span.
+Top on-path totals are now `ATTN_DQ_WG` `294.7us`, `SWIGLU_BWD_4W` `281.2us`,
+`GEMMNN 1024x512x3072.wg` `268.0us`, `ATTN_FWD_WG` `255.3us`,
+`RMSNORM_BWD_DX` `241.6us`, lm-head dX `204.0us`, and
+`GEMMNT 1024x3072x512.wg` `195.5us`. Fresh score measured megakernel
+`3289.4us`, eager `16904.5us`, compile `4138.9us`, compile+CUDAGraph
+`2094.7us`, and compile+CUDAGraph+ `1894.0us` (megakernel gap `1.74x` vs
+graph+). Logs: `mkv3-p4b-profile-small-current-581278a-20260706T1741Z.log` and
+`mkv3-p4b-score-small-current-581278a-20260706T1741Z.log`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
