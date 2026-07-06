@@ -5192,6 +5192,20 @@ default wins `80/80` and `80/80`. Keep the D64 mbar-ring default. Log:
 `mkv3-p4b-small-gmbar-after-n128-20260706T1820Z.log`. Detail note:
 `results/operator-gap/small-gmbar-post-n128-keep.md`.
 
+## Post-NT small lm-head n128 check (this session, 20260706T1835Z)
+
+After the NN/NT n128 row gates, rechecked the remaining generic n128 row on
+H512/S1024 small by comparing current default against `MK_WGMMA_N128=0`. This
+only moved lm-head forward row 152 (`GEMMNN 1024x16384x512`) off n128, changing
+`n128=2 -> 1`; head-dX row 155 remained on its explicit n128 path. Program shape
+stayed `n_instr=288`, `critical_path=144`, `gated=127`, and parity stayed clean
+(`loss_diff=-2.86e-06` / `-3.81e-06`, worst selected grad rel `<7.2e-07`).
+Disabling the lm-head n128 row lost both construction orders:
+default-minus-n128off medians `-48.88us` and `-48.67us`, with n128off wins
+`1/80` and `0/80`. Keep the current lm-head n128 route. Log:
+`mkv3-p4b-small-n128off-after-nt-20260706T1830Z.log`. Detail note:
+`results/operator-gap/small-lmhead-n128-post-nt-keep.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
