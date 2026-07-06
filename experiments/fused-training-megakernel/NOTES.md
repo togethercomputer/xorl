@@ -4623,6 +4623,59 @@ this tax). Handed to the owning session on the board with a 45-min window.
 META: this is why the periodic full certification exists — per-lane paired
 A/Bs cannot see a uniform tax that lands between their two arms.
 
+### CORRECTION (20260706T0545Z, same session): STACK is not the mechanism
+
+Runtime bisect + perturbation probes (all median-of-50 small on clean GPU 6,
+graph+ control stable 1899-1910us in every run) revise the paragraph above:
+
+| binary | megakernel_df STACK | small us |
+|---|---:|---:|
+| 06f3101 (pre-window) | 32 | 3472.0 |
+| 06f3101 + fat NEVER-EXECUTED n128 clone | 32 | 3458.9 |
+| c590974 (mid-window, pre-stage3) | 64 | 3548.1 |
+| 544640f (stage3 ring) | 208 | 3657.8 |
+| 1cb68c8 (cert head) | 176 | 3662.4 |
+| 1cb68c8 + ENTIRE n256 family compiled out | 80 | 3735.6 |
+
+- The regression is CUMULATIVE across the ungated n256 device-code commits
+  (+76 by c590974 before stage3 exists, +110 more by 544640f), not a stage3
+  cliff. Route at small is bit-identical across the window (invariant-field
+  instr diff: only a +1 buffer-table index shift) — python emission exonerated.
+- Dead code volume is FREE (row 2: +173 dead lines, STACK 32, runtime equal).
+- Removing all n256 code did NOT recover and made it worse (row 6): the probe's
+  `__trap()` (noreturn) sat in the hot gemm dispatch CFG, and other window code
+  keeps STACK at 80 — so STACK/res-usage CANNOT certify a fix; the n256off
+  binary has near-clean stack and the worst runtime.
+- Surviving mechanism: the shape of the HOT GEMM DISPATCH caller codegen
+  (flag-decode + four template call sites hoisted into it by the n256 commits).
+  Fix probe in flight: one `__noinline__` n256 trampoline so the caller regains
+  a single call site; runtime-certified only. Logs:
+  `mkv3-p4b-small-at-{544640f,c590974}-*.log`,
+  `mkv3-p4b-small-n256off-1cb68c8-*.log`,
+  `mkv3-p4b-small-lottery-06f3101-*.log`,
+  `mkv3-p4b-small-regression-control-20260706T044823Z.log`.
+
+RESOLUTION (20260706T0620Z): ncu SourceCounters on a `-lineinfo` head build
+attributed ~15M of 16M executed local sectors to `megakernel.cu:351-424` — the
+scheduler claim loop spilling around the inlined dispatch switch. The n256
+fanout was exonerated twice (a `__noinline__` trampoline was runtime-neutral
+both above and below the pressure cliff). The dominant term was the five D=128
+WGMMA attention ops (`op_attn_fwd_wg128{,_mbar}`, `op_attn_dkv_wg128`,
+`op_attn_dq_wg128{,_rowsplit}`) inlining fat accumulator frames into the
+dispatch switch against the n128 precedent. `__noinline__` on all five:
+small **3660.4 -> 3557.7us** (STACK 176 -> 128), qwen4b-l1 neutral
+(9890.0 vs 9955.1 unpatched, three-arm within p10-p90 band;
+`mkv3-p4b-small-d128noinline-9930a29-*.log`,
+`mkv3-p4b-qwen-d128noinline-ab-*.log`). A residual ~85us of window tax at
+small (3557.7 vs 3472.0 pre-window) remains unattributed — candidates: the
+remaining inline dispatch additions (nt-bf16 n256 routing block, sparse
+embed-clear) — re-run knob: the same ncu one-pass
+(`l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum`, target 0) after any
+candidate fix. LAW (supplements P1/P6): fat op bodies MUST be `__noinline__`
+before entering the dispatch switch; certify with executed local-load sectors
++ runtime, never STACK/res-usage alone.
+
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

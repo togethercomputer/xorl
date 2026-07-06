@@ -1085,7 +1085,7 @@ struct __align__(16) AttnWgFwd128MbSmem {  // 112KB + barriers
   uint64_t bempty[WGA_FWD_D128_MB_S];
 };
 
-__device__ void op_attn_fwd_wg128_mbar(const Instr& I, int tile, void** bufs,
+__device__ __noinline__ void op_attn_fwd_wg128_mbar(const Instr& I, int tile, void** bufs,
                                        char* smem_raw) {
   constexpr int D = 128;
   constexpr int NS = WGA_FWD_D128_MB_S;
@@ -1273,7 +1273,7 @@ __device__ void op_attn_fwd_wg128_mbar(const Instr& I, int tile, void** bufs,
   }
 }
 
-__device__ void op_attn_fwd_wg128(const Instr& I, int tile, void** bufs,
+__device__ __noinline__ void op_attn_fwd_wg128(const Instr& I, int tile, void** bufs,
                                   char* smem_raw) {
   constexpr int D = 128;
   const int S = I.args[3], nq = I.args[4], nkv = I.args[5];
@@ -1455,7 +1455,7 @@ struct __align__(16) AttnWgDkv128Smem {  // 112KB (needs the 120KB carveout:
   bf16 dO[2][8192];  // [stage]
 };
 
-__device__ void op_attn_dkv_wg128(const Instr& I, int tile, void** bufs,
+__device__ __noinline__ void op_attn_dkv_wg128(const Instr& I, int tile, void** bufs,
                                   char* smem_raw) {
   constexpr int D = 128;
   const int S = I.args[5], nq = I.args[6], nkv = I.args[7];
@@ -1625,7 +1625,7 @@ struct __align__(16) AttnWgDq128RowSplitSmem {  // 144KB
   bf16 V[2][8192];   // [stage]
 };
 
-__device__ void op_attn_dq_wg128_rowsplit(const Instr& I, int tile, void** bufs,
+__device__ __noinline__ void op_attn_dq_wg128_rowsplit(const Instr& I, int tile, void** bufs,
                                           char* smem_raw) {
   constexpr int D = 128;
   const int S = I.args[5], nq = I.args[6], nkv = I.args[7];
@@ -1797,7 +1797,7 @@ struct __align__(16) AttnWgDq128Smem {  // 104KB
   bf16 V[2][8192];   // [stage]
 };
 
-__device__ void op_attn_dq_wg128(const Instr& I, int tile, void** bufs,
+__device__ __noinline__ void op_attn_dq_wg128(const Instr& I, int tile, void** bufs,
                                  char* smem_raw) {
   constexpr int D = 128;
   const int S = I.args[5], nq = I.args[6], nkv = I.args[7];
