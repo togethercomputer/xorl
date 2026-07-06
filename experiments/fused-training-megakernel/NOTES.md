@@ -4436,6 +4436,19 @@ in reverse (`mkv3-p4b-qwen-d128-dqfirst-ab-20260706T035952Z.log`). Keep the
 current dKV-then-dQ emission; the apparent dQ wait is mostly balanced against
 the dKV completion requirement before qk-norm backward.
 
+Qwen post-claim1 all-hot scheduler recheck: NO-GO. The fresh qwen profile still
+has a giant off-path vocab dW sink (`GEMMTN 151936x2560x1024.wg`, `5135.6us`
+span), so a source-free `MK_ALLHOT=1` A/B checked whether the hot/cold split is
+still load-bearing after D128 claim1. Route/parity were clean: default had
+`hot=31/cold=16`, all-hot had `hot=47/cold=0`, D128 attention claims stayed
+`1/1/1`, loss diffs were `0` and `-1.91e-06`, and worst selected-gradient rel
+was `1.37e-03` on sparse `grad:emb`. Timing still rejected all-hot:
+default-minus-allhot was `-18.05us` median / `-10.03us` paired with only
+`9/32` all-hot wins, then `-16.10us` median / `-14.19us` paired with `8/32`
+wins in reverse (`mkv3-p4b-qwen-allhot-postclaim1-ab-20260706T040318Z.log`).
+Keep hot/cold criticality; the remaining qwen gap is structural n256/rowop work,
+not ready-ring policy.
+
 Qwen head-dX n256 split-K probe: NO-GO, source reverted. The top current qwen
 hop is still the 80-tile n256 direct `dlogits @ Wlm` row
 (`GEMMNN 1024x2560x151936.wg`), so a temporary default-off
