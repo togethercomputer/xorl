@@ -5166,6 +5166,21 @@ profile measured `3354.8us`; the refreshed final score measured megakernel
 `mkv3-p4b-score-small-n128nt-default-20260706T1757Z.log`. Detail note:
 `results/operator-gap/small-n128nt-post4w-promote.md`.
 
+## Post-n128 small cold-cap recheck (this session, 20260706T1815Z)
+
+After the NN/NT n128 route changes, re-swept H512/S1024 small `MK_COLD_CAP` over
+`0/16/33/48/64/96`. Route shape stayed `n_instr=288`, `critical_path=144`,
+`gated=127`, `hot=197`, `cold=91`, and parity against cap48 stayed clean
+(worst selected grad rel `<5.4e-07`). The broad 60-sample pass was flat:
+cap48 `3283.47us`, cap64 `3280.27us`, cap16/cap33/cap96 all about `3283us`,
+with only cap0 clearly worse at `3322.08us`. The focused cap48-vs-cap64
+160-sample gate failed the decision bar: cap48-first measured
+cap48-minus-cap64 `-0.13us` median, cap64 wins `79/160`; cap64-first measured
+`+1.36us`, cap64 wins `86/160`. Keep cap48. Logs:
+`mkv3-p4b-small-coldcap-after-n128-20260706T1805Z.log`,
+`mkv3-p4b-small-coldcap-after-n128-focused-20260706T1810Z.log`. Detail note:
+`results/operator-gap/small-coldcap-post-n128-nogo.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
