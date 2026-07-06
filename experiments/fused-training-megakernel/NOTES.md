@@ -6193,6 +6193,34 @@ tax on df measured +11.0us small (6/40) / +8.2us nano (2/40) — far below the
 ws-history 4-12% bound, so the phase-2 mailbox-TMA-producer gate is GO.
 Logs: mkv3-p4b-nano-deep-idle-postskr-*, mkv3-p4b-idle-rev-dfnr240-*.log.
 
+s3072/s4096 head-dX SKR promotion (SKR round 4, session b603d819): the S>=2048
+"no-atomic direct route stands" verdict from the s2048 NO-GO does NOT extend up
+the S axis. The s3072/s4096 head-dX default was the exact-gated n256 direct
+route at only 24/32 CTAs — parallelism-starved on 132 SMs with the full K=8192
+chain per tile. SKR-2 (n128 x 2 K-slices = 96/128 CTAs, still sub-wave, halved
+serial K chain, one ~3-4us reduce hop) wins decisively on clean GPU 6, both
+construction orders. At 0abc08f: s3072 -118.6/-120.6us 40/40, s4096
+-90.0/-75.6us 40/40+39/40; skr=4 inferior (s3072 -100.4 — past one wave the
+split only adds slab traffic). Re-anchored at the final promotion surface
+(post 0b7ed2a, so the s3072 forced-old arm is the TMA-fed n256 route):
+promoted-vs-forced-old s3072 old +95.2/+89.4us 0/40 both orders, s4096 old
++77.4/+80.9us 0/40 both orders, clean windows, parity clean. NOTE: this SUPERSEDES the 0b7ed2a s3072 n256-TMA
+default — s3072's only TMA-eligible row (head-dX 3072x256x8192) leaves the
+default route; the TMA gate stays for MK_HEAD_DX_SKR=0 and the long-K
+principle in the ledger is untouched. K/CTAs = 170/128, both >= nvjet's ~90
+split gate — the in-model result again reproduces nvjet's own routing policy;
+s2048 (K/CTAs 256 but exposure-hidden) and s8192 (K/CTAs 64, one-wave)
+correctly bracket the window. Promoted `_HEAD_DX_SKR[s3072]=2, [s4096]=2`.
+s1024 is a recorded order-flip no-go at head (-6.3 69/80 then +10.0 4/80; it
+had won both orders at 5c6e234 pre-qkbwd — the resweep law cutting the other
+way). res-usage flavor pair: df 255/48 and ws 168/96 bit-identical,
+`megakernel` stack 48->64 only. ncu LD gate: s4096 bit-identical 2022 sectors
+both arms; s3072 promoted LOWER (2.676M vs 2.715M; NB the large pre-existing
+s3072 local-LD baseline in BOTH arms — flagged to the LD-sweep owner).
+test_ops (incl. SKR slab unit case) + test_model green. Evidence:
+results/operator-gap/s3072-s4096-headdx-skr-promote.md; driver
+results/headdx_skr_shape_ab_b603d819.py; logs mkv3-p4b-hdskr-shape-*.log.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

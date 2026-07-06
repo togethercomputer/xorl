@@ -963,6 +963,21 @@ never apply per-layer. The portable pieces of a standalone ladder (K-split +
 plain slabs + reduce) can beat the ladder's in-model expectation because the
 win is wave-filling, which standalone probes cannot see.
 
+**head-dX SKR at s3072/s4096 (SKR round 4)** — WIN skr=2 both (-118.6/-120.6
+40/40 and -90.0/-75.6 40/40+39/40 at 0abc08f; re-anchored forced-old at
+322f344 +95.2/+89.4 and +77.4/+80.9, 0/40 x4; skr=4 inferior; s1024
+order-flipped at head after winning both orders at 5c6e234 — left atomic)
+Why: their n256 direct head-dX ran 24/32 CTAs — parallelism-starved with the
+full K=8192 chain per tile; SKR-2 = 96/128 n128-CTAs, half the serial K, one
+reduce. K/CTAs 170/128 >= nvjet's ~90 split gate; s2048 (exposure-hidden) and
+s8192 (one-wave, K/CTAs 64) bracket the window. SUPERSEDES the 0b7ed2a s3072
+n256-TMA default (its only TMA row leaves the route; long-K TMA principle
+untouched).
+Principle: "the direct route stands" verdicts are S-local — a NO-GO at one
+shape does not close its neighbors; walk the boundary. Sub-wave n256 tiles
+can be WORSE than more, smaller n128 tiles when CTAs << SMs: tile fatness
+buys nothing idle SMs could have eaten.
+
 **lm_head fwd n256 resweep cascade (small/s1024/s2048)** — WIN (-33/-23,
 -11/-12, -25/-21 both orders; 7f77378, 5c6e234)
 Why: the 0928Z gauntlet CORRECTLY rejected these cells; the same-day SKR and
