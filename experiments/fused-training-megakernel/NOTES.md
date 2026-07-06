@@ -5048,6 +5048,28 @@ shape-scoped LD law as small==0, long-S budgeted separately. Logs:
 `mkv3-p4b-small-ldgate-ab4ffde-20260706T154439Z.{log,details.csv,ncu-rep}`.
 Detailed note: `results/operator-gap/small-swiglu-4w-cacheoff-ldgate.md`.
 
+## Post-4W source-free follow-ups: nano 4W and small cold cap no-go (this session, 20260706T1600Z)
+
+Two current-head follow-ups after the small 4W/cache-off route did not promote:
+
+- H256/S128 nano `MK_SWIGLU_BWD_4W=1` is an order-sensitive wash. The forced
+  route changed nano from `sw_bwd=4/256` to `sw_bwd4w=4/1024` and parity stayed
+  within the usual noisy envelope (`loss_diff=+3.81e-06`, worst selected grad
+  `emb` rel `4.26e-03`), but timing failed the both-order gate: default-first
+  showed forced 4W faster by `+10.51us` median with wins `72/80`, while
+  force4w-first flipped negative at `-5.34us` with wins `18/80`. Keep nano on
+  the generic SwiGLU backward route. Log:
+  `mkv3-p4b-nano-swiglu-4w-env-ab-20260706T154841Z.log`; detail note:
+  `results/operator-gap/nano-swiglu-4w-env-nogo.md`.
+- H512/S1024 small `MK_COLD_CAP` also remains at the existing cap48 default.
+  Broad source-free sweep over `0/16/33/48/64/96` suggested cap64/cap96 about
+  `12us` faster than cap48, but the focused cap48-vs-cap64 A/B failed
+  construction-order reversal: cap48-first measured cap48-minus-cap64
+  `+15.09us` median with cap64 wins `68/80`, while cap64-first flipped to
+  `-1.02us` with cap64 wins `38/80`. Keep `_cold_cap()` unchanged. Log:
+  `mkv3-p4b-small-coldcap-current-f66c432-20260706T1555Z.log`; detail note:
+  `results/operator-gap/small-coldcap-post4w-nogo.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
