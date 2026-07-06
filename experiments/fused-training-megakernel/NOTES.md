@@ -5471,6 +5471,18 @@ sub-microsecond reverse-order effect. Logs:
 `mkv3-p4b-small-headdx-noatomic64-current-repeat2-20260706T1754Z.log`. Detail
 note: `results/operator-gap/small-headdx-current-route-keep.md`.
 
+Current-head small Drow zero-fill skip recheck: because `FILL_F32` is still a
+large off-path bucket, retested the earlier broad-small no-go with
+`MK_DROW_ZERO_FILL=0` after the current route changes. The skip removed exactly
+the eight expected Drow fill instructions (`FILL_F32=85/3130 -> 77/3122`) while
+leaving `critical_path=144`, `gated=127`, and `drow_gemm=8`; parity stayed clean
+(`loss_diff=-1.91e-06` / `-9.54e-07`, worst selected grad rel `<4.5e-07`).
+Timing remained order-mixed and failed the promotion gate: default-minus-skip
+`+0.88us` with skip wins `41/80`, then `-7.23us` with skip wins `20/80`. Keep
+Drow zero-fill enabled for H512/S1024 small. Log:
+`mkv3-p4b-small-drowzero-current-20260706T1757Z.log`. Detail note:
+`results/operator-gap/small-drowzero-current-nogo.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
