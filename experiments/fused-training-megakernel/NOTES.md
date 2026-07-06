@@ -5288,6 +5288,27 @@ Keep the dKV float2 direct-atomic default after direct-BF16. Log:
 `mkv3-p4b-small-dkvf2-post-directbf16-20260706T1659Z.log`. Detail note:
 `results/operator-gap/small-dkvf2-post-directbf16-keep.md`.
 
+Post-direct small attention fast-log recheck: because `ATTN_FWD_WG` remains
+top-three but H256/S1024 had already shown fast-log neutral, rechecked exact
+H512/L8/S1024 small against `MK_ATTN_FAST_LOG=0`. Precise `logf` dropped the
+`_aflog` suffix, kept route shape unchanged (`n_instr=288`,
+`critical_path=144`, `gated=127`, `ATTN_FWD_WG=8/512`), and stayed within the
+normal q/k norm tolerance (worst selected grad `qn.0` rel around `9.54e-03`).
+The signal is small but repeatable: source-free precise beat fast by
+`+1.34/+1.46us` over 80 reps, `+2.35/+1.07us` over 240 reps, and
+`+0.83/+1.22us` over 480 reps. Exact small now requests precise attention LSE
+log by default; `MK_ATTN_FAST_LOG=1` restores the old `_aflog` route. Promoted
+default beat forced fast by `-1.04us` and `-1.65us` over 240 reps, validation
+passed `py_compile`, `test_model.py`, and `test_ops.py`, refreshed profile was
+`3331.4us`, and refreshed score was megakernel `3312.6us` vs graph+ `1898.0us`.
+Logs: `mkv3-p4b-small-aflog-post-directbf16-20260706T1702Z.log`,
+`mkv3-p4b-small-aflog-post-directbf16-repeat-20260706T1702Z.log`,
+`mkv3-p4b-small-aflog-post-directbf16-repeat2-20260706T1702Z.log`,
+`mkv3-p4b-small-aflog-promoted-20260706T1702Z.log`,
+`mkv3-p4b-profile-small-aflog-precise-default-20260706T1702Z.log`, and
+`mkv3-p4b-score-small-aflog-precise-default-20260706T1702Z.log`. Detail note:
+`results/operator-gap/small-aflog-post-directbf16-promote.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

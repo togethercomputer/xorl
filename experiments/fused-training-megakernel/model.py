@@ -300,6 +300,10 @@ class MKQwen3:
             c.H == 256 and c.D == 64 and c.S in _H256_D64_DKV_ROW_BCAST_S
         )
         self.attn_dq_float2_store_default = c.H == 256 and c.S in _H256_DQ_FLOAT2_S
+        self.attn_fast_log_default = (
+            (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
+            != (512, 8, 1024, 8, 4, 64, 1536, 16384)
+        )
         self.gemm_mbar_ring_default = c.D == 64 and c.S >= 1024 and c.S % 128 == 0
         self.gemm_direct_bf16_epilogue_default = c.D == 64 and (
             c.S == 128 or (c.H, c.L, c.S, c.nq, c.nkv, c.I) == (512, 8, 1024, 8, 4, 1536)
@@ -313,6 +317,7 @@ class MKQwen3:
             lmhead_exp2_approx=self.lmhead_exp2_approx_default,
             ce_bwd_exp2_approx=self.ce_bwd_exp2_approx_default,
             idle_ns=self.idle_ns_default,
+            attn_fast_log=self.attn_fast_log_default,
             attn_dkv_float2_atomic=self.attn_dkv_float2_atomic_default,
             attn_dkv_row_bcast=self.attn_dkv_row_bcast_default,
             attn_dq_float2_store=self.attn_dq_float2_store_default,

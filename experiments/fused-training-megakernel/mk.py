@@ -407,6 +407,7 @@ def load_ext(
     lmhead_exp2_approx=None,
     ce_bwd_exp2_approx=None,
     idle_ns=None,
+    attn_fast_log=None,
     attn_dkv_float2_atomic=None,
     attn_dq_float2_store=None,
     attn_dkv_row_bcast=None,
@@ -447,7 +448,11 @@ def load_ext(
     else:
         drow_direct_store = int(bool(drow_direct_store))
     # MK_ATTN_FAST_LOG=0 restores precise logf for WGMMA fwd LSE.
-    attn_fast_log = int(os.environ.get("MK_ATTN_FAST_LOG", "1"))
+    attn_fast_log_env = os.environ.get("MK_ATTN_FAST_LOG")
+    if attn_fast_log_env is not None:
+        attn_fast_log = int(attn_fast_log_env)
+    else:
+        attn_fast_log = 1 if attn_fast_log is None else int(bool(attn_fast_log))
     attn_exp2_approx_env = os.environ.get("MK_ATTN_EXP2_APPROX")
     if attn_exp2_approx_env is not None:
         attn_exp2_approx = int(attn_exp2_approx_env)
