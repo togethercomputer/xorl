@@ -5265,6 +5265,18 @@ and `-0.85us` with cap64 wins `75/160` in cap64-first. Keep cap48. Log:
 `mkv3-p4b-small-coldcap-post-directbf16-20260706T1940Z.log`. Detail note:
 `results/operator-gap/small-coldcap-post-n128-nogo.md`.
 
+Post-direct small RMS dX R4 recheck: because RMS dX is back in the small
+top-five after the n128 and direct-BF16 route moves, rechecked forced
+`MK_RMS_DX_R4=1` against the current default. Route shape stayed
+`n_instr=288`, `critical_path=144`, `gated=127`; default used 17 two-row
+`RMSNORM_BWD_DX` ops / 1088 tiles, while R4 used 17 `RMSNORM_BWD_DX_R4` ops /
+544 tiles. Parity stayed clean (`loss_diff=-3.81e-06` / `+2.86e-06`, worst
+selected grad rel `<7.1e-07`), but R4 lost both orders: default-minus-R4
+`-34.08us` and `-35.23us`, R4 wins `0/160` and `1/160`. Keep H512/S1024 small
+on the normal two-row RMS dX route. Log:
+`mkv3-p4b-small-rmsdx-r4-post-directbf16-20260706T1657Z.log`. Detail note:
+`results/operator-gap/small-rmsdx-r4-post-directbf16-nogo.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
