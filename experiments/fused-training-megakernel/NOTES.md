@@ -4224,6 +4224,33 @@ into each CTA's local smem before GMMA. DSMEM remains available for scalar
 exchange and possible epilogue/reduction protocols, but not as a direct GMMA
 operand source.
 
+## v3 P4b cluster TMA multicast + local GMMA probe: PASS
+
+`tma_multicast_gmma_probe.py` validates the viable paired-M cluster primitive.
+Rank0 issues one `cp.async.bulk.tensor.2d.shared::cluster.global...multicast::cluster`
+load of a 128x64 B tile from a CUtensorMap into the same CTA-relative SW128 B
+slab in both CTAs (`ctaMask=0x3`). Each CTA pre-arms its local mbarrier with
+`mbarrier.arrive.expect_tx`, waits locally, then runs an ordinary local GMMA B
+descriptor. Rank1's local B slab is zeroed before the multicast, so rank1
+correctness proves the multicast populated local smem; no remote-GMMA descriptor
+is involved.
+
+Evidence (`mkv3-tma-multicast-gmma-probe-20260706T030112Z.log`, GPU5, private
+torch extension cache):
+- Both destination barriers completed: rank0 `wait_ok=1`, rank1 `wait_ok=1`.
+- Rank0 and rank1 both matched torch with max error `3.814697e-06`.
+- The first B bf16 bits matched on both CTAs (`0xbf22`), while rank1's local B
+  address carried the cluster-rank tag (`0x1002800`). Both GMMA descriptor start
+  fields were local (`0x280`) because TMA materialized B into each CTA's own
+  smem.
+- Launch-plus-probe timing was `6.37us` for this tiny two-CTA harness; treat it
+  as a sanity datapoint, not a model-speed estimate.
+
+Outcome: the next production path should pair adjacent M tiles inside a cluster
+and have the elected CTA issue the B TMA multicast for the pair, with each CTA
+keeping its own A load and local GMMA. This is the concrete mechanism that the
+bit26 N-major tile order prepared for.
+
 ## v3 P4b D=128 dQ register-A feed: NO-GO in-model
 
 The operator-gap standalone `attn_dq_d128_rf` result was ported narrowly onto
