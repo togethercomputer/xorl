@@ -5078,6 +5078,40 @@ Current-head follow-ups after the small 4W/cache-off route:
   Log: `mkv3-p4b-small-gmbar-current-f66c432-20260706T1600Z.log`; detail
   note: `results/operator-gap/small-gmbar-post4w-keep.md`.
 
+## Small H512/S1024 NN n128 route retune (this session, 20260706T1700Z)
+
+After the small 4W/cache-off route, the remaining MLP dX stack made the two
+repeated H512/S1024 NN bf16 n128 rows worth rechecking. A broad source-free
+`MK_WGMMA_N128_NN=0` probe first disabled all NN n128 rows and won both
+construction orders (`+63.90us` and `+56.69us`, `80/80` wins each), but the
+source promotion is narrower: with `MK_WGMMA_N128_NN` unset,
+`wgmma_n128_ok()` now routes only `(1024,512,3072)` and `(1024,512,1024)` NN
+rows through the normal m64n64 WGMMA path. `MK_WGMMA_N128_NN=1` still restores
+the old NN n128 behavior for A/B, and `=0` still disables NN n128 broadly.
+
+The explicit promoted-default route check on H512/S1024 small kept
+`n_instr=288`, `critical_path=144`, `gated=127`, and `splitK=33`. Default had
+`n128=34`; forced old had `n128=50`. The 16 changed rows are exactly 8x
+`GEMMNN 1024x512x3072` and 8x `GEMMNN 1024x512x1024`, moving from n128 flags
+`4224` / `32` tiles to m64n64 flags `128` / `64` tiles. Parity stayed clean
+(`loss_diff=-1.91e-06` / `-2.86e-06`, worst selected grad rel `<5.4e-07`), and
+timing won both construction orders: old-minus-default medians `+28.67us` and
+`+28.40us`, default wins `78/80` and `77/80`. Logs:
+`mkv3-p4b-small-n128nn-post4w-20260706T1610Z.log`,
+`mkv3-p4b-small-n128nn-promoted-explicit-20260706T1640Z.log`,
+`mkv3-p4b-small-n128nn-promoted-route-explicit-20260706T1644Z.log`.
+Discard `mkv3-p4b-small-n128nn-promoted-20260706T1620Z.log` as decision
+evidence: its route print showed the default side at `n128=0`, not the intended
+promoted route.
+
+The refreshed default profile measured `3374.9us` (previous post-cache-off
+profile `3421.6us`). The refreshed small score measured megakernel `3392.1us`
+vs compile+CUDAGraph+ `1896.8us` (gap still `1.79x`). Validation passed
+`py_compile`, `git diff --check`, `test_model.py`, and `test_ops.py`. Logs:
+`mkv3-p4b-profile-small-n128nn-default-20260706T1655Z.log`,
+`mkv3-p4b-score-small-n128nn-default-20260706T1656Z.log`. Detail note:
+`results/operator-gap/small-n128nn-post4w-promote.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

@@ -131,7 +131,13 @@ def wgmma_n128_ok(M, N, K, flags):
     if not (flags & 2):  # NN (dX): MN-major 128-wide B; tile-gated like the m64n64
         # NN route (halved tile count needs co-scheduling headroom). MK_WGMMA_N128_NN
         # gates it separately; threshold in n128 tiles.
-        if not int(os.environ.get("MK_WGMMA_N128_NN", "1")):
+        n128_nn_env = os.environ.get("MK_WGMMA_N128_NN")
+        if n128_nn_env is not None and not int(n128_nn_env):
+            return False
+        # Post-small-4W retune: H512/S1024's two 32-tile NN bf16 dX rows run faster
+        # on the normal m64n64 WGMMA path despite doubled tile count. Keep env =1 as
+        # a force-on override for A/B.
+        if n128_nn_env is None and (M, N, K) in {(1024, 512, 3072), (1024, 512, 1024)}:
             return False
         if gemm_tiles_wgmma_n128(M, N) < int(os.environ.get("MK_WGMMA_N128_NN_MIN", "32")):
             return False
