@@ -4123,6 +4123,43 @@ A/B (`mkv3-p4b-qwen-coldcap96-post-stage3-ab-20260706T0218Z.log`) measured
 cap0-minus-cap96 median `+7.26us` in one order but `-9.07us` in the reverse,
 `-3.14us` overall with `47/96` wins. Keep qwen `default_cold_cap=0`.
 
+## v3 P4b cooperative cluster launch enablement
+
+The operator-gap branch proved that `cudaLaunchKernelEx` can combine cluster
+dimensions with cooperative grid launch on this driver, and that 132 blocks /
+66 two-block clusters remain co-resident with no launch-latency penalty. The
+main branch now carries the matching host-side opt-in:
+
+- `MK_CLUSTER_X=2` switches all megakernel executors (`waves`, `df`, `df2`,
+  `ws`) from `cudaLaunchCooperativeKernel` to `cudaLaunchKernelEx` with
+  `cudaLaunchAttributeClusterDimension` and `cudaLaunchAttributeCooperative`.
+- The default remains `MK_CLUSTER_X=1`, preserving the old launch path. The
+  current support is intentionally limited to cluster size 2 because that is the
+  target for adjacent-M-tile B-multicast and is what the residency probe cleared.
+
+Validation:
+- Clustered `test_ops.py` PASS
+  (`mkv3-cluster-launch-testops-20260706T0225Z.log`), including the permanent
+  n256 stage3 NT-tail, NN, and TN cases.
+- Clustered `test_model.py` PASS
+  (`mkv3-cluster-launch-testmodel-20260706T0228Z.log`), covering `df`, `waves`,
+  `df2`, and `ws` executor modes.
+- Fresh qwen profile at HEAD
+  (`mkv3-p4b-qwen-current-profile-20260706T0221Z.log`) measured `10284.3us`;
+  remaining on-path leaders are still head-dX
+  `GEMMNN 1024x2560x151936.wg` at `3122.5us` and lm-head fwd
+  `GEMMNT 1024x151936x2560.wg` at `2561.0us`.
+- Launch-only qwen A/B
+  (`mkv3-p4b-qwen-cluster-launch-ab-20260706T0233Z.log`) was neutral:
+  cluster1-minus-cluster2 medians were `-7.73us` and `+1.97us` by order,
+  `-2.69us` overall with `31/64` wins. This confirms the launch path itself is
+  not a speedup and does not impose a measurable tax.
+
+Next work is the real cluster mechanism: paired adjacent-M tile claiming plus a
+GEMM body that uses cluster DSMEM/TMA multicast for the shared B operand. The
+existing scheduler still claims one tile at a time from a global cursor, so
+cluster launch alone cannot reduce the qwen giant-vocab spans.
+
 ## v3 P4b D=128 dQ register-A feed: NO-GO in-model
 
 The operator-gap standalone `attn_dq_d128_rf` result was ported narrowly onto

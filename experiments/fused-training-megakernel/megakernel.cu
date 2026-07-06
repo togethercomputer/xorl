@@ -13,6 +13,8 @@
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 
+#include <cstdlib>
+
 namespace cg = cooperative_groups;
 
 #define MK_MAX_ARGS 23
@@ -1000,6 +1002,44 @@ extern "C" __global__ void __maxnreg__(168) megakernel_ws(
 
 
 // ---- host launcher ------------------------------------------------------------------
+static int mk_cluster_x() {
+  const char* env = std::getenv("MK_CLUSTER_X");
+  if (!env || !*env) return 1;
+  const int x = std::atoi(env);
+  TORCH_CHECK(x == 1 || x == 2, "MK_CLUSTER_X currently supports only 1 or 2, got ", x);
+  return x;
+}
+
+template <typename Kernel, typename... Args>
+static void mk_launch_cooperative(Kernel kernel, dim3 grid, dim3 block, void** legacy_args,
+                                  size_t smem_bytes, cudaStream_t stream, Args... args) {
+  const int cluster_x = mk_cluster_x();
+  if (cluster_x == 1) {
+    C10_CUDA_CHECK(cudaLaunchCooperativeKernel((void*)kernel, grid, block, legacy_args,
+                                               smem_bytes, stream));
+    return;
+  }
+
+  TORCH_CHECK(grid.x % cluster_x == 0,
+              "cluster launch requires grid.x divisible by MK_CLUSTER_X; grid.x=",
+              grid.x, " MK_CLUSTER_X=", cluster_x);
+  cudaLaunchConfig_t cfg = {0};
+  cfg.gridDim = grid;
+  cfg.blockDim = block;
+  cfg.dynamicSmemBytes = smem_bytes;
+  cfg.stream = stream;
+  cudaLaunchAttribute attrs[2];
+  attrs[0].id = cudaLaunchAttributeClusterDimension;
+  attrs[0].val.clusterDim.x = cluster_x;
+  attrs[0].val.clusterDim.y = 1;
+  attrs[0].val.clusterDim.z = 1;
+  attrs[1].id = cudaLaunchAttributeCooperative;
+  attrs[1].val.cooperative = 1;
+  cfg.attrs = attrs;
+  cfg.numAttrs = 2;
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, args...));
+}
+
 static int g_nblocks = -1;
 
 void mk_run(torch::Tensor instrs, torch::Tensor wave_start, torch::Tensor wave_tiles,
@@ -1039,9 +1079,9 @@ void mk_run(torch::Tensor instrs, torch::Tensor wave_start, torch::Tensor wave_t
   void* args[] = {(void*)&d_instrs, (void*)&d_ws, (void*)&d_wt, (void*)&nwaves,
                   (void*)&d_bufs, (void*)&d_clk};
   auto stream = at::cuda::getCurrentCUDAStream();
-  C10_CUDA_CHECK(cudaLaunchCooperativeKernel((void*)megakernel, dim3(g_nblocks),
-                                             dim3(256), args, (size_t)smem_bytes,
-                                             stream.stream()));
+  mk_launch_cooperative(megakernel, dim3(g_nblocks), dim3(256), args,
+                        (size_t)smem_bytes, stream.stream(), d_instrs, d_ws, d_wt,
+                        nwaves, d_bufs, d_clk);
 }
 
 int64_t mk_nblocks() { return g_nblocks; }
@@ -1095,9 +1135,10 @@ void mk_run_df(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_of
                   (void*)&d_state,  (void*)&d_bufs,  (void*)&d_clk,   (void*)&bind0,
                   (void*)&ptr0,     (void*)&bind1,   (void*)&ptr1};
   auto stream = at::cuda::getCurrentCUDAStream();
-  C10_CUDA_CHECK(cudaLaunchCooperativeKernel((void*)megakernel_df, dim3(df_nblocks),
-                                             dim3(256), args, (size_t)smem_bytes,
-                                             stream.stream()));
+  mk_launch_cooperative(megakernel_df, dim3(df_nblocks), dim3(256), args,
+                        (size_t)smem_bytes, stream.stream(), d_instrs, n_instr,
+                        d_dc, d_ao, d_ad, d_cs, d_cr, cold_cap, d_state, d_bufs,
+                        d_clk, bind0, ptr0, bind1, ptr1);
 }
 
 void mk_run_ws(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_off,
@@ -1146,9 +1187,10 @@ void mk_run_ws(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_of
                   (void*)&d_ad,     (void*)&d_cs,      (void*)&d_cr,    (void*)&d_state,
                   (void*)&pad,      (void*)&lookahead, (void*)&d_bufs,  (void*)&d_clk};
   auto stream = at::cuda::getCurrentCUDAStream();
-  C10_CUDA_CHECK(cudaLaunchCooperativeKernel((void*)megakernel_ws, dim3(ws_nblocks),
-                                             dim3(MK_WS_THREADS), args,
-                                             (size_t)smem_bytes, stream.stream()));
+  mk_launch_cooperative(megakernel_ws, dim3(ws_nblocks), dim3(MK_WS_THREADS), args,
+                        (size_t)smem_bytes, stream.stream(), d_instrs, n_instr,
+                        d_dc, d_ao, d_ad, d_cs, d_cr, d_state, pad, lookahead,
+                        d_bufs, d_clk);
 }
 
 void mk_run_df2(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_off,
@@ -1202,9 +1244,10 @@ void mk_run_df2(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_o
                   (void*)&d_gc,     (void*)&d_gk,    (void*)&d_state,  (void*)&d_bufs,
                   (void*)&d_clk};
   auto stream = at::cuda::getCurrentCUDAStream();
-  C10_CUDA_CHECK(cudaLaunchCooperativeKernel((void*)megakernel_df2, dim3(df2_nblocks),
-                                             dim3(256), args, (size_t)smem_bytes,
-                                             stream.stream()));
+  mk_launch_cooperative(megakernel_df2, dim3(df2_nblocks), dim3(256), args,
+                        (size_t)smem_bytes, stream.stream(), d_instrs, n_instr,
+                        ring_cap, d_dc, d_ao, d_ad, d_cs, d_gi, d_bt, d_ro, d_rc,
+                        d_go, d_gc, d_gk, d_state, d_bufs, d_clk);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
