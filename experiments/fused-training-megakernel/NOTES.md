@@ -4067,6 +4067,30 @@ Evidence:
   (`mkv3-p4b-dwskipfill-testops-20260706T0154Z.log`), `py_compile`,
   `ruff check`, and `git diff --check` passed.
 
+## v3 P4b D=128 dQ register-A feed: NO-GO in-model
+
+The operator-gap standalone `attn_dq_d128_rf` result was ported narrowly onto
+the promoted qwen row-split dQ route as an opt-in test: dS was packed directly
+from the C-fragment layout into 16 bf16x2 A-registers for an RS WGMMA, bypassing
+the dS smem store, `fence.proxy.async`, WG sync, and SS A-smem read. The test
+kept the current non-mbarrier row-split scheduling and qwen's 148KB launch
+carveout.
+
+Evidence:
+- Smoke/control log `mkv3-p4b-d128-dqrf-smoke-20260706T0156Z.log`: forced
+  control route emitted dQ `[(256,16777217)]`; forced RS-feed emitted
+  `[(256,83886081)]`. Qwen one-step parity was clean: loss diff `-1.9e-06`,
+  worst full-gradient relative diff `4.632988e-07`.
+- Paired timing `mkv3-p4b-d128-dqrf-ab-20260706T0156Z.log` rejected the route:
+  old-minus-new medians were `-6.40us` and `-14.08us`, with weak `30/64` and
+  `23/64` wins. The standalone per-stage work removal is too small after the
+  row-split/direct-store dQ route and is absorbed by the composed qwen step.
+
+Outcome: candidate source was reverted; do not carry `MK_ATTN_D128_DQ_RF` in
+production. If this mechanism is revisited, it should be as part of the larger
+S^T/full-TMA D=128 bwd rewrite, not another narrow bolt-on to the current dQ
+row-split body.
+
 ## v3 P4b fwd KV-widening in-model (session 2853e0de): NO-GO — absorption
 
 The FA4-B w128 fwd port (OP_ATTN_FWD_WGW128, `megakernel-attn-w128` worktree,
