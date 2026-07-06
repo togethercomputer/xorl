@@ -4367,6 +4367,18 @@ default-minus-R4 median deltas were `-22.70us` and `-25.10us`, with only `5/32`
 R4 wins in each order. Keep qwen H2560 on the existing two-row RMS dX body;
 `MK_RMS_DX_R4` remains a sweep override, not a qwen default.
 
+Qwen combined RMS backward recheck: NO-GO. Source-free
+`MK_RMS_BWD_SPLIT_DW=0` collapsed the three split `RMSNORM_BWD_DX` plus three
+`RMSNORM_BWD_DW` instructions back into three combined `RMSNORM_BWD` ops
+(`n_instr=47 -> 44`, region-gated `14 -> 11`) without changing tile count.
+Log `mkv3-p4b-qwen-rms-combined-ab-20260706T033617Z.log` kept two-step parity
+clean: loss diffs `0` and `-2.86e-06`, worst selected-gradient rel
+`3.21e-07`, and embedding nonzero row counts matched (`1021/1021`). Timing was
+construction-order biased, not a win: default-minus-combined was `+11.04us`
+median / `+14.72us` paired in the default-first order, but `-50.11us` median /
+`-31.36us` paired in the reverse order. Keep the current split RMS backward;
+the cold dW drain still belongs off the dX path.
+
 Qwen head-dX n256 split-K probe: NO-GO, source reverted. The top current qwen
 hop is still the 80-tile n256 direct `dlogits @ Wlm` row
 (`GEMMNN 1024x2560x151936.wg`), so a temporary default-off
