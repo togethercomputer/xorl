@@ -4353,6 +4353,40 @@ Validation:
   shapes.
 - `py_compile`, `ruff check`, and `git diff --check` passed.
 
+Qwen H2560 RMS dX R4 recheck: NO-GO. After sparse embedding clearing removed
+the support-fill distraction, the qwen profile still showed three generic
+`RMSNORM_BWD_DX` hops at ~484us total on path, so an env-only
+`MK_RMS_DX_R4=1` sweep tested the existing four-row fold outside its H256
+default gate. Log `mkv3-p4b-qwen-rmsdx-r4-20260706T032840Z.log` changed the
+three RMS dX instructions from `OP_RMSNORM_BWD_DX` with 192 total tiles to
+`OP_RMSNORM_BWD_DX_R4` with 96 total tiles and kept parity clean over two
+changing-token steps: loss diffs were `-9.54e-07` and `+1.91e-06`, worst
+selected-gradient rel was `3.73e-07`, and embedding nonzero row counts matched
+(`1018/1018`). Timing rejected the fold in both construction orders:
+default-minus-R4 median deltas were `-22.70us` and `-25.10us`, with only `5/32`
+R4 wins in each order. Keep qwen H2560 on the existing two-row RMS dX body;
+`MK_RMS_DX_R4` remains a sweep override, not a qwen default.
+
+Qwen head-dX n256 split-K probe: NO-GO, source reverted. The top current qwen
+hop is still the 80-tile n256 direct `dlogits @ Wlm` row
+(`GEMMNN 1024x2560x151936.wg`), so a temporary default-off
+`MK_HEAD_DX_N256_SPLIT=1` source probe taught the n256 fp32 body to split K and
+atomically accumulate into the existing fp32 `dXN` workspace. Smoke log
+`mkv3-p4b-qwen-headdx-n256split-smoke-20260706T033134Z.log` changed head-dX
+from `ntiles=80, flags=100679816` to `ntiles=160, flags=100679848, sk=2` and
+added one `FILL_F32` instruction. Two-step selected-gradient parity was clean
+within the usual atomic-order tolerance: loss diffs were `+1.91e-06` on both
+steps, worst selected grad rel was `5.78e-03`, and embedding nonzero row counts
+matched (`1021/1021`). Timing did not clear the bar: the first paired check was
+order-mixed (`+1.55us` median but `-10.88us` paired for sk2, then `+35.09us`
+median and `+17.73us` paired in reverse). The target sweep
+`mkv3-p4b-qwen-headdx-n256split-targets-20260706T033447Z.log` rejected sk2/sk3/sk4:
+default-minus-split was negative in both sweep halves for every target
+(`-34.90us/-16.67us` for sk2, `-60.80us/-31.66us` for sk3, and
+`-78.19us/-29.44us` for sk4). The extra fill, wave, and fp32 atomics eat the
+shorter-K tile benefit. Do not add n256 split-K support to the production body
+without a different accumulation strategy.
+
 ## v3 P4b D=128 dQ register-A feed: NO-GO in-model
 
 The operator-gap standalone `attn_dq_d128_rf` result was ported narrowly onto
