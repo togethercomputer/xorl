@@ -79,6 +79,8 @@ _H256_D64_QKBWD_SPLIT_V_S = (3072, 4096, 8192)  # H==256/D==64: split qkrope v-b
 _H256_ATTN_CHUNKS = {512: (2, 2), 1024: (2, 2), 2048: (2, 2)}
 # non-WGMMA D=128 fallback DQ chunks; exact attention-shape gate from qwen4b-l1.
 _D128_GENERIC_DQ_C1 = {(2560, 1024, 32, 8)}  # (H, S, nq, nkv); D==128
+_ATTN_D128_DQ_RS_FLAG = 1 << 24
+_D128_DQ_ROWSPLIT = {(2560, 1024, 9728, 151936, 32, 8, 128, 1)}  # H,S,I,V,nq,nkv,D,L
 _QWEN_L1_HEAD_DX_N128_F32 = {(2560, 1024, 151936, 32, 8, 128, 1)}  # H,S,V,nq,nkv,D,L
 _QWEN_L1_DW_NO_ATOMIC_SK1 = {  # M,N,K for qwen4b-l1 dW GEMMs that split-K computes as sk=1
     (151936, 2560, 1024),  # wlm
@@ -300,7 +302,17 @@ class MKQwen3:
             if d128_env is None
             else (bool(int(d128_env)) and c.D == 128 and c.S % 64 == 0)
         )
-        self._smem_bytes = 120 * 1024 if self.attn_d128_wg_enabled else None
+        dq_rs_env = os.environ.get("MK_ATTN_D128_DQ_RS")
+        dq_rs_default = (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) in _D128_DQ_ROWSPLIT
+        self.attn_d128_dq_rowsplit_enabled = (
+            self.attn_d128_wg_enabled
+            and c.S % 128 == 0
+            and (dq_rs_default if dq_rs_env is None else bool(int(dq_rs_env)))
+        )
+        if self.attn_d128_dq_rowsplit_enabled:
+            self._smem_bytes = 148 * 1024
+        else:
+            self._smem_bytes = 120 * 1024 if self.attn_d128_wg_enabled else None
         self.in_kernel_inv_valid = bool(int(os.environ.get("MK_INV_VALID_IN_KERNEL", "1")))
         self.bind_inputs = bool(int(os.environ.get("MK_BIND_INPUTS", "1")))
         self._inputs_bound_external = False
@@ -967,7 +979,14 @@ class MKQwen3:
                 # accumulators, C=1.
                 n_t64 = c.S // 64
                 p.instr(mk.OP_ATTN_DKV_WG128, c.nkv * n_t64 * G, dkv_args() + [1])
-                p.instr(mk.OP_ATTN_DQ_WG128, c.nq * n_t64, dq_args() + [1])
+                if self.attn_d128_dq_rowsplit_enabled:
+                    p.instr(
+                        mk.OP_ATTN_DQ_WG128,
+                        c.nq * (c.S // 128),
+                        dq_args() + [1 | _ATTN_D128_DQ_RS_FLAG],
+                    )
+                else:
+                    p.instr(mk.OP_ATTN_DQ_WG128, c.nq * n_t64, dq_args() + [1])
             else:
                 generic_dq_c_env = os.environ.get("MK_ATTN_DQ_C")
                 if generic_dq_c_env is None:

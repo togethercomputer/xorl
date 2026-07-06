@@ -3927,6 +3927,46 @@ without reducing the realized model path. Keep the operator-gap result as a futu
 rewrite spec for a deeper mainloop/producer design, but do not carry this direct
 port in main.
 
+## v3 P4b D=128 dQ row-split route: exact-shape qwen promotion
+
+The operator-gap D=128 dQ topology handoff (`attn_dq_d128`: 128-row q tile,
+each WG owns 64 q rows and accumulates both D halves) does transfer if we keep
+the carveout tight and avoid the standalone probe's unnecessary C==1 atomics.
+
+Implementation:
+- `OP_ATTN_DQ_WG128` reuses a high bit in `Craw` (`1 << 24`) to select the
+  row-split body; the old 64-row redundant-S body remains the fallback.
+- Row-split smem is 144KB; qwen default uses a 148KB dynamic-smem launch
+  (`MK_ATTN_D128_DQ_RS=0` restores old 120KB redundant-S, `=1` forces the
+  row-split route for eligible `D==128 && S%128==0` configs).
+- The route uses the existing conflict-reduced 64x128 loader mapping, fuses
+  S and dP as one k=128 x2 WGMMA batch, then direct-stores both D halves when
+  `C==1` (the qwen path). The atomic/staged epilogue remains only for `C>1`.
+- Default gate is exact qwen4b-l1: `(H,S,I,V,nq,nkv,D,L) =
+  (2560,1024,9728,151936,32,8,128,1)`.
+
+Evidence:
+- Promoted-default A/B vs forced old (`mkv3-p4b-d128-dqrs-promoted-ab-20260706T0119Z.log`):
+  unset default routes `[(256, 16777217)]` at 148KB; forced old routes
+  `[(512, 1)]` at 120KB. Parity is clean in both construction orders
+  (loss diff <= `2.9e-06`, worst grad rel `0.006289`). Paired timing over
+  64 pairs: old-minus-default `+32.54us` / `+35.79us` medians, `50/64` wins
+  in both orders.
+- Instruction profile (`mkv3-p4b-d128-dqrs-direct-profile-20260706T0118Z.log`):
+  dQ span drops `317.6us -> 186.0us`; best profiled step total drops
+  `10823.9us -> 10711.2us`, median `10853.2us -> 10792.8us`.
+- Earlier direct-store paired delta before promotion
+  (`mkv3-p4b-d128-dqrs-direct-paired-20260706T0118Z.log`) was positive in both
+  pair orders: `+19.71us` / `+19.22us` median old-minus-new.
+
+Validation:
+- Route/default checks: unset env rowsplit enabled, `MK_ATTN_D128_DQ_RS=0`
+  old route, `=1` forced row-split.
+- `test_model.py` PASS (`mkv3-p4b-d128-dqrs-testmodel-20260706T0119Z.log`).
+- `test_ops.py` PASS (`mkv3-p4b-d128-dqrs-testops-20260706T0120Z.log`).
+- `py_compile`, `ruff check` (system `/home/apanda/.local/bin/ruff`), and
+  `git diff --check` passed.
+
 ## v3 P4b fwd KV-widening in-model (session 2853e0de): NO-GO — absorption
 
 The FA4-B w128 fwd port (OP_ATTN_FWD_WGW128, `megakernel-attn-w128` worktree,
