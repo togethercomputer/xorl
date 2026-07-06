@@ -5870,6 +5870,16 @@ change. Logs:
 `mkv3-p4b-s8192-bwdband-postn256nn-t44-variant-first-20260706T2025Z.log`.
 Detail note: `results/operator-gap/s8192-bwdband-postn256nn-t44-nogo.md`.
 
+Post-n256-NN S8192 band-order recheck: after the exact n256 NN BF16 promotion,
+also rechecked forced `MK_ATTN_BAND_ORDER=lpt` against the current S8192
+`dq_first` default because the earlier post-combine check was order-mixed. It
+remained a no-go: `lpt` lost default-first by `+2.82us` candidate-minus-default
+and was only `-1.22us` in reverse with `8/16` wins. Full-gradient parity stayed
+clean. Keep S8192 on `dq_first`; no source change. Logs:
+`mkv3-p4b-s8192-bandorder-postn256nn-lpt-default-first-20260706T2026Z.log` and
+`mkv3-p4b-s8192-bandorder-postn256nn-lpt-variant-first-20260706T2026Z.log`.
+Detail note: `results/operator-gap/s8192-bandorder-postn256nn-lpt-nogo.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
