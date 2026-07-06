@@ -4929,6 +4929,23 @@ eligible`. Set `MK_WGMMA_N128=2` to force the old S256 lm-head n128 route for A/
 Logs: `mkv3-p4b-s256-nano-n128off-current-20260706T1402Z.log` and
 `mkv3-p4b-s256-n128off-profile-20260706T1408Z.log`.
 
+## Long-S local-LD trace: LAW AMENDED, no action (2853e0de + subagent, 20260706T1440Z)
+
+The 786,432 local-LD sectors at S8192 are NOT spill and NOT the n256 route
+(same-binary env A/B: identical LD with route on/off). 100% comes from ONE
+dynamically-indexed `float w[8]` in `op_attn_combine` (attention.cuh:296) —
+local-by-construction, executes only where fwd split-bands run (never small),
+latency-hidden: stall-priced at ~1-2us (all local traffic ~20-25us). The 13.1M
+local ST sectors are matching-LDL-free semi-dead stores (ld8bf staging f[8]) —
+ABI-frame class, harmless. n256 mainloop d[128] fully register-resident.
+**LAW AMENDMENTS**: (1) the promotion LD==0 gate is SHAPE-SCOPED — certify
+small==0 plus control-equality at band-enabled long S; (2) when attributing
+via nvdisasm line info, use the INNERMOST inline frame — the outermost frame
+collapses everything to the dispatch line (megakernel.cu:423), which polluted
+the first reading of the morning's spill hunt (runtime fixes stood anyway).
+Optional hygiene (not time): #pragma unroll the three C-loops in combine with
+c<C guards. Log: mkv3-p4b-n256-longs-ld-20260706T143417Z.log.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
