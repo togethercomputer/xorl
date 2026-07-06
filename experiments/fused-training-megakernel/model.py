@@ -61,8 +61,9 @@ def attn_bands(n_qt128, stages_of, T):
 
 # cached-sigmoid SwiGLU fwd + two-warp bwd; keys (H, S, I). One set drives BOTH
 # MK_SWIGLU_CACHE_SIG and MK_SWIGLU_BWD_2W defaults (independently overridable).
+# Small H512/S1024 moved to cache-off 4W, with separate 2W fallback below.
 _SWIGLU_CACHED_2W = {
-    (512, 1024, 1536), (256, 1024, 768), (256, 2048, 768),
+    (256, 1024, 768), (256, 2048, 768),
     (256, 3072, 768), (256, 4096, 768), (256, 8192, 768),
 }
 _QWEN_L1_SWIGLU_BWD_2W = {
@@ -74,6 +75,7 @@ _QWEN_L1_SWIGLU_BWD_4W = {
 _SMALL_SWIGLU_BWD_4W = {
     (512, 1024, 1536, 16384, 8, 4, 64, 8),  # H,S,I,V,nq,nkv,D,L
 }
+_SMALL_SWIGLU_BWD_2W = _SMALL_SWIGLU_BWD_4W
 _H256_IDLE32_S = (2048, 3072, 4096, 8192)  # H==256: scheduler idle poll 32ns (else 256)
 _H256_DQ_FLOAT2_S = (3072, 4096, 8192)     # H==256: attention-dQ float2 direct store
 _H256_D64_DKV_ROW_BCAST_S = ()             # H==256/D==64: attention-dKV row scalar shuffles
@@ -261,6 +263,7 @@ class MKQwen3:
         self.swiglu_bwd_2w_default = (
             self.swiglu_cache_sig_default
             or (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) in _QWEN_L1_SWIGLU_BWD_2W
+            or (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) in _SMALL_SWIGLU_BWD_2W
         )
         self.swiglu_bwd_4w_default = (
             (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) in _QWEN_L1_SWIGLU_BWD_4W

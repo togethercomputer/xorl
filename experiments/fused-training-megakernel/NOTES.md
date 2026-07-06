@@ -4977,11 +4977,13 @@ and `47/48`. Main validation passed `py_compile`, `git diff --check`,
 ## Small H512/S1024 SwiGLU backward 4W route (this session, 20260706T1530Z)
 
 Extended the existing `SWIGLU_BWD_4W` opcode to the exact small benchmark shape
-`H512/S1024/I1536/V16384/nq8/nkv4/D64/L8`. The default now routes small's
+`H512/S1024/I1536/V16384/nq8/nkv4/D64/L8`. The first promotion routed small's
 cached-sigmoid SwiGLU backward rows through four warps per row, while
-`MK_SWIGLU_BWD_4W=0` restores the old 2W route for A/B. This current-head
-recheck overturns the earlier small 4W no-go after the surrounding scheduler and
-4W implementation changed.
+`MK_SWIGLU_BWD_4W=0` restored the old 2W worker-count route for A/B. This
+current-head recheck overturned the earlier small 4W no-go after the surrounding
+scheduler and 4W implementation changed. Follow-up below moves the final small
+default to cache-off + 4W; set `MK_SWIGLU_CACHE_SIG=1 MK_SWIGLU_BWD_4W=0` to
+restore the full pre-1530Z small behavior.
 
 Current-head refresh before the change measured small at `3601.0us` in
 `profile_df.py` and `3576.2us` vs graph+ `1903.9us` in `final_bench.py`; the
@@ -5005,6 +5007,34 @@ measured small `3446.7us` vs graph+ `1890.7us` (gap `1.82x`). Validation passed
 `mkv3-p4b-small-swiglu-4w-promoted-old2w-first-20260706T1528Z.log`,
 `mkv3-p4b-profile-small-swiglu-4w-default-20260706T1528Z.log`,
 `mkv3-p4b-score-small-swiglu-4w-default-20260706T1528Z.log`.
+
+## Small SwiGLU cache-off with 4W follow-up (this session, 20260706T1540Z)
+
+With small on the 4W backward body, rechecked whether cached sigmoid still pays.
+Source-free env A/B kept `SWIGLU_BWD_4W` active in both arms and toggled only
+`MK_SWIGLU_CACHE_SIG=0`. Routes stayed `sw_bwd4w=8/4096`; default had
+`swsig=True`, cache-off had `swsig=False`. Parity stayed inside tolerance
+(`loss_diff=+3.81e-06` / `-1.91e-06`, worst grad `kn.0` rel `1.31e-02`), and
+cache-off won both construction orders: default-minus-cacheoff medians
+`+25.68us` and `+22.70us`, cacheoff wins `78/80` and `78/80`. Logs:
+`mkv3-p4b-small-swiglu-4w-cacheoff-default-first-20260706T1530Z.log`,
+`mkv3-p4b-small-swiglu-4w-cacheoff-cacheoff-first-20260706T1530Z.log`.
+
+The final small default removes `(512, 1024, 1536)` from `_SWIGLU_CACHED_2W`,
+keeps a separate `_SMALL_SWIGLU_BWD_2W` fallback for worker-count A/B, and keeps
+`_SMALL_SWIGLU_BWD_4W` enabled. Against the full previous default
+(`MK_SWIGLU_CACHE_SIG=1 MK_SWIGLU_BWD_4W=0`), the final default routed
+`swsig=False, sw_bwd4w=8/4096` versus old `swsig=True, sw_bwd2w=8/2048`, with
+parity clean (`loss_diff=+2.86e-06` / `-1.91e-06`, worst grad `kn.0` rel
+`1.31e-02`) and wins both orders: old-minus-default medians `+156.70us` and
+`+148.88us`, default wins `80/80` and `80/80`. The refreshed default profile
+measured `3421.6us`; refreshed score measured small `3425.9us` vs graph+
+`1916.7us` (gap `1.79x`). Validation passed `py_compile`, `git diff --check`,
+`test_model.py`, and `test_ops.py`. Logs:
+`mkv3-p4b-small-swiglu-4w-cacheoff-promoted-default-first-20260706T1530Z.log`,
+`mkv3-p4b-small-swiglu-4w-cacheoff-promoted-old-first-20260706T1530Z.log`,
+`mkv3-p4b-profile-small-swiglu-4w-cacheoff-default-20260706T1530Z.log`,
+`mkv3-p4b-score-small-swiglu-4w-cacheoff-default-20260706T1530Z.log`.
 
 ## Honest assessment + v2 roadmap
 
