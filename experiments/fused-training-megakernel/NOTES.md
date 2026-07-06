@@ -5880,6 +5880,18 @@ clean. Keep S8192 on `dq_first`; no source change. Logs:
 `mkv3-p4b-s8192-bandorder-postn256nn-lpt-variant-first-20260706T2026Z.log`.
 Detail note: `results/operator-gap/s8192-bandorder-postn256nn-lpt-nogo.md`.
 
+Post-n256-NN S8192 dQ float2-store recheck: because the earlier post-rowbcast
+forced-scalar check was order-mixed and the fresh S8192 profile still has large
+off-path `ATTN_DQ_WG` volume, rechecked `MK_ATTN_DQ_FLOAT2_STORE=0` against the
+current `_adqf2` default. The scalar extension compiled from the current tree
+and full-gradient parity stayed clean, but the result is still order-mixed/too
+small: `-1.42us` candidate-minus-default in default-first with `9/16` scalar
+wins, then `+2.74us` in variant-first with `5/16` scalar wins. Keep S8192 in
+`_H256_DQ_FLOAT2_S`; no source change. Logs:
+`mkv3-p4b-s8192-adqf2-postn256nn-default-first-20260706T2028Z.log` and
+`mkv3-p4b-s8192-adqf2-postn256nn-variant-first-20260706T2028Z.log`. Detail note:
+`results/operator-gap/s8192-adqf2-postn256nn-nogo.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
