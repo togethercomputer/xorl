@@ -5377,6 +5377,17 @@ default-minus-old `-46.56us` and `-49.86us`, old wins `0/80` and `0/80`. Keep
 `mkv3-p4b-small-drowst-post-lex2-20260706T1727Z.log`. Detail note:
 `results/operator-gap/small-drowst-post-lex2-keep.md`.
 
+Post-drowst small attention dKV direct-atomic recheck: forced the old smem-drain
+dKV epilogue with `MK_ATTN_DKV_DIRECT_ATOMIC=0`. The forced-old extension
+correctly dropped both `_adkva` and `_adkvf2`, kept route shape unchanged
+(`n_instr=288`, `critical_path=144`, `gated=127`, `ATTN_FWD/DKV/DQ=8/512`
+each), and parity stayed clean (`loss_diff=-1.91e-06` / `+2.86e-06`, worst
+selected grad rel `<9.7e-07`). The old smem-drain path lost both construction
+orders: default-minus-old `-91.33us` and `-94.29us`, old wins `0/80` and
+`0/80`. Keep `_adkva` and `_adkvf2` enabled for H512/S1024 small. Log:
+`mkv3-p4b-small-adkva-post-drowst-20260706T1731Z.log`. Detail note:
+`results/operator-gap/small-adkva-post-drowst-keep.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
