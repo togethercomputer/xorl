@@ -5546,6 +5546,17 @@ candidate (worst selected grad rel at most `0.015114`). Keep
 `mkv3-p4b-s8192-fwdband-postcombine-t72-band-first-20260706T1819Z.log`. Detail
 note: `results/operator-gap/s8192-fwdband-postcombine-retune-nogo.md`.
 
+Post-combine-unroll S8192 attention-bwd band-order recheck: because the latest
+profile is dominated by on-path `ATTN_DKV_WG` wait, rechecked forced
+`MK_ATTN_BAND_ORDER=lpt` against the current exact S8192 default `dq_first` at
+`c3c5f56`. The helper reports `forced - default`: forced `lpt` was
+order-mixed, `-2.96us` with `10/16` wins in default-first, then `+5.79us` with
+`6/16` wins in forced-first. Route size stayed `4888` instructions and parity
+was clean (worst selected grad rel `0.004888`). Keep S8192 on `dq_first`. Logs:
+`mkv3-p4b-s8192-bandorder-postcombine-lpt-default-first-20260706T1822Z.log` and
+`mkv3-p4b-s8192-bandorder-postcombine-lpt-forced-first-20260706T1822Z.log`.
+Detail note: `results/operator-gap/s8192-bandorder-postcombine-lpt-nogo.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
