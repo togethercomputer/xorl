@@ -6160,6 +6160,27 @@ promotion). test_model passed. Logs:
 `results/operator-gap/s8192-n256tma-nogo.md`,
 `results/operator-gap/s3072-n256tma-promote.md`.
 
+Qwen4b-L2 GEMM-cluster promotion (gate-extension lane, session f30b8c0c):
+every l1-exact qwen gate was dark at Cfg(H=2560, L=2, ..., S=1024) — the l2
+n256 rows ran the 2-stage no-ring cp.async loop, no N-major, no dq RS-feed,
+no TMA. Arm A extended the whole promoted l1 GEMM cluster at once (n256
+stage3+nmajor+dq-RS via the L2 `_D128_DQ_ROWSPLIT` tuple; mbar ring; TMA
+NN+TN; NT stays on the promoted `_n256ntold` refill): **-1530.45us /
+-1509.79us, 12/12 wins in both construction orders** (16205.52 ->
+14675.07us and 16164.56 -> 14654.77us), loss parity <3e-06, worst grad emb
+6.0e-03. Route: all 26 n256 rows take stage3+nmajor, 17 carry tmap args,
+smem carveout 148KB. Promoted via `exact_qwen4b_l2` (ring/TMA/NT-old
+defaults) + the L2 tuple in `_D128_DQ_ROWSPLIT`. Promoted-default vs
+forced-old (`MK_GEMM_MBAR_RING=0,MK_WGMMA_N256_STAGE3=0,
+MK_WGMMA_N256_NMAJOR=0,MK_ATTN_D128_DQ_RS=0`): old lost both orders,
+old loses +1543.92us (1/12) default-first and +1592.21us (0/12) in the clean variant-first rerun (first vfirst window discarded as contaminated); test_model passed. The R4 peel-resweep (each component env-off on
+the new default) and the support arms (cefix, swb4w, sparse-embed,
+cold-cap0) follow as separate records. Logs:
+`mkv3-p4b-qwenl2-gemmcluster-{default,variant}_first-20260706T2350Z.log`,
+`mkv3-p4b-qwenl2-cluster-promoted-20260707T0010Z.log`,
+`mkv3-p4b-qwenl2-cluster-promoted-vfirst-clean-20260707T0030Z.log`. Detail
+note: `results/operator-gap/qwenl2-gemm-cluster-promote.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

@@ -95,7 +95,11 @@ _D128_GENERIC_DQ_C1 = {(2560, 1024, 32, 8)}  # (H, S, nq, nkv); D==128
 _ATTN_D128_FWD_MB_FLAG = 1 << 24
 _ATTN_D128_DQ_RS_FLAG = 1 << 24
 _D128_FWD_MBAR = {(2560, 1024, 9728, 151936, 32, 8, 128, 1)}  # H,S,I,V,nq,nkv,D,L
-_D128_DQ_ROWSPLIT = {(2560, 1024, 9728, 151936, 32, 8, 128, 1)}  # H,S,I,V,nq,nkv,D,L
+# qwen4b L=1 and L=2: the L2 tuple was promoted as the arm-A GEMM cluster
+# (stage3+nmajor+dqRS+ring+TMA together): -1530.45/-1509.79us, 12/12 both
+# construction orders (mkv3-p4b-qwenl2-gemmcluster-*-20260706T2350Z.log).
+_D128_DQ_ROWSPLIT = {(2560, 1024, 9728, 151936, 32, 8, 128, 1),
+                     (2560, 1024, 9728, 151936, 32, 8, 128, 2)}  # H,S,I,V,nq,nkv,D,L
 _QWEN_L1_HEAD_DX_N128_F32 = {(2560, 1024, 151936, 32, 8, 128, 1)}  # H,S,V,nq,nkv,D,L
 _QWEN_L1_DW_NO_ATOMIC_SK1 = {  # M,N,K for qwen4b-l1 dW GEMMs that split-K computes as sk=1
     (151936, 2560, 1024),  # wlm
@@ -342,6 +346,10 @@ class MKQwen3:
             (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
             == (2560, 1, 1024, 32, 8, 128, 9728, 151936)
         )
+        exact_qwen4b_l2 = (
+            (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
+            == (2560, 2, 1024, 32, 8, 128, 9728, 151936)
+        )
         exact_s8192 = (
             (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
             == (256, 4, 8192, 4, 2, 64, 768, 8192)
@@ -355,9 +363,10 @@ class MKQwen3:
         )
         self.gemm_mbar_ring_default = (
             c.D == 64 and c.S >= 1024 and c.S % 128 == 0
-        ) or exact_qwen4b_l1
+        ) or exact_qwen4b_l1 or exact_qwen4b_l2
         self.gemm_n256_nt_mbar_default = (
-            self.gemm_mbar_ring_default and not exact_qwen4b_l1
+            self.gemm_mbar_ring_default
+            and not (exact_qwen4b_l1 or exact_qwen4b_l2)
         )
         # GEMM round-4 TMA feed on the n256 NN ring rows (elected-thread
         # cp.async.bulk.tensor + expect_tx from a global tensormap table).
@@ -375,7 +384,9 @@ class MKQwen3:
             (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
             == (256, 4, 3072, 4, 2, 64, 768, 8192)
         )
-        self.gemm_n256_tma_default = exact_qwen4b_l1 or exact_s3072
+        self.gemm_n256_tma_default = (
+            exact_qwen4b_l1 or exact_qwen4b_l2 or exact_s3072
+        )
         self.gemm_direct_bf16_epilogue_default = c.D == 64 and (
             c.S == 128 or (c.H, c.L, c.S, c.nq, c.nkv, c.I) == (512, 8, 1024, 8, 4, 1536)
         )
