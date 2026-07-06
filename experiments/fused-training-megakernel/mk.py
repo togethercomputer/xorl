@@ -184,14 +184,19 @@ def wgmma_n256_direct_ok(M, N, K, flags):
         return False
     if mode == 1:
         return True
-    # long-S gauntlet head (H256/V8192): giant-N tile pays only at M>=3072
-    # (S3072 -59us, S4096 -39, S8192 -255; S<=2048 regress — measured
-    # mkv3-p4b-n256head-gauntlet-20260706T092847Z.log). small's regression
-    # FLIPPED after the head-dX SKR promotion restructured its head region
-    # (resweep law): -33.5/-22.8us 40/40 both orders post-193a108
-    # (mkv3-p4b-small-lmhead-n256-postskr-20260706T2218Z.log).
+    # long-S gauntlet head (H256/V8192): the 0928Z gauntlet gated this to M>=3072
+    # (S3072 -59us, S4096 -39, S8192 -255; S<=2048/small regressed then). ALL
+    # THREE stale rejections FLIPPED after the evening structural promotions
+    # (SKR head-dX at small; mbar ring/commit batching at H256 S>=1024) — the
+    # resweep law: small -33.5/-22.8us 40/40, s2048 -25.0/-20.9 40/40 both
+    # orders (mkv3-p4b-small-lmhead-n256-postskr-*, -postskr-resweep1{,-rev}-*).
+    # s1024 is dispersion-edged: probe -10.9/-11.9 (40/40+39/40) but rechecks
+    # bounce -4.5..+8.4 (mkv3-p4b-s1024-n256-tiebreak-*) — kept on the probe
+    # majority; revisit if a later resweep flips it consistently. s128-512
+    # remain unmeasured-post; their heads are sub-wave anyway.
     return (M, N, K) in {(1024, 151936, 2560),
                          (1024, 16384, 512),  # small lm_head fwd (post-SKR)
+                         (1024, 8192, 256), (2048, 8192, 256),
                          (3072, 8192, 256), (4096, 8192, 256), (8192, 8192, 256)}
 
 

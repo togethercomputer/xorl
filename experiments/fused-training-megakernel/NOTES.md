@@ -6016,6 +6016,19 @@ compiles in every build) — no res-usage/LD surface. Paired small arm now
 ~3258-3273us. Logs: mkv3-p4b-small-lmhead-n256-postskr-20260706T2218Z.log,
 mkv3-p4b-small-lmhead-n256-promote-check-20260706T2225Z.log.
 
+s1024/s2048 lm_head n256 promotion (resweep round 2): the 0928Z gauntlet's
+S<=2048 n256-head rejections were stale — the evening structural promotions
+(mbar ring + S/dP commit batching at H256 S>=1024, SKR at small) moved those
+routes. Env probes both orders on clean GPU 3: s2048 -25.0/-20.9us 40/40+40/40
+(promoted-vs-old confirms, old +20.7 0/40); s1024 -10.9/-11.9us 40/40+39/40 in
+the probe but recheck-dispersed (-4.5..+8.4 across three more runs) — kept on
+the probe majority with the dispersion documented in the gate comment. Same
+resweep batch reconfirmed MK_CLAIM=132 decisively (64: +468us 0/40; 264:
++131us 0/40) and left cold_cap=8 as a weak candidate (-5.7/-6.0, 35/40+27/40 —
+high-rep repeat pending). Parity clean everywhere. Routing-only changes. Logs:
+mkv3-p4b-postskr-resweep1{,-rev}-*.log, mkv3-p4b-s1024-s2048-n256-promote-
+check-*.log, mkv3-p4b-s1024-n256-tiebreak-*.log.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
