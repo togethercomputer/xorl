@@ -43,6 +43,20 @@ Principle: before sweeping scheduling knobs on a wait-heavy bucket, compute
 packing efficiency from the iclk timeline (total stage-units x per-stage cost
 / 132 blocks vs actual window) — it splits scheduling from op cost in minutes.
 
+**Small idle_ns 256->64** — WIN (small ~-20us; 32/64/128 ALL beat 256 in 10
+paired runs post-SKR; fe0fe19)
+Why: SKR+n256 shortened small's hop structure; the ready-ring poll cadence
+tuned for the old hop lengths left idle blocks sleeping through short waits.
+Principle: poll cadence is a resweep-law knob — recheck it at a shape after
+any promotion that changes that shape's hop-length distribution.
+
+**MK_CLAIM 64/264 + cold_cap 8/32 at small (post-SKR recheck)** — NO-GO
+(claim: +468/+131 0/40; cold_cap: died at 120 reps after 40-rep positives)
+Why: claim quantum verdicts are robust to today's structural changes; the
+cold_cap "wins" were window noise.
+Principle: sub-6us 40-rep verdicts are NOISE — require 120+ reps or a
+double-order margin >2x the window drift before believing knob deltas.
+
 ## Attention op bodies
 
 **S/dP one-commit batch + fused ALU (dkv+dq)** — WIN (all D64 shapes; S8192
@@ -86,6 +100,29 @@ hop REPLACEMENT is not hop DELETION; the rowop span was absorbed anyway.
 Principle: fusion pays only if the consumer's dependency lands with the
 PRODUCER (true hop deletion) or deletes real traffic; count chain hops before
 building.
+
+**head-dX SKR in-model port (splitK + separate reduce)** — WIN small skr=2
+(-115/-112 40/40 x4, 193a108), nano/deep skr=4 (-12, -31/-35; 0abc08f);
+NO-GO s128/s256 (+36/+12: n128 tile collapses at M<=256), s1024 (noise),
+s2048 (+18: direct route stands), per-layer gate_up dX (+83/+65 0/80)
+Why: K-splitting a HALF-WAVE long-K head gemm doubles tile parallelism to one
+wave and halves the serial K chain, for ONE ~11us reduce hop; per-layer
+application multiplies the reduce tax past the split gain; replaces zero-fill
++ fp32-atomic epilogues (the round-12 16-30us atomic tax) at nano/deep.
+Principle: SKR pays iff ONE giant sub-wave long-K gemm amortizes ONE reduce;
+never apply per-layer. The portable pieces of a standalone ladder (K-split +
+plain slabs + reduce) can beat the ladder's in-model expectation because the
+win is wave-filling, which standalone probes cannot see.
+
+**lm_head fwd n256 resweep cascade (small/s1024/s2048)** — WIN (-33/-23,
+-11/-12, -25/-21 both orders; 7f77378, 5c6e234)
+Why: the 0928Z gauntlet CORRECTLY rejected these cells; the same-day SKR and
+mbar-ring/commit-batching promotions restructured the surrounding schedule
+and flipped them.
+Principle: exact-shape gates rot in BOTH directions — after any structural
+promotion, re-run the cheap env probes for neighboring REJECTED routes at the
+affected shapes; 4 of this session's 6 promotions were resweep flips found by
+2-run env A/Bs.
 
 ## Meta / measurement
 
