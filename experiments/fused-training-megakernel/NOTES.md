@@ -5256,6 +5256,15 @@ both orders: default-minus-variant `-29.44us` and `-28.46us`, variant wins
 `mkv3-p4b-small-attnc-post-directbf16-20260706T1930Z.log`. Detail note:
 `results/operator-gap/small-attnc-post-n128-nogo.md`.
 
+Post-direct focused cold-cap recheck: because cap64 was close before direct-BF16,
+rechecked current cap48/default against `MK_COLD_CAP=64`. Route shape stayed
+`n_instr=288`, `critical_path=144`, `gated=127`, `hot=197`, `cold=91`, and
+parity stayed clean (worst selected grad rel `<6.7e-07`). Cap64 still failed:
+default-minus-cap64 was `-3.04us` with cap64 wins `65/160` in default-first,
+and `-0.85us` with cap64 wins `75/160` in cap64-first. Keep cap48. Log:
+`mkv3-p4b-small-coldcap-post-directbf16-20260706T1940Z.log`. Detail note:
+`results/operator-gap/small-coldcap-post-n128-nogo.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

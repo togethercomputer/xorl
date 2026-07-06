@@ -64,3 +64,35 @@ Focused cap48 vs cap64, 160 samples per arm:
 Reject. The remaining cap64 signal is within timing noise after the n128 route
 changes and does not justify changing `_cold_cap()`. Keep the H512/S1024 small
 default cap48.
+
+## Post-direct-BF16 addendum
+
+After `fc32323` promoted direct-BF16 GEMM epilogues for exact H512/L8/S1024
+small, cap64 was rechecked against the current cap48 default because the earlier
+cap64 result was close.
+
+Log: `results/mkv3-p4b-small-coldcap-post-directbf16-20260706T1940Z.log`
+
+Route shape stayed unchanged:
+
+- `n_instr=288`
+- `critical_path=144`
+- `gated=127`
+- `hot=197`
+- `cold=91`
+
+Parity stayed clean:
+
+- default-first: `loss_diff=+1.90734863e-06`, worst selected grad `kn.0`,
+  relative error `3.599131e-07`.
+- cap64-first: `loss_diff=+1.90734863e-06`, worst selected grad `qn.0`,
+  relative error `6.613873e-07`.
+
+Cap64 still failed the focused gate:
+
+| Order | Cap48/default | Cap64 | Paired delta |
+| --- | ---: | ---: | --- |
+| default first | `3267.70us` | `3269.31us` | default-minus-cap64 `-3.04us` median, `-2.51us` mean, cap64 wins `65/160` |
+| cap64 first | `3261.01us` | `3262.67us` | default-minus-cap64 `-0.85us` median, `-1.91us` mean, cap64 wins `75/160` |
+
+Keep cap48 after the direct-BF16 promotion.
