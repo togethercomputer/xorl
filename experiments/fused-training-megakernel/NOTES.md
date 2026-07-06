@@ -4397,6 +4397,30 @@ the fused op's span was `327.1us`, barely below split `CE_FWD+CE_BWD`
 giant n256 head/lm-head GEMMs. Do not carry a fused CE opcode unless it also
 changes the downstream head/dW dataflow, not just the local CE hop.
 
+Qwen D=128 WGMMA attention claim1: PROMOTED. The old absorption-ledger note
+said `MK_ATTN_D128_CLAIM1=1` was an order-mixed wash before the sparse-embed
+and current qwen defaults. A source-free recheck on the current qwen4b-l1 shape
+(`Cfg(H=2560,L=1,nq=32,nkv=8,D=128,I=9728,V=151936,S=1024)`) changed only the
+claim tensor for `ATTN_FWD_WG128`, `ATTN_DKV_WG128`, and `ATTN_DQ_WG128`:
+default claims were `2/4/2`, claim1 claims were `1/1/1`, with identical
+`n_instr=47`, `critical_path=26`, `gated=14`, and `waves=26`. Two-step parity
+was clean for a scheduler-only atomic-order change: loss diffs were
+`-2.86e-06` and `-1.91e-06` across the two construction orders, worst selected
+grad rel was `1.33e-03` on sparse `grad:emb` rows, and embedding nonzero row
+counts matched (`1019/1019`). Timing cleared both order checks:
+default-minus-claim1 was `+37.30us` median / `+50.56us` paired with `31/32`
+claim1 wins, then `+35.07us` median / `+30.74us` paired with `30/32` wins in
+reverse (`mkv3-p4b-qwen-d128claim1-ab-20260706T035004Z.log`). Default now uses
+claim1 for D=128 WGMMA attention rows; set `MK_ATTN_D128_CLAIM1=0` to restore
+the previous ntiles/132 batching for A/B. Post-promotion validation:
+`py_compile`, `ruff`, and `git diff --check` passed; `test_model.py` passed
+nano plus D128-ragged correctness/executor/SGD coverage
+(`mkv3-d128claim1-testmodel-20260706T035329Z.log`). Patched-default qwen A/B
+against forced old kept the win: old-minus-default was `+36.46us` median /
+`+34.05us` paired with `26/32` default wins, then `+33.90us` median /
+`+38.42us` paired with `26/32` wins in reverse
+(`mkv3-p4b-qwen-d128claim1-default-ab-20260706T035810Z.log`).
+
 Qwen head-dX n256 split-K probe: NO-GO, source reverted. The top current qwen
 hop is still the 80-tile n256 direct `dlogits @ Wlm` row
 (`GEMMNN 1024x2560x151936.wg`), so a temporary default-off
