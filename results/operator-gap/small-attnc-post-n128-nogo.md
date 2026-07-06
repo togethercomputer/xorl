@@ -62,3 +62,28 @@ Keep H512/S1024 small attention chunks at the current default
 `DKV_C=1`, `DQ_C=1`. No source change.
 
 Log: `results/mkv3-p4b-small-attnc-post-n128-20260706T1840Z.log`
+
+## Post-direct-BF16 addendum
+
+After `fc32323` promoted direct-BF16 GEMM epilogues for exact H512/L8/S1024
+small, the closest prior variant (`MK_ATTN_DKV_C=1 MK_ATTN_DQ_C=2`) was
+rechecked source-free.
+
+Log: `results/mkv3-p4b-small-attnc-post-directbf16-20260706T1930Z.log`
+
+Route shape stayed `n_instr=288`, `critical_path=144`, `gated=127`; the variant
+changed only `ATTN_DQ_WG=8/512 -> 8/1024`. Parity stayed clean:
+
+- default-first: `loss_diff=+9.53674316e-07`, worst selected grad `qn.0`,
+  relative error `1.172124e-02`.
+- variant-first: `loss_diff=+0.00000000e+00`, worst selected grad `qn.0`,
+  relative error `1.172104e-02`.
+
+The variant still lost both construction orders:
+
+- default-first: default `3269.31us`, variant `3301.47us`,
+  default-minus-variant `-29.44us`, variant wins `2/80`.
+- variant-first: default `3260.82us`, variant `3288.24us`,
+  default-minus-variant `-28.46us`, variant wins `1/80`.
+
+Keep `DKV_C=1`, `DQ_C=1` after the direct-BF16 promotion.

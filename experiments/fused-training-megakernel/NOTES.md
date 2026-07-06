@@ -5246,6 +5246,16 @@ Refreshed profile measured `3320.1us`; refreshed score measured megakernel
 `mkv3-p4b-score-small-directbf16-default-20260706T1925Z.log`. Detail note:
 `results/operator-gap/small-directbf16-post-n128-promote.md`.
 
+Post-direct focused attention recheck: because the direct-BF16 promotion moved
+attention around in the realized profile, rechecked the closest prior attention
+chunk no-go, `MK_ATTN_DKV_C=1 MK_ATTN_DQ_C=2`, on current head. It still only
+changed `ATTN_DQ_WG=8/512 -> 8/1024`, stayed parity-clean
+(`loss_diff=+9.54e-07` / `0`, worst selected grad rel `<1.18e-02`), and lost
+both orders: default-minus-variant `-29.44us` and `-28.46us`, variant wins
+`2/80` and `1/80`. Keep small attention chunks at `DKV_C=1/DQ_C=1`. Log:
+`mkv3-p4b-small-attnc-post-directbf16-20260706T1930Z.log`. Detail note:
+`results/operator-gap/small-attnc-post-n128-nogo.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
