@@ -5330,6 +5330,16 @@ and `-25.66us`, precise wins `3/80` and `3/80`. Keep `_aex2` enabled for
 H512/S1024 small. Log: `mkv3-p4b-small-aex2-post-aflog-20260706T1712Z.log`.
 Detail note: `results/operator-gap/small-aex2-post-aflog-keep.md`.
 
+Post-fast-log small qknorm D64 cache recheck: forced the old generic loop with
+`MK_QKBWD_D64_CACHE=0`. The forced-old extension correctly dropped `_qkbc`,
+kept route shape unchanged (`n_instr=288`, `critical_path=144`, `gated=127`,
+`QKNORM_ROPE_BWD=8/1024`), and stayed parity-clean (`loss_diff=-3.81e-06` /
+`0`, worst selected grad `kn.0` rel around `1.03e-02`). The old loop lost both
+orders: default-minus-old `-29.25us` and `-26.21us`, old wins `2/80` and
+`1/80`. Keep `_qkbc` enabled for H512/S1024 small. Log:
+`mkv3-p4b-small-qkbc-post-aflog-20260706T1715Z.log`. Detail note:
+`results/operator-gap/small-qkbc-post-aflog-keep.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
