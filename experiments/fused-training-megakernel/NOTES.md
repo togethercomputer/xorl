@@ -4421,6 +4421,21 @@ against forced old kept the win: old-minus-default was `+36.46us` median /
 `+38.42us` paired with `26/32` wins in reverse
 (`mkv3-p4b-qwen-d128claim1-default-ab-20260706T035810Z.log`).
 
+Qwen D=128 backward DQ-before-DKV emission order: NO-GO, source reverted. The
+post-claim1 profile (`mkv3-p4b-qwen-d128claim1-profile-20260706T035905Z.log`)
+showed `ATTN_DQ_WG128` on path mostly as wait (`327.0us` wait + `110.1us`
+span) while `ATTN_DKV_WG128` was off path at `372.4us`, so a temporary
+`MK_ATTN_D128_BWD_DQ_FIRST=1` probe emitted the dQ instruction before dKV
+inside the same backward wave. Route/parity were clean: `n_instr=47`,
+`critical_path=26`, `gated=14`, `waves=26`, dQ/dKV instruction indices swapped,
+loss diffs stayed within `2.86e-06`, and worst selected-gradient rel was
+`2.89e-03` on sparse `grad:emb`. Timing did not justify promotion:
+default-minus-dqfirst was `-0.86us` median / `+1.70us` paired with `17/32`
+dq-first wins, then only `+9.55us` median / `+7.04us` paired with `20/32` wins
+in reverse (`mkv3-p4b-qwen-d128-dqfirst-ab-20260706T035952Z.log`). Keep the
+current dKV-then-dQ emission; the apparent dQ wait is mostly balanced against
+the dKV completion requirement before qk-norm backward.
+
 Qwen head-dX n256 split-K probe: NO-GO, source reverted. The top current qwen
 hop is still the 80-tile n256 direct `dlogits @ Wlm` row
 (`GEMMNN 1024x2560x151936.wg`), so a temporary default-off
