@@ -5137,6 +5137,35 @@ megakernel `3373.2us` vs compile+CUDAGraph+ `1904.9us` (gap `1.77x`). Logs:
 `mkv3-p4b-profile-small-n128nn-final-default-20260706T1732Z.log`,
 `mkv3-p4b-score-small-n128nn-final-default-20260706T1735Z.log`.
 
+## Small H512/S1024 NT n128 route retune (this session, 20260706T1800Z)
+
+After the NN n128 retunes, `MK_WGMMA_N128=2` was used as a source-free probe to
+keep lm-head/head-dX n128 behavior but disable the general NT n128 route. On
+H512/S1024 small this changed exactly 24 rows: 8x
+`GEMMNT 1024x512x512` (`12434` / 32 tiles -> `8338` / 64 tiles), 8x
+`GEMMNT 1024x3072x512` (`4226` / 192 tiles -> `130` / 384 tiles), and 8x
+`GEMMNT 1024x512x1536` (`12434` / 32 tiles -> `8338` / 64 tiles). Route shape
+stayed `n_instr=288`, `critical_path=144`, `gated=127`, while `n128` dropped
+from `26` to `2`. Parity stayed clean (`loss_diff=-2.86e-06` / `+3.81e-06`,
+worst selected grad rel `<4.3e-07`), and timing won both construction orders:
+default-minus-mode2 medians `+56.46us` and `+55.62us`, mode2 wins `80/80` and
+`80/80`. Log: `mkv3-p4b-small-n128-mode2-after-final-20260706T1740Z.log`.
+
+The promoted default now excludes only those exact NT shapes when
+`MK_WGMMA_N128` is unset; `MK_WGMMA_N128=1` still restores old general n128 for
+A/B, and `=2` still means lm-head-only mode. Promoted validation against
+`MK_WGMMA_N128=1` kept `n128=2` in default vs `n128=26` in forced-old, with clean
+parity (`loss_diff=+9.54e-07` / `-1.91e-06`, worst selected grad rel
+`<6.2e-07`) and wins both orders: old-minus-default medians `+53.36us` and
+`+44.85us`, default wins `79/80` and `80/80`. Validation passed `py_compile`,
+`git diff --check`, `test_model.py`, and `test_ops.py`. The refreshed final
+profile measured `3354.8us`; the refreshed final score measured megakernel
+`3356.6us` vs compile+CUDAGraph+ `1888.5us` (gap `1.78x`). Logs:
+`mkv3-p4b-small-n128nt-promoted-20260706T1750Z.log`,
+`mkv3-p4b-profile-small-n128nt-default-20260706T1755Z.log`,
+`mkv3-p4b-score-small-n128nt-default-20260706T1757Z.log`. Detail note:
+`results/operator-gap/small-n128nt-post4w-promote.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

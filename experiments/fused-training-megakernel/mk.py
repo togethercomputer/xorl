@@ -128,6 +128,15 @@ def wgmma_n128_ok(M, N, K, flags):
         return False
     if flags & (1 | 4 | 8 | 32 | 256 | 1024):
         return False
+    # Post-small-4W retune: H512/S1024's remaining general NT n128 rows are
+    # slower than the normal m64n64 WGMMA path. Env mode 1 remains a force-on
+    # override, and mode 2 remains the lm-head-only probe.
+    if mode_env is None and (flags & 2) and (M, N, K) in {
+        (1024, 3072, 512),
+        (1024, 512, 512),
+        (1024, 512, 1536),
+    }:
+        return False
     if not (flags & 2):  # NN (dX): MN-major 128-wide B; tile-gated like the m64n64
         # NN route (halved tile count needs co-scheduling headroom). MK_WGMMA_N128_NN
         # gates it separately; threshold in n128 tiles.
