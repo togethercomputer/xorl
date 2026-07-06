@@ -595,6 +595,19 @@ def load_ext(
     assert not (df_named_bar and df_producer), (
         "MK_DF_NAMED_BAR is redundant under MK_DF_PRODUCER"
     )
+    # Producer-df register-point executor (megakernel_pdf): 384 threads at entry
+    # __maxnreg__(168), consumers setmaxnreg.inc->MK_PDF_REGS (default 240), WG2
+    # dec->MK_PDF_DEC (phase 1: exits; phase 2 MK_PDF_PRODUCER=1: pure TMA
+    # producer for n256-TMA rows). Compiled only when MK_PDF=1; the reg points
+    # are part of the extension name (name-keyed cache). Pool feasibility:
+    # 8*regs + 4*dec <= 2048 (240/24 exact, 232/<=40, 224/<=56).
+    pdf = int(os.environ.get("MK_PDF", "0"))
+    pdf_regs = int(os.environ.get("MK_PDF_REGS", "240"))
+    pdf_dec = int(os.environ.get("MK_PDF_DEC", "24"))
+    pdf_producer = int(os.environ.get("MK_PDF_PRODUCER", "0"))
+    if pdf_producer:
+        pdf = 1
+    assert not pdf or 8 * pdf_regs + 4 * pdf_dec <= 2048, "pdf register pool infeasible"
     # D=64 qknorm-bwd fast path; MK_QKBWD_D64_CACHE=0 keeps the old generic loop for
     # A/B and bisects. Separate extension name because torch's cache is name-keyed.
     qkbc = int(os.environ.get("MK_QKBWD_D64_CACHE", "1"))
@@ -683,7 +696,10 @@ def load_ext(
         + ("_gtma" if gemm_n256_tma else "")
         + ("_d64tma" if gemm_d64_tma else "")
         + ("_gdbf16" if gemm_direct_bf16_epilogue else "")
-        + ("_hdskr" if head_dx_skr else ""),
+        + ("_hdskr" if head_dx_skr else "")
+        + (f"_pdf{pdf_regs}" if pdf else "")
+        + (f"d{pdf_dec}" if pdf and pdf_dec != 24 else "")
+        + ("p" if pdf_producer else ""),
         sources=[os.path.join(_DIR, "megakernel.cu")],
         extra_ldflags=["-lcuda"],
         extra_cuda_cflags=[
@@ -725,7 +741,9 @@ def load_ext(
         + (["-DMK_GEMM_N256_TMA"] if gemm_n256_tma else [])
         + (["-DMK_GEMM_D64_TMA"] if gemm_d64_tma else [])
         + (["-DMK_GEMM_DIRECT_BF16_EPILOGUE"] if gemm_direct_bf16_epilogue else [])
-        + (["-DMK_HEAD_DX_SKR"] if head_dx_skr else []),
+        + (["-DMK_HEAD_DX_SKR"] if head_dx_skr else [])
+        + (["-DMK_PDF", f"-DMK_PDF_REGS={pdf_regs}", f"-DMK_PDF_DEC={pdf_dec}"] if pdf else [])
+        + (["-DMK_PDF_PRODUCER"] if pdf_producer else []),
         verbose=verbose,
     )
 
@@ -1385,6 +1403,28 @@ class Program:
                 self._buftab,
                 smem_bytes,
                 wave_clk,
+            )
+        elif mode == "pdf":
+            # producer-df register-point executor: identical protocol and state
+            # layout to df, so it shares self._state and the df bind fast path.
+            if bind_bufs:
+                (bind0, tensor0), (bind1, tensor1) = bind_bufs
+                bind_args = (bind0, tensor0.data_ptr(), bind1, tensor1.data_ptr())
+            else:
+                bind_args = (-1, 0, -1, 0)
+            ext.run_pdf(
+                self._instrs,
+                self._dep_cnt,
+                self._adj_off,
+                self._adj,
+                self._claim,
+                self._crit,
+                int(os.environ.get("MK_COLD_CAP", str(self.default_cold_cap))),
+                self._state,
+                self._buftab,
+                smem_bytes,
+                wave_clk,
+                *bind_args,
             )
         else:
             if bind_bufs:

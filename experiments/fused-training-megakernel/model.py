@@ -1389,7 +1389,7 @@ class MKQwen3:
         """One fused fwd+bwd. Returns the (device) loss scalar; grads are in self.grads."""
         bind_inputs = (
             self.bind_inputs
-            and mode == "df"
+            and mode in ("df", "pdf")  # pdf shares df's state layout and bind path
             and tokens.is_cuda
             and labels.is_cuda
             and tokens.device == self.tokens.device

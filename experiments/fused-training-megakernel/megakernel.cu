@@ -376,6 +376,9 @@ extern "C" __global__ void MK_LB MK_DF_NR megakernel_df(const Instr* __restrict_
     if (bind0 >= 0) bufs[bind0] = reinterpret_cast<void*>(ptr0);
     if (bind1 >= 0) bufs[bind1] = reinterpret_cast<void*>(ptr1);
   }
+#ifdef MK_PDF_PRODUCER
+  if (threadIdx.x == 0) g_pdf_feed.active = 0;  // smem is not zeroed across launches
+#endif
   int* pending = state;
   int* cursor = state + n_instr;
   int* done = state + 2 * n_instr;
@@ -555,6 +558,272 @@ extern "C" __global__ void MK_LB MK_DF_NR megakernel_df(const Instr* __restrict_
     mk_df_sync();
   }
 }
+
+// ---- producer-df executor (MK_PDF): the register-point probe --------------------------
+// The df protocol EXACTLY (claim loop, hot/cold rings, sticky claims, completion hints —
+// keep this body in lockstep with megakernel_df above), launched at 384 threads with the
+// ws register plumbing: entry __maxnreg__(168) (the 12-warp charge ceiling), consumer
+// warpgroups 0-1 setmaxnreg.inc -> MK_PDF_REGS (default 240; 8*MK_PDF_REGS + 4*24 must
+// stay <= 2048 warp-regs — 240/24 is the exact-balance point: 128*(168-24) ==
+// 256*(240-168)), warpgroup 2 setmaxnreg.dec -> 24 and exits after init (PHASE 1: this
+// isolates the pure register-point tax vs df's 255 regs at an otherwise identical
+// protocol; the ws-vs-df comparison could never do that because ws also changes the
+// scheduling protocol). PHASE 2 keeps WG2 resident as a pure TMA producer for GEMM
+// mbarrier-ring rows (the GEMM round-5 escape, in-model). Block-wide __syncthreads is
+// replaced by consumer_sync() — WG2 does not participate below the grid.syncs (the ws
+// invariant; ops already sync on bar.sync 1,256).
+#ifdef MK_PDF
+#ifndef MK_PDF_REGS
+#define MK_PDF_REGS 240
+#endif
+#define MK_PDF_THREADS 384
+
+extern "C" __global__ void __maxnreg__(168) megakernel_pdf(
+    const Instr* __restrict__ instrs, int n_instr, const int* __restrict__ dep_cnt,
+    const int* __restrict__ adj_off, const int* __restrict__ adj,
+    const int* __restrict__ claim_sz, const int* __restrict__ crit, int cold_cap,
+    int* state, void** bufs, long long* iclk /* nullable [2*n] */, int bind0,
+    unsigned long long ptr0, int bind1, unsigned long long ptr1) {
+  extern __shared__ char smem[];
+  cg::grid_group grid = cg::this_grid();
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    if (bind0 >= 0) bufs[bind0] = reinterpret_cast<void*>(ptr0);
+    if (bind1 >= 0) bufs[bind1] = reinterpret_cast<void*>(ptr1);
+  }
+#ifdef MK_PDF_PRODUCER
+  if (threadIdx.x == 0) {
+    g_pdf_feed.active = 1;  // ordered for the whole block by the init grid.sync
+    g_pdf_feed.seq = 0;
+    g_pdf_feed.halt = 0;
+  }
+#endif
+  int* pending = state;
+  int* cursor = state + n_instr;
+  int* done = state + 2 * n_instr;
+  int* ready_hot = state + 3 * n_instr;
+  int* ready_cold = state + 4 * n_instr;
+  int* ctrl = state + 5 * n_instr;
+
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_instr;
+       i += gridDim.x * blockDim.x) {
+    pending[i] = dep_cnt[i];
+    cursor[i] = 0;
+    done[i] = 0;
+    ready_hot[i] = -1;
+    ready_cold[i] = -1;
+  }
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    ctrl[0] = 0;
+    ctrl[1] = 0;
+    ctrl[2] = 0;
+    ctrl[3] = 0;
+    ctrl[4] = 0;
+    ctrl[5] = 0;
+  }
+  grid.sync();
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_instr;
+       i += gridDim.x * blockDim.x) {
+    if (dep_cnt[i] == 0) {
+      if (crit[i]) {
+        const int t = atomicAdd(&ctrl[0], 1);
+        atomicExch(&ready_hot[t], i);
+      } else {
+        const int t = atomicAdd(&ctrl[3], 1);
+        atomicExch(&ready_cold[t], i);
+      }
+    }
+  }
+  grid.sync();
+
+  // -------- specialization (the ws register dance; no full-block barrier below) --------
+  // STRUCTURE MATTERS: ptxas honors the inc region ONLY in the ws idiom — the inc'd
+  // consumer body self-contained inside the taken branch, ending in return, with the
+  // dec path on the fallthrough. With the inc on the fallthrough (dec branch first),
+  // ptxas silently keeps the whole kernel at the 168 entry cap (max SASS reg R165,
+  // STACK:208) for EVERY inc value 224/232/240 — measured on CUDA 13.1.
+  __shared__ int s_ins, s_t0, s_t1;
+  __shared__ Instr s_I;
+  if (threadIdx.x < MK_CONSUMERS) {
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" ::"n"(MK_PDF_REGS));
+
+  int last_ins = -1;
+  int last_cold = 0;
+  int seen_hot = 0;
+  volatile int* vhot = ready_hot;
+  volatile int* vcold = ready_cold;
+  volatile int* vctrl = ctrl;
+  for (;;) {
+    if (threadIdx.x == 0) {
+      s_ins = -1;
+      if (last_ins >= 0 && !(last_cold && vctrl[0] != seen_hot)) {
+        const int nt = instrs[last_ins].ntiles;
+        if (cursor[last_ins] < nt) {
+          const int bs = claim_sz[last_ins];
+          const int t0 = atomicAdd(&cursor[last_ins], bs);
+          if (t0 < nt) {
+            s_ins = last_ins;
+            s_t0 = t0;
+            s_t1 = min(t0 + bs, nt);
+          }
+        }
+      }
+      while (s_ins < 0 && vctrl[1] < n_instr) {
+        const int htail = vctrl[0];
+        int hvis = htail;
+        for (int q = vctrl[2]; q < htail; ++q) {
+          const int ins = vhot[q];
+          if (ins < 0) {
+            if (q < hvis) hvis = q;
+            continue;
+          }
+          const int nt = instrs[ins].ntiles;
+          if (cursor[ins] >= nt) {
+            if (q == vctrl[2]) atomicCAS(&ctrl[2], q, q + 1);
+            continue;
+          }
+          const int bs = claim_sz[ins];
+          const int t0 = atomicAdd(&cursor[ins], bs);
+          if (t0 < nt) {
+            s_ins = ins;
+            s_t0 = t0;
+            s_t1 = min(t0 + bs, nt);
+            if (last_cold) atomicSub(&ctrl[5], 1);
+            last_cold = 0;
+            break;
+          }
+        }
+        if (s_ins >= 0) break;
+        seen_hot = hvis;
+        if (last_cold || vctrl[5] < cold_cap) {
+          const int ctail = vctrl[3];
+          for (int q = vctrl[4]; q < ctail; ++q) {
+            const int ins = vcold[q];
+            if (ins < 0) continue;
+            const int nt = instrs[ins].ntiles;
+            if (cursor[ins] >= nt) {
+              if (q == vctrl[4]) atomicCAS(&ctrl[4], q, q + 1);
+              continue;
+            }
+            const int bs = claim_sz[ins];
+            const int t0 = atomicAdd(&cursor[ins], bs);
+            if (t0 < nt) {
+              s_ins = ins;
+              s_t0 = t0;
+              s_t1 = min(t0 + bs, nt);
+              if (!last_cold) atomicAdd(&ctrl[5], 1);
+              last_cold = 1;
+              break;
+            }
+          }
+        }
+        if (s_ins >= 0) break;
+        __nanosleep(MK_IDLE_NS);
+      }
+      if (s_ins < 0 && last_cold) atomicSub(&ctrl[5], 1);
+      last_ins = s_ins;
+    }
+    consumer_sync();
+    const int ins = s_ins;
+    if (ins < 0) break;
+    const int t0 = s_t0, t1 = s_t1;
+    if (threadIdx.x < 3 + MK_MAX_ARGS)
+      reinterpret_cast<int*>(&s_I)[threadIdx.x] =
+          reinterpret_cast<const int*>(instrs + ins)[threadIdx.x];
+    consumer_sync();
+    if (iclk && threadIdx.x == 0 && t0 == 0) iclk[2 * ins] = mk_globaltimer();
+    for (int t = t0; t < t1; ++t) {
+      dispatch(s_I, t, bufs, smem);
+      consumer_sync();
+    }
+    if (threadIdx.x == 0) {
+      __threadfence();
+      const int d = atomicAdd(&done[ins], t1 - t0) + (t1 - t0);
+      if (d == s_I.ntiles) {
+        if (iclk) iclk[2 * ins + 1] = mk_globaltimer();
+        int hint = -1;
+        for (int e = adj_off[ins]; e < adj_off[ins + 1]; ++e) {
+          const int dep = adj[e];
+          if (atomicSub(&pending[dep], 1) == 1) {
+            if (crit[dep]) {
+              const int t = atomicAdd(&ctrl[0], 1);
+              atomicExch(&ready_hot[t], dep);
+              if (hint < 0) hint = dep;
+            } else {
+              const int t = atomicAdd(&ctrl[3], 1);
+              atomicExch(&ready_cold[t], dep);
+            }
+          }
+        }
+        atomicAdd(&ctrl[1], 1);
+        if (hint >= 0) {
+          if (last_cold) atomicSub(&ctrl[5], 1);
+          last_ins = hint;
+          last_cold = 0;
+        }
+      }
+    }
+    consumer_sync();
+  }
+#ifdef MK_PDF_PRODUCER
+  if (threadIdx.x == 0) mk_pdf_st_release(&g_pdf_feed.halt, 1);
+#endif
+  return;
+  }  // threadIdx.x < MK_CONSUMERS
+
+#ifndef MK_PDF_DEC
+#define MK_PDF_DEC 24
+#endif
+  asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" ::"n"(MK_PDF_DEC));
+#ifdef MK_PDF_FEED
+  // -------- WG2 producer (thread 256; 257-383 exit) --------------------------------
+  // Pure TMA issuer at the dec register point: replays each posted tile's full stage
+  // schedule, gated only by ring empties — never by the consumers' mma cadence. One
+  // request is in flight at a time by construction (tile T+1 posts program-order
+  // after tile T's last full-wait on the same consumer thread).
+  if (threadIdx.x == MK_CONSUMERS) {
+    volatile MkPdfFeed* Fv = &g_pdf_feed;
+    int seen = 0;
+    for (;;) {
+      const int s = mk_pdf_ld_acquire(const_cast<const int*>(&Fv->seq));
+      if (s == seen) {
+        if (Fv->halt) break;
+        __nanosleep(64);
+        continue;
+      }
+      ++seen;
+      const char* tmA = Fv->tmA;
+      const char* tmB = Fv->tmB;
+      char* a0 = Fv->a0;
+      char* a1 = Fv->a1;
+      char* b0 = Fv->b0;
+      uint64_t* bfull = Fv->bfull;
+      uint64_t* bempty = Fv->bempty;
+      const int a_st = Fv->a_stride, b_st = Fv->b_stride;
+      const int m0 = Fv->m0, n0 = Fv->n0, iters = Fv->iters, stages = Fv->stages;
+      const int a_t = Fv->a_t, bk = Fv->bk;
+      const unsigned xb = Fv->expect_bytes;
+      wg_tmap_fence_acquire(tmA);
+      wg_tmap_fence_acquire(tmB);
+      for (int t = 0; t < iters; ++t) {
+        const int st = t % stages;
+        if (t >= stages) wg_mbar_wait(&bempty[st], (t / stages - 1) & 1);
+        wg_mbar_expect_tx(&bfull[st], xb);
+        const int k0 = t * bk;
+        if (a_t) {
+          wg_tma_load_2d(tmA, a0 + st * a_st, m0, k0, &bfull[st]);
+          wg_tma_load_2d(tmA, a1 + st * a_st, m0 + 64, k0, &bfull[st]);
+        } else {
+          wg_tma_load_2d(tmA, a0 + st * a_st, k0, m0, &bfull[st]);
+        }
+#pragma unroll
+        for (int g = 0; g < 4; ++g)
+          wg_tma_load_2d(tmB, b0 + st * b_st + g * 8192, n0 + g * 64, k0, &bfull[st]);
+      }
+    }
+  }
+#endif  // MK_PDF_FEED
+}
+#endif  // MK_PDF
 
 // ---- dataflow executor v2: region watermarks (tile-granular producer/consumer) -------
 // Like megakernel_df, plus: producers with gated out-edges count completed tiles per
@@ -849,6 +1118,9 @@ extern "C" __global__ void __maxnreg__(168) megakernel_ws(
   WsCtrl* C = reinterpret_cast<WsCtrl*>(smem);
   char* opsmem = smem + MK_WS_CTRL_BYTES;  // ops get the rest (16B-aligned)
   cg::grid_group grid = cg::this_grid();
+#ifdef MK_PDF_PRODUCER
+  if (threadIdx.x == 0) g_pdf_feed.active = 0;  // smem is not zeroed across launches
+#endif
   int* cursor = state;
   int* done = state + n_instr * pad;
   int* pending = state + 2 * n_instr * pad;
@@ -1249,6 +1521,63 @@ void mk_run_df(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_of
                         d_clk, bind0, ptr0, bind1, ptr1);
 }
 
+#ifdef MK_PDF
+void mk_run_pdf(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_off,
+                torch::Tensor adj, torch::Tensor claim_sz, torch::Tensor crit,
+                int64_t cold_cap64, torch::Tensor state, torch::Tensor bufs,
+                int64_t smem_bytes, c10::optional<torch::Tensor> iclk,
+                int64_t bind0_64, int64_t ptr0_64, int64_t bind1_64, int64_t ptr1_64) {
+  TORCH_CHECK(instrs.is_cuda() && instrs.dtype() == torch::kInt32);
+  const int n_instr = (int)(instrs.numel() / (3 + MK_MAX_ARGS));
+  TORCH_CHECK(state.numel() >= 5 * (int64_t)n_instr + 8, "pdf state tensor too small");
+
+  static int pdf_configured = 0;
+  static int pdf_nblocks = -1;
+  if ((int)smem_bytes > pdf_configured) {
+    C10_CUDA_CHECK(cudaFuncSetAttribute((void*)megakernel_pdf,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        (int)smem_bytes));
+    pdf_configured = (int)smem_bytes;
+    pdf_nblocks = -1;
+  }
+  if (pdf_nblocks < 0) {
+    int dev, sms, per_sm;
+    C10_CUDA_CHECK(cudaGetDevice(&dev));
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &per_sm, (void*)megakernel_pdf, MK_PDF_THREADS, (int)smem_bytes));
+    TORCH_CHECK(per_sm >= 1, "megakernel_pdf does not fit an SM with smem=", smem_bytes);
+    pdf_nblocks = sms;  // 1 block/SM by design (384 threads at entry 168 regs)
+  }
+
+  const Instr* d_instrs = reinterpret_cast<const Instr*>(instrs.data_ptr<int>());
+  const int* d_dc = dep_cnt.data_ptr<int>();
+  const int* d_ao = adj_off.data_ptr<int>();
+  const int* d_ad = adj.data_ptr<int>();
+  const int* d_cs = claim_sz.data_ptr<int>();
+  const int* d_cr = crit.data_ptr<int>();
+  int cold_cap = (int)cold_cap64;
+  if (cold_cap <= 0) cold_cap = pdf_nblocks;  // 0 = uncapped
+  int* d_state = state.data_ptr<int>();
+  void** d_bufs = reinterpret_cast<void**>(bufs.data_ptr<int64_t>());
+  long long* d_clk =
+      iclk.has_value() ? reinterpret_cast<long long*>(iclk->data_ptr<int64_t>()) : nullptr;
+  int bind0 = (int)bind0_64;
+  int bind1 = (int)bind1_64;
+  unsigned long long ptr0 = (unsigned long long)ptr0_64;
+  unsigned long long ptr1 = (unsigned long long)ptr1_64;
+  void* args[] = {(void*)&d_instrs, (void*)&n_instr, (void*)&d_dc,    (void*)&d_ao,
+                  (void*)&d_ad,     (void*)&d_cs,    (void*)&d_cr,    (void*)&cold_cap,
+                  (void*)&d_state,  (void*)&d_bufs,  (void*)&d_clk,   (void*)&bind0,
+                  (void*)&ptr0,     (void*)&bind1,   (void*)&ptr1};
+  auto stream = at::cuda::getCurrentCUDAStream();
+  mk_launch_cooperative(megakernel_pdf, dim3(pdf_nblocks), dim3(MK_PDF_THREADS), args,
+                        (size_t)smem_bytes, stream.stream(), d_instrs, n_instr,
+                        d_dc, d_ao, d_ad, d_cs, d_cr, cold_cap, d_state, d_bufs,
+                        d_clk, bind0, ptr0, bind1, ptr1);
+}
+#endif  // MK_PDF
+
 void mk_run_ws(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_off,
                torch::Tensor adj, torch::Tensor claim_sz, torch::Tensor crit,
                torch::Tensor state, int64_t pad64, int64_t lookahead64,
@@ -1389,6 +1718,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "encode a 128B CUtensorMap (bf16 2D row-major, SW128) as a CPU u8 tensor");
   m.def("run_df", &mk_run_df, "run megakernel program (dataflow mode)");
   m.def("run_ws", &mk_run_ws, "run megakernel program (warp-specialized dataflow mode)");
+#ifdef MK_PDF
+  m.def("run_pdf", &mk_run_pdf, "run megakernel program (producer-df register-point mode)");
+#endif
   m.def("run_df2", &mk_run_df2, "run megakernel program (region-watermark dataflow mode)");
   m.def("nblocks", &mk_nblocks, "resolved persistent block count");
 }

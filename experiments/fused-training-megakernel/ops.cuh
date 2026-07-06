@@ -527,6 +527,52 @@ __device__ __forceinline__ void wg_tma_load_2d(const void* map, void* dst, int x
 }
 #endif
 
+#ifdef MK_PDF_PRODUCER
+// Producer-feed mailbox (producer-df executor, phase 2): consumer thread 0 posts
+// one request per n256-TMA tile; the pdf executor's WG2 producer thread (thin
+// setmaxnreg.dec region, pure issuer) replicates the stage schedule and issues
+// every TMA load, gated only by ring empties — the GEMM round-5 producer
+// topology in-model, motivated by the long-D64 finding that the elected-thread
+// feed's fence+expect_tx serialization loses per row family. Requests are
+// strictly serial per block: tile T+1's post happens program-order after tile
+// T's last full-wait, so the producer is always done with T's barriers before
+// T+1's re-init. File-scope __shared__: every kernel that references it gets a
+// per-block instance; megakernel_pdf arms `active`, other executors clear it
+// (smem is not guaranteed zero across launches).
+struct MkPdfFeed {
+  const char* tmA;
+  const char* tmB;
+  char* a0;                // S.A[0][0]
+  char* a1;                // S.A[0][1] (a_t only)
+  char* b0;                // S.B[0]
+  uint64_t* bfull;
+  uint64_t* bempty;
+  int a_stride, b_stride;  // per-stage slab strides (bytes)
+  int m0, n0, iters, stages, a_t, bk;
+  unsigned expect_bytes;
+  int active;
+  int halt;
+  int seq;                 // release-published request counter
+};
+__shared__ MkPdfFeed g_pdf_feed;
+
+// The feed only functions when the n256 TMA machinery is compiled in.
+#ifdef MK_GEMM_N256_TMA
+#define MK_PDF_FEED 1
+#endif
+
+__device__ __forceinline__ void mk_pdf_st_release(int* p, int v) {
+  const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
+  asm volatile("st.release.cta.shared.b32 [%0], %1;" ::"r"(a), "r"(v) : "memory");
+}
+__device__ __forceinline__ int mk_pdf_ld_acquire(const int* p) {
+  const uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
+  int v;
+  asm volatile("ld.acquire.cta.shared.b32 %0, [%1];" : "=r"(v) : "r"(a) : "memory");
+  return v;
+}
+#endif
+
 template <class MMA>
 __device__ __forceinline__ void wg_mma_ktile(const uint64_t (&da)[4], const uint64_t (&db)[4],
                                              float (&d)[32]) {
@@ -910,6 +956,37 @@ __device__ __noinline__ void op_gemm_wgmma_n256_nn_f32_impl(const Instr& I, int 
     }
   }
   consumer_sync();
+#ifdef MK_PDF_FEED
+  // producer-df: hand the whole stage schedule to the WG2 producer; consumers
+  // keep only wait-full -> mma -> arrive-empty. The post is release-ordered
+  // AFTER the barrier init consumer_sync above, so the producer never sees a
+  // request whose barriers are not yet initialized.
+  const bool pdf_feed = use_tma && g_pdf_feed.active;
+  if (pdf_feed && tid == 0) {
+    MkPdfFeed& F = g_pdf_feed;
+    F.tmA = tmA;
+    F.tmB = tmB;
+    F.a0 = reinterpret_cast<char*>(S.A[0][0]);
+    F.a1 = reinterpret_cast<char*>(S.A[0][1]);
+    F.b0 = reinterpret_cast<char*>(S.B[0]);
+    F.a_stride = (STAGES > 1)
+        ? (int)(reinterpret_cast<char*>(S.A[1][0]) - reinterpret_cast<char*>(S.A[0][0]))
+        : 0;
+    F.b_stride = (STAGES > 1)
+        ? (int)(reinterpret_cast<char*>(S.B[1]) - reinterpret_cast<char*>(S.B[0]))
+        : 0;
+    F.bfull = bfull;
+    F.bempty = bempty;
+    F.m0 = m0;
+    F.n0 = n0;
+    F.iters = iters;
+    F.stages = STAGES;
+    F.a_t = a_t ? 1 : 0;
+    F.bk = WG_BK;
+    F.expect_bytes = 49152;
+    mk_pdf_st_release(&F.seq, F.seq + 1);
+  }
+#endif
   auto issue_stage_mb = [&](int t) {
     const int st = t % STAGES;
 #ifdef MK_GEMM_N256_TMA
@@ -934,9 +1011,14 @@ __device__ __noinline__ void op_gemm_wgmma_n256_nn_f32_impl(const Instr& I, int 
     issue_stage(t * WG_BK, st);
     wg_mbar_arrive_cpasync(&bfull[st]);
   };
+#ifdef MK_PDF_FEED
+  if (!pdf_feed)
+#endif
+  {
 #pragma unroll
-  for (int p = 0; p < min(WG_N256_MBAR_LEAD + 1, iters); ++p)
-    issue_stage_mb(p);
+    for (int p = 0; p < min(WG_N256_MBAR_LEAD + 1, iters); ++p)
+      issue_stage_mb(p);
+  }
   for (int t = 0; t < iters; ++t) {
     const int st = t % STAGES;
     wg_mbar_wait(&bfull[st], (t / STAGES) & 1);
@@ -953,11 +1035,16 @@ __device__ __noinline__ void op_gemm_wgmma_n256_nn_f32_impl(const Instr& I, int 
       wg_mma_ktile_n256<SG::MMA_64x256x16_F32BF16BF16_SS<SG::Major::K, SG::Major::MN>>(
           da, db, d);
     wg_mbar_arrive(&bempty[st]);
-    const int tn = t + WG_N256_MBAR_LEAD + 1;
-    if (tn < iters) {
-      if (tn >= STAGES)
-        wg_mbar_wait(&bempty[tn % STAGES], (tn / STAGES - 1) & 1);
-      issue_stage_mb(tn);
+#ifdef MK_PDF_FEED
+    if (!pdf_feed)
+#endif
+    {
+      const int tn = t + WG_N256_MBAR_LEAD + 1;
+      if (tn < iters) {
+        if (tn >= STAGES)
+          wg_mbar_wait(&bempty[tn % STAGES], (tn / STAGES - 1) & 1);
+        issue_stage_mb(tn);
+      }
     }
   }
   cute::warpgroup_wait<0>();
