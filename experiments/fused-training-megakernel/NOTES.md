@@ -6221,6 +6221,24 @@ test_ops (incl. SKR slab unit case) + test_model green. Evidence:
 results/operator-gap/s3072-s4096-headdx-skr-promote.md; driver
 results/headdx_skr_shape_ab_b603d819.py; logs mkv3-p4b-hdskr-shape-*.log.
 
+## dkv stage-anatomy ablation @ S8192 (session 2853e0de + subagent, 20260706T2350Z)
+
+Five compile variants of op_attn_dkv_wg (baseline / no-exp / no-alu /
+no-score-gemm / no-accum-gemm), iclk-profiled, >=2 agreeing clean runs each
+(`mkv3-p4b-dkv-ablate-{A..E}-*.log`). On-path span decomposition (470.9us):
+**ALU pass 40.8%** (exp chain 19.9% + LSE/Drow loads + dS math + bf16 cvt +
+P/dS stores 20.9%), **accum-gemm drain 21.0%**, **score-gemm only 10.2%**
+(partially hidden under cp.async — deleting it returns just 48us), residual
+syncs/loop 28.1%. On/off-path fractions agree within noise. Two structural
+conclusions: (1) the next dkv/dq lever is PING-PONG/WARP-SPEC (overlap stage
+t's ALU with t+-1's gemm batches) — addresses ~70% of span vs ~30% for any
+gemm-side work; (2) span cuts COMPOUND: no-alu cut 192us of on-path span but
+485us of step (all 16 instrs speed up and waits shrink) — the 81%-wait
+composition of the dkv bucket does not cap the win. OPERATIONAL: GPU 6 hosts
+an invisible ~61GB CUDA context (absent from nvidia-smi compute-apps) whose
+wakeups land as in-step preemption — huge fake waits with clean spans;
+mitigate with gated launch + repeat-until-two-agree at the low end.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

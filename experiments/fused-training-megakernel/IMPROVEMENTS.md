@@ -1174,7 +1174,35 @@ split: 128*(168-24) == 256*(240-168)) + WG2 as a parked pure-TMA producer
 fed by a smem mailbox on GEMM rows only. Cost side bounded by the measured
 224-tax (fat ops +4-12% at 224, so <that at 240); win side = the round-5
 producer dividend, IF the mailbox handoff beats elected-thread issue
-in-model. Nobody has measured (b).
+in-model. Cell (b) is now BUILT (megakernel_pdf, worktree xorl-oss-pdf240,
+session e5225c66) — measurement in flight.
+
+**ptxas setmaxnreg REGION IDIOM (CUDA 13.1)** — TOOLCHAIN LAW (measured on
+megakernel_pdf, 2026-07-06; board entry has the SASS evidence)
+ptxas honors a setmaxnreg.inc region ONLY in the ws/CUTLASS idiom: the inc'd
+body self-contained INSIDE the taken branch, ending in return, with the dec
+path on the fallthrough. Inc on the fallthrough (dec-branch-first) is
+SILENTLY compiled at the entry cap — every value 224/232/240 refused (max
+SASS reg R165, STACK:208 spill) while the runtime USETMAXREG.TRY_ALLOC is
+still emitted, so warps own registers ptxas never allocates. Restructured to
+the idiom: 240 honored (R237, STACK 80).
+Why: ptxas's region formation appears to require the raised budget to be
+scoped to a single-entry single-exit branch body; a fallthrough region that
+merges with the function exit is kept at entry budget.
+Principle: always structure warp-spec as `if (consumer) { inc; body; return; }
+dec; thin-path` and CHECK max SASS register index (not res-usage REG, which
+reports the entry value) after every change near these branches. Retro-note:
+the P4b-r3 512-thr dual-stream refutation ("no extra compile budget") likely
+hit this same structure trap; re-run in the idiom before citing it as a
+hardware limit.
+
+**dkv stage ablation ladder (no-exp/no-alu/no-gemm compile variants)** —
+MEASUREMENT (S8192; `mkv3-p4b-dkv-ablate-*.log`)
+Why: decomposed the 2.5us stage: ALU 41%, accum drain 21%, score gemm 6-10%,
+syncs 28%; span cuts compound into wait cuts (192us span -> 485us step).
+Principle: ablate before architecting — the "obvious" gemm target was the
+SMALLEST slice; ALU+sync overlap (warp-spec/ping-pong) owns ~70%. Beware
+invisible co-tenant preemption faking waits (repeat until two runs agree).
 
 ## Meta / measurement
 
