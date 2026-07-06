@@ -116,10 +116,11 @@ def wgmma_n128_ok(M, N, K, flags):
     budget. Excludes split-K/acc/f32-out/qkrope/Drow (epilogues not implemented
     at 128 cols; CE partials bit11 and residual bit16 ARE supported).
     MK_WGMMA_N128: 0=off, 1=all eligible, 2=lm_head(bit11)-only. The default is
-    shape-gated: short-row GEMMs cannot amortize the larger tile, while M>=1024 can."""
+    shape-gated: S256 lm_head rechecked slower at 128 cols, S512+ keeps the larger
+    tile, and M>=1024 enables all eligible routes."""
     mode_env = os.environ.get("MK_WGMMA_N128")
     if mode_env is None:
-        mode = 0 if M < 256 else (2 if M < 1024 else 1)
+        mode = 0 if M < 512 else (2 if M < 1024 else 1)
     else:
         mode = int(mode_env)
     if mode == 0:

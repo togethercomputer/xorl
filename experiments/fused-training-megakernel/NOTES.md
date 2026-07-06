@@ -4912,6 +4912,23 @@ pre-existing since the 43803eb n256 head route (proven by control equality);
 small remains 0. Worth an ncu source pass on the n256 impls at long-S.
 Logs: mkv3-p4b-fwdpipe-*-20260706T122413Z.log.
 
+## S256 lm-head n128 default retune (session codex, 20260706T1402Z)
+
+Current-head source-free P5 retune from `smallshape-gemm-study.md`: disabling the
+generic m64n128 route with `MK_WGMMA_N128=0` only changed the S256 lm-head fwd row
+from n128 (`GEMMNT 256x8192x256.wg`, 128 tiles, flags 6274) to the older n64 route
+(`256` tiles, flags 2178), leaving `n_instr=161`, `critical_path=76`, and
+`gated=67`. Parity stayed in the normal route-tolerance class (`loss_diff
+-1.91e-06`, worst grad `emb` rel `6.82e-03`), and paired timing won both orders:
+default-then-n128off `+6.56us` median / `+6.79us` mean with `145/160` wins, and
+n128off-then-default `+5.90us` median / `+5.98us` mean with `139/160` wins.
+Nano/S512 was a no-change boundary (`+0.45us` then `+0.16us` medians, second-order
+mean negative), so keep nano on n128. The default `wgmma_n128_ok` gate now uses
+`M < 512 -> off`, `512 <= M < 1024 -> lm_head-only`, and `M >= 1024 -> all
+eligible`. Set `MK_WGMMA_N128=2` to force the old S256 lm-head n128 route for A/B.
+Logs: `mkv3-p4b-s256-nano-n128off-current-20260706T1402Z.log` and
+`mkv3-p4b-s256-n128off-profile-20260706T1408Z.log`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
