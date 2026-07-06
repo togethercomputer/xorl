@@ -5592,6 +5592,35 @@ was clean (worst selected grad rel `0.004888`). Keep S8192 on `dq_first`. Logs:
 `mkv3-p4b-s8192-bandorder-postcombine-lpt-forced-first-20260706T1822Z.log`.
 Detail note: `results/operator-gap/s8192-bandorder-postcombine-lpt-nogo.md`.
 
+Qwen n256 GEMM mbarrier-ring promotion: the current qwen profile after the n256
+stage3/N-major confirmations was dominated by exact qwen m64n256 head rows, but
+those direct bodies still used the old CTA-sync refill loop while the generic
+D64 GEMM path already had `MK_GEMM_MBAR_RING`. The source change ports the same
+full/empty mbarrier protocol into `op_gemm_wgmma_n256_direct_impl` and
+`op_gemm_wgmma_n256_nn_f32_impl` under the existing compile-time knob, then
+enables `gemm_mbar_ring_default` only for the exact qwen4b-L1 tuple
+`(H,L,S,nq,nkv,D,I,V)=(2560,1,1024,32,8,128,9728,151936)`.
+Forced candidate `MK_GEMM_MBAR_RING=1` beat the old default in both orders:
+variant-minus-default `-168.98us` and `-190.53us`, mbar wins `16/16` and
+`16/16`, with the same route counts (`n256=15 stage3=15 nmajor=15`) and loss
+parity within `3.82e-06`. After promotion, forced old `MK_GEMM_MBAR_RING=0`
+lost both orders: forced-old-minus-default `+200.67us` and `+170.30us`, old
+wins `0/16` and `0/16`. The promoted profile uses the `_gmbar` qwen extension
+and moves total `9221.8us -> 8910.2us`; head-dX drops `2886.0us -> 2571.3us`
+while lm-head fwd is roughly flat/slightly worse (`2463.6us -> 2567.8us`) and
+other n256 rows improve. Resource usage remains on the safe side of the spill
+gate for the timed df binary (`REG:255 STACK:32 LOCAL:0`; df2 `STACK:48`, ws
+`STACK:80`). Validation passed `py_compile`, `test_model.py`, `test_ops.py`,
+and `git diff --check`. Logs:
+`mkv3-p4b-qwen-n256-mbar-default-first-20260706T1835Z.log`,
+`mkv3-p4b-qwen-n256-mbar-variant-first-20260706T1835Z.log`,
+`mkv3-p4b-qwen-n256-mbar-promoted-default-first-20260706T1835Z.log`,
+`mkv3-p4b-qwen-n256-mbar-promoted-variant-first-20260706T1835Z.log`,
+`mkv3-p4b-profile-qwen-n256-mbar-20260706T1835Z.log`,
+`mkv3-p4b-qwen-n256-mbar-testmodel-20260706T1835Z.log`, and
+`mkv3-p4b-qwen-n256-mbar-testops-20260706T1835Z.log`. Detail note:
+`results/operator-gap/qwen-n256-mbar-promote.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

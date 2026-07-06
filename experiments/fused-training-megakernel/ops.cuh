@@ -573,6 +573,56 @@ __device__ __noinline__ void op_gemm_wgmma_n256_direct_impl(const Instr& I, int 
 #pragma unroll
   for (int i = 0; i < 128; ++i) d[i] = 0.0f;
   const int iters = K / WG_BK;
+#ifdef MK_GEMM_MBAR_RING
+  constexpr int WG_N256_MBAR_LEAD = STAGES - 2;
+  uint64_t* bfull = reinterpret_cast<uint64_t*>(smem_raw + sizeof(S));
+  uint64_t* bempty = bfull + STAGES;
+  if (tid == 0) {
+#pragma unroll
+    for (int s = 0; s < STAGES; ++s) {
+      wg_mbar_init(&bfull[s], 256);
+      wg_mbar_init(&bempty[s], 256);
+    }
+  }
+  consumer_sync();
+  auto issue_stage_mb = [&](int t) {
+    const int st = t % STAGES;
+    issue_stage(t * WG_BK, st);
+    wg_mbar_arrive_cpasync(&bfull[st]);
+  };
+#pragma unroll
+  for (int p = 0; p < min(WG_N256_MBAR_LEAD + 1, iters); ++p)
+    issue_stage_mb(p);
+  for (int t = 0; t < iters; ++t) {
+    const int st = t % STAGES;
+    wg_mbar_wait(&bfull[st], (t / STAGES) & 1);
+    uint64_t da[4], db[4];
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      da[s] = wg_desc_ksw(S.A[st][wg], s);
+      db[s] = wg_desc_ksw(S.B[st], s);
+    }
+    wg_mma_ktile_n256<SG::MMA_64x256x16_F32BF16BF16_SS<SG::Major::K, SG::Major::K>>(
+        da, db, d);
+    wg_mbar_arrive(&bempty[st]);
+    const int tn = t + WG_N256_MBAR_LEAD + 1;
+    if (tn < iters) {
+      if (tn >= STAGES)
+        wg_mbar_wait(&bempty[tn % STAGES], (tn / STAGES - 1) & 1);
+      issue_stage_mb(tn);
+    }
+  }
+  cute::warpgroup_wait<0>();
+  consumer_sync();
+  if (tid == 0) {
+#pragma unroll
+    for (int s = 0; s < STAGES; ++s) {
+      wg_mbar_init(&bfull[s], 256);
+      wg_mbar_init(&bempty[s], 256);
+    }
+  }
+  consumer_sync();
+#else
 #pragma unroll
   for (int p = 0; p < STAGES - 1; ++p)
     if (p < iters) issue_stage(p * WG_BK, p);
@@ -591,6 +641,7 @@ __device__ __noinline__ void op_gemm_wgmma_n256_direct_impl(const Instr& I, int 
         da, db, d);
     consumer_sync();
   }
+#endif
 
   const int w = wtid / 32, l = wtid % 32;
   const int cb = (l & 3) * 2;
@@ -766,6 +817,60 @@ __device__ __noinline__ void op_gemm_wgmma_n256_nn_f32_impl(const Instr& I, int 
 #pragma unroll
   for (int i = 0; i < 128; ++i) d[i] = 0.0f;
   const int iters = K / WG_BK;
+#ifdef MK_GEMM_MBAR_RING
+  constexpr int WG_N256_MBAR_LEAD = STAGES - 2;
+  uint64_t* bfull = reinterpret_cast<uint64_t*>(smem_raw + sizeof(S));
+  uint64_t* bempty = bfull + STAGES;
+  if (tid == 0) {
+#pragma unroll
+    for (int s = 0; s < STAGES; ++s) {
+      wg_mbar_init(&bfull[s], 256);
+      wg_mbar_init(&bempty[s], 256);
+    }
+  }
+  consumer_sync();
+  auto issue_stage_mb = [&](int t) {
+    const int st = t % STAGES;
+    issue_stage(t * WG_BK, st);
+    wg_mbar_arrive_cpasync(&bfull[st]);
+  };
+#pragma unroll
+  for (int p = 0; p < min(WG_N256_MBAR_LEAD + 1, iters); ++p)
+    issue_stage_mb(p);
+  for (int t = 0; t < iters; ++t) {
+    const int st = t % STAGES;
+    wg_mbar_wait(&bfull[st], (t / STAGES) & 1);
+    uint64_t da[4], db[4];
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      da[s] = a_t ? wg_desc_mnsw(S.A[st][wg], s) : wg_desc_ksw(S.A[st][wg], s);
+      db[s] = wg_desc_mnsw128(S.B[st], s);
+    }
+    if (a_t)
+      wg_mma_ktile_n256<SG::MMA_64x256x16_F32BF16BF16_SS<SG::Major::MN, SG::Major::MN>>(
+          da, db, d);
+    else
+      wg_mma_ktile_n256<SG::MMA_64x256x16_F32BF16BF16_SS<SG::Major::K, SG::Major::MN>>(
+          da, db, d);
+    wg_mbar_arrive(&bempty[st]);
+    const int tn = t + WG_N256_MBAR_LEAD + 1;
+    if (tn < iters) {
+      if (tn >= STAGES)
+        wg_mbar_wait(&bempty[tn % STAGES], (tn / STAGES - 1) & 1);
+      issue_stage_mb(tn);
+    }
+  }
+  cute::warpgroup_wait<0>();
+  consumer_sync();
+  if (tid == 0) {
+#pragma unroll
+    for (int s = 0; s < STAGES; ++s) {
+      wg_mbar_init(&bfull[s], 256);
+      wg_mbar_init(&bempty[s], 256);
+    }
+  }
+  consumer_sync();
+#else
 #pragma unroll
   for (int p = 0; p < STAGES - 1; ++p)
     if (p < iters) issue_stage(p * WG_BK, p);
@@ -788,6 +893,7 @@ __device__ __noinline__ void op_gemm_wgmma_n256_nn_f32_impl(const Instr& I, int 
           da, db, d);
     consumer_sync();
   }
+#endif
 
   const int w = wtid / 32, l = wtid % 32;
   const int cb = (l & 3) * 2;

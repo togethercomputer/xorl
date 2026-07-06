@@ -304,7 +304,12 @@ class MKQwen3:
             (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
             != (512, 8, 1024, 8, 4, 64, 1536, 16384)
         )
-        self.gemm_mbar_ring_default = c.D == 64 and c.S >= 1024 and c.S % 128 == 0
+        self.gemm_mbar_ring_default = (
+            c.D == 64 and c.S >= 1024 and c.S % 128 == 0
+        ) or (
+            (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
+            == (2560, 1, 1024, 32, 8, 128, 9728, 151936)
+        )
         self.gemm_direct_bf16_epilogue_default = c.D == 64 and (
             c.S == 128 or (c.H, c.L, c.S, c.nq, c.nkv, c.I) == (512, 8, 1024, 8, 4, 1536)
         )
