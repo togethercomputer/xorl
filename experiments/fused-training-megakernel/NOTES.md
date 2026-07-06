@@ -4767,6 +4767,23 @@ cross-stage pipelining (issue stage t+1's S/dP batch during stage t's
 accumulation drain) — needs P/dS smem doubling and commit-group bookkeeping;
 scoped, unclaimed.
 
+## D=128 dQ rowsplit register-A dS feed (this session, 20260706T1155Z)
+
+Ported the FA4 RS-feed handoff into `op_attn_dq_wg128_rowsplit`: dS is now
+packed from the computed C-fragment values directly into `MMA_64x64x16...
+_RS<K,MN>` A registers, deleting the dS smem tile, proxy fence, WG sync, and
+smem-A reads before `dQ += dS @ K`. The rowsplit smem struct drops 144KB ->
+128KB, while the qwen launch carveout remains 148KB because neighboring qwen
+n256 routes still need it.
+
+Exact qwen dQ op (`S=1024,nq=32,nkv=8,D=128`) is parity-clean vs PyTorch
+(`max_abs=1.26e-03`, `max_rel=2.52e-03`) and improves the same harness from
+103.65us base to 99.62us. Resource usage is unchanged (`megakernel_df STACK:32`,
+`df2 STACK:48`, `ws STACK:64`), avoiding the hidden dispatch tax that killed
+the dKV S^T port. Validation: `test_ops.py`, `test_model.py`, and a forced
+`MK_ATTN_D128_DQ_RS=1` S256 model parity check including df2/ws agreement all
+passed (`mkv3-p4b-d128-dq-rsfeed-main-*.log`).
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

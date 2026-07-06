@@ -1041,6 +1041,36 @@ __device__ __forceinline__ void wga_mma64_kk_k128_x2(const bf16* A1, const bf16*
   cute::warpgroup_wait<0>();
 }
 
+// dQ rowsplit: dS is already in the C-fragment layout for a K-major A operand
+// with q rows as M. Feed those bf16 pairs from registers instead of round-tripping
+// through smem before dQ += dS @ K.
+__device__ __forceinline__ void wga_mma64_rs_x2(const uint32_t (&a)[16],
+                                                const bf16* B0, float (&d1)[32],
+                                                const bf16* B1, float (&d2)[32]) {
+  using RS =
+      cute::SM90::GMMA::MMA_64x64x16_F32BF16BF16_RS<cute::SM90::GMMA::Major::K,
+                                                    cute::SM90::GMMA::Major::MN>;
+  cute::warpgroup_arrive();
+  {
+    float(&d)[32] = d1;
+#pragma unroll
+    for (int s = 0; s < 4; ++s)
+      RS::fma(a[4 * s], a[4 * s + 1], a[4 * s + 2], a[4 * s + 3],
+              wga_desc_mn((const char*)B0 + s * 2048), WGA_FMA32,
+              cute::SM90::GMMA::ScaleOut::One);
+  }
+  {
+    float(&d)[32] = d2;
+#pragma unroll
+    for (int s = 0; s < 4; ++s)
+      RS::fma(a[4 * s], a[4 * s + 1], a[4 * s + 2], a[4 * s + 3],
+              wga_desc_mn((const char*)B1 + s * 2048), WGA_FMA32,
+              cute::SM90::GMMA::ScaleOut::One);
+  }
+  cute::warpgroup_commit_batch();
+  cute::warpgroup_wait<0>();
+}
+
 constexpr int WGA_FWD128_MBAR_FLAG = 1 << 24;
 #define WGA_FWD_D128_MB_S 2
 struct __align__(16) AttnWgFwd128MbSmem {  // 112KB + barriers
@@ -1584,10 +1614,9 @@ __device__ __noinline__ void op_attn_dkv_wg128(const Instr& I, int tile, void** 
 
 constexpr int WGA_DQ128_ROW_SPLIT_FLAG = 1 << 24;
 
-struct __align__(16) AttnWgDq128RowSplitSmem {  // 144KB
+struct __align__(16) AttnWgDq128RowSplitSmem {  // 128KB
   bf16 Q[2][8192];   // [wg] owned 64 q rows x 128 D
   bf16 dO[2][8192];  // [wg] owned
-  bf16 dS[2][4096];  // [wg] [q64, kv64], K-view A
   bf16 K[2][8192];   // [stage]
   bf16 V[2][8192];   // [stage]
 };
@@ -1685,6 +1714,7 @@ __device__ __noinline__ void op_attn_dq_wg128_rowsplit(const Instr& I, int tile,
       for (int i = 0; i < 32; ++i) s[i] = s2[i] = 0.0f;
       wga_mma64_kk_k128_x2(sm.Q[wg], sm.K[t & 1], s, sm.dO[wg], sm.V[t & 1], s2);
       const bool masked = k0 + 63 > q0wg;
+      uint32_t areg[16];
 #pragma unroll
       for (int i = 0; i < 2; ++i) {
 #pragma unroll
@@ -1698,17 +1728,10 @@ __device__ __noinline__ void op_attn_dq_wg128_rowsplit(const Instr& I, int tile,
           __nv_bfloat162 dsv;
           dsv.x = f2bf(p0 * (s2[idx] - dr[i]) * scale);
           dsv.y = f2bf(p1 * (s2[idx + 1] - dr[i]) * scale);
-          *reinterpret_cast<__nv_bfloat162*>(
-              (char*)sm.dS[wg] + wga_off64(r0 + 8 * i, n8 * 8 + cb)) = dsv;
+          areg[4 * (n8 >> 1) + (n8 & 1) * 2 + i] = *reinterpret_cast<uint32_t*>(&dsv);
         }
       }
-    }
-    wga_fence_smem_to_async();
-    consumer_sync();  // dS visible; K stage still valid
-    if (!skip) {
-      wga_mma64_x2<WGA_MMA_KMN, false, true>(
-          sm.dS[wg], sm.K[t & 1], dq0,
-          sm.dS[wg], sm.K[t & 1] + 4096, dq1);
+      wga_mma64_rs_x2(areg, sm.K[t & 1], dq0, sm.K[t & 1] + 4096, dq1);
     }
     consumer_sync();  // both WGs done reading K/V stage t before refill
   }
