@@ -5649,6 +5649,23 @@ Validation passed `py_compile`, `test_ops.py`, `test_model.py`, and
 `mkv3-p4b-qwen-n256-ntmbar-testmodel-20260706T1847Z.log`. Detail note:
 `results/operator-gap/qwen-n256-ntmbar-split-promote.md`.
 
+Post-`_gmbar_n256ntold` qwen n256 route confirmation: after splitting the NT
+body back to the old refill loop while leaving NN/TN on the mbarrier ring,
+rechecked the cheap exact-qwen route knobs because the n256 loop timing changed
+materially. Forced old M-major ordering (`MK_WGMMA_N256_NMAJOR=0`) changed only
+bit26 (`nmajor=15 -> 0`) while keeping `n256=15` and `stage3=15`; clean parity
+held both orders, and the forced route still lost by `+69.58us` and `+55.02us`
+variant-minus-default with only `1/16` wins in each order. Forced old stage2
+(`MK_WGMMA_N256_STAGE3=0`) changed only bit25 (`stage3=15 -> 0`) while keeping
+`n256=15` and `nmajor=15`; clean parity held both orders, and the forced route
+lost decisively by `+2569.49us` and `+2571.98us` with `0/16` wins. Keep qwen
+N-major and stage3 default-on under `_gmbar_n256ntold`. Logs:
+`mkv3-p4b-qwen-nmajor-post-ntmbar-default-first-20260706T1900Z.log`,
+`mkv3-p4b-qwen-nmajor-post-ntmbar-variant-first-20260706T1900Z.log`,
+`mkv3-p4b-qwen-stage3-post-ntmbar-default-first-20260706T1900Z.log`, and
+`mkv3-p4b-qwen-stage3-post-ntmbar-variant-first-20260706T1900Z.log`.
+Detail note: `results/operator-gap/qwen-n256-route-post-ntmbar-keep.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
