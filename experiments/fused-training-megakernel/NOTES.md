@@ -4946,6 +4946,34 @@ the first reading of the morning's spill hunt (runtime fixes stood anyway).
 Optional hygiene (not time): #pragma unroll the three C-loops in combine with
 c<C guards. Log: mkv3-p4b-n256-longs-ld-20260706T143417Z.log.
 
+## Qwen SwiGLU backward 4W route (this session, 20260706T1515Z)
+
+Added an exact qwen4b-L1 route for `SWIGLU_BWD_4W`: four warps cooperate on one
+very-wide I=9728 row, replacing the promoted qwen 2W route at the same program
+point. The 2W code still compiles for the shape, but default runtime routing now
+prefers 4W; set `MK_SWIGLU_BWD_4W=0` to force the old 2W route for A/B. This
+shape is separate from the earlier small H512/I1536 4W no-go.
+
+Scratch validation from `/home/apanda/xorl-oss-qwen-swiglu-4w` first proved the
+source route default-off, then the promoted default. The promoted scratch route
+was `sw_bwd4w=1/512` by default and `sw_bwd2w=1/256` with
+`MK_SWIGLU_BWD_4W=0`, with selected-gradient parity clean (`loss_diff`
+`-9.54e-07` / `-9.54e-07`, worst grad `emb` rel `3.14e-03`). Timing won both
+construction orders: old2w-minus-default medians `+355.71us` and `+329.78us`,
+default4w wins `47/48` and `48/48`. Scratch `test_model.py` and `test_ops.py`
+passed. Logs:
+`mkv3-p4b-qwen-swiglu-4w-promoted-default-first-20260706T1456Z.log`,
+`mkv3-p4b-qwen-swiglu-4w-promoted-old2w-first-20260706T1456Z.log`.
+
+After applying the identical patch in main, the qwen A/B stayed positive with the
+same route split and parity clean (`loss_diff=+2.86e-06` / `-1.91e-06`, worst
+grad `emb` rel `1.57e-03` / `3.14e-03`). Timing won both construction orders:
+old2w-minus-default medians `+355.97us` and `+342.80us`, default4w wins `48/48`
+and `47/48`. Main validation passed `py_compile`, `git diff --check`,
+`test_model.py`, and `test_ops.py`. Logs:
+`mkv3-p4b-qwen-swiglu-4w-main-default-first-20260706T1505Z.log`,
+`mkv3-p4b-qwen-swiglu-4w-main-old2w-first-20260706T1505Z.log`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

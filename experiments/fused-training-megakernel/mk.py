@@ -52,6 +52,7 @@ OP_ATTN_DKV_WG128 = 33  # D=128 wgmma attention dK/dV (same pattern)
 OP_ATTN_DQ_WG128 = 34  # D=128 wgmma attention dQ (same pattern)
 OP_EMBED_ZERO_ROWS = 35  # sparse grad:emb clear for previous/current token rows
 OP_COPY_I32 = 36  # small state copy, currently current tokens -> previous tokens
+OP_SWIGLU_BWD_4W = 37  # opt-in four-warps-per-row SwiGLU backward route
 
 GEMM_BM, GEMM_BN = 64, 128  # keep in sync with ops.cuh
 GEMM_N256_STAGE3_FLAG = 1 << 25
@@ -380,6 +381,7 @@ INSTR_INTS = 3 + MAX_ARGS  # op, tile_off, ntiles, args[23]
 def load_ext(
     verbose=False,
     swiglu_bwd_2w=None,
+    swiglu_bwd_4w=False,
     swiglu_cache_sig=None,
     drow_direct_store=None,
     attn_exp2_approx=None,
@@ -460,6 +462,9 @@ def load_ext(
         swiglu_bwd_2w = int(swiglu_bwd_2w_env)
     else:
         swiglu_bwd_2w = int(bool(swiglu_bwd_2w))
+    # Qwen4B-L1 uses a four-warps-per-row SwiGLU backward by default. The env
+    # override keeps the old 2W route available for A/B and bisects.
+    swiglu_bwd_4w = int(os.environ.get("MK_SWIGLU_BWD_4W", int(bool(swiglu_bwd_4w))))
     swiglu_cache_sig = int(
         os.environ.get("MK_SWIGLU_CACHE_SIG", int(bool(swiglu_cache_sig)))
     )
@@ -488,6 +493,7 @@ def load_ext(
         + ("_qkbc" if qkbc else "")
         + ("_qkbc128" if qkbc128 else "")
         + ("_swfma" if swiglu_fma_deriv else "") + ("_swb2w" if swiglu_bwd_2w else "")
+        + ("_swb4w" if swiglu_bwd_4w else "")
         + ("_swcsig" if swiglu_cache_sig else "")
         + ("_gmbar" if gemm_mbar_ring else "")
         + ("_gdbf16" if gemm_direct_bf16_epilogue else ""),
@@ -519,6 +525,7 @@ def load_ext(
         + (["-DMK_QKBWD_D128_CACHE"] if qkbc128 else [])
         + (["-DMK_SWIGLU_FMA_DERIV"] if swiglu_fma_deriv else [])
         + (["-DMK_SWIGLU_BWD_2W"] if swiglu_bwd_2w else [])
+        + (["-DMK_SWIGLU_BWD_4W"] if swiglu_bwd_4w else [])
         + (["-DMK_SWIGLU_CACHE_SIG"] if swiglu_cache_sig else [])
         + (["-DMK_GEMM_MBAR_RING"] if gemm_mbar_ring else [])
         + (["-DMK_GEMM_DIRECT_BF16_EPILOGUE"] if gemm_direct_bf16_epilogue else []),
@@ -571,7 +578,7 @@ def _access_sets(op, args):
         return [0, 2, 5], [4]
     if op == OP_SWIGLU_FWD:
         return [0], ([1, 4] if len(args) > 4 else [1])
-    if op in (OP_SWIGLU_BWD, OP_SWIGLU_BWD_2W):
+    if op in (OP_SWIGLU_BWD, OP_SWIGLU_BWD_2W, OP_SWIGLU_BWD_4W):
         return ([0, 1, 6] if len(args) > 6 else [0, 1]), [2]
     if op == OP_QKNORM_ROPE_FWD:
         return [0, 2, 3, 6, 7], [1, 4, 5]
@@ -624,6 +631,7 @@ ROWOP_R = 8    # swiglu/qknorm rows per tile (ops.cuh MK_ROW_R)
 ROWOP_R2 = 16  # rmsnorm rows per tile, 2 rows/warp interleaved (ops.cuh MK_ROW_R2)
 ROWOP_R4 = 32  # dx-only RMSNorm long-S fold, 4 rows/warp interleaved
 SWIGLU_BWD_2W_R = 4  # two warps per row, four rows per 8-warp block
+SWIGLU_BWD_4W_R = 2  # four warps per row, two rows per 8-warp block
 # measured split (v3 P4b): interleave pays only where per-row MLP is starved
 # (rmsnorm's H<=512 rows = 2 load iterations); swiglu's 6-iteration rows are
 # already saturated and qknorm's per-warp task chain doubles serially (+142us).
@@ -640,6 +648,7 @@ _ROW_TILE_R = {
     OP_SWIGLU_FWD: ROWOP_R,
     OP_SWIGLU_BWD: ROWOP_R,
     OP_SWIGLU_BWD_2W: SWIGLU_BWD_2W_R,
+    OP_SWIGLU_BWD_4W: SWIGLU_BWD_4W_R,
     OP_QKNORM_ROPE_BWD: ROWOP_R,
     OP_QKV_V_BWD: ROWOP_R,
 }
@@ -660,6 +669,7 @@ _ROW_WRITE_POS = {
     OP_SWIGLU_FWD: (1, 4),
     OP_SWIGLU_BWD: (2,),
     OP_SWIGLU_BWD_2W: (2,),
+    OP_SWIGLU_BWD_4W: (2,),
     OP_QKNORM_ROPE_FWD: (1, 4, 5),
     OP_QKNORM_ROPE_BWD: (2,),
     OP_QKV_V_BWD: (1,),
@@ -680,6 +690,7 @@ _ROW_READ_POS = {
     OP_SWIGLU_FWD: (0,),
     OP_SWIGLU_BWD: (0, 1, 6),
     OP_SWIGLU_BWD_2W: (0, 1, 6),
+    OP_SWIGLU_BWD_4W: (0, 1, 6),
     OP_QKNORM_ROPE_FWD: (0,),
     OP_QKNORM_ROPE_BWD: (0, 1, 7, 8),
     OP_QKV_V_BWD: (0,),
@@ -958,6 +969,7 @@ class Program:
                    OP_RMSNORM_BWD_DX_FMA, OP_RMSNORM_BWD_DX_H256,
                    OP_RMSNORM_BWD_DW, OP_RMSNORM_BWD_DX_R4,
                    OP_SWIGLU_FWD, OP_SWIGLU_BWD, OP_SWIGLU_BWD_2W,
+                   OP_SWIGLU_BWD_4W,
                    OP_QKNORM_ROPE_FWD, OP_QKNORM_ROPE_BWD, OP_QKV_V_BWD)
         claim = [max(c, rc) if op in _rowops else c
                  for c, (op, ntiles, _) in zip(claim, flat)]

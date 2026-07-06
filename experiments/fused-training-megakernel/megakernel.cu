@@ -65,6 +65,7 @@ enum Op : int {
   OP_ATTN_DQ_WG128 = 34,
   OP_EMBED_ZERO_ROWS = 35,
   OP_COPY_I32 = 36,
+  OP_SWIGLU_BWD_4W = 37,
 };
 
 __device__ __forceinline__ long long mk_globaltimer() {
@@ -141,6 +142,13 @@ __device__ __forceinline__ void dispatch(const Instr& I, int tile, void** bufs,
     case OP_SWIGLU_BWD_2W:
 #ifdef MK_SWIGLU_BWD_2W
       op_swiglu_bwd_2w(I, tile, bufs);
+#else
+      asm volatile("trap;");
+#endif
+      break;
+    case OP_SWIGLU_BWD_4W:
+#ifdef MK_SWIGLU_BWD_4W
+      op_swiglu_bwd_4w(I, tile, bufs);
 #else
       asm volatile("trap;");
 #endif

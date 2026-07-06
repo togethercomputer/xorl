@@ -68,6 +68,9 @@ _SWIGLU_CACHED_2W = {
 _QWEN_L1_SWIGLU_BWD_2W = {
     (2560, 1024, 9728, 151936, 32, 8, 128, 1),  # H,S,I,V,nq,nkv,D,L
 }
+_QWEN_L1_SWIGLU_BWD_4W = {
+    (2560, 1024, 9728, 151936, 32, 8, 128, 1),  # H,S,I,V,nq,nkv,D,L
+}
 _H256_IDLE32_S = (2048, 3072, 4096, 8192)  # H==256: scheduler idle poll 32ns (else 256)
 _H256_DQ_FLOAT2_S = (3072, 4096, 8192)     # H==256: attention-dQ float2 direct store
 _H256_D64_DKV_ROW_BCAST_S = ()             # H==256/D==64: attention-dKV row scalar shuffles
@@ -256,6 +259,9 @@ class MKQwen3:
             self.swiglu_cache_sig_default
             or (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) in _QWEN_L1_SWIGLU_BWD_2W
         )
+        self.swiglu_bwd_4w_default = (
+            (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) in _QWEN_L1_SWIGLU_BWD_4W
+        )
         self.drow_direct_store_default = c.D == 64 and c.S < 2048
         drow_direct_store_env = os.environ.get("MK_DROW_DIRECT_STORE")
         self.drow_direct_store_enabled = (
@@ -291,6 +297,7 @@ class MKQwen3:
         self.gemm_direct_bf16_epilogue_default = c.D == 64 and c.S == 128
         self.ext = mk.load_ext(
             swiglu_bwd_2w=self.swiglu_bwd_2w_default,
+            swiglu_bwd_4w=self.swiglu_bwd_4w_default,
             swiglu_cache_sig=self.swiglu_cache_sig_enabled,
             drow_direct_store=self.drow_direct_store_enabled,
             attn_exp2_approx=self.attn_exp2_approx_default,
@@ -497,6 +504,11 @@ class MKQwen3:
             swiglu_bwd_2w = self.swiglu_bwd_2w_default
         else:
             swiglu_bwd_2w = bool(int(swiglu_bwd_2w_env))
+        swiglu_bwd_4w_env = os.environ.get("MK_SWIGLU_BWD_4W")
+        if swiglu_bwd_4w_env is None:
+            swiglu_bwd_4w = self.swiglu_bwd_4w_default
+        else:
+            swiglu_bwd_4w = bool(int(swiglu_bwd_4w_env))
         swiglu_cache_sig = self.swiglu_cache_sig_enabled
         qkbwd_split_v_env = os.environ.get("MK_QKBWD_SPLIT_V")
         if qkbwd_split_v_env is None:
@@ -908,7 +920,16 @@ class MKQwen3:
             dhs, dhs_f32 = gemm_dx(B(W["dX"]), pr("wd"), B(W["dHs"]), lambda: B(W[f"dHs_f32.{l}"]), c.S, c.I, c.H)
             gemm(B(W["dX"]), a("hs"), gr("wd"), c.H, c.I, c.S, 1 | 4 | 8)
             p.wave()
-            if swiglu_bwd_2w:
+            if swiglu_bwd_4w:
+                swiglu_bwd_args = [a("gu"), dhs, B(W["dGU"]), c.S, c.I, dhs_f32]
+                if swiglu_cache_sig:
+                    swiglu_bwd_args.append(a("swsig"))
+                p.instr(
+                    mk.OP_SWIGLU_BWD_4W,
+                    mk.rowop_tiles(c.S, mk.SWIGLU_BWD_4W_R),
+                    swiglu_bwd_args,
+                )
+            elif swiglu_bwd_2w:
                 swiglu_bwd_args = [a("gu"), dhs, B(W["dGU"]), c.S, c.I, dhs_f32]
                 if swiglu_cache_sig:
                     swiglu_bwd_args.append(a("swsig"))
