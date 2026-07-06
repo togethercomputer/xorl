@@ -6044,6 +6044,20 @@ first sweep's +286 was a first-run-after-build artifact — recheck 930/930 vs
 test_model green. Landing was briefly parked behind a peer's uncommitted
 ops.cuh WIP — patch applied cleanly post-clear.
 
+## v3 P4b post-SKR small cold-cap8 no-go
+
+The post-SKR small resweep's weak `MK_COLD_CAP=8` signal did not survive a
+high-rep order-reversal gate. Two independent repeats on the exact H512/L8/S1024
+small shape kept the route graph unchanged (`n_instr=289`) and parity clean, but
+cap8 was only noise-positive in default-first and clearly negative in reverse:
+120 reps/order measured `-0.27us` then `+8.70us`; a separate 160-rep confirmation
+measured `-2.51us` then `+7.71us`. Keep `_cold_cap()` unchanged at the existing
+cap48 small default. Logs:
+`mkv3-p4b-small-coldcap8-repeat-20260706T2322Z.log`,
+`mkv3-p4b-small-coldcap8-postskr-default-first-20260706T2155Z.log`, and
+`mkv3-p4b-small-coldcap8-postskr-variant-first-20260706T2155Z.log`. Detail note:
+`results/operator-gap/small-coldcap8-postskr-nogo.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
