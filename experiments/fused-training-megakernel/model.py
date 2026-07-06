@@ -71,6 +71,9 @@ _QWEN_L1_SWIGLU_BWD_2W = {
 }
 _QWEN_L1_SWIGLU_BWD_4W = {
     (2560, 1024, 9728, 151936, 32, 8, 128, 1),  # H,S,I,V,nq,nkv,D,L
+    # L=2 promoted on the l2 support battery: -74.9/-75.1us, 16-17/24 both
+    # orders (repeat windows; mkv3-p4b-l2followup-confirm-20260707T0120Z.log).
+    (2560, 1024, 9728, 151936, 32, 8, 128, 2),
 }
 _SMALL_SWIGLU_BWD_4W = {
     (512, 1024, 1536, 16384, 8, 4, 64, 8),  # H,S,I,V,nq,nkv,D,L
@@ -371,8 +374,11 @@ class MKQwen3:
             (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
             == (512, 8, 1024, 8, 4, 64, 1536, 16384)
         )
+        # exact_qwen4b_l2 added on the l2 support battery: 4 negative windows
+        # (-52.6/-12.9/-13.6/-73.1us; mkv3-p4b-qwenl2-peel-support + followup).
         self.ce_bwd_label_fixup_default = (
             exact_qwen4b_l1 or exact_s8192 or exact_small_h512_s1024
+            or exact_qwen4b_l2
         )
         self.gemm_mbar_ring_default = (
             c.D == 64 and c.S >= 1024 and c.S % 128 == 0
@@ -385,21 +391,17 @@ class MKQwen3:
         # cp.async.bulk.tensor + expect_tx from a global tensormap table).
         # Promoted exact-qwen: -340.40/-335.25us, 16/16 both construction
         # orders, parity clean (mkv3-p4b-qwen-n256tma-*-20260706T2145Z.log).
-        # Also exact H256/D64/S3072, whose only eligible row is the long-K
-        # head-dX 3072x256x8192: -7.12us (35/40) / -10.16us (39/40) both
-        # orders. S4096 (+6.1/+11.9, <=7/40) and S8192 (+27.3/+33.6, 2/16 —
-        # 12 of 13 rows short-K, fence/expect_tx does not amortize) are
-        # NO-GO; see results/operator-gap/s8192-n256tma-nogo.md.
+        # H256/D64 boundary: S3072 was briefly promoted (its only eligible
+        # row was the long-K head-dX) but REVERTED after fe15e24 moved that
+        # row to the SKR route — post-SKR windows read TMA-off faster by
+        # -16.3/-20.2us at 40/40 both orders (resweep law). S4096
+        # (+6.1/+11.9, <=7/40) and S8192 (+27.3/+33.6, 2/16 — 12 of 13 rows
+        # short-K, fence/expect_tx does not amortize) are NO-GO;
+        # see results/operator-gap/s8192-n256tma-nogo.md.
         # MK_GEMM_N256_TMA=0 restores the per-thread cp.async ring feed;
         # =1 force-enables for probing; TN rows stay off (order-mixed
         # standalone) behind MK_GEMM_N256_TMA_TN except at exact qwen.
-        exact_s3072 = (
-            (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
-            == (256, 4, 3072, 4, 2, 64, 768, 8192)
-        )
-        self.gemm_n256_tma_default = (
-            exact_qwen4b_l1 or exact_qwen4b_l2 or exact_s3072
-        )
+        self.gemm_n256_tma_default = exact_qwen4b_l1 or exact_qwen4b_l2
         self.gemm_direct_bf16_epilogue_default = c.D == 64 and (
             c.S == 128 or (c.H, c.L, c.S, c.nq, c.nkv, c.I) == (512, 8, 1024, 8, 4, 1536)
         )
@@ -447,7 +449,15 @@ class MKQwen3:
             else (bool(int(d128_env)) and c.D == 128 and c.S % 64 == 0)
         )
         dq_rs_env = os.environ.get("MK_ATTN_D128_DQ_RS")
-        dq_rs_default = (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) in _D128_DQ_ROWSPLIT
+        # dq RS-feed stays L1-ONLY: the l2 peel measured RS-off faster in 4
+        # consecutive windows (-165.9/-63.9/-85.1/-52.8us, 10-16/24 wins;
+        # mkv3-p4b-qwenl2-{peel-support,followup-confirm} logs) — the l2
+        # 2-layer dq structure does not profit from the row-split. stage3/
+        # nmajor/smem keep the full _D128_DQ_ROWSPLIT (l1+l2).
+        dq_rs_default = (
+            (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) in _D128_DQ_ROWSPLIT
+            and c.L == 1
+        )
         self.attn_d128_dq_rowsplit_enabled = (
             self.attn_d128_wg_enabled
             and c.S % 128 == 0
@@ -701,7 +711,10 @@ class MKQwen3:
         prev_tokens_buf = B(self.prev_tokens)
         skip_direct_dw_fill = bool(int(os.environ.get("MK_DW_DIRECT_SKIP_FILL", "1")))
         sparse_embed_zero_env = os.environ.get("MK_EMB_SPARSE_ZERO")
-        sparse_embed_zero_default = c.L == 1 and c.H >= 1024 and c.V >= 32768
+        # L==1 original; L==2 promoted on the l2 support battery
+        # (-219.39/-218.38us, 11/12 both orders,
+        # mkv3-p4b-qwenl2-peel-support-20260707T0046Z.log).
+        sparse_embed_zero_default = c.L in (1, 2) and c.H >= 1024 and c.V >= 32768
         sparse_embed_zero = (
             sparse_embed_zero_default
             if sparse_embed_zero_env is None

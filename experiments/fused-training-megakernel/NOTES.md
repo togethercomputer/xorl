@@ -6239,6 +6239,35 @@ an invisible ~61GB CUDA context (absent from nvidia-smi compute-apps) whose
 wakeups land as in-step preemption — huge fake waits with clean spans;
 mitigate with gated launch + repeat-until-two-agree at the low end.
 
+Qwen4b-L2 peel-resweep + support batch (session f30b8c0c, follows the
+GEMM-cluster promotion): per-component peel on the promoted l2 default
+confirmed stage3 as the largest single component (forced stage2
++3303.9/+3368.8us, 0/12 both orders), TMA +710.8/+728.5 (0/12), TN-TMA on
+top of NN +1583.3/+1645.8 (0/12), N-major +135.3/+20.3, NT-old refill
++152.1/+222.8 (keep). Mechanism note: NN-only TMA (TN rows on cp.async)
+INVERTS to ~1.5ms WORSE than no TMA at all at l2 — the doubled dW TN sink
+volume contends with the elected-thread TMA issue on co-resident NN rows;
+full TMA removes the cp.async pressure globally. Four promotions landed on
+this evidence, each with promoted-vs-forced-old in both orders:
+- sparse-embed zero extended to L=2 (`c.L in (1, 2)`): battery
+  -219.4/-218.4us (11/12); forced-off +135.1/+260.1 (0/12).
+- CE_BWD label fixup extended to exact_qwen4b_l2: four negative windows
+  (-52.6/-12.9/-13.6/-73.1us).
+- SwiGLU BWD 4W extended to the L2 tuple: -74.9/-75.1us (16-17/24 repeats).
+- dq RS-feed DECOUPLED to L1-only (`dq_rs_default ... and c.L == 1`): RS-off
+  measured faster in four consecutive l2 windows
+  (-165.9/-63.9/-85.1/-52.8us) — the 2-layer dq structure does not profit
+  from the row-split; stage3/nmajor/smem keep the full l1+l2 tuple set.
+Also in this batch: the S3072 head-dX TMA gate was REVERTED (resweep law) —
+`fe15e24` (peer head-dX SKR promotion) restructured the target row and
+post-SKR windows read TMA-off faster (-16.3/-20.2us 40/40 both orders;
+revert confirm: forced TMA=1 loses +16.2/+19.0, 1-2/40). Cold-cap0 at l2 is
+a NO-GO (order-mixed -2.5/-81.0). Batch-2 promoted-vs-forced-old: dq-RS-old +52.0/+93.6 (5-7/24), cefix-old +34.0/-0.5 (one dead-even window noted; five of six windows favor cefix), swb4w-old +20.3/+83.0 (10-11/24); test_model passed; promoted l2 default ~14.25ms (from 16.21ms pre-lane).
+Logs: `mkv3-p4b-qwenl2-peel-support-20260707T0046Z.log`,
+`mkv3-p4b-l2followup-confirm-20260707T0120Z.log`,
+`mkv3-p4b-l2batch2-promoted-20260707T0140Z.log`. Detail note:
+`results/operator-gap/qwenl2-gemm-cluster-promote.md` (updated in place).
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
