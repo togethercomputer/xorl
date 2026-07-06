@@ -5388,6 +5388,17 @@ orders: default-minus-old `-91.33us` and `-94.29us`, old wins `0/80` and
 `mkv3-p4b-small-adkva-post-drowst-20260706T1731Z.log`. Detail note:
 `results/operator-gap/small-adkva-post-drowst-keep.md`.
 
+Post-adkva small CE backward exp2 recheck: forced the old precise CE backward
+exponential path with `MK_CE_BWD_EXP2_APPROX=0`. The forced-precise extension
+correctly dropped `_ceb2`, kept route shape unchanged (`n_instr=288`,
+`critical_path=144`, `gated=127`, `CE_FWD=1/1024`, `CE_BWD=1/1024`), and parity
+stayed clean (worst selected grad `kn.0` rel around `1.13e-02`). Precise lost
+both construction orders: default-minus-precise `-13.98us` and `-12.46us`,
+precise wins `11/80` and `8/80`. Keep `_ceb2` enabled for H512/S1024 small; the
+current-stack margin is smaller than the original promotion check, but remains
+order-stable. Log: `mkv3-p4b-small-ceb2-post-adkva-20260706T1734Z.log`. Detail
+note: `results/operator-gap/small-ceb2-post-adkva-keep.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
