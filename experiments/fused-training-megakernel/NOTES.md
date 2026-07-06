@@ -5436,6 +5436,20 @@ add a DQ row-broadcast knob/default for H512/S1024 small. Log:
 `mkv3-p4b-small-dqrowbc-sourceprobe-20260706T1745Z.log`. Detail note:
 `results/operator-gap/small-dq-rowbcast-sourceprobe-nogo.md`.
 
+Current-head small RMS backward split recheck: forced the old combined
+RMS backward route with `MK_RMS_BWD_SPLIT_DW=0` after the current profile showed
+`RMSNORM_BWD_DX` back in the top-five on-path totals. The combined route changed
+default split `RMSNORM_BWD_DX=17/1088` plus `RMSNORM_BWD_DW=17/1088` into
+`RMSNORM_BWD=17/1088`, reducing `n_instr=288 -> 271` and `gated=127 -> 110`
+while leaving `critical_path=144`. Parity stayed clean
+(`loss_diff=-9.54e-07` / `+2.86e-06`, worst selected grad rel `<4.9e-07`), but
+combined lost both construction orders: default-minus-combined `-5.39us` and
+`-12.02us`, combined wins `26/80` and `15/80`. Keep split RMS backward on the
+current H512/S1024 stack; fewer instructions do not offset reintroducing the dW
+drain onto the dX chain. Log:
+`mkv3-p4b-small-rmssplit-current-20260706T1750Z.log`. Detail note:
+`results/operator-gap/small-rmssplit-current-keep.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
