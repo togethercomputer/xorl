@@ -4005,6 +4005,31 @@ Validation:
 - `test_ops.py` PASS (`mkv3-p4b-d128-fwdmb-testops-20260706T0131Z.log`).
 - `py_compile`, `ruff check`, and `git diff --check` passed.
 
+## v3 P4b D=128 dQ mbarrier/split-wait: NO-GO in-model
+
+After the qwen dQ row-split and fwd mbarrier promotions, the remaining
+operator-gap D=128 bwd lead was a dQ mbarrier K/V ring with split S/dP WGMMA
+waits (run exp/mask while dP is still flying). It was tested as an opt-in
+`OP_ATTN_DQ_WG128` high-bit route on top of the current qwen default:
+forward mbarrier still active, dQ row-split still active, 148KB carveout.
+
+Evidence:
+- Route/smoke: `MK_ATTN_D128_DQ_MB=1` emitted dQ `[(256, 50331649)]`
+  (`row-split | mbar`) and completed the qwen one-step smoke.
+- Paired A/B vs current default (`mkv3-p4b-d128-dqmb-ab-20260706T0138Z.log`):
+  parity was clean in both construction orders (loss diff `2.9e-06`, worst
+  grad rel `0.000001`), but timing did not clear the bar:
+  default-minus-mbar medians `-0.82us` and `-11.39us`, with weak `31/64` and
+  `22/64` wins.
+- Instruction profile (`mkv3-p4b-d128-dqmb-profile-20260706T0138Z.log`) showed
+  why: dQ span barely moved (`201.9us -> 198.6us`) and total median worsened
+  (`10848.0us -> 10879.5us`). The local split-wait overlap is too small after
+  the row-split/direct-store route, and the extra mbarrier protocol is absorbed.
+
+Outcome: candidate source was reverted; do not carry `MK_ATTN_D128_DQ_MB`.
+The next D=128 bwd direction should be the operator-gap S^T/register-A feed
+design, not another K/V-ring bolt-on.
+
 ## v3 P4b fwd KV-widening in-model (session 2853e0de): NO-GO — absorption
 
 The FA4-B w128 fwd port (OP_ATTN_FWD_WGW128, `megakernel-attn-w128` worktree,
