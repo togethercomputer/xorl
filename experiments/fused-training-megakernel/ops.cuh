@@ -2793,6 +2793,13 @@ __device__ void op_ce_bwd(const Instr& I, int tile, void** bufs) {
   const float lse = reinterpret_cast<const float*>(bufs[I.args[2]])[tile];
   const float inv_valid = *reinterpret_cast<const float*>(bufs[I.args[3]]);
   const float scale = (label >= 0) ? inv_valid : 0.0f;
+#ifdef MK_CE_BWD_LABEL_FIXUP
+  float label_out = 0.0f;
+  if (label >= 0 && mk_tid() == 0) {
+    const float p = ce_bwd_exp(bf2f(z[label]) - lse);
+    label_out = scale * (p - 1.0f);
+  }
+#endif
   if ((V & 7) == 0) {  // uint4 IO (v3 P4b): the scalar loop was ~2KB/row/thread of
     // 2-byte accesses on the fattest activation buffer — latency-bound at 8 warps.
     // libm expf is the default: bitwise-identical dlogits vs the reference path (the
@@ -2804,14 +2811,26 @@ __device__ void op_ce_bwd(const Instr& I, int tile, void** bufs) {
 #pragma unroll
       for (int j = 0; j < 8; j++) {
         const float p = ce_bwd_exp(zv[j] - lse);
+#ifdef MK_CE_BWD_LABEL_FIXUP
+        zv[j] = scale * p;
+#else
         zv[j] = scale * (p - (i + j == label ? 1.0f : 0.0f));
+#endif
       }
       st8bf(z + i, zv);
     }
   } else {
     for (int i = mk_tid(); i < V; i += MK_CONSUMERS) {
       const float p = ce_bwd_exp(bf2f(z[i]) - lse);
+#ifdef MK_CE_BWD_LABEL_FIXUP
+      z[i] = f2bf(scale * p);
+#else
       z[i] = f2bf(scale * (p - (i == label ? 1.0f : 0.0f)));
+#endif
     }
   }
+#ifdef MK_CE_BWD_LABEL_FIXUP
+  consumer_sync();
+  if (label >= 0 && mk_tid() == 0) z[label] = f2bf(label_out);
+#endif
 }

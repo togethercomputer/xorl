@@ -5709,6 +5709,36 @@ and
 `mkv3-p4b-s8192-rowbcast-postcombine-variant-first-repeat-20260706T1910Z.log`.
 Detail note: `results/operator-gap/s8192-rowbcast-postcombine-nogo.md`.
 
+Qwen CE_BWD label-fixup promotion: `OP_CE_BWD` used to subtract the one-hot
+label inside every vectorized vocab element update. Added
+`MK_CE_BWD_LABEL_FIXUP`, which reads the original label logit once, writes
+`scale * softmax` for the full row without the per-element label compare, then
+overwrites the exact label element after a block sync. The default is exact
+qwen4b-L1 only, where CE_BWD is on path with large `V=151936`; the env override
+restores the old in-loop one-hot form for A/B. Before promotion, forced fixup
+beat the old default in both construction orders with clean qwen gradient
+parity: `-26.14us` and `-25.28us` over 12 reps, then confirmation
+`-13.01us` and `-30.48us` over 32 reps. After promotion, forced old
+`MK_CE_BWD_LABEL_FIXUP=0` lost both orders: `+33.18us` and `+24.37us`
+old-minus-default, with only `5/32` and `9/32` old wins. The promoted profile
+uses `_ceb2_cefix_gmbar_n256ntold`, measures `8858.0us` total, and moves
+CE_BWD from `294.2us` (`291.6us` span) to `256.0us` (`253.1us` span) versus the
+prior `_gmbar_n256ntold` profile. Resource usage stays spill-safe
+(`REG:255 STACK:32 LOCAL:0` on df; df2 `STACK:48`, ws `REG:168 STACK:80`).
+Validation passed `py_compile`, `test_ops.py`, `test_model.py`, and
+`git diff --check`. Logs:
+`mkv3-p4b-qwen-cefix-default-first-20260706T1914Z.log`,
+`mkv3-p4b-qwen-cefix-variant-first-20260706T1914Z.log`,
+`mkv3-p4b-qwen-cefix-default-first-confirm-20260706T1914Z.log`,
+`mkv3-p4b-qwen-cefix-variant-first-confirm-20260706T1914Z.log`,
+`mkv3-p4b-qwen-cefix-promoted-default-first-20260706T1914Z.log`,
+`mkv3-p4b-qwen-cefix-promoted-variant-first-20260706T1914Z.log`,
+`mkv3-p4b-profile-qwen-cefix-20260706T1914Z.log`,
+`mkv3-p4b-qwen-cefix-resusage-20260706T1914Z.txt`,
+`mkv3-p4b-qwen-cefix-testops-20260706T1914Z.log`, and
+`mkv3-p4b-qwen-cefix-testmodel-20260706T1914Z.log`. Detail note:
+`results/operator-gap/qwen-cebwd-label-fixup-promote.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

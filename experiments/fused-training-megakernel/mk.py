@@ -406,6 +406,7 @@ def load_ext(
     attn_exp2_approx=None,
     lmhead_exp2_approx=None,
     ce_bwd_exp2_approx=None,
+    ce_bwd_label_fixup=None,
     idle_ns=None,
     attn_fast_log=None,
     attn_dkv_float2_atomic=None,
@@ -469,6 +470,9 @@ def load_ext(
     ce_bwd_exp2_approx = int(
         os.environ.get("MK_CE_BWD_EXP2_APPROX", int(bool(ce_bwd_exp2_approx)))
     )
+    ce_bwd_label_fixup = int(
+        os.environ.get("MK_CE_BWD_LABEL_FIXUP", int(bool(ce_bwd_label_fixup)))
+    )
     idle_ns_env = os.environ.get("MK_IDLE_NS")
     if idle_ns_env is not None:
         idle_ns = int(idle_ns_env)
@@ -529,6 +533,7 @@ def load_ext(
         + ("_acur" if attn_combine_unroll else "")
         + ("_lex2" if lmhead_exp2_approx else "")
         + ("_ceb2" if ce_bwd_exp2_approx else "")
+        + ("_cefix" if ce_bwd_label_fixup else "")
         + (f"_idle{idle_ns}" if idle_ns != 256 else "")
         + ("_qkbc" if qkbc else "")
         + ("_qkbc128" if qkbc128 else "")
@@ -562,6 +567,7 @@ def load_ext(
         + (["-DMK_ATTN_COMBINE_UNROLL"] if attn_combine_unroll else [])
         + (["-DMK_LMHEAD_EXP2_APPROX"] if lmhead_exp2_approx else [])
         + (["-DMK_CE_BWD_EXP2_APPROX"] if ce_bwd_exp2_approx else [])
+        + (["-DMK_CE_BWD_LABEL_FIXUP"] if ce_bwd_label_fixup else [])
         + ([f"-DMK_IDLE_NS={idle_ns}"] if idle_ns != 256 else [])
         + (["-DMK_QKBWD_D64_CACHE"] if qkbc else [])
         + (["-DMK_QKBWD_D128_CACHE"] if qkbc128 else [])

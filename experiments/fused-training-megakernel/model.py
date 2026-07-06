@@ -308,6 +308,7 @@ class MKQwen3:
             (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
             == (2560, 1, 1024, 32, 8, 128, 9728, 151936)
         )
+        self.ce_bwd_label_fixup_default = exact_qwen4b_l1
         self.gemm_mbar_ring_default = (
             c.D == 64 and c.S >= 1024 and c.S % 128 == 0
         ) or exact_qwen4b_l1
@@ -329,6 +330,7 @@ class MKQwen3:
             attn_exp2_approx=self.attn_exp2_approx_default,
             lmhead_exp2_approx=self.lmhead_exp2_approx_default,
             ce_bwd_exp2_approx=self.ce_bwd_exp2_approx_default,
+            ce_bwd_label_fixup=self.ce_bwd_label_fixup_default,
             idle_ns=self.idle_ns_default,
             attn_fast_log=self.attn_fast_log_default,
             attn_dkv_float2_atomic=self.attn_dkv_float2_atomic_default,
