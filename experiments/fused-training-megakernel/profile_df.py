@@ -19,6 +19,7 @@ import mk
 import torch
 from model import Cfg, MKQwen3
 
+
 OP_NAMES = {v: k[3:] for k, v in vars(mk).items() if k.startswith("OP_")}
 
 
@@ -57,7 +58,7 @@ def profile(m, runs=5, mode="df"):
     best = None
     for _ in range(runs):
         iclk = torch.zeros(2 * n, dtype=torch.int64, device="cuda")
-        prog.run(m.ext, wave_clk=iclk, mode=mode)
+        prog.run(m.ext, smem_bytes=getattr(m, "_smem_bytes", None), wave_clk=iclk, mode=mode)
         torch.cuda.synchronize()
         clk = iclk.cpu()
         starts, ends = clk[0::2].numpy(), clk[1::2].numpy()

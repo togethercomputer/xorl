@@ -20,7 +20,7 @@ def profile(cfg):
     m.inv_valid.fill_(1.0 / (cfg.S - 1))
     clk = torch.zeros(m.n_waves + 1, device="cuda", dtype=torch.int64)
     for _ in range(3):
-        m.prog.run(m.ext, wave_clk=clk)
+        m.prog.run(m.ext, smem_bytes=getattr(m, "_smem_bytes", None), wave_clk=clk)
     torch.cuda.synchronize()
     d = clk.diff().cpu()
     per_op = collections.Counter()

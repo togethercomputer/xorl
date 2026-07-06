@@ -3794,6 +3794,35 @@ straggler diagnosis; banding composes per their spec. Repro:
 `results/d128_qwen4b_ab.py <order>` and
 `mkv3-p4b-d128-{family-smoke-v3,promote}-*.log` in the attn-d128 worktree.
 
+Current-head addendum after the qwen dW n256 route: full `test_model.py` with the
+D=128 route default and full `test_ops.py` both passed
+(`mkv3-p4b-d128-main-default-testmodel-20260706T0031Z.log`,
+`mkv3-p4b-d128-main-default-testops-20260706T0036Z.log`). Fresh qwen4b-l1
+default-vs-forced-old (`MK_ATTN_D128_WG=0`) A/B measured default `11043.2us` vs old
+`13124.7us` in default-first order and default `11156.9us` vs old `13031.7us` in
+old-first order, with old-minus-default `+2081.5us` / `+1874.8us`, `12/12` wins in
+both orders, and worst selected grad rel `0.008648` on `emb`
+(`mkv3-p4b-d128-main-default-vs-old-qwen4b-defaultfirst-20260706T0038Z.log`,
+`mkv3-p4b-d128-main-default-vs-old-qwen4b-oldfirst-20260706T0042Z.log`).
+
+Profiler footgun fixed: `profile_df.py` and `profile_waves.py` used to call
+`Program.run` directly without `MKQwen3._smem_bytes`, so D=128 profiles silently
+fell back to the 100KB default smem allocation. `compute-sanitizer` pinned the crash
+to an invalid shared write in `op_attn_dq_wg128` at `wgmma_attention.cuh:1411`,
+address just above 100KB
+(`mkv3-p4b-d128-main-ragged-iclk-compute-sanitizer-20260706T0104Z.log`). The
+profilers now pass `getattr(m, "_smem_bytes", None)` to `Program.run`, matching
+`MKQwen3.step()`.
+
+Post-fix qwen4b-l1 profile
+`mkv3-p4b-d128-main-default-qwen4b-profile-20260706T0108Z.log` measured total
+`11070.1us`, `n_instr=51`, `critical_path=26`, `gated=23`, and `360.7us` on-path
+wait. Remaining on-path leaders are head-dX `GEMMNN 1024x2560x151936.wg`
+(`2912.8us`), lm-head fwd `GEMMNT 1024x151936x2560.wg` (`2698.5us`), MLP
+fwd/bwd (`956.3us`, `673.2us`), then `ATTN_DQ_WG128` (`598.8us`). `ATTN_FWD_WG128`
+is `219.0us`, and `ATTN_DKV_WG128` is off-path at `466.1us`; the next qwen-class
+lane is back to the giant vocab/head GEMMs, not D=128 attention.
+
 ## v3 P4b fwd KV-widening in-model (session 2853e0de): NO-GO — absorption
 
 The FA4-B w128 fwd port (OP_ATTN_FWD_WGW128, `megakernel-attn-w128` worktree,
