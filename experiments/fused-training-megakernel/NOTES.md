@@ -4998,6 +4998,17 @@ N-major default-on. Logs:
 `mkv3-p4b-qwen-nmajor-current-variant-first-20260706T1829Z.log`. Detail note:
 `results/operator-gap/qwen-nmajor-current-keep.md`.
 
+Current qwen n256 stage3 route confirmation: rechecked forced old stage2
+routing with `MK_WGMMA_N256_STAGE3=0` against the current default, leaving
+N-major otherwise default-on. The route changed only bit25 stage3 routing
+(`stage3=15 -> 0`) while keeping `n256=15` and `nmajor=15`. Loss parity was
+identical in both orders. The forced old route lost both construction orders:
+variant-minus-default `+293.62us` with `0/16` old wins, then `+251.34us` with
+`0/16` old wins. Keep qwen stage3 default-on. Logs:
+`mkv3-p4b-qwen-stage3-current-default-first-20260706T1830Z.log` and
+`mkv3-p4b-qwen-stage3-current-variant-first-20260706T1830Z.log`. Detail note:
+`results/operator-gap/qwen-stage3-current-keep.md`.
+
 ## Small H512/S1024 SwiGLU backward 4W route (this session, 20260706T1530Z)
 
 Extended the existing `SWIGLU_BWD_4W` opcode to the exact small benchmark shape
