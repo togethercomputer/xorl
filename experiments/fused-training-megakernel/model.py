@@ -301,7 +301,9 @@ class MKQwen3:
         )
         self.attn_dq_float2_store_default = c.H == 256 and c.S in _H256_DQ_FLOAT2_S
         self.gemm_mbar_ring_default = c.D == 64 and c.S >= 1024 and c.S % 128 == 0
-        self.gemm_direct_bf16_epilogue_default = c.D == 64 and c.S == 128
+        self.gemm_direct_bf16_epilogue_default = c.D == 64 and (
+            c.S == 128 or (c.H, c.L, c.S, c.nq, c.nkv, c.I) == (512, 8, 1024, 8, 4, 1536)
+        )
         self.ext = mk.load_ext(
             swiglu_bwd_2w=self.swiglu_bwd_2w_default,
             swiglu_bwd_4w=self.swiglu_bwd_4w_default,

@@ -5221,6 +5221,31 @@ lost both build orders with zero wins: default-minus-variant medians were
 `mkv3-p4b-small-attnc-post-n128-20260706T1840Z.log`. Detail note:
 `results/operator-gap/small-attnc-post-n128-nogo.md`.
 
+## Small direct-BF16 GEMM epilogue post-n128 promotion (this session, 20260706T1925Z)
+
+The earlier direct-BF16 GEMM epilogue result was S128-only because H512/S1024
+small lost or was neutral. After the NN/NT n128 retunes, forced
+`MK_GEMM_DIRECT_BF16_EPILOGUE=1` now covers 32 ordinary WGMMA BF16-output rows
+(`5632` tiles): 8x `GEMMNN 1024x512x1024`, 8x `GEMMNN 1024x512x3072`, 8x
+`GEMMNN 1024x1536x512`, and 8x `GEMMNT 1024x3072x512`. Route shape stayed
+`n_instr=288`, `critical_path=144`, `gated=127`, and parity stayed clean
+(`loss_diff=+/-9.54e-07`, worst selected grad rel `<5.3e-07`). Forced direct
+won both source-free orders: default-minus-direct medians `+27.82us` and
+`+27.01us`, direct wins `80/80` and `80/80`.
+
+The default gate now also enables direct-BF16 GEMM epilogues for exact
+H512/L8/S1024 small, while preserving the earlier S128 default. Forced old
+`MK_GEMM_DIRECT_BF16_EPILOGUE=0` lost both promoted-default orders: default beat
+old by `28.82us` and `23.71us`, with old wins `1/80` and `2/80`. Validation
+passed `py_compile`, `git diff --check`, `test_model.py`, and `test_ops.py`.
+Refreshed profile measured `3320.1us`; refreshed score measured megakernel
+`3312.5us` vs compile+CUDAGraph+ `1903.3us` (gap `1.74x`). Logs:
+`mkv3-p4b-small-directbf16-post-n128-20260706T1905Z.log`,
+`mkv3-p4b-small-directbf16-promoted-20260706T1915Z.log`,
+`mkv3-p4b-profile-small-directbf16-default-20260706T1925Z.log`, and
+`mkv3-p4b-score-small-directbf16-default-20260706T1925Z.log`. Detail note:
+`results/operator-gap/small-directbf16-post-n128-promote.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
