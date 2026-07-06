@@ -4379,6 +4379,24 @@ median / `+14.72us` paired in the default-first order, but `-50.11us` median /
 `-31.36us` paired in the reverse order. Keep the current split RMS backward;
 the cold dW drain still belongs off the dX path.
 
+Qwen CE forward/backward fusion probe: NO-GO, source reverted. A temporary
+`OP_CE_FWD_BWD` combined the lm-head partial-lse reduction/loss update and the
+in-place dlogits pass, replacing `CE_FWD` + `CE_BWD` with one row op and one
+fewer wave. Unit coverage passed, including the partial-lse form used by qwen
+(`mkv3-cefwdbwd-testops-20260706T034126Z.log`). Qwen two-step parity was clean:
+route changed from `CE_FWD=1`, `CE_BWD=1`, `n_instr=47`, `critical_path=26` to
+`CE_FWD_BWD=1`, `n_instr=46`, `critical_path=25`; loss diffs were
+`+1.91e-06` and `+2.86e-06`, worst selected-gradient rel was `4.88e-07`, and
+embedding nonzero row counts matched (`1018/1018`). Timing rejected promotion:
+default-minus-fused was `-109.87us` median / `-104.10us` paired in the
+default-first order, then only `+29.12us` median / `+29.62us` paired in reverse
+(`mkv3-p4b-qwen-cefwdbwd-ab-20260706T034413Z.log`). Profile
+`mkv3-p4b-qwen-cefwdbwd-profile-20260706T034640Z.log` explained the weak result:
+the fused op's span was `327.1us`, barely below split `CE_FWD+CE_BWD`
+(`34.7us + 296.4us`) while whole-step attribution stayed dominated by the
+giant n256 head/lm-head GEMMs. Do not carry a fused CE opcode unless it also
+changes the downstream head/dW dataflow, not just the local CE hop.
+
 Qwen head-dX n256 split-K probe: NO-GO, source reverted. The top current qwen
 hop is still the 80-tile n256 direct `dlogits @ Wlm` row
 (`GEMMNN 1024x2560x151936.wg`), so a temporary default-off
