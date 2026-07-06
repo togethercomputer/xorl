@@ -5780,6 +5780,23 @@ Validation passed `py_compile`, `test_model.py`, and `git diff --check`. Logs:
 `mkv3-p4b-small-cefix-test-model-20260706T1934Z.log`. Detail note:
 `results/operator-gap/small-cebwd-label-fixup-promote.md`.
 
+H256 CE_BWD label-fixup no-go sweep: after promoting qwen, S8192, and exact
+small, tested the remaining H256/D64 sequence lengths S1024/S2048/S3072/S4096
+source-free with forced `MK_CE_BWD_LABEL_FIXUP=1`. Full-gradient parity stayed
+clean throughout, but no shape met the two-order gate. S1024 was `-6.54us` in
+default-first and `+2.08us` in reverse; S2048 was `-7.18us` and `+9.01us`;
+S3072 was effectively zero (`-0.98us` and `-0.05us`); S4096 was `-9.34us` and
+`+1.07us`. Keep the H256 default limited to exact S8192 for now. Logs:
+`mkv3-p4b-h256-cefix-s1024-default-first-20260706T1947Z.log`,
+`mkv3-p4b-h256-cefix-s1024-variant-first-20260706T1947Z.log`,
+`mkv3-p4b-h256-cefix-s2048-default-first-20260706T1947Z.log`,
+`mkv3-p4b-h256-cefix-s2048-variant-first-20260706T1947Z.log`,
+`mkv3-p4b-h256-cefix-s3072-default-first-20260706T1947Z.log`,
+`mkv3-p4b-h256-cefix-s3072-variant-first-20260706T1947Z.log`,
+`mkv3-p4b-h256-cefix-s4096-default-first-20260706T1947Z.log`, and
+`mkv3-p4b-h256-cefix-s4096-variant-first-20260706T1947Z.log`. Detail note:
+`results/operator-gap/h256-cebwd-label-fixup-sweep-nogo.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
