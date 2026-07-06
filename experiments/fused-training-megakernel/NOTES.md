@@ -4582,6 +4582,33 @@ pass; the dx-side and swiglu-side fusions are unexplored). That is a major
 multi-session arc: each fused epilogue deletes a chain hop AND removes the
 rowop's exposure to co-scheduling stretch. Flagged unclaimed on the board.
 
+## v3 P4b dispatch-spill regression caught by certification (session 2853e0de)
+
+The full certified scoreboard at the 0345Z-class head read UNIFORMLY high vs
+the freshest per-shape measurements (`mkv3-p4b-score-full-1cb68c8-20260706T034649Z.log`):
+
+| shape | mk | graph+ | gap | vs fresh expectation |
+|---|---:|---:|---:|---|
+| nano | 939.0 | 632.4 | 1.48x | +22us |
+| small | 3660.2 | 1904.1 | 1.92x | +200us |
+| deep-L12 | 2448.1 | 1774.4 | 1.38x | +48us |
+| S2048 | 1899.7 | 983.1 | 1.93x | +74us |
+| S3072 | 2651.2 | 1330.2 | 1.99x | +150us |
+| S4096 | 3362.7 | 1581.1 | 2.13x | +230us |
+| S8192 | 7744.0 | 3153.0 | 2.46x | +624us (+8.8%) |
+
+Root cause found by compile-only STACK bisect
+(`mkv3-p4b-stack-bisect-20260706T040413Z.log`): `megakernel_df` STACK
+went 48 (my d128 merge) -> 32 (the rowbcast/rms-h256/drow commits IMPROVED it)
+-> **208 at `544640f` (qwen n256 stage3 ring)** and 176-208 since. Classic P1
+dispatch-spill law: ~176B of spill at the dispatch call sites taxes every op
+on every shape, biggest absolute cost on the longest steps. Fix recipe per P6
+round 2: __noinline__ the fat body or re-stage its hoisted mainloop state;
+verify STACK <= 48 and re-run the stage3 A/B (its measured margin partly paid
+this tax). Handed to the owning session on the board with a 45-min window.
+META: this is why the periodic full certification exists — per-lane paired
+A/Bs cannot see a uniform tax that lands between their two arms.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
