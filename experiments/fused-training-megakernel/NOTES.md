@@ -5206,6 +5206,21 @@ default-minus-n128off medians `-48.88us` and `-48.67us`, with n128off wins
 `mkv3-p4b-small-n128off-after-nt-20260706T1830Z.log`. Detail note:
 `results/operator-gap/small-lmhead-n128-post-nt-keep.md`.
 
+## Post-n128 small attention chunk recheck (this session, 20260706T1900Z)
+
+After the 4W/cache and NN/NT n128 route changes, rechecked H512/S1024 small
+attention chunk envs against the current `DKV_C=1/DQ_C=1` default. Route shape
+stayed `n_instr=288`, `critical_path=144`, `gated=127`; default remained
+`ATTN_FWD_WG=8/512`, `ATTN_DKV_WG=8/512`, `ATTN_DQ_WG=8/512`. The variants
+`DKV_C=2/DQ_C=1`, `DKV_C=3/DQ_C=1`, `DKV_C=1/DQ_C=2`, and `DKV_C=2/DQ_C=2`
+changed only the expected DKV/DQ tile counts and stayed parity-clean
+(`loss_diff` within `+/-4.77e-06`, worst selected grad rel `<1.18e-02`), but all
+lost both build orders with zero wins: default-minus-variant medians were
+`-77.71us`/`-72.86us`, `-81.81us`/`-77.81us`, `-34.61us`/`-32.99us`, and
+`-69.42us`/`-65.44us`. Keep small attention chunks at `DKV_C=1/DQ_C=1`. Log:
+`mkv3-p4b-small-attnc-post-n128-20260706T1840Z.log`. Detail note:
+`results/operator-gap/small-attnc-post-n128-nogo.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
