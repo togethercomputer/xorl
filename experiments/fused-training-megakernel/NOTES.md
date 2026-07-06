@@ -5693,6 +5693,22 @@ split the NN/TN body unless a more specific profile mechanism appears. Logs:
 `mkv3-p4b-qwen-gmbar-post-ntmbar-variant-first-20260706T1906Z.log`. Detail
 note: `results/operator-gap/qwen-gmbar-post-ntmbar-keep.md`.
 
+Post-combine-unroll S8192 dKV row-broadcast composition recheck: because
+`MK_ATTN_DKV_ROW_BCAST=1` was once positive for S8192 and then reverted after
+`MK_GEMM_MBAR_RING`, rechecked it after the later combine-unroll/schedule
+change. The first pair looked positive (`-12.18us`, 16/16 wins, then
+`-3.50us`, 11/16 wins), but the repeat exposed order/window sensitivity:
+default-first strengthened to `-24.40us` with 15/16 wins, while variant-first
+flipped to `+5.57us` with only 8/16 wins. Loss and selected-gradient parity
+were clean. Keep the row-broadcast default gate empty; do not re-promote it
+from this order-mixed composition signal. Logs:
+`mkv3-p4b-s8192-rowbcast-postcombine-default-first-20260706T1910Z.log`,
+`mkv3-p4b-s8192-rowbcast-postcombine-variant-first-20260706T1910Z.log`,
+`mkv3-p4b-s8192-rowbcast-postcombine-default-first-repeat-20260706T1910Z.log`,
+and
+`mkv3-p4b-s8192-rowbcast-postcombine-variant-first-repeat-20260706T1910Z.log`.
+Detail note: `results/operator-gap/s8192-rowbcast-postcombine-nogo.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
