@@ -4974,6 +4974,18 @@ and `47/48`. Main validation passed `py_compile`, `git diff --check`,
 `mkv3-p4b-qwen-swiglu-4w-main-default-first-20260706T1505Z.log`,
 `mkv3-p4b-qwen-swiglu-4w-main-old2w-first-20260706T1505Z.log`.
 
+Current qwen4b-L1 profile anchor at `607ed60`: after the qwen n256, D128
+qknorm, and SwiGLU 4W route promotions, a fresh source-free profile measured
+`n_instr=47`, `critical_path=26`, `gated=9`, qwen smem `151552`, total
+`9221.8us`, 26 chain hops, `306.8us` on-path wait, and `8915.0us` on-path span.
+The current qwen leaders are the giant n256 head rows: head-dX
+`GEMMNN 1024x2560x151936.wg` `2886.0us` and lm-head forward
+`GEMMNT 1024x151936x2560.wg` `2463.6us`, followed by MLP dX rows, RMS dX,
+`ATTN_DQ_WG128` at `315.4us` (`203.6us` wait), CE, and qknorm-bwd. Off-path dW
+is still large (`GEMMTN 151936x2560x1024.wg` `5112.1us`) but overlapped. Log:
+`mkv3-p4b-profile-qwen-current-607ed60-20260706T1825Z.log`. Detail note:
+`results/operator-gap/qwen-current-607ed60-profile.md`.
+
 ## Small H512/S1024 SwiGLU backward 4W route (this session, 20260706T1530Z)
 
 Extended the existing `SWIGLU_BWD_4W` opcode to the exact small benchmark shape
