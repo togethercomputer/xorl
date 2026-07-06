@@ -477,10 +477,10 @@ __device__ __forceinline__ void wg_mma_ktile_n256(const uint64_t (&da)[4], const
 #undef WG_D16
 #undef WG_D4
 
-// m64n256 NT direct-store lm-head tile (qwen giant-vocab follow-up to fat_gemm_probe.py).
+// m64n256 NT direct-store tile (qwen giant-vocab follow-up to fat_gemm_probe.py).
 // The staged 128x256 route needs 160KB and fails the current cooperative launch at 132
 // blocks; this variant keeps the 100KB page by skipping the coalesced fp32 epilogue slab.
-// It is deliberately narrow: NT only, bf16 logits only, CE/LSE partials only, and a
+// It is deliberately narrow: NT only, bf16 output only, optional CE/LSE partials, and a
 // final 128-column tail. Broad direct-store use regressed in the standalone probe.
 __device__ __noinline__ void op_gemm_wgmma_n256_direct(const Instr& I, int tile, void** bufs,
                                                        char* smem_raw) {
@@ -489,7 +489,7 @@ __device__ __noinline__ void op_gemm_wgmma_n256_direct(const Instr& I, int tile,
   const bf16* B = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
   bf16* C = reinterpret_cast<bf16*>(bufs[I.args[2]]);
   const int N = I.args[4], K = I.args[5], flags = I.args[6];
-  if (!(flags & 2) || !(flags & 2048)) return;
+  if (!(flags & 2)) return;
 
   smem_raw = reinterpret_cast<char*>(
       (reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
@@ -559,6 +559,8 @@ __device__ __noinline__ void op_gemm_wgmma_n256_direct(const Instr& I, int tile,
       }
     }
   }
+
+  if (!(flags & 2048)) return;
 
   float* parts = reinterpret_cast<float*>(bufs[I.args[9]]);
   const int nparts = I.args[10];
@@ -885,7 +887,7 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
   void* Cp = bufs[I.args[2]];
   const int M = I.args[3], N = I.args[4], K = I.args[5], flags = I.args[6];
   if (flags & 16384) {
-    if ((flags & 2) && (flags & 2048))
+    if (flags & 2)
       op_gemm_wgmma_n256_direct(I, tile, bufs, smem_raw);
     else
       op_gemm_wgmma_n256_nn_f32(I, tile, bufs, smem_raw);

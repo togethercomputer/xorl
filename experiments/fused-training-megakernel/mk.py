@@ -160,6 +160,31 @@ def wgmma_n256_direct_ok(M, N, K, flags):
     return (M, N, K) == (1024, 151936, 2560)
 
 
+def wgmma_n256_nt_bf16_ok(M, N, K, flags):
+    """Qwen no-residual NT bf16 forward m64n256 route.
+
+    This reuses the direct-store n256 kernel without CE partials. Keep it exact-gated:
+    the direct epilogue is useful for qwen's large no-residual NT forwards, while
+    broader direct-store use has regressed in standalone probes. Set
+    MK_WGMMA_N256_NT_BF16=0 to restore the n128 route, or =1 to force all structurally
+    eligible NT bf16 probes.
+    """
+    mode_env = os.environ.get("MK_WGMMA_N256_NT_BF16")
+    mode = -1 if mode_env is None else int(mode_env)
+    if mode == 0:
+        return False
+    if flags != 2:
+        return False
+    if M % 128 or N % 256 or K % 64:
+        return False
+    if mode == 1:
+        return True
+    return (M, N, K) in {
+        (1024, 19456, 2560),  # qwen4b-l1 wgu
+        (1024, 6144, 2560),   # qwen4b-l1 wqkv
+    }
+
+
 def gemm_tiles_wgmma_n256_direct(M, N):
     return (M // 128) * ((N + 255) // 256)
 

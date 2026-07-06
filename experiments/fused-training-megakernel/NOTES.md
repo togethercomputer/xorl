@@ -3823,6 +3823,41 @@ fwd/bwd (`956.3us`, `673.2us`), then `ATTN_DQ_WG128` (`598.8us`). `ATTN_FWD_WG12
 is `219.0us`, and `ATTN_DKV_WG128` is off-path at `466.1us`; the next qwen-class
 lane is back to the giant vocab/head GEMMs, not D=128 attention.
 
+## v3 P4b qwen no-residual NT bf16 n256 direct route
+
+The existing m64n256 direct NT kernel was previously CE-only in dispatch even though
+its body already performs ordinary bf16 output stores before the optional CE/LSE
+partials. Extending it to no-CE NT bf16 needed two pieces: dispatch now sends any
+`flags & 2` n256-direct GEMM to `op_gemm_wgmma_n256_direct` (the NN/TN fp32 route
+still handles non-NT bit14 cases), and the CE partial epilogue returns early when
+bit11 is absent. A permanent `test_ops.py` case now covers direct `2|128|16384`
+NT bf16 output. The initial standalone probe caught the old dispatch bug because
+non-CE n256 NT was incorrectly sent to the fp32 NN/TN kernel and produced garbage;
+the fixed standalone check passed `128x256x64`, qwen `1024x6144x2560`, and qwen
+`1024x19456x2560` (`mkv3-p4b-n256-ntbf16-standalone-fix-20260706T0130Z.log`).
+
+The promoted default is exact-gated by `MK_WGMMA_N256_NT_BF16`: unset routes only
+qwen4b-l1 no-residual NT bf16 forwards `(M,N,K)=(1024,19456,2560)` (`wgu`) and
+`(1024,6144,2560)` (`wqkv`); `=0` restores the old n128 route, and `=1` force-probes
+all structurally eligible NT bf16 shapes. Focused qwen A/B changed those rows from
+`ntiles=1216/384, flags=4226` to `ntiles=608/192, flags=16514`; lm-head stayed on
+the existing `flags=18562` n256+CE route. Default-first timing measured old
+`11045.7us`, new `10816.7us`, old-minus-new `+228.9us`, `16/16` wins, with loss
+rel diff `+2.26e-7` and worst selected grad rel `3.34e-7`. Reverse construction
+order measured old `11015.3us`, new `10840.8us`, old-minus-new `+174.5us`, `16/16`
+wins, worst grad rel `5.84e-7`
+(`mkv3-p4b-qwen-n256-ntbf16-ab-fix-20260706T0134Z.log`,
+`mkv3-p4b-qwen-n256-ntbf16-ab-fix-rev-20260706T0138Z.log`).
+
+Post-route profile `mkv3-p4b-qwen-n256-ntbf16-profile-20260706T0139Z.log` measured
+total `10830.1us`. The intended `GEMMNT 1024x19456x2560.wg` hop is now
+`325.1us` after the tile count halves; remaining top on-path work is lm-head fwd
+`3016.1us`, head-dX `2926.1us`, MLP dX `615.5us`, `ATTN_DQ_WG128` `501.7us`, and
+residual NT MLP/WO forwards (`375.2us`, `196.6us`). Full `test_ops.py` and
+`test_model.py` passed in
+`mkv3-p4b-qwen-n256-ntbf16-testops2-20260706T0146Z.log` and
+`mkv3-p4b-qwen-n256-ntbf16-testmodel-20260706T0141Z.log`.
+
 ## v3 P4b fwd KV-widening in-model (session 2853e0de): NO-GO — absorption
 
 The FA4-B w128 fwd port (OP_ATTN_FWD_WGW128, `megakernel-attn-w128` worktree,
