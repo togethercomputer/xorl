@@ -4675,6 +4675,26 @@ candidate fix. LAW (supplements P1/P6): fat op bodies MUST be `__noinline__`
 before entering the dispatch switch; certify with executed local-load sectors
 + runtime, never STACK/res-usage alone.
 
+### PROMOTED (20260706T0635Z): D=64 wg attention trio noinline — spill zeroed
+
+`__noinline__` on `op_attn_fwd_wg` / `op_attn_dkv_wg` / `op_attn_dq_wg`
+(stacked on 6b78314) zeroes executed local-LD at small (4.09M -> 0 sectors)
+and recovers the remaining tax: small 3557.7 -> **3511.1us** (~39us from the
+3472.0 pre-window anchor, inside the cross-binary noise band). These ops
+pre-date the regression window and were fine under the old pressure baseline;
+the window's additions raised global allocation and ptxas began spilling
+scheduler state around them — noinline fixes the interaction, not the ops.
+Full certified scoreboard vs the 1cb68c8 certification (all guards clean,
+S8192 pre-guard read a transient 80% so its gain is understated;
+`mkv3-p4b-score-full-d64noinline-*.log`): nano 927.5 (-11.5), small 3510.2
+(-150), deep-L12 2422.8 (-25), S2048 1830.8 (-69), S3072 2539.7 (-112),
+S4096 3196.3 (-166), S8192 7241.8 (-502). Exonerated en route: 53f8c99
+sparse embed-clear (removal is WORSE: 3618.0/LD 4.57M), a354e8f cluster
+launch (identical), n256 fanout trampoline (neutral twice). test_ops +
+test_model green (`mkv3-d64noinline-tests-*.log`). Re-run knob: the ncu
+one-pass LD metric; any future kernel-touching promotion should keep
+`l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum == 0` at small.
+
 
 ## Honest assessment + v2 roadmap
 

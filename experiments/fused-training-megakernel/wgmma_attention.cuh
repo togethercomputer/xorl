@@ -408,7 +408,7 @@ __device__ void op_attn_fwd_wg_pipe(const Instr& I, int tile, void** bufs,
 }
 #endif  // MK_ATTN_PIPE
 
-__device__ void op_attn_fwd_wg(const Instr& I, int tile, void** bufs, char* smem_raw) {
+__device__ __noinline__ void op_attn_fwd_wg(const Instr& I, int tile, void** bufs, char* smem_raw) {
 #ifdef MK_ATTN_PIPE
   op_attn_fwd_wg_pipe(I, tile, bufs, smem_raw);
 #else
@@ -610,7 +610,7 @@ struct __align__(16) AttnWgDkvSmem {  // 96KB
   bf16 dO[2][4096];  // [stage] K-view A (dP = dO V^T) + MN-view B (dV += P^T dO)
 };
 
-__device__ void op_attn_dkv_wg(const Instr& I, int tile, void** bufs, char* smem_raw) {
+__device__ __noinline__ void op_attn_dkv_wg(const Instr& I, int tile, void** bufs, char* smem_raw) {
   constexpr int D = 64;
   const int S = I.args[5], nq = I.args[6], nkv = I.args[7];
   const float scale = __int_as_float(I.args[9]);
@@ -829,7 +829,7 @@ struct __align__(16) AttnWgDqSmem {  // 80KB
   bf16 V[2][4096];   // [stage] K-view B (= V^T)
 };
 
-__device__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs, char* smem_raw) {
+__device__ __noinline__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs, char* smem_raw) {
   constexpr int D = 64;
   const int S = I.args[5], nq = I.args[6], nkv = I.args[7];
   const float scale = __int_as_float(I.args[9]);
