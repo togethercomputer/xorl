@@ -699,16 +699,17 @@ __device__ __noinline__ void op_attn_dkv_wg(const Instr& I, int tile, void** buf
     consumer_sync();
     const bool skip = q0s < kv0wg;  // WG1's first stage: fully masked
     if (!skip) {
-      // Register diet (the interpreter shares one 255-reg allocation across ALL ops;
-      // spills tax every op uniformly — the v3 P1 lesson): never hold the P(fp32) and
-      // dP(fp32) banks at once. P goes to smem as bf16 immediately and is read BACK
-      // (same thread, same addresses) for dS — the dV gemm consumes bf16 P anyway, so
-      // this costs no precision. Live fp32 banks: dk, dv, s (96) instead of 128.
-      float s[32];
+      // S and dP are independent gemms: one commit batch (wga_mma64_x2) deletes a
+      // full warpgroup drain from the per-stage chain, and with BOTH fp32 banks live
+      // the softmax + dS ALU fuse into one pass — no P smem re-read on the chain.
+      // Live fp32 banks: dk, dv, s, s2 (128); the old 96-bank register diet paid a
+      // drain + a round-trip per stage instead (measured on-path, this trades up).
+      float s[32], s2[32];
 #pragma unroll
-      for (int i = 0; i < 32; ++i) s[i] = 0.0f;
-      // rows of s = q stage rows; cols = this WG's kv rows
-      wga_mma64<WGA_MMA_KK, false, false>(sm.Q[t & 1], sm.K[wg], s);  // S = Q K^T
+      for (int i = 0; i < 32; ++i) s[i] = s2[i] = 0.0f;
+      // rows = q stage rows; cols = this WG's kv rows
+      wga_mma64_x2<WGA_MMA_KK, false, false>(sm.Q[t & 1], sm.K[wg], s,     // S = Q K^T
+                                             sm.dO[t & 1], sm.V[wg], s2);  // dP = dO V^T
       const bool masked = q0s == kv0wg;  // diagonal stage
 #pragma unroll
       for (int i = 0; i < 2; ++i) {
@@ -716,8 +717,11 @@ __device__ __noinline__ void op_attn_dkv_wg(const Instr& I, int tile, void** buf
 #ifdef MK_ATTN_DKV_ROW_BCAST
         float lse = ((ln & 3) == 0) ? LSE[(int64_t)qh * S + qr] : 0.0f;
         lse = __shfl_sync(0xffffffffu, lse, ln & ~3);
+        float dr = ((ln & 3) == 0) ? Drow[(int64_t)qh * S + qr] : 0.0f;
+        dr = __shfl_sync(0xffffffffu, dr, ln & ~3);
 #else
         const float lse = LSE[(int64_t)qh * S + qr];
+        const float dr = Drow[(int64_t)qh * S + qr];
 #endif
 #pragma unroll
         for (int n8 = 0; n8 < 8; ++n8) {
@@ -727,34 +731,14 @@ __device__ __noinline__ void op_attn_dkv_wg(const Instr& I, int tile, void** buf
           float p1 = wga_exp(s[idx + 1] * scale - lse);
           if (masked && kr > qr) p0 = 0.0f;
           if (masked && kr + 1 > qr) p1 = 0.0f;
+          const int off = wga_off64(r0 + 8 * i, n8 * 8 + cb);
           __nv_bfloat162 pv;
           pv.x = f2bf(p0);
           pv.y = f2bf(p1);
-          *reinterpret_cast<__nv_bfloat162*>(
-              (char*)sm.P[wg] + wga_off64(r0 + 8 * i, n8 * 8 + cb)) = pv;
-        }
-      }
-#pragma unroll
-      for (int i = 0; i < 32; ++i) s[i] = 0.0f;
-      wga_mma64<WGA_MMA_KK, false, false>(sm.dO[t & 1], sm.V[wg], s);  // dP = dO V^T
-#pragma unroll
-      for (int i = 0; i < 2; ++i) {
-        const int qr = q0s + r0 + 8 * i;
-#ifdef MK_ATTN_DKV_ROW_BCAST
-        float dr = ((ln & 3) == 0) ? Drow[(int64_t)qh * S + qr] : 0.0f;
-        dr = __shfl_sync(0xffffffffu, dr, ln & ~3);
-#else
-        const float dr = Drow[(int64_t)qh * S + qr];
-#endif
-#pragma unroll
-        for (int n8 = 0; n8 < 8; ++n8) {
-          const int idx = n8 * 4 + i * 2;
-          const int off = wga_off64(r0 + 8 * i, n8 * 8 + cb);
-          const __nv_bfloat162 pv =
-              *reinterpret_cast<const __nv_bfloat162*>((char*)sm.P[wg] + off);
+          *reinterpret_cast<__nv_bfloat162*>((char*)sm.P[wg] + off) = pv;
           __nv_bfloat162 dsv;
-          dsv.x = f2bf(bf2f(pv.x) * (s[idx] - dr) * scale);
-          dsv.y = f2bf(bf2f(pv.y) * (s[idx + 1] - dr) * scale);
+          dsv.x = f2bf(bf2f(pv.x) * (s2[idx] - dr) * scale);
+          dsv.y = f2bf(bf2f(pv.y) * (s2[idx + 1] - dr) * scale);
           *reinterpret_cast<__nv_bfloat162*>((char*)sm.dS[wg] + off) = dsv;
         }
       }
@@ -913,13 +897,13 @@ __device__ __noinline__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs
     consumer_sync();
     const bool skip = k0 > q0wg + 63;  // WG0's tail stage
     if (!skip) {
-      // Register diet as in dkv: P parks in the dS tile (bf16) across the dP gemm and
-      // is read back (same thread, same addresses), then overwritten with dS. Live
-      // fp32 banks: dq, s (64) instead of 96.
-      float s[32];
+      // S and dP batched in one warpgroup commit (as in dkv): deletes a drain and
+      // the P park/re-read from the per-stage chain. Live fp32 banks: dq, s, s2 (96).
+      float s[32], s2[32];
 #pragma unroll
-      for (int i = 0; i < 32; ++i) s[i] = 0.0f;
-      wga_mma64<WGA_MMA_KK, false, false>(sm.Q[wg], sm.K[t & 1], s);  // S = Q K^T
+      for (int i = 0; i < 32; ++i) s[i] = s2[i] = 0.0f;
+      wga_mma64_x2<WGA_MMA_KK, false, false>(sm.Q[wg], sm.K[t & 1], s,     // S = Q K^T
+                                             sm.dO[wg], sm.V[t & 1], s2);  // dP = dO V^T
       const bool masked = k0 + 63 > q0wg;
 #pragma unroll
       for (int i = 0; i < 2; ++i) {
@@ -931,27 +915,10 @@ __device__ __noinline__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs
           float p1 = wga_exp(s[idx + 1] * scale - lse[i]);
           if (masked && kr > qr[i]) p0 = 0.0f;
           if (masked && kr + 1 > qr[i]) p1 = 0.0f;
-          __nv_bfloat162 pv;
-          pv.x = f2bf(p0);
-          pv.y = f2bf(p1);
-          *reinterpret_cast<__nv_bfloat162*>(
-              (char*)sm.dS[wg] + wga_off64(r0 + 8 * i, n8 * 8 + cb)) = pv;
-        }
-      }
-#pragma unroll
-      for (int i = 0; i < 32; ++i) s[i] = 0.0f;
-      wga_mma64<WGA_MMA_KK, false, false>(sm.dO[wg], sm.V[t & 1], s);  // dP = dO V^T
-#pragma unroll
-      for (int i = 0; i < 2; ++i) {
-#pragma unroll
-        for (int n8 = 0; n8 < 8; ++n8) {
-          const int idx = n8 * 4 + i * 2;
           const int off = wga_off64(r0 + 8 * i, n8 * 8 + cb);
-          const __nv_bfloat162 pv =
-              *reinterpret_cast<const __nv_bfloat162*>((char*)sm.dS[wg] + off);
           __nv_bfloat162 dsv;
-          dsv.x = f2bf(bf2f(pv.x) * (s[idx] - dr[i]) * scale);
-          dsv.y = f2bf(bf2f(pv.y) * (s[idx + 1] - dr[i]) * scale);
+          dsv.x = f2bf(bf2f(f2bf(p0)) * (s2[idx] - dr[i]) * scale);
+          dsv.y = f2bf(bf2f(f2bf(p1)) * (s2[idx + 1] - dr[i]) * scale);
           *reinterpret_cast<__nv_bfloat162*>((char*)sm.dS[wg] + off) = dsv;
         }
       }

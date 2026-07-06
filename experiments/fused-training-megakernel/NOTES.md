@@ -4743,6 +4743,30 @@ verified unchanged (929.2/3440.3;
 green. Arms compose additively (lm -165, dx -82 at S8192). Next structural
 S8192 target per the same profile: ATTN_DKV_WG on-path 2565us at 80% wait.
 
+## bwd-attention S/dP one-batch + fused ALU pass (session 2853e0de, 20260706T1010Z)
+
+Follow-through on the scheduling-exoneration diagnosis (packing 77-83%; the
+gap is per-stage op cost). In both `op_attn_dkv_wg` and `op_attn_dq_wg`, the
+S=QK^T and dP=dO V^T gemms are independent but were issued as two fully
+drained `wga_mma64` batches, serialized only by sharing one fp32 bank (the old
+register diet). Change: `wga_mma64_x2` batches both in ONE warpgroup commit
+(s+s2 banks: dkv 96->128, dq 64->96 live), and with both banks live the
+softmax + dS ALU fuse into one pass — dkv drops the P smem re-read, dq drops
+the P park/re-read entirely (dS written once, P never materialized;
+`bf2f(f2bf(p))` preserves the exact old rounding). Deletes one full drain +
+one smem round-trip per 64-row stage from the serial chain. Validation:
+test_ops + test_model green, dqkv wgmma error unchanged (7.535e-03), losses
+bit-identical every shape, REG:255 STACK:32 LOCAL:0, executed local-LD = 0
+(the spill gate). Gauntlet patched-vs-control
+(`mkv3-p4b-dqdkv-sdp-batch-gauntlet-20260706T095454Z.log`): nano -5.6,
+small -9.9, S2048 -2.9, S3072 -13.2, S4096 -20.0, **S8192 -113.1**; reverse
+order S8192 -93.8 (`...-seal-*.log`); dkv-only intermediate was -40/-49
+(`mkv3-p4b-dkv-sdp-batch-*.log`), dq added the rest. Next slope-changer for
+the remaining bwd-attention gap (~180 TF/s effective vs flash ~500):
+cross-stage pipelining (issue stage t+1's S/dP batch during stage t's
+accumulation drain) — needs P/dS smem doubling and commit-group bookkeeping;
+scoped, unclaimed.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
