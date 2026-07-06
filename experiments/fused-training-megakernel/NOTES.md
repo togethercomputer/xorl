@@ -4111,7 +4111,9 @@ Evidence:
 
 Validation:
 - `test_model.py` PASS (`mkv3-p4b-n256-stage3-testmodel-20260706T0208Z.log`).
-- `test_ops.py` PASS (`mkv3-p4b-n256-stage3-testops-20260706T0213Z.log`).
+- `test_ops.py` now has permanent bit25 coverage for NT stage3 with a 128-column
+  tail plus fp32 NN/TN stage3 dispatch; PASS
+  (`mkv3-p4b-n256-stage3-testops2-20260706T0219Z.log`).
 - `py_compile`, `ruff check`, and `git diff --check` passed.
 
 Follow-up scheduler check: post-stage3 `MK_COLD_CAP` resweep
