@@ -202,7 +202,7 @@ __device__ __forceinline__ void wga_mma64_x2(const bf16* A1, const bf16* B1,
 // args: {qkv_r, O, LSE, S, nq, nkv, D(=64), scale_bits}; tile = qt*nq + qh (qt-outer,
 // 128-row tiles -> O/LSE complete in row order; band = nq tiles per 128 rows).
 
-struct __align__(16) AttnWgFwdSmem {  // 64KB (80KB under MK_ATTN_PIPE: P ping-pong)
+struct __align__(16) AttnWgFwdSmem {  // 80KB (112KB under MK_ATTN_PIPE: P ping-pong)
   bf16 Q[2][4096];  // [wg]    q rows, K-view A of S = Q K^T
 #ifdef MK_ATTN_PIPE
   bf16 P[2][2][4096];  // [wg][stage&1]  P ping-pong: O-mma(t) reads P[t&1] while
@@ -211,8 +211,8 @@ struct __align__(16) AttnWgFwdSmem {  // 64KB (80KB under MK_ATTN_PIPE: P ping-p
   bf16 V[4][4096];     //          reads (t-1)%4 — a 2-ring would alias (112KB total)
 #else
   bf16 P[2][4096];  // [wg]    P [q,kv], K-view A of O += P V
-  bf16 K[2][4096];  // [stage] kv rows, K-view B (= K^T)
-  bf16 V[2][4096];  // [stage] kv rows, MN-view B (= V)
+  bf16 K[3][4096];  // [stage%3] kv rows, K-view B (= K^T); 3-ring so the in-flight
+  bf16 V[3][4096];  // [stage%3] PV(t) survives iter t+1's refill (targets (t+2)%3)
 #endif
 };
 
@@ -477,10 +477,18 @@ __device__ __noinline__ void op_attn_fwd_wg(const Instr& I, int tile, void** buf
   const int r0 = w * 16 + (ln >> 2);  // local row (+8 for i=1)
   const int cb = (ln & 3) * 2;        // col base within an 8-col group
 
+  // Cross-stage PV pipeline (v3 P4b fwdpipe, spec 1055Z+1115Z): PV(t) is committed
+  // WITHOUT a drain and retired at iter t+1 by the wait<0> right before the softmax
+  // ALU reads s — in-order retirement means that wait retires PV(t) then S(t+1), so
+  // the flying PV(t) overlaps iter t+1's cp.async wait + consumer_syncs + S issue.
+  // Hazards: PV(t) reads V[t%3] + P[wg]; iter t+1 refills (t+2)%3 (disjoint under
+  // the 3-ring) and rewrites P[wg] only after the wait<0>. A skip stage (WG0's
+  // fully-masked tail, always the FINAL stage) commits nothing, so its pending
+  // PV(t-1) drains at the unconditional post-loop wait<0>.
   const int n_stages = (q0 / 64 + 2 - c + C - 1) / C;
   for (int t = 0; t < n_stages; ++t) {
     const int k0 = (c + t * C) * 64;
-    if (t + 1 < n_stages) issue_kv_stage((c + (t + 1) * C) * 64, (t + 1) & 1);
+    if (t + 1 < n_stages) issue_kv_stage((c + (t + 1) * C) * 64, (t + 1) % 3);
     __pipeline_wait_prior(t + 1 < n_stages ? 1 : 0);
     consumer_sync();
     const bool skip = k0 > q0wg + 63;  // WG0's tail stage: fully masked
@@ -489,7 +497,8 @@ __device__ __noinline__ void op_attn_fwd_wg(const Instr& I, int tile, void** buf
       float s[32];
 #pragma unroll
       for (int i = 0; i < 32; ++i) s[i] = 0.0f;
-      wga_mma64<WGA_MMA_KK, false, false>(sm.Q[wg], sm.K[t & 1], s);  // S = Q K^T
+      wga_mma64_issue<WGA_MMA_KK, false, false>(sm.Q[wg], sm.K[t % 3], s);  // S = Q K^T
+      cute::warpgroup_wait<0>();  // retires PV(t-1), then S(t); s readable below
       const bool masked = k0 + 63 > q0wg;                             // diagonal stage
       float rmax[2] = {-INFINITY, -INFINITY};
 #pragma unroll
@@ -543,10 +552,13 @@ __device__ __noinline__ void op_attn_fwd_wg(const Instr& I, int tile, void** buf
         for (int i = 0; i < 2; ++i)
 #pragma unroll
           for (int j = 0; j < 2; ++j) o[n8 * 4 + i * 2 + j] *= alpha[i];
-      wga_mma64<WGA_MMA_KMN, false, true>(sm.P[wg], sm.V[t & 1], o);  // O += P V
+      // O += P V, committed with NO drain: flies across the bottom sync and iter
+      // t+1's (t+2)%3 refill; retired at iter t+1's wait<0> (or post-loop).
+      wga_mma64_issue<WGA_MMA_KMN, false, true>(sm.P[wg], sm.V[t % 3], o);
     }
-    consumer_sync();  // both WGs done reading K/V stage t before refill
+    consumer_sync();  // stage-(t-1) reads retired in both WGs -> (t+2)%3 refill safe
   }
+  cute::warpgroup_wait<0>();  // drain the final in-flight PV (no-op if none pending)
 
   // epilogue: LSE + O from registers; O staged through smem for coalesced stores.
   // C > 1 chunks write the flash-decoding partial instead: locally-normalized O_c
@@ -573,6 +585,7 @@ __device__ __noinline__ void op_attn_fwd_wg(const Instr& I, int tile, void** buf
     }
   }
   float* Cs = reinterpret_cast<float*>(smem_raw);  // overlay [128][68] over dead tiles
+  consumer_sync();  // BOTH WGs past their post-loop drain: no wgmma still reads Q/P
 #pragma unroll
   for (int n8 = 0; n8 < 8; ++n8)
 #pragma unroll

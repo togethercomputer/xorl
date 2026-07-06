@@ -4894,6 +4894,24 @@ with new wins 15/16 (`mkv3-p4b-drow-n256-qwen-main-ab-20260706T1247Z.log`).
 Main `test_ops.py` passed with the new n256 Drow cases
 (`mkv3-p4b-drow-n256-qwen-main-testops-20260706T1249Z.log`).
 
+## ATTN_FWD_WG cross-stage PV pipeline (session 2853e0de + subagent, 20260706T1245Z)
+
+Triple-buffered K/V (AttnWgFwdSmem 64->80KB, fits the 100KB carveout), S
+issued via the existing no-wait helper with one `warpgroup_wait<0>` before the
+softmax ALU (in-order retirement covers PV(t-1)+S(t)), PV commits with no
+drain and flies across the bottom consumer_sync and the (t+2)%3 refill
+(disjoint by parity); post-loop drain + a NEW consumer_sync before the fp32
+epilogue overlay (cross-WG P/Q overlay hazard found in implementation).
+Op-level O/LSE BITWISE identical; test_ops/test_model green; REG:255 STACK:32
+LD-gate 0 at small. Isolated A/B vs clean a7a75d3 both orders: S8192
+**-53.6/-41.0**, small -18.3/-15.7, S4096/nano noise. Far below the ~-270
+fwd-bucket hope — the PV drain was mostly absorbed by co-scheduling
+(absorption ledger, 8th entry) — kept as a safe monotone win. NOTE
+(follow-up, unclaimed): S8192 shows 786432 local-LD sectors in BOTH arms —
+pre-existing since the 43803eb n256 head route (proven by control equality);
+small remains 0. Worth an ncu source pass on the n256 impls at long-S.
+Logs: mkv3-p4b-fwdpipe-*-20260706T122413Z.log.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
