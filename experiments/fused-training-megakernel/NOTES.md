@@ -5522,6 +5522,30 @@ forced old both orders: default-minus-old `-29.30us` and `-44.29us`, old wins
 `mkv3-p4b-s8192-combine-unroll-promoted-20260706T1808Z.log`. Detail note:
 `results/operator-gap/s8192-combine-unroll-promote.md`.
 
+Post-combine-unroll S8192 fwd-band retune no-go: because the promoted combine
+unroll made `OP_ATTN_COMBINE` cheaper and the post-`8135329` profile still had
+`ATTN_FWD_WG` as a large on-path bucket, rechecked nearby
+`MK_ATTN_FWD_BAND` targets against the current H256/D64/S8192 T64 default. The
+candidate helper reports `candidate - default`, so positive values keep T64.
+Smaller third-band routes lost: T48 `+58.48us`/`+78.26us` (`0/16`, `0/16`),
+T56 `+7.63us`/`+15.65us` (`3/16`, `2/16`), T60 `+74.90us` (`0/16`), and T63
+`+119.74us` (`0/16`). Larger two-band shifts also lost: T66
+`+8.56us`/`+11.50us` (`8/16`, `3/16`) and T72 `+399.79us`/`+436.29us`
+(`0/16`, `0/16`). Parity stayed within the helper threshold for every sampled
+candidate (worst selected grad rel at most `0.015114`). Keep
+`_ATTN_FWD_BAND_T[8192] = 64`; no source change. Logs:
+`mkv3-p4b-s8192-fwdband-postcombine-t48-default-first-20260706T1819Z.log`,
+`mkv3-p4b-s8192-fwdband-postcombine-t48-band-first-20260706T1819Z.log`,
+`mkv3-p4b-s8192-fwdband-postcombine-t56-default-first-20260706T1819Z.log`,
+`mkv3-p4b-s8192-fwdband-postcombine-t56-band-first-20260706T1819Z.log`,
+`mkv3-p4b-s8192-fwdband-postcombine-t60-default-first-20260706T1819Z.log`,
+`mkv3-p4b-s8192-fwdband-postcombine-t63-default-first-20260706T1819Z.log`,
+`mkv3-p4b-s8192-fwdband-postcombine-t66-default-first-20260706T1819Z.log`,
+`mkv3-p4b-s8192-fwdband-postcombine-t66-band-first-20260706T1819Z.log`,
+`mkv3-p4b-s8192-fwdband-postcombine-t72-default-first-20260706T1819Z.log`, and
+`mkv3-p4b-s8192-fwdband-postcombine-t72-band-first-20260706T1819Z.log`. Detail
+note: `results/operator-gap/s8192-fwdband-postcombine-retune-nogo.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
