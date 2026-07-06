@@ -5309,6 +5309,17 @@ Logs: `mkv3-p4b-small-aflog-post-directbf16-20260706T1702Z.log`,
 `mkv3-p4b-score-small-aflog-precise-default-20260706T1702Z.log`. Detail note:
 `results/operator-gap/small-aflog-post-directbf16-promote.md`.
 
+Post-fast-log small attention dQ float2 recheck: after the precise-log default
+made `ATTN_DQ_WG` more exposed in the profile, forced
+`MK_ATTN_DQ_FLOAT2_STORE=1` for exact H512/S1024 small. The variant compiled the
+expected `_adqf2` extension, kept route shape unchanged (`n_instr=288`,
+`critical_path=144`, `gated=127`, `ATTN_DQ_WG=8/512`), and stayed parity-clean
+(`loss_diff=-1.91e-06` / `+9.54e-07`, worst selected grad rel `<4.7e-07`), but
+lost both orders: default-minus-float2 `-3.18us` and `-5.76us`, float2 wins
+`33/80` and `27/80`. Keep `_adqf2` limited to the existing H256 long-shape
+gates. Log: `mkv3-p4b-small-dqf2-post-aflog-20260706T1709Z.log`. Detail note:
+`results/operator-gap/small-dqf2-post-aflog-nogo.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
