@@ -4809,6 +4809,37 @@ After applying the same patch in the main checkout, the qwen activated-path A/B
 remained positive: median +28.7us old-minus-new, mean +38.3us, new wins 20/24
 (`mkv3-p4b-qkbwd-d128-cache-main-qwen-ab-20260706T1412Z.log`).
 
+## Qwen MLP dX m64n256 BF16 NN route (this session, 20260706T1515Z)
+
+Promoted a qwen-only BF16-output use of the existing m64n256 NN/TN direct body
+for the two remaining on-path MLP dX rows:
+`GEMMNN 1024x9728x2560` (wd dX) and `GEMMNN 1024x2560x19456` (wgu dX). Current
+main routed both through n128 (`flags=4224`, tiles 608/160). The new route is
+exact-gated by `wgmma_n256_nn_bf16_ok`, uses the qwen stage3+n-major n256 bits,
+and can be disabled with `MK_WGMMA_N256_NN_BF16=0`. The earlier small-shape
+`GEMMNN 1024x512x3072` n256 BF16 probe remains rejected; this gate intentionally
+does not cover it.
+
+Scratch route check changed only those rows: tiles `608 -> 304` and `160 -> 80`,
+with `n_instr=47`, `critical_path=26`, and the existing qwen 148KB smem page.
+Qwen A/B against forced-old was parity-clean under the standard model-style
+gradient scale (`loss_diff=-1.91e-06`, worst grad `emb` rel `3.05e-03`) and won
+both construction/timing orders: forced-old first median +120.5us old-minus-new,
+new wins 24/24 (`mkv3-p4b-qwen-n256-nn-bf16-ab-20260706T1502Z.log`); candidate
+first median +102.8us, new wins 24/24
+(`mkv3-p4b-qwen-n256-nn-bf16-reverse-20260706T1507Z.log`). Candidate profile
+measured step total 9220.1us vs the refreshed current-main 9314.2us, with the
+targeted MLP dX spans dropping to 502.5us and 314.0us
+(`mkv3-p4b-profile-qwen-n256-nn-bf16-20260706T1510Z.log`). Validation:
+`diff --check`, `py_compile`, `ruff`, focused n256 BF16 NN `test_ops.py`, and
+full `test_model.py` passed in the scratch worktree.
+After applying the same patch in main, the qwen A/B remained positive:
+`loss_diff=+2.86e-06`, worst grad `emb` rel `3.05e-03`, median +98.7us
+old-minus-new, new wins 16/16
+(`mkv3-p4b-qwen-n256-nn-bf16-main-ab-20260706T1519Z.log`). Main `test_ops.py`
+also passed with the new BF16 n256 NN cases
+(`mkv3-p4b-qwen-n256-nn-bf16-main-testops-20260706T1524Z.log`).
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

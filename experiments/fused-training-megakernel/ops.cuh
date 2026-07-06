@@ -697,18 +697,18 @@ __device__ __noinline__ void op_gemm_wgmma_n256_direct_impl(const Instr& I, int 
   }
 }
 
-// m64n256 direct-store fp32 tile for exact qwen giant-vocab NN head-dX and TN dW
-// follow-ups. This keeps the 100KB page by skipping the fp32 epilogue slab. It is
-// deliberately narrow: fp32 output only, no split-K/acc/residual.
+// m64n256 direct-store tile for exact qwen giant-vocab NN head-dX / TN dW and
+// scratch-gated BF16 NN dX follow-ups. This keeps the 100KB page by skipping the
+// fp32 epilogue slab. It is deliberately narrow: no split-K/acc/residual.
 template <int STAGES>
 __device__ __noinline__ void op_gemm_wgmma_n256_nn_f32_impl(const Instr& I, int tile,
                                                             void** bufs, char* smem_raw) {
   namespace SG = cute::SM90::GMMA;
   const bf16* A = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
   const bf16* B = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
-  float* C = reinterpret_cast<float*>(bufs[I.args[2]]);
+  void* Cp = bufs[I.args[2]];
   const int M = I.args[3], N = I.args[4], K = I.args[5], flags = I.args[6];
-  if ((flags & 2) || !(flags & 8) || (flags & (4 | 16 | 32 | 256 | 1024 | 2048 | 8192))) {
+  if ((flags & 2) || (flags & (4 | 16 | 32 | 256 | 1024 | 2048 | 8192))) {
     return;
   }
 
@@ -726,6 +726,7 @@ __device__ __noinline__ void op_gemm_wgmma_n256_nn_f32_impl(const Instr& I, int 
   const int wg = tid / 128;
   const int wtid = tid % 128;
   const bool a_t = flags & 1;
+  const bool c_f32 = flags & 8;
   if (m0 >= M) return;
 
   auto issue_stage = [&](int k0, int st) {
@@ -790,8 +791,18 @@ __device__ __noinline__ void op_gemm_wgmma_n256_nn_f32_impl(const Instr& I, int 
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
       const int r = wg * 64 + w * 16 + l / 4 + 8 * i;
-      float2 out = make_float2(d[n8 * 4 + i * 2 + 0], d[n8 * 4 + i * 2 + 1]);
-      *reinterpret_cast<float2*>(&C[(int64_t)(m0 + r) * N + n0 + n8 * 8 + cb]) = out;
+      const int64_t idx = (int64_t)(m0 + r) * N + n0 + n8 * 8 + cb;
+      if (c_f32) {
+        float* C = reinterpret_cast<float*>(Cp);
+        float2 out = make_float2(d[n8 * 4 + i * 2 + 0], d[n8 * 4 + i * 2 + 1]);
+        *reinterpret_cast<float2*>(&C[idx]) = out;
+      } else {
+        bf16* C = reinterpret_cast<bf16*>(Cp);
+        __nv_bfloat162 out;
+        out.x = f2bf(d[n8 * 4 + i * 2 + 0]);
+        out.y = f2bf(d[n8 * 4 + i * 2 + 1]);
+        *reinterpret_cast<__nv_bfloat162*>(&C[idx]) = out;
+      }
     }
   }
 }

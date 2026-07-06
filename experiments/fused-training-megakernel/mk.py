@@ -196,6 +196,30 @@ def wgmma_n256_nt_bf16_ok(M, N, K, flags):
     }
 
 
+def wgmma_n256_nn_bf16_ok(M, N, K, flags):
+    """Qwen NN bf16 dX m64n256 route.
+
+    A small-shape probe of `GEMMNN 1024x512x3072` lost decisively, so the
+    default only tries the two qwen4b-l1 on-path MLP dX rows that remain on
+    n128. Set MK_WGMMA_N256_NN_BF16=0 to force the old n128 route, or =1 to
+    force all structurally eligible NN bf16 routes for probing.
+    """
+    mode_env = os.environ.get("MK_WGMMA_N256_NN_BF16")
+    mode = -1 if mode_env is None else int(mode_env)
+    if mode == 0:
+        return False
+    if flags != 0:
+        return False
+    if M % 128 or N % 256 or K % 64:
+        return False
+    if mode == 1:
+        return True
+    return (M, N, K) in {
+        (1024, 9728, 2560),    # qwen4b-l1 wd dX
+        (1024, 2560, 19456),   # qwen4b-l1 wgu dX
+    }
+
+
 def gemm_tiles_wgmma_n256_direct(M, N):
     return (M // 128) * ((N + 255) // 256)
 
@@ -207,6 +231,8 @@ _QWEN_N256_STAGE3_SHAPES = {
     (1024, 6144, 2560),     # wqkv fwd
     (1024, 2560, 9728),     # wd fwd
     (1024, 2560, 4096),     # wo fwd
+    (1024, 9728, 2560),     # wd dX
+    (1024, 2560, 19456),    # wgu dX
     (151936, 2560, 1024),   # wlm dW
     (2560, 9728, 1024),     # wd dW
     (19456, 2560, 1024),    # wgu dW
