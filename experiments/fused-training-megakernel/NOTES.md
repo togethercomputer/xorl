@@ -5036,6 +5036,18 @@ measured `3421.6us`; refreshed score measured small `3425.9us` vs graph+
 `mkv3-p4b-profile-small-swiglu-4w-cacheoff-default-20260706T1530Z.log`,
 `mkv3-p4b-score-small-swiglu-4w-cacheoff-default-20260706T1530Z.log`.
 
+Follow-up local-load certification on the final `ab4ffde` cache-off default
+closed the 80d0053 advisory. SourceCounters on H512/S1024 small found **zero**
+local-load source rows and only local stores; the one-pass metric gate confirmed
+`l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum = 0` and
+`local_op_st.sum = 8,437,760` with `gpu__time_duration.sum = 3.95 ms` under NCU.
+So the earlier 2,906 local-load sectors belonged to the intermediate cached
+4W arm, not the final small default. No source change is needed; keep the
+shape-scoped LD law as small==0, long-S budgeted separately. Logs:
+`mkv3-p4b-small-source-ab4ffde-20260706T154058Z.{log,csv,ncu-rep}`,
+`mkv3-p4b-small-ldgate-ab4ffde-20260706T154439Z.{log,details.csv,ncu-rep}`.
+Detailed note: `results/operator-gap/small-swiglu-4w-cacheoff-ldgate.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
