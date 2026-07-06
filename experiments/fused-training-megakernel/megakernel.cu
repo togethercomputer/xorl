@@ -282,10 +282,35 @@ extern "C" __global__ void megakernel(const Instr* __restrict__ instrs,
 //   ctrl[0]=ready tail, ctrl[1]=finished instr count.
 // MK_DF_MAXNREG (build knob): entry register ceiling for the 240/24 producer-df
 // study — phase 1 measures the consumer-ceiling tax alone (no producer WG).
+// MK_DF_PRODUCER (build knob, step A executor shell): 384-thread megakernel_df.
+// WG0+WG1 (threads 0-255) run the df body unchanged at setmaxnreg.inc 240 (same
+// consumer codegen budget as MK_DF_MAXNREG=240); WG2 (threads 256-383) decs to 24
+// and PARKS on ctrl[1] (finished-instr count) until the run completes — step B
+// makes it the TMA mailbox producer. Entry __maxnreg__(168): any block >256
+// threads is charged 12 warps -> 65536/384 hard ceiling (see the megakernel_ws
+// comment block), and ptxas ignores setmaxnreg without an entry maxnreg (C7508).
+// Balance: 256*240 + 128*24 = 64512 <= 65536. Under this variant the executor
+// loop must sync exactly the 256 consumers (WG2 never reaches the loop): the
+// ops' named barrier (bar.sync 1, 256 == consumer_sync for threads 0-255)
+// replaces __syncthreads, which would count all 384 threads and hang.
+#if defined(MK_DF_PRODUCER) && defined(MK_DF_MAXNREG)
+#error "MK_DF_PRODUCER and MK_DF_MAXNREG are mutually exclusive (producer sets entry maxnreg 168)"
+#endif
+#if defined(MK_DF_PRODUCER) && defined(MK_OCC2)
+#error "MK_DF_PRODUCER and MK_OCC2 are mutually exclusive (384 threads vs __launch_bounds__(256,2))"
+#endif
+#ifdef MK_DF_PRODUCER
+#define MK_DF_NR __maxnreg__(168)
+#define MK_DF_THREADS 384
+#define mk_df_sync() consumer_sync()
+#else
 #ifdef MK_DF_MAXNREG
 #define MK_DF_NR __maxnreg__(MK_DF_MAXNREG)
 #else
 #define MK_DF_NR
+#endif
+#define MK_DF_THREADS 256
+#define mk_df_sync() __syncthreads()
 #endif
 extern "C" __global__ void MK_LB MK_DF_NR megakernel_df(const Instr* __restrict__ instrs, int n_instr,
                                          const int* __restrict__ dep_cnt,
@@ -346,6 +371,22 @@ extern "C" __global__ void MK_LB MK_DF_NR megakernel_df(const Instr* __restrict_
     }
   }
   grid.sync();
+
+#ifdef MK_DF_PRODUCER
+  // Warpgroup specialization (after the last grid.sync: WG2 participated in all
+  // init loops + both grid.syncs above; no grid.sync exists below). The branch is
+  // warpgroup-uniform, so each setmaxnreg is converged across its warpgroup as
+  // .sync.aligned requires. WG2 parks on gmem ctrl[1] — the same finished-instr
+  // count the consumer claim loop exits on (vctrl[1] >= n_instr) — and never
+  // touches a consumer barrier or the op smem.
+  if (threadIdx.x >= MK_CONSUMERS) {
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 24;");
+    volatile int* vfin = ctrl + 1;
+    while (*vfin < n_instr) __nanosleep(1024);
+    return;
+  }
+  asm volatile("setmaxnreg.inc.sync.aligned.u32 240;");  // blocks until WG2's dec frees regs
+#endif
 
   __shared__ int s_ins, s_t0, s_t1;
   __shared__ Instr s_I;  // claimed instr staged in smem (see the dispatch-loop note)
@@ -432,7 +473,7 @@ extern "C" __global__ void MK_LB MK_DF_NR megakernel_df(const Instr* __restrict_
       if (s_ins < 0 && last_cold) atomicSub(&ctrl[5], 1);  // exiting: release the slot
       last_ins = s_ins;
     }
-    __syncthreads();
+    mk_df_sync();
     const int ins = s_ins;
     if (ins < 0) break;  // everything finished
     const int t0 = s_t0, t1 = s_t1;
@@ -442,11 +483,11 @@ extern "C" __global__ void MK_LB MK_DF_NR megakernel_df(const Instr* __restrict_
     if (threadIdx.x < 3 + MK_MAX_ARGS)
       reinterpret_cast<int*>(&s_I)[threadIdx.x] =
           reinterpret_cast<const int*>(instrs + ins)[threadIdx.x];
-    __syncthreads();
+    mk_df_sync();
     if (iclk && threadIdx.x == 0 && t0 == 0) iclk[2 * ins] = mk_globaltimer();
     for (int t = t0; t < t1; ++t) {
       dispatch(s_I, t, bufs, smem);
-      __syncthreads();
+      mk_df_sync();
     }
     if (threadIdx.x == 0) {
       __threadfence();  // publish this instr's writes before enabling dependents
@@ -477,7 +518,7 @@ extern "C" __global__ void MK_LB MK_DF_NR megakernel_df(const Instr* __restrict_
         }
       }
     }
-    __syncthreads();
+    mk_df_sync();
   }
 }
 
@@ -1142,7 +1183,7 @@ void mk_run_df(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_of
     C10_CUDA_CHECK(cudaGetDevice(&dev));
     C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
     C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &per_sm, (void*)megakernel_df, 256, (int)smem_bytes));
+        &per_sm, (void*)megakernel_df, MK_DF_THREADS, (int)smem_bytes));
     TORCH_CHECK(per_sm >= 1, "megakernel_df does not fit an SM with smem=", smem_bytes);
     df_nblocks = sms * per_sm;
   }
@@ -1168,7 +1209,7 @@ void mk_run_df(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_of
                   (void*)&d_state,  (void*)&d_bufs,  (void*)&d_clk,   (void*)&bind0,
                   (void*)&ptr0,     (void*)&bind1,   (void*)&ptr1};
   auto stream = at::cuda::getCurrentCUDAStream();
-  mk_launch_cooperative(megakernel_df, dim3(df_nblocks), dim3(256), args,
+  mk_launch_cooperative(megakernel_df, dim3(df_nblocks), dim3(MK_DF_THREADS), args,
                         (size_t)smem_bytes, stream.stream(), d_instrs, n_instr,
                         d_dc, d_ao, d_ad, d_cs, d_cr, cold_cap, d_state, d_bufs,
                         d_clk, bind0, ptr0, bind1, ptr1);

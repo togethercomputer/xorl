@@ -528,6 +528,19 @@ def load_ext(
     # 240/24 producer-df study, phase 1: entry register ceiling on megakernel_df
     # (MK_DF_MAXNREG=240 etc.; 0/unset = plain 255). Probe-only knob.
     df_maxnreg = int(os.environ.get("MK_DF_MAXNREG", "0"))
+    # 240/24 producer-df study, step A: MK_DF_PRODUCER=1 builds the 384-thread
+    # megakernel_df executor shell (WG0+WG1 = consumers at setmaxnreg 240, WG2
+    # parked at 24 until step B's mailbox producer; entry __maxnreg__ 168; df
+    # launches at 384 threads host-side via the same define). Mutually exclusive
+    # with MK_DF_MAXNREG (the variant owns the entry ceiling) and MK_OCC2
+    # (__launch_bounds__(256,2) vs 384 threads).
+    df_producer = int(os.environ.get("MK_DF_PRODUCER", "0"))
+    assert not (df_producer and df_maxnreg), (
+        "MK_DF_PRODUCER and MK_DF_MAXNREG are mutually exclusive"
+    )
+    assert not (df_producer and occ2), (
+        "MK_DF_PRODUCER and MK_OCC2 are mutually exclusive"
+    )
     # D=64 qknorm-bwd fast path; MK_QKBWD_D64_CACHE=0 keeps the old generic loop for
     # A/B and bisects. Separate extension name because torch's cache is name-keyed.
     qkbc = int(os.environ.get("MK_QKBWD_D64_CACHE", "1"))
@@ -595,6 +608,7 @@ def load_ext(
         + ("_cefix" if ce_bwd_label_fixup else "")
         + (f"_idle{idle_ns}" if idle_ns != 256 else "")
         + (f"_dfnr{df_maxnreg}" if df_maxnreg else "")
+        + ("_dfprod" if df_producer else "")
         + ("_qkbc" if qkbc else "")
         + ("_qkbc128" if qkbc128 else "")
         + ("_swfma" if swiglu_fma_deriv else "") + ("_swb2w" if swiglu_bwd_2w else "")
@@ -633,6 +647,7 @@ def load_ext(
         + (["-DMK_CE_BWD_LABEL_FIXUP"] if ce_bwd_label_fixup else [])
         + ([f"-DMK_IDLE_NS={idle_ns}"] if idle_ns != 256 else [])
         + ([f"-DMK_DF_MAXNREG={df_maxnreg}"] if df_maxnreg else [])
+        + (["-DMK_DF_PRODUCER"] if df_producer else [])
         + (["-DMK_QKBWD_D64_CACHE"] if qkbc else [])
         + (["-DMK_QKBWD_D128_CACHE"] if qkbc128 else [])
         + (["-DMK_SWIGLU_FMA_DERIV"] if swiglu_fma_deriv else [])
