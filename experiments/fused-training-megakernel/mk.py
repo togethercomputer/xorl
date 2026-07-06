@@ -200,9 +200,11 @@ def wgmma_n256_nn_bf16_ok(M, N, K, flags):
     """Qwen NN bf16 dX m64n256 route.
 
     A small-shape probe of `GEMMNN 1024x512x3072` lost decisively, so the
-    default only tries the two qwen4b-l1 on-path MLP dX rows that remain on
-    n128. Set MK_WGMMA_N256_NN_BF16=0 to force the old n128 route, or =1 to
-    force all structurally eligible NN bf16 routes for probing.
+    default tries the exact qwen4b-l1 on-path MLP dX rows plus the qkv dX row.
+    Set MK_WGMMA_N256_NN_BF16=0 to force the old n128 route, or =1 to force all
+    structurally eligible NN bf16 routes for probing. For an isolated A/B
+    against the prior MLP dX commit, set MK_WGMMA_N256_QKVDX_BF16=0 to disable
+    only the qkv dX route.
     """
     mode_env = os.environ.get("MK_WGMMA_N256_NN_BF16")
     mode = -1 if mode_env is None else int(mode_env)
@@ -214,10 +216,14 @@ def wgmma_n256_nn_bf16_ok(M, N, K, flags):
         return False
     if mode == 1:
         return True
-    return (M, N, K) in {
+    if (M, N, K) in {
         (1024, 9728, 2560),    # qwen4b-l1 wd dX
         (1024, 2560, 19456),   # qwen4b-l1 wgu dX
-    }
+    }:
+        return True
+    qkvdx_env = os.environ.get("MK_WGMMA_N256_QKVDX_BF16")
+    qkvdx_on = True if qkvdx_env is None else bool(int(qkvdx_env))
+    return qkvdx_on and (M, N, K) == (1024, 2560, 6144)  # qwen4b-l1 wqkv dX
 
 
 def gemm_tiles_wgmma_n256_direct(M, N):
@@ -233,6 +239,7 @@ _QWEN_N256_STAGE3_SHAPES = {
     (1024, 2560, 4096),     # wo fwd
     (1024, 9728, 2560),     # wd dX
     (1024, 2560, 19456),    # wgu dX
+    (1024, 2560, 6144),     # wqkv dX
     (151936, 2560, 1024),   # wlm dW
     (2560, 9728, 1024),     # wd dW
     (19456, 2560, 1024),    # wgu dW

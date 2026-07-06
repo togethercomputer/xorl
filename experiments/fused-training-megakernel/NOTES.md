@@ -4840,6 +4840,32 @@ old-minus-new, new wins 16/16
 also passed with the new BF16 n256 NN cases
 (`mkv3-p4b-qwen-n256-nn-bf16-main-testops-20260706T1524Z.log`).
 
+## Qwen qkv dX m64n256 BF16 NN route (this session, 20260706T1235Z)
+
+Extended the qwen-only BF16-output m64n256 NN route to the remaining on-path
+qkv dX row: `GEMMNN 1024x2560x6144`. The route is still exact-shape gated by
+`wgmma_n256_nn_bf16_ok`; `MK_WGMMA_N256_NN_BF16=0` disables all BF16 NN n256
+probes, while the narrower `MK_WGMMA_N256_QKVDX_BF16=0` disables only this qkv
+dX addition for A/B against the prior MLP dX promotion.
+
+Scratch route check against `6ae088f` left the MLP dX rows unchanged and moved
+only qkv dX from n128 to qwen stage3+n-major n256:
+`tiles 160 -> 80`, flags `[7,12] -> [7,14,25,26]`, `n_instr=47`,
+`critical_path=26`, qwen smem still 148KB. The isolated qwen A/B was parity
+clean (`loss_diff=0`, worst grad `emb` rel `3.00e-03`) and won both
+construction orders: old-then-new median +21.7us old-minus-new, new wins 15/16;
+new-then-old median +27.1us, new wins 14/16
+(`mkv3-p4b-qwen-n256-qkvdx-ab-20260706T1230Z.log`). A profile with qkv enabled
+showed the targeted row span moving from 288.6us to 264.2us, with whole-step
+best profile time 9368.5us -> 9148.0us
+(`mkv3-p4b-profile-qwen-n256-qkvdx-20260706T1232Z.log`).
+After applying the same patch in main, the qwen A/B remained positive:
+`loss_diff=0`, worst grad `emb` rel `3.00e-03`, old-then-new median +25.6us
+old-minus-new with new wins 13/16, and new-then-old median +31.5us with new
+wins 15/16 (`mkv3-p4b-qwen-n256-qkvdx-main-ab-20260706T1233Z.log`). Main
+`test_ops.py` passed, including the n256 BF16 NN coverage
+(`mkv3-p4b-qwen-n256-qkvdx-main-testops-20260706T1235Z.log`).
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
