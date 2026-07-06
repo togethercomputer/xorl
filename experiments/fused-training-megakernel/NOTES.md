@@ -6002,6 +6002,20 @@ note: `results/operator-gap/small-headdx-skr-promote.md`; A/B drivers
 `results/headdx_skr_ab.py` (probe) and `results/headdx_skr_promoted_ab.py`
 (promoted default vs old).
 
+Small lm_head fwd n256 promotion (post-SKR resweep flip): after the head-dX SKR
+promotion restructured small's head region, the post-promotion profile ranked
+lm_head fwd (`GEMMNT 1024x16384x512.wg`, 1024 tiles = 8 waves) as small's top
+hop (141.7us span), and the previously-rejected n256 direct route flipped
+positive — the resweep law's textbook case (the 0928Z gauntlet had measured
+small REGRESSING on this exact knob). Env probe `MK_WGMMA_N256_DIRECT=1`:
+-33.5us 40/40 / -22.8us 40/40 both construction orders on clean GPU 3; gate
+widened with exact (1024, 16384, 512) in `wgmma_n256_direct_ok`; promoted
+default-vs-forced-old confirms old loses both orders (+11.1us 9/40, +33.8us
+2/40). Parity clean (worst emb 6.0e-03). Routing-only change (the n256 body
+compiles in every build) — no res-usage/LD surface. Paired small arm now
+~3258-3273us. Logs: mkv3-p4b-small-lmhead-n256-postskr-20260706T2218Z.log,
+mkv3-p4b-small-lmhead-n256-promote-check-20260706T2225Z.log.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

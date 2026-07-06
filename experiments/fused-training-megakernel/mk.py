@@ -185,9 +185,13 @@ def wgmma_n256_direct_ok(M, N, K, flags):
     if mode == 1:
         return True
     # long-S gauntlet head (H256/V8192): giant-N tile pays only at M>=3072
-    # (S3072 -59us, S4096 -39, S8192 -255; S<=2048/small regress — measured
-    # mkv3-p4b-n256head-gauntlet-20260706T092847Z.log)
+    # (S3072 -59us, S4096 -39, S8192 -255; S<=2048 regress — measured
+    # mkv3-p4b-n256head-gauntlet-20260706T092847Z.log). small's regression
+    # FLIPPED after the head-dX SKR promotion restructured its head region
+    # (resweep law): -33.5/-22.8us 40/40 both orders post-193a108
+    # (mkv3-p4b-small-lmhead-n256-postskr-20260706T2218Z.log).
     return (M, N, K) in {(1024, 151936, 2560),
+                         (1024, 16384, 512),  # small lm_head fwd (post-SKR)
                          (3072, 8192, 256), (4096, 8192, 256), (8192, 8192, 256)}
 
 
