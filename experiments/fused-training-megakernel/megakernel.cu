@@ -63,6 +63,8 @@ enum Op : int {
   OP_ATTN_FWD_WG128 = 32,
   OP_ATTN_DKV_WG128 = 33,
   OP_ATTN_DQ_WG128 = 34,
+  OP_EMBED_ZERO_ROWS = 35,
+  OP_COPY_I32 = 36,
 };
 
 __device__ __forceinline__ long long mk_globaltimer() {
@@ -157,6 +159,12 @@ __device__ __forceinline__ void dispatch(const Instr& I, int tile, void** bufs,
       break;
     case OP_EMBED_BWD:
       op_embed_bwd(I, tile, bufs);
+      break;
+    case OP_EMBED_ZERO_ROWS:
+      op_embed_zero_rows(I, tile, bufs);
+      break;
+    case OP_COPY_I32:
+      op_copy_i32(I, tile, bufs);
       break;
     case OP_INV_VALID:
       op_inv_valid(I, tile, bufs, smem);

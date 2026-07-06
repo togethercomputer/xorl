@@ -2197,6 +2197,33 @@ __device__ void op_embed_bwd(const Instr& I, int tile, void** bufs) {
   for (int i = mk_tid(); i < H; i += MK_CONSUMERS) atomicAdd(&de[i], bf2f(dx[i]));
 }
 
+// Sparse embedding-gradient clear. args: {prev_tok, tok, demb, H}; tile = row.
+// Clears rows that may be nonzero from the previous step plus rows that will receive
+// atomics in this step. Duplicate/current==previous rows are benign zero races.
+__device__ void op_embed_zero_rows(const Instr& I, int tile, void** bufs) {
+  const int H = I.args[3];
+  const int* prev_tok = reinterpret_cast<const int*>(bufs[I.args[0]]);
+  const int* tok = reinterpret_cast<const int*>(bufs[I.args[1]]);
+  float* demb = reinterpret_cast<float*>(bufs[I.args[2]]);
+  const int t_prev = prev_tok[tile];
+  const int t_cur = tok[tile];
+  float* de_prev = demb + (int64_t)t_prev * H;
+  float* de_cur = demb + (int64_t)t_cur * H;
+  for (int i = mk_tid(); i < H; i += MK_CONSUMERS) {
+    de_prev[i] = 0.0f;
+    de_cur[i] = 0.0f;
+  }
+}
+
+// args: {src, dst, n}; tile = MK_CHUNK-element chunk index.
+__device__ void op_copy_i32(const Instr& I, int tile, void** bufs) {
+  const int* src = reinterpret_cast<const int*>(bufs[I.args[0]]);
+  int* dst = reinterpret_cast<int*>(bufs[I.args[1]]);
+  const int n = I.args[2];
+  const int base = tile * MK_CHUNK, end = min(base + MK_CHUNK, n);
+  for (int i = base + mk_tid(); i < end; i += MK_CONSUMERS) dst[i] = src[i];
+}
+
 // Valid-label reciprocal for CE. Keeping this inside the cooperative launch avoids a
 // handful of host-side PyTorch kernels in MKQwen3.step(), while CE_FWD/BWD still read
 // the same scalar contract: inv_valid = 1 / max(count(labels >= 0), 1).

@@ -187,6 +187,7 @@ class MKQwen3:
 
         # ---- io + backward workspace ----
         self.tokens = torch.zeros(c.S, device=dev, dtype=torch.int32)
+        self.prev_tokens = torch.zeros(c.S, device=dev, dtype=torch.int32)
         self.labels = torch.full((c.S,), -100, device=dev, dtype=torch.int32)
         self.inv_valid = torch.zeros(1, device=dev, dtype=f32)
         self.loss = torch.zeros(1, device=dev, dtype=f32)
@@ -529,7 +530,15 @@ class MKQwen3:
         labels_buf = B(self.labels)
         self._tokens_buf = tokens_buf
         self._labels_buf = labels_buf
+        prev_tokens_buf = B(self.prev_tokens)
         skip_direct_dw_fill = bool(int(os.environ.get("MK_DW_DIRECT_SKIP_FILL", "1")))
+        sparse_embed_zero_env = os.environ.get("MK_EMB_SPARSE_ZERO")
+        sparse_embed_zero_default = c.L == 1 and c.H >= 1024 and c.V >= 32768
+        sparse_embed_zero = (
+            sparse_embed_zero_default
+            if sparse_embed_zero_env is None
+            else bool(int(sparse_embed_zero_env))
+        )
         direct_store_grads = set()
         if skip_direct_dw_fill:
             if dw_direct_store_overwrites(c.V, c.H, c.S):
@@ -546,9 +555,17 @@ class MKQwen3:
 
         # ---- wave 0: embedding gather + zero fp32 grad / loss / dX streams ----
         p.instr(mk.OP_EMBED_FWD, c.S, [tokens_buf, B(self.params["emb"]), X[0], c.H])
+        if sparse_embed_zero:
+            p.instr(
+                mk.OP_EMBED_ZERO_ROWS,
+                c.S,
+                [prev_tokens_buf, tokens_buf, B(self.grads["emb"]), c.H],
+            )
         if self.in_kernel_inv_valid:
             p.instr(mk.OP_INV_VALID, 1, [labels_buf, B(self.inv_valid), c.S])
         for name, g in self.grads.items():
+            if name == "emb" and sparse_embed_zero:
+                continue
             if name in direct_store_grads:
                 continue
             fill_zero(g)
@@ -1108,6 +1125,8 @@ class MKQwen3:
             p.wave()
 
         p.instr(mk.OP_EMBED_BWD, c.S, [B(self.tokens), B(W["dX"]), B(self.grads["emb"]), c.H])
+        if sparse_embed_zero:
+            p.instr(mk.OP_COPY_I32, mk.chunk_tiles(c.S), [tokens_buf, prev_tokens_buf, c.S])
         p.wave()
 
         self.prog = p.finalize(self.dev)

@@ -50,6 +50,8 @@ OP_RMSNORM_BWD_DX_H256 = 31  # H==256 fixed-width dx-only route (env probe)
 OP_ATTN_FWD_WG128 = 32  # D=128 wgmma attention fwd: 64-row tiles, redundant-S + split-D halves
 OP_ATTN_DKV_WG128 = 33  # D=128 wgmma attention dK/dV (same pattern)
 OP_ATTN_DQ_WG128 = 34  # D=128 wgmma attention dQ (same pattern)
+OP_EMBED_ZERO_ROWS = 35  # sparse grad:emb clear for previous/current token rows
+OP_COPY_I32 = 36  # small state copy, currently current tokens -> previous tokens
 
 GEMM_BM, GEMM_BN = 64, 128  # keep in sync with ops.cuh
 GEMM_N256_STAGE3_FLAG = 1 << 25
@@ -496,6 +498,10 @@ def _access_sets(op, args):
         return [0, 1], [2]
     if op == OP_EMBED_BWD:
         return [0, 1], [2]
+    if op == OP_EMBED_ZERO_ROWS:
+        return [0, 1], [2]
+    if op == OP_COPY_I32:
+        return [0], [1]
     if op == OP_INV_VALID:
         return [0], [1]
     if op == OP_CE_FWD:

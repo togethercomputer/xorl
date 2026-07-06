@@ -4281,6 +4281,78 @@ not beat the existing per-CTA SW128 cp.async body at the qwen K=2560 body shape.
 The bit26 N-major order remains a small standalone win and keeps the option open,
 but the next megakernel work should pivot away from n256 B-multicast plumbing.
 
+## v3 P4b qwen n256 scheduler follow-ups: NO-GO
+
+After rejecting paired TMA, two source-free follow-up probes checked whether the
+current n256 routes wanted a smaller scheduler adjustment instead of another body.
+
+1. Selective head-dX M-major: a monkeypatch cleared bit26 only for qwen head-dX
+   `(M,N,K)=(1024,2560,151936)` while leaving all other exact n256 rows N-major.
+   Parity stayed clean, but timing was order-mixed
+   (`mkv3-p4b-qwen-nmajor-headdx-mask-20260706T031350Z.log`): default-minus-variant
+   `+11.52us` in default-first order with weak `14/32` variant wins, then
+   `-68.35us` in variant-first order with only `7/32` variant wins. Keep head-dX
+   on the same default N-major policy as the rest of the qwen n256 rows.
+2. Global claim-batch retune: `MK_CLAIM=64/32/16` tried to raise the 80-tile
+   n256 rows from one-tile claims to 2/3/5 tile claims. This is decisively
+   wrong for qwen (`mkv3-p4b-qwen-claim-sweep-20260706T031422Z.log`):
+   claim64 regressed by `3359.17us` and `3596.67us`, claim32 by `9012.93us`
+   and `8998.40us`, and claim16 by `17797.44us` and `17584.43us` in the two
+   construction orders, all with `0` variant wins. Keep the default `MK_CLAIM`
+   behavior.
+
+Outcome: no n256 scheduler-only tweak was promoted. The remaining profitable
+qwen work came from support memory traffic, not wider tile claims.
+
+## v3 P4b qwen sparse embedding-gradient clear: exact-regime promotion
+
+The post-n256 qwen profile still showed a large support fill bucket. Five
+direct-store dW fills were already elided, but `grad:emb` was still fully
+zero-filled every step (`151936 x 2560` fp32 elements) even though embedding
+backward only atomically adds into rows touched by the current token batch.
+
+Implementation:
+- Added `OP_EMBED_ZERO_ROWS`: row-tiled sparse clear of both `prev_tokens[t]`
+  and `tokens[t]` embedding-gradient rows before `OP_EMBED_BWD`.
+- Added `OP_COPY_I32`: copies current tokens into a persistent `prev_tokens`
+  buffer at the end of the step.
+- The invariant is: after a step, only current-token rows may be nonzero. The
+  next step clears previous-token rows and current-token rows before atomic
+  accumulation. Duplicate tokens and previous/current overlap are benign zero
+  races.
+- Default gate is conservative and matches the qwen-class giant single-layer
+  regime: `L==1`, `H>=1024`, `V>=32768`. `MK_EMB_SPARSE_ZERO=0` restores the
+  old full embedding-gradient fill; `=1` force-enables the sparse clear for
+  validation/probing.
+
+Evidence:
+- Two-step changing-token parity with sparse forced passed all executors
+  (`mkv3-emb-sparse-two-step-parity-20260706T031614Z.log`): `df`, `waves`,
+  `df2`, and `ws` all kept loss diffs within `1.91e-06`; worst selected grad
+  rel stayed below `5.88e-03`; nonzero embedding-gradient row counts matched.
+- Initial qwen env A/B (`mkv3-p4b-qwen-emb-sparse-ab-20260706T031837Z.log`)
+  changed qwen from `n_instr=46`, `FILL_F32=10` to `n_instr=47`, `FILL_F32=9`,
+  `EMBED_ZERO_ROWS=1`, `COPY_I32=1`; parity was clean across two token batches
+  and timing won both orders: default-minus-sparse `+234.46us` and `+254.32us`,
+  `32/32` sparse wins in both.
+- Promoted-default vs forced old (`mkv3-p4b-qwen-emb-sparse-default-ab-20260706T032116Z.log`):
+  unset default emits sparse clear, `MK_EMB_SPARSE_ZERO=0` restores old full fill.
+  Old-minus-default was `+259.01us` and `+234.91us`, with `32/32` default wins in
+  both orders; selected grad rel stayed below `3.37e-07` and embedding nonzero row
+  counts matched (`1021/1021`).
+- Fresh qwen profile (`mkv3-p4b-qwen-emb-sparse-profile-20260706T032129Z.log`)
+  measured `10159.6us` best total. The old off-path `FILL_F32` bucket no longer
+  appears in the top eight; `EMBED_ZERO_ROWS` appears as a small `42.2us` off-path
+  support op.
+
+Validation:
+- `test_ops.py` PASS (`mkv3-emb-sparse-testops-20260706T032141Z.log`).
+- `MK_EMB_SPARSE_ZERO=1 test_model.py` PASS
+  (`mkv3-emb-sparse-testmodel-20260706T032400Z.log`), covering rerun stability,
+  `waves`, `df2`, `ws`, and SGD sanity with the sparse path forced on non-qwen
+  shapes.
+- `py_compile`, `ruff check`, and `git diff --check` passed.
+
 ## v3 P4b D=128 dQ register-A feed: NO-GO in-model
 
 The operator-gap standalone `attn_dq_d128_rf` result was ported narrowly onto
