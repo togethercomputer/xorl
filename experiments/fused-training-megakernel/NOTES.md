@@ -4251,6 +4251,36 @@ and have the elected CTA issue the B TMA multicast for the pair, with each CTA
 keeping its own A load and local GMMA. This is the concrete mechanism that the
 bit26 N-major tile order prepared for.
 
+## v3 P4b production-shaped n256 pair TMA probe: NO-GO for current body
+
+`n256_pair_tma_probe.py` moved beyond the minimal primitive and ran a full grid
+of 2-CTA clusters, each cluster computing adjacent 128-row M bands for one
+256-column B tile. It compares:
+- `cpasync`: current-style duplicated per-CTA B `cp.async` loads.
+- `tma-sync`: rank0 TMA multicast with a conservative cluster sync before each
+  TMA issue.
+- `tma-nosync`: rank0 TMA multicast after local mbarrier arming, relying on
+  paired-CTA lockstep and skipping the per-stage cluster sync.
+
+Evidence:
+- Smoke shape (`mkv3-n256-pair-tma-nosync-smoke-20260706T030736Z.log`):
+  all three variants parity-clean (`max_abs=1.907349e-05`); K512 timings were
+  cpasync `10.981us`, tma-sync `18.746us`, tma-nosync `12.492us`.
+- Qwen-shaped body (`mkv3-n256-pair-tma-nosync-qwen-20260706T030736Z.log`):
+  full 66 clusters, M=16896, N=256, K=2560, 20 reps. cpasync `44.070us`
+  (502.5 TF), tma-sync `80.608us`, tma-nosync `46.722us`.
+- Reversed-order qwen check
+  (`mkv3-n256-pair-tma-nosync-qwen-rev-20260706T030736Z.log`) confirmed the
+  no-go: tma-nosync medians `47.451us` and `47.868us`; cpasync medians
+  `44.164us` and `44.382us`.
+
+Outcome: do not spend the scheduler/ABI complexity to integrate cluster-paired
+TMA multicast into the current n256 direct body. The primitive is correct, but
+without a decoupled producer warp or a different ring protocol, the TMA path does
+not beat the existing per-CTA SW128 cp.async body at the qwen K=2560 body shape.
+The bit26 N-major order remains a small standalone win and keeps the option open,
+but the next megakernel work should pivot away from n256 B-multicast plumbing.
+
 ## v3 P4b D=128 dQ register-A feed: NO-GO in-model
 
 The operator-gap standalone `attn_dq_d128_rf` result was ported narrowly onto
