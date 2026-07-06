@@ -4449,6 +4449,36 @@ wins in reverse (`mkv3-p4b-qwen-allhot-postclaim1-ab-20260706T040318Z.log`).
 Keep hot/cold criticality; the remaining qwen gap is structural n256/rowop work,
 not ready-ring policy.
 
+Qwen SwiGLU cached-sigmoid + two-warp backward: PROMOTED. The post-claim1
+profile showed qwen's one-warp `SWIGLU_BWD` still on path at `5.8us` wait plus
+`227.9us` span (`mkv3-p4b-qwen-d128claim1-profile-20260706T035905Z.log`), so a
+source-free `MK_SWIGLU_CACHE_SIG=1 MK_SWIGLU_BWD_2W=1` A/B checked whether the
+existing H256/H512 route transfers to the H2560 qwen MLP. Route/parity were
+clean: the forced route kept `n_instr=47`, `critical_path=26`, `gated=14`,
+`waves=26`, changed `swsig=False`/`SWIGLU_BWD=1/128` to
+`swsig=True`/`SWIGLU_BWD_2W=1/256`, kept D128 attention claims at `1/1/1`, and
+kept loss diffs within `2.86e-06` with worst selected-gradient rel
+`6.29e-03` on sparse `grad:emb`. Timing won both construction orders:
+default-minus-forced-new was `+302.45us` median / `+305.85us` paired with
+`32/32` wins, then `+314.83us` median / `+300.90us` paired with `32/32` wins
+in reverse (`mkv3-p4b-qwen-swiglu-cache2w-ab-20260706T040611Z.log`).
+
+The production gate is exact qwen4b-l1
+`(H,S,I,V,nq,nkv,D,L)=(2560,1024,9728,151936,32,8,128,1)` via
+`_QWEN_L1_SWIGLU_CACHED_2W`; `MK_SWIGLU_CACHE_SIG=0 MK_SWIGLU_BWD_2W=0` restores
+the old one-warp route for A/B. Patched-default vs forced-old timing kept the
+win: default was the cached/2W route, forced-old was `SWIGLU_BWD=1/128`, parity
+was clean (loss diffs `+3.81e-06`, worst selected-gradient rel `6.25e-03` on
+`grad:emb`), and default beat old by `304.50us` and `313.41us` medians with
+forced-old winning `0/32` in both orders
+(`mkv3-p4b-qwen-swiglu-cache2w-default-ab-20260706T041135Z.log`). Validation:
+`py_compile`, `git diff --check`, and `test_model.py` passed
+(`mkv3-p4b-qwen-swiglu-cache2w-testmodel-20260706T041135Z.log`). Fresh qwen
+profile after promotion measured total `9865.4us`, with `SWIGLU_BWD_2W`
+down to `5.2us` wait plus `114.2us` span; the remaining qwen leaders are still
+the giant n256 head-dX/lm-head rows and MLP GEMMs
+(`mkv3-p4b-qwen-swiglu-cache2w-profile-20260706T041135Z.log`).
+
 Qwen head-dX n256 split-K probe: NO-GO, source reverted. The top current qwen
 hop is still the 80-tile n256 direct `dlogits @ Wlm` row
 (`GEMMNN 1024x2560x151936.wg`), so a temporary default-off
