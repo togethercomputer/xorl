@@ -52,6 +52,7 @@ OP_ATTN_DKV_WG128 = 33  # D=128 wgmma attention dK/dV (same pattern)
 OP_ATTN_DQ_WG128 = 34  # D=128 wgmma attention dQ (same pattern)
 
 GEMM_BM, GEMM_BN = 64, 128  # keep in sync with ops.cuh
+GEMM_N256_STAGE3_FLAG = 1 << 25
 FILL_CHUNK = 16384  # elements per fill/cvt work item (MK_CHUNK in ops.cuh)
 
 
@@ -190,6 +191,33 @@ def wgmma_n256_nt_bf16_ok(M, N, K, flags):
 
 def gemm_tiles_wgmma_n256_direct(M, N):
     return (M // 128) * ((N + 255) // 256)
+
+
+_QWEN_N256_STAGE3_SHAPES = {
+    (1024, 151936, 2560),   # lm-head fwd
+    (1024, 2560, 151936),   # lm-head dX
+    (1024, 19456, 2560),    # wgu fwd
+    (1024, 6144, 2560),     # wqkv fwd
+    (1024, 2560, 9728),     # wd fwd
+    (1024, 2560, 4096),     # wo fwd
+    (151936, 2560, 1024),   # wlm dW
+    (2560, 9728, 1024),     # wd dW
+    (19456, 2560, 1024),    # wgu dW
+    (2560, 4096, 1024),     # wo dW
+    (6144, 2560, 1024),     # wqkv dW
+}
+
+
+def wgmma_n256_stage3_flag(M, N, K):
+    """3-stage ring flag for exact qwen n256 direct routes.
+
+    The smem footprint is 144KB before the 1KB alignment pad, so this is only valid
+    under the qwen 148KB launch carveout. The model builder owns the env gate and
+    matching smem request; this helper only guards exact n256 shapes.
+    """
+    if M % 128 or K % 64:
+        return 0
+    return GEMM_N256_STAGE3_FLAG if (M, N, K) in _QWEN_N256_STAGE3_SHAPES else 0
 
 
 def wgmma_n256_head_dx_ok(M, N, K, flags):

@@ -4067,6 +4067,53 @@ Evidence:
   (`mkv3-p4b-dwskipfill-testops-20260706T0154Z.log`), `py_compile`,
   `ruff check`, and `git diff --check` passed.
 
+## v3 P4b qwen n256 3-stage operand ring: exact-route promotion
+
+The qwen4b-l1 default already needs a 148KB dynamic-smem page for the D=128 dQ
+row-split route, while the promoted n256 direct GEMMs still used a two-stage
+96KB operand page. A full staged 128x256 route remains blocked at 160KB, but a
+3-stage operand ring for the existing direct-store n256 bodies fits: each stage
+is 16KB of A plus 32KB of B, so three stages are 144KB before the existing 1KB
+alignment pad.
+
+Implementation:
+- `WgmmaSmemN256T<STAGES>` now backs both n256 direct kernels. The old path
+  instantiates `STAGES=2`; the new exact qwen path instantiates `STAGES=3` and
+  preissues `STAGES-1` cp.async groups, then waits with the correct shrinking
+  tail depth.
+- GEMM flag bit25 (`GEMM_N256_STAGE3_FLAG`) selects the 3-stage body under the
+  existing bit14 n256 route. It does not change tile counts or epilogues.
+- The model builder defaults `self.n256_stage3_enabled` on only for the exact
+  qwen4b-l1 shape and requests the 148KB launch page whenever that route is
+  enabled. `MK_WGMMA_N256_STAGE3=0` restores the previous two-stage n256 bodies.
+  The default affects all 11 qwen n256 rows: no-residual/residual NT forwards,
+  lm-head forward with its 128-column tail, head-dX, and the five direct-store
+  dW GEMMs.
+
+Evidence:
+- Route/default check (`mkv3-p4b-qwen-n256-stage3-route-20260706T0208Z.log`):
+  unset default emits all 11 n256 rows with bit25 and `smem=151552`; forced
+  `MK_WGMMA_N256_STAGE3=0` restores the old flags (`16514/24722/18562/16520/16521`)
+  while keeping the rest of the qwen program unchanged.
+- Qwen smoke (`mkv3-p4b-qwen-n256-stage3-smoke2-20260706T0206Z.log`): all 11
+  rows carry bit25 under the candidate, loss diff is `-9.53674316e-07`, and
+  chunked full-gradient comparison has worst relative diff `3.527165e-07`.
+- Paired timing (`mkv3-p4b-qwen-n256-stage3-ab-20260706T0207Z.log`): old
+  two-stage vs new 3-stage medians are old-minus-new `+424.24us` and
+  `+387.22us` in the two run orders, `32/32` wins each (`64/64` overall).
+- Matched profile comparison: forced old
+  `mkv3-p4b-qwen-n256-stage3-old-profile-20260706T0217Z.log` measured total
+  `10815.7us`; promoted stage3
+  `mkv3-p4b-qwen-n256-stage3-profile-20260706T0207Z.log` measured `10434.9us`.
+  The on-path lm-head forward span dropped `2756.3us -> 2574.6us`, head-dX
+  `3256.6us -> 3157.5us`, and the off-path vocab dW sink
+  `5779.2us -> 5107.1us`.
+
+Validation:
+- `test_model.py` PASS (`mkv3-p4b-n256-stage3-testmodel-20260706T0208Z.log`).
+- `test_ops.py` PASS (`mkv3-p4b-n256-stage3-testops-20260706T0213Z.log`).
+- `py_compile`, `ruff check`, and `git diff --check` passed.
+
 ## v3 P4b D=128 dQ register-A feed: NO-GO in-model
 
 The operator-gap standalone `attn_dq_d128_rf` result was ported narrowly onto

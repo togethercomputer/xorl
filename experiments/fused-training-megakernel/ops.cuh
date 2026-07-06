@@ -109,6 +109,8 @@ __device__ __forceinline__ void op_axpy_f32(const Instr& I, int tile, void** buf
 //               occupancy for small dW matrices (few M*N tiles, large K).
 //   flags bit14: direct m64n256 WGMMA tile; qwen-specific paths for NT lm-head with
 //                CE/LSE partials (bit11) and NN fp32 head-dX.
+//   flags bit25: opt-in 3-stage operand ring for the direct m64n256 tile. This needs
+//                the qwen 148KB launch page and is never emitted by generic routes.
 // args: {A, B, C, M, N, K, flags, res, sk}
 // tile id = (m_tile * n_tiles + n_tile) * sk + k_slice.
 
@@ -319,6 +321,7 @@ __device__ void op_gemm(const Instr& I, int tile, void** bufs, char* smem_raw) {
 #define WG_BM 128
 #define WG_BN 64
 #define WG_BK 64
+#define GEMM_N256_STAGE3_FLAG (1 << 25)
 
 struct WgmmaSmem {
   bf16 A[2][2][4][1024];  // [stage][row-half][k16-step][64x16 INTER block] = 32KB
@@ -328,10 +331,12 @@ struct WgmmaSmemN128 {
   bf16 A[2][2][4][1024];  // [stage][row-half][k16-step][64x64 SW128 slab] = 32KB
   bf16 B[2][8192];        // [stage][128 rows x 64 k elts SW128]           = 32KB
 };
-struct WgmmaSmemN256 {
-  bf16 A[2][2][4][1024];  // [stage][row-half][k16-step][64x64 SW128 slab] = 32KB
-  bf16 B[2][16384];       // [stage][256 rows x 64 k elts SW128]           = 64KB
+template <int STAGES>
+struct WgmmaSmemN256T {
+  bf16 A[STAGES][2][4][1024];  // per stage: A 16KB
+  bf16 B[STAGES][16384];       // per stage: B 32KB
 };
+using WgmmaSmemN256 = WgmmaSmemN256T<2>;
 // epilogue staging overlays the (dead-by-then) stage buffers: 128 x 68 fp32 = 34.8KB
 // (n128: 128 x 128 fp32 = 64KB over the 64KB n128 stages)
 #define WG_LDC 68
@@ -482,8 +487,9 @@ __device__ __forceinline__ void wg_mma_ktile_n256(const uint64_t (&da)[4], const
 // blocks; this variant keeps the 100KB page by skipping the coalesced fp32 epilogue slab.
 // It is deliberately narrow: NT only, bf16 output only, optional CE/LSE partials, and a
 // final 128-column tail. Broad direct-store use regressed in the standalone probe.
-__device__ __noinline__ void op_gemm_wgmma_n256_direct(const Instr& I, int tile, void** bufs,
-                                                       char* smem_raw) {
+template <int STAGES>
+__device__ __noinline__ void op_gemm_wgmma_n256_direct_impl(const Instr& I, int tile,
+                                                            void** bufs, char* smem_raw) {
   namespace SG = cute::SM90::GMMA;
   const bf16* A = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
   const bf16* B = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
@@ -494,7 +500,7 @@ __device__ __noinline__ void op_gemm_wgmma_n256_direct(const Instr& I, int tile,
 
   smem_raw = reinterpret_cast<char*>(
       (reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
-  WgmmaSmemN256& S = *reinterpret_cast<WgmmaSmemN256*>(smem_raw);
+  WgmmaSmemN256T<STAGES>& S = *reinterpret_cast<WgmmaSmemN256T<STAGES>*>(smem_raw);
   const int n_tiles = (N + 255) / 256;
   const int m0 = (tile / n_tiles) * WG_BM;
   const int n0 = (tile % n_tiles) * 256;
@@ -528,16 +534,19 @@ __device__ __noinline__ void op_gemm_wgmma_n256_direct(const Instr& I, int tile,
 #pragma unroll
   for (int i = 0; i < 128; ++i) d[i] = 0.0f;
   const int iters = K / WG_BK;
-  issue_stage(0, 0);
+#pragma unroll
+  for (int p = 0; p < STAGES - 1; ++p)
+    if (p < iters) issue_stage(p * WG_BK, p);
   for (int t = 0; t < iters; ++t) {
-    if (t + 1 < iters) issue_stage((t + 1) * WG_BK, (t + 1) & 1);
-    __pipeline_wait_prior(t + 1 < iters ? 1 : 0);
+    if (t + STAGES - 1 < iters)
+      issue_stage((t + STAGES - 1) * WG_BK, (t + STAGES - 1) % STAGES);
+    __pipeline_wait_prior(min(STAGES - 1, iters - t - 1));
     consumer_sync();
     uint64_t da[4], db[4];
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
-      da[s] = wg_desc_ksw(S.A[t & 1][wg], s);
-      db[s] = wg_desc_ksw(S.B[t & 1], s);
+      da[s] = wg_desc_ksw(S.A[t % STAGES][wg], s);
+      db[s] = wg_desc_ksw(S.B[t % STAGES], s);
     }
     wg_mma_ktile_n256<SG::MMA_64x256x16_F32BF16BF16_SS<SG::Major::K, SG::Major::K>>(
         da, db, d);
@@ -652,8 +661,9 @@ __device__ __noinline__ void op_gemm_wgmma_n256_direct(const Instr& I, int tile,
 // m64n256 direct-store fp32 tile for exact qwen giant-vocab NN head-dX and TN dW
 // follow-ups. This keeps the 100KB page by skipping the fp32 epilogue slab. It is
 // deliberately narrow: fp32 output only, no split-K/acc/residual.
-__device__ __noinline__ void op_gemm_wgmma_n256_nn_f32(const Instr& I, int tile, void** bufs,
-                                                       char* smem_raw) {
+template <int STAGES>
+__device__ __noinline__ void op_gemm_wgmma_n256_nn_f32_impl(const Instr& I, int tile,
+                                                            void** bufs, char* smem_raw) {
   namespace SG = cute::SM90::GMMA;
   const bf16* A = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
   const bf16* B = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
@@ -665,7 +675,7 @@ __device__ __noinline__ void op_gemm_wgmma_n256_nn_f32(const Instr& I, int tile,
 
   smem_raw = reinterpret_cast<char*>(
       (reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
-  WgmmaSmemN256& S = *reinterpret_cast<WgmmaSmemN256*>(smem_raw);
+  WgmmaSmemN256T<STAGES>& S = *reinterpret_cast<WgmmaSmemN256T<STAGES>*>(smem_raw);
   const int n_tiles = N / 256;
   const int m0 = (tile / n_tiles) * WG_BM;
   const int n0 = (tile % n_tiles) * 256;
@@ -707,16 +717,19 @@ __device__ __noinline__ void op_gemm_wgmma_n256_nn_f32(const Instr& I, int tile,
 #pragma unroll
   for (int i = 0; i < 128; ++i) d[i] = 0.0f;
   const int iters = K / WG_BK;
-  issue_stage(0, 0);
+#pragma unroll
+  for (int p = 0; p < STAGES - 1; ++p)
+    if (p < iters) issue_stage(p * WG_BK, p);
   for (int t = 0; t < iters; ++t) {
-    if (t + 1 < iters) issue_stage((t + 1) * WG_BK, (t + 1) & 1);
-    __pipeline_wait_prior(t + 1 < iters ? 1 : 0);
+    if (t + STAGES - 1 < iters)
+      issue_stage((t + STAGES - 1) * WG_BK, (t + STAGES - 1) % STAGES);
+    __pipeline_wait_prior(min(STAGES - 1, iters - t - 1));
     consumer_sync();
     uint64_t da[4], db[4];
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
-      da[s] = a_t ? wg_desc_mnsw(S.A[t & 1][wg], s) : wg_desc_ksw(S.A[t & 1][wg], s);
-      db[s] = wg_desc_mnsw128(S.B[t & 1], s);
+      da[s] = a_t ? wg_desc_mnsw(S.A[t % STAGES][wg], s) : wg_desc_ksw(S.A[t % STAGES][wg], s);
+      db[s] = wg_desc_mnsw128(S.B[t % STAGES], s);
     }
     if (a_t)
       wg_mma_ktile_n256<SG::MMA_64x256x16_F32BF16BF16_SS<SG::Major::MN, SG::Major::MN>>(
@@ -929,10 +942,17 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
   void* Cp = bufs[I.args[2]];
   const int M = I.args[3], N = I.args[4], K = I.args[5], flags = I.args[6];
   if (flags & 16384) {
-    if (flags & 2)
-      op_gemm_wgmma_n256_direct(I, tile, bufs, smem_raw);
-    else
-      op_gemm_wgmma_n256_nn_f32(I, tile, bufs, smem_raw);
+    if (flags & 2) {
+      if (flags & GEMM_N256_STAGE3_FLAG)
+        op_gemm_wgmma_n256_direct_impl<3>(I, tile, bufs, smem_raw);
+      else
+        op_gemm_wgmma_n256_direct_impl<2>(I, tile, bufs, smem_raw);
+    } else {
+      if (flags & GEMM_N256_STAGE3_FLAG)
+        op_gemm_wgmma_n256_nn_f32_impl<3>(I, tile, bufs, smem_raw);
+      else
+        op_gemm_wgmma_n256_nn_f32_impl<2>(I, tile, bufs, smem_raw);
+    }
     return;
   }
   if (flags & 4096) {
