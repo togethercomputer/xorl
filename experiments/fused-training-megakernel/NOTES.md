@@ -5621,6 +5621,34 @@ and `git diff --check`. Logs:
 `mkv3-p4b-qwen-n256-mbar-testops-20260706T1835Z.log`. Detail note:
 `results/operator-gap/qwen-n256-mbar-promote.md`.
 
+Qwen n256 NT mbar split promotion: follow-up profiling of the qwen `_gmbar`
+default showed the full mbarrier ring improved total time and head-dX, but the
+giant NT lm-head forward row was slower than the old refill loop. Added a
+separate compile-time sub-knob, `MK_GEMM_N256_NT_MBAR`, while leaving
+`MK_GEMM_MBAR_RING` responsible for the generic ring and qwen NN/TN n256
+coverage. Exact qwen4b-L1 now defaults to `_gmbar_n256ntold`:
+`MK_GEMM_MBAR_RING=1` with `MK_GEMM_N256_NT_MBAR=0`; the env override
+`MK_GEMM_N256_NT_MBAR=1` restores the full `_gmbar` path. Forced NT-old beat
+full mbar before promotion in both orders: variant-minus-default `-112.35us`
+and `-140.50us`, NT-old wins `11/12` and `15/16`, with unchanged route counts
+(`n256=15 stage3=15 nmajor=15`) and clean loss parity. After promotion, forced
+full NT mbar lost both orders: forced-full-minus-default `+145.18us` and
+`+123.68us`, full wins `0/16` and `0/16`. The promoted split profile uses
+`_gmbar_n256ntold` and measures `8904.8us` total; the NT row improves relative
+to full mbar (`2567.8us -> 2476.3us`) while head-dX gives back part of the
+profile-local full-mbar gain (`2571.3us -> 2639.1us`). Resource usage remains
+spill-safe (`REG:255 STACK:32 LOCAL:0` on df; df2 `STACK:48`, ws `STACK:80`).
+Validation passed `py_compile`, `test_ops.py`, `test_model.py`, and
+`git diff --check`. Logs:
+`mkv3-p4b-qwen-n256-ntmbar-default-first-20260706T1847Z.log`,
+`mkv3-p4b-qwen-n256-ntmbar-variant-first-20260706T1847Z.log`,
+`mkv3-p4b-qwen-n256-ntmbar-promoted-default-first-20260706T1847Z.log`,
+`mkv3-p4b-qwen-n256-ntmbar-promoted-variant-first-20260706T1847Z.log`,
+`mkv3-p4b-profile-qwen-n256-ntmbar-20260706T1847Z.log`,
+`mkv3-p4b-qwen-n256-ntmbar-testops-20260706T1847Z.log`, and
+`mkv3-p4b-qwen-n256-ntmbar-testmodel-20260706T1847Z.log`. Detail note:
+`results/operator-gap/qwen-n256-ntmbar-split-promote.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

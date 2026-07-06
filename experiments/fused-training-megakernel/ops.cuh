@@ -573,7 +573,7 @@ __device__ __noinline__ void op_gemm_wgmma_n256_direct_impl(const Instr& I, int 
 #pragma unroll
   for (int i = 0; i < 128; ++i) d[i] = 0.0f;
   const int iters = K / WG_BK;
-#ifdef MK_GEMM_MBAR_RING
+#if defined(MK_GEMM_MBAR_RING) && defined(MK_GEMM_N256_NT_MBAR)
   constexpr int WG_N256_MBAR_LEAD = STAGES - 2;
   uint64_t* bfull = reinterpret_cast<uint64_t*>(smem_raw + sizeof(S));
   uint64_t* bempty = bfull + STAGES;

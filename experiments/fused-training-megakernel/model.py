@@ -304,11 +304,15 @@ class MKQwen3:
             (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
             != (512, 8, 1024, 8, 4, 64, 1536, 16384)
         )
-        self.gemm_mbar_ring_default = (
-            c.D == 64 and c.S >= 1024 and c.S % 128 == 0
-        ) or (
+        exact_qwen4b_l1 = (
             (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
             == (2560, 1, 1024, 32, 8, 128, 9728, 151936)
+        )
+        self.gemm_mbar_ring_default = (
+            c.D == 64 and c.S >= 1024 and c.S % 128 == 0
+        ) or exact_qwen4b_l1
+        self.gemm_n256_nt_mbar_default = (
+            self.gemm_mbar_ring_default and not exact_qwen4b_l1
         )
         self.gemm_direct_bf16_epilogue_default = c.D == 64 and (
             c.S == 128 or (c.H, c.L, c.S, c.nq, c.nkv, c.I) == (512, 8, 1024, 8, 4, 1536)
@@ -332,6 +336,7 @@ class MKQwen3:
             attn_dq_float2_store=self.attn_dq_float2_store_default,
             attn_combine_unroll=self.attn_combine_unroll_default,
             gemm_mbar_ring=self.gemm_mbar_ring_default,
+            gemm_n256_nt_mbar=self.gemm_n256_nt_mbar_default,
             gemm_direct_bf16_epilogue=self.gemm_direct_bf16_epilogue_default,
         )
         # D=128 WGMMA attention route (default ON for D==128, S%64==0; the opgap

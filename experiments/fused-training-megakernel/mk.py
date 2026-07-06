@@ -413,6 +413,7 @@ def load_ext(
     attn_dkv_row_bcast=None,
     attn_combine_unroll=None,
     gemm_mbar_ring=None,
+    gemm_n256_nt_mbar=None,
     gemm_direct_bf16_epilogue=None,
 ):
     # MK_OCC2=1 builds the 256-thread executors with __launch_bounds__(256, 2):
@@ -501,6 +502,16 @@ def load_ext(
         gemm_mbar_ring = int(gemm_mbar_ring_env)
     else:
         gemm_mbar_ring = int(bool(gemm_mbar_ring))
+    gemm_n256_nt_mbar_env = os.environ.get("MK_GEMM_N256_NT_MBAR")
+    if gemm_n256_nt_mbar_env is not None:
+        gemm_n256_nt_mbar = int(gemm_n256_nt_mbar_env)
+    else:
+        gemm_n256_nt_mbar = (
+            gemm_mbar_ring
+            if gemm_n256_nt_mbar is None
+            else int(bool(gemm_n256_nt_mbar))
+        )
+    gemm_n256_nt_mbar = int(bool(gemm_mbar_ring and gemm_n256_nt_mbar))
     gemm_direct_bf16_epilogue = int(
         os.environ.get(
             "MK_GEMM_DIRECT_BF16_EPILOGUE",
@@ -525,6 +536,7 @@ def load_ext(
         + ("_swb4w" if swiglu_bwd_4w else "")
         + ("_swcsig" if swiglu_cache_sig else "")
         + ("_gmbar" if gemm_mbar_ring else "")
+        + ("_n256ntold" if gemm_mbar_ring and not gemm_n256_nt_mbar else "")
         + ("_gdbf16" if gemm_direct_bf16_epilogue else ""),
         sources=[os.path.join(_DIR, "megakernel.cu")],
         extra_cuda_cflags=[
@@ -558,6 +570,7 @@ def load_ext(
         + (["-DMK_SWIGLU_BWD_4W"] if swiglu_bwd_4w else [])
         + (["-DMK_SWIGLU_CACHE_SIG"] if swiglu_cache_sig else [])
         + (["-DMK_GEMM_MBAR_RING"] if gemm_mbar_ring else [])
+        + (["-DMK_GEMM_N256_NT_MBAR"] if gemm_n256_nt_mbar else [])
         + (["-DMK_GEMM_DIRECT_BF16_EPILOGUE"] if gemm_direct_bf16_epilogue else []),
         verbose=verbose,
     )
