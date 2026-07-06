@@ -3794,6 +3794,32 @@ straggler diagnosis; banding composes per their spec. Repro:
 `results/d128_qwen4b_ab.py <order>` and
 `mkv3-p4b-d128-{family-smoke-v3,promote}-*.log` in the attn-d128 worktree.
 
+## v3 P4b fwd KV-widening in-model (session 2853e0de): NO-GO — absorption
+
+The FA4-B w128 fwd port (OP_ATTN_FWD_WGW128, `megakernel-attn-w128` worktree,
+default-off) is parity-consistent but its +11-19% STANDALONE win does not
+survive in-model composition anywhere
+(`mkv3-p4b-w128-{smoke,unbanded-sweep}-*.log`):
+- Banded long shapes (S4096): +18.7/+17.4us (2/40 both orders). Mechanism: at
+  banded shapes only the C==1 bands (the SHORT, off-path tail tiles) can take
+  the plain w128 op — no realized path gain, while the 120KB carveout + fatter
+  code shape cost a little everywhere.
+- Unbanded shapes: S512 -6.5/-1.9us (33/40 then 25/40 — order-decaying, under
+  the bar), S1024 +3.3/+7.7. The fwd bucket at short S is co-scheduled and
+  partially off-path: op-local boundary savings get absorbed (the absorption
+  ledger's 5th confirmation).
+- Numerics note: the single 128-wide online-softmax pass gives a DIFFERENT fp
+  path than two 64-wide rescales — in-model worst grad rel vs w64 is ~0.021
+  (kn), and a nano-forced run overshoots the test_model fp32-reference bar
+  marginally (kn.3 0.0306 vs 0.03) — same kn-sensitivity class as the fwd-band
+  nano-T4 note. Any future gate must respect this.
+The one theoretically-aligned continuation (unclaimed, with caveats): port the
+w128 body into the banded C>1 PARTIALS path so the on-path straggler chunks
+get the halved boundary count (chunk stage counts halve; band T values would
+need re-tuning). Given five absorption strikes, treat as low-prior. The op
+stays default-off as a building block; the standalone win in the opgap ledger
+stands — this entry records only its in-model fate.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
