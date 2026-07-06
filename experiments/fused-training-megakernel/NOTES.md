@@ -4030,6 +4030,43 @@ Outcome: candidate source was reverted; do not carry `MK_ATTN_D128_DQ_MB`.
 The next D=128 bwd direction should be the operator-gap S^T/register-A feed
 design, not another K/V-ring bolt-on.
 
+## v3 P4b qwen direct-store dW fill elision: exact-route promotion
+
+After the qwen dW sk1/no-atomic and n256 TN promotions, the current qwen4b-l1
+program still zero-filled every fp32 gradient up front. The two giant vocab fills
+were visible in the post-D128 profile: `grad:emb` and `grad:wlm` both zeroed
+`388956160` fp32 elements. `grad:emb` is still required because `EMBED_BWD`
+atomic-adds into vocab rows, but `grad:wlm` and the four layer dW gradients are
+now overwritten by direct-store dW GEMMs (`flags=16521`) whenever
+`MK_DW_NO_ATOMIC_SK1` selects the no-atomic sk1 route.
+
+Promoted a builder-side skip for exactly those direct-store dW gradients. The
+route decision reuses the existing `MK_DW_NO_ATOMIC_SK1` logic and split-K check;
+it does not skip fills for atomic/split-K dW, norm gradients, embedding gradients,
+or workspaces. `MK_DW_DIRECT_SKIP_FILL=0` restores the old fill instructions
+while keeping the direct-store GEMM routes, and `MK_DW_NO_ATOMIC_SK1=0` still
+restores the older split-K/atomic dW rows.
+
+Evidence:
+- Route check (`mkv3-p4b-qwen-dwskipfill-ab-20260706T0154Z.log`): qwen default
+  drops five dW fills and moves from `n_instr=51` to `46`; old-control
+  `MK_DW_DIRECT_SKIP_FILL=0` keeps the same five `flags=16521` direct-store dW
+  rows but retains the fills.
+- Correctness in the same log: identical loss (`12.54405022` both arms) and
+  full gradient comparison worst relative diff `3.129190e-07` (`w1.0`; the
+  direct-store dW gradients including `wlm` were exactly equal).
+- Paired timing in both construction orders: old-minus-new medians `+523.90us`
+  and `+514.19us`, with `48/48` wins in both orders.
+- Fresh qwen profile (`mkv3-p4b-qwen-dwskipfill-profile-20260706T0154Z.log`):
+  `n_instr=46`, best total `10270.6us`. The remaining off-path fill volume is
+  `1146.9us`, dominated by required `grad:emb`; off-path vocab dW remains the
+  largest sink span (`GEMMTN 151936x2560x1024.wg`, `5349.4us`), while on-path
+  leaders are head-dX (`2932.6us`) and lm-head forward (`2702.2us`).
+- Validation: `test_model.py` PASS
+  (`mkv3-p4b-dwskipfill-testmodel-20260706T0154Z.log`), `test_ops.py` PASS
+  (`mkv3-p4b-dwskipfill-testops-20260706T0154Z.log`), `py_compile`,
+  `ruff check`, and `git diff --check` passed.
+
 ## v3 P4b fwd KV-widening in-model (session 2853e0de): NO-GO — absorption
 
 The FA4-B w128 fwd port (OP_ATTN_FWD_WGW128, `megakernel-attn-w128` worktree,

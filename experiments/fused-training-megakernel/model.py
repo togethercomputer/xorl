@@ -340,6 +340,18 @@ class MKQwen3:
         p = mk.Program()
         p.default_cold_cap = _cold_cap(c)
         B = p.buf
+        dw_no_atomic_env = os.environ.get("MK_DW_NO_ATOMIC_SK1")
+
+        def dw_no_atomic_sk1_enabled(M, N, K, wgmma):
+            if dw_no_atomic_env is None:
+                return wgmma and (M, N, K) in _QWEN_L1_DW_NO_ATOMIC_SK1
+            return bool(int(dw_no_atomic_env))
+
+        def dw_direct_store_overwrites(M, N, K):
+            flags = 1 | 4 | 8
+            if mk.wgmma_ok(M, N, K, flags):
+                return dw_no_atomic_sk1_enabled(M, N, K, True) and mk.wgmma_split_k(M, N, K) == 1
+            return dw_no_atomic_sk1_enabled(M, N, K, False) and mk.gemm_split_k(M, N, K) == 1
 
         def gemm(a, b, out, M, N, K, flags, res=0, ssq=0, ssq_nparts=0):
             # ssq/ssq_nparts (bit13, v3 P4b r4): the wgmma epilogues emit per-64-col
@@ -350,11 +362,7 @@ class MKQwen3:
             if flags & 8 and flags & 4:  # fp32 accumulating dW: split-K for occupancy
                 if mk.wgmma_ok(M, N, K, flags):
                     sk = mk.wgmma_split_k(M, N, K)
-                    no_atomic_env = os.environ.get("MK_DW_NO_ATOMIC_SK1")
-                    if no_atomic_env is None:
-                        no_atomic_sk1 = (M, N, K) in _QWEN_L1_DW_NO_ATOMIC_SK1
-                    else:
-                        no_atomic_sk1 = bool(int(no_atomic_env))
+                    no_atomic_sk1 = dw_no_atomic_sk1_enabled(M, N, K, True)
                     if no_atomic_sk1 and sk == 1:
                         f = ((flags | 128) & ~(4 | 32))
                         if mk.wgmma_n256_dw_tn_ok(M, N, K, f):
@@ -377,8 +385,7 @@ class MKQwen3:
                     )
                 else:
                     sk = mk.gemm_split_k(M, N, K)
-                    no_atomic_env = os.environ.get("MK_DW_NO_ATOMIC_SK1")
-                    no_atomic_sk1 = bool(int(no_atomic_env)) if no_atomic_env is not None else False
+                    no_atomic_sk1 = dw_no_atomic_sk1_enabled(M, N, K, False)
                     if no_atomic_sk1 and sk == 1:
                         p.instr(
                             mk.OP_GEMM,
@@ -499,12 +506,28 @@ class MKQwen3:
         labels_buf = B(self.labels)
         self._tokens_buf = tokens_buf
         self._labels_buf = labels_buf
+        skip_direct_dw_fill = bool(int(os.environ.get("MK_DW_DIRECT_SKIP_FILL", "1")))
+        direct_store_grads = set()
+        if skip_direct_dw_fill:
+            if dw_direct_store_overwrites(c.V, c.H, c.S):
+                direct_store_grads.add("wlm")
+            for lz in range(c.L):
+                if dw_direct_store_overwrites(QD, c.H, c.S):
+                    direct_store_grads.add(f"wqkv.{lz}")
+                if dw_direct_store_overwrites(c.H, c.nq * c.D, c.S):
+                    direct_store_grads.add(f"wo.{lz}")
+                if dw_direct_store_overwrites(2 * c.I, c.H, c.S):
+                    direct_store_grads.add(f"wgu.{lz}")
+                if dw_direct_store_overwrites(c.H, c.I, c.S):
+                    direct_store_grads.add(f"wd.{lz}")
 
-        # ---- wave 0: embedding gather + zero every fp32 grad / loss / dX stream ----
+        # ---- wave 0: embedding gather + zero fp32 grad / loss / dX streams ----
         p.instr(mk.OP_EMBED_FWD, c.S, [tokens_buf, B(self.params["emb"]), X[0], c.H])
         if self.in_kernel_inv_valid:
             p.instr(mk.OP_INV_VALID, 1, [labels_buf, B(self.inv_valid), c.S])
-        for g in self.grads.values():
+        for name, g in self.grads.items():
+            if name in direct_store_grads:
+                continue
             fill_zero(g)
         fill_zero(self.loss)
         for lz in range(c.L):
