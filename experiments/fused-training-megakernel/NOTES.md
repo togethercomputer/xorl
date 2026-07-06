@@ -5078,7 +5078,7 @@ Current-head follow-ups after the small 4W/cache-off route:
   Log: `mkv3-p4b-small-gmbar-current-f66c432-20260706T1600Z.log`; detail
   note: `results/operator-gap/small-gmbar-post4w-keep.md`.
 
-## Small H512/S1024 NN n128 route retune (this session, 20260706T1700Z)
+## Small H512/S1024 NN n128 route retunes (this session, 20260706T1725Z)
 
 After the small 4W/cache-off route, the remaining MLP dX stack made the two
 repeated H512/S1024 NN bf16 n128 rows worth rechecking. A broad source-free
@@ -5104,13 +5104,38 @@ Discard `mkv3-p4b-small-n128nn-promoted-20260706T1620Z.log` as decision
 evidence: its route print showed the default side at `n128=0`, not the intended
 promoted route.
 
-The refreshed default profile measured `3374.9us` (previous post-cache-off
-profile `3421.6us`). The refreshed small score measured megakernel `3392.1us`
-vs compile+CUDAGraph+ `1896.8us` (gap still `1.79x`). Validation passed
-`py_compile`, `git diff --check`, `test_model.py`, and `test_ops.py`. Logs:
+The refreshed narrow-default profile measured `3374.9us` (previous
+post-cache-off profile `3421.6us`). The refreshed small score measured
+megakernel `3392.1us` vs compile+CUDAGraph+ `1896.8us` (gap still `1.79x`).
+Validation passed `py_compile`, `git diff --check`, `test_model.py`, and
+`test_ops.py`. Logs:
 `mkv3-p4b-profile-small-n128nn-default-20260706T1655Z.log`,
 `mkv3-p4b-score-small-n128nn-default-20260706T1656Z.log`. Detail note:
 `results/operator-gap/small-n128nn-post4w-promote.md`.
+
+Follow-up after the narrow promotion compared current default against broad
+`MK_WGMMA_N128_NN=0` and found only one remaining changed row family:
+8x `GEMMNN 1024x1536x512`, moving from n128 flags `4224` / `96` tiles to
+m64n64 flags `128` / `192` tiles. The 160-sample repeat survived both
+construction orders with clean parity (`loss_diff=-1.91e-06` / `+0.00e+00`,
+worst selected grad rel `<7.1e-07`): default-minus-broad-off medians
+`+11.76us` and `+7.01us`, broad-off wins `127/160` and `114/160`. The default
+gate now also excludes exact shape `(1024,1536,512)` when
+`MK_WGMMA_N128_NN` is unset; force-on/force-off env semantics are unchanged.
+Logs: `mkv3-p4b-small-n128nn-broad-after-promote-20260706T1710Z.log`,
+`mkv3-p4b-small-n128nn-broad-after-promote-repeat-20260706T1715Z.log`.
+
+Final promoted-default validation against `MK_WGMMA_N128_NN=1` restored all 24
+old NN n128 rows in the forced-old arm (`n128=26 -> 50`) and won both
+construction orders: old-minus-default medians `+39.22us` and `+33.17us`,
+default wins `80/80` and `80/80`, with clean parity (`loss_diff=+2.86e-06` /
+`-1.91e-06`, worst selected grad rel `<7.2e-07`). Post-edit validation again
+passed `py_compile`, `git diff --check`, `test_model.py`, and `test_ops.py`.
+The final refreshed profile measured `3379.2us`; the final small score measured
+megakernel `3373.2us` vs compile+CUDAGraph+ `1904.9us` (gap `1.77x`). Logs:
+`mkv3-p4b-small-n128nn-final-promoted-20260706T1725Z.log`,
+`mkv3-p4b-profile-small-n128nn-final-default-20260706T1732Z.log`,
+`mkv3-p4b-score-small-n128nn-final-default-20260706T1735Z.log`.
 
 ## Honest assessment + v2 roadmap
 
