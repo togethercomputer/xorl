@@ -5422,6 +5422,20 @@ Top on-path totals are now `ATTN_DQ_WG` `294.7us`, `SWIGLU_BWD_4W` `281.2us`,
 graph+). Logs: `mkv3-p4b-profile-small-current-581278a-20260706T1741Z.log` and
 `mkv3-p4b-score-small-current-581278a-20260706T1741Z.log`.
 
+Post-current-profile small attention dQ row-broadcast source probe: because
+`ATTN_DQ_WG` was the largest current on-path total, tested a temporary
+default-off `MK_ATTN_DQ_ROW_BCAST=1` compile flag that quad-broadcast the two
+per-row `LSE`/`Drow` scalars inside `op_attn_dq_wg`, analogous to the existing
+DKV row-broadcast probe. The variant compiled the expected temporary `_adqbc`
+extension, kept route shape unchanged (`n_instr=288`, `critical_path=144`,
+`gated=127`, `ATTN_FWD/DKV/DQ=8/512`), and stayed parity-clean
+(`loss_diff=+9.54e-07` / `+1.91e-06`, worst selected grad rel `<6.7e-07`).
+It lost both construction orders: default-minus-rowbcast `-14.00us` and
+`-13.47us`, rowbcast wins `8/80` and `14/80`. No source change remains; do not
+add a DQ row-broadcast knob/default for H512/S1024 small. Log:
+`mkv3-p4b-small-dqrowbc-sourceprobe-20260706T1745Z.log`. Detail note:
+`results/operator-gap/small-dq-rowbcast-sourceprobe-nogo.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
