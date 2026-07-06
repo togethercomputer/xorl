@@ -3372,6 +3372,15 @@ old-minus-new with parity clean
 exact H256/D64/S8192 only in the consolidated tuning table; the env override
 still forces old/new for A/B.
 
+Post-GEMM-mbarrier-ring correction (20260706): row-broadcast no longer composes with
+the long-D64 default. After `31dad00` (`MK_GEMM_MBAR_RING` default for long D64),
+forced old `MK_ATTN_DKV_ROW_BCAST=0` beat the promoted S8192 default in both
+construction orders: -32.43us and -30.77us, 16/16 wins each, with parity clean
+(`mkv3-p4b-post-gmbar-s8192-rowbcast-default-first-20260706T0807Z.log`,
+`mkv3-p4b-post-gmbar-s8192-rowbcast-variant-first-20260706T0807Z.log`). The exact
+default gate is therefore empty again; `MK_ATTN_DKV_ROW_BCAST=1` remains available for
+A/B and future composition checks.
+
 Post-row-broadcast S8192 profile/score refresh:
 `mkv3-p4b-profile-score-s8192-post-rowbcast-d3581ed-20260705T2145Z.log` (first
 attempt failed before CUDA due to a relative venv path; retry completed with GPU5
