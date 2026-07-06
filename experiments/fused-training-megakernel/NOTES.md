@@ -5483,6 +5483,20 @@ Drow zero-fill enabled for H512/S1024 small. Log:
 `mkv3-p4b-small-drowzero-current-20260706T1757Z.log`. Detail note:
 `results/operator-gap/small-drowzero-current-nogo.md`.
 
+Current-head small `SWIGLU_BWD_4W` 4-wide source probe: because
+`SWIGLU_BWD_4W` remains a top on-path bucket, tested a default-off
+`MK_SWIGLU_BWD_4W_V4=1` body that processed four bf16 elements per lane
+iteration instead of eight to reduce local register pressure. The variant
+compiled as the expected temporary `_swb4v4` extension, left route shape
+unchanged (`n_instr=288`, `critical_path=144`, `gated=127`,
+`SWIGLU_BWD_4W=8/4096`, `swsig=False`), and stayed parity-clean
+(`loss_diff=+2.86e-06` both orders, worst selected grad rel `<4.5e-07`).
+Timing lost both construction orders: default-minus-v4 `-5.97us` with v4 wins
+`22/80`, then `-8.54us` with v4 wins `18/80`. Do not add the 4-wide body or
+gate for H512/S1024 small; the temporary source probe was reverted. Log:
+`mkv3-p4b-small-swb4v4-sourceprobe-20260706T1758Z.log`. Detail note:
+`results/operator-gap/small-swb4v4-sourceprobe-nogo.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
