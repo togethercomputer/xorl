@@ -4114,6 +4114,13 @@ Validation:
 - `test_ops.py` PASS (`mkv3-p4b-n256-stage3-testops-20260706T0213Z.log`).
 - `py_compile`, `ruff check`, and `git diff --check` passed.
 
+Follow-up scheduler check: post-stage3 `MK_COLD_CAP` resweep
+(`mkv3-p4b-qwen-coldcap-post-stage3-20260706T0218Z.log`) still rejects low
+cold caps; cap96/cap132 were within noise of cap0. The focused cap0-vs-cap96
+A/B (`mkv3-p4b-qwen-coldcap96-post-stage3-ab-20260706T0218Z.log`) measured
+cap0-minus-cap96 median `+7.26us` in one order but `-9.07us` in the reverse,
+`-3.14us` overall with `47/96` wins. Keep qwen `default_cold_cap=0`.
+
 ## v3 P4b D=128 dQ register-A feed: NO-GO in-model
 
 The operator-gap standalone `attn_dq_d128_rf` result was ported narrowly onto
