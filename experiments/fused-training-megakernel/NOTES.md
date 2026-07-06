@@ -5759,6 +5759,27 @@ step-time sign. Resource usage stays spill-safe (`LOCAL:0`; df `STACK:48`, df2
 `mkv3-p4b-s8192-cefix-resusage-20260706T1927Z.txt`. Detail note:
 `results/operator-gap/s8192-cebwd-label-fixup-promote.md`.
 
+Small H512/S1024 CE_BWD label-fixup broadening: the exact small benchmark shape
+also takes the same `_cefix` default, but the step-time effect is intentionally
+recorded as a tiny paired median win rather than a large local rewrite. Before
+promotion, forced `MK_CE_BWD_LABEL_FIXUP=1` beat the current default in both
+construction orders with clean selected-gradient parity: `-2.67us` and
+`-3.30us` over 80 reps, then confirmation `-1.28us` and `-3.87us` over 160
+reps. After broadening the default to exact H512/L8/S1024, forced old
+`MK_CE_BWD_LABEL_FIXUP=0` lost both orders: `+3.84us` and `+2.70us`
+old-minus-default, with old wins `62/160` and `58/160`. Resource usage remains
+spill-safe (`LOCAL:0`; df `STACK:48`, df2 `STACK:48`, ws `REG:168 STACK:80`).
+Validation passed `py_compile`, `test_model.py`, and `git diff --check`. Logs:
+`mkv3-p4b-small-cefix-default-first-20260706T1934Z.log`,
+`mkv3-p4b-small-cefix-variant-first-20260706T1934Z.log`,
+`mkv3-p4b-small-cefix-default-first-confirm-20260706T1934Z.log`,
+`mkv3-p4b-small-cefix-variant-first-confirm-20260706T1934Z.log`,
+`mkv3-p4b-small-cefix-promoted-old-default-first-20260706T1934Z.log`,
+`mkv3-p4b-small-cefix-promoted-old-variant-first-20260706T1934Z.log`,
+`mkv3-p4b-small-cefix-resusage-20260706T1934Z.txt`, and
+`mkv3-p4b-small-cefix-test-model-20260706T1934Z.log`. Detail note:
+`results/operator-gap/small-cebwd-label-fixup-promote.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
