@@ -240,6 +240,9 @@ def wgmma_n256_nn_bf16_ok(M, N, K, flags):
     if (M, N, K) in {
         (1024, 9728, 2560),    # qwen4b-l1 wd dX
         (1024, 2560, 19456),   # qwen4b-l1 wgu dX
+        (8192, 768, 256),      # H256/D64/S8192 wd dX
+        (8192, 256, 1536),     # H256/D64/S8192 wgu dX
+        (8192, 256, 512),      # H256/D64/S8192 wo dX
     }:
         return True
     qkvdx_env = os.environ.get("MK_WGMMA_N256_QKVDX_BF16")

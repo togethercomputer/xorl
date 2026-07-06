@@ -5834,6 +5834,31 @@ force broad NT BF16 n256. Logs:
 `mkv3-p4b-s8192-n256ntbf16-route-20260706T2009Z.log`. Detail note:
 `results/operator-gap/s8192-n256ntbf16-broad-nogo.md`.
 
+S8192 exact n256 NN BF16 promotion: the broad NN force knob was unmeasured for
+the exact H256/D64/S8192 stack, so forced `MK_WGMMA_N256_NN_BF16=1` and
+inspected the route. The force-on arm changed twelve rows, four each of
+`8192x768x256`, `8192x256x1536`, and `8192x256x512`, while the fused-Drow
+`8192x256x256` rows correctly stayed on the existing Drow path. Full-gradient
+parity stayed clean, and the force-on route won both construction orders:
+`-29.14us` and `-18.00us` variant-minus-default, `15/16` wins in both orders.
+Promoted only those three exact NN BF16 shapes in `wgmma_n256_nn_bf16_ok`.
+Post-promotion route inspection showed default `n256=14` and forced-old
+`MK_WGMMA_N256_NN_BF16=0` back to `n256=2`; forced-old lost both construction
+orders by `+16.30us` and `+22.19us` old-minus-new. A fresh profile is recorded
+for current-state attribution (`6984.3us`, still dominated by attention dKV
+wait), but the decision gate is the paired A/B rather than profile-to-profile
+noise. Validation: `py_compile`, `ruff`, `git diff --check`, and `test_model.py`
+passed. Logs:
+`mkv3-p4b-s8192-n256nnbf16-route-20260706T2014Z.log`,
+`mkv3-p4b-s8192-n256nnbf16-default-first-20260706T2014Z.log`,
+`mkv3-p4b-s8192-n256nnbf16-variant-first-20260706T2014Z.log`,
+`mkv3-p4b-s8192-n256nnbf16-promote-route-20260706T2014Z.log`,
+`mkv3-p4b-s8192-n256nnbf16-promote-default-first-20260706T2014Z.log`,
+`mkv3-p4b-s8192-n256nnbf16-promote-variant-first-20260706T2014Z.log`,
+`mkv3-p4b-profile-s8192-n256nnbf16-20260706T2014Z.log`, and
+`mkv3-p4b-s8192-n256nnbf16-test-model-20260706T2014Z.log`. Detail note:
+`results/operator-gap/s8192-n256nnbf16-exact-promote.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
