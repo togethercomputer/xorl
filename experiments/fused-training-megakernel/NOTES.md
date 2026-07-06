@@ -4195,6 +4195,35 @@ Validation:
   (`mkv3-p4b-n256-nmajor-testops-20260706T0243Z.log`).
 - `test_model.py` PASS (`mkv3-p4b-n256-nmajor-testmodel-20260706T0245Z.log`).
 
+## v3 P4b cluster DSMEM-fed GMMA probe: NO-GO, use TMA multicast
+
+Before wiring paired-M cluster tiles into the interpreter, `dsmem_gmma_probe.py`
+tested the cheap alternative to TMA multicast: rank0 stages the shared B tile in
+its DSMEM, rank1 maps rank0's shared address with `mapa.shared::cluster`, then a
+normal GMMA B descriptor is built from that mapped address. The same probe first
+checks a scalar `ld.shared::cluster` so a negative GMMA result is not confused
+with a broken cluster launch or DSMEM address.
+
+Evidence (`mkv3-dsmem-gmma-probe-20260706T025558Z.log`, GPU5, private torch
+extension cache):
+- Scalar DSMEM works: rank0 read rank1 probe value `1001`, rank1 read rank0
+  probe value `1000`.
+- Rank0 local-B GMMA is correct: max error `1.907349e-06`.
+- Rank1 remote-B GMMA is not viable: max error `3.250951e+01`, output abs max
+  `0.000000e+00` because rank1's local B slab was intentionally zeroed.
+- Address diagnostics explain the failure mode: rank1 local B address was
+  `0x1002400`, the mapped rank0 B address was `0x2400`, and the GMMA descriptor
+  start field for both local and mapped addresses collapsed to `0x240`. The
+  14-bit GMMA shared descriptor cannot carry the cluster-rank part of a DSMEM
+  address, so GMMA consumes local shared memory only.
+
+Outcome: do not implement a paired-tile body where one CTA stages B and the peer
+CTA points GMMA at that DSMEM. The cluster GEMM route needs TMA
+`.multicast::cluster` (or equivalent bulk multicast) to materialize the B tile
+into each CTA's local smem before GMMA. DSMEM remains available for scalar
+exchange and possible epilogue/reduction protocols, but not as a direct GMMA
+operand source.
+
 ## v3 P4b D=128 dQ register-A feed: NO-GO in-model
 
 The operator-gap standalone `attn_dq_d128_rf` result was ported narrowly onto
