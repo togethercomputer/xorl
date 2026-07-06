@@ -3894,6 +3894,39 @@ Validation:
 - Full `test_model.py` passed in
   `mkv3-p4b-qwen-n256-ntbf16-res-testmodel-20260706T0208Z.log`.
 
+## v3 P4b mbarrier feed-ring in-model probe: NO-GO for current WGMMA ops
+
+Tried the operator-gap barrier-free feed-ring prescription as an in-model integration
+slice, but did not promote it. The prototype was kept opt-in during measurement and
+then removed from tracked code after timing.
+
+Coverage and correctness:
+- Generic m64n64 depth-4 ring direct NN/NT cases passed `test_ops.py`
+  (`mkv3-p4b-mbar-generic-testops2-20260706T0224Z.log`), and full
+  `test_model.py` with only the generic ring opt-in passed
+  (`mkv3-p4b-mbar-generic-testmodel-20260706T0228Z.log`).
+- n128 depth-3 ring direct NN/NT cases also passed `test_ops.py`
+  (`mkv3-p4b-mbar-n128-testops-20260706T0240Z.log`), and full `test_model.py`
+  with only `MK_WGMMA_N128_MBAR=1` passed
+  (`mkv3-p4b-mbar-n128-testmodel-20260706T0244Z.log`).
+
+Timing rejected both slices:
+- Generic m64n64 ring (`mkv3-p4b-mbar-generic-ab-20260706T0232Z.log`): nano routed
+  16 rows and regressed old `933.9us` -> mbar `949.0us` (old-minus-mbar `-15.2us`,
+  `0/20` wins). Small routed zero rows through the generic path, so its `+6.8us`
+  old-minus-mbar result was noise, not a promotion signal.
+- n128 ring (`mkv3-p4b-mbar-n128-ab-20260706T0248Z.log`): nano routed zero rows
+  (noise: old-minus-n128_mbar `-2.6us`, `9/24` wins). Small routed 48 rows and
+  regressed decisively: old `3549.5us`, n128_mbar `3600.4us`,
+  old-minus-n128_mbar `-51.0us`, `1/24` wins.
+
+Interpretation: the standalone barrier-free ring win does not transfer when bolted
+onto the current interpreter op bodies. The current helpers still drain each GMMA
+batch with `warpgroup_wait<0>`, and the deeper smem page/phase protocol adds overhead
+without reducing the realized model path. Keep the operator-gap result as a future
+rewrite spec for a deeper mainloop/producer design, but do not carry this direct
+port in main.
+
 ## v3 P4b fwd KV-widening in-model (session 2853e0de): NO-GO — absorption
 
 The FA4-B w128 fwd port (OP_ATTN_FWD_WGW128, `megakernel-attn-w128` worktree,
