@@ -5557,6 +5557,30 @@ forced old both orders: default-minus-old `-29.30us` and `-44.29us`, old wins
 `mkv3-p4b-s8192-combine-unroll-promoted-20260706T1808Z.log`. Detail note:
 `results/operator-gap/s8192-combine-unroll-promote.md`.
 
+S4096 attention-combine unroll boundary promotion: after the S3072/S4096/S8192
+fused-qkrope n128 promotion changed the H256/D64/S4096 route timing, rechecked
+S4096 from a clean detached `005ad84` sibling worktree. The earlier post-qkrope
+run was discarded as contaminated because step medians were around 5.7ms, far
+outside the expected S4096 band. The clean repeat returned to the expected
+3.13-3.15ms band and won both construction orders: default-first
+`3151.62us` default vs `3133.38us` unroll, default-minus-unroll `+18.35us`,
+paired mean `+18.59us`, `160/160` unroll wins; variant-first `3139.23us`
+default vs `3131.50us` unroll, default-minus-unroll `+7.25us`, paired mean
+`+7.21us`, `137/160` unroll wins. Route shape and full-gradient parity stayed
+clean (`worst_selected_grad_rel=3.846151e-03`, `emb`). `_H256_D64_COMBINE_UNROLL_S`
+now covers exact H256/D64 S4096 and S8192; S3072 remains excluded by the prior
+regression and S2048 was not promoted. Log:
+`mkv3-p4b-s4096-combine-unroll-clean005ad84-repeat-20260706T2128Z.log`.
+Promoted-default A/B against `MK_ATTN_COMBINE_UNROLL=0` confirmed the default
+gate: default-minus-old `-13.38us` and `-23.76us`, with old wins `4/160` and
+`1/160`; parity stayed clean. Validation passed `py_compile`, `ruff`,
+`git diff --check`, trailing-whitespace scan for the new note, and
+`test_model.py`. Logs:
+`mkv3-p4b-s4096-combine-unroll-promoted-clean005ad84-20260706T2134Z.log` and
+`mkv3-p4b-s4096-combine-unroll-promote-test-model-20260706T2134Z.log`.
+Detail note:
+`results/operator-gap/s4096-combine-unroll-post-qkrope-promote.md`.
+
 Post-combine-unroll S8192 fwd-band retune no-go: because the promoted combine
 unroll made `OP_ATTN_COMBINE` cheaper and the post-`8135329` profile still had
 `ATTN_FWD_WG` as a large on-path bucket, rechecked nearby
