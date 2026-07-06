@@ -6029,6 +6029,21 @@ high-rep repeat pending). Parity clean everywhere. Routing-only changes. Logs:
 mkv3-p4b-postskr-resweep1{,-rev}-*.log, mkv3-p4b-s1024-s2048-n256-promote-
 check-*.log, mkv3-p4b-s1024-n256-tiebreak-*.log.
 
+## QKNORM_ROPE_BWD per-warp dw partials (session 2853e0de, 20260706T2200Z)
+
+The #3 S8192 on-path bucket (312us) was smem-atomic contention: every lane of
+every warp atomicAdd'ed into ONE shared [D]+[D] dw partial array — block-wide
+serialization on 64 addresses, ~30x above the op's bandwidth floor. Fix:
+per-warp [nwarp][D] slices with plain lane-disjoint adds, one cross-warp
+reduce + global atomic at the drain (+4-8KB smem). Covers the D64 cache path,
+D128 qwen path, and the generic loop. Validated
+(`mkv3-p4b-qkbwd-warpslice-20260706T210333Z.log` + nano recheck): small
+-21.1, S4096 -16.5, **S8192 -42.6/-65.7 both orders**, nano neutral (the
+first sweep's +286 was a first-run-after-build artifact — recheck 930/930 vs
+936/928), losses bit-identical every shape, test_ops (qkrope cases exact) +
+test_model green. Landing was briefly parked behind a peer's uncommitted
+ops.cuh WIP — patch applied cleanly post-clear.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

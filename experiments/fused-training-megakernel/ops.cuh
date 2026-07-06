@@ -2564,9 +2564,12 @@ __device__ void op_qknorm_rope_bwd(const Instr& I, int tile, void** bufs, char* 
   const int stride = (nq + 2 * nkv) * D, nh = nq + (split_v ? nkv : 2 * nkv);
   const int warp = mk_tid() / 32, lane = mk_tid() % 32, nwarp = MK_CONSUMERS / 32;
 
-  float* dwq_s = reinterpret_cast<float*>(smem_raw);  // [D] + [D] fp32 partials
-  float* dwk_s = dwq_s + D;
-  for (int i = mk_tid(); i < 2 * D; i += MK_CONSUMERS) dwq_s[i] = 0.0f;
+  // per-warp dw partial slices: plain adds instead of block-wide smem atomics
+  // (the old shared [D]+[D] arrays serialized every lane of every warp on 64
+  // addresses — the dominant cost of this op at long S)
+  float* dwq_s = reinterpret_cast<float*>(smem_raw);  // [nwarp][D] + [nwarp][D]
+  float* dwk_s = dwq_s + (MK_CONSUMERS / 32) * D;
+  for (int i = mk_tid(); i < 2 * (MK_CONSUMERS / 32) * D; i += MK_CONSUMERS) dwq_s[i] = 0.0f;
   consumer_sync();
 
   for (int t = warp; t < MK_ROW_R * nh; t += nwarp) {
@@ -2591,7 +2594,7 @@ __device__ void op_qknorm_rope_bwd(const Instr& I, int tile, void** bufs, char* 
     }
     const bool is_q = h < nq;
     const bf16* w = reinterpret_cast<const bf16*>(bufs[is_q ? I.args[3] : I.args[4]]);
-    float* dw_s = is_q ? dwq_s : dwk_s;
+    float* dw_s = (is_q ? dwq_s : dwk_s) + warp * D;
     const float r = reinterpret_cast<const float*>(
         bufs[is_q ? I.args[7] : I.args[8]])[(int64_t)row * (is_q ? nq : nkv) + (is_q ? h : h - nq)];
 
@@ -2612,8 +2615,8 @@ __device__ void op_qknorm_rope_bwd(const Instr& I, int tile, void** bufs, char* 
       dot *= 1.0f / 64.0f;
       dxr[i] = f2bf(r * (da * w1 - xh1 * dot));
       dxr[i + 32] = f2bf(r * (db * w2 - xh2 * dot));
-      atomicAdd(&dw_s[i], da * xh1);
-      atomicAdd(&dw_s[i + 32], db * xh2);
+      dw_s[i] += da * xh1;
+      dw_s[i + 32] += db * xh2;
       continue;
     }
 #endif
@@ -2651,10 +2654,10 @@ __device__ void op_qknorm_rope_bwd(const Instr& I, int tile, void** bufs, char* 
       dxr[i0 + 64] = f2bf(r * (db0 * w20 - xh20 * dot));
       dxr[i1] = f2bf(r * (da1 * w11 - xh11 * dot));
       dxr[i1 + 64] = f2bf(r * (db1 * w21 - xh21 * dot));
-      atomicAdd(&dw_s[i0], da0 * xh10);
-      atomicAdd(&dw_s[i0 + 64], db0 * xh20);
-      atomicAdd(&dw_s[i1], da1 * xh11);
-      atomicAdd(&dw_s[i1 + 64], db1 * xh21);
+      dw_s[i0] += da0 * xh10;
+      dw_s[i0 + 64] += db0 * xh20;
+      dw_s[i1] += da1 * xh11;
+      dw_s[i1 + 64] += db1 * xh21;
       continue;
     }
 #endif
@@ -2679,16 +2682,22 @@ __device__ void op_qknorm_rope_bwd(const Instr& I, int tile, void** bufs, char* 
       const float xh1 = bf2f(xr[i]) * r, xh2 = bf2f(xr[i + D / 2]) * r;
       dxr[i] = f2bf(r * (da * bf2f(w[i]) - xh1 * dot));
       dxr[i + D / 2] = f2bf(r * (db * bf2f(w[i + D / 2]) - xh2 * dot));
-      atomicAdd(&dw_s[i], da * xh1);
-      atomicAdd(&dw_s[i + D / 2], db * xh2);
+      dw_s[i] += da * xh1;
+      dw_s[i + D / 2] += db * xh2;
     }
   }
   consumer_sync();
   float* dqw = reinterpret_cast<float*>(bufs[I.args[5]]);
   float* dkw = reinterpret_cast<float*>(bufs[I.args[6]]);
   for (int i = mk_tid(); i < D; i += MK_CONSUMERS) {
-    atomicAdd(&dqw[i], dwq_s[i]);
-    atomicAdd(&dkw[i], dwk_s[i]);
+    float aq = 0.0f, ak = 0.0f;
+#pragma unroll
+    for (int w2 = 0; w2 < MK_CONSUMERS / 32; ++w2) {
+      aq += dwq_s[w2 * D + i];
+      ak += dwk_s[w2 * D + i];
+    }
+    atomicAdd(&dqw[i], aq);
+    atomicAdd(&dkw[i], ak);
   }
 }
 
