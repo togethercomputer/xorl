@@ -3858,6 +3858,42 @@ residual NT MLP/WO forwards (`375.2us`, `196.6us`). Full `test_ops.py` and
 `mkv3-p4b-qwen-n256-ntbf16-testops2-20260706T0146Z.log` and
 `mkv3-p4b-qwen-n256-ntbf16-testmodel-20260706T0141Z.log`.
 
+## v3 P4b qwen residual NT bf16 n256 direct route
+
+Extended the exact qwen `MK_WGMMA_N256_NT_BF16` route to the residual NT bf16
+producers `(M,N,K)=(1024,2560,4096)` (`wo`) and `(1024,2560,9728)` (`wd`). The
+n256 direct epilogue now adds bit4 residual before bf16 conversion, and when bit13
+is set it emits sum-of-squares partials from the post-residual bf16-rounded output,
+matching the existing RMSNorm SSQ contract. The model emission passes the SSQ buffer
+and returns `do_ssq` for this path, so qwen `wo`/`wd` preserve the fused RMSNorm
+producer shortcut instead of falling back to a separate variance pass.
+
+Validation:
+- Permanent unit coverage now includes direct `NT n256 residual` and `NT n256 ssq`;
+  `test_ops.py` passed in
+  `mkv3-p4b-qwen-n256-ntbf16-res-testops-20260706T0152Z.log`.
+- Focused qwen A/B changed residual rows from n128 `ntiles=160, flags=12434` to
+  n256 `ntiles=80, flags=24722` while keeping the no-residual rows on the earlier
+  `flags=16514` route and lm-head on `flags=18562`.
+- Default-first timing:
+  `mkv3-p4b-qwen-n256-ntbf16-res-ab-20260706T0156Z.log` measured old `11181.2us`,
+  new `10905.1us`, old-minus-new `+276.1us`, `16/16` wins, loss rel diff
+  `+7.534e-08`, worst grad rel `0.006289`.
+- Reverse construction/order timing:
+  `mkv3-p4b-qwen-n256-ntbf16-res-ab-rev-20260706T0200Z.log` measured old
+  `11069.7us`, new `10821.2us`, old-minus-new `+248.5us`, `16/16` wins, loss rel
+  diff `+5.295e-07`, worst grad rel `0.006168`.
+- Post-route profile
+  `mkv3-p4b-qwen-n256-ntbf16-res-profile-20260706T0204Z.log` measured total
+  `10850.8us`. On-path residual NT spans are now `GEMMNT 1024x2560x9728.wg`
+  `287.1us` and `GEMMNT 1024x2560x4096.wg` `155.9us`; no-residual `wgu`/`wqkv`
+  remain `313.1us` and `123.3us`. The remaining top work is still lm-head fwd
+  `3045.1us` and head-dX `2947.6us`, so the next qwen GEMM lane is those giant
+  vocab/head paths or the shared mbarrier-ring port, not another narrow NT-forward
+  expansion.
+- Full `test_model.py` passed in
+  `mkv3-p4b-qwen-n256-ntbf16-res-testmodel-20260706T0208Z.log`.
+
 ## v3 P4b fwd KV-widening in-model (session 2853e0de): NO-GO — absorption
 
 The FA4-B w128 fwd port (OP_ATTN_FWD_WGW128, `megakernel-attn-w128` worktree,

@@ -53,7 +53,7 @@ def test_gemm():
     run1(lambda p: p.instr(mk.OP_GEMM, gemm_tiles(M, N), [p.buf(A), p.buf(Wt), p.buf(C2), M, N, K, 2 | 16, p.buf(Res)]))
     check("NT + residual", C2, A.float() @ Wt.float().T + Res.float(), atol=0.35)
 
-    # Direct m64n256 NT bf16 route: used by exact-gated qwen no-residual forwards.
+    # Direct m64n256 NT bf16 route: used by exact-gated qwen forwards.
     M2, N2, K2 = 128, 256, 64
     A2 = torch.randn(M2, K2, device=DEV, dtype=torch.bfloat16)
     Wt2 = torch.randn(N2, K2, device=DEV, dtype=torch.bfloat16)
@@ -66,6 +66,32 @@ def test_gemm():
         )
     )
     check("NT n256 bf16", C2n, A2.float() @ Wt2.float().T, atol=0.35)
+
+    Res2 = torch.randn(M2, N2, device=DEV, dtype=torch.bfloat16)
+    C2r = torch.empty(M2, N2, device=DEV, dtype=torch.bfloat16)
+    parts2 = torch.empty(M2, N2 // 64, device=DEV, dtype=torch.float32)
+    run1(
+        lambda p: p.instr(
+            mk.OP_GEMM,
+            mk.gemm_tiles_wgmma_n256_direct(M2, N2),
+            [
+                p.buf(A2),
+                p.buf(Wt2),
+                p.buf(C2r),
+                M2,
+                N2,
+                K2,
+                2 | 16 | 128 | 16384 | 8192,
+                p.buf(Res2),
+                0,
+                p.buf(parts2),
+                N2 // 64,
+            ],
+        )
+    )
+    ref2r = (A2.float() @ Wt2.float().T + Res2.float()).to(torch.bfloat16).float()
+    check("NT n256 residual", C2r, ref2r, atol=0.35)
+    check("NT n256 ssq", parts2, ref2r.view(M2, N2 // 64, 64).pow(2).sum(-1), atol=0.4, rtol=3e-2)
 
     # A^T (dW shape), fp32 out, accumulate
     C3 = torch.ones(M, N, device=DEV, dtype=torch.float32)

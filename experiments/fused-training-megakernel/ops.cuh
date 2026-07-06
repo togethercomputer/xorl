@@ -490,6 +490,7 @@ __device__ __noinline__ void op_gemm_wgmma_n256_direct(const Instr& I, int tile,
   bf16* C = reinterpret_cast<bf16*>(bufs[I.args[2]]);
   const int N = I.args[4], K = I.args[5], flags = I.args[6];
   if (!(flags & 2)) return;
+  const bf16* Res = (flags & 16) ? reinterpret_cast<const bf16*>(bufs[I.args[7]]) : nullptr;
 
   smem_raw = reinterpret_cast<char*>(
       (reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
@@ -552,10 +553,51 @@ __device__ __noinline__ void op_gemm_wgmma_n256_direct(const Instr& I, int tile,
 #pragma unroll
       for (int i = 0; i < 2; ++i) {
         const int r = wg * 64 + w * 16 + l / 4 + 8 * i;
+        const int64_t idx = (int64_t)(m0 + r) * N + n0 + c;
         __nv_bfloat162 out;
-        out.x = f2bf(d[n8 * 4 + i * 2 + 0]);
-        out.y = f2bf(d[n8 * 4 + i * 2 + 1]);
-        *reinterpret_cast<__nv_bfloat162*>(&C[(int64_t)(m0 + r) * N + n0 + c]) = out;
+        float v0 = d[n8 * 4 + i * 2 + 0];
+        float v1 = d[n8 * 4 + i * 2 + 1];
+        if (Res) {
+          v0 += bf2f(Res[idx + 0]);
+          v1 += bf2f(Res[idx + 1]);
+        }
+        out.x = f2bf(v0);
+        out.y = f2bf(v1);
+        *reinterpret_cast<__nv_bfloat162*>(&C[idx]) = out;
+      }
+    }
+  }
+
+  if (flags & 8192) {  // ssq partials from post-residual bf16-rounded output
+    float* parts = reinterpret_cast<float*>(bufs[I.args[9]]);
+    const int nparts = I.args[10];
+    const int warp = tid / 32, lane = tid % 32;
+    const int row_base = (warp / 4) * 64 + (warp & 3) * 16;
+    const int lane_row = lane / 4;
+    const int cb = (lane & 3) * 2;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const int r = row_base + lane_row + 8 * i;
+#pragma unroll
+      for (int half = 0; half < 4; ++half) {
+        if (half * WG_BN >= valid_cols) continue;
+        float ss = 0.0f;
+#pragma unroll
+        for (int n8 = half * 8; n8 < half * 8 + 8; ++n8) {
+#pragma unroll
+          for (int j = 0; j < 2; ++j) {
+            const int c = n8 * 8 + cb + j;
+            float v = d[n8 * 4 + i * 2 + j];
+            if (Res) v += bf2f(Res[(int64_t)(m0 + r) * N + n0 + c]);
+            const float zv = bf2f(f2bf(v));
+            ss += zv * zv;
+          }
+        }
+#pragma unroll
+        for (int o = 1; o < 4; o <<= 1) ss += __shfl_xor_sync(0xffffffff, ss, o);
+        const int part = n0 / WG_BN + half;
+        if ((lane & 3) == 0 && part < nparts)
+          parts[(int64_t)(m0 + r) * nparts + part] = ss;
       }
     }
   }

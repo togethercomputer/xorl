@@ -375,9 +375,11 @@ class MKQwen3:
                 p.instr(
                     mk.OP_GEMM,
                     mk.gemm_tiles_wgmma_n256_direct(M, N),
-                    [a, b, out, M, N, K, flags | 128 | 16384, res],
+                    [a, b, out, M, N, K, flags | 128 | 16384 | (8192 if do_ssq else 0),
+                     res, 0, ssq, ssq_nparts] if do_ssq
+                    else [a, b, out, M, N, K, flags | 128 | 16384, res],
                 )
-                return False
+                return do_ssq
             if mk.wgmma_n128_ok(M, N, K, flags):  # m64n128 NT tile (P4b r3)
                 f = flags | 128 | 4096 | (8192 if do_ssq else 0)
                 p.instr(mk.OP_GEMM, mk.gemm_tiles_wgmma_n128(M, N),
