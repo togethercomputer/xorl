@@ -226,6 +226,27 @@ def wgmma_n256_nn_bf16_ok(M, N, K, flags):
     return qkvdx_on and (M, N, K) == (1024, 2560, 6144)  # qwen4b-l1 wqkv dX
 
 
+def wgmma_n256_nn_bf16_drow_ok(M, N, K, flags):
+    """Qwen fused dOatt/Drow m64n256 route.
+
+    Exact-gated because the n256 Drow epilogue is specialized for qwen D=128:
+    each 256-column tile covers two complete attention heads and publishes two
+    drow reductions per row. Set MK_WGMMA_N256_DROW_BF16=0 to restore the
+    existing WGMMA Drow route.
+    """
+    mode_env = os.environ.get("MK_WGMMA_N256_DROW_BF16")
+    mode = -1 if mode_env is None else int(mode_env)
+    if mode == 0:
+        return False
+    if flags != 1024:
+        return False
+    if M % 128 or N % 256 or K % 64:
+        return False
+    if mode == 1:
+        return True
+    return (M, N, K) == (1024, 4096, 2560)  # qwen4b-l1 dOatt + Drow, D=128
+
+
 def gemm_tiles_wgmma_n256_direct(M, N):
     return (M // 128) * ((N + 255) // 256)
 
@@ -237,6 +258,7 @@ _QWEN_N256_STAGE3_SHAPES = {
     (1024, 6144, 2560),     # wqkv fwd
     (1024, 2560, 9728),     # wd fwd
     (1024, 2560, 4096),     # wo fwd
+    (1024, 4096, 2560),     # wo dX + Drow
     (1024, 9728, 2560),     # wd dX
     (1024, 2560, 19456),    # wgu dX
     (1024, 2560, 6144),     # wqkv dX

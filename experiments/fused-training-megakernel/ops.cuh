@@ -700,7 +700,7 @@ __device__ __noinline__ void op_gemm_wgmma_n256_direct_impl(const Instr& I, int 
 // m64n256 direct-store tile for exact qwen giant-vocab NN head-dX / TN dW and
 // scratch-gated BF16 NN dX follow-ups. This keeps the 100KB page by skipping the
 // fp32 epilogue slab. It is deliberately narrow: no split-K/acc/residual.
-template <int STAGES>
+template <int STAGES, bool DROW = false>
 __device__ __noinline__ void op_gemm_wgmma_n256_nn_f32_impl(const Instr& I, int tile,
                                                             void** bufs, char* smem_raw) {
   namespace SG = cute::SM90::GMMA;
@@ -708,8 +708,13 @@ __device__ __noinline__ void op_gemm_wgmma_n256_nn_f32_impl(const Instr& I, int 
   const bf16* B = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
   void* Cp = bufs[I.args[2]];
   const int M = I.args[3], N = I.args[4], K = I.args[5], flags = I.args[6];
-  if ((flags & 2) || (flags & (4 | 16 | 32 | 256 | 1024 | 2048 | 8192))) {
+  if ((flags & 2) || (flags & (4 | 16 | 32 | 256 | 2048 | 8192))) {
     return;
+  }
+  if constexpr (DROW) {
+    if (!(flags & 1024) || (flags & 8) || I.args[11] != 128) return;
+  } else {
+    if (flags & 1024) return;
   }
 
   smem_raw = reinterpret_cast<char*>(
@@ -786,22 +791,59 @@ __device__ __noinline__ void op_gemm_wgmma_n256_nn_f32_impl(const Instr& I, int 
 
   const int w = wtid / 32, l = wtid % 32;
   const int cb = (l & 3) * 2;
+  if constexpr (DROW) {
+    bf16* C = reinterpret_cast<bf16*>(Cp);
+    const bf16* Oatt = reinterpret_cast<const bf16*>(bufs[I.args[9]]);
+    float* drow = reinterpret_cast<float*>(bufs[I.args[10]]);
+    const int D = I.args[11];
+    float drow_sum[2][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}};
 #pragma unroll
-  for (int n8 = 0; n8 < 32; ++n8) {
+    for (int n8 = 0; n8 < 32; ++n8) {
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const int r = wg * 64 + w * 16 + l / 4 + 8 * i;
+        const int64_t idx = (int64_t)(m0 + r) * N + n0 + n8 * 8 + cb;
+        __nv_bfloat162 out;
+        const bf16 z0 = f2bf(d[n8 * 4 + i * 2 + 0]);
+        const bf16 z1 = f2bf(d[n8 * 4 + i * 2 + 1]);
+        out.x = z0;
+        out.y = z1;
+        *reinterpret_cast<__nv_bfloat162*>(&C[idx]) = out;
+        const int h = n8 >> 4;
+        drow_sum[i][h] += bf2f(z0) * bf2f(Oatt[idx]) + bf2f(z1) * bf2f(Oatt[idx + 1]);
+      }
+    }
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
-      const int r = wg * 64 + w * 16 + l / 4 + 8 * i;
-      const int64_t idx = (int64_t)(m0 + r) * N + n0 + n8 * 8 + cb;
-      if (c_f32) {
-        float* C = reinterpret_cast<float*>(Cp);
-        float2 out = make_float2(d[n8 * 4 + i * 2 + 0], d[n8 * 4 + i * 2 + 1]);
-        *reinterpret_cast<float2*>(&C[idx]) = out;
-      } else {
-        bf16* C = reinterpret_cast<bf16*>(Cp);
-        __nv_bfloat162 out;
-        out.x = f2bf(d[n8 * 4 + i * 2 + 0]);
-        out.y = f2bf(d[n8 * 4 + i * 2 + 1]);
-        *reinterpret_cast<__nv_bfloat162*>(&C[idx]) = out;
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        float s = drow_sum[i][h];
+        s += __shfl_xor_sync(0xffffffff, s, 1);
+        s += __shfl_xor_sync(0xffffffff, s, 2);
+        if ((l & 3) == 0) {
+          const int r = wg * 64 + w * 16 + l / 4 + 8 * i;
+          atomicAdd(&drow[(int64_t)(n0 / D + h) * M + m0 + r], s);
+        }
+      }
+    }
+  } else {
+#pragma unroll
+    for (int n8 = 0; n8 < 32; ++n8) {
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const int r = wg * 64 + w * 16 + l / 4 + 8 * i;
+        const int64_t idx = (int64_t)(m0 + r) * N + n0 + n8 * 8 + cb;
+        if (c_f32) {
+          float* C = reinterpret_cast<float*>(Cp);
+          float2 out = make_float2(d[n8 * 4 + i * 2 + 0], d[n8 * 4 + i * 2 + 1]);
+          *reinterpret_cast<float2*>(&C[idx]) = out;
+        } else {
+          bf16* C = reinterpret_cast<bf16*>(Cp);
+          __nv_bfloat162 out;
+          out.x = f2bf(d[n8 * 4 + i * 2 + 0]);
+          out.y = f2bf(d[n8 * 4 + i * 2 + 1]);
+          *reinterpret_cast<__nv_bfloat162*>(&C[idx]) = out;
+        }
       }
     }
   }
@@ -1081,10 +1123,19 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
       else
         op_gemm_wgmma_n256_direct_impl<2>(I, tile, bufs, smem_raw);
     } else {
-      if (flags & GEMM_N256_STAGE3_FLAG)
-        op_gemm_wgmma_n256_nn_f32_impl<3>(I, tile, bufs, smem_raw);
-      else
-        op_gemm_wgmma_n256_nn_f32_impl<2>(I, tile, bufs, smem_raw);
+      if (flags & GEMM_N256_STAGE3_FLAG) {
+        if (flags & 1024) {
+          op_gemm_wgmma_n256_nn_f32_impl<3, true>(I, tile, bufs, smem_raw);
+        } else {
+          op_gemm_wgmma_n256_nn_f32_impl<3, false>(I, tile, bufs, smem_raw);
+        }
+      } else {
+        if (flags & 1024) {
+          op_gemm_wgmma_n256_nn_f32_impl<2, true>(I, tile, bufs, smem_raw);
+        } else {
+          op_gemm_wgmma_n256_nn_f32_impl<2, false>(I, tile, bufs, smem_raw);
+        }
+      }
     }
     return;
   }

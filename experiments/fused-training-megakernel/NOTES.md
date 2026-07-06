@@ -4866,6 +4866,34 @@ wins 15/16 (`mkv3-p4b-qwen-n256-qkvdx-main-ab-20260706T1233Z.log`). Main
 `test_ops.py` passed, including the n256 BF16 NN coverage
 (`mkv3-p4b-qwen-n256-qkvdx-main-testops-20260706T1235Z.log`).
 
+## Qwen fused dOatt/Drow m64n256 route (this session, 20260706T1245Z)
+
+Added exact qwen D=128 support for the fused dOatt/Drow GEMM through the n256
+NN direct body: `GEMMNN 1024x4096x2560` with flags bit10. The n256 Drow
+specialization is compile-time separated from the non-Drow n256 NN routes, and
+the route is gated by `wgmma_n256_nn_bf16_drow_ok`; set
+`MK_WGMMA_N256_DROW_BF16=0` to restore the previous WGMMA Drow route.
+
+Scratch route check moved only the Drow row from WGMMA (`flags=1152`, tiles 512)
+to qwen stage3+n-major n256 (`flags=100680832`, tiles 128), leaving `n_instr=47`,
+`critical_path=26`, and qwen smem at 148KB. Qwen smoke parity was clean
+(`loss_diff=+1.91e-06`, worst grad `emb` rel `3.00e-03`;
+`mkv3-p4b-drow-n256-qwen-smoke-20260706T1241Z.log`). Paired qwen timing won
+both construction orders: old-then-new median +152.8us old-minus-new, new wins
+16/16; new-then-old median +127.5us, new wins 16/16
+(`mkv3-p4b-drow-n256-qwen-ab-20260706T1243Z.log`). Profile attribution showed
+the targeted Drow row span moving from 350.7us to 244.7us, with best traced step
+9287.3us -> 9022.7us
+(`mkv3-p4b-profile-drow-n256-qwen-20260706T1243Z.log`). Scratch `test_ops.py`
+passed with new direct coverage for both `NN n256 drow bf16` and `NN n256 drow`
+(`mkv3-p4b-drow-n256-qwen-testops-20260706T1244Z.log`).
+After applying the same patch in main, the qwen A/B remained positive:
+`loss_diff=+3.81e-06`, worst grad `emb` rel `3.00e-03`, old-then-new median
++120.2us old-minus-new with new wins 16/16, and new-then-old median +140.3us
+with new wins 15/16 (`mkv3-p4b-drow-n256-qwen-main-ab-20260706T1247Z.log`).
+Main `test_ops.py` passed with the new n256 Drow cases
+(`mkv3-p4b-drow-n256-qwen-main-testops-20260706T1249Z.log`).
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

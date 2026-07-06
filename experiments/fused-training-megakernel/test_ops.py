@@ -191,6 +191,35 @@ def test_gemm():
     )
     check("NN n256 nmajor bf16", C3nnbn, A3.float() @ B3.float(), atol=0.35)
 
+    O3 = torch.randn(M3, 256, device=DEV, dtype=torch.bfloat16)
+    C3drow = torch.empty(M3, 256, device=DEV, dtype=torch.bfloat16)
+    Drow3 = torch.zeros(2, M3, device=DEV, dtype=torch.float32)
+    run1(
+        lambda p: p.instr(
+            mk.OP_GEMM,
+            mk.gemm_tiles_wgmma_n256_direct(M3, 256),
+            [
+                p.buf(A3),
+                p.buf(B3),
+                p.buf(C3drow),
+                M3,
+                256,
+                K3,
+                1024 | 128 | 16384 | mk.GEMM_N256_STAGE3_FLAG | mk.GEMM_N256_NMAJOR_FLAG,
+                0,
+                0,
+                p.buf(O3),
+                p.buf(Drow3),
+                128,
+            ],
+        ),
+        smem_bytes=148 * 1024,
+    )
+    ref3d = (A3.float() @ B3.float()).to(torch.bfloat16).float()
+    check("NN n256 drow bf16", C3drow, ref3d, atol=0.35)
+    ref_drow3 = (ref3d.view(M3, 2, 128) * O3.float().view(M3, 2, 128)).sum(-1).T
+    check("NN n256 drow", Drow3, ref_drow3, atol=0.45, rtol=3e-2)
+
     At3 = torch.randn(K3, M3, device=DEV, dtype=torch.bfloat16)
     C3tn = torch.empty(M3, 256, device=DEV, dtype=torch.float32)
     run1(

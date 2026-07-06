@@ -936,7 +936,17 @@ class MKQwen3:
             # through WGMMA whenever the GEMM gate accepts the shape"; =0 restores WMMA.
             drow_wg_default = "1"
             drow_wg = bool(int(os.environ.get("MK_DROW_WG_LONGONLY", drow_wg_default)))
-            if drow_wg and mk.wgmma_ok(c.S, c.nq * c.D, c.H, drow_flags):
+            if drow_wg and mk.wgmma_n256_nn_bf16_drow_ok(c.S, c.nq * c.D, c.H, drow_flags):
+                stage3 = n256_stage3_flag(c.S, c.nq * c.D, c.H)
+                nmajor = n256_nmajor_flag(c.S, c.nq * c.D, c.H)
+                p.instr(
+                    mk.OP_GEMM,
+                    mk.gemm_tiles_wgmma_n256_direct(c.S, c.nq * c.D),
+                    [B(W["dX"]), pr("wo"), B(W["dOatt"]), c.S, c.nq * c.D, c.H,
+                     drow_flags | 128 | 16384 | stage3 | nmajor,
+                     0, 0, a("oatt"), B(W[f"drow.{l}"]), c.D],
+                )
+            elif drow_wg and mk.wgmma_ok(c.S, c.nq * c.D, c.H, drow_flags):
                 p.instr(
                     mk.OP_GEMM,
                     mk.gemm_tiles_wgmma(c.S, c.nq * c.D),
