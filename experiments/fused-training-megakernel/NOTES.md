@@ -4974,6 +4974,38 @@ and `47/48`. Main validation passed `py_compile`, `git diff --check`,
 `mkv3-p4b-qwen-swiglu-4w-main-default-first-20260706T1505Z.log`,
 `mkv3-p4b-qwen-swiglu-4w-main-old2w-first-20260706T1505Z.log`.
 
+## Small H512/S1024 SwiGLU backward 4W route (this session, 20260706T1530Z)
+
+Extended the existing `SWIGLU_BWD_4W` opcode to the exact small benchmark shape
+`H512/S1024/I1536/V16384/nq8/nkv4/D64/L8`. The default now routes small's
+cached-sigmoid SwiGLU backward rows through four warps per row, while
+`MK_SWIGLU_BWD_4W=0` restores the old 2W route for A/B. This current-head
+recheck overturns the earlier small 4W no-go after the surrounding scheduler and
+4W implementation changed.
+
+Current-head refresh before the change measured small at `3601.0us` in
+`profile_df.py` and `3576.2us` vs graph+ `1903.9us` in `final_bench.py`; the
+on-path `SWIGLU_BWD_2W` bucket was `31.5us` wait + `210.7us` span. Source-free
+env A/B with `MK_SWIGLU_BWD_4W=1` routed default `sw_bwd2w=8/2048` versus
+candidate `sw_bwd4w=8/4096`, kept selected-gradient parity clean
+(`loss_diff=+0.00e+00` / `+2.86e-06`, worst grad `qn.0` rel `<5.3e-07`), and
+won both construction orders: default-minus-4W medians `+132.27us` and
+`+121.23us`, 4W wins `80/80` and `80/80`. Logs:
+`mkv3-p4b-small-swiglu-4w-current-default-first-20260706T1517Z.log`,
+`mkv3-p4b-small-swiglu-4w-current-sw4w-first-20260706T1517Z.log`.
+
+After promoting the shape default, forced-old A/B stayed positive with the same
+route split and clean parity (`loss_diff=-4.77e-06` / `+0.00e+00`, worst grad
+`qn.0` rel `4.41e-07`). Default4W won both construction orders:
+old2w-minus-default medians `+126.06us` and `+133.02us`, wins `80/80` and
+`80/80`. The refreshed default profile measured `3458.7us`; refreshed score
+measured small `3446.7us` vs graph+ `1890.7us` (gap `1.82x`). Validation passed
+`py_compile`, `git diff --check`, `test_model.py`, and `test_ops.py`. Logs:
+`mkv3-p4b-small-swiglu-4w-promoted-default-first-20260706T1528Z.log`,
+`mkv3-p4b-small-swiglu-4w-promoted-old2w-first-20260706T1528Z.log`,
+`mkv3-p4b-profile-small-swiglu-4w-default-20260706T1528Z.log`,
+`mkv3-p4b-score-small-swiglu-4w-default-20260706T1528Z.log`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

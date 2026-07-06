@@ -71,6 +71,9 @@ _QWEN_L1_SWIGLU_BWD_2W = {
 _QWEN_L1_SWIGLU_BWD_4W = {
     (2560, 1024, 9728, 151936, 32, 8, 128, 1),  # H,S,I,V,nq,nkv,D,L
 }
+_SMALL_SWIGLU_BWD_4W = {
+    (512, 1024, 1536, 16384, 8, 4, 64, 8),  # H,S,I,V,nq,nkv,D,L
+}
 _H256_IDLE32_S = (2048, 3072, 4096, 8192)  # H==256: scheduler idle poll 32ns (else 256)
 _H256_DQ_FLOAT2_S = (3072, 4096, 8192)     # H==256: attention-dQ float2 direct store
 _H256_D64_DKV_ROW_BCAST_S = ()             # H==256/D==64: attention-dKV row scalar shuffles
@@ -261,6 +264,7 @@ class MKQwen3:
         )
         self.swiglu_bwd_4w_default = (
             (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) in _QWEN_L1_SWIGLU_BWD_4W
+            or (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) in _SMALL_SWIGLU_BWD_4W
         )
         self.drow_direct_store_default = c.D == 64 and c.S < 2048
         drow_direct_store_env = os.environ.get("MK_DROW_DIRECT_STORE")
