@@ -5181,6 +5181,17 @@ cap48-minus-cap64 `-0.13us` median, cap64 wins `79/160`; cap64-first measured
 `mkv3-p4b-small-coldcap-after-n128-focused-20260706T1810Z.log`. Detail note:
 `results/operator-gap/small-coldcap-post-n128-nogo.md`.
 
+## Post-n128 small GEMM mbar-ring recheck (this session, 20260706T1825Z)
+
+After the n128 row gates, rechecked H512/S1024 small `MK_GEMM_MBAR_RING=0`.
+Program shape stayed `n_instr=288`, `critical_path=144`, `gated=127`, and
+parity stayed clean (`loss_diff=+3.81e-06` / `+0.00e+00`, worst selected grad
+rel `<6.8e-07`). Forced old two-stage GEMM feed path lost both construction
+orders by a large margin: old-minus-default medians `+154.51us` and `+150.94us`,
+default wins `80/80` and `80/80`. Keep the D64 mbar-ring default. Log:
+`mkv3-p4b-small-gmbar-after-n128-20260706T1820Z.log`. Detail note:
+`results/operator-gap/small-gmbar-post-n128-keep.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
