@@ -5320,6 +5320,16 @@ lost both orders: default-minus-float2 `-3.18us` and `-5.76us`, float2 wins
 gates. Log: `mkv3-p4b-small-dqf2-post-aflog-20260706T1709Z.log`. Detail note:
 `results/operator-gap/small-dqf2-post-aflog-nogo.md`.
 
+Post-fast-log small attention exp2 recheck: forced the old precise exp path with
+`MK_ATTN_EXP2_APPROX=0` after the small fast-log retune. The forced-old
+extension correctly dropped `_aex2`, kept route shape unchanged (`n_instr=288`,
+`critical_path=144`, `gated=127`, `ATTN_FWD/DKV/DQ=8/512`), and parity stayed
+clean (`loss_diff=-1.91e-06` / `-9.54e-07`, worst selected grad rel
+`<5.4e-07`). Precise exp lost both orders: default-minus-precise `-28.80us`
+and `-25.66us`, precise wins `3/80` and `3/80`. Keep `_aex2` enabled for
+H512/S1024 small. Log: `mkv3-p4b-small-aex2-post-aflog-20260706T1712Z.log`.
+Detail note: `results/operator-gap/small-aex2-post-aflog-keep.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
