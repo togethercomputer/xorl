@@ -1214,6 +1214,53 @@ __device__ __noinline__ void op_gemm_wgmma_n128(const Instr& I, int tile, void**
       }
     }
   }
+
+  if (flags & 256) {  // qk-RMSNorm + RoPE over the two 64-col heads in this n128 tile
+    const int nq_ = I.args[16], nkv_ = I.args[17], D_ = I.args[18];
+    if (D_ != WG_BN) return;
+    const float eps = __int_as_float(I.args[19]);
+    bf16* qkvr = reinterpret_cast<bf16*>(bufs[I.args[15]]);
+    const int warp = tid / 32, lane = tid % 32;
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+      const int n_base = n0 + half * WG_BN;
+      const int head = n_base / D_;
+      if (head >= nq_ + nkv_) {
+#pragma unroll
+        for (int g = 0; g < 4; ++g) {
+          const int gid = tid + g * 256;
+          const int m = gid / 8, c8 = (gid % 8) * 8;
+          uint4 out;
+          bf16* oe = reinterpret_cast<bf16*>(&out);
+#pragma unroll
+          for (int e = 0; e < 8; ++e) oe[e] = f2bf(Cs[m * WG_LDC_N128 + half * WG_BN + c8 + e]);
+          *reinterpret_cast<uint4*>(&qkvr[(int64_t)(m0 + m) * N + n_base + c8]) = out;
+        }
+      } else {
+        const bool is_q = head < nq_;
+        const bf16* w_ = reinterpret_cast<const bf16*>(bufs[is_q ? I.args[9] : I.args[10]]);
+        float* rstd = reinterpret_cast<float*>(bufs[is_q ? I.args[11] : I.args[12]]);
+        const float* cosr = reinterpret_cast<const float*>(bufs[I.args[13]]);
+        const float* sinr = reinterpret_cast<const float*>(bufs[I.args[14]]);
+        const int hd = is_q ? head : head - nq_;
+        for (int r = warp; r < WG_BM; r += 8) {
+          const int gm = m0 + r;
+          const float x0 = Cs[r * WG_LDC_N128 + half * WG_BN + lane];
+          const float x1 = Cs[r * WG_LDC_N128 + half * WG_BN + lane + 32];
+          float ss = x0 * x0 + x1 * x1;
+#pragma unroll
+          for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, o);
+          const float rs = rsqrtf(ss / D_ + eps);
+          if (lane == 0) rstd[(int64_t)gm * (is_q ? nq_ : nkv_) + hd] = rs;
+          const float a = x0 * rs * bf2f(w_[lane]);
+          const float b = x1 * rs * bf2f(w_[lane + 32]);
+          const float cv = cosr[(int64_t)gm * 32 + lane], sv = sinr[(int64_t)gm * 32 + lane];
+          qkvr[(int64_t)gm * N + n_base + lane] = f2bf(a * cv - b * sv);
+          qkvr[(int64_t)gm * N + n_base + lane + 32] = f2bf(b * cv + a * sv);
+        }
+      }
+    }
+  }
 }
 
 __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_raw) {

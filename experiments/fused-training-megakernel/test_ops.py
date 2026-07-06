@@ -287,6 +287,65 @@ def test_gemm():
     check("NT n256 residual", C2r, ref2r, atol=0.35)
     check("NT n256 ssq", parts2, ref2r.view(M2, N2 // 64, 64).pow(2).sum(-1), atol=0.4, rtol=3e-2)
 
+    Mq, Nq, Kq, Dq, nq, nkv, eps = 128, 256, 64, 64, 2, 1, 1e-6
+    Aq = torch.randn(Mq, Kq, device=DEV, dtype=torch.bfloat16)
+    Wq = torch.randn(Nq, Kq, device=DEV, dtype=torch.bfloat16)
+    Cq = torch.empty(Mq, Nq, device=DEV, dtype=torch.bfloat16)
+    QKVR = torch.empty(Mq, Nq, device=DEV, dtype=torch.bfloat16)
+    qw = torch.randn(Dq, device=DEV, dtype=torch.bfloat16)
+    kw = torch.randn(Dq, device=DEV, dtype=torch.bfloat16)
+    rq = torch.empty(Mq, nq, device=DEV, dtype=torch.float32)
+    rk = torch.empty(Mq, nkv, device=DEV, dtype=torch.float32)
+    cos = torch.randn(Mq, Dq // 2, device=DEV, dtype=torch.float32)
+    sin = torch.randn(Mq, Dq // 2, device=DEV, dtype=torch.float32)
+    run1(
+        lambda p: p.instr(
+            mk.OP_GEMM,
+            mk.gemm_tiles_wgmma_n128(Mq, Nq),
+            [
+                p.buf(Aq),
+                p.buf(Wq),
+                p.buf(Cq),
+                Mq,
+                Nq,
+                Kq,
+                2 | 128 | 256 | 4096,
+                0,
+                0,
+                p.buf(qw),
+                p.buf(kw),
+                p.buf(rq),
+                p.buf(rk),
+                p.buf(cos),
+                p.buf(sin),
+                p.buf(QKVR),
+                nq,
+                nkv,
+                Dq,
+                mk.f2i(eps),
+            ],
+        )
+    )
+    raw = Aq.float() @ Wq.float().T
+    ref_heads = raw.view(Mq, nq + 2 * nkv, Dq)
+    ref_q = ref_heads[:, :nq]
+    ref_k = ref_heads[:, nq:nq + nkv]
+    ref_v = ref_heads[:, nq + nkv:]
+    ref_rq = torch.rsqrt(ref_q.pow(2).mean(-1) + eps)
+    ref_rk = torch.rsqrt(ref_k.pow(2).mean(-1) + eps)
+
+    def rope(x, rstd, w):
+        y = x * rstd[..., None] * w.float()
+        a, b = y[..., : Dq // 2], y[..., Dq // 2:]
+        cc, ss = cos[:, None, :], sin[:, None, :]
+        return torch.cat([a * cc - b * ss, b * cc + a * ss], dim=-1)
+
+    ref_qkvr = torch.cat([rope(ref_q, ref_rq, qw), rope(ref_k, ref_rk, kw), ref_v], dim=1).reshape(Mq, Nq)
+    check("NT n128 qkrope raw", Cq, raw, atol=0.35)
+    check("NT n128 qkrope out", QKVR, ref_qkvr, atol=0.35)
+    check("NT n128 qkrope rq", rq, ref_rq, atol=1e-4)
+    check("NT n128 qkrope rk", rk, ref_rk, atol=1e-4)
+
     # A^T (dW shape), fp32 out, accumulate
     C3 = torch.ones(M, N, device=DEV, dtype=torch.float32)
     run1(lambda p: p.instr(mk.OP_GEMM, gemm_tiles(M, N), [p.buf(At), p.buf(B), p.buf(C3), M, N, K, 1 | 4 | 8, 0]))

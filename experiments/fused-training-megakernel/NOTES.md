@@ -5892,6 +5892,30 @@ wins, then `+2.74us` in variant-first with `5/16` scalar wins. Keep S8192 in
 `mkv3-p4b-s8192-adqf2-postn256nn-variant-first-20260706T2028Z.log`. Detail note:
 `results/operator-gap/s8192-adqf2-postn256nn-nogo.md`.
 
+S8192 fused-qkrope n128 promotion: route inventory after the n256 NN promotion
+showed the only remaining one-wave plain GEMM forward row still on wg64 was the
+fused qkv/qk-RMSNorm/RoPE row, four `GEMMNT 8192x512x256.wg.+qkrope`
+instructions at `512` tiles each. Added a narrow `op_gemm_wgmma_n128` epilogue
+for `flags & 256` that processes the two 64-column D64 heads in a 128-column
+tile, including q/k rstd, RoPE, and v-head passthrough, and gated it by default
+only for exact H256/D64/S8192 (`MK_WGMMA_N128_QKROPE=0` restores the old wg64
+route; `=1` force-enables D64 qkv probes). Route inspection confirms the four
+rows now emit `n128+qkrope` at `256` tiles each. Full-gradient A/B against
+forced-old was clean and decisive in both construction orders: old route lost by
+`+56.37us` and `+52.26us` old-minus-new, with `0/16` and `1/16` old wins.
+Fresh profile shows the on-path fused-qkrope bucket at `173.1us` total
+(`161.4us` span) versus `211.4us` total (`199.0us` span) in the prior profile.
+Validation: `py_compile`, `ruff`, `test_ops.py` with a new n128 qkrope
+raw/rstd/RoPE unit case, `test_model.py`, and `git diff --check` passed. Logs:
+`s8192-current-gemm-route-inventory-20260706T2035Z.log`,
+`s8192-qkrope-n128-route-20260706T2034Z.log`,
+`mkv3-p4b-s8192-qkrope-n128-default-first-20260706T2034Z.log`,
+`mkv3-p4b-s8192-qkrope-n128-variant-first-20260706T2034Z.log`,
+`mkv3-p4b-profile-s8192-qkrope-n128-20260706T2034Z.log`,
+`mkv3-p4b-s8192-qkrope-n128-test-ops-20260706T2034Z.log`, and
+`mkv3-p4b-s8192-qkrope-n128-test-model-20260706T2034Z.log`. Detail note:
+`results/operator-gap/s8192-qkrope-n128-promote.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

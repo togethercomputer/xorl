@@ -85,6 +85,7 @@ _ATTN_BWD_BAND_T = {2048: 12, 3072: 16, 4096: 29, 8192: 40}  # H==256/D==64; 0 e
 _ATTN_FWD_BAND_T = {2048: 16, 3072: 32, 4096: 22, 8192: 64}  # H==256/D==64; 0 elsewhere
 _ATTN_BAND_DQ_FIRST_S = (8192,)  # H==256/D==64: dq-first band emission (else lpt)
 _H256_D64_QKBWD_SPLIT_V_S = (3072, 4096, 8192)  # H==256/D==64: split qkrope v-bwd
+_H256_D64_QKROPE_N128_S = (8192,)  # H==256/D==64: qkv fwd fused-qkrope n128 route
 # H==256 uniform attention chunks (Ckv, Cq) when bands are off; other shapes use the
 # formula fallback (Ckv = 1 once nq*(S/128) >= 64 else 2, Cq = 1) at the use site.
 _H256_ATTN_CHUNKS = {512: (2, 2), 1024: (2, 2), 2048: (2, 2)}
@@ -662,10 +663,18 @@ class MKQwen3:
                     + ([B(A[f"Xssq.{l}"]), c.H // 64] if X_fused.get(l) else []))
             p.wave()
             if c.D == 64 and mk.wgmma_ok(c.S, QD, c.H, 2):
-                # qk-norm + rope fused into the qkv gemm epilogue (one head per tile)
+                qkrope_n128_env = os.environ.get("MK_WGMMA_N128_QKROPE")
+                qkrope_n128_default = c.H == 256 and c.S in _H256_D64_QKROPE_N128_S
+                qkrope_n128 = qkrope_n128_default if qkrope_n128_env is None else bool(int(qkrope_n128_env))
+                qkrope_flags = 2 | 128 | 256
+                qkrope_tiles = mk.gemm_tiles_wgmma(c.S, QD)
+                if qkrope_n128 and c.S % 128 == 0 and QD % 128 == 0 and c.H % 64 == 0:
+                    qkrope_flags |= 4096
+                    qkrope_tiles = mk.gemm_tiles_wgmma_n128(c.S, QD)
+                # qk-norm + rope fused into the qkv gemm epilogue.
                 p.instr(
                     mk.OP_GEMM,
-                    mk.gemm_tiles_wgmma(c.S, QD),
+                    qkrope_tiles,
                     [
                         a("xn1"),
                         pr("wqkv"),
@@ -673,7 +682,7 @@ class MKQwen3:
                         c.S,
                         QD,
                         c.H,
-                        2 | 128 | 256,
+                        qkrope_flags,
                         0,
                         0,
                         pr("qn"),
