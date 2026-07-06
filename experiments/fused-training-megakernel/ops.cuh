@@ -97,6 +97,31 @@ __device__ __forceinline__ void op_axpy_f32(const Instr& I, int tile, void** buf
     y[i] += a * x[i];
 }
 
+#ifdef MK_HEAD_DX_SKR
+// args: {ws, out, n, ks}; tile = 4096-element chunk index. out[i] = sum over ks
+// per-K-slice fp32 partial slabs (round-12 SKR: the split gemm stores plain
+// per-slice partials; this separate reduce replaces the fp32-atomic epilogue).
+__device__ __forceinline__ void op_skr_reduce(const Instr& I, int tile, void** bufs) {
+  const float* ws = reinterpret_cast<const float*>(bufs[I.args[0]]);
+  float* out = reinterpret_cast<float*>(bufs[I.args[1]]);
+  const int n = I.args[2];
+  const int ks = I.args[3];
+  const int base = tile * 4096, end = min(base + 4096, n);
+  const int quads = (end - base) / 4;  // n is a whole fp32 matrix: n % 4 == 0
+  const float4* w4 = reinterpret_cast<const float4*>(ws + base);
+  float4* o4 = reinterpret_cast<float4*>(out + base);
+  const long ns4 = (long)n / 4;  // slab stride in float4s
+  for (int i = mk_tid(); i < quads; i += MK_CONSUMERS) {
+    float4 acc = w4[i];
+    for (int k = 1; k < ks; ++k) {
+      const float4 p = w4[(long)k * ns4 + i];
+      acc.x += p.x; acc.y += p.y; acc.z += p.z; acc.w += p.w;
+    }
+    o4[i] = acc;
+  }
+}
+#endif
+
 // ---- GEMM -----------------------------------------------------------------------------
 // C[M,N] (+)= A[M,K] @ B[K,N].
 //   flags bit0: A stored [K,M] row-major (use A^T)
@@ -107,6 +132,9 @@ __device__ __forceinline__ void op_axpy_f32(const Instr& I, int tile, void** buf
 //   flags bit5: split-K (requires fp32 C, pre-zeroed): args[8] = #slices, each slice
 //               computes a K-range and accumulates via fp32 atomicAdd. Rescues SM
 //               occupancy for small dW matrices (few M*N tiles, large K).
+//   flags bit15 (MK_HEAD_DX_SKR builds, with bit5): split-K slices write plain fp32
+//               partials to per-slice slabs at C + slice*M*N (no zero-fill, no
+//               atomics); OP_SKR_REDUCE sums the slabs (round-12 SKR structure).
 //   flags bit14: direct m64n256 WGMMA tile; qwen-specific paths for NT lm-head with
 //                CE/LSE partials (bit11) and NN fp32 head-dX.
 //   flags bit25: opt-in 3-stage operand ring for the direct m64n256 tile. This needs
@@ -1148,8 +1176,19 @@ __device__ __noinline__ void op_gemm_wgmma_n128(const Instr& I, int tile, void**
     if (c_f32) {
       float* C = reinterpret_cast<float*>(Cp);
       if (flags & 32) {
+#ifdef MK_HEAD_DX_SKR
+        if (flags & 32768) {  // SKR: plain stores to this slice's partial slab
+          float* Cs32 = C + (int64_t)slice * M * N;
+          float4 o0 = make_float4(v[0], v[1], v[2], v[3]);
+          float4 o1 = make_float4(v[4], v[5], v[6], v[7]);
+          *reinterpret_cast<float4*>(&Cs32[idx]) = o0;
+          *reinterpret_cast<float4*>(&Cs32[idx + 4]) = o1;
+        } else
+#endif
+        {
 #pragma unroll
-        for (int e = 0; e < 8; ++e) atomicAdd(&C[idx + e], v[e]);
+          for (int e = 0; e < 8; ++e) atomicAdd(&C[idx + e], v[e]);
+        }
       } else {
         float4 o0 = make_float4(v[0], v[1], v[2], v[3]);
         float4 o1 = make_float4(v[4], v[5], v[6], v[7]);

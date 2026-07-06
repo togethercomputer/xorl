@@ -106,6 +106,14 @@ _QWEN_L1_DW_NO_ATOMIC_SK1 = {  # M,N,K for qwen4b-l1 dW GEMMs that split-K compu
 # dlogits @ Wlm split-K tile targets: {H: {S: target}}, 192 elsewhere.
 _HEAD_DX_TARGET = {256: {128: 32, 256: 64, 1024: 64, 512: 96, 2048: 96, 3072: 96},
                    512: {1024: 96}}
+# Round-12 SKR head-dX (splitK + separate reduce): K-sliced n128 tiles write plain
+# fp32 partial slabs; OP_SKR_REDUCE sums them into dXN_f32. Value = slice count.
+# Measured: small skr=2 -115/-108us 40/40 both orders (skr=3 -98, skr=4 -77/-59);
+# s2048 NO-GO (+18 both orders at skr=4, +3 at skr=2) — its no-atomic direct route
+# stands. MK_HEAD_DX_SKR force-overrides (0 restores the old route).
+_HEAD_DX_SKR = {
+    (512, 1024, 1536, 16384, 8, 4, 64, 8): 2,  # H,S,I,V,nq,nkv,D,L (small)
+}
 
 
 def _cold_cap(c):
@@ -228,6 +236,17 @@ class MKQwen3:
         for l in range(c.L):
             W[f"dQKV_f32.{l}"] = torch.empty(c.S, QD, device=dev, dtype=f32)
         W["dXN_f32"] = torch.empty(c.S, c.H, device=dev, dtype=f32)
+        # round-12 SKR head-dX (see _HEAD_DX_SKR): per-K-slice fp32 partial slabs for
+        # the split head-dX gemm; OP_SKR_REDUCE sums them into dXN_f32
+        skr_env = os.environ.get("MK_HEAD_DX_SKR")
+        skr_key = (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L)
+        self.head_dx_skr = (
+            _HEAD_DX_SKR.get(skr_key, 0) if skr_env is None else int(skr_env)
+        )
+        if not (c.S % 128 == 0 and c.H % 128 == 0 and c.V % 64 == 0):
+            self.head_dx_skr = 0
+        if self.head_dx_skr > 1:
+            W["headdx_skr"] = torch.empty(self.head_dx_skr, c.S, c.H, device=dev, dtype=f32)
         # per-layer fp32 workspaces for the parallelism-starved bwd dX gemms
         # (dx_split_k routing; see gemm_dx below); allocated only for the shapes the
         # tile gate will actually split
@@ -351,6 +370,7 @@ class MKQwen3:
             gemm_mbar_ring=self.gemm_mbar_ring_default,
             gemm_n256_nt_mbar=self.gemm_n256_nt_mbar_default,
             gemm_direct_bf16_epilogue=self.gemm_direct_bf16_epilogue_default,
+            head_dx_skr=self.head_dx_skr,
         )
         # D=128 WGMMA attention route (default ON for D==128, S%64==0; the opgap
         # FA4-C trio spec's fallback replacement): MK_ATTN_D128_WG=0 restores the
@@ -906,7 +926,27 @@ class MKQwen3:
             head_dx_tiles = mk.gemm_tiles(c.S, c.H)
             head_dx_flags = 8
             head_dx_args = [B(A["logits"]), B(self.params["wlm"]), B(W["dXN_f32"]), c.S, c.H, c.V]
-        if head_dx_no_atomic_sk1 and sk_head == 1:
+        if self.head_dx_skr > 1 and (head_dx_flags & 128):
+            # Round-12 SKR (splitK + separate reduce): K-sliced n128 tiles write
+            # per-slice fp32 partial slabs (plain stores, no zero-fill, no atomics);
+            # a grid-stride reduce hop sums the slices into dXN_f32 for the existing
+            # dy_f32 consumer. Gate: _HEAD_DX_SKR / MK_HEAD_DX_SKR.
+            skr = min(self.head_dx_skr, c.V // 64)
+            kchunk = ((c.V + skr * 64 - 1) // (skr * 64)) * 64
+            active = (c.V + kchunk - 1) // kchunk  # trailing slices can be empty
+            p.instr(
+                mk.OP_GEMM,
+                mk.gemm_tiles_wgmma_n128(c.S, c.H) * skr,
+                [B(A["logits"]), B(self.params["wlm"]), B(W["headdx_skr"]), c.S, c.H,
+                 c.V, head_dx_flags | 32 | 4096 | mk.GEMM_SKR_FLAG, 0, skr],
+            )
+            p.wave()  # wave-mode barrier; df derives the slab dep automatically
+            p.instr(
+                mk.OP_SKR_REDUCE,
+                (c.S * c.H + 4095) // 4096,
+                [B(W["headdx_skr"]), B(W["dXN_f32"]), c.S * c.H, active],
+            )
+        elif head_dx_no_atomic_sk1 and sk_head == 1:
             if mk.wgmma_n256_head_dx_ok(c.S, c.H, c.V, head_dx_flags):
                 stage3 = n256_stage3_flag(c.S, c.H, c.V)
                 nmajor = n256_nmajor_flag(c.S, c.H, c.V)

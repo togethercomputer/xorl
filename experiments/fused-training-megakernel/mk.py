@@ -53,8 +53,10 @@ OP_ATTN_DQ_WG128 = 34  # D=128 wgmma attention dQ (same pattern)
 OP_EMBED_ZERO_ROWS = 35  # sparse grad:emb clear for previous/current token rows
 OP_COPY_I32 = 36  # small state copy, currently current tokens -> previous tokens
 OP_SWIGLU_BWD_4W = 37  # opt-in four-warps-per-row SwiGLU backward route
+OP_SKR_REDUCE = 38  # sum split-K fp32 partial slabs (round-12 SKR head-dX route)
 
 GEMM_BM, GEMM_BN = 64, 128  # keep in sync with ops.cuh
+GEMM_SKR_FLAG = 1 << 15  # with bit5: plain per-slice slab stores + OP_SKR_REDUCE
 GEMM_N256_STAGE3_FLAG = 1 << 25
 GEMM_N256_NMAJOR_FLAG = 1 << 26
 FILL_CHUNK = 16384  # elements per fill/cvt work item (MK_CHUNK in ops.cuh)
@@ -419,6 +421,7 @@ def load_ext(
     gemm_mbar_ring=None,
     gemm_n256_nt_mbar=None,
     gemm_direct_bf16_epilogue=None,
+    head_dx_skr=0,
 ):
     # MK_OCC2=1 builds the 256-thread executors with __launch_bounds__(256, 2):
     # 2 blocks/SM (128-reg ceiling, ptxas spills the fat op paths). Motivated by the
@@ -481,6 +484,10 @@ def load_ext(
         idle_ns = int(idle_ns_env)
     else:
         idle_ns = 256 if idle_ns is None else int(idle_ns)
+    # Round-12 SKR head-dX route (splitK + separate reduce): compiles the per-slice
+    # slab stores + OP_SKR_REDUCE. Model shape defaults flow in via the kwarg;
+    # MK_HEAD_DX_SKR=<slices> force-overrides for A/B (0 restores the old route).
+    head_dx_skr = int(os.environ.get("MK_HEAD_DX_SKR", int(head_dx_skr)))
     # D=64 qknorm-bwd fast path; MK_QKBWD_D64_CACHE=0 keeps the old generic loop for
     # A/B and bisects. Separate extension name because torch's cache is name-keyed.
     qkbc = int(os.environ.get("MK_QKBWD_D64_CACHE", "1"))
@@ -545,7 +552,8 @@ def load_ext(
         + ("_swcsig" if swiglu_cache_sig else "")
         + ("_gmbar" if gemm_mbar_ring else "")
         + ("_n256ntold" if gemm_mbar_ring and not gemm_n256_nt_mbar else "")
-        + ("_gdbf16" if gemm_direct_bf16_epilogue else ""),
+        + ("_gdbf16" if gemm_direct_bf16_epilogue else "")
+        + ("_hdskr" if head_dx_skr else ""),
         sources=[os.path.join(_DIR, "megakernel.cu")],
         extra_cuda_cflags=[
             "-O3",
@@ -580,7 +588,8 @@ def load_ext(
         + (["-DMK_SWIGLU_CACHE_SIG"] if swiglu_cache_sig else [])
         + (["-DMK_GEMM_MBAR_RING"] if gemm_mbar_ring else [])
         + (["-DMK_GEMM_N256_NT_MBAR"] if gemm_n256_nt_mbar else [])
-        + (["-DMK_GEMM_DIRECT_BF16_EPILOGUE"] if gemm_direct_bf16_epilogue else []),
+        + (["-DMK_GEMM_DIRECT_BF16_EPILOGUE"] if gemm_direct_bf16_epilogue else [])
+        + (["-DMK_HEAD_DX_SKR"] if head_dx_skr else []),
         verbose=verbose,
     )
 
@@ -602,6 +611,8 @@ def _access_sets(op, args):
         return [], [0]
     if op == OP_AXPY_F32:
         return [1], [0]
+    if op == OP_SKR_REDUCE:
+        return [0], [1]
     if op == OP_GEMM:
         flags = args[6]
         r, w = [0, 1], [2]

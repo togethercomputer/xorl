@@ -3,6 +3,8 @@
 Run: CUDA_VISIBLE_DEVICES=<idle> <fa4-venv>/bin/python test_ops.py
 """
 
+import os
+
 import mk
 import torch
 
@@ -350,6 +352,33 @@ def test_gemm():
     C3 = torch.ones(M, N, device=DEV, dtype=torch.float32)
     run1(lambda p: p.instr(mk.OP_GEMM, gemm_tiles(M, N), [p.buf(At), p.buf(B), p.buf(C3), M, N, K, 1 | 4 | 8, 0]))
     check("TN fp32 accum", C3, At.float().T @ B.float() + 1.0, atol=0.35)
+
+    # Round-12 SKR pair (only compiled when the env/gate builds -DMK_HEAD_DX_SKR):
+    # K-sliced n128 NN gemm -> per-slice fp32 partial slabs + OP_SKR_REDUCE. The
+    # slab prefill checks every element is overwritten by the plain-store epilogue.
+    if int(os.environ.get("MK_HEAD_DX_SKR", "0")):
+        M4, N4, K4, skr = 256, 128, 512, 2
+        A4 = torch.randn(M4, K4, device=DEV, dtype=torch.bfloat16)
+        B4 = torch.randn(K4, N4, device=DEV, dtype=torch.bfloat16)
+        ws = torch.full((skr, M4, N4), 7.0, device=DEV, dtype=torch.float32)
+        C4 = torch.empty(M4, N4, device=DEV, dtype=torch.float32)
+
+        def build_skr(p):
+            p.instr(
+                mk.OP_GEMM,
+                mk.gemm_tiles_wgmma_n128(M4, N4) * skr,
+                [p.buf(A4), p.buf(B4), p.buf(ws), M4, N4, K4,
+                 8 | 32 | 128 | 4096 | mk.GEMM_SKR_FLAG, 0, skr],
+            )
+            p.wave()
+            p.instr(
+                mk.OP_SKR_REDUCE,
+                (M4 * N4 + 4095) // 4096,
+                [p.buf(ws), p.buf(C4), M4 * N4, skr],
+            )
+
+        run1(build_skr)
+        check("NN n128 SKR f32", C4, A4.float() @ B4.float(), atol=0.35)
 
 
 def test_rmsnorm():

@@ -5941,6 +5941,43 @@ confirmation logs and
 `mkv3-p4b-qkrope-n128-s3072-s4096-test-model-20260706T2059Z.log`. Detail note:
 `results/operator-gap/s3072-s4096-qkrope-n128-promote.md`.
 
+Small head-dX SKR promotion (round-12 splitK + separate reduce, in-model port):
+the last measured-but-unlanded GEMM-lane win from the operator-gap program. New
+GEMM flag bit15 (with bit5, compiled under `-DMK_HEAD_DX_SKR` / `_hdskr`
+extension): the K-sliced n128 head-dX route writes plain fp32 partials to
+per-slice slabs at `C + slice*M*N` (no zero-fill, no atomics), and a new
+`OP_SKR_REDUCE` (4096-element grid-stride chunks, float4) sums the slices
+straight into `dXN_f32` for the existing dy_f32 final-rmsnorm consumer — one
+added chain hop, slab dependency derived from the standard access sets. Gate:
+`_HEAD_DX_SKR = {(512,1024,1536,16384,8,4,64,8): 2}` (exact small, 2 slices);
+`MK_HEAD_DX_SKR` force-overrides (0 restores the old n128/fp32 direct route).
+
+Mechanism: small's head-dX was a HALF-WAVE 32-tile n128 instruction over
+K=16384; skr=2 doubles tile parallelism to one wave and halves each tile's
+serial K chain, for the price of one ~128-tile reduce hop (~6MB traffic).
+GPU 3 clean-window paired A/B (40 reps/order, alternating): skr=2
+**-115.1/-107.7us, 40/40 BOTH construction orders**; skr=3 -97.6, skr=4
+-76.7/-58.8 — past one wave the extra split only adds slab traffic (the wave
+quantization law again). s2048 NO-GO (+18.1/+18.3 at skr=4 both orders, +3.2
+at skr=2): its promoted no-atomic direct route stands, matching nvjet's own
+K/CTAs split gate. Parity clean everywhere (worst kn.0 ~1.1-1.5e-02).
+
+Scope note: pipe_probe_sk.py's 53.3us SKR4 rode the standalone 384/168
+producer+TMA fat-tile body (regime-blocked in the one-image interpreter); this
+port lands only the portable mechanism (K-split parallelism + plain slab
+stores + separate reduce), which is where the in-model win actually lives.
+
+Validation: `test_ops.py` gained an env-gated `NN n128 SKR f32` unit case with
+a 7.0-prefilled slab (proves the plain-store epilogue fully overwrites every
+element; max_abs_err 3.1e-05); `test_model.py` all green (cross-executor
+agreement, training sanity); `cuobjdump -res-usage` bit-identical for the
+small flavor with/without SKR (df REG:255 STACK:48, ws REG:168 STACK:80);
+promoted default-vs-forced-old paired A/B + ncu local-LD gate in
+`results/mkv3-p4b-small-hdskr-promoted-final-20260706T2150Z.log`. Evidence
+note: `results/operator-gap/small-headdx-skr-promote.md`; A/B drivers
+`results/headdx_skr_ab.py` (probe) and `results/headdx_skr_promoted_ab.py`
+(promoted default vs old).
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
