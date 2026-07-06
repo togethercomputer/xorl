@@ -3750,6 +3750,50 @@ lm-head rerun `mkv3-p4b-qwen-post-dwtn-lmhead-route-20260706T0001Z.log` checked
 `MK_WGMMA_N256_DIRECT=0` separately and kept default n256 by `862.0us` median with
 `16/16` wins.
 
+## v3 P4b D=128 WGMMA attention (session 2853e0de): the trio lands in-model
+
+**PROMOTED, default-on for `D==128 && S%64==0`** (commits `1566e51..dac7321`,
+merged): `OP_ATTN_{FWD,DKV,DQ}_WG128` replace the generic WMMA attention ops at
+D=128. This lands the opgap session's FA4-C fallback-replacement spec (their
+standalone trio in `attention_probe.cu` on `megakernel-opgap`,
+`results/operator-gap/fa4c-d128-trio-round.md`) — independently converged on
+the same two design rules: **split-D** (each WG owns a 64-wide D-half of every
+output, so all accumulators stay standard m64n64 [32]-fragments and no new
+descriptor layouts exist anywhere) and **P-parking** (only s[32] transient).
+This implementation's third rule: **redundant-S** — both WGs compute S = Q K^T
+(k=128 dual-subtile, one 8-fma commit batch) and the softmax/dS algebra
+redundantly; WG0 publishes P/dS once; redundant tensor/SFU work is free in the
+latency-bound regime and removes all cross-WG serialization except one
+publication barrier per stage. 64-row tiles kill the beyond-diagonal skip
+stages (n_stages = q0/64 + 1) and double instruction-level parallelism.
+
+qwen4b-l1 (H2560/L1/nq32/nkv8/D128/V151936/S1024): env A/B **-1586.5/-1846.4us
+(12/12 both orders)**; promoted-default vs forced-old WMMA **+1885.4/+1627.5us
+(old wins 0/12 both)**; worst grad rel 0.008648, losses equal. Full test_ops +
+test_model green with the route default (including df2/ws executor agreement at
+the D128/S192 ragged config). ~9% of the qwen4b step from one route.
+
+Two infrastructure fixes the route needed (both would have bitten any D=128
+landing): (1) all four executor runners cached
+`cudaFuncSetAttribute(MaxDynamicSharedMemorySize)` in process-lifetime statics,
+so mixed-carveout processes launched with a stale attribute
+(cooperative-launch-too-large / illegal smem access); they now re-configure
+whenever the requested carveout grows (`c590974`). (2) The DKV128 smem struct
+is 112KB and ws mode offsets ops by 256B of control smem — a 112KB carveout
+fits df byte-exactly but overruns in ws by 256B (illegal address only under
+real timing; memcheck missed it; found by bisect + arithmetic). The route takes
+the 120KB carveout (`f33f604`; MK_ATTN_PIPE precedent, measured neutral).
+
+Follow-ons queued (integration deltas vs the opgap memos): (a) cross-time the
+DQ register topology — the opgap probe holds both D-half accumulators
+(dq0/dq1, REG:172) instead of redundant-S; adopt if faster (may close the gap
+to their ~2.4ms standalone projection); (b) port the FA4-B fwd KV-widening
+spec (+11-19% standalone, REG:165) to OP_ATTN_FWD_WG — the mechanism (halved
+per-stage boundary costs) is the measured 1.5us/stage fwd overhead from the
+straggler diagnosis; banding composes per their spec. Repro:
+`results/d128_qwen4b_ab.py <order>` and
+`mkv3-p4b-d128-{family-smoke-v3,promote}-*.log` in the attn-d128 worktree.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
