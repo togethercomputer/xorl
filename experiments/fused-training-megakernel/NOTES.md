@@ -5819,6 +5819,21 @@ Logs: `mkv3-p4b-small-dkv-rowbcast-20260706T2003Z.log` and
 `mkv3-p4b-small-dkv-rowbcast-confirm-20260706T2003Z.log`. Detail note:
 `results/operator-gap/small-dkv-rowbcast-current-nogo.md`.
 
+S8192 broad n256 NT BF16 no-go: because the current S8192 profile still has
+several on-path NT BF16 GEMMs after the lm-head n256 promotions, forced
+`MK_WGMMA_N256_NT_BF16=1` against the exact H256/D64/S8192 default. Route
+inspection showed the current default has only two n256 rows (lm-head fwd and
+head dX), while the force-on arm moves twelve additional NT BF16 rows to n256:
+4x `8192x256x256`, 4x `8192x1536x256`, and 4x `8192x256x768`. Loss/full-gradient
+parity stayed clean, but the broader route lost decisively in both construction
+orders: `+150.26us` and `+162.40us` variant-minus-default, with `0/16` wins in
+both orders. Keep H256/S8192 n256 limited to the existing head gates; do not
+force broad NT BF16 n256. Logs:
+`mkv3-p4b-s8192-n256ntbf16-default-first-20260706T2009Z.log`,
+`mkv3-p4b-s8192-n256ntbf16-variant-first-20260706T2009Z.log`, and
+`mkv3-p4b-s8192-n256ntbf16-route-20260706T2009Z.log`. Detail note:
+`results/operator-gap/s8192-n256ntbf16-broad-nogo.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
