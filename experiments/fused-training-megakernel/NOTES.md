@@ -5366,6 +5366,17 @@ precise wins `0/80` and `0/80`. Keep `_lex2` enabled for H512/S1024 small. Log:
 `mkv3-p4b-small-lex2-post-swfma-20260706T1728Z.log`. Detail note:
 `results/operator-gap/small-lex2-post-swfma-keep.md`.
 
+Post-lex2 small Drow direct-store recheck: forced the old atomic fused-Drow
+epilogue with `MK_DROW_DIRECT_STORE=0`. The forced-old extension correctly
+dropped `_drowst`, kept route shape unchanged (`n_instr=288`,
+`critical_path=144`, `gated=127`, `drow_gemm=8/512`, `gemm=99/13856`), and
+parity stayed clean (`loss_diff=-4.77e-06` / `+2.86e-06`, worst selected grad
+rel `<4.7e-07`). The old atomic path lost both construction orders:
+default-minus-old `-46.56us` and `-49.86us`, old wins `0/80` and `0/80`. Keep
+`_drowst` enabled for H512/S1024 small. Log:
+`mkv3-p4b-small-drowst-post-lex2-20260706T1727Z.log`. Detail note:
+`results/operator-gap/small-drowst-post-lex2-keep.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
