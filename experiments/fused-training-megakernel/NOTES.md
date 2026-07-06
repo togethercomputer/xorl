@@ -4986,6 +4986,18 @@ is still large (`GEMMTN 151936x2560x1024.wg` `5112.1us`) but overlapped. Log:
 `mkv3-p4b-profile-qwen-current-607ed60-20260706T1825Z.log`. Detail note:
 `results/operator-gap/qwen-current-607ed60-profile.md`.
 
+Current qwen n256 N-major route confirmation: because the current qwen profile
+is dominated by exact qwen n256 head rows, rechecked forced old M-major ordering
+with `MK_WGMMA_N256_NMAJOR=0` against the current default. The route changed
+only bit26 ordering (`nmajor=15 -> 0`) while keeping `n256=15` and `stage3=15`.
+Loss parity stayed clean (`+9.54e-07` and `+3.81e-06`). The forced old route
+lost both construction orders: variant-minus-default `+87.02us` with only
+`2/16` M-major wins, then `+37.73us` with `4/16` M-major wins. Keep qwen
+N-major default-on. Logs:
+`mkv3-p4b-qwen-nmajor-current-default-first-20260706T1829Z.log` and
+`mkv3-p4b-qwen-nmajor-current-variant-first-20260706T1829Z.log`. Detail note:
+`results/operator-gap/qwen-nmajor-current-keep.md`.
+
 ## Small H512/S1024 SwiGLU backward 4W route (this session, 20260706T1530Z)
 
 Extended the existing `SWIGLU_BWD_4W` opcode to the exact small benchmark shape
