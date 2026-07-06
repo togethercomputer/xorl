@@ -5355,6 +5355,17 @@ not survive the both-order repeat gate with a meaningful margin. Logs:
 `mkv3-p4b-small-swfma-post-qkbc-repeat-20260706T1724Z.log`. Detail note:
 `results/operator-gap/small-swfma-post-qkbc-keep.md`.
 
+Post-swfma small lm-head exp2 recheck: forced the old precise lm-head
+CE-partial exponential path with `MK_LMHEAD_EXP2_APPROX=0`. The forced-precise
+extension correctly dropped `_lex2`, kept route shape unchanged
+(`n_instr=288`, `critical_path=144`, `gated=127`, `lmhead_gemm=1/1024`,
+`gemm=99/13856`, `ce_fwd=1/1024`), and parity stayed clean (`loss_diff`
+`-2.86e-06` / `+5.72e-06`, worst selected grad rel `<4.5e-07`). Precise exp
+lost both construction orders: default-minus-precise `-68.45us` and `-67.42us`,
+precise wins `0/80` and `0/80`. Keep `_lex2` enabled for H512/S1024 small. Log:
+`mkv3-p4b-small-lex2-post-swfma-20260706T1728Z.log`. Detail note:
+`results/operator-gap/small-lex2-post-swfma-keep.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
