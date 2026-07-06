@@ -110,10 +110,15 @@ _HEAD_DX_TARGET = {256: {128: 32, 256: 64, 1024: 64, 512: 96, 2048: 96, 3072: 96
 # Round-12 SKR head-dX (splitK + separate reduce): K-sliced n128 tiles write plain
 # fp32 partial slabs; OP_SKR_REDUCE sums them into dXN_f32. Value = slice count.
 # Measured: small skr=2 -115/-108us 40/40 both orders (skr=3 -98, skr=4 -77/-59);
-# s2048 NO-GO (+18 both orders at skr=4, +3 at skr=2) — its no-atomic direct route
-# stands. MK_HEAD_DX_SKR force-overrides (0 restores the old route).
+# nano skr=4 -10.5/-14.3 (37/40+40/40) and deep skr=4 -32.9/-31.1 (38/40+40/40),
+# replacing their zero-fill+atomic splitK head route (skr=6 no better); s128
+# NO-GO +36.1 0/40 and s256 NO-GO +11.9 2/40 (the n128 tile shape collapses at
+# M<=256); s1024 noise (-3.5, 29/40); s2048 NO-GO (+18 skr=4, +3 skr=2) — its
+# no-atomic direct route stands. MK_HEAD_DX_SKR force-overrides (0 = old route).
 _HEAD_DX_SKR = {
     (512, 1024, 1536, 16384, 8, 4, 64, 8): 2,  # H,S,I,V,nq,nkv,D,L (small)
+    (256, 512, 768, 8192, 4, 2, 64, 4): 4,     # nano
+    (256, 512, 768, 8192, 4, 2, 64, 12): 4,    # deep
 }
 
 

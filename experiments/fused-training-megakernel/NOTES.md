@@ -6108,6 +6108,22 @@ confirmation + NN+TN racecheck/synccheck:
 `mkv3-p4b-qwen-n256tma-tn-promoted-*-20260706T2330Z.log`,
 `mkv3-p4b-qwen-n256tma-tn-racecheck-20260706T2330Z.log`.
 
+nano/deep head-dX SKR promotion (SKR round 3): extended the small SKR route to
+the shapes still running the zero-fill + fp32-atomic splitK head-dX (the
+16-30us atomic-epilogue-tax class round-12 measured standalone). Env probes on
+clean GPU 3, both orders: nano skr=4 -10.5/-14.3us (37/40+40/40), deep skr=4
+-32.9/-31.1us (38/40+40/40); skr=6 no better (nano -10.2, deep -30.4); the
+route swap is instruction-count-neutral (fill+gemm -> gemm+reduce). Promoted
+defaults `_HEAD_DX_SKR[nano]=4, [deep]=4`; promoted-vs-forced-old confirms:
+nano old +18.9/+8.5 (0/40+4/40), deep old +34.9/+30.8 (0/40+0/40). NO-GOs
+recorded with mechanism: s128 +36.1 0/40, s256 +11.9 2/40 (the n128 tile shape
+collapses at M<=256 — 2-4 fat tiles can't cover the machine), s1024 noise
+(-3.5, 29/40; stays on atomic sk=2), gate_up dX per-layer SKR +83.1/+65.4 0/80
+(8 reduce hops invert the economics — SKR pays iff ONE giant sub-wave long-K
+gemm amortizes ONE reduce). Parity clean everywhere. Logs:
+mkv3-p4b-headdx-skr-shortS{,2}-*.log, mkv3-p4b-small-dxskr-probe-*.log,
+mkv3-p4b-nano-deep-skr-promote-check-*.log.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
