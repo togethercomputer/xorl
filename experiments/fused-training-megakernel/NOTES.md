@@ -5713,10 +5713,10 @@ Qwen CE_BWD label-fixup promotion: `OP_CE_BWD` used to subtract the one-hot
 label inside every vectorized vocab element update. Added
 `MK_CE_BWD_LABEL_FIXUP`, which reads the original label logit once, writes
 `scale * softmax` for the full row without the per-element label compare, then
-overwrites the exact label element after a block sync. The default is exact
-qwen4b-L1 only, where CE_BWD is on path with large `V=151936`; the env override
-restores the old in-loop one-hot form for A/B. Before promotion, forced fixup
-beat the old default in both construction orders with clean qwen gradient
+overwrites the exact label element after a block sync. The first default is
+exact qwen4b-L1, where CE_BWD is on path with large `V=151936`; the env
+override restores the old in-loop one-hot form for A/B. Before promotion, forced
+fixup beat the old default in both construction orders with clean qwen gradient
 parity: `-26.14us` and `-25.28us` over 12 reps, then confirmation
 `-13.01us` and `-30.48us` over 32 reps. After promotion, forced old
 `MK_CE_BWD_LABEL_FIXUP=0` lost both orders: `+33.18us` and `+24.37us`
@@ -5738,6 +5738,26 @@ Validation passed `py_compile`, `test_ops.py`, `test_model.py`, and
 `mkv3-p4b-qwen-cefix-testops-20260706T1914Z.log`, and
 `mkv3-p4b-qwen-cefix-testmodel-20260706T1914Z.log`. Detail note:
 `results/operator-gap/qwen-cebwd-label-fixup-promote.md`.
+
+S8192 CE_BWD label-fixup broadening: the same mechanism also composes with the
+exact H256/D64/S8192 gauntlet shape, where CE_BWD remains a visible on-path row
+but is far smaller than qwen. Forced `MK_CE_BWD_LABEL_FIXUP=1` beat the current
+default both construction orders with clean loss/selected-gradient parity:
+`-44.78us` and `-31.82us`, 16/16 wins in both orders. After broadening the
+default to exact S8192, forced old `MK_CE_BWD_LABEL_FIXUP=0` lost both orders:
+`+22.29us` and `+31.65us`, old wins `2/16` and `1/16`. The promoted S8192
+profile uses `_ceb2_cefix_idle32...gmbar`; CE_BWD moves from the prior
+post-combine `162.4us` (`160.2us` span) to `144.2us` (`141.9us` span). Whole
+profile total remains dominated by DKV wait, so rely on the paired A/B for
+step-time sign. Resource usage stays spill-safe (`LOCAL:0`; df `STACK:48`, df2
+`STACK:48`, ws `REG:168 STACK:64`). Logs:
+`mkv3-p4b-s8192-cefix-default-first-20260706T1927Z.log`,
+`mkv3-p4b-s8192-cefix-variant-first-20260706T1927Z.log`,
+`mkv3-p4b-s8192-cefix-promoted-default-first-20260706T1927Z.log`,
+`mkv3-p4b-s8192-cefix-promoted-variant-first-20260706T1927Z.log`,
+`mkv3-p4b-profile-s8192-cefix-20260706T1927Z.log`, and
+`mkv3-p4b-s8192-cefix-resusage-20260706T1927Z.txt`. Detail note:
+`results/operator-gap/s8192-cebwd-label-fixup-promote.md`.
 
 ## Honest assessment + v2 roadmap
 

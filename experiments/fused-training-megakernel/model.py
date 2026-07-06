@@ -308,7 +308,11 @@ class MKQwen3:
             (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
             == (2560, 1, 1024, 32, 8, 128, 9728, 151936)
         )
-        self.ce_bwd_label_fixup_default = exact_qwen4b_l1
+        exact_s8192 = (
+            (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
+            == (256, 4, 8192, 4, 2, 64, 768, 8192)
+        )
+        self.ce_bwd_label_fixup_default = exact_qwen4b_l1 or exact_s8192
         self.gemm_mbar_ring_default = (
             c.D == 64 and c.S >= 1024 and c.S % 128 == 0
         ) or exact_qwen4b_l1
