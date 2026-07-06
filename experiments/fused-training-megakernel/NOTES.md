@@ -5681,6 +5681,18 @@ Logs:
 `mkv3-p4b-s8192-bwdband-postcombine-t48-default-first-20260706T1902Z.log`.
 Detail note: `results/operator-gap/s8192-bwdband-postcombine-retune-nogo.md`.
 
+Post-`_gmbar_n256ntold` qwen mbar coverage recheck: before splitting the shared
+n256 NN/TN body further, forced `MK_GEMM_MBAR_RING=0` against the current split
+default. In this state NT is already on its old refill loop, so the forced
+variant removes the remaining generic/NN/TN mbar coverage. Route counts stayed
+`n256=15 stage3=15 nmajor=15`, parity was clean, and forced no-mbar lost both
+construction orders: `+363.39us` and `+331.84us` variant-minus-default with
+`0/16` wins in both orders. Keep remaining qwen mbar coverage enabled; do not
+split the NN/TN body unless a more specific profile mechanism appears. Logs:
+`mkv3-p4b-qwen-gmbar-post-ntmbar-default-first-20260706T1906Z.log` and
+`mkv3-p4b-qwen-gmbar-post-ntmbar-variant-first-20260706T1906Z.log`. Detail
+note: `results/operator-gap/qwen-gmbar-post-ntmbar-keep.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
