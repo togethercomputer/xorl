@@ -827,6 +827,16 @@ class Program:
                    OP_QKNORM_ROPE_FWD, OP_QKNORM_ROPE_BWD, OP_QKV_V_BWD)
         claim = [max(c, rc) if op in _rowops else c
                  for c, (op, ntiles, _) in zip(claim, flat)]
+        # Unbanded causal attention tiles are triangle-imbalanced: claim batching
+        # runs the LONGEST tiles serially on one block (claim 4 -> 1 recovered
+        # fwd -48us / dq -75us / dkv -85us STANDALONE at qwen4b-l1 D=128). But
+        # in-model it is a WASH (-9.1/+5.4us, order-mixed): co-scheduled ops
+        # already fill the serialized-straggler gaps — the absorption ledger's
+        # 6th strike. Default OFF; MK_ATTN_D128_CLAIM1=1 re-runs the experiment.
+        if int(os.environ.get("MK_ATTN_D128_CLAIM1", "0")):
+            _d128_attn = (OP_ATTN_FWD_WG128, OP_ATTN_DKV_WG128, OP_ATTN_DQ_WG128)
+            claim = [1 if op in _d128_attn else c
+                     for c, (op, ntiles, _) in zip(claim, flat)]
         self.n_instr = n
         self._dep_cnt = torch.tensor(dep_cnt, dtype=torch.int32, device=device)
         self._adj_off = torch.tensor(adj_off, dtype=torch.int32, device=device)
