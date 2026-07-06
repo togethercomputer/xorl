@@ -5797,6 +5797,28 @@ S3072 was effectively zero (`-0.98us` and `-0.05us`); S4096 was `-9.34us` and
 `mkv3-p4b-h256-cefix-s4096-variant-first-20260706T1947Z.log`. Detail note:
 `results/operator-gap/h256-cebwd-label-fixup-sweep-nogo.md`.
 
+Current small profile/score refresh after the CE_BWD fixup line measured
+H512/S1024 at `3333.5us` profile total and `3327.6us` benchmark median versus
+`1901.2us` compile+cudagraph+ (`1.75x` gap). CE_BWD is now only `28.4us`
+on-path. The top on-path buckets are `ATTN_DKV_WG` `310.3us`,
+`SWIGLU_BWD_4W` `284.9us`, `ATTN_FWD_WG` `273.0us`, MLP dX
+`GEMMNN 1024x512x3072.wg` `269.7us`, and `RMSNORM_BWD_DX` `232.9us`. Logs:
+`mkv3-p4b-profile-small-current-88dfafb-20260706T2000Z.log` and
+`mkv3-p4b-score-small-current-88dfafb-20260706T2000Z.log`.
+
+Small dKV row-broadcast no-go: because `ATTN_DKV_WG` remains the largest small
+on-path bucket and the existing `MK_ATTN_DKV_ROW_BCAST` flag had only been
+rechecked on S8192, forced it on for exact H512/S1024. The variant compiled the
+expected `_adkvbc` suffix and kept route counts unchanged
+(`ATTN_FWD/DKV/DQ=8/512`). Selected-gradient parity stayed clean. The first
+80-rep pair looked weak-positive (`+1.55us` and `+5.84us`
+default-minus-rowbcast), but 160-rep confirmation collapsed in default-first
+(`-0.06us`, 79/160 rowbcast wins) and stayed positive only in reverse
+(`+3.94us`, 103/160 rowbcast wins). Keep dKV row-broadcast off for exact small.
+Logs: `mkv3-p4b-small-dkv-rowbcast-20260706T2003Z.log` and
+`mkv3-p4b-small-dkv-rowbcast-confirm-20260706T2003Z.log`. Detail note:
+`results/operator-gap/small-dkv-rowbcast-current-nogo.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
