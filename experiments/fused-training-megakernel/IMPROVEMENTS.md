@@ -154,6 +154,19 @@ in-model before rejecting; (3) validated ports carry across divergent heads
 when gated per-shape — confirm with a same-instrument control, not the
 original session's absolutes.
 
+**TMA feed at H256/D64 n256 shapes (boundary sweep)** — S3072 WIN, S4096 +
+S8192 NO-GO (s3072 -7.1/-10.2 35-39/40 both orders + promoted-old
++11.2/+8.1, commit 0b7ed2a; s4096 +6.1/+11.9 <=7/40; s8192 +27.3/+33.6 2/16;
+`mkv3-p4b-s{3072,4096,8192}-n256tma-*.log`)
+Why: the win class is LONG-K rows only (s3072's sole eligible row = head-dX
+K=8192, 128 ring iters). 12 of s8192's 13 eligible rows run 4-24 iters where
+the elected-thread fence+expect_tx serialization exceeds the per-thread issue
+work it deletes; s4096's 32-tile head-dX packing loses where s3072's 24-tile
+wins. The s8192 probe also parity-proved the STAGES=2 TMA arm.
+Principle: TMA-feed eligibility is a K-length question, not a route question —
+short-K rings keep the 256-thread cp.async feed; boundary-sweep per shape
+because tile-count packing flips neighbors (3072 vs 4096).
+
 ## Register architecture / warp specialization
 
 (Consolidates the megakernel-paper-style "reallocate registers from task
