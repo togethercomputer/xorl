@@ -116,3 +116,58 @@ OFF-PATH ops can still win in-model by freeing issue slots — measure
 in-model before rejecting; (3) validated ports carry across divergent heads
 when gated per-shape — confirm with a same-instrument control, not the
 original session's absolutes.
+
+## Register architecture / warp specialization
+
+(Consolidates the megakernel-paper-style "reallocate registers from task
+managers/loaders to consumers" question — asked 2026-07-06; every cell below
+was already measured across P2/P4a/P4b-r3 and GEMM rounds 5-12.)
+
+**setmaxnreg reallocation, scheduler WG -> consumers (ws mode)** — WIN inside
+`megakernel_ws`, where it is MANDATORY (entry `__maxnreg__(168)` at 384thr;
+consumers inc->224, scheduler warpgroup dec->56; without it ptxas spills the
+op hot paths at the 168 entry ceiling: REG:168 STACK:544, +14% both configs;
+megakernel.cu:702-715, results/mkv3-p4a.md)
+Why: H100 charges registers at 4-WARP granularity — any block >256 threads
+pays the 65536/384 = 168-reg entry ceiling; reallocation is how consumers
+climb back to 224. Needs explicit `-gencode=arch=compute_90a,code=sm_90a`
+(plain -arch=sm_90a also embeds compute_90 PTX where setmaxnreg is rejected)
+AND an entry maxnreg, or ptxas ignores it.
+Principle: reallocation is a prerequisite for warp-spec on this op library,
+not a speedup by itself — ws still trails df by a uniform ~8-20%/op, which IS
+the 224-vs-255 consumer ceiling (structural).
+
+**Reallocation split sweep (224/56 vs 240/24 vs 512-thr 192/64)** — 224/56
+best; 240/24 NO-GO both configs (the dec-24 scheduler spills its
+claim/accounting path; the slower handoff costs more than the 16 extra
+consumer regs recover); 512-thr dual-stream 192/64 NO-GO (ptxas compiled the
+whole image at the 128-reg entry cap, STACK:848).
+Why: freed registers pay only if the thin warpgroup's own code fits its
+budget — a pure TMA producer fits 24 regs (round-5-proven), a scheduler
+needs ~56.
+Principle: size dec targets to the thin path's real register need; every
+added warpgroup takes its registers straight off the consumer ceiling
+(256thr x 255regs = the exact-64K Pareto point of this op library).
+
+**Full MK-paper/nvjet producer topology for GEMM (384/168 + WG2 dec-24 pure
+TMA producer)** — WIN standalone / NO-GO as a uniform library point.
+Standalone: s8192 dX-head 69.1us/497TF = 1.03x nvjet, +16-36% across the dX
+family (pipe_probe_prod.py, results/operator-gap/gemmb-probe-round5.md).
+Uniform point: REFUTED by the accumulated register-point map (rounds 5-12 +
+attention register-feed rounds: dkv S^T REG:224, supertile 180-224, generic
+df ops at 255 are what a uniform 168 ceiling sacrifices).
+Why: ptxas gives one kernel image one register point; the producer dividend
+is confined to 168-fitting ops = the dX GEMM family, which then reached
+1.03-1.29x standalone anyway via splitK+separate-reduce (SKR, round 12) and
+elected-thread TMA feeds — both of which fit the 255-pt df image with ZERO
+extra warps and are the mechanisms actually promoted in-model.
+Principle: harvest loader-decoupling where it fits the image (elected-thread
+TMA inside consumer warps) instead of paying a warpgroup for it. Surviving
+UNMEASURED cells for the design conversation: (a) per-op-class register
+modes (multi-image / launch-select executor variants); (b) single-image
+240/24 producer-df — df self-scheduling consumers at 240 (the exact-balance
+split: 128*(168-24) == 256*(240-168)) + WG2 as a parked pure-TMA producer
+fed by a smem mailbox on GEMM rows only. Cost side bounded by the measured
+224-tax (fat ops +4-12% at 224, so <that at 240); win side = the round-5
+producer dividend, IF the mailbox handoff beats elected-thread issue
+in-model. Nobody has measured (b).
