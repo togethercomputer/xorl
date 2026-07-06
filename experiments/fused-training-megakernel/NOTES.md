@@ -5277,6 +5277,17 @@ on the normal two-row RMS dX route. Log:
 `mkv3-p4b-small-rmsdx-r4-post-directbf16-20260706T1657Z.log`. Detail note:
 `results/operator-gap/small-rmsdx-r4-post-directbf16-nogo.md`.
 
+Post-direct small dKV float2 recheck: because `ATTN_DKV_WG` remains a large
+on-path bucket, rechecked forced scalar direct atomics via
+`MK_ATTN_DKV_FLOAT2_ATOMIC=0`. The scalar extension correctly dropped `_adkvf2`
+while route shape stayed `n_instr=288`, `critical_path=144`, `gated=127`,
+`ATTN_DKV_WG=8/512`. Parity stayed clean (`loss_diff=+9.54e-07` /
+`-9.54e-07`, worst selected grad rel `<6.3e-07`), and scalar lost both orders:
+default-minus-scalar `-30.77us` and `-28.56us`, scalar wins `1/80` and `0/80`.
+Keep the dKV float2 direct-atomic default after direct-BF16. Log:
+`mkv3-p4b-small-dkvf2-post-directbf16-20260706T1659Z.log`. Detail note:
+`results/operator-gap/small-dkvf2-post-directbf16-keep.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
