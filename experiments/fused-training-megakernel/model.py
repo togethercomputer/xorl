@@ -85,7 +85,7 @@ _ATTN_BWD_BAND_T = {2048: 12, 3072: 16, 4096: 29, 8192: 40}  # H==256/D==64; 0 e
 _ATTN_FWD_BAND_T = {2048: 16, 3072: 32, 4096: 22, 8192: 64}  # H==256/D==64; 0 elsewhere
 _ATTN_BAND_DQ_FIRST_S = (8192,)  # H==256/D==64: dq-first band emission (else lpt)
 _H256_D64_QKBWD_SPLIT_V_S = (3072, 4096, 8192)  # H==256/D==64: split qkrope v-bwd
-_H256_D64_QKROPE_N128_S = (8192,)  # H==256/D==64: qkv fwd fused-qkrope n128 route
+_H256_D64_QKROPE_N128_S = (3072, 4096, 8192)  # H==256/D==64: qkv fwd fused-qkrope n128 route
 # H==256 uniform attention chunks (Ckv, Cq) when bands are off; other shapes use the
 # formula fallback (Ckv = 1 once nq*(S/128) >= 64 else 2, Cq = 1) at the use site.
 _H256_ATTN_CHUNKS = {512: (2, 2), 1024: (2, 2), 2048: (2, 2)}

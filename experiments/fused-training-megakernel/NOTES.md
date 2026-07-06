@@ -5916,6 +5916,31 @@ raw/rstd/RoPE unit case, `test_model.py`, and `git diff --check` passed. Logs:
 `mkv3-p4b-s8192-qkrope-n128-test-model-20260706T2034Z.log`. Detail note:
 `results/operator-gap/s8192-qkrope-n128-promote.md`.
 
+S3072/S4096 fused-qkrope n128 boundary promotion: after the S8192 win, the
+same `MK_WGMMA_N128_QKROPE=1` route was rechecked below S8192. S4096 won both
+construction orders by `-41.71us` and `-31.50us` variant-minus-default with
+`40/40` wins in each order; S3072 won by `-43.01us` and `-39.44us`, again
+`40/40` wins both orders. S2048 is the lower boundary and stays on wg64:
+default-first looked faster (`-8.82us`, `40/40`), but variant-first regressed
+by `+4.34us` with only `13/40` wins. `_H256_D64_QKROPE_N128_S` now covers
+exact H256/D64 S3072/S4096/S8192 only; `MK_WGMMA_N128_QKROPE=0` remains the
+forced-old route. Promoted-default route inspection confirms S2048 stays
+wg64, S3072/S4096/S8192 use `n128+qkrope`, and forced-old restores wg64 for
+S3072/S4096. Promoted-default A/B beat forced-old by `+39.49us`/`+31.12us`
+old-minus-new at S3072 and `+32.03us`/`+39.02us` at S4096, with old wins
+`0/40`, `1/40`, `1/40`, and `1/40`. Validation: `py_compile`, `ruff`,
+`git diff --check`, route inspection, and `test_model.py` passed. Logs:
+`mkv3-p4b-s4096-qkrope-n128-force-default-first-20260706T2046Z.log`,
+`mkv3-p4b-s4096-qkrope-n128-force-variant-first-20260706T2046Z.log`,
+`mkv3-p4b-s3072-qkrope-n128-force-default-first-20260706T2046Z.log`,
+`mkv3-p4b-s3072-qkrope-n128-force-variant-first-20260706T2046Z.log`,
+`mkv3-p4b-s2048-qkrope-n128-force-default-first-20260706T2046Z.log`, and
+`mkv3-p4b-s2048-qkrope-n128-force-variant-first-20260706T2046Z.log`, plus
+the `mkv3-p4b-s{3072,4096}-qkrope-n128-promoted-*-20260706T2059Z.log`
+confirmation logs and
+`mkv3-p4b-qkrope-n128-s3072-s4096-test-model-20260706T2059Z.log`. Detail note:
+`results/operator-gap/s3072-s4096-qkrope-n128-promote.md`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
