@@ -4784,6 +4784,31 @@ the dKV S^T port. Validation: `test_ops.py`, `test_model.py`, and a forced
 `MK_ATTN_D128_DQ_RS=1` S256 model parity check including df2/ws agreement all
 passed (`mkv3-p4b-d128-dq-rsfeed-main-*.log`).
 
+## Qwen D=128 QKNORM_ROPE_BWD cached-pair path (this session, 20260706T1355Z)
+
+Promoted a D=128 companion to the D=64 qknorm-bwd cache path: each lane owns
+two rope pairs and keeps the inverse-rope/RMS intermediates live across the dot
+reduction, deleting the generic D!=64 second pass reload/recompute. The default
+compile flag is `MK_QKBWD_D128_CACHE=1`, with `=0` retaining the old generic
+loop for A/B. The device body is runtime-scoped to the measured qwen attention
+shape (`S=1024,nq=32,nkv=8,D=128`) so other D=128 layouts remain on the old
+path.
+
+Fresh-cache qwen A/B against forced-old passed parity
+(`loss_diff=9.54e-07`, worst selected grad rel `3.14e-03`) and won both timed
+orders: default-new then forced-old median +25.5us old-minus-new, new wins
+35/40 (`mkv3-p4b-qkbwd-d128-cache-final-defaultfirst-20260706T1342Z.log`);
+forced-old then default-new median +26.8us, new wins 32/40
+(`mkv3-p4b-qkbwd-d128-cache-final-reverse2-20260706T1353Z.log`). A profile with
+the path enabled moved qwen `QKNORM_ROPE_BWD` from the current-main profile's
+304.5us total to 281.2us and whole-step profile time 9345.0 -> 9324.0us
+(`mkv3-p4b-profile-qwen-qkbwd-d128-cache-20260706T1337Z.log`). Validation:
+`diff --check`, `py_compile`, `ruff`, `test_ops.py`, and `test_model.py` passed
+with the guarded default-on build (`mkv3-p4b-qkbwd-d128-cache-test*.log`).
+After applying the same patch in the main checkout, the qwen activated-path A/B
+remained positive: median +28.7us old-minus-new, mean +38.3us, new wins 20/24
+(`mkv3-p4b-qkbwd-d128-cache-main-qwen-ab-20260706T1412Z.log`).
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

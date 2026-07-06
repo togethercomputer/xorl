@@ -390,6 +390,10 @@ def load_ext(
     # D=64 qknorm-bwd fast path; MK_QKBWD_D64_CACHE=0 keeps the old generic loop for
     # A/B and bisects. Separate extension name because torch's cache is name-keyed.
     qkbc = int(os.environ.get("MK_QKBWD_D64_CACHE", "1"))
+    # D=128 qwen qknorm-bwd fast path; MK_QKBWD_D128_CACHE=0 keeps the old
+    # generic D!=64 loop for A/B and bisects. The kernel body is runtime-scoped
+    # to the measured qwen attention shape.
+    qkbc128 = int(os.environ.get("MK_QKBWD_D128_CACHE", "1"))
     # SWIGLU_BWD derivative algebra: fmaf(-sg, sig, sig+sg) avoids the explicit
     # (1-sig) dependency. MK_SWIGLU_FMA_DERIV=0 restores the old form for A/B.
     swiglu_fma_deriv = int(os.environ.get("MK_SWIGLU_FMA_DERIV", "1"))
@@ -426,6 +430,7 @@ def load_ext(
         + ("_ceb2" if ce_bwd_exp2_approx else "")
         + (f"_idle{idle_ns}" if idle_ns != 256 else "")
         + ("_qkbc" if qkbc else "")
+        + ("_qkbc128" if qkbc128 else "")
         + ("_swfma" if swiglu_fma_deriv else "") + ("_swb2w" if swiglu_bwd_2w else "")
         + ("_swcsig" if swiglu_cache_sig else "")
         + ("_gmbar" if gemm_mbar_ring else "")
@@ -455,6 +460,7 @@ def load_ext(
         + (["-DMK_CE_BWD_EXP2_APPROX"] if ce_bwd_exp2_approx else [])
         + ([f"-DMK_IDLE_NS={idle_ns}"] if idle_ns != 256 else [])
         + (["-DMK_QKBWD_D64_CACHE"] if qkbc else [])
+        + (["-DMK_QKBWD_D128_CACHE"] if qkbc128 else [])
         + (["-DMK_SWIGLU_FMA_DERIV"] if swiglu_fma_deriv else [])
         + (["-DMK_SWIGLU_BWD_2W"] if swiglu_bwd_2w else [])
         + (["-DMK_SWIGLU_CACHE_SIG"] if swiglu_cache_sig else [])

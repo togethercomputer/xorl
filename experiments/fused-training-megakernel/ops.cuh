@@ -2306,6 +2306,47 @@ __device__ void op_qknorm_rope_bwd(const Instr& I, int tile, void** bufs, char* 
     }
 #endif
 
+#ifdef MK_QKBWD_D128_CACHE
+    if (D == 128 && S == 1024 && nq == 32 && nkv == 8) {
+      // D=128 qwen path: each lane owns two rope pairs. Keep both pairs'
+      // intermediates live across the dot reduction instead of reloading them
+      // in the dx/dw pass below. The shape guard keeps unmeasured D=128 layouts
+      // on the generic loop.
+      const int i0 = lane;
+      const int i1 = lane + 32;
+
+      const float c0 = cosr[i0], s0 = sinr[i0];
+      const float dy10 = dyr(i0), dy20 = dyr(i0 + 64);
+      const float da0 = dy10 * c0 + dy20 * s0;
+      const float db0 = -dy10 * s0 + dy20 * c0;
+      const float w10 = bf2f(w[i0]), w20 = bf2f(w[i0 + 64]);
+      const float xh10 = bf2f(xr[i0]) * r, xh20 = bf2f(xr[i0 + 64]) * r;
+
+      const float c1 = cosr[i1], s1 = sinr[i1];
+      const float dy11 = dyr(i1), dy21 = dyr(i1 + 64);
+      const float da1 = dy11 * c1 + dy21 * s1;
+      const float db1 = -dy11 * s1 + dy21 * c1;
+      const float w11 = bf2f(w[i1]), w21 = bf2f(w[i1 + 64]);
+      const float xh11 = bf2f(xr[i1]) * r, xh21 = bf2f(xr[i1 + 64]) * r;
+
+      float dot = da0 * w10 * xh10 + db0 * w20 * xh20 +
+                  da1 * w11 * xh11 + db1 * w21 * xh21;
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffff, dot, o);
+      dot *= 1.0f / 128.0f;
+
+      dxr[i0] = f2bf(r * (da0 * w10 - xh10 * dot));
+      dxr[i0 + 64] = f2bf(r * (db0 * w20 - xh20 * dot));
+      dxr[i1] = f2bf(r * (da1 * w11 - xh11 * dot));
+      dxr[i1 + 64] = f2bf(r * (db1 * w21 - xh21 * dot));
+      atomicAdd(&dw_s[i0], da0 * xh10);
+      atomicAdd(&dw_s[i0 + 64], db0 * xh20);
+      atomicAdd(&dw_s[i1], da1 * xh11);
+      atomicAdd(&dw_s[i1 + 64], db1 * xh21);
+      continue;
+    }
+#endif
+
     // rope^-1 on the incoming grad: da = dy1*c + dy2*s ; db = -dy1*s + dy2*c;
     // then per-head rmsnorm bwd with x = raw.
     float dot = 0.0f;
