@@ -327,9 +327,15 @@ class MKQwen3:
         # joined at 64ns post-SKR/n256 (32/64/128 all beat 256 in 10 paired runs;
         # 64 = plateau center, -37.3 40/40 / -6.4 34/40 both orders —
         # mkv3-p4b-small-idle{,-postskr,64-check,128-rev}-*.log).
+        # nano/deep joined at 64ns post-SKR (nano -5.7/-5.6, 33/40 + 107/120;
+        # deep -28.0 40/40 / -31.4 38/40; idle32 equivalent — plateau, 64 kept
+        # for consistency with small; mkv3-p4b-nano-deep-idle-postskr-*,
+        # mkv3-p4b-idle-rev-dfnr240-*.log).
         if c.H == 256 and c.S in _H256_IDLE32_S:
             self.idle_ns_default = 32
         elif (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) == (512, 1024, 1536, 16384, 8, 4, 64, 8):
+            self.idle_ns_default = 64
+        elif (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D) == (256, 512, 768, 8192, 4, 2, 64) and c.L in (4, 12):
             self.idle_ns_default = 64
         else:
             self.idle_ns_default = 256

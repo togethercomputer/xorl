@@ -6181,6 +6181,18 @@ cold-cap0) follow as separate records. Logs:
 `mkv3-p4b-qwenl2-cluster-promoted-vfirst-clean-20260707T0030Z.log`. Detail
 note: `results/operator-gap/qwenl2-gemm-cluster-promote.md`.
 
+nano/deep idle_ns 256->64 promotion (resweep round 5, post-SKR): the same
+poll-cadence flip small took — nano -5.7us 33/40 forward / -5.6us 107/120
+reverse at 120 reps (passes the sub-6us noise rule); deep -28.0us 40/40 /
+-31.4us 38/40 (reverse ran in a co-tenant-polluted window — absolutes 2x high
+— but the paired delta matched the clean forward run; idle32 measured
+equivalent at both shapes, 64 kept as the plateau/consistency point).
+Promoted via exact-tuple gate for nano+deep in idle_ns_default. Same batch
+opened the 240/24 producer-df lane phase 1: MK_DF_MAXNREG=240 entry-ceiling
+tax on df measured +11.0us small (6/40) / +8.2us nano (2/40) — far below the
+ws-history 4-12% bound, so the phase-2 mailbox-TMA-producer gate is GO.
+Logs: mkv3-p4b-nano-deep-idle-postskr-*, mkv3-p4b-idle-rev-dfnr240-*.log.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
