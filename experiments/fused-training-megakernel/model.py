@@ -346,6 +346,14 @@ class MKQwen3:
         self.gemm_n256_nt_mbar_default = (
             self.gemm_mbar_ring_default and not exact_qwen4b_l1
         )
+        # GEMM round-4 TMA feed on the n256 NN ring rows (elected-thread
+        # cp.async.bulk.tensor + expect_tx from a global tensormap table).
+        # Promoted exact-qwen: -340.40/-335.25us, 16/16 both construction
+        # orders, parity clean (mkv3-p4b-qwen-n256tma-*-20260706T2145Z.log).
+        # MK_GEMM_N256_TMA=0 restores the per-thread cp.async ring feed;
+        # =1 force-enables for probing; TN rows stay off (order-mixed
+        # standalone) behind MK_GEMM_N256_TMA_TN.
+        self.gemm_n256_tma_default = exact_qwen4b_l1
         self.gemm_direct_bf16_epilogue_default = c.D == 64 and (
             c.S == 128 or (c.H, c.L, c.S, c.nq, c.nkv, c.I) == (512, 8, 1024, 8, 4, 1536)
         )
@@ -376,6 +384,7 @@ class MKQwen3:
             attn_combine_unroll=self.attn_combine_unroll_default,
             gemm_mbar_ring=self.gemm_mbar_ring_default,
             gemm_n256_nt_mbar=self.gemm_n256_nt_mbar_default,
+            gemm_n256_tma=self.gemm_n256_tma_default,
             gemm_direct_bf16_epilogue=self.gemm_direct_bf16_epilogue_default,
             head_dx_skr=self.head_dx_skr,
         )
@@ -438,6 +447,16 @@ class MKQwen3:
         wg_attn = c.D == 64 and c.S % 128 == 0
         p = mk.Program()
         p.default_cold_cap = _cold_cap(c)
+        # Program-side arm of MK_GEMM_N256_TMA: mirrors load_ext's resolution
+        # (ring required) so the compiled path and the injected tmap args agree.
+        _ring_env = os.environ.get("MK_GEMM_MBAR_RING")
+        _ring_on = (bool(int(_ring_env)) if _ring_env is not None
+                    else self.gemm_mbar_ring_default)
+        _tma_env = os.environ.get("MK_GEMM_N256_TMA")
+        _tma_on = (bool(int(_tma_env)) if _tma_env is not None
+                   else self.gemm_n256_tma_default)
+        if _ring_on and _tma_on:
+            p.gemm_n256_tma_ext = self.ext
         B = p.buf
         dw_no_atomic_env = os.environ.get("MK_DW_NO_ATOMIC_SK1")
 

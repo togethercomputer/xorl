@@ -193,6 +193,48 @@ def test_gemm():
     )
     check("NN n256 nmajor bf16", C3nnbn, A3.float() @ B3.float(), atol=0.35)
 
+    if "_gtma" in EXT.__name__:
+        # Round-4 TMA feed on the n256 NN/TN ring bodies: elected-thread
+        # cp.async.bulk.tensor from a global-memory tensormap table. Covers the
+        # NN {64k,128m} A box, the TN {64m,64k} A boxes, and the {64n,64k} B
+        # boxes over a multi-iteration ring (K=256 -> 4 stages' worth).
+        Mt, Nt, Kt = 256, 256, 256
+        At_nn = torch.randn(Mt, Kt, device=DEV, dtype=torch.bfloat16)
+        Bt_nn = torch.randn(Kt, Nt, device=DEV, dtype=torch.bfloat16)
+
+        def build_tma(p, a, b, c, flags):
+            p.gemm_n256_tma_ext = EXT
+            p.instr(
+                mk.OP_GEMM,
+                mk.gemm_tiles_wgmma_n256_direct(Mt, Nt),
+                [p.buf(a), p.buf(b), p.buf(c), Mt, Nt, Kt, flags, 0],
+            )
+
+        Ct = torch.empty(Mt, Nt, device=DEV, dtype=torch.float32)
+        run1(
+            lambda p: build_tma(
+                p, At_nn, Bt_nn, Ct, 8 | 128 | 16384 | mk.GEMM_N256_STAGE3_FLAG
+            ),
+            smem_bytes=148 * 1024,
+        )
+        check("NN n256 stage3 fp32 TMA", Ct, At_nn.float() @ Bt_nn.float(), atol=0.35)
+
+        At_tn = torch.randn(Kt, Mt, device=DEV, dtype=torch.bfloat16)
+        Ct2 = torch.empty(Mt, Nt, device=DEV, dtype=torch.float32)
+        os.environ["MK_GEMM_N256_TMA_TN"] = "1"
+        try:
+            run1(
+                lambda p: build_tma(
+                    p, At_tn, Bt_nn, Ct2,
+                    1 | 8 | 128 | 16384 | mk.GEMM_N256_STAGE3_FLAG,
+                ),
+                smem_bytes=148 * 1024,
+            )
+        finally:
+            os.environ.pop("MK_GEMM_N256_TMA_TN", None)
+        check("TN n256 stage3 fp32 TMA", Ct2, At_tn.float().T @ Bt_nn.float(),
+              atol=0.35)
+
     O3 = torch.randn(M3, 256, device=DEV, dtype=torch.bfloat16)
     C3drow = torch.empty(M3, 256, device=DEV, dtype=torch.bfloat16)
     Drow3 = torch.zeros(2, M3, device=DEV, dtype=torch.float32)

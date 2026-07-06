@@ -379,6 +379,28 @@ def wgmma_n256_dw_tn_ok(M, N, K, flags):
     }
 
 
+def gemm_n256_tma_eligible(args):
+    """Per-instruction gate for the round-4 TMA feed (MK_GEMM_N256_TMA).
+
+    Only the n256 NN/TN fp32-body ring rows (bit14, not bit2) qualify. NN only
+    by default: the standalone ring probe (n256_tma_ring_probe.py) measured the
+    dX family at -7..-9% but the TN dW rows order-mixed/neutral; set
+    MK_GEMM_N256_TMA_TN=1 to include the TN rows for probing. Geometry must be
+    tile-exact (the tensormap boxes have no tail handling).
+    """
+    flags = args[6]
+    if not (flags & 16384) or (flags & 2):
+        return False
+    if flags & (4 | 16 | 32 | 256 | 2048 | 8192):
+        return False
+    if (flags & 1) and not int(os.environ.get("MK_GEMM_N256_TMA_TN", "0")):
+        return False
+    M, N, K = args[3], args[4], args[5]
+    if M % 128 or N % 256 or K % 64:
+        return False
+    return True
+
+
 def _default_split_k_target(K):
     env = os.environ.get("MK_DW_TARGET_TILES")
     if env is not None:
@@ -429,6 +451,7 @@ def load_ext(
     attn_combine_unroll=None,
     gemm_mbar_ring=None,
     gemm_n256_nt_mbar=None,
+    gemm_n256_tma=None,
     gemm_direct_bf16_epilogue=None,
     head_dx_skr=0,
 ):
@@ -535,6 +558,15 @@ def load_ext(
             else int(bool(gemm_n256_nt_mbar))
         )
     gemm_n256_nt_mbar = int(bool(gemm_mbar_ring and gemm_n256_nt_mbar))
+    # GEMM round-4 TMA feed for the n256 NN/TN mbarrier-ring bodies. Requires
+    # the ring; the per-instruction gate is the tmap args injected by
+    # Program._inject_gemm_tmaps (this only compiles the device path).
+    gemm_n256_tma_env = os.environ.get("MK_GEMM_N256_TMA")
+    if gemm_n256_tma_env is not None:
+        gemm_n256_tma = int(gemm_n256_tma_env)
+    else:
+        gemm_n256_tma = 0 if gemm_n256_tma is None else int(bool(gemm_n256_tma))
+    gemm_n256_tma = int(bool(gemm_mbar_ring and gemm_n256_tma))
     gemm_direct_bf16_epilogue = int(
         os.environ.get(
             "MK_GEMM_DIRECT_BF16_EPILOGUE",
@@ -561,9 +593,11 @@ def load_ext(
         + ("_swcsig" if swiglu_cache_sig else "")
         + ("_gmbar" if gemm_mbar_ring else "")
         + ("_n256ntold" if gemm_mbar_ring and not gemm_n256_nt_mbar else "")
+        + ("_gtma" if gemm_n256_tma else "")
         + ("_gdbf16" if gemm_direct_bf16_epilogue else "")
         + ("_hdskr" if head_dx_skr else ""),
         sources=[os.path.join(_DIR, "megakernel.cu")],
+        extra_ldflags=["-lcuda"],
         extra_cuda_cflags=[
             "-O3",
             # wgmma + setmaxnreg need the 90a feature set. Explicit -gencode, NOT
@@ -597,6 +631,7 @@ def load_ext(
         + (["-DMK_SWIGLU_CACHE_SIG"] if swiglu_cache_sig else [])
         + (["-DMK_GEMM_MBAR_RING"] if gemm_mbar_ring else [])
         + (["-DMK_GEMM_N256_NT_MBAR"] if gemm_n256_nt_mbar else [])
+        + (["-DMK_GEMM_N256_TMA"] if gemm_n256_tma else [])
         + (["-DMK_GEMM_DIRECT_BF16_EPILOGUE"] if gemm_direct_bf16_epilogue else [])
         + (["-DMK_HEAD_DX_SKR"] if head_dx_skr else []),
         verbose=verbose,
@@ -851,6 +886,9 @@ class Program:
         self._buf_meta = []  # (root_ptr, slot) per buffer-table entry
         self.waves = [[]]  # list of waves; each wave = list of (op, ntiles, args)
         self.default_cold_cap = 16
+        # set to the loaded extension by the model builder when the n256 TMA
+        # feed is enabled; finalize() then encodes per-instruction tensormaps.
+        self.gemm_n256_tma_ext = None
 
     def buf(self, t: torch.Tensor, slot=None) -> int:
         """Register a CUDA tensor; returns its buffer-table index.
@@ -994,9 +1032,62 @@ class Program:
             gate_off.append(len(gate_cons))
         return deps2, gated_in, band, region_off, region_cnt0, gate_off, gate_cons, gate_k
 
+    def _inject_gemm_tmaps(self):
+        """Encode CUtensorMaps for TMA-eligible n256 ring GEMMs (round-4 port).
+
+        Builds one GPU uint8 table of 128B tensormap rows (deduped by encode
+        key), registers it in the buffer table, and patches each eligible
+        instruction's args[20..22] = (1 + table buf id, A row, B row). The
+        table is read-only and never written by any op, so it adds no
+        dependency edges; tokens/labels rebinding never touches these rows
+        (bf16 operand guard).
+        """
+        ext = self.gemm_n256_tma_ext
+        if ext is None:
+            return
+        rows, row_ids, patches = [], {}, []
+
+        def tmap_row(ptr, inner, outer, stride_bytes, box_inner, box_outer):
+            key = (ptr, inner, outer, stride_bytes, box_inner, box_outer)
+            if key not in row_ids:
+                row_ids[key] = len(rows)
+                rows.append(
+                    ext.encode_tmap_2d(ptr, inner, outer, stride_bytes, box_inner,
+                                       box_outer))
+            return row_ids[key]
+
+        for wave in self.waves:
+            for op, _ntiles, args in wave:
+                if op != OP_GEMM or len(args) <= 6:
+                    continue
+                if not gemm_n256_tma_eligible(args):
+                    continue
+                ta, tb = self.bufs[args[0]], self.bufs[args[1]]
+                if ta.dtype != torch.bfloat16 or tb.dtype != torch.bfloat16:
+                    continue
+                M, N, K = args[3], args[4], args[5]
+                if args[6] & 1:  # TN: A[K,M] M-contig, two {64m,64k} boxes
+                    ra = tmap_row(ta.data_ptr(), M, K, M * 2, 64, 64)
+                else:  # NN: A[M,K] K-contig, one {64k,128m} box
+                    ra = tmap_row(ta.data_ptr(), K, M, K * 2, 64, 128)
+                rb = tmap_row(tb.data_ptr(), N, K, N * 2, 64, 64)  # B[K,N] N-contig
+                patches.append((args, ra, rb))
+        if not patches:
+            return
+        table = torch.cat(rows).cuda()
+        assert table.data_ptr() % 128 == 0
+        table_buf = self.buf(table)
+        for args, ra, rb in patches:
+            while len(args) < MAX_ARGS:
+                args.append(0)
+            args[20] = table_buf + 1
+            args[21] = ra
+            args[22] = rb
+
     def finalize(self, device="cuda"):
         if not self.waves[-1]:
             self.waves.pop()
+        self._inject_gemm_tmaps()
         flat = [ins for wave in self.waves for ins in wave]
 
         # wave-mode arrays

@@ -6057,6 +6057,38 @@ cap48 small default. Logs:
 `mkv3-p4b-small-coldcap8-postskr-default-first-20260706T2155Z.log`, and
 `mkv3-p4b-small-coldcap8-postskr-variant-first-20260706T2155Z.log`. Detail note:
 `results/operator-gap/small-coldcap8-postskr-nogo.md`.
+Qwen n256 NN TMA-feed promotion (GEMM round-4 port): the last unported rung of
+the round-2/3/4 GEMM ladder for the qwen pair. `MK_GEMM_N256_TMA` compiles a
+TMA issue path into the n256 mbarrier-ring bodies
+(`op_gemm_wgmma_n256_nn_f32_impl`, incl. DROW): an elected thread issues
+`cp.async.bulk.tensor.2d` per stage (one {64k,128m} A box NN, two {64m,64k} A
+boxes TN, four {64n,64k} B boxes) with `mbarrier.arrive.expect_tx` (49152B) on
+a count-1 `bfull`, replacing 12 per-thread cp.async slices + 256 `.noinc`
+arrivals; `bempty`, ring depth, smem, and the consumer_sync contract are
+unchanged. Tensormaps live in a per-program GLOBAL-memory table (128B rows,
+`mk.Program._inject_gemm_tmaps` + new `encode_tmap_2d` host export;
+SWIZZLE_128B == the SW128 slabs) acquired in-kernel with
+`fence.proxy.tensormap::generic.acquire.gpu`; per-instr gate args[20..22].
+This is NOT the 0307Z cluster-multicast no-go: per-CTA, no clusters — the
+"different ring protocol" that memo said was missing. Unit probe
+(`n256_tma_ring_probe.py`): parity bit-identical to the cp.async ring;
+standalone qwen dX-head -8.8%/-7.2% both orders (394->427-432 TF); TN dW rows
+order-mixed -> NN-only default (MK_GEMM_N256_TMA_TN=1 re-probes TN).
+In-model qwen4b-l1 forced-on vs old default: **-340.40us** default-first
+(9148.27 -> 8807.87us) and **-335.25us** variant-first, 16/16 wins in BOTH
+orders; loss parity ±2.9e-06, full-gradient worst rel 1.22e-02 (emb).
+Route: exactly 5 NN rows patched (head-dX 1024x2560x151936, wd/wgu/qkv dX,
+Drow wo dX); TN and the `_n256ntold` NT body untouched. res-usage: df/df2
+UNCHANGED (REG:255 STACK:48/32, LOCAL:0), ws stack 80->112, no reg cliff.
+test_ops (incl. new NN/TN n256 TMA unit cases) and test_model passed.
+Promoted default: exact qwen4b-L1 only. Logs:
+`mkv3-p4b-qwen-n256tma-default-first-20260706T2145Z.log`,
+`mkv3-p4b-qwen-n256tma-variant-first-20260706T2145Z.log`,
+`mkv3-p4b-qwen-n256tma-resusage-20260706T2145Z.txt`,
+`mkv3-p4b-qwen-n256tma-tests-20260706T2213Z.log`,
+`mkv3-p4b-qwen-n256tma-test-ops-20260706T2230Z.log`,
+`mkv3-p4b-qwen-n256tma-racecheck-20260706T2233Z.log`. Detail note:
+`results/operator-gap/qwen-n256-tma-promote.md`.
 
 ## Honest assessment + v2 roadmap
 

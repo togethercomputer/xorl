@@ -494,6 +494,37 @@ __device__ __forceinline__ void wg_mbar_wait(uint64_t* bar, uint32_t phase) {
   }
 }
 
+#ifdef MK_GEMM_N256_TMA
+// GEMM round-4 TMA feed for the n256 NN/TN mbarrier ring: an elected thread
+// issues cp.async.bulk.tensor.2d per stage instead of 12 per-thread cp.async
+// slices, with mbarrier.arrive.expect_tx on a count-1 full barrier. Tensormaps
+// live in GLOBAL memory (per-program table built by mk.py; the SW128 slabs are
+// exactly CU_TENSOR_MAP_SWIZZLE_128B), which requires a tensormap-proxy acquire
+// fence before first use. Validated by n256_tma_ring_probe.py: parity
+// bit-identical to the cp.async ring; qwen dX-head -7..-9% standalone.
+__device__ __forceinline__ void wg_tmap_fence_acquire(const void* map) {
+  asm volatile("fence.proxy.tensormap::generic.acquire.gpu [%0], 128;" ::"l"(map)
+               : "memory");
+}
+__device__ __forceinline__ void wg_mbar_expect_tx(uint64_t* bar, uint32_t bytes) {
+  const uint32_t a = (uint32_t)__cvta_generic_to_shared(bar);
+  asm volatile("{.reg .b64 t; mbarrier.arrive.expect_tx.shared::cta.b64 t, [%0], %1;}"
+               ::"r"(a), "r"(bytes)
+               : "memory");
+}
+__device__ __forceinline__ void wg_tma_load_2d(const void* map, void* dst, int x, int y,
+                                               uint64_t* bar) {
+  const uint32_t d = (uint32_t)__cvta_generic_to_shared(dst);
+  const uint32_t b = (uint32_t)__cvta_generic_to_shared(bar);
+  asm volatile(
+      "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
+      " [%0], [%1, {%2, %3}], [%4];"
+      :
+      : "r"(d), "l"(map), "r"(x), "r"(y), "r"(b)
+      : "memory");
+}
+#endif
+
 template <class MMA>
 __device__ __forceinline__ void wg_mma_ktile(const uint64_t (&da)[4], const uint64_t (&db)[4],
                                              float (&d)[32]) {
@@ -849,16 +880,55 @@ __device__ __noinline__ void op_gemm_wgmma_n256_nn_f32_impl(const Instr& I, int 
   constexpr int WG_N256_MBAR_LEAD = STAGES - 2;
   uint64_t* bfull = reinterpret_cast<uint64_t*>(smem_raw + sizeof(S));
   uint64_t* bempty = bfull + STAGES;
+#ifdef MK_GEMM_N256_TMA
+  // TMA feed (round 4): args[20] = 1 + tmap-table buffer id (0 = cp.async
+  // feed), args[21]/args[22] = 128B row indices of the A/B tensormaps. bfull
+  // becomes a count-1 expect_tx barrier; bempty and the ring are unchanged.
+  const bool use_tma = I.args[20] > 0;
+  const char* tmA = nullptr;
+  const char* tmB = nullptr;
+  if (use_tma) {
+    const char* tbl = reinterpret_cast<const char*>(bufs[I.args[20] - 1]);
+    tmA = tbl + (int64_t)I.args[21] * 128;
+    tmB = tbl + (int64_t)I.args[22] * 128;
+    if (tid == 0) {
+      wg_tmap_fence_acquire(tmA);
+      wg_tmap_fence_acquire(tmB);
+    }
+  }
+  const uint32_t bfull_cnt = use_tma ? 1u : 256u;
+#else
+  const uint32_t bfull_cnt = 256u;
+#endif
   if (tid == 0) {
 #pragma unroll
     for (int s = 0; s < STAGES; ++s) {
-      wg_mbar_init(&bfull[s], 256);
+      wg_mbar_init(&bfull[s], bfull_cnt);
       wg_mbar_init(&bempty[s], 256);
     }
   }
   consumer_sync();
   auto issue_stage_mb = [&](int t) {
     const int st = t % STAGES;
+#ifdef MK_GEMM_N256_TMA
+    if (use_tma) {
+      if (tid == 0) {
+        const int k0 = t * WG_BK;
+        wg_mbar_expect_tx(&bfull[st], 49152);  // A 16KB + B 32KB per stage
+        if (a_t) {
+          wg_tma_load_2d(tmA, S.A[st][0], m0, k0, &bfull[st]);
+          wg_tma_load_2d(tmA, S.A[st][1], m0 + 64, k0, &bfull[st]);
+        } else {
+          wg_tma_load_2d(tmA, S.A[st][0], k0, m0, &bfull[st]);
+        }
+#pragma unroll
+        for (int g = 0; g < 4; ++g)
+          wg_tma_load_2d(tmB, reinterpret_cast<char*>(S.B[st]) + g * 8192,
+                         n0 + g * 64, k0, &bfull[st]);
+      }
+      return;
+    }
+#endif
     issue_stage(t * WG_BK, st);
     wg_mbar_arrive_cpasync(&bfull[st]);
   };
@@ -893,7 +963,7 @@ __device__ __noinline__ void op_gemm_wgmma_n256_nn_f32_impl(const Instr& I, int 
   if (tid == 0) {
 #pragma unroll
     for (int s = 0; s < STAGES; ++s) {
-      wg_mbar_init(&bfull[s], 256);
+      wg_mbar_init(&bfull[s], bfull_cnt);
       wg_mbar_init(&bempty[s], 256);
     }
   }

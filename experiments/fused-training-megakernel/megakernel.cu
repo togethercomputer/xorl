@@ -11,9 +11,11 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cooperative_groups.h>
+#include <cuda.h>
 #include <cuda_bf16.h>
 
 #include <cstdlib>
+#include <cstring>
 
 namespace cg = cooperative_groups;
 
@@ -1274,8 +1276,35 @@ void mk_run_df2(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_o
                         d_go, d_gc, d_gk, d_state, d_bufs, d_clk);
 }
 
+// Host-side CUtensorMap encoder for the n256 TMA feed (MK_GEMM_N256_TMA).
+// Returns one 128B tensormap as a CPU uint8 tensor; mk.py concatenates rows
+// into a per-program GPU table (rows stay 128B-aligned) referenced through the
+// buffer table. bf16 2D row-major only; SWIZZLE_128B matches the SW128 slabs.
+torch::Tensor mk_encode_tmap_2d(int64_t ptr, int64_t inner, int64_t outer,
+                                int64_t stride_bytes, int64_t box_inner,
+                                int64_t box_outer) {
+  TORCH_CHECK(ptr % 16 == 0, "tensormap base must be 16B-aligned");
+  TORCH_CHECK(stride_bytes % 16 == 0, "tensormap row stride must be 16B-aligned");
+  auto out = torch::empty({128}, torch::dtype(torch::kUInt8));
+  CUtensorMap map;
+  cuuint64_t gdim[2] = {(cuuint64_t)inner, (cuuint64_t)outer};
+  cuuint64_t gstride[1] = {(cuuint64_t)stride_bytes};
+  cuuint32_t bdim[2] = {(cuuint32_t)box_inner, (cuuint32_t)box_outer};
+  cuuint32_t estride[2] = {1, 1};
+  CUresult r = cuTensorMapEncodeTiled(
+      &map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, reinterpret_cast<void*>(ptr), gdim,
+      gstride, bdim, estride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+      CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  TORCH_CHECK(r == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed: ", (int)r);
+  static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap ABI");
+  std::memcpy(out.data_ptr<uint8_t>(), &map, 128);
+  return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("run", &mk_run, "run megakernel program (wave mode)");
+  m.def("encode_tmap_2d", &mk_encode_tmap_2d,
+        "encode a 128B CUtensorMap (bf16 2D row-major, SW128) as a CPU u8 tensor");
   m.def("run_df", &mk_run_df, "run megakernel program (dataflow mode)");
   m.def("run_ws", &mk_run_ws, "run megakernel program (warp-specialized dataflow mode)");
   m.def("run_df2", &mk_run_df2, "run megakernel program (region-watermark dataflow mode)");
