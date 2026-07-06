@@ -5048,9 +5048,9 @@ shape-scoped LD law as small==0, long-S budgeted separately. Logs:
 `mkv3-p4b-small-ldgate-ab4ffde-20260706T154439Z.{log,details.csv,ncu-rep}`.
 Detailed note: `results/operator-gap/small-swiglu-4w-cacheoff-ldgate.md`.
 
-## Post-4W source-free follow-ups: nano 4W and small cold cap no-go (this session, 20260706T1600Z)
+## Post-4W source-free follow-ups: nano 4W, small cold cap, and small gmbar (this session, 20260706T1605Z)
 
-Two current-head follow-ups after the small 4W/cache-off route did not promote:
+Current-head follow-ups after the small 4W/cache-off route:
 
 - H256/S128 nano `MK_SWIGLU_BWD_4W=1` is an order-sensitive wash. The forced
   route changed nano from `sw_bwd=4/256` to `sw_bwd4w=4/1024` and parity stayed
@@ -5069,6 +5069,14 @@ Two current-head follow-ups after the small 4W/cache-off route did not promote:
   `-1.02us` with cap64 wins `38/80`. Keep `_cold_cap()` unchanged. Log:
   `mkv3-p4b-small-coldcap-current-f66c432-20260706T1555Z.log`; detail note:
   `results/operator-gap/small-coldcap-post4w-nogo.md`.
+- H512/S1024 small `MK_GEMM_MBAR_RING=0` confirmed the current D64 mbar-ring
+  default is still load-bearing. Forced old two-stage GEMM feed path preserved
+  parity (`loss_diff=-9.54e-07`, worst selected grad `wf` rel `2.88e-07`) but
+  lost both construction orders: old-minus-default `+38.03us` median with
+  default wins `62/80`, and `+44.38us` with default wins `79/80`. Keep
+  `gemm_mbar_ring_default = c.D == 64 and c.S >= 1024 and c.S % 128 == 0`.
+  Log: `mkv3-p4b-small-gmbar-current-f66c432-20260706T1600Z.log`; detail
+  note: `results/operator-gap/small-gmbar-post4w-keep.md`.
 
 ## Honest assessment + v2 roadmap
 
