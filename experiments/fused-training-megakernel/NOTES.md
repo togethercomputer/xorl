@@ -4696,6 +4696,26 @@ one-pass LD metric; any future kernel-touching promotion should keep
 `l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum == 0` at small.
 
 
+## Epilogue-fusion phase 1 (MLP rmsnorm dissolution) NO-GO (session 2853e0de, 20260706T0740Z)
+
+Implemented per `results/epilogue-fusion-spec-2853e0de.md` (bit15 rstd
+row-scale n128 epilogue, rstd-only RMSNORM_FWD mode via args[9], raw-x2 +
+host-folded diag(w2)@wgu consumer, env `MK_EPIFUSE_MLP`, worktree wt-epifuse,
+default off). Route: n_instr 288->296, **critical_path 144->144** — the
+rstd-only op replaces the rmsnorm at the SAME hop count (both feed off the
+wo-gemm bit13 partials), so only span could win, and the rowop span was
+absorbed (7th absorption-ledger strike). Paired A/B medians-of-50 both orders
+(`mkv3-p4b-epifuse-small-parity-ab-20260706T064529Z.log`): small
+3565.6/3567.0 vs 3567.1/3565.0 (wash); S4096 3236.9/3248.6 vs 3255.6/3250.6
+(+10-19 WORSE); S8192 7359.4/7361.1 vs 7377.9/7380.3 (+17-19 WORSE). Parity:
+loss diff 5e-5, grad absmax rel ~1.2e-4 (bf16 weight-fold rounding — would
+need a fp32-fold variant at promotion). LESSON: hop REPLACEMENT is not hop
+DELETION — the fusion only pays if the consumer's rstd dep lands with the
+PRODUCER (rstd finalized inside the wo-gemm epilogue, needs cross-tile
+completion signaling) or if the bwd-side xn2 buffer deletion (phase 2,
+different mechanism: memory traffic) carries it. Re-run knob:
+`MK_EPIFUSE_MLP=1` in wt-epifuse @c9d77d5.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
