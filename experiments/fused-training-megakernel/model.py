@@ -496,9 +496,14 @@ class MKQwen3:
         # s8192 -101.0/-65.9 (10/10 x6, 9/10, 7/10). qwen lm-head is a compute
         # regime where the recipe measured neutral-to-negative standalone
         # (nt-storerecipe-standalone-a440677.md) — excluded by the exact gate.
+        # small (H512, lm-head 1024x16384x512 on the n256 direct route) joined:
+        # -14.9/-22.3us 38/40+39/40 both orders; s1024 wash (+1.2, 19/40 — its
+        # 2-wave head has less C-store pressure), stays off.
         exact_n256_tma_store = (
             (c.H, c.L, c.nq, c.nkv, c.D, c.I, c.V) == (256, 4, 4, 2, 64, 768, 8192)
             and c.S in (2048, 3072, 4096, 8192)
+        ) or (
+            (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) == (512, 1024, 1536, 16384, 8, 4, 64, 8)
         )
         gemm_n256_tma_store_env = os.environ.get("MK_GEMM_N256_TMA_STORE")
         self.gemm_n256_tma_store_enabled = (
@@ -508,6 +513,26 @@ class MKQwen3:
         )
         self.gemm_direct_bf16_epilogue_default = c.D == 64 and (
             c.S == 128 or (c.H, c.L, c.S, c.nq, c.nkv, c.I) == (512, 8, 1024, 8, 4, 1536)
+        )
+        # D64 standard WGMMA Drow register epilogue: compute the Drow dot from
+        # the bf16-rounded register accumulator and skip the shared-memory Cs
+        # reread loop. Measured positive on s128/s256/nano/deep/s1024/small;
+        # MK_DROW_REG_EPILOGUE=0 keeps a direct rollback/forced-off guard.
+        exact_h256_d64_drow_reg = (
+            (c.H, c.nq, c.nkv, c.D, c.I, c.V) == (256, 4, 2, 64, 768, 8192)
+            and (
+                (c.L == 4 and c.S in (128, 256, 512, 1024))
+                or (c.L == 12 and c.S == 512)
+            )
+        )
+        self.drow_reg_epilogue_default = (
+            exact_h256_d64_drow_reg or exact_small_h512_s1024
+        )
+        drow_reg_epilogue_env = os.environ.get("MK_DROW_REG_EPILOGUE")
+        self.drow_reg_epilogue_enabled = (
+            self.drow_reg_epilogue_default
+            if drow_reg_epilogue_env is None
+            else bool(int(drow_reg_epilogue_env))
         )
         self.attn_combine_unroll_default = (
             c.H == 256
@@ -576,6 +601,7 @@ class MKQwen3:
             swiglu_bwd_4w=self.swiglu_bwd_4w_default,
             swiglu_cache_sig=self.swiglu_cache_sig_enabled,
             drow_direct_store=self.drow_direct_store_enabled,
+            drow_reg_epilogue=self.drow_reg_epilogue_enabled,
             attn_exp2_approx=self.attn_exp2_approx_default,
             attn_exp2_prebias=self.attn_exp2_prebias_default,
             lmhead_exp2_approx=self.lmhead_exp2_approx_default,

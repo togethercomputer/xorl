@@ -6479,6 +6479,47 @@ there); deep SKR skr=4 and idle confirmed robust to tmared. Default arms
 post-tmared: nano ~883-890, deep ~2301-2310. Logs:
 mkv3-p4b-nanodeep-posttmared-*, -nano-idle32-{rev,promote-check}-*.
 
+head-dX n128 TMA reduce-add direct drain no-go (94cb1ef): isolated worktree
+`/home/apanda/xorl-oss-headdx-tmared-94cb1ef` added default-off
+`MK_HEAD_DX_TMA_RED=1`, replacing head-dX SKR partial slabs + `OP_SKR_REDUCE`
+with a direct n128 split-K `cp.reduce.async.bulk.add.f32` drain into
+`dXN_f32`. The first build failed the built-in UBLKRED audit; the invalid
+`nop;` salt rerun was fixed to `mov.u32`, but salts 1-3 still produced the
+same map; a final typed 2D fp32 shared-memory row-view patch still failed on
+salts 1-2. Stable map: `megakernel_ws` two F32 UBLKRED lines, launchable
+df/df2 one F32 plus one non-F32 each. The job was stopped before correctness
+or timing; this closes the direct n128 drain source topology, not every
+possible head-dX TMA reduce-add design. Detail:
+results/operator-gap/headdx-tmared-94cb1ef-nogo.md.
+
+current-head anchor refresh (94cb1ef): route/profile job
+`current-anchor-94cb1ef-1305` completed, but its same-process score loop hit
+TorchDynamo `recompile_limit` at `small`. Repair job
+`current-anchor-clean-scores-94cb1ef-1322` reran one shape per Python process
+and completed cleanly at 2026-07-07T13:55:10Z. Clean ratios vs graph+:
+`s128` 1.459x, `s256` 1.415x, `nano` 1.390x, `deep` 1.313x, `small`
+1.695x, `s4096` 1.873x, `s8192` 1.984x, `qwen4b-l1` 1.120x, `qwen4b-l2`
+1.239x. Profile read: short/nano/deep are span-led, while `small` remains a
+broad GEMM/RMS/SwiGLU/attention frontier. Detail:
+results/operator-gap/current-anchor-94cb1ef.md.
+
+qwen L1/L2 source-free profile at 94cb1ef: both shapes still run
+`default_mode=pdf`, and the qwen lm-head pair remains the dominant on-path
+body target. L1 top spans are `GEMMNT 1024x151936x2560.wg` `2444.7us` and
+`GEMMNN 1024x2560x151936.wg` `1648.9us`; L2 top spans are `2468.1us` and
+`1663.8us` for the same pair. Treat the next qwen source claim as a
+body-quality port once active n256 ownership releases; do not spend another
+lane on CE/LSE epilogue-only variants. Detail:
+results/operator-gap/qwen-profile-94cb1ef.md.
+
+small lm-head tmastore extension (gate widening): the 3d37664 EVICT_FIRST
+TMA C-store mechanism reaches small's n256-direct lm_head fwd (1024x16384x512)
+via the force knob and wins -14.9/-22.3us 38/40+39/40 both orders; promoted
+exact-small into the gate; forced-off after +24.8/+22.2 (2/80). s1024 wash
+(+1.2, 19/40 — 2-wave head, less C-store pressure), stays off. small paired
+arm ~3178us (~1.68x); day ledger small ~3400 -> ~3178. Logs:
+mkv3-p4b-tmastore-{ext,small-rev,small-promote-check}-*.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
