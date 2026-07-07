@@ -1706,3 +1706,74 @@ class MKQwen3:
                 self.inv_valid.copy_(1.0 / (labels >= 0).sum().clamp(min=1).float().reshape(1))
             self.prog.run(self.ext, smem_bytes=self._smem_bytes, mode=mode)
         return self.loss
+
+    # ------------------------------------------------------------------ #
+    def make_graphed_step(self, tokens: torch.Tensor, labels: torch.Tensor, mode=None, warmup=3):
+        """Capture one step into a CUDA graph; returns replay() -> device loss.
+
+        Kills the per-step Python + pybind + cudaLaunchCooperativeKernel cost
+        (~9us/step measured at nano; the cooperative launch captures cleanly on
+        cu13.0). The graph binds tokens/labels by ADDRESS: replays read their
+        current CONTENTS, so the caller may rewrite them in place but must keep
+        them alive and never reallocate. Env knobs read inside prog.run
+        (MK_COLD_CAP etc.) are frozen at capture time.
+        """
+        if mode is None:
+            mode = self.default_mode
+        graphable = (
+            mode in ("df", "pdf")
+            and tokens.is_cuda
+            and labels.is_cuda
+            and tokens.device == self.tokens.device
+            and labels.device == self.labels.device
+            and tokens.is_contiguous()
+            and labels.is_contiguous()
+            and tokens.dtype == torch.int32
+            and labels.dtype == torch.int32
+            and tuple(tokens.shape) == (self.cfg.S,)
+            and tuple(labels.shape) == (self.cfg.S,)
+        )
+        if not graphable:
+            raise ValueError("make_graphed_step needs canonical cuda int32 [S] inputs and a df/pdf mode")
+        bind = self.bind_inputs
+        if not bind and self._inputs_bound_external:
+            self.prog._buftab[self._tokens_buf] = self.tokens.data_ptr()
+            self.prog._buftab[self._labels_buf] = self.labels.data_ptr()
+            self._inputs_bound_external = False
+
+        def _body():
+            if bind:
+                if not self.in_kernel_inv_valid:
+                    self.inv_valid.copy_(1.0 / (labels >= 0).sum().clamp(min=1).float().reshape(1))
+                self.prog.run(
+                    self.ext,
+                    smem_bytes=self._smem_bytes,
+                    mode=mode,
+                    bind_bufs=((self._tokens_buf, tokens), (self._labels_buf, labels)),
+                )
+            else:
+                self.tokens.copy_(tokens)
+                self.labels.copy_(labels)
+                if not self.in_kernel_inv_valid:
+                    self.inv_valid.copy_(1.0 / (labels >= 0).sum().clamp(min=1).float().reshape(1))
+                self.prog.run(self.ext, smem_bytes=self._smem_bytes, mode=mode)
+
+        side = torch.cuda.Stream(tokens.device)
+        side.wait_stream(torch.cuda.current_stream(tokens.device))
+        with torch.cuda.stream(side):
+            for _ in range(max(1, warmup)):
+                _body()
+        torch.cuda.current_stream(tokens.device).wait_stream(side)
+        torch.cuda.synchronize(tokens.device)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            _body()
+        if bind:
+            self._inputs_bound_external = True
+
+        def replay():
+            graph.replay()
+            return self.loss
+
+        replay.graph = graph
+        return replay

@@ -128,6 +128,35 @@ def main():
             assert (g0[k] - m.grads[k]).abs().max().item() < 2e-2 * ref, f"ws grad: {k}"
         print("ws agreement OK (warp-specialized scheduler)")
 
+        # graphed step (CUDA-graph replay of the same launch) must agree too
+        greplay = m.make_graphed_step(tokens, labels)
+        loss6 = greplay()
+        torch.cuda.synchronize()
+        assert abs(loss6.item() - loss1) < 1e-4 * abs(loss1), "graphed-step loss drifted"
+        for k in g0:
+            ref = g0[k].abs().max().item() + 1e-8
+            assert (g0[k] - m.grads[k]).abs().max().item() < 2e-2 * ref, f"graphed-step grad: {k}"
+        print("graphed-step agreement OK (CUDA-graph replay)")
+
+        # the graph binds input ADDRESSES: an in-place rewrite must be visible to
+        # the next replay (stale-pointer/stale-content regression check)
+        torch.manual_seed(3)
+        tokens.copy_(torch.randint(0, cfg.V, (cfg.S,), device="cuda", dtype=torch.int32))
+        labels.copy_(torch.roll(tokens, -1).to(torch.int32))
+        labels[-1] = -100
+        lossg = greplay()
+        torch.cuda.synchronize()
+        lossg = lossg.item()
+        gg = {k: v.clone() for k, v in m.grads.items()}
+        losss = m.step(tokens, labels)
+        torch.cuda.synchronize()
+        losss = losss.item()
+        assert abs(lossg - losss) < 1e-4 * abs(losss), "graphed-step replay used stale inputs"
+        for k in gg:
+            ref = gg[k].abs().max().item() + 1e-8
+            assert (gg[k] - m.grads[k]).abs().max().item() < 2e-2 * ref, f"graphed-step rewrite grad: {k}"
+        print("graphed-step input rewrite OK")
+
     # ---- learning sanity: SGD on megakernel grads must drive loss down ----
     cfg = Cfg()
     m = MKQwen3(cfg, seed=0)

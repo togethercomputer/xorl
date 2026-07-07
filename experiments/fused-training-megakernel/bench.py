@@ -82,6 +82,15 @@ def bench_cfg(cfg: Cfg):
     results = {}
     results["megakernel"] = time_fn(lambda: mk_model.step(tokens, labels))
 
+    # additive row: same kernel launched by CUDA-graph replay, symmetric with the
+    # graphed baselines below (host launch + pybind + Python step() off the meter).
+    # The primary "megakernel" row is unchanged; scoreboard adoption is a separate
+    # explicit decision (measurement-honesty rule 7).
+    try:
+        results["megakernel+graph"] = time_fn(mk_model.make_graphed_step(tokens, labels))
+    except Exception as e:  # older drivers may refuse cooperative-launch capture
+        print(f"  megakernel+graph skipped: {e}")
+
     tm = TorchQwen3(cfg, mk_model.params).cuda()
 
     def eager_step():
