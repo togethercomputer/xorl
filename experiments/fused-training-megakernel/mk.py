@@ -512,6 +512,7 @@ def load_ext(
     swiglu_bwd_4w=False,
     swiglu_cache_sig=None,
     drow_direct_store=None,
+    drow_reg_epilogue=None,
     attn_exp2_approx=None,
     attn_exp2_prebias=None,
     lmhead_exp2_approx=None,
@@ -622,6 +623,11 @@ def load_ext(
         drow_direct_store = int(drow_direct_store_env)
     else:
         drow_direct_store = int(bool(drow_direct_store))
+    drow_reg_epilogue_env = os.environ.get("MK_DROW_REG_EPILOGUE")
+    if drow_reg_epilogue_env is not None:
+        drow_reg_epilogue = int(drow_reg_epilogue_env)
+    else:
+        drow_reg_epilogue = int(bool(drow_reg_epilogue))
     # MK_ATTN_FAST_LOG=0 restores precise logf for WGMMA fwd LSE.
     attn_fast_log_env = os.environ.get("MK_ATTN_FAST_LOG")
     if attn_fast_log_env is not None:
@@ -831,6 +837,7 @@ def load_ext(
         + ("_n256tst" if gemm_n256_tma_store else "")
         + ("_gdbf16" if gemm_direct_bf16_epilogue else "")
         + ("_hdskr" if head_dx_skr else "")
+        + ("_drowreg" if drow_reg_epilogue else "")
         + (f"_pdf{pdf_regs}" if pdf else "")
         + (f"d{pdf_dec}" if pdf and pdf_dec != 24 else "")
         + ("p" if pdf_producer else "")
@@ -889,6 +896,7 @@ def load_ext(
         + (["-DMK_GEMM_N256_TMA_STORE"] if gemm_n256_tma_store else [])
         + (["-DMK_GEMM_DIRECT_BF16_EPILOGUE"] if gemm_direct_bf16_epilogue else [])
         + (["-DMK_HEAD_DX_SKR"] if head_dx_skr else [])
+        + (["-DMK_DROW_REG_EPILOGUE"] if drow_reg_epilogue else [])
         + (["-DMK_PDF", f"-DMK_PDF_REGS={pdf_regs}", f"-DMK_PDF_DEC={pdf_dec}"] if pdf else [])
         + (["-DMK_PDF_PRODUCER"] if pdf_producer else [])
         + (["-DMK_PDF_D64_FEED"] if pdf_d64_feed else [])
