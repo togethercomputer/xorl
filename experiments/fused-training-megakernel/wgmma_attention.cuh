@@ -984,8 +984,13 @@ __device__ __noinline__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs
           if (masked && kr > qr[i]) p0 = 0.0f;
           if (masked && kr + 1 > qr[i]) p1 = 0.0f;
           __nv_bfloat162 dsv;
+#ifdef MK_ATTN_DQ_FP32_P
+          dsv.x = f2bf(p0 * (s2[idx] - dr[i]) * scale);
+          dsv.y = f2bf(p1 * (s2[idx + 1] - dr[i]) * scale);
+#else
           dsv.x = f2bf(bf2f(f2bf(p0)) * (s2[idx] - dr[i]) * scale);
           dsv.y = f2bf(bf2f(f2bf(p1)) * (s2[idx + 1] - dr[i]) * scale);
+#endif
 #ifdef MK_ATTN_DQ_RS_FEED
           areg[4 * (n8 >> 1) + (n8 & 1) * 2 + i] = *reinterpret_cast<uint32_t*>(&dsv);
 #else

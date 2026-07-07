@@ -520,6 +520,7 @@ def load_ext(
     attn_fast_log=None,
     attn_dkv_float2_atomic=None,
     attn_dq_float2_store=None,
+    attn_dq_fp32_p=None,
     attn_dq_rs_feed=None,
     attn_dkv_row_bcast=None,
     attn_combine_unroll=None,
@@ -561,6 +562,11 @@ def load_ext(
         attn_dq_float2_store = int(attn_dq_float2_store_env)
     else:
         attn_dq_float2_store = int(bool(attn_dq_float2_store))
+    attn_dq_fp32_p_env = os.environ.get("MK_ATTN_DQ_FP32_P")
+    if attn_dq_fp32_p_env is not None:
+        attn_dq_fp32_p = int(attn_dq_fp32_p_env)
+    else:
+        attn_dq_fp32_p = int(bool(attn_dq_fp32_p))
     # D64 dQ register-A dS feed: skips the dS smem store/fence/sync and feeds
     # the computed bf16 dS pairs directly to WGMMA as an RS A operand.
     attn_dq_rs_feed_env = os.environ.get("MK_ATTN_DQ_RS_FEED")
@@ -734,6 +740,7 @@ def load_ext(
         + ("_adkvbc" if attn_dkv_row_bcast else "")
         + ("_adkvf2" if attn_dkv_float2_atomic else "")
         + ("_adqf2" if attn_dq_float2_store else "")
+        + ("_adqf32p" if attn_dq_fp32_p else "")
         + ("_adqrs" if attn_dq_rs_feed else "")
         + ("_drowst" if drow_direct_store else "")
         + ("_aflog" if attn_fast_log else "") + ("_aex2" if attn_exp2_approx else "")
@@ -781,6 +788,7 @@ def load_ext(
         + (["-DMK_ATTN_DKV_DIRECT_ATOMIC"] if attn_dkv_direct_atomic else [])
         + (["-DMK_ATTN_DKV_FLOAT2_ATOMIC"] if attn_dkv_float2_atomic else [])
         + (["-DMK_ATTN_DQ_FLOAT2_STORE"] if attn_dq_float2_store else [])
+        + (["-DMK_ATTN_DQ_FP32_P"] if attn_dq_fp32_p else [])
         + (["-DMK_ATTN_DQ_RS_FEED"] if attn_dq_rs_feed else [])
         + (["-DMK_DROW_DIRECT_STORE"] if drow_direct_store else [])
         + (["-DMK_ATTN_FAST_LOG"] if attn_fast_log else [])

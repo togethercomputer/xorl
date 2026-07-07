@@ -480,6 +480,10 @@ class MKQwen3:
         # store gates. S3072 stayed too small in reverse-order confirmation.
         # MK_ATTN_DQ_RS_FEED=0/1 remains the explicit A/B override.
         self.attn_dq_rs_feed_default = exact_s4096 or exact_s8192
+        # D64 dQ fp32-P pack: exact S8192 wins by removing an extra bf16(P)->fp32(P)
+        # round before the final bf16 dS pack on the RS-feed path. S4096 was neutral,
+        # so keep this exact-S8192 only; MK_ATTN_DQ_FP32_P=0/1 guards A/B.
+        self.attn_dq_fp32_p_default = exact_s8192
         # Producer-df default mode (per-shape executor routing; see _PDF_MODE).
         # The pdf executor + WG2 producer compile only for gated shapes.
         self.default_mode = (
@@ -514,6 +518,7 @@ class MKQwen3:
             attn_dkv_float2_atomic=self.attn_dkv_float2_atomic_default,
             attn_dkv_row_bcast=self.attn_dkv_row_bcast_default,
             attn_dq_float2_store=self.attn_dq_float2_store_default,
+            attn_dq_fp32_p=self.attn_dq_fp32_p_default,
             attn_dq_rs_feed=self.attn_dq_rs_feed_default,
             attn_combine_unroll=self.attn_combine_unroll_default,
             gemm_mbar_ring=self.gemm_mbar_ring_default,
