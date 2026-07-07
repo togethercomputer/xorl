@@ -522,6 +522,7 @@ def load_ext(
     attn_dq_float2_store=None,
     attn_dq_fp32_p=None,
     attn_dq_rs_feed=None,
+    attn_dq_bulk_red=None,
     attn_dkv_row_bcast=None,
     attn_combine_unroll=None,
     gemm_mbar_ring=None,
@@ -597,7 +598,11 @@ def load_ext(
     # context. Every flag-on build is therefore hard-gated by a per-image SASS
     # audit below; MK_ATTN_DQ_BULK_RED_SALT=<n> injects n NOPs to reroll ptxas
     # codegen when the audit trips.
-    attn_dq_bulk_red = int(os.environ.get("MK_ATTN_DQ_BULK_RED", "0"))
+    attn_dq_bulk_red_env = os.environ.get("MK_ATTN_DQ_BULK_RED")
+    if attn_dq_bulk_red_env is not None:
+        attn_dq_bulk_red = int(attn_dq_bulk_red_env)
+    else:
+        attn_dq_bulk_red = int(bool(attn_dq_bulk_red))
     attn_dq_bulk_red_salt = int(os.environ.get("MK_ATTN_DQ_BULK_RED_SALT", "0"))
     drow_direct_store_env = os.environ.get("MK_DROW_DIRECT_STORE")
     if drow_direct_store_env is not None:
