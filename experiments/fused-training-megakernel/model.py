@@ -474,6 +474,10 @@ class MKQwen3:
         # S8192 regressed and small was neutral, but exact S4096 was positive in
         # both orders. Keep this exact unless a future rerun widens the gate.
         self.attn_exp2_prebias_default = exact_s4096
+        # D64 dQ register-A dS feed: exact S4096 removes the dS smem round trip
+        # and won both 160-rep construction orders after the pdf+d64feed/scalar
+        # store gates. MK_ATTN_DQ_RS_FEED=0/1 remains the explicit A/B override.
+        self.attn_dq_rs_feed_default = exact_s4096
         # Producer-df default mode (per-shape executor routing; see _PDF_MODE).
         # The pdf executor + WG2 producer compile only for gated shapes.
         self.default_mode = (
@@ -508,6 +512,7 @@ class MKQwen3:
             attn_dkv_float2_atomic=self.attn_dkv_float2_atomic_default,
             attn_dkv_row_bcast=self.attn_dkv_row_bcast_default,
             attn_dq_float2_store=self.attn_dq_float2_store_default,
+            attn_dq_rs_feed=self.attn_dq_rs_feed_default,
             attn_combine_unroll=self.attn_combine_unroll_default,
             gemm_mbar_ring=self.gemm_mbar_ring_default,
             gemm_n256_nt_mbar=self.gemm_n256_nt_mbar_default,

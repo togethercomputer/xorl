@@ -208,6 +208,23 @@ __device__ __forceinline__ void wga_mma64_x2(const bf16* A1, const bf16* B1,
   cute::warpgroup_wait<0>();
 }
 
+// D64 dQ: dS is already in the C-fragment layout for a K-major A operand with
+// q rows as M. Feed the bf16 pairs from registers to skip the dS smem round trip.
+__device__ __forceinline__ void wga_mma64_rs(const uint32_t (&a)[16],
+                                             const bf16* B, float (&d)[32]) {
+  using RS =
+      cute::SM90::GMMA::MMA_64x64x16_F32BF16BF16_RS<cute::SM90::GMMA::Major::K,
+                                                    cute::SM90::GMMA::Major::MN>;
+  cute::warpgroup_arrive();
+#pragma unroll
+  for (int s = 0; s < 4; ++s)
+    RS::fma(a[4 * s], a[4 * s + 1], a[4 * s + 2], a[4 * s + 3],
+            wga_desc_mn((const char*)B + s * 2048), WGA_FMA32,
+            cute::SM90::GMMA::ScaleOut::One);
+  cute::warpgroup_commit_batch();
+  cute::warpgroup_wait<0>();
+}
+
 // ---- forward ---------------------------------------------------------------------------
 // args: {qkv_r, O, LSE, S, nq, nkv, D(=64), scale_bits}; tile = qt*nq + qh (qt-outer,
 // 128-row tiles -> O/LSE complete in row order; band = nq tiles per 128 rows).
@@ -948,6 +965,9 @@ __device__ __noinline__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs
       wga_mma64_x2<WGA_MMA_KK, false, false>(sm.Q[wg], sm.K[t & 1], s,     // S = Q K^T
                                              sm.dO[wg], sm.V[t & 1], s2);  // dP = dO V^T
       const bool masked = k0 + 63 > q0wg;
+#ifdef MK_ATTN_DQ_RS_FEED
+      uint32_t areg[16];
+#endif
 #pragma unroll
       for (int i = 0; i < 2; ++i) {
 #pragma unroll
@@ -963,18 +983,27 @@ __device__ __noinline__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs
 #endif
           if (masked && kr > qr[i]) p0 = 0.0f;
           if (masked && kr + 1 > qr[i]) p1 = 0.0f;
-          const int off = wga_off64(r0 + 8 * i, n8 * 8 + cb);
           __nv_bfloat162 dsv;
           dsv.x = f2bf(bf2f(f2bf(p0)) * (s2[idx] - dr[i]) * scale);
           dsv.y = f2bf(bf2f(f2bf(p1)) * (s2[idx + 1] - dr[i]) * scale);
+#ifdef MK_ATTN_DQ_RS_FEED
+          areg[4 * (n8 >> 1) + (n8 & 1) * 2 + i] = *reinterpret_cast<uint32_t*>(&dsv);
+#else
+          const int off = wga_off64(r0 + 8 * i, n8 * 8 + cb);
           *reinterpret_cast<__nv_bfloat162*>((char*)sm.dS[wg] + off) = dsv;
+#endif
         }
       }
+#ifdef MK_ATTN_DQ_RS_FEED
+      wga_mma64_rs(areg, sm.K[t & 1], dq);  // dQ += dS K
+#endif
     }
+#ifndef MK_ATTN_DQ_RS_FEED
     wga_fence_smem_to_async();
     consumer_sync();  // dS visible; K stage still valid
     if (!skip)
       wga_mma64<WGA_MMA_KMN, false, true>(sm.dS[wg], sm.K[t & 1], dq);  // dQ += dS K
+#endif
     consumer_sync();  // both WGs done reading K/V stage t before refill
   }
 
