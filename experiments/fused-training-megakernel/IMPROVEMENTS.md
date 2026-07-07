@@ -1145,6 +1145,33 @@ the launcher writes the override before the existing init sync for free.
 Principle: put fast-path plumbing below the Python boundary; measure the
 plumbing, not the concept.
 
+**Qwen4b-L2 gate-extension lane (cluster + support + head-dX)** — WIN
+(l2 16.21ms -> ~12.06ms, -26%; commits 6c4d63c+e1e23b2+c3cc32c;
+`mkv3-p4b-qwenl2-*.log`)
+Why: every l1-exact qwen gate was dark at L=2 (tuple sets and
+exact_qwen4b_l1 all L-keyed) — the l2 n256 rows ran 2-stage no-ring
+cp.async and head-dX ran splitK. Extending the proven l1 cluster
+(stage3+nmajor+ring+TMA, -1.53ms), the support knobs (sparse-embed -219us,
+cefix, swb4w), and the head-dX no-split n256 route (-2.15ms, loss-exact)
+recovered it. Peel attribution: stage3 alone +3.3ms, TN-TMA +1.6ms on top
+of NN, TMA +0.7ms. dq RS-feed was the ONE l1 component that HURT l2
+(RS-off faster in 4 windows, -53..-166us) and was decoupled to L1-only.
+Principle: (1) exact-tuple gates silently orphan sibling shapes — sweep
+every L/S neighbor of a promoted config with the cluster, not per-knob;
+(2) peel-resweep after cluster promotion catches components that do not
+transfer (dq-RS); (3) NN-only TMA inverted ~1.5ms WORSE than no-TMA at l2
+(elected-thread issue contends with doubled cp.async TN sink pressure) —
+partial feed conversions can be worse than none.
+
+**S3072 head-dX TMA gate (promoted then reverted)** — SUPERSEDED
+(promote 0b7ed2a -7/-10us 35-39/40; revert after fe15e24 head-dX SKR:
+TMA-off faster -16.3/-20.2 40/40; revert-confirm +16.2/+19.0 1-2/40)
+Why: the SKR promotion moved the gated row off the n256 route; the leftover
+_gtma compile taxes the binary with no active rows (the noinline lesson).
+Principle: a shape gate whose target row is re-routed by a LATER promotion
+is not merely vacuous — retest and revert it; resweep-law applies to gates,
+not just knobs.
+
 ## Register architecture / warp specialization
 
 (Consolidates the megakernel-paper-style "reallocate registers from task
