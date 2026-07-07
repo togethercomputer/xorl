@@ -155,6 +155,7 @@ _PDF_MODE = {
     (2560, 1024, 9728, 151936, 32, 8, 128, 1),  # H,S,I,V,nq,nkv,D,L (qwen4b-l1)
     (2560, 1024, 9728, 151936, 32, 8, 128, 2),  # qwen4b-l2
     (256, 3072, 768, 8192, 4, 2, 64, 4),        # s3072
+    (256, 4096, 768, 8192, 4, 2, 64, 4),        # s4096
     (256, 8192, 768, 8192, 4, 2, 64, 4),        # s8192
 }
 
@@ -483,12 +484,12 @@ class MKQwen3:
         if mode_env:
             self.default_mode = mode_env
         # D64-TMA producer feed on the pdf executor. The opt-in probe split by
-        # shape: S3072 won in both orders, while S8192 regressed decisively.
-        # Keep the default exact and let MK_PDF_D64_FEED force A/Bs.
+        # shape: S3072 and S4096 won in both orders, while S8192 regressed
+        # decisively. Keep the default exact and let MK_PDF_D64_FEED force A/Bs.
         self.pdf_d64_feed_default = (
             self.default_mode == "pdf"
             and exact_long_d64
-            and c.S == 3072
+            and c.S in (3072, 4096)
         )
         self.ext = mk.load_ext(
             swiglu_bwd_2w=self.swiglu_bwd_2w_default,
