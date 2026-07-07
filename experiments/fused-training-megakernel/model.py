@@ -121,6 +121,14 @@ _QWEN_L1_DW_NO_ATOMIC_SK1 = {  # M,N,K for qwen4b-l1 dW GEMMs that split-K compu
     (2560, 4096, 1024),    # wo
     (6144, 2560, 1024),    # wqkv
 }
+_GENERIC_SHORT_DW_NO_ATOMIC_SK1_CFGS = {
+    # 20260707 current-head gate: removing generic dW sk=1 zero-fill+atomics
+    # wins both construction orders only for the H256/L4 short-S family.
+    # Keep S1024+, deep (L12), and small (H512) on the split-K atomic route.
+    (256, 4, 4, 2, 64, 768, 8192, 128),
+    (256, 4, 4, 2, 64, 768, 8192, 256),
+    (256, 4, 4, 2, 64, 768, 8192, 512),
+}
 # dlogits @ Wlm split-K tile targets: {H: {S: target}}, 192 elsewhere.
 _HEAD_DX_TARGET = {256: {128: 32, 256: 64, 1024: 64, 512: 96, 2048: 96, 3072: 96},
                    512: {1024: 96}}
@@ -658,7 +666,12 @@ class MKQwen3:
 
         def dw_no_atomic_sk1_enabled(M, N, K, wgmma):
             if dw_no_atomic_env is None:
-                return wgmma and (M, N, K) in _QWEN_L1_DW_NO_ATOMIC_SK1
+                short_default = (
+                    c.H, c.L, c.nq, c.nkv, c.D, c.I, c.V, c.S
+                ) in _GENERIC_SHORT_DW_NO_ATOMIC_SK1_CFGS
+                return short_default or (
+                    wgmma and (M, N, K) in _QWEN_L1_DW_NO_ATOMIC_SK1
+                )
             return bool(int(dw_no_atomic_env))
 
         def dw_direct_store_overwrites(M, N, K):
