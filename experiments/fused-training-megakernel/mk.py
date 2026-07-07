@@ -512,6 +512,7 @@ def load_ext(
     swiglu_cache_sig=None,
     drow_direct_store=None,
     attn_exp2_approx=None,
+    attn_exp2_prebias=None,
     lmhead_exp2_approx=None,
     ce_bwd_exp2_approx=None,
     ce_bwd_label_fixup=None,
@@ -575,6 +576,15 @@ def load_ext(
         attn_exp2_approx = int(attn_exp2_approx_env)
     else:
         attn_exp2_approx = int(bool(attn_exp2_approx))
+    # D64 attention-bwd exact-shape prebias: with the exp2 approximation enabled,
+    # hoist log2(e) row bias out of the per-element expression. Env overrides keep
+    # the candidate force-on/off for A/B and bisect.
+    attn_exp2_prebias_env = os.environ.get("MK_ATTN_EXP2_PREBIAS")
+    if attn_exp2_prebias_env is not None:
+        attn_exp2_prebias = int(attn_exp2_prebias_env)
+    else:
+        attn_exp2_prebias = 0 if attn_exp2_prebias is None else int(bool(attn_exp2_prebias))
+    attn_exp2_prebias = int(bool(attn_exp2_approx and attn_exp2_prebias))
     attn_combine_unroll = int(
         os.environ.get("MK_ATTN_COMBINE_UNROLL", int(bool(attn_combine_unroll)))
     )
@@ -718,6 +728,7 @@ def load_ext(
         + ("_adqf2" if attn_dq_float2_store else "")
         + ("_drowst" if drow_direct_store else "")
         + ("_aflog" if attn_fast_log else "") + ("_aex2" if attn_exp2_approx else "")
+        + ("pb" if attn_exp2_prebias else "")
         + ("_acur" if attn_combine_unroll else "")
         + ("_lex2" if lmhead_exp2_approx else "")
         + ("_ceb2" if ce_bwd_exp2_approx else "")
@@ -764,6 +775,7 @@ def load_ext(
         + (["-DMK_DROW_DIRECT_STORE"] if drow_direct_store else [])
         + (["-DMK_ATTN_FAST_LOG"] if attn_fast_log else [])
         + (["-DMK_ATTN_EXP2_APPROX"] if attn_exp2_approx else [])
+        + (["-DMK_ATTN_EXP2_PREBIAS"] if attn_exp2_prebias else [])
         + (["-DMK_ATTN_COMBINE_UNROLL"] if attn_combine_unroll else [])
         + (["-DMK_LMHEAD_EXP2_APPROX"] if lmhead_exp2_approx else [])
         + (["-DMK_CE_BWD_EXP2_APPROX"] if ce_bwd_exp2_approx else [])

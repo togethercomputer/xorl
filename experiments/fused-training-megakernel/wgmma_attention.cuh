@@ -56,6 +56,16 @@ __device__ __forceinline__ float wga_exp(float x) {
 #endif
 }
 
+#ifdef MK_ATTN_EXP2_PREBIAS
+static constexpr float WGA_LOG2E = 1.4426950408889634f;
+__device__ __forceinline__ float wga_exp2_prebias(float score, float scale_l2,
+                                                  float neg_lse_l2) {
+  float y;
+  asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(fmaf(score, scale_l2, neg_lse_l2)));
+  return y;
+}
+#endif
+
 __device__ __forceinline__ void wga_mbar_init(uint64_t* bar, uint32_t count) {
   const uint32_t a = (uint32_t)__cvta_generic_to_shared(bar);
   asm volatile("mbarrier.init.shared.b64 [%0], %1;" ::"r"(a), "r"(count));
@@ -629,6 +639,9 @@ __device__ __noinline__ void op_attn_dkv_wg(const Instr& I, int tile, void** buf
   constexpr int D = 64;
   const int S = I.args[5], nq = I.args[6], nkv = I.args[7];
   const float scale = __int_as_float(I.args[9]);
+#ifdef MK_ATTN_EXP2_PREBIAS
+  const float scale_l2 = scale * WGA_LOG2E;
+#endif
   // args[10] packs C | band_kv_tile_off<<8 | band_width<<16 (off/width 0 = full
   // range, so pre-band callers passing a bare C decode unchanged). Banded emission
   // gives the causal-triangle straggler tiles more chunks than the tail tiles: at
@@ -739,12 +752,20 @@ __device__ __noinline__ void op_attn_dkv_wg(const Instr& I, int tile, void** buf
         const int qr = q0s + r0 + 8 * i;
         const float lse = sm.LSEs[t & 1][r0 + 8 * i];
         const float dr = sm.Drows[t & 1][r0 + 8 * i];
+#ifdef MK_ATTN_EXP2_PREBIAS
+        const float neg_lse_l2 = -lse * WGA_LOG2E;
+#endif
 #pragma unroll
         for (int n8 = 0; n8 < 8; ++n8) {
           const int idx = n8 * 4 + i * 2;
           const int kr = kv0wg + n8 * 8 + cb;
+#ifdef MK_ATTN_EXP2_PREBIAS
+          float p0 = wga_exp2_prebias(s[idx], scale_l2, neg_lse_l2);
+          float p1 = wga_exp2_prebias(s[idx + 1], scale_l2, neg_lse_l2);
+#else
           float p0 = wga_exp(s[idx] * scale - lse);
           float p1 = wga_exp(s[idx + 1] * scale - lse);
+#endif
           if (masked && kr > qr) p0 = 0.0f;
           if (masked && kr + 1 > qr) p1 = 0.0f;
           const int off = wga_off64(r0 + 8 * i, n8 * 8 + cb);
@@ -833,6 +854,9 @@ __device__ __noinline__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs
   constexpr int D = 64;
   const int S = I.args[5], nq = I.args[6], nkv = I.args[7];
   const float scale = __int_as_float(I.args[9]);
+#ifdef MK_ATTN_EXP2_PREBIAS
+  const float scale_l2 = scale * WGA_LOG2E;
+#endif
   // args[10] packs C | band_q_tile_off<<8 | band_width<<16, as in op_attn_dkv_wg.
   // A band emitted with C==1 still has one writer per q slice (bands are q-disjoint),
   // so the direct-store epilogue below stays valid per band.
@@ -905,6 +929,9 @@ __device__ __noinline__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs
   const int qr[2] = {q0wg + r0, q0wg + r0 + 8};
   const float lse[2] = {LSE[(int64_t)qh * S + qr[0]], LSE[(int64_t)qh * S + qr[1]]};
   const float dr[2] = {Drow[(int64_t)qh * S + qr[0]], Drow[(int64_t)qh * S + qr[1]]};
+#ifdef MK_ATTN_EXP2_PREBIAS
+  const float neg_lse_l2[2] = {-lse[0] * WGA_LOG2E, -lse[1] * WGA_LOG2E};
+#endif
 
   for (int t = 0; t < n_stages; ++t) {
     const int k0 = (c + t * C) * 64;
@@ -927,8 +954,13 @@ __device__ __noinline__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs
         for (int n8 = 0; n8 < 8; ++n8) {
           const int idx = n8 * 4 + i * 2;
           const int kr = k0 + n8 * 8 + cb;
+#ifdef MK_ATTN_EXP2_PREBIAS
+          float p0 = wga_exp2_prebias(s[idx], scale_l2, neg_lse_l2[i]);
+          float p1 = wga_exp2_prebias(s[idx + 1], scale_l2, neg_lse_l2[i]);
+#else
           float p0 = wga_exp(s[idx] * scale - lse[i]);
           float p1 = wga_exp(s[idx + 1] * scale - lse[i]);
+#endif
           if (masked && kr > qr[i]) p0 = 0.0f;
           if (masked && kr + 1 > qr[i]) p1 = 0.0f;
           const int off = wga_off64(r0 + 8 * i, n8 * 8 + cb);

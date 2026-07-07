@@ -393,6 +393,10 @@ class MKQwen3:
             (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
             == (256, 4, 8192, 4, 2, 64, 768, 8192)
         )
+        exact_s4096 = (
+            (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
+            == (256, 4, 4096, 4, 2, 64, 768, 8192)
+        )
         exact_small_h512_s1024 = (
             (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
             == (512, 8, 1024, 8, 4, 64, 1536, 16384)
@@ -460,6 +464,10 @@ class MKQwen3:
             and c.I == 768
             and c.V == 8192
         )
+        # D64 attention-bwd exp2 prebias: the global probe was a no-go because
+        # S8192 regressed and small was neutral, but exact S4096 was positive in
+        # both orders. Keep this exact unless a future rerun widens the gate.
+        self.attn_exp2_prebias_default = exact_s4096
         # Producer-df default mode (per-shape executor routing; see _PDF_MODE).
         # The pdf executor + WG2 producer compile only for gated shapes.
         self.default_mode = (
@@ -484,6 +492,7 @@ class MKQwen3:
             swiglu_cache_sig=self.swiglu_cache_sig_enabled,
             drow_direct_store=self.drow_direct_store_enabled,
             attn_exp2_approx=self.attn_exp2_approx_default,
+            attn_exp2_prebias=self.attn_exp2_prebias_default,
             lmhead_exp2_approx=self.lmhead_exp2_approx_default,
             ce_bwd_exp2_approx=self.ce_bwd_exp2_approx_default,
             ce_bwd_label_fixup=self.ce_bwd_label_fixup_default,
