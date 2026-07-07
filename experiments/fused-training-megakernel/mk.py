@@ -506,6 +506,7 @@ def load_ext(
     gemm_d64_tma=None,
     gemm_direct_bf16_epilogue=None,
     head_dx_skr=0,
+    pdf_producer=0,
 ):
     # MK_OCC2=1 builds the 256-thread executors with __launch_bounds__(256, 2):
     # 2 blocks/SM (128-reg ceiling, ptxas spills the fat op paths). Motivated by the
@@ -604,7 +605,7 @@ def load_ext(
     pdf = int(os.environ.get("MK_PDF", "0"))
     pdf_regs = int(os.environ.get("MK_PDF_REGS", "240"))
     pdf_dec = int(os.environ.get("MK_PDF_DEC", "24"))
-    pdf_producer = int(os.environ.get("MK_PDF_PRODUCER", "0"))
+    pdf_producer = int(os.environ.get("MK_PDF_PRODUCER", int(bool(pdf_producer))))
     if pdf_producer:
         pdf = 1
     assert not pdf or 8 * pdf_regs + 4 * pdf_dec <= 2048, "pdf register pool infeasible"

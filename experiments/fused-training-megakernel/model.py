@@ -139,6 +139,24 @@ _HEAD_DX_SKR = {
     (256, 3072, 768, 8192, 4, 2, 64, 4): 2,    # s3072
     (256, 4096, 768, 8192, 4, 2, 64, 4): 2,    # s4096
 }
+# Producer-df executor mode (megakernel_pdf): 384thr, consumers in a
+# setmaxnreg-region at 240 regs, WG2 = pure-TMA producer feeding the n256-TMA
+# rows via the MkPdfFeed smem mailbox. Measured at head e8837a5 (k8s paired
+# same-binary df-vs-pdf, both orders, parity clean + GPU-5 iclk profile):
+# qwen4b-l1 -1056/-1127us 12/12 (lm-head dX span 2453->1680, -32%),
+# qwen4b-l2 -1511/-1370us 12/12 (on top of the l2 gemm-cluster promotion),
+# s3072 -20.7/-21.7us 40/40+39/40, s8192 -171/-162us 16/16 (head binary;
+# pre-rebase binary read +63 — re-certify after any big codegen shift);
+# NO-GO small +142/+147us 0/40 (the 240-region tax, short-S stays df).
+# Flat-cap control MK_DF_MAXNREG=240 at qwen is +30/+44us WORSE — the
+# region-compiled image + producer, not the ceiling, carry the win.
+# MK_MODE force-overrides (df|pdf|ws|df2|waves).
+_PDF_MODE = {
+    (2560, 1024, 9728, 151936, 32, 8, 128, 1),  # H,S,I,V,nq,nkv,D,L (qwen4b-l1)
+    (2560, 1024, 9728, 151936, 32, 8, 128, 2),  # qwen4b-l2
+    (256, 3072, 768, 8192, 4, 2, 64, 4),        # s3072
+    (256, 8192, 768, 8192, 4, 2, 64, 4),        # s8192
+}
 
 
 def _cold_cap(c):
@@ -432,6 +450,16 @@ class MKQwen3:
             and c.I == 768
             and c.V == 8192
         )
+        # Producer-df default mode (per-shape executor routing; see _PDF_MODE).
+        # The pdf executor + WG2 producer compile only for gated shapes.
+        self.default_mode = (
+            "pdf"
+            if (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) in _PDF_MODE
+            else "df"
+        )
+        mode_env = os.environ.get("MK_MODE")
+        if mode_env:
+            self.default_mode = mode_env
         self.ext = mk.load_ext(
             swiglu_bwd_2w=self.swiglu_bwd_2w_default,
             swiglu_bwd_4w=self.swiglu_bwd_4w_default,
@@ -453,6 +481,7 @@ class MKQwen3:
             gemm_d64_tma=self.gemm_d64_tma_default,
             gemm_direct_bf16_epilogue=self.gemm_direct_bf16_epilogue_default,
             head_dx_skr=self.head_dx_skr,
+            pdf_producer=self.default_mode == "pdf",
         )
         # D=128 WGMMA attention route (default ON for D==128, S%64==0; the opgap
         # FA4-C trio spec's fallback replacement): MK_ATTN_D128_WG=0 restores the
@@ -1385,8 +1414,14 @@ class MKQwen3:
         self.n_waves = len(p.waves)
 
     # ------------------------------------------------------------------ #
-    def step(self, tokens: torch.Tensor, labels: torch.Tensor, mode="df") -> torch.Tensor:
-        """One fused fwd+bwd. Returns the (device) loss scalar; grads are in self.grads."""
+    def step(self, tokens: torch.Tensor, labels: torch.Tensor, mode=None) -> torch.Tensor:
+        """One fused fwd+bwd. Returns the (device) loss scalar; grads are in self.grads.
+
+        mode=None resolves to the shape's default executor (_PDF_MODE routing);
+        pass an explicit mode ("df"/"pdf"/"ws"/...) to force one.
+        """
+        if mode is None:
+            mode = self.default_mode
         bind_inputs = (
             self.bind_inputs
             and mode in ("df", "pdf")  # pdf shares df's state layout and bind path

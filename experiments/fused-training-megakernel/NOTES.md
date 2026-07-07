@@ -6401,6 +6401,41 @@ measured structural gap, in order:
    (the dW gemms); tile-granular counters would let dependent ops start on partially
    complete producers (true MPK-style pipelining).
 
+## Producer-df executor (mode=pdf): the round-5 topology, in-model (2026-07-07)
+
+`megakernel_pdf` (session e5225c66): the df protocol verbatim at 384 threads /
+entry `__maxnreg__(168)`; consumer warpgroups run inside a `setmaxnreg.inc 240`
+region (the whole consumer body INSIDE the taken branch ending in return — the
+region idiom, see IMPROVEMENTS.md toolchain law: a fallthrough inc is silently
+compiled at the entry cap), WG2 `setmaxnreg.dec 24`. With `MK_PDF_PRODUCER`
+(model kwarg `pdf_producer`, auto-set by the `_PDF_MODE` gate), WG2 thread 256
+parks as a pure TMA issuer (R18 of 24) fed by the `MkPdfFeed` static-smem
+mailbox: consumer tid0 posts one request per n256-TMA tile after barrier init
+(release/acquire seq), the producer replays the full stage schedule gated only
+by ring empties; consumers keep wait-full -> mma -> arrive-empty. Requests are
+strictly serial per block (tile T+1 posts program-order after T's last
+full-wait), so the mailbox needs no other synchronization. synccheck 0 errors;
+racecheck shows only the by-design acquire/release class.
+
+Measured (head e8837a5, k8s paired same-binary df-vs-pdf, both orders, parity
+clean; GPU-5 iclk profile concurring): qwen4b-l1 -1056/-1127us 12/12 (lm-head
+dX span 2453->1680us, -32%; step ~7.97ms => ~1.11x vs graph+), qwen4b-l2
+-1511/-1370us 12/12 (composes with the l2 gemm-cluster promotion; ~1.53x),
+s3072 -20.7/-21.7us 40/40+39/40, s8192 -171/-162us 16/16 (head binary; the
+pre-rebase binary read +63 — cross-binary band, re-certify on codegen shifts),
+small +142/+147us 0/40 (the 240-region tax; short-S stays df). Controls:
+MK_DF_MAXNREG=240 flat cap at qwen is +30/+44us WORSE — the region-compiled
+image + producer carry the win, not the lower ceiling.
+
+Routing: `_PDF_MODE` (model.py) defaults mode=pdf at qwen4b-l1/l2, s3072,
+s8192; `step(mode=None)` resolves per shape; `MK_MODE` force-overrides.
+Non-gated shapes compile WITHOUT the pdf executor (bit-identical binaries to
+the pre-landing head). Follow-ons: NT lm-head fwd row (2.49ms at qwen, needs
+NT mbar + NT tmap + producer), generic long-D64 ring rows (compose with the
+_gmtma tmap injection; the elected-feed no-go there isolated exactly the
+serialization the producer removes), the residual ~+134us shell cost at small
+(STACK 80 vs 32 — main session's restructure lane).
+
 ## Superseded: v0 assessment
 
 The megakernel beats eager (4.1x) and matches plain torch.compile at nano scale, but
