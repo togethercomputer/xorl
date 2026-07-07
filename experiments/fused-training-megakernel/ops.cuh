@@ -2158,6 +2158,48 @@ void op_gemm_wgmma_n64_impl(const Instr& I, int tile, void** bufs, char* smem_ra
   }
 #endif
 
+#ifdef MK_DROW_REG_EPILOGUE
+  if ((flags & 1024) && I.args[11] == WG_BN) {
+    bf16* C = reinterpret_cast<bf16*>(Cp);
+    const bf16* Oatt = reinterpret_cast<const bf16*>(bufs[I.args[9]]);
+    float* drow = reinterpret_cast<float*>(bufs[I.args[10]]);
+    const int w = wtid / 32, l = wtid & 31;
+    const int cb = (l & 3) * 2;
+    float drow_sum[2] = {0.0f, 0.0f};
+#pragma unroll
+    for (int n8 = 0; n8 < 8; ++n8) {
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const int r = wg * 64 + w * 16 + l / 4 + 8 * i;
+        const int64_t idx = (int64_t)(m0 + r) * N + n0 + n8 * 8 + cb;
+        const bf16 z0 = f2bf(d[n8 * 4 + i * 2 + 0]);
+        const bf16 z1 = f2bf(d[n8 * 4 + i * 2 + 1]);
+        __nv_bfloat162 out;
+        out.x = z0;
+        out.y = z1;
+        *reinterpret_cast<__nv_bfloat162*>(&C[idx]) = out;
+        drow_sum[i] += bf2f(z0) * bf2f(Oatt[idx]) + bf2f(z1) * bf2f(Oatt[idx + 1]);
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      float s = drow_sum[i];
+      s += __shfl_xor_sync(0xffffffffu, s, 1);
+      s += __shfl_xor_sync(0xffffffffu, s, 2);
+      if ((l & 3) == 0) {
+        const int r = wg * 64 + w * 16 + l / 4 + 8 * i;
+#ifdef MK_DROW_DIRECT_STORE
+        if (M < 2048)
+          drow[(int64_t)(n0 / WG_BN) * M + m0 + r] = s;
+        else
+#endif
+          atomicAdd(&drow[(int64_t)(n0 / WG_BN) * M + m0 + r], s);
+      }
+    }
+    return;
+  }
+#endif
+
   // stage accumulators to smem (over the dead A/B buffers), then coalesced epilogue
   float* Cs = reinterpret_cast<float*>(smem_raw);
   const int w = wtid / 32, l = wtid % 32;

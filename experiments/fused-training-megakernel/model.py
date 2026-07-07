@@ -80,9 +80,9 @@ _SMALL_SWIGLU_BWD_4W = {
 }
 _SMALL_SWIGLU_BWD_2W = _SMALL_SWIGLU_BWD_4W
 _H256_IDLE32_S = (2048, 3072, 4096, 8192)  # H==256: scheduler idle poll 32ns (else 256)
-_H256_DQ_FLOAT2_S = (3072, 8192)           # H==256: attention-dQ float2 direct store
+_H256_DQ_FLOAT2_S = (128, 256, 3072, 8192) # H==256: attention-dQ float2 direct store
 _H256_D64_DKV_ROW_BCAST_S = ()             # H==256/D==64: attention-dKV row scalar shuffles
-_H256_RMS_DX_H256_S = (512, 1024, 8192)    # H==256: fixed-width RMS bwd-dx opcode
+_H256_RMS_DX_H256_S = (128, 512, 1024, 2048, 3072, 8192) # H==256: fixed-width RMS bwd-dx opcode; S256/S4096 rejected (see rmsdx-h256-mids-3f21e1e.md)
 _H256_D64_DROW_ZERO_SKIP_S = (256, 512)    # H==256/D==64: direct-store drow overwrites
 _ATTN_BWD_BAND_T = {2048: 12, 3072: 20, 4096: 29, 8192: 40}  # H==256/D==64; 0 elsewhere
 # (3072: 16->20 post-dq-p-pack, resweep flip: -12.8/-5.4 38/40+32/40 both orders)
@@ -123,11 +123,20 @@ _QWEN_L1_DW_NO_ATOMIC_SK1 = {  # M,N,K for qwen4b-l1 dW GEMMs that split-K compu
 }
 _GENERIC_SHORT_DW_NO_ATOMIC_SK1_CFGS = {
     # 20260707 current-head gate: removing generic dW sk=1 zero-fill+atomics
-    # wins both construction orders only for the H256/L4 short-S family.
-    # Keep S1024+, deep (L12), and small (H512) on the split-K atomic route.
+    # wins both construction orders for H256/L4 short-S plus exact deep/small,
+    # and (same-day mid/long-S map, dw-sk1-mids-3f21e1e.md) for H256/L4
+    # S2048/S3072/S4096/S8192 (-24..-39us, 40/40 or 31/32 pooled both orders).
+    # Exact S1024 H256/L4 is an order-mixed WASH — keep it and all non-exact
+    # generic configs on the atomic route.
     (256, 4, 4, 2, 64, 768, 8192, 128),
     (256, 4, 4, 2, 64, 768, 8192, 256),
     (256, 4, 4, 2, 64, 768, 8192, 512),
+    (256, 4, 4, 2, 64, 768, 8192, 2048),
+    (256, 4, 4, 2, 64, 768, 8192, 3072),
+    (256, 4, 4, 2, 64, 768, 8192, 4096),
+    (256, 4, 4, 2, 64, 768, 8192, 8192),
+    (256, 12, 4, 2, 64, 768, 8192, 512),
+    (512, 8, 8, 4, 64, 1536, 16384, 1024),
 }
 # dlogits @ Wlm split-K tile targets: {H: {S: target}}, 192 elsewhere.
 _HEAD_DX_TARGET = {256: {128: 32, 256: 64, 1024: 64, 512: 96, 2048: 96, 3072: 96},
@@ -367,7 +376,18 @@ class MKQwen3:
             if drow_zero_fill_env is None
             else bool(int(drow_zero_fill_env)) or not self.drow_direct_store_overwrites
         )
-        self.attn_exp2_approx_default = c.D == 64 and c.S >= 512 and c.S % 128 == 0
+        exact_h256_d64_s128_s256 = (
+            (c.H, c.L, c.nq, c.nkv, c.D, c.I, c.V) == (256, 4, 4, 2, 64, 768, 8192)
+            and c.S in (128, 256)
+        )
+        exact_h256_d64_deep = (
+            (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
+            == (256, 12, 512, 4, 2, 64, 768, 8192)
+        )
+        self.attn_exp2_approx_default = (
+            (c.D == 64 and c.S >= 512 and c.S % 128 == 0)
+            or exact_h256_d64_s128_s256
+        )
         self.lmhead_exp2_approx_default = c.V >= 8192 and c.V % 64 == 0 and c.S >= 256
         self.ce_bwd_exp2_approx_default = c.S >= 1024 and c.V >= 8192 and c.V % 8 == 0
         # S2048/S8192 joined post-band; the full long-S H256 bucket now wins 32ns
@@ -419,6 +439,18 @@ class MKQwen3:
             (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
             == (256, 4, 3072, 4, 2, 64, 768, 8192)
         )
+        exact_s2048 = (
+            (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
+            == (256, 4, 2048, 4, 2, 64, 768, 8192)
+        )
+        exact_s1024 = (
+            (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
+            == (256, 4, 1024, 4, 2, 64, 768, 8192)
+        )
+        exact_h256_d64_nano = (
+            (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
+            == (256, 4, 512, 4, 2, 64, 768, 8192)
+        )
         exact_small_h512_s1024 = (
             (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
             == (512, 8, 1024, 8, 4, 64, 1536, 16384)
@@ -451,11 +483,13 @@ class MKQwen3:
         # =1 force-enables for probing; TN rows stay off (order-mixed
         # standalone) behind MK_GEMM_N256_TMA_TN except at exact qwen.
         self.gemm_n256_tma_default = exact_qwen4b_l1 or exact_qwen4b_l2
-        # Qwen4B-L1 lm-head fwd NT row: TMA/pdf producer feed for full
-        # 256-column vocab tiles, with the final 128-column tail on the existing
-        # cp.async direct body. L2 stayed mixed in the local order-reversal
-        # window, so keep the default l1-only; MK_GEMM_N256_NT_TMA=0/1 guards A/B.
-        self.gemm_n256_nt_tma_default = exact_qwen4b_l1
+        # Qwen4B lm-head fwd NT row: TMA/pdf producer feed for full 256-column
+        # vocab tiles, with the final 128-column tail on the existing cp.async
+        # direct body. L2 was widened after the a00c1dd current-head refresh
+        # measured MK_GEMM_N256_NT_TMA=1 positive in both orders
+        # (+66.91/+68.40us versus forced old, parity clean, LOCAL:0).
+        # MK_GEMM_N256_NT_TMA=0/1 remains the explicit A/B override.
+        self.gemm_n256_nt_tma_default = exact_qwen4b_l1 or exact_qwen4b_l2
         # L2 terminal EMBED_BWD sits as an off-path cold leaf while lm-head dW drains;
         # making only that leaf hot recovers ~0.14-0.17ms at exact qwen4b-l2 with
         # qwen4b-l1 neutral and generic shapes order-mixed. MK_HOT_EMBED_BWD=0/1
@@ -546,28 +580,57 @@ class MKQwen3:
         )
         # D64 attention-bwd exp2 prebias: exact S4096 was promoted first; after
         # the S8192 dQ register-feed landing, exact S8192 also wins both orders.
-        # Keep the gate exact because small stayed neutral/negative.
-        self.attn_exp2_prebias_default = exact_s4096 or exact_s8192
+        # Exact H256 deep S512 joined in the short-S attention combo confirmation;
+        # keep the gate exact because small stayed neutral/negative.
+        self.attn_exp2_prebias_default = (
+            exact_s4096 or exact_s8192 or exact_h256_d64_deep
+        )
         # D64 dQ register-A dS feed: exact S4096/S8192 remove the dS smem round
         # trip and won both construction orders after the pdf+d64feed/scalar
-        # store gates. S3072 stayed too small in reverse-order confirmation.
+        # store gates. Exact H256 short S128/S256 and deep S512 joined in the
+        # short-S combo confirmation. S3072 stayed too small in reverse-order
+        # confirmation.
         # MK_ATTN_DQ_RS_FEED=0/1 remains the explicit A/B override.
-        self.attn_dq_rs_feed_default = exact_s4096 or exact_s8192
+        self.attn_dq_rs_feed_default = (
+            exact_s4096
+            or exact_s8192
+            or exact_h256_d64_s128_s256
+            or exact_h256_d64_deep
+        )
         # D64 dQ fp32-P pack: exact S8192 and S3072 win by removing an extra
         # bf16(P)->fp32(P) round before the final bf16 dS pack on the RS-feed
-        # path. S4096 was neutral, so keep this exact-shape gated;
+        # path. Exact H256 short S128/S256 and deep S512 also win with RS-feed
+        # composed. S4096 was neutral, so keep this exact-shape gated;
         # MK_ATTN_DQ_FP32_P=0/1 guards A/B.
-        self.attn_dq_fp32_p_default = exact_s3072 or exact_s8192
-        # D64 dQ C>1 bulk-reduce drain (cp.reduce.async.bulk.add.f32): exact
-        # S4096 wins -32.7..-41.4us at 40/40 both orders plus reruns; S8192 is
-        # REFUTED (+39..+55us — the drain's mandatory wait_group 0 puts the TMA
-        # round trip on the critical C=4 tail bands; the replaced fp32 atomics
-        # are fire-and-forget). MK_ATTN_DQ_BULK_RED=0/1 guards A/B. Flag-on
+        self.attn_dq_fp32_p_default = (
+            exact_s3072
+            or exact_s8192
+            or exact_h256_d64_s128_s256
+            or exact_h256_d64_deep
+        )
+        # D64 dQ C>1 bulk-reduce drain (cp.reduce.async.bulk.add.f32): the
+        # 2026-07-07 gate-map completion promoted every measured H256/D64
+        # cell S512..S4096 both orders (nano -3..-6 via 4/4 x120 escalation,
+        # s1024 -6..-11, s2048 -17..-23, s3072 -11..-13, s4096 -33..-41,
+        # deep -10..-13); small (H512) is order-mixed NO-GO and S8192 is
+        # REFUTED (+39..+55us -- the drain's mandatory wait_group 0 puts the
+        # TMA round trip on the critical C=4 tail bands; the replaced fp32
+        # atomics are fire-and-forget). MK_ATTN_DQ_BULK_RED=0/1 guards A/B.
+        # Flag-on
         # builds force-inline op_attn_dq_wg and hard-audit UBLKRED F32 SASS per
         # kernel clone (ptxas 13.1 otherwise silently assembles the asm as
         # ADD.U64 in all but one cloned entry).
-        # See results/operator-gap/dq-bulkreduce-drain-b1d36305.md.
-        self.attn_dq_bulk_red_default = exact_s4096
+        # See results/operator-gap/dq-bulkreduce-drain-b1d36305.md,
+        # results/operator-gap/deep-dq-bulkred-a00c1dd-promote.md, and
+        # results/operator-gap/dq-bulkred-gatemap-3f21e1e.md.
+        self.attn_dq_bulk_red_default = (
+            exact_s4096
+            or exact_h256_d64_deep
+            or exact_h256_d64_nano
+            or exact_s1024
+            or exact_s2048
+            or exact_s3072
+        )
         # Producer-df default mode (per-shape executor routing; see _PDF_MODE).
         # The pdf executor + WG2 producer compile only for gated shapes.
         self.default_mode = (
