@@ -132,6 +132,9 @@ __device__ __forceinline__ void op_skr_reduce(const Instr& I, int tile, void** b
 //   flags bit5: split-K (requires fp32 C, pre-zeroed): args[8] = #slices, each slice
 //               computes a K-range and accumulates via fp32 atomicAdd. Rescues SM
 //               occupancy for small dW matrices (few M*N tiles, large K).
+//   flags bit6 (MK_GEMM_DX_TMA_RED builds, with bit5): NN dX split-K slices stage
+//               fp32 C rows to smem, then drain each full 64x128 tile with
+//               cp.reduce.async.bulk.add.f32 instead of per-element atomics.
 //   flags bit15 (MK_HEAD_DX_SKR builds, with bit5): split-K slices write plain fp32
 //               partials to per-slice slabs at C + slice*M*N (no zero-fill, no
 //               atomics); OP_SKR_REDUCE sums the slabs (round-12 SKR structure).
@@ -150,6 +153,7 @@ __device__ __forceinline__ void op_skr_reduce(const Instr& I, int tile, void** b
 #define GEMM_LDA (GEMM_BK + 8)  // bf16 smem strides (pad: bank conflicts + wmma align)
 #define GEMM_LDB (GEMM_BN + 8)
 #define GEMM_LDC (GEMM_BN + 4)  // fp32 staging (wmma: fp32 ld must be a multiple of 4)
+#define GEMM_DX_TMA_RED_FLAG 64
 
 struct GemmSmem {
   bf16 As[GEMM_BM][GEMM_LDA];
@@ -161,7 +165,35 @@ __device__ __forceinline__ uint4 ldg16(const bf16* p) {
   return *reinterpret_cast<const uint4*>(p);
 }
 
+#ifdef MK_GEMM_DX_TMA_RED
+__device__ __forceinline__ void gemm_dx_tma_red_drain_tile(float* C, const GemmSmem& S,
+                                                           int N, int m0, int n0) {
+  const int tid = mk_tid();
+  if (tid < GEMM_BM) {
+    uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_normal.b64 %0;" : "=l"(policy));
+    const uint32_t src =
+        static_cast<uint32_t>(__cvta_generic_to_shared(&S.Cs[tid][0]));
+    asm volatile(
+        "cp.reduce.async.bulk.global.shared::cta.bulk_group.L2::cache_hint.add.f32"
+        " [%0], [%1], %2, %3;"
+        :
+        : "l"(C + (int64_t)(m0 + tid) * N + n0), "r"(src), "r"(GEMM_BN * 4),
+          "l"(policy)
+        : "memory");
+    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+    asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
+    asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+  }
+}
+#endif
+
+#ifdef MK_GEMM_DX_TMA_RED
+__device__ __forceinline__ void op_gemm(const Instr& I, int tile, void** bufs,
+                                        char* smem_raw) {
+#else
 __device__ void op_gemm(const Instr& I, int tile, void** bufs, char* smem_raw) {
+#endif
   const bf16* A = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
   const bf16* B = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
   void* Cp = bufs[I.args[2]];
@@ -185,6 +217,11 @@ __device__ void op_gemm(const Instr& I, int tile, void** bufs, char* smem_raw) {
   // Fast path: whole tile in bounds and every vectorized load 16B-aligned.
   const bool fast = (m0 + GEMM_BM <= M) && (n0 + GEMM_BN <= N) && (K % 8 == 0) &&
                     (M % 8 == 0) && (N % 8 == 0);
+#ifdef MK_GEMM_DX_TMA_RED
+  const bool dx_tma_red = (flags & GEMM_DX_TMA_RED_FLAG) && (flags & 32) && c_f32 &&
+                          !a_t && !b_t && !Res && (m0 + GEMM_BM <= M) &&
+                          (n0 + GEMM_BN <= N);
+#endif
 
   // 8 warps as 2(m) x 4(n): each computes a 32x32 warp tile = 2x2 wmma frags.
   const int warp = tid / 32;
@@ -296,7 +333,18 @@ __device__ void op_gemm(const Instr& I, int tile, void** bufs, char* smem_raw) {
     for (int j = 0; j < 2; ++j)
       wmma::store_matrix_sync(&S.Cs[wm * 32 + i * 16][wn * 32 + j * 16], c_frag[i][j],
                               GEMM_LDC, wmma::mem_row_major);
+#ifdef MK_GEMM_DX_TMA_RED
+  if (dx_tma_red) asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+#endif
   consumer_sync();
+
+#ifdef MK_GEMM_DX_TMA_RED
+  if (dx_tma_red) {
+    gemm_dx_tma_red_drain_tile(reinterpret_cast<float*>(Cp), S, N, m0, n0);
+    consumer_sync();
+    return;
+  }
+#endif
 
   for (int i = tid; i < GEMM_BM * GEMM_BN; i += MK_CONSUMERS) {
     const int m = i / GEMM_BN, n = i % GEMM_BN;

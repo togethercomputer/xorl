@@ -56,6 +56,7 @@ OP_SWIGLU_BWD_4W = 37  # opt-in four-warps-per-row SwiGLU backward route
 OP_SKR_REDUCE = 38  # sum split-K fp32 partial slabs (round-12 SKR head-dX route)
 
 GEMM_BM, GEMM_BN = 64, 128  # keep in sync with ops.cuh
+GEMM_DX_TMA_RED_FLAG = 1 << 6  # with bit5: dX split-K smem tile -> bulk reduce-add
 GEMM_SKR_FLAG = 1 << 15  # with bit5: plain per-slice slab stores + OP_SKR_REDUCE
 GEMM_N256_STAGE3_FLAG = 1 << 25
 GEMM_N256_NMAJOR_FLAG = 1 << 26
@@ -530,6 +531,7 @@ def load_ext(
     gemm_n256_tma=None,
     gemm_n256_nt_tma=None,
     gemm_d64_tma=None,
+    gemm_dx_tma_red=None,
     gemm_direct_bf16_epilogue=None,
     head_dx_skr=0,
     pdf_producer=0,
@@ -604,6 +606,11 @@ def load_ext(
     else:
         attn_dq_bulk_red = int(bool(attn_dq_bulk_red))
     attn_dq_bulk_red_salt = int(os.environ.get("MK_ATTN_DQ_BULK_RED_SALT", "0"))
+    gemm_dx_tma_red_env = os.environ.get("MK_GEMM_DX_TMA_RED")
+    if gemm_dx_tma_red_env is not None:
+        gemm_dx_tma_red = int(gemm_dx_tma_red_env)
+    else:
+        gemm_dx_tma_red = int(bool(gemm_dx_tma_red))
     drow_direct_store_env = os.environ.get("MK_DROW_DIRECT_STORE")
     if drow_direct_store_env is not None:
         drow_direct_store = int(drow_direct_store_env)
@@ -814,6 +821,7 @@ def load_ext(
         + ("_gtma" if gemm_n256_tma else "")
         + ("_nttma" if gemm_n256_nt_tma else "")
         + ("_d64tma" if gemm_d64_tma else "")
+        + ("_gdxtred" if gemm_dx_tma_red else "")
         + ("_gdbf16" if gemm_direct_bf16_epilogue else "")
         + ("_hdskr" if head_dx_skr else "")
         + (f"_pdf{pdf_regs}" if pdf else "")
@@ -870,6 +878,7 @@ def load_ext(
         + (["-DMK_GEMM_N256_TMA"] if gemm_n256_tma else [])
         + (["-DMK_GEMM_N256_NT_TMA"] if gemm_n256_nt_tma else [])
         + (["-DMK_GEMM_D64_TMA"] if gemm_d64_tma else [])
+        + (["-DMK_GEMM_DX_TMA_RED"] if gemm_dx_tma_red else [])
         + (["-DMK_GEMM_DIRECT_BF16_EPILOGUE"] if gemm_direct_bf16_epilogue else [])
         + (["-DMK_HEAD_DX_SKR"] if head_dx_skr else [])
         + (["-DMK_PDF", f"-DMK_PDF_REGS={pdf_regs}", f"-DMK_PDF_DEC={pdf_dec}"] if pdf else [])
@@ -878,7 +887,7 @@ def load_ext(
         + ([f"-DMK_ATTN_PDF_FEED={attn_pdf_feed}"] if attn_pdf_feed else []),
         verbose=verbose,
     )
-    if attn_dq_bulk_red:
+    if attn_dq_bulk_red or gemm_dx_tma_red:
         _audit_bulkred_sass(ext.__file__)
     return ext
 

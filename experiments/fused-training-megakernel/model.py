@@ -474,6 +474,18 @@ class MKQwen3:
             and c.S in (2048, 3072, 4096, 8192)
         )
         self.gemm_d64_tma_default = exact_long_d64
+        # dX split-K TMA reduce-add: measured positive only on the generic H256/D64
+        # short/nano/deep shapes with actual NN split-K dX rows. Keep an env override
+        # for rollback and A/B; other shapes avoid the extra extension/audit path.
+        exact_dx_tma_red = (
+            (c.H, c.nq, c.nkv, c.D, c.I, c.V) == (256, 4, 2, 64, 768, 8192)
+            and c.S in (128, 256, 512)
+            and c.L in (4, 12)
+        )
+        gemm_dx_tma_red_env = os.environ.get("MK_GEMM_DX_TMA_RED")
+        self.gemm_dx_tma_red_enabled = (
+            exact_dx_tma_red if gemm_dx_tma_red_env is None else bool(int(gemm_dx_tma_red_env))
+        )
         self.gemm_direct_bf16_epilogue_default = c.D == 64 and (
             c.S == 128 or (c.H, c.L, c.S, c.nq, c.nkv, c.I) == (512, 8, 1024, 8, 4, 1536)
         )
@@ -563,6 +575,7 @@ class MKQwen3:
             gemm_n256_tma=self.gemm_n256_tma_default,
             gemm_n256_nt_tma=self.gemm_n256_nt_tma_default,
             gemm_d64_tma=self.gemm_d64_tma_default,
+            gemm_dx_tma_red=self.gemm_dx_tma_red_enabled,
             gemm_direct_bf16_epilogue=self.gemm_direct_bf16_epilogue_default,
             head_dx_skr=self.head_dx_skr,
             pdf_producer=self.default_mode == "pdf",
@@ -856,7 +869,10 @@ class MKQwen3:
             plain gemms already have >= 64 tiles — hence the tile gate."""
             if self.dx_split_k and mk.gemm_tiles(M, N) < 32:
                 sk = mk.gemm_split_k(M, N, K, target_tiles=128)
-                p.instr(mk.OP_GEMM, mk.gemm_tiles(M, N) * sk, [a, b, out_f32(), M, N, K, 8 | 32, 0, sk])
+                flags = 8 | 32
+                if self.gemm_dx_tma_red_enabled:
+                    flags |= mk.GEMM_DX_TMA_RED_FLAG
+                p.instr(mk.OP_GEMM, mk.gemm_tiles(M, N) * sk, [a, b, out_f32(), M, N, K, flags, 0, sk])
                 return out_f32(), 1
             gemm(a, b, out_bf, M, N, K, 0)  # via the helper: participates in routing flips
             return out_bf, 0

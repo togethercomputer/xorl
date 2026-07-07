@@ -433,6 +433,27 @@ def test_gemm():
     run1(lambda p: p.instr(mk.OP_GEMM, gemm_tiles(M, N), [p.buf(At), p.buf(B), p.buf(C3), M, N, K, 1 | 4 | 8, 0]))
     check("TN fp32 accum", C3, At.float().T @ B.float() + 1.0, atol=0.35)
 
+    # Env-gated dX split-K bulk reduce-add: matches model gemm_dx rows
+    # (NN, fp32 output, full tiles, pre-zeroed destination).
+    if int(os.environ.get("MK_GEMM_DX_TMA_RED", "0")):
+        M4, N4, K4, sk = 128, 256, 512, 4
+        A4 = torch.randn(M4, K4, device=DEV, dtype=torch.bfloat16)
+        B4 = torch.randn(K4, N4, device=DEV, dtype=torch.bfloat16)
+        C4 = torch.empty(M4, N4, device=DEV, dtype=torch.float32)
+
+        def build_tma_red(p):
+            p.instr(mk.OP_FILL_F32, mk.chunk_tiles(M4 * N4), [p.buf(C4), M4 * N4, mk.f2i(0.0)])
+            p.wave()
+            p.instr(
+                mk.OP_GEMM,
+                mk.gemm_tiles(M4, N4) * sk,
+                [p.buf(A4), p.buf(B4), p.buf(C4), M4, N4, K4,
+                 8 | 32 | mk.GEMM_DX_TMA_RED_FLAG, 0, sk],
+            )
+
+        run1(build_tma_red)
+        check("NN splitK TMA-red f32", C4, A4.float() @ B4.float(), atol=0.35)
+
     # Round-12 SKR pair (only compiled when the env/gate builds -DMK_HEAD_DX_SKR):
     # K-sliced n128 NN gemm -> per-slice fp32 partial slabs + OP_SKR_REDUCE. The
     # slab prefill checks every element is overwritten by the plain-store epilogue.
