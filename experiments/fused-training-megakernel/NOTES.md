@@ -6325,6 +6325,25 @@ filters for future resweeps: `MK_GEMM_D64_TMA_TN`, `_CLASS` (n64,n128),
 `mkv3-p4b-d64tma-lossdet-{base,tma}-s3072-*.log`,
 `mkv3-p4b-d64tma-{test-ops-splitloop,test-model,resusage-splitloop,ncu-ld-small,unchanged-timers,gradxarm-s3072,route-s3072,route-s4096,route-s8192}-*`.
 
+## dq cross-stage ping-pong NO-GO (session 2853e0de + subagent, 20260707T0125Z)
+
+Full implementation (K/V triple-buffer, dS[wg][t&1] double bank, no-wait S+dP
+and accum commits, struct 80->112KB @120KB carveout, MK_ATTN_DQ_PIPE knob,
+worktree wt-dqpipe — correctness-clean: attention errors bit-identical
+ON/OFF, REG:255 STACK:32 LOCAL:0, LD gate 2906 unchanged, carveout control
+neutral). Measured: **+3/+13/+30-35us at S3072/4096/8192, 4/4 windows at
+S8192** (`mkv3-p4b-dqpipe-*.log`); the pipelined op is ~3% slower with a DKV
+wait knock-on. Mechanism: dq's per-stage critical path is score->ALU — the
+accum drain was ALREADY hidden — and letting each WG carry two in-flight
+batches contends on the shared tensor pipe with the sibling WG's score pair.
+IMPLICATION: in-place ping-pong within the 2-WG cooperative design is DEAD
+for dq and by structure for dkv (same contention, worse smem fit). The
+ablation's remaining 70% (ALU+syncs) needs either a direct ALU attack (exp
+chain ~20% + loads/dS-math/stores ~21%) or TRUE producer/consumer
+warp-specialization (dedicated ALU warps vs gemm warpgroups, setmaxnreg
+class — the multi-session P4-style arc). Re-run knob: MK_ATTN_DQ_PIPE=1 in
+wt-dqpipe (default flipped off if picked up).
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

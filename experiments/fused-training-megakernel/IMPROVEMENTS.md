@@ -1285,6 +1285,17 @@ reflow — keep old/new as separate loops, extract shared fat bodies
 __noinline__; (2) df-mode loss is not bit-stable within an arm (~5e-6 fp32
 atomic spread) — parity means cross-arm delta <= within-arm replay spread.
 
+**dq cross-stage ping-pong (no-wait accum + triple K/V + double dS)** —
+NO-GO (S3072 +3 / S4096 +13 / S8192 +32, scales with S; correctness-clean;
+wt-dqpipe, `mkv3-p4b-dqpipe-*.log`)
+Why: dq's stage path is score->ALU — the accum drain was already hidden; two
+in-flight batches per WG contend on the shared tensor pipe with the sibling
+WG's score pair.
+Principle: ablate the SPECIFIC op before porting a pipeline pattern —
+fwd/dkv/dq have different drain anatomies; and in a 2-WG cooperative body,
+extra in-flight batches steal the sibling's tensor-pipe slots. In-place
+ping-pong is dead here; the ALU share needs warp-spec or direct ALU work.
+
 ## Meta / measurement
 
 **STACK-is-not-runtime** — STACK/res-usage is a smell, never certification.
