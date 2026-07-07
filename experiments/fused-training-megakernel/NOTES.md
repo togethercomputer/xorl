@@ -6416,6 +6416,25 @@ Ceiling ~220-320us/step at S8192 for fwd + the dkv/dq compounding. This
 CONVERGES with the pdf producer-df executor lane (WG2 producer feed) — the
 softmax-offload should be designed as a pdf phase, not a third architecture.
 
+## Partials-fed RMSNORM_BWD_DX NO-GO (session 2853e0de + subagent, 20260707T0405Z)
+
+Full implementation (gemm bit16 dy-dot-xn partials in m64n64/n128/n256-NN
+epilogues, partials-fed DX/DX_FMA rowop modes, dep-signature + region-gating
+plumbing, wt-rmspart @165127f, gate-clean: tests+8 cases, parity, REG/LD
+baselines exact). Measured NO-GO both orders (`mkv3-p4b-rmspart-*.log`):
+small +6.1/+7.6, S4096 +7.3/+1.2. Attribution: the target rowop bucket
+shrinks 153.3->124.4 (-29us) but the dX gemm spans grow +40us — the chain
+moved INTO the on-chain gemm, and the epilogue's xn loads are COLD while the
+rowop's dy re-read was L2-hot (produced by that same gemm). TWO LAWS:
+(1) partial-fusion arithmetic must weight traffic by CACHE STATE and by
+WHOSE chain it lands on — bytes moved off a rowop onto its on-chain producer
+are a loss even at 2x fewer bytes; the fwd bit13 win worked because ssq is
+free math on register-resident output, no new loads; (2) REDISCOVERED: a
+runtime-flag-gated accumulator inside a hot epilogue loop spills at the
+REG:255 ceiling even with the flag OFF (LD 2906 -> 2.09M sectors) — bit-gated
+paths must be fully SEPARATE loops (same law as the TMA port's reflow tax).
+Knob stays default OFF; implementation retained in wt-rmspart for resweeps.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

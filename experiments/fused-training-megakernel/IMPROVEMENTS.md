@@ -1368,6 +1368,16 @@ volatile — ablation gemm shares need SASS verification; (2) fwd+dkv agree:
 the lever is producer-warp softmax offload (pdf-executor phase), everything
 smaller is capped <5%.
 
+**Partials-fed RMSNORM_BWD_DX (bit16 dy-dot-xn in dX-gemm epilogues)** —
+NO-GO (small +6/+8, S4096 +1/+7 both orders; target bucket -29 but dX gemm
++40; wt-rmspart)
+Why: the epilogue's xn loads are cold and land on the on-chain gemm; the
+rowop's dy re-read was L2-hot from that same gemm.
+Principle: fusion arithmetic must weight bytes by cache state and by whose
+chain they land on; bit13-class wins need FREE math on register-resident
+values — any new epilogue load is a chain tax. Also: flag-gated accumulators
+in hot loops spill at the REG ceiling even when OFF — separate loops always.
+
 ## Meta / measurement
 
 **STACK-is-not-runtime** — STACK/res-usage is a smell, never certification.
