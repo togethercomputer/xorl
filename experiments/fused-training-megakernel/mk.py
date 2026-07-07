@@ -543,13 +543,17 @@ def load_ext(
     occ2 = int(os.environ.get("MK_OCC2", "0"))
     regcopy = int(os.environ.get("MK_WS_REGCOPY", "0"))
     attnpipe = int(os.environ.get("MK_ATTN_PIPE", "0"))
-    # FA4-fwd softmax ALU cuts (default off, env-only). EXPFOLD folds scale*log2e
-    # into the exp2 argument (running max tracked in the scaled-log2 domain: one
+    # FA4-fwd softmax ALU cuts (env-only). EXPFOLD folds scale*log2e into the
+    # exp2 argument (running max tracked in the scaled-log2 domain: one
     # FMA+ex2 per element, no separate s*scale multiply); DEFER_RSUM keeps the
     # per-thread partial row sum through the stage loop and quad-reduces once at
     # the tile epilogue instead of two shfl_xor per 64-col stage.
+    # DEFER_RSUM default-on: -36.5/-47.0us s8192, -10.1/-7.3us s4096, >=0
+    # nano/small, both orders (results/operator-gap/fwd-expfold-defersum-
+    # b1d36305.md). EXPFOLD stays off: +47/+43us s8192 — the p-loop is
+    # MUFU-bound, the deleted FMULs were free co-issue work.
     attn_fwd_expfold = int(os.environ.get("MK_ATTN_FWD_EXPFOLD", "0"))
-    attn_fwd_defer_rsum = int(os.environ.get("MK_ATTN_FWD_DEFER_RSUM", "0"))
+    attn_fwd_defer_rsum = int(os.environ.get("MK_ATTN_FWD_DEFER_RSUM", "1"))
     attn_dkv_row_bcast_env = os.environ.get("MK_ATTN_DKV_ROW_BCAST")
     if attn_dkv_row_bcast_env is not None:
         attn_dkv_row_bcast = int(attn_dkv_row_bcast_env)
