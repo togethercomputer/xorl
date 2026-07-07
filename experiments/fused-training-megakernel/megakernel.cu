@@ -247,6 +247,12 @@ extern "C" __global__ void megakernel(const Instr* __restrict__ instrs,
   cg::grid_group grid = cg::this_grid();
   const int nblocks = gridDim.x;
 
+#if defined(MK_PDF_PRODUCER) && defined(MK_ATTN_PDF_FEED)
+  // The attention bodies read g_pdf_feed.active; smem is not zeroed across
+  // launches, so every executor image must clear it (ordered for the block by
+  // the pre-dispatch __syncthreads).
+  if (threadIdx.x == 0) g_pdf_feed.active = 0;
+#endif
   if (wave_clk && blockIdx.x == 0 && threadIdx.x == 0) wave_clk[0] = clock64();
   for (int w = 0; w < nwaves; ++w) {
     const int i0 = wave_start[w], i1 = wave_start[w + 1];
@@ -792,7 +798,21 @@ extern "C" __global__ void __maxnreg__(168) megakernel_pdf(
   // schedule, gated only by ring empties — never by the consumers' mma cadence. One
   // request is in flight at a time by construction (tile T+1 posts program-order
   // after tile T's last full-wait on the same consumer thread).
+#ifdef MK_ATTN_PDF_FEED
+  // Attention stream requests (kind 4) are served WARPGROUP-WIDE: each of the
+  // 128 producer threads issues 4 cp.async 16B slices per operand tile with the
+  // exact consumer-loader slice geometry (v = ptid + i*128 -> r += 16, c8
+  // fixed, wga_off64 += 2048 per i), so the destination bytes are identical to
+  // the consumer path (the layout-preserving Branch A of the feasibility note).
+  // GEMM TMA replay (kinds 0-3) stays on the elected thread 256; threads
+  // 257-383 skip those requests but track seq. The serial-request invariant
+  // holds for kind 4 too: the consumer's last bfull wait needs all 128
+  // producer-thread arrivals, so every producer thread finished issuing tile T
+  // before tile T+1 posts.
+  if (threadIdx.x >= MK_CONSUMERS) {
+#else
   if (threadIdx.x == MK_CONSUMERS) {
+#endif
     volatile MkPdfFeed* Fv = &g_pdf_feed;
     int seen = 0;
     for (;;) {
@@ -803,6 +823,48 @@ extern "C" __global__ void __maxnreg__(168) megakernel_pdf(
         continue;
       }
       ++seen;
+#ifdef MK_ATTN_PDF_FEED
+      if (Fv->kind == 4) {
+        // Attention cp.async stream: operand GMEM row bases in tmA/tmB, gmem
+        // row strides (bytes) in m0/n0, per-stage gmem byte steps in
+        // k_base/bk; dst wga_off64 slabs a0/b0 with a_stride/b_stride
+        // per-stage slab strides (see the MkPdfFeed kind-4 comment).
+        const char* gA = Fv->tmA;
+        const char* gB = Fv->tmB;
+        char* a0 = Fv->a0;
+        char* b0 = Fv->b0;
+        uint64_t* bfull = Fv->bfull;
+        uint64_t* bempty = Fv->bempty;
+        const int a_st = Fv->a_stride, b_st = Fv->b_stride;
+        const int a_gs = Fv->m0, b_gs = Fv->n0;
+        const int stepA = Fv->k_base, stepB = Fv->bk;
+        const int iters = Fv->iters, stages = Fv->stages;
+        const int ptid = threadIdx.x - MK_CONSUMERS;
+        const int r = ((ptid >> 6) << 3) | (ptid & 7);
+        const int c8 = ((ptid >> 3) & 7) << 3;
+        const int doff = wga_off64(r, c8);
+        gA += (int64_t)r * a_gs + c8 * 2;
+        gB += (int64_t)r * b_gs + c8 * 2;
+        for (int t = 0; t < iters; ++t) {
+          const int st = t % stages;
+          if (t >= stages) wg_mbar_wait(&bempty[st], (t / stages - 1) & 1);
+          char* dA = a0 + st * a_st + doff;
+          char* dB = b0 + st * b_st + doff;
+#pragma unroll
+          for (int i = 0; i < 4; ++i)
+            __pipeline_memcpy_async(dA + i * 2048, gA + i * (a_gs << 4), 16);
+#pragma unroll
+          for (int i = 0; i < 4; ++i)
+            __pipeline_memcpy_async(dB + i * 2048, gB + i * (b_gs << 4), 16);
+          wg_mbar_arrive_cpasync(&bfull[st]);
+          gA += stepA;
+          gB += stepB;
+        }
+        continue;
+      }
+      if (threadIdx.x != MK_CONSUMERS) continue;
+#endif
+#ifdef MK_PDF_GEMM_FEED
       const char* tmA = Fv->tmA;
       const char* tmB = Fv->tmB;
       char* a0 = Fv->a0;
@@ -856,6 +918,7 @@ extern "C" __global__ void __maxnreg__(168) megakernel_pdf(
                            &bfull[st]);
         }
       }
+#endif  // MK_PDF_GEMM_FEED
     }
   }
 #endif  // MK_PDF_FEED
@@ -895,6 +958,9 @@ __global__ void megakernel_df2(const Instr* __restrict__ instrs, const int n_ins
   const int R = region_off[n_instr];
 
   cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+#if defined(MK_PDF_PRODUCER) && defined(MK_ATTN_PDF_FEED)
+  if (threadIdx.x == 0) g_pdf_feed.active = 0;  // smem is not zeroed across launches
+#endif
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_instr;
        i += gridDim.x * blockDim.x) {
     pending[i] = dep_cnt[i];

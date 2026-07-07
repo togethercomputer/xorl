@@ -527,6 +527,10 @@ __device__ __forceinline__ void wg_tma_load_2d(const void* map, void* dst, int x
 }
 #endif
 
+#if defined(MK_ATTN_PDF_FEED) && !defined(MK_PDF_PRODUCER)
+#error "MK_ATTN_PDF_FEED requires MK_PDF_PRODUCER (the pdf WG2 producer image)"
+#endif
+
 #ifdef MK_PDF_PRODUCER
 // Producer-feed mailbox (producer-df executor, phase 2): consumer thread 0 posts
 // one request per n256-TMA tile; the pdf executor's WG2 producer thread (thin
@@ -539,6 +543,14 @@ __device__ __forceinline__ void wg_tma_load_2d(const void* map, void* dst, int x
 // T+1's re-init. File-scope __shared__: every kernel that references it gets a
 // per-block instance; megakernel_pdf arms `active`, other executors clear it
 // (smem is not guaranteed zero across launches).
+// Attention stream requests (kind 4, MK_ATTN_PDF_FEED) reuse the fields with
+// a cp.async-generic meaning: tmA/tmB = the two operand GMEM row-0 base
+// pointers (dq: K/V; dkv: Q/dO), m0/n0 = their gmem row strides in BYTES,
+// k_base/bk = their per-stage gmem byte steps, a0/b0 = the wga_off64 dst
+// slabs with a_stride/b_stride per-stage slab strides. bfull is count-128
+// (one cp.async.mbarrier.arrive per producer thread), bempty count-1
+// (consumer tid0 arms it behind the end-of-stage consumer_sync). a1/a_t/b_t/
+// expect_bytes are unused for kind 4.
 struct MkPdfFeed {
   const char* tmA;
   const char* tmB;
@@ -566,7 +578,12 @@ __shared__ MkPdfFeed g_pdf_feed;
 #if defined(MK_GEMM_D64_TMA) && defined(MK_PDF_D64_FEED)
 #define MK_PDF_D64_TMA_FEED 1
 #endif
+// GEMM TMA replay needs the tensormap helpers; the attention cp.async stream
+// (MK_ATTN_PDF_FEED) does not, so it arms the WG2 loop independently.
 #if defined(MK_PDF_N256_FEED) || defined(MK_PDF_N256_NT_FEED) || defined(MK_PDF_D64_TMA_FEED)
+#define MK_PDF_GEMM_FEED 1
+#endif
+#if defined(MK_PDF_GEMM_FEED) || defined(MK_ATTN_PDF_FEED)
 #define MK_PDF_FEED 1
 #endif
 

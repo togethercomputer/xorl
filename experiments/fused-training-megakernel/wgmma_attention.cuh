@@ -754,20 +754,64 @@ __device__ __noinline__ void op_attn_dkv_wg(const Instr& I, int tile, void** buf
   const int n_stages = ((S - kv0) / 64 - c + C - 1) / C;
   if (n_stages <= 0) return;  // uniform: before any cp.async/barrier
 
-  auto issue_qdo_stage = [&](int q0s, int st) {
+#if defined(MK_ATTN_PDF_FEED) && MK_ATTN_PDF_FEED >= 2
+  // Producer feed (attn-pdf-feed Phase 1, =2 only): WG2 issues the streamed
+  // Q/dO stage fills; the LSE/Drow scalar prefetch STAYS on the consumer
+  // cp.async path (same one-commit-per-stage group structure, so the
+  // wait_prior expressions below are unchanged). Same handshake as dq:
+  // bfull count-128 via producer cp.async arrivals, bempty count-1 by tid0.
+  uint64_t* apf_bfull = reinterpret_cast<uint64_t*>(smem_raw + sizeof(AttnWgDkvSmem));
+  uint64_t* apf_bempty = apf_bfull + 2;
+  const bool apf = g_pdf_feed.active != 0;
+  if (apf) {
+    if (tid == 0) {
 #pragma unroll
-    for (int i = 0; i < 2; ++i) {
-      const int v = tid + i * MK_CONSUMERS;
-      const int r = ((v >> 6) << 3) | (v & 7), c8 = ((v >> 3) & 7) << 3;
-      __pipeline_memcpy_async((char*)sm.Q[st] + wga_off64(r, c8),
-                              &qkv[(int64_t)(q0s + r) * stride + qh * D + c8], 16);
+      for (int s = 0; s < 2; ++s) {
+        wg_mbar_init(&apf_bfull[s], 128);
+        wg_mbar_init(&apf_bempty[s], 1);
+      }
     }
+    consumer_sync();
+    if (tid == 0) {
+      MkPdfFeed& F = g_pdf_feed;
+      F.tmA = reinterpret_cast<const char*>(&qkv[(int64_t)(kv0 + c * 64) * stride + qh * D]);
+      F.tmB = reinterpret_cast<const char*>(&dOg[(int64_t)(kv0 + c * 64) * (nq * D) + qh * D]);
+      F.a0 = reinterpret_cast<char*>(sm.Q[0]);
+      F.b0 = reinterpret_cast<char*>(sm.dO[0]);
+      F.a_stride = sizeof(sm.Q[0]);
+      F.b_stride = sizeof(sm.dO[0]);
+      F.m0 = stride * 2;
+      F.n0 = nq * D * 2;
+      F.k_base = C * 64 * stride * 2;
+      F.bk = C * 64 * (nq * D) * 2;
+      F.bfull = apf_bfull;
+      F.bempty = apf_bempty;
+      F.iters = n_stages;
+      F.stages = 2;
+      F.kind = 4;
+      mk_pdf_st_release(&F.seq, F.seq + 1);
+    }
+  }
+#endif
+  auto issue_qdo_stage = [&](int q0s, int st) {
+#if defined(MK_ATTN_PDF_FEED) && MK_ATTN_PDF_FEED >= 2
+    if (!apf)
+#endif
+    {
 #pragma unroll
-    for (int i = 0; i < 2; ++i) {
-      const int v = tid + i * MK_CONSUMERS;
-      const int r = ((v >> 6) << 3) | (v & 7), c8 = ((v >> 3) & 7) << 3;
-      __pipeline_memcpy_async((char*)sm.dO[st] + wga_off64(r, c8),
-                              &dOg[(int64_t)(q0s + r) * (nq * D) + qh * D + c8], 16);
+      for (int i = 0; i < 2; ++i) {
+        const int v = tid + i * MK_CONSUMERS;
+        const int r = ((v >> 6) << 3) | (v & 7), c8 = ((v >> 3) & 7) << 3;
+        __pipeline_memcpy_async((char*)sm.Q[st] + wga_off64(r, c8),
+                                &qkv[(int64_t)(q0s + r) * stride + qh * D + c8], 16);
+      }
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const int v = tid + i * MK_CONSUMERS;
+        const int r = ((v >> 6) << 3) | (v & 7), c8 = ((v >> 3) & 7) << 3;
+        __pipeline_memcpy_async((char*)sm.dO[st] + wga_off64(r, c8),
+                                &dOg[(int64_t)(q0s + r) * (nq * D) + qh * D + c8], 16);
+      }
     }
     // per-row LSE/Drow staged with the same commit group: their gmem latency
     // moves off the per-stage ALU chain (ablation: loads are ~half the non-exp
@@ -812,6 +856,9 @@ __device__ __noinline__ void op_attn_dkv_wg(const Instr& I, int tile, void** buf
     const int q0s = kv0 + (c + t * C) * 64;
     if (t + 1 < n_stages) issue_qdo_stage(kv0 + (c + (t + 1) * C) * 64, (t + 1) & 1);
     __pipeline_wait_prior(t + 1 < n_stages ? 1 : 0);
+#if defined(MK_ATTN_PDF_FEED) && MK_ATTN_PDF_FEED >= 2
+    if (apf) wg_mbar_wait(&apf_bfull[t & 1], (t >> 1) & 1);  // WG2's Q/dO stage landed
+#endif
     consumer_sync();
     const bool skip = q0s < kv0wg;  // WG1's first stage: fully masked
     if (!skip) {
@@ -866,6 +913,9 @@ __device__ __noinline__ void op_attn_dkv_wg(const Instr& I, int tile, void** buf
       wga_mma64_x2<WGA_MMA_MNMN, true, true>(sm.P[wg], sm.dO[t & 1], dv,   // dV += P^T dO
                                              sm.dS[wg], sm.Q[t & 1], dk);  // dK += dS^T Q
     consumer_sync();  // both WGs done reading Q/dO stage t before refill
+#if defined(MK_ATTN_PDF_FEED) && MK_ATTN_PDF_FEED >= 2
+    if (apf && tid == 0) wg_mbar_arrive(&apf_bempty[t & 1]);  // slot free for WG2
+#endif
   }
 
   // epilogue: stage each 128x64 accumulator to smem, coalesced fp32 atomics
@@ -962,6 +1012,48 @@ __device__ __noinline__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs
   const int n_stages = (q0 / 64 + 2 - c + C - 1) / C;
   if (n_stages <= 0) return;  // uniform: before any cp.async/barrier
 
+#ifdef MK_ATTN_PDF_FEED
+  // Producer feed (attn-pdf-feed Phase 1, pdf executor only): WG2 issues the
+  // streamed K/V stage cp.async fills into the SAME wga_off64 addresses;
+  // consumers keep the owned Q/dO loads and all math. Handshake: bfull[st]
+  // fires via one cp.async.mbarrier.arrive per producer thread (count 128);
+  // tid0 releases slots on bempty[st] (count 1) behind the end-of-stage
+  // consumer_sync. Barriers live past the smem struct (80KB + 32B < the
+  // 100KB carveout). The consumer_sync after init is REQUIRED: other
+  // consumer threads' first bfull try_wait must not race the init.
+  uint64_t* apf_bfull = reinterpret_cast<uint64_t*>(smem_raw + sizeof(AttnWgDqSmem));
+  uint64_t* apf_bempty = apf_bfull + 2;
+  const bool apf = g_pdf_feed.active != 0;
+  if (apf) {
+    if (tid == 0) {
+#pragma unroll
+      for (int s = 0; s < 2; ++s) {
+        wg_mbar_init(&apf_bfull[s], 128);
+        wg_mbar_init(&apf_bempty[s], 1);
+      }
+    }
+    consumer_sync();
+    if (tid == 0) {
+      MkPdfFeed& F = g_pdf_feed;
+      F.tmA = reinterpret_cast<const char*>(&qkv[(int64_t)(c * 64) * stride + (nq + kvh) * D]);
+      F.tmB = reinterpret_cast<const char*>(&qkv[(int64_t)(c * 64) * stride + (nq + nkv + kvh) * D]);
+      F.a0 = reinterpret_cast<char*>(sm.K[0]);
+      F.b0 = reinterpret_cast<char*>(sm.V[0]);
+      F.a_stride = sizeof(sm.K[0]);
+      F.b_stride = sizeof(sm.V[0]);
+      F.m0 = stride * 2;
+      F.n0 = stride * 2;
+      F.k_base = C * 64 * stride * 2;
+      F.bk = C * 64 * stride * 2;
+      F.bfull = apf_bfull;
+      F.bempty = apf_bempty;
+      F.iters = n_stages;
+      F.stages = 2;
+      F.kind = 4;
+      mk_pdf_st_release(&F.seq, F.seq + 1);
+    }
+  }
+#endif
   auto issue_kv_stage = [&](int k0, int st) {
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
@@ -998,7 +1090,14 @@ __device__ __noinline__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs
     __pipeline_memcpy_async((char*)sm.dO[h] + wga_off64(r, c8),
                             &dOg[(int64_t)(q0 + h * 64 + r) * (nq * D) + qh * D + c8], 16);
   }
+#ifdef MK_ATTN_PDF_FEED
+  if (apf)
+    __pipeline_commit();  // close the owned Q/dO group; K/V stages come from WG2
+  else
+    issue_kv_stage(c * 64, 0);
+#else
   issue_kv_stage(c * 64, 0);
+#endif
 
   float dq[32];
 #pragma unroll
@@ -1015,8 +1114,18 @@ __device__ __noinline__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs
 
   for (int t = 0; t < n_stages; ++t) {
     const int k0 = (c + t * C) * 64;
+#ifdef MK_ATTN_PDF_FEED
+    if (apf) {
+      if (t == 0) __pipeline_wait_prior(0);           // owned Q/dO landed
+      wg_mbar_wait(&apf_bfull[t & 1], (t >> 1) & 1);  // WG2's K/V stage landed
+    } else {
+      if (t + 1 < n_stages) issue_kv_stage((c + (t + 1) * C) * 64, (t + 1) & 1);
+      __pipeline_wait_prior(t + 1 < n_stages ? 1 : 0);
+    }
+#else
     if (t + 1 < n_stages) issue_kv_stage((c + (t + 1) * C) * 64, (t + 1) & 1);
     __pipeline_wait_prior(t + 1 < n_stages ? 1 : 0);
+#endif
     consumer_sync();
     const bool skip = k0 > q0wg + 63;  // WG0's tail stage
     if (!skip) {
@@ -1073,6 +1182,9 @@ __device__ __noinline__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs
       wga_mma64<WGA_MMA_KMN, false, true>(sm.dS[wg], sm.K[t & 1], dq);  // dQ += dS K
 #endif
     consumer_sync();  // both WGs done reading K/V stage t before refill
+#ifdef MK_ATTN_PDF_FEED
+    if (apf && tid == 0) wg_mbar_arrive(&apf_bempty[t & 1]);  // slot free for WG2
+#endif
   }
 
   // epilogue: C=1 has one writer per q slice, so write the accumulator layout directly
