@@ -1172,6 +1172,17 @@ Principle: a shape gate whose target row is re-routed by a LATER promotion
 is not merely vacuous — retest and revert it; resweep-law applies to gates,
 not just knobs.
 
+**Qwen4b-l2 cold-cap-0 (flipped on, then killed by pdf)** — NO-GO
+(pre-pdf resweep: cap0 -108.9/-49.7 11/16 both orders at 5f566dc; post-pdf
+recheck at 589ee3d: +17.1/+4.9 wash-to-loss; stashed edit discarded;
+`mkv3-p4b-qwenl2-coldcap-postpdf-k8s-20260707T0510Z.log`)
+Why: the head-dX restructure opened a cold-ring window that uncapping
+exploited; the producer-df executor restructured scheduling again and
+closed it — two head-moves flipped the same knob twice in one day.
+Principle: between measuring a knob win and committing its flip, re-check
+what landed; a verdict is only valid at the structure it was measured on
+(the resweep law applies at commit time, not just probe time).
+
 ## Register architecture / warp specialization
 
 (Consolidates the megakernel-paper-style "reallocate registers from task
