@@ -6268,6 +6268,19 @@ Logs: `mkv3-p4b-qwenl2-peel-support-20260707T0046Z.log`,
 `mkv3-p4b-l2batch2-promoted-20260707T0140Z.log`. Detail note:
 `results/operator-gap/qwenl2-gemm-cluster-promote.md` (updated in place).
 
+Qwen4b-L2 head-dX n256 promotion (session f30b8c0c): the fresh post-batch l2
+profile showed head-dX still on the splitK route (4380.1us on-path,
+tiles=320) because `_QWEN_L1_HEAD_DX_N128_F32` was L=1-keyed. Adding the L2
+tuple routes it no-split -> n256+stage3+nmajor+ring+TMA (n_instr 79->78):
+env probe **-2152.24/-2149.63us, 12/12 both construction orders**
+(14167.34 -> 12015.10us / 14151.34 -> 12001.71us), loss diff exactly 0.0;
+promoted-default vs forced-old `MK_HEAD_DX_N128_F32=0` lost
+**+2080.48us (0/12)** and **+2151.73us (0/12)**; test_model passed.
+Cumulative l2 lane: 16.21ms -> ~12.06ms (-26%). Logs:
+`mkv3-p4b-profile-qwenl2-e1e23b2-20260707T0215Z.log`,
+`mkv3-p4b-qwenl2-headdx-n256-*-20260707T0225Z.log`,
+`mkv3-p4b-qwenl2-headdx-promoted-20260707T0240Z.log`.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

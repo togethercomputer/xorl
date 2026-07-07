@@ -103,7 +103,12 @@ _D128_FWD_MBAR = {(2560, 1024, 9728, 151936, 32, 8, 128, 1)}  # H,S,I,V,nq,nkv,D
 # construction orders (mkv3-p4b-qwenl2-gemmcluster-*-20260706T2350Z.log).
 _D128_DQ_ROWSPLIT = {(2560, 1024, 9728, 151936, 32, 8, 128, 1),
                      (2560, 1024, 9728, 151936, 32, 8, 128, 2)}  # H,S,I,V,nq,nkv,D,L
-_QWEN_L1_HEAD_DX_N128_F32 = {(2560, 1024, 151936, 32, 8, 128, 1)}  # H,S,V,nq,nkv,D,L
+# L=1 original; L=2 promoted 20260707: routing head-dX off the splitK route
+# onto no-split n256+stage3+nmajor+ring+TMA measured -2152.2/-2149.6us,
+# 12/12 both construction orders, loss diff exactly 0, n_instr 79->78
+# (mkv3-p4b-qwenl2-headdx-n256-*-20260707T0225Z.log).
+_QWEN_L1_HEAD_DX_N128_F32 = {(2560, 1024, 151936, 32, 8, 128, 1),
+                             (2560, 1024, 151936, 32, 8, 128, 2)}  # H,S,V,nq,nkv,D,L
 _QWEN_L1_DW_NO_ATOMIC_SK1 = {  # M,N,K for qwen4b-l1 dW GEMMs that split-K computes as sk=1
     (151936, 2560, 1024),  # wlm
     (2560, 9728, 1024),    # wd
