@@ -6448,6 +6448,22 @@ Default medians reproduced at 0.6% spread and match the certified anchors.
 The scheduler-knob space is CLOSED at these shapes until the next structural
 change (pdf executor phases will require the next pass).
 
+s2048 fused-qkrope n128 promotion (post-wave resweep, session b603d819): the
+S2048 lower boundary of the qkrope-n128 route — order-mixed and left on wg64
+at the original 2046Z boundary check — FLIPPED after the s2048 pdf-d64 feed
+(d4758a3) restructured the shape's schedule. Dedicated k8s H100 at 6b137f5:
+screening -13.9 paired 40/40; 120-rep escalation **-13.7us 119/120
+default-first / -11.1us 114/120 variant-first**. Two sibling candidates from
+the same screening died at 120 reps per the noise rule (fwd-band T20
+order-collapsed 99/120 -> 60/120; idle64 order-flipped 104/120 -> 8/120 —
+independently matching the parallel scheduler-knob pass above). Promotion is
+routing-only: `_H256_D64_QKROPE_N128_S` += 2048 (the n128+qkrope body already
+compiles in these flavors; unit case exists in test_ops). Promoted-vs-forced-
+old + test_model at the promotion anchor recorded in
+results/operator-gap/s2048-qkrope-n128-postwave-promote.md. Logs:
+mkv3-p4b-resweep-postwave-6b137f5-k8s-*, mkv3-p4b-resweep2-s2048-6b137f5-k8s-*,
+mkv3-p4b-s2048-qkrope-promote-k8s-*.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

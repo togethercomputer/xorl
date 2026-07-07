@@ -89,7 +89,10 @@ _ATTN_FWD_BAND_T = {2048: 16, 3072: 32, 4096: 22, 8192: 64}  # H==256/D==64; 0 e
 _ATTN_BAND_DQ_FIRST_S = ()  # H==256/D==64: dq-first band emission (else lpt)
 _H256_D64_QKBWD_SPLIT_V_S = (3072, 4096, 8192)  # H==256/D==64: split qkrope v-bwd
 _H256_D64_QKV_V_BWD_KV_SLOT_S = (3072, 8192)  # H==256/D==64: qkv-v reads only KV rows
-_H256_D64_QKROPE_N128_S = (3072, 4096, 8192)  # H==256/D==64: qkv fwd fused-qkrope n128 route
+_H256_D64_QKROPE_N128_S = (2048, 3072, 4096, 8192)  # H==256/D==64: qkv fwd fused-qkrope n128
+# route. 2048 joined post pdf-d64-feed (d4758a3): the pre-wave order-mixed
+# boundary flipped — 120-rep both orders -13.7 (119/120) / -11.1 (114/120)
+# on a dedicated k8s H100 (resweep law; mkv3-p4b-resweep2-s2048-*).
 _H256_D64_COMBINE_UNROLL_S = (4096, 8192)  # H==256/D==64: scalarized attention combine weights
 # H==256 uniform attention chunks (Ckv, Cq) when bands are off; other shapes use the
 # formula fallback (Ckv = 1 once nq*(S/128) >= 64 else 2, Cq = 1) at the use site.
