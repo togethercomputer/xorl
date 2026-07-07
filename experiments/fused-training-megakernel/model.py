@@ -80,7 +80,7 @@ _SMALL_SWIGLU_BWD_4W = {
 }
 _SMALL_SWIGLU_BWD_2W = _SMALL_SWIGLU_BWD_4W
 _H256_IDLE32_S = (2048, 3072, 4096, 8192)  # H==256: scheduler idle poll 32ns (else 256)
-_H256_DQ_FLOAT2_S = (3072, 4096, 8192)     # H==256: attention-dQ float2 direct store
+_H256_DQ_FLOAT2_S = (3072, 8192)           # H==256: attention-dQ float2 direct store
 _H256_D64_DKV_ROW_BCAST_S = ()             # H==256/D==64: attention-dKV row scalar shuffles
 _H256_RMS_DX_H256_S = (512, 1024, 8192)    # H==256: fixed-width RMS bwd-dx opcode
 _H256_D64_DROW_ZERO_SKIP_S = (256, 512)    # H==256/D==64: direct-store drow overwrites
