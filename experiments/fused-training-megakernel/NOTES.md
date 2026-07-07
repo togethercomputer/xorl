@@ -6435,6 +6435,19 @@ REG:255 ceiling even with the flag OFF (LD 2906 -> 2.09M sectors) — bit-gated
 paths must be fully SEPARATE loops (same law as the TMA port's reflow tax).
 Knob stays default OFF; implementation retained in wt-rmspart for resweeps.
 
+## Post-burst knob resweep: ALL DEFAULTS UPHELD (2853e0de + subagent, 20260707T0450Z)
+
+Resweep-law pass over MK_IDLE_NS / MK_ATTN_BAND / MK_ATTN_FWD_BAND /
+MK_COLD_CAP at small + S2048/4096/8192 after the structural burst
+(`mkv3-p4b-knob-resweep-20260707T0341Z.log`): zero flips — first burst that
+invalidated nothing. Both band tables sit at SHARP optima (+-25% costs
++30..+490us; fwd-band S8192 T=80 worst via wave quantization); idle 32<->64
+is a plateau, 256 always loses; S8192 cold-cap uncapped confirmed. The one
+triage candidate (s2048 idle64 -10.5) was refuted by the paired instrument.
+Default medians reproduced at 0.6% spread and match the certified anchors.
+The scheduler-knob space is CLOSED at these shapes until the next structural
+change (pdf executor phases will require the next pass).
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

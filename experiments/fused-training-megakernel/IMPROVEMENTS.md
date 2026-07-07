@@ -1378,6 +1378,14 @@ chain they land on; bit13-class wins need FREE math on register-resident
 values — any new epilogue load is a chain tax. Also: flag-gated accumulators
 in hot loops spill at the REG ceiling even when OFF — separate loops always.
 
+**Post-burst scheduler-knob resweep (idle/band-T/cold-cap, 20 arms)** —
+ALL UPHELD (zero flips; band tables at sharp optima +-25% = +30..+490us)
+Why: the burst's wins were op-body/feed-side; the scheduling optimum didn't
+move.
+Principle: resweep passes are still mandatory after bursts (two prior rounds
+DID flip verdicts) — but a clean pass CLOSES the knob space and stops
+speculative sweeping until the next structural change.
+
 ## Meta / measurement
 
 **STACK-is-not-runtime** — STACK/res-usage is a smell, never certification.
