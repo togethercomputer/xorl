@@ -460,6 +460,14 @@ class MKQwen3:
         mode_env = os.environ.get("MK_MODE")
         if mode_env:
             self.default_mode = mode_env
+        # D64-TMA producer feed on the pdf executor. The opt-in probe split by
+        # shape: S3072 won in both orders, while S8192 regressed decisively.
+        # Keep the default exact and let MK_PDF_D64_FEED force A/Bs.
+        self.pdf_d64_feed_default = (
+            self.default_mode == "pdf"
+            and exact_long_d64
+            and c.S == 3072
+        )
         self.ext = mk.load_ext(
             swiglu_bwd_2w=self.swiglu_bwd_2w_default,
             swiglu_bwd_4w=self.swiglu_bwd_4w_default,
@@ -482,6 +490,7 @@ class MKQwen3:
             gemm_direct_bf16_epilogue=self.gemm_direct_bf16_epilogue_default,
             head_dx_skr=self.head_dx_skr,
             pdf_producer=self.default_mode == "pdf",
+            pdf_d64_feed=self.pdf_d64_feed_default,
         )
         # D=128 WGMMA attention route (default ON for D==128, S%64==0; the opgap
         # FA4-C trio spec's fallback replacement): MK_ATTN_D128_WG=0 restores the
