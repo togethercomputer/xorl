@@ -84,7 +84,8 @@ _H256_DQ_FLOAT2_S = (3072, 8192)           # H==256: attention-dQ float2 direct 
 _H256_D64_DKV_ROW_BCAST_S = ()             # H==256/D==64: attention-dKV row scalar shuffles
 _H256_RMS_DX_H256_S = (512, 1024, 8192)    # H==256: fixed-width RMS bwd-dx opcode
 _H256_D64_DROW_ZERO_SKIP_S = (256, 512)    # H==256/D==64: direct-store drow overwrites
-_ATTN_BWD_BAND_T = {2048: 12, 3072: 16, 4096: 29, 8192: 40}  # H==256/D==64; 0 elsewhere
+_ATTN_BWD_BAND_T = {2048: 12, 3072: 20, 4096: 29, 8192: 40}  # H==256/D==64; 0 elsewhere
+# (3072: 16->20 post-dq-p-pack, resweep flip: -12.8/-5.4 38/40+32/40 both orders)
 _ATTN_FWD_BAND_T = {2048: 16, 3072: 32, 4096: 22, 8192: 64}  # H==256/D==64; 0 elsewhere
 _ATTN_BAND_DQ_FIRST_S = ()  # H==256/D==64: dq-first band emission (else lpt)
 _H256_D64_QKBWD_SPLIT_V_S = (3072, 4096, 8192)  # H==256/D==64: split qkrope v-bwd

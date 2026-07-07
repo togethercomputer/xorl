@@ -6464,6 +6464,12 @@ results/operator-gap/s2048-qkrope-n128-postwave-promote.md. Logs:
 mkv3-p4b-resweep-postwave-6b137f5-k8s-*, mkv3-p4b-resweep2-s2048-6b137f5-k8s-*,
 mkv3-p4b-s2048-qkrope-promote-k8s-*.
 
+s3072 bwd-band T16->20 (post-p-pack resweep flip): the dq fp32 p-pack gate
+(2a41f6a) changed s3072's dq stage cost and flipped the T20 cell (noise
+pre-p-pack): -12.8/-5.4us 38/40+32/40 both orders; forced-T16 after promotion
++0.9/+14.1 (11/40+1/40). Certified s3072 post-p-pack: 2337.5/1343.3 = 1.740x.
+Logs: mkv3-p4b-s3072-postppack-*, -bandt20-rev-*, -t20-promote-check-*.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

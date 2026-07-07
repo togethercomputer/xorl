@@ -1434,6 +1434,11 @@ Principle: resweep passes are still mandatory after bursts (two prior rounds
 DID flip verdicts) — but a clean pass CLOSES the knob space and stops
 speculative sweeping until the next structural change.
 
+**s3072 bwd-band T20 (resweep flip post-p-pack)** — WIN (-12.8/-5.4 both
+orders; T20 was noise before 2a41f6a changed the dq stage cost)
+Principle: band budgets couple to per-stage op cost — re-sweep T neighbors
+after any attention op-body promotion at that shape.
+
 ## Meta / measurement
 
 **STACK-is-not-runtime** — STACK/res-usage is a smell, never certification.
@@ -1548,3 +1553,15 @@ span model).
 Principle: profile "on-path span" is not automatically exposed time — check
 the WAIT column of the surrounding chain before optimizing a hop; in
 wait-slack regimes only the wait producer itself is worth attacking.
+
+**s2048 qkrope-n128 (post-pdf resweep flip, ad8824a)** — WIN (-13.7 119/120 /
+-11.1 114/120 at 120 reps both orders; forced-old +15.9/+16.3 2-3/120;
+route 4x 128-tile wg64 -> 4x 64-tile n128+qkrope)
+Why: the s2048 pdf-d64 feed (d4758a3) restructured the schedule and flipped
+the boundary that was order-mixed at the original 2046Z check; third
+resweep-law flip in this route family. Sibling scheduler candidates
+(fwd-band T20, idle64) died at 120 reps — order-collapsed/flipped.
+Principle: route-gate boundaries are per-shape verdicts pinned to a schedule
+epoch — after a structural landing AT a shape, re-probe that shape`s
+REJECTED route boundaries first (they flip more often than scheduler knobs,
+which have now died at 120 reps across three independent passes).
