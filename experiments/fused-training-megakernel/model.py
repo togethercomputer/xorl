@@ -407,6 +407,17 @@ class MKQwen3:
         # =1 force-enables for probing; TN rows stay off (order-mixed
         # standalone) behind MK_GEMM_N256_TMA_TN except at exact qwen.
         self.gemm_n256_tma_default = exact_qwen4b_l1 or exact_qwen4b_l2
+        # D64 ring TMA feed (round-4 port to the m64n64/m64n128 mbarrier-ring
+        # bodies, all majors): standalone every class wins (d64_tma_ring_probe
+        # both orders; TN long-K dW -16.5..-19.6%, NT/NN -1..-4.6%). Default ON
+        # for the exact long-S H256/D64 bench shapes only (measure before
+        # widening); MK_GEMM_D64_TMA=0/1 overrides, MK_GEMM_D64_TMA_TN=0
+        # excludes the TN dW rows for A/B.
+        exact_long_d64 = (
+            (c.H, c.L, c.nq, c.nkv, c.D, c.I, c.V) == (256, 4, 4, 2, 64, 768, 8192)
+            and c.S in (3072, 4096, 8192)
+        )
+        self.gemm_d64_tma_default = exact_long_d64
         self.gemm_direct_bf16_epilogue_default = c.D == 64 and (
             c.S == 128 or (c.H, c.L, c.S, c.nq, c.nkv, c.I) == (512, 8, 1024, 8, 4, 1536)
         )
@@ -438,6 +449,7 @@ class MKQwen3:
             gemm_mbar_ring=self.gemm_mbar_ring_default,
             gemm_n256_nt_mbar=self.gemm_n256_nt_mbar_default,
             gemm_n256_tma=self.gemm_n256_tma_default,
+            gemm_d64_tma=self.gemm_d64_tma_default,
             gemm_direct_bf16_epilogue=self.gemm_direct_bf16_epilogue_default,
             head_dx_skr=self.head_dx_skr,
         )
@@ -521,6 +533,12 @@ class MKQwen3:
             # TN dW rows: promoted for exact qwen on the R4 resweep evidence
             # (-294.6/-333.8us, 16/16 both orders; see mk.gemm_n256_tma_eligible).
             p.gemm_n256_tma_tn_default = self.gemm_n256_tma_default
+        # Program-side arm of MK_GEMM_D64_TMA (same ring requirement).
+        _d64tma_env = os.environ.get("MK_GEMM_D64_TMA")
+        _d64tma_on = (bool(int(_d64tma_env)) if _d64tma_env is not None
+                      else self.gemm_d64_tma_default)
+        if _ring_on and _d64tma_on:
+            p.gemm_d64_tma_ext = self.ext
         B = p.buf
         dw_no_atomic_env = os.environ.get("MK_DW_NO_ATOMIC_SK1")
 

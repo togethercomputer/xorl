@@ -406,6 +406,52 @@ def gemm_n256_tma_eligible(args, tn_default=False):
     return True
 
 
+def gemm_d64_tma_eligible(args):
+    """Per-instruction gate for the D64 ring TMA feed (MK_GEMM_D64_TMA).
+
+    Any wgmma-routed mbarrier-ring row that is NOT an n256 row qualifies:
+    the m64n64 body (all four storage majors, incl. split-K dW rows — the
+    feed coordinates are k-offset based) and the m64n128 body (bit12; A is
+    K-major only there). bit14 rows have their own MK_GEMM_N256_TMA gate;
+    the two ports share args[20..22] because the row sets are disjoint.
+    Geometry must be tile-exact (the tensormap boxes have no tail handling).
+    Standalone (d64_tma_ring_probe.py, both orders): every class wins —
+    TN long-K dW rows -16.5..-19.6%, NT/NN short-K rows -1..-4.6%.
+    MK_GEMM_D64_TMA_TN=0 excludes the TN (a_t) rows for A/B probing.
+    """
+    flags = args[6]
+    if not (flags & 128) or (flags & 16384):
+        return False
+    M, N, K = args[3], args[4], args[5]
+    if M % 128 or K % 64:
+        return False
+    if flags & 4096:  # m64n128 body: A K-major only
+        if (flags & 1) or N % 128:
+            return False
+    elif N % 64:
+        return False
+    if (flags & 1) and not int(os.environ.get("MK_GEMM_D64_TMA_TN", "1")):
+        return False
+    # Probe-only subset filters (same-binary A/B bisection; the compiled path
+    # keys off the injected args, so patch-set changes need no rebuild).
+    cls_env = os.environ.get("MK_GEMM_D64_TMA_CLASS")
+    if cls_env is not None:
+        if ("n128" if flags & 4096 else "n64") not in cls_env.split(","):
+            return False
+    maj_env = os.environ.get("MK_GEMM_D64_TMA_MAJ")
+    if maj_env is not None:
+        maj = "TN" if flags & 1 else ("NT" if flags & 2 else "NN")
+        if maj not in maj_env.split(","):
+            return False
+    kmin_env = os.environ.get("MK_GEMM_D64_TMA_KMIN")
+    if kmin_env is not None:  # min k-iterations per tile slice (split-K aware)
+        sk = args[8] if (flags & 32) and len(args) > 8 else 1
+        kchunk = -(-K // (sk * 64)) * 64
+        if min(K, kchunk) // 64 < int(kmin_env):
+            return False
+    return True
+
+
 def _default_split_k_target(K):
     env = os.environ.get("MK_DW_TARGET_TILES")
     if env is not None:
@@ -457,6 +503,7 @@ def load_ext(
     gemm_mbar_ring=None,
     gemm_n256_nt_mbar=None,
     gemm_n256_tma=None,
+    gemm_d64_tma=None,
     gemm_direct_bf16_epilogue=None,
     head_dx_skr=0,
 ):
@@ -588,6 +635,15 @@ def load_ext(
     else:
         gemm_n256_tma = 0 if gemm_n256_tma is None else int(bool(gemm_n256_tma))
     gemm_n256_tma = int(bool(gemm_mbar_ring and gemm_n256_tma))
+    # D64 ring TMA feed for the m64n64/m64n128 mbarrier-ring bodies. Requires
+    # the ring; the per-instruction gate is the tmap args injected by
+    # Program._inject_gemm_tmaps (this only compiles the device path).
+    gemm_d64_tma_env = os.environ.get("MK_GEMM_D64_TMA")
+    if gemm_d64_tma_env is not None:
+        gemm_d64_tma = int(gemm_d64_tma_env)
+    else:
+        gemm_d64_tma = 0 if gemm_d64_tma is None else int(bool(gemm_d64_tma))
+    gemm_d64_tma = int(bool(gemm_mbar_ring and gemm_d64_tma))
     gemm_direct_bf16_epilogue = int(
         os.environ.get(
             "MK_GEMM_DIRECT_BF16_EPILOGUE",
@@ -617,6 +673,7 @@ def load_ext(
         + ("_gmbar" if gemm_mbar_ring else "")
         + ("_n256ntold" if gemm_mbar_ring and not gemm_n256_nt_mbar else "")
         + ("_gtma" if gemm_n256_tma else "")
+        + ("_d64tma" if gemm_d64_tma else "")
         + ("_gdbf16" if gemm_direct_bf16_epilogue else "")
         + ("_hdskr" if head_dx_skr else ""),
         sources=[os.path.join(_DIR, "megakernel.cu")],
@@ -657,6 +714,7 @@ def load_ext(
         + (["-DMK_GEMM_MBAR_RING"] if gemm_mbar_ring else [])
         + (["-DMK_GEMM_N256_NT_MBAR"] if gemm_n256_nt_mbar else [])
         + (["-DMK_GEMM_N256_TMA"] if gemm_n256_tma else [])
+        + (["-DMK_GEMM_D64_TMA"] if gemm_d64_tma else [])
         + (["-DMK_GEMM_DIRECT_BF16_EPILOGUE"] if gemm_direct_bf16_epilogue else [])
         + (["-DMK_HEAD_DX_SKR"] if head_dx_skr else []),
         verbose=verbose,
@@ -915,6 +973,9 @@ class Program:
         # feed is enabled; finalize() then encodes per-instruction tensormaps.
         self.gemm_n256_tma_ext = None
         self.gemm_n256_tma_tn_default = False
+        # D64 ring TMA feed (m64n64/m64n128 mbarrier-ring bodies): same
+        # contract as gemm_n256_tma_ext; the two ports share one tmap table.
+        self.gemm_d64_tma_ext = None
 
     def buf(self, t: torch.Tensor, slot=None) -> int:
         """Register a CUDA tensor; returns its buffer-table index.
@@ -1059,16 +1120,21 @@ class Program:
         return deps2, gated_in, band, region_off, region_cnt0, gate_off, gate_cons, gate_k
 
     def _inject_gemm_tmaps(self):
-        """Encode CUtensorMaps for TMA-eligible n256 ring GEMMs (round-4 port).
+        """Encode CUtensorMaps for TMA-eligible ring GEMMs (round-4 ports).
 
-        Builds one GPU uint8 table of 128B tensormap rows (deduped by encode
-        key), registers it in the buffer table, and patches each eligible
-        instruction's args[20..22] = (1 + table buf id, A row, B row). The
-        table is read-only and never written by any op, so it adds no
-        dependency edges; tokens/labels rebinding never touches these rows
-        (bf16 operand guard).
+        Covers the n256 NN/TN rows (gemm_n256_tma_ext) and the D64 m64n64/
+        m64n128 ring rows (gemm_d64_tma_ext) — disjoint row sets (bit14) that
+        share one table and the args[20..22] contract. Builds one GPU uint8
+        table of 128B tensormap rows (deduped by encode key), registers it in
+        the buffer table, and patches each eligible instruction's
+        args[20..22] = (1 + table buf id, A row, B row). The table is
+        read-only and never written by any op, so it adds no dependency
+        edges; tokens/labels rebinding never touches these rows (bf16 operand
+        guard).
         """
-        ext = self.gemm_n256_tma_ext
+        n256_ext = self.gemm_n256_tma_ext
+        d64_ext = self.gemm_d64_tma_ext
+        ext = n256_ext if n256_ext is not None else d64_ext
         if ext is None:
             return
         rows, row_ids, patches = [], {}, []
@@ -1086,17 +1152,38 @@ class Program:
             for op, _ntiles, args in wave:
                 if op != OP_GEMM or len(args) <= 6:
                     continue
-                if not gemm_n256_tma_eligible(args, self.gemm_n256_tma_tn_default):
+                flags = args[6]
+                is_n256 = n256_ext is not None and gemm_n256_tma_eligible(
+                    args, self.gemm_n256_tma_tn_default)
+                is_d64 = (not is_n256 and d64_ext is not None
+                          and gemm_d64_tma_eligible(args))
+                if not (is_n256 or is_d64):
                     continue
                 ta, tb = self.bufs[args[0]], self.bufs[args[1]]
                 if ta.dtype != torch.bfloat16 or tb.dtype != torch.bfloat16:
                     continue
                 M, N, K = args[3], args[4], args[5]
-                if args[6] & 1:  # TN: A[K,M] M-contig, two {64m,64k} boxes
-                    ra = tmap_row(ta.data_ptr(), M, K, M * 2, 64, 64)
-                else:  # NN: A[M,K] K-contig, one {64k,128m} box
+                if is_n256:
+                    if flags & 1:  # TN: A[K,M] M-contig, two {64m,64k} boxes
+                        ra = tmap_row(ta.data_ptr(), M, K, M * 2, 64, 64)
+                    else:  # NN: A[M,K] K-contig, one {64k,128m} box
+                        ra = tmap_row(ta.data_ptr(), K, M, K * 2, 64, 128)
+                    rb = tmap_row(tb.data_ptr(), N, K, N * 2, 64, 64)  # B[K,N] N-contig
+                elif flags & 4096:  # D64 m64n128 body: A always [M,K] K-contig
                     ra = tmap_row(ta.data_ptr(), K, M, K * 2, 64, 128)
-                rb = tmap_row(tb.data_ptr(), N, K, N * 2, 64, 64)  # B[K,N] N-contig
+                    if flags & 2:  # NT B[N,K] K-contig, one {64k,128n} box
+                        rb = tmap_row(tb.data_ptr(), K, N, K * 2, 64, 128)
+                    else:  # NN B[K,N] N-contig, two {64n,64k} MN boxes
+                        rb = tmap_row(tb.data_ptr(), N, K, N * 2, 64, 64)
+                else:  # D64 m64n64 body: all four storage majors
+                    if flags & 1:  # A[K,M] M-contig, two {64m,64k} MN boxes
+                        ra = tmap_row(ta.data_ptr(), M, K, M * 2, 64, 64)
+                    else:  # A[M,K] K-contig, one {64k,128m} box
+                        ra = tmap_row(ta.data_ptr(), K, M, K * 2, 64, 128)
+                    if flags & 2:  # B[N,K] K-contig, one {64k,64n} box
+                        rb = tmap_row(tb.data_ptr(), K, N, K * 2, 64, 64)
+                    else:  # B[K,N] N-contig, one {64n,64k} MN box
+                        rb = tmap_row(tb.data_ptr(), N, K, N * 2, 64, 64)
                 patches.append((args, ra, rb))
         if not patches:
             return

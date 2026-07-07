@@ -494,14 +494,16 @@ __device__ __forceinline__ void wg_mbar_wait(uint64_t* bar, uint32_t phase) {
   }
 }
 
-#ifdef MK_GEMM_N256_TMA
-// GEMM round-4 TMA feed for the n256 NN/TN mbarrier ring: an elected thread
-// issues cp.async.bulk.tensor.2d per stage instead of 12 per-thread cp.async
+#if defined(MK_GEMM_N256_TMA) || defined(MK_GEMM_D64_TMA)
+// GEMM round-4 TMA feed for the mbarrier-ring bodies: an elected thread
+// issues cp.async.bulk.tensor.2d per stage instead of the per-thread cp.async
 // slices, with mbarrier.arrive.expect_tx on a count-1 full barrier. Tensormaps
 // live in GLOBAL memory (per-program table built by mk.py; the SW128 slabs are
 // exactly CU_TENSOR_MAP_SWIZZLE_128B), which requires a tensormap-proxy acquire
-// fence before first use. Validated by n256_tma_ring_probe.py: parity
-// bit-identical to the cp.async ring; qwen dX-head -7..-9% standalone.
+// fence before first use. Validated by n256_tma_ring_probe.py (n256 bodies:
+// parity bit-identical to the cp.async ring; qwen dX-head -7..-9% standalone)
+// and d64_tma_ring_probe.py (m64n64/m64n128 ring bodies: bit-identical, all
+// classes win standalone; TN long-K dW rows -16.5..-19.6%).
 __device__ __forceinline__ void wg_tmap_fence_acquire(const void* map) {
   asm volatile("fence.proxy.tensormap::generic.acquire.gpu [%0], 128;" ::"l"(map)
                : "memory");
@@ -1128,6 +1130,80 @@ __device__ __noinline__ void op_gemm_wgmma_n128(const Instr& I, int tile, void**
   constexpr int WG_N128_LEAD = WG_N128_STAGES - 2;
   uint64_t* bfull = reinterpret_cast<uint64_t*>(smem_raw + sizeof(S));
   uint64_t* bempty = bfull + WG_N128_STAGES;
+#ifdef MK_GEMM_D64_TMA
+  // D64 ring TMA feed (round-4 port): args[20] = 1 + tmap-table buffer id
+  // (0 = cp.async feed), args[21]/args[22] = 128B row indices of the A/B
+  // tensormaps — the SAME slots as the n256 port (the row sets are disjoint:
+  // this body never sees bit14 rows). A = one {64k,128m} box; B = one
+  // {64k,128n} box (NT) or two {64n,64k} MN boxes 8KB apart (NN). bfull is a
+  // count-1 expect_tx barrier; bempty and the ring are unchanged. The TMA
+  // path is a FULLY SEPARATE loop: a merged use_tma branch inside the shared
+  // ring loop taxed the cp.async path ~30us/step at S3072 (codegen reflow)
+  // even when never taken.
+  if (I.args[20] > 0) {
+    const char* tbl = reinterpret_cast<const char*>(bufs[I.args[20] - 1]);
+    const char* tmA = tbl + (int64_t)I.args[21] * 128;
+    const char* tmB = tbl + (int64_t)I.args[22] * 128;
+    if (tid == 0) {
+      wg_tmap_fence_acquire(tmA);
+      wg_tmap_fence_acquire(tmB);
+#pragma unroll
+      for (int s = 0; s < WG_N128_STAGES; ++s) {
+        wg_mbar_init(&bfull[s], 1);
+        wg_mbar_init(&bempty[s], 256);
+      }
+    }
+    consumer_sync();
+    auto issue_stage_tma = [&](int t) {
+      if (tid == 0) {
+        const int st = t % WG_N128_STAGES;
+        const int k0 = k_lo + t * WG_BK;
+        wg_mbar_expect_tx(&bfull[st], 32768);  // A 16KB + B 16KB per stage
+        wg_tma_load_2d(tmA, S.A[st][0], k0, m0, &bfull[st]);
+        if (b_t) {
+          wg_tma_load_2d(tmB, S.B[st], k0, n0, &bfull[st]);
+        } else {
+#pragma unroll
+          for (int g = 0; g < 2; ++g)
+            wg_tma_load_2d(tmB, reinterpret_cast<char*>(S.B[st]) + g * 8192,
+                           n0 + g * 64, k0, &bfull[st]);
+        }
+      }
+    };
+    for (int p = 0; p < min(WG_N128_LEAD + 1, iters); ++p) issue_stage_tma(p);
+    for (int t = 0; t < iters; ++t) {
+      const int st = t % WG_N128_STAGES;
+      wg_mbar_wait(&bfull[st], (t / WG_N128_STAGES) & 1);
+      uint64_t da[4], db[4];
+#pragma unroll
+      for (int s = 0; s < 4; ++s) {
+        da[s] = wg_desc_ksw(S.A[st][wg], s);
+        db[s] = b_t ? wg_desc_ksw(S.B[st], s) : wg_desc_mnsw128(S.B[st], s);
+      }
+      if (b_t)
+        wg_mma_ktile_n128<SG::MMA_64x128x16_F32BF16BF16_SS<SG::Major::K, SG::Major::K>>(da, db, d);
+      else
+        wg_mma_ktile_n128<SG::MMA_64x128x16_F32BF16BF16_SS<SG::Major::K, SG::Major::MN>>(da, db, d);
+      wg_mbar_arrive(&bempty[st]);
+      const int tn = t + WG_N128_LEAD + 1;
+      if (tn < iters) {
+        if (tn >= WG_N128_STAGES)
+          wg_mbar_wait(&bempty[tn % WG_N128_STAGES], (tn / WG_N128_STAGES - 1) & 1);
+        issue_stage_tma(tn);
+      }
+    }
+    cute::warpgroup_wait<0>();
+    consumer_sync();
+    if (tid == 0) {
+#pragma unroll
+      for (int s = 0; s < WG_N128_STAGES; ++s) {
+        wg_mbar_init(&bfull[s], 1);
+        wg_mbar_init(&bempty[s], 256);
+      }
+    }
+    consumer_sync();
+  } else {
+#endif
   if (tid == 0) {
 #pragma unroll
     for (int s = 0; s < WG_N128_STAGES; ++s) {
@@ -1173,6 +1249,9 @@ __device__ __noinline__ void op_gemm_wgmma_n128(const Instr& I, int tile, void**
     }
   }
   consumer_sync();
+#ifdef MK_GEMM_D64_TMA
+  }
+#endif
 #else
   issue_stage(k_lo, 0);
   for (int t = 0; t < iters; ++t) {
@@ -1372,39 +1451,23 @@ __device__ __noinline__ void op_gemm_wgmma_n128(const Instr& I, int tile, void**
   }
 }
 
-__device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_raw) {
+// Generic m64n64 (128x64-tile) wgmma body. Under MK_GEMM_D64_TMA it is
+// __noinline__: the TMA additions otherwise reflow the one-giant-function
+// dispatch frame (same-binary control measured ~+30us/step at S3072 from the
+// compile-in alone — the STACK-IS-NOT-RUNTIME codegen-shape class); isolating
+// the fat frame is the P1 __noinline__ law. Without the knob it stays
+// __forceinline__ so the no-TMA binary keeps today's codegen exactly.
+#ifdef MK_GEMM_D64_TMA
+__device__ __noinline__
+#else
+__device__ __forceinline__
+#endif
+void op_gemm_wgmma_n64_impl(const Instr& I, int tile, void** bufs, char* smem_raw) {
   namespace SG = cute::SM90::GMMA;
   const bf16* A = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
   const bf16* B = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
   void* Cp = bufs[I.args[2]];
   const int M = I.args[3], N = I.args[4], K = I.args[5], flags = I.args[6];
-  if (flags & 16384) {
-    if (flags & 2) {
-      if (flags & GEMM_N256_STAGE3_FLAG)
-        op_gemm_wgmma_n256_direct_impl<3>(I, tile, bufs, smem_raw);
-      else
-        op_gemm_wgmma_n256_direct_impl<2>(I, tile, bufs, smem_raw);
-    } else {
-      if (flags & GEMM_N256_STAGE3_FLAG) {
-        if (flags & 1024) {
-          op_gemm_wgmma_n256_nn_f32_impl<3, true>(I, tile, bufs, smem_raw);
-        } else {
-          op_gemm_wgmma_n256_nn_f32_impl<3, false>(I, tile, bufs, smem_raw);
-        }
-      } else {
-        if (flags & 1024) {
-          op_gemm_wgmma_n256_nn_f32_impl<2, true>(I, tile, bufs, smem_raw);
-        } else {
-          op_gemm_wgmma_n256_nn_f32_impl<2, false>(I, tile, bufs, smem_raw);
-        }
-      }
-    }
-    return;
-  }
-  if (flags & 4096) {
-    op_gemm_wgmma_n128(I, tile, bufs, smem_raw);
-    return;
-  }
   const bool acc_c = flags & 4, c_f32 = flags & 8;
   const bf16* Res = (flags & 16) ? reinterpret_cast<const bf16*>(bufs[I.args[7]]) : nullptr;
 
@@ -1477,6 +1540,83 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
   constexpr int WG_MBAR_LEAD = WG_MBAR_STAGES - 2;
   uint64_t* bfull = reinterpret_cast<uint64_t*>(smem_raw + sizeof(S));
   uint64_t* bempty = bfull + WG_MBAR_STAGES;
+#ifdef MK_GEMM_D64_TMA
+  // D64 ring TMA feed (round-4 port): same args[20..22] contract as the n256
+  // port (disjoint row sets — this body never sees bit14 rows). All four
+  // storage majors are SW128 128B-row slabs: A = one {64k,128m} box (!a_t) or
+  // two {64m,64k} MN boxes (a_t); B = one {64k,64n} box (b_t) or one {64n,64k}
+  // MN box (!b_t). bfull is a count-1 expect_tx barrier. Fully separate loop —
+  // see the n128 body's comment (merged-branch codegen tax).
+  if (I.args[20] > 0) {
+    const char* tbl = reinterpret_cast<const char*>(bufs[I.args[20] - 1]);
+    const char* tmA = tbl + (int64_t)I.args[21] * 128;
+    const char* tmB = tbl + (int64_t)I.args[22] * 128;
+    if (tid == 0) {
+      wg_tmap_fence_acquire(tmA);
+      wg_tmap_fence_acquire(tmB);
+#pragma unroll
+      for (int s = 0; s < WG_MBAR_STAGES; ++s) {
+        wg_mbar_init(&bfull[s], 1);
+        wg_mbar_init(&bempty[s], 256);
+      }
+    }
+    consumer_sync();
+    auto issue_stage_tma = [&](int t) {
+      if (tid == 0) {
+        const int st = t % WG_MBAR_STAGES;
+        const int k0 = k_lo + t * WG_BK;
+        wg_mbar_expect_tx(&bfull[st], 24576);  // A 16KB + B 8KB per stage
+        if (a_t) {
+          wg_tma_load_2d(tmA, S.A[st][0], m0, k0, &bfull[st]);
+          wg_tma_load_2d(tmA, S.A[st][1], m0 + 64, k0, &bfull[st]);
+        } else {
+          wg_tma_load_2d(tmA, S.A[st][0], k0, m0, &bfull[st]);
+        }
+        if (b_t) {
+          wg_tma_load_2d(tmB, S.B[st], k0, n0, &bfull[st]);
+        } else {
+          wg_tma_load_2d(tmB, S.B[st], n0, k0, &bfull[st]);
+        }
+      }
+    };
+    for (int p = 0; p < min(WG_MBAR_LEAD + 1, iters); ++p) issue_stage_tma(p);
+    for (int t = 0; t < iters; ++t) {
+      const int st = t % WG_MBAR_STAGES;
+      wg_mbar_wait(&bfull[st], (t / WG_MBAR_STAGES) & 1);
+      uint64_t da[4], db[4];
+#pragma unroll
+      for (int s = 0; s < 4; ++s) {
+        da[s] = a_t ? wg_desc_mnsw(S.A[st][wg], s) : wg_desc_ksw(S.A[st][wg], s);
+        db[s] = b_t ? wg_desc_ksw(S.B[st], s) : wg_desc_mnsw(S.B[st], s);
+      }
+      if (!a_t && b_t)
+        wg_mma_ktile<SG::MMA_64x64x16_F32BF16BF16_SS<SG::Major::K, SG::Major::K>>(da, db, d);
+      else if (!a_t && !b_t)
+        wg_mma_ktile<SG::MMA_64x64x16_F32BF16BF16_SS<SG::Major::K, SG::Major::MN>>(da, db, d);
+      else if (a_t && b_t)
+        wg_mma_ktile<SG::MMA_64x64x16_F32BF16BF16_SS<SG::Major::MN, SG::Major::K>>(da, db, d);
+      else
+        wg_mma_ktile<SG::MMA_64x64x16_F32BF16BF16_SS<SG::Major::MN, SG::Major::MN>>(da, db, d);
+      wg_mbar_arrive(&bempty[st]);
+      const int tn = t + WG_MBAR_LEAD + 1;
+      if (tn < iters) {
+        if (tn >= WG_MBAR_STAGES)
+          wg_mbar_wait(&bempty[tn % WG_MBAR_STAGES], (tn / WG_MBAR_STAGES - 1) & 1);
+        issue_stage_tma(tn);
+      }
+    }
+    cute::warpgroup_wait<0>();
+    consumer_sync();
+    if (tid == 0) {
+#pragma unroll
+      for (int s = 0; s < WG_MBAR_STAGES; ++s) {
+        wg_mbar_init(&bfull[s], 1);
+        wg_mbar_init(&bempty[s], 256);
+      }
+    }
+    consumer_sync();
+  } else {
+#endif
   if (tid == 0) {
 #pragma unroll
     for (int s = 0; s < WG_MBAR_STAGES; ++s) {
@@ -1526,6 +1666,9 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
     }
   }
   consumer_sync();
+#ifdef MK_GEMM_D64_TMA
+  }
+#endif
 #else
   issue_stage(k_lo, 0);
   for (int t = 0; t < iters; ++t) {
@@ -1762,6 +1905,38 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
       }
     }
   }
+}
+
+__device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_raw) {
+  const int flags = I.args[6];
+  if (flags & 16384) {
+    if (flags & 2) {
+      if (flags & GEMM_N256_STAGE3_FLAG)
+        op_gemm_wgmma_n256_direct_impl<3>(I, tile, bufs, smem_raw);
+      else
+        op_gemm_wgmma_n256_direct_impl<2>(I, tile, bufs, smem_raw);
+    } else {
+      if (flags & GEMM_N256_STAGE3_FLAG) {
+        if (flags & 1024) {
+          op_gemm_wgmma_n256_nn_f32_impl<3, true>(I, tile, bufs, smem_raw);
+        } else {
+          op_gemm_wgmma_n256_nn_f32_impl<3, false>(I, tile, bufs, smem_raw);
+        }
+      } else {
+        if (flags & 1024) {
+          op_gemm_wgmma_n256_nn_f32_impl<2, true>(I, tile, bufs, smem_raw);
+        } else {
+          op_gemm_wgmma_n256_nn_f32_impl<2, false>(I, tile, bufs, smem_raw);
+        }
+      }
+    }
+    return;
+  }
+  if (flags & 4096) {
+    op_gemm_wgmma_n128(I, tile, bufs, smem_raw);
+    return;
+  }
+  op_gemm_wgmma_n64_impl(I, tile, bufs, smem_raw);
 }
 
 // ---- fp32 -> bf16 convert (drains split/atomic fp32 workspaces) -------------------------

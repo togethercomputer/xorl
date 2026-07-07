@@ -6280,6 +6280,50 @@ Cumulative l2 lane: 16.21ms -> ~12.06ms (-26%). Logs:
 `mkv3-p4b-profile-qwenl2-e1e23b2-20260707T0215Z.log`,
 `mkv3-p4b-qwenl2-headdx-n256-*-20260707T0225Z.log`,
 `mkv3-p4b-qwenl2-headdx-promoted-20260707T0240Z.log`.
+D64 ring TMA feed (round-4 port to the long-D64 mbarrier-ring bodies):
+`MK_GEMM_D64_TMA` compiles the elected-thread `cp.async.bulk.tensor.2d` +
+count-1 `expect_tx` feed into BOTH D64 ring bodies — `op_gemm_wgmma_n64_impl`
+(m64n64, 4-stage, all four storage majors) and `op_gemm_wgmma_n128` (m64n128,
+3-stage, A K-major). All four slab arrangements are SW128 128B-row layouts ==
+`CU_TENSOR_MAP_SWIZZLE_128B`; boxes: A = {64k,128m} (one load covers both
+64-row halves) or two {64m,64k} MN boxes (TN); B = {64k,64n} / {64k,128n}
+K-major or {64n,64k} MN slabs (two 8KB-apart for n128 NN). Same
+tensormap-table + args[20..22] contract as the n256 port (row sets disjoint by
+bit14; `_inject_gemm_tmaps` handles both). Standalone probe
+(`d64_tma_ring_probe.py`, both orders): bit-identical parity all 5
+body/major combos; every class wins — TN long-K dW -16.5..-19.6%, NT/NN
+short-K -1..-4.6%. TWO PORT LESSONS: (1) a merged `use_tma` branch inside the
+shared ring loop taxed the never-taken cp.async path ~30us/step at S3072
+(res-usage IDENTICAL — pure codegen reflow; caught only by the same-binary
+patched-vs-unpatched control, which won -21us while the cross-binary A/B lost
++12): the TMA path must be a FULLY SEPARATE loop, original loop verbatim.
+(2) the m64n64 body was the last non-`__noinline__` fat wgmma frame (inlined
+into dispatch); under the knob it is now extracted `__noinline__`
+(`__forceinline__` without the knob — knob-off codegen preserved). In-model
+paired A/B (default vs `MK_GEMM_D64_TMA=0`, both construction orders,
+16x10 rounds): S3072 **-23.9/-24.1us** (15/16, 16/16), S4096
+**-31.9/-29.8us** (16/16, 16/16), S8192 **-18.6/-11.8us** (16/16, 16/16).
+Default ON for exact (H256,L4,nq4,nkv2,D64,I768,V8192) x S in
+{3072,4096,8192} only (49/49/37 of 51 gemm rows patched; S1024/S2048/other
+ring shapes unmeasured — resweep before widening). LOSS-PARITY FACT: the df
+loss is NOT bit-stable within one arm (base arm alone: 6 distinct values,
+spread 4.8e-6 over 20 identical steps at S3072 — CE/emb fp32 atomic order),
+so cross-arm bit-identity is unachievable; gate = cross-arm delta within the
+within-arm replay spread (measured 4.8e-7..1.4e-6 << 3.8e-6..5.7e-6).
+Cross-arm full-grad check at S3072: weights <= 3.6e-7 rel (several exact-0),
+emb 4.7e-3 (scatter atomics; n256 precedent had emb 1.22e-2). Gates:
+test_ops (+5 D64 TMA unit cases covering all boxes at K=512 ring-parity
+wrap) and test_model pass; res-usage df REG:255 STACK:32-48 LOCAL:0 on all
+knob combos; ncu small local-LD = 2906 exact; nano/small interleaved
+pristine-vs-new medians unchanged (913.5/915.0, 3262/3263). Probe-only env
+filters for future resweeps: `MK_GEMM_D64_TMA_TN`, `_CLASS` (n64,n128),
+`_MAJ` (NT,NN,TN), `_KMIN` (min k-iters/slice). Logs:
+`mkv3-p4b-d64tma-probe-{smoke,long-fwd,long-rev}-*.log`,
+`mkv3-p4b-d64tma-s3072-splitloop-{default,variant}-first-*.log`,
+`mkv3-p4b-d64tma-s{4096,8192}-{default,variant}-first-*.log`,
+`mkv3-p4b-d64tma-s3072-subsets-*.log` (same-binary class bisection),
+`mkv3-p4b-d64tma-lossdet-{base,tma}-s3072-*.log`,
+`mkv3-p4b-d64tma-{test-ops-splitloop,test-model,resusage-splitloop,ncu-ld-small,unchanged-timers,gradxarm-s3072,route-s3072,route-s4096,route-s8192}-*`.
 
 ## Honest assessment + v2 roadmap
 

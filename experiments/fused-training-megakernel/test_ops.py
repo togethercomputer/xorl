@@ -235,6 +235,44 @@ def test_gemm():
         check("TN n256 stage3 fp32 TMA", Ct2, At_tn.float().T @ Bt_nn.float(),
               atol=0.35)
 
+    if "_d64tma" in EXT.__name__:
+        # D64 ring TMA feed: the m64n64 body (all four in-model majors:
+        # NT/NN/TN) and the m64n128 body (NT/NN). K=512 wraps the parity of
+        # both ring depths (4 and 3 stages). Boxes: A {64k,128m} / two
+        # {64m,64k}; B {64k,64n}, {64k,128n}, or {64n,64k} MN slabs.
+        Md, Nd, Kd = 256, 128, 512
+        Ad = torch.randn(Md, Kd, device=DEV, dtype=torch.bfloat16)
+        Adt = torch.randn(Kd, Md, device=DEV, dtype=torch.bfloat16)
+        Bd_nn = torch.randn(Kd, Nd, device=DEV, dtype=torch.bfloat16)
+        Bd_nt = torch.randn(Nd, Kd, device=DEV, dtype=torch.bfloat16)
+
+        def build_d64(p, a, b, c, flags, ntiles):
+            p.gemm_d64_tma_ext = EXT
+            p.instr(
+                mk.OP_GEMM, ntiles,
+                [p.buf(a), p.buf(b), p.buf(c), Md, Nd, Kd, flags, 0],
+            )
+
+        n64_tiles = mk.gemm_tiles_wgmma(Md, Nd)
+        n128_tiles = mk.gemm_tiles_wgmma_n128(Md, Nd)
+        for name, a, b, ref, flags, ntiles, f32 in (
+            ("NT m64n64 TMA", Ad, Bd_nt, lambda: Ad.float() @ Bd_nt.float().T,
+             2 | 128, n64_tiles, False),
+            ("NN m64n64 TMA", Ad, Bd_nn, lambda: Ad.float() @ Bd_nn.float(),
+             128, n64_tiles, False),
+            ("TN m64n64 fp32 TMA", Adt, Bd_nn,
+             lambda: Adt.float().T @ Bd_nn.float(), 1 | 8 | 128, n64_tiles, True),
+            ("NT m64n128 TMA", Ad, Bd_nt, lambda: Ad.float() @ Bd_nt.float().T,
+             2 | 128 | 4096, n128_tiles, False),
+            ("NN m64n128 TMA", Ad, Bd_nn, lambda: Ad.float() @ Bd_nn.float(),
+             128 | 4096, n128_tiles, False),
+        ):
+            Cd = torch.empty(Md, Nd, device=DEV,
+                             dtype=torch.float32 if f32 else torch.bfloat16)
+            run1(lambda p, a=a, b=b, Cd=Cd, flags=flags, ntiles=ntiles:
+                 build_d64(p, a, b, Cd, flags, ntiles))
+            check(name, Cd, ref(), atol=0.5)
+
     O3 = torch.randn(M3, 256, device=DEV, dtype=torch.bfloat16)
     C3drow = torch.empty(M3, 256, device=DEV, dtype=torch.bfloat16)
     Drow3 = torch.zeros(2, M3, device=DEV, dtype=torch.float32)
