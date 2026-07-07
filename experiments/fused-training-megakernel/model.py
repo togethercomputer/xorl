@@ -470,10 +470,10 @@ class MKQwen3:
             and c.I == 768
             and c.V == 8192
         )
-        # D64 attention-bwd exp2 prebias: the global probe was a no-go because
-        # S8192 regressed and small was neutral, but exact S4096 was positive in
-        # both orders. Keep this exact unless a future rerun widens the gate.
-        self.attn_exp2_prebias_default = exact_s4096
+        # D64 attention-bwd exp2 prebias: exact S4096 was promoted first; after
+        # the S8192 dQ register-feed landing, exact S8192 also wins both orders.
+        # Keep the gate exact because small stayed neutral/negative.
+        self.attn_exp2_prebias_default = exact_s4096 or exact_s8192
         # D64 dQ register-A dS feed: exact S4096/S8192 remove the dS smem round
         # trip and won both construction orders after the pdf+d64feed/scalar
         # store gates. S3072 stayed too small in reverse-order confirmation.
