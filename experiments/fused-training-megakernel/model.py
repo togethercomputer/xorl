@@ -493,6 +493,16 @@ class MKQwen3:
         # path. S4096 was neutral, so keep this exact-shape gated;
         # MK_ATTN_DQ_FP32_P=0/1 guards A/B.
         self.attn_dq_fp32_p_default = exact_s3072 or exact_s8192
+        # D64 dQ C>1 bulk-reduce drain (cp.reduce.async.bulk.add.f32): exact
+        # S4096 wins -32.7..-41.4us at 40/40 both orders plus reruns; S8192 is
+        # REFUTED (+39..+55us — the drain's mandatory wait_group 0 puts the TMA
+        # round trip on the critical C=4 tail bands; the replaced fp32 atomics
+        # are fire-and-forget). MK_ATTN_DQ_BULK_RED=0/1 guards A/B. Flag-on
+        # builds force-inline op_attn_dq_wg and hard-audit UBLKRED F32 SASS per
+        # kernel clone (ptxas 13.1 otherwise silently assembles the asm as
+        # ADD.U64 in all but one cloned entry).
+        # See results/operator-gap/dq-bulkreduce-drain-b1d36305.md.
+        self.attn_dq_bulk_red_default = exact_s4096
         # Producer-df default mode (per-shape executor routing; see _PDF_MODE).
         # The pdf executor + WG2 producer compile only for gated shapes.
         self.default_mode = (
@@ -535,6 +545,7 @@ class MKQwen3:
             attn_dq_float2_store=self.attn_dq_float2_store_default,
             attn_dq_fp32_p=self.attn_dq_fp32_p_default,
             attn_dq_rs_feed=self.attn_dq_rs_feed_default,
+            attn_dq_bulk_red=self.attn_dq_bulk_red_default,
             attn_combine_unroll=self.attn_combine_unroll_default,
             gemm_mbar_ring=self.gemm_mbar_ring_default,
             gemm_n256_nt_mbar=self.gemm_n256_nt_mbar_default,
