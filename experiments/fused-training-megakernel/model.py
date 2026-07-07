@@ -187,9 +187,17 @@ def _cold_cap(c):
     """Hot/cold ring cold-work cap (v3 P6/P4b retunes; 0 = uncapped)."""
     if c.H == 256 and c.L == 4 and c.S in (128, 512):
         return 0
+    if c.H == 256 and c.L == 4 and c.S == 2048 and c.D == 64:
+        # post dq-bulkred/pdf-d64-feed/qkrope-n128 resweep flip (72a40301):
+        # 0 -> 33, -5..-7us at 120+240 reps both orders
+        return 33
     if c.S >= 2048:
         return 0
     if c.L == 1 and c.H >= 1024 and c.V >= 32768:
+        return 0
+    if c.H == 512 and c.L == 8 and c.S == 1024 and c.D == 64:
+        # post dW-SK1-no-atomic resweep flip (72a40301): the atomic-dW
+        # contention that motivated capping is gone; 48 -> 0, -10..-15us
         return 0
     if c.H == 256 and c.S == 1024:
         return 64
