@@ -588,6 +588,13 @@ def load_ext(
     assert not (df_producer and occ2), (
         "MK_DF_PRODUCER and MK_OCC2 are mutually exclusive"
     )
+    # Attribution knob: plain 256-thread df with the executor-loop __syncthreads
+    # swapped for the producer variant's bar.sync 1,256 (isolates barrier cost
+    # from WG2-residency/setmaxnreg cost). Redundant under MK_DF_PRODUCER.
+    df_named_bar = int(os.environ.get("MK_DF_NAMED_BAR", "0"))
+    assert not (df_named_bar and df_producer), (
+        "MK_DF_NAMED_BAR is redundant under MK_DF_PRODUCER"
+    )
     # D=64 qknorm-bwd fast path; MK_QKBWD_D64_CACHE=0 keeps the old generic loop for
     # A/B and bisects. Separate extension name because torch's cache is name-keyed.
     qkbc = int(os.environ.get("MK_QKBWD_D64_CACHE", "1"))
@@ -665,6 +672,7 @@ def load_ext(
         + (f"_idle{idle_ns}" if idle_ns != 256 else "")
         + (f"_dfnr{df_maxnreg}" if df_maxnreg else "")
         + ("_dfprod" if df_producer else "")
+        + ("_dfnbar" if df_named_bar else "")
         + ("_qkbc" if qkbc else "")
         + ("_qkbc128" if qkbc128 else "")
         + ("_swfma" if swiglu_fma_deriv else "") + ("_swb2w" if swiglu_bwd_2w else "")
@@ -705,6 +713,7 @@ def load_ext(
         + ([f"-DMK_IDLE_NS={idle_ns}"] if idle_ns != 256 else [])
         + ([f"-DMK_DF_MAXNREG={df_maxnreg}"] if df_maxnreg else [])
         + (["-DMK_DF_PRODUCER"] if df_producer else [])
+        + (["-DMK_DF_NAMED_BAR"] if df_named_bar else [])
         + (["-DMK_QKBWD_D64_CACHE"] if qkbc else [])
         + (["-DMK_QKBWD_D128_CACHE"] if qkbc128 else [])
         + (["-DMK_SWIGLU_FMA_DERIV"] if swiglu_fma_deriv else [])

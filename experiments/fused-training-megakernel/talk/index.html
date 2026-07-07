@@ -1,0 +1,1168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fused Training Megakernel — the gap vs compile+CUDAGraph+</title>
+<style>
+/* ---------- tokens (dark palette, validated against surface #1a1a19) ---------- */
+:root {
+  --page:          #0d0d0d;
+  --surface:       #1a1a19;
+  --ink:           #ffffff;
+  --ink-2:         #c3c2b7;
+  --ink-muted:     #898781;
+  --grid:          #2c2c2a;
+  --baseline:      #383835;
+  --border:        rgba(255,255,255,0.10);
+  --series-1:      #3987e5;   /* blue   */
+  --series-2:      #199e70;   /* aqua   */
+  --series-3:      #c98500;   /* yellow */
+  --series-4:      #9085e9;   /* violet */
+  --blue-150:      #b7d3f6;
+  --status-good:   #0ca30c;
+  --status-crit:   #d03b3b;
+  --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --math: "STIX Two Math", "Cambria Math", "Latin Modern Math", Georgia, serif;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html { scroll-snap-type: y mandatory; scroll-behavior: smooth; }
+body {
+  background: var(--page);
+  color: var(--ink-2);
+  font-family: var(--sans);
+  font-size: 17px;
+  line-height: 1.55;
+}
+
+/* ---------- sections ---------- */
+section.slide {
+  min-height: 100vh;
+  scroll-snap-align: start;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 56px max(7vw, 48px);
+  position: relative;
+}
+.slide-inner { max-width: 1180px; width: 100%; margin: 0 auto; }
+
+.eyebrow {
+  font-size: 13px; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--ink-muted); margin-bottom: 14px; font-weight: 600;
+}
+.eyebrow .k { color: var(--series-1); }
+h2 { color: var(--ink); font-size: clamp(26px, 3vw, 40px); line-height: 1.12; letter-spacing: -0.012em; font-weight: 700; margin-bottom: 18px; }
+h3 { color: var(--ink); font-size: 18px; font-weight: 650; margin-bottom: 8px; }
+strong { color: var(--ink); font-weight: 650; }
+code { font-family: var(--mono); font-size: 0.92em; color: var(--blue-150); background: rgba(57,135,229,0.10); padding: 1px 5px; border-radius: 4px; }
+
+/* staged entrance */
+[data-step] { opacity: 0; transform: translateY(14px); transition: opacity .55s ease, transform .55s ease; }
+section.in-view [data-step] { opacity: 1; transform: none; }
+section.in-view [data-step="1"] { transition-delay: .05s; }
+section.in-view [data-step="2"] { transition-delay: .22s; }
+section.in-view [data-step="3"] { transition-delay: .40s; }
+section.in-view [data-step="4"] { transition-delay: .58s; }
+
+/* ---------- cards / tiles ---------- */
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 24px; }
+.card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  padding: 20px 22px 18px;
+}
+.card h3 { font-size: 16.5px; }
+.card p { font-size: 14px; color: var(--ink-2); margin-top: 6px; }
+.card .num { font-family: var(--mono); color: var(--series-1); font-size: 13px; margin-bottom: 6px; }
+.card .big { font-size: 25px; font-weight: 700; color: var(--ink); line-height: 1.15; }
+.card .big .hl { color: var(--series-1); }
+
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-top: 24px; }
+.tile { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px 16px; }
+.tile .label { font-size: 13.5px; color: var(--ink-muted); }
+.tile .value { font-size: 32px; font-weight: 700; color: var(--ink); margin-top: 4px; line-height: 1.05; font-variant-numeric: tabular-nums; }
+.tile .detail { font-size: 13px; color: var(--ink-2); margin-top: 7px; }
+.tile.accent .value { color: var(--series-1); }
+.tile.crit .value { color: var(--status-crit); }
+.tile.good .value { color: var(--status-good); }
+
+/* task chips */
+.chips { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 4px; margin-bottom: 6px; }
+.chip { background: var(--surface); border: 1px solid var(--border); border-radius: 999px; padding: 6px 14px; font-size: 13px; color: var(--ink-2); }
+.chip b { color: var(--ink); font-weight: 650; }
+
+/* go-deeper panels */
+details.deeper { margin-top: 18px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+details.deeper summary { cursor: pointer; padding: 11px 18px; color: var(--ink-muted); font-size: 14px; list-style: none; user-select: none; }
+details.deeper summary::before { content: "▸ "; color: var(--series-1); }
+details.deeper[open] summary::before { content: "▾ "; }
+details.deeper .body { padding: 2px 20px 16px; font-size: 14px; color: var(--ink-2); }
+details.deeper .body ul { margin: 6px 0 0 18px; }
+details.deeper .body li { margin-top: 6px; }
+details.deeper .body table { border-collapse: collapse; margin-top: 12px; font-size: 13px; font-variant-numeric: tabular-nums; }
+details.deeper .body th, details.deeper .body td { padding: 4px 12px 4px 0; text-align: right; border-bottom: 1px solid var(--grid); }
+details.deeper .body th { color: var(--ink-muted); font-weight: 600; }
+details.deeper .body td:first-child, details.deeper .body th:first-child { text-align: left; font-family: var(--mono); font-size: 12.5px; }
+
+/* chart & diagram blocks */
+.chart-block { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px 24px 14px; margin-top: 22px; }
+.chart-host { position: relative; }
+.chart-host svg { display: block; width: 100%; height: auto; }
+.diagram { margin-top: 22px; }
+.diagram svg { width: 100%; height: auto; display: block; }
+.legend { display: flex; gap: 22px; margin: 10px 2px 2px; flex-wrap: wrap; }
+.legend .li { display: flex; align-items: center; gap: 8px; font-size: 13.5px; color: var(--ink-2); }
+.legend .key { width: 18px; height: 12px; border-radius: 3px; flex: none; }
+.legend .key.line { height: 0; border-top: 3px solid; border-radius: 2px; background: none !important; }
+
+.viz-tooltip {
+  position: fixed; pointer-events: none; z-index: 50; display: none;
+  background: #232322; border: 1px solid var(--border); border-radius: 8px;
+  padding: 9px 12px; font-size: 13px; color: var(--ink-2); box-shadow: 0 6px 24px rgba(0,0,0,.5);
+  min-width: 150px;
+}
+.viz-tooltip .tt-x { color: var(--ink-muted); font-size: 12px; margin-bottom: 5px; }
+.viz-tooltip .tt-row { display: flex; align-items: center; gap: 8px; margin-top: 3px; }
+.viz-tooltip .tt-key { width: 12px; height: 0; border-top: 3px solid; border-radius: 2px; flex: none; }
+.viz-tooltip .tt-val { color: var(--ink); font-weight: 650; margin-left: auto; font-variant-numeric: tabular-nums; }
+
+/* diagram SVG text classes */
+.d-box   { fill: var(--surface); stroke: var(--border); }
+.d-title { fill: var(--ink); font: 650 15px var(--sans); }
+.d-label { fill: var(--ink-2); font: 13px var(--sans); }
+.d-note  { fill: var(--ink-muted); font: 12px var(--sans); }
+.d-mono  { fill: var(--blue-150); font: 12.5px var(--mono); }
+
+.src { font-size: 12.5px; color: var(--ink-muted); font-family: var(--mono); }
+
+/* annotated equation */
+.eq-block { margin-top: 26px; display: flex; align-items: flex-start; gap: 20px; flex-wrap: wrap; }
+.eq-term { display: flex; flex-direction: column; gap: 7px; max-width: 300px; }
+.eq-term .t { font-family: var(--math); font-style: italic; font-size: 29px; color: var(--ink); white-space: nowrap; }
+.eq-term .t.blue { color: var(--series-1); }
+.eq-term .t.green { color: var(--status-good); }
+.eq-term .lbl { font-size: 12.5px; color: var(--ink-muted); line-height: 1.45; }
+.eq-op { font-family: var(--math); font-size: 27px; color: var(--ink-muted); padding-top: 3px; }
+
+/* operator table */
+table.op-table { width: 100%; border-collapse: collapse; margin-top: 22px; font-size: 13px; }
+table.op-table th, table.op-table td { text-align: left; padding: 6px 16px 6px 0; border-bottom: 1px solid var(--grid); vertical-align: top; }
+table.op-table th { color: var(--ink-muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+table.op-table td:first-child { color: var(--ink); font-weight: 600; white-space: nowrap; }
+table.op-table td.f { font-family: var(--math); font-style: italic; font-size: 13.5px; color: var(--ink-2); }
+table.op-table td.s { font-family: var(--mono); font-size: 12px; color: var(--blue-150); white-space: nowrap; }
+table.op-table .bchip { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 9px; vertical-align: baseline; }
+
+/* progress rail */
+#rail {
+  position: fixed; right: 22px; top: 50%; transform: translateY(-50%);
+  display: flex; flex-direction: column; gap: 7px; z-index: 40; align-items: center;
+}
+#rail .dot {
+  width: 8px; height: 8px; border-radius: 50%; background: var(--baseline);
+  cursor: pointer; border: none; padding: 0; transition: background .2s, transform .2s;
+}
+#rail .dot:hover { background: var(--ink-muted); }
+#rail .dot.active { background: var(--series-1); transform: scale(1.45); }
+#act-label {
+  position: fixed; left: 26px; bottom: 22px; z-index: 40;
+  font-size: 12.5px; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--ink-muted); font-weight: 600;
+}
+#act-label .k { color: var(--series-1); }
+@media (max-width: 780px) { #rail, #act-label { display: none; } }
+
+@media print {
+  html { scroll-snap-type: none; }
+  section.slide { min-height: auto; page-break-inside: avoid; }
+  [data-step] { opacity: 1 !important; transform: none !important; }
+  #rail, #act-label { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  [data-step] { transition: none; opacity: 1; transform: none; }
+}
+</style>
+</head>
+<body>
+
+<nav id="rail" aria-label="Slide progress"></nav>
+<div id="act-label" aria-hidden="true"></div>
+<div class="viz-tooltip" id="tooltip" role="status"></div>
+
+<!-- ================= 1 · THE STEP ================= -->
+<section class="slide" data-act="1 · The step">
+  <div class="slide-inner">
+    <div class="eyebrow"><span class="k">01</span> · Fused training megakernel vs compile+CUDAGraph+ — gap study</div>
+    <h2 data-step="1">What one training step computes</h2>
+    <div class="chips" data-step="1">
+      <span class="chip"><b>Qwen3 architecture</b> — L transformer blocks</span>
+      <span class="chip">S packed tokens · causal attention · bf16</span>
+      <span class="chip">step = forward + backward + grad-zero (optimizer excluded)</span>
+    </div>
+    <div class="diagram" data-step="2" id="mkgap-viz-step"></div>
+    <div class="legend" data-step="2" id="mkgap-legend-step"></div>
+    <div class="eq-block" data-step="3">
+      <span class="eq-term"><span class="t">y = x·W<sup>T</sup></span><span class="lbl">every linear layer, forward — one GEMM</span></span>
+      <span class="eq-op">⇒</span>
+      <span class="eq-term"><span class="t blue">dx = dy·W</span><span class="lbl"><strong>GEMM dX</strong> — the input gradient. It feeds the next op upstream, so it sits on the step's critical path.</span></span>
+      <span class="eq-op">+</span>
+      <span class="eq-term"><span class="t green">dW = dy<sup>T</sup>·x</span><span class="lbl"><strong>GEMM dW</strong> — the weight gradient. It dead-ends in the optimizer state: nothing waits on it, so it can run whenever there are idle SMs (an off-path “sink”).</span></span>
+    </div>
+    <details class="deeper" data-step="4"><summary>the full forward math · what backward produces</summary>
+      <div class="body">
+        <ul>
+          <li><strong>embedding</strong>: <em>x = P<sub>emb</sub>[tokens]</em> — a gather of S rows of width H.</li>
+          <li><strong>rmsnorm</strong> (before attention, before MLP, and once at the end): <em>x̂ = x · rsqrt(mean<sub>H</sub>(x²) + ε) ⊙ w</em> — one reduction per token row.</li>
+          <li><strong>qkv projection</strong>: <em>[q | k | v] = x̂ · W<sub>qkv</sub><sup>T</sup></em>, split into n<sub>q</sub> query heads and n<sub>kv</sub> key/value heads of dim D (grouped-query attention: queries share KV heads).</li>
+          <li><strong>qk-norm + RoPE</strong>: per head, <em>q ← rope(rms(q) ⊙ w<sub>q</sub>)</em>, same for k; rope rotates dimension pairs by a position-dependent angle. Fused into the qkv GEMM's epilogue in the megakernel.</li>
+          <li><strong>attention</strong>: per query head, <em>o = softmax(q·K<sup>T</sup>/√D + causal)·V</em> — an S×S lower-triangular score matrix per head, streamed flash-style (never materialized).</li>
+          <li><strong>o projection</strong>: <em>x ← x + o·W<sub>o</sub><sup>T</sup></em> (residual add).</li>
+          <li><strong>MLP</strong>: <em>[g | u] = x̂ · W<sub>gu</sub><sup>T</sup></em>; <em>h = silu(g) ⊙ u</em> (swiglu); <em>x ← x + h·W<sub>d</sub><sup>T</sup></em>.</li>
+          <li><strong>head + loss</strong>: <em>logits = x̂ · W<sub>lm</sub><sup>T</sup></em>; <em>ℓ</em> = cross-entropy against the next token, averaged over positions.</li>
+          <li><strong>backward = reverse-mode AD</strong>, right to left. CE bwd: <em>dlogits = (softmax(logits) − onehot)/S</em>. Every GEMM node splits into the dx / dW pair above. rmsnorm bwd reuses the saved row rstd and adds a dw row-reduce. swiglu bwd: <em>dg = dh ⊙ u ⊙ silu′(g)</em>, <em>du = dh ⊙ silu(g)</em>. Attention bwd re-streams the causal triangle: <em>dV = P<sup>T</sup>·dO</em>, <em>dS = P ⊙ (dO·V<sup>T</sup> − Drow)</em>, <em>dQ = dS·K</em>, <em>dK = dS<sup>T</sup>·Q</em>, with <em>Drow = rowsum(dO ⊙ O)</em>.</li>
+          <li>Weight grads accumulate in fp32 (megakernel: pre-zeroed fp32 workspaces + atomics; baseline: AccumulateGrad kernels).</li>
+        </ul>
+      </div>
+    </details>
+  </div>
+</section>
+
+<!-- ================= 2 · OPERATORS ================= -->
+<section class="slide" data-act="2 · Operators">
+  <div class="slide-inner">
+    <div class="eyebrow"><span class="k">02</span> · The operators — every matmul in the step, H256 · S8192 shown</div>
+    <h2 data-step="1">Each operator and its shape</h2>
+    <div class="diagram" data-step="2" id="mkgap-viz-shapes"></div>
+    <div data-step="3" id="mkgap-table-ops"></div>
+    <details class="deeper" data-step="4"><summary>the same shapes at H512 and H2560 (Qwen3-4B class)</summary>
+      <div class="body" id="mkgap-table-ops-more"></div>
+    </details>
+  </div>
+</section>
+
+<!-- ================= 3 · THE GAP ================= -->
+<section class="slide" data-act="3 · The gap">
+  <div class="slide-inner">
+    <div class="eyebrow"><span class="k">03</span> · The measured gap — step-time ratio by shape</div>
+    <h2 data-step="1">The gap, by shape</h2>
+    <div class="chips" data-step="1">
+      <span class="chip"><b>one persistent kernel</b> — whole fwd+bwd step</span>
+      <span class="chip">vs <b>compile (max-autotune) + whole-step CUDA graph</b></span>
+      <span class="chip">bf16 Qwen3 arch · 1×H100</span>
+      <span class="chip">CUDA-event median of 50 · fresh process per shape</span>
+    </div>
+    <div class="chart-block" data-step="2"><div class="chart-host" id="mkgap-chart-gap"></div></div>
+    <div class="legend" data-step="2" id="mkgap-legend-gap"></div>
+    <div class="tiles" data-step="3">
+      <div class="tile crit"><div class="label">H256 · S ≤ 1k</div><div class="value" id="mkgap-tile-short">—</div><div class="detail">the GEMM-tax regime — flat, size-independent deficit</div></div>
+      <div class="tile crit"><div class="label">H256 · S = 8k</div><div class="value" id="mkgap-tile-long">—</div><div class="detail">the attention-wall regime — gap grows with S</div></div>
+      <div class="tile accent"><div class="label">H2560 (Qwen3-4B class) · S = 1k</div><div class="value" id="mkgap-tile-qwen">—</div><div class="detail">was 4.05× on Jul 5, before the D=128 attention route landed</div></div>
+    </div>
+    <details class="deeper" data-step="4"><summary>every number · windows · noise</summary>
+      <div class="body">
+        <div id="mkgap-table-scores"></div>
+        <ul>
+          <li><strong>Jul 5 matrix window</strong>: 12-shape operator-gap matrix, clean-GPU window, fresh process per shape (<span class="src">results/operator-gap/score_*.json</span>).</li>
+          <li><strong>Jul 6 current head</strong>: same recipe re-run at head <span class="src">53eeb23</span> after the day's promotions (D=128 attention trio, n256/head-dX routes, CE-bwd fixup, qk-rope n128). Shapes whose GPU-util+memory guards were dirty were re-run in clean windows (at <span class="src">005ad84</span>, which only widens an H256 gate), never hand-corrected.</li>
+          <li><strong>Giant-shape dispersion</strong>: qwen4b-l1's same-day clean windows measured 1.26× and 1.34× (megakernel 9080 vs 9586 µs, baseline stable) — H2560 medians disperse ~5% across windows; H256 shapes reproduce &lt;1%.</li>
+          <li>Baseline graph+ medians bounce ±8% across clean windows on this box; megakernel steps bounce &lt;1% — read trends, not second decimals.</li>
+          <li>Baseline = <code>torch.compile(mode="max-autotune-no-cudagraphs")</code> + <code>torch._foreach_zero_</code> + manual whole-step CUDA-graph replay (the hardened arm in <span class="src">bench.py</span>).</li>
+        </ul>
+      </div>
+    </details>
+  </div>
+</section>
+
+<!-- ================= 4 · WHERE ================= -->
+<section class="slide" data-act="4 · Where">
+  <div class="slide-inner">
+    <div class="eyebrow"><span class="k">04</span> · Where the gap lives — operator buckets</div>
+    <h2 data-step="1">Where the extra microseconds go</h2>
+    <div class="chart-block" data-step="2"><div class="chart-host" id="mkgap-chart-stack"></div></div>
+    <div class="legend" data-step="2" id="mkgap-legend-stack"></div>
+    <div class="tiles" data-step="3">
+      <div class="tile good"><div class="label">grad zero + accumulate</div><div class="value">0 µs</div><div class="detail">structurally sunk; the baseline pays 70–220 µs serialized every step</div></div>
+      <div class="tile good"><div class="label">dW GEMMs</div><div class="value">0.5–0.8×</div><div class="detail">weight-grad sinks overlap off the critical path — megakernel wins this bucket</div></div>
+      <div class="tile crit"><div class="label">worst bucket, every shape</div><div class="value">gemm dX</div><div class="detail">3.8× → 8.3× vs nvjet as S grows (H256 family)</div></div>
+    </div>
+    <details class="deeper" data-step="4"><summary>raw bucket table · how attribution works</summary>
+      <div class="body">
+        <ul>
+          <li>Megakernel side: <span class="src">profile_df.py</span> realized-critical-path attribution — only on-path wait+span counts; off-path volume is overlapped work. Baseline side: median nsys <code>--cuda-graph-trace=node</code> replay, active+gap per operator family (99.5%+ kernel-name match to a torch.profiler calibration run).</li>
+          <li>Chart bars rescale each side's bucket shares to its CUDA-event step total (node-mode traces inflate replay walls ~10%, worse at short S), so per-shape stacks sum to the measured step-time gap.</li>
+        </ul>
+        <div id="mkgap-table-buckets"></div>
+      </div>
+    </details>
+  </div>
+</section>
+
+<!-- ================= 5 · TREND ================= -->
+<section class="slide" data-act="5 · Trend">
+  <div class="slide-inner">
+    <div class="eyebrow"><span class="k">05</span> · How each bucket scales with sequence length</div>
+    <h2 data-step="1">Flat GEMM tax, growing attention wall</h2>
+    <div class="chart-block" data-step="2"><div class="chart-host" id="mkgap-chart-ratio"></div></div>
+    <div class="legend" data-step="2" id="mkgap-legend-ratio"></div>
+    <div class="tiles" data-step="3">
+      <div class="tile good"><div class="label">attention bwd · S ≤ 1024</div><div class="value">0.6–0.7×</div><div class="detail">the megakernel beats cuDNN's fused flash bprop at short S</div></div>
+      <div class="tile crit"><div class="label">attention bwd · S = 8192</div><div class="value">2090 µs</div><div class="detail">dKV wait (+515 µs span) vs cuDNN's 1137 µs total — a scheduling problem first</div></div>
+      <div class="tile crit"><div class="label">lm-head fwd · S = 8192</div><div class="value">6.6×</div><div class="detail">440 µs vs nvjet's 66 µs — the single worst instruction</div></div>
+    </div>
+    <details class="deeper" data-step="4"><summary>what moved long-S attention · packing law</summary>
+      <div class="body">
+        <ul>
+          <li>The long-S bwd deficit was the <strong>C=1 causal-triangle straggler</strong>: makespan = the longest tile's serial chain. Banded chunking (split only the long tiles, per-band workspace slots) recovered ~530 µs at S=8192 bwd and ~480 µs fwd via flash-decoding partials + range-limited combine.</li>
+          <li>Post-banding the bwd bands are 77–83% packed (stage-units × per-stage cost / 132 blocks vs actual window) — scheduling knobs can recover ≤10%; the rest is per-stage op cost: dKV ~2.7 µs and dQ ~1.9 µs per 64-row stage ≈ 200 TF/s machine-wide vs flash ~500.</li>
+          <li>Bucket ratios here are trace-share ratios exactly as in the operator-gap report (megakernel on-path µs ÷ baseline active+gap µs).</li>
+        </ul>
+      </div>
+    </details>
+  </div>
+</section>
+
+<!-- ================= 6 · HIDDEN DIM ================= -->
+<section class="slide" data-act="6 · Hidden dim">
+  <div class="slide-inner">
+    <div class="eyebrow"><span class="k">06</span> · The hidden-dim axis — H 256 → 2560, D 64 → 128, V 152k</div>
+    <h2 data-step="1">H=2560: missing routes, not physics</h2>
+    <div class="chart-block" data-step="2"><div class="chart-host" id="mkgap-chart-qwen"></div></div>
+    <div class="cards" data-step="3">
+      <div class="card"><div class="num">closed · attention</div><div class="big">D=128 route</div>
+        <p>The matrix ran D=128 heads on the WMMA fallback (~3.2 ms on-path fwd+dQ). The WGMMA trio (split-D, P-parking, redundant-S) replaced it: dQ span went 1169 → 99 µs.</p></div>
+      <div class="card"><div class="num">closed · scheduling</div><div class="big">Sink starvation</div>
+        <p>At L=1 the critical path waited 14.2 ms in EMBED_BWD while all 132 blocks chewed lm-head dW split-K sinks. After the giant-shape rounds, total on-path wait is 0.29 ms.</p></div>
+      <div class="card"><div class="num">remaining</div><div class="big">lm-head pair</div>
+        <p>lm-head fwd + dX now span 5.1 ms of the ~9 ms step vs nvjet's ~2.0 ms for the same pair — a tile-quality/DRAM-rate deficit at V=152k, the next lane.</p></div>
+    </div>
+    <details class="deeper" data-step="4"><summary>current H2560 profile vs baseline kernels</summary>
+      <div class="body" id="mkgap-table-qwen"></div>
+    </details>
+  </div>
+</section>
+
+<!-- ================= 7 · WHY ================= -->
+<section class="slide" data-act="7 · Why">
+  <div class="slide-inner">
+    <div class="eyebrow"><span class="k">07</span> · The mechanism under all four buckets</div>
+    <h2 data-step="1">One kernel, one resource point</h2>
+    <div class="diagram" data-step="2" id="mkgap-viz-regpoint"></div>
+    <div class="tiles" data-step="3">
+      <div class="tile crit"><div class="label">SM issue, inside the megakernel</div><div class="value">19%</div><div class="detail">nsys gpu-metrics sampled in-window (small, clean GPU)</div></div>
+      <div class="tile crit"><div class="label">compute warps in flight</div><div class="value">12%</div><div class="detail">= the single 256-thread block; 87% of warp slots unallocated</div></div>
+      <div class="tile crit"><div class="label">DRAM read+write</div><div class="value">&lt;10%</div><div class="detail">not bandwidth-bound — latency-bound at 1/8 occupancy</div></div>
+    </div>
+    <div class="cards" data-step="3">
+      <div class="card"><div class="num">measured law</div><div class="big">Only chain-shortening pays</div>
+        <p>Caching weights in smem, cutting DRAM traffic, deeper software pipelines, and prefetch topologies were each measured slower in the 8-warp regime — the bytes already ride the latency the chain exposes. Every win came from removing dependent-latency links: epilogue fusion, register feeds, boundary removal, banding.</p></div>
+      <div class="card"><div class="num">measured law</div><div class="big">The ops aren't the gap</div>
+        <p>Standalone, the same mechanisms reach parity: the dX GEMM ladder closed 187.9 → 69.1 µs = 1.03× nvjet, and the attention ops are FA-class (fwd 35 µs / dKV 45 µs / dQ 30 µs ≈ flash). In-model the identical instruction pays +30–50% — the tax is the execution environment.</p></div>
+      <div class="card"><div class="num">structural constraint</div><div class="big">64K registers, one image</div>
+        <p>256 threads × 255 registers fills the register file exactly; every op must compile into that one point. nvjet's fastest dX shape wants 384 threads at 168 regs with a dedicated TMA-producer warpgroup, cuDNN's bprop wants warp-specialized groups — per-family register points a single kernel image cannot route across.</p></div>
+    </div>
+    <details class="deeper" data-step="4"><summary>closure ladders · code map · protocol</summary>
+      <div class="body">
+        <ul id="mkgap-ladder"></ul>
+        <ul>
+          <li><strong>NT lm-head floor</strong>: 146 µs vs nvjet 86.8 (1.66×) with identical traffic and 100% L2 write-hit both sides — nvjet sustains 48% vs our 24% DRAM writeback; closed against every SM-side mechanism and raster order.</li>
+          <li><strong>Register-point map</strong>: winning ops cluster at {168, 224, 255} regs; a uniform library rewrite to any single point was refuted — the architecture is per-family routing, which is nvjet's own per-shape selection one level up.</li>
+        </ul>
+        <ul>
+          <li><span class="src">experiments/fused-training-megakernel/megakernel.cu · ops.cuh · wgmma_attention.cuh</span> — interpreter + device op library</li>
+          <li><span class="src">model.py</span> — Qwen3 program builder + the per-shape gate table · <span class="src">bench.py</span> — all baseline arms</li>
+          <li><span class="src">profile_df.py</span> — critical-path attribution · <span class="src">xorl-oss-opgap: mk_profile_ops.py / trace_baseline_ops.py / opgap_report.py</span> — the matrix harness</li>
+          <li>Source of record: <span class="src">xorl-oss-opgap/results/operator_gap_report.md</span> + <span class="src">results/operator-gap/*.md</span> (per-lane memos)</li>
+          <li>Protocol: fresh process per shape · private <code>TORCH_EXTENSIONS_DIR</code> · GPU-util guards before/after every timed window · paired A/B in both construction orders for promotions.</li>
+        </ul>
+      </div>
+    </details>
+  </div>
+</section>
+
+<!-- ================= data ================= -->
+<script id="mkgap-facts" type="application/json">{"meta":{"topic":"fused training megakernel vs compile+CUDAGraph+ operator gap","matrix_window":"2026-07-05 ~21-23Z, clean-GPU window, fresh process per shape, megakernel-opgap branch","matrix_source":"results/operator-gap/score_*.json + xorl-oss-opgap/results/operator_gap_report.md","fresh_window":"2026-07-06 21:00-21:35Z, head 53eeb23 (small/qwen re-runs at 005ad84, which only widens the H256 qkrope-n128 gate at S3072/4096), fresh process per shape, GPU-util+memory guards; dirty windows re-run, never hand-corrected","qwen_l1_dispersion":"qwen4b-l1 same-day clean windows measured mk 9080 and 9586 us (1.26x / 1.34x; baseline stable at ~7.15-7.18ms) - giant-shape medians disperse ~5% across windows; H256 shapes reproduce <1%","fresh_source":"scratchpad sweep log (score_shape.py, bench.py-verbatim recipe)","baseline_def":"torch.compile(mode=max-autotune-no-cudagraphs) + foreach grad zero + whole-step manual CUDA graph replay (bench.py hardened arm)","timing":"CUDA-event median of 50, one H100, bf16 Qwen3 architecture, step = fwd+bwd+grad-zero"},"shapes":[{"name":"s128","H":256,"L":4,"S":128,"D":64,"V":8192,"I":768,"nq":4,"nkv":2,"axis":"seq"},{"name":"s256","H":256,"L":4,"S":256,"D":64,"V":8192,"I":768,"nq":4,"nkv":2,"axis":"seq"},{"name":"nano","H":256,"L":4,"S":512,"D":64,"V":8192,"I":768,"nq":4,"nkv":2,"axis":"seq"},{"name":"s1024","H":256,"L":4,"S":1024,"D":64,"V":8192,"I":768,"nq":4,"nkv":2,"axis":"seq"},{"name":"s2048","H":256,"L":4,"S":2048,"D":64,"V":8192,"I":768,"nq":4,"nkv":2,"axis":"seq"},{"name":"s3072","H":256,"L":4,"S":3072,"D":64,"V":8192,"I":768,"nq":4,"nkv":2,"axis":"seq"},{"name":"s4096","H":256,"L":4,"S":4096,"D":64,"V":8192,"I":768,"nq":4,"nkv":2,"axis":"seq"},{"name":"s8192","H":256,"L":4,"S":8192,"D":64,"V":8192,"I":768,"nq":4,"nkv":2,"axis":"seq"},{"name":"deep","H":256,"L":12,"S":512,"D":64,"V":8192,"I":768,"nq":4,"nkv":2,"axis":"depth"},{"name":"small","H":512,"L":8,"S":1024,"D":64,"V":16384,"I":1536,"nq":8,"nkv":4,"axis":"hidden"},{"name":"qwen4b-l1","H":2560,"L":1,"S":1024,"D":128,"V":151936,"I":9728,"nq":32,"nkv":8,"axis":"hidden"},{"name":"qwen4b-l2","H":2560,"L":2,"S":1024,"D":128,"V":151936,"I":9728,"nq":32,"nkv":8,"axis":"hidden"}],"matrix":{"s128":{"mk":739.3,"base":428.8,"ratio":1.724},"s256":{"mk":814.3,"base":552.1,"ratio":1.475},"nano":{"mk":912.0,"base":581.4,"ratio":1.569},"s1024":{"mk":1224.3,"base":790.8,"ratio":1.548},"s2048":{"mk":1778.6,"base":978.0,"ratio":1.819},"s3072":{"mk":2483.5,"base":1263.4,"ratio":1.966},"s4096":{"mk":3144.1,"base":1503.8,"ratio":2.091},"s8192":{"mk":7009.7,"base":3047.0,"ratio":2.301},"deep":{"mk":2371.6,"base":1572.4,"ratio":1.508},"small":{"mk":3472.6,"base":1772.2,"ratio":1.96},"qwen4b-l1":{"mk":29094.2,"base":7191.2,"ratio":4.046},"qwen4b-l2":{"mk":35318.9,"base":8646.0,"ratio":4.085}},"fresh":{"s128":{"mk":753.2,"base":431.9,"ratio":1.744},"s256":{"mk":825.0,"base":554.0,"ratio":1.489},"nano":{"mk":928.1,"base":632.8,"ratio":1.467},"s1024":{"mk":1289.1,"base":780.0,"ratio":1.653},"s2048":{"mk":1866.7,"base":1050.4,"ratio":1.777},"s3072":{"mk":2576.6,"base":1333.8,"ratio":1.932},"s4096":{"mk":3204.5,"base":1578.2,"ratio":2.03},"s8192":{"mk":6884.1,"base":3157.0,"ratio":2.181},"deep":{"mk":2420.7,"base":1576.9,"ratio":1.535},"small":{"mk":3324.2,"base":1909.8,"ratio":1.741},"qwen4b-l1":{"mk":9586.3,"base":7152.6,"ratio":1.34},"qwen4b-l2":{"mk":15971.0,"base":8685.6,"ratio":1.839}},"buckets":{"order":["s128","s256","nano","s1024","s2048","s3072","s4096","s8192","deep","small","qwen4b-l1","qwen4b-l2"],"note":"megakernel = realized-critical-path on-path us (profile_df attribution); baseline = median nsys graph-node replay active+gap us per operator family. Trace shares only; absolute step totals come from CUDA-event score runs.","attn_fwd":{"mk":[41,52,77,125,179,255,369,1110,223,261,1762,3093],"base":[45,51,58,78,109,147,182,505,173,149,36,70]},"attn_bwd_all":{"mk":[57,69,85,133,278,520,783,2605,252,436,1431,2771],"base":[97,113,138,188,278,384,485,1236,410,374,120,240]},"gemm_fwd":{"mk":[201,213,239,298,379,557,572,967,615,836,4502,5558],"base":[59,63,69,83,107,138,157,263,193,243,1317,1627]},"gemm_dx":{"mk":[247,168,249,390,527,602,739,1086,659,1033,5766,8619],"base":[65,44,57,87,93,118,135,130,154,184,286,579]},"gemm_dw":{"mk":[0,101,37,0,0,0,0,188,112,211,0,0],"base":[48,79,80,84,115,158,186,335,229,259,1323,1636]},"rowop_fwd":{"mk":[74,74,73,81,93,118,136,233,202,186,205,338],"base":[40,42,44,53,48,71,77,104,129,97,52,93]},"rowop_bwd":{"mk":[81,84,87,118,203,273,336,560,256,422,646,1384],"base":[95,118,134,148,154,209,232,320,389,299,113,232]},"ce":{"mk":[13,17,24,33,71,109,148,293,24,56,331,331],"base":[11,14,38,44,54,88,103,192,19,54,414,419]},"embed":{"mk":[7,16,12,23,31,47,60,116,22,42,14342,12990],"base":[2,2,2,2,3,3,4,6,2,3,14,13]},"support":{"mk":[0,0,0,0,0,0,0,0,0,0,0,0],"base":[81,80,84,84,72,86,85,74,222,215,2259,2547]},"other":{"mk":[0,0,0,0,0,0,0,0,0,0,0,0],"base":[2,2,3,2,2,2,2,2,2,5,1181,1184]}},"s8192_attn_bwd":{"wait_us":2089.9,"span_us":514.8,"cudnn_bprop_us":1136.8,"op":"ATTN_DKV_WG x16 (banded)"},"s8192_lm_head":{"mk_us":440.2,"nvjet_us":66.3},"qwen_now":{"note":"qwen4b-l1 movement since the matrix window: D=128 WGMMA attention trio replaced the WMMA fallback (~-3.4ms), n256/head-dX/cold-cap giant-shape rounds + CE-bwd label fixup; paired A/B step at head 3e08bc2 era: 9103us default arm","matrix_mk":29094.2,"ab_mk_20260706":9103.1,"base":7191.2,"profile_top_now":[{"op":"lm_head dX  GEMMNN 1024x2560x151936","span_us":2636.6},{"op":"lm_head fwd GEMMNT 1024x151936x2560","span_us":2479.3},{"op":"mlp gate/up dX GEMMNN 1024x2560x19456","span_us":467.1},{"op":"mlp down dX GEMMNN 1024x9728x2560","span_us":335.6},{"op":"ATTN_DQ_WG128 (was 1431us ATTN_DQ fallback)","span_us":99.4}],"base_top":[{"op":"lm_head fwd nvjet coopB TNT","us":1015.7},{"op":"lm_head dW nvjet coopB NTT","us":1015.1},{"op":"lm_head dX-class nvjet coopB NNT","us":939.2},{"op":"AccumulateGrad elementwise x11","us":1712.4}]},"mechanism":{"gpu_metrics":{"sm_issue_pct":19,"warps_in_flight_pct":12,"unallocated_warp_slots_pct":87,"dram_rw_pct_lt":10,"source":"nsys gpu-metrics sampled inside the megakernel window (small, 5 steps, clean GPU)"},"register_point":{"threads":256,"regs_per_thread":255,"regfile_per_sm":65536,"blocks":132,"blocks_per_sm":1,"nvjet_dx_point":"384 threads @ 168 regs + 24-reg dedicated TMA producer warpgroup","cudnn_point":"warp-specialized flash bprop, own launch shape per S"},"dx_ladder":{"shape":"s8192 dX-head 8192x256x8192","rungs":[{"name":"BN64 + syncthreads pipeline","us":187.9},{"name":"fat 128x128 tiles","us":117.5},{"name":"mbarrier ring (decoupled issue)","us":90.9},{"name":"TMA feed","us":87.3},{"name":"producer warpgroup 384/168","us":69.1}],"nvjet_us":67.2,"final_ratio":1.03,"tf":497,"note":"standalone probe ladder; in-model today: SW128 + wave-gated n128/n256 fat tiles + gated mbarrier rings + split-K routing \u2014 the producer-warpgroup rung is the unreachable remainder (register accounting)"},"nt_floor":{"mk_us":146,"nvjet_us":86.8,"ratio":1.66,"note":"s8192 NT lm_head: identical traffic, 100% L2 write-hit both sides; nvjet 48% vs our 24% DRAM writeback rate \u2014 memory-system behavior, closed against every SM-side mechanism"},"attn_standalone":{"note":"D=64 attention ops are FA-class standalone (fwd 35us, dKV 45us, dQ 30us at small shapes ~ flash parity); in-model instruction tax +30-50% is the latency environment, not op quality"},"baseline_support_tax_us":[70,220],"qwen_accumgrad_us":1712,"laws":[{"name":"Only chain-shortening pays","detail":"weight-stationary smem residency 0.91x, deep K-rings, FA2-style pipelining, MPK prefetch, register-resident reuse \u2014 all measured slower in the 8-warp regime; wins came from fusion, register feeds, boundary removal, banding"},{"name":"One register point","detail":"256 threads x 255 regs = the 64K regfile exactly; every add-warps design pays fat-path registers; nvjet routes per family across register points, the megakernel cannot"},{"name":"Wave quantization","detail":"132 blocks = one wave; tile counts quantize to 132; banding wins iff band tiles stay near <=132 or total work >> one wave"}]},"provenance":{"matrix_sha_range":"f6b1f85..0e65676 (megakernel-opgap)","noise":"baseline graph+ medians bounce +-8% across clean windows; megakernel steps bounce <1% \u2014 ratio second decimals are noise","trace_caveat":"nsys node-mode inflates replay walls ~10%; per-kernel shares only, absolute totals from CUDA events","logs":["results/operator-gap/score_*.json, mk_*.jsonl, baseline_*.csv (12-shape matrix)","results/mkv3-p4b-score-full-d64noinline-20260706T061633Z.log (certified 7-shape, GPU 6)","results/mkv3-p4b-score-small-current-88dfafb-20260706T2000Z.log","results/mkv3-p4b-profile-s8192-qkrope-n128-20260706T2034Z.log","results/mkv3-p4b-qwen-cefix-*-20260706T1914Z.log (paired A/B + fresh profile)","results/operator-gap/gemmb-probe-round5.md (dX ladder), round9-10 (NT floor)","NOTES.md gpu-metrics verdict (SM issue 19% / warps 12% / DRAM <10%)"]}}</script>
+
+<script>
+"use strict";
+(function () {
+/* ============================================================
+   Fused-megakernel gap deck — charts, diagrams, nav. Single file,
+   no network. All content ids prefixed mkgap-; JS scoped in IIFE.
+   ============================================================ */
+
+const C = {
+  s1: "#3987e5", s2: "#199e70", s3: "#c98500", s4: "#9085e9",
+  ink: "#ffffff", ink2: "#c3c2b7", muted: "#898781",
+  grid: "#2c2c2a", baseline: "#383835", surface: "#1a1a19",
+  crit: "#d03b3b", good: "#0ca30c", blue150: "#b7d3f6",
+};
+
+let F = null;
+try { F = JSON.parse(document.getElementById("mkgap-facts").textContent); } catch (e) { F = null; }
+if (!F || !F.matrix) {
+  document.body.insertAdjacentHTML("afterbegin",
+    '<div style="position:fixed;top:0;left:0;right:0;padding:8px 16px;background:#5a1f1f;color:#fff;z-index:99;font:14px sans-serif">facts blob missing — run build.py</div>');
+}
+
+/* ---------- SVG helpers ---------- */
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, parent) {
+  const n = document.createElementNS(NS, tag);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(n);
+  return n;
+}
+function txt(node, s) { node.textContent = s; return node; }
+function label(svg, x, y, s, cls = "d-label", anchor = "middle", style = "") {
+  const t = el("text", { x, y, "text-anchor": anchor, class: cls }, svg);
+  if (style) t.setAttribute("style", style);
+  return txt(t, s);
+}
+
+const tooltip = document.getElementById("tooltip");
+function showTooltip(x, y, xLabel, rows) {
+  tooltip.replaceChildren();
+  const tx = document.createElement("div"); tx.className = "tt-x"; tx.textContent = xLabel;
+  tooltip.appendChild(tx);
+  for (const r of rows) {
+    const row = document.createElement("div"); row.className = "tt-row";
+    const key = document.createElement("span"); key.className = "tt-key"; key.style.borderTopColor = r.color;
+    const name = document.createElement("span"); name.textContent = r.name;
+    const val = document.createElement("span"); val.className = "tt-val"; val.textContent = r.value;
+    row.append(key, name, val); tooltip.appendChild(row);
+  }
+  tooltip.style.display = "block";
+  const w = tooltip.offsetWidth, h = tooltip.offsetHeight;
+  tooltip.style.left = Math.min(x + 16, window.innerWidth - w - 12) + "px";
+  tooltip.style.top = Math.max(12, Math.min(y - h - 12, window.innerHeight - h - 12)) + "px";
+}
+function hideTooltip() { tooltip.style.display = "none"; }
+
+function legendRow(hostId, items) {
+  const lg = document.getElementById(hostId);
+  if (!lg) return;
+  items.forEach(([name, color, line]) => {
+    const li = document.createElement("div"); li.className = "li";
+    const key = document.createElement("span"); key.className = "key" + (line ? " line" : "");
+    if (line) key.style.borderTopColor = color; else key.style.background = color;
+    const t = document.createElement("span"); t.textContent = name;
+    li.append(key, t); lg.appendChild(li);
+  });
+}
+
+const fmt1 = v => v.toFixed(2).replace(/0$/, "") + "×";
+const fmtUs = v => Math.abs(v) >= 1000 ? (v / 1000).toFixed(1) + " ms" : Math.round(v) + " µs";
+
+const SEQ = ["s128", "s256", "nano", "s1024", "s2048", "s3072", "s4096", "s8192"];
+const shapeByName = {};
+(F ? F.shapes : []).forEach(s => shapeByName[s.name] = s);
+
+/* ============================================================
+   1 · Gap-vs-shape chart. x = log2(S) for the H256/L4 family,
+   two windows (Jul 5 matrix, Jul 6 head); H512 / H2560 / L12
+   as distinct markers at their own S.
+   ============================================================ */
+function chartGap() {
+  const host = document.getElementById("mkgap-chart-gap");
+  if (!host || !F) return;
+  const W = 1080, H = 430, m = { t: 34, r: 200, b: 52, l: 64 };
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img",
+    "aria-label": "Step-time ratio megakernel over compile plus CUDA graph, by sequence length and hidden dim" });
+  host.appendChild(svg);
+
+  const yMax = 2.7, yMin = 0.8;
+  const X = s => m.l + (Math.log2(s) - 7) / (13 - 7) * (W - m.l - m.r);
+  const Y = v => m.t + (1 - (v - yMin) / (yMax - yMin)) * (H - m.t - m.b);
+
+  for (let v = 1.0; v <= yMax + 1e-9; v += 0.5) {
+    el("line", { x1: m.l, x2: W - m.r, y1: Y(v), y2: Y(v), stroke: C.grid }, svg);
+    label(svg, m.l - 10, Y(v) + 4, v.toFixed(1) + "×", "d-note", "end");
+  }
+  // parity reference
+  el("line", { x1: m.l, x2: W - m.r, y1: Y(1), y2: Y(1), stroke: C.ink2, "stroke-dasharray": "6 5", opacity: 0.55 }, svg);
+  label(svg, W - m.r + 8, Y(1) + 4, "parity", "d-note", "start");
+  [128, 256, 512, 1024, 2048, 4096, 8192].forEach(s => {
+    label(svg, X(s), H - m.b + 20, s >= 1024 ? (s / 1024) + "k" : s, "d-note");
+    el("line", { x1: X(s), x2: X(s), y1: H - m.b, y2: H - m.b + 5, stroke: C.grid }, svg);
+  });
+  label(svg, m.l, 16, "step-time ratio — megakernel ÷ compile+CUDAGraph+", "d-note", "start");
+  label(svg, (m.l + W - m.r) / 2, H - 8, "sequence length (tokens, log scale) — H256 · L4 family", "d-note");
+
+  function seriesPts(src) {
+    return SEQ.filter(n => src[n]).map(n => ({ n, S: shapeByName[n].S, r: src[n].ratio }));
+  }
+  const gapEndLabels = [];
+  function drawSeries(pts, color, width, dotR, name) {
+    if (!pts.length) return;
+    const d = pts.map((p, i) => (i ? "L" : "M") + X(p.S) + " " + Y(p.r)).join(" ");
+    el("path", { d, stroke: color, "stroke-width": width, fill: "none" }, svg);
+    pts.forEach(p => el("circle", { cx: X(p.S), cy: Y(p.r), r: dotR, fill: color }, svg));
+    const last = pts[pts.length - 1];
+    gapEndLabels.push({ x: X(last.S) + 12, y: Y(last.r) + 4, text: name + "  " + fmt1(last.r), color });
+  }
+  const mPts = seriesPts(F.matrix);
+  const fPts = seriesPts(F.fresh || {});
+  drawSeries(mPts, C.muted, 2, 3.5, "Jul 5");
+  drawSeries(fPts, C.s1, 3, 4.5, "Jul 6");
+  gapEndLabels.sort((a, b) => a.y - b.y);
+  for (let i = 1; i < gapEndLabels.length; i++) {
+    if (gapEndLabels[i].y - gapEndLabels[i - 1].y < 17) gapEndLabels[i].y = gapEndLabels[i - 1].y + 17;
+  }
+  gapEndLabels.forEach(L => label(svg, L.x, L.y, L.text, "d-label", "start", `fill:${L.color};font-weight:650`));
+
+  // off-family markers: small (H512), qwen4b-l1 (H2560), deep (L12)
+  function marker(name, labelTxt, shape, dy, dx, anchor) {
+    const s = shapeByName[name];
+    const wins = [["matrix", F.matrix[name], C.muted], ["fresh", (F.fresh || {})[name], C.s1]];
+    const onScale = wins.filter(([, row]) => row && row.ratio <= yMax);
+    const labelRow = onScale.length ? onScale[onScale.length - 1][1] : null;  // label the freshest on-scale window only
+    wins.forEach(([, row, color]) => {
+      if (!row) return;
+      const off = row.ratio > yMax;
+      const x = X(s.S), y = off ? m.t + 14 : Y(row.ratio);
+      if (shape === "diamond") el("path", { d: `M ${x} ${y - 6} L ${x + 6} ${y} L ${x} ${y + 6} L ${x - 6} ${y} Z`, fill: color }, svg);
+      else if (shape === "square") el("rect", { x: x - 5, y: y - 5, width: 10, height: 10, fill: color }, svg);
+      else el("circle", { cx: x, cy: y, r: 5, fill: "none", stroke: color, "stroke-width": 2.5 }, svg);
+      if (off) {
+        el("path", { d: `M ${x} ${y - 8} L ${x} ${y - 15} M ${x - 4} ${y - 11} L ${x} ${y - 17} L ${x + 4} ${y - 11}`,
+          fill: "none", stroke: color, "stroke-width": 2 }, svg);
+        label(svg, x + 11, y + 4, labelTxt + "  " + row.ratio.toFixed(2) + "×, off scale", "d-note", "start", `fill:${color}`);
+      } else if (row === labelRow) {
+        label(svg, x + (dx || 10), y + dy, labelTxt + "  " + fmt1(row.ratio), "d-note", anchor || "start", `fill:${color}`);
+      }
+    });
+  }
+  marker("small", "H512", "diamond", -9);
+  marker("qwen4b-l1", "H2560", "square", 18);
+  marker("deep", "L12", "circle", 20, -10, "end");
+
+  // hover crosshair over the H256 series
+  const cross = el("line", { y1: m.t, y2: H - m.b, stroke: C.ink2, opacity: 0, "stroke-dasharray": "3 4" }, svg);
+  const hot = el("rect", { x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b, fill: "transparent" }, svg);
+  hot.addEventListener("pointermove", ev => {
+    const box = svg.getBoundingClientRect();
+    const px = (ev.clientX - box.left) / box.width * W;
+    let best = null, bd = 1e9;
+    SEQ.forEach(n => { const d = Math.abs(X(shapeByName[n].S) - px); if (d < bd) { bd = d; best = n; } });
+    if (!best) return;
+    const x = X(shapeByName[best].S);
+    cross.setAttribute("x1", x); cross.setAttribute("x2", x); cross.setAttribute("opacity", 0.5);
+    const rows = [];
+    if ((F.fresh || {})[best]) rows.push({ name: "Jul 6 head", color: C.s1, value: fmt1(F.fresh[best].ratio) + "  (" + fmtUs(F.fresh[best].mk) + " / " + fmtUs(F.fresh[best].base) + ")" });
+    if (F.matrix[best]) rows.push({ name: "Jul 5 matrix", color: C.muted, value: fmt1(F.matrix[best].ratio) });
+    showTooltip(ev.clientX, ev.clientY, best + "  ·  S=" + shapeByName[best].S, rows);
+  });
+  hot.addEventListener("pointerleave", () => { cross.setAttribute("opacity", 0); hideTooltip(); });
+
+  legendRow("mkgap-legend-gap", [
+    ["Jul 6, current head", C.s1, true],
+    ["Jul 5, operator-gap matrix window", C.muted, true],
+    ["◆ H512·L8   ■ H2560·D128·V152k   ○ H256·L12", "transparent", false],
+  ]);
+}
+
+/* ============================================================
+   2 · Stacked gap decomposition. Per shape: (mk − baseline) µs
+   per bucket group, shares rescaled to CUDA-event step totals.
+   Positive stacks above zero, wins below.
+   ============================================================ */
+const GROUPS = [
+  { key: "gemm_dx", name: "GEMM dX", color: C.s1, buckets: ["gemm_dx"] },
+  { key: "gemm_fwd", name: "GEMM fwd", color: C.s4, buckets: ["gemm_fwd"] },
+  { key: "attn_bwd", name: "attention bwd", color: C.s3, buckets: ["attn_bwd_all"] },
+  { key: "attn_fwd", name: "attention fwd", color: C.s2, buckets: ["attn_fwd"] },
+  { key: "rowops", name: "rowops · CE · embed", color: C.muted, buckets: ["rowop_fwd", "rowop_bwd", "ce", "embed"] },
+  { key: "wins", name: "megakernel wins (dW sinks · zero/accum)", color: C.good, buckets: ["gemm_dw", "support", "other"] },
+];
+const STACK_SHAPES = ["s128", "s256", "nano", "s1024", "s2048", "s3072", "s4096", "s8192", "deep", "small"];
+
+function bucketDeltas(name) {
+  const i = F.buckets.order.indexOf(name);
+  let mkSum = 0, baseSum = 0;
+  for (const k in F.buckets) {
+    if (k === "order" || k === "note") continue;
+    mkSum += F.buckets[k].mk[i]; baseSum += F.buckets[k].base[i];
+  }
+  const row = F.matrix[name];   // same window as the bucket shares — do not mix in fresh totals
+  const mkScale = row.mk / mkSum, baseScale = row.base / baseSum;
+  return GROUPS.map(g => {
+    let mk = 0, base = 0;
+    g.buckets.forEach(b => { mk += F.buckets[b].mk[i]; base += F.buckets[b].base[i]; });
+    return { g, delta: mk * mkScale - base * baseScale };
+  });
+}
+
+function chartStack() {
+  const host = document.getElementById("mkgap-chart-stack");
+  if (!host || !F) return;
+  const W = 1080, H = 460, m = { t: 30, r: 20, b: 56, l: 70 };
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img",
+    "aria-label": "Per-shape step-time gap decomposed by operator bucket; GEMM dX and attention dominate, dW sinks and support ops are megakernel wins" });
+  host.appendChild(svg);
+
+  const data = STACK_SHAPES.map(n => ({ n, parts: bucketDeltas(n) }));
+  const posMax = Math.max(...data.map(d => d.parts.filter(p => p.delta > 0).reduce((a, p) => a + p.delta, 0)));
+  const negMax = Math.max(...data.map(d => -d.parts.filter(p => p.delta < 0).reduce((a, p) => a + p.delta, 0)));
+  const yMax = posMax * 1.08, yMin = -negMax * 1.6;
+  const Y = v => m.t + (yMax - v) / (yMax - yMin) * (H - m.t - m.b);
+
+  const stepv = yMax > 3000 ? 1000 : 500;
+  for (let v = 0; v <= yMax; v += stepv) {
+    el("line", { x1: m.l, x2: W - m.r, y1: Y(v), y2: Y(v), stroke: C.grid }, svg);
+    label(svg, m.l - 10, Y(v) + 4, v ? (v / 1000).toFixed(1) : "0", "d-note", "end");
+  }
+  el("line", { x1: m.l, x2: W - m.r, y1: Y(0), y2: Y(0), stroke: C.baseline, "stroke-width": 1.5 }, svg);
+  label(svg, m.l, 14, "step-time gap, megakernel − baseline (ms), Jul 5 matrix window — below zero = megakernel faster", "d-note", "start");
+
+  const slot = (W - m.l - m.r) / data.length, bw = Math.min(slot * 0.56, 64);
+  data.forEach((d, i) => {
+    const cx = m.l + slot * (i + 0.5), x = bw / -2 + cx;
+    let up = 0, down = 0;
+    const g = el("g", {}, svg);
+    d.parts.forEach(p => {
+      if (Math.abs(p.delta) < 0.5) return;
+      let y0;
+      if (p.delta > 0) { y0 = Y(up + p.delta); up += p.delta; }
+      else { y0 = Y(down); down += p.delta; }
+      el("rect", { x, y: y0, width: bw, height: Math.abs(Y(0) - Y(Math.abs(p.delta))) - 0 , rx: 1.5,
+        fill: p.g.color, opacity: p.g.key === "wins" ? 0.75 : 0.92 }, g);
+    });
+    // total marker
+    label(svg, cx, Y(up) - 8, fmtUs(up + down), "d-note", "middle", "fill:" + C.ink2 + ";font-weight:650");
+    const s = shapeByName[d.n];
+    label(svg, cx, H - m.b + 20, s.S >= 1024 ? "S=" + (s.S / 1024) + "k" : "S=" + s.S, "d-note");
+    label(svg, cx, H - m.b + 36, d.n === "deep" ? "L12" : d.n === "small" ? "H512" : d.n, "d-note", "middle",
+      d.n === "deep" || d.n === "small" ? "fill:" + C.ink2 : "");
+    g.addEventListener("pointermove", ev => showTooltip(ev.clientX, ev.clientY,
+      d.n + " — gap " + fmtUs(up + down),
+      d.parts.map(p => ({ name: p.g.name, color: p.g.color, value: (p.delta >= 0 ? "+" : "−") + fmtUs(Math.abs(p.delta)) }))));
+    g.addEventListener("pointerleave", hideTooltip);
+  });
+
+  legendRow("mkgap-legend-stack", GROUPS.map(g => [g.name, g.color, false]));
+}
+
+/* ============================================================
+   3 · Bucket ratio vs S (trace-share ratios, as in the report).
+   ============================================================ */
+function chartRatio() {
+  const host = document.getElementById("mkgap-chart-ratio");
+  if (!host || !F) return;
+  const W = 1080, H = 430, m = { t: 34, r: 230, b: 52, l: 64 };
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img",
+    "aria-label": "Per-bucket megakernel-to-baseline ratio versus sequence length: GEMM ratios are flat, attention crosses parity near S 2048 and grows" });
+  host.appendChild(svg);
+
+  const series = [
+    { key: "gemm_dx", name: "GEMM dX", color: C.s1 },
+    { key: "gemm_fwd", name: "GEMM fwd", color: C.s4 },
+    { key: "attn_bwd_all", name: "attention bwd", color: C.s3 },
+    { key: "attn_fwd", name: "attention fwd", color: C.s2 },
+  ];
+  const yMax = 9, yMin = 0;
+  const X = s => m.l + (Math.log2(s) - 7) / (13 - 7) * (W - m.l - m.r);
+  const Y = v => m.t + (1 - (v - yMin) / (yMax - yMin)) * (H - m.t - m.b);
+
+  for (let v = 0; v <= yMax; v += 2) {
+    el("line", { x1: m.l, x2: W - m.r, y1: Y(v), y2: Y(v), stroke: C.grid }, svg);
+    label(svg, m.l - 10, Y(v) + 4, v + "×", "d-note", "end");
+  }
+  el("line", { x1: m.l, x2: W - m.r, y1: Y(1), y2: Y(1), stroke: C.ink2, "stroke-dasharray": "6 5", opacity: 0.6 }, svg);
+  label(svg, W - m.r + 8, Y(1) + 4, "parity — below = megakernel wins", "d-note", "start");
+  [128, 256, 512, 1024, 2048, 4096, 8192].forEach(s => {
+    label(svg, X(s), H - m.b + 20, s >= 1024 ? (s / 1024) + "k" : s, "d-note");
+  });
+  label(svg, m.l, 16, "bucket ratio — megakernel on-path µs ÷ baseline active+gap µs (H256 · L4 family)", "d-note", "start");
+  label(svg, (m.l + W - m.r) / 2, H - 8, "sequence length (tokens, log scale)", "d-note");
+
+  const idx = SEQ.map(n => F.buckets.order.indexOf(n));
+  const endLabels = [];
+  series.forEach(s => {
+    const pts = SEQ.map((n, j) => {
+      const mk = F.buckets[s.key].mk[idx[j]], base = F.buckets[s.key].base[idx[j]];
+      return base > 0 && mk > 0 ? { S: shapeByName[n].S, r: mk / base } : null;
+    }).filter(Boolean);
+    const d = pts.map((p, i) => (i ? "L" : "M") + X(p.S) + " " + Y(p.r)).join(" ");
+    el("path", { d, stroke: s.color, "stroke-width": 2.6, fill: "none" }, svg);
+    pts.forEach(p => el("circle", { cx: X(p.S), cy: Y(p.r), r: 3.5, fill: s.color }, svg));
+    const last = pts[pts.length - 1];
+    endLabels.push({ x: X(last.S) + 12, y: Y(last.r) + 4, text: s.name + "  " + last.r.toFixed(1) + "×", color: s.color });
+  });
+  // de-collide end labels: enforce 17px vertical separation, top-down
+  endLabels.sort((a, b) => a.y - b.y);
+  for (let i = 1; i < endLabels.length; i++) {
+    if (endLabels[i].y - endLabels[i - 1].y < 17) endLabels[i].y = endLabels[i - 1].y + 17;
+  }
+  endLabels.forEach(L => label(svg, L.x, L.y, L.text, "d-label", "start", `fill:${L.color};font-weight:650`));
+
+  const cross = el("line", { y1: m.t, y2: H - m.b, stroke: C.ink2, opacity: 0, "stroke-dasharray": "3 4" }, svg);
+  const hot = el("rect", { x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b, fill: "transparent" }, svg);
+  hot.addEventListener("pointermove", ev => {
+    const box = svg.getBoundingClientRect();
+    const px = (ev.clientX - box.left) / box.width * W;
+    let best = null, bd = 1e9, bj = 0;
+    SEQ.forEach((n, j) => { const d = Math.abs(X(shapeByName[n].S) - px); if (d < bd) { bd = d; best = n; bj = j; } });
+    if (!best) return;
+    const x = X(shapeByName[best].S);
+    cross.setAttribute("x1", x); cross.setAttribute("x2", x); cross.setAttribute("opacity", 0.5);
+    showTooltip(ev.clientX, ev.clientY, best + "  ·  S=" + shapeByName[best].S,
+      series.map(s => {
+        const mk = F.buckets[s.key].mk[idx[bj]], base = F.buckets[s.key].base[idx[bj]];
+        return { name: s.name, color: s.color, value: base > 0 && mk > 0 ? (mk / base).toFixed(2) + "×  (" + mk + "/" + base + ")" : "—" };
+      }));
+  });
+  hot.addEventListener("pointerleave", () => { cross.setAttribute("opacity", 0); hideTooltip(); });
+
+  legendRow("mkgap-legend-ratio", series.map(s => [s.name, s.color, true]));
+}
+
+/* ============================================================
+   4 · H2560: matrix vs today, dashed baseline reference.
+   ============================================================ */
+function chartQwen() {
+  const host = document.getElementById("mkgap-chart-qwen");
+  if (!host || !F) return;
+  const q = F.qwen_now;
+  const freshRow = (F.fresh || {})["qwen4b-l1"];
+  const nowMk = freshRow ? freshRow.mk : q.ab_mk_20260706;
+  const nowBase = freshRow ? freshRow.base : q.base;
+  const nowSrc = freshRow ? "fresh score, Jul 6 head" : "paired-A/B arm, Jul 6 (pre-evening promotions)";
+
+  const W = 1080, H = 360, m = { t: 40, r: 40, b: 56, l: 70 };
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img",
+    "aria-label": "Qwen3-4B-class shape: megakernel step 29.1 ms in the Jul 5 matrix, about 9 ms today, baseline 7.2 ms" });
+  host.appendChild(svg);
+  const yMax = 31000;
+  const Y = v => m.t + (1 - v / yMax) * (H - m.t - m.b);
+  for (let v = 0; v <= yMax; v += 10000) {
+    el("line", { x1: m.l, x2: W - m.r, y1: Y(v), y2: Y(v), stroke: C.grid }, svg);
+    label(svg, m.l - 10, Y(v) + 4, v / 1000, "d-note", "end");
+  }
+  label(svg, m.l, 16, "megakernel step time (ms) — qwen4b-l1: H2560 · 32q/8kv heads · D128 · I9728 · V151936 · L1 · S1024", "d-note", "start");
+
+  const bars = [
+    { x: 0.30, v: F.matrix["qwen4b-l1"].mk, color: C.muted, name: "Jul 5 matrix", note: "WMMA-fallback attention · pre giant-shape rounds" },
+    { x: 0.62, v: nowMk, color: C.s1, name: "Jul 6", note: nowSrc },
+  ];
+  const bw = 130;
+  bars.forEach(b => {
+    const cx = m.l + (W - m.l - m.r) * b.x;
+    const g = el("g", {}, svg);
+    el("rect", { x: cx - bw / 2, y: Y(b.v), width: bw, height: Y(0) - Y(b.v), rx: 5, fill: b.color, opacity: 0.92 }, g);
+    label(svg, cx, Y(b.v) - 10, (b.v / 1000).toFixed(1) + " ms  ·  " + fmt1(b.v / nowBase), "d-label", "middle",
+      "fill:" + C.ink + ";font-weight:700;font-size:17px");
+    label(svg, cx, H - m.b + 22, b.name, "d-label");
+    label(svg, cx, H - m.b + 40, b.note, "d-note");
+    g.addEventListener("pointermove", ev => showTooltip(ev.clientX, ev.clientY, b.name,
+      [{ name: "megakernel", color: b.color, value: (b.v / 1000).toFixed(2) + " ms" },
+       { name: "ratio", color: C.ink2, value: fmt1(b.v / nowBase) }]));
+    g.addEventListener("pointerleave", hideTooltip);
+  });
+  // arrow between bars
+  const x1 = m.l + (W - m.l - m.r) * 0.30 + bw / 2 + 14, x2 = m.l + (W - m.l - m.r) * 0.62 - bw / 2 - 14;
+  const midY = Y(F.matrix["qwen4b-l1"].mk * 0.55);
+  const defs = el("defs", {}, svg);
+  el("marker", { id: "mkgap-qa", markerWidth: 9, markerHeight: 9, refX: 7, refY: 4.5, orient: "auto" }, defs)
+    .appendChild(el("path", { d: "M0,0 L9,4.5 L0,9 z", fill: C.s1 }));
+  el("path", { d: `M ${x1} ${midY} C ${x1 + 60} ${midY - 40}, ${x2 - 60} ${Y(nowMk) - 60}, ${x2} ${Y(nowMk) - 26}`,
+    stroke: C.s1, "stroke-width": 2, fill: "none", "marker-end": "url(#mkgap-qa)" }, svg);
+  label(svg, (x1 + x2) / 2, midY - 44, "D=128 WGMMA trio · giant-shape GEMM rounds · starvation fixes", "d-note", "middle", "fill:" + C.s1);
+
+  // baseline reference
+  el("line", { x1: m.l, x2: W - m.r, y1: Y(nowBase), y2: Y(nowBase), stroke: C.s2, "stroke-dasharray": "7 5", "stroke-width": 2 }, svg);
+  label(svg, W - m.r - 6, Y(nowBase) - 8, "compile+CUDAGraph+  " + (nowBase / 1000).toFixed(1) + " ms", "d-note", "end", "fill:" + C.s2 + ";font-weight:650");
+}
+
+/* ============================================================
+   5 · Resource-point diagram.
+   ============================================================ */
+function vizRegPoint() {
+  const host = document.getElementById("mkgap-viz-regpoint");
+  if (!host) return;
+  const W = 1080, H = 320;
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img",
+    "aria-label": "The megakernel compiles every op into one kernel image at one launch configuration; the baseline picks a tuned kernel per op" }, );
+  host.appendChild(svg);
+
+  // left: megakernel
+  el("rect", { x: 30, y: 34, width: 480, height: 250, rx: 12, class: "d-box", style: "stroke:" + C.s1 }, svg);
+  label(svg, 270, 62, "megakernel — one persistent kernel", "d-title");
+  label(svg, 270, 84, "132 blocks · 1 per SM · 256 threads · 255 regs = the full 64K regfile", "d-mono");
+  const ops = ["GEMM NT/NN/TN", "attention fwd/dQ/dKV", "rmsnorm · swiglu · rope", "CE · embed · fills"];
+  ops.forEach((o, i) => {
+    const x = 56 + (i % 2) * 220, y = 104 + Math.floor(i / 2) * 54;
+    el("rect", { x, y, width: 200, height: 40, rx: 7, fill: "rgba(57,135,229,0.10)", stroke: C.s1 }, svg);
+    label(svg, x + 100, y + 24, o, "d-label");
+  });
+  el("rect", { x: 56, y: 218, width: 420, height: 44, rx: 7, fill: "none", stroke: C.crit, "stroke-dasharray": "5 4" }, svg);
+  label(svg, 266, 236, "one register/smem/launch point for every op", "d-note", "middle", "fill:" + C.crit);
+  label(svg, 266, 254, "dispatch switch + dataflow scheduler between instructions", "d-note");
+
+  // right: baseline
+  el("rect", { x: 570, y: 34, width: 480, height: 250, rx: 12, class: "d-box" }, svg);
+  label(svg, 810, 62, "compile+CUDAGraph+ — a kernel per op", "d-title");
+  label(svg, 810, 84, "each at its own tuned launch shape, replayed gap-free", "d-note");
+  const kern = [
+    ["nvjet dX", "384 thr · 168 reg + TMA producer WG"],
+    ["nvjet NT", "supertiles · per-shape family select"],
+    ["cuDNN flash bprop", "warp-specialized · fused"],
+    ["triton rowops", "inductor max-autotune"],
+  ];
+  kern.forEach(([name, cfg], i) => {
+    const x = 596 + (i % 2) * 220, y = 104 + Math.floor(i / 2) * 54;
+    el("rect", { x, y, width: 200, height: 40, rx: 7, fill: "rgba(25,158,112,0.10)", stroke: C.s2 }, svg);
+    label(svg, x + 100, y + 20, name, "d-label");
+    label(svg, x + 100, y + 34, cfg, "d-note", "middle", "font-size:10.5px");
+  });
+  el("rect", { x: 596, y: 218, width: 420, height: 44, rx: 7, fill: "none", stroke: C.s2, "stroke-dasharray": "5 4" }, svg);
+  label(svg, 806, 236, "a register point per kernel — 12 warps, producer splits, clusters", "d-note", "middle", "fill:" + C.s2);
+  label(svg, 806, 254, "cost: kernel boundaries — hidden by graph replay (75–97% active)", "d-note");
+}
+
+/* ============================================================
+   1 · The step — forward chain, backward chain, dW sinks.
+   Colors = the bucket palette used by every later chart.
+   ============================================================ */
+function vizStep() {
+  const host = document.getElementById("mkgap-viz-step");
+  if (!host) return;
+  const W = 1080, H = 346;
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img",
+    "aria-label": "One training step: the forward operator chain left to right, the backward gradient chain right to left, and the weight-gradient sinks below" });
+  host.appendChild(svg);
+  const defs = el("defs", {}, svg);
+  function mk(id, color) {
+    el("marker", { id, markerWidth: 8, markerHeight: 8, refX: 6, refY: 3.5, orient: "auto" }, defs)
+      .appendChild(el("path", { d: "M0,0 L7,3.5 L0,7 z", fill: color }));
+    return `url(#${id})`;
+  }
+  const aMut = mk("mkgap-sa-m", "#6a6862"), aBlue = mk("mkgap-sa-b", C.s1), aGreen = mk("mkgap-sa-g", C.good);
+
+  const CAT = {
+    gf: { fill: "rgba(144,133,233,0.14)", stroke: C.s4 },
+    gx: { fill: "rgba(57,135,229,0.16)", stroke: C.s1 },
+    af: { fill: "rgba(25,158,112,0.14)", stroke: C.s2 },
+    ab: { fill: "rgba(201,133,0,0.16)", stroke: C.s3 },
+    row: { fill: "rgba(137,135,129,0.10)", stroke: "#5d5b56" },
+  };
+  const FWD = [
+    ["embed", "P[tok]", "row"], ["rmsnorm", "rms(x)·w₁", "row"], ["qkv proj", "x̂·Wqkvᵀ", "gf"],
+    ["qknorm+rope", "rope(rms(qk))", "row"], ["attention", "sm(qKᵀ/√D)V", "af"], ["o proj (+x)", "o·Woᵀ", "gf"],
+    ["rmsnorm", "rms(x)·w₂", "row"], ["gate/up", "x̂·Wguᵀ", "gf"], ["swiglu", "silu(g)⊙u", "row"],
+    ["down (+x)", "h·Wdᵀ", "gf"], ["final norm", "rms(x)·wf", "row"], ["lm head", "x̂·Wlmᵀ", "gf"],
+    ["CE loss", "−log p(next)", "row"],
+  ];
+  const BWD = [
+    ["embed bwd", "scatter dx", "row", 0], ["rms dX+dw", "", "row", 0], ["qkv dX", "dy·Wqkv", "gx", 1],
+    ["qk/rope bwd", "", "row", 0], ["attn bwd", "dQ · dKV", "ab", 0], ["o dX", "dy·Wo", "gx", 1],
+    ["rms dX+dw", "", "row", 0], ["gu dX", "dy·Wgu", "gx", 1], ["swiglu bwd", "", "row", 0],
+    ["down dX", "dy·Wd", "gx", 1], ["rms dX+dw", "", "row", 0], ["head dX", "dy·Wlm", "gx", 1],
+    ["CE bwd", "dlogits", "row", 0],
+  ];
+  const x0 = 26, slot = (W - 52) / 13, bw = slot - 8, bh = 46;
+  const yF = 64, yB = 182;
+  const bx = i => x0 + i * slot + 4;
+
+  function node(i, y, t, f, c) {
+    const s = CAT[c];
+    el("rect", { x: bx(i), y, width: bw, height: bh, rx: 6, fill: s.fill, stroke: s.stroke }, svg);
+    label(svg, bx(i) + bw / 2, y + (f ? 19 : 27), t, "d-label", "middle", "font-size:10.5px;fill:" + C.ink);
+    if (f) label(svg, bx(i) + bw / 2, y + 35, f, "d-note", "middle", "font-size:9.5px;font-family:var(--math);font-style:italic");
+  }
+  label(svg, x0, yF - 10, "forward  →", "d-note", "start", "fill:" + C.ink2 + ";font-weight:650");
+  label(svg, x0, yB - 10, "←  backward — the gradient chain (the step's critical path)", "d-note", "start", "fill:" + C.ink2 + ";font-weight:650");
+  FWD.forEach((n, i) => node(i, yF, n[0], n[1], n[2]));
+  BWD.forEach((n, i) => node(i, yB, n[0], n[1], n[2]));
+  for (let i = 0; i < 12; i++) {
+    const y1 = yF + bh / 2, y2 = yB + bh / 2;
+    el("line", { x1: bx(i) + bw, y1, x2: bx(i + 1) - 1, y2: y1, stroke: "#6a6862", "stroke-width": 1.5, "marker-end": aMut }, svg);
+    el("line", { x1: bx(i + 1), y1: y2, x2: bx(i) + bw + 1, y2, stroke: C.s1, "stroke-width": 1.5, opacity: 0.8, "marker-end": aBlue }, svg);
+  }
+  el("path", { d: `M ${bx(12) + bw / 2} ${yF + bh} L ${bx(12) + bw / 2} ${yB - 2}`, stroke: "#6a6862", "stroke-width": 1.5, "marker-end": aMut }, svg);
+  label(svg, bx(12) + bw / 2 + 8, (yF + bh + yB) / 2 + 4, "ℓ", "d-note", "start", "font-family:var(--math);font-style:italic;font-size:13px");
+  const brY = 34;
+  el("path", { d: `M ${bx(1)} ${brY + 10} L ${bx(1)} ${brY} L ${bx(9) + bw} ${brY} L ${bx(9) + bw} ${brY + 10}`,
+    fill: "none", stroke: C.ink2, "stroke-width": 1.3, opacity: 0.7 }, svg);
+  label(svg, (bx(1) + bx(9) + bw) / 2, brY - 7, "one transformer block — repeated ×L", "d-note");
+  const yS = 268;
+  el("rect", { x: bx(2), y: yS, width: bx(12) + bw - bx(2), height: 46, rx: 8, fill: "rgba(12,163,12,0.07)",
+    stroke: C.good, "stroke-dasharray": "6 5" }, svg);
+  label(svg, (bx(2) + bx(12) + bw) / 2, yS + 20, "dW = dyᵀ·x — a weight-grad GEMM per linear (+ norm/qk-norm dw reduces)", "d-label", "middle", "fill:" + C.good);
+  label(svg, (bx(2) + bx(12) + bw) / 2, yS + 37, "split-K fp32 sinks: nothing downstream waits on them — they fill idle SMs off the chain", "d-note");
+  BWD.forEach((n, i) => {
+    if (!n[3]) return;
+    el("line", { x1: bx(i) + bw / 2, y1: yB + bh, x2: bx(i) + bw / 2, y2: yS - 2, stroke: C.good, "stroke-width": 1.5, opacity: 0.85, "marker-end": aGreen }, svg);
+  });
+
+  legendRow("mkgap-legend-step", [
+    ["GEMM forward", C.s4, false], ["GEMM dX — input grads", C.s1, false],
+    ["attention forward", C.s2, false], ["attention backward", C.s3, false],
+    ["rowops · CE · embed", C.muted, false], ["weight-grad sinks (off-path)", C.good, false],
+    ["— the same bucket colors are used in every chart below", "transparent", false],
+  ]);
+}
+
+/* ============================================================
+   2 · Operators & shapes — tensor pictures to scale (H256·S8192)
+   + the operator table.
+   ============================================================ */
+const OPCFG = { name: "H256 · L4 · S8192", S: 8192, H: 256, V: 8192, I: 768, nq: 4, nkv: 2, D: 64 };
+
+function vizShapes() {
+  const host = document.getElementById("mkgap-viz-shapes");
+  if (!host) return;
+  const W = 1080, H = 322;
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img",
+    "aria-label": "The lm-head linear drawn as three GEMM tensor pictures to scale, and the causal attention score triangle" });
+  host.appendChild(svg);
+  const c = OPCFG;
+  const px = d => Math.max(5, d / 56);   // 8192 → 146 px; 256 → 5 px (clamped, noted)
+  const gflop = (2 * c.S * c.V * c.H / 1e9).toFixed(1);
+
+  label(svg, 26, 22, `lm head at ${c.name} — one linear, three GEMMs, drawn to scale`, "d-title", "start");
+  label(svg, 26, 40, `the same ${gflop} GFLOP in all three — only the shapes (and memory behavior) differ`, "d-note", "start");
+
+  const yT = 66, big = px(c.S), thin = px(c.H);
+  function rect(x, y, w, h, color, dims) {
+    el("rect", { x, y, width: w, height: h, rx: 2, fill: color + "26", stroke: color }, svg);
+    if (dims) {
+      if (h > 40 && w <= 40) {
+        const t = label(svg, x - 5, y + h / 2, dims, "d-note", "middle", "font-size:10px");
+        t.setAttribute("transform", `rotate(-90 ${x - 5} ${y + h / 2})`);
+      } else label(svg, x + w / 2, y - 5, dims, "d-note", "middle", "font-size:10px");
+    }
+  }
+  function glyph(x, name, layout, A, B, Cc, color, note1, note2) {
+    let cx = x;
+    const mid = yT + big / 2;
+    rect(cx, mid - A.h / 2, A.w, A.h, "#898781", A.d); cx += A.w;
+    label(svg, cx + 6, mid + 4, "·", "d-label", "middle", "font-size:16px"); cx += 13;
+    rect(cx, mid - B.h / 2, B.w, B.h, "#898781", B.d); cx += B.w;
+    label(svg, cx + 9, mid + 4, "→", "d-label", "middle", "font-size:13px"); cx += 19;
+    rect(cx, mid - Cc.h / 2, Cc.w, Cc.h, color, Cc.d); cx += Cc.w;
+    label(svg, (x + cx) / 2, yT + big + 30, name + " — " + layout, "d-label", "middle", `fill:${color};font-weight:650;font-size:12.5px`);
+    label(svg, (x + cx) / 2, yT + big + 47, note1, "d-note", "middle", "font-size:11px");
+    if (note2) label(svg, (x + cx) / 2, yT + big + 62, note2, "d-note", "middle", "font-size:11px");
+    return cx;
+  }
+  let x = 46;
+  x = glyph(x, "forward", "GEMM NT 8192·8192·256",
+    { w: thin, h: big, d: "x  S×H" }, { w: big, h: thin, d: "Wᵀ  H×V" }, { w: big, h: big, d: "logits  S×V" },
+    C.s4, "K = 256: a skinny inner dim —", "tile-quality bound, not FLOP bound") + 52;
+  x = glyph(x, "dX", "GEMM NN 8192·256·8192",
+    { w: big, h: big, d: "dy  S×V" }, { w: thin, h: big, d: "W" }, { w: thin, h: big, d: "dx" },
+    C.s1, "K = 8192: re-streams the 134 MB dy —", "a pure DRAM-rate contest") + 52;
+  x = glyph(x, "dW (sink)", "GEMM TN 8192·256·8192",
+    { w: big, h: big, d: "dyᵀ  V×S" }, { w: thin, h: big, d: "x" }, { w: thin, h: big, d: "dW" },
+    C.good, "K = S: split-K over the sequence,", "fp32-atomic reduce — off-path") + 46;
+
+  const ax = x + 30, aw = big;
+  label(svg, ax, 22, "attention — per head", "d-title", "start");
+  label(svg, ax, 40, `GQA: ${c.nq} q · ${c.nkv} KV · D=${c.D}`, "d-note", "start");
+  el("rect", { x: ax, y: yT, width: aw, height: aw, rx: 2, fill: "none", stroke: C.s2, opacity: 0.6 }, svg);
+  el("path", { d: `M ${ax} ${yT} L ${ax + aw} ${yT + aw} L ${ax} ${yT + aw} Z`, fill: "rgba(25,158,112,0.22)", stroke: C.s2 }, svg);
+  label(svg, ax + aw * 0.30, yT + aw * 0.72, "q·Kᵀ", "d-label", "middle", "font-family:var(--math);font-style:italic;fill:" + C.s2);
+  label(svg, ax + aw / 2, yT - 5, "keys  S", "d-note", "middle", "font-size:10px");
+  const qv = label(svg, ax - 5, yT + aw / 2, "queries  S", "d-note", "middle", "font-size:10px");
+  qv.setAttribute("transform", `rotate(-90 ${ax - 5} ${yT + aw / 2})`);
+  label(svg, ax + aw / 2, yT + aw + 30, `${(c.S * c.S / 2 / 1e6).toFixed(1)} M causal scores / head`, "d-note", "middle", "font-size:11px");
+  label(svg, ax + aw / 2, yT + aw + 45, "work ∝ S² — flash-streamed;", "d-note", "middle", "font-size:11px");
+  label(svg, ax + aw / 2, yT + aw + 60, "bwd re-streams the triangle", "d-note", "middle", "font-size:11px");
+
+  label(svg, 46, H - 6, "thin slivers clamped to 5 px — true widths are thinner · everything non-GEMM (rmsnorm, swiglu, rope, CE, embed) is O(S·H) row work: bandwidth-bound, no matmul", "d-note", "start", "font-size:10.5px");
+}
+
+const OP_ROWS = cfg => {
+  const qkvOut = (cfg.nq + 2 * cfg.nkv) * cfg.D, oIn = cfg.nq * cfg.D;
+  const d = (m, n, k) => `${m}·${n}·${k}`;
+  return [
+    ["embedding", "x = P[tokens]", "gather S×H", "scatter-add dx into dP (sink)", "row"],
+    ["rmsnorm ×3 sites", "x·rsqrt(mean(x²)+ε)⊙w", "row reduce, O(S·H)", "dX (reuses rstd) + dw reduce (sink)", "row"],
+    ["qkv proj", "[q|k|v] = x̂·Wqkvᵀ", "NT " + d(cfg.S, qkvOut, cfg.H), "dX: NN " + d(cfg.S, cfg.H, qkvOut) + " · dW: TN " + d(qkvOut, cfg.H, cfg.S), "gemm"],
+    ["qk-norm + RoPE", "rope(rms(q)⊙wq), same for k", "rowop — fused into the qkv epilogue", "unfused rowop", "row"],
+    ["attention", "softmax(qKᵀ/√D + causal)·V", `S²/2 scores × ${cfg.nq} heads, D=${cfg.D}`, "dQ + dKV — triangle re-streamed", "attn"],
+    ["o proj", "x += o·Woᵀ", "NT " + d(cfg.S, cfg.H, oIn), "dX: NN " + d(cfg.S, oIn, cfg.H) + " · dW: TN " + d(cfg.H, oIn, cfg.S), "gemm"],
+    ["mlp gate/up", "[g|u] = x̂·Wguᵀ", "NT " + d(cfg.S, 2 * cfg.I, cfg.H), "dX: NN " + d(cfg.S, cfg.H, 2 * cfg.I) + " · dW: TN " + d(2 * cfg.I, cfg.H, cfg.S), "gemm"],
+    ["swiglu", "h = silu(g)⊙u", "elementwise O(S·I)", "dg, du elementwise", "row"],
+    ["mlp down", "x += h·Wdᵀ", "NT " + d(cfg.S, cfg.H, cfg.I), "dX: NN " + d(cfg.S, cfg.I, cfg.H) + " · dW: TN " + d(cfg.H, cfg.I, cfg.S), "gemm"],
+    ["lm head", "logits = x̂·Wlmᵀ", "NT " + d(cfg.S, cfg.V, cfg.H), "dX: NN " + d(cfg.S, cfg.H, cfg.V) + " · dW: TN " + d(cfg.V, cfg.H, cfg.S), "gemm"],
+    ["cross-entropy", "−log softmax(logits)[next]", "row reduce over V", "dlogits = softmax − onehot", "row"],
+  ];
+};
+
+function opsTable(hostId, cfg, title) {
+  const host = document.getElementById(hostId);
+  if (!host) return;
+  if (title) {
+    const h = document.createElement("h3");
+    h.textContent = title;
+    h.style.marginTop = "16px";
+    host.appendChild(h);
+  }
+  const t = document.createElement("table");
+  t.className = "op-table";
+  t.innerHTML = "<tr><th>operator</th><th>computes</th><th>forward (M·N·K)</th><th>backward</th></tr>";
+  OP_ROWS(cfg).forEach(([op, f, fwd, bwd, cat]) => {
+    const chip = { gemm: C.s4, attn: C.s2, row: C.muted }[cat];
+    const tr = document.createElement("tr");
+    const bwdHtml = bwd
+      .replace(/dX: (NN [\d·]+)/, '<span style="color:var(--series-1)">dX: $1</span>')
+      .replace(/dW: (TN [\d·]+)/, '<span style="color:var(--status-good)">dW: $1</span>')
+      .replace("dQ + dKV", '<span style="color:var(--series-3)">dQ + dKV</span>');
+    tr.innerHTML = `<td><span class="bchip" style="background:${chip}"></span>${op}</td>` +
+      `<td class="f">${f}</td><td class="s" style="color:${cat === "gemm" ? "var(--series-4)" : "var(--ink-2)"}">${fwd}</td><td class="s">${bwdHtml}</td>`;
+    t.appendChild(tr);
+  });
+  host.appendChild(t);
+}
+
+/* ---------- tables & tiles ---------- */
+function fillTiles() {
+  if (!F) return;
+  const src = n => (F.fresh || {})[n] || F.matrix[n];
+  const shortR = ["s128", "s256", "nano", "s1024"].map(n => src(n).ratio);
+  const set = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = v; };
+  set("mkgap-tile-short", Math.min(...shortR).toFixed(2).replace(/0$/, "") + "–" + Math.max(...shortR).toFixed(2).replace(/0$/, "") + "×");
+  set("mkgap-tile-long", fmt1(src("s8192").ratio));
+  const q = (F.fresh || {})["qwen4b-l1"];
+  set("mkgap-tile-qwen", q ? fmt1(q.ratio) : fmt1(F.qwen_now.ab_mk_20260706 / F.qwen_now.base));
+}
+
+function tableScores() {
+  const host = document.getElementById("mkgap-table-scores");
+  if (!host || !F) return;
+  const t = document.createElement("table");
+  t.innerHTML = "<tr><th>shape</th><th>H</th><th>L</th><th>S</th><th>mk µs (Jul 5)</th><th>base µs (Jul 5)</th><th>ratio</th><th>mk µs (Jul 6)</th><th>base µs (Jul 6)</th><th>ratio</th></tr>";
+  F.shapes.forEach(s => {
+    const a = F.matrix[s.name], b = (F.fresh || {})[s.name];
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${s.name}</td><td>${s.H}</td><td>${s.L}</td><td>${s.S}</td>` +
+      `<td>${a.mk.toFixed(1)}</td><td>${a.base.toFixed(1)}</td><td>${a.ratio.toFixed(2)}</td>` +
+      (b ? `<td>${b.mk.toFixed(1)}</td><td>${b.base.toFixed(1)}</td><td><b style="color:var(--series-1)">${b.ratio.toFixed(2)}</b></td>` : "<td>—</td><td>—</td><td>—</td>");
+    t.appendChild(tr);
+  });
+  host.appendChild(t);
+}
+
+function tableBuckets() {
+  const host = document.getElementById("mkgap-table-buckets");
+  if (!host || !F) return;
+  const t = document.createElement("table");
+  const names = F.buckets.order;
+  t.innerHTML = "<tr><th>bucket (mk/base µs)</th>" + names.map(n => `<th>${n}</th>`).join("") + "</tr>";
+  for (const k in F.buckets) {
+    if (k === "order" || k === "note") continue;
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${k}</td>` + names.map((n, i) =>
+      `<td>${F.buckets[k].mk[i]}/${F.buckets[k].base[i]}</td>`).join("");
+    t.appendChild(tr);
+  }
+  const wrap = document.createElement("div");
+  wrap.style.overflowX = "auto";
+  wrap.appendChild(t);
+  host.appendChild(wrap);
+}
+
+function tableQwen() {
+  const host = document.getElementById("mkgap-table-qwen");
+  if (!host || !F) return;
+  const q = F.qwen_now;
+  const t = document.createElement("table");
+  t.innerHTML = "<tr><th>megakernel on-path today (span µs)</th><th></th><th>baseline top kernels (µs)</th><th></th></tr>";
+  const n = Math.max(q.profile_top_now.length, q.base_top.length);
+  for (let i = 0; i < n; i++) {
+    const a = q.profile_top_now[i], b = q.base_top[i];
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${a ? a.op : ""}</td><td>${a ? a.span_us.toFixed(0) : ""}</td>` +
+      `<td style="text-align:left;font-family:var(--mono);font-size:12.5px">${b ? b.op : ""}</td><td>${b ? b.us.toFixed(0) : ""}</td>`;
+    t.appendChild(tr);
+  }
+  host.appendChild(t);
+}
+
+function fillLadder() {
+  const host = document.getElementById("mkgap-ladder");
+  if (!host || !F) return;
+  const L = F.mechanism.dx_ladder;
+  const li = document.createElement("li");
+  li.innerHTML = `<strong>dX GEMM closure ladder</strong> (${L.shape}, standalone): ` +
+    L.rungs.map(r => `${r.name} <b style="color:var(--ink)">${r.us}µs</b>`).join(" → ") +
+    ` — vs nvjet ${L.nvjet_us}µs = <b style="color:var(--series-1)">${L.final_ratio}×</b> (${L.tf}TF). ${L.note}.`;
+  host.appendChild(li);
+}
+
+/* ---------- render ---------- */
+vizStep();
+vizShapes();
+opsTable("mkgap-table-ops", OPCFG, "");
+opsTable("mkgap-table-ops-more", { name: "small", S: 1024, H: 512, V: 16384, I: 1536, nq: 8, nkv: 4, D: 64 }, "H512 · L8 · S1024 (small)");
+opsTable("mkgap-table-ops-more", { name: "qwen4b", S: 1024, H: 2560, V: 151936, I: 9728, nq: 32, nkv: 8, D: 128 }, "H2560 · S1024 (Qwen3-4B class)");
+chartGap();
+chartStack();
+chartRatio();
+chartQwen();
+vizRegPoint();
+fillTiles();
+tableScores();
+tableBuckets();
+tableQwen();
+fillLadder();
+
+/* ---------- sections: reveal, rail, keyboard ---------- */
+const slides = [...document.querySelectorAll("section.slide")];
+const rail = document.getElementById("rail");
+const actLabel = document.getElementById("act-label");
+
+const io = new IntersectionObserver(entries => {
+  for (const e of entries) {
+    if (e.isIntersecting) {
+      e.target.classList.add("in-view");
+      const i = slides.indexOf(e.target);
+      rail.querySelectorAll(".dot").forEach((d, j) => d.classList.toggle("active", j === i));
+      actLabel.replaceChildren();
+      const no = document.createElement("span"); no.className = "k"; no.textContent = e.target.dataset.act || "";
+      actLabel.appendChild(no);
+    }
+  }
+}, { threshold: 0.55 });
+
+slides.forEach((s, i) => {
+  io.observe(s);
+  const dot = document.createElement("button");
+  dot.className = "dot"; dot.title = s.dataset.act || `slide ${i + 1}`;
+  dot.setAttribute("aria-label", `Go to ${s.dataset.act || "slide " + (i + 1)}`);
+  dot.addEventListener("click", () => s.scrollIntoView({ behavior: "smooth" }));
+  rail.appendChild(dot);
+});
+
+function currentIndex() {
+  const y = window.scrollY + window.innerHeight / 2;
+  let best = 0, bd = Infinity;
+  slides.forEach((s, i) => {
+    const c = s.offsetTop + s.offsetHeight / 2;
+    if (Math.abs(c - y) < bd) { bd = Math.abs(c - y); best = i; }
+  });
+  return best;
+}
+document.addEventListener("keydown", ev => {
+  if (ev.target.closest("input, textarea, [contenteditable]")) return;
+  const i = currentIndex();
+  const next = () => slides[Math.min(i + 1, slides.length - 1)].scrollIntoView({ behavior: "smooth" });
+  const prev = () => slides[Math.max(i - 1, 0)].scrollIntoView({ behavior: "smooth" });
+  switch (ev.key) {
+    case "ArrowRight": case "ArrowDown": case "PageDown": case " ":
+      ev.preventDefault(); next(); break;
+    case "ArrowLeft": case "ArrowUp": case "PageUp":
+      ev.preventDefault(); prev(); break;
+    case "Home": ev.preventDefault(); slides[0].scrollIntoView(); break;
+    case "End": ev.preventDefault(); slides[slides.length - 1].scrollIntoView(); break;
+  }
+});
+})();
+</script>
+</body>
+</html>

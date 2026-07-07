@@ -1304,6 +1304,19 @@ Principle: scalar gmem loads inside a stage's ALU pass are chain links —
 prefetch them with the stage's bulk loads; the ablation's "loads" share is
 often the cheapest slice to delete.
 
+**Single-image 240/24 producer-df (unmeasured cell (b))** — NO-GO, measured
+(shell tax small +156.8/+137, nano +42.4/+45.8 0/40; decomposition: named
+bar.sync 1,256 = 0, flat-240 ceiling = +11.0/+8.2, remainder = WG2 residency
+~+34us at nano even PARKED in nanosleep-8192; commits 16be37e inert knob,
+logs mkv3-p4b-dfprod-*, design results/operator-gap/producer-df-design.md)
+Why: 4 extra resident warps dilute per-SM issue in the latency-bound 8-warp
+regime even when they never execute work — the cost is residency, not
+registers, spills, or barriers (all isolated).
+Principle: the 256-thread/255-reg point is the measured Pareto point against
+ALL added-warpgroup designs, parked or active; harvest loader decoupling only
+via elected threads inside consumer warps (the landed TMA feeds). Register
+architecture design space is now CLOSED by measurement.
+
 ## Meta / measurement
 
 **STACK-is-not-runtime** — STACK/res-usage is a smell, never certification.

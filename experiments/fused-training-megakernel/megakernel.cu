@@ -293,11 +293,29 @@ extern "C" __global__ void megakernel(const Instr* __restrict__ instrs,
 // loop must sync exactly the 256 consumers (WG2 never reaches the loop): the
 // ops' named barrier (bar.sync 1, 256 == consumer_sync for threads 0-255)
 // replaces __syncthreads, which would count all 384 threads and hang.
+// Round 2: the split sits at KERNEL ENTRY, before any shared code — the round-1
+// shell split after init and every consumer instruction (init, claim loop, the
+// whole op library) was allocated at the 168 entry ceiling (STACK 112 vs plain
+// 48; measured +156.8us small / +45.8us nano on GPU 3, 14x the flat-240 ceiling
+// tax). With the split first, the consumer path is dominated by the inc-240 so
+// ptxas allocates it at 240; the WG2 path (2 grid.syncs + a relaxed poll) must
+// fit its dec-24 budget. The paths NEVER reconverge (the CUTLASS/ws rule):
+// WG2 pairs with the consumers' two init grid.syncs from its own call sites
+// (cg grid.sync's internal CTA barrier is call-site agnostic), so init work
+// loops are MK_CONSUMERS-wide (identical arithmetic for all 256-thread builds).
 #if defined(MK_DF_PRODUCER) && defined(MK_DF_MAXNREG)
 #error "MK_DF_PRODUCER and MK_DF_MAXNREG are mutually exclusive (producer sets entry maxnreg 168)"
 #endif
 #if defined(MK_DF_PRODUCER) && defined(MK_OCC2)
 #error "MK_DF_PRODUCER and MK_OCC2 are mutually exclusive (384 threads vs __launch_bounds__(256,2))"
+#endif
+// MK_DF_NAMED_BAR (attribution knob): plain 256-thread df with the four
+// executor-loop __syncthreads replaced by the producer variant's bar.sync 1,256
+// (consumer_sync) — isolates the named-barrier cost from the producer topology
+// (WG2 residency, setmaxnreg partition, entry ceiling). Redundant under
+// MK_DF_PRODUCER, which already syncs on the named barrier.
+#if defined(MK_DF_NAMED_BAR) && defined(MK_DF_PRODUCER)
+#error "MK_DF_NAMED_BAR is redundant under MK_DF_PRODUCER (it already uses bar.sync 1,256)"
 #endif
 #ifdef MK_DF_PRODUCER
 #define MK_DF_NR __maxnreg__(168)
@@ -310,7 +328,11 @@ extern "C" __global__ void megakernel(const Instr* __restrict__ instrs,
 #define MK_DF_NR
 #endif
 #define MK_DF_THREADS 256
+#ifdef MK_DF_NAMED_BAR
+#define mk_df_sync() consumer_sync()
+#else
 #define mk_df_sync() __syncthreads()
+#endif
 #endif
 extern "C" __global__ void MK_LB MK_DF_NR megakernel_df(const Instr* __restrict__ instrs, int n_instr,
                                          const int* __restrict__ dep_cnt,
@@ -324,6 +346,32 @@ extern "C" __global__ void MK_LB MK_DF_NR megakernel_df(const Instr* __restrict_
                                          int bind1, unsigned long long ptr1) {
   extern __shared__ char smem[];
   cg::grid_group grid = cg::this_grid();
+#ifdef MK_DF_PRODUCER
+  // Entry warpgroup split (see the knob comment above). The branch is
+  // warpgroup-uniform, so each setmaxnreg is converged across its warpgroup as
+  // .sync.aligned requires; WG2's dec is unconditional and first, so the
+  // consumers' inc (which blocks until registers are free) cannot deadlock.
+  // WG2 skips the init WORK (the loops below are MK_CONSUMERS-wide) but calls
+  // grid.sync() twice to pair with the consumers' init grid.syncs, then parks:
+  // ld.relaxed.gpu on ctrl[1] every 8192ns keeps it off the L2 hot path. The
+  // poll starts only after the second grid.sync — before that, ctrl[1] still
+  // holds n_instr from the PREVIOUS launch (state is reused across steps) and
+  // an early read would exit WG2 into step B's producer role prematurely.
+  if (threadIdx.x >= MK_CONSUMERS) {
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 24;");
+    const int* fin = state + 5 * n_instr + 1;  // ctrl[1] = finished instr count
+    grid.sync();
+    grid.sync();
+    for (;;) {
+      int f;
+      asm volatile("ld.relaxed.gpu.global.b32 %0, [%1];" : "=r"(f) : "l"(fin) : "memory");
+      if (f >= n_instr) break;
+      __nanosleep(8192);
+    }
+    return;
+  }
+  asm volatile("setmaxnreg.inc.sync.aligned.u32 240;");  // blocks until WG2's dec frees regs
+#endif
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     if (bind0 >= 0) bufs[bind0] = reinterpret_cast<void*>(ptr0);
     if (bind1 >= 0) bufs[bind1] = reinterpret_cast<void*>(ptr1);
@@ -340,9 +388,11 @@ extern "C" __global__ void MK_LB MK_DF_NR megakernel_df(const Instr* __restrict_
   int* ctrl = state + 5 * n_instr;
 
   // init, then one sync, then seed roots (visible before anyone consumes: the tail
-  // increment in the seeding phase publishes them).
-  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_instr;
-       i += gridDim.x * blockDim.x) {
+  // increment in the seeding phase publishes them). MK_CONSUMERS-wide strides,
+  // NOT blockDim.x: under MK_DF_PRODUCER only the 256 consumers run these loops
+  // (WG2 split off above); for every other df build blockDim.x == MK_CONSUMERS.
+  for (int i = blockIdx.x * MK_CONSUMERS + threadIdx.x; i < n_instr;
+       i += gridDim.x * MK_CONSUMERS) {
     pending[i] = dep_cnt[i];
     cursor[i] = 0;
     done[i] = 0;
@@ -358,8 +408,8 @@ extern "C" __global__ void MK_LB MK_DF_NR megakernel_df(const Instr* __restrict_
     ctrl[5] = 0;  // blocks currently working cold entries (cold_cap limiter)
   }
   grid.sync();
-  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_instr;
-       i += gridDim.x * blockDim.x) {
+  for (int i = blockIdx.x * MK_CONSUMERS + threadIdx.x; i < n_instr;
+       i += gridDim.x * MK_CONSUMERS) {
     if (dep_cnt[i] == 0) {
       if (crit[i]) {
         const int t = atomicAdd(&ctrl[0], 1);
@@ -371,22 +421,6 @@ extern "C" __global__ void MK_LB MK_DF_NR megakernel_df(const Instr* __restrict_
     }
   }
   grid.sync();
-
-#ifdef MK_DF_PRODUCER
-  // Warpgroup specialization (after the last grid.sync: WG2 participated in all
-  // init loops + both grid.syncs above; no grid.sync exists below). The branch is
-  // warpgroup-uniform, so each setmaxnreg is converged across its warpgroup as
-  // .sync.aligned requires. WG2 parks on gmem ctrl[1] — the same finished-instr
-  // count the consumer claim loop exits on (vctrl[1] >= n_instr) — and never
-  // touches a consumer barrier or the op smem.
-  if (threadIdx.x >= MK_CONSUMERS) {
-    asm volatile("setmaxnreg.dec.sync.aligned.u32 24;");
-    volatile int* vfin = ctrl + 1;
-    while (*vfin < n_instr) __nanosleep(1024);
-    return;
-  }
-  asm volatile("setmaxnreg.inc.sync.aligned.u32 240;");  // blocks until WG2's dec frees regs
-#endif
 
   __shared__ int s_ins, s_t0, s_t1;
   __shared__ Instr s_I;  // claimed instr staged in smem (see the dispatch-loop note)

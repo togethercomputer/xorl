@@ -6357,6 +6357,13 @@ Validated (`mkv3-p4b-dkv-lsepre*-*.log`): S8192 **6747/6750/6748 vs
 (two contaminated co-tenant reads discarded at 12.5/16.7ms); S4096 and small
 neutral; tests green, losses bit-identical; errors match head references.
 
+Producer-df (240/24) CLOSED NO-GO: shell tax decomposed on clean GPU 3 —
+named-barrier 0, 240-ceiling +11/+8, parked-WG2 residency ~+34us nano (~5%);
+even a nanosleep-parked warpgroup dilutes issue in this regime. Full record:
+IMPROVEMENTS.md entry + results/operator-gap/producer-df-design.md. Knob
+stack kept inert (MK_DF_MAXNREG, MK_DF_PRODUCER, MK_DF_NAMED_BAR) as no-go
+evidence + future attribution tools.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

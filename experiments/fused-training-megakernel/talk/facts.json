@@ -1,0 +1,113 @@
+{
+  "meta": {
+    "topic": "fused training megakernel vs compile+CUDAGraph+ operator gap",
+    "matrix_window": "2026-07-05 ~21-23Z, clean-GPU window, fresh process per shape, megakernel-opgap branch",
+    "matrix_source": "results/operator-gap/score_*.json + xorl-oss-opgap/results/operator_gap_report.md",
+    "fresh_window": "2026-07-06 21:00-21:35Z, head 53eeb23 (small/qwen re-runs at 005ad84, which only widens the H256 qkrope-n128 gate at S3072/4096), fresh process per shape, GPU-util+memory guards; dirty windows re-run, never hand-corrected",
+    "qwen_l1_dispersion": "qwen4b-l1 same-day clean windows measured mk 9080 and 9586 us (1.26x / 1.34x; baseline stable at ~7.15-7.18ms) - giant-shape medians disperse ~5% across windows; H256 shapes reproduce <1%",
+    "fresh_source": "scratchpad sweep log (score_shape.py, bench.py-verbatim recipe)",
+    "baseline_def": "torch.compile(mode=max-autotune-no-cudagraphs) + foreach grad zero + whole-step manual CUDA graph replay (bench.py hardened arm)",
+    "timing": "CUDA-event median of 50, one H100, bf16 Qwen3 architecture, step = fwd+bwd+grad-zero"
+  },
+  "shapes": [
+    {"name": "s128",      "H": 256,  "L": 4,  "S": 128,  "D": 64,  "V": 8192,   "I": 768,  "nq": 4,  "nkv": 2, "axis": "seq"},
+    {"name": "s256",      "H": 256,  "L": 4,  "S": 256,  "D": 64,  "V": 8192,   "I": 768,  "nq": 4,  "nkv": 2, "axis": "seq"},
+    {"name": "nano",      "H": 256,  "L": 4,  "S": 512,  "D": 64,  "V": 8192,   "I": 768,  "nq": 4,  "nkv": 2, "axis": "seq"},
+    {"name": "s1024",     "H": 256,  "L": 4,  "S": 1024, "D": 64,  "V": 8192,   "I": 768,  "nq": 4,  "nkv": 2, "axis": "seq"},
+    {"name": "s2048",     "H": 256,  "L": 4,  "S": 2048, "D": 64,  "V": 8192,   "I": 768,  "nq": 4,  "nkv": 2, "axis": "seq"},
+    {"name": "s3072",     "H": 256,  "L": 4,  "S": 3072, "D": 64,  "V": 8192,   "I": 768,  "nq": 4,  "nkv": 2, "axis": "seq"},
+    {"name": "s4096",     "H": 256,  "L": 4,  "S": 4096, "D": 64,  "V": 8192,   "I": 768,  "nq": 4,  "nkv": 2, "axis": "seq"},
+    {"name": "s8192",     "H": 256,  "L": 4,  "S": 8192, "D": 64,  "V": 8192,   "I": 768,  "nq": 4,  "nkv": 2, "axis": "seq"},
+    {"name": "deep",      "H": 256,  "L": 12, "S": 512,  "D": 64,  "V": 8192,   "I": 768,  "nq": 4,  "nkv": 2, "axis": "depth"},
+    {"name": "small",     "H": 512,  "L": 8,  "S": 1024, "D": 64,  "V": 16384,  "I": 1536, "nq": 8,  "nkv": 4, "axis": "hidden"},
+    {"name": "qwen4b-l1", "H": 2560, "L": 1,  "S": 1024, "D": 128, "V": 151936, "I": 9728, "nq": 32, "nkv": 8, "axis": "hidden"},
+    {"name": "qwen4b-l2", "H": 2560, "L": 2,  "S": 1024, "D": 128, "V": 151936, "I": 9728, "nq": 32, "nkv": 8, "axis": "hidden"}
+  ],
+  "matrix": {
+    "s128":      {"mk": 739.3,   "base": 428.8,  "ratio": 1.724},
+    "s256":      {"mk": 814.3,   "base": 552.1,  "ratio": 1.475},
+    "nano":      {"mk": 912.0,   "base": 581.4,  "ratio": 1.569},
+    "s1024":     {"mk": 1224.3,  "base": 790.8,  "ratio": 1.548},
+    "s2048":     {"mk": 1778.6,  "base": 978.0,  "ratio": 1.819},
+    "s3072":     {"mk": 2483.5,  "base": 1263.4, "ratio": 1.966},
+    "s4096":     {"mk": 3144.1,  "base": 1503.8, "ratio": 2.091},
+    "s8192":     {"mk": 7009.7,  "base": 3047.0, "ratio": 2.301},
+    "deep":      {"mk": 2371.6,  "base": 1572.4, "ratio": 1.508},
+    "small":     {"mk": 3472.6,  "base": 1772.2, "ratio": 1.96},
+    "qwen4b-l1": {"mk": 29094.2, "base": 7191.2, "ratio": 4.046},
+    "qwen4b-l2": {"mk": 35318.9, "base": 8646.0, "ratio": 4.085}
+  },
+  "fresh": {},
+  "buckets": {
+    "order": ["s128", "s256", "nano", "s1024", "s2048", "s3072", "s4096", "s8192", "deep", "small", "qwen4b-l1", "qwen4b-l2"],
+    "note": "megakernel = realized-critical-path on-path us (profile_df attribution); baseline = median nsys graph-node replay active+gap us per operator family. Trace shares only; absolute step totals come from CUDA-event score runs.",
+    "attn_fwd":     {"mk": [41, 52, 77, 125, 179, 255, 369, 1110, 223, 261, 1762, 3093],  "base": [45, 51, 58, 78, 109, 147, 182, 505, 173, 149, 36, 70]},
+    "attn_bwd_all": {"mk": [57, 69, 85, 133, 278, 520, 783, 2605, 252, 436, 1431, 2771],  "base": [97, 113, 138, 188, 278, 384, 485, 1236, 410, 374, 120, 240]},
+    "gemm_fwd":     {"mk": [201, 213, 239, 298, 379, 557, 572, 967, 615, 836, 4502, 5558], "base": [59, 63, 69, 83, 107, 138, 157, 263, 193, 243, 1317, 1627]},
+    "gemm_dx":      {"mk": [247, 168, 249, 390, 527, 602, 739, 1086, 659, 1033, 5766, 8619], "base": [65, 44, 57, 87, 93, 118, 135, 130, 154, 184, 286, 579]},
+    "gemm_dw":      {"mk": [0, 101, 37, 0, 0, 0, 0, 188, 112, 211, 0, 0],                  "base": [48, 79, 80, 84, 115, 158, 186, 335, 229, 259, 1323, 1636]},
+    "rowop_fwd":    {"mk": [74, 74, 73, 81, 93, 118, 136, 233, 202, 186, 205, 338],        "base": [40, 42, 44, 53, 48, 71, 77, 104, 129, 97, 52, 93]},
+    "rowop_bwd":    {"mk": [81, 84, 87, 118, 203, 273, 336, 560, 256, 422, 646, 1384],     "base": [95, 118, 134, 148, 154, 209, 232, 320, 389, 299, 113, 232]},
+    "ce":           {"mk": [13, 17, 24, 33, 71, 109, 148, 293, 24, 56, 331, 331],          "base": [11, 14, 38, 44, 54, 88, 103, 192, 19, 54, 414, 419]},
+    "embed":        {"mk": [7, 16, 12, 23, 31, 47, 60, 116, 22, 42, 14342, 12990],         "base": [2, 2, 2, 2, 3, 3, 4, 6, 2, 3, 14, 13]},
+    "support":      {"mk": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],                            "base": [81, 80, 84, 84, 72, 86, 85, 74, 222, 215, 2259, 2547]},
+    "other":        {"mk": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],                            "base": [2, 2, 3, 2, 2, 2, 2, 2, 2, 5, 1181, 1184]}
+  },
+  "s8192_attn_bwd": {"wait_us": 2089.9, "span_us": 514.8, "cudnn_bprop_us": 1136.8, "op": "ATTN_DKV_WG x16 (banded)"},
+  "s8192_lm_head":  {"mk_us": 440.2, "nvjet_us": 66.3},
+  "qwen_now": {
+    "note": "qwen4b-l1 movement since the matrix window: D=128 WGMMA attention trio replaced the WMMA fallback (~-3.4ms), n256/head-dX/cold-cap giant-shape rounds + CE-bwd label fixup; paired A/B step at head 3e08bc2 era: 9103us default arm",
+    "matrix_mk": 29094.2, "ab_mk_20260706": 9103.1, "base": 7191.2,
+    "profile_top_now": [
+      {"op": "lm_head dX  GEMMNN 1024x2560x151936", "span_us": 2636.6},
+      {"op": "lm_head fwd GEMMNT 1024x151936x2560", "span_us": 2479.3},
+      {"op": "mlp gate/up dX GEMMNN 1024x2560x19456", "span_us": 467.1},
+      {"op": "mlp down dX GEMMNN 1024x9728x2560", "span_us": 335.6},
+      {"op": "ATTN_DQ_WG128 (was 1431us ATTN_DQ fallback)", "span_us": 99.4}
+    ],
+    "base_top": [
+      {"op": "lm_head fwd nvjet coopB TNT", "us": 1015.7},
+      {"op": "lm_head dW nvjet coopB NTT", "us": 1015.1},
+      {"op": "lm_head dX-class nvjet coopB NNT", "us": 939.2},
+      {"op": "AccumulateGrad elementwise x11", "us": 1712.4}
+    ]
+  },
+  "mechanism": {
+    "gpu_metrics": {"sm_issue_pct": 19, "warps_in_flight_pct": 12, "unallocated_warp_slots_pct": 87, "dram_rw_pct_lt": 10,
+      "source": "nsys gpu-metrics sampled inside the megakernel window (small, 5 steps, clean GPU)"},
+    "register_point": {"threads": 256, "regs_per_thread": 255, "regfile_per_sm": 65536, "blocks": 132, "blocks_per_sm": 1,
+      "nvjet_dx_point": "384 threads @ 168 regs + 24-reg dedicated TMA producer warpgroup",
+      "cudnn_point": "warp-specialized flash bprop, own launch shape per S"},
+    "dx_ladder": {"shape": "s8192 dX-head 8192x256x8192", "rungs": [
+      {"name": "BN64 + syncthreads pipeline", "us": 187.9},
+      {"name": "fat 128x128 tiles", "us": 117.5},
+      {"name": "mbarrier ring (decoupled issue)", "us": 90.9},
+      {"name": "TMA feed", "us": 87.3},
+      {"name": "producer warpgroup 384/168", "us": 69.1}
+    ], "nvjet_us": 67.2, "final_ratio": 1.03, "tf": 497,
+      "note": "standalone probe ladder; in-model today: SW128 + wave-gated n128/n256 fat tiles + gated mbarrier rings + split-K routing — the producer-warpgroup rung is the unreachable remainder (register accounting)"},
+    "nt_floor": {"mk_us": 146, "nvjet_us": 86.8, "ratio": 1.66,
+      "note": "s8192 NT lm_head: identical traffic, 100% L2 write-hit both sides; nvjet 48% vs our 24% DRAM writeback rate — memory-system behavior, closed against every SM-side mechanism"},
+    "attn_standalone": {"note": "D=64 attention ops are FA-class standalone (fwd 35us, dKV 45us, dQ 30us at small shapes ~ flash parity); in-model instruction tax +30-50% is the latency environment, not op quality"},
+    "baseline_support_tax_us": [70, 220], "qwen_accumgrad_us": 1712,
+    "laws": [
+      {"name": "Only chain-shortening pays", "detail": "weight-stationary smem residency 0.91x, deep K-rings, FA2-style pipelining, MPK prefetch, register-resident reuse — all measured slower in the 8-warp regime; wins came from fusion, register feeds, boundary removal, banding"},
+      {"name": "One register point", "detail": "256 threads x 255 regs = the 64K regfile exactly; every add-warps design pays fat-path registers; nvjet routes per family across register points, the megakernel cannot"},
+      {"name": "Wave quantization", "detail": "132 blocks = one wave; tile counts quantize to 132; banding wins iff band tiles stay near <=132 or total work >> one wave"}
+    ]
+  },
+  "provenance": {
+    "matrix_sha_range": "f6b1f85..0e65676 (megakernel-opgap)",
+    "noise": "baseline graph+ medians bounce +-8% across clean windows; megakernel steps bounce <1% — ratio second decimals are noise",
+    "trace_caveat": "nsys node-mode inflates replay walls ~10%; per-kernel shares only, absolute totals from CUDA events",
+    "logs": [
+      "results/operator-gap/score_*.json, mk_*.jsonl, baseline_*.csv (12-shape matrix)",
+      "results/mkv3-p4b-score-full-d64noinline-20260706T061633Z.log (certified 7-shape, GPU 6)",
+      "results/mkv3-p4b-score-small-current-88dfafb-20260706T2000Z.log",
+      "results/mkv3-p4b-profile-s8192-qkrope-n128-20260706T2034Z.log",
+      "results/mkv3-p4b-qwen-cefix-*-20260706T1914Z.log (paired A/B + fresh profile)",
+      "results/operator-gap/gemmb-probe-round5.md (dX ladder), round9-10 (NT floor)",
+      "NOTES.md gpu-metrics verdict (SM issue 19% / warps 12% / DRAM <10%)"
+    ]
+  }
+}
