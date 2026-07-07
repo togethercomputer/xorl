@@ -176,6 +176,23 @@ def main():
                 p.add_((-0.5 * m.grads[k]).to(torch.bfloat16))
     print(f"training sanity: loss {first:.4f} -> {last:.4f} over 40 SGD steps")
     assert last < first - 2.0, "megakernel gradients do not learn"
+
+    # same loop through graph REPLAY: in-place param updates (p.add_) must be
+    # visible to the next replay (production launches under a step graph)
+    m2 = MKQwen3(cfg, seed=0)
+    greplay = m2.make_graphed_step(tokens, labels)
+    first = last = None
+    for it in range(40):
+        loss = greplay()
+        torch.cuda.synchronize()
+        if it == 0:
+            first = loss.item()
+        last = loss.item()
+        with torch.no_grad():
+            for k, p in m2.params.items():
+                p.add_((-0.5 * m2.grads[k]).to(torch.bfloat16))
+    print(f"graphed training sanity: loss {first:.4f} -> {last:.4f} over 40 replay steps")
+    assert last < first - 2.0, "graphed-step replays do not learn"
     print("ALL MODEL TESTS PASSED")
 
 
