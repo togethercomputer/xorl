@@ -1183,6 +1183,22 @@ Principle: between measuring a knob win and committing its flip, re-check
 what landed; a verdict is only valid at the structure it was measured on
 (the resweep law applies at commit time, not just probe time).
 
+**df2 region-gating at the qwen class (parked-verdict carve-out probe)** —
+NO-GO vs pdf; MECHANISM CONFIRMED at l2
+(df2 vs pdf +772/+1260us 0/12 both shapes; df2 vs df CROSSES SIGN: -381/-252us
+at l2 vs +165/+262 at l1 and +300-400 at the original nano/small park;
+`mkv3-p4b-df2qwen-scope-k8s-20260707T0735Z.log`,
+results/operator-gap/df2-qwen-scope-close.md)
+Why: the parked verdict said tile-granular deps eat only the QUEUEING share
+of span and nano/small have none; qwen-l2's 2-layer giant-row chain (80-320
+tile rows on 132 blocks) does have one, so gating pays ~300us on the df
+base — but the df2 wakeup/bounded-claim machinery costs more than that
+relative to the pdf executor.
+Principle: a parked verdict's own carve-out is a measurement obligation once
+a shape in that regime exists; and mechanism-wins do not survive being
+attached to a superseded executor — port the mechanism (pdf+gates), not the
+old vehicle.
+
 ## Register architecture / warp specialization
 
 (Consolidates the megakernel-paper-style "reallocate registers from task
