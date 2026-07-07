@@ -21,13 +21,51 @@ from typing import Any, Dict, Tuple
 import torch
 import triton
 import triton.language as tl
+from triton.runtime.errors import OutOfResources
+
+from xorl.ops.bi_gemm_configs import baseline_mm_config, lookup_mm_config
 
 
 # --- Stubs for SGLang-internal imports ---------------------------------------
-# Force the pure-Triton matmul path (no DeepGEMM). DeepGEMM is an alternate
-# bf16 GEMM backend that is NOT the batch-invariant Triton kernel, so disabling
-# it guarantees every mm/addmm goes through matmul_kernel_persistent.
-ENABLE_JIT_DEEPGEMM = False
+# DeepGEMM's bf16 NN GEMM is admitted only after a bitwise comparison with the
+# pinned persistent kernel. Detection stays lazy so importing this module does
+# not initialize CUDA.
+_DEEPGEMM_READY: bool | None = None
+
+
+def _deepgemm_ready() -> bool:
+    global _DEEPGEMM_READY
+    if _DEEPGEMM_READY is None:
+        try:
+            import deep_gemm  # noqa: F401, PLC0415
+
+            _DEEPGEMM_READY = (
+                torch.cuda.is_available()
+                and torch.cuda.get_device_capability()[0] >= 9
+                and hasattr(deep_gemm, "bf16_gemm_nn")
+            )
+        except Exception:  # noqa: BLE001
+            _DEEPGEMM_READY = False
+    return _DEEPGEMM_READY
+
+
+ENABLE_JIT_DEEPGEMM = True
+
+# Triton's epilogue shared-memory use varies by version. Remember table entries
+# that fail at launch and fall back to the pinned baseline for that shape.
+_MM_CONFIG_OOM_SHAPES: set[tuple] = set()
+
+
+def _launch_with_config_fallback(launch, dtype, M, N, K, out_itemsize=None):
+    key = (str(dtype), M, N, K, out_itemsize)
+    if key in _MM_CONFIG_OOM_SHAPES:
+        launch(baseline_mm_config(dtype))
+        return
+    try:
+        launch(lookup_mm_config(dtype, M, N, K, out_itemsize=out_itemsize))
+    except OutOfResources:
+        _MM_CONFIG_OOM_SHAPES.add(key)
+        launch(baseline_mm_config(dtype))
 
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
@@ -45,7 +83,10 @@ def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
 # -----------------------------------------------------------------------------
 
 
-_ENABLE_MM_DEEPGEMM = get_bool_env_var("SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM", "1")
+_ENABLE_MM_DEEPGEMM = get_bool_env_var(
+    "XORL_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM",
+    os.getenv("SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM", "1"),
+)
 # If true, allows to fallback to batch variant gemm when the shape cannot be run in DeepGEMM
 _ENABLE_MM_FALLBACK_VARIANT = get_bool_env_var("SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT", "0")
 _ENABLE_MM_COMPARISON_TEST = get_bool_env_var("SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST")
@@ -236,54 +277,32 @@ def _matmul_persistent_triton(a: torch.Tensor, b: torch.Tensor, bias: torch.Tens
             ),
         )
 
-    configs = {
-        torch.bfloat16: {
-            "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 64,
-            "GROUP_SIZE_M": 8,
-            "num_stages": 3,
-            "num_warps": 8,
-        },
-        torch.float16: {
-            "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 256,
-            "BLOCK_SIZE_K": 64,
-            "GROUP_SIZE_M": 8,
-            "num_stages": 3,
-            "num_warps": 8,
-        },
-        torch.float32: {
-            "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 32,
-            "GROUP_SIZE_M": 8,
-            "num_stages": 3,
-            "num_warps": 8,
-        },
-    }
-    # print(a.device, b.device, c.device)
-    matmul_kernel_persistent[grid](
-        a,
-        b,
-        c,  #
-        bias,
-        M,
-        N,
-        K,  #
-        a.stride(0),
-        a.stride(1),  #
-        b.stride(0),
-        b.stride(1),  #
-        c.stride(0),
-        c.stride(1),  #
-        NUM_SMS=NUM_SMS,  #
-        A_LARGE=a.numel() > 2**31,
-        B_LARGE=b.numel() > 2**31,
-        C_LARGE=c.numel() > 2**31,
-        HAS_BIAS=bias is not None,
-        **configs[dtype],
-    )
+    # BLOCK_SIZE_K stays pinned because it owns accumulation order. The other
+    # axes are selected from the bitwise-gated shape table for performance.
+    def _launch(config):
+        matmul_kernel_persistent[grid](
+            a,
+            b,
+            c,
+            bias,
+            M,
+            N,
+            K,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            c.stride(0),
+            c.stride(1),
+            NUM_SMS=NUM_SMS,
+            A_LARGE=a.numel() > 2**31,
+            B_LARGE=b.numel() > 2**31,
+            C_LARGE=c.numel() > 2**31,
+            HAS_BIAS=bias is not None,
+            **config,
+        )
+
+    _launch_with_config_fallback(_launch, dtype, M, N, K)
     return c
 
 
@@ -315,12 +334,12 @@ def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | Non
 
     if (
         _ENABLE_MM_DEEPGEMM
-        and ENABLE_JIT_DEEPGEMM
         and (a.dtype == torch.bfloat16)
         and (b.dtype == torch.bfloat16)
         and a.is_contiguous()
         and b.transpose(0, 1).is_contiguous()
         and N >= MIN_DEEPGEMM_DIM
+        and _deepgemm_ready()
     ):
         if _ENABLE_MM_COMPARISON_TEST:
             out_triton = _matmul_persistent_triton(a=a, b=b, bias=bias)
