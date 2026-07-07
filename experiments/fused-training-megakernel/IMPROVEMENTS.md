@@ -950,6 +950,18 @@ Principle: fusion pays only if the consumer's dependency lands with the
 PRODUCER (true hop deletion) or deletes real traffic; count chain hops before
 building.
 
+**Epilogue fusion phase 2 (MLP `xn2` deletion via scaled dW B-load)** — NO-GO
+(H512/L1/S1024/V4096 `MK_EPIFUSE_MLP=1`: +16.32/+15.58us, 1/40+0/40; attr:
+fwd +1.01/+4.26, bwd +9.63/+17.20; note
+`results/operator-gap/rowop-epifuse-phase2-nogo.md`)
+Why: correctness holds, but deleting `xn2` requires the generic WGMMA TN
+B-load to materialize `x2 * rstd2 * w2` elementwise; that scaled-load path is
+the measured loser. The forward row-scale/rstd-only half is only neutral and
+cannot delete traffic alone.
+Principle: buffer-deletion fusion pays only if the replacement consumer can
+absorb the transformation cheaply; moving rowop math into an exposed operand
+feed is still on-path arithmetic, not free traffic deletion.
+
 **head-dX SKR in-model port (splitK + separate reduce)** — WIN small skr=2
 (-115/-112 40/40 x4, 193a108), nano/deep skr=4 (-12, -31/-35; 0abc08f);
 NO-GO s128/s256 (+36/+12: n128 tile collapses at M<=256), s1024 (noise),
@@ -987,6 +999,18 @@ Principle: exact-shape gates rot in BOTH directions — after any structural
 promotion, re-run the cheap env probes for neighboring REJECTED routes at the
 affected shapes; 4 of this session's 6 promotions were resweep flips found by
 2-run env A/Bs.
+
+**lm_head fwd n256 short-S boundary at 9199394** — NO-GO for forced n256 at
+s128/s256; nano weak/noise, keep current gates (s128 +37.20/+21.50us 0/80
+both-ish; s256 +14.96/+11.50us 1/80+4/80; nano -4.22/-0.40us 66/80+47/80;
+job `lmhead-n256-boundary-9199394-2325`, note
+`results/operator-gap/lmhead-n256-short-boundary-9199394-nogo.md`)
+Why: the n256 direct route still needs enough rows to fill its fatter tile;
+s128/s256 expose pure underfill, and nano's tiny one-order movement is below
+the promotion bar after the current idle/SKR route state.
+Principle: route-boundary resweeps should close both sides of the boundary.
+Decisive neighbor losses and sub-noise middle movement mean keep the gate, not
+promote an exact-shape exception.
 
 ## Numerics / approximation
 
@@ -1177,6 +1201,26 @@ producer dividend, IF the mailbox handoff beats elected-thread issue
 in-model. Cell (b) is now BUILT (megakernel_pdf, worktree xorl-oss-pdf240,
 session e5225c66) — measurement in flight.
 
+**Producer-df executor (megakernel_pdf: 384thr, consumers inc-240, WG2 =
+pure TMA producer via smem mailbox)** — WIN at TMA-row shapes / NO-GO
+short-S (head-rebased e8837a5, k8s both orders + GPU-5 profile, parity
+clean: qwen4b-l1 -1056/-1127us 12/12 with lm-head dX span 2453->1680 (-32%);
+qwen4b-l2 -1511/-1370us 12/12 on top of the l2 gemm-cluster promotion;
+s3072 -21us 40/40+39/40; s8192 -165us 16/16 at head; small +145us 0/40.
+Session e5225c66, logs mkv3-p4b-pdf240-*-head-20260706T2345Z.log)
+Why: the WG2 producer (dec-24 region, R18 used) replays each posted tile's
+full stage schedule gated only by ring empties — issue decouples from the
+consumers' mma cadence, the exact serialization the long-D64 elected-feed
+no-go isolated. Separately, the region-compiled 240 image wins ~-405us at
+qwen while MK_DF_MAXNREG=240 (flat entry cap, 256thr df) is +30/+44us
+WORSE — the shell, not the lower ceiling, carries the phase-1 win.
+Principle: (1) the round-5 producer topology IS reachable inside the
+one-image megakernel — as a per-SHAPE executor mode, not a uniform library
+point; register-point routing extends to executors (gate mode=pdf like a
+knob); (2) requests strictly serial per block make the mailbox ordering
+free (tile T+1 posts program-order after T's last full-wait); racecheck
+shows only the by-design acquire/release class, synccheck 0.
+
 **ptxas setmaxnreg REGION IDIOM (CUDA 13.1)** — TOOLCHAIN LAW (measured on
 megakernel_pdf, 2026-07-06; board entry has the SASS evidence)
 ptxas honors a setmaxnreg.inc region ONLY in the ws/CUTLASS idiom: the inc'd
@@ -1295,3 +1339,26 @@ by hashing instruction streams/claims/deps across all 11 gauntlet shapes
 Principle: measured gates accrete into unmaintainable expressions — relocate
 them behind a hash-verified refactor so retunes edit one line, and keep each
 gate at the exact dimensionality it was measured under.
+
+**s3072/s4096 post-SKR knob resweep (R4 round, session b603d819)** — ALL
+DEFAULTS STAND (bwd band: s3072 12/+43, 20/-2.5 81/120 sub-noise, 24/wash;
+s4096 24/+67, 32/+65; fwd band: s3072 24/wash, 40/+34; s4096 20/+18, 24/+11;
+dq_first +47/+50 0/40 both; idle 64/32 wash-to-sub-noise both shapes;
+mkv3-p4b-resweep-*.log)
+Why: the SKR promotion moved head-dX off the path but the s3072/s4096 chains
+are ATTN_DQ-wait-bound (305/536us wait) — knob nudges reshuffle slack, not
+throughput.
+Principle: a 40-rep -6..-10us "win" that fails at 120 reps is the noise rule
+working — always escalate marginal band/idle candidates to 120+ reps before
+promoting.
+
+**OP_SKR_REDUCE fatter chunks (claim-tax hypothesis)** — NO-GO/ABSORBED
+(chunk 8192/16384/32768 at s4096 all ±3us 17-26/40; s3072 16384 -5.9 29/40
+sub-noise; patch parked at results/skr_reduce_chunk_probe_b603d819.patch)
+Why: the reduce shows 122.7us on-path span at s4096 (256 one-shot 4096-elem
+tiles), but shrinking it buys nothing — the chain sits in a 536us ATTN_DQ
+wait-slack regime that absorbs on-path hop savings (exposure logic beats the
+span model).
+Principle: profile "on-path span" is not automatically exposed time — check
+the WAIT column of the surrounding chain before optimizing a hop; in
+wait-slack regimes only the wait producer itself is worth attacking.
