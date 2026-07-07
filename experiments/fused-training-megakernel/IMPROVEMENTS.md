@@ -1217,6 +1217,22 @@ instrument after any dW-body/bandwidth win (it is in-tree, default off,
 zero-cost when off); the remaining join wait is dependency-structural
 (the last dX hop), which is the pdf+gates lane's territory.
 
+**S3072 D64 dQ fp32-P pack boundary promotion** — WIN
+(current-head clean rerun at `063a9dd`: variant-first
+`MK_ATTN_DQ_FP32_P=1` -10.29us, 77/80 wins, worst grad rel 0.006525;
+default-first -15.39us, 80/80 wins, worst grad rel 0.005962; promoted default
+vs forced-old `MK_ATTN_DQ_FP32_P=0` confirmed old path is slower by +12.46us,
+old wins 3/40; logs
+`mkv3-p4b-s3072-dqfp32p-{variantfirst,defaultfirst}-clean-063a9dd-20260707T071{0,5}Z.log`,
+`mkv3-p4b-s3072-dqfp32p-gate-forceold-063a9dd-20260707T0720Z.log`)
+Why: S8192's fp32-P dS pack also pays at the S3072 boundary after the later
+body/gate composition, while S4096 remains neutral from the prior sweep.
+The default gate now covers exact H256/D64 S3072 and S8192 only; the
+`MK_ATTN_DQ_FP32_P=0/1` env override still forces old/new for A/B.
+Principle: do not promote from a single order, but do reopen boundary shapes
+after downstream long-S route composition changes; the same local mechanism can
+cross from too small to measurable once the realized path is better balanced.
+
 ## Register architecture / warp specialization
 
 (Consolidates the megakernel-paper-style "reallocate registers from task
