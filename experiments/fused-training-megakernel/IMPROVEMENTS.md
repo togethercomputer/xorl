@@ -1261,6 +1261,22 @@ on a sink, measure the sink's exclusive gap before scheduling around it.
 Candidate mechanism for the next claimant: m128-pair tiles sharing B at the
 existing 128-acc budget (halves B traffic + per-output tax, no 160KB page).
 
+**m-wider dW pair tiles (shared-B, fewer boundaries)** — NO-GO, mechanism
+refuted + gap re-decomposed
+(m192-pair +8.1/+2.4% vs control; m256-pair = register wall, 65536 accs =
+the whole register file, +378%; raw control 2055us = 23.0us/tile vs the
+megakernel's 2631us exclusive and nvjet's 1015us;
+results/operator-gap/lmdw-pair-probe-refute.md)
+Why: per-tile boundary cost was not the dW tax — ~22% of the exclusive gap
+is interpreter/route overhead that vanishes in a bare kernel, and the rest
+is steady-state mainloop rate (907 vs ~1840 GB/s), the producer-feed class.
+Principle: (1) a 256x256 fp32 accumulator tile cannot exist on sm90 — pair
+designs must stay <=192 rows and it does not pay; (2) before designing
+around per-tile fixed costs, reproduce them in a bare kernel — interpreter
+tax and body tax decompose differently; (3) the dW steady-loop gap points
+at extending the pdf WG2 producer feed to TN dW rows (handed to the
+producer-feed owners).
+
 ## Register architecture / warp specialization
 
 (Consolidates the megakernel-paper-style "reallocate registers from task
