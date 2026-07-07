@@ -507,6 +507,7 @@ def load_ext(
     gemm_direct_bf16_epilogue=None,
     head_dx_skr=0,
     pdf_producer=0,
+    pdf_d64_feed=None,
 ):
     # MK_OCC2=1 builds the 256-thread executors with __launch_bounds__(256, 2):
     # 2 blocks/SM (128-reg ceiling, ptxas spills the fat op paths). Motivated by the
@@ -606,6 +607,10 @@ def load_ext(
     pdf_regs = int(os.environ.get("MK_PDF_REGS", "240"))
     pdf_dec = int(os.environ.get("MK_PDF_DEC", "24"))
     pdf_producer = int(os.environ.get("MK_PDF_PRODUCER", int(bool(pdf_producer))))
+    pdf_d64_feed = int(os.environ.get(
+        "MK_PDF_D64_FEED",
+        "0" if pdf_d64_feed is None else str(int(bool(pdf_d64_feed))),
+    ))
     if pdf_producer:
         pdf = 1
     assert not pdf or 8 * pdf_regs + 4 * pdf_dec <= 2048, "pdf register pool infeasible"
@@ -665,6 +670,7 @@ def load_ext(
     else:
         gemm_d64_tma = 0 if gemm_d64_tma is None else int(bool(gemm_d64_tma))
     gemm_d64_tma = int(bool(gemm_mbar_ring and gemm_d64_tma))
+    pdf_d64_feed = int(bool(pdf_producer and gemm_d64_tma and pdf_d64_feed))
     gemm_direct_bf16_epilogue = int(
         os.environ.get(
             "MK_GEMM_DIRECT_BF16_EPILOGUE",
@@ -700,7 +706,8 @@ def load_ext(
         + ("_hdskr" if head_dx_skr else "")
         + (f"_pdf{pdf_regs}" if pdf else "")
         + (f"d{pdf_dec}" if pdf and pdf_dec != 24 else "")
-        + ("p" if pdf_producer else ""),
+        + ("p" if pdf_producer else "")
+        + ("_pd64f" if pdf_d64_feed else ""),
         sources=[os.path.join(_DIR, "megakernel.cu")],
         extra_ldflags=["-lcuda"],
         extra_cuda_cflags=[
@@ -744,7 +751,8 @@ def load_ext(
         + (["-DMK_GEMM_DIRECT_BF16_EPILOGUE"] if gemm_direct_bf16_epilogue else [])
         + (["-DMK_HEAD_DX_SKR"] if head_dx_skr else [])
         + (["-DMK_PDF", f"-DMK_PDF_REGS={pdf_regs}", f"-DMK_PDF_DEC={pdf_dec}"] if pdf else [])
-        + (["-DMK_PDF_PRODUCER"] if pdf_producer else []),
+        + (["-DMK_PDF_PRODUCER"] if pdf_producer else [])
+        + (["-DMK_PDF_D64_FEED"] if pdf_d64_feed else []),
         verbose=verbose,
     )
 

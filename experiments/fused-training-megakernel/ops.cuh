@@ -548,7 +548,7 @@ struct MkPdfFeed {
   uint64_t* bfull;
   uint64_t* bempty;
   int a_stride, b_stride;  // per-stage slab strides (bytes)
-  int m0, n0, iters, stages, a_t, bk;
+  int m0, n0, iters, stages, a_t, b_t, bk, k_base, kind;
   unsigned expect_bytes;
   int active;
   int halt;
@@ -556,8 +556,14 @@ struct MkPdfFeed {
 };
 __shared__ MkPdfFeed g_pdf_feed;
 
-// The feed only functions when the n256 TMA machinery is compiled in.
+// The feed functions for n256-TMA, and optionally for D64-TMA probe builds.
 #ifdef MK_GEMM_N256_TMA
+#define MK_PDF_N256_FEED 1
+#endif
+#if defined(MK_GEMM_D64_TMA) && defined(MK_PDF_D64_FEED)
+#define MK_PDF_D64_TMA_FEED 1
+#endif
+#if defined(MK_PDF_N256_FEED) || defined(MK_PDF_D64_TMA_FEED)
 #define MK_PDF_FEED 1
 #endif
 
@@ -956,7 +962,7 @@ __device__ __noinline__ void op_gemm_wgmma_n256_nn_f32_impl(const Instr& I, int 
     }
   }
   consumer_sync();
-#ifdef MK_PDF_FEED
+#ifdef MK_PDF_N256_FEED
   // producer-df: hand the whole stage schedule to the WG2 producer; consumers
   // keep only wait-full -> mma -> arrive-empty. The post is release-ordered
   // AFTER the barrier init consumer_sync above, so the producer never sees a
@@ -982,7 +988,10 @@ __device__ __noinline__ void op_gemm_wgmma_n256_nn_f32_impl(const Instr& I, int 
     F.iters = iters;
     F.stages = STAGES;
     F.a_t = a_t ? 1 : 0;
+    F.b_t = 0;
     F.bk = WG_BK;
+    F.k_base = 0;
+    F.kind = 0;
     F.expect_bytes = 49152;
     mk_pdf_st_release(&F.seq, F.seq + 1);
   }
@@ -1011,7 +1020,7 @@ __device__ __noinline__ void op_gemm_wgmma_n256_nn_f32_impl(const Instr& I, int 
     issue_stage(t * WG_BK, st);
     wg_mbar_arrive_cpasync(&bfull[st]);
   };
-#ifdef MK_PDF_FEED
+#ifdef MK_PDF_N256_FEED
   if (!pdf_feed)
 #endif
   {
@@ -1035,7 +1044,7 @@ __device__ __noinline__ void op_gemm_wgmma_n256_nn_f32_impl(const Instr& I, int 
       wg_mma_ktile_n256<SG::MMA_64x256x16_F32BF16BF16_SS<SG::Major::K, SG::Major::MN>>(
           da, db, d);
     wg_mbar_arrive(&bempty[st]);
-#ifdef MK_PDF_FEED
+#ifdef MK_PDF_N256_FEED
     if (!pdf_feed)
 #endif
     {
@@ -1241,6 +1250,36 @@ __device__ __noinline__ void op_gemm_wgmma_n128(const Instr& I, int tile, void**
       }
     }
     consumer_sync();
+#ifdef MK_PDF_D64_TMA_FEED
+    const bool pdf_feed = g_pdf_feed.active;
+    if (pdf_feed && tid == 0) {
+      MkPdfFeed& F = g_pdf_feed;
+      F.tmA = tmA;
+      F.tmB = tmB;
+      F.a0 = reinterpret_cast<char*>(S.A[0][0]);
+      F.a1 = nullptr;
+      F.b0 = reinterpret_cast<char*>(S.B[0]);
+      F.a_stride = (WG_N128_STAGES > 1)
+          ? (int)(reinterpret_cast<char*>(S.A[1][0]) - reinterpret_cast<char*>(S.A[0][0]))
+          : 0;
+      F.b_stride = (WG_N128_STAGES > 1)
+          ? (int)(reinterpret_cast<char*>(S.B[1]) - reinterpret_cast<char*>(S.B[0]))
+          : 0;
+      F.bfull = bfull;
+      F.bempty = bempty;
+      F.m0 = m0;
+      F.n0 = n0;
+      F.iters = iters;
+      F.stages = WG_N128_STAGES;
+      F.a_t = 0;
+      F.b_t = b_t ? 1 : 0;
+      F.bk = WG_BK;
+      F.k_base = k_lo;
+      F.kind = 1;
+      F.expect_bytes = 32768;
+      mk_pdf_st_release(&F.seq, F.seq + 1);
+    }
+#endif
     auto issue_stage_tma = [&](int t) {
       if (tid == 0) {
         const int st = t % WG_N128_STAGES;
@@ -1257,7 +1296,12 @@ __device__ __noinline__ void op_gemm_wgmma_n128(const Instr& I, int tile, void**
         }
       }
     };
-    for (int p = 0; p < min(WG_N128_LEAD + 1, iters); ++p) issue_stage_tma(p);
+#ifdef MK_PDF_D64_TMA_FEED
+    if (!pdf_feed)
+#endif
+    {
+      for (int p = 0; p < min(WG_N128_LEAD + 1, iters); ++p) issue_stage_tma(p);
+    }
     for (int t = 0; t < iters; ++t) {
       const int st = t % WG_N128_STAGES;
       wg_mbar_wait(&bfull[st], (t / WG_N128_STAGES) & 1);
@@ -1272,11 +1316,16 @@ __device__ __noinline__ void op_gemm_wgmma_n128(const Instr& I, int tile, void**
       else
         wg_mma_ktile_n128<SG::MMA_64x128x16_F32BF16BF16_SS<SG::Major::K, SG::Major::MN>>(da, db, d);
       wg_mbar_arrive(&bempty[st]);
-      const int tn = t + WG_N128_LEAD + 1;
-      if (tn < iters) {
-        if (tn >= WG_N128_STAGES)
-          wg_mbar_wait(&bempty[tn % WG_N128_STAGES], (tn / WG_N128_STAGES - 1) & 1);
-        issue_stage_tma(tn);
+#ifdef MK_PDF_D64_TMA_FEED
+      if (!pdf_feed)
+#endif
+      {
+        const int tn = t + WG_N128_LEAD + 1;
+        if (tn < iters) {
+          if (tn >= WG_N128_STAGES)
+            wg_mbar_wait(&bempty[tn % WG_N128_STAGES], (tn / WG_N128_STAGES - 1) & 1);
+          issue_stage_tma(tn);
+        }
       }
     }
     cute::warpgroup_wait<0>();
@@ -1648,6 +1697,36 @@ void op_gemm_wgmma_n64_impl(const Instr& I, int tile, void** bufs, char* smem_ra
       }
     }
     consumer_sync();
+#ifdef MK_PDF_D64_TMA_FEED
+    const bool pdf_feed = g_pdf_feed.active;
+    if (pdf_feed && tid == 0) {
+      MkPdfFeed& F = g_pdf_feed;
+      F.tmA = tmA;
+      F.tmB = tmB;
+      F.a0 = reinterpret_cast<char*>(S.A[0][0]);
+      F.a1 = reinterpret_cast<char*>(S.A[0][1]);
+      F.b0 = reinterpret_cast<char*>(S.B[0]);
+      F.a_stride = (WG_MBAR_STAGES > 1)
+          ? (int)(reinterpret_cast<char*>(S.A[1][0]) - reinterpret_cast<char*>(S.A[0][0]))
+          : 0;
+      F.b_stride = (WG_MBAR_STAGES > 1)
+          ? (int)(reinterpret_cast<char*>(S.B[1]) - reinterpret_cast<char*>(S.B[0]))
+          : 0;
+      F.bfull = bfull;
+      F.bempty = bempty;
+      F.m0 = m0;
+      F.n0 = n0;
+      F.iters = iters;
+      F.stages = WG_MBAR_STAGES;
+      F.a_t = a_t ? 1 : 0;
+      F.b_t = b_t ? 1 : 0;
+      F.bk = WG_BK;
+      F.k_base = k_lo;
+      F.kind = 2;
+      F.expect_bytes = 24576;
+      mk_pdf_st_release(&F.seq, F.seq + 1);
+    }
+#endif
     auto issue_stage_tma = [&](int t) {
       if (tid == 0) {
         const int st = t % WG_MBAR_STAGES;
@@ -1666,7 +1745,12 @@ void op_gemm_wgmma_n64_impl(const Instr& I, int tile, void** bufs, char* smem_ra
         }
       }
     };
-    for (int p = 0; p < min(WG_MBAR_LEAD + 1, iters); ++p) issue_stage_tma(p);
+#ifdef MK_PDF_D64_TMA_FEED
+    if (!pdf_feed)
+#endif
+    {
+      for (int p = 0; p < min(WG_MBAR_LEAD + 1, iters); ++p) issue_stage_tma(p);
+    }
     for (int t = 0; t < iters; ++t) {
       const int st = t % WG_MBAR_STAGES;
       wg_mbar_wait(&bfull[st], (t / WG_MBAR_STAGES) & 1);
@@ -1685,11 +1769,16 @@ void op_gemm_wgmma_n64_impl(const Instr& I, int tile, void** bufs, char* smem_ra
       else
         wg_mma_ktile<SG::MMA_64x64x16_F32BF16BF16_SS<SG::Major::MN, SG::Major::MN>>(da, db, d);
       wg_mbar_arrive(&bempty[st]);
-      const int tn = t + WG_MBAR_LEAD + 1;
-      if (tn < iters) {
-        if (tn >= WG_MBAR_STAGES)
-          wg_mbar_wait(&bempty[tn % WG_MBAR_STAGES], (tn / WG_MBAR_STAGES - 1) & 1);
-        issue_stage_tma(tn);
+#ifdef MK_PDF_D64_TMA_FEED
+      if (!pdf_feed)
+#endif
+      {
+        const int tn = t + WG_MBAR_LEAD + 1;
+        if (tn < iters) {
+          if (tn >= WG_MBAR_STAGES)
+            wg_mbar_wait(&bempty[tn % WG_MBAR_STAGES], (tn / WG_MBAR_STAGES - 1) & 1);
+          issue_stage_tma(tn);
+        }
       }
     }
     cute::warpgroup_wait<0>();

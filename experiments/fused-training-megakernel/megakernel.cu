@@ -800,7 +800,8 @@ extern "C" __global__ void __maxnreg__(168) megakernel_pdf(
       uint64_t* bempty = Fv->bempty;
       const int a_st = Fv->a_stride, b_st = Fv->b_stride;
       const int m0 = Fv->m0, n0 = Fv->n0, iters = Fv->iters, stages = Fv->stages;
-      const int a_t = Fv->a_t, bk = Fv->bk;
+      const int a_t = Fv->a_t, b_t = Fv->b_t, bk = Fv->bk;
+      const int k_base = Fv->k_base, kind = Fv->kind;
       const unsigned xb = Fv->expect_bytes;
       wg_tmap_fence_acquire(tmA);
       wg_tmap_fence_acquire(tmB);
@@ -808,16 +809,34 @@ extern "C" __global__ void __maxnreg__(168) megakernel_pdf(
         const int st = t % stages;
         if (t >= stages) wg_mbar_wait(&bempty[st], (t / stages - 1) & 1);
         wg_mbar_expect_tx(&bfull[st], xb);
-        const int k0 = t * bk;
-        if (a_t) {
+        const int k0 = k_base + t * bk;
+        if (kind == 1) {
+          wg_tma_load_2d(tmA, a0 + st * a_st, k0, m0, &bfull[st]);
+          if (b_t) {
+            wg_tma_load_2d(tmB, b0 + st * b_st, k0, n0, &bfull[st]);
+          } else {
+#pragma unroll
+            for (int g = 0; g < 2; ++g)
+              wg_tma_load_2d(tmB, b0 + st * b_st + g * 8192, n0 + g * 64, k0,
+                             &bfull[st]);
+          }
+        } else if (a_t) {
           wg_tma_load_2d(tmA, a0 + st * a_st, m0, k0, &bfull[st]);
           wg_tma_load_2d(tmA, a1 + st * a_st, m0 + 64, k0, &bfull[st]);
         } else {
           wg_tma_load_2d(tmA, a0 + st * a_st, k0, m0, &bfull[st]);
         }
+        if (kind == 2) {
+          if (b_t)
+            wg_tma_load_2d(tmB, b0 + st * b_st, k0, n0, &bfull[st]);
+          else
+            wg_tma_load_2d(tmB, b0 + st * b_st, n0, k0, &bfull[st]);
+        } else if (kind == 0) {
 #pragma unroll
-        for (int g = 0; g < 4; ++g)
-          wg_tma_load_2d(tmB, b0 + st * b_st + g * 8192, n0 + g * 64, k0, &bfull[st]);
+          for (int g = 0; g < 4; ++g)
+            wg_tma_load_2d(tmB, b0 + st * b_st + g * 8192, n0 + g * 64, k0,
+                           &bfull[st]);
+        }
       }
     }
   }
