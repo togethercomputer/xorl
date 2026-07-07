@@ -6397,6 +6397,25 @@ pair still +30 NO-GO). Mechanism: the TMA feed pays when K=S>=2048 amortizes
 fence/expect_tx per stage; K=1024 rows lose. Diagnostic: S2048-noTN still
 -15 — NT/NN long-K dX rows carry the win, TN dW adds ~8.
 
+## fwd stage-anatomy ablation @ S8192 (session 2853e0de + subagent, 20260707T0245Z)
+
+Six variants, SASS-verified DCE per variant (`mkv3-p4b-fwd-ablate-{A..F}-*.log`).
+fwd on-path span 1053.6us decomposes: **softmax ALU 42.6%** (exp chain 30.7%
+— 72% of the ALU bucket, exp-heavier than dkv's 49%; rowmax+shuffles only
+4.3%), PV drain exposed 27.8% (12% real at step level), score gemm 12.7%
+(mostly hidden under cp.async), residual syncs 16.9%. fwd span cuts
+SUB-translate (~0.7:1 down to 0.3:1) unlike dkv's 2.5x amplification — the
+bucket is span-bound. **DCE LAW CORRECTION: accumulator-dead wgmma is NOT
+protected by asm volatile — ptxas narrowed the S wgmma 4x64x64x16 ->
+1x64x8x16 in variant C; dkv's C-variant had the same contamination, so both
+ALU shares are brackets ([315,449] fwd), not points.** VERDICT (both
+ablations agree): producer/consumer warp-spec moving softmax ALU off the
+gemm warpgroups — NOT ping-pong (measured no-go: sibling-WG tensor-pipe
+contention), NOT exp micro-opts (already ex2.approx), NOT rowmax (4.3% cap).
+Ceiling ~220-320us/step at S8192 for fwd + the dkv/dq compounding. This
+CONVERGES with the pdf producer-df executor lane (WG2 producer feed) — the
+softmax-offload should be designed as a pdf phase, not a third architecture.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

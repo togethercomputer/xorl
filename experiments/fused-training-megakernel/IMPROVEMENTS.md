@@ -1360,6 +1360,14 @@ Principle: resweep-law passes are cheap (env-only) and should test the
 MECHANISM boundary (here: K), not just shapes — the boundary told us which
 future shapes will win without measuring them.
 
+**fwd stage ablation (6 variants, SASS-verified)** — MEASUREMENT (S8192)
+Why: ALU 42.6% (exp 72% of it), PV drain 28% exposed/12% real, score gemm
+13% (cp.async-hidden), syncs 17%; fwd span cuts sub-translate 0.7:1.
+Principle: (1) accumulator-dead wgmma gets NARROWED by ptxas despite asm
+volatile — ablation gemm shares need SASS verification; (2) fwd+dkv agree:
+the lever is producer-warp softmax offload (pdf-executor phase), everything
+smaller is capped <5%.
+
 ## Meta / measurement
 
 **STACK-is-not-runtime** — STACK/res-usage is a smell, never certification.
