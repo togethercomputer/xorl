@@ -66,6 +66,23 @@ __device__ __forceinline__ float wga_exp2_prebias(float score, float scale_l2,
 }
 #endif
 
+#ifdef MK_ATTN_FWD_EXPFOLD
+#ifdef MK_ATTN_PIPE
+#error "MK_ATTN_FWD_EXPFOLD is only implemented for the non-pipe op_attn_fwd_wg body"
+#endif
+// FA4-fwd exp fold: the online-softmax running max is tracked in the
+// scaled-log2 domain (m_scaled = max(score)*scale*log2e), so the per-element
+// exp is ONE fma + ex2 — no s*scale multiply, no log2e multiply in the exp.
+__device__ __forceinline__ float wga_exp2_raw(float x) {
+  float y;
+  asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+#endif
+#if defined(MK_ATTN_FWD_DEFER_RSUM) && defined(MK_ATTN_PIPE)
+#error "MK_ATTN_FWD_DEFER_RSUM is only implemented for the non-pipe op_attn_fwd_wg body"
+#endif
+
 __device__ __forceinline__ void wga_mbar_init(uint64_t* bar, uint32_t count) {
   const uint32_t a = (uint32_t)__cvta_generic_to_shared(bar);
   asm volatile("mbarrier.init.shared.b64 [%0], %1;" ::"r"(a), "r"(count));
@@ -443,6 +460,9 @@ __device__ __noinline__ void op_attn_fwd_wg(const Instr& I, int tile, void** buf
   constexpr int D = 64;  // host routes D!=64 to op_attn_fwd
   const int S = I.args[3], nq = I.args[4], nkv = I.args[5];
   const float scale = __int_as_float(I.args[7]);
+#ifdef MK_ATTN_FWD_EXPFOLD
+  const float scale_l2 = scale * 1.4426950408889634f;  // scale * log2(e)
+#endif
   // args[8] packs C | band_q_tile_off<<8 (args pad to 0 for pre-band callers ->
   // C=1, off=0). C > 1 tiles are flash-decoding kv chunks: the same online
   // softmax runs over stages k0 = (c + t*C)*64 and the epilogue writes
@@ -536,7 +556,11 @@ __device__ __noinline__ void op_attn_fwd_wg(const Instr& I, int tile, void** buf
 #pragma unroll
           for (int j = 0; j < 2; ++j) {
             const int idx = n8 * 4 + i * 2 + j;
+#ifdef MK_ATTN_FWD_EXPFOLD
+            float sc = s[idx];  // raw score; scale folds into the exp2 argument
+#else
             float sc = s[idx] * scale;
+#endif
             if (masked && k0 + n8 * 8 + cb + j > qr) sc = -INFINITY;
             s[idx] = sc;
             rmax[i] = fmaxf(rmax[i], sc);
@@ -546,8 +570,14 @@ __device__ __noinline__ void op_attn_fwd_wg(const Instr& I, int tile, void** buf
       for (int i = 0; i < 2; ++i) {
         rmax[i] = fmaxf(rmax[i], __shfl_xor_sync(0xffffffffu, rmax[i], 1));
         rmax[i] = fmaxf(rmax[i], __shfl_xor_sync(0xffffffffu, rmax[i], 2));
+#ifdef MK_ATTN_FWD_EXPFOLD
+        // scaled-log2 domain: rescale factor is ex2(m_old - m_new) directly.
+        const float mnew = fmaxf(m[i], rmax[i] * scale_l2);
+        alpha[i] = wga_exp2_raw(m[i] - mnew);  // m=-inf only at stage 0, mnew finite
+#else
         const float mnew = fmaxf(m[i], rmax[i]);
         alpha[i] = wga_exp(m[i] - mnew);  // m=-inf only at stage 0, where mnew is finite
+#endif
         m[i] = mnew;
       }
       float rsum[2] = {0.0f, 0.0f};
@@ -556,8 +586,13 @@ __device__ __noinline__ void op_attn_fwd_wg(const Instr& I, int tile, void** buf
 #pragma unroll
         for (int n8 = 0; n8 < 8; ++n8) {
           const int idx = n8 * 4 + i * 2;
+#ifdef MK_ATTN_FWD_EXPFOLD
+          const float p0 = wga_exp2_raw(fmaf(s[idx], scale_l2, -m[i]));  // masked: ex2(-inf)=0
+          const float p1 = wga_exp2_raw(fmaf(s[idx + 1], scale_l2, -m[i]));
+#else
           const float p0 = wga_exp(s[idx] - m[i]);  // masked: exp(-inf)=0
           const float p1 = wga_exp(s[idx + 1] - m[i]);
+#endif
           rsum[i] += p0 + p1;
           __nv_bfloat162 pv;
           pv.x = f2bf(p0);
@@ -565,8 +600,10 @@ __device__ __noinline__ void op_attn_fwd_wg(const Instr& I, int tile, void** buf
           *reinterpret_cast<__nv_bfloat162*>((char*)sm.P[wg] +
                                              wga_off64(r0 + 8 * i, n8 * 8 + cb)) = pv;
         }
+#ifndef MK_ATTN_FWD_DEFER_RSUM
         rsum[i] += __shfl_xor_sync(0xffffffffu, rsum[i], 1);
         rsum[i] += __shfl_xor_sync(0xffffffffu, rsum[i], 2);
+#endif
         l[i] = l[i] * alpha[i] + rsum[i];
       }
     }
@@ -586,6 +623,17 @@ __device__ __noinline__ void op_attn_fwd_wg(const Instr& I, int tile, void** buf
     consumer_sync();  // stage-(t-1) reads retired in both WGs -> (t+2)%3 refill safe
   }
   cute::warpgroup_wait<0>();  // drain the final in-flight PV (no-op if none pending)
+#ifdef MK_ATTN_FWD_DEFER_RSUM
+  // FA4 deferred row-sum: l was held as a per-thread partial through the stage
+  // loop (the alpha rescale is quad-uniform because the max IS quad-reduced each
+  // stage, so partials stay linear); ONE cross-thread quad reduce here replaces
+  // the two shfl_xor per 64-col stage.
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    l[i] += __shfl_xor_sync(0xffffffffu, l[i], 1);
+    l[i] += __shfl_xor_sync(0xffffffffu, l[i], 2);
+  }
+#endif
 
   // epilogue: LSE + O from registers; O staged through smem for coalesced stores.
   // C > 1 chunks write the flash-decoding partial instead: locally-normalized O_c
@@ -596,8 +644,15 @@ __device__ __noinline__ void op_attn_fwd_wg(const Instr& I, int tile, void** buf
   bf16* Odst = O;
   if (C == 1) {
     if ((ln & 3) == 0) {
+#ifdef MK_ATTN_FWD_EXPFOLD
+      // m is in the scale*log2e domain; the LSE contract stays natural-log.
+      LSE[(int64_t)qh * S + q0wg + r0] = fmaf(m[0], 0.6931471805599453f, wga_lse_log(l[0]));
+      LSE[(int64_t)qh * S + q0wg + r0 + 8] =
+          fmaf(m[1], 0.6931471805599453f, wga_lse_log(l[1]));
+#else
       LSE[(int64_t)qh * S + q0wg + r0] = m[0] + wga_lse_log(l[0]);
       LSE[(int64_t)qh * S + q0wg + r0 + 8] = m[1] + wga_lse_log(l[1]);
+#endif
     }
   } else {
     bf16* Opart = reinterpret_cast<bf16*>(bufs[I.args[9]]);
@@ -605,8 +660,16 @@ __device__ __noinline__ void op_attn_fwd_wg(const Instr& I, int tile, void** buf
     float* Lpart = reinterpret_cast<float*>(bufs[I.args[11]]);
     Odst = Opart + (int64_t)c * S * nq * D;
     if ((ln & 3) == 0) {
+#ifdef MK_ATTN_FWD_EXPFOLD
+      // OP_ATTN_COMBINE consumes natural-domain (m, l): convert the scaled-log2
+      // running max back before storing the band partial (-inf stays -inf, so
+      // empty chunks keep combine weight 0).
+      Mpart[((int64_t)c * nq + qh) * S + q0wg + r0] = m[0] * 0.6931471805599453f;
+      Mpart[((int64_t)c * nq + qh) * S + q0wg + r0 + 8] = m[1] * 0.6931471805599453f;
+#else
       Mpart[((int64_t)c * nq + qh) * S + q0wg + r0] = m[0];
       Mpart[((int64_t)c * nq + qh) * S + q0wg + r0 + 8] = m[1];
+#endif
       Lpart[((int64_t)c * nq + qh) * S + q0wg + r0] = l[0];
       Lpart[((int64_t)c * nq + qh) * S + q0wg + r0 + 8] = l[1];
     }

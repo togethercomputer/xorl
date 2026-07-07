@@ -542,6 +542,13 @@ def load_ext(
     occ2 = int(os.environ.get("MK_OCC2", "0"))
     regcopy = int(os.environ.get("MK_WS_REGCOPY", "0"))
     attnpipe = int(os.environ.get("MK_ATTN_PIPE", "0"))
+    # FA4-fwd softmax ALU cuts (default off, env-only). EXPFOLD folds scale*log2e
+    # into the exp2 argument (running max tracked in the scaled-log2 domain: one
+    # FMA+ex2 per element, no separate s*scale multiply); DEFER_RSUM keeps the
+    # per-thread partial row sum through the stage loop and quad-reduces once at
+    # the tile epilogue instead of two shfl_xor per 64-col stage.
+    attn_fwd_expfold = int(os.environ.get("MK_ATTN_FWD_EXPFOLD", "0"))
+    attn_fwd_defer_rsum = int(os.environ.get("MK_ATTN_FWD_DEFER_RSUM", "0"))
     attn_dkv_row_bcast_env = os.environ.get("MK_ATTN_DKV_ROW_BCAST")
     if attn_dkv_row_bcast_env is not None:
         attn_dkv_row_bcast = int(attn_dkv_row_bcast_env)
@@ -736,7 +743,13 @@ def load_ext(
     )
     return load(
         name="xorl_megakernel" + ("_occ2" if occ2 else "") + ("_wsrc" if regcopy else "")
-        + ("_apipe" if attnpipe else "") + ("_adkva" if attn_dkv_direct_atomic else "")
+        + ("_apipe" if attnpipe else "")
+        + (
+            "_afexp" + ("e" if attn_fwd_expfold else "") + ("r" if attn_fwd_defer_rsum else "")
+            if (attn_fwd_expfold or attn_fwd_defer_rsum)
+            else ""
+        )
+        + ("_adkva" if attn_dkv_direct_atomic else "")
         + ("_adkvbc" if attn_dkv_row_bcast else "")
         + ("_adkvf2" if attn_dkv_float2_atomic else "")
         + ("_adqf2" if attn_dq_float2_store else "")
@@ -784,6 +797,8 @@ def load_ext(
         + (["-DMK_OCC2"] if occ2 else [])
         + (["-DMK_WS_REGCOPY"] if regcopy else [])
         + (["-DMK_ATTN_PIPE"] if attnpipe else [])
+        + (["-DMK_ATTN_FWD_EXPFOLD"] if attn_fwd_expfold else [])
+        + (["-DMK_ATTN_FWD_DEFER_RSUM"] if attn_fwd_defer_rsum else [])
         + (["-DMK_ATTN_DKV_ROW_BCAST"] if attn_dkv_row_bcast else [])
         + (["-DMK_ATTN_DKV_DIRECT_ATOMIC"] if attn_dkv_direct_atomic else [])
         + (["-DMK_ATTN_DKV_FLOAT2_ATOMIC"] if attn_dkv_float2_atomic else [])
