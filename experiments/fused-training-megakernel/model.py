@@ -532,10 +532,13 @@ class MKQwen3:
         )
         # Attention producer-feed (attn-pdf-feed lane, Phase 0/1): WG2 issues
         # the streamed attention stage cp.async fills (dq K/V at =1, + dkv
-        # Q/dO at =2) into the existing wga_off64 layout. Default OFF
-        # everywhere until an exact-S8192 both-order win is certified;
-        # MK_ATTN_PDF_FEED=1/2 force-enables on pdf-mode shapes for probing.
-        self.attn_pdf_feed_default = 0
+        # Q/dO at =2) into the existing wga_off64 layout. Exact S8192 feed=1
+        # wins in both construction orders; S4096/S2048 regress and feed=2 is
+        # order-mixed, so keep the default narrow. MK_ATTN_PDF_FEED=0/1/2
+        # guards A/B and follow-up probes.
+        self.attn_pdf_feed_default = (
+            1 if self.default_mode == "pdf" and exact_long_d64 and c.S == 8192 else 0
+        )
         self.ext = mk.load_ext(
             swiglu_bwd_2w=self.swiglu_bwd_2w_default,
             swiglu_bwd_4w=self.swiglu_bwd_4w_default,
