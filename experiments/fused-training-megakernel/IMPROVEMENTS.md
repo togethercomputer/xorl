@@ -1304,18 +1304,26 @@ Principle: scalar gmem loads inside a stage's ALU pass are chain links —
 prefetch them with the stage's bulk loads; the ablation's "loads" share is
 often the cheapest slice to delete.
 
-**Single-image 240/24 producer-df (unmeasured cell (b))** — NO-GO, measured
-(shell tax small +156.8/+137, nano +42.4/+45.8 0/40; decomposition: named
-bar.sync 1,256 = 0, flat-240 ceiling = +11.0/+8.2, remainder = WG2 residency
-~+34us at nano even PARKED in nanosleep-8192; commits 16be37e inert knob,
-logs mkv3-p4b-dfprod-*, design results/operator-gap/producer-df-design.md)
+**Single-image 240/24 producer-df SHELL at short-S (cell (b), cost side)** —
+NO-GO at short-S/non-TMA shapes, measured (shell tax small +156.8/+137, nano
++42.4/+45.8 0/40; decomposition: named bar.sync 1,256 = 0, flat-240 ceiling =
++11.0/+8.2, remainder = WG2 residency ~+34us at nano even PARKED in
+nanosleep-8192; commits 16be37e inert knob, logs mkv3-p4b-dfprod-*, design
+results/operator-gap/producer-df-design.md)
 Why: 4 extra resident warps dilute per-SM issue in the latency-bound 8-warp
 regime even when they never execute work — the cost is residency, not
 registers, spills, or barriers (all isolated).
-Principle: the 256-thread/255-reg point is the measured Pareto point against
-ALL added-warpgroup designs, parked or active; harvest loader decoupling only
-via elected threads inside consumer warps (the landed TMA feeds). Register
-architecture design space is now CLOSED by measurement.
+Principle (SCOPE reconciled with the producer-df executor WIN entry above,
+session e5225c66 — the two data sets agree everywhere both measured): the
+residency tax is real and unconditional (~+34us nano / part of small's +145
+band), so 256thr/255regs stays the Pareto point at shapes with NO producer
+work — which is why the _PDF_MODE gate keeps short-S on df with bit-identical
+binaries. It does NOT close the design at TMA-row shapes, where the measured
+producer dividend + region effect exceed the tax by an order of magnitude
+(qwen4b-l1 -1056..-1133us 12/12 across k8s + clean GPU 3, l2 -1370..-1511,
+s3072 -21 40/40, s8192 -165 16/16). Corrected law: the register/executor
+point is a PER-SHAPE routing decision — elected-thread feeds where the tax
+dominates, the WG2 producer where giant TMA rows dominate.
 
 ## Meta / measurement
 
