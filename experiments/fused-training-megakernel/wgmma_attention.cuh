@@ -985,19 +985,22 @@ struct __align__(16) AttnWgDqSmem {  // 80KB
 // contiguous Cs staging rows into the fp32 workspace, one commit group, then a FULL
 // completion wait (reads AND global adds) before returning.
 //
-// The ABI-call indirection at the call site is LOAD-BEARING, not style: ptxas
-// (CUDA 13.1) mis-assembles this exact asm when it is inlined into the big executor
-// bodies — the same `cp.reduce...add.f32` PTX assembles to UBLKRED.G.S.ADD.U64 (a
-// silent 64-bit INTEGER reduce over the f32 data) in the megakernel/megakernel_df/
-// megakernel_df2 clones (dst uniform-register pair allocated >= UR16), while the
-// megakernel_ws clone gets the correct UBLKRED.G.S.ADD.F32.RN (dst UR14). Measured
-// corruption signature: dst_bits + src_bits (mod 2^32/2^64) instead of the f32 sum.
-// A plain __noinline__ hint is re-inlined by ptxas -O3 and still mis-assembles; the
-// volatile-function-pointer call forces a real ABI boundary so the callee gets its
-// own fresh (low) UR allocation, which assembles correctly. Any change here must
-// re-audit `cuobjdump -sass | grep UBLKRED` PER KERNEL CLONE for ADD.U64.
-__device__ __noinline__ void wga_dq_bulkred_drain16(float* dst0, const float* Cs,
-                                                    int row0, int stride) {
+// __forceinline__ here AND on op_attn_dq_wg (flag-on only) is LOAD-BEARING, not
+// style: ptxas (CUDA 13.1, V13.1.115) mis-assembles this asm when a SINGLE PTX
+// .func containing it is materialized into multiple kernel entries — exactly one
+// entry gets the correct UBLKRED.G.S.ADD.F32.RN and every other clone gets
+// UBLKRED.G.S.ADD.U64, a silent 64-bit INTEGER reduce over the f32 data (measured
+// corruption: dst_bits + src_bits mod 2^32, with u64 carry between f32 pairs).
+// Which entry wins reshuffles with unrelated codegen changes; operand registers,
+// issue pattern, ABI-call restructuring, L2::cache_hint spelling and NOP salts all
+// failed to fix it. Kernels whose asm statements are PTX-DISTINCT (standalone
+// probes; force-inlined copies) always assemble correctly, so the drain chain must
+// inline all the way into each executor entry: helper __forceinline__ + the op's
+// flag-gated __forceinline__ (dispatch() is already __forceinline__). Any change
+// here must re-audit `cuobjdump -sass | grep UBLKRED` PER KERNEL CLONE via
+// mk._audit_bulkred_sass (automatic on flag-on builds).
+__device__ __forceinline__ void wga_dq_bulkred_drain16(float* dst0, const float* Cs,
+                                                       int row0, int stride) {
 #if defined(MK_ADQBR_SALT) && MK_ADQBR_SALT > 0
   // Codegen-reroll salt (see mk.py::_audit_bulkred_sass): perturbs ptxas scheduling
   // so a build whose clone dice landed on ADD.U64 can be rebuilt until clean.
@@ -1027,10 +1030,17 @@ __device__ __noinline__ void wga_dq_bulkred_drain16(float* dst0, const float* Cs
   asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
   asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
 }
-using wga_dq_drain_fn = void (*)(float*, const float*, int, int);
 #endif
 
+#ifdef MK_ATTN_DQ_BULK_RED
+// Flag-on: force-inlined so each executor entry owns a PTX-distinct copy of the
+// bulk-reduce asm statements (see wga_dq_bulkred_drain16 — a single shared .func
+// triggers the ptxas 13.1 ADD.U64 mis-assembly in all but one entry).
+__device__ __forceinline__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs,
+                                              char* smem_raw) {
+#else
 __device__ __noinline__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs, char* smem_raw) {
+#endif
   constexpr int D = 64;
   const int S = I.args[5], nq = I.args[6], nkv = I.args[7];
   const float scale = __int_as_float(I.args[9]);
@@ -1287,10 +1297,9 @@ __device__ __noinline__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs
   // (full completion) returns before the op does: the executor's post-batch barrier +
   // __threadfence publishes only after that, so the region watermark / dependents can
   // never observe the tile complete before the reduction is globally visible.
-  if (ln == 0) {
-    volatile wga_dq_drain_fn drain = wga_dq_bulkred_drain16;  // opaque: forces ABI call
-    drain(&ws[(int64_t)q0 * stride + qh * D], Cs, wg * 64 + w * 16, stride);
-  }
+  if (ln == 0)
+    wga_dq_bulkred_drain16(&ws[(int64_t)q0 * stride + qh * D], Cs, wg * 64 + w * 16,
+                           stride);
 #else
 #pragma unroll
   for (int gq = 0; gq < 4; ++gq) {
