@@ -1199,6 +1199,24 @@ a shape in that regime exists; and mechanism-wins do not survive being
 attached to a superseded executor — port the mechanism (pdf+gates), not the
 old vehicle.
 
+**Phase-adaptive cold-cap release (MK_COLD_RELEASE_TAIL)** — NO-GO for
+promotion; MECHANISM CONFIRMED; landed as default-off instrument
+(l2 K-sweep: K=4 +113/+81; K=8/16 weakly negative at 16 reps; 32-rep
+decisive round ORDER-SPLIT at K=16 (-195/+97) and K=24 (+159/-50);
+mechanism profile K=16: on-path wait 1046.5 -> 542.7us and the EMBED_BWD
+join wait ~eliminated (3.4us), but on-path SPAN +285us;
+`mkv3-p4b-coldrelease{,2}-l2-k8s-20260707T{0845,0915}Z.log`)
+Why: lifting the cold cap when the hot consumed head crosses n_hot-K frees
+blocks for the dW sinks exactly as designed — but the released bandwidth
+contention stretches the remaining chain spans by almost the same amount.
+The cap tradeoff is two-sided at EVERY release point, not just at t=0
+(cap0) or never (cap48).
+Principle: wait-shrinking scheduler knobs are bounded by the bandwidth
+tradeoff unless the sink work itself gets cheaper — re-probe the release
+instrument after any dW-body/bandwidth win (it is in-tree, default off,
+zero-cost when off); the remaining join wait is dependency-structural
+(the last dX hop), which is the pdf+gates lane's territory.
+
 ## Register architecture / warp specialization
 
 (Consolidates the megakernel-paper-style "reallocate registers from task
