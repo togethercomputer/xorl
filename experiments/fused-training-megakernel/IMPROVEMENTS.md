@@ -1275,6 +1275,16 @@ Principle: ablate before architecting — the "obvious" gemm target was the
 SMALLEST slice; ALU+sync overlap (warp-spec/ping-pong) owns ~70%. Beware
 invisible co-tenant preemption faking waits (repeat until two runs agree).
 
+**TMA feed for long-S D64 gemm rings (all majors + split-K TN)** — WIN
+(S3072 -24, S4096 -30, S8192 -15; both orders 15-16/16; 17b1596+27c8084)
+Why: elected-thread bulk-tensor loads + count-1 expect_tx replace 12-16
+per-thread cp.async slices + 256 arrivals per ring stage; biggest on long-K
+TN dW sinks (issue-slot relief for the co-scheduled chain).
+Principle: (1) never-taken alternate paths tax the hot path via codegen
+reflow — keep old/new as separate loops, extract shared fat bodies
+__noinline__; (2) df-mode loss is not bit-stable within an arm (~5e-6 fp32
+atomic spread) — parity means cross-arm delta <= within-arm replay spread.
+
 ## Meta / measurement
 
 **STACK-is-not-runtime** — STACK/res-usage is a smell, never certification.
