@@ -987,6 +987,9 @@ def _access_sets(op, args):
         r, w = [0, 1], [2]
         if flags & 16:
             r.append(7)
+        if flags & 2048:  # fused-CE lm-head epilogue: per-row lse partials
+            w.append(9)  # (masked in-model by the logits RAW edge; required
+            # by args-driven tooling — found by the mbi merged replay)
         if flags & 256:  # fused qk-norm+rope epilogue
             r += [9, 10, 13, 14]
             w += [11, 12, 15]
