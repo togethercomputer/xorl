@@ -533,6 +533,7 @@ def load_ext(
     head_dx_skr=0,
     pdf_producer=0,
     pdf_d64_feed=None,
+    attn_pdf_feed=None,
 ):
     # MK_OCC2=1 builds the 256-thread executors with __launch_bounds__(256, 2):
     # 2 blocks/SM (128-reg ceiling, ptxas spills the fat op paths). Motivated by the
@@ -667,6 +668,19 @@ def load_ext(
     if pdf_producer:
         pdf = 1
     assert not pdf or 8 * pdf_regs + 4 * pdf_dec <= 2048, "pdf register pool infeasible"
+    # Attention producer-feed on the pdf executor (attn-pdf-feed lane, Phase
+    # 0/1): WG2 issues the streamed attention stage cp.async fills into the
+    # existing wga_off64 layout via the MkPdfFeed mailbox (kind 4; the GEMM
+    # SW128 TMA reuse is a layout NO-GO, see
+    # results/operator-gap/attention-tma-layout-feasibility-2a41f6a.md).
+    # 1 = dq K/V stage feed only, 2 = + dkv Q/dO stage feed (LSE/Drow scalars
+    # stay on the consumer cp.async path either way). Default OFF everywhere;
+    # requires the pdf producer image (forced 0 without it).
+    attn_pdf_feed = int(os.environ.get(
+        "MK_ATTN_PDF_FEED",
+        "0" if attn_pdf_feed is None else str(int(attn_pdf_feed)),
+    ))
+    attn_pdf_feed = attn_pdf_feed if pdf_producer else 0
     # D=64 qknorm-bwd fast path; MK_QKBWD_D64_CACHE=0 keeps the old generic loop for
     # A/B and bisects. Separate extension name because torch's cache is name-keyed.
     qkbc = int(os.environ.get("MK_QKBWD_D64_CACHE", "1"))
@@ -781,7 +795,8 @@ def load_ext(
         + (f"_pdf{pdf_regs}" if pdf else "")
         + (f"d{pdf_dec}" if pdf and pdf_dec != 24 else "")
         + ("p" if pdf_producer else "")
-        + ("_pd64f" if pdf_d64_feed else ""),
+        + ("_pd64f" if pdf_d64_feed else "")
+        + (("_apdff" + ("2" if attn_pdf_feed >= 2 else "")) if attn_pdf_feed else ""),
         sources=[os.path.join(_DIR, "megakernel.cu")],
         extra_ldflags=["-lcuda"],
         extra_cuda_cflags=[
@@ -832,7 +847,8 @@ def load_ext(
         + (["-DMK_HEAD_DX_SKR"] if head_dx_skr else [])
         + (["-DMK_PDF", f"-DMK_PDF_REGS={pdf_regs}", f"-DMK_PDF_DEC={pdf_dec}"] if pdf else [])
         + (["-DMK_PDF_PRODUCER"] if pdf_producer else [])
-        + (["-DMK_PDF_D64_FEED"] if pdf_d64_feed else []),
+        + (["-DMK_PDF_D64_FEED"] if pdf_d64_feed else [])
+        + ([f"-DMK_ATTN_PDF_FEED={attn_pdf_feed}"] if attn_pdf_feed else []),
         verbose=verbose,
     )
 
