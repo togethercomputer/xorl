@@ -1233,6 +1233,20 @@ Principle: do not promote from a single order, but do reopen boundary shapes
 after downstream long-S route composition changes; the same local mechanism can
 cross from too small to measurable once the realized path is better balanced.
 
+**pdfg: region-watermark gates on the pdf executor** — NO-GO (wash);
+protocol correct; branch archived
+(l2 A/B vs pdf -24.5 (8/16) / +105.4 (5/16) order-split; smoke/parity exact;
+racecheck hazards identical to the MK_MODE=pdf control (pre-existing feed
+noise, ws-precedent class); branch `megakernel-pdfgates` @ c54c32d+210bb1e
+in xorl-oss-pdfgates-063a9dd; results/operator-gap/pdfg-gates-scope-close.md)
+Why: the WG2 producer feed already overlaps operand staging with consumer
+tails, absorbing the queue-backlog window that gated early-start exploited
+on the df base (df2-df was -381/-252us at l2; on pdf it evaporates).
+Principle: executor-regime wins do not compose across executors — the day's
+third instance (with cold-release and NN-only TMA); measure the mechanism ON
+the target executor before porting machinery to it, and archive correct-but-
+wash implementations as branches, not in-tree code (code-size bar).
+
 ## Register architecture / warp specialization
 
 (Consolidates the megakernel-paper-style "reallocate registers from task
