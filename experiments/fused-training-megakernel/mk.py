@@ -1435,6 +1435,7 @@ class Program:
         if os.environ.get("MK_ALLHOT"):  # bisect knob: single-ring behavior
             crit = [1] * n
         self._crit = torch.tensor(crit, dtype=torch.int32, device=device)
+        self._n_hot = int(sum(crit))
         # state: pending[n] | cursor[n] | done[n] | ready_hot[n] | ready_cold[n] | ctrl[8]
         self._state = torch.empty(5 * n + 8, dtype=torch.int32, device=device)
         # ws executor state: cursor[n*pad] | done[n*pad] | pending[n*pad] | ready[n]
@@ -1497,6 +1498,19 @@ class Program:
             depth[i] = 1 + max((depth[j] for j in d), default=0)
         return max(depth, default=0)
 
+    def _cold_cap_word(self):
+        """Cold cap for df/pdf, with the phase-adaptive release threshold in the
+        high bits (low 20 = cap; pybind signature unchanged). While the hot
+        chain runs the cap holds; once the hot consumed head crosses
+        n_hot - MK_COLD_RELEASE_TAIL the executor lifts it so sink work (dW,
+        the EMBED_BWD join feeders) finishes on the freed blocks. tail=0
+        (default) = off = existing static-cap behavior."""
+        cap = int(os.environ.get("MK_COLD_CAP", str(self.default_cold_cap)))
+        tail = int(os.environ.get("MK_COLD_RELEASE_TAIL", "0"))
+        if tail > 0:
+            cap |= max(1, self._n_hot - tail) << 20
+        return cap
+
     def run(self, ext, smem_bytes=None, wave_clk=None, mode="df", bind_bufs=None):
         if smem_bytes is None:
             # Default ops fit in 100KB. The measured-negative MK_ATTN_PIPE artifact
@@ -1554,7 +1568,7 @@ class Program:
                 self._adj,
                 self._claim,
                 self._crit,
-                int(os.environ.get("MK_COLD_CAP", str(self.default_cold_cap))),
+                self._cold_cap_word(),
                 self._state,
                 self._buftab,
                 smem_bytes,
@@ -1574,10 +1588,11 @@ class Program:
                 self._adj,
                 self._claim,
                 self._crit,
-                # MK_COLD_CAP overrides. Default is shape-set by the model builder:
-                # cap short shapes where cold dW work is net-contentious; leave long S
-                # uncapped where the cap delays useful tail work.
-                int(os.environ.get("MK_COLD_CAP", str(self.default_cold_cap))),
+                # MK_COLD_CAP / MK_COLD_RELEASE_TAIL override. Default is shape-set
+                # by the model builder: cap short shapes where cold dW work is
+                # net-contentious; leave long S uncapped where the cap delays
+                # useful tail work.
+                self._cold_cap_word(),
                 self._state,
                 self._buftab,
                 smem_bytes,

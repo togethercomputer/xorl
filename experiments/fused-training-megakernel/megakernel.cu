@@ -340,7 +340,7 @@ extern "C" __global__ void MK_LB MK_DF_NR megakernel_df(const Instr* __restrict_
                                          const int* __restrict__ adj,
                                          const int* __restrict__ claim_sz,
                                          const int* __restrict__ crit, int cold_cap,
-                                         int* state, void** bufs,
+                                         int release_at, int* state, void** bufs,
                                          long long* iclk /* nullable [2*n] */,
                                          int bind0, unsigned long long ptr0,
                                          int bind1, unsigned long long ptr1) {
@@ -482,7 +482,13 @@ extern "C" __global__ void MK_LB MK_DF_NR megakernel_df(const Instr* __restrict_
         // cold_cap bounds how many blocks work cold entries concurrently (bandwidth
         // headroom for the chain); a block already on cold keeps its slot — the cap
         // must not lock out every worker or capped cold work could never finish.
-        if (last_cold || vctrl[5] < cold_cap) {
+        // phase-adaptive cold-cap release (f30b8c0c): once the hot consumed
+        // head crosses release_at (host: n_hot - MK_COLD_RELEASE_TAIL), the
+        // chain is nearly drained and the cap lifts so sink work (dW, the
+        // EMBED_BWD join feeders) finishes with the freed blocks. ctrl[5]
+        // accounting is admission-only, so exceeding the cap after release
+        // is benign. release_at = INT_MAX when the knob is off.
+        if (last_cold || vctrl[5] < cold_cap || vctrl[2] >= release_at) {
           const int ctail = vctrl[3];
           for (int q = vctrl[4]; q < ctail; ++q) {
             const int ins = vcold[q];
@@ -582,7 +588,7 @@ extern "C" __global__ void __maxnreg__(168) megakernel_pdf(
     const Instr* __restrict__ instrs, int n_instr, const int* __restrict__ dep_cnt,
     const int* __restrict__ adj_off, const int* __restrict__ adj,
     const int* __restrict__ claim_sz, const int* __restrict__ crit, int cold_cap,
-    int* state, void** bufs, long long* iclk /* nullable [2*n] */, int bind0,
+    int release_at, int* state, void** bufs, long long* iclk /* nullable [2*n] */, int bind0,
     unsigned long long ptr0, int bind1, unsigned long long ptr1) {
   extern __shared__ char smem[];
   cg::grid_group grid = cg::this_grid();
@@ -694,7 +700,13 @@ extern "C" __global__ void __maxnreg__(168) megakernel_pdf(
         }
         if (s_ins >= 0) break;
         seen_hot = hvis;
-        if (last_cold || vctrl[5] < cold_cap) {
+        // phase-adaptive cold-cap release (f30b8c0c): once the hot consumed
+        // head crosses release_at (host: n_hot - MK_COLD_RELEASE_TAIL), the
+        // chain is nearly drained and the cap lifts so sink work (dW, the
+        // EMBED_BWD join feeders) finishes with the freed blocks. ctrl[5]
+        // accounting is admission-only, so exceeding the cap after release
+        // is benign. release_at = INT_MAX when the knob is off.
+        if (last_cold || vctrl[5] < cold_cap || vctrl[2] >= release_at) {
           const int ctail = vctrl[3];
           for (int q = vctrl[4]; q < ctail; ++q) {
             const int ins = vcold[q];
@@ -1525,7 +1537,11 @@ void mk_run_df(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_of
   const int* d_ad = adj.data_ptr<int>();
   const int* d_cs = claim_sz.data_ptr<int>();
   const int* d_cr = crit.data_ptr<int>();
-  int cold_cap = (int)cold_cap64;
+  // low 20 bits = cap; high bits = hot-consumed-head release threshold
+  // (phase-adaptive cold-cap release; 0 = knob off -> INT_MAX)
+  int cold_cap = (int)(cold_cap64 & 0xFFFFF);
+  int release_at = (int)(cold_cap64 >> 20);
+  if (release_at <= 0) release_at = INT_MAX;
   if (cold_cap <= 0) cold_cap = df_nblocks;  // 0 = uncapped
   int* d_state = state.data_ptr<int>();
   void** d_bufs = reinterpret_cast<void**>(bufs.data_ptr<int64_t>());
@@ -1537,13 +1553,13 @@ void mk_run_df(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_of
   unsigned long long ptr1 = (unsigned long long)ptr1_64;
   void* args[] = {(void*)&d_instrs, (void*)&n_instr, (void*)&d_dc,    (void*)&d_ao,
                   (void*)&d_ad,     (void*)&d_cs,    (void*)&d_cr,    (void*)&cold_cap,
-                  (void*)&d_state,  (void*)&d_bufs,  (void*)&d_clk,   (void*)&bind0,
-                  (void*)&ptr0,     (void*)&bind1,   (void*)&ptr1};
+                  (void*)&release_at, (void*)&d_state, (void*)&d_bufs, (void*)&d_clk,
+                  (void*)&bind0,    (void*)&ptr0,    (void*)&bind1,   (void*)&ptr1};
   auto stream = at::cuda::getCurrentCUDAStream();
   mk_launch_cooperative(megakernel_df, dim3(df_nblocks), dim3(MK_DF_THREADS), args,
                         (size_t)smem_bytes, stream.stream(), d_instrs, n_instr,
-                        d_dc, d_ao, d_ad, d_cs, d_cr, cold_cap, d_state, d_bufs,
-                        d_clk, bind0, ptr0, bind1, ptr1);
+                        d_dc, d_ao, d_ad, d_cs, d_cr, cold_cap, release_at, d_state,
+                        d_bufs, d_clk, bind0, ptr0, bind1, ptr1);
 }
 
 #ifdef MK_PDF
@@ -1581,7 +1597,9 @@ void mk_run_pdf(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_o
   const int* d_ad = adj.data_ptr<int>();
   const int* d_cs = claim_sz.data_ptr<int>();
   const int* d_cr = crit.data_ptr<int>();
-  int cold_cap = (int)cold_cap64;
+  int cold_cap = (int)(cold_cap64 & 0xFFFFF);
+  int release_at = (int)(cold_cap64 >> 20);
+  if (release_at <= 0) release_at = INT_MAX;
   if (cold_cap <= 0) cold_cap = pdf_nblocks;  // 0 = uncapped
   int* d_state = state.data_ptr<int>();
   void** d_bufs = reinterpret_cast<void**>(bufs.data_ptr<int64_t>());
@@ -1593,13 +1611,13 @@ void mk_run_pdf(torch::Tensor instrs, torch::Tensor dep_cnt, torch::Tensor adj_o
   unsigned long long ptr1 = (unsigned long long)ptr1_64;
   void* args[] = {(void*)&d_instrs, (void*)&n_instr, (void*)&d_dc,    (void*)&d_ao,
                   (void*)&d_ad,     (void*)&d_cs,    (void*)&d_cr,    (void*)&cold_cap,
-                  (void*)&d_state,  (void*)&d_bufs,  (void*)&d_clk,   (void*)&bind0,
-                  (void*)&ptr0,     (void*)&bind1,   (void*)&ptr1};
+                  (void*)&release_at, (void*)&d_state, (void*)&d_bufs, (void*)&d_clk,
+                  (void*)&bind0,    (void*)&ptr0,    (void*)&bind1,   (void*)&ptr1};
   auto stream = at::cuda::getCurrentCUDAStream();
   mk_launch_cooperative(megakernel_pdf, dim3(pdf_nblocks), dim3(MK_PDF_THREADS), args,
                         (size_t)smem_bytes, stream.stream(), d_instrs, n_instr,
-                        d_dc, d_ao, d_ad, d_cs, d_cr, cold_cap, d_state, d_bufs,
-                        d_clk, bind0, ptr0, bind1, ptr1);
+                        d_dc, d_ao, d_ad, d_cs, d_cr, cold_cap, release_at, d_state,
+                        d_bufs, d_clk, bind0, ptr0, bind1, ptr1);
 }
 #endif  // MK_PDF
 
