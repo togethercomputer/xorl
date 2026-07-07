@@ -980,6 +980,53 @@ struct __align__(16) AttnWgDqSmem {  // 80KB
   bf16 V[2][4096];   // [stage] K-view B (= V^T)
 };
 
+#ifdef MK_ATTN_DQ_BULK_RED
+// Zero-atomic dQ drain (FA4 idiom): 16 per-row 256B f32 bulk reduce-adds from the
+// contiguous Cs staging rows into the fp32 workspace, one commit group, then a FULL
+// completion wait (reads AND global adds) before returning.
+//
+// The ABI-call indirection at the call site is LOAD-BEARING, not style: ptxas
+// (CUDA 13.1) mis-assembles this exact asm when it is inlined into the big executor
+// bodies — the same `cp.reduce...add.f32` PTX assembles to UBLKRED.G.S.ADD.U64 (a
+// silent 64-bit INTEGER reduce over the f32 data) in the megakernel/megakernel_df/
+// megakernel_df2 clones (dst uniform-register pair allocated >= UR16), while the
+// megakernel_ws clone gets the correct UBLKRED.G.S.ADD.F32.RN (dst UR14). Measured
+// corruption signature: dst_bits + src_bits (mod 2^32/2^64) instead of the f32 sum.
+// A plain __noinline__ hint is re-inlined by ptxas -O3 and still mis-assembles; the
+// volatile-function-pointer call forces a real ABI boundary so the callee gets its
+// own fresh (low) UR allocation, which assembles correctly. Any change here must
+// re-audit `cuobjdump -sass | grep UBLKRED` PER KERNEL CLONE for ADD.U64.
+__device__ __noinline__ void wga_dq_bulkred_drain16(float* dst0, const float* Cs,
+                                                    int row0, int stride) {
+#if defined(MK_ADQBR_SALT) && MK_ADQBR_SALT > 0
+  // Codegen-reroll salt (see mk.py::_audit_bulkred_sass): perturbs ptxas scheduling
+  // so a build whose clone dice landed on ADD.U64 can be rebuilt until clean.
+#pragma unroll
+  for (int s = 0; s < MK_ADQBR_SALT; ++s) asm volatile("nop;" ::: "memory");
+#endif
+  // L2::cache_hint spelling: semantically the plain add.f32 reduce (evict_normal is
+  // the default policy) but a different ptxas encoder path — the plain spelling hits
+  // the ADD.U64 mis-assembly described above.
+  uint64_t policy;
+  asm volatile("createpolicy.fractional.L2::evict_normal.b64 %0;" : "=l"(policy));
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    const int r = row0 + i;
+    const uint32_t src = static_cast<uint32_t>(__cvta_generic_to_shared(Cs + r * 68));
+    asm volatile(
+        "cp.reduce.async.bulk.global.shared::cta.bulk_group.L2::cache_hint.add.f32"
+        " [%0], [%1], %2, %3;"
+        :
+        : "l"(dst0 + (int64_t)r * stride), "r"(src), "r"(256), "l"(policy)
+        : "memory");
+  }
+  asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+  asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
+  asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+}
+using wga_dq_drain_fn = void (*)(float*, const float*, int, int);
+#endif
+
 __device__ __noinline__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs, char* smem_raw) {
   constexpr int D = 64;
   const int S = I.args[5], nq = I.args[6], nkv = I.args[7];
@@ -1211,7 +1258,7 @@ __device__ __noinline__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs
   }
 
   // Chunked C>1 routes have multiple writers per q slice, so stage dQ then drain with
-  // coalesced fp32 atomics.
+  // coalesced fp32 atomics (default) or zero-atomic bulk reduce-adds (MK_ATTN_DQ_BULK_RED).
   float* Cs = reinterpret_cast<float*>(smem_raw);  // [128][68] overlay
 #pragma unroll
   for (int n8 = 0; n8 < 8; ++n8)
@@ -1220,7 +1267,28 @@ __device__ __noinline__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs
 #pragma unroll
       for (int j = 0; j < 2; ++j)
         Cs[(wg * 64 + r0 + 8 * i) * 68 + n8 * 8 + cb + j] = dq[n8 * 4 + i * 2 + j];
+#ifdef MK_ATTN_DQ_BULK_RED
+  // Every WRITING thread fences its generic-proxy smem stores into the async proxy
+  // BEFORE the barrier (CUDA-guide TMA-store order: stores -> fence.proxy.async ->
+  // barrier -> elected issue). A lane-0-only post-barrier fence leaves the async
+  // proxy reading the stale K/V bf16 view of the overlay (measured: err ~1e35).
+  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+#endif
   consumer_sync();
+#ifdef MK_ATTN_DQ_BULK_RED
+  // Zero-atomic drain (FA4 idiom). Each staged Cs row is 64 contiguous f32 (256B at
+  // stride 68*4=272B, 16B-aligned) and its workspace dQ slot is 64 contiguous f32 at
+  // a 256B-aligned address, so one elected lane per warp issues its warp's 16 rows as
+  // per-row 1-D bulk reduce-adds via wga_dq_bulkred_drain16 (see its comment: the
+  // __noinline__ split dodges a ptxas ADD.U64 miscompile). The helper's wait_group 0
+  // (full completion) returns before the op does: the executor's post-batch barrier +
+  // __threadfence publishes only after that, so the region watermark / dependents can
+  // never observe the tile complete before the reduction is globally visible.
+  if (ln == 0) {
+    volatile wga_dq_drain_fn drain = wga_dq_bulkred_drain16;  // opaque: forces ABI call
+    drain(&ws[(int64_t)q0 * stride + qh * D], Cs, wg * 64 + w * 16, stride);
+  }
+#else
 #pragma unroll
   for (int gq = 0; gq < 4; ++gq) {
     const int gid = tid + gq * MK_CONSUMERS;
@@ -1229,6 +1297,7 @@ __device__ __noinline__ void op_attn_dq_wg(const Instr& I, int tile, void** bufs
     for (int e = 0; e < 8; ++e)
       atomicAdd(&ws[(int64_t)(q0 + r) * stride + qh * D + c8 + e], Cs[r * 68 + c8 + e]);
   }
+#endif
 }
 
 // ---- D=128 forward (v3 P4b D128 port) ------------------------------------------------

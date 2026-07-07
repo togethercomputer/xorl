@@ -586,6 +586,19 @@ def load_ext(
         attn_dq_rs_feed = int(attn_dq_rs_feed_env)
     else:
         attn_dq_rs_feed = int(bool(attn_dq_rs_feed))
+    # D64 dQ C>1 zero-atomic drain (FA4 idiom): replace the smem->gmem fp32
+    # atomicAdd drain with per-row cp.reduce.async.bulk.add.f32 bulk-group
+    # reduce-adds. Env-only A/B knob, default off; flag-off builds are
+    # name/flag-identical to base.
+    # TOOLCHAIN HAZARD (CUDA 13.1 ptxas V13.1.115): the op's single
+    # `cp.reduce...add.f32` asm sometimes assembles to UBLKRED.G.S.ADD.U64 (a
+    # silent 64-bit INTEGER reduce; corruption = dst_bits+src_bits) in a subset
+    # of the per-kernel clones, varying arbitrarily with unrelated codegen
+    # context. Every flag-on build is therefore hard-gated by a per-image SASS
+    # audit below; MK_ATTN_DQ_BULK_RED_SALT=<n> injects n NOPs to reroll ptxas
+    # codegen when the audit trips.
+    attn_dq_bulk_red = int(os.environ.get("MK_ATTN_DQ_BULK_RED", "0"))
+    attn_dq_bulk_red_salt = int(os.environ.get("MK_ATTN_DQ_BULK_RED_SALT", "0"))
     drow_direct_store_env = os.environ.get("MK_DROW_DIRECT_STORE")
     if drow_direct_store_env is not None:
         drow_direct_store = int(drow_direct_store_env)
@@ -759,7 +772,7 @@ def load_ext(
             int(bool(gemm_direct_bf16_epilogue)),
         )
     )
-    return load(
+    ext = load(
         name="xorl_megakernel" + ("_occ2" if occ2 else "") + ("_wsrc" if regcopy else "")
         + ("_apipe" if attnpipe else "")
         + (
@@ -773,6 +786,8 @@ def load_ext(
         + ("_adqf2" if attn_dq_float2_store else "")
         + ("_adqf32p" if attn_dq_fp32_p else "")
         + ("_adqrs" if attn_dq_rs_feed else "")
+        + ("_adqbr" if attn_dq_bulk_red else "")
+        + (f"s{attn_dq_bulk_red_salt}" if attn_dq_bulk_red and attn_dq_bulk_red_salt else "")
         + ("_drowst" if drow_direct_store else "")
         + ("_aflog" if attn_fast_log else "") + ("_aex2" if attn_exp2_approx else "")
         + ("pb" if attn_exp2_prebias else "")
@@ -824,6 +839,9 @@ def load_ext(
         + (["-DMK_ATTN_DQ_FLOAT2_STORE"] if attn_dq_float2_store else [])
         + (["-DMK_ATTN_DQ_FP32_P"] if attn_dq_fp32_p else [])
         + (["-DMK_ATTN_DQ_RS_FEED"] if attn_dq_rs_feed else [])
+        + (["-DMK_ATTN_DQ_BULK_RED"] if attn_dq_bulk_red else [])
+        + ([f"-DMK_ADQBR_SALT={attn_dq_bulk_red_salt}"]
+           if attn_dq_bulk_red and attn_dq_bulk_red_salt else [])
         + (["-DMK_DROW_DIRECT_STORE"] if drow_direct_store else [])
         + (["-DMK_ATTN_FAST_LOG"] if attn_fast_log else [])
         + (["-DMK_ATTN_EXP2_APPROX"] if attn_exp2_approx else [])
@@ -855,6 +873,56 @@ def load_ext(
         + ([f"-DMK_ATTN_PDF_FEED={attn_pdf_feed}"] if attn_pdf_feed else []),
         verbose=verbose,
     )
+    if attn_dq_bulk_red:
+        _audit_bulkred_sass(ext.__file__)
+    return ext
+
+
+def _audit_bulkred_sass(so_path):
+    """Hard gate for MK_ATTN_DQ_BULK_RED builds (CUDA 13.1 ptxas instability).
+
+    The dq drain's single `cp.reduce.async.bulk...add.f32` asm sometimes
+    assembles to UBLKRED.G.S.ADD.U64 — a silent 64-bit INTEGER reduce over the
+    f32 workspace (measured corruption: dst_bits + src_bits mod 2^32) — in a
+    subset of the per-kernel clones, and WHICH clones are broken varies with
+    unrelated codegen context (observed flipping between megakernel_ws and
+    megakernel_df across source-identical drains). Fail the build if any image
+    the model can launch (df/df2/pdf) mis-assembled; warn for the probe-only
+    images (waves/ws). MK_ATTN_DQ_BULK_RED_SALT=<n> rerolls codegen.
+    """
+    import re
+    import subprocess
+
+    out = subprocess.run(
+        ["cuobjdump", "-sass", so_path], capture_output=True, text=True, check=True
+    ).stdout
+    fn, per = None, {}
+    for line in out.splitlines():
+        m = re.search(r"Function : (\S+)", line)
+        if m:
+            fn = m.group(1)
+        if "UBLKRED" in line:
+            kind = "F32" if "ADD.F32" in line else "NON-F32"
+            per.setdefault(fn, {})[kind] = per.setdefault(fn, {}).get(kind, 0) + 1
+    if not per:
+        raise RuntimeError(f"MK_ATTN_DQ_BULK_RED: no UBLKRED found in {so_path}")
+
+    def launchable(name):
+        return "megakernel_df" in name or "megakernel_pdf" in name
+
+    bad = sorted(f for f, k in per.items() if k.get("NON-F32") and launchable(f))
+    warn = sorted(f for f, k in per.items() if k.get("NON-F32") and not launchable(f))
+    if warn:
+        print(
+            f"[mk] WARNING MK_ATTN_DQ_BULK_RED: probe-only images {warn} have "
+            f"UBLKRED non-ADD.F32 (do NOT force MK_MODE=waves/ws); map {per}"
+        )
+    if bad:
+        raise RuntimeError(
+            f"MK_ATTN_DQ_BULK_RED ptxas mis-assembly: UBLKRED non-ADD.F32 in "
+            f"launchable images {bad} of {so_path}; per-image map {per}. Set "
+            f"MK_ATTN_DQ_BULK_RED_SALT=<n> (1,2,...) to reroll ptxas codegen."
+        )
 
 
 def f2i(x: float) -> int:
