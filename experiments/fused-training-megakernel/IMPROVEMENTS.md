@@ -1247,6 +1247,20 @@ third instance (with cold-release and NN-only TMA); measure the mechanism ON
 the target executor before porting machinery to it, and archive correct-but-
 wash implementations as branches, not in-tree code (code-size bar).
 
+**lm dW sink exclusive anatomy (the join-wait budget question)** — OPEN
+LANE SPEC'D: 2.6x exclusive gap is body-structural, knobs exhausted
+(exclusive 2631us vs nvjet 1015.1 at ~700 GB/s = 27% DRAM; stage3 already
+banked +1.26ms; m-major/claim-quantum neutral; n128 worse; TMA==cp.async;
+`results/operator-gap/lmdw-anatomy.md`)
+Why: 29.2us/tile wall vs ~13.5us compute+bandwidth floor across 90 waves —
+per-tile fixed costs (fp32 epilogue, entry/exit syncs, prologue fraction)
+on a tiles>>blocks throughput shape the rounds never body-mined.
+Principle: the wait lanes closed against scheduling (caps, release, gates x2)
+because the real budget was in the SINK BODY all along — when a join waits
+on a sink, measure the sink's exclusive gap before scheduling around it.
+Candidate mechanism for the next claimant: m128-pair tiles sharing B at the
+existing 128-acc budget (halves B traffic + per-output tax, no 160KB page).
+
 ## Register architecture / warp specialization
 
 (Consolidates the megakernel-paper-style "reallocate registers from task
