@@ -810,7 +810,13 @@ extern "C" __global__ void __maxnreg__(168) megakernel_pdf(
         if (t >= stages) wg_mbar_wait(&bempty[st], (t / stages - 1) & 1);
         wg_mbar_expect_tx(&bfull[st], xb);
         const int k0 = k_base + t * bk;
-        if (kind == 1) {
+        if (kind == 3) {
+          wg_tma_load_2d(tmA, a0 + st * a_st, k0, m0, &bfull[st]);
+#pragma unroll
+          for (int g = 0; g < 4; ++g)
+            wg_tma_load_2d(tmB, b0 + st * b_st + g * 8192, k0, n0 + g * 64,
+                           &bfull[st]);
+        } else if (kind == 1) {
           wg_tma_load_2d(tmA, a0 + st * a_st, k0, m0, &bfull[st]);
           if (b_t) {
             wg_tma_load_2d(tmB, b0 + st * b_st, k0, n0, &bfull[st]);

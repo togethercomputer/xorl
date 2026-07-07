@@ -425,6 +425,11 @@ class MKQwen3:
         # =1 force-enables for probing; TN rows stay off (order-mixed
         # standalone) behind MK_GEMM_N256_TMA_TN except at exact qwen.
         self.gemm_n256_tma_default = exact_qwen4b_l1 or exact_qwen4b_l2
+        # Qwen4B-L1 lm-head fwd NT row: TMA/pdf producer feed for full
+        # 256-column vocab tiles, with the final 128-column tail on the existing
+        # cp.async direct body. L2 stayed mixed in the local order-reversal
+        # window, so keep the default l1-only; MK_GEMM_N256_NT_TMA=0/1 guards A/B.
+        self.gemm_n256_nt_tma_default = exact_qwen4b_l1
         # D64 ring TMA feed (round-4 port to the m64n64/m64n128 mbarrier-ring
         # bodies, all majors): standalone every class wins (d64_tma_ring_probe
         # both orders; TN long-K dW -16.5..-19.6%, NT/NN -1..-4.6%). Default ON
@@ -486,6 +491,7 @@ class MKQwen3:
             gemm_mbar_ring=self.gemm_mbar_ring_default,
             gemm_n256_nt_mbar=self.gemm_n256_nt_mbar_default,
             gemm_n256_tma=self.gemm_n256_tma_default,
+            gemm_n256_nt_tma=self.gemm_n256_nt_tma_default,
             gemm_d64_tma=self.gemm_d64_tma_default,
             gemm_direct_bf16_epilogue=self.gemm_direct_bf16_epilogue_default,
             head_dx_skr=self.head_dx_skr,
@@ -567,11 +573,18 @@ class MKQwen3:
         _tma_env = os.environ.get("MK_GEMM_N256_TMA")
         _tma_on = (bool(int(_tma_env)) if _tma_env is not None
                    else self.gemm_n256_tma_default)
-        if _ring_on and _tma_on:
+        _nt_tma_env = os.environ.get("MK_GEMM_N256_NT_TMA")
+        _nt_tma_on = (bool(int(_nt_tma_env)) if _nt_tma_env is not None
+                      else self.gemm_n256_nt_tma_default)
+        if _ring_on and (_tma_on or _nt_tma_on):
             p.gemm_n256_tma_ext = self.ext
+        if _ring_on and _tma_on:
+            p.gemm_n256_tma_enabled = True
             # TN dW rows: promoted for exact qwen on the R4 resweep evidence
             # (-294.6/-333.8us, 16/16 both orders; see mk.gemm_n256_tma_eligible).
             p.gemm_n256_tma_tn_default = self.gemm_n256_tma_default
+        if _ring_on and _nt_tma_on:
+            p.gemm_n256_nt_tma_enabled = True
         # Program-side arm of MK_GEMM_D64_TMA (same ring requirement).
         _d64tma_env = os.environ.get("MK_GEMM_D64_TMA")
         _d64tma_on = (bool(int(_d64tma_env)) if _d64tma_env is not None

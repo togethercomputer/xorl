@@ -406,6 +406,27 @@ def gemm_n256_tma_eligible(args, tn_default=False):
     return True
 
 
+def gemm_n256_nt_tma_eligible(args):
+    """NT TMA gate for the qwen giant-vocab lm-head fwd row.
+
+    The direct n256 NT body already handles the final 128-column vocab tail via
+    cp.async. The TMA path is therefore instruction-scoped here and tile-scoped
+    in the kernel: args[20..22] are injected only for the exact row, while the
+    device path still requires a full 256-column tile before issuing TMA.
+    """
+    flags = args[6]
+    if not (flags & 128) or not (flags & 16384):
+        return False
+    if not (flags & 2) or not (flags & 2048):
+        return False
+    if flags & (1 | 4 | 16 | 32 | 256 | 8192):
+        return False
+    M, N, K = args[3], args[4], args[5]
+    if (M, N, K) != (1024, 151936, 2560):
+        return False
+    return M % 128 == 0 and K % 64 == 0
+
+
 def gemm_d64_tma_eligible(args):
     """Per-instruction gate for the D64 ring TMA feed (MK_GEMM_D64_TMA).
 
@@ -503,6 +524,7 @@ def load_ext(
     gemm_mbar_ring=None,
     gemm_n256_nt_mbar=None,
     gemm_n256_tma=None,
+    gemm_n256_nt_tma=None,
     gemm_d64_tma=None,
     gemm_direct_bf16_epilogue=None,
     head_dx_skr=0,
@@ -661,6 +683,17 @@ def load_ext(
     else:
         gemm_n256_tma = 0 if gemm_n256_tma is None else int(bool(gemm_n256_tma))
     gemm_n256_tma = int(bool(gemm_mbar_ring and gemm_n256_tma))
+    # Exact-qwen n256 direct NT lm-head feed. It shares the n256 tensormap table
+    # but has its own device define because the B map is [N,K] K-contiguous and
+    # the final vocab tail must fall back to cp.async.
+    gemm_n256_nt_tma_env = os.environ.get("MK_GEMM_N256_NT_TMA")
+    if gemm_n256_nt_tma_env is not None:
+        gemm_n256_nt_tma = int(gemm_n256_nt_tma_env)
+    else:
+        gemm_n256_nt_tma = (
+            0 if gemm_n256_nt_tma is None else int(bool(gemm_n256_nt_tma))
+        )
+    gemm_n256_nt_tma = int(bool(gemm_mbar_ring and gemm_n256_nt_tma))
     # D64 ring TMA feed for the m64n64/m64n128 mbarrier-ring bodies. Requires
     # the ring; the per-instruction gate is the tmap args injected by
     # Program._inject_gemm_tmaps (this only compiles the device path).
@@ -701,6 +734,7 @@ def load_ext(
         + ("_gmbar" if gemm_mbar_ring else "")
         + ("_n256ntold" if gemm_mbar_ring and not gemm_n256_nt_mbar else "")
         + ("_gtma" if gemm_n256_tma else "")
+        + ("_nttma" if gemm_n256_nt_tma else "")
         + ("_d64tma" if gemm_d64_tma else "")
         + ("_gdbf16" if gemm_direct_bf16_epilogue else "")
         + ("_hdskr" if head_dx_skr else "")
@@ -747,6 +781,7 @@ def load_ext(
         + (["-DMK_GEMM_MBAR_RING"] if gemm_mbar_ring else [])
         + (["-DMK_GEMM_N256_NT_MBAR"] if gemm_n256_nt_mbar else [])
         + (["-DMK_GEMM_N256_TMA"] if gemm_n256_tma else [])
+        + (["-DMK_GEMM_N256_NT_TMA"] if gemm_n256_nt_tma else [])
         + (["-DMK_GEMM_D64_TMA"] if gemm_d64_tma else [])
         + (["-DMK_GEMM_DIRECT_BF16_EPILOGUE"] if gemm_direct_bf16_epilogue else [])
         + (["-DMK_HEAD_DX_SKR"] if head_dx_skr else [])
@@ -1008,6 +1043,8 @@ class Program:
         # set to the loaded extension by the model builder when the n256 TMA
         # feed is enabled; finalize() then encodes per-instruction tensormaps.
         self.gemm_n256_tma_ext = None
+        self.gemm_n256_tma_enabled = False
+        self.gemm_n256_nt_tma_enabled = False
         self.gemm_n256_tma_tn_default = False
         # D64 ring TMA feed (m64n64/m64n128 mbarrier-ring bodies): same
         # contract as gemm_n256_tma_ext; the two ports share one tmap table.
@@ -1158,8 +1195,9 @@ class Program:
     def _inject_gemm_tmaps(self):
         """Encode CUtensorMaps for TMA-eligible ring GEMMs (round-4 ports).
 
-        Covers the n256 NN/TN rows (gemm_n256_tma_ext) and the D64 m64n64/
-        m64n128 ring rows (gemm_d64_tma_ext) — disjoint row sets (bit14) that
+        Covers the n256 NN/TN rows (gemm_n256_tma_ext), the exact qwen n256
+        direct NT lm-head probe row, and the D64 m64n64/m64n128 ring rows
+        (gemm_d64_tma_ext) — disjoint row sets (bit14/storage-major flags) that
         share one table and the args[20..22] contract. Builds one GPU uint8
         table of 128B tensormap rows (deduped by encode key), registers it in
         the buffer table, and patches each eligible instruction's
@@ -1189,17 +1227,23 @@ class Program:
                 if op != OP_GEMM or len(args) <= 6:
                     continue
                 flags = args[6]
-                is_n256 = n256_ext is not None and gemm_n256_tma_eligible(
-                    args, self.gemm_n256_tma_tn_default)
-                is_d64 = (not is_n256 and d64_ext is not None
+                is_n256 = (self.gemm_n256_tma_enabled and n256_ext is not None
+                            and gemm_n256_tma_eligible(
+                                args, self.gemm_n256_tma_tn_default))
+                is_n256_nt = (self.gemm_n256_nt_tma_enabled and n256_ext is not None
+                               and gemm_n256_nt_tma_eligible(args))
+                is_d64 = (not (is_n256 or is_n256_nt) and d64_ext is not None
                           and gemm_d64_tma_eligible(args))
-                if not (is_n256 or is_d64):
+                if not (is_n256 or is_n256_nt or is_d64):
                     continue
                 ta, tb = self.bufs[args[0]], self.bufs[args[1]]
                 if ta.dtype != torch.bfloat16 or tb.dtype != torch.bfloat16:
                     continue
                 M, N, K = args[3], args[4], args[5]
-                if is_n256:
+                if is_n256_nt:
+                    ra = tmap_row(ta.data_ptr(), K, M, K * 2, 64, 128)  # A[M,K]
+                    rb = tmap_row(tb.data_ptr(), K, N, K * 2, 64, 64)   # B[N,K]
+                elif is_n256:
                     if flags & 1:  # TN: A[K,M] M-contig, two {64m,64k} boxes
                         ra = tmap_row(ta.data_ptr(), M, K, M * 2, 64, 64)
                     else:  # NN: A[M,K] K-contig, one {64k,128m} box

@@ -494,7 +494,7 @@ __device__ __forceinline__ void wg_mbar_wait(uint64_t* bar, uint32_t phase) {
   }
 }
 
-#if defined(MK_GEMM_N256_TMA) || defined(MK_GEMM_D64_TMA)
+#if defined(MK_GEMM_N256_TMA) || defined(MK_GEMM_N256_NT_TMA) || defined(MK_GEMM_D64_TMA)
 // GEMM round-4 TMA feed for the mbarrier-ring bodies: an elected thread
 // issues cp.async.bulk.tensor.2d per stage instead of the per-thread cp.async
 // slices, with mbarrier.arrive.expect_tx on a count-1 full barrier. Tensormaps
@@ -560,10 +560,13 @@ __shared__ MkPdfFeed g_pdf_feed;
 #ifdef MK_GEMM_N256_TMA
 #define MK_PDF_N256_FEED 1
 #endif
+#ifdef MK_GEMM_N256_NT_TMA
+#define MK_PDF_N256_NT_FEED 1
+#endif
 #if defined(MK_GEMM_D64_TMA) && defined(MK_PDF_D64_FEED)
 #define MK_PDF_D64_TMA_FEED 1
 #endif
-#if defined(MK_PDF_N256_FEED) || defined(MK_PDF_D64_TMA_FEED)
+#if defined(MK_PDF_N256_FEED) || defined(MK_PDF_N256_NT_FEED) || defined(MK_PDF_D64_TMA_FEED)
 #define MK_PDF_FEED 1
 #endif
 
@@ -686,73 +689,183 @@ __device__ __noinline__ void op_gemm_wgmma_n256_direct_impl(const Instr& I, int 
 #pragma unroll
   for (int i = 0; i < 128; ++i) d[i] = 0.0f;
   const int iters = K / WG_BK;
+  bool did_tma = false;
+#if defined(MK_GEMM_MBAR_RING) && defined(MK_GEMM_N256_NT_TMA)
+  if (I.args[20] > 0 && valid_cols == 256) {
+    did_tma = true;
+    constexpr int WG_N256_MBAR_LEAD = STAGES - 2;
+    const char* tbl = reinterpret_cast<const char*>(bufs[I.args[20] - 1]);
+    const char* tmA = tbl + (int64_t)I.args[21] * 128;
+    const char* tmB = tbl + (int64_t)I.args[22] * 128;
+    uint64_t* bfull = reinterpret_cast<uint64_t*>(smem_raw + sizeof(S));
+    uint64_t* bempty = bfull + STAGES;
+    if (tid == 0) {
+      wg_tmap_fence_acquire(tmA);
+      wg_tmap_fence_acquire(tmB);
+#pragma unroll
+      for (int s = 0; s < STAGES; ++s) {
+        wg_mbar_init(&bfull[s], 1);
+        wg_mbar_init(&bempty[s], 256);
+      }
+    }
+    consumer_sync();
+#ifdef MK_PDF_N256_NT_FEED
+    const bool pdf_feed = g_pdf_feed.active;
+    if (pdf_feed && tid == 0) {
+      MkPdfFeed& F = g_pdf_feed;
+      F.tmA = tmA;
+      F.tmB = tmB;
+      F.a0 = reinterpret_cast<char*>(S.A[0][0]);
+      F.a1 = nullptr;
+      F.b0 = reinterpret_cast<char*>(S.B[0]);
+      F.a_stride = (STAGES > 1)
+          ? (int)(reinterpret_cast<char*>(S.A[1][0]) - reinterpret_cast<char*>(S.A[0][0]))
+          : 0;
+      F.b_stride = (STAGES > 1)
+          ? (int)(reinterpret_cast<char*>(S.B[1]) - reinterpret_cast<char*>(S.B[0]))
+          : 0;
+      F.bfull = bfull;
+      F.bempty = bempty;
+      F.m0 = m0;
+      F.n0 = n0;
+      F.iters = iters;
+      F.stages = STAGES;
+      F.a_t = 0;
+      F.b_t = 1;
+      F.bk = WG_BK;
+      F.k_base = 0;
+      F.kind = 3;
+      F.expect_bytes = 49152;
+      mk_pdf_st_release(&F.seq, F.seq + 1);
+    }
+#endif
+    auto issue_stage_tma = [&](int t) {
+      if (tid == 0) {
+        const int st = t % STAGES;
+        const int k0 = t * WG_BK;
+        wg_mbar_expect_tx(&bfull[st], 49152);  // A 16KB + B 32KB per stage
+        wg_tma_load_2d(tmA, S.A[st][0], k0, m0, &bfull[st]);
+#pragma unroll
+        for (int g = 0; g < 4; ++g)
+          wg_tma_load_2d(tmB, reinterpret_cast<char*>(S.B[st]) + g * 8192,
+                         k0, n0 + g * 64, &bfull[st]);
+      }
+    };
+#ifdef MK_PDF_N256_NT_FEED
+    if (!pdf_feed)
+#endif
+    {
+#pragma unroll
+      for (int p = 0; p < min(WG_N256_MBAR_LEAD + 1, iters); ++p)
+        issue_stage_tma(p);
+    }
+    for (int t = 0; t < iters; ++t) {
+      const int st = t % STAGES;
+      wg_mbar_wait(&bfull[st], (t / STAGES) & 1);
+      uint64_t da[4], db[4];
+#pragma unroll
+      for (int s = 0; s < 4; ++s) {
+        da[s] = wg_desc_ksw(S.A[st][wg], s);
+        db[s] = wg_desc_ksw(S.B[st], s);
+      }
+      wg_mma_ktile_n256<SG::MMA_64x256x16_F32BF16BF16_SS<SG::Major::K, SG::Major::K>>(
+          da, db, d);
+      wg_mbar_arrive(&bempty[st]);
+#ifdef MK_PDF_N256_NT_FEED
+      if (!pdf_feed)
+#endif
+      {
+        const int tn = t + WG_N256_MBAR_LEAD + 1;
+        if (tn < iters) {
+          if (tn >= STAGES)
+            wg_mbar_wait(&bempty[tn % STAGES], (tn / STAGES - 1) & 1);
+          issue_stage_tma(tn);
+        }
+      }
+    }
+    cute::warpgroup_wait<0>();
+    consumer_sync();
+    if (tid == 0) {
+#pragma unroll
+      for (int s = 0; s < STAGES; ++s) {
+        wg_mbar_init(&bfull[s], 1);
+        wg_mbar_init(&bempty[s], 256);
+      }
+    }
+    consumer_sync();
+  }
+#endif
 #if defined(MK_GEMM_MBAR_RING) && defined(MK_GEMM_N256_NT_MBAR)
-  constexpr int WG_N256_MBAR_LEAD = STAGES - 2;
-  uint64_t* bfull = reinterpret_cast<uint64_t*>(smem_raw + sizeof(S));
-  uint64_t* bempty = bfull + STAGES;
-  if (tid == 0) {
+  if (!did_tma) {
+    constexpr int WG_N256_MBAR_LEAD = STAGES - 2;
+    uint64_t* bfull = reinterpret_cast<uint64_t*>(smem_raw + sizeof(S));
+    uint64_t* bempty = bfull + STAGES;
+    if (tid == 0) {
 #pragma unroll
-    for (int s = 0; s < STAGES; ++s) {
-      wg_mbar_init(&bfull[s], 256);
-      wg_mbar_init(&bempty[s], 256);
+      for (int s = 0; s < STAGES; ++s) {
+        wg_mbar_init(&bfull[s], 256);
+        wg_mbar_init(&bempty[s], 256);
+      }
     }
+    consumer_sync();
+    auto issue_stage_mb = [&](int t) {
+      const int st = t % STAGES;
+      issue_stage(t * WG_BK, st);
+      wg_mbar_arrive_cpasync(&bfull[st]);
+    };
+#pragma unroll
+    for (int p = 0; p < min(WG_N256_MBAR_LEAD + 1, iters); ++p)
+      issue_stage_mb(p);
+    for (int t = 0; t < iters; ++t) {
+      const int st = t % STAGES;
+      wg_mbar_wait(&bfull[st], (t / STAGES) & 1);
+      uint64_t da[4], db[4];
+#pragma unroll
+      for (int s = 0; s < 4; ++s) {
+        da[s] = wg_desc_ksw(S.A[st][wg], s);
+        db[s] = wg_desc_ksw(S.B[st], s);
+      }
+      wg_mma_ktile_n256<SG::MMA_64x256x16_F32BF16BF16_SS<SG::Major::K, SG::Major::K>>(
+          da, db, d);
+      wg_mbar_arrive(&bempty[st]);
+      const int tn = t + WG_N256_MBAR_LEAD + 1;
+      if (tn < iters) {
+        if (tn >= STAGES)
+          wg_mbar_wait(&bempty[tn % STAGES], (tn / STAGES - 1) & 1);
+        issue_stage_mb(tn);
+      }
+    }
+    cute::warpgroup_wait<0>();
+    consumer_sync();
+    if (tid == 0) {
+#pragma unroll
+      for (int s = 0; s < STAGES; ++s) {
+        wg_mbar_init(&bfull[s], 256);
+        wg_mbar_init(&bempty[s], 256);
+      }
+    }
+    consumer_sync();
   }
-  consumer_sync();
-  auto issue_stage_mb = [&](int t) {
-    const int st = t % STAGES;
-    issue_stage(t * WG_BK, st);
-    wg_mbar_arrive_cpasync(&bfull[st]);
-  };
-#pragma unroll
-  for (int p = 0; p < min(WG_N256_MBAR_LEAD + 1, iters); ++p)
-    issue_stage_mb(p);
-  for (int t = 0; t < iters; ++t) {
-    const int st = t % STAGES;
-    wg_mbar_wait(&bfull[st], (t / STAGES) & 1);
-    uint64_t da[4], db[4];
-#pragma unroll
-    for (int s = 0; s < 4; ++s) {
-      da[s] = wg_desc_ksw(S.A[st][wg], s);
-      db[s] = wg_desc_ksw(S.B[st], s);
-    }
-    wg_mma_ktile_n256<SG::MMA_64x256x16_F32BF16BF16_SS<SG::Major::K, SG::Major::K>>(
-        da, db, d);
-    wg_mbar_arrive(&bempty[st]);
-    const int tn = t + WG_N256_MBAR_LEAD + 1;
-    if (tn < iters) {
-      if (tn >= STAGES)
-        wg_mbar_wait(&bempty[tn % STAGES], (tn / STAGES - 1) & 1);
-      issue_stage_mb(tn);
-    }
-  }
-  cute::warpgroup_wait<0>();
-  consumer_sync();
-  if (tid == 0) {
-#pragma unroll
-    for (int s = 0; s < STAGES; ++s) {
-      wg_mbar_init(&bfull[s], 256);
-      wg_mbar_init(&bempty[s], 256);
-    }
-  }
-  consumer_sync();
 #else
+  if (!did_tma) {
 #pragma unroll
-  for (int p = 0; p < STAGES - 1; ++p)
-    if (p < iters) issue_stage(p * WG_BK, p);
-  for (int t = 0; t < iters; ++t) {
-    if (t + STAGES - 1 < iters)
-      issue_stage((t + STAGES - 1) * WG_BK, (t + STAGES - 1) % STAGES);
-    __pipeline_wait_prior(min(STAGES - 1, iters - t - 1));
-    consumer_sync();
-    uint64_t da[4], db[4];
+    for (int p = 0; p < STAGES - 1; ++p)
+      if (p < iters) issue_stage(p * WG_BK, p);
+    for (int t = 0; t < iters; ++t) {
+      if (t + STAGES - 1 < iters)
+        issue_stage((t + STAGES - 1) * WG_BK, (t + STAGES - 1) % STAGES);
+      __pipeline_wait_prior(min(STAGES - 1, iters - t - 1));
+      consumer_sync();
+      uint64_t da[4], db[4];
 #pragma unroll
-    for (int s = 0; s < 4; ++s) {
-      da[s] = wg_desc_ksw(S.A[t % STAGES][wg], s);
-      db[s] = wg_desc_ksw(S.B[t % STAGES], s);
+      for (int s = 0; s < 4; ++s) {
+        da[s] = wg_desc_ksw(S.A[t % STAGES][wg], s);
+        db[s] = wg_desc_ksw(S.B[t % STAGES], s);
+      }
+      wg_mma_ktile_n256<SG::MMA_64x256x16_F32BF16BF16_SS<SG::Major::K, SG::Major::K>>(
+          da, db, d);
+      consumer_sync();
     }
-    wg_mma_ktile_n256<SG::MMA_64x256x16_F32BF16BF16_SS<SG::Major::K, SG::Major::K>>(
-        da, db, d);
-    consumer_sync();
   }
 #endif
 
