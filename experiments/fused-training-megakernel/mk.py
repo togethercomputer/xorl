@@ -1046,6 +1046,7 @@ class Program:
         self.gemm_n256_tma_enabled = False
         self.gemm_n256_nt_tma_enabled = False
         self.gemm_n256_tma_tn_default = False
+        self.hot_embed_bwd_default = False
         # D64 ring TMA feed (m64n64/m64n128 mbarrier-ring bodies): same
         # contract as gemm_n256_tma_ext; the two ports share one tmap table.
         self.gemm_d64_tma_ext = None
@@ -1346,8 +1347,16 @@ class Program:
         # nothing in the step depends on the instr (dW/sink gemms, embed_bwd) or it is
         # a fill; HOT (1) otherwise. Idle blocks drain hot first, so chain consumers
         # start within ~a claim batch instead of behind sticky off-path tile claims.
+        hot_embed_bwd_env = os.environ.get("MK_HOT_EMBED_BWD")
+        hot_embed_bwd = (
+            self.hot_embed_bwd_default
+            if hot_embed_bwd_env is None
+            else bool(int(hot_embed_bwd_env))
+        )
         crit = [
-            0 if (adj_off[i + 1] == adj_off[i] or flat[i][0] == OP_FILL_F32) else 1
+            1 if (hot_embed_bwd and flat[i][0] == OP_EMBED_BWD)
+            else 0 if (adj_off[i + 1] == adj_off[i] or flat[i][0] == OP_FILL_F32)
+            else 1
             for i in range(n)
         ]
         if os.environ.get("MK_ALLHOT"):  # bisect knob: single-ring behavior

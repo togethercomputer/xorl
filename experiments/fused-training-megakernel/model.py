@@ -430,6 +430,11 @@ class MKQwen3:
         # cp.async direct body. L2 stayed mixed in the local order-reversal
         # window, so keep the default l1-only; MK_GEMM_N256_NT_TMA=0/1 guards A/B.
         self.gemm_n256_nt_tma_default = exact_qwen4b_l1
+        # L2 terminal EMBED_BWD sits as an off-path cold leaf while lm-head dW drains;
+        # making only that leaf hot recovers ~0.14-0.17ms at exact qwen4b-l2 with
+        # qwen4b-l1 neutral and generic shapes order-mixed. MK_HOT_EMBED_BWD=0/1
+        # remains the explicit override.
+        self.hot_embed_bwd_default = exact_qwen4b_l2
         # D64 ring TMA feed (round-4 port to the m64n64/m64n128 mbarrier-ring
         # bodies, all majors): standalone every class wins (d64_tma_ring_probe
         # both orders; TN long-K dW -16.5..-19.6%, NT/NN -1..-4.6%). Default ON
@@ -565,6 +570,7 @@ class MKQwen3:
         wg_attn = c.D == 64 and c.S % 128 == 0
         p = mk.Program()
         p.default_cold_cap = _cold_cap(c)
+        p.hot_embed_bwd_default = self.hot_embed_bwd_default
         # Program-side arm of MK_GEMM_N256_TMA: mirrors load_ext's resolution
         # (ring required) so the compiled path and the injected tmap args agree.
         _ring_env = os.environ.get("MK_GEMM_MBAR_RING")
