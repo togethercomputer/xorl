@@ -4,6 +4,10 @@ Copy of the results/env_ab_main.py pattern, defaulting MKAB_TREE to this
 worktree. argv: shape order env1=val1[,env2=val2...] [reps]
 Model A = current defaults, model B = defaults + env overrides. Route summary
 (instr count), loss/grad parity, paired alternating timing.
+
+MKAB_FORCE_MODE=<df|pdf|...> forces the same executor mode for BOTH models
+(needed when the ptxas UBLKRED audit only clears one image; see
+mk._audit_bulkred_sass).
 """
 import os, statistics, sys
 import torch
@@ -51,6 +55,11 @@ def main():
     else:
         mb = build(shape, envs)
         ma = build(shape, [])
+    force_mode = os.environ.get("MKAB_FORCE_MODE")
+    if force_mode:
+        ma.default_mode = force_mode
+        mb.default_mode = force_mode
+        print(f"FORCED MODE {force_mode}", flush=True)
     na = sum(len(w) for w in ma.prog.waves)
     nb = sum(len(w) for w in mb.prog.waves)
     print(f"ROUTE {shape} n_instr default={na} variant={nb}", flush=True)

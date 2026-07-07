@@ -1001,8 +1001,11 @@ __device__ __noinline__ void wga_dq_bulkred_drain16(float* dst0, const float* Cs
 #if defined(MK_ADQBR_SALT) && MK_ADQBR_SALT > 0
   // Codegen-reroll salt (see mk.py::_audit_bulkred_sass): perturbs ptxas scheduling
   // so a build whose clone dice landed on ADD.U64 can be rebuilt until clean.
+  // (PTX has no `nop`; a self-add is the cheapest legal perturbation.)
+  int salt_dummy = row0;
 #pragma unroll
-  for (int s = 0; s < MK_ADQBR_SALT; ++s) asm volatile("nop;" ::: "memory");
+  for (int s = 0; s < MK_ADQBR_SALT; ++s)
+    asm volatile("add.s32 %0, %0, 0;" : "+r"(salt_dummy));
 #endif
   // L2::cache_hint spelling: semantically the plain add.f32 reduce (evict_normal is
   // the default policy) but a different ptxas encoder path — the plain spelling hits

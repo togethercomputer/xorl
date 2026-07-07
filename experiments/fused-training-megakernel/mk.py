@@ -907,7 +907,15 @@ def _audit_bulkred_sass(so_path):
     if not per:
         raise RuntimeError(f"MK_ATTN_DQ_BULK_RED: no UBLKRED found in {so_path}")
 
+    # MK_ATTN_DQ_BULK_RED_AUDIT: "all" (default) enforces every image the model can
+    # launch (df/df2/pdf); a comma-list (e.g. "megakernel_pdf") restricts enforcement
+    # to the images a controlled experiment will actually run — the caller then OWNS
+    # the guarantee that no other executor mode is launched in that process.
+    scope = os.environ.get("MK_ATTN_DQ_BULK_RED_AUDIT", "all")
+
     def launchable(name):
+        if scope != "all":
+            return any(s and s in name for s in scope.split(","))
         return "megakernel_df" in name or "megakernel_pdf" in name
 
     bad = sorted(f for f, k in per.items() if k.get("NON-F32") and launchable(f))
