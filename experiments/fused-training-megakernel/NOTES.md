@@ -6344,6 +6344,19 @@ warp-specialization (dedicated ALU warps vs gemm warpgroups, setmaxnreg
 class — the multi-session P4-style arc). Re-run knob: MK_ATTN_DQ_PIPE=1 in
 wt-dqpipe (default flipped off if picked up).
 
+## dkv LSE/Drow stage prefetch (session 2853e0de, 20260707T0100Z)
+
+Direct-ALU attack round 1 from the stage ablation: the per-stage LSE/Drow
+gmem loads sat on the dkv ALU critical chain (loads+dS-math+stores ~21% of
+stage span). Fix: cp.async both rows' scalars with the Q/dO stage fills into
+[2][64] float smem banks (+1KB, struct 96->97KB; same commit group, so the
+existing wait_prior covers them), ALU reads smem at local stage index —
+also deletes the ROW_BCAST ifdef fork. dq unaffected (loads once per tile).
+Validated (`mkv3-p4b-dkv-lsepre*-*.log`): S8192 **6747/6750/6748 vs
+6812/6803/6805 (-55..-64us)**, three clean pairs each arm both orders
+(two contaminated co-tenant reads discarded at 12.5/16.7ms); S4096 and small
+neutral; tests green, losses bit-identical; errors match head references.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

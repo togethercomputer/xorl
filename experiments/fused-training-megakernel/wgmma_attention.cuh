@@ -614,13 +614,15 @@ __device__ __noinline__ void op_attn_fwd_wg(const Instr& I, int tile, void** buf
 // trades C-fold owned-tile reloads for C-fold less serial latency; the fp32 atomic
 // epilogue makes chunks race-free). dK/dV accumulate in registers.
 
-struct __align__(16) AttnWgDkvSmem {  // 96KB
+struct __align__(16) AttnWgDkvSmem {  // 97KB
   bf16 K[2][4096];   // [wg] owned kv rows, K-view B (= K^T)
   bf16 V[2][4096];   // [wg] owned kv rows, K-view B (= V^T)
   bf16 P[2][4096];   // [wg] [q,kv]; MN-view A = P^T
   bf16 dS[2][4096];  // [wg] [q,kv]; MN-view A = dS^T
   bf16 Q[2][4096];   // [stage] K-view A (S = Q K^T) + MN-view B (dK += dS^T Q)
   bf16 dO[2][4096];  // [stage] K-view A (dP = dO V^T) + MN-view B (dV += P^T dO)
+  float LSEs[2][64];   // [stage] per-q-row LSE, prefetched off the ALU chain
+  float Drows[2][64];  // [stage] per-q-row Drow, prefetched off the ALU chain
 };
 
 __device__ __noinline__ void op_attn_dkv_wg(const Instr& I, int tile, void** bufs, char* smem_raw) {
@@ -674,6 +676,14 @@ __device__ __noinline__ void op_attn_dkv_wg(const Instr& I, int tile, void** buf
       __pipeline_memcpy_async((char*)sm.dO[st] + wga_off64(r, c8),
                               &dOg[(int64_t)(q0s + r) * (nq * D) + qh * D + c8], 16);
     }
+    // per-row LSE/Drow staged with the same commit group: their gmem latency
+    // moves off the per-stage ALU chain (ablation: loads are ~half the non-exp
+    // ALU share)
+    if (tid < 16)
+      __pipeline_memcpy_async(&sm.LSEs[st][tid * 4], &LSE[(int64_t)qh * S + q0s + tid * 4], 16);
+    else if (tid < 32)
+      __pipeline_memcpy_async(&sm.Drows[st][(tid - 16) * 4],
+                              &Drow[(int64_t)qh * S + q0s + (tid - 16) * 4], 16);
     __pipeline_commit();
   };
 
@@ -727,15 +737,8 @@ __device__ __noinline__ void op_attn_dkv_wg(const Instr& I, int tile, void** buf
 #pragma unroll
       for (int i = 0; i < 2; ++i) {
         const int qr = q0s + r0 + 8 * i;
-#ifdef MK_ATTN_DKV_ROW_BCAST
-        float lse = ((ln & 3) == 0) ? LSE[(int64_t)qh * S + qr] : 0.0f;
-        lse = __shfl_sync(0xffffffffu, lse, ln & ~3);
-        float dr = ((ln & 3) == 0) ? Drow[(int64_t)qh * S + qr] : 0.0f;
-        dr = __shfl_sync(0xffffffffu, dr, ln & ~3);
-#else
-        const float lse = LSE[(int64_t)qh * S + qr];
-        const float dr = Drow[(int64_t)qh * S + qr];
-#endif
+        const float lse = sm.LSEs[t & 1][r0 + 8 * i];
+        const float dr = sm.Drows[t & 1][r0 + 8 * i];
 #pragma unroll
         for (int n8 = 0; n8 < 8; ++n8) {
           const int idx = n8 * 4 + i * 2;

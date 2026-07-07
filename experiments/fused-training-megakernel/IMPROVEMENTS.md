@@ -1296,6 +1296,14 @@ fwd/dkv/dq have different drain anatomies; and in a 2-WG cooperative body,
 extra in-flight batches steal the sibling's tensor-pipe slots. In-place
 ping-pong is dead here; the ALU share needs warp-spec or direct ALU work.
 
+**dkv LSE/Drow stage prefetch (cp.async with Q/dO fills)** — WIN (S8192
+-55..-64, 3 clean pairs both orders; S4096/small neutral; +1KB smem)
+Why: two per-row gmem scalar loads sat on the per-stage ALU critical chain;
+staging them with the existing cp.async group moves their latency off-chain.
+Principle: scalar gmem loads inside a stage's ALU pass are chain links —
+prefetch them with the stage's bulk loads; the ablation's "loads" share is
+often the cheapest slice to delete.
+
 ## Meta / measurement
 
 **STACK-is-not-runtime** — STACK/res-usage is a smell, never certification.
