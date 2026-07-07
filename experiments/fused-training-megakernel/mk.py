@@ -532,6 +532,7 @@ def load_ext(
     gemm_n256_nt_tma=None,
     gemm_d64_tma=None,
     gemm_dx_tma_red=None,
+    gemm_n256_tma_store=None,
     gemm_direct_bf16_epilogue=None,
     head_dx_skr=0,
     pdf_producer=0,
@@ -611,6 +612,11 @@ def load_ext(
         gemm_dx_tma_red = int(gemm_dx_tma_red_env)
     else:
         gemm_dx_tma_red = int(bool(gemm_dx_tma_red))
+    gemm_n256_tma_store_env = os.environ.get("MK_GEMM_N256_TMA_STORE")
+    if gemm_n256_tma_store_env is not None:
+        gemm_n256_tma_store = int(gemm_n256_tma_store_env)
+    else:
+        gemm_n256_tma_store = int(bool(gemm_n256_tma_store))
     drow_direct_store_env = os.environ.get("MK_DROW_DIRECT_STORE")
     if drow_direct_store_env is not None:
         drow_direct_store = int(drow_direct_store_env)
@@ -822,6 +828,7 @@ def load_ext(
         + ("_nttma" if gemm_n256_nt_tma else "")
         + ("_d64tma" if gemm_d64_tma else "")
         + ("_gdxtred" if gemm_dx_tma_red else "")
+        + ("_n256tst" if gemm_n256_tma_store else "")
         + ("_gdbf16" if gemm_direct_bf16_epilogue else "")
         + ("_hdskr" if head_dx_skr else "")
         + (f"_pdf{pdf_regs}" if pdf else "")
@@ -879,6 +886,7 @@ def load_ext(
         + (["-DMK_GEMM_N256_NT_TMA"] if gemm_n256_nt_tma else [])
         + (["-DMK_GEMM_D64_TMA"] if gemm_d64_tma else [])
         + (["-DMK_GEMM_DX_TMA_RED"] if gemm_dx_tma_red else [])
+        + (["-DMK_GEMM_N256_TMA_STORE"] if gemm_n256_tma_store else [])
         + (["-DMK_GEMM_DIRECT_BF16_EPILOGUE"] if gemm_direct_bf16_epilogue else [])
         + (["-DMK_HEAD_DX_SKR"] if head_dx_skr else [])
         + (["-DMK_PDF", f"-DMK_PDF_REGS={pdf_regs}", f"-DMK_PDF_DEC={pdf_dec}"] if pdf else [])
@@ -1228,6 +1236,11 @@ class Program:
         # D64 ring TMA feed (m64n64/m64n128 mbarrier-ring bodies): same
         # contract as gemm_n256_tma_ext; the two ports share one tmap table.
         self.gemm_d64_tma_ext = None
+        # n256-direct NT EVICT_FIRST TMA C store (DeepGEMM R3 port): epilogue-
+        # only, independent of the feed gates; shares the tmap table via
+        # args[20] and adds args[19] = 1 + C row (0 = direct-store path).
+        self.gemm_cstore_ext = None
+        self.gemm_n256_tma_store_enabled = False
 
     def buf(self, t: torch.Tensor, slot=None) -> int:
         """Register a CUDA tensor; returns its buffer-table index.
@@ -1387,7 +1400,8 @@ class Program:
         """
         n256_ext = self.gemm_n256_tma_ext
         d64_ext = self.gemm_d64_tma_ext
-        ext = n256_ext if n256_ext is not None else d64_ext
+        cstore_ext = self.gemm_cstore_ext if self.gemm_n256_tma_store_enabled else None
+        ext = n256_ext or d64_ext or cstore_ext
         if ext is None:
             return
         rows, row_ids, patches = [], {}, []
@@ -1413,12 +1427,31 @@ class Program:
                                and gemm_n256_nt_tma_eligible(args))
                 is_d64 = (not (is_n256 or is_n256_nt) and d64_ext is not None
                           and gemm_d64_tma_eligible(args))
-                if not (is_n256 or is_n256_nt or is_d64):
+                # n256-direct NT EVICT_FIRST TMA C store (DeepGEMM R3 port):
+                # epilogue-only, orthogonal to the feed gates above. bit14+bit2
+                # routes op_gemm_wgmma_n256_direct; the box is {64n,128m} SW128,
+                # so C must be bf16 with whole 128-row tiles. Tail n-tiles
+                # (valid_cols<256) fall back to direct stores on device.
+                is_cstore = (
+                    cstore_ext is not None
+                    and (flags & 16384) and (flags & 2) and (flags & 128)
+                    and not (flags & 4) and not (flags & 8)
+                    and args[3] % 128 == 0 and args[4] % 8 == 0
+                    and self.bufs[args[2]].dtype == torch.bfloat16
+                )
+                if not (is_n256 or is_n256_nt or is_d64 or is_cstore):
                     continue
                 ta, tb = self.bufs[args[0]], self.bufs[args[1]]
                 if ta.dtype != torch.bfloat16 or tb.dtype != torch.bfloat16:
                     continue
                 M, N, K = args[3], args[4], args[5]
+                rc = -1
+                if is_cstore:
+                    tc = self.bufs[args[2]]
+                    rc = tmap_row(tc.data_ptr(), N, M, N * 2, 64, 128)  # C[M,N]
+                if not (is_n256 or is_n256_nt or is_d64):
+                    patches.append((args, -1, -1, rc))
+                    continue
                 if is_n256_nt:
                     ra = tmap_row(ta.data_ptr(), K, M, K * 2, 64, 128)  # A[M,K]
                     rb = tmap_row(tb.data_ptr(), K, N, K * 2, 64, 64)   # B[N,K]
@@ -1443,18 +1476,21 @@ class Program:
                         rb = tmap_row(tb.data_ptr(), K, N, K * 2, 64, 64)
                     else:  # B[K,N] N-contig, one {64n,64k} MN box
                         rb = tmap_row(tb.data_ptr(), N, K, N * 2, 64, 64)
-                patches.append((args, ra, rb))
+                patches.append((args, ra, rb, rc))
         if not patches:
             return
         table = torch.cat(rows).cuda()
         assert table.data_ptr() % 128 == 0
         table_buf = self.buf(table)
-        for args, ra, rb in patches:
+        for args, ra, rb, rc in patches:
             while len(args) < MAX_ARGS:
                 args.append(0)
             args[20] = table_buf + 1
-            args[21] = ra
-            args[22] = rb
+            if ra >= 0:
+                args[21] = ra
+                args[22] = rb
+            if rc >= 0:
+                args[19] = rc + 1
 
     def finalize(self, device="cuda"):
         if not self.waves[-1]:

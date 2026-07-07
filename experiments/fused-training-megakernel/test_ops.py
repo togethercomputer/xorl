@@ -112,6 +112,62 @@ def test_gemm():
     )
     check("NT n256 nmajor bf16", C3sn, A3.float() @ Wt3.float().T, atol=0.35)
 
+    # Env-gated n256-direct EVICT_FIRST TMA C store (DeepGEMM R3 port): the
+    # host injects args[19]=1+C tmap row; full 256-col tiles drain via TMA,
+    # tail tiles fall back to the direct path inside the same instruction.
+    if int(os.environ.get("MK_GEMM_N256_TMA_STORE", "0")):
+        M5, N5, K5 = 256, 512, 128
+        A5 = torch.randn(M5, K5, device=DEV, dtype=torch.bfloat16)
+        Wt5 = torch.randn(N5, K5, device=DEV, dtype=torch.bfloat16)
+        Res5 = torch.randn(M5, N5, device=DEV, dtype=torch.bfloat16)
+
+        def build_tst(p, c, flags, res=0):
+            p.gemm_cstore_ext = EXT
+            p.gemm_n256_tma_store_enabled = True
+            p.instr(
+                mk.OP_GEMM,
+                mk.gemm_tiles_wgmma_n256_direct(M5, N5),
+                [p.buf(A5), p.buf(Wt5), p.buf(c), M5, N5, K5, flags, res],
+            )
+
+        C5 = torch.empty(M5, N5, device=DEV, dtype=torch.bfloat16)
+        run1(lambda p: build_tst(p, C5, 2 | 128 | 16384))
+        check("NT n256 TMA-store bf16", C5, A5.float() @ Wt5.float().T, atol=0.35)
+
+        C5r = torch.empty(M5, N5, device=DEV, dtype=torch.bfloat16)
+
+        def build_tst_res(p):
+            p.gemm_cstore_ext = EXT
+            p.gemm_n256_tma_store_enabled = True
+            p.instr(
+                mk.OP_GEMM,
+                mk.gemm_tiles_wgmma_n256_direct(M5, N5),
+                [p.buf(A5), p.buf(Wt5), p.buf(C5r), M5, N5, K5,
+                 2 | 16 | 128 | 16384, p.buf(Res5)],
+            )
+
+        run1(build_tst_res)
+        check("NT n256 TMA-store + residual", C5r,
+              A5.float() @ Wt5.float().T + Res5.float(), atol=0.35)
+
+        # Tail mix: N=384 -> one full TMA tile + one 128-col direct tail per
+        # 128-row band, stage3 variant.
+        C5t = torch.empty(M3, N3, device=DEV, dtype=torch.bfloat16)
+
+        def build_tst_tail(p):
+            p.gemm_cstore_ext = EXT
+            p.gemm_n256_tma_store_enabled = True
+            p.instr(
+                mk.OP_GEMM,
+                mk.gemm_tiles_wgmma_n256_direct(M3, N3),
+                [p.buf(A3), p.buf(Wt3), p.buf(C5t), M3, N3, K3,
+                 2 | 128 | 16384 | mk.GEMM_N256_STAGE3_FLAG, 0],
+            )
+
+        run1(build_tst_tail, smem_bytes=148 * 1024)
+        check("NT n256 TMA-store tail mix", C5t, A3.float() @ Wt3.float().T,
+              atol=0.35)
+
     B3 = torch.randn(K3, 256, device=DEV, dtype=torch.bfloat16)
     C3nn = torch.empty(M3, 256, device=DEV, dtype=torch.float32)
     run1(

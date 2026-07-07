@@ -542,7 +542,8 @@ __device__ __forceinline__ void wg_mbar_wait(uint64_t* bar, uint32_t phase) {
   }
 }
 
-#if defined(MK_GEMM_N256_TMA) || defined(MK_GEMM_N256_NT_TMA) || defined(MK_GEMM_D64_TMA)
+#if defined(MK_GEMM_N256_TMA) || defined(MK_GEMM_N256_NT_TMA) || defined(MK_GEMM_D64_TMA) || \
+    defined(MK_GEMM_N256_TMA_STORE)
 // GEMM round-4 TMA feed for the mbarrier-ring bodies: an elected thread
 // issues cp.async.bulk.tensor.2d per stage instead of the per-thread cp.async
 // slices, with mbarrier.arrive.expect_tx on a count-1 full barrier. Tensormaps
@@ -556,6 +557,25 @@ __device__ __forceinline__ void wg_tmap_fence_acquire(const void* map) {
   asm volatile("fence.proxy.tensormap::generic.acquire.gpu [%0], 128;" ::"l"(map)
                : "memory");
 }
+#endif
+#ifdef MK_GEMM_N256_TMA_STORE
+// DeepGEMM R3 store recipe (nt-storerecipe-standalone-a440677.md): bulk-tensor
+// C store with an EVICT_FIRST L2 policy (0x12F0... = cute CacheHintSm90::
+// EVICT_FIRST). Dirty C lines stream into DRAM writeback early instead of
+// pooling in L2 — standalone -24% / 0.92->1.21 TB/s on the C-write-bound NT
+// lm-head rows. Store-side hint only: the load-side EVICT_FIRST variant
+// measured HARMFUL (kills B L2 reuse) — do not add it to the feed paths.
+__device__ __forceinline__ void wg_tma_store_2d_ef(const void* map, const void* src,
+                                                   int x, int y) {
+  const uint32_t s = (uint32_t)__cvta_generic_to_shared(src);
+  asm volatile(
+      "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group.L2::cache_hint"
+      " [%0, {%1, %2}], [%3], %4;" ::"l"(map), "r"(x), "r"(y), "r"(s),
+      "l"(0x12F0000000000000ull)
+      : "memory");
+}
+#endif
+#if defined(MK_GEMM_N256_TMA) || defined(MK_GEMM_N256_NT_TMA) || defined(MK_GEMM_D64_TMA)
 __device__ __forceinline__ void wg_mbar_expect_tx(uint64_t* bar, uint32_t bytes) {
   const uint32_t a = (uint32_t)__cvta_generic_to_shared(bar);
   asm volatile("{.reg .b64 t; mbarrier.arrive.expect_tx.shared::cta.b64 t, [%0], %1;}"
@@ -936,6 +956,50 @@ __device__ __noinline__ void op_gemm_wgmma_n256_direct_impl(const Instr& I, int 
 
   const int w = wtid / 32, l = wtid % 32;
   const int cb = (l & 3) * 2;
+#ifdef MK_GEMM_N256_TMA_STORE
+  // DeepGEMM R3 store recipe port: stage the 128x256 bf16 tile into the DEAD
+  // mainloop ring smem (every mainloop variant ends warpgroup_wait<0> +
+  // consumer_sync before this point) as four SW128 64-col slabs
+  // (TMA_D_BLOCK_N=64), then drain via four EVICT_FIRST bulk-tensor stores on
+  // tid<4's private bulk groups. The drain overlaps the ssq/CE partial
+  // epilogues below; wait + consumer_sync run before op return so the next
+  // op's smem writes cannot race the in-flight TMA reads. Host injects
+  // args[19] = 1 + C tensormap row ({64n,128m} box, SW128) only on exact
+  // eligible rows; unset rows take the byte-identical direct path.
+  const bool tma_store = I.args[19] > 0 && I.args[20] > 0 && valid_cols == 256;
+  if (tma_store) {
+    bf16* cs = reinterpret_cast<bf16*>(&S);
+#pragma unroll
+    for (int n8 = 0; n8 < 32; ++n8) {
+      const int slab = n8 >> 3, ch = n8 & 7;
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const int r = wg * 64 + w * 16 + l / 4 + 8 * i;
+        float v0 = d[n8 * 4 + i * 2 + 0];
+        float v1 = d[n8 * 4 + i * 2 + 1];
+        if (Res) {
+          const int64_t idx = (int64_t)(m0 + r) * N + n0 + n8 * 8 + cb;
+          v0 += bf2f(Res[idx + 0]);
+          v1 += bf2f(Res[idx + 1]);
+        }
+        __nv_bfloat162 out;
+        out.x = f2bf(v0);
+        out.y = f2bf(v1);
+        *reinterpret_cast<__nv_bfloat162*>(
+            &cs[slab * 8192 + r * 64 + ((ch ^ (r & 7)) << 3) + cb]) = out;
+      }
+    }
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    consumer_sync();
+    if (tid < 4) {
+      const char* tbl = reinterpret_cast<const char*>(bufs[I.args[20] - 1]);
+      const char* tmC = tbl + (int64_t)(I.args[19] - 1) * 128;
+      wg_tmap_fence_acquire(tmC);
+      wg_tma_store_2d_ef(tmC, cs + tid * 8192, n0 + tid * 64, m0);
+      asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+    }
+  } else {
+#endif
 #pragma unroll
   for (int n8 = 0; n8 < 32; ++n8) {
     const int c = n8 * 8 + cb;
@@ -957,6 +1021,9 @@ __device__ __noinline__ void op_gemm_wgmma_n256_direct_impl(const Instr& I, int 
       }
     }
   }
+#ifdef MK_GEMM_N256_TMA_STORE
+  }
+#endif
 
   if (flags & 8192) {  // ssq partials from post-residual bf16-rounded output
     float* parts = reinterpret_cast<float*>(bufs[I.args[9]]);
@@ -992,7 +1059,26 @@ __device__ __noinline__ void op_gemm_wgmma_n256_direct_impl(const Instr& I, int 
     }
   }
 
+#ifdef MK_GEMM_N256_TMA_STORE
+  // Drain the EVICT_FIRST C stores (issued above, overlapped with the ssq/CE
+  // partials) before any thread can leave the op and start the next op's smem
+  // writes. tid<4 wait their private bulk groups; consumer_sync fans out.
+  auto tma_store_drain = [&] {
+    if (tma_store) {
+      if (tid < 4) {
+        asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
+        asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+      }
+      consumer_sync();
+    }
+  };
+  if (!(flags & 2048)) {
+    tma_store_drain();
+    return;
+  }
+#else
   if (!(flags & 2048)) return;
+#endif
 
   float* parts = reinterpret_cast<float*>(bufs[I.args[9]]);
   const int nparts = I.args[10];
@@ -1037,6 +1123,9 @@ __device__ __noinline__ void op_gemm_wgmma_n256_direct_impl(const Instr& I, int 
       }
     }
   }
+#ifdef MK_GEMM_N256_TMA_STORE
+  tma_store_drain();
+#endif
 }
 
 // m64n256 direct-store tile for exact qwen giant-vocab NN head-dX / TN dW and

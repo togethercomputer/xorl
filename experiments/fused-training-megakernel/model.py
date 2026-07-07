@@ -489,6 +489,23 @@ class MKQwen3:
         self.gemm_dx_tma_red_enabled = (
             exact_dx_tma_red if gemm_dx_tma_red_env is None else bool(int(gemm_dx_tma_red_env))
         )
+        # n256-direct NT EVICT_FIRST TMA C store (DeepGEMM R3 port): default-on
+        # for the measured C-write-bound H256/D64 long-S lm-head rows only.
+        # Certified paired A/B both orders (n256-tmastore-94cb1ef gate job):
+        # s2048 -17.3/-2.7us, s3072 -20.5/-22.8, s4096 -32.5/-27.7,
+        # s8192 -101.0/-65.9 (10/10 x6, 9/10, 7/10). qwen lm-head is a compute
+        # regime where the recipe measured neutral-to-negative standalone
+        # (nt-storerecipe-standalone-a440677.md) — excluded by the exact gate.
+        exact_n256_tma_store = (
+            (c.H, c.L, c.nq, c.nkv, c.D, c.I, c.V) == (256, 4, 4, 2, 64, 768, 8192)
+            and c.S in (2048, 3072, 4096, 8192)
+        )
+        gemm_n256_tma_store_env = os.environ.get("MK_GEMM_N256_TMA_STORE")
+        self.gemm_n256_tma_store_enabled = (
+            exact_n256_tma_store
+            if gemm_n256_tma_store_env is None
+            else bool(int(gemm_n256_tma_store_env))
+        )
         self.gemm_direct_bf16_epilogue_default = c.D == 64 and (
             c.S == 128 or (c.H, c.L, c.S, c.nq, c.nkv, c.I) == (512, 8, 1024, 8, 4, 1536)
         )
@@ -579,6 +596,7 @@ class MKQwen3:
             gemm_n256_nt_tma=self.gemm_n256_nt_tma_default,
             gemm_d64_tma=self.gemm_d64_tma_default,
             gemm_dx_tma_red=self.gemm_dx_tma_red_enabled,
+            gemm_n256_tma_store=self.gemm_n256_tma_store_enabled,
             gemm_direct_bf16_epilogue=self.gemm_direct_bf16_epilogue_default,
             head_dx_skr=self.head_dx_skr,
             pdf_producer=self.default_mode == "pdf",
@@ -680,6 +698,11 @@ class MKQwen3:
                       else self.gemm_d64_tma_default)
         if _ring_on and _d64tma_on:
             p.gemm_d64_tma_ext = self.ext
+        # Program-side arm of the n256-direct TMA C store (epilogue-only; no
+        # ring requirement — the store branch never touches the mbar ring).
+        if self.gemm_n256_tma_store_enabled:
+            p.gemm_cstore_ext = self.ext
+            p.gemm_n256_tma_store_enabled = True
         B = p.buf
         dw_no_atomic_env = os.environ.get("MK_DW_NO_ATOMIC_SK1")
 
