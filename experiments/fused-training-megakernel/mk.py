@@ -1059,6 +1059,7 @@ class Program:
         self.gemm_n256_nt_tma_enabled = False
         self.gemm_n256_tma_tn_default = False
         self.hot_embed_bwd_default = False
+        self.hot_qwen_wgu_dw_default = False
         # D64 ring TMA feed (m64n64/m64n128 mbarrier-ring bodies): same
         # contract as gemm_n256_tma_ext; the two ports share one tmap table.
         self.gemm_d64_tma_ext = None
@@ -1365,8 +1366,28 @@ class Program:
             if hot_embed_bwd_env is None
             else bool(int(hot_embed_bwd_env))
         )
+        hot_qwen_wgu_dw_env = os.environ.get("MK_HOT_QWEN_WGU_DW")
+        hot_qwen_wgu_dw = (
+            self.hot_qwen_wgu_dw_default
+            if hot_qwen_wgu_dw_env is None
+            else bool(int(hot_qwen_wgu_dw_env))
+        )
+
+        def hot_qwen_wgu_dw_leaf(i, op, args):
+            if not hot_qwen_wgu_dw or op != OP_GEMM:
+                return False
+            flags = args[6]
+            return (
+                adj_off[i + 1] == adj_off[i]
+                and args[3] == 19456 and args[4] == 2560 and args[5] == 1024
+                and (flags & 1) and not (flags & 2) and (flags & 128)
+            )
+
         crit = [
-            1 if (hot_embed_bwd and flat[i][0] == OP_EMBED_BWD)
+            1 if (
+                (hot_embed_bwd and flat[i][0] == OP_EMBED_BWD)
+                or hot_qwen_wgu_dw_leaf(i, flat[i][0], flat[i][2])
+            )
             else 0 if (adj_off[i + 1] == adj_off[i] or flat[i][0] == OP_FILL_F32)
             else 1
             for i in range(n)
