@@ -86,7 +86,7 @@ _H256_RMS_DX_H256_S = (512, 1024, 8192)    # H==256: fixed-width RMS bwd-dx opco
 _H256_D64_DROW_ZERO_SKIP_S = (256, 512)    # H==256/D==64: direct-store drow overwrites
 _ATTN_BWD_BAND_T = {2048: 12, 3072: 16, 4096: 29, 8192: 40}  # H==256/D==64; 0 elsewhere
 _ATTN_FWD_BAND_T = {2048: 16, 3072: 32, 4096: 22, 8192: 64}  # H==256/D==64; 0 elsewhere
-_ATTN_BAND_DQ_FIRST_S = (8192,)  # H==256/D==64: dq-first band emission (else lpt)
+_ATTN_BAND_DQ_FIRST_S = ()  # H==256/D==64: dq-first band emission (else lpt)
 _H256_D64_QKBWD_SPLIT_V_S = (3072, 4096, 8192)  # H==256/D==64: split qkrope v-bwd
 _H256_D64_QKROPE_N128_S = (3072, 4096, 8192)  # H==256/D==64: qkv fwd fused-qkrope n128 route
 _H256_D64_COMBINE_UNROLL_S = (4096, 8192)  # H==256/D==64: scalarized attention combine weights
@@ -1285,7 +1285,8 @@ class MKQwen3:
                 )
                 band_T = int(os.environ.get("MK_ATTN_BAND", str(default_band_T)))
                 if band_T > 0:
-                    # Only S8192 wins when DQ bands lead; shorter gated shapes regress.
+                    # Post-pdf S8192 recheck flipped back to LPT; keep dq-first
+                    # only for shapes that re-earn it in both construction orders.
                     default_band_order = (
                         "dq_first"
                         if c.H == 256 and c.D == 64 and c.S in _ATTN_BAND_DQ_FIRST_S
