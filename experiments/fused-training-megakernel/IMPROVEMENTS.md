@@ -1336,6 +1336,14 @@ s3072 -21 40/40, s8192 -165 16/16). Corrected law: the register/executor
 point is a PER-SHAPE routing decision — elected-thread feeds where the tax
 dominates, the WG2 producer where giant TMA rows dominate.
 
+**D64 TMA resweep at excluded shapes** — WIN at S2048 (-24, gate widened);
+S1024/small/nano exclusions UPHELD (+15/+64/inert)
+Why: the TMA fence/expect_tx cost amortizes only when K=S>=2048 per ring
+stage; K=1024 rows pay more in fence than they save in issue slots.
+Principle: resweep-law passes are cheap (env-only) and should test the
+MECHANISM boundary (here: K), not just shapes — the boundary told us which
+future shapes will win without measuring them.
+
 ## Meta / measurement
 
 **STACK-is-not-runtime** — STACK/res-usage is a smell, never certification.

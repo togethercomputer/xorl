@@ -6386,6 +6386,17 @@ other shapes off. The isolated promotion branch `a1647ee` already passed
 promoted-default vs forced-old `MK_GEMM_D64_TMA=0` on base `81d8222`; the shared
 landing on top of `9f0fda0` should run the same forced-old confirmation.
 
+## D64 TMA resweep at excluded shapes (session 2853e0de + subagent, 20260707T0140Z)
+
+Resweep-law pass over the D64 ring TMA exclusions
+(`mkv3-p4b-d64tma-resweep-20260707T005210Z.log`): **S2048 flips to WIN
+(-23.6us low-end, 3/3 pairs both orders) — gate widened to S in (2048, 3072,
+4096, 8192)**. Upheld exclusions with mechanism: S1024 +15, small +64 (noTN
+worse, +108), nano structurally inert (ring gate needs S>=1024; ring-forced
+pair still +30 NO-GO). Mechanism: the TMA feed pays when K=S>=2048 amortizes
+fence/expect_tx per stage; K=1024 rows lose. Diagnostic: S2048-noTN still
+-15 — NT/NN long-K dX rows carry the win, TN dW adds ~8.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
