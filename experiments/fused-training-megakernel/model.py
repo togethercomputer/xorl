@@ -88,6 +88,7 @@ _ATTN_BWD_BAND_T = {2048: 12, 3072: 16, 4096: 29, 8192: 40}  # H==256/D==64; 0 e
 _ATTN_FWD_BAND_T = {2048: 16, 3072: 32, 4096: 22, 8192: 64}  # H==256/D==64; 0 elsewhere
 _ATTN_BAND_DQ_FIRST_S = ()  # H==256/D==64: dq-first band emission (else lpt)
 _H256_D64_QKBWD_SPLIT_V_S = (3072, 4096, 8192)  # H==256/D==64: split qkrope v-bwd
+_H256_D64_QKV_V_BWD_KV_SLOT_S = (3072, 8192)  # H==256/D==64: qkv-v reads only KV rows
 _H256_D64_QKROPE_N128_S = (3072, 4096, 8192)  # H==256/D==64: qkv fwd fused-qkrope n128 route
 _H256_D64_COMBINE_UNROLL_S = (4096, 8192)  # H==256/D==64: scalarized attention combine weights
 # H==256 uniform attention chunks (Ckv, Cq) when bands are off; other shapes use the
@@ -766,6 +767,13 @@ class MKQwen3:
             qkbwd_split_v = c.H == 256 and c.D == 64 and c.S in _H256_D64_QKBWD_SPLIT_V_S
         else:
             qkbwd_split_v = bool(int(qkbwd_split_v_env))
+        qkv_v_bwd_kv_slot_env = os.environ.get("MK_QKV_V_BWD_KV_SLOT")
+        if qkv_v_bwd_kv_slot_env is None:
+            qkv_v_bwd_kv_slot = (
+                c.H == 256 and c.D == 64 and c.S in _H256_D64_QKV_V_BWD_KV_SLOT_S
+            )
+        else:
+            qkv_v_bwd_kv_slot = bool(int(qkv_v_bwd_kv_slot_env))
 
         def head_dx_target_tiles():
             env = os.environ.get("MK_HEAD_DX_TARGET_TILES")
@@ -1415,11 +1423,16 @@ class MKQwen3:
             # (dy_f32) — the former per-layer CVT chain hop is gone (v3 P1).
             qkvraw_bwd = p.buf(W["dQKVraw"], slot="qk") if qkbwd_split_v else B(W["dQKVraw"])
             if qkbwd_split_v:
+                qkv_v_bwd_src = (
+                    p.buf(W[f"dQKV_f32.{l}"], slot="kv*")
+                    if qkv_v_bwd_kv_slot
+                    else B(W[f"dQKV_f32.{l}"])
+                )
                 p.instr(
                     mk.OP_QKV_V_BWD,
                     mk.rowop_tiles(c.S),
                     [
-                        B(W[f"dQKV_f32.{l}"]),
+                        qkv_v_bwd_src,
                         p.buf(W["dQKVraw"], slot="v"),
                         c.nq,
                         c.nkv,

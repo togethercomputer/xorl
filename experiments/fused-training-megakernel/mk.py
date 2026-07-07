@@ -908,6 +908,28 @@ def _access_sets(op, args):
     raise ValueError(f"no access signature for op {op}")
 
 
+def _slots_conflict(a, b):
+    if a is None or b is None:
+        return True
+    if a == b:
+        return True
+    if (
+        isinstance(a, str)
+        and a.endswith("*")
+        and isinstance(b, str)
+        and b.startswith(a[:-1])
+    ):
+        return True
+    if (
+        isinstance(b, str)
+        and b.endswith("*")
+        and isinstance(a, str)
+        and a.startswith(b[:-1])
+    ):
+        return True
+    return False
+
+
 REGION_ROWS = 128  # producer progress granularity for df2 region watermarks
 
 ROWOP_R = 8    # swiglu/qknorm rows per tile (ops.cuh MK_ROW_R)
@@ -1110,7 +1132,7 @@ class Program:
                 for prior_idx, prior_write, prior_slot in history.get(root, ()):
                     if not (is_write or prior_write):
                         continue  # read-read never conflicts
-                    if slot is not None and prior_slot is not None and slot != prior_slot:
+                    if not _slots_conflict(slot, prior_slot):
                         continue  # declared-disjoint regions
                     if prior_idx != idx:
                         deps[idx].add(prior_idx)
@@ -1143,7 +1165,7 @@ class Program:
                 for prior_idx, prior_write, prior_slot in history.get(root, ()):
                     if not prior_write:
                         continue
-                    if slot is not None and prior_slot is not None and slot != prior_slot:
+                    if not _slots_conflict(slot, prior_slot):
                         continue
                     if prior_idx != idx:
                         s.add(prior_idx)
