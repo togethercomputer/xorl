@@ -384,7 +384,10 @@ class MKQwen3:
         elif (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) == (512, 1024, 1536, 16384, 8, 4, 64, 8):
             self.idle_ns_default = 64
         elif (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D) == (256, 512, 768, 8192, 4, 2, 64) and c.L in (4, 12):
-            self.idle_ns_default = 64
+            # post-tmared (abf854b) resweep: nano edged down to 32
+            # (-7.0/-2.4, 102/120+77/120 both orders at 120 reps); deep stays 64
+            # (32/128 wash there).
+            self.idle_ns_default = 32 if c.L == 4 else 64
         else:
             self.idle_ns_default = 256
         self.attn_dkv_float2_atomic_default = c.D == 64 and c.S % 128 == 0

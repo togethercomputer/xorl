@@ -6470,6 +6470,15 @@ pre-p-pack): -12.8/-5.4us 38/40+32/40 both orders; forced-T16 after promotion
 +0.9/+14.1 (11/40+1/40). Certified s3072 post-p-pack: 2337.5/1343.3 = 1.740x.
 Logs: mkv3-p4b-s3072-postppack-*, -bandt20-rev-*, -t20-promote-check-*.
 
+nano idle_ns 64->32 (post-tmared resweep, marginal): after abf854b changed the
+layer-dX sink cost, nano's poll optimum edged down: 32 beat 64 by -7.0/-2.4us
+(102/120+77/120, both orders, 120 reps); promoted-32 vs forced-64 check reads
+wash/-2.1-favoring-32 (59/120+88/120). Marginal (~2-7us class) but
+order-consistent at 120 reps in all four windows. deep stays 64 (32/128 wash
+there); deep SKR skr=4 and idle confirmed robust to tmared. Default arms
+post-tmared: nano ~883-890, deep ~2301-2310. Logs:
+mkv3-p4b-nanodeep-posttmared-*, -nano-idle32-{rev,promote-check}-*.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The
