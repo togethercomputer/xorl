@@ -6364,6 +6364,28 @@ IMPROVEMENTS.md entry + results/operator-gap/producer-df-design.md. Knob
 stack kept inert (MK_DF_MAXNREG, MK_DF_PRODUCER, MK_DF_NAMED_BAR) as no-go
 evidence + future attribution tools.
 
+## S2048 D64 ring TMA widening (session codex continuation, 20260707T0050Z)
+
+Source-free widening gate after the D64 ring TMA landing found the exact S2048
+cell positive while the other unmeasured boundaries stayed closed. First
+resweep pinned to `27c8084`: S1024 **+26.40/+13.78us** (0/40 and 2/40) and
+H512 small **+92.67/+76.54us** (0/40 both orders) are NO-GO; S2048 was
+negative in both orders (**-15.57/-7.58us**, 39/40 and 36/40).
+
+Current-head gate at clean `9550a7b` confirmed S2048 with forced
+`MK_GEMM_D64_TMA=1`: default-first **1834.58 -> 1818.24us (-16.34us,
+80/80)**, variant-first **1836.32 -> 1827.92us (-8.40us, 74/80)**,
+unchanged n_instr=176, loss unchanged at 9.06381, worst grad rel 0.004431
+on emb. Route dump: 51 GEMM rows, 50 eligible D64 ring rows, 50 patched,
+0 n256 rows patched, no unpatched eligible D64 rows. Gates:
+`test_ops.py` and `test_model.py` passed under `MK_GEMM_D64_TMA=1`; forced
+`_d64tma` res-usage `megakernel_df REG:255 STACK:48 LOCAL:0`, df2 same,
+`megakernel REG:255 STACK:64 LOCAL:0`. Default widened only for exact
+H256/L4/nq4/nkv2/D64/I768/V8192 S2048. Keep S1024, H512 small, qwen, and
+other shapes off. The isolated promotion branch `a1647ee` already passed
+promoted-default vs forced-old `MK_GEMM_D64_TMA=0` on base `81d8222`; the shared
+landing on top of `9f0fda0` should run the same forced-old confirmation.
+
 ## Honest assessment + v2 roadmap
 
 compile+CUDAGraph remains ~2.0x faster on the current flag-planting configs. The

@@ -410,12 +410,13 @@ class MKQwen3:
         # D64 ring TMA feed (round-4 port to the m64n64/m64n128 mbarrier-ring
         # bodies, all majors): standalone every class wins (d64_tma_ring_probe
         # both orders; TN long-K dW -16.5..-19.6%, NT/NN -1..-4.6%). Default ON
-        # for the exact long-S H256/D64 bench shapes only (measure before
-        # widening); MK_GEMM_D64_TMA=0/1 overrides, MK_GEMM_D64_TMA_TN=0
-        # excludes the TN dW rows for A/B.
+        # for the exact long-S H256/D64 bench shapes only. S2048 was widened
+        # after the current-head gate at 9550a7b (-16.34/-8.40us, 80/80 and
+        # 74/80 wins; S1024/H512 small stayed no-go). MK_GEMM_D64_TMA=0/1
+        # overrides, MK_GEMM_D64_TMA_TN=0 excludes the TN dW rows for A/B.
         exact_long_d64 = (
             (c.H, c.L, c.nq, c.nkv, c.D, c.I, c.V) == (256, 4, 4, 2, 64, 768, 8192)
-            and c.S in (3072, 4096, 8192)
+            and c.S in (2048, 3072, 4096, 8192)
         )
         self.gemm_d64_tma_default = exact_long_d64
         self.gemm_direct_bf16_epilogue_default = c.D == 64 and (
