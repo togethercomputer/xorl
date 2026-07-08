@@ -149,15 +149,16 @@ _HEAD_DX_TARGET = {256: {128: 32, 256: 64, 1024: 64, 512: 96, 2048: 96, 3072: 96
 # skr=2 -118.6/-120.6 40/40 and s4096 skr=2 -90.0/-75.6 40/40+39/40 at 0abc08f
 # (their n256 direct head-dX was 24/32 CTAs, parallelism-starved; K/CTAs 170/128
 # matches nvjet's >=90 split gate; skr=4 inferior -100.4 — one wave is enough);
-# s128 NO-GO +36.1 0/40 and s256 NO-GO +11.9 2/40 (the n128 tile shape collapses
-# at M<=256); s1024 order-flipped at 0abc08f (-6.3 69/80 then +10.0 4/80; won
-# both orders pre-qkbwd at 5c6e234 — resweep-law casualty, stays atomic); s2048
-# NO-GO (+18 skr=4, +3 skr=2) — its no-atomic direct route stands.
+# s128 NO-GO +36.1 0/40 and s256 NO-GO +11.9 2/40 (the n128 tile shape
+# collapses at M<=256); s1024 rechecked after later route changes and now wins
+# at skr=4 (-6.48 72/80, -4.02 61/80; skr=2 still rejected); s2048 NO-GO
+# (+18 skr=4, +3 skr=2) — its no-atomic direct route stands.
 # MK_HEAD_DX_SKR force-overrides (0 = old route).
 _HEAD_DX_SKR = {
     (512, 1024, 1536, 16384, 8, 4, 64, 8): 2,  # H,S,I,V,nq,nkv,D,L (small)
     (256, 512, 768, 8192, 4, 2, 64, 4): 4,     # nano
     (256, 512, 768, 8192, 4, 2, 64, 12): 4,    # deep
+    (256, 1024, 768, 8192, 4, 2, 64, 4): 4,    # s1024
     (256, 3072, 768, 8192, 4, 2, 64, 4): 2,    # s3072
     (256, 4096, 768, 8192, 4, 2, 64, 4): 2,    # s4096
 }
