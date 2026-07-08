@@ -1680,3 +1680,55 @@ improved in one day; floor deep 1.267x, frontier s8192 1.942x, small 1.533x
 Principle: batch-commit the promoted gate set, then re-cert immediately —
 per-shape paired wins compose to whole-board movement when the gates are
 exact-tuple-disjoint.
+
+**Interpreter machinery floor measured in-model (itax, 72a40301)** —
+MEASUREMENT (nop-body floors: s128 261.8 / s256 270.5 / nano 283.6 / s1024
+301.3 / s4096 433.6 / s8192 493.4 / small 575.8 / deep 717.3us = 8-36% of
+step; floor EXCEEDS the whole gap at s128/s256/nano/deep; split 74-79%
+claim+idle, 9-16% acct, <3% per-tile sync scaffold;
+itax-decomposition-3f21e1e.md; knobs default-off on itax-3f21e1e @ 92029e3)
+Why: MK_ITAX_NOP_BODY no-ops every body at dispatch() top with geometry
+pinned; MK_ITAX_STAMPS thread-0 phase buckets close at 99% attribution.
+Principle: floor = critical_path x ~3.4-4.0us/hop (df; pdf 5.4-6.2) —
+short/deep are machinery-bound, op-body work cannot close them; a deleted
+hop is worth its span PLUS ~3.5us; sync-elision and claim-batch widening
+are dead (<3% scaffold).
+
+**Release-atomic accounting publish (MK_ACCT_RELEASE_ATOM)** — NO-GO,
+correctness-refuted (deep wlm accum grad rel 1041/5730 both orders, loss
+bit-equal; itax-arel-ab-9c2b604 logs)
+Why: the per-contributor __threadfence is the protocol single global
+visibility point; dependents observe via relaxed/volatile ring reads with
+no acquire — release-only publication never establishes third-party data
+visibility.
+Principle: the accounting fence is load-bearing for DATA, not counts; no
+localized fence-weakening — a correct weak-ordering rework must acquire the
+whole discovery path, which costs more than the fence.
+
+**In-kernel AXPY grad-sum tail (microbatch interleave)** — WIN only at n==2
+(deep -82us, nano wash; deep n=3 +248us REFUTED; mbi @ 381365f)
+Why: ~200 extra cold rows are free while claim+idle dominates and poison
+the tail once three chains fill the troughs.
+Principle: cold-sink capacity is a budget — re-measure any tail insertion
+at every n.
+
+**Cold-cap post-landing resweep family (small/s2048 flips)** — WIN x2 +
+defaults-stand x5 (applied @ 05e9e97: small 48->0 -10..-15us, s2048 0->33
+-5..-7us, both 120+240-rep both-order + forced-old; deep/s1024/s3072/
+s4096/nano stand — s3072 cap16 loses +56-61us 0/120; harness nulls clean)
+Why: capping trades atomic-sink bandwidth contention against tail
+serialization; dW-SK1 removed the contention side at small, and the s2048
+gate cluster moved its balance the other way.
+Principle: resweep the cap exactly where structural landings moved the
+contention/serialization boundary; run a default-vs-itself null arm to
+validate the harness.
+
+**_access_sets fused-CE lse-partials write (flags & 2048 -> args[9])** —
+FIX landed shared @ 38e03b9 (route-identical: the dep dedupes into the
+logits RAW edge)
+Why: masked in-model, but args-driven tooling mis-handles the row — found
+when the mbi merged replay cross-aliased replica partials (deterministic
+-6.6e-3 loss drift traced to a single diverged lse_ce).
+Principle: every fused epilogue MUST register its buffer args in
+_access_sets; raw-pointer tmap descriptors are OUTSIDE the buffer-table
+contract and must be audited separately in any program surgery.
