@@ -1617,3 +1617,66 @@ Principle: a profile bucket is a bound, not a value — quote
 onpath..onpath+offpath @ anchor/mode from the dual-bound matrix, profile the
 certified route with MEDIAN selection, and size ceilings at-shape; standalone
 times never substitute for in-model (ONBOARDING rule 7).
+
+**CUDA-graphed cooperative step (make_graphed_step, 9b325e8/e5cc832)** — WIN
+additive (+8..17us/step recoverable at all 12 shapes, both executors;
+host-launch-overhead-graphstep-3f21e1e.md)
+Why: the mk arm paid Python step() + 16-arg pybind + cudaLaunchCooperativeKernel
+per step while both baselines replay graphs; coop launch captures cleanly on
+cu13.0 (D128/TMA/148KB carveout included).
+Principle: the score meter includes the launch path — measure host-side cost
+per-arm before attributing gap to the kernel; primary-row adoption is a
+meter-policy decision, not a code change.
+
+**dQ bulk-red drain gate map completed (785d048)** — WIN nano/s1024/s2048/s3072
+(-2..-23us, both orders; nano via 4/4x120), NO-GO small (order-mixed), s8192
+REFUTED AGAIN and STRENGTHENED post-dW-SK1 (+98/+100us vs +39..+55;
+dq-bulkred-gatemap-3f21e1e.md)
+Why: the drain is off-chain until the C=4 tail bands dominate; removing
+off-path atomic pressure (dW SK1) tightened the chain and exposed the drain's
+wait_group MORE.
+Principle: removing off-path pressure amplifies on-path wait laws — resweeps
+of wait-law no-gos after off-path landings confirm, not flip.
+
+**RMS dX H256 S-map completed (785d048)** — WIN s2048 (4/4x120) + s3072
+(40/40 both, -13us); map now: wins 128/512/1024/2048/3072/8192, losses
+256/4096 (rmsdx-h256-mids-3f21e1e.md)
+Why: killing the runtime H loop pays where the op is exposed on-path;
+exposure is not S-monotone.
+Principle: complete the S-map before generalizing a fixed-width body verdict —
+neighbor cells flip.
+
+**dW SK1 no-atomic mid/long-S (785d048)** — WIN s2048/s3072/s4096/s8192
+(-24..-39us each, 40/40 or 31/32 pooled), WASH s1024
+(dw-sk1-mids-3f21e1e.md)
+Why: zero-fill+atomic dW sink removal frees issue slots the overlapped
+attention chain absorbs — the off-path dual-bound (B2) family monetized.
+Principle: "off-path" is not free; direct-store rewrites of overlapped sinks
+win exactly where an on-path consumer competes for issue slots.
+
+**s2048 dQ float2-store** — NO-GO order-asymmetric (default-first -6..-7 at
+102-104/120 but variant-first 59-70/120 coin flips;
+s2048-dqf2-3f21e1e.md). _H256_DQ_FLOAT2_S map complete; S512 closed
+mechanism-N/A by source read (C==1-only epilogue, S512 rows are C=2).
+Principle: an order-asymmetric win is an allocator/layout artifact, not a
+mechanism win — close, do not promote.
+
+**Native microbatches= (canonical: 72a40301 mbi-native-05e9e97 @ 27d7e2a;
+independent replication + n-table: 6b9218df mbi-native-e5cc832 @ 57d5916)** —
+WIN: per-seq beats compile+cudagraph+ at every starvation-bound short shape
+(s128 n=4 385.5us vs 492.9; s256 n=3 1.890x family max; nano n=3; deep n=3-4);
+mid/long-S plateau at n=2-3 op-bound; pdf composes (1.24x s2048);
+graphed merged launch composes (s128 n=4 342.1us/seq = 1.44x over baseline)
+(mbi-native-e5cc832.md, mbi-native-integration-design-72a40301.md)
+Why: short-S floor is claim+idle starvation (itax hop law); a second DAG fills
+troughs without deepening the chain.
+Principle (capture gotcha): n>2 host-side grad adds must be INSIDE the CUDA
+graph (or in-kernel) — capturing only the launch silently drops accumulation
+(grad_rel ~1.0).
+
+**Post-burst certified scoreboard @ 05e9e97** — ANCHORS: all ten cells
+improved in one day; floor deep 1.267x, frontier s8192 1.942x, small 1.533x
+(-296us) (postburst-scoreboard-05e9e97.md — supersedes bb199ea non-qwen).
+Principle: batch-commit the promoted gate set, then re-cert immediately —
+per-shape paired wins compose to whole-board movement when the gates are
+exact-tuple-disjoint.
