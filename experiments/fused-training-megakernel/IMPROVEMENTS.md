@@ -1469,6 +1469,18 @@ orders; T20 was noise before 2a41f6a changed the dq stage cost)
 Principle: band budgets couple to per-stage op cost — re-sweep T neighbors
 after any attention op-body promotion at that shape.
 
+**nano idle_ns 64->32 (post-tmared)** — WIN, marginal (~2-7us, order-consistent
+4/4 windows at 120 reps; 94cb1ef)
+Principle: poll cadence re-couples after any layer-dX sink cost change; sub-6us
+verdicts need 120+ reps and order-consistency, never 40-rep singles.
+
+**small lm-head EVICT_FIRST tmastore (gate widening)** — WIN (-14.9/-22.3
+38/40+39/40; forced-off +24.8/+22.2 after; 3f59171). s1024 wash (2-wave head).
+Principle: when a peer lands a new mechanism behind an exact gate, immediately
+force-probe the mechanism's UNMEASURED shape cells (the extension pattern) —
+the gate's original shape set reflects its author's lane, not the mechanism's
+reach.
+
 ## Meta / measurement
 
 **STACK-is-not-runtime** — STACK/res-usage is a smell, never certification.
