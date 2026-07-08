@@ -1595,3 +1595,25 @@ Principle: route-gate boundaries are per-shape verdicts pinned to a schedule
 epoch — after a structural landing AT a shape, re-probe that shape`s
 REJECTED route boundaries first (they flip more often than scheduler knobs,
 which have now died at 120 reps across three independent passes).
+
+**Head-dX n128 TMA reduce-add direct drain (94cb1ef)** — NO-GO/AUDIT-BLOCKED
+(results/operator-gap/headdx-tmared-94cb1ef-nogo.md)
+Why: no-salt, `mov.u32` salt rerolls, and typed 2D fp32 shared-memory source
+views all compiled one non-F32 UBLKRED in launchable df/df2 images; the built-
+in SASS audit correctly blocked correctness/timing.
+Principle: `cp.reduce.async.bulk.add.f32` source shape is part of the contract,
+not just the mnemonic — promote only after launchable-image UBLKRED audit is
+clean; salts are not a substitute for a different source topology.
+
+**Meter honesty: per-op gap under-claim root-caused (3f21e1e/df52827)** — LANDED
+(profile_df + opgap mk_profile_ops/opgap_report; note
+results/operator-gap/gap-outline-and-claim-bias-a00c1dd.md)
+Why: the per-op matrix divided mk realized-critical-path-only, MIN-of-5,
+often-df-mode time by baseline full-wall median time — off-path mass (s8192
+attn dkv +2.9ms), the ~22% interpreter tax, and mode/anchor drift all vanish
+from every bucket, so summed per-op gaps read far below the certified step
+(gemm_dw "0.6x win" is really 0.6..5.2x).
+Principle: a profile bucket is a bound, not a value — quote
+onpath..onpath+offpath @ anchor/mode from the dual-bound matrix, profile the
+certified route with MEDIAN selection, and size ceilings at-shape; standalone
+times never substitute for in-model (ONBOARDING rule 7).
