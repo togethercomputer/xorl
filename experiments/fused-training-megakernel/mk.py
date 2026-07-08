@@ -722,6 +722,22 @@ def load_ext(
         "0" if attn_pdf_feed is None else str(int(attn_pdf_feed)),
     ))
     attn_pdf_feed = attn_pdf_feed if pdf_producer else 0
+    # pdf shell smem-state fix (pdfld lane, claim 20260708T0140Z-realclock):
+    # re-read s_ins/s_t0/s_t1 from shared across the dispatch call instead of
+    # hoisting them into registers once per claim — at the 240-reg consumer
+    # point the fat noinline callees clobber the whole pool and ptxas parks
+    # the hoisted copies in LOCAL (s2048 default-pdf: 4.83M local-LD + 6.49M
+    # local-ST sectors/launch, 63% on the shell lines; df at the same shape:
+    # 198K/2.3M; with the fix: 4.11M/5.41M — the loop counter t must stay a
+    # register, see the megakernel.cu comment). Compiled only into pdf images
+    # — non-pdf builds are bit-identical either way, and DEFAULT-OFF pending
+    # the paired timing cert (counters-only lane; stall-sample ceiling ~2% at
+    # s2048), so the certified default image is byte-stable meanwhile.
+    # MK_PDF_SHELL_SMEM=1 selects the fix image (`_pdfsms`) for A/B.
+    # (__noinline__ on the inlined row/CE op bodies was tried first and
+    # refuted: LD rose 4.83M -> 6.32M, the traffic is the ABI call boundary,
+    # not inline pressure.)
+    pdf_shell_smem = int(os.environ.get("MK_PDF_SHELL_SMEM", "0")) if pdf else 0
     # D=64 qknorm-bwd fast path; MK_QKBWD_D64_CACHE=0 keeps the old generic loop for
     # A/B and bisects. Separate extension name because torch's cache is name-keyed.
     qkbc = int(os.environ.get("MK_QKBWD_D64_CACHE", "1"))
@@ -842,7 +858,8 @@ def load_ext(
         + (f"d{pdf_dec}" if pdf and pdf_dec != 24 else "")
         + ("p" if pdf_producer else "")
         + ("_pd64f" if pdf_d64_feed else "")
-        + (("_apdff" + ("2" if attn_pdf_feed >= 2 else "")) if attn_pdf_feed else ""),
+        + (("_apdff" + ("2" if attn_pdf_feed >= 2 else "")) if attn_pdf_feed else "")
+        + ("_pdfsms" if pdf_shell_smem else ""),
         sources=[os.path.join(_DIR, "megakernel.cu")],
         extra_ldflags=["-lcuda"],
         extra_cuda_cflags=[
@@ -898,6 +915,7 @@ def load_ext(
         + (["-DMK_HEAD_DX_SKR"] if head_dx_skr else [])
         + (["-DMK_DROW_REG_EPILOGUE"] if drow_reg_epilogue else [])
         + (["-DMK_PDF", f"-DMK_PDF_REGS={pdf_regs}", f"-DMK_PDF_DEC={pdf_dec}"] if pdf else [])
+        + (["-DMK_PDF_SHELL_SMEM"] if pdf_shell_smem else [])
         + (["-DMK_PDF_PRODUCER"] if pdf_producer else [])
         + (["-DMK_PDF_D64_FEED"] if pdf_d64_feed else [])
         + ([f"-DMK_ATTN_PDF_FEED={attn_pdf_feed}"] if attn_pdf_feed else []),

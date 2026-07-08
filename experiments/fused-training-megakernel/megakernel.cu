@@ -741,6 +741,44 @@ extern "C" __global__ void __maxnreg__(168) megakernel_pdf(
       last_ins = s_ins;
     }
     consumer_sync();
+#ifdef MK_PDF_SHELL_SMEM
+    // Local-spill fix for the 240-reg consumer region (pdfld lane, claim
+    // 20260708T0140Z-realclock): the fat noinline op bodies clobber ~the whole
+    // 240-reg pool at the dispatch call, so hoisting ins/t0/t1 into registers
+    // once per claim (the df idiom, fine at 255 regs where R249+ survive every
+    // call) makes ptxas park them in LOCAL and reload per tile — measured
+    // 4.83M local-LD + 6.49M local-ST sectors/launch at s2048 default-pdf,
+    // 63% on these shell lines (df image at the same shape: 198K/2.3M).
+    // Re-reading s_ins/s_t0/s_t1 from SHARED across the call turns each
+    // rehydrate into an LDS (the call is a smem barrier, so the loads stay in
+    // the loop by construction). Writes to s_* can't race: thread 0 only
+    // rewrites them in the claim phase, which every thread's tile loop + the
+    // completion consumer_sync separate from these reads. The loop counter t
+    // stays a REGISTER on purpose: a shared tile cursor advanced by thread 0
+    // after dispatch races with other threads' loop-top reads inside the same
+    // barrier interval (tile skip / barrier desync), and the race-free
+    // variant costs a second consumer_sync per tile — t's remaining local
+    // round-trip (~2.4M sectors/launch at s2048) is the documented residual.
+    // __noinline__ on the inlined row/CE ops was tried first and REFUTED
+    // (LD 4.83M -> 6.32M): the traffic is the ABI boundary itself, not
+    // inline pressure.
+    if (s_ins < 0) break;
+    if (threadIdx.x < 3 + MK_MAX_ARGS)
+      reinterpret_cast<int*>(&s_I)[threadIdx.x] =
+          reinterpret_cast<const int*>(instrs + s_ins)[threadIdx.x];
+    consumer_sync();
+    if (iclk && threadIdx.x == 0 && s_t0 == 0) iclk[2 * s_ins] = mk_globaltimer();
+    for (int t = s_t0; t < s_t1; ++t) {
+      dispatch(s_I, t, bufs, smem);
+      consumer_sync();
+    }
+    if (threadIdx.x == 0) {
+      __threadfence();
+      const int ins = s_ins;
+      const int nt_done = s_t1 - s_t0;
+      const int d = atomicAdd(&done[ins], nt_done) + nt_done;
+      if (d == s_I.ntiles) {
+#else
     const int ins = s_ins;
     if (ins < 0) break;
     const int t0 = s_t0, t1 = s_t1;
@@ -757,6 +795,7 @@ extern "C" __global__ void __maxnreg__(168) megakernel_pdf(
       __threadfence();
       const int d = atomicAdd(&done[ins], t1 - t0) + (t1 - t0);
       if (d == s_I.ntiles) {
+#endif  // MK_PDF_SHELL_SMEM
         if (iclk) iclk[2 * ins + 1] = mk_globaltimer();
         int hint = -1;
         for (int e = adj_off[ins]; e < adj_off[ins + 1]; ++e) {

@@ -1744,3 +1744,19 @@ when the mbi merged replay cross-aliased replica partials (deterministic
 Principle: every fused epilogue MUST register its buffer args in
 _access_sets; raw-pointer tmap descriptors are OUTSIDE the buffer-table
 contract and must be audited separately in any program surgery.
+**Default-pdf local-memory attribution + MK_PDF_SHELL_SMEM (pdfld lane,
+20260708)** — MEASURED/KNOB-PARKED (counters-only: s2048 default-pdf pays
+4.83M local-LD + 6.49M local-ST sectors/launch vs df-at-s2048 198K/2.3M; 63%
+= shell claim-state rehydrates across dispatch; fix `MK_PDF_SHELL_SMEM=1`
+re-reads s_ins/s_t0/s_t1 from shared -> 4.11M/5.41M; DEFAULT-OFF pending
+paired timing cert; note results/operator-gap/pdf-localld-attribution-3f21e1e.md)
+Why: at the 240/24 exact-balance register point every dispatch call clobbers
+the whole pool, so across-call shell scalars and op-internal arrays (n128 dX
+atomic drain v[8] 921K) round-trip through local; stall-sample ceiling ~2.1%
+(0.8% on the fix image) — a boundary tax, not the long-S residual.
+Principle: the P1 __noinline__ law does NOT generalize to call-boundary
+spill — broad noinline of the inlined row/CE ops made LD WORSE (6.32M) while
+the shell class stayed byte-identical; when the pool is exactly saturated,
+the levers are live-state reduction (smem re-reads) or reg-point changes,
+never more frame isolation. A shared tile cursor is barrier-racy without a
+second consumer_sync per tile — loop counters must stay registers.
