@@ -1760,3 +1760,19 @@ the shell class stayed byte-identical; when the pool is exactly saturated,
 the levers are live-state reduction (smem re-reads) or reg-point changes,
 never more frame isolation. A shared tile cursor is barrier-racy without a
 second consumer_sync per tile — loop counters must stay registers.
+
+**pdf shell smem-state default at exact qwen4b-l1 (this commit)** — PROMOTED
+(results/operator-gap/pdf-localld-attribution-3f21e1e.md + batteries
+pdfshell-{battery-0215,esc-0300,land-0325})
+Why: 63% of the default-pdf local traffic was the shell rehydrating
+ins/t0/t1 through LOCAL across every dispatch call at the 240/24 exact-
+balance point; MK_PDF_SHELL_SMEM re-reads them from shared (LD -15%,
+ST -17%). Exact-l1 timing: -27.94/-32.29us 49/60+50/60 both orders at
+3f21e1e; promoted-vs-old at this anchor +14.77/+23.79 (old loses 17/24,
+20/24). l2 ORDER-MIXED at 80 reps (off), s8192 consistent loss (off),
+s2048-s4096 wash (off).
+Principle: at the pdf register point the ABI call boundary, not inline
+pressure, owns the local traffic — broad `__noinline__` made it WORSE
+(4.83M -> 6.32M); fix state placement, not inlining, and gate per shape
+(the s8192 loss shows shell smem re-reads tax the critical DQ-chain
+shape).

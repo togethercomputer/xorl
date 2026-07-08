@@ -539,6 +539,7 @@ def load_ext(
     pdf_producer=0,
     pdf_d64_feed=None,
     attn_pdf_feed=None,
+    pdf_shell_smem=0,
 ):
     # MK_OCC2=1 builds the 256-thread executors with __launch_bounds__(256, 2):
     # 2 blocks/SM (128-reg ceiling, ptxas spills the fat op paths). Motivated by the
@@ -737,7 +738,7 @@ def load_ext(
     # (__noinline__ on the inlined row/CE op bodies was tried first and
     # refuted: LD rose 4.83M -> 6.32M, the traffic is the ABI call boundary,
     # not inline pressure.)
-    pdf_shell_smem = int(os.environ.get("MK_PDF_SHELL_SMEM", "0")) if pdf else 0
+    pdf_shell_smem = int(os.environ.get("MK_PDF_SHELL_SMEM", int(pdf_shell_smem))) if pdf else 0
     # D=64 qknorm-bwd fast path; MK_QKBWD_D64_CACHE=0 keeps the old generic loop for
     # A/B and bisects. Separate extension name because torch's cache is name-keyed.
     qkbc = int(os.environ.get("MK_QKBWD_D64_CACHE", "1"))

@@ -507,6 +507,13 @@ class MKQwen3:
         # EMBED_BWD is hot. Marking only that exact leaf hot wins locally in both
         # construction orders; MK_HOT_QWEN_WGU_DW=0 restores the cold-leaf route.
         self.hot_qwen_wgu_dw_default = exact_qwen4b_l2
+        # pdf shell smem-state fix (see mk.py MK_PDF_SHELL_SMEM): certified
+        # exact-l1 only — escalation pdfshell-esc-3f21e1e-0300 -27.94us 49/60 /
+        # -32.29us 50/60 both orders; l2 ORDER-MIXED at 80 reps (stays off),
+        # s8192 consistent loss (+17.9/+28.5), s2048-s4096 wash
+        # (results/operator-gap/pdf-localld-attribution-3f21e1e.md + the 0215
+        # battery). MK_PDF_SHELL_SMEM overrides both ways.
+        self.pdf_shell_smem_default = exact_qwen4b_l1
         # D64 ring TMA feed (round-4 port to the m64n64/m64n128 mbarrier-ring
         # bodies, all majors): standalone every class wins (d64_tma_ring_probe
         # both orders; TN long-K dW -16.5..-19.6%, NT/NN -1..-4.6%). Default ON
@@ -699,6 +706,7 @@ class MKQwen3:
             pdf_producer=self.default_mode == "pdf",
             pdf_d64_feed=self.pdf_d64_feed_default,
             attn_pdf_feed=self.attn_pdf_feed_default,
+            pdf_shell_smem=1 if self.pdf_shell_smem_default else 0,
         )
         # D=128 WGMMA attention route (default ON for D==128, S%64==0; the opgap
         # FA4-C trio spec's fallback replacement): MK_ATTN_D128_WG=0 restores the
