@@ -69,6 +69,7 @@ enum Op : int {
   OP_COPY_I32 = 36,
   OP_SWIGLU_BWD_4W = 37,
   OP_SKR_REDUCE = 38,
+  OP_QWEN_NT_SIDECAR_BOUNDARY = 39,
 };
 
 __device__ __forceinline__ long long mk_globaltimer() {
@@ -163,6 +164,13 @@ __device__ __forceinline__ void dispatch(const Instr& I, int tile, void** bufs,
       asm volatile("trap;");
 #endif
       break;
+    case OP_QWEN_NT_SIDECAR_BOUNDARY:
+#ifdef MK_GEMM_N256_NT_SUPERTILE_SIDECAR_BOUNDARY
+      break;
+#else
+      asm volatile("trap;");
+#endif
+      break;
     case OP_QKNORM_ROPE_FWD:
       op_qknorm_rope_fwd(I, tile, bufs, smem);
       break;
@@ -236,6 +244,33 @@ __device__ __forceinline__ void dispatch(const Instr& I, int tile, void** bufs,
       break;
   }
 }
+
+#if defined(MK_GEMM_N256_NT_SUPERTILE_TOPEMBED) || \
+    defined(MK_GEMM_N256_NT_SUPERTILE_SIDECAR)
+#if !defined(MK_PDF) || !defined(MK_PDF_PRODUCER) || !defined(MK_PDF_N256_NT_FEED) || \
+    !defined(MK_GEMM_N256_NT_SUPERTILE_PDFONLY) || \
+    !defined(MK_GEMM_N256_NT_SUPERTILE_REG_EPI)
+#error "qwen NT topembed/sidecar requires qwen NT PDF producer/reg-epilogue"
+#endif
+#ifdef MK_GEMM_N256_NT_SUPERTILE_SIDECAR_BOUNDARY
+#define MK_QWEN_NT_LMHEAD_OP_MATCH(_I) \
+  (((_I).op == OP_GEMM) || ((_I).op == OP_QWEN_NT_SIDECAR_BOUNDARY))
+#else
+#define MK_QWEN_NT_LMHEAD_OP_MATCH(_I) ((_I).op == OP_GEMM)
+#endif
+#define MK_QWEN_NT_TOPEMBED_MATCH(_I) \
+  (MK_QWEN_NT_LMHEAD_OP_MATCH(_I) && \
+   (_I).args[3] == 1024 && (_I).args[4] == 151936 && \
+   (_I).args[5] == 2560 && (((_I).args[6] & 128) != 0) && \
+   (((_I).args[6] & 16384) != 0) && (((_I).args[6] & 2) != 0) && \
+   (((_I).args[6] & GEMM_N256_NT_SUPERTILE_FLAG) != 0) && \
+   !((_I).args[6] & (1 | 4 | 8 | 16 | 32 | 256 | 8192)) && \
+   (_I).args[20] > 0)
+#endif
+#if defined(MK_GEMM_N256_NT_SUPERTILE_PRUNED) && \
+    !defined(MK_GEMM_N256_NT_SUPERTILE_TOPEMBED)
+#error "MK_GEMM_N256_NT_SUPERTILE_PRUNED requires TOPEMBED"
+#endif
 
 extern "C" __global__ void megakernel(const Instr* __restrict__ instrs,
                                       const int* __restrict__ wave_start,  // [nwaves+1]
@@ -782,7 +817,34 @@ extern "C" __global__ void __maxnreg__(168) megakernel_pdf(
     consumer_sync();
     if (iclk && threadIdx.x == 0 && s_t0 == 0) iclk[2 * s_ins] = mk_globaltimer();
     for (int t = s_t0; t < s_t1; ++t) {
+#ifdef MK_GEMM_N256_NT_SUPERTILE_PRUNED
+      if (MK_QWEN_NT_TOPEMBED_MATCH(s_I)) {
+#define MK_NT_TOPEMBED_I s_I
+#define MK_NT_TOPEMBED_TILE t
+#define MK_NT_TOPEMBED_BUFS bufs
+#define MK_NT_TOPEMBED_SMEM smem
+#include "qwen_nt_topembed_body.cuh"
+#undef MK_NT_TOPEMBED_SMEM
+#undef MK_NT_TOPEMBED_BUFS
+#undef MK_NT_TOPEMBED_TILE
+#undef MK_NT_TOPEMBED_I
+      }
+#else
+#ifdef MK_GEMM_N256_NT_SUPERTILE_TOPEMBED
+      if (MK_QWEN_NT_TOPEMBED_MATCH(s_I)) {
+#define MK_NT_TOPEMBED_I s_I
+#define MK_NT_TOPEMBED_TILE t
+#define MK_NT_TOPEMBED_BUFS bufs
+#define MK_NT_TOPEMBED_SMEM smem
+#include "qwen_nt_topembed_body.cuh"
+#undef MK_NT_TOPEMBED_SMEM
+#undef MK_NT_TOPEMBED_BUFS
+#undef MK_NT_TOPEMBED_TILE
+#undef MK_NT_TOPEMBED_I
+      } else
+#endif
       dispatch(s_I, t, bufs, smem);
+#endif
       consumer_sync();
     }
     if (threadIdx.x == 0) {
@@ -801,7 +863,34 @@ extern "C" __global__ void __maxnreg__(168) megakernel_pdf(
     consumer_sync();
     if (iclk && threadIdx.x == 0 && t0 == 0) iclk[2 * ins] = mk_globaltimer();
     for (int t = t0; t < t1; ++t) {
+#ifdef MK_GEMM_N256_NT_SUPERTILE_PRUNED
+      if (MK_QWEN_NT_TOPEMBED_MATCH(s_I)) {
+#define MK_NT_TOPEMBED_I s_I
+#define MK_NT_TOPEMBED_TILE t
+#define MK_NT_TOPEMBED_BUFS bufs
+#define MK_NT_TOPEMBED_SMEM smem
+#include "qwen_nt_topembed_body.cuh"
+#undef MK_NT_TOPEMBED_SMEM
+#undef MK_NT_TOPEMBED_BUFS
+#undef MK_NT_TOPEMBED_TILE
+#undef MK_NT_TOPEMBED_I
+      }
+#else
+#ifdef MK_GEMM_N256_NT_SUPERTILE_TOPEMBED
+      if (MK_QWEN_NT_TOPEMBED_MATCH(s_I)) {
+#define MK_NT_TOPEMBED_I s_I
+#define MK_NT_TOPEMBED_TILE t
+#define MK_NT_TOPEMBED_BUFS bufs
+#define MK_NT_TOPEMBED_SMEM smem
+#include "qwen_nt_topembed_body.cuh"
+#undef MK_NT_TOPEMBED_SMEM
+#undef MK_NT_TOPEMBED_BUFS
+#undef MK_NT_TOPEMBED_TILE
+#undef MK_NT_TOPEMBED_I
+      } else
+#endif
       dispatch(s_I, t, bufs, smem);
+#endif
       consumer_sync();
     }
     if (threadIdx.x == 0) {
@@ -983,6 +1072,115 @@ extern "C" __global__ void __maxnreg__(168) megakernel_pdf(
   }
 #endif  // MK_PDF_FEED
 }
+
+#ifdef MK_GEMM_N256_NT_SUPERTILE_SIDECAR
+extern "C" __global__ void __maxnreg__(168) qwen_nt_lmhead_sidecar(
+    const Instr* __restrict__ instrs, int ins, int t0, int t1, void** bufs) {
+  extern __shared__ char smem[];
+  const int t = t0 + (int)blockIdx.x;
+  if (t >= t1) return;
+  __shared__ Instr s_I;
+  if (threadIdx.x == 0) {
+    g_pdf_feed.active = 1;
+    g_pdf_feed.seq = 0;
+    g_pdf_feed.halt = 0;
+  }
+  if (threadIdx.x < 3 + MK_MAX_ARGS) {
+    reinterpret_cast<int*>(&s_I)[threadIdx.x] =
+        reinterpret_cast<const int*>(instrs + ins)[threadIdx.x];
+  }
+  __syncthreads();
+  if (threadIdx.x < MK_CONSUMERS) {
+    if (MK_QWEN_NT_TOPEMBED_MATCH(s_I)) {
+#define MK_NT_TOPEMBED_I s_I
+#define MK_NT_TOPEMBED_TILE t
+#define MK_NT_TOPEMBED_BUFS bufs
+#define MK_NT_TOPEMBED_SMEM smem
+#include "qwen_nt_topembed_body.cuh"
+#undef MK_NT_TOPEMBED_SMEM
+#undef MK_NT_TOPEMBED_BUFS
+#undef MK_NT_TOPEMBED_TILE
+#undef MK_NT_TOPEMBED_I
+      consumer_sync();
+    }
+    if (threadIdx.x == 0) mk_pdf_st_release(&g_pdf_feed.halt, 1);
+    return;
+  }
+
+  asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" ::"n"(MK_PDF_DEC));
+#ifdef MK_PDF_GEMM_FEED
+  if (threadIdx.x == MK_CONSUMERS) {
+    volatile MkPdfFeed* Fv = &g_pdf_feed;
+    int seen = 0;
+    for (;;) {
+      const int s = mk_pdf_ld_acquire(const_cast<const int*>(&Fv->seq));
+      if (s == seen) {
+        if (Fv->halt) break;
+        __nanosleep(64);
+        continue;
+      }
+      ++seen;
+      const char* tmA = Fv->tmA;
+      const char* tmB = Fv->tmB;
+      char* a0 = Fv->a0;
+      char* a1 = Fv->a1;
+      char* b0 = Fv->b0;
+      uint64_t* bfull = Fv->bfull;
+      uint64_t* bempty = Fv->bempty;
+      const int a_st = Fv->a_stride, b_st = Fv->b_stride;
+      const int m0 = Fv->m0, n0 = Fv->n0, iters = Fv->iters, stages = Fv->stages;
+      const int bk = Fv->bk, k_base = Fv->k_base, kind = Fv->kind;
+      const unsigned xb = Fv->expect_bytes;
+      if (kind != 6) continue;
+      wg_tmap_fence_acquire(tmA);
+      wg_tmap_fence_acquire(tmB);
+      for (int t = 0; t < iters; ++t) {
+        const int st = t % stages;
+        if (t >= stages) wg_mbar_wait(&bempty[st], (t / stages - 1) & 1);
+        wg_mbar_expect_tx(&bfull[st], xb);
+        const int k0 = k_base + t * bk;
+        wg_tma_load_2d(tmA, a0 + st * a_st, k0, m0, &bfull[st]);
+        wg_tma_load_2d(tmA, a1 + st * a_st, k0, m0 + 128, &bfull[st]);
+#pragma unroll
+        for (int g = 0; g < 2; ++g)
+          wg_tma_load_2d(tmB, b0 + st * b_st + g * 8192, k0, n0 + g * 64,
+                         &bfull[st]);
+      }
+    }
+  }
+#endif  // MK_PDF_GEMM_FEED
+}
+
+void mk_run_qwen_nt_lmhead_sidecar(torch::Tensor instrs, int64_t ins64,
+                                   int64_t t0_64, int64_t t1_64,
+                                   torch::Tensor bufs, int64_t smem_bytes) {
+  TORCH_CHECK(instrs.is_cuda() && instrs.dtype() == torch::kInt32);
+  TORCH_CHECK(bufs.is_cuda() && bufs.dtype() == torch::kInt64);
+  const int n_instr = (int)(instrs.numel() / (3 + MK_MAX_ARGS));
+  TORCH_CHECK(ins64 >= 0 && ins64 < n_instr, "sidecar instruction index out of range");
+  TORCH_CHECK(t0_64 >= 0 && t0_64 < t1_64, "sidecar tile range is empty or invalid");
+  TORCH_CHECK(smem_bytes > 0, "sidecar smem_bytes must be positive");
+
+  static int sidecar_configured = 0;
+  if ((int)smem_bytes > sidecar_configured) {
+    C10_CUDA_CHECK(cudaFuncSetAttribute((void*)qwen_nt_lmhead_sidecar,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        (int)smem_bytes));
+    sidecar_configured = (int)smem_bytes;
+  }
+
+  const Instr* d_instrs = reinterpret_cast<const Instr*>(instrs.data_ptr<int>());
+  void** d_bufs = reinterpret_cast<void**>(bufs.data_ptr<int64_t>());
+  int ins = (int)ins64;
+  int t0 = (int)t0_64;
+  int t1 = (int)t1_64;
+  int ntiles = t1 - t0;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  qwen_nt_lmhead_sidecar<<<dim3(ntiles), dim3(MK_PDF_THREADS), (size_t)smem_bytes,
+                           stream.stream()>>>(d_instrs, ins, t0, t1, d_bufs);
+  C10_CUDA_CHECK(cudaGetLastError());
+}
+#endif  // MK_GEMM_N256_NT_SUPERTILE_SIDECAR
 #endif  // MK_PDF
 
 // ---- dataflow executor v2: region watermarks (tile-granular producer/consumer) -------
@@ -1889,6 +2087,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("run_ws", &mk_run_ws, "run megakernel program (warp-specialized dataflow mode)");
 #ifdef MK_PDF
   m.def("run_pdf", &mk_run_pdf, "run megakernel program (producer-df register-point mode)");
+#ifdef MK_GEMM_N256_NT_SUPERTILE_SIDECAR
+  m.def("run_qwen_nt_lmhead_sidecar", &mk_run_qwen_nt_lmhead_sidecar,
+        "run one debug qwen NT lm-head sidecar CTA over a tile interval");
+#endif
 #endif
   m.def("run_df2", &mk_run_df2, "run megakernel program (region-watermark dataflow mode)");
   m.def("nblocks", &mk_nblocks, "resolved persistent block count");

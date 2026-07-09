@@ -54,6 +54,7 @@ OP_EMBED_ZERO_ROWS = 35  # sparse grad:emb clear for previous/current token rows
 OP_COPY_I32 = 36  # small state copy, currently current tokens -> previous tokens
 OP_SWIGLU_BWD_4W = 37  # opt-in four-warps-per-row SwiGLU backward route
 OP_SKR_REDUCE = 38  # sum split-K fp32 partial slabs (round-12 SKR head-dX route)
+OP_QWEN_NT_SIDECAR_BOUNDARY = 39  # typed external sidecar producer placeholder
 
 GEMM_BM, GEMM_BN = 64, 128  # keep in sync with ops.cuh
 GEMM_DX_TMA_RED_FLAG = 1 << 6  # with bit5: dX split-K smem tile -> bulk reduce-add
@@ -555,6 +556,10 @@ def load_ext(
     gemm_n256_nt_supertile_reg_epi=None,
     gemm_n256_nt_supertile_pdfonly=None,
     gemm_n256_nt_supertile_postinit_nosync=None,
+    gemm_n256_nt_supertile_topembed=None,
+    gemm_n256_nt_supertile_pruned=None,
+    gemm_n256_nt_supertile_sidecar=None,
+    gemm_n256_nt_supertile_sidecar_boundary=None,
     gemm_n256_head_dx_exact=None,
     gemm_n256_head_dx_pdfonly=None,
     gemm_d64_tma=None,
@@ -808,9 +813,7 @@ def load_ext(
     qkbc128 = int(os.environ.get("MK_QKBWD_D128_CACHE", "1"))
     # QKNORM_ROPE_BWD vectorized IO: 16B ld8bf/st8bf/ld8dy task loops, 32/(D/16)
     # (head,row) tasks per warp iteration, per-(warp,slot) smem dw slices.
-    # Shape-gated default via the model.py kwarg (exact H256 family, S in
-    # {2048, 4096, 8192}); MK_QKBWD_VEC8=0/1 force-overrides the `_qkv8` image
-    # for A/B and rollback.
+    # Shape-gated default via the model.py kwarg; MK_QKBWD_VEC8=0/1 force-overrides.
     qkbwd_vec8 = int(os.environ.get("MK_QKBWD_VEC8", int(bool(qkbwd_vec8))))
     # SWIGLU_BWD derivative algebra: fmaf(-sg, sig, sig+sg) avoids the explicit
     # (1-sig) dependency. MK_SWIGLU_FMA_DERIV=0 restores the old form for A/B.
@@ -899,6 +902,68 @@ def load_ext(
         and gemm_n256_nt_supertile_reg_epi
         and gemm_n256_nt_supertile_postinit_nosync
     ))
+    gemm_n256_nt_supertile_topembed_env = os.environ.get(
+        "MK_GEMM_N256_NT_SUPERTILE_TOPEMBED"
+    )
+    if gemm_n256_nt_supertile_topembed is None:
+        gemm_n256_nt_supertile_topembed = int(
+            gemm_n256_nt_supertile_topembed_env or "0"
+        )
+    else:
+        gemm_n256_nt_supertile_topembed = int(bool(gemm_n256_nt_supertile_topembed))
+    gemm_n256_nt_supertile_topembed = int(bool(
+        gemm_n256_nt_supertile_pdfonly
+        and gemm_n256_nt_supertile_reg_epi
+        and gemm_n256_nt_supertile_topembed
+    ))
+    gemm_n256_nt_supertile_pruned_env = os.environ.get(
+        "MK_GEMM_N256_NT_SUPERTILE_PRUNED"
+    )
+    if gemm_n256_nt_supertile_pruned is None:
+        gemm_n256_nt_supertile_pruned = int(
+            gemm_n256_nt_supertile_pruned_env or "0"
+        )
+    else:
+        gemm_n256_nt_supertile_pruned = int(bool(gemm_n256_nt_supertile_pruned))
+    if gemm_n256_nt_supertile_pruned:
+        gemm_n256_nt_supertile_topembed = int(bool(
+            gemm_n256_nt_supertile_pdfonly
+            and gemm_n256_nt_supertile_reg_epi
+        ))
+    gemm_n256_nt_supertile_pruned = int(bool(
+        gemm_n256_nt_supertile_topembed and gemm_n256_nt_supertile_pruned
+    ))
+    gemm_n256_nt_supertile_sidecar_env = os.environ.get(
+        "MK_GEMM_N256_NT_SUPERTILE_SIDECAR"
+    )
+    gemm_n256_nt_supertile_sidecar_boundary_env = os.environ.get(
+        "MK_GEMM_N256_NT_SUPERTILE_SIDECAR_BOUNDARY"
+    )
+    if gemm_n256_nt_supertile_sidecar is None:
+        gemm_n256_nt_supertile_sidecar = int(
+            gemm_n256_nt_supertile_sidecar_env
+            or gemm_n256_nt_supertile_sidecar_boundary_env
+            or "0"
+        )
+    else:
+        gemm_n256_nt_supertile_sidecar = int(bool(gemm_n256_nt_supertile_sidecar))
+    gemm_n256_nt_supertile_sidecar = int(bool(
+        gemm_n256_nt_supertile_pdfonly
+        and gemm_n256_nt_supertile_reg_epi
+        and gemm_n256_nt_supertile_sidecar
+    ))
+    if gemm_n256_nt_supertile_sidecar_boundary is None:
+        gemm_n256_nt_supertile_sidecar_boundary = int(
+            gemm_n256_nt_supertile_sidecar_boundary_env or "0"
+        )
+    else:
+        gemm_n256_nt_supertile_sidecar_boundary = int(
+            bool(gemm_n256_nt_supertile_sidecar_boundary)
+        )
+    gemm_n256_nt_supertile_sidecar_boundary = int(bool(
+        gemm_n256_nt_supertile_sidecar
+        and gemm_n256_nt_supertile_sidecar_boundary
+    ))
     gemm_n256_head_dx_exact = int(os.environ.get(
         "MK_GEMM_N256_HEAD_DX_EXACT",
         "0" if gemm_n256_head_dx_exact is None
@@ -979,6 +1044,10 @@ def load_ext(
            else "_ntst" if gemm_n256_nt_supertile else "")
         + ("reg" if gemm_n256_nt_supertile_reg_epi else "")
         + ("_ntstnosync" if gemm_n256_nt_supertile_postinit_nosync else "")
+        + ("_nttop" if gemm_n256_nt_supertile_topembed else "")
+        + ("_ntpr" if gemm_n256_nt_supertile_pruned else "")
+        + ("_ntsc" if gemm_n256_nt_supertile_sidecar else "")
+        + ("bnd" if gemm_n256_nt_supertile_sidecar_boundary else "")
         + ("_hdxex" if gemm_n256_head_dx_exact else "")
         + ("pdf" if gemm_n256_head_dx_pdfonly else "")
         + ("_d64tma" if gemm_d64_tma else "")
@@ -1056,6 +1125,14 @@ def load_ext(
            if gemm_n256_nt_supertile_pdfonly else [])
         + (["-DMK_GEMM_N256_NT_SUPERTILE_POSTINIT_NOSYNC"]
            if gemm_n256_nt_supertile_postinit_nosync else [])
+        + (["-DMK_GEMM_N256_NT_SUPERTILE_TOPEMBED"]
+           if gemm_n256_nt_supertile_topembed else [])
+        + (["-DMK_GEMM_N256_NT_SUPERTILE_PRUNED"]
+           if gemm_n256_nt_supertile_pruned else [])
+        + (["-DMK_GEMM_N256_NT_SUPERTILE_SIDECAR"]
+           if gemm_n256_nt_supertile_sidecar else [])
+        + (["-DMK_GEMM_N256_NT_SUPERTILE_SIDECAR_BOUNDARY"]
+           if gemm_n256_nt_supertile_sidecar_boundary else [])
         + (["-DMK_GEMM_N256_HEAD_DX_EXACT"] if gemm_n256_head_dx_exact else [])
         + (["-DMK_GEMM_N256_HEAD_DX_PDFONLY"] if gemm_n256_head_dx_pdfonly else [])
         + (["-DMK_GEMM_D64_TMA"] if gemm_d64_tma else [])
@@ -1152,7 +1229,7 @@ def _access_sets(op, args):
         return [1], [0]
     if op == OP_SKR_REDUCE:
         return [0], [1]
-    if op == OP_GEMM:
+    if op in (OP_GEMM, OP_QWEN_NT_SIDECAR_BOUNDARY):
         flags = args[6]
         r, w = [0, 1], [2]
         if flags & 16:
@@ -1342,7 +1419,7 @@ def _gemm_row_info(args):
 
 def _producer_row_info(op, ntiles, args, root, root_of):
     """(rows, band_tiles) if `root` is written row-linearly by this instr."""
-    if op == OP_GEMM:
+    if op in (OP_GEMM, OP_QWEN_NT_SIDECAR_BOUNDARY):
         if root_of(args[2]) == root:
             return _gemm_row_info(args)
         if args[6] & 256 and root_of(args[15]) == root:  # fused qkrope: qkvr rows = C rows
@@ -1372,7 +1449,7 @@ def _producer_row_info(op, ntiles, args, root, root_of):
 
 def _consumer_gate_k(op, ntiles, args, pos, prod_rows):
     """Consumer tiles enabled per completed producer region, or None if not gateable."""
-    if op == OP_GEMM:
+    if op in (OP_GEMM, OP_QWEN_NT_SIDECAR_BOUNDARY):
         flags = args[6]
         ok = (pos == 0 and not (flags & 1)) or (pos == 7 and (flags & 16))
         if not ok:
@@ -1424,6 +1501,12 @@ class Program:
         # args[20] and adds args[19] = 1 + C row (0 = direct-store path).
         self.gemm_cstore_ext = None
         self.gemm_n256_tma_store_enabled = False
+        self.gemm_n256_nt_sidecar_cutpoint_enabled = False
+        self.gemm_n256_nt_sidecar_split_plan_enabled = False
+        self.gemm_n256_nt_sidecar_boundary_enabled = False
+        self.qwen_nt_sidecar_cutpoints = []
+        self.qwen_nt_sidecar_split_plan = None
+        self.qwen_nt_sidecar_boundary_rows = []
 
     def buf(self, t: torch.Tensor, slot=None) -> int:
         """Register a CUDA tensor; returns its buffer-table index.
@@ -1469,6 +1552,232 @@ class Program:
                 root, _ = self._buf_meta[buf_id]
                 history.setdefault(root, []).append((idx, is_write, self._buf_meta[buf_id][1]))
         return deps
+
+    @staticmethod
+    def _is_qwen_nt_sidecar_lmhead_row(op, ntiles, args):
+        required = (
+            2
+            | 128
+            | 2048
+            | 16384
+            | GEMM_N256_STAGE3_FLAG
+            | GEMM_N256_NMAJOR_FLAG
+            | GEMM_N256_NT_SUPERTILE_FLAG
+        )
+        forbidden = 1 | 4 | 8 | 32
+        if op not in (OP_GEMM, OP_QWEN_NT_SIDECAR_BOUNDARY) or len(args) < 11:
+            return False
+        flags = int(args[6])
+        if (flags & required) != required or (flags & forbidden):
+            return False
+        if [int(args[3]), int(args[4]), int(args[5])] != [1024, 151936, 2560]:
+            return False
+        expected_tiles = gemm_tiles_wgmma_n256_nt_supertile(args[3], args[4])
+        return int(ntiles) == expected_tiles
+
+    def _apply_qwen_nt_sidecar_boundary(self):
+        """Replace the exact qwen lm-head GEMM row with a typed boundary op."""
+        rows = []
+        flat_idx = 0
+        for wave in self.waves:
+            for j, (op, ntiles, args) in enumerate(wave):
+                if self._is_qwen_nt_sidecar_lmhead_row(op, ntiles, args):
+                    if op == OP_QWEN_NT_SIDECAR_BOUNDARY:
+                        raise RuntimeError("qwen NT sidecar boundary was applied twice")
+                    wave[j] = (
+                        OP_QWEN_NT_SIDECAR_BOUNDARY,
+                        ntiles,
+                        list(args),
+                    )
+                    rows.append({
+                        "instr_index": int(flat_idx),
+                        "op": OP_QWEN_NT_SIDECAR_BOUNDARY,
+                        "replaces_op": OP_GEMM,
+                        "symbol": "qwen_nt_lmhead_sidecar",
+                        "ntiles": int(ntiles),
+                        "shape": {
+                            "M": int(args[3]),
+                            "N": int(args[4]),
+                            "K": int(args[5]),
+                        },
+                        "flags": int(args[6]),
+                    })
+                flat_idx += 1
+        if len(rows) != 1:
+            raise RuntimeError(
+                "expected exactly one qwen NT sidecar boundary row, "
+                f"found {len(rows)}"
+            )
+        self.qwen_nt_sidecar_boundary_rows = rows
+
+    def _build_qwen_nt_sidecar_cutpoints(self, flat, deps, dependents):
+        """Host-only contract for splitting the exact qwen L2 lm-head row."""
+        cutpoints = []
+        for idx, (op, ntiles, args) in enumerate(flat):
+            if not self._is_qwen_nt_sidecar_lmhead_row(op, ntiles, args):
+                continue
+            flags = int(args[6])
+            r_pos, w_pos = _access_sets(op, args)
+            direct = sorted(dependents[idx])
+            ce_fwd = [
+                j for j in direct
+                if flat[j][0] == OP_CE_FWD
+                and flat[j][2][0] == args[2]
+                and len(flat[j][2]) > 6
+                and flat[j][2][6] == args[9]
+            ]
+            ce_bwd = [
+                j for j in direct
+                if flat[j][0] == OP_CE_BWD and flat[j][2][0] == args[2]
+            ]
+            if not ce_fwd or not ce_bwd:
+                continue
+            cutpoints.append({
+                "kind": "qwen_nt_lmhead",
+                "symbol": "qwen_nt_lmhead_sidecar",
+                "instr_index": idx,
+                "op": int(op),
+                "original_op": OP_GEMM,
+                "boundary_op": (
+                    OP_QWEN_NT_SIDECAR_BOUNDARY
+                    if op == OP_QWEN_NT_SIDECAR_BOUNDARY
+                    else None
+                ),
+                "ntiles": int(ntiles),
+                "tile_start": 0,
+                "tile_stop": int(ntiles),
+                "shape": {"M": int(args[3]), "N": int(args[4]), "K": int(args[5])},
+                "flags": flags,
+                "args": [int(x) for x in args],
+                "read_arg_positions": list(r_pos),
+                "write_arg_positions": list(w_pos),
+                "input_bufs": {"xnf": int(args[0]), "wlm": int(args[1])},
+                "output_bufs": {"logits": int(args[2]), "lse_parts": int(args[9])},
+                "producer_deps": sorted(int(x) for x in deps[idx]),
+                "producer_dep_ops": [int(flat[j][0]) for j in sorted(deps[idx])],
+                "direct_dependents": direct,
+                "direct_dependent_ops": [int(flat[j][0]) for j in direct],
+                "ce_fwd_dependents": ce_fwd,
+                "ce_bwd_dependents": ce_bwd,
+                "sidecar_launch": {
+                    "instrs": "Program._instrs",
+                    "ins": idx,
+                    "t0": 0,
+                    "t1": int(ntiles),
+                    "bufs": "Program._buftab",
+                    "threads": 384,
+                },
+            })
+        if len(cutpoints) != 1:
+            raise RuntimeError(
+                "expected exactly one qwen NT lm-head sidecar cutpoint, "
+                f"found {len(cutpoints)}"
+            )
+        return cutpoints
+
+    @staticmethod
+    def _transitive_closure(starts, edges):
+        seen = {int(x) for x in starts}
+        stack = list(seen)
+        while stack:
+            src = stack.pop()
+            for dst in edges[src]:
+                dst = int(dst)
+                if dst in seen:
+                    continue
+                seen.add(dst)
+                stack.append(dst)
+        return sorted(seen)
+
+    def _build_qwen_nt_sidecar_split_plan(self, flat, deps, dependents):
+        """Static split/rejoin protocol derived from the qwen NT cutpoint DAG."""
+        if len(self.qwen_nt_sidecar_cutpoints) != 1:
+            raise RuntimeError(
+                "expected exactly one qwen NT sidecar cutpoint before split plan"
+            )
+        cutpoint = self.qwen_nt_sidecar_cutpoints[0]
+        idx = int(cutpoint["instr_index"])
+        producer_deps = sorted(int(x) for x in deps[idx])
+        direct = sorted(int(x) for x in dependents[idx])
+        pre_closure = self._transitive_closure(producer_deps, deps)
+        independent_before = [
+            int(i) for i in range(idx) if i not in pre_closure
+        ]
+        post_closure = self._transitive_closure(direct, dependents)
+        independent_after = [
+            int(i) for i in range(idx + 1, len(flat)) if i not in post_closure
+        ]
+        violations = []
+        if any(i >= idx for i in pre_closure):
+            violations.append("pre-sidecar dependency closure reaches the cutpoint")
+        if any(i <= idx for i in post_closure):
+            violations.append("post-sidecar dependent closure reaches before the cutpoint")
+        for i, d in enumerate(deps):
+            for j in d:
+                if int(j) >= i:
+                    violations.append(f"dependency {j}->{i} violates instruction order")
+        if sorted(int(x) for x in cutpoint["producer_deps"]) != producer_deps:
+            violations.append("cutpoint producer deps changed before split-plan build")
+        if sorted(int(x) for x in cutpoint["direct_dependents"]) != direct:
+            violations.append("cutpoint direct dependents changed before split-plan build")
+        for i in direct:
+            if idx not in deps[i]:
+                violations.append(f"direct rejoin row {i} no longer depends on cutpoint")
+
+        return {
+            "kind": "qwen_nt_lmhead_sidecar_split_plan",
+            "runnable_now": False,
+            "valid_topological_split": not violations,
+            "violations": violations,
+            "cutpoint_instr": idx,
+            "cutpoint_kind": cutpoint["kind"],
+            "cutpoint_symbol": cutpoint["symbol"],
+            "cutpoint_shape": dict(cutpoint["shape"]),
+            "cutpoint_flags": int(cutpoint["flags"]),
+            "cutpoint_ntiles": int(cutpoint["ntiles"]),
+            "cutpoint_op": int(cutpoint["op"]),
+            "cutpoint_original_op": int(cutpoint["original_op"]),
+            "cutpoint_boundary_op": cutpoint["boundary_op"],
+            "main_row_replaced_by_boundary": (
+                cutpoint["boundary_op"] == OP_QWEN_NT_SIDECAR_BOUNDARY
+            ),
+            "pre_sidecar_required_closure": pre_closure,
+            "pre_sidecar_independent_before_cutpoint": independent_before,
+            "pre_sidecar_instruction_window": [0, idx],
+            "sidecar_external_producer": {
+                "symbol": cutpoint["symbol"],
+                "replaces_instr": idx,
+                "reads": dict(cutpoint["input_bufs"]),
+                "writes": dict(cutpoint["output_bufs"]),
+                "launch": dict(cutpoint["sidecar_launch"]),
+            },
+            "direct_rejoin_dependents": direct,
+            "direct_rejoin_ops": [int(flat[i][0]) for i in direct],
+            "direct_rejoin_original_deps": {
+                str(i): sorted(int(x) for x in deps[i]) for i in direct
+            },
+            "external_edges": [
+                {
+                    "producer": cutpoint["symbol"],
+                    "consumer": int(i),
+                    "consumer_op": int(flat[i][0]),
+                }
+                for i in direct
+            ],
+            "post_sidecar_closure": post_closure,
+            "post_sidecar_ops": [int(flat[i][0]) for i in post_closure],
+            "independent_after_cutpoint": independent_after,
+            "original_row_policy": (
+                "replace the original lm-head row with a typed boundary/no-op "
+                "or run a partial executor that skips it before parity"
+            ),
+            "executor_requirements": [
+                "run all pre-sidecar dependencies through the recorded cutpoint deps",
+                "launch qwen_nt_lmhead_sidecar for the recorded tile range",
+                "publish logits and lse_parts as an external producer",
+                "resume the direct rejoin dependents only after sidecar completion",
+            ],
+        }
 
     def _build_gates(self, flat, deps):
         """Region-watermark gating for df2: pick ≤1 gated in-edge per consumer.
@@ -1679,6 +1988,10 @@ class Program:
         if not self.waves[-1]:
             self.waves.pop()
         self._inject_gemm_tmaps()
+        if self.gemm_n256_nt_sidecar_boundary_enabled:
+            self._apply_qwen_nt_sidecar_boundary()
+        else:
+            self.qwen_nt_sidecar_boundary_rows = []
         flat = [ins for wave in self.waves for ins in wave]
 
         # wave-mode arrays
@@ -1704,6 +2017,16 @@ class Program:
         for i, d in enumerate(deps):
             for j in d:
                 dependents[j].append(i)
+        self.qwen_nt_sidecar_cutpoints = (
+            self._build_qwen_nt_sidecar_cutpoints(flat, deps, dependents)
+            if self.gemm_n256_nt_sidecar_cutpoint_enabled
+            else []
+        )
+        self.qwen_nt_sidecar_split_plan = (
+            self._build_qwen_nt_sidecar_split_plan(flat, deps, dependents)
+            if self.gemm_n256_nt_sidecar_split_plan_enabled
+            else None
+        )
         adj_off, adj = [0], []
         for i in range(n):
             adj.extend(sorted(dependents[i]))
@@ -1888,6 +2211,151 @@ class Program:
         if tail > 0:
             cap |= max(1, self._n_hot - tail) << 20
         return cap
+
+    def _build_pdf_subprogram(self, indices):
+        """Build PDF executor tensors for a topological subgraph.
+
+        Dependencies outside the subgraph are intentionally dropped; callers must
+        sequence those producers before launching the returned subprogram.
+        """
+        indices = [int(i) for i in indices]
+        if not indices:
+            raise ValueError("pdf subprogram must contain at least one instruction")
+        if indices != sorted(indices):
+            raise ValueError("pdf subprogram indices must be in topological order")
+        if len(set(indices)) != len(indices):
+            raise ValueError("pdf subprogram indices must be unique")
+
+        flat = [ins for wave in self.waves for ins in wave]
+        if indices[0] < 0 or indices[-1] >= len(flat):
+            raise ValueError("pdf subprogram index out of range")
+        deps = self._build_deps(flat)
+        remap = {old: new for new, old in enumerate(indices)}
+        local_deps = []
+        local_deps_by_index = {}
+        dropped_deps = {}
+        for old in indices:
+            local = []
+            local_orig = []
+            dropped = []
+            for dep in deps[old]:
+                if dep in remap:
+                    local.append(remap[dep])
+                    local_orig.append(int(dep))
+                else:
+                    dropped.append(int(dep))
+            local_deps.append(local)
+            if local_orig:
+                local_deps_by_index[int(old)] = local_orig
+            if dropped:
+                dropped_deps[int(old)] = dropped
+
+        dependents = [[] for _ in indices]
+        for i, row_deps in enumerate(local_deps):
+            for dep in row_deps:
+                dependents[dep].append(i)
+        adj_off, adj = [0], []
+        for deps_i in dependents:
+            adj.extend(sorted(deps_i))
+            adj_off.append(len(adj))
+
+        dep_cnt = [len(d) for d in local_deps]
+        device = self._instrs.device
+        idx = torch.tensor(indices, dtype=torch.long, device=device)
+        instr_rows = self._instrs.view(-1, INSTR_INTS).index_select(0, idx).contiguous()
+        return {
+            "indices": indices,
+            "instrs": instr_rows.view(-1).contiguous(),
+            "dep_cnt": torch.tensor(dep_cnt, dtype=torch.int32, device=device),
+            "adj_off": torch.tensor(adj_off, dtype=torch.int32, device=device),
+            "adj": torch.tensor(adj if adj else [0], dtype=torch.int32, device=device),
+            "claim": self._claim.index_select(0, idx).contiguous(),
+            "crit": self._crit.index_select(0, idx).contiguous(),
+            "state": torch.empty(5 * len(indices) + 8, dtype=torch.int32, device=device),
+            "dep_cnt_list": dep_cnt,
+            "adj_off_list": adj_off,
+            "adj_list": adj,
+            "local_deps_by_index": local_deps_by_index,
+            "dropped_deps": dropped_deps,
+            "critical_path": self._critical_path(local_deps, [flat[i] for i in indices]),
+            "n_instr": len(indices),
+        }
+
+    def _run_pdf_subprogram(self, ext, subprogram, smem_bytes, wave_clk=None):
+        if not hasattr(ext, "run_pdf"):
+            raise RuntimeError("extension was not built with PDF executor export")
+        ext.run_pdf(
+            subprogram["instrs"],
+            subprogram["dep_cnt"],
+            subprogram["adj_off"],
+            subprogram["adj"],
+            subprogram["claim"],
+            subprogram["crit"],
+            self._cold_cap_word(),
+            subprogram["state"],
+            self._buftab,
+            int(smem_bytes),
+            wave_clk,
+            -1,
+            0,
+            -1,
+            0,
+        )
+
+    def qwen_nt_sidecar_pdf_subprograms(self):
+        if not self.qwen_nt_sidecar_split_plan:
+            raise RuntimeError("qwen NT sidecar split plan is not available")
+        if len(self.qwen_nt_sidecar_cutpoints) != 1:
+            raise RuntimeError("expected exactly one qwen NT sidecar cutpoint")
+        cutpoint = self.qwen_nt_sidecar_cutpoints[0]
+        idx = int(cutpoint["instr_index"])
+        n = int(self.n_instr)
+        prefix_indices = list(range(idx))
+        post_indices = list(range(idx + 1, n))
+        prefix = self._build_pdf_subprogram(prefix_indices)
+        post = self._build_pdf_subprogram(post_indices)
+        return {
+            "cutpoint": cutpoint,
+            "prefix": prefix,
+            "post": post,
+            "prefix_indices": prefix_indices,
+            "post_indices": post_indices,
+        }
+
+    def run_qwen_nt_sidecar_prefix(self, ext, smem_bytes, subprograms=None):
+        if subprograms is None:
+            subprograms = self.qwen_nt_sidecar_pdf_subprograms()
+        self._run_pdf_subprogram(ext, subprograms["prefix"], smem_bytes)
+
+    def run_qwen_nt_sidecar_post(self, ext, smem_bytes, subprograms=None):
+        if subprograms is None:
+            subprograms = self.qwen_nt_sidecar_pdf_subprograms()
+        self._run_pdf_subprogram(ext, subprograms["post"], smem_bytes)
+
+    def run_qwen_nt_lmhead_sidecar(self, ext, smem_bytes, cutpoint=None,
+                                   tile_start=None, tile_stop=None):
+        """Debug-launch the qwen NT lm-head sidecar for a recorded cutpoint range."""
+        if cutpoint is None:
+            if len(self.qwen_nt_sidecar_cutpoints) != 1:
+                raise RuntimeError("expected exactly one qwen NT sidecar cutpoint")
+            cutpoint = self.qwen_nt_sidecar_cutpoints[0]
+        if not hasattr(ext, "run_qwen_nt_lmhead_sidecar"):
+            raise RuntimeError("extension was not built with qwen NT sidecar export")
+        t0 = int(cutpoint["tile_start"] if tile_start is None else tile_start)
+        t1 = int(cutpoint["tile_stop"] if tile_stop is None else tile_stop)
+        if not (0 <= t0 < t1 <= int(cutpoint["ntiles"])):
+            raise ValueError(
+                f"invalid qwen NT sidecar tile range [{t0}, {t1}) "
+                f"for {cutpoint['ntiles']} tiles"
+            )
+        ext.run_qwen_nt_lmhead_sidecar(
+            self._instrs,
+            int(cutpoint["instr_index"]),
+            t0,
+            t1,
+            self._buftab,
+            int(smem_bytes),
+        )
 
     def run(self, ext, smem_bytes=None, wave_clk=None, mode="df", bind_bufs=None):
         if smem_bytes is None:

@@ -530,6 +530,73 @@ class MKQwen3:
         # MK_GEMM_N256_NT_SUPERTILE_POSTINIT_NOSYNC=0 restores the old sync path;
         # L1 remains env-only until it has stronger evidence.
         self.gemm_n256_nt_supertile_postinit_nosync_default = exact_qwen4b_l2
+        nt_supertile_topembed_env = os.environ.get(
+            "MK_GEMM_N256_NT_SUPERTILE_TOPEMBED"
+        )
+        nt_supertile_pruned_env = os.environ.get(
+            "MK_GEMM_N256_NT_SUPERTILE_PRUNED"
+        )
+        nt_supertile_sidecar_env = os.environ.get(
+            "MK_GEMM_N256_NT_SUPERTILE_SIDECAR"
+        )
+        nt_supertile_sidecar_cutpoint_env = os.environ.get(
+            "MK_GEMM_N256_NT_SUPERTILE_SIDECAR_CUTPOINT"
+        )
+        nt_supertile_sidecar_split_plan_env = os.environ.get(
+            "MK_GEMM_N256_NT_SUPERTILE_SIDECAR_SPLIT_PLAN"
+        )
+        nt_supertile_sidecar_boundary_env = os.environ.get(
+            "MK_GEMM_N256_NT_SUPERTILE_SIDECAR_BOUNDARY"
+        )
+        nt_supertile_sidecar_boundary_default = exact_qwen4b_l1 or exact_qwen4b_l2
+        self.gemm_n256_nt_supertile_sidecar_boundary_requested = bool(
+            int(
+                nt_supertile_sidecar_boundary_env
+                if nt_supertile_sidecar_boundary_env is not None
+                else str(int(nt_supertile_sidecar_boundary_default))
+            )
+        )
+        self.gemm_n256_nt_supertile_sidecar_split_plan_requested = bool(
+            int(nt_supertile_sidecar_split_plan_env or "0")
+        ) or self.gemm_n256_nt_supertile_sidecar_boundary_requested
+        nt_supertile_sidecar_requested = (
+            bool(int(nt_supertile_sidecar_env or "0"))
+            or bool(int(nt_supertile_sidecar_cutpoint_env or "0"))
+            or self.gemm_n256_nt_supertile_sidecar_split_plan_requested
+        )
+        self.gemm_n256_nt_supertile_sidecar_cutpoint_requested = bool(
+            int(nt_supertile_sidecar_cutpoint_env or "0")
+        ) or self.gemm_n256_nt_supertile_sidecar_split_plan_requested
+        self.gemm_n256_nt_supertile_pruned_enabled = (
+            bool(int(nt_supertile_pruned_env or "0"))
+            and exact_qwen4b_l2
+            and self.gemm_n256_nt_supertile_enabled
+            and self.gemm_n256_nt_supertile_reg_epi_enabled
+            and self.gemm_n256_nt_supertile_pdfonly_default
+        )
+        self.gemm_n256_nt_supertile_sidecar_enabled = (
+            nt_supertile_sidecar_requested
+            and (exact_qwen4b_l1 or exact_qwen4b_l2)
+            and self.gemm_n256_nt_supertile_enabled
+            and self.gemm_n256_nt_supertile_reg_epi_enabled
+            and self.gemm_n256_nt_supertile_pdfonly_default
+        )
+        self.gemm_n256_nt_supertile_sidecar_cutpoint_enabled = (
+            self.gemm_n256_nt_supertile_sidecar_cutpoint_requested
+            and self.gemm_n256_nt_supertile_sidecar_enabled
+        )
+        self.gemm_n256_nt_supertile_sidecar_boundary_enabled = (
+            self.gemm_n256_nt_supertile_sidecar_boundary_requested
+            and self.gemm_n256_nt_supertile_sidecar_enabled
+        )
+        self.gemm_n256_nt_supertile_topembed_enabled = (
+            (bool(int(nt_supertile_topembed_env or "0"))
+             or self.gemm_n256_nt_supertile_pruned_enabled)
+            and exact_qwen4b_l2
+            and self.gemm_n256_nt_supertile_enabled
+            and self.gemm_n256_nt_supertile_reg_epi_enabled
+            and self.gemm_n256_nt_supertile_pdfonly_default
+        )
         # L2 terminal EMBED_BWD sits as an off-path cold leaf while lm-head dW drains;
         # making only that leaf hot recovers ~0.14-0.17ms at exact qwen4b-l2 with
         # qwen4b-l1 neutral and generic shapes order-mixed. MK_HOT_EMBED_BWD=0/1
@@ -779,16 +846,8 @@ class MKQwen3:
         )
         # QKNORM_ROPE_BWD vectorized IO (MK_QKBWD_VEC8): 16B ld8bf/st8bf/ld8dy
         # task loops, 32/(D/16) (head,row) tasks per warp iteration,
-        # per-(warp,slot) smem dw slices. Clean-GPU verdicts (GPU 3, both
-        # construction orders):
-        #   PROMOTE s8192 -129.7/-127.9us (16/16 x2)
-        #   PROMOTE s4096 -36.1/-34.0us (40/40 x2)
-        #   PROMOTE s2048 -10.9/-11.5us (37/40 + 35/40)
-        #   EXCLUDE s3072 wash (-8.6us, 23/40)
-        #   EXCLUDE nano +5.3us (4/40)
-        #   EXCLUDE small +91.2us (0/40, hard regression)
-        # Exact H256-family gate, S in {2048, 4096, 8192} only.
-        # MK_QKBWD_VEC8=0/1 force-overrides for A/B and rollback.
+        # per-(warp,slot) smem dw slices. Exact H256-family gate, S in
+        # {2048, 4096, 8192} only. MK_QKBWD_VEC8=0/1 force-overrides.
         self.qkbwd_vec8_default = (
             (c.H, c.L, c.nq, c.nkv, c.D, c.I, c.V) == (256, 4, 4, 2, 64, 768, 8192)
             and c.S in (2048, 4096, 8192)
@@ -827,6 +886,18 @@ class MKQwen3:
             gemm_n256_nt_supertile_pdfonly=self.gemm_n256_nt_supertile_pdfonly_default,
             gemm_n256_nt_supertile_postinit_nosync=(
                 self.gemm_n256_nt_supertile_postinit_nosync_default
+            ),
+            gemm_n256_nt_supertile_topembed=(
+                self.gemm_n256_nt_supertile_topembed_enabled
+            ),
+            gemm_n256_nt_supertile_pruned=(
+                self.gemm_n256_nt_supertile_pruned_enabled
+            ),
+            gemm_n256_nt_supertile_sidecar=(
+                self.gemm_n256_nt_supertile_sidecar_enabled
+            ),
+            gemm_n256_nt_supertile_sidecar_boundary=(
+                self.gemm_n256_nt_supertile_sidecar_boundary_enabled
             ),
             gemm_n256_head_dx_exact=self.gemm_n256_head_dx_exact_default,
             gemm_n256_head_dx_pdfonly=self.gemm_n256_head_dx_pdfonly_default,
@@ -899,6 +970,13 @@ class MKQwen3:
         self.in_kernel_inv_valid = bool(int(os.environ.get("MK_INV_VALID_IN_KERNEL", "1")))
         self.bind_inputs = bool(int(os.environ.get("MK_BIND_INPUTS", "1")))
         self._inputs_bound_external = False
+        self._qwen_nt_sidecar_pdf_subprograms = None
+        qwen_nt_sidecar_step_env = os.environ.get("MK_QWEN_NT_SIDECAR_STEP")
+        self.qwen_nt_sidecar_step_requested = bool(
+            int(qwen_nt_sidecar_step_env)
+            if qwen_nt_sidecar_step_env is not None
+            else self.gemm_n256_nt_supertile_sidecar_boundary_enabled
+        )
         self._build_program()
 
     # ------------------------------------------------------------------ #
@@ -940,6 +1018,16 @@ class MKQwen3:
         _nt_supertile_on = (
             self.gemm_n256_nt_supertile_enabled and _ring_on and _nt_tma_on
         )
+        _nt_pdfonly_env = os.environ.get("MK_GEMM_N256_NT_SUPERTILE_PDFONLY")
+        _nt_pdfonly_on = (
+            bool(int(_nt_pdfonly_env)) if _nt_pdfonly_env is not None
+            else self.gemm_n256_nt_supertile_pdfonly_default
+        )
+        _pdf_producer_env = os.environ.get("MK_PDF_PRODUCER")
+        _pdf_producer_on = (
+            bool(int(_pdf_producer_env)) if _pdf_producer_env is not None
+            else self.default_mode == "pdf"
+        )
         # Program-side arm of MK_GEMM_D64_TMA (same ring requirement).
         _d64tma_env = os.environ.get("MK_GEMM_D64_TMA")
         _d64tma_on = (bool(int(_d64tma_env)) if _d64tma_env is not None
@@ -951,6 +1039,22 @@ class MKQwen3:
         if self.gemm_n256_tma_store_enabled:
             p.gemm_cstore_ext = self.ext
             p.gemm_n256_tma_store_enabled = True
+        p.gemm_n256_nt_sidecar_cutpoint_enabled = (
+            self.gemm_n256_nt_supertile_sidecar_cutpoint_requested
+            and _nt_supertile_on
+            and _nt_pdfonly_on
+            and _pdf_producer_on
+            and self.gemm_n256_nt_supertile_reg_epi_enabled
+            and self.gemm_n256_nt_supertile_sidecar_enabled
+        )
+        p.gemm_n256_nt_sidecar_split_plan_enabled = (
+            self.gemm_n256_nt_supertile_sidecar_split_plan_requested
+            and p.gemm_n256_nt_sidecar_cutpoint_enabled
+        )
+        p.gemm_n256_nt_sidecar_boundary_enabled = (
+            self.gemm_n256_nt_supertile_sidecar_boundary_requested
+            and p.gemm_n256_nt_sidecar_split_plan_enabled
+        )
         B = p.buf
         dw_no_atomic_env = os.environ.get("MK_DW_NO_ATOMIC_SK1")
 
@@ -1423,8 +1527,7 @@ class MKQwen3:
                  B(W["lse_parts"]), c.V // 64],
             )
             p.wave()
-            # default ON wherever lse partials exist: wash-at-worst measured (nano/small
-            # coin-flips), -28..-105us at S>=2048; MK_CE_FWD_WARPROW=0 restores.
+            # default ON wherever lse partials exist; MK_CE_FWD_WARPROW=0 restores.
             ce_warprow = int(os.environ.get("MK_CE_FWD_WARPROW", "1"))
             p.instr(
                 mk.OP_CE_FWD,
@@ -1828,7 +1931,105 @@ class MKQwen3:
         p.wave()
 
         self.prog = p.finalize(self.dev)
+        self.qwen_nt_sidecar_cutpoints = self.prog.qwen_nt_sidecar_cutpoints
+        self.qwen_nt_sidecar_split_plan = self.prog.qwen_nt_sidecar_split_plan
+        self.qwen_nt_sidecar_boundary_rows = self.prog.qwen_nt_sidecar_boundary_rows
         self.n_waves = len(p.waves)
+
+    # ------------------------------------------------------------------ #
+    def qwen_nt_sidecar_step_available(self) -> bool:
+        """Whether this model has the explicit qwen NT sidecar split route."""
+        plan = self.qwen_nt_sidecar_split_plan
+        return (
+            self.default_mode == "pdf"
+            and self.gemm_n256_nt_supertile_sidecar_boundary_enabled
+            and len(self.qwen_nt_sidecar_cutpoints) == 1
+            and len(self.qwen_nt_sidecar_boundary_rows) == 1
+            and isinstance(plan, dict)
+            and plan.get("kind") == "qwen_nt_lmhead_sidecar_split_plan"
+            and bool(plan.get("valid_topological_split"))
+            and bool(plan.get("main_row_replaced_by_boundary"))
+        )
+
+    def qwen_nt_sidecar_pdf_subprograms(self):
+        """Return cached PDF prefix/post subprograms for the sidecar split route."""
+        if not self.qwen_nt_sidecar_step_available():
+            raise RuntimeError("qwen NT sidecar split route is not available")
+        if self._qwen_nt_sidecar_pdf_subprograms is None:
+            self._qwen_nt_sidecar_pdf_subprograms = self.prog.qwen_nt_sidecar_pdf_subprograms()
+        return self._qwen_nt_sidecar_pdf_subprograms
+
+    def step_qwen_nt_sidecar(self, tokens: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Run the explicit qwen NT prefix + sidecar + post split step.
+
+        The default route stays unchanged unless MK_QWEN_NT_SIDECAR_STEP=1
+        explicitly routes step() through this method.
+        """
+        subprograms = self.qwen_nt_sidecar_pdf_subprograms()
+        if self._inputs_bound_external:
+            self.prog._buftab[self._tokens_buf] = self.tokens.data_ptr()
+            self.prog._buftab[self._labels_buf] = self.labels.data_ptr()
+            self._inputs_bound_external = False
+        self.tokens.copy_(tokens)
+        self.labels.copy_(labels)
+        if not self.in_kernel_inv_valid:
+            self.inv_valid.copy_(1.0 / (labels >= 0).sum().clamp(min=1).float().reshape(1))
+        self.prog.run_qwen_nt_sidecar_prefix(self.ext, self._smem_bytes, subprograms)
+        self.prog.run_qwen_nt_lmhead_sidecar(self.ext, self._smem_bytes)
+        self.prog.run_qwen_nt_sidecar_post(self.ext, self._smem_bytes, subprograms)
+        return self.loss
+
+    # ------------------------------------------------------------------ #
+    def make_graphed_qwen_nt_sidecar_step(self, tokens: torch.Tensor, labels: torch.Tensor, warmup=3):
+        """Capture the explicit qwen NT sidecar split step into a CUDA graph."""
+        if not self.qwen_nt_sidecar_step_available():
+            raise RuntimeError("qwen NT sidecar split route is not available")
+        graphable = (
+            tokens.is_cuda
+            and labels.is_cuda
+            and tokens.device == self.tokens.device
+            and labels.device == self.labels.device
+            and tokens.is_contiguous()
+            and labels.is_contiguous()
+            and tokens.dtype == torch.int32
+            and labels.dtype == torch.int32
+            and tuple(tokens.shape) == (self.cfg.S,)
+            and tuple(labels.shape) == (self.cfg.S,)
+        )
+        if not graphable:
+            raise ValueError("make_graphed_qwen_nt_sidecar_step needs canonical cuda int32 [S] inputs")
+        if self._inputs_bound_external:
+            self.prog._buftab[self._tokens_buf] = self.tokens.data_ptr()
+            self.prog._buftab[self._labels_buf] = self.labels.data_ptr()
+            self._inputs_bound_external = False
+        subprograms = self.qwen_nt_sidecar_pdf_subprograms()
+
+        def _body():
+            self.tokens.copy_(tokens)
+            self.labels.copy_(labels)
+            if not self.in_kernel_inv_valid:
+                self.inv_valid.copy_(1.0 / (labels >= 0).sum().clamp(min=1).float().reshape(1))
+            self.prog.run_qwen_nt_sidecar_prefix(self.ext, self._smem_bytes, subprograms)
+            self.prog.run_qwen_nt_lmhead_sidecar(self.ext, self._smem_bytes)
+            self.prog.run_qwen_nt_sidecar_post(self.ext, self._smem_bytes, subprograms)
+
+        side = torch.cuda.Stream(tokens.device)
+        side.wait_stream(torch.cuda.current_stream(tokens.device))
+        with torch.cuda.stream(side):
+            for _ in range(max(1, warmup)):
+                _body()
+        torch.cuda.current_stream(tokens.device).wait_stream(side)
+        torch.cuda.synchronize(tokens.device)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            _body()
+
+        def replay():
+            graph.replay()
+            return self.loss
+
+        replay.graph = graph
+        return replay
 
     # ------------------------------------------------------------------ #
     def step(self, tokens: torch.Tensor, labels: torch.Tensor, mode=None) -> torch.Tensor:
@@ -1839,6 +2040,21 @@ class MKQwen3:
         """
         if mode is None:
             mode = self.default_mode
+        sidecar_available = self.qwen_nt_sidecar_step_available()
+        if self.qwen_nt_sidecar_step_requested:
+            if mode != "pdf":
+                raise RuntimeError("MK_QWEN_NT_SIDECAR_STEP=1 requires pdf mode")
+            if not sidecar_available:
+                raise RuntimeError(
+                    "MK_QWEN_NT_SIDECAR_STEP=1 requires the qwen NT sidecar "
+                    "boundary split route"
+                )
+            return self.step_qwen_nt_sidecar(tokens, labels)
+        if sidecar_available:
+            raise RuntimeError(
+                "qwen NT sidecar boundary step requires step_qwen_nt_sidecar() "
+                "or MK_QWEN_NT_SIDECAR_STEP=1"
+            )
         bind_inputs = (
             self.bind_inputs
             and mode in ("df", "pdf")  # pdf shares df's state layout and bind path
@@ -1893,6 +2109,20 @@ class MKQwen3:
         """
         if mode is None:
             mode = self.default_mode
+        if self.qwen_nt_sidecar_step_requested:
+            if mode != "pdf":
+                raise RuntimeError("MK_QWEN_NT_SIDECAR_STEP=1 requires pdf mode")
+            if not self.qwen_nt_sidecar_step_available():
+                raise RuntimeError(
+                    "MK_QWEN_NT_SIDECAR_STEP=1 requires the qwen NT sidecar "
+                    "boundary split route"
+                )
+            return self.make_graphed_qwen_nt_sidecar_step(tokens, labels, warmup=warmup)
+        if self.qwen_nt_sidecar_step_available():
+            raise RuntimeError(
+                "qwen NT sidecar boundary graph capture requires "
+                "MK_QWEN_NT_SIDECAR_STEP=1"
+            )
         graphable = (
             mode in ("df", "pdf")
             and tokens.is_cuda
