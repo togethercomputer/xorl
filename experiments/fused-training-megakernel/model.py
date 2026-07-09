@@ -312,6 +312,16 @@ class MKQwen3:
         for l in range(c.L):
             W[f"dQKV_f32.{l}"] = torch.empty(c.S, QD, device=dev, dtype=f32)
         W["dXN_f32"] = torch.empty(c.S, c.H, device=dev, dtype=f32)
+        qwen_hdx_rmsdot_shape = (
+            (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
+            == (2560, 2, 1024, 32, 8, 128, 9728, 151936)
+        )
+        self.qwen_head_dx_rmsdot_partials_requested = (
+            bool(int(os.environ.get("MK_QWEN_HEADDX_RMS_DOT_PARTIALS", "0")))
+            and qwen_hdx_rmsdot_shape
+        )
+        if self.qwen_head_dx_rmsdot_partials_requested:
+            W["headdx_rmsdot_parts"] = torch.empty(c.S, c.H // 256, device=dev, dtype=f32)
         # round-12 SKR head-dX (see _HEAD_DX_SKR): per-K-slice fp32 partial slabs for
         # the split head-dX gemm; OP_SKR_REDUCE sums them into dXN_f32
         skr_env = os.environ.get("MK_HEAD_DX_SKR")
@@ -619,6 +629,28 @@ class MKQwen3:
         # MK_GEMM_N256_HEAD_DX_PDFONLY=0 restores the exact body with the generic
         # TMA fallback still compiled.
         self.gemm_n256_head_dx_pdfonly_default = exact_qwen4b_l2
+        # Source-gate probe: qwen4b-l2 final head-dX can write per-row RMS-dot
+        # partials for the first final RMS dX, allowing that rowop to skip its dot pass.
+        # Explicitly default-off because it changes the producer/consumer contract.
+        _rms2560_on = bool(int(os.environ.get(
+            "MK_RMS_DX_H2560",
+            str(int(bool(self.rms_dx_h2560_default))),
+        )))
+        _hdx_exact_on = bool(int(os.environ.get(
+            "MK_GEMM_N256_HEAD_DX_EXACT",
+            str(int(bool(self.gemm_n256_head_dx_exact_default))),
+        )))
+        _hdx_pdfonly_on = bool(int(os.environ.get(
+            "MK_GEMM_N256_HEAD_DX_PDFONLY",
+            str(int(bool(self.gemm_n256_head_dx_pdfonly_default))),
+        )))
+        self.qwen_head_dx_rmsdot_partials_enabled = (
+            self.qwen_head_dx_rmsdot_partials_requested
+            and exact_qwen4b_l2
+            and _rms2560_on
+            and _hdx_exact_on
+            and _hdx_pdfonly_on
+        )
         # L2 layer-0 WGU dW leaf (#64) becomes the next terminal cold sink after
         # EMBED_BWD is hot. Marking only that exact leaf hot wins locally in both
         # construction orders; MK_HOT_QWEN_WGU_DW=0 restores the cold-leaf route.
@@ -826,6 +858,10 @@ class MKQwen3:
         mode_env = os.environ.get("MK_MODE")
         if mode_env:
             self.default_mode = mode_env
+        self.qwen_head_dx_rmsdot_partials_enabled = (
+            self.qwen_head_dx_rmsdot_partials_enabled
+            and self.default_mode == "pdf"
+        )
         # D64-TMA producer feed on the pdf executor. The opt-in probe split by
         # shape: S2048, S3072, and S4096 won in both orders, while S8192
         # regressed decisively. Keep the default exact and let MK_PDF_D64_FEED
@@ -901,6 +937,7 @@ class MKQwen3:
             ),
             gemm_n256_head_dx_exact=self.gemm_n256_head_dx_exact_default,
             gemm_n256_head_dx_pdfonly=self.gemm_n256_head_dx_pdfonly_default,
+            qwen_head_dx_rmsdot_partials=self.qwen_head_dx_rmsdot_partials_enabled,
             gemm_d64_tma=self.gemm_d64_tma_default,
             gemm_dx_tma_red=self.gemm_dx_tma_red_enabled,
             dw_tn_tma_red=self.dw_tn_tma_red_enabled,
@@ -1222,18 +1259,19 @@ class MKQwen3:
             return _HEAD_DX_TARGET.get(c.H, {}).get(c.S, 192)
 
         def rmsnorm_bwd(args):
+            S_arg = args[8] if len(args) > 8 else args[-1]
             if split_rms_bwd:
                 if rms_dx_h256_route:
-                    p.instr(mk.OP_RMSNORM_BWD_DX_H256, mk.rowop_tiles(args[-1], mk.ROWOP_R2), args)
+                    p.instr(mk.OP_RMSNORM_BWD_DX_H256, mk.rowop_tiles(S_arg, mk.ROWOP_R2), args)
                 elif rms_dx_r4:
-                    p.instr(mk.OP_RMSNORM_BWD_DX_R4, mk.rowop_tiles(args[-1], mk.ROWOP_R4), args)
+                    p.instr(mk.OP_RMSNORM_BWD_DX_R4, mk.rowop_tiles(S_arg, mk.ROWOP_R4), args)
                 elif rms_dx_fma_route:
-                    p.instr(mk.OP_RMSNORM_BWD_DX_FMA, mk.rowop_tiles(args[-1], mk.ROWOP_R2), args)
+                    p.instr(mk.OP_RMSNORM_BWD_DX_FMA, mk.rowop_tiles(S_arg, mk.ROWOP_R2), args)
                 else:
-                    p.instr(mk.OP_RMSNORM_BWD_DX, mk.rowop_tiles(args[-1], mk.ROWOP_R2), args)
-                p.instr(mk.OP_RMSNORM_BWD_DW, mk.rowop_tiles(args[-1], mk.ROWOP_R2), args)
+                    p.instr(mk.OP_RMSNORM_BWD_DX, mk.rowop_tiles(S_arg, mk.ROWOP_R2), args)
+                p.instr(mk.OP_RMSNORM_BWD_DW, mk.rowop_tiles(S_arg, mk.ROWOP_R2), args)
             else:
-                p.instr(mk.OP_RMSNORM_BWD, mk.rowop_tiles(args[-1], mk.ROWOP_R2), args)
+                p.instr(mk.OP_RMSNORM_BWD, mk.rowop_tiles(S_arg, mk.ROWOP_R2), args)
 
         def gemm_dx(a, b, out_bf, out_f32, M, N, K):
             """On-path NN dX gemm; parallelism-starved shapes (< 32 MN tiles) route via
@@ -1605,10 +1643,22 @@ class MKQwen3:
             if mk.wgmma_n256_head_dx_ok(c.S, c.H, c.V, head_dx_flags):
                 stage3 = n256_stage3_flag(c.S, c.H, c.V)
                 nmajor = n256_nmajor_flag(c.S, c.H, c.V)
+                exact_head_dx_flags = head_dx_flags | 16384 | stage3 | nmajor
+                exact_head_dx_args = head_dx_args + [exact_head_dx_flags, 0]
+                if self.qwen_head_dx_rmsdot_partials_enabled:
+                    exact_head_dx_args = head_dx_args + [
+                        exact_head_dx_flags | mk.GEMM_HEADDX_RMSDOT_FLAG,
+                        0,
+                        0,
+                        B(W["headdx_rmsdot_parts"]),
+                        c.H // 256,
+                        X[c.L],
+                        B(self.params["wf"]),
+                    ]
                 p.instr(
                     mk.OP_GEMM,
                     mk.gemm_tiles_wgmma_n256_direct(c.S, c.H),
-                    head_dx_args + [head_dx_flags | 16384 | stage3 | nmajor, 0],
+                    exact_head_dx_args,
                 )
             elif head_dx_n128_f32 and c.S % 128 == 0 and c.H % 128 == 0 and c.V % 64 == 0:
                 p.instr(
@@ -1654,7 +1704,20 @@ class MKQwen3:
         gemm(B(A["logits"]), B(A["xnf"]), B(self.grads["wlm"]), c.V, c.H, c.S, 1 | 4 | 8)
         p.wave()
         # final-norm bwd reads the split-K fp32 workspace directly (dy_f32; no CVT hop)
-        rmsnorm_bwd([X[c.L], B(self.params["wf"]), B(W["dXN_f32"]), B(W["dX"]), B(self.grads["wf"]), B(A["rstdf"]), c.H, 1, c.S])
+        final_rms_args = [
+            X[c.L],
+            B(self.params["wf"]),
+            B(W["dXN_f32"]),
+            B(W["dX"]),
+            B(self.grads["wf"]),
+            B(A["rstdf"]),
+            c.H,
+            1,
+            c.S,
+        ]
+        if self.qwen_head_dx_rmsdot_partials_enabled:
+            final_rms_args += [B(W["headdx_rmsdot_parts"]), c.H // 256]
+        rmsnorm_bwd(final_rms_args)
         p.wave()
 
         for l in reversed(range(c.L)):

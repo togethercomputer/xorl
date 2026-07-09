@@ -140,6 +140,8 @@ __device__ __forceinline__ void op_skr_reduce(const Instr& I, int tile, void** b
 //               atomics); OP_SKR_REDUCE sums the slabs (round-12 SKR structure).
 //   flags bit14: direct m64n256 WGMMA tile; qwen-specific paths for NT lm-head with
 //                CE/LSE partials (bit11) and NN fp32 head-dX.
+//   flags bit17: qwen final head-dX emits per-row RMS-dot partials for the first
+//                final RMS dX consumer. args[9]=partials, 10=nparts, 11=X, 12=wf.
 //   flags bit25: opt-in 3-stage operand ring for the direct m64n256 tile. This needs
 //                the qwen 148KB launch page and is never emitted by generic routes.
 //   flags bit26: opt-in N-major tile order for exact qwen n256 routes. This groups
@@ -409,6 +411,7 @@ __device__ void op_gemm(const Instr& I, int tile, void** bufs, char* smem_raw) {
 #define GEMM_N256_STAGE3_FLAG (1 << 25)
 #define GEMM_N256_NMAJOR_FLAG (1 << 26)
 #define GEMM_N256_NT_SUPERTILE_FLAG (1 << 27)
+#define GEMM_HEADDX_RMSDOT_FLAG (1 << 17)
 
 template <int STAGES>
 struct WgmmaSmemT {
@@ -1858,6 +1861,15 @@ __device__ __noinline__ void op_gemm_wgmma_n256_head_dx_exact_impl(
 
   const int w = wtid / 32, l = wtid % 32;
   const int cb = (l & 3) * 2;
+#ifdef MK_QWEN_HEADDX_RMS_DOT_PARTIALS
+  const bool rmsdot_partials =
+      (flags & GEMM_HEADDX_RMSDOT_FLAG) && I.args[10] == (N / 256);
+  float rmsdot0 = 0.0f, rmsdot1 = 0.0f;
+  const bf16* rmsdot_x =
+      rmsdot_partials ? reinterpret_cast<const bf16*>(bufs[I.args[11]]) : nullptr;
+  const bf16* rmsdot_w =
+      rmsdot_partials ? reinterpret_cast<const bf16*>(bufs[I.args[12]]) : nullptr;
+#endif
 #pragma unroll
   for (int n8 = 0; n8 < 32; ++n8) {
 #pragma unroll
@@ -1866,8 +1878,37 @@ __device__ __noinline__ void op_gemm_wgmma_n256_head_dx_exact_impl(
       const int64_t idx = (int64_t)(m0 + r) * N + n0 + n8 * 8 + cb;
       float2 out = make_float2(d[n8 * 4 + i * 2 + 0], d[n8 * 4 + i * 2 + 1]);
       *reinterpret_cast<float2*>(&C[idx]) = out;
+#ifdef MK_QWEN_HEADDX_RMS_DOT_PARTIALS
+      if (rmsdot_partials) {
+        const int col = n0 + n8 * 8 + cb;
+        const bf16* xr = rmsdot_x + (int64_t)(m0 + r) * N;
+        const float contrib =
+            out.x * bf2f(rmsdot_w[col]) * bf2f(xr[col]) +
+            out.y * bf2f(rmsdot_w[col + 1]) * bf2f(xr[col + 1]);
+        if (i == 0)
+          rmsdot0 += contrib;
+        else
+          rmsdot1 += contrib;
+      }
+#endif
     }
   }
+#ifdef MK_QWEN_HEADDX_RMS_DOT_PARTIALS
+  if (rmsdot_partials) {
+    rmsdot0 += __shfl_xor_sync(0xffffffff, rmsdot0, 1);
+    rmsdot1 += __shfl_xor_sync(0xffffffff, rmsdot1, 1);
+    rmsdot0 += __shfl_xor_sync(0xffffffff, rmsdot0, 2);
+    rmsdot1 += __shfl_xor_sync(0xffffffff, rmsdot1, 2);
+    if ((l & 3) == 0) {
+      float* parts = reinterpret_cast<float*>(bufs[I.args[9]]);
+      const int nparts = I.args[10];
+      const int row0 = wg * 64 + w * 16 + l / 4;
+      const int row1 = row0 + 8;
+      parts[(int64_t)(m0 + row0) * nparts + nt] = rmsdot0;
+      parts[(int64_t)(m0 + row1) * nparts + nt] = rmsdot1;
+    }
+  }
+#endif
 }
 #endif
 
@@ -3437,12 +3478,76 @@ __device__ void op_rmsnorm_bwd_dx_h2560(const Instr& I, int tile, void** bufs,
     if (hasB) st8bf(dxB + i, dxv);
   }
 }
+
+#ifdef MK_QWEN_HEADDX_RMS_DOT_PARTIALS
+__device__ void op_rmsnorm_bwd_dx_h2560_dotparts(const Instr& I, int tile, void** bufs,
+                                                 char* smem_raw) {
+  const int S = I.args[8];
+  const bool dy_f32 = I.args[7] != 0;
+  const int warp = mk_tid() >> 5, lane = mk_tid() & 31;
+  const int rowA = tile * MK_ROW_R2 + warp;
+  if (rowA >= S) return;  // barrier-free op: early exit is safe
+  const bool hasB = rowA + 8 < S;
+  const int rowB = hasB ? rowA + 8 : rowA;
+  constexpr int H = 2560;
+  constexpr float invH = 1.0f / H;
+  const bf16* xb = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
+  const bf16* xA = xb + (int64_t)rowA * H;
+  const bf16* xB = xb + (int64_t)rowB * H;
+  const bf16* w = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
+  const bf16* dybA = reinterpret_cast<const bf16*>(bufs[I.args[2]]) + (int64_t)rowA * H;
+  const float* dyfA = reinterpret_cast<const float*>(bufs[I.args[2]]) + (int64_t)rowA * H;
+  const bf16* dybB = reinterpret_cast<const bf16*>(bufs[I.args[2]]) + (int64_t)rowB * H;
+  const float* dyfB = reinterpret_cast<const float*>(bufs[I.args[2]]) + (int64_t)rowB * H;
+  bf16* dxb = reinterpret_cast<bf16*>(bufs[I.args[3]]);
+  bf16* dxA = dxb + (int64_t)rowA * H;
+  bf16* dxB = dxb + (int64_t)rowB * H;
+  const float rA = reinterpret_cast<const float*>(bufs[I.args[5]])[rowA];
+  const float rB = reinterpret_cast<const float*>(bufs[I.args[5]])[rowB];
+  const float* parts = reinterpret_cast<const float*>(bufs[I.args[9]]);
+  const int nparts = I.args[10];
+
+  float dotA = 0.0f, dotB = 0.0f;
+  for (int p = lane; p < nparts; p += 32) {
+    dotA += parts[(int64_t)rowA * nparts + p];
+    if (hasB) dotB += parts[(int64_t)rowB * nparts + p];
+  }
+  const float mA = warp_sum(dotA) * rA * invH;
+  const float mB = warp_sum(dotB) * rB * invH;
+
+#pragma unroll
+  for (int i = lane * 8; i < H; i += 32 * 8) {
+    float xa[8], xv[8], da[8], db[8], wv[8], dxa[8], dxv[8];
+    ld8bf(xA + i, xa);
+    ld8bf(xB + i, xv);
+    ld8dy(dybA, dyfA, dy_f32, i, da);
+    ld8dy(dybB, dyfB, dy_f32, i, db);
+    ld8bf(w + i, wv);
+    ld8bf(dxA + i, dxa);
+    ld8bf(dxB + i, dxv);
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+      const float xhA = xa[j] * rA, xhB = xv[j] * rB;
+      dxa[j] = rms_dx_acc<false>(dxa[j], rA, da[j] * wv[j], xhA, mA);
+      dxv[j] = rms_dx_acc<false>(dxv[j], rB, db[j] * wv[j], xhB, mB);
+    }
+    st8bf(dxA + i, dxa);
+    if (hasB) st8bf(dxB + i, dxv);
+  }
+}
+#endif
 #endif
 
 __device__ void op_rmsnorm_bwd_dx(const Instr& I, int tile, void** bufs,
                                   char* smem_raw) {
 #ifdef MK_RMS_DX_H2560
   if (I.args[6] == 2560) {
+#ifdef MK_QWEN_HEADDX_RMS_DOT_PARTIALS
+    if (I.args[10] == 10) {
+      op_rmsnorm_bwd_dx_h2560_dotparts(I, tile, bufs, smem_raw);
+      return;
+    }
+#endif
     op_rmsnorm_bwd_dx_h2560(I, tile, bufs, smem_raw);
     return;
   }

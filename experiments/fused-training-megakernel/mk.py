@@ -59,6 +59,7 @@ OP_QWEN_NT_SIDECAR_BOUNDARY = 39  # typed external sidecar producer placeholder
 GEMM_BM, GEMM_BN = 64, 128  # keep in sync with ops.cuh
 GEMM_DX_TMA_RED_FLAG = 1 << 6  # with bit5: dX split-K smem tile -> bulk reduce-add
 GEMM_SKR_FLAG = 1 << 15  # with bit5: plain per-slice slab stores + OP_SKR_REDUCE
+GEMM_HEADDX_RMSDOT_FLAG = 1 << 17  # qwen final head-dX writes RMS-dot partials
 GEMM_N256_STAGE3_FLAG = 1 << 25
 GEMM_N256_NMAJOR_FLAG = 1 << 26
 GEMM_N256_NT_SUPERTILE_FLAG = 1 << 27
@@ -562,6 +563,7 @@ def load_ext(
     gemm_n256_nt_supertile_sidecar_boundary=None,
     gemm_n256_head_dx_exact=None,
     gemm_n256_head_dx_pdfonly=None,
+    qwen_head_dx_rmsdot_partials=None,
     gemm_d64_tma=None,
     gemm_dx_tma_red=None,
     dw_tn_tma_red=None,
@@ -977,6 +979,17 @@ def load_ext(
     gemm_n256_head_dx_pdfonly = int(bool(
         gemm_n256_head_dx_exact and pdf_producer and gemm_n256_head_dx_pdfonly
     ))
+    qwen_head_dx_rmsdot_partials = int(os.environ.get(
+        "MK_QWEN_HEADDX_RMS_DOT_PARTIALS",
+        "0" if qwen_head_dx_rmsdot_partials is None
+        else str(int(bool(qwen_head_dx_rmsdot_partials))),
+    ))
+    qwen_head_dx_rmsdot_partials = int(bool(
+        qwen_head_dx_rmsdot_partials
+        and gemm_n256_head_dx_exact
+        and gemm_n256_head_dx_pdfonly
+        and rms_dx_h2560
+    ))
     # D64 ring TMA feed for the m64n64/m64n128 mbarrier-ring bodies. Requires
     # the ring; the per-instruction gate is the tmap args injected by
     # Program._inject_gemm_tmaps (this only compiles the device path).
@@ -1050,6 +1063,7 @@ def load_ext(
         + ("bnd" if gemm_n256_nt_supertile_sidecar_boundary else "")
         + ("_hdxex" if gemm_n256_head_dx_exact else "")
         + ("pdf" if gemm_n256_head_dx_pdfonly else "")
+        + ("_hdxrmsdot" if qwen_head_dx_rmsdot_partials else "")
         + ("_d64tma" if gemm_d64_tma else "")
         + ("_gdxtred" if gemm_dx_tma_red else "")
         + ("_dwtntr" if dw_tn_tma_red else "")
@@ -1135,6 +1149,8 @@ def load_ext(
            if gemm_n256_nt_supertile_sidecar_boundary else [])
         + (["-DMK_GEMM_N256_HEAD_DX_EXACT"] if gemm_n256_head_dx_exact else [])
         + (["-DMK_GEMM_N256_HEAD_DX_PDFONLY"] if gemm_n256_head_dx_pdfonly else [])
+        + (["-DMK_QWEN_HEADDX_RMS_DOT_PARTIALS"]
+           if qwen_head_dx_rmsdot_partials else [])
         + (["-DMK_GEMM_D64_TMA"] if gemm_d64_tma else [])
         + (["-DMK_GEMM_DX_TMA_RED"] if gemm_dx_tma_red else [])
         + (["-DMK_DW_TN_TMA_RED"] if dw_tn_tma_red else [])
@@ -1245,6 +1261,9 @@ def _access_sets(op, args):
             w.append(10)
         if flags & 8192:  # fused ssq partials (rmsnorm variance pass skip)
             w.append(9)
+        if flags & GEMM_HEADDX_RMSDOT_FLAG:
+            r += [11, 12]  # X_final and wf for dXN*wf*X partials
+            w.append(9)  # fp32 partials [S, H/256]
         return r, w
     if op == OP_RMSNORM_FWD:
         r = [0, 1]
@@ -1255,7 +1274,10 @@ def _access_sets(op, args):
         return [0, 1, 2, 5], [3, 4]
     if op in (OP_RMSNORM_BWD_DX, OP_RMSNORM_BWD_DX_R4, OP_RMSNORM_BWD_DX_FMA,
               OP_RMSNORM_BWD_DX_H256):
-        return [0, 1, 2, 5], [3]
+        r = [0, 1, 2, 5]
+        if op == OP_RMSNORM_BWD_DX and len(args) > 10 and args[10]:
+            r.append(9)
+        return r, [3]
     if op == OP_RMSNORM_BWD_DW:
         return [0, 2, 5], [4]
     if op == OP_SWIGLU_FWD:
