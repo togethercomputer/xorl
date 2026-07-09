@@ -316,8 +316,14 @@ class MKQwen3:
             (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
             == (2560, 2, 1024, 32, 8, 128, 9728, 151936)
         )
+        qwen_hdx_rmsdot_env = os.environ.get("MK_QWEN_HEADDX_RMS_DOT_PARTIALS")
+        self.qwen_head_dx_rmsdot_partials_default = qwen_hdx_rmsdot_shape
         self.qwen_head_dx_rmsdot_partials_requested = (
-            bool(int(os.environ.get("MK_QWEN_HEADDX_RMS_DOT_PARTIALS", "0")))
+            (
+                self.qwen_head_dx_rmsdot_partials_default
+                if qwen_hdx_rmsdot_env is None
+                else bool(int(qwen_hdx_rmsdot_env))
+            )
             and qwen_hdx_rmsdot_shape
         )
         if self.qwen_head_dx_rmsdot_partials_requested:
@@ -629,9 +635,11 @@ class MKQwen3:
         # MK_GEMM_N256_HEAD_DX_PDFONLY=0 restores the exact body with the generic
         # TMA fallback still compiled.
         self.gemm_n256_head_dx_pdfonly_default = exact_qwen4b_l2
-        # Source-gate probe: qwen4b-l2 final head-dX can write per-row RMS-dot
-        # partials for the first final RMS dX, allowing that rowop to skip its dot pass.
-        # Explicitly default-off because it changes the producer/consumer contract.
+        # qwen4b-l2 final head-dX writes per-row RMS-dot partials for the first
+        # final RMS dX, allowing that rowop to skip its dot pass. Default-on for
+        # the exact promoted shape; MK_QWEN_HEADDX_RMS_DOT_PARTIALS=0 is the
+        # rollback guard, and dependency checks below keep the producer/consumer
+        # contract tied to the exact PDF head-dX + H2560 RMS-dX route.
         _rms2560_on = bool(int(os.environ.get(
             "MK_RMS_DX_H2560",
             str(int(bool(self.rms_dx_h2560_default))),
