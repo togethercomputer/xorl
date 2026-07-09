@@ -675,6 +675,22 @@ class MKQwen3:
         self.attn_pdf_feed_default = (
             1 if self.default_mode == "pdf" and exact_long_d64 and c.S == 8192 else 0
         )
+        # QKNORM_ROPE_BWD vectorized IO (MK_QKBWD_VEC8): 16B ld8bf/st8bf/ld8dy
+        # task loops, 32/(D/16) (head,row) tasks per warp iteration,
+        # per-(warp,slot) smem dw slices. Clean-GPU verdicts (GPU 3, both
+        # construction orders):
+        #   PROMOTE s8192 -129.7/-127.9us (16/16 x2)
+        #   PROMOTE s4096 -36.1/-34.0us (40/40 x2)
+        #   PROMOTE s2048 -10.9/-11.5us (37/40 + 35/40)
+        #   EXCLUDE s3072 wash (-8.6us, 23/40)
+        #   EXCLUDE nano +5.3us (4/40)
+        #   EXCLUDE small +91.2us (0/40, hard regression)
+        # Exact H256-family gate, S in {2048, 4096, 8192} only.
+        # MK_QKBWD_VEC8=0/1 force-overrides for A/B and rollback.
+        self.qkbwd_vec8_default = (
+            (c.H, c.L, c.nq, c.nkv, c.D, c.I, c.V) == (256, 4, 4, 2, 64, 768, 8192)
+            and c.S in (2048, 4096, 8192)
+        )
         self.ext = mk.load_ext(
             swiglu_bwd_2w=self.swiglu_bwd_2w_default,
             swiglu_bwd_4w=self.swiglu_bwd_4w_default,
@@ -708,6 +724,7 @@ class MKQwen3:
             pdf_d64_feed=self.pdf_d64_feed_default,
             attn_pdf_feed=self.attn_pdf_feed_default,
             pdf_shell_smem=1 if self.pdf_shell_smem_default else 0,
+            qkbwd_vec8=self.qkbwd_vec8_default,
         )
         # D=128 WGMMA attention route (default ON for D==128, S%64==0; the opgap
         # FA4-C trio spec's fallback replacement): MK_ATTN_D128_WG=0 restores the
@@ -1270,11 +1287,14 @@ class MKQwen3:
                  B(W["lse_parts"]), c.V // 64],
             )
             p.wave()
+            # default ON wherever lse partials exist: wash-at-worst measured (nano/small
+            # coin-flips), -28..-105us at S>=2048; MK_CE_FWD_WARPROW=0 restores.
+            ce_warprow = int(os.environ.get("MK_CE_FWD_WARPROW", "1"))
             p.instr(
                 mk.OP_CE_FWD,
-                c.S,
+                (c.S + 7) // 8 if ce_warprow else c.S,
                 [B(A["logits"]), labels_buf, B(A["lse_ce"]), B(self.loss), B(self.inv_valid), c.V,
-                 B(W["lse_parts"]), c.V // 64],
+                 B(W["lse_parts"]), c.V // 64, c.S],
             )
         else:
             gemm(B(A["xnf"]), B(self.params["wlm"]), B(A["logits"]), c.S, c.V, c.H, 2)

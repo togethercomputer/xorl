@@ -3294,6 +3294,118 @@ __device__ void op_qknorm_rope_bwd(const Instr& I, int tile, void** bufs, char* 
   const int stride = (nq + 2 * nkv) * D, nh = nq + (split_v ? nkv : 2 * nkv);
   const int warp = mk_tid() / 32, lane = mk_tid() % 32, nwarp = MK_CONSUMERS / 32;
 
+#ifdef MK_QKBWD_VEC8
+  // Vectorized-IO probe path: every global access in the task loop is 16B wide
+  // (ld8bf/st8bf/ld8dy) instead of per-element bf16/fp32. Restructure: each
+  // warp runs G = 32/(D/16) (head,row) tasks per iteration with C = D/16 lanes
+  // per task; lane q of a task owns ONE 8-pair chunk — first-half elements
+  // [8q, 8q+8) plus their rope partners [8q+D/2, 8q+D/2+8) — so both halves of
+  // every pair are local to the lane (no cross-lane exchange) and the
+  // per-element arithmetic (da/db/dx/dw formulas) is identical to the scalar
+  // paths. The dot reduction becomes 8 serial adds per lane + an aligned
+  // C-lane xor butterfly, so dx matches at tolerance level (reduction order),
+  // not bitwise. dw partials stay plain (non-atomic) smem adds: each
+  // (warp, task-slot) pair gets its own slice — G*D == 512 floats per warp per
+  // weight for any admissible D — and the flush sums nwarp*G slices before the
+  // one global atomicAdd per element (same tolerance class as before). Takes
+  // precedence over the D64/D128 cache paths; falls back to the scalar body
+  // unless D % 16 == 0 and (32 % (D/16)) == 0 (covers the (D & 7) == 0 guard
+  // for every shape the model ships: D = 64, 128).
+  if ((D % 16) == 0 && (32 % (D / 16)) == 0) {
+    const int C = D / 16, G = 32 / C;
+    const int g = lane / C, q = lane - g * C;  // task-in-warp, chunk-in-task
+    float* dwq_s = reinterpret_cast<float*>(smem_raw);  // [nwarp][G][D] == [nwarp][512]
+    float* dwk_s = dwq_s + (MK_CONSUMERS / 32) * 512;
+    for (int i = mk_tid(); i < 2 * (MK_CONSUMERS / 32) * 512; i += MK_CONSUMERS) dwq_s[i] = 0.0f;
+    consumer_sync();
+
+    for (int t0 = warp * G; t0 < MK_ROW_R * nh; t0 += nwarp * G) {
+      const int t = t0 + g;
+      const bool in_range = t < MK_ROW_R * nh;
+      const int h = in_range ? t % nh : 0, rr = in_range ? t / nh : 0;
+      const int row = tile * MK_ROW_R + rr;
+      const bool act = in_range && row < S;
+      const int64_t off = (int64_t)row * stride + h * D;
+      const bf16* xr = reinterpret_cast<const bf16*>(bufs[I.args[0]]) + off;
+      const bf16* dyb = reinterpret_cast<const bf16*>(bufs[I.args[1]]) + off;
+      const float* dyf = reinterpret_cast<const float*>(bufs[I.args[1]]) + off;
+      bf16* dxr = reinterpret_cast<bf16*>(bufs[I.args[2]]) + off;
+      const int i0 = q * 8;
+
+      if (act && h >= nq + nkv) {  // v grads pass through: two 8-chunks per lane
+        float f[8];
+        ld8dy(dyb, dyf, dy_f32, i0, f);
+        st8bf(dxr + i0, f);
+        ld8dy(dyb, dyf, dy_f32, i0 + D / 2, f);
+        st8bf(dxr + i0 + D / 2, f);
+      }
+      const bool is_qk = act && h < nq + nkv;
+      const bool is_q = h < nq;
+      float da[8], db[8], xh1[8], xh2[8], w1[8], w2[8];
+      float r = 0.0f, dot = 0.0f;
+      if (is_qk) {
+        const bf16* w = reinterpret_cast<const bf16*>(bufs[is_q ? I.args[3] : I.args[4]]);
+        r = reinterpret_cast<const float*>(bufs[is_q ? I.args[7] : I.args[8]])
+            [(int64_t)row * (is_q ? nq : nkv) + (is_q ? h : h - nq)];
+        const float* cosr =
+            reinterpret_cast<const float*>(bufs[I.args[9]]) + (int64_t)row * (D / 2);
+        const float* sinr =
+            reinterpret_cast<const float*>(bufs[I.args[10]]) + (int64_t)row * (D / 2);
+        float dy1[8], dy2[8], cv[8], sv[8];
+        ld8dy(dyb, dyf, dy_f32, i0, dy1);
+        ld8dy(dyb, dyf, dy_f32, i0 + D / 2, dy2);
+        ld8dy(nullptr, cosr, true, i0, cv);
+        ld8dy(nullptr, sinr, true, i0, sv);
+        ld8bf(w + i0, w1);
+        ld8bf(w + i0 + D / 2, w2);
+        ld8bf(xr + i0, xh1);
+        ld8bf(xr + i0 + D / 2, xh2);
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+          da[j] = dy1[j] * cv[j] + dy2[j] * sv[j];
+          db[j] = -dy1[j] * sv[j] + dy2[j] * cv[j];
+          xh1[j] *= r;
+          xh2[j] *= r;
+          dot += da[j] * w1[j] * xh1[j] + db[j] * w2[j] * xh2[j];
+        }
+      }
+      // all 32 lanes execute the butterfly (aligned C-blocks; idle lanes carry 0)
+      for (int o = C >> 1; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
+      dot /= D;
+      if (is_qk) {
+        float o1[8], o2[8];
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+          o1[j] = r * (da[j] * w1[j] - xh1[j] * dot);
+          o2[j] = r * (db[j] * w2[j] - xh2[j] * dot);
+        }
+        st8bf(dxr + i0, o1);
+        st8bf(dxr + i0 + D / 2, o2);
+        float* dw_s = (is_q ? dwq_s : dwk_s) + (warp * G + g) * D;
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+          dw_s[i0 + j] += da[j] * xh1[j];
+          dw_s[i0 + D / 2 + j] += db[j] * xh2[j];
+        }
+      }
+    }
+    consumer_sync();
+    float* dqw = reinterpret_cast<float*>(bufs[I.args[5]]);
+    float* dkw = reinterpret_cast<float*>(bufs[I.args[6]]);
+    const int nsl = (MK_CONSUMERS / 32) * G;
+    for (int i = mk_tid(); i < D; i += MK_CONSUMERS) {
+      float aq = 0.0f, ak = 0.0f;
+      for (int s2 = 0; s2 < nsl; ++s2) {
+        aq += dwq_s[s2 * D + i];
+        ak += dwk_s[s2 * D + i];
+      }
+      atomicAdd(&dqw[i], aq);
+      atomicAdd(&dkw[i], ak);
+    }
+    return;
+  }
+#endif
+
   // per-warp dw partial slices: plain adds instead of block-wide smem atomics
   // (the old shared [D]+[D] arrays serialized every lane of every warp on 64
   // addresses — the dominant cost of this op at long S)
@@ -3549,6 +3661,46 @@ __device__ void op_ce_fwd(const Instr& I, int tile, void** bufs, char* smem_raw)
   const float inv_valid = *reinterpret_cast<const float*>(bufs[I.args[4]]);
   const int nparts = I.args[7];
   float* scratch = reinterpret_cast<float*>(smem_raw);
+
+#ifdef MK_CE_FWD_WARPROW
+  if (nparts > 0) {
+    // Warp-per-row partials reduce (MK_CONSUMERS/32 rows per tile, ZERO block
+    // syncs): the per-row block-sync ladder below costs ~2us/row of pure
+    // overhead at long S (8192 rows ~ 130us on-path); a warp shuffle-merge of
+    // the (max,sumexp) pairs needs no cross-warp traffic at all.
+    // args[8] = S (row count); tile covers rows [tile*8, tile*8+8).
+    const int S = I.args[8];
+    const int warp = mk_tid() >> 5, lane = mk_tid() & 31;
+    const int row = tile * (MK_CONSUMERS / 32) + warp;
+    if (row >= S) return;
+    const bf16* zr = reinterpret_cast<const bf16*>(bufs[I.args[0]]) + (int64_t)row * V;
+    const int lab = reinterpret_cast<const int*>(bufs[I.args[1]])[row];
+    const float* parts =
+        reinterpret_cast<const float*>(bufs[I.args[6]]) + (int64_t)row * nparts * 2;
+    float m = -INFINITY, s = 0.0f;
+    for (int i = lane; i < nparts; i += 32) {
+      const float om = parts[i * 2], os = parts[i * 2 + 1];
+      const float M = fmaxf(m, om);
+      s = (m == -INFINITY && om == -INFINITY) ? 0.0f
+                                              : s * ce_exp(m - M) + os * ce_exp(om - M);
+      m = M;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+      const float om = __shfl_xor_sync(0xffffffff, m, off);
+      const float os = __shfl_xor_sync(0xffffffff, s, off);
+      const float M = fmaxf(m, om);
+      s = (m == -INFINITY && om == -INFINITY) ? 0.0f
+                                              : s * ce_exp(m - M) + os * ce_exp(om - M);
+      m = M;
+    }
+    if (lane == 0) {
+      const float row_lse = m + logf(s);
+      lse_out[row] = row_lse;
+      if (lab >= 0) atomicAdd(loss, (row_lse - bf2f(zr[lab])) * inv_valid);
+    }
+    return;
+  }
+#endif
 
   // single-pass online (m, s) accumulation: one read of the logits row instead of two
   float mx = -INFINITY, se = 0.0f;
