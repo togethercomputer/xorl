@@ -534,8 +534,21 @@ extern "C" __global__ void MK_LB MK_DF_NR megakernel_df(const Instr* __restrict_
           reinterpret_cast<const int*>(instrs + ins)[threadIdx.x];
     mk_df_sync();
     if (iclk && threadIdx.x == 0 && t0 == 0) iclk[2 * ins] = mk_globaltimer();
+#ifdef MK_GEMM_N64_FAST_DISPATCH
+    const int fast_flags = s_I.args[6];
+    const bool fast_n64 =
+        s_I.op == OP_GEMM && (fast_flags & 128) &&
+        !(fast_flags & (4096 | 16384));
+#endif
     for (int t = t0; t < t1; ++t) {
+#ifdef MK_GEMM_N64_FAST_DISPATCH
+      if (fast_n64)
+        op_gemm_wgmma_n64_impl(s_I, t, bufs, smem);
+      else
+        dispatch(s_I, t, bufs, smem);
+#else
       dispatch(s_I, t, bufs, smem);
+#endif
       mk_df_sync();
     }
     if (threadIdx.x == 0) {
@@ -843,7 +856,8 @@ extern "C" __global__ void __maxnreg__(168) megakernel_pdf(
   // exact consumer-loader slice geometry (v = ptid + i*128 -> r += 16, c8
   // fixed, wga_off64 += 2048 per i), so the destination bytes are identical to
   // the consumer path (the layout-preserving Branch A of the feasibility note).
-  // GEMM TMA replay (kinds 0-3) stays on the elected thread 256; threads
+  // GEMM TMA replay (kinds 0-3 and the qwen NT supertile kind 6) stays on
+  // the elected thread 256; threads
   // 257-383 skip those requests but track seq. The serial-request invariant
   // holds for kind 4 too: the consumer's last bfull wait needs all 128
   // producer-thread arrivals, so every producer thread finished issuing tile T
@@ -923,7 +937,14 @@ extern "C" __global__ void __maxnreg__(168) megakernel_pdf(
         if (t >= stages) wg_mbar_wait(&bempty[st], (t / stages - 1) & 1);
         wg_mbar_expect_tx(&bfull[st], xb);
         const int k0 = k_base + t * bk;
-        if (kind == 3) {
+        if (kind == 6) {
+          wg_tma_load_2d(tmA, a0 + st * a_st, k0, m0, &bfull[st]);
+          wg_tma_load_2d(tmA, a1 + st * a_st, k0, m0 + 128, &bfull[st]);
+#pragma unroll
+          for (int g = 0; g < 2; ++g)
+            wg_tma_load_2d(tmB, b0 + st * b_st + g * 8192, k0, n0 + g * 64,
+                           &bfull[st]);
+        } else if (kind == 3) {
           wg_tma_load_2d(tmA, a0 + st * a_st, k0, m0, &bfull[st]);
 #pragma unroll
           for (int g = 0; g < 4; ++g)

@@ -499,15 +499,69 @@ class MKQwen3:
         # (+66.91/+68.40us versus forced old, parity clean, LOCAL:0).
         # MK_GEMM_N256_NT_TMA=0/1 remains the explicit A/B override.
         self.gemm_n256_nt_tma_default = exact_qwen4b_l1 or exact_qwen4b_l2
+        nt_supertile_env = os.environ.get("MK_GEMM_N256_NT_SUPERTILE")
+        # Store-loop CE64 partials turn the qwen NT-TMA lm-head row into a step
+        # win: L1 was promotion-grade in the nan-audited k8s A/B; L2 won on top
+        # of forced L2 NT-TMA. env=0 is the rollback guard.
+        self.gemm_n256_nt_supertile_enabled = (
+            exact_qwen4b_l1 or exact_qwen4b_l2
+            if nt_supertile_env is None
+            else bool(int(nt_supertile_env)) and (exact_qwen4b_l1 or exact_qwen4b_l2)
+        )
+        nt_supertile_reg_epi_env = os.environ.get("MK_GEMM_N256_NT_SUPERTILE_REG_EPI")
+        # qwen ST-S3 register epilogue: skip the shared-memory C staging/reread
+        # in the lone lm-head NT supertile row and compute CE64 partials from the
+        # bf16-rounded registers. Local paired A/B at 1554f9d: qwen4b-l1
+        # -32/-55us over 48 reps, qwen4b-l2 -126/-116us, clean parity both
+        # construction orders. Env=0 is the rollback guard.
+        self.gemm_n256_nt_supertile_reg_epi_enabled = (
+            self.gemm_n256_nt_supertile_enabled
+            if nt_supertile_reg_epi_env is None
+            else bool(int(nt_supertile_reg_epi_env)) and self.gemm_n256_nt_supertile_enabled
+        )
+        # Qwen ST-S3 PDF compile-prune: in producer-pdf mode, compile out the
+        # consumer-side non-PDF TMA fallback from the exact NT supertile body.
+        # MK_GEMM_N256_NT_SUPERTILE_PDFONLY=0 restores the fallback body.
+        self.gemm_n256_nt_supertile_pdfonly_default = (
+            exact_qwen4b_l1 or exact_qwen4b_l2
+        )
+        # L2 qwen ST-S3 PDF body: skip the second internal sync after tid0
+        # reinitializes NT supertile mbarriers.
+        # MK_GEMM_N256_NT_SUPERTILE_POSTINIT_NOSYNC=0 restores the old sync path;
+        # L1 remains env-only until it has stronger evidence.
+        self.gemm_n256_nt_supertile_postinit_nosync_default = exact_qwen4b_l2
         # L2 terminal EMBED_BWD sits as an off-path cold leaf while lm-head dW drains;
         # making only that leaf hot recovers ~0.14-0.17ms at exact qwen4b-l2 with
         # qwen4b-l1 neutral and generic shapes order-mixed. MK_HOT_EMBED_BWD=0/1
         # remains the explicit override.
         self.hot_embed_bwd_default = exact_qwen4b_l2
+        # L2 lm-head dW is the giant terminal cold sink exposed after the register
+        # epilogue + WQKV hot-leaf defaults. Making it hot won by -272/-223us in
+        # forced A/B and -247/-229us in no-env default proof at 1554f9d.
+        # MK_HOT_QWEN_LM_DW=0 restores the cold route.
+        self.hot_qwen_lm_dw_default = exact_qwen4b_l2
+        # H2560 split RMSNorm dX body specialization removes the runtime H loop
+        # from the qwen4b-l2 rowop. MK_RMS_DX_H2560=0 restores the generic body.
+        self.rms_dx_h2560_default = exact_qwen4b_l2
+        # Exact qwen4b-l2 lm-head dX n256 body specialization: same route and
+        # TMA/pdf protocol, but the body hardcodes the NN fp32 head-dX invariants.
+        # MK_GEMM_N256_HEAD_DX_EXACT=0 restores the generic n256 NN/TN body.
+        self.gemm_n256_head_dx_exact_default = exact_qwen4b_l2
+        # L2 head-dX PDF-only exact body: when the producer-df feed is active,
+        # compile out the consumer-side non-PDF TMA issue path. Route unchanged;
+        # MK_GEMM_N256_HEAD_DX_PDFONLY=0 restores the exact body with the generic
+        # TMA fallback still compiled.
+        self.gemm_n256_head_dx_pdfonly_default = exact_qwen4b_l2
         # L2 layer-0 WGU dW leaf (#64) becomes the next terminal cold sink after
         # EMBED_BWD is hot. Marking only that exact leaf hot wins locally in both
         # construction orders; MK_HOT_QWEN_WGU_DW=0 restores the cold-leaf route.
         self.hot_qwen_wgu_dw_default = exact_qwen4b_l2
+        # L2 layer-1 WQKV dW leaf (#73) is the next exposed cold sink after the
+        # register-epilogue promotion. Marking it hot moves
+        # `GEMMTN 6144x2560x1024.wg` off-path; 120-rep A/B was -91/-90us median
+        # both construction orders, forced profile median improved 9857.5->9769.1us.
+        # MK_HOT_QWEN_WQKV_DW=0 restores the cold-leaf route.
+        self.hot_qwen_wqkv_dw_default = exact_qwen4b_l2
         # pdf shell smem-state fix (see mk.py MK_PDF_SHELL_SMEM): certified
         # exact-l1 only — escalation pdfshell-esc-3f21e1e-0300 -27.94us 49/60 /
         # -32.29us 50/60 both orders; l2 ORDER-MIXED at 80 reps (stays off),
@@ -539,6 +593,13 @@ class MKQwen3:
         self.gemm_dx_tma_red_enabled = (
             exact_dx_tma_red if gemm_dx_tma_red_env is None else bool(int(gemm_dx_tma_red_env))
         )
+        # Exact-s1024 generic TN dW split-K epilogue: keep the current host route
+        # and replace only the full-tile fp32 atomic drain with per-row
+        # cp.reduce.async.bulk.add.f32. MK_DW_TN_TMA_RED=0/1 guards A/B.
+        dw_tn_tma_red_env = os.environ.get("MK_DW_TN_TMA_RED")
+        self.dw_tn_tma_red_enabled = (
+            exact_s1024 if dw_tn_tma_red_env is None else bool(int(dw_tn_tma_red_env))
+        )
         # n256-direct NT EVICT_FIRST TMA C store (DeepGEMM R3 port): default-on
         # for the measured C-write-bound H256/D64 long-S lm-head rows only.
         # Certified paired A/B both orders (n256-tmastore-94cb1ef gate job):
@@ -561,8 +622,19 @@ class MKQwen3:
             if gemm_n256_tma_store_env is None
             else bool(int(gemm_n256_tma_store_env))
         )
+        # Plain BF16 WGMMA GEMM epilogue: exact S1024 joined after the current
+        # attention+dW promoted stack made 16 plain rows selected-path visible.
         self.gemm_direct_bf16_epilogue_default = c.D == 64 and (
-            c.S == 128 or (c.H, c.L, c.S, c.nq, c.nkv, c.I) == (512, 8, 1024, 8, 4, 1536)
+            c.S == 128
+            or exact_s1024
+            or (c.H, c.L, c.S, c.nq, c.nkv, c.I) == (512, 8, 1024, 8, 4, 1536)
+        )
+        # Direct N64 GEMM dispatch removes the generic opcode switch inside the
+        # DF tile loop. It stays exact-short-shape gated: exact S1024 loses under
+        # composition, while H256/D64 S128/S256/nano/deep win. Env 0/1 remains
+        # the rollback/A-B override.
+        self.gemm_n64_fast_dispatch_default = (
+            exact_h256_d64_s128_s256 or exact_h256_d64_nano or exact_h256_d64_deep
         )
         # D64 standard WGMMA Drow register epilogue: compute the Drow dot from
         # the bf16-rounded register accumulator and skip the shared-memory Cs
@@ -596,33 +668,63 @@ class MKQwen3:
         )
         # D64 attention-bwd exp2 prebias: exact S4096 was promoted first; after
         # the S8192 dQ register-feed landing, exact S8192 also wins both orders.
-        # Exact H256 deep S512 joined in the short-S attention combo confirmation;
-        # keep the gate exact because small stayed neutral/negative.
+        # Exact S1024 joined after the DQ RS+fp32-P and fwd expfold promotions
+        # made DKV fully selected-path visible. Exact H256 deep S512 joined in
+        # the short-S attention combo confirmation; keep the gate exact because
+        # small stayed neutral/negative.
         self.attn_exp2_prebias_default = (
-            exact_s4096 or exact_s8192 or exact_h256_d64_deep
+            exact_s4096 or exact_s8192 or exact_s1024 or exact_h256_d64_deep
         )
+        # Fwd D64 exp-argument fold: long S8192 is a hard no-go, but exact S1024
+        # wins both construction orders after the head-dX SKR and DQ RS+fp32-P
+        # schedule changes. MK_ATTN_FWD_EXPFOLD=0/1 remains the explicit A/B
+        # override.
+        self.attn_fwd_expfold_default = exact_s1024
+        # D64 fwd de-divergence: exact S1024 wins by executing WG0's fully masked
+        # tail stage through the existing mask math instead of branching away.
+        # MK_ATTN_FWD_DEDIVERGE=0/1 remains the explicit A/B override.
+        self.attn_fwd_dediverge_default = exact_s1024
+        # D64 fwd score-mask split: exact S1024 wins by routing common unmasked
+        # stages around per-element causal-mask predicates while preserving the
+        # existing masked diagonal/tail path.
+        # MK_ATTN_FWD_MASK_SPLIT=0/1 remains the explicit A/B override.
+        self.attn_fwd_mask_split_default = exact_s1024
+        # D64 dKV fp32-P dS pack: keep bf16 P in smem for dV, but use the fp32
+        # p0/p1 values for dS = P * (dP - Drow) * scale. Exact S1024 wins both
+        # construction orders after DKV becomes fully selected-path visible.
+        # Exact-small wins only when composed with DQ RS-feed + fp32-P.
+        # MK_ATTN_DKV_FP32_P=0/1 guards A/B.
+        self.attn_dkv_fp32_p_default = exact_s1024 or exact_small_h512_s1024
         # D64 dQ register-A dS feed: exact S4096/S8192 remove the dS smem round
         # trip and won both construction orders after the pdf+d64feed/scalar
-        # store gates. Exact H256 short S128/S256 and deep S512 joined in the
-        # short-S combo confirmation. S3072 stayed too small in reverse-order
-        # confirmation.
+        # store gates. Exact S1024 joined after the head-dX SKR schedule made a
+        # dQ row selected-path visible. Exact H256 short S128/S256 and deep S512
+        # joined in the short-S combo confirmation. Exact-small joins only as
+        # the DQ+DKV precision composition. S3072 stayed too small in
+        # reverse-order confirmation.
         # MK_ATTN_DQ_RS_FEED=0/1 remains the explicit A/B override.
         self.attn_dq_rs_feed_default = (
             exact_s4096
             or exact_s8192
+            or exact_s1024
             or exact_h256_d64_s128_s256
             or exact_h256_d64_deep
+            or exact_small_h512_s1024
         )
         # D64 dQ fp32-P pack: exact S8192 and S3072 win by removing an extra
         # bf16(P)->fp32(P) round before the final bf16 dS pack on the RS-feed
-        # path. Exact H256 short S128/S256 and deep S512 also win with RS-feed
-        # composed. S4096 was neutral, so keep this exact-shape gated;
+        # path. Exact S1024 wins when composed with RS-feed after the head-dX
+        # SKR schedule. Exact H256 short S128/S256 and deep S512 also win with
+        # RS-feed composed. Exact-small joins only as the DQ+DKV precision
+        # composition. S4096 was neutral, so keep this exact-shape gated;
         # MK_ATTN_DQ_FP32_P=0/1 guards A/B.
         self.attn_dq_fp32_p_default = (
             exact_s3072
             or exact_s8192
+            or exact_s1024
             or exact_h256_d64_s128_s256
             or exact_h256_d64_deep
+            or exact_small_h512_s1024
         )
         # D64 dQ C>1 bulk-reduce drain (cp.reduce.async.bulk.add.f32): the
         # 2026-07-07 gate-map completion promoted every measured H256/D64
@@ -700,11 +802,16 @@ class MKQwen3:
             attn_exp2_approx=self.attn_exp2_approx_default,
             attn_exp2_prebias=self.attn_exp2_prebias_default,
             lmhead_exp2_approx=self.lmhead_exp2_approx_default,
+            rms_dx_h2560=self.rms_dx_h2560_default,
             ce_bwd_exp2_approx=self.ce_bwd_exp2_approx_default,
             ce_bwd_label_fixup=self.ce_bwd_label_fixup_default,
             idle_ns=self.idle_ns_default,
             attn_fast_log=self.attn_fast_log_default,
+            attn_fwd_expfold=self.attn_fwd_expfold_default,
+            attn_fwd_dediverge=self.attn_fwd_dediverge_default,
+            attn_fwd_mask_split=self.attn_fwd_mask_split_default,
             attn_dkv_float2_atomic=self.attn_dkv_float2_atomic_default,
+            attn_dkv_fp32_p=self.attn_dkv_fp32_p_default,
             attn_dkv_row_bcast=self.attn_dkv_row_bcast_default,
             attn_dq_float2_store=self.attn_dq_float2_store_default,
             attn_dq_fp32_p=self.attn_dq_fp32_p_default,
@@ -715,10 +822,20 @@ class MKQwen3:
             gemm_n256_nt_mbar=self.gemm_n256_nt_mbar_default,
             gemm_n256_tma=self.gemm_n256_tma_default,
             gemm_n256_nt_tma=self.gemm_n256_nt_tma_default,
+            gemm_n256_nt_supertile=self.gemm_n256_nt_supertile_enabled,
+            gemm_n256_nt_supertile_reg_epi=self.gemm_n256_nt_supertile_reg_epi_enabled,
+            gemm_n256_nt_supertile_pdfonly=self.gemm_n256_nt_supertile_pdfonly_default,
+            gemm_n256_nt_supertile_postinit_nosync=(
+                self.gemm_n256_nt_supertile_postinit_nosync_default
+            ),
+            gemm_n256_head_dx_exact=self.gemm_n256_head_dx_exact_default,
+            gemm_n256_head_dx_pdfonly=self.gemm_n256_head_dx_pdfonly_default,
             gemm_d64_tma=self.gemm_d64_tma_default,
             gemm_dx_tma_red=self.gemm_dx_tma_red_enabled,
+            dw_tn_tma_red=self.dw_tn_tma_red_enabled,
             gemm_n256_tma_store=self.gemm_n256_tma_store_enabled,
             gemm_direct_bf16_epilogue=self.gemm_direct_bf16_epilogue_default,
+            gemm_n64_fast_dispatch=self.gemm_n64_fast_dispatch_default,
             head_dx_skr=self.head_dx_skr,
             pdf_producer=self.default_mode == "pdf",
             pdf_d64_feed=self.pdf_d64_feed_default,
@@ -739,14 +856,13 @@ class MKQwen3:
             else (bool(int(d128_env)) and c.D == 128 and c.S % 64 == 0)
         )
         dq_rs_env = os.environ.get("MK_ATTN_D128_DQ_RS")
-        # dq RS-feed stays L1-ONLY: the l2 peel measured RS-off faster in 4
-        # consecutive windows (-165.9/-63.9/-85.1/-52.8us, 10-16/24 wins;
-        # mkv3-p4b-qwenl2-{peel-support,followup-confirm} logs) — the l2
-        # 2-layer dq structure does not profit from the row-split. stage3/
-        # nmajor/smem keep the full _D128_DQ_ROWSPLIT (l1+l2).
+        # dq RS-feed: L1 stayed on from the original D128 port. L2 was off after
+        # the peel-era route, but the post-rms2560 chain makes RS-feed a clear
+        # qwen4b-l2 win again (-133/-145us, parity clean). MK_ATTN_D128_DQ_RS=0
+        # restores the non-RS DQ route for rollback and stale-checks.
         dq_rs_default = (
             (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) in _D128_DQ_ROWSPLIT
-            and c.L == 1
+            and c.L in (1, 2)
         )
         self.attn_d128_dq_rowsplit_enabled = (
             self.attn_d128_wg_enabled
@@ -772,7 +888,11 @@ class MKQwen3:
             n256_nmajor_default if n256_nmajor_env is None else
             (bool(int(n256_nmajor_env)) and n256_nmajor_default)
         )
-        if self.attn_d128_dq_rowsplit_enabled or self.n256_stage3_enabled:
+        if (
+            self.attn_d128_dq_rowsplit_enabled
+            or self.n256_stage3_enabled
+            or self.gemm_n256_nt_supertile_enabled
+        ):
             self._smem_bytes = 148 * 1024
         else:
             self._smem_bytes = 120 * 1024 if self.attn_d128_wg_enabled else None
@@ -794,7 +914,9 @@ class MKQwen3:
         p = mk.Program()
         p.default_cold_cap = _cold_cap(c)
         p.hot_embed_bwd_default = self.hot_embed_bwd_default
+        p.hot_qwen_lm_dw_default = self.hot_qwen_lm_dw_default
         p.hot_qwen_wgu_dw_default = self.hot_qwen_wgu_dw_default
+        p.hot_qwen_wqkv_dw_default = self.hot_qwen_wqkv_dw_default
         # Program-side arm of MK_GEMM_N256_TMA: mirrors load_ext's resolution
         # (ring required) so the compiled path and the injected tmap args agree.
         _ring_env = os.environ.get("MK_GEMM_MBAR_RING")
@@ -815,6 +937,9 @@ class MKQwen3:
             p.gemm_n256_tma_tn_default = self.gemm_n256_tma_default
         if _ring_on and _nt_tma_on:
             p.gemm_n256_nt_tma_enabled = True
+        _nt_supertile_on = (
+            self.gemm_n256_nt_supertile_enabled and _ring_on and _nt_tma_on
+        )
         # Program-side arm of MK_GEMM_D64_TMA (same ring requirement).
         _d64tma_env = os.environ.get("MK_GEMM_D64_TMA")
         _d64tma_on = (bool(int(_d64tma_env)) if _d64tma_env is not None
@@ -1273,17 +1398,28 @@ class MKQwen3:
         if self.fuse_ce and mk.wgmma_ok(c.S, c.V, c.H, 2):
             # lm_head gemm with per-row lse partials in the epilogue (bit11): CE fwd
             # reduces V/64 (max, sumexp) pairs instead of rescanning the V-wide row
-            n256d = mk.wgmma_n256_direct_ok(c.S, c.V, c.H, 2 | 2048)
-            n128 = (not n256d) and mk.wgmma_n128_ok(c.S, c.V, c.H, 2 | 2048)
-            n256_stage3_bits = n256_stage3_flag(c.S, c.V, c.H) if n256d else 0
-            n256_nmajor_bits = n256_nmajor_flag(c.S, c.V, c.H) if n256d else 0
+            n256st = (
+                _nt_supertile_on
+                and mk.wgmma_n256_nt_supertile_ok(c.S, c.V, c.H, 2 | 2048)
+            )
+            n256d = (not n256st) and mk.wgmma_n256_direct_ok(c.S, c.V, c.H, 2 | 2048)
+            n128 = (
+                not n256st
+                and not n256d
+                and mk.wgmma_n128_ok(c.S, c.V, c.H, 2 | 2048)
+            )
+            n256_route = n256st or n256d
+            n256_stage3_bits = n256_stage3_flag(c.S, c.V, c.H) if n256_route else 0
+            n256_nmajor_bits = n256_nmajor_flag(c.S, c.V, c.H) if n256_route else 0
             p.instr(
                 mk.OP_GEMM,
-                (mk.gemm_tiles_wgmma_n256_direct(c.S, c.V) if n256d else
+                (mk.gemm_tiles_wgmma_n256_nt_supertile(c.S, c.V) if n256st else
+                 mk.gemm_tiles_wgmma_n256_direct(c.S, c.V) if n256d else
                  mk.gemm_tiles_wgmma_n128(c.S, c.V) if n128 else mk.gemm_tiles_wgmma(c.S, c.V)),
                 [B(A["xnf"]), B(self.params["wlm"]), B(A["logits"]), c.S, c.V, c.H,
                  2 | 128 | 2048 | n256_stage3_bits | n256_nmajor_bits |
-                 (16384 if n256d else 4096 if n128 else 0), 0, 0,
+                 (mk.GEMM_N256_NT_SUPERTILE_FLAG if n256st else 0) |
+                 (16384 if n256_route else 4096 if n128 else 0), 0, 0,
                  B(W["lse_parts"]), c.V // 64],
             )
             p.wave()

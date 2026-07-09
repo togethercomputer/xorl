@@ -538,7 +538,11 @@ __device__ __noinline__ void op_attn_fwd_wg(const Instr& I, int tile, void** buf
     if (t + 1 < n_stages) issue_kv_stage((c + (t + 1) * C) * 64, (t + 1) % 3);
     __pipeline_wait_prior(t + 1 < n_stages ? 1 : 0);
     consumer_sync();
+#ifdef MK_ATTN_FWD_DEDIVERGE
+    const bool skip = false;           // execute the fully masked WG0 tail stage
+#else
     const bool skip = k0 > q0wg + 63;  // WG0's tail stage: fully masked
+#endif
     float alpha[2];
     if (!skip) {
       float s[32];
@@ -548,6 +552,45 @@ __device__ __noinline__ void op_attn_fwd_wg(const Instr& I, int tile, void** buf
       cute::warpgroup_wait<0>();  // retires PV(t-1), then S(t); s readable below
       const bool masked = k0 + 63 > q0wg;                             // diagonal stage
       float rmax[2] = {-INFINITY, -INFINITY};
+#ifdef MK_ATTN_FWD_MASK_SPLIT
+      if (masked) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+          const int qr = q0wg + r0 + 8 * i;
+#pragma unroll
+          for (int n8 = 0; n8 < 8; ++n8)
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+              const int idx = n8 * 4 + i * 2 + j;
+#ifdef MK_ATTN_FWD_EXPFOLD
+              float sc = s[idx];  // raw score; scale folds into the exp2 argument
+#else
+              float sc = s[idx] * scale;
+#endif
+              if (k0 + n8 * 8 + cb + j > qr) sc = -INFINITY;
+              s[idx] = sc;
+              rmax[i] = fmaxf(rmax[i], sc);
+            }
+        }
+      } else {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+#pragma unroll
+          for (int n8 = 0; n8 < 8; ++n8)
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+              const int idx = n8 * 4 + i * 2 + j;
+#ifdef MK_ATTN_FWD_EXPFOLD
+              const float sc = s[idx];  // raw score; scale folds into the exp2 argument
+#else
+              const float sc = s[idx] * scale;
+#endif
+              s[idx] = sc;
+              rmax[i] = fmaxf(rmax[i], sc);
+            }
+        }
+      }
+#else
 #pragma unroll
       for (int i = 0; i < 2; ++i) {
         const int qr = q0wg + r0 + 8 * i;
@@ -566,6 +609,7 @@ __device__ __noinline__ void op_attn_fwd_wg(const Instr& I, int tile, void** buf
             rmax[i] = fmaxf(rmax[i], sc);
           }
       }
+#endif
 #pragma unroll
       for (int i = 0; i < 2; ++i) {
         rmax[i] = fmaxf(rmax[i], __shfl_xor_sync(0xffffffffu, rmax[i], 1));
@@ -901,8 +945,13 @@ __device__ __noinline__ void op_attn_dkv_wg(const Instr& I, int tile, void** buf
           pv.y = f2bf(p1);
           *reinterpret_cast<__nv_bfloat162*>((char*)sm.P[wg] + off) = pv;
           __nv_bfloat162 dsv;
+#ifdef MK_ATTN_DKV_FP32_P
+          dsv.x = f2bf(p0 * (s2[idx] - dr) * scale);
+          dsv.y = f2bf(p1 * (s2[idx + 1] - dr) * scale);
+#else
           dsv.x = f2bf(bf2f(pv.x) * (s2[idx] - dr) * scale);
           dsv.y = f2bf(bf2f(pv.y) * (s2[idx + 1] - dr) * scale);
+#endif
           *reinterpret_cast<__nv_bfloat162*>((char*)sm.dS[wg] + off) = dsv;
         }
       }

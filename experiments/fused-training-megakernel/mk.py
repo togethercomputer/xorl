@@ -60,6 +60,7 @@ GEMM_DX_TMA_RED_FLAG = 1 << 6  # with bit5: dX split-K smem tile -> bulk reduce-
 GEMM_SKR_FLAG = 1 << 15  # with bit5: plain per-slice slab stores + OP_SKR_REDUCE
 GEMM_N256_STAGE3_FLAG = 1 << 25
 GEMM_N256_NMAJOR_FLAG = 1 << 26
+GEMM_N256_NT_SUPERTILE_FLAG = 1 << 27
 FILL_CHUNK = 16384  # elements per fill/cvt work item (MK_CHUNK in ops.cuh)
 
 
@@ -287,6 +288,19 @@ def gemm_tiles_wgmma_n256_direct(M, N):
     return (M // 128) * ((N + 255) // 256)
 
 
+def gemm_tiles_wgmma_n256_nt_supertile(M, N):
+    return (M // 256) * (N // 128)
+
+
+def wgmma_n256_nt_supertile_ok(M, N, K, flags):
+    """Exact qwen lm-head fwd 256x128 supertile route."""
+    if flags not in (2, 2 | 2048):
+        return False
+    if (M, N, K) != (1024, 151936, 2560):
+        return False
+    return M % 256 == 0 and N % 128 == 0 and K % 64 == 0
+
+
 _QWEN_N256_STAGE3_SHAPES = {
     (1024, 151936, 2560),   # lm-head fwd
     (1024, 2560, 151936),   # lm-head dX
@@ -418,7 +432,8 @@ def gemm_n256_nt_tma_eligible(args):
     flags = args[6]
     if not (flags & 128) or not (flags & 16384):
         return False
-    if not (flags & 2) or not (flags & 2048):
+    is_supertile = bool(flags & GEMM_N256_NT_SUPERTILE_FLAG)
+    if not (flags & 2) or (not (flags & 2048) and not is_supertile):
         return False
     if flags & (1 | 4 | 16 | 32 | 256 | 8192):
         return False
@@ -516,11 +531,16 @@ def load_ext(
     attn_exp2_approx=None,
     attn_exp2_prebias=None,
     lmhead_exp2_approx=None,
+    rms_dx_h2560=None,
     ce_bwd_exp2_approx=None,
     ce_bwd_label_fixup=None,
     idle_ns=None,
     attn_fast_log=None,
+    attn_fwd_expfold=None,
+    attn_fwd_dediverge=None,
+    attn_fwd_mask_split=None,
     attn_dkv_float2_atomic=None,
+    attn_dkv_fp32_p=None,
     attn_dq_float2_store=None,
     attn_dq_fp32_p=None,
     attn_dq_rs_feed=None,
@@ -531,10 +551,18 @@ def load_ext(
     gemm_n256_nt_mbar=None,
     gemm_n256_tma=None,
     gemm_n256_nt_tma=None,
+    gemm_n256_nt_supertile=None,
+    gemm_n256_nt_supertile_reg_epi=None,
+    gemm_n256_nt_supertile_pdfonly=None,
+    gemm_n256_nt_supertile_postinit_nosync=None,
+    gemm_n256_head_dx_exact=None,
+    gemm_n256_head_dx_pdfonly=None,
     gemm_d64_tma=None,
     gemm_dx_tma_red=None,
+    dw_tn_tma_red=None,
     gemm_n256_tma_store=None,
     gemm_direct_bf16_epilogue=None,
+    gemm_n64_fast_dispatch=None,
     head_dx_skr=0,
     pdf_producer=0,
     pdf_d64_feed=None,
@@ -550,17 +578,27 @@ def load_ext(
     occ2 = int(os.environ.get("MK_OCC2", "0"))
     regcopy = int(os.environ.get("MK_WS_REGCOPY", "0"))
     attnpipe = int(os.environ.get("MK_ATTN_PIPE", "0"))
-    # FA4-fwd softmax ALU cuts (env-only). EXPFOLD folds scale*log2e into the
-    # exp2 argument (running max tracked in the scaled-log2 domain: one
-    # FMA+ex2 per element, no separate s*scale multiply); DEFER_RSUM keeps the
-    # per-thread partial row sum through the stage loop and quad-reduces once at
-    # the tile epilogue instead of two shfl_xor per 64-col stage.
+    # FA4-fwd softmax ALU cuts. EXPFOLD folds scale*log2e into the exp2 argument
+    # (running max tracked in the scaled-log2 domain: one FMA+ex2 per element,
+    # no separate s*scale multiply); DEFER_RSUM keeps the per-thread partial row
+    # sum through the stage loop and quad-reduces once at the tile epilogue
+    # instead of two shfl_xor per 64-col stage.
     # DEFER_RSUM default-on: -36.5/-47.0us s8192, -10.1/-7.3us s4096, >=0
     # nano/small, both orders (results/operator-gap/fwd-expfold-defersum-
-    # b1d36305.md). EXPFOLD stays off: +47/+43us s8192 — the p-loop is
-    # MUFU-bound, the deleted FMULs were free co-issue work.
-    attn_fwd_expfold = int(os.environ.get("MK_ATTN_FWD_EXPFOLD", "0"))
+    # b1d36305.md). EXPFOLD stays shape-gated: +47/+43us s8192, but exact s1024
+    # wins after the head-dX SKR and DQ RS+fp32-P schedule changes.
+    attn_fwd_expfold_env = os.environ.get("MK_ATTN_FWD_EXPFOLD")
+    if attn_fwd_expfold_env is not None:
+        attn_fwd_expfold = int(attn_fwd_expfold_env)
+    else:
+        attn_fwd_expfold = int(bool(attn_fwd_expfold))
     attn_fwd_defer_rsum = int(os.environ.get("MK_ATTN_FWD_DEFER_RSUM", "1"))
+    attn_fwd_dediverge = int(
+        os.environ.get("MK_ATTN_FWD_DEDIVERGE", int(bool(attn_fwd_dediverge)))
+    )
+    attn_fwd_mask_split = int(
+        os.environ.get("MK_ATTN_FWD_MASK_SPLIT", int(bool(attn_fwd_mask_split)))
+    )
     attn_dkv_row_bcast_env = os.environ.get("MK_ATTN_DKV_ROW_BCAST")
     if attn_dkv_row_bcast_env is not None:
         attn_dkv_row_bcast = int(attn_dkv_row_bcast_env)
@@ -576,6 +614,11 @@ def load_ext(
     else:
         attn_dkv_float2_atomic = int(bool(attn_dkv_float2_atomic))
     attn_dkv_float2_atomic = int(bool(attn_dkv_float2_atomic and attn_dkv_direct_atomic))
+    attn_dkv_fp32_p_env = os.environ.get("MK_ATTN_DKV_FP32_P")
+    if attn_dkv_fp32_p_env is not None:
+        attn_dkv_fp32_p = int(attn_dkv_fp32_p_env)
+    else:
+        attn_dkv_fp32_p = int(bool(attn_dkv_fp32_p))
     attn_dq_float2_store_env = os.environ.get("MK_ATTN_DQ_FLOAT2_STORE")
     if attn_dq_float2_store_env is not None:
         attn_dq_float2_store = int(attn_dq_float2_store_env)
@@ -615,6 +658,14 @@ def load_ext(
         gemm_dx_tma_red = int(gemm_dx_tma_red_env)
     else:
         gemm_dx_tma_red = int(bool(gemm_dx_tma_red))
+    # Generic WMMA TN dW split-K reduce-add drain: for exact s1024, full-tile
+    # dW rows are better as per-row cp.reduce.async.bulk.add.f32 than as the
+    # old per-element fp32 atomicAdd loop. MK_DW_TN_TMA_RED=0/1 guards A/B.
+    dw_tn_tma_red_env = os.environ.get("MK_DW_TN_TMA_RED")
+    if dw_tn_tma_red_env is not None:
+        dw_tn_tma_red = int(dw_tn_tma_red_env)
+    else:
+        dw_tn_tma_red = int(bool(dw_tn_tma_red))
     gemm_n256_tma_store_env = os.environ.get("MK_GEMM_N256_TMA_STORE")
     if gemm_n256_tma_store_env is not None:
         gemm_n256_tma_store = int(gemm_n256_tma_store_env)
@@ -655,6 +706,12 @@ def load_ext(
     )
     lmhead_exp2_approx = int(
         os.environ.get("MK_LMHEAD_EXP2_APPROX", int(bool(lmhead_exp2_approx)))
+    )
+    rms_dx_h2560 = int(
+        os.environ.get(
+            "MK_RMS_DX_H2560",
+            "0" if rms_dx_h2560 is None else str(int(bool(rms_dx_h2560))),
+        )
     )
     ce_bwd_exp2_approx = int(
         os.environ.get("MK_CE_BWD_EXP2_APPROX", int(bool(ce_bwd_exp2_approx)))
@@ -806,6 +863,55 @@ def load_ext(
             0 if gemm_n256_nt_tma is None else int(bool(gemm_n256_nt_tma))
         )
     gemm_n256_nt_tma = int(bool(gemm_mbar_ring and gemm_n256_nt_tma))
+    gemm_n256_nt_supertile_env = os.environ.get("MK_GEMM_N256_NT_SUPERTILE")
+    if gemm_n256_nt_supertile_env is not None:
+        gemm_n256_nt_supertile = int(gemm_n256_nt_supertile_env)
+    else:
+        gemm_n256_nt_supertile = (
+            0 if gemm_n256_nt_supertile is None else int(bool(gemm_n256_nt_supertile))
+        )
+    gemm_n256_nt_supertile = int(
+        bool(gemm_mbar_ring and gemm_n256_nt_tma and gemm_n256_nt_supertile)
+    )
+    gemm_n256_nt_supertile_reg_epi = int(os.environ.get(
+        "MK_GEMM_N256_NT_SUPERTILE_REG_EPI",
+        "0" if gemm_n256_nt_supertile_reg_epi is None
+        else str(int(bool(gemm_n256_nt_supertile_reg_epi))),
+    ))
+    gemm_n256_nt_supertile_reg_epi = int(
+        bool(gemm_n256_nt_supertile and gemm_n256_nt_supertile_reg_epi)
+    )
+    gemm_n256_nt_supertile_pdfonly = int(os.environ.get(
+        "MK_GEMM_N256_NT_SUPERTILE_PDFONLY",
+        "0" if gemm_n256_nt_supertile_pdfonly is None
+        else str(int(bool(gemm_n256_nt_supertile_pdfonly))),
+    ))
+    gemm_n256_nt_supertile_pdfonly = int(bool(
+        gemm_n256_nt_supertile and pdf_producer and gemm_n256_nt_supertile_pdfonly
+    ))
+    gemm_n256_nt_supertile_postinit_nosync = int(os.environ.get(
+        "MK_GEMM_N256_NT_SUPERTILE_POSTINIT_NOSYNC",
+        "0" if gemm_n256_nt_supertile_postinit_nosync is None
+        else str(int(bool(gemm_n256_nt_supertile_postinit_nosync))),
+    ))
+    gemm_n256_nt_supertile_postinit_nosync = int(bool(
+        gemm_n256_nt_supertile_pdfonly
+        and gemm_n256_nt_supertile_reg_epi
+        and gemm_n256_nt_supertile_postinit_nosync
+    ))
+    gemm_n256_head_dx_exact = int(os.environ.get(
+        "MK_GEMM_N256_HEAD_DX_EXACT",
+        "0" if gemm_n256_head_dx_exact is None
+        else str(int(bool(gemm_n256_head_dx_exact))),
+    ))
+    gemm_n256_head_dx_pdfonly = int(os.environ.get(
+        "MK_GEMM_N256_HEAD_DX_PDFONLY",
+        "0" if gemm_n256_head_dx_pdfonly is None
+        else str(int(bool(gemm_n256_head_dx_pdfonly))),
+    ))
+    gemm_n256_head_dx_pdfonly = int(bool(
+        gemm_n256_head_dx_exact and pdf_producer and gemm_n256_head_dx_pdfonly
+    ))
     # D64 ring TMA feed for the m64n64/m64n128 mbarrier-ring bodies. Requires
     # the ring; the per-instruction gate is the tmap args injected by
     # Program._inject_gemm_tmaps (this only compiles the device path).
@@ -822,6 +928,11 @@ def load_ext(
             int(bool(gemm_direct_bf16_epilogue)),
         )
     )
+    gemm_n64_fast_dispatch_env = os.environ.get("MK_GEMM_N64_FAST_DISPATCH")
+    if gemm_n64_fast_dispatch_env is not None:
+        gemm_n64_fast_dispatch = int(gemm_n64_fast_dispatch_env)
+    else:
+        gemm_n64_fast_dispatch = int(bool(gemm_n64_fast_dispatch))
     ext = load(
         name="xorl_megakernel" + ("_occ2" if occ2 else "") + ("_wsrc" if regcopy else "")
         + ("_apipe" if attnpipe else "")
@@ -830,9 +941,12 @@ def load_ext(
             if (attn_fwd_expfold or attn_fwd_defer_rsum)
             else ""
         )
+        + ("_afdediv" if attn_fwd_dediverge else "")
+        + ("_afms" if attn_fwd_mask_split else "")
         + ("_adkva" if attn_dkv_direct_atomic else "")
         + ("_adkvbc" if attn_dkv_row_bcast else "")
         + ("_adkvf2" if attn_dkv_float2_atomic else "")
+        + ("_adkvf32p" if attn_dkv_fp32_p else "")
         + ("_adqf2" if attn_dq_float2_store else "")
         + ("_adqf32p" if attn_dq_fp32_p else "")
         + ("_adqrs" if attn_dq_rs_feed else "")
@@ -843,6 +957,7 @@ def load_ext(
         + ("pb" if attn_exp2_prebias else "")
         + ("_acur" if attn_combine_unroll else "")
         + ("_lex2" if lmhead_exp2_approx else "")
+        + ("_rms2560" if rms_dx_h2560 else "")
         + ("_ceb2" if ce_bwd_exp2_approx else "")
         + ("_cefix" if ce_bwd_label_fixup else "")
         + (f"_idle{idle_ns}" if idle_ns != 256 else "")
@@ -860,10 +975,18 @@ def load_ext(
         + ("_n256ntold" if gemm_mbar_ring and not gemm_n256_nt_mbar else "")
         + ("_gtma" if gemm_n256_tma else "")
         + ("_nttma" if gemm_n256_nt_tma else "")
+        + ("_ntstpdf" if gemm_n256_nt_supertile_pdfonly
+           else "_ntst" if gemm_n256_nt_supertile else "")
+        + ("reg" if gemm_n256_nt_supertile_reg_epi else "")
+        + ("_ntstnosync" if gemm_n256_nt_supertile_postinit_nosync else "")
+        + ("_hdxex" if gemm_n256_head_dx_exact else "")
+        + ("pdf" if gemm_n256_head_dx_pdfonly else "")
         + ("_d64tma" if gemm_d64_tma else "")
         + ("_gdxtred" if gemm_dx_tma_red else "")
+        + ("_dwtntr" if dw_tn_tma_red else "")
         + ("_n256tst" if gemm_n256_tma_store else "")
         + ("_gdbf16" if gemm_direct_bf16_epilogue else "")
+        + ("_gfdn64" if gemm_n64_fast_dispatch else "")
         + ("_hdskr" if head_dx_skr else "")
         + ("_drowreg" if drow_reg_epilogue else "")
         + (f"_pdf{pdf_regs}" if pdf else "")
@@ -889,9 +1012,12 @@ def load_ext(
         + (["-DMK_ATTN_PIPE"] if attnpipe else [])
         + (["-DMK_ATTN_FWD_EXPFOLD"] if attn_fwd_expfold else [])
         + (["-DMK_ATTN_FWD_DEFER_RSUM"] if attn_fwd_defer_rsum else [])
+        + (["-DMK_ATTN_FWD_DEDIVERGE"] if attn_fwd_dediverge else [])
+        + (["-DMK_ATTN_FWD_MASK_SPLIT"] if attn_fwd_mask_split else [])
         + (["-DMK_ATTN_DKV_ROW_BCAST"] if attn_dkv_row_bcast else [])
         + (["-DMK_ATTN_DKV_DIRECT_ATOMIC"] if attn_dkv_direct_atomic else [])
         + (["-DMK_ATTN_DKV_FLOAT2_ATOMIC"] if attn_dkv_float2_atomic else [])
+        + (["-DMK_ATTN_DKV_FP32_P"] if attn_dkv_fp32_p else [])
         + (["-DMK_ATTN_DQ_FLOAT2_STORE"] if attn_dq_float2_store else [])
         + (["-DMK_ATTN_DQ_FP32_P"] if attn_dq_fp32_p else [])
         + (["-DMK_ATTN_DQ_RS_FEED"] if attn_dq_rs_feed else [])
@@ -904,6 +1030,7 @@ def load_ext(
         + (["-DMK_ATTN_EXP2_PREBIAS"] if attn_exp2_prebias else [])
         + (["-DMK_ATTN_COMBINE_UNROLL"] if attn_combine_unroll else [])
         + (["-DMK_LMHEAD_EXP2_APPROX"] if lmhead_exp2_approx else [])
+        + (["-DMK_RMS_DX_H2560"] if rms_dx_h2560 else [])
         + (["-DMK_CE_BWD_EXP2_APPROX"] if ce_bwd_exp2_approx else [])
         + (["-DMK_CE_BWD_LABEL_FIXUP"] if ce_bwd_label_fixup else [])
         + ([f"-DMK_IDLE_NS={idle_ns}"] if idle_ns != 256 else [])
@@ -922,10 +1049,21 @@ def load_ext(
         + (["-DMK_GEMM_N256_NT_MBAR"] if gemm_n256_nt_mbar else [])
         + (["-DMK_GEMM_N256_TMA"] if gemm_n256_tma else [])
         + (["-DMK_GEMM_N256_NT_TMA"] if gemm_n256_nt_tma else [])
+        + (["-DMK_GEMM_N256_NT_SUPERTILE"] if gemm_n256_nt_supertile else [])
+        + (["-DMK_GEMM_N256_NT_SUPERTILE_REG_EPI"]
+           if gemm_n256_nt_supertile_reg_epi else [])
+        + (["-DMK_GEMM_N256_NT_SUPERTILE_PDFONLY"]
+           if gemm_n256_nt_supertile_pdfonly else [])
+        + (["-DMK_GEMM_N256_NT_SUPERTILE_POSTINIT_NOSYNC"]
+           if gemm_n256_nt_supertile_postinit_nosync else [])
+        + (["-DMK_GEMM_N256_HEAD_DX_EXACT"] if gemm_n256_head_dx_exact else [])
+        + (["-DMK_GEMM_N256_HEAD_DX_PDFONLY"] if gemm_n256_head_dx_pdfonly else [])
         + (["-DMK_GEMM_D64_TMA"] if gemm_d64_tma else [])
         + (["-DMK_GEMM_DX_TMA_RED"] if gemm_dx_tma_red else [])
+        + (["-DMK_DW_TN_TMA_RED"] if dw_tn_tma_red else [])
         + (["-DMK_GEMM_N256_TMA_STORE"] if gemm_n256_tma_store else [])
         + (["-DMK_GEMM_DIRECT_BF16_EPILOGUE"] if gemm_direct_bf16_epilogue else [])
+        + (["-DMK_GEMM_N64_FAST_DISPATCH"] if gemm_n64_fast_dispatch else [])
         + (["-DMK_HEAD_DX_SKR"] if head_dx_skr else [])
         + (["-DMK_DROW_REG_EPILOGUE"] if drow_reg_epilogue else [])
         + (["-DMK_PDF", f"-DMK_PDF_REGS={pdf_regs}", f"-DMK_PDF_DEC={pdf_dec}"] if pdf else [])
@@ -935,7 +1073,7 @@ def load_ext(
         + ([f"-DMK_ATTN_PDF_FEED={attn_pdf_feed}"] if attn_pdf_feed else []),
         verbose=verbose,
     )
-    if attn_dq_bulk_red or gemm_dx_tma_red:
+    if attn_dq_bulk_red or gemm_dx_tma_red or dw_tn_tma_red:
         _audit_bulkred_sass(ext.__file__)
     return ext
 
@@ -1275,7 +1413,9 @@ class Program:
         self.gemm_n256_nt_tma_enabled = False
         self.gemm_n256_tma_tn_default = False
         self.hot_embed_bwd_default = False
+        self.hot_qwen_lm_dw_default = False
         self.hot_qwen_wgu_dw_default = False
+        self.hot_qwen_wqkv_dw_default = False
         # D64 ring TMA feed (m64n64/m64n128 mbarrier-ring bodies): same
         # contract as gemm_n256_tma_ext; the two ports share one tmap table.
         self.gemm_d64_tma_ext = None
@@ -1610,12 +1750,34 @@ class Program:
             if hot_embed_bwd_env is None
             else bool(int(hot_embed_bwd_env))
         )
+        hot_qwen_lm_dw_env = os.environ.get("MK_HOT_QWEN_LM_DW")
+        hot_qwen_lm_dw = (
+            self.hot_qwen_lm_dw_default
+            if hot_qwen_lm_dw_env is None
+            else bool(int(hot_qwen_lm_dw_env))
+        )
         hot_qwen_wgu_dw_env = os.environ.get("MK_HOT_QWEN_WGU_DW")
         hot_qwen_wgu_dw = (
             self.hot_qwen_wgu_dw_default
             if hot_qwen_wgu_dw_env is None
             else bool(int(hot_qwen_wgu_dw_env))
         )
+        hot_qwen_wqkv_dw_env = os.environ.get("MK_HOT_QWEN_WQKV_DW")
+        hot_qwen_wqkv_dw = (
+            self.hot_qwen_wqkv_dw_default
+            if hot_qwen_wqkv_dw_env is None
+            else bool(int(hot_qwen_wqkv_dw_env))
+        )
+
+        def hot_qwen_lm_dw_leaf(i, op, args):
+            if not hot_qwen_lm_dw or op != OP_GEMM:
+                return False
+            flags = args[6]
+            return (
+                adj_off[i + 1] == adj_off[i]
+                and args[3] == 151936 and args[4] == 2560 and args[5] == 1024
+                and (flags & 1) and not (flags & 2) and (flags & 128)
+            )
 
         def hot_qwen_wgu_dw_leaf(i, op, args):
             if not hot_qwen_wgu_dw or op != OP_GEMM:
@@ -1627,10 +1789,22 @@ class Program:
                 and (flags & 1) and not (flags & 2) and (flags & 128)
             )
 
+        def hot_qwen_wqkv_dw_leaf(i, op, args):
+            if not hot_qwen_wqkv_dw or op != OP_GEMM:
+                return False
+            flags = args[6]
+            return (
+                adj_off[i + 1] == adj_off[i]
+                and args[3] == 6144 and args[4] == 2560 and args[5] == 1024
+                and (flags & 1) and not (flags & 2) and (flags & 128)
+            )
+
         crit = [
             1 if (
                 (hot_embed_bwd and flat[i][0] == OP_EMBED_BWD)
+                or hot_qwen_lm_dw_leaf(i, flat[i][0], flat[i][2])
                 or hot_qwen_wgu_dw_leaf(i, flat[i][0], flat[i][2])
+                or hot_qwen_wqkv_dw_leaf(i, flat[i][0], flat[i][2])
             )
             else 0 if (adj_off[i + 1] == adj_off[i] or flat[i][0] == OP_FILL_F32)
             else 1

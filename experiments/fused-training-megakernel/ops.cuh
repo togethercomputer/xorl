@@ -165,7 +165,7 @@ __device__ __forceinline__ uint4 ldg16(const bf16* p) {
   return *reinterpret_cast<const uint4*>(p);
 }
 
-#ifdef MK_GEMM_DX_TMA_RED
+#if defined(MK_GEMM_DX_TMA_RED) || defined(MK_DW_TN_TMA_RED)
 __device__ __forceinline__ void gemm_dx_tma_red_drain_tile(float* C, const GemmSmem& S,
                                                            int N, int m0, int n0) {
   const int tid = mk_tid();
@@ -188,7 +188,7 @@ __device__ __forceinline__ void gemm_dx_tma_red_drain_tile(float* C, const GemmS
 }
 #endif
 
-#ifdef MK_GEMM_DX_TMA_RED
+#if defined(MK_GEMM_DX_TMA_RED) || defined(MK_DW_TN_TMA_RED)
 __device__ __forceinline__ void op_gemm(const Instr& I, int tile, void** bufs,
                                         char* smem_raw) {
 #else
@@ -217,10 +217,17 @@ __device__ void op_gemm(const Instr& I, int tile, void** bufs, char* smem_raw) {
   // Fast path: whole tile in bounds and every vectorized load 16B-aligned.
   const bool fast = (m0 + GEMM_BM <= M) && (n0 + GEMM_BN <= N) && (K % 8 == 0) &&
                     (M % 8 == 0) && (N % 8 == 0);
+#if defined(MK_GEMM_DX_TMA_RED) || defined(MK_DW_TN_TMA_RED)
+  bool tma_red = false;
 #ifdef MK_GEMM_DX_TMA_RED
-  const bool dx_tma_red = (flags & GEMM_DX_TMA_RED_FLAG) && (flags & 32) && c_f32 &&
-                          !a_t && !b_t && !Res && (m0 + GEMM_BM <= M) &&
-                          (n0 + GEMM_BN <= N);
+  tma_red = tma_red || ((flags & GEMM_DX_TMA_RED_FLAG) && (flags & 32) && c_f32 &&
+                        !a_t && !b_t && !Res && (m0 + GEMM_BM <= M) &&
+                        (n0 + GEMM_BN <= N));
+#endif
+#ifdef MK_DW_TN_TMA_RED
+  tma_red = tma_red || ((flags & 32) && c_f32 && !acc_c && a_t && !b_t && !Res &&
+                        (m0 + GEMM_BM <= M) && (n0 + GEMM_BN <= N));
+#endif
 #endif
 
   // 8 warps as 2(m) x 4(n): each computes a 32x32 warp tile = 2x2 wmma frags.
@@ -333,13 +340,13 @@ __device__ void op_gemm(const Instr& I, int tile, void** bufs, char* smem_raw) {
     for (int j = 0; j < 2; ++j)
       wmma::store_matrix_sync(&S.Cs[wm * 32 + i * 16][wn * 32 + j * 16], c_frag[i][j],
                               GEMM_LDC, wmma::mem_row_major);
-#ifdef MK_GEMM_DX_TMA_RED
-  if (dx_tma_red) asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+#if defined(MK_GEMM_DX_TMA_RED) || defined(MK_DW_TN_TMA_RED)
+  if (tma_red) asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 #endif
   consumer_sync();
 
-#ifdef MK_GEMM_DX_TMA_RED
-  if (dx_tma_red) {
+#if defined(MK_GEMM_DX_TMA_RED) || defined(MK_DW_TN_TMA_RED)
+  if (tma_red) {
     gemm_dx_tma_red_drain_tile(reinterpret_cast<float*>(Cp), S, N, m0, n0);
     consumer_sync();
     return;
@@ -401,6 +408,7 @@ __device__ void op_gemm(const Instr& I, int tile, void** bufs, char* smem_raw) {
 #define WG_BK 64
 #define GEMM_N256_STAGE3_FLAG (1 << 25)
 #define GEMM_N256_NMAJOR_FLAG (1 << 26)
+#define GEMM_N256_NT_SUPERTILE_FLAG (1 << 27)
 
 template <int STAGES>
 struct WgmmaSmemT {
@@ -420,6 +428,11 @@ struct WgmmaSmemN256T {
   bf16 B[STAGES][16384];       // per stage: B 32KB
 };
 using WgmmaSmemN256 = WgmmaSmemN256T<2>;
+template <int STAGES>
+struct WgmmaSmemN256NtSupertileT {
+  bf16 A[STAGES][4][4096];  // per stage: two 128-row A strips, 32KB
+  bf16 B[STAGES][8192];     // per stage: one shared 128-col NT B slab, 16KB
+};
 // epilogue staging overlays the (dead-by-then) stage buffers: 128 x 68 fp32 = 34.8KB
 // (n128: 128 x 128 fp32 = 64KB over the 64KB n128 stages)
 #define WG_LDC 68
@@ -717,6 +730,290 @@ __device__ __forceinline__ void wg_mma_ktile_n256(const uint64_t (&da)[4], const
 #undef WG_D64
 #undef WG_D16
 #undef WG_D4
+
+#ifdef MK_GEMM_N256_NT_SUPERTILE
+// Exact qwen lm-head NT+CE route: 256x128 supertile from pipe_probe_st.py.
+// Two 128-row output strips share one 128-column B slab per K stage; the qwen
+// vocab is divisible by 128, so this avoids the n256 body's final 128-col tail.
+template <int STAGES>
+__device__ __noinline__ void op_gemm_wgmma_n256_nt_supertile_impl(
+    const Instr& I, int tile, void** bufs, char* smem_raw) {
+  namespace SG = cute::SM90::GMMA;
+  const bf16* A = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
+  const bf16* B = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
+  bf16* C = reinterpret_cast<bf16*>(bufs[I.args[2]]);
+  const int M = I.args[3], N = I.args[4], K = I.args[5], flags = I.args[6];
+  if (!(flags & 2) || I.args[20] <= 0) return;
+  if (flags & (1 | 4 | 8 | 16 | 32 | 256 | 8192)) return;
+
+  smem_raw = reinterpret_cast<char*>(
+      (reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
+  WgmmaSmemN256NtSupertileT<STAGES>& S =
+      *reinterpret_cast<WgmmaSmemN256NtSupertileT<STAGES>*>(smem_raw);
+  const int n_tiles = N / 128;
+  const int m_tiles = M / 256;
+  const bool nmajor = flags & GEMM_N256_NMAJOR_FLAG;
+  const int mt = nmajor ? (tile % m_tiles) : (tile / n_tiles);
+  const int nt = nmajor ? (tile / m_tiles) : (tile % n_tiles);
+  const int m0 = mt * 256;
+  const int n0 = nt * 128;
+  const int tid = mk_tid();
+  const int wg = tid / 128;
+
+  const char* tbl = reinterpret_cast<const char*>(bufs[I.args[20] - 1]);
+  const char* tmA = tbl + (int64_t)I.args[21] * 128;
+  const char* tmB = tbl + (int64_t)I.args[22] * 128;
+  uint64_t* bfull = reinterpret_cast<uint64_t*>(smem_raw + sizeof(S));
+  uint64_t* bempty = bfull + STAGES;
+  if (tid == 0) {
+    wg_tmap_fence_acquire(tmA);
+    wg_tmap_fence_acquire(tmB);
+#pragma unroll
+    for (int s = 0; s < STAGES; ++s) {
+      wg_mbar_init(&bfull[s], 1);
+      wg_mbar_init(&bempty[s], 256);
+    }
+  }
+  consumer_sync();
+#ifdef MK_PDF_N256_NT_FEED
+#ifdef MK_GEMM_N256_NT_SUPERTILE_PDFONLY
+  if (tid == 0) {
+#else
+  const bool pdf_feed = g_pdf_feed.active;
+  if (pdf_feed && tid == 0) {
+#endif
+    MkPdfFeed& F = g_pdf_feed;
+    F.tmA = tmA;
+    F.tmB = tmB;
+    F.a0 = reinterpret_cast<char*>(S.A[0][0]);
+    F.a1 = reinterpret_cast<char*>(S.A[0][2]);
+    F.b0 = reinterpret_cast<char*>(S.B[0]);
+    F.a_stride = (STAGES > 1)
+        ? (int)(reinterpret_cast<char*>(S.A[1][0]) - reinterpret_cast<char*>(S.A[0][0]))
+        : 0;
+    F.b_stride = (STAGES > 1)
+        ? (int)(reinterpret_cast<char*>(S.B[1]) - reinterpret_cast<char*>(S.B[0]))
+        : 0;
+    F.bfull = bfull;
+    F.bempty = bempty;
+    F.m0 = m0;
+    F.n0 = n0;
+    F.iters = K / WG_BK;
+    F.stages = STAGES;
+    F.a_t = 0;
+    F.b_t = 1;
+    F.bk = WG_BK;
+    F.k_base = 0;
+    F.kind = 6;
+    F.expect_bytes = 49152;
+    mk_pdf_st_release(&F.seq, F.seq + 1);
+  }
+#else
+#ifdef MK_GEMM_N256_NT_SUPERTILE_PDFONLY
+  return;
+#else
+  const bool pdf_feed = false;
+#endif
+#endif
+
+  float d0[64], d1[64];
+#pragma unroll
+  for (int i = 0; i < 64; ++i) {
+    d0[i] = 0.0f;
+    d1[i] = 0.0f;
+  }
+  const int iters = K / WG_BK;
+  constexpr int LEAD = STAGES - 2;
+#ifndef MK_GEMM_N256_NT_SUPERTILE_PDFONLY
+  auto issue_stage_tma = [&](int t) {
+    const int st = t % STAGES;
+    const int k0 = t * WG_BK;
+    uint64_t* bar = &bfull[st];
+    wg_mbar_expect_tx(bar, 49152);  // two A 128x64 boxes + two B 64x64 boxes
+    wg_tma_load_2d(tmA, S.A[st][0], k0, m0, bar);
+    wg_tma_load_2d(tmA, S.A[st][2], k0, m0 + 128, bar);
+#pragma unroll
+    for (int g = 0; g < 2; ++g)
+      wg_tma_load_2d(tmB, reinterpret_cast<char*>(S.B[st]) + g * 8192,
+                     k0, n0 + g * 64, bar);
+  };
+  if (!pdf_feed && tid == 0) {
+#pragma unroll
+    for (int p = 0; p < min(LEAD + 1, iters); ++p) issue_stage_tma(p);
+  }
+#endif
+  for (int t = 0; t < iters; ++t) {
+    const int st = t % STAGES;
+    wg_mbar_wait(&bfull[st], (t / STAGES) & 1);
+#ifndef MK_GEMM_N256_NT_SUPERTILE_PDFONLY
+    if (!pdf_feed && tid == 0) {
+      const int tn = t + LEAD + 1;
+      if (tn < iters) {
+        if (tn >= STAGES)
+          wg_mbar_wait(&bempty[tn % STAGES], (tn / STAGES - 1) & 1);
+        issue_stage_tma(tn);
+      }
+    }
+#endif
+    uint64_t da0[4], da1[4], db[4];
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      da0[s] = wg_desc_ksw(S.A[st][wg], s);
+      da1[s] = wg_desc_ksw(S.A[st][2 + wg], s);
+      db[s] = wg_desc_ksw(S.B[st], s);
+    }
+    wg_mma_ktile_n128<SG::MMA_64x128x16_F32BF16BF16_SS<SG::Major::K, SG::Major::K>>(
+        da0, db, d0);
+    wg_mma_ktile_n128<SG::MMA_64x128x16_F32BF16BF16_SS<SG::Major::K, SG::Major::K>>(
+        da1, db, d1);
+    wg_mbar_arrive(&bempty[st]);
+  }
+  cute::warpgroup_wait<0>();
+  consumer_sync();
+  if (tid == 0) {
+#pragma unroll
+    for (int s = 0; s < STAGES; ++s) {
+      wg_mbar_init(&bfull[s], 1);
+      wg_mbar_init(&bempty[s], 256);
+    }
+  }
+#ifndef MK_GEMM_N256_NT_SUPERTILE_POSTINIT_NOSYNC
+  consumer_sync();
+#endif
+
+#ifdef MK_GEMM_N256_NT_SUPERTILE_REG_EPI
+  const int wtid = tid % 128;
+  const int w = wtid / 32, l = wtid % 32;
+  const int cb = (l & 3) * 2;
+#pragma unroll
+  for (int strip = 0; strip < 2; ++strip) {
+    const float(&d)[64] = strip == 0 ? d0 : d1;
+    const int row_off = m0 + strip * 128;
+#pragma unroll
+    for (int n8 = 0; n8 < 16; ++n8) {
+      const int c = n8 * 8 + cb;
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const int r = wg * 64 + w * 16 + l / 4 + 8 * i;
+        const int64_t idx = (int64_t)(row_off + r) * N + n0 + c;
+        __nv_bfloat162 out;
+        out.x = f2bf(d[n8 * 4 + i * 2 + 0]);
+        out.y = f2bf(d[n8 * 4 + i * 2 + 1]);
+        *reinterpret_cast<__nv_bfloat162*>(&C[idx]) = out;
+      }
+    }
+
+    if (flags & 2048) {
+      float* parts = reinterpret_cast<float*>(bufs[I.args[9]]);
+      const int nparts = I.args[10];
+      const int row_base = wg * 64 + w * 16 + l / 4;
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const int r = row_base + 8 * i;
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+          float mx = -INFINITY, se = 0.0f;
+#pragma unroll
+          for (int n8 = half * 8; n8 < half * 8 + 8; ++n8) {
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+              const float zv = bf2f(f2bf(d[n8 * 4 + i * 2 + j]));
+              if (zv > mx) {
+                se = se * lmhead_exp(mx - zv) + 1.0f;
+                mx = zv;
+              } else {
+                se += lmhead_exp(zv - mx);
+              }
+            }
+          }
+#pragma unroll
+          for (int o = 1; o < 4; o <<= 1) {
+            const float om = __shfl_xor_sync(0xffffffff, mx, o);
+            const float os = __shfl_xor_sync(0xffffffff, se, o);
+            const float Mx = fmaxf(mx, om);
+            se = (mx == -INFINITY && om == -INFINITY) ? 0.0f
+                                                      : se * lmhead_exp(mx - Mx) +
+                                                            os * lmhead_exp(om - Mx);
+            mx = Mx;
+          }
+          const int part = n0 / WG_BN + half;
+          if ((l & 3) == 0 && part < nparts) {
+            const int64_t o = ((int64_t)(row_off + r) * nparts + part) * 2;
+            parts[o] = mx;
+            parts[o + 1] = se;
+          }
+        }
+      }
+    }
+  }
+#else
+  float* Cs = reinterpret_cast<float*>(smem_raw);
+  const int wtid = tid % 128;
+  const int w = wtid / 32, l = wtid % 32;
+  const int cb = (l & 3) * 2;
+#pragma unroll
+  for (int strip = 0; strip < 2; ++strip) {
+    const float(&d)[64] = strip == 0 ? d0 : d1;
+    const int row_off = m0 + strip * 128;
+    {
+      const int r = wg * 64 + w * 16 + l / 4;
+#pragma unroll
+      for (int n8 = 0; n8 < 16; ++n8)
+#pragma unroll
+        for (int i = 0; i < 2; ++i)
+#pragma unroll
+          for (int j = 0; j < 2; ++j)
+            Cs[(r + 8 * i) * WG_LDC_N128 + n8 * 8 + cb + j] =
+                d[n8 * 4 + i * 2 + j];
+    }
+    consumer_sync();
+    float* parts = (flags & 2048) ? reinterpret_cast<float*>(bufs[I.args[9]]) : nullptr;
+    const int nparts = (flags & 2048) ? I.args[10] : 0;
+    const int nb = n0 / WG_BN;
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+      const int gid = tid + g * 256;
+      const int m = gid / 16, c8 = (gid % 16) * 8;
+      const int64_t idx = (int64_t)(row_off + m) * N + n0 + c8;
+      uint4 out;
+      bf16* oe = reinterpret_cast<bf16*>(&out);
+      float zv[8];
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        oe[e] = f2bf(Cs[m * WG_LDC_N128 + c8 + e]);
+        zv[e] = bf2f(oe[e]);
+      }
+      *reinterpret_cast<uint4*>(&C[idx]) = out;
+
+      if (parts) {
+        float mx = zv[0];
+#pragma unroll
+        for (int e = 1; e < 8; ++e) mx = fmaxf(mx, zv[e]);
+        const int lane = tid & 31;
+        const unsigned mask = 0xffu << (lane & 24);
+#pragma unroll
+        for (int off = 4; off > 0; off >>= 1)
+          mx = fmaxf(mx, __shfl_xor_sync(mask, mx, off));
+        float se = 0.0f;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) se += lmhead_exp(zv[e] - mx);
+#pragma unroll
+        for (int off = 4; off > 0; off >>= 1)
+          se += __shfl_xor_sync(mask, se, off);
+        if ((lane & 7) == 0) {
+          const int half = c8 >= WG_BN;
+          const int64_t o = ((int64_t)(row_off + m) * nparts + nb + half) * 2;
+          parts[o] = mx;
+          parts[o + 1] = se;
+        }
+      }
+    }
+    consumer_sync();
+  }
+#endif
+}
+
+#endif
 
 // m64n256 NT direct-store tile (qwen giant-vocab follow-up to fat_gemm_probe.py).
 // The staged 128x256 route needs 160KB and fails the current cooperative launch at 132
@@ -1417,6 +1714,162 @@ __device__ __noinline__ void op_gemm_wgmma_n256_nn_f32_impl(const Instr& I, int 
     }
   }
 }
+
+#ifdef MK_GEMM_N256_HEAD_DX_EXACT
+__device__ __noinline__ void op_gemm_wgmma_n256_head_dx_exact_impl(
+    const Instr& I, int tile, void** bufs, char* smem_raw) {
+  namespace SG = cute::SM90::GMMA;
+  const bf16* A = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
+  const bf16* B = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
+  float* C = reinterpret_cast<float*>(bufs[I.args[2]]);
+  const int flags = I.args[6];
+  if (I.args[3] != 1024 || I.args[4] != 2560 || I.args[5] != 151936) return;
+  if (!(flags & 8) || (flags & (1 | 2 | 4 | 16 | 32 | 256 | 1024 | 2048 | 8192))) {
+    return;
+  }
+  if (!(flags & GEMM_N256_STAGE3_FLAG) || !(flags & GEMM_N256_NMAJOR_FLAG)) return;
+  if (I.args[20] <= 0) return;
+
+  smem_raw = reinterpret_cast<char*>(
+      (reinterpret_cast<uintptr_t>(smem_raw) + 1023) & ~uintptr_t(1023));
+  constexpr int STAGES = 3;
+  constexpr int M = 1024;
+  constexpr int N = 2560;
+  constexpr int K = 151936;
+  constexpr int ITERS = K / WG_BK;
+  WgmmaSmemN256T<STAGES>& S = *reinterpret_cast<WgmmaSmemN256T<STAGES>*>(smem_raw);
+  const int mt = tile & 7;
+  const int nt = tile >> 3;
+  if (nt >= 10) return;
+  const int m0 = mt * WG_BM;
+  const int n0 = nt * 256;
+  const int tid = mk_tid();
+  const int wg = tid / 128;
+  const int wtid = tid % 128;
+
+  const char* tbl = reinterpret_cast<const char*>(bufs[I.args[20] - 1]);
+  const char* tmA = tbl + (int64_t)I.args[21] * 128;
+  const char* tmB = tbl + (int64_t)I.args[22] * 128;
+  uint64_t* bfull = reinterpret_cast<uint64_t*>(smem_raw + sizeof(S));
+  uint64_t* bempty = bfull + STAGES;
+  if (tid == 0) {
+    wg_tmap_fence_acquire(tmA);
+    wg_tmap_fence_acquire(tmB);
+#pragma unroll
+    for (int s = 0; s < STAGES; ++s) {
+      wg_mbar_init(&bfull[s], 1);
+      wg_mbar_init(&bempty[s], 256);
+    }
+  }
+  consumer_sync();
+
+#ifdef MK_PDF_N256_FEED
+#ifdef MK_GEMM_N256_HEAD_DX_PDFONLY
+  if (tid == 0) {
+#else
+  const bool pdf_feed = g_pdf_feed.active;
+  if (pdf_feed && tid == 0) {
+#endif
+    MkPdfFeed& F = g_pdf_feed;
+    F.tmA = tmA;
+    F.tmB = tmB;
+    F.a0 = reinterpret_cast<char*>(S.A[0][0]);
+    F.a1 = reinterpret_cast<char*>(S.A[0][1]);
+    F.b0 = reinterpret_cast<char*>(S.B[0]);
+    F.a_stride = (int)(reinterpret_cast<char*>(S.A[1][0]) -
+                       reinterpret_cast<char*>(S.A[0][0]));
+    F.b_stride = (int)(reinterpret_cast<char*>(S.B[1]) -
+                       reinterpret_cast<char*>(S.B[0]));
+    F.bfull = bfull;
+    F.bempty = bempty;
+    F.m0 = m0;
+    F.n0 = n0;
+    F.iters = ITERS;
+    F.stages = STAGES;
+    F.a_t = 0;
+    F.b_t = 0;
+    F.bk = WG_BK;
+    F.k_base = 0;
+    F.kind = 0;
+    F.expect_bytes = 49152;
+    mk_pdf_st_release(&F.seq, F.seq + 1);
+  }
+#else
+#ifndef MK_GEMM_N256_HEAD_DX_PDFONLY
+  const bool pdf_feed = false;
+#endif
+#endif
+
+  float d[128];
+#pragma unroll
+  for (int i = 0; i < 128; ++i) d[i] = 0.0f;
+  constexpr int WG_N256_MBAR_LEAD = STAGES - 2;
+#ifndef MK_GEMM_N256_HEAD_DX_PDFONLY
+  auto issue_stage_tma = [&](int t) {
+    if (tid == 0) {
+      const int st = t % STAGES;
+      const int k0 = t * WG_BK;
+      wg_mbar_expect_tx(&bfull[st], 49152);
+      wg_tma_load_2d(tmA, S.A[st][0], k0, m0, &bfull[st]);
+#pragma unroll
+      for (int g = 0; g < 4; ++g)
+      wg_tma_load_2d(tmB, reinterpret_cast<char*>(S.B[st]) + g * 8192,
+                       n0 + g * 64, k0, &bfull[st]);
+    }
+  };
+  if (!pdf_feed) {
+#pragma unroll
+    for (int p = 0; p < WG_N256_MBAR_LEAD + 1; ++p) issue_stage_tma(p);
+  }
+#endif
+  for (int t = 0; t < ITERS; ++t) {
+    const int st = t % STAGES;
+    wg_mbar_wait(&bfull[st], (t / STAGES) & 1);
+    uint64_t da[4], db[4];
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      da[s] = wg_desc_ksw(S.A[st][wg], s);
+      db[s] = wg_desc_mnsw128(S.B[st], s);
+    }
+    wg_mma_ktile_n256<SG::MMA_64x256x16_F32BF16BF16_SS<SG::Major::K, SG::Major::MN>>(
+        da, db, d);
+    wg_mbar_arrive(&bempty[st]);
+#ifndef MK_GEMM_N256_HEAD_DX_PDFONLY
+    if (!pdf_feed) {
+      const int tn = t + WG_N256_MBAR_LEAD + 1;
+      if (tn < ITERS) {
+        if (tn >= STAGES)
+          wg_mbar_wait(&bempty[tn % STAGES], (tn / STAGES - 1) & 1);
+        issue_stage_tma(tn);
+      }
+    }
+#endif
+  }
+  cute::warpgroup_wait<0>();
+  consumer_sync();
+  if (tid == 0) {
+#pragma unroll
+    for (int s = 0; s < STAGES; ++s) {
+      wg_mbar_init(&bfull[s], 1);
+      wg_mbar_init(&bempty[s], 256);
+    }
+  }
+  consumer_sync();
+
+  const int w = wtid / 32, l = wtid % 32;
+  const int cb = (l & 3) * 2;
+#pragma unroll
+  for (int n8 = 0; n8 < 32; ++n8) {
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const int r = wg * 64 + w * 16 + l / 4 + 8 * i;
+      const int64_t idx = (int64_t)(m0 + r) * N + n0 + n8 * 8 + cb;
+      float2 out = make_float2(d[n8 * 4 + i * 2 + 0], d[n8 * 4 + i * 2 + 1]);
+      *reinterpret_cast<float2*>(&C[idx]) = out;
+    }
+  }
+}
+#endif
 
 // m64n128 NT tile (v3 P4b r3, generalized from the peer session's lm_head route):
 // 64 fp32 accumulators/thread double the mma work per sync and halve B-traffic per
@@ -2396,11 +2849,33 @@ __device__ void op_gemm_wgmma(const Instr& I, int tile, void** bufs, char* smem_
   const int flags = I.args[6];
   if (flags & 16384) {
     if (flags & 2) {
+#ifdef MK_GEMM_N256_NT_SUPERTILE
+      if (flags & GEMM_N256_NT_SUPERTILE_FLAG) {
+        op_gemm_wgmma_n256_nt_supertile_impl<3>(I, tile, bufs, smem_raw);
+        return;
+      }
+#endif
       if (flags & GEMM_N256_STAGE3_FLAG)
         op_gemm_wgmma_n256_direct_impl<3>(I, tile, bufs, smem_raw);
       else
         op_gemm_wgmma_n256_direct_impl<2>(I, tile, bufs, smem_raw);
     } else {
+#ifdef MK_GEMM_N256_HEAD_DX_EXACT
+      if (I.args[3] == 1024 && I.args[4] == 2560 && I.args[5] == 151936 &&
+          (flags & 8) && (flags & GEMM_N256_STAGE3_FLAG) &&
+          (flags & GEMM_N256_NMAJOR_FLAG) && I.args[20] > 0 &&
+          !(flags & (1 | 2 | 4 | 16 | 32 | 256 | 1024 | 2048 | 8192))) {
+#ifdef MK_GEMM_N256_HEAD_DX_PDFONLY
+        if (g_pdf_feed.active) {
+          op_gemm_wgmma_n256_head_dx_exact_impl(I, tile, bufs, smem_raw);
+          return;
+        }
+#else
+        op_gemm_wgmma_n256_head_dx_exact_impl(I, tile, bufs, smem_raw);
+        return;
+#endif
+      }
+#endif
       if (flags & GEMM_N256_STAGE3_FLAG) {
         if (flags & 1024) {
           op_gemm_wgmma_n256_nn_f32_impl<3, true>(I, tile, bufs, smem_raw);
@@ -2898,8 +3373,80 @@ __device__ void op_rmsnorm_bwd_dx_impl(const Instr& I, int tile, void** bufs,
   }
 }
 
+#ifdef MK_RMS_DX_H2560
+__device__ void op_rmsnorm_bwd_dx_h2560(const Instr& I, int tile, void** bufs,
+                                        char* smem_raw) {
+  const int S = I.args[8];
+  const bool dy_f32 = I.args[7] != 0;
+  const int warp = mk_tid() >> 5, lane = mk_tid() & 31;
+  const int rowA = tile * MK_ROW_R2 + warp;
+  if (rowA >= S) return;  // barrier-free op: early exit is safe
+  const bool hasB = rowA + 8 < S;
+  const int rowB = hasB ? rowA + 8 : rowA;
+  constexpr int H = 2560;
+  constexpr float invH = 1.0f / H;
+  const bf16* xb = reinterpret_cast<const bf16*>(bufs[I.args[0]]);
+  const bf16* xA = xb + (int64_t)rowA * H;
+  const bf16* xB = xb + (int64_t)rowB * H;
+  const bf16* w = reinterpret_cast<const bf16*>(bufs[I.args[1]]);
+  const bf16* dybA = reinterpret_cast<const bf16*>(bufs[I.args[2]]) + (int64_t)rowA * H;
+  const float* dyfA = reinterpret_cast<const float*>(bufs[I.args[2]]) + (int64_t)rowA * H;
+  const bf16* dybB = reinterpret_cast<const bf16*>(bufs[I.args[2]]) + (int64_t)rowB * H;
+  const float* dyfB = reinterpret_cast<const float*>(bufs[I.args[2]]) + (int64_t)rowB * H;
+  bf16* dxb = reinterpret_cast<bf16*>(bufs[I.args[3]]);
+  bf16* dxA = dxb + (int64_t)rowA * H;
+  bf16* dxB = dxb + (int64_t)rowB * H;
+  const float rA = reinterpret_cast<const float*>(bufs[I.args[5]])[rowA];
+  const float rB = reinterpret_cast<const float*>(bufs[I.args[5]])[rowB];
+
+  float dotA = 0.0f, dotB = 0.0f;
+#pragma unroll
+  for (int i = lane * 8; i < H; i += 32 * 8) {
+    float xa[8], xv[8], da[8], db[8], wv[8];
+    ld8bf(xA + i, xa);
+    ld8bf(xB + i, xv);
+    ld8dy(dybA, dyfA, dy_f32, i, da);
+    ld8dy(dybB, dyfB, dy_f32, i, db);
+    ld8bf(w + i, wv);
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+      dotA += da[j] * wv[j] * xa[j];
+      dotB += db[j] * wv[j] * xv[j];
+    }
+  }
+  const float mA = warp_sum(dotA) * rA * invH;
+  const float mB = warp_sum(dotB) * rB * invH;
+
+#pragma unroll
+  for (int i = lane * 8; i < H; i += 32 * 8) {
+    float xa[8], xv[8], da[8], db[8], wv[8], dxa[8], dxv[8];
+    ld8bf(xA + i, xa);
+    ld8bf(xB + i, xv);
+    ld8dy(dybA, dyfA, dy_f32, i, da);
+    ld8dy(dybB, dyfB, dy_f32, i, db);
+    ld8bf(w + i, wv);
+    ld8bf(dxA + i, dxa);
+    ld8bf(dxB + i, dxv);
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+      const float xhA = xa[j] * rA, xhB = xv[j] * rB;
+      dxa[j] = rms_dx_acc<false>(dxa[j], rA, da[j] * wv[j], xhA, mA);
+      dxv[j] = rms_dx_acc<false>(dxv[j], rB, db[j] * wv[j], xhB, mB);
+    }
+    st8bf(dxA + i, dxa);
+    if (hasB) st8bf(dxB + i, dxv);
+  }
+}
+#endif
+
 __device__ void op_rmsnorm_bwd_dx(const Instr& I, int tile, void** bufs,
                                   char* smem_raw) {
+#ifdef MK_RMS_DX_H2560
+  if (I.args[6] == 2560) {
+    op_rmsnorm_bwd_dx_h2560(I, tile, bufs, smem_raw);
+    return;
+  }
+#endif
   op_rmsnorm_bwd_dx_impl<false>(I, tile, bufs, smem_raw);
 }
 
