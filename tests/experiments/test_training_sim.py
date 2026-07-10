@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 import yaml
 
 from xorl.sim.analytical_ledgers import activation_ledger, communication_ledger, flops_ledger
@@ -8,6 +9,7 @@ from xorl.sim.calibration_evaluator import evaluate_calibration
 from xorl.sim.calibration_packs import (
     list_calibration_packs,
     load_calibration_pack,
+    resolve_calibration_pack,
     validate_calibration_pack,
 )
 from xorl.sim.collect_calibration import parse_log_text, summarize_observed_run
@@ -650,6 +652,27 @@ def test_builtin_calibration_packs_are_sanitized_and_versioned() -> None:
         assert pack.manifest["schema_version"] == 1
         assert pack.default_config.is_file()
         assert validation["status"] == "pass"
+
+
+def test_builtin_pack_prefix_rejects_path_traversal() -> None:
+    with pytest.raises(ValueError, match="unknown built-in calibration pack"):
+        resolve_calibration_pack("builtin:../qwen3_6_35b_a3b")
+
+
+def test_model_metadata_restricts_local_config_reads_to_approved_roots(tmp_path: Path) -> None:
+    allowed_root = tmp_path / "allowed"
+    blocked_config = tmp_path / "blocked" / "config.json"
+    allowed_root.mkdir()
+    blocked_config.parent.mkdir()
+    blocked_config.write_text('{"num_experts": 999}', encoding="utf-8")
+
+    metadata = resolve_model_metadata(
+        {"model": {"model_path": str(blocked_config)}},
+        hf_cache_roots=[allowed_root],
+    )
+
+    assert metadata.config_path is None
+    assert metadata.num_experts is None
 
 
 def test_builtin_qwen35_pack_preserves_raw_and_promotable_winners() -> None:
