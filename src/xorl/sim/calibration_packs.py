@@ -55,12 +55,12 @@ def resolve_calibration_pack(value: str | Path) -> Path:
 
     raw = str(value)
     name = raw.removeprefix("builtin:")
-    builtin = _PACK_ROOT / name
-    if raw.startswith("builtin:") or (not Path(raw).exists() and (builtin / "manifest.json").is_file()):
-        if not (builtin / "manifest.json").is_file():
-            available = ", ".join(list_calibration_packs()) or "none"
+    available_names = list_calibration_packs()
+    if raw.startswith("builtin:") or (not Path(raw).exists() and name in available_names):
+        if name not in available_names:
+            available = ", ".join(available_names) or "none"
             raise ValueError(f"unknown built-in calibration pack {name!r}; available: {available}")
-        return builtin
+        return _PACK_ROOT / name
     return Path(raw)
 
 

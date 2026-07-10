@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -233,13 +234,25 @@ def default_hf_cache_roots() -> list[Path]:
 
 def _candidate_config_paths(model_ref: str, hf_cache_roots: list[Path]) -> list[Path]:
     ref_path = Path(model_ref).expanduser()
+    allowed_roots = [root.expanduser().resolve() for root in hf_cache_roots]
+
+    def is_allowed(path: Path) -> bool:
+        resolved = path.resolve()
+        return any(resolved.is_relative_to(root) for root in allowed_roots)
+
     candidates: list[Path] = []
-    if ref_path.is_file():
+    if ref_path.name == "config.json" and ref_path.is_file() and is_allowed(ref_path):
         candidates.append(ref_path)
-    elif ref_path.is_dir():
+    elif ref_path.is_dir() and is_allowed(ref_path):
         candidates.append(ref_path / "config.json")
 
-    if "/" in model_ref and not ref_path.exists():
+    repo_parts = model_ref.split("/")
+    is_hf_repo_id = (
+        len(repo_parts) == 2
+        and all(part not in {"", ".", ".."} for part in repo_parts)
+        and all(re.fullmatch(r"[A-Za-z0-9_.-]+", part) is not None for part in repo_parts)
+    )
+    if is_hf_repo_id and not ref_path.exists():
         cache_name = "models--" + model_ref.replace("/", "--")
         for root in hf_cache_roots:
             snapshots_dir = root / cache_name / "snapshots"
