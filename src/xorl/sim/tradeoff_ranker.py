@@ -9,11 +9,13 @@ from pathlib import Path
 
 try:
     from .benchmark_behavior import load_benchmark_behavior_points, predict_benchmark_behavior
+    from .calibration_packs import resolve_calibration_pack
     from .config_fingerprint import load_training_config, resolve_topology
     from .schemas import BenchmarkBehaviorPoint, Topology, TradeoffCandidate, TradeoffReport, to_jsonable
     from .shape_engine import build_shape_ledger
 except ImportError:  # pragma: no cover - exercised by direct script execution
     from benchmark_behavior import load_benchmark_behavior_points, predict_benchmark_behavior
+    from calibration_packs import resolve_calibration_pack
     from config_fingerprint import load_training_config, resolve_topology
     from schemas import BenchmarkBehaviorPoint, Topology, TradeoffCandidate, TradeoffReport, to_jsonable
     from shape_engine import build_shape_ledger
@@ -111,7 +113,7 @@ def rank_benchmark_tradeoffs(
     world_size: int | None = None,
     local_world_size: int | None = None,
 ) -> TradeoffReport:
-    benchmark_path = Path(benchmark_dir)
+    benchmark_path = resolve_calibration_pack(benchmark_dir)
     configs = sorted((benchmark_path / "configs").glob("*.yaml"))
     behavior_points = load_benchmark_behavior_points(benchmark_path)
     warnings: list[str] = []
@@ -179,7 +181,7 @@ def rank_benchmark_tradeoffs(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("benchmark_dir", type=Path)
+    parser.add_argument("benchmark_dir", help="Path or built-in calibration-pack name")
     parser.add_argument("--world-size", type=int, default=None)
     parser.add_argument("--local-world-size", type=int, default=None)
     parser.add_argument("--output", type=Path, default=None)

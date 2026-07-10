@@ -10,18 +10,24 @@ from typing import Any
 
 try:
     from .benchmark_behavior import load_benchmark_behavior_points, predict_benchmark_behavior
+    from .calibration_packs import resolve_pack_inputs
     from .collect_calibration import merge_observed_runs, parse_log_path, summarize_observed_run
     from .config_fingerprint import build_fingerprint, load_training_config
     from .memory_ledger import build_memory_ledger
     from .schemas import PredictionReport, to_jsonable
     from .shape_engine import build_shape_ledger
+    from .simulator_support import resolve_simulator_support
+    from .timing_ledger import build_timing_ledger
 except ImportError:  # pragma: no cover - exercised by direct script execution
     from benchmark_behavior import load_benchmark_behavior_points, predict_benchmark_behavior
+    from calibration_packs import resolve_pack_inputs
     from collect_calibration import merge_observed_runs, parse_log_path, summarize_observed_run
     from config_fingerprint import build_fingerprint, load_training_config
     from memory_ledger import build_memory_ledger
     from schemas import PredictionReport, to_jsonable
     from shape_engine import build_shape_ledger
+    from simulator_support import resolve_simulator_support
+    from timing_ledger import build_timing_ledger
 
 
 def build_report(
@@ -45,6 +51,9 @@ def build_report(
         top_k=top_k,
     )
     raw_config = load_training_config(config_path)
+    simulator = raw_config.setdefault("simulator", {})
+    if isinstance(simulator, dict):
+        simulator["balanced_routing"] = balanced_routing
     shape = build_shape_ledger(fingerprint.topology, balanced_routing=balanced_routing)
     observed = None
     observed_summary: dict[str, Any] | None = None
@@ -58,26 +67,49 @@ def build_report(
             world_size=fingerprint.topology.world_size,
         )
 
+    benchmark_behavior = None
+    if benchmark_dir is not None:
+        behavior_points = load_benchmark_behavior_points(benchmark_dir)
+        benchmark_behavior = predict_benchmark_behavior(behavior_points, fingerprint.topology, shape, raw_config)
     memory = build_memory_ledger(
         raw_config,
         observed,
         topology=fingerprint.topology,
         model_metadata=fingerprint.model_metadata,
+        calibrated_peak_mem_gb=benchmark_behavior.peak_mem_gb if benchmark_behavior is not None else None,
+        calibrated_peak_source=(
+            f"benchmark_behavior:{benchmark_behavior.matched_label}"
+            if benchmark_behavior is not None and benchmark_behavior.matched_label is not None
+            else None
+        ),
+        calibrated_phase_peak_gb=(benchmark_behavior.phase_memory_peak_gb if benchmark_behavior is not None else None),
     )
-    benchmark_behavior = None
-    if benchmark_dir is not None:
-        behavior_points = load_benchmark_behavior_points(benchmark_dir)
-        benchmark_behavior = predict_benchmark_behavior(behavior_points, fingerprint.topology, shape, raw_config)
     warnings = list(shape.warnings)
     if memory.observed_peak_mem_gb_max is None:
         warnings.append("no observed memory calibration was supplied")
     if benchmark_behavior is not None:
         warnings.extend(benchmark_behavior.warnings)
+    timing = build_timing_ledger(
+        observed_summary,
+        benchmark_behavior,
+        calibration_sources=calibration_sources,
+    )
+    support = resolve_simulator_support(
+        raw_config,
+        topology=fingerprint.topology,
+        memory=memory,
+        timing=timing,
+    )
+    if support.support_blockers:
+        warnings.append(f"simulator support status: {support.support_status}")
+        warnings.extend(f"simulator support blocker: {blocker}" for blocker in support.support_blockers)
 
     return PredictionReport(
         fingerprint=fingerprint,
         shape=shape,
         memory=memory,
+        timing=timing,
+        support=support,
         benchmark_behavior=benchmark_behavior,
         observed_summary=observed_summary,
         calibration_sources=calibration_sources,
@@ -87,7 +119,8 @@ def build_report(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, required=True, help="XoRL YAML config")
+    parser.add_argument("--pack", help="Built-in calibration-pack name")
+    parser.add_argument("--config", type=Path, default=None, help="XoRL YAML config")
     parser.add_argument("--world-size", type=int, default=None, help="Override WORLD_SIZE for config resolution")
     parser.add_argument("--local-world-size", type=int, default=None, help="Override LOCAL_WORLD_SIZE")
     parser.add_argument("--balanced-routing", action="store_true", help="Assume deterministic balanced MoE routing")
@@ -100,6 +133,10 @@ def main() -> None:
     parser.add_argument("--benchmark-dir", type=Path, default=None, help="Optional benchmark recipe directory")
     parser.add_argument("--output", type=Path, default=None, help="Write JSON report to this path")
     args = parser.parse_args()
+
+    args.config, args.benchmark_dir = resolve_pack_inputs(args.pack, args.config, args.benchmark_dir)
+    if args.config is None:
+        parser.error("provide --pack or --config")
 
     report = build_report(
         args.config,

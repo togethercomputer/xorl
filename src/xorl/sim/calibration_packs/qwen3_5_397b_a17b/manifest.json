@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "name": "qwen3_5_397b_a17b",
+  "model": "Qwen/Qwen3.5-397B-A17B",
+  "description": "Portable Qwen3.5-397B short-context throughput and correctness calibration pack.",
+  "captured_at": "2026-05-20",
+  "hardware": "64 NVIDIA H100 GPUs",
+  "balanced_routing": true,
+  "default_config": "configs/qwen35_r73_sync.yaml",
+  "configs": [
+    "configs/qwen35_r69_mbs4.yaml",
+    "configs/qwen35_r73_sync.yaml",
+    "configs/qwen35_r75_async.yaml",
+    "configs/qwen35_ep64_reference.yaml"
+  ],
+  "results": [
+    "results/shortctx_8node_mfu_summary_20260519.json"
+  ],
+  "golden": {
+    "behavior_point_count": 6,
+    "world_size": 64,
+    "global_batch_size": 320,
+    "default_tokens_per_sec": 59188.0,
+    "best_raw_tokens_per_sec": 59217.0,
+    "best_promotable_tokens_per_sec": 59188.0,
+    "analytic_peak_floor_gb": 46.767
+  },
+  "limitations": [
+    "The rows are short synthetic-data measurements.",
+    "The synchronous R73 row has a matching static K3 pass; asynchronous rows require their own correctness gate."
+  ]
+}

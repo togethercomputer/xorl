@@ -14,9 +14,11 @@ import yaml
 try:
     from .model_metadata import resolve_model_metadata
     from .schemas import RunFingerprint, Topology
+    from .simulator_support import requested_simulator_surface
 except ImportError:  # pragma: no cover - exercised by direct script execution
     from model_metadata import resolve_model_metadata
     from schemas import RunFingerprint, Topology
+    from simulator_support import requested_simulator_surface
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -46,6 +48,21 @@ def repo_commit(repo_root: str | Path = REPO_ROOT) -> str | None:
 def _section(raw: dict[str, Any], name: str) -> dict[str, Any]:
     value = raw.get(name, {})
     return value if isinstance(value, dict) else {}
+
+
+def _topology_sections(raw_config: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    train = _section(raw_config, "train")
+    data = _section(raw_config, "data")
+    if train:
+        return train, data
+
+    if requested_simulator_surface(raw_config) == "server_forward_backward":
+        server = _section(raw_config, "server")
+        if server:
+            return server, server
+        return raw_config, raw_config
+
+    return train, data
 
 
 def _int_value(section: dict[str, Any], key: str, default: int | None = None) -> int | None:
@@ -121,8 +138,7 @@ def resolve_topology(
     num_experts: int | None = None,
     top_k: int | None = None,
 ) -> Topology:
-    train = _section(raw_config, "train")
-    data = _section(raw_config, "data")
+    train, data = _topology_sections(raw_config)
 
     ulysses = _int_value(train, "ulysses_parallel_size", 1) or 1
     ringattn = _int_value(train, "ringattn_parallel_size", 1) or 1
