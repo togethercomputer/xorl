@@ -563,7 +563,7 @@ def _readme_topology_defaults(readme_text: str) -> dict[str, int | float | bool 
     field_patterns = {
         "data_parallel_replicate_size": (
             r"\bdata_parallel_replicate_size[=: ]+(?P<value>\d+)\b",
-            r"\bdp[_-]?rep(?:licate)?[=_ ](?P<value>\d+)\b",
+            r"\bdp[_-]?rep(?:lica(?:te)?)?[=_ ](?P<value>\d+)\b",
         ),
         "data_parallel_shard_size": (
             r"\bdata_parallel_shard_size[=: ]+(?P<value>\d+)\b",

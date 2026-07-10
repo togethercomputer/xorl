@@ -856,7 +856,7 @@ def _calibration_validation_gap_portfolio(
                 gap_status="throughput_error_needs_attribution",
                 priority=120,
                 required_measurement="replay_high_error_holdouts_with_component_timing",
-                reason="at least one scored holdout exceeds the throughput MAPE target",
+                reason="at least one scored holdout exceeds the throughput mean absolute percentage error target",
                 affected_holdouts=affected,
                 blocker_names=["max_throughput_mape_exceeds_8_percent"],
             )
