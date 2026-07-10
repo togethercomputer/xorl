@@ -1,0 +1,72 @@
+model:
+  model_path: Qwen/Qwen3.5-397B-A17B
+  tokenizer_path: Qwen/Qwen3.5-397B-A17B
+  attn_implementation: flash_attention_3
+  moe_implementation: quack
+  ep_dispatch: deepep
+  train_router: false
+  record_routing_weights: false
+  rmsnorm_mode: compile
+  deepep_buffer_size_gb: 1.0
+  deepep_num_sms: 48
+  deepep_async_combine: false
+data:
+  datasets:
+  - path: dummy
+    type: tokenized
+    max_seq_len: 4096
+  select_columns:
+  - input_ids
+  - labels
+  sample_packing_method: sequential
+  sample_packing_sequence_len: 4096
+  dataloader_num_workers: 0
+  dataloader_pin_memory: false
+  pad_to_multiple_of: 128
+train:
+  output_dir: outputs/xorl-sim/r69
+  data_parallel_mode: fsdp2
+  ulysses_parallel_size: 1
+  ringattn_parallel_size: 1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  expert_parallel_size: 32
+  data_parallel_replicate_size: 1
+  data_parallel_shard_size: 64
+  ep_intranode: true
+  num_train_epochs: 1
+  max_steps: 8
+  micro_batch_size: 4
+  gradient_accumulation_steps: 1
+  optimizer: muon
+  optimizer_dtype: bf16
+  muon_lr: 0.0001
+  muon_momentum: 0.0
+  muon_update_dtype: bf16
+  muon_ns_algorithm: gram_newton_schulz
+  muon_ns_use_quack_kernels: true
+  lr: 1.0e-05
+  lr_warmup_ratio: 0.0
+  lr_decay_style: constant
+  lr_decay_ratio: 1.0
+  weight_decay: 0.01
+  max_grad_norm: 0.0
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  gradient_checkpointing_method: recompute_full_layer
+  enable_full_shard: true
+  enable_activation_offload: true
+  activation_gpu_limit: 0.0
+  activation_offload_prefetch_count: 2
+  init_device: meta
+  load_weights_mode: all_ranks
+  enable_full_determinism: false
+  enable_compile: true
+  empty_cache_steps: 10
+  gc_steps: 10
+  ckpt_manager: dcp
+  save_steps: 0
+  save_epochs: 0
+  save_hf_weights: false
+  log_format: structured
+  use_wandb: false

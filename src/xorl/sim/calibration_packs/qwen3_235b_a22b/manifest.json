@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "name": "qwen3_235b_a22b",
+  "model": "Qwen/Qwen3-235B-A22B",
+  "description": "Portable Qwen3-235B topology config and summarized 2k-context GA/OOM calibration rows.",
+  "captured_at": "2026-06-26",
+  "hardware": "32 NVIDIA H100 GPUs",
+  "balanced_routing": false,
+  "default_config": "configs/qwen3_235b_a22b_2k_4node_ep8.yaml",
+  "configs": [
+    "configs/qwen3_235b_a22b_2k_4node_ep8.yaml",
+    "configs/qwen3_235b_a22b_muon_8node_ep8_efsdp8_deepep.yaml"
+  ],
+  "results": [
+    "RESULTS.md"
+  ],
+  "golden": {
+    "behavior_point_count": 3,
+    "world_size": 32,
+    "global_batch_size": 32,
+    "default_tokens_per_sec": 6800.0,
+    "best_raw_tokens_per_sec": 8400.0,
+    "best_promotable_tokens_per_sec": null,
+    "analytic_peak_floor_gb": 56.812
+  },
+  "limitations": [
+    "Historical observations are intended for regression and calibration, not hardware-independent performance claims.",
+    "No correctness gate is attached to these throughput rows."
+  ]
+}

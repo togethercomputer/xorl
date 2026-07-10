@@ -81,6 +81,17 @@ dependencies = [
   #   uv pip install fast-hadamard-transform
 ]
 
+[project.scripts]
+xorl-sim-calibrate = "xorl.sim.calibration_evaluator:main"
+xorl-sim-collect = "xorl.sim.collect_calibration:main"
+xorl-sim-feasibility = "xorl.sim.feasibility_evaluator:main"
+xorl-sim-kernels = "xorl.sim.kernel_variants:main"
+xorl-sim-packs = "xorl.sim.calibration_packs:main"
+xorl-sim-plan = "xorl.sim.scenario_planner:main"
+xorl-sim-predict = "xorl.sim.predict:main"
+xorl-sim-rank = "xorl.sim.tradeoff_ranker:main"
+xorl-sim-validate = "xorl.sim.validate:main"
+
 [dependency-groups]
 # Follow the best practice in https://docs.astral.sh/uv/concepts/projects/dependencies/#development-dependencies
 # to manage dev dependencies (i.e., dependencies that are only used in development) like
@@ -115,6 +126,9 @@ version = {attr = "xorl.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"xorl.sim" = ["README.md", "calibration_packs/**/*"]
 
 [tool.ruff]
 target-version = "py312"

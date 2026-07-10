@@ -28,6 +28,59 @@ KNOWN_MODEL_METADATA: dict[str, dict[str, int]] = {
         "vocab_size": 151936,
         "tie_word_embeddings": False,
     },
+    "Qwen/Qwen3-235B-A22B-Instruct-2507": {
+        "num_experts": 128,
+        "top_k": 8,
+        "num_hidden_layers": 94,
+        "hidden_size": 4096,
+        "intermediate_size": 12288,
+        "moe_intermediate_size": 1536,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "vocab_size": 151936,
+        "tie_word_embeddings": False,
+    },
+    "Qwen/Qwen3.5-397B-A17B": {
+        "num_experts": 512,
+        "top_k": 10,
+        "num_hidden_layers": 60,
+        "hidden_size": 4096,
+        "moe_intermediate_size": 1024,
+        "shared_expert_intermediate_size": 1024,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 256,
+        "full_attention_interval": 4,
+        "attn_output_gate": True,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 64,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "vocab_size": 248320,
+        "tie_word_embeddings": False,
+    },
+    "Qwen/Qwen3.5-35B-A3B": {
+        "num_experts": 256,
+        "top_k": 8,
+        "num_hidden_layers": 40,
+        "hidden_size": 2048,
+        "moe_intermediate_size": 512,
+        "shared_expert_intermediate_size": 512,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 2,
+        "head_dim": 256,
+        "full_attention_interval": 4,
+        "attn_output_gate": True,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 32,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "vocab_size": 248320,
+        "tie_word_embeddings": False,
+    },
     "Qwen/Qwen3.6-35B-A3B": {
         "num_experts": 256,
         "top_k": 8,
@@ -38,6 +91,13 @@ KNOWN_MODEL_METADATA: dict[str, dict[str, int]] = {
         "num_attention_heads": 16,
         "num_key_value_heads": 2,
         "head_dim": 256,
+        "full_attention_interval": 4,
+        "attn_output_gate": True,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 32,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
         "vocab_size": 248320,
         "tie_word_embeddings": False,
     },
@@ -51,7 +111,81 @@ KNOWN_MODEL_METADATA: dict[str, dict[str, int]] = {
         "num_attention_heads": 16,
         "num_key_value_heads": 2,
         "head_dim": 256,
+        "full_attention_interval": 4,
+        "attn_output_gate": True,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 32,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
         "vocab_size": 248320,
+        "tie_word_embeddings": False,
+    },
+    "Qwen/Qwen3-30B-A3B": {
+        # Non-Coder Qwen3-30B-A3B (model_type=qwen3_moe). Verified against the cached HF
+        # config.json: decoder_sparse_step=1 and mlp_only_layers=[] mean every layer is MoE,
+        # so the dense intermediate_size=6144 is unused for FFN params (the memory ledger
+        # ignores it once moe_intermediate_size is set). Shape params are identical to the
+        # Coder-30B variant; the two differ only in max_position_embeddings (40960 vs 262144)
+        # and rope_theta, neither of which changes training fwd/bwd shapes or param counts.
+        # Kept as a distinct identity so its evidence stream is not confused with Coder-30B.
+        "num_experts": 128,
+        "top_k": 8,
+        "num_hidden_layers": 48,
+        "hidden_size": 2048,
+        "intermediate_size": 6144,
+        "moe_intermediate_size": 768,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "vocab_size": 151936,
+        "tie_word_embeddings": False,
+    },
+    "Qwen/Qwen3-Coder-30B-A3B": {
+        "num_experts": 128,
+        "top_k": 8,
+        "num_hidden_layers": 48,
+        "hidden_size": 2048,
+        "intermediate_size": 6144,
+        "moe_intermediate_size": 768,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "vocab_size": 151936,
+        "tie_word_embeddings": False,
+    },
+    "Qwen/Qwen3-Coder-30B-A3B-Instruct": {
+        "num_experts": 128,
+        "top_k": 8,
+        "num_hidden_layers": 48,
+        "hidden_size": 2048,
+        "intermediate_size": 6144,
+        "moe_intermediate_size": 768,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "vocab_size": 151936,
+        "tie_word_embeddings": False,
+    },
+    "Qwen/Qwen3-32B": {
+        "num_hidden_layers": 64,
+        "hidden_size": 5120,
+        "intermediate_size": 25600,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "vocab_size": 151936,
+        "tie_word_embeddings": False,
+    },
+    "Qwen/Qwen3-8B": {
+        # Dense Qwen3-8B (model_type=qwen3), verified against its Hugging Face config.
+        "num_hidden_layers": 36,
+        "hidden_size": 4096,
+        "intermediate_size": 12288,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "vocab_size": 151936,
         "tie_word_embeddings": False,
     },
 }
@@ -86,12 +220,7 @@ def default_hf_cache_roots() -> list[Path]:
     hf_home = os.environ.get("HF_HOME")
     if hf_home:
         roots.append(Path(hf_home) / "hub")
-    roots.extend(
-        [
-            Path("/shared/huggingface/hub"),
-            Path.home() / ".cache" / "huggingface" / "hub",
-        ]
-    )
+    roots.append(Path.home() / ".cache" / "huggingface" / "hub")
     deduped: list[Path] = []
     seen: set[Path] = set()
     for root in roots:
@@ -157,11 +286,28 @@ def _read_metadata_file(config_path: Path, model_ref: str | None) -> ModelMetada
         head_dim=_find_int(sections, ("head_dim",)),
         vocab_size=_find_int(sections, ("vocab_size",)),
         tie_word_embeddings=_find_bool(sections, ("tie_word_embeddings",)),
+        full_attention_interval=_find_int(sections, ("full_attention_interval",)),
+        attn_output_gate=_find_bool(sections, ("attn_output_gate",)),
+        linear_num_key_heads=_find_int(sections, ("linear_num_key_heads",)),
+        linear_num_value_heads=_find_int(sections, ("linear_num_value_heads",)),
+        linear_key_head_dim=_find_int(sections, ("linear_key_head_dim",)),
+        linear_value_head_dim=_find_int(sections, ("linear_value_head_dim",)),
+        linear_conv_kernel_dim=_find_int(sections, ("linear_conv_kernel_dim",)),
     )
 
 
 def _known_metadata(model_ref: str) -> ModelMetadata | None:
     values = KNOWN_MODEL_METADATA.get(model_ref)
+    if values is None:
+        lowered = model_ref.lower()
+        for known_ref in sorted(KNOWN_MODEL_METADATA, key=len, reverse=True):
+            known_lowered = known_ref.lower()
+            known_name = known_ref.rsplit("/", 1)[-1].lower()
+            cache_name = known_ref.replace("/", "--").lower()
+            if known_lowered in lowered or known_name in lowered or cache_name in lowered:
+                values = KNOWN_MODEL_METADATA[known_ref]
+                model_ref = known_ref
+                break
     if values is None:
         return None
     return ModelMetadata(
@@ -180,6 +326,13 @@ def _known_metadata(model_ref: str) -> ModelMetadata | None:
         head_dim=values.get("head_dim"),
         vocab_size=values.get("vocab_size"),
         tie_word_embeddings=values.get("tie_word_embeddings"),
+        full_attention_interval=values.get("full_attention_interval"),
+        attn_output_gate=values.get("attn_output_gate"),
+        linear_num_key_heads=values.get("linear_num_key_heads"),
+        linear_num_value_heads=values.get("linear_num_value_heads"),
+        linear_key_head_dim=values.get("linear_key_head_dim"),
+        linear_value_head_dim=values.get("linear_value_head_dim"),
+        linear_conv_kernel_dim=values.get("linear_conv_kernel_dim"),
     )
 
 
@@ -212,6 +365,13 @@ def resolve_model_metadata(
         head_dim=_find_int(config_sections, ("head_dim",)),
         vocab_size=_find_int(config_sections, ("vocab_size",)),
         tie_word_embeddings=_find_bool(config_sections, ("tie_word_embeddings",)),
+        full_attention_interval=_find_int(config_sections, ("full_attention_interval",)),
+        attn_output_gate=_find_bool(config_sections, ("attn_output_gate",)),
+        linear_num_key_heads=_find_int(config_sections, ("linear_num_key_heads",)),
+        linear_num_value_heads=_find_int(config_sections, ("linear_num_value_heads",)),
+        linear_key_head_dim=_find_int(config_sections, ("linear_key_head_dim",)),
+        linear_value_head_dim=_find_int(config_sections, ("linear_value_head_dim",)),
+        linear_conv_kernel_dim=_find_int(config_sections, ("linear_conv_kernel_dim",)),
     )
 
     file_metadata = None
@@ -252,4 +412,39 @@ def resolve_model_metadata(
         head_dim=source_metadata.head_dim,
         vocab_size=source_metadata.vocab_size,
         tie_word_embeddings=source_metadata.tie_word_embeddings,
+        full_attention_interval=(
+            config_metadata.full_attention_interval
+            if config_metadata.full_attention_interval is not None
+            else source_metadata.full_attention_interval
+        ),
+        attn_output_gate=(
+            config_metadata.attn_output_gate
+            if config_metadata.attn_output_gate is not None
+            else source_metadata.attn_output_gate
+        ),
+        linear_num_key_heads=(
+            config_metadata.linear_num_key_heads
+            if config_metadata.linear_num_key_heads is not None
+            else source_metadata.linear_num_key_heads
+        ),
+        linear_num_value_heads=(
+            config_metadata.linear_num_value_heads
+            if config_metadata.linear_num_value_heads is not None
+            else source_metadata.linear_num_value_heads
+        ),
+        linear_key_head_dim=(
+            config_metadata.linear_key_head_dim
+            if config_metadata.linear_key_head_dim is not None
+            else source_metadata.linear_key_head_dim
+        ),
+        linear_value_head_dim=(
+            config_metadata.linear_value_head_dim
+            if config_metadata.linear_value_head_dim is not None
+            else source_metadata.linear_value_head_dim
+        ),
+        linear_conv_kernel_dim=(
+            config_metadata.linear_conv_kernel_dim
+            if config_metadata.linear_conv_kernel_dim is not None
+            else source_metadata.linear_conv_kernel_dim
+        ),
     )

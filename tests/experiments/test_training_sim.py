@@ -2,13 +2,24 @@ from pathlib import Path
 
 import yaml
 
-from experiments.local_benchmark.training_sim.benchmark_behavior import load_benchmark_behavior_points
-from experiments.local_benchmark.training_sim.calibration_evaluator import evaluate_calibration
-from experiments.local_benchmark.training_sim.collect_calibration import parse_log_text, summarize_observed_run
-from experiments.local_benchmark.training_sim.config_fingerprint import build_fingerprint, resolve_topology
-from experiments.local_benchmark.training_sim.model_metadata import resolve_model_metadata
-from experiments.local_benchmark.training_sim.scenario_planner import plan_scenario
-from experiments.local_benchmark.training_sim.shape_engine import balanced_counts, build_shape_ledger
+from xorl.sim.analytical_ledgers import activation_ledger, communication_ledger, flops_ledger
+from xorl.sim.benchmark_behavior import load_benchmark_behavior_points
+from xorl.sim.calibration_evaluator import evaluate_calibration
+from xorl.sim.calibration_packs import (
+    list_calibration_packs,
+    load_calibration_pack,
+    validate_calibration_pack,
+)
+from xorl.sim.collect_calibration import parse_log_text, summarize_observed_run
+from xorl.sim.config_fingerprint import build_fingerprint, load_training_config, resolve_topology
+from xorl.sim.feasibility_evaluator import evaluate_feasibility
+from xorl.sim.kernel_variants import compare_kernel_variants, rank_kernel_variants
+from xorl.sim.model_metadata import resolve_model_metadata
+from xorl.sim.predict import build_report
+from xorl.sim.scenario_planner import plan_scenario
+from xorl.sim.shape_engine import balanced_counts, build_shape_ledger
+from xorl.sim.tradeoff_ranker import rank_benchmark_tradeoffs
+from xorl.sim.validate import validate_simulator
 
 
 def test_balanced_counts_round_robin_distribution() -> None:
@@ -227,7 +238,7 @@ def test_scenario_planner_keeps_observed_fit_feasible_when_safety_margin_is_tigh
     assert report.best_raw.score_tokens_per_sec == 1_100.0
     assert report.best_raw.feasibility_status == "feasible_calibrated_peak_high_pressure"
     assert report.best_raw.memory_headroom_gb == -0.5
-    assert report.best_raw.recommendation == "correctness_gate_required"
+    assert report.best_raw.recommendation == "remeasure_for_stability"
 
 
 def test_build_fingerprint_reads_config_file(tmp_path: Path) -> None:
@@ -370,7 +381,10 @@ def _write_q235_config_fixture(config_path: Path) -> None:
         "model": {
             "model_path": "Qwen/Qwen3-235B-A22B",
             "ep_dispatch": "deepep",
+            "moe_implementation": "quack",
             "deepep_buffer_size_gb": 2.0,
+            "deepep_num_sms": 24,
+            "deepep_async_combine": False,
         },
         "data": {
             "sample_packing_sequence_len": 4096,
@@ -388,8 +402,12 @@ def _write_q235_config_fixture(config_path: Path) -> None:
             "gradient_accumulation_steps": 1,
             "optimizer": "muon",
             "optimizer_dtype": "bf16",
-            "muon_momentum": 0.0,
+            "muon_momentum": 0.95,
             "enable_mixed_precision": True,
+            "skip_param_upcast": True,
+            "fsdp_reduce_dtype": "fp32",
+            "ce_mode": "quack_linear",
+            "gradient_checkpointing_method": "recompute_before_dispatch",
         },
     }
     config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
@@ -417,7 +435,7 @@ def test_qwen235_scenario_planner_uses_markdown_calibration_for_ga_tradeoff(tmp_
     assert report.best_raw.prediction_confidence == "calibrated"
     assert report.best_raw.score_tokens_per_sec == 8_400.0
     assert report.best_raw.behavior.tokens_per_sec_per_gpu == 262.5
-    assert report.best_raw.analytic_peak_floor_gb == 29.363
+    assert report.best_raw.analytic_peak_floor_gb == 56.812
     assert report.best_raw.estimated_peak_mem_gb == 68.3
     assert report.best_raw.memory_basis == "calibrated_peak"
     assert report.best_raw.feasibility_status == "feasible_calibrated_peak_high_pressure"
@@ -444,13 +462,13 @@ def test_qwen235_scenario_planner_extrapolates_ga_asymptote_from_step_time_fit(t
     assert report.best_raw is not None
     assert report.best_raw.label == "mbs1-gb256-ep8-efsdp4-tp1-pp1-u1-r1:extrapolated"
     assert report.best_raw.prediction_confidence == "extrapolated_step_time_fit"
-    assert report.best_raw.score_tokens_per_sec == 9646.513
-    assert report.best_raw.behavior.step_time_sec == 108.7
+    assert report.best_raw.score_tokens_per_sec == 10_200.0
+    assert report.best_raw.behavior.step_time_sec == 102.801569
     assert report.best_raw.estimated_peak_mem_gb == 68.3
-    assert report.best_raw.memory_basis == "extrapolated_peak"
-    assert report.best_raw.feasibility_status == "feasible_extrapolated_peak_high_pressure"
+    assert report.best_raw.memory_basis == "calibrated_overhead_peak"
+    assert report.best_raw.feasibility_status == "feasible_calibrated_overhead_peak_high_pressure"
     assert report.best_raw.calibration_scope == "outside_measured_envelope"
-    assert report.best_raw.score_risk_adjusted_tokens_per_sec == 4796.729
+    assert report.best_raw.score_risk_adjusted_tokens_per_sec == 4666.194
     assert report.best_raw.recommendation == "remeasure_before_ranking"
     assert "outside_measured_envelope" in report.best_raw.risk_flags
     assert "requires_remeasurement" in report.best_raw.risk_flags
@@ -463,7 +481,7 @@ def test_qwen235_scenario_planner_extrapolates_ga_asymptote_from_step_time_fit(t
     by_label = {candidate.label: candidate for candidate in report.candidates}
     ga4 = by_label["mbs1-gb128-ep8-efsdp4-tp1-pp1-u1-r1:extrapolated"]
     assert ga4.prediction_confidence == "extrapolated_step_time_fit"
-    assert ga4.score_tokens_per_sec == 9181.926
+    assert ga4.score_tokens_per_sec == 9_520.0
 
 
 def test_qwen235_calibration_evaluator_reports_leave_one_out_ga_error(tmp_path: Path) -> None:
@@ -484,15 +502,15 @@ def test_qwen235_calibration_evaluator_reports_leave_one_out_ga_error(tmp_path: 
     assert report.evaluated_count == 2
     assert report.skipped_count == 0
     assert report.prediction_status_counts == {"extrapolated": 2}
-    assert report.mean_absolute_percentage_error == 21.288
+    assert report.mean_absolute_percentage_error == 19.16
     by_label = {holdout.label: holdout for holdout in report.holdouts}
     ga1 = by_label["q235_markdown:n4_ep8_bd_pk4096"]
     ga2 = by_label["q235_markdown:n4_ep8_bd_pk4096_ga2"]
     assert ga1.topology_label == "mbs1-gb32-ep8-efsdp4-tp1-pp1-u1-r1"
-    assert ga1.predicted_tokens_per_sec == 8_400.0
-    assert ga1.absolute_percentage_error == 23.529
-    assert ga2.predicted_tokens_per_sec == 6_800.0
-    assert ga2.absolute_percentage_error == 19.048
+    assert ga1.predicted_tokens_per_sec == 7_560.0
+    assert ga1.absolute_percentage_error == 11.176
+    assert ga2.predicted_tokens_per_sec == 6_120.0
+    assert ga2.absolute_percentage_error == 27.143
 
 
 def test_qwen235_scenario_planner_does_not_exact_match_observed_row_to_tp_what_if(tmp_path: Path) -> None:
@@ -520,7 +538,7 @@ def test_qwen235_scenario_planner_does_not_exact_match_observed_row_to_tp_what_i
     assert tp2.prediction_confidence == "extrapolated"
     assert tp2.behavior.matched_label == "q235_markdown:n4_ep8_bd_pk4096_ga2"
     assert "TP extrapolation uses conservative communication penalty" in tp2.behavior.warnings
-    assert tp2.score_tokens_per_sec == 7_560.0
+    assert tp2.score_tokens_per_sec == 6_804.0
 
 
 def test_qwen235_scenario_planner_auto_sweeps_parallelism_strategy_space(tmp_path: Path) -> None:
@@ -622,3 +640,116 @@ def test_qwen235_scenario_planner_marks_matching_oom_pack_infeasible(tmp_path: P
     assert candidate.score_tokens_per_sec is None
     assert candidate.calibration_scope == "exact_calibrated"
     assert "observed_oom_boundary:q235_markdown:n4_ep8_bd_pk16k" in candidate.risk_flags
+
+
+def test_builtin_calibration_packs_are_sanitized_and_versioned() -> None:
+    assert list_calibration_packs() == ["qwen3_235b_a22b", "qwen3_5_397b_a17b", "qwen3_6_35b_a3b"]
+    for name in list_calibration_packs():
+        pack = load_calibration_pack(name)
+        validation = validate_calibration_pack(pack.path)
+        assert pack.manifest["schema_version"] == 1
+        assert pack.default_config.is_file()
+        assert validation["status"] == "pass"
+
+
+def test_builtin_qwen35_pack_preserves_raw_and_promotable_winners() -> None:
+    pack = load_calibration_pack("qwen3_5_397b_a17b")
+    points = load_benchmark_behavior_points(pack.path)
+    report = rank_benchmark_tradeoffs(pack.path)
+
+    assert len(points) == 6
+    assert report.best_raw is not None
+    assert report.best_raw.score_tokens_per_sec == 59_217.0
+    assert report.best_raw.promotable is False
+    assert report.best_promotable is not None
+    assert report.best_promotable.score_tokens_per_sec == 59_188.0
+    assert report.best_promotable.promotable is True
+
+
+def test_builtin_qwen36_pack_matches_default_config_but_remains_ungated() -> None:
+    pack = load_calibration_pack("qwen3_6_35b_a3b")
+    report = build_report(
+        pack.default_config,
+        world_size=None,
+        local_world_size=None,
+        balanced_routing=True,
+        num_experts=None,
+        top_k=None,
+        benchmark_dir=pack.path,
+    )
+
+    assert report.benchmark_behavior is not None
+    assert report.benchmark_behavior.matched_label == "readme_reference_mbs8"
+    assert report.benchmark_behavior.tokens_per_sec == 261_000.0
+    assert report.benchmark_behavior.correctness_status == "raw_speed_not_promoted_without_matching_k3_pass"
+    assert report.support.support_status == "supported_local_non_pp"
+    assert report.timing.timing_coverage_status == "benchmark_total_step_only"
+
+
+def test_builtin_qwen235_pack_replays_fit_and_oom_boundaries() -> None:
+    pack = load_calibration_pack("qwen3_235b_a22b")
+    report = evaluate_feasibility(pack.default_config, benchmark_dir=pack.path)
+
+    assert report.status == "ok"
+    assert report.evaluated_count == 3
+    assert report.accuracy == 1.0
+    assert report.fit_recall == 1.0
+    assert report.oom_recall == 1.0
+    assert {holdout.actual_outcome for holdout in report.holdouts} == {"fit", "oom"}
+
+
+def test_portable_analytical_core_covers_flops_activations_and_communication() -> None:
+    pack = load_calibration_pack("qwen3_5_397b_a17b")
+    raw_config = load_training_config(pack.default_config)
+    topology = resolve_topology(raw_config)
+    metadata = resolve_model_metadata(raw_config)
+
+    flops = flops_ledger(metadata, topology)
+    activations = activation_ledger(metadata, topology, raw_config["train"])
+    communication = communication_ledger(metadata, topology, raw_config["train"])
+
+    assert metadata.full_attention_interval == 4
+    assert metadata.linear_num_value_heads == 64
+    assert flops["status"] == "exact_analytic"
+    assert flops["total_flops"] > 0
+    assert activations["status"] == "exact_analytic_lower_bound"
+    assert activations["analytic_activation_lower_bound_gb"] > 0
+    assert communication["status"] == "exact_analytic_bytes"
+    assert communication["total_per_rank_gb"] > 0
+
+
+def test_kernel_variant_ranking_requires_a_correctness_gate() -> None:
+    rows = [
+        {
+            "family": "attention",
+            "variant": "fast-ungated",
+            "workload": "qwen35-seq4096",
+            "latency_ms": 8.0,
+            "correctness_status": "not_promoted",
+        },
+        {
+            "family": "attention",
+            "variant": "validated",
+            "workload": "qwen35-seq4096",
+            "latency_ms": 10.0,
+            "correctness_status": "pass",
+        },
+    ]
+
+    report = rank_kernel_variants(rows)
+    comparison = compare_kernel_variants(rows[1], rows[0])
+
+    assert report["status"] == "ok"
+    assert report["best"]["variant"] == "validated"
+    assert report["measurements"][0]["variant"] == "fast-ungated"
+    assert comparison["speedup"] == 1.25
+    assert comparison["candidate_promotable"] is False
+
+
+def test_consolidated_validator_covers_all_builtin_packs() -> None:
+    report = validate_simulator()
+
+    assert report["status"] == "pass"
+    assert report["pack_count"] == 3
+    assert report["check_count"] >= 200
+    assert report["failed_check_count"] == 0

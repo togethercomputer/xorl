@@ -1,0 +1,68 @@
+{
+  "diagnostic_replays": [
+    {
+      "candidate": "qwen36_diagnostic_1",
+      "k3_max": 0.3917743468870727,
+      "k3_mean": 0.007526155813053868,
+      "k3_p95": 0.02364128327561078,
+      "status": "diagnostic_low_k3",
+      "total_tokens": 192
+    },
+    {
+      "candidate": "qwen36_diagnostic_2",
+      "k3_max": 0.3917743468870727,
+      "k3_mean": 0.007526155813053868,
+      "k3_p95": 0.02364128327561078,
+      "status": "diagnostic_low_k3",
+      "total_tokens": 192
+    },
+    {
+      "candidate": "qwen36_diagnostic_3",
+      "k3_max": 4.682859666612269,
+      "k3_mean": 0.039442088877642674,
+      "k3_p95": 0.043214317136827184,
+      "status": "diagnostic",
+      "total_tokens": 192
+    }
+  ],
+  "k3_gate": {
+    "candidate": "qwen36_deepep_mbs6",
+    "k3": {
+      "max": 394.1870587177588,
+      "mean": 2.1339466950283534,
+      "median": 2.0777892217216376e-05,
+      "p95": 0.08342470559875832,
+      "p99": 1.6374857623690962,
+      "total_prompts": 3,
+      "total_tokens": 192
+    },
+    "outlier_note": "The worst token accounts for most of the total K3; SGLang generation logprob and prefill top-logprob disagree on that token, so this artifact is useful for debugging but is not a passing promotion gate.",
+    "primary_failure": "k3.mean <= 0.001",
+    "source": "sanitized static replay summary",
+    "status": "fail",
+    "thresholds": {
+      "mean": 0.001,
+      "p95": 0.01
+    }
+  },
+  "model": "Qwen/Qwen3.6-35B-A3B",
+  "static_traces": {
+    "note": "These traces are Qwen3.6-specific and must not be reused for Qwen3.5-397B.",
+    "num_traces": 3,
+    "source": "sanitized Qwen3.6 static replay summary",
+    "total_tokens": 192,
+    "trace_mode": "sglang_generation"
+  },
+  "throughput": {
+    "candidate": "qwen36_deepep_mbs6",
+    "global_batch_size": 192,
+    "gpu_alloc_gb": 46.08,
+    "gpus": 32,
+    "mfu_percent": 15.84,
+    "micro_batch_size": 6,
+    "step_time_sec": 6.178,
+    "tokens_per_sec": 254600.0,
+    "tokens_per_sec_per_gpu": 7956.25
+  },
+  "workload": "synthetic packed 8k full training, 4 nodes x 8 H100"
+}
