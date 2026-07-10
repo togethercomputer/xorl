@@ -55,10 +55,12 @@ def anchor_stamp():
     """Commit hash (+dirty) of this tree, for stamping decompositions."""
     here = os.path.dirname(os.path.abspath(__file__))
     try:
-        head = subprocess.run(["git", "-C", here, "rev-parse", "--short", "HEAD"],
-                              capture_output=True, text=True, timeout=5).stdout.strip()
-        dirty = subprocess.run(["git", "-C", here, "status", "--porcelain", "."],
-                               capture_output=True, text=True, timeout=5).stdout.strip()
+        head = subprocess.run(
+            ["git", "-C", here, "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "-C", here, "status", "--porcelain", "."], capture_output=True, text=True, timeout=5
+        ).stdout.strip()
         return f"{head}{'+dirty' if dirty else ''}" if head else "unknown"
     except Exception:
         return "unknown"
@@ -95,9 +97,11 @@ def profile(m, runs=5, mode=None):
     picked = trials[0] if select == "min" else trials[len(trials) // 2]
     total, starts, ends = picked
     t0 = starts.min()
-    print(f"anchor {anchor_stamp()}   mode={mode}{' (forced)' if forced else ' (certified default)'}   "
-          f"select={select} of {runs} runs   min {trials[0][0] / 1e3:.1f} / "
-          f"median {trials[len(trials) // 2][0] / 1e3:.1f} us")
+    print(
+        f"anchor {anchor_stamp()}   mode={mode}{' (forced)' if forced else ' (certified default)'}   "
+        f"select={select} of {runs} runs   min {trials[0][0] / 1e3:.1f} / "
+        f"median {trials[len(trials) // 2][0] / 1e3:.1f} us"
+    )
 
     # realized critical path: from the last-ending instr, walk back through the dep
     # whose end is latest (instr-granular deps guarantee start_i >= end_j for j in deps)
@@ -116,18 +120,21 @@ def profile(m, runs=5, mode=None):
     path.reverse()
 
     covered = sum(w + s for _, w, s in path) + (0 if not path else starts[path[0][0]] - t0)
-    print(f"step total {total / 1e3:9.1f} us   chain hops {len(path)}   "
-          f"attribution {covered / total * 100:5.1f}%")
-    print(f"  READ RULE: the chain telescopes the step by construction — interpreter/"
-          f"route/dispatch cost is folded INSIDE every wait/span cell (~22% at "
-          f"exclusive-run calibration), so bare-kernel standalone times are NOT "
-          f"comparable to these rows; compare only against the certified score step.")
+    print(f"step total {total / 1e3:9.1f} us   chain hops {len(path)}   attribution {covered / total * 100:5.1f}%")
+    print(
+        "  READ RULE: the chain telescopes the step by construction — interpreter/"
+        "route/dispatch cost is folded INSIDE every wait/span cell (~22% at "
+        "exclusive-run calibration), so bare-kernel standalone times are NOT "
+        "comparable to these rows; compare only against the certified score step."
+    )
     W = sum(w for _, w, _ in path if w > 0)
     O = -sum(w for _, w, _ in path if w < 0)  # negative wait = region-gated overlap (df2)
     E = sum(s for _, _, s in path)
-    print(f"  on-path wait {W / 1e3:8.1f} us ({W / total * 100:4.1f}%)   "
-          f"on-path span {E / 1e3:8.1f} us ({E / total * 100:4.1f}%)   "
-          f"overlap {O / 1e3:8.1f} us")
+    print(
+        f"  on-path wait {W / 1e3:8.1f} us ({W / total * 100:4.1f}%)   "
+        f"on-path span {E / 1e3:8.1f} us ({E / total * 100:4.1f}%)   "
+        f"overlap {O / 1e3:8.1f} us"
+    )
 
     # per-label aggregation: on-path (wait/span) AND off-path span in one table.
     # on-path total is the LOWER bound of a label's step contribution; onpath+offpath
@@ -146,23 +153,27 @@ def profile(m, runs=5, mode=None):
         lbl = instr_label(op, args)
         c, tw, ts, oc, os_ = agg.get(lbl, (0, 0, 0, 0, 0))
         agg[lbl] = (c, tw, ts, oc + 1, os_ + (ends[i] - starts[i]))
-    print(f"  {'op (on+off path)':44s} {'cnt':>4s} {'wait us':>9s} {'span us':>9s} "
-          f"{'onpath us':>9s} {'offp cnt':>8s} {'offp us':>9s} {'ub us':>9s}")
-    for lbl, (c, tw, ts, oc, os_) in sorted(
-            agg.items(), key=lambda kv: -(kv[1][1] + kv[1][2] + kv[1][4])):
-        print(f"  {lbl:44s} {c:4d} {tw / 1e3:9.1f} {ts / 1e3:9.1f} {(tw + ts) / 1e3:9.1f} "
-              f"{oc:8d} {os_ / 1e3:9.1f} {(tw + ts + os_) / 1e3:9.1f}")
+    print(
+        f"  {'op (on+off path)':44s} {'cnt':>4s} {'wait us':>9s} {'span us':>9s} "
+        f"{'onpath us':>9s} {'offp cnt':>8s} {'offp us':>9s} {'ub us':>9s}"
+    )
+    for lbl, (c, tw, ts, oc, os_) in sorted(agg.items(), key=lambda kv: -(kv[1][1] + kv[1][2] + kv[1][4])):
+        print(
+            f"  {lbl:44s} {c:4d} {tw / 1e3:9.1f} {ts / 1e3:9.1f} {(tw + ts) / 1e3:9.1f} "
+            f"{oc:8d} {os_ / 1e3:9.1f} {(tw + ts + os_) / 1e3:9.1f}"
+        )
     offtot = sum(os_ for _, _, _, _, os_ in agg.values())
-    print(f"  {'TOTALS':44s} {'':4s} {W / 1e3:9.1f} {E / 1e3:9.1f} "
-          f"{(W + E) / 1e3:9.1f} {'':8s} {offtot / 1e3:9.1f}   "
-          f"(quote a bucket as 'onpath..ub us @ anchor/mode', never onpath alone)")
+    print(
+        f"  {'TOTALS':44s} {'':4s} {W / 1e3:9.1f} {E / 1e3:9.1f} "
+        f"{(W + E) / 1e3:9.1f} {'':8s} {offtot / 1e3:9.1f}   "
+        f"(quote a bucket as 'onpath..ub us @ anchor/mode', never onpath alone)"
+    )
 
     # worst individual hops
     print("  worst hops (wait+span):")
     for i, w, s in sorted(path, key=lambda x: -(x[1] + x[2]))[:12]:
         op, ntiles, args = flat[i]
-        print(f"    #{i:3d} {instr_label(op, args):40s} tiles={ntiles:4d} "
-              f"wait={w / 1e3:7.1f} span={s / 1e3:7.1f} us")
+        print(f"    #{i:3d} {instr_label(op, args):40s} tiles={ntiles:4d} wait={w / 1e3:7.1f} span={s / 1e3:7.1f} us")
     return total, path, flat
 
 

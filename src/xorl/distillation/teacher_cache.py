@@ -351,8 +351,7 @@ class TeacherActivationCache:
         max_idx = flat_indices.max().item()
         if max_idx >= num_tokens:
             raise IndexError(
-                f"teacher_cache_indices contain {max_idx}, "
-                f"but teacher_id={key} cache only has {num_tokens} rows"
+                f"teacher_cache_indices contain {max_idx}, but teacher_id={key} cache only has {num_tokens} rows"
             )
 
     def _cache_for_access(

@@ -137,11 +137,16 @@ def wgmma_n128_ok(M, N, K, flags):
     # Post-small-4W retune: H512/S1024's remaining general NT n128 rows are
     # slower than the normal m64n64 WGMMA path. Env mode 1 remains a force-on
     # override, and mode 2 remains the lm-head-only probe.
-    if mode_env is None and (flags & 2) and (M, N, K) in {
-        (1024, 3072, 512),
-        (1024, 512, 512),
-        (1024, 512, 1536),
-    }:
+    if (
+        mode_env is None
+        and (flags & 2)
+        and (M, N, K)
+        in {
+            (1024, 3072, 512),
+            (1024, 512, 512),
+            (1024, 512, 1536),
+        }
+    ):
         return False
     if not (flags & 2):  # NN (dX): MN-major 128-wide B; tile-gated like the m64n64
         # NN route (halved tile count needs co-scheduling headroom). MK_WGMMA_N128_NN
@@ -198,10 +203,15 @@ def wgmma_n256_direct_ok(M, N, K, flags):
     # bounce -4.5..+8.4 (mkv3-p4b-s1024-n256-tiebreak-*) — kept on the probe
     # majority; revisit if a later resweep flips it consistently. s128-512
     # remain unmeasured-post; their heads are sub-wave anyway.
-    return (M, N, K) in {(1024, 151936, 2560),
-                         (1024, 16384, 512),  # small lm_head fwd (post-SKR)
-                         (1024, 8192, 256), (2048, 8192, 256),
-                         (3072, 8192, 256), (4096, 8192, 256), (8192, 8192, 256)}
+    return (M, N, K) in {
+        (1024, 151936, 2560),
+        (1024, 16384, 512),  # small lm_head fwd (post-SKR)
+        (1024, 8192, 256),
+        (2048, 8192, 256),
+        (3072, 8192, 256),
+        (4096, 8192, 256),
+        (8192, 8192, 256),
+    }
 
 
 def wgmma_n256_nt_bf16_ok(M, N, K, flags):
@@ -226,9 +236,9 @@ def wgmma_n256_nt_bf16_ok(M, N, K, flags):
         return True
     return (M, N, K) in {
         (1024, 19456, 2560),  # qwen4b-l1 wgu
-        (1024, 6144, 2560),   # qwen4b-l1 wqkv
-        (1024, 2560, 9728),   # qwen4b-l1 wd
-        (1024, 2560, 4096),   # qwen4b-l1 wo
+        (1024, 6144, 2560),  # qwen4b-l1 wqkv
+        (1024, 2560, 9728),  # qwen4b-l1 wd
+        (1024, 2560, 4096),  # qwen4b-l1 wo
     }
 
 
@@ -253,11 +263,11 @@ def wgmma_n256_nn_bf16_ok(M, N, K, flags):
     if mode == 1:
         return True
     if (M, N, K) in {
-        (1024, 9728, 2560),    # qwen4b-l1 wd dX
-        (1024, 2560, 19456),   # qwen4b-l1 wgu dX
-        (8192, 768, 256),      # H256/D64/S8192 wd dX
-        (8192, 256, 1536),     # H256/D64/S8192 wgu dX
-        (8192, 256, 512),      # H256/D64/S8192 wo dX
+        (1024, 9728, 2560),  # qwen4b-l1 wd dX
+        (1024, 2560, 19456),  # qwen4b-l1 wgu dX
+        (8192, 768, 256),  # H256/D64/S8192 wd dX
+        (8192, 256, 1536),  # H256/D64/S8192 wgu dX
+        (8192, 256, 512),  # H256/D64/S8192 wo dX
     }:
         return True
     qkvdx_env = os.environ.get("MK_WGMMA_N256_QKVDX_BF16")
@@ -304,21 +314,21 @@ def wgmma_n256_nt_supertile_ok(M, N, K, flags):
 
 
 _QWEN_N256_STAGE3_SHAPES = {
-    (1024, 151936, 2560),   # lm-head fwd
-    (1024, 2560, 151936),   # lm-head dX
-    (1024, 19456, 2560),    # wgu fwd
-    (1024, 6144, 2560),     # wqkv fwd
-    (1024, 2560, 9728),     # wd fwd
-    (1024, 2560, 4096),     # wo fwd
-    (1024, 4096, 2560),     # wo dX + Drow
-    (1024, 9728, 2560),     # wd dX
-    (1024, 2560, 19456),    # wgu dX
-    (1024, 2560, 6144),     # wqkv dX
-    (151936, 2560, 1024),   # wlm dW
-    (2560, 9728, 1024),     # wd dW
-    (19456, 2560, 1024),    # wgu dW
-    (2560, 4096, 1024),     # wo dW
-    (6144, 2560, 1024),     # wqkv dW
+    (1024, 151936, 2560),  # lm-head fwd
+    (1024, 2560, 151936),  # lm-head dX
+    (1024, 19456, 2560),  # wgu fwd
+    (1024, 6144, 2560),  # wqkv fwd
+    (1024, 2560, 9728),  # wd fwd
+    (1024, 2560, 4096),  # wo fwd
+    (1024, 4096, 2560),  # wo dX + Drow
+    (1024, 9728, 2560),  # wd dX
+    (1024, 2560, 19456),  # wgu dX
+    (1024, 2560, 6144),  # wqkv dX
+    (151936, 2560, 1024),  # wlm dW
+    (2560, 9728, 1024),  # wd dW
+    (19456, 2560, 1024),  # wgu dW
+    (2560, 4096, 1024),  # wo dW
+    (6144, 2560, 1024),  # wqkv dW
 }
 
 
@@ -365,8 +375,7 @@ def wgmma_n256_head_dx_ok(M, N, K, flags):
     if mode == 1:
         return True
     # long-S gauntlet head-dX companions of the lm-head gate above
-    return (M, N, K) in {(1024, 2560, 151936),
-                         (3072, 256, 8192), (4096, 256, 8192), (8192, 256, 8192)}
+    return (M, N, K) in {(1024, 2560, 151936), (3072, 256, 8192), (4096, 256, 8192), (8192, 256, 8192)}
 
 
 def wgmma_n256_dw_tn_ok(M, N, K, flags):
@@ -600,12 +609,8 @@ def load_ext(
     else:
         attn_fwd_expfold = int(bool(attn_fwd_expfold))
     attn_fwd_defer_rsum = int(os.environ.get("MK_ATTN_FWD_DEFER_RSUM", "1"))
-    attn_fwd_dediverge = int(
-        os.environ.get("MK_ATTN_FWD_DEDIVERGE", int(bool(attn_fwd_dediverge)))
-    )
-    attn_fwd_mask_split = int(
-        os.environ.get("MK_ATTN_FWD_MASK_SPLIT", int(bool(attn_fwd_mask_split)))
-    )
+    attn_fwd_dediverge = int(os.environ.get("MK_ATTN_FWD_DEDIVERGE", int(bool(attn_fwd_dediverge))))
+    attn_fwd_mask_split = int(os.environ.get("MK_ATTN_FWD_MASK_SPLIT", int(bool(attn_fwd_mask_split))))
     attn_dkv_row_bcast_env = os.environ.get("MK_ATTN_DKV_ROW_BCAST")
     if attn_dkv_row_bcast_env is not None:
         attn_dkv_row_bcast = int(attn_dkv_row_bcast_env)
@@ -708,24 +713,16 @@ def load_ext(
     else:
         attn_exp2_prebias = 0 if attn_exp2_prebias is None else int(bool(attn_exp2_prebias))
     attn_exp2_prebias = int(bool(attn_exp2_approx and attn_exp2_prebias))
-    attn_combine_unroll = int(
-        os.environ.get("MK_ATTN_COMBINE_UNROLL", int(bool(attn_combine_unroll)))
-    )
-    lmhead_exp2_approx = int(
-        os.environ.get("MK_LMHEAD_EXP2_APPROX", int(bool(lmhead_exp2_approx)))
-    )
+    attn_combine_unroll = int(os.environ.get("MK_ATTN_COMBINE_UNROLL", int(bool(attn_combine_unroll))))
+    lmhead_exp2_approx = int(os.environ.get("MK_LMHEAD_EXP2_APPROX", int(bool(lmhead_exp2_approx))))
     rms_dx_h2560 = int(
         os.environ.get(
             "MK_RMS_DX_H2560",
             "0" if rms_dx_h2560 is None else str(int(bool(rms_dx_h2560))),
         )
     )
-    ce_bwd_exp2_approx = int(
-        os.environ.get("MK_CE_BWD_EXP2_APPROX", int(bool(ce_bwd_exp2_approx)))
-    )
-    ce_bwd_label_fixup = int(
-        os.environ.get("MK_CE_BWD_LABEL_FIXUP", int(bool(ce_bwd_label_fixup)))
-    )
+    ce_bwd_exp2_approx = int(os.environ.get("MK_CE_BWD_EXP2_APPROX", int(bool(ce_bwd_exp2_approx))))
+    ce_bwd_label_fixup = int(os.environ.get("MK_CE_BWD_LABEL_FIXUP", int(bool(ce_bwd_label_fixup))))
     idle_ns_env = os.environ.get("MK_IDLE_NS")
     if idle_ns_env is not None:
         idle_ns = int(idle_ns_env)
@@ -747,19 +744,13 @@ def load_ext(
     # with MK_DF_MAXNREG (the variant owns the entry ceiling) and MK_OCC2
     # (__launch_bounds__(256,2) vs 384 threads).
     df_producer = int(os.environ.get("MK_DF_PRODUCER", "0"))
-    assert not (df_producer and df_maxnreg), (
-        "MK_DF_PRODUCER and MK_DF_MAXNREG are mutually exclusive"
-    )
-    assert not (df_producer and occ2), (
-        "MK_DF_PRODUCER and MK_OCC2 are mutually exclusive"
-    )
+    assert not (df_producer and df_maxnreg), "MK_DF_PRODUCER and MK_DF_MAXNREG are mutually exclusive"
+    assert not (df_producer and occ2), "MK_DF_PRODUCER and MK_OCC2 are mutually exclusive"
     # Attribution knob: plain 256-thread df with the executor-loop __syncthreads
     # swapped for the producer variant's bar.sync 1,256 (isolates barrier cost
     # from WG2-residency/setmaxnreg cost). Redundant under MK_DF_PRODUCER.
     df_named_bar = int(os.environ.get("MK_DF_NAMED_BAR", "0"))
-    assert not (df_named_bar and df_producer), (
-        "MK_DF_NAMED_BAR is redundant under MK_DF_PRODUCER"
-    )
+    assert not (df_named_bar and df_producer), "MK_DF_NAMED_BAR is redundant under MK_DF_PRODUCER"
     # Producer-df register-point executor (megakernel_pdf): 384 threads at entry
     # __maxnreg__(168), consumers setmaxnreg.inc->MK_PDF_REGS (default 240), WG2
     # dec->MK_PDF_DEC (phase 1: exits; phase 2 MK_PDF_PRODUCER=1: pure TMA
@@ -770,10 +761,12 @@ def load_ext(
     pdf_regs = int(os.environ.get("MK_PDF_REGS", "240"))
     pdf_dec = int(os.environ.get("MK_PDF_DEC", "24"))
     pdf_producer = int(os.environ.get("MK_PDF_PRODUCER", int(bool(pdf_producer))))
-    pdf_d64_feed = int(os.environ.get(
-        "MK_PDF_D64_FEED",
-        "0" if pdf_d64_feed is None else str(int(bool(pdf_d64_feed))),
-    ))
+    pdf_d64_feed = int(
+        os.environ.get(
+            "MK_PDF_D64_FEED",
+            "0" if pdf_d64_feed is None else str(int(bool(pdf_d64_feed))),
+        )
+    )
     if pdf_producer:
         pdf = 1
     assert not pdf or 8 * pdf_regs + 4 * pdf_dec <= 2048, "pdf register pool infeasible"
@@ -785,10 +778,12 @@ def load_ext(
     # 1 = dq K/V stage feed only, 2 = + dkv Q/dO stage feed (LSE/Drow scalars
     # stay on the consumer cp.async path either way). Default OFF everywhere;
     # requires the pdf producer image (forced 0 without it).
-    attn_pdf_feed = int(os.environ.get(
-        "MK_ATTN_PDF_FEED",
-        "0" if attn_pdf_feed is None else str(int(attn_pdf_feed)),
-    ))
+    attn_pdf_feed = int(
+        os.environ.get(
+            "MK_ATTN_PDF_FEED",
+            "0" if attn_pdf_feed is None else str(int(attn_pdf_feed)),
+        )
+    )
     attn_pdf_feed = attn_pdf_feed if pdf_producer else 0
     # pdf shell smem-state fix (pdfld lane, claim 20260708T0140Z-realclock):
     # re-read s_ins/s_t0/s_t1 from shared across the dispatch call instead of
@@ -830,9 +825,7 @@ def load_ext(
     # Qwen4B-L1 uses a four-warps-per-row SwiGLU backward by default. The env
     # override keeps the old 2W route available for A/B and bisects.
     swiglu_bwd_4w = int(os.environ.get("MK_SWIGLU_BWD_4W", int(bool(swiglu_bwd_4w))))
-    swiglu_cache_sig = int(
-        os.environ.get("MK_SWIGLU_CACHE_SIG", int(bool(swiglu_cache_sig)))
-    )
+    swiglu_cache_sig = int(os.environ.get("MK_SWIGLU_CACHE_SIG", int(bool(swiglu_cache_sig))))
     gemm_mbar_ring_env = os.environ.get("MK_GEMM_MBAR_RING")
     if gemm_mbar_ring_env is not None:
         gemm_mbar_ring = int(gemm_mbar_ring_env)
@@ -842,11 +835,7 @@ def load_ext(
     if gemm_n256_nt_mbar_env is not None:
         gemm_n256_nt_mbar = int(gemm_n256_nt_mbar_env)
     else:
-        gemm_n256_nt_mbar = (
-            gemm_mbar_ring
-            if gemm_n256_nt_mbar is None
-            else int(bool(gemm_n256_nt_mbar))
-        )
+        gemm_n256_nt_mbar = gemm_mbar_ring if gemm_n256_nt_mbar is None else int(bool(gemm_n256_nt_mbar))
     gemm_n256_nt_mbar = int(bool(gemm_mbar_ring and gemm_n256_nt_mbar))
     # GEMM round-4 TMA feed for the n256 NN/TN mbarrier-ring bodies. Requires
     # the ring; the per-instruction gate is the tmap args injected by
@@ -864,132 +853,99 @@ def load_ext(
     if gemm_n256_nt_tma_env is not None:
         gemm_n256_nt_tma = int(gemm_n256_nt_tma_env)
     else:
-        gemm_n256_nt_tma = (
-            0 if gemm_n256_nt_tma is None else int(bool(gemm_n256_nt_tma))
-        )
+        gemm_n256_nt_tma = 0 if gemm_n256_nt_tma is None else int(bool(gemm_n256_nt_tma))
     gemm_n256_nt_tma = int(bool(gemm_mbar_ring and gemm_n256_nt_tma))
     gemm_n256_nt_supertile_env = os.environ.get("MK_GEMM_N256_NT_SUPERTILE")
     if gemm_n256_nt_supertile_env is not None:
         gemm_n256_nt_supertile = int(gemm_n256_nt_supertile_env)
     else:
-        gemm_n256_nt_supertile = (
-            0 if gemm_n256_nt_supertile is None else int(bool(gemm_n256_nt_supertile))
-        )
-    gemm_n256_nt_supertile = int(
-        bool(gemm_mbar_ring and gemm_n256_nt_tma and gemm_n256_nt_supertile)
-    )
-    gemm_n256_nt_supertile_reg_epi = int(os.environ.get(
-        "MK_GEMM_N256_NT_SUPERTILE_REG_EPI",
-        "0" if gemm_n256_nt_supertile_reg_epi is None
-        else str(int(bool(gemm_n256_nt_supertile_reg_epi))),
-    ))
+        gemm_n256_nt_supertile = 0 if gemm_n256_nt_supertile is None else int(bool(gemm_n256_nt_supertile))
+    gemm_n256_nt_supertile = int(bool(gemm_mbar_ring and gemm_n256_nt_tma and gemm_n256_nt_supertile))
     gemm_n256_nt_supertile_reg_epi = int(
-        bool(gemm_n256_nt_supertile and gemm_n256_nt_supertile_reg_epi)
-    )
-    gemm_n256_nt_supertile_pdfonly = int(os.environ.get(
-        "MK_GEMM_N256_NT_SUPERTILE_PDFONLY",
-        "0" if gemm_n256_nt_supertile_pdfonly is None
-        else str(int(bool(gemm_n256_nt_supertile_pdfonly))),
-    ))
-    gemm_n256_nt_supertile_pdfonly = int(bool(
-        gemm_n256_nt_supertile and pdf_producer and gemm_n256_nt_supertile_pdfonly
-    ))
-    gemm_n256_nt_supertile_postinit_nosync = int(os.environ.get(
-        "MK_GEMM_N256_NT_SUPERTILE_POSTINIT_NOSYNC",
-        "0" if gemm_n256_nt_supertile_postinit_nosync is None
-        else str(int(bool(gemm_n256_nt_supertile_postinit_nosync))),
-    ))
-    gemm_n256_nt_supertile_postinit_nosync = int(bool(
-        gemm_n256_nt_supertile_pdfonly
-        and gemm_n256_nt_supertile_reg_epi
-        and gemm_n256_nt_supertile_postinit_nosync
-    ))
-    gemm_n256_nt_supertile_topembed_env = os.environ.get(
-        "MK_GEMM_N256_NT_SUPERTILE_TOPEMBED"
-    )
-    if gemm_n256_nt_supertile_topembed is None:
-        gemm_n256_nt_supertile_topembed = int(
-            gemm_n256_nt_supertile_topembed_env or "0"
+        os.environ.get(
+            "MK_GEMM_N256_NT_SUPERTILE_REG_EPI",
+            "0" if gemm_n256_nt_supertile_reg_epi is None else str(int(bool(gemm_n256_nt_supertile_reg_epi))),
         )
+    )
+    gemm_n256_nt_supertile_reg_epi = int(bool(gemm_n256_nt_supertile and gemm_n256_nt_supertile_reg_epi))
+    gemm_n256_nt_supertile_pdfonly = int(
+        os.environ.get(
+            "MK_GEMM_N256_NT_SUPERTILE_PDFONLY",
+            "0" if gemm_n256_nt_supertile_pdfonly is None else str(int(bool(gemm_n256_nt_supertile_pdfonly))),
+        )
+    )
+    gemm_n256_nt_supertile_pdfonly = int(
+        bool(gemm_n256_nt_supertile and pdf_producer and gemm_n256_nt_supertile_pdfonly)
+    )
+    gemm_n256_nt_supertile_postinit_nosync = int(
+        os.environ.get(
+            "MK_GEMM_N256_NT_SUPERTILE_POSTINIT_NOSYNC",
+            "0"
+            if gemm_n256_nt_supertile_postinit_nosync is None
+            else str(int(bool(gemm_n256_nt_supertile_postinit_nosync))),
+        )
+    )
+    gemm_n256_nt_supertile_postinit_nosync = int(
+        bool(
+            gemm_n256_nt_supertile_pdfonly and gemm_n256_nt_supertile_reg_epi and gemm_n256_nt_supertile_postinit_nosync
+        )
+    )
+    gemm_n256_nt_supertile_topembed_env = os.environ.get("MK_GEMM_N256_NT_SUPERTILE_TOPEMBED")
+    if gemm_n256_nt_supertile_topembed is None:
+        gemm_n256_nt_supertile_topembed = int(gemm_n256_nt_supertile_topembed_env or "0")
     else:
         gemm_n256_nt_supertile_topembed = int(bool(gemm_n256_nt_supertile_topembed))
-    gemm_n256_nt_supertile_topembed = int(bool(
-        gemm_n256_nt_supertile_pdfonly
-        and gemm_n256_nt_supertile_reg_epi
-        and gemm_n256_nt_supertile_topembed
-    ))
-    gemm_n256_nt_supertile_pruned_env = os.environ.get(
-        "MK_GEMM_N256_NT_SUPERTILE_PRUNED"
+    gemm_n256_nt_supertile_topembed = int(
+        bool(gemm_n256_nt_supertile_pdfonly and gemm_n256_nt_supertile_reg_epi and gemm_n256_nt_supertile_topembed)
     )
+    gemm_n256_nt_supertile_pruned_env = os.environ.get("MK_GEMM_N256_NT_SUPERTILE_PRUNED")
     if gemm_n256_nt_supertile_pruned is None:
-        gemm_n256_nt_supertile_pruned = int(
-            gemm_n256_nt_supertile_pruned_env or "0"
-        )
+        gemm_n256_nt_supertile_pruned = int(gemm_n256_nt_supertile_pruned_env or "0")
     else:
         gemm_n256_nt_supertile_pruned = int(bool(gemm_n256_nt_supertile_pruned))
     if gemm_n256_nt_supertile_pruned:
-        gemm_n256_nt_supertile_topembed = int(bool(
-            gemm_n256_nt_supertile_pdfonly
-            and gemm_n256_nt_supertile_reg_epi
-        ))
-    gemm_n256_nt_supertile_pruned = int(bool(
-        gemm_n256_nt_supertile_topembed and gemm_n256_nt_supertile_pruned
-    ))
-    gemm_n256_nt_supertile_sidecar_env = os.environ.get(
-        "MK_GEMM_N256_NT_SUPERTILE_SIDECAR"
-    )
-    gemm_n256_nt_supertile_sidecar_boundary_env = os.environ.get(
-        "MK_GEMM_N256_NT_SUPERTILE_SIDECAR_BOUNDARY"
-    )
+        gemm_n256_nt_supertile_topembed = int(bool(gemm_n256_nt_supertile_pdfonly and gemm_n256_nt_supertile_reg_epi))
+    gemm_n256_nt_supertile_pruned = int(bool(gemm_n256_nt_supertile_topembed and gemm_n256_nt_supertile_pruned))
+    gemm_n256_nt_supertile_sidecar_env = os.environ.get("MK_GEMM_N256_NT_SUPERTILE_SIDECAR")
+    gemm_n256_nt_supertile_sidecar_boundary_env = os.environ.get("MK_GEMM_N256_NT_SUPERTILE_SIDECAR_BOUNDARY")
     if gemm_n256_nt_supertile_sidecar is None:
         gemm_n256_nt_supertile_sidecar = int(
-            gemm_n256_nt_supertile_sidecar_env
-            or gemm_n256_nt_supertile_sidecar_boundary_env
-            or "0"
+            gemm_n256_nt_supertile_sidecar_env or gemm_n256_nt_supertile_sidecar_boundary_env or "0"
         )
     else:
         gemm_n256_nt_supertile_sidecar = int(bool(gemm_n256_nt_supertile_sidecar))
-    gemm_n256_nt_supertile_sidecar = int(bool(
-        gemm_n256_nt_supertile_pdfonly
-        and gemm_n256_nt_supertile_reg_epi
-        and gemm_n256_nt_supertile_sidecar
-    ))
+    gemm_n256_nt_supertile_sidecar = int(
+        bool(gemm_n256_nt_supertile_pdfonly and gemm_n256_nt_supertile_reg_epi and gemm_n256_nt_supertile_sidecar)
+    )
     if gemm_n256_nt_supertile_sidecar_boundary is None:
-        gemm_n256_nt_supertile_sidecar_boundary = int(
-            gemm_n256_nt_supertile_sidecar_boundary_env or "0"
-        )
+        gemm_n256_nt_supertile_sidecar_boundary = int(gemm_n256_nt_supertile_sidecar_boundary_env or "0")
     else:
-        gemm_n256_nt_supertile_sidecar_boundary = int(
-            bool(gemm_n256_nt_supertile_sidecar_boundary)
+        gemm_n256_nt_supertile_sidecar_boundary = int(bool(gemm_n256_nt_supertile_sidecar_boundary))
+    gemm_n256_nt_supertile_sidecar_boundary = int(
+        bool(gemm_n256_nt_supertile_sidecar and gemm_n256_nt_supertile_sidecar_boundary)
+    )
+    gemm_n256_head_dx_exact = int(
+        os.environ.get(
+            "MK_GEMM_N256_HEAD_DX_EXACT",
+            "0" if gemm_n256_head_dx_exact is None else str(int(bool(gemm_n256_head_dx_exact))),
         )
-    gemm_n256_nt_supertile_sidecar_boundary = int(bool(
-        gemm_n256_nt_supertile_sidecar
-        and gemm_n256_nt_supertile_sidecar_boundary
-    ))
-    gemm_n256_head_dx_exact = int(os.environ.get(
-        "MK_GEMM_N256_HEAD_DX_EXACT",
-        "0" if gemm_n256_head_dx_exact is None
-        else str(int(bool(gemm_n256_head_dx_exact))),
-    ))
-    gemm_n256_head_dx_pdfonly = int(os.environ.get(
-        "MK_GEMM_N256_HEAD_DX_PDFONLY",
-        "0" if gemm_n256_head_dx_pdfonly is None
-        else str(int(bool(gemm_n256_head_dx_pdfonly))),
-    ))
-    gemm_n256_head_dx_pdfonly = int(bool(
-        gemm_n256_head_dx_exact and pdf_producer and gemm_n256_head_dx_pdfonly
-    ))
-    qwen_head_dx_rmsdot_partials = int(os.environ.get(
-        "MK_QWEN_HEADDX_RMS_DOT_PARTIALS",
-        "0" if qwen_head_dx_rmsdot_partials is None
-        else str(int(bool(qwen_head_dx_rmsdot_partials))),
-    ))
-    qwen_head_dx_rmsdot_partials = int(bool(
-        qwen_head_dx_rmsdot_partials
-        and gemm_n256_head_dx_exact
-        and gemm_n256_head_dx_pdfonly
-        and rms_dx_h2560
-    ))
+    )
+    gemm_n256_head_dx_pdfonly = int(
+        os.environ.get(
+            "MK_GEMM_N256_HEAD_DX_PDFONLY",
+            "0" if gemm_n256_head_dx_pdfonly is None else str(int(bool(gemm_n256_head_dx_pdfonly))),
+        )
+    )
+    gemm_n256_head_dx_pdfonly = int(bool(gemm_n256_head_dx_exact and pdf_producer and gemm_n256_head_dx_pdfonly))
+    qwen_head_dx_rmsdot_partials = int(
+        os.environ.get(
+            "MK_QWEN_HEADDX_RMS_DOT_PARTIALS",
+            "0" if qwen_head_dx_rmsdot_partials is None else str(int(bool(qwen_head_dx_rmsdot_partials))),
+        )
+    )
+    qwen_head_dx_rmsdot_partials = int(
+        bool(qwen_head_dx_rmsdot_partials and gemm_n256_head_dx_exact and gemm_n256_head_dx_pdfonly and rms_dx_h2560)
+    )
     # D64 ring TMA feed for the m64n64/m64n128 mbarrier-ring bodies. Requires
     # the ring; the per-instruction gate is the tmap args injected by
     # Program._inject_gemm_tmaps (this only compiles the device path).
@@ -1012,7 +968,9 @@ def load_ext(
     else:
         gemm_n64_fast_dispatch = int(bool(gemm_n64_fast_dispatch))
     ext = load(
-        name="xorl_megakernel" + ("_occ2" if occ2 else "") + ("_wsrc" if regcopy else "")
+        name="xorl_megakernel"
+        + ("_occ2" if occ2 else "")
+        + ("_wsrc" if regcopy else "")
         + ("_apipe" if attnpipe else "")
         + (
             "_afexp" + ("e" if attn_fwd_expfold else "") + ("r" if attn_fwd_defer_rsum else "")
@@ -1031,7 +989,8 @@ def load_ext(
         + ("_adqbr" if attn_dq_bulk_red else "")
         + (f"s{attn_dq_bulk_red_salt}" if attn_dq_bulk_red and attn_dq_bulk_red_salt else "")
         + ("_drowst" if drow_direct_store else "")
-        + ("_aflog" if attn_fast_log else "") + ("_aex2" if attn_exp2_approx else "")
+        + ("_aflog" if attn_fast_log else "")
+        + ("_aex2" if attn_exp2_approx else "")
         + ("pb" if attn_exp2_prebias else "")
         + ("_acur" if attn_combine_unroll else "")
         + ("_lex2" if lmhead_exp2_approx else "")
@@ -1046,15 +1005,15 @@ def load_ext(
         + ("_qkbc" if qkbc else "")
         + ("_qkbc128" if qkbc128 else "")
         + ("_qkv8" if qkbwd_vec8 else "")
-        + ("_swfma" if swiglu_fma_deriv else "") + ("_swb2w" if swiglu_bwd_2w else "")
+        + ("_swfma" if swiglu_fma_deriv else "")
+        + ("_swb2w" if swiglu_bwd_2w else "")
         + ("_swb4w" if swiglu_bwd_4w else "")
         + ("_swcsig" if swiglu_cache_sig else "")
         + ("_gmbar" if gemm_mbar_ring else "")
         + ("_n256ntold" if gemm_mbar_ring and not gemm_n256_nt_mbar else "")
         + ("_gtma" if gemm_n256_tma else "")
         + ("_nttma" if gemm_n256_nt_tma else "")
-        + ("_ntstpdf" if gemm_n256_nt_supertile_pdfonly
-           else "_ntst" if gemm_n256_nt_supertile else "")
+        + ("_ntstpdf" if gemm_n256_nt_supertile_pdfonly else "_ntst" if gemm_n256_nt_supertile else "")
         + ("reg" if gemm_n256_nt_supertile_reg_epi else "")
         + ("_ntstnosync" if gemm_n256_nt_supertile_postinit_nosync else "")
         + ("_nttop" if gemm_n256_nt_supertile_topembed else "")
@@ -1105,8 +1064,7 @@ def load_ext(
         + (["-DMK_ATTN_DQ_FP32_P"] if attn_dq_fp32_p else [])
         + (["-DMK_ATTN_DQ_RS_FEED"] if attn_dq_rs_feed else [])
         + (["-DMK_ATTN_DQ_BULK_RED"] if attn_dq_bulk_red else [])
-        + ([f"-DMK_ADQBR_SALT={attn_dq_bulk_red_salt}"]
-           if attn_dq_bulk_red and attn_dq_bulk_red_salt else [])
+        + ([f"-DMK_ADQBR_SALT={attn_dq_bulk_red_salt}"] if attn_dq_bulk_red and attn_dq_bulk_red_salt else [])
         + (["-DMK_DROW_DIRECT_STORE"] if drow_direct_store else [])
         + (["-DMK_ATTN_FAST_LOG"] if attn_fast_log else [])
         + (["-DMK_ATTN_EXP2_APPROX"] if attn_exp2_approx else [])
@@ -1133,24 +1091,16 @@ def load_ext(
         + (["-DMK_GEMM_N256_TMA"] if gemm_n256_tma else [])
         + (["-DMK_GEMM_N256_NT_TMA"] if gemm_n256_nt_tma else [])
         + (["-DMK_GEMM_N256_NT_SUPERTILE"] if gemm_n256_nt_supertile else [])
-        + (["-DMK_GEMM_N256_NT_SUPERTILE_REG_EPI"]
-           if gemm_n256_nt_supertile_reg_epi else [])
-        + (["-DMK_GEMM_N256_NT_SUPERTILE_PDFONLY"]
-           if gemm_n256_nt_supertile_pdfonly else [])
-        + (["-DMK_GEMM_N256_NT_SUPERTILE_POSTINIT_NOSYNC"]
-           if gemm_n256_nt_supertile_postinit_nosync else [])
-        + (["-DMK_GEMM_N256_NT_SUPERTILE_TOPEMBED"]
-           if gemm_n256_nt_supertile_topembed else [])
-        + (["-DMK_GEMM_N256_NT_SUPERTILE_PRUNED"]
-           if gemm_n256_nt_supertile_pruned else [])
-        + (["-DMK_GEMM_N256_NT_SUPERTILE_SIDECAR"]
-           if gemm_n256_nt_supertile_sidecar else [])
-        + (["-DMK_GEMM_N256_NT_SUPERTILE_SIDECAR_BOUNDARY"]
-           if gemm_n256_nt_supertile_sidecar_boundary else [])
+        + (["-DMK_GEMM_N256_NT_SUPERTILE_REG_EPI"] if gemm_n256_nt_supertile_reg_epi else [])
+        + (["-DMK_GEMM_N256_NT_SUPERTILE_PDFONLY"] if gemm_n256_nt_supertile_pdfonly else [])
+        + (["-DMK_GEMM_N256_NT_SUPERTILE_POSTINIT_NOSYNC"] if gemm_n256_nt_supertile_postinit_nosync else [])
+        + (["-DMK_GEMM_N256_NT_SUPERTILE_TOPEMBED"] if gemm_n256_nt_supertile_topembed else [])
+        + (["-DMK_GEMM_N256_NT_SUPERTILE_PRUNED"] if gemm_n256_nt_supertile_pruned else [])
+        + (["-DMK_GEMM_N256_NT_SUPERTILE_SIDECAR"] if gemm_n256_nt_supertile_sidecar else [])
+        + (["-DMK_GEMM_N256_NT_SUPERTILE_SIDECAR_BOUNDARY"] if gemm_n256_nt_supertile_sidecar_boundary else [])
         + (["-DMK_GEMM_N256_HEAD_DX_EXACT"] if gemm_n256_head_dx_exact else [])
         + (["-DMK_GEMM_N256_HEAD_DX_PDFONLY"] if gemm_n256_head_dx_pdfonly else [])
-        + (["-DMK_QWEN_HEADDX_RMS_DOT_PARTIALS"]
-           if qwen_head_dx_rmsdot_partials else [])
+        + (["-DMK_QWEN_HEADDX_RMS_DOT_PARTIALS"] if qwen_head_dx_rmsdot_partials else [])
         + (["-DMK_GEMM_D64_TMA"] if gemm_d64_tma else [])
         + (["-DMK_GEMM_DX_TMA_RED"] if gemm_dx_tma_red else [])
         + (["-DMK_DW_TN_TMA_RED"] if dw_tn_tma_red else [])
@@ -1186,9 +1136,7 @@ def _audit_bulkred_sass(so_path):
     import re
     import subprocess
 
-    out = subprocess.run(
-        ["cuobjdump", "-sass", so_path], capture_output=True, text=True, check=True
-    ).stdout
+    out = subprocess.run(["cuobjdump", "-sass", so_path], capture_output=True, text=True, check=True).stdout
     fn, per = None, {}
     for line in out.splitlines():
         m = re.search(r"Function : (\S+)", line)
@@ -1272,8 +1220,7 @@ def _access_sets(op, args):
         return r, [2, 3]
     if op == OP_RMSNORM_BWD:
         return [0, 1, 2, 5], [3, 4]
-    if op in (OP_RMSNORM_BWD_DX, OP_RMSNORM_BWD_DX_R4, OP_RMSNORM_BWD_DX_FMA,
-              OP_RMSNORM_BWD_DX_H256):
+    if op in (OP_RMSNORM_BWD_DX, OP_RMSNORM_BWD_DX_R4, OP_RMSNORM_BWD_DX_FMA, OP_RMSNORM_BWD_DX_H256):
         r = [0, 1, 2, 5]
         if op == OP_RMSNORM_BWD_DX and len(args) > 10 and args[10]:
             r.append(9)
@@ -1334,26 +1281,16 @@ def _slots_conflict(a, b):
         return True
     if a == b:
         return True
-    if (
-        isinstance(a, str)
-        and a.endswith("*")
-        and isinstance(b, str)
-        and b.startswith(a[:-1])
-    ):
+    if isinstance(a, str) and a.endswith("*") and isinstance(b, str) and b.startswith(a[:-1]):
         return True
-    if (
-        isinstance(b, str)
-        and b.endswith("*")
-        and isinstance(a, str)
-        and a.startswith(b[:-1])
-    ):
+    if isinstance(b, str) and b.endswith("*") and isinstance(a, str) and a.startswith(b[:-1]):
         return True
     return False
 
 
 REGION_ROWS = 128  # producer progress granularity for df2 region watermarks
 
-ROWOP_R = 8    # swiglu/qknorm rows per tile (ops.cuh MK_ROW_R)
+ROWOP_R = 8  # swiglu/qknorm rows per tile (ops.cuh MK_ROW_R)
 ROWOP_R2 = 16  # rmsnorm rows per tile, 2 rows/warp interleaved (ops.cuh MK_ROW_R2)
 ROWOP_R4 = 32  # dx-only RMSNorm long-S fold, 4 rows/warp interleaved
 SWIGLU_BWD_2W_R = 4  # two warps per row, four rows per 8-warp block
@@ -1382,6 +1319,7 @@ _ROW_TILE_R = {
 
 def rowop_tiles(S, R=ROWOP_R):
     return (S + R - 1) // R
+
 
 # write positions whose output is row-linear in the instr's m-major tile order
 # (tile t covers rows [t*rows_per_tile, ...) — the requirement for region gating)
@@ -1577,15 +1515,7 @@ class Program:
 
     @staticmethod
     def _is_qwen_nt_sidecar_lmhead_row(op, ntiles, args):
-        required = (
-            2
-            | 128
-            | 2048
-            | 16384
-            | GEMM_N256_STAGE3_FLAG
-            | GEMM_N256_NMAJOR_FLAG
-            | GEMM_N256_NT_SUPERTILE_FLAG
-        )
+        required = 2 | 128 | 2048 | 16384 | GEMM_N256_STAGE3_FLAG | GEMM_N256_NMAJOR_FLAG | GEMM_N256_NT_SUPERTILE_FLAG
         forbidden = 1 | 4 | 8 | 32
         if op not in (OP_GEMM, OP_QWEN_NT_SIDECAR_BOUNDARY) or len(args) < 11:
             return False
@@ -1611,25 +1541,24 @@ class Program:
                         ntiles,
                         list(args),
                     )
-                    rows.append({
-                        "instr_index": int(flat_idx),
-                        "op": OP_QWEN_NT_SIDECAR_BOUNDARY,
-                        "replaces_op": OP_GEMM,
-                        "symbol": "qwen_nt_lmhead_sidecar",
-                        "ntiles": int(ntiles),
-                        "shape": {
-                            "M": int(args[3]),
-                            "N": int(args[4]),
-                            "K": int(args[5]),
-                        },
-                        "flags": int(args[6]),
-                    })
+                    rows.append(
+                        {
+                            "instr_index": int(flat_idx),
+                            "op": OP_QWEN_NT_SIDECAR_BOUNDARY,
+                            "replaces_op": OP_GEMM,
+                            "symbol": "qwen_nt_lmhead_sidecar",
+                            "ntiles": int(ntiles),
+                            "shape": {
+                                "M": int(args[3]),
+                                "N": int(args[4]),
+                                "K": int(args[5]),
+                            },
+                            "flags": int(args[6]),
+                        }
+                    )
                 flat_idx += 1
         if len(rows) != 1:
-            raise RuntimeError(
-                "expected exactly one qwen NT sidecar boundary row, "
-                f"found {len(rows)}"
-            )
+            raise RuntimeError(f"expected exactly one qwen NT sidecar boundary row, found {len(rows)}")
         self.qwen_nt_sidecar_boundary_rows = rows
 
     def _build_qwen_nt_sidecar_cutpoints(self, flat, deps, dependents):
@@ -1642,59 +1571,52 @@ class Program:
             r_pos, w_pos = _access_sets(op, args)
             direct = sorted(dependents[idx])
             ce_fwd = [
-                j for j in direct
+                j
+                for j in direct
                 if flat[j][0] == OP_CE_FWD
                 and flat[j][2][0] == args[2]
                 and len(flat[j][2]) > 6
                 and flat[j][2][6] == args[9]
             ]
-            ce_bwd = [
-                j for j in direct
-                if flat[j][0] == OP_CE_BWD and flat[j][2][0] == args[2]
-            ]
+            ce_bwd = [j for j in direct if flat[j][0] == OP_CE_BWD and flat[j][2][0] == args[2]]
             if not ce_fwd or not ce_bwd:
                 continue
-            cutpoints.append({
-                "kind": "qwen_nt_lmhead",
-                "symbol": "qwen_nt_lmhead_sidecar",
-                "instr_index": idx,
-                "op": int(op),
-                "original_op": OP_GEMM,
-                "boundary_op": (
-                    OP_QWEN_NT_SIDECAR_BOUNDARY
-                    if op == OP_QWEN_NT_SIDECAR_BOUNDARY
-                    else None
-                ),
-                "ntiles": int(ntiles),
-                "tile_start": 0,
-                "tile_stop": int(ntiles),
-                "shape": {"M": int(args[3]), "N": int(args[4]), "K": int(args[5])},
-                "flags": flags,
-                "args": [int(x) for x in args],
-                "read_arg_positions": list(r_pos),
-                "write_arg_positions": list(w_pos),
-                "input_bufs": {"xnf": int(args[0]), "wlm": int(args[1])},
-                "output_bufs": {"logits": int(args[2]), "lse_parts": int(args[9])},
-                "producer_deps": sorted(int(x) for x in deps[idx]),
-                "producer_dep_ops": [int(flat[j][0]) for j in sorted(deps[idx])],
-                "direct_dependents": direct,
-                "direct_dependent_ops": [int(flat[j][0]) for j in direct],
-                "ce_fwd_dependents": ce_fwd,
-                "ce_bwd_dependents": ce_bwd,
-                "sidecar_launch": {
-                    "instrs": "Program._instrs",
-                    "ins": idx,
-                    "t0": 0,
-                    "t1": int(ntiles),
-                    "bufs": "Program._buftab",
-                    "threads": 384,
-                },
-            })
-        if len(cutpoints) != 1:
-            raise RuntimeError(
-                "expected exactly one qwen NT lm-head sidecar cutpoint, "
-                f"found {len(cutpoints)}"
+            cutpoints.append(
+                {
+                    "kind": "qwen_nt_lmhead",
+                    "symbol": "qwen_nt_lmhead_sidecar",
+                    "instr_index": idx,
+                    "op": int(op),
+                    "original_op": OP_GEMM,
+                    "boundary_op": (OP_QWEN_NT_SIDECAR_BOUNDARY if op == OP_QWEN_NT_SIDECAR_BOUNDARY else None),
+                    "ntiles": int(ntiles),
+                    "tile_start": 0,
+                    "tile_stop": int(ntiles),
+                    "shape": {"M": int(args[3]), "N": int(args[4]), "K": int(args[5])},
+                    "flags": flags,
+                    "args": [int(x) for x in args],
+                    "read_arg_positions": list(r_pos),
+                    "write_arg_positions": list(w_pos),
+                    "input_bufs": {"xnf": int(args[0]), "wlm": int(args[1])},
+                    "output_bufs": {"logits": int(args[2]), "lse_parts": int(args[9])},
+                    "producer_deps": sorted(int(x) for x in deps[idx]),
+                    "producer_dep_ops": [int(flat[j][0]) for j in sorted(deps[idx])],
+                    "direct_dependents": direct,
+                    "direct_dependent_ops": [int(flat[j][0]) for j in direct],
+                    "ce_fwd_dependents": ce_fwd,
+                    "ce_bwd_dependents": ce_bwd,
+                    "sidecar_launch": {
+                        "instrs": "Program._instrs",
+                        "ins": idx,
+                        "t0": 0,
+                        "t1": int(ntiles),
+                        "bufs": "Program._buftab",
+                        "threads": 384,
+                    },
+                }
             )
+        if len(cutpoints) != 1:
+            raise RuntimeError(f"expected exactly one qwen NT lm-head sidecar cutpoint, found {len(cutpoints)}")
         return cutpoints
 
     @staticmethod
@@ -1714,21 +1636,15 @@ class Program:
     def _build_qwen_nt_sidecar_split_plan(self, flat, deps, dependents):
         """Static split/rejoin protocol derived from the qwen NT cutpoint DAG."""
         if len(self.qwen_nt_sidecar_cutpoints) != 1:
-            raise RuntimeError(
-                "expected exactly one qwen NT sidecar cutpoint before split plan"
-            )
+            raise RuntimeError("expected exactly one qwen NT sidecar cutpoint before split plan")
         cutpoint = self.qwen_nt_sidecar_cutpoints[0]
         idx = int(cutpoint["instr_index"])
         producer_deps = sorted(int(x) for x in deps[idx])
         direct = sorted(int(x) for x in dependents[idx])
         pre_closure = self._transitive_closure(producer_deps, deps)
-        independent_before = [
-            int(i) for i in range(idx) if i not in pre_closure
-        ]
+        independent_before = [int(i) for i in range(idx) if i not in pre_closure]
         post_closure = self._transitive_closure(direct, dependents)
-        independent_after = [
-            int(i) for i in range(idx + 1, len(flat)) if i not in post_closure
-        ]
+        independent_after = [int(i) for i in range(idx + 1, len(flat)) if i not in post_closure]
         violations = []
         if any(i >= idx for i in pre_closure):
             violations.append("pre-sidecar dependency closure reaches the cutpoint")
@@ -1760,9 +1676,7 @@ class Program:
             "cutpoint_op": int(cutpoint["op"]),
             "cutpoint_original_op": int(cutpoint["original_op"]),
             "cutpoint_boundary_op": cutpoint["boundary_op"],
-            "main_row_replaced_by_boundary": (
-                cutpoint["boundary_op"] == OP_QWEN_NT_SIDECAR_BOUNDARY
-            ),
+            "main_row_replaced_by_boundary": (cutpoint["boundary_op"] == OP_QWEN_NT_SIDECAR_BOUNDARY),
             "pre_sidecar_required_closure": pre_closure,
             "pre_sidecar_independent_before_cutpoint": independent_before,
             "pre_sidecar_instruction_window": [0, idx],
@@ -1775,9 +1689,7 @@ class Program:
             },
             "direct_rejoin_dependents": direct,
             "direct_rejoin_ops": [int(flat[i][0]) for i in direct],
-            "direct_rejoin_original_deps": {
-                str(i): sorted(int(x) for x in deps[i]) for i in direct
-            },
+            "direct_rejoin_original_deps": {str(i): sorted(int(x) for x in deps[i]) for i in direct},
             "external_edges": [
                 {
                     "producer": cutpoint["symbol"],
@@ -1924,9 +1836,7 @@ class Program:
             key = (ptr, inner, outer, stride_bytes, box_inner, box_outer)
             if key not in row_ids:
                 row_ids[key] = len(rows)
-                rows.append(
-                    ext.encode_tmap_2d(ptr, inner, outer, stride_bytes, box_inner,
-                                       box_outer))
+                rows.append(ext.encode_tmap_2d(ptr, inner, outer, stride_bytes, box_inner, box_outer))
             return row_ids[key]
 
         for wave in self.waves:
@@ -1934,13 +1844,13 @@ class Program:
                 if op != OP_GEMM or len(args) <= 6:
                     continue
                 flags = args[6]
-                is_n256 = (self.gemm_n256_tma_enabled and n256_ext is not None
-                            and gemm_n256_tma_eligible(
-                                args, self.gemm_n256_tma_tn_default))
-                is_n256_nt = (self.gemm_n256_nt_tma_enabled and n256_ext is not None
-                               and gemm_n256_nt_tma_eligible(args))
-                is_d64 = (not (is_n256 or is_n256_nt) and d64_ext is not None
-                          and gemm_d64_tma_eligible(args))
+                is_n256 = (
+                    self.gemm_n256_tma_enabled
+                    and n256_ext is not None
+                    and gemm_n256_tma_eligible(args, self.gemm_n256_tma_tn_default)
+                )
+                is_n256_nt = self.gemm_n256_nt_tma_enabled and n256_ext is not None and gemm_n256_nt_tma_eligible(args)
+                is_d64 = not (is_n256 or is_n256_nt) and d64_ext is not None and gemm_d64_tma_eligible(args)
                 # n256-direct NT EVICT_FIRST TMA C store (DeepGEMM R3 port):
                 # epilogue-only, orthogonal to the feed gates above. bit14+bit2
                 # routes op_gemm_wgmma_n256_direct; the box is {64n,128m} SW128,
@@ -1948,9 +1858,13 @@ class Program:
                 # (valid_cols<256) fall back to direct stores on device.
                 is_cstore = (
                     cstore_ext is not None
-                    and (flags & 16384) and (flags & 2) and (flags & 128)
-                    and not (flags & 4) and not (flags & 8)
-                    and args[3] % 128 == 0 and args[4] % 8 == 0
+                    and (flags & 16384)
+                    and (flags & 2)
+                    and (flags & 128)
+                    and not (flags & 4)
+                    and not (flags & 8)
+                    and args[3] % 128 == 0
+                    and args[4] % 8 == 0
                     and self.bufs[args[2]].dtype == torch.bfloat16
                 )
                 if not (is_n256 or is_n256_nt or is_d64 or is_cstore):
@@ -1968,7 +1882,7 @@ class Program:
                     continue
                 if is_n256_nt:
                     ra = tmap_row(ta.data_ptr(), K, M, K * 2, 64, 128)  # A[M,K]
-                    rb = tmap_row(tb.data_ptr(), K, N, K * 2, 64, 64)   # B[N,K]
+                    rb = tmap_row(tb.data_ptr(), K, N, K * 2, 64, 64)  # B[N,K]
                 elif is_n256:
                     if flags & 1:  # TN: A[K,M] M-contig, two {64m,64k} boxes
                         ra = tmap_row(ta.data_ptr(), M, K, M * 2, 64, 64)
@@ -2064,22 +1978,30 @@ class Program:
         # lose the tail balance (the Stream-K physics, again). Default 1 = no-op;
         # MK_ROWOP_CLAIM re-runs the experiment.
         rc = int(os.environ.get("MK_ROWOP_CLAIM", "1"))
-        _rowops = (OP_RMSNORM_FWD, OP_RMSNORM_BWD, OP_RMSNORM_BWD_DX,
-                   OP_RMSNORM_BWD_DX_FMA, OP_RMSNORM_BWD_DX_H256,
-                   OP_RMSNORM_BWD_DW, OP_RMSNORM_BWD_DX_R4,
-                   OP_SWIGLU_FWD, OP_SWIGLU_BWD, OP_SWIGLU_BWD_2W,
-                   OP_SWIGLU_BWD_4W,
-                   OP_QKNORM_ROPE_FWD, OP_QKNORM_ROPE_BWD, OP_QKV_V_BWD)
-        claim = [max(c, rc) if op in _rowops else c
-                 for c, (op, ntiles, _) in zip(claim, flat)]
+        _rowops = (
+            OP_RMSNORM_FWD,
+            OP_RMSNORM_BWD,
+            OP_RMSNORM_BWD_DX,
+            OP_RMSNORM_BWD_DX_FMA,
+            OP_RMSNORM_BWD_DX_H256,
+            OP_RMSNORM_BWD_DW,
+            OP_RMSNORM_BWD_DX_R4,
+            OP_SWIGLU_FWD,
+            OP_SWIGLU_BWD,
+            OP_SWIGLU_BWD_2W,
+            OP_SWIGLU_BWD_4W,
+            OP_QKNORM_ROPE_FWD,
+            OP_QKNORM_ROPE_BWD,
+            OP_QKV_V_BWD,
+        )
+        claim = [max(c, rc) if op in _rowops else c for c, (op, ntiles, _) in zip(claim, flat)]
         # Unbanded causal D=128 WGMMA attention tiles are triangle-imbalanced:
         # claim batching runs the longest tiles serially on one block. Rechecked
         # after the qwen sparse-embed/default stack, claim1 won both construction
         # orders; MK_ATTN_D128_CLAIM1=0 restores the old ntiles/132 batching.
         if int(os.environ.get("MK_ATTN_D128_CLAIM1", "1")):
             _d128_attn = (OP_ATTN_FWD_WG128, OP_ATTN_DKV_WG128, OP_ATTN_DQ_WG128)
-            claim = [1 if op in _d128_attn else c
-                     for c, (op, ntiles, _) in zip(claim, flat)]
+            claim = [1 if op in _d128_attn else c for c, (op, ntiles, _) in zip(claim, flat)]
         self.n_instr = n
         self._dep_cnt = torch.tensor(dep_cnt, dtype=torch.int32, device=device)
         self._adj_off = torch.tensor(adj_off, dtype=torch.int32, device=device)
@@ -2090,28 +2012,16 @@ class Program:
         # a fill; HOT (1) otherwise. Idle blocks drain hot first, so chain consumers
         # start within ~a claim batch instead of behind sticky off-path tile claims.
         hot_embed_bwd_env = os.environ.get("MK_HOT_EMBED_BWD")
-        hot_embed_bwd = (
-            self.hot_embed_bwd_default
-            if hot_embed_bwd_env is None
-            else bool(int(hot_embed_bwd_env))
-        )
+        hot_embed_bwd = self.hot_embed_bwd_default if hot_embed_bwd_env is None else bool(int(hot_embed_bwd_env))
         hot_qwen_lm_dw_env = os.environ.get("MK_HOT_QWEN_LM_DW")
-        hot_qwen_lm_dw = (
-            self.hot_qwen_lm_dw_default
-            if hot_qwen_lm_dw_env is None
-            else bool(int(hot_qwen_lm_dw_env))
-        )
+        hot_qwen_lm_dw = self.hot_qwen_lm_dw_default if hot_qwen_lm_dw_env is None else bool(int(hot_qwen_lm_dw_env))
         hot_qwen_wgu_dw_env = os.environ.get("MK_HOT_QWEN_WGU_DW")
         hot_qwen_wgu_dw = (
-            self.hot_qwen_wgu_dw_default
-            if hot_qwen_wgu_dw_env is None
-            else bool(int(hot_qwen_wgu_dw_env))
+            self.hot_qwen_wgu_dw_default if hot_qwen_wgu_dw_env is None else bool(int(hot_qwen_wgu_dw_env))
         )
         hot_qwen_wqkv_dw_env = os.environ.get("MK_HOT_QWEN_WQKV_DW")
         hot_qwen_wqkv_dw = (
-            self.hot_qwen_wqkv_dw_default
-            if hot_qwen_wqkv_dw_env is None
-            else bool(int(hot_qwen_wqkv_dw_env))
+            self.hot_qwen_wqkv_dw_default if hot_qwen_wqkv_dw_env is None else bool(int(hot_qwen_wqkv_dw_env))
         )
 
         def hot_qwen_lm_dw_leaf(i, op, args):
@@ -2120,8 +2030,12 @@ class Program:
             flags = args[6]
             return (
                 adj_off[i + 1] == adj_off[i]
-                and args[3] == 151936 and args[4] == 2560 and args[5] == 1024
-                and (flags & 1) and not (flags & 2) and (flags & 128)
+                and args[3] == 151936
+                and args[4] == 2560
+                and args[5] == 1024
+                and (flags & 1)
+                and not (flags & 2)
+                and (flags & 128)
             )
 
         def hot_qwen_wgu_dw_leaf(i, op, args):
@@ -2130,8 +2044,12 @@ class Program:
             flags = args[6]
             return (
                 adj_off[i + 1] == adj_off[i]
-                and args[3] == 19456 and args[4] == 2560 and args[5] == 1024
-                and (flags & 1) and not (flags & 2) and (flags & 128)
+                and args[3] == 19456
+                and args[4] == 2560
+                and args[5] == 1024
+                and (flags & 1)
+                and not (flags & 2)
+                and (flags & 128)
             )
 
         def hot_qwen_wqkv_dw_leaf(i, op, args):
@@ -2140,18 +2058,24 @@ class Program:
             flags = args[6]
             return (
                 adj_off[i + 1] == adj_off[i]
-                and args[3] == 6144 and args[4] == 2560 and args[5] == 1024
-                and (flags & 1) and not (flags & 2) and (flags & 128)
+                and args[3] == 6144
+                and args[4] == 2560
+                and args[5] == 1024
+                and (flags & 1)
+                and not (flags & 2)
+                and (flags & 128)
             )
 
         crit = [
-            1 if (
+            1
+            if (
                 (hot_embed_bwd and flat[i][0] == OP_EMBED_BWD)
                 or hot_qwen_lm_dw_leaf(i, flat[i][0], flat[i][2])
                 or hot_qwen_wgu_dw_leaf(i, flat[i][0], flat[i][2])
                 or hot_qwen_wqkv_dw_leaf(i, flat[i][0], flat[i][2])
             )
-            else 0 if (adj_off[i + 1] == adj_off[i] or flat[i][0] == OP_FILL_F32)
+            else 0
+            if (adj_off[i + 1] == adj_off[i] or flat[i][0] == OP_FILL_F32)
             else 1
             for i in range(n)
         ]
@@ -2179,9 +2103,7 @@ class Program:
         self.critical_path = self._critical_path(deps, flat)
 
         # df2 arrays: region-watermark gating (dep DAG minus gated edges + gate CSR)
-        deps2, gated_in, band, region_off, region_cnt0, gate_off, gate_cons, gate_k = (
-            self._build_gates(flat, deps)
-        )
+        deps2, gated_in, band, region_off, region_cnt0, gate_off, gate_cons, gate_k = self._build_gates(flat, deps)
         dep_cnt2 = [len(d) for d in deps2]
         dependents2 = [[] for _ in range(n)]
         for i, d in enumerate(deps2):
@@ -2354,8 +2276,7 @@ class Program:
             subprograms = self.qwen_nt_sidecar_pdf_subprograms()
         self._run_pdf_subprogram(ext, subprograms["post"], smem_bytes)
 
-    def run_qwen_nt_lmhead_sidecar(self, ext, smem_bytes, cutpoint=None,
-                                   tile_start=None, tile_stop=None):
+    def run_qwen_nt_lmhead_sidecar(self, ext, smem_bytes, cutpoint=None, tile_start=None, tile_stop=None):
         """Debug-launch the qwen NT lm-head sidecar for a recorded cutpoint range."""
         if cutpoint is None:
             if len(self.qwen_nt_sidecar_cutpoints) != 1:
@@ -2366,10 +2287,7 @@ class Program:
         t0 = int(cutpoint["tile_start"] if tile_start is None else tile_start)
         t1 = int(cutpoint["tile_stop"] if tile_stop is None else tile_stop)
         if not (0 <= t0 < t1 <= int(cutpoint["ntiles"])):
-            raise ValueError(
-                f"invalid qwen NT sidecar tile range [{t0}, {t1}) "
-                f"for {cutpoint['ntiles']} tiles"
-            )
+            raise ValueError(f"invalid qwen NT sidecar tile range [{t0}, {t1}) for {cutpoint['ntiles']} tiles")
         ext.run_qwen_nt_lmhead_sidecar(
             self._instrs,
             int(cutpoint["instr_index"]),

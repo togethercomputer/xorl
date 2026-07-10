@@ -48,10 +48,16 @@ def _coerce_batch(raw_batch: Any, *, sequence_length: int | None) -> dict[str, t
     if isinstance(raw_batch, Mapping):
         if "input_ids" not in raw_batch:
             raise ValueError("QARL calibration mapping batches must include 'input_ids'")
-        batch: dict[str, torch.Tensor] = {"input_ids": _to_long_tensor(raw_batch["input_ids"], sequence_length=sequence_length)}
+        batch: dict[str, torch.Tensor] = {
+            "input_ids": _to_long_tensor(raw_batch["input_ids"], sequence_length=sequence_length)
+        }
         for key in ("attention_mask", "position_ids"):
             if key in raw_batch and raw_batch[key] is not None:
-                value = raw_batch[key].detach().cpu() if isinstance(raw_batch[key], torch.Tensor) else torch.as_tensor(raw_batch[key])
+                value = (
+                    raw_batch[key].detach().cpu()
+                    if isinstance(raw_batch[key], torch.Tensor)
+                    else torch.as_tensor(raw_batch[key])
+                )
                 if value.ndim == 1:
                     value = value.unsqueeze(0)
                 batch[key] = _slice_sequence(value, sequence_length)

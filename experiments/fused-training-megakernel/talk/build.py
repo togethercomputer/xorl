@@ -19,6 +19,7 @@ import re
 import sys
 from pathlib import Path
 
+
 HERE = Path(__file__).resolve().parent
 
 
@@ -27,7 +28,7 @@ def load_sweep(paths):
     for p in paths:
         for line in Path(p).read_text().splitlines():
             if line.startswith("SCORE "):
-                row = json.loads(line[len("SCORE "):])
+                row = json.loads(line[len("SCORE ") :])
                 fresh[row["shape"]] = {
                     "mk": row["megakernel_us"],
                     "base": row["compile_cudagraph_plus_us"],
@@ -67,17 +68,13 @@ def main():
     blob = json.dumps(facts, separators=(",", ":"))
     html_path = HERE / "index.html"
     html = html_path.read_text()
-    pat = re.compile(
-        r'(<script id="mkgap-facts" type="application/json">).*?(</script>)', re.S
-    )
+    pat = re.compile(r'(<script id="mkgap-facts" type="application/json">).*?(</script>)', re.S)
     cur = pat.search(html)
     assert cur, "mkgap-facts blob not found in index.html"
     # never-shrink guard: a rebuild must not silently drop fresh shapes that
     # are already published in index.html (the failure mode when the sweep
     # logs have been cleaned out of /tmp and facts.json lagged behind)
-    cur_blob = re.search(
-        r'<script id="mkgap-facts" type="application/json">(.*?)</script>', html, re.S
-    ).group(1)
+    cur_blob = re.search(r'<script id="mkgap-facts" type="application/json">(.*?)</script>', html, re.S).group(1)
     try:
         published = set(json.loads(cur_blob).get("fresh") or {})
     except json.JSONDecodeError:

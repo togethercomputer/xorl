@@ -79,12 +79,15 @@ def main() -> None:
                 and "_ntscbnd" in name
                 and len(model.qwen_nt_sidecar_boundary_rows) == 1
                 and len(model.qwen_nt_sidecar_cutpoints) == 1
-                and head_rows == [{
-                    "idx": 37,
-                    "op": mk.OP_QWEN_NT_SIDECAR_BOUNDARY,
-                    "ntiles": 4748,
-                    "flags": 234899586,
-                }]
+                and head_rows
+                == [
+                    {
+                        "idx": 37,
+                        "op": mk.OP_QWEN_NT_SIDECAR_BOUNDARY,
+                        "ntiles": 4748,
+                        "flags": 234899586,
+                    }
+                ]
                 and model.qwen_nt_sidecar_split_plan["main_row_replaced_by_boundary"]
             ),
             "name": name,

@@ -52,8 +52,10 @@ def report(name, prog, ext, n):
     ms = time_prog(prog, ext)
     hop_us = ms * 1e3 / (n - 1)
     gap, span = gap_span(prog, ext, n)
-    print(f"{name:16s} {n:4d} links: {ms * 1e3:9.1f} us total  "
-          f"{hop_us:6.2f} us/hop  (median gap {gap:5.2f} + span {span:5.2f})")
+    print(
+        f"{name:16s} {n:4d} links: {ms * 1e3:9.1f} us total  "
+        f"{hop_us:6.2f} us/hop  (median gap {gap:5.2f} + span {span:5.2f})"
+    )
     return hop_us
 
 

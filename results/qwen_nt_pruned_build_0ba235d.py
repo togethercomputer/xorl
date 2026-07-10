@@ -62,7 +62,7 @@ def function_resusage(text: str, needle: str = "megakernel_pdf") -> str:
     lines = text.splitlines()
     for idx, line in enumerate(lines):
         if f"Function {needle}:" in line or f"Function : {needle}" in line:
-            for nxt in lines[idx + 1: idx + 8]:
+            for nxt in lines[idx + 1 : idx + 8]:
                 if "REG:" in nxt:
                     return nxt.strip()
     return ""

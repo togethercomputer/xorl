@@ -137,8 +137,7 @@ def route_summary(model: MKQwen3) -> dict[str, object]:
 def emit(tag: str, cfg: Cfg, updates: dict[str, str | None]) -> dict[str, object]:
     payload = {"tag": tag, **route_summary(build(cfg, updates))}
     print(
-        "QWEN_NT_SIDECAR_CUTPOINT_ROUTE_JSON "
-        + json.dumps(payload, sort_keys=True),
+        "QWEN_NT_SIDECAR_CUTPOINT_ROUTE_JSON " + json.dumps(payload, sort_keys=True),
         flush=True,
     )
     return payload
@@ -208,22 +207,38 @@ def main() -> None:
     l2_cutpoint = emit("l2_cutpoint_forced", CFG_L2, {CUTPOINT_ENV: "1"})
     l1_cutpoint = emit("l1_cutpoint_forced_negative", CFG_L1, {CUTPOINT_ENV: "1"})
     small_cutpoint = emit("small_cutpoint_forced_negative", CFG_SMALL, {CUTPOINT_ENV: "1"})
-    l2_super_off = emit("l2_supertile_off_cutpoint_forced", CFG_L2, {
-        CUTPOINT_ENV: "1",
-        "MK_GEMM_N256_NT_SUPERTILE": "0",
-    })
-    l2_pdfprod_off = emit("l2_pdfprod_off_cutpoint_forced", CFG_L2, {
-        CUTPOINT_ENV: "1",
-        "MK_PDF_PRODUCER": "0",
-    })
-    l2_pdfonly_off = emit("l2_pdfonly_off_cutpoint_forced", CFG_L2, {
-        CUTPOINT_ENV: "1",
-        "MK_GEMM_N256_NT_SUPERTILE_PDFONLY": "0",
-    })
-    l2_reg_off = emit("l2_reg_off_cutpoint_forced", CFG_L2, {
-        CUTPOINT_ENV: "1",
-        "MK_GEMM_N256_NT_SUPERTILE_REG_EPI": "0",
-    })
+    l2_super_off = emit(
+        "l2_supertile_off_cutpoint_forced",
+        CFG_L2,
+        {
+            CUTPOINT_ENV: "1",
+            "MK_GEMM_N256_NT_SUPERTILE": "0",
+        },
+    )
+    l2_pdfprod_off = emit(
+        "l2_pdfprod_off_cutpoint_forced",
+        CFG_L2,
+        {
+            CUTPOINT_ENV: "1",
+            "MK_PDF_PRODUCER": "0",
+        },
+    )
+    l2_pdfonly_off = emit(
+        "l2_pdfonly_off_cutpoint_forced",
+        CFG_L2,
+        {
+            CUTPOINT_ENV: "1",
+            "MK_GEMM_N256_NT_SUPERTILE_PDFONLY": "0",
+        },
+    )
+    l2_reg_off = emit(
+        "l2_reg_off_cutpoint_forced",
+        CFG_L2,
+        {
+            CUTPOINT_ENV: "1",
+            "MK_GEMM_N256_NT_SUPERTILE_REG_EPI": "0",
+        },
+    )
 
     errors: list[str] = []
     invariant_fields = (
@@ -285,8 +300,7 @@ def main() -> None:
         ],
     }
     print(
-        "QWEN_NT_SIDECAR_CUTPOINT_ROUTE_SUMMARY "
-        + json.dumps(summary, sort_keys=True),
+        "QWEN_NT_SIDECAR_CUTPOINT_ROUTE_SUMMARY " + json.dumps(summary, sort_keys=True),
         flush=True,
     )
     if errors:

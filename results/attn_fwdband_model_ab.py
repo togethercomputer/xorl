@@ -26,6 +26,7 @@ def build_model(S, band):
     else:
         os.environ.pop("MK_ATTN_FWD_BAND", None)
     from model import Cfg, MKQwen3
+
     return MKQwen3(Cfg(S=S), seed=0)
 
 
@@ -69,8 +70,7 @@ def main():
         rel = (ga - gb).abs().max().item() / denom
         if rel > worst:
             worst, worst_name = rel, name
-    print(f"PARITY S={S} T={T} loss {l_def:.5f} vs {l_band:.5f} "
-          f"worst_grad_rel {worst:.6f} ({worst_name})", flush=True)
+    print(f"PARITY S={S} T={T} loss {l_def:.5f} vs {l_band:.5f} worst_grad_rel {worst:.6f} ({worst_name})", flush=True)
     assert abs(l_def - l_band) < 5e-3 and worst < 0.03, "band parity failed"
 
     # paired alternating timing
@@ -96,8 +96,11 @@ def main():
         tb.append(b)
         wins += b < a
     md, mb = statistics.median(td), statistics.median(tb)
-    print(f"TIMING S={S} T={T} order={order} default {md:.2f}us banded {mb:.2f}us "
-          f"delta {mb - md:+.2f}us wins {wins}/{reps}", flush=True)
+    print(
+        f"TIMING S={S} T={T} order={order} default {md:.2f}us banded {mb:.2f}us "
+        f"delta {mb - md:+.2f}us wins {wins}/{reps}",
+        flush=True,
+    )
     print("MODEL-AB DONE", flush=True)
 
 

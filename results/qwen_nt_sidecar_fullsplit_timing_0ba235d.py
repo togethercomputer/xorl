@@ -94,9 +94,7 @@ def route_summary(model: MKQwen3) -> dict[str, object]:
         "boundary_row_count": len(getattr(model, "qwen_nt_sidecar_boundary_rows", [])),
         "prefix_n_instr": None if subs is None else int(subs["prefix"]["n_instr"]),
         "post_n_instr": None if subs is None else int(subs["post"]["n_instr"]),
-        "sidecar_tile_range": None
-        if not cutpoints
-        else [0, int(cutpoints[0]["ntiles"])],
+        "sidecar_tile_range": None if not cutpoints else [0, int(cutpoints[0]["ntiles"])],
     }
 
 

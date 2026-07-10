@@ -480,13 +480,17 @@ class FP8Linear(nn.Linear):
             )
             if bias is not None:
                 out = out.redistribute(placements=[Replicate()], async_op=True)
-                bias_dtensor = bias if bias_is_dtensor else DTensor.from_local(
-                    bias,
-                    mesh,
-                    [Replicate()],
-                    run_check=False,
-                    shape=torch.Size([weight.shape[0]]),
-                    stride=(1,),
+                bias_dtensor = (
+                    bias
+                    if bias_is_dtensor
+                    else DTensor.from_local(
+                        bias,
+                        mesh,
+                        [Replicate()],
+                        run_check=False,
+                        shape=torch.Size([weight.shape[0]]),
+                        stride=(1,),
+                    )
                 )
                 out = out + bias_dtensor
             return out

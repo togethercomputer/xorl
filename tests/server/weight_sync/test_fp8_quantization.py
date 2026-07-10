@@ -623,6 +623,8 @@ def test_fp8_quantization_skips_shared_expert_gate_by_default():
     )
 
     assert out == [(name, tensor)]
+
+
 def test_fp8_quantization_includes_qwen_linear_attention_packed_projections():
     names = [
         "model.layers.0.linear_attn.in_proj_qkv.weight",

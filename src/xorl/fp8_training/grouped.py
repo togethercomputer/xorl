@@ -210,7 +210,9 @@ def _batched_block_fp8_quantize_gkn_rowwise(x: Tensor, block_size: int = _FP8_BL
     if not x.is_cuda:
         raise RuntimeError("batched rowwise block-FP8 GKN quantization requires a CUDA tensor")
     if x.dim() != 3 or not x.is_contiguous():
-        raise RuntimeError(f"batched rowwise block-FP8 GKN quantization expects contiguous rank-3 input, got {x.shape=}")
+        raise RuntimeError(
+            f"batched rowwise block-FP8 GKN quantization expects contiguous rank-3 input, got {x.shape=}"
+        )
     num_experts, n, k = x.shape
     y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     scales = torch.empty(
@@ -349,8 +351,7 @@ def _grouped_block_fp8_same_mn_kernel(
 def validate_fp8_grouped_backend(backend: str) -> str:
     if backend not in _FP8_GROUPED_BACKENDS:
         raise ValueError(
-            f"Unsupported FP8 grouped backend: {backend!r}. "
-            f"Expected one of {sorted(_FP8_GROUPED_BACKENDS)}"
+            f"Unsupported FP8 grouped backend: {backend!r}. Expected one of {sorted(_FP8_GROUPED_BACKENDS)}"
         )
     return backend
 
@@ -530,9 +531,7 @@ def fp8_deep_gemm_group_gemm_same_nk(
     per_block_cast_to_fp8 = _DEEP_GEMM_PER_BLOCK_CAST_TO_FP8
     per_token_cast_to_fp8 = _DEEP_GEMM_PER_TOKEN_CAST_TO_FP8
     if (
-        deep_gemm is None
-        or per_block_cast_to_fp8 is None
-        or per_token_cast_to_fp8 is None
+        deep_gemm is None or per_block_cast_to_fp8 is None or per_token_cast_to_fp8 is None
     ):  # pragma: no cover - exercised without optional dependency.
         raise RuntimeError("DeepGEMM FP8 grouped backend requested but deep_gemm is not installed") from (
             _DEEP_GEMM_IMPORT_ERROR

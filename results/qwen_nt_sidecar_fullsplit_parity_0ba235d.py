@@ -16,7 +16,6 @@ ROOT = Path(os.environ.get("MKAB_TREE", Path(__file__).resolve().parents[1]))
 MKDIR = ROOT / "experiments" / "fused-training-megakernel"
 sys.path.insert(0, str(MKDIR))
 
-import mk  # noqa: E402
 from model import Cfg, MKQwen3  # noqa: E402
 
 
@@ -146,12 +145,16 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001
         split_error = repr(exc)
     split_loss = float(split.loss.item()) if split_error is None else None
-    grad_cmp = compare_grads(ref_grads, split) if split_error is None else {
-        "worst_grad_rel": float("inf"),
-        "worst_grad_abs": float("inf"),
-        "worst_grad_name": "",
-        "per_grad": {},
-    }
+    grad_cmp = (
+        compare_grads(ref_grads, split)
+        if split_error is None
+        else {
+            "worst_grad_rel": float("inf"),
+            "worst_grad_abs": float("inf"),
+            "worst_grad_name": "",
+            "per_grad": {},
+        }
+    )
     loss_diff = None if split_loss is None else split_loss - default_loss
     pass_gate = (
         split_error is None

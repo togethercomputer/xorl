@@ -738,7 +738,18 @@ def test_packed_sample_debug_writer_records_teacher_segments(tmp_path):
         "packed_row_source_group_size": 3,
     }
     component_tensor = torch.tensor(
-        [[[10.0, 11.0], [12.0, 13.0], [14.0, 15.0], [20.0, 21.0], [22.0, 23.0], [30.0, 31.0], [32.0, 33.0], [34.0, 35.0]]]
+        [
+            [
+                [10.0, 11.0],
+                [12.0, 13.0],
+                [14.0, 15.0],
+                [20.0, 21.0],
+                [22.0, 23.0],
+                [30.0, 31.0],
+                [32.0, 33.0],
+                [34.0, 35.0],
+            ]
+        ]
     )
     student_component_debug = [
         {"layer": 2, "name": "mlp", "order": 10, "tensor": component_tensor + 100.0},
@@ -747,9 +758,7 @@ def test_packed_sample_debug_writer_records_teacher_segments(tmp_path):
 
     for teacher_id in (0, 1):
         student_hidden_debug = (
-            torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
-            if teacher_id == 0
-            else torch.tensor([[7.0, 8.0]])
+            torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]) if teacher_id == 0 else torch.tensor([[7.0, 8.0]])
         )
         runner._maybe_write_opd_packed_sample_debug(
             {"opd_debug_packed_sample_path": str(debug_path)},
@@ -759,9 +768,7 @@ def test_packed_sample_debug_writer_records_teacher_segments(tmp_path):
                 "opd_kl": 0.25,
                 "opd_weighted_kl": 0.5,
                 "opd_vocab_parallel_group_tokens": 4,
-                "_opd_debug_local_token_kl": torch.tensor([0.1, 0.2, 0.3])
-                if teacher_id == 0
-                else torch.tensor([0.4]),
+                "_opd_debug_local_token_kl": torch.tensor([0.1, 0.2, 0.3]) if teacher_id == 0 else torch.tensor([0.4]),
                 "_opd_debug_local_weighted_token_kl": torch.tensor([1.0, 2.0, 3.0])
                 if teacher_id == 0
                 else torch.tensor([4.0]),

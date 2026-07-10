@@ -1,7 +1,6 @@
 from argparse import Namespace
 
 import pytest
-
 from scripts.materialize_grouped_load import _derive_parallel_sizes
 
 

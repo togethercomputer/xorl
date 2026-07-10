@@ -109,18 +109,18 @@ def main() -> None:
                 finite = torch.isfinite(after)
                 sentinel_mask = after == sentinel
                 finite_delta = torch.abs(after[finite] - sentinel)
-                write_summary.update({
-                    "overwritten_count": int((~sentinel_mask).sum().item()),
-                    "sentinel_count": int(sentinel_mask.sum().item()),
-                    "finite_count": int(finite.sum().item()),
-                    "nan_count": int(torch.isnan(after).sum().item()),
-                    "tile_numel": int(after.numel()),
-                    "max_finite_abs_delta_from_sentinel": (
-                        float(finite_delta.max().item())
-                        if int(finite_delta.numel()) > 0
-                        else 0.0
-                    ),
-                })
+                write_summary.update(
+                    {
+                        "overwritten_count": int((~sentinel_mask).sum().item()),
+                        "sentinel_count": int(sentinel_mask.sum().item()),
+                        "finite_count": int(finite.sum().item()),
+                        "nan_count": int(torch.isnan(after).sum().item()),
+                        "tile_numel": int(after.numel()),
+                        "max_finite_abs_delta_from_sentinel": (
+                            float(finite_delta.max().item()) if int(finite_delta.numel()) > 0 else 0.0
+                        ),
+                    }
+                )
 
         row_summary = {
             "idx": int(cutpoint["instr_index"]),
@@ -140,7 +140,8 @@ def main() -> None:
             "pass": (
                 prefix_error is None
                 and launch_error is None
-                and row_summary == {
+                and row_summary
+                == {
                     "idx": 37,
                     "op": mk.OP_QWEN_NT_SIDECAR_BOUNDARY,
                     "ntiles": 4748,

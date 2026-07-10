@@ -65,7 +65,7 @@ def restore_env(old: dict[str, str | None]) -> None:
 
 
 def build_model(enabled: bool) -> MKQwen3:
-    updates = {key: None for key in UNSET_FOR_COMPARISON}
+    updates = dict.fromkeys(UNSET_FOR_COMPARISON)
     updates[PROBE_ENV] = "1" if enabled else "0"
     old = with_env(updates)
     try:
@@ -82,7 +82,7 @@ def function_resusage(text: str, needle: str) -> str:
     lines = text.splitlines()
     for idx, line in enumerate(lines):
         if f"Function {needle}:" in line or f"Function : {needle}" in line or needle in line:
-            for nxt in lines[idx + 1: idx + 12]:
+            for nxt in lines[idx + 1 : idx + 12]:
                 if "REG:" in nxt:
                     return nxt.strip()
     return ""
@@ -132,29 +132,33 @@ def route_summary(model: MKQwen3, enabled: bool) -> dict[str, Any]:
             and (int(args[6]) & 8)
         ):
             flags = int(args[6])
-            head_rows.append({
-                "idx": idx,
-                "op": int(op),
-                "ntiles": int(ntiles),
-                "flags": flags,
-                "has_rmsdot_flag": bool(flags & mk.GEMM_HEADDX_RMSDOT_FLAG),
-                "arg9_partials": int(args[9]) if len(args) > 9 else 0,
-                "arg10_nparts": int(args[10]) if len(args) > 10 else 0,
-                "arg11_x": int(args[11]) if len(args) > 11 else 0,
-                "arg12_wf": int(args[12]) if len(args) > 12 else 0,
-                "arg20_tmap_table_plus1": int(args[20]) if len(args) > 20 else 0,
-            })
+            head_rows.append(
+                {
+                    "idx": idx,
+                    "op": int(op),
+                    "ntiles": int(ntiles),
+                    "flags": flags,
+                    "has_rmsdot_flag": bool(flags & mk.GEMM_HEADDX_RMSDOT_FLAG),
+                    "arg9_partials": int(args[9]) if len(args) > 9 else 0,
+                    "arg10_nparts": int(args[10]) if len(args) > 10 else 0,
+                    "arg11_x": int(args[11]) if len(args) > 11 else 0,
+                    "arg12_wf": int(args[12]) if len(args) > 12 else 0,
+                    "arg20_tmap_table_plus1": int(args[20]) if len(args) > 20 else 0,
+                }
+            )
         if op == mk.OP_RMSNORM_BWD_DX and len(args) > 8 and int(args[6]) == 2560:
-            rms_dx_rows.append({
-                "idx": idx,
-                "op": int(op),
-                "ntiles": int(ntiles),
-                "dy_f32": int(args[7]),
-                "S": int(args[8]),
-                "has_partials": len(args) > 10 and bool(args[9]),
-                "arg9_partials": int(args[9]) if len(args) > 9 else 0,
-                "arg10_nparts": int(args[10]) if len(args) > 10 else 0,
-            })
+            rms_dx_rows.append(
+                {
+                    "idx": idx,
+                    "op": int(op),
+                    "ntiles": int(ntiles),
+                    "dy_f32": int(args[7]),
+                    "S": int(args[8]),
+                    "has_partials": len(args) > 10 and bool(args[9]),
+                    "arg9_partials": int(args[9]) if len(args) > 9 else 0,
+                    "arg10_nparts": int(args[10]) if len(args) > 10 else 0,
+                }
+            )
     name = Path(model.ext.__file__).name
     return {
         "enabled": enabled,

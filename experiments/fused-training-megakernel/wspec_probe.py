@@ -23,6 +23,7 @@ import os
 import torch
 from torch.utils.cpp_extension import load
 
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 CUTE_INC = "/home/apanda/xorl-internal/.venv/lib/python3.12/site-packages/deep_gemm/include"
 
@@ -36,8 +37,7 @@ def build(verbose=False):
         sources=[os.path.join(HERE, "wspec_probe.cu")],
         # CUDA 13.1: -arch=sm_90a silently emits compute_90 PTX (setmaxnreg then fails
         # to assemble); the explicit -gencode spelling is required.
-        extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a", f"-I{CUTE_INC}",
-                           "--expt-relaxed-constexpr"],
+        extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a", f"-I{CUTE_INC}", "--expt-relaxed-constexpr"],
         verbose=verbose,
     )
     ext.init()
@@ -50,8 +50,7 @@ def make_chain(n, nn, seed=0):
     # near-orthogonal, slightly contractive: 256-deep chain stays O(1), never underflows
     B = (0.995 * q).to(torch.bfloat16).contiguous()  # NT: stored [N,K]; NN: stored [K,N]
     A0 = torch.randn(128, 64, device="cuda", dtype=torch.float32).to(torch.bfloat16)
-    Cs = [torch.full((128, 64), float("nan"), device="cuda", dtype=torch.bfloat16)
-          for _ in range(n)]
+    Cs = [torch.full((128, 64), float("nan"), device="cuda", dtype=torch.bfloat16) for _ in range(n)]
     ptrs = torch.tensor([c.data_ptr() for c in Cs], device="cuda", dtype=torch.int64)
     done = torch.zeros(n * 32, device="cuda", dtype=torch.int32)
     ctrl = torch.zeros(8, device="cuda", dtype=torch.int32)
@@ -114,18 +113,23 @@ def main():
         tag = f"{mode}{'-nn' if args.nn else ''}"
         if args.bringup:
             errs = parity(ext, mode, args.nn, args.bringup, args.nblocks)
-            print(f"[{tag}] bringup n={args.bringup} parity: "
-                  + " ".join(f"C{i}={e:.4f}" for i, e in errs.items()), flush=True)
+            print(
+                f"[{tag}] bringup n={args.bringup} parity: " + " ".join(f"C{i}={e:.4f}" for i, e in errs.items()),
+                flush=True,
+            )
             assert max(errs.values()) < 0.15, f"{tag} bringup parity FAILED"
         errs = parity(ext, mode, args.nn, args.n, args.nblocks)
         emax = max(errs.values())
-        print(f"[{tag}] n={args.n} parity: " + " ".join(f"C{i}={e:.4f}" for i, e in errs.items())
-              + f"  -> {'OK' if emax < 0.15 else 'FAIL'}", flush=True)
+        print(
+            f"[{tag}] n={args.n} parity: "
+            + " ".join(f"C{i}={e:.4f}" for i, e in errs.items())
+            + f"  -> {'OK' if emax < 0.15 else 'FAIL'}",
+            flush=True,
+        )
         assert emax < 0.15, f"{tag} parity gate FAILED ({emax:.4f})"
         if not args.no_timing:
             tot, hop = timeit(ext, mode, args.nn, args.n, args.nblocks, iters=args.iters)
-            print(f"[{tag}] n={args.n} nblocks={args.nblocks}: {tot:9.1f} us total  "
-                  f"{hop:6.3f} us/hop", flush=True)
+            print(f"[{tag}] n={args.n} nblocks={args.nblocks}: {tot:9.1f} us total  {hop:6.3f} us/hop", flush=True)
     print("WSPEC PROBE DONE")
 
 

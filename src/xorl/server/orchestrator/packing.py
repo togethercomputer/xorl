@@ -659,9 +659,7 @@ class SequentialPacker(Packer):
                 # truncate
                 datum = self._truncate_datum(datum, seq_len, max_seq_len, sample_idx)
                 seq_len = max_seq_len
-                logger.warning(
-                    f"Sample {sample_idx} truncated from original length to max_seq_len {max_seq_len}."
-                )
+                logger.warning(f"Sample {sample_idx} truncated from original length to max_seq_len {max_seq_len}.")
 
             measured.append(_MeasuredSample(orig_idx=sample_idx, datum=datum, seq_len=seq_len))
 
@@ -1023,7 +1021,9 @@ class SequentialPacker(Packer):
                 t_in = t_in.tolist()
             t_kept = flattened_datum.get("teacher_kept_indices")
             if t_kept is None:
-                raise ValueError(f"Sample {sample_idx}: teacher_input_ids requires teacher_kept_indices for OPRD packing")
+                raise ValueError(
+                    f"Sample {sample_idx}: teacher_input_ids requires teacher_kept_indices for OPRD packing"
+                )
             if hasattr(t_kept, "tolist"):
                 t_kept = t_kept.tolist()
             cum_teacher = batch.get("_oprd_cum_teacher_len", 0)

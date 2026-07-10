@@ -144,7 +144,9 @@ def _source_token_spans(row: Dict[str, Any], token_offset: int) -> list[list[int
     return spans
 
 
-def packed_row_source_provenance(row: Dict[str, Any], *, fallback_batch_id: int, token_offset: int = 0) -> Dict[str, Any]:
+def packed_row_source_provenance(
+    row: Dict[str, Any], *, fallback_batch_id: int, token_offset: int = 0
+) -> Dict[str, Any]:
     existing_batch_ids = _coerce_source_list(row.get("packed_row_source_batch_ids"))
     source_batch_ids = (
         [_coerce_int(value, fallback_batch_id) for value in existing_batch_ids]

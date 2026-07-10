@@ -631,9 +631,7 @@ def _zorl_fresh_ab_module_delta(eps_a: torch.Tensor, eps_b: torch.Tensor) -> tor
         return eps_b @ eps_a
     if eps_a.ndim == 3 and eps_b.ndim == 3:
         return torch.matmul(eps_a, eps_b)
-    raise ValueError(
-        f"Unsupported fresh_ab LoRA factor ranks: eps_A ndim={eps_a.ndim}, eps_B ndim={eps_b.ndim}"
-    )
+    raise ValueError(f"Unsupported fresh_ab LoRA factor ranks: eps_A ndim={eps_a.ndim}, eps_B ndim={eps_b.ndim}")
 
 
 def build_zorl_fresh_ab_candidate_lora_state_dict(

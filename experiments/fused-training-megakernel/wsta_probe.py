@@ -33,10 +33,10 @@ Run: CUDA_VISIBLE_DEVICES=<idle> .venv-fa4/bin/python wsta_probe.py
 """
 
 import statistics
-import sys
 
 import torch
 from torch.utils.cpp_extension import load_inline
+
 
 CUTE_INC = "/home/apanda/xorl-internal/.venv/lib/python3.12/site-packages/deep_gemm/include"
 
@@ -294,7 +294,7 @@ def main():
         # reference for the last layer
         ref = X0.float()
         for l in range(L):
-            ref = (ref @ Ws[l].float().T)
+            ref = ref @ Ws[l].float().T
             ref = torch.from_numpy(ref.to(torch.bfloat16).float().cpu().numpy()).cuda()  # round like the chain
         results = {}
         for v in (0, 1, 2):
@@ -303,7 +303,7 @@ def main():
             torch.cuda.synchronize()
             err = (Ys[-1].float() - ref.float()).abs().max().item()
             scale = ref.float().abs().max().item() + 1e-3
-            assert err / scale < 3e-2, f"{VAR[v]} mismatch rel={err/scale}"
+            assert err / scale < 3e-2, f"{VAR[v]} mismatch rel={err / scale}"
             times = []
             for _ in range(30):
                 bar.zero_()
@@ -318,7 +318,7 @@ def main():
         base = results[0]
         row = f"{label}  L={L}: "
         for v in (0, 1, 2):
-            row += f"{VAR[v]} {results[v]:7.1f}us ({base/results[v]:4.2f}x)   "
+            row += f"{VAR[v]} {results[v]:7.1f}us ({base / results[v]:4.2f}x)   "
         print(row)
 
 

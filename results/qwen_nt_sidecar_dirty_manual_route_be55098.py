@@ -215,20 +215,28 @@ def main() -> None:
     ]
     by_tag = {row["tag"]: row for row in rows}
     errors: list[str] = []
-    expect_sidecar(by_tag["l1_default"], {
-        "n_instr": 47,
-        "critical_path": 26,
-        "gated": 9,
-        "prefix_n_instr": 22,
-        "post_n_instr": 24,
-    }, errors)
-    expect_sidecar(by_tag["l2_default"], {
-        "n_instr": 78,
-        "critical_path": 44,
-        "gated": 14,
-        "prefix_n_instr": 37,
-        "post_n_instr": 40,
-    }, errors)
+    expect_sidecar(
+        by_tag["l1_default"],
+        {
+            "n_instr": 47,
+            "critical_path": 26,
+            "gated": 9,
+            "prefix_n_instr": 22,
+            "post_n_instr": 24,
+        },
+        errors,
+    )
+    expect_sidecar(
+        by_tag["l2_default"],
+        {
+            "n_instr": 78,
+            "critical_path": 44,
+            "gated": 14,
+            "prefix_n_instr": 37,
+            "post_n_instr": 40,
+        },
+        errors,
+    )
     for tag in (
         "l1_forced_old",
         "l2_forced_old",

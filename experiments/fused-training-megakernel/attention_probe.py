@@ -14,10 +14,10 @@ import os
 import statistics
 import sys
 
+import mk
 import torch
 from torch.utils.cpp_extension import load
 
-import mk
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 CUTE_INC = "/home/apanda/xorl-internal/.venv/lib/python3.12/site-packages/deep_gemm/include"
@@ -45,8 +45,7 @@ def check(name, got, ref, atol, rtol=2e-2):
     got, ref = got.float(), ref.float()
     err = (got - ref).abs().max().item()
     ok = torch.allclose(got, ref, atol=atol, rtol=rtol)
-    print(f"  {name:44s} max_abs_err={err:.3e} (ref_max={ref.abs().max().item():.3e}) "
-          f"{'OK' if ok else 'FAIL'}")
+    print(f"  {name:44s} max_abs_err={err:.3e} (ref_max={ref.abs().max().item():.3e}) {'OK' if ok else 'FAIL'}")
     assert ok, name
     return err
 
@@ -130,8 +129,7 @@ def milestone_b(ext):
         ext.attn_fwd(qkv, O, LSE, S, nq, nkv, scale)
         torch.cuda.synchronize()
         check(f"O   S={S} nq={nq} nkv={nkv}", O, sdpa_ref(qkv, nq, nkv, S), atol=2.5e-2)
-        check(f"LSE S={S} nq={nq} nkv={nkv}", LSE, lse_ref(qkv, nq, nkv, S, scale),
-              atol=1e-3, rtol=1e-4)
+        check(f"LSE S={S} nq={nq} nkv={nkv}", LSE, lse_ref(qkv, nq, nkv, S, scale), atol=1e-3, rtol=1e-4)
 
 
 def time_launch(fn, iters=50, warmup=10):
@@ -170,13 +168,20 @@ def milestone_c(ext, EXT):
         O2 = torch.empty_like(O)
         LSE2 = torch.empty_like(LSE)
         n_qt = S // 32
-        cur = time_launch(current_op_runner(EXT, lambda p: p.instr(
-            mk.OP_ATTN_FWD, nq * n_qt,
-            [p.buf(qkv), p.buf(O2), p.buf(LSE2), S, nq, nkv, D, mk.f2i(scale)])))
+        cur = time_launch(
+            current_op_runner(
+                EXT,
+                lambda p: p.instr(
+                    mk.OP_ATTN_FWD, nq * n_qt, [p.buf(qkv), p.buf(O2), p.buf(LSE2), S, nq, nkv, D, mk.f2i(scale)]
+                ),
+            )
+        )
         # cross-check outputs agree (guards against timing a broken config)
         err = (O.float() - O2.float()).abs().max().item()
-        print(f"  S={S:5d} nq={nq}: probe {mine:7.1f}us  current {cur:7.1f}us  "
-              f"speedup {cur / mine:4.2f}x  (cross-err {err:.2e})")
+        print(
+            f"  S={S:5d} nq={nq}: probe {mine:7.1f}us  current {cur:7.1f}us  "
+            f"speedup {cur / mine:4.2f}x  (cross-err {err:.2e})"
+        )
         results.append((S, nq, mine, cur))
     return results
 
@@ -196,14 +201,12 @@ def milestone_d(ext):
             ws = torch.zeros(S, stride, device=DEV, dtype=torch.float32)
             ext.attn_dkv(qkv, dO, LSE, Drow, ws, S, nq, nkv, scale, C)
             torch.cuda.synchronize()
-            check(f"dK S={S} nq={nq} C={C}", ws[:, nq * D:(nq + nkv) * D],
-                  ref[:, nq * D:(nq + nkv) * D], atol=0.06)
-            check(f"dV S={S} nq={nq} C={C}", ws[:, (nq + nkv) * D:],
-                  ref[:, (nq + nkv) * D:], atol=0.06)
+            check(f"dK S={S} nq={nq} C={C}", ws[:, nq * D : (nq + nkv) * D], ref[:, nq * D : (nq + nkv) * D], atol=0.06)
+            check(f"dV S={S} nq={nq} C={C}", ws[:, (nq + nkv) * D :], ref[:, (nq + nkv) * D :], atol=0.06)
 
             ext.attn_dq(qkv, dO, LSE, Drow, ws, S, nq, nkv, scale, C)
             torch.cuda.synchronize()
-            check(f"dQ S={S} nq={nq} C={C}", ws[:, :nq * D], ref[:, :nq * D], atol=0.06)
+            check(f"dQ S={S} nq={nq} C={C}", ws[:, : nq * D], ref[:, : nq * D], atol=0.06)
 
 
 def milestone_e(ext, EXT):
@@ -219,31 +222,42 @@ def milestone_e(ext, EXT):
 
         dkv_by_c, dq_by_c = {}, {}
         for C in (1, 2, 4):
-            dkv_by_c[C] = time_launch(
-                lambda: ext.attn_dkv(qkv, dO, LSE, Drow, ws, S, nq, nkv, scale, C))
-            dq_by_c[C] = time_launch(
-                lambda: ext.attn_dq(qkv, dO, LSE, Drow, ws, S, nq, nkv, scale, C))
+            dkv_by_c[C] = time_launch(lambda: ext.attn_dkv(qkv, dO, LSE, Drow, ws, S, nq, nkv, scale, C))
+            dq_by_c[C] = time_launch(lambda: ext.attn_dq(qkv, dO, LSE, Drow, ws, S, nq, nkv, scale, C))
         best_ckv = min(dkv_by_c, key=dkv_by_c.get)
         best_cq = min(dq_by_c, key=dq_by_c.get)
         mine_dkv, mine_dq = dkv_by_c[best_ckv], dq_by_c[best_cq]
-        print(f"  S={S:5d} nq={nq}: dKV by C {dkv_by_c} -> C={best_ckv} | "
-              f"dQ by C {dq_by_c} -> C={best_cq}")
+        print(f"  S={S:5d} nq={nq}: dKV by C {dkv_by_c} -> C={best_ckv} | dQ by C {dq_by_c} -> C={best_cq}")
 
         n_qt = S // 32
         G = nq // nkv
         Cq = 4 if n_qt >= 8 else 2  # what model.py uses at these shapes
         ws2 = torch.zeros_like(ws)
-        cur_dkv = time_launch(current_op_runner(EXT, lambda p: p.instr(
-            mk.OP_ATTN_DKV, nkv * n_qt * G,
-            [p.buf(qkv), p.buf(dO), p.buf(LSE), p.buf(Drow), p.buf(ws2),
-             S, nq, nkv, D, mk.f2i(scale)])))
-        cur_dq = time_launch(current_op_runner(EXT, lambda p: p.instr(
-            mk.OP_ATTN_DQ, nq * n_qt * Cq,
-            [p.buf(qkv), p.buf(dO), p.buf(LSE), p.buf(Drow), p.buf(ws2),
-             S, nq, nkv, D, mk.f2i(scale), Cq])))
-        print(f"  S={S:5d} nq={nq}: dKV probe {mine_dkv:7.1f}us vs {cur_dkv:7.1f}us "
-              f"({cur_dkv / mine_dkv:4.2f}x) | dQ probe {mine_dq:7.1f}us vs {cur_dq:7.1f}us "
-              f"({cur_dq / mine_dq:4.2f}x)")
+        cur_dkv = time_launch(
+            current_op_runner(
+                EXT,
+                lambda p: p.instr(
+                    mk.OP_ATTN_DKV,
+                    nkv * n_qt * G,
+                    [p.buf(qkv), p.buf(dO), p.buf(LSE), p.buf(Drow), p.buf(ws2), S, nq, nkv, D, mk.f2i(scale)],
+                ),
+            )
+        )
+        cur_dq = time_launch(
+            current_op_runner(
+                EXT,
+                lambda p: p.instr(
+                    mk.OP_ATTN_DQ,
+                    nq * n_qt * Cq,
+                    [p.buf(qkv), p.buf(dO), p.buf(LSE), p.buf(Drow), p.buf(ws2), S, nq, nkv, D, mk.f2i(scale), Cq],
+                ),
+            )
+        )
+        print(
+            f"  S={S:5d} nq={nq}: dKV probe {mine_dkv:7.1f}us vs {cur_dkv:7.1f}us "
+            f"({cur_dkv / mine_dkv:4.2f}x) | dQ probe {mine_dq:7.1f}us vs {cur_dq:7.1f}us "
+            f"({cur_dq / mine_dq:4.2f}x)"
+        )
         results.append((S, nq, mine_dkv, cur_dkv, mine_dq, cur_dq))
     return results
 

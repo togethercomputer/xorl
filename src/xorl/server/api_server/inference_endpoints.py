@@ -167,9 +167,7 @@ class InferenceEndpointsMixin:
     ) -> tuple[str | None, str | None]:
         try:
             train_config = getattr(self, "train_config", {}) or {}
-            server_expected = self._normalize_receiver_kv_cache_dtype(
-                train_config.get("receiver_kv_cache_dtype")
-            )
+            server_expected = self._normalize_receiver_kv_cache_dtype(train_config.get("receiver_kv_cache_dtype"))
             request_expected = self._normalize_receiver_kv_cache_dtype(request.receiver_kv_cache_dtype)
         except ValueError as exc:
             return None, str(exc)
@@ -929,9 +927,7 @@ class InferenceEndpointsMixin:
                         message=ep_result.get("message", ""),
                         cache_epoch=self._cache_epoch_from_mapping(ep_result),
                         fp8_kv_cache_postprocess_ran=ep_result.get("fp8_kv_cache_postprocess_ran"),
-                        fp8_kv_cache_static_scales_updated=ep_result.get(
-                            "fp8_kv_cache_static_scales_updated"
-                        ),
+                        fp8_kv_cache_static_scales_updated=ep_result.get("fp8_kv_cache_static_scales_updated"),
                     )
                 )
             result_cache_epoch = self._cache_epoch_from_mapping(result)
@@ -956,9 +952,7 @@ class InferenceEndpointsMixin:
                     "cache_invalidation_mode", cache_behavior["cache_invalidation_mode"]
                 ),
                 flush_cache=result.get("flush_cache", cache_behavior["flush_cache"]),
-                fp8_kv_cache_enabled=result.get(
-                    "fp8_kv_cache_enabled", cache_behavior["fp8_kv_cache_enabled"]
-                ),
+                fp8_kv_cache_enabled=result.get("fp8_kv_cache_enabled", cache_behavior["fp8_kv_cache_enabled"]),
                 fp8_kv_cache_postprocess_requested=result.get(
                     "fp8_kv_cache_postprocess_requested",
                     cache_behavior["fp8_kv_cache_postprocess_required"],

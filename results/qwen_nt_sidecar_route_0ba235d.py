@@ -152,22 +152,38 @@ def main() -> None:
     l2_sidecar = emit("l2_sidecar_forced", CFG_L2, {SIDECAR_ENV: "1"})
     l1_sidecar = emit("l1_sidecar_forced_negative", CFG_L1, {SIDECAR_ENV: "1"})
     small_sidecar = emit("small_sidecar_forced_negative", CFG_SMALL, {SIDECAR_ENV: "1"})
-    l2_super_off = emit("l2_supertile_off_sidecar_forced", CFG_L2, {
-        SIDECAR_ENV: "1",
-        "MK_GEMM_N256_NT_SUPERTILE": "0",
-    })
-    l2_pdfprod_off = emit("l2_pdfprod_off_sidecar_forced", CFG_L2, {
-        SIDECAR_ENV: "1",
-        "MK_PDF_PRODUCER": "0",
-    })
-    l2_pdfonly_off = emit("l2_pdfonly_off_sidecar_forced", CFG_L2, {
-        SIDECAR_ENV: "1",
-        "MK_GEMM_N256_NT_SUPERTILE_PDFONLY": "0",
-    })
-    l2_reg_off = emit("l2_reg_off_sidecar_forced", CFG_L2, {
-        SIDECAR_ENV: "1",
-        "MK_GEMM_N256_NT_SUPERTILE_REG_EPI": "0",
-    })
+    l2_super_off = emit(
+        "l2_supertile_off_sidecar_forced",
+        CFG_L2,
+        {
+            SIDECAR_ENV: "1",
+            "MK_GEMM_N256_NT_SUPERTILE": "0",
+        },
+    )
+    l2_pdfprod_off = emit(
+        "l2_pdfprod_off_sidecar_forced",
+        CFG_L2,
+        {
+            SIDECAR_ENV: "1",
+            "MK_PDF_PRODUCER": "0",
+        },
+    )
+    l2_pdfonly_off = emit(
+        "l2_pdfonly_off_sidecar_forced",
+        CFG_L2,
+        {
+            SIDECAR_ENV: "1",
+            "MK_GEMM_N256_NT_SUPERTILE_PDFONLY": "0",
+        },
+    )
+    l2_reg_off = emit(
+        "l2_reg_off_sidecar_forced",
+        CFG_L2,
+        {
+            SIDECAR_ENV: "1",
+            "MK_GEMM_N256_NT_SUPERTILE_REG_EPI": "0",
+        },
+    )
 
     errors: list[str] = []
     invariant_fields = (

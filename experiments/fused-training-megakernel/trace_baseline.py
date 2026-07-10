@@ -18,6 +18,7 @@ baseline's own floor. Plan Phase 0 stop rule keys off these numbers.
 import sqlite3
 import sys
 
+
 REPLAYS = 20
 
 
@@ -87,8 +88,7 @@ def analyze(sqlite_path):
         # launches the identical kernel sequence, so equal-count chunking is exact
         per = len(rows) // REPLAYS
         replays = [rows[i * per : (i + 1) * per] for i in range(REPLAYS)]
-    print(f"{len(rows)} kernels in {len(replays)} replay clusters "
-          f"(expect {REPLAYS}; first cluster may be partial)")
+    print(f"{len(rows)} kernels in {len(replays)} replay clusters (expect {REPLAYS}; first cluster may be partial)")
 
     stats = []
     for rep in replays:
@@ -105,9 +105,11 @@ def analyze(sqlite_path):
         stats.append((len(rep), wall, active, wall - active))
     stats.sort(key=lambda x: x[1])
     n, wall, active, gap = stats[len(stats) // 2]
-    print(f"median replay: {n} kernels  wall {wall / 1e3:8.1f} us  "
-          f"active {active / 1e3:8.1f} us ({active / wall * 100:4.1f}%)  "
-          f"gap {gap / 1e3:8.1f} us ({gap / wall * 100:4.1f}%)")
+    print(
+        f"median replay: {n} kernels  wall {wall / 1e3:8.1f} us  "
+        f"active {active / 1e3:8.1f} us ({active / wall * 100:4.1f}%)  "
+        f"gap {gap / 1e3:8.1f} us ({gap / wall * 100:4.1f}%)"
+    )
     print(f"per-kernel boundary tax: {gap / n / 1e3:.2f} us/kernel")
 
     agg = {}

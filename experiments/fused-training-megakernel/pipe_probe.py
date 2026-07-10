@@ -311,8 +311,17 @@ void run_gemm(torch::Tensor A, torch::Tensor B, torch::Tensor C, int64_t M, int6
 cpp_src = "void run_gemm(torch::Tensor A, torch::Tensor B, torch::Tensor C, int64_t M, int64_t N, int64_t K, int64_t flags, int64_t claim_sz, torch::Tensor cursor, int64_t variant, int64_t nblocks);"
 
 VARIANTS = [
-    "S2W0(cur)", "S3W0", "S4W0", "S3W1", "S4W1", "S2W0-sw", "S3W1-sw", "S4W1-sw",
-    "S6W1-sw", "S8W1-sw", "S9W1-sw",
+    "S2W0(cur)",
+    "S3W0",
+    "S4W0",
+    "S3W1",
+    "S4W1",
+    "S2W0-sw",
+    "S3W1-sw",
+    "S4W1-sw",
+    "S6W1-sw",
+    "S8W1-sw",
+    "S9W1-sw",
 ]
 
 
@@ -332,8 +341,16 @@ def bench_shape(ext, M, N, K, a_t, b_t, iters=30, nblocks=132):
     """Times each variant; returns dict variant -> (us, tf)."""
     torch.manual_seed(0)
     # operands stored exactly as the op sees them (a_t: A[K,M]; b_t: B[N,K])
-    A = torch.randn(K, M, device="cuda", dtype=torch.bfloat16) if a_t else torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
-    B = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) if b_t else torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
+    A = (
+        torch.randn(K, M, device="cuda", dtype=torch.bfloat16)
+        if a_t
+        else torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    )
+    B = (
+        torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+        if b_t
+        else torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
+    )
     C = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
     Am = A.t() if a_t else A
     Bm = B.t() if b_t else B

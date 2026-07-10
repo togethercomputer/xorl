@@ -317,8 +317,7 @@ def claim_for(tiles: int, nblocks: int) -> int:
     return max(1, min(8, (tiles + nblocks - 1) // nblocks))
 
 
-def run_one(ext, fn_name: str, A, B, C, M: int, N: int, K: int, bn: int,
-            iters: int, nblocks: int):
+def run_one(ext, fn_name: str, A, B, C, M: int, N: int, K: int, bn: int, iters: int, nblocks: int):
     tiles = (M // 128) * (N // bn)
     claim = claim_for(tiles, nblocks)
     cursor = torch.zeros(1, device="cuda", dtype=torch.int32)
@@ -353,8 +352,10 @@ def check_correct(ext):
         diff = (C - ref).abs()
         denom = ref.abs().clamp_min(0.5)
         rel = (diff / denom).max().item()
-        print(f"check {name}: rel={rel:.4e} max_abs={diff.max().item():.4e} "
-              f"time={med:.1f}us tiles={tiles} claim={claim}", flush=True)
+        print(
+            f"check {name}: rel={rel:.4e} max_abs={diff.max().item():.4e} time={med:.1f}us tiles={tiles} claim={claim}",
+            flush=True,
+        )
         assert rel < 3e-2, name
 
 
@@ -371,8 +372,10 @@ def bench_shape(ext, label: str, M: int, N: int, K: int, iters: int):
         rows.append((name, med, lo, hi, tf, tiles, claim))
     print(label, flush=True)
     for name, med, lo, hi, tf, tiles, claim in rows:
-        print(f"  {name:8s} med={med:8.1f}us min={lo:8.1f} max={hi:8.1f} "
-              f"tf={tf:6.1f} tiles={tiles:5d} claim={claim}", flush=True)
+        print(
+            f"  {name:8s} med={med:8.1f}us min={lo:8.1f} max={hi:8.1f} tf={tf:6.1f} tiles={tiles:5d} claim={claim}",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

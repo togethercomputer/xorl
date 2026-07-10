@@ -62,12 +62,7 @@ def main() -> None:
         export_callable = callable(getattr(model.ext, "run_qwen_nt_lmhead_sidecar", None))
         name = Path(model.ext.__file__).name
         summary = {
-            "pass": (
-                has_export
-                and export_callable
-                and len(model.qwen_nt_sidecar_cutpoints) == 1
-                and "_ntsc" in name
-            ),
+            "pass": (has_export and export_callable and len(model.qwen_nt_sidecar_cutpoints) == 1 and "_ntsc" in name),
             "name": name,
             "so": model.ext.__file__,
             "has_export": has_export,

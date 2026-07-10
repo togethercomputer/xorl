@@ -18,6 +18,7 @@ import sys
 import torch
 from torch.utils.cpp_extension import load_inline
 
+
 CUTE_INC = "/home/apanda/xorl-internal/.venv/lib/python3.12/site-packages/deep_gemm/include"
 
 cuda_src = r"""
@@ -390,8 +391,13 @@ def build():
         functions=["ws_run", "ws_smem_used"],
         # explicit gencode: CUDA 13's -arch=sm_90a ALSO embeds a compute_90 PTX pass,
         # where unguarded setmaxnreg asm fails ptxas (cute guards its wgmma; we can't).
-        extra_cuda_cflags=["-O3", "-gencode=arch=compute_90a,code=sm_90a", f"-I{CUTE_INC}",
-                           "--expt-relaxed-constexpr", "-lineinfo"],
+        extra_cuda_cflags=[
+            "-O3",
+            "-gencode=arch=compute_90a,code=sm_90a",
+            f"-I{CUTE_INC}",
+            "--expt-relaxed-constexpr",
+            "-lineinfo",
+        ],
         verbose=False,
     )
 
@@ -412,14 +418,14 @@ class Chain:
             self.bufB = {0: self.Bmat}  # stored [N,K]
         else:  # alternate NN (even, writes C^T) / TN (odd, reads MN-major A)
             self.modes = [1 if i % 2 == 0 else 2 for i in range(n)]
-            self.bufB = {1: self.Bmat.t().contiguous(),  # NN: B stored [K,N] = Bmat^T
-                         2: self.Bmat}                   # TN: B stored [N,K]
+            self.bufB = {
+                1: self.Bmat.t().contiguous(),  # NN: B stored [K,N] = Bmat^T
+                2: self.Bmat,
+            }  # TN: B stored [N,K]
         aptr = [self.a0.data_ptr()] + [c.data_ptr() for c in self.cs[:-1]]
         self.Aptrs = torch.tensor(aptr, dtype=torch.int64, device="cuda")
-        self.Bptrs = torch.tensor([self.bufB[m].data_ptr() for m in self.modes],
-                                  dtype=torch.int64, device="cuda")
-        self.Cptrs = torch.tensor([c.data_ptr() for c in self.cs], dtype=torch.int64,
-                                  device="cuda")
+        self.Bptrs = torch.tensor([self.bufB[m].data_ptr() for m in self.modes], dtype=torch.int64, device="cuda")
+        self.Cptrs = torch.tensor([c.data_ptr() for c in self.cs], dtype=torch.int64, device="cuda")
         self.modes_t = torch.tensor(self.modes, dtype=torch.int32, device="cuda")
         self.done = torch.zeros(n * 32, dtype=torch.int32, device="cuda")
         self.cursor = torch.zeros(1, dtype=torch.int32, device="cuda")
@@ -434,8 +440,21 @@ class Chain:
     def run(self, ext, nblocks=132, prefetch=1, done_by=0, smr=0, handoff=0, stamps=None):
         self.done.zero_()
         self.cursor.zero_()
-        ext.ws_run(self.Aptrs, self.Bptrs, self.Cptrs, self.modes_t, self.done, self.cursor,
-                   stamps, self.n, nblocks, prefetch, done_by, smr, handoff)
+        ext.ws_run(
+            self.Aptrs,
+            self.Bptrs,
+            self.Cptrs,
+            self.modes_t,
+            self.done,
+            self.cursor,
+            stamps,
+            self.n,
+            nblocks,
+            prefetch,
+            done_by,
+            smr,
+            handoff,
+        )
 
     def parity(self, ext, cfg, label=""):
         for c in self.cs:
@@ -456,8 +475,10 @@ class Chain:
             c = (c.float() @ Bf.T).to(torch.bfloat16)
         drift = (self.stored(self.n - 1).float() - c.float()).abs().max().item()
         ok = worst < 0.05
-        print(f"  parity[{label}] one-step max err {worst:.4e} "
-              f"({'OK' if ok else 'FAIL'}), chain-end drift {drift:.4e}", flush=True)
+        print(
+            f"  parity[{label}] one-step max err {worst:.4e} ({'OK' if ok else 'FAIL'}), chain-end drift {drift:.4e}",
+            flush=True,
+        )
         return ok
 
     def bench(self, ext, cfg, iters=20, warmup=5):
@@ -532,8 +553,7 @@ def main():
             continue
         hop = ch.bench(ext, full)
         gap, span = ch.gap_span(ext, full)
-        print(f"  cfg {name:28s}: {hop:6.2f} us/hop  (median gap {gap:5.2f} + span {span:5.2f})",
-              flush=True)
+        print(f"  cfg {name:28s}: {hop:6.2f} us/hop  (median gap {gap:5.2f} + span {span:5.2f})", flush=True)
         results.append((name, cfg, hop, gap, span))
 
     good = [r for r in results if r[2] is not None]
@@ -548,10 +568,9 @@ def main():
         if ok:
             hop = ca.bench(ext, full)
             gap, span = ca.gap_span(ext, full)
-            print(f"  cfg {name:28s}: {hop:6.2f} us/hop  (gap {gap:5.2f} + span {span:5.2f})",
-                  flush=True)
+            print(f"  cfg {name:28s}: {hop:6.2f} us/hop  (gap {gap:5.2f} + span {span:5.2f})", flush=True)
 
-    print(f"\n== informational: single-block chain (same-SM hops), best cfg ==", flush=True)
+    print("\n== informational: single-block chain (same-SM hops), best cfg ==", flush=True)
     for nb in (1, 132):
         hop = ch.bench(ext, dict(best[1], nblocks=nb))
         print(f"  nblocks={nb:3d}: {hop:6.2f} us/hop", flush=True)

@@ -4,8 +4,8 @@ import pytest
 import torch
 
 from xorl.distributed.torch_parallelize import (
-    _configure_manual_fsdp_prefetch,
     _coerce_optional_bool_config,
+    _configure_manual_fsdp_prefetch,
     _expert_mixed_precision_policy,
     _resolve_fsdp_reduce_dtype,
     _sequence_parallel_fully_folded_into_fsdp,

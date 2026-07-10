@@ -28,8 +28,10 @@ from qwen_nt_sidecar_api_0ba235d import (  # noqa: E402
     grad_stats,
     max_grad_stat_delta,
     restore_env,
-    route_summary as api_route_summary,
     with_env,
+)
+from qwen_nt_sidecar_api_0ba235d import (
+    route_summary as api_route_summary,
 )
 from qwen_nt_sidecar_graph_policy_0ba235d import POLICY_ENV  # noqa: E402
 
@@ -83,9 +85,7 @@ def build_policy_off_guard(cfg: Cfg) -> MKQwen3:
 
 def route_summary(model: MKQwen3) -> dict[str, object]:
     summary = api_route_summary(model)
-    summary["policy_requested"] = bool(
-        getattr(model, "qwen_nt_sidecar_step_requested", False)
-    )
+    summary["policy_requested"] = bool(getattr(model, "qwen_nt_sidecar_step_requested", False))
     return summary
 
 
@@ -105,10 +105,7 @@ def check_policy_off_guards(
     except RuntimeError as exc:
         graph_error = str(exc)
     return {
-        "pass": (
-            "sidecar boundary step requires" in step_error
-            and "boundary graph capture requires" in graph_error
-        ),
+        "pass": ("sidecar boundary step requires" in step_error and "boundary graph capture requires" in graph_error),
         "step_error": step_error,
         "graph_error": graph_error,
     }
@@ -138,10 +135,7 @@ def check_step_equivalence(
 
     stat_delta = max_grad_stat_delta(step_stats, explicit_stats)
     loss_diff = explicit_loss - step_loss
-    stat_ok = (
-        float(stat_delta["max_abs_delta"]) <= stat_atol
-        or float(stat_delta["max_rel_delta"]) <= stat_rtol
-    )
+    stat_ok = float(stat_delta["max_abs_delta"]) <= stat_atol or float(stat_delta["max_rel_delta"]) <= stat_rtol
     return {
         "pass": abs(loss_diff) <= loss_atol and stat_ok,
         "loss_atol": loss_atol,
@@ -289,8 +283,7 @@ def run_case(
 
     guard_result = check_policy_off_guards(guard, tokens, labels)
     print(
-        "POLICY_OFF_GUARD_JSON "
-        + json.dumps({"shape": shape, "order": order, **guard_result}, sort_keys=True),
+        "POLICY_OFF_GUARD_JSON " + json.dumps({"shape": shape, "order": order, **guard_result}, sort_keys=True),
         flush=True,
     )
     if not guard_result["pass"]:
@@ -298,8 +291,7 @@ def run_case(
 
     step_equivalence = check_step_equivalence(promoted, tokens, labels)
     print(
-        "STEP_EQUIV_JSON "
-        + json.dumps({"shape": shape, "order": order, **step_equivalence}, sort_keys=True),
+        "STEP_EQUIV_JSON " + json.dumps({"shape": shape, "order": order, **step_equivalence}, sort_keys=True),
         flush=True,
     )
     if not step_equivalence["pass"]:
@@ -307,8 +299,7 @@ def run_case(
 
     step_parity = check_step_parity(old, promoted, tokens, labels, loss_atol, grad_rtol)
     print(
-        "STEP_PARITY_JSON "
-        + json.dumps({"shape": shape, "order": order, **step_parity}, sort_keys=True),
+        "STEP_PARITY_JSON " + json.dumps({"shape": shape, "order": order, **step_parity}, sort_keys=True),
         flush=True,
     )
     if not step_parity["pass"]:
@@ -324,8 +315,7 @@ def run_case(
         reps,
     )
     print(
-        "STEP_TIMING_JSON "
-        + json.dumps({"shape": shape, "order": order, **step_timing}, sort_keys=True),
+        "STEP_TIMING_JSON " + json.dumps({"shape": shape, "order": order, **step_timing}, sort_keys=True),
         flush=True,
     )
 
@@ -337,8 +327,7 @@ def run_case(
         "promoted_has_graph": hasattr(promoted_replay, "graph"),
     }
     print(
-        "GRAPH_CAPTURE_JSON "
-        + json.dumps({"shape": shape, "order": order, **graph_capture}, sort_keys=True),
+        "GRAPH_CAPTURE_JSON " + json.dumps({"shape": shape, "order": order, **graph_capture}, sort_keys=True),
         flush=True,
     )
 
@@ -351,8 +340,7 @@ def run_case(
         grad_rtol,
     )
     print(
-        "GRAPH_PARITY_JSON "
-        + json.dumps({"shape": shape, "order": order, **graph_parity}, sort_keys=True),
+        "GRAPH_PARITY_JSON " + json.dumps({"shape": shape, "order": order, **graph_parity}, sort_keys=True),
         flush=True,
     )
     if not graph_parity["pass"]:
@@ -364,8 +352,7 @@ def run_case(
     torch.cuda.synchronize()
     graph_timing = time_pair(old_replay, promoted_replay, reps)
     print(
-        "GRAPH_TIMING_JSON "
-        + json.dumps({"shape": shape, "order": order, **graph_timing}, sort_keys=True),
+        "GRAPH_TIMING_JSON " + json.dumps({"shape": shape, "order": order, **graph_timing}, sort_keys=True),
         flush=True,
     )
 

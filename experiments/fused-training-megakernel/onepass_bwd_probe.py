@@ -19,6 +19,7 @@ import sys
 import torch
 from torch.utils.cpp_extension import load
 
+
 _DIR = os.path.dirname(os.path.abspath(__file__))
 CUTE_INC = "/home/apanda/xorl-internal/.venv/lib/python3.12/site-packages/deep_gemm/include"
 DEV = "cuda"
@@ -43,8 +44,7 @@ def check(name, got, ref, atol, rtol=2e-2):
     got, ref = got.float(), ref.float()
     err = (got - ref).abs().max().item()
     ok = torch.allclose(got, ref, atol=atol, rtol=rtol)
-    print(f"  {name:52s} max_abs_err={err:.3e} (ref_max={ref.abs().max().item():.3e}) "
-          f"{'OK' if ok else 'FAIL'}")
+    print(f"  {name:52s} max_abs_err={err:.3e} (ref_max={ref.abs().max().item():.3e}) {'OK' if ok else 'FAIL'}")
     assert ok, name
     return err
 
@@ -60,8 +60,8 @@ def make_inputs(S, nq, nkv, seed=0):
 def qkv_split(qkv, nq, nkv, S):
     x = qkv.float().view(S, nq + 2 * nkv, D)
     q = x[:, :nq].permute(1, 0, 2)
-    k = x[:, nq: nq + nkv].permute(1, 0, 2).repeat_interleave(nq // nkv, dim=0)
-    v = x[:, nq + nkv:].permute(1, 0, 2).repeat_interleave(nq // nkv, dim=0)
+    k = x[:, nq : nq + nkv].permute(1, 0, 2).repeat_interleave(nq // nkv, dim=0)
+    v = x[:, nq + nkv :].permute(1, 0, 2).repeat_interleave(nq // nkv, dim=0)
     return q, k, v
 
 
@@ -88,8 +88,8 @@ def grad_ref(qkv, dO, nq, nkv, S):
     qkvr = qkv.float().detach().requires_grad_(True)
     x = qkvr.view(S, nq + 2 * nkv, D)
     q = x[:, :nq].permute(1, 0, 2)
-    k = x[:, nq: nq + nkv].permute(1, 0, 2).repeat_interleave(nq // nkv, dim=0)
-    v = x[:, nq + nkv:].permute(1, 0, 2).repeat_interleave(nq // nkv, dim=0)
+    k = x[:, nq : nq + nkv].permute(1, 0, 2).repeat_interleave(nq // nkv, dim=0)
+    v = x[:, nq + nkv :].permute(1, 0, 2).repeat_interleave(nq // nkv, dim=0)
     o = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
     o.permute(1, 0, 2).reshape(S, nq * D).backward(dO.float())
     return qkvr.grad
@@ -130,7 +130,7 @@ def stage_parity(ext):
     for S, nq, nkv in [(2048, 4, 2), (4096, 4, 2)]:
         qkv, dO = make_inputs(S, nq, nkv)
         stride = (nq + 2 * nkv) * D
-        scale = D ** -0.5
+        scale = D**-0.5
         LSE, Drow = lse_drow_ref(qkv, dO, nq, nkv, S, scale)
         ref = grad_ref(qkv, dO, nq, nkv, S)
 
@@ -139,26 +139,21 @@ def stage_parity(ext):
             ext.attn_dkv2(qkv, dO, LSE, Drow, ws, S, nq, nkv, scale, C)
             ext.attn_dq2(qkv, dO, LSE, Drow, ws, S, nq, nkv, scale, C)
             torch.cuda.synchronize()
-            check(f"2pass dK S={S} C={C}", ws[:, nq * D:(nq + nkv) * D],
-                  ref[:, nq * D:(nq + nkv) * D], atol=0.06)
-            check(f"2pass dV S={S} C={C}", ws[:, (nq + nkv) * D:],
-                  ref[:, (nq + nkv) * D:], atol=0.06)
-            check(f"2pass dQ S={S} C={C}", ws[:, :nq * D], ref[:, :nq * D], atol=0.06)
+            check(f"2pass dK S={S} C={C}", ws[:, nq * D : (nq + nkv) * D], ref[:, nq * D : (nq + nkv) * D], atol=0.06)
+            check(f"2pass dV S={S} C={C}", ws[:, (nq + nkv) * D :], ref[:, (nq + nkv) * D :], atol=0.06)
+            check(f"2pass dQ S={S} C={C}", ws[:, : nq * D], ref[:, : nq * D], atol=0.06)
 
             for dq_rs in (1, 0):
                 for drain in (0, 1):
                     ws = torch.zeros(S, stride, device=DEV, dtype=torch.float32)
                     dqa = torch.zeros(nq * S * D, device=DEV, dtype=torch.float32)
-                    ext.attn_onepass(qkv, dO, LSE, Drow, ws, dqa, S, nq, nkv, scale, C,
-                                     dq_rs, drain)
+                    ext.attn_onepass(qkv, dO, LSE, Drow, ws, dqa, S, nq, nkv, scale, C, dq_rs, drain)
                     torch.cuda.synchronize()
                     tag = f"1pass rs={dq_rs} drain={drain} S={S} C={C}"
-                    check(f"{tag} dK", ws[:, nq * D:(nq + nkv) * D],
-                          ref[:, nq * D:(nq + nkv) * D], atol=0.06)
-                    check(f"{tag} dV", ws[:, (nq + nkv) * D:],
-                          ref[:, (nq + nkv) * D:], atol=0.06)
+                    check(f"{tag} dK", ws[:, nq * D : (nq + nkv) * D], ref[:, nq * D : (nq + nkv) * D], atol=0.06)
+                    check(f"{tag} dV", ws[:, (nq + nkv) * D :], ref[:, (nq + nkv) * D :], atol=0.06)
                     dq = dqa_to_natural(dqa, nq, S, drain)
-                    check(f"{tag} dQ", dq, ref[:, :nq * D], atol=0.06)
+                    check(f"{tag} dQ", dq, ref[:, : nq * D], atol=0.06)
 
 
 def time_launch(fn, iters=50, warmup=10):
@@ -184,22 +179,20 @@ def stage_timing(ext):
     for S, nq, nkv in [(4096, 4, 2), (8192, 4, 2)]:
         qkv, dO = make_inputs(S, nq, nkv)
         stride = (nq + 2 * nkv) * D
-        scale = D ** -0.5
+        scale = D**-0.5
         LSE, Drow = lse_drow_ref(qkv, dO, nq, nkv, S, scale)
         ws = torch.zeros(S, stride, device=DEV, dtype=torch.float32)
         dqa = torch.zeros(nq * S * D, device=DEV, dtype=torch.float32)
 
         res = {}
         for C in (1, 2, 4):
-            res[("dkv2", C)] = time_launch(
-                lambda: ext.attn_dkv2(qkv, dO, LSE, Drow, ws, S, nq, nkv, scale, C))
-            res[("dq2", C)] = time_launch(
-                lambda: ext.attn_dq2(qkv, dO, LSE, Drow, ws, S, nq, nkv, scale, C))
+            res[("dkv2", C)] = time_launch(lambda: ext.attn_dkv2(qkv, dO, LSE, Drow, ws, S, nq, nkv, scale, C))
+            res[("dq2", C)] = time_launch(lambda: ext.attn_dq2(qkv, dO, LSE, Drow, ws, S, nq, nkv, scale, C))
             for dq_rs in (1, 0):
                 for drain in (0, 1):
                     res[(f"1p rs{dq_rs} dr{drain}", C)] = time_launch(
-                        lambda: ext.attn_onepass(qkv, dO, LSE, Drow, ws, dqa, S, nq,
-                                                 nkv, scale, C, dq_rs, drain))
+                        lambda: ext.attn_onepass(qkv, dO, LSE, Drow, ws, dqa, S, nq, nkv, scale, C, dq_rs, drain)
+                    )
 
         names = ["dkv2", "dq2", "1p rs1 dr0", "1p rs1 dr1", "1p rs0 dr0", "1p rs0 dr1"]
         best = {}
@@ -214,9 +207,11 @@ def stage_timing(ext):
         gflop = 5 * S * S * D * nq / 1e9  # causal bwd FLOPs convention (concept map §0)
         for n in names[2:]:
             one = best[n][1]
-            print(f"  S={S}: TOTAL two-pass {two:7.1f}us vs {n} {one:7.1f}us "
-                  f"-> {two / one:4.2f}x  ({gflop / one * 1e3:5.0f} vs "
-                  f"{gflop / two * 1e3:5.0f} TF/s)")
+            print(
+                f"  S={S}: TOTAL two-pass {two:7.1f}us vs {n} {one:7.1f}us "
+                f"-> {two / one:4.2f}x  ({gflop / one * 1e3:5.0f} vs "
+                f"{gflop / two * 1e3:5.0f} TF/s)"
+            )
         flops_note.append((S, two, {n: best[n] for n in names}))
     return flops_note
 

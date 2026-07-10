@@ -235,6 +235,5 @@ class DummyBackend(Backend):
     async def abort_zorl_generation(self, model_id="default", generation_id="", request_id=None):
         return {"success": True, "model_id": model_id, "generation_id": generation_id, "deleted_candidates": 2}
 
-
     async def health_check(self, request_id=None):
         return {"status": "healthy"}

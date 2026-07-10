@@ -142,13 +142,11 @@ def test_gemm():
             p.instr(
                 mk.OP_GEMM,
                 mk.gemm_tiles_wgmma_n256_direct(M5, N5),
-                [p.buf(A5), p.buf(Wt5), p.buf(C5r), M5, N5, K5,
-                 2 | 16 | 128 | 16384, p.buf(Res5)],
+                [p.buf(A5), p.buf(Wt5), p.buf(C5r), M5, N5, K5, 2 | 16 | 128 | 16384, p.buf(Res5)],
             )
 
         run1(build_tst_res)
-        check("NT n256 TMA-store + residual", C5r,
-              A5.float() @ Wt5.float().T + Res5.float(), atol=0.35)
+        check("NT n256 TMA-store + residual", C5r, A5.float() @ Wt5.float().T + Res5.float(), atol=0.35)
 
         # Tail mix: N=384 -> one full TMA tile + one 128-col direct tail per
         # 128-row band, stage3 variant.
@@ -160,13 +158,11 @@ def test_gemm():
             p.instr(
                 mk.OP_GEMM,
                 mk.gemm_tiles_wgmma_n256_direct(M3, N3),
-                [p.buf(A3), p.buf(Wt3), p.buf(C5t), M3, N3, K3,
-                 2 | 128 | 16384 | mk.GEMM_N256_STAGE3_FLAG, 0],
+                [p.buf(A3), p.buf(Wt3), p.buf(C5t), M3, N3, K3, 2 | 128 | 16384 | mk.GEMM_N256_STAGE3_FLAG, 0],
             )
 
         run1(build_tst_tail, smem_bytes=148 * 1024)
-        check("NT n256 TMA-store tail mix", C5t, A3.float() @ Wt3.float().T,
-              atol=0.35)
+        check("NT n256 TMA-store tail mix", C5t, A3.float() @ Wt3.float().T, atol=0.35)
 
     B3 = torch.randn(K3, 256, device=DEV, dtype=torch.bfloat16)
     C3nn = torch.empty(M3, 256, device=DEV, dtype=torch.float32)
@@ -268,9 +264,7 @@ def test_gemm():
 
         Ct = torch.empty(Mt, Nt, device=DEV, dtype=torch.float32)
         run1(
-            lambda p: build_tma(
-                p, At_nn, Bt_nn, Ct, 8 | 128 | 16384 | mk.GEMM_N256_STAGE3_FLAG
-            ),
+            lambda p: build_tma(p, At_nn, Bt_nn, Ct, 8 | 128 | 16384 | mk.GEMM_N256_STAGE3_FLAG),
             smem_bytes=148 * 1024,
         )
         check("NN n256 stage3 fp32 TMA", Ct, At_nn.float() @ Bt_nn.float(), atol=0.35)
@@ -281,15 +275,17 @@ def test_gemm():
         try:
             run1(
                 lambda p: build_tma(
-                    p, At_tn, Bt_nn, Ct2,
+                    p,
+                    At_tn,
+                    Bt_nn,
+                    Ct2,
                     1 | 8 | 128 | 16384 | mk.GEMM_N256_STAGE3_FLAG,
                 ),
                 smem_bytes=148 * 1024,
             )
         finally:
             os.environ.pop("MK_GEMM_N256_TMA_TN", None)
-        check("TN n256 stage3 fp32 TMA", Ct2, At_tn.float().T @ Bt_nn.float(),
-              atol=0.35)
+        check("TN n256 stage3 fp32 TMA", Ct2, At_tn.float().T @ Bt_nn.float(), atol=0.35)
 
     if "_d64tma" in EXT.__name__:
         # D64 ring TMA feed: the m64n64 body (all four in-model majors:
@@ -305,28 +301,22 @@ def test_gemm():
         def build_d64(p, a, b, c, flags, ntiles):
             p.gemm_d64_tma_ext = EXT
             p.instr(
-                mk.OP_GEMM, ntiles,
+                mk.OP_GEMM,
+                ntiles,
                 [p.buf(a), p.buf(b), p.buf(c), Md, Nd, Kd, flags, 0],
             )
 
         n64_tiles = mk.gemm_tiles_wgmma(Md, Nd)
         n128_tiles = mk.gemm_tiles_wgmma_n128(Md, Nd)
         for name, a, b, ref, flags, ntiles, f32 in (
-            ("NT m64n64 TMA", Ad, Bd_nt, lambda: Ad.float() @ Bd_nt.float().T,
-             2 | 128, n64_tiles, False),
-            ("NN m64n64 TMA", Ad, Bd_nn, lambda: Ad.float() @ Bd_nn.float(),
-             128, n64_tiles, False),
-            ("TN m64n64 fp32 TMA", Adt, Bd_nn,
-             lambda: Adt.float().T @ Bd_nn.float(), 1 | 8 | 128, n64_tiles, True),
-            ("NT m64n128 TMA", Ad, Bd_nt, lambda: Ad.float() @ Bd_nt.float().T,
-             2 | 128 | 4096, n128_tiles, False),
-            ("NN m64n128 TMA", Ad, Bd_nn, lambda: Ad.float() @ Bd_nn.float(),
-             128 | 4096, n128_tiles, False),
+            ("NT m64n64 TMA", Ad, Bd_nt, lambda: Ad.float() @ Bd_nt.float().T, 2 | 128, n64_tiles, False),
+            ("NN m64n64 TMA", Ad, Bd_nn, lambda: Ad.float() @ Bd_nn.float(), 128, n64_tiles, False),
+            ("TN m64n64 fp32 TMA", Adt, Bd_nn, lambda: Adt.float().T @ Bd_nn.float(), 1 | 8 | 128, n64_tiles, True),
+            ("NT m64n128 TMA", Ad, Bd_nt, lambda: Ad.float() @ Bd_nt.float().T, 2 | 128 | 4096, n128_tiles, False),
+            ("NN m64n128 TMA", Ad, Bd_nn, lambda: Ad.float() @ Bd_nn.float(), 128 | 4096, n128_tiles, False),
         ):
-            Cd = torch.empty(Md, Nd, device=DEV,
-                             dtype=torch.float32 if f32 else torch.bfloat16)
-            run1(lambda p, a=a, b=b, Cd=Cd, flags=flags, ntiles=ntiles:
-                 build_d64(p, a, b, Cd, flags, ntiles))
+            Cd = torch.empty(Md, Nd, device=DEV, dtype=torch.float32 if f32 else torch.bfloat16)
+            run1(lambda p, a=a, b=b, Cd=Cd, flags=flags, ntiles=ntiles: build_d64(p, a, b, Cd, flags, ntiles))
             check(name, Cd, ref(), atol=0.5)
 
     O3 = torch.randn(M3, 256, device=DEV, dtype=torch.bfloat16)
@@ -467,14 +457,14 @@ def test_gemm():
     raw = Aq.float() @ Wq.float().T
     ref_heads = raw.view(Mq, nq + 2 * nkv, Dq)
     ref_q = ref_heads[:, :nq]
-    ref_k = ref_heads[:, nq:nq + nkv]
-    ref_v = ref_heads[:, nq + nkv:]
+    ref_k = ref_heads[:, nq : nq + nkv]
+    ref_v = ref_heads[:, nq + nkv :]
     ref_rq = torch.rsqrt(ref_q.pow(2).mean(-1) + eps)
     ref_rk = torch.rsqrt(ref_k.pow(2).mean(-1) + eps)
 
     def rope(x, rstd, w):
         y = x * rstd[..., None] * w.float()
-        a, b = y[..., : Dq // 2], y[..., Dq // 2:]
+        a, b = y[..., : Dq // 2], y[..., Dq // 2 :]
         cc, ss = cos[:, None, :], sin[:, None, :]
         return torch.cat([a * cc - b * ss, b * cc + a * ss], dim=-1)
 
@@ -503,8 +493,7 @@ def test_gemm():
             p.instr(
                 mk.OP_GEMM,
                 mk.gemm_tiles(M4, N4) * sk,
-                [p.buf(A4), p.buf(B4), p.buf(C4), M4, N4, K4,
-                 8 | 32 | mk.GEMM_DX_TMA_RED_FLAG, 0, sk],
+                [p.buf(A4), p.buf(B4), p.buf(C4), M4, N4, K4, 8 | 32 | mk.GEMM_DX_TMA_RED_FLAG, 0, sk],
             )
 
         run1(build_tma_red)
@@ -524,8 +513,7 @@ def test_gemm():
             p.instr(
                 mk.OP_GEMM,
                 mk.gemm_tiles_wgmma_n128(M4, N4) * skr,
-                [p.buf(A4), p.buf(B4), p.buf(ws), M4, N4, K4,
-                 8 | 32 | 128 | 4096 | mk.GEMM_SKR_FLAG, 0, skr],
+                [p.buf(A4), p.buf(B4), p.buf(ws), M4, N4, K4, 8 | 32 | 128 | 4096 | mk.GEMM_SKR_FLAG, 0, skr],
             )
             p.wave()
             p.instr(
@@ -545,7 +533,11 @@ def test_rmsnorm():
     w = torch.randn(H, device=DEV, dtype=torch.bfloat16)
     y = torch.empty_like(x)
     rstd = torch.empty(S, device=DEV, dtype=torch.float32)
-    run1(lambda p: p.instr(mk.OP_RMSNORM_FWD, mk.rowop_tiles(S), [p.buf(x), p.buf(w), p.buf(y), p.buf(rstd), H, mk.f2i(eps), S]))
+    run1(
+        lambda p: p.instr(
+            mk.OP_RMSNORM_FWD, mk.rowop_tiles(S), [p.buf(x), p.buf(w), p.buf(y), p.buf(rstd), H, mk.f2i(eps), S]
+        )
+    )
     xf = x.float()
     ref_rstd = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
     check("fwd", y, xf * ref_rstd * w.float(), atol=0.05)
@@ -555,7 +547,13 @@ def test_rmsnorm():
     dx = torch.randn(S, H, device=DEV, dtype=torch.bfloat16)  # pre-existing (residual stream)
     dx0 = dx.clone()
     dw = torch.zeros(H, device=DEV, dtype=torch.float32)
-    run1(lambda p: p.instr(mk.OP_RMSNORM_BWD, mk.rowop_tiles(S), [p.buf(x), p.buf(w), p.buf(dy), p.buf(dx), p.buf(dw), p.buf(rstd), H, 0, S]))
+    run1(
+        lambda p: p.instr(
+            mk.OP_RMSNORM_BWD,
+            mk.rowop_tiles(S),
+            [p.buf(x), p.buf(w), p.buf(dy), p.buf(dx), p.buf(dw), p.buf(rstd), H, 0, S],
+        )
+    )
     xr = xf.detach().requires_grad_(True)
     wr = w.float().detach().requires_grad_(True)
     yr = xr * torch.rsqrt(xr.pow(2).mean(-1, keepdim=True) + eps) * wr

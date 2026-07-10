@@ -511,6 +511,5 @@ class RemoteBackend(Backend):
             timeout=120.0,
         )
 
-
     async def health_check(self, request_id=None):
         return await self._execute("health_check", EmptyData(), request_id=request_id, timeout=5.0)

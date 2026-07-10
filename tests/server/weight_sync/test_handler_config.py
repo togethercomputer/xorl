@@ -1033,6 +1033,7 @@ def test_broadcast_buffer_strips_orig_mod_before_backend_transfer():
     assert backend.flush_cache is True
     assert backend.weight_version == "wv"
 
+
 def test_sparse_delta_paths_fast_path_bypasses_trainer_model(monkeypatch):
     events = []
 

@@ -112,9 +112,7 @@ def validate_external_fp8_runtime_config(config: Mapping[str, Any], *, context: 
             kv_cache_candidates.append(
                 (f"{context}.policy.generation.kv_cache_dtype", policy_generation.get("kv_cache_dtype"))
             )
-            qarl_candidates.append(
-                (f"{context}.policy.generation.quant_cfg", policy_generation.get("quant_cfg"))
-            )
+            qarl_candidates.append((f"{context}.policy.generation.quant_cfg", policy_generation.get("quant_cfg")))
     vllm_cfg = config.get("vllm_cfg")
     if vllm_cfg is not None:
         candidates.append((f"{context}.vllm_cfg", vllm_cfg))

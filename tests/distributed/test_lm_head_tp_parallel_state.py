@@ -83,21 +83,15 @@ if __name__ != "__main__":
     SCRIPT_PATH = os.path.abspath(__file__)
 
     def test_lm_head_tp_parallel_state_cpu():
-        result = run_distributed_script(
-            SCRIPT_PATH, num_gpus=4, timeout=120, extra_env={"XORL_LMHEAD_PS_CFG": "cp"}
-        )
+        result = run_distributed_script(SCRIPT_PATH, num_gpus=4, timeout=120, extra_env={"XORL_LMHEAD_PS_CFG": "cp"})
         result.assert_success()
 
     def test_lm_head_tp_parallel_state_nocp_dp_cpu():
-        result = run_distributed_script(
-            SCRIPT_PATH, num_gpus=4, timeout=120, extra_env={"XORL_LMHEAD_PS_CFG": "dp"}
-        )
+        result = run_distributed_script(SCRIPT_PATH, num_gpus=4, timeout=120, extra_env={"XORL_LMHEAD_PS_CFG": "dp"})
         result.assert_success()
 
     def test_lm_head_tp_parallel_state_nocp_hsdp_cpu():
-        result = run_distributed_script(
-            SCRIPT_PATH, num_gpus=4, timeout=120, extra_env={"XORL_LMHEAD_PS_CFG": "hsdp"}
-        )
+        result = run_distributed_script(SCRIPT_PATH, num_gpus=4, timeout=120, extra_env={"XORL_LMHEAD_PS_CFG": "hsdp"})
         result.assert_success()
 
 

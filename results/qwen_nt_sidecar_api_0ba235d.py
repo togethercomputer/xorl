@@ -97,15 +97,11 @@ def route_summary(model: MKQwen3) -> dict[str, object]:
         "cutpoint_count": len(cutpoints),
         "boundary_row_count": len(getattr(model, "qwen_nt_sidecar_boundary_rows", [])),
         "split_plan_valid": None if plan is None else bool(plan.get("valid_topological_split")),
-        "main_row_replaced_by_boundary": None
-        if plan is None
-        else bool(plan.get("main_row_replaced_by_boundary")),
+        "main_row_replaced_by_boundary": None if plan is None else bool(plan.get("main_row_replaced_by_boundary")),
         "subprogram_cache_reused": cache_reused,
         "prefix_n_instr": None if subs is None else int(subs["prefix"]["n_instr"]),
         "post_n_instr": None if subs is None else int(subs["post"]["n_instr"]),
-        "sidecar_tile_range": None
-        if not cutpoints
-        else [0, int(cutpoints[0]["ntiles"])],
+        "sidecar_tile_range": None if not cutpoints else [0, int(cutpoints[0]["ntiles"])],
     }
 
 
@@ -202,15 +198,8 @@ def check_api_wrapper_equivalence(
     manual_stats = grad_stats(split)
     stat_delta = max_grad_stat_delta(api_stats, manual_stats)
     loss_diff = manual_loss - api_loss
-    stat_ok = (
-        float(stat_delta["max_abs_delta"]) <= stat_atol
-        or float(stat_delta["max_rel_delta"]) <= stat_rtol
-    )
-    ok = (
-        cache_reused
-        and abs(loss_diff) <= loss_atol
-        and stat_ok
-    )
+    stat_ok = float(stat_delta["max_abs_delta"]) <= stat_atol or float(stat_delta["max_rel_delta"]) <= stat_rtol
+    ok = cache_reused and abs(loss_diff) <= loss_atol and stat_ok
     return {
         "pass": ok,
         "cache_reused": cache_reused,

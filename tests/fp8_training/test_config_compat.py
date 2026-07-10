@@ -100,14 +100,10 @@ def test_vllm_fp8_runtime_knobs_fail_before_silent_translation():
         validate_external_fp8_runtime_config({"generation": {"vllm_cfg": {"use_deep_gemm": True}}})
 
     with pytest.raises(UnsupportedFP8ConfigError, match="pow2_weight_scaling_factors"):
-        validate_external_fp8_runtime_config(
-            {"generation": {"vllm_cfg": {"pow2_weight_scaling_factors": True}}}
-        )
+        validate_external_fp8_runtime_config({"generation": {"vllm_cfg": {"pow2_weight_scaling_factors": True}}})
 
     with pytest.raises(UnsupportedFP8ConfigError, match="pow2_activation_scaling_factors"):
-        validate_external_fp8_runtime_config(
-            {"generation": {"vllm_cfg": {"pow2_activation_scaling_factors": True}}}
-        )
+        validate_external_fp8_runtime_config({"generation": {"vllm_cfg": {"pow2_activation_scaling_factors": True}}})
 
     with pytest.raises(UnsupportedFP8ConfigError, match="receiver_kv_cache_dtype"):
         validate_external_fp8_runtime_config({"generation": {"vllm_cfg": {"kv_cache_dtype": "fp8_e4m3"}}})

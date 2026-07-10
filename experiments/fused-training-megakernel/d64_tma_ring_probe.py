@@ -445,19 +445,25 @@ def build():
 def gpu_util() -> int:
     dev = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]
     out = subprocess.run(
-        ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits",
-         "-i", dev],
-        capture_output=True, text=True,
+        ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits", "-i", dev],
+        capture_output=True,
+        text=True,
     )
     return int(out.stdout.strip().splitlines()[0])
 
 
 def make_inputs(M, N, K, a_t, b_t, seed):
     torch.manual_seed(seed)
-    a = (torch.randn(K, M, device="cuda", dtype=torch.bfloat16) if a_t
-         else torch.randn(M, K, device="cuda", dtype=torch.bfloat16)) * 0.05
-    b = (torch.randn(N, K, device="cuda", dtype=torch.bfloat16) if b_t
-         else torch.randn(K, N, device="cuda", dtype=torch.bfloat16)) * 0.05
+    a = (
+        torch.randn(K, M, device="cuda", dtype=torch.bfloat16)
+        if a_t
+        else torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    ) * 0.05
+    b = (
+        torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+        if b_t
+        else torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
+    ) * 0.05
     c = torch.empty(M, N, device="cuda", dtype=torch.float32)
     return a, b, c
 
@@ -482,12 +488,13 @@ def check(ext, M, N, K, a_t, b_t, bn, nblocks, claim):
         outs[variant] = c.clone()
         diff = (got - ref).abs()
         rel = (diff / ref.abs().clamp_min(0.25)).max().item()
-        print(f"check {_name(a_t, b_t)} bn={bn} M={M} N={N} K={K} {name}: "
-              f"max_abs={diff.max().item():.6e} rel={rel:.6e}", flush=True)
+        print(
+            f"check {_name(a_t, b_t)} bn={bn} M={M} N={N} K={K} {name}: max_abs={diff.max().item():.6e} rel={rel:.6e}",
+            flush=True,
+        )
         assert rel < 3e-2, name
     bit = torch.equal(outs[0], outs[1])
-    print(f"check {_name(a_t, b_t)} bn={bn}: tma vs cpasync bit-identical: {bit}",
-          flush=True)
+    print(f"check {_name(a_t, b_t)} bn={bn}: tma vs cpasync bit-identical: {bit}", flush=True)
     assert bit, "TMA feed must be bit-identical to the cp.async ring"
 
 
@@ -508,20 +515,23 @@ def bench(ext, M, N, K, a_t, b_t, bn, nblocks, claim, reps, iters, order, label=
             e = torch.cuda.Event(enable_timing=True)
             s.record()
             for _ in range(reps):
-                ext.run_ring(a, b, c, tmaps, claim, M, N, K, a_t, b_t, bn, variant,
-                             nblocks)
+                ext.run_ring(a, b, c, tmaps, claim, M, N, K, a_t, b_t, bn, variant, nblocks)
             e.record()
             torch.cuda.synchronize()
             vals.append(s.elapsed_time(e) * 1e3 / reps)
         vals.sort()
         results[name] = statistics.median(vals)
         tf = (2.0 * M * N * K) / (results[name] * 1e-6) / 1e12
-        print(f"  {name:12s} med={results[name]:9.3f}us min={vals[0]:9.3f} "
-              f"max={vals[-1]:9.3f} tf={tf:7.1f}", flush=True)
+        print(
+            f"  {name:12s} med={results[name]:9.3f}us min={vals[0]:9.3f} max={vals[-1]:9.3f} tf={tf:7.1f}", flush=True
+        )
     delta = results["tma-ring"] - results["cpasync-ring"]
     pct = 100.0 * delta / results["cpasync-ring"]
-    print(f"bench {label} {_name(a_t, b_t)} bn={bn} M={M} N={N} K={K} order={order}: "
-          f"tma-minus-cpasync {delta:+9.3f}us ({pct:+.2f}%)", flush=True)
+    print(
+        f"bench {label} {_name(a_t, b_t)} bn={bn} M={M} N={N} K={K} order={order}: "
+        f"tma-minus-cpasync {delta:+9.3f}us ({pct:+.2f}%)",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
@@ -533,9 +543,9 @@ if __name__ == "__main__":
     nblocks = torch.cuda.get_device_properties(dev).multi_processor_count
     claim = torch.zeros(1, device="cuda", dtype=torch.int32)
     # parity: K=512 wraps ring parity for both stage counts; all body/major combos
-    check(ext, 256, 512, 512, 0, 1, 64, nblocks, claim)   # m64n64 NT
-    check(ext, 256, 512, 512, 0, 0, 64, nblocks, claim)   # m64n64 NN (MN-major B)
-    check(ext, 256, 512, 512, 1, 0, 64, nblocks, claim)   # m64n64 TN (MN-major A)
+    check(ext, 256, 512, 512, 0, 1, 64, nblocks, claim)  # m64n64 NT
+    check(ext, 256, 512, 512, 0, 0, 64, nblocks, claim)  # m64n64 NN (MN-major B)
+    check(ext, 256, 512, 512, 1, 0, 64, nblocks, claim)  # m64n64 TN (MN-major A)
     check(ext, 256, 512, 512, 0, 1, 128, nblocks, claim)  # m64n128 NT
     check(ext, 256, 512, 512, 0, 0, 128, nblocks, claim)  # m64n128 NN
     if mode == "long":

@@ -24,14 +24,16 @@ class FakeExt:
         self.sidecar_calls: list[dict[str, object]] = []
 
     def run_qwen_nt_lmhead_sidecar(self, instrs, ins, t0, t1, bufs, smem_bytes) -> None:
-        self.sidecar_calls.append({
-            "instrs_device": str(getattr(instrs, "device", "")),
-            "bufs_device": str(getattr(bufs, "device", "")),
-            "ins": int(ins),
-            "t0": int(t0),
-            "t1": int(t1),
-            "smem_bytes": int(smem_bytes),
-        })
+        self.sidecar_calls.append(
+            {
+                "instrs_device": str(getattr(instrs, "device", "")),
+                "bufs_device": str(getattr(bufs, "device", "")),
+                "ins": int(ins),
+                "t0": int(t0),
+                "t1": int(t1),
+                "smem_bytes": int(smem_bytes),
+            }
+        )
 
 
 class NoExportExt:
@@ -151,25 +153,19 @@ def main() -> None:
         errors.append(f"wrong sidecar call ABI: {calls!r}")
 
     expect_raises(
-        lambda: default_model.prog.run_qwen_nt_lmhead_sidecar(
-            default_model.ext, default_model._smem_bytes
-        ),
+        lambda: default_model.prog.run_qwen_nt_lmhead_sidecar(default_model.ext, default_model._smem_bytes),
         "expected exactly one qwen NT sidecar cutpoint",
         errors,
         "default no-cutpoint guard",
     )
     expect_raises(
-        lambda: sidecar_only.prog.run_qwen_nt_lmhead_sidecar(
-            sidecar_only.ext, sidecar_only._smem_bytes
-        ),
+        lambda: sidecar_only.prog.run_qwen_nt_lmhead_sidecar(sidecar_only.ext, sidecar_only._smem_bytes),
         "expected exactly one qwen NT sidecar cutpoint",
         errors,
         "sidecar-only no-cutpoint guard",
     )
     expect_raises(
-        lambda: cutpoint_model.prog.run_qwen_nt_lmhead_sidecar(
-            NoExportExt(), cutpoint_model._smem_bytes
-        ),
+        lambda: cutpoint_model.prog.run_qwen_nt_lmhead_sidecar(NoExportExt(), cutpoint_model._smem_bytes),
         "extension was not built with qwen NT sidecar export",
         errors,
         "missing export guard",

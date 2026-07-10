@@ -149,27 +149,41 @@ def main() -> None:
     l2_default = emit("l2_default", CFG_L2, {})
     l2_top = emit("l2_topembed_forced", CFG_L2, {TOP_ENV: "1"})
     l2_pruned = emit("l2_pruned_forced", CFG_L2, {PRUNED_ENV: "1"})
-    l2_pruned_top0 = emit(
-        "l2_pruned_forced_topembed_env0", CFG_L2, {TOP_ENV: "0", PRUNED_ENV: "1"}
-    )
+    l2_pruned_top0 = emit("l2_pruned_forced_topembed_env0", CFG_L2, {TOP_ENV: "0", PRUNED_ENV: "1"})
     l1_pruned = emit("l1_pruned_forced_negative", CFG_L1, {PRUNED_ENV: "1"})
     small_pruned = emit("small_pruned_forced_negative", CFG_SMALL, {PRUNED_ENV: "1"})
-    l2_super_off = emit("l2_supertile_off_pruned_forced", CFG_L2, {
-        PRUNED_ENV: "1",
-        "MK_GEMM_N256_NT_SUPERTILE": "0",
-    })
-    l2_pdfprod_off = emit("l2_pdfprod_off_pruned_forced", CFG_L2, {
-        PRUNED_ENV: "1",
-        "MK_PDF_PRODUCER": "0",
-    })
-    l2_pdfonly_off = emit("l2_pdfonly_off_pruned_forced", CFG_L2, {
-        PRUNED_ENV: "1",
-        "MK_GEMM_N256_NT_SUPERTILE_PDFONLY": "0",
-    })
-    l2_reg_off = emit("l2_reg_off_pruned_forced", CFG_L2, {
-        PRUNED_ENV: "1",
-        "MK_GEMM_N256_NT_SUPERTILE_REG_EPI": "0",
-    })
+    l2_super_off = emit(
+        "l2_supertile_off_pruned_forced",
+        CFG_L2,
+        {
+            PRUNED_ENV: "1",
+            "MK_GEMM_N256_NT_SUPERTILE": "0",
+        },
+    )
+    l2_pdfprod_off = emit(
+        "l2_pdfprod_off_pruned_forced",
+        CFG_L2,
+        {
+            PRUNED_ENV: "1",
+            "MK_PDF_PRODUCER": "0",
+        },
+    )
+    l2_pdfonly_off = emit(
+        "l2_pdfonly_off_pruned_forced",
+        CFG_L2,
+        {
+            PRUNED_ENV: "1",
+            "MK_GEMM_N256_NT_SUPERTILE_PDFONLY": "0",
+        },
+    )
+    l2_reg_off = emit(
+        "l2_reg_off_pruned_forced",
+        CFG_L2,
+        {
+            PRUNED_ENV: "1",
+            "MK_GEMM_N256_NT_SUPERTILE_REG_EPI": "0",
+        },
+    )
 
     errors: list[str] = []
     invariant_fields = (
@@ -203,17 +217,10 @@ def main() -> None:
         errors.append("topembed-only route unexpectedly carries pruned flag")
     for tag, row in (("pruned", l2_pruned), ("pruned top0", l2_pruned_top0)):
         if not (
-            row["has_nttop_suffix"]
-            and row["has_nttop_define"]
-            and row["has_ntpr_suffix"]
-            and row["has_ntpr_define"]
+            row["has_nttop_suffix"] and row["has_nttop_define"] and row["has_ntpr_suffix"] and row["has_ntpr_define"]
         ):
             errors.append(f"{tag} did not carry topembed+pruned suffix/define")
-        if not (
-            row["has_nt_pdfonly_define"]
-            and row["has_nt_reg_define"]
-            and row["has_pdf_producer_define"]
-        ):
+        if not (row["has_nt_pdfonly_define"] and row["has_nt_reg_define"] and row["has_pdf_producer_define"]):
             errors.append(f"{tag} missing prerequisite qwen pdf/reg defines")
 
     for tag, row in (

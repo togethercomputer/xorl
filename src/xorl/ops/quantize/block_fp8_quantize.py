@@ -74,6 +74,7 @@ def block_fp8_quantize(
         raise ValueError(f"amax_scale must be positive, got {amax_scale}")
     y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
+
     def grid(meta):
         return (triton.cdiv(x.numel(), meta["BLOCK_SIZE"]),)
 
@@ -120,6 +121,7 @@ def block_fp8_dequantize(y: torch.Tensor, s: torch.Tensor, block_size: int = 128
     assert y.is_contiguous()
     assert y.size(-1) % block_size == 0, "Last dimension must be divisible by block_size"
     x = torch.empty_like(y, dtype=torch.float32)
+
     def grid(meta):
         return (triton.cdiv(y.numel(), meta["BLOCK_SIZE"]),)
 
@@ -356,9 +358,7 @@ def block_fp8_gemm(
         weight_scale_layout=weight_scale_layout,
     )
     if backend == "torch_scaled_mm" and not use_torch_scaled_mm:
-        raise ValueError(
-            "torch_scaled_mm backend requires CUDA FP8 rowwise block128 inputs with M/N/K divisible by 16"
-        )
+        raise ValueError("torch_scaled_mm backend requires CUDA FP8 rowwise block128 inputs with M/N/K divisible by 16")
     if use_torch_scaled_mm and backend in {"torch_scaled_mm", "auto"}:
         try:
             return _block_fp8_gemm_torch_scaled_mm(

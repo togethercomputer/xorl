@@ -133,18 +133,18 @@ def main() -> None:
                 sentinel_mask = after == sentinel
                 delta = torch.abs(after - sentinel)
                 finite_delta = delta[finite]
-                write_summary.update({
-                    "overwritten_count": int((~sentinel_mask).sum().item()),
-                    "sentinel_count": int(sentinel_mask.sum().item()),
-                    "finite_count": int(finite.sum().item()),
-                    "nan_count": int(torch.isnan(after).sum().item()),
-                    "tile_numel": int(after.numel()),
-                    "max_finite_abs_delta_from_sentinel": (
-                        float(finite_delta.max().item())
-                        if int(finite_delta.numel()) > 0
-                        else 0.0
-                    ),
-                })
+                write_summary.update(
+                    {
+                        "overwritten_count": int((~sentinel_mask).sum().item()),
+                        "sentinel_count": int(sentinel_mask.sum().item()),
+                        "finite_count": int(finite.sum().item()),
+                        "nan_count": int(torch.isnan(after).sum().item()),
+                        "tile_numel": int(after.numel()),
+                        "max_finite_abs_delta_from_sentinel": (
+                            float(finite_delta.max().item()) if int(finite_delta.numel()) > 0 else 0.0
+                        ),
+                    }
+                )
 
         has_export = hasattr(model.ext, "run_qwen_nt_lmhead_sidecar")
         export_callable = callable(getattr(model.ext, "run_qwen_nt_lmhead_sidecar", None))
@@ -173,7 +173,8 @@ def main() -> None:
                 and out_of_range_guard
                 and len(cutpoints) == 1
                 and len(boundary_rows) == 1
-                and row_summary == {
+                and row_summary
+                == {
                     "idx": 37,
                     "op": mk.OP_QWEN_NT_SIDECAR_BOUNDARY,
                     "ntiles": 4748,

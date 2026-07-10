@@ -7,8 +7,8 @@ import torch
 import xorl.server.runner.runner_dispatcher as runner_dispatcher_module
 from xorl.server.orchestrator.packing import SequentialPacker
 from xorl.server.runner.runner_dispatcher import RunnerDispatcher
-from xorl.server.side_payloads import MooncakeSidePayloadStore, put_r3_mooncake_payload_refs
 from xorl.server.runner.utils.batch_utils import batch_packed_rows
+from xorl.server.side_payloads import MooncakeSidePayloadStore, put_r3_mooncake_payload_refs
 
 
 pytestmark = [pytest.mark.cpu, pytest.mark.server]

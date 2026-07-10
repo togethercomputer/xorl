@@ -57,11 +57,7 @@ def _mix_torch_manual_seed(base_seed: int, *components: int) -> int:
     """Mix deterministic seed components into PyTorch's signed 63-bit range."""
     acc = int(base_seed) & _TORCH_MANUAL_SEED_MASK
     for index, component in enumerate(components, start=1):
-        acc = (
-            acc * 6364136223846793005
-            + int(component) * 1442695040888963407
-            + index
-        ) & _TORCH_MANUAL_SEED_MASK
+        acc = (acc * 6364136223846793005 + int(component) * 1442695040888963407 + index) & _TORCH_MANUAL_SEED_MASK
     return acc
 
 

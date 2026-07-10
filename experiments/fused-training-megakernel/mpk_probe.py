@@ -27,10 +27,10 @@ Run: CUDA_VISIBLE_DEVICES=<idle> .venv-fa4/bin/python mpk_probe.py
 """
 
 import statistics
-import sys
 
 import torch
 from torch.utils.cpp_extension import load_inline
+
 
 CUTE_INC = "/home/apanda/xorl-internal/.venv/lib/python3.12/site-packages/deep_gemm/include"
 
@@ -287,8 +287,10 @@ def main():
         st = stamps.cpu().tolist()
         hops = [(st[i + 1] - st[i]) / 1e3 for i in range(8, NI - 1)]
         hops.sort()
-        print(f"prefetch={pf}: total {med:8.1f}us for {NI} instrs = {med / NI:5.2f}us/hop"
-              f"   (stamp-median {hops[len(hops) // 2]:5.2f}us)")
+        print(
+            f"prefetch={pf}: total {med:8.1f}us for {NI} instrs = {med / NI:5.2f}us/hop"
+            f"   (stamp-median {hops[len(hops) // 2]:5.2f}us)"
+        )
 
 
 if __name__ == "__main__":

@@ -63,8 +63,11 @@ def attn_bands(n_qt128, stages_of, T):
 # MK_SWIGLU_CACHE_SIG and MK_SWIGLU_BWD_2W defaults (independently overridable).
 # Small H512/S1024 moved to cache-off 4W, with separate 2W fallback below.
 _SWIGLU_CACHED_2W = {
-    (256, 1024, 768), (256, 2048, 768),
-    (256, 3072, 768), (256, 4096, 768), (256, 8192, 768),
+    (256, 1024, 768),
+    (256, 2048, 768),
+    (256, 3072, 768),
+    (256, 4096, 768),
+    (256, 8192, 768),
 }
 _QWEN_L1_SWIGLU_BWD_2W = {
     (2560, 1024, 9728, 151936, 32, 8, 128, 1),  # H,S,I,V,nq,nkv,D,L
@@ -80,10 +83,17 @@ _SMALL_SWIGLU_BWD_4W = {
 }
 _SMALL_SWIGLU_BWD_2W = _SMALL_SWIGLU_BWD_4W
 _H256_IDLE32_S = (2048, 3072, 4096, 8192)  # H==256: scheduler idle poll 32ns (else 256)
-_H256_DQ_FLOAT2_S = (128, 256, 3072, 8192) # H==256: attention-dQ float2 direct store
-_H256_D64_DKV_ROW_BCAST_S = ()             # H==256/D==64: attention-dKV row scalar shuffles
-_H256_RMS_DX_H256_S = (128, 512, 1024, 2048, 3072, 8192) # H==256: fixed-width RMS bwd-dx opcode; S256/S4096 rejected (see rmsdx-h256-mids-3f21e1e.md)
-_H256_D64_DROW_ZERO_SKIP_S = (256, 512)    # H==256/D==64: direct-store drow overwrites
+_H256_DQ_FLOAT2_S = (128, 256, 3072, 8192)  # H==256: attention-dQ float2 direct store
+_H256_D64_DKV_ROW_BCAST_S = ()  # H==256/D==64: attention-dKV row scalar shuffles
+_H256_RMS_DX_H256_S = (
+    128,
+    512,
+    1024,
+    2048,
+    3072,
+    8192,
+)  # H==256: fixed-width RMS bwd-dx opcode; S256/S4096 rejected (see rmsdx-h256-mids-3f21e1e.md)
+_H256_D64_DROW_ZERO_SKIP_S = (256, 512)  # H==256/D==64: direct-store drow overwrites
 _ATTN_BWD_BAND_T = {2048: 12, 3072: 20, 4096: 29, 8192: 40}  # H==256/D==64; 0 elsewhere
 # (3072: 16->20 post-dq-p-pack, resweep flip: -12.8/-5.4 38/40+32/40 both orders)
 _ATTN_FWD_BAND_T = {2048: 16, 3072: 32, 4096: 22, 8192: 64}  # H==256/D==64; 0 elsewhere
@@ -106,20 +116,24 @@ _D128_FWD_MBAR = {(2560, 1024, 9728, 151936, 32, 8, 128, 1)}  # H,S,I,V,nq,nkv,D
 # qwen4b L=1 and L=2: the L2 tuple was promoted as the arm-A GEMM cluster
 # (stage3+nmajor+dqRS+ring+TMA together): -1530.45/-1509.79us, 12/12 both
 # construction orders (mkv3-p4b-qwenl2-gemmcluster-*-20260706T2350Z.log).
-_D128_DQ_ROWSPLIT = {(2560, 1024, 9728, 151936, 32, 8, 128, 1),
-                     (2560, 1024, 9728, 151936, 32, 8, 128, 2)}  # H,S,I,V,nq,nkv,D,L
+_D128_DQ_ROWSPLIT = {
+    (2560, 1024, 9728, 151936, 32, 8, 128, 1),
+    (2560, 1024, 9728, 151936, 32, 8, 128, 2),
+}  # H,S,I,V,nq,nkv,D,L
 # L=1 original; L=2 promoted 20260707: routing head-dX off the splitK route
 # onto no-split n256+stage3+nmajor+ring+TMA measured -2152.2/-2149.6us,
 # 12/12 both construction orders, loss diff exactly 0, n_instr 79->78
 # (mkv3-p4b-qwenl2-headdx-n256-*-20260707T0225Z.log).
-_QWEN_L1_HEAD_DX_N128_F32 = {(2560, 1024, 151936, 32, 8, 128, 1),
-                             (2560, 1024, 151936, 32, 8, 128, 2)}  # H,S,V,nq,nkv,D,L
+_QWEN_L1_HEAD_DX_N128_F32 = {
+    (2560, 1024, 151936, 32, 8, 128, 1),
+    (2560, 1024, 151936, 32, 8, 128, 2),
+}  # H,S,V,nq,nkv,D,L
 _QWEN_L1_DW_NO_ATOMIC_SK1 = {  # M,N,K for qwen4b-l1 dW GEMMs that split-K computes as sk=1
     (151936, 2560, 1024),  # wlm
-    (2560, 9728, 1024),    # wd
-    (19456, 2560, 1024),   # wgu
-    (2560, 4096, 1024),    # wo
-    (6144, 2560, 1024),    # wqkv
+    (2560, 9728, 1024),  # wd
+    (19456, 2560, 1024),  # wgu
+    (2560, 4096, 1024),  # wo
+    (6144, 2560, 1024),  # wqkv
 }
 _GENERIC_SHORT_DW_NO_ATOMIC_SK1_CFGS = {
     # 20260707 current-head gate: removing generic dW sk=1 zero-fill+atomics
@@ -139,8 +153,7 @@ _GENERIC_SHORT_DW_NO_ATOMIC_SK1_CFGS = {
     (512, 8, 8, 4, 64, 1536, 16384, 1024),
 }
 # dlogits @ Wlm split-K tile targets: {H: {S: target}}, 192 elsewhere.
-_HEAD_DX_TARGET = {256: {128: 32, 256: 64, 1024: 64, 512: 96, 2048: 96, 3072: 96},
-                   512: {1024: 96}}
+_HEAD_DX_TARGET = {256: {128: 32, 256: 64, 1024: 64, 512: 96, 2048: 96, 3072: 96}, 512: {1024: 96}}
 # Round-12 SKR head-dX (splitK + separate reduce): K-sliced n128 tiles write plain
 # fp32 partial slabs; OP_SKR_REDUCE sums them into dXN_f32. Value = slice count.
 # Measured: small skr=2 -115/-108us 40/40 both orders (skr=3 -98, skr=4 -77/-59);
@@ -156,11 +169,11 @@ _HEAD_DX_TARGET = {256: {128: 32, 256: 64, 1024: 64, 512: 96, 2048: 96, 3072: 96
 # MK_HEAD_DX_SKR force-overrides (0 = old route).
 _HEAD_DX_SKR = {
     (512, 1024, 1536, 16384, 8, 4, 64, 8): 2,  # H,S,I,V,nq,nkv,D,L (small)
-    (256, 512, 768, 8192, 4, 2, 64, 4): 4,     # nano
-    (256, 512, 768, 8192, 4, 2, 64, 12): 4,    # deep
-    (256, 1024, 768, 8192, 4, 2, 64, 4): 4,    # s1024
-    (256, 3072, 768, 8192, 4, 2, 64, 4): 2,    # s3072
-    (256, 4096, 768, 8192, 4, 2, 64, 4): 2,    # s4096
+    (256, 512, 768, 8192, 4, 2, 64, 4): 4,  # nano
+    (256, 512, 768, 8192, 4, 2, 64, 12): 4,  # deep
+    (256, 1024, 768, 8192, 4, 2, 64, 4): 4,  # s1024
+    (256, 3072, 768, 8192, 4, 2, 64, 4): 2,  # s3072
+    (256, 4096, 768, 8192, 4, 2, 64, 4): 2,  # s4096
 }
 # Producer-df executor mode (megakernel_pdf): 384thr, consumers in a
 # setmaxnreg-region at 240 regs, WG2 = pure-TMA producer feeding the n256-TMA
@@ -177,10 +190,10 @@ _HEAD_DX_SKR = {
 _PDF_MODE = {
     (2560, 1024, 9728, 151936, 32, 8, 128, 1),  # H,S,I,V,nq,nkv,D,L (qwen4b-l1)
     (2560, 1024, 9728, 151936, 32, 8, 128, 2),  # qwen4b-l2
-    (256, 2048, 768, 8192, 4, 2, 64, 4),        # s2048
-    (256, 3072, 768, 8192, 4, 2, 64, 4),        # s3072
-    (256, 4096, 768, 8192, 4, 2, 64, 4),        # s4096
-    (256, 8192, 768, 8192, 4, 2, 64, 4),        # s8192
+    (256, 2048, 768, 8192, 4, 2, 64, 4),  # s2048
+    (256, 3072, 768, 8192, 4, 2, 64, 4),  # s3072
+    (256, 4096, 768, 8192, 4, 2, 64, 4),  # s4096
+    (256, 8192, 768, 8192, 4, 2, 64, 4),  # s8192
 }
 
 
@@ -221,9 +234,7 @@ class MKQwen3:
         # both construction orders; mkv3-p4b-postband-knob-recheck-20260705T185629Z).
         self.swiglu_cache_sig_default = (c.H, c.S, c.I) in _SWIGLU_CACHED_2W
         self.swiglu_cache_sig_enabled = (
-            self.swiglu_cache_sig_default
-            if swiglu_cache_sig_env is None
-            else bool(int(swiglu_cache_sig_env))
+            self.swiglu_cache_sig_default if swiglu_cache_sig_env is None else bool(int(swiglu_cache_sig_env))
         )
 
         def P(*shape, std=0.02):
@@ -312,29 +323,19 @@ class MKQwen3:
         for l in range(c.L):
             W[f"dQKV_f32.{l}"] = torch.empty(c.S, QD, device=dev, dtype=f32)
         W["dXN_f32"] = torch.empty(c.S, c.H, device=dev, dtype=f32)
-        qwen_hdx_rmsdot_shape = (
-            (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
-            == (2560, 2, 1024, 32, 8, 128, 9728, 151936)
-        )
+        qwen_hdx_rmsdot_shape = (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V) == (2560, 2, 1024, 32, 8, 128, 9728, 151936)
         qwen_hdx_rmsdot_env = os.environ.get("MK_QWEN_HEADDX_RMS_DOT_PARTIALS")
         self.qwen_head_dx_rmsdot_partials_default = qwen_hdx_rmsdot_shape
         self.qwen_head_dx_rmsdot_partials_requested = (
-            (
-                self.qwen_head_dx_rmsdot_partials_default
-                if qwen_hdx_rmsdot_env is None
-                else bool(int(qwen_hdx_rmsdot_env))
-            )
-            and qwen_hdx_rmsdot_shape
-        )
+            self.qwen_head_dx_rmsdot_partials_default if qwen_hdx_rmsdot_env is None else bool(int(qwen_hdx_rmsdot_env))
+        ) and qwen_hdx_rmsdot_shape
         if self.qwen_head_dx_rmsdot_partials_requested:
             W["headdx_rmsdot_parts"] = torch.empty(c.S, c.H // 256, device=dev, dtype=f32)
         # round-12 SKR head-dX (see _HEAD_DX_SKR): per-K-slice fp32 partial slabs for
         # the split head-dX gemm; OP_SKR_REDUCE sums them into dXN_f32
         skr_env = os.environ.get("MK_HEAD_DX_SKR")
         skr_key = (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L)
-        self.head_dx_skr = (
-            _HEAD_DX_SKR.get(skr_key, 0) if skr_env is None else int(skr_env)
-        )
+        self.head_dx_skr = _HEAD_DX_SKR.get(skr_key, 0) if skr_env is None else int(skr_env)
         if not (c.S % 128 == 0 and c.H % 128 == 0 and c.V % 64 == 0):
             self.head_dx_skr = 0
         if self.head_dx_skr > 1:
@@ -356,9 +357,7 @@ class MKQwen3:
         # fwd split-band partials (MK_ATTN_FWD_BAND = target stages per chunk, 0 =
         # off): straggler q-tiles run as flash-decoding kv chunks writing
         # locally-normalized partials; a range-limited OP_ATTN_COMBINE merges them.
-        default_attn_fwd_band_T = (
-            _ATTN_FWD_BAND_T.get(c.S, 0) if c.H == 256 and c.D == 64 else 0
-        )
+        default_attn_fwd_band_T = _ATTN_FWD_BAND_T.get(c.S, 0) if c.H == 256 and c.D == 64 else 0
         self.attn_fwd_band_T = int(os.environ.get("MK_ATTN_FWD_BAND", str(default_attn_fwd_band_T)))
         self.attn_fwd_bands = None
         if self.attn_fwd_band_T > 0 and c.D == 64 and c.S % 128 == 0:
@@ -377,42 +376,37 @@ class MKQwen3:
             or (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) in _QWEN_L1_SWIGLU_BWD_2W
             or (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) in _SMALL_SWIGLU_BWD_2W
         )
-        self.swiglu_bwd_4w_default = (
-            (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) in _QWEN_L1_SWIGLU_BWD_4W
-            or (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) in _SMALL_SWIGLU_BWD_4W
-        )
+        self.swiglu_bwd_4w_default = (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) in _QWEN_L1_SWIGLU_BWD_4W or (
+            c.H,
+            c.S,
+            c.I,
+            c.V,
+            c.nq,
+            c.nkv,
+            c.D,
+            c.L,
+        ) in _SMALL_SWIGLU_BWD_4W
         self.drow_direct_store_default = c.D == 64 and c.S < 2048
         drow_direct_store_env = os.environ.get("MK_DROW_DIRECT_STORE")
         self.drow_direct_store_enabled = (
-            self.drow_direct_store_default
-            if drow_direct_store_env is None
-            else bool(int(drow_direct_store_env))
+            self.drow_direct_store_default if drow_direct_store_env is None else bool(int(drow_direct_store_env))
         )
-        self.drow_direct_store_overwrites = (
-            self.drow_direct_store_enabled and c.D == 64 and c.S < 2048
-        )
+        self.drow_direct_store_overwrites = self.drow_direct_store_enabled and c.D == 64 and c.S < 2048
         drow_zero_fill_env = os.environ.get("MK_DROW_ZERO_FILL")
         self.drow_zero_fill_default = not (
-            self.drow_direct_store_overwrites
-            and c.H == 256 and c.L == 4 and c.S in _H256_D64_DROW_ZERO_SKIP_S
+            self.drow_direct_store_overwrites and c.H == 256 and c.L == 4 and c.S in _H256_D64_DROW_ZERO_SKIP_S
         )
         self.drow_zero_fill_enabled = (
             self.drow_zero_fill_default
             if drow_zero_fill_env is None
             else bool(int(drow_zero_fill_env)) or not self.drow_direct_store_overwrites
         )
-        exact_h256_d64_s128_s256 = (
-            (c.H, c.L, c.nq, c.nkv, c.D, c.I, c.V) == (256, 4, 4, 2, 64, 768, 8192)
-            and c.S in (128, 256)
+        exact_h256_d64_s128_s256 = (c.H, c.L, c.nq, c.nkv, c.D, c.I, c.V) == (256, 4, 4, 2, 64, 768, 8192) and c.S in (
+            128,
+            256,
         )
-        exact_h256_d64_deep = (
-            (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
-            == (256, 12, 512, 4, 2, 64, 768, 8192)
-        )
-        self.attn_exp2_approx_default = (
-            (c.D == 64 and c.S >= 512 and c.S % 128 == 0)
-            or exact_h256_d64_s128_s256
-        )
+        exact_h256_d64_deep = (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V) == (256, 12, 512, 4, 2, 64, 768, 8192)
+        self.attn_exp2_approx_default = (c.D == 64 and c.S >= 512 and c.S % 128 == 0) or exact_h256_d64_s128_s256
         self.lmhead_exp2_approx_default = c.V >= 8192 and c.V % 64 == 0 and c.S >= 256
         self.ce_bwd_exp2_approx_default = c.S >= 1024 and c.V >= 8192 and c.V % 8 == 0
         # S2048/S8192 joined post-band; the full long-S H256 bucket now wins 32ns
@@ -436,63 +430,34 @@ class MKQwen3:
         else:
             self.idle_ns_default = 256
         self.attn_dkv_float2_atomic_default = c.D == 64 and c.S % 128 == 0
-        self.attn_dkv_row_bcast_default = (
-            c.H == 256 and c.D == 64 and c.S in _H256_D64_DKV_ROW_BCAST_S
-        )
+        self.attn_dkv_row_bcast_default = c.H == 256 and c.D == 64 and c.S in _H256_D64_DKV_ROW_BCAST_S
         self.attn_dq_float2_store_default = c.H == 256 and c.S in _H256_DQ_FLOAT2_S
-        self.attn_fast_log_default = (
-            (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
-            != (512, 8, 1024, 8, 4, 64, 1536, 16384)
+        self.attn_fast_log_default = (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V) != (
+            512,
+            8,
+            1024,
+            8,
+            4,
+            64,
+            1536,
+            16384,
         )
-        exact_qwen4b_l1 = (
-            (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
-            == (2560, 1, 1024, 32, 8, 128, 9728, 151936)
-        )
-        exact_qwen4b_l2 = (
-            (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
-            == (2560, 2, 1024, 32, 8, 128, 9728, 151936)
-        )
-        exact_s8192 = (
-            (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
-            == (256, 4, 8192, 4, 2, 64, 768, 8192)
-        )
-        exact_s4096 = (
-            (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
-            == (256, 4, 4096, 4, 2, 64, 768, 8192)
-        )
-        exact_s3072 = (
-            (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
-            == (256, 4, 3072, 4, 2, 64, 768, 8192)
-        )
-        exact_s2048 = (
-            (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
-            == (256, 4, 2048, 4, 2, 64, 768, 8192)
-        )
-        exact_s1024 = (
-            (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
-            == (256, 4, 1024, 4, 2, 64, 768, 8192)
-        )
-        exact_h256_d64_nano = (
-            (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
-            == (256, 4, 512, 4, 2, 64, 768, 8192)
-        )
-        exact_small_h512_s1024 = (
-            (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V)
-            == (512, 8, 1024, 8, 4, 64, 1536, 16384)
-        )
+        exact_qwen4b_l1 = (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V) == (2560, 1, 1024, 32, 8, 128, 9728, 151936)
+        exact_qwen4b_l2 = (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V) == (2560, 2, 1024, 32, 8, 128, 9728, 151936)
+        exact_s8192 = (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V) == (256, 4, 8192, 4, 2, 64, 768, 8192)
+        exact_s4096 = (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V) == (256, 4, 4096, 4, 2, 64, 768, 8192)
+        exact_s3072 = (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V) == (256, 4, 3072, 4, 2, 64, 768, 8192)
+        exact_s2048 = (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V) == (256, 4, 2048, 4, 2, 64, 768, 8192)
+        exact_s1024 = (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V) == (256, 4, 1024, 4, 2, 64, 768, 8192)
+        exact_h256_d64_nano = (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V) == (256, 4, 512, 4, 2, 64, 768, 8192)
+        exact_small_h512_s1024 = (c.H, c.L, c.S, c.nq, c.nkv, c.D, c.I, c.V) == (512, 8, 1024, 8, 4, 64, 1536, 16384)
         # exact_qwen4b_l2 added on the l2 support battery: 4 negative windows
         # (-52.6/-12.9/-13.6/-73.1us; mkv3-p4b-qwenl2-peel-support + followup).
-        self.ce_bwd_label_fixup_default = (
-            exact_qwen4b_l1 or exact_s8192 or exact_small_h512_s1024
-            or exact_qwen4b_l2
-        )
+        self.ce_bwd_label_fixup_default = exact_qwen4b_l1 or exact_s8192 or exact_small_h512_s1024 or exact_qwen4b_l2
         self.gemm_mbar_ring_default = (
-            c.D == 64 and c.S >= 1024 and c.S % 128 == 0
-        ) or exact_qwen4b_l1 or exact_qwen4b_l2
-        self.gemm_n256_nt_mbar_default = (
-            self.gemm_mbar_ring_default
-            and not (exact_qwen4b_l1 or exact_qwen4b_l2)
+            (c.D == 64 and c.S >= 1024 and c.S % 128 == 0) or exact_qwen4b_l1 or exact_qwen4b_l2
         )
+        self.gemm_n256_nt_mbar_default = self.gemm_mbar_ring_default and not (exact_qwen4b_l1 or exact_qwen4b_l2)
         # GEMM round-4 TMA feed on the n256 NN ring rows (elected-thread
         # cp.async.bulk.tensor + expect_tx from a global tensormap table).
         # Promoted exact-qwen: -340.40/-335.25us, 16/16 both construction
@@ -538,32 +503,18 @@ class MKQwen3:
         # Qwen ST-S3 PDF compile-prune: in producer-pdf mode, compile out the
         # consumer-side non-PDF TMA fallback from the exact NT supertile body.
         # MK_GEMM_N256_NT_SUPERTILE_PDFONLY=0 restores the fallback body.
-        self.gemm_n256_nt_supertile_pdfonly_default = (
-            exact_qwen4b_l1 or exact_qwen4b_l2
-        )
+        self.gemm_n256_nt_supertile_pdfonly_default = exact_qwen4b_l1 or exact_qwen4b_l2
         # L2 qwen ST-S3 PDF body: skip the second internal sync after tid0
         # reinitializes NT supertile mbarriers.
         # MK_GEMM_N256_NT_SUPERTILE_POSTINIT_NOSYNC=0 restores the old sync path;
         # L1 remains env-only until it has stronger evidence.
         self.gemm_n256_nt_supertile_postinit_nosync_default = exact_qwen4b_l2
-        nt_supertile_topembed_env = os.environ.get(
-            "MK_GEMM_N256_NT_SUPERTILE_TOPEMBED"
-        )
-        nt_supertile_pruned_env = os.environ.get(
-            "MK_GEMM_N256_NT_SUPERTILE_PRUNED"
-        )
-        nt_supertile_sidecar_env = os.environ.get(
-            "MK_GEMM_N256_NT_SUPERTILE_SIDECAR"
-        )
-        nt_supertile_sidecar_cutpoint_env = os.environ.get(
-            "MK_GEMM_N256_NT_SUPERTILE_SIDECAR_CUTPOINT"
-        )
-        nt_supertile_sidecar_split_plan_env = os.environ.get(
-            "MK_GEMM_N256_NT_SUPERTILE_SIDECAR_SPLIT_PLAN"
-        )
-        nt_supertile_sidecar_boundary_env = os.environ.get(
-            "MK_GEMM_N256_NT_SUPERTILE_SIDECAR_BOUNDARY"
-        )
+        nt_supertile_topembed_env = os.environ.get("MK_GEMM_N256_NT_SUPERTILE_TOPEMBED")
+        nt_supertile_pruned_env = os.environ.get("MK_GEMM_N256_NT_SUPERTILE_PRUNED")
+        nt_supertile_sidecar_env = os.environ.get("MK_GEMM_N256_NT_SUPERTILE_SIDECAR")
+        nt_supertile_sidecar_cutpoint_env = os.environ.get("MK_GEMM_N256_NT_SUPERTILE_SIDECAR_CUTPOINT")
+        nt_supertile_sidecar_split_plan_env = os.environ.get("MK_GEMM_N256_NT_SUPERTILE_SIDECAR_SPLIT_PLAN")
+        nt_supertile_sidecar_boundary_env = os.environ.get("MK_GEMM_N256_NT_SUPERTILE_SIDECAR_BOUNDARY")
         nt_supertile_sidecar_boundary_default = exact_qwen4b_l1 or exact_qwen4b_l2
         self.gemm_n256_nt_supertile_sidecar_boundary_requested = bool(
             int(
@@ -572,17 +523,19 @@ class MKQwen3:
                 else str(int(nt_supertile_sidecar_boundary_default))
             )
         )
-        self.gemm_n256_nt_supertile_sidecar_split_plan_requested = bool(
-            int(nt_supertile_sidecar_split_plan_env or "0")
-        ) or self.gemm_n256_nt_supertile_sidecar_boundary_requested
+        self.gemm_n256_nt_supertile_sidecar_split_plan_requested = (
+            bool(int(nt_supertile_sidecar_split_plan_env or "0"))
+            or self.gemm_n256_nt_supertile_sidecar_boundary_requested
+        )
         nt_supertile_sidecar_requested = (
             bool(int(nt_supertile_sidecar_env or "0"))
             or bool(int(nt_supertile_sidecar_cutpoint_env or "0"))
             or self.gemm_n256_nt_supertile_sidecar_split_plan_requested
         )
-        self.gemm_n256_nt_supertile_sidecar_cutpoint_requested = bool(
-            int(nt_supertile_sidecar_cutpoint_env or "0")
-        ) or self.gemm_n256_nt_supertile_sidecar_split_plan_requested
+        self.gemm_n256_nt_supertile_sidecar_cutpoint_requested = (
+            bool(int(nt_supertile_sidecar_cutpoint_env or "0"))
+            or self.gemm_n256_nt_supertile_sidecar_split_plan_requested
+        )
         self.gemm_n256_nt_supertile_pruned_enabled = (
             bool(int(nt_supertile_pruned_env or "0"))
             and exact_qwen4b_l2
@@ -598,16 +551,13 @@ class MKQwen3:
             and self.gemm_n256_nt_supertile_pdfonly_default
         )
         self.gemm_n256_nt_supertile_sidecar_cutpoint_enabled = (
-            self.gemm_n256_nt_supertile_sidecar_cutpoint_requested
-            and self.gemm_n256_nt_supertile_sidecar_enabled
+            self.gemm_n256_nt_supertile_sidecar_cutpoint_requested and self.gemm_n256_nt_supertile_sidecar_enabled
         )
         self.gemm_n256_nt_supertile_sidecar_boundary_enabled = (
-            self.gemm_n256_nt_supertile_sidecar_boundary_requested
-            and self.gemm_n256_nt_supertile_sidecar_enabled
+            self.gemm_n256_nt_supertile_sidecar_boundary_requested and self.gemm_n256_nt_supertile_sidecar_enabled
         )
         self.gemm_n256_nt_supertile_topembed_enabled = (
-            (bool(int(nt_supertile_topembed_env or "0"))
-             or self.gemm_n256_nt_supertile_pruned_enabled)
+            (bool(int(nt_supertile_topembed_env or "0")) or self.gemm_n256_nt_supertile_pruned_enabled)
             and exact_qwen4b_l2
             and self.gemm_n256_nt_supertile_enabled
             and self.gemm_n256_nt_supertile_reg_epi_enabled
@@ -640,18 +590,30 @@ class MKQwen3:
         # the exact promoted shape; MK_QWEN_HEADDX_RMS_DOT_PARTIALS=0 is the
         # rollback guard, and dependency checks below keep the producer/consumer
         # contract tied to the exact PDF head-dX + H2560 RMS-dX route.
-        _rms2560_on = bool(int(os.environ.get(
-            "MK_RMS_DX_H2560",
-            str(int(bool(self.rms_dx_h2560_default))),
-        )))
-        _hdx_exact_on = bool(int(os.environ.get(
-            "MK_GEMM_N256_HEAD_DX_EXACT",
-            str(int(bool(self.gemm_n256_head_dx_exact_default))),
-        )))
-        _hdx_pdfonly_on = bool(int(os.environ.get(
-            "MK_GEMM_N256_HEAD_DX_PDFONLY",
-            str(int(bool(self.gemm_n256_head_dx_pdfonly_default))),
-        )))
+        _rms2560_on = bool(
+            int(
+                os.environ.get(
+                    "MK_RMS_DX_H2560",
+                    str(int(bool(self.rms_dx_h2560_default))),
+                )
+            )
+        )
+        _hdx_exact_on = bool(
+            int(
+                os.environ.get(
+                    "MK_GEMM_N256_HEAD_DX_EXACT",
+                    str(int(bool(self.gemm_n256_head_dx_exact_default))),
+                )
+            )
+        )
+        _hdx_pdfonly_on = bool(
+            int(
+                os.environ.get(
+                    "MK_GEMM_N256_HEAD_DX_PDFONLY",
+                    str(int(bool(self.gemm_n256_head_dx_pdfonly_default))),
+                )
+            )
+        )
         self.qwen_head_dx_rmsdot_partials_enabled = (
             self.qwen_head_dx_rmsdot_partials_requested
             and exact_qwen4b_l2
@@ -683,9 +645,11 @@ class MKQwen3:
         # after the current-head gate at 9550a7b (-16.34/-8.40us, 80/80 and
         # 74/80 wins; S1024/H512 small stayed no-go). MK_GEMM_D64_TMA=0/1
         # overrides, MK_GEMM_D64_TMA_TN=0 excludes the TN dW rows for A/B.
-        exact_long_d64 = (
-            (c.H, c.L, c.nq, c.nkv, c.D, c.I, c.V) == (256, 4, 4, 2, 64, 768, 8192)
-            and c.S in (2048, 3072, 4096, 8192)
+        exact_long_d64 = (c.H, c.L, c.nq, c.nkv, c.D, c.I, c.V) == (256, 4, 4, 2, 64, 768, 8192) and c.S in (
+            2048,
+            3072,
+            4096,
+            8192,
         )
         self.gemm_d64_tma_default = exact_long_d64
         # dX split-K TMA reduce-add: measured positive only on the generic H256/D64
@@ -704,9 +668,7 @@ class MKQwen3:
         # and replace only the full-tile fp32 atomic drain with per-row
         # cp.reduce.async.bulk.add.f32. MK_DW_TN_TMA_RED=0/1 guards A/B.
         dw_tn_tma_red_env = os.environ.get("MK_DW_TN_TMA_RED")
-        self.dw_tn_tma_red_enabled = (
-            exact_s1024 if dw_tn_tma_red_env is None else bool(int(dw_tn_tma_red_env))
-        )
+        self.dw_tn_tma_red_enabled = exact_s1024 if dw_tn_tma_red_env is None else bool(int(dw_tn_tma_red_env))
         # n256-direct NT EVICT_FIRST TMA C store (DeepGEMM R3 port): default-on
         # for the measured C-write-bound H256/D64 long-S lm-head rows only.
         # Certified paired A/B both orders (n256-tmastore-94cb1ef gate job):
@@ -718,50 +680,33 @@ class MKQwen3:
         # -14.9/-22.3us 38/40+39/40 both orders; s1024 wash (+1.2, 19/40 — its
         # 2-wave head has less C-store pressure), stays off.
         exact_n256_tma_store = (
-            (c.H, c.L, c.nq, c.nkv, c.D, c.I, c.V) == (256, 4, 4, 2, 64, 768, 8192)
-            and c.S in (2048, 3072, 4096, 8192)
-        ) or (
-            (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) == (512, 1024, 1536, 16384, 8, 4, 64, 8)
-        )
+            (c.H, c.L, c.nq, c.nkv, c.D, c.I, c.V) == (256, 4, 4, 2, 64, 768, 8192) and c.S in (2048, 3072, 4096, 8192)
+        ) or ((c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) == (512, 1024, 1536, 16384, 8, 4, 64, 8))
         gemm_n256_tma_store_env = os.environ.get("MK_GEMM_N256_TMA_STORE")
         self.gemm_n256_tma_store_enabled = (
-            exact_n256_tma_store
-            if gemm_n256_tma_store_env is None
-            else bool(int(gemm_n256_tma_store_env))
+            exact_n256_tma_store if gemm_n256_tma_store_env is None else bool(int(gemm_n256_tma_store_env))
         )
         # Plain BF16 WGMMA GEMM epilogue: exact S1024 joined after the current
         # attention+dW promoted stack made 16 plain rows selected-path visible.
         self.gemm_direct_bf16_epilogue_default = c.D == 64 and (
-            c.S == 128
-            or exact_s1024
-            or (c.H, c.L, c.S, c.nq, c.nkv, c.I) == (512, 8, 1024, 8, 4, 1536)
+            c.S == 128 or exact_s1024 or (c.H, c.L, c.S, c.nq, c.nkv, c.I) == (512, 8, 1024, 8, 4, 1536)
         )
         # Direct N64 GEMM dispatch removes the generic opcode switch inside the
         # DF tile loop. It stays exact-short-shape gated: exact S1024 loses under
         # composition, while H256/D64 S128/S256/nano/deep win. Env 0/1 remains
         # the rollback/A-B override.
-        self.gemm_n64_fast_dispatch_default = (
-            exact_h256_d64_s128_s256 or exact_h256_d64_nano or exact_h256_d64_deep
-        )
+        self.gemm_n64_fast_dispatch_default = exact_h256_d64_s128_s256 or exact_h256_d64_nano or exact_h256_d64_deep
         # D64 standard WGMMA Drow register epilogue: compute the Drow dot from
         # the bf16-rounded register accumulator and skip the shared-memory Cs
         # reread loop. Measured positive on s128/s256/nano/deep/s1024/small;
         # MK_DROW_REG_EPILOGUE=0 keeps a direct rollback/forced-off guard.
-        exact_h256_d64_drow_reg = (
-            (c.H, c.nq, c.nkv, c.D, c.I, c.V) == (256, 4, 2, 64, 768, 8192)
-            and (
-                (c.L == 4 and c.S in (128, 256, 512, 1024))
-                or (c.L == 12 and c.S == 512)
-            )
+        exact_h256_d64_drow_reg = (c.H, c.nq, c.nkv, c.D, c.I, c.V) == (256, 4, 2, 64, 768, 8192) and (
+            (c.L == 4 and c.S in (128, 256, 512, 1024)) or (c.L == 12 and c.S == 512)
         )
-        self.drow_reg_epilogue_default = (
-            exact_h256_d64_drow_reg or exact_small_h512_s1024
-        )
+        self.drow_reg_epilogue_default = exact_h256_d64_drow_reg or exact_small_h512_s1024
         drow_reg_epilogue_env = os.environ.get("MK_DROW_REG_EPILOGUE")
         self.drow_reg_epilogue_enabled = (
-            self.drow_reg_epilogue_default
-            if drow_reg_epilogue_env is None
-            else bool(int(drow_reg_epilogue_env))
+            self.drow_reg_epilogue_default if drow_reg_epilogue_env is None else bool(int(drow_reg_epilogue_env))
         )
         self.attn_combine_unroll_default = (
             c.H == 256
@@ -779,9 +724,7 @@ class MKQwen3:
         # made DKV fully selected-path visible. Exact H256 deep S512 joined in
         # the short-S attention combo confirmation; keep the gate exact because
         # small stayed neutral/negative.
-        self.attn_exp2_prebias_default = (
-            exact_s4096 or exact_s8192 or exact_s1024 or exact_h256_d64_deep
-        )
+        self.attn_exp2_prebias_default = exact_s4096 or exact_s8192 or exact_s1024 or exact_h256_d64_deep
         # Fwd D64 exp-argument fold: long S8192 is a hard no-go, but exact S1024
         # wins both construction orders after the head-dX SKR and DQ RS+fp32-P
         # schedule changes. MK_ATTN_FWD_EXPFOLD=0/1 remains the explicit A/B
@@ -849,52 +792,37 @@ class MKQwen3:
         # results/operator-gap/deep-dq-bulkred-a00c1dd-promote.md, and
         # results/operator-gap/dq-bulkred-gatemap-3f21e1e.md.
         self.attn_dq_bulk_red_default = (
-            exact_s4096
-            or exact_h256_d64_deep
-            or exact_h256_d64_nano
-            or exact_s1024
-            or exact_s2048
-            or exact_s3072
+            exact_s4096 or exact_h256_d64_deep or exact_h256_d64_nano or exact_s1024 or exact_s2048 or exact_s3072
         )
         # Producer-df default mode (per-shape executor routing; see _PDF_MODE).
         # The pdf executor + WG2 producer compile only for gated shapes.
-        self.default_mode = (
-            "pdf"
-            if (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) in _PDF_MODE
-            else "df"
-        )
+        self.default_mode = "pdf" if (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) in _PDF_MODE else "df"
         mode_env = os.environ.get("MK_MODE")
         if mode_env:
             self.default_mode = mode_env
         self.qwen_head_dx_rmsdot_partials_enabled = (
-            self.qwen_head_dx_rmsdot_partials_enabled
-            and self.default_mode == "pdf"
+            self.qwen_head_dx_rmsdot_partials_enabled and self.default_mode == "pdf"
         )
         # D64-TMA producer feed on the pdf executor. The opt-in probe split by
         # shape: S2048, S3072, and S4096 won in both orders, while S8192
         # regressed decisively. Keep the default exact and let MK_PDF_D64_FEED
         # force A/Bs.
-        self.pdf_d64_feed_default = (
-            self.default_mode == "pdf"
-            and exact_long_d64
-            and c.S in (2048, 3072, 4096)
-        )
+        self.pdf_d64_feed_default = self.default_mode == "pdf" and exact_long_d64 and c.S in (2048, 3072, 4096)
         # Attention producer-feed (attn-pdf-feed lane, Phase 0/1): WG2 issues
         # the streamed attention stage cp.async fills (dq K/V at =1, + dkv
         # Q/dO at =2) into the existing wga_off64 layout. Exact S8192 feed=1
         # wins in both construction orders; S4096/S2048 regress and feed=2 is
         # order-mixed, so keep the default narrow. MK_ATTN_PDF_FEED=0/1/2
         # guards A/B and follow-up probes.
-        self.attn_pdf_feed_default = (
-            1 if self.default_mode == "pdf" and exact_long_d64 and c.S == 8192 else 0
-        )
+        self.attn_pdf_feed_default = 1 if self.default_mode == "pdf" and exact_long_d64 and c.S == 8192 else 0
         # QKNORM_ROPE_BWD vectorized IO (MK_QKBWD_VEC8): 16B ld8bf/st8bf/ld8dy
         # task loops, 32/(D/16) (head,row) tasks per warp iteration,
         # per-(warp,slot) smem dw slices. Exact H256-family gate, S in
         # {2048, 4096, 8192} only. MK_QKBWD_VEC8=0/1 force-overrides.
-        self.qkbwd_vec8_default = (
-            (c.H, c.L, c.nq, c.nkv, c.D, c.I, c.V) == (256, 4, 4, 2, 64, 768, 8192)
-            and c.S in (2048, 4096, 8192)
+        self.qkbwd_vec8_default = (c.H, c.L, c.nq, c.nkv, c.D, c.I, c.V) == (256, 4, 4, 2, 64, 768, 8192) and c.S in (
+            2048,
+            4096,
+            8192,
         )
         self.ext = mk.load_ext(
             swiglu_bwd_2w=self.swiglu_bwd_2w_default,
@@ -928,21 +856,11 @@ class MKQwen3:
             gemm_n256_nt_supertile=self.gemm_n256_nt_supertile_enabled,
             gemm_n256_nt_supertile_reg_epi=self.gemm_n256_nt_supertile_reg_epi_enabled,
             gemm_n256_nt_supertile_pdfonly=self.gemm_n256_nt_supertile_pdfonly_default,
-            gemm_n256_nt_supertile_postinit_nosync=(
-                self.gemm_n256_nt_supertile_postinit_nosync_default
-            ),
-            gemm_n256_nt_supertile_topembed=(
-                self.gemm_n256_nt_supertile_topembed_enabled
-            ),
-            gemm_n256_nt_supertile_pruned=(
-                self.gemm_n256_nt_supertile_pruned_enabled
-            ),
-            gemm_n256_nt_supertile_sidecar=(
-                self.gemm_n256_nt_supertile_sidecar_enabled
-            ),
-            gemm_n256_nt_supertile_sidecar_boundary=(
-                self.gemm_n256_nt_supertile_sidecar_boundary_enabled
-            ),
+            gemm_n256_nt_supertile_postinit_nosync=(self.gemm_n256_nt_supertile_postinit_nosync_default),
+            gemm_n256_nt_supertile_topembed=(self.gemm_n256_nt_supertile_topembed_enabled),
+            gemm_n256_nt_supertile_pruned=(self.gemm_n256_nt_supertile_pruned_enabled),
+            gemm_n256_nt_supertile_sidecar=(self.gemm_n256_nt_supertile_sidecar_enabled),
+            gemm_n256_nt_supertile_sidecar_boundary=(self.gemm_n256_nt_supertile_sidecar_boundary_enabled),
             gemm_n256_head_dx_exact=self.gemm_n256_head_dx_exact_default,
             gemm_n256_head_dx_pdfonly=self.gemm_n256_head_dx_pdfonly_default,
             qwen_head_dx_rmsdot_partials=self.qwen_head_dx_rmsdot_partials_enabled,
@@ -976,10 +894,7 @@ class MKQwen3:
         # the peel-era route, but the post-rms2560 chain makes RS-feed a clear
         # qwen4b-l2 win again (-133/-145us, parity clean). MK_ATTN_D128_DQ_RS=0
         # restores the non-RS DQ route for rollback and stale-checks.
-        dq_rs_default = (
-            (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) in _D128_DQ_ROWSPLIT
-            and c.L in (1, 2)
-        )
+        dq_rs_default = (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) in _D128_DQ_ROWSPLIT and c.L in (1, 2)
         self.attn_d128_dq_rowsplit_enabled = (
             self.attn_d128_wg_enabled
             and c.S % 128 == 0
@@ -995,20 +910,14 @@ class MKQwen3:
         n256_stage3_env = os.environ.get("MK_WGMMA_N256_STAGE3")
         n256_stage3_default = (c.H, c.S, c.I, c.V, c.nq, c.nkv, c.D, c.L) in _D128_DQ_ROWSPLIT
         self.n256_stage3_enabled = (
-            n256_stage3_default if n256_stage3_env is None else
-            (bool(int(n256_stage3_env)) and n256_stage3_default)
+            n256_stage3_default if n256_stage3_env is None else (bool(int(n256_stage3_env)) and n256_stage3_default)
         )
         n256_nmajor_env = os.environ.get("MK_WGMMA_N256_NMAJOR")
         n256_nmajor_default = n256_stage3_default
         self.n256_nmajor_enabled = (
-            n256_nmajor_default if n256_nmajor_env is None else
-            (bool(int(n256_nmajor_env)) and n256_nmajor_default)
+            n256_nmajor_default if n256_nmajor_env is None else (bool(int(n256_nmajor_env)) and n256_nmajor_default)
         )
-        if (
-            self.attn_d128_dq_rowsplit_enabled
-            or self.n256_stage3_enabled
-            or self.gemm_n256_nt_supertile_enabled
-        ):
+        if self.attn_d128_dq_rowsplit_enabled or self.n256_stage3_enabled or self.gemm_n256_nt_supertile_enabled:
             self._smem_bytes = 148 * 1024
         else:
             self._smem_bytes = 120 * 1024 if self.attn_d128_wg_enabled else None
@@ -1043,14 +952,11 @@ class MKQwen3:
         # Program-side arm of MK_GEMM_N256_TMA: mirrors load_ext's resolution
         # (ring required) so the compiled path and the injected tmap args agree.
         _ring_env = os.environ.get("MK_GEMM_MBAR_RING")
-        _ring_on = (bool(int(_ring_env)) if _ring_env is not None
-                    else self.gemm_mbar_ring_default)
+        _ring_on = bool(int(_ring_env)) if _ring_env is not None else self.gemm_mbar_ring_default
         _tma_env = os.environ.get("MK_GEMM_N256_TMA")
-        _tma_on = (bool(int(_tma_env)) if _tma_env is not None
-                   else self.gemm_n256_tma_default)
+        _tma_on = bool(int(_tma_env)) if _tma_env is not None else self.gemm_n256_tma_default
         _nt_tma_env = os.environ.get("MK_GEMM_N256_NT_TMA")
-        _nt_tma_on = (bool(int(_nt_tma_env)) if _nt_tma_env is not None
-                      else self.gemm_n256_nt_tma_default)
+        _nt_tma_on = bool(int(_nt_tma_env)) if _nt_tma_env is not None else self.gemm_n256_nt_tma_default
         if _ring_on and (_tma_on or _nt_tma_on):
             p.gemm_n256_tma_ext = self.ext
         if _ring_on and _tma_on:
@@ -1060,23 +966,16 @@ class MKQwen3:
             p.gemm_n256_tma_tn_default = self.gemm_n256_tma_default
         if _ring_on and _nt_tma_on:
             p.gemm_n256_nt_tma_enabled = True
-        _nt_supertile_on = (
-            self.gemm_n256_nt_supertile_enabled and _ring_on and _nt_tma_on
-        )
+        _nt_supertile_on = self.gemm_n256_nt_supertile_enabled and _ring_on and _nt_tma_on
         _nt_pdfonly_env = os.environ.get("MK_GEMM_N256_NT_SUPERTILE_PDFONLY")
         _nt_pdfonly_on = (
-            bool(int(_nt_pdfonly_env)) if _nt_pdfonly_env is not None
-            else self.gemm_n256_nt_supertile_pdfonly_default
+            bool(int(_nt_pdfonly_env)) if _nt_pdfonly_env is not None else self.gemm_n256_nt_supertile_pdfonly_default
         )
         _pdf_producer_env = os.environ.get("MK_PDF_PRODUCER")
-        _pdf_producer_on = (
-            bool(int(_pdf_producer_env)) if _pdf_producer_env is not None
-            else self.default_mode == "pdf"
-        )
+        _pdf_producer_on = bool(int(_pdf_producer_env)) if _pdf_producer_env is not None else self.default_mode == "pdf"
         # Program-side arm of MK_GEMM_D64_TMA (same ring requirement).
         _d64tma_env = os.environ.get("MK_GEMM_D64_TMA")
-        _d64tma_on = (bool(int(_d64tma_env)) if _d64tma_env is not None
-                      else self.gemm_d64_tma_default)
+        _d64tma_on = bool(int(_d64tma_env)) if _d64tma_env is not None else self.gemm_d64_tma_default
         if _ring_on and _d64tma_on:
             p.gemm_d64_tma_ext = self.ext
         # Program-side arm of the n256-direct TMA C store (epilogue-only; no
@@ -1093,24 +992,18 @@ class MKQwen3:
             and self.gemm_n256_nt_supertile_sidecar_enabled
         )
         p.gemm_n256_nt_sidecar_split_plan_enabled = (
-            self.gemm_n256_nt_supertile_sidecar_split_plan_requested
-            and p.gemm_n256_nt_sidecar_cutpoint_enabled
+            self.gemm_n256_nt_supertile_sidecar_split_plan_requested and p.gemm_n256_nt_sidecar_cutpoint_enabled
         )
         p.gemm_n256_nt_sidecar_boundary_enabled = (
-            self.gemm_n256_nt_supertile_sidecar_boundary_requested
-            and p.gemm_n256_nt_sidecar_split_plan_enabled
+            self.gemm_n256_nt_supertile_sidecar_boundary_requested and p.gemm_n256_nt_sidecar_split_plan_enabled
         )
         B = p.buf
         dw_no_atomic_env = os.environ.get("MK_DW_NO_ATOMIC_SK1")
 
         def dw_no_atomic_sk1_enabled(M, N, K, wgmma):
             if dw_no_atomic_env is None:
-                short_default = (
-                    c.H, c.L, c.nq, c.nkv, c.D, c.I, c.V, c.S
-                ) in _GENERIC_SHORT_DW_NO_ATOMIC_SK1_CFGS
-                return short_default or (
-                    wgmma and (M, N, K) in _QWEN_L1_DW_NO_ATOMIC_SK1
-                )
+                short_default = (c.H, c.L, c.nq, c.nkv, c.D, c.I, c.V, c.S) in _GENERIC_SHORT_DW_NO_ATOMIC_SK1_CFGS
+                return short_default or (wgmma and (M, N, K) in _QWEN_L1_DW_NO_ATOMIC_SK1)
             return bool(int(dw_no_atomic_env))
 
         def dw_direct_store_overwrites(M, N, K):
@@ -1136,7 +1029,7 @@ class MKQwen3:
                     sk = mk.wgmma_split_k(M, N, K)
                     no_atomic_sk1 = dw_no_atomic_sk1_enabled(M, N, K, True)
                     if no_atomic_sk1 and sk == 1:
-                        f = ((flags | 128) & ~(4 | 32))
+                        f = (flags | 128) & ~(4 | 32)
                         if mk.wgmma_n256_dw_tn_ok(M, N, K, f):
                             stage3 = n256_stage3_flag(M, N, K)
                             nmajor = n256_nmajor_flag(M, N, K)
@@ -1188,23 +1081,38 @@ class MKQwen3:
                 p.instr(
                     mk.OP_GEMM,
                     mk.gemm_tiles_wgmma_n256_direct(M, N),
-                    [a, b, out, M, N, K,
-                     flags | 128 | 16384 | stage3 | nmajor | (8192 if do_ssq else 0),
-                     res, 0, ssq, ssq_nparts] if do_ssq
+                    [
+                        a,
+                        b,
+                        out,
+                        M,
+                        N,
+                        K,
+                        flags | 128 | 16384 | stage3 | nmajor | (8192 if do_ssq else 0),
+                        res,
+                        0,
+                        ssq,
+                        ssq_nparts,
+                    ]
+                    if do_ssq
                     else [a, b, out, M, N, K, flags | 128 | 16384 | stage3 | nmajor, res],
                 )
                 return do_ssq
             if mk.wgmma_n128_ok(M, N, K, flags):  # m64n128 NT tile (P4b r3)
                 f = flags | 128 | 4096 | (8192 if do_ssq else 0)
-                p.instr(mk.OP_GEMM, mk.gemm_tiles_wgmma_n128(M, N),
-                        [a, b, out, M, N, K, f, res, 0, ssq, ssq_nparts] if do_ssq
-                        else [a, b, out, M, N, K, f, res])
+                p.instr(
+                    mk.OP_GEMM,
+                    mk.gemm_tiles_wgmma_n128(M, N),
+                    [a, b, out, M, N, K, f, res, 0, ssq, ssq_nparts] if do_ssq else [a, b, out, M, N, K, f, res],
+                )
                 return do_ssq
             if mk.wgmma_ok(M, N, K, flags):  # Hopper warpgroup path
                 f = flags | 128 | (8192 if do_ssq else 0)
-                p.instr(mk.OP_GEMM, mk.gemm_tiles_wgmma(M, N),
-                        [a, b, out, M, N, K, f, res, 0, ssq, ssq_nparts] if do_ssq
-                        else [a, b, out, M, N, K, f, res])
+                p.instr(
+                    mk.OP_GEMM,
+                    mk.gemm_tiles_wgmma(M, N),
+                    [a, b, out, M, N, K, f, res, 0, ssq, ssq_nparts] if do_ssq else [a, b, out, M, N, K, f, res],
+                )
                 return do_ssq
             p.instr(mk.OP_GEMM, mk.gemm_tiles(M, N), [a, b, out, M, N, K, flags, res])
             return False
@@ -1253,9 +1161,7 @@ class MKQwen3:
             qkbwd_split_v = bool(int(qkbwd_split_v_env))
         qkv_v_bwd_kv_slot_env = os.environ.get("MK_QKV_V_BWD_KV_SLOT")
         if qkv_v_bwd_kv_slot_env is None:
-            qkv_v_bwd_kv_slot = (
-                c.H == 256 and c.D == 64 and c.S in _H256_D64_QKV_V_BWD_KV_SLOT_S
-            )
+            qkv_v_bwd_kv_slot = c.H == 256 and c.D == 64 and c.S in _H256_D64_QKV_V_BWD_KV_SLOT_S
         else:
             qkv_v_bwd_kv_slot = bool(int(qkv_v_bwd_kv_slot_env))
 
@@ -1316,9 +1222,7 @@ class MKQwen3:
         # mkv3-p4b-qwenl2-peel-support-20260707T0046Z.log).
         sparse_embed_zero_default = c.L in (1, 2) and c.H >= 1024 and c.V >= 32768
         sparse_embed_zero = (
-            sparse_embed_zero_default
-            if sparse_embed_zero_env is None
-            else bool(int(sparse_embed_zero_env))
+            sparse_embed_zero_default if sparse_embed_zero_env is None else bool(int(sparse_embed_zero_env))
         )
         direct_store_grads = set()
         if skip_direct_dw_fill:
@@ -1366,9 +1270,12 @@ class MKQwen3:
         for l in range(c.L):
             pr = lambda n: B(self.params[f"{n}.{l}"])  # noqa: E731
             a = lambda n: B(A[f"{n}.{l}"])  # noqa: E731
-            p.instr(mk.OP_RMSNORM_FWD, mk.rowop_tiles(c.S, mk.ROWOP_R2),
-                    [X[l], pr("w1"), a("xn1"), a("rstd1"), c.H, eps, c.S]
-                    + ([B(A[f"Xssq.{l}"]), c.H // 64] if X_fused.get(l) else []))
+            p.instr(
+                mk.OP_RMSNORM_FWD,
+                mk.rowop_tiles(c.S, mk.ROWOP_R2),
+                [X[l], pr("w1"), a("xn1"), a("rstd1"), c.H, eps, c.S]
+                + ([B(A[f"Xssq.{l}"]), c.H // 64] if X_fused.get(l) else []),
+            )
             p.wave()
             if c.D == 64 and mk.wgmma_ok(c.S, QD, c.H, 2):
                 qkrope_n128_env = os.environ.get("MK_WGMMA_N128_QKROPE")
@@ -1436,45 +1343,64 @@ class MKQwen3:
                 # epilogue. Per-band slots on O/LSE/parts keep bands and combines
                 # concurrent (row-disjoint); downstream readers register slot=None
                 # and so conflict with every writer. Longest chunks emit first.
-                for bi, (off, w, Cb) in enumerate(
-                        sorted(self.attn_fwd_bands, key=lambda e: -e[2])):
+                for bi, (off, w, Cb) in enumerate(sorted(self.attn_fwd_bands, key=lambda e: -e[2])):
                     if Cb == 1:
                         p.instr(
                             mk.OP_ATTN_FWD_WG,
                             c.nq * w,
-                            [a("qkvr"),
-                             p.buf(A[f"oatt.{l}"], slot=f"fo{bi}"),
-                             p.buf(A[f"lse.{l}"], slot=f"fl{bi}"),
-                             c.S, c.nq, c.nkv, c.D, scale, 1 | (off << 8)],
+                            [
+                                a("qkvr"),
+                                p.buf(A[f"oatt.{l}"], slot=f"fo{bi}"),
+                                p.buf(A[f"lse.{l}"], slot=f"fl{bi}"),
+                                c.S,
+                                c.nq,
+                                c.nkv,
+                                c.D,
+                                scale,
+                                1 | (off << 8),
+                            ],
                         )
                     else:
                         p.instr(
                             mk.OP_ATTN_FWD_WG,
                             c.nq * w * Cb,
-                            [a("qkvr"),
-                             p.buf(A[f"oatt.{l}"], slot=f"fo{bi}"),
-                             p.buf(A[f"lse.{l}"], slot=f"fl{bi}"),
-                             c.S, c.nq, c.nkv, c.D, scale, Cb | (off << 8),
-                             p.buf(W["fopart"], slot=f"fp{bi}"),
-                             p.buf(W["fmpart"], slot=f"fp{bi}"),
-                             p.buf(W["flpart"], slot=f"fp{bi}")],
+                            [
+                                a("qkvr"),
+                                p.buf(A[f"oatt.{l}"], slot=f"fo{bi}"),
+                                p.buf(A[f"lse.{l}"], slot=f"fl{bi}"),
+                                c.S,
+                                c.nq,
+                                c.nkv,
+                                c.D,
+                                scale,
+                                Cb | (off << 8),
+                                p.buf(W["fopart"], slot=f"fp{bi}"),
+                                p.buf(W["fmpart"], slot=f"fp{bi}"),
+                                p.buf(W["flpart"], slot=f"fp{bi}"),
+                            ],
                         )
                 # combine rows are batched R=8 per tile (MK_ATTN_COMBINE_R=1 for
                 # the old one-row tiles): at long S the one-row tiling made the
                 # combine claim-overhead-bound (2-4k tiny tiles per instruction).
                 comb_R = max(1, int(os.environ.get("MK_ATTN_COMBINE_R", "8")))
-                for bi, (off, w, Cb) in enumerate(
-                        sorted(self.attn_fwd_bands, key=lambda e: -e[2])):
+                for bi, (off, w, Cb) in enumerate(sorted(self.attn_fwd_bands, key=lambda e: -e[2])):
                     if Cb > 1:
                         p.instr(
                             mk.OP_ATTN_COMBINE,
                             (w * 128 + comb_R - 1) // comb_R,
-                            [p.buf(W["fopart"], slot=f"fp{bi}"),
-                             p.buf(W["fmpart"], slot=f"fp{bi}"),
-                             p.buf(W["flpart"], slot=f"fp{bi}"),
-                             p.buf(A[f"oatt.{l}"], slot=f"foc{bi}"),
-                             p.buf(A[f"lse.{l}"], slot=f"flc{bi}"),
-                             c.S, c.nq, c.D, Cb, off * 128, comb_R],
+                            [
+                                p.buf(W["fopart"], slot=f"fp{bi}"),
+                                p.buf(W["fmpart"], slot=f"fp{bi}"),
+                                p.buf(W["flpart"], slot=f"fp{bi}"),
+                                p.buf(A[f"oatt.{l}"], slot=f"foc{bi}"),
+                                p.buf(A[f"lse.{l}"], slot=f"flc{bi}"),
+                                c.S,
+                                c.nq,
+                                c.D,
+                                Cb,
+                                off * 128,
+                                comb_R,
+                            ],
                         )
                 p.wave()
             elif wg_attn:
@@ -1512,13 +1438,25 @@ class MKQwen3:
             else:
                 p.instr(mk.OP_ATTN_FWD, c.nq * n_qt, [a("qkvr"), a("oatt"), a("lse"), c.S, c.nq, c.nkv, c.D, scale])
                 p.wave()
-            x2_fused = gemm(a("oatt"), pr("wo"), a("x2"), c.S, c.H, c.nq * c.D, 2 | 16, X[l],
-                            ssq=(B(A[f"x2ssq.{l}"]) if c.H % 64 == 0 else 0),
-                            ssq_nparts=(c.H // 64 if c.H % 64 == 0 else 0))
+            x2_fused = gemm(
+                a("oatt"),
+                pr("wo"),
+                a("x2"),
+                c.S,
+                c.H,
+                c.nq * c.D,
+                2 | 16,
+                X[l],
+                ssq=(B(A[f"x2ssq.{l}"]) if c.H % 64 == 0 else 0),
+                ssq_nparts=(c.H // 64 if c.H % 64 == 0 else 0),
+            )
             p.wave()
-            p.instr(mk.OP_RMSNORM_FWD, mk.rowop_tiles(c.S, mk.ROWOP_R2),
-                    [a("x2"), pr("w2"), a("xn2"), a("rstd2"), c.H, eps, c.S]
-                    + ([B(A[f"x2ssq.{l}"]), c.H // 64] if x2_fused else []))
+            p.instr(
+                mk.OP_RMSNORM_FWD,
+                mk.rowop_tiles(c.S, mk.ROWOP_R2),
+                [a("x2"), pr("w2"), a("xn2"), a("rstd2"), c.H, eps, c.S]
+                + ([B(A[f"x2ssq.{l}"]), c.H // 64] if x2_fused else []),
+            )
             p.wave()
             # Paired-column swiglu fusion (gate/up in one tile, two k-loops) was TRIED
             # AND REMOVED: halving the gu tiles doubles per-tile serial span (nano +88us,
@@ -1531,15 +1469,27 @@ class MKQwen3:
                 swiglu_fwd_args.append(a("swsig"))
             p.instr(mk.OP_SWIGLU_FWD, mk.rowop_tiles(c.S), swiglu_fwd_args)
             p.wave()
-            X_fused[l + 1] = gemm(a("hs"), pr("wd"), X[l + 1], c.S, c.H, c.I, 2 | 16, a("x2"),
-                                  ssq=(B(A[f"Xssq.{l + 1}"]) if c.H % 64 == 0 else 0),
-                                  ssq_nparts=(c.H // 64 if c.H % 64 == 0 else 0))
+            X_fused[l + 1] = gemm(
+                a("hs"),
+                pr("wd"),
+                X[l + 1],
+                c.S,
+                c.H,
+                c.I,
+                2 | 16,
+                a("x2"),
+                ssq=(B(A[f"Xssq.{l + 1}"]) if c.H % 64 == 0 else 0),
+                ssq_nparts=(c.H // 64 if c.H % 64 == 0 else 0),
+            )
             p.wave()
 
         # ---- head + loss ----
-        p.instr(mk.OP_RMSNORM_FWD, mk.rowop_tiles(c.S, mk.ROWOP_R2),
-                [X[c.L], B(self.params["wf"]), B(A["xnf"]), B(A["rstdf"]), c.H, eps, c.S]
-                + ([B(A[f"Xssq.{c.L}"]), c.H // 64] if X_fused.get(c.L) else []))
+        p.instr(
+            mk.OP_RMSNORM_FWD,
+            mk.rowop_tiles(c.S, mk.ROWOP_R2),
+            [X[c.L], B(self.params["wf"]), B(A["xnf"]), B(A["rstdf"]), c.H, eps, c.S]
+            + ([B(A[f"Xssq.{c.L}"]), c.H // 64] if X_fused.get(c.L) else []),
+        )
         p.wave()
         # bit11 (lse partials in the lm_head epilogue): A/B measured NEUTRAL within
         # noise (on: 1865/9275, off: 1861/9317). Kept ON — cheapens the CE hop ~5x
@@ -1548,29 +1498,42 @@ class MKQwen3:
         if self.fuse_ce and mk.wgmma_ok(c.S, c.V, c.H, 2):
             # lm_head gemm with per-row lse partials in the epilogue (bit11): CE fwd
             # reduces V/64 (max, sumexp) pairs instead of rescanning the V-wide row
-            n256st = (
-                _nt_supertile_on
-                and mk.wgmma_n256_nt_supertile_ok(c.S, c.V, c.H, 2 | 2048)
-            )
+            n256st = _nt_supertile_on and mk.wgmma_n256_nt_supertile_ok(c.S, c.V, c.H, 2 | 2048)
             n256d = (not n256st) and mk.wgmma_n256_direct_ok(c.S, c.V, c.H, 2 | 2048)
-            n128 = (
-                not n256st
-                and not n256d
-                and mk.wgmma_n128_ok(c.S, c.V, c.H, 2 | 2048)
-            )
+            n128 = not n256st and not n256d and mk.wgmma_n128_ok(c.S, c.V, c.H, 2 | 2048)
             n256_route = n256st or n256d
             n256_stage3_bits = n256_stage3_flag(c.S, c.V, c.H) if n256_route else 0
             n256_nmajor_bits = n256_nmajor_flag(c.S, c.V, c.H) if n256_route else 0
             p.instr(
                 mk.OP_GEMM,
-                (mk.gemm_tiles_wgmma_n256_nt_supertile(c.S, c.V) if n256st else
-                 mk.gemm_tiles_wgmma_n256_direct(c.S, c.V) if n256d else
-                 mk.gemm_tiles_wgmma_n128(c.S, c.V) if n128 else mk.gemm_tiles_wgmma(c.S, c.V)),
-                [B(A["xnf"]), B(self.params["wlm"]), B(A["logits"]), c.S, c.V, c.H,
-                 2 | 128 | 2048 | n256_stage3_bits | n256_nmajor_bits |
-                 (mk.GEMM_N256_NT_SUPERTILE_FLAG if n256st else 0) |
-                 (16384 if n256_route else 4096 if n128 else 0), 0, 0,
-                 B(W["lse_parts"]), c.V // 64],
+                (
+                    mk.gemm_tiles_wgmma_n256_nt_supertile(c.S, c.V)
+                    if n256st
+                    else mk.gemm_tiles_wgmma_n256_direct(c.S, c.V)
+                    if n256d
+                    else mk.gemm_tiles_wgmma_n128(c.S, c.V)
+                    if n128
+                    else mk.gemm_tiles_wgmma(c.S, c.V)
+                ),
+                [
+                    B(A["xnf"]),
+                    B(self.params["wlm"]),
+                    B(A["logits"]),
+                    c.S,
+                    c.V,
+                    c.H,
+                    2
+                    | 128
+                    | 2048
+                    | n256_stage3_bits
+                    | n256_nmajor_bits
+                    | (mk.GEMM_N256_NT_SUPERTILE_FLAG if n256st else 0)
+                    | (16384 if n256_route else 4096 if n128 else 0),
+                    0,
+                    0,
+                    B(W["lse_parts"]),
+                    c.V // 64,
+                ],
             )
             p.wave()
             # default ON wherever lse partials exist; MK_CE_FWD_WARPROW=0 restores.
@@ -1578,8 +1541,17 @@ class MKQwen3:
             p.instr(
                 mk.OP_CE_FWD,
                 (c.S + 7) // 8 if ce_warprow else c.S,
-                [B(A["logits"]), labels_buf, B(A["lse_ce"]), B(self.loss), B(self.inv_valid), c.V,
-                 B(W["lse_parts"]), c.V // 64, c.S],
+                [
+                    B(A["logits"]),
+                    labels_buf,
+                    B(A["lse_ce"]),
+                    B(self.loss),
+                    B(self.inv_valid),
+                    c.V,
+                    B(W["lse_parts"]),
+                    c.V // 64,
+                    c.S,
+                ],
             )
         else:
             gemm(B(A["xnf"]), B(self.params["wlm"]), B(A["logits"]), c.S, c.V, c.H, 2)
@@ -1599,10 +1571,15 @@ class MKQwen3:
         head_dx_n128_f32_env = os.environ.get("MK_HEAD_DX_N128_F32")
         head_dx_n128_split_env = os.environ.get("MK_HEAD_DX_N128_SPLIT")
         if head_dx_n128_f32_env is None:
-            head_dx_n128_f32 = (
-                (c.H == 512 and c.S == 1024 and c.V % 64 == 0)
-                or (c.H, c.S, c.V, c.nq, c.nkv, c.D, c.L) in _QWEN_L1_HEAD_DX_N128_F32
-            )
+            head_dx_n128_f32 = (c.H == 512 and c.S == 1024 and c.V % 64 == 0) or (
+                c.H,
+                c.S,
+                c.V,
+                c.nq,
+                c.nkv,
+                c.D,
+                c.L,
+            ) in _QWEN_L1_HEAD_DX_N128_F32
         else:
             head_dx_n128_f32 = bool(int(head_dx_n128_f32_env))
         if head_dx_no_atomic_sk1_env is None:
@@ -1614,16 +1591,12 @@ class MKQwen3:
         else:
             head_dx_n128_split = bool(int(head_dx_n128_split_env))
         if mk.wgmma_ok(c.S, c.H, c.V, 0):
-            sk_head = mk.wgmma_split_k(
-                c.S, c.H, c.V, target_tiles=head_dx_target_tiles()
-            )
+            sk_head = mk.wgmma_split_k(c.S, c.H, c.V, target_tiles=head_dx_target_tiles())
             head_dx_tiles = mk.gemm_tiles_wgmma(c.S, c.H)
             head_dx_flags = 8 | 128
             head_dx_args = [B(A["logits"]), B(self.params["wlm"]), B(W["dXN_f32"]), c.S, c.H, c.V]
         else:
-            sk_head = mk.gemm_split_k(
-                c.S, c.H, c.V, target_tiles=head_dx_target_tiles()
-            )
+            sk_head = mk.gemm_split_k(c.S, c.H, c.V, target_tiles=head_dx_target_tiles())
             head_dx_tiles = mk.gemm_tiles(c.S, c.H)
             head_dx_flags = 8
             head_dx_args = [B(A["logits"]), B(self.params["wlm"]), B(W["dXN_f32"]), c.S, c.H, c.V]
@@ -1638,8 +1611,17 @@ class MKQwen3:
             p.instr(
                 mk.OP_GEMM,
                 mk.gemm_tiles_wgmma_n128(c.S, c.H) * skr,
-                [B(A["logits"]), B(self.params["wlm"]), B(W["headdx_skr"]), c.S, c.H,
-                 c.V, head_dx_flags | 32 | 4096 | mk.GEMM_SKR_FLAG, 0, skr],
+                [
+                    B(A["logits"]),
+                    B(self.params["wlm"]),
+                    B(W["headdx_skr"]),
+                    c.S,
+                    c.H,
+                    c.V,
+                    head_dx_flags | 32 | 4096 | mk.GEMM_SKR_FLAG,
+                    0,
+                    skr,
+                ],
             )
             p.wave()  # wave-mode barrier; df derives the slab dep automatically
             p.instr(
@@ -1683,13 +1665,7 @@ class MKQwen3:
         else:
             fill_zero(W["dXN_f32"])
             p.wave()
-            if (
-                head_dx_n128_split
-                and (head_dx_flags & 128)
-                and c.S % 128 == 0
-                and c.H % 128 == 0
-                and c.V % 64 == 0
-            ):
+            if head_dx_n128_split and (head_dx_flags & 128) and c.S % 128 == 0 and c.H % 128 == 0 and c.V % 64 == 0:
                 n128_tiles = mk.gemm_tiles_wgmma_n128(c.S, c.H)
                 n128_target = int(
                     os.environ.get(
@@ -1760,7 +1736,9 @@ class MKQwen3:
                     swiglu_bwd_args.append(a("swsig"))
                 p.instr(mk.OP_SWIGLU_BWD, mk.rowop_tiles(c.S), swiglu_bwd_args)
             p.wave()
-            dxn, dxn_f32 = gemm_dx(B(W["dGU"]), pr("wgu"), B(W["dXN"]), lambda: B(W[f"dXN2_f32.{l}"]), c.S, c.H, 2 * c.I)
+            dxn, dxn_f32 = gemm_dx(
+                B(W["dGU"]), pr("wgu"), B(W["dXN"]), lambda: B(W[f"dXN2_f32.{l}"]), c.S, c.H, 2 * c.I
+            )
             gemm(B(W["dGU"]), a("xn2"), gr("wgu"), 2 * c.I, c.H, c.S, 1 | 4 | 8)
             p.wave()
             rmsnorm_bwd([a("x2"), pr("w2"), dxn, B(W["dX"]), gr("w2"), a("rstd2"), c.H, dxn_f32, c.S])
@@ -1779,23 +1757,58 @@ class MKQwen3:
                 p.instr(
                     mk.OP_GEMM,
                     mk.gemm_tiles_wgmma_n256_direct(c.S, c.nq * c.D),
-                    [B(W["dX"]), pr("wo"), B(W["dOatt"]), c.S, c.nq * c.D, c.H,
-                     drow_flags | 128 | 16384 | stage3 | nmajor,
-                     0, 0, a("oatt"), B(W[f"drow.{l}"]), c.D],
+                    [
+                        B(W["dX"]),
+                        pr("wo"),
+                        B(W["dOatt"]),
+                        c.S,
+                        c.nq * c.D,
+                        c.H,
+                        drow_flags | 128 | 16384 | stage3 | nmajor,
+                        0,
+                        0,
+                        a("oatt"),
+                        B(W[f"drow.{l}"]),
+                        c.D,
+                    ],
                 )
             elif drow_wg and mk.wgmma_ok(c.S, c.nq * c.D, c.H, drow_flags):
                 p.instr(
                     mk.OP_GEMM,
                     mk.gemm_tiles_wgmma(c.S, c.nq * c.D),
-                    [B(W["dX"]), pr("wo"), B(W["dOatt"]), c.S, c.nq * c.D, c.H,
-                     drow_flags | 128, 0, 0, a("oatt"), B(W[f"drow.{l}"]), c.D],
+                    [
+                        B(W["dX"]),
+                        pr("wo"),
+                        B(W["dOatt"]),
+                        c.S,
+                        c.nq * c.D,
+                        c.H,
+                        drow_flags | 128,
+                        0,
+                        0,
+                        a("oatt"),
+                        B(W[f"drow.{l}"]),
+                        c.D,
+                    ],
                 )
             else:
                 p.instr(
                     mk.OP_GEMM,
                     mk.gemm_tiles(c.S, c.nq * c.D),
-                    [B(W["dX"]), pr("wo"), B(W["dOatt"]), c.S, c.nq * c.D, c.H,
-                     drow_flags, 0, 0, a("oatt"), B(W[f"drow.{l}"]), c.D],
+                    [
+                        B(W["dX"]),
+                        pr("wo"),
+                        B(W["dOatt"]),
+                        c.S,
+                        c.nq * c.D,
+                        c.H,
+                        drow_flags,
+                        0,
+                        0,
+                        a("oatt"),
+                        B(W[f"drow.{l}"]),
+                        c.D,
+                    ],
                 )
             gemm(B(W["dX"]), a("oatt"), gr("wo"), c.H, c.nq * c.D, c.S, 1 | 4 | 8)
             p.wave()
@@ -1865,17 +1878,13 @@ class MKQwen3:
                 # composition (-60us vs T=32), S8192 retuned to T=40 after idle32/
                 # cached-SwiGLU composition (-88/-110us vs T=32). Standalone +
                 # in-model logs in the attn-band worktree and shared results/.
-                default_band_T = (
-                    _ATTN_BWD_BAND_T.get(c.S, 0) if c.H == 256 and c.D == 64 else 0
-                )
+                default_band_T = _ATTN_BWD_BAND_T.get(c.S, 0) if c.H == 256 and c.D == 64 else 0
                 band_T = int(os.environ.get("MK_ATTN_BAND", str(default_band_T)))
                 if band_T > 0:
                     # Post-pdf S8192 recheck flipped back to LPT; keep dq-first
                     # only for shapes that re-earn it in both construction orders.
                     default_band_order = (
-                        "dq_first"
-                        if c.H == 256 and c.D == 64 and c.S in _ATTN_BAND_DQ_FIRST_S
-                        else "lpt"
+                        "dq_first" if c.H == 256 and c.D == 64 and c.S in _ATTN_BAND_DQ_FIRST_S else "lpt"
                     )
                     band_order = os.environ.get("MK_ATTN_BAND_ORDER", default_band_order)
 
@@ -1889,6 +1898,7 @@ class MKQwen3:
                             out.append((j, k - j, Cj))
                             j = k
                         return out
+
                     # (chunk_stages, seq, kind, off, width, chunks, op, ntiles, args)
                     # LPT order matches the pre-order-probe promoted route exactly. The
                     # dq_first probe tests whether the post-band DQ wait path is
@@ -1896,16 +1906,40 @@ class MKQwen3:
                     emit = []
                     for bi, (off, w, Cb) in enumerate(bands(lambda j: (c.S - j * 128) // 64)):
                         st = -(-((c.S - off * 128) // 64) // Cb)
-                        emit.append((st, len(emit), "dkv", off, w, Cb, mk.OP_ATTN_DKV_WG, c.nkv * w * G * Cb,
-                                     dkv_args()[:4]
-                                     + [p.buf(W[f"dQKV_f32.{l}"], slot=f"kv{bi}")]
-                                     + dkv_args()[5:] + [Cb | (off << 8) | (w << 16)]))
+                        emit.append(
+                            (
+                                st,
+                                len(emit),
+                                "dkv",
+                                off,
+                                w,
+                                Cb,
+                                mk.OP_ATTN_DKV_WG,
+                                c.nkv * w * G * Cb,
+                                dkv_args()[:4]
+                                + [p.buf(W[f"dQKV_f32.{l}"], slot=f"kv{bi}")]
+                                + dkv_args()[5:]
+                                + [Cb | (off << 8) | (w << 16)],
+                            )
+                        )
                     for bi, (off, w, Cb) in enumerate(bands(lambda i: i * 2 + 2)):
                         st = -(-((off + w - 1) * 2 + 2) // Cb)
-                        emit.append((st, len(emit), "dq", off, w, Cb, mk.OP_ATTN_DQ_WG, c.nq * w * Cb,
-                                     dq_args()[:4]
-                                     + [p.buf(W[f"dQKV_f32.{l}"], slot=f"q{bi}")]
-                                     + dq_args()[5:] + [Cb | (off << 8) | (w << 16)]))
+                        emit.append(
+                            (
+                                st,
+                                len(emit),
+                                "dq",
+                                off,
+                                w,
+                                Cb,
+                                mk.OP_ATTN_DQ_WG,
+                                c.nq * w * Cb,
+                                dq_args()[:4]
+                                + [p.buf(W[f"dQKV_f32.{l}"], slot=f"q{bi}")]
+                                + dq_args()[5:]
+                                + [Cb | (off << 8) | (w << 16)],
+                            )
+                        )
                     if band_order == "dq_first":
                         ordered_emit = sorted(
                             emit,
@@ -1949,11 +1983,7 @@ class MKQwen3:
             # (dy_f32) — the former per-layer CVT chain hop is gone (v3 P1).
             qkvraw_bwd = p.buf(W["dQKVraw"], slot="qk") if qkbwd_split_v else B(W["dQKVraw"])
             if qkbwd_split_v:
-                qkv_v_bwd_src = (
-                    p.buf(W[f"dQKV_f32.{l}"], slot="kv*")
-                    if qkv_v_bwd_kv_slot
-                    else B(W[f"dQKV_f32.{l}"])
-                )
+                qkv_v_bwd_src = p.buf(W[f"dQKV_f32.{l}"], slot="kv*") if qkv_v_bwd_kv_slot else B(W[f"dQKV_f32.{l}"])
                 p.instr(
                     mk.OP_QKV_V_BWD,
                     mk.rowop_tiles(c.S),
@@ -1990,7 +2020,9 @@ class MKQwen3:
                 ],
             )
             p.wave()
-            dxn1, dxn1_f32 = gemm_dx(B(W["dQKVraw"]), pr("wqkv"), B(W["dXN"]), lambda: B(W[f"dXN1_f32.{l}"]), c.S, c.H, QD)
+            dxn1, dxn1_f32 = gemm_dx(
+                B(W["dQKVraw"]), pr("wqkv"), B(W["dXN"]), lambda: B(W[f"dXN1_f32.{l}"]), c.S, c.H, QD
+            )
             gemm(B(W["dQKVraw"]), a("xn1"), gr("wqkv"), QD, c.H, c.S, 1 | 4 | 8)
             p.wave()
             rmsnorm_bwd([X[l], pr("w1"), dxn1, B(W["dX"]), gr("w1"), a("rstd1"), c.H, dxn1_f32, c.S])
@@ -2116,15 +2148,11 @@ class MKQwen3:
             if mode != "pdf":
                 raise RuntimeError("MK_QWEN_NT_SIDECAR_STEP=1 requires pdf mode")
             if not sidecar_available:
-                raise RuntimeError(
-                    "MK_QWEN_NT_SIDECAR_STEP=1 requires the qwen NT sidecar "
-                    "boundary split route"
-                )
+                raise RuntimeError("MK_QWEN_NT_SIDECAR_STEP=1 requires the qwen NT sidecar boundary split route")
             return self.step_qwen_nt_sidecar(tokens, labels)
         if sidecar_available:
             raise RuntimeError(
-                "qwen NT sidecar boundary step requires step_qwen_nt_sidecar() "
-                "or MK_QWEN_NT_SIDECAR_STEP=1"
+                "qwen NT sidecar boundary step requires step_qwen_nt_sidecar() or MK_QWEN_NT_SIDECAR_STEP=1"
             )
         bind_inputs = (
             self.bind_inputs
@@ -2184,16 +2212,10 @@ class MKQwen3:
             if mode != "pdf":
                 raise RuntimeError("MK_QWEN_NT_SIDECAR_STEP=1 requires pdf mode")
             if not self.qwen_nt_sidecar_step_available():
-                raise RuntimeError(
-                    "MK_QWEN_NT_SIDECAR_STEP=1 requires the qwen NT sidecar "
-                    "boundary split route"
-                )
+                raise RuntimeError("MK_QWEN_NT_SIDECAR_STEP=1 requires the qwen NT sidecar boundary split route")
             return self.make_graphed_qwen_nt_sidecar_step(tokens, labels, warmup=warmup)
         if self.qwen_nt_sidecar_step_available():
-            raise RuntimeError(
-                "qwen NT sidecar boundary graph capture requires "
-                "MK_QWEN_NT_SIDECAR_STEP=1"
-            )
+            raise RuntimeError("qwen NT sidecar boundary graph capture requires MK_QWEN_NT_SIDECAR_STEP=1")
         graphable = (
             mode in ("df", "pdf")
             and tokens.is_cuda

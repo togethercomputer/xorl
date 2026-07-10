@@ -16,9 +16,9 @@ RESULTS = ROOT / "results"
 sys.path.insert(0, str(MKDIR))
 sys.path.insert(0, str(RESULTS))
 
-from model import Cfg  # noqa: E402
 import qwen_nt_sidecar_api_0ba235d as api  # noqa: E402
 import qwen_nt_sidecar_graph_policy_0ba235d as gpol  # noqa: E402
+from model import Cfg  # noqa: E402
 
 
 CFG = Cfg(H=2560, L=1, nq=32, nkv=8, D=128, I=9728, V=151936, S=1024)

@@ -88,6 +88,7 @@ def test_tiny_dense_qarl_training_smoke_changes_logprobs_and_restores_state(tmp_
         restored.model.layers[0]["proj"].qarl_weight_scale_inv,
         model.model.layers[0]["proj"].qarl_weight_scale_inv,
     )
-    assert restored.model.layers[0]["proj"].qarl_forward_count.item() >= model.model.layers[0][
-        "proj"
-    ].qarl_forward_count.item()
+    assert (
+        restored.model.layers[0]["proj"].qarl_forward_count.item()
+        >= model.model.layers[0]["proj"].qarl_forward_count.item()
+    )

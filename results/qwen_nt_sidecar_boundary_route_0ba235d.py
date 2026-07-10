@@ -99,12 +99,14 @@ def route_summary(model: MKQwen3) -> dict[str, object]:
             ntst += int(bool(flags & mk.GEMM_N256_NT_SUPERTILE_FLAG))
         if int(args[3]) == 1024 and int(args[4]) == 151936 and int(args[5]) == 2560:
             if flags & 2:
-                head_rows.append({
-                    "idx": idx,
-                    "op": int(op),
-                    "flags": flags,
-                    "ntiles": int(ntiles),
-                })
+                head_rows.append(
+                    {
+                        "idx": idx,
+                        "op": int(op),
+                        "flags": flags,
+                        "ntiles": int(ntiles),
+                    }
+                )
 
     cflags = list(model.ext.kwargs["extra_cuda_cflags"])
     name = str(model.ext.kwargs["name"])
@@ -139,8 +141,7 @@ def route_summary(model: MKQwen3) -> dict[str, object]:
 def emit(tag: str, cfg: Cfg, updates: dict[str, str | None]) -> dict[str, object]:
     payload = {"tag": tag, **route_summary(build(cfg, updates))}
     print(
-        "QWEN_NT_SIDECAR_BOUNDARY_ROUTE_JSON "
-        + json.dumps(payload, sort_keys=True),
+        "QWEN_NT_SIDECAR_BOUNDARY_ROUTE_JSON " + json.dumps(payload, sort_keys=True),
         flush=True,
     )
     return payload
@@ -160,23 +161,27 @@ def same_fields(
 
 def check_boundary(row: dict[str, object], errors: list[str]) -> None:
     head_rows = row.get("head_rows")
-    if head_rows != [{
-        "idx": 37,
-        "op": mk.OP_QWEN_NT_SIDECAR_BOUNDARY,
-        "flags": 234899586,
-        "ntiles": 4748,
-    }]:
+    if head_rows != [
+        {
+            "idx": 37,
+            "op": mk.OP_QWEN_NT_SIDECAR_BOUNDARY,
+            "flags": 234899586,
+            "ntiles": 4748,
+        }
+    ]:
         errors.append(f"wrong typed head row: {head_rows!r}")
     boundary_rows = row.get("boundary_rows")
-    if boundary_rows != [{
-        "flags": 234899586,
-        "instr_index": 37,
-        "ntiles": 4748,
-        "op": mk.OP_QWEN_NT_SIDECAR_BOUNDARY,
-        "replaces_op": mk.OP_GEMM,
-        "shape": {"M": 1024, "N": 151936, "K": 2560},
-        "symbol": "qwen_nt_lmhead_sidecar",
-    }]:
+    if boundary_rows != [
+        {
+            "flags": 234899586,
+            "instr_index": 37,
+            "ntiles": 4748,
+            "op": mk.OP_QWEN_NT_SIDECAR_BOUNDARY,
+            "replaces_op": mk.OP_GEMM,
+            "shape": {"M": 1024, "N": 151936, "K": 2560},
+            "symbol": "qwen_nt_lmhead_sidecar",
+        }
+    ]:
         errors.append(f"wrong boundary row metadata: {boundary_rows!r}")
 
     cps = row.get("cutpoints")
@@ -228,22 +233,38 @@ def main() -> None:
     l2_boundary = emit("l2_boundary_forced", CFG_L2, {BOUNDARY_ENV: "1"})
     l1_boundary = emit("l1_boundary_forced_negative", CFG_L1, {BOUNDARY_ENV: "1"})
     small_boundary = emit("small_boundary_forced_negative", CFG_SMALL, {BOUNDARY_ENV: "1"})
-    l2_super_off = emit("l2_supertile_off_boundary_forced", CFG_L2, {
-        BOUNDARY_ENV: "1",
-        "MK_GEMM_N256_NT_SUPERTILE": "0",
-    })
-    l2_pdfprod_off = emit("l2_pdfprod_off_boundary_forced", CFG_L2, {
-        BOUNDARY_ENV: "1",
-        "MK_PDF_PRODUCER": "0",
-    })
-    l2_pdfonly_off = emit("l2_pdfonly_off_boundary_forced", CFG_L2, {
-        BOUNDARY_ENV: "1",
-        "MK_GEMM_N256_NT_SUPERTILE_PDFONLY": "0",
-    })
-    l2_reg_off = emit("l2_reg_off_boundary_forced", CFG_L2, {
-        BOUNDARY_ENV: "1",
-        "MK_GEMM_N256_NT_SUPERTILE_REG_EPI": "0",
-    })
+    l2_super_off = emit(
+        "l2_supertile_off_boundary_forced",
+        CFG_L2,
+        {
+            BOUNDARY_ENV: "1",
+            "MK_GEMM_N256_NT_SUPERTILE": "0",
+        },
+    )
+    l2_pdfprod_off = emit(
+        "l2_pdfprod_off_boundary_forced",
+        CFG_L2,
+        {
+            BOUNDARY_ENV: "1",
+            "MK_PDF_PRODUCER": "0",
+        },
+    )
+    l2_pdfonly_off = emit(
+        "l2_pdfonly_off_boundary_forced",
+        CFG_L2,
+        {
+            BOUNDARY_ENV: "1",
+            "MK_GEMM_N256_NT_SUPERTILE_PDFONLY": "0",
+        },
+    )
+    l2_reg_off = emit(
+        "l2_reg_off_boundary_forced",
+        CFG_L2,
+        {
+            BOUNDARY_ENV: "1",
+            "MK_GEMM_N256_NT_SUPERTILE_REG_EPI": "0",
+        },
+    )
 
     errors: list[str] = []
     invariant_fields = (
@@ -258,21 +279,21 @@ def main() -> None:
     )
     same_fields(l2_default, l2_split, invariant_fields, "l2 split", errors)
     same_fields(l2_default, l2_boundary, invariant_fields, "l2 boundary", errors)
-    if l2_default["head_rows"] != [{
-        "idx": 37,
-        "op": mk.OP_GEMM,
-        "flags": 234899586,
-        "ntiles": 4748,
-    }]:
+    if l2_default["head_rows"] != [
+        {
+            "idx": 37,
+            "op": mk.OP_GEMM,
+            "flags": 234899586,
+            "ntiles": 4748,
+        }
+    ]:
         errors.append(f"default head row changed: {l2_default['head_rows']!r}")
     if l2_split["head_rows"] != l2_default["head_rows"]:
         errors.append("split-plan-only route should not type the main row")
     if l2_split["boundary_row_count"] != 0 or l2_split["has_boundary_define"]:
         errors.append("split-plan-only route unexpectedly enabled boundary")
     if not (
-        l2_boundary["has_ntscbnd_suffix"]
-        and l2_boundary["has_ntsc_define"]
-        and l2_boundary["has_boundary_define"]
+        l2_boundary["has_ntscbnd_suffix"] and l2_boundary["has_ntsc_define"] and l2_boundary["has_boundary_define"]
     ):
         errors.append("boundary route did not build the sidecar boundary image")
     check_boundary(l2_boundary, errors)
@@ -285,11 +306,7 @@ def main() -> None:
         ("pdfonly off", l2_pdfonly_off),
         ("reg epilogue off", l2_reg_off),
     ):
-        if (
-            row["boundary_row_count"] != 0
-            or row["cutpoint_count"] != 0
-            or row["split_plan"] is not None
-        ):
+        if row["boundary_row_count"] != 0 or row["cutpoint_count"] != 0 or row["split_plan"] is not None:
             errors.append(f"{tag} unexpectedly exposed boundary metadata")
         if row["has_boundary_define"] or row["has_ntscbnd_suffix"]:
             errors.append(f"{tag} unexpectedly enabled boundary image")
@@ -309,9 +326,7 @@ def main() -> None:
         "main_row_replaced_by_boundary": (
             plan.get("main_row_replaced_by_boundary") if isinstance(plan, dict) else None
         ),
-        "direct_rejoin_dependents": (
-            plan.get("direct_rejoin_dependents", []) if isinstance(plan, dict) else []
-        ),
+        "direct_rejoin_dependents": (plan.get("direct_rejoin_dependents", []) if isinstance(plan, dict) else []),
     }
     print("QWEN_NT_SIDECAR_BOUNDARY_SUMMARY " + json.dumps(summary, sort_keys=True))
     if errors:

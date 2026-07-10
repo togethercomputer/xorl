@@ -1337,9 +1337,7 @@ class NCCLBroadcastBackend(WeightTransportBackend):
             device=cfg.device,
             run_post_process_weights=bool(cfg.backend_config.get("run_post_process_weights", False)),
             fp8_kv_cache_enabled=bool(cfg.backend_config.get("fp8_kv_cache_enabled", False)),
-            fp8_kv_cache_postprocess_required=bool(
-                cfg.backend_config.get("fp8_kv_cache_postprocess_required", False)
-            ),
+            fp8_kv_cache_postprocess_required=bool(cfg.backend_config.get("fp8_kv_cache_postprocess_required", False)),
             fp8_kv_cache_static_scales=bool(cfg.backend_config.get("fp8_kv_cache_static_scales", False)),
         )
         logger.info(f"[NCCLBroadcast] Initializing NCCL sync group ({len(ep_infos)} endpoints, device={cfg.device})")

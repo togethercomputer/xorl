@@ -364,7 +364,11 @@ class TrainingOpsMixin:
                     "teacher_hidden_cache_write_s",
                 ):
                     metrics[key] = value
-                elif key.startswith("executor_") or key in PROFILE_TIMING_METRIC_KEYS or key.startswith(PROFILE_TIMING_METRIC_PREFIXES):
+                elif (
+                    key.startswith("executor_")
+                    or key in PROFILE_TIMING_METRIC_KEYS
+                    or key.startswith(PROFILE_TIMING_METRIC_PREFIXES)
+                ):
                     metrics[key] = value
 
             # Pass through expert load summary for MoE models
@@ -460,7 +464,11 @@ class TrainingOpsMixin:
                     "teacher_hidden_cache_write_s",
                 ):
                     metrics[key] = value
-                elif key.startswith("executor_") or key in PROFILE_TIMING_METRIC_KEYS or key.startswith(PROFILE_TIMING_METRIC_PREFIXES):
+                elif (
+                    key.startswith("executor_")
+                    or key in PROFILE_TIMING_METRIC_KEYS
+                    or key.startswith(PROFILE_TIMING_METRIC_PREFIXES)
+                ):
                     metrics[key] = value
             for key in (
                 "teacher_prefill_tokens",

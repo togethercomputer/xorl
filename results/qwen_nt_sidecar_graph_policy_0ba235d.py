@@ -23,15 +23,17 @@ sys.path.insert(0, str(RESULTS))
 
 from model import MKQwen3  # noqa: E402
 from qwen_nt_sidecar_api_0ba235d import (  # noqa: E402
-    CFG,
     BOUNDARY_ENV,
+    CFG,
     compare_grads,
     grad_stats,
     make_tokens,
     max_grad_stat_delta,
     restore_env,
-    route_summary as api_route_summary,
     with_env,
+)
+from qwen_nt_sidecar_api_0ba235d import (
+    route_summary as api_route_summary,
 )
 
 
@@ -75,9 +77,7 @@ def build_policy() -> MKQwen3:
 
 def route_summary(model: MKQwen3) -> dict[str, object]:
     summary = api_route_summary(model)
-    summary["policy_requested"] = bool(
-        getattr(model, "qwen_nt_sidecar_step_requested", False)
-    )
+    summary["policy_requested"] = bool(getattr(model, "qwen_nt_sidecar_step_requested", False))
     return summary
 
 
@@ -150,10 +150,7 @@ def check_policy_graph_equivalence(
 
     stat_delta = max_grad_stat_delta(graph_stats, explicit_stats)
     loss_diff = explicit_loss - graph_loss
-    stat_ok = (
-        float(stat_delta["max_abs_delta"]) <= stat_atol
-        or float(stat_delta["max_rel_delta"]) <= stat_rtol
-    )
+    stat_ok = float(stat_delta["max_abs_delta"]) <= stat_atol or float(stat_delta["max_rel_delta"]) <= stat_rtol
     ok = abs(loss_diff) <= loss_atol and stat_ok
     return {
         "pass": ok,
@@ -228,8 +225,7 @@ def run_order(
 
     boundary_step_guard = check_boundary_step_guard(boundary, tokens, labels)
     print(
-        "BOUNDARY_STEP_GUARD_JSON "
-        + json.dumps({"order": order, **boundary_step_guard}, sort_keys=True),
+        "BOUNDARY_STEP_GUARD_JSON " + json.dumps({"order": order, **boundary_step_guard}, sort_keys=True),
         flush=True,
     )
     if not boundary_step_guard["pass"]:
@@ -237,8 +233,7 @@ def run_order(
 
     boundary_graph_guard = check_boundary_graph_guard(boundary, tokens, labels)
     print(
-        "BOUNDARY_GRAPH_GUARD_JSON "
-        + json.dumps({"order": order, **boundary_graph_guard}, sort_keys=True),
+        "BOUNDARY_GRAPH_GUARD_JSON " + json.dumps({"order": order, **boundary_graph_guard}, sort_keys=True),
         flush=True,
     )
     if not boundary_graph_guard["pass"]:
@@ -255,8 +250,7 @@ def run_order(
 
     policy_equivalence = check_policy_graph_equivalence(policy, policy_replay, tokens, labels)
     print(
-        "POLICY_GRAPH_EQUIV_JSON "
-        + json.dumps({"order": order, **policy_equivalence}, sort_keys=True),
+        "POLICY_GRAPH_EQUIV_JSON " + json.dumps({"order": order, **policy_equivalence}, sort_keys=True),
         flush=True,
     )
     if not policy_equivalence["pass"]:

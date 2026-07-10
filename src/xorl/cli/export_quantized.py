@@ -311,7 +311,9 @@ def _positive_int_config_value(value: Any) -> bool:
 
 def _looks_like_mtp_name(name: str) -> bool:
     parts = [part.strip().lower() for part in name.replace("/", ".").split(".") if part.strip()]
-    return any(part == "mtp" or part.startswith("mtp_") or part == "nextn" or part.startswith("nextn_") for part in parts)
+    return any(
+        part == "mtp" or part.startswith("mtp_") or part == "nextn" or part.startswith("nextn_") for part in parts
+    )
 
 
 def _mtp_evidence_from_config(config: dict[str, Any]) -> list[str]:
@@ -909,7 +911,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=config_defaults.get("output_dir"),
         help="Output HF directory for block-FP8 weights",
     )
-    parser.add_argument("--fmt", default=config_defaults.get("fmt", "e4m3"), choices=["e4m3"], help="FP8 format to write")
+    parser.add_argument(
+        "--fmt", default=config_defaults.get("fmt", "e4m3"), choices=["e4m3"], help="FP8 format to write"
+    )
     parser.add_argument(
         "--weight-block-size",
         type=int,

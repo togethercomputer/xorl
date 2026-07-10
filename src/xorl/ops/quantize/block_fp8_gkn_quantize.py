@@ -102,6 +102,7 @@ def block_fp8_quantize_gkn(
         dtype=torch.float32,
         device=x.device,
     )
+
     def grid(meta):
         return (
             triton.cdiv(M, block_size),
@@ -168,6 +169,7 @@ def block_fp8_dequantize_gkn(x: torch.Tensor, s: torch.Tensor, block_size: int =
     assert x.dim() == 2 and s.dim() == 2
     M, N = x.size()
     y = torch.empty_like(x, dtype=torch.get_default_dtype())
+
     def grid(meta):
         return (
             triton.cdiv(M, block_size),
@@ -303,6 +305,7 @@ def block_fp8_dequantize_gkn_rowwise(
     M, N = x.size()
     assert s.shape == (M, triton.cdiv(N, block_size))
     y = torch.empty_like(x, dtype=torch.get_default_dtype())
+
     def grid(meta):
         return (
             M,

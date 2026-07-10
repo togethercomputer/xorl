@@ -113,10 +113,7 @@ def main() -> None:
     if prefix["dropped_deps"] != {}:
         errors.append(f"prefix dropped deps: {prefix['dropped_deps']!r}")
     post_dropped = post["dropped_deps"]
-    bad_external = {
-        row: deps for row, deps in post_dropped.items()
-        if any(dep >= 38 for dep in deps)
-    }
+    bad_external = {row: deps for row, deps in post_dropped.items() if any(dep >= 38 for dep in deps)}
     if bad_external:
         errors.append(f"post dropped non-external deps: {bad_external!r}")
     for row, deps in expected_post_dropped.items():
@@ -124,10 +121,7 @@ def main() -> None:
             errors.append(f"post dropped deps for row {row}: {post_dropped.get(row)!r}")
     for row, deps in {39: [38], 40: [39], 41: [39]}.items():
         if post["local_deps_by_index"].get(row) != deps:
-            errors.append(
-                f"post local deps for row {row}: "
-                f"{post['local_deps_by_index'].get(row)!r} != {deps!r}"
-            )
+            errors.append(f"post local deps for row {row}: {post['local_deps_by_index'].get(row)!r} != {deps!r}")
     if prefix["n_instr"] != 37 or post["n_instr"] != 40:
         errors.append(f"wrong subprogram sizes: {prefix['n_instr']} / {post['n_instr']}")
     if prefix["instr_numel"] != 37 * mk.INSTR_INTS:

@@ -86,9 +86,7 @@ def test_qarl_weight_fake_quant_matches_folded_block_fp8_export():
         base.weight.copy_(torch.arange(15, dtype=torch.float32).reshape(3, 5) / 8)
     layer = QARLLinear.from_linear(
         base,
-        quant_cfg=normalize_qarl_quant_cfg(
-            {"format": "fp8_e4m3", "activation": False, "weight_block_size": [2, 2]}
-        ),
+        quant_cfg=normalize_qarl_quant_cfg({"format": "fp8_e4m3", "activation": False, "weight_block_size": [2, 2]}),
     )
     x = torch.arange(10, dtype=torch.float32).reshape(2, 5) / 7
 

@@ -269,7 +269,9 @@ def test_best_fit_never_more_rows_than_sequential():
 def test_best_fit_utilization_at_least_sequential():
     data = _make_data(60, seed=2)
     pack_len = 4096
-    seq = SequentialPacker(log_stats=False, pad_to_multiple_of=1, strategy="sequential").pack(data, max_seq_len=pack_len)
+    seq = SequentialPacker(log_stats=False, pad_to_multiple_of=1, strategy="sequential").pack(
+        data, max_seq_len=pack_len
+    )
     bf = SequentialPacker(log_stats=False, pad_to_multiple_of=1, strategy="best_fit").pack(data, max_seq_len=pack_len)
     seq_util = sum(_row_lengths(seq)) / (len(seq) * pack_len)
     bf_util = sum(_row_lengths(bf)) / (len(bf) * pack_len)

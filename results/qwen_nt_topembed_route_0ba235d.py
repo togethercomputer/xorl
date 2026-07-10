@@ -119,9 +119,7 @@ def route_summary(model: MKQwen3) -> dict[str, object]:
         "has_nttop_define": DEFINE in cflags,
         "has_nt_pdfonly_define": "-DMK_GEMM_N256_NT_SUPERTILE_PDFONLY" in cflags,
         "has_nt_reg_define": "-DMK_GEMM_N256_NT_SUPERTILE_REG_EPI" in cflags,
-        "has_nt_nosync_define": (
-            "-DMK_GEMM_N256_NT_SUPERTILE_POSTINIT_NOSYNC" in cflags
-        ),
+        "has_nt_nosync_define": ("-DMK_GEMM_N256_NT_SUPERTILE_POSTINIT_NOSYNC" in cflags),
         "has_pdf_producer_define": "-DMK_PDF_PRODUCER" in cflags,
     }
 
@@ -149,22 +147,38 @@ def main() -> None:
     l2_forced = emit("l2_nttop_forced", CFG_L2, {ENV: "1"})
     l1_forced = emit("l1_nttop_forced_negative", CFG_L1, {ENV: "1"})
     small_forced = emit("small_nttop_forced_negative", CFG_SMALL, {ENV: "1"})
-    l2_super_off = emit("l2_supertile_off_nttop_forced", CFG_L2, {
-        ENV: "1",
-        "MK_GEMM_N256_NT_SUPERTILE": "0",
-    })
-    l2_pdfprod_off = emit("l2_pdfprod_off_nttop_forced", CFG_L2, {
-        ENV: "1",
-        "MK_PDF_PRODUCER": "0",
-    })
-    l2_pdfonly_off = emit("l2_pdfonly_off_nttop_forced", CFG_L2, {
-        ENV: "1",
-        "MK_GEMM_N256_NT_SUPERTILE_PDFONLY": "0",
-    })
-    l2_reg_off = emit("l2_reg_off_nttop_forced", CFG_L2, {
-        ENV: "1",
-        "MK_GEMM_N256_NT_SUPERTILE_REG_EPI": "0",
-    })
+    l2_super_off = emit(
+        "l2_supertile_off_nttop_forced",
+        CFG_L2,
+        {
+            ENV: "1",
+            "MK_GEMM_N256_NT_SUPERTILE": "0",
+        },
+    )
+    l2_pdfprod_off = emit(
+        "l2_pdfprod_off_nttop_forced",
+        CFG_L2,
+        {
+            ENV: "1",
+            "MK_PDF_PRODUCER": "0",
+        },
+    )
+    l2_pdfonly_off = emit(
+        "l2_pdfonly_off_nttop_forced",
+        CFG_L2,
+        {
+            ENV: "1",
+            "MK_GEMM_N256_NT_SUPERTILE_PDFONLY": "0",
+        },
+    )
+    l2_reg_off = emit(
+        "l2_reg_off_nttop_forced",
+        CFG_L2,
+        {
+            ENV: "1",
+            "MK_GEMM_N256_NT_SUPERTILE_REG_EPI": "0",
+        },
+    )
 
     errors: list[str] = []
     invariant_fields = (
@@ -191,9 +205,7 @@ def main() -> None:
     if not l2_forced["has_nttop_suffix"] or not l2_forced["has_nttop_define"]:
         errors.append("forced l2 route did not carry topembed suffix/define")
     if not (
-        l2_forced["has_nt_pdfonly_define"]
-        and l2_forced["has_nt_reg_define"]
-        and l2_forced["has_pdf_producer_define"]
+        l2_forced["has_nt_pdfonly_define"] and l2_forced["has_nt_reg_define"] and l2_forced["has_pdf_producer_define"]
     ):
         errors.append("forced l2 topembed missing prerequisite qwen pdf/reg defines")
 

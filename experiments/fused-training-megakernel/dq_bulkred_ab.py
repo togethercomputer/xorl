@@ -9,8 +9,13 @@ MKAB_FORCE_MODE=<df|pdf|...> forces the same executor mode for BOTH models
 (needed when the ptxas UBLKRED audit only clears one image; see
 mk._audit_bulkred_sass).
 """
-import os, statistics, sys
+
+import os
+import statistics
+import sys
+
 import torch
+
 
 sys.path.insert(0, os.environ.get("MKAB_TREE", os.path.dirname(os.path.abspath(__file__))))
 
@@ -32,6 +37,7 @@ def build(shape, envs):
     for k, v in envs:
         os.environ[k] = v
     from model import Cfg, MKQwen3
+
     m = MKQwen3(Cfg(**SHAPES[shape]), seed=0)
     for k, _ in envs:
         os.environ.pop(k, None)
@@ -63,7 +69,9 @@ def main():
     na = sum(len(w) for w in ma.prog.waves)
     nb = sum(len(w) for w in mb.prog.waves)
     print(f"ROUTE {shape} n_instr default={na} variant={nb}", flush=True)
-    ma.step(tokens, labels); mb.step(tokens, labels); torch.cuda.synchronize()
+    ma.step(tokens, labels)
+    mb.step(tokens, labels)
+    torch.cuda.synchronize()
     la, lb = float(ma.loss.item()), float(mb.loss.item())
     worst, wn = 0.0, ""
     for n in ma.grads:
@@ -79,19 +87,30 @@ def main():
 
     def t1(m):
         e0, e1 = torch.cuda.Event(True), torch.cuda.Event(True)
-        e0.record(); m.step(tokens, labels); e1.record(); torch.cuda.synchronize()
+        e0.record()
+        m.step(tokens, labels)
+        e1.record()
+        torch.cuda.synchronize()
         return e0.elapsed_time(e1) * 1e3
 
     for _ in range(8):
-        ma.step(tokens, labels); mb.step(tokens, labels)
+        ma.step(tokens, labels)
+        mb.step(tokens, labels)
     torch.cuda.synchronize()
     reps = int(sys.argv[4]) if len(sys.argv) > 4 else (40 if S <= 4096 else 16)
     ta, tb, w = [], [], 0
     for _ in range(reps):
-        a = t1(ma); b = t1(mb); ta.append(a); tb.append(b); w += b < a
-    print(f"TIMING {shape} {sys.argv[3]} order={order} default {statistics.median(ta):.2f}us "
-          f"variant {statistics.median(tb):.2f}us delta {statistics.median(tb)-statistics.median(ta):+.2f}us "
-          f"wins {w}/{reps}", flush=True)
+        a = t1(ma)
+        b = t1(mb)
+        ta.append(a)
+        tb.append(b)
+        w += b < a
+    print(
+        f"TIMING {shape} {sys.argv[3]} order={order} default {statistics.median(ta):.2f}us "
+        f"variant {statistics.median(tb):.2f}us delta {statistics.median(tb) - statistics.median(ta):+.2f}us "
+        f"wins {w}/{reps}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

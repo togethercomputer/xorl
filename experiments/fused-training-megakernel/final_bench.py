@@ -11,6 +11,7 @@ import torch
 from bench import bench_cfg
 from model import Cfg
 
+
 if __name__ == "__main__":
     torch.cuda.set_device(0)
     which = sys.argv[1] if len(sys.argv) > 1 else "all"

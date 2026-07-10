@@ -29,7 +29,9 @@ def _qarl_block_size(model: nn.Module, qarl_modules: list[str]) -> list[int]:
         assert isinstance(module, QARLLinear)
         block_sizes.add(tuple(module.qarl_weight_block_size))
     if len(block_sizes) != 1:
-        raise ValueError(f"QARL online FP8 sync requires one weight_block_size across wrapped modules; got {block_sizes}")
+        raise ValueError(
+            f"QARL online FP8 sync requires one weight_block_size across wrapped modules; got {block_sizes}"
+        )
     block_rows, block_cols = next(iter(block_sizes))
     return [int(block_rows), int(block_cols)]
 

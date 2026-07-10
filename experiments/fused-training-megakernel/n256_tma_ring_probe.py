@@ -388,9 +388,9 @@ def build():
 def gpu_util() -> int:
     dev = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]
     out = subprocess.run(
-        ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits",
-         "-i", dev],
-        capture_output=True, text=True,
+        ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits", "-i", dev],
+        capture_output=True,
+        text=True,
     )
     return int(out.stdout.strip().splitlines()[0])
 
@@ -419,8 +419,10 @@ def check(ext, M, N, K, a_t, nblocks, claim):
         got = c[rows.cuda()]
         diff = (got - ref).abs()
         rel = (diff / ref.abs().clamp_min(0.25)).max().item()
-        print(f"check {'TN' if a_t else 'NN'} M={M} N={N} K={K} {name}: "
-              f"max_abs={diff.max().item():.6e} rel={rel:.6e}", flush=True)
+        print(
+            f"check {'TN' if a_t else 'NN'} M={M} N={N} K={K} {name}: max_abs={diff.max().item():.6e} rel={rel:.6e}",
+            flush=True,
+        )
         assert rel < 3e-2, name
 
 
@@ -448,12 +450,16 @@ def bench(ext, M, N, K, a_t, nblocks, claim, reps, iters, order):
         vals.sort()
         results[name] = statistics.median(vals)
         tf = (2.0 * M * N * K) / (results[name] * 1e-6) / 1e12
-        print(f"  {name:12s} med={results[name]:9.3f}us min={vals[0]:9.3f} "
-              f"max={vals[-1]:9.3f} tf={tf:7.1f}", flush=True)
+        print(
+            f"  {name:12s} med={results[name]:9.3f}us min={vals[0]:9.3f} max={vals[-1]:9.3f} tf={tf:7.1f}", flush=True
+        )
     delta = results["tma-ring"] - results["cpasync-ring"]
     pct = 100.0 * delta / results["cpasync-ring"]
-    print(f"bench {'TN' if a_t else 'NN'} M={M} N={N} K={K} order={order}: "
-          f"tma-minus-cpasync {delta:+9.3f}us ({pct:+.2f}%)", flush=True)
+    print(
+        f"bench {'TN' if a_t else 'NN'} M={M} N={N} K={K} order={order}: "
+        f"tma-minus-cpasync {delta:+9.3f}us ({pct:+.2f}%)",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

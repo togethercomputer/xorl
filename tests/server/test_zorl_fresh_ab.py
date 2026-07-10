@@ -227,9 +227,7 @@ def test_fresh_ab_fold_moe_orientation_and_hybrid_broadcast():
     pairs = [(11, 21, 1.0), (12, 22, -0.7)]
     scaling = 1.5
 
-    updates, _ = build_zorl_fresh_ab_base_update_from_rewards(
-        lora_params, pair_seeds_and_scores=pairs, scaling=scaling
-    )
+    updates, _ = build_zorl_fresh_ab_base_update_from_rewards(lora_params, pair_seeds_and_scores=pairs, scaling=scaling)
 
     assert tuple(updates["layers.0.experts.down_proj"].shape) == (num_experts, inter, hidden)
     assert tuple(updates["layers.0.experts.gate_proj"].shape) == (num_experts, hidden, inter)
@@ -300,9 +298,7 @@ def test_fresh_ab_fold_matches_sglang_reference_formula():
     pairs = [(301, 401, 1.1), (302, 402, -0.6), (303, 403, 0.2), (304, 404, -1.4)]
     scaling = 8.0 / 4.0
 
-    updates, _ = build_zorl_fresh_ab_base_update_from_rewards(
-        lora_params, pair_seeds_and_scores=pairs, scaling=scaling
-    )
+    updates, _ = build_zorl_fresh_ab_base_update_from_rewards(lora_params, pair_seeds_and_scores=pairs, scaling=scaling)
     reference = _reference_fresh_ab_fold(lora_shapes, pairs, scaling)
 
     assert set(updates) == set(reference)
@@ -431,9 +427,7 @@ def test_fresh_ab_end_to_end_muon_apply_moves_base_along_ns_direction(tmp_path):
             param.requires_grad = False  # LoRA server mode: base frozen
 
     lora_params = {
-        name: nn.Parameter(param.data.clone())
-        for name, param in model.named_parameters()
-        if "lora_" in name
+        name: nn.Parameter(param.data.clone()) for name, param in model.named_parameters() if "lora_" in name
     }
     runner = _make_runner(model, lora_params, tmp_path)
 
@@ -501,9 +495,7 @@ def test_fresh_ab_apply_zorl_rewards_full_path_folds_base_and_leaves_parent(tmp_
             param.requires_grad = False
 
     lora_params = {
-        name: nn.Parameter(param.data.clone())
-        for name, param in model.named_parameters()
-        if "lora_" in name
+        name: nn.Parameter(param.data.clone()) for name, param in model.named_parameters() if "lora_" in name
     }
     # Parent LoRA-B == 0: the fresh_ab invariant (served parent delta is zero).
     lora_params["proj.lora_B"].data.zero_()
@@ -550,9 +542,7 @@ def test_fresh_ab_fold_writes_fused_moe_gate_up_slices(tmp_path):
     class FakeExperts(nn.Module):
         def __init__(self):
             super().__init__()
-            self.gate_up_proj = nn.Parameter(
-                torch.randn(num_experts, hidden, 2 * inter), requires_grad=False
-            )
+            self.gate_up_proj = nn.Parameter(torch.randn(num_experts, hidden, 2 * inter), requires_grad=False)
             self.gate_up_proj._fused_gate_up = True
             self.down_proj = nn.Parameter(torch.randn(num_experts, inter, hidden), requires_grad=False)
 

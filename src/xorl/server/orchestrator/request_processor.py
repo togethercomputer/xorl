@@ -70,13 +70,13 @@ from xorl.server.protocol.operations import (
     ZORLApplyRewardsData,
     ZORLStartGenerationData,
 )
+from xorl.server.runner.utils import batch_packed_rows
 from xorl.server.side_payloads import (
     MooncakeSidePayloadStore,
     R3PayloadCleanup,
     cleanup_r3_mooncake_payloads,
     put_r3_mooncake_payload_refs,
 )
-from xorl.server.runner.utils import batch_packed_rows
 from xorl.utils.seqlen_pos_transform_utils import pos2culen
 
 
@@ -97,6 +97,7 @@ def _truthy_env(name: str) -> bool:
 
 def _r3_verbose_logging_enabled() -> bool:
     return _truthy_env("XORL_R3_VERBOSE_LOGGING")
+
 
 # Metadata and precomputed attention fields that should not be stacked as
 # sequence-aligned lists when grouping packed rows.
@@ -407,14 +408,14 @@ class RequestProcessor:
         return True, first_keys
 
     @classmethod
-    def _merge_packed_row_group(cls, rows: list[Dict[str, Any]], batch_id: int, sequence_keys: set[str]) -> Dict[str, Any]:
+    def _merge_packed_row_group(
+        cls, rows: list[Dict[str, Any]], batch_id: int, sequence_keys: set[str]
+    ) -> Dict[str, Any]:
         merged: Dict[str, Any] = {
             "request_id": rows[0]["request_id"],
             "batch_id": batch_id,
             "num_samples": sum(int(row.get("num_samples", 0)) for row in rows),
-            "_r3_sample_lengths": [
-                length for row in rows for length in row.get("_r3_sample_lengths", [])
-            ],
+            "_r3_sample_lengths": [length for row in rows for length in row.get("_r3_sample_lengths", [])],
         }
         if "_shifted" in rows[0]:
             merged["_shifted"] = all(bool(row.get("_shifted", False)) for row in rows)

@@ -191,9 +191,7 @@ def _run_opd_case(dp_replicate: int, dp_shard: int, ulysses: int, lm_head_tp: in
         )
 
         ref_weight = full_student_weight.detach().clone().requires_grad_(True)
-        ref_hiddens = [
-            full_student_hidden[d].detach().clone().requires_grad_(True) for d in range(dp_size)
-        ]
+        ref_hiddens = [full_student_hidden[d].detach().clone().requires_grad_(True) for d in range(dp_size)]
         ref_loss = torch.zeros((), dtype=torch.float32)
         for d in range(dp_size):
             student_logits = ref_hiddens[d].reshape(-1, hidden_size) @ ref_weight.t()
@@ -239,9 +237,7 @@ def _run_opd_case(dp_replicate: int, dp_shard: int, ulysses: int, lm_head_tp: in
             .reshape(-1, hidden_size)
         )
         local_labels = full_labels[dp_idx][:, cp_idx * local_seq : (cp_idx + 1) * local_seq].reshape(-1)
-        local_token_weights = full_token_weights[dp_idx][
-            :, cp_idx * local_seq : (cp_idx + 1) * local_seq
-        ].reshape(-1)
+        local_token_weights = full_token_weights[dp_idx][:, cp_idx * local_seq : (cp_idx + 1) * local_seq].reshape(-1)
 
         out = opd_vocab_parallel_loss_function(
             student_hidden_flat=local_student_hidden,
@@ -269,13 +265,12 @@ def _run_opd_case(dp_replicate: int, dp_shard: int, ulysses: int, lm_head_tp: in
         full_wgrad = torch.cat(gathered, dim=0)
         torch.testing.assert_close(full_wgrad, ref_weight.grad, rtol=1e-4, atol=1e-5)
 
-        ref_hidden_grad = ref_hiddens[dp_idx].grad[
-            :, cp_idx * local_seq : (cp_idx + 1) * local_seq, :
-        ].reshape(-1, hidden_size)
+        ref_hidden_grad = (
+            ref_hiddens[dp_idx].grad[:, cp_idx * local_seq : (cp_idx + 1) * local_seq, :].reshape(-1, hidden_size)
+        )
         torch.testing.assert_close(local_student_hidden.grad, ref_hidden_grad, rtol=1e-4, atol=1e-5)
         print(
-            f"rank{rank} OPD dp_replicate={dp_replicate} dp_shard={dp_shard} "
-            f"OK raw_loss={reported_loss_sum.item():.6f}"
+            f"rank{rank} OPD dp_replicate={dp_replicate} dp_shard={dp_shard} OK raw_loss={reported_loss_sum.item():.6f}"
         )
     finally:
         dist.destroy_process_group()

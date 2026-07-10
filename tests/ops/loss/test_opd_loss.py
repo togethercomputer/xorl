@@ -102,13 +102,23 @@ def test_opd_streaming_lowmem_matches_streaming(inputs):
     teacher_weights = inputs[5]
 
     def run(lowmem):
-        hs, w, th, tw = (base[0].clone().requires_grad_(True), base[1].clone().requires_grad_(True),
-                         base[3].clone().requires_grad_(True), base[4].clone().requires_grad_(True))
+        hs, w, th, tw = (
+            base[0].clone().requires_grad_(True),
+            base[1].clone().requires_grad_(True),
+            base[3].clone().requires_grad_(True),
+            base[4].clone().requires_grad_(True),
+        )
         labels = base[2]
         out = opd_loss_function(
-            hidden_states=hs, weight=w, labels=labels, teacher_hidden_states=th,
-            teacher_lm_head_weight=tw, teacher_weights=teacher_weights,
-            kl_backend="streaming", streaming_lowmem=lowmem, vocab_chunk_size=5,
+            hidden_states=hs,
+            weight=w,
+            labels=labels,
+            teacher_hidden_states=th,
+            teacher_lm_head_weight=tw,
+            teacher_weights=teacher_weights,
+            kl_backend="streaming",
+            streaming_lowmem=lowmem,
+            vocab_chunk_size=5,
         )
         out.loss.backward()
         return out.loss, w.grad, hs.grad

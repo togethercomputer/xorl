@@ -134,8 +134,7 @@ def route_summary(model: MKQwen3) -> dict[str, object]:
 def emit(tag: str, cfg: Cfg, updates: dict[str, str | None]) -> dict[str, object]:
     payload = {"tag": tag, **route_summary(build(cfg, updates))}
     print(
-        "QWEN_NT_SIDECAR_SPLITPLAN_ROUTE_JSON "
-        + json.dumps(payload, sort_keys=True),
+        "QWEN_NT_SIDECAR_SPLITPLAN_ROUTE_JSON " + json.dumps(payload, sort_keys=True),
         flush=True,
     )
     return payload
@@ -183,16 +182,11 @@ def check_split_plan(row: dict[str, object], errors: list[str]) -> None:
     if pre != [0] + list(range(18, 37)):
         errors.append(f"bad pre-sidecar closure: {pre!r}")
     if plan.get("pre_sidecar_independent_before_cutpoint") != list(range(1, 18)):
-        errors.append(
-            "bad pre-sidecar independent rows: "
-            f"{plan.get('pre_sidecar_independent_before_cutpoint')!r}"
-        )
+        errors.append(f"bad pre-sidecar independent rows: {plan.get('pre_sidecar_independent_before_cutpoint')!r}")
     if post != list(range(38, 77)):
         errors.append(f"bad post-sidecar closure: {post!r}")
     if plan.get("independent_after_cutpoint") != [77]:
-        errors.append(
-            f"bad post-sidecar independent rows: {plan.get('independent_after_cutpoint')!r}"
-        )
+        errors.append(f"bad post-sidecar independent rows: {plan.get('independent_after_cutpoint')!r}")
     for row_idx in ["38", "39", "40", "41"]:
         deps = plan.get("direct_rejoin_original_deps", {}).get(row_idx)
         if not isinstance(deps, list) or 37 not in deps:
@@ -227,22 +221,38 @@ def main() -> None:
     l2_split = emit("l2_split_plan_forced", CFG_L2, {SPLIT_ENV: "1"})
     l1_split = emit("l1_split_plan_forced_negative", CFG_L1, {SPLIT_ENV: "1"})
     small_split = emit("small_split_plan_forced_negative", CFG_SMALL, {SPLIT_ENV: "1"})
-    l2_super_off = emit("l2_supertile_off_split_plan_forced", CFG_L2, {
-        SPLIT_ENV: "1",
-        "MK_GEMM_N256_NT_SUPERTILE": "0",
-    })
-    l2_pdfprod_off = emit("l2_pdfprod_off_split_plan_forced", CFG_L2, {
-        SPLIT_ENV: "1",
-        "MK_PDF_PRODUCER": "0",
-    })
-    l2_pdfonly_off = emit("l2_pdfonly_off_split_plan_forced", CFG_L2, {
-        SPLIT_ENV: "1",
-        "MK_GEMM_N256_NT_SUPERTILE_PDFONLY": "0",
-    })
-    l2_reg_off = emit("l2_reg_off_split_plan_forced", CFG_L2, {
-        SPLIT_ENV: "1",
-        "MK_GEMM_N256_NT_SUPERTILE_REG_EPI": "0",
-    })
+    l2_super_off = emit(
+        "l2_supertile_off_split_plan_forced",
+        CFG_L2,
+        {
+            SPLIT_ENV: "1",
+            "MK_GEMM_N256_NT_SUPERTILE": "0",
+        },
+    )
+    l2_pdfprod_off = emit(
+        "l2_pdfprod_off_split_plan_forced",
+        CFG_L2,
+        {
+            SPLIT_ENV: "1",
+            "MK_PDF_PRODUCER": "0",
+        },
+    )
+    l2_pdfonly_off = emit(
+        "l2_pdfonly_off_split_plan_forced",
+        CFG_L2,
+        {
+            SPLIT_ENV: "1",
+            "MK_GEMM_N256_NT_SUPERTILE_PDFONLY": "0",
+        },
+    )
+    l2_reg_off = emit(
+        "l2_reg_off_split_plan_forced",
+        CFG_L2,
+        {
+            SPLIT_ENV: "1",
+            "MK_GEMM_N256_NT_SUPERTILE_REG_EPI": "0",
+        },
+    )
 
     errors: list[str] = []
     invariant_fields = (
@@ -273,9 +283,7 @@ def main() -> None:
     if not l2_split["has_ntsc_suffix"] or not l2_split["has_ntsc_define"]:
         errors.append("split-plan route did not build the sidecar export image")
     if not (
-        l2_split["has_nt_pdfonly_define"]
-        and l2_split["has_nt_reg_define"]
-        and l2_split["has_pdf_producer_define"]
+        l2_split["has_nt_pdfonly_define"] and l2_split["has_nt_reg_define"] and l2_split["has_pdf_producer_define"]
     ):
         errors.append("split-plan route missing prerequisite qwen pdf/reg defines")
     check_split_plan(l2_split, errors)
@@ -305,17 +313,9 @@ def main() -> None:
         },
         "cutpoint_count": l2_split["cutpoint_count"],
         "split_plan_present": isinstance(plan, dict),
-        "pre_closure_count": (
-            len(plan.get("pre_sidecar_required_closure", []))
-            if isinstance(plan, dict)
-            else 0
-        ),
-        "post_closure_count": (
-            len(plan.get("post_sidecar_closure", [])) if isinstance(plan, dict) else 0
-        ),
-        "independent_after_cutpoint": (
-            plan.get("independent_after_cutpoint", []) if isinstance(plan, dict) else []
-        ),
+        "pre_closure_count": (len(plan.get("pre_sidecar_required_closure", [])) if isinstance(plan, dict) else 0),
+        "post_closure_count": (len(plan.get("post_sidecar_closure", [])) if isinstance(plan, dict) else 0),
+        "independent_after_cutpoint": (plan.get("independent_after_cutpoint", []) if isinstance(plan, dict) else []),
     }
     print("QWEN_NT_SIDECAR_SPLITPLAN_SUMMARY " + json.dumps(summary, sort_keys=True))
     if errors:

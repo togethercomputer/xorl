@@ -208,7 +208,9 @@ def test_build_training_model_runs_qarl_calibration_before_parallelize(monkeypat
         captured["proj_weight_scale_inv"] = model.proj.qarl_weight_scale_inv.detach().clone()
         return model
 
-    monkeypatch.setattr("xorl.trainers.model_builder.build_foundation_model", lambda **_kwargs: TinyQARLCalibrationModel())
+    monkeypatch.setattr(
+        "xorl.trainers.model_builder.build_foundation_model", lambda **_kwargs: TinyQARLCalibrationModel()
+    )
     monkeypatch.setattr("xorl.trainers.model_builder._parallelize", fake_parallelize)
     monkeypatch.setattr("xorl.trainers.model_builder.helper.print_device_mem_info", lambda *args, **kwargs: None)
 
