@@ -25,6 +25,7 @@ class MoeModelOutput(ModelOutput):
     hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
     attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
     router_logits: Optional[Tuple[torch.FloatTensor]] = None
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor, torch.FloatTensor], ...]] = None
 
 
 @dataclass
@@ -45,6 +46,7 @@ class MoeCausalLMOutput(ModelOutput):
     # Per-layer residual-stream hidden states (all-layer OPRD). Populated only
     # when forward(output_hidden_states=True); None otherwise.
     hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor, torch.FloatTensor], ...]] = None
 
 
 __all__ = [

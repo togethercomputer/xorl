@@ -8,11 +8,14 @@ mode (the K3 regime), and check that the closed-form backward matches autograd
 of the eager reference. The CPU tests exercise the eager fallback.
 """
 
+import os
+
 import pytest
 import torch
 
 from xorl.models.layers.normalization import (
     RMSNorm,
+    fast_batch_invariant_rms_norm,
     fast_sglang_residual_rms_norm,
     fast_sglang_rms_norm,
     set_rmsnorm_mode,
@@ -20,7 +23,12 @@ from xorl.models.layers.normalization import (
 )
 from xorl.models.transformers.qwen3.configuration_qwen3 import Qwen3Config
 from xorl.models.transformers.qwen3.modeling_qwen3 import Qwen3DecoderLayer
-from xorl.ops.batch_invariant_ops import set_batch_invariant_mode
+from xorl.ops.batch_invariant_ops import (
+    fused_add_rms_norm_batch_invariant,
+    rms_norm_batch_invariant,
+    set_batch_invariant_mode,
+    set_trunk_linear_contract,
+)
 
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -51,6 +59,12 @@ def test_sglang_fused_cpu_residual_matches_eager():
         assert torch.equal(out, expected)
     finally:
         set_rmsnorm_mode("native")
+
+
+# This suite pins the v1 family kernels through the fast_* dispatchers; with
+# families-v2 default-on those dispatchers route to the v2 tree, so pin the
+# kill switch (env is read per call). v2 has its own suite (test_bi_families_v2.py).
+os.environ["XORL_FAMILIES_V2"] = "0"
 
 
 def test_sglang_fused_cpu_force_no_residual_matches_eager():
@@ -164,8 +178,11 @@ def test_module_sglang_fused_equals_sglang():
         assert torch.equal(out_sg2, out_sf2)
 
         # No-residual, no-force (q/k norm, layer-0 input) path -> both native.
-        out_sg3 = sg(hidden)
-        out_sf3 = sf(hidden)
+        # Under XORL-244 the interposed aten::rms_norm refuses grad-requiring
+        # inputs (it records no graph), so this forward-only check runs no_grad.
+        with torch.no_grad():
+            out_sg3 = sg(hidden)
+            out_sf3 = sf(hidden)
         assert torch.equal(out_sg3, out_sf3)
 
 
@@ -252,6 +269,29 @@ def test_dense_qwen3_layer_forward_bit_exact_sglang_vs_fused():
 
 @requires_cuda
 @pytest.mark.gpu
+def test_single_tensor_force_call_bit_matches_serving_fused_residual_tree():
+    """The layer>0 input-norm / final-norm call shape (pre-summed single tensor,
+    force_sglang_residual=True) must be bit-identical to serving's fused residual
+    tree (``fused_add_rms_norm_batch_invariant``). Guards the norm-seed trap where
+    this call fell through native -> batch-invariant aten interception -> the
+    vllm-style rms_norm kernel, which disagrees at 1 ulp on rare boundary values
+    (the k3(1 fp32 ulp) floor)."""
+    torch.manual_seed(11)
+    x = torch.randn(512, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    norm = RMSNorm(HIDDEN, eps=EPS, mode="sglang_fused").to(device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        norm.weight.copy_(torch.randn(HIDDEN, device="cuda").to(torch.bfloat16))
+
+    with set_batch_invariant_mode(True), torch.no_grad():
+        out_module = norm(x, force_sglang_residual=True)
+        ref, residual_out = fused_add_rms_norm_batch_invariant(x, torch.zeros_like(x), norm.weight, EPS)
+
+    assert torch.equal(residual_out, x)
+    assert torch.equal(out_module, ref)
+
+
+@requires_cuda
+@pytest.mark.gpu
 def test_fused_no_residual_backward_matches_autograd():
     torch.manual_seed(5)
     device = "cuda"
@@ -274,3 +314,74 @@ def test_fused_no_residual_backward_matches_autograd():
 
     assert torch.allclose(h_f.grad.float(), h_ref.grad.float(), rtol=2e-2, atol=2e-2)
     assert torch.allclose(w_f.grad.float(), w_ref.grad.float(), rtol=2e-2, atol=2e-2)
+
+
+# --------------------------------------------------------------------------- #
+# Trunk contract lane (XORL_BI_TRUNK_LINEAR): the no-residual dispatch (qk-norm)
+# must bit-match serving's family-1 batch-invariant kernel — which is the
+# aten::rms_norm interpose kernel, NOT the fused sglang residual tree (the two
+# disagree at 1 ulp on rare bf16 boundary values).
+# --------------------------------------------------------------------------- #
+@requires_cuda
+@pytest.mark.gpu
+def test_trunk_contract_no_residual_bit_matches_interpose_kernel():
+    torch.manual_seed(21)
+    # qk-norm call shape: [tokens, heads, head_dim] with a head_dim-sized weight.
+    head_dim = 128
+    x = torch.randn(256, 16, head_dim, device="cuda", dtype=torch.bfloat16)
+    norm = RMSNorm(head_dim, eps=EPS, mode="sglang_fused").to(device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        norm.weight.copy_(torch.randn(head_dim, device="cuda").to(torch.bfloat16))
+
+    set_trunk_linear_contract(True)
+    try:
+        with torch.no_grad():
+            out = norm(x)
+            ref = rms_norm_batch_invariant(x, norm.weight, eps=EPS)
+            with set_batch_invariant_mode(True):
+                ref_interpose = torch.nn.functional.rms_norm(x, (head_dim,), norm.weight, eps=EPS)
+    finally:
+        set_trunk_linear_contract(False)
+
+    assert torch.equal(out, ref)
+    assert torch.equal(out, ref_interpose), "contract-lane qk-norm must equal the aten interpose lane bit-for-bit"
+
+
+@requires_cuda
+@pytest.mark.gpu
+def test_no_residual_dispatch_unchanged_without_contract():
+    torch.manual_seed(22)
+    x = torch.randn(N_TOKENS, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    norm = RMSNorm(HIDDEN, eps=EPS, mode="sglang_fused").to(device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        out = norm(x)
+        ref = torch.nn.functional.rms_norm(x, (HIDDEN,), norm.weight, eps=EPS)
+    assert torch.equal(out, ref)
+
+
+@requires_cuda
+@pytest.mark.gpu
+def test_trunk_contract_no_residual_backward_matches_eager():
+    # Same convention as test_fused_no_residual_backward_matches_autograd: fp32
+    # weight leaf and the fp32-multiply eager reference (the kernel's semantics),
+    # so the comparison is not dominated by bf16 grad-accumulation rounding.
+    torch.manual_seed(23)
+    head_dim = 128
+    h0 = torch.randn(512, head_dim, device="cuda", dtype=torch.bfloat16)
+    w0 = torch.randn(head_dim, device="cuda", dtype=torch.float32)
+    g_out = torch.randn(512, head_dim, device="cuda", dtype=torch.bfloat16)
+
+    def leaf(t):
+        return t.clone().detach().requires_grad_(True)
+
+    h_ref, w_ref = leaf(h0), leaf(w0)
+    out_ref = sglang_residual_rms_norm(h_ref, w_ref, EPS)
+    out_ref.backward(g_out)
+
+    h_c, w_c = leaf(h0), leaf(w0)
+    out_c = fast_batch_invariant_rms_norm(h_c, w_c, EPS)
+    out_c.backward(g_out)
+
+    assert torch.isfinite(h_c.grad.float()).all() and torch.isfinite(w_c.grad.float()).all()
+    assert torch.allclose(h_c.grad.float(), h_ref.grad.float(), rtol=2e-2, atol=2e-2)
+    assert torch.allclose(w_c.grad.float(), w_ref.grad.float(), rtol=2e-2, atol=2e-2)

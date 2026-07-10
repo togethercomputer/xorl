@@ -56,4 +56,6 @@ enable_packing: true
 
 # Full-weights training
 enable_lora: false
+# bi_fused = K3 lm-head contract CE (fp32-class, tp1, no z-loss).
+ce_mode: bi_fused
 freeze_router: false

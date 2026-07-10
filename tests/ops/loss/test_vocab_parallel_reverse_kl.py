@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Multi-process correctness test for vocab_parallel_reverse_kl_function.
 
 Shards the lm_head along the vocab dim across `world` gloo/CPU ranks and checks
@@ -6,9 +5,9 @@ the vocab-parallel reverse-KL (kl, grad_hidden, grad_weight) against a
 single-process full-vocab brute-force reference. Gradient-identity is the bar.
 
 Run (no GPU needed):
-  PYTHONPATH=/home/apanda/xorl-opd-kl-fused/src \
-    /home/apanda/xorl-internal/.venv/bin/python test_vocab_parallel_reverse_kl.py
+  uv run pytest tests/ops/loss/test_vocab_parallel_reverse_kl.py
 """
+
 from __future__ import annotations
 
 import os
@@ -18,10 +17,11 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
+
 WORLD = 4
-N = 48          # tokens
-H = 96          # hidden
-V = 4 * 130     # vocab (divisible by WORLD; 520)
+N = 48  # tokens
+H = 96  # hidden
+V = 4 * 130  # vocab (divisible by WORLD; 520)
 IGNORE = -100
 
 
@@ -67,9 +67,13 @@ def _worker(rank, world, ret):
     tw_local = tw[lo:hi].clone()
 
     kl = vocab_parallel_reverse_kl_function(
-        student_hidden_states=sh_v, student_weight_local=sw_local,
-        teacher_hidden_states=th, teacher_weight_local=tw_local,
-        labels=labels, ignore_index=IGNORE, group=None,
+        student_hidden_states=sh_v,
+        student_weight_local=sw_local,
+        teacher_hidden_states=th,
+        teacher_weight_local=tw_local,
+        labels=labels,
+        ignore_index=IGNORE,
+        group=None,
     )
     kl.sum().backward()
 
@@ -103,7 +107,7 @@ def main():
     print(f"  grad_hidden max|abs|={ret['gh']:.3e}  rel={gh_rel:.3e}  (scale {ret['gh_scale']:.3e})")
     print(f"  grad_weight max|abs|={ret['gw']:.3e}  rel={gw_rel:.3e}  (scale {ret['gw_scale']:.3e})")
     # float32 summation-order tolerance.
-    ok = (kl_rel < 1e-3 and gh_rel < 1e-4 and gw_rel < 1e-4)
+    ok = kl_rel < 1e-3 and gh_rel < 1e-4 and gw_rel < 1e-4
     print(f"  => {'PASS (matches full-vocab reference to float32 precision)' if ok else 'FAIL'}")
     return 0 if ok else 1
 

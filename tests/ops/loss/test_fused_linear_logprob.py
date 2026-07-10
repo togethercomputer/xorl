@@ -161,6 +161,40 @@ def test_quack_linear_return_per_token_dispatch_via_causallm_loss_function():
     assert (quack.per_token_logprobs - eager.per_token_logprobs).abs().max().item() < 5e-2
 
 
+@pytest.mark.parametrize("vocab", [100000, 151936, 201088])
+def test_production_vocab_sizes_no_nan(vocab):
+    """Regression: the quack CE fwd kernel launched cluster blocks whose column
+    tile was entirely out of range at these vocab sizes ((cluster_n-1)*tile_n >=
+    V), reducing max over zero elements (-inf) and NaN-ing the LSE for every
+    row. 151936/201088 are the Qwen3 / GPT-OSS vocabs; tests previously only
+    covered V <= 65536-class shapes where every cluster block owns columns."""
+    N, H = 512, 1024
+    h, w, b, labels = _make_inputs(N, H, vocab, torch.bfloat16, has_bias=False)
+    hf = h.clone().requires_grad_(True)
+    wf = w.clone().requires_grad_(True)
+    ce = fused_selected_logprob_ce(hf, wf, labels, bias=b, ignore_index=-100, chunk_size=256)
+    assert torch.isfinite(ce[labels != -100]).all(), "NaN/inf per-token CE at production vocab size"
+    ref = _ref_ce(h, w, b, labels, -100, 1.0)
+    assert (ce - ref).abs().max().item() < 5e-2
+    ce.sum().backward()
+    assert torch.isfinite(hf.grad).all() and torch.isfinite(wf.grad).all()
+
+
+def test_quack_linear_per_token_matches_eager_at_qwen_vocab():
+    """quack_linear per-token dispatch at the Qwen3 vocab (the shape long-context
+    recipes actually run); small-vocab dispatch tests missed the cluster NaN."""
+    from xorl.ops.loss.causallm_loss import causallm_loss_function  # noqa: PLC0415
+
+    N, H, V = 512, 1024, 151936
+    h, w, _, labels = _make_inputs(N, H, V, torch.bfloat16, has_bias=False)
+    h3, lab3 = h.view(1, N, H), labels.view(1, N)
+    quack = causallm_loss_function(h3, w, lab3, ignore_index=-100, ce_mode="quack_linear", return_per_token=True)
+    eager = causallm_loss_function(h3, w, lab3, ignore_index=-100, ce_mode="eager", return_per_token=True)
+    assert torch.isfinite(quack.loss).all()
+    assert (quack.loss - eager.loss).abs().item() < 5e-2
+    assert (quack.per_token_loss - eager.per_token_loss).abs().max().item() < 5e-2
+
+
 def test_causallm_fused_quack_does_not_materialize_full_logits():
     """Regression for the OOM bug: ``causallm_loss_function`` had no fused_quack
     branch, so fused_quack fell through to the eager ``hidden @ weight.t()`` path

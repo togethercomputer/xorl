@@ -18,6 +18,12 @@ assert FLA_TRIL_PRECISION in ["ieee", "tf32", "tf32x3"], (
 )
 DOT_PRECISION_AUTOTUNE_LIST = ["ieee"] if not IS_TMA_SUPPORTED else list({"ieee", FLA_TRIL_PRECISION})
 
+# The forward-substitution tl.sum reassociates with num_warps (measured: three
+# distinct bitwise outputs for 2/4/8 warps on Qwen3.5 shapes), so autotuning it
+# by timing makes the solve nondeterministic across autotune caches. Pin the
+# (measured-fastest) 2-warp variant; num_stages stays tuned (timing-only).
+SOLVE_TRIL_NUM_WARPS = [2]
+
 
 @triton.heuristics(
     {
@@ -27,7 +33,7 @@ DOT_PRECISION_AUTOTUNE_LIST = ["ieee"] if not IS_TMA_SUPPORTED else list({"ieee"
 @triton.autotune(
     configs=[
         triton.Config({"DOT_PRECISION": "ieee"}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [1, 2, 4, 8]
+        for num_warps in SOLVE_TRIL_NUM_WARPS
         for num_stages in [2, 3, 4, 5]
     ],
     key=["BT"],
@@ -96,7 +102,7 @@ def solve_tril_16x16_kernel(
 @triton.autotune(
     configs=[
         triton.Config({"DOT_PRECISION": DOT_PRECISION}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [1, 2, 4, 8]
+        for num_warps in SOLVE_TRIL_NUM_WARPS
         for num_stages in [2, 3, 4, 5]
         for DOT_PRECISION in DOT_PRECISION_AUTOTUNE_LIST
     ],
@@ -187,7 +193,7 @@ def merge_16x16_to_32x32_inverse_kernel(
 @triton.autotune(
     configs=[
         triton.Config({"DOT_PRECISION": DOT_PRECISION}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
+        for num_warps in SOLVE_TRIL_NUM_WARPS
         for num_stages in [2, 3, 4, 5]
         for DOT_PRECISION in DOT_PRECISION_AUTOTUNE_LIST
     ],

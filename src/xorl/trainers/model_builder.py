@@ -5,6 +5,7 @@ so that every feature (QLoRA, TP, DeepEP, …) is supported in both paths
 without reimplementation.
 """
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Set
 
@@ -111,8 +112,9 @@ def build_training_model(
     config_path: str,
     weights_path: str,
     torch_dtype: str = "bfloat16",
-    attn_implementation: str = "flash_attention_3",
+    attn_implementation: str = "flash_attention_4",
     moe_implementation: Optional[str] = None,
+    moe_routing_weights_before_down: bool | str = "auto",
     ep_dispatch: str = "alltoall",
     train_router: bool = False,
     record_routing_weights: bool = True,
@@ -176,6 +178,11 @@ def build_training_model(
     fp8_training_exclude_modules: Optional[List[str]] = None,
     fp8_training_allow_bf16_fallback: bool = False,
     pp_schedule: Optional[str] = None,
+    pp_virtual_stages: int = 1,
+    pp_input_weight: int = 1,
+    pp_output_weight: int = 1,
+    pp_num_layers_in_first_stage: Optional[int] = None,
+    pp_num_layers_in_last_stage: Optional[int] = None,
     # --- Training flags ---
     freeze_router: bool = False,
     # --- SGLang numerical alignment ---
@@ -198,7 +205,7 @@ def build_training_model(
         2. Unfuse QKV (for TP)
         3. QLoRA or LoRA injection
         4. LoRA + mixed-precision: upcast trainable params to fp32
-        5. Save optimizer pre-hook
+        5. XORL_BI_TRUNK_LINEAR trunk wrap (pre-FSDP2) + save optimizer pre-hook
         6. build_parallelize_model()
         7. Deferred QLoRA quantization
         8. Freeze base params (LoRA/QLoRA) + optional router freeze
@@ -217,6 +224,7 @@ def build_training_model(
         torch_dtype=torch_dtype,
         attn_implementation=attn_implementation,
         moe_implementation=moe_implementation,
+        moe_routing_weights_before_down=moe_routing_weights_before_down,
         ep_dispatch=ep_dispatch,
         train_router=train_router,
         record_routing_weights=record_routing_weights,
@@ -266,7 +274,11 @@ def build_training_model(
                 layer.self_attn.unfuse_for_tp()
         logger.info_rank0("Unfused QKV projections (merge_qkv=False)")
 
-    if get_parallel_state().tp_enabled and hasattr(model, "unfuse_for_tp") and not getattr(model, "_unfused_for_tp", False):
+    if (
+        get_parallel_state().tp_enabled
+        and hasattr(model, "unfuse_for_tp")
+        and not getattr(model, "_unfused_for_tp", False)
+    ):
         logger.info_rank0("Unfusing projections before FP8 training injection for tensor parallelism")
         model.unfuse_for_tp()
 
@@ -371,7 +383,20 @@ def build_training_model(
     )
 
     # ------------------------------------------------------------------
-    # 5. Save optimizer pre-hook (some models register hooks)
+    # 5. Scoped batch-invariant trunk-linear contract (must precede FSDP2)
+    # ------------------------------------------------------------------
+    if os.environ.get("XORL_BI_TRUNK_LINEAR", "0") == "1":
+        from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415
+
+        wrapped = wrap_trunk_linears_batch_invariant(model)
+        pattern = ", ".join(f"{name}x{count}" for name, count in sorted(wrapped.items()))
+        logger.info_rank0(
+            f"XORL_BI_TRUNK_LINEAR=1: wrapped {sum(wrapped.values())} trunk linears "
+            f"(fwd batch-invariant, bwd cuBLAS; qk-norm on the family-1 BI kernel): {pattern}"
+        )
+
+    # ------------------------------------------------------------------
+    # 5b. Save optimizer pre-hook (some models register hooks)
     # ------------------------------------------------------------------
     optimizer_pre_hook_fn = getattr(model, "get_optimizer_pre_hook", None)
 
@@ -396,6 +421,11 @@ def build_training_model(
         enable_backward_prefetch=enable_backward_prefetch,
         load_weights_mode=load_weights_mode,
         pp_schedule=effective_pp_schedule,
+        pp_virtual_stages=pp_virtual_stages,
+        pp_input_weight=pp_input_weight,
+        pp_output_weight=pp_output_weight,
+        pp_num_layers_in_first_stage=pp_num_layers_in_first_stage,
+        pp_num_layers_in_last_stage=pp_num_layers_in_last_stage,
         reshard_after_forward=reshard_after_forward,
         moe_grad_reduce_mode=moe_grad_reduce_mode,
         fsdp_sharded_lm_head_loss=fsdp_sharded_lm_head_loss,
@@ -421,44 +451,55 @@ def build_training_model(
     else:
         model = build_result
 
+    # Steps 7-9 apply to every local model chunk (PP virtual stages own several)
+    all_parts = model_parts if pp_enabled else [model]
+
     # ------------------------------------------------------------------
     # 7. Deferred QLoRA quantization
     # ------------------------------------------------------------------
     if enable_qlora:
-        _deferred_qlora_quantize(model, weights_path, load_weights_mode=load_weights_mode)
+        for part in all_parts:
+            _deferred_qlora_quantize(part, weights_path, load_weights_mode=load_weights_mode)
 
     # ------------------------------------------------------------------
     # 8. Freeze base params
     # ------------------------------------------------------------------
     if enable_qlora:
         # After QLoRA quantization, freeze everything except LoRA
-        for name, param in model.named_parameters():
-            if "lora_A" not in name and "lora_B" not in name:
-                param.requires_grad = False
+        for part in all_parts:
+            for name, param in part.named_parameters():
+                if "lora_A" not in name and "lora_B" not in name:
+                    param.requires_grad = False
         helper.print_device_mem_info("VRAM usage after QLoRA quantization")
     elif enable_lora:
-        freeze_base_parameters(model)
+        for part in all_parts:
+            freeze_base_parameters(part)
         logger.info_rank0("Base model parameters frozen, only LoRA parameters trainable")
     else:
         # Full-weights: all params trainable
-        for param in model.parameters():
-            param.requires_grad = True
+        for part in all_parts:
+            for param in part.parameters():
+                param.requires_grad = True
 
     # Optionally freeze MoE router
     if freeze_router:
-        router_frozen_count = freeze_deepseek_v3_router_parameters(model)
-        if router_frozen_count == 0:
-            for name, param in model.named_parameters():
-                if ".gate.weight" in name:
-                    param.requires_grad = False
-                    router_frozen_count += 1
+        router_frozen_count = 0
+        for part in all_parts:
+            part_frozen = freeze_deepseek_v3_router_parameters(part)
+            if part_frozen == 0:
+                for name, param in part.named_parameters():
+                    if ".gate.weight" in name:
+                        param.requires_grad = False
+                        part_frozen += 1
+            router_frozen_count += part_frozen
         if router_frozen_count > 0:
             logger.info_rank0(f"Froze {router_frozen_count} MoE router (gate) parameters")
 
     # ------------------------------------------------------------------
     # 9. model.train()
     # ------------------------------------------------------------------
-    model.train()
+    for part in all_parts:
+        part.train()
     logger.info_rank0("Model built and parallelized")
 
     return TrainingModelResult(

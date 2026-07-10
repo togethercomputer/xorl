@@ -29,6 +29,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer, PretrainedConfig
 
@@ -48,7 +49,12 @@ from xorl.distillation import (
 )
 from xorl.distributed.offloading import build_activation_offloading_context
 from xorl.distributed.parallel_state import get_parallel_state, init_parallel_state
-from xorl.distributed.pipeline_parallel import build_pipeline_schedule, build_pp_stage
+from xorl.distributed.pipeline_parallel import (
+    build_pipeline_schedule,
+    build_pp_stage,
+    schedule_stage_style,
+    stage_ids_for_rank,
+)
 from xorl.distributed.sequence_parallel.data import gather_outputs
 from xorl.lora import LoraLinear
 from xorl.lora.utils import get_lora_state_dict
@@ -103,6 +109,7 @@ from xorl.trainers.training_utils import (
     count_active_microbatches,
     count_valid_tokens,
     forward_backward_pp,
+    forward_only_pp,
     get_distsign_grad_scale_factor,
     get_effective_grad_clip_value,
     make_pp_loss_fn,
@@ -135,6 +142,51 @@ def _skip_empty_cache_after_optim_step(train_config: Dict[str, Any]) -> bool:
     return _truthy_flag(os.environ.get("XORL_SKIP_EMPTY_CACHE_AFTER_OPTIM_STEP", False)) or _truthy_flag(
         train_config.get("skip_empty_cache_after_optim_step", False)
     )
+
+
+def _optimizer_effective_hparams(optimizer: Any) -> Dict[str, Any]:
+    """Read the effective (lr, betas, eps, weight_decay) off a built optimizer.
+
+    Reports the first occurrence of each key across param groups (the decay
+    group comes first in build_optimizer's group order). Keys absent from
+    every group (e.g. betas on SGD) are simply omitted.
+    """
+    hparams: Dict[str, Any] = {}
+    for group in getattr(optimizer, "param_groups", []):
+        for key in ("lr", "betas", "eps", "weight_decay"):
+            if key in group and key not in hparams:
+                hparams[key] = group[key]
+    return hparams
+
+
+def _apply_adam_hparams_to_param_groups(
+    optimizer: Any,
+    beta1: Optional[float],
+    beta2: Optional[float],
+    eps: Optional[float],
+) -> Dict[str, Any]:
+    """Apply client-passed Adam-family hyperparameters to optimizer param groups.
+
+    Only keys already present in a param group are updated, so groups without
+    Adam semantics (SGD momentum groups, Muon matrix groups keyed on
+    ``adamw_betas``) are left untouched. Returns the applied values (empty when
+    nothing was applied). No-op when all values are None.
+    """
+    applied: Dict[str, Any] = {}
+    if beta1 is None and beta2 is None and eps is None:
+        return applied
+    for group in getattr(optimizer, "param_groups", []):
+        if (beta1 is not None or beta2 is not None) and "betas" in group:
+            old_beta1, old_beta2 = group["betas"]
+            group["betas"] = (
+                float(beta1) if beta1 is not None else old_beta1,
+                float(beta2) if beta2 is not None else old_beta2,
+            )
+            applied["betas"] = group["betas"]
+        if eps is not None and "eps" in group:
+            group["eps"] = float(eps)
+            applied["eps"] = group["eps"]
+    return applied
 
 
 # Clamp-frac + region/correctness KL-split metric keys emitted by OPDLossMetrics.
@@ -420,6 +472,7 @@ class ModelRunner:
         self.model_parts = None
         self.has_first_stage = False
         self.has_last_stage = False
+        self.pp_num_stages = 0
 
         # Device setup
         get_torch_device().set_device(f"{get_device_type()}:{local_rank}")
@@ -430,13 +483,6 @@ class ModelRunner:
         # Disable TF32 and BF16 reduced-precision accumulation for
         # consistent numerics across parallelism strategies.
         helper.enable_high_precision_for_bf16()
-        if os.environ.get("XORL_BATCH_INVARIANT_MATMUL", "0") == "1":
-            from xorl.ops.batch_invariant_ops import enable_batch_invariant_mode  # noqa: PLC0415
-
-            enable_batch_invariant_mode()
-            logger.info(
-                "XORL_BATCH_INVARIANT_MATMUL=1: enabled SGLang-compatible batch-invariant ops"
-            )
 
         # Optional: route aten::{mm,addmm,bmm,_log_softmax,mean.dim,rms_norm,mm.dtype}
         # through the same batch-invariant Triton kernels SGLang uses, so the linear
@@ -1194,8 +1240,10 @@ class ModelRunner:
             if param_name not in base_grads:
                 base_params[param_name] = param
                 base_grads[param_name] = torch.zeros(tuple(param.shape), dtype=torch.float32)
-            target = base_grads[param_name] if last_dim_slice is None else base_grads[param_name].narrow(
-                -1, last_dim_slice[0], last_dim_slice[1]
+            target = (
+                base_grads[param_name]
+                if last_dim_slice is None
+                else base_grads[param_name].narrow(-1, last_dim_slice[0], last_dim_slice[1])
             )
             if tuple(update.shape) != tuple(target.shape):
                 raise ValueError(
@@ -1225,9 +1273,7 @@ class ModelRunner:
                     param.device_mesh,
                     param.placements,
                 )
-                param.grad = DTensor.from_local(
-                    grad_local, param.device_mesh, param.placements, run_check=False
-                )
+                param.grad = DTensor.from_local(grad_local, param.device_mesh, param.placements, run_check=False)
             else:
                 param.grad = grad_full.to(device=param.device, dtype=param.dtype)
 
@@ -1464,6 +1510,7 @@ class ModelRunner:
             torch_dtype=model_dtype,
             attn_implementation=self.model_config.get("attn_implementation", "sdpa"),
             moe_implementation=self.model_config.get("moe_implementation"),
+            moe_routing_weights_before_down=self.model_config.get("moe_routing_weights_before_down", "auto"),
             ep_dispatch=self.model_config.get("ep_dispatch", "alltoall"),
             train_router=self.model_config.get("train_router", False),
             record_routing_weights=self.model_config.get("record_routing_weights", True),
@@ -1529,6 +1576,11 @@ class ModelRunner:
             moe_grad_reduce_mode=self.train_config.get("moe_grad_reduce_mode", "reduce_scatter"),
             fsdp_sharded_lm_head_loss=self.train_config.get("fsdp_sharded_lm_head_loss", False),
             pp_schedule=pp_schedule_name,
+            pp_virtual_stages=self.train_config.get("pipeline_parallel_virtual_stages", 1),
+            pp_input_weight=self.train_config.get("pipeline_parallel_input_weight", 1),
+            pp_output_weight=self.train_config.get("pipeline_parallel_output_weight", 1),
+            pp_num_layers_in_first_stage=self.train_config.get("pipeline_parallel_num_layers_in_first_stage"),
+            pp_num_layers_in_last_stage=self.train_config.get("pipeline_parallel_num_layers_in_last_stage"),
             freeze_router=self.train_config.get("freeze_router", False),
             router_fp32=self.model_config.get("router_fp32", True),
             lm_head_fp32=self.model_config.get("lm_head_fp32", True),
@@ -1548,6 +1600,7 @@ class ModelRunner:
         self.model_parts = result.model_parts
         self.has_first_stage = result.has_first_stage
         self.has_last_stage = result.has_last_stage
+        self.pp_num_stages = self.pp_stages[0].num_stages if self.pp_enabled else 0
         self.get_optimizer_pre_hook = result.optimizer_pre_hook_fn
         self.is_prequantized = result.is_prequantized
         self.checkpoint_quant_format = result.checkpoint_quant_format
@@ -1698,8 +1751,20 @@ class ModelRunner:
         if self._use_distsignsgd and self.lora_config.get("enable_lora", False):
             raise NotImplementedError("DistSignSGD does not yet support server LoRA adapter-manager training.")
         optimizer_kwargs = self._get_optimizer_kwargs()
+        # Adam-family betas/eps from the server config yaml. When unset,
+        # build_optimizer's own defaults bind (betas=(0.9, 0.95), eps=1e-8).
+        adam_overrides: Dict[str, Any] = {}
+        adam_betas = self.train_config.get("adam_betas")
+        if adam_betas is not None:
+            if not isinstance(adam_betas, (list, tuple)) or len(adam_betas) != 2:
+                raise ValueError(f"adam_betas must be a length-2 list/tuple, got {adam_betas!r}")
+            adam_overrides["betas"] = (float(adam_betas[0]), float(adam_betas[1]))
+        adam_eps = self.train_config.get("adam_eps")
+        if adam_eps is not None:
+            adam_overrides["eps"] = float(adam_eps)
+        parts = self.model_parts if self.pp_enabled else None
         self.optimizer = build_optimizer(
-            self.model,
+            parts if parts and len(parts) > 1 else self.model,
             lr=self.train_config.get("lr", 1e-5),
             weight_decay=self.train_config.get("weight_decay", 0.01),
             fused=True,
@@ -1707,6 +1772,7 @@ class ModelRunner:
             optimizer_dtype=self.train_config.get("optimizer_dtype", "bf16"),
             optimizer_kwargs=optimizer_kwargs or None,
             cautious_weight_decay=self.train_config.get("cautious_weight_decay", False),
+            **adam_overrides,
         )
 
         # Muon runs carry a two-tier lr: matrix groups at muon_lr, fallback groups
@@ -1733,7 +1799,15 @@ class ModelRunner:
             )
             self.optimizer.register_step_pre_hook(optimizer_pre_hook)
 
-        logger.info(f"Optimizer initialized: {self.train_config.get('optimizer', 'adamw')}")
+        # Log the EFFECTIVE hyperparameters read back off the built optimizer
+        # (not the requested ones) so silently-dropped values are visible.
+        effective = _optimizer_effective_hparams(self.optimizer)
+        logger.info(
+            f"Optimizer initialized: {optimizer_type} "
+            f"(lr={effective.get('lr')}, betas={effective.get('betas')}, eps={effective.get('eps')}, "
+            f"weight_decay={effective.get('weight_decay')}, "
+            f"dtype={self.train_config.get('optimizer_dtype', 'bf16')}, fused=True)"
+        )
 
     def _initialize_checkpointer(self):
         """Initialize checkpointer for save/load."""
@@ -1984,6 +2058,164 @@ class ModelRunner:
             .to(torch.long)
         )
 
+    @staticmethod
+    def _load_diagnostic_layer_output_overrides() -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        """Load opt-in per-layer hidden-state overrides for K3 source localization."""
+        path = os.environ.get("XORL_DIAGNOSTIC_LAYER_OUTPUT_OVERRIDE_PATH", "").strip()
+        if not path:
+            return {}
+
+        override_path = Path(path)
+        if not override_path.exists():
+            raise FileNotFoundError(f"XORL_DIAGNOSTIC_LAYER_OUTPUT_OVERRIDE_PATH does not exist: {override_path}")
+
+        try:
+            payload = torch.load(override_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            payload = torch.load(override_path, map_location="cpu")
+
+        if not isinstance(payload, dict):
+            raise ValueError("Diagnostic layer-output override payload must be a dict")
+
+        raw_outputs = payload.get("layer_outputs")
+        if raw_outputs is None:
+            raw_outputs = payload.get("outputs")
+        if raw_outputs is None:
+            raw_outputs = payload.get("layers")
+        if raw_outputs is None:
+            return {}
+        if not isinstance(raw_outputs, dict):
+            raise ValueError(
+                "Diagnostic layer-output override payload must contain a dict under "
+                "'layer_outputs', 'outputs', or 'layers'"
+            )
+
+        raw_masks = payload.get("masks") or payload.get("layer_masks") or {}
+        if raw_masks is not None and not isinstance(raw_masks, dict):
+            raise ValueError("Diagnostic layer-output override masks must be a dict when provided")
+
+        overrides: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        for raw_layer_idx, raw_value in raw_outputs.items():
+            layer_idx = int(raw_layer_idx)
+            raw_mask = None
+            if isinstance(raw_value, dict):
+                tensor = raw_value.get("tensor")
+                if tensor is None:
+                    tensor = raw_value.get("value")
+                if tensor is None:
+                    tensor = raw_value.get("output")
+                raw_mask = raw_value.get("mask")
+            else:
+                tensor = raw_value
+            if raw_mask is None and isinstance(raw_masks, dict):
+                raw_mask = raw_masks.get(raw_layer_idx)
+                if raw_mask is None:
+                    raw_mask = raw_masks.get(str(layer_idx))
+                if raw_mask is None:
+                    raw_mask = raw_masks.get(layer_idx)
+            if not isinstance(tensor, torch.Tensor):
+                raise ValueError(f"Diagnostic layer-output override for layer {layer_idx} is not a tensor")
+            if raw_mask is None:
+                mask = torch.ones(tensor.shape[:-1], dtype=torch.bool)
+            elif isinstance(raw_mask, torch.Tensor):
+                mask = raw_mask.to(dtype=torch.bool)
+            else:
+                mask = torch.as_tensor(raw_mask, dtype=torch.bool)
+            if mask.shape != tensor.shape[:-1]:
+                raise ValueError(
+                    "Diagnostic layer-output override mask shape mismatch for layer "
+                    f"{layer_idx}: mask={tuple(mask.shape)} tensor_prefix={tuple(tensor.shape[:-1])}"
+                )
+            overrides[layer_idx] = (tensor.detach().cpu(), mask.detach().cpu())
+
+        logger.info("Loaded diagnostic layer-output overrides from %s for layers %s", override_path, sorted(overrides))
+        return overrides
+
+    @staticmethod
+    def _load_diagnostic_component_overrides() -> dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]]:
+        """Load opt-in internal component overrides for K3 source localization."""
+        path = os.environ.get("XORL_DIAGNOSTIC_LAYER_OUTPUT_OVERRIDE_PATH", "").strip()
+        if not path:
+            return {}
+
+        override_path = Path(path)
+        if not override_path.exists():
+            raise FileNotFoundError(f"XORL_DIAGNOSTIC_LAYER_OUTPUT_OVERRIDE_PATH does not exist: {override_path}")
+
+        try:
+            payload = torch.load(override_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            payload = torch.load(override_path, map_location="cpu")
+
+        if not isinstance(payload, dict):
+            raise ValueError("Diagnostic component override payload must be a dict")
+
+        raw_outputs = payload.get("component_outputs")
+        if raw_outputs is None:
+            raw_outputs = payload.get("components")
+        if raw_outputs is None:
+            return {}
+        if not isinstance(raw_outputs, dict):
+            raise ValueError("Diagnostic component override payload must contain a component_outputs dict")
+
+        raw_masks = payload.get("component_masks") or {}
+        if raw_masks is not None and not isinstance(raw_masks, dict):
+            raise ValueError("Diagnostic component override masks must be a dict when provided")
+
+        overrides: dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]] = {}
+        for raw_layer_idx, raw_layer_outputs in raw_outputs.items():
+            layer_idx = int(raw_layer_idx)
+            if not isinstance(raw_layer_outputs, dict):
+                raise ValueError(f"Diagnostic component overrides for layer {layer_idx} must be a dict")
+            layer_masks = {}
+            if isinstance(raw_masks, dict):
+                layer_masks = (
+                    raw_masks.get(raw_layer_idx) or raw_masks.get(str(layer_idx)) or raw_masks.get(layer_idx) or {}
+                )
+            if layer_masks is not None and not isinstance(layer_masks, dict):
+                raise ValueError(f"Diagnostic component masks for layer {layer_idx} must be a dict")
+            layer_overrides: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+            for component_name, raw_value in raw_layer_outputs.items():
+                raw_mask = None
+                if isinstance(raw_value, dict):
+                    tensor = raw_value.get("tensor")
+                    if tensor is None:
+                        tensor = raw_value.get("value")
+                    if tensor is None:
+                        tensor = raw_value.get("output")
+                    raw_mask = raw_value.get("mask")
+                else:
+                    tensor = raw_value
+                if raw_mask is None and isinstance(layer_masks, dict):
+                    raw_mask = layer_masks.get(component_name)
+                if not isinstance(tensor, torch.Tensor):
+                    raise ValueError(
+                        f"Diagnostic component override for layer {layer_idx} component {component_name!r} "
+                        "is not a tensor"
+                    )
+                if raw_mask is None:
+                    mask = torch.ones(tensor.shape[:-1], dtype=torch.bool)
+                elif isinstance(raw_mask, torch.Tensor):
+                    mask = raw_mask.to(dtype=torch.bool)
+                else:
+                    mask = torch.as_tensor(raw_mask, dtype=torch.bool)
+                if mask.shape != tensor.shape[:-1]:
+                    raise ValueError(
+                        "Diagnostic component override mask shape mismatch for layer "
+                        f"{layer_idx} component {component_name!r}: mask={tuple(mask.shape)} "
+                        f"tensor_prefix={tuple(tensor.shape[:-1])}"
+                    )
+                layer_overrides[str(component_name)] = (tensor.detach().cpu(), mask.detach().cpu())
+            if layer_overrides:
+                overrides[layer_idx] = layer_overrides
+
+        logger.info(
+            "Loaded diagnostic component overrides from %s for layers/components %s",
+            override_path,
+            {layer_idx: sorted(layer_overrides) for layer_idx, layer_overrides in overrides.items()},
+        )
+        return overrides
+
     def _install_hidden_component_hooks(self, layer_indices: list[int]) -> tuple[list[dict[str, Any]], list[Any]]:
         class _AttributeRestoreHandle:
             _missing = object()
@@ -2049,7 +2281,48 @@ class ModelRunner:
             "router_logits": 35,
             "router_routing_weights": 36,
             "router_selected_experts": 37,
+            "materialized_layer_input": 38,
+            "delayed_pair_delta": 38,
+            "delayed_pair_residual": 38,
+            "delayed_pair_shard_sum": 38,
+            "delayed_pair_shard_materialized": 38,
+            "input_norm_residual": 39,
+            "attn_output_eager_candidate": 40,
+            "post_attention_o_proj_partial_sum": 41,
+            "post_attention_partial_residual": 41,
+            "post_attention_o_proj_partial_sum_split_output": 41,
+            "post_attention_partial_residual_split_output": 41,
+            "post_attention_o_proj_partial_sum_sum_then_residual": 41,
+            "post_attention_partial_residual_sum_then_residual": 41,
+            "post_attention_o_proj_partial_sum_residual_then_partials": 41,
+            "post_attention_partial_residual_residual_then_partials": 41,
+            "post_attention_o_proj_partial_sum_fp32_sum_then_residual": 41,
+            "post_attention_partial_residual_fp32_sum_then_residual": 41,
+            "moe_experts_output_tp_shard_0": 42,
+            "moe_experts_output_tp_shard_1": 42,
+            "moe_experts_output_tp_shard_2": 42,
+            "moe_experts_output_tp_shard_3": 42,
+            "moe_experts_output_tp_shard_4": 42,
+            "moe_experts_output_tp_shard_5": 42,
+            "moe_experts_output_tp_shard_6": 42,
+            "moe_experts_output_tp_shard_7": 42,
+            "moe_experts_output_tp_shard_sum": 42,
+            "moe_experts_output_override": 43,
+            "moe_input_override": 44,
+            "final_residual_input": 45,
+            "final_residual_input_override": 46,
+            "final_mlp_output": 47,
+            "final_mlp_output_override": 48,
+            "final_residual_output": 49,
+            "layer_output_override": 50,
         }
+
+        layer_output_overrides = self._load_diagnostic_layer_output_overrides()
+        component_overrides = self._load_diagnostic_component_overrides()
+        if layer_output_overrides:
+            layer_indices = sorted(set(layer_indices) | set(layer_output_overrides))
+        if component_overrides:
+            layer_indices = sorted(set(layer_indices) | set(component_overrides))
 
         def capture(layer_idx: int, name: str, value: Any) -> None:
             tensor = self._first_tensor(value)
@@ -2057,6 +2330,7 @@ class ModelRunner:
                 snapshot = tensor.detach().clone()
                 captures.append(
                     {
+                        "capture_index": len(captures),
                         "layer": layer_idx,
                         "name": name,
                         "order": component_order[name],
@@ -2085,6 +2359,70 @@ class ModelRunner:
             if layer is None:
                 continue
 
+            def make_tensor_override(
+                *,
+                layer_idx: int,
+                component_name: str,
+                override_tensor: torch.Tensor,
+                override_mask: torch.Tensor,
+            ):
+                def override(hidden_states: torch.Tensor) -> torch.Tensor:
+                    if hidden_states.shape != override_tensor.shape:
+                        raise ValueError(
+                            "Diagnostic override shape mismatch for layer "
+                            f"{layer_idx} component {component_name!r}: "
+                            f"hidden_states={tuple(hidden_states.shape)} override={tuple(override_tensor.shape)}"
+                        )
+                    if override_mask.shape != hidden_states.shape[:-1]:
+                        raise ValueError(
+                            "Diagnostic override mask shape mismatch for layer "
+                            f"{layer_idx} component {component_name!r}: "
+                            f"mask={tuple(override_mask.shape)} hidden_prefix={tuple(hidden_states.shape[:-1])}"
+                        )
+                    ref = override_tensor.to(device=hidden_states.device, dtype=hidden_states.dtype)
+                    mask = override_mask.to(device=hidden_states.device, dtype=torch.bool).unsqueeze(-1)
+                    return torch.where(mask, ref, hidden_states)
+
+                return override
+
+            override_map = None
+            layer_component_overrides = component_overrides.get(layer_idx)
+            if layer_component_overrides:
+                override_map = {
+                    component_name: make_tensor_override(
+                        layer_idx=layer_idx,
+                        component_name=component_name,
+                        override_tensor=override_tensor,
+                        override_mask=override_mask,
+                    )
+                    for component_name, (override_tensor, override_mask) in layer_component_overrides.items()
+                }
+                restore_handle = _AttributeRestoreHandle(layer, "_diagnostic_component_overrides")
+                setattr(layer, "_diagnostic_component_overrides", override_map)
+                handles.append(restore_handle)
+
+            output_override = layer_output_overrides.get(layer_idx)
+            if output_override is not None:
+                override_tensor, override_mask = output_override
+
+                override_layer_output = make_tensor_override(
+                    layer_idx=layer_idx,
+                    component_name="layer_output",
+                    override_tensor=override_tensor,
+                    override_mask=override_mask,
+                )
+
+                restore_handle = _AttributeRestoreHandle(layer, "_diagnostic_layer_output_override")
+                setattr(layer, "_diagnostic_layer_output_override", override_layer_output)
+                handles.append(restore_handle)
+
+            restore_handle = _AttributeRestoreHandle(layer, "_diagnostic_capture_component")
+            setattr(
+                layer,
+                "_diagnostic_capture_component",
+                lambda name, value, layer_idx=layer_idx: capture(layer_idx, name, value),
+            )
+            handles.append(restore_handle)
             handles.append(
                 layer.register_forward_pre_hook(
                     lambda _module, args, layer_idx=layer_idx: capture(
@@ -2123,6 +2461,7 @@ class ModelRunner:
 
             post_attention_norm = getattr(layer, "post_attention_layernorm", None)
             if post_attention_norm is not None:
+
                 def post_attention_pre_hook(_module, args, kwargs, layer_idx=layer_idx):
                     if args:
                         capture(layer_idx, "post_attention_norm_input", args[0])
@@ -2142,6 +2481,11 @@ class ModelRunner:
 
             mlp = getattr(layer, "mlp", None)
             if mlp is not None:
+                if override_map is not None:
+                    restore_handle = _AttributeRestoreHandle(mlp, "_diagnostic_component_overrides")
+                    setattr(mlp, "_diagnostic_component_overrides", override_map)
+                    handles.append(restore_handle)
+
                 restore_handle = _AttributeRestoreHandle(mlp, "_diagnostic_capture_component")
                 setattr(
                     mlp,
@@ -2271,7 +2615,9 @@ class ModelRunner:
                 weights_key = f"model.layers.{layer_idx}.router_routing_weights"
                 routing_weights = reference.get(weights_key)
                 if not isinstance(routing_weights, torch.Tensor):
-                    logger.warning("Skipping diagnostic forced weights for layer %s; missing %s", layer_idx, weights_key)
+                    logger.warning(
+                        "Skipping diagnostic forced weights for layer %s; missing %s", layer_idx, weights_key
+                    )
                 else:
                     setattr(mlp, "_diagnostic_forced_routing_weights", routing_weights.detach().cpu())
             elif hasattr(mlp, "_diagnostic_forced_routing_weights"):
@@ -2352,14 +2698,42 @@ class ModelRunner:
 
         ordered_components = sorted(
             hidden_components,
-            key=lambda item: (int(item["layer"]), int(item.get("order", 0)), str(item["name"])),
+            key=lambda item: (
+                int(item["layer"]),
+                int(item.get("order", 0)),
+                str(item["name"]),
+                int(item.get("capture_index", 0)),
+            ),
         )
+        key_counts: dict[str, int] = {}
+        component_records: list[dict[str, Any]] = []
         for component in ordered_components:
             tensor = component.get("tensor")
             if not isinstance(tensor, torch.Tensor):
                 continue
-            key = f"model.layers.{int(component['layer'])}.{str(component['name'])}"
+            base_key = f"model.layers.{int(component['layer'])}.{str(component['name'])}"
+            occurrence = key_counts.get(base_key, 0)
+            key_counts[base_key] = occurrence + 1
+            key = base_key if occurrence == 0 else f"{base_key}.occurrence{occurrence:05d}"
             payload[key] = tensor.detach().cpu()
+            component_records.append(
+                {
+                    "key": key,
+                    "base_key": base_key,
+                    "occurrence": occurrence,
+                    "capture_index": int(component.get("capture_index", -1)),
+                    "layer": int(component["layer"]),
+                    "name": str(component["name"]),
+                    "order": int(component.get("order", 0)),
+                    "shape": list(tensor.shape),
+                    "dtype": str(tensor.dtype),
+                }
+            )
+
+        payload["__metadata__"]["components"] = component_records
+        payload["__metadata__"]["duplicate_component_keys"] = {
+            key: count for key, count in key_counts.items() if count > 1
+        }
 
         torch.save(payload, output_path)
         return str(output_path)
@@ -3905,9 +4279,7 @@ class ModelRunner:
             "opd_kl_group_mean": opd_kl,
             "opd_weighted_kl_group_mean": opd_weighted_kl,
             "opd_vocab_parallel_kl_sum": float(metrics.get("opd_vocab_parallel_kl_sum", 0.0) or 0.0),
-            "opd_vocab_parallel_weighted_kl_sum": float(
-                metrics.get("opd_vocab_parallel_weighted_kl_sum", 0.0) or 0.0
-            ),
+            "opd_vocab_parallel_weighted_kl_sum": float(metrics.get("opd_vocab_parallel_weighted_kl_sum", 0.0) or 0.0),
             "model_runner_local_kl_contribution": opd_kl * float(local_valid_tokens),
             "model_runner_local_weighted_kl_contribution": opd_weighted_kl * float(local_valid_tokens),
             "opd_oprd_loss_local_mean": float(metrics.get("opd_oprd_loss", 0.0) or 0.0),
@@ -4016,7 +4388,9 @@ class ModelRunner:
         }
 
     @staticmethod
-    def _opd_debug_tensor_sha256(values: Optional[torch.Tensor], *, dtype: Optional[torch.dtype] = None) -> Optional[str]:
+    def _opd_debug_tensor_sha256(
+        values: Optional[torch.Tensor], *, dtype: Optional[torch.dtype] = None
+    ) -> Optional[str]:
         if values is None:
             return None
         cpu = values.detach().to(device="cpu")
@@ -5085,6 +5459,210 @@ class ModelRunner:
             return torch.zeros((), dtype=torch.float32, device=tensor.device)
         return tensor.reshape(-1)[:1].float().sum() * 0.0
 
+    @staticmethod
+    def _clear_diagnostic_decode_cache(model: nn.Module) -> None:
+        for module in model.modules():
+            if hasattr(module, "_diagnostic_past_key_value"):
+                delattr(module, "_diagnostic_past_key_value")
+
+    @staticmethod
+    def _diagnostic_decode_cache_lengths(model: nn.Module) -> list[int]:
+        lengths: list[tuple[int, int]] = []
+        for module in model.modules():
+            past = getattr(module, "_diagnostic_past_key_value", None)
+            if past is None:
+                continue
+            key_states = past[0]
+            if not isinstance(key_states, torch.Tensor):
+                continue
+            layer_idx = int(getattr(module, "layer_idx", len(lengths)))
+            lengths.append((layer_idx, int(key_states.shape[1])))
+        return [length for _, length in sorted(lengths)]
+
+    def _compute_decode_cache_micro_batch_loss(
+        self,
+        *,
+        micro_batch,
+        model_inputs,
+        return_per_token: bool,
+        logprob_temperature: float,
+        diagnostic_topk: int = 0,
+        diagnostic_reference_logits: bool = False,
+        diagnostic_hidden_states: bool = False,
+        diagnostic_hidden_sample_count: int = 8,
+        diagnostic_hidden_sample_indices: Any = None,
+    ):
+        """Forward-only diagnostic scorer that uses a KV cache like rollout decode."""
+        input_ids = model_inputs.get("input_ids")
+        labels = micro_batch.get("labels")
+        if not isinstance(input_ids, torch.Tensor) or not isinstance(labels, torch.Tensor):
+            raise ValueError("diagnostic_decode_cache requires tensor input_ids and labels")
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise ValueError("diagnostic_decode_cache currently supports one un-packed datum per micro-batch")
+        if labels.shape != input_ids.shape:
+            raise ValueError(
+                "diagnostic_decode_cache requires labels to match input_ids shape, "
+                f"got labels={tuple(labels.shape)} input_ids={tuple(input_ids.shape)}"
+            )
+
+        valid_positions = (labels.reshape(-1) != IGNORE_INDEX).nonzero(as_tuple=True)[0]
+        local_first = int(valid_positions[0].item()) if valid_positions.numel() > 0 else input_ids.shape[1]
+        local_last = int(valid_positions[-1].item()) if valid_positions.numel() > 0 else -1
+        local_has_valid = int(valid_positions.numel() > 0)
+
+        bounds = torch.tensor(
+            [local_first, -local_last, local_has_valid],
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(bounds, op=dist.ReduceOp.MIN)
+            has_valid = torch.tensor([local_has_valid], dtype=torch.long, device=input_ids.device)
+            dist.all_reduce(has_valid, op=dist.ReduceOp.MAX)
+            bounds[2] = has_valid[0]
+
+        if int(bounds[2].item()) == 0:
+            zero = torch.zeros((), dtype=torch.float32, device=input_ids.device)
+            return zero, {}, None, None, None
+
+        first_valid = int(bounds[0].item())
+        last_valid = -int(bounds[1].item())
+        segments = [(0, first_valid + 1), *((pos, pos + 1) for pos in range(first_valid + 1, last_valid + 1))]
+
+        past_key_values = []
+        decode_cache_segments = []
+        hidden_states = None
+        all_hidden_states = None
+        outputs = None
+        was_training = self.model.training
+        if was_training:
+            self.model.eval()
+        self._clear_diagnostic_decode_cache(self.model)
+        try:
+            for start, end in segments:
+                segment_input_ids = input_ids[:, start:end]
+                segment_attention_mask = torch.ones(
+                    input_ids.shape[0],
+                    end,
+                    dtype=torch.long,
+                    device=input_ids.device,
+                )
+                segment_position_ids = torch.arange(start, end, device=input_ids.device, dtype=torch.long).unsqueeze(0)
+                outputs = self.model(
+                    input_ids=segment_input_ids,
+                    attention_mask=segment_attention_mask,
+                    position_ids=segment_position_ids,
+                    past_key_values=past_key_values,
+                    output_hidden_states=diagnostic_hidden_states,
+                    diagnostic_decode_cache=True,
+                )
+                returned_past_key_values = getattr(outputs, "past_key_values", None)
+                if returned_past_key_values is not None:
+                    past_key_values = list(returned_past_key_values)
+                cache_lengths = [
+                    int(past[0].shape[1]) if past is not None and isinstance(past[0], torch.Tensor) else None
+                    for past in past_key_values
+                ]
+                diagnostic_cache_lengths = self._diagnostic_decode_cache_lengths(self.model)
+                if diagnostic_cache_lengths:
+                    cache_lengths = diagnostic_cache_lengths
+                decode_cache_segments.append(
+                    {
+                        "start": int(start),
+                        "end": int(end),
+                        "position_ids": list(range(int(start), int(end))),
+                        "past_key_values_len": len(cache_lengths),
+                        "past_key_lengths": cache_lengths,
+                    }
+                )
+                if hidden_states is None:
+                    hidden_states = outputs.last_hidden_state.new_zeros(
+                        input_ids.shape[0],
+                        input_ids.shape[1],
+                        outputs.last_hidden_state.shape[-1],
+                    )
+                hidden_states[:, start:end, :] = outputs.last_hidden_state
+                if diagnostic_hidden_states:
+                    segment_hidden_states = getattr(outputs, "hidden_states", None)
+                    if segment_hidden_states is None and isinstance(outputs, dict):
+                        segment_hidden_states = outputs.get("hidden_states")
+                    if segment_hidden_states is None:
+                        segment_hidden_states = (outputs.last_hidden_state,)
+                    if all_hidden_states is None:
+                        all_hidden_states = [
+                            layer_hidden.new_zeros(
+                                input_ids.shape[0],
+                                input_ids.shape[1],
+                                layer_hidden.shape[-1],
+                            )
+                            for layer_hidden in segment_hidden_states
+                        ]
+                    if len(segment_hidden_states) != len(all_hidden_states):
+                        raise RuntimeError(
+                            "diagnostic_decode_cache hidden-state layer count changed across segments: "
+                            f"{len(segment_hidden_states)} != {len(all_hidden_states)}"
+                        )
+                    for layer_index, layer_hidden in enumerate(segment_hidden_states):
+                        all_hidden_states[layer_index][:, start:end, :] = layer_hidden
+        finally:
+            self._clear_diagnostic_decode_cache(self.model)
+            if was_training:
+                self.model.train()
+
+        if hidden_states is None or outputs is None:
+            raise RuntimeError("diagnostic_decode_cache did not execute any model segments")
+
+        self._last_decode_cache_diagnostic_metadata = {
+            "segments": decode_cache_segments,
+            "segment_count": len(decode_cache_segments),
+        }
+
+        effective_weight = self._get_effective_lm_head_weight()
+        fp8_lm_head = self._get_fp8_lm_head_module(getattr(self.model, "lm_head", None))
+        token_sum_reducer = TokenPartial(scale=torch.tensor(1.0, device=hidden_states.device))
+        loss_tp_group = self._get_loss_tp_group()
+        result = causallm_loss_function(
+            hidden_states=hidden_states,
+            weight=effective_weight,
+            labels=labels,
+            return_per_token=return_per_token,
+            ce_mode=self.ce_mode,
+            lm_head_fp32=self.lm_head_fp32,
+            loss_reducer=token_sum_reducer,
+            tp_group=loss_tp_group,
+            lm_head=fp8_lm_head,
+            logprob_temperature=logprob_temperature,
+        )
+
+        per_token_outputs = {}
+        if return_per_token:
+            per_token_outputs["logprobs"] = result.per_token_logprobs
+            per_token_outputs["loss"] = result.per_token_loss
+        if diagnostic_topk > 0 and not return_per_token:
+            logger.warning(
+                "diagnostic_decode_cache diagnostic_topk requires return_per_token=True; skipping token diagnostics"
+            )
+        elif diagnostic_topk > 0 and loss_tp_group is not None:
+            logger.warning("diagnostic_decode_cache diagnostic_topk is not supported with vocab-parallel lm_head")
+        elif diagnostic_topk > 0:
+            token_diagnostics = self._compute_token_diagnostics(
+                hidden_states=hidden_states,
+                weight=effective_weight,
+                labels=labels,
+                topk=diagnostic_topk,
+                lm_head=fp8_lm_head,
+                lm_head_fp32=self.lm_head_fp32,
+                per_token_logprobs=result.per_token_logprobs if return_per_token else None,
+                include_weight_reference=diagnostic_reference_logits,
+                all_hidden_states=tuple(all_hidden_states) if all_hidden_states is not None else None,
+                hidden_sample_count=diagnostic_hidden_sample_count,
+                hidden_sample_indices=diagnostic_hidden_sample_indices,
+                logprob_temperature=logprob_temperature,
+            )
+            if token_diagnostics is not None:
+                per_token_outputs["token_diagnostics"] = token_diagnostics
+        return result.loss, per_token_outputs, None, None, outputs
+
     def _compute_micro_batch_loss(self, micro_batch, loss_fn, loss_fn_params):
         """Compute loss for a single micro-batch."""
         params = loss_fn_params or {}
@@ -5174,6 +5752,50 @@ class ModelRunner:
                 force_weights=diagnostic_moe_routing_reference_weights,
             )
 
+        if bool(params.get("diagnostic_decode_cache", False)):
+            if loss_fn not in ["causallm_loss", "cross_entropy"]:
+                raise ValueError("diagnostic_decode_cache only supports causallm_loss/cross_entropy")
+            if diagnostic_hidden_states and diagnostic_topk <= 0:
+                raise ValueError("diagnostic_decode_cache hidden-state summaries require diagnostic_topk > 0")
+            if diagnostic_hidden_components and not diagnostic_hidden_component_path:
+                raise ValueError("diagnostic_decode_cache hidden-component diagnostics require a dump path")
+            try:
+                result = self._compute_decode_cache_micro_batch_loss(
+                    micro_batch=micro_batch,
+                    model_inputs=model_inputs,
+                    return_per_token=return_per_token,
+                    logprob_temperature=logprob_temperature,
+                    diagnostic_topk=diagnostic_topk,
+                    diagnostic_reference_logits=bool(params.get("diagnostic_reference_logits", False)),
+                    diagnostic_hidden_states=diagnostic_hidden_states,
+                    diagnostic_hidden_sample_count=diagnostic_hidden_sample_count,
+                    diagnostic_hidden_sample_indices=diagnostic_hidden_sample_indices,
+                )
+                if diagnostic_component_captures and diagnostic_hidden_component_path:
+                    labels = micro_batch.get("labels")
+                    saved_path = self._write_hidden_component_tensor_dump(
+                        diagnostic_hidden_component_path,
+                        diagnostic_component_captures,
+                        labels=labels,
+                        metadata={
+                            "diagnostic_score_mode": "decode_cache",
+                            "diagnostic_hidden_component_layers": diagnostic_hidden_component_layers,
+                            "diagnostic_decode_cache": getattr(self, "_last_decode_cache_diagnostic_metadata", None),
+                            "valid_label_count": int((labels != IGNORE_INDEX).sum().item())
+                            if labels is not None
+                            else None,
+                        },
+                    )
+                    logger.info("Decode-cache hidden-component diagnostic tensors saved to %s", saved_path)
+                return result
+            finally:
+                for handle in opd_selected_layer_handles:
+                    handle.remove()
+                for handle in diagnostic_component_handles:
+                    handle.remove()
+                for handle in diagnostic_moe_routing_reference_handles:
+                    handle.remove()
+
         # Dual-regime eval toggle (W4 vs W4A4): when loss_fn_params carries
         # ``eval_quantize_activations`` (not None), force activation fake-quant on/off
         # across every QARL module for THIS forward only, then restore. Eval is
@@ -5211,6 +5833,16 @@ class ModelRunner:
                 handle.remove()
         profile_model_forward_ms = _profile_elapsed_ms(profile_model_start) if profile_timings else 0.0
         hidden_states = outputs.last_hidden_state
+        if diagnostic_component_captures is not None:
+            diagnostic_component_captures.append(
+                {
+                    "capture_index": len(diagnostic_component_captures),
+                    "layer": -1,
+                    "name": "final_hidden",
+                    "order": 10000,
+                    "tensor": hidden_states.detach().clone(),
+                }
+            )
         diagnostic_all_hidden_states = None
         if diagnostic_hidden_states:
             diagnostic_all_hidden_states = getattr(outputs, "hidden_states", None)
@@ -5677,6 +6309,8 @@ class ModelRunner:
             finally:
                 if r3_enabled:
                     self._routing_handler.cleanup()
+        if compute_backward and bool(params.get("diagnostic_decode_cache", False)):
+            raise ValueError("diagnostic_decode_cache is a forward-only diagnostic")
 
         # Count valid tokens globally
         global_valid_tokens = self._count_global_valid_tokens(micro_batches)
@@ -5988,28 +6622,106 @@ class ModelRunner:
     # Pipeline Parallelism support
     # =========================================================================
 
-    def _get_pp_schedule(self, n_microbatches, seq_len):
-        """Return a cached PP schedule keyed by (n_microbatches, seq_len).
+    def _make_pp_train_loss_fn(self):
+        """Training PP loss fn; under quack_linear it consumes the last stage's
+        HIDDEN states and needs that stage's lm_head (mirrors the Trainer)."""
+        pp_lm_head = None
+        if self.ce_mode == "quack_linear":
+            for model_part, init_stage in zip(self.model_parts, self.pp_stages):
+                if init_stage.stage_index == self.pp_num_stages - 1:
+                    pp_lm_head = getattr(model_part, "lm_head", None)
+        return make_pp_loss_fn(self.ce_mode, lm_head=pp_lm_head)
 
-        A new PipelineStage (cheap, no deepcopy) is created for each unique
-        seq_len so P2P buffers match the actual tensor shape.
+    def _bucket_pp_seq_len(self, seq_len: int) -> int:
+        """Round the negotiated seq_len up to the configured bucket so the
+        schedule/P2P-buffer cache stays bounded (0 disables bucketing)."""
+        bucket = self.train_config.get("pp_seq_len_bucket_size", 1024)
+        if bucket > 1:
+            return ((seq_len + bucket - 1) // bucket) * bucket
+        return seq_len
+
+    def _pp_last_stage_part(self):
+        """This rank's model part holding the LAST global stage (norm+lm_head), or None."""
+        for model_part, init_stage in zip(self.model_parts, self.pp_stages):
+            if init_stage.stage_index == self.pp_num_stages - 1:
+                return model_part
+        return None
+
+    def _pp_last_stage_src_rank(self) -> int:
+        """Global rank (in the default group) of the pp_group member owning the last stage."""
+        ps = get_parallel_state()
+        style = schedule_stage_style(self.train_config.get("pipeline_parallel_schedule", "1F1B"))
+        for pp_rank in range(ps.pp_size):
+            if self.pp_num_stages - 1 in stage_ids_for_rank(pp_rank, ps.pp_size, self.pp_num_stages, style):
+                return dist.get_global_rank(ps.pp_group, pp_rank)
+        raise RuntimeError("No PP rank owns the last stage — invalid stage mapping")
+
+    def _set_pp_lm_head_in_loss(self, lm_head_in_loss: bool) -> None:
+        """Set whether the last stage returns HIDDEN (lm_head applied in the loss /
+        outside the schedule) — must be refreshed per call because training and
+        forward-only schedules alternate on the same model parts."""
+        for model_part in self.model_parts:
+            model_part._pp_lm_head_in_loss = lm_head_in_loss
+
+    def _build_pp_stage_io(self, example_input_ids, stage_index: int, lm_head_in_loss: bool):
+        """Meta (input_args, output_args) so PipelineStage skips its shape-inference
+        forward (mirrors Trainer._build_pp_stage_io; mandatory for forward-only
+        schedules whose metadata queue a shape-inference forward would corrupt)."""
+        if example_input_ids is None:
+            return None, None
+        mbs = example_input_ids.shape[0]
+        s = example_input_ids.shape[-1]
+        cfg = self.model.config
+        dt = torch.bfloat16
+        if stage_index == 0:
+            input_args = (torch.empty(mbs, s, dtype=example_input_ids.dtype, device="meta"),)
+        else:
+            input_args = (torch.empty(mbs, s, cfg.hidden_size, dtype=dt, device="meta"),)
+        if stage_index == self.pp_num_stages - 1 and not lm_head_in_loss:
+            output_args = (torch.empty(mbs, s, cfg.vocab_size, dtype=dt, device="meta"),)
+        else:
+            output_args = (torch.empty(mbs, s, cfg.hidden_size, dtype=dt, device="meta"),)
+        return input_args, output_args
+
+    def _get_pp_schedule(self, n_microbatches, seq_len, loss_fn=None, example_input_ids=None):
+        """Return a cached PP schedule keyed by (n_microbatches, seq_len, has_loss).
+
+        A new PipelineStage per local model chunk (cheap, no deepcopy) is created
+        for each unique bucketed seq_len so P2P buffers match the actual tensor
+        shape. ``loss_fn=None`` builds a forward-only schedule (eval / ref
+        logprobs) whose last stage returns HIDDEN states; the caller applies
+        lm_head + loss outside the schedule.
         """
-        key = (n_microbatches, seq_len)
+        has_loss = loss_fn is not None
+        key = (n_microbatches, seq_len, has_loss)
+        # Forward-only always keeps lm_head out of the stage output (hidden out);
+        # training does so only under quack_linear.
+        lm_head_in_loss = (self.ce_mode == "quack_linear") if has_loss else True
         if key not in self._pp_schedule_cache:
             ps = get_parallel_state()
-            stage = build_pp_stage(
-                self.model_parts[0],
-                pp_rank=ps.pp_rank,
-                num_stages=ps.pp_size,
-                device=get_device_type(),
-                pp_group=ps.pp_group,
-            )
+            stages = []
+            for model_part, init_stage in zip(self.model_parts, self.pp_stages):
+                input_args, output_args = self._build_pp_stage_io(
+                    example_input_ids, init_stage.stage_index, lm_head_in_loss
+                )
+                stages.append(
+                    build_pp_stage(
+                        model_part,
+                        stage_index=init_stage.stage_index,
+                        num_stages=self.pp_num_stages,
+                        device=get_device_type(),
+                        pp_group=ps.pp_group,
+                        input_args=input_args,
+                        output_args=output_args,
+                    )
+                )
             self._pp_schedule_cache[key] = build_pipeline_schedule(
-                stages=[stage],
+                stages=stages,
                 n_microbatches=n_microbatches,
-                loss_fn=make_pp_loss_fn(self.ce_mode),
+                loss_fn=loss_fn,
                 schedule_name=self.train_config.get("pipeline_parallel_schedule", "1F1B"),
             )
+        self._set_pp_lm_head_in_loss(lm_head_in_loss)
         return self._pp_schedule_cache[key]
 
     def _forward_backward_pp(self, micro_batches, global_valid_tokens):
@@ -6024,7 +6736,7 @@ class ModelRunner:
         """
         ps = get_parallel_state()
         if self.train_config.get("pp_variable_seq_lengths", False):
-            seq_len = negotiate_pp_seq_len(micro_batches, ps.pp_group)
+            seq_len = self._bucket_pp_seq_len(negotiate_pp_seq_len(micro_batches, ps.pp_group))
             pad_micro_batches_for_pp(
                 micro_batches,
                 sample_packing_sequence_len=seq_len * ps.cp_size,
@@ -6034,7 +6746,12 @@ class ModelRunner:
         else:
             seq_len = micro_batches[0]["input_ids"].shape[-1]
 
-        pp_schedule = self._get_pp_schedule(len(micro_batches), seq_len)
+        pp_schedule = self._get_pp_schedule(
+            len(micro_batches),
+            seq_len,
+            loss_fn=self._make_pp_train_loss_fn(),
+            example_input_ids=micro_batches[0]["input_ids"],
+        )
         return forward_backward_pp(
             model_parts=self.model_parts,
             pp_schedule=pp_schedule,
@@ -6043,6 +6760,160 @@ class ModelRunner:
             has_last_stage=self.has_last_stage,
             pp_group=ps.pp_group,
         )
+
+    _PP_FORWARD_ONLY_LOSS_FNS = frozenset({"causallm_loss", "cross_entropy"})
+
+    @torch.no_grad()
+    def _pp_forward_only_loop(self, micro_batches, loss_fn, loss_fn_params, r3_enabled=False):
+        """Pipeline-aware forward-only pass (eval / reference logprobs).
+
+        Runs the full pipeline schedule in forward-only mode (all microbatches in
+        one pipelined step), computes loss + per-token logprobs from the last
+        stage's hidden states, and broadcasts per-microbatch results across
+        pp_group so every rank returns the same result dict as the non-PP
+        ``_forward_loop``.
+        """
+        if loss_fn not in self._PP_FORWARD_ONLY_LOSS_FNS:
+            raise NotImplementedError(
+                f"Forward-only loss_fn '{loss_fn}' is not yet pipeline-aware "
+                f"(supported: {sorted(self._PP_FORWARD_ONLY_LOSS_FNS)})."
+            )
+        params = loss_fn_params or {}
+        return_per_token = params.get("return_per_token", True)
+        ps = get_parallel_state()
+
+        global_valid_tokens = self._count_global_valid_tokens(micro_batches)
+
+        if self.train_config.get("pp_variable_seq_lengths", False):
+            seq_len = self._bucket_pp_seq_len(negotiate_pp_seq_len(micro_batches, ps.pp_group))
+            pad_target = seq_len * ps.cp_size
+        else:
+            # Static padding mirrors the training path: config value is the full
+            # (unsharded) packed length.
+            pad_target = self.train_config.get("sample_packing_sequence_len", 0)
+        pad_micro_batches_for_pp(
+            micro_batches,
+            sample_packing_sequence_len=pad_target,
+            sp_size=ps.cp_size,
+            pad_to_multiple_of=self.train_config.get("pad_to_multiple_of", 1),
+        )
+
+        micro_batches = [
+            {k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in mb.items()}
+            for mb in micro_batches
+        ]
+
+        logger.info(
+            f"Rank {self.rank}: PP forward-only start ({len(micro_batches)} microbatches, "
+            f"seq={micro_batches[0]['input_ids'].shape[-1]}, loss_fn={loss_fn})"
+        )
+        if r3_enabled:
+            set_replay_stage("replay_forward")
+        try:
+            pp_schedule = self._get_pp_schedule(
+                len(micro_batches),
+                micro_batches[0]["input_ids"].shape[-1],
+                loss_fn=None,
+                example_input_ids=micro_batches[0]["input_ids"],
+            )
+            hidden_per_mb = forward_only_pp(
+                model_parts=self.model_parts,
+                pp_schedule=pp_schedule,
+                micro_batches=micro_batches,
+                has_first_stage=self.has_first_stage,
+                has_last_stage=self.has_last_stage,
+            )
+        finally:
+            if r3_enabled:
+                set_replay_stage(None)
+        logger.info(f"Rank {self.rank}: PP forward-only schedule step done (last_stage={hidden_per_mb is not None})")
+
+        src_rank = self._pp_last_stage_src_rank()
+        total_loss = 0.0
+        accumulators = {"logprobs": [], "losses": [], "position_ids": [], "token_diagnostics": []}
+        raw_per_mb_logprobs = []
+
+        prefer_target_tokens = bool(params.get("_prefer_target_tokens", False))
+
+        def _mb_labels(micro_batch):
+            if prefer_target_tokens:
+                return micro_batch.get("target_tokens", micro_batch.get("labels"))
+            return micro_batch.get("labels", micro_batch.get("target_tokens"))
+
+        # Compute all per-microbatch payloads on the last stage, then ONE
+        # broadcast to pp_group. Errors are broadcast too so every rank raises
+        # together instead of peers hanging in the collective.
+        if hidden_per_mb is not None:
+            try:
+                last_part = self._pp_last_stage_part()
+                lm_head = last_part.lm_head
+                effective_weight = (
+                    lm_head.weight + lm_head.get_delta_weight().to(lm_head.weight.dtype)
+                    if isinstance(lm_head, LoraLinear)
+                    else lm_head.weight
+                )
+                # Under no_grad FSDP2 reshards after the stage forward even with
+                # reshard_after_forward=False, so the weight is a sharded DTensor
+                # here — materialize the full tensor for the loss.
+                if hasattr(effective_weight, "full_tensor"):
+                    effective_weight = effective_weight.full_tensor()
+                payloads = []
+                for batch_idx, micro_batch in enumerate(micro_batches):
+                    _result = causallm_loss_function(
+                        hidden_states=hidden_per_mb[batch_idx],
+                        weight=effective_weight,
+                        labels=_mb_labels(micro_batch),
+                        return_per_token=return_per_token,
+                        ce_mode=self.ce_mode,
+                        lm_head_fp32=self.lm_head_fp32,
+                        loss_reducer=TokenPartial(scale=torch.tensor(1.0, device=hidden_per_mb[batch_idx].device)),
+                        lm_head=self._get_fp8_lm_head_module(lm_head),
+                    )
+                    payloads.append(
+                        [
+                            _result.loss.detach().float().cpu(),
+                            _result.per_token_logprobs.detach().cpu() if return_per_token else None,
+                            _result.per_token_loss.detach().cpu() if return_per_token else None,
+                        ]
+                    )
+                wire = ["ok", payloads]
+            except Exception as exc:
+                logger.error(f"Rank {self.rank}: PP forward-only loss failed: {exc}", exc_info=True)
+                wire = ["error", f"{type(exc).__name__}: {exc}"]
+        else:
+            wire = [None, None]
+        dist.broadcast_object_list(wire, src=src_rank, group=ps.pp_group)
+        status, payloads = wire
+        if status == "error":
+            raise RuntimeError(f"PP forward-only loss failed on the last stage: {payloads}")
+
+        for batch_idx, micro_batch in enumerate(micro_batches):
+            local_loss_sum, per_token_logprobs, per_token_loss = payloads[batch_idx]
+
+            if global_valid_tokens.item() > 0:
+                total_loss += local_loss_sum.item() / global_valid_tokens.item()
+            per_token_outputs = {}
+            if return_per_token and per_token_logprobs is not None:
+                device = get_device_type()
+                per_token_outputs["logprobs"] = per_token_logprobs.to(device)
+                if per_token_loss is not None:
+                    per_token_outputs["loss"] = per_token_loss.to(device)
+                raw_per_mb_logprobs.append(per_token_logprobs)
+                self._collect_per_token_outputs(per_token_outputs, micro_batch, accumulators)
+
+        result = {
+            "total_loss": total_loss,
+            "global_valid_tokens": global_valid_tokens.item(),
+        }
+        if accumulators["logprobs"]:
+            result["packed_logprobs"] = [t.tolist() for t in accumulators["logprobs"]]
+            if accumulators["losses"]:
+                result["packed_losses"] = [t.tolist() for t in accumulators["losses"]]
+            if accumulators["position_ids"]:
+                result["packed_position_ids"] = [t.tolist() for t in accumulators["position_ids"]]
+        result["_pp_raw_per_token_logprobs"] = raw_per_mb_logprobs
+        synchronize()
+        return result
 
     # =========================================================================
     # Forward and backward passes
@@ -6151,11 +7022,23 @@ class ModelRunner:
             # Set up R3 routing for ref pass if needed (separate from main pass)
             ref_r3_enabled = self._routing_handler.setup(micro_batches, routed_experts, routed_expert_logits)
 
+            if self.pp_enabled:
+                # Pipeline-aware ref pass: one forward-only schedule step over all
+                # microbatches; per-token logprobs broadcast across pp_group.
+                ref_result = self._pp_forward_only_loop(
+                    micro_batches,
+                    "causallm_loss",
+                    {"return_per_token": True, "_prefer_target_tokens": True},
+                    r3_enabled=ref_r3_enabled,
+                )
+                for batch_idx, ref_logprobs in enumerate(ref_result["_pp_raw_per_token_logprobs"]):
+                    micro_batches[batch_idx]["logprobs"] = ref_logprobs
+
             with torch.no_grad():
-                if ref_r3_enabled:
+                if ref_r3_enabled and not self.pp_enabled:
                     set_replay_stage("replay_forward")
 
-                for batch_idx, micro_batch in enumerate(micro_batches):
+                for batch_idx, micro_batch in enumerate([] if self.pp_enabled else micro_batches):
                     mb = {
                         k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v
                         for k, v in micro_batch.items()
@@ -6384,16 +7267,30 @@ class ModelRunner:
         if self.pp_enabled and loss_fn == "opd_loss":
             raise NotImplementedError("opd_loss does not yet support pipeline parallelism")
 
-        r3_enabled = self._routing_handler.setup(micro_batches, routed_experts, routed_expert_logits)
+        params = loss_fn_params or {}
+        if bool(params.get("diagnostic_decode_cache", False)):
+            r3_enabled = self._routing_handler.setup_decode_cache(micro_batches, routed_experts, routed_expert_logits)
+        else:
+            r3_enabled = self._routing_handler.setup(micro_batches, routed_experts, routed_expert_logits)
 
-        result = self._forward_loop(
-            micro_batches,
-            loss_fn,
-            loss_fn_params,
-            compute_backward=False,
-            r3_enabled=r3_enabled,
-            model_id=model_id,
-        )
+        if self.pp_enabled:
+            # Forward-only must run the pipeline schedule — calling self.model(...)
+            # would execute only this rank's first stage.
+            try:
+                result = self._pp_forward_only_loop(micro_batches, loss_fn, loss_fn_params, r3_enabled=r3_enabled)
+                result.pop("_pp_raw_per_token_logprobs", None)
+            finally:
+                if r3_enabled:
+                    self._routing_handler.cleanup()
+        else:
+            result = self._forward_loop(
+                micro_batches,
+                loss_fn,
+                loss_fn_params,
+                compute_backward=False,
+                r3_enabled=r3_enabled,
+                model_id=model_id,
+            )
 
         if self._adapter_manager is not None:
             result["step"] = self._adapter_manager.get_adapter_state(model_id).global_forward_backward_step
@@ -6421,10 +7318,26 @@ class ModelRunner:
     # Optimizer step
     # =========================================================================
 
+    def _apply_optim_step_adam_hparams(
+        self,
+        optimizer: Any,
+        beta1: Optional[float],
+        beta2: Optional[float],
+        eps: Optional[float],
+    ) -> None:
+        """Apply client-passed betas/eps to ``optimizer`` and log when they change."""
+        applied = _apply_adam_hparams_to_param_groups(optimizer, beta1, beta2, eps)
+        if applied and applied != getattr(self, "_last_optim_step_adam_hparams", None):
+            self._last_optim_step_adam_hparams = applied
+            logger.info(f"optim_step: applying client Adam hyperparameters to param groups: {applied}")
+
     def optim_step(
         self,
         gradient_clip: Optional[float] = None,
         lr: Optional[float] = None,
+        beta1: Optional[float] = None,
+        beta2: Optional[float] = None,
+        eps: Optional[float] = None,
         model_id: str = "default",
         sparse_delta_capture: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -6439,6 +7352,9 @@ class ModelRunner:
         Args:
             gradient_clip: Optional gradient clipping value
             lr: Learning rate to set for this step (overrides adapter's lr if provided)
+            beta1: Optional Adam-family beta1 to apply to the optimizer param groups
+            beta2: Optional Adam-family beta2 to apply to the optimizer param groups
+            eps: Optional Adam-family eps to apply to the optimizer param groups
             model_id: The model_id for multi-adapter training (default: "default")
             sparse_delta_capture: Optional source sparse-delta capture config.
 
@@ -6487,6 +7403,14 @@ class ModelRunner:
             else:
                 effective_lr = self._adapter_manager.get_lr(model_id)
 
+            # Client-passed betas/eps apply to the adapter's own optimizer. Only
+            # reach into adapter state when there is something to apply, so
+            # adapter-manager fakes/implementations without get_adapter_state
+            # keep working unchanged.
+            if beta1 is not None or beta2 is not None or eps is not None:
+                adapter_state = self._adapter_manager.get_adapter_state(model_id)
+                self._apply_optim_step_adam_hparams(adapter_state.optimizer, beta1, beta2, eps)
+
             # Step the adapter's optimizer (handles LR update, grad clip, step, zero_grad)
             # Gradients are in the adapter's params (captured by capture_gradients in forward_backward)
             # Pass accumulated_valid_tokens for deferred gradient normalization
@@ -6523,6 +7447,10 @@ class ModelRunner:
                     else:
                         param_group["lr"] = effective_lr
 
+            # Client-passed Adam betas/eps are applied every step like lr; when
+            # absent (None) the optimizer keeps its configured values.
+            self._apply_optim_step_adam_hparams(self.optimizer, beta1, beta2, eps)
+
             ps = get_parallel_state()
             clip_value = get_effective_grad_clip_value(
                 clip_value,
@@ -6530,7 +7458,7 @@ class ModelRunner:
             )
 
             grad_norm = clip_gradients(
-                self.model,
+                self.model_parts if self.pp_enabled else self.model,
                 clip_value,
                 pp_enabled=self.pp_enabled,
                 pp_group=ps.pp_group if self.pp_enabled else None,
@@ -6547,7 +7475,8 @@ class ModelRunner:
             except TypeError:
                 # MultiOptimizer (Muon) doesn't support set_to_none kwarg
                 self.optimizer.zero_grad()
-            self.model.zero_grad(set_to_none=True)
+            for part in self.model_parts if self.pp_enabled else [self.model]:
+                part.zero_grad(set_to_none=True)
             skip_optim_empty_cache = _skip_empty_cache_after_optim_step(self.train_config)
             if skip_optim_empty_cache:
                 logger.debug("Skipping torch.cuda.empty_cache() after optimizer step")

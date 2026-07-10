@@ -11,6 +11,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..fold import (
+    FoldedLoraWeightLinear,
+    canonical_lora_fold_linear,
+    lora_merged_cache_enabled,
+    lora_merged_forward_enabled,
+)
 from .base import LoraModule
 
 
@@ -163,6 +169,61 @@ class LoraLinear(LoraModule, nn.Linear):
     def _active_scaling(self) -> float:
         return self.active_lora_alpha / self.active_r
 
+    # ------------------------------------------------------------------
+    # Merged-forward K3 contract lane (XORL_LORA_MERGED_FORWARD=1)
+    # ------------------------------------------------------------------
+
+    def invalidate_merged_weight_cache(self) -> None:
+        self._merged_weight_cache = {}
+
+    def _merged_weight_key(self) -> tuple:
+        t = (self.lora_A, self.lora_B, self.weight)
+        return (
+            tuple(x._version for x in t),
+            tuple(x.data_ptr() for x in t),
+            self.active_r,
+            self.active_lora_alpha,
+        )
+
+    def _merged_weight(self) -> torch.Tensor:
+        """Canonically folded ``W' = (W.fp32 + (B@A)*scaling).to(W.dtype)``
+        (:func:`xorl.lora.fold.canonical_lora_fold_linear` — the same bytes the
+        weight-sync merged extraction ships under the flag). Cached keyed on
+        param versions + active rank/alpha."""
+        cache = getattr(self, "_merged_weight_cache", None)
+        if cache is None:
+            cache = {}
+            self._merged_weight_cache = cache
+        key = self._merged_weight_key()
+        if lora_merged_cache_enabled() and cache.get("key") == key:
+            return cache["weight"]
+        with torch.no_grad():
+            folded = canonical_lora_fold_linear(
+                self.weight,
+                self.lora_A[: self.active_r],
+                self.lora_B[:, : self.active_r],
+                self._active_scaling(),
+            )
+        if lora_merged_cache_enabled():
+            cache["key"] = key
+            cache["weight"] = folded
+        else:
+            cache.clear()
+        return folded
+
+    def merged_weight_for_forward(self) -> torch.Tensor:
+        """Straight-through merged weight: forward bits = the cached canonical
+        fold; backward = exact chain rule into the active LoRA factor slices."""
+        folded = self._merged_weight()
+        if torch.is_grad_enabled() and (self.lora_A.requires_grad or self.lora_B.requires_grad):
+            return FoldedLoraWeightLinear.apply(
+                folded,
+                self.lora_A[: self.active_r],
+                self.lora_B[:, : self.active_r],
+                self._active_scaling(),
+            )
+        return folded
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass with LoRA adaptation.
@@ -173,6 +234,12 @@ class LoraLinear(LoraModule, nn.Linear):
         Returns:
             Output tensor of shape [..., out_features]
         """
+        if lora_merged_forward_enabled():
+            # Merged-forward contract lane: the base kernel runs on the folded
+            # weight (identical to a serving engine that received W'), and the
+            # low-rank GEMM lane exits the forward entirely.
+            return F.linear(x, self.merged_weight_for_forward(), self.bias)
+
         # Base linear transformation
         result = F.linear(x, self.weight, self.bias)
 

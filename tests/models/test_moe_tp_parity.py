@@ -11,6 +11,35 @@ def _fake_tp_state(tp_size: int = 2):
     return SimpleNamespace(ep_enabled=False, tp_size=tp_size)
 
 
+def test_sglang_moe_tp_sim_env_enables_no_ep_tp1(monkeypatch):
+    experts = MoEExperts(num_experts=3, hidden_dim=4, intermediate_size=6, moe_implementation="eager")
+    tp1_state = _fake_tp_state(tp_size=1)
+
+    monkeypatch.delenv("XORL_SGLANG_MOE_TP_SIM", raising=False)
+    assert not experts.sglang_moe_tp_sim_enabled(tp1_state)
+
+    monkeypatch.setenv("XORL_SGLANG_MOE_TP_SIM", "sglang_runner")
+    assert experts.sglang_moe_tp_sim_enabled(tp1_state)
+
+    ep_state = SimpleNamespace(ep_enabled=True, tp_size=1)
+    assert not experts.sglang_moe_tp_sim_enabled(ep_state)
+
+
+def test_sglang_moe_tp_sim_layer_filter(monkeypatch):
+    experts = MoEExperts(num_experts=3, hidden_dim=4, intermediate_size=6, moe_implementation="eager")
+    tp1_state = _fake_tp_state(tp_size=1)
+    monkeypatch.setenv("XORL_SGLANG_MOE_TP_SIM", "sglang")
+    monkeypatch.setenv("XORL_SGLANG_MOE_TP_SIM_LAYERS", "2,4")
+
+    assert not experts.sglang_moe_tp_sim_enabled(tp1_state)
+
+    experts.layer_idx = 3
+    assert not experts.sglang_moe_tp_sim_enabled(tp1_state)
+
+    experts.layer_idx = 4
+    assert experts.sglang_moe_tp_sim_enabled(tp1_state)
+
+
 def _manual_sglang_tp_sim_direct(
     experts: MoEExperts,
     hidden_states: torch.Tensor,
@@ -47,6 +76,46 @@ def _manual_sglang_tp_sim_direct(
             expert_out = expert_out * routing_flat[token_rows, topk_slots].unsqueeze(-1)
             shard_output.index_add_(0, token_rows, expert_out)
         output = output + shard_output
+
+    return output.reshape(hidden_states.shape)
+
+
+def _manual_sglang_tp_sim_direct_bf16_reduce(
+    experts: MoEExperts,
+    hidden_states: torch.Tensor,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    tp_size: int,
+) -> torch.Tensor:
+    hidden_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+    selected_flat = selected_experts.reshape(hidden_flat.shape[0], -1)
+    routing_flat = routing_weights.reshape(hidden_flat.shape[0], -1)
+    output = hidden_flat.new_zeros(hidden_flat.shape)
+    shard_intermediate = experts.intermediate_size // tp_size
+
+    for tp_rank in range(tp_size):
+        start = tp_rank * shard_intermediate
+        end = start + shard_intermediate
+        shard_output = hidden_flat.new_zeros(hidden_flat.shape)
+        for expert_idx in range(experts.num_experts):
+            mask = selected_flat == expert_idx
+            if not bool(mask.any().item()):
+                continue
+            token_rows, topk_slots = mask.nonzero(as_tuple=True)
+            tokens = hidden_flat.index_select(0, token_rows)
+            gate = tokens.matmul(experts.gate_up_proj[expert_idx, :, start:end])
+            up = tokens.matmul(
+                experts.gate_up_proj[
+                    expert_idx,
+                    :,
+                    experts.intermediate_size + start : experts.intermediate_size + end,
+                ]
+            )
+            activated = apply_moe_activation(experts.hidden_act, gate, up)
+            expert_out = activated.matmul(experts.down_proj[expert_idx, start:end, :])
+            expert_out = expert_out * routing_flat[token_rows, topk_slots].unsqueeze(-1)
+            shard_output.index_add_(0, token_rows, expert_out)
+        output = output.to(torch.bfloat16) + shard_output.to(torch.bfloat16)
 
     return output.reshape(hidden_states.shape)
 
@@ -191,9 +260,94 @@ def test_sglang_moe_tp_sim_matches_manual_shard_reduce(monkeypatch):
     torch.testing.assert_close(actual, expected)
 
 
+def test_sglang_moe_tp_sim_bf16_reduce_forces_shard_accumulation_dtype(monkeypatch):
+    monkeypatch.setenv("XORL_SGLANG_MOE_TP_SIM", "1")
+    monkeypatch.setenv("XORL_SGLANG_MOE_TP_SIM_BF16_REDUCE", "1")
+    monkeypatch.setattr(parallel_state_module, "get_parallel_state", lambda: _fake_tp_state(tp_size=2))
+
+    torch.manual_seed(0)
+    experts = MoEExperts(num_experts=3, hidden_dim=4, intermediate_size=6, moe_implementation="eager")
+    with torch.no_grad():
+        experts.gate_up_proj.copy_(torch.randn_like(experts.gate_up_proj) * 0.1)
+        experts.down_proj.copy_(torch.randn_like(experts.down_proj) * 0.1)
+
+    hidden_states = torch.randn(5, 4)
+    selected_experts = torch.tensor(
+        [
+            [0, 1],
+            [2, 0],
+            [1, 2],
+            [2, 1],
+            [0, 2],
+        ],
+        dtype=torch.long,
+    )
+    routing_weights = torch.tensor(
+        [
+            [0.75, 0.25],
+            [0.60, 0.40],
+            [0.55, 0.45],
+            [0.80, 0.20],
+            [0.50, 0.50],
+        ],
+        dtype=hidden_states.dtype,
+    )
+
+    actual = experts(hidden_states, routing_weights, selected_experts)
+    expected = _manual_sglang_tp_sim_direct_bf16_reduce(
+        experts,
+        hidden_states,
+        routing_weights,
+        selected_experts,
+        tp_size=2,
+    )
+
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual, expected)
+
+
 def test_sglang_moe_tp_cache_mode_matches_manual_cache_reduce(monkeypatch):
     monkeypatch.setenv("XORL_SGLANG_MOE_TP_SIM", "cache")
     monkeypatch.setattr(parallel_state_module, "get_parallel_state", lambda: _fake_tp_state(tp_size=2))
+
+    torch.manual_seed(0)
+    experts = MoEExperts(num_experts=3, hidden_dim=4, intermediate_size=6, moe_implementation="eager")
+    with torch.no_grad():
+        experts.gate_up_proj.copy_(torch.randn_like(experts.gate_up_proj) * 0.1)
+        experts.down_proj.copy_(torch.randn_like(experts.down_proj) * 0.1)
+
+    hidden_states = torch.randn(5, 4)
+    selected_experts = torch.tensor(
+        [
+            [0, 1],
+            [2, 0],
+            [1, 2],
+            [2, 1],
+            [0, 2],
+        ],
+        dtype=torch.long,
+    )
+    routing_weights = torch.tensor(
+        [
+            [0.75, 0.25],
+            [0.60, 0.40],
+            [0.55, 0.45],
+            [0.80, 0.20],
+            [0.50, 0.50],
+        ],
+        dtype=hidden_states.dtype,
+    )
+
+    actual = experts(hidden_states, routing_weights, selected_experts)
+    expected = _manual_sglang_tp_sim_cache(experts, hidden_states, routing_weights, selected_experts, tp_size=2)
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_sglang_moe_tp_sim_size_override_under_tp1(monkeypatch):
+    monkeypatch.setenv("XORL_SGLANG_MOE_TP_SIM", "cache")
+    monkeypatch.setenv("XORL_SGLANG_MOE_TP_SIM_SIZE", "2")
+    monkeypatch.setattr(parallel_state_module, "get_parallel_state", lambda: _fake_tp_state(tp_size=1))
 
     torch.manual_seed(0)
     experts = MoEExperts(num_experts=3, hidden_dim=4, intermediate_size=6, moe_implementation="eager")
@@ -639,6 +793,9 @@ def test_eager_moe_block_uses_tp_sim_without_per_expert_bypass(monkeypatch):
         intermediate_size=6,
         moe_implementation="eager",
     )
+    with torch.no_grad():
+        block.experts.gate_up_proj.copy_(torch.randn_like(block.experts.gate_up_proj) * 0.1)
+        block.experts.down_proj.copy_(torch.randn_like(block.experts.down_proj) * 0.1)
     hidden_states = torch.randn(2, 3, 4)
 
     flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
@@ -654,3 +811,66 @@ def test_eager_moe_block_uses_tp_sim_without_per_expert_bypass(monkeypatch):
     actual, _ = block(hidden_states)
 
     torch.testing.assert_close(actual, expected)
+
+
+def test_sglang_moe_tp_sim_carry_shards_survives_moe_block_reshape(monkeypatch):
+    monkeypatch.setenv("XORL_SGLANG_MOE_TP_SIM", "1")
+    monkeypatch.setenv("XORL_SGLANG_MOE_TP_SIM_CARRY_SHARDS", "1")
+    monkeypatch.setattr(parallel_state_module, "get_parallel_state", lambda: _fake_tp_state(tp_size=2))
+
+    torch.manual_seed(2)
+    block = MoEBlock(
+        hidden_size=4,
+        num_experts=3,
+        top_k=2,
+        intermediate_size=6,
+        moe_implementation="eager",
+    )
+    with torch.no_grad():
+        block.experts.gate_up_proj.copy_(torch.randn_like(block.experts.gate_up_proj) * 0.1)
+        block.experts.down_proj.copy_(torch.randn_like(block.experts.down_proj) * 0.1)
+    hidden_states = torch.randn(2, 3, 4)
+
+    actual, _ = block(hidden_states)
+    carried_shards = getattr(actual, "_xorl_sglang_moe_tp_shards", None)
+
+    assert carried_shards is not None
+    assert len(carried_shards) == 2
+    assert all(shard.shape == actual.shape for shard in carried_shards)
+    expected = carried_shards[0] + carried_shards[1]
+    torch.testing.assert_close(actual, expected)
+
+
+def test_sglang_moe_tp_sim_captures_flat_shards(monkeypatch):
+    monkeypatch.setenv("XORL_SGLANG_MOE_TP_SIM", "1")
+    monkeypatch.setenv("XORL_SGLANG_MOE_TP_SIM_CARRY_SHARDS", "1")
+    monkeypatch.setattr(parallel_state_module, "get_parallel_state", lambda: _fake_tp_state(tp_size=2))
+
+    torch.manual_seed(3)
+    block = MoEBlock(
+        hidden_size=4,
+        num_experts=3,
+        top_k=2,
+        intermediate_size=6,
+        moe_implementation="eager",
+    )
+    with torch.no_grad():
+        block.experts.gate_up_proj.copy_(torch.randn_like(block.experts.gate_up_proj) * 0.1)
+        block.experts.down_proj.copy_(torch.randn_like(block.experts.down_proj) * 0.1)
+    captures = {}
+    block._diagnostic_capture_component = lambda name, tensor: captures.setdefault(name, tensor.detach().clone())
+    hidden_states = torch.randn(2, 3, 4)
+
+    actual, _ = block(hidden_states)
+
+    assert "moe_experts_output_tp_shard_0" in captures
+    assert "moe_experts_output_tp_shard_1" in captures
+    assert "moe_experts_output_tp_shard_sum" in captures
+    assert captures["moe_experts_output_tp_shard_0"].shape == (6, 4)
+    assert captures["moe_experts_output_tp_shard_1"].shape == (6, 4)
+    torch.testing.assert_close(
+        captures["moe_experts_output_tp_shard_sum"],
+        captures["moe_experts_output_tp_shard_0"] + captures["moe_experts_output_tp_shard_1"],
+    )
+    torch.testing.assert_close(captures["moe_experts_output_tp_shard_sum"], captures["moe_experts_output"])
+    torch.testing.assert_close(actual, captures["moe_experts_output"].reshape_as(actual))

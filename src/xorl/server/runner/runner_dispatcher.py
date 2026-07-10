@@ -1497,9 +1497,15 @@ class RunnerDispatcher:
         was_auto_loaded, auto_load_path = self._adapter_coordinator.auto_load_if_evicted(model_id)
 
         # All ranks execute optim_step (synchronized via DDP)
+        # beta1/beta2/eps are threaded through from AdamParams; dropping them
+        # here silently ran every server-mode run at build_optimizer's default
+        # betas (beta2=0.95 instead of the advertised value).
         result = self.trainer.optim_step(
             gradient_clip=gradient_clip,
             lr=lr,
+            beta1=p.beta1,
+            beta2=p.beta2,
+            eps=p.eps,
             model_id=model_id,
             sparse_delta_capture=p.sparse_delta_capture,
         )

@@ -24,6 +24,7 @@ def _trainer_args():
             model_path="unused-weights",
             attn_implementation="eager",
             moe_implementation=None,
+            moe_routing_weights_before_down=True,
             ep_dispatch="alltoall",
             train_router=False,
             record_routing_weights=True,
@@ -80,3 +81,4 @@ def test_local_trainer_forwards_model_numeric_alignment_flags(monkeypatch):
     assert captured["activation_native"] is True
     assert captured["rope_native"] is True
     assert captured["attention_cast_bf16"] is True
+    assert captured["moe_routing_weights_before_down"] is True

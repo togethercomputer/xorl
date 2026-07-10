@@ -51,7 +51,10 @@ class TestAttentionBackendRegistry:
 
             assert not reloaded_flash.FA3_AVAILABLE
             assert reloaded_flash.FA4_AVAILABLE
-            assert "flash_attention_3" not in reloaded_backend.ATTENTION_FUNCTIONS
+            # flash_attention_3 must stay registered in FA4-only environments:
+            # flash_attention_forward falls through to FA4 internally, and an
+            # unregistered key would silently dispatch to eager attention.
+            assert "flash_attention_3" in reloaded_backend.ATTENTION_FUNCTIONS
             assert "flash_attention_4" in reloaded_backend.ATTENTION_FUNCTIONS
         finally:
             monkeypatch.undo()
@@ -270,4 +273,133 @@ class TestEagerAttentionForward:
                 attention_mask=None,
                 scaling=8**-0.5,
                 dropout=0.0,
+            )
+
+
+class TestSglKernelParityPath:
+    """XORL_FLASH_ATTN_SGL_KERNEL routes packed attention through sgl_kernel FA3."""
+
+    @pytest.fixture(autouse=True)
+    def _skip_when_flash_attention_unavailable(self):
+        if _FLASH_ATTN_IMPORT_ERROR is not None:
+            pytest.skip(f"flash attention backend unavailable: {_FLASH_ATTN_IMPORT_ERROR}")
+
+    @staticmethod
+    def _module():
+        module = Mock()
+        module.is_causal = True
+        module.config = Mock()
+        module.config._flash_attention_deterministic = False
+        return module
+
+    def test_varlen_path_routes_through_sgl_kernel(self):
+        total_tokens, num_heads, head_dim = 32, 8, 64
+        query = torch.randn(1, total_tokens, num_heads, head_dim)
+        key = torch.randn(1, total_tokens, num_heads, head_dim)
+        value = torch.randn(1, total_tokens, num_heads, head_dim)
+        cu_seqlens = torch.tensor([0, 16, 32], dtype=torch.int64)
+
+        with (
+            patch.object(flash_module, "XORL_FLASH_ATTN_SGL_KERNEL", True),
+            patch.object(flash_module, "sgl_flash_attn_with_kvcache") as mock_sgl,
+        ):
+            mock_sgl.return_value = torch.zeros(total_tokens, num_heads, head_dim)
+            result, _ = flash_attention_forward(
+                self._module(),
+                query,
+                key,
+                value,
+                attention_mask=None,
+                scaling=0.125,
+                cu_seq_lens_q=cu_seqlens,
+                cu_seq_lens_k=cu_seqlens,
+                max_length_q=16,
+                max_length_k=16,
+            )
+        assert mock_sgl.called
+        kwargs = mock_sgl.call_args[1]
+        assert kwargs["num_splits"] == 1
+        assert kwargs["cu_seqlens_q"].dtype == torch.int32
+        # page-size-1 KV cache: one page per token
+        assert kwargs["k_cache"].shape == (total_tokens, 1, num_heads, head_dim)
+        assert kwargs["page_table"].shape == (2, 16)
+        assert kwargs["cache_seqlens"].tolist() == [16, 16]
+        assert kwargs["softmax_scale"] == 0.125
+        assert kwargs["causal"] is True
+        assert result.shape == (1, total_tokens, num_heads, head_dim)
+
+    def test_single_sequence_batched_path_synthesizes_cu_seqlens(self):
+        seqlen, num_heads, head_dim = 16, 8, 64
+        query = torch.randn(1, seqlen, num_heads, head_dim)
+        key = torch.randn(1, seqlen, num_heads, head_dim)
+        value = torch.randn(1, seqlen, num_heads, head_dim)
+
+        with (
+            patch.object(flash_module, "XORL_FLASH_ATTN_SGL_KERNEL", True),
+            patch.object(flash_module, "sgl_flash_attn_with_kvcache") as mock_sgl,
+        ):
+            mock_sgl.return_value = torch.zeros(seqlen, num_heads, head_dim)
+            result, _ = flash_attention_forward(
+                self._module(),
+                query,
+                key,
+                value,
+                attention_mask=None,
+            )
+        assert mock_sgl.called
+        kwargs = mock_sgl.call_args[1]
+        assert kwargs["cu_seqlens_q"].tolist() == [0, seqlen]
+        assert kwargs["max_seqlen_q"] == seqlen
+        assert result.shape == (1, seqlen, num_heads, head_dim)
+
+    def test_flag_off_keeps_default_varlen_path(self):
+        total_tokens, num_heads, head_dim = 32, 8, 64
+        query = torch.randn(1, total_tokens, num_heads, head_dim)
+        key = torch.randn(1, total_tokens, num_heads, head_dim)
+        value = torch.randn(1, total_tokens, num_heads, head_dim)
+        cu_seqlens = torch.tensor([0, 16, 32], dtype=torch.int64)
+
+        with (
+            patch.object(flash_module, "XORL_FLASH_ATTN_SGL_KERNEL", False),
+            patch.object(flash_module, "FA3_AVAILABLE", True),
+            patch.object(flash_module, "sgl_flash_attn_with_kvcache") as mock_sgl,
+            patch.object(flash_module, "_should_use_fa4", return_value=False),
+            patch.object(flash_module, "flash_attn_varlen_func") as mock_varlen,
+        ):
+            mock_varlen.return_value = torch.zeros(total_tokens, num_heads, head_dim)
+            flash_attention_forward(
+                self._module(),
+                query,
+                key,
+                value,
+                attention_mask=None,
+                cu_seq_lens_q=cu_seqlens,
+                cu_seq_lens_k=cu_seqlens,
+                max_length_q=16,
+                max_length_k=16,
+            )
+        assert not mock_sgl.called
+        assert mock_varlen.called
+
+    def test_rejects_cross_attention_cu_seqlens(self):
+        num_heads, head_dim = 8, 64
+        q = torch.randn(32, num_heads, head_dim)
+        k = torch.randn(48, num_heads, head_dim)
+        v = torch.randn(48, num_heads, head_dim)
+        with (
+            patch.object(flash_module, "sgl_flash_attn_with_kvcache", Mock()),
+            pytest.raises(ValueError, match="self-attention"),
+        ):
+            flash_module._flash_attn_varlen_with_sgl_kernel(
+                q,
+                k,
+                v,
+                torch.tensor([0, 32], dtype=torch.int32),
+                torch.tensor([0, 48], dtype=torch.int32),
+                32,
+                48,
+                None,
+                True,
+                (-1, -1),
+                None,
             )

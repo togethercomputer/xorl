@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -7,6 +8,27 @@ import torch.nn.functional as F
 
 from .comm import all_to_all
 from .utils import permute, permuted_weights, sort_chunks_by_idxs, unpermute
+
+
+_MOE_SGLANG_FUSED_EXPERTS_ENV = "XORL_MOE_SGLANG_FUSED_EXPERTS"
+
+
+def _sglang_fused_experts_keep_score_dtype() -> bool:
+    """K3 parity mode: keep dispatched routing scores in their source dtype.
+
+    Under ``XORL_MOE_SGLANG_FUSED_EXPERTS=1`` the EP expert compute feeds the
+    dispatched pair weights to SGLang's serving kernel in fp32 (the serving
+    contract, applied on the fp32 down-GEMM accumulator). The post-arrival cast
+    to the token dtype below would silently round fp32 routing weights to bf16
+    first. The score all-to-all itself always runs in the routing weights'
+    source dtype (the cast happens after arrival), so skipping it changes no
+    dispatch bytes. Env check duplicated (explicit-opt-in semantics, matching
+    the EP path in ``xorl.models.layers.moe.experts._ep_forward``) to avoid a
+    circular import; the unset auto-default never engages the parity path
+    under EP.
+    """
+    value = os.environ.get(_MOE_SGLANG_FUSED_EXPERTS_ENV, "0").strip().lower()
+    return value not in {"0", "false", "no", "off", ""}
 
 
 def _expert_chunk_permute_order(num_experts: int, ep_size: int) -> List[int]:
@@ -289,7 +311,9 @@ def alltoall_pre_dispatch(
         output_splits=output_splits,
         num_global_tokens_per_local_expert=num_tokens_per_expert,
         ep_group=ep_group,
-    ).to(permuted_tokens.dtype)
+    )
+    if not _sglang_fused_experts_keep_score_dtype():
+        expert_scores = expert_scores.to(permuted_tokens.dtype)
 
     ctx = AllToAllDispatchContext(
         input_splits=input_splits,

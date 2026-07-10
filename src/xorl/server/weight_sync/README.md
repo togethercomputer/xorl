@@ -591,34 +591,9 @@ optim = requests.post("http://localhost:6000/api/v1/retrieve_future", json={
 source_manifest = optim["info"]["sparse_delta_capture"]["manifest_path"]
 ```
 
-For Qwen3.6 source-capture experiments, the source manifest can be translated
-with `experiments/local_benchmark/scripts/sparse_delta_qwen36_source_encoded_e2e.py`
-using `--source-capture-manifest`; the generated terminal paths should then be
-posted through `sync_inference_weights` with `prepacked_only`.
-
-Manual receiver smoke test:
-
-```bash
-python scripts/weight_sync_sparse_delta_client.py \
-  --base-url http://192.168.229.98:30123 \
-  --delta-path /shared/p2p-sync-stress/sparse-delta-validation/qwen06b-qnorm-three.packed \
-  --tp-size 1 \
-  --weight-version sparse-qnorm-smoke \
-  --warmup 1 \
-  --repeat 5
-```
-
-Example:
-
-```bash
-python scripts/weight_sync_delta_probe.py \
-  --delta-encoding-path /home/apanda/delta-encoding \
-  --shape 4096x4096 \
-  --dtype uint8 \
-  --density 0.001 \
-  --density 0.01 \
-  --density 0.1
-```
+Source-capture manifests must be translated into receiver-compatible files by
+the inference integration. Post the generated terminal paths through
+`sync_inference_weights` with `prepacked_only`.
 
 For dense FP8 updates, the packed sparse format is larger than the dense payload
 because it stores values plus index deltas. It becomes attractive only when the

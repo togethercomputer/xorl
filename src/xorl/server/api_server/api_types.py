@@ -91,6 +91,26 @@ class Datum(BaseModel):
 
         def convert_value(v: InputType) -> List[Union[int, float, str]]:
             if isinstance(v, TensorData):
+                # Rank>=2 TensorData: re-nest the flattened data per shape. The engine
+                # datum pipeline (orchestrator packer / collators) expects sequence
+                # fields as nested per-token rows (e.g. client-provided
+                # teacher_hidden_states [seq_len, hidden]). Returning flat data drops
+                # the shape: the packer then sees len != seq_len, misclassifies the
+                # field as scalar metadata, and silently keeps only the last sample's
+                # values. Rank-0/1 behavior is unchanged.
+                if v.shape is not None and len(v.shape) > 1:
+                    expected = 1
+                    for dim in v.shape:
+                        expected *= dim
+                    if expected == len(v.data) and expected > 0:
+
+                        def nest(flat: List[Any], dims: List[int]) -> List[Any]:
+                            if len(dims) == 1:
+                                return flat
+                            step = len(flat) // dims[0]
+                            return [nest(flat[i * step : (i + 1) * step], dims[1:]) for i in range(dims[0])]
+
+                        return nest(v.data, list(v.shape))
                 return v.data
             return v
 

@@ -15,6 +15,10 @@ Two implementations are available:
 Select the backend with the ``XORL_GDN_BACKEND`` environment variable
 (``fla`` | ``flashqla``). ``flashqla`` requires head dim 128; for other head dims
 the caller falls back to ``fla`` (see :func:`warn_cp_fallback_once`).
+
+``XORL_GDN_FLASHQLA_AUTOCP`` overrides FlashQLA's ``auto_cp`` intra-card CP
+heuristic (default: on; pinned off while the ``XORL_BI_GDN`` contract lane is
+armed — see :func:`resolve_flashqla_auto_cp`).
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from typing import Any, Callable
 
 
 GDN_BACKEND_ENV = "XORL_GDN_BACKEND"
+FLASHQLA_AUTOCP_ENV = "XORL_GDN_FLASHQLA_AUTOCP"
 _VALID_BACKENDS = ("fla", "flashqla")
 
 _flashqla_chunk: Callable[..., Any] | None = None
@@ -40,6 +45,24 @@ def get_gdn_backend() -> str:
             f"{GDN_BACKEND_ENV}={backend!r} is invalid; expected one of {_VALID_BACKENDS}.",
         )
     return backend
+
+
+def resolve_flashqla_auto_cp(auto_cp: bool | None) -> bool:
+    """Resolve FlashQLA's ``auto_cp`` mode: explicit arg > env > contract-lane default.
+
+    auto_cp's intra-card CP heuristic (Be*H<=40 gate + warmup h0-drop approximation)
+    breaks batch-invariance and changes math, so it is pinned OFF whenever the GDN
+    bitwise contract lane (``XORL_BI_GDN``) is armed; otherwise it defaults to ON
+    (unchanged non-contract throughput behavior).
+    """
+    if auto_cp is not None:
+        return auto_cp
+    env = os.environ.get(FLASHQLA_AUTOCP_ENV)
+    if env is not None:
+        return env.strip().lower() in {"1", "true", "yes", "on"}
+    from xorl.ops.linear_attention.modules.bi_contract import is_gdn_contract_enabled  # noqa: PLC0415
+
+    return not is_gdn_contract_enabled()
 
 
 def warn_cp_fallback_once() -> None:

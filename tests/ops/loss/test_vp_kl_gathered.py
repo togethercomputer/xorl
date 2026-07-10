@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Multi-process test for vocab_parallel_reverse_kl_gathered — the FSDP integration
 glue (gather activations, shard weights, local-slice grad).
 
@@ -10,8 +9,7 @@ after gather→VP-KL→loss.sum()→backward:
   - this rank's weight-shard grad == reference grad for its vocab shard.
 
 Run (no GPU needed):
-  PYTHONPATH=/home/apanda/xorl-opd-kl-fused/src \
-    /home/apanda/xorl-internal/.venv/bin/python test_vp_kl_gathered.py
+  uv run pytest tests/ops/loss/test_vp_kl_gathered.py
 """
 
 from __future__ import annotations
@@ -518,8 +516,12 @@ def main():
 
     ret_opd2 = mgr.dict()
     mp.spawn(_worker_opd_two_lm_tp_groups, args=(WORLD, ret_opd2), nprocs=WORLD, join=True)
-    opd2_gh_rel = max(ret_opd2[f"opd2_gh_{rank}"] / max(ret_opd2[f"opd2_gh_scale_{rank}"], 1e-30) for rank in range(WORLD))
-    opd2_gw_rel = max(ret_opd2[f"opd2_gw_{rank}"] / max(ret_opd2[f"opd2_gw_scale_{rank}"], 1e-30) for rank in range(WORLD))
+    opd2_gh_rel = max(
+        ret_opd2[f"opd2_gh_{rank}"] / max(ret_opd2[f"opd2_gh_scale_{rank}"], 1e-30) for rank in range(WORLD)
+    )
+    opd2_gw_rel = max(
+        ret_opd2[f"opd2_gw_{rank}"] / max(ret_opd2[f"opd2_gw_scale_{rank}"], 1e-30) for rank in range(WORLD)
+    )
     opd2_report_loss_err = max(
         abs(ret_opd2[f"opd2_report_loss_{rank}"] - ret_opd2[f"opd2_ref_loss_{rank}"]) for rank in range(WORLD)
     )

@@ -65,10 +65,10 @@ class ServerArguments:
     tokenizer_path: Optional[str] = field(default=None, metadata={"help": "Path to tokenizer. Defaults to config_path"})
 
     attn_implementation: Optional[Literal["eager", "sdpa", "native", "flash_attention_3", "flash_attention_4"]] = field(
-        default="flash_attention_3",
+        default="flash_attention_4",
         metadata={
             "help": "Attention implementation. 'native': PyTorch SDPA+cuDNN (no deps, Hopper+Blackwell). "
-            "'flash_attention_3': FA3 (Hopper). 'flash_attention_4': FA4 CUTE (Hopper+Blackwell)."
+            "'flash_attention_3': FA3 (Hopper). 'flash_attention_4': FA4 CUTE (Hopper+Blackwell, default)."
         },
     )
 
@@ -76,6 +76,18 @@ class ServerArguments:
         default=None,
         metadata={
             "help": "MoE implementation. 'triton' uses Triton group GEMM kernels, 'native' uses torch._grouped_mm, 'quack' uses quack kernels."
+        },
+    )
+
+    moe_routing_weights_before_down: Union[bool, str] = field(
+        default="auto",
+        metadata={
+            "help": "Fold routing weights into the down-GEMM input instead of scaling its output "
+            "(triton EP expert backend only). Same math, different bf16 rounding point; cheaper "
+            "backward when router gradients are needed (train_router=True). 'auto' (default) enables "
+            "it only for train_router=true + alltoall dispatch with the XORL_MOE_SGLANG_FUSED_EXPERTS "
+            "parity opt-in inactive; explicit true/false override the regime check. Keep false for "
+            "K3/parity lanes anchored on the historical reduction tree."
         },
     )
 
@@ -139,6 +151,8 @@ class ServerArguments:
                 "and is the default. 'compile' runs that native path through torch.compile. "
                 "'eager' uses the plain eager implementation. 'sglang' uses native RMSNorm for "
                 "no-residual calls and SGLang's native residual RMSNorm reduction order. "
+                "'sglang_fused' matches 'sglang' bit-for-bit but replaces its eager residual-style "
+                "norms with fused batch-invariant Triton kernels (faster training, K3 preserved). "
                 "'sglang_jit' uses SGLang's JIT CUDA RMSNorm kernels for forward parity diagnostics. "
                 "'sglang_kernel' uses SGLang's production sgl_kernel RMSNorm kernels for diagnostics."
             },
@@ -189,7 +203,43 @@ class ServerArguments:
     pipeline_parallel_size: int = field(default=1, metadata={"help": "Pipeline parallelism size. 1 = disabled."})
 
     pipeline_parallel_schedule: str = field(
-        default="1F1B", metadata={"help": "Pipeline parallelism schedule: '1F1B' or 'GPipe'."}
+        default="1F1B",
+        metadata={
+            "help": (
+                "Pipeline parallelism schedule: '1F1B', 'GPipe' (one stage per rank), "
+                "'Interleaved1F1B', 'InterleavedZeroBubble' (pipeline_parallel_virtual_stages >= 2), "
+                "'ZBVZeroBubble', 'DualPipeV' (exactly 2 virtual stages per rank)."
+            )
+        },
+    )
+    pipeline_parallel_virtual_stages: int = field(
+        default=1,
+        metadata={"help": "Model chunks (virtual stages) per PP rank. 1 for GPipe/1F1B."},
+    )
+    pipeline_parallel_input_weight: int = field(
+        default=1,
+        metadata={"help": "Layer-equivalent cost of the embedding on stage 0 for stage balancing."},
+    )
+    pipeline_parallel_output_weight: int = field(
+        default=1,
+        metadata={"help": "Layer-equivalent cost of norm+lm_head(+CE) on the last stage for stage balancing."},
+    )
+    pipeline_parallel_num_layers_in_first_stage: Optional[int] = field(
+        default=None,
+        metadata={"help": "Explicit decoder-layer count for the first PP stage (overrides input_weight balancing)."},
+    )
+    pipeline_parallel_num_layers_in_last_stage: Optional[int] = field(
+        default=None,
+        metadata={"help": "Explicit decoder-layer count for the last PP stage (overrides output_weight balancing)."},
+    )
+    pp_seq_len_bucket_size: int = field(
+        default=1024,
+        metadata={
+            "help": (
+                "With pp_variable_seq_lengths, round the negotiated per-step seq_len up to a multiple of this "
+                "bucket so the schedule/P2P-buffer cache stays bounded. 0 caches one schedule per exact seq_len."
+            )
+        },
     )
     pp_variable_seq_lengths: bool = field(
         default=True,
@@ -558,9 +608,10 @@ class ServerArguments:
     ce_mode: CrossEntropyMode = field(
         default="compiled",
         metadata={
-            "help": "Cross-entropy implementation: 'compiled' (RECOMMENDED, torch.compile), "
-            "'quack_linear' (Quack scalar loss; return_per_token uses fused "
-            "selected-logprob CE), or 'eager' (baseline, may OOM at 32K)"
+            "help": "Cross-entropy implementation: 'bi_fused' (RECOMMENDED for server RL: batch-invariant "
+            "K3 lm-head contract, fp32-class; needs tp=1, no z-loss, bf16 hidden/weight, lm_head_fp32), "
+            "'compiled' (torch.compile), 'quack_linear' (Quack scalar loss; return_per_token uses fused "
+            "selected-logprob CE), 'fused_quack', or 'eager' (baseline, may OOM at 32K)"
         },
     )
 
@@ -594,6 +645,23 @@ class ServerArguments:
     weight_decay: float = field(
         default=0.01,
         metadata={"help": "Default weight decay for the server's implicit/default training session."},
+    )
+
+    adam_betas: Optional[List[float]] = field(
+        default=None,
+        metadata={
+            "help": "Adam-family (beta1, beta2) for the server's default optimizer, e.g. [0.9, 0.999]. "
+            "None keeps build_optimizer's default (0.9, 0.95). Client optim_step AdamParams "
+            "betas override these per step."
+        },
+    )
+
+    adam_eps: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "Adam-family epsilon for the server's default optimizer. "
+            "None keeps build_optimizer's default (1e-8)."
+        },
     )
 
     optimizer_dtype: Literal["fp32", "bf16"] = field(
@@ -1032,7 +1100,15 @@ class ServerArguments:
     # MoE Training Configuration
     # ========================================================================
 
-    freeze_router: bool = field(default=True, metadata={"help": "Freeze MoE router weights during training"})
+    freeze_router: bool = field(
+        default=True,
+        metadata={
+            "help": "Freeze MoE router weights during training. Defaults to True here: the RL server "
+            "freezes the router so rollout-time expert routing stays consistent for replay. The local "
+            "training surface (arguments.py) intentionally defaults to False — pretraining/SFT trains "
+            "the router. The opposite defaults are deliberate."
+        },
+    )
 
     # ========================================================================
     # Inference Weight Sync Configuration
@@ -1193,6 +1269,20 @@ class ServerArguments:
                 "pipeline_parallel_size > 1 is not supported with multi-adapter LoRA server training. "
                 "Adapter coordination currently assumes identical local LoRA layouts on every rank."
             )
+        if self.pipeline_parallel_size > 1:
+            # Deferred import keeps server_arguments import-light (pulls in torch).
+            from xorl.distributed.pipeline_parallel import validate_pp_schedule_config  # noqa: PLC0415
+
+            # Server microbatch counts are per-request; validate schedule/virtual-stage
+            # compatibility only (n_microbatches = num_stages always passes count checks).
+            validate_pp_schedule_config(
+                self.pipeline_parallel_schedule,
+                self.pipeline_parallel_virtual_stages,
+                self.pipeline_parallel_size * self.pipeline_parallel_virtual_stages,
+                self.pipeline_parallel_size,
+            )
+        elif self.pipeline_parallel_virtual_stages != 1:
+            raise ValueError("pipeline_parallel_virtual_stages requires pipeline_parallel_size > 1.")
         if self.enable_lora and self.merge_lora_interval > 0:
             raise ValueError("merge_lora_interval is not supported with multi-adapter LoRA server training")
         if self.max_lora_rank is None:
@@ -1241,6 +1331,7 @@ class ServerArguments:
                 "tokenizer_path": self.tokenizer_path,
                 "attn_implementation": self.attn_implementation,
                 "moe_implementation": self.moe_implementation,
+                "moe_routing_weights_before_down": self.moe_routing_weights_before_down,
                 "ep_dispatch": self.ep_dispatch,
                 "train_router": self.train_router,
                 "record_routing_weights": self.record_routing_weights,
@@ -1327,6 +1418,8 @@ class ServerArguments:
                 "optimizer": self.optimizer,
                 "lr": self.lr,
                 "weight_decay": self.weight_decay,
+                "adam_betas": self.adam_betas,
+                "adam_eps": self.adam_eps,
                 "optimizer_dtype": self.optimizer_dtype,
                 "cautious_weight_decay": self.cautious_weight_decay,
                 "muon_lr": self.muon_lr,
@@ -1356,6 +1449,12 @@ class ServerArguments:
                 "freeze_router": self.freeze_router,
                 "pipeline_parallel_size": self.pipeline_parallel_size,
                 "pipeline_parallel_schedule": self.pipeline_parallel_schedule,
+                "pipeline_parallel_virtual_stages": self.pipeline_parallel_virtual_stages,
+                "pipeline_parallel_input_weight": self.pipeline_parallel_input_weight,
+                "pipeline_parallel_output_weight": self.pipeline_parallel_output_weight,
+                "pipeline_parallel_num_layers_in_first_stage": self.pipeline_parallel_num_layers_in_first_stage,
+                "pipeline_parallel_num_layers_in_last_stage": self.pipeline_parallel_num_layers_in_last_stage,
+                "pp_seq_len_bucket_size": self.pp_seq_len_bucket_size,
                 "pp_variable_seq_lengths": self.pp_variable_seq_lengths,
                 "defer_grad_sync_in_accumulation": self.defer_grad_sync_in_accumulation,
                 "pad_to_multiple_of": self.pad_to_multiple_of,

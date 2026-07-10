@@ -169,12 +169,13 @@ class GptOssAttention(nn.Module):
 
     Attention sinks are per-head scalar biases that compete with real tokens
     in the softmax, allowing the model to "waste" attention weight rather than
-    attending to specific tokens.  Sinks are applied in both the eager path
-    (via explicit concat-then-softmax) and the ``flash_attention_3`` backend
+    attending to specific tokens.  Sinks are applied in the eager path
+    (via explicit concat-then-softmax), the ``flash_attention_3`` backend
     (via a custom autograd wrapper that post-multiplies by
-    ``sigmoid(lse - sink)``; see ``flash_sink_attention.py``).  Other backends
-    raise ``NotImplementedError`` — silently dropping sinks would corrupt
-    GPT-OSS semantics.
+    ``sigmoid(lse - sink)``; see ``flash_sink_attention.py``), and the
+    ``flash_attention_4`` backend (via the kernel's native ``learnable_sink``
+    argument).  Other backends raise ``NotImplementedError`` — silently
+    dropping sinks would corrupt GPT-OSS semantics.
     """
 
     def __init__(self, config: GptOssConfig, layer_idx: int):
@@ -285,7 +286,8 @@ class GptOssAttention(nn.Module):
             return self._flash_attention_4_with_sinks
         if impl in ATTENTION_FUNCTIONS:
             raise NotImplementedError(
-                f"GPT-OSS attention sinks are not wired through the {impl!r} backend. Use flash_attention_3 or eager."
+                f"GPT-OSS attention sinks are not wired through the {impl!r} backend. "
+                "Use flash_attention_4, flash_attention_3, or eager."
             )
         return ATTENTION_FUNCTIONS.get(impl, self._attention_with_sinks)
 

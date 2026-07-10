@@ -144,7 +144,7 @@ class NemotronHCheckpointHandler(CheckpointHandler):
             return [(f"model.layers.{layer_idx}.mixer.experts.{param}", tensor)]
 
         if FUSED_GATE_UP_KEY_PATTERN.match(key) is not None:
-            # xorl-internal GKN checkpoint; only EP slicing is needed.
+            # Native fused GKN checkpoint; only EP slicing is needed.
             return [(key, self._slice_expert_tensor_for_ep(tensor))]
 
         return [(key, tensor)]

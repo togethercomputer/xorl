@@ -449,6 +449,19 @@ class RotaryEmbedding(nn.Module):
         self._use_sglang_default_cache = bool(getattr(config, "_rope_native", False) and self.rope_type == "default")
         if self._use_sglang_default_cache:
             self._sglang_default_cache = self._build_sglang_default_cache(self.max_seq_len_cached)
+        # rope_native contract, non-default static rope types (llama3/yarn/linear):
+        # keep an fp32 CPU-computed inv_freq as a plain attribute. The buffer above is
+        # downcast by the loader's model-wide `.to(torch_dtype)` (serving keeps fp32 —
+        # HF computes inv_freq on CPU and never casts it), so forward() must not read it.
+        self._contract_inv_freq_fp32 = None
+        if (
+            getattr(config, "_rope_native", False)
+            and self.rope_type != "default"
+            and "dynamic" not in self.rope_type
+            and self.rope_type != "longrope"
+        ):
+            contract_inv_freq, _ = self.rope_init_fn(self.config, "cpu")
+            self._contract_inv_freq_fp32 = contract_inv_freq.float()
 
     def _default_rope_base_and_dim(self) -> tuple[float, int]:
         rope_parameters_dict = getattr(self.config, "rope_parameters", None) or {}
@@ -495,7 +508,13 @@ class RotaryEmbedding(nn.Module):
             sin = torch.cat((sin_half, sin_half), dim=-1).view(*position_ids.shape, -1)
             return cos.to(device=x.device, dtype=x.dtype), sin.to(device=x.device, dtype=x.dtype)
 
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        if self._contract_inv_freq_fp32 is not None:
+            if self._contract_inv_freq_fp32.device != x.device:
+                self._contract_inv_freq_fp32 = self._contract_inv_freq_fp32.to(x.device)
+            inv_freq = self._contract_inv_freq_fp32
+        else:
+            inv_freq = self.inv_freq
+        inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
 
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"

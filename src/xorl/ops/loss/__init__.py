@@ -25,7 +25,10 @@ from xorl.ops.loss.vocab_parallel_cross_entropy import vocab_parallel_cross_entr
 # and server-runner (ServerArguments) entry points so the Literal stays in sync.
 # "fused_quack" routes selected-token log-prob through chunked cuBLAS matmul +
 # a fused CuTeDSL cross-entropy reduction (chunk-sized logits, scalar TP reductions).
-CrossEntropyMode = Literal["eager", "compiled", "quack_linear", "fused_quack"]
+# "bi_fused" routes it through the batch-invariant lm-head contract (bf16-resident
+# weight, chunked BI Triton GEMM + pinned-order LSE) — bitwise identical to
+# SGLang's vendored copy for train/serve K3 parity.
+CrossEntropyMode = Literal["eager", "compiled", "quack_linear", "fused_quack", "bi_fused"]
 
 
 # ---------------------------------------------------------------------------

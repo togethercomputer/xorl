@@ -28,6 +28,7 @@ from xorl.server.api_server.api_types import (
     SaveWeightsForSamplerResponse,
     SaveWeightsRequest,
     SaveWeightsResponse,
+    TensorData,
     WeightsInfoResponse,
 )
 
@@ -135,6 +136,71 @@ class TestDatumAndForwardBackward:
                 loss_fn_output_type="single_loss",
                 loss_fn_outputs=[LossFnOutput(loss=2.345)],
             )
+
+
+class TestDatumToPlainDictTensorData:
+    """Test Datum.to_plain_dict TensorData conversion, in particular rank>=2 re-nesting.
+
+    Rank>=2 TensorData (e.g. client-provided teacher_hidden_states [seq_len, hidden])
+    must be re-nested per its shape: returning the flat data drops the shape, so the
+    orchestrator packer sees len(value) != seq_len, misclassifies the field as scalar
+    metadata, and silently keeps only the last datum's values.
+    """
+
+    def test_rank1_passthrough(self):
+        """Rank-1 TensorData stays a flat list (unchanged legacy behavior)."""
+        datum = Datum(
+            model_input={"input_ids": TensorData(data=[1, 2, 3], dtype="int64", shape=[3])},
+            loss_fn_inputs={"labels": TensorData(data=[2, 3, 4], dtype="int64", shape=[3])},
+        )
+        plain = datum.to_plain_dict()
+        assert plain["model_input"]["input_ids"] == [1, 2, 3]
+        assert plain["loss_fn_inputs"]["labels"] == [2, 3, 4]
+
+    def test_rank2_renested_per_shape(self):
+        """Rank-2 TensorData is re-nested into per-row lists per its shape."""
+        # [seq_len=3, hidden=2], flattened row-major like TensorData.from_torch
+        flat = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+        datum = Datum(
+            model_input={"input_ids": [1, 2, 3]},
+            loss_fn_inputs={"teacher_hidden_states": TensorData(data=flat, dtype="float32", shape=[3, 2])},
+        )
+        plain = datum.to_plain_dict()
+        nested = plain["loss_fn_inputs"]["teacher_hidden_states"]
+        assert nested == [[0.0, 1.0], [2.0, 3.0], [4.0, 5.0]]
+        # One row per sequence position, so the packer classifies it as a sequence field
+        assert len(nested) == 3
+
+    def test_rank3_renested_per_shape(self):
+        """Rank-3 TensorData nests recursively."""
+        flat = list(range(12))
+        datum = Datum(
+            model_input={"input_ids": [1, 2]},
+            loss_fn_inputs={"routed": TensorData(data=flat, dtype="int64", shape=[2, 3, 2])},
+        )
+        plain = datum.to_plain_dict()
+        assert plain["loss_fn_inputs"]["routed"] == [
+            [[0, 1], [2, 3], [4, 5]],
+            [[6, 7], [8, 9], [10, 11]],
+        ]
+
+    def test_shape_data_mismatch_falls_back_to_flat(self):
+        """If shape does not match the data length, fall back to the flat data."""
+        datum = Datum(
+            model_input={"input_ids": [1, 2]},
+            loss_fn_inputs={"bad": TensorData(data=[0.0, 1.0, 2.0, 3.0, 4.0], dtype="float32", shape=[2, 3])},
+        )
+        plain = datum.to_plain_dict()
+        assert plain["loss_fn_inputs"]["bad"] == [0.0, 1.0, 2.0, 3.0, 4.0]
+
+    def test_empty_rank2_falls_back_to_flat(self):
+        """Zero-element rank>=2 shapes fall back to the (empty) flat data."""
+        datum = Datum(
+            model_input={"input_ids": [1]},
+            loss_fn_inputs={"empty": TensorData(data=[], dtype="float32", shape=[0, 2])},
+        )
+        plain = datum.to_plain_dict()
+        assert plain["loss_fn_inputs"]["empty"] == []
 
 
 class TestOptimWeightsHealthAndSerialization:

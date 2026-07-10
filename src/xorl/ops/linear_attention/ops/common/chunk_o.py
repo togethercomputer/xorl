@@ -1,6 +1,8 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # Portions of this file are adapted from flash-linear-attention, Copyright (c) 2023-2025 Songlin Yang, licensed under the MIT License.
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -14,6 +16,19 @@ BKV_LIST = [64, 128] if check_shared_mem() else ([32, 64] if check_shared_mem("a
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
 
 
+# BK/BV/num_warps are bit-relevant axes of chunk_fwd_kernel_o and their bits flip across triton 3.5->3.7;
+# BK128/BV128/w4 reproduces the triton-3.5.1 anchor bits on both (K<=128), so it is pinned by default.
+_FWD_O_CONFIGS = (
+    [
+        triton.Config({"BK": 128, "BV": 128}, num_warps=8, num_stages=3),
+        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BK": 32, "BV": 32}, num_warps=2, num_stages=3),
+    ]
+    if os.environ.get("XORL_FLA_FWD_O_AUTOTUNE", "0") == "1"
+    else [triton.Config({"BK": 128, "BV": 128}, num_warps=4, num_stages=3)]
+)
+
+
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
@@ -22,11 +37,7 @@ NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BK": 128, "BV": 128}, num_warps=8, num_stages=3),
-        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=3),
-        triton.Config({"BK": 32, "BV": 32}, num_warps=2, num_stages=3),
-    ],
+    configs=_FWD_O_CONFIGS,
     key=["H", "K", "V", "BT"],
     **autotune_cache_kwargs,
 )

@@ -22,6 +22,13 @@ from typing import List, Optional
 import torch
 import torch.nn as nn
 
+from ....lora.fold import (
+    FoldedLoraWeightGateUpGKN,
+    FoldedLoraWeightGKN,
+    canonical_lora_fold_gkn,
+    lora_merged_cache_enabled,
+    lora_merged_forward_enabled,
+)
 from ....lora.modules.base import LoraModule
 from ....ops.group_gemm.kernel import compute_lora_scaling
 from ....utils import logging
@@ -78,6 +85,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         self.num_experts = num_local_experts if num_local_experts is not None else num_experts
         self.hidden_dim = hidden_dim
         self.intermediate_size = intermediate_size
+        self.hidden_act = hidden_act
         self.moe_implementation = moe_implementation
         self.lora_config = lora_config or MoELoRAConfig()
         self.r = self.lora_config.r
@@ -208,6 +216,287 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
                 base.data.copy_(merged.to(base.dtype))
         self.reset_lora_parameters()
 
+    # ------------------------------------------------------------------
+    # Merged-forward K3 contract lane (XORL_LORA_MERGED_FORWARD=1)
+    # ------------------------------------------------------------------
+
+    def sglang_moe_tp_sim_enabled(self, parallel_state) -> bool:
+        """TP-sim is outside the LoRA merged-forward envelope."""
+        return False
+
+    def sglang_fused_experts_auto_supported(self) -> bool:
+        """Auto-default eligibility mirror of :meth:`MoEExperts.sglang_fused_experts_auto_supported`:
+        under ``XORL_LORA_MERGED_FORWARD=1`` the adapted experts fold their delta
+        (canonical fold) and run the contracted serving kernel on the merged
+        weights, so the ep=1 auto-enable applies to them too."""
+        return (
+            lora_merged_forward_enabled()
+            and self.hidden_act in {"silu", "gelu", "gelu_tanh"}
+            and self.swiglu_limit == 0.0
+        )
+
+    def invalidate_merged_weight_cache(self) -> None:
+        self._merged_weight_cache = {}
+
+    def _merged_weight_key(self) -> tuple:
+        params = (
+            self.gate_proj_lora_A,
+            self.gate_proj_lora_B,
+            self.up_proj_lora_A,
+            self.up_proj_lora_B,
+            self.down_proj_lora_A,
+            self.down_proj_lora_B,
+            self.gate_up_proj,
+            self.down_proj,
+        )
+        return (
+            tuple(t._version for t in params),
+            tuple(t.data_ptr() for t in params),
+            self.active_r,
+            self.active_lora_alpha,
+        )
+
+    def _merged_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Canonically folded ``(gate_up' [E, H, 2I], down' [E, I, H])``.
+
+        Fold = :func:`xorl.lora.fold.canonical_lora_fold_gkn` per projection
+        (fp32 accumulate, cast once) — the exact arithmetic the weight-sync
+        merged extraction ships under the same flag, so the trainer forward and
+        the serving engine see identical merged bytes. Cached per module, keyed
+        on adapter/base param versions and the active rank/alpha; the optimizer
+        step's in-place update invalidates the key. ``XORL_LORA_MERGED_FORWARD_CACHE=0``
+        refolds on every call (bounded memory)."""
+        cache = getattr(self, "_merged_weight_cache", None)
+        if cache is None:
+            cache = {}
+            self._merged_weight_cache = cache
+        key = self._merged_weight_key()
+        if lora_merged_cache_enabled() and cache.get("key") == key:
+            return cache["gate_up"], cache["down"]
+        scaling = self._active_scaling()
+        inter = self.intermediate_size
+        with torch.no_grad():
+            gate_A, gate_B = self._active_lora_views("gate_proj")
+            up_A, up_B = self._active_lora_views("up_proj")
+            down_A, down_B = self._active_lora_views("down_proj")
+            gate_f = canonical_lora_fold_gkn(self.gate_up_proj[..., :inter], gate_A, gate_B, scaling)
+            up_f = canonical_lora_fold_gkn(self.gate_up_proj[..., inter:], up_A, up_B, scaling)
+            gate_up_f = torch.cat([gate_f, up_f], dim=-1)
+            down_f = canonical_lora_fold_gkn(self.down_proj, down_A, down_B, scaling)
+        if lora_merged_cache_enabled():
+            cache["key"] = key
+            cache["gate_up"] = gate_up_f
+            cache["down"] = down_f
+        else:
+            cache.clear()
+        return gate_up_f, down_f
+
+    def canonical_merged_proj_weight(self, proj_name: str) -> torch.Tensor:
+        """Per-projection view of the canonically folded weights (weight-sync
+        extraction consumes this so the shipped bytes are exactly the bytes the
+        merged forward trains with)."""
+        gate_up_f, down_f = self._merged_weights()
+        if proj_name == "down_proj":
+            return down_f
+        inter = self.intermediate_size
+        if proj_name == "gate_proj":
+            return gate_up_f[..., :inter]
+        if proj_name == "up_proj":
+            return gate_up_f[..., inter:]
+        raise KeyError(f"unknown projection {proj_name!r}")
+
+    def _merged_trainable_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Straight-through merged weights: forward bits = the cached fold,
+        backward = exact chain rule through W' = W + scaling * (A @ B) into the
+        (active slices of the) LoRA factors."""
+        gate_up_f, down_f = self._merged_weights()
+        r = self.active_r
+        scaling = self._active_scaling()
+        gate_up_w = FoldedLoraWeightGateUpGKN.apply(
+            gate_up_f,
+            self.gate_proj_lora_A[..., :r],
+            self.gate_proj_lora_B[:, :r, :],
+            self.up_proj_lora_A[..., :r],
+            self.up_proj_lora_B[:, :r, :],
+            scaling,
+            self.intermediate_size,
+        )
+        down_w = FoldedLoraWeightGKN.apply(
+            down_f,
+            self.down_proj_lora_A[..., :r],
+            self.down_proj_lora_B[:, :r, :],
+            scaling,
+        )
+        return gate_up_w, down_w
+
+    def _merged_lora_needs_grad(self, *activations: torch.Tensor) -> bool:
+        if not torch.is_grad_enabled():
+            return False
+        if any(t is not None and t.requires_grad for t in activations):
+            return True
+        return any(
+            getattr(self, f"{proj}_lora_{f}").requires_grad
+            for proj in ("gate_proj", "up_proj", "down_proj")
+            for f in ("A", "B")
+            if isinstance(getattr(self, f"{proj}_lora_{f}"), nn.Parameter)
+        )
+
+    def sglang_fused_experts_forward(
+        self,
+        hidden_states: torch.Tensor,
+        routing_weights: torch.Tensor,
+        selected_experts: torch.Tensor,
+    ) -> torch.Tensor:
+        """LoRA K3 contract lane: canonical fold + the contracted serving-kernel
+        forward on the merged weights (bit-identical to a serving engine that
+        received the folded weights), backward through the low-rank factors.
+
+        Mirrors :meth:`MoEExperts.sglang_fused_experts_forward`; requires
+        ``XORL_LORA_MERGED_FORWARD=1`` (a fused-experts flag alone must not
+        silently change what the adapters train against)."""
+        from .experts import (  # noqa: PLC0415
+            _MOE_SGLANG_FUSED_EXPERTS_ENV,
+            MoEExperts,
+            _sglang_fused_experts_kernel_call,
+            _SglangFusedExpertsTrainFunction,
+            moe_sglang_fused_experts_weight_mode,
+        )
+
+        if not lora_merged_forward_enabled():
+            raise NotImplementedError(
+                f"{_MOE_SGLANG_FUSED_EXPERTS_ENV}=1 on LoRA-adapted experts requires the merged-forward "
+                "contract lane: set XORL_LORA_MERGED_FORWARD=1 (canonical fold + serving kernel on merged "
+                "weights), or drop the fused-experts flag to keep the stock LoRA backends."
+            )
+        if self.hidden_act not in {"silu", "gelu_tanh"} or self.swiglu_limit != 0.0:
+            raise NotImplementedError(
+                "XORL_LORA_MERGED_FORWARD=1 supports gated silu/gelu_tanh without swiglu_limit only"
+            )
+        if moe_sglang_fused_experts_weight_mode() == "cached":
+            raise NotImplementedError(
+                "XORL_LORA_MERGED_FORWARD=1 does not compose with "
+                "XORL_MOE_SGLANG_FUSED_EXPERTS_WEIGHT_MODE=cached (the transpose cache cannot track "
+                "per-step merged weights); use the strided (default) or transient mode."
+            )
+        fused_experts_impl = MoEExperts._load_sglang_fused_experts_impl()
+
+        original_shape = hidden_states.shape
+        hidden_flat = hidden_states.reshape(-1, int(hidden_states.shape[-1]))
+        selected_flat = selected_experts.reshape(hidden_flat.shape[0], -1)
+        routing_flat = routing_weights.reshape(hidden_flat.shape[0], -1)
+        activation = "gelu" if self.hidden_act == "gelu_tanh" else self.hidden_act
+
+        if self._merged_lora_needs_grad(hidden_flat, routing_flat):
+            gate_up_w, down_w = self._merged_trainable_weights()
+            output = _SglangFusedExpertsTrainFunction.apply(
+                hidden_flat,
+                routing_flat,
+                selected_flat,
+                gate_up_w,
+                down_w,
+                fused_experts_impl,
+                activation,
+                self.hidden_act,
+                self.swiglu_limit,
+                self.num_experts,
+                None,
+            )
+        else:
+            gate_up_f, down_f = self._merged_weights()
+            output = _sglang_fused_experts_kernel_call(
+                hidden_flat,
+                gate_up_f,
+                down_f,
+                routing_flat,
+                selected_flat,
+                fused_experts_impl,
+                activation,
+                self.swiglu_limit,
+                None,
+                weight_cache=None,
+            )
+        return output.reshape(original_shape)
+
+    def _merged_ep_forward(
+        self,
+        hidden_states: torch.Tensor,
+        routing_weights: torch.Tensor,
+        selected_experts: torch.Tensor,
+        parallel_state,
+    ) -> torch.Tensor:
+        """Merged-forward EP lane: alltoall dispatch, canonical fold of the
+        LOCAL expert slice, the contracted per-rank serving-kernel compute
+        (routing weight applied in-kernel, mirroring
+        :meth:`MoEExperts.sglang_fused_experts_ep_compute`), stock combine."""
+        from .experts import (  # noqa: PLC0415
+            _MOE_SGLANG_FUSED_EXPERTS_ENV,
+            MoEExperts,
+            _sglang_fused_experts_ep_kernel_call,
+            _SglangFusedExpertsEPTrainFunction,
+            moe_sglang_fused_experts_weight_mode,
+        )
+
+        if self.ep_dispatch != "alltoall":
+            raise NotImplementedError(
+                f"{_MOE_SGLANG_FUSED_EXPERTS_ENV}=1 supports ep_dispatch='alltoall' only (got {self.ep_dispatch!r})"
+            )
+        if self.hidden_act not in {"silu", "gelu_tanh"} or self.swiglu_limit != 0.0:
+            raise NotImplementedError(
+                "XORL_LORA_MERGED_FORWARD=1 supports gated silu/gelu_tanh without swiglu_limit only"
+            )
+        if moe_sglang_fused_experts_weight_mode() == "cached":
+            raise NotImplementedError(
+                "XORL_LORA_MERGED_FORWARD=1 does not compose with WEIGHT_MODE=cached; use strided/transient."
+            )
+        fused_experts_impl = MoEExperts._load_sglang_fused_experts_impl()
+        activation = "gelu" if self.hidden_act == "gelu_tanh" else self.hidden_act
+
+        dispatch_kwargs = self._build_dispatch_kwargs(hidden_states, routing_weights, selected_experts, parallel_state)
+        permute_tokens, cumsum, ctx = EP_DISPATCH[self.ep_dispatch](**dispatch_kwargs)
+        expert_scores = getattr(ctx, "expert_scores", getattr(ctx, "permuted_scores", None))
+        if expert_scores is None:
+            raise ValueError("XORL_LORA_MERGED_FORWARD=1 EP compute requires dispatched expert scores")
+
+        if self._merged_lora_needs_grad(permute_tokens, expert_scores):
+            gate_up_w, down_w = self._merged_trainable_weights()
+            expert_output = _SglangFusedExpertsEPTrainFunction.apply(
+                permute_tokens,
+                expert_scores,
+                gate_up_w,
+                down_w,
+                cumsum,
+                fused_experts_impl,
+                activation,
+                self.hidden_act,
+                self.swiglu_limit,
+                True,
+                None,
+            )
+        else:
+            gate_up_f, down_f = self._merged_weights()
+            permute_tokens = permute_tokens.contiguous()
+            if permute_tokens.shape[0] == 0:
+                expert_output = permute_tokens.new_zeros(permute_tokens.shape)
+            else:
+                expert_output = _sglang_fused_experts_ep_kernel_call(
+                    permute_tokens,
+                    gate_up_f,
+                    down_f,
+                    expert_scores,
+                    cumsum,
+                    fused_experts_impl,
+                    activation,
+                    self.swiglu_limit,
+                    gate_up_bias=None,
+                    gated=True,
+                    weight_cache=None,
+                )
+
+        # Routing weights were applied in-kernel (serving semantics) — no
+        # post-hoc expert_scores multiply on this lane.
+        combine_kwargs = self._build_combine_kwargs(expert_output, ctx, dispatch_kwargs, parallel_state)
+        return EP_COMBINE[self.ep_dispatch](**combine_kwargs)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -267,8 +556,25 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         """Unified EP forward with LoRA: dispatch → compute → combine.
 
         Uses the same dispatch/combine as ``MoEExperts._ep_forward()`` but
-        routes to the LoRA-aware EP compute registry.
+        routes to the LoRA-aware EP compute registry. Under the explicit
+        ``XORL_MOE_SGLANG_FUSED_EXPERTS=1`` contract flag the merged-forward
+        lane replaces the LoRA compute (and requires
+        ``XORL_LORA_MERGED_FORWARD=1`` — mirroring MoEExperts, EP never
+        auto-enables the parity kernel).
         """
+        from .experts import _moe_sglang_fused_experts_env_state  # noqa: PLC0415
+
+        explicit_sglang_fused = _moe_sglang_fused_experts_env_state()
+        if explicit_sglang_fused is True:
+            if not lora_merged_forward_enabled():
+                from .experts import _MOE_SGLANG_FUSED_EXPERTS_ENV  # noqa: PLC0415
+
+                raise NotImplementedError(
+                    f"{_MOE_SGLANG_FUSED_EXPERTS_ENV}=1 on LoRA-adapted experts requires "
+                    "XORL_LORA_MERGED_FORWARD=1 (canonical fold + serving kernel on merged weights); "
+                    "a partially-contracted LoRA lane would silently void the contract."
+                )
+            return self._merged_ep_forward(hidden_states, routing_weights, selected_experts, parallel_state)
 
         if self.moe_implementation not in EP_EXPERT_COMPUTE_LORA:
             raise ValueError(

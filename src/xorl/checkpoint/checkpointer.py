@@ -3,6 +3,7 @@ import json
 import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Set
 
 import torch
@@ -124,25 +125,42 @@ def _drop_ep_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh):
     return tensor_to_put
 
 
-def _get_model_param_keys(model: torch.nn.Module) -> List[str]:
-    """Get sorted list of parameter keys from a model."""
-    return sorted([_strip_compile_prefix(name) for name, _ in model.named_parameters()])
+def _as_model_parts(model) -> List[torch.nn.Module]:
+    """Normalize a model-or-parts-list (PP virtual stages) to a list of modules."""
+    return list(model) if isinstance(model, (list, tuple)) else [model]
 
 
-def _get_model_persistent_buffer_keys(model: torch.nn.Module) -> List[str]:
-    """Get sorted list of persistent buffer keys from a model."""
-    modules = dict(model.named_modules(remove_duplicate=False))
-    buffer_keys: List[str] = []
-    for name, buffer in model.named_buffers(remove_duplicate=False):
-        if buffer is None:
-            continue
-        module_name, _, buffer_name = name.rpartition(".")
-        parent_module = modules[module_name] if module_name else model
-        if buffer_name in getattr(parent_module, "_non_persistent_buffers_set", set()):
-            continue
-        # Strip the compile prefix only on the recorded key; the module lookup above uses the
-        # live (possibly ``_orig_mod``-wrapped) FQN.
-        buffer_keys.append(_strip_compile_prefix(name))
+def _merged_model_state_dict(model) -> Dict[str, Any]:
+    """get_model_state_dict merged across PP virtual-stage parts (disjoint FQNs;
+    duplicates from always-keep modules resolve last-wins)."""
+    merged: Dict[str, Any] = {}
+    for part in _as_model_parts(model):
+        merged.update(get_model_state_dict(model=part))
+    return merged
+
+
+def _get_model_param_keys(model) -> List[str]:
+    """Get sorted list of parameter keys from a model (or PP virtual-stage parts)."""
+    return sorted(
+        {_strip_compile_prefix(name) for part in _as_model_parts(model) for name, _ in part.named_parameters()}
+    )
+
+
+def _get_model_persistent_buffer_keys(model) -> List[str]:
+    """Get sorted list of persistent buffer keys from a model (or PP virtual-stage parts)."""
+    buffer_keys: set = set()
+    for part in _as_model_parts(model):
+        modules = dict(part.named_modules(remove_duplicate=False))
+        for name, buffer in part.named_buffers(remove_duplicate=False):
+            if buffer is None:
+                continue
+            module_name, _, buffer_name = name.rpartition(".")
+            parent_module = modules[module_name] if module_name else part
+            if buffer_name in getattr(parent_module, "_non_persistent_buffers_set", set()):
+                continue
+            # Strip the compile prefix only on the recorded key; the module lookup above uses the
+            # live (possibly ``_orig_mod``-wrapped) FQN.
+            buffer_keys.add(_strip_compile_prefix(name))
     return sorted(buffer_keys)
 
 
@@ -331,13 +349,14 @@ class ModelState(Stateful):
 
         # Determine whether this is EP+FSDP2 case
         # If so, we need to restore EP-dim before saving to DCP
+        # (model may be a PP virtual-stage parts list — EP is rejected there, so getattr yields None)
         self.parallel_state = get_parallel_state()
         self.ep_fqn2spec_info = _compile_agnostic_spec_info(getattr(self.model, "_fqn2spec_info", None))
         self.should_ep_aware = self.ep_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
 
     @torch.no_grad()
     def state_dict(self):
-        model_state_dict = get_model_state_dict(model=self.model)
+        model_state_dict = _merged_model_state_dict(self.model)
         if self.should_ep_aware:
             logger.info_rank0(
                 "Getting model state_dict from ModelState wrapper, would restore EP dim for Experts module"
@@ -368,20 +387,21 @@ class ModelState(Stateful):
         a time during save.
         """
         model_state_dict: "OrderedDict[str, torch.Tensor]" = OrderedDict()
-        modules = dict(self.model.named_modules(remove_duplicate=False))
+        for part in _as_model_parts(self.model):
+            modules = dict(part.named_modules(remove_duplicate=False))
 
-        for name, parameter in self.model.named_parameters(remove_duplicate=False):
-            if parameter is not None:
-                model_state_dict[name] = parameter
+            for name, parameter in part.named_parameters(remove_duplicate=False):
+                if parameter is not None:
+                    model_state_dict[name] = parameter
 
-        for name, buffer in self.model.named_buffers(remove_duplicate=False):
-            if buffer is None:
-                continue
-            module_name, _, buffer_name = name.rpartition(".")
-            parent_module = modules[module_name] if module_name else self.model
-            if buffer_name in getattr(parent_module, "_non_persistent_buffers_set", set()):
-                continue
-            model_state_dict[name] = buffer
+            for name, buffer in part.named_buffers(remove_duplicate=False):
+                if buffer is None:
+                    continue
+                module_name, _, buffer_name = name.rpartition(".")
+                parent_module = modules[module_name] if module_name else part
+                if buffer_name in getattr(parent_module, "_non_persistent_buffers_set", set()):
+                    continue
+                model_state_dict[name] = buffer
 
         if self.should_ep_aware:
             logger.info_rank0(
@@ -421,7 +441,21 @@ class ModelState(Stateful):
         # Use strict=False to allow missing LoRA parameters when loading from
         # a checkpoint that was saved before LoRA was injected
         options = StateDictOptions(strict=False)
-        incompatible = set_model_state_dict(model=self.model, model_state_dict=model_state_dict, options=options)
+        parts = _as_model_parts(self.model)
+        if len(parts) == 1:
+            incompatible = set_model_state_dict(model=parts[0], model_state_dict=model_state_dict, options=options)
+        else:
+            # PP virtual stages: load each part from its own key subset so other
+            # parts' keys don't show up as unexpected.
+            missing_keys: List[str] = []
+            unexpected: set = set(model_state_dict.keys())
+            for part in parts:
+                part_keys = set(get_model_state_dict(model=part).keys())
+                part_sd = {k: v for k, v in model_state_dict.items() if k in part_keys}
+                unexpected -= part_keys
+                inc = set_model_state_dict(model=part, model_state_dict=part_sd, options=options)
+                missing_keys.extend(inc.missing_keys)
+            incompatible = SimpleNamespace(missing_keys=missing_keys, unexpected_keys=sorted(unexpected))
 
         # Log missing/unexpected keys for debugging
         if incompatible.missing_keys:
@@ -495,6 +529,10 @@ class OptimizerState(Stateful):
         self.optimizer = optimizer
         self.load_keys = load_keys
         self._allow_partial_optimizer_load = False
+        if isinstance(model, (list, tuple)) and not getattr(optimizer, "_is_multi_optimizer", False):
+            # PP virtual stages require the per-part MultiOptimizer (it owns the
+            # part->model mapping DCP needs to resolve FQNs).
+            raise ValueError("Checkpointing multiple PP model parts requires a MultiOptimizer.")
 
         # Mirror ModelState: in the EP+FSDP2 case the per-param optimizer state for expert
         # weights is sharded just like the weights themselves, so it must carry the EP dim in
@@ -843,7 +881,7 @@ class DistributedCheckpointer(CheckpointerBase):
             # so DCP only loads the LoRA parameters.
             # Must use get_model_state_dict() to capture both params AND buffers
             # (e.g., weight_block_scales, weight_global_scale from QLoRA).
-            all_model_keys = set(get_model_state_dict(model=state["model"]).keys())
+            all_model_keys = set(_merged_model_state_dict(state["model"]).keys())
             exclude_keys = {k for k in all_model_keys if "lora_" not in k}
             logger.info_rank0(f"LoRA-only checkpoint: excluding {len(exclude_keys)} non-LoRA keys from load")
 

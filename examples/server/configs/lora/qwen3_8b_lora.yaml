@@ -42,4 +42,5 @@ lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_p
 
 # Skip initial checkpoint
 skip_initial_checkpoint: true
-ce_mode: compiled
+# bi_fused = K3 lm-head contract CE (fp32-class, tp1, no z-loss).
+ce_mode: bi_fused

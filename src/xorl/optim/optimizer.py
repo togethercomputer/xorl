@@ -424,7 +424,7 @@ def _make_muon_param_groups(
 
 
 def build_optimizer(
-    model: "nn.Module",
+    model: "nn.Module | Sequence[nn.Module]",
     lr: float = 1e-3,
     betas: Tuple[float, float] = (0.9, 0.95),
     eps: float = 1e-8,
@@ -442,7 +442,8 @@ def build_optimizer(
     Build an optimizer for the given model.
 
     Args:
-        model: The model whose parameters to optimize.
+        model: The model whose parameters to optimize, or a list of PP virtual-stage
+            model parts (one optimizer per part, wrapped in a MultiOptimizer).
         lr: Learning rate (used as AdamW lr for Muon's non-Muon param groups).
         betas: AdamW beta coefficients.
         eps: AdamW epsilon.
@@ -477,6 +478,38 @@ def build_optimizer(
     ps = get_parallel_state()
     if optimizer_type == "distsignsgd" and ps.dp_mode != "fsdp2":
         raise ValueError("DistSignSGD requires data_parallel_mode='fsdp2'.")
+
+    # PP virtual stages: one optimizer per local model chunk, wrapped in a
+    # MultiOptimizer keyed by part so DCP state-dict FQNs resolve per part.
+    if isinstance(model, (list, tuple)):
+        parts = list(model)
+        if len(parts) == 1:
+            model = parts[0]
+        else:
+            if param_groups is not None:
+                raise ValueError("Custom param_groups are not supported with multiple PP model parts.")
+            part_models = {f"pp_part_{i}": part for i, part in enumerate(parts)}
+            part_optimizers = {}
+            for key, part in part_models.items():
+                part_optimizers[key] = build_optimizer(
+                    part,
+                    lr=lr,
+                    betas=betas,
+                    eps=eps,
+                    weight_decay=weight_decay,
+                    fused=fused,
+                    optimizer_type=optimizer_type,
+                    optimizer_dtype=optimizer_dtype,
+                    no_decay_modules=no_decay_modules,
+                    no_decay_params=no_decay_params,
+                    optimizer_kwargs=optimizer_kwargs,
+                    cautious_weight_decay=cautious_weight_decay,
+                )
+                if getattr(part_optimizers[key], "_is_multi_optimizer", False):
+                    # EP-aware builds return a MultiOptimizer; nesting is unsupported
+                    # (EP + virtual PP stages is rejected at parallelize time).
+                    raise NotImplementedError("Nested MultiOptimizer (EP + PP virtual stages) is not supported.")
+            return MultiOptimizer(part_models, part_optimizers, list(part_models.keys()))
 
     # EP-aware routing: for FSDP2+EP, split params into EP and non-EP groups and build two optimizers.
     if _should_build_ep_aware(model, param_groups):

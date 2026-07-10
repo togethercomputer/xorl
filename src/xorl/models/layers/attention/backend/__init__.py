@@ -72,7 +72,13 @@ ATTENTION_FUNCTIONS: Dict[str, Callable] = {
 try:
     from .flash_attention import FA3_AVAILABLE, FA4_AVAILABLE, flash_attention_forward
 
-    if FA3_AVAILABLE:
+    # flash_attention_forward selects FA3/FA4 (and the sgl_kernel parity path)
+    # internally, so register the flash_attention_2/3 keys whenever ANY flash
+    # build is importable. Gating them on FA3_AVAILABLE alone made
+    # attn_implementation=flash_attention_3 silently fall back to eager
+    # attention in FA4-only environments (MultiHeadAttention dispatches via
+    # ATTENTION_FUNCTIONS.get(impl, eager_attention_forward)).
+    if FA3_AVAILABLE or FA4_AVAILABLE:
         ATTENTION_FUNCTIONS["flash_attention_2"] = flash_attention_forward
         ATTENTION_FUNCTIONS["flash_attention_3"] = flash_attention_forward
 

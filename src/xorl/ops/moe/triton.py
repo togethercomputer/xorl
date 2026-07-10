@@ -25,10 +25,54 @@ if is_fused_moe_available():
     )
 
 
-# Fold expert_scores into FC2 input rather than scaling the output. Off by
-# default; gated behind an env var because it changes when expert_scores is
-# applied and we want explicit opt-in until benchmarked across backends.
-_ROUTING_WEIGHTS_BEFORE_DOWN = os.environ.get("XORL_MOE_ROUTING_WEIGHTS_BEFORE_DOWN", "0") == "1"
+# Fold expert_scores into the down-GEMM input (before-down) rather than scaling the
+# down-GEMM output (after-down, the historical default). Mathematically identical (a
+# per-row scalar commutes through the linear down projection) but a different bf16
+# rounding point, and a cheaper backward when router gradients are needed: after-down
+# recomputes a full down GEMM just for grad_expert_scores and materializes [M, H]
+# transients, while before-down harvests grad_expert_scores from the FC2 dgrad with
+# only an [M, I] extra. Off by default; K3/parity lanes must keep it off (it changes
+# the trainer's reduction tree). Covered by test_moe_routing_weight_position.py.
+_ROUTING_WEIGHTS_BEFORE_DOWN_CONFIG = False
+
+
+def set_routing_weights_before_down(enabled: bool) -> None:
+    """Set the config-driven routing-weight position (called at model init)."""
+    global _ROUTING_WEIGHTS_BEFORE_DOWN_CONFIG
+    _ROUTING_WEIGHTS_BEFORE_DOWN_CONFIG = bool(enabled)
+
+
+def routing_weights_before_down() -> bool:
+    """Whether expert_scores fold into the down-GEMM input instead of its output.
+
+    The ``XORL_MOE_ROUTING_WEIGHTS_BEFORE_DOWN=1`` env var force-enables the
+    before-down position regardless of config; it is read lazily (per forward)
+    so it keeps working when set after import.
+    """
+    return _ROUTING_WEIGHTS_BEFORE_DOWN_CONFIG or os.environ.get("XORL_MOE_ROUTING_WEIGHTS_BEFORE_DOWN", "0") == "1"
+
+
+def resolve_routing_weights_before_down(setting: bool | str, *, train_router: bool, ep_dispatch: str) -> bool:
+    """Resolve the ``moe_routing_weights_before_down`` knob (``auto``/true/false) to a position.
+
+    Explicit true/false overrides are honored as-is. ``auto`` (the default) enables
+    the before-down position only in the regime where it is a measured win — router
+    gradients needed (``train_router=True``) with alltoall EP dispatch — and never
+    while the ``XORL_MOE_SGLANG_FUSED_EXPERTS`` parity opt-in is active, so
+    K3/parity lanes stay anchored on the historical after-down reduction tree.
+    """
+    if isinstance(setting, bool):
+        return setting
+    normalized = str(setting).strip().lower()
+    if normalized in ("true", "1"):
+        return True
+    if normalized in ("false", "0"):
+        return False
+    if normalized != "auto":
+        raise ValueError(f"Invalid moe_routing_weights_before_down={setting!r}; expected 'auto', true, or false.")
+    from xorl.models.layers.moe.experts import moe_sglang_fused_experts_enabled  # noqa: PLC0415
+
+    return train_router and ep_dispatch == "alltoall" and not moe_sglang_fused_experts_enabled()
 
 
 def _maybe_fake_quant_down_input(tensor: torch.Tensor, act_quant_group_size: int) -> torch.Tensor:
@@ -150,10 +194,11 @@ class TritonEPGroupGemm(torch.autograd.Function):
         else:
             gate_output = up_output = gate_up_output
 
+        before_down = routing_weights_before_down()
         gate_for_activation = _maybe_clamp_swiglu_gate(gate_output, ctx.swiglu_limit)
         gate_activation = _moe_gate_activation(gate_for_activation, getattr(ctx, "hidden_act", "silu"))
         gated_output = gate_activation * up_output
-        if _ROUTING_WEIGHTS_BEFORE_DOWN and expert_scores is not None:
+        if before_down and expert_scores is not None:
             gated_output.mul_(expert_scores.to(gated_output.dtype).unsqueeze(-1))
         del gate_activation, gate_for_activation
 
@@ -174,14 +219,14 @@ class TritonEPGroupGemm(torch.autograd.Function):
         )
         del gated_output
 
-        if expert_scores is not None and not _ROUTING_WEIGHTS_BEFORE_DOWN:
+        if expert_scores is not None and not before_down:
             down_output.mul_(expert_scores.to(down_output.dtype).unsqueeze(-1))
 
         if expert_scores is None:
             expert_scores = permute_tokens.new_ones(permute_tokens.shape[0])
         ctx.save_for_backward(permute_tokens, cumsum, gate_up_proj, down_proj, gate_up_output, expert_scores)
         ctx.intermediate_size = I
-        ctx.routing_weights_before_down = _ROUTING_WEIGHTS_BEFORE_DOWN
+        ctx.routing_weights_before_down = before_down
 
         return down_output
 
@@ -370,9 +415,10 @@ class TritonEPGroupGemmMoeAct(torch.autograd.Function):
             transpose_a=False,
             transpose_b=False,
         )
+        before_down = routing_weights_before_down()
         gate_activation = _moe_gate_activation(gate_up_output[..., :I], getattr(ctx, "hidden_act", "silu"))
         gated_output = gate_activation * gate_up_output[..., I:]
-        if _ROUTING_WEIGHTS_BEFORE_DOWN and expert_scores is not None:
+        if before_down and expert_scores is not None:
             gated_output.mul_(expert_scores.to(gated_output.dtype).unsqueeze(-1))
         del gate_activation, gate_up_output
 
@@ -384,14 +430,14 @@ class TritonEPGroupGemmMoeAct(torch.autograd.Function):
         )
         del gated_output
 
-        if expert_scores is not None and not _ROUTING_WEIGHTS_BEFORE_DOWN:
+        if expert_scores is not None and not before_down:
             down_output.mul_(expert_scores.to(down_output.dtype).unsqueeze(-1))
 
         if expert_scores is None:
             expert_scores = permute_tokens.new_ones(permute_tokens.shape[0])
         ctx.save_for_backward(permute_tokens, cumsum, gate_up_proj, down_proj, expert_scores)
         ctx.intermediate_size = I
-        ctx.routing_weights_before_down = _ROUTING_WEIGHTS_BEFORE_DOWN
+        ctx.routing_weights_before_down = before_down
         return down_output
 
     @staticmethod

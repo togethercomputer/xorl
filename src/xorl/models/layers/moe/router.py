@@ -9,6 +9,11 @@ import torch.nn.functional as F
 
 _SYNTHETIC_ROUTING_ENV = "XORL_MOE_SYNTHETIC_ROUTING"
 _ROUTER_TOPK_POLICY_ENV = "XORL_MOE_ROUTER_TOPK_POLICY"
+_MOE_BI_ROUTER_ENV = "XORL_MOE_BI_ROUTER"
+
+
+def _moe_bi_router_enabled() -> bool:
+    return os.environ.get(_MOE_BI_ROUTER_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def balanced_synthetic_routing(
@@ -238,9 +243,17 @@ class TopKRouter(nn.Module):
         else:
             selected_experts = _topk_indices_with_policy(router_logits, self.top_k)
             routing_weights = torch.gather(routing_weights, 1, selected_experts)
-        if self.norm_topk_prob:
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        routing_weights = routing_weights.to(input_dtype)
+        if _moe_bi_router_enabled():
+            # K3 router contract: fixed-order renorm + cast so the top-k weights
+            # are bit-identical to SGLang's SGLANG_BI_ROUTER path (the stock
+            # sum(dim=-1) reduction is build-dependent; see bi_router_topk_weights).
+            from xorl.ops.batch_invariant_ops import bi_router_topk_weights  # noqa: PLC0415
+
+            routing_weights = bi_router_topk_weights(routing_weights, self.norm_topk_prob, input_dtype)
+        else:
+            if self.norm_topk_prob:
+                routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+            routing_weights = routing_weights.to(input_dtype)
         return routing_weights, selected_experts
 
     def _forward_sqrtsoftplus(

@@ -111,7 +111,7 @@ def sync_lm_head_tp_parameters(model: torch.nn.Module, lm_head_tp_replica_group)
 
 
 def clip_gradients(
-    model: torch.nn.Module,
+    model: "torch.nn.Module | List[torch.nn.Module]",
     max_grad_norm: float,
     pp_enabled: bool = False,
     pp_group=None,
@@ -119,7 +119,8 @@ def clip_gradients(
     """Clip gradients and return grad_norm. Handles PP all-reduce.
 
     Args:
-        model: The model (may have FSDP's clip_grad_norm_).
+        model: The model (may have FSDP's clip_grad_norm_), or a list of PP
+            virtual-stage model parts (clipped jointly with one local norm).
         max_grad_norm: Maximum gradient norm for clipping.
         pp_enabled: Whether pipeline parallelism is active.
         pp_group: Process group for PP all-reduce of grad norms.
@@ -130,11 +131,13 @@ def clip_gradients(
     if max_grad_norm <= 0:
         return 0.0
 
-    if hasattr(model, "clip_grad_norm_"):
-        _gn = model.clip_grad_norm_(max_grad_norm)
+    models = model if isinstance(model, (list, tuple)) else [model]
+    if len(models) == 1 and hasattr(models[0], "clip_grad_norm_"):
+        _gn = models[0].clip_grad_norm_(max_grad_norm)
         grad_norm = _gn.item() if hasattr(_gn, "item") else float(_gn)
     else:
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        params = [p for m in models for p in m.parameters()]
+        grad_norm = torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
         if hasattr(grad_norm, "full_tensor"):
             grad_norm = grad_norm.full_tensor().item()
         elif hasattr(grad_norm, "item"):
@@ -503,6 +506,29 @@ def pad_micro_batches_for_pp(
                     mb[ml_key] = new_max
 
 
+_PP_FA_KEYS = ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k")
+
+
+def _set_pp_batch_metadata(model_parts: List[torch.nn.Module], micro_batches: List[Dict[str, Any]]) -> None:
+    """Queue per-microbatch metadata (position_ids, flash-attn kwargs) on each part.
+
+    Each part gets its own dict copies: _pp_forward pops keys from the entry,
+    so sharing dicts across virtual stages would corrupt later stages' metadata.
+    """
+    pp_metadata_list = []
+    for mb in micro_batches:
+        md = {}
+        if "position_ids" in mb:
+            md["position_ids"] = mb["position_ids"]
+        for key in _PP_FA_KEYS:
+            if key in mb:
+                md[key] = mb[key]
+        pp_metadata_list.append(md)
+
+    for model_part in model_parts:
+        model_part._pp_batch_metadata = deque(dict(md) for md in pp_metadata_list)
+
+
 def forward_backward_pp(
     model_parts: List[torch.nn.Module],
     pp_schedule,
@@ -524,28 +550,17 @@ def forward_backward_pp(
     input_ids = torch.cat([mb["input_ids"].to(device, non_blocking=True) for mb in micro_batches], dim=0)
     labels = torch.cat([mb["labels"].to(device, non_blocking=True) for mb in micro_batches], dim=0)
 
-    # Per-microbatch metadata for PP forward (position_ids, flash-attn kwargs)
-    _PP_FA_KEYS = ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k")
-    pp_metadata_list = []
-    for mb in micro_batches:
-        md = {}
-        if "position_ids" in mb:
-            md["position_ids"] = mb["position_ids"]
-        for key in _PP_FA_KEYS:
-            if key in mb:
-                md[key] = mb[key]
-        pp_metadata_list.append(md)
-
-    for model_part in model_parts:
-        model_part._pp_batch_metadata = deque(pp_metadata_list)
+    _set_pp_batch_metadata(model_parts, micro_batches)
 
     targets = labels if has_last_stage else None
     losses = [] if has_last_stage else None
 
+    # return_outputs=False: the merged last-stage output is unused for training and
+    # costs an O(n_microbatches x seq x vocab) allocation (37 GiB at m=16/8k/151k).
     if has_first_stage:
-        pp_schedule.step(input_ids, target=targets, losses=losses)
+        pp_schedule.step(input_ids, target=targets, losses=losses, return_outputs=False)
     else:
-        pp_schedule.step(target=targets, losses=losses)
+        pp_schedule.step(target=targets, losses=losses, return_outputs=False)
 
     # Broadcast loss from last stage via MAX
     if has_last_stage:
@@ -558,3 +573,41 @@ def forward_backward_pp(
 
     del input_ids, labels
     return loss_tensor.item()
+
+
+def forward_only_pp(
+    model_parts: List[torch.nn.Module],
+    pp_schedule,
+    micro_batches: List[Dict[str, Any]],
+    has_first_stage: bool,
+    has_last_stage: bool,
+) -> Optional[List[torch.Tensor]]:
+    """Run the PP schedule forward-only (eval / reference logprobs).
+
+    The schedule must be built with ``loss_fn=None`` and with meta input/output
+    args on every stage (shape inference would otherwise consume the metadata
+    queue). The last stage must return HIDDEN states (``_pp_lm_head_in_loss``);
+    the caller applies lm_head + loss outside the schedule.
+
+    Returns:
+        Per-microbatch last-stage hidden states on ranks holding the last
+        stage; None elsewhere.
+    """
+    device = get_device_type()
+    input_ids = torch.cat([mb["input_ids"].to(device, non_blocking=True) for mb in micro_batches], dim=0)
+
+    _set_pp_batch_metadata(model_parts, micro_batches)
+    for model_part in model_parts:
+        model_part._pp_forward_only = True
+    try:
+        if has_first_stage:
+            output = pp_schedule.step(input_ids)
+        else:
+            output = pp_schedule.step()
+    finally:
+        for model_part in model_parts:
+            model_part._pp_forward_only = False
+
+    if not has_last_stage or output is None:
+        return None
+    return list(output.chunk(len(micro_batches), dim=0))

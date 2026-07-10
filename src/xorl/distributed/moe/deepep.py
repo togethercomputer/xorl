@@ -35,6 +35,89 @@ def check_deepep_available():
         raise ImportError("DeepEP is not installed. Please install it from https://github.com/deepseek-ai/DeepEP")
 
 
+_SKIP_PREFLIGHT_ENV = "XORL_SKIP_DEEPEP_INTERNODE_PREFLIGHT"
+
+
+def _ep_group_spans_nodes(ep_group: Optional[dist.ProcessGroup]) -> Optional[bool]:
+    """Best-effort node-span check from the torchrun rank layout; None if undeterminable."""
+    if not dist.is_initialized():
+        return None
+    try:
+        local_world = int(_os.environ.get("LOCAL_WORLD_SIZE", "0"))
+    except ValueError:
+        return None
+    if local_world <= 0:
+        return None
+    world_size = dist.get_world_size()
+    if world_size <= local_world:
+        return False
+    ranks = dist.get_process_group_ranks(ep_group) if ep_group is not None else range(world_size)
+    return len({r // local_world for r in ranks}) > 1
+
+
+def preflight_internode_transport(
+    ep_group: Optional[dist.ProcessGroup],
+    hidden_dim: int,
+    buffer_size_gb: float = 2.0,
+    num_sms: int = 20,
+) -> None:
+    """Probe DeepEP's internode transport with a tiny dispatch+combine before training.
+
+    A fabric or per-node IB fault that NCCL rides out (NCCL_IB_TIMEOUT/RETRY_CNT, HCA
+    excludes) can leave NVSHMEM — DeepEP's internode transport, which honors none of the
+    NCCL env — undeliverable. The first MoE dispatch then spins on
+    moe_recv_expert_counter=-1 after minutes of model loading, holding the whole gang
+    (observed on q30 EP16 2-node: pair/time-specific, independent of the MoE compute
+    backend). Failing here instead costs seconds and names the participating nodes.
+
+    Relies on DeepEP's own CPU timeout to unstick a dead dispatch; the buffer created
+    here is the cached default buffer, sized with the same hidden_bytes training uses.
+    """
+    if _os.environ.get(_SKIP_PREFLIGHT_ENV, "0") == "1":
+        return
+    if not dist.is_initialized():
+        return
+    if not _ep_group_spans_nodes(ep_group):  # False or None (unknown topology)
+        return
+
+    import socket  # noqa: PLC0415
+
+    from xorl.utils.logging import get_logger  # noqa: PLC0415
+
+    world = dist.get_world_size(ep_group) if ep_group is not None else dist.get_world_size()
+    hosts: List[Optional[str]] = [None] * world
+    dist.all_gather_object(hosts, socket.gethostname(), group=ep_group)
+    node_list = sorted({h for h in hosts if h})
+
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    hidden_dim = max(int(hidden_dim), 64)
+    x = torch.randn(world, hidden_dim, device=device, dtype=torch.bfloat16)
+    routing_weights = torch.ones(world, 1, device=device, dtype=torch.float32)
+    selected_experts = torch.arange(world, device=device, dtype=torch.int64).unsqueeze(1)
+
+    buffer = get_default_buffer(ep_group=ep_group, buffer_size_gb=buffer_size_gb, num_sms=num_sms)
+    try:
+        buffer.init_buffer(hidden_bytes=hidden_dim * 2)
+        recv_x, _, _, _, handle = dispatch_no_grad(buffer, x, routing_weights, selected_experts, num_experts=world)
+        out = combine_no_grad(buffer, recv_x.contiguous(), handle)
+    except Exception as exc:
+        raise RuntimeError(
+            f"DeepEP internode preflight failed on the EP group spanning nodes {node_list}: {exc}\n"
+            "The internode transport (NVSHMEM) is not delivering between these nodes even though "
+            "NCCL rendezvous worked — typically transient fabric or per-node IB health (NVSHMEM "
+            "does not honor NCCL_IB_HCA excludes or NCCL retry/timeout settings). Reschedule onto "
+            "different nodes or fall back to ep_dispatch='alltoall'. "
+            f"Set {_SKIP_PREFLIGHT_ENV}=1 to skip this probe."
+        ) from exc
+    if not torch.allclose(out.float(), x.float(), atol=1e-2, rtol=1e-2):
+        raise RuntimeError(
+            f"DeepEP internode preflight round-trip corrupted data on EP group spanning {node_list}: "
+            "dispatch+combine of an identity routing did not return the input. Suspect node/fabric "
+            f"health; reschedule or use ep_dispatch='alltoall'. Set {_SKIP_PREFLIGHT_ENV}=1 to skip."
+        )
+    get_logger(__name__).info_rank0(f"DeepEP internode preflight OK across {len(node_list)} nodes: {node_list}")
+
+
 def get_hidden_bytes(x: torch.Tensor) -> int:
     """Calculate the number of hidden bytes for one token.
 
@@ -124,6 +207,19 @@ class DeepEPBuffer:
                         )
                 except (AttributeError, TypeError):
                     pass  # Fallback to fixed size for older DeepEP versions
+
+        # DeepEP asserts 128-byte alignment, and caps NVL bytes at int32 max whenever an
+        # RDMA (internode) buffer exists — otherwise it aborts with a cryptic C++ assert
+        # (deep_ep.cpp 'num_nvl_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0 and ...').
+        num_nvl_bytes -= num_nvl_bytes % 128
+        num_rdma_bytes -= num_rdma_bytes % 128
+        int32_max = 2**31 - 1
+        if num_rdma_bytes > 0 and num_nvl_bytes > int32_max:
+            raise ValueError(
+                f"deepep_buffer_size_gb={self.buffer_size_gb} gives num_nvl_bytes={num_nvl_bytes}, above "
+                f"DeepEP's int32 limit ({int32_max}) for buffers with an internode (RDMA) component. "
+                "Use deepep_buffer_size_gb <= 2.0 when the EP group spans nodes."
+            )
 
         self._buffer = deep_ep.Buffer(
             group=self.ep_group,
@@ -651,6 +747,10 @@ class _FusedUnpermuteAndCombine(torch.autograd.Function):
             _store_pending_event(event)
         else:
             event.current_stream_wait()
+        # combined_x is comm-stream-owned (allocate_on_comm_stream): without
+        # record_stream, its freed block returns to the comm-stream pool and a
+        # later collective can reuse it while compute-stream reads are in flight.
+        combined_x.record_stream(torch.cuda.current_stream())
 
         ctx.save_for_backward(dispatch_ctx.permuted_indices)
         ctx.buffer = buffer
@@ -678,6 +778,9 @@ class _FusedUnpermuteAndCombine(torch.autograd.Function):
             allocate_on_comm_stream=True,
         )
         event.current_stream_wait()
+        # grad_gather is comm-stream-owned (allocate_on_comm_stream): guard its
+        # block against comm-pool reuse while compute-stream reads are in flight.
+        grad_gather.record_stream(torch.cuda.current_stream())
 
         if grad_gather.dtype != ctx.input_dtype:
             grad_gather = grad_gather.to(ctx.input_dtype)

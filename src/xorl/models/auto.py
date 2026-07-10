@@ -14,6 +14,7 @@ from transformers import (
 )
 
 from ..distributed.parallel_state import get_parallel_state
+from ..ops.moe.triton import resolve_routing_weights_before_down, set_routing_weights_before_down
 from ..utils import logging
 from .layers.attention import ATTENTION_FUNCTIONS
 from .layers.normalization import set_rmsnorm_mode
@@ -188,8 +189,9 @@ def build_foundation_model(
     torch_dtype: Literal["float16", "bfloat16", "float32"] = "bfloat16",
     attn_implementation: Optional[
         Literal["eager", "sdpa", "native", "flash_attention_3", "flash_attention_4", "minimax_msa"]
-    ] = "flash_attention_3",
+    ] = "flash_attention_4",
     moe_implementation: Optional[Literal["eager", "triton", "native", "quack"]] = None,
+    moe_routing_weights_before_down: Union[bool, str] = "auto",
     ep_dispatch: str = "alltoall",
     train_router: bool = False,
     record_routing_weights: bool = True,
@@ -250,6 +252,15 @@ def build_foundation_model(
     config._alltoall_combine_hidden_chunk_size = alltoall_combine_hidden_chunk_size
     config._router_fp32 = router_fp32
     config._lm_head_fp32 = lm_head_fp32
+    routing_before_down = resolve_routing_weights_before_down(
+        moe_routing_weights_before_down, train_router=train_router, ep_dispatch=ep_dispatch
+    )
+    set_routing_weights_before_down(routing_before_down)
+    logger.info_rank0(
+        f"MoE routing-weight position: {'before' if routing_before_down else 'after'}-down "
+        f"(moe_routing_weights_before_down={moe_routing_weights_before_down!r}, "
+        f"train_router={train_router}, ep_dispatch={ep_dispatch})"
+    )
     set_rmsnorm_mode(rmsnorm_mode)
     config._rmsnorm_mode = rmsnorm_mode
     config._activation_native = activation_native
@@ -260,6 +271,18 @@ def build_foundation_model(
     config._flash_attention_deterministic = flash_attention_deterministic
 
     if ep_dispatch == "deepep":
+        # Probe the internode transport before weight loading: a dead NVSHMEM path
+        # otherwise wedges the gang at the first MoE dispatch, minutes later.
+        ep_state = get_parallel_state()
+        if ep_state.ep_enabled:
+            from ..distributed.moe.deepep import preflight_internode_transport  # noqa: PLC0415
+
+            preflight_internode_transport(
+                ep_state.ep_group,
+                hidden_dim=getattr(config, "hidden_size", 0) or 2048,
+                buffer_size_gb=deepep_buffer_size_gb,
+                num_sms=deepep_num_sms,
+            )
         logger.info_rank0(
             f"DeepEP dispatch enabled (buffer={deepep_buffer_size_gb} GB, "
             f"num_sms={deepep_num_sms}, async_combine={deepep_async_combine})"
@@ -269,7 +292,7 @@ def build_foundation_model(
     if attn_implementation == "sdpa":
         raise ValueError(
             "attn_implementation='sdpa' is not supported for packed sequences with sequence parallelism. "
-            "Please use 'flash_attention_3' for correct cu_seqlens handling."
+            "Please use 'flash_attention_4' (default) or 'flash_attention_3' for correct cu_seqlens handling."
         )
 
     ps = get_parallel_state()
@@ -278,11 +301,11 @@ def build_foundation_model(
         raise ValueError(LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE)
     validate_glm5_sequence_parallel(config, parallel_state=ps)
 
-    if _is_gpt_oss_config(config) and attn_implementation not in ("eager", "flash_attention_3"):
+    if _is_gpt_oss_config(config) and attn_implementation not in ("eager", "flash_attention_3", "flash_attention_4"):
         raise ValueError(
             "GPT-OSS attention sinks are only implemented for attn_implementation="
-            "'eager' or 'flash_attention_3' in xorl. Using other backends (sdpa, "
-            "flash_attention_2, flash_attention_4, native) would silently drop the "
+            "'eager', 'flash_attention_3', or 'flash_attention_4' in xorl. Using other "
+            "backends (sdpa, flash_attention_2, native) would silently drop the "
             "sink logits and change model outputs."
         )
 

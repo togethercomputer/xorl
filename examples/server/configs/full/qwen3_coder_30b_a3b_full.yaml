@@ -41,7 +41,8 @@ enable_packing: true
 
 # Full weight training
 skip_initial_checkpoint: true
-ce_mode: compiled
+# bi_fused = K3 lm-head contract CE (fp32-class, tp1, no z-loss).
+ce_mode: bi_fused
 
 # Optimizer: Muon with bf16 states on GPU (no offload with 8 GPUs).
 # 8 GPUs: weights ~7.5GB/GPU + Muon momentum ~7.5GB/GPU = ~15GB/GPU. Fits easily.

@@ -86,3 +86,7 @@ experiments/local_benchmark/sweeps/
 
 # Multi-adapter LoRA E2E artifacts can contain full per-rank logs and copied checkpoints.
 experiments/multi_adapter_lora/results/
+
+# K3 experiment raw tensor dumps (data, not code) — keep out of git history
+experiments/k3_tests/results/q30b_weighted_zero_20260630/
+experiments/k3_tests/results/**/*.pt

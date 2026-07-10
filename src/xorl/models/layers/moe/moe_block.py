@@ -7,9 +7,64 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .experts import MoEExperts
+from .experts import MoEExperts, moe_sglang_fused_experts_enabled
 from .router import TopKRouter, balanced_synthetic_routing
 from .routing_replay import RoutingReplay, get_replay_stage
+
+
+_MOE_FP64_ACCUM_ENV = "XORL_MOE_FP64_ACCUM"
+
+
+def _moe_fp64_accum_enabled() -> bool:
+    """K3 parity mode: fp64-accumulate eager expert GEMMs + weighted combine.
+
+    Order-invariant MoE reductions (see ``eager_expert_forward_fp64``). Slow —
+    fp64 GEMMs run at H100 fp64 tensor-core rate (~15x below bf16) — so this is
+    an opt-in reconciliation mode, never a training default.
+    """
+    return os.environ.get(_MOE_FP64_ACCUM_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+_MOE_BI_ROUTER_ENV = "XORL_MOE_BI_ROUTER"
+
+
+def _moe_bi_router_enabled() -> bool:
+    """K3 router contract: route the gate/router matmul through the shared
+    batch-invariant router GEMM (``ops.batch_invariant_ops.bi_router_gemm``),
+    vendored bit-for-bit into SGLang. Opt-in; never a training default.
+
+    Live training routes independently of serving (no routing replay), so the
+    fp32 router-GEMM reduction-order tail can flip top-k expert selection on
+    razor-edge tokens. This pins the router logits identically cross-engine.
+    """
+    return os.environ.get(_MOE_BI_ROUTER_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+class _BIRouterGemm(torch.autograd.Function):
+    """Differentiable wrapper for the forward-only ``bi_router_gemm`` contract.
+
+    The forward is the pinned batch-invariant kernel (enters the K3 stream); the
+    backward is the ordinary linear backward (does not enter the forward K3, so
+    reduction order is irrelevant and plain matmuls suffice).
+    """
+
+    @staticmethod
+    def forward(ctx, hidden, weight):
+        from xorl.ops.batch_invariant_ops import bi_router_gemm  # noqa: PLC0415
+
+        ctx.save_for_backward(hidden, weight)
+        return bi_router_gemm(hidden, weight)
+
+    @staticmethod
+    def backward(ctx, grad_logits):
+        hidden, weight = ctx.saved_tensors
+        grad_logits = grad_logits.to(torch.float32)
+        grad_hidden = grad_weight = None
+        if ctx.needs_input_grad[0]:
+            grad_hidden = (grad_logits @ weight.float()).to(hidden.dtype)
+        if ctx.needs_input_grad[1]:
+            grad_weight = (grad_logits.t() @ hidden.float()).to(weight.dtype)
+        return grad_hidden, grad_weight
 
 
 _ROUTER_FP32_LAYERS_ENV = "XORL_MOE_ROUTER_FP32_LAYERS"
@@ -121,6 +176,33 @@ class MoEBlock(nn.Module):
         if callable(capture):
             capture(name, tensor)
 
+    def _override_diagnostic_component(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
+        overrides = getattr(self, "_diagnostic_component_overrides", None)
+        override = overrides.get(name) if isinstance(overrides, dict) else None
+        if callable(override):
+            tensor = override(tensor)
+            self._capture_diagnostic_component(f"{name}_override", tensor)
+        return tensor
+
+    def _capture_moe_tp_shards(self, name: str, tensor: torch.Tensor) -> None:
+        capture = getattr(self, "_diagnostic_capture_component", None)
+        if not callable(capture):
+            return
+        tp_shards = getattr(tensor, "_xorl_sglang_moe_tp_shards", None)
+        if not tp_shards:
+            return
+
+        shard_sum = None
+        for shard_idx, shard in enumerate(tp_shards):
+            self._capture_diagnostic_component(f"{name}_tp_shard_{shard_idx}", shard)
+            if shard_sum is None:
+                shard_sum = shard.clone()
+            else:
+                shard_sum = shard_sum + shard.to(shard_sum.dtype)
+
+        if shard_sum is not None:
+            self._capture_diagnostic_component(f"{name}_tp_shard_sum", shard_sum)
+
     def inject_lora(
         self,
         r: int = 16,
@@ -200,6 +282,25 @@ class MoEBlock(nn.Module):
         routing_weights = routing_weights.to(input_dtype)
         return cached_experts, routing_weights
 
+    def _bi_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Router logits through the shared batch-invariant router GEMM.
+
+        Guards raise loudly on configs the contract has not verified: an fp8
+        gate, a gate bias, or non-bf16 hidden/weight (the bf16-upcast exactness
+        argument requires bf16 inputs). Returns fp32 logits ``[N, num_experts]``
+        bit-identical to SGLang's ``SGLANG_BI_ROUTER=1`` path.
+        """
+        if hasattr(self.gate, "fp8_block_size"):
+            raise NotImplementedError(f"{_MOE_BI_ROUTER_ENV} does not support an fp8 gate")
+        if getattr(self.gate, "bias", None) is not None:
+            raise NotImplementedError(f"{_MOE_BI_ROUTER_ENV} does not support a gate bias")
+        if hidden_states.dtype != torch.bfloat16 or self.gate.weight.dtype != torch.bfloat16:
+            raise NotImplementedError(
+                f"{_MOE_BI_ROUTER_ENV} requires bf16 hidden states and gate weight; got "
+                f"hidden={hidden_states.dtype}, weight={self.gate.weight.dtype}"
+            )
+        return _BIRouterGemm.apply(hidden_states, self.gate.weight)
+
     def route(self, hidden_states: torch.Tensor):
         """Compute routing weights and expert assignments.
 
@@ -222,7 +323,9 @@ class MoEBlock(nn.Module):
             and getattr(self.config, "_router_fp32", False)
             or _router_fp32_layers_enabled(getattr(self, "layer_idx", None))
         )
-        if router_fp32 and not hasattr(self.gate, "fp8_block_size"):
+        if _moe_bi_router_enabled():
+            router_logits = self._bi_router_logits(hidden_states)
+        elif router_fp32 and not hasattr(self.gate, "fp8_block_size"):
             router_logits = F.linear(hidden_states.float(), self.gate.weight.float())
         else:
             router_logits = self.gate(hidden_states)
@@ -345,8 +448,33 @@ class MoEBlock(nn.Module):
         """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        hidden_states = self.experts(hidden_states, routing_weights, selected_experts)
+        self._capture_diagnostic_component("moe_input", hidden_states)
+        from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+
+        parallel_state = get_parallel_state()
+        if (
+            _moe_fp64_accum_enabled()
+            and not parallel_state.ep_enabled
+            and not self.experts.sglang_moe_tp_sim_enabled(parallel_state)
+        ):
+            hidden_states = self._eager_forward_fp64(hidden_states, routing_weights, selected_experts)
+        elif (
+            moe_sglang_fused_experts_enabled(getattr(parallel_state, "ep_size", 1), hidden_states.device, self.experts)
+            and not parallel_state.ep_enabled
+            and not self.experts.sglang_moe_tp_sim_enabled(parallel_state)
+        ):
+            hidden_states = self.experts.sglang_fused_experts_forward(hidden_states, routing_weights, selected_experts)
+        else:
+            hidden_states = self.experts(hidden_states, routing_weights, selected_experts)
+        self._capture_diagnostic_component("moe_experts_output", hidden_states)
+        self._capture_moe_tp_shards("moe_experts_output", hidden_states)
+        hidden_states = self._override_diagnostic_component("moe_experts_output", hidden_states)
+        tp_shards = getattr(hidden_states, "_xorl_sglang_moe_tp_shards", None)
         hidden_states = hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        if tp_shards is not None:
+            hidden_states._xorl_sglang_moe_tp_shards = tuple(
+                shard.reshape(batch_size, sequence_length, hidden_dim) for shard in tp_shards
+            )
         return hidden_states
 
     def forward(self, hidden_states: torch.Tensor):
@@ -373,6 +501,26 @@ class MoEBlock(nn.Module):
 
         parallel_state = get_parallel_state()
         if (
+            _moe_fp64_accum_enabled()
+            and not parallel_state.ep_enabled
+            and not self.experts.sglang_moe_tp_sim_enabled(parallel_state)
+        ):
+            # K3 parity mode overrides the configured backend (eager/triton/...):
+            # the fp64 loop is the order-invariant reference for all of them.
+            final_hidden_states = self._eager_forward_fp64(flat_hidden_states, routing_weights, selected_experts)
+        elif (
+            moe_sglang_fused_experts_enabled(
+                getattr(parallel_state, "ep_size", 1), flat_hidden_states.device, self.experts
+            )
+            and not parallel_state.ep_enabled
+            and not self.experts.sglang_moe_tp_sim_enabled(parallel_state)
+        ):
+            # K3 parity mode: SGLang's serving kernel overrides the configured
+            # backend so trainer and serving share one MoE reduction tree.
+            final_hidden_states = self.experts.sglang_fused_experts_forward(
+                flat_hidden_states, routing_weights, selected_experts
+            )
+        elif (
             self.moe_implementation == "eager"
             and not parallel_state.ep_enabled
             and not self.experts.sglang_moe_tp_sim_enabled(parallel_state)
@@ -381,7 +529,14 @@ class MoEBlock(nn.Module):
         else:
             final_hidden_states = self.experts(flat_hidden_states, routing_weights, selected_experts)
         self._capture_diagnostic_component("moe_experts_output", final_hidden_states)
+        self._capture_moe_tp_shards("moe_experts_output", final_hidden_states)
+        final_hidden_states = self._override_diagnostic_component("moe_experts_output", final_hidden_states)
+        tp_shards = getattr(final_hidden_states, "_xorl_sglang_moe_tp_shards", None)
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        if tp_shards is not None:
+            final_hidden_states._xorl_sglang_moe_tp_shards = tuple(
+                shard.reshape(batch_size, sequence_length, hidden_dim) for shard in tp_shards
+            )
 
         return final_hidden_states, router_logits
 
@@ -392,6 +547,8 @@ class MoEBlock(nn.Module):
         selected_experts: torch.Tensor,
     ) -> torch.Tensor:
         """Per-expert loop for eager mode."""
+        if _moe_fp64_accum_enabled():
+            return self._eager_forward_fp64(hidden_states, routing_weights, selected_experts)
         hidden_dim = hidden_states.shape[-1]
         final_hidden_states = torch.zeros_like(hidden_states)
 
@@ -407,6 +564,50 @@ class MoEBlock(nn.Module):
             final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
 
         return final_hidden_states
+
+    def _eager_forward_fp64(
+        self,
+        hidden_states: torch.Tensor,
+        routing_weights: torch.Tensor,
+        selected_experts: torch.Tensor,
+    ) -> torch.Tensor:
+        """K3 parity variant of ``_eager_forward``: order-invariant fp64 reductions.
+
+        Same routing/masking as the bf16 loop, but the three expert GEMMs, the
+        routing-weight multiply, and the cross-expert combine all accumulate in
+        fp64; the only intermediate bf16 cast is the activation product inside
+        ``eager_expert_forward_fp64``, and the result is cast back once at the
+        end. Inference-only (no autograd through the fp64 detour is needed for
+        logprob scoring; gradients are unsupported).
+        """
+        from .backend.eager import eager_expert_forward_fp64  # noqa: PLC0415
+
+        experts = self.experts
+        if not experts.gated or experts.hidden_act != "silu":
+            raise NotImplementedError(f"{_MOE_FP64_ACCUM_ENV} supports gated SiLU experts only")
+        if experts.gate_up_bias is not None or experts.down_bias is not None:
+            raise NotImplementedError(f"{_MOE_FP64_ACCUM_ENV} does not support expert biases")
+        if experts.swiglu_limit > 0:
+            raise NotImplementedError(f"{_MOE_FP64_ACCUM_ENV} does not support swiglu_limit")
+
+        hidden_dim = hidden_states.shape[-1]
+        gate_proj = experts.gate_proj
+        up_proj = experts.up_proj
+        down_proj = experts.down_proj
+        final_hidden_states = torch.zeros(hidden_states.shape, dtype=torch.float64, device=hidden_states.device)
+
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+
+        for expert_idx in range(self.num_experts):
+            idx, top_x = torch.where(expert_mask[expert_idx])
+            if top_x.numel() == 0:
+                continue
+
+            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
+            expert_out64 = eager_expert_forward_fp64(current_state, expert_idx, gate_proj, up_proj, down_proj)
+            final_hidden_states.index_add_(0, top_x, expert_out64 * routing_weights[top_x, idx, None].to(torch.float64))
+
+        return final_hidden_states.to(hidden_states.dtype)
 
     @classmethod
     def from_config(cls, config, moe_implementation: str = "triton"):

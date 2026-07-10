@@ -48,9 +48,7 @@ def _add_import_path(path: str | Path | None) -> str | None:
 
 
 def _require_delta_encoding() -> str | None:
-    delta_path = _add_import_path(os.environ.get("XORL_DELTA_ENCODING_PATH")) or _add_import_path(
-        "/home/apanda/delta-encoding"
-    )
+    delta_path = _add_import_path(os.environ.get("XORL_DELTA_ENCODING_PATH"))
     try:
         importlib.import_module("delta_encoding.encoding.packed")
         importlib.import_module("delta_encoding.encoding.compression")
@@ -60,11 +58,11 @@ def _require_delta_encoding() -> str | None:
 
 
 def _require_sglang_apply_sparse_delta_file() -> Callable[..., object]:
-    _add_import_path(os.environ.get("XORL_SGLANG_PATH")) or _add_import_path("/home/apanda/xorl-sglang-internal")
+    _add_import_path(os.environ.get("XORL_SGLANG_PATH"))
     try:
         module = importlib.import_module("sglang.srt.weight_sync.sparse_delta")
     except Exception as exc:
-        pytest.skip(f"xorl-sglang-internal sparse-delta receiver is not importable: {exc}")
+        pytest.skip(f"SGLang sparse-delta receiver is not importable: {exc}")
     return module.apply_sparse_delta_file
 
 

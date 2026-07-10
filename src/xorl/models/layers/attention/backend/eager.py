@@ -91,11 +91,9 @@ def prepare_causal_mask(
     **kwargs,
 ) -> Optional[torch.Tensor]:
     """Build 4D causal mask for the eager attention backend."""
-    past_seen_tokens = 0
     sequence_length = input_tensor.shape[1]
-    target_length = (
-        attention_mask.shape[-1] if isinstance(attention_mask, torch.Tensor) else past_seen_tokens + sequence_length + 1
-    )
+    cache_target_length = int(cache_position[-1].item()) + 1 if cache_position.numel() > 0 else sequence_length
+    target_length = attention_mask.shape[-1] if isinstance(attention_mask, torch.Tensor) else cache_target_length
 
     return prepare_4d_causal_attention_mask_with_cache_position(
         attention_mask,

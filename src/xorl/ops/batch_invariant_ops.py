@@ -7,27 +7,72 @@
 # bit-for-bit match SGLang's reduction order, collapsing the cross-engine K3
 # logprob tail.
 #
-# Two SGLang-internal dependencies are stubbed/inlined here so this module is
-# self-contained:
-#   - ENABLE_JIT_DEEPGEMM -> forced False (pure-Triton matmul path, no DeepGEMM)
-#   - get_bool_env_var / calc_diff -> inlined below
+# SGLang-internal helpers are stubbed/inlined so this module is self-contained.
+# DeepGEMM is discovered lazily and used only on a supported Hopper bf16 route;
+# otherwise the vendored Triton path remains the fallback. Environment parsing
+# and calc_diff are inlined below.
 
 import contextlib
 import os
 from collections import namedtuple
 from collections.abc import Callable
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Literal, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
+from triton.runtime.errors import OutOfResources
+
+from xorl.ops.bi_gemm_configs import baseline_mm_config, lookup_mm_config
 
 
 # --- Stubs for SGLang-internal imports ---------------------------------------
-# Force the pure-Triton matmul path (no DeepGEMM). DeepGEMM is an alternate
-# bf16 GEMM backend that is NOT the batch-invariant Triton kernel, so disabling
-# it guarantees every mm/addmm goes through matmul_kernel_persistent.
-ENABLE_JIT_DEEPGEMM = False
+# DeepGEMM's bf16 NN GEMM is bitwise-identical to the batch-invariant Triton
+# persistent kernel (verified per-shape by tune_bi_gemm.py and gated by
+# tests/ops/test_bi_gemm_config_table.py). Serving's mm route already relies on
+# that equality — SGLang sends every contiguous bf16 N>=16 mm to DeepGEMM while
+# the trainer ran pure Triton — so routing the trainer the same way cannot move
+# cross-engine bits, and it is markedly faster at trainer token counts.
+# Requires Hopper+ and an importable deep_gemm; kill switch:
+# XORL_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM=0 (SGLANG_ prefix honored too).
+# Detection is lazy (first mm) so importing this module never initializes CUDA.
+_DEEPGEMM_READY: bool | None = None
+
+
+def _deepgemm_ready() -> bool:
+    global _DEEPGEMM_READY
+    if _DEEPGEMM_READY is None:
+        try:
+            import deep_gemm  # noqa: F401, PLC0415
+
+            _DEEPGEMM_READY = (
+                torch.cuda.is_available()
+                and torch.cuda.get_device_capability()[0] >= 9
+                and hasattr(deep_gemm, "bf16_gemm_nn")
+            )
+        except Exception:  # noqa: BLE001
+            _DEEPGEMM_READY = False
+    return _DEEPGEMM_READY
+
+
+ENABLE_JIT_DEEPGEMM = True  # gated per-call by _deepgemm_ready()
+
+# Shapes whose table config exceeded shared memory at launch (Triton's epilogue
+# staging for wide-output tiles is version-dependent): remembered so the hot
+# path re-launches straight on the pinned baseline without re-raising.
+_MM_CONFIG_OOM_SHAPES: set[tuple] = set()
+
+
+def _launch_with_config_fallback(launch, dtype, M, N, K, out_itemsize=None):
+    key = (str(dtype), M, N, K, out_itemsize)
+    if key in _MM_CONFIG_OOM_SHAPES:
+        launch(baseline_mm_config(dtype))
+        return
+    try:
+        launch(lookup_mm_config(dtype, M, N, K, out_itemsize=out_itemsize))
+    except OutOfResources:
+        _MM_CONFIG_OOM_SHAPES.add(key)
+        launch(baseline_mm_config(dtype))
 
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
@@ -45,7 +90,10 @@ def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
 # -----------------------------------------------------------------------------
 
 
-_ENABLE_MM_DEEPGEMM = get_bool_env_var("SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM", "1")
+_ENABLE_MM_DEEPGEMM = get_bool_env_var(
+    "XORL_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM",
+    os.getenv("SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM", "1"),
+)
 # If true, allows to fallback to batch variant gemm when the shape cannot be run in DeepGEMM
 _ENABLE_MM_FALLBACK_VARIANT = get_bool_env_var("SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT", "0")
 _ENABLE_MM_COMPARISON_TEST = get_bool_env_var("SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST")
@@ -61,6 +109,15 @@ __all__ = [
     "fused_add_rms_norm_batch_invariant",
     "sglang_rms_norm_batch_invariant",
     "fused_rms_norm_backward",
+    "wrap_trunk_linears_batch_invariant",
+    "is_trunk_linear_contract_enabled",
+    "set_trunk_linear_contract",
+    "RMSNormFamily",
+    "RMS_NORM_FAMILY_NO_RESIDUAL",
+    "RMS_NORM_FAMILY_RESIDUAL_TREE",
+    "RMS_NORM_FAMILIES",
+    "bi_rms_norm",
+    "bi_fused_add_rms_norm",
 ]
 
 
@@ -236,54 +293,32 @@ def _matmul_persistent_triton(a: torch.Tensor, b: torch.Tensor, bias: torch.Tens
             ),
         )
 
-    configs = {
-        torch.bfloat16: {
-            "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 64,
-            "GROUP_SIZE_M": 8,
-            "num_stages": 3,
-            "num_warps": 8,
-        },
-        torch.float16: {
-            "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 256,
-            "BLOCK_SIZE_K": 64,
-            "GROUP_SIZE_M": 8,
-            "num_stages": 3,
-            "num_warps": 8,
-        },
-        torch.float32: {
-            "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 32,
-            "GROUP_SIZE_M": 8,
-            "num_stages": 3,
-            "num_warps": 8,
-        },
-    }
-    # print(a.device, b.device, c.device)
-    matmul_kernel_persistent[grid](
-        a,
-        b,
-        c,  #
-        bias,
-        M,
-        N,
-        K,  #
-        a.stride(0),
-        a.stride(1),  #
-        b.stride(0),
-        b.stride(1),  #
-        c.stride(0),
-        c.stride(1),  #
-        NUM_SMS=NUM_SMS,  #
-        A_LARGE=a.numel() > 2**31,
-        B_LARGE=b.numel() > 2**31,
-        C_LARGE=c.numel() > 2**31,
-        HAS_BIAS=bias is not None,
-        **configs[dtype],
-    )
+    # Shape-keyed on the bit-neutral axes only; BLOCK_SIZE_K stays pinned per
+    # dtype (bi_gemm_configs — the R1 config table, identical in both engines).
+    def _launch(config):
+        matmul_kernel_persistent[grid](
+            a,
+            b,
+            c,  #
+            bias,
+            M,
+            N,
+            K,  #
+            a.stride(0),
+            a.stride(1),  #
+            b.stride(0),
+            b.stride(1),  #
+            c.stride(0),
+            c.stride(1),  #
+            NUM_SMS=NUM_SMS,  #
+            A_LARGE=a.numel() > 2**31,
+            B_LARGE=b.numel() > 2**31,
+            C_LARGE=c.numel() > 2**31,
+            HAS_BIAS=bias is not None,
+            **config,
+        )
+
+    _launch_with_config_fallback(_launch, dtype, M, N, K)
     return c
 
 
@@ -315,12 +350,12 @@ def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | Non
 
     if (
         _ENABLE_MM_DEEPGEMM
-        and ENABLE_JIT_DEEPGEMM
         and (a.dtype == torch.bfloat16)
         and (b.dtype == torch.bfloat16)
         and a.is_contiguous()
         and b.transpose(0, 1).is_contiguous()
         and N >= MIN_DEEPGEMM_DIM
+        and _deepgemm_ready()
     ):
         if _ENABLE_MM_COMPARISON_TEST:
             out_triton = _matmul_persistent_triton(a=a, b=b, bias=bias)
@@ -598,21 +633,44 @@ def mean_dim(
     return output
 
 
+_INTERPOSE_GRAD_ERROR = (
+    "Batch-invariant interposed op '{op}' received a grad-requiring input while grad is enabled. "
+    "The global interpose (XORL_BATCH_INVARIANT_MATMUL / enable_batch_invariant_mode) is "
+    "inference/verification-only: the aten::rms_norm override records no autograd graph (q/k-norm "
+    "gradients silently vanish) and the torch.bmm monkeypatch detaches the graph. For a training "
+    "forward on the batch-invariant contract use the module-scoped XORL_BI_TRUNK_LINEAR=1 lane "
+    "instead (XORL-244)."
+)
+
+
+def _guard_interpose_no_grad(op: str, *tensors) -> None:
+    """Loud-fail (XORL-244): the global interpose must never see a training forward."""
+    if torch.is_grad_enabled() and any(isinstance(t, torch.Tensor) and t.requires_grad for t in tensors):
+        raise RuntimeError(_INTERPOSE_GRAD_ERROR.format(op=op))
+
+
 def mm_batch_invariant(a, b):
+    _guard_interpose_no_grad("aten::mm", a, b)
     return matmul_persistent(a, b)
 
 
 def addmm_batch_invariant(bias, a, b):
+    _guard_interpose_no_grad("aten::addmm", bias, a, b)
     return matmul_persistent(a, b, bias=bias)
 
 
 def _log_softmax_batch_invariant(input, dim, _half_to_float):
     assert not _half_to_float, "not implemented"
+    _guard_interpose_no_grad("aten::_log_softmax", input)
     return log_softmax(input, dim=dim)
 
 
 def mean_batch_invariant(input, dim, keepdim=False, dtype: torch.dtype | None = None):
+    _guard_interpose_no_grad("aten::mean.dim", input)
     assert dtype is None or dtype == torch.float32, f"unsupported dtype: {dtype}"
+    if dim is None or len(dim) == 0:
+        # aten::mean full-reduce dispatches here with dim=[]; the empty n_elems product returned the SUM
+        dim = list(range(input.ndim))
     if len(dim) == 1:
         return mean_dim(input, dim[0], keepdim=keepdim)
     else:
@@ -728,6 +786,7 @@ def bmm_kernel_persistent(
 
 
 def bmm_batch_invariant(a, b, *, out=None):
+    _guard_interpose_no_grad("aten::bmm/torch.bmm", a, b)
     # Batched matrix multiply: (B, M, K) x (B, K, N) -> (B, M, N)
     # Process batches in parallel with our persistent kernel
     if a.ndim == 3 and b.ndim == 3:
@@ -1299,6 +1358,454 @@ def sglang_rms_norm_batch_invariant(
     return output.reshape(original_shape)
 
 
+# --------------------------------------------------------------------------- #
+# RMSNorm kernel-family contract
+#
+# Two batch-invariant RMSNorm kernel families coexist, and they disagree at
+# 1 ulp on rare bf16 boundary values (~2/524288 at [4096, 128]), so silently
+# swapping one for the other seeds K3 divergence that amplifies downstream
+# (the 2026-07-04 norm-seed incident: 2.99e-5 K3 from five such seeds).
+# Each family is pinned to the serving site-class that executes it:
+#   - "serving_no_residual" (family-1): the looped ``tl.sum`` + ``1.0/tl.sqrt``
+#     kernel (``rms_norm_batch_invariant``), what SGLang dispatches when
+#     ``residual is None`` under batch-invariant mode and what the
+#     ``aten::rms_norm`` interpose runs. Site-classes: qk-norm, layer-0 input
+#     layernorm.
+#   - "serving_residual_tree" (family-2): the ``mean_dim`` + ``tl.rsqrt``
+#     fused residual-tree kernels (``fused_add_rms_norm_batch_invariant`` /
+#     ``sglang_rms_norm_batch_invariant``), what SGLang dispatches for
+#     residual calls under the rl-on-policy lane. Site-classes: input
+#     layernorm at layer>0, post-attention layernorm, final norm.
+# Every call site must name its family through ``bi_rms_norm`` /
+# ``bi_fused_add_rms_norm``; never call the family kernels directly.
+# --------------------------------------------------------------------------- #
+RMS_NORM_FAMILY_NO_RESIDUAL = "serving_no_residual"
+RMS_NORM_FAMILY_RESIDUAL_TREE = "serving_residual_tree"
+RMS_NORM_FAMILIES = (RMS_NORM_FAMILY_NO_RESIDUAL, RMS_NORM_FAMILY_RESIDUAL_TREE)
+RMSNormFamily = Literal["serving_no_residual", "serving_residual_tree"]
+
+
+def bi_rms_norm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    *,
+    family: RMSNormFamily,
+    zero_centered: bool = False,
+) -> torch.Tensor:
+    """Single-tensor batch-invariant RMSNorm with an explicit kernel family.
+
+    The single sanctioned entry point for both no-residual family kernels; the
+    ``family`` keyword must name the serving counterpart of the call site.
+
+    ``zero_centered`` is the Gemma-style Qwen3.5 form: an fp32 upcast with the
+    ``1 + weight`` scale folded in fp32, cast back last, exactly as
+    ``normalization.native_zero_centered_rms_norm`` composes it. It is an affine
+    fold around the SAME family-1 reduction tree — not a third family — and only
+    exists in no-residual form (Qwen3.5 residual-tree norms run the eager native
+    path, never a batch-invariant kernel).
+    """
+    if zero_centered:
+        if family != RMS_NORM_FAMILY_NO_RESIDUAL:
+            raise ValueError(
+                "zero-centered RMSNorm only exists in the 'serving_no_residual' family; "
+                "Qwen3.5 residual-tree norms run the native path, not a batch-invariant kernel"
+            )
+        return rms_norm_batch_invariant(input.float(), 1.0 + weight.float(), eps=eps).type_as(input)
+    if family == RMS_NORM_FAMILY_NO_RESIDUAL:
+        return rms_norm_batch_invariant(input, weight, eps=eps)
+    if family == RMS_NORM_FAMILY_RESIDUAL_TREE:
+        return sglang_rms_norm_batch_invariant(input, weight, eps=eps)
+    raise ValueError(f"Unknown RMSNorm family {family!r}; expected one of {RMS_NORM_FAMILIES}")
+
+
+def bi_fused_add_rms_norm(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    *,
+    family: RMSNormFamily,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused residual-add batch-invariant RMSNorm with an explicit kernel family.
+
+    Only the serving residual tree has a fused-add kernel; requesting the
+    no-residual family with a residual stream is a contract violation (serving
+    never runs family-1 on a residual site) and raises.
+    """
+    if family == RMS_NORM_FAMILY_RESIDUAL_TREE:
+        return fused_add_rms_norm_batch_invariant(input, residual, weight, eps=eps)
+    if family == RMS_NORM_FAMILY_NO_RESIDUAL:
+        raise ValueError(
+            "RMSNorm family 'serving_no_residual' has no fused-add kernel: residual "
+            "site-classes are 'serving_residual_tree' by the cross-engine contract"
+        )
+    raise ValueError(f"Unknown RMSNorm family {family!r}; expected one of {RMS_NORM_FAMILIES}")
+
+
+# --------------------------------------------------------------------------- #
+# Batch-invariant fused LM-head selected-token log-probability
+#
+# The K3 lm-head contract, vendored identically in xorl and SGLang
+# (python/sglang/srt/batch_invariant_ops/batch_invariant_ops.py). Both engines
+# compute per-token logprobs of given token ids from bit-exact bf16 hidden
+# states and the bf16 lm-head weight through the SAME reduction trees, so the
+# results are bitwise identical cross-engine:
+#   1. chunk GEMM — ``matmul_kernel_persistent`` with the family's fixed bf16
+#      tile config and an fp32 output buffer. bf16xbf16 products are exact in
+#      fp32, so reading the weight in bf16 with tensor-core fp32 accumulation
+#      equals a GEMM over materialized fp32 upcasts with the same tree (and
+#      deletes the fp32 weight copy the eager paths materialize).
+#   2. chunk stats — per-row max and sum(exp(x - chunk_max)) in a fixed
+#      sequential BLOCK loop (same discipline as ``_rms_norm_kernel``), plus
+#      the selected-token logit gather.
+#   3. merge — global max over chunk maxima (exact), then the rescaled sumexp
+#      accumulated in pinned chunk order; lse = gmax + log(acc).
+# All transcendentals stay inside these kernels: tl.exp/tl.log measured
+# bit-identical across triton 3.5.1 (serving venv) and 3.7.1 (trainer venv),
+# as is the fixed-tile tl.dot fp32 accumulator. VOCAB_CHUNK and STATS_BLOCK are
+# contract constants — changing either changes the bits (the LSE reduction
+# tree). The chunk GEMM's tile config is shape-keyed via bi_gemm_configs: only
+# its BLOCK_SIZE_K (pinned there) is bit-relevant.
+# Forward-only; the trainer wraps it in an autograd.Function (ops/loss).
+# --------------------------------------------------------------------------- #
+
+BI_LM_HEAD_VOCAB_CHUNK = 8192
+_BI_LM_HEAD_STATS_BLOCK = 1024
+
+
+@triton.jit
+def _lm_head_chunk_stats_kernel(
+    logits_ptr,
+    token_ids_ptr,
+    sel_ptr,
+    m_ptr,
+    s_ptr,
+    temp_ptr,
+    logits_row_stride,
+    n_cols,
+    col_offset,
+    chunk_idx,
+    n_chunks,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_TEMP: tl.constexpr,
+):
+    """Per-row chunk statistics over an fp32 logits tile [N, n_cols]:
+    chunk max, sum(exp(x - chunk_max)) in a fixed sequential block loop, and
+    the selected-token logit when ``token_ids[row]`` falls in this chunk.
+    With HAS_TEMP, logits are scaled by 1/temp[row] before the statistics and
+    the selected logit; the fp32 divide runs in-kernel so every engine
+    computes the identical scale (elementwise, so batch-invariance holds)."""
+    row = tl.program_id(0).to(tl.int64)
+    row_ptr = logits_ptr + row * logits_row_stride
+    if HAS_TEMP:
+        inv_t = 1.0 / tl.load(temp_ptr + row)
+    else:
+        inv_t = 1.0
+
+    row_max = float("-inf")
+    for col_start in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_start + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+        vals = tl.load(row_ptr + col_idx, mask=mask, other=float("-inf"))
+        if HAS_TEMP:
+            vals = vals * inv_t
+        row_max = tl.maximum(row_max, tl.max(vals))
+
+    sum_exp = 0.0
+    for col_start in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_start + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+        vals = tl.load(row_ptr + col_idx, mask=mask, other=float("-inf"))
+        if HAS_TEMP:
+            vals = vals * inv_t
+        e = tl.exp(vals - row_max)
+        sum_exp += tl.sum(tl.where(mask, e, 0.0))
+
+    tl.store(m_ptr + row * n_chunks + chunk_idx, row_max)
+    tl.store(s_ptr + row * n_chunks + chunk_idx, sum_exp)
+
+    tok = tl.load(token_ids_ptr + row)
+    local = tok - col_offset
+    in_chunk = (local >= 0) & (local < n_cols)
+    sel = tl.load(row_ptr + local, mask=in_chunk, other=0.0)
+    if HAS_TEMP:
+        sel = sel * inv_t
+    tl.store(sel_ptr + row, sel, mask=in_chunk)
+
+
+@triton.jit
+def _lm_head_lse_merge_kernel(
+    m_ptr,
+    s_ptr,
+    lse_ptr,
+    n_chunks,
+):
+    """lse[row] = gmax + log(sum_c s_c * exp(m_c - gmax)), chunks in pinned order."""
+    row = tl.program_id(0).to(tl.int64)
+    base = row * n_chunks
+    gmax = float("-inf")
+    for c in range(n_chunks):
+        gmax = tl.maximum(gmax, tl.load(m_ptr + base + c))
+    acc = 0.0
+    for c in range(n_chunks):
+        acc += tl.load(s_ptr + base + c) * tl.exp(tl.load(m_ptr + base + c) - gmax)
+    tl.store(lse_ptr + row, gmax + tl.log(acc))
+
+
+def _bi_lm_head_chunk_gemm_fp32(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
+    """Launch the family's persistent matmul with the shape-keyed bf16 config and
+    an fp32 output buffer (the fp32 store path keeps the raw accumulator bits)."""
+    NUM_SMS = torch.cuda.get_device_properties(a.device).multi_processor_count
+    M, K = a.shape
+    _, N = b.shape
+
+    def grid(META):
+        return (min(NUM_SMS, triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])),)
+
+    def _launch(config):
+        matmul_kernel_persistent[grid](
+            a,
+            b,
+            out,
+            None,
+            M,
+            N,
+            K,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            out.stride(0),
+            out.stride(1),
+            NUM_SMS=NUM_SMS,
+            A_LARGE=a.numel() > 2**31,
+            B_LARGE=b.numel() > 2**31,
+            C_LARGE=out.numel() > 2**31,
+            HAS_BIAS=False,
+            **config,
+        )
+
+    _launch_with_config_fallback(_launch, a.dtype, M, N, K, out_itemsize=out.element_size())
+
+
+def bi_lm_head_selected_logprob(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    token_ids: torch.Tensor,
+    temperature: Optional[torch.Tensor] = None,
+    vocab_chunk: int = BI_LM_HEAD_VOCAB_CHUNK,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-token ``log p(token_ids)`` for the LM head, batch-invariant and
+    cross-engine bit-exact (the K3 lm-head contract).
+
+    Args:
+        hidden: ``[N, H]`` bf16 hidden states (pre lm-head).
+        weight: ``[V, H]`` bf16 lm-head weight (kept resident in bf16; no fp32
+            copy is materialized).
+        token_ids: ``[N]`` integer token ids to score (callers must pre-clamp
+            ignored positions to a valid id and mask outputs downstream).
+        temperature: optional ``[N]`` fp32 per-row temperatures (> 0). Logits
+            are scaled by ``1/temperature[row]`` inside the stats kernel (the
+            divide runs in-kernel, so engines sharing the contract compute the
+            identical scale). ``None`` is the exact temperature-1.0 path.
+
+    Returns:
+        ``(logprob, lse, selected)`` — all ``[N]`` fp32; ``logprob = selected - lse``
+        (temperature-scaled when ``temperature`` is given).
+    """
+    assert hidden.ndim == 2 and weight.ndim == 2, "hidden and weight must be 2D"
+    assert hidden.shape[1] == weight.shape[1], "hidden dim mismatch"
+    assert hidden.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16, (
+        "the lm-head contract takes bf16 hidden/weight (fp32 upcast is exact inside the GEMM)"
+    )
+    assert hidden.is_cuda, "CUDA only"
+
+    hidden = hidden.contiguous()
+    token_ids = token_ids.contiguous().to(device=hidden.device, dtype=torch.int64)
+    n_tokens = hidden.shape[0]
+    vocab = weight.shape[0]
+    n_chunks = (vocab + vocab_chunk - 1) // vocab_chunk
+    if temperature is not None:
+        temperature = temperature.reshape(-1).to(device=hidden.device, dtype=torch.float32).contiguous()
+        assert temperature.shape[0] == n_tokens, "temperature must be per-row [N]"
+        assert bool((temperature > 0).all()), "temperature must be > 0"
+
+    chunk_max = torch.empty((n_tokens, n_chunks), dtype=torch.float32, device=hidden.device)
+    chunk_sumexp = torch.empty_like(chunk_max)
+    selected = torch.zeros(n_tokens, dtype=torch.float32, device=hidden.device)
+    lse = torch.empty(n_tokens, dtype=torch.float32, device=hidden.device)
+    logits_buf = torch.empty((n_tokens, vocab_chunk), dtype=torch.float32, device=hidden.device)
+
+    for chunk_idx, col_start in enumerate(range(0, vocab, vocab_chunk)):
+        col_end = min(col_start + vocab_chunk, vocab)
+        n_cols = col_end - col_start
+        logits_c = logits_buf[:, :n_cols]
+        # [H, C] transposed view of the resident bf16 weight — the persistent
+        # kernel takes explicit strides, so no copy is made.
+        _bi_lm_head_chunk_gemm_fp32(hidden, weight[col_start:col_end].t(), logits_c)
+        _lm_head_chunk_stats_kernel[(n_tokens,)](
+            logits_c,
+            token_ids,
+            selected,
+            chunk_max,
+            chunk_sumexp,
+            temperature,
+            logits_c.stride(0),
+            n_cols,
+            col_start,
+            chunk_idx,
+            n_chunks,
+            BLOCK_SIZE=_BI_LM_HEAD_STATS_BLOCK,
+            HAS_TEMP=temperature is not None,
+        )
+
+    _lm_head_lse_merge_kernel[(n_tokens,)](chunk_max, chunk_sumexp, lse, n_chunks)
+    # In exact math the selected logit never exceeds the LSE; clamp the one-ulp
+    # fp boundary case (p~1 tokens) so contract logprobs are provably <= 0.
+    return torch.clamp_max(selected - lse, 0.0), lse, selected
+
+
+# --------------------------------------------------------------------------- #
+# Batch-invariant MoE router GEMM (the K3 router contract)
+#
+# Vendored identically in xorl and SGLang so the MoE gate/router logits are
+# computed through ONE reduction tree cross-engine. Unlike the capture/replay
+# lane, live training routes independently of serving (no routing replay), so a
+# ~1e-10..1e-4 router-logit reduction-order diff between the two engines' GEMMs
+# can flip the top-k expert selection on razor-edge tokens and cause large,
+# rare-token logprob divergence. This kernel removes that last term:
+#   - bf16 hidden [N, H] @ bf16 gate weight [E, H]^T -> fp32 logits [N, E]
+#   - ``matmul_kernel_persistent`` with a pinned tile config and an fp32 output
+#     buffer (same discipline as the lm-head contract). bf16xbf16 products are
+#     exact in fp32, so reading both operands in bf16 with tensor-core fp32
+#     accumulation equals an fp32 GEMM over their (exact) fp32 upcasts, but with
+#     the reduction order pinned identically in both engines — and without the
+#     fp32 weight/activation copies the eager fp32-router paths materialize.
+# num_experts is small (a single BLOCK_SIZE_N tile for the common E <= 128), so
+# the whole GEMM is one persistent launch. The config below is part of the
+# contract; changing any constant changes the bits.
+# Enable via XORL_MOE_BI_ROUTER=1 (xorl) / SGLANG_BI_ROUTER=1 (sglang).
+# Forward-only; the trainer wraps it in an autograd.Function with a closed-form
+# (order-insensitive) backward — gradients do not enter the forward K3.
+# --------------------------------------------------------------------------- #
+
+_BI_ROUTER_GEMM_CONFIG = {
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 64,
+    "GROUP_SIZE_M": 8,
+    "num_stages": 3,
+    "num_warps": 8,
+}
+
+
+def bi_router_gemm(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """fp32 MoE router logits ``[N, E]`` from bf16 hidden ``[N, H]`` and bf16 gate
+    weight ``[E, H]`` (the K3 router contract).
+
+    One persistent bf16-in / fp32-accumulate / fp32-out GEMM with a pinned launch
+    config, vendored identically in xorl and SGLang so the router logits (and
+    therefore the top-k expert selection) are bitwise identical cross-engine.
+    bf16xbf16 products are exact in fp32, so this equals an fp32 GEMM over the
+    upcast operands the eager fp32-router paths materialize — minus the fp32
+    weight/activation copies and with a reduction order that no longer depends on
+    the backend GEMM.
+
+    Args:
+        hidden: ``[N, H]`` bf16 hidden states (pre-gate).
+        weight: ``[E, H]`` bf16 gate weight (kept resident in bf16; no fp32 copy).
+
+    Returns:
+        ``[N, E]`` fp32 router logits.
+    """
+    assert hidden.ndim == 2 and weight.ndim == 2, "hidden and weight must be 2D"
+    assert hidden.shape[1] == weight.shape[1], "hidden dim mismatch"
+    assert hidden.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16, (
+        "the router contract takes bf16 hidden/weight (fp32 upcast is exact inside the GEMM)"
+    )
+    assert hidden.is_cuda, "CUDA only"
+
+    hidden = hidden.contiguous()
+    weight = weight.contiguous()
+    n_tokens = hidden.shape[0]
+    num_experts = weight.shape[0]
+    logits = torch.empty((n_tokens, num_experts), dtype=torch.float32, device=hidden.device)
+    if n_tokens == 0:
+        return logits
+
+    # [H, E] transposed view of the resident bf16 gate weight — the persistent
+    # kernel takes explicit strides, so no copy is made.
+    b = weight.t()
+    NUM_SMS = torch.cuda.get_device_properties(hidden.device).multi_processor_count
+    M, K = hidden.shape
+    N = num_experts
+
+    def grid(META):
+        return (min(NUM_SMS, triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])),)
+
+    matmul_kernel_persistent[grid](
+        hidden,
+        b,
+        logits,
+        None,
+        M,
+        N,
+        K,
+        hidden.stride(0),
+        hidden.stride(1),
+        b.stride(0),
+        b.stride(1),
+        logits.stride(0),
+        logits.stride(1),
+        NUM_SMS=NUM_SMS,
+        A_LARGE=hidden.numel() > 2**31,
+        B_LARGE=weight.numel() > 2**31,
+        C_LARGE=logits.numel() > 2**31,
+        HAS_BIAS=False,
+        **_BI_ROUTER_GEMM_CONFIG,
+    )
+    return logits
+
+
+def bi_router_topk_weights(
+    topk_vals: torch.Tensor,
+    norm_topk_prob: bool = True,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Renormalize the gathered top-k router scores in a fixed reduction order,
+    then cast — the second half of the K3 router contract.
+
+    ``bi_router_gemm`` makes the router logits (and therefore ``torch.topk``
+    selection and the gathered top-k softmax scores) bitwise identical
+    cross-engine, but the stock renorm ``vals / vals.sum(dim=-1, keepdim=True)``
+    is not: the small last-dim reduction ``sum(dim=-1)`` uses a build-dependent
+    tree order, so the divisor can differ by ~1 fp32 ulp between the trainer's
+    and the server's torch/triton, occasionally flipping the final bf16 weight
+    on rare tokens. Elementwise ops (add, divide, round-to-bf16) are IEEE
+    correctly-rounded and build-invariant, so accumulating the divisor with a
+    pinned left-to-right order makes the top-k weights bit-identical too.
+
+    Args:
+        topk_vals: ``[N, top_k]`` fp32 gathered top-k router scores (softmax
+            probabilities on the softmax path).
+        norm_topk_prob: renormalize the top-k slice to sum to 1 (Qwen3 MoE
+            default). When False the scores are only cast (already bit-identical
+            cross-engine, since the softmax/top-k that produced them are).
+        out_dtype: routing-weight dtype (the model activation dtype, bf16).
+
+    Returns:
+        ``[N, top_k]`` ``out_dtype`` routing weights.
+    """
+    assert topk_vals.dtype == torch.float32, "the router contract renorms fp32 top-k scores"
+    if norm_topk_prob:
+        denom = topk_vals[..., 0]
+        for k in range(1, topk_vals.shape[-1]):
+            denom = denom + topk_vals[..., k]
+        topk_vals = topk_vals / denom.unsqueeze(-1)
+    return topk_vals.to(out_dtype)
+
+
 _ONES_CACHE: Dict[Tuple[str, int | None, torch.dtype, int], torch.Tensor] = {}
 
 
@@ -1314,6 +1821,7 @@ def _get_or_make_ones(input: torch.Tensor, normalized_shape: list[int]) -> torch
 
 
 def _rms_norm_aten_compat(input, normalized_shape, weight=None, eps=None):
+    _guard_interpose_no_grad("aten::rms_norm", input, weight)
     normalized_shape = [int(dim) for dim in normalized_shape]
     if len(normalized_shape) != 1 or input.shape[-1] != normalized_shape[0]:
         raise NotImplementedError("Batch-invariant RMSNorm only supports last dimension")
@@ -1321,7 +1829,9 @@ def _rms_norm_aten_compat(input, normalized_shape, weight=None, eps=None):
         weight = _get_or_make_ones(input, normalized_shape)
     if eps is None:
         eps = torch.finfo(input.dtype).eps
-    return rms_norm_batch_invariant(input, weight, eps=eps)
+    # The interpose IS the no-residual family: every F.rms_norm that reaches it
+    # is a no-residual site (qk-norm, layer-0 input norm) by the family contract.
+    return bi_rms_norm(input, weight, eps=eps, family=RMS_NORM_FAMILY_NO_RESIDUAL)
 
 
 def _mm_dtype_compat(a, b, out_dtype):
@@ -1411,6 +1921,166 @@ def set_batch_invariant_mode(enabled: bool = True):
             enable_batch_invariant_mode()
         else:
             disable_batch_invariant_mode()
+
+
+_TRUNK_LINEAR_NAMES = (
+    "qkv_proj",
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_up_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    # Qwen2/3.5-MoE shared-expert sigmoid gate: serving contracts it through the
+    # global interpose (plain nn.Linear -> aten::mm), so the trunk lane must too.
+    "shared_expert_gate",
+)
+
+_TRUNK_LINEAR_CONTRACT_ACTIVE = False
+
+
+def is_trunk_linear_contract_enabled() -> bool:
+    """True once :func:`wrap_trunk_linears_batch_invariant` armed the contract lane.
+
+    RMSNorm dispatch keys off this to route no-residual (family-1) norms through
+    the serving batch-invariant kernel (the qk-norm term of the K3 contract).
+    """
+    return _TRUNK_LINEAR_CONTRACT_ACTIVE
+
+
+def set_trunk_linear_contract(enabled: bool) -> None:
+    global _TRUNK_LINEAR_CONTRACT_ACTIVE
+    _TRUNK_LINEAR_CONTRACT_ACTIVE = enabled
+
+
+class _BatchInvariantTrunkLinearFn(torch.autograd.Function):
+    """Forward through the batch-invariant persistent GEMM; backward stays cuBLAS."""
+
+    @staticmethod
+    def forward(ctx, input, weight, bias):
+        if input.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+            raise RuntimeError(
+                f"XORL_BI_TRUNK_LINEAR contract is bf16-only; got input={input.dtype}, weight={weight.dtype} "
+                "(XORL-244)."
+            )
+        ctx.save_for_backward(input, weight)
+        ctx.has_bias = bias is not None
+        x2d = input.reshape(-1, input.shape[-1])
+        out = matmul_persistent(x2d, weight.t(), bias=bias)
+        return out.reshape(*input.shape[:-1], weight.shape[0])
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, weight = ctx.saved_tensors
+        go2d = grad_output.reshape(-1, grad_output.shape[-1])
+        grad_input = grad_weight = grad_bias = None
+        if ctx.needs_input_grad[0]:
+            grad_input = (go2d @ weight).reshape_as(input)
+        if ctx.needs_input_grad[1]:
+            grad_weight = go2d.t() @ input.reshape(-1, input.shape[-1])
+        if ctx.has_bias and ctx.needs_input_grad[2]:
+            grad_bias = go2d.sum(dim=0)
+        return grad_input, grad_weight, grad_bias
+
+
+def wrap_trunk_linears_batch_invariant(
+    model: torch.nn.Module, names: Tuple[str, ...] = _TRUNK_LINEAR_NAMES
+) -> Dict[str, int]:
+    """Route ONLY transformer-trunk nn.Linear forwards through the batch-invariant GEMM.
+
+    Module-scoped alternative to enable_batch_invariant_mode(): forward bits match the
+    serving-side matmul_persistent contract while backward/optimizer/loss stay on cuBLAS.
+
+    Selection is explicit: a module is wrapped iff its leaf name is in ``names`` AND it is
+    exactly ``torch.nn.Linear``. lm_head/embeddings never match the name set; routed MoE
+    experts (FQN containing ``.experts.``) are skipped — they are contracted through the
+    fused sglang expert path. LoRA/QLoRA-wrapped modules and FP8/TE/custom Linear
+    subclasses RAISE: silently skipping them would void the bitwise contract the flag
+    promises. Idempotent (already-wrapped modules are left alone).
+
+    Returns ``{leaf_name: wrapped_count}`` and arms the contract lane
+    (see :func:`is_trunk_linear_contract_enabled`).
+    """
+    import types  # noqa: PLC0415
+
+    from xorl.lora.fold import lora_merged_forward_enabled  # noqa: PLC0415
+    from xorl.lora.modules.base import LoraModule  # noqa: PLC0415
+    from xorl.lora.modules.linear import LoraLinear  # noqa: PLC0415
+
+    if is_batch_invariant_mode_enabled():
+        raise RuntimeError(
+            "XORL_BI_TRUNK_LINEAR cannot be combined with the global batch-invariant interpose "
+            "(XORL_BATCH_INVARIANT_MATMUL): the wrapped backward would silently ride the interposed "
+            "aten::mm instead of cuBLAS. Pick one lane (XORL-244)."
+        )
+
+    def _forward(self, input):
+        return _BatchInvariantTrunkLinearFn.apply(input, self.weight, self.bias)
+
+    def _forward_lora_merged(self, input):
+        # Merged-forward LoRA lane: the BI GEMM runs on the canonically folded
+        # weight (identical bits to a serving engine that received W'); backward
+        # flows dW' through the straight-through fold into the LoRA factors.
+        return _BatchInvariantTrunkLinearFn.apply(input, self.merged_weight_for_forward(), self.bias)
+
+    wrapped: Dict[str, int] = {}
+    already_wrapped = 0
+    for module_name, module in model.named_modules():
+        leaf = module_name.rsplit(".", 1)[-1]
+        if leaf not in names:
+            continue
+        if ".experts." in f".{module_name}.":
+            continue
+        if type(module) is LoraLinear and lora_merged_forward_enabled():
+            # Merged-forward contract lane: the adapted linear serves and trains
+            # through the folded weight, so the trunk contract composes.
+            if module.weight.dtype not in (torch.bfloat16, torch.float32):
+                raise RuntimeError(
+                    f"XORL_BI_TRUNK_LINEAR: {module_name} weight is {module.weight.dtype}; the trunk "
+                    "contract is bf16-only (XORL-244)."
+                )
+            if getattr(module, "_xorl_bi_trunk_wrapped", False):
+                already_wrapped += 1
+                continue
+            module.forward = types.MethodType(_forward_lora_merged, module)
+            module._xorl_bi_trunk_wrapped = True
+            wrapped[leaf] = wrapped.get(leaf, 0) + 1
+            continue
+        if isinstance(module, LoraModule):
+            raise NotImplementedError(
+                f"XORL_BI_TRUNK_LINEAR: {module_name} is adapter-wrapped ({type(module).__qualname__}); "
+                "the trunk contract composes with LoRA only under XORL_LORA_MERGED_FORWARD=1 "
+                "(plain LoraLinear) — set the merged-forward flag or exclude the adapter (XORL-244)."
+            )
+        if type(module) is not torch.nn.Linear:
+            raise NotImplementedError(
+                f"XORL_BI_TRUNK_LINEAR: {module_name} is {type(module).__qualname__}, not a plain "
+                "nn.Linear; fp8/te/custom linears are outside the bf16 trunk contract (XORL-244)."
+            )
+        if module.weight.dtype not in (torch.bfloat16, torch.float32):
+            # fp32 is allowed here only as a mixed-precision master: FSDP2's mp_policy
+            # casts it to bf16 before forward, and the runtime guard in
+            # _BatchInvariantTrunkLinearFn enforces bf16 on the actual GEMM operands.
+            raise RuntimeError(
+                f"XORL_BI_TRUNK_LINEAR: {module_name} weight is {module.weight.dtype}; the trunk contract "
+                "is bf16-only (XORL-244)."
+            )
+        if getattr(module, "_xorl_bi_trunk_wrapped", False):
+            already_wrapped += 1
+            continue
+        module.forward = types.MethodType(_forward, module)
+        module._xorl_bi_trunk_wrapped = True
+        wrapped[leaf] = wrapped.get(leaf, 0) + 1
+
+    if not wrapped and not already_wrapped:
+        raise RuntimeError(
+            "XORL_BI_TRUNK_LINEAR=1 matched no trunk linears; expected leaf names "
+            f"{sorted(names)} — wire the model's projections or drop the flag (XORL-244)."
+        )
+    set_trunk_linear_contract(True)
+    return wrapped
 
 
 AttentionBlockSize = namedtuple("AttentionBlockSize", ["block_m", "block_n"])

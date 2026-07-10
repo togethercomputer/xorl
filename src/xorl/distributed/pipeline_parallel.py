@@ -18,6 +18,10 @@ GPU Layout (4 GPUs, PP=2, FSDP=2):
   | embed +        |       | layers N..M    |
   | layers 0..N    |       | + norm + head  |
   +----------------+       +----------------+
+
+Virtual stages (stages_per_rank >= 2) place multiple model chunks per rank:
+  loop style (Interleaved1F1B, InterleavedZeroBubble): rank r owns stages [r, r+p, r+2p, ...]
+  V style (ZBVZeroBubble, DualPipeV):                  rank r owns stages [r, 2p-1-r]
 """
 
 import copy
@@ -29,6 +33,7 @@ import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.pipelining import PipelineStage
 from torch.distributed.pipelining.schedules import (
+    PipelineScheduleSingle,
     _PipelineSchedule,
     get_schedule_class,
 )
@@ -46,7 +51,72 @@ __all__ = [
     "pipeline_module_split",
     "build_pp_stage",
     "build_pipeline_schedule",
+    "schedule_stage_style",
+    "stage_ids_for_rank",
+    "is_single_stage_schedule",
+    "schedule_splits_backward",
+    "validate_pp_schedule_config",
 ]
+
+
+# Schedules taking exactly one stage per rank use style "single"; multi-stage
+# schedules place chunks in "loop" or "v" order (must match torch's
+# generate_stage_to_rank_mapping so schedule-side P2P routing agrees).
+_SCHEDULE_STYLES = {
+    "gpipe": "single",
+    "1f1b": "single",
+    "interleaved1f1b": "loop",
+    "interleavedzerobubble": "loop",
+    "zbvzerobubble": "v",
+    "dualpipev": "v",
+}
+
+
+def schedule_stage_style(schedule_name: str) -> str:
+    """Return the stage-placement style ('single', 'loop', or 'v') for a schedule."""
+    key = schedule_name.lower()
+    if key not in _SCHEDULE_STYLES:
+        raise ValueError(f"Unsupported PP schedule '{schedule_name}'. Supported schedules: {sorted(_SCHEDULE_STYLES)}")
+    return _SCHEDULE_STYLES[key]
+
+
+def is_single_stage_schedule(schedule_name: str) -> bool:
+    """True when the schedule requires exactly one stage per rank (GPipe, 1F1B)."""
+    return issubclass(get_schedule_class(schedule_name), PipelineScheduleSingle)
+
+
+_BACKWARD_SPLIT_SCHEDULES = frozenset({"interleavedzerobubble", "zbvzerobubble", "dualpipev"})
+
+
+def schedule_splits_backward(schedule_name: str) -> bool:
+    """True for zero-bubble schedules that run separate dX (input) and dW (weight) backward passes."""
+    return schedule_name.lower() in _BACKWARD_SPLIT_SCHEDULES
+
+
+def stage_ids_for_rank(pp_rank: int, pp_size: int, num_stages: int, style: str) -> List[int]:
+    """Global stage indices owned by ``pp_rank``, matching torch's stage-to-rank mapping.
+
+    loop: rank r owns [r, r+p, r+2p, ...] (Interleaved1F1B, InterleavedZeroBubble).
+    v:    zigzag placement; for 2 stages/rank, rank r owns [r, 2p-1-r] (ZBV, DualPipeV).
+    """
+    if num_stages % pp_size != 0:
+        raise ValueError(f"num_stages ({num_stages}) must be divisible by pp_size ({pp_size})")
+    if style in ("single", "loop"):
+        if style == "single" and num_stages != pp_size:
+            raise ValueError(f"single-stage schedules require num_stages == pp_size, got {num_stages} != {pp_size}")
+        return list(range(pp_rank, num_stages, pp_size))
+    if style == "v":
+        # Mirror torch.distributed.pipelining._utils.generate_stage_to_rank_mapping(style="v").
+        stage_ids = []
+        rank_index = 0
+        for stage_index in range(num_stages):
+            if rank_index == pp_rank:
+                stage_ids.append(stage_index)
+            if (stage_index + 1) % pp_size == 0:
+                continue
+            rank_index += 1 if (stage_index // pp_size) % 2 == 0 else -1
+        return stage_ids
+    raise ValueError(f"Unknown stage placement style: {style!r}")
 
 
 def generate_llm_fqn_per_model_part(
@@ -57,6 +127,8 @@ def generate_llm_fqn_per_model_part(
     input_fqns: Optional[List[str]] = None,
     layer_prefix: str = "layers",
     output_fqns: Optional[List[str]] = None,
+    num_layers_in_first_stage: Optional[int] = None,
+    num_layers_in_last_stage: Optional[int] = None,
 ) -> List[List[str]]:
     """
     Programmatically generates module FQN names per model part.
@@ -72,6 +144,10 @@ def generate_llm_fqn_per_model_part(
         input_fqns: FQN list for input modules (default: ["tok_embeddings"])
         layer_prefix: FQN prefix for transformer layers (default: "layers")
         output_fqns: FQN list for output modules (default: ["norm", "output"])
+        num_layers_in_first_stage: Explicit decoder-layer count for stage 0
+            (Megatron-style override; takes precedence over input_weight)
+        num_layers_in_last_stage: Explicit decoder-layer count for the last stage
+            (takes precedence over output_weight)
 
     Returns:
         List of lists containing module FQN names for each model part
@@ -101,6 +177,50 @@ def generate_llm_fqn_per_model_part(
     if num_stages == 1:
         layer_names = [f"{layer_prefix}.{i}" for i in range(num_layers)]
         return [list(input_fqns) + layer_names + list(output_fqns)]
+
+    # Explicit first/last-stage layer counts (Megatron-style) take precedence
+    # over the weight heuristic; remaining layers are split evenly across the
+    # unpinned stages (remainder to earlier stages).
+    if num_layers_in_first_stage is not None or num_layers_in_last_stage is not None:
+        pinned_first = num_layers_in_first_stage is not None
+        pinned_last = num_layers_in_last_stage is not None
+        pinned_total = (num_layers_in_first_stage or 0) + (num_layers_in_last_stage or 0)
+        free_stages = num_stages - int(pinned_first) - int(pinned_last)
+        free_layers = num_layers - pinned_total
+        if free_layers < 0 or (free_stages == 0 and free_layers != 0):
+            raise ValueError(
+                f"num_layers_in_first_stage={num_layers_in_first_stage} + "
+                f"num_layers_in_last_stage={num_layers_in_last_stage} incompatible with "
+                f"num_layers={num_layers} across {num_stages} stages."
+            )
+        if free_stages > 0 and free_layers < free_stages:
+            raise ValueError(
+                f"Explicit stage layer counts leave {free_layers} layers for {free_stages} unpinned stages; "
+                f"each stage needs at least one layer."
+            )
+        layer_counts = []
+        base, extra = (free_layers // free_stages, free_layers % free_stages) if free_stages else (0, 0)
+        free_idx = 0
+        for stage_idx in range(num_stages):
+            if stage_idx == 0 and pinned_first:
+                layer_counts.append(num_layers_in_first_stage)
+            elif stage_idx == num_stages - 1 and pinned_last:
+                layer_counts.append(num_layers_in_last_stage)
+            else:
+                layer_counts.append(base + (1 if free_idx < extra else 0))
+                free_idx += 1
+        module_names_per_stage = []
+        current_layer = 0
+        for stage_idx, count in enumerate(layer_counts):
+            stage_modules = []
+            if stage_idx == 0:
+                stage_modules.extend(input_fqns)
+            stage_modules.extend(f"{layer_prefix}.{i}" for i in range(current_layer, current_layer + count))
+            current_layer += count
+            if stage_idx == num_stages - 1:
+                stage_modules.extend(output_fqns)
+            module_names_per_stage.append(stage_modules)
+        return module_names_per_stage
 
     # Calculate effective layers including weights
     num_effective_layers = num_layers + input_weight + output_weight
@@ -204,11 +324,14 @@ def _pp_forward(self, x):
     # We must NOT record routing decisions during shape inference — they
     # would pollute the replay cache with garbage entries, causing
     # pop_backward() to return wrong routing during checkpoint recompute.
-    # When grad is disabled (shape inference or eval), set stage to None
-    # so MoE blocks use standard routing without recording.
+    # A scheduled forward is either grad-enabled (training) or explicitly
+    # flagged forward-only (``_pp_forward_only``, set by forward_only_pp for
+    # eval/ref-logprob passes, whose stages skip shape inference via meta IO
+    # args); anything else is shape inference — no recording, no metadata.
+    in_scheduled_forward = torch.is_grad_enabled() or getattr(self, "_pp_forward_only", False)
     old_stage = get_replay_stage()
-    if not torch.is_grad_enabled():
-        # Shape inference or eval — don't record/replay
+    if not in_scheduled_forward:
+        # Shape inference — don't record/replay
         set_replay_stage(None)
     elif old_stage == "replay_backward":
         if is_r3_mode():
@@ -217,11 +340,11 @@ def _pp_forward(self, x):
             set_replay_stage("record")
 
     # --- Pop per-microbatch metadata (set by training loop) ---
-    # Skip during shape inference (no_grad) to avoid consuming queue entries
-    # that are needed for the actual training forward passes.
+    # Skip during shape inference to avoid consuming queue entries that are
+    # needed for the actual scheduled forward passes.
     position_ids = None
     extra_kwargs = {}
-    if torch.is_grad_enabled():
+    if in_scheduled_forward:
         metadata_queue = getattr(self, "_pp_batch_metadata", None)
         if metadata_queue:
             metadata = metadata_queue.popleft()
@@ -330,11 +453,14 @@ def pipeline_module_split(
     device: torch.device,
     module_names_per_stage: List[List[str]],
     always_keep_fqns: Optional[List[str]] = None,
+    stage_style: str = "single",
 ) -> tuple:
     """
     Split a model into pipeline stages based on specified module FQN names.
 
-    Supports GPipe and 1F1B schedules (one stage per rank).
+    Supports one stage per rank (GPipe, 1F1B) and virtual stages
+    (stages_per_rank >= 2) with loop-style (Interleaved1F1B,
+    InterleavedZeroBubble) or V-style (ZBVZeroBubble, DualPipeV) placement.
 
     Ported from torchtitan's pipeline_module_split, extended with:
     - Recursive pruning for nested HF model structures
@@ -350,21 +476,27 @@ def pipeline_module_split(
         pp_mesh: Pipeline parallel device mesh
         device: Target device
         module_names_per_stage: List of lists of module FQN names per stage
-                                (length must equal pp_degree; one stage per rank)
+                                (length = pp_degree * stages_per_rank)
         always_keep_fqns: Module FQNs to keep on every stage (e.g., ["model.rotary_emb"])
+        stage_style: Stage placement ('single', 'loop', or 'v'); must match the
+                     schedule this rank's stages will run under
 
     Returns:
         Tuple of (stages, model_parts) where stages are PipelineStage objects
-        and model_parts are the corresponding pruned models
+        and model_parts are the corresponding pruned models, ordered by this
+        rank's stage ids as produced by ``stage_ids_for_rank``
     """
     pp_rank = pp_mesh.get_local_rank()
     pp_degree = pp_mesh.size()
     num_stages = len(module_names_per_stage)
 
-    if num_stages != pp_degree:
+    if num_stages % pp_degree != 0:
+        raise ValueError(f"module_names_per_stage has {num_stages} entries, not divisible by pp_degree={pp_degree}.")
+    if stage_style == "single" and num_stages != pp_degree:
         raise ValueError(
             f"module_names_per_stage has {num_stages} entries but pp_degree={pp_degree}. "
-            f"GPipe and 1F1B require exactly one stage per rank."
+            f"GPipe and 1F1B require exactly one stage per rank; use an interleaved/ZB "
+            f"schedule for virtual stages."
         )
 
     always_keep = set(always_keep_fqns) if always_keep_fqns else set()
@@ -377,33 +509,40 @@ def pipeline_module_split(
             "Set tie_word_embeddings: false in the model config."
         )
 
-    module_names = module_names_per_stage[pp_rank]
-    model = copy.deepcopy(whole_model)
-    fqns_to_keep = set(module_names) | always_keep
+    stage_ids = stage_ids_for_rank(pp_rank, pp_degree, num_stages, stage_style)
 
-    # Recursive pruning handles nested HF model structures
-    _recursive_prune(model, "", fqns_to_keep)
+    stages, model_parts = [], []
+    for stage_idx in stage_ids:
+        module_names = module_names_per_stage[stage_idx]
+        model = copy.deepcopy(whole_model)
+        fqns_to_keep = set(module_names) | always_keep
 
-    model._pp_is_first = pp_rank == 0
-    model._pp_is_last = pp_rank == pp_degree - 1
-    model._pp_original_forward = model.forward
-    model.forward = types.MethodType(_pp_forward, model)
+        # Recursive pruning handles nested HF model structures
+        _recursive_prune(model, "", fqns_to_keep)
 
-    stage = PipelineStage(
-        model,
-        pp_rank,
-        num_stages,
-        device,
-        group=pp_mesh.get_group("pp"),
-    )
-    logger.info(f"PP rank {pp_rank} built stage {pp_rank} with modules {module_names}")
+        model._pp_is_first = stage_idx == 0
+        model._pp_is_last = stage_idx == num_stages - 1
+        model._pp_stage_idx = stage_idx
+        model._pp_original_forward = model.forward
+        model.forward = types.MethodType(_pp_forward, model)
 
-    return [stage], [model]
+        stage = PipelineStage(
+            model,
+            stage_idx,
+            num_stages,
+            device,
+            group=pp_mesh.get_group("pp"),
+        )
+        logger.info(f"PP rank {pp_rank} built stage {stage_idx} with modules {module_names}")
+        stages.append(stage)
+        model_parts.append(model)
+
+    return stages, model_parts
 
 
 def build_pp_stage(
     model_part: nn.Module,
-    pp_rank: int,
+    stage_index: int,
     num_stages: int,
     device: torch.device,
     pp_group,
@@ -425,7 +564,7 @@ def build_pp_stage(
     """
     return PipelineStage(
         model_part,
-        pp_rank,
+        stage_index,
         num_stages,
         device,
         input_args=input_args,
@@ -434,7 +573,35 @@ def build_pp_stage(
     )
 
 
-_SUPPORTED_PP_SCHEDULES = {"gpipe", "1f1b"}
+_SUPPORTED_PP_SCHEDULES = frozenset(_SCHEDULE_STYLES)
+
+
+def validate_pp_schedule_config(schedule_name: str, virtual_stages: int, n_microbatches: int, pp_size: int) -> None:
+    """Fail fast on schedule/virtual-stage/microbatch combinations torch would reject at runtime."""
+    style = schedule_stage_style(schedule_name)
+    if style == "single" and virtual_stages != 1:
+        raise ValueError(
+            f"Schedule '{schedule_name}' supports exactly one stage per rank; "
+            f"got pipeline_parallel_virtual_stages={virtual_stages}. "
+            f"Use Interleaved1F1B/InterleavedZeroBubble (any) or ZBVZeroBubble/DualPipeV (=2)."
+        )
+    if style == "v" and virtual_stages != 2:
+        raise ValueError(
+            f"Schedule '{schedule_name}' requires exactly 2 stages per rank "
+            f"(pipeline_parallel_virtual_stages=2), got {virtual_stages}."
+        )
+    if style == "loop":
+        # Interleaved schedules round microbatches over the PP group.
+        number_of_rounds = max(1, n_microbatches // pp_size)
+        if n_microbatches % number_of_rounds != 0:
+            raise ValueError(
+                f"Schedule '{schedule_name}' requires n_microbatches ({n_microbatches}) to be a multiple of "
+                f"the number of rounds ({number_of_rounds} = max(1, n_microbatches // pp_size))."
+            )
+    if schedule_name.lower() == "dualpipev" and n_microbatches < pp_size * virtual_stages:
+        raise ValueError(
+            f"DualPipeV requires n_microbatches >= num_stages ({pp_size * virtual_stages}), got {n_microbatches}."
+        )
 
 
 def build_pipeline_schedule(
@@ -444,13 +611,15 @@ def build_pipeline_schedule(
     schedule_name: str = "1F1B",
 ) -> _PipelineSchedule:
     """
-    Build a GPipe or 1F1B pipeline schedule (one stage per rank).
+    Build a pipeline schedule over this rank's stage(s).
 
     Args:
-        stages: List containing exactly one PipelineStage (one per rank)
+        stages: This rank's PipelineStage list — exactly one for GPipe/1F1B,
+                stages_per_rank entries (stage-id order) for multi-stage schedules
         n_microbatches: Number of microbatches
-        loss_fn: Loss function (only called on last stage)
-        schedule_name: "GPipe" or "1F1B" (case-insensitive)
+        loss_fn: Loss function (only called on the stage where is_last holds)
+        schedule_name: One of GPipe, 1F1B, Interleaved1F1B, InterleavedZeroBubble,
+                       ZBVZeroBubble, DualPipeV (case-insensitive)
 
     Returns:
         Pipeline schedule object
@@ -461,11 +630,14 @@ def build_pipeline_schedule(
         )
 
     schedule_class = get_schedule_class(schedule_name)
+    single = issubclass(schedule_class, PipelineScheduleSingle)
+    if single and len(stages) != 1:
+        raise ValueError(f"Schedule '{schedule_name}' takes exactly one stage per rank, got {len(stages)}.")
     schedule = schedule_class(
-        stages[0],
+        stages[0] if single else stages,
         n_microbatches=n_microbatches,
         loss_fn=loss_fn,
         scale_grads=False,
     )
-    logger.info(f"Pipeline schedule: {schedule_name}, n_microbatches={n_microbatches}")
+    logger.info(f"Pipeline schedule: {schedule_name}, n_microbatches={n_microbatches}, stages_per_rank={len(stages)}")
     return schedule

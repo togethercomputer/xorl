@@ -293,6 +293,7 @@ class TrainState:
     epoch: int = 0
     start_step: int = 0  # step within current epoch to resume from
     loss_history: List[float] = field(default_factory=list)
+    grad_norm_history: List[float] = field(default_factory=list)
 
     def state_dict(self) -> Dict[str, Any]:
         return {
@@ -300,6 +301,7 @@ class TrainState:
             "epoch": self.epoch,
             "start_step": self.start_step,
             "loss_history": self.loss_history,
+            "grad_norm_history": self.grad_norm_history,
         }
 
     def load_state_dict(self, d: Dict[str, Any]) -> None:
@@ -307,6 +309,7 @@ class TrainState:
         self.epoch = d.get("epoch", 0)
         self.start_step = d.get("start_step", 0)
         self.loss_history = d.get("loss_history", [])
+        self.grad_norm_history = d.get("grad_norm_history", [])
 
 
 # ---------------------------------------------------------------------------
@@ -390,9 +393,7 @@ class Trainer:
             from xorl.ops.batch_invariant_ops import enable_batch_invariant_mode  # noqa: PLC0415
 
             enable_batch_invariant_mode()
-            logger.info_rank0(
-                "XORL_BATCH_INVARIANT_MATMUL=1: enabled SGLang-compatible batch-invariant ops"
-            )
+            logger.info_rank0("XORL_BATCH_INVARIANT_MATMUL=1: enabled SGLang-compatible batch-invariant ops")
 
         if args.train.global_rank == 0:
             save_args(args, args.train.output_dir)
@@ -685,6 +686,7 @@ class Trainer:
             torch_dtype=model_dtype,
             attn_implementation=args.model.attn_implementation,
             moe_implementation=args.model.moe_implementation,
+            moe_routing_weights_before_down=args.model.moe_routing_weights_before_down,
             ep_dispatch=args.model.ep_dispatch,
             train_router=args.model.train_router,
             record_routing_weights=args.model.record_routing_weights,
@@ -822,6 +824,16 @@ class Trainer:
             enable_mixed_precision=args.train.enable_mixed_precision,
         )
 
+        if os.environ.get("XORL_BI_TRUNK_LINEAR", "0") == "1":
+            from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415
+
+            wrapped = wrap_trunk_linears_batch_invariant(self.model)
+            pattern = ", ".join(f"{name}x{count}" for name, count in sorted(wrapped.items()))
+            logger.info_rank0(
+                f"XORL_BI_TRUNK_LINEAR=1: wrapped {sum(wrapped.values())} trunk linears "
+                f"(fwd batch-invariant, bwd cuBLAS; qk-norm on the family-1 BI kernel): {pattern}"
+            )
+
         # Save pre-hook before parallelization (some models register optimizer hooks)
         self._optimizer_pre_hook_fn = getattr(self.model, "get_optimizer_pre_hook", None)
 
@@ -918,6 +930,11 @@ class Trainer:
             enable_backward_prefetch=args.train.enable_backward_prefetch,
             load_weights_mode=args.train.load_weights_mode,
             pp_schedule=args.train.pipeline_parallel_schedule if args.train.pipeline_parallel_size > 1 else None,
+            pp_virtual_stages=args.train.pipeline_parallel_virtual_stages,
+            pp_input_weight=args.train.pipeline_parallel_input_weight,
+            pp_output_weight=args.train.pipeline_parallel_output_weight,
+            pp_num_layers_in_first_stage=args.train.pipeline_parallel_num_layers_in_first_stage,
+            pp_num_layers_in_last_stage=args.train.pipeline_parallel_num_layers_in_last_stage,
             reshard_after_forward=args.train.reshard_after_forward,
             fsdp_sharded_lm_head_loss=args.train.fsdp_sharded_lm_head_loss,
             moe_grad_reduce_mode=args.train.moe_grad_reduce_mode,
@@ -938,12 +955,14 @@ class Trainer:
         self.model_parts = None
         self.has_first_stage = False
         self.has_last_stage = False
+        self.pp_num_stages = 0
         if self.pp_enabled:
             self.pp_stages = build_result["stages"]
             self.model_parts = build_result["model_parts"]
             self.has_first_stage = build_result["has_first_stage"]
             self.has_last_stage = build_result["has_last_stage"]
-            self.model = self.model_parts[0]  # primary model for optimizer etc.
+            self.pp_num_stages = self.pp_stages[0].num_stages
+            self.model = self.model_parts[0]  # primary model for config access etc.
         else:
             self.model = build_result
 
@@ -953,57 +972,76 @@ class Trainer:
 
         # Freeze non-LoRA params for plain LoRA (QLoRA does this in _deferred_qlora_quantize)
         if args.lora.enable_lora and not args.lora.enable_qlora:
-            for name, param in self.model.named_parameters():
-                if "lora_A" not in name and "lora_B" not in name:
-                    param.requires_grad = False
+            for part in self._all_model_parts():
+                for name, param in part.named_parameters():
+                    if "lora_A" not in name and "lora_B" not in name:
+                        param.requires_grad = False
 
         if args.model.freeze_router:
-            frozen = freeze_deepseek_v3_router_parameters(self.model)
-            if frozen == 0:
-                for name, param in self.model.named_parameters():
-                    if ".gate.weight" in name:
-                        param.requires_grad = False
-                        frozen += 1
+            frozen = 0
+            for part in self._all_model_parts():
+                part_frozen = freeze_deepseek_v3_router_parameters(part)
+                if part_frozen == 0:
+                    for name, param in part.named_parameters():
+                        if ".gate.weight" in name:
+                            param.requires_grad = False
+                            part_frozen += 1
+                frozen += part_frozen
             if frozen > 0:
                 logger.info_rank0(f"Froze {frozen} MoE router (gate) parameters")
+
+    def _all_model_parts(self) -> List[torch.nn.Module]:
+        """All local model chunks: PP virtual stages own several, else just self.model."""
+        return list(self.model_parts) if self.pp_enabled else [self.model]
+
+    def _checkpoint_model_state(self):
+        """Model object handed to the checkpointer: the parts list under PP virtual
+        stages (ModelState/OptimizerState merge per-part state dicts), else the model."""
+        parts = self._all_model_parts()
+        return parts if len(parts) > 1 else self.model
 
     def _deferred_qlora_quantize(self) -> None:
         """After FSDP loads weights, quantize them into uint8 buffers."""
         args = self.args
+        parts = self._all_model_parts()
         if self.is_prequantized:
             logger.info("Starting pre-quantized weight loading...")
             helper.print_device_mem_info("VRAM before pre-quantized loading")
-            maybe_load_prequantized_qlora(self.model, args.model.model_path)
+            for part in parts:
+                maybe_load_prequantized_qlora(part, args.model.model_path)
             logger.info("Done pre-quantized weight loading, freezing non-LoRA params...")
         else:
             logger.info("Starting maybe_quantize_qlora...")
             helper.print_device_mem_info("VRAM before QLoRA quantization")
-            maybe_quantize_qlora(self.model)
+            for part in parts:
+                maybe_quantize_qlora(part)
             logger.info("Done maybe_quantize_qlora, starting MoE weight loading...")
             helper.print_device_mem_info("VRAM after QLoRA linear quantization")
-            maybe_load_and_quantize_moe_qlora(self.model, args.model.model_path)
+            for part in parts:
+                maybe_load_and_quantize_moe_qlora(part, args.model.model_path)
             logger.info("Done MoE weight loading, freezing non-LoRA params...")
             # Deregister packed_weight_f32 from FSDP2 (prevent mixed-precision corruption)
-            removed = _deregister_qlora_weights_from_fsdp(
-                self.model,
-                param_names=("packed_weight_f32",),
+            removed = sum(
+                _deregister_qlora_weights_from_fsdp(part, param_names=("packed_weight_f32",)) for part in parts
             )
             torch.cuda.empty_cache()
             if removed > 0:
                 logger.info(f"Deregistered {removed} packed_weight_f32 params from FSDP2")
 
         # Freeze all non-LoRA parameters
-        for name, param in self.model.named_parameters():
-            if "lora_A" not in name and "lora_B" not in name:
-                param.requires_grad = False
+        for part in parts:
+            for name, param in part.named_parameters():
+                if "lora_A" not in name and "lora_B" not in name:
+                    param.requires_grad = False
         helper.print_device_mem_info("VRAM usage after QLoRA quantization")
 
     def _build_optimizer(self) -> None:
         """Build optimizer and LR scheduler."""
         args = self.args
         self._use_distsignsgd = args.train.optimizer == "distsignsgd"
+        parts = self._all_model_parts()
         self.optimizer = build_optimizer(
-            self.model,
+            parts if len(parts) > 1 else self.model,
             lr=args.train.lr,
             weight_decay=args.train.weight_decay,
             fused=True,
@@ -1075,10 +1113,11 @@ class Trainer:
         # wrapper (unlike manual setattr which would break FSDP2's internal state).
         if args.train.load_weights_mode == "skip":
             logger.info_rank0("Materializing meta parameters to CUDA via to_empty()...")
-            self.model.to_empty(device=f"cuda:{args.train.local_rank}")
+            for part in self._all_model_parts():
+                part.to_empty(device=f"cuda:{args.train.local_rank}")
             logger.info_rank0("Meta parameters materialized.")
 
-        state = {"model": self.model, "extra_state": {}}
+        state = {"model": self._checkpoint_model_state(), "extra_state": {}}
         # Only include optimizer if the checkpoint has optimizer state (i.e., resuming training).
         # Model-only DCP checkpoints (from convert_checkpoint.py) won't have optimizer state.
         # load_optimizer=False forces a weights-only resume (optimizer re-initialized fresh / zero
@@ -1123,7 +1162,7 @@ class Trainer:
         """Initialize PP schedule cache (schedules are built lazily by seq_len)."""
         self._pp_schedule_cache: Dict[int, Any] = {}
 
-    def _build_pp_stage_io(self, example_input_ids: "Optional[torch.Tensor]"):
+    def _build_pp_stage_io(self, example_input_ids: "Optional[torch.Tensor]", stage_index: int, lm_head_in_loss: bool):
         """Build (input_args, output_args) meta tensors so PipelineStage skips its
         shape-inference forward (which deadlocks under Ulysses CP). Returns
         (None, None) when no example is available (runtime inference fallback)."""
@@ -1135,29 +1174,37 @@ class Trainer:
         h = cfg.hidden_size
         v = cfg.vocab_size
         dt = torch.bfloat16
-        # quack_linear PP loss consumes HIDDEN (lm_head fused into the loss fn),
-        # so the last stage outputs hidden [mbs,s,h] instead of logits [mbs,s,v]
-        # — this is what avoids the 8GB+ last-stage logits OOM at 248k vocab.
-        lm_head_in_loss = self.args.train.ce_mode == "quack_linear"
-        if self.ps.is_first_pp_stage:
+        if stage_index == 0:
             input_args = (torch.empty(mbs, s, dtype=example_input_ids.dtype, device="meta"),)
         else:
             input_args = (torch.empty(mbs, s, h, dtype=dt, device="meta"),)
-        if self.ps.is_last_pp_stage and not lm_head_in_loss:
+        # quack_linear PP loss consumes HIDDEN (lm_head fused into the loss fn),
+        # so the last stage outputs hidden [mbs,s,h] instead of logits [mbs,s,v]
+        # — this is what avoids the 8GB+ last-stage logits OOM at 248k vocab.
+        if stage_index == self.pp_num_stages - 1 and not lm_head_in_loss:
             output_args = (torch.empty(mbs, s, v, dtype=dt, device="meta"),)
         else:
             output_args = (torch.empty(mbs, s, h, dtype=dt, device="meta"),)
         return input_args, output_args
 
+    def _bucket_pp_seq_len(self, seq_len: int) -> int:
+        """Round the negotiated seq_len up to the configured bucket so the
+        schedule/P2P-buffer cache stays bounded (0 disables bucketing)."""
+        bucket = self.args.train.pp_seq_len_bucket_size
+        if bucket > 1:
+            return ((seq_len + bucket - 1) // bucket) * bucket
+        return seq_len
+
     def _get_pp_schedule(self, seq_len: int, example_input_ids: "Optional[torch.Tensor]" = None):
         """Return a cached PP schedule for the given seq_len, building if needed.
 
-        With pp_variable_seq_lengths=True, a new PipelineStage (cheap, no deepcopy)
-        is created for each unique seq_len so P2P buffers match the actual shape.
-        With static padding, seq_len is always the same so only one entry is cached.
+        With pp_variable_seq_lengths=True, a new PipelineStage per local model
+        chunk (cheap, no deepcopy) is created for each unique bucketed seq_len so
+        P2P buffers match the actual shape. With static padding, seq_len is
+        always the same so only one entry is cached.
 
         When ``example_input_ids`` is provided we pass explicit meta input/output
-        args to the stage so PipelineStage SKIPS its init-time shape-inference
+        args to the stages so PipelineStage SKIPS its init-time shape-inference
         forward. This is mandatory under Ulysses CP: the shape-inference dummy
         forward would run the intra-stage CP collectives, which deadlock with the
         cross-stage shape-exchange P2P (observed as a mesh_pp + mesh_ulysses NCCL
@@ -1166,25 +1213,38 @@ class Trainer:
         if seq_len not in self._pp_schedule_cache:
             # quack_linear: last stage returns hidden; the loss fn applies lm_head.
             ce_mode = self.args.train.ce_mode
-            self.model_parts[0]._pp_lm_head_in_loss = ce_mode == "quack_linear"
-            # Only the last stage computes the loss; pass its lm_head to the loss fn.
-            pp_lm_head = getattr(self.model, "lm_head", None) if self.ps.is_last_pp_stage else None
-            input_args, output_args = self._build_pp_stage_io(example_input_ids)
-            stage = build_pp_stage(
-                self.model_parts[0],
-                pp_rank=self.ps.pp_rank,
-                num_stages=self.ps.pp_size,
-                device=get_device_type(),
-                pp_group=self.ps.pp_group,
-                input_args=input_args,
-                output_args=output_args,
-            )
-            self._pp_schedule_cache[seq_len] = build_pipeline_schedule(
-                stages=[stage],
+            lm_head_in_loss = ce_mode == "quack_linear"
+            stages = []
+            pp_lm_head = None
+            for model_part, init_stage in zip(self.model_parts, self.pp_stages):
+                stage_index = init_stage.stage_index
+                model_part._pp_lm_head_in_loss = lm_head_in_loss
+                input_args, output_args = self._build_pp_stage_io(example_input_ids, stage_index, lm_head_in_loss)
+                stages.append(
+                    build_pp_stage(
+                        model_part,
+                        stage_index=stage_index,
+                        num_stages=self.pp_num_stages,
+                        device=get_device_type(),
+                        pp_group=self.ps.pp_group,
+                        input_args=input_args,
+                        output_args=output_args,
+                    )
+                )
+                if stage_index == self.pp_num_stages - 1:
+                    # Only the last stage computes the loss; pass its lm_head to the loss fn.
+                    pp_lm_head = getattr(model_part, "lm_head", None)
+            schedule = build_pipeline_schedule(
+                stages=stages,
                 n_microbatches=self.args.train.gradient_accumulation_steps,
                 loss_fn=make_pp_loss_fn(ce_mode, lm_head=pp_lm_head),
                 schedule_name=self.args.train.pipeline_parallel_schedule,
             )
+            if os.environ.get("XORL_PP_BUBBLE_PROFILE", "0") == "1":
+                from xorl.distributed.pp_profiling import PPBubbleProfiler  # noqa: PLC0415
+
+                schedule._xorl_bubble_profiler = PPBubbleProfiler(schedule)
+            self._pp_schedule_cache[seq_len] = schedule
         return self._pp_schedule_cache[seq_len]
 
     # ===================================================================
@@ -1207,7 +1267,8 @@ class Trainer:
         self._model_fwd_context = model_fwd_context
         self._model_bwd_context = model_bwd_context
 
-        self.model.train()
+        for part in self._all_model_parts():
+            part.train()
         logger.info(
             f"rank{args.train.local_rank} Start training, "
             f"train_steps_per_epoch: {self.train_steps_per_epoch}, "
@@ -1283,6 +1344,24 @@ class Trainer:
                 lr = max(self.lr_scheduler.get_last_lr())
                 train_metrics = self.environ_meter.step(delta_time, global_step=state.global_step)
                 state.loss_history.append(total_loss)
+                state.grad_norm_history.append(grad_norm)
+
+                if (
+                    os.environ.get("XORL_MEMHIST", "0") == "1"
+                    and args.train.global_rank == 0
+                    and state.global_step == int(os.environ.get("XORL_MEMHIST_DUMP_STEP", "3"))
+                ):
+                    import torch as _torch
+
+                    memhist_dir = os.environ.get("XORL_MEMHIST_DIR", "/tmp")
+                    os.makedirs(memhist_dir, exist_ok=True)
+                    memhist_path = os.path.join(
+                        memhist_dir,
+                        f"memhist_rank{args.train.global_rank}_step{state.global_step}.pkl",
+                    )
+                    _torch.cuda.memory._dump_snapshot(memhist_path)
+                    _torch.cuda.memory._record_memory_history(enabled=None)
+                    logger.info_rank0(f"[XORL_MEMHIST] dumped snapshot to {memhist_path}")
 
                 # Logging
                 self._maybe_log(
@@ -1648,7 +1727,7 @@ class Trainer:
                 self._time_step_phase(
                     "distsign_grad_scale",
                     lambda: scale_model_gradients(
-                        self.model,
+                        self._all_model_parts(),
                         get_distsign_grad_scale_factor(active_voter_total),
                     ),
                 )
@@ -1699,7 +1778,7 @@ class Trainer:
         bad_names: list[str] = []
         per_layer_bad: dict[str, int] = {}
         per_layer_total: dict[str, int] = {}
-        for name, param in self.model.named_parameters():
+        for name, param in ((n, p) for part in self._all_model_parts() for n, p in part.named_parameters()):
             grad = param.grad
             if grad is None:
                 continue
@@ -1752,11 +1831,12 @@ class Trainer:
 
     def _sync_sp_gradients(self) -> None:
         """All-reduce gradients for CP/Ulysses dims not folded into FSDP."""
-        sync_sp_gradients(
-            self.model,
-            self.ps.sp_grad_sync_group,
-            skip_dtensor_grads=self._use_distsignsgd,
-        )
+        for part in self._all_model_parts():
+            sync_sp_gradients(
+                part,
+                self.ps.sp_grad_sync_group,
+                skip_dtensor_grads=self._use_distsignsgd,
+            )
 
     def _reduce_metrics(self, total_loss: float, grad_norm: float) -> Tuple[float, float]:
         """All-reduce loss and grad_norm across DP for logging."""
@@ -1936,7 +2016,7 @@ class Trainer:
         if self.args.train.pp_variable_seq_lengths:
             seq_len = self._time_step_phase(
                 "pp_negotiate_seq_len",
-                lambda: negotiate_pp_seq_len(micro_batches, self.ps.pp_group),
+                lambda: self._bucket_pp_seq_len(negotiate_pp_seq_len(micro_batches, self.ps.pp_group)),
             )
             self._time_step_phase(
                 "pp_pad_microbatches",
@@ -1950,17 +2030,30 @@ class Trainer:
         else:
             seq_len = micro_batches[0]["input_ids"].shape[-1]
 
-        raw_loss = self._time_step_phase(
-            "pp_forward_backward",
-            lambda: forward_backward_pp(
+        pp_schedule = self._get_pp_schedule(seq_len, example_input_ids=micro_batches[0]["input_ids"])
+        profiler = getattr(pp_schedule, "_xorl_bubble_profiler", None)
+
+        def _run_schedule() -> float:
+            return forward_backward_pp(
                 model_parts=self.model_parts,
-                pp_schedule=self._get_pp_schedule(seq_len, example_input_ids=micro_batches[0]["input_ids"]),
+                pp_schedule=pp_schedule,
                 micro_batches=micro_batches,
                 has_first_stage=self.has_first_stage,
                 has_last_stage=self.has_last_stage,
                 pp_group=self.ps.pp_group,
-            ),
-        )
+            )
+
+        if profiler is not None:
+            with profiler.step_scope():
+                raw_loss = self._time_step_phase("pp_forward_backward", _run_schedule)
+            rep = profiler.report()
+            logger.info(
+                f"[PP_BUBBLE] step={self.state.global_step} bubble={rep['bubble_fraction']:.4f} "
+                f"busy_s={rep['busy_time_s']:.3f} step_s={rep['step_time_s']:.3f} "
+                f"peak_mem_gb={rep['peak_memory_bytes'] / 1e9:.2f} stages={rep['num_local_stages']}"
+            )
+        else:
+            raw_loss = self._time_step_phase("pp_forward_backward", _run_schedule)
         gvt = global_valid_tokens.item()
         if gvt > 0 and not self._use_distsignsgd:
             self._time_step_phase(
@@ -1981,7 +2074,7 @@ class Trainer:
         grad_norm = self._time_step_phase(
             "clip_gradients",
             lambda: clip_gradients(
-                self.model,
+                self.model_parts if self.pp_enabled else self.model,
                 clip_value,
                 pp_enabled=self.pp_enabled,
                 pp_group=self.ps.pp_group if self.pp_enabled else None,
@@ -2236,7 +2329,7 @@ class Trainer:
         helper.empty_cache()
         save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{step}")
         state = {
-            "model": self.model,
+            "model": self._checkpoint_model_state(),
             "optimizer": self.optimizer,
             "extra_state": {
                 "global_step": step,
@@ -2392,6 +2485,7 @@ class Trainer:
             "global_step": state.global_step,
             "total_train_steps": self.total_train_steps,
             "loss_history": state.loss_history,
+            "grad_norm_history": state.grad_norm_history,
         }
         if args.train.enable_fp8_training:
             training_metrics["fp8_training"] = self._collect_fp8_training_metrics()

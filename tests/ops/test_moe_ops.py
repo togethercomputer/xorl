@@ -103,6 +103,96 @@ class TestExpertHistogramAndIndex:
         assert torch.all(expert_1_idx == torch.arange(4, 8).cuda())
 
 
+class TestDeterministicScatter:
+    """Deterministic scatter (default ON): run-invariant permutation from moe_index_compute.
+
+    XORL_MOE_DETERMINISTIC_SCATTER=0 is the escape hatch back to the atomics kernel.
+    """
+
+    @staticmethod
+    def _naive_stable_index(experts_for_tokens: torch.Tensor, num_experts: int) -> torch.Tensor:
+        """Reference: expert regions in expert-id order, rows in flattened (token, k) order."""
+        flat = experts_for_tokens.flatten().tolist()
+        hist = [0] * num_experts
+        for e in flat:
+            hist[e] += 1
+        start, acc = [0] * num_experts, 0
+        for e in range(num_experts):
+            start[e] = acc
+            acc += hist[e]
+        seen = [0] * num_experts
+        out = []
+        for e in flat:
+            out.append(start[e] + seen[e])
+            seen[e] += 1
+        return torch.tensor(out, dtype=torch.int64).view(experts_for_tokens.shape)
+
+    def test_deterministic_scatter(self, monkeypatch):
+        """Run-invariance, validity vs stock coverage, exact stable order, escape-hatch routing."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        try:
+            import xorl.ops.group_gemm.kernel.moe as moe_mod  # noqa: PLC0415
+            from xorl.ops.group_gemm.kernel.moe import expert_histogram, moe_index_compute  # noqa: PLC0415
+        except ImportError:
+            pytest.skip("moe ops not available")
+
+        torch.manual_seed(0)
+        num_experts, M, topk = 16, 4096, 8
+        experts = torch.randint(0, num_experts, (M, topk), dtype=torch.int32).cuda()
+        hist = expert_histogram(experts, num_experts)
+        cumsum = torch.cumsum(hist, dim=0)
+
+        # Stock atomics draw (escape hatch =0) for the coverage comparison.
+        monkeypatch.setenv("XORL_MOE_DETERMINISTIC_SCATTER", "0")
+        stock = moe_index_compute(experts, cumsum)
+
+        # Default ON: flag unset routes through the deterministic path.
+        monkeypatch.delenv("XORL_MOE_DETERMINISTIC_SCATTER", raising=False)
+        det_a = moe_index_compute(experts, cumsum)
+        det_b = moe_index_compute(experts, cumsum)
+
+        # Run-invariance: two independent calls produce the identical permutation.
+        assert torch.equal(det_a, det_b)
+
+        # Validity: same shape/dtype contract as stock, full slot coverage, and per-expert
+        # slot SETS identical to the stock draw (both fill [cumsum[e-1], cumsum[e])).
+        assert det_a.shape == stock.shape
+        assert det_a.dtype == stock.dtype
+        full = torch.arange(M * topk, device=det_a.device)
+        assert torch.equal(det_a.flatten().sort()[0], full)
+        for e in range(num_experts):
+            mask = experts == e
+            assert torch.equal(det_a[mask].sort()[0], stock[mask].sort()[0])
+
+        # Exact value: stable order = flattened (token, k) order within each expert.
+        expected = self._naive_stable_index(experts.cpu(), num_experts).cuda()
+        assert torch.equal(det_a, expected)
+
+        # int64 ids too (the model path passes topk_ids as int64).
+        assert torch.equal(moe_index_compute(experts.long().contiguous(), cumsum), expected)
+
+        # Truthy values keep routing through the deterministic path.
+        monkeypatch.setenv("XORL_MOE_DETERMINISTIC_SCATTER", "1")
+        assert torch.equal(moe_index_compute(experts, cumsum), expected)
+
+        # Escape hatch: explicit falsey values must never route through the
+        # deterministic path (old atomics behavior).
+        def _boom(*args, **kwargs):
+            raise AssertionError("deterministic path used with escape hatch set")
+
+        monkeypatch.setattr(moe_mod, "_moe_index_compute_deterministic", _boom)
+        for falsey in ("0", "false", "off", ""):
+            monkeypatch.setenv("XORL_MOE_DETERMINISTIC_SCATTER", falsey)
+            out = moe_index_compute(experts, cumsum)
+            assert torch.equal(out.flatten().sort()[0], full)
+
+        # Default ON: unset must route through the deterministic path.
+        monkeypatch.delenv("XORL_MOE_DETERMINISTIC_SCATTER", raising=False)
+        with pytest.raises(AssertionError, match="deterministic path used"):
+            moe_index_compute(experts, cumsum)
+
+
 class TestMoEGatherScatterAddGather:
     """Tests for moe_gather, moe_scatter, moe_add_gather, and scatter-gather roundtrip."""
 

@@ -17,6 +17,8 @@ from xorl.distributed.parallel_state import get_parallel_state
 from xorl.distributed.pipeline_parallel import (
     generate_llm_fqn_per_model_part,
     pipeline_module_split,
+    schedule_splits_backward,
+    schedule_stage_style,
 )
 from xorl.lora import LoraLinear
 from xorl.models import all_ranks_load_weights, grouped_load_weights
@@ -735,6 +737,11 @@ def build_parallelize_model(
     compile_dynamic_shapes: bool = False,
     basic_modules: Optional[List[str]] = None,
     pp_schedule: Optional[str] = None,
+    pp_virtual_stages: int = 1,
+    pp_input_weight: int = 1,
+    pp_output_weight: int = 1,
+    pp_num_layers_in_first_stage: Optional[int] = None,
+    pp_num_layers_in_last_stage: Optional[int] = None,
     reshard_after_forward: Optional[bool] = None,
     moe_grad_reduce_mode: str = "reduce_scatter",
     fsdp_reduce_dtype: str = "fp32",
@@ -778,13 +785,35 @@ def build_parallelize_model(
                 "See Qwen3ForCausalLM for an example."
             )
 
+        stage_style = schedule_stage_style(pp_schedule)
+        num_stages = pp_degree * pp_virtual_stages
+        if schedule_splits_backward(pp_schedule):
+            # ZB dX-then-dW backward runs autograd.grad(retain_graph=True), which
+            # AOTAutograd donated buffers forbid — the compiled CE loss (and any
+            # compiled decoder layers) would raise at the first backward_input.
+            torch._functorch.config.donated_buffer = False
+            logger.info_rank0(
+                f"PP schedule {pp_schedule} splits backward into dX/dW: disabling torch._functorch "
+                f"donated buffers (retain_graph backward through compiled regions)."
+            )
+        if pp_virtual_stages > 1 and ps.ep_enabled:
+            # EP-aware optimizer/state-dict plumbing is single-part-per-rank today.
+            raise NotImplementedError(
+                "Virtual PP stages (pipeline_parallel_virtual_stages > 1) are not yet supported with "
+                "expert parallelism; use a one-stage-per-rank schedule (1F1B/GPipe) for MoE+EP."
+            )
+
         # 2. Generate FQN assignment per stage
         module_names_per_stage = generate_llm_fqn_per_model_part(
-            num_stages=pp_degree,
+            num_stages=num_stages,
             num_layers=pp_config["num_layers"],
+            input_weight=pp_input_weight,
+            output_weight=pp_output_weight,
             input_fqns=pp_config.get("input_fqns"),
             layer_prefix=pp_config.get("layer_prefix", "layers"),
             output_fqns=pp_config.get("output_fqns"),
+            num_layers_in_first_stage=pp_num_layers_in_first_stage,
+            num_layers_in_last_stage=pp_num_layers_in_last_stage,
         )
 
         # 3. Split model into pipeline stages
@@ -794,8 +823,9 @@ def build_parallelize_model(
             device=device,
             module_names_per_stage=module_names_per_stage,
             always_keep_fqns=pp_config.get("always_keep_fqns"),
+            stage_style=stage_style,
         )
-        logger.info_rank0(f"Model split into {pp_degree} PP stages")
+        logger.info_rank0(f"Model split into {num_stages} PP stages ({pp_virtual_stages} per rank, {stage_style})")
 
         # Extract gradient checkpointing kwargs before the loop
         use_reentrant = kwargs.pop("enable_reentrant", False)
@@ -816,7 +846,9 @@ def build_parallelize_model(
                 # through the SkipFunctionVariable (noop_context_fn). Without context_fn,
                 # checkpoint uses the same default behavior and dynamo can trace natively.
                 if not enable_compile:
-                    grad_ckpt_kwargs["context_fn"] = recompute_context_fn if i == 0 else noop_context_fn
+                    # Every local part needs the recompute context (i indexes this rank's
+                    # virtual stages, not the global stage id).
+                    grad_ckpt_kwargs["context_fn"] = recompute_context_fn
                 if grad_ckpt_method is not None:
                     grad_ckpt_kwargs["gradient_checkpointing_method"] = grad_ckpt_method
                 model_part.gradient_checkpointing_enable(gradient_checkpointing_kwargs=grad_ckpt_kwargs)
@@ -923,7 +955,7 @@ def build_parallelize_model(
 
         # Determine which stages this rank has
         has_first_stage = any(s.stage_index == 0 for s in stages)
-        has_last_stage = any(s.stage_index == pp_degree - 1 for s in stages)
+        has_last_stage = any(s.stage_index == num_stages - 1 for s in stages)
 
         return {
             "stages": stages,

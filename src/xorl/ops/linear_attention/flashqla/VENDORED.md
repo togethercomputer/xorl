@@ -38,6 +38,16 @@ the Qwen team's fused TileLang kernels for Gated Delta Rule (GDN) linear attenti
    Same substitution is used by the CP bridge (`../../../flashqla_cp.py`). The original 4-head
    parity tests never hit this; `tests/ops/test_flashqla_gdn.py` now parametrizes H∈{4,32}.
 
+5. **`auto_cp` exposure + contract pin:** `chunk_gated_delta_rule` /
+   `ChunkGatedDeltaRuleFunction` thread `auto_cp: bool | None` through to
+   `chunk_gated_delta_rule_fwd`; `None` resolves via
+   `xorl.ops.linear_attention.backend.resolve_flashqla_auto_cp` (explicit arg >
+   `XORL_GDN_FLASHQLA_AUTOCP` env > pinned **OFF** while the `XORL_BI_GDN` GDN contract
+   lane is armed, ON otherwise). auto_cp's intra-card CP heuristic (`Be*H<=40` gate +
+   warmup h0-drop approximation) breaks batch-invariance and changes math (XORL-245
+   cert memo gates 2/4); non-contract default behavior is unchanged. Regression tests:
+   `tests/ops/test_flashqla_contract_pin.py`.
+
 Validated on H100 (parity vs FLA at H∈{4,32}, seq 4096: fwd cos 0.99999, bwd grad cos 0.9999,
 all finite).
 
@@ -49,7 +59,9 @@ all finite).
   so it is **not** in the PyPI `tilelang==0.1.10` wheel. `pyproject.toml` therefore pins a prebuilt
   wheel of stock `tile-ai/tilelang@a8d93798` (includes #2303), hosted on
   `togethercomputer/xorl-wheels` (`tilelang_0.1.10_cu131`, cp38-abi3, CUDA 13.1) — switch to PyPI
-  `tilelang>=0.1.11` once a release carrying #2303 ships. Also needs `apache-tvm-ffi>=0.1.10`.
+  `tilelang>=0.1.11` once a release carrying #2303 ships. Also needs `apache-tvm-ffi==0.1.11`
+  (0.1.12 aborts at import against this wheel: duplicate FFI type registration) and
+  `z3-solver<4.16` (4.16 drops the `libz3.so.4.15` soname the wheel links).
   `gemm_v1` itself is supplied in-repo by `../tilelang_gemm_v1.py` (vendored shim, quack-style
   injection), so the wheel is unmodified upstream. Stock tilelang's unified `T.gemm` (tileop
   inline-wgmma) is ~4-5x slower here.

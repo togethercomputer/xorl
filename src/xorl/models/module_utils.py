@@ -2978,6 +2978,19 @@ class MoEGradientCheckpointingLayer(nn.Module):
         routing_weights, selected_experts, router_logits = self.mlp.route(flat)
         return hidden_states, residual, routing_weights, selected_experts, router_logits
 
+    def _capture_diagnostic_component(self, name: str, tensor) -> None:
+        capture = getattr(self, "_diagnostic_capture_component", None)
+        if callable(capture) and tensor is not None:
+            capture(name, tensor)
+
+    def _override_diagnostic_component(self, name: str, tensor):
+        overrides = getattr(self, "_diagnostic_component_overrides", None)
+        override = overrides.get(name) if isinstance(overrides, dict) else None
+        if callable(override):
+            tensor = override(tensor)
+            self._capture_diagnostic_component(f"{name}_override", tensor)
+        return tensor
+
     def _moe_forward(self, hidden_states, output_router_logits=False, **kwargs):
         """Forward with selective checkpointing. Called by subclass ``forward()``.
 
@@ -3003,15 +3016,18 @@ class MoEGradientCheckpointingLayer(nn.Module):
             moe_input, residual, routing_weights, selected_experts, router_logits = self._gradient_checkpointing_func(
                 _dynamo_stable_checkpoint_fn(self._pre_dispatch_forward), hidden_states, **kwargs
             )
+            moe_input = self._override_diagnostic_component("moe_input", moe_input)
             hidden_states = self.mlp.forward_experts_only(moe_input, routing_weights, selected_experts)
         elif _selective:
             hidden_states, residual = self._gradient_checkpointing_func(
                 _dynamo_stable_checkpoint_fn(self._pre_mlp_forward), hidden_states, **kwargs
             )
+            hidden_states = self._override_diagnostic_component("moe_input", hidden_states)
             hidden_states = self.mlp(hidden_states)
             router_logits = None
         else:
             hidden_states, residual = self._pre_mlp_forward(hidden_states, **kwargs)
+            hidden_states = self._override_diagnostic_component("moe_input", hidden_states)
             hidden_states = self.mlp(hidden_states)
             if isinstance(hidden_states, tuple):
                 hidden_states, router_logits = hidden_states
@@ -3019,7 +3035,21 @@ class MoEGradientCheckpointingLayer(nn.Module):
                 router_logits = None
 
         sync_pending_combine()
-        hidden_states = residual + hidden_states
+        self._capture_diagnostic_component("final_residual_input", residual)
+        residual = self._override_diagnostic_component("final_residual_input", residual)
+        self._capture_diagnostic_component("final_mlp_output", hidden_states)
+        hidden_states = self._override_diagnostic_component("final_mlp_output", hidden_states)
+        materialized_hidden_states = residual + hidden_states
+        self._capture_diagnostic_component("final_residual_output", materialized_hidden_states)
+        layer_output_override = getattr(self, "_diagnostic_layer_output_override", None)
+        if callable(layer_output_override):
+            materialized_hidden_states = layer_output_override(materialized_hidden_states)
+            self._capture_diagnostic_component("layer_output_override", materialized_hidden_states)
+            hidden_states = materialized_hidden_states
+        elif getattr(self, "_delay_moe_residual_output", False):
+            hidden_states = (hidden_states, residual)
+        else:
+            hidden_states = materialized_hidden_states
 
         outputs = (hidden_states,)
         if output_router_logits:

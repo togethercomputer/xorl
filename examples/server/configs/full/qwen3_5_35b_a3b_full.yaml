@@ -36,7 +36,8 @@ sample_packing_sequence_len: 128000
 enable_packing: true
 
 skip_initial_checkpoint: true
-ce_mode: compiled
+# bi_fused = K3 lm-head contract CE (fp32-class, tp1, no z-loss).
+ce_mode: bi_fused
 
 optimizer: muon
 optimizer_dtype: bf16

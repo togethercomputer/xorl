@@ -4,6 +4,7 @@
 import tilelang
 import torch
 
+from xorl.ops.linear_attention.backend import resolve_flashqla_auto_cp
 from xorl.ops.linear_attention.flashqla.ops.utils import chunk_local_cumsum, group_reduce_vector
 from xorl.ops.linear_attention.flashqla.utils import l2norm
 
@@ -50,8 +51,11 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: torch.LongTensor | None = None,
     output_final_state: bool = True,
     output_h: bool = False,
-    auto_cp: bool = True,
+    auto_cp: bool | None = None,
 ):
+    # auto_cp's intra-card CP heuristic (Be*H<=40 gate + warmup h0-drop approximation) breaks batch-invariance
+    # and changes math; None resolves to ON except under the armed XORL_BI_GDN contract lane (pinned OFF).
+    auto_cp = resolve_flashqla_auto_cp(auto_cp)
     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
     A = robust_kkt_solve(
         k=k,
@@ -150,6 +154,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         initial_state: torch.Tensor | None = None,
         output_final_state: bool = False,
         cu_seqlens: torch.LongTensor | None = None,
+        auto_cp: bool | None = None,
     ):
         q_orig = q
         k_orig = k
@@ -165,6 +170,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             output_final_state=output_final_state,
             output_h=False,
             cu_seqlens=cu_seqlens,
+            auto_cp=auto_cp,
         )
 
         ctx.save_for_backward(q_orig, k_orig, v, g, beta, A, initial_state, cu_seqlens)
@@ -200,6 +206,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             dh0,
             None,
             None,
+            None,
         )
 
 
@@ -216,6 +223,7 @@ def chunk_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     head_first: bool = False,
+    auto_cp: bool | None = None,
 ):
     assert q.dtype == k.dtype == v.dtype
     assert q.dtype != torch.float32, (
@@ -253,6 +261,7 @@ def chunk_gated_delta_rule(
         initial_state,
         output_final_state,
         cu_seqlens,
+        auto_cp,
     )
 
     return o, final_state

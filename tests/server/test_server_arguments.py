@@ -1838,3 +1838,48 @@ def test_load_server_arguments_preserves_runner_compatibility_fields(tmp_path):
     assert config["train"]["moe_grad_reduce_mode"] == "bf16_a2a_fp32_sum"
     assert config["train"]["optimizer_kwargs"]["muon_distributed_mode"] == "full_gradient"
     assert config["lora"]["lora_export_format"] == "sglang_shared_outer"
+
+
+def test_load_server_arguments_threads_moe_routing_weights_before_down(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "model_path": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+                    "moe_routing_weights_before_down": True,
+                },
+                "train": {
+                    "output_dir": str(tmp_path / "outputs"),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = load_server_arguments(str(config_path))
+
+    assert args.moe_routing_weights_before_down is True
+    assert args.to_config_dict()["model"]["moe_routing_weights_before_down"] is True
+
+
+def test_server_arguments_moe_routing_weights_before_down_defaults_auto(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "model_path": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+                },
+                "train": {
+                    "output_dir": str(tmp_path / "outputs"),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = load_server_arguments(str(config_path))
+
+    assert args.moe_routing_weights_before_down == "auto"
+    assert args.to_config_dict()["model"]["moe_routing_weights_before_down"] == "auto"

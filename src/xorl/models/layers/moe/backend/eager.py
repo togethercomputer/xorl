@@ -65,6 +65,40 @@ def eager_expert_forward(
     return out
 
 
+def eager_expert_forward_fp64(
+    hidden_states: torch.Tensor,
+    expert_idx: int,
+    gate_proj: torch.Tensor,
+    up_proj: torch.Tensor,
+    down_proj: torch.Tensor,
+) -> torch.Tensor:
+    """fp64-accumulate expert forward for the K3 train/serve parity mode.
+
+    The cross-engine MoE divergence is reduction-ORDER sensitivity: xorl's and
+    SGLang's expert GEMMs tile the K reduction differently, so their fp32
+    accumulators round differently (~1 bf16 ULP on ~0.1% of elements). fp64
+    accumulation of bf16 products is order-invariant far below bf16 resolution
+    (as verified by the cross-engine parity tests), so engines
+    that both accumulate in fp64 produce identical bf16 outputs regardless of
+    tiling.
+
+    Cast contract (must stay matched to the serving-side fp64 mode and to the
+    offline reference): bf16 inputs/weights upcast losslessly to fp64; gate/up
+    GEMMs, SiLU (``z * sigmoid(z)``), and the gating product all in fp64; the
+    activation product is cast to bf16 (the standard fused-MoE intermediate
+    cast point); the down GEMM re-upcasts and accumulates in fp64. Returns the
+    UNWEIGHTED fp64 down output — the caller applies routing weights and the
+    cross-expert combine in fp64 and casts to bf16 once at the end.
+
+    Gated SiLU without biases only (Qwen3-MoE family).
+    """
+    x64 = hidden_states.to(torch.float64)
+    gate = x64 @ gate_proj[expert_idx].to(torch.float64)
+    up = x64 @ up_proj[expert_idx].to(torch.float64)
+    h = ((gate * torch.sigmoid(gate)) * up).to(torch.bfloat16)
+    return h.to(torch.float64) @ down_proj[expert_idx].to(torch.float64)
+
+
 def _counts_from_cumsum(cumsum: torch.Tensor, num_experts: int) -> list[int]:
     """Convert inclusive cumsum token counts to per-expert counts."""
     counts = []

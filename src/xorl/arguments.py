@@ -456,10 +456,10 @@ class ModelArguments:
         metadata={"help": "Multimodal encoder config and weights."},
     )
     attn_implementation: Optional[Literal["eager", "sdpa", "native", "flash_attention_3", "flash_attention_4"]] = field(
-        default="flash_attention_3",
+        default="flash_attention_4",
         metadata={
             "help": "Attention implementation. 'native': PyTorch SDPA+cuDNN (no deps, Hopper+Blackwell). "
-            "'flash_attention_3': FA3 (Hopper). 'flash_attention_4': FA4 CUTE (Hopper+Blackwell)."
+            "'flash_attention_3': FA3 (Hopper). 'flash_attention_4': FA4 CUTE (Hopper+Blackwell, default)."
         },
     )
     flash_attention_deterministic: bool = field(
@@ -470,6 +470,17 @@ class ModelArguments:
         default=None,
         metadata={
             "help": "MoE implementation to use. 'triton' uses Triton group GEMM kernels, 'native' uses torch._grouped_mm, 'quack' uses quack kernels."
+        },
+    )
+    moe_routing_weights_before_down: Literal["auto", "true", "false"] = field(
+        default="auto",
+        metadata={
+            "help": "Fold routing weights into the down-GEMM input instead of scaling its output "
+            "(triton EP expert backend only). Same math, different bf16 rounding point; cheaper "
+            "backward when router gradients are needed (train_router=True). 'auto' (default) enables "
+            "it only for train_router=true + alltoall dispatch with the XORL_MOE_SGLANG_FUSED_EXPERTS "
+            "parity opt-in inactive; explicit true/false override the regime check. Keep false for "
+            "K3/parity lanes anchored on the historical reduction tree."
         },
     )
     ep_dispatch: str = field(
@@ -485,7 +496,12 @@ class ModelArguments:
     )
     freeze_router: bool = field(
         default=False,
-        metadata={"help": "Freeze MoE router weights during training."},
+        metadata={
+            "help": "Freeze MoE router weights during training. Defaults to False here: local "
+            "pretraining/SFT trains the router. The RL server surface (server_arguments.py) "
+            "intentionally defaults to True — it freezes the router so rollout-time expert "
+            "routing stays consistent for replay. The opposite defaults are deliberate."
+        },
     )
     record_routing_weights: bool = field(
         default=True,
@@ -1251,10 +1267,11 @@ class TrainingArguments:
         default=False,
         metadata={
             "help": "Disable TF32 and BF16 reduced-precision reductions in matmuls for consistent numerics "
-            "across parallelism strategies. Mirrors the server forward path (model_runner) so "
-            "trainer-recomputed logprobs match the values measured by the K3 harness against the server. "
-            "Costs matmul throughput on non-K3 workloads; leave disabled unless train/serve logprob "
-            "parity is required."
+            "across parallelism strategies. NOTE: defaults to False, while the server forward path "
+            "(model_runner) applies enable_high_precision_for_bf16() unconditionally — so out of the box "
+            "local training does NOT match server/K3 numerics. Local runs must opt in (set True) whenever "
+            "trainer-recomputed logprobs need to match the values measured by the K3 harness against the "
+            "server. Kept opt-in for throughput: measured +5.5% step time on a 30B-A3B MoE at 128k."
         },
     )
     allow_cuda_launch_blocking: bool = field(
@@ -1333,7 +1350,58 @@ class TrainingArguments:
     )
     pipeline_parallel_schedule: str = field(
         default="1F1B",
-        metadata={"help": "Pipeline parallel schedule: '1F1B' or 'GPipe'."},
+        metadata={
+            "help": (
+                "Pipeline parallel schedule: '1F1B', 'GPipe' (one stage per rank), "
+                "'Interleaved1F1B', 'InterleavedZeroBubble' (pipeline_parallel_virtual_stages >= 2), "
+                "'ZBVZeroBubble', 'DualPipeV' (exactly 2 virtual stages per rank)."
+            )
+        },
+    )
+    pipeline_parallel_virtual_stages: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Model chunks (virtual stages) per PP rank. 1 for GPipe/1F1B. Interleaved and "
+                "zero-bubble schedules divide the pipeline bubble by roughly this factor."
+            )
+        },
+    )
+    pipeline_parallel_input_weight: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Layer-equivalent cost of the embedding on stage 0 for stage balancing. "
+                "Raise for vocab-heavy models so the first stage gets fewer decoder layers."
+            )
+        },
+    )
+    pipeline_parallel_output_weight: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Layer-equivalent cost of norm+lm_head(+CE) on the last stage for stage balancing. "
+                "A 150k-vocab lm_head+CE is worth several decoder layers."
+            )
+        },
+    )
+    pipeline_parallel_num_layers_in_first_stage: Optional[int] = field(
+        default=None,
+        metadata={"help": "Explicit decoder-layer count for the first PP stage (overrides input_weight balancing)."},
+    )
+    pipeline_parallel_num_layers_in_last_stage: Optional[int] = field(
+        default=None,
+        metadata={"help": "Explicit decoder-layer count for the last PP stage (overrides output_weight balancing)."},
+    )
+    pp_seq_len_bucket_size: int = field(
+        default=1024,
+        metadata={
+            "help": (
+                "With pp_variable_seq_lengths, round the negotiated per-step seq_len up to a multiple of "
+                "this bucket so the schedule/P2P-buffer cache stays bounded. 0 caches one schedule per "
+                "exact seq_len (unbounded)."
+            )
+        },
     )
     pp_variable_seq_lengths: bool = field(
         default=True,
@@ -1616,6 +1684,19 @@ class TrainingArguments:
                 f"pipeline_parallel_size ({self.pipeline_parallel_size}) = {non_dp_size}."
             )
         self.data_parallel_size = self.world_size // non_dp_size
+
+        if self.pipeline_parallel_size > 1:
+            # Deferred import: keep arguments.py import-light (validate_pp_schedule_config pulls in torch).
+            from xorl.distributed.pipeline_parallel import validate_pp_schedule_config  # noqa: PLC0415
+
+            validate_pp_schedule_config(
+                self.pipeline_parallel_schedule,
+                self.pipeline_parallel_virtual_stages,
+                self.gradient_accumulation_steps,
+                self.pipeline_parallel_size,
+            )
+        elif self.pipeline_parallel_virtual_stages != 1:
+            raise ValueError("pipeline_parallel_virtual_stages requires pipeline_parallel_size > 1.")
 
         # configure data parallel size
         if self.data_parallel_replicate_size > 0 and self.data_parallel_shard_size > 0:

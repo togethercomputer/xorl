@@ -422,7 +422,7 @@ def run_sft_steps(training_client, data, num_steps=5, lr=1e-3) -> list:
 
     for step in range(num_steps):
         fwd_bwd = training_client.forward_backward(data, loss_fn="causallm_loss")
-        optim = training_client.optim_step(learning_rate=lr)
+        optim = training_client.optim_step({"learning_rate": lr})
         result = fwd_bwd.result()
         optim.result()
 
