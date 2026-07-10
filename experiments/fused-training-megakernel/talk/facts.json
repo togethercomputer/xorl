@@ -3,14 +3,14 @@
   "topic": "fused training megakernel vs compile+CUDAGraph+ operator gap",
   "matrix_window": "2026-07-05 ~21-23Z, clean-GPU window, fresh process per shape, megakernel-opgap branch",
   "matrix_source": "results/operator-gap/score_*.json + xorl-oss-opgap/results/operator_gap_report.md",
-  "fresh_window": "2026-07-07 ~09Z, head 94cb1ef (S8192 attention PDF feed, dX TMA-reduce short splitK, dW sk1 no-atomic, dq bulk-reduce, defer-rsum, band/qkrope retunes), fresh process per shape, GPU-util+memory guards",
+  "fresh_window": "2026-07-08 post-burst certified sweep, adopted at 0ba235d: 10 non-qwen shapes @05e9e97 (dedicated k8s H100, median-of-50, fresh process per shape; includes the producer executor, head-dX split-K gates, TMA feeds, the EVICT_FIRST TMA C store, graphed-step, cold-cap re-tunes) + qwen l1/l2 @6d4e86d (post NT-supertile PDF-only promotion)",
   "qwen_l1_dispersion": "Jul-6 observation: qwen4b-l1 same-day clean windows measured mk 9080 and 9586 us (baseline stable ~7.15-7.18ms) - giant-shape medians disperse ~5% across windows; H256 shapes reproduce <1%",
-  "fresh_source": "scratchpad sweep log (score_shape.py, bench.py-verbatim recipe)",
+  "fresh_source": "results/operator-gap/talk-fresh-sweep-jul8-postburst-20260708T1020Z.log (durable copy; score_shape.py, bench.py-verbatim recipe)",
   "baseline_def": "torch.compile(mode=max-autotune-no-cudagraphs) + foreach grad zero + whole-step manual CUDA graph replay (bench.py hardened arm)",
   "timing": "CUDA-event median of 50, one H100, bf16 Qwen3 architecture, step = fwd+bwd+grad-zero",
-  "head": "94cb1ef",
-  "date": "2026-07-07",
-  "post_window": "landed after the fresh window, not in the sweep: EVICT_FIRST TMA C store for long-S lm-head NT (3d37664, gate widened 3f59171) - paired A/B -17/-3, -20/-23, -32/-28, -101/-66 us at s2048/s3072/s4096/s8192 both orders; post-land s8192 anchor 6255.0 us (results/operator-gap/n256-tmastore-postland-score-3d37664.md). 10-shape k8s re-cert @ bb199ea (= a00c1dd kernel, TMA C store included) 20260707T2035Z: deep 1.30x .. s4096 1.93x, s8192 1.95x (mk 6276.4 / graph+ 3215.2 us) - first sub-2x frontier reading; qwen shapes not re-run, so the chart series stays at the complete 94cb1ef window (results/meter-reanchor-bb199ea-k8s-20260707T2035Z.log)"
+  "head": "0ba235d",
+  "date": "2026-07-08",
+  "post_window": "in flight, not in this window: landing the already-certified parked wins (integration lags verdicts), the image-partitioning prototype for long-S attention-bwd, the swiglu-bwd fold, a CE op body at long S. One-pass attention bwd is CLOSED BY LAW (6 variants incl. banded PDR lost; overlap-preservation). Source: results/operator-gap/dynamics-synthesis-0ba235d.md. Trajectory: Jul-5 matrix 1.47-2.30x + qwen 4.05x -> Jul-8 certified 1.03-1.94x, every shape under 2x"
  },
  "shapes": [
   {
@@ -692,7 +692,7 @@
    "paired_ab": "qwen4b-l1 -1056/-1127us 12/12, qwen4b-l2 -1511/-1370us 12/12",
    "gates": "default at qwen4b-l1/l2 and s2048-s8192 (_PDF_MODE); short S + small stay df",
    "residency_tax": "a parked producer warpgroup costs ~+34us at nano, +145us at small - warp-slot dilution, so short-S keeps the 256-thread image",
-   "remaining": "lm-head fwd NT row ~2.49ms vs nvjet ~1.0ms - NT producer feed is the queued follow-on; the long-S NT C-store recipe (3d37664) is N/A here - the qwen NT row is compute-regime, not writeback-bound"
+   "remaining": "CLOSED Jul 8: the NT forward row landed as the exact-qwen NT supertile PDF-only route (loader-warp feed) - qwen4b-l1 reads 1.018-1.028x post-promotion (@6d4e86d refresh 7558/7422us; results/operator-gap/qwen-postntpdf-score-profile-6d4e86d.md); l2 residual ~1.11x"
   }
  },
  "mechanism": {
@@ -1350,5 +1350,80 @@
     ]
    }
   }
+ },
+ "dynamics": {
+  "source": "results/operator-gap/dynamics-synthesis-0ba235d.md (2026-07-09; full-corpus extraction, ~500 verdict-bearing trials, 38 laws adversarially validated with counterexamples)",
+  "binding": [
+   {
+    "row": "s8192",
+    "ratio": "1.94",
+    "gap_us": 2996,
+    "class": "attn",
+    "what": "dQ wait 1751 \u00b7 attn-fwd span 1024 \u00b7 lm-head 503 \u00b7 CE 285"
+   },
+   {
+    "row": "s4096",
+    "ratio": "1.85",
+    "gap_us": 1350,
+    "class": "attn",
+    "what": "dKV wait 465 \u00b7 attn-fwd 288 \u00b7 CE 150"
+   },
+   {
+    "row": "small",
+    "ratio": "1.53",
+    "gap_us": 1020,
+    "class": "body",
+    "what": "attention bodies + RMS dX + the machinery floor (145 handoffs)"
+   },
+   {
+    "row": "qwen-l2",
+    "ratio": "1.11",
+    "gap_us": 972,
+    "class": "body",
+    "what": "op-body spans (only 5% is waiting) + drain cadence"
+   },
+   {
+    "row": "s3072",
+    "ratio": "1.70",
+    "gap_us": 930,
+    "class": "attn",
+    "what": "dQ wait \u00b7 attn-fwd \u00b7 lm-head \u00b7 CE"
+   },
+   {
+    "row": "s2048",
+    "ratio": "1.64",
+    "gap_us": 672,
+    "class": "attn",
+    "what": "dQ wait \u00b7 attn-fwd \u00b7 lm-head \u00b7 CE"
+   },
+   {
+    "row": "deep",
+    "ratio": "1.27",
+    "gap_us": 472,
+    "class": "floor",
+    "what": "fixed cost: 213 op-to-op handoffs \u00d7 ~3.5 \u00b5s each"
+   },
+   {
+    "row": "s1024",
+    "ratio": "1.59",
+    "gap_us": 463,
+    "class": "body",
+    "what": "attn-fwd + lm-head pair; body space picked clean"
+   },
+   {
+    "row": "nano \u00b7 s128 \u00b7 s256",
+    "ratio": "1.38\u20131.42",
+    "gap_us": 220,
+    "class": "floor",
+    "what": "the floor alone is 110\u2013133% of the whole gap"
+   },
+   {
+    "row": "qwen-l1",
+    "ratio": "1.03",
+    "gap_us": 205,
+    "class": "closed",
+    "what": "at the parity threshold"
+   }
+  ]
  }
 }

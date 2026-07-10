@@ -6590,3 +6590,855 @@ library), `mk.py` (program builder), `model.py` (Qwen3 program + `MKQwen3.step()
 
 Env: torch 2.14 cu130 (`.venv-fa4`) + system CUDA 13.1 nvcc, sm_90. Run everything with
 `CUDA_VISIBLE_DEVICES=<idle> .venv-fa4/bin/python <script>.py` from this directory.
+
+## S1024 fused-qkrope n128 stale check (2026-07-08)
+
+Source-free force of the existing `MK_WGMMA_N128_QKROPE=1` gate on exact S1024
+was rejected at `0ba235d` after the current promoted stack. The helper
+`results/s1024_qkrope_n128_ab_0ba235d.py` moved exactly the four
+`GEMMNT 1024x512x256.wg.+qkrope` rows from flags 386 / ntiles64 to flags 4482 /
+ntiles32, with route unchanged at `153/77/66` and parity clean.
+
+Paired x40 timing on GPU3 lost both orders: default-first `+29.26us` with
+forced n128 winning `0/40`, variant-first `+7.52us` with forced n128 winning
+`6/40`. The current `_H256_D64_QKROPE_N128_S = (2048, 3072, 4096, 8192)` lower
+bound stands; exact-S1024 qkrope should not be revisited by plain n128 route
+widening without a different body or overlap mechanism. Full record:
+`results/operator-gap/s1024-qkrope-n128-0ba235d-nopromote.md`.
+
+## S1024 SSQ-off current-stack stale check (2026-07-08)
+
+Source-free `MK_SSQ_FUSE=0` on exact S1024 was rejected at `0ba235d` after the
+current promoted stack. Route stayed unchanged at `153/77/66` and parity was
+clean across x40/x80 both-order runs.
+
+Timing remained a construction-order split. At x80, default-first lost with
+SSQ-off `+6.94us` and only `10/80` wins, while variant-first showed SSQ-off
+`-12.58us` with `79/80` wins. Keep fused SSQ default-on for exact S1024; do not
+reopen this knob without a different body or dependency mechanism. Full record:
+`results/operator-gap/s1024-ssqoff-current-0ba235d-nopromote.md`.
+
+## S1024 N128 residual+SSQ direct epilogue (2026-07-08)
+
+Default-off `MK_GEMM_N128_RSSQ_DIRECT_EPILOGUE=1` was prototyped in sibling
+worktree `/home/apanda/xorl-oss-s1024-n128-rssqepi-0ba235d` and rejected. The
+candidate targeted exactly the eight current N128 residual+SSQ rows
+(`1024x256x256` and `1024x256x768`, flags `12434`) and kept the route unchanged
+at `153/77/66`.
+
+Static, route, resource, SASS, and parity gates passed. The full-step timing did
+not: x80 default-first lost `+3.34us` with `25/80` wins, while x80 variant-first
+won `-16.86us` with `80/80` wins. Do not promote or reopen this exact body as
+written. Full record: `results/operator-gap/s1024-n128-rssqepi-0ba235d-nopromote.md`.
+
+## S1024 current-stack FWD w128 refresh (2026-07-08)
+
+Default-off `MK_ATTN_FWD_W128=1` / `_afw128` was prototyped in sibling worktree
+`/home/apanda/xorl-oss-s1024-fwdw128-refresh-0ba235d` and rejected. This was a
+fresh current-stack port of the older FA4-B 128-wide forward-attention idea:
+exp-fold, deferred row-sum, de-diverge, and mask-split compatibility were kept,
+and exactly the four exact-S1024 forward rows moved from `OP_ATTN_FWD_WG` to
+`OP_ATTN_FWD_WGW128`.
+
+Static and route gates passed. Both default and forced routes stayed
+`153/77/66`; the default image kept no `_afw128` suffix, while the forced image
+requested `122880` bytes smem. Codegen confirmed the default-off boundary:
+unset-env default stayed `LOCAL:0` with stack `96/64/48/64`, while the forced
+w128 image was also `LOCAL:0` but grew to `224/160/144/224`.
+
+Parity was clean, but x40 timing rejected the candidate before x80:
+default-first lost `+18.51us` with `0/40` wins, and variant-first lost
+`+1.22us` with `16/40` wins. Do not promote or reopen this exact two-ring w128
+body. A future S1024 forward-attention attempt needs a materially different
+layout, such as preserving PV overlap under a new smem/register contract. Full
+record: `results/operator-gap/s1024-fwdw128-refresh-0ba235d-nopromote.md`.
+
+## S1024 forced pdf/D64/feed composition (2026-07-08)
+
+Source-free current-stack `MK_MODE=pdf,MK_GEMM_D64_TMA=1,
+MK_PDF_D64_FEED=1` on exact S1024 was rejected at `0ba235d`. With
+`MK_ATTN_PDF_FEED=0`, route row count stayed `153 -> 153` and parity was clean,
+but x8 timing failed the both-order gate: default-first lost `+12.74us` with
+`1/8` wins, while variant-first was only `-1.90us` with `6/8` wins.
+
+`MK_ATTN_PDF_FEED=1` was retried in a fresh private extension cache and failed
+the same way as the first attempt: the `_pdf240p_pd64f_apdff` binary built, but
+`importlib` raised `dynamic module does not define module export function`.
+`nm -D` and `ctypes` both saw the expected 208-character `PyInit_..._apdff`
+symbol, so this is a reproducible current-stack extension import mismatch for
+that forced suffix, not a missing binary. `MK_ATTN_PDF_FEED=2` was skipped
+because the ordered source-free gates were already negative.
+
+Do not promote or reopen this forced producer-pdf/feed composition as a narrow
+S1024 retry. The next S1024 source lane needs a larger attention producer/drain
+or one-pass topology with a different register/dependency contract. Full record:
+`results/operator-gap/s1024-pdffeed-composition-0ba235d-nopromote.md`.
+
+## S1024 FWD GQA64 paired-row body (2026-07-08)
+
+Default-off `MK_ATTN_FWD_GQA64=1` / `_afgqa64` was prototyped in sibling
+worktree `/home/apanda/xorl-oss-s1024-fwd-gqa64-0ba235d` and rejected. The body
+remapped the two consumer WGs from two 64-row halves of one q-head to the two
+q-heads sharing one K/V head for the same 64-row band. Only the four exact
+S1024 FWD rows moved from `OP_ATTN_FWD_WG` to `OP_ATTN_FWD_GQA64`; route stayed
+`153/77/66`.
+
+Static, route, resource/SASS, and parity gates passed. Default and forced
+images were resource-identical and spill-free (`LOCAL:0`, stacks
+`96/80/64/64` across exported kernels), but the forced SASS image grew
+(`__LINES__ +3576`, `HGMMA.64 +32`, `WARPGROUP.ARRIVE +32`,
+`BAR.SYNC.DEFER_BLOCKING +20`).
+
+Timing rejected the candidate by construction-order split. x80 default-first
+lost `+2.70us` with `37/80` wins, while x80 variant-first won `-14.14us` with
+`80/80` wins. Do not promote or reopen this exact GQA64 FWD body. The next
+S1024 attention attempt needs a producer/drain or dependency/register-contract
+change, not just a consumer-WG remap. Full record:
+`results/operator-gap/s1024-fwd-gqa64-0ba235d-nopromote.md`.
+
+## S1024 DKV P/dS-ring stage pipeline (2026-07-08)
+
+Default-off `MK_ATTN_DKV_PDS_RING=1` / `_adkvpds` was prototyped in sibling
+worktree `/home/apanda/xorl-oss-s1024-dkv-pdsring-0ba235d` and rejected. The
+candidate kept the same four exact-S1024 `OP_ATTN_DKV_WG` route rows and spent
+148KB smem on an explicit P/dS ring so one pending S/dP stage could overlap
+the current dV/dK drain without carrying two full S/dP banks in registers.
+
+Static and route gates passed. Default and forced routes stayed `153/77/66`;
+attention row counts stayed FWD/DKV/DQ `4/4/4`; forced `_adkvpds` touched only
+exact `S=1024`, `D=64`, `G=2`, `C=2`, `ntiles=64` DKV rows. The forced image
+was spill-free but costly: stack grew from `96/64/48/64` to
+`368/224/208/448`, and SASS grew by `__LINES__ +11922`, `HGMMA.64 +96`,
+`LDL +739`, and `STL +342`.
+
+Smoke parity was clean, but timing rejected the candidate before longer runs:
+x2 default-first lost `+69.82us` with `0/2` wins and x2 variant-first lost
+`+54.91us` with `0/2` wins. Do not promote or reopen this exact P/dS-ring DKV
+stage pipeline as written. Future S1024 DKV work needs a stronger
+producer/drain or topology change, not a smem ring around the same staged S/dP
+and dV/dK sequence. Full record:
+`results/operator-gap/s1024-dkv-pdsring-0ba235d-nopromote.md`.
+
+## S1024 MLP dX static-body current-stack refresh (2026-07-08)
+
+Default-off `MK_GEMM_MLPDX_STATIC=1` / `_mlpdxst` was refreshed on the current
+promoted exact-S1024 stack in sibling worktree
+`/home/apanda/xorl-oss-s1024-mlpdx-static-refresh-0ba235d` and rejected. The
+candidate retested the earlier source-body prototype only for the exact four
+`GEMMNN 1024x256x1536.wg` flags-128 rows, because the old one-op result was a
+real win but the integrated gate was borderline/order-mixed before later
+S1024 stack changes.
+
+Static and route gates passed. Default and forced routes stayed `153/77/66`;
+forced `_mlpdxst` touched only target rows at indices `91/107/123/139`, all
+`M=1024`, `N=256`, `K=1536`, flags `128`, `ntiles=32`. Resource usage was
+identical and spill-free (`LOCAL:0`, stacks `96/64/48/64` across exported
+kernels), with moderate SASS growth (`__LINES__ +3488`, `HGMMA.64x64 +16`,
+`LDGSTS.E.BYPASS.128 +96`).
+
+Smoke parity passed and smoke timing was positive, but x40 rejected the refresh
+by construction-order split: default-first lost `+5.18us` with `6/40` wins,
+while variant-first won `-17.47us` with `40/40` wins. Do not promote or reopen
+this exact static-body codegen as written. Future work on this bucket needs a
+different scheduling or fusion mechanism, not another `MK_GEMM_MLPDX_STATIC`
+refresh. Full record:
+`results/operator-gap/s1024-mlpdx-static-refresh-0ba235d-nopromote.md`.
+
+## Qwen D128 rowsplit dQ descriptor-precompute (2026-07-08)
+
+Default-off `MK_ATTN_D128_DQ_DESC_PRE=1` / `_ad128dqdpre` was prototyped in
+sibling worktree `/home/apanda/xorl-oss-qwen-d128-dqdesc-0ba235d` and rejected
+at the SASS gate before timing. The candidate only changed descriptor
+materialization for `op_attn_dq_wg128_rowsplit`: both KK descriptor sets were
+named before the S/dP HGMMA chain to test whether ptxas would reduce the
+per-HGMMA `WARPGROUP.DEPBAR.LE gsb0, 0x0` serialization observed in the D128
+FA4 SASS comparison.
+
+Static and route gates passed. Host route proof stayed `47/26/9` for qwen4b-L1
+and `78/44/14` for qwen4b-L2; forced builds added `_ad128dqdpre` and
+`-DMK_ATTN_D128_DQ_DESC_PRE`; rowsplit DQ rows stayed `(256, 16777217)`, and
+`MK_ATTN_D128_DQ_RS=0` restored two generic `(512, 1)` L2 DQ rows. Real
+qwen4b-L2 build proof also stayed `78/44/14` with `n256=27`, `stage3=27`,
+`nmajor=27`, `ntst=1`, and `tma=19`.
+
+Resource usage was identical and spill-free (`megakernel_pdf REG 168 STACK 112
+LOCAL 0`; plain `megakernel REG 255 STACK 176 LOCAL 0`). The SASS objective
+failed: full-image SASS grew by only `__LINES__ +32`, while `HGMMA.64`,
+`WARPGROUP.ARRIVE`, and `WARPGROUP.DEPBAR.LE gsb0, 0x0` all stayed
+`1080 -> 1080`. `BAR.SYNC.DEFER_BLOCKING` also stayed `618 -> 618`.
+
+Do not promote or reopen this exact descriptor-precompute form. Future D128
+rowsplit work needs a different WGMMA issue/wait contract or body topology,
+not just named descriptor temporaries. Full record:
+`results/operator-gap/qwen-d128-dqdesc-0ba235d-nopromote.md`.
+
+## Qwen NT standalone frontier refresh (2026-07-08)
+
+The existing source-free qwen lm-head NT standalone probe was rerun at
+`0ba235d` after the later qwen PDF-only, NT postinit-nosync, and head-dX
+promotions. The goal was to check whether the older `3f21e1e` standalone
+frontier still represented the body class to optimize.
+
+Command:
+
+```text
+CUDA_VISIBLE_DEVICES=6
+TORCH_EXTENSIONS_DIR=/tmp/torchext-qwen-nt-frontier-0ba235d-20260708T1403Z
+/home/apanda/xorl-oss/.venv-fa4/bin/python \
+  experiments/fused-training-megakernel/fat_gemm_probe.py qwen
+```
+
+Correctness smoke passed for `run_n128`, `run_n256`, and `run_n256d`. The qwen
+prefix `1024x151808x2560` results were:
+
+```text
+run_n128  med=2768.3us  tf=287.5  tiles=9488
+run_n256  med=2447.7us  tf=325.2  tiles=4744
+run_n256d med=2482.3us  tf=320.6  tiles=4744
+```
+
+This is essentially unchanged from the older standalone frontier. It now
+contradicts the current integrated qwen4b-L2 profile, where
+`GEMMNT 1024x151936x2560.wg` is `1763.7us`. Therefore the standalone probe is
+not the right baseline for the next qwen NT body rewrite; the production
+PDF/producer context and exact qwen page/register-epilogue contract are
+material to the current body rate.
+
+Future qwen NT work should start from the production
+`op_gemm_wgmma_n256_nt_supertile_impl<3>` context and use route/SASS gates before
+timing. Do not port a standalone `fat_gemm_probe.py` wait-distance or layout arm
+unless it first explains or reproduces the current production-context speedup.
+Full record: `results/operator-gap/qwen-nt-body-frontier-0ba235d-refresh.md`.
+
+## Qwen NT supertile wait-distance no-go (2026-07-08)
+
+The production qwen NT body was tested with a default-off wait-distance source
+variant:
+
+```text
+MK_GEMM_N256_NT_SUPERTILE_WAITDIST=1
+suffix: _ntwd
+target: op_gemm_wgmma_n256_nt_supertile_impl<3>
+```
+
+The forced body issued one combined d0/d1 WGMMA batch per K stage, delayed
+`bempty` release for the previous stage until after `warpgroup_wait<1>`, and
+drained the final batch with `warpgroup_wait<0>`. This was intended to create
+a nvjet-style wait-distance SASS change in the current PDF-only/register
+epilogue production context.
+
+Static, host route, and real CUDA build gates passed. The real qwen4b-L2 route
+stayed unchanged:
+
+```text
+n_instr=78 critical_path=44 gated=14 smem=151552
+n256=27 stage3=27 nmajor=27 ntst=1 tma=19
+```
+
+Resources stayed identical and spill-free, including `megakernel_pdf REG 168
+STACK 112 LOCAL 0`. The SASS objective failed:
+
+```text
+SASS lines                         827622 -> 827766
+HGMMA                              1080 -> 1080
+WARPGROUP.ARRIVE                   1080 -> 1080
+WARPGROUP.DEPBAR                   1080 -> 1080
+WARPGROUP.DEPBAR.LE ... 0x0        1080 -> 1080
+WARPGROUP.DEPBAR.LE ... 0x1        0 -> 0
+BAR.SYNC.DEFER_BLOCKING            618 -> 618
+```
+
+No timing run was performed. Do not reopen this exact source-level wait-distance
+shape; ptxas preserved the same WGMMA dependency-barrier cadence. Future qwen NT
+work needs a stronger assembly-level or body-topology mechanism that visibly
+moves DEPBAR placement before timing. Full record:
+`results/operator-gap/qwen-nt-waitdist-0ba235d-nopromote.md`.
+
+## Qwen D128 rowsplit dQ C1 full-seed retry no-go (2026-07-08)
+
+The earlier D128 C1 separate-body lane was re-run from a corrected seed because
+the prior default-only hang was caused by an incomplete promoted-stack import:
+`ops.cuh` posted the qwen NT PDF producer `kind == 6`, but that sibling lacked
+the matching `megakernel.cu` producer branch. The full-seed retry imported the
+current promoted qwen stack for:
+
+```text
+megakernel.cu
+mk.py
+model.py
+ops.cuh
+wgmma_attention.cuh
+```
+
+Before applying any C1 diff, the corrected seed passed default-only qwen4b-L2
+runtime:
+
+```text
+FULLSEED_SINGLE_STEP_DONE loss=12.61334419
+```
+
+The default-off candidate added:
+
+```text
+MK_ATTN_D128_DQ_RS_C1=1
+suffix: _ad128dqc1
+target: exact qwen D128 op_attn_dq_wg128_rowsplit C=1 body
+```
+
+It kept the generic rowsplit body isolated for default builds and compiled a
+separate forced C1 body. This is not the failed template-wrapper implementation.
+
+Static, route, real-build, resource/SASS, and correctness gates passed:
+
+```text
+L1 route                 47/26/9
+L2 route                 78/44/14
+smem                     151552
+tma                      19
+megakernel_pdf           REG 168 STACK 112 LOCAL 0
+plain megakernel stack   176 -> 160
+SASS lines               827622 -> 807718
+ATOM                     5321 -> 4361
+BAR.SYNC.DEFER_BLOCKING  618 -> 598
+HGMMA/WARPGROUP/DEPBAR   unchanged
+```
+
+Correctness smoke was clean, with worst gradient relative error around
+`0.0048`. Timing rejected the candidate at x40:
+
+```text
+default-first  default 9782.43us  variant 9797.70us  delta +15.26us  wins 16/40
+variant-first  default 9793.71us  variant 9793.52us  delta -0.19us   wins 22/40
+```
+
+No x80 was run because default-first already lost and reverse order was flat.
+Do not promote or reopen this exact C1 separate-body shape. Future D128 C1 work
+should preserve the full-stack seed discipline proven here, but needs a stronger
+runtime mechanism. Full record:
+`results/operator-gap/qwen-d128-dqc1-fullseed-0ba235d-nopromote.md`.
+
+## Qwen NT supertile CE-store single-pass no-go (2026-07-08)
+
+The production qwen NT supertile body was tested with a default-off CE-store
+single-pass variant:
+
+```text
+MK_GEMM_N256_NT_SUPERTILE_CESTORE1=1
+suffix: _ntce1p
+target: op_gemm_wgmma_n256_nt_supertile_impl<3>
+```
+
+The probe targeted only the current production register epilogue under PDF
+producer + PDF-only + register epilogue + CE64. It attempted to publish bf16
+output and compute CE64 max/sum from the same rounded bf16 values in one
+half-chunk pass, replacing the separate store and CE partial conversion loop.
+
+Static, host route, and real CUDA build gates passed. The real qwen4b-L2 route
+stayed unchanged:
+
+```text
+n_instr=78 critical_path=44 gated=14
+smem=151552 n256=27 stage3=27 nmajor=27 ntst=1 tma=19
+```
+
+Resources stayed identical and spill-free:
+
+```text
+megakernel_pdf REG 168 STACK 112 LOCAL 0
+plain megakernel REG 255 STACK 176 LOCAL 0
+```
+
+The SASS objective failed before timing:
+
+```text
+__LINES__                  +3184
+HGMMA                      1080 -> 1080
+WARPGROUP.ARRIVE           1080 -> 1080
+WARPGROUP.DEPBAR           1080 -> 1080
+BAR.SYNC.DEFER_BLOCKING    618 -> 618
+UTMALDG                    497 -> 497
+MUFU.EX2                   7542 -> 7542
+F2FP.BF16.F32.PACK_AB      5566 -> 5566
+F2F.BF16.F32               5677 -> 5677
+FADD                       23723 -> 23723
+FMUL                       24278 -> 24278
+FFMA                       16809 -> 16809
+SHFL.BFLY                  4477 -> 4477
+PRMT                       +416
+BRA                        +24
+```
+
+The intended reduction in duplicate conversion, exp/reduction math, or control
+did not materialize. The forced image is strictly larger in global SASS counts
+and adds permutation/control pressure. Do not promote, time, or reopen this exact
+CE-store half-chunk formulation. Future qwen NT work needs a larger body or
+executor change with a visible HGMMA/DEPBAR contract shift, or a resource-neutral
+reduction in register-epilogue math before timing. Full record:
+`results/operator-gap/qwen-nt-cestore-0ba235d-nopromote.md`.
+
+## S8192 DKV P/dS STSM no-go (2026-07-08)
+
+The S8192 STSM mapping probe proved that non-trans
+`stmatrix.sync.aligned.x4.m8n8.shared.b16` exactly covers the current DKV
+`wga_off64` P/dS accumulator layout, so a sibling source lane tested a
+default-off production replacement:
+
+```text
+MK_ATTN_DKV_STSM_PDS=1
+suffix: _adkvstsm
+target: exact H256/D64/S8192 op_attn_dkv_wg P/dS staging
+```
+
+Static and host-route gates passed. Default, forced, and forced-off all
+preserved the exact route:
+
+```text
+n_instr=183 critical_path=80 gated=62 mode=pdf smem=102400
+```
+
+The real CUDA build/resource/SASS gate also passed on GPU3 from private cache
+`/tmp/torchext-s8192-dkv-stsm-0ba235d-20260708T1647Z`: default had `STSM=0`,
+forced had `STSM=40`, and both images stayed `LOCAL=0` with unchanged `LDL=154`
+and `STL=277` counts.
+
+Correctness was clean, but timing rejected the candidate. The x2 smoke was
+order-mixed (`-11.74us` then `+27.18us`), and both x16 decision windows lost:
+
+```text
+default-first x16: variant-minus-default +10.21us, wins 4/16, worst grad rel 0.005193
+variant-first x16: variant-minus-default +14.18us, wins 0/16, worst grad rel 0.005359
+```
+
+Do not promote or reopen this exact DKV-only STSM replacement. The mechanical
+STSM mapping is valid, but replacing DKV P/dS generic stores alone does not
+shrink the current exact-S8192 model step. Future STSM work should be coupled to
+a larger dependency/topology change and should first prove that the measured DQ
+wait cells or another current path bucket shrink. Full record:
+`results/operator-gap/s8192-dkv-stsm-0ba235d-nopromote.md`.
+
+## S8192 DQ tail ready-order no-go (2026-07-08)
+
+The S8192 readiness-priority preflight found four critical DQ tail waits after
+`GEMMNN 8192x256x256.wg`, so a sibling source lane tested a default-off
+host-scheduler-only priority change:
+
+```text
+MK_ATTN_DQ_TAIL_READY_FIRST=1
+target producers: rows 97/120/143/166
+target dependents: ATTN_DQ_WG rows 106/129/152/175
+```
+
+Static and host route/dependency gates passed. The exact route stayed stable:
+
+```text
+n_instr=183 critical_path=80 gated=62 mode=pdf smem=102400
+```
+
+The only host metadata change was adjacency order: the DQ tail row became the
+first dependent for each matching dO/drow producer. Dependency sets, claims,
+criticality, op histograms, and attention rows were unchanged.
+
+GPU3 profile-only validation rejected the lane before timing. The DQ tail wait
+collapsed as intended, but total selected profile time worsened and the same
+tail delay moved to DKV siblings:
+
+```text
+default-first profile: forced-minus-default +67.520us
+variant-first profile: forced-minus-default +104.864us
+DQ tail wait avg: ~431-434us -> ~3us
+new forced worst hops: ATTN_DKV_WG rows 105/128/151/174, wait ~410-418us
+```
+
+Do not promote, time, or reopen this exact DQ-only adjacency priority. It only
+chooses which sibling sees the producer fanout wait. Future S8192 scheduler work
+should first prove that the combined DQ/DKV sibling wait bucket shrinks. Full
+record: `results/operator-gap/s8192-dq-ready-order-0ba235d-nopromote.md`.
+
+## S8192 Tail-Pair Ready-Order No-Promote
+
+Sibling: `/home/apanda/xorl-oss-s8192-tailpair-ready-0ba235d`
+Patch artifact:
+`/home/apanda/xorl-oss-s8192-tailpair-ready-0ba235d/results/s8192-tailpair-ready-defaultoff-0ba235d-20260708T1718Z.patch`
+
+Candidate:
+
+```text
+MK_ATTN_TAIL_PAIR_READY_FIRST=dkv_first|dq_first
+target producers: rows 97/120/143/166
+target tail pairs: [105,106], [128,129], [151,152], [174,175]
+```
+
+Static and host route/dependency gates passed. The exact route stayed stable:
+
+```text
+n_instr=183 critical_path=80 gated=62 mode=pdf smem=102400
+```
+
+GPU3 profile-only validation rejected the lane before timing. The combined
+local DKV/DQ tail wait collapsed from `3268.096us` to about `30us`, but selected
+profile time worsened:
+
+```text
+dkv_first: +135.616us versus default
+dq_first:  +126.976us versus default
+```
+
+The same producer fanout delay moved into larger `ATTN_DQ_WG ntiles=240`
+sibling bands with waits around `358-360us`, and on-path span grew by roughly
+`+412..414us`.
+
+Do not promote, time, or reopen this exact tail-pair adjacency priority. Future
+S8192 scheduler work should target the whole post-dO/drow attention sibling
+fanout and require selected profile time to improve before paired timing. Full
+record: `results/operator-gap/s8192-tailpair-ready-0ba235d-nopromote.md`.
+
+## S8192 DQ-Family Ready-Order No-Promote
+
+Sibling: `/home/apanda/xorl-oss-s8192-dq-family-ready-0ba235d`
+Patch artifact:
+`/home/apanda/xorl-oss-s8192-dq-family-ready-0ba235d/results/s8192-dq-family-ready-defaultoff-0ba235d-20260708T1728Z.patch`
+
+Candidate:
+
+```text
+MK_ATTN_DQ_FAMILY_READY_FIRST=stage_first|dq_family_first
+target producers: rows 97/120/143/166
+target DQ family: C3, C2, C1, C4 sibling bands
+```
+
+Static and host route/dependency gates passed. The exact route stayed stable:
+
+```text
+n_instr=183 critical_path=80 gated=62 mode=pdf smem=102400
+```
+
+GPU3 profile-only validation rejected the lane before timing:
+
+```text
+stage_first:     +105.856us versus default
+dq_family_first:  +66.400us versus default
+dq_c3 wait avg: 298.760us -> ~2.8us
+```
+
+The mechanism correctly admitted the large DQ C3/C2/C1/C4 siblings earlier, but
+the path moved to DKV C4 tails. For `dq_family_first`, DQ-family wait sum fell
+`4919.616us -> 1052.064us`, while DKV-family wait sum grew
+`2334.912us -> 4624.736us` and on-path span grew `+129.184us`.
+
+Do not promote, time, or reopen this exact DQ-family adjacency priority. Future
+S8192 work needs a multi-sibling fanout/executor contract or a body/topology
+change that reduces the DKV C4 tail after DQ priority. Full record:
+`results/operator-gap/s8192-dq-family-ready-0ba235d-nopromote.md`.
+
+## S8192 Hot-Ring Fair-Quantum No-Promote
+
+Sibling: `/home/apanda/xorl-oss-s8192-hotfair-0ba235d`
+Patch artifact:
+`/home/apanda/xorl-oss-s8192-hotfair-0ba235d/results/s8192-hotfair-defaultoff-0ba235d-20260708T1740Z.patch`
+
+Candidate:
+
+```text
+MK_S8192_ATTN_HOT_FAIR=1
+MK_S8192_ATTN_HOT_FAIR_Q=16
+target rows: exact S8192 DQ/DKV attention siblings after dO/drow producers
+```
+
+Static, host route, and resource/SASS gates passed. The exact route stayed
+stable:
+
+```text
+n_instr=183 critical_path=80 gated=62 mode=pdf smem=102400
+megakernel_pdf REG:168 STACK:144 SHARED:1264 LOCAL:0
+```
+
+GPU3 profile-only validation rejected the lane before timing:
+
+```text
+selected_us:         6278.720 -> 6480.640 (+201.920)
+onpath_wait_us:      1952.416 -> 525.216 (-1427.200)
+onpath_span_us:      4326.304 -> 5955.424 (+1629.120)
+dq_family_wait_sum:  4926.944 -> 1032.512
+dkv_family_wait_sum: 2340.096 -> 423.744
+```
+
+The mechanism correctly admits DQ/DKV siblings earlier, but the first-quantum
+fair pass fragments the long attention rows and moves the selected path onto
+large C3 DQ row spans. Do not promote, time, or reopen this exact bounded
+hot-ring fair-quantum policy. Full record:
+`results/operator-gap/s8192-hotfair-0ba235d-nopromote.md`.
+
+## Qwen NT Descriptor-Fidelity SASS Probe Route-Away
+
+Sibling: `/home/apanda/xorl-oss-qwen-nt-descfidelity-0ba235d`
+Probe source:
+`experiments/fused-training-megakernel/qwen_nt_descfidelity_sass_probe.py`
+
+Artifacts:
+
+```text
+results/operator-gap/qwen-nt-descfidelity-probe-0ba235d.md
+/home/apanda/xorl-oss-qwen-nt-descfidelity-0ba235d/results/qwen-nt-descfidelity-gpu6-0ba235d-20260708T1752Z.log
+/home/apanda/xorl-oss-qwen-nt-descfidelity-0ba235d/results/qwen-nt-descfidelity-summary-0ba235d-20260708T1752Z.json
+/home/apanda/xorl-oss-qwen-nt-descfidelity-0ba235d/results/qwen-nt-descfidelity-probe-0ba235d-20260708T1757Z.patch
+```
+
+The standalone descriptor-fidelity probe varied the qwen NT WGMMA operand form
+outside the production body: K/K baseline, K/MN `.tnspB`, K/MN with MN128 and
+MN B descriptors, plus stagepair and immediate controls. All variants built and
+launched once on GPU6, with no local-memory spill.
+
+Key result:
+
+```text
+pair2k_kk_ksw:        .tnspB=0,  DEPBAR=4, HGMMA.64x128 hist {16: 4}
+pair2k_kmn_ksw:       .tnspB=64, DEPBAR=4, HGMMA.64x128 hist {16: 4}
+pair2k_kmn_mnsw128:   .tnspB=64, DEPBAR=4, HGMMA.64x128 hist {16: 4}
+pair2k_kmn_mnsw:      .tnspB=64, DEPBAR=4, HGMMA.64x128 hist {16: 4}
+stagepair_kmn_mnsw128:.tnspB=64, DEPBAR=8, HGMMA.64x128 hist {8: 8}
+immediate_kmn_mnsw128:.tnspB=64, DEPBAR=16, HGMMA.64x128 hist {4: 16}
+```
+
+This closes the `.tnspB`/descriptor-layout branch as non-causal for the
+production singleton drain. The prior production focused windows remain
+different (`HGMMA=DEPBAR` in qwen NT production pair2k/rawprod), so future qwen
+NT work must extract more of the real body embedding around WGMMA, barriers,
+mbarriers, and epilogue live ranges before another production patch. Do not
+reopen a direct qwen NT operand-form-only patch.
+
+## Qwen NT Production-Embedding Reproducer Preflight
+
+Record:
+`results/operator-gap/qwen-nt-production-embedding-preflight-0ba235d.md`
+
+This source-free pass corrects the earlier singleton-drain attribution scope.
+The first broad focused windows included generic WGMMA function bodies and are
+not valid source-line localization evidence for the qwen NT supertile. Counting
+only the noinline symbol
+`op_gemm_wgmma_n256_nt_supertile_impl<3>` preserves the core result:
+
+```text
+pair2k symbol lines 170542..177385:
+  HGMMA.64x128=24 ARRIVE=24 DEPBAR=24 hist {1:24}
+rawprod symbol lines 170515..176939:
+  HGMMA.64x128=8 ARRIVE=8 DEPBAR=8 hist {1:8}
+```
+
+The grouped controls remain grouped:
+
+```text
+prodpressure pair2k: HGMMA.64x128=64 ARRIVE=4 DEPBAR=4 hist {16:4}
+descfidelity pair2k_kmn_mnsw128: HGMMA.64x128=64 ARRIVE=4 DEPBAR=4 hist {16:4}
+```
+
+Therefore `.tnspB`, descriptor layout, generic pressure, 384-thread launch, and
+qwen-like smem footprint are not sufficient. The missing context is the full
+noinline production body embedding around the grouped helper: mbarrier waits
+and arrivals, PDF/TMA feed branches, accumulator live ranges, post-WGMMA
+sync/reinit, and the epilogue/CE partial live ranges.
+
+Next qwen NT lane should be a sibling-only standalone body-embedding SASS probe,
+not a production source patch. Build variants that progressively add the
+noinline supertile shell, fake mbarrier/PDF branch context, epilogue, CE partial
+loop, and the full combination under qwen-like launch/resource limits. Reject
+before production edits unless a variant reproduces or materially approaches the
+production singleton drain with `LOCAL:0`.
+
+## Qwen NT Body-Embedding Standalone SASS Probe
+
+Record: `results/operator-gap/qwen-nt-bodyembed-probe-0ba235d.md`
+
+Sibling: `/home/apanda/xorl-oss-qwen-nt-bodyembed-0ba235d`
+
+Commits:
+
+```text
+a957e08 checkpoint current promoted stack for qwen nt bodyembed
+4befcd0 add qwen nt body embedding sass probe
+94830ef add qwen nt inline control to body embedding probe
+6778213 add direct kernel control to qwen nt body embedding probe
+```
+
+GPU4 SASS gates found a standalone reproducer. All bodyembed variants were
+spill-free and singleton-drained:
+
+```text
+pair2k_inline_control:       HGMMA.64x128=64 ARRIVE=64 DEPBAR=64 hist {1:64} LOCAL:0
+pair2k_noinline_control:     HGMMA.64x128=64 ARRIVE=64 DEPBAR=64 hist {1:64} LOCAL:0
+body_shell:                  HGMMA.64x128=64 ARRIVE=64 DEPBAR=64 hist {1:64} LOCAL:0
+body_epilogue:               HGMMA.64x128=64 ARRIVE=64 DEPBAR=64 hist {1:64} LOCAL:0
+body_ce:                     HGMMA.64x128=64 ARRIVE=64 DEPBAR=64 hist {1:64} LOCAL:0
+body_full:                   HGMMA.64x128=64 ARRIVE=64 DEPBAR=64 hist {1:64} LOCAL:0
+pair2k_direct_kernel_control HGMMA.64x128=64 ARRIVE=64 DEPBAR=64 hist {1:64} LOCAL:0
+```
+
+The descriptor-fidelity control was rerun under the same GPU/toolchain and
+still grouped:
+
+```text
+pair2k_kmn_mnsw128: HGMMA.64x128=64 ARRIVE=4 DEPBAR=4 hist {16:4} LOCAL:0
+```
+
+Interpretation: the standalone reproducer is positive, but the trigger is a
+broader code-shape or translation-unit context, not proven to be noinline,
+mbarrier, epilogue, or CE alone. The direct bodyembed branch emits per-HGMMA
+`gsb0` and DEPBAR, while the descriptor-fidelity control carries only boundary
+`gsb0` and groups 16 HGMMA per wait. Next qwen NT lane should ablate from the
+grouped descriptor-fidelity probe by adding bodyembed context pieces one at a
+time; do not open another production patch until the first causal collapse
+trigger is isolated.
+
+## Qwen NT Code-Shape Collapse Ablation Preflight
+
+Record: `results/operator-gap/qwen-nt-codeshape-ablation-preflight-0ba235d.md`
+
+Route: open a sibling-only ablation probe that starts from the grouped
+descriptor-fidelity CUDA source and adds one bodyembed source-shape difference
+per variant. Use separate CUDA source strings per variant to isolate unused
+definitions from active kernel code. Order:
+
+```text
+base descriptor source -> hard-coded K/MN+mnsw128 -> mk_tid/unused bfull prologue
+-> unused helper definitions -> inline/noinline wrapper definitions
+-> body template definitions -> selected noinline body
+```
+
+Stop at the first variant that flips from `{16:4}` to `{1:64}`, rerun it in a
+fresh cache, and compare its first HGMMA window against the previous grouped
+variant. No production qwen NT source patch before that trigger is known.
+
+## Qwen NT Code-Shape Manual Ablation Invalid Baseline
+
+Record:
+`results/operator-gap/qwen-nt-codeshape-ablation-invalid-baseline-0ba235d.md`
+
+The first code-shape ablation sibling
+`/home/apanda/xorl-oss-qwen-nt-codeshape-0ba235d` is closed as invalid-baseline.
+Its manually reconstructed descriptor baseline singleton-drained even after
+restoring the obvious unused descriptor helpers and matching the descriptor
+probe's active `tid`/store-guard control flow:
+
+```text
+base_macro attempts: HGMMA.64x128=64 ARRIVE=64 DEPBAR=64 hist {1:64} LOCAL:0
+```
+
+The original descriptor-fidelity control rerun still groups at `{16:4}`, so no
+causal trigger can be inferred from the manual copy. Next ablation must import
+the original descriptor-fidelity `CUDA_SRC` byte-for-byte, verify `{16:4}`, then
+apply one controlled string mutation per variant.
+
+## Qwen NT Exact-Source Mutation Probe
+
+Record: `results/operator-gap/qwen-nt-exactsrc-mutation-probe-0ba235d.md`
+
+Sibling: `/home/apanda/xorl-oss-qwen-nt-exactsrc-0ba235d`
+
+The import-based ablation verified that the descriptor-fidelity `CUDA_SRC`
+baseline still groups, then applied four narrow mutations to the exact imported
+string. All stayed grouped and spill-free:
+
+```text
+baseline_import:                  HGMMA.64x128=64 ARRIVE=4 DEPBAR=4 hist {16:4} LOCAL:0
+remove_cute_mma4:                 HGMMA.64x128=64 ARRIVE=4 DEPBAR=4 hist {16:4} LOCAL:0
+remove_issue_stage_pair:          HGMMA.64x128=64 ARRIVE=4 DEPBAR=4 hist {16:4} LOCAL:0
+remove_both_unused_stage_helpers: HGMMA.64x128=64 ARRIVE=4 DEPBAR=4 hist {16:4} LOCAL:0
+bodyembed_tid_store_shape:        HGMMA.64x128=64 ARRIVE=4 DEPBAR=4 hist {16:4} LOCAL:0
+```
+
+Interpretation: the singleton-drain trigger is not the unused stage helper
+definitions or the bodyembed tid/store guard shape. Continue with exact imported
+source and add larger bodyembed context blocks one at a time; no production qwen
+NT source patch before the first `{16:4}` -> `{1:64}` collapse trigger is known.
+
+## Qwen NT Exact-Source Body-Context Probe
+
+Record: `results/operator-gap/qwen-nt-exactsrc-bodyctx-probe-0ba235d.md`
+
+Sibling: `/home/apanda/xorl-oss-qwen-nt-exactsrc-0ba235d`
+
+Commit: `daf1e03 extend qwen nt exact source body context probe`
+
+The first collapse trigger is now isolated:
+
+```text
+baseline_import:           hist {16:4}, ARRIVE=4,  DEPBAR=4,  gsb0=8
+hardcoded_desc:            hist {16:4}, ARRIVE=4,  DEPBAR=4,  gsb0=8
+active_bodyembed_prologue: hist {16:4}, ARRIVE=4,  DEPBAR=4,  gsb0=8
+unused_body_helpers:       hist {16:4}, ARRIVE=4,  DEPBAR=4,  gsb0=8
+wrapper_defs:              hist {16:4}, ARRIVE=4,  DEPBAR=4,  gsb0=8
+call_inline_wrapper:       hist {1:64}, ARRIVE=64, DEPBAR=64, gsb0=128
+```
+
+Fresh-cache confirmation of `call_inline_wrapper` reproduced the same singleton
+drain with `LOCAL:0`. The active forceinline pair2k wrapper call is sufficient
+to make ptxas put `gsb0` on every HGMMA and drain after each one, while the same
+wrapper definitions left unselected do not. Next production-facing qwen NT work
+should flatten or bypass selected WGMMA helper-call boundaries in the real
+supertile and gate on real `megakernel_pdf` SASS, not timing.
+
+## Qwen NT Direct In-Body Production Issue
+
+Record: `results/operator-gap/qwen-nt-directissue-0ba235d-nopromote.md`
+
+Sibling: `/home/apanda/xorl-oss-qwen-nt-directissue-0ba235d`
+
+Commits:
+
+```text
+b5845b3 checkpoint current promoted stack for qwen nt direct issue
+7d8f2b1 add qwen nt direct in-body issue candidate
+f96db58 add qwen nt direct issue build helper
+```
+
+The default-off `_ntdi` patch flattened the two-strip CUTE WGMMA issue directly
+inside `op_gemm_wgmma_n256_nt_supertile_impl<3>`, avoiding the selected
+`wg_mma_ktile_n128` helper-call boundary. Static, route, and build gates passed,
+but focused `megakernel_pdf` SASS did not move:
+
+```text
+default: HGMMA.64x128=16 ARRIVE=216 DEPBAR=216 hist {1:16} max=1
+variant: HGMMA.64x128=16 ARRIVE=216 DEPBAR=216 hist {1:16} max=1
+focused SASS cmp: identical
+```
+
+Interpretation: helper-call grouping, raw-helper issue, and direct C++ in-body
+issue have all failed the real production `megakernel_pdf` SASS gate. Do not run
+timing or reopen these exact qwen NT issue-cadence spellings. A future qwen NT
+cadence attempt needs a smaller production-context lowering reproducer or a
+different executor/body strategy with a new emitted-instruction contract.
+
+## Small Attention Inline D64 WGMMA Bodies
+
+Record: `results/operator-gap/small-attn-inline-0ba235d-nopromote.md`
+
+Sibling: `/home/apanda/xorl-oss-small-attn-inline-0ba235d`
+
+Commits:
+
+```text
+bfd9a3c add small attention inline wgmma body candidate
+a515f35 refresh small attention inline baseline after precision promotion
+ce32a81 add small attention inline sass gate helper
+```
+
+The default-off `_sattninl` patch force-inlined exact-small D64
+`op_attn_fwd_wg`, `op_attn_dkv_wg`, and `op_attn_dq_wg` without changing the
+route. Host route proof after the DQ+DKV precision-composition promotion kept
+exact-small at `264/145/126`, mode `df`, and FWD/DKV/DQ `8` rows / `512` tiles;
+forced added only `_sattninl`.
+
+Real GPU4 SASS/resource gate:
+
+```text
+default megakernel_df: HGMMA=196 ARRIVE=392 DEPBAR=196 hist {1:196} max=1
+forced  megakernel_df: HGMMA=196 ARRIVE=392 DEPBAR=196 hist {1:196} max=1
+default stack: df=32 df2=64 ws=64 megakernel=64, LOCAL:0
+forced  stack: df=128 df2=144 ws=128 megakernel=224, LOCAL:0
+```
+
+Forced local attention symbols disappeared, confirming the inlining attribute was
+visible, but the whole-image HGMMA/DEPBAR cadence did not move and frame cost
+grew. No timing was run. Do not replay this exact function-attribute-only small
+attention lane; the next attempt must alter the emitted async-group/wait contract
+and prove fewer depbars or max HGMMA run greater than 1 in `megakernel_df` before
+any A/B.

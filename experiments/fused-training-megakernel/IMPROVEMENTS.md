@@ -1776,3 +1776,457 @@ pressure, owns the local traffic — broad `__noinline__` made it WORSE
 (4.83M -> 6.32M); fix state placement, not inlining, and gate per shape
 (the s8192 loss shows shell smem re-reads tax the critical DQ-chain
 shape).
+
+**S1024 fused-qkrope n128 force (0ba235d)** — NO-GO (source-free exact S1024;
+four `1024x512x256` rows moved from flags 386/ntiles64 to flags
+4482/ntiles32; x40 was +29.26us 0/40 and +7.52us 6/40, parity clean;
+s1024-qkrope-n128-0ba235d-nopromote.md)
+Why: halving qkrope tile count with the existing n128 body increases step time
+at exact S1024; the on-path qkrope bucket does not monetize plain route
+widening.
+Principle: the S2048+ qkrope-n128 boundary is a regime boundary; below it, keep
+plain n128 widening closed unless the body or overlap mechanism changes.
+
+**S1024 SSQ-off current-stack stale check (0ba235d)** — NO-GO/KEEP default
+(route unchanged `153`; x80 default-first SSQ-off lost +6.94us, 10/80 wins,
+while x80 variant-first won -12.58us, 79/80; parity clean;
+s1024-ssqoff-current-0ba235d-nopromote.md)
+Why: disabling fused SSQ remains a construction-order artifact at exact S1024
+after the current promotion stack; one build order rewards the off image while
+the other rejects it.
+Principle: fused reductions with opposite-sign both-order timing are not
+mechanism wins; keep the default and require a different body/dependency change.
+
+**S1024 n128 residual+SSQ direct epilogue (0ba235d)** — NO-GO
+(route `153/77/66`; exact eight flags-12434 rows; LOCAL:0; x80 default-first
+lost +3.34us, 25/80 wins, while variant-first won -16.86us, 80/80;
+s1024-n128-rssqepi-0ba235d-nopromote.md)
+Why: removing the runtime shared-epilogue round trip is plausible and parity-clean,
+but the full-step image remains construction-order sensitive.
+Principle: a direct epilogue that only wins in one build order is not a default;
+future S1024 NT+SSQ work needs composition-stable layout or dependency changes.
+
+**S1024 current-stack FWD w128 refresh (0ba235d)** — NO-GO
+(route `153/77/66`; default-off `_afw128`; exactly four `OP_ATTN_FWD_WG`
+rows moved to `OP_ATTN_FWD_WGW128`; default image `LOCAL:0` and stack
+`96/64/48/64`, forced image `LOCAL:0` but stack `224/160/144/224`; x40
+default-first lost +18.51us with 0/40 wins, variant-first lost +1.22us with
+16/40 wins; s1024-fwdw128-refresh-0ba235d-nopromote.md)
+Why: the 128-wide K/V stage count reduction is real and routes cleanly, but the
+two-ring body loses the current PV-overlap structure and pays the 120KB carveout
+plus fatter codegen.
+Principle: S1024 forward attention needs a body/layout change that preserves
+overlap or changes the dependency contract; plain 128-wide staging is closed.
+
+**S1024 forced pdf/D64/feed composition (0ba235d)** — NO-GO/NO-ROUTE
+(source-free current-stack check; `MK_MODE=pdf,MK_GEMM_D64_TMA=1,
+MK_PDF_D64_FEED=1`; `MK_ATTN_PDF_FEED=0` route rows stayed `153` and parity was
+clean, but x8 was order-mixed: default-first lost +12.74us with 1/8 wins,
+variant-first won only -1.90us with 6/8; `MK_ATTN_PDF_FEED=1` reproducibly
+builds `_pdf240p_pd64f_apdff` then importlib fails despite `nm` and ctypes
+seeing the 208-char `PyInit_..._apdff` symbol; `=2` skipped;
+s1024-pdffeed-composition-0ba235d-nopromote.md)
+Why: producer-pdf plus D64/feed is not a hidden current-stack S1024 win, and the
+attention-pdf-feed variant currently trips the Torch/Python extension import
+contract before timing.
+Principle: route/composition checks must pass both construction orders before
+source work; if pdf/feed is revisited, it must come with a larger
+producer/drain or one-pass topology and a shorter/stabler extension-load
+contract.
+
+**S1024 FWD GQA64 paired-row body (0ba235d)** — NO-GO
+(default-off `_afgqa64`; route `153/77/66`; exactly four exact-S1024
+`OP_ATTN_FWD_WG` rows moved to `OP_ATTN_FWD_GQA64`; resources identical and
+spill-free at `168/96/0`, `255/80/0`, `255/64/0`, `255/64/0`; x80
+default-first lost +2.70us with 37/80 wins, while variant-first won -14.14us
+with 80/80; parity clean; s1024-fwd-gqa64-0ba235d-nopromote.md)
+Why: grouping the two q-heads that share a K/V head is route-clean and
+correct, but the forced image grows SASS (`__LINES__ +3576`, HGMMA/warpgroups
++32) and the step win is construction-order sensitive.
+Principle: remapping the existing forward-attention consumer WGs is not enough;
+the next S1024 attention lane needs a producer/drain or register/dependency
+contract change that wins in both build orders.
+
+**S1024 DKV P/dS-ring stage pipeline (0ba235d)** — NO-GO
+(default-off `_adkvpds`; route `153/77/66`; same four exact-S1024
+`OP_ATTN_DKV_WG` rows, forced-only 148KB smem; LOCAL:0 but stack grew from
+`96/64/48/64` to `368/224/208/448`; SASS grew `__LINES__ +11922`,
+`HGMMA.64 +96`, `LDL +739`, `STL +342`; smoke x2 lost both orders,
+`+69.82us` and `+54.91us`, with 0/2 wins; parity clean;
+s1024-dkv-pdsring-0ba235d-nopromote.md)
+Why: the explicit P/dS smem ring avoids the rejected no-page-growth
+stage-pipe register-bank cliff, but the 148KB carveout and fatter body more
+than erase any overlap benefit.
+Principle: S1024 DKV needs a stronger producer/drain or topology change that
+reduces work, not a smem ring wrapped around the same staged S/dP and dV/dK
+sequence.
+
+**S1024 MLP dX static-body current-stack refresh (0ba235d)** — NO-GO
+(default-off `_mlpdxst`; exact four `GEMMNN 1024x256x1536.wg` flags-128 rows;
+route `153/77/66`; resources identical/spill-free at `168/96/0`, `255/64/0`,
+`255/48/0`, `255/64/0`; SASS `__LINES__ +3488`, `HGMMA.64x64 +16`; x40
+default-first lost `+5.18us` with 6/40 wins, while variant-first won
+`-17.47us` with 40/40; parity clean;
+s1024-mlpdx-static-refresh-0ba235d-nopromote.md)
+Why: staticizing the n64 WGMMA MLP dX body preserves the strong one-op win and
+does not hurt resource usage, but the full-step effect remains
+construction-order sensitive on the current stack.
+Principle: do not reopen this exact static-body codegen; the MLP dX bucket needs
+a different scheduling/fusion mechanism, not another current-stack refresh.
+
+**Qwen D128 rowsplit dQ descriptor precompute (0ba235d)** - NO-GO
+(default-off `_ad128dqdpre`; L2 route unchanged `78/44/14`; resources
+identical/spill-free at `megakernel_pdf REG 168 STACK 112 LOCAL 0`; SASS
+`__LINES__ +32`, but `HGMMA.64`, `WARPGROUP.ARRIVE`, and
+`WARPGROUP.DEPBAR.LE gsb0, 0x0` all stayed `1080 -> 1080`;
+qwen-d128-dqdesc-0ba235d-nopromote.md)
+Why: precomputing the same KK descriptors as named temporaries changes code
+shape slightly but does not alter ptxas' HGMMA dependency-barrier cadence.
+Principle: D128 rowsplit attention needs a different WGMMA issue/wait or body
+topology contract; descriptor materialization alone is closed.
+
+**Qwen NT standalone frontier refresh (0ba235d)** - MEASUREMENT
+(source-free `fat_gemm_probe.py qwen`; prefix `1024x151808x2560`;
+`run_n128 2768.3us`, `run_n256 2447.7us`, `run_n256d 2482.3us`;
+current integrated qwen4b-L2 NT bucket is `1763.7us`;
+qwen-nt-body-frontier-0ba235d-refresh.md)
+Why: the old standalone probe remains at the stale 2.45ms body class while the
+production PDF/producer context now runs the integrated NT row around 1.76ms.
+Principle: future qwen NT body work must target the production
+`op_gemm_wgmma_n256_nt_supertile_impl<3>` context; do not port from the
+standalone probe without first explaining the production-context speedup.
+
+**Qwen NT supertile wait-distance (0ba235d)** - NO-GO
+(default-off `_ntwd`; production `op_gemm_wgmma_n256_nt_supertile_impl<3>`;
+real qwen4b-L2 route unchanged `78/44/14`, `smem=151552`, `tma=19`;
+resources identical/spill-free at `megakernel_pdf REG 168 STACK 112 LOCAL 0`;
+SASS `__LINES__ +144`, but `HGMMA 1080 -> 1080`,
+`WARPGROUP.ARRIVE 1080 -> 1080`, `WARPGROUP.DEPBAR 1080 -> 1080`,
+`WARPGROUP.DEPBAR.LE ... 0x0 1080 -> 1080`, no `0x1` wait sites, and
+`BAR.SYNC.DEFER_BLOCKING 618 -> 618`;
+qwen-nt-waitdist-0ba235d-nopromote.md)
+Why: the source-level delayed wait and previous-stage release compiles, but
+ptxas preserves the same WGMMA dependency-barrier cadence. Timing was skipped
+because the required SASS objective did not materialize.
+Principle: do not reopen this exact wait-distance source shape; qwen NT needs a
+stronger assembly-level or body-topology mechanism that visibly moves DEPBAR
+placement before timing.
+
+**Qwen D128 rowsplit dQ C1 full-seed retry (0ba235d)** - NO-GO
+(default-off `_ad128dqc1`; first corrected the prior invalid seed by importing
+the full promoted qwen stack including `megakernel.cu`, then proved default-only
+qwen4b-L2 runtime: `FULLSEED_SINGLE_STEP_DONE loss=12.61334419`; candidate route
+unchanged `78/44/14`, `smem=151552`, `tma=19`; resource/SASS looked strong:
+`megakernel_pdf REG 168 STACK 112 LOCAL 0`, plain `megakernel STACK 176 -> 160`,
+SASS `__LINES__ -19904`, `ATOM -960`, `BAR.SYNC.DEFER_BLOCKING -20`;
+qwen-d128-dqc1-fullseed-0ba235d-nopromote.md)
+Why: the separate C1 body removes the intended static atomic/barrier work and is
+correct, but full-step timing is not promotion-grade: x40 default-first lost
+`+15.26us` with 16/40 wins and variant-first was flat at `-0.19us` with 22/40.
+Principle: future D128 C1 work must start from a full-stack seed, but this exact
+separate-body shape is closed; do not reopen the failed template-wrapper path.
+
+**Qwen NT supertile CE-store single-pass (0ba235d)** - NO-GO
+(default-off `_ntce1p`; current production
+`op_gemm_wgmma_n256_nt_supertile_impl<3>` register-epilogue probe that stores
+bf16 output and computes CE64 partials from the same rounded values in one
+half-chunk pass; route unchanged `78/44/14`, `smem=151552`, `tma=19`; resources
+identical/spill-free at `megakernel_pdf REG 168 STACK 112 LOCAL 0`; SASS gate
+failed with `__LINES__ +3184`, `PRMT +416`, `BRA +24`, and no reduction in
+`MUFU.EX2`, `F2FP.BF16.F32.PACK_AB`, `F2F.BF16.F32`, `FADD`, `FMUL`,
+`SHFL.BFLY`, HGMMA, WARPGROUP, or barriers;
+qwen-nt-cestore-0ba235d-nopromote.md)
+Why: the current supertile epilogue formulation compiles cleanly but ptxas does
+not fuse away the duplicate conversion/math work; it grows permutation/control
+SASS instead. Timing was skipped.
+Principle: do not replay this CE-store half-chunk formulation; future qwen NT
+work needs a larger body/executor change or a visibly different HGMMA/DEPBAR
+contract before timing.
+
+**S8192 DKV P/dS STSM staging (0ba235d)** - NO-GO
+(default-off `_adkvstsm`; exact S8192 route unchanged `183/80/62`, `mode=pdf`,
+`smem=102400`; SASS objective passed with `STSM 0 -> 40` and `LOCAL=0`;
+parity clean, but x16 timing lost both orders: `+10.21us` with 4/16 wins and
+`+14.18us` with 0/16 wins; s8192-dkv-stsm-0ba235d-nopromote.md)
+Why: the proven non-trans x4 STSM mapping correctly replaces DKV P/dS generic
+stores, but DKV-only store issue is not a profitable current exact-S8192 path.
+Principle: do not reopen this exact DKV-only STSM replacement; future STSM work
+must be tied to a dependency/topology change that shrinks measured wait cells.
+
+**S8192 DQ tail ready-order priority (0ba235d)** - NO-GO
+(default-off `MK_ATTN_DQ_TAIL_READY_FIRST=1`; exact S8192 route unchanged
+`183/80/62`, `mode=pdf`, `smem=102400`; host proof changed only adjacency order
+for dO/drow producer rows `[97,120,143,166]`, making DQ tail rows
+`[106,129,152,175]` first dependents; s8192-dq-ready-order-0ba235d-nopromote.md)
+Why: the profile mechanism worked locally, shrinking DQ tail wait from
+`~431-434us` to `~3us`, but the realized path moved to sibling `ATTN_DKV_WG`
+rows with `~410-418us` waits and selected profile total worsened in both orders
+(`+67.52us`, `+104.864us`).
+Principle: do not reopen this exact DQ-only adjacency priority. Future S8192
+scheduler work must shrink the combined DQ/DKV sibling wait bucket instead of
+choosing which sibling inherits the same producer fanout delay.
+
+**S8192 tail-pair ready-order priority (0ba235d)** - NO-GO
+(default-off `MK_ATTN_TAIL_PAIR_READY_FIRST=dkv_first|dq_first`; exact S8192
+route unchanged `183/80/62`, `mode=pdf`, `smem=102400`; host proof changed only
+adjacency order for dO/drow producer rows `[97,120,143,166]`, moving local DKV/DQ
+tail pairs `[105,106]`, `[128,129]`, `[151,152]`, `[174,175]` ahead of larger
+sibling bands; s8192-tailpair-ready-0ba235d-nopromote.md)
+Why: the local wait mechanism worked, cutting combined DKV/DQ tail wait from
+`3268.096us` to about `30us`, but selected profile time worsened for both
+orders (`+135.616us` for `dkv_first`, `+126.976us` for `dq_first`) because the
+path moved to larger `ATTN_DQ_WG ntiles=240` sibling waits around `358-360us`.
+Principle: do not reopen this exact tail-pair adjacency priority. Future S8192
+scheduler work must handle the whole sibling fanout after the dO/drow producers,
+not only the small local C4 tail pair.
+
+**S8192 DQ-family ready-order priority (0ba235d)** - NO-GO
+(default-off `MK_ATTN_DQ_FAMILY_READY_FIRST=stage_first|dq_family_first`;
+exact S8192 route unchanged `183/80/62`, `mode=pdf`, `smem=102400`; host proof
+changed only adjacency order for dO/drow producer rows `[97,120,143,166]`;
+s8192-dq-family-ready-0ba235d-nopromote.md)
+Why: both variants erased the large DQ C3 wait (`298.760us -> ~2.8us` avg), but
+selected profile time still worsened (`+105.856us` for `stage_first`, `+66.400us`
+for `dq_family_first`) because the realized path moved to DKV C4 tail rows and
+span grew (`+70.944us` / `+129.184us`).
+Principle: do not reopen single-family adjacency priority. Exact S8192 needs a
+stronger sibling-fanout contract than one producer completion hint, or a
+body/topology change that reduces the DKV C4 tail after DQ priority.
+
+**S8192 hot-ring fair-quantum executor policy (0ba235d)** - NO-GO
+(default-off `MK_S8192_ATTN_HOT_FAIR=1`, `_s8192hfq16`; exact S8192 route
+unchanged `183/80/62`, `mode=pdf`, `smem=102400`; resource/SASS spill-free with
+unchanged `megakernel_pdf REG:168 STACK:144 SHARED:1264 LOCAL:0`;
+s8192-hotfair-0ba235d-nopromote.md)
+Why: the bounded fair pass removed most DQ/DKV ready wait
+(`dq_family_wait_sum 4926.944us -> 1032.512us`,
+`dkv_family_wait_sum 2340.096us -> 423.744us`), but selected profile time
+worsened by `+201.920us` because on-path span grew by `+1629.120us` and the
+path moved onto fragmented long C3 DQ rows.
+Principle: do not reopen this exact first-quantum hot-ring fair pass. Future
+S8192 scheduler work needs coarser group admission that avoids fragmenting the
+long attention bodies, or a body/topology change that reduces the exposed row
+span before paired timing.
+
+**Qwen NT descriptor-fidelity singleton-drain probe (0ba235d)** - ROUTE-AWAY
+(standalone `_descfidelity` SASS probe in sibling, no production source edits;
+K/MN `.tnspB` variants with K, MN128, and MN B descriptors all compiled
+spill-free and kept pair2k grouping at `HGMMA.64x128 segment hist {16: 4}`;
+qwen-nt-descfidelity-probe-0ba235d.md)
+Why: `.tnspB`, uniform-register descriptors, MN descriptor construction,
+384-thread launch, `__maxnreg__(168)`, and qwen-like smem footprint are not
+sufficient to reproduce production's HGMMA=DEPBAR singleton drain.
+Principle: do not reopen qwen NT from operand form alone. The next reproducer
+must include more of the production body embedding around WGMMA/barrier/epilogue
+live ranges before another production source patch.
+
+**Qwen NT production-embedding reproducer preflight (0ba235d)** - ROUTE
+(source-free correction/route note; function-local qwen NT supertile counts
+show production pair2k `HGMMA.64x128=24, DEPBAR=24, hist {1:24}` and rawprod
+`HGMMA.64x128=8, DEPBAR=8, hist {1:8}`; standalone production-pressure and
+descriptor-fidelity pair2k controls stay grouped at `{16:4}`;
+qwen-nt-production-embedding-preflight-0ba235d.md)
+Why: the earlier broad focused window was polluted by generic WGMMA code, but
+the corrected noinline-symbol count still proves singleton drain inside the
+real production supertile body. Operand form, `.tnspB`, generic pressure,
+384-thread launch, and qwen-like smem are not sufficient standalone causes.
+Principle: the next qwen NT artifact should be a sibling-only body-embedding
+SASS probe that progressively adds the noinline supertile shell, mbarrier/PDF
+branch context, epilogue, and CE live ranges around the grouped helper. Do not
+open another production patch until that smaller embedding reproduces or
+materially approaches the singleton drain.
+
+**Qwen NT body-embedding standalone SASS probe (0ba235d)** - ROUTE
+(sibling-only standalone probe; all bodyembed variants including direct kernel
+control reproduced singleton `HGMMA.64x128=64, DEPBAR=64, hist {1:64}` with
+`LOCAL:0`; descriptor-fidelity rerun control still grouped at `{16:4}`;
+qwen-nt-bodyembed-probe-0ba235d.md)
+Why: the qwen NT singleton drain is now reproducible outside the production
+route, but the immediate trigger is not isolated to explicit noinline,
+mbarriers, epilogue, or CE live ranges. The bodyembed translation-unit/code
+shape is enough to make a direct pair2k control emit per-HGMMA `gsb0`/DEPBAR,
+while the smaller descriptor-fidelity translation unit still groups.
+Principle: do not open a production body patch from this result alone. Next
+qwen NT work should start from the grouped descriptor-fidelity probe and add
+bodyembed context one piece at a time until `{16:4}` first collapses to `{1:64}`.
+
+**Qwen NT code-shape collapse ablation preflight (0ba235d)** - ROUTE
+(source-free matrix selection; grouped descriptor rerun remains `{16:4}` while
+bodyembed direct is `{1:64}`; qwen-nt-codeshape-ablation-preflight-0ba235d.md)
+Why: the next useful standalone probe must start from the grouped descriptor
+source, not the already-poisoned bodyembed source, and add one source-shape
+difference per variant.
+Principle: isolate the first collapse trigger with separate CUDA source strings
+before any production qwen NT patch.
+
+**Qwen NT manual code-shape ablation (0ba235d)** - INVALID-BASELINE
+(sibling `/home/apanda/xorl-oss-qwen-nt-codeshape-0ba235d`; manual
+descriptor-source copy could not reproduce grouped baseline and singleton-drained
+in all baseline repair attempts; qwen-nt-codeshape-ablation-invalid-baseline-0ba235d.md)
+Why: the original descriptor-fidelity rerun still groups, so the manual copy is
+not source-identical enough for causal conclusions.
+Principle: the next ablation must import the original descriptor-fidelity
+`CUDA_SRC` byte-for-byte and mutate that exact string one controlled step at a
+time.
+
+**Qwen NT exact-source mutation probe (0ba235d)** - ROUTE-AWAY
+(sibling `/home/apanda/xorl-oss-qwen-nt-exactsrc-0ba235d`; imported the
+descriptor-fidelity `CUDA_SRC` byte-for-byte and applied narrow mutations;
+qwen-nt-exactsrc-mutation-probe-0ba235d.md)
+Why: the imported baseline grouped correctly (`HGMMA.64x128=64, DEPBAR=4,
+hist {16:4}`), and removing `cute_mma4`, removing `issue_stage_pair`, removing
+both unused stage helpers, or switching to the bodyembed tid/store shape all
+still grouped with `LOCAL:0`.
+Principle: do not rerun helper-removal or tid/store-shape qwen NT ablations.
+The first singleton-drain trigger is still in larger bodyembed context: hardcoded
+descriptor selection, active `mk_tid`/unused `bfull` prologue, unused bodyembed
+helper definitions, wrapper definitions, body template definitions, or selected
+noinline body calls. Keep using exact imported descriptor source as the baseline.
+
+**Qwen NT exact-source body-context probe (0ba235d)** - ROUTE
+(same sibling, commit `daf1e03`; qwen-nt-exactsrc-bodyctx-probe-0ba235d.md)
+Why: the first reproduced collapse is the selected forceinline pair2k wrapper
+call. `baseline_import`, `hardcoded_desc`, `active_bodyembed_prologue`,
+`unused_body_helpers`, and unselected `wrapper_defs` all kept grouped
+`HGMMA.64x128=64, DEPBAR=4, hist {16:4}`, but `call_inline_wrapper` flipped to
+`ARRIVE=64, DEPBAR=64, hist {1:64}`, `gsb0=128`, `LOCAL:0`; a fresh-cache
+single-variant rerun reproduced it.
+Principle: qwen NT production work should now target the active WGMMA issue
+boundary. Avoid selected helper-call wrapper shapes around pair2k issue in the
+real supertile, and require real `megakernel_pdf` SASS to show grouped issue or
+reduced per-HGMMA `gsb0`/DEPBAR before timing.
+
+**Qwen NT direct in-body production issue (0ba235d)** - NO-GO
+(sibling `/home/apanda/xorl-oss-qwen-nt-directissue-0ba235d`; default-off
+`MK_GEMM_N256_NT_SUPERTILE_DIRECT_ISSUE=1`, `_ntdi`;
+qwen-nt-directissue-0ba235d-nopromote.md)
+Why: route/static/build/resource gates passed, but focused `megakernel_pdf` SASS
+was byte-identical to default. Both images stayed
+`HGMMA.64x128=16`, `ARRIVE=216`, `DEPBAR=216`, `hist {1:16}`,
+`MAX_HGMMA_BETWEEN_DEPBAR=1`, `megakernel_pdf REG:168 STACK:112 LOCAL:0`.
+Principle: ordinary production C++ spellings around the current qwen NT
+supertile issue path are closed as a cadence fix: helper-call `_ntp2k`, raw
+helper `_ntraw`, and direct in-body `_ntdi` all fail the real `megakernel_pdf`
+SASS gate. Future qwen NT issue work needs a smaller production-context lowering
+reproducer or a different executor/body strategy before another source patch.
+
+**Small attention inline D64 WGMMA bodies (0ba235d)** - NO-GO
+(sibling `/home/apanda/xorl-oss-small-attn-inline-0ba235d`; default-off
+`MK_INLINE_SMALL_ATTN_WGMMA_BODIES=1`, `_sattninl`;
+small-attn-inline-0ba235d-nopromote.md)
+Why: the forced image removed the exact-small FWD/DKV/DQ local function labels,
+but whole `megakernel_df` SASS stayed fully serialized:
+`HGMMA=196`, `WARPGROUP.DEPBAR=196`, `hist {1:196}`, `max=1`, identical to
+default. Resources stayed `LOCAL:0`, but stack grew materially
+(`megakernel_df 32->128`, `df2 64->144`, `megakernel 64->224`), so no timing
+was run.
+Principle: function-attribute inlining alone is not a sufficient small-attention
+cadence fix in the current image. Future small-attention WGMMA work needs a new
+emitted-code contract that visibly changes DEPBAR placement or max HGMMA run
+before timing, while preserving `LOCAL:0` and avoiding the frame cliff.
+
+**s2048 precision sibling 2^3 lattice (rs=DQ_RS_FEED / qp=DQ_FP32_P / kp=DKV_FP32_P)**
+— PROMOTE-CANDIDATE: exact-s2048 triple -36.6/-23.5us both orders 40/40 (k8s x40,
+parity + forced test_model + LOCAL:0 clean); full lattice: rs -11.9 and qp -11.7 hold
+alone, kp order-mixed alone (-10.3/+0.4) but worth -9..-11 composed; interactions
+rs*kp -6.3, qp*kp -3.6 (super-additive), rs*qp +3.8; top-level additive
+(results/operator-gap/precision-lattice-s2048-0ba235d.md).
+Why: the s2048 gate hole was singles-first screening stopping before composition —
+neighbor-shape refutations (rs at s3072, kp beyond s1024) were read as shape verdicts.
+Principle: sibling-group sign dependence is a property of the DKV knob, not the group;
+screen COMPOSITIONS wherever a sibling set shares a data path.
+
+**Partial-gate precision completion resweep (s1024/s3072/s4096, env-only k8s battery)**
+— PROMOTE-CANDIDATE x2: s3072 +rs+kp -36.0/-34.8us and s4096 +qp+kp -56.3/-54.4us
+(40/40 both orders, parity/LOCAL:0 clean); TWO verdict-rot flips: rs@s3072 (old
+reverse-order refutation) now -28.4 alone, qp@s4096 (old neutral) now -18.3 alone;
+kp tracks the DKV-wait bucket (-32 s4096, -9 s3072, mixed shorter); s1024 all cells
+order-mixed (+/-7us second-build-wins artifact) — closed
+(results/operator-gap/precision-completion-s1024-s3072-s4096-0ba235d.md).
+Why: both refutations predate bulk-red/prebias/pdf/NT-store; the stack moved under them.
+Principle: resweep refuted knobs AS COMPOSITIONS after structural landings — the
+completion cell is the cheapest resweep and caught ~-121us across three shapes.
+
+**kp (DKV FP32-P) completion at rs+qp shapes (s8192/deep/s128/s256, env-only k8s)**
+— PROMOTE-CANDIDATE x2: s8192 +kp -103.3/-109.4us and deep +kp -19.7/-23.6us (40/40
+both orders each, parity/LOCAL:0 clean); s128/s256 order-mixed flat. Completes the
+precision-sibling gate map: kp value tracks TOTAL DKV wait mass (s8192 -106 @1751us
+wait, s4096 -32 @465us, deep -21.6 @12xS512, s3072 -9.4, shorter flat/mixed)
+(results/operator-gap/kp-completion-deep-s128-s256-s8192-0ba235d.md).
+Why: kp cuts the bf16 round-trip on the DKV P operand; the saving is proportional
+to how much DKV wait the shape carries, and s8192 carries the most anywhere.
+Principle: a knob whose mechanism prices one wait bucket scales with that bucket's
+mass — gate by the bucket, not the shape family. Session integration payload now
+~-249us across five shapes (s2048/s3072/s4096/s8192/deep triples).
+
+**Mid-S prebias completion + s8192 bulk-red composition recheck (env-only k8s)**
+— PROMOTE-CANDIDATE: prebias exact_s3072 -13.4us (40/40+39/40); s2048 weak-hold
+-5.2 (integrator's choice). Bulk-red @s8192 refutation RECONFIRMED stronger
+(+94/+86, 0/40 both) and robust under kp's -106us DKV-wait cut (marginal +80.5):
+promote to conservation-grade do-not-spend, no expiry
+(results/operator-gap/prebias-completion-bulkred-recheck-0ba235d.md).
+Why: the drain's mandatory wait_group 0 sits on the C=4 tail bands regardless of
+how much DKV wait the shape carries; prebias scales with attention-bwd exp mass.
+Principle: a composition recheck is the cheapest way to upgrade a mechanism-scoped
+NO-GO to conservation-scoped — or catch its rot; this one held, the precision
+family's two did not.
+
+**Composed precision-default validation (candidate 6c9ecab, forced-old rollback x5 shapes)**
+— INTEGRATION-READY: new defaults win over forced-old at every payload shape, both
+orders (s2048 +20.7/+32.1 old-slower, s3072 +32.0/+34.9, s4096 +49.8/+48.1, s8192
++98.6/+98.6, deep +16.9/+6.3; parity 10/10, LOCAL:0, ROUTE suffix proofs) =>
+composed total ~-219us vs the -262 naive per-knob sum
+(results/operator-gap/prebias-completion-bulkred-recheck-0ba235d.md, patch
+results/precision-payload-gate-edits-6c9ecab-20260709T0426Z.patch).
+Why: triple and prebias overlap on the attention-bwd exp/pack path — per-knob cell
+sums over-claim; the composed forced-old number is the honest promotion value.
+Principle: promote COMPOSED defaults with one forced-old validation per shape;
+never sum per-knob deltas into a promotion claim.
+
+**Second-ring completion: DQ float2-store holes + prebias@small (env-only, composed base)**
+— SPLIT: all four _H256_DQ_FLOAT2_S holes (deep/s1024/s2048/s4096) GENUINE no-go
+(order-mixed/noise inside the measured null band); prebias@small FLIPPED -11.6/-4.8
+(39/40, 32/40) = third verdict-rot flip, addendum promote-candidate on the 6c9ecab
+payload (results/operator-gap/ring2-float2holes-prebias-small-0ba235d.md).
+Why: tonight's rot concentrated on knobs sharing the attention-bwd precision/exp
+data path the payload changed; the store-side float2 knob is untouched by it.
+Principle: composition-rot is data-path-local — resweep the knobs that share the
+changed path first, not the whole neighborhood.
+
+**Fwd-knob mid-S completion (expfold/mask_split/dediverge, env-only, composed base)**
+— PROMOTE-CANDIDATE: mask_split@s3072 -16.6/-12.2 (40/40 both); expfold@s3072 also
+holds (-13.2/-11.0) but the composed cell (-14.3/-11.4) proves FULL OVERLAP — land
+mask_split alone. All three s2048 fwd cells null (one-order -10 artifact); expfold
+@s4096 borderline, expiry-dated (results/operator-gap/fwdmid-completion-0ba235d.md).
+Why: cross-path coupling (bwd payload flipping fwd verdicts) is shape-selective —
+present where the payload moved per-wave scheduling most (s3072), absent at s2048.
+Principle: when two sibling knobs win at the same shape, the composed cell decides
+between them — full overlap means land ONE, not both.
+
+**Payload v2.1 final validation (mask_split@s3072 in, prebias@small OUT)**
+— s3072 v2 composed VALIDATED forced-old +46.0/+52.4 (0/40 both; total s3072 now
+~-49us vs pre-session); prebias@small REVERTED: forced-old rollback null both
+orders (-0.6/+1.6) — the ring2 env-on "flip" (-11.6/-4.8) was a null-band FP
+caught by the validation pass (results/operator-gap/fwdmid-completion-0ba235d.md
++ ring2 note corrected). Final integration patch:
+results/precision-payload-v2.1-gate-edits-4e09c47-20260709T0603Z.patch.
+Why: a weak-order paired win under ~9us is inside the measured identical-build
+null band regardless of win count; env-on and forced-old must AGREE before a
+default lands.
+Principle: the forced-old validation is not a formality — it is the FP filter;
+raise the weak-order acceptance bar to the measured null band (~9us).
+
+**Post-payload residual re-profile (5 shapes, candidate 4e09c47, median-of-7)**
+— MAP UPDATE: s4096 DKV wait 465->218 (kp halved it; DQ/DKV now balanced 330/326
+— target jointly); s8192 DQ wait 1751->1629 remains #1; s2048 now FLAT (top op 8%
+of step -> floor-shape classification); deep top waits = RMS rowops
+(results/operator-gap/residuals-post-payload-4e09c47.md).
+Why: the payload moved wait mass, not just span — the binding-constraint column
+must be re-derived after every promotion burst, before new lane selection.
+Principle: re-profile BEFORE picking the next lane, not after it fails.
+
+**expfold@s4096 x80 escalation** — NO-GO (x40 borderline -7.8/-2.8 evaporated at
+x80: +3.4 (21/80) / -0.9 (39/80), sign inversion in the strong order; parity/
+LOCAL:0 clean). expfold stays exact-s1024/s3072-adjacent per the fwdmid map.
+Principle: escalate reps INSIDE the noise band before promoting or deferring —
+an x40 single-order -8 with 34/40 wins can be pure noise.

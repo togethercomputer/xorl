@@ -14,7 +14,6 @@ mathgen.cjs (LaTeX -> MathJax SVG at build time; needs mathjax-full@3 on the
 node module path). This script does not touch it.
 """
 
-import glob
 import json
 import re
 import sys
@@ -50,9 +49,10 @@ def main():
             continue
         assert len(v["mk"]) == 12 and len(v["base"]) == 12, k
 
-    sweep_paths = sys.argv[1:] or sorted(
-        glob.glob("/tmp/claude-0/-home-apanda-xorl-oss/*/scratchpad/sweep-*.log")
-    )
+    # Sweep ingestion is EXPLICIT-ONLY: facts.json is the durable home of the
+    # fresh series. An implicit /tmp glob could silently regress it to an older
+    # session's logs (per-shape merge lets any stale log win). Pass paths.
+    sweep_paths = sys.argv[1:]
     fresh = load_sweep(sweep_paths)
     if fresh:
         unknown = set(fresh) - set(names)
