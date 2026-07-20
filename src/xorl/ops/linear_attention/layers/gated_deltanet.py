@@ -549,6 +549,15 @@ class GatedDeltaNet(nn.Module):
             b_input = self.b_proj(hidden_states)
             gate_input = self.g_proj(hidden_states) if self.use_gate else None
 
+        diagnostic_capture = getattr(self, "_diagnostic_capture_component", None)
+        if diagnostic_capture is not None:
+            diagnostic_capture("gdn_q_input", q_input)
+            diagnostic_capture("gdn_k_input", k_input)
+            diagnostic_capture("gdn_v_input", v_input)
+            diagnostic_capture("gdn_a_input", a_input)
+            diagnostic_capture("gdn_b_input", b_input)
+            diagnostic_capture("gdn_gate_input", gate_input)
+
         if _conv_contract_enabled() and not self.use_short_conv:
             raise RuntimeError("XORL_GDN_CONV_CONTRACT is armed but this GatedDeltaNet has use_short_conv=False.")
 
@@ -600,6 +609,11 @@ class GatedDeltaNet(nn.Module):
             v = F.silu(v_input)
             conv_state_q = conv_state_k = conv_state_v = None
 
+        if diagnostic_capture is not None:
+            diagnostic_capture("gdn_conv_q", q)
+            diagnostic_capture("gdn_conv_k", k)
+            diagnostic_capture("gdn_conv_v", v)
+
         q, k = (rearrange(x, "... (h d) -> ... h d", d=self.head_k_dim) for x in (q, k))
         v = rearrange(v, "... (h d) -> ... h d", d=self.head_v_dim)
 
@@ -617,6 +631,9 @@ class GatedDeltaNet(nn.Module):
             g = -self.A_log.float().exp() * F.softplus(a_input + self.dt_bias)
         if self.allow_neg_eigval:
             beta = beta * 2.0
+        if diagnostic_capture is not None:
+            diagnostic_capture("gdn_g", g)
+            diagnostic_capture("gdn_beta", beta)
 
         recurrent_state = last_state["recurrent_state"] if last_state is not None else None
 
@@ -684,6 +701,7 @@ class GatedDeltaNet(nn.Module):
                 if cp_context is not None:
                     chunk_kwargs["cp_context"] = cp_context
                 o, recurrent_state = chunk_fn(**chunk_kwargs)
+
         elif mode == "fused_recurrent":
             o, recurrent_state = fused_recurrent_gated_delta_rule(
                 q=q,
@@ -699,6 +717,9 @@ class GatedDeltaNet(nn.Module):
         else:
             raise NotImplementedError(f"Unsupported mode `{mode}`.")
 
+        if diagnostic_capture is not None:
+            diagnostic_capture("gdn_scan_out", o)
+
         if past_key_values is not None and self.layer_idx is not None:
             past_key_values.update(
                 recurrent_state=recurrent_state,
@@ -712,6 +733,8 @@ class GatedDeltaNet(nn.Module):
             o = self.o_norm(o, gate)
         else:
             o = self.o_norm(o)
+        if diagnostic_capture is not None:
+            diagnostic_capture("gdn_normed", o)
 
         o = rearrange(o, "b t h d -> b t (h d)")
         o = self._project_output_linear(o)

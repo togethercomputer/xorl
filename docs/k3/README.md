@@ -11,6 +11,14 @@ Start with [DEFAULTS_AND_PARETO.md](DEFAULTS_AND_PARETO.md). It contains:
 - the evidence class and measured speed status for each recipe;
 - production, diagnostic-only, and rejected flag classifications.
 
+Model-family bring-up guides:
+
+- [NEW_MODEL_ZERO_K3_BRINGUP.md](NEW_MODEL_ZERO_K3_BRINGUP.md) — reusable first-divergence,
+  contract, DR-GRPO, overhead-measurement, and upstream/default workflow for GLM and future
+  families.
+- [QWEN35_GDN_ZERO_K3_RUNBOOK.md](QWEN35_GDN_ZERO_K3_RUNBOOK.md) — dense Qwen3.5 GDN live-zero
+  result, root-cause chain, exact paired contract, measured overhead, receipts, and defaults.
+
 ## Evidence classes
 
 - **[GATE]**: a frozen-input component, layer, or end-to-end equivalence gate.
@@ -28,8 +36,17 @@ Never promote a claim to a stronger class without new evidence. Always report th
   with the current trees.
 - Softmax-attention MoE scoring has a bitwise contract **[GATE]**. Live MoE must also preserve
   routing capture/replay and validate the serving topology.
-- Hybrid GDN+MoE is bitwise for teacher-forced prefill/scoring **[GATE]**; live recurrent decode
-  still has a declared nonzero floor. Do not advertise it as a zero-K3 live lane.
+- Qwen3.5-MoE has a trainable native-EP ordered-combine path **[GATE]**, but it remains explicit
+  opt-in: trainer EP must mirror serving EP, every serving environment needs a fresh capture gate,
+  and no composed throughput result supports making it a generic default.
+- Dense Qwen3.5-0.8B GDN at TP1 has an exact live rollout-to-optimizer mechanics gate
+  **[LOCAL]** under the correctness-oriented rescan contract. This closes the blanket claim that
+  GDN live decode has an unavoidable numerical floor; it does **not** certify Qwen3.5 MoE,
+  distributed serving, production length, or production throughput. See
+  [QWEN35_GDN_ZERO_K3_RUNBOOK.md](QWEN35_GDN_ZERO_K3_RUNBOOK.md).
+- Hybrid GDN+MoE remains bitwise for teacher-forced prefill/scoring **[GATE]** only. Its live
+  recurrent decode, MoE composition, and production topology still need a fresh exact gate; do
+  not infer a zero-K3 production lane from the tiny dense result.
 - Conventional tensor-sharded serving with effective `attn_tp_size` or `head_tp_size` greater
   than 1 has no certified BI lm-head/trunk contract. Top-level TP with EP8+DP-attention can still
   have effective attention/head TP1. The validated TP2 Wordle fallback is minimum-K3, not zero.

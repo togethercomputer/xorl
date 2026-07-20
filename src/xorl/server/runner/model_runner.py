@@ -2315,6 +2315,19 @@ class ModelRunner:
             "final_mlp_output_override": 48,
             "final_residual_output": 49,
             "layer_output_override": 50,
+            "gdn_q_input": 60,
+            "gdn_k_input": 61,
+            "gdn_v_input": 62,
+            "gdn_a_input": 63,
+            "gdn_b_input": 64,
+            "gdn_gate_input": 65,
+            "gdn_conv_q": 66,
+            "gdn_conv_k": 67,
+            "gdn_conv_v": 68,
+            "gdn_g": 69,
+            "gdn_beta": 70,
+            "gdn_scan_out": 71,
+            "gdn_normed": 72,
         }
 
         layer_output_overrides = self._load_diagnostic_layer_output_overrides()
@@ -6500,7 +6513,9 @@ class ModelRunner:
                     # ranks holding only IGNORE_INDEX tokens may hit early-return
                     # paths with a different dtype than the normal-return path.
                     loss_report = local_loss_sum.detach().float()
-                    dist.all_reduce(loss_report, op=dist.ReduceOp.SUM, group=ps.fsdp_group if self.pp_enabled else None)
+                    loss_report_group = ps.fsdp_group if self.pp_enabled else None
+                    if dist.get_world_size(group=loss_report_group) > 1:
+                        dist.all_reduce(loss_report, op=dist.ReduceOp.SUM, group=loss_report_group)
                     if global_valid_tokens.item() > 0:
                         total_loss += (loss_report / global_valid_tokens).item()
             else:

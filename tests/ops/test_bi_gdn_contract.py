@@ -34,12 +34,15 @@ def test_gating_forward_matches_reference_composition():
     A_log, a, b, dt_bias = _gating_inputs(2048)
     g, beta = bi_fused_gdn_gating(A_log, a, b, dt_bias)
     g_ref = -A_log.exp().view(1, 1, -1) * F.softplus(a + dt_bias.view(1, 1, -1))
-    beta_ref = b.float().sigmoid().to(b.dtype).float()
+    beta_ref = b.float().sigmoid()
     assert g.dtype == torch.float32 and g.shape == g_ref.shape
     # the serving kernel's tl.log(1+tl.exp) vs torch softplus is a 1-ulp fp32 term
     assert torch.allclose(g, g_ref, rtol=1e-5, atol=1e-5)
-    # beta (sigmoid rounded through bf16) is bitwise either way
-    assert torch.equal(beta, beta_ref)
+    # fp32-beta convention: full precision, no bf16 round; tl.sigmoid vs
+    # torch.sigmoid is a 1-ulp fp32 term
+    assert beta.dtype == torch.float32
+    assert torch.allclose(beta, beta_ref, rtol=1e-6, atol=1e-6)
+    assert not torch.equal(beta, beta_ref.to(b.dtype).float()), "beta must not be bf16-rounded"
 
 
 @requires_cuda
