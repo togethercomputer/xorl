@@ -1,4 +1,4 @@
-"""R1 gate: the shape-keyed BI GEMM config table is bit-neutral.
+"""Gate: the shape-keyed BI GEMM config table is bit-neutral.
 
 Locks the doctrine that makes the table legal: BLOCK_SIZE_K (pinned per dtype)
 is the only bit-relevant axis of matmul_kernel_persistent. Every table/class
