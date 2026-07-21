@@ -1,8 +1,7 @@
 # K3 train/serve parity
 
 This directory is the current operator entry point for minimizing trainer-to-sampler logprob
-divergence without giving up measured throughput. It describes the current contract as of
-2026-07-10.
+divergence without giving up measured throughput.
 
 Start with [DEFAULTS_AND_PARETO.md](DEFAULTS_AND_PARETO.md). It contains:
 
@@ -11,11 +10,8 @@ Start with [DEFAULTS_AND_PARETO.md](DEFAULTS_AND_PARETO.md). It contains:
 - the evidence class and measured speed status for each recipe;
 - production, diagnostic-only, and rejected flag classifications.
 
-Model-family bring-up guides:
+Model-family bring-up guide:
 
-- [NEW_MODEL_ZERO_K3_BRINGUP.md](NEW_MODEL_ZERO_K3_BRINGUP.md) — reusable first-divergence,
-  contract, DR-GRPO, overhead-measurement, and upstream/default workflow for GLM and future
-  families.
 - [QWEN35_GDN_ZERO_K3_RUNBOOK.md](QWEN35_GDN_ZERO_K3_RUNBOOK.md) — dense Qwen3.5 GDN live-zero
   result, root-cause chain, exact paired contract, measured overhead, receipts, and defaults.
 

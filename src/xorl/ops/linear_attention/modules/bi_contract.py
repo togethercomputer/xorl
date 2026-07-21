@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# The K3 GDN trainer contract (XORL-245), vendored from xorl-sglang.
+# The K3 GDN trainer contract, vendored from xorl-sglang.
 #
 # Under XORL_BI_GDN=1 the two remaining GDN cross-engine terms that live on the
 # trainer side are contracted by running serving's exact kernels with real
@@ -68,7 +68,7 @@ def fused_gdn_gating_kernel(
     softplus_x = tl.where(beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x)
     blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
     tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
-    # XORL-245 fp32-beta convention (paired with serving's fused_gdn_gating):
+    # fp32-beta convention (paired with serving's fused_gdn_gating):
     # beta stays fp32; the old bf16 round disagreed with decode's in-kernel
     # fp32 gating on every token.
     blk_beta_output = tl.sigmoid(blk_b.to(tl.float32))

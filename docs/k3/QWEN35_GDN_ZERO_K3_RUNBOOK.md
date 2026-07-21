@@ -1,39 +1,37 @@
 # Qwen3.5 dense GDN zero-K3 bring-up
 
-Status: 2026-07-20. This is the model-specific evidence and continuation guide for the first
+This is the model-specific evidence and continuation guide for the first
 exact live Qwen3.5 GatedDeltaNet lane. Read it after
-[DEFAULTS_AND_PARETO.md](DEFAULTS_AND_PARETO.md). The reusable procedure extracted from this work
-is [NEW_MODEL_ZERO_K3_BRINGUP.md](NEW_MODEL_ZERO_K3_BRINGUP.md).
+[DEFAULTS_AND_PARETO.md](DEFAULTS_AND_PARETO.md).
 
 ## Result and scope
 
 A one-GPU Qwen3.5-0.8B dense model reached exact trainer/sampler agreement on both the static
 gate and a real rollout-to-update mechanics gate:
 
-| evidence | result | receipt |
+| evidence | result | run artifact |
 |---|---|---|
-| Sampler decode logprobs vs the same sampler's teacher-forced prefill | 64/64 generated tokens bitwise equal | `/shared/apanda/q35_dense_08b_fwdo_pin_20260720/trace_64.json` |
-| Sampler decode logprobs vs xorl teacher-forced logprobs | 64/64 generated tokens bitwise equal; token K3 mean/max `0.0` | `/shared/apanda/q35_dense_08b_fwdo_pin_20260720/static_bifused_v1.json` |
-| Two real SGLang rollouts into xorl DR-GRPO forward/backward and Adam step | `behavior_k3=0.0`, ratio mean `1.0`, policy-KL mean `0.0`, both clip fractions `0.0`, 128 valid completion tokens, optimizer step 1 | `/shared/apanda/q35_dense_08b_fwdo_pin_20260720/live_grpo_gate_final.json` |
+| Sampler decode logprobs vs the same sampler's teacher-forced prefill | 64/64 generated tokens bitwise equal | `trace_64.json` |
+| Sampler decode logprobs vs xorl teacher-forced logprobs | 64/64 generated tokens bitwise equal; token K3 mean/max `0.0` | `static_bifused_v1.json` |
+| Two real SGLang rollouts into xorl DR-GRPO forward/backward and Adam step | `behavior_k3=0.0`, ratio mean `1.0`, policy-KL mean `0.0`, both clip fractions `0.0`, 128 valid completion tokens, optimizer step 1 | `live_grpo_gate_final.json` |
 
-The model snapshot was
-`/shared/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17`.
-The live driver is
-[`experiments/k3_tests/run_q35_live_grpo_gate.py`](../../experiments/k3_tests/run_q35_live_grpo_gate.py).
+The model was `Qwen/Qwen3.5-0.8B` at revision
+`2fc06364715b967f1860aea9cf38778875588b17`.
 
 This is **[LOCAL]**, not **[PROD]**. It proves the one-GPU, TP1, dense, greedy Qwen3.5 GDN
 numerical contract and completes actual DR-GRPO forward/backward plus an optimizer step. The
 driver uses synthetic `+1/-1` advantages so both policy-gradient signs are exercised; it is a
-training-mechanics gate rather than a reward-bearing science campaign.
+training-mechanics gate rather than a reward-bearing experiment.
 It does not certify Qwen3.5 MoE, EP/TP serving, sampled-temperature distributions, long context,
 weight synchronization, or production throughput. It is sufficient to make the contract the
 default for the supported Qwen3.5 on-policy RL lane once the paired implementation lands on both
-`apanda-dev` branches; it is not a generic default for unrelated inference or architectures.
+public xorl and xorl-sglang branches; it is not a generic default for unrelated inference or
+architectures.
 
 ## Measured overhead
 
 The sampler's exact recurrent contract has a real but substantially smaller cost than the old
-research estimate. A controlled A/B on `apanda/olb-dev-04` used the same H100, model snapshot,
+research estimate. A controlled A/B used one H100, a fixed model revision,
 SGLang commit `a2ae035e9`, 45-token prompt, 64 forced generated tokens, batch 1, returned
 logprobs, FA4, PyTorch sampling, disabled CUDA graphs/radix cache/overlap, and all other BI flags
 held fixed. The only intended difference was `SGLANG_BI_GDN_DECODE=0` versus `1`. Seven warm
@@ -59,7 +57,7 @@ Qwen3.5 implementation.
 The old blanket diagnosis, "GDN live decode has an irreducible floor," was too coarse. Three
 independent contract gaps were hiding behind it.
 
-### 1. An internal q/k L2Norm launch configuration changed forward bits
+### 1. The q/k L2Norm launch configuration changed forward bits
 
 The first divergent model boundary was layer 1's GDN scan output. Coarse captures misleadingly
 showed exact q/k/v projections, convolution, gate, and beta. Capturing *inside* the scan moved
@@ -157,54 +155,40 @@ export SGLANG_BI_FWD_O_AUTOTUNE=0
 # --disable-cuda-graph
 ```
 
-The paired SGLang correctness branch was
-`/home/apanda/xorl-sglang-q35-live-fwdo-pin`, branch `k3/q35-live-fwdo-pin`, commit
-`a2ae035e9`. Its fixed GDN `fwd_o` launch is a useful explicit contract, but pinning it did **not**
-move the measured mismatch and was not the root-cause fix. Do not attribute the result to that
-change alone.
+The passing research snapshot also fixed the GDN `fwd_o` launch. That is a useful explicit
+contract, but pinning it did **not** move the measured mismatch and was not the root-cause fix.
+Do not attribute the result to that change alone.
 
 ## Upstream and default disposition
 
-The result is not complete as repository work until the paired code is on both `apanda-dev`
-branches. The policy decision is: zero-K3 behavior becomes the default for supported Qwen3.5
-on-policy RL; faster non-contract behavior remains an explicit opt-out, never an implicit
-autotuner or silent fallback.
+The implementation is deliberately split across two independently reviewable public changes.
+The policy decision is: zero-K3 behavior becomes the default for supported Qwen3.5 on-policy RL;
+faster non-contract behavior remains an explicit opt-out, never an implicit autotuner or silent
+fallback.
 
 | repository | changes to upstream | default after landing |
 |---|---|---|
-| xorl `apanda-dev` | Qwen3.5 norm-family routing and tests; FP32 GDN beta; fixed q/k L2Norm `BT16/w8/s3` with config-sweep tests; single-rank loss-report collective skip; live DR-GRPO gate; generalized GDN replay probes | fixed L2Norm and model routing are normal Qwen3.5 contract behavior; `XORL_FLA_L2NORM_AUTOTUNE=1` is the explicit non-contract opt-out |
-| xorl-sglang `apanda-dev` | the `origin/k3/bi-gdn-decode` partial-chunk-rescan chain through `0646e2f5f`, FP32 beta, norm-row pin, seed/DP-row fixes, Qwen3.5 wiring, BI head pairing, engagement tests/logs, and the `a2ae035e9` fwd-o launch pin | when `--rl-on-policy-target xorl` selects supported Qwen3.5 GDN, exact decode and its paired prefill/head contract engage by default; an explicit kill switch may select recurrent non-contract decode with a loud warning |
+| xorl `apanda-dev` | Qwen3.5 norm-family routing and tests; FP32 GDN beta; fixed q/k L2Norm `BT16/w8/s3` with config-sweep tests; opt-in GDN layer captures | fixed L2Norm and model routing are normal Qwen3.5 contract behavior; `XORL_FLA_L2NORM_AUTOTUNE=1` is the explicit non-contract opt-out |
+| xorl-sglang `main` | xorl-compatible prefill scan, exact partial-chunk-rescan decode, FP32 beta, norm-row pin, Qwen3.5 default wiring, paired BI head, and engagement tests/logs | when `--rl-on-policy-target xorl` selects supported dense Qwen3.5, exact decode and its paired prefill/head contract engage by default; `SGLANG_BI_GDN_DECODE=0` selects recurrent non-contract decode with a warning |
 
-Current source state at the time of this doc:
+The two changes only work as a pair, so review them together:
 
-- xorl changes are uncommitted in `k3-recon-r4` at base `3c28fbc2e` and must be split from
-  unrelated dirty-worktree material before upstreaming;
-- SGLang evidence lives on `/home/apanda/xorl-sglang-q35-live-fwdo-pin`, branch
-  `k3/q35-live-fwdo-pin`, head `a2ae035e9`; its ancestry is a research series, not yet
-  `origin/apanda-dev`;
 - families-v2 must be implemented and gated on the Qwen3.5 SGLang path before making current-v2
   the paired default. The passing v1 pairing is a receipt, not a reason to globally roll back v2;
 - diagnostic tensor captures remain opt-in and are not production defaults.
 
-Upstream definition of done is paired commits on both `apanda-dev` branches, targeted tests,
-static 64/64 replay, the live DR-GRPO gate, a fresh overhead A/B from the landed commits, and an
-engagement log proving the default path was selected without recipe-only flags.
+Landing definition of done is paired commits, targeted tests, static 64/64 replay, the live
+DR-GRPO gate, a fresh overhead A/B from the landed commits, and an engagement log proving the
+default path was selected without recipe-only flags.
 
 ## Reproduce the live mechanics gate
 
-Start the sampler and xorl training server with the paired recipe, verify their real `/generate`
-and service endpoints, then run:
+Start the sampler and xorl training server with the paired recipe and verify their real
+`/generate` and service endpoints. Then sample two completions of 64 tokens from the running
+sampler, feed the returned decode logprobs unchanged into an xorl DR-GRPO forward/backward with
+synthetic `+1/-1` advantages, and take one optimizer step.
 
-```bash
-python experiments/k3_tests/run_q35_live_grpo_gate.py \
-  --sglang-url http://SAMPLER:PORT \
-  --xorl-url http://TRAINER:PORT \
-  --trace-file /shared/apanda/q35_dense_08b_fwdo_pin_20260720/trace_64.json \
-  --max-new-tokens 64 \
-  --output-json /shared/apanda/q35_dense_08b_fwdo_pin_20260720/live_grpo_gate_rerun.json
-```
-
-The script returns nonzero unless `behavior_k3 == 0.0`, ratio mean is exactly `1.0`, and the
+A rerun only counts as passing if `behavior_k3 == 0.0`, ratio mean is exactly `1.0`, and the
 policy-KL mean is exactly `0.0`. Before calling a rerun equivalent to the receipt, also require:
 
 - 128 valid completion tokens from two actual sampler responses;
@@ -222,18 +206,16 @@ not a K3 term.
 
 ## Investigation record
 
-The architecture-neutral ladder now lives in
-[NEW_MODEL_ZERO_K3_BRINGUP.md](NEW_MODEL_ZERO_K3_BRINGUP.md). Qwen3.5-specific observations:
+Qwen3.5-specific observations from the architecture-neutral first-divergence ladder:
 
 - the short eight-token trace was about `1.93e-12`, while the 64-token trace exposed `3.10e-5`
   with a worst logprob difference near `0.0367`;
-- the earliest coarse divergence was layer 1 GDN scan output; internal captures moved it to q/k
+- the earliest coarse divergence was layer 1 GDN scan output; inner-op captures moved it to q/k
   L2Norm;
 - optional captures live in
-  [`src/xorl/ops/linear_attention/layers/gated_deltanet.py`](../../src/xorl/ops/linear_attention/layers/gated_deltanet.py);
-- generalized layer probes are
-  [`replay_gdn_mixer_sampler.py`](../../experiments/k3_tests/replay_gdn_mixer_sampler.py) and
-  [`replay_gdn_mixer_trainer.py`](../../experiments/k3_tests/replay_gdn_mixer_trainer.py).
+  [`src/xorl/ops/linear_attention/layers/gated_deltanet.py`](../../src/xorl/ops/linear_attention/layers/gated_deltanet.py),
+  and dumping them from both engines is what moved the first divergence inward. Offline replay of
+  a captured layer is the cheap loop: it needs no live server and reproduces the mismatch exactly.
 
 ### Falsified hypotheses worth preserving
 

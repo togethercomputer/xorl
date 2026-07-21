@@ -622,7 +622,7 @@ class GatedDeltaNet(nn.Module):
             q, k = (repeat(x, "... h d -> ... (h g) d", g=repeat_factor) for x in (q, k))
 
         if is_gdn_contract_enabled():
-            # XORL-245 GDN contract: serving's fused_gdn_gating kernel kills the
+            # GDN contract: serving's fused_gdn_gating kernel kills the
             # 1-ULP g term (torch softplus vs tl.log(1+tl.exp)); beta is bitwise
             # either way.
             g, beta = bi_fused_gdn_gating(self.A_log, a_input, b_input, self.dt_bias)

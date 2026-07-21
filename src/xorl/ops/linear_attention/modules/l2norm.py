@@ -17,11 +17,7 @@ NUM_WARPS_AUTOTUNE = [1, 2, 4, 8, 16] if IS_AMD else [1, 2, 4, 8, 16, 32]
 # contract uses BT16/w8/stages3; independent autotuning can select another
 # reduction tree and move a handful of bf16 elements by one ULP.
 _L2NORM_FWD_CONFIGS = (
-    [
-        triton.Config({"BT": BT}, num_warps=num_warps)
-        for num_warps in [1, 2, 4, 8, 16]
-        for BT in BT_LIST
-    ]
+    [triton.Config({"BT": BT}, num_warps=num_warps) for num_warps in [1, 2, 4, 8, 16] for BT in BT_LIST]
     if os.environ.get("XORL_FLA_L2NORM_AUTOTUNE", "0") == "1"
     else [triton.Config({"BT": 16}, num_warps=8, num_stages=3)]
 )
