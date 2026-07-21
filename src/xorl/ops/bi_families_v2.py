@@ -1,21 +1,20 @@
-# Families v2 — redefined frozen reduction trees for the K3 BI contract (N6).
+# Families v2 — redefined frozen reduction trees for the K3 BI contract.
 #
 # VENDORED BYTE-IDENTICAL into xorl/ops/ and sglang/srt/batch_invariant_ops/
 # (CI hash-gates the two copies). Self-contained: torch + triton only — no
 # engine imports, so the same file runs under either engine and any venv.
 #
-# Design: docs/notes/families_v2_tree_design_20260708.md (xorl-k3-recon-r4).
 # Rule A: every bit-relevant reduction is written explicitly — an
 # adjacent-pairwise balanced binary tree within a block (tl.split + one add
 # per level; a 2-element reduction has exactly one association, so the
 # compiler owns no tree choice) and a sequential scalar chain across chunks
 # in index order. tl.sum over >2 elements is banned in bit-relevant positions.
-# Rule B: golden-value gates pin the bits on both venvs
-# (experiments/k3_tests/families_v2/ in xorl-k3-recon-r4).
+# Rule B: golden-value gates pin the bits on both venvs.
 #
-# Status: PROVISIONAL — default-off behind the XORL_FAMILIES_V2 /
-# SGLANG_FAMILIES_V2 env pair; not part of the [PROD] contract until the N6
-# re-certification completes. v1 kernels stay untouched.
+# The final-projection entry point in ``bi_fused_lm_head`` uses the head-v2
+# kernels by default and keeps the v1 chunked implementation as a kill-switch
+# rollback. The normalization entry points in this shared vendored module are
+# separate and remain gated by the XORL_FAMILIES_V2 / SGLANG_FAMILIES_V2 pair.
 
 import os
 
@@ -35,7 +34,7 @@ FAMILIES_V2_ENV_VARS = ("XORL_FAMILIES_V2", "SGLANG_FAMILIES_V2")
 def families_v2_enabled() -> bool:
     """True if this engine's env-pair flag is set. Call sites gate on this;
     the k3 harness asserts the two engines' flags AGREE (a mixed flip is the
-    norm-seed incident class)."""
+    silent family-flip class)."""
     return any(os.getenv(v, "0").lower() in ("1", "true", "yes") for v in FAMILIES_V2_ENV_VARS)
 
 
