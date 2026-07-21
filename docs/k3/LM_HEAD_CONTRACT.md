@@ -12,12 +12,17 @@ production vocabulary sizes.
 
 ## Fix
 
-`bi_lm_head_selected_logprob` performs the projection in fixed vocabulary
-chunks with the shared persistent BF16 GEMM and an fp32 accumulator. It records
-each chunk's maximum, fixed-order exponential sum, and selected-token logit.
-`_lm_head_lse_merge_kernel` then merges chunk statistics in increasing chunk
-order. `BI_LM_HEAD_VOCAB_CHUNK` and `_BI_LM_HEAD_STATS_BLOCK` are numerical
-contract constants: changing either requires a new cross-engine bitwise gate.
+The current `head_v2_selected_logprob` kernel performs the projection and
+computes fixed-order vocabulary statistics from its fp32 accumulator in one
+launch. `HEAD_V2_BLOCK_K` fixes the projection's accumulation order and
+`HEAD_V2_STATS_TILE_N` fixes the log-sum-exp tree. The merge kernel combines
+those tile statistics in one explicit pairwise tree. Changing either constant
+requires a new cross-engine bitwise gate.
+
+The earlier `bi_lm_head_selected_logprob` path remains available with
+`XORL_BI_HEAD_V2=0`. It materializes one vocabulary chunk at a time, records
+the same maximum, exponential sum, and selected logit, then merges chunks in
+pinned order. This rollback is exact but uses more launches.
 
 The trainer exposes this as `ce_mode="bi_fused"`. Its custom autograd function
 saves the exact forward LSE and recomputes the conventional closed-form CE

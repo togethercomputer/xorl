@@ -12,15 +12,24 @@ Backward is the closed-form CE gradient computed against the saved forward
 fused CE backwards — the contract governs the forward bits only).
 """
 
+import os
+
 import torch
 
 from xorl.ops.batch_invariant_ops import BI_LM_HEAD_VOCAB_CHUNK, bi_lm_head_selected_logprob
+from xorl.ops.bi_families_v2 import head_v2_selected_logprob
 
 
 class _BiFusedLmHeadPerTokenCE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden, weight, labels_safe, valid_mask, vocab_chunk):
-        logprob, lse, _ = bi_lm_head_selected_logprob(hidden, weight, labels_safe, vocab_chunk=vocab_chunk)
+        if os.getenv("XORL_BI_HEAD_V2", "1") != "0":
+            # Current path: projection and fixed-order vocabulary statistics
+            # share one launch. The v1 chunked path remains the kill-switch
+            # rollback and uses the same pinned GEMM K chain.
+            logprob, lse, _ = head_v2_selected_logprob(hidden, weight, labels_safe)
+        else:
+            logprob, lse, _ = bi_lm_head_selected_logprob(hidden, weight, labels_safe, vocab_chunk=vocab_chunk)
         ctx.save_for_backward(hidden, weight, labels_safe, valid_mask, lse)
         ctx.vocab_chunk = vocab_chunk
         return torch.where(valid_mask, -logprob, torch.zeros_like(logprob))
