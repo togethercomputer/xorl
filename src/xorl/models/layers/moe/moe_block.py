@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .experts import MoEExperts
+from .experts import MoEExperts, moe_sglang_fused_experts_enabled
 from .router import TopKRouter, balanced_synthetic_routing
 from .routing_replay import RoutingReplay, get_replay_stage
 
@@ -241,7 +241,18 @@ class MoEBlock(nn.Module):
         """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        hidden_states = self.experts(hidden_states, routing_weights, selected_experts)
+        if moe_sglang_fused_experts_enabled():
+            from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+
+            parallel_state = get_parallel_state()
+            if parallel_state.ep_size != 1 or parallel_state.tp_size != 1:
+                raise NotImplementedError(
+                    "XORL_MOE_SGLANG_FUSED_EXPERTS=1 requires trainer EP1/TP1; "
+                    "distributed expert-combine order is a separate contract"
+                )
+            hidden_states = self.experts.sglang_fused_experts_forward(hidden_states, routing_weights, selected_experts)
+        else:
+            hidden_states = self.experts(hidden_states, routing_weights, selected_experts)
         hidden_states = hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return hidden_states
 
@@ -261,8 +272,20 @@ class MoEBlock(nn.Module):
 
         routing_weights, selected_experts, router_logits = self.route(flat_hidden_states)
 
-        # Expert computation (already flat — call experts directly to avoid extra reshape)
-        if self.moe_implementation == "eager":
+        # The serving-kernel contract overrides the configured local backend.
+        if moe_sglang_fused_experts_enabled():
+            from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+
+            parallel_state = get_parallel_state()
+            if parallel_state.ep_size != 1 or parallel_state.tp_size != 1:
+                raise NotImplementedError(
+                    "XORL_MOE_SGLANG_FUSED_EXPERTS=1 requires trainer EP1/TP1; "
+                    "distributed expert-combine order is a separate contract"
+                )
+            final_hidden_states = self.experts.sglang_fused_experts_forward(
+                flat_hidden_states, routing_weights, selected_experts
+            )
+        elif self.moe_implementation == "eager":
             final_hidden_states = self._eager_forward(flat_hidden_states, routing_weights, selected_experts)
         else:
             final_hidden_states = self.experts(flat_hidden_states, routing_weights, selected_experts)
