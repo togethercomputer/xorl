@@ -18,7 +18,7 @@ _FORBIDDEN_CONTENT = {
     "absolute home path": re.compile(r"/home/"),
     "workspace mount": re.compile(r"/workspace(?:/|\b)"),
     "shared mount": re.compile(r"/shared(?:/|\b)"),
-    "internal repository name": re.compile(r"\bxorl-internal\b"),
+    "internal repository name": re.compile(r"\bxorl(?:-[a-z]+)?-internal\b"),
     "Kubernetes command": re.compile(r"\bkubectl\b", re.IGNORECASE),
     "Kubernetes service address": re.compile(r"\.svc\.cluster\.local\b"),
     "PVC setting": re.compile(r"\b(?:home|shared)[_-]?pvc\b", re.IGNORECASE),
@@ -35,7 +35,21 @@ class CalibrationPack:
 
     @property
     def default_config(self) -> Path:
-        return self.path / str(self.manifest["default_config"])
+        return self.resolve_declared_path(self.manifest.get("default_config"), field="default_config")
+
+    def resolve_declared_path(self, value: Any, *, field: str) -> Path:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"calibration-pack {field} must be a non-empty relative path")
+        relative = Path(value)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"calibration-pack {field} must stay within {self.path}: {value!r}")
+        root = self.path.resolve()
+        resolved = (root / relative).resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"calibration-pack {field} escapes {root}: {value!r}") from exc
+        return resolved
 
 
 def calibration_pack_root() -> Path:
@@ -65,12 +79,22 @@ def resolve_calibration_pack(value: str | Path) -> Path:
 
 
 def load_calibration_pack(value: str | Path) -> CalibrationPack:
-    path = resolve_calibration_pack(value)
+    path = resolve_calibration_pack(value).resolve()
     manifest_path = path / "manifest.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(f"missing calibration-pack manifest: {manifest_path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    return CalibrationPack(name=str(manifest.get("name", path.name)), path=path, manifest=manifest)
+    if not isinstance(manifest, dict):
+        raise ValueError(f"calibration-pack manifest must be a JSON object: {manifest_path}")
+    pack = CalibrationPack(name=str(manifest.get("name", path.name)), path=path, manifest=manifest)
+    pack.default_config
+    for field in ("configs", "results"):
+        values = manifest.get(field, [])
+        if not isinstance(values, list):
+            raise ValueError(f"calibration-pack {field} must be a list")
+        for declared in values:
+            pack.resolve_declared_path(declared, field=field)
+    return pack
 
 
 def resolve_pack_inputs(

@@ -420,11 +420,12 @@ def activation_ledger(
                 "one dense layer recomputed at a time in backward; dense gate/up intermediate dominates",
             )
     else:
+        retained_intermediate = top_k * moe_inter if is_moe else dense_inter
         add(
             "saved_full_activations",
-            layers * model_rank_tokens * (hidden + top_k * moe_inter) * act,
+            layers * model_rank_tokens * (hidden + retained_intermediate) * act,
             activation_term_status,
-            "no full-layer recompute: per-layer activations retained",
+            "no full-layer recompute: per-layer hidden and dense/routed intermediate activations retained",
         )
     add(
         "ce_logit_buffer",
@@ -1167,7 +1168,7 @@ def communication_ledger(
     exposed_cross_node_step_gb = 0.0
     for term_name, term in terms.items():
         term_cross_gb = float(term.get("cross_gb") or 0.0)
-        if term_name == "fsdp_param_all_gather":
+        if term_name in {"fsdp_param_all_gather", "expert_fsdp_param_all_gather"}:
             # The byte ledger records every logical all-gather pass. The calibrated
             # step-time coefficient was fit to the step-visible param traffic: one
             # pass, plus grad reduce-scatter, when non-PP FSDP auto-reshards.

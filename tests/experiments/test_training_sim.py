@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ from xorl.sim.kernel_variants import compare_kernel_variants, rank_kernel_varian
 from xorl.sim.model_metadata import resolve_model_metadata
 from xorl.sim.predict import build_report
 from xorl.sim.scenario_planner import plan_scenario
+from xorl.sim.schemas import ModelMetadata, Topology
 from xorl.sim.shape_engine import balanced_counts, build_shape_ledger
 from xorl.sim.tradeoff_ranker import rank_benchmark_tradeoffs
 from xorl.sim.validate import validate_simulator
@@ -659,6 +661,54 @@ def test_builtin_pack_prefix_rejects_path_traversal() -> None:
         resolve_calibration_pack("builtin:../qwen3_6_35b_a3b")
 
 
+def test_calibration_pack_rejects_paths_outside_pack_root(tmp_path: Path) -> None:
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(
+            {
+                "name": "unsafe",
+                "default_config": "../outside.yaml",
+                "configs": [],
+                "results": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="must stay within"):
+        load_calibration_pack(tmp_path)
+
+
+def test_calibration_pack_requires_default_config(tmp_path: Path) -> None:
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"name": "incomplete", "configs": [], "results": []}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="default_config must be a non-empty relative path"):
+        load_calibration_pack(tmp_path)
+
+
+def test_calibration_pack_rejects_symlink_escape(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    (outside / "train.yaml").write_text("train: {}\n", encoding="utf-8")
+    (tmp_path / "configs").symlink_to(outside, target_is_directory=True)
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(
+            {
+                "name": "symlink-escape",
+                "default_config": "configs/train.yaml",
+                "configs": ["configs/train.yaml"],
+                "results": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="escapes"):
+        load_calibration_pack(tmp_path)
+
+
 def test_model_metadata_restricts_local_config_reads_to_approved_roots(tmp_path: Path) -> None:
     allowed_root = tmp_path / "allowed"
     blocked_config = tmp_path / "blocked" / "config.json"
@@ -739,6 +789,99 @@ def test_portable_analytical_core_covers_flops_activations_and_communication() -
     assert activations["analytic_activation_lower_bound_gb"] > 0
     assert communication["status"] == "exact_analytic_bytes"
     assert communication["total_per_rank_gb"] > 0
+
+
+def test_dense_no_recompute_activation_ledger_includes_mlp_intermediate() -> None:
+    metadata = ModelMetadata(
+        model_path=None,
+        config_path=None,
+        source="test",
+        num_hidden_layers=2,
+        hidden_size=4096,
+        intermediate_size=14336,
+        vocab_size=32000,
+    )
+    topology = Topology(
+        world_size=1,
+        local_world_size=1,
+        node_count=1,
+        data_parallel_size=1,
+        data_parallel_replicate_size=1,
+        data_parallel_shard_size=1,
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        expert_parallel_size=1,
+        ep_fsdp_size=1,
+        ulysses_parallel_size=1,
+        ringattn_parallel_size=1,
+        micro_batch_size=1,
+        gradient_accumulation_steps=1,
+        global_batch_size=1,
+        sample_packing_sequence_len=1024,
+    )
+
+    ledger = activation_ledger(metadata, topology, {"enable_mixed_precision": True})
+
+    expected_gb = round(2 * 1024 * (4096 + 14336) * 2 / (1024**3), 4)
+    assert ledger["terms"]["saved_full_activations"]["gb"] == expected_gb
+
+
+def test_exposed_cross_node_traffic_normalizes_expert_fsdp_all_gather_passes() -> None:
+    metadata = ModelMetadata(
+        model_path=None,
+        config_path=None,
+        source="test",
+        num_experts=16,
+        top_k=2,
+        num_hidden_layers=8,
+        hidden_size=1024,
+        intermediate_size=4096,
+        moe_intermediate_size=2048,
+        num_attention_heads=16,
+        num_key_value_heads=4,
+        head_dim=64,
+        vocab_size=32000,
+    )
+    topology = Topology(
+        world_size=16,
+        local_world_size=8,
+        node_count=2,
+        data_parallel_size=16,
+        data_parallel_replicate_size=1,
+        data_parallel_shard_size=16,
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        expert_parallel_size=4,
+        ep_fsdp_size=4,
+        ulysses_parallel_size=1,
+        ringattn_parallel_size=1,
+        micro_batch_size=1,
+        gradient_accumulation_steps=1,
+        global_batch_size=16,
+        sample_packing_sequence_len=1024,
+        num_experts=16,
+        top_k=2,
+    )
+
+    ledger = communication_ledger(
+        metadata,
+        topology,
+        {"enable_mixed_precision": True, "reshard_after_forward": True, "ep_intranode": True},
+    )
+    terms = ledger["terms"]
+    expert_all_gather = terms["expert_fsdp_param_all_gather"]
+    assert expert_all_gather["cross_gb"] > 0
+    assert expert_all_gather["passes"] > 1
+    expected_exposed_gb = round(
+        sum(
+            float(term.get("cross_gb") or 0.0) / max(float(term.get("passes") or 1.0), 1.0)
+            if name in {"fsdp_param_all_gather", "expert_fsdp_param_all_gather"}
+            else float(term.get("cross_gb") or 0.0)
+            for name, term in terms.items()
+        ),
+        4,
+    )
+    assert ledger["time_estimate"]["exposed_cross_node_step_gb"] == expected_exposed_gb
 
 
 def test_kernel_variant_ranking_requires_a_correctness_gate() -> None:

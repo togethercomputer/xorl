@@ -21,6 +21,7 @@ After installing XoRL, the following commands are available:
 | `xorl-sim-rank` | Rank raw and correctness-promotable measurements |
 | `xorl-sim-kernels` | Rank portable kernel-variant measurements |
 | `xorl-sim-validate` | Run pack sanitation and analytical golden gates |
+| `xorl-sim-collect` | Summarize a portable observed-run calibration record |
 
 ## Built-In Qwen Packs
 
