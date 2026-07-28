@@ -18,7 +18,7 @@ _FORBIDDEN_CONTENT = {
     "absolute home path": re.compile(r"/home/"),
     "workspace mount": re.compile(r"/workspace(?:/|\b)"),
     "shared mount": re.compile(r"/shared(?:/|\b)"),
-    "internal repository name": re.compile(r"\bxorl-internal\b"),
+    "internal repository name": re.compile(r"\bxorl(?:-[a-z]+)?-internal\b"),
     "Kubernetes command": re.compile(r"\bkubectl\b", re.IGNORECASE),
     "Kubernetes service address": re.compile(r"\.svc\.cluster\.local\b"),
     "PVC setting": re.compile(r"\b(?:home|shared)[_-]?pvc\b", re.IGNORECASE),
