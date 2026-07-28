@@ -1,4 +1,4 @@
-# Vendored from xorl-sglang-internal @ b670667f989a9eea30cac69f34e6c52bf10937bf
+# Vendored from xorl-sglang @ b670667f989a9eea30cac69f34e6c52bf10937bf
 # python/sglang/srt/layers/attention/mamba/causal_conv1d_triton.py, lines 1-552:
 # the varlen prefill forward kernel + wrapper only (the decode update kernel is
 # not vendored). Serving's GDN prefill dispatches HERE (channel-last x +

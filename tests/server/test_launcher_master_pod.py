@@ -266,14 +266,14 @@ def test_wait_for_engine_ready_fails_fast_when_worker_exits():
 @_skip_if_launcher_refactored
 def test_launch_forwards_model_path_when_overrides_empty(tmp_path):
     launcher = _make_launcher(
-        model_path="/shared/huggingface/.../snapshots/abc",
-        tokenizer_path="/shared/huggingface/.../snapshots/abc",
+        model_path="/models/example/snapshots/abc",
+        tokenizer_path="/models/example/snapshots/abc",
         server_overrides={},
         config_path=str(_write_flat_config(tmp_path)),
     )
     cmd = _capture_torchrun_cmd(launcher)
-    assert "--model_path=/shared/huggingface/.../snapshots/abc" in cmd
-    assert "--tokenizer_path=/shared/huggingface/.../snapshots/abc" in cmd
+    assert "--model_path=/models/example/snapshots/abc" in cmd
+    assert "--tokenizer_path=/models/example/snapshots/abc" in cmd
 
 
 @_skip_if_launcher_refactored

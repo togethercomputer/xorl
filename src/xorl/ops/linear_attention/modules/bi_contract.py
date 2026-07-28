@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# The K3 GDN trainer contract (XORL-245), vendored from xorl-sglang-internal.
+# The K3 GDN trainer contract (XORL-245), vendored from xorl-sglang.
 #
 # Under XORL_BI_GDN=1 the two remaining GDN cross-engine terms that live on the
 # trainer side are contracted by running serving's exact kernels with real
@@ -18,7 +18,7 @@ from __future__ import annotations
 #     (per-row numerics are invariant to ROWS_PER_BLOCK, which only tiles
 #     rows; serving pins 4 under piecewise cuda graphs and so do we).
 #
-# Kernel bodies are byte-identical to xorl-sglang-internal @ the PR base
+# Kernel bodies are byte-identical to xorl-sglang @ the PR base
 # (python/sglang/srt/layers/attention/fla/{fused_gdn_gating,layernorm_gated}.py);
 # only imports/drivers are adapted. The companion serving-side flag is
 # SGLANG_BI_GDN_PREFILL (scan composition adoption); enable both for the
