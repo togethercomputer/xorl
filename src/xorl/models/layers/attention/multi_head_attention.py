@@ -8,7 +8,7 @@ from torch import nn
 from xorl.distributed.sequence_parallel.strategy import get_cp_strategy
 from xorl.models.layers.attention.backend import ATTENTION_FUNCTIONS, AttentionKwargs
 from xorl.models.layers.attention.backend.eager import eager_attention_forward
-from xorl.models.layers.normalization import RMSNorm
+from xorl.models.layers.normalization import RMS_NORM_FAMILY_NO_RESIDUAL, RMSNorm
 from xorl.models.layers.rope import apply_rotary_pos_emb
 
 
@@ -40,8 +40,9 @@ class MultiHeadAttention(nn.Module):
         self.qkv_proj = nn.Linear(config.hidden_size, self.q_dim + 2 * self.kv_dim, bias=qkv_bias)
         self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
         if self._use_qk_norm:
-            self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-            self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            # qk-norms are no-residual sites: serving runs the family-1 kernel.
+            self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, family=RMS_NORM_FAMILY_NO_RESIDUAL)
+            self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, family=RMS_NORM_FAMILY_NO_RESIDUAL)
         self.sliding_window = self._init_sliding_window(config)
 
     # ------------------------------------------------------------------ #
