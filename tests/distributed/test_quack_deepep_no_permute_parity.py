@@ -8,8 +8,7 @@ test drives the no-permute path directly at the Qwen3.6-35B-A3B MoE shape
 against the trusted triton generic path on the same DeepEP dispatch.
 
 Repro for the 2026-06-12 local-train nan: quack backward produced nan/inf
-grads on step 1 while the forward stayed finite
-(docs/notes/quack_moe_local_train_nan_handoff.md).
+grads on step 1 while the forward stayed finite.
 """
 
 import os

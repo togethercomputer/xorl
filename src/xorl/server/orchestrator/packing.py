@@ -142,8 +142,7 @@ def _resolve_teacher_cache_base(t_base: Any, t_cache: List[int]) -> int:
     The client sends ``teacher_cache_base`` as a 1-element list (the API schema's
     loss_fn_inputs InputType has no scalar form); accept a bare scalar too.
     Legacy clients omit it — fall back to ``min()`` inference, which is only
-    correct for unmasked contiguous slices (masked variants 0-fill, so min()==0;
-    see docs/notes/oprd_warm_cache_indices_rebase_bug.md).
+    correct for unmasked contiguous slices (masked variants 0-fill, so min()==0).
     """
     if t_base is not None:
         if hasattr(t_base, "tolist"):
@@ -1036,8 +1035,7 @@ class SequentialPacker(Packer):
             batch.setdefault("teacher_position_ids", []).extend(range(len(t_in)))
             # teacher_cache_indices (already trimmed to the shifted student length by
             # shift_opd_token_aligned_fields above) carries GLOBAL teacher-cache rows
-            # with TWO consumers that need different views (see
-            # docs/notes/oprd_warm_cache_indices_rebase_bug.md):
+            # with TWO consumers that need different views:
             #   * the KL hidden-fetch indexes the GLOBAL teacher cache — it needs the
             #     rows passed through UNCHANGED;
             #   * the trainer-forward OPRD gather indexes the PER-MICRO-BATCH kept-row

@@ -9,6 +9,9 @@ The patterns here are narrower than the calibration-pack ones on purpose. A bare
 ``/shared`` matches ``fwd_moe/shared``, and a bare ``volcano`` matches a citation
 of "Volcano Engine", a published external framework. Both produce noise, and a
 check that cries wolf gets ignored.
+
+``docs/notes/`` is here because that directory is internal-only: a reference to
+it reads as a live cross-reference but resolves to nothing on this tree.
 """
 
 from __future__ import annotations
@@ -30,6 +33,8 @@ PATTERNS = {
     "cluster service address": re.compile(r"\.svc\.cluster\.local\b"),
     "scheduling queue label": re.compile(r"\bteam:\s*(?:turbo|shaping)\b", re.IGNORECASE),
     "volcano scheduler key": re.compile(r"scheduling\.volcano\.sh"),
+    "pointer to an internal-only note": re.compile(r"\bdocs/notes/"),
+    "internal branch archaeology": re.compile(r"\bapanda-dev/\w+"),
 }
 
 # These two state the patterns, so they necessarily contain them.

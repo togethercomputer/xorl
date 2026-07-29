@@ -5164,8 +5164,7 @@ class ModelRunner:
                     # Use the packer-emitted PER-MICRO-BATCH-LOCAL view
                     # (teacher_cache_local_indices), NOT teacher_cache_indices: the
                     # latter carries GLOBAL teacher-cache rows for the KL hidden-fetch
-                    # and walks out of bounds here (see
-                    # docs/notes/oprd_warm_cache_indices_rebase_bug.md).
+                    # and walks out of bounds here.
                     local_cache_indices = micro_batch.get("teacher_cache_local_indices")
                     if local_cache_indices is None:
                         raise ValueError(
@@ -6607,7 +6606,7 @@ class ModelRunner:
         # valid-token micro-batch (small batch on a large gang, or ulysses
         # sequence sharding) otherwise carry a different metric-key set and the
         # all-reduce inside _finalize_loss_metrics mismatches in size -> NCCL
-        # hang. (Call was dropped in the apanda-dev/glm5 rebase; restored.)
+        # hang.
         if loss_fn == "opd_loss":
             self._ensure_opd_loss_metric_accumulators(
                 accumulated_loss_metrics,

@@ -2,7 +2,7 @@
 
 This directory is the current operator entry point for minimizing trainer-to-sampler logprob
 divergence without giving up measured throughput. It describes the current contract as of
-2026-07-10; older notes under `docs/notes/` are evidence records, not launch recipes.
+2026-07-10.
 
 Start with [DEFAULTS_AND_PARETO.md](DEFAULTS_AND_PARETO.md). It contains:
 

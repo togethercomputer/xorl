@@ -306,7 +306,6 @@ def _warn_chunked_deepep_once() -> None:
     designed one-dispatch-one-combine handle cadence. Under
     recompute_full_layer this corrupted comm-stream-owned outputs (scattered
     non-finite elements -> nan grads); full-size chunks are also ~1.6x faster.
-    See docs/notes/quack_moe_nan_root_cause_record_stream.md (2026-06-12).
     Chunking remains available as an explicit memory lever for huge shapes."""
     global _CHUNKED_DEEPEP_WARNED
     if not _CHUNKED_DEEPEP_WARNED:
@@ -314,7 +313,7 @@ def _warn_chunked_deepep_once() -> None:
         print(
             "[xorl.ops.moe.quack] WARNING: chunked DeepEP no-permute mode enabled via "
             "XORL_QUACK_DEEPEP_*_CHUNK_SIZE — known to corrupt gradients under "
-            "recompute_full_layer (see docs/notes/quack_moe_nan_root_cause_record_stream.md); "
+            "recompute_full_layer; "
             "prefer the full-size default.",
             flush=True,
         )
