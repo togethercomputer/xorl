@@ -380,6 +380,12 @@ class RingAttentionStrategy(CPStrategy):
     def compute_attention(self, module, q, k, v, attention_mask, **kwargs):
         from .ring_attention import ring_flash_attention_forward  # noqa: PLC0415
 
+        if kwargs.get("shared_prefix_context") is not None:
+            raise NotImplementedError(
+                "shared-prefix attention does not compose with ring attention "
+                "(zigzag reorder breaks the full-coordinate context); use Ulysses SP or disable shared-prefix."
+            )
+
         attn_kwargs = module._attention_kwargs()
         cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k = _scale_cu_seqlens_for_ringattn(
             kwargs, self.ringattn_group
@@ -436,6 +442,12 @@ class HybridUlyssesRingStrategy(CPStrategy):
 
     def compute_attention(self, module, q, k, v, attention_mask, **kwargs):
         from .ring_attention import ring_flash_attention_forward  # noqa: PLC0415
+
+        if kwargs.get("shared_prefix_context") is not None:
+            raise NotImplementedError(
+                "shared-prefix attention does not compose with ring attention "
+                "(zigzag reorder breaks the full-coordinate context); use Ulysses SP or disable shared-prefix."
+            )
 
         attn_kwargs = module._attention_kwargs()
         cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k = _scale_cu_seqlens_for_ringattn(

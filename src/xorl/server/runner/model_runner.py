@@ -72,6 +72,7 @@ from xorl.ops.loss import (
     opd_vocab_parallel_loss_function,
     policy_loss_function,
 )
+from xorl.ops.shared_prefix import shared_prefix_remap_to_original
 from xorl.optim import build_optimizer
 from xorl.server.runner.adapters import LoRAAdapterManager
 from xorl.server.runner.checkpoint import CheckpointManager
@@ -423,6 +424,9 @@ class ModelRunner:
 
         # LM head fp32 flag for loss functions
         self.lm_head_fp32 = self.model_config.get("lm_head_fp32", True)
+
+        # Deduplicate common prompts in packed RL policy-update batches.
+        self.use_shared_prefix = self.train_config.get("use_shared_prefix", False)
 
         # Training state
         self.global_step = 0
@@ -1960,21 +1964,26 @@ class ModelRunner:
                     group=sp_group,
                 )
 
-            if position_ids is not None:
-                accumulators["position_ids"].append(position_ids.cpu())
-            else:
-                generated_pos_ids = torch.arange(original_seq_len, dtype=torch.long).unsqueeze(0)
-                accumulators["position_ids"].append(generated_pos_ids)
         else:
             gathered = per_token_tensors
             position_ids = micro_batch.get("position_ids")
 
-            if position_ids is not None:
-                accumulators["position_ids"].append(position_ids.cpu())
-            else:
-                seq_len = gathered["logprobs"].shape[-1] + 1
-                generated_pos_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
-                accumulators["position_ids"].append(generated_pos_ids)
+        shared_prefix_context = micro_batch.get("shared_prefix_context")
+        if shared_prefix_context is not None:
+            gathered = {
+                key: shared_prefix_remap_to_original(value, shared_prefix_context) for key, value in gathered.items()
+            }
+            position_ids = shared_prefix_context.orig_position_ids
+
+        if position_ids is not None:
+            accumulators["position_ids"].append(position_ids.cpu())
+        elif ps.cp_enabled:
+            generated_pos_ids = torch.arange(original_seq_len, dtype=torch.long).unsqueeze(0)
+            accumulators["position_ids"].append(generated_pos_ids)
+        else:
+            seq_len = gathered["logprobs"].shape[-1] + 1
+            generated_pos_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
+            accumulators["position_ids"].append(generated_pos_ids)
 
         accumulators["logprobs"].append(gathered["logprobs"].cpu())
         if gathered.get("loss") is not None:

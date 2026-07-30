@@ -1385,13 +1385,6 @@ class WeightSyncHandler:
         # timeout.
         p2p_status_gathered = False
 
-        # Tracks whether this rank has participated in the collective P2P
-        # transfer-status all_gather below. If a transfer fails before we
-        # reach it, the except handler re-runs the gather so peer ranks that
-        # already reached it don't wedge until the orchestrator request
-        # timeout.
-        p2p_status_gathered = False
-
         try:
             for pp_stage in range(_pp_size):
                 _is_my_stage = _pp_rank == pp_stage

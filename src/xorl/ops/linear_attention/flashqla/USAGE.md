@@ -1,8 +1,7 @@
-# Runbook: consuming the FlashQLA GDN backend from another branch
+# FlashQLA GDN backend
 
-Audience: an agent/engineer on a branch **other** than `feature/flashqla-gdn-kernels`
-(e.g. an OPD run on `codex/opd-mainline-run-*`) who wants the faster Gated Delta Rule
-(GDN) linear-attention kernels.
+This guide explains how to enable the optional FlashQLA Gated Delta Rule
+(GDN) linear-attention kernels in an installed XoRL checkout.
 
 **TL;DR:** FlashQLA is an *opt-in, drop-in* replacement for the FLA-Triton GDN chunk
 kernel, selected with `XORL_GDN_BACKEND=flashqla`. It is **Hopper (SM90) only**, needs a
@@ -26,28 +25,16 @@ shape, but it's not the whole step).
 
 ---
 
-## 1. Get the code onto your branch
+## 1. Integration surface
 
-The integration is a handful of files. Easiest is to merge the branch (or, once
-PR #339 lands on `main`, just rebase your branch on `main`):
-
-```bash
-cd ~/xorl-opd-mainline-run            # your worktree
-git fetch origin
-# Option A — before PR #339 merges: merge the feature branch
-git merge origin/feature/flashqla-gdn-kernels
-# Option B — after PR #339 merges to main: rebase/merge main as usual
-git merge origin/main
-```
-
-What it brings in (if you cherry-pick instead of merge, these are the files):
+The backend is part of the source tree. Its main integration points are:
 
 | file | what |
 | --- | --- |
 | `src/xorl/ops/linear_attention/flashqla/` | vendored FlashQLA TileLang kernels |
 | `src/xorl/ops/linear_attention/tilelang_gemm_v1.py` | in-repo `gemm_v1` shim (monkeypatches stock tilelang) |
 | `src/xorl/ops/linear_attention/backend.py` | `XORL_GDN_BACKEND` resolver + lazy import |
-| `src/xorl/ops/linear_attention/layers/gated_deltanet.py` | routes the chunk kernel to FlashQLA (a *modify* — resolve conflicts against your branch's copy) |
+| `src/xorl/ops/linear_attention/layers/gated_deltanet.py` | routes the chunk kernel to FlashQLA |
 | `pyproject.toml` | the `tilelang` wheel pin + `apache-tvm-ffi` |
 
 The vendored `flashqla/` tree is `T.gemm`-additive: it does **not** touch the `tilelang`
@@ -63,13 +50,13 @@ so **not** in the PyPI `tilelang==0.1.10` wheel). We therefore pin a prebuilt wh
 upstream `tile-ai/tilelang@a8d93798` (includes #2303; no source fork) hosted on
 `togethercomputer/xorl-wheels`.
 
-If you merged `pyproject.toml` (step 1), just sync:
+Install the pinned project dependencies:
 
 ```bash
 uv sync
 ```
 
-If you are NOT taking the pyproject change, add the dep manually:
+For an existing environment, the equivalent direct install is:
 
 ```bash
 uv pip install \

@@ -66,12 +66,12 @@ dependencies = [
   # libz3.so.4.15 soname the wheel links.
   "apache-tvm-ffi==0.1.11",
   "z3-solver<4.16",
-  # nvidia-cutlass-dsl 4.6.0 (pulled in unpinned via flash-attn-4) removed
-  # cutlass.cute.core.ThrCopy, which the vendored quack ops
-  # (src/xorl/ops/quack/copy_utils.py) reference at import time — breaking
-  # every `xorl.ops` import in a fresh venv. 4.5.2 is flash-attn-4's floor
-  # and still ships ThrCopy.
-  "nvidia-cutlass-dsl>=4.5.2,<4.6",
+  # nvidia-cutlass-dsl 4.6.0 removed cutlass.cute.core.ThrCopy, which the
+  # Quack compatibility layer still needs at import time.
+  "nvidia-cutlass-dsl==4.5.2",
+  # Some vendored compatibility modules intentionally import the canonical
+  # top-level Quack helpers. Keep that dependency pinned to the validated ABI.
+  "quack-kernels==0.5.0",
   # Fast Hadamard transform — preferred backend for DSv4
   # ops.utils.rotate_activation. Imported lazily; the helper falls back to a
   # pure-torch FWHT (iterative butterfly) when the wheel is unavailable, so

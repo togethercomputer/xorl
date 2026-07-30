@@ -73,6 +73,7 @@ import zmq.asyncio
 
 from xorl.data.collators import TextSequenceShardCollator
 from xorl.distributed.parallel_state import get_parallel_state
+from xorl.ops.shared_prefix import shared_prefix_repack_batch
 from xorl.server.protocol.operations import (
     AdapterStateData,
     EmptyData,
@@ -1345,6 +1346,20 @@ class RunnerDispatcher:
         Returns:
             Tuple of (sharded_batches, sliced_routed_experts, sliced_routed_expert_logits).
         """
+        if getattr(self.trainer, "use_shared_prefix", False) and not parallel_state.ringattn_enabled:
+            opd_fields = ("teacher_ids", "teacher_hidden_states", "teacher_cache_indices", "teacher_weights")
+            repacked_batches = []
+            for batch in my_batches:
+                if any(key in batch for key in opd_fields):
+                    repacked_batches.append(batch)
+                    continue
+                repacked = shared_prefix_repack_batch(batch)
+                repacked_batches.append(repacked if repacked is not None else batch)
+            my_batches = repacked_batches
+
+        # Context indices use full repacked coordinates and must not be sharded.
+        shared_prefix_contexts = [batch.pop("shared_prefix_context", None) for batch in my_batches]
+
         # Log and validate batch shapes before applying sharding
         for i, batch in enumerate(my_batches):
             shapes = {
@@ -1394,6 +1409,10 @@ class RunnerDispatcher:
                     raise
             my_batches = sharded_batches
             logger.debug(f"Rank {self.rank}: Applied sequence sharding locally (cp_rank={parallel_state.cp_rank})")
+
+        for batch, shared_prefix_context in zip(my_batches, shared_prefix_contexts):
+            if shared_prefix_context is not None:
+                batch["shared_prefix_context"] = shared_prefix_context
 
         # Slice R3 side arrays for this rank's datum subset. IDs and routing
         # weights must stay aligned because R3 weight replay indexes both by

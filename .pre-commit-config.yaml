@@ -1,5 +1,5 @@
 default_stages: [pre-commit, pre-push, manual]
-exclude: ^(submodules/|\.venv/)
+exclude: ^(submodules/|\.venv/|src/xorl/ops/quack/)
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks

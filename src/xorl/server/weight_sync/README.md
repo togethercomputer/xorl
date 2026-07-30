@@ -252,7 +252,7 @@ Trainer-side options, in precedence order:
   covers `world_size`, entries are global-rank indexed; otherwise entries are
   local-rank indexed.
 - `P2P_TRAINER_GPU_TO_IB_DEVICE_MAP`: physical GPU to HCA map, for example
-  `0=mlx5_2,1=mlx5_3,2=mlx5_1,3=mlx5_5,4=mlx5_9,5=mlx5_9,6=mlx5_6,7=mlx5_5`.
+  `0=mlx5_0,1=mlx5_1`.
   Kubernetes launches should leave device visibility to the NVIDIA device plugin.
   Only set `P2P_TRAINER_VISIBLE_GPU_INDICES` explicitly when an HCA diagnostic
   needs physical GPU indices; it is not a CUDA visibility mechanism.
@@ -260,55 +260,25 @@ Trainer-side options, in precedence order:
   but it pins every trainer rank to one rail.
 
 Receiver-side SGLang uses `--mooncake-ib-device` as a JSON map keyed by local
-rank on each receiver node, not global TP rank. On the current H100 validation
-nodes, we avoid `mlx5_4`, `mlx5_7`, and `mlx5_8` and spread TP ranks over the
-remaining working HCAs.
+rank on each receiver node, not global TP rank. Validate the usable HCA set on
+each deployment and spread local ranks across those devices.
 
-### Recommended P2P profile for scaled Qwen3-style MoE
+### P2P profile guidance
 
-For the 4 trainer pod → 16 SGLang TP2 encoded-reasoning shape, use the
-following profile as the starting point. It keeps dense/root chunking separate
-from MoE batching, uses the cached receiver prepare path on warm syncs, and
-avoids the measured-regressed debug/experimental knobs.
-
-```bash
-# Required for Kubernetes Mooncake reachability.
-export P2P_TRAINER_HOSTNAME="${POD_IP}"
-export XORL_WEIGHT_SYNC_MASTER_ADDRESS="${POD_IP}"
-
-# Normal multi-endpoint P2P syncs should fan out to all receiver endpoints in a
-# single backend operation. Enable serial endpoint sync only as a fallback while
-# diagnosing endpoint/session instability.
-export XORL_SERIAL_INFERENCE_ENDPOINT_SYNC=0
-
-# Keep dense/root tensors small enough for scratch pools while batching MoE.
-export XORL_WEIGHT_SYNC_DENSE_BUCKET_BYTES=134217728      # 128 MiB
-export XORL_WEIGHT_SYNC_MOE_BUCKET_BYTES=1073741824       # 1 GiB
-export XORL_WEIGHT_SYNC_BUCKET_BYTES=1073741824           # legacy MoE alias
-export XORL_WEIGHT_SYNC_BATCH_MOE=1
-
-# Source-reuse path keeps the required pool size near source bytes, not
-# receiver-fanout bytes. 2 GiB was the best measured pool size for the scaled
-# Qwen3-30B-A3B TP2 receiver layout.
-export XORL_P2P_CPU_SCRATCH_POOL_BYTES=2147483648         # 2 GiB
-export XORL_P2P_MOONCAKE_TRANSFER_CHUNK=8
-export XORL_P2P_CPU_POOL_MIN_BYTES=65536                  # small CUDA direct path
-export XORL_P2P_PENDING_TRANSFER_TIMEOUT_S=120
-
-# This is now the default copy mode, but keep the explicit variable in older
-# generated manifests that still set XORL_P2P_SCATTER_COPY_MODE=list.
-export XORL_P2P_SCATTER_REUSE_LOCATORS=1
-```
+Tune dense and MoE bucket sizes separately, size the CPU scratch pool for the
+largest concurrent transfer, and validate timeouts against the deployment's
+fabric. Multi-endpoint sync normally fans out in one backend operation; use
+serial endpoint sync only as a diagnostic fallback. Keep locator reuse enabled
+on warm syncs to avoid rebuilding receiver tensor maps.
 
 Leave these unset for the default performance path:
 
 - `XORL_P2P_USE_ASYNC_API`: Mooncake async writes are still experimental; they
   have produced hangs or mixed results in repeated-update tests.
-- `XORL_P2P_CPU_POOL_MIN_BYTES=0`: forces tiny transfers through CPU scratch;
-  this was safe in smoke tests but slower than the default GPU-direct threshold.
+- `XORL_P2P_CPU_POOL_MIN_BYTES=0`: forces tiny transfers through CPU scratch
+  and should be treated as a diagnostic setting.
 - `XORL_P2P_PERSIST_SMALL_REGISTRATION=1`: persistent registration of small
-  CUDA sources was safe in smoke tests but regressed warm sync on the scaled
-  TP2 layout.
+  CUDA sources is experimental and should be benchmarked before use.
 - `XORL_P2P_LOG_BUCKET_DETAILS=1` and `XORL_P2P_TRANSFER_DEBUG=1`: useful for
   failure diagnosis, but intentionally off the hot path because they add
   logging and debug-object allocation.

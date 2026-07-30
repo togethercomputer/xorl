@@ -287,6 +287,22 @@ def flash_attention_forward(
     kwargs.pop("is_causal", None)
     diagnostic_decode_cache = bool(kwargs.pop("diagnostic_decode_cache", False))
 
+    shared_prefix_context = kwargs.pop("shared_prefix_context", None)
+    if shared_prefix_context is not None:
+        from .shared_prefix_attention import shared_prefix_attention_forward  # noqa: PLC0415
+
+        return shared_prefix_attention_forward(
+            module,
+            query,
+            key,
+            value,
+            attention_mask,
+            scaling=scaling,
+            sliding_window=sliding_window,
+            dropout=dropout,
+            shared_prefix_context=shared_prefix_context,
+        )
+
     # This is for Qwen2VL's mrope
     position_ids = kwargs.pop("position_ids", None)
     if position_ids is not None and position_ids.dim() == 3:

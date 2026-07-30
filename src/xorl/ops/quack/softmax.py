@@ -1,20 +1,25 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
 import math
-from functools import partial
 from typing import Type
+from functools import partial
+
+import torch
 
 import cuda.bindings.driver as cuda
+
 import cutlass
 import cutlass.cute as cute
-import torch
-from cutlass import Float32, Int64, const_expr
+from cutlass import Int64, Float32, const_expr
 
-from . import copy_utils, utils
+from . import utils as utils
+from . import copy_utils as copy_utils
 from .compile_utils import make_fake_tensor as fake_tensor
-from .cute_dsl_utils import torch2cute_dtype_map
-from .reduce import online_softmax_reduce, row_reduce
+from .reduce import row_reduce, online_softmax_reduce
 from .reduction_base import ReductionBase
+from .cache_utils import jit_cache
+from .cute_dsl_utils import torch2cute_dtype_map
+from cutlass.base_dsl.arch import Arch
 
 
 class Softmax(ReductionBase):
@@ -36,8 +41,18 @@ class Softmax(ReductionBase):
         return 256
 
     def _set_cluster_n(self):
+        arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+        # SM8x (Ampere/Ada) lacks cluster support
+        if arch < Arch.sm_90:
+            self.cluster_n = 1
+            return
+        # SM12x supports cluster up to 8
+        max_cluster = 8 if arch.major == 12 else 16
         N = self.N
-        if const_expr(self.dtype.width == 16):
+        if arch.major == 12 and const_expr(self.dtype.width >= 32):
+            # SM12x 99 KB SMEM: fp32 needs tighter clustering (same limits as fp16)
+            thresholds = [(16 * 1024, 1), (32 * 1024, 2), (64 * 1024, 4), (128 * 1024, 8)]
+        elif const_expr(self.dtype.width == 16):
             thresholds = [(16 * 1024, 1), (32 * 1024, 2), (64 * 1024, 4), (128 * 1024, 8)]
         else:
             thresholds = [(32 * 1024, 1), (64 * 1024, 2), (128 * 1024, 4), (256 * 1024, 8)]
@@ -45,7 +60,7 @@ class Softmax(ReductionBase):
             if N <= limit:
                 self.cluster_n = cluster
                 return
-        self.cluster_n = 16
+        self.cluster_n = max_cluster
 
     @cute.jit
     def __call__(
@@ -57,7 +72,9 @@ class Softmax(ReductionBase):
         assert mX.element_type == self.dtype
         self._set_cluster_n()
         largest_dtype_width = const_expr(max(t.element_type.width for t in [mX, mO]))
-        tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(vecsize=128 // largest_dtype_width)
+        tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(
+            vecsize=128 // largest_dtype_width
+        )
         num_threads = tiled_copy.size
         self.kernel(mX, mO, tiler_mn, tiled_copy, threads_per_row).launch(
             grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
@@ -87,7 +104,9 @@ class Softmax(ReductionBase):
         gX, gO, cX = [cute.local_tile(mT, tiler_mn, (bidx, cluster_y)) for mT in (mX, mO, idX)]
 
         smem = cutlass.utils.SmemAllocator()
-        sX = smem.allocate_tensor(mX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16)
+        sX = smem.allocate_tensor(
+            mX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16
+        )
         reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
 
         thr_copy_X = tiled_copy.get_slice(tidx)
@@ -96,10 +115,14 @@ class Softmax(ReductionBase):
         tXsX = thr_copy_X.partition_D(sX)
         tXgO = thr_copy_X.partition_D(gO)
         tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
-        tXrX, tXrO = [cute.make_fragment_like(thr) for thr in (tXgX, tXgO)]
+        tXrX, tXrO = [cute.make_rmem_tensor_like(thr) for thr in (tXgX, tXgO)]
 
         is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
-        tXpX = None if is_even_N else copy_utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
+        tXpX = (
+            None
+            if is_even_N
+            else copy_utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
+        )
         # Each copy will use the same predicate
         copy = partial(copy_utils.copy, pred=tXpX)
 
@@ -152,6 +175,21 @@ class Softmax(ReductionBase):
             copy(tXrO, tXgO)
 
 
+@jit_cache
+def _compile_softmax_fwd(dtype, out_dtype, N):
+    batch_sym = cute.sym_int()
+    div = math.gcd(128 // dtype.width, N)
+    x_cute, out_cute = [fake_tensor(dt, (batch_sym, N), div) for dt in [dtype, out_dtype]]
+    softmax_op = Softmax(dtype, N)
+    return cute.compile(
+        softmax_op,
+        x_cute,
+        out_cute,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+
+
 @torch.library.custom_op("xorl_quack::_softmax_fwd", mutates_args={"out"})
 def _softmax_fwd(x: torch.Tensor, out: torch.Tensor) -> None:
     """Softmax forward pass.
@@ -165,28 +203,30 @@ def _softmax_fwd(x: torch.Tensor, out: torch.Tensor) -> None:
     assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
     N = x.size(1)
     dtype, out_dtype = [torch2cute_dtype_map[t.dtype] for t in [x, out]]
-    compile_key = (dtype, out_dtype, N)
-    if compile_key not in _softmax_fwd.compile_cache:
-        batch_sym = cute.sym_int()
-        div = math.gcd(128 // dtype.width, N)
-        x_cute, out_cute = [fake_tensor(dt, (batch_sym, N), div) for dt in [dtype, out_dtype]]
-        softmax_op = Softmax(dtype, N)
-        _softmax_fwd.compile_cache[compile_key] = cute.compile(
-            softmax_op,
-            x_cute,
-            out_cute,
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--enable-tvm-ffi",
-        )
-    _softmax_fwd.compile_cache[compile_key](x, out)
+    _compile_softmax_fwd(dtype, out_dtype, N)(x, out)
 
 
-_softmax_fwd.compile_cache = {}
+@_softmax_fwd.register_fake
+def _softmax_fwd_fake(x: torch.Tensor, out: torch.Tensor) -> None:
+    # This register_fake serves two purposes:
+    # 1. torch.compile: When dynamo traces with symbolic shapes (SymInt), we must be a no-op.
+    #    Without register_fake, dynamo would trace the real impl which calls _compile_softmax_fwd
+    #    with a SymInt N — crashing @lru_cache since SymInt isn't hashable.
+    # 2. --compile-only mode: We enter FakeTensorMode with *concrete* shapes to pre-compile
+    #    kernels without GPU memory. Here we trigger both fwd and bwd compilation.
+    from .cache_utils import COMPILE_ONLY
+
+    if COMPILE_ONLY and not isinstance(x.size(1), torch.SymInt):
+        N = x.size(1)
+        dtype, out_dtype = [torch2cute_dtype_map[t.dtype] for t in [x, out]]
+        _compile_softmax_fwd(dtype, out_dtype, N)
+        _compile_softmax_backward(dtype, out_dtype, out_dtype, N)
 
 
 def softmax_fwd(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
-    _softmax_fwd(x, out)
+    if x.numel() > 0:
+        _softmax_fwd(x, out)
     return out
 
 
@@ -203,8 +243,18 @@ class SoftmaxBackward(ReductionBase):
         return 256
 
     def _set_cluster_n(self):
+        arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+        # SM8x (Ampere/Ada) lacks cluster support
+        if arch < Arch.sm_90:
+            self.cluster_n = 1
+            return
+        # SM12x supports cluster up to 8
+        max_cluster = 8 if arch.major == 12 else 16
         N = self.N
-        if const_expr(self.dtype.width == 16):
+        if arch.major == 12 and const_expr(self.dtype.width >= 32):
+            # SM12x 99 KB SMEM: fp32 bwd has 2 SMEM tensors, needs tighter clustering
+            thresholds = [(8 * 1024, 1), (16 * 1024, 2), (32 * 1024, 4), (64 * 1024, 8)]
+        elif const_expr(self.dtype.width == 16):
             thresholds = [(16 * 1024, 1), (32 * 1024, 2), (64 * 1024, 4), (128 * 1024, 8)]
         else:
             thresholds = [(16 * 1024, 1), (32 * 1024, 2), (64 * 1024, 4), (128 * 1024, 8)]
@@ -212,7 +262,7 @@ class SoftmaxBackward(ReductionBase):
             if N <= limit:
                 self.cluster_n = cluster
                 return
-        self.cluster_n = 16
+        self.cluster_n = max_cluster
 
     def _num_threads(self):
         return 128 if self.N <= 8192 else 256
@@ -228,7 +278,9 @@ class SoftmaxBackward(ReductionBase):
         assert mdY.element_type == self.dtype
         self._set_cluster_n()
         largest_dtype_width = const_expr(max(t.element_type.width for t in [mdY, mY, mdX]))
-        tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(vecsize=128 // largest_dtype_width)
+        tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(
+            vecsize=128 // largest_dtype_width
+        )
         num_threads = tiled_copy.size
         self.kernel(mdY, mY, mdX, tiler_mn, tiled_copy, threads_per_row).launch(
             grid=[cute.ceil_div(mdY.shape[0], tiler_mn[0]), self.cluster_n, 1],
@@ -255,13 +307,17 @@ class SoftmaxBackward(ReductionBase):
         shape = mdY.shape
         idX = cute.make_identity_tensor(shape)
         # slice for CTAs
-        gdY, gY, gdX, cX = [cute.local_tile(mT, tiler_mn, (bidx, cluster_y)) for mT in (mdY, mY, mdX, idX)]
+        gdY, gY, gdX, cX = [
+            cute.local_tile(mT, tiler_mn, (bidx, cluster_y)) for mT in (mdY, mY, mdX, idX)
+        ]
 
         smem = cutlass.utils.SmemAllocator()
         sdY = smem.allocate_tensor(
             mdY.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16
         )
-        sY = smem.allocate_tensor(mY.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16)
+        sY = smem.allocate_tensor(
+            mY.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16
+        )
         reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
 
         thr_copy = tiled_copy.get_slice(tidx)
@@ -272,10 +328,12 @@ class SoftmaxBackward(ReductionBase):
         tYsY = thr_copy.partition_D(sY)
         tdXgdX = thr_copy.partition_D(gdX)
         tXcX = thr_copy.partition_S(cX)[(0, None), None, None]
-        tdYrdY, tYrY, tdXrdX = [cute.make_fragment_like(thr) for thr in (tdYgdY, tYgY, tdXgdX)]
+        tdYrdY, tYrY, tdXrdX = [cute.make_rmem_tensor_like(thr) for thr in (tdYgdY, tYgY, tdXgdX)]
 
         is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
-        tXpX = None if is_even_N else copy_utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
+        tXpX = (
+            None if is_even_N else copy_utils.predicate_k(thr_copy.partition_S(cX), limit=shape[1])
+        )
         # Each copy will use the same predicate
         copy = partial(copy_utils.copy, pred=tXpX)
 
@@ -312,6 +370,24 @@ class SoftmaxBackward(ReductionBase):
             copy(tdXrdX, tdXgdX)
 
 
+@jit_cache
+def _compile_softmax_backward(dtype, y_dtype, dx_dtype, N):
+    batch_sym = cute.sym_int()
+    div = math.gcd(128 // dtype.width, N)
+    dy_cute, y_cute, dx_cute = [
+        fake_tensor(dt, (batch_sym, N), div) for dt in [dtype, y_dtype, dx_dtype]
+    ]
+    softmax_backward_op = SoftmaxBackward(dtype, N)
+    return cute.compile(
+        softmax_backward_op,
+        dy_cute,
+        y_cute,
+        dx_cute,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+
+
 @torch.library.custom_op("xorl_quack::_softmax_backward", mutates_args={"dx"})
 def _softmax_backward(dy: torch.Tensor, y: torch.Tensor, dx: torch.Tensor) -> None:
     """Softmax backward pass.
@@ -327,32 +403,26 @@ def _softmax_backward(dy: torch.Tensor, y: torch.Tensor, dx: torch.Tensor) -> No
     assert dy.is_cuda and y.is_cuda, "Tensors must be on CUDA device"
     assert dy.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
     assert y.dtype == dy.dtype, "dy and y must have same dtype"
-
     N = dy.size(1)
     dtype, y_dtype, dx_dtype = [torch2cute_dtype_map[t.dtype] for t in [dy, y, dx]]
-    compile_key = (dtype, y_dtype, dx_dtype, N)
-    if compile_key not in _softmax_backward.compile_cache:
-        batch_sym = cute.sym_int()
-        div = math.gcd(128 // dtype.width, N)
-        dy_cute, y_cute, dx_cute = [fake_tensor(dt, (batch_sym, N), div) for dt in [dtype, y_dtype, dx_dtype]]
-        softmax_backward_op = SoftmaxBackward(dtype, N)
-        _softmax_backward.compile_cache[compile_key] = cute.compile(
-            softmax_backward_op,
-            dy_cute,
-            y_cute,
-            dx_cute,
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--enable-tvm-ffi",
-        )
-    _softmax_backward.compile_cache[compile_key](dy, y, dx)
+    _compile_softmax_backward(dtype, y_dtype, dx_dtype, N)(dy, y, dx)
 
 
-_softmax_backward.compile_cache = {}
+@_softmax_backward.register_fake
+def _softmax_backward_fake(dy: torch.Tensor, y: torch.Tensor, dx: torch.Tensor) -> None:
+    # See _softmax_fwd_fake for why register_fake is needed.
+    from .cache_utils import COMPILE_ONLY
+
+    if COMPILE_ONLY and not isinstance(dy.size(1), torch.SymInt):
+        N = dy.size(1)
+        dtype, y_dtype, dx_dtype = [torch2cute_dtype_map[t.dtype] for t in [dy, y, dx]]
+        _compile_softmax_backward(dtype, y_dtype, dx_dtype, N)
 
 
 def softmax_bwd(dy: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     dx = torch.empty_like(dy)
-    _softmax_backward(dy, y, dx)
+    if dy.numel() > 0:
+        _softmax_backward(dy, y, dx)
     return dx
 
 

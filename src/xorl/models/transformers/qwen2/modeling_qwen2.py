@@ -36,6 +36,7 @@ from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
 _RUNTIME_CONFIG_ATTRS = {
     "_attn_implementation",
     "_attention_cast_bf16",
+    "_alltoall_combine_hidden_chunk_size",
     "_commit_hash",
     "_deepep_async_combine",
     "_deepep_buffer_size_gb",

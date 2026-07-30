@@ -74,6 +74,7 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         deepep_buffer_size_gb: float = 2.0,
         deepep_num_sms: int = 20,
         deepep_async_combine: bool = False,
+        alltoall_combine_hidden_chunk_size: int = 0,
     ):
         super().__init__()
         self.num_local_experts = num_local_experts
@@ -99,6 +100,7 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         self.deepep_buffer_size_gb = deepep_buffer_size_gb
         self.deepep_num_sms = deepep_num_sms
         self.deepep_async_combine = deepep_async_combine
+        self.alltoall_combine_hidden_chunk_size = alltoall_combine_hidden_chunk_size
 
         # Base weights are NOT nn.Parameters -- loaded separately via
         # load_and_quantize_weights() to avoid FSDP GPU allocation OOM.
@@ -302,6 +304,7 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
             deepep_buffer_size_gb=getattr(module, "deepep_buffer_size_gb", 2.0),
             deepep_num_sms=getattr(module, "deepep_num_sms", 20),
             deepep_async_combine=getattr(module, "deepep_async_combine", False),
+            alltoall_combine_hidden_chunk_size=getattr(module, "alltoall_combine_hidden_chunk_size", 0),
         )
 
         # Weights will be loaded via load_and_quantize_weights()
@@ -585,7 +588,12 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
     def _build_combine_kwargs(self, expert_output, ctx, dispatch_kwargs, parallel_state):
         """Build combine kwargs based on ep_dispatch strategy."""
         if self.ep_dispatch == "alltoall":
-            return dict(expert_output=expert_output, ctx=ctx, ep_group=parallel_state.ep_group)
+            return dict(
+                expert_output=expert_output,
+                ctx=ctx,
+                ep_group=parallel_state.ep_group,
+                hidden_chunk_size=self.alltoall_combine_hidden_chunk_size,
+            )
         elif self.ep_dispatch == "deepep":
             return dict(
                 buffer=dispatch_kwargs["buffer"],
@@ -684,6 +692,7 @@ class NvFP4QLoRAMoeExperts(QLoRAMoeExperts):
         deepep_buffer_size_gb: float = 2.0,
         deepep_num_sms: int = 20,
         deepep_async_combine: bool = False,
+        alltoall_combine_hidden_chunk_size: int = 0,
     ):
         super().__init__(
             num_local_experts,
@@ -704,6 +713,7 @@ class NvFP4QLoRAMoeExperts(QLoRAMoeExperts):
             deepep_buffer_size_gb=deepep_buffer_size_gb,
             deepep_num_sms=deepep_num_sms,
             deepep_async_combine=deepep_async_combine,
+            alltoall_combine_hidden_chunk_size=alltoall_combine_hidden_chunk_size,
         )
         # Quantized weight storage: 9 buffers (packed + block_scales + global_scale per projection)
         self.register_buffer("gate_packed", None)
@@ -886,6 +896,7 @@ class BlockFP8QLoRAMoeExperts(QLoRAMoeExperts):
         deepep_buffer_size_gb: float = 2.0,
         deepep_num_sms: int = 20,
         deepep_async_combine: bool = False,
+        alltoall_combine_hidden_chunk_size: int = 0,
     ):
         super().__init__(
             num_local_experts,
@@ -906,6 +917,7 @@ class BlockFP8QLoRAMoeExperts(QLoRAMoeExperts):
             deepep_buffer_size_gb=deepep_buffer_size_gb,
             deepep_num_sms=deepep_num_sms,
             deepep_async_combine=deepep_async_combine,
+            alltoall_combine_hidden_chunk_size=alltoall_combine_hidden_chunk_size,
         )
         # Quantized weight storage: 6 buffers (packed + block_scales per projection, no global_scale)
         self.register_buffer("gate_packed", None)
@@ -1019,6 +1031,7 @@ class NF4QLoRAMoeExperts(QLoRAMoeExperts):
         deepep_buffer_size_gb: float = 2.0,
         deepep_num_sms: int = 20,
         deepep_async_combine: bool = False,
+        alltoall_combine_hidden_chunk_size: int = 0,
     ):
         super().__init__(
             num_local_experts,
@@ -1039,6 +1052,7 @@ class NF4QLoRAMoeExperts(QLoRAMoeExperts):
             deepep_buffer_size_gb=deepep_buffer_size_gb,
             deepep_num_sms=deepep_num_sms,
             deepep_async_combine=deepep_async_combine,
+            alltoall_combine_hidden_chunk_size=alltoall_combine_hidden_chunk_size,
         )
         # Quantized weight storage: 6 buffers (packed + scales per projection)
         self.register_buffer("gate_packed", None)
