@@ -109,6 +109,10 @@ from xorl.server.side_payloads import (
     r3_payload_count,
 )
 from xorl.server.weight_sync.handler import WeightSyncHandler
+from xorl.server.weight_sync.source_delta_capture import (
+    sparse_delta_capture_enabled,
+    write_sparse_source_delta_global_manifest,
+)
 from xorl.trainers.training_utils import count_valid_tokens
 
 
@@ -1470,6 +1474,7 @@ class RunnerDispatcher:
         gradient_clip = p.gradient_clip
         lr = p.lr
         model_id = p.model_id or "default"
+        capture_requested = sparse_delta_capture_enabled(p.sparse_delta_capture)
 
         # Auto-load adapter if it was evicted (all ranks must call this together)
         # This can happen if forward_backward was done on this adapter, then another adapter
@@ -1487,7 +1492,18 @@ class RunnerDispatcher:
             beta2=p.beta2,
             eps=p.eps,
             model_id=model_id,
+            sparse_delta_capture=p.sparse_delta_capture,
         )
+
+        if capture_requested:
+            rank_capture = result.get("sparse_delta_capture")
+            if self.world_size > 1 and dist.is_available() and dist.is_initialized():
+                all_rank_captures = [None] * self.world_size
+                dist.all_gather_object(all_rank_captures, rank_capture)
+            else:
+                all_rank_captures = [rank_capture]
+            if self.rank == 0:
+                result["sparse_delta_capture"] = write_sparse_source_delta_global_manifest(all_rank_captures)
 
         # Add auto-load info to result if adapter was loaded from checkpoint
         if was_auto_loaded and self.rank == 0:

@@ -392,12 +392,14 @@ def test_teacher_hidden_cache_contributor_skips_duplicate_cp_ranks_and_keys_ep_r
         runner._teacher_hidden_cache_contributor_key(SimpleNamespace(cp_enabled=True, cp_rank=1, ep_enabled=False))
         is None
     )
+    runner.rank = 4
     assert (
         runner._teacher_hidden_cache_contributor_key(
-            SimpleNamespace(cp_enabled=True, cp_rank=0, ep_enabled=False, dp_rank=2, dp_size=8)
+            SimpleNamespace(cp_enabled=True, cp_rank=0, cp_size=2, ep_enabled=False, pp_size=1)
         )
         == 2
     )
+    runner.rank = 3
     # Distinct-slice dispatch (default): every EP rank contributes its own slice,
     # keyed by the stage-local rank to mirror batch_slice_rank_and_size.
     assert (

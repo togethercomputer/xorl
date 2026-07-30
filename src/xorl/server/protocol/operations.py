@@ -54,6 +54,7 @@ class OptimStepData:
     beta2: Optional[float] = None
     eps: Optional[float] = None
     model_id: Optional[str] = None
+    sparse_delta_capture: Optional[Dict[str, Any]] = None
 
 
 @dataclass
