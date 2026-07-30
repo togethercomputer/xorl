@@ -1,0 +1,17 @@
+# Example: export a bf16 Qwen3-8B HF checkpoint to block-FP8 (e4m3) format.
+#
+# Usage:
+#   python -m xorl.cli.export_quantized --config examples/server/configs/export/qwen3_8b_block_fp8_export.yaml
+#
+# Embeddings, lm_head, and the first/last transformer layer stay in bf16;
+# everything else is quantized with 128x128 block scales.
+
+input_dir: /path/to/qwen3-8b-bf16-hf-weights
+output_dir: /path/to/qwen3-8b-block-fp8-hf-weights
+fmt: e4m3
+weight_block_size: [128, 128]
+modules_to_not_convert:
+  - model.embed_tokens
+  - lm_head
+num_first_layers_bf16: 1
+num_last_layers_bf16: 1
