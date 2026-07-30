@@ -355,7 +355,7 @@ class FutureStore:
             return entry
 
         # Wait for completion with timeout
-        completed = await entry.wait_for_completion(timeout)
+        await entry.wait_for_completion(timeout)
 
         # Return the entry regardless of whether it completed
         # Caller checks entry.is_terminal() to determine if result is ready

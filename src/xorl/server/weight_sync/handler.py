@@ -698,8 +698,8 @@ class WeightSyncHandler:
         Handle sync inference weights request (all ranks participate).
 
         The ``sync_method`` field selects the transport backend.  Currently
-        supported: ``"nccl_broadcast"``, ``"p2p"``, and experimental
-        ``"sparse_delta"``. New backends (RDMA, multi-rank NCCL, etc.) can be
+        supported: ``"nccl_broadcast"``, ``"nccl_simple"``, ``"p2p"``, and
+        experimental ``"sparse_delta"``. New backends can be
         added by implementing :class:`WeightTransportBackend` and registering
         in :func:`backends.create_backend`.
         """
@@ -1377,6 +1377,13 @@ class WeightSyncHandler:
                 "Weight sync does not yet support PP virtual stages (multiple model chunks per rank); "
                 "use a one-stage-per-rank schedule (1F1B/GPipe) on weight-sync (RL) lanes."
             )
+
+        # Tracks whether this rank has participated in the collective P2P
+        # transfer-status all_gather below. If a transfer fails before we
+        # reach it, the except handler re-runs the gather so peer ranks that
+        # already reached it don't wedge until the orchestrator request
+        # timeout.
+        p2p_status_gathered = False
 
         # Tracks whether this rank has participated in the collective P2P
         # transfer-status all_gather below. If a transfer fails before we

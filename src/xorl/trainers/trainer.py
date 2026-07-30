@@ -1351,7 +1351,7 @@ class Trainer:
                     and args.train.global_rank == 0
                     and state.global_step == int(os.environ.get("XORL_MEMHIST_DUMP_STEP", "3"))
                 ):
-                    import torch as _torch
+                    import torch as _torch  # noqa: PLC0415
 
                     memhist_dir = os.environ.get("XORL_MEMHIST_DIR", "/tmp")
                     os.makedirs(memhist_dir, exist_ok=True)

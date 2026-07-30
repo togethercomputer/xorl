@@ -58,10 +58,13 @@ Note: Only rank 0 communicates with Executor via ZMQ.
 
 import asyncio
 import datetime
+import json
 import logging
 import os
+import pickle
 import sys
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -79,6 +82,9 @@ from xorl.server.protocol.operations import (
     SaveFullWeightsData,
     SaveLoraOnlyData,
     SaveStateData,
+    ZORLAbortGenerationData,
+    ZORLApplyRewardsData,
+    ZORLStartGenerationData,
 )
 from xorl.server.protocol.orchestrator_runner import (
     RunnerDispatchCommand,
@@ -89,14 +95,33 @@ from xorl.server.runner.model_runner import ModelRunner
 from xorl.server.runner.utils import (
     Rank0Protocol,
     apply_sequence_sharding,
+    batch_packed_rows,
+    batch_slice_rank_and_size,
     convert_batch_to_tensors,
+    positive_int_param,
     simple_sequence_shard,
     validate_batch_shapes,
 )
+from xorl.server.side_payloads import (
+    MooncakeSidePayloadStore,
+    is_side_payload_ref,
+    load_r3_mooncake_payload_slice,
+    r3_payload_count,
+)
 from xorl.server.weight_sync.handler import WeightSyncHandler
+from xorl.trainers.training_utils import count_valid_tokens
 
 
 logger = logging.getLogger(__name__)
+ROUTING_PAYLOAD_REF_KEY = "__xorl_routing_payload_ref__"
+
+
+def _truthy_env(name: str) -> bool:
+    return os.getenv(name, "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _r3_verbose_logging_enabled() -> bool:
+    return _truthy_env("XORL_R3_VERBOSE_LOGGING")
 
 
 # ============================================================================
@@ -186,6 +211,7 @@ class RunnerDispatcher:
 
         # NCCL watchdog: error state for cross-rank propagation
         self._worker_error: Optional[str] = None
+        self._routing_payload_stores: Dict[tuple[str, str, str, str], MooncakeSidePayloadStore] = {}
 
         logger.info(
             f"RunnerDispatcher initialized (rank={rank}/{world_size}, bind_address={bind_address}, device={device})"
@@ -194,7 +220,15 @@ class RunnerDispatcher:
     # Operations that participate in cross-rank error sync.
     # These ops execute on every rank, and rank-0 success is not trustworthy if any
     # worker rank failed locally.
-    _ERROR_SYNC_OPS = {"forward_backward", "forward", "optim_step", "register_session"}
+    _ERROR_SYNC_OPS = {
+        "forward_backward",
+        "forward",
+        "optim_step",
+        "register_session",
+        "start_zorl_generation",
+        "apply_zorl_rewards",
+        "abort_zorl_generation",
+    }
 
     def _sync_error_state(self) -> Optional[str]:
         """Synchronize error state across all ranks via Gloo group.
@@ -294,6 +328,12 @@ class RunnerDispatcher:
                 logger.info(f"Rank {self.rank}:   Total Requests: {self._protocol.request_count}")
                 logger.info(f"Rank {self.rank}:   Successful: {self._protocol.success_count}")
                 logger.info(f"Rank {self.rank}:   Failed: {self._protocol.failure_count}")
+
+        for store in getattr(self, "_routing_payload_stores", {}).values():
+            store.close()
+        injected_store = getattr(self, "_routing_payload_store", None)
+        if injected_store is not None:
+            injected_store.close()
 
         logger.info(f"Rank {self.rank}: RunnerDispatcher stopped")
 
@@ -407,6 +447,9 @@ class RunnerDispatcher:
         "load_adapter_state": "_handle_load_adapter_state",
         "get_adapter_info": "_handle_get_adapter_info",
         "kill_session": "_handle_kill_session",
+        "start_zorl_generation": "_handle_start_zorl_generation",
+        "apply_zorl_rewards": "_handle_apply_zorl_rewards",
+        "abort_zorl_generation": "_handle_abort_zorl_generation",
     }
 
     # Commands handled on rank 0 only (no broadcast needed)
@@ -450,10 +493,37 @@ class RunnerDispatcher:
 
             # Broadcast command to all ranks using Gloo (CPU-based, doesn't block GPU)
             if self.world_size > 1 and command_dict:
-                logger.debug(f"Rank {self.rank}: Broadcasting command: {request.operation}")
+                payload = command_dict.get("payload")
+                verbose_model_pass = isinstance(payload, ModelPassData) and _r3_verbose_logging_enabled()
+                if verbose_model_pass:
+                    broadcast_log_fn = logger.info
+                    broadcast_log_fn(
+                        "Rank %s: Broadcasting command %s request=%s batches=%s routed=%s routed_weights=%s",
+                        self.rank,
+                        request.operation,
+                        request.message_id,
+                        len(payload.batches or []),
+                        self._routing_payload_count(payload.routed_experts),
+                        self._routing_payload_count(payload.routed_expert_logits),
+                    )
+                else:
+                    broadcast_log_fn = logger.debug
+                    broadcast_log_fn(
+                        "Rank %s: Broadcasting command %s request=%s",
+                        self.rank,
+                        request.operation,
+                        request.message_id,
+                    )
+                broadcast_start = time.perf_counter()
                 command_obj = [command_dict]
                 dist.broadcast_object_list(command_obj, src=0, group=self.cpu_group)
-                logger.debug(f"Rank {self.rank}: Broadcast completed: {request.operation}")
+                broadcast_log_fn(
+                    "Rank %s: Broadcast completed %s request=%s duration=%.3fs",
+                    self.rank,
+                    request.operation,
+                    request.message_id,
+                    time.perf_counter() - broadcast_start,
+                )
 
             # Execute command on rank 0
             command_type = command_dict.get("command", "")
@@ -567,7 +637,8 @@ class RunnerDispatcher:
         p: ModelPassData = command_dict.get("payload", ModelPassData())
         batches = p.batches or []
         loss_fn = p.loss_fn
-        loss_fn_params = p.loss_fn_params
+        loss_fn_params = dict(p.loss_fn_params or {})
+        loss_fn_params.setdefault("diagnostic_microbatch_request_id", command_dict.get("request_id"))
         routed_experts = p.routed_experts
         routed_expert_logits = p.routed_expert_logits
         model_id = p.model_id or "default"
@@ -580,7 +651,10 @@ class RunnerDispatcher:
 
         # Select and prepare batches (broadcast-and-select, no scatter)
         my_batches, routed_experts, routed_expert_logits = self._select_and_prepare_batches(
-            batches, routed_experts=routed_experts, routed_expert_logits=routed_expert_logits
+            batches,
+            loss_fn_params=loss_fn_params,
+            routed_experts=routed_experts,
+            routed_expert_logits=routed_expert_logits,
         )
 
         # Get sequence parallelism info
@@ -622,7 +696,8 @@ class RunnerDispatcher:
         p: ModelPassData = command_dict.get("payload", ModelPassData())
         batches = p.batches or []
         loss_fn = p.loss_fn
-        loss_fn_params = p.loss_fn_params
+        loss_fn_params = dict(p.loss_fn_params or {})
+        loss_fn_params.setdefault("diagnostic_microbatch_request_id", command_dict.get("request_id"))
         routed_experts = p.routed_experts
         routed_expert_logits = p.routed_expert_logits
         model_id = p.model_id or "default"
@@ -632,7 +707,10 @@ class RunnerDispatcher:
 
         # Select and prepare this rank's batches from broadcast data (no scatter)
         my_batches, routed_experts, routed_expert_logits = self._select_and_prepare_batches(
-            batches, routed_experts=routed_experts, routed_expert_logits=routed_expert_logits
+            batches,
+            loss_fn_params=loss_fn_params,
+            routed_experts=routed_experts,
+            routed_expert_logits=routed_expert_logits,
         )
 
         # Get parallel state for SP info
@@ -669,22 +747,235 @@ class RunnerDispatcher:
         routed_expert_logits=None,
     ):
         """Shard batches, execute compute, gather IS metrics. Shared by rank-0 and workers."""
-        my_batches, routed_experts = self._shard_and_slice_batches(
-            my_batches, routed_experts, cp_enabled, parallel_state
+        my_batches, routed_experts, routed_expert_logits = self._shard_and_slice_batches(
+            my_batches, routed_experts, routed_expert_logits, cp_enabled, parallel_state
         )
-
-        result = self._execute_compute(
+        self._maybe_dump_microbatch_diagnostic(
             my_batches,
-            loss_fn,
-            loss_fn_params,
-            routed_experts,
+            loss_fn=loss_fn,
+            loss_fn_params=loss_fn_params,
+            parallel_state=parallel_state,
             with_backward=with_backward,
             model_id=model_id,
+            routed_experts=routed_experts,
             routed_expert_logits=routed_expert_logits,
         )
+
+        if self._microbatch_diagnostic_summary_only(loss_fn_params):
+            result = self._microbatch_diagnostic_only_result(my_batches, parallel_state)
+        else:
+            result = self._execute_compute(
+                my_batches,
+                loss_fn,
+                loss_fn_params,
+                routed_experts,
+                with_backward=with_backward,
+                model_id=model_id,
+                routed_expert_logits=routed_expert_logits,
+            )
         del my_batches
         self._gather_is_metrics(result, cp_enabled, is_rank0=is_rank0)
         return result
+
+    @staticmethod
+    def _microbatch_diagnostic_summary_only(loss_fn_params: Optional[Dict[str, Any]]) -> bool:
+        params = loss_fn_params or {}
+        return bool(params.get("diagnostic_microbatch_summary_only", False))
+
+    @staticmethod
+    def _microbatch_diagnostic_only_result(
+        micro_batches: List[Dict[str, Any]],
+        parallel_state: Any,
+    ) -> Dict[str, Any]:
+        group = (
+            getattr(parallel_state, "fsdp_group", None) if bool(getattr(parallel_state, "pp_enabled", False)) else None
+        )
+        global_valid_tokens = count_valid_tokens(micro_batches, group=group)
+        return {
+            "total_loss": 0.0,
+            "global_valid_tokens": int(global_valid_tokens.item()),
+            "execution_time": 0.0,
+            "microbatch_diagnostic_summary_only": True,
+        }
+
+    @staticmethod
+    def _safe_request_fragment(value: Any) -> str:
+        text = str(value or "unknown")
+        return "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in text)[:160]
+
+    @staticmethod
+    def _position_summary(tensor: torch.Tensor) -> Dict[str, Any]:
+        flat = tensor.detach().reshape(-1).to(dtype=torch.long, device="cpu")
+        if flat.numel() == 0:
+            return {"segments": 0, "max_segment_len": 0}
+        resets = torch.zeros(flat.numel(), dtype=torch.bool)
+        resets[0] = True
+        if flat.numel() > 1:
+            resets[1:] = flat[1:] <= flat[:-1]
+        starts = torch.nonzero(resets, as_tuple=False).flatten()
+        ends = torch.cat([starts[1:], torch.tensor([flat.numel()], dtype=torch.long)])
+        lengths = ends - starts
+        return {
+            "segments": int(lengths.numel()),
+            "max_segment_len": int(lengths.max().item()) if lengths.numel() else 0,
+            "min_segment_len": int(lengths.min().item()) if lengths.numel() else 0,
+            "total_positions": int(flat.numel()),
+        }
+
+    @staticmethod
+    def _tensor_summary(key: str, tensor: torch.Tensor) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "shape": list(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "device": str(tensor.device),
+            "numel": int(tensor.numel()),
+        }
+        if key in {"labels", "target_tokens"}:
+            out["valid_tokens"] = int((tensor != -100).sum().item())
+        elif key == "attention_mask":
+            out["nonzero"] = int((tensor != 0).sum().item())
+        elif key in {"position_ids", "_original_position_ids"}:
+            out.update(RunnerDispatcher._position_summary(tensor))
+        return out
+
+    @staticmethod
+    def _cpu_payload(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu()
+        if isinstance(value, dict):
+            return {k: RunnerDispatcher._cpu_payload(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [RunnerDispatcher._cpu_payload(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(RunnerDispatcher._cpu_payload(v) for v in value)
+        return value
+
+    @staticmethod
+    def _json_payload(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return RunnerDispatcher._tensor_summary("value", value)
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {str(k): RunnerDispatcher._json_payload(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [RunnerDispatcher._json_payload(v) for v in value]
+        if isinstance(value, tuple):
+            return [RunnerDispatcher._json_payload(v) for v in value]
+        try:
+            json.dumps(value)
+        except TypeError:
+            return str(value)
+        return value
+
+    def _maybe_dump_microbatch_diagnostic(
+        self,
+        micro_batches: List[Dict[str, Any]],
+        *,
+        loss_fn: str,
+        loss_fn_params: Optional[Dict[str, Any]],
+        parallel_state: Any,
+        with_backward: bool,
+        model_id: str,
+        routed_experts: Optional[List[Any]] = None,
+        routed_expert_logits: Optional[List[Any]] = None,
+    ) -> None:
+        params = loss_fn_params or {}
+        dump_dir = params.get("diagnostic_microbatch_dump_dir") or os.getenv("XORL_MICROBATCH_DIAGNOSTIC_DIR")
+        if not dump_dir:
+            return
+
+        request_id = params.get("diagnostic_microbatch_request_id") or params.get("request_id") or "unknown"
+        safe_request_id = self._safe_request_fragment(request_id)
+        out_dir = Path(str(dump_dir))
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        batch_summaries = []
+        total_valid_tokens = 0
+        total_input_tokens = 0
+        real_micro_batches = 0
+        for batch_idx, batch in enumerate(micro_batches):
+            tensors = {
+                key: self._tensor_summary(key, value)
+                for key, value in batch.items()
+                if isinstance(value, torch.Tensor)
+                and key
+                in {
+                    "input_ids",
+                    "labels",
+                    "target_tokens",
+                    "position_ids",
+                    "_original_position_ids",
+                    "attention_mask",
+                    "logprobs",
+                    "teacher_cache_indices",
+                    "teacher_cache_local_indices",
+                    "teacher_ids",
+                    "teacher_weights",
+                }
+            }
+            valid_tokens = int(tensors.get("target_tokens", tensors.get("labels", {})).get("valid_tokens", 0))
+            input_tokens = int(tensors.get("input_ids", {}).get("numel", 0))
+            num_samples = int(batch.get("num_samples", 1) or 0)
+            total_valid_tokens += valid_tokens
+            total_input_tokens += input_tokens
+            if num_samples > 0 and valid_tokens > 0:
+                real_micro_batches += 1
+            batch_summaries.append(
+                {
+                    "batch_idx": batch_idx,
+                    "num_samples": num_samples,
+                    "valid_tokens": valid_tokens,
+                    "input_tokens": input_tokens,
+                    "is_dummy": num_samples == 0 or valid_tokens == 0,
+                    "tensors": tensors,
+                }
+            )
+
+        summary = {
+            "request_id": str(request_id),
+            "rank": self.rank,
+            "world_size": self.world_size,
+            "model_id": model_id,
+            "loss_fn": loss_fn,
+            "loss_fn_params": self._json_payload(loss_fn_params or {}),
+            "with_backward": bool(with_backward),
+            "num_micro_batches": len(micro_batches),
+            "real_micro_batches": real_micro_batches,
+            "total_valid_tokens_local": total_valid_tokens,
+            "total_input_tokens_local": total_input_tokens,
+            "parallel": {
+                "ep_enabled": bool(getattr(parallel_state, "ep_enabled", False)),
+                "ep_size": int(getattr(parallel_state, "ep_size", 1)),
+                "dp_size": int(getattr(parallel_state, "dp_size", 1)),
+                "cp_size": int(getattr(parallel_state, "cp_size", 1)),
+                "pp_size": int(getattr(parallel_state, "pp_size", 1)),
+            },
+            "routing": {
+                "routed_experts_count": len(routed_experts or []),
+                "routed_expert_logits_count": len(routed_expert_logits or []),
+            },
+            "batches": batch_summaries,
+        }
+
+        summary_path = out_dir / f"microbatch_{safe_request_id}_rank{self.rank:05d}.json"
+        summary_path.write_text(json.dumps(summary, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+
+        dump_tensors = bool(params.get("diagnostic_microbatch_dump_tensors", False)) or os.getenv(
+            "XORL_MICROBATCH_DIAGNOSTIC_TENSORS", "0"
+        ).strip().lower() in {"1", "true", "yes"}
+        if dump_tensors:
+            tensor_path = out_dir / f"microbatch_{safe_request_id}_rank{self.rank:05d}.pt"
+            torch.save(
+                {
+                    "summary": summary,
+                    "loss_fn_params": self._cpu_payload(loss_fn_params or {}),
+                    "micro_batches": self._cpu_payload(micro_batches),
+                    "routed_experts": self._cpu_payload(routed_experts),
+                    "routed_expert_logits": self._cpu_payload(routed_expert_logits),
+                },
+                tensor_path,
+            )
 
     @staticmethod
     def _create_dummy_batch(src_batch: Dict[str, Any]) -> Dict[str, Any]:
@@ -695,6 +986,19 @@ class RunnerDispatcher:
         target_tokens are set to -100 (IGNORE_INDEX) so cross-entropy loss = 0 and
         gradient_accumulate_loss produces grad_scale = 0 (local_valid_tokens = 0).
         """
+        min_tokens_raw = os.getenv("XORL_SERVER_MINIMAL_DUMMY_BATCH_TOKENS", "").strip()
+        if min_tokens_raw:
+            try:
+                min_tokens = int(min_tokens_raw)
+            except ValueError:
+                min_tokens = 0
+            if min_tokens > 0:
+                return RunnerDispatcher._create_minimal_dummy_batch(src_batch, min_tokens)
+
+        return RunnerDispatcher._create_legacy_dummy_batch(src_batch)
+
+    @staticmethod
+    def _create_legacy_dummy_batch(src_batch: Dict[str, Any]) -> Dict[str, Any]:
         _LABEL_KEYS = {"labels", "target_tokens"}
         dummy_batch = {}
         for key, value in src_batch.items():
@@ -713,6 +1017,66 @@ class RunnerDispatcher:
         return dummy_batch
 
     @staticmethod
+    def _create_minimal_dummy_batch(src_batch: Dict[str, Any], min_tokens: int) -> Dict[str, Any]:
+        """Create a short zero-loss dummy batch for empty data-slice ranks.
+
+        This keeps collective participation uniform while avoiding cloned full
+        OPRD rows on ranks that have no real samples. The OPRD trainer-side
+        teacher forward falls back to this short student sequence when
+        teacher_input_ids/teacher_kept_indices are absent.
+        """
+        input_ids = src_batch.get("input_ids")
+        if not isinstance(input_ids, torch.Tensor) or input_ids.dim() < 1:
+            return RunnerDispatcher._create_legacy_dummy_batch(src_batch)
+
+        seq_len = int(input_ids.shape[-1])
+        if seq_len <= 0:
+            return RunnerDispatcher._create_legacy_dummy_batch(src_batch)
+        keep = max(1, min(int(min_tokens), seq_len))
+
+        label_keys = {"labels", "target_tokens"}
+        drop_keys = {
+            "cu_seq_lens_q",
+            "cu_seq_lens_k",
+            "max_length_q",
+            "max_length_k",
+            "_original_position_ids",
+            "teacher_input_ids",
+            "teacher_kept_indices",
+            "teacher_position_ids",
+            "teacher_cache_indices",
+            "teacher_cache_local_indices",
+            "teacher_cache_base",
+        }
+
+        dummy_batch: Dict[str, Any] = {}
+        for key, value in src_batch.items():
+            if key in drop_keys:
+                continue
+            if isinstance(value, torch.Tensor):
+                if key in label_keys:
+                    if value.dim() >= 1 and int(value.shape[-1]) == seq_len:
+                        dummy_batch[key] = torch.full_like(value[..., :keep], -100)
+                    else:
+                        dummy_batch[key] = torch.full_like(value, -100)
+                elif key == "position_ids" and value.dim() >= 1 and int(value.shape[-1]) == seq_len:
+                    shape = value.shape[:-1] + (keep,)
+                    pos = torch.arange(keep, dtype=value.dtype, device=value.device)
+                    dummy_batch[key] = pos.reshape((1,) * (len(shape) - 1) + (keep,)).expand(shape).clone()
+                elif key == "attention_mask" and value.dim() >= 1 and int(value.shape[-1]) == seq_len:
+                    dummy_batch[key] = torch.ones_like(value[..., :keep])
+                elif value.dim() >= 1 and int(value.shape[-1]) == seq_len:
+                    dummy_batch[key] = value[..., :keep].clone()
+                else:
+                    dummy_batch[key] = value.clone()
+            else:
+                dummy_batch[key] = value
+
+        dummy_batch["num_samples"] = 0
+        dummy_batch["_r3_sample_lengths"] = []
+        return dummy_batch
+
+    @staticmethod
     def _dp_batch_range(dp_rank: int, base_count: int, remainder: int):
         """Return (start_idx, count) for a DP rank under balanced distribution.
 
@@ -727,36 +1091,100 @@ class RunnerDispatcher:
     def _batch_parallel_rank_and_size(self, parallel_state, cp_size: int, pp_size: int) -> tuple[int, int]:
         """Return the logical data slice rank/size for request batch dispatch.
 
-        Expert-parallel ranks cooperate on one logical batch slice.  The
-        ep_fsdp coordinate identifies which EP group receives a distinct slice;
-        ranks within that group must all see the same packed batch so MoE/FSDP
-        collectives and OPD full-vocab KL work stay aligned.
+        Every rank gets a distinct slice (CP/SP ranks share one); EP groups no
+        longer duplicate a slice across their ranks unless the legacy
+        XORL_SERVER_EP_DUPLICATE_BATCHES rollback switch is set — see
+        batch_slice_rank_and_size for the correctness argument.
         """
-        if getattr(parallel_state, "ep_enabled", False):
-            ep_size = max(1, int(getattr(parallel_state, "ep_size", 1)))
-            ep_fsdp_size = max(1, int(getattr(parallel_state, "dp_shard_in_ep_size", 1)))
-            ep_mesh = getattr(parallel_state, "ep_fsdp_device_mesh", None)
-            if ep_mesh is not None:
-                try:
-                    ep_fsdp_rank = int(ep_mesh.get_local_rank("ep_fsdp"))
-                    return min(ep_fsdp_rank, ep_fsdp_size - 1), ep_fsdp_size
-                except Exception as exc:
-                    logger.debug(
-                        "Rank %s: could not read ep_fsdp local rank from EP mesh (%s); falling back to rank arithmetic",
-                        self.rank,
-                        exc,
-                    )
+        return batch_slice_rank_and_size(self.rank, self.world_size, parallel_state, cp_size, pp_size)
 
-            ranks_per_pp_stage = max(1, self.world_size // max(1, pp_size))
-            local_stage_rank = self.rank % ranks_per_pp_stage
-            ep_fsdp_rank = min(local_stage_rank // ep_size, ep_fsdp_size - 1)
-            return ep_fsdp_rank, ep_fsdp_size
+    @staticmethod
+    def _is_routing_payload_ref(value: Any) -> bool:
+        return is_side_payload_ref(value) or (isinstance(value, dict) and bool(value.get(ROUTING_PAYLOAD_REF_KEY)))
 
-        dp_size = max(1, self.world_size // max(1, cp_size * pp_size))
-        dp_rank = min(self.rank // max(1, cp_size * pp_size), dp_size - 1)
-        return dp_rank, dp_size
+    @staticmethod
+    def _routing_payload_count(value: Optional[Any]) -> int:
+        if value is None:
+            return 0
+        if is_side_payload_ref(value):
+            return r3_payload_count(value)
+        if RunnerDispatcher._is_routing_payload_ref(value):
+            return int(value.get("count", 0))
+        return len(value)
 
-    def _select_and_prepare_batches(self, raw_batches, routed_experts=None, routed_expert_logits=None):
+    def _load_routing_payload_slice(self, value: Optional[Any], start: int, count: int) -> Optional[List[Any]]:
+        if value is None:
+            return None
+        if not RunnerDispatcher._is_routing_payload_ref(value):
+            return value[start : start + count]
+        if is_side_payload_ref(value):
+            items = load_r3_mooncake_payload_slice(
+                value,
+                start,
+                count,
+                store=self._get_mooncake_routing_payload_store(value),
+            )
+            log_fn = logger.info if _r3_verbose_logging_enabled() else logger.debug
+            log_fn(
+                "Rank %s: Loaded R3 %s Mooncake slice [%s:%s]",
+                self.rank,
+                value.get("field"),
+                start,
+                start + count,
+            )
+            return items
+
+        manifest_path = Path(str(value["manifest"]))
+        kind = str(value["kind"])
+        with manifest_path.open("rb") as f:
+            manifest = pickle.load(f)
+        kind_meta = manifest.get(kind)
+        if not kind_meta:
+            return None
+        item_dir = Path(str(kind_meta["dir"]))
+        items = []
+        for idx in range(start, start + count):
+            with (item_dir / f"{idx:06d}.pkl").open("rb") as f:
+                items.append(pickle.load(f))
+        log_fn = logger.info if _r3_verbose_logging_enabled() else logger.debug
+        log_fn(
+            "Rank %s: Loaded R3 %s slice [%s:%s] from %s",
+            self.rank,
+            kind,
+            start,
+            start + count,
+            item_dir,
+        )
+        return items
+
+    def _get_mooncake_routing_payload_store(self, value: Dict[str, Any]) -> MooncakeSidePayloadStore:
+        injected_store = getattr(self, "_routing_payload_store", None)
+        if injected_store is not None:
+            return injected_store
+        mooncake = value.get("mooncake")
+        if not isinstance(mooncake, dict):
+            raise ValueError(f"R3 Mooncake payload ref missing mooncake metadata: {value!r}")
+        cache_key = (
+            str(mooncake.get("master_server_address", "")),
+            str(mooncake.get("metadata_server", "")),
+            str(mooncake.get("protocol", "")),
+            str(mooncake.get("device_name", "")),
+        )
+        stores = getattr(self, "_routing_payload_stores", None)
+        if stores is None:
+            stores = {}
+            self._routing_payload_stores = stores
+        if cache_key not in stores:
+            stores[cache_key] = MooncakeSidePayloadStore.from_metadata(mooncake)
+        return stores[cache_key]
+
+    def _select_and_prepare_batches(
+        self,
+        raw_batches,
+        loss_fn_params: Optional[Dict[str, Any]] = None,
+        routed_experts=None,
+        routed_expert_logits=None,
+    ):
         """Each rank locally selects its own batches from the full broadcast data.
 
         Instead of scatter, every rank receives ALL raw batches via broadcast and
@@ -764,6 +1192,9 @@ class RunnerDispatcher:
 
         Args:
             raw_batches: List of raw batch dicts (Python lists, not yet tensors).
+            loss_fn_params: Loss parameters. ``opd_packed_row_batch_size`` is
+                applied after this rank has selected its normal data slice when
+                ``opd_packed_row_batch_scope`` is rank-local.
             routed_experts: Optional R3 routing data (list indexed by datum).
             routed_expert_logits: Optional R3 routing logits (list indexed by datum).
 
@@ -774,11 +1205,49 @@ class RunnerDispatcher:
         cp_size = parallel_state.cp_size
         pp_size = parallel_state.pp_size if parallel_state.pp_enabled else 1
 
+        params = loss_fn_params or {}
+        row_batch_size = positive_int_param(
+            params.get("opd_packed_row_batch_size", params.get("packed_row_batch_size")),
+            name="opd_packed_row_batch_size",
+            default=1,
+        )
+        row_batch_scope = str(params.get("opd_packed_row_batch_scope", "rank_local")).lower()
+        rank_local_row_batching = row_batch_size > 1 and row_batch_scope in {
+            "rank_local",
+            "rank-local",
+            "local",
+            "per_rank",
+            "per-rank",
+        }
+        if row_batch_size > 1 and row_batch_scope not in {
+            "rank_local",
+            "rank-local",
+            "local",
+            "per_rank",
+            "per-rank",
+            "global",
+            "executor",
+            "orchestrator",
+        }:
+            raise ValueError(
+                "opd_packed_row_batch_scope must be one of rank_local, global, executor, or orchestrator; "
+                f"got {row_batch_scope!r}"
+            )
+
         num_batches = len(raw_batches)
 
         if self.world_size <= 1:
-            converted = [self._convert_batch_to_tensors(b) for b in raw_batches]
-            return converted, routed_experts, routed_expert_logits
+            selected = batch_packed_rows(raw_batches, row_batch_size) if rank_local_row_batching else raw_batches
+            converted = [self._convert_batch_to_tensors(b) for b in selected]
+            return (
+                converted,
+                self._load_routing_payload_slice(routed_experts, 0, self._routing_payload_count(routed_experts)),
+                self._load_routing_payload_slice(
+                    routed_expert_logits,
+                    0,
+                    self._routing_payload_count(routed_expert_logits),
+                ),
+            )
 
         dp_rank, dp_size = self._batch_parallel_rank_and_size(parallel_state, cp_size, pp_size)
         batches_per_dp_group = (num_batches + dp_size - 1) // dp_size
@@ -791,13 +1260,42 @@ class RunnerDispatcher:
         start_idx, my_real_count = self._dp_batch_range(dp_rank, base_count, remainder)
         my_raw_batches = raw_batches[start_idx : start_idx + my_real_count]
 
+        target_batches_per_dp_group = batches_per_dp_group
+        if rank_local_row_batching:
+            if routed_experts is not None or routed_expert_logits is not None:
+                raise ValueError("opd_packed_row_batch_size is not supported with routed_experts replay")
+            before_count = len(my_raw_batches)
+            my_raw_batches = batch_packed_rows(my_raw_batches, row_batch_size)
+            local_grouped_count = len(my_raw_batches)
+            cpu_group = getattr(self, "cpu_group", None)
+            if self.world_size > 1 and cpu_group is not None:
+                count_tensor = torch.tensor([local_grouped_count], dtype=torch.int64)
+                dist.all_reduce(count_tensor, op=dist.ReduceOp.MAX, group=cpu_group)
+                target_batches_per_dp_group = int(count_tensor.item())
+            else:
+                target_batches_per_dp_group = local_grouped_count
+            if pp_size > 1:
+                target_batches_per_dp_group = max(target_batches_per_dp_group, pp_size)
+            target_batches_per_dp_group = max(1, target_batches_per_dp_group)
+            if before_count != local_grouped_count:
+                logger.info(
+                    "Rank %s: rank-local packed-row batching selected slice %d/%d: %d -> %d real batches "
+                    "(row_batch_size=%d)",
+                    self.rank,
+                    dp_rank,
+                    dp_size,
+                    before_count,
+                    local_grouped_count,
+                    row_batch_size,
+                )
+
         # Convert only this rank's batches to tensors
         my_batches = [self._convert_batch_to_tensors(b) for b in my_raw_batches]
 
         # Pad with dummy batches to reach batches_per_dp_group
-        if len(my_batches) < batches_per_dp_group:
+        if len(my_batches) < target_batches_per_dp_group:
             reference = my_batches[-1] if my_batches else self._convert_batch_to_tensors(raw_batches[0])
-            for _ in range(batches_per_dp_group - len(my_batches)):
+            for _ in range(target_batches_per_dp_group - len(my_batches)):
                 my_batches.append(self._create_dummy_batch(reference))
 
         # Slice routed_experts / routed_expert_logits for this DP group
@@ -814,9 +1312,13 @@ class RunnerDispatcher:
             dp_datum_count = sum(raw_batches[start_idx + i].get("num_samples", 1) for i in range(my_real_count))
 
             if routed_experts is not None:
-                routed_experts_slice = routed_experts[datum_offset : datum_offset + dp_datum_count]
+                routed_experts_slice = self._load_routing_payload_slice(routed_experts, datum_offset, dp_datum_count)
             if routed_expert_logits is not None:
-                routed_expert_logits_slice = routed_expert_logits[datum_offset : datum_offset + dp_datum_count]
+                routed_expert_logits_slice = self._load_routing_payload_slice(
+                    routed_expert_logits,
+                    datum_offset,
+                    dp_datum_count,
+                )
 
         logger.debug(
             f"Rank {self.rank}: _select_and_prepare_batches: dp_rank={dp_rank}/{dp_size}, "
@@ -830,13 +1332,14 @@ class RunnerDispatcher:
         self,
         my_batches: List[Dict[str, Any]],
         routed_experts: Optional[List[Any]],
+        routed_expert_logits: Optional[List[Any]],
         cp_enabled: bool,
         parallel_state: Any,
-    ) -> Tuple[List[Dict[str, Any]], Optional[List[Any]]]:
+    ) -> Tuple[List[Dict[str, Any]], Optional[List[Any]], Optional[List[Any]]]:
         """Validate, apply SP sharding, and slice R3 routing data for this rank's batches.
 
         Returns:
-            Tuple of (sharded_batches, sliced_routed_experts).
+            Tuple of (sharded_batches, sliced_routed_experts, sliced_routed_expert_logits).
         """
         # Log and validate batch shapes before applying sharding
         for i, batch in enumerate(my_batches):
@@ -888,14 +1391,19 @@ class RunnerDispatcher:
             my_batches = sharded_batches
             logger.debug(f"Rank {self.rank}: Applied sequence sharding locally (cp_rank={parallel_state.cp_rank})")
 
-        # Slice routed_experts for this rank's datum subset
-        if routed_experts is not None and my_batches:
+        # Slice R3 side arrays for this rank's datum subset. IDs and routing
+        # weights must stay aligned because R3 weight replay indexes both by
+        # the same per-datum order.
+        if (routed_experts is not None or routed_expert_logits is not None) and my_batches:
             r3_offset = my_batches[0].pop("_r3_datum_offset", None)
             r3_count = my_batches[0].pop("_r3_datum_count", None)
             if r3_offset is not None and r3_count is not None:
-                routed_experts = routed_experts[r3_offset : r3_offset + r3_count]
+                if routed_experts is not None:
+                    routed_experts = routed_experts[r3_offset : r3_offset + r3_count]
+                if routed_expert_logits is not None:
+                    routed_expert_logits = routed_expert_logits[r3_offset : r3_offset + r3_count]
 
-        return my_batches, routed_experts
+        return my_batches, routed_experts, routed_expert_logits
 
     def _execute_compute(
         self,
@@ -969,7 +1477,17 @@ class RunnerDispatcher:
         was_auto_loaded, auto_load_path = self._adapter_coordinator.auto_load_if_evicted(model_id)
 
         # All ranks execute optim_step (synchronized via DDP)
-        result = self.trainer.optim_step(gradient_clip=gradient_clip, lr=lr, model_id=model_id)
+        # beta1/beta2/eps are threaded through from AdamParams; dropping them
+        # here silently ran every server-mode run at build_optimizer's default
+        # betas (beta2=0.95 instead of the advertised value).
+        result = self.trainer.optim_step(
+            gradient_clip=gradient_clip,
+            lr=lr,
+            beta1=p.beta1,
+            beta2=p.beta2,
+            eps=p.eps,
+            model_id=model_id,
+        )
 
         # Add auto-load info to result if adapter was loaded from checkpoint
         if was_auto_loaded and self.rank == 0:
@@ -1334,6 +1852,55 @@ class RunnerDispatcher:
 
     async def _handle_kill_session(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
         return await self._adapter_coordinator.handle_kill_session(command_dict)
+
+    async def _handle_start_zorl_generation(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle start_zorl_generation on all ranks."""
+        p: ZORLStartGenerationData = command_dict.get("payload", ZORLStartGenerationData())
+        model_id = p.model_id or "default"
+
+        was_auto_loaded, auto_load_path = self._adapter_coordinator.auto_load_if_evicted(
+            model_id,
+            allow_fresh_materialization=False,
+        )
+        result = self.trainer.start_zorl_generation(
+            model_id=model_id,
+            num_pairs=p.num_pairs,
+            materialization=p.materialization,
+            owner_url=p.owner_url,
+        )
+        if was_auto_loaded and self.rank == 0:
+            result["auto_loaded"] = True
+            result["auto_load_path"] = auto_load_path
+        return result if self.rank == 0 else {}
+
+    async def _handle_apply_zorl_rewards(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle apply_zorl_rewards on all ranks."""
+        p: ZORLApplyRewardsData = command_dict.get("payload", ZORLApplyRewardsData())
+        model_id = p.model_id or "default"
+
+        was_auto_loaded, auto_load_path = self._adapter_coordinator.auto_load_if_evicted(
+            model_id,
+            allow_fresh_materialization=False,
+        )
+        result = self.trainer.apply_zorl_rewards(
+            model_id=model_id,
+            generation_id=p.generation_id,
+            candidate_rewards=p.candidate_rewards,
+            learning_rate=p.learning_rate,
+        )
+        if was_auto_loaded and self.rank == 0:
+            result["auto_loaded"] = True
+            result["auto_load_path"] = auto_load_path
+        return result if self.rank == 0 else {}
+
+    async def _handle_abort_zorl_generation(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle abort_zorl_generation on all ranks."""
+        p: ZORLAbortGenerationData = command_dict.get("payload", ZORLAbortGenerationData())
+        result = self.trainer.abort_zorl_generation(
+            model_id=p.model_id or "default",
+            generation_id=p.generation_id,
+        )
+        return result if self.rank == 0 else {}
 
 
 if __name__ == "__main__":

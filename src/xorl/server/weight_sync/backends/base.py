@@ -90,6 +90,7 @@ class WeightTransportBackend(ABC):
 
     def __init__(self, config: TransportConfig) -> None:
         self.config = config
+        self.endpoint_results: List[Dict[str, Any]] = []
 
     # ------------------------------------------------------------------
     # Lifecycle

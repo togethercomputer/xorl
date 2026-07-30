@@ -17,18 +17,21 @@ sync, and rollouts after sync differ from the initial model output.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import signal
+import socket
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 import pytest
 import requests
 import torch
 
-from tests._helpers.opd import save_teacher_hidden_cache
+from xorl.distillation import MooncakeHiddenStore
 
 from .e2e_utils import create_tiny_model_dir
 from .server_utils import (
@@ -61,6 +64,94 @@ pytestmark = [
         reason="Set XORL_SGLANG_SOURCE_DIR or XORL_SGLANG_INTERNAL_DIR",
     ),
 ]
+
+
+def _wait_tcp(host: str, port: int, timeout: float) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                return True
+        except OSError:
+            time.sleep(0.3)
+    return False
+
+
+class _MooncakeMaster:
+    """Run a local Mooncake master + HTTP metadata server for the OPD cache path.
+
+    Sets the ``MOONCAKE_*`` env so the xorl trainer (started afterwards) and this
+    test process both attach to it. ``pytest.skip``s cleanly if Mooncake (binary
+    or ``mooncake.store``) is unavailable, so the test never hard-fails on envs
+    that can't host the transport.
+    """
+
+    def __init__(self, log_path: Path, rpc_port: int, meta_port: int):
+        self.log_path = log_path
+        self.rpc_port = rpc_port
+        self.meta_port = meta_port
+        self.proc: subprocess.Popen | None = None
+
+    def start(self) -> None:
+        if importlib.util.find_spec("mooncake.store") is None:
+            pytest.skip("mooncake.store not importable")
+        spec = importlib.util.find_spec("mooncake")
+        master_bin = Path(spec.submodule_search_locations[0]) / "mooncake_master"
+        if not master_bin.exists():
+            pytest.skip(f"mooncake_master binary not found at {master_bin}")
+        log = self.log_path.open("w")
+        self.proc = subprocess.Popen(
+            [
+                str(master_bin),
+                "-enable_http_metadata_server",
+                "-http_metadata_server_host=0.0.0.0",
+                f"-http_metadata_server_port={self.meta_port}",
+                f"-rpc_port={self.rpc_port}",
+                f"-port={self.rpc_port}",
+                "-logtostderr",
+            ],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+        if not (_wait_tcp("127.0.0.1", self.rpc_port, 30.0) and _wait_tcp("127.0.0.1", self.meta_port, 30.0)):
+            self.stop()
+            pytest.skip("mooncake master did not become ready")
+        os.environ["MOONCAKE_MASTER_SERVER"] = f"127.0.0.1:{self.rpc_port}"
+        os.environ["MOONCAKE_METADATA_SERVER"] = f"http://127.0.0.1:{self.meta_port}/metadata"
+        os.environ["MOONCAKE_PROTOCOL"] = "tcp"
+        os.environ["MOONCAKE_LOCAL_HOSTNAME"] = "127.0.0.1"
+
+    def stop(self) -> None:
+        for key in (
+            "MOONCAKE_MASTER_SERVER",
+            "MOONCAKE_METADATA_SERVER",
+            "MOONCAKE_PROTOCOL",
+            "MOONCAKE_LOCAL_HOSTNAME",
+        ):
+            os.environ.pop(key, None)
+        if self.proc is not None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+            self.proc = None
+
+
+def _put_hiddens_mooncake(store, hiddens: list[torch.Tensor]) -> tuple[dict, list[list[int]]]:
+    """Concatenate per-sample teacher hiddens into Mooncake; return (metadata, indices)."""
+    cache_indices: list[list[int]] = []
+    chunks = []
+    offset = 0
+    for h in hiddens:
+        tensor = h if torch.is_tensor(h) else torch.tensor(h, dtype=torch.bfloat16)
+        tensor = tensor.to(torch.bfloat16)
+        chunks.append(tensor)
+        cache_indices.append(list(range(offset, offset + tensor.shape[0])))
+        offset += tensor.shape[0]
+    big = torch.cat(chunks, dim=0).contiguous()
+    metadata = store.put_hidden(f"opd/e2e/{uuid.uuid4().hex}/teacher/0/hidden", big)
+    return metadata, cache_indices
 
 
 class _SGLangServer:
@@ -306,7 +397,14 @@ def test_opd_full_pipeline_with_weight_sync(tmp_path):
     # straight from the safetensors shard, so no extra extraction step is needed.
     teacher_head_entry = teacher_dir
 
+    # Teacher hidden-state caches travel only through Mooncake; stand up a local
+    # master and attach this test process (producer) + the trainer (consumer).
+    master = _MooncakeMaster(tmp_path / "mooncake_master.log", _get_free_port(), _get_free_port())
+    store = None
+
     try:
+        master.start()  # sets MOONCAKE_* env before the trainer server spawns
+        store = MooncakeHiddenStore()
         teacher.start(timeout=300.0)
         student.start(timeout=300.0)
         try:
@@ -341,8 +439,7 @@ def test_opd_full_pipeline_with_weight_sync(tmp_path):
             )
 
             hiddens = _teacher_hidden_states_for(teacher, sequences)
-            cache_path = tmp_path / f"teacher_hidden_step{step}.safetensors"
-            cache_indices = save_teacher_hidden_cache(hiddens, cache_path)
+            cache_entry, cache_indices = _put_hiddens_mooncake(store, hiddens)
 
             data = []
             for seq, indices in zip(sequences, cache_indices):
@@ -368,7 +465,7 @@ def test_opd_full_pipeline_with_weight_sync(tmp_path):
                         "loss_fn": "opd_loss",
                         "loss_fn_params": {
                             "teacher_heads": {"0": str(teacher_head_entry)},
-                            "teacher_hidden_caches": {"0": str(cache_path)},
+                            "teacher_hidden_caches": {"0": cache_entry},
                             "opd_sort_by_teacher": True,
                             "num_chunks": 4,
                         },
@@ -441,10 +538,15 @@ def test_opd_full_pipeline_with_weight_sync(tmp_path):
         # only shows the top-level assertion.
         (tmp_path / "loss_history.json").write_text(json.dumps(loss_history), encoding="utf-8")
     finally:
+        if store is not None:
+            store.close()
         try:
             server.stop()
         finally:
             try:
                 student.stop()
             finally:
-                teacher.stop()
+                try:
+                    teacher.stop()
+                finally:
+                    master.stop()

@@ -391,7 +391,7 @@ def _bi_fused_per_token_ce_checked(
     """Guarded entry for ``ce_mode='bi_fused'`` (the batch-invariant lm-head
     contract). The contract IS the fp32-class lm-head computation, so it
     requires ``lm_head_fp32`` semantics without materializing the fp32 weight."""
-    from xorl.ops.loss.bi_fused_lm_head import bi_fused_per_token_ce
+    from xorl.ops.loss.bi_fused_lm_head import bi_fused_per_token_ce  # noqa: PLC0415
 
     if z_loss_enabled:
         raise NotImplementedError("ce_mode='bi_fused' does not support softmax_auxiliary_loss")

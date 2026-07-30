@@ -5,6 +5,7 @@ The server supports heterogeneous multi-adapter LoRA sessions where each
 
 - a LoRA runtime config (rank + alpha)
 - an optimizer contract (type + kwargs + default learning rate)
+- an optional ZORL runtime config for zeroth-order LoRA search
 
 This module normalizes those specs into a shared JSON-safe structure used by
 the API server, worker runtime, and checkpoint metadata.
@@ -18,6 +19,8 @@ from copy import deepcopy
 from typing import Any, Dict, Optional
 
 import torch
+
+from xorl.server.zorl import normalize_zorl_runtime_config
 
 
 SUPPORTED_OPTIMIZER_TYPES = {
@@ -233,11 +236,13 @@ def normalize_session_spec(
     default_optimizer_dtype: str,
     default_optimizer_kwargs: Optional[Dict[str, Any]],
     server_lora_config: Optional[Dict[str, Any]] = None,
+    raw_zorl_config: Optional[Dict[str, Any]] = None,
+    default_zorl_config: Optional[Dict[str, Any]] = None,
     default_betas: tuple[float, float] = DEFAULT_ADAM_BETAS,
     default_eps: float = DEFAULT_ADAM_EPS,
 ) -> Dict[str, Any]:
     """Normalize the full per-session runtime spec."""
-    return {
+    session_spec = {
         "base_model": base_model,
         "is_lora": True,
         "lora_config": normalize_lora_runtime_config(
@@ -259,12 +264,22 @@ def normalize_session_spec(
         ),
     }
 
+    zorl_config = normalize_zorl_runtime_config(
+        raw_zorl_config,
+        default_zorl_config=default_zorl_config,
+    )
+    if zorl_config is not None:
+        session_spec["zorl_config"] = zorl_config
+
+    return session_spec
+
 
 def build_default_session_spec(
     *,
     base_model: str,
     train_config: Dict[str, Any],
     lora_config: Dict[str, Any],
+    zorl_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build the default worker session spec from server config."""
     max_lora_rank = int(lora_config.get("max_lora_rank", lora_config.get("lora_rank", 32)))
@@ -281,6 +296,7 @@ def build_default_session_spec(
             "optimizer_dtype": train_config.get("optimizer_dtype", "bf16"),
             "optimizer_kwargs": train_config.get("optimizer_kwargs", {}),
         },
+        raw_zorl_config=zorl_config,
         default_rank=lora_config.get("lora_rank", 32),
         default_alpha=lora_config.get("lora_alpha", 16),
         max_lora_rank=max_lora_rank,
@@ -290,6 +306,7 @@ def build_default_session_spec(
         default_optimizer_dtype=train_config.get("optimizer_dtype", "bf16"),
         default_optimizer_kwargs=train_config.get("optimizer_kwargs", {}),
         server_lora_config=lora_config,
+        default_zorl_config=zorl_config,
     )
 
 
@@ -437,9 +454,14 @@ def load_session_spec_from_checkpoint(
         ),
     )
 
-    return {
+    zorl_config = normalize_zorl_runtime_config(fallback_session_spec.get("zorl_config"))
+
+    session_spec = {
         "base_model": base_model,
         "is_lora": True,
         "lora_config": lora_config,
         "optimizer_config": optimizer_config,
     }
+    if zorl_config is not None:
+        session_spec["zorl_config"] = zorl_config
+    return session_spec

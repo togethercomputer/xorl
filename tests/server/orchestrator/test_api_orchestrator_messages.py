@@ -10,9 +10,6 @@ This module tests the communication protocol between API Server and Engine:
 
 import pytest
 
-
-pytestmark = [pytest.mark.cpu, pytest.mark.server]
-
 from xorl.server.protocol.api_orchestrator import (
     OrchestratorOutputs,
     # Core Message Types
@@ -40,6 +37,9 @@ from xorl.server.protocol.operations import (
     OptimStepData,
     SaveStateData,
 )
+
+
+pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
 
 class TestSerializationAndBuilders:

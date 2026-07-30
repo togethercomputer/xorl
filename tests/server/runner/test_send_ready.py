@@ -11,9 +11,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-
-pytestmark = [pytest.mark.cpu, pytest.mark.server]
-
 from xorl.server.protocol.operations import (
     EmptyData,
     ModelPassData,
@@ -26,6 +23,9 @@ from xorl.server.protocol.orchestrator_runner import (
     serialize_message,
 )
 from xorl.server.runner.utils.rank0_protocol import Rank0Protocol
+
+
+pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
 
 def _make_protocol_stub():

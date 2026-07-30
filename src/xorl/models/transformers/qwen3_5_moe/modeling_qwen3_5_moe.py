@@ -213,7 +213,7 @@ class Qwen3_5MoeAttention(nn.Module):
 
 
 class Qwen3_5MoeSparseMoeBlock(MoEBlock):
-    def __init__(self, config, moe_implementation="triton"):
+    def __init__(self, config, moe_implementation="triton", layer_idx: int | None = None):
         super().__init__(
             hidden_size=config.hidden_size,
             num_experts=config.num_experts,
@@ -225,6 +225,7 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
             train_router=getattr(config, "train_router", False),
         )
         self.config = config
+        self.layer_idx = layer_idx
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
         self.experts.deepep_buffer_size_gb = getattr(config, "_deepep_buffer_size_gb", 2.0)
         self.experts.deepep_num_sms = getattr(config, "_deepep_num_sms", 20)
@@ -287,7 +288,7 @@ class Qwen3_5MoeDecoderLayer(MoEGradientCheckpointingLayer):
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
             moe_implementation = getattr(config, "_moe_implementation", "triton")
-            self.mlp = QWEN3_5_MOE_CLASSES[moe_implementation](config)
+            self.mlp = QWEN3_5_MOE_CLASSES[moe_implementation](config, layer_idx=layer_idx)
         else:
             self.mlp = Qwen3_5MoeMLP(config, intermediate_size=config.intermediate_size)
 
@@ -406,7 +407,7 @@ class Qwen3_5MoePreTrainedModel(XorlPreTrainedModel):
         head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
         skip_expert_loading = False
         if not is_prequantized:
-            from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
+            from xorl.qlora.modules.moe_experts import QLoRAMoeExperts  # noqa: PLC0415
 
             skip_expert_loading = any(
                 isinstance(module, QLoRAMoeExperts) and not getattr(module, "_weights_loaded", False)
