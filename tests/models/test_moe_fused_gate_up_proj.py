@@ -201,7 +201,7 @@ def test_save_model_weights_drops_qarl_buffers_and_unfuses_qkv(tmp_path):
     p = "model.layers.0.self_attn"
     state_dict = {
         f"{p}.qkv_proj.weight": torch.randn(q_dim + 2 * kv_dim, hidden),
-        # QARLLinear observer/scale buffers registered under the fused module (the crashers):
+        # QARLLinear observer/scale buffers registered under the fused module (the crashes):
         f"{p}.qkv_proj.qarl_input_amax": torch.zeros(()),  # 0-dim scalar
         f"{p}.qkv_proj.qarl_forward_count": torch.zeros((), dtype=torch.long),  # 0-dim scalar
         f"{p}.qkv_proj.qarl_weight_scale_inv": torch.zeros(8, 4),  # 2-D, would be mis-split
