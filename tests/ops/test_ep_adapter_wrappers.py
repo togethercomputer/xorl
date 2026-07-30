@@ -16,7 +16,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from xorl.models.layers.moe.backend import EP_EXPERT_COMPUTE
+import xorl.models.layers.moe.backend as moe_backend
+from xorl.models.layers.moe.backend import EP_EXPERT_COMPUTE, EP_EXPERT_COMPUTE_MOE_ACT
 from xorl.utils import import_utils
 
 
@@ -28,6 +29,7 @@ _MODULE_PATHS = {
 }
 
 _BACKEND_INIT_PATH = Path(__file__).resolve().parents[2] / "src/xorl/models/layers/moe/backend/__init__.py"
+_BACKEND_PACKAGE = "xorl.models.layers.moe.backend"
 
 
 def _counts_from_cumsum(cumsum: torch.Tensor) -> list[int]:
@@ -135,6 +137,37 @@ def _make_test_data(dtype=torch.float32):
     return permute_tokens, cumsum, gate_proj, up_proj, down_proj, gate_up_proj, intermediate_size, expert_scores
 
 
+def test_quack_ep_registers_without_optional_moe_act(monkeypatch):
+    """The base Quack EP path must not depend on the optional MoE-act class."""
+    for module_name in list(sys.modules):
+        if module_name == _BACKEND_PACKAGE or module_name.startswith(f"{_BACKEND_PACKAGE}."):
+            monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+    quack_stub = types.ModuleType("xorl.ops.moe.quack")
+
+    class QuackEPGroupGemm:
+        @staticmethod
+        def apply(*args, **kwargs):
+            return args, kwargs
+
+    quack_stub.QuackEPGroupGemm = QuackEPGroupGemm
+    monkeypatch.setitem(sys.modules, "xorl.ops.moe.quack", quack_stub)
+
+    spec = importlib.util.spec_from_file_location(
+        _BACKEND_PACKAGE,
+        _BACKEND_INIT_PATH,
+        submodule_search_locations=[str(_BACKEND_INIT_PATH.parent)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, _BACKEND_PACKAGE, module)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    assert "quack" in module.EP_EXPERT_COMPUTE
+    assert "quack" not in module.EP_EXPERT_COMPUTE_MOE_ACT
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton/Quack EP kernels require CUDA")
 @pytest.mark.parametrize(
     ("backend_type", "class_name"),
     [
@@ -174,7 +207,7 @@ def test_adapter_forwards_expert_scores(monkeypatch, backend_type, class_name):
 # ---------------------------------------------------------------------------
 
 # Required explicit parameters for every EP_EXPERT_COMPUTE entry.
-_REQUIRED_EP_PARAMS = ("expert_scores", "hidden_act")
+_REQUIRED_EP_PARAMS = ("expert_scores", "hidden_act", "activation_native", "swiglu_limit")
 
 
 @pytest.mark.parametrize("name,fn", list(EP_EXPERT_COMPUTE.items()))
@@ -195,3 +228,238 @@ def test_ep_compute_signature_contract(name, fn):
         f"EP_EXPERT_COMPUTE['{name}'] has no **kwargs — new extras like "
         f"gate_up_bias will break callers. Signature: {sig}"
     )
+
+
+def test_native_ep_adapter_consumes_fp8_kwargs_when_fp8_compute_is_disabled():
+    """Native EP is a BF16 fallback path but receives the common EP FP8 kwargs."""
+
+    fn = EP_EXPERT_COMPUTE.get("native")
+    if fn is None:
+        pytest.skip("native EP backend is unavailable")
+
+    permute_tokens = torch.empty(0, 4)
+    cumsum = torch.zeros(1, dtype=torch.int32)
+    gate_up_proj = torch.empty(1, 4, 8)
+    down_proj = torch.empty(1, 4, 4)
+
+    out = fn(
+        permute_tokens,
+        cumsum,
+        gate_up_proj,
+        down_proj,
+        intermediate_size=4,
+        expert_scores=None,
+        hidden_act="silu",
+        fp8_compute=False,
+        fp8_grouped_backend="triton_grouped",
+        fp8_block_size=128,
+        gate_up_bias=None,
+        down_bias=None,
+    )
+
+    assert out.shape == permute_tokens.shape
+
+
+def test_native_ep_adapter_rejects_fp8_expert_compute_explicitly():
+    fn = EP_EXPERT_COMPUTE.get("native")
+    if fn is None:
+        pytest.skip("native EP backend is unavailable")
+
+    permute_tokens = torch.empty(0, 4)
+    cumsum = torch.zeros(1, dtype=torch.int32)
+    gate_up_proj = torch.empty(1, 4, 8)
+    down_proj = torch.empty(1, 4, 4)
+
+    with pytest.raises(NotImplementedError, match="native EP backend does not support FP8 expert compute"):
+        fn(
+            permute_tokens,
+            cumsum,
+            gate_up_proj,
+            down_proj,
+            intermediate_size=4,
+            expert_scores=None,
+            hidden_act="silu",
+            fp8_compute=True,
+            fp8_grouped_backend="triton_grouped",
+            fp8_block_size=128,
+        )
+
+
+def test_triton_ep_adapter_consumes_fp8_kwargs_when_fp8_compute_is_disabled(monkeypatch):
+    fn = EP_EXPERT_COMPUTE.get("triton")
+    if fn is None or not hasattr(moe_backend, "TritonEPGroupGemm"):
+        pytest.skip("triton EP backend is unavailable")
+
+    def fake_apply(*args):
+        return args[0].new_empty(args[0].shape)
+
+    monkeypatch.setattr(moe_backend.TritonEPGroupGemm, "apply", staticmethod(fake_apply))
+
+    permute_tokens = torch.empty(0, 4)
+    cumsum = torch.zeros(1, dtype=torch.int32)
+    gate_up_proj = torch.empty(1, 4, 8)
+    down_proj = torch.empty(1, 4, 4)
+
+    out = fn(
+        permute_tokens,
+        cumsum,
+        gate_up_proj,
+        down_proj,
+        intermediate_size=4,
+        expert_scores=None,
+        hidden_act="silu",
+        fp8_compute=False,
+        fp8_grouped_backend="triton_grouped",
+        fp8_block_size=128,
+        gate_up_bias=None,
+        down_bias=None,
+    )
+
+    assert out.shape == permute_tokens.shape
+
+
+def test_triton_ep_adapter_rejects_fp8_expert_compute_explicitly():
+    fn = EP_EXPERT_COMPUTE.get("triton")
+    if fn is None:
+        pytest.skip("triton EP backend is unavailable")
+
+    permute_tokens = torch.empty(0, 4)
+    cumsum = torch.zeros(1, dtype=torch.int32)
+    gate_up_proj = torch.empty(1, 4, 8)
+    down_proj = torch.empty(1, 4, 4)
+
+    with pytest.raises(NotImplementedError, match="triton EP backend does not support FP8 expert compute"):
+        fn(
+            permute_tokens,
+            cumsum,
+            gate_up_proj,
+            down_proj,
+            intermediate_size=4,
+            expert_scores=None,
+            hidden_act="silu",
+            fp8_compute=True,
+            fp8_grouped_backend="triton_grouped",
+            fp8_block_size=128,
+            gate_up_bias=None,
+            down_bias=None,
+        )
+
+
+def test_triton_moe_act_ep_adapter_consumes_common_kwargs(monkeypatch):
+    fn = EP_EXPERT_COMPUTE_MOE_ACT.get("triton")
+    if fn is None or not hasattr(moe_backend, "TritonEPGroupGemmMoeAct"):
+        pytest.skip("triton moe_act EP backend is unavailable")
+
+    def fake_apply(*args):
+        return args[0].new_empty(args[0].shape)
+
+    monkeypatch.setattr(moe_backend.TritonEPGroupGemmMoeAct, "apply", staticmethod(fake_apply))
+
+    permute_tokens = torch.empty(0, 4)
+    cumsum = torch.zeros(1, dtype=torch.int32)
+    gate_up_proj = torch.empty(1, 4, 8)
+    down_proj = torch.empty(1, 4, 4)
+
+    out = fn(
+        permute_tokens,
+        cumsum,
+        gate_up_proj,
+        down_proj,
+        intermediate_size=4,
+        expert_scores=None,
+        hidden_act="silu",
+        activation_native=False,
+        fp8_compute=False,
+        fp8_grouped_backend="triton_grouped",
+        fp8_block_size=128,
+        swiglu_limit=0.0,
+        gate_up_bias=None,
+        down_bias=None,
+        gated=True,
+    )
+
+    assert out.shape == permute_tokens.shape
+
+
+@pytest.mark.parametrize("name,fn", list(EP_EXPERT_COMPUTE_MOE_ACT.items()))
+def test_moe_act_ep_compute_signature_contract(name, fn):
+    sig = inspect.signature(fn)
+    params = sig.parameters
+
+    for required in _REQUIRED_EP_PARAMS:
+        assert required in params, (
+            f"EP_EXPERT_COMPUTE_MOE_ACT['{name}'] is missing explicit '{required}' param. Signature: {sig}"
+        )
+
+    has_var_keyword = any(p.kind == p.VAR_KEYWORD for p in params.values())
+    assert has_var_keyword, (
+        f"EP_EXPERT_COMPUTE_MOE_ACT['{name}'] has no **kwargs — new extras like "
+        f"gate_up_bias will break callers. Signature: {sig}"
+    )
+
+
+def test_triton_moe_act_ep_adapter_rejects_fp8_expert_compute_explicitly():
+    fn = EP_EXPERT_COMPUTE_MOE_ACT.get("triton")
+    if fn is None:
+        pytest.skip("triton moe_act EP backend is unavailable")
+
+    permute_tokens = torch.empty(0, 4)
+    cumsum = torch.zeros(1, dtype=torch.int32)
+    gate_up_proj = torch.empty(1, 4, 8)
+    down_proj = torch.empty(1, 4, 4)
+
+    with pytest.raises(NotImplementedError, match="triton moe_act EP backend does not support FP8 expert compute"):
+        fn(
+            permute_tokens,
+            cumsum,
+            gate_up_proj,
+            down_proj,
+            intermediate_size=4,
+            expert_scores=None,
+            hidden_act="silu",
+            activation_native=False,
+            fp8_compute=True,
+            fp8_grouped_backend="triton_grouped",
+            fp8_block_size=128,
+            gate_up_bias=None,
+            down_bias=None,
+        )
+
+
+def test_quack_ep_adapter_forwards_activation_native(monkeypatch):
+    fn = EP_EXPERT_COMPUTE.get("quack")
+    quack_cls = getattr(moe_backend, "_QuackEPGroupGemm", None)
+    if fn is None or quack_cls is None:
+        pytest.skip("quack EP backend is unavailable")
+
+    seen = {}
+
+    def fake_apply(*args):
+        seen["activation_native"] = args[7]
+        return args[0].new_empty(args[0].shape)
+
+    monkeypatch.setattr(quack_cls, "apply", staticmethod(fake_apply))
+
+    permute_tokens = torch.empty(0, 4)
+    cumsum = torch.zeros(1, dtype=torch.int32)
+    gate_up_proj = torch.empty(1, 4, 8)
+    down_proj = torch.empty(1, 4, 4)
+
+    out = fn(
+        permute_tokens,
+        cumsum,
+        gate_up_proj,
+        down_proj,
+        intermediate_size=4,
+        expert_scores=None,
+        hidden_act="silu",
+        activation_native=True,
+        fp8_compute=False,
+        fp8_grouped_backend="triton_grouped",
+        fp8_block_size=128,
+        gate_up_bias=None,
+        down_bias=None,
+    )
+
+    assert out.shape == permute_tokens.shape
+    assert seen["activation_native"] is True

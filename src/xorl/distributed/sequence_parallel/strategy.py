@@ -79,6 +79,11 @@ def _gather_seq_scatter_kv(k, v, *, seq_dim: int, head_dim: int, group):
     return kv[:, :, :, 0, :].contiguous(), kv[:, :, :, 1, :].contiguous()
 
 
+def _needs_module_projection_path(proj) -> bool:
+    """Return true when async Ulysses cannot safely bypass module forward()."""
+    return getattr(proj, "weight", None) is None or hasattr(proj, "forward_with_weight")
+
+
 # ------------------------------------------------------------------ #
 # Base class
 # ------------------------------------------------------------------ #
@@ -246,10 +251,11 @@ class UlyssesAsyncStrategy(CPStrategy):
         self.ulysses_size = ulysses_size
 
     def project_qkv(self, module, hidden_states, position_embeddings):
-        # QLoRA fallback: weight is None (packed in quantized buffers).
-        # Fall back to sync-style: module._project_qkv() + synchronous a2a.
-        if not hasattr(module, "qkv_proj") or module.qkv_proj.weight is None:
-            q, k, v = module._project_qkv(hidden_states, position_embeddings)
+        # Async Ulysses slices raw weights and bypasses module forward(). FP8Linear
+        # and packed QLoRA projections need the module path for their compute recipe.
+        if not hasattr(module, "qkv_proj") or _needs_module_projection_path(module.qkv_proj):
+            local_position_embeddings = slice_position_embedding(position_embeddings, dim=1, sp_group=self.group)
+            q, k, v = module._project_qkv(hidden_states, local_position_embeddings)
             if q.ndim == 4 and q.size(0) == 1:
                 q = q.squeeze(0)
                 k = k.squeeze(0)
@@ -322,9 +328,9 @@ class UlyssesAsyncStrategy(CPStrategy):
         return attn_output
 
     def project_output(self, module, attn_output):
-        # QLoRA fallback: weight is None (packed in quantized buffers).
-        # Fall back to sync-style: a2a + module.o_proj() forward.
-        if module.o_proj.weight is None:
+        # Async Ulysses bypasses module forward(); FP8Linear and packed QLoRA
+        # projections need sync-style a2a + module._project_output().
+        if _needs_module_projection_path(module.o_proj):
             if attn_output.ndim == 4 and attn_output.size(0) == 1:
                 attn_output = attn_output.squeeze(0)
                 attn_output = gather_heads_scatter_seq(attn_output, seq_dim=0, head_dim=1, group=self.group)

@@ -132,6 +132,8 @@ def _run_experts_grouped_mm(
     gate_up_proj: torch.Tensor | None = None,
     gate_up_bias: torch.Tensor | None = None,
     down_bias: torch.Tensor | None = None,
+    swiglu_limit: float = 0.0,
+    gated: bool = True,
 ) -> torch.Tensor:
     """Run MoE experts using ``torch._grouped_mm``.
 
@@ -140,6 +142,10 @@ def _run_experts_grouped_mm(
     When ``gate_up_proj`` is provided, uses a single fused GEMM (matching HF)
     instead of two separate gate/up GEMMs for better bf16 numerical consistency.
 
+    With ``gated=False``, ``gate_up_proj`` holds the plain up projection
+    ``[E, in_dim, intermediate_size]`` and the activation is applied directly
+    to the single GEMM output.
+
     Optional per-expert biases (pre-expanded to ``[total_padded, dim]``) are
     applied before the activation (gate_up_bias) and after the down projection
     (down_bias).
@@ -147,42 +153,53 @@ def _run_experts_grouped_mm(
     offsets = torch.cumsum(padded_counts, dim=0, dtype=torch.int32)
     compute_dtype = torch.bfloat16
 
-    if gate_up_proj is not None:
-        # Fused: single GEMM -> chunk (matches HF's grouped_mm dispatch)
-        gate_up_out = torch._grouped_mm(
-            x.to(compute_dtype),
-            gate_up_proj.to(compute_dtype),
-            offs=offsets,
-        )
-        intermediate_size = gate_up_out.shape[-1] // 2
-        gate_raw = gate_up_out[..., :intermediate_size]
-        up_out = gate_up_out[..., intermediate_size:]
+    if not gated:
+        # Non-gated experts: single first GEMM, activation applied directly.
+        up_out = torch._grouped_mm(x.to(compute_dtype), gate_up_proj.to(compute_dtype), offs=offsets)
+        if gate_up_bias is not None:
+            up_out = up_out + gate_up_bias.to(compute_dtype)
+        # relu2 — the only supported non-gated activation (validated at entry).
+        h = F.relu(up_out) * up_out
     else:
-        # Split: separate gate/up GEMMs (legacy path)
-        gate_raw = torch._grouped_mm(x.to(compute_dtype), gate_proj.to(compute_dtype), offs=offsets)
-        up_out = torch._grouped_mm(x.to(compute_dtype), up_proj.to(compute_dtype), offs=offsets)
+        if gate_up_proj is not None:
+            # Fused: single GEMM -> chunk (matches HF's grouped_mm dispatch)
+            gate_up_out = torch._grouped_mm(
+                x.to(compute_dtype),
+                gate_up_proj.to(compute_dtype),
+                offs=offsets,
+            )
+            intermediate_size = gate_up_out.shape[-1] // 2
+            gate_raw = gate_up_out[..., :intermediate_size]
+            up_out = gate_up_out[..., intermediate_size:]
+        else:
+            # Split: separate gate/up GEMMs (legacy path)
+            gate_raw = torch._grouped_mm(x.to(compute_dtype), gate_proj.to(compute_dtype), offs=offsets)
+            up_out = torch._grouped_mm(x.to(compute_dtype), up_proj.to(compute_dtype), offs=offsets)
 
-    if gate_up_bias is not None:
-        intermediate = gate_raw.shape[-1]
-        gate_raw = gate_raw + gate_up_bias[:, :intermediate].to(compute_dtype)
-        up_out = up_out + gate_up_bias[:, intermediate:].to(compute_dtype)
+        if gate_up_bias is not None:
+            intermediate = gate_raw.shape[-1]
+            gate_raw = gate_raw + gate_up_bias[:, :intermediate].to(compute_dtype)
+            up_out = up_out + gate_up_bias[:, intermediate:].to(compute_dtype)
 
-    # GLU: act(gate) * up
-    if hidden_act == "gelu_tanh":
-        gate_out = F.gelu(gate_raw, approximate="tanh")
-        h = gate_out * up_out
-    elif hidden_act == "clamped_swiglu":
-        # GPT-OSS clamped SwiGLU: clamp both branches, scaled sigmoid gate,
-        # +1 bias on the up/linear branch.
-        _CLAMPED_SWIGLU_ALPHA = 1.702
-        _CLAMPED_SWIGLU_LIMIT = 7.0
-        gate_raw = gate_raw.clamp(max=_CLAMPED_SWIGLU_LIMIT)
-        up_out = up_out.clamp(min=-_CLAMPED_SWIGLU_LIMIT, max=_CLAMPED_SWIGLU_LIMIT)
-        gate_out = gate_raw * torch.sigmoid(_CLAMPED_SWIGLU_ALPHA * gate_raw)
-        h = gate_out * (up_out + 1)
-    else:
-        gate_out = F.silu(gate_raw)
-        h = gate_out * up_out
+        if swiglu_limit > 0:
+            gate_raw = gate_raw.clamp(-swiglu_limit, swiglu_limit)
+
+        # GLU: act(gate) * up
+        if hidden_act == "gelu_tanh":
+            gate_out = F.gelu(gate_raw, approximate="tanh")
+            h = gate_out * up_out
+        elif hidden_act == "clamped_swiglu":
+            # GPT-OSS clamped SwiGLU: clamp both branches, scaled sigmoid gate,
+            # +1 bias on the up/linear branch.
+            _CLAMPED_SWIGLU_ALPHA = 1.702
+            _CLAMPED_SWIGLU_LIMIT = 7.0
+            gate_raw = gate_raw.clamp(max=_CLAMPED_SWIGLU_LIMIT)
+            up_out = up_out.clamp(min=-_CLAMPED_SWIGLU_LIMIT, max=_CLAMPED_SWIGLU_LIMIT)
+            gate_out = gate_raw * torch.sigmoid(_CLAMPED_SWIGLU_ALPHA * gate_raw)
+            h = gate_out * (up_out + 1)
+        else:
+            gate_out = F.silu(gate_raw)
+            h = gate_out * up_out
 
     # down: h @ down_proj -> (tokens, hidden)
     out = torch._grouped_mm(
@@ -211,7 +228,16 @@ _run_experts_compiled = torch.compile(_run_experts_grouped_mm, fullgraph=True)
 
 
 def _run_experts_gelu_tanh_wrapper(
-    gate_proj, up_proj, down_proj, x, padded_counts, expert_scores=None, gate_up_proj=None
+    gate_proj,
+    up_proj,
+    down_proj,
+    x,
+    padded_counts,
+    expert_scores=None,
+    gate_up_proj=None,
+    gate_up_bias=None,
+    down_bias=None,
+    swiglu_limit=0.0,
 ):
     return _run_experts_grouped_mm(
         gate_proj,
@@ -222,6 +248,9 @@ def _run_experts_gelu_tanh_wrapper(
         expert_scores,
         hidden_act="gelu_tanh",
         gate_up_proj=gate_up_proj,
+        gate_up_bias=gate_up_bias,
+        down_bias=down_bias,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -353,8 +382,12 @@ def _native_expert_forward_impl(
 SUPPORTED_HIDDEN_ACTS = frozenset({"silu", "gelu_tanh", "clamped_swiglu"})
 
 
-def _select_compiled_fn(hidden_act: str = "silu"):
+def _select_compiled_fn(hidden_act: str = "silu", swiglu_limit: float = 0.0, gated: bool = True):
     """Select the right compute variant based on activation kind."""
+    if not gated:
+        return lambda *a, **kw: _run_experts_grouped_mm(*a, hidden_act=hidden_act, gated=False, **kw)
+    if swiglu_limit > 0:
+        return lambda *a, **kw: _run_experts_grouped_mm(*a, hidden_act=hidden_act, swiglu_limit=swiglu_limit, **kw)
     if hidden_act == "gelu_tanh":
         # Use uncompiled for now — torch.compile fullgraph has issues with
         # the gate_up_proj branch when switching between None/non-None.
@@ -362,6 +395,16 @@ def _select_compiled_fn(hidden_act: str = "silu"):
     if hidden_act == "clamped_swiglu":
         return lambda *a, **kw: _run_experts_grouped_mm(*a, hidden_act="clamped_swiglu", **kw)
     return _run_experts_compiled
+
+
+def _check_native_hidden_act(hidden_act: str, gated: bool) -> None:
+    """Validate the activation against the gated or non-gated supported set."""
+    from xorl.ops.moe.activations import UNGATED_HIDDEN_ACTS, check_hidden_act_supported  # noqa: PLC0415
+
+    if gated:
+        check_hidden_act_supported(hidden_act, "native", SUPPORTED_HIDDEN_ACTS)
+    else:
+        check_hidden_act_supported(hidden_act, "native (non-gated)", UNGATED_HIDDEN_ACTS)
 
 
 def native_expert_forward(
@@ -374,16 +417,17 @@ def native_expert_forward(
     num_experts: int,
     hidden_act: str = "silu",
     gate_up_proj: torch.Tensor = None,
+    swiglu_limit: float = 0.0,
+    gated: bool = True,
     **kwargs,
 ) -> torch.Tensor:
     """Forward pass using native PyTorch ``torch._grouped_mm``.
 
     Accepts optional ``gate_up_bias`` / ``down_bias`` via ``**kwargs`` for
-    GPT-OSS models that use per-expert biases.
+    GPT-OSS models that use per-expert biases. With ``gated=False``,
+    ``gate_up_proj`` holds the plain up projection ``[E, in_dim, I]``.
     """
-    from xorl.ops.moe.triton import check_hidden_act_supported
-
-    check_hidden_act_supported(hidden_act, "native", SUPPORTED_HIDDEN_ACTS)
+    _check_native_hidden_act(hidden_act, gated)
     return _native_expert_forward_impl(
         hidden_states,
         routing_weights,
@@ -392,7 +436,7 @@ def native_expert_forward(
         up_proj,
         down_proj,
         num_experts,
-        _select_compiled_fn(hidden_act),
+        _select_compiled_fn(hidden_act, swiglu_limit, gated),
         gate_up_proj=gate_up_proj,
         gate_up_bias=kwargs.get("gate_up_bias"),
         down_bias=kwargs.get("down_bias"),
@@ -459,6 +503,7 @@ def _run_grouped_mm_with_lora(
     down_proj_lora_A: torch.Tensor,
     down_proj_lora_B: torch.Tensor,
     scaling: float,
+    swiglu_limit: float = 0.0,
 ) -> torch.Tensor:
     """Run MoE experts with LoRA using ``torch._grouped_mm``.
 
@@ -479,7 +524,10 @@ def _run_grouped_mm_with_lora(
         gate_lora_B,
         offs=offsets,
     )
-    gate_out = F.silu(gate_out + gate_lora_out * scaling)
+    gate_out = gate_out + gate_lora_out * scaling
+    if swiglu_limit > 0:
+        gate_out = gate_out.clamp(-swiglu_limit, swiglu_limit)
+    gate_out = F.silu(gate_out)
 
     # --- Up projection with LoRA ---
     up_out = torch._grouped_mm(x_bf16, up_proj.to(compute_dtype), offs=offsets)
@@ -531,6 +579,7 @@ def native_expert_lora_forward(
     down_proj_lora_A: torch.Tensor,
     down_proj_lora_B: torch.Tensor,
     scaling: float,
+    swiglu_limit: float = 0.0,
     **kwargs,
 ) -> torch.Tensor:
     """Native LoRA forward using ``torch._grouped_mm`` (local single-GPU).
@@ -540,7 +589,6 @@ def native_expert_lora_forward(
     """
     num_tokens, top_k = selected_experts.shape
     hidden_dim = hidden_states.shape[-1]
-    device = hidden_states.device
 
     # 1. Flatten top-k assignments
     flat_experts = selected_experts.view(-1)
@@ -577,6 +625,7 @@ def native_expert_lora_forward(
         down_proj_lora_A,
         down_proj_lora_B,
         scaling,
+        swiglu_limit,
     )
 
     # 6. Unpad + apply routing weights
@@ -605,6 +654,8 @@ def native_ep_compute(
     hidden_act: str = "silu",
     gate_up_bias: torch.Tensor | None = None,
     down_bias: torch.Tensor | None = None,
+    swiglu_limit: float = 0.0,
+    gated: bool = True,
 ) -> torch.Tensor:
     """EP expert compute using ``torch._grouped_mm`` with fused gate+up GEMM.
 
@@ -612,10 +663,10 @@ def native_ep_compute(
 
     Optional ``gate_up_bias`` ``[num_local_experts, 2*I]`` and ``down_bias``
     ``[num_local_experts, H]`` are per-expert biases for GPT-OSS models.
+    With ``gated=False``, ``gate_up_proj`` holds the plain up projection
+    ``[num_local_experts, in_dim, I]``.
     """
-    from xorl.ops.moe.triton import check_hidden_act_supported
-
-    check_hidden_act_supported(hidden_act, "native", SUPPORTED_HIDDEN_ACTS)
+    _check_native_hidden_act(hidden_act, gated)
     if permute_tokens.shape[0] == 0:
         return permute_tokens
 
@@ -635,7 +686,7 @@ def native_ep_compute(
     gate_up_bias_exp = _expand_expert_bias(gate_up_bias, padded_counts) if gate_up_bias is not None else None
     down_bias_exp = _expand_expert_bias(down_bias, padded_counts) if down_bias is not None else None
 
-    compiled_fn = _select_compiled_fn(hidden_act)
+    compiled_fn = _select_compiled_fn(hidden_act, swiglu_limit, gated)
     # gate_proj/up_proj positional args are unused when gate_up_proj is provided
     out_padded = compiled_fn(
         None,
@@ -670,6 +721,7 @@ def native_ep_compute_lora(
     down_proj_lora_A: torch.Tensor,
     down_proj_lora_B: torch.Tensor,
     scaling: float,
+    swiglu_limit: float = 0.0,
 ) -> torch.Tensor:
     """EP expert compute with LoRA using ``torch._grouped_mm``.
 
@@ -695,6 +747,7 @@ def native_ep_compute_lora(
         down_proj_lora_A,
         down_proj_lora_B,
         scaling,
+        swiglu_limit,
     )
 
     return _unpad(out_padded, counts, padded_counts, num_local_experts, permute_tokens.shape[0])

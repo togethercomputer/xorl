@@ -14,6 +14,7 @@ from transformers import (
 )
 
 from ..distributed.parallel_state import get_parallel_state
+from ..ops.moe.triton import resolve_routing_weights_before_down, set_routing_weights_before_down
 from ..utils import logging
 from .layers.attention import ATTENTION_FUNCTIONS
 from .layers.normalization import set_rmsnorm_mode
@@ -21,7 +22,11 @@ from .loader import ModelLoader, get_loader
 from .transformers.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from .transformers.deepseek_v3.support import validate_deepseek_v3_router_settings
 from .transformers.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
+from .transformers.glm5.configuration_glm5 import Glm5Config
+from .transformers.glm5.support import validate_glm5_router_settings, validate_glm5_sequence_parallel
 from .transformers.gpt_oss.configuration_gpt_oss import GptOssConfig
+from .transformers.minimax_m3.configuration_minimax_m3 import MiniMaxM3Config
+from .transformers.nemotron_h.configuration_nemotron_h import NemotronHConfig
 from .transformers.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 from .transformers.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
 from .transformers.qwen3_5_shared import (
@@ -78,6 +83,9 @@ def _load_local_xorl_config(
     config_dict, _ = PretrainedConfig.get_config_dict(config_path, **config_kwargs)
     model_type = config_dict.get("model_type")
 
+    if model_type == "glm_moe_dsa":
+        return Glm5Config.from_hf_config(_namespace_from_dict(config_dict))
+
     if model_type == "glm4_moe":
         return Glm4MoeConfig.from_dict(config_dict)
 
@@ -90,6 +98,9 @@ def _load_local_xorl_config(
     if model_type in {"deepseek_v3", "kimi_k2", "kimi_k25"}:
         return DeepseekV3Config.from_hf_config(_namespace_from_dict(config_dict))
 
+    if model_type == "nemotron_h":
+        return NemotronHConfig.from_hf_config(_namespace_from_dict(config_dict))
+
     if model_type == "qwen2":
         from .transformers.qwen2.configuration_qwen2 import Qwen2Config  # noqa: PLC0415
 
@@ -97,6 +108,10 @@ def _load_local_xorl_config(
 
     if model_type == "gpt_oss":
         return GptOssConfig.from_hf_config(_namespace_from_dict(config_dict))
+
+    if model_type in {"minimax_m3_vl", "xorl_minimax_m3"}:
+        return MiniMaxM3Config.from_hf_config(_namespace_from_dict(config_dict))
+
     if model_type == "olmo2":
         from .transformers.olmo2.configuration_olmo2 import Olmo2Config  # noqa: PLC0415
 
@@ -116,6 +131,12 @@ def _get_architectures(config: "PretrainedConfig") -> set[str]:
 
 def _is_gpt_oss_config(config: "PretrainedConfig") -> bool:
     return getattr(config, "model_type", None) == "gpt_oss" or "GptOssForCausalLM" in _get_architectures(config)
+
+
+def _is_minimax_m3_config(config: "PretrainedConfig") -> bool:
+    return getattr(config, "model_type", None) == "xorl_minimax_m3" or bool(
+        _get_architectures(config) & {"MiniMaxM3SparseForConditionalGeneration", "MiniMaxM3SparseForCausalLM"}
+    )
 
 
 def build_tokenizer(tokenizer_path: str) -> "PreTrainedTokenizer":
@@ -167,21 +188,27 @@ def build_foundation_model(
     weights_path: Optional[str] = None,
     torch_dtype: Literal["float16", "bfloat16", "float32"] = "bfloat16",
     attn_implementation: Optional[
-        Literal["eager", "sdpa", "native", "flash_attention_3", "flash_attention_4"]
-    ] = "flash_attention_3",
+        Literal["eager", "sdpa", "native", "flash_attention_3", "flash_attention_4", "minimax_msa"]
+    ] = "flash_attention_4",
     moe_implementation: Optional[Literal["eager", "triton", "native", "quack"]] = None,
+    moe_routing_weights_before_down: Union[bool, str] = "auto",
     ep_dispatch: str = "alltoall",
     train_router: bool = False,
     record_routing_weights: bool = True,
     deepep_buffer_size_gb: float = 2.0,
     deepep_num_sms: int = 20,
     deepep_async_combine: bool = False,
+    alltoall_combine_hidden_chunk_size: int = 0,
     router_fp32: bool = True,
     lm_head_fp32: bool = True,
-    rmsnorm_mode: Literal["eager", "native", "compile"] = "native",
+    rmsnorm_mode: Literal[
+        "eager", "native", "compile", "sglang", "sglang_fused", "sglang_jit", "sglang_kernel"
+    ] = "native",
     activation_native: bool = False,
     rope_native: bool = False,
     attention_cast_bf16: bool = False,
+    sparse_mla_enabled: bool = False,
+    sparse_mla_backend: str = "auto",
     flash_attention_deterministic: bool = False,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
@@ -208,6 +235,7 @@ def build_foundation_model(
         logger.info_rank0(f"Moe implementation: {moe_implementation}")
 
     validate_deepseek_v3_router_settings(config, train_router=train_router)
+    validate_glm5_router_settings(config, train_router=train_router)
 
     if ep_dispatch == "deepep" and train_router:
         raise ValueError(
@@ -221,16 +249,40 @@ def build_foundation_model(
     config._deepep_buffer_size_gb = deepep_buffer_size_gb
     config._deepep_num_sms = deepep_num_sms
     config._deepep_async_combine = deepep_async_combine
+    config._alltoall_combine_hidden_chunk_size = alltoall_combine_hidden_chunk_size
     config._router_fp32 = router_fp32
     config._lm_head_fp32 = lm_head_fp32
+    routing_before_down = resolve_routing_weights_before_down(
+        moe_routing_weights_before_down, train_router=train_router, ep_dispatch=ep_dispatch
+    )
+    set_routing_weights_before_down(routing_before_down)
+    logger.info_rank0(
+        f"MoE routing-weight position: {'before' if routing_before_down else 'after'}-down "
+        f"(moe_routing_weights_before_down={moe_routing_weights_before_down!r}, "
+        f"train_router={train_router}, ep_dispatch={ep_dispatch})"
+    )
     set_rmsnorm_mode(rmsnorm_mode)
     config._rmsnorm_mode = rmsnorm_mode
     config._activation_native = activation_native
     config._rope_native = rope_native
     config._attention_cast_bf16 = attention_cast_bf16
+    config._sparse_mla_enabled = sparse_mla_enabled
+    config._sparse_mla_backend = sparse_mla_backend
     config._flash_attention_deterministic = flash_attention_deterministic
 
     if ep_dispatch == "deepep":
+        # Probe the internode transport before weight loading: a dead NVSHMEM path
+        # otherwise wedges the gang at the first MoE dispatch, minutes later.
+        ep_state = get_parallel_state()
+        if ep_state.ep_enabled:
+            from ..distributed.moe.deepep import preflight_internode_transport  # noqa: PLC0415
+
+            preflight_internode_transport(
+                ep_state.ep_group,
+                hidden_dim=getattr(config, "hidden_size", 0) or 2048,
+                buffer_size_gb=deepep_buffer_size_gb,
+                num_sms=deepep_num_sms,
+            )
         logger.info_rank0(
             f"DeepEP dispatch enabled (buffer={deepep_buffer_size_gb} GB, "
             f"num_sms={deepep_num_sms}, async_combine={deepep_async_combine})"
@@ -240,21 +292,36 @@ def build_foundation_model(
     if attn_implementation == "sdpa":
         raise ValueError(
             "attn_implementation='sdpa' is not supported for packed sequences with sequence parallelism. "
-            "Please use 'flash_attention_3' for correct cu_seqlens handling."
+            "Please use 'flash_attention_4' (default) or 'flash_attention_3' for correct cu_seqlens handling."
         )
 
     ps = get_parallel_state()
     if ps.ringattn_size > 1 and has_linear_attention_layers(config):
         logger.warning_once(LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE)
         raise ValueError(LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE)
+    validate_glm5_sequence_parallel(config, parallel_state=ps)
 
-    if _is_gpt_oss_config(config) and attn_implementation not in ("eager", "flash_attention_3"):
+    if _is_gpt_oss_config(config) and attn_implementation not in ("eager", "flash_attention_3", "flash_attention_4"):
         raise ValueError(
             "GPT-OSS attention sinks are only implemented for attn_implementation="
-            "'eager' or 'flash_attention_3' in xorl. Using other backends (sdpa, "
-            "flash_attention_2, flash_attention_4, native) would silently drop the "
+            "'eager', 'flash_attention_3', or 'flash_attention_4' in xorl. Using other "
+            "backends (sdpa, flash_attention_2, native) would silently drop the "
             "sink logits and change model outputs."
         )
+
+    if _is_minimax_m3_config(config):
+        unsupported = (
+            ps.tp_size > 1
+            or ps.pp_size > 1
+            or ps.ringattn_size > 1
+            or ps.ulysses_size > 1
+            or getattr(ps, "lm_head_tp_size", 1) > 1
+        )
+        if unsupported:
+            raise ValueError(
+                "MiniMax M3 xorl support currently supports data/FSDP2 and expert parallelism only; "
+                "tensor parallelism, pipeline parallelism, Ulysses, Ring, and lm-head TP are not supported yet."
+            )
 
     loader: ModelLoader = get_loader(config)
 
@@ -272,6 +339,8 @@ def build_foundation_model(
     hf_attn_implementation = attn_implementation
     if attn_implementation in ("flash_attention_3", "flash_attention_4"):
         hf_attn_implementation = "flash_attention_2"
+    elif attn_implementation == "minimax_msa":
+        hf_attn_implementation = "eager"
 
     init_kwargs = {
         "config": config,

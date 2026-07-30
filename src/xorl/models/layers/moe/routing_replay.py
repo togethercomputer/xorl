@@ -51,15 +51,17 @@ class RoutingReplay:
         Disabled for torch.compile — pin_memory and list-append side
         effects are not supported by Inductor/Dynamo.
         """
-        buf = torch.empty_like(selected_experts, device="cpu", pin_memory=torch.cuda.is_available())
-        buf.copy_(selected_experts)
+        pin = torch.cuda.is_available()
+        buf = torch.empty_like(selected_experts, device="cpu", pin_memory=pin)
+        buf.copy_(selected_experts, non_blocking=pin)
         self.top_indices_list.append(buf)
 
     @torch.compiler.disable
     def record_weights(self, routing_weights: torch.Tensor):
-        """Append routing weights (CPU copy) for R3 weight replay."""
-        buf = torch.empty_like(routing_weights, device="cpu", pin_memory=torch.cuda.is_available())
-        buf.copy_(routing_weights)
+        """Append routing weights (CPU pinned copy) for R3 weight replay."""
+        pin = torch.cuda.is_available()
+        buf = torch.empty_like(routing_weights, device="cpu", pin_memory=pin)
+        buf.copy_(routing_weights, non_blocking=pin)
         self.top_weights_list.append(buf)
 
     def _target_device(self) -> torch.device:

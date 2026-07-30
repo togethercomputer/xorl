@@ -3,6 +3,7 @@ import json
 import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Set
 
 import torch
@@ -19,6 +20,7 @@ from ..utils.logging import get_logger
 if is_torch_version_greater_than("2.4"):
     import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint import (
+        DefaultLoadPlanner,
         FileSystemReader,
         FileSystemWriter,
     )
@@ -37,11 +39,129 @@ logger = get_logger(__name__)
 _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 _EXTRA_STATE_DIR = "extra_state"
 _CHECKPOINT_METADATA_FILE = "checkpoint_metadata.json"
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
-def _get_model_param_keys(model: torch.nn.Module) -> List[str]:
-    """Get sorted list of parameter keys from a model."""
-    return sorted([name for name, _ in model.named_parameters()])
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in _TRUE_ENV_VALUES
+
+
+_COMPILE_WRAPPER_SEGMENT = "._orig_mod."
+
+
+def _strip_compile_prefix(name: str) -> str:
+    """Strip the ``._orig_mod.`` segment ``torch.compile`` inserts into parameter/buffer FQNs.
+
+    DCP checkpoints follow the convention that keys are stored WITHOUT this segment
+    (mirrors ``models.module_utils._build_compiled_key_map``), so a checkpoint saved from a
+    compiled model loads into an eager model and vice versa. Without this, a checkpoint saved
+    mid-training under ``enable_compile`` records keys like ``model.layers.0._orig_mod.mlp...``
+    that fail to match the eager model materialized at load time (resume happens before the
+    model is compiled), raising "Checkpoint incompatible with model". No-op for eager models.
+    """
+    return name.replace(_COMPILE_WRAPPER_SEGMENT, ".")
+
+
+def _compile_agnostic_spec_info(spec_info):
+    """Alias torch.compile-wrapped FQNs to checkpoint FQNs in EP spec metadata."""
+    if spec_info is None:
+        return None
+
+    normalized_spec_info = dict(spec_info)
+    for name, info in list(spec_info.items()):
+        normalized_spec_info.setdefault(_strip_compile_prefix(name), info)
+    return normalized_spec_info
+
+
+def _restore_ep_dim(origin_tensor: torch.Tensor, device_mesh: DeviceMesh):
+    """Restore the EP dim so that DCP records the true global (EP+FSDP) size.
+
+    The live model holds expert tensors as 1-D DTensors sharded only on the FSDP
+    dim (the EP dim is implicit/local). On save we reconstruct the 2-D
+    ``[Shard(0)=ep, Shard(1)=ep_fsdp]`` DTensor so DCP knows the full expert
+    dimension and can later reshard across a different EP size.
+
+    Shared by ``ModelState`` (weights) and ``OptimizerState`` (per-param optimizer
+    state such as Muon ``momentum_buffer`` / AdamW ``exp_avg``).
+
+    Args:
+        origin_tensor: The (FSDP-sharded) expert tensor or its optimizer-state buffer.
+        device_mesh: The 2-D ``["ep", "ep_fsdp"]`` device mesh.
+    """
+    assert device_mesh.ndim == 2, f"global_mesh.ndim must be 2, got {device_mesh.ndim}"
+    ep_mesh = device_mesh["ep"]
+
+    if origin_tensor.__class__.__name__ == "DTensor":
+        # EP+FSDP2
+        dtensor = DTensor.from_local(
+            origin_tensor._local_tensor, device_mesh=device_mesh, placements=[Shard(0), Shard(1)]
+        )
+    elif origin_tensor.__class__.__name__ == "Tensor":
+        # If there is no FSDP
+        dtensor = DTensor.from_local(origin_tensor, device_mesh=ep_mesh, placements=[Shard(0)])
+
+    return dtensor
+
+
+def _drop_ep_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh):
+    """Drop the EP dim after loading from DCP so EP-FSDP is not confused.
+
+    Reverse of :func:`_restore_ep_dim`: collapse the reconstructed 2-D EP+FSDP
+    DTensor back to the FSDP-only layout (or a plain local tensor when there is
+    no FSDP) that the live model/optimizer expects.
+    """
+    assert device_mesh.ndim == 2, f"global_mesh.ndim must be 2, got {device_mesh.ndim}"
+    ep_fsdp_mesh = device_mesh["ep_fsdp"]
+
+    if len(loaded_tensor.placements) == 2:
+        tensor_to_put = DTensor.from_local(loaded_tensor._local_tensor, device_mesh=ep_fsdp_mesh, placements=[Shard(1)])
+    elif len(loaded_tensor.placements) == 1:
+        tensor_to_put = loaded_tensor.to_local()
+    else:
+        raise RuntimeError(
+            f"Expect EP parameters from checkpoints to be DTensor with 1-dim (no FSDP) or 2-dim (EP+FSDP), got {loaded_tensor}"
+        )
+
+    return tensor_to_put
+
+
+def _as_model_parts(model) -> List[torch.nn.Module]:
+    """Normalize a model-or-parts-list (PP virtual stages) to a list of modules."""
+    return list(model) if isinstance(model, (list, tuple)) else [model]
+
+
+def _merged_model_state_dict(model) -> Dict[str, Any]:
+    """get_model_state_dict merged across PP virtual-stage parts (disjoint FQNs;
+    duplicates from always-keep modules resolve last-wins)."""
+    merged: Dict[str, Any] = {}
+    for part in _as_model_parts(model):
+        merged.update(get_model_state_dict(model=part))
+    return merged
+
+
+def _get_model_param_keys(model) -> List[str]:
+    """Get sorted list of parameter keys from a model (or PP virtual-stage parts)."""
+    return sorted(
+        {_strip_compile_prefix(name) for part in _as_model_parts(model) for name, _ in part.named_parameters()}
+    )
+
+
+def _get_model_persistent_buffer_keys(model) -> List[str]:
+    """Get sorted list of persistent buffer keys from a model (or PP virtual-stage parts)."""
+    buffer_keys: set = set()
+    for part in _as_model_parts(model):
+        modules = dict(part.named_modules(remove_duplicate=False))
+        for name, buffer in part.named_buffers(remove_duplicate=False):
+            if buffer is None:
+                continue
+            module_name, _, buffer_name = name.rpartition(".")
+            parent_module = modules[module_name] if module_name else part
+            if buffer_name in getattr(parent_module, "_non_persistent_buffers_set", set()):
+                continue
+            # Strip the compile prefix only on the recorded key; the module lookup above uses the
+            # live (possibly ``_orig_mod``-wrapped) FQN.
+            buffer_keys.add(_strip_compile_prefix(name))
+    return sorted(buffer_keys)
 
 
 def _save_checkpoint_metadata(
@@ -58,25 +178,31 @@ def _save_checkpoint_metadata(
         return
 
     param_keys = _get_model_param_keys(model)
+    buffer_keys = _get_model_persistent_buffer_keys(model)
     lora_keys = [k for k in param_keys if "lora" in k.lower()]
 
     if save_lora_only:
         # Only LoRA keys are actually saved
         param_keys = lora_keys
+        buffer_keys = []
 
     metadata = {
         "num_parameters": len(param_keys),
+        "num_buffers": len(buffer_keys),
         "has_lora": has_lora or len(lora_keys) > 0,
         "num_lora_parameters": len(lora_keys),
         "save_lora_only": save_lora_only,
         "parameter_keys": param_keys,
+        "buffer_keys": buffer_keys,
     }
 
     metadata_path = os.path.join(checkpoint_dir, _CHECKPOINT_METADATA_FILE)
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
 
-    logger.info(f"Saved checkpoint metadata: {len(param_keys)} params, {len(lora_keys)} LoRA params")
+    logger.info(
+        f"Saved checkpoint metadata: {len(param_keys)} params, {len(buffer_keys)} buffers, {len(lora_keys)} LoRA params"
+    )
 
 
 def _validate_checkpoint_compatibility(
@@ -112,11 +238,17 @@ def _validate_checkpoint_compatibility(
 
     ckpt_keys = set(ckpt_metadata.get("parameter_keys", []))
     model_keys = set(_get_model_param_keys(model))
+    ckpt_buffer_keys_raw = ckpt_metadata.get("buffer_keys")
+    buffers_validated = isinstance(ckpt_buffer_keys_raw, list)
+    ckpt_buffer_keys = set(ckpt_buffer_keys_raw) if buffers_validated else set()
+    model_buffer_keys = set(_get_model_persistent_buffer_keys(model)) if buffers_validated else set()
 
     # Keys in model but not in checkpoint (e.g., LoRA params added after checkpoint was saved)
     missing_in_ckpt = model_keys - ckpt_keys
     # Keys in checkpoint but not in model (e.g., removed params)
     unexpected_in_ckpt = ckpt_keys - model_keys
+    missing_buffers_in_ckpt = model_buffer_keys - ckpt_buffer_keys
+    unexpected_buffers_in_ckpt = ckpt_buffer_keys - model_buffer_keys
 
     # Check if checkpoint was saved with save_lora_only
     ckpt_lora_only = ckpt_metadata.get("save_lora_only", False)
@@ -132,13 +264,21 @@ def _validate_checkpoint_compatibility(
         "model_has_lora": any("lora" in k.lower() for k in model_keys),
         "missing_in_checkpoint": list(missing_in_ckpt),
         "unexpected_in_checkpoint": list(unexpected_in_ckpt),
+        "buffers_validated": buffers_validated,
+        "missing_buffers_in_checkpoint": list(missing_buffers_in_ckpt),
+        "unexpected_buffers_in_checkpoint": list(unexpected_buffers_in_ckpt),
         "missing_lora_keys": missing_lora_keys,
         "missing_non_lora_keys": missing_non_lora_keys,
-        "compatible": len(missing_non_lora_keys) == 0 and len(unexpected_in_ckpt) == 0,
+        "compatible": (
+            len(missing_non_lora_keys) == 0
+            and len(unexpected_in_ckpt) == 0
+            and len(missing_buffers_in_ckpt) == 0
+            and len(unexpected_buffers_in_ckpt) == 0
+        ),
     }
 
     # Log validation results
-    if missing_in_ckpt or unexpected_in_ckpt:
+    if missing_in_ckpt or unexpected_in_ckpt or missing_buffers_in_ckpt or unexpected_buffers_in_ckpt:
         # LoRA-only checkpoint: missing non-LoRA keys are expected
         if ckpt_lora_only and len(missing_non_lora_keys) > 0 and len(unexpected_in_ckpt) == 0:
             logger.info(
@@ -153,21 +293,38 @@ def _validate_checkpoint_compatibility(
             f"Checkpoint compatibility check:\n"
             f"  - Missing in checkpoint: {len(missing_in_ckpt)} keys "
             f"({len(missing_lora_keys)} LoRA, {len(missing_non_lora_keys)} non-LoRA)\n"
-            f"  - Unexpected in checkpoint: {len(unexpected_in_ckpt)} keys"
+            f"  - Unexpected in checkpoint: {len(unexpected_in_ckpt)} keys\n"
+            f"  - Missing buffers in checkpoint: {len(missing_buffers_in_ckpt)} keys\n"
+            f"  - Unexpected buffers in checkpoint: {len(unexpected_buffers_in_ckpt)} keys"
         )
 
         # If only LoRA keys are missing, this is expected when loading base checkpoint into LoRA model
-        if len(missing_lora_keys) > 0 and len(missing_non_lora_keys) == 0 and len(unexpected_in_ckpt) == 0:
+        if (
+            len(missing_lora_keys) > 0
+            and len(missing_non_lora_keys) == 0
+            and len(unexpected_in_ckpt) == 0
+            and len(missing_buffers_in_ckpt) == 0
+            and len(unexpected_buffers_in_ckpt) == 0
+        ):
             logger.info(
                 "Loading base model checkpoint into LoRA-enabled model. "
                 f"LoRA parameters ({len(missing_lora_keys)} keys) will keep their initialized values."
             )
             result["load_mode"] = "base_to_lora"
-        elif strict and (len(missing_non_lora_keys) > 0 or len(unexpected_in_ckpt) > 0):
+        elif strict and (
+            len(missing_non_lora_keys) > 0
+            or len(unexpected_in_ckpt) > 0
+            or len(missing_buffers_in_ckpt) > 0
+            or len(unexpected_buffers_in_ckpt) > 0
+        ):
             error_msg = (
                 f"Checkpoint incompatible with model:\n"
                 f"  Missing non-LoRA keys: {missing_non_lora_keys[:5]}{'...' if len(missing_non_lora_keys) > 5 else ''}\n"
-                f"  Unexpected keys: {list(unexpected_in_ckpt)[:5]}{'...' if len(unexpected_in_ckpt) > 5 else ''}"
+                f"  Unexpected keys: {list(unexpected_in_ckpt)[:5]}{'...' if len(unexpected_in_ckpt) > 5 else ''}\n"
+                f"  Missing buffers: {list(missing_buffers_in_ckpt)[:5]}"
+                f"{'...' if len(missing_buffers_in_ckpt) > 5 else ''}\n"
+                f"  Unexpected buffers: {list(unexpected_buffers_in_ckpt)[:5]}"
+                f"{'...' if len(unexpected_buffers_in_ckpt) > 5 else ''}"
             )
             raise RuntimeError(error_msg)
 
@@ -192,18 +349,23 @@ class ModelState(Stateful):
 
         # Determine whether this is EP+FSDP2 case
         # If so, we need to restore EP-dim before saving to DCP
+        # (model may be a PP virtual-stage parts list — EP is rejected there, so getattr yields None)
         self.parallel_state = get_parallel_state()
-        self.ep_fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
+        self.ep_fqn2spec_info = _compile_agnostic_spec_info(getattr(self.model, "_fqn2spec_info", None))
         self.should_ep_aware = self.ep_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
 
     @torch.no_grad()
     def state_dict(self):
-        model_state_dict = get_model_state_dict(model=self.model)
+        model_state_dict = _merged_model_state_dict(self.model)
         if self.should_ep_aware:
             logger.info_rank0(
                 "Getting model state_dict from ModelState wrapper, would restore EP dim for Experts module"
             )
             model_state_dict = self.get_state_dict_with_ep_dim(model_state_dict)
+
+        # Strip torch.compile's ``._orig_mod.`` prefix AFTER EP-dim restoration (which matches
+        # keys against the compiled model's _fqn2spec_info) so checkpoints stay compile-agnostic.
+        model_state_dict = {_strip_compile_prefix(k): v for k, v in model_state_dict.items()}
 
         # Filter out excluded keys (e.g., LoRA params when loading base checkpoint)
         if self.exclude_keys:
@@ -225,20 +387,21 @@ class ModelState(Stateful):
         a time during save.
         """
         model_state_dict: "OrderedDict[str, torch.Tensor]" = OrderedDict()
-        modules = dict(self.model.named_modules(remove_duplicate=False))
+        for part in _as_model_parts(self.model):
+            modules = dict(part.named_modules(remove_duplicate=False))
 
-        for name, parameter in self.model.named_parameters(remove_duplicate=False):
-            if parameter is not None:
-                model_state_dict[name] = parameter
+            for name, parameter in part.named_parameters(remove_duplicate=False):
+                if parameter is not None:
+                    model_state_dict[name] = parameter
 
-        for name, buffer in self.model.named_buffers(remove_duplicate=False):
-            if buffer is None:
-                continue
-            module_name, _, buffer_name = name.rpartition(".")
-            parent_module = modules[module_name] if module_name else self.model
-            if buffer_name in getattr(parent_module, "_non_persistent_buffers_set", set()):
-                continue
-            model_state_dict[name] = buffer
+            for name, buffer in part.named_buffers(remove_duplicate=False):
+                if buffer is None:
+                    continue
+                module_name, _, buffer_name = name.rpartition(".")
+                parent_module = modules[module_name] if module_name else part
+                if buffer_name in getattr(parent_module, "_non_persistent_buffers_set", set()):
+                    continue
+                model_state_dict[name] = buffer
 
         if self.should_ep_aware:
             logger.info_rank0(
@@ -246,6 +409,9 @@ class ModelState(Stateful):
                 "restoring EP dim for Experts module"
             )
             model_state_dict = self.get_state_dict_with_ep_dim(model_state_dict)
+
+        # Compile-agnostic keys (see state_dict): strip after EP-dim restoration.
+        model_state_dict = OrderedDict((_strip_compile_prefix(k), v) for k, v in model_state_dict.items())
 
         if self.exclude_keys:
             model_state_dict = OrderedDict((k, v) for k, v in model_state_dict.items() if k not in self.exclude_keys)
@@ -275,7 +441,21 @@ class ModelState(Stateful):
         # Use strict=False to allow missing LoRA parameters when loading from
         # a checkpoint that was saved before LoRA was injected
         options = StateDictOptions(strict=False)
-        incompatible = set_model_state_dict(model=self.model, model_state_dict=model_state_dict, options=options)
+        parts = _as_model_parts(self.model)
+        if len(parts) == 1:
+            incompatible = set_model_state_dict(model=parts[0], model_state_dict=model_state_dict, options=options)
+        else:
+            # PP virtual stages: load each part from its own key subset so other
+            # parts' keys don't show up as unexpected.
+            missing_keys: List[str] = []
+            unexpected: set = set(model_state_dict.keys())
+            for part in parts:
+                part_keys = set(get_model_state_dict(model=part).keys())
+                part_sd = {k: v for k, v in model_state_dict.items() if k in part_keys}
+                unexpected -= part_keys
+                inc = set_model_state_dict(model=part, model_state_dict=part_sd, options=options)
+                missing_keys.extend(inc.missing_keys)
+            incompatible = SimpleNamespace(missing_keys=missing_keys, unexpected_keys=sorted(unexpected))
 
         # Log missing/unexpected keys for debugging
         if incompatible.missing_keys:
@@ -306,13 +486,13 @@ class ModelState(Stateful):
             if name in ep_fqn2spec_info and isinstance(ep_fqn2spec_info[name].placement, Shard):
                 cur_spec_info = ep_fqn2spec_info[name]
                 tensor = state_dict[name]
-                tensor = self._restore_ep_dim(tensor, cur_spec_info.ep_fsdp_mesh)
+                tensor = _restore_ep_dim(tensor, cur_spec_info.ep_fsdp_mesh)
                 state_dict[name] = tensor
 
         return state_dict
 
     def get_state_dict_without_ep_dim(self, state_dict):
-        fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
+        fqn2spec_info = self.ep_fqn2spec_info
         assert fqn2spec_info is not None, "if fqn2spec_info is None it should not be patch"
 
         ep_mesh = self.parallel_state.ep_fsdp_device_mesh["ep"]
@@ -326,54 +506,10 @@ class ModelState(Stateful):
             if name in fqn2spec_info and isinstance(fqn2spec_info[name].placement, Shard):
                 cur_spec_info = fqn2spec_info[name]
                 tensor = state_dict[name]
-                tensor = self._drop_ep_dim(tensor, cur_spec_info.ep_fsdp_mesh)
+                tensor = _drop_ep_dim(tensor, cur_spec_info.ep_fsdp_mesh)
                 state_dict[name] = tensor
 
         return state_dict
-
-    def _restore_ep_dim(self, origin_tensor: torch.Tensor, device_mesh: DeviceMesh):
-        """
-        Restore EP dim so that DCP can be aware about EP ranks
-
-        args:
-            origin_tensor (torch.Tensor): The origin tensor.
-            device_mesh (DeviceMesh): The ep device mesh.
-            shard (Shard): The shard info, default Shard(0).
-
-        """
-        assert device_mesh.ndim == 2, f"global_mesh.ndim must be 2, got {device_mesh.ndim}"
-        ep_mesh = device_mesh["ep"]
-
-        if origin_tensor.__class__.__name__ == "DTensor":
-            # EP+FSDP2
-            dtensor = DTensor.from_local(
-                origin_tensor._local_tensor, device_mesh=device_mesh, placements=[Shard(0), Shard(1)]
-            )
-        elif origin_tensor.__class__.__name__ == "Tensor":
-            # If there is no FSDP
-            dtensor = DTensor.from_local(origin_tensor, device_mesh=ep_mesh, placements=[Shard(0)])
-
-        return dtensor
-
-    def _drop_ep_dim(self, loaded_tensor: torch.Tensor, device_mesh: DeviceMesh):
-        """
-        Drop EP dims after loading from DCP so that EP-FSDP would not be confused
-        """
-        assert device_mesh.ndim == 2, f"global_mesh.ndim must be 2, got {device_mesh.ndim}"
-        ep_fsdp_mesh = device_mesh["ep_fsdp"]
-
-        if len(loaded_tensor.placements) == 2:
-            tensor_to_put = DTensor.from_local(
-                loaded_tensor._local_tensor, device_mesh=ep_fsdp_mesh, placements=[Shard(1)]
-            )
-        elif len(loaded_tensor.placements) == 1:
-            tensor_to_put = loaded_tensor.to_local()
-        else:
-            raise RuntimeError(
-                f"Expect EP parameters from checkpoints to be DTensor with 1-dim (no FSDP) or 2-dim (EP+FSDP), got {loaded_tensor}"
-            )
-
-        return tensor_to_put
 
 
 class OptimizerState(Stateful):
@@ -384,9 +520,77 @@ class OptimizerState(Stateful):
         optimizer (Optimizer): optimizer to wrap.
     """
 
-    def __init__(self, model, optimizer):
+    # Flattened per-param optimizer-state buffers that share the parameter's sharding
+    # (Muon momentum + AdamW first/second moments). ``step`` is a scalar and is excluded.
+    _EP_SHARDED_STATE_KEYS = frozenset({"momentum_buffer", "exp_avg", "exp_avg_sq"})
+
+    def __init__(self, model, optimizer, load_keys: Optional[Set[str]] = None):
         self.model = model
         self.optimizer = optimizer
+        self.load_keys = load_keys
+        self._allow_partial_optimizer_load = False
+        if isinstance(model, (list, tuple)) and not getattr(optimizer, "_is_multi_optimizer", False):
+            # PP virtual stages require the per-part MultiOptimizer (it owns the
+            # part->model mapping DCP needs to resolve FQNs).
+            raise ValueError("Checkpointing multiple PP model parts requires a MultiOptimizer.")
+
+        # Mirror ModelState: in the EP+FSDP2 case the per-param optimizer state for expert
+        # weights is sharded just like the weights themselves, so it must carry the EP dim in
+        # DCP (restore on save / drop on load) to reshard across different EP sizes on resume.
+        self.parallel_state = get_parallel_state()
+        self.ep_fqn2spec_info = _compile_agnostic_spec_info(getattr(self.model, "_fqn2spec_info", None))
+        self.should_ep_aware = self.ep_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
+
+    @staticmethod
+    def _flattened_key_param_fqn(key: str):
+        """Map a flattened optimizer key ``state.<param_fqn>.<state_key>`` to (param_fqn, state_key).
+
+        Returns ``(None, None)`` for non-``state.*`` keys (e.g. ``param_groups.*``). The param FQN
+        is normalized to be torch.compile-agnostic so it matches ``ep_fqn2spec_info``.
+        """
+        if not key.startswith("state."):
+            return None, None
+        remainder = key[len("state.") :]
+        param_fqn, _, state_key = remainder.rpartition(".")
+        if not param_fqn:
+            return None, None
+        return _strip_compile_prefix(param_fqn), state_key
+
+    def _get_optimizer_state_dict_with_ep_dim(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Restore the EP dim on the flattened optimizer state before saving to DCP."""
+        for key in sorted(state_dict.keys()):
+            param_fqn, state_key = self._flattened_key_param_fqn(key)
+            if param_fqn is None or state_key not in self._EP_SHARDED_STATE_KEYS:
+                continue
+            spec_info = self.ep_fqn2spec_info.get(param_fqn)
+            if spec_info is not None and isinstance(spec_info.placement, Shard):
+                state_dict[key] = _restore_ep_dim(state_dict[key], spec_info.ep_fsdp_mesh)
+        return state_dict
+
+    def _get_optimizer_state_dict_without_ep_dim(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Drop the EP dim on the flattened optimizer state after loading from DCP."""
+        for key in sorted(state_dict.keys()):
+            param_fqn, state_key = self._flattened_key_param_fqn(key)
+            if param_fqn is None or state_key not in self._EP_SHARDED_STATE_KEYS:
+                continue
+            spec_info = self.ep_fqn2spec_info.get(param_fqn)
+            if spec_info is not None and isinstance(spec_info.placement, Shard):
+                state_dict[key] = _drop_ep_dim(state_dict[key], spec_info.ep_fsdp_mesh)
+        return state_dict
+
+    def _filter_state_dict_for_load(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
+        if self.load_keys is None:
+            return state_dict
+
+        filtered = {key: value for key, value in state_dict.items() if key in self.load_keys}
+        dropped = len(state_dict) - len(filtered)
+        if dropped > 0:
+            self._allow_partial_optimizer_load = True
+            logger.info_rank0(
+                f"Filtered optimizer load target to {len(filtered)} checkpoint key(s), "
+                f"dropping {dropped} key(s) without saved optimizer state."
+            )
+        return filtered
 
     def state_dict(self):
         # If optimizer is None (when save_optimizer=False), return empty dict
@@ -396,11 +600,17 @@ class OptimizerState(Stateful):
         # MultiOptimizer is only used for EP+FSDP2 case for now,
         # and it knows how to produce a merged, flattened dict already
         if getattr(self.optimizer, "_is_multi_optimizer", False):
-            return self.optimizer.state_dict()
+            sd = self.optimizer.state_dict()
+            if self.should_ep_aware:
+                logger.info_rank0(
+                    "Getting optimizer state_dict from OptimizerState wrapper, restoring EP dim for Experts state"
+                )
+                sd = self._get_optimizer_state_dict_with_ep_dim(sd)
+            return self._filter_state_dict_for_load(sd)
 
         # Single torch optimizer
         sd = get_optimizer_state_dict(model=self.model, optimizers=self.optimizer)
-        return sd
+        return self._filter_state_dict_for_load(sd)
 
     def load_state_dict(self, state_dict):
         # If optimizer is None (when load_optimizer=False), skip loading
@@ -415,7 +625,12 @@ class OptimizerState(Stateful):
 
         # Delegate to MultiOptimizer (it will split/filter correctly)
         if getattr(self.optimizer, "_is_multi_optimizer", False):
-            self.optimizer.load_state_dict(optim_state)
+            if self.should_ep_aware:
+                logger.info_rank0(
+                    "Loading optimizer state_dict via OptimizerState wrapper, dropping EP dim for Experts state"
+                )
+                optim_state = self._get_optimizer_state_dict_without_ep_dim(optim_state)
+            self.optimizer.load_state_dict(optim_state, strict=not self._allow_partial_optimizer_load)
             return
 
         # Single torch optimizer
@@ -423,6 +638,7 @@ class OptimizerState(Stateful):
             model=self.model,
             optimizers=self.optimizer,
             optim_state_dict=optim_state,
+            options=StateDictOptions(strict=not self._allow_partial_optimizer_load),
         )
 
 
@@ -491,6 +707,18 @@ class DistributedCheckpointer(CheckpointerBase):
     dcp_save_future: Optional[Any] = None
     # Dedicated process group for async saves (created on first use)
     _async_process_group: Optional[Any] = None
+    # Dedicated Gloo process group for DCP metadata/object collectives. NCCL
+    # object collectives can corrupt large DCP planning payloads at high rank
+    # counts; async saves already use Gloo for this reason.
+    _sync_process_group: Optional[Any] = None
+
+    @classmethod
+    def _get_sync_process_group(cls):
+        if not dist.is_available() or not dist.is_initialized() or dist.get_backend() == "gloo":
+            return None
+        if cls._sync_process_group is None:
+            cls._sync_process_group = dist.new_group(backend="gloo")
+        return cls._sync_process_group
 
     @classmethod
     def save(
@@ -557,6 +785,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 process_group=cls._async_process_group,
             )
         else:
+            process_group = cls._get_sync_process_group()
             dcp.save(
                 state_dict=save_state,
                 storage_writer=FileSystemWriter(
@@ -566,6 +795,7 @@ class DistributedCheckpointer(CheckpointerBase):
                     sync_files=False,
                     overwrite=True,
                 ),
+                process_group=process_group,
             )
 
         # Aggressive cleanup after DCP save to release all intermediate memory
@@ -615,6 +845,26 @@ class DistributedCheckpointer(CheckpointerBase):
         if "model" not in state:
             raise ValueError("Model must be provided to load a distributed checkpoint.")
 
+        # Resolve the DCP load process group FIRST, before any rank-divergent code
+        # below (checkpoint validation, the per-rank optimizer-metadata read). The
+        # sync group is created via dist.new_group() — a collective on the DEFAULT
+        # process group that every rank entering load() must issue together and in
+        # the same order. If it is created lazily *after* a validation/metadata step
+        # that raises on only a subset of ranks, the remaining ranks block on a Gloo
+        # CPU collective (/default_pg/.../cpu) for the full PG timeout (observed:
+        # DistStoreError after 1800000ms on the 4-node DCP reshard load). Creating it
+        # here keeps it uniform across all ranks. XORL_DCP_LOAD_NO_DIST=1 disables
+        # distributed DCP planning entirely (each rank reads its shards from the
+        # shared checkpoint dir), sidestepping the collective.
+        load_no_dist = _env_flag("XORL_DCP_LOAD_NO_DIST")
+        if load_no_dist:
+            logger.info_rank0(
+                "Loading DCP checkpoint with no_dist=True; distributed DCP planning collectives are disabled."
+            )
+            process_group = None
+        elif process_group is None:
+            process_group = cls._get_sync_process_group()
+
         # Validate checkpoint compatibility before loading
         validation_result = _validate_checkpoint_compatibility(checkpoint_dir, state["model"], strict=strict)
 
@@ -631,29 +881,48 @@ class DistributedCheckpointer(CheckpointerBase):
             # so DCP only loads the LoRA parameters.
             # Must use get_model_state_dict() to capture both params AND buffers
             # (e.g., weight_block_scales, weight_global_scale from QLoRA).
-            all_model_keys = set(get_model_state_dict(model=state["model"]).keys())
+            all_model_keys = set(_merged_model_state_dict(state["model"]).keys())
             exclude_keys = {k for k in all_model_keys if "lora_" not in k}
             logger.info_rank0(f"LoRA-only checkpoint: excluding {len(exclude_keys)} non-LoRA keys from load")
 
         load_state = {"model": ModelState(state["model"], exclude_keys=exclude_keys)}
         has_optimizer_state = False
+        optimizer_load_keys: Optional[Set[str]] = None
         if "optimizer" in state and state["optimizer"] is not None:
             try:
                 dcp_metadata = FileSystemReader(checkpoint_dir).read_metadata()
-                has_optimizer_state = any(key.startswith("optimizer") for key in dcp_metadata.state_dict_metadata)
+                metadata_keys = set(dcp_metadata.state_dict_metadata)
+                has_optimizer_state = any(key.startswith("optimizer") for key in metadata_keys)
+                optimizer_load_keys = {
+                    key.removeprefix("optimizer.") for key in metadata_keys if key.startswith("optimizer.")
+                }
             except Exception as exc:
                 logger.warning_rank0(f"Could not inspect DCP optimizer metadata at {checkpoint_dir}: {exc}")
                 has_optimizer_state = True
 
         if has_optimizer_state:
-            load_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])  # type: ignore[index]
+            load_state["optimizer"] = OptimizerState(  # type: ignore[index]
+                model=state["model"],
+                optimizer=state["optimizer"],
+                load_keys=optimizer_load_keys,
+            )
         elif "optimizer" in state and state["optimizer"] is not None:
             logger.info_rank0(f"No optimizer state found in {checkpoint_dir}; loading model state only.")
+
+        # ``StateDictOptions(strict=False)`` in ``ModelState.load_state_dict``
+        # only applies after DCP has planned and read checkpoint entries. The
+        # default load planner still raises during planning when a target key is
+        # absent from checkpoint metadata, which is exactly what happens when a
+        # metadata-less base DCP is loaded into a LoRA-injected model. Mirror
+        # this API's ``strict=False`` at DCP planner time as well.
+        load_planner = DefaultLoadPlanner(allow_partial_load=not strict)
 
         dcp.load(
             state_dict=load_state,
             storage_reader=FileSystemReader(checkpoint_dir),
+            planner=load_planner,
             process_group=process_group,
+            no_dist=load_no_dist,
         )
         # Note: further per-param DTensor alignment and device fixes happen inside OptimizerState.load_state_dict
 

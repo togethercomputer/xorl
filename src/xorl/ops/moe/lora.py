@@ -17,6 +17,7 @@ import torch
 import torch.distributed as dist
 
 from xorl.ops.group_gemm.kernel.moe import expert_histogram, moe_add_gather, moe_gather, moe_scatter
+from xorl.ops.moe.triton import _apply_swiglu_clamp_backward, _maybe_clamp_swiglu_gate
 
 
 # ============================================================================
@@ -59,7 +60,9 @@ def make_ep_lora_compute(gemm_nk, gemm_mn):
             down_proj_lora_A,
             down_proj_lora_B,
             scaling,
+            swiglu_limit=0.0,
         ):
+            ctx.swiglu_limit = float(swiglu_limit or 0.0)
             max_M = permute_tokens.shape[0]
             num_local_experts = gate_proj.shape[0]
             intermediate_size = gate_proj.shape[2]
@@ -145,8 +148,10 @@ def make_ep_lora_compute(gemm_nk, gemm_mn):
             up_output = (up_base + up_lora_output * scaling).contiguous()
 
             # === Activation ===
-            gate_activation = torch.ops.aten.silu(gate_output.float()).to(gate_output.dtype)
+            gate_for_activation = _maybe_clamp_swiglu_gate(gate_output, ctx.swiglu_limit)
+            gate_activation = torch.ops.aten.silu(gate_for_activation.float()).to(gate_output.dtype)
             gated_output = gate_activation * up_output
+            del gate_for_activation
 
             # === down_proj with LoRA ===
             down_output = gemm_nk(
@@ -336,7 +341,8 @@ def make_ep_lora_compute(gemm_nk, gemm_mn):
             grad_gated_output = grad_gated_output + grad_gated_from_lora
 
             # === Activation backward ===
-            gate_activation = torch.ops.aten.silu(gate_output.float()).to(gate_output.dtype)
+            gate_for_activation = _maybe_clamp_swiglu_gate(gate_output, getattr(ctx, "swiglu_limit", 0.0))
+            gate_activation = torch.ops.aten.silu(gate_for_activation.float()).to(gate_output.dtype)
             grad_up_output = (gate_activation * grad_gated_output).contiguous()
             grad_gate_activation = (grad_gated_output * up_output).contiguous()
 
@@ -390,10 +396,14 @@ def make_ep_lora_compute(gemm_nk, gemm_mn):
 
             # === SiLU backward ===
             grad_gate_output = (
-                torch.ops.aten.silu_backward(grad_gate_activation.float(), gate_output.float())
+                torch.ops.aten.silu_backward(grad_gate_activation.float(), gate_for_activation.float())
                 .to(gate_output.dtype)
                 .contiguous()
             )
+            grad_gate_output = _apply_swiglu_clamp_backward(
+                grad_gate_output, gate_output, getattr(ctx, "swiglu_limit", 0.0)
+            )
+            del gate_for_activation
 
             # === gate_proj backward ===
             grad_permute_tokens_1 = gemm_nk(
@@ -481,6 +491,7 @@ def make_ep_lora_compute(gemm_nk, gemm_mn):
                 grad_down_proj_lora_A,
                 grad_down_proj_lora_B,
                 None,  # scaling
+                None,  # swiglu_limit
             )
 
     return _EPGroupGemmWithLoRA
@@ -537,7 +548,9 @@ def make_local_lora_compute(gemm_nk, gemm_mn):
             down_proj_lora_B: torch.Tensor,
             # LoRA config
             scaling: float,
+            swiglu_limit=0.0,
         ):
+            ctx.swiglu_limit = float(swiglu_limit or 0.0)
             # Save original LoRA weights for backward (need original dtype for gradients)
             orig_gate_proj_lora_A = gate_proj_lora_A
             orig_gate_proj_lora_B = gate_proj_lora_B
@@ -628,8 +641,10 @@ def make_local_lora_compute(gemm_nk, gemm_mn):
             up_output = (up_base + up_lora_output * scaling).contiguous()
 
             # SiLU + mul
-            gate_activation = torch.ops.aten.silu(gate_output)
+            gate_for_activation = _maybe_clamp_swiglu_gate(gate_output, ctx.swiglu_limit)
+            gate_activation = torch.ops.aten.silu(gate_for_activation)
             gated_activation = gate_activation * up_output
+            del gate_for_activation
 
             # Routing weights
             reshaped_gate_weight = gate_weights.reshape(-1, 1)
@@ -851,7 +866,8 @@ def make_local_lora_compute(gemm_nk, gemm_mn):
             grad_gate_weight = grad_scattered_gate_weight[scatter_index.flatten()]
             grad_gate_weight = grad_gate_weight.reshape(gate_weights.shape)
 
-            gate_activation = torch.ops.aten.silu(gate_output)
+            gate_for_activation = _maybe_clamp_swiglu_gate(gate_output, getattr(ctx, "swiglu_limit", 0.0))
+            gate_activation = torch.ops.aten.silu(gate_for_activation)
             grad_gate_activation = grad_gated_activation * up_output
             grad_up_output = gate_activation * grad_gated_activation
 
@@ -904,7 +920,11 @@ def make_local_lora_compute(gemm_nk, gemm_mn):
             grad_scatter_output_2 = grad_scatter_output_2 + grad_scatter_from_lora_2
 
             # ====== SiLU backward ======
-            grad_gate_output = torch.ops.aten.silu_backward(grad_gate_activation, gate_output)
+            grad_gate_output = torch.ops.aten.silu_backward(grad_gate_activation, gate_for_activation)
+            grad_gate_output = _apply_swiglu_clamp_backward(
+                grad_gate_output, gate_output, getattr(ctx, "swiglu_limit", 0.0)
+            )
+            del gate_for_activation
 
             # ====== gate_proj backward ======
             grad_scatter_output_1 = gemm_nk(
@@ -989,6 +1009,7 @@ def make_local_lora_compute(gemm_nk, gemm_mn):
                 grad_down_proj_lora_A,
                 grad_down_proj_lora_B,
                 None,  # scaling
+                None,  # swiglu_limit
             )
 
     return _MoeExpertsLoRAFunction

@@ -15,6 +15,8 @@ def triton_expert_forward(
     num_experts: int,
     hidden_act: str = "silu",
     gate_up_proj: torch.Tensor | None = None,
+    swiglu_limit: float = 0.0,
+    gated: bool = True,
     **kwargs,
 ) -> torch.Tensor:
     """Forward pass using custom Triton group GEMM kernels.
@@ -30,9 +32,13 @@ def triton_expert_forward(
         up_proj: Up projection weights ``[num_experts, hidden, intermediate]``.
         down_proj: Down projection weights ``[num_experts, intermediate, hidden]``.
         num_experts: Total number of experts.
-        hidden_act: Activation kind ("silu" or "gelu_tanh").
+        hidden_act: Activation kind ("silu" or "gelu_tanh"; "relu2" when ``gated=False``).
         gate_up_proj: Pre-fused ``[num_experts, hidden, 2*intermediate]`` weight
             used by the fused-GEMM path (required by ``TritonMoeExpertsFunction``).
+            Holds the plain up projection ``[num_experts, in_dim, intermediate]``
+            when ``gated=False``.
+        swiglu_limit: Optional gate pre-activation clamp (DeepSeek-V4 SwiGLU limit).
+        gated: Whether the experts use a gated (GLU) first projection.
         **kwargs: Forwarded for forward compatibility; currently unused.
 
     Returns:
@@ -50,4 +56,6 @@ def triton_expert_forward(
         down_proj=down_proj,
         gate_up_proj=gate_up_proj,
         hidden_act=hidden_act,
+        swiglu_limit=swiglu_limit,
+        gated=gated,
     )

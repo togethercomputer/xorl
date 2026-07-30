@@ -10,7 +10,7 @@ This module provides various loss functions for language model training:
 
 from typing import Callable, Dict, Literal
 
-from xorl.ops.loss.causallm_loss import causallm_loss_function
+from xorl.ops.loss.causallm_loss import causallm_loss_function, fsdp_sharded_causallm_loss_function
 from xorl.ops.loss.grpo_loss import drgrpo_loss_function
 from xorl.ops.loss.importance_sampling_loss import importance_sampling_loss_function
 from xorl.ops.loss.loss_output import LossOutput
@@ -61,6 +61,7 @@ __all__ = [
     "get_loss_function",
     "register_loss_function",
     "causallm_loss_function",
+    "fsdp_sharded_causallm_loss_function",
     "drgrpo_loss_function",
     "importance_sampling_loss_function",
     "opd_loss_function",

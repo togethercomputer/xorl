@@ -5,6 +5,7 @@ counting, LoRA merge, PP forward-backward) into reusable free functions.
 """
 
 import logging
+import os
 from collections import deque
 from typing import Any, Dict, List, Optional
 
@@ -17,6 +18,7 @@ from xorl.lora.modules.base import LoraModule
 from xorl.lora.utils import maybe_merge_lora as _merge
 from xorl.qlora.utils import maybe_requant_qlora
 from xorl.utils.device import get_device_type
+from xorl.utils.dist_utils import all_reduce_metadata_tensor
 
 
 try:
@@ -50,11 +52,66 @@ def sync_sp_gradients(
                 continue
             if skip_dtensor_grads and DTensor is not None and isinstance(p.grad, DTensor):
                 continue
-            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, group=sp_grad_sync_group)
+            grad = p.grad.to_local() if DTensor is not None and isinstance(p.grad, DTensor) else p.grad
+            dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=sp_grad_sync_group)
+
+
+def sync_lm_head_tp_gradient(model: torch.nn.Module, lm_head_tp_replica_group) -> None:
+    """Sum the lm-head-TP weight gradient over its replica dim (cp_replica x DP).
+
+    With lm-head-only TP the lm_head is FSDP-sharded over a dedicated 2-D mesh
+    (Shard(0) over the vocab/lm_head_tp dim, replicated over cp_replica x DP). The
+    vocab-parallel CE reads lm_head.weight directly, so FSDP's reduce-scatter hook
+    never fires and the replica ranks are left holding *partial* gradients for the
+    same vocab rows. Sum them here. This is complementary to ``sync_sp_gradients``:
+    lm-head TP requires cp_fsdp_mode='all' (sp_grad_sync_group is None), so that
+    pass is a no-op for the lm_head and there is no double reduction.
+    """
+    if lm_head_tp_replica_group is None:
+        return
+    if dist.get_world_size(lm_head_tp_replica_group) <= 1:
+        return
+    for module in model.modules():
+        if not getattr(module, "_xorl_fsdp_sharded_lm_head_loss", False):
+            continue
+        for p in module.parameters(recurse=False):
+            if p.grad is None:
+                continue
+            grad = p.grad.to_local() if DTensor is not None and isinstance(p.grad, DTensor) else p.grad
+            dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=lm_head_tp_replica_group)
+
+
+def _group_root_rank(group) -> int:
+    if hasattr(dist, "get_global_rank"):
+        return int(dist.get_global_rank(group, 0))
+    return int(dist.get_process_group_ranks(group)[0])
+
+
+def sync_lm_head_tp_parameters(model: torch.nn.Module, lm_head_tp_replica_group) -> None:
+    """Broadcast lm-head-TP parameter shards over the replica dim after load.
+
+    The lm-head-only TP mesh shards vocab rows over ``lm_head_tp`` and replicates
+    each local vocab shard over DP/cp_replica. Gradients are summed over that
+    replica dim before optimizer step, so replicas stay identical once they start
+    identical. This post-load sync makes that invariant explicit for DCP loads
+    and model-only replay loads.
+    """
+    if lm_head_tp_replica_group is None:
+        return
+    if dist.get_world_size(lm_head_tp_replica_group) <= 1:
+        return
+    src = _group_root_rank(lm_head_tp_replica_group)
+    with torch.no_grad():
+        for module in model.modules():
+            if not getattr(module, "_xorl_fsdp_sharded_lm_head_loss", False):
+                continue
+            for p in module.parameters(recurse=False):
+                param = p.data.to_local() if DTensor is not None and isinstance(p.data, DTensor) else p.data
+                dist.broadcast(param, src=src, group=lm_head_tp_replica_group)
 
 
 def clip_gradients(
-    model: torch.nn.Module,
+    model: "torch.nn.Module | List[torch.nn.Module]",
     max_grad_norm: float,
     pp_enabled: bool = False,
     pp_group=None,
@@ -62,7 +119,8 @@ def clip_gradients(
     """Clip gradients and return grad_norm. Handles PP all-reduce.
 
     Args:
-        model: The model (may have FSDP's clip_grad_norm_).
+        model: The model (may have FSDP's clip_grad_norm_), or a list of PP
+            virtual-stage model parts (clipped jointly with one local norm).
         max_grad_norm: Maximum gradient norm for clipping.
         pp_enabled: Whether pipeline parallelism is active.
         pp_group: Process group for PP all-reduce of grad norms.
@@ -70,11 +128,16 @@ def clip_gradients(
     Returns:
         Scalar grad_norm value.
     """
-    if hasattr(model, "clip_grad_norm_"):
-        _gn = model.clip_grad_norm_(max_grad_norm)
+    if max_grad_norm <= 0:
+        return 0.0
+
+    models = model if isinstance(model, (list, tuple)) else [model]
+    if len(models) == 1 and hasattr(models[0], "clip_grad_norm_"):
+        _gn = models[0].clip_grad_norm_(max_grad_norm)
         grad_norm = _gn.item() if hasattr(_gn, "item") else float(_gn)
     else:
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        params = [p for m in models for p in m.parameters()]
+        grad_norm = torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
         if hasattr(grad_norm, "full_tensor"):
             grad_norm = grad_norm.full_tensor().item()
         elif hasattr(grad_norm, "item"):
@@ -90,6 +153,8 @@ def clip_gradients(
 
 def get_effective_grad_clip_value(max_grad_norm: float, *, use_distsignsgd: bool) -> float:
     """Return the clipping threshold to use for the current optimizer path.
+
+    Non-positive ``max_grad_norm`` disables local-training gradient clipping.
 
     DistSignSGD turns gradients into sign-vote accumulators before the training
     loop reaches grad clipping. Clipping those sign votes changes the update
@@ -129,15 +194,20 @@ def count_valid_tokens(
     """Count valid (non-IGNORE_INDEX) tokens and all-reduce across group.
 
     Supports both "labels" and "target_tokens" keys for compatibility
-    with Trainer and ModelRunner respectively.
+    with Trainer and ModelRunner respectively. When both exist, prefer
+    target_tokens because RL losses use it as the actual selected-token mask.
     """
-    global_valid_tokens = torch.tensor(0, device=get_device_type())
+    global_valid_tokens = torch.tensor(0, device="cpu", dtype=torch.int64)
     for mb in micro_batches:
-        labels = mb.get("labels", mb.get("target_tokens"))
+        labels = mb.get("target_tokens", mb.get("labels"))
         if labels is not None:
-            global_valid_tokens += (labels != IGNORE_INDEX).sum()
-    dist.all_reduce(global_valid_tokens, op=dist.ReduceOp.SUM, group=group)
-    return global_valid_tokens
+            global_valid_tokens += (labels != IGNORE_INDEX).sum().to(device="cpu", dtype=torch.int64)
+    return all_reduce_metadata_tensor(
+        global_valid_tokens,
+        op=dist.ReduceOp.SUM,
+        group=group,
+        device=get_device_type(),
+    )
 
 
 def count_active_microbatches(
@@ -162,13 +232,18 @@ def count_active_microbatches(
     if not micro_batches:
         return 0, 0
 
-    flags = torch.zeros(len(micro_batches), device=get_device_type(), dtype=torch.int64)
+    flags = torch.zeros(len(micro_batches), device="cpu", dtype=torch.int64)
     for i, mb in enumerate(micro_batches):
-        labels = mb.get("labels", mb.get("target_tokens"))
+        labels = mb.get("target_tokens", mb.get("labels"))
         if labels is None:
             continue
-        flags[i] = (labels != IGNORE_INDEX).any().to(torch.int64)
-    dist.all_reduce(flags, op=dist.ReduceOp.SUM, group=group)
+        flags[i] = int((labels != IGNORE_INDEX).any().item())
+    flags = all_reduce_metadata_tensor(
+        flags,
+        op=dist.ReduceOp.SUM,
+        group=group,
+        device="cpu",
+    )
     active_voter_total = int(flags.sum().item())
     active_microbatches = int((flags > 0).sum().item())
     return active_microbatches, active_voter_total
@@ -287,18 +362,90 @@ def _pp_ce_sum(pred, labels):
 _pp_ce_sum_compiled = torch.compile(_pp_ce_sum)
 
 
-def make_pp_loss_fn(ce_mode: str = "compiled"):
+def _pp_ce_chunk_tokens() -> int:
+    raw_value = os.environ.get("XORL_PP_CE_CHUNK_TOKENS", "0").strip()
+    try:
+        return max(0, int(raw_value))
+    except ValueError as exc:
+        raise ValueError("XORL_PP_CE_CHUNK_TOKENS must be an integer") from exc
+
+
+def _pp_ce_sum_chunked(pred, labels):
+    """Raw PP cross-entropy sum computed in token chunks to bound CE temporaries."""
+    chunk_tokens = _pp_ce_chunk_tokens()
+    if chunk_tokens <= 0:
+        return _pp_ce_sum(pred, labels)
+
+    pred_flat = pred.flatten(0, 1)
+    labels_flat = labels.flatten(0, 1)
+    loss = torch.zeros((), dtype=torch.float32, device=pred.device)
+    for start in range(0, pred_flat.shape[0], chunk_tokens):
+        end = min(start + chunk_tokens, pred_flat.shape[0])
+        loss = loss + F.cross_entropy(
+            pred_flat[start:end].float(),
+            labels_flat[start:end],
+            ignore_index=IGNORE_INDEX,
+            reduction="sum",
+        )
+    return loss
+
+
+def _pp_quack_linear_ce_sum(hidden, labels, *, lm_head, num_chunks: int = 8):
+    """Fused linear+CE sum for PP, taking HIDDEN states (not logits).
+
+    The last PP stage returns hidden instead of materializing the full
+    [mbs, seq, vocab] logits (8GB+ at 248k vocab -> OOM). This applies the
+    lm_head and cross-entropy in a single chunked kernel that never holds the
+    full logits, matching the unnormalized reduction='sum' convention of
+    ``_pp_ce_sum``. lm_head.weight is kept all-gathered by FSDP (norm+lm_head
+    share a reshard_after_forward=False unit whose norm runs in the stage
+    forward), so the schedule's autograd.backward(loss) flows grads to both
+    hidden (pipeline) and lm_head.weight (its FSDP unit reduce-scatters them).
+    """
+    from xorl.models.module_utils import get_lm_head_weight  # noqa: PLC0415
+    from xorl.ops.loss.causallm_loss import _chunk_size_from_num_chunks  # noqa: PLC0415
+    from xorl.ops.quack.linear_cross_entropy import chunked_linear_cross_entropy  # noqa: PLC0415
+
+    weight = get_lm_head_weight(lm_head, fsdp_sharded_loss=False)
+    h = hidden.reshape(-1, hidden.shape[-1])
+    lbl = labels.reshape(-1)
+    chunk_size = _chunk_size_from_num_chunks(h.shape[0], num_chunks)
+    return chunked_linear_cross_entropy(
+        h, weight, lbl, chunk_size=chunk_size, ignore_index=IGNORE_INDEX, reduction="sum"
+    )
+
+
+def make_pp_loss_fn(ce_mode: str = "compiled", lm_head=None):
     """Return the PP cross-entropy loss variant selected by ``ce_mode``.
 
     'compiled' (default) returns the torch.compile'd CE sum; 'eager'
     returns the uncompiled baseline (useful for debugging or when compile
-    regresses).
+    regresses). 'quack_linear' returns a fused linear+CE that consumes the
+    last stage's HIDDEN states (the stage must return hidden, not logits) and
+    requires the last-stage ``lm_head`` module — avoiding the full 248k-vocab
+    logits materialization (OOM) on the last stage.
     """
     if ce_mode == "eager":
+        if _pp_ce_chunk_tokens() > 0:
+            return _pp_ce_sum_chunked
         return _pp_ce_sum
     if ce_mode == "compiled":
         return _pp_ce_sum_compiled
-    raise ValueError(f"Unknown ce_mode: {ce_mode!r} (expected 'eager' or 'compiled')")
+    if ce_mode == "quack_linear":
+        # The schedule constructs a loss_fn on EVERY rank (for _has_backward) but
+        # only CALLS it on the last stage. Defer the lm_head check into the
+        # closure so non-last stages (which pass lm_head=None and never call it)
+        # don't fail at construction.
+        def _quack_loss(hidden, labels):
+            if lm_head is None:
+                raise ValueError(
+                    "ce_mode='quack_linear' under PP requires the last-stage lm_head module "
+                    "(pass lm_head=model.lm_head on the last stage)."
+                )
+            return _pp_quack_linear_ce_sum(hidden, labels, lm_head=lm_head)
+
+        return _quack_loss
+    raise ValueError(f"Unknown ce_mode: {ce_mode!r} (expected 'eager', 'compiled', or 'quack_linear')")
 
 
 def pad_micro_batches_for_pp(
@@ -359,6 +506,29 @@ def pad_micro_batches_for_pp(
                     mb[ml_key] = new_max
 
 
+_PP_FA_KEYS = ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k")
+
+
+def _set_pp_batch_metadata(model_parts: List[torch.nn.Module], micro_batches: List[Dict[str, Any]]) -> None:
+    """Queue per-microbatch metadata (position_ids, flash-attn kwargs) on each part.
+
+    Each part gets its own dict copies: _pp_forward pops keys from the entry,
+    so sharing dicts across virtual stages would corrupt later stages' metadata.
+    """
+    pp_metadata_list = []
+    for mb in micro_batches:
+        md = {}
+        if "position_ids" in mb:
+            md["position_ids"] = mb["position_ids"]
+        for key in _PP_FA_KEYS:
+            if key in mb:
+                md[key] = mb[key]
+        pp_metadata_list.append(md)
+
+    for model_part in model_parts:
+        model_part._pp_batch_metadata = deque(dict(md) for md in pp_metadata_list)
+
+
 def forward_backward_pp(
     model_parts: List[torch.nn.Module],
     pp_schedule,
@@ -380,28 +550,17 @@ def forward_backward_pp(
     input_ids = torch.cat([mb["input_ids"].to(device, non_blocking=True) for mb in micro_batches], dim=0)
     labels = torch.cat([mb["labels"].to(device, non_blocking=True) for mb in micro_batches], dim=0)
 
-    # Per-microbatch metadata for PP forward (position_ids, flash-attn kwargs)
-    _PP_FA_KEYS = ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k")
-    pp_metadata_list = []
-    for mb in micro_batches:
-        md = {}
-        if "position_ids" in mb:
-            md["position_ids"] = mb["position_ids"]
-        for key in _PP_FA_KEYS:
-            if key in mb:
-                md[key] = mb[key]
-        pp_metadata_list.append(md)
-
-    for model_part in model_parts:
-        model_part._pp_batch_metadata = deque(pp_metadata_list)
+    _set_pp_batch_metadata(model_parts, micro_batches)
 
     targets = labels if has_last_stage else None
     losses = [] if has_last_stage else None
 
+    # return_outputs=False: the merged last-stage output is unused for training and
+    # costs an O(n_microbatches x seq x vocab) allocation (37 GiB at m=16/8k/151k).
     if has_first_stage:
-        pp_schedule.step(input_ids, target=targets, losses=losses)
+        pp_schedule.step(input_ids, target=targets, losses=losses, return_outputs=False)
     else:
-        pp_schedule.step(target=targets, losses=losses)
+        pp_schedule.step(target=targets, losses=losses, return_outputs=False)
 
     # Broadcast loss from last stage via MAX
     if has_last_stage:
@@ -414,3 +573,41 @@ def forward_backward_pp(
 
     del input_ids, labels
     return loss_tensor.item()
+
+
+def forward_only_pp(
+    model_parts: List[torch.nn.Module],
+    pp_schedule,
+    micro_batches: List[Dict[str, Any]],
+    has_first_stage: bool,
+    has_last_stage: bool,
+) -> Optional[List[torch.Tensor]]:
+    """Run the PP schedule forward-only (eval / reference logprobs).
+
+    The schedule must be built with ``loss_fn=None`` and with meta input/output
+    args on every stage (shape inference would otherwise consume the metadata
+    queue). The last stage must return HIDDEN states (``_pp_lm_head_in_loss``);
+    the caller applies lm_head + loss outside the schedule.
+
+    Returns:
+        Per-microbatch last-stage hidden states on ranks holding the last
+        stage; None elsewhere.
+    """
+    device = get_device_type()
+    input_ids = torch.cat([mb["input_ids"].to(device, non_blocking=True) for mb in micro_batches], dim=0)
+
+    _set_pp_batch_metadata(model_parts, micro_batches)
+    for model_part in model_parts:
+        model_part._pp_forward_only = True
+    try:
+        if has_first_stage:
+            output = pp_schedule.step(input_ids)
+        else:
+            output = pp_schedule.step()
+    finally:
+        for model_part in model_parts:
+            model_part._pp_forward_only = False
+
+    if not has_last_stage or output is None:
+        return None
+    return list(output.chunk(len(micro_batches), dim=0))

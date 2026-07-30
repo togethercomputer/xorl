@@ -147,3 +147,60 @@ def test_alltoall_pre_dispatch_routes_scores_with_received_token_order(monkeypat
         ]
     )
     torch.testing.assert_close(routing_weights.grad, expected_grad)
+
+
+def test_tokens_post_all2all_hidden_chunking_matches_unchunked(monkeypatch):
+    class FakeGroup:
+        def size(self):
+            return 2
+
+    calls = []
+
+    def fake_all_to_all(group, input, output_split_sizes, input_split_sizes):
+        calls.append(input.shape)
+        return input
+
+    monkeypatch.setattr(alltoall_module, "all_to_all", fake_all_to_all)
+
+    num_experts = 4
+    input_splits = [3, 3]
+    output_splits = [3, 3]
+    num_tokens_per_expert = torch.tensor([[1, 2], [2, 1]], dtype=torch.int64)
+    permutation_mapping = torch.tensor([0, 1, 0, 2, 3, 1], dtype=torch.long)
+    orig_shape = torch.Size([4, 5])
+    base_expert_outputs = torch.arange(30, dtype=torch.float32).view(6, 5) / 10
+
+    unchunked_input = base_expert_outputs.clone().requires_grad_(True)
+    unchunked = alltoall_module.tokens_post_all2all(
+        expert_outputs=unchunked_input,
+        num_experts=num_experts,
+        input_splits=input_splits,
+        output_splits=output_splits,
+        num_global_tokens_per_local_expert=num_tokens_per_expert,
+        routing_map=torch.empty(0),
+        local_input_permutation_mapping=permutation_mapping,
+        org_hidden_states_shape=orig_shape,
+        ep_group=FakeGroup(),
+    )
+    (unchunked.square().sum()).backward()
+    expected_grad = unchunked_input.grad.detach().clone()
+
+    calls.clear()
+    chunked_input = base_expert_outputs.clone().requires_grad_(True)
+    chunked = alltoall_module.tokens_post_all2all(
+        expert_outputs=chunked_input,
+        num_experts=num_experts,
+        input_splits=input_splits,
+        output_splits=output_splits,
+        num_global_tokens_per_local_expert=num_tokens_per_expert,
+        routing_map=torch.empty(0),
+        local_input_permutation_mapping=permutation_mapping,
+        org_hidden_states_shape=orig_shape,
+        ep_group=FakeGroup(),
+        hidden_chunk_size=2,
+    )
+    (chunked.square().sum()).backward()
+
+    torch.testing.assert_close(chunked, unchunked)
+    torch.testing.assert_close(chunked_input.grad, expected_grad)
+    assert [shape[1] for shape in calls] == [2, 2, 1]
