@@ -38,10 +38,10 @@ await executor.stop()
 ```
 """
 
+import json
 import logging
 import math
 import os
-import pickle
 import shutil
 import time
 import uuid
@@ -72,8 +72,11 @@ from xorl.server.protocol.operations import (
 )
 from xorl.server.runner.utils import batch_packed_rows
 from xorl.server.side_payloads import (
+    R3_ROUTED_EXPERT_LOGITS,
+    R3_ROUTED_EXPERTS,
     MooncakeSidePayloadStore,
     R3PayloadCleanup,
+    canonicalize_r3_payload_item,
     cleanup_r3_mooncake_payloads,
     put_r3_mooncake_payload_refs,
 )
@@ -306,20 +309,40 @@ class RequestProcessor:
                     return None
                 item_dir = tmp_root / kind
                 item_dir.mkdir(parents=True, exist_ok=True)
+                if kind == R3_ROUTED_EXPERTS:
+                    target_dtype = torch.int32
+                    dtype_name = "int32"
+                elif kind == R3_ROUTED_EXPERT_LOGITS:
+                    target_dtype = torch.float32
+                    dtype_name = "float32"
+                else:  # pragma: no cover - both callers use the constants above
+                    raise ValueError(f"Unsupported R3 filesystem payload kind {kind!r}")
+
+                metadata = []
                 for idx, item in enumerate(items):
-                    with (item_dir / f"{idx:06d}.pkl").open("wb") as f:
-                        pickle.dump(item, f, protocol=pickle.HIGHEST_PROTOCOL)
-                return {"dir": str(root / kind), "count": len(items)}
+                    tensor = canonicalize_r3_payload_item(item, field=kind, target_dtype=target_dtype)
+                    data = tensor.numpy().tobytes(order="C")
+                    (item_dir / f"{idx:06d}.bin").write_bytes(data)
+                    metadata.append(
+                        {
+                            "shape": [int(dim) for dim in tensor.shape],
+                            "dtype": dtype_name,
+                            "nbytes": len(data),
+                        }
+                    )
+                return {"count": len(items), "items": metadata}
 
             manifest = {
-                "version": 1,
+                "format": "xorl-r3-raw",
+                "version": 2,
                 "request_id": str(request_id),
-                "root": str(root),
-                "routed_experts": _write_items("routed_experts", routed_experts),
-                "routed_expert_logits": _write_items("routed_expert_logits", routed_expert_logits),
+                R3_ROUTED_EXPERTS: _write_items(R3_ROUTED_EXPERTS, routed_experts),
+                R3_ROUTED_EXPERT_LOGITS: _write_items(R3_ROUTED_EXPERT_LOGITS, routed_expert_logits),
             }
-            with (tmp_root / "manifest.pkl").open("wb") as f:
-                pickle.dump(manifest, f, protocol=pickle.HIGHEST_PROTOCOL)
+            (tmp_root / "manifest.json").write_text(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
 
             tmp_root.rename(root)
         except Exception:
@@ -331,7 +354,9 @@ class RequestProcessor:
                 return None
             return {
                 ROUTING_PAYLOAD_REF_KEY: True,
-                "manifest": str(root / "manifest.pkl"),
+                "transport": "filesystem",
+                "version": 2,
+                "manifest": str(root / "manifest.json"),
                 "kind": kind,
                 "count": len(items),
             }

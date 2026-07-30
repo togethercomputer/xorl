@@ -1,4 +1,4 @@
-import pickle
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -27,6 +27,7 @@ def _dispatcher(rank: int, world_size: int) -> RunnerDispatcher:
     dispatcher = object.__new__(RunnerDispatcher)
     dispatcher.rank = rank
     dispatcher.world_size = world_size
+    dispatcher.trainer = SimpleNamespace(use_shared_prefix=False)
     return dispatcher
 
 
@@ -76,6 +77,7 @@ def _parallel_state(**overrides):
         ep_size=overrides.get("ep_size", 1),
         dp_shard_in_ep_size=overrides.get("dp_shard_in_ep_size", 1),
         ep_fsdp_device_mesh=overrides.get("ep_fsdp_device_mesh"),
+        ringattn_enabled=overrides.get("ringattn_enabled", False),
     )
 
 
@@ -252,27 +254,38 @@ def test_select_batches_loads_only_routing_ref_slice(monkeypatch, tmp_path):
     logits_dir = root / "routed_expert_logits"
     experts_dir.mkdir(parents=True)
     logits_dir.mkdir(parents=True)
+    expert_metadata = []
+    logit_metadata = []
     for idx in range(4):
-        with (experts_dir / f"{idx:06d}.pkl").open("wb") as f:
-            pickle.dump(f"r{idx}", f)
-        with (logits_dir / f"{idx:06d}.pkl").open("wb") as f:
-            pickle.dump(f"l{idx}", f)
+        experts = torch.tensor([[[idx, idx + 1]]], dtype=torch.int32)
+        logits = torch.tensor([[[float(idx), float(idx + 1)]]], dtype=torch.float32)
+        expert_data = experts.numpy().tobytes()
+        logit_data = logits.numpy().tobytes()
+        (experts_dir / f"{idx:06d}.bin").write_bytes(expert_data)
+        (logits_dir / f"{idx:06d}.bin").write_bytes(logit_data)
+        expert_metadata.append({"shape": [1, 1, 2], "dtype": "int32", "nbytes": len(expert_data)})
+        logit_metadata.append({"shape": [1, 1, 2], "dtype": "float32", "nbytes": len(logit_data)})
     manifest = {
-        "routed_experts": {"dir": str(experts_dir), "count": 4},
-        "routed_expert_logits": {"dir": str(logits_dir), "count": 4},
+        "format": "xorl-r3-raw",
+        "version": 2,
+        "routed_experts": {"count": 4, "items": expert_metadata},
+        "routed_expert_logits": {"count": 4, "items": logit_metadata},
     }
-    manifest_path = root / "manifest.pkl"
-    with manifest_path.open("wb") as f:
-        pickle.dump(manifest, f)
+    manifest_path = root / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     expert_ref = {
         runner_dispatcher_module.ROUTING_PAYLOAD_REF_KEY: True,
+        "transport": "filesystem",
+        "version": 2,
         "manifest": str(manifest_path),
         "kind": "routed_experts",
         "count": 4,
     }
     logits_ref = {
         runner_dispatcher_module.ROUTING_PAYLOAD_REF_KEY: True,
+        "transport": "filesystem",
+        "version": 2,
         "manifest": str(manifest_path),
         "kind": "routed_expert_logits",
         "count": 4,
@@ -287,8 +300,41 @@ def test_select_batches_loads_only_routing_ref_slice(monkeypatch, tmp_path):
 
     assert len(my_batches) == 1
     assert torch.equal(my_batches[0]["input_ids"], torch.tensor([[30, 31]]))
-    assert routed_experts == ["r2"]
-    assert routed_logits == ["l2"]
+    assert len(routed_experts) == len(routed_logits) == 1
+    assert torch.equal(routed_experts[0], torch.tensor([[[2, 3]]], dtype=torch.int32))
+    assert torch.equal(routed_logits[0], torch.tensor([[[2.0, 3.0]]], dtype=torch.float32))
+
+
+def test_select_batches_rejects_legacy_pickle_routing_ref(tmp_path):
+    manifest_path = tmp_path / "manifest.pkl"
+    manifest_path.write_bytes(b"untrusted pickle bytes")
+    ref = {
+        runner_dispatcher_module.ROUTING_PAYLOAD_REF_KEY: True,
+        "manifest": str(manifest_path),
+        "kind": "routed_experts",
+        "count": 1,
+    }
+
+    with pytest.raises(ValueError, match="Legacy pickle routing payload references are disabled"):
+        _dispatcher(rank=0, world_size=1)._load_routing_payload_slice(ref, 0, 1)
+
+
+def test_select_batches_rejects_symlinked_routing_manifest(tmp_path):
+    real_manifest = tmp_path / "real.json"
+    real_manifest.write_text("{}", encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.symlink_to(real_manifest)
+    ref = {
+        runner_dispatcher_module.ROUTING_PAYLOAD_REF_KEY: True,
+        "transport": "filesystem",
+        "version": 2,
+        "manifest": str(manifest_path),
+        "kind": "routed_experts",
+        "count": 1,
+    }
+
+    with pytest.raises(ValueError, match="Invalid R3 filesystem manifest path"):
+        _dispatcher(rank=0, world_size=1)._load_routing_payload_slice(ref, 0, 1)
 
 
 def test_select_batches_loads_only_mooncake_routing_ref_slice(monkeypatch):

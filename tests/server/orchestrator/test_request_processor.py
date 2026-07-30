@@ -13,7 +13,6 @@ Test Strategy:
 - Verify RequestProcessor correctly packs data and formats outputs
 """
 
-import pickle
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -471,10 +470,11 @@ async def test_model_pass_cleans_externalized_routing_payloads_by_default(tmp_pa
         manifest_path = Path(expert_ref["manifest"])
         assert manifest_path.exists()
         seen["root"] = manifest_path.parent
-        with manifest_path.open("rb") as f:
-            manifest = pickle.load(f)
-        with open(f"{manifest['routed_experts']['dir']}/000001.pkl", "rb") as f:
-            assert pickle.load(f) == "r1"
+        dispatcher = object.__new__(RunnerDispatcher)
+        dispatcher.rank = 0
+        loaded = dispatcher._load_routing_payload_slice(expert_ref, 1, 1)
+        assert loaded is not None
+        assert torch.equal(loaded[0], torch.tensor([[[20, 21]]], dtype=torch.int32))
         return {"total_loss": 1.25, "global_valid_tokens": 3}
 
     try:
@@ -488,8 +488,8 @@ async def test_model_pass_cleans_externalized_routing_payloads_by_default(tmp_pa
                     {"input_ids": [1, 2, 3], "labels": [2, 3, 4]},
                     {"input_ids": [4, 5, 6], "labels": [5, 6, 7]},
                 ],
-                routed_experts=["r0", "r1"],
-                routed_expert_logits=["l0", "l1"],
+                routed_experts=[[[[10, 11]]], [[[20, 21]]]],
+                routed_expert_logits=[[[[0.1, 0.9]]], [[[0.2, 0.8]]]],
             ),
         )
         await exec.execute_forward_backward(request)

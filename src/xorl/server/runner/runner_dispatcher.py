@@ -60,12 +60,12 @@ import asyncio
 import datetime
 import json
 import logging
+import math
 import os
-import pickle
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -1139,18 +1139,80 @@ class RunnerDispatcher:
             )
             return items
 
-        manifest_path = Path(str(value["manifest"]))
+        if value.get("transport") != "filesystem" or int(value.get("version", 0)) != 2:
+            raise ValueError("Legacy pickle routing payload references are disabled; use filesystem version 2")
+
+        manifest_path = Path(str(value.get("manifest", "")))
+        if not manifest_path.is_absolute():
+            raise ValueError("R3 filesystem manifest path must be absolute")
+        if manifest_path.is_symlink():
+            raise ValueError(f"Invalid R3 filesystem manifest path: {manifest_path}")
+        manifest_path = manifest_path.resolve(strict=True)
+        if manifest_path.name != "manifest.json":
+            raise ValueError(f"Invalid R3 filesystem manifest path: {manifest_path}")
+
         kind = str(value["kind"])
-        with manifest_path.open("rb") as f:
-            manifest = pickle.load(f)
+        if kind not in {"routed_experts", "routed_expert_logits"}:
+            raise ValueError(f"Unsupported R3 filesystem payload kind {kind!r}")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Invalid R3 filesystem manifest {manifest_path}: {exc}") from exc
+        if not isinstance(manifest, Mapping):
+            raise ValueError("R3 filesystem manifest must be a JSON object")
+        if manifest.get("format") != "xorl-r3-raw" or int(manifest.get("version", 0)) != 2:
+            raise ValueError("R3 filesystem manifest must use xorl-r3-raw version 2")
+
         kind_meta = manifest.get(kind)
         if not kind_meta:
             return None
-        item_dir = Path(str(kind_meta["dir"]))
+        if not isinstance(kind_meta, Mapping):
+            raise ValueError(f"R3 filesystem manifest field {kind!r} must be an object")
+        metadata_items = kind_meta.get("items")
+        total = int(kind_meta.get("count", -1))
+        if not isinstance(metadata_items, list) or total != len(metadata_items):
+            raise ValueError(f"R3 filesystem manifest has invalid {kind!r} item metadata")
+        if int(value.get("count", -1)) != total:
+            raise ValueError(f"R3 filesystem reference count mismatch for {kind}: {value.get('count')} != {total}")
+        if start < 0 or count < 0 or start + count > total:
+            raise ValueError(
+                f"R3 filesystem payload slice out of range for {kind}: start={start}, count={count}, total={total}"
+            )
+
+        item_dir = manifest_path.parent / kind
+        if item_dir.is_symlink() or item_dir.resolve(strict=True).parent != manifest_path.parent:
+            raise ValueError(f"Invalid R3 filesystem item directory: {item_dir}")
+        expected_dtype = torch.int32 if kind == "routed_experts" else torch.float32
+        expected_dtype_name = "int32" if kind == "routed_experts" else "float32"
         items = []
         for idx in range(start, start + count):
-            with (item_dir / f"{idx:06d}.pkl").open("rb") as f:
-                items.append(pickle.load(f))
+            metadata = metadata_items[idx]
+            if not isinstance(metadata, Mapping):
+                raise ValueError(f"R3 filesystem item metadata {kind}[{idx}] must be an object")
+            shape = metadata.get("shape")
+            if (
+                not isinstance(shape, list)
+                or len(shape) != 3
+                or not all(isinstance(dim, int) and dim >= 0 for dim in shape)
+            ):
+                raise ValueError(f"R3 filesystem item {kind}[{idx}] has invalid shape {shape!r}")
+            if metadata.get("dtype") != expected_dtype_name:
+                raise ValueError(f"R3 filesystem item {kind}[{idx}] has invalid dtype {metadata.get('dtype')!r}")
+            expected_nbytes = math.prod(shape) * 4
+            if int(metadata.get("nbytes", -1)) != expected_nbytes:
+                raise ValueError(f"R3 filesystem item {kind}[{idx}] has inconsistent byte size metadata")
+
+            item_path = item_dir / f"{idx:06d}.bin"
+            if item_path.is_symlink() or item_path.resolve(strict=True).parent != item_dir:
+                raise ValueError(f"Invalid R3 filesystem item path: {item_path}")
+            if item_path.stat().st_size != expected_nbytes:
+                raise ValueError(f"R3 filesystem item {kind}[{idx}] byte size does not match its shape")
+            data = item_path.read_bytes()
+            if expected_nbytes == 0:
+                tensor = torch.empty(shape, dtype=expected_dtype)
+            else:
+                tensor = torch.frombuffer(bytearray(data), dtype=expected_dtype).reshape(shape).clone()
+            items.append(tensor)
         log_fn = logger.info if _r3_verbose_logging_enabled() else logger.debug
         log_fn(
             "Rank %s: Loaded R3 %s slice [%s:%s] from %s",
