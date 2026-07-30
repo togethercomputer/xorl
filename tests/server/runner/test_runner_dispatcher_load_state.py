@@ -51,9 +51,10 @@ class _FakeTrainerSingleTenant:
         return {"success": True, "model_id": model_id}
 
 
-def test_handle_load_state_uses_adapter_coordinator_for_multi_adapter(tmp_path):
+def test_handle_load_state_uses_adapter_coordinator_for_multi_adapter(tmp_path, monkeypatch):
     checkpoint_path = tmp_path / "checkpoint"
     checkpoint_path.mkdir()
+    monkeypatch.setenv("XORL_SERVER_ARTIFACT_ROOT", str(tmp_path))
 
     dispatcher = object.__new__(RunnerDispatcher)
     dispatcher.rank = 0
@@ -83,9 +84,10 @@ def test_handle_load_state_uses_adapter_coordinator_for_multi_adapter(tmp_path):
     assert payload.load_optimizer is False
 
 
-def test_handle_load_state_uses_trainer_load_state_without_adapter_manager(tmp_path):
+def test_handle_load_state_uses_trainer_load_state_without_adapter_manager(tmp_path, monkeypatch):
     checkpoint_path = tmp_path / "checkpoint"
     checkpoint_path.mkdir()
+    monkeypatch.setenv("XORL_SERVER_ARTIFACT_ROOT", str(tmp_path))
 
     dispatcher = object.__new__(RunnerDispatcher)
     dispatcher.rank = 0

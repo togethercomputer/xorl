@@ -345,7 +345,7 @@ def write_sparse_delta_files_by_rank(
     stats: dict[int, SparseDeltaFileStats] = {}
     for rank, updates in sorted(updates_by_rank.items()):
         rank_int = int(rank)
-        filename = filename_template.format(rank=rank_int)
+        filename = _render_rank_filename(filename_template, rank_int)
         path = output_dir / filename
         stats[rank_int] = write_sparse_delta_file(
             list(updates),
@@ -380,7 +380,7 @@ def write_encoded_sparse_delta_files_by_rank(
         if not encoded_tensors:
             raise ValueError(f"Rank {rank} has no encoded sparse-delta tensors")
         rank_int = int(rank)
-        path = output_dir / filename_template.format(rank=rank_int)
+        path = output_dir / _render_rank_filename(filename_template, rank_int)
         written = Path(write_packed_file(dict(encoded_tensors), path))
         nnz = sum(int(getattr(encoded, "values").numel()) for encoded in encoded_tensors.values())
         stats[rank_int] = SparseDeltaFileStats(
@@ -390,6 +390,21 @@ def write_encoded_sparse_delta_files_by_rank(
             packed_bytes=written.stat().st_size,
         )
     return stats
+
+
+def _render_rank_filename(filename_template: str, rank: int) -> str:
+    """Render one rank filename without allowing directory traversal."""
+    filename = filename_template.format(rank=rank)
+    candidate = Path(filename)
+    if (
+        not filename
+        or "\x00" in filename
+        or candidate.is_absolute()
+        or candidate.name != filename
+        or filename in {".", ".."}
+    ):
+        raise ValueError("Sparse-delta filename_template must render a plain filename")
+    return filename
 
 
 def collect_encoded_sparse_deltas_by_rank(

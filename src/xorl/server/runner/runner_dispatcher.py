@@ -103,6 +103,7 @@ from xorl.server.runner.utils import (
     simple_sequence_shard,
     validate_batch_shapes,
 )
+from xorl.server.security import resolve_server_artifact, validate_identifier
 from xorl.server.side_payloads import (
     MooncakeSidePayloadStore,
     is_side_payload_ref,
@@ -1603,28 +1604,24 @@ class RunnerDispatcher:
         checkpoint_path = p.checkpoint_path
         save_optimizer = p.save_optimizer
         use_timestamp = p.use_timestamp
-        model_id = p.model_id or "default"
+        model_id = validate_identifier(p.model_id or "default", name="model_id")
 
         # If no checkpoint path provided, generate one with timestamp_step_{step} format
         if checkpoint_path is None:
-            # Default to checkpoints/ directory in current working directory
-            base_dir = os.path.join(os.getcwd(), "checkpoints")
-            os.makedirs(base_dir, exist_ok=True)
-
             current_step = getattr(self.trainer, "step", 0)
 
             if use_timestamp:
                 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                checkpoint_path = os.path.join(base_dir, f"{timestamp}_step_{current_step}")
+                checkpoint_path = f"{timestamp}_step_{current_step}"
             else:
-                checkpoint_path = os.path.join(base_dir, f"checkpoint_step_{current_step}")
+                checkpoint_path = f"checkpoint_step_{current_step}"
         else:
-            # User provided a path - use it with optional timestamp suffix
             if use_timestamp:
                 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                 current_step = getattr(self.trainer, "step", 0)
                 checkpoint_path = checkpoint_path.rstrip("/")
                 checkpoint_path = f"{checkpoint_path}_{timestamp}_step_{current_step}"
+        checkpoint_path = str(resolve_server_artifact(checkpoint_path))
 
         return {
             "command": "save_state",
@@ -1639,22 +1636,23 @@ class RunnerDispatcher:
     async def _prepare_load_state_command(self, request: RunnerDispatchCommand) -> Dict[str, Any]:
         """Prepare load_state command."""
         p: LoadStateData = request.payload
+        checkpoint_path = str(resolve_server_artifact(p.checkpoint_path, must_exist=True))
         return {
             "command": "load_state",
             "request_id": request.message_id,
             "payload": LoadStateData(
-                checkpoint_path=p.checkpoint_path,
+                checkpoint_path=checkpoint_path,
                 load_optimizer=p.load_optimizer,
-                model_id=p.model_id or "default",
+                model_id=validate_identifier(p.model_id or "default", name="model_id"),
             ),
         }
 
     async def _handle_save_state(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
         """Handle save_state on all ranks (unified handler)."""
         p: SaveStateData = command_dict.get("payload", SaveStateData())
-        checkpoint_path = p.checkpoint_path
+        checkpoint_path = str(resolve_server_artifact(p.checkpoint_path))
         save_optimizer = p.save_optimizer
-        model_id = p.model_id or "default"
+        model_id = validate_identifier(p.model_id or "default", name="model_id")
 
         logger.debug(
             f"Rank {self.rank}: Saving state to {checkpoint_path}, model_id={model_id}, save_optimizer={save_optimizer}"
@@ -1690,8 +1688,8 @@ class RunnerDispatcher:
             "command": "save_lora_only",
             "request_id": request.message_id,
             "payload": SaveLoraOnlyData(
-                lora_path=p.lora_path,
-                model_id=p.model_id or "default",
+                lora_path=str(resolve_server_artifact(p.lora_path)),
+                model_id=validate_identifier(p.model_id or "default", name="model_id"),
             ),
         }
 
@@ -1702,7 +1700,7 @@ class RunnerDispatcher:
             "command": "save_full_weights",
             "request_id": request.message_id,
             "payload": SaveFullWeightsData(
-                output_path=p.output_path,
+                output_path=str(resolve_server_artifact(p.output_path)),
                 dtype=p.dtype,
                 base_model_path=p.base_model_path,
             ),
@@ -1714,8 +1712,8 @@ class RunnerDispatcher:
         Saves only LoRA adapter weights in PEFT-compatible format.
         """
         p: SaveLoraOnlyData = command_dict.get("payload", SaveLoraOnlyData())
-        lora_path = p.lora_path
-        model_id = p.model_id or "default"
+        lora_path = str(resolve_server_artifact(p.lora_path))
+        model_id = validate_identifier(p.model_id or "default", name="model_id")
 
         logger.debug(f"Rank {self.rank}: Saving LoRA adapter to {lora_path} for model_id={model_id}")
 
@@ -1741,7 +1739,7 @@ class RunnerDispatcher:
         Saves full model weights as safetensors with config files for SGLang loading.
         """
         p: SaveFullWeightsData = command_dict.get("payload", SaveFullWeightsData())
-        output_path = p.output_path
+        output_path = str(resolve_server_artifact(p.output_path))
         dtype = p.dtype
         base_model_path = p.base_model_path
 
@@ -1765,9 +1763,9 @@ class RunnerDispatcher:
     async def _handle_load_state(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
         """Handle load_state on all ranks (unified handler)."""
         p: LoadStateData = command_dict.get("payload", LoadStateData())
-        checkpoint_path = p.checkpoint_path
+        checkpoint_path = str(resolve_server_artifact(p.checkpoint_path, must_exist=True))
         load_optimizer = p.load_optimizer
-        model_id = p.model_id or "default"
+        model_id = validate_identifier(p.model_id or "default", name="model_id")
 
         logger.debug(
             f"Rank {self.rank}: Loading state from {checkpoint_path}, "
@@ -1830,9 +1828,10 @@ class RunnerDispatcher:
 
         # If no output path provided, default to checkpoints/hf_weights/
         if output_path is None:
-            base_dir = os.path.join(os.getcwd(), "checkpoints", "hf_weights")
-            os.makedirs(base_dir, exist_ok=True)
-            output_path = base_dir
+            output_path = "hf_weights"
+        output_path = str(resolve_server_artifact(output_path))
+        if checkpoint_path is not None:
+            checkpoint_path = str(resolve_server_artifact(checkpoint_path, must_exist=True))
 
         return {
             "command": "save_weights_for_sampler",
@@ -1848,7 +1847,9 @@ class RunnerDispatcher:
         """Handle save_weights_for_sampler on all ranks (unified handler)."""
         p: SaveStateData = command_dict.get("payload", SaveStateData())
         checkpoint_path = p.checkpoint_path
-        output_path = command_dict.get("output_path")
+        if checkpoint_path is not None:
+            checkpoint_path = str(resolve_server_artifact(checkpoint_path, must_exist=True))
+        output_path = str(resolve_server_artifact(command_dict.get("output_path")))
         save_dtype = command_dict.get("save_dtype", "bfloat16")
 
         logger.debug(f"Rank {self.rank}: Saving HF weights from {checkpoint_path} to {output_path}, dtype={save_dtype}")

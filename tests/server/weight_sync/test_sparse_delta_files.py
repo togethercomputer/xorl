@@ -419,6 +419,26 @@ def test_write_sparse_delta_files_by_rank_writes_rank_ordered_paths(
     assert stats[1].nnz == 1
 
 
+def test_write_sparse_delta_files_by_rank_rejects_traversing_template(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+    _install_fake_delta_encoding(monkeypatch, captured)
+    updates = {
+        0: [
+            SparseTensorUpdate(
+                name="lm_head.weight",
+                flat_indices=torch.tensor([0], dtype=torch.int32),
+                values=torch.tensor([1.0], dtype=torch.bfloat16),
+                shape=(2, 4),
+            )
+        ]
+    }
+
+    with pytest.raises(ValueError, match="plain filename"):
+        write_sparse_delta_files_by_rank(updates, tmp_path, filename_template="../rank{rank}.packed")
+
+
 def test_write_encoded_sparse_delta_files_by_rank_uses_packed_api(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

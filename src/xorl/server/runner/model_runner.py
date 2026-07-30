@@ -85,6 +85,7 @@ from xorl.server.runner.utils import (
     run_self_test,
     validate_token_ids,
 )
+from xorl.server.security import resolve_diagnostic_input, resolve_path_within, validate_identifier
 from xorl.server.session_spec import build_default_session_spec
 from xorl.server.weight_sync.source_delta_capture import (
     snapshot_sparse_delta_tensors,
@@ -632,7 +633,9 @@ class ModelRunner:
 
     def _zorl_generation_export_dir(self, generation_id: str) -> str:
         """Return the sampler-weight export directory for one ZORL generation."""
-        return os.path.join(self.train_config.get("output_dir", "outputs"), "sampler_weights", "zorl", generation_id)
+        generation_id = validate_identifier(generation_id, name="generation_id")
+        output_dir = Path(self.train_config.get("output_dir", "outputs"))
+        return str(resolve_path_within(output_dir, Path("sampler_weights") / "zorl" / generation_id))
 
     def _cleanup_zorl_generation_exports(
         self,
@@ -649,6 +652,7 @@ class ModelRunner:
                 shutil.rmtree(export_dir, ignore_errors=True)
             else:
                 for candidate_id in sorted(candidate_ids):
+                    candidate_id = validate_identifier(candidate_id, name="candidate_id")
                     candidate_path = os.path.join(export_dir, candidate_id)
                     if os.path.isdir(candidate_path):
                         shutil.rmtree(candidate_path, ignore_errors=True)
@@ -775,7 +779,9 @@ class ModelRunner:
             materialization_plan,
             num_pairs=global_num_pairs,
         )
-        materialized_candidate_ids = {candidate.candidate_id for candidate in local_candidates_to_export}
+        materialized_candidate_ids = {
+            validate_identifier(candidate.candidate_id, name="candidate_id") for candidate in local_candidates_to_export
+        }
         export_dir = self._zorl_generation_export_dir(plan.generation_id)
         session_spec = self.get_lora_session_spec(model_id)
 
@@ -856,7 +862,8 @@ class ModelRunner:
                 source_params = adapter_state.lora_params
             candidates: List[Dict[str, Any]] = []
             for candidate in local_candidates_to_export:
-                candidate_path = os.path.join(export_dir, candidate.candidate_id)
+                candidate_id = validate_identifier(candidate.candidate_id, name="candidate_id")
+                candidate_path = os.path.join(export_dir, candidate_id)
                 if perturbation_mode == "fresh_ab":
                     # EGGROLL-style probe: candidate REPLACES the parent factors
                     # with (A = eps_A, B = sign * sigma * eps_B); the pair shares
@@ -1359,6 +1366,7 @@ class ModelRunner:
         Raises:
             ValueError: If model_id doesn't match the active session.
         """
+        model_id = validate_identifier(model_id, name="model_id")
         if self.lora_enabled:
             if model_id == "default":
                 return {
@@ -1735,15 +1743,27 @@ class ModelRunner:
 
     def _get_adapter_checkpoint_dir(self) -> str:
         """Return the shared adapter checkpoint directory under the server output dir."""
-        return os.path.join(self.train_config.get("output_dir", "outputs"), "adapters")
+        output_dir = Path(self.train_config.get("output_dir", "outputs"))
+        return str(resolve_path_within(output_dir, "adapters"))
 
     def _promote_evicted_adapter_checkpoint(self, model_id: str, evicted_path: str) -> str:
         """Copy an evicted adapter checkpoint into the public weights namespace."""
-        checkpoint_path = os.path.join(
-            self.train_config.get("output_dir", "outputs"),
-            "weights",
-            model_id,
-            f"session_{model_id}_final",
+        model_id = validate_identifier(model_id, name="model_id")
+        output_dir = Path(self.train_config.get("output_dir", "outputs"))
+        evicted_path = str(
+            resolve_path_within(
+                self._get_adapter_checkpoint_dir(),
+                evicted_path,
+                must_exist=True,
+                reject_symlinks=True,
+            )
+        )
+        checkpoint_path = str(
+            resolve_path_within(
+                output_dir,
+                Path("weights") / model_id / f"session_{model_id}_final",
+                reject_symlinks=True,
+            )
         )
         if self.rank == 0:
             os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
@@ -2078,10 +2098,7 @@ class ModelRunner:
         if not path:
             return {}
 
-        override_path = Path(path)
-        if not override_path.exists():
-            raise FileNotFoundError(f"XORL_DIAGNOSTIC_LAYER_OUTPUT_OVERRIDE_PATH does not exist: {override_path}")
-
+        override_path = resolve_diagnostic_input(path)
         payload = torch.load(override_path, map_location="cpu", weights_only=True)
 
         if not isinstance(payload, dict):
@@ -2148,10 +2165,7 @@ class ModelRunner:
         if not path:
             return {}
 
-        override_path = Path(path)
-        if not override_path.exists():
-            raise FileNotFoundError(f"XORL_DIAGNOSTIC_LAYER_OUTPUT_OVERRIDE_PATH does not exist: {override_path}")
-
+        override_path = resolve_diagnostic_input(path)
         payload = torch.load(override_path, map_location="cpu", weights_only=True)
 
         if not isinstance(payload, dict):
@@ -2585,6 +2599,7 @@ class ModelRunner:
                 else:
                     setattr(self.obj, self.name, self.value)
 
+        reference_path = resolve_diagnostic_input(reference_path)
         reference = torch.load(reference_path, map_location="cpu", weights_only=True)
         if not isinstance(reference, dict):
             raise TypeError(f"diagnostic_moe_routing_reference_path must contain a dict, got {type(reference)}")

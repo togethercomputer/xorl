@@ -1013,10 +1013,7 @@ class LoRAAdapterManager:
         if path is None:
             path = str(resolve_path_within(self.checkpoint_dir, model_id))
         else:
-            explicit_path = Path(path).expanduser()
-            if explicit_path.is_symlink():
-                raise ValueError(f"Adapter checkpoint path cannot be a symlink: {explicit_path}")
-            path = str(explicit_path.resolve())
+            path = str(resolve_path_within(self.checkpoint_dir, path, reject_symlinks=True))
 
         # Create directory
         os.makedirs(path, exist_ok=True)

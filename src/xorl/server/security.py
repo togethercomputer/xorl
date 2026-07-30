@@ -17,6 +17,7 @@ _HOSTNAME_RE = re.compile(
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _OUTBOUND_ALLOWLIST_ENV = "XORL_OUTBOUND_ENDPOINT_ALLOWLIST"
 _DIAGNOSTIC_INPUT_ROOT_ENV = "XORL_DIAGNOSTIC_INPUT_ROOT"
+_SERVER_ARTIFACT_ROOT_ENV = "XORL_SERVER_ARTIFACT_ROOT"
 _MAX_DIAGNOSTIC_INPUT_BYTES = 8 * 1024 * 1024 * 1024
 
 
@@ -79,6 +80,24 @@ def resolve_diagnostic_input(candidate: str | os.PathLike[str]) -> Path:
     if metadata.st_size > _MAX_DIAGNOSTIC_INPUT_BYTES:
         raise ValueError(f"Diagnostic input exceeds the {_MAX_DIAGNOSTIC_INPUT_BYTES}-byte limit: {resolved}")
     return resolved
+
+
+def resolve_server_artifact(
+    candidate: str | os.PathLike[str],
+    *,
+    must_exist: bool = False,
+) -> Path:
+    """Resolve a server checkpoint or export path below its configured root."""
+    if candidate is None or not str(candidate).strip():
+        raise ValueError("Server artifact path must be non-empty")
+    configured_root = os.environ.get(_SERVER_ARTIFACT_ROOT_ENV, "").strip()
+    root = configured_root or str(Path.cwd() / "checkpoints")
+    return resolve_path_within(
+        root,
+        candidate,
+        must_exist=must_exist,
+        reject_symlinks=True,
+    )
 
 
 def _allowlist_entries() -> list[str]:

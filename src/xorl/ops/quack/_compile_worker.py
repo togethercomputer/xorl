@@ -5,6 +5,7 @@
 # Stays alive to process multiple configs (amortizes import overhead).
 
 import importlib
+import re
 import sys
 
 import torch
@@ -28,6 +29,26 @@ _dtype_map = {
     "torch.bool": torch.bool,
 }
 
+_ALLOWED_MODULE_PREFIXES = ("quack.", "xorl.ops.quack.")
+_QUALNAME_PART_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _resolve_compile_function(fn_module: str, fn_qualname: str):
+    """Resolve an autotune target only from the Quack kernel namespace."""
+    if not isinstance(fn_module, str) or not fn_module.startswith(_ALLOWED_MODULE_PREFIXES):
+        raise ValueError("Compile worker target must be a Quack module")
+    parts = fn_qualname.split(".") if isinstance(fn_qualname, str) else []
+    if not parts or any(not _QUALNAME_PART_RE.fullmatch(part) or part.startswith("__") for part in parts):
+        raise ValueError("Compile worker target must use a safe qualified name")
+
+    obj = importlib.import_module(fn_module)
+    for part in parts:
+        obj = getattr(obj, part)
+    obj = getattr(obj, "fn", obj)
+    if not callable(obj):
+        raise TypeError("Compile worker target must be callable")
+    return obj
+
 
 def _make_fake_tensor(meta):
     shape = meta["shape"]
@@ -37,28 +58,20 @@ def _make_fake_tensor(meta):
 
 
 def main():
+    if len(sys.argv) != 3:
+        raise SystemExit("usage: python -m xorl.ops.quack._compile_worker MODULE QUALNAME")
+    fn = _resolve_compile_function(sys.argv[1], sys.argv[2])
+
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
 
     # Signal ready
     send_message(stdout, "READY")
 
-    fn_cache = {}
     while True:
         payload = recv_message(stdin)
         if payload is None:
             break
-
-        fn_module = payload["fn_module"]
-        fn_qualname = payload["fn_qualname"]
-        fn_key = (fn_module, fn_qualname)
-        if fn_key not in fn_cache:
-            mod = importlib.import_module(fn_module)
-            obj = mod
-            for part in fn_qualname.split("."):
-                obj = getattr(obj, part)
-            fn_cache[fn_key] = getattr(obj, "fn", obj)
-        fn = fn_cache[fn_key]
 
         tensor_meta = payload["tensor_meta"]
         kwargs = payload["kwargs"]

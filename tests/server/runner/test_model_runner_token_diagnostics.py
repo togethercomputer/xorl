@@ -433,3 +433,19 @@ def test_hidden_component_hooks_capture_shared_expert_split():
     torch.testing.assert_close(by_name["experts"], torch.full((1, 2, 3), 11.0))
     torch.testing.assert_close(by_name["mlp"], torch.full((1, 2, 3), 12.5))
     assert "_shared_expert" not in layer.mlp.__dict__
+
+
+def test_diagnostic_layer_override_requires_trusted_input_root(tmp_path, monkeypatch):
+    trusted_root = tmp_path / "trusted"
+    trusted_root.mkdir()
+    override_path = trusted_root / "layer-output.pt"
+    torch.save({"layer_outputs": {0: torch.ones(1, 2, 3)}}, override_path)
+
+    monkeypatch.setenv("XORL_DIAGNOSTIC_LAYER_OUTPUT_OVERRIDE_PATH", str(override_path))
+    monkeypatch.delenv("XORL_DIAGNOSTIC_INPUT_ROOT", raising=False)
+    with pytest.raises(ValueError, match="XORL_DIAGNOSTIC_INPUT_ROOT"):
+        ModelRunner._load_diagnostic_layer_output_overrides()
+
+    monkeypatch.setenv("XORL_DIAGNOSTIC_INPUT_ROOT", str(trusted_root))
+    overrides = ModelRunner._load_diagnostic_layer_output_overrides()
+    torch.testing.assert_close(overrides[0][0], torch.ones(1, 2, 3))

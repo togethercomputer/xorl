@@ -7,7 +7,9 @@ import builtins
 import hashlib
 import inspect
 import json
+import math
 import os
+import stat
 import time
 from functools import cached_property, partial
 from pathlib import Path
@@ -58,13 +60,29 @@ def default_cache_dir():
 class FileCacheManager(triton.runtime.cache.FileCacheManager):
     def __init__(self, key):
         super().__init__(key)
-        self.cache_dir = os.getenv(f"{PACKAGE_NAME.upper()}_CACHE_DIR", "").strip() or default_cache_dir()
-        if self.cache_dir:
-            self.cache_dir = os.path.join(self.cache_dir, self.key)
-            self.lock_path = os.path.join(self.cache_dir, "lock")
-            os.makedirs(self.cache_dir, exist_ok=True)
-        else:
-            raise RuntimeError("Could not create or locate cache dir")
+        raw_cache_root = os.getenv(f"{PACKAGE_NAME.upper()}_CACHE_DIR", "").strip() or default_cache_dir()
+        cache_root = Path(raw_cache_root).expanduser()
+        if cache_root.is_symlink():
+            raise RuntimeError(f"Autotune cache root cannot be a symlink: {cache_root}")
+        cache_root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        cache_root = cache_root.resolve()
+        root_metadata = cache_root.stat()
+        if not stat.S_ISDIR(root_metadata.st_mode) or root_metadata.st_uid != os.getuid():
+            raise RuntimeError(f"Autotune cache root must be owned by the current user: {cache_root}")
+        if root_metadata.st_mode & 0o077:
+            cache_root.chmod(0o700)
+
+        cache_dir = cache_root / self.key
+        if cache_dir.is_symlink():
+            raise RuntimeError(f"Autotune cache directory cannot be a symlink: {cache_dir}")
+        cache_dir.mkdir(mode=0o700, exist_ok=True)
+        metadata = cache_dir.stat()
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+            raise RuntimeError(f"Autotune cache directory must be owned by the current user: {cache_dir}")
+        if metadata.st_mode & 0o077:
+            cache_dir.chmod(0o700)
+        self.cache_dir = str(cache_dir)
+        self.lock_path = str(cache_dir / "lock")
 
 
 def _base32(key):
@@ -225,7 +243,13 @@ class Autotuner:
         workers = []
         for _ in range(max_workers):
             p = subprocess.Popen(
-                [sys.executable, "-m", "_compile_worker"],
+                [
+                    sys.executable,
+                    "-m",
+                    "xorl.ops.quack._compile_worker",
+                    fn_module,
+                    fn_qualname,
+                ],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL if not verbose else None,
@@ -247,8 +271,6 @@ class Autotuner:
             send_message(
                 w.stdin,
                 {
-                    "fn_module": fn_module,
-                    "fn_qualname": fn_qualname,
                     "tensor_meta": tensor_meta,
                     "kwargs": kwargs,
                     "config_kwargs": config.all_kwargs(),
@@ -328,14 +350,41 @@ class Autotuner:
         path = cache.get_file(file_name)
         # There's an environment variable to force cache update
         if path and not os.environ.get(f"{PACKAGE_NAME.upper()}_FORCE_CACHE_UPDATE", False):
-            str2config = dict(zip(config_str_list, configs))
-            with open(path, "r") as cached_configs:
-                timings = json.load(cached_configs)["configs_timings"]
-                timings = {str2config[config]: timing for config, timing in timings}
+            from .cache_utils import _trusted_cache_object
+
+            try:
+                cache_path = Path(path)
+                if not _trusted_cache_object(cache_path):
+                    raise ValueError(f"Refusing untrusted autotune cache file: {cache_path}")
+                cached_payload = json.loads(cache_path.read_text(encoding="utf-8"))
+                raw_timings = cached_payload["configs_timings"]
+                if not isinstance(raw_timings, list) or len(raw_timings) != len(configs):
+                    raise ValueError("Autotune cache has an invalid config set")
+                str2config = dict(zip(config_str_list, configs))
+                timings = {}
+                for entry in raw_timings:
+                    if not isinstance(entry, list) or len(entry) != 2 or entry[0] not in str2config:
+                        raise ValueError("Autotune cache has an unknown config")
+                    timing = entry[1]
+                    if (
+                        not isinstance(timing, list)
+                        or not timing
+                        or any(
+                            not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0
+                            for value in timing
+                        )
+                    ):
+                        raise ValueError("Autotune cache has invalid timings")
+                    timings[str2config[entry[0]]] = timing
+                if len(timings) != len(configs):
+                    raise ValueError("Autotune cache has duplicate configs")
+            except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+                pass
+            else:
                 self.cache[tuning_key] = builtins.min(timings, key=timings.get)
                 self.configs_timings = timings
                 self.bench_time = 0
-            return
+                return
 
         bench_fn()
         cache.put(

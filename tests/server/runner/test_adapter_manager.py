@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -139,6 +140,14 @@ def test_save_adapter_state_preserves_lora_weight_dtype(tmp_path):
     assert weights["base_model.model.model.layers.0.self_attn.o_proj.lora_B"].dtype == torch.float32
 
 
+def test_save_adapter_state_rejects_path_outside_checkpoint_root(tmp_path):
+    manager = _build_manager(tmp_path, optimizer_type="adamw")
+    manager.register_adapter("policy-contained", lr=0.1, initialize_fresh=True)
+
+    with pytest.raises(ValueError, match="escapes configured root"):
+        manager.save_adapter_state("policy-contained", path=str(tmp_path / "outside"))
+
+
 def test_load_adapter_state_uses_checkpoint_optimizer_contract_for_fresh_session(tmp_path):
     source_manager = _build_manager(tmp_path, optimizer_type="signsgd")
     source_manager.register_adapter("policy-b", lr=0.1, initialize_fresh=True)
@@ -189,7 +198,9 @@ def test_adapter_coordinator_auto_load_evicted_uses_checkpoint_session_spec(tmp_
     source_manager = _build_manager(tmp_path / "source", optimizer_type="signsgd")
     source_manager.register_adapter("policy-evicted", lr=0.2, initialize_fresh=True)
     checkpoint_path = Path(target_manager.checkpoint_dir) / "evicted" / "policy-evicted"
-    source_manager.save_adapter_state("policy-evicted", str(checkpoint_path))
+    source_checkpoint = source_manager.save_adapter_state("policy-evicted")["path"]
+    checkpoint_path.parent.mkdir(parents=True)
+    shutil.copytree(source_checkpoint, checkpoint_path)
 
     coordinator = AdapterCoordinator(
         trainer=_CoordinatorTrainer(target_manager),

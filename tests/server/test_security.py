@@ -11,6 +11,7 @@ from xorl.server.security import (
     build_http_endpoint_url,
     resolve_diagnostic_input,
     resolve_path_within,
+    resolve_server_artifact,
     validate_outbound_endpoint,
 )
 
@@ -94,6 +95,27 @@ def test_diagnostic_input_requires_configured_root_and_regular_private_file(tmp_
     outside.write_bytes(b"outside")
     with pytest.raises(ValueError, match="escapes configured root"):
         resolve_diagnostic_input(outside)
+
+
+def test_server_artifact_path_is_confined_to_configured_root(tmp_path, monkeypatch):
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    checkpoint = root / "checkpoint"
+    checkpoint.mkdir()
+    monkeypatch.setenv("XORL_SERVER_ARTIFACT_ROOT", str(root))
+
+    assert resolve_server_artifact("checkpoint", must_exist=True) == checkpoint
+    with pytest.raises(ValueError, match="escapes configured root"):
+        resolve_server_artifact(tmp_path / "outside")
+
+
+def test_compile_worker_rejects_targets_outside_quack():
+    from xorl.ops.quack._compile_worker import _resolve_compile_function
+
+    with pytest.raises(ValueError, match="Quack module"):
+        _resolve_compile_function("os", "system")
+    with pytest.raises(ValueError, match="safe qualified name"):
+        _resolve_compile_function("xorl.ops.quack.autotuner", "__builtins__.eval")
 
 
 def test_compile_worker_protocol_roundtrips_safe_types_and_rejects_oversized_header():

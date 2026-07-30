@@ -10,6 +10,7 @@ Environment variables:
     CUTE_DSL_KEEP_PTX      - Must be set to 1 before cutlass is imported
     CUTE_DSL_PTXAS_VERBOSE - Set to 1 for verbose output
     CUTE_DSL_DUMP_DIR      - Directory for dumped PTX files (default: cwd)
+    CUTE_DSL_TRUSTED_DUMP_ROOT - Allowed root for CUTE_DSL_DUMP_DIR (default: cwd)
     CUTE_DSL_KEEP_CUBIN    - Set to 1 to save compiled cubin files
 """
 
@@ -33,6 +34,7 @@ VERBOSE = os.environ.get("CUTE_DSL_PTXAS_VERBOSE", "0") == "1"
 _original_load_cuda_library = None
 _original_create_tvm_ffi_function = None
 _user_wanted_ptx = False  # True if user originally set CUTE_DSL_KEEP_PTX=1
+_MAX_PTX_BYTES = 64 * 1024 * 1024
 
 
 def _log(msg: str):
@@ -54,6 +56,56 @@ def _validated_ptxas_path() -> str:
     if metadata.st_uid != 0 or metadata.st_mode & 0o022:
         raise RuntimeError(f"ptxas must be root-owned and not writable by group or others: {resolved}")
     return str(resolved)
+
+
+def _validated_dump_dir() -> Path:
+    """Resolve the PTX dump directory below an operator-selected trusted root."""
+    trusted_root = Path(os.environ.get("CUTE_DSL_TRUSTED_DUMP_ROOT", Path.cwd())).expanduser().resolve()
+    root_metadata = trusted_root.stat()
+    if (
+        not stat.S_ISDIR(root_metadata.st_mode)
+        or trusted_root.is_symlink()
+        or root_metadata.st_uid != os.getuid()
+        or root_metadata.st_mode & 0o022
+    ):
+        raise RuntimeError(f"Trusted PTX dump root must be an owned, non-writable directory: {trusted_root}")
+
+    raw_dump_dir = Path(os.environ.get("CUTE_DSL_DUMP_DIR", trusted_root)).expanduser()
+    dump_dir = raw_dump_dir if raw_dump_dir.is_absolute() else trusted_root / raw_dump_dir
+    current = dump_dir
+    while current != trusted_root and current != current.parent:
+        if current.is_symlink():
+            raise RuntimeError(f"PTX dump directory cannot contain symlinks: {dump_dir}")
+        current = current.parent
+    dump_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+    resolved = dump_dir.resolve()
+    try:
+        resolved.relative_to(trusted_root)
+    except ValueError as exc:
+        raise RuntimeError(f"PTX dump directory escapes trusted root {trusted_root}: {dump_dir}") from exc
+    metadata = resolved.stat()
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
+        raise RuntimeError(f"PTX dump directory must be owned and not writable by others: {resolved}")
+    return resolved
+
+
+def _validated_ptx_file(ptx_path: Path, dump_dir: Path) -> Path:
+    """Return a private regular PTX file confined below ``dump_dir``."""
+    try:
+        metadata = ptx_path.lstat()
+        resolved = ptx_path.resolve(strict=True)
+        resolved.relative_to(dump_dir)
+    except (FileNotFoundError, ValueError) as exc:
+        raise RuntimeError(f"Unsafe PTX file: {ptx_path}") from exc
+    if (
+        ptx_path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_mode & 0o022
+        or metadata.st_size > _MAX_PTX_BYTES
+    ):
+        raise RuntimeError(f"PTX file must be an owned, private regular file below the dump root: {ptx_path}")
+    return resolved
 
 
 def _read_ptx(ptx_path: Path) -> str | None:
@@ -78,15 +130,26 @@ def _get_ptx(compiled_func) -> tuple[str, Path] | None:
         _log("Compiled function is missing function_name")
         return None
 
-    dump_dir = Path(os.environ.get("CUTE_DSL_DUMP_DIR", Path.cwd()))
-    dump_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        dump_dir = _validated_dump_dir()
+    except RuntimeError as exc:
+        _log(str(exc))
+        return None
 
-    ptx_paths = sorted(dump_dir.rglob("*.ptx"), key=lambda path: path.stat().st_mtime_ns, reverse=True)
+    ptx_paths = []
+    for candidate in dump_dir.rglob("*.ptx"):
+        try:
+            validated = _validated_ptx_file(candidate, dump_dir)
+        except RuntimeError as exc:
+            _log(str(exc))
+            continue
+        ptx_paths.append(validated)
+    ptx_paths.sort(key=lambda path: path.stat().st_mtime_ns, reverse=True)
     _log(f"Searching dumped PTX for {func_name} in {dump_dir}")
     _log(f"Found {len(ptx_paths)} PTX candidate files in {dump_dir}")
 
     # Strategy 1: match by filename
-    filename_matches = [ptx_path for ptx_path in ptx_paths if func_name in ptx_path.name]
+    filename_matches = [ptx_path for ptx_path in ptx_paths if ptx_path.stem == func_name]
     if filename_matches:
         _log(f"Found {len(filename_matches)} filename matches for {func_name}")
         for ptx_path in filename_matches:
@@ -105,13 +168,6 @@ def _get_ptx(compiled_func) -> tuple[str, Path] | None:
         if entry_pattern.search(content):
             _log(f"Found PTX for {func_name}: {ptx_path}")
             return content, ptx_path
-
-    # Strategy 3: use sole candidate as fallback
-    if len(ptx_paths) == 1:
-        content = _read_complete_ptx(ptx_paths[0])
-        if content is not None:
-            _log(f"Using sole PTX candidate for {func_name}: {ptx_paths[0]}")
-            return content, ptx_paths[0]
 
     _log(f"No PTX found for function {func_name} in {dump_dir}")
     return None
