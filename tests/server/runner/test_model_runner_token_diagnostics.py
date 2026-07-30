@@ -347,6 +347,8 @@ def test_hidden_component_hooks_capture_residual_and_mlp_equation_terms():
         "input_norm",
         "attention",
         "post_attention_norm",
+        "post_attention_norm_input",
+        "post_attention_norm_residual",
         "post_attention_residual",
         "mlp",
         "layer_output",

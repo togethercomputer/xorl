@@ -24,6 +24,7 @@ def _trainer_args():
             model_path="unused-weights",
             attn_implementation="eager",
             moe_implementation=None,
+            moe_routing_weights_before_down=True,
             ep_dispatch="alltoall",
             train_router=False,
             record_routing_weights=True,

@@ -30,13 +30,12 @@ torchrun --nproc_per_node=8 -m xorl.cli.train config.yaml \
 | `model_path` | `null` | HF Hub ID or local path to pre-trained weights. If `null`, model is randomly initialized. |
 | `config_path` | same as `model_path` | Path to model config. Useful when config and weights are in separate locations. |
 | `tokenizer_path` | same as `config_path` | Path to tokenizer. |
-| `attn_implementation` | `flash_attention_4` | Attention backend: `eager`, `sdpa`, `native` (PyTorch SDPA+cuDNN, no deps, Hopper+Blackwell), `flash_attention_3` (FA3, Hopper), `flash_attention_4` (FA4 CUTE, Hopper+Blackwell). |
+| `attn_implementation` | `flash_attention_3` | Attention backend: `eager`, `sdpa`, `native` (PyTorch SDPA+cuDNN, no deps, Hopper+Blackwell), `flash_attention_3` (FA3, Hopper), `flash_attention_4` (FA4 CUTE, Hopper+Blackwell). |
 | `moe_implementation` | `null` | MoE kernel: `null` (auto), `eager`, `triton` (Triton group GEMM), `native` (torch._grouped_mm), `quack`. |
 | `ep_dispatch` | `alltoall` | Expert-parallel dispatch: `alltoall` or `deepep` (NVLink-optimized). |
 | `deepep_buffer_size_gb` | `2.0` | DeepEP NVLink buffer size per GPU in GB. Only active when `ep_dispatch: deepep`. |
 | `deepep_num_sms` | `20` | SMs assigned to DeepEP communication kernels. Must be even. Lower values leave more SMs for overlapped compute. |
 | `deepep_async_combine` | `false` | Overlap DeepEP combine with the next layer's compute (experimental, unsafe). Forced to `false` in code unless `XORL_DEEPEP_UNSAFE_ASYNC_COMBINE=1` is exported; without that env var, deferring the comm-stream sync races the transformer block's read of the combined tensor on the default stream. |
-| `alltoall_combine_hidden_chunk_size` | `0` | Hidden-dimension chunk size for all-to-all EP combine. `0` disables chunking; use a positive value to reduce long-context MoE combine memory peaks. |
 | `merge_qkv` | `true` | Keep Q/K/V projections fused as `qkv_proj`. Set `false` for tensor parallelism or per-projection LoRA. |
 | `basic_modules` | `[]` | Additional module names (beyond `_no_split_modules`) to shard as separate FSDP units. |
 | `foundation` | `{}` | Extra foundation model config (dict). |

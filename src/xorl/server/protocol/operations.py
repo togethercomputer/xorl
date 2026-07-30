@@ -112,6 +112,8 @@ class SyncWeightsData:
     pause_mode: str = "in_place"
     weight_version: Optional[str] = None
     quantization: Optional[Dict[str, Any]] = None
+    sparse_delta_paths: Optional[List[str]] = None
+    sparse_delta_config: Optional[Dict[str, Any]] = None
 
 
 @dataclass
