@@ -29,7 +29,7 @@ pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
 @pytest.fixture(autouse=True)
 def _allow_test_inference_endpoint(monkeypatch):
-    monkeypatch.setenv("XORL_OUTBOUND_ENDPOINT_ALLOWLIST", "inference.example")
+    monkeypatch.setenv("XORL_OUTBOUND_ENDPOINT_ALLOWLIST", "8.8.8.8")
 
 
 class FakeResponse:
@@ -76,8 +76,8 @@ class TestInferenceEndpointRegistration:
     def test_add_inference_endpoint_uses_single_endpoint_port(self, monkeypatch):
         calls: list[str] = []
         responses = {
-            "http://inference.example:30000/health": FakeResponse(),
-            "http://inference.example:30000/server_info": FakeResponse(json_data={"model_path": None, "tp_size": 1}),
+            "http://8.8.8.8:30000/health": FakeResponse(),
+            "http://8.8.8.8:30000/server_info": FakeResponse(json_data={"model_path": None, "tp_size": 1}),
         }
         monkeypatch.setattr(
             "xorl.server.api_server.inference_endpoints.httpx.AsyncClient",
@@ -91,7 +91,7 @@ class TestInferenceEndpointRegistration:
 
         response = asyncio.run(
             server.add_inference_endpoint(
-                AddInferenceEndpointRequest(host="inference.example", port=30000),
+                AddInferenceEndpointRequest(host="8.8.8.8", port=30000),
             )
         )
 
@@ -99,14 +99,14 @@ class TestInferenceEndpointRegistration:
         assert response.endpoint is not None
         assert response.endpoint.port == 30000
         assert response.endpoint.worker_port == 30000
-        assert "http://inference.example:29999/health" not in calls
+        assert "http://8.8.8.8:29999/health" not in calls
 
     def test_add_inference_endpoint_checks_explicit_worker_port(self, monkeypatch):
         calls: list[str] = []
         responses = {
-            "http://inference.example:30000/health": FakeResponse(),
-            "http://inference.example:31000/health": FakeResponse(),
-            "http://inference.example:30000/server_info": FakeResponse(json_data={"model_path": None, "tp_size": 1}),
+            "http://8.8.8.8:30000/health": FakeResponse(),
+            "http://8.8.8.8:31000/health": FakeResponse(),
+            "http://8.8.8.8:30000/server_info": FakeResponse(json_data={"model_path": None, "tp_size": 1}),
         }
         monkeypatch.setattr(
             "xorl.server.api_server.inference_endpoints.httpx.AsyncClient",
@@ -120,21 +120,21 @@ class TestInferenceEndpointRegistration:
 
         response = asyncio.run(
             server.add_inference_endpoint(
-                AddInferenceEndpointRequest(host="inference.example", port=30000, worker_port=31000),
+                AddInferenceEndpointRequest(host="8.8.8.8", port=30000, worker_port=31000),
             )
         )
 
         assert response.success is True
         assert response.endpoint is not None
         assert response.endpoint.worker_port == 31000
-        assert "http://inference.example:30000/health" in calls
-        assert "http://inference.example:31000/health" in calls
+        assert "http://8.8.8.8:30000/health" in calls
+        assert "http://8.8.8.8:31000/health" in calls
 
     def test_add_inference_endpoint_auto_sync_uses_detected_tp_size(self, monkeypatch):
         calls: list[str] = []
         responses = {
-            "http://inference.example:30000/health": FakeResponse(),
-            "http://inference.example:30000/server_info": FakeResponse(json_data={"model_path": None, "tp_size": 4}),
+            "http://8.8.8.8:30000/health": FakeResponse(),
+            "http://8.8.8.8:30000/server_info": FakeResponse(json_data={"model_path": None, "tp_size": 4}),
         }
         monkeypatch.setattr(
             "xorl.server.api_server.inference_endpoints.httpx.AsyncClient",
@@ -159,7 +159,7 @@ class TestInferenceEndpointRegistration:
         response = asyncio.run(
             server.add_inference_endpoint(
                 AddInferenceEndpointRequest(
-                    host="inference.example",
+                    host="8.8.8.8",
                     port=30000,
                     world_size=1,
                     sync_weights=True,
@@ -171,13 +171,13 @@ class TestInferenceEndpointRegistration:
         assert response.success is True
         assert response.endpoint is not None
         assert response.endpoint.world_size == 4
-        assert captured_endpoints == [{"host": "inference.example", "port": 30000, "world_size": 4}]
+        assert captured_endpoints == [{"host": "8.8.8.8", "port": 30000, "world_size": 4}]
 
     def test_add_inference_endpoint_records_fp8_kv_cache_server_info(self, monkeypatch):
         calls: list[str] = []
         responses = {
-            "http://inference.example:30000/health": FakeResponse(),
-            "http://inference.example:30000/server_info": FakeResponse(
+            "http://8.8.8.8:30000/health": FakeResponse(),
+            "http://8.8.8.8:30000/server_info": FakeResponse(
                 json_data={
                     "model_path": None,
                     "tp_size": 1,
@@ -201,7 +201,7 @@ class TestInferenceEndpointRegistration:
         response = asyncio.run(
             server.add_inference_endpoint(
                 AddInferenceEndpointRequest(
-                    host="inference.example",
+                    host="8.8.8.8",
                     port=30000,
                     receiver_kv_cache_dtype="fp8_e4m3",
                 ),
@@ -220,8 +220,8 @@ class TestInferenceEndpointRegistration:
     def test_add_inference_endpoint_accepts_cache_version_alias_and_infers_fp8_kv_cache(self, monkeypatch):
         calls: list[str] = []
         responses = {
-            "http://inference.example:30000/health": FakeResponse(),
-            "http://inference.example:30000/server_info": FakeResponse(
+            "http://8.8.8.8:30000/health": FakeResponse(),
+            "http://8.8.8.8:30000/server_info": FakeResponse(
                 json_data={
                     "model_path": None,
                     "tp_size": 1,
@@ -243,7 +243,7 @@ class TestInferenceEndpointRegistration:
         response = asyncio.run(
             server.add_inference_endpoint(
                 AddInferenceEndpointRequest(
-                    host="inference.example",
+                    host="8.8.8.8",
                     port=30000,
                     receiver_kv_cache_dtype="fp8",
                 ),
@@ -259,8 +259,8 @@ class TestInferenceEndpointRegistration:
     def test_add_inference_endpoint_rejects_non_fp8_kv_cache_when_config_requires_fp8(self, monkeypatch):
         calls: list[str] = []
         responses = {
-            "http://inference.example:30000/health": FakeResponse(),
-            "http://inference.example:30000/server_info": FakeResponse(
+            "http://8.8.8.8:30000/health": FakeResponse(),
+            "http://8.8.8.8:30000/server_info": FakeResponse(
                 json_data={
                     "model_path": None,
                     "tp_size": 1,
@@ -282,7 +282,7 @@ class TestInferenceEndpointRegistration:
 
         response = asyncio.run(
             server.add_inference_endpoint(
-                AddInferenceEndpointRequest(host="inference.example", port=30000),
+                AddInferenceEndpointRequest(host="8.8.8.8", port=30000),
             )
         )
 
@@ -294,8 +294,8 @@ class TestInferenceEndpointRegistration:
     def test_list_inference_endpoints_accepts_v1_models_health_fallback(self, monkeypatch):
         calls: list[str] = []
         responses = {
-            "http://inference.example:30000/health": FakeResponse(status_code=404),
-            "http://inference.example:30000/v1/models": FakeResponse(json_data={"data": []}),
+            "http://8.8.8.8:30000/health": FakeResponse(status_code=404),
+            "http://8.8.8.8:30000/v1/models": FakeResponse(json_data={"data": []}),
         }
         monkeypatch.setattr(
             "xorl.server.api_server.inference_endpoints.httpx.AsyncClient",
@@ -307,15 +307,15 @@ class TestInferenceEndpointRegistration:
             engine_output_addr="tcp://127.0.0.1:17003",
         )
         server.inference_endpoints = [
-            InferenceEndpoint(host="inference.example", port=30000, world_size=1),
+            InferenceEndpoint(host="8.8.8.8", port=30000, world_size=1),
         ]
 
         response = asyncio.run(server.list_inference_endpoints())
 
         assert response.count == 1
-        assert response.endpoints[0].host == "inference.example"
-        assert "http://inference.example:30000/health" in calls
-        assert "http://inference.example:30000/v1/models" in calls
+        assert response.endpoints[0].host == "8.8.8.8"
+        assert "http://8.8.8.8:30000/health" in calls
+        assert "http://8.8.8.8:30000/v1/models" in calls
 
     def test_lora_adapter_management_uses_worker_port(self, monkeypatch):
         calls: list[str] = []
@@ -331,21 +331,21 @@ class TestInferenceEndpointRegistration:
             engine_output_addr="tcp://127.0.0.1:17003",
         )
         server.inference_endpoints = [
-            InferenceEndpoint(host="inference.example", port=30000, worker_port=31000, world_size=1),
+            InferenceEndpoint(host="8.8.8.8", port=30000, worker_port=31000, world_size=1),
         ]
 
         asyncio.run(server._load_lora_on_inference_endpoints("adapter-001", "/tmp/adapter-001"))
         asyncio.run(server._unload_lora_on_inference_endpoints("adapter-001"))
 
         assert calls == [
-            "http://inference.example:31000/load_lora_adapter",
-            "http://inference.example:31000/unload_lora_adapter",
+            "http://8.8.8.8:31000/load_lora_adapter",
+            "http://8.8.8.8:31000/unload_lora_adapter",
         ]
 
     def test_loaded_adapter_query_uses_worker_port(self, monkeypatch):
         calls: list[str] = []
         responses = {
-            "http://inference.example:31000/v1/models": FakeResponse(
+            "http://8.8.8.8:31000/v1/models": FakeResponse(
                 json_data={
                     "data": [
                         {"id": "base-model"},
@@ -363,12 +363,12 @@ class TestInferenceEndpointRegistration:
             engine_input_addr="tcp://127.0.0.1:17002",
             engine_output_addr="tcp://127.0.0.1:17003",
         )
-        endpoint = InferenceEndpoint(host="inference.example", port=30000, worker_port=31000, world_size=1)
+        endpoint = InferenceEndpoint(host="8.8.8.8", port=30000, worker_port=31000, world_size=1)
 
         adapters = asyncio.run(server._get_loaded_adapters_from_endpoint(endpoint))
 
         assert adapters == ["adapter-001"]
-        assert calls == ["http://inference.example:31000/v1/models"]
+        assert calls == ["http://8.8.8.8:31000/v1/models"]
 
     def test_sync_inference_weights_forwards_single_endpoint(self):
         server = APIServer(
@@ -377,7 +377,7 @@ class TestInferenceEndpointRegistration:
         )
         server._running = True
         server.inference_endpoints = [
-            InferenceEndpoint(host="inference.example", port=30000, world_size=2),
+            InferenceEndpoint(host="8.8.8.8", port=30000, world_size=2),
         ]
 
         captured_request = {}
@@ -398,7 +398,7 @@ class TestInferenceEndpointRegistration:
                             "num_buckets": 1,
                             "timing_breakdown": {"transfer_s": 0.1, "total_handler_s": 0.2},
                             "p2p_rank_summaries": [{"rank": 0, "is_sender": True, "transfer_wall_s": 0.1}],
-                            "endpoint_results": [{"host": "inference.example", "port": 30000, "success": True}],
+                            "endpoint_results": [{"host": "8.8.8.8", "port": 30000, "success": True}],
                         }
                     ],
                 )
@@ -420,7 +420,7 @@ class TestInferenceEndpointRegistration:
         assert response.success is True
         assert captured_request["request"].payload.endpoints == [
             {
-                "host": "inference.example",
+                "host": "8.8.8.8",
                 "port": 30000,
                 "world_size": 2,
             }
@@ -505,7 +505,7 @@ class TestInferenceEndpointRegistration:
         )
         server._running = True
         server._default_sync_quantization = {"quant_method": "fp8", "weight_block_size": [128, 128]}
-        server.inference_endpoints = [InferenceEndpoint(host="inference.example", port=30000, world_size=1)]
+        server.inference_endpoints = [InferenceEndpoint(host="8.8.8.8", port=30000, world_size=1)]
         captured_request = {}
 
         async def fake_send_request(engine_request):
@@ -536,7 +536,7 @@ class TestInferenceEndpointRegistration:
         server._running = True
         server.inference_endpoints = [
             InferenceEndpoint(
-                host="inference.example",
+                host="8.8.8.8",
                 port=30000,
                 world_size=1,
                 server_info=InferenceEndpointServerInfo(
@@ -563,7 +563,7 @@ class TestInferenceEndpointRegistration:
                             "cache_epoch": None,
                             "endpoint_results": [
                                 {
-                                    "host": "inference.example",
+                                    "host": "8.8.8.8",
                                     "port": 30000,
                                     "success": True,
                                     "cache_epoch": "epoch-8",
@@ -609,7 +609,7 @@ class TestInferenceEndpointRegistration:
         server._running = True
         server.inference_endpoints = [
             InferenceEndpoint(
-                host="inference.example",
+                host="8.8.8.8",
                 port=30000,
                 world_size=1,
                 server_info=InferenceEndpointServerInfo(
@@ -634,7 +634,7 @@ class TestInferenceEndpointRegistration:
                             "message": "ok",
                             "endpoint_results": [
                                 {
-                                    "host": "inference.example",
+                                    "host": "8.8.8.8",
                                     "port": 30000,
                                     "success": True,
                                     "cache_version": "version-2",
@@ -676,7 +676,7 @@ class TestInferenceEndpointRegistration:
         server._running = True
         server.inference_endpoints = [
             InferenceEndpoint(
-                host="inference.example",
+                host="8.8.8.8",
                 port=30000,
                 world_size=1,
                 server_info=InferenceEndpointServerInfo(
@@ -721,7 +721,7 @@ class TestInferenceEndpointRegistration:
         server._running = True
         server.inference_endpoints = [
             InferenceEndpoint(
-                host="inference.example",
+                host="8.8.8.8",
                 port=30000,
                 world_size=1,
                 server_info=InferenceEndpointServerInfo(
@@ -764,7 +764,7 @@ class TestInferenceEndpointRegistration:
             engine_output_addr="tcp://127.0.0.1:17003",
         )
         server._running = True
-        server.inference_endpoints = [InferenceEndpoint(host="inference.example", port=30000, world_size=1)]
+        server.inference_endpoints = [InferenceEndpoint(host="8.8.8.8", port=30000, world_size=1)]
         server.orchestrator_client = MagicMock(send_request=AsyncMock())
 
         with pytest.raises(HTTPException) as exc_info:
@@ -784,8 +784,8 @@ class TestInferenceEndpointRegistration:
     def test_add_inference_endpoint_auto_sync_uses_configured_sync_method(self, monkeypatch):
         calls: list[str] = []
         responses = {
-            "http://inference.example:30000/health": FakeResponse(),
-            "http://inference.example:30000/server_info": FakeResponse(json_data={"model_path": None, "tp_size": 1}),
+            "http://8.8.8.8:30000/health": FakeResponse(),
+            "http://8.8.8.8:30000/server_info": FakeResponse(json_data={"model_path": None, "tp_size": 1}),
         }
         monkeypatch.setattr(
             "xorl.server.api_server.inference_endpoints.httpx.AsyncClient",
@@ -823,7 +823,7 @@ class TestInferenceEndpointRegistration:
         response = asyncio.run(
             server.add_inference_endpoint(
                 AddInferenceEndpointRequest(
-                    host="inference.example",
+                    host="8.8.8.8",
                     port=30000,
                     sync_weights=True,
                     master_address="train.example",

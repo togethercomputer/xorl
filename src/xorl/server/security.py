@@ -6,6 +6,7 @@ import ipaddress
 import os
 import re
 import socket
+import stat
 from pathlib import Path
 from typing import Iterable
 
@@ -15,6 +16,8 @@ _HOSTNAME_RE = re.compile(
 )
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _OUTBOUND_ALLOWLIST_ENV = "XORL_OUTBOUND_ENDPOINT_ALLOWLIST"
+_DIAGNOSTIC_INPUT_ROOT_ENV = "XORL_DIAGNOSTIC_INPUT_ROOT"
+_MAX_DIAGNOSTIC_INPUT_BYTES = 8 * 1024 * 1024 * 1024
 
 
 def validate_identifier(value: str, *, name: str = "identifier") -> str:
@@ -57,6 +60,27 @@ def resolve_path_within(
     return resolved
 
 
+def resolve_diagnostic_input(candidate: str | os.PathLike[str]) -> Path:
+    """Resolve a regular diagnostic input below an explicitly configured root."""
+    configured_root = os.environ.get(_DIAGNOSTIC_INPUT_ROOT_ENV, "").strip()
+    if not configured_root:
+        raise ValueError(f"Diagnostic file inputs require {_DIAGNOSTIC_INPUT_ROOT_ENV}")
+    resolved = resolve_path_within(
+        configured_root,
+        candidate,
+        must_exist=True,
+        reject_symlinks=True,
+    )
+    metadata = resolved.stat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"Diagnostic input must be a regular file: {resolved}")
+    if metadata.st_mode & 0o022:
+        raise ValueError(f"Diagnostic input must not be group- or world-writable: {resolved}")
+    if metadata.st_size > _MAX_DIAGNOSTIC_INPUT_BYTES:
+        raise ValueError(f"Diagnostic input exceeds the {_MAX_DIAGNOSTIC_INPUT_BYTES}-byte limit: {resolved}")
+    return resolved
+
+
 def _allowlist_entries() -> list[str]:
     return [entry.strip() for entry in os.environ.get(_OUTBOUND_ALLOWLIST_ENV, "").split(",") if entry.strip()]
 
@@ -87,7 +111,9 @@ def validate_outbound_endpoint(
     The optional ``XORL_OUTBOUND_ENDPOINT_ALLOWLIST`` accepts exact hostnames,
     IP addresses, and CIDRs. API-supplied endpoints require an allowlist entry;
     configured transport endpoints still reject malformed, link-local,
-    multicast, unspecified, and reserved targets.
+    multicast, unspecified, and reserved targets. Hostnames are resolved once
+    and returned as a validated IP literal so the subsequent HTTP request
+    cannot be redirected by a second DNS lookup.
     """
     normalized_host = str(host).strip().rstrip(".")
     if not normalized_host or any(ch in normalized_host for ch in "/\\@?#\x00\r\n"):
@@ -103,20 +129,14 @@ def validate_outbound_endpoint(
     entries = _allowlist_entries()
     explicitly_allowed = _host_explicitly_allowed(normalized_host, entries)
     if require_allowlist and not entries and normalized_host.lower() not in {"localhost"}:
-        raise ValueError(
-            f"Endpoint host {normalized_host!r} is not allowed; configure {_OUTBOUND_ALLOWLIST_ENV}"
-        )
+        raise ValueError(f"Endpoint host {normalized_host!r} is not allowed; configure {_OUTBOUND_ALLOWLIST_ENV}")
     if require_allowlist and entries and not explicitly_allowed:
         try:
             literal_address = ipaddress.ip_address(normalized_host.strip("[]"))
         except ValueError:
-            raise ValueError(
-                f"Endpoint host {normalized_host!r} is not present in {_OUTBOUND_ALLOWLIST_ENV}"
-            ) from None
+            raise ValueError(f"Endpoint host {normalized_host!r} is not present in {_OUTBOUND_ALLOWLIST_ENV}") from None
         if not _ip_allowed(literal_address, entries):
-            raise ValueError(
-                f"Endpoint address {literal_address} is not present in {_OUTBOUND_ALLOWLIST_ENV}"
-            )
+            raise ValueError(f"Endpoint address {literal_address} is not present in {_OUTBOUND_ALLOWLIST_ENV}")
 
     try:
         literal = ipaddress.ip_address(normalized_host.strip("[]"))
@@ -134,23 +154,22 @@ def validate_outbound_endpoint(
                 if family in {socket.AF_INET, socket.AF_INET6}:
                     addresses.append(ipaddress.ip_address(sockaddr[0]))
         except socket.gaierror:
-            # Kubernetes service names may be resolvable only inside the target
-            # pod. Syntax and an explicit allowlist still constrain API input.
-            if require_allowlist and not explicitly_allowed and normalized_host.lower() != "localhost":
-                raise ValueError(f"Endpoint hostname could not be resolved safely: {normalized_host}") from None
+            raise ValueError(f"Endpoint hostname could not be resolved safely: {normalized_host}") from None
+        if not addresses:
+            raise ValueError(f"Endpoint hostname did not resolve to an IP address: {normalized_host}")
 
     for address in addresses:
         if address.is_link_local or address.is_multicast or address.is_unspecified or address.is_reserved:
             if not _ip_allowed(address, entries):
                 raise ValueError(f"Unsafe endpoint address: {address}")
-        if require_allowlist and address.is_private and not (
-            _ip_allowed(address, entries) or explicitly_allowed or address.is_loopback
+        if (
+            require_allowlist
+            and address.is_private
+            and not (_ip_allowed(address, entries) or explicitly_allowed or address.is_loopback)
         ):
-            raise ValueError(
-                f"Private endpoint address {address} requires an entry in {_OUTBOUND_ALLOWLIST_ENV}"
-            )
+            raise ValueError(f"Private endpoint address {address} requires an entry in {_OUTBOUND_ALLOWLIST_ENV}")
 
-    return normalized_host, normalized_port
+    return str(addresses[0]), normalized_port
 
 
 def build_http_endpoint_url(
