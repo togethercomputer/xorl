@@ -1,18 +1,18 @@
 # Copyright (c) 2025, Tri Dao.
 # Persistent subprocess worker for parallel autotuning pre-compilation.
-# Receives length-prefixed pickled tasks on stdin, creates FakeTensors
+# Receives length-prefixed MessagePack tasks on stdin, creates FakeTensors
 # matching the parent's tensor metadata, and compiles with COMPILE_ONLY=True.
 # Stays alive to process multiple configs (amortizes import overhead).
 
 import importlib
-import pickle
-import struct
 import sys
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from . import cache_utils
+from ._worker_protocol import recv_message, send_message
+
 
 cache_utils.COMPILE_ONLY = True
 
@@ -36,36 +36,16 @@ def _make_fake_tensor(meta):
     return torch.empty_strided(shape, stride, dtype=dtype, device="cuda")
 
 
-def _recv(stream):
-    """Read a length-prefixed pickled message. Returns None on EOF."""
-    header = stream.read(4)
-    if len(header) < 4:
-        return None
-    length = struct.unpack("<I", header)[0]
-    if length == 0:
-        return None
-    data = stream.read(length)
-    return pickle.loads(data)
-
-
-def _send(stream, msg):
-    """Write a length-prefixed pickled message."""
-    data = pickle.dumps(msg)
-    stream.write(struct.pack("<I", len(data)))
-    stream.write(data)
-    stream.flush()
-
-
 def main():
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
 
     # Signal ready
-    _send(stdout, "READY")
+    send_message(stdout, "READY")
 
     fn_cache = {}
     while True:
-        payload = _recv(stdin)
+        payload = recv_message(stdin)
         if payload is None:
             break
 
@@ -93,9 +73,9 @@ def main():
                     fake_args.append(meta)
             try:
                 fn(*fake_args, **kwargs, **config_kwargs)
-                _send(stdout, "OK")
+                send_message(stdout, "OK")
             except Exception as e:
-                _send(stdout, f"ERR:{e}")
+                send_message(stdout, f"ERR:{e}")
 
 
 if __name__ == "__main__":

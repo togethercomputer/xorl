@@ -24,6 +24,8 @@ from typing import Any, Callable, ClassVar, Dict, FrozenSet, List, Optional, Tup
 import requests
 import torch
 
+from xorl.server.security import build_http_endpoint_url, resolve_path_within
+
 from ..sparse_delta_files import prepare_delta_encoding_runtime
 from .base import TransportConfig, WeightTransportBackend
 
@@ -103,6 +105,7 @@ class SparseDeltaTransportBackend(WeightTransportBackend):
         self._output_dir = Path(
             str(be_cfg.get("output_dir") or os.environ.get("XORL_SPARSE_DELTA_OUTPUT_DIR", "/tmp/xorl-sparse-delta"))
         )
+        self._input_dir = Path(str(be_cfg.get("input_dir") or self._output_dir))
         self._keep_files = bool(be_cfg.get("keep_files", _env_bool("XORL_SPARSE_DELTA_KEEP_FILES", False)))
         self._timeout_s = float(
             be_cfg.get("timeout_s", _env_float("XORL_SPARSE_DELTA_HTTP_TIMEOUT_S", _HTTP_TIMEOUT_SECONDS))
@@ -335,10 +338,18 @@ class SparseDeltaTransportBackend(WeightTransportBackend):
         if not delta_paths:
             raise ValueError("post_packed_delta_paths requires at least one packed delta path")
 
-        paths = [Path(path) for path in delta_paths]
-        missing = [str(path) for path in paths if not path.exists()]
-        if missing:
-            raise FileNotFoundError(f"Sparse-delta packed path(s) do not exist: {missing}")
+        paths = [
+            resolve_path_within(
+                self._input_dir,
+                path,
+                must_exist=True,
+                reject_symlinks=True,
+            )
+            for path in delta_paths
+        ]
+        non_files = [str(path) for path in paths if not path.is_file()]
+        if non_files:
+            raise ValueError(f"Sparse-delta packed paths must be regular files: {non_files}")
 
         unique_paths = {str(path): path for path in paths}
         packed_bytes = sum(path.stat().st_size for path in unique_paths.values())
@@ -436,7 +447,7 @@ class SparseDeltaTransportBackend(WeightTransportBackend):
                 if be_cfg.get(key):
                     payload[key] = True
 
-            url = f"http://{endpoint.host}:{endpoint.port}/update_weights_from_sparse_delta"
+            url = build_http_endpoint_url(endpoint.host, endpoint.port, "/update_weights_from_sparse_delta")
             response = requests.post(url, json=payload, timeout=self._timeout_s)
             try:
                 response.raise_for_status()

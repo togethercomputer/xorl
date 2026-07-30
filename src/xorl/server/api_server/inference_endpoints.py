@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import socket
 from pathlib import Path
 from typing import Any, Dict, List
@@ -34,6 +33,7 @@ from xorl.server.api_server.api_types import (
 from xorl.server.api_server.utils import validate_model_id
 from xorl.server.protocol.api_orchestrator import OrchestratorRequest
 from xorl.server.protocol.operations import SyncWeightsData
+from xorl.server.security import build_http_endpoint_url, resolve_path_within, validate_outbound_endpoint
 
 
 logger = logging.getLogger(__name__)
@@ -46,7 +46,7 @@ class InferenceEndpointsMixin:
     def _endpoint_worker_url(endpoint: InferenceEndpoint) -> str:
         """Return the inference worker URL used for LoRA adapter management."""
         worker_port = endpoint.worker_port if endpoint.worker_port is not None else endpoint.port
-        return f"http://{endpoint.host}:{worker_port}"
+        return build_http_endpoint_url(endpoint.host, worker_port, "/").rstrip("/")
 
     @staticmethod
     async def _check_endpoint_health(client: httpx.AsyncClient, endpoint_url: str, endpoint_name: str) -> bool:
@@ -513,9 +513,41 @@ class InferenceEndpointsMixin:
         Returns:
             Response indicating success/failure and endpoint info
         """
-        endpoint_url = f"http://{request.host}:{request.port}"
+        try:
+            endpoint_host, endpoint_port = validate_outbound_endpoint(
+                request.host,
+                request.port,
+                require_allowlist=True,
+            )
+            worker_port = request.worker_port if request.worker_port is not None else endpoint_port
+            _, worker_port = validate_outbound_endpoint(
+                endpoint_host,
+                worker_port,
+                require_allowlist=True,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+        request = request.model_copy(
+            update={
+                "host": endpoint_host,
+                "port": endpoint_port,
+                "worker_port": worker_port if request.worker_port is not None else None,
+            }
+        )
+        endpoint_url = build_http_endpoint_url(
+            endpoint_host,
+            endpoint_port,
+            "/",
+            require_allowlist=True,
+        ).rstrip("/")
         worker_port = request.worker_port if request.worker_port is not None else request.port
-        worker_url = f"http://{request.host}:{worker_port}"
+        worker_url = build_http_endpoint_url(
+            endpoint_host,
+            worker_port,
+            "/",
+            require_allowlist=True,
+        ).rstrip("/")
 
         # Check if endpoint already exists
         for existing in self.inference_endpoints:
@@ -1035,11 +1067,35 @@ class InferenceEndpointsMixin:
             # Just the adapter name
             lora_name = model_path
 
-        # Construct absolute path - sampler_weights are stored flat under output_dir/sampler_weights/
-        absolute_path = os.path.abspath(os.path.join(self.output_dir, "sampler_weights", lora_name))
+        sampler_root = Path(self.output_dir) / "sampler_weights"
+        try:
+            resolved_path = resolve_path_within(
+                sampler_root,
+                lora_name,
+                must_exist=True,
+                reject_symlinks=True,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid sampler-weight adapter path",
+            ) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Model path does not exist",
+            ) from exc
+        try:
+            lora_name = resolved_path.relative_to(sampler_root.resolve()).as_posix()
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid sampler-weight adapter path",
+            ) from exc
+        absolute_path = str(resolved_path)
 
         # Check if path exists
-        if not os.path.exists(absolute_path):
+        if not resolved_path.exists():
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=f"Model path does not exist: {absolute_path}"
             )

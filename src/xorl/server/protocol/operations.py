@@ -7,7 +7,7 @@ and RunnerDispatchCommand.data.
 
 These types are shared by both protocol layers:
 - API→Engine (msgpack): serialized via payload_to_dict(), deserialized via payload_from_dict()
-- Executor→Worker (pickle): serialized directly as typed objects
+- Executor→Worker (MessagePack): serialized through the typed payload registry
 - Worker broadcast (Gloo): pickle internally, typed objects work identically to dicts
 """
 

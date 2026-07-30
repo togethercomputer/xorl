@@ -268,6 +268,8 @@ class _DirectMooncakeTransferEngine:
         if _base:
             try:
                 _pinned = int(_base) + int(gpu_id)
+                if not 1024 <= _pinned <= 65535:
+                    raise ValueError(f"computed port {_pinned} is outside [1024, 65535]")
                 os.environ["MC_HANDSHAKE_PORT"] = str(_pinned)
                 logging.getLogger(__name__).info(
                     "[P2P] pinning Mooncake handshake port to %d (base=%s + gpu_id=%d) "

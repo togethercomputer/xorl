@@ -13,7 +13,6 @@ import gc
 import json
 import logging
 import os
-import pickle
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -925,11 +924,12 @@ class CheckpointManager:
 
         # Phase 4: Gather shard metadata to rank 0 and write index.json
         if num_shards > 1:
-            # Serialize shard results for gathering
+            # Serialize the primitive-only shard metadata without executable
+            # object deserialization.
             if is_writer:
-                local_results_bytes = pickle.dumps(my_shard_results)
+                local_results_bytes = json.dumps(my_shard_results, separators=(",", ":")).encode("utf-8")
             else:
-                local_results_bytes = pickle.dumps([])
+                local_results_bytes = b"[]"
 
             # Gather sizes first
             local_size = torch.tensor([len(local_results_bytes)], dtype=torch.long, device="cuda")
@@ -952,7 +952,9 @@ class CheckpointManager:
                     size = size_tensor.item()
                     if size > 0:
                         result_bytes = bytes(padded[:size].cpu().tolist())
-                        results = pickle.loads(result_bytes)
+                        results = json.loads(result_bytes.decode("utf-8"))
+                        if not isinstance(results, list):
+                            raise ValueError(f"Rank {i} returned invalid shard metadata")
                         all_shard_results.extend(results)
 
                 # Sort by shard index and build weight_map

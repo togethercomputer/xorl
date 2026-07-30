@@ -27,6 +27,11 @@ from xorl.server.weight_sync.quantization_config import (
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
 
+@pytest.fixture(autouse=True)
+def _allow_test_inference_endpoint(monkeypatch):
+    monkeypatch.setenv("XORL_OUTBOUND_ENDPOINT_ALLOWLIST", "inference.example")
+
+
 class FakeResponse:
     """Minimal fake httpx response for endpoint registration tests."""
 

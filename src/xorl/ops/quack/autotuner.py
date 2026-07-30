@@ -2,21 +2,20 @@
 # Copyright (C) 2025, Tri Dao.
 from __future__ import annotations
 
+import base64
 import builtins
+import hashlib
+import inspect
+import json
 import os
 import time
-import inspect
-import base64
-import hashlib
-import json
-from pathlib import Path
 from functools import cached_property, partial
-from typing import Dict, Tuple, List, Optional, Any
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from torch import Tensor
-
 import triton
+from torch import Tensor
 
 from . import __version__
 
@@ -59,9 +58,7 @@ def default_cache_dir():
 class FileCacheManager(triton.runtime.cache.FileCacheManager):
     def __init__(self, key):
         super().__init__(key)
-        self.cache_dir = (
-            os.getenv(f"{PACKAGE_NAME.upper()}_CACHE_DIR", "").strip() or default_cache_dir()
-        )
+        self.cache_dir = os.getenv(f"{PACKAGE_NAME.upper()}_CACHE_DIR", "").strip() or default_cache_dir()
         if self.cache_dir:
             self.cache_dir = os.path.join(self.cache_dir, self.key)
             self.lock_path = os.path.join(self.cache_dir, "lock")
@@ -116,9 +113,7 @@ class Autotuner:
         self.keys = key
         self.cache: Dict[Tuple, AutotuneConfig] = {}
         self.arg_names = list(signature.parameters.keys())
-        self.cache_results = (
-            cache_results or os.getenv(f"{PACKAGE_NAME.upper()}_CACHE_AUTOTUNING", None) == "1"
-        )
+        self.cache_results = cache_results or os.getenv(f"{PACKAGE_NAME.upper()}_CACHE_AUTOTUNING", None) == "1"
 
         self.restore_value = []
         if restore_value is not None:
@@ -150,9 +145,7 @@ class Autotuner:
         if prune_configs_by:
             self.perf_model = prune_configs_by.get("perf_model", self.perf_model)
             self.configs_top_k = prune_configs_by.get("top_k", self.configs_top_k)
-            self.early_config_prune = prune_configs_by.get(
-                "early_config_prune", self.early_config_prune
-            )
+            self.early_config_prune = prune_configs_by.get("early_config_prune", self.early_config_prune)
 
         self.fn = fn
         self._do_bench = do_bench
@@ -198,23 +191,10 @@ class Autotuner:
             print(f"Pre-compiling {len(configs)} configs with {max_workers} workers")
         t0 = time.time()
 
-        import pickle
-        import struct
         import subprocess
         import sys
 
-        def _send(stream, msg):
-            data = pickle.dumps(msg)
-            stream.write(struct.pack("<I", len(data)))
-            stream.write(data)
-            stream.flush()
-
-        def _recv(stream):
-            header = stream.read(4)
-            if len(header) < 4:
-                return None
-            length = struct.unpack("<I", header)[0]
-            return pickle.loads(stream.read(length)) if length else None
+        from ._worker_protocol import recv_message, send_message
 
         # Serialize tensor metadata
         tensor_meta = []
@@ -251,7 +231,7 @@ class Autotuner:
                 stderr=subprocess.DEVNULL if not verbose else None,
                 env=worker_env,
             )
-            ready = _recv(p.stdout)
+            ready = recv_message(p.stdout)
             if ready != "READY":
                 p.kill()
                 continue
@@ -264,7 +244,7 @@ class Autotuner:
         pending = [0] * len(workers)
         for i, config in enumerate(configs):
             w = workers[i % len(workers)]
-            _send(
+            send_message(
                 w.stdin,
                 {
                     "fn_module": fn_module,
@@ -279,7 +259,7 @@ class Autotuner:
         # Collect all results
         for wi, w in enumerate(workers):
             for _ in range(pending[wi]):
-                _recv(w.stdout)
+                recv_message(w.stdout)
 
         # Shutdown workers (close stdin → worker exits)
         for w in workers:
@@ -348,7 +328,7 @@ class Autotuner:
         path = cache.get_file(file_name)
         # There's an environment variable to force cache update
         if path and not os.environ.get(f"{PACKAGE_NAME.upper()}_FORCE_CACHE_UPDATE", False):
-            str2config = {s: c for s, c in zip(config_str_list, configs)}
+            str2config = dict(zip(config_str_list, configs))
             with open(path, "r") as cached_configs:
                 timings = json.load(cached_configs)["configs_timings"]
                 timings = {str2config[config]: timing for config, timing in timings}
@@ -362,9 +342,7 @@ class Autotuner:
             json.dumps(
                 {
                     "key": tuning_key,
-                    "configs_timings": [
-                        (str(config), timings) for config, timings in self.configs_timings.items()
-                    ],
+                    "configs_timings": [(str(config), timings) for config, timings in self.configs_timings.items()],
                 }
             ),
             file_name,
@@ -395,10 +373,7 @@ class Autotuner:
                     self._precompile(*args, configs=pruned_configs, **kwargs)
                     _gpu_warmup()
                     bench_start = time.time()
-                    timings = {
-                        config: self._bench(*args, config=config, **kwargs)
-                        for config in pruned_configs
-                    }
+                    timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
                     bench_end = time.time()
                     if os.getenv(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1":
                         for config, time_ in timings.items():
@@ -416,10 +391,7 @@ class Autotuner:
         else:
             config = self.configs[0]
         self.best_config = config
-        if (
-            os.getenv(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1"
-            and not used_cached_result
-        ):
+        if os.getenv(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1" and not used_cached_result:
             print(
                 f"{PACKAGE_NAME} autotuning for function {self.fn.__name__} finished after "
                 f"{self.bench_time:.2f}s; best config selected: {self.best_config};"
@@ -442,9 +414,7 @@ class Autotuner:
                 top_k = int(len(self.configs) * top_k)
             elif not isinstance(top_k, int):
                 # Slice index must be an integer
-                raise TypeError(
-                    "Error while pruning configs, top_k must be either 1) a float <= 1.0 or 2) an int"
-                )
+                raise TypeError("Error while pruning configs, top_k must be either 1) a float <= 1.0 or 2) an int")
 
             if len(pruned_configs) > top_k:
                 est_timing = {
@@ -491,9 +461,7 @@ class AutotuneConfig:
         return self_tuple == other_tuple
 
 
-def autotune(
-    configs, key=None, prune_configs_by=None, restore_value=None, do_bench=None, cache_results=True
-):
+def autotune(configs, key=None, prune_configs_by=None, restore_value=None, do_bench=None, cache_results=True):
     f"""
     Decorator for auto-tuning a function function.
 

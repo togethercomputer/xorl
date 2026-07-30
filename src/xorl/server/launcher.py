@@ -59,6 +59,14 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
+def _validated_subprocess_value(name: str, value: Any) -> str:
+    """Return one inert argv value, rejecting control-character injection."""
+    text = str(value)
+    if not text or any(ch in text for ch in "\x00\r\n"):
+        raise ValueError(f"Invalid {name} for worker subprocess")
+    return text
+
+
 class RetrieveFutureFilter(logging.Filter):
     """Filter out noisy retrieve_future polling requests from access logs.
 
@@ -1139,18 +1147,25 @@ class Launcher:
         # mounted worktrees the torchrun console script can have a host-path
         # shebang that does not exist inside the container, while
         # ``python -m torch.distributed.run`` remains relocatable.
+        nnodes_arg = _validated_subprocess_value("nnodes", self.nnodes)
+        nproc_arg = _validated_subprocess_value("nproc_per_node", self.nproc_per_node)
+        master_addr_arg = _validated_subprocess_value("master_addr", self.master_addr)
+        master_port_arg = _validated_subprocess_value("master_port", self.master_port)
+        worker_address_arg = _validated_subprocess_value("worker_address", self.worker_address)
+        config_path_arg = _validated_subprocess_value("config_path", Path(self.config_path).resolve())
+
         cmd = [
             sys.executable,
             "-m",
             "torch.distributed.run",
-            f"--nnodes={self.nnodes}",
-            f"--nproc-per-node={self.nproc_per_node}",
-            f"--master-addr={self.master_addr}",
-            f"--master-port={self.master_port}",
+            f"--nnodes={nnodes_arg}",
+            f"--nproc-per-node={nproc_arg}",
+            f"--master-addr={master_addr_arg}",
+            f"--master-port={master_port_arg}",
             "-m",
             "xorl.server.runner.runner_dispatcher",
-            self.config_path,
-            f"--worker.bind_address={self.worker_address}",
+            config_path_arg,
+            f"--worker.bind_address={worker_address_arg}",
         ]
         if rdzv_conf := os.environ.get("XORL_TORCHRUN_RDZV_CONF"):
             # Keep the head's rendezvous config identical to the sibling-pod
@@ -1159,6 +1174,7 @@ class Launcher:
             # after --master-port (index 6) and before the `-m` (index 7) — so the
             # flag lands as `... --master-port=P --rdzv-conf=X -m runner_dispatcher`,
             # not wedged between `-m` and the module name.
+            rdzv_conf = _validated_subprocess_value("rdzv_conf", rdzv_conf)
             cmd[7:7] = [f"--rdzv-conf={rdzv_conf}"]
             logger.info(f"  RDZV Conf:   {rdzv_conf}")
 
@@ -1192,9 +1208,11 @@ class Launcher:
                     logger.info(f"Auto-forwarding --{key}={value} to worker subprocess")
 
             for key, value in forwarded.items():
+                key = _validated_subprocess_value("server override key", key)
                 if isinstance(value, bool):
                     cmd.append(f"--{key}={str(value).lower()}")
                 else:
+                    value = _validated_subprocess_value(f"server override {key}", value)
                     cmd.append(f"--{key}={value}")
 
         logger.info(f"Running: {' '.join(cmd)}")

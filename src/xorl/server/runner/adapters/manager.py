@@ -19,6 +19,7 @@ import os
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -31,6 +32,7 @@ from xorl.lora.utils import (
     get_lora_tensor_shard_specs,
 )
 from xorl.optim import build_optimizer
+from xorl.server.security import resolve_path_within, validate_identifier
 from xorl.server.session_spec import (
     load_session_spec_from_checkpoint,
     session_optimizer_build_kwargs,
@@ -591,6 +593,7 @@ class LoRAAdapterManager:
             initialize_fresh: If True, initialize with fresh random weights.
                             If False, use the current model's LoRA weights.
         """
+        model_id = validate_identifier(model_id, name="model_id")
         effective_lr = float(lr) if lr is not None else None
         if session_spec is None:
             if effective_lr is None:
@@ -775,6 +778,7 @@ class LoRAAdapterManager:
         """
         if model_id not in self.adapters:
             raise KeyError(f"Adapter for model_id={model_id} not registered")
+        model_id = validate_identifier(model_id, name="model_id")
 
         state = self.adapters[model_id]
         grad_count = 0
@@ -999,6 +1003,7 @@ class LoRAAdapterManager:
         Returns:
             Dict with path, model_id, step, and save_time
         """
+        model_id = validate_identifier(model_id, name="model_id")
         if model_id not in self.adapters:
             raise KeyError(f"Adapter for model_id={model_id} not registered")
 
@@ -1006,7 +1011,12 @@ class LoRAAdapterManager:
 
         # Use default path if not provided
         if path is None:
-            path = os.path.join(self.checkpoint_dir, model_id)
+            path = str(resolve_path_within(self.checkpoint_dir, model_id))
+        else:
+            explicit_path = Path(path).expanduser()
+            if explicit_path.is_symlink():
+                raise ValueError(f"Adapter checkpoint path cannot be a symlink: {explicit_path}")
+            path = str(explicit_path.resolve())
 
         # Create directory
         os.makedirs(path, exist_ok=True)
@@ -1116,8 +1126,13 @@ class LoRAAdapterManager:
         Returns:
             Dict with path, model_id, step, and load_time
         """
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Checkpoint path does not exist: {path}")
+        model_id = validate_identifier(model_id, name="model_id")
+        checkpoint_path = Path(path).expanduser()
+        if checkpoint_path.is_symlink():
+            raise ValueError(f"Adapter checkpoint path cannot be a symlink: {checkpoint_path}")
+        path = str(checkpoint_path.resolve(strict=True))
+        if not Path(path).is_dir():
+            raise ValueError(f"Adapter checkpoint path must be a directory: {path}")
 
         start_time = time.time()
 

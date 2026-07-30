@@ -13,11 +13,12 @@ Environment variables:
     CUTE_DSL_KEEP_CUBIN    - Set to 1 to save compiled cubin files
 """
 
-import os
-import sys
-import re
 import ctypes
+import os
+import re
+import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import cutlass
@@ -37,6 +38,22 @@ _user_wanted_ptx = False  # True if user originally set CUTE_DSL_KEEP_PTX=1
 def _log(msg: str):
     if VERBOSE:
         print(f"[ptxas] {msg}", file=sys.stderr)
+
+
+def _validated_ptxas_path() -> str:
+    """Resolve the operator-selected compiler to a trusted system executable."""
+    if CUTE_DSL_PTXAS_PATH is None:
+        raise RuntimeError("CUTE_DSL_PTXAS_PATH is not configured")
+    candidate = Path(CUTE_DSL_PTXAS_PATH).expanduser()
+    if not candidate.is_absolute():
+        raise RuntimeError("CUTE_DSL_PTXAS_PATH must be absolute")
+    resolved = candidate.resolve(strict=True)
+    metadata = resolved.stat()
+    if not stat.S_ISREG(metadata.st_mode) or not os.access(resolved, os.X_OK):
+        raise RuntimeError(f"ptxas is not an executable regular file: {resolved}")
+    if metadata.st_uid != 0 or metadata.st_mode & 0o022:
+        raise RuntimeError(f"ptxas must be root-owned and not writable by group or others: {resolved}")
+    return str(resolved)
 
 
 def _read_ptx(ptx_path: Path) -> str | None:
@@ -64,9 +81,7 @@ def _get_ptx(compiled_func) -> tuple[str, Path] | None:
     dump_dir = Path(os.environ.get("CUTE_DSL_DUMP_DIR", Path.cwd()))
     dump_dir.mkdir(parents=True, exist_ok=True)
 
-    ptx_paths = sorted(
-        dump_dir.rglob("*.ptx"), key=lambda path: path.stat().st_mtime_ns, reverse=True
-    )
+    ptx_paths = sorted(dump_dir.rglob("*.ptx"), key=lambda path: path.stat().st_mtime_ns, reverse=True)
     _log(f"Searching dumped PTX for {func_name} in {dump_dir}")
     _log(f"Found {len(ptx_paths)} PTX candidate files in {dump_dir}")
 
@@ -115,9 +130,9 @@ def _compile_ptx(ptx_path: Path, ptx_content: str) -> bytes:
     # Compile
     cubin_tmp = ptx_path.with_suffix(".cubin.tmp")
     try:
-        assert CUTE_DSL_PTXAS_PATH is not None
+        ptxas_path = _validated_ptxas_path()
         result = subprocess.run(
-            [CUTE_DSL_PTXAS_PATH, f"-arch={arch}", "-O3", "-o", str(cubin_tmp), str(ptx_path)],
+            [ptxas_path, f"-arch={arch}", "-O3", "-o", str(cubin_tmp), str(ptx_path)],
             capture_output=True,
             text=True,
         )
@@ -195,9 +210,7 @@ def _patched_create_tvm_ffi_function(self):
     # Ensure CUDA library is loaded before TVM FFI creation
     if getattr(self, "_ptxas_cuda_library", None) is None:
         self._ptxas_cuda_library = self._load_cuda_library()
-        _log(
-            f"Loaded {len(self._ptxas_cuda_library)} CUDA libraries before creating TVM FFI function"
-        )
+        _log(f"Loaded {len(self._ptxas_cuda_library)} CUDA libraries before creating TVM FFI function")
     return _original_create_tvm_ffi_function(self)
 
 
@@ -206,13 +219,10 @@ def patch():
     global _original_load_cuda_library, _original_create_tvm_ffi_function, _user_wanted_ptx
 
     assert CUTE_DSL_PTXAS_PATH is not None
-    if not os.path.isfile(CUTE_DSL_PTXAS_PATH) or not os.access(CUTE_DSL_PTXAS_PATH, os.X_OK):
-        raise RuntimeError(f"ptxas not found: {CUTE_DSL_PTXAS_PATH}")
+    _validated_ptxas_path()
 
     _user_wanted_ptx = os.environ.get("CUTE_DSL_KEEP_PTX", "0") == "1"
-    assert os.environ.get("CUTE_DSL_KEEP_PTX", "0") == "1", (
-        "Require CUTE_DSL_KEEP_PTX=1 to use system's ptxas"
-    )
+    assert os.environ.get("CUTE_DSL_KEEP_PTX", "0") == "1", "Require CUTE_DSL_KEEP_PTX=1 to use system's ptxas"
 
     patched = False
     cuda_jit_function_cls = cutlass.cutlass_dsl.cuda_jit_executor.CudaDialectJitCompiledFunction
@@ -223,10 +233,7 @@ def patch():
 
     from cutlass.cutlass_dsl.tvm_ffi_provider import TVMFFIJitCompiledFunctionBase
 
-    if (
-        TVMFFIJitCompiledFunctionBase._create_tvm_ffi_function
-        is not _patched_create_tvm_ffi_function
-    ):
+    if TVMFFIJitCompiledFunctionBase._create_tvm_ffi_function is not _patched_create_tvm_ffi_function:
         _original_create_tvm_ffi_function = TVMFFIJitCompiledFunctionBase._create_tvm_ffi_function
         TVMFFIJitCompiledFunctionBase._create_tvm_ffi_function = _patched_create_tvm_ffi_function
         patched = True

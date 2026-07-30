@@ -32,6 +32,8 @@ from torch.distributed.distributed_c10d import (
     default_pg_timeout,
 )
 
+from xorl.server.security import build_http_endpoint_url
+
 
 logger = logging.getLogger(__name__)
 
@@ -531,7 +533,7 @@ class NCCLWeightSynchronizer:
         session = _get_http_session()
 
         def init_single(rank_offset: int, endpoint: EndpointInfo) -> Dict[str, Any]:
-            url = f"http://{endpoint.host}:{endpoint.port}/init_weights_update_group"
+            url = build_http_endpoint_url(endpoint.host, endpoint.port, "/init_weights_update_group")
             payload = {
                 "master_address": self.master_address,
                 "master_port": self._active_master_port,
@@ -587,7 +589,7 @@ class NCCLWeightSynchronizer:
         session = _get_http_session()
 
         def destroy_single(endpoint: EndpointInfo) -> Dict[str, Any]:
-            url = f"http://{endpoint.host}:{endpoint.port}/destroy_weights_update_group"
+            url = build_http_endpoint_url(endpoint.host, endpoint.port, "/destroy_weights_update_group")
             payload = {"group_name": self.group_name}
             try:
                 response = session.post(url, json=payload, timeout=30)
@@ -803,7 +805,7 @@ class NCCLWeightSynchronizer:
             }
             if receiver_load_format is not None:
                 payload["load_format"] = receiver_load_format
-            url = f"http://{endpoint.host}:{endpoint.port}/prepare_weights_update"
+            url = build_http_endpoint_url(endpoint.host, endpoint.port, "/prepare_weights_update")
             try:
                 response = session.post(url, json=payload, timeout=600)
                 result = response.json()
@@ -835,7 +837,7 @@ class NCCLWeightSynchronizer:
                     payload[key] = True
             if receiver_load_format is not None:
                 payload["load_format"] = receiver_load_format
-            url = f"http://{endpoint.host}:{endpoint.port}/complete_weights_update"
+            url = build_http_endpoint_url(endpoint.host, endpoint.port, "/complete_weights_update")
             try:
                 response = session.post(url, json=payload, timeout=600)
                 result = response.json()
@@ -862,11 +864,8 @@ class NCCLWeightSynchronizer:
                 }
                 if receiver_load_format is not None:
                     payload["load_format"] = receiver_load_format
-                response = session.post(
-                    f"http://{endpoint.host}:{endpoint.port}/update_weights_from_distributed",
-                    json=payload,
-                    timeout=600,
-                )
+                url = build_http_endpoint_url(endpoint.host, endpoint.port, "/update_weights_from_distributed")
+                response = session.post(url, json=payload, timeout=600)
                 result = response.json()
                 update_results.append(_endpoint_update_result(endpoint, result))
                 if not result.get("success"):

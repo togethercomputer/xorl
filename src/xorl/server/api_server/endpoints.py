@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -59,6 +60,7 @@ from xorl.server.api_server.api_types import (
 from xorl.server.api_server.utils import validate_model_id
 from xorl.server.protocol.api_orchestrator import OrchestratorRequest
 from xorl.server.protocol.operations import KillSessionData, RegisterSessionData
+from xorl.server.security import resolve_path_within, validate_identifier
 from xorl.server.session_spec import (
     load_session_spec_from_checkpoint,
     normalize_session_spec,
@@ -467,35 +469,43 @@ async def weights_info_endpoint(request: WeightsInfoRequest, server=Depends(requ
         )
     checkpoint_model_id = validate_model_id(checkpoint_model_id)
 
-    weights_dir = os.path.abspath(os.path.join(server.output_dir, "weights", checkpoint_model_id))
-    checkpoint_path = os.path.abspath(os.path.join(weights_dir, checkpoint_name))
     try:
-        if os.path.commonpath([checkpoint_path, weights_dir]) != weights_dir:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid checkpoint path in xorl_path: {xorl_path}",
-            )
+        checkpoint_name = validate_identifier(checkpoint_name, name="checkpoint_name")
+        weights_dir = Path(server.output_dir) / "weights" / checkpoint_model_id
+        checkpoint_path = resolve_path_within(
+            weights_dir,
+            checkpoint_name,
+            must_exist=True,
+            reject_symlinks=True,
+        )
     except ValueError:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid checkpoint path in xorl_path: {xorl_path}",
-        )
-    if not os.path.exists(checkpoint_path):
+        ) from None
+    except FileNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Checkpoint not found: {xorl_path}",
-        )
+        ) from None
+    try:
+        checkpoint_path.relative_to(weights_dir.resolve())
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid checkpoint path in xorl_path: {xorl_path}"
+        ) from None
 
     try:
         session_spec = load_session_spec_from_checkpoint(
-            checkpoint_path,
+            str(checkpoint_path),
             fallback_base_model=server.base_model,
             fallback_session_spec=server.model_configs.get(checkpoint_model_id) or server.default_session_spec,
         )
     except Exception as e:
+        logger.exception("Failed to read checkpoint metadata for %s", xorl_path)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to read checkpoint metadata from {xorl_path}: {e}",
+            detail="Failed to read checkpoint metadata; see server logs for the request ID",
         ) from e
 
     return WeightsInfoResponse(**session_spec)

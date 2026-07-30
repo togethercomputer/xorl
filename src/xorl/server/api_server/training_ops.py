@@ -399,8 +399,9 @@ class TrainingOpsMixin:
         except Exception as e:
             logger.error(f"Forward-backward failed: {e}", exc_info=True)
             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Forward-backward failed: {e}"
-            )
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Forward-backward failed; see server logs for the request ID",
+            ) from e
 
     async def forward(self, request: ForwardRequest) -> ForwardResponse:
         """
@@ -489,7 +490,10 @@ class TrainingOpsMixin:
             raise
         except Exception as e:
             logger.error(f"Forward failed: {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Forward failed: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Forward failed; see server logs for the request ID",
+            ) from e
 
     async def optim_step(self, request: OptimStepRequest) -> OptimStepResponse:
         """
@@ -581,7 +585,10 @@ class TrainingOpsMixin:
             raise
         except Exception as e:
             logger.error(f"Optimizer step failed: {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Optimizer step failed: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Optimizer step failed; see server logs for the request ID",
+            ) from e
 
     def _zorl_candidate_uri(self, model_id: str, candidate_path: str) -> tuple[str, str]:
         """Convert a worker-exported candidate path into a public sampler URI."""
@@ -731,8 +738,8 @@ class TrainingOpsMixin:
             logger.error(f"Start ZORL generation failed: {e}", exc_info=True)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Start ZORL generation failed: {e}",
-            )
+                detail="Start ZORL generation failed; see server logs for the request ID",
+            ) from e
 
     async def apply_zorl_rewards(self, request: ZORLApplyRewardsRequest) -> ZORLApplyRewardsResponse:
         """Apply externally aggregated ZORL rewards to the parent adapter."""
@@ -768,8 +775,8 @@ class TrainingOpsMixin:
             logger.error(f"Apply ZORL rewards failed: {e}", exc_info=True)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Apply ZORL rewards failed: {e}",
-            )
+                detail="Apply ZORL rewards failed; see server logs for the request ID",
+            ) from e
 
     async def _sync_inference_weights_after_zorl_apply(self, request: ZORLApplyRewardsRequest) -> Dict[str, Any]:
         """Push post-apply weights to the registered inference endpoints.
@@ -836,5 +843,5 @@ class TrainingOpsMixin:
             logger.error(f"Abort ZORL generation failed: {e}", exc_info=True)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Abort ZORL generation failed: {e}",
-            )
+                detail="Abort ZORL generation failed; see server logs for the request ID",
+            ) from e

@@ -2082,10 +2082,7 @@ class ModelRunner:
         if not override_path.exists():
             raise FileNotFoundError(f"XORL_DIAGNOSTIC_LAYER_OUTPUT_OVERRIDE_PATH does not exist: {override_path}")
 
-        try:
-            payload = torch.load(override_path, map_location="cpu", weights_only=False)
-        except TypeError:
-            payload = torch.load(override_path, map_location="cpu")
+        payload = torch.load(override_path, map_location="cpu", weights_only=True)
 
         if not isinstance(payload, dict):
             raise ValueError("Diagnostic layer-output override payload must be a dict")
@@ -2155,10 +2152,7 @@ class ModelRunner:
         if not override_path.exists():
             raise FileNotFoundError(f"XORL_DIAGNOSTIC_LAYER_OUTPUT_OVERRIDE_PATH does not exist: {override_path}")
 
-        try:
-            payload = torch.load(override_path, map_location="cpu", weights_only=False)
-        except TypeError:
-            payload = torch.load(override_path, map_location="cpu")
+        payload = torch.load(override_path, map_location="cpu", weights_only=True)
 
         if not isinstance(payload, dict):
             raise ValueError("Diagnostic component override payload must be a dict")
@@ -2591,10 +2585,7 @@ class ModelRunner:
                 else:
                     setattr(self.obj, self.name, self.value)
 
-        try:
-            reference = torch.load(reference_path, map_location="cpu", weights_only=True)
-        except TypeError:
-            reference = torch.load(reference_path, map_location="cpu")
+        reference = torch.load(reference_path, map_location="cpu", weights_only=True)
         if not isinstance(reference, dict):
             raise TypeError(f"diagnostic_moe_routing_reference_path must contain a dict, got {type(reference)}")
 

@@ -9,6 +9,7 @@ It intentionally does not inspect trainer modules or FSDP state.
 from __future__ import annotations
 
 import importlib
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,6 +72,21 @@ def prepare_delta_encoding_runtime(
 
     if delta_encoding_path:
         resolved = str(Path(delta_encoding_path).expanduser().resolve())
+        trusted_root = os.environ.get("XORL_TRUSTED_DELTA_ENCODING_ROOT", "").strip()
+        if not trusted_root:
+            raise ValueError("delta_encoding_path requires XORL_TRUSTED_DELTA_ENCODING_ROOT to be set by the operator")
+        trusted_resolved = str(Path(trusted_root).expanduser().resolve(strict=True))
+        if resolved != trusted_resolved:
+            raise ValueError("delta_encoding_path does not match XORL_TRUSTED_DELTA_ENCODING_ROOT")
+        root_path = Path(resolved)
+        root_stat = root_path.stat()
+        if not root_path.is_dir() or root_path.is_symlink():
+            raise ValueError("Trusted delta-encoding root must be a real directory")
+        if root_stat.st_uid != os.getuid() or root_stat.st_mode & 0o022:
+            raise ValueError("Trusted delta-encoding root must be owned by the current user and not writable by others")
+        package_path = root_path / "delta_encoding"
+        if not package_path.is_dir() or package_path.is_symlink():
+            raise ValueError("Trusted delta-encoding root does not contain a safe delta_encoding package")
         if resolved not in sys.path:
             sys.path.insert(0, resolved)
     if not use_native_extension:

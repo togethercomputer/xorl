@@ -15,16 +15,16 @@ import functools
 import hashlib
 import os
 import pickle
+import stat
 import sys
-import tempfile
 import time
 from collections import namedtuple
-from getpass import getuser
 from pathlib import Path
 
 import cutlass
 import cutlass.cute as cute
 import tvm_ffi
+
 
 CACHE_ENABLED: bool = os.getenv("QUACK_CACHE_ENABLED", "1") == "1"
 CACHE_DIR: str | None = os.getenv("QUACK_CACHE_DIR", None)
@@ -45,11 +45,34 @@ def _noop_kernel(*args, **kwargs):
 
 def get_cache_path() -> Path:
     if CACHE_DIR is not None:
-        cache_dir = Path(CACHE_DIR)
+        cache_dir = Path(CACHE_DIR).expanduser()
     else:
-        cache_dir = Path(tempfile.gettempdir()) / getuser() / "quack_cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_home = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")).expanduser()
+        cache_dir = cache_home / "xorl" / "quack"
+    if cache_dir.is_symlink():
+        raise RuntimeError(f"Quack cache directory cannot be a symlink: {cache_dir}")
+    cache_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+    cache_dir = cache_dir.resolve()
+    cache_stat = cache_dir.stat()
+    if cache_stat.st_uid != os.getuid():
+        raise RuntimeError(f"Quack cache directory is not owned by the current user: {cache_dir}")
+    if cache_stat.st_mode & 0o077:
+        cache_dir.chmod(0o700)
     return cache_dir
+
+
+def _trusted_cache_object(path: Path) -> bool:
+    """Return whether a cached object is a private, regular, owned file."""
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and not path.is_symlink()
+        and metadata.st_uid == os.getuid()
+        and metadata.st_mode & 0o022 == 0
+    )
 
 
 def _hash_source_dir(h, root: Path) -> None:
@@ -96,8 +119,9 @@ class FileLock:
 
     def __enter__(self) -> "FileLock":
         flags = os.O_WRONLY | os.O_CREAT if self.exclusive else os.O_RDONLY | os.O_CREAT
+        flags |= getattr(os, "O_NOFOLLOW", 0)
         lock_type = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
-        self._fd = os.open(str(self.lock_path), flags)
+        self._fd = os.open(str(self.lock_path), flags, 0o600)
         deadline = time.monotonic() + self.timeout
         while time.monotonic() < deadline:
             try:
@@ -151,7 +175,7 @@ def jit_cache(fn):
             lock_path = cache_path / f"{sha}.lock"
             try:
                 with FileLock(lock_path, exclusive=False, timeout=LOCK_TIMEOUT):
-                    if o_path.exists():
+                    if _trusted_cache_object(o_path):
                         m = cute.runtime.load_module(str(o_path), enable_tvm_ffi=True)
                         loaded = m[EXPORT_FUNC_NAME]
                         cache[cache_key] = loaded
@@ -175,6 +199,10 @@ def jit_cache(fn):
                             object_file_path=str(o_path),
                             function_name=EXPORT_FUNC_NAME,
                         )
+                        o_path.chmod(0o600)
+                        if not _trusted_cache_object(o_path):
+                            o_path.unlink(missing_ok=True)
+                            raise RuntimeError(f"Refusing unsafe Quack cache object: {o_path}")
             except Exception as e:
                 print(f"quack cache: export failed for key {sha}: {e}")
 

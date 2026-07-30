@@ -103,6 +103,18 @@ def test_serialization_roundtrip_all_types():
         assert deserialized.message_id == original_msg.message_id
 
 
+def test_deserializer_rejects_pickle_frames_and_roundtrips_tensors():
+    with pytest.raises((ValueError, TypeError)):
+        deserialize_message(b"\x80\x04N.")
+
+    original = RunnerResponse(
+        request_id="tensor-response",
+        result={"values": pytest.importorskip("torch").tensor([[1, 2], [3, 4]])},
+    )
+    restored = deserialize_message(serialize_message(original))
+    assert restored.result["values"].equal(original.result["values"])
+
+
 def test_json_conversion():
     """Test JSON serialization and deserialization of messages."""
     # to_json
