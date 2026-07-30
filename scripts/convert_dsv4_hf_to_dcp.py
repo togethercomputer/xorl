@@ -52,7 +52,7 @@ def _say(msg: str) -> None:
     """Unbuffered progress print. The xorl logger can drop messages depending
     on how the root logger is configured at script start; ``print`` with
     ``flush=True`` is the dependable way to show progress in
-    ``kubectl logs``."""
+    ``pod logs``."""
     print(msg, flush=True)
 
 

@@ -84,8 +84,7 @@ class FusedRMSNormGated(nn.Module):
             # contracted; anything else voids the bitwise claim, so fail loud.
             if residual is not None or prenorm or self.bias is not None or self.weight is None:
                 raise NotImplementedError(
-                    "XORL_BI_GDN gated-RMSNorm contract covers the GDN o_norm config only "
-                    "(no residual/prenorm/bias)."
+                    "XORL_BI_GDN gated-RMSNorm contract covers the GDN o_norm config only (no residual/prenorm/bias)."
                 )
             return bi_rms_norm_gated(x, self.weight, g, self.eps, activation=self.activation)
         return rms_norm_gated(
