@@ -81,6 +81,15 @@ def test_lora_dtype_policy_matches_intended_training_modes():
             enable_lora=False,
             enable_qlora=False,
             enable_mixed_precision=True,
+            skip_param_upcast=True,
+        )
+        == "bfloat16"
+    )
+    assert (
+        resolve_training_model_dtype(
+            enable_lora=False,
+            enable_qlora=False,
+            enable_mixed_precision=True,
         )
         == "float32"
     )
@@ -95,6 +104,14 @@ def test_lora_dtype_policy_matches_intended_training_modes():
         should_skip_generic_param_upcast(
             enable_lora=False,
             enable_qlora=True,
+        )
+        is True
+    )
+    assert (
+        should_skip_generic_param_upcast(
+            enable_lora=False,
+            enable_qlora=False,
+            skip_param_upcast=True,
         )
         is True
     )

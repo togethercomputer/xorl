@@ -5,6 +5,7 @@ so that every feature (QLoRA, TP, DeepEP, …) is supported in both paths
 without reimplementation.
 """
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Set
 
@@ -22,6 +23,7 @@ from xorl.models.transformers.deepseek_v3.support import (
     freeze_deepseek_v3_router_parameters,
     validate_deepseek_v3_training_mode,
 )
+from xorl.models.transformers.glm5.support import validate_glm5_training_mode
 from xorl.qlora import (
     detect_prequantized_block_fp8,
     detect_prequantized_nvfp4,
@@ -61,14 +63,16 @@ def resolve_training_model_dtype(
     enable_lora: bool,
     enable_qlora: bool,
     enable_mixed_precision: bool,
+    skip_param_upcast: bool = False,
 ) -> str:
     """Return the foundation-model dtype for the requested training mode.
 
     Full-weight mixed-precision training keeps parameters in fp32 before FSDP
-    wrapping. LoRA/QLoRA instead keep the frozen base weights in bf16 and only
-    upcast the trainable adapter weights to fp32.
+    wrapping unless ``skip_param_upcast`` is set. LoRA/QLoRA and skip-upcast
+    full-weight runs keep checkpoint-native bf16 weights and only LoRA/QLoRA
+    upcasts trainable adapter weights to fp32.
     """
-    if (enable_lora or enable_qlora) and enable_mixed_precision:
+    if (enable_lora or enable_qlora or skip_param_upcast) and enable_mixed_precision:
         return "bfloat16"
     if enable_mixed_precision:
         return "float32"
@@ -79,9 +83,10 @@ def should_skip_generic_param_upcast(
     *,
     enable_lora: bool,
     enable_qlora: bool,
+    skip_param_upcast: bool = False,
 ) -> bool:
     """Whether the generic full-model fp32 upcast should be skipped."""
-    return enable_lora or enable_qlora
+    return enable_lora or enable_qlora or skip_param_upcast
 
 
 def maybe_upcast_trainable_adapter_params(
@@ -109,12 +114,14 @@ def build_training_model(
     torch_dtype: str = "bfloat16",
     attn_implementation: str = "flash_attention_3",
     moe_implementation: Optional[str] = None,
+    moe_routing_weights_before_down: bool | str = "auto",
     ep_dispatch: str = "alltoall",
     train_router: bool = False,
     record_routing_weights: bool = True,
     deepep_buffer_size_gb: float = 2.0,
     deepep_num_sms: int = 20,
     deepep_async_combine: bool = False,
+    alltoall_combine_hidden_chunk_size: int = 0,
     init_device: str = "meta",
     merge_qkv: bool = True,
     # --- LoRA ---
@@ -132,14 +139,50 @@ def build_training_model(
     enable_full_shard: bool = True,
     enable_mixed_precision: bool = True,
     enable_gradient_checkpointing: bool = True,
+    gradient_checkpointing_method: Optional[str] = None,
     enable_compile: bool = False,
+    compile_dynamic_shapes: bool = False,
     basic_modules: Optional[List[str]] = None,
     enable_reentrant: bool = False,
     enable_forward_prefetch: bool = True,
+    enable_backward_prefetch: Optional[bool] = None,
     load_weights_mode: str = "grouped",
     reshard_after_forward: Optional[bool] = None,
     moe_grad_reduce_mode: str = "reduce_scatter",
+    fsdp_sharded_lm_head_loss: bool = False,
+    fsdp_reduce_dtype: str = "fp32",
+    skip_param_upcast: bool = False,
+    enable_fp8_training: bool = False,
+    enable_qarl: bool = False,
+    qarl_quant_cfg: Optional[dict[str, Any] | str] = None,
+    qarl_calib_data: Optional[str] = None,
+    qarl_calib_size: int = 0,
+    qarl_quant_sequence_length: Optional[int] = None,
+    qarl_sync_format: str = "fp8",
+    qarl_target_modules: Optional[List[str]] = None,
+    qarl_exclude_modules: Optional[List[str]] = None,
+    fp8_training_num_first_layers_bf16: int = 0,
+    fp8_training_num_last_layers_bf16: int = 0,
+    fp8_training_allow_blackwell: bool = False,
+    fp8_training_blackwell_validation_artifact: Optional[str] = None,
+    fp8_training_block_size: int = 128,
+    fp8_training_backward: str = "fp8",
+    fp8_training_smoothquant_alpha: Optional[float] = None,
+    fp8_training_lm_head_smoothquant_alpha: Optional[float] = None,
+    fp8_training_activation_amax_scale: float = 1.0,
+    fp8_training_weight_amax_scale: float = 1.0,
+    fp8_training_correction_mode: str = "none",
+    fp8_training_module_overrides: Optional[dict[str, dict[str, Any]]] = None,
+    fp8_training_moe_grouped_backend: str = "triton_grouped",
+    fp8_training_target_modules: Optional[List[str]] = None,
+    fp8_training_exclude_modules: Optional[List[str]] = None,
+    fp8_training_allow_bf16_fallback: bool = False,
     pp_schedule: Optional[str] = None,
+    pp_virtual_stages: int = 1,
+    pp_input_weight: int = 1,
+    pp_output_weight: int = 1,
+    pp_num_layers_in_first_stage: Optional[int] = None,
+    pp_num_layers_in_last_stage: Optional[int] = None,
     # --- Training flags ---
     freeze_router: bool = False,
     # --- SGLang numerical alignment ---
@@ -149,6 +192,8 @@ def build_training_model(
     activation_native: bool = False,
     rope_native: bool = False,
     attention_cast_bf16: bool = False,
+    sparse_mla_enabled: bool = False,
+    sparse_mla_backend: str = "auto",
     flash_attention_deterministic: bool = False,
 ) -> TrainingModelResult:
     """Build, inject LoRA/QLoRA, and parallelize a training model.
@@ -160,7 +205,7 @@ def build_training_model(
         2. Unfuse QKV (for TP)
         3. QLoRA or LoRA injection
         4. LoRA + mixed-precision: upcast trainable params to fp32
-        5. Save optimizer pre-hook
+        5. XORL_BI_TRUNK_LINEAR trunk wrap (pre-FSDP2) + save optimizer pre-hook
         6. build_parallelize_model()
         7. Deferred QLoRA quantization
         8. Freeze base params (LoRA/QLoRA) + optional router freeze
@@ -179,18 +224,22 @@ def build_training_model(
         torch_dtype=torch_dtype,
         attn_implementation=attn_implementation,
         moe_implementation=moe_implementation,
+        moe_routing_weights_before_down=moe_routing_weights_before_down,
         ep_dispatch=ep_dispatch,
         train_router=train_router,
         record_routing_weights=record_routing_weights,
         deepep_buffer_size_gb=deepep_buffer_size_gb,
         deepep_num_sms=deepep_num_sms,
         deepep_async_combine=deepep_async_combine,
+        alltoall_combine_hidden_chunk_size=alltoall_combine_hidden_chunk_size,
         router_fp32=router_fp32,
         lm_head_fp32=lm_head_fp32,
         rmsnorm_mode=rmsnorm_mode,
         activation_native=activation_native,
         rope_native=rope_native,
         attention_cast_bf16=attention_cast_bf16,
+        sparse_mla_enabled=sparse_mla_enabled,
+        sparse_mla_backend=sparse_mla_backend,
         flash_attention_deterministic=flash_attention_deterministic,
         init_device=init_device,
     )
@@ -208,6 +257,12 @@ def build_training_model(
         freeze_router=freeze_router,
         merge_qkv=merge_qkv,
     )
+    validate_glm5_training_mode(
+        model_config,
+        enable_qlora=enable_qlora,
+        freeze_router=freeze_router,
+        merge_qkv=merge_qkv,
+    )
     helper.print_device_mem_info("VRAM usage after building model")
 
     # ------------------------------------------------------------------
@@ -219,14 +274,84 @@ def build_training_model(
                 layer.self_attn.unfuse_for_tp()
         logger.info_rank0("Unfused QKV projections (merge_qkv=False)")
 
+    if (
+        get_parallel_state().tp_enabled
+        and hasattr(model, "unfuse_for_tp")
+        and not getattr(model, "_unfused_for_tp", False)
+    ):
+        logger.info_rank0("Unfusing projections before FP8 training injection for tensor parallelism")
+        model.unfuse_for_tp()
+
     # ------------------------------------------------------------------
-    # 3. QLoRA / LoRA injection
+    # 3. FP8 full-weight / QLoRA / LoRA injection
     # ------------------------------------------------------------------
     is_prequantized = False
     checkpoint_quant_format = None
     exclude_modules: Set[str] = set()
 
-    if enable_qlora:
+    if enable_fp8_training and (enable_lora or enable_qlora):
+        raise ValueError("enable_fp8_training is a full-weight mode and cannot be combined with LoRA or QLoRA")
+    if enable_qarl and (enable_lora or enable_qlora):
+        raise ValueError("enable_qarl is a full-weight mode and cannot be combined with LoRA or QLoRA")
+    if enable_qarl and enable_fp8_training:
+        raise ValueError("enable_qarl cannot be combined with enable_fp8_training; choose one low-precision train path")
+    if enable_qarl and qarl_sync_format != "fp8":
+        raise ValueError("Initial QARL supports only qarl_sync_format='fp8'")
+    if enable_qarl and qarl_calib_size < 0:
+        raise ValueError("qarl_calib_size must be non-negative")
+    if enable_qarl and qarl_quant_sequence_length is not None and qarl_quant_sequence_length <= 0:
+        raise ValueError("qarl_quant_sequence_length must be positive when set")
+    if enable_qarl and qarl_calib_data is None and (qarl_calib_size or qarl_quant_sequence_length is not None):
+        raise ValueError("qarl_calib_size and qarl_quant_sequence_length require qarl_calib_data")
+
+    if enable_fp8_training:
+        from xorl.fp8_training import (  # noqa: PLC0415
+            inject_fp8_training_into_model,
+            validate_fp8_blackwell_training_policy,
+        )
+
+        validate_fp8_blackwell_training_policy(
+            enable_fp8_training=True,
+            allow_blackwell=fp8_training_allow_blackwell,
+            validation_artifact=fp8_training_blackwell_validation_artifact,
+        )
+
+        inject_fp8_training_into_model(
+            model,
+            target_modules=fp8_training_target_modules,
+            exclude_modules=fp8_training_exclude_modules,
+            num_first_layers_bf16=fp8_training_num_first_layers_bf16,
+            num_last_layers_bf16=fp8_training_num_last_layers_bf16,
+            block_size=fp8_training_block_size,
+            backward_mode=fp8_training_backward,
+            smoothquant_alpha=fp8_training_smoothquant_alpha,
+            lm_head_smoothquant_alpha=fp8_training_lm_head_smoothquant_alpha,
+            activation_amax_scale=fp8_training_activation_amax_scale,
+            weight_amax_scale=fp8_training_weight_amax_scale,
+            correction_mode=fp8_training_correction_mode,
+            module_overrides=fp8_training_module_overrides,
+            allow_bf16_fallback=fp8_training_allow_bf16_fallback,
+            moe_grouped_backend=fp8_training_moe_grouped_backend,
+        )
+        helper.print_device_mem_info("VRAM usage after FP8 training injection")
+    elif enable_qarl:
+        from xorl.qarl import calibrate_qarl_model, inject_qarl_into_model  # noqa: PLC0415
+
+        inject_qarl_into_model(
+            model,
+            quant_cfg=qarl_quant_cfg,
+            target_modules=qarl_target_modules,
+            exclude_modules=qarl_exclude_modules,
+        )
+        if qarl_calib_data is not None:
+            model._qarl_calibration_summary = calibrate_qarl_model(
+                model,
+                qarl_calib_data,
+                calibration_size=qarl_calib_size,
+                sequence_length=qarl_quant_sequence_length,
+            )
+        helper.print_device_mem_info("VRAM usage after QARL fake-quant injection")
+    elif enable_qlora:
         is_prequantized, checkpoint_quant_format, exclude_modules = _inject_qlora(
             model,
             weights_path=weights_path,
@@ -258,7 +383,20 @@ def build_training_model(
     )
 
     # ------------------------------------------------------------------
-    # 5. Save optimizer pre-hook (some models register hooks)
+    # 5. Scoped batch-invariant trunk-linear contract (must precede FSDP2)
+    # ------------------------------------------------------------------
+    if os.environ.get("XORL_BI_TRUNK_LINEAR", "0") == "1":
+        from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415
+
+        wrapped = wrap_trunk_linears_batch_invariant(model)
+        pattern = ", ".join(f"{name}x{count}" for name, count in sorted(wrapped.items()))
+        logger.info_rank0(
+            f"XORL_BI_TRUNK_LINEAR=1: wrapped {sum(wrapped.values())} trunk linears "
+            f"(fwd batch-invariant, bwd cuBLAS; qk-norm on the family-1 BI kernel): {pattern}"
+        )
+
+    # ------------------------------------------------------------------
+    # 5b. Save optimizer pre-hook (some models register hooks)
     # ------------------------------------------------------------------
     optimizer_pre_hook_fn = getattr(model, "get_optimizer_pre_hook", None)
 
@@ -274,17 +412,28 @@ def build_training_model(
         enable_full_shard=enable_full_shard,
         enable_mixed_precision=enable_mixed_precision,
         enable_gradient_checkpointing=enable_gradient_checkpointing,
+        gradient_checkpointing_method=gradient_checkpointing_method,
         enable_compile=enable_compile,
+        compile_dynamic_shapes=compile_dynamic_shapes,
         basic_modules=_basic_modules,
         enable_reentrant=enable_reentrant,
         enable_forward_prefetch=enable_forward_prefetch,
+        enable_backward_prefetch=enable_backward_prefetch,
         load_weights_mode=load_weights_mode,
         pp_schedule=effective_pp_schedule,
+        pp_virtual_stages=pp_virtual_stages,
+        pp_input_weight=pp_input_weight,
+        pp_output_weight=pp_output_weight,
+        pp_num_layers_in_first_stage=pp_num_layers_in_first_stage,
+        pp_num_layers_in_last_stage=pp_num_layers_in_last_stage,
         reshard_after_forward=reshard_after_forward,
         moe_grad_reduce_mode=moe_grad_reduce_mode,
+        fsdp_sharded_lm_head_loss=fsdp_sharded_lm_head_loss,
+        fsdp_reduce_dtype=fsdp_reduce_dtype,
         skip_param_upcast=should_skip_generic_param_upcast(
             enable_lora=enable_lora,
             enable_qlora=enable_qlora,
+            skip_param_upcast=skip_param_upcast,
         ),
     )
 
@@ -302,44 +451,55 @@ def build_training_model(
     else:
         model = build_result
 
+    # Steps 7-9 apply to every local model chunk (PP virtual stages own several)
+    all_parts = model_parts if pp_enabled else [model]
+
     # ------------------------------------------------------------------
     # 7. Deferred QLoRA quantization
     # ------------------------------------------------------------------
     if enable_qlora:
-        _deferred_qlora_quantize(model, weights_path, load_weights_mode=load_weights_mode)
+        for part in all_parts:
+            _deferred_qlora_quantize(part, weights_path, load_weights_mode=load_weights_mode)
 
     # ------------------------------------------------------------------
     # 8. Freeze base params
     # ------------------------------------------------------------------
     if enable_qlora:
         # After QLoRA quantization, freeze everything except LoRA
-        for name, param in model.named_parameters():
-            if "lora_A" not in name and "lora_B" not in name:
-                param.requires_grad = False
+        for part in all_parts:
+            for name, param in part.named_parameters():
+                if "lora_A" not in name and "lora_B" not in name:
+                    param.requires_grad = False
         helper.print_device_mem_info("VRAM usage after QLoRA quantization")
     elif enable_lora:
-        freeze_base_parameters(model)
+        for part in all_parts:
+            freeze_base_parameters(part)
         logger.info_rank0("Base model parameters frozen, only LoRA parameters trainable")
     else:
         # Full-weights: all params trainable
-        for param in model.parameters():
-            param.requires_grad = True
+        for part in all_parts:
+            for param in part.parameters():
+                param.requires_grad = True
 
     # Optionally freeze MoE router
     if freeze_router:
-        router_frozen_count = freeze_deepseek_v3_router_parameters(model)
-        if router_frozen_count == 0:
-            for name, param in model.named_parameters():
-                if ".gate.weight" in name:
-                    param.requires_grad = False
-                    router_frozen_count += 1
+        router_frozen_count = 0
+        for part in all_parts:
+            part_frozen = freeze_deepseek_v3_router_parameters(part)
+            if part_frozen == 0:
+                for name, param in part.named_parameters():
+                    if ".gate.weight" in name:
+                        param.requires_grad = False
+                        part_frozen += 1
+            router_frozen_count += part_frozen
         if router_frozen_count > 0:
             logger.info_rank0(f"Froze {router_frozen_count} MoE router (gate) parameters")
 
     # ------------------------------------------------------------------
     # 9. model.train()
     # ------------------------------------------------------------------
-    model.train()
+    for part in all_parts:
+        part.train()
     logger.info_rank0("Model built and parallelized")
 
     return TrainingModelResult(
