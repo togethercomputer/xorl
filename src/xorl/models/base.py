@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from ..utils import logging
+from .layers.moe.experts import MoEExperts
 from .layers.moe.moe_block import MoEBlock
 from .layers.moe.routing_replay import RoutingReplay
 from .module_utils import DEFAULT_GRADIENT_CHECKPOINTING_METHOD, GradientCheckpointingMethod
@@ -32,6 +33,11 @@ class XorlPreTrainedModel(nn.Module):
     base_model_prefix = "model"
     _no_split_modules = []
     _tied_weights_keys = {}
+
+    # Subclasses set this to False if their architecture has no TP plan yet
+    # (e.g. MLA-style attention with a sparse indexer). torch_parallelize.py
+    # checks this attribute before applying tensor parallelism.
+    supports_tensor_parallelism: bool = True
 
     def __init__(self, config):
         super().__init__()
@@ -100,6 +106,8 @@ class XorlPreTrainedModel(nn.Module):
         grad_ckpt_method = gradient_checkpointing_kwargs.pop(
             "gradient_checkpointing_method", DEFAULT_GRADIENT_CHECKPOINTING_METHOD
         )
+        moe_act = grad_ckpt_method == "moe_act"
+        effective_grad_ckpt_method = DEFAULT_GRADIENT_CHECKPOINTING_METHOD if moe_act else grad_ckpt_method
 
         grad_ckpt_func = partial(torch.utils.checkpoint.checkpoint, **gradient_checkpointing_kwargs)
 
@@ -107,7 +115,9 @@ class XorlPreTrainedModel(nn.Module):
             if hasattr(module, "gradient_checkpointing"):
                 module.gradient_checkpointing = True
                 module._gradient_checkpointing_func = grad_ckpt_func
-                module._gradient_checkpointing_method = grad_ckpt_method
+                module._gradient_checkpointing_method = effective_grad_ckpt_method
+            if isinstance(module, MoEExperts):
+                module._moe_act = moe_act
 
         if grad_ckpt_method != DEFAULT_GRADIENT_CHECKPOINTING_METHOD:
             logger.info(f"Selective checkpointing enabled: gradient_checkpointing_method={grad_ckpt_method}")

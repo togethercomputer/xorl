@@ -94,6 +94,21 @@ def _run_with_replay(layer, x):
 class TestRoutingReplayUnit:
     """Unit tests for RoutingReplay class, stage management, clear, and registry."""
 
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_async_cpu_record_is_ordered_before_replay(self):
+        replay = RoutingReplay()
+        source = torch.arange(16, device="cuda", dtype=torch.int64)
+        record_stream = torch.cuda.Stream()
+        with torch.cuda.stream(record_stream):
+            replay.record(source)
+
+        actual = replay.pop_forward()
+        torch.cuda.synchronize()
+
+        assert replay.top_indices_events[0] is not None
+        torch.testing.assert_close(actual, source)
+
     def test_record_pop_dual_index_clear_stage_and_registry(self):
         """Test record, forward/backward pop, dual-index, CPU pinned storage,
         clear, clear_all, reset_all_forward/backward, registry, and stage management."""

@@ -1,7 +1,12 @@
+import glob
+import os
+
 import pytest
 import torch
+from safetensors.torch import load_file
 
 from xorl.models.layers.moe import MoEExperts, MoEExpertsLoRA, MoELoRAConfig
+from xorl.models.module_utils import save_model_weights
 from xorl.models.transformers.qwen3_5_moe.checkpoint_handler import Qwen3_5MoeCheckpointHandler
 from xorl.models.transformers.qwen3_moe.checkpoint_handler import Qwen3MoeCheckpointHandler
 
@@ -176,3 +181,43 @@ def test_qwen3_5_moe_checkpoint_handler_skips_deferred_qlora_expert_loading():
 
     assert handler.on_load_weight("model.layers.0.mlp.experts.0.gate_proj.weight", torch.randn(3, 4)) == []
     assert handler.on_load_weight("model.layers.0.mlp.experts.gate_up_proj.weight", torch.randn(2, 6, 4)) == []
+
+
+def test_save_model_weights_drops_qarl_buffers_and_unfuses_qkv(tmp_path):
+    """Regression: ``save_hf_weights: true`` + QAT (qarl) on a model with fused ``qkv_proj``
+    crashed because the checkpoint handler split every ``.qkv_proj.*`` tensor on dim 0,
+    hitting QARLLinear's 0-dim observer buffers (``RuntimeError: split expects at least a
+    1-dimensional tensor``). ``save_model_weights`` must drop all ``qarl_*`` buffers before
+    the handler runs, and still unfuse ``qkv_proj`` -> q/k/v.
+    """
+    n_heads, n_kv, head_dim, hidden = 2, 1, 2, 4
+    q_dim, kv_dim = n_heads * head_dim, n_kv * head_dim
+    handler = Qwen3MoeCheckpointHandler(
+        num_experts=2,
+        num_attention_heads=n_heads,
+        num_key_value_heads=n_kv,
+        head_dim=head_dim,
+    )
+    p = "model.layers.0.self_attn"
+    state_dict = {
+        f"{p}.qkv_proj.weight": torch.randn(q_dim + 2 * kv_dim, hidden),
+        # QARLLinear observer/scale buffers registered under the fused module (the crashes):
+        f"{p}.qkv_proj.qarl_input_amax": torch.zeros(()),  # 0-dim scalar
+        f"{p}.qkv_proj.qarl_forward_count": torch.zeros((), dtype=torch.long),  # 0-dim scalar
+        f"{p}.qkv_proj.qarl_weight_scale_inv": torch.zeros(8, 4),  # 2-D, would be mis-split
+        f"{p}.o_proj.weight": torch.randn(hidden, q_dim),
+        f"{p}.o_proj.qarl_input_amax": torch.zeros(()),
+    }
+
+    # Must not raise (previously crashed on the 0-dim qarl scalar under qkv_proj).
+    save_model_weights(str(tmp_path), state_dict, global_rank=None, save_dtype=None, checkpoint_handler=handler)
+
+    merged = {}
+    for shard in glob.glob(os.path.join(tmp_path, "*.safetensors")):
+        merged.update(load_file(shard))
+
+    # qkv_proj unfused into q/k/v; o_proj passed through.
+    for key in ("q_proj.weight", "k_proj.weight", "v_proj.weight", "o_proj.weight"):
+        assert f"{p}.{key}" in merged, sorted(merged)
+    # All qarl_* observer buffers dropped from the saved checkpoint.
+    assert not [k for k in merged if "qarl_" in k]

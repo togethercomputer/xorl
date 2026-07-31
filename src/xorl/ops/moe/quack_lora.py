@@ -34,6 +34,7 @@ def quack_moe_lora_forward(
     down_proj_lora_A,
     down_proj_lora_B,
     scaling: float,
+    swiglu_limit: float = 0.0,
 ):
     """MoE + LoRA forward pass using quack group GEMM kernels (local single-GPU)."""
     return QuackMoeExpertsLoRAFunction.apply(
@@ -51,4 +52,5 @@ def quack_moe_lora_forward(
         down_proj_lora_A,
         down_proj_lora_B,
         scaling,
+        swiglu_limit,
     )
