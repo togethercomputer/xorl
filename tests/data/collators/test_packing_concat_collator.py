@@ -158,3 +158,28 @@ class TestPackingConcatCollator:
             batch["teacher_hidden_states"],
             torch.tensor([[[0.25, 0.5], [1.25, 1.5], [2.25, 2.5], [0.0, 0.0]]]),
         )
+
+    @patch("xorl.data.collators.packing_concat_collator.get_parallel_state")
+    def test_hidden_match_weights_are_padded_as_sequence_field(self, mock_parallel_state):
+        mock_parallel_state.return_value = Mock(cp_enabled=False)
+        collator = PackingConcatCollator(pad_to_multiple_of=4)
+        features = [
+            {
+                "input_ids": torch.tensor([1, 2]),
+                "position_ids": torch.tensor([0, 1]),
+                "hidden_match_weights": torch.tensor([0.25, 0.5]),
+            },
+            {
+                "input_ids": torch.tensor([3]),
+                "position_ids": torch.tensor([0]),
+                "hidden_match_weights": torch.tensor([0.75]),
+            },
+        ]
+
+        batch = collator(features)
+
+        assert batch["hidden_match_weights"].shape == (1, 4)
+        torch.testing.assert_close(
+            batch["hidden_match_weights"],
+            torch.tensor([[0.25, 0.5, 0.75, 0.0]]),
+        )

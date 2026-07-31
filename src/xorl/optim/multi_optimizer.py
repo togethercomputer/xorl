@@ -18,17 +18,22 @@ logger = logging.get_logger(__name__)
 
 class MultiOptimizer(Optimizer, Stateful):
     """
-    A container that handles multiple optimizers (for ep and non-ep parameters when ep+fsdp2 is enabled)
+    A container that handles multiple optimizers (for ep and non-ep parameters when ep+fsdp2 is enabled,
+    or one optimizer per local model chunk under PP virtual stages)
 
     Mapping of name -> torch.optim.Optimizer with convenience methods.
     Compatible with torch.distributed.checkpoint optimizer APIs that accept a Mapping.
 
     This class is needed for EP+FSDP2 case because EP and non-EP param have different FSDP sharding dimension (dim-0 vs. dim-1).
+
+    ``root_model`` is either a single module covering every optimizer's params, or a
+    mapping ``key_name -> module`` when each optimizer covers a different module
+    (PP virtual stages: DCP state-dict FQNs must come from the owning model part).
     """
 
     def __init__(
         self,
-        root_model: nn.Module,
+        root_model,
         optimizers: dict,
         key_names: list[str],
     ):
@@ -36,6 +41,11 @@ class MultiOptimizer(Optimizer, Stateful):
         self.optimizers_dict = optimizers
         self._is_multi_optimizer: bool = True
         self.key_names = key_names
+
+    def _model_for(self, name: str) -> nn.Module:
+        if isinstance(self.model, dict):
+            return self.model[name]
+        return self.model
 
     @property
     def param_groups(self) -> List[Dict[str, Any]]:
@@ -65,7 +75,9 @@ class MultiOptimizer(Optimizer, Stateful):
         merged: Dict[str, Any] = {}
         for name in self.key_names:
             opt = self.optimizers_dict.get(name)
-            sd = get_optimizer_state_dict(self.model, opt, options=StateDictOptions(flatten_optimizer_state_dict=True))
+            sd = get_optimizer_state_dict(
+                self._model_for(name), opt, options=StateDictOptions(flatten_optimizer_state_dict=True)
+            )
             overlap = set(merged.keys()) & set(sd.keys())
             if overlap:
                 raise KeyError(
@@ -79,14 +91,32 @@ class MultiOptimizer(Optimizer, Stateful):
 
         return merged
 
-    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+    def load_state_dict(self, state_dict: Dict[str, Any], strict: bool = True) -> None:
         for name in self.key_names:
             opt = self.optimizers_dict.get(name)
-            set_optimizer_state_dict(
-                self.model,
+            if opt is None:
+                continue
+            target_sd = get_optimizer_state_dict(
+                self._model_for(name),
                 opt,
-                optim_state_dict=state_dict,
                 options=StateDictOptions(flatten_optimizer_state_dict=True),
+            )
+            loaded_state_dict = {key: state_dict[key] for key in target_sd if key in state_dict}
+            missing = len(target_sd) - len(loaded_state_dict)
+            if missing > 0:
+                logger.info_rank0(
+                    f"MultiOptimizer loading '{name}' optimizer state with {len(loaded_state_dict)} checkpoint key(s), "
+                    f"using freshly initialized state for {missing} key(s) absent from checkpoint."
+                )
+                opt_state_dict = dict(target_sd)
+                opt_state_dict.update(loaded_state_dict)
+            else:
+                opt_state_dict = loaded_state_dict
+            set_optimizer_state_dict(
+                self._model_for(name),
+                opt,
+                optim_state_dict=opt_state_dict,
+                options=StateDictOptions(flatten_optimizer_state_dict=True, strict=strict and missing == 0),
             )
 
     def register_step_pre_hook(self, hook):

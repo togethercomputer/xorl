@@ -39,7 +39,7 @@ def culen2pos(cu_seqlens: "torch.Tensor") -> "torch.Tensor":
     return position_ids.unsqueeze(0)
 
 
-def prepare_fa_kwargs_from_position_ids(position_ids):
+def prepare_fa_kwargs_from_position_ids(position_ids, max_length_bucket: int = 0):
     """
     Copy from transformers/modeling_flash_attention_utils.py 354567d955fbc5fbd70fc841b7a7bcc654bea3f1
     This function returns all the necessary kwargs to call `flash_attn_varlen_func` extracted from position_ids.
@@ -47,6 +47,12 @@ def prepare_fa_kwargs_from_position_ids(position_ids):
     Arguments:
         position_ids (`torch.Tensor`):
             Boolean or int tensor of shape (batch_size, sequence_length), 1 means valid and 0 means not valid.
+        max_length_bucket (`int`, default 0):
+            If > 0, round ``max_length_q``/``max_length_k`` UP to a multiple of this value (capped at the
+            packed sequence length). These are only an UPPER BOUND for the flash-attn kernel's tiling
+            (correctness comes from ``cu_seqlens``), so rounding up is safe. Bucketing the longest-segment
+            int to a few distinct values prevents ``torch.compile``/dynamo from recompiling on every
+            ragged pack (dynamo specializes on python int args). 0 = off (exact max, original behavior).
 
     Return:
         (cu_seqlens_q, cu_seqlens_k) (`tuple[int]`):
@@ -79,6 +85,10 @@ def prepare_fa_kwargs_from_position_ids(position_ids):
     # This is a limitation of flash attention API, as the function `flash_attn_varlen_func`
     # requires `max_length_q`, `max_length_k` to be passed as `int` and not `torch.Tensor`.
     max_length_q = max_length_q.item()
+    if max_length_bucket and max_length_bucket > 0:
+        total_len = int(position_ids.size(0))
+        bucketed = ((max_length_q + max_length_bucket - 1) // max_length_bucket) * max_length_bucket
+        max_length_q = min(bucketed, total_len)
     max_length_k = max_length_q
 
     return (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k)

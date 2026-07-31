@@ -189,6 +189,9 @@ class Muon(TorchMuon):
             finishing the second iteration.
         grouped_gram_ns_fp32_byte_limit: Maximum fp32 scratch bytes per grouped
             Gram Newton-Schulz batch before splitting it into smaller chunks.
+        fallback_optimizer: Optimizer used for non-Muon parameter groups.
+            ``"adamw"`` preserves the historical behavior. ``"sgd"`` uses a
+            state-free update for memory-constrained no-momentum Muon runs.
         adamw_state_dtype: If set, force AdamW fallback optimizer states
             (``exp_avg``, ``exp_avg_sq``) to this dtype (e.g.
             ``torch.bfloat16``).  Default ``None`` inherits dtype from
@@ -226,6 +229,7 @@ class Muon(TorchMuon):
         gram_newton_schulz_num_restarts: int = 1,
         gram_newton_schulz_restart_iterations: Optional[Iterable[int]] = None,
         grouped_gram_ns_fp32_byte_limit: int = GROUPED_GRAM_NS_FP32_BYTE_LIMIT,
+        fallback_optimizer: str = "adamw",
         adamw_state_dtype: Optional[torch.dtype] = None,
         cautious: bool = False,
         distributed_mode: str = "shard_local",
@@ -245,11 +249,14 @@ class Muon(TorchMuon):
             )
         if grouped_gram_ns_fp32_byte_limit <= 0:
             raise ValueError(f"grouped_gram_ns_fp32_byte_limit must be positive, got {grouped_gram_ns_fp32_byte_limit}")
+        if fallback_optimizer not in {"adamw", "sgd"}:
+            raise ValueError(f"Unsupported Muon fallback optimizer: {fallback_optimizer!r}. Expected 'adamw' or 'sgd'.")
 
         self._momentum_dtype = momentum_dtype
         self._grad_dtype = grad_dtype
         self._update_dtype = update_dtype
         self._force_momentum_path = force_momentum_path
+        self._fallback_optimizer = fallback_optimizer
         self._adamw_state_dtype = adamw_state_dtype
         self._distributed_mode = distributed_mode
         self._logged_dtypes = False
@@ -293,10 +300,41 @@ class Muon(TorchMuon):
         for group in self.param_groups:
             if group.get("use_muon", False):
                 self._muon_step(group)
-            else:
+                continue
+            fallback_optimizer = group.get("fallback_optimizer", self._fallback_optimizer)
+            if fallback_optimizer == "sgd":
+                self._sgd_step(group)
+            elif fallback_optimizer == "adamw":
                 self._adamw_step(group)
+            else:
+                raise ValueError(
+                    f"Unsupported Muon fallback optimizer: {fallback_optimizer!r}. Expected 'adamw' or 'sgd'."
+                )
 
         return loss
+
+    @staticmethod
+    def _init_momentum_buffer(p: torch.Tensor, grad_local: torch.Tensor, buf_dtype: torch.dtype) -> torch.Tensor:
+        """Allocate the Muon momentum buffer, preserving DTensor sharding metadata.
+
+        When ``p`` is a sharded DTensor (FSDP2/EP), the buffer is wrapped as a DTensor
+        carrying the same ``device_mesh`` + ``placements`` so DCP records the true global
+        size and can reshard the saved state across different EP/FSDP layouts on resume
+        (matching how ``torch.optim`` initializes state via ``torch.zeros_like(p)`` on the
+        DTensor param). All Muon math still runs on ``buf._local_tensor``, so the numerics
+        are byte-identical to a plain local buffer.
+
+        The buffer is only wrapped when ``grad_local`` keeps ``p``'s local shape — i.e. the
+        common 2D (``Shard(0)``) and 3D MoE-expert (``Shard(1)``) cases where the leading-dim
+        reshape in ``_muon_step`` is a no-op, and the ``full_gradient`` path where the reshape
+        is deferred until after momentum. Single-GPU (plain-tensor) params and any layout
+        whose local shape is collapsed by the reshape keep a plain local buffer (no behavior
+        change), since their local shape no longer matches ``p``'s DTensor spec.
+        """
+        local_zeros = torch.zeros_like(grad_local, dtype=buf_dtype)
+        if isinstance(p, DTensor) and tuple(grad_local.shape) == tuple(p._local_tensor.shape):
+            return DTensor.from_local(local_zeros, p.device_mesh, p.placements, run_check=False)
+        return local_zeros
 
     def _muon_step(self, group: dict) -> None:
         """Newton-Schulz orthogonalization + momentum update.
@@ -386,24 +424,26 @@ class Muon(TorchMuon):
                 state = self.state[p]
                 if "momentum_buffer" not in state:
                     buf_dtype = self._momentum_dtype or grad_local.dtype
-                    state["momentum_buffer"] = torch.zeros_like(
-                        grad_local,
-                        dtype=buf_dtype,
-                    )
+                    state["momentum_buffer"] = self._init_momentum_buffer(p, grad_local, buf_dtype)
                 buf = state["momentum_buffer"]
+                # All NS / lerp math operates on the LOCAL shard. When the buffer is a
+                # DTensor (so DCP records the true global size and can reshard across EP
+                # sizes), unwrap to its local tensor; the numerics are identical to the
+                # pre-DTensor plain-local-tensor path.
+                buf_local = buf._local_tensor if isinstance(buf, DTensor) else buf
 
                 # EMA momentum: B = (1-μ)*g + μ*B
                 # Cast grad to buf dtype for the in-place lerp
-                buf.lerp_(grad_local.to(buf.dtype), 1 - momentum)
+                buf_local.lerp_(grad_local.to(buf_local.dtype), 1 - momentum)
 
                 # Nesterov: ~B = g + μ*B  (or just B if nesterov=False)
-                update = grad_local.to(buf.dtype).lerp(buf, momentum) if nesterov else buf
+                update = grad_local.to(buf_local.dtype).lerp(buf_local, momentum) if nesterov else buf_local
                 if self._update_dtype is not None and update.dtype != self._update_dtype:
                     update = update.to(self._update_dtype)
                 if not self._logged_dtypes:
                     logger.info_rank0(
                         f"Muon dtypes: param={p_local.dtype}, raw_grad={raw_grad_dtype}, grad={grad_local.dtype}, "
-                        f"momentum={buf.dtype}, update={update.dtype}, "
+                        f"momentum={buf_local.dtype}, update={update.dtype}, "
                         f"force_momentum_path={self._force_momentum_path} "
                         f"(shape={list(grad_local.shape)})"
                     )
@@ -663,3 +703,26 @@ class Muon(TorchMuon):
 
             denom = (exp_avg_sq.sqrt() / (bias_correction2**0.5)).add_(eps)
             p.data.addcdiv_(exp_avg, denom, value=-step_size)
+
+    def _sgd_step(self, group: dict) -> None:
+        """State-free fallback update for non-Muon parameters."""
+        lr = group["lr"]
+        weight_decay = group["weight_decay"]
+        cautious = group.get("cautious", False)
+
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+
+            grad = p.grad
+            if grad.is_sparse:
+                raise RuntimeError("Muon (SGD fallback) does not support sparse gradients.")
+
+            apply_cautious_decay_(
+                p.data,
+                update_sign_proxy=grad,
+                lr=lr,
+                weight_decay=weight_decay,
+                cautious=cautious,
+            )
+            p.data.add_(grad, alpha=-lr)

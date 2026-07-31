@@ -16,7 +16,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Shard, distribute_tensor
 
 from xorl.distributed.fsdp2.clip_grad_norm import (
     clip_grad_norm,
@@ -210,6 +213,7 @@ class TestEPFSDP2ClipGradNorm:
         with patch("xorl.distributed.fsdp2.clip_grad_norm.get_parallel_state", return_value=_mock_parallel_state()):
             total_norm = ep_fsdp2_clip_grad_norm(model, max_norm=10.0)
 
+        assert total_norm.item() == pytest.approx(5.0, abs=1e-5)
         # Gradients unchanged
         torch.testing.assert_close(non_ep[0].grad, torch.tensor([3.0, 4.0]))
 
@@ -389,3 +393,77 @@ class TestClipGradNormDispatch:
             total_norm = clip_grad_norm(model, max_norm=100.0)
 
         assert total_norm.item() == pytest.approx(5.0, abs=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# 5. Flat path with mixed-mesh DTensor grads (no _ep_param_groups)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def single_rank_dist():
+    """World-1 gloo process group for building CPU DTensors on real device meshes."""
+    created = False
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend="gloo",
+            init_method="tcp://127.0.0.1:29517",
+            rank=0,
+            world_size=1,
+        )
+        created = True
+    yield
+    if created:
+        dist.destroy_process_group()
+
+
+class TestMixedMeshFlatPath:
+    """External callers (no _ep_param_groups) with params on dp_shard + ep_fsdp meshes.
+
+    Regression test: torch's default foreach grouping mixes the meshes into one
+    _foreach op and raises 'Could not run pointwise computation across different
+    mesh' deep inside torch. The flat path must fall back to per-tensor clipping.
+    """
+
+    def _mixed_mesh_model(self):
+        mesh_dp = init_device_mesh("cpu", (1,), mesh_dim_names=("dp_shard",))
+        mesh_ep = init_device_mesh("cpu", (1,), mesh_dim_names=("ep_fsdp",))
+
+        model = nn.Module()
+        p_dp = nn.Parameter(distribute_tensor(torch.zeros(2), mesh_dp, [Shard(0)]))
+        p_dp.grad = distribute_tensor(torch.tensor([3.0, 0.0]), mesh_dp, [Shard(0)])
+        p_ep = nn.Parameter(distribute_tensor(torch.zeros(2), mesh_ep, [Shard(0)]))
+        p_ep.grad = distribute_tensor(torch.tensor([0.0, 4.0]), mesh_ep, [Shard(0)])
+        model.register_parameter("p_dp", p_dp)
+        model.register_parameter("p_ep", p_ep)
+        return model, p_dp, p_ep
+
+    def test_mixed_mesh_does_not_crash_and_norm_is_correct(self, single_rank_dist):
+        model, _, _ = self._mixed_mesh_model()
+
+        ps = _mock_parallel_state(ep_enabled=True)
+        with patch("xorl.distributed.fsdp2.clip_grad_norm.get_parallel_state", return_value=ps):
+            total_norm = clip_grad_norm(model, max_norm=100.0)
+
+        assert total_norm.item() == pytest.approx(5.0, abs=1e-5)
+
+    def test_mixed_mesh_grads_clipped_per_tensor(self, single_rank_dist):
+        model, p_dp, p_ep = self._mixed_mesh_model()
+
+        ps = _mock_parallel_state(ep_enabled=True)
+        with patch("xorl.distributed.fsdp2.clip_grad_norm.get_parallel_state", return_value=ps):
+            total_norm = clip_grad_norm(model, max_norm=1.0)
+
+        assert total_norm.item() == pytest.approx(5.0, abs=1e-5)
+        # clip coefficient = 1.0 / 5.0
+        assert p_dp.grad.to_local()[0].item() == pytest.approx(0.6, abs=1e-4)
+        assert p_ep.grad.to_local()[1].item() == pytest.approx(0.8, abs=1e-4)
+
+    def test_explicit_foreach_true_still_raises(self, single_rank_dist):
+        """An explicit foreach=True is honored — only the default is made safe."""
+        model, _, _ = self._mixed_mesh_model()
+
+        ps = _mock_parallel_state(ep_enabled=True)
+        with patch("xorl.distributed.fsdp2.clip_grad_norm.get_parallel_state", return_value=ps):
+            with pytest.raises(RuntimeError, match="different mesh"):
+                clip_grad_norm(model, max_norm=1.0, foreach=True)

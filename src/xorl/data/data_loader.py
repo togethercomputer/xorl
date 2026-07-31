@@ -138,6 +138,7 @@ class DataLoaderBuilder:
         prefetch_factor: Optional[int] = 2,
         seed: int = 0,
         pad_to_multiple_of: int = 128,
+        fa_max_length_bucket: int = 0,
     ):
         """
         Initialize the DataLoaderBuilder.
@@ -165,6 +166,7 @@ class DataLoaderBuilder:
         self.prefetch_factor = None if num_workers == 0 else prefetch_factor
         self.seed = seed
         self.pad_to_multiple_of = pad_to_multiple_of
+        self.fa_max_length_bucket = fa_max_length_bucket
         self.parallel_state = get_parallel_state()
 
         # Initialize collator pipeline
@@ -184,11 +186,16 @@ class DataLoaderBuilder:
             ToTensorCollator(),  # 1. Convert to tensors
             FlattenCollator(),  # 2. Flatten list of lists to flat list
             ShiftTokensCollator(auto_detect=True),  # 3. Shift tokens for causal LM (auto-detects if needed)
-            PackingConcatCollator(pad_to_multiple_of=self.pad_to_multiple_of),  # 4. Concatenate sequences for packing
+            PackingConcatCollator(
+                pad_to_multiple_of=self.pad_to_multiple_of,
+                fa_max_length_bucket=self.fa_max_length_bucket,
+            ),  # 4. Concatenate sequences for packing
         ]
 
         if self.parallel_state.cp_enabled:
-            collators.append(TextSequenceShardCollator())  # 5. Shard sequences (if SP enabled)
+            collators.append(
+                TextSequenceShardCollator(fa_max_length_bucket=self.fa_max_length_bucket)
+            )  # 5. Shard sequences (if SP enabled)
 
         return collators
 

@@ -226,12 +226,22 @@ def _fsdp2_reduce_and_clip(
         total_norm = total_p ** (1.0 / float(norm_type))
 
     # Disable foreach when mixing DTensor and plain tensor grads (e.g., TP meshes,
-    # or QLoRA MoE experts excluded from FSDP via _skip_fsdp).
+    # or QLoRA MoE experts excluded from FSDP via _skip_fsdp), or DTensor grads on
+    # different device meshes (e.g., dp_shard + ep_fsdp without _ep_param_groups) —
+    # torch's foreach path groups them into one op and raises a cross-mesh error.
     ps = get_parallel_state()
-    if foreach is None:
-        has_dtensor = any(isinstance(p.grad, DTensor) for p in params if p.grad is not None)
-        has_plain = any(not isinstance(p.grad, DTensor) for p in params if p.grad is not None)
-        if (ps.tp_enabled) or (has_dtensor and has_plain):
-            foreach = False
+    grads = [p.grad for p in params if p.grad is not None]
+    has_dtensor = any(isinstance(g, DTensor) for g in grads)
+    has_plain = any(not isinstance(g, DTensor) for g in grads)
+    grad_meshes = {g.device_mesh for g in grads if isinstance(g, DTensor)}
+    if len(grad_meshes) > 1:
+        logger.warning_once(
+            "clip_grad_norm: gradients live on multiple device meshes "
+            f"({sorted(str(m.mesh_dim_names) for m in grad_meshes)}); using per-tensor clipping. "
+            "For EP models, build model._ep_param_groups first "
+            "(xorl.distributed.torch_parallelize._build_ep_param_groups) to get the EP-aware path."
+        )
+    if foreach is None and (ps.tp_enabled or (has_dtensor and has_plain) or len(grad_meshes) > 1):
+        foreach = False
     torch.nn.utils.clip_grads_with_norm_(params, max_norm, total_norm, foreach=foreach)
     return total_norm
