@@ -23,6 +23,16 @@ from xorl.ops.loss.reducers import Reducer, TokenPartial
 logger = logging.getLogger(__name__)
 
 
+K3_DEBUG_THRESHOLDS = (
+    ("1e_minus_6", 1e-6),
+    ("1e_minus_4", 1e-4),
+    ("1e_minus_3", 1e-3),
+    ("1e_minus_2", 1e-2),
+    ("1e_minus_1", 1e-1),
+    ("1", 1.0),
+)
+
+
 @torch.compile(dynamic=True)
 def compute_ppo_loss(
     ppo_kl: torch.Tensor,
@@ -146,6 +156,8 @@ def policy_loss_function(
     icepop_beta: Optional[float] = None,
     loss_reducer: Optional[Reducer] = None,
     metric_reducer: Optional[Reducer] = None,
+    lm_head: Optional[torch.nn.Module] = None,
+    logprob_temperature: float = 1.0,
 ) -> "LossOutput":
     """
     Policy loss with PPO clipping, optional IcePop masking, and optional TIS correction.
@@ -187,6 +199,10 @@ def policy_loss_function(
         metric_reducer: Reduces per-token /mean metrics (pg_clipfrac, icepop_maskfrac,
             tis_mean, tis_clipfrac, kl_sample_train_k3, entropy_sample, ratio_mean)
             the same way. ratio_min/ratio_max/tis_min/tis_max stay local scalars.
+        logprob_temperature: Temperature applied to trainer logits before
+            selected-token logprob calculation. ``1.0`` is raw policy logprobs;
+            setting this to the rollout temperature yields Slime-style behavior
+            logprob semantics for PPO ratios and K3 stats.
 
     Returns:
         LossOutput with loss, per_token_logprobs (new logprobs), and metrics.
@@ -221,6 +237,8 @@ def policy_loss_function(
         num_chunks,
         tp_group=tp_group,
         lm_head_fp32=lm_head_fp32,
+        lm_head=lm_head,
+        logprob_temperature=logprob_temperature,
     )
 
     new_logprobs_flat = -per_token_ce.detach()
@@ -243,16 +261,36 @@ def policy_loss_function(
             if valid_mask.any():
                 _ratio_min = _ratio_full.masked_fill(~valid_mask, float("inf")).min()
                 _ratio_max = _ratio_full.masked_fill(~valid_mask, float("-inf")).max()
+                _k3_max = _per_token_k3.masked_fill(~valid_mask, float("-inf")).max()
+                _logratio_min = _log_ratio_full.masked_fill(~valid_mask, float("inf")).min()
+                _logratio_max = _log_ratio_full.masked_fill(~valid_mask, float("-inf")).max()
+                _abs_logratio_max = _log_ratio_full.abs().masked_fill(~valid_mask, float("-inf")).max()
             else:
                 _ratio_min = _ratio_full.new_tensor(float("inf"))
                 _ratio_max = _ratio_full.new_tensor(float("-inf"))
+                _k3_max = _per_token_k3.new_tensor(float("-inf"))
+                _logratio_min = _log_ratio_full.new_tensor(float("inf"))
+                _logratio_max = _log_ratio_full.new_tensor(float("-inf"))
+                _abs_logratio_max = _log_ratio_full.new_tensor(float("-inf"))
             _kl_stats = {
                 "kl_sample_train_k3": metric_reducer(_per_token_k3, valid_mask_f),
+                "kl_k3_debug_mean": metric_reducer(_per_token_k3, valid_mask_f),
+                "kl_k3_debug_max": _k3_max,
+                "kl_k3_debug_abs_logratio_mean": metric_reducer(_log_ratio_full.abs(), valid_mask_f),
+                "kl_k3_debug_abs_logratio_max": _abs_logratio_max,
+                "kl_k3_debug_logratio_mean": metric_reducer(_log_ratio_full, valid_mask_f),
+                "kl_k3_debug_logratio_min": _logratio_min,
+                "kl_k3_debug_logratio_max": _logratio_max,
+                "kl_k3_debug_frac_logratio_positive": metric_reducer((_log_ratio_full > 0).float(), valid_mask_f),
                 "entropy_sample": metric_reducer(-old_logprobs_flat, valid_mask_f),
                 "ratio_mean": metric_reducer(_ratio_full, valid_mask_f),
                 "ratio_min": _ratio_min,
                 "ratio_max": _ratio_max,
             }
+            for suffix, threshold in K3_DEBUG_THRESHOLDS:
+                _kl_stats[f"kl_k3_debug_frac_gt_{suffix}"] = metric_reducer(
+                    (_per_token_k3 > threshold).float(), valid_mask_f
+                )
 
     # Compute PPO-style clipped loss (returns per-token losses, clip mask, and ratio)
     pg_losses, is_clipped, ratio = compute_ppo_loss(
@@ -325,6 +363,10 @@ def policy_loss_function(
     if _kl_stats is not None:
         metric_ops["ratio_min"] = "min"
         metric_ops["ratio_max"] = "max"
+        metric_ops["kl_k3_debug_max"] = "max"
+        metric_ops["kl_k3_debug_abs_logratio_max"] = "max"
+        metric_ops["kl_k3_debug_logratio_min"] = "min"
+        metric_ops["kl_k3_debug_logratio_max"] = "max"
     if tis_metrics:
         metric_ops["tis_min"] = "min"
         metric_ops["tis_max"] = "max"

@@ -107,3 +107,39 @@ def test_microbatch_composition(inputs, extra):
             torch.as_tensor(sum(mb.metrics[key] for mb in mbs), dtype=torch.float64),
             torch.as_tensor(expected, dtype=torch.float64),
         )
+
+
+def test_kl_debug_tail_metrics(inputs):
+    d = inputs
+    out = _call(d, slice(None), compute_kl_stats=True)
+
+    valid = d["labels"] != _IGNORE
+    log_ratio = out.per_token_logprobs - d["old_logprobs"]
+    k3 = torch.exp(log_ratio) - log_ratio - 1.0
+
+    assert_close(torch.as_tensor(out.metrics["kl_k3_debug_max"]), k3[valid].max())
+    assert_close(torch.as_tensor(out.metrics["kl_k3_debug_logratio_min"]), log_ratio[valid].min())
+    assert_close(torch.as_tensor(out.metrics["kl_k3_debug_logratio_max"]), log_ratio[valid].max())
+    assert_close(torch.as_tensor(out.metrics["kl_k3_debug_abs_logratio_max"]), log_ratio[valid].abs().max())
+    assert out.metric_ops["kl_k3_debug_max"] == "max"
+    assert out.metric_ops["kl_k3_debug_logratio_min"] == "min"
+    assert out.metric_ops["kl_k3_debug_logratio_max"] == "max"
+
+
+def test_logprob_temperature_drives_behavior_k3(inputs):
+    d = inputs
+    temperature = 0.7
+    labels = d["labels"]
+    logits = (d["hidden_states"].reshape(-1, d["hidden_states"].size(-1)) @ d["weight"].t()).float()
+    behavior_ce = torch.nn.functional.cross_entropy(
+        logits / temperature,
+        labels.reshape(-1),
+        reduction="none",
+        ignore_index=_IGNORE,
+    ).view_as(labels)
+    d = {**d, "old_logprobs": -behavior_ce}
+
+    out = _call(d, slice(None), compute_kl_stats=True, logprob_temperature=temperature)
+
+    assert_close(out.per_token_logprobs, -behavior_ce)
+    assert_close(torch.as_tensor(out.metrics["kl_sample_train_k3"]), torch.tensor(0.0))

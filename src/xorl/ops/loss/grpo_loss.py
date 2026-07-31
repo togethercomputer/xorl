@@ -130,6 +130,8 @@ def drgrpo_loss_function(
     lm_head_fp32: bool = False,
     loss_reducer: Reducer | None = None,
     metric_reducer: Reducer | None = None,
+    lm_head: torch.nn.Module | None = None,
+    logprob_temperature: float = 1.0,
 ) -> LossOutput:
     """DR-GRPO loss for RL training.
 
@@ -158,6 +160,10 @@ def drgrpo_loss_function(
             ``TokenPartial(scale=loss_mask.sum())`` (legacy local active-token
             mean; does not compose across mbs/ranks). Pass shared global-scale
             reducers to make summed partial shares recover the global value.
+        logprob_temperature: Temperature applied to trainer logits before
+            selected-token logprob calculation. ``1.0`` is raw policy logprobs;
+            setting this to the rollout temperature yields behavior-policy
+            semantics for DR-GRPO ratios and K3 stats.
 
     Returns:
         LossOutput with loss, per_token_logprobs, per_token_loss, and metrics.
@@ -180,6 +186,8 @@ def drgrpo_loss_function(
         num_chunks,
         tp_group=tp_group,
         lm_head_fp32=lm_head_fp32,
+        lm_head=lm_head,
+        logprob_temperature=logprob_temperature,
     )
     logprobs = -per_token_ce.view(B, S)
 
