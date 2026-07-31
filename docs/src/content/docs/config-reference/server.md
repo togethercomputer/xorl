@@ -28,7 +28,7 @@ python -m xorl.server.launcher --mode auto --config config.yaml \
 | `model_name` | same as `model_path` | Model identifier for validation. |
 | `config_path` | same as `model_path` | Path to model config. |
 | `tokenizer_path` | same as `config_path` | Path to tokenizer. |
-| `attn_implementation` | `flash_attention_3` | Attention backend: `eager`, `sdpa`, `native` (PyTorch SDPA+cuDNN, no deps, Hopper+Blackwell), `flash_attention_3` (FA3, Hopper), `flash_attention_4` (FA4 CUTE, Hopper+Blackwell). |
+| `attn_implementation` | `flash_attention_4` | Attention backend: `eager`, `sdpa`, `native` (PyTorch SDPA+cuDNN, no deps, Hopper+Blackwell), `flash_attention_3` (FA3, Hopper), `flash_attention_4` (FA4 CUTE, Hopper+Blackwell). |
 | `moe_implementation` | `null` | MoE kernel: `null` (auto), `eager`, `triton`, `native`, `quack`. |
 | `ep_dispatch` | `alltoall` | Expert-parallel dispatch: `alltoall` or `deepep` (NVLink-optimized). |
 | `deepep_buffer_size_gb` | `2.0` | DeepEP NVLink buffer size per GPU in GB. Only active when `ep_dispatch: deepep`. |

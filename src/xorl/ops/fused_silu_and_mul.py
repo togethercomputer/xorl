@@ -9,6 +9,13 @@ import triton
 import triton.language as tl
 
 
+def _native_silu_and_mul(input_tensor: torch.Tensor) -> torch.Tensor:
+    """Run SwiGLU with the eager PyTorch operation ordering used by serving."""
+    assert input_tensor.shape[-1] % 2 == 0, "Last dimension must be even"
+    split = input_tensor.shape[-1] // 2
+    return torch.nn.functional.silu(input_tensor[..., :split]) * input_tensor[..., split:]
+
+
 @triton.jit
 def _silu_and_mul_kernel(
     input_ptr,

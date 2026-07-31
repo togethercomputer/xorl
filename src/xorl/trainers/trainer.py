@@ -699,6 +699,7 @@ class Trainer:
             rmsnorm_mode=args.model.rmsnorm_mode,
             activation_native=args.model.activation_native,
             rope_native=args.model.rope_native,
+            rope_class_b=args.model.rope_class_b,
             attention_cast_bf16=args.model.attention_cast_bf16,
             sparse_mla_enabled=args.model.sparse_mla_enabled,
             sparse_mla_backend=args.model.sparse_mla_backend,

@@ -14,14 +14,14 @@ from xorl.models.checkpoint_handlers.buffers import (
 )
 from xorl.models.layers import ACT2FN, RotaryEmbedding
 from xorl.models.layers.attention import AttentionKwargs, update_causal_mask
-from xorl.models.layers.attention.backend import ATTENTION_FUNCTIONS
-from xorl.models.layers.attention.backend.eager import eager_attention_forward
+from xorl.models.layers.attention.backend import get_attention_fn
 from xorl.models.layers.moe import MoEBlock
 from xorl.models.layers.normalization import (
     compiled_zero_centered_rms_norm,
     eager_zero_centered_rms_norm,
     get_rmsnorm_mode,
     native_zero_centered_rms_norm,
+    native_zero_centered_rms_norm_without_batch_invariant,
 )
 from xorl.models.module_utils import MoEGradientCheckpointingLayer
 from xorl.models.outputs import MoeCausalLMOutput, MoeModelOutput
@@ -101,6 +101,7 @@ class Qwen3_5MoeRMSNorm(nn.Module):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         prenorm: bool = False,
+        force_sglang_residual: bool = False,
     ):
         residual_out: Optional[torch.Tensor] = None
         norm_input = x
@@ -114,6 +115,11 @@ class Qwen3_5MoeRMSNorm(nn.Module):
             out = native_zero_centered_rms_norm(norm_input, self.weight, self.eps)
         elif self.mode == "compile":
             out = compiled_zero_centered_rms_norm(norm_input, self.weight, self.eps)
+        elif self.mode == "sglang":
+            if residual_out is not None or force_sglang_residual:
+                out = native_zero_centered_rms_norm_without_batch_invariant(norm_input, self.weight, self.eps)
+            else:
+                out = native_zero_centered_rms_norm(norm_input, self.weight, self.eps)
         else:
             raise NotImplementedError(f"Unsupported rmsnorm_mode for Qwen3.5 MoE RMSNorm: {self.mode}")
 
@@ -184,7 +190,7 @@ class Qwen3_5MoeAttention(nn.Module):
         return self.o_proj(attn_output)
 
     def _get_attention_fn(self) -> Callable:
-        return ATTENTION_FUNCTIONS.get(self.config._attn_implementation, eager_attention_forward)
+        return get_attention_fn(self.config._attn_implementation)
 
     def _attention_kwargs(self) -> dict:
         return dict(
@@ -260,6 +266,7 @@ QWEN3_5_MOE_CLASSES = {
 class Qwen3_5MoeDecoderLayer(MoEGradientCheckpointingLayer):
     def __init__(self, config: Qwen3_5MoeConfig, layer_idx: int):
         super().__init__()
+        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.layer_type = config.layer_types[layer_idx] if layer_idx < len(config.layer_types) else "full_attention"
         self.self_attn = None
@@ -302,7 +309,10 @@ class Qwen3_5MoeDecoderLayer(MoEGradientCheckpointingLayer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Layernorm → attention → layernorm."""
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.input_layernorm(
+            hidden_states,
+            force_sglang_residual=self.layer_idx > 0 and self.input_layernorm.mode == "sglang",
+        )
 
         if self.linear_attn is not None:
             linear_kwargs = {}
@@ -553,7 +563,11 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
             if output_router_logits:
                 all_router_logits += (layer_outputs[-1],)
 
-        hidden_states = self.norm(hidden_states) if self.norm is not None else hidden_states
+        if self.norm is not None:
+            hidden_states = self.norm(
+                hidden_states,
+                force_sglang_residual=getattr(self.norm, "mode", None) == "sglang",
+            )
         return MoeModelOutput(
             last_hidden_state=hidden_states, attentions=all_self_attns, router_logits=all_router_logits
         )

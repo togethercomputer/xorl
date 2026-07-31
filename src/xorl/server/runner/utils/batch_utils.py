@@ -275,14 +275,13 @@ def batch_slice_rank_and_size(
     cp_size: int,
     pp_size: int,
 ) -> tuple[int, int]:
-    """Return (slice_rank, slice_count) for request batch dispatch.
+    """Return the logical request-batch slice rank and count.
 
-    Every rank gets a distinct batch slice; ranks that shard the same sequence
-    (CP/SP) or the same pipeline stage share one. With EP enabled the slice is
-    derived from the stage-local rank, so ranks within an EP group also see
-    distinct data. Set XORL_SERVER_EP_DUPLICATE_BATCHES=1 to restore the legacy
-    one-duplicated-slice-per-EP-group dispatch (see ep_duplicate_batches_enabled).
+    Ranks that shard the same sample through FSDP, CP/SP, TP, or pipeline
+    parallelism share a slice. EP ranks receive distinct slices unless the
+    legacy duplication switch is enabled.
     """
+    tp_size = max(1, int(getattr(parallel_state, "tp_size", 1)))
     if getattr(parallel_state, "ep_enabled", False):
         ranks_per_pp_stage = max(1, world_size // max(1, pp_size))
         local_stage_rank = rank % ranks_per_pp_stage
@@ -295,22 +294,33 @@ def batch_slice_rank_and_size(
                 try:
                     ep_fsdp_rank = int(ep_mesh.get_local_rank("ep_fsdp"))
                     return min(ep_fsdp_rank, ep_fsdp_size - 1), ep_fsdp_size
-                except Exception as exc:
-                    logger.debug(
-                        "Rank %s: could not read ep_fsdp local rank from EP mesh (%s); falling back to rank arithmetic",
-                        rank,
-                        exc,
-                    )
+                except Exception:
+                    logger.debug("Could not read ep_fsdp local rank; falling back to rank arithmetic", exc_info=True)
             ep_fsdp_rank = min(local_stage_rank // ep_size, ep_fsdp_size - 1)
             return ep_fsdp_rank, ep_fsdp_size
 
-        denom = max(1, cp_size)
+        denom = max(1, cp_size * tp_size)
         slice_count = max(1, ranks_per_pp_stage // denom)
         return min(local_stage_rank // denom, slice_count - 1), slice_count
 
-    dp_size = max(1, world_size // max(1, cp_size * pp_size))
-    dp_rank = min(rank // max(1, cp_size * pp_size), dp_size - 1)
-    return dp_rank, dp_size
+    if hasattr(parallel_state, "dp_replicate_size"):
+        try:
+            replicate_size = max(1, int(getattr(parallel_state, "dp_replicate_size")))
+            if replicate_size == 1:
+                return 0, 1
+            return int(getattr(parallel_state, "dp_replicate_rank")), replicate_size
+        except (TypeError, ValueError):
+            logger.debug("Could not read dp_replicate rank/size; falling back to dp rank/size", exc_info=True)
+
+    try:
+        return int(parallel_state.dp_rank), max(1, int(parallel_state.dp_size))
+    except (AttributeError, TypeError, ValueError):
+        ranks_per_pp_stage = max(1, world_size // max(1, pp_size))
+        local_stage_rank = rank % ranks_per_pp_stage
+        denom = max(1, cp_size * tp_size)
+        dp_size = max(1, ranks_per_pp_stage // denom)
+        dp_rank = min(local_stage_rank // denom, dp_size - 1)
+        return dp_rank, dp_size
 
 
 def _pad_teacher_hidden_states(value: list[Any]) -> torch.Tensor:

@@ -26,7 +26,13 @@ from xorl.models.checkpoint_handlers.buffers import (
     detect_prequantized_checkpoint,
     get_prequantized_exclude_modules,
 )
-from xorl.models.layers import ACT2FN, RMSNorm, RotaryEmbedding
+from xorl.models.layers import (
+    ACT2FN,
+    RMS_NORM_FAMILY_NO_RESIDUAL,
+    RMS_NORM_FAMILY_RESIDUAL_TREE,
+    RMSNorm,
+    RotaryEmbedding,
+)
 from xorl.models.layers.attention import (
     AttentionKwargs,
     MultiHeadAttention,
@@ -223,8 +229,17 @@ class Qwen3MoeDecoderLayer(MoEGradientCheckpointingLayer):
 
         self.self_attn = Qwen3MoeAttention(config, layer_idx)
 
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Family contract: layer-0 input norm is a no-residual site; at layer>0
+        # the pre-summed input sits on the serving residual tree (the norm-seed
+        # fix, now declared explicitly).
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            family=RMS_NORM_FAMILY_RESIDUAL_TREE if layer_idx > 0 else RMS_NORM_FAMILY_NO_RESIDUAL,
+        )
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, family=RMS_NORM_FAMILY_RESIDUAL_TREE
+        )
 
         if (layer_idx not in config.mlp_only_layers) and (
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
@@ -360,7 +375,7 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         self.layers = nn.ModuleList(
             [Qwen3MoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, family=RMS_NORM_FAMILY_RESIDUAL_TREE)
         self.rotary_emb = RotaryEmbedding(config=config)
 
         self.gradient_checkpointing = False

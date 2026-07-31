@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import torch
 
+from xorl.models.layers.rope import rope_class_b_enabled, stock_fused_apply_rotary_pos_emb
+
 
 def glm5_rotate_half(x: torch.Tensor, interleaved: bool = False) -> torch.Tensor:
     if not interleaved:
@@ -23,6 +25,9 @@ def glm5_apply_rotary_pos_emb(
     sin: torch.Tensor,
     interleaved: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if rope_class_b_enabled() and q.is_cuda:
+        return stock_fused_apply_rotary_pos_emb(q, k, cos, sin, interleaved=interleaved)
+
     if interleaved:
         # RotaryEmbedding emits halved layout [c0..cN, c0..cN], while
         # interleaved rotate_half pairs dimensions as (0, 1), (2, 3), ...

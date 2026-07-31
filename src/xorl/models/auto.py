@@ -16,7 +16,7 @@ from transformers import (
 from ..distributed.parallel_state import get_parallel_state
 from ..ops.moe.triton import resolve_routing_weights_before_down, set_routing_weights_before_down
 from ..utils import logging
-from .layers.attention import ATTENTION_FUNCTIONS
+from .layers.attention import get_attention_fn
 from .layers.normalization import set_rmsnorm_mode
 from .loader import ModelLoader, get_loader
 from .transformers.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
@@ -353,13 +353,10 @@ def build_foundation_model(
 
     loader: ModelLoader = get_loader(config)
 
-    # Validate FA4 availability early
+    # Validate the requested backend is importable before loading weights, so a
+    # missing flash build raises here instead of reaching the first forward.
+    get_attention_fn(attn_implementation)
     if attn_implementation == "flash_attention_4":
-        if "flash_attention_4" not in ATTENTION_FUNCTIONS:
-            raise ImportError(
-                "flash_attention_4 requested but flash_attn.cute is not installed. "
-                "Please install FA4 dependencies or use flash_attention_3."
-            )
         logger.info_rank0("Using Flash Attention 4 (CUTE) for attention computation")
 
     # For HF model init: map all flash variants to "flash_attention_2" (HF's known key).

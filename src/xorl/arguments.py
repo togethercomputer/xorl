@@ -573,6 +573,12 @@ class ModelArguments:
     rope_native: bool = field(
         default=False, metadata={"help": "Use naive RoPE implementation instead of flash_attn fused kernel."}
     )
+    rope_class_b: bool = field(
+        default=False,
+        metadata={
+            "help": "Use compiled Class-B RoPE fp32-chain numerics aligned with SGLang's stock fused CUDA kernel."
+        },
+    )
     attention_cast_bf16: bool = field(
         default=False, metadata={"help": "Explicitly cast Q/K to bfloat16 after RoPE for SGLang alignment."}
     )

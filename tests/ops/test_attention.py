@@ -1,24 +1,80 @@
 """Tests for attention backend functions."""
 
+import importlib
+import sys
+import types
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
+import xorl.models.layers.attention.backend as backend_module
+import xorl.models.layers.attention.backend.flash_attention as flash_module
+from xorl.models.layers.attention.backend import ATTENTION_FUNCTIONS, is_flash_attention
 from xorl.models.layers.attention.backend.eager import eager_attention_forward
 from xorl.models.layers.attention.utils import repeat_kv
 
 
 try:
-    from xorl.models.layers.attention.backend.flash_attention import flash_attention_forward
+    from xorl.models.layers.attention.backend.flash_attention import FA3_AVAILABLE, flash_attention_forward
 
     _FLASH_ATTN_IMPORT_ERROR = None
 except ImportError as exc:
+    FA3_AVAILABLE = False
     flash_attention_forward = None
     _FLASH_ATTN_IMPORT_ERROR = exc
 
 
 pytestmark = pytest.mark.cpu
+
+
+class TestAttentionBackendRegistry:
+    """flash_attention_forward picks FA3/FA4 internally, so registration must not
+    depend on FA3 alone: an unregistered key silently dispatches to eager."""
+
+    def test_flash_attention_2_registry_and_mask_detection_are_consistent(self):
+        assert is_flash_attention("flash_attention_2") == ("flash_attention_2" in ATTENTION_FUNCTIONS)
+        if "flash_attention_2" in ATTENTION_FUNCTIONS:
+            assert ATTENTION_FUNCTIONS["flash_attention_2"] is ATTENTION_FUNCTIONS["flash_attention_3"]
+
+    def test_flash_attention_registers_without_flash_attention_3_dependency(self, monkeypatch):
+        fake_flash_attn = types.ModuleType("flash_attn")
+        fake_flash_attn.__path__ = []
+        fake_cute = types.ModuleType("flash_attn.cute")
+        fake_cute.flash_attn_func = Mock()
+        fake_cute.flash_attn_varlen_func = Mock()
+
+        monkeypatch.setitem(sys.modules, "flash_attn_interface", None)
+        monkeypatch.setitem(sys.modules, "flash_attn", fake_flash_attn)
+        monkeypatch.setitem(sys.modules, "flash_attn.cute", fake_cute)
+
+        try:
+            reloaded_flash = importlib.reload(flash_module)
+            reloaded_backend = importlib.reload(backend_module)
+
+            assert not reloaded_flash.FA3_AVAILABLE
+            assert reloaded_flash.FA4_AVAILABLE
+            assert "flash_attention_3" in reloaded_backend.ATTENTION_FUNCTIONS
+            assert "flash_attention_4" in reloaded_backend.ATTENTION_FUNCTIONS
+        finally:
+            monkeypatch.undo()
+            importlib.reload(flash_module)
+            importlib.reload(backend_module)
+
+    # Resolved through backend_module rather than the names imported above:
+    # the reload test rebinds the module's registry, and a stale reference would
+    # make these assert against a dict get_attention_fn no longer reads.
+    def test_unavailable_flash_backend_raises_instead_of_running_eager(self, monkeypatch):
+        monkeypatch.delitem(backend_module.ATTENTION_FUNCTIONS, "flash_attention_3", raising=False)
+        with pytest.raises(ImportError, match="flash_attention_3"):
+            backend_module.get_attention_fn("flash_attention_3")
+
+    def test_get_attention_fn_returns_registered_and_non_flash_backends(self):
+        assert backend_module.get_attention_fn("eager") is eager_attention_forward
+        assert backend_module.get_attention_fn("native") is backend_module.ATTENTION_FUNCTIONS["native"]
+        # A non-flash implementation has no attention contract to drop, so it
+        # may still default to eager; only the flash family raises.
+        assert backend_module.get_attention_fn("flex_attention") is eager_attention_forward
 
 
 class TestRepeatKV:
@@ -64,6 +120,8 @@ class TestFlashAttentionForward:
     def _skip_when_flash_attention_unavailable(self):
         if _FLASH_ATTN_IMPORT_ERROR is not None:
             pytest.skip(f"flash attention backend unavailable: {_FLASH_ATTN_IMPORT_ERROR}")
+        if not FA3_AVAILABLE:
+            pytest.skip("flash attention 3 backend unavailable")
 
     def test_flash_attention_api_behavior(self):
         """Warnings, is_causal handling, return values, scaling, sliding window."""
@@ -114,7 +172,7 @@ class TestFlashAttentionForward:
                 attention_mask=None,
                 is_causal=True,
             )
-            assert mock_fa.call_args[1]["causal"] == False
+            assert not mock_fa.call_args[1]["causal"]
 
             # Returns None attention weights
             module.is_causal = True
@@ -230,4 +288,197 @@ class TestEagerAttentionForward:
                 attention_mask=None,
                 scaling=8**-0.5,
                 dropout=0.0,
+            )
+
+
+class TestPageSize1KVCacheParityPaths:
+    """The env-gated routes must reach the serving entry point with num_splits=1."""
+
+    @pytest.fixture(autouse=True)
+    def _skip_when_flash_attention_unavailable(self):
+        if _FLASH_ATTN_IMPORT_ERROR is not None:
+            pytest.skip(f"flash attention backend unavailable: {_FLASH_ATTN_IMPORT_ERROR}")
+
+    @staticmethod
+    def _module():
+        module = Mock()
+        module.is_causal = True
+        module.config = Mock()
+        module.config._flash_attention_deterministic = False
+        return module
+
+    def test_varlen_path_routes_through_sgl_kernel(self):
+        total_tokens, num_heads, head_dim = 32, 8, 64
+        query = torch.randn(1, total_tokens, num_heads, head_dim)
+        key = torch.randn(1, total_tokens, num_heads, head_dim)
+        value = torch.randn(1, total_tokens, num_heads, head_dim)
+        cu_seqlens = torch.tensor([0, 16, 32], dtype=torch.int64)
+
+        with (
+            patch.object(flash_module, "XORL_FLASH_ATTN_SGL_KERNEL", True),
+            patch.object(flash_module, "sgl_flash_attn_with_kvcache") as mock_sgl,
+        ):
+            mock_sgl.return_value = torch.zeros(total_tokens, num_heads, head_dim)
+            result, _ = flash_attention_forward(
+                self._module(),
+                query,
+                key,
+                value,
+                attention_mask=None,
+                scaling=0.125,
+                cu_seq_lens_q=cu_seqlens,
+                cu_seq_lens_k=cu_seqlens,
+                max_length_q=16,
+                max_length_k=16,
+            )
+        assert mock_sgl.called
+        kwargs = mock_sgl.call_args[1]
+        assert kwargs["num_splits"] == 1
+        assert kwargs["cu_seqlens_q"].dtype == torch.int32
+        # page-size-1 KV cache: one page per token
+        assert kwargs["k_cache"].shape == (total_tokens, 1, num_heads, head_dim)
+        assert kwargs["page_table"].shape == (2, 16)
+        assert kwargs["cache_seqlens"].tolist() == [16, 16]
+        assert kwargs["softmax_scale"] == 0.125
+        assert kwargs["causal"] is True
+        assert result.shape == (1, total_tokens, num_heads, head_dim)
+
+    def test_single_sequence_batched_path_synthesizes_cu_seqlens(self):
+        seqlen, num_heads, head_dim = 16, 8, 64
+        query = torch.randn(1, seqlen, num_heads, head_dim)
+        key = torch.randn(1, seqlen, num_heads, head_dim)
+        value = torch.randn(1, seqlen, num_heads, head_dim)
+
+        with (
+            patch.object(flash_module, "XORL_FLASH_ATTN_SGL_KERNEL", True),
+            patch.object(flash_module, "sgl_flash_attn_with_kvcache") as mock_sgl,
+        ):
+            mock_sgl.return_value = torch.zeros(seqlen, num_heads, head_dim)
+            result, _ = flash_attention_forward(
+                self._module(),
+                query,
+                key,
+                value,
+                attention_mask=None,
+            )
+        assert mock_sgl.called
+        kwargs = mock_sgl.call_args[1]
+        assert kwargs["cu_seqlens_q"].tolist() == [0, seqlen]
+        assert kwargs["max_seqlen_q"] == seqlen
+        assert result.shape == (1, seqlen, num_heads, head_dim)
+
+    def test_paged_kvcache_flag_pins_num_splits(self):
+        total_tokens, num_heads, head_dim = 32, 8, 64
+        query = torch.randn(1, total_tokens, num_heads, head_dim)
+        key = torch.randn(1, total_tokens, num_heads, head_dim)
+        value = torch.randn(1, total_tokens, num_heads, head_dim)
+        cu_seqlens = torch.tensor([0, 16, 32], dtype=torch.int64)
+
+        with (
+            patch.object(flash_module, "XORL_FLASH_ATTN_SGL_KERNEL", False),
+            patch.object(flash_module, "XORL_FLASH_ATTN_PAGED_KVCACHE", True),
+            patch.object(flash_module, "FA3_AVAILABLE", True),
+            patch.object(flash_module, "_should_use_fa4", return_value=False),
+            patch.object(flash_module, "flash_attn_with_kvcache") as mock_kvcache,
+        ):
+            mock_kvcache.return_value = torch.zeros(total_tokens, num_heads, head_dim)
+            flash_attention_forward(
+                self._module(),
+                query,
+                key,
+                value,
+                attention_mask=None,
+                cu_seq_lens_q=cu_seqlens,
+                cu_seq_lens_k=cu_seqlens,
+                max_length_q=16,
+                max_length_k=16,
+            )
+        assert mock_kvcache.called
+        kwargs = mock_kvcache.call_args[1]
+        assert kwargs["num_splits"] == 1
+        assert kwargs["k_cache"].shape == (total_tokens, 1, num_heads, head_dim)
+
+    def test_flags_off_keep_default_varlen_path(self):
+        total_tokens, num_heads, head_dim = 32, 8, 64
+        query = torch.randn(1, total_tokens, num_heads, head_dim)
+        key = torch.randn(1, total_tokens, num_heads, head_dim)
+        value = torch.randn(1, total_tokens, num_heads, head_dim)
+        cu_seqlens = torch.tensor([0, 16, 32], dtype=torch.int64)
+
+        with (
+            patch.object(flash_module, "XORL_FLASH_ATTN_SGL_KERNEL", False),
+            patch.object(flash_module, "XORL_FLASH_ATTN_PAGED_KVCACHE", False),
+            patch.object(flash_module, "FA3_AVAILABLE", True),
+            patch.object(flash_module, "sgl_flash_attn_with_kvcache") as mock_sgl,
+            patch.object(flash_module, "_should_use_fa4", return_value=False),
+            patch.object(flash_module, "flash_attn_varlen_func") as mock_varlen,
+        ):
+            mock_varlen.return_value = torch.zeros(total_tokens, num_heads, head_dim)
+            flash_attention_forward(
+                self._module(),
+                query,
+                key,
+                value,
+                attention_mask=None,
+                cu_seq_lens_q=cu_seqlens,
+                cu_seq_lens_k=cu_seqlens,
+                max_length_q=16,
+                max_length_k=16,
+            )
+        assert not mock_sgl.called
+        assert mock_varlen.called
+
+    def test_fa4_path_pins_num_splits_and_forwards_scale(self):
+        total_tokens, num_heads, head_dim = 32, 8, 64
+        query = torch.randn(1, total_tokens, num_heads, head_dim)
+        key = torch.randn(1, total_tokens, num_heads, head_dim)
+        value = torch.randn(1, total_tokens, num_heads, head_dim)
+        cu_seqlens = torch.tensor([0, 16, 32], dtype=torch.int64)
+
+        with (
+            patch.object(flash_module, "XORL_FLASH_ATTN_SGL_KERNEL", False),
+            patch.object(flash_module, "FA4_AVAILABLE", True),
+            patch.object(flash_module, "_should_use_fa4", return_value=True),
+            patch.object(flash_module, "fa4_flash_attn_varlen_func") as mock_fa4,
+        ):
+            mock_fa4.return_value = (torch.zeros(total_tokens, num_heads, head_dim), None)
+            flash_attention_forward(
+                self._module(),
+                query,
+                key,
+                value,
+                attention_mask=None,
+                scaling=0.125,
+                cu_seq_lens_q=cu_seqlens,
+                cu_seq_lens_k=cu_seqlens,
+                max_length_q=16,
+                max_length_k=16,
+            )
+        assert mock_fa4.called
+        kwargs = mock_fa4.call_args[1]
+        assert kwargs["num_splits"] == 1
+        assert kwargs["softmax_scale"] == 0.125
+        assert kwargs["causal"] is True
+
+    def test_rejects_cross_attention_cu_seqlens(self):
+        num_heads, head_dim = 8, 64
+        q = torch.randn(32, num_heads, head_dim)
+        k = torch.randn(48, num_heads, head_dim)
+        v = torch.randn(48, num_heads, head_dim)
+        with (
+            patch.object(flash_module, "sgl_flash_attn_with_kvcache", Mock()),
+            pytest.raises(ValueError, match="self-attention"),
+        ):
+            flash_module._flash_attn_varlen_with_sgl_kernel(
+                q,
+                k,
+                v,
+                torch.tensor([0, 32], dtype=torch.int32),
+                torch.tensor([0, 48], dtype=torch.int32),
+                32,
+                48,
+                None,
+                True,
+                (-1, -1),
+                None,
             )
