@@ -24,6 +24,7 @@ from typing import Optional
 import torch
 
 from xorl.ops.quack.gemm_interface import gemm as quack_gemm
+from xorl.ops.quack.gemm_interface import gemm_gated as quack_gemm_gated
 
 
 def _quack_tuned_enabled() -> bool:
@@ -32,6 +33,19 @@ def _quack_tuned_enabled() -> bool:
 
 
 _TUNED = _quack_tuned_enabled()
+
+
+def _is_fp8_dtype(dtype: torch.dtype) -> bool:
+    return dtype in {
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e5m2", None),
+    }
+
+
+def _ensure_fp8_b_k_major(b: torch.Tensor) -> torch.Tensor:
+    if _is_fp8_dtype(b.dtype) and b.stride(-2) != 1:
+        return b.transpose(-2, -1).contiguous().transpose(-2, -1)
+    return b
 
 
 def cumsum_to_cu_seqlens(cumsum: torch.Tensor) -> torch.Tensor:
@@ -72,6 +86,7 @@ def quack_group_gemm_same_nk(
         b_quack = b.transpose(-2, -1).contiguous()
     else:
         b_quack = b
+    b_quack = _ensure_fp8_b_k_major(b_quack)
 
     if out is None:
         out = torch.empty(total_M, N, dtype=a.dtype, device=a.device)
@@ -90,6 +105,35 @@ def quack_group_gemm_same_nk(
     )
 
     return out
+
+
+def quack_group_gemm_gated_same_nk(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    cumsum_M: torch.Tensor,
+    max_M: int,
+    activation: str,
+    preact_out: Optional[torch.Tensor] = None,
+    postact_out: Optional[torch.Tensor] = None,
+    store_preact: bool = False,
+    cu_seqlens_m: Optional[torch.Tensor] = None,
+) -> tuple[Optional[torch.Tensor], torch.Tensor]:
+    """Grouped gate/up GEMM with Quack's fused gated activation."""
+    del max_M  # Kept for API compatibility with the other grouped GEMM helpers.
+
+    if cu_seqlens_m is None:
+        cu_seqlens_m = cumsum_to_cu_seqlens(cumsum_M)
+
+    return quack_gemm_gated(
+        A=a,
+        B=b,
+        preact_out=preact_out,
+        postact_out=postact_out,
+        activation=activation,
+        cu_seqlens_m=cu_seqlens_m,
+        store_preact=store_preact,
+        tuned=_TUNED,
+    )
 
 
 def quack_group_gemm_same_mn(

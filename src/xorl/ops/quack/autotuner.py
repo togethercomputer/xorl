@@ -7,7 +7,9 @@ import builtins
 import hashlib
 import inspect
 import json
+import math
 import os
+import stat
 import time
 from functools import cached_property, partial
 from pathlib import Path
@@ -24,6 +26,29 @@ PACKAGE_NAME = "quack"
 VERSION = __version__
 
 
+def _get_current_cuda_device() -> str | None:
+    """Return the physical CUDA device identifier for the current process.
+
+    Maps the logical ``torch.cuda.current_device()`` index through
+    ``CUDA_VISIBLE_DEVICES`` (if set) so the result is valid as a
+    standalone ``CUDA_VISIBLE_DEVICES`` value (handles integer IDs,
+    GPU UUIDs, and MIG IDs).
+
+    Returns ``None`` if CUDA is not initialized or the device cannot
+    be determined.
+    """
+    if not (torch.cuda.is_available() and torch.cuda.is_initialized()):
+        return None
+    logical_device = torch.cuda.current_device()
+    parent_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if parent_visible is not None:
+        visible_devices = [d.strip() for d in parent_visible.split(",")]
+        if logical_device < len(visible_devices):
+            return visible_devices[logical_device]
+        return None
+    return str(logical_device)
+
+
 def get_home_dir():
     return os.getenv(f"{PACKAGE_NAME.upper()}_HOME", Path.home())
 
@@ -35,18 +60,50 @@ def default_cache_dir():
 class FileCacheManager(triton.runtime.cache.FileCacheManager):
     def __init__(self, key):
         super().__init__(key)
-        self.cache_dir = os.getenv(f"{PACKAGE_NAME.upper()}_CACHE_DIR", "").strip() or default_cache_dir()
-        if self.cache_dir:
-            self.cache_dir = os.path.join(self.cache_dir, self.key)
-            self.lock_path = os.path.join(self.cache_dir, "lock")
-            os.makedirs(self.cache_dir, exist_ok=True)
-        else:
-            raise RuntimeError("Could not create or locate cache dir")
+        raw_cache_root = os.getenv(f"{PACKAGE_NAME.upper()}_CACHE_DIR", "").strip() or default_cache_dir()
+        cache_root = Path(raw_cache_root).expanduser()
+        if cache_root.is_symlink():
+            raise RuntimeError(f"Autotune cache root cannot be a symlink: {cache_root}")
+        cache_root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        cache_root = cache_root.resolve()
+        root_metadata = cache_root.stat()
+        if not stat.S_ISDIR(root_metadata.st_mode) or root_metadata.st_uid != os.getuid():
+            raise RuntimeError(f"Autotune cache root must be owned by the current user: {cache_root}")
+        if root_metadata.st_mode & 0o077:
+            cache_root.chmod(0o700)
+
+        cache_dir = cache_root / self.key
+        if cache_dir.is_symlink():
+            raise RuntimeError(f"Autotune cache directory cannot be a symlink: {cache_dir}")
+        cache_dir.mkdir(mode=0o700, exist_ok=True)
+        metadata = cache_dir.stat()
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+            raise RuntimeError(f"Autotune cache directory must be owned by the current user: {cache_dir}")
+        if metadata.st_mode & 0o077:
+            cache_dir.chmod(0o700)
+        self.cache_dir = str(cache_dir)
+        self.lock_path = str(cache_dir / "lock")
 
 
 def _base32(key):
     # Assume key is a hex string.
     return base64.b32encode(bytes.fromhex(key)).decode("utf-8").rstrip("=")
+
+
+def _gpu_warmup(duration_ms=200):
+    """Saturate the GPU to reach thermal steady-state before benchmarking.
+
+    Without this, the first autotuning config gets artificially good numbers
+    because the GPU hasn't been power-throttled yet.
+    """
+    a = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+    torch.cuda.synchronize()
+    target = duration_ms / 1000
+    t0 = time.time()
+    while time.time() - t0 < target:
+        for _ in range(100):
+            a = a @ a
+        torch.cuda.synchronize()
 
 
 class Autotuner:
@@ -117,6 +174,153 @@ class Autotuner:
             return partial(triton.testing.do_bench, warmup=5, rep=25)
         return self._do_bench
 
+    def _precompile(self, *args, configs, **kwargs):
+        """Pre-compile all configs in parallel subprocesses to populate .o cache.
+
+        cute.compile() is not thread-safe (MLIR thread-local state) and fork after
+        CUDA init causes segfaults. So we spawn persistent subprocess workers: each
+        has its own CUDA context, creates FakeTensors matching the parent's tensor
+        metadata, and compiles with COMPILE_ONLY=True. Workers stay alive to amortize
+        import overhead across multiple configs. The parent then loads instantly from
+        the .o cache during benchmarking.
+        """
+        from .cache_utils import CACHE_ENABLED
+
+        if not CACHE_ENABLED:
+            return
+
+        max_workers = min(len(configs), int(os.getenv("QUACK_COMPILE_WORKERS", "8")))
+        if max_workers <= 1:
+            return
+
+        # Quick check: compile first config in-process. If it loads from .o cache
+        # (<0.5s), the rest are likely cached too — skip spawning workers.
+        t_check = time.time()
+        try:
+            current = dict(kwargs, **configs[0].all_kwargs())
+            self.fn(*args, **current)
+        except Exception:
+            pass
+        if time.time() - t_check < 0.5:
+            return
+
+        verbose = os.getenv(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1"
+        if verbose:
+            print(f"Pre-compiling {len(configs)} configs with {max_workers} workers")
+        t0 = time.time()
+
+        import subprocess
+        import sys
+
+        from ._worker_protocol import recv_message, send_message
+
+        # Serialize tensor metadata
+        tensor_meta = []
+        for arg in args:
+            if isinstance(arg, Tensor):
+                tensor_meta.append(
+                    {
+                        "shape": list(arg.shape),
+                        "stride": list(arg.stride()),
+                        "dtype": str(arg.dtype),
+                    }
+                )
+            else:
+                tensor_meta.append(arg)
+
+        fn_module = self.fn.__module__
+        fn_qualname = self.fn.__qualname__
+
+        # Restrict worker subprocesses to the parent's current CUDA device.
+        # Without this, all workers default to cuda:0 and their CUDA context
+        # initialization can OOM when many ranks share a node.
+        worker_env = os.environ.copy()
+        current_device = _get_current_cuda_device()
+        if current_device is not None:
+            worker_env["CUDA_VISIBLE_DEVICES"] = current_device
+
+        worker_timeout_s = float(os.getenv("QUACK_COMPILE_WORKER_TIMEOUT_S", "300"))
+        if worker_timeout_s <= 0:
+            raise ValueError("QUACK_COMPILE_WORKER_TIMEOUT_S must be positive")
+
+        def _terminate(worker):
+            if worker.poll() is None:
+                worker.kill()
+            worker.wait()
+
+        # Launch persistent worker pool
+        workers = []
+        completed = False
+        try:
+            for _ in range(max_workers):
+                p = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-m",
+                        "xorl.ops.quack._compile_worker",
+                        fn_module,
+                        fn_qualname,
+                    ],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL if not verbose else None,
+                    env=worker_env,
+                )
+                try:
+                    ready = recv_message(p.stdout, timeout_s=worker_timeout_s)
+                except (OSError, TimeoutError, ValueError):
+                    _terminate(p)
+                    continue
+                if ready != "READY":
+                    _terminate(p)
+                    continue
+                workers.append(p)
+
+            if not workers:
+                return
+
+            # Round-robin dispatch configs to workers
+            pending = [0] * len(workers)
+            for i, config in enumerate(configs):
+                w = workers[i % len(workers)]
+                send_message(
+                    w.stdin,
+                    {
+                        "tensor_meta": tensor_meta,
+                        "kwargs": kwargs,
+                        "config_kwargs": config.all_kwargs(),
+                    },
+                )
+                pending[i % len(workers)] += 1
+
+            # A worker failure only disables this optimization. Benchmarking below
+            # compiles any missing configurations in the parent process.
+            for wi, w in enumerate(workers):
+                for _ in range(pending[wi]):
+                    response = recv_message(w.stdout, timeout_s=worker_timeout_s)
+                    if response != "OK":
+                        raise RuntimeError(f"Compile worker failed: {response}")
+            completed = True
+        except (BrokenPipeError, OSError, RuntimeError, TimeoutError, ValueError) as exc:
+            if verbose:
+                print(f"Parallel pre-compilation disabled after worker failure: {exc}")
+        finally:
+            for w in workers:
+                if completed and w.poll() is None:
+                    try:
+                        w.stdin.close()
+                        w.wait(timeout=5)
+                    except (BrokenPipeError, subprocess.TimeoutExpired):
+                        _terminate(w)
+                else:
+                    _terminate(w)
+
+        if not completed:
+            return
+
+        if verbose:
+            print(f"Pre-compilation done in {time.time() - t0:.1f}s")
+
     def _bench(self, *args, config, **meta):
         verbose = os.environ.get(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1"
         if verbose:
@@ -176,14 +380,41 @@ class Autotuner:
         path = cache.get_file(file_name)
         # There's an environment variable to force cache update
         if path and not os.environ.get(f"{PACKAGE_NAME.upper()}_FORCE_CACHE_UPDATE", False):
-            str2config = {s: c for s, c in zip(config_str_list, configs)}
-            with open(path, "r") as cached_configs:
-                timings = json.load(cached_configs)["configs_timings"]
-                timings = {str2config[config]: timing for config, timing in timings}
+            from .cache_utils import _trusted_cache_object
+
+            try:
+                cache_path = Path(path)
+                if not _trusted_cache_object(cache_path):
+                    raise ValueError(f"Refusing untrusted autotune cache file: {cache_path}")
+                cached_payload = json.loads(cache_path.read_text(encoding="utf-8"))
+                raw_timings = cached_payload["configs_timings"]
+                if not isinstance(raw_timings, list) or len(raw_timings) != len(configs):
+                    raise ValueError("Autotune cache has an invalid config set")
+                str2config = dict(zip(config_str_list, configs))
+                timings = {}
+                for entry in raw_timings:
+                    if not isinstance(entry, list) or len(entry) != 2 or entry[0] not in str2config:
+                        raise ValueError("Autotune cache has an unknown config")
+                    timing = entry[1]
+                    if (
+                        not isinstance(timing, list)
+                        or not timing
+                        or any(
+                            not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0
+                            for value in timing
+                        )
+                    ):
+                        raise ValueError("Autotune cache has invalid timings")
+                    timings[str2config[entry[0]]] = timing
+                if len(timings) != len(configs):
+                    raise ValueError("Autotune cache has duplicate configs")
+            except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+                pass
+            else:
                 self.cache[tuning_key] = builtins.min(timings, key=timings.get)
                 self.configs_timings = timings
                 self.bench_time = 0
-            return
+                return
 
         bench_fn()
         cache.put(
@@ -218,6 +449,8 @@ class Autotuner:
 
                 @torch.compiler.disable  # Don't want any tracing here
                 def benchmark():
+                    self._precompile(*args, configs=pruned_configs, **kwargs)
+                    _gpu_warmup()
                     bench_start = time.time()
                     timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
                     bench_end = time.time()
@@ -299,11 +532,11 @@ class AutotuneConfig:
         return ", ".join(res)
 
     def __hash__(self):
-        return hash(tuple(*self.all_kwargs().items()))
+        return hash(tuple(self.all_kwargs().items()))
 
     def __eq__(self, other):
-        self_tuple = tuple(*self.all_kwargs().items())
-        other_tuple = tuple(*other.all_kwargs().items())
+        self_tuple = tuple(self.all_kwargs().items())
+        other_tuple = tuple(other.all_kwargs().items())
         return self_tuple == other_tuple
 
 
