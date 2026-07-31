@@ -497,12 +497,83 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         combine_kwargs = self._build_combine_kwargs(expert_output, ctx, dispatch_kwargs, parallel_state)
         return EP_COMBINE[self.ep_dispatch](**combine_kwargs)
 
+    def sglang_ep_native_routed_partial(
+        self,
+        hidden_flat: torch.Tensor,
+        routing_flat: torch.Tensor,
+        local_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """LoRA-aware local partial for the native EP ordered-combine lane.
+
+        The native combine enters through ``Module.__call__`` so FSDP
+        materializes this rank's expert slice. Fold the active LoRA factors
+        into that slice with the same canonical arithmetic used by weight
+        sync, then run the masked serving kernel (``-1`` means non-local).
+        Forward bits therefore remain the serving bytes while the custom
+        folded-weight autograd sends gradients into the low-rank factors.
+        """
+        from .experts import (  # noqa: PLC0415
+            _MOE_SGLANG_EP_COMBINE_ENV,
+            MoEExperts,
+            _sglang_fused_experts_kernel_call,
+            _SglangFusedExpertsTrainFunction,
+            moe_sglang_fused_experts_weight_mode,
+        )
+
+        if not lora_merged_forward_enabled():
+            raise NotImplementedError(
+                f"{_MOE_SGLANG_EP_COMBINE_ENV}=native on LoRA-adapted experts requires XORL_LORA_MERGED_FORWARD=1"
+            )
+        if self.hidden_act not in {"silu", "gelu_tanh"} or self.swiglu_limit != 0.0:
+            raise NotImplementedError("LoRA native EP combine supports gated silu/gelu_tanh without swiglu_limit only")
+        if moe_sglang_fused_experts_weight_mode() == "cached":
+            raise NotImplementedError(
+                "XORL_LORA_MERGED_FORWARD=1 does not compose with WEIGHT_MODE=cached; use strided/transient."
+            )
+
+        fused_experts_impl = MoEExperts._load_sglang_fused_experts_impl()
+        activation = "gelu" if self.hidden_act == "gelu_tanh" else self.hidden_act
+        e_local = int(self.gate_up_proj.shape[0])
+
+        if self._merged_lora_needs_grad(hidden_flat, routing_flat):
+            gate_up_w, down_w = self._merged_trainable_weights()
+            return _SglangFusedExpertsTrainFunction.apply(
+                hidden_flat,
+                routing_flat,
+                local_ids,
+                gate_up_w,
+                down_w,
+                fused_experts_impl,
+                activation,
+                self.hidden_act,
+                self.swiglu_limit,
+                e_local,
+                None,
+                True,
+            )
+
+        gate_up_f, down_f = self._merged_weights()
+        return _sglang_fused_experts_kernel_call(
+            hidden_flat,
+            gate_up_f,
+            down_f,
+            routing_flat,
+            local_ids,
+            fused_experts_impl,
+            activation,
+            self.swiglu_limit,
+            None,
+            weight_cache=None,
+            filter_expert=True,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         routing_weights: torch.Tensor = None,
         selected_experts: torch.Tensor = None,
         expert_idx: int = None,
+        sglang_ep_native_local_ids: torch.Tensor = None,
     ) -> torch.Tensor:
         """Forward pass with LoRA.
 
@@ -510,6 +581,13 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         For all implementations: checks EP first, falls back to local path.
         """
         from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+
+        if sglang_ep_native_local_ids is not None:
+            return self.sglang_ep_native_routed_partial(
+                hidden_states,
+                routing_weights,
+                sglang_ep_native_local_ids,
+            )
 
         parallel_state = get_parallel_state()
 

@@ -234,6 +234,56 @@ class RoutingReplayHandler:
         """Append a CPU replay buffer without the extra pinned-memory staging copy."""
         getattr(replay, list_name).append(tensor.detach().cpu().contiguous())
 
+    @staticmethod
+    def _flatten_labels_for_decode_cache(labels: Any) -> List[int]:
+        if labels is None:
+            return []
+        if isinstance(labels, torch.Tensor):
+            return [int(v) for v in labels.reshape(-1).tolist()]
+        if isinstance(labels, np.ndarray):
+            return [int(v) for v in labels.reshape(-1).tolist()]
+        if isinstance(labels, list):
+            if labels and isinstance(labels[0], list):
+                return [int(v) for row in labels for v in row]
+            return [int(v) for v in labels]
+        return []
+
+    @staticmethod
+    def _decode_cache_segments(labels: List[int]) -> List[tuple[int, int]]:
+        valid_positions = [idx for idx, label in enumerate(labels) if label != -100]
+        if not valid_positions:
+            return []
+        first_valid = valid_positions[0]
+        last_valid = valid_positions[-1]
+        return [(0, first_valid + 1), *((pos, pos + 1) for pos in range(first_valid + 1, last_valid + 1))]
+
+    def _populate_segmented_routing(
+        self,
+        *,
+        per_mb_routing: List[torch.Tensor],
+        micro_batches: List[Dict[str, Any]],
+        moe_blocks: List[nn.Module],
+        list_name: str,
+    ) -> int:
+        segment_count = 0
+        num_moe_layers = len(moe_blocks)
+        for mb_idx, mb_routing_tensor in enumerate(per_mb_routing):
+            micro_batch = micro_batches[mb_idx] if mb_idx < len(micro_batches) else {}
+            labels = self._flatten_labels_for_decode_cache(micro_batch.get("target_tokens", micro_batch.get("labels")))
+            segments = self._decode_cache_segments(labels)
+            if not segments:
+                continue
+            num_layers_to_use = min(num_moe_layers, mb_routing_tensor.shape[1])
+            for start, end in segments:
+                for moe_idx in range(num_layers_to_use):
+                    self._append_cpu_replay_tensor(
+                        moe_blocks[moe_idx]._routing_replay,
+                        list_name,
+                        mb_routing_tensor[start:end, moe_idx, :],
+                    )
+                segment_count += 1
+        return segment_count
+
     def _infer_shape(self, arr: np.ndarray, num_moe_layers: int) -> Optional[np.ndarray]:
         """Infer [num_tokens, num_layers, topk] shape from flat array.
 
@@ -737,6 +787,81 @@ class RoutingReplayHandler:
             set_r3_mode(True)
             set_replay_stage("replay_backward")
         return r3_enabled
+
+    def setup_decode_cache(
+        self,
+        micro_batches: List[Dict[str, Any]],
+        routed_experts: Optional[List[Any]],
+        routed_expert_logits: Optional[List[Any]] = None,
+    ) -> bool:
+        """Set up R3 replay for diagnostic prefill-plus-decode scoring.
+
+        Unlike normal R3, this pre-populates one replay item per internal model
+        call: the prompt/prefix prefill segment, followed by one row per decoded
+        token row. This is intentionally narrow and is used only by the
+        forward-only K3 diagnostic decode-cache scorer.
+        """
+        if routed_experts is None:
+            return False
+
+        moe_blocks = self.get_moe_blocks()
+        num_moe_layers = len(moe_blocks)
+        if num_moe_layers == 0:
+            logger.warning("R3 decode-cache: routed_experts provided but no MoE layers found in model")
+            return False
+
+        decoded_routing = []
+        for item in routed_experts:
+            decoded = self.decode_routed_experts_item(item, num_moe_layers)
+            if decoded is not None:
+                decoded_routing.append(decoded)
+        if not decoded_routing:
+            logger.warning("R3 decode-cache: no valid routing data after decoding")
+            return False
+
+        num_layers_in_data = (
+            decoded_routing[0].shape[1] if isinstance(decoded_routing[0], np.ndarray) else len(decoded_routing[0][0])
+        )
+        topk = self._model_topk or (
+            decoded_routing[0].shape[2] if isinstance(decoded_routing[0], np.ndarray) else len(decoded_routing[0][0][0])
+        )
+        per_mb_routing = self._build_per_mb_routing(micro_batches, decoded_routing, num_layers_in_data, topk)
+        segment_count = self._populate_segmented_routing(
+            per_mb_routing=per_mb_routing,
+            micro_batches=micro_batches,
+            moe_blocks=moe_blocks,
+            list_name="top_indices_list",
+        )
+
+        if routed_expert_logits is not None:
+            decoded_weights = []
+            for item in routed_expert_logits:
+                decoded = self.decode_routed_expert_logits_item(item, num_moe_layers)
+                if decoded is not None:
+                    decoded_weights.append(decoded)
+            if decoded_weights:
+                per_mb_weights = self._build_per_mb_routing(
+                    micro_batches,
+                    decoded_weights,
+                    num_layers_in_data,
+                    topk,
+                    tensor_dtype=torch.float32,
+                )
+                self._populate_segmented_routing(
+                    per_mb_routing=per_mb_weights,
+                    micro_batches=micro_batches,
+                    moe_blocks=moe_blocks,
+                    list_name="top_weights_list",
+                )
+
+        if segment_count == 0:
+            logger.warning("R3 decode-cache: no valid label segments to replay")
+            return False
+
+        _r3_log_info("R3 decode-cache: pre-populated %s internal replay segments", segment_count)
+        set_r3_mode(True)
+        set_replay_stage("replay_backward")
+        return True
 
     def cleanup(self) -> None:
         """

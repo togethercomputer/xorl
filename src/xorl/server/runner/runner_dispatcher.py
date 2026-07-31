@@ -952,10 +952,10 @@ class RunnerDispatcher:
             "total_input_tokens_local": total_input_tokens,
             "parallel": {
                 "ep_enabled": bool(getattr(parallel_state, "ep_enabled", False)),
-                "ep_size": int(getattr(parallel_state, "ep_size", 1)),
-                "dp_size": int(getattr(parallel_state, "dp_size", 1)),
-                "cp_size": int(getattr(parallel_state, "cp_size", 1)),
-                "pp_size": int(getattr(parallel_state, "pp_size", 1)),
+                "ep_size": int(getattr(parallel_state, "ep_size", 1) or 1),
+                "dp_size": int(getattr(parallel_state, "dp_size", 1) or 1),
+                "cp_size": int(getattr(parallel_state, "cp_size", 1) or 1),
+                "pp_size": int(getattr(parallel_state, "pp_size", 1) or 1),
             },
             "routing": {
                 "routed_experts_count": len(routed_experts or []),
@@ -1097,7 +1097,8 @@ class RunnerDispatcher:
     def _batch_parallel_rank_and_size(self, parallel_state, cp_size: int, pp_size: int) -> tuple[int, int]:
         """Return the logical data slice rank/size for request batch dispatch.
 
-        Every rank gets a distinct slice (CP/SP ranks share one); EP groups no
+        Every logical data replica gets a distinct slice; FSDP, CP/SP, TP, and
+        same-stage ranks share that slice. EP groups no
         longer duplicate a slice across their ranks unless the legacy
         XORL_SERVER_EP_DUPLICATE_BATCHES rollback switch is set — see
         batch_slice_rank_and_size for the correctness argument.
@@ -1524,10 +1525,12 @@ class RunnerDispatcher:
     def _gather_is_metrics(self, result: Dict[str, Any], cp_enabled: bool, *, is_rank0: bool) -> None:
         """Gather importance-sampling metrics across ranks via all_gather.
 
-        All ranks must call this together when SP is enabled.
+        All ranks must call this together when SP is enabled or when an
+        explicit cross-rank forward/backward diagnostic was requested.
         Rank 0 merges IS metrics into its result dict; workers just participate.
         """
-        if not (self.world_size > 1 and cp_enabled):
+        diagnostic_topk = int(result.get("forward_backward_kl_top_tokens_requested", 0) or 0)
+        if not (self.world_size > 1 and (cp_enabled or diagnostic_topk > 0)):
             return
 
         logger.debug(f"Rank {self.rank}: Gathering results from all ranks to merge IS metrics...")
@@ -1542,6 +1545,18 @@ class RunnerDispatcher:
                         if key.startswith("is_") and key not in result:
                             result[key] = rank_result[key]
                             logger.debug(f"Rank {self.rank}: Copied IS metric '{key}' from rank {i}")
+            topk_requested = max(
+                int((rank_result or {}).get("forward_backward_kl_top_tokens_requested", 0) or 0)
+                for rank_result in all_results
+            )
+            if topk_requested > 0:
+                top_tokens: list[dict[str, Any]] = []
+                for rank_result in all_results:
+                    if rank_result:
+                        top_tokens.extend(rank_result.get("forward_backward_kl_top_tokens") or [])
+                top_tokens.sort(key=lambda item: float(item.get("k3", float("-inf"))), reverse=True)
+                result["forward_backward_kl_top_tokens_requested"] = topk_requested
+                result["forward_backward_kl_top_tokens"] = top_tokens[:topk_requested]
             logger.debug(f"Rank {self.rank}: Final result keys: {list(result.keys())}")
 
         del all_results

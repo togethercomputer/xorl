@@ -32,7 +32,7 @@ from xorl.server.launcher import (
 )
 
 
-# The launcher refactor no longer exposes _master_addr_is_local, no longer
+# The launcher refactor no longer exposes _master_addr_is_local and no longer
 # forwards --model_path / --server.* overrides into the worker torchrun cmd, and no longer
 # validates overrides at Launcher.__init__ time. The tests below target that pre-refactor
 # behavior; gate them so they re-enable automatically if the API returns upstream.

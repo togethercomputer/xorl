@@ -12,6 +12,7 @@ Design (Revised - Per-Adapter Parameters + Optimizer):
 - No gradient collision because each adapter's gradients live in its own Parameters
 """
 
+import hashlib
 import json
 import logging
 import math
@@ -24,12 +25,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from safetensors.torch import load_file as safetensors_load_file
+from safetensors import safe_open
 from safetensors.torch import save_file as safetensors_save_file
 
+from xorl.lora.target_manifest import load_lora_target_manifest
 from xorl.lora.utils import (
     convert_peft_lora_state_dict,
     get_lora_tensor_shard_specs,
+    load_lora_checkpoint_state_dict,
 )
 from xorl.optim import build_optimizer
 from xorl.server.security import resolve_path_within, resolve_server_artifact, validate_identifier
@@ -53,6 +56,242 @@ logger = logging.getLogger(__name__)
 
 
 _TORCH_MANUAL_SEED_MASK = 0x7FFFFFFFFFFFFFFF
+_TARGET_MANIFEST_FILENAME = "lora_target_manifest.json"
+
+OPTIMIZER_SHARD_MANIFEST_FILENAME = "optimizer_shards.json"
+_LEGACY_OPTIMIZER_FILENAME = "optimizer.pt"
+_OPTIMIZER_STATE_METADATA_KEY = "xorl_optimizer_state_v1"
+_OPTIMIZER_STATE_MAX_DEPTH = 64
+
+
+def _optimizer_shard_rank_world() -> Tuple[int, int]:
+    """Current (rank, world_size); uninitialized torch.distributed counts as single-rank."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank(), torch.distributed.get_world_size()
+    return 0, 1
+
+
+def _optimizer_shard_filename(rank: int) -> str:
+    return f"optimizer-rank{rank:05d}.safetensors"
+
+
+def _encode_optimizer_state(value: Any, tensors: Dict[str, torch.Tensor], *, depth: int = 0) -> Any:
+    if depth > _OPTIMIZER_STATE_MAX_DEPTH:
+        raise ValueError("optimizer state exceeds the supported nesting depth")
+    if isinstance(value, torch.Tensor):
+        tensor_name = f"tensor-{len(tensors):08d}"
+        tensors[tensor_name] = value.detach().to(device="cpu", copy=True).contiguous()
+        return {"tensor": tensor_name}
+    value_type = type(value)
+    if value is None or value_type in {bool, int, str}:
+        return value
+    if value_type is float:
+        return {"float": value.hex()}
+    if value_type is list:
+        return {"list": [_encode_optimizer_state(item, tensors, depth=depth + 1) for item in value]}
+    if value_type is tuple:
+        return {"tuple": [_encode_optimizer_state(item, tensors, depth=depth + 1) for item in value]}
+    if value_type is dict:
+        return {
+            "dict": [
+                [
+                    _encode_optimizer_state(key, tensors, depth=depth + 1),
+                    _encode_optimizer_state(item, tensors, depth=depth + 1),
+                ]
+                for key, item in value.items()
+            ]
+        }
+    raise TypeError(f"unsupported optimizer-state value: {value_type.__module__}.{value_type.__qualname__}")
+
+
+def _decode_optimizer_state(value: Any, tensors: Dict[str, torch.Tensor], consumed: set[str], *, depth: int = 0) -> Any:
+    if depth > _OPTIMIZER_STATE_MAX_DEPTH:
+        raise ValueError("optimizer state exceeds the supported nesting depth")
+    if value is None or type(value) in {bool, int, str}:
+        return value
+    if type(value) is not dict or len(value) != 1:
+        raise ValueError("invalid optimizer-state metadata node")
+    kind, payload = next(iter(value.items()))
+    if kind == "tensor":
+        if type(payload) is not str or payload not in tensors or payload in consumed:
+            raise ValueError(f"invalid optimizer-state tensor reference: {payload!r}")
+        consumed.add(payload)
+        return tensors[payload]
+    if kind == "float":
+        if type(payload) is not str:
+            raise ValueError("invalid optimizer-state float encoding")
+        return float.fromhex(payload)
+    if kind in {"list", "tuple"}:
+        if type(payload) is not list:
+            raise ValueError(f"invalid optimizer-state {kind} encoding")
+        decoded = [_decode_optimizer_state(item, tensors, consumed, depth=depth + 1) for item in payload]
+        return decoded if kind == "list" else tuple(decoded)
+    if kind == "dict":
+        if type(payload) is not list:
+            raise ValueError("invalid optimizer-state dict encoding")
+        result = {}
+        for pair in payload:
+            if type(pair) is not list or len(pair) != 2:
+                raise ValueError("invalid optimizer-state dict item")
+            key = _decode_optimizer_state(pair[0], tensors, consumed, depth=depth + 1)
+            if type(key) not in {bool, int, str}:
+                raise ValueError(f"unsupported optimizer-state mapping key: {type(key).__name__}")
+            if key in result:
+                raise ValueError(f"duplicate optimizer-state mapping key: {key!r}")
+            result[key] = _decode_optimizer_state(pair[1], tensors, consumed, depth=depth + 1)
+        return result
+    raise ValueError(f"unknown optimizer-state metadata kind: {kind!r}")
+
+
+def _save_optimizer_state_safetensors(optimizer_state: Dict[str, Any], path: str) -> None:
+    tensors: Dict[str, torch.Tensor] = {}
+    encoded = _encode_optimizer_state(optimizer_state, tensors)
+    safetensors_save_file(
+        tensors,
+        path,
+        metadata={_OPTIMIZER_STATE_METADATA_KEY: json.dumps(encoded, separators=(",", ":"))},
+    )
+
+
+def _load_optimizer_state_safetensors(path: str, device: torch.device) -> Dict[str, Any]:
+    with safe_open(path, framework="pt", device=str(device)) as shard:
+        metadata = shard.metadata()
+        encoded_text = metadata.get(_OPTIMIZER_STATE_METADATA_KEY)
+        if encoded_text is None:
+            raise ValueError(f"optimizer shard is missing {_OPTIMIZER_STATE_METADATA_KEY} metadata: {path}")
+        encoded = json.loads(encoded_text)
+        tensors = {name: shard.get_tensor(name) for name in shard.keys()}
+    consumed: set[str] = set()
+    optimizer_state = _decode_optimizer_state(encoded, tensors, consumed)
+    if type(optimizer_state) is not dict:
+        raise ValueError(f"optimizer shard root must be a mapping: {path}")
+    unused = set(tensors) - consumed
+    if unused:
+        raise ValueError(f"optimizer shard contains unreferenced tensors: {sorted(unused)}")
+    return optimizer_state
+
+
+def _clone_state_to_cpu(value: Any) -> Any:
+    """Recursively clone transaction state onto CPU to avoid GPU snapshot spikes."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device="cpu", copy=True)
+    if isinstance(value, dict):
+        return {key: _clone_state_to_cpu(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clone_state_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_state_to_cpu(item) for item in value)
+    return deepcopy(value)
+
+
+def _adapter_param_structure_fingerprint(lora_params: Dict[str, nn.Parameter]) -> str:
+    """Order-sensitive fingerprint of an adapter's local (name, shape, dtype) sequence.
+
+    Optimizer state_dicts key parameters by position, so a saved shard is only
+    meaningful on a rank whose parameter sequence matches the saving rank
+    exactly. Under expert parallelism the same position holds DIFFERENT expert
+    slices on different ranks, which shape checks alone cannot distinguish;
+    world-size + per-rank fingerprints together make misassignment loud.
+    """
+    structure = [[name, list(param.shape), str(param.dtype)] for name, param in lora_params.items()]
+    return hashlib.sha256(json.dumps(structure).encode("utf-8")).hexdigest()
+
+
+def save_adapter_optimizer_shards(adapter_state: "AdapterState", path: str) -> Dict[str, Any]:
+    """Collectively save per-rank adapter optimizer shards plus a topology manifest.
+
+    Under expert parallelism each rank's per-adapter optimizer holds Adam
+    moments only for that rank's local expert slices, so one rank's state_dict
+    is not a complete checkpoint: the legacy single-file ``optimizer.pt`` wrote
+    rank 0's moments and silently dropped every other rank's. ALL ranks must
+    call this together; rank 0 additionally writes the manifest.
+    """
+    rank, world = _optimizer_shard_rank_world()
+    os.makedirs(path, exist_ok=True)
+    shard_path = resolve_path_within(path, _optimizer_shard_filename(rank), reject_symlinks=True)
+    _save_optimizer_state_safetensors(
+        adapter_state.optimizer.state_dict(),
+        str(shard_path),
+    )
+    fingerprint = _adapter_param_structure_fingerprint(adapter_state.lora_params)
+    if world > 1:
+        fingerprints: List[Optional[str]] = [None] * world
+        torch.distributed.all_gather_object(fingerprints, fingerprint)
+    else:
+        fingerprints = [fingerprint]
+    manifest = {
+        "format_version": 2,
+        "world_size": world,
+        "per_rank_param_structure_sha256": fingerprints,
+    }
+    if rank == 0:
+        with open(os.path.join(path, OPTIMIZER_SHARD_MANIFEST_FILENAME), "w") as f:
+            json.dump(manifest, f, indent=2)
+    return manifest
+
+
+def load_adapter_optimizer_shards(
+    adapter_state: "AdapterState",
+    path: str,
+    device: torch.device,
+) -> bool:
+    """Restore this rank's adapter optimizer shard saved by ``save_adapter_optimizer_shards``.
+
+    Returns True when optimizer state was restored, False when the checkpoint
+    carries no optimizer state at all. Raises on topology or parameter-structure
+    mismatch, and on legacy single-file checkpoints in multi-rank runs (loading
+    rank-0 moments on every rank silently misassigns them).
+    """
+    manifest_path = os.path.join(path, OPTIMIZER_SHARD_MANIFEST_FILENAME)
+    legacy_path = os.path.join(path, _LEGACY_OPTIMIZER_FILENAME)
+    rank, world = _optimizer_shard_rank_world()
+    if os.path.exists(manifest_path):
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        if manifest.get("format_version") != 2:
+            raise RuntimeError(
+                f"Adapter optimizer checkpoint at {path} uses unsupported or pickle-backed format version "
+                f"{manifest.get('format_version')!r}; load weights-only (load_optimizer=False)."
+            )
+        saved_world = int(manifest["world_size"])
+        if saved_world != world:
+            raise RuntimeError(
+                f"Adapter optimizer checkpoint at {path} was saved with world_size={saved_world} but is "
+                f"being loaded with world_size={world}. Per-rank Adam moments cannot be re-sharded; resume "
+                "on the saved topology or load weights-only (load_optimizer=False)."
+            )
+        expected_fingerprint = manifest["per_rank_param_structure_sha256"][rank]
+        live_fingerprint = _adapter_param_structure_fingerprint(adapter_state.lora_params)
+        if expected_fingerprint != live_fingerprint:
+            raise RuntimeError(
+                f"Adapter optimizer shard for rank {rank} at {path} was saved for a different local "
+                "parameter structure. Refusing to load misassigned Adam moments; load weights-only "
+                "(load_optimizer=False) instead."
+            )
+        shard_path = resolve_path_within(
+            path,
+            _optimizer_shard_filename(rank),
+            must_exist=True,
+            reject_symlinks=True,
+        )
+        optimizer_state = _load_optimizer_state_safetensors(str(shard_path), device)
+        adapter_state.optimizer.load_state_dict(optimizer_state)
+        logger.info(f"Loaded rank-{rank} adapter optimizer shard from {shard_path}")
+        return True
+    if os.path.exists(legacy_path):
+        raise RuntimeError(
+            f"Adapter checkpoint at {path} has a legacy pickle-backed optimizer.pt, which is never loaded. "
+            "Re-save with the safetensors sharded format, or pass load_optimizer=False for a weights-only "
+            "warm start."
+        )
+    incomplete_shards = sorted(Path(path).glob("optimizer-rank*"))
+    if incomplete_shards:
+        raise RuntimeError(
+            f"Adapter checkpoint at {path} contains per-rank optimizer shards but no "
+            f"{OPTIMIZER_SHARD_MANIFEST_FILENAME}. Refusing an incomplete optimizer resume; "
+            "use load_optimizer=False for a weights-only warm start."
+        )
+    return False
 
 
 def _mix_torch_manual_seed(base_seed: int, *components: int) -> int:
@@ -351,6 +590,21 @@ class LoRAAdapterManager:
                     f"checkpoint={checkpoint_hybrid!r}, live={expected_hybrid!r}"
                 )
 
+        live_manifest = load_lora_target_manifest(self.lora_config.get("lora_target_manifest"))
+        checkpoint_manifest_path = os.path.join(path, _TARGET_MANIFEST_FILENAME)
+        if live_manifest is not None and not os.path.exists(checkpoint_manifest_path):
+            raise ValueError(
+                f"Checkpoint is missing {_TARGET_MANIFEST_FILENAME} required by the live strict LoRA configuration"
+            )
+        if os.path.exists(checkpoint_manifest_path):
+            checkpoint_manifest = load_lora_target_manifest(checkpoint_manifest_path)
+            if live_manifest is None:
+                raise ValueError(
+                    f"Checkpoint contains {_TARGET_MANIFEST_FILENAME} but the live server has no strict LoRA manifest"
+                )
+            if checkpoint_manifest != live_manifest:
+                raise ValueError("Checkpoint LoRA target manifest does not match the live strict LoRA configuration")
+
     def get_optimizer_metadata(self) -> Dict[str, Any]:
         """Return a JSON-safe description of the adapter optimizer contract."""
         return {
@@ -547,6 +801,13 @@ class LoRAAdapterManager:
         if len(self.adapters) >= self.max_adapters:
             if not self.adapters:
                 return None
+            _rank, world = _optimizer_shard_rank_world()
+            if world > 1:
+                raise RuntimeError(
+                    "Automatic LoRA adapter eviction is disabled for multi-rank training because the "
+                    "noncollective eviction path cannot preserve every rank's optimizer shard. Increase "
+                    "max_adapters or save the adapter collectively before removing it."
+                )
             evictable_ids = [
                 model_id for model_id, state in self.adapters.items() if not self._has_pending_gradients(state)
             ]
@@ -562,12 +823,9 @@ class LoRAAdapterManager:
 
             # Auto-save before eviction if enabled
             if self.auto_save_on_eviction:
-                try:
-                    eviction_path = os.path.join(self.checkpoint_dir, "evicted", lru_id)
-                    self.save_adapter_state(lru_id, eviction_path)
-                    logger.info(f"Auto-saved adapter {lru_id} before eviction to {eviction_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to auto-save adapter {lru_id} before eviction: {e}")
+                eviction_path = os.path.join(self.checkpoint_dir, "evicted", lru_id)
+                self.save_adapter_state(lru_id, eviction_path)
+                logger.info(f"Auto-saved adapter {lru_id} before eviction to {eviction_path}")
 
             self.remove_adapter(lru_id)
             return lru_id
@@ -979,6 +1237,23 @@ class LoRAAdapterManager:
             usage[model_id] = param_bytes + optim_bytes
         return usage
 
+    @staticmethod
+    def _optimizer_state_metadata(optimizer: torch.optim.Optimizer) -> Dict[str, Any]:
+        """Return the observed optimizer-state contract without serializing values."""
+        tensor_fields: Dict[str, int] = {}
+        tensor_elements: Dict[str, int] = {}
+        for parameter_state in optimizer.state.values():
+            for field_name, value in parameter_state.items():
+                if not isinstance(value, torch.Tensor):
+                    continue
+                key = f"{field_name}:{value.dtype}"
+                tensor_fields[key] = tensor_fields.get(key, 0) + 1
+                tensor_elements[key] = tensor_elements.get(key, 0) + value.numel()
+        return {
+            "tensor_fields": dict(sorted(tensor_fields.items())),
+            "tensor_elements": dict(sorted(tensor_elements.items())),
+        }
+
     def get_adapter_count(self) -> int:
         """Return the number of currently loaded adapters."""
         return len(self.adapters)
@@ -1009,6 +1284,14 @@ class LoRAAdapterManager:
 
         state = self.adapters[model_id]
 
+        _rank, world = _optimizer_shard_rank_world()
+        if save_optimizer and world > 1:
+            raise RuntimeError(
+                "LoRAAdapterManager.save_adapter_state is noncollective and cannot preserve every rank's "
+                "optimizer shard. Use CheckpointManager.save_adapter_state collectively, or pass "
+                "save_optimizer=False for a weights-only checkpoint."
+            )
+
         # Use default path if not provided
         if path is None:
             path = str(resolve_path_within(self.checkpoint_dir, model_id))
@@ -1037,10 +1320,21 @@ class LoRAAdapterManager:
         weights_path = os.path.join(path, "adapter_model.safetensors")
         safetensors_save_file(weights_dict, weights_path)
 
-        # 2. Save optimizer state
+        # 2. Save optimizer state. NOTE: this path is NOT collective (LRU
+        # eviction saves run on rank 0 only), so in multi-rank runs it writes
+        # rank 0's shard in the sharded layout WITHOUT a manifest — such a
+        # checkpoint is intentionally not optimizer-resumable; the collective
+        # save path is CheckpointManager.save_adapter_state /
+        # save_adapter_optimizer_shards.
         if save_optimizer:
-            optimizer_path = os.path.join(path, "optimizer.pt")
-            torch.save(state.optimizer.state_dict(), optimizer_path)
+            rank, world = _optimizer_shard_rank_world()
+            if world == 1:
+                save_adapter_optimizer_shards(state, path)
+            else:
+                _save_optimizer_state_safetensors(
+                    state.optimizer.state_dict(),
+                    str(resolve_path_within(path, _optimizer_shard_filename(rank), reject_symlinks=True)),
+                )
 
         # 3. Save normalized session runtime spec with the current learning rate.
         checkpoint_session_spec = deepcopy(state.session_spec)
@@ -1056,6 +1350,7 @@ class LoRAAdapterManager:
             "timestamp": time.time(),
             "save_optimizer": save_optimizer,
             "optimizer": deepcopy(checkpoint_session_spec["optimizer_config"]),
+            "optimizer_state": self._optimizer_state_metadata(state.optimizer),
         }
         metadata_path = os.path.join(path, "metadata.json")
         with open(metadata_path, "w") as f:
@@ -1087,6 +1382,12 @@ class LoRAAdapterManager:
         config_path = os.path.join(path, "adapter_config.json")
         with open(config_path, "w") as f:
             json.dump(adapter_config, f, indent=2)
+
+        target_manifest = load_lora_target_manifest(self.lora_config.get("lora_target_manifest"))
+        if target_manifest is not None:
+            target_manifest_path = os.path.join(path, _TARGET_MANIFEST_FILENAME)
+            with open(target_manifest_path, "w") as f:
+                json.dump(target_manifest, f, indent=2, sort_keys=True)
 
         save_time = time.time() - start_time
         logger.info(
@@ -1197,13 +1498,25 @@ class LoRAAdapterManager:
             )
             registered_here = True
 
-        try:
-            state = self.adapters[model_id]
+        state = self.adapters[model_id]
+        resident_snapshot = None
+        if not registered_here:
+            resident_snapshot = {
+                "lora_params": {name: _clone_state_to_cpu(param) for name, param in state.lora_params.items()},
+                "optimizer": _clone_state_to_cpu(state.optimizer.state_dict()),
+                "session_spec": deepcopy(state.session_spec),
+                "global_step": state.global_step,
+                "global_forward_backward_step": state.global_forward_backward_step,
+                "lr": state.lr,
+                "last_access_time": state.last_access_time,
+            }
 
+        try:
             # 3. Load LoRA weights
             weights_path = os.path.join(path, "adapter_model.safetensors")
-            if os.path.exists(weights_path):
-                loaded_weights = safetensors_load_file(weights_path)
+            sharded_index_path = os.path.join(path, "adapter_model.safetensors.index.json")
+            if os.path.exists(weights_path) or os.path.exists(sharded_index_path):
+                loaded_weights = load_lora_checkpoint_state_dict(path)
                 expected_param_map: Dict[str, str] = {}
                 expected_shapes: Dict[str, torch.Size] = {}
                 for actual_name in state.lora_params:
@@ -1249,17 +1562,38 @@ class LoRAAdapterManager:
                             f"live={tuple(target_param.shape)!r}"
                         )
 
-                for internal_name, tensor in checkpoint_tensors.items():
-                    state.lora_params[expected_param_map[internal_name]].data.copy_(tensor)
             else:
                 raise FileNotFoundError(f"Weights file not found: {weights_path}")
 
-            # 4. Load optimizer state
-            optimizer_path = os.path.join(path, "optimizer.pt")
-            if load_optimizer and os.path.exists(optimizer_path):
-                optimizer_state = torch.load(optimizer_path, map_location=self.device, weights_only=True)
-                state.optimizer.load_state_dict(optimizer_state)
-                logger.debug(f"Loaded optimizer state from {optimizer_path}")
+            # 4. Validate and restore optimizer state before mutating resident
+            # LoRA weights. A missing or invalid optimizer checkpoint must not
+            # leave old optimizer moments paired with checkpoint weights.
+            if load_optimizer:
+                optimizer_restored = load_adapter_optimizer_shards(state, path, self.device)
+                if not optimizer_restored and metadata.get("save_optimizer") is True:
+                    raise RuntimeError(
+                        f"Adapter checkpoint at {path} declares saved optimizer state but contains no "
+                        "complete optimizer checkpoint. Use load_optimizer=False for a weights-only warm start."
+                    )
+
+            # All checkpoint components are valid. Commit the LoRA tensors only
+            # after optimizer restore succeeds.
+            for internal_name, tensor in checkpoint_tensors.items():
+                state.lora_params[expected_param_map[internal_name]].data.copy_(tensor)
+
+            # 5. Restore metadata
+            state.global_step = metadata.get("global_step", 0)
+            state.global_forward_backward_step = metadata.get("global_forward_backward_step", 0)
+            if lr is not None:
+                self._update_state_learning_rate(state, lr)
+            elif "lr" in metadata and (
+                load_optimizer
+                or self._strip_optimizer_learning_rate(checkpoint_session_spec)
+                == self._strip_optimizer_learning_rate(state.session_spec)
+            ):
+                self._update_state_learning_rate(state, metadata["lr"])
+
+            state.last_access_time = time.time()
         except Exception:
             if registered_here:
                 try:
@@ -1268,22 +1602,24 @@ class LoRAAdapterManager:
                     logger.warning(
                         f"Cleanup remove_adapter({model_id}) after failed load_adapter_state raised: {cleanup_error}"
                     )
+            elif resident_snapshot is not None:
+                try:
+                    with torch.no_grad():
+                        for name, tensor in resident_snapshot["lora_params"].items():
+                            state.lora_params[name].copy_(tensor)
+                    state.optimizer.load_state_dict(resident_snapshot["optimizer"])
+                    state.session_spec = resident_snapshot["session_spec"]
+                    state.global_step = resident_snapshot["global_step"]
+                    state.global_forward_backward_step = resident_snapshot["global_forward_backward_step"]
+                    state.lr = resident_snapshot["lr"]
+                    state.last_access_time = resident_snapshot["last_access_time"]
+                except Exception as rollback_error:
+                    logger.error(
+                        f"Failed to roll back resident adapter {model_id} after load_adapter_state error: "
+                        f"{rollback_error}",
+                        exc_info=True,
+                    )
             raise
-
-        # 5. Restore metadata
-        state.global_step = metadata.get("global_step", 0)
-        state.global_forward_backward_step = metadata.get("global_forward_backward_step", 0)
-        if lr is not None:
-            self._update_state_learning_rate(state, lr)
-        elif "lr" in metadata and (
-            load_optimizer
-            or self._strip_optimizer_learning_rate(checkpoint_session_spec)
-            == self._strip_optimizer_learning_rate(state.session_spec)
-        ):
-            self._update_state_learning_rate(state, metadata["lr"])
-
-        # Update last access time
-        state.last_access_time = time.time()
 
         load_time = time.time() - start_time
         logger.info(

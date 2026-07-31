@@ -13,6 +13,7 @@ from safetensors.torch import save_file as safetensors_save_file
 
 from xorl.optim import SignSGD
 from xorl.server.protocol.operations import AdapterStateData
+from xorl.server.runner.adapters import manager as adapter_manager_module
 from xorl.server.runner.adapters.adapter_coordinator import AdapterCoordinator
 from xorl.server.runner.adapters.manager import LoRAAdapterManager
 from xorl.server.session_spec import normalize_session_spec
@@ -151,6 +152,43 @@ def test_save_adapter_state_rejects_path_outside_checkpoint_root(tmp_path):
 
     with pytest.raises(ValueError, match="escapes configured root"):
         manager.save_adapter_state("policy-contained", path=str(tmp_path / "outside"))
+
+
+def test_save_and_validate_adapter_state_binds_strict_target_manifest(tmp_path):
+    manifest = {
+        "schema_version": 1,
+        "target_modules": ["o_proj"],
+        "expected_modules": [
+            {
+                "pattern": "model.layers.*.self_attn.o_proj",
+                "count": 1,
+                "rank": 4,
+            }
+        ],
+        "allow_unlisted": False,
+    }
+    manager = _build_manager(
+        tmp_path,
+        optimizer_type="adamw",
+        lora_config={
+            "base_model": "Qwen/Qwen3-8B",
+            "lora_rank": 4,
+            "lora_alpha": 16,
+            "lora_target_manifest": manifest,
+        },
+    )
+    manager.register_adapter("policy-strict", lr=0.1, initialize_fresh=True)
+    checkpoint = Path(manager.save_adapter_state("policy-strict")["path"])
+
+    assert json.loads((checkpoint / "lora_target_manifest.json").read_text()) == manifest
+    manager._validate_checkpoint_adapter_config(str(checkpoint))
+
+    manager.lora_config["lora_target_manifest"] = {
+        **manifest,
+        "expected_modules": [{**manifest["expected_modules"][0], "count": 2}],
+    }
+    with pytest.raises(ValueError, match="target manifest does not match"):
+        manager._validate_checkpoint_adapter_config(str(checkpoint))
 
 
 def test_load_adapter_state_uses_checkpoint_optimizer_contract_for_fresh_session(tmp_path):
@@ -409,6 +447,43 @@ def test_load_adapter_state_accepts_weight_suffixed_checkpoint_tensor_names(tmp_
     )
 
 
+def test_load_adapter_state_accepts_indexed_sharded_peft_checkpoint(tmp_path):
+    source_manager = _build_manager(tmp_path / "source", optimizer_type="adamw")
+    source_manager.register_adapter("policy-sharded", lr=0.1, initialize_fresh=True)
+    source_state = source_manager.get_adapter_state("policy-sharded")
+    source_state.lora_params["model.layers.0.self_attn.o_proj.lora_A"].data.fill_(2.5)
+    source_state.lora_params["model.layers.0.self_attn.o_proj.lora_B"].data.fill_(1.25)
+    checkpoint_path = Path(source_manager.save_adapter_state("policy-sharded")["path"])
+
+    weights_path = checkpoint_path / "adapter_model.safetensors"
+    weights = safetensors_load_file(str(weights_path))
+    weight_items = sorted(weights.items())
+    weight_map = {}
+    for index, (key, value) in enumerate(weight_items, start=1):
+        shard_name = f"adapter_model-{index:05d}-of-{len(weight_items):05d}.safetensors"
+        safetensors_save_file({key: value}, str(checkpoint_path / shard_name))
+        weight_map[key] = shard_name
+    (checkpoint_path / "adapter_model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {}, "weight_map": weight_map}),
+        encoding="utf-8",
+    )
+    weights_path.unlink()
+
+    target_manager = _build_manager(tmp_path / "target", optimizer_type="adamw")
+    result = target_manager.load_adapter_state("policy-sharded", str(checkpoint_path), load_optimizer=True)
+
+    target_state = target_manager.get_adapter_state("policy-sharded")
+    assert result["model_id"] == "policy-sharded"
+    assert torch.allclose(
+        target_state.lora_params["model.layers.0.self_attn.o_proj.lora_A"],
+        torch.full((4, 8), 2.5),
+    )
+    assert torch.allclose(
+        target_state.lora_params["model.layers.0.self_attn.o_proj.lora_B"],
+        torch.full((8, 4), 1.25),
+    )
+
+
 def test_load_adapter_state_rejects_checkpoint_rank_exceeding_model_capacity(tmp_path):
     source_manager = _build_manager(
         tmp_path / "source",
@@ -469,6 +544,38 @@ def test_register_adapter_evicts_clean_adapter_before_dirty_one(tmp_path):
     assert manager.has_adapter("policy-a")
     assert not manager.has_adapter("policy-b")
     assert manager.has_adapter("policy-c")
+
+
+def test_register_adapter_refuses_multi_rank_eviction(tmp_path, monkeypatch):
+    manager = _build_manager(tmp_path, max_adapters=1, optimizer_type="adamw")
+    manager.register_adapter("policy-a", session_spec=_session_spec(rank=4, alpha=16, optimizer_type="adamw", lr=0.1))
+    monkeypatch.setattr(adapter_manager_module, "_optimizer_shard_rank_world", lambda: (0, 8))
+
+    with pytest.raises(RuntimeError, match="disabled for multi-rank training"):
+        manager.register_adapter(
+            "policy-b", session_spec=_session_spec(rank=4, alpha=16, optimizer_type="adamw", lr=0.2)
+        )
+
+    assert manager.has_adapter("policy-a")
+    assert not manager.has_adapter("policy-b")
+
+
+def test_register_adapter_keeps_resident_adapter_when_auto_save_fails(tmp_path, monkeypatch):
+    manager = _build_manager(tmp_path, max_adapters=1, optimizer_type="adamw")
+    manager.auto_save_on_eviction = True
+    manager.register_adapter("policy-a", session_spec=_session_spec(rank=4, alpha=16, optimizer_type="adamw", lr=0.1))
+
+    def fail_save(*_args, **_kwargs):
+        raise RuntimeError("injected save failure")
+
+    monkeypatch.setattr(manager, "save_adapter_state", fail_save)
+    with pytest.raises(RuntimeError, match="injected save failure"):
+        manager.register_adapter(
+            "policy-b", session_spec=_session_spec(rank=4, alpha=16, optimizer_type="adamw", lr=0.2)
+        )
+
+    assert manager.has_adapter("policy-a")
+    assert not manager.has_adapter("policy-b")
 
 
 def test_multi_adapter_manager_supports_mixed_ranks_and_optimizers(tmp_path):
@@ -568,6 +675,12 @@ def test_save_adapter_state_persists_current_learning_rate(tmp_path):
     assert session_spec_json["optimizer_config"]["learning_rate"] == pytest.approx(0.25)
     assert metadata_json["lr"] == pytest.approx(0.25)
     assert metadata_json["optimizer"]["learning_rate"] == pytest.approx(0.25)
+    assert metadata_json["optimizer"]["optimizer_dtype"] == "bf16"
+    assert metadata_json["optimizer_state"]["tensor_fields"] == {
+        "exp_avg:torch.float32": 2,
+        "exp_avg_sq:torch.float32": 2,
+        "step:torch.float32": 2,
+    }
 
 
 def test_register_adapter_hoists_common_adam_hparams_out_of_optimizer_kwargs(tmp_path):

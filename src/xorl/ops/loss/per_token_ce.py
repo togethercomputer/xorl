@@ -127,6 +127,30 @@ def compute_per_token_ce(
             ignore_index=ignore_index,
         )
 
+    # ``bi_fused`` is the K3 lm-head contract (vendored identically in SGLang).
+    # Hidden states stay bf16 and temperature scales the logits IN-KERNEL —
+    # matching serving's temp-scaled input logprobs bitwise, unlike the
+    # scale-hidden-pre-GEMM convention used by the other modes.
+    if ce_mode == "bi_fused":
+        from xorl.ops.loss.bi_fused_lm_head import bi_fused_per_token_ce  # noqa: PLC0415
+
+        if tp_group is not None:
+            raise NotImplementedError("ce_mode='bi_fused' does not support tensor parallelism yet")
+        if use_lm_head_module:
+            raise NotImplementedError("ce_mode='bi_fused' does not support FP8 lm_head modules")
+        if not lm_head_fp32:
+            raise NotImplementedError(
+                "ce_mode='bi_fused' implements the fp32-class lm-head contract; set lm_head_fp32: true"
+            )
+        local_weight = weight.to_local() if hasattr(weight, "to_local") else weight
+        return bi_fused_per_token_ce(
+            hidden_states_flat,
+            local_weight,
+            labels_flat,
+            ignore_index,
+            temperature=logprob_temperature,
+        )
+
     if tp_group is not None:
         if use_lm_head_module:
             if logprob_temperature != 1.0:

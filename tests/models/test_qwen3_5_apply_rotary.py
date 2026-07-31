@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from xorl.models.layers.rope import rotate_half
+from xorl.models.transformers import qwen3_5_shared
 from xorl.models.transformers.qwen3_5 import modeling_qwen3_5
 from xorl.models.transformers.qwen3_5_moe import modeling_qwen3_5_moe
 from xorl.models.transformers.qwen3_5_shared import qwen3_5_apply_rotary_pos_emb
@@ -104,6 +105,25 @@ def test_interleaved_pairwise_rotation_d8():
     # cos_unique[t=0] = [1,1,1,1] and sin_unique[t=0] = [0,0,0,0], so rotation
     # at position 0 is the identity.
     torch.testing.assert_close(q_out, q, atol=1e-6, rtol=1e-6)
+
+
+def test_class_b_dispatches_before_eager_qwen_math(monkeypatch):
+    sentinel = (object(), object())
+    calls = []
+
+    class _CudaInput:
+        is_cuda = True
+
+    def _stock(q, k, cos, sin, *, interleaved):
+        calls.append((q, k, cos, sin, interleaved))
+        return sentinel
+
+    monkeypatch.setattr(qwen3_5_shared, "rope_class_b_enabled", lambda: True)
+    monkeypatch.setattr(qwen3_5_shared, "stock_fused_apply_rotary_pos_emb", _stock)
+    q, k, cos, sin = (_CudaInput() for _ in range(4))
+
+    assert qwen3_5_shared.qwen3_5_apply_rotary_pos_emb(q, k, cos, sin) is sentinel
+    assert calls == [(q, k, cos, sin, False)]
 
 
 @pytest.mark.parametrize("modeling_module", [modeling_qwen3_5, modeling_qwen3_5_moe])

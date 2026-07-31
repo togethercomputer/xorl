@@ -46,7 +46,7 @@ def test_norm_dispatcher_routes_to_families_v2(monkeypatch):
 
     # Rollback: assert on the kernel selected, not on the bits. The two trees
     # agree on most values, so a bit comparison would be a weak signal.
-    import xorl.ops.bi_families_v2 as module
+    import xorl.ops.bi_families_v2 as module  # noqa: PLC0415
 
     reached = []
     original = module.rms_norm_v2

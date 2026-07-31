@@ -61,6 +61,7 @@ from xorl.lora.utils import get_lora_state_dict
 from xorl.models.layers.moe.routing_replay import set_replay_stage
 from xorl.models.transformers.deepseek_v3.support import deepseek_v3_default_lora_targets
 from xorl.models.transformers.glm5.support import glm5_default_lora_targets
+from xorl.ops.batch_invariant_ops import enable_batch_invariant_mode, get_batch_invariant_ops
 from xorl.ops.loss import (
     LossOutput,
     OPDLossMetrics,
@@ -487,12 +488,13 @@ class ModelRunner:
         # Disable TF32 and BF16 reduced-precision accumulation for
         # consistent numerics across parallelism strategies.
         helper.enable_high_precision_for_bf16()
-        if os.environ.get("XORL_BATCH_INVARIANT_MATMUL", "0") == "1":
-            from xorl.ops.batch_invariant_ops import (  # noqa: PLC0415
-                enable_batch_invariant_mode,
-                get_batch_invariant_ops,
-            )
 
+        # Optional: route aten::{mm,addmm,bmm,_log_softmax,mean.dim,rms_norm,mm.dtype}
+        # through the same batch-invariant Triton kernels SGLang uses, so the linear
+        # layers, router gate matmul, lm_head, RMSNorm and (for the eager MoE
+        # backend) the per-expert torch.matmul GEMMs match SGLang's reduction order
+        # bit-for-bit. Gated, default-off; forward-path correctness experiment.
+        if os.environ.get("XORL_BATCH_INVARIANT_MATMUL", "0") == "1":
             enable_batch_invariant_mode()
             logger.info(
                 "XORL_BATCH_INVARIANT_MATMUL=1: enabled batch-invariant (SGLang-matched) ops=%s",
@@ -1534,6 +1536,7 @@ class ModelRunner:
             lora_rank=self.lora_config.get("max_lora_rank", self.lora_config.get("lora_rank", 32)),
             lora_alpha=self.lora_config.get("lora_alpha", 16),
             lora_target_modules=target_modules,
+            lora_target_manifest=self.lora_config.get("lora_target_manifest"),
             moe_hybrid_shared_lora=self.lora_config.get("moe_hybrid_shared_lora", False),
             enable_qlora=enable_qlora,
             quant_format=self.lora_config.get("quant_format", "nvfp4"),
@@ -1636,6 +1639,14 @@ class ModelRunner:
         explicit_target_modules = self.lora_config.get("lora_target_modules", None)
         if explicit_target_modules is not None:
             return explicit_target_modules
+
+        target_manifest = self.lora_config.get("lora_target_manifest")
+        if target_manifest is not None:
+            from xorl.lora.target_manifest import load_lora_target_manifest  # noqa: PLC0415
+
+            loaded_manifest = load_lora_target_manifest(target_manifest)
+            assert loaded_manifest is not None
+            return list(loaded_manifest["target_modules"])
 
         config_path = self.model_config.get("config_path") or self.model_config.get("model_path")
         model_type = None
@@ -2331,6 +2342,19 @@ class ModelRunner:
             "final_mlp_output_override": 48,
             "final_residual_output": 49,
             "layer_output_override": 50,
+            "gdn_q_input": 60,
+            "gdn_k_input": 61,
+            "gdn_v_input": 62,
+            "gdn_a_input": 63,
+            "gdn_b_input": 64,
+            "gdn_gate_input": 65,
+            "gdn_conv_q": 66,
+            "gdn_conv_k": 67,
+            "gdn_conv_v": 68,
+            "gdn_g": 69,
+            "gdn_beta": 70,
+            "gdn_scan_out": 71,
+            "gdn_normed": 72,
         }
 
         layer_output_overrides = self._load_diagnostic_layer_output_overrides()
@@ -5178,7 +5202,8 @@ class ModelRunner:
                     # Use the packer-emitted PER-MICRO-BATCH-LOCAL view
                     # (teacher_cache_local_indices), NOT teacher_cache_indices: the
                     # latter carries GLOBAL teacher-cache rows for the KL hidden-fetch
-                    # and walks out of bounds here.
+                    # and walks out of bounds here (see
+                    # the OPRD warm-cache index rebase analysis).
                     local_cache_indices = micro_batch.get("teacher_cache_local_indices")
                     if local_cache_indices is None:
                         raise ValueError(
@@ -6514,7 +6539,9 @@ class ModelRunner:
                     # ranks holding only IGNORE_INDEX tokens may hit early-return
                     # paths with a different dtype than the normal-return path.
                     loss_report = local_loss_sum.detach().float()
-                    dist.all_reduce(loss_report, op=dist.ReduceOp.SUM, group=ps.fsdp_group if self.pp_enabled else None)
+                    loss_report_group = ps.fsdp_group if self.pp_enabled else None
+                    if dist.get_world_size(group=loss_report_group) > 1:
+                        dist.all_reduce(loss_report, op=dist.ReduceOp.SUM, group=loss_report_group)
                     if global_valid_tokens.item() > 0:
                         total_loss += (loss_report / global_valid_tokens).item()
             else:
@@ -6620,7 +6647,7 @@ class ModelRunner:
         # valid-token micro-batch (small batch on a large gang, or ulysses
         # sequence sharding) otherwise carry a different metric-key set and the
         # all-reduce inside _finalize_loss_metrics mismatches in size -> NCCL
-        # hang. This call was dropped in an earlier GLM5 rebase and is restored here.
+        # hang. (Call was dropped during a GLM-5 rebase; restored.)
         if loss_fn == "opd_loss":
             self._ensure_opd_loss_metric_accumulators(
                 accumulated_loss_metrics,

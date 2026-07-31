@@ -1,3 +1,4 @@
+import os
 from typing import Callable, Optional, Tuple, Unpack
 
 import torch
@@ -21,8 +22,12 @@ from xorl.models.layers.attention.backend import get_attention_fn
 from xorl.models.layers.normalization import (
     compiled_zero_centered_rms_norm,
     eager_zero_centered_rms_norm,
+    fast_zero_centered_batch_invariant_residual_rms_norm,
+    fast_zero_centered_batch_invariant_rms_norm,
     get_rmsnorm_mode,
+    is_bi_residual_norm_enabled,
     native_zero_centered_rms_norm,
+    native_zero_centered_rms_norm_without_batch_invariant,
 )
 from xorl.models.module_utils import GradientCheckpointingLayer
 from xorl.models.outputs import BaseModelOutput, CausalLMOutput
@@ -36,6 +41,7 @@ from xorl.models.transformers.qwen3_5_shared import (
     has_linear_attention_layers,
     qwen3_5_apply_rotary_pos_emb,
 )
+from xorl.ops.batch_invariant_ops import is_trunk_linear_contract_enabled
 from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
 from xorl.ops.linear_attention import GatedDeltaNet
 from xorl.ops.linear_attention.ops.cp import build_linear_attention_cp_context
@@ -43,6 +49,12 @@ from xorl.utils import logging
 
 
 logger = logging.get_logger(__name__)
+
+
+def _default_qwen35_gdn_contract_family() -> None:
+    """Keep the certified Qwen3.5 GDN pair on v1 until v2 is exact here."""
+    if os.environ.get("XORL_BI_GDN", "").lower() in {"1", "true", "yes", "on"}:
+        os.environ.setdefault("XORL_FAMILIES_V2", "0")
 
 
 def _adapt_qwen3_5_config(config):
@@ -69,7 +81,7 @@ class Qwen3_5MLP(nn.Module):
         self.gate_up_proj = nn.Linear(self.hidden_size, 2 * self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self._use_fused_silu = config.hidden_act == "silu"
+        self._use_fused_silu = config.hidden_act == "silu" and not getattr(config, "_activation_native", False)
 
     def unfuse_for_tp(self):
         """Replace fused gate_up_proj with separate gate_proj and up_proj for tensor parallelism."""
@@ -103,6 +115,7 @@ class Qwen3_5RMSNorm(nn.Module):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         prenorm: bool = False,
+        force_sglang_residual: bool = False,
     ):
         residual_out: Optional[torch.Tensor] = None
         norm_input = x
@@ -116,6 +129,20 @@ class Qwen3_5RMSNorm(nn.Module):
             out = native_zero_centered_rms_norm(norm_input, self.weight, self.eps)
         elif self.mode == "compile":
             out = compiled_zero_centered_rms_norm(norm_input, self.weight, self.eps)
+        elif self.mode in ("sglang", "sglang_fused"):
+            # Qwen3.5 uses two serving norm families. Residual-tree norms
+            # (layer>0 input / post-attention / final) use the BI-mean
+            # composition, while qk norms and the layer-0 input norm use the
+            # no-residual family-1 kernel.
+            if residual_out is not None or force_sglang_residual:
+                if is_bi_residual_norm_enabled():
+                    out = fast_zero_centered_batch_invariant_residual_rms_norm(norm_input, self.weight, self.eps)
+                else:
+                    out = native_zero_centered_rms_norm_without_batch_invariant(norm_input, self.weight, self.eps)
+            elif self.mode == "sglang_fused" and is_trunk_linear_contract_enabled():
+                out = fast_zero_centered_batch_invariant_rms_norm(norm_input, self.weight, self.eps)
+            else:
+                out = native_zero_centered_rms_norm(norm_input, self.weight, self.eps)
         else:
             raise NotImplementedError(f"Unsupported rmsnorm_mode for Qwen3.5 RMSNorm: {self.mode}")
 
@@ -168,10 +195,12 @@ class Qwen3_5Attention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape)
 
         cos, sin = position_embeddings
-        # `mrope_interleaved` controls T/H/W frequency mixing in cos/sin
-        # construction upstream, not the q/k rotation convention. q/k always
-        # use the standard half-rotate convention (HF/SGLang).
-        query_states, key_states = qwen3_5_apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = qwen3_5_apply_rotary_pos_emb(
+            query_states,
+            key_states,
+            cos,
+            sin,
+        )
         return query_states.contiguous(), key_states.contiguous(), value_states.contiguous()
 
     def _project_output(self, attn_output: torch.Tensor) -> torch.Tensor:
@@ -215,6 +244,7 @@ class Qwen3_5Attention(nn.Module):
 class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Qwen3_5Config, layer_idx: int):
         super().__init__()
+        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.layer_type = config.layer_types[layer_idx] if layer_idx < len(config.layer_types) else "full_attention"
         self.self_attn = None
@@ -255,7 +285,10 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
 
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.input_layernorm(
+            hidden_states,
+            force_sglang_residual=self.layer_idx > 0 and self.input_layernorm.mode in ("sglang", "sglang_fused"),
+        )
 
         if self.linear_attn is not None:
             linear_kwargs = {}
@@ -356,6 +389,7 @@ class Qwen3_5PreTrainedModel(XorlPreTrainedModel):
 
 class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
     def __init__(self, config: Qwen3_5Config):
+        _default_qwen35_gdn_contract_family()
         config = _adapt_qwen3_5_config(config)
         super().__init__(config)
         self.padding_idx = config.pad_token_id
@@ -432,6 +466,10 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         )
 
         all_self_attns = () if output_attentions else None
+        # output_hidden_states collects the per-layer residual-stream hidden states
+        # (pre-final-norm), one entry per decoder layer in layer order. Used by the
+        # multi-layer OPRD path; off by default (no collection, no extra memory).
+        all_hidden_states = () if output_hidden_states else None
 
         for decoder_layer in self.layers:
             if decoder_layer is None:
@@ -448,13 +486,21 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
 
             hidden_states = layer_outputs[0]
 
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
-        hidden_states = self.norm(hidden_states) if self.norm is not None else hidden_states
+        if self.norm is not None:
+            hidden_states = self.norm(
+                hidden_states,
+                force_sglang_residual=getattr(self.norm, "mode", None) in ("sglang", "sglang_fused"),
+            )
 
         return BaseModelOutput(
             last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
 
@@ -527,7 +573,10 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel):
 
         last_hidden_state = outputs.last_hidden_state
 
-        return CausalLMOutput(last_hidden_state=last_hidden_state)
+        return CausalLMOutput(
+            last_hidden_state=last_hidden_state,
+            hidden_states=outputs.hidden_states,
+        )
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3_5ForCausalLM):

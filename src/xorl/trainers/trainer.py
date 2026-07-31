@@ -898,6 +898,7 @@ class Trainer:
                 lora_alpha=args.lora.lora_alpha,
                 target_modules=args.lora.lora_target_modules,
                 moe_hybrid_shared_lora=args.lora.moe_hybrid_shared_lora,
+                target_manifest=args.lora.lora_target_manifest,
             )
         else:
             inject_lora_into_model(
@@ -905,6 +906,7 @@ class Trainer:
                 r=args.lora.lora_rank,
                 lora_alpha=args.lora.lora_alpha,
                 target_modules=args.lora.lora_target_modules,
+                target_manifest=args.lora.lora_target_manifest,
             )
         helper.print_device_mem_info("VRAM usage after LoRA injection")
 

@@ -111,6 +111,7 @@ __all__ = [
     "fused_rms_norm_backward",
     "wrap_trunk_linears_batch_invariant",
     "is_trunk_linear_contract_enabled",
+    "batch_invariant_trunk_linear",
     "set_trunk_linear_contract",
     "RMSNormFamily",
     "RMS_NORM_FAMILY_NO_RESIDUAL",
@@ -1982,6 +1983,15 @@ class _BatchInvariantTrunkLinearFn(torch.autograd.Function):
         if ctx.has_bias and ctx.needs_input_grad[2]:
             grad_bias = go2d.sum(dim=0)
         return grad_input, grad_weight, grad_bias
+
+
+def batch_invariant_trunk_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run the public trunk-linear contract on an explicitly folded weight."""
+    return _BatchInvariantTrunkLinearFn.apply(input, weight, bias)
 
 
 def wrap_trunk_linears_batch_invariant(

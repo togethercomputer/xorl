@@ -1,6 +1,6 @@
 # K3 defaults and Pareto matrix
 
-Status: 2026-07-10, based on the paired families-v2 trainer/serving contract. This is the launch and
+Based on the paired families-v2 trainer/serving contract. This is the launch and
 housekeeping source of truth. It separates generic xorl defaults from the numerical profile a
 specific RL lane must select. Frozen anchors from earlier contract trees are invalid and must be
 re-frozen before reuse.
@@ -35,7 +35,8 @@ MoE, hybrid, TP-sharded, and multi-adapter models. A K3 lane must select one exa
 | Dense softmax, TP1 serving | Current families-v2 live step-0 behavior K3 exactly `0.0` over 4,096 rollouts / 65.5M valid tokens **[PROD]**; local long gate 7,239/7,239 bitwise **[LOCAL]**. Pre-v2 full-run anchors were 83/85 zero steps in v12 and 140/140 in v15. | Quiet-node v2 vs stock **[LOCAL]**: decode -1.4/+0.5/+0.1/-0.9% at bs1/8/16/64, prefill -7.5%, reuse -13.8%. RL-shape clean run was about -6.7% but interference-flaky and needs remeasurement. | Default K3 recipe for supported dense RL |
 | Softmax MoE, supported TP1 head | Bitwise scoring/replay-free zero **[GATE]**; routing replay remains the guard for value-edge flips | Composed q30 trainer measured +1.23% step / -1.21% tok/s **[LOCAL]**; sampler router cost not isolated | Use dense base plus MoE overlay and routing policy |
 | Hybrid GDN+MoE, teacher-forced | All 40 residual boundaries and teacher-forced K3 bitwise **[GATE]** on the EP8/DP-attention capture | Scoring contract is viable; EP-combine simulation is forward-only | Certification/scoring only; do not infer live zero |
-| Hybrid GDN live decode | Declared nonzero recurrent-decode floor; no zero recipe | Best recompute-decode path remained 3.11x the recurrent op | Accept and monitor a written floor, or stop |
+| Dense Qwen3.5 GDN live decode, TP1 | Qwen3.5-0.8B static 64/64 exact and a two-rollout DR-GRPO backward/Adam mechanics gate at behavior K3 `0.0` **[LOCAL]** | Batch-1 45+64 decode: 19.517 vs 33.762 tok/s, -42.19% throughput / 1.730x wall; no fleet result | Land the paired xorl/xorl-sglang changes and default supported Qwen3.5 on-policy RL to the contract; retain an explicit non-contract opt-out |
+| Hybrid GDN+MoE live decode | Dense GDN removes the blanket numerical floor, but MoE composition, distributed topology, production length, and current-family pairing remain ungated | Historical best recompute-decode path was 3.11x the recurrent op | Fresh full-stack exact gate and composed throughput result required |
 | Conventional TP-sharded serving | No certified BI head/trunk contract when effective `attn_tp_size` or `head_tp_size` exceeds 1. Full BI deployment was about 8x worse than the measured fallback on the Wordle lane **[PROD, one-step comparison]** | Best measured EP8-trainer / 4x TP2-sampler Wordle fallback was about `2.24e-4` at step 1 and flat-floor oriented | Use the topology-specific fallback; never apply the TP1 stack blindly |
 | Single-adapter LoRA | Folded forward is contracted **[GATE]**; production zero confirmation remains pending | Serving +81% decode at small M and +16-23% prefill; trainer merged forward 3-6x faster than unmerged | Use folded single-adapter overlay |
 | Multi-adapter LoRA | Uncontracted serving path | No trustworthy zero-K3 Pareto point | Name the LoRA floor; do not claim zero |
@@ -271,7 +272,7 @@ K3_ROUTING_SOURCE=decode
 Decode routing is required; prefill-route replay is the wrong behavior reference. The current
 exceptions are known unsupported cells that must be caught by vitality and shape guards:
 
-- EP8+DP-attention `return_routed_experts` is silently all-zero in the known affected runtime.
+- EP8+DP-attention `return_routed_experts` is silently all-zero.
 - EP8+packing can fail with an R3 split mismatch between routed tokens and permuted tokens.
 
 Until fixed, reject or explicitly suppress R3 only for those affected cells and record that the

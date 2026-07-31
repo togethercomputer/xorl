@@ -1851,6 +1851,13 @@ class LoRAArguments:
         default=None,
         metadata={"help": "Modules to apply LoRA to. If None, uses default linear projections."},
     )
+    lora_target_manifest: Optional[Dict[str, Any] | str] = field(
+        default=None,
+        metadata={
+            "help": "Strict LoRA target manifest mapping or JSON path. The manifest supplies target_modules "
+            "and validates exact runtime module counts/ranks before training."
+        },
+    )
     save_lora_only: bool = field(
         default=False,
         metadata={"help": "Only save LoRA weights (not full model) in HF checkpoints"},

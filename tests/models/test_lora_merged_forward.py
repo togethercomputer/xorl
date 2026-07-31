@@ -7,6 +7,8 @@ byte-consistency helper. Cross-engine bitwise gates (trainer merged forward vs
 sglang postfold serving) live in experiments/k3_tests/lora_path_xengine.py.
 """
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -265,6 +267,77 @@ class TestMoEExpertsLoRAMerged:
                 torch.rand(3, 2).to(torch.bfloat16),
                 torch.randint(0, E, (3, 2)),
             )
+
+    def test_native_ep_keyword_routes_to_masked_lora_partial(self, monkeypatch):
+        monkeypatch.setenv("XORL_LORA_MERGED_FORWARD", "1")
+        mod = self._module()
+        hidden = torch.randn(3, H).to(torch.bfloat16)
+        routing = torch.rand(3, 2).to(torch.bfloat16)
+        local_ids = torch.tensor([[0, -1], [1, -1], [-1, 2]], dtype=torch.int32)
+        expected = torch.randn_like(hidden)
+        calls = []
+
+        def masked_partial(got_hidden, got_routing, got_ids):
+            calls.append((got_hidden, got_routing, got_ids))
+            return expected
+
+        monkeypatch.setattr(mod, "sglang_ep_native_routed_partial", masked_partial)
+        got = mod(hidden, routing, sglang_ep_native_local_ids=local_ids)
+        assert got is expected
+        assert calls == [(hidden, routing, local_ids)]
+
+    def test_native_ep_no_grad_uses_canonical_fold_and_filter(self, monkeypatch):
+        monkeypatch.setenv("XORL_LORA_MERGED_FORWARD", "1")
+        mod = self._module()
+        hidden = torch.randn(3, H).to(torch.bfloat16)
+        routing = torch.rand(3, 2).to(torch.bfloat16)
+        local_ids = torch.tensor([[0, -1], [1, -1], [-1, 2]], dtype=torch.int32)
+        expected = torch.randn_like(hidden)
+        gate_up_f, down_f = mod._merged_weights()
+        captured = {}
+
+        def fake_kernel(
+            got_hidden,
+            got_gate_up,
+            got_down,
+            got_routing,
+            got_ids,
+            _impl,
+            _activation,
+            _swiglu_limit,
+            _bias,
+            *,
+            weight_cache,
+            filter_expert,
+        ):
+            captured.update(
+                hidden=got_hidden,
+                gate_up=got_gate_up,
+                down=got_down,
+                routing=got_routing,
+                ids=got_ids,
+                weight_cache=weight_cache,
+                filter_expert=filter_expert,
+            )
+            return expected
+
+        with (
+            patch("xorl.models.layers.moe.experts.MoEExperts._load_sglang_fused_experts_impl", return_value=object()),
+            patch("xorl.models.layers.moe.experts._sglang_fused_experts_kernel_call", side_effect=fake_kernel),
+            torch.no_grad(),
+        ):
+            got = mod.sglang_ep_native_routed_partial(hidden, routing, local_ids)
+
+        assert got is expected
+        assert captured == {
+            "hidden": hidden,
+            "gate_up": gate_up_f,
+            "down": down_f,
+            "routing": routing,
+            "ids": local_ids,
+            "weight_cache": None,
+            "filter_expert": True,
+        }
 
 
 class TestTrunkWrapComposition:

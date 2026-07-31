@@ -129,6 +129,7 @@ def build_training_model(
     lora_rank: int = 32,
     lora_alpha: int = 16,
     lora_target_modules: Optional[List[str]] = None,
+    lora_target_manifest: Optional[dict[str, Any] | str] = None,
     moe_hybrid_shared_lora: bool = False,
     # --- QLoRA ---
     enable_qlora: bool = False,
@@ -384,6 +385,7 @@ def build_training_model(
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
             lora_target_modules=lora_target_modules,
+            lora_target_manifest=lora_target_manifest,
             moe_hybrid_shared_lora=moe_hybrid_shared_lora,
         )
 
@@ -626,6 +628,7 @@ def _inject_lora(
     lora_rank: int,
     lora_alpha: int,
     lora_target_modules: Optional[List[str]],
+    lora_target_manifest: Optional[dict[str, Any] | str] = None,
     moe_hybrid_shared_lora: bool = False,
 ) -> None:
     """Plain LoRA injection (dense + optional MoE-aware)."""
@@ -639,6 +642,7 @@ def _inject_lora(
             lora_alpha=lora_alpha,
             target_modules=lora_target_modules,
             moe_hybrid_shared_lora=moe_hybrid_shared_lora,
+            target_manifest=lora_target_manifest,
         )
     else:
         inject_lora_into_model(
@@ -646,6 +650,7 @@ def _inject_lora(
             r=lora_rank,
             lora_alpha=lora_alpha,
             target_modules=lora_target_modules,
+            target_manifest=lora_target_manifest,
         )
 
     helper.print_device_mem_info("VRAM usage after LoRA injection")

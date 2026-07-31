@@ -334,3 +334,27 @@ def test_lora_save_forwards_export_format(monkeypatch, tmp_path):
     manager._save_lora_weights(str(tmp_path / "sglang-export"), "default")
 
     assert captured["lora_export_format"] == "sglang_shared_outer"
+
+
+def test_adapter_training_artifacts_include_strict_target_manifest(tmp_path):
+    manager = _build_checkpoint_manager()
+    manifest = {
+        "schema_version": 1,
+        "config_rank": 4,
+        "config_alpha": 16.0,
+        "target_modules": ["o_proj"],
+        "expected_modules": [{"pattern": "model.layers.*.self_attn.o_proj", "count": 1, "rank": 4}],
+        "allow_unlisted": False,
+        "source_lora_key_fingerprint": "a" * 64,
+        "source_lora_shape_fingerprint": "b" * 64,
+    }
+    manager.lora_config["lora_target_manifest"] = manifest
+
+    manager._write_adapter_training_artifacts(
+        str(tmp_path),
+        "policy-a",
+        manager._adapter_manager.get_adapter_state("policy-a"),
+        save_optimizer=True,
+    )
+
+    assert json.loads((tmp_path / "lora_target_manifest.json").read_text()) == manifest

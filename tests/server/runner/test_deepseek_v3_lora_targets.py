@@ -100,3 +100,24 @@ def test_model_runner_prefers_explicit_lora_targets(tmp_path):
     )
 
     assert runner._resolve_lora_target_modules() == ["q_b_proj", "o_proj"]
+
+
+def test_model_runner_uses_strict_target_manifest_as_target_source(tmp_path):
+    config_dir = tmp_path / "kimi-k25"
+    _write_kimi_config(config_dir)
+    runner = _make_runner(
+        config_dir,
+        {
+            "lora_target_manifest": {
+                "schema_version": 1,
+                "target_modules": ["q_b_proj", "o_proj"],
+                "expected_modules": [{"pattern": "model.layers.*.self_attn.q_b_proj", "count": 4, "rank": 8}],
+                "allow_unlisted": False,
+            },
+            "train_attn": False,
+            "train_mlp": False,
+            "train_unembed": False,
+        },
+    )
+
+    assert runner._resolve_lora_target_modules() == ["q_b_proj", "o_proj"]

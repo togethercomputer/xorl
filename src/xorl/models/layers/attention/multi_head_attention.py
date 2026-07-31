@@ -1,6 +1,6 @@
 """Base attention module shared across all decoder model variants."""
 
-from typing import Callable, Optional, Tuple, Unpack
+from typing import Callable, List, Optional, Tuple, Unpack
 
 import torch
 from torch import nn
@@ -115,6 +115,28 @@ class MultiHeadAttention(nn.Module):
         attn_output = attn_output.reshape(*attn_output.shape[:-2], -1).contiguous()
         return self.o_proj(attn_output)
 
+    def _append_past_key_values(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        past_key_values: Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor]]]],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Append this layer's KV state for incremental decoding."""
+        if past_key_values is None:
+            return key_states, value_states
+
+        while len(past_key_values) <= self.layer_idx:
+            past_key_values.append(None)
+
+        past = past_key_values[self.layer_idx]
+        if past is not None:
+            past_key_states, past_value_states = past
+            key_states = torch.cat((past_key_states.to(key_states.device), key_states), dim=1)
+            value_states = torch.cat((past_value_states.to(value_states.device), value_states), dim=1)
+
+        past_key_values[self.layer_idx] = (key_states, value_states)
+        return key_states, value_states
+
     # ------------------------------------------------------------------ #
     # Attention function helpers
     # ------------------------------------------------------------------ #
@@ -140,12 +162,14 @@ class MultiHeadAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor]]]] = None,
         **kwargs: Unpack[AttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         attn_strategy = get_cp_strategy(num_kv_heads=self.config.num_key_value_heads)
 
         # Phase 1: QKV projection + norm + RoPE (+ pre-attention SP communication)
         q, k, v = attn_strategy.project_qkv(self, hidden_states, position_embeddings)
+        k, v = self._append_past_key_values(k, v, past_key_values)
 
         # Phase 2: Attention (ring attention puts P2P communication here)
         attn_output = attn_strategy.compute_attention(self, q, k, v, attention_mask, **kwargs)

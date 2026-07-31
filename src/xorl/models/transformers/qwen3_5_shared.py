@@ -6,6 +6,12 @@ from typing import Optional
 
 import torch
 
+from xorl.models.layers.rope import (
+    _note_class_a,
+    rope_class_b_enabled,
+    stock_fused_apply_rotary_pos_emb,
+)
+
 
 QWEN3_5_CHECKPOINT_CONVERSION_MAPPING = {
     r"^model\.language_model\.": "model.",
@@ -51,6 +57,10 @@ def qwen3_5_apply_rotary_pos_emb(
     sin: torch.Tensor,
     interleaved: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if rope_class_b_enabled() and q.is_cuda:
+        return stock_fused_apply_rotary_pos_emb(q, k, cos, sin, interleaved=interleaved)
+
+    _note_class_a("qwen3_5_apply_rotary_pos_emb")
     # `interleaved` describes the q/k feature-layout convention only.
     #   - `False` (default): standard half-rotate. Used by Qwen3.5/Qwen3.6
     #     (HF/SGLang). Qwen's `mrope_interleaved` is about T/H/W frequency

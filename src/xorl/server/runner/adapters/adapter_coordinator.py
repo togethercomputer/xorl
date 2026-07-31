@@ -29,6 +29,7 @@ from xorl.server.protocol.operations import (
     RegisterAdapterData,
     RegisterSessionData,
 )
+from xorl.server.runner.adapters.manager import OPTIMIZER_SHARD_MANIFEST_FILENAME
 from xorl.server.session_spec import load_session_spec_from_checkpoint
 
 
@@ -258,7 +259,11 @@ class AdapterCoordinator:
                     "session_spec": checkpoint_session_spec,
                     "metadata": metadata,
                     "weights": {name: tensor.cpu() for name, tensor in loaded_weights.items()},
-                    "optimizer_present": load_optimizer and os.path.exists(os.path.join(path, "optimizer.pt")),
+                    "optimizer_present": load_optimizer
+                    and (
+                        os.path.exists(os.path.join(path, "optimizer.pt"))
+                        or os.path.exists(os.path.join(path, OPTIMIZER_SHARD_MANIFEST_FILENAME))
+                    ),
                 }
             except Exception as e:
                 payload[0] = {"error": str(e)}
@@ -355,8 +360,10 @@ class AdapterCoordinator:
 
         if payload.get("optimizer_present") and self.rank == 0:
             logger.warning(
-                "Skipping optimizer restore for EP-sharded rank0_broadcast adapter load because optimizer.pt "
-                "contains rank-local optimizer tensors. Adapter weights and metadata were restored safely."
+                "Skipping optimizer restore for EP-sharded rank0_broadcast adapter load: optimizer state is "
+                "rank-local (sharded manifest or legacy optimizer.pt). For a full optimizer resume use "
+                "adapter_state_load_mode=all_ranks on a shared filesystem. Adapter weights and metadata "
+                "were restored safely."
             )
 
         state = self.trainer.adapter_manager.get_adapter_state(model_id)

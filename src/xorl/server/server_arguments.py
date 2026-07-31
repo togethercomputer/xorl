@@ -1019,6 +1019,14 @@ class ServerArguments:
         },
     )
 
+    lora_target_manifest: Optional[Union[Dict[str, Any], str]] = field(
+        default=None,
+        metadata={
+            "help": "Strict LoRA target manifest mapping or JSON path. Validates exact module counts and ranks "
+            "before the server accepts training work."
+        },
+    )
+
     moe_hybrid_shared_lora: bool = field(
         default=False,
         metadata={
@@ -1478,6 +1486,7 @@ class ServerArguments:
                 "max_lora_rank": self.max_lora_rank,
                 "lora_alpha": self.lora_alpha,
                 "lora_target_modules": self.lora_target_modules,
+                "lora_target_manifest": self.lora_target_manifest,
                 "moe_hybrid_shared_lora": self.moe_hybrid_shared_lora,
                 "lora_export_format": self.lora_export_format,
                 "enable_qlora": self.enable_qlora,

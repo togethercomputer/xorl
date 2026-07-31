@@ -29,8 +29,10 @@ from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_
 from xorl.checkpoint import ckpt_to_state_dict
 from xorl.checkpoint.checkpointer import ModelState
 from xorl.distributed.parallel_state import get_parallel_state
+from xorl.lora.target_manifest import load_lora_target_manifest
 from xorl.lora.utils import get_lora_state_dict, save_lora_checkpoint
 from xorl.models import save_model_weights
+from xorl.server.runner.adapters.manager import save_adapter_optimizer_shards
 from xorl.server.session_spec import write_session_spec
 from xorl.utils import helper
 from xorl.utils.device import get_device_type
@@ -199,11 +201,12 @@ class CheckpointManager:
         adapter_state: Any,
         save_optimizer: bool,
     ) -> None:
-        """Write adapter-specific optimizer state and training metadata on rank 0."""
-        if save_optimizer:
-            optimizer_path = os.path.join(path, "optimizer.pt")
-            torch.save(adapter_state.optimizer.state_dict(), optimizer_path)
+        """Write adapter training metadata on rank 0.
 
+        Optimizer state is written collectively (per-rank shards) by
+        ``save_adapter_optimizer_shards`` in ``save_adapter_state``; a single
+        rank's state_dict silently drops the other ranks' EP-local Adam moments.
+        """
         metadata = {
             "model_id": model_id,
             "global_step": adapter_state.global_step,
@@ -211,11 +214,18 @@ class CheckpointManager:
             "lr": adapter_state.lr,
             "timestamp": time.time(),
             "save_optimizer": save_optimizer,
+            "optimizer_format": "sharded_v1" if save_optimizer else None,
             "optimizer": adapter_state.session_spec["optimizer_config"],
         }
         metadata_path = os.path.join(path, "metadata.json")
         with open(metadata_path, "w") as f:
             json.dump(metadata, f, indent=2)
+
+        target_manifest = load_lora_target_manifest(self.lora_config.get("lora_target_manifest"))
+        if target_manifest is not None:
+            target_manifest_path = os.path.join(path, "lora_target_manifest.json")
+            with open(target_manifest_path, "w") as f:
+                json.dump(target_manifest, f, indent=2, sort_keys=True)
 
     def _gather_adapter_lora_params(self, model_id: str) -> Dict[str, torch.Tensor]:
         """Gather LoRA params from adapter manager with EP support.
@@ -438,6 +448,11 @@ class CheckpointManager:
         try:
             # Save LoRA weights (collective operation)
             self._save_lora_weights(path, model_id, preserve_lora_dtype=True)
+
+            # Save per-rank optimizer shards (collective operation): each rank's
+            # adapter optimizer only holds its own EP-local expert moments.
+            if save_optimizer:
+                save_adapter_optimizer_shards(adapter_state, path)
 
             if self.rank == 0:
                 self._write_adapter_training_artifacts(path, model_id, adapter_state, save_optimizer)

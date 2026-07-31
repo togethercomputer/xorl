@@ -12,6 +12,7 @@ import torch.nn as nn
 from einops import rearrange, repeat
 from torch.nn import functional as F
 
+from xorl.lora.fold import lora_merged_forward_enabled
 from xorl.ops.linear_attention.backend import (
     flashqla_chunk_gated_delta_rule,
     flashqla_chunk_gated_delta_rule_cp,
@@ -280,10 +281,50 @@ class GatedDeltaNet(nn.Module):
                     param.grad.data = param.grad.data.float()
         return module
 
+    def _fused_qkvz_lora_delta(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Apply River's fused q/k/v/z LoRA delta and split its output."""
+        adapter = getattr(self, "in_proj_qkvz", None)
+        if adapter is None:
+            return None
+        delta = adapter(hidden_states)
+        expected = 2 * self.key_dim + 2 * self.value_dim
+        if delta.shape[-1] != expected:
+            raise RuntimeError(f"Fused GDN LoRA produced {delta.shape[-1]} features, expected {expected}")
+        return delta.split(
+            (self.key_dim, self.key_dim, self.value_dim, self.value_dim),
+            dim=-1,
+        )
+
+    def _add_output_lora(self, inputs: torch.Tensor, base_output: torch.Tensor) -> torch.Tensor:
+        """Add River's fused GDN output LoRA delta when one is injected."""
+        adapter = getattr(self, "out_proj", None)
+        if adapter is None:
+            return base_output
+        return base_output + adapter(inputs).to(base_output.dtype)
+
+    @staticmethod
+    def _linear_with_contract(
+        module: nn.Linear,
+        inputs: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> torch.Tensor:
+        if getattr(module, "_xorl_bi_trunk_wrapped", False):
+            from xorl.ops.batch_invariant_ops import batch_invariant_trunk_linear  # noqa: PLC0415
+
+            return batch_invariant_trunk_linear(inputs, weight, module.bias)
+        return F.linear(inputs, weight, module.bias)
+
     def _project_output_linear(self, o: torch.Tensor) -> torch.Tensor:
+        output_adapter = getattr(self, "out_proj", None)
+        if output_adapter is not None and lora_merged_forward_enabled():
+            folded = output_adapter.merged_weight_for_forward(self.o_proj.weight)
+            return self._linear_with_contract(self.o_proj, o, folded)
+
         split_count = int(os.environ.get("XORL_GDN_DIAGNOSTIC_O_PROJ_TP_SPLIT", "0") or 0)
         if split_count <= 1:
-            return self.o_proj(o)
+            return self._add_output_lora(o, self.o_proj(o))
 
         split_layers = os.environ.get("XORL_GDN_DIAGNOSTIC_O_PROJ_TP_SPLIT_LAYERS", "").strip()
         if split_layers and split_layers.lower() not in {"all", "*"}:
@@ -295,12 +336,12 @@ class GatedDeltaNet(nn.Module):
                     "expected comma-separated layer indices"
                 ) from exc
             if self.layer_idx not in enabled_layers:
-                return self.o_proj(o)
+                return self._add_output_lora(o, self.o_proj(o))
 
         weight = self.o_proj.weight
         input_dim = o.shape[-1]
         if input_dim % split_count != 0 or weight.shape[1] != input_dim:
-            return self.o_proj(o)
+            return self._add_output_lora(o, self.o_proj(o))
 
         sum_fp32 = _env_flag("XORL_GDN_DIAGNOSTIC_O_PROJ_TP_SPLIT_SUM_FP32")
         keep_fp32 = _env_flag("XORL_GDN_DIAGNOSTIC_O_PROJ_TP_SPLIT_KEEP_FP32")
@@ -321,7 +362,7 @@ class GatedDeltaNet(nn.Module):
             output = partial if output is None else output + partial
         if sum_fp32 and output_dtype is not None and not keep_fp32:
             output = output.to(output_dtype)
-        return output
+        return self._add_output_lora(o, output)
 
     def _diagnostic_tp_split_count(self) -> int:
         split_count = int(os.environ.get("XORL_GDN_DIAGNOSTIC_TP_SPLIT", "0") or 0)
@@ -517,6 +558,7 @@ class GatedDeltaNet(nn.Module):
                 o = pad_input(o.squeeze(0), indices, batch_size, q_len)
             return o, None, past_key_values
 
+        merged_input_adapter = getattr(self, "in_proj_qkvz", None)
         if _fused_projection_enabled() and self.use_gate:
             qkvz_weight = torch.cat(
                 (
@@ -527,6 +569,8 @@ class GatedDeltaNet(nn.Module):
                 ),
                 dim=0,
             )
+            if merged_input_adapter is not None and lora_merged_forward_enabled():
+                qkvz_weight = merged_input_adapter.merged_weight_for_forward(qkvz_weight)
             qkvz = F.linear(hidden_states, qkvz_weight)
             q_input, k_input, v_input, gate_input = qkvz.split(
                 (self.key_dim, self.key_dim, self.value_dim, self.value_dim),
@@ -541,6 +585,28 @@ class GatedDeltaNet(nn.Module):
                 dim=-1,
             )
             a_input = a_input.float()
+        elif merged_input_adapter is not None and lora_merged_forward_enabled():
+            offsets = [0]
+            for projection in (self.q_proj, self.k_proj, self.v_proj, self.g_proj):
+                offsets.append(offsets[-1] + projection.out_features)
+            q_weight = merged_input_adapter.merged_weight_for_forward(
+                self.q_proj.weight, output_start=offsets[0], output_end=offsets[1]
+            )
+            k_weight = merged_input_adapter.merged_weight_for_forward(
+                self.k_proj.weight, output_start=offsets[1], output_end=offsets[2]
+            )
+            v_weight = merged_input_adapter.merged_weight_for_forward(
+                self.v_proj.weight, output_start=offsets[2], output_end=offsets[3]
+            )
+            gate_weight = merged_input_adapter.merged_weight_for_forward(
+                self.g_proj.weight, output_start=offsets[3], output_end=offsets[4]
+            )
+            q_input = self._linear_with_contract(self.q_proj, hidden_states, q_weight)
+            k_input = self._linear_with_contract(self.k_proj, hidden_states, k_weight)
+            v_input = self._linear_with_contract(self.v_proj, hidden_states, v_weight)
+            gate_input = self._linear_with_contract(self.g_proj, hidden_states, gate_weight)
+            a_input = self.a_proj(hidden_states).float()
+            b_input = self.b_proj(hidden_states)
         else:
             q_input = self.q_proj(hidden_states)
             k_input = self.k_proj(hidden_states)
@@ -548,6 +614,25 @@ class GatedDeltaNet(nn.Module):
             a_input = self.a_proj(hidden_states).float()
             b_input = self.b_proj(hidden_states)
             gate_input = self.g_proj(hidden_states) if self.use_gate else None
+
+        fused_lora_delta = None if lora_merged_forward_enabled() else self._fused_qkvz_lora_delta(hidden_states)
+        if fused_lora_delta is not None:
+            q_delta, k_delta, v_delta, gate_delta = fused_lora_delta
+            q_input = q_input + q_delta.to(q_input.dtype)
+            k_input = k_input + k_delta.to(k_input.dtype)
+            v_input = v_input + v_delta.to(v_input.dtype)
+            if gate_input is None:
+                raise RuntimeError("Fused qkvz LoRA requires a gated GDN layer")
+            gate_input = gate_input + gate_delta.to(gate_input.dtype)
+
+        diagnostic_capture = getattr(self, "_diagnostic_capture_component", None)
+        if diagnostic_capture is not None:
+            diagnostic_capture("gdn_q_input", q_input)
+            diagnostic_capture("gdn_k_input", k_input)
+            diagnostic_capture("gdn_v_input", v_input)
+            diagnostic_capture("gdn_a_input", a_input)
+            diagnostic_capture("gdn_b_input", b_input)
+            diagnostic_capture("gdn_gate_input", gate_input)
 
         if _conv_contract_enabled() and not self.use_short_conv:
             raise RuntimeError("XORL_GDN_CONV_CONTRACT is armed but this GatedDeltaNet has use_short_conv=False.")
@@ -600,6 +685,11 @@ class GatedDeltaNet(nn.Module):
             v = F.silu(v_input)
             conv_state_q = conv_state_k = conv_state_v = None
 
+        if diagnostic_capture is not None:
+            diagnostic_capture("gdn_conv_q", q)
+            diagnostic_capture("gdn_conv_k", k)
+            diagnostic_capture("gdn_conv_v", v)
+
         q, k = (rearrange(x, "... (h d) -> ... h d", d=self.head_k_dim) for x in (q, k))
         v = rearrange(v, "... (h d) -> ... h d", d=self.head_v_dim)
 
@@ -608,7 +698,7 @@ class GatedDeltaNet(nn.Module):
             q, k = (repeat(x, "... h d -> ... (h g) d", g=repeat_factor) for x in (q, k))
 
         if is_gdn_contract_enabled():
-            # GDN contract: serving's fused_gdn_gating kernel kills the
+            # P5 GDN contract: serving's fused_gdn_gating kernel kills the
             # 1-ULP g term (torch softplus vs tl.log(1+tl.exp)); beta is bitwise
             # either way.
             g, beta = bi_fused_gdn_gating(self.A_log, a_input, b_input, self.dt_bias)
@@ -617,6 +707,9 @@ class GatedDeltaNet(nn.Module):
             g = -self.A_log.float().exp() * F.softplus(a_input + self.dt_bias)
         if self.allow_neg_eigval:
             beta = beta * 2.0
+        if diagnostic_capture is not None:
+            diagnostic_capture("gdn_g", g)
+            diagnostic_capture("gdn_beta", beta)
 
         recurrent_state = last_state["recurrent_state"] if last_state is not None else None
 
@@ -684,6 +777,7 @@ class GatedDeltaNet(nn.Module):
                 if cp_context is not None:
                     chunk_kwargs["cp_context"] = cp_context
                 o, recurrent_state = chunk_fn(**chunk_kwargs)
+
         elif mode == "fused_recurrent":
             o, recurrent_state = fused_recurrent_gated_delta_rule(
                 q=q,
@@ -699,6 +793,9 @@ class GatedDeltaNet(nn.Module):
         else:
             raise NotImplementedError(f"Unsupported mode `{mode}`.")
 
+        if diagnostic_capture is not None:
+            diagnostic_capture("gdn_scan_out", o)
+
         if past_key_values is not None and self.layer_idx is not None:
             past_key_values.update(
                 recurrent_state=recurrent_state,
@@ -712,6 +809,8 @@ class GatedDeltaNet(nn.Module):
             o = self.o_norm(o, gate)
         else:
             o = self.o_norm(o)
+        if diagnostic_capture is not None:
+            diagnostic_capture("gdn_normed", o)
 
         o = rearrange(o, "b t h d -> b t (h d)")
         o = self._project_output_linear(o)

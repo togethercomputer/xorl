@@ -44,6 +44,7 @@ from xorl.distributed.parallel_state import get_parallel_state
 from xorl.fp8_training.config_compat import enrich_sync_quantization_with_fp8_bf16_islands
 from xorl.lora.fold import lora_merged_forward_enabled
 from xorl.lora.modules.base import LoraModule
+from xorl.lora.modules.delta_linear import LoraDeltaLinear
 from xorl.lora.modules.linear import LoraLinear
 from xorl.models.layers.moe.experts import MoEExperts
 from xorl.models.layers.moe.lora import MoEExpertsLoRA
@@ -698,8 +699,8 @@ class WeightSyncHandler:
         Handle sync inference weights request (all ranks participate).
 
         The ``sync_method`` field selects the transport backend.  Currently
-        supported: ``"nccl_broadcast"``, ``"p2p"``, and experimental
-        ``"sparse_delta"``. New backends (RDMA, multi-rank NCCL, etc.) can be
+        supported: ``"nccl_broadcast"``, ``"nccl_simple"``, ``"p2p"``, and
+        experimental ``"sparse_delta"``. New backends can be
         added by implementing :class:`WeightTransportBackend` and registering
         in :func:`backends.create_backend`.
         """
@@ -4116,14 +4117,42 @@ class WeightSyncHandler:
             if isinstance(mod, LoraModule):
                 lora_modules[mname] = mod
 
-        # Track which params are LoRA A/B or QLoRA internal so we skip them
+        # Track which params are LoRA A/B or QLoRA internal so we skip them.
+        # fused_gdn_base_deltas maps a base projection name (q/k/v/g/o_proj) to the
+        # (LoraDeltaLinear, start, end) row-slice of the fused delta to fold into it.
         lora_param_names = set()
+        fused_gdn_base_deltas = {}
         for mname, mod in lora_modules.items():
             prefix = f"{mname}." if mname else ""
             if isinstance(mod, QLoRALinear):
                 lora_param_names.add(f"{prefix}lora_A")
                 lora_param_names.add(f"{prefix}lora_B")
                 lora_param_names.add(f"{prefix}packed_weight_f32")
+            elif isinstance(mod, LoraDeltaLinear):
+                # Fused-GDN LoRA (in_proj_qkvz / out_proj): the raw factors are NOT
+                # shipped — they are folded into the trainer's SEPARATE base
+                # projections (q/k/v/g for in_proj_qkvz, o for out_proj) below. The
+                # pure-base sampler has no receiver slot for these factors, so
+                # skipping them here is both correct and required.
+                lora_param_names.add(f"{prefix}lora_A")
+                lora_param_names.add(f"{prefix}lora_B")
+                gdn_parent_name, gdn_leaf = mname.rsplit(".", 1)
+                gdn_parent = fsdp_mod.get_submodule(gdn_parent_name)
+                if gdn_leaf == "in_proj_qkvz":
+                    offset = 0
+                    for projection in ("q_proj", "k_proj", "v_proj", "g_proj"):
+                        projection_module = getattr(gdn_parent, projection)
+                        end = offset + projection_module.out_features
+                        fused_gdn_base_deltas[f"{gdn_parent_name}.{projection}"] = (mod, offset, end)
+                        offset = end
+                    if offset != mod.out_features:
+                        raise RuntimeError(
+                            f"{mname}: fused LoRA output size {mod.out_features} does not match q/k/v/z total {offset}"
+                        )
+                elif gdn_leaf == "out_proj":
+                    fused_gdn_base_deltas[f"{gdn_parent_name}.o_proj"] = (mod, 0, mod.out_features)
+                else:
+                    raise RuntimeError(f"Unexpected fused-GDN LoRA leaf {gdn_leaf!r} for {mname}")
             elif isinstance(mod, LoraLinear):
                 lora_param_names.add(f"{prefix}lora_A")
                 lora_param_names.add(f"{prefix}lora_B")
@@ -4132,6 +4161,7 @@ class WeightSyncHandler:
                     lora_param_names.add(f"{prefix}{proj}_lora_A")
                     lora_param_names.add(f"{prefix}{proj}_lora_B")
 
+        fused_delta_cache = {}
         for pname, param in fsdp_mod.named_parameters():
             # Skip params owned by child FSDP modules (processed separately)
             if any(pname.startswith(p) for p in child_fsdp_prefixes):
@@ -4170,6 +4200,33 @@ class WeightSyncHandler:
             #   parent module "self_attn.q_proj" is the LoraLinear
             parent_name = ".".join(pname.split(".")[:-1])
             param_leaf = pname.split(".")[-1]  # e.g. "weight", "gate_proj"
+
+            # Fused-GDN fold: this base projection (q/k/v/g/o_proj) gets the
+            # corresponding row-slice of the fused in_proj_qkvz / out_proj delta.
+            fused_delta_spec = fused_gdn_base_deltas.get(parent_name)
+            if fused_delta_spec is not None and param_leaf == "weight":
+                delta_module, start, end = fused_delta_spec
+                if lora_merged_forward_enabled():
+                    # Ship the exact canonical bytes used by the fused-GDN
+                    # merged forward: fp32 accumulate and one final cast.
+                    merged = delta_module._merged_weight(
+                        param.data,
+                        output_start=start,
+                        output_end=end,
+                    ).to(dtype=torch.bfloat16)
+                else:
+                    cache_key = id(delta_module)
+                    if cache_key not in fused_delta_cache:
+                        fused_delta_cache[cache_key] = delta_module.get_delta_weight()
+                    delta = fused_delta_cache[cache_key][start:end]
+                    if tuple(delta.shape) != tuple(param.shape):
+                        raise RuntimeError(
+                            f"Fused GDN LoRA delta for {full_name} has shape "
+                            f"{tuple(delta.shape)}, expected {tuple(param.shape)}"
+                        )
+                    merged = param.data.to(dtype=torch.bfloat16) + delta.to(dtype=torch.bfloat16)
+                buffer.append((full_name, merged.clone()))
+                continue
 
             if parent_name in lora_modules:
                 lora_mod = lora_modules[parent_name]

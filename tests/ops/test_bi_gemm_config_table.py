@@ -97,7 +97,7 @@ def test_table_config_bitwise_equals_baseline(dtype, shape):
     # launcher — table config with OutOfResources->baseline fallback — and
     # assert bit-neutrality down to raw accumulator bits
     if dtype == torch.bfloat16:
-        from triton.runtime.errors import OutOfResources
+        from triton.runtime.errors import OutOfResources  # noqa: PLC0415
 
         cfg32 = lookup_mm_config(dtype, M, N, K, out_itemsize=4)
         try:

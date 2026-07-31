@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 
 from xorl.fp8_training import enrich_sync_quantization_with_fp8_bf16_islands
+from xorl.lora.modules.delta_linear import LoraDeltaLinear
 from xorl.lora.modules.linear import LoraLinear
 from xorl.qlora.modules.linear import QLoRALinear
 from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
@@ -1123,6 +1124,62 @@ def test_fp8_cpu_expert_projection_respects_modules_to_not_convert():
     }
     assert out_by_name["model.layers.0.mlp.experts.0.gate_proj.weight"].dtype == torch.bfloat16
     assert out_by_name["model.layers.0.mlp.experts.0.gate_proj.weight"].device.type == "cpu"
+
+
+def test_sync_extraction_folds_fused_gdn_lora_into_separate_base_projections():
+    # River fuses one LoRA on GDN in_proj_qkvz (out = q|k|v|z contiguous) and one on
+    # out_proj. The weight sync must FOLD those deltas into the trainer's SEPARATE
+    # base q/k/v/g/o projections (contiguous row slices) and NOT ship the raw
+    # lora_A/lora_B (a pure-base sampler has no receiver slot for them).
+    class Layer(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear_attn = nn.Module()
+            self.linear_attn.q_proj = nn.Linear(4, 2, bias=False, dtype=torch.bfloat16)
+            self.linear_attn.k_proj = nn.Linear(4, 2, bias=False, dtype=torch.bfloat16)
+            self.linear_attn.v_proj = nn.Linear(4, 3, bias=False, dtype=torch.bfloat16)
+            self.linear_attn.g_proj = nn.Linear(4, 3, bias=False, dtype=torch.bfloat16)
+            self.linear_attn.o_proj = nn.Linear(3, 4, bias=False, dtype=torch.bfloat16)
+            self.linear_attn.in_proj_qkvz = LoraDeltaLinear(4, 10, r=2, lora_alpha=2, dtype=torch.bfloat16)
+            self.linear_attn.out_proj = LoraDeltaLinear(3, 4, r=2, lora_alpha=2, dtype=torch.bfloat16)
+
+    class FakeDTensor:
+        pass
+
+    layer = Layer()
+    with torch.no_grad():
+        for projection in ("q_proj", "k_proj", "v_proj", "g_proj", "o_proj"):
+            getattr(layer.linear_attn, projection).weight.zero_()
+        layer.linear_attn.in_proj_qkvz.lora_A.copy_(
+            torch.tensor([[1.0, 2.0, 3.0, 4.0], [4.0, 3.0, 2.0, 1.0]], dtype=torch.bfloat16)
+        )
+        layer.linear_attn.in_proj_qkvz.lora_B.copy_(
+            torch.arange(1, 21, dtype=torch.float32).reshape(10, 2).to(torch.bfloat16)
+        )
+        layer.linear_attn.out_proj.lora_A.copy_(torch.tensor([[1.0, 2.0, 3.0], [3.0, 2.0, 1.0]], dtype=torch.bfloat16))
+        layer.linear_attn.out_proj.lora_B.copy_(
+            torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [-1.0, 2.0]], dtype=torch.bfloat16)
+        )
+
+    extracted = dict(WeightSyncHandler._extract_params_for_sync(layer, "model.layers.0", FakeDTensor))
+    input_delta = layer.linear_attn.in_proj_qkvz.get_delta_weight().to(torch.bfloat16)
+    output_delta = layer.linear_attn.out_proj.get_delta_weight().to(torch.bfloat16)
+    # in_proj_qkvz out=10: q[0:2] k[2:4] v[4:7] g[7:10] (contiguous q|k|v|z), out_proj=o
+    slices = {
+        "q_proj": input_delta[0:2],
+        "k_proj": input_delta[2:4],
+        "v_proj": input_delta[4:7],
+        "g_proj": input_delta[7:10],
+        "o_proj": output_delta,
+    }
+    assert set(extracted) == {f"model.layers.0.linear_attn.{projection}.weight" for projection in slices}
+    # raw fused-GDN factors must NOT be shipped
+    for raw in ("in_proj_qkvz.lora_A", "in_proj_qkvz.lora_B", "out_proj.lora_A", "out_proj.lora_B"):
+        assert f"model.layers.0.linear_attn.{raw}" not in extracted
+    for projection, expected in slices.items():
+        torch.testing.assert_close(
+            extracted[f"model.layers.0.linear_attn.{projection}.weight"], expected, rtol=0.0, atol=0.0
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

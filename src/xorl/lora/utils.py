@@ -4,11 +4,13 @@ LoRA utility functions.
 Functions for injecting LoRA into models and managing LoRA state dicts.
 """
 
+import fnmatch
 import json
 import logging
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 import torch
@@ -196,11 +198,86 @@ def _find_target_modules(
     return matched_paths
 
 
+def _manifest_allows_module_path(path: str, manifest: Optional[dict]) -> bool:
+    if manifest is None:
+        return True
+    return any(fnmatch.fnmatchcase(path, entry["pattern"]) for entry in manifest["expected_modules"])
+
+
+def _inject_fused_gdn_delta_lora(
+    model: nn.Module,
+    *,
+    r: int,
+    lora_alpha: int,
+    target_modules: List[str],
+    target_manifest: Optional[dict],
+) -> int:
+    """Attach River/SGLang-shaped GDN deltas to the separate-weight trainer."""
+    from xorl.lora.modules.delta_linear import LoraDeltaLinear  # noqa: PLC0415
+
+    requested_input = "in_proj_qkvz" in target_modules
+    requested_output = "out_proj" in target_modules
+    if not requested_input and not requested_output:
+        return 0
+
+    injected = 0
+    for module_path, module in list(model.named_modules()):
+        required = ("q_proj", "k_proj", "v_proj", "g_proj", "o_proj")
+        if not module_path or not all(hasattr(module, name) for name in required):
+            continue
+        q_proj = module.q_proj
+        k_proj = module.k_proj
+        v_proj = module.v_proj
+        g_proj = module.g_proj
+        o_proj = module.o_proj
+        if not all(isinstance(proj, nn.Linear) for proj in (q_proj, k_proj, v_proj, g_proj, o_proj)):
+            continue
+        if not (q_proj.in_features == k_proj.in_features == v_proj.in_features == g_proj.in_features):
+            raise ValueError(f"{module_path}: GDN q/k/v/z input dimensions differ")
+
+        if requested_input:
+            path = f"{module_path}.in_proj_qkvz"
+            if _manifest_allows_module_path(path, target_manifest):
+                if hasattr(module, "in_proj_qkvz"):
+                    raise ValueError(f"{path} already exists before fused-GDN LoRA injection")
+                module.add_module(
+                    "in_proj_qkvz",
+                    LoraDeltaLinear(
+                        q_proj.in_features,
+                        q_proj.out_features + k_proj.out_features + v_proj.out_features + g_proj.out_features,
+                        r=r,
+                        lora_alpha=lora_alpha,
+                        device=q_proj.weight.device,
+                    ),
+                )
+                injected += 1
+
+        if requested_output:
+            path = f"{module_path}.out_proj"
+            if _manifest_allows_module_path(path, target_manifest):
+                if hasattr(module, "out_proj"):
+                    raise ValueError(f"{path} already exists before fused-GDN LoRA injection")
+                module.add_module(
+                    "out_proj",
+                    LoraDeltaLinear(
+                        o_proj.in_features,
+                        o_proj.out_features,
+                        r=r,
+                        lora_alpha=lora_alpha,
+                        device=o_proj.weight.device,
+                    ),
+                )
+                injected += 1
+    return injected
+
+
 def inject_lora_into_model(
     model: nn.Module,
     r: int = 16,
     lora_alpha: int = 16,
     target_modules: Optional[List[str]] = None,
+    target_manifest: Optional[dict | str] = None,
+    _defer_manifest_validation: bool = False,
 ) -> nn.Module:
     """
     Inject LoRA adapters into a model by replacing target modules.
@@ -241,20 +318,35 @@ def inject_lora_into_model(
         ...     target_modules=["q_proj", "v_proj", "gate_proj", "up_proj", "down_proj"],
         ... )
     """
+    from xorl.lora.target_manifest import resolve_lora_target_modules, validate_lora_target_manifest  # noqa: PLC0415
+
+    target_modules, loaded_manifest = resolve_lora_target_modules(target_modules, target_manifest)
     if target_modules is None:
         target_modules = _get_default_target_modules(model)
 
+    fused_gdn_count = _inject_fused_gdn_delta_lora(
+        model,
+        r=r,
+        lora_alpha=lora_alpha,
+        target_modules=target_modules,
+        target_manifest=loaded_manifest,
+    )
+
     # Find all matching modules
     target_paths = _find_target_modules(model, target_modules)
+    target_paths = [path for path in target_paths if _manifest_allows_module_path(path, loaded_manifest)]
 
-    if not target_paths:
+    if not target_paths and fused_gdn_count == 0:
         raise ValueError(
             f"No modules found matching target_modules={target_modules}. "
             f"Please check that the model has modules with these names. "
             f"Available module names: {[name.split('.')[-1] for name, _ in model.named_modules() if name][:20]}..."
         )
 
-    logger.info(f"Injecting LoRA into {len(target_paths)} modules with r={r}, alpha={lora_alpha}")
+    logger.info(
+        f"Injecting LoRA into {len(target_paths)} base modules and "
+        f"{fused_gdn_count} fused-GDN delta modules with r={r}, alpha={lora_alpha}"
+    )
 
     # Replace each target module
     replaced_count = 0
@@ -283,7 +375,7 @@ def inject_lora_into_model(
         logger.debug(f"Replaced {target_path} with {lora_cls.__name__}")
 
     # Check if any modules were actually replaced
-    if replaced_count == 0:
+    if replaced_count == 0 and fused_gdn_count == 0:
         skipped_info = ", ".join([f"{path} ({typ})" for path, typ in skipped_modules[:5]])
         if len(skipped_modules) > 5:
             skipped_info += f"... and {len(skipped_modules) - 5} more"
@@ -300,7 +392,12 @@ def inject_lora_into_model(
             f"{[path for path, _ in skipped_modules[:5]]}{'...' if len(skipped_modules) > 5 else ''}"
         )
 
-    logger.info(f"Successfully injected LoRA into {replaced_count} modules")
+    logger.info(
+        f"Successfully injected LoRA into {replaced_count} base modules and {fused_gdn_count} fused-GDN delta modules"
+    )
+    if loaded_manifest is not None and not _defer_manifest_validation:
+        validated = validate_lora_target_manifest(model, loaded_manifest)
+        logger.info(f"Strict LoRA target manifest validated {len(validated)} runtime modules")
     return model
 
 
@@ -1062,6 +1159,54 @@ def save_lora_checkpoint(
     return save_path
 
 
+def load_lora_checkpoint_state_dict(checkpoint_path: str) -> Dict[str, torch.Tensor]:
+    """Load a single-file or indexed-sharded PEFT LoRA state dict safely."""
+    # Determine checkpoint file(s)
+    sharded_index = None
+    if os.path.isdir(checkpoint_path):
+        weights_file = os.path.join(checkpoint_path, "adapter_model.safetensors")
+        if not os.path.exists(weights_file):
+            candidate_index = os.path.join(checkpoint_path, "adapter_model.safetensors.index.json")
+            if os.path.exists(candidate_index):
+                sharded_index = candidate_index
+            else:
+                weights_file = os.path.join(checkpoint_path, "adapter_model.bin")
+    else:
+        weights_file = checkpoint_path
+
+    # Load weights
+    if sharded_index is not None:
+        index = json.loads(Path(sharded_index).read_text())
+        weight_map = index.get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise ValueError(f"Invalid sharded LoRA index {sharded_index}: missing weight_map")
+        checkpoint_root = Path(sharded_index).resolve().parent
+        state_dict = {}
+        for shard_name in sorted(set(weight_map.values())):
+            shard_path = (checkpoint_root / shard_name).resolve()
+            if checkpoint_root not in shard_path.parents:
+                raise ValueError(f"Invalid sharded LoRA index path outside checkpoint: {shard_name!r}")
+            shard = load_file(str(shard_path))
+            duplicate = set(state_dict).intersection(shard)
+            if duplicate:
+                raise ValueError(f"Duplicate tensors across LoRA shards: {sorted(duplicate)!r}")
+            state_dict.update(shard)
+        missing_from_shards = set(weight_map) - set(state_dict)
+        unexpected_in_shards = set(state_dict) - set(weight_map)
+        if missing_from_shards or unexpected_in_shards:
+            raise ValueError(
+                "Sharded LoRA index mismatch: "
+                f"missing={sorted(missing_from_shards)!r}, "
+                f"unexpected={sorted(unexpected_in_shards)!r}"
+            )
+    elif weights_file.endswith(".safetensors"):
+        state_dict = load_file(weights_file)
+    else:
+        state_dict = torch.load(weights_file, map_location="cpu", weights_only=True)
+
+    return state_dict
+
+
 def load_lora_checkpoint(
     model: nn.Module,
     checkpoint_path: str,
@@ -1082,19 +1227,7 @@ def load_lora_checkpoint(
     Returns:
         Model with loaded LoRA weights
     """
-    # Determine checkpoint file
-    if os.path.isdir(checkpoint_path):
-        weights_file = os.path.join(checkpoint_path, "adapter_model.safetensors")
-        if not os.path.exists(weights_file):
-            weights_file = os.path.join(checkpoint_path, "adapter_model.bin")
-    else:
-        weights_file = checkpoint_path
-
-    # Load weights
-    if weights_file.endswith(".safetensors"):
-        state_dict = load_file(weights_file)
-    else:
-        state_dict = torch.load(weights_file, map_location="cpu", weights_only=True)
+    state_dict = load_lora_checkpoint_state_dict(checkpoint_path)
 
     model_lora_shapes = {
         key: value.shape for key, value in model.state_dict().items() if "lora_A" in key or "lora_B" in key
@@ -1218,6 +1351,7 @@ def inject_lora_into_model_with_moe(
     lora_alpha: int = 16,
     target_modules: Optional[List[str]] = None,
     moe_hybrid_shared_lora: bool = False,
+    target_manifest: Optional[dict | str] = None,
 ) -> nn.Module:
     """
     Inject LoRA adapters into both dense layers and MoE expert blocks.
@@ -1251,6 +1385,9 @@ def inject_lora_into_model_with_moe(
         ...     target_modules=["q_proj", "v_proj", "gate_proj", "up_proj", "down_proj"]
         ... )
     """
+    from xorl.lora.target_manifest import resolve_lora_target_modules, validate_lora_target_manifest  # noqa: PLC0415
+
+    target_modules, loaded_manifest = resolve_lora_target_modules(target_modules, target_manifest)
     if target_modules is None:
         target_modules = _get_default_target_modules(model)
 
@@ -1274,6 +1411,8 @@ def inject_lora_into_model_with_moe(
             r=r,
             lora_alpha=lora_alpha,
             target_modules=all_linear_targets,
+            target_manifest=loaded_manifest,
+            _defer_manifest_validation=True,
         )
 
     # Step 2: Inject LoRA into MoE expert blocks
@@ -1286,6 +1425,10 @@ def inject_lora_into_model_with_moe(
             target_modules=expert_modules,
             hybrid_shared=moe_hybrid_shared_lora,
         )
+
+    if loaded_manifest is not None:
+        validated = validate_lora_target_manifest(model, loaded_manifest)
+        logger.info(f"Strict LoRA target manifest validated {len(validated)} runtime modules")
 
     return model
 

@@ -1,7 +1,9 @@
+import os
 from functools import partial
 from typing import Callable, Optional, Tuple, Unpack
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from xorl.distributed.parallel_state import get_parallel_state
@@ -14,12 +16,18 @@ from xorl.models.checkpoint_handlers.buffers import (
 )
 from xorl.models.layers import ACT2FN, RotaryEmbedding
 from xorl.models.layers.attention import AttentionKwargs, update_causal_mask
-from xorl.models.layers.attention.backend import get_attention_fn
+from xorl.models.layers.attention.backend import ATTENTION_FUNCTIONS
+from xorl.models.layers.attention.backend.eager import eager_attention_forward
 from xorl.models.layers.moe import MoEBlock
+from xorl.models.layers.moe.ep_native_combine import moe_sglang_ep_combine_native_enabled
+from xorl.models.layers.moe.experts import moe_sglang_ep_combine_sim_size
 from xorl.models.layers.normalization import (
     compiled_zero_centered_rms_norm,
     eager_zero_centered_rms_norm,
+    fast_zero_centered_batch_invariant_residual_rms_norm,
+    fast_zero_centered_batch_invariant_rms_norm,
     get_rmsnorm_mode,
+    is_bi_residual_norm_enabled,
     native_zero_centered_rms_norm,
     native_zero_centered_rms_norm_without_batch_invariant,
 )
@@ -35,6 +43,7 @@ from xorl.models.transformers.qwen3_5_shared import (
     has_linear_attention_layers,
     qwen3_5_apply_rotary_pos_emb,
 )
+from xorl.ops.batch_invariant_ops import is_trunk_linear_contract_enabled
 from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
 from xorl.ops.linear_attention import GatedDeltaNet
 from xorl.ops.linear_attention.ops.cp import build_linear_attention_cp_context
@@ -42,6 +51,44 @@ from xorl.utils import logging
 
 
 logger = logging.get_logger(__name__)
+
+
+def _default_qwen35_moe_gdn_contract() -> None:
+    """Select the certified Qwen3.5-MoE EP8 contract when GDN parity is armed.
+
+    The dense GDN terms apply at every EP size. The ordered combine mirrors
+    SGLang's EP8/a2a-none reduction tree; keep other EP sizes opt-in until they
+    have their own captured serving gate. Explicit environment values,
+    including an opt-out, always win.
+    """
+    if os.environ.get("XORL_BI_GDN", "").lower() not in {"1", "true", "yes", "on"}:
+        return
+
+    contract_defaults = {
+        "XORL_GDN_CONV_CONTRACT": "1",
+        "XORL_BI_TRUNK_LINEAR": "1",
+        "XORL_BI_RESIDUAL_NORM": "1",
+        "XORL_FAMILIES_V2": "0",
+        "XORL_FLA_L2NORM_AUTOTUNE": "0",
+        "XORL_MOE_BI_ROUTER": "1",
+    }
+    for name, value in contract_defaults.items():
+        os.environ.setdefault(name, value)
+
+    ps = get_parallel_state()
+    if ps.ep_enabled and ps.ep_size == 8:
+        os.environ.setdefault("XORL_MOE_SGLANG_EP_COMBINE", "native")
+        logger.info_rank0(
+            "Qwen3.5-MoE zero-K3 contract engaged: GDN conv=%s, trunk linear=%s, residual norm=%s, "
+            "families-v%s, L2Norm autotune=%s, BI router=%s, EP8 combine=%s",
+            os.environ["XORL_GDN_CONV_CONTRACT"],
+            os.environ["XORL_BI_TRUNK_LINEAR"],
+            os.environ["XORL_BI_RESIDUAL_NORM"],
+            os.environ["XORL_FAMILIES_V2"],
+            os.environ["XORL_FLA_L2NORM_AUTOTUNE"],
+            os.environ["XORL_MOE_BI_ROUTER"],
+            os.environ["XORL_MOE_SGLANG_EP_COMBINE"],
+        )
 
 
 def _adapt_qwen3_5_moe_config(config):
@@ -68,7 +115,7 @@ class Qwen3_5MoeMLP(nn.Module):
         self.gate_up_proj = nn.Linear(self.hidden_size, 2 * self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self._use_fused_silu = config.hidden_act == "silu"
+        self._use_fused_silu = config.hidden_act == "silu" and not getattr(config, "_activation_native", False)
 
     def unfuse_for_tp(self):
         device = self.gate_up_proj.weight.device
@@ -115,9 +162,22 @@ class Qwen3_5MoeRMSNorm(nn.Module):
             out = native_zero_centered_rms_norm(norm_input, self.weight, self.eps)
         elif self.mode == "compile":
             out = compiled_zero_centered_rms_norm(norm_input, self.weight, self.eps)
-        elif self.mode == "sglang":
+        elif self.mode in ("sglang", "sglang_fused"):
+            # Norm-seed contract (§14) family split, ported from qwen3_moe:
+            # residual-tree norms (layer>0 input / post-attn / final) are family-2,
+            # no-residual norms (qk-norm / layer-0 input) are family-1.
             if residual_out is not None or force_sglang_residual:
-                out = native_zero_centered_rms_norm_without_batch_invariant(norm_input, self.weight, self.eps)
+                if is_bi_residual_norm_enabled():
+                    # P5 family-2 contract: pair with the BI-ops sampler's
+                    # eager-with-BI-mean composition (F.rms_norm is 1 ulp off at
+                    # rare boundary values).
+                    out = fast_zero_centered_batch_invariant_residual_rms_norm(norm_input, self.weight, self.eps)
+                else:
+                    out = native_zero_centered_rms_norm_without_batch_invariant(norm_input, self.weight, self.eps)
+            elif self.mode == "sglang_fused" and is_trunk_linear_contract_enabled():
+                # Trunk contract lane: family-1 must bit-match the aten::rms_norm
+                # interpose kernel, with real gradients.
+                out = fast_zero_centered_batch_invariant_rms_norm(norm_input, self.weight, self.eps)
             else:
                 out = native_zero_centered_rms_norm(norm_input, self.weight, self.eps)
         else:
@@ -174,10 +234,12 @@ class Qwen3_5MoeAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape)
 
         cos, sin = position_embeddings
-        # `mrope_interleaved` controls T/H/W frequency mixing in cos/sin
-        # construction upstream, not the q/k rotation convention. q/k always
-        # use the standard half-rotate convention (HF/SGLang).
-        query_states, key_states = qwen3_5_apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = qwen3_5_apply_rotary_pos_emb(
+            query_states,
+            key_states,
+            cos,
+            sin,
+        )
         return query_states, key_states, value_states
 
     def _project_output(self, attn_output: torch.Tensor) -> torch.Tensor:
@@ -190,7 +252,7 @@ class Qwen3_5MoeAttention(nn.Module):
         return self.o_proj(attn_output)
 
     def _get_attention_fn(self) -> Callable:
-        return get_attention_fn(self.config._attn_implementation)
+        return ATTENTION_FUNCTIONS.get(self.config._attn_implementation, eager_attention_forward)
 
     def _attention_kwargs(self) -> dict:
         return dict(
@@ -219,7 +281,7 @@ class Qwen3_5MoeAttention(nn.Module):
 
 
 class Qwen3_5MoeSparseMoeBlock(MoEBlock):
-    def __init__(self, config, moe_implementation="triton"):
+    def __init__(self, config, moe_implementation="triton", layer_idx: int | None = None):
         super().__init__(
             hidden_size=config.hidden_size,
             num_experts=config.num_experts,
@@ -229,12 +291,15 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
             norm_topk_prob=config.norm_topk_prob,
             moe_implementation=moe_implementation,
             train_router=getattr(config, "train_router", False),
+            activation_native=getattr(config, "_activation_native", False),
         )
         self.config = config
+        self.layer_idx = layer_idx
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
         self.experts.deepep_buffer_size_gb = getattr(config, "_deepep_buffer_size_gb", 2.0)
         self.experts.deepep_num_sms = getattr(config, "_deepep_num_sms", 20)
         self.experts.deepep_async_combine = getattr(config, "_deepep_async_combine", False)
+        self.experts.alltoall_combine_hidden_chunk_size = getattr(config, "_alltoall_combine_hidden_chunk_size", 0)
         self.shared_expert = Qwen3_5MoeMLP(config, intermediate_size=config.shared_expert_intermediate_size)
         self.shared_expert_gate = nn.Linear(config.hidden_size, 1, bias=False)
 
@@ -245,12 +310,199 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
         out = torch.sigmoid(self.shared_expert_gate(flat)) * out
         return out.view_as(hidden_states)
 
+    def _ep_combine_sim(
+        self,
+        hidden_states: torch.Tensor,
+        routing_weights: torch.Tensor,
+        selected_experts: torch.Tensor,
+        ep_size: int,
+    ) -> torch.Tensor:
+        """P5 EP-combine simulation: reproduce an EP<n>/a2a-none BI-ops
+        serving engine's whole MoE-block output bitwise on local weights.
+
+        Per simulated rank r: routed partial through the serving kernel on the
+        contiguous expert slice (global top-k ids mapped local, -1 filtered) +
+        the shared expert computed as serving's TP slice (BI GEMMs on the
+        [gate|up] row-slice, torch-native bf16 silu*mul, BI down GEMM on the
+        column slice, sigmoid(BI gate GEMM) mul), added in bf16 per rank; then
+        the NCCL-tree-equivalent SEQUENTIAL bf16 chain sum in rank order
+        (n-1) -> 0. Forward-only: the shared-expert partials here run serving's
+        BI inference GEMMs (no backward); the trainable lane is the native-EP8
+        ordered combine, which pairs the trainable routed-partial primitive
+        with xorl's shared expert."""
+        from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+        from xorl.ops.batch_invariant_ops import matmul_persistent  # noqa: PLC0415
+
+        if torch.is_grad_enabled() and (hidden_states.requires_grad or any(p.requires_grad for p in self.parameters())):
+            raise RuntimeError(
+                "XORL_MOE_SGLANG_EP_COMBINE_SIM is a forward-only K3 lane (scoring/replay): the "
+                "shared-expert partials run serving's BI inference GEMMs. Train through the "
+                "native-EP8 ordered-combine lane instead."
+            )
+        if get_parallel_state().ep_enabled:
+            raise RuntimeError(
+                "XORL_MOE_SGLANG_EP_COMBINE_SIM requires trainer EP disabled (full-width local "
+                "expert weights); run the scoring server with expert_parallel_size: 1."
+            )
+        if not hasattr(self.shared_expert, "gate_up_proj"):
+            raise NotImplementedError("XORL_MOE_SGLANG_EP_COMBINE_SIM requires the fused shared-expert gate_up_proj")
+        inter = self.shared_expert.intermediate_size
+        if inter % ep_size != 0:
+            raise ValueError(
+                f"XORL_MOE_SGLANG_EP_COMBINE_SIM: shared_expert intermediate_size={inter} "
+                f"not divisible by simulated ep_size={ep_size}"
+            )
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        flat = hidden_states.reshape(-1, hidden_dim)
+        routing_flat = routing_weights.reshape(flat.shape[0], -1)
+        selected_flat = selected_experts.reshape(flat.shape[0], -1)
+
+        w_gu = self.shared_expert.gate_up_proj.weight  # [2I, H], gate rows first
+        w_down = self.shared_expert.down_proj.weight  # [H, I]
+        w_gate = self.shared_expert_gate.weight  # [1, H]
+        shard = inter // ep_size
+        # serving applies the sigmoid shared-expert gate on each rank's partial;
+        # the scalar is identical across ranks, computed once here.
+        gate_value = torch.sigmoid(matmul_persistent(flat, w_gate.t()))
+
+        acc = None
+        for rank in range(ep_size - 1, -1, -1):
+            routed = self.experts.sglang_moe_ep_sim_routed_partial(flat, routing_flat, selected_flat, rank, ep_size).to(
+                torch.bfloat16
+            )
+            lo = rank * shard
+            w_slice = torch.cat((w_gu[lo : lo + shard], w_gu[inter + lo : inter + lo + shard]), dim=0).contiguous()
+            gate_up = matmul_persistent(flat, w_slice.t())
+            gate, up = gate_up.chunk(2, dim=-1)
+            act = F.silu(gate) * up  # torch-native bf16 (serving's BI-ops lane; NOT the fused kernel)
+            down = matmul_persistent(act, w_down[:, lo : lo + shard].contiguous().t())
+            partial = routed + (gate_value * down).to(torch.bfloat16)
+            acc = partial if acc is None else acc + partial
+        return acc.reshape(batch_size, sequence_length, hidden_dim)
+
+    def _ep_combine_native(
+        self,
+        hidden_states: torch.Tensor,
+        routing_weights: torch.Tensor,
+        selected_experts: torch.Tensor,
+    ) -> torch.Tensor:
+        """P5 native-EP ordered combine: the TRAINABLE mirror of
+        :meth:`_ep_combine_sim` on the trainer's real EP group.
+
+        Every rank gathers the full token batch (backward: reduce-scatter sum),
+        computes ITS routed partial through the masked serving-kernel Function
+        on the LOCAL expert slice + ITS shared-expert TP slice (trainable BI
+        GEMMs, torch-native bf16 silu*mul, sigmoid gate) added in bf16 — exactly
+        serving's per-rank partial — then partials are exchanged RAW
+        (all-to-all, never NCCL-summed) and each rank chain-sums its own tokens'
+        n partials in serving rank order (n-1) -> 0. Forward bits == the #478
+        simulation == the serving engine; backward is stock numerics throughout
+        (cuBLAS shared-expert grads, grouped-GEMM expert grads, NCCL grad
+        reductions)."""
+        from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+        from xorl.models.layers.moe.ep_native_combine import (  # noqa: PLC0415
+            exchange_and_chain_sum,
+            gather_ids_for_ep_combine,
+            gather_tokens_for_ep_combine,
+            max_rows_for_ep_combine,
+        )
+        from xorl.ops.batch_invariant_ops import _BatchInvariantTrunkLinearFn  # noqa: PLC0415
+
+        ps = get_parallel_state()
+        if not ps.ep_enabled:
+            raise RuntimeError(
+                "XORL_MOE_SGLANG_EP_COMBINE=native requires trainer EP mirroring the serving EP size "
+                "(expert_parallel_size == the serving --ep-size); for EP-disabled scoring use "
+                "XORL_MOE_SGLANG_EP_COMBINE_SIM instead."
+            )
+        if moe_sglang_ep_combine_sim_size() > 0:
+            raise RuntimeError("XORL_MOE_SGLANG_EP_COMBINE=native and XORL_MOE_SGLANG_EP_COMBINE_SIM are exclusive")
+        if not hasattr(self.shared_expert, "gate_up_proj"):
+            raise NotImplementedError("XORL_MOE_SGLANG_EP_COMBINE=native requires the fused shared-expert gate_up_proj")
+        ep_size, ep_rank, ep_group = ps.ep_size, ps.ep_rank, ps.ep_group
+        inter = self.shared_expert.intermediate_size
+        if inter % ep_size != 0:
+            raise ValueError(
+                f"XORL_MOE_SGLANG_EP_COMBINE=native: shared_expert intermediate_size={inter} "
+                f"not divisible by ep_size={ep_size}"
+            )
+        e_local = int(self.experts.gate_up_proj.shape[0])
+        if e_local * ep_size != self.experts.num_experts:
+            raise RuntimeError(
+                f"XORL_MOE_SGLANG_EP_COMBINE=native: local expert slice {e_local} x ep_size {ep_size} "
+                f"!= num_experts {self.experts.num_experts} (trainer EP must mirror serving EP)"
+            )
+
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        flat = hidden_states.reshape(-1, hidden_dim)
+        routing_flat = routing_weights.reshape(flat.shape[0], -1)
+        selected_flat = selected_experts.reshape(flat.shape[0], -1)
+
+        # 1. full token batch on every rank (serving's DP-attention gather)
+        # Packed DP slices can have different local row counts, so negotiate one
+        # equal-count collective shape and discard this rank's padding after the
+        # ordered combine. BI kernels make those extra rows forward-independent.
+        padded_rows = max_rows_for_ep_combine(flat.shape[0], flat.device, ep_group)
+        gathered = gather_tokens_for_ep_combine(flat, ep_group, padded_rows)
+        gathered_routing = gather_tokens_for_ep_combine(routing_flat, ep_group, padded_rows)
+        gathered_ids = gather_ids_for_ep_combine(selected_flat, ep_group, padded_rows)
+
+        # 2. this rank's partial: routed (masked serving kernel on the local
+        #    slice) + shared-expert TP slice, added in bf16 (serving semantics)
+        lo = ep_rank * e_local
+        local_ids = torch.where(
+            (gathered_ids >= lo) & (gathered_ids < lo + e_local),
+            gathered_ids - lo,
+            gathered_ids.new_full((), -1),
+        ).to(torch.int32)
+        # Enter through Module.__call__ so the experts FSDP unit materializes
+        # its BF16 compute parameters before invoking the serving kernel.
+        routed = self.experts(
+            gathered,
+            gathered_routing,
+            sglang_ep_native_local_ids=local_ids,
+        ).to(torch.bfloat16)
+
+        w_gu = self.shared_expert.gate_up_proj.weight  # [2I, H], gate rows first
+        w_down = self.shared_expert.down_proj.weight  # [H, I]
+        shard = inter // ep_size
+        lo_s = ep_rank * shard
+        # serving applies the sigmoid shared-expert gate on each rank's partial;
+        # the scalar is identical across ranks.
+        gate_value = torch.sigmoid(_BatchInvariantTrunkLinearFn.apply(gathered, self.shared_expert_gate.weight, None))
+        w_slice = torch.cat((w_gu[lo_s : lo_s + shard], w_gu[inter + lo_s : inter + lo_s + shard]), dim=0)
+        gate_up = _BatchInvariantTrunkLinearFn.apply(gathered, w_slice, None)
+        gate, up = gate_up.chunk(2, dim=-1)
+        act = F.silu(gate) * up  # torch-native bf16 (serving's BI-ops lane; NOT the fused kernel)
+        down = _BatchInvariantTrunkLinearFn.apply(act, w_down[:, lo_s : lo_s + shard].contiguous(), None)
+        partial = routed + (gate_value * down).to(torch.bfloat16)
+
+        # 3./4. raw exchange + serving-order chain sum (autograd reverses the exchange)
+        out = exchange_and_chain_sum(partial, ep_group, ep_size)
+        return out[: flat.shape[0]].reshape(batch_size, sequence_length, hidden_dim)
+
     def forward_experts_only(self, hidden_states, routing_weights, selected_experts):
         """Sparse experts + shared expert with pre-computed routing."""
+        if moe_sglang_ep_combine_native_enabled():
+            return self._ep_combine_native(hidden_states, routing_weights, selected_experts)
+        ep_sim = moe_sglang_ep_combine_sim_size()
+        if ep_sim > 0:
+            return self._ep_combine_sim(hidden_states, routing_weights, selected_experts, ep_sim)
         expert_output = super().forward_experts_only(hidden_states, routing_weights, selected_experts)
         return expert_output + self._shared_expert(hidden_states)
 
     def forward(self, hidden_states: torch.Tensor):
+        if moe_sglang_ep_combine_native_enabled():
+            batch_size, sequence_length, hidden_dim = hidden_states.shape
+            routing_weights, selected_experts, router_logits = self.route(hidden_states.view(-1, hidden_dim))
+            out = self._ep_combine_native(hidden_states, routing_weights, selected_experts)
+            return out, router_logits
+        ep_sim = moe_sglang_ep_combine_sim_size()
+        if ep_sim > 0:
+            batch_size, sequence_length, hidden_dim = hidden_states.shape
+            routing_weights, selected_experts, router_logits = self.route(hidden_states.view(-1, hidden_dim))
+            out = self._ep_combine_sim(hidden_states, routing_weights, selected_experts, ep_sim)
+            return out, router_logits
         expert_output, router_logits = super().forward(hidden_states)
         return expert_output + self._shared_expert(hidden_states), router_logits
 
@@ -294,7 +546,7 @@ class Qwen3_5MoeDecoderLayer(MoEGradientCheckpointingLayer):
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
             moe_implementation = getattr(config, "_moe_implementation", "triton")
-            self.mlp = QWEN3_5_MOE_CLASSES[moe_implementation](config)
+            self.mlp = QWEN3_5_MOE_CLASSES[moe_implementation](config, layer_idx=layer_idx)
         else:
             self.mlp = Qwen3_5MoeMLP(config, intermediate_size=config.intermediate_size)
 
@@ -311,28 +563,29 @@ class Qwen3_5MoeDecoderLayer(MoEGradientCheckpointingLayer):
         residual = hidden_states
         hidden_states = self.input_layernorm(
             hidden_states,
-            force_sglang_residual=self.layer_idx > 0 and self.input_layernorm.mode == "sglang",
+            force_sglang_residual=self.layer_idx > 0 and self.input_layernorm.mode in ("sglang", "sglang_fused"),
         )
 
         if self.linear_attn is not None:
-            linear_kwargs = {}
-            if kwargs.get("cu_seq_lens_q") is not None:
-                linear_kwargs["cu_seqlens"] = kwargs.get("cu_seq_lens_q")
+            cu_seqlens = kwargs.get("cu_seq_lens_q")
             cp_context = build_linear_attention_cp_context(
-                kwargs.get("cu_seq_lens_q"),
+                cu_seqlens,
                 conv1d_kernel_size=self.linear_attn.conv_size if self.linear_attn.use_short_conv else None,
             )
-            if cp_context is not None:
-                linear_kwargs["cp_context"] = cp_context
             linear_mask = attention_mask if attention_mask is not None and attention_mask.dim() == 2 else None
             if cp_context is not None:
                 linear_mask = None
+            # Pass cu_seqlens/cp_context as EXPLICIT kwargs (not a **dict splat) so torch.compile/dynamo can
+            # trace through this call. The `**linear_kwargs` splat here was a CALL_FUNCTION_EX graph break at
+            # the GatedDeltaNet boundary that fragmented the compiled graph. GatedDeltaNet.forward reads both
+            # via kwargs.get() (None-safe), so explicit None is identical to the old conditional omission.
             hidden_states, _, _ = self.linear_attn(
                 hidden_states=hidden_states,
                 attention_mask=linear_mask,
                 past_key_values=past_key_values,
                 use_cache=False,
-                **linear_kwargs,
+                cu_seqlens=cu_seqlens,
+                cp_context=cp_context,
             )
         else:
             hidden_states, _ = self.self_attn(
@@ -416,7 +669,7 @@ class Qwen3_5MoePreTrainedModel(XorlPreTrainedModel):
         head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
         skip_expert_loading = False
         if not is_prequantized:
-            from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
+            from xorl.qlora.modules.moe_experts import QLoRAMoeExperts  # noqa: PLC0415
 
             skip_expert_loading = any(
                 isinstance(module, QLoRAMoeExperts) and not getattr(module, "_weights_loaded", False)
@@ -442,6 +695,7 @@ class Qwen3_5MoePreTrainedModel(XorlPreTrainedModel):
 
 class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
     def __init__(self, config: Qwen3_5MoeConfig):
+        _default_qwen35_moe_gdn_contract()
         config = _adapt_qwen3_5_moe_config(config)
         super().__init__(config)
         self.padding_idx = config.pad_token_id
@@ -476,6 +730,9 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_router_logits = (
             output_router_logits if output_router_logits is not None else self.config.output_router_logits
+        )
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
         if self.embed_tokens is not None:
@@ -520,6 +777,13 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
 
         all_self_attns = () if output_attentions else None
         all_router_logits = () if output_router_logits else None
+        # Per-layer residual-stream hiddens for all-layer OPRD (post-decoder-layer,
+        # pre-final-norm). Student and teacher use the SAME convention here, so they
+        # align 1:1 per layer; KL still uses the post-norm last_hidden_state below.
+        # NB: we append the OUTPUT of each decoder layer (index i == layer i output,
+        # 40 entries total) — NOT the standard-HF embedding+inputs convention — so the
+        # OPRD layer-index resolution in model_runner indexes hidden_states[i] directly.
+        all_hidden_states = () if output_hidden_states else None
         for decoder_layer in self.layers:
             if decoder_layer is None:
                 continue
@@ -557,6 +821,8 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
                     **kwargs,
                 )
             hidden_states = layer_outputs[0]
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
             if output_attentions:
                 # _moe_forward does not produce attention weights; use None placeholder.
                 all_self_attns += (None,)
@@ -566,10 +832,13 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
         if self.norm is not None:
             hidden_states = self.norm(
                 hidden_states,
-                force_sglang_residual=getattr(self.norm, "mode", None) == "sglang",
+                force_sglang_residual=getattr(self.norm, "mode", None) in ("sglang", "sglang_fused"),
             )
         return MoeModelOutput(
-            last_hidden_state=hidden_states, attentions=all_self_attns, router_logits=all_router_logits
+            last_hidden_state=hidden_states,
+            attentions=all_self_attns,
+            router_logits=all_router_logits,
+            hidden_states=all_hidden_states,
         )
 
 
@@ -636,7 +905,11 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel):
             output_router_logits=output_router_logits,
             **kwargs,
         )
-        return MoeCausalLMOutput(last_hidden_state=outputs.last_hidden_state, router_logits=outputs.router_logits)
+        return MoeCausalLMOutput(
+            last_hidden_state=outputs.last_hidden_state,
+            router_logits=outputs.router_logits,
+            hidden_states=outputs.hidden_states,
+        )
 
 
 class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoeForCausalLM):
