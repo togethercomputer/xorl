@@ -22,6 +22,8 @@ from .loader import ModelLoader, get_loader
 from .transformers.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from .transformers.deepseek_v3.support import validate_deepseek_v3_router_settings
 from .transformers.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
+from .transformers.glm5.configuration_glm5 import Glm5Config
+from .transformers.glm5.support import validate_glm5_router_settings, validate_glm5_sequence_parallel
 from .transformers.gpt_oss.configuration_gpt_oss import GptOssConfig
 from .transformers.minimax_m3.configuration_minimax_m3 import MiniMaxM3Config
 from .transformers.nemotron_h.configuration_nemotron_h import NemotronHConfig
@@ -37,6 +39,33 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer, ProcessorMixin
 
 logger = logging.get_logger(__name__)
+
+_MAX_CONFIG_DEPTH = 32
+_MAX_CONFIG_CONTAINER_ITEMS = 100_000
+
+
+def _validate_plain_config_value(value: Any, *, path: str = "$", depth: int = 0) -> Any:
+    """Copy an HF config tree while admitting only bounded plain-JSON values."""
+    if depth > _MAX_CONFIG_DEPTH:
+        raise ValueError(f"model config exceeds maximum nesting depth at {path}")
+    if value is None or type(value) in {bool, int, float, str}:
+        return value
+    if type(value) is list:
+        if len(value) > _MAX_CONFIG_CONTAINER_ITEMS:
+            raise ValueError(f"model config list is too large at {path}")
+        return [
+            _validate_plain_config_value(item, path=f"{path}[{idx}]", depth=depth + 1) for idx, item in enumerate(value)
+        ]
+    if type(value) is dict:
+        if len(value) > _MAX_CONFIG_CONTAINER_ITEMS:
+            raise ValueError(f"model config mapping is too large at {path}")
+        result = {}
+        for key, item in value.items():
+            if type(key) is not str or key.startswith("__"):
+                raise ValueError(f"model config contains an unsafe key at {path}: {key!r}")
+            result[key] = _validate_plain_config_value(item, path=f"{path}.{key}", depth=depth + 1)
+        return result
+    raise ValueError(f"model config contains a non-JSON value at {path}: {type(value).__name__}")
 
 
 def _build_local_kimi_tokenizer(tokenizer_path: str):
@@ -79,7 +108,11 @@ def _load_local_xorl_config(
     config_kwargs: Dict[str, Any],
 ) -> Optional["PretrainedConfig"]:
     config_dict, _ = PretrainedConfig.get_config_dict(config_path, **config_kwargs)
+    config_dict = _validate_plain_config_value(config_dict)
     model_type = config_dict.get("model_type")
+
+    if model_type == "glm_moe_dsa":
+        return Glm5Config.from_hf_config(_namespace_from_dict(config_dict))
 
     if model_type == "glm4_moe":
         return Glm4MoeConfig.from_dict(config_dict)
@@ -202,6 +235,8 @@ def build_foundation_model(
     activation_native: bool = False,
     rope_native: bool = False,
     attention_cast_bf16: bool = False,
+    sparse_mla_enabled: bool = False,
+    sparse_mla_backend: str = "auto",
     flash_attention_deterministic: bool = False,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
@@ -228,6 +263,8 @@ def build_foundation_model(
         logger.info_rank0(f"Moe implementation: {moe_implementation}")
 
     validate_deepseek_v3_router_settings(config, train_router=train_router)
+    validate_glm5_router_settings(config, train_router=train_router)
+
     if ep_dispatch == "deepep" and train_router:
         raise ValueError(
             "train_router=True is not supported with ep_dispatch='deepep'. "
@@ -257,6 +294,8 @@ def build_foundation_model(
     config._activation_native = activation_native
     config._rope_native = rope_native
     config._attention_cast_bf16 = attention_cast_bf16
+    config._sparse_mla_enabled = sparse_mla_enabled
+    config._sparse_mla_backend = sparse_mla_backend
     config._flash_attention_deterministic = flash_attention_deterministic
 
     if ep_dispatch == "deepep":
@@ -288,6 +327,8 @@ def build_foundation_model(
     if ps.ringattn_size > 1 and has_linear_attention_layers(config):
         logger.warning_once(LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE)
         raise ValueError(LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE)
+    validate_glm5_sequence_parallel(config, parallel_state=ps)
+
     if _is_gpt_oss_config(config) and attn_implementation not in ("eager", "flash_attention_3", "flash_attention_4"):
         raise ValueError(
             "GPT-OSS attention sinks are only implemented for attn_implementation="

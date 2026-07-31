@@ -208,6 +208,7 @@ class DeepseekV3MoEBlock(MoEBlock):
             moe_implementation=getattr(config, "_moe_implementation", "eager"),
             train_router=getattr(config, "train_router", False),
             record_routing_weights=getattr(config, "record_routing_weights", True),
+            activation_native=getattr(config, "_activation_native", False),
         )
         self.config = config
         self.gate = DeepseekV3TopkRouter(config)
@@ -215,6 +216,7 @@ class DeepseekV3MoEBlock(MoEBlock):
         self.experts.deepep_buffer_size_gb = getattr(config, "_deepep_buffer_size_gb", 2.0)
         self.experts.deepep_num_sms = getattr(config, "_deepep_num_sms", 20)
         self.experts.deepep_async_combine = getattr(config, "_deepep_async_combine", False)
+        self.experts.alltoall_combine_hidden_chunk_size = getattr(config, "_alltoall_combine_hidden_chunk_size", 0)
         self.n_group = config.n_group
         self.topk_group = config.topk_group
         self.norm_topk_prob = config.norm_topk_prob
