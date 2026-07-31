@@ -85,3 +85,26 @@ def test_model_runner_loads_initial_checkpoint_and_syncs_state():
     assert runner._checkpoint_mgr.calls == [("/tmp/initial-dcp", True)]
     assert runner.global_step == 13
     assert runner.global_forward_backward_step == 17
+
+
+def test_model_runner_can_skip_initial_checkpoint_optimizer_state():
+    class FakeCheckpointManager:
+        def __init__(self):
+            self.calls = []
+            self.global_step = 13
+            self.global_forward_backward_step = 17
+
+        def load_state(self, checkpoint_path, load_optimizer=True):
+            self.calls.append((checkpoint_path, load_optimizer))
+
+    runner = object.__new__(ModelRunner)
+    runner.train_config = {"load_checkpoint_path": "/tmp/initial-dcp", "load_optimizer": False}
+    runner.global_step = 0
+    runner.global_forward_backward_step = 0
+    runner._checkpoint_mgr = FakeCheckpointManager()
+
+    runner._load_initial_checkpoint()
+
+    assert runner._checkpoint_mgr.calls == [("/tmp/initial-dcp", False)]
+    assert runner.global_step == 13
+    assert runner.global_forward_backward_step == 17

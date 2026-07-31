@@ -171,6 +171,13 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
         # Each model_id has its own set of tracked adapters to support parallel training runs
         self.loaded_sampling_loras: Dict[str, List[tuple]] = {}
 
+        # Per-model_id lock for atomic mutations of loaded_sampling_loras. Required
+        # because cleanup_zorl_generation_sampling does an unload (await)
+        # followed by a read-modify-write on the list, and a concurrent
+        # start_zorl_generation / cleanup on the same model_id could overwrite
+        # each other's filtering and leak SGLang slots.
+        self._sampling_loras_locks: Dict[str, asyncio.Lock] = {}
+
         # Maximum number of adapters per model_id for sampling. Default is intentionally
         # generous (was 3) because SGLang's /unload_lora_adapter has been observed to
         # hang on 30B-class hosts, so eviction during a multi-step OPD run wedges the
@@ -297,6 +304,7 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
                             data=elementwise_loss, dtype="float32", shape=[len(elementwise_loss)]
                         ),
                         k3=k3_val,
+                        token_diagnostics=sample.get("token_diagnostics"),
                     )
                 )
             return outputs, "CrossEntropyLossReturn"
@@ -310,13 +318,17 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
 
     @staticmethod
     def _build_info(result: Dict[str, Any]) -> Dict[str, Any]:
-        """Extract auto-load info from engine result."""
+        """Extract non-loss metadata from engine result."""
         info: Dict[str, Any] = {}
         if result.get("auto_loaded"):
-            info["auto_loaded"] = True
-            info["auto_load_path"] = result.get("auto_load_path")
-        if "teacher_hidden_cache" in result:
+            info.update({"auto_loaded": True, "auto_load_path": result.get("auto_load_path")})
+        if result.get("teacher_hidden_cache"):
             info["teacher_hidden_cache"] = result["teacher_hidden_cache"]
+        if result.get("sparse_delta_capture"):
+            info["sparse_delta_capture"] = result["sparse_delta_capture"]
+        for key, value in result.items():
+            if key.startswith("forward_backward_"):
+                info[key] = value
         return info
 
     async def _cleanup_session(self, model_id: str, *, notify_workers: bool = True) -> None:
@@ -513,6 +525,11 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
 
         self._running = False
         logger.info("APIServer stopped")
+
+
+# ============================================================================
+# Global API Server Instance
+# ============================================================================
 
 
 @asynccontextmanager

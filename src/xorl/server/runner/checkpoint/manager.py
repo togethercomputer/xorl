@@ -13,7 +13,6 @@ import gc
 import json
 import logging
 import os
-import pickle
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -351,6 +350,58 @@ class CheckpointManager:
         del lora_state_dict
         gc.collect()
         torch.cuda.empty_cache()
+
+    def save_explicit_lora_checkpoint(
+        self,
+        save_path: str,
+        *,
+        lora_state_dict: Dict[str, torch.Tensor],
+        session_spec: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Save a PEFT LoRA checkpoint from an explicit LoRA state dict."""
+        start_time = time.time()
+
+        local_error = None
+        try:
+            if self.rank == 0:
+                # MoE hybrid-shared adapters must be exported in SGLang's stacked
+                # shared_outer layout (experts.w1/w2/w3) or the scorer's
+                # --lora-moe-format hybrid_shared loader rejects them. Thread the
+                # configured export format through (falls back to shared_outer when
+                # hybrid-shared MoE LoRA is enabled, else PEFT).
+                moe_hybrid = self.lora_config.get("moe_hybrid_shared_lora", False)
+                export_format = self.lora_config.get(
+                    "lora_export_format",
+                    "sglang_shared_outer" if moe_hybrid else "peft",
+                )
+                save_lora_checkpoint(
+                    model=self.model,
+                    save_path=save_path,
+                    base_model_name=session_spec.get("base_model") or self.model_config.get("model_path"),
+                    target_modules=None,
+                    r=int(session_spec["lora_config"]["lora_rank"]),
+                    lora_alpha=int(session_spec["lora_config"]["lora_alpha"]),
+                    moe_hybrid_shared_lora=moe_hybrid,
+                    lora_state_dict=lora_state_dict,
+                    lora_export_format=export_format,
+                )
+                write_session_spec(save_path, session_spec)
+        except Exception as exc:  # pragma: no cover - exercised through sync wrapper
+            logger.error(f"Failed to save explicit LoRA checkpoint to {save_path}: {exc}", exc_info=True)
+            local_error = str(exc)
+
+        synced_error = self._sync_collective_error(local_error)
+        if synced_error:
+            raise RuntimeError(f"Explicit LoRA save failed: {synced_error}")
+
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            dist.barrier()
+
+        return {
+            "lora_path": save_path,
+            "save_time": time.time() - start_time,
+            "success": True,
+        }
 
     def save_adapter_state(
         self, model_id: str, path: Optional[str] = None, save_optimizer: bool = True
@@ -873,11 +924,12 @@ class CheckpointManager:
 
         # Phase 4: Gather shard metadata to rank 0 and write index.json
         if num_shards > 1:
-            # Serialize shard results for gathering
+            # Serialize the primitive-only shard metadata without executable
+            # object deserialization.
             if is_writer:
-                local_results_bytes = pickle.dumps(my_shard_results)
+                local_results_bytes = json.dumps(my_shard_results, separators=(",", ":")).encode("utf-8")
             else:
-                local_results_bytes = pickle.dumps([])
+                local_results_bytes = b"[]"
 
             # Gather sizes first
             local_size = torch.tensor([len(local_results_bytes)], dtype=torch.long, device="cuda")
@@ -900,7 +952,9 @@ class CheckpointManager:
                     size = size_tensor.item()
                     if size > 0:
                         result_bytes = bytes(padded[:size].cpu().tolist())
-                        results = pickle.loads(result_bytes)
+                        results = json.loads(result_bytes.decode("utf-8"))
+                        if not isinstance(results, list):
+                            raise ValueError(f"Rank {i} returned invalid shard metadata")
                         all_shard_results.extend(results)
 
                 # Sort by shard index and build weight_map

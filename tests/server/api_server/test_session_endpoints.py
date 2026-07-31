@@ -21,6 +21,7 @@ from xorl.server.api_server.api_types import (
     WeightsInfoRequest,
 )
 from xorl.server.api_server.endpoints import (
+    _canon_base_model,
     create_model_endpoint,
     create_session_endpoint,
     kill_session_endpoint,
@@ -632,3 +633,30 @@ def test_load_session_spec_from_checkpoint_upgrades_legacy_signsgd_metadata(tmp_
     assert session_spec["optimizer_config"]["type"] == "signsgd"
     assert session_spec["optimizer_config"]["betas"] is None
     assert session_spec["optimizer_config"]["eps"] is None
+
+
+@pytest.mark.parametrize(
+    ("client_ref", "server_ref"),
+    [
+        ("Qwen/Qwen3.5-35B-A3B", "Qwen/Qwen3.5-35B-A3B"),
+        (
+            "Qwen/Qwen3.5-35B-A3B",
+            "/root/.cache/huggingface/hub/models--Qwen--Qwen3.5-35B-A3B/snapshots/abc123def",
+        ),
+        (
+            "/data/hf-cache/models--Qwen--Qwen3.5-35B-A3B/snapshots/abc123def",
+            "Qwen/Qwen3.5-35B-A3B",
+        ),
+    ],
+)
+def test_canon_base_model_matches_hf_cache_path_to_repo_id(client_ref, server_ref):
+    assert _canon_base_model(client_ref) == _canon_base_model(server_ref)
+
+
+def test_canon_base_model_distinct_models_still_differ():
+    assert _canon_base_model("Qwen/Qwen3-8B") != _canon_base_model(
+        "/root/.cache/huggingface/hub/models--Qwen--Qwen3.5-35B-A3B/snapshots/abc123def"
+    )
+    # Non-cache paths and None pass through untouched.
+    assert _canon_base_model("/shared/checkpoints/my-model") == "/shared/checkpoints/my-model"
+    assert _canon_base_model(None) is None

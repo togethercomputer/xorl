@@ -9,11 +9,9 @@ This test suite verifies the Scheduler and FIFO scheduling policy:
 5. FIFO policy behavior
 """
 
-import pytest
-
-
-pytestmark = [pytest.mark.cpu, pytest.mark.server]
 import time
+
+import pytest
 
 from xorl.server.orchestrator.scheduler import (
     FIFOPolicy,
@@ -25,6 +23,9 @@ from xorl.server.protocol.api_orchestrator import (
     RequestType,
 )
 from xorl.server.protocol.operations import EmptyData
+
+
+pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
 
 @pytest.fixture
@@ -90,7 +91,7 @@ def test_add_dispatch_peek_and_capacity(scheduler, create_request):
     req1 = scheduler.get_next_request()
     assert req1.request_id == request.request_id
     assert req1.status == "processing" and req1.start_time is not None
-    req2 = scheduler.get_next_request()
+    scheduler.get_next_request()
     assert scheduler.get_running_count() == 2
 
     # At capacity

@@ -197,6 +197,37 @@ class Backend(ABC):
         """Kill training session. Returns {success, message, checkpoint_path, ...}."""
 
     @abstractmethod
+    async def start_zorl_generation(
+        self,
+        model_id: str = "default",
+        num_pairs: Optional[int] = None,
+        materialization: Optional[Dict[str, Any]] = None,
+        owner_url: Optional[str] = None,
+        request_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Plan and export one ZORL generation."""
+
+    @abstractmethod
+    async def apply_zorl_rewards(
+        self,
+        model_id: str = "default",
+        generation_id: str = "",
+        candidate_rewards: Optional[List[Dict[str, Any]]] = None,
+        learning_rate: Optional[float] = None,
+        request_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Apply externally aggregated ZORL rewards to the parent LoRA-B weights."""
+
+    @abstractmethod
+    async def abort_zorl_generation(
+        self,
+        model_id: str = "default",
+        generation_id: str = "",
+        request_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Abort the active ZORL generation and delete exported candidates."""
+
+    @abstractmethod
     async def health_check(self, request_id: Optional[str] = None) -> Dict[str, Any]:
         """Health check. Returns {status, ...}."""
 

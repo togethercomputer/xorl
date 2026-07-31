@@ -28,9 +28,9 @@ import uvicorn
 repo_root = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(repo_root))
 
-from xorl.server.api_server.server import app
-from xorl.server.backend import DummyBackend
-from xorl.server.orchestrator.orchestrator import Orchestrator
+from xorl.server.api_server.server import app  # noqa: E402
+from xorl.server.backend import DummyBackend  # noqa: E402
+from xorl.server.orchestrator.orchestrator import Orchestrator  # noqa: E402
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")

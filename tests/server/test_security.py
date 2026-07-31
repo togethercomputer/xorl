@@ -9,7 +9,9 @@ import torch
 from xorl.ops.quack._worker_protocol import recv_message, send_message
 from xorl.server.security import (
     build_http_endpoint_url,
+    resolve_diagnostic_input,
     resolve_path_within,
+    resolve_server_artifact,
     validate_outbound_endpoint,
 )
 
@@ -73,6 +75,38 @@ def test_resolve_path_within_rejects_escape_and_symlink(tmp_path):
     link.symlink_to(outside, target_is_directory=True)
     with pytest.raises(ValueError, match="Symlinked paths"):
         resolve_path_within(root, link, must_exist=True, reject_symlinks=True)
+
+
+def test_server_artifact_path_is_confined_to_configured_root(tmp_path, monkeypatch):
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    checkpoint = root / "checkpoint"
+    checkpoint.mkdir()
+    monkeypatch.setenv("XORL_SERVER_ARTIFACT_ROOT", str(root))
+
+    assert resolve_server_artifact("checkpoint", must_exist=True) == checkpoint
+    with pytest.raises(ValueError, match="escapes configured root"):
+        resolve_server_artifact(tmp_path / "outside")
+
+
+def test_diagnostic_input_requires_configured_root_and_regular_private_file(tmp_path, monkeypatch):
+    root = tmp_path / "diagnostics"
+    root.mkdir()
+    payload = root / "reference.pt"
+    payload.write_bytes(b"safe")
+    payload.chmod(0o600)
+
+    monkeypatch.delenv("XORL_DIAGNOSTIC_INPUT_ROOT", raising=False)
+    with pytest.raises(ValueError, match="XORL_DIAGNOSTIC_INPUT_ROOT"):
+        resolve_diagnostic_input(payload)
+
+    monkeypatch.setenv("XORL_DIAGNOSTIC_INPUT_ROOT", str(root))
+    assert resolve_diagnostic_input(payload) == payload.resolve()
+
+    outside = tmp_path / "outside.pt"
+    outside.write_bytes(b"outside")
+    with pytest.raises(ValueError, match="escapes configured root"):
+        resolve_diagnostic_input(outside)
 
 
 def test_compile_worker_rejects_targets_outside_quack():

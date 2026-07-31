@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,11 @@ from xorl.server.session_spec import normalize_session_spec
 
 
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
+
+
+@pytest.fixture(autouse=True)
+def _trusted_server_artifact_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("XORL_SERVER_ARTIFACT_ROOT", str(tmp_path))
 
 
 class _DummyLoRALayer(nn.Module):
@@ -139,6 +145,14 @@ def test_save_adapter_state_preserves_lora_weight_dtype(tmp_path):
     assert weights["base_model.model.model.layers.0.self_attn.o_proj.lora_B"].dtype == torch.float32
 
 
+def test_save_adapter_state_rejects_path_outside_checkpoint_root(tmp_path):
+    manager = _build_manager(tmp_path, optimizer_type="adamw")
+    manager.register_adapter("policy-contained", lr=0.1, initialize_fresh=True)
+
+    with pytest.raises(ValueError, match="escapes configured root"):
+        manager.save_adapter_state("policy-contained", path=str(tmp_path / "outside"))
+
+
 def test_load_adapter_state_uses_checkpoint_optimizer_contract_for_fresh_session(tmp_path):
     source_manager = _build_manager(tmp_path, optimizer_type="signsgd")
     source_manager.register_adapter("policy-b", lr=0.1, initialize_fresh=True)
@@ -189,7 +203,9 @@ def test_adapter_coordinator_auto_load_evicted_uses_checkpoint_session_spec(tmp_
     source_manager = _build_manager(tmp_path / "source", optimizer_type="signsgd")
     source_manager.register_adapter("policy-evicted", lr=0.2, initialize_fresh=True)
     checkpoint_path = Path(target_manager.checkpoint_dir) / "evicted" / "policy-evicted"
-    source_manager.save_adapter_state("policy-evicted", str(checkpoint_path))
+    source_checkpoint = source_manager.save_adapter_state("policy-evicted")["path"]
+    checkpoint_path.parent.mkdir(parents=True)
+    shutil.copytree(source_checkpoint, checkpoint_path)
 
     coordinator = AdapterCoordinator(
         trainer=_CoordinatorTrainer(target_manager),
@@ -218,6 +234,17 @@ def test_load_adapter_state_rejects_registered_session_spec_mismatch(tmp_path):
 
     with pytest.raises(ValueError, match="Checkpoint session spec does not match"):
         target_manager.load_adapter_state("policy-b", checkpoint_path, load_optimizer=True)
+
+
+def test_load_adapter_state_rejects_checkpoint_outside_trusted_roots(tmp_path, monkeypatch):
+    server_root = tmp_path / "server"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setenv("XORL_SERVER_ARTIFACT_ROOT", str(server_root))
+    manager = _build_manager(server_root, optimizer_type="adamw")
+
+    with pytest.raises(ValueError, match="escapes configured root"):
+        manager.load_adapter_state("policy-b", str(outside), load_optimizer=False)
 
 
 def test_load_adapter_state_allows_lr_override_for_registered_session(tmp_path):
@@ -611,3 +638,10 @@ def test_muon_set_lr_preserves_muon_param_group_lr(tmp_path):
     manager.optim_step("policy-muon", lr=3e-4)
     assert state.lr == pytest.approx(3e-4)
     assert all(param_group["lr"] == pytest.approx(0.02) for param_group in muon_groups)
+
+
+def test_capture_gradients_validates_identifier_before_registry_lookup(tmp_path):
+    manager = _build_manager(tmp_path)
+
+    with pytest.raises(ValueError, match="model_id"):
+        manager.capture_gradients("../outside")

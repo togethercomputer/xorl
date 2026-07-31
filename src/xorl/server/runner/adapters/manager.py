@@ -19,6 +19,7 @@ import os
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -31,6 +32,7 @@ from xorl.lora.utils import (
     get_lora_tensor_shard_specs,
 )
 from xorl.optim import build_optimizer
+from xorl.server.security import resolve_path_within, resolve_server_artifact, validate_identifier
 from xorl.server.session_spec import (
     load_session_spec_from_checkpoint,
     session_optimizer_build_kwargs,
@@ -48,6 +50,17 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+
+_TORCH_MANUAL_SEED_MASK = 0x7FFFFFFFFFFFFFFF
+
+
+def _mix_torch_manual_seed(base_seed: int, *components: int) -> int:
+    """Mix deterministic seed components into PyTorch's signed 63-bit range."""
+    acc = int(base_seed) & _TORCH_MANUAL_SEED_MASK
+    for index, component in enumerate(components, start=1):
+        acc = (acc * 6364136223846793005 + int(component) * 1442695040888963407 + index) & _TORCH_MANUAL_SEED_MASK
+    return acc
 
 
 @dataclass
@@ -213,9 +226,16 @@ class LoRAAdapterManager:
 
     @staticmethod
     def _strip_optimizer_config(session_spec: Dict[str, Any]) -> Dict[str, Any]:
-        """Return the structural part of a LoRA session spec without optimizer metadata."""
+        """Return the structural part of a LoRA session spec without optimizer metadata.
+
+        For weights-only restore we also strip zorl_config: the LoRA tensor
+        shapes are determined by lora_config (rank/alpha) only, so a
+        target session can change ZORL hyperparameters (num_perturbation_pairs,
+        b_sigma, etc.) without invalidating a saved set of weights.
+        """
         stripped = deepcopy(session_spec)
         stripped.pop("optimizer_config", None)
+        stripped.pop("zorl_config", None)
         return stripped
 
     @staticmethod
@@ -432,6 +452,79 @@ class LoRAAdapterManager:
             **build_kwargs,
         )
 
+    def _reset_adapter_optimizer(self, model_id: str) -> None:
+        """Rebuild an adapter optimizer from its normalized session spec."""
+        state = self.get_adapter_state(model_id)
+        state.optimizer = self._build_adapter_optimizer_for_session(state.lora_params, state.session_spec)
+
+    def reinitialize_adapter_for_zorl_family(
+        self,
+        model_id: str,
+        *,
+        a_seed: int,
+        a_init: str = "gaussian_jl",
+    ) -> None:
+        """Refresh a ZORL parent adapter with a fresh LoRA-A family and zero LoRA-B."""
+        if a_init != "gaussian_jl":
+            raise ValueError(f"Unsupported ZORL LoRA-A init: {a_init!r}")
+
+        state = self.get_adapter_state(model_id)
+
+        # MoE params are 3D ``[num_local_experts, ...]``. With EP > 1, every
+        # rank sees the *same* shape but different *global* experts. If we
+        # used one rank-identical seed for the whole tensor, expert i on
+        # rank 0 and expert i on rank N would draw identical LoRA-A values,
+        # collapsing the search dimension. Mix the global expert index into
+        # the seed for each MoE expert instead.
+        try:
+            from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+
+            ep_rank = get_parallel_state().ep_rank if get_parallel_state().ep_size > 1 else 0
+        except Exception:
+            ep_rank = 0
+
+        with torch.no_grad():
+            for name in sorted(state.lora_params):
+                param = state.lora_params[name]
+                if "lora_A" in name:
+                    if param.ndim == 3:
+                        # MoE LoRA-A: [num_local_experts, in, r]. Seed per
+                        # global expert so EP siblings sample independently.
+                        num_local_experts = int(param.shape[0])
+                        input_dim = int(param.shape[1])
+                        inv_scale = 1.0 / math.sqrt(max(input_dim, 1))
+                        values = torch.empty(tuple(param.shape), dtype=torch.float32)
+                        for local_idx in range(num_local_experts):
+                            global_expert_idx = ep_rank * num_local_experts + local_idx
+                            expert_gen = torch.Generator(device="cpu")
+                            expert_gen.manual_seed(_mix_torch_manual_seed(a_seed, global_expert_idx))
+                            torch.randn(
+                                tuple(param.shape[1:]),
+                                generator=expert_gen,
+                                dtype=torch.float32,
+                                out=values[local_idx],
+                            )
+                    else:
+                        # Non-MoE LoRA-A: rank-identical seed is correct; the
+                        # tensor lives on every rank as a replica.
+                        input_dim = int(param.shape[1]) if param.ndim > 1 else int(param.numel())
+                        inv_scale = 1.0 / math.sqrt(max(input_dim, 1))
+                        generator = torch.Generator(device="cpu")
+                        generator.manual_seed(_mix_torch_manual_seed(a_seed))
+                        values = torch.randn(tuple(param.shape), generator=generator, dtype=torch.float32)
+                    values.mul_(inv_scale)
+                    param.data.copy_(values.to(device=param.device, dtype=param.dtype))
+                elif "lora_B" in name:
+                    param.zero_()
+                param.grad = None
+
+        self._reset_adapter_optimizer(model_id)
+        state.last_access_time = time.time()
+        logger.info(
+            f"Reinitialized ZORL family for model_id={model_id} "
+            f"(a_init={a_init}, a_seed={a_seed}, optimizer={state.session_spec['optimizer_config']['type']})"
+        )
+
     @staticmethod
     def _has_pending_gradients(state: AdapterState) -> bool:
         """Return whether an adapter has captured gradients awaiting an optimizer step."""
@@ -500,6 +593,7 @@ class LoRAAdapterManager:
             initialize_fresh: If True, initialize with fresh random weights.
                             If False, use the current model's LoRA weights.
         """
+        model_id = validate_identifier(model_id, name="model_id")
         effective_lr = float(lr) if lr is not None else None
         if session_spec is None:
             if effective_lr is None:
@@ -682,6 +776,7 @@ class LoRAAdapterManager:
         Args:
             model_id: The adapter to capture gradients for
         """
+        model_id = validate_identifier(model_id, name="model_id")
         if model_id not in self.adapters:
             raise KeyError(f"Adapter for model_id={model_id} not registered")
 
@@ -908,6 +1003,7 @@ class LoRAAdapterManager:
         Returns:
             Dict with path, model_id, step, and save_time
         """
+        model_id = validate_identifier(model_id, name="model_id")
         if model_id not in self.adapters:
             raise KeyError(f"Adapter for model_id={model_id} not registered")
 
@@ -915,7 +1011,9 @@ class LoRAAdapterManager:
 
         # Use default path if not provided
         if path is None:
-            path = os.path.join(self.checkpoint_dir, model_id)
+            path = str(resolve_path_within(self.checkpoint_dir, model_id))
+        else:
+            path = str(resolve_path_within(self.checkpoint_dir, path, reject_symlinks=True))
 
         # Create directory
         os.makedirs(path, exist_ok=True)
@@ -1025,8 +1123,20 @@ class LoRAAdapterManager:
         Returns:
             Dict with path, model_id, step, and load_time
         """
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Checkpoint path does not exist: {path}")
+        model_id = validate_identifier(model_id, name="model_id")
+        local_artifact_root = Path(self.checkpoint_dir).expanduser().resolve().parent
+        try:
+            checkpoint_path = resolve_path_within(
+                local_artifact_root,
+                path,
+                must_exist=True,
+                reject_symlinks=True,
+            )
+        except ValueError:
+            checkpoint_path = resolve_server_artifact(path, must_exist=True)
+        path = str(checkpoint_path)
+        if not checkpoint_path.is_dir():
+            raise ValueError(f"Adapter checkpoint path must be a directory: {path}")
 
         start_time = time.time()
 

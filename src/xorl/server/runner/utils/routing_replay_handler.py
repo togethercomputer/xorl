@@ -23,6 +23,8 @@ The handler manages:
 
 import base64
 import logging
+import os
+import time
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
@@ -45,6 +47,19 @@ except ImportError:
     _HAS_MOE_BLOCK = False
 
 logger = logging.getLogger(__name__)
+
+
+def _truthy_env(name: str) -> bool:
+    return os.getenv(name, "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _r3_verbose_logging_enabled() -> bool:
+    return _truthy_env("XORL_R3_VERBOSE_LOGGING")
+
+
+def _r3_log_info(message: str, *args: Any) -> None:
+    log_fn = logger.info if _r3_verbose_logging_enabled() else logger.debug
+    log_fn(message, *args)
 
 
 class RoutingReplayHandler:
@@ -123,24 +138,36 @@ class RoutingReplayHandler:
 
     def _decode_routing_array(
         self,
-        item: Union[str, List, dict],
+        item: Union[str, List, dict, np.ndarray, torch.Tensor],
         num_moe_layers: int,
         dtype: "np.dtype",
         log_prefix: str,
-    ) -> Optional[List]:
+    ) -> Optional[Union[List, np.ndarray]]:
         """Decode a base64-encoded or nested-list routing array.
 
         Args:
-            item: Base64 string, dict with 'data'/'shape' keys, or nested list.
+            item: Base64 string, dict with 'data'/'shape' keys, nested list, or decoded array/tensor.
             num_moe_layers: Used for shape inference when shape is absent.
             dtype: numpy dtype for decoding (e.g. np.int32 or np.float32).
             log_prefix: Prefix for warning messages.
 
         Returns:
-            Nested list [num_tokens, num_layers, topk], or None if invalid.
+            Nested list or NumPy array [num_tokens, num_layers, topk], or None
+            if invalid.
         """
         if item is None:
             return None
+
+        if isinstance(item, torch.Tensor):
+            item = item.detach().cpu().numpy()
+
+        if isinstance(item, np.ndarray):
+            if item.ndim != 3:
+                logger.warning(f"{log_prefix}: Decoded routing array must be rank 3, got shape {item.shape}")
+                return None
+            if item.dtype != dtype:
+                item = item.astype(dtype, copy=False)
+            return item
 
         if isinstance(item, list):
             return item
@@ -168,7 +195,7 @@ class RoutingReplayHandler:
                 arr = self._infer_shape(arr, num_moe_layers)
                 if arr is None:
                     return None
-            return arr.tolist()
+            return arr
 
         # Base64 string directly (legacy format)
         if isinstance(item, str):
@@ -178,7 +205,7 @@ class RoutingReplayHandler:
                 arr = self._infer_shape(arr, num_moe_layers)
                 if arr is None:
                     return None
-                return arr.tolist()
+                return arr
             except Exception as e:
                 logger.warning(f"{log_prefix}: Failed to decode base64 string: {e}")
                 return None
@@ -188,19 +215,24 @@ class RoutingReplayHandler:
 
     def decode_routed_experts_item(
         self,
-        item: Union[str, List, dict],
+        item: Union[str, List, dict, np.ndarray, torch.Tensor],
         num_moe_layers: int,
-    ) -> Optional[List[List[List[int]]]]:
+    ) -> Optional[Union[List[List[List[int]]], np.ndarray]]:
         """Decode a single routed_experts item (int32 expert indices)."""
         return self._decode_routing_array(item, num_moe_layers, np.int32, "R3")
 
     def decode_routed_expert_logits_item(
         self,
-        item: Union[str, List, dict],
+        item: Union[str, List, dict, np.ndarray, torch.Tensor],
         num_moe_layers: int,
-    ) -> Optional[List[List[List[float]]]]:
+    ) -> Optional[Union[List[List[List[float]]], np.ndarray]]:
         """Decode a single routed_expert_logits item (float32 routing weights)."""
         return self._decode_routing_array(item, num_moe_layers, np.float32, "R3 weights")
+
+    @staticmethod
+    def _append_cpu_replay_tensor(replay: RoutingReplay, list_name: str, tensor: torch.Tensor) -> None:
+        """Append a CPU replay buffer without the extra pinned-memory staging copy."""
+        getattr(replay, list_name).append(tensor.detach().cpu().contiguous())
 
     def _infer_shape(self, arr: np.ndarray, num_moe_layers: int) -> Optional[np.ndarray]:
         """Infer [num_tokens, num_layers, topk] shape from flat array.
@@ -260,6 +292,8 @@ class RoutingReplayHandler:
             logger.warning("R3: routed_experts provided but no MoE layers found in model")
             return False
 
+        decode_start = time.perf_counter()
+
         # Decode each item (may be base64-encoded or nested list)
         decoded_routing = []
         for item in routed_experts:
@@ -276,17 +310,25 @@ class RoutingReplayHandler:
         # Prefer the model config top-k when available, then fall back to the
         # first decoded datum. Mixed 6/8 routing rows (Qwen3.6) can otherwise
         # let row 0 pick the wrong width and crash tensorization downstream.
-        num_layers_in_data = len(decoded_routing[0][0])
-        topk = self._model_topk or len(decoded_routing[0][0][0])
+        num_layers_in_data = (
+            decoded_routing[0].shape[1] if isinstance(decoded_routing[0], np.ndarray) else len(decoded_routing[0][0])
+        )
+        topk = self._model_topk or (
+            decoded_routing[0].shape[2] if isinstance(decoded_routing[0], np.ndarray) else len(decoded_routing[0][0][0])
+        )
         total_tokens_raw = sum(len(d) for d in decoded_routing)
 
-        logger.debug(
-            f"R3: Processing routing data - raw_tokens={total_tokens_raw}, "
-            f"num_datums={len(decoded_routing)}, "
-            f"layers={num_layers_in_data}, topk={topk}, moe_layers={num_moe_layers}"
+        _r3_log_info(
+            "R3: Processing routing data - raw_tokens=%s, num_datums=%s, layers=%s, topk=%s, moe_layers=%s",
+            total_tokens_raw,
+            len(decoded_routing),
+            num_layers_in_data,
+            topk,
+            num_moe_layers,
         )
 
         # Build per-micro-batch routing tensors, handling packing + SP slicing
+        build_start = time.perf_counter()
         per_mb_routing = self._build_per_mb_routing(micro_batches, decoded_routing, num_layers_in_data, topk)
 
         if not per_mb_routing:
@@ -295,16 +337,22 @@ class RoutingReplayHandler:
 
         # Pre-populate RoutingReplay instances: for each micro-batch, for each
         # MoE block, call record() with the routing tensor for that (mb, layer).
+        populate_start = time.perf_counter()
         for mb_idx, mb_routing_tensor in enumerate(per_mb_routing):
             # mb_routing_tensor: [num_tokens_mb, num_layers, topk]
             num_layers_to_use = min(num_moe_layers, mb_routing_tensor.shape[1])
             for moe_idx in range(num_layers_to_use):
                 # [num_tokens_mb, topk]
                 layer_routing = mb_routing_tensor[:, moe_idx, :]
-                moe_blocks[moe_idx]._routing_replay.record(layer_routing)
+                self._append_cpu_replay_tensor(
+                    moe_blocks[moe_idx]._routing_replay,
+                    "top_indices_list",
+                    layer_routing,
+                )
 
         # Pre-populate routing weights if provided (R3 weight replay)
         if routed_expert_logits is not None:
+            weights_decode_start = time.perf_counter()
             decoded_weights = []
             for item in routed_expert_logits:
                 decoded = self.decode_routed_expert_logits_item(item, num_moe_layers)
@@ -312,17 +360,39 @@ class RoutingReplayHandler:
                     decoded_weights.append(decoded)
 
             if decoded_weights:
-                per_mb_weights = self._build_per_mb_routing(micro_batches, decoded_weights, num_layers_in_data, topk)
+                weights_build_start = time.perf_counter()
+                per_mb_weights = self._build_per_mb_routing(
+                    micro_batches,
+                    decoded_weights,
+                    num_layers_in_data,
+                    topk,
+                    tensor_dtype=torch.float32,
+                )
                 for mb_idx, mb_weights_tensor in enumerate(per_mb_weights):
                     num_layers_to_use_w = min(num_moe_layers, mb_weights_tensor.shape[1])
                     for moe_idx in range(num_layers_to_use_w):
                         layer_weights = mb_weights_tensor[:, moe_idx, :].float()
-                        moe_blocks[moe_idx]._routing_replay.record_weights(layer_weights)
-                logger.debug(f"R3: Pre-populated routing weights for {len(per_mb_weights)} micro-batches")
+                        self._append_cpu_replay_tensor(
+                            moe_blocks[moe_idx]._routing_replay,
+                            "top_weights_list",
+                            layer_weights,
+                        )
+                _r3_log_info(
+                    "R3: Pre-populated routing weights for %s micro-batches (decode=%.3fs build=%.3fs)",
+                    len(per_mb_weights),
+                    weights_build_start - weights_decode_start,
+                    time.perf_counter() - weights_build_start,
+                )
 
-        logger.debug(
-            f"R3: Pre-populated {len(per_mb_routing)} micro-batches x "
-            f"{num_layers_to_use} MoE layers into RoutingReplay instances"
+        _r3_log_info(
+            "R3: Pre-populated %s micro-batches x %s MoE layers into RoutingReplay instances "
+            "(decode=%.3fs build=%.3fs populate=%.3fs total=%.3fs)",
+            len(per_mb_routing),
+            num_layers_to_use,
+            build_start - decode_start,
+            populate_start - build_start,
+            time.perf_counter() - populate_start,
+            time.perf_counter() - decode_start,
         )
         return True
 
@@ -332,6 +402,7 @@ class RoutingReplayHandler:
         decoded_routing: List[List],
         num_layers_in_data: int,
         topk: int,
+        tensor_dtype: torch.dtype = torch.long,
     ) -> List[torch.Tensor]:
         """
         Build per-micro-batch routing tensors with packing-aware SP slicing.
@@ -341,7 +412,7 @@ class RoutingReplayHandler:
         token counts.
 
         Returns:
-            List of tensors, each [num_tokens_mb, num_layers, topk] as torch.long.
+            List of tensors, each [num_tokens_mb, num_layers, topk].
         """
         parallel_state = get_parallel_state()
         cp_enabled = parallel_state.cp_enabled
@@ -349,14 +420,51 @@ class RoutingReplayHandler:
             cp_size = parallel_state.cp_size
             cp_rank = parallel_state.cp_rank
 
+        def _numpy_dtype() -> np.dtype:
+            if tensor_dtype.is_floating_point:
+                return np.dtype(np.float32)
+            return np.dtype(np.int64)
+
         def _pad_entry():
+            if tensor_dtype.is_floating_point:
+                return [[1.0 / max(topk, 1)] * topk for _ in range(num_layers_in_data)]
             return [list(range(topk)) for _ in range(num_layers_in_data)]
+
+        def _pad_array(pad_count: int) -> np.ndarray:
+            if tensor_dtype.is_floating_point:
+                return np.full(
+                    (pad_count, num_layers_in_data, topk),
+                    1.0 / max(topk, 1),
+                    dtype=_numpy_dtype(),
+                )
+            topk_row = np.arange(topk, dtype=_numpy_dtype())
+            return np.broadcast_to(topk_row, (pad_count, num_layers_in_data, topk)).copy()
+
+        def _routing_len(routing: Any) -> int:
+            if isinstance(routing, np.ndarray):
+                return int(routing.shape[0])
+            return len(routing)
+
+        def _concat_routing(parts: List[Any]) -> Any:
+            if not parts:
+                return np.empty((0, num_layers_in_data, topk), dtype=_numpy_dtype())
+            if all(isinstance(part, np.ndarray) for part in parts):
+                return np.concatenate(parts, axis=0)
+            routing = []
+            for part in parts:
+                if isinstance(part, np.ndarray):
+                    routing.extend(part.tolist())
+                else:
+                    routing.extend(part)
+            return routing
 
         def _num_tokens(value: Any) -> Optional[int]:
             if value is None:
                 return None
             if isinstance(value, torch.Tensor):
                 return int(value.numel())
+            if isinstance(value, np.ndarray):
+                return int(value.size)
             if isinstance(value, list):
                 if value and isinstance(value[0], list):
                     return sum(len(row) if isinstance(row, list) else 1 for row in value)
@@ -366,12 +474,16 @@ class RoutingReplayHandler:
         def _first_dim(value: Any) -> Optional[int]:
             if isinstance(value, torch.Tensor) and value.ndim >= 2:
                 return int(value.shape[0])
+            if isinstance(value, np.ndarray) and value.ndim >= 2:
+                return int(value.shape[0])
             if isinstance(value, list) and value and isinstance(value[0], list):
                 return len(value)
             return None
 
         def _last_dim(value: Any) -> Optional[int]:
             if isinstance(value, torch.Tensor) and value.ndim >= 1:
+                return int(value.shape[-1])
+            if isinstance(value, np.ndarray) and value.ndim >= 1:
                 return int(value.shape[-1])
             if isinstance(value, list):
                 if value and isinstance(value[0], list):
@@ -383,6 +495,8 @@ class RoutingReplayHandler:
             if value is None:
                 return None
             if isinstance(value, torch.Tensor):
+                return [int(v) for v in value.reshape(-1).tolist()]
+            if isinstance(value, np.ndarray):
                 return [int(v) for v in value.reshape(-1).tolist()]
             if isinstance(value, list):
                 if value and isinstance(value[0], list):
@@ -403,7 +517,7 @@ class RoutingReplayHandler:
             position_ids: List[int],
             ringattn_size: int,
             mb_idx: int,
-        ) -> List[Any]:
+        ) -> Any:
             if ringattn_size <= 1:
                 return routing
 
@@ -411,6 +525,7 @@ class RoutingReplayHandler:
             boundaries.append(len(position_ids))
             num_subchunks = 2 * ringattn_size
             rank_parts = [[] for _ in range(ringattn_size)]
+            np_rank_parts = [[] for _ in range(ringattn_size)]
 
             for boundary_idx in range(len(boundaries) - 1):
                 start_idx = boundaries[boundary_idx]
@@ -431,23 +546,35 @@ class RoutingReplayHandler:
                     for subchunk_idx in range(num_subchunks)
                 ]
                 for ring_rank in range(ringattn_size):
-                    rank_parts[ring_rank].extend(chunks[ring_rank])
-                    rank_parts[ring_rank].extend(chunks[num_subchunks - 1 - ring_rank])
+                    if isinstance(routing, np.ndarray):
+                        np_rank_parts[ring_rank].append(chunks[ring_rank])
+                        np_rank_parts[ring_rank].append(chunks[num_subchunks - 1 - ring_rank])
+                    else:
+                        rank_parts[ring_rank].extend(chunks[ring_rank])
+                        rank_parts[ring_rank].extend(chunks[num_subchunks - 1 - ring_rank])
 
+            if isinstance(routing, np.ndarray):
+                ordered_parts = [part for rank_part in np_rank_parts for part in rank_part]
+                if not ordered_parts:
+                    return routing[:0]
+                return np.concatenate(ordered_parts, axis=0)
             return [token_routing for rank_part in rank_parts for token_routing in rank_part]
 
-        def _resize_routing(routing: List[Any], target_tokens: Optional[int], mb_idx: int, reason: str) -> List[Any]:
+        def _resize_routing(routing: Any, target_tokens: Optional[int], mb_idx: int, reason: str) -> Any:
             if target_tokens is None:
                 return routing
-            if len(routing) < target_tokens:
-                pad_count = target_tokens - len(routing)
+            routing_len = _routing_len(routing)
+            if routing_len < target_tokens:
+                pad_count = target_tokens - routing_len
                 logger.debug("R3: Padded MB%s routing by %s tokens to match %s", mb_idx, pad_count, reason)
+                if isinstance(routing, np.ndarray):
+                    return np.concatenate([routing, _pad_array(pad_count)], axis=0)
                 return routing + [_pad_entry()] * pad_count
-            if len(routing) > target_tokens:
+            if routing_len > target_tokens:
                 logger.debug(
                     "R3: Truncated MB%s routing by %s tokens to match %s",
                     mb_idx,
-                    len(routing) - target_tokens,
+                    routing_len - target_tokens,
                     reason,
                 )
                 return routing[:target_tokens]
@@ -480,8 +607,8 @@ class RoutingReplayHandler:
                     datum_routing.append(decoded_routing[datum_cursor])
                     datum_cursor += 1
 
-            mb_routing = [token_routing for datum in datum_routing for token_routing in datum]
-            mb_total_tokens = len(mb_routing)
+            mb_routing = _concat_routing(datum_routing)
+            mb_total_tokens = _routing_len(mb_routing)
             micro_batch = micro_batches[mb_idx] if mb_idx < len(micro_batches) else {}
             expected_mb_tokens = _num_tokens(micro_batch.get("input_ids"))
 
@@ -507,14 +634,19 @@ class RoutingReplayHandler:
                 )
 
                 if rowwise_unpacked:
+                    sharded_parts = []
                     sharded_routing = []
                     cp_chunk_size = local_seq_len
                     start = cp_rank * cp_chunk_size
                     end = start + cp_chunk_size
                     for row_routing in datum_routing:
-                        row_routing = _resize_routing(list(row_routing), full_seq_len, mb_idx, "full row length")
-                        sharded_routing.extend(row_routing[start:end])
-                    mb_routing = sharded_routing
+                        row_routing = _resize_routing(row_routing, full_seq_len, mb_idx, "full row length")
+                        row_slice = row_routing[start:end]
+                        if isinstance(row_slice, np.ndarray):
+                            sharded_parts.append(row_slice)
+                        else:
+                            sharded_routing.extend(row_slice)
+                    mb_routing = _concat_routing(sharded_parts) if sharded_parts else sharded_routing
                     logger.debug(
                         "R3: SP MB%s rowwise - raw_tokens=%s, rows=%s, full_seq=%s, local_seq=%s, cp_rank=%s",
                         mb_idx,
@@ -539,14 +671,14 @@ class RoutingReplayHandler:
                                 mb_idx,
                             )
                         else:
-                            zigzag_position_ids = _resize_position_ids(zigzag_position_ids, len(mb_routing))
+                            zigzag_position_ids = _resize_position_ids(zigzag_position_ids, _routing_len(mb_routing))
                             mb_routing = _zigzag_reorder_routing(
                                 mb_routing,
                                 zigzag_position_ids,
                                 ringattn_size,
                                 mb_idx,
                             )
-                    cp_chunk_size = expected_mb_tokens or ((len(mb_routing) + cp_size - 1) // cp_size)
+                    cp_chunk_size = expected_mb_tokens or ((_routing_len(mb_routing) + cp_size - 1) // cp_size)
                     start = cp_rank * cp_chunk_size
                     end = start + cp_chunk_size
                     mb_routing = mb_routing[start:end]
@@ -562,9 +694,12 @@ class RoutingReplayHandler:
             if expected_mb_tokens is not None:
                 mb_routing = _resize_routing(mb_routing, expected_mb_tokens, mb_idx, "micro-batch size")
 
-            if mb_routing:
+            if _routing_len(mb_routing) > 0:
                 # Convert to tensor: [num_tokens_mb, num_layers, topk]
-                per_mb_routing.append(torch.tensor(mb_routing, dtype=torch.long))
+                if isinstance(mb_routing, np.ndarray):
+                    per_mb_routing.append(torch.as_tensor(mb_routing, dtype=tensor_dtype))
+                else:
+                    per_mb_routing.append(torch.tensor(mb_routing, dtype=tensor_dtype))
 
         return per_mb_routing
 
@@ -591,6 +726,12 @@ class RoutingReplayHandler:
         if routed_experts is None:
             return False
 
+        _r3_log_info(
+            "R3: setup start micro_batches=%s routed=%s routed_weights=%s",
+            len(micro_batches),
+            len(routed_experts),
+            len(routed_expert_logits or []),
+        )
         r3_enabled = self.fill_routing_replay(micro_batches, routed_experts, routed_expert_logits)
         if r3_enabled:
             set_r3_mode(True)
