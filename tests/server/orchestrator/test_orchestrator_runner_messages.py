@@ -13,9 +13,6 @@ import time
 
 import pytest
 
-
-pytestmark = [pytest.mark.cpu, pytest.mark.server]
-
 from xorl.server.protocol.operations import (
     EmptyData,
     LoadStateData,
@@ -34,6 +31,9 @@ from xorl.server.protocol.orchestrator_runner import (
     deserialize_message,
     serialize_message,
 )
+
+
+pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
 
 def test_dispatch_command_all_operations():
@@ -98,9 +98,21 @@ def test_serialization_roundtrip_all_types():
     for original_msg in messages:
         serialized = serialize_message(original_msg)
         deserialized = deserialize_message(serialized)
-        assert type(deserialized) == type(original_msg)
+        assert type(deserialized) is type(original_msg)
         assert deserialized.message_type == original_msg.message_type
         assert deserialized.message_id == original_msg.message_id
+
+
+def test_deserializer_rejects_pickle_frames_and_roundtrips_tensors():
+    with pytest.raises((ValueError, TypeError)):
+        deserialize_message(b"\x80\x04N.")
+
+    original = RunnerResponse(
+        request_id="tensor-response",
+        result={"values": pytest.importorskip("torch").tensor([[1, 2], [3, 4]])},
+    )
+    restored = deserialize_message(serialize_message(original))
+    assert restored.result["values"].equal(original.result["values"])
 
 
 def test_json_conversion():

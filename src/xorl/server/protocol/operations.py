@@ -7,7 +7,7 @@ and RunnerDispatchCommand.data.
 
 These types are shared by both protocol layers:
 - API→Engine (msgpack): serialized via payload_to_dict(), deserialized via payload_from_dict()
-- Executor→Worker (pickle): serialized directly as typed objects
+- Executor→Worker (MessagePack): serialized through the typed payload registry
 - Worker broadcast (Gloo): pickle internally, typed objects work identically to dicts
 """
 
@@ -54,6 +54,7 @@ class OptimStepData:
     beta2: Optional[float] = None
     eps: Optional[float] = None
     model_id: Optional[str] = None
+    sparse_delta_capture: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -97,6 +98,7 @@ class SaveFullWeightsData:
 class SyncWeightsData:
     """Payload for sync_inference_weights operations."""
 
+    model_id: Optional[str] = None
     endpoints: List[Dict[str, Any]] = field(default_factory=list)
     master_address: str = "localhost"
     master_port: int = 0
@@ -104,9 +106,15 @@ class SyncWeightsData:
     buffer_size_mb: int = 1024
     sync_method: str = "nccl_broadcast"
     flush_cache: bool = False
+    cache_invalidation_mode: str = "auto"
+    fp8_kv_cache_enabled: bool = False
+    fp8_kv_cache_postprocess_required: bool = False
+    fp8_kv_cache_static_scales: bool = False
     pause_mode: str = "in_place"
     weight_version: Optional[str] = None
     quantization: Optional[Dict[str, Any]] = None
+    sparse_delta_paths: Optional[List[str]] = None
+    sparse_delta_config: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -147,6 +155,34 @@ class KillSessionData:
 
 
 @dataclass
+class ZORLStartGenerationData:
+    """Payload for start_zorl_generation operations."""
+
+    model_id: str = "default"
+    num_pairs: Optional[int] = None
+    materialization: Optional[Dict[str, Any]] = None
+    owner_url: Optional[str] = None
+
+
+@dataclass
+class ZORLApplyRewardsData:
+    """Payload for apply_zorl_rewards operations."""
+
+    model_id: str = "default"
+    generation_id: str = ""
+    candidate_rewards: List[Dict[str, Any]] = field(default_factory=list)
+    learning_rate: Optional[float] = None
+
+
+@dataclass
+class ZORLAbortGenerationData:
+    """Payload for abort_zorl_generation operations."""
+
+    model_id: str = "default"
+    generation_id: str = ""
+
+
+@dataclass
 class AbortData:
     """Payload for abort operations."""
 
@@ -176,6 +212,9 @@ OperationPayload = Union[
     RegisterSessionData,
     AdapterStateData,
     KillSessionData,
+    ZORLStartGenerationData,
+    ZORLApplyRewardsData,
+    ZORLAbortGenerationData,
     AbortData,
     EmptyData,
 ]
@@ -196,6 +235,9 @@ _PAYLOAD_TYPE_MAP: Dict[str, type] = {
     "save_adapter_state": AdapterStateData,
     "load_adapter_state": AdapterStateData,
     "kill_session": KillSessionData,
+    "start_zorl_generation": ZORLStartGenerationData,
+    "apply_zorl_rewards": ZORLApplyRewardsData,
+    "abort_zorl_generation": ZORLAbortGenerationData,
     "health_check": EmptyData,
     "sleep": EmptyData,
     "wake_up": EmptyData,

@@ -71,6 +71,14 @@ result = resp.json()
 `set_sync_quantization`. If omitted, the server uses the default (or
 auto-detects from the endpoint's quantization config).
 
+Only BF16/no quantization and sender-side block-FP8 sync are supported online.
+Use `null` for BF16/no quantization. FP8 sync currently supports only
+Slime/SGLang-compatible E4M3 weights with FP32 `weight_scale_inv` block scales.
+Unsupported methods such as `int4`,
+`compressed-tensors`, `awq`, or QAT/fake-quant configs are rejected before
+transport starts; those workflows need a separate sender format, receiver
+pre/post-processing contract, and logprob validation gate.
+
 ### Typical usage pattern
 
 ```python
@@ -91,6 +99,21 @@ for step in range(num_steps):
 requests.post("http://localhost:6000/api/v1/sync_inference_weights",
               json={"master_address": "localhost"})
 ```
+
+For a runnable same-prompt SGLang logprob gate around FP8 sync, use:
+
+```bash
+python scripts/fp8_sync_logprob_gate.py \
+  --xorl-url http://localhost:6000 \
+  --sglang-url http://localhost:30000 \
+  --master-address localhost \
+  --fmt e4m3 \
+  --weight-block-size 128 128
+```
+
+When the receiver is booted from a prequantized HF FP8 checkpoint and the trainer is booted from the BF16 checkpoint,
+launch a separate BF16 SGLang reference and add `--reference-sglang-url`; this makes the gate compare post-sync receiver
+logprobs against the same training-state weights rather than against the receiver's initial FP8 artifact.
 
 ---
 
@@ -229,56 +252,33 @@ Trainer-side options, in precedence order:
   covers `world_size`, entries are global-rank indexed; otherwise entries are
   local-rank indexed.
 - `P2P_TRAINER_GPU_TO_IB_DEVICE_MAP`: physical GPU to HCA map, for example
-  `0=mlx5_2,1=mlx5_3,2=mlx5_1,3=mlx5_5,4=mlx5_9,5=mlx5_9,6=mlx5_6,7=mlx5_5`.
-  If the launcher sets `CUDA_VISIBLE_DEVICES` to GPU UUIDs, also set
-  `P2P_TRAINER_VISIBLE_GPU_INDICES` to the selected physical GPU indices in
-  local-rank order.
+  `0=mlx5_0,1=mlx5_1`.
+  Kubernetes launches should leave device visibility to the NVIDIA device plugin.
+  Only set `P2P_TRAINER_VISIBLE_GPU_INDICES` explicitly when an HCA diagnostic
+  needs physical GPU indices; it is not a CUDA visibility mechanism.
 - `P2P_TRAINER_IB_DEVICE`: single HCA fallback. This is useful for debugging,
   but it pins every trainer rank to one rail.
 
 Receiver-side SGLang uses `--mooncake-ib-device` as a JSON map keyed by local
-rank on each receiver node, not global TP rank. On the current H100 validation
-nodes, we avoid `mlx5_4`, `mlx5_7`, and `mlx5_8` and spread TP ranks over the
-remaining working HCAs.
+rank on each receiver node, not global TP rank. Validate the usable HCA set on
+each deployment and spread local ranks across those devices.
 
-### Recommended P2P profile for scaled Qwen3-style MoE
+### P2P profile guidance
 
-For the 4 trainer pod → 16 SGLang TP2 encoded-reasoning shape, use the
-following profile as the starting point. It keeps dense/root chunking separate
-from MoE batching, uses the cached receiver prepare path on warm syncs, and
-avoids the measured-regressed debug/experimental knobs.
-
-```bash
-# Required for Kubernetes Mooncake reachability.
-export P2P_TRAINER_HOSTNAME="${POD_IP}"
-export XORL_WEIGHT_SYNC_MASTER_ADDRESS="${POD_IP}"
-
-# Keep dense/root tensors small enough for scratch pools while batching MoE.
-export XORL_WEIGHT_SYNC_DENSE_BUCKET_BYTES=134217728      # 128 MiB
-export XORL_WEIGHT_SYNC_MOE_BUCKET_BYTES=1073741824       # 1 GiB
-export XORL_WEIGHT_SYNC_BUCKET_BYTES=1073741824           # legacy MoE alias
-export XORL_WEIGHT_SYNC_BATCH_MOE=1
-
-# Source-reuse path keeps the required pool size near source bytes, not
-# receiver-fanout bytes. 2 GiB was the best measured pool size for the scaled
-# Qwen3-30B-A3B TP2 receiver layout.
-export XORL_P2P_CPU_SCRATCH_POOL_BYTES=2147483648         # 2 GiB
-export XORL_P2P_MOONCAKE_TRANSFER_CHUNK=8
-
-# This is now the default copy mode, but keep the explicit variable in older
-# generated manifests that still set XORL_P2P_SCATTER_COPY_MODE=list.
-export XORL_P2P_SCATTER_REUSE_LOCATORS=1
-```
+Tune dense and MoE bucket sizes separately, size the CPU scratch pool for the
+largest concurrent transfer, and validate timeouts against the deployment's
+fabric. Multi-endpoint sync normally fans out in one backend operation; use
+serial endpoint sync only as a diagnostic fallback. Keep locator reuse enabled
+on warm syncs to avoid rebuilding receiver tensor maps.
 
 Leave these unset for the default performance path:
 
 - `XORL_P2P_USE_ASYNC_API`: Mooncake async writes are still experimental; they
   have produced hangs or mixed results in repeated-update tests.
-- `XORL_P2P_CPU_POOL_MIN_BYTES=0`: forces tiny transfers through CPU scratch;
-  this was safe in smoke tests but slower than the default GPU-direct threshold.
+- `XORL_P2P_CPU_POOL_MIN_BYTES=0`: forces tiny transfers through CPU scratch
+  and should be treated as a diagnostic setting.
 - `XORL_P2P_PERSIST_SMALL_REGISTRATION=1`: persistent registration of small
-  CUDA sources was safe in smoke tests but regressed warm sync on the scaled
-  TP2 layout.
+  CUDA sources is experimental and should be benchmarked before use.
 - `XORL_P2P_LOG_BUCKET_DETAILS=1` and `XORL_P2P_TRANSFER_DEBUG=1`: useful for
   failure diagnosis, but intentionally off the hot path because they add
   logging and debug-object allocation.
@@ -299,10 +299,13 @@ P2P tuning options:
   request's `quantization` field.
 - With P2P and explicit FP8 sync quantization, the handler quantizes supported
   projection weights on the trainer side, transfers FP8 weights plus
-  `weight_scale_inv` tensors, and automatically asks the receiver to run
-  post-processing after loading. If the receiver is FP8 but the sync request has
-  no FP8 quantization config, tensor-size validation should fail instead of
-  silently copying bf16 into FP8 locators.
+  `weight_scale_inv` tensors, and skips receiver post-processing by default
+  because direct P2P writes already target receiver-native FP8 storage. Set
+  `XORL_WEIGHT_SYNC_RUN_POST_PROCESS_WEIGHTS=1` or
+  `XORL_P2P_RUN_POST_PROCESS_WEIGHTS=1` only for legacy receivers that still
+  require finalization after P2P writes. If the receiver is FP8 but the sync
+  request has no FP8 quantization config, tensor-size validation should fail
+  instead of silently copying bf16 into FP8 locators.
 - The SGLang receiver must expose a matching block-FP8 layout. XORL emits
   block-wise `weight_scale_inv` tensors; a receiver exposing only per-tensor
   `weight_scale` tensors for FusedMoE is not compatible with this sender path.
@@ -341,6 +344,10 @@ P2P tuning options:
   serialized prepare behavior.
 - `XORL_P2P_PREPARE_TIMEOUT_S`: per-endpoint prepare HTTP timeout. Default:
   120 seconds.
+- `XORL_SERIAL_INFERENCE_ENDPOINT_SYNC=1`: fallback/debug guard for
+  multi-endpoint P2P. It sends each receiver endpoint through its own serialized
+  sync group, avoiding cross-endpoint Mooncake session reuse at the cost of
+  giving up normal endpoint fanout parallelism.
 - `XORL_P2P_SCATTER_COPY_MODE`: controls how rank 0 builds per-sender tensor
   map payloads for direct-EP scatter. Default `none` reuses read-only locator
   lists/dicts while constructing scatter payloads. Set `list` to shallow-copy
@@ -374,6 +381,12 @@ P2P tuning options:
   benchmarked.
 - `XORL_P2P_CPU_SCRATCH_POOL_BYTES`: CPU pinned staging pool size. Keep this
   above the largest unique-source staged P2P bucket; the default is 4 GiB.
+- `XORL_P2P_CPU_POOL_MIN_BYTES`: CUDA tensors smaller than this threshold take
+  the small GPU-direct path with per-bucket registration; larger CUDA tensors
+  and CPU tensors use the pre-registered CPU scratch pool. Default: 64 KiB.
+- `XORL_P2P_PENDING_TRANSFER_TIMEOUT_S`: bounded wait used when draining
+  outstanding Mooncake worker futures during flush/destroy. Default: 300
+  seconds.
 - `XORL_P2P_LOG_BUCKET_DETAILS=1`: opt into per-bucket P2P coalescing, source
   reuse, and worker transfer summaries. Disabled by default to keep log I/O off
   the weight-sync hot path.
@@ -383,32 +396,6 @@ P2P tuning options:
 - `MC_IB_PCI_RELAXED_ORDERING=1`: enables relaxed PCIe ordering in Mooncake
   RDMA when the deployment fabric supports it. Leave unset or `0` if the NIC /
   platform combination is not validated.
-
-## Sparse Delta Probe
-
-`scripts/weight_sync_delta_probe.py` can measure whether an update is sparse
-enough for a future sparse-delta receiver protocol to be worthwhile. It uses the
-optional `delta-encoding` package when available, but it does not change the
-current production P2P path. Current SGLang P2P receivers register dense tensor
-buffers and expect full tensor writes; sparse deltas would also require a
-receiver-side decode/scatter finalization path.
-
-Example:
-
-```bash
-python scripts/weight_sync_delta_probe.py \
-  --delta-encoding-path /path/to/delta-encoding \
-  --shape 4096x4096 \
-  --dtype uint8 \
-  --density 0.001 \
-  --density 0.01 \
-  --density 0.1
-```
-
-For dense FP8 updates, the packed sparse format is larger than the dense payload
-because it stores values plus index deltas. It becomes attractive only when the
-changed-entry fraction is small enough, or if a future protocol transfers LoRA
-adapter tensors/factors instead of merged dense weights.
 
 ## Adding a New Backend
 

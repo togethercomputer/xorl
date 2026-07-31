@@ -208,12 +208,44 @@ class AsyncRouterChannel:
         self._socket = self._context.socket(zmq.ROUTER)
         self._socket.setsockopt(zmq.LINGER, 0)
         self._socket.setsockopt(zmq.SNDHWM, self._hwm)
+        # ROUTER_MANDATORY: raise EHOSTUNREACH on an unroutable send instead of
+        # silently dropping the frame. A DEALER peer's identity is briefly
+        # unrouted right after it (re)connects; without this + the retry in
+        # send(), a request dropped during that window left the caller awaiting a
+        # response that never arrived (root cause of the 1-node forward_backward
+        # dispatch deadlock: the orchestrator never received the fb command).
+        self._socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
         self._socket.bind(self._address)
         logger.info(f"AsyncRouterChannel bound to {self._address}")
 
-    async def send(self, identity: bytes, data: bytes) -> None:
-        """Send data to a specific peer identified by identity."""
-        await self._socket.send_multipart([identity, b"", data])
+    async def send(self, identity: bytes, data: bytes, *, route_timeout: float = 30.0) -> None:
+        """Send data to a peer, retrying while its identity is not yet routable.
+
+        With ROUTER_MANDATORY, ZMQ raises EHOSTUNREACH when ``identity`` is not
+        currently routable (e.g. the DEALER peer just (re)connected and the
+        ROUTER has not registered it yet). Retry with a short exponential backoff
+        until the peer is routable or ``route_timeout`` elapses, so a transient
+        unroutable window never silently drops a request.
+        """
+        deadline = asyncio.get_event_loop().time() + route_timeout
+        backoff = 0.005
+        warned = False
+        while True:
+            try:
+                await self._socket.send_multipart([identity, b"", data])
+                return
+            except zmq.error.ZMQError as e:
+                if e.errno == zmq.EHOSTUNREACH and asyncio.get_event_loop().time() < deadline:
+                    if not warned:
+                        logger.warning(
+                            f"AsyncRouterChannel: identity {identity!r} not routable yet; "
+                            f"retrying send for up to {route_timeout:.0f}s"
+                        )
+                        warned = True
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 0.1)
+                    continue
+                raise
 
     async def recv(self) -> Tuple[bytes, bytes]:
         """Receive message, returning (identity, data).
