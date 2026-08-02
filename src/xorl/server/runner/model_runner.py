@@ -923,7 +923,6 @@ class ModelRunner:
             )
 
         plan = zorl_state.active_generation
-        adapter_state = self._adapter_manager.get_adapter_state(model_id)
         reward_by_candidate = {str(item["candidate_id"]): item for item in candidate_rewards}
         score_normalizations = {
             str(item.get("_zorl_score_normalization") or item.get("zorl_score_normalization") or "standard")
@@ -1013,8 +1012,17 @@ class ModelRunner:
                 learning_rate=effective_lr,
             )
         else:
+            logical_lora = self._adapter_manager.materialize_logical_state_dict(model_id, destination_rank=self.rank)
+
+            class _LogicalParam:
+                __slots__ = ("data", "shape")
+
+                def __init__(self, tensor: torch.Tensor):
+                    self.data = tensor
+                    self.shape = tensor.shape
+
             update, update_norm = build_zorl_update_from_rewards(
-                adapter_state.local_params,
+                {name: _LogicalParam(tensor) for name, tensor in logical_lora.items()},
                 pair_seeds_and_scores=[
                     (b_seed, normalized_score)
                     for (b_seed, _a_seed, _raw_score), normalized_score in zip(
@@ -1023,12 +1031,11 @@ class ModelRunner:
                 ],
             )
 
-            for param in adapter_state.local_params.values():
-                param.grad = None
-            for name, param in adapter_state.local_params.items():
-                if "lora_B" not in name:
-                    continue
-                param.grad = (-update[name]).to(device=param.device, dtype=param.dtype)
+            self._adapter_manager.load_logical_gradients(
+                model_id,
+                {name: -tensor for name, tensor in update.items()},
+                accumulate=False,
+            )
 
             grad_norm = float(
                 self._adapter_manager.optim_step(model_id, effective_lr, None, accumulated_valid_tokens=0)
@@ -1200,7 +1207,16 @@ class ModelRunner:
         lora_config = session_spec["lora_config"]
         scaling = float(lora_config["lora_alpha"]) / float(lora_config["lora_rank"])
 
-        logical_lora = self._adapter_manager.materialize_logical_state_dict(model_id, destination_rank=self.rank)
+        materialize_logical_state = getattr(self._adapter_manager, "materialize_logical_state_dict", None)
+        if materialize_logical_state is None:
+            # Lightweight test and legacy adapter managers expose only their
+            # local state; preserve that interface for the cold fresh_ab path.
+            adapter_state = self._adapter_manager.get_adapter_state(model_id)
+            logical_lora = getattr(adapter_state, "local_params", None)
+            if logical_lora is None:
+                logical_lora = adapter_state.lora_params
+        else:
+            logical_lora = materialize_logical_state(model_id, destination_rank=self.rank)
 
         class _LogicalParam:
             __slots__ = ("data", "shape")

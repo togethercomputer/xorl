@@ -304,7 +304,7 @@ def test_auto_load_if_evicted_uses_rank0_broadcast_mode_on_non_rank0(tmp_path):
     trainer = _FakeTrainer(checkpoint_dir, adapter_state_load_mode="rank0_broadcast")
     trainer.register_session("policy-c", trainer._session_spec(1e-5), materialize=False)
     coordinator = AdapterCoordinator(trainer=trainer, rank=1, world_size=2, cpu_group=None)
-    coordinator._restore_ep_sharded_rank0_broadcast_adapter_state = Mock(
+    coordinator._restore_rank0_broadcast_adapter_state = Mock(
         return_value={"success": True, "model_id": "policy-c", "step": 0}
     )
     coordinator.broadcast_adapter_state = Mock()
@@ -316,7 +316,7 @@ def test_auto_load_if_evicted_uses_rank0_broadcast_mode_on_non_rank0(tmp_path):
     assert checkpoint_path == str(evicted_path)
     assert trainer.register_calls == [("policy-c", 1e-5)]
     assert trainer.load_calls == []
-    coordinator._restore_ep_sharded_rank0_broadcast_adapter_state.assert_called_once()
+    coordinator._restore_rank0_broadcast_adapter_state.assert_called_once()
     coordinator.broadcast_adapter_state.assert_not_called()
     coordinator.broadcast_adapter_optimizer_state.assert_not_called()
 
@@ -330,7 +330,7 @@ def test_handle_load_adapter_state_uses_rank0_broadcast_mode_on_non_rank0(tmp_pa
     trainer = _FakeTrainer(checkpoint_dir, adapter_state_load_mode="rank0_broadcast")
     trainer.register_session("policy-d", trainer._session_spec(2e-5), materialize=False)
     coordinator = AdapterCoordinator(trainer=trainer, rank=1, world_size=2, cpu_group=None)
-    coordinator._restore_ep_sharded_rank0_broadcast_adapter_state = Mock(
+    coordinator._restore_rank0_broadcast_adapter_state = Mock(
         return_value={"success": True, "model_id": "policy-d", "step": 0}
     )
     coordinator.broadcast_adapter_state = Mock()
@@ -348,7 +348,7 @@ def test_handle_load_adapter_state_uses_rank0_broadcast_mode_on_non_rank0(tmp_pa
     assert result == {"success": True, "model_id": "policy-d"}
     assert trainer.register_calls == [("policy-d", 2e-5)]
     assert trainer.load_calls == []
-    coordinator._restore_ep_sharded_rank0_broadcast_adapter_state.assert_called_once()
+    coordinator._restore_rank0_broadcast_adapter_state.assert_called_once()
     coordinator.broadcast_adapter_state.assert_not_called()
     coordinator.broadcast_adapter_optimizer_state.assert_not_called()
 
@@ -480,7 +480,7 @@ def test_rank0_broadcast_ep_sharded_restore_rejects_session_spec_mismatch(monkey
     coordinator = AdapterCoordinator(trainer=trainer, rank=0, world_size=2, cpu_group=None)
 
     with pytest.raises(ValueError, match="Checkpoint session spec does not match"):
-        coordinator._restore_ep_sharded_rank0_broadcast_adapter_state(
+        coordinator._restore_rank0_broadcast_adapter_state(
             model_id="policy-ep",
             path=str(adapter_path),
             load_optimizer=True,

@@ -12,6 +12,7 @@ letting us verify the local math without distributed infrastructure.
 """
 
 import math
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -467,3 +468,52 @@ class TestMixedMeshFlatPath:
         with patch("xorl.distributed.fsdp2.clip_grad_norm.get_parallel_state", return_value=ps):
             with pytest.raises(RuntimeError, match="different mesh"):
                 clip_grad_norm(model, max_norm=1.0, foreach=True)
+
+
+def test_real_two_rank_ep_clip_and_nonfinite_gate():
+    """Exercise the EP reduction and finite gate on a live two-rank group."""
+
+    from tests.distributed.distributed_utils import run_distributed_script
+
+    result = run_distributed_script(
+        __file__,
+        num_gpus=2,
+        timeout=120,
+        extra_env={"XORL_EP_CLIP_DISTRIBUTED_WORKER": "1"},
+    )
+    result.assert_success("two-rank EP clip reduction and non-finite gate")
+
+
+def _run_distributed_ep_clip_worker() -> None:
+    dist.init_process_group("gloo")
+    rank = dist.get_rank()
+    model = nn.Module()
+    expert = nn.Parameter(torch.zeros(1))
+    expert.grad = torch.tensor([3.0 if rank == 0 else 4.0])
+    model.register_parameter("expert", expert)
+    model._ep_param_groups = {"ep": [expert], "non_ep": []}
+    parallel_state = MagicMock()
+    parallel_state.ep_enabled = True
+    parallel_state.fsdp_group = None
+    parallel_state.ep_group = dist.group.WORLD
+    parallel_state.tp_enabled = False
+    parallel_state.tp_group = None
+
+    with patch("xorl.distributed.fsdp2.clip_grad_norm.get_parallel_state", return_value=parallel_state):
+        total_norm = ep_fsdp2_clip_grad_norm(model, max_norm=1.0)
+    assert total_norm.item() == pytest.approx(5.0, abs=1e-6)
+    assert expert.grad.item() == pytest.approx(0.6 if rank == 0 else 0.8, abs=1e-6)
+
+    expert.grad = torch.tensor([float("nan") if rank == 0 else 4.0])
+    with patch("xorl.distributed.fsdp2.clip_grad_norm.get_parallel_state", return_value=parallel_state):
+        with pytest.raises(RuntimeError, match="Non-finite gradient"):
+            ep_fsdp2_clip_grad_norm(model, max_norm=1.0, error_if_nonfinite=True)
+    if rank == 0:
+        assert torch.isnan(expert.grad).all()
+    else:
+        assert expert.grad.item() == pytest.approx(4.0)
+    dist.destroy_process_group()
+
+
+if os.environ.get("XORL_EP_CLIP_DISTRIBUTED_WORKER") == "1":
+    _run_distributed_ep_clip_worker()

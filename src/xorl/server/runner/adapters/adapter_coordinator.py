@@ -257,7 +257,7 @@ class AdapterCoordinator:
             adapter_manager.set_lr(model_id, metadata["lr"])
         state.last_access_time = time.time()
 
-    def _restore_ep_sharded_rank0_broadcast_adapter_state(
+    def _restore_rank0_broadcast_adapter_state(
         self,
         model_id: str,
         path: str,
@@ -418,7 +418,7 @@ class AdapterCoordinator:
 
         try:
             if mode == "rank0_broadcast" and self.world_size > 1:
-                result = self._restore_ep_sharded_rank0_broadcast_adapter_state(
+                result = self._restore_rank0_broadcast_adapter_state(
                     model_id=model_id,
                     path=path,
                     load_optimizer=load_optimizer,

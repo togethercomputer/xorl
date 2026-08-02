@@ -222,6 +222,7 @@ def save_adapter_optimizer_shards(adapter_state: "AdapterState", path: str) -> D
     layout_descriptors = [
         adapter_state.tensor_layouts[name].to_json_dict() for name in sorted(adapter_state.tensor_layouts)
     ]
+    session_rank = int(adapter_state.session_spec["lora_config"]["lora_rank"])
     if world > 1:
         fingerprints: List[Optional[str]] = [None] * world
         torch.distributed.all_gather_object(fingerprints, fingerprint)
@@ -229,19 +230,33 @@ def save_adapter_optimizer_shards(adapter_state: "AdapterState", path: str) -> D
         torch.distributed.all_gather_object(layout_fingerprints, adapter_state.layout_fingerprint)
         layout_descriptors_by_rank: List[Optional[List[Dict[str, Any]]]] = [None] * world
         torch.distributed.all_gather_object(layout_descriptors_by_rank, layout_descriptors)
+        local_optimizer_order = [
+            canonical_parameter_name(name)
+            for name in sorted(adapter_state.local_params)
+            if adapter_state.local_params[name].numel() > 0
+        ]
+        optimizer_orders_by_rank: List[Optional[List[str]]] = [None] * world
+        torch.distributed.all_gather_object(optimizer_orders_by_rank, local_optimizer_order)
     else:
         fingerprints = [fingerprint]
         layout_fingerprints = [adapter_state.layout_fingerprint]
         layout_descriptors_by_rank = [layout_descriptors]
+        optimizer_orders_by_rank = [
+            [
+                canonical_parameter_name(name)
+                for name in sorted(adapter_state.local_params)
+                if adapter_state.local_params[name].numel() > 0
+            ]
+        ]
     manifest = {
         "format_version": 3,
         "world_size": world,
         "per_rank_param_structure_sha256": fingerprints,
         "per_rank_layout_fingerprint": layout_fingerprints,
         "per_rank_layout_descriptors": layout_descriptors_by_rank,
-        "optimizer_parameter_order": [
-            name for name in sorted(adapter_state.local_params) if adapter_state.local_params[name].numel() > 0
-        ],
+        "session_rank": session_rank,
+        "optimizer_parameter_order": optimizer_orders_by_rank[0],
+        "per_rank_optimizer_parameter_order": optimizer_orders_by_rank,
     }
     if rank == 0:
         with open(os.path.join(path, OPTIMIZER_SHARD_MANIFEST_FILENAME), "w") as f:
@@ -295,9 +310,22 @@ def load_adapter_optimizer_shards(
                 "fingerprint. Refusing to load rank-local optimizer state; load weights-only "
                 "(load_optimizer=False) instead."
             )
-        expected_order = manifest.get("optimizer_parameter_order")
+        expected_session_rank = manifest.get("session_rank")
+        live_session_rank = int(adapter_state.session_spec["lora_config"]["lora_rank"])
+        if expected_session_rank != live_session_rank:
+            raise RuntimeError(
+                f"Adapter optimizer shard at {path} was saved for session_rank={expected_session_rank!r}, "
+                f"but the live adapter uses session_rank={live_session_rank}; load weights-only "
+                "(load_optimizer=False) instead."
+            )
+        per_rank_orders = manifest.get("per_rank_optimizer_parameter_order")
+        expected_order = (
+            per_rank_orders[rank] if per_rank_orders is not None else manifest.get("optimizer_parameter_order")
+        )
         live_order = [
-            name for name in sorted(adapter_state.local_params) if adapter_state.local_params[name].numel() > 0
+            canonical_parameter_name(name)
+            for name in sorted(adapter_state.local_params)
+            if adapter_state.local_params[name].numel() > 0
         ]
         if expected_order != live_order:
             raise RuntimeError(
@@ -575,6 +603,46 @@ class LoRAAdapterManager:
                     f"LoRA parameter placement changed after layout discovery for {name}: "
                     f"local shape {tuple(local.shape)} != {layout.local_substrate_shape}"
                 )
+
+    @staticmethod
+    def _replica_validation_enabled() -> bool:
+        return os.environ.get("XORL_VALIDATE_ADAPTER_REPLICAS") == "1"
+
+    def _validate_replica_coherence(self, state: AdapterState, *, gradients: bool) -> None:
+        """Optionally verify that identical logical rectangles remain coherent."""
+
+        if (
+            not self._replica_validation_enabled()
+            or not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+            or torch.distributed.get_world_size() <= 1
+        ):
+            return
+        local_payload = []
+        for name in sorted(state.local_params):
+            layout = state.tensor_layouts[name]
+            if layout.replica_count <= 1:
+                continue
+            value = state.local_params[name].grad if gradients else state.local_params[name].detach()
+            local_payload.append((layout.replica_key, None if value is None else value.detach().cpu().contiguous()))
+        gathered = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered, local_payload)
+        by_key: dict[tuple[Any, ...], list[Optional[torch.Tensor]]] = {}
+        for rank_payload in gathered:
+            for key, value in rank_payload:
+                by_key.setdefault(tuple(key), []).append(value)
+        local_keys = {layout.replica_key: layout.replica_count for layout in state.tensor_layouts.values()}
+        for key, expected_count in local_keys.items():
+            if expected_count <= 1:
+                continue
+            values = by_key.get(key, [])
+            if len(values) != expected_count:
+                raise RuntimeError(f"Replica descriptor count changed for {key[0]!r}: {len(values)}")
+            reference = values[0]
+            if any((value is None) != (reference is None) for value in values):
+                raise RuntimeError(f"Replica gradient/weight presence diverged for {key[0]!r}")
+            if reference is not None and any(not torch.equal(reference, value) for value in values[1:]):
+                raise RuntimeError(f"Replica values diverged for logical rectangle {key[0]!r}")
 
     @staticmethod
     def _is_lora_b(name: str) -> bool:
@@ -989,6 +1057,7 @@ class LoRAAdapterManager:
 
         state = self.adapters[model_id]
         self._validate_model_layout_identity(state)
+        self._validate_replica_coherence(state, gradients=False)
         # Update last access time for LRU tracking
         state.last_access_time = time.time()
         self._set_model_runtime_lora_config(
@@ -1119,6 +1188,8 @@ class LoRAAdapterManager:
                 f"Non-finite adapter gradient detected for model_id={model_id}; "
                 "all ranks skipped the optimizer step and cleared gradients."
             )
+
+        self._validate_replica_coherence(state, gradients=True)
 
         if gradient_clip is None or gradient_clip <= 0:
             clipping_enabled = False
@@ -1322,6 +1393,41 @@ class LoRAAdapterManager:
         with torch.no_grad():
             for name, local_slot in packed.items():
                 state.local_params[name].data.copy_(local_slot.to(self.device, state.local_params[name].dtype))
+
+    def load_logical_gradients(
+        self,
+        model_id: str,
+        gradient_state_dict: Dict[str, torch.Tensor],
+        *,
+        accumulate: bool = True,
+    ) -> None:
+        """Pack logical gradients into local adapter slots without model scratch state."""
+
+        state = self.get_adapter_state(model_id)
+        expected_names = {canonical_parameter_name(name): name for name in state.local_params}
+        converted_by_name = {canonical_parameter_name(name): tensor for name, tensor in gradient_state_dict.items()}
+        unexpected = sorted(set(converted_by_name) - set(expected_names))
+        if unexpected:
+            raise ValueError(f"Logical gradient state contains unexpected parameters: {unexpected!r}")
+        with torch.no_grad():
+            for canonical_name, logical_gradient in converted_by_name.items():
+                actual_name = expected_names[canonical_name]
+                layout = state.tensor_layouts[actual_name]
+                if tuple(logical_gradient.shape) != layout.logical_shape:
+                    raise ValueError(
+                        f"Logical gradient {canonical_name!r} has shape {tuple(logical_gradient.shape)}, "
+                        f"expected {layout.logical_shape}"
+                    )
+                local_gradient = pack_logical_tensor(layout, logical_gradient).to(
+                    device=state.local_params[actual_name].device,
+                    dtype=torch.float32
+                    if state.local_params[actual_name].dtype in {torch.float16, torch.bfloat16}
+                    else state.local_params[actual_name].dtype,
+                )
+                if not accumulate or state.local_params[actual_name].grad is None:
+                    state.local_params[actual_name].grad = local_gradient
+                else:
+                    state.local_params[actual_name].grad.add_(local_gradient)
 
     def _pack_logical_state_dict(
         self, state: AdapterState, state_dict: Dict[str, torch.Tensor]

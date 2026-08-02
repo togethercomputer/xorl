@@ -98,12 +98,41 @@ def test_save_writes_sharded_optimizer_with_manifest(tmp_path: Path):
         manifest = json.load(f)
     assert manifest["format_version"] == 3
     assert manifest["world_size"] == 1
+    assert manifest["session_rank"] == 4
+    assert manifest["per_rank_optimizer_parameter_order"] == [manifest["optimizer_parameter_order"]]
     assert manifest["per_rank_layout_fingerprint"] == [manager.get_adapter_state("resume-a").layout_fingerprint]
     assert manifest["optimizer_parameter_order"] == sorted(
-        name for name, param in manager.get_adapter_state("resume-a").local_params.items() if param.numel() > 0
+        adapter_manager_module.canonical_parameter_name(name)
+        for name, param in manager.get_adapter_state("resume-a").local_params.items()
+        if param.numel() > 0
     )
     state = manager.get_adapter_state("resume-a")
     assert manifest["per_rank_param_structure_sha256"] == [_adapter_param_structure_fingerprint(state.lora_params)]
+
+
+@pytest.mark.parametrize(
+    ("manifest_update", "error_match"),
+    [
+        ({"session_rank": 2}, "saved for session_rank"),
+        ({"per_rank_layout_fingerprint": ["0" * 64]}, "different topology/layout fingerprint"),
+        ({"per_rank_optimizer_parameter_order": [["wrong.fqn"]]}, "different optimizer parameter order"),
+    ],
+)
+def test_manifest_identity_contract_refuses_incompatible_optimizer_shards(tmp_path, manifest_update, error_match):
+    source = _build_manager(tmp_path / "source")
+    _register(source, "resume-contract")
+    _apply_step(source, "resume-contract", seed=3)
+    path = source.save_adapter_state("resume-contract")["path"]
+    manifest_path = os.path.join(path, OPTIMIZER_SHARD_MANIFEST_FILENAME)
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    manifest.update(manifest_update)
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f)
+
+    target = _build_manager(tmp_path / "target")
+    with pytest.raises(RuntimeError, match=error_match):
+        target.load_adapter_state(model_id="resume-contract", path=path, load_optimizer=True)
 
 
 def test_load_restores_optimizer_moments_and_step_bitwise(tmp_path: Path):

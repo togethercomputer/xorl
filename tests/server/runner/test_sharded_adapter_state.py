@@ -34,6 +34,10 @@ class _DummyLoRALayer(nn.Module):
         self.active_r = lora_rank
         self.active_lora_alpha = lora_alpha
 
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        delta_weight = self.lora_B @ self.lora_A
+        return hidden_states @ delta_weight.transpose(0, 1)
+
 
 class _DummyLoRAModel(nn.Module):
     def __init__(self, *, max_rank: int = 4) -> None:
@@ -42,6 +46,20 @@ class _DummyLoRAModel(nn.Module):
         self.model.layers = nn.ModuleList([nn.Module()])
         self.model.layers[0].self_attn = nn.Module()
         self.model.layers[0].self_attn.o_proj = _DummyLoRALayer(max_rank=max_rank)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.model.layers[0].self_attn.o_proj(hidden_states)
+
+
+class _ReorderedDummyLoRALayer(_DummyLoRALayer):
+    """Same logical factors, registered B-before-A to change FQN iteration order."""
+
+    def __init__(self, *, max_rank: int = 4) -> None:
+        nn.Module.__init__(self)
+        self.lora_B = nn.Parameter(torch.zeros(8, max_rank))
+        self.lora_A = nn.Parameter(torch.randn(max_rank, 8))
+        self.active_r = max_rank
+        self.active_lora_alpha = 16
 
 
 def _build_manager(tmp_path, **kwargs):
@@ -148,6 +166,27 @@ def test_deterministic_initialization_is_coordinate_and_replica_stable():
     )
 
 
+def test_deterministic_initialization_is_independent_of_fqn_iteration_order(tmp_path):
+    ordered = _build_manager(tmp_path / "ordered", optimizer_type="sgd")
+    reordered_model = _DummyLoRAModel()
+    reordered_model.model.layers[0].self_attn.o_proj = _ReorderedDummyLoRALayer()
+    reordered = LoRAAdapterManager(
+        reordered_model,
+        device=torch.device("cpu"),
+        checkpoint_dir=str(tmp_path / "reordered" / "adapters"),
+        auto_save_on_eviction=False,
+        optimizer_type="sgd",
+    )
+    spec = _session_spec(rank=4, alpha=16, optimizer_type="sgd", lr=0.1)
+    ordered.register_adapter("policy", session_spec=spec, initialize_fresh=True)
+    reordered.register_adapter("policy", session_spec=spec, initialize_fresh=True)
+    ordered_state = ordered.get_adapter_state("policy")
+    reordered_state = reordered.get_adapter_state("policy")
+    assert list(ordered_state.local_params) != list(reordered_state.local_params)
+    for name in ordered_state.local_params:
+        assert torch.equal(ordered_state.local_params[name], reordered_state.local_params[name]), name
+
+
 def test_manager_owns_local_active_slots_and_capture_hot_path_has_no_full_tensor(tmp_path):
     manager = _build_manager(tmp_path, optimizer_type="sgd", max_rank=4)
     manager.register_adapter(
@@ -167,6 +206,15 @@ def test_manager_owns_local_active_slots_and_capture_hot_path_has_no_full_tensor
 def test_capture_source_contract_excludes_full_tensor():
     source = inspect.getsource(LoRAAdapterManager.capture_gradients)
     assert "full_tensor" not in source
+
+
+def test_forward_and_capture_hot_paths_have_no_collective_or_full_materialization():
+    for method in (LoRAAdapterManager.prepare_forward, LoRAAdapterManager.capture_gradients):
+        source = inspect.getsource(method)
+        assert "full_tensor" not in source
+        assert "all_gather" not in source
+        assert "all_reduce" not in source
+        assert "broadcast" not in source
 
 
 def test_capture_eight_microbatches_matches_one_combined_gradient(tmp_path):
@@ -400,16 +448,44 @@ def _run_nccl_fused_worker() -> None:
         initialize_fresh=True,
     )
     state = manager.get_adapter_state("fused")
-    for param in state.local_params.values():
-        param.grad = torch.ones_like(param)
-    norm = manager.optim_step("fused", lr=1e-3, gradient_clip=1.0)
-    torch.cuda.synchronize()
+    inputs = torch.arange(32, dtype=torch.float32, device="cuda").reshape(4, 8) / 8.0
+    target = torch.ones(4, 8, dtype=torch.float32, device="cuda")
+    torch.cuda.reset_peak_memory_stats()
+
+    def capture_real_backward() -> None:
+        manager.prepare_forward("fused")
+        model.zero_grad(set_to_none=True)
+        loss = torch.nn.functional.mse_loss(model(inputs), target)
+        loss.backward()
+        assert any(param.grad is not None for param in model.parameters())
+        manager.capture_gradients("fused")
+        assert all(param.grad is None for param in model.parameters())
+
+    # Accumulate two real forward/backward captures before the first step.
+    capture_real_backward()
+    capture_real_backward()
+    norm = manager.optim_step("fused", lr=1e-3, gradient_clip=0.1)
     assert norm > 0.0
     assert state.global_step == 1
+
+    capture_real_backward()
+    second_norm = manager.optim_step("fused", lr=1e-3, gradient_clip=0.1)
+    assert second_norm > 0.0
+    assert state.global_step == 2
+    torch.cuda.synchronize()
+
+    gathered = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, {name: param.detach().cpu() for name, param in state.local_params.items()})
+    for name, value in gathered[0].items():
+        for replica in gathered[1:]:
+            assert torch.equal(value, replica[name]), name
     peak_memory = torch.tensor([torch.cuda.max_memory_allocated()], dtype=torch.int64, device="cuda")
     dist.all_reduce(peak_memory, op=dist.ReduceOp.MAX)
     if rank == 0:
-        print(f"NCCL fused adapter gate: world_size=2 peak_memory_bytes={int(peak_memory.item())}")
+        print(
+            "NCCL fused adapter gate: world_size=2 steps=2 captures_before_first_step=2 "
+            f"peak_memory_bytes={int(peak_memory.item())}"
+        )
     dist.destroy_process_group()
 
 
