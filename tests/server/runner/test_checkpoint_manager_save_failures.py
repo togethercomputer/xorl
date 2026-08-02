@@ -34,7 +34,9 @@ class _FakeAdapterState:
         self.global_forward_backward_step = 11
         self.lr = 2e-5
         self.optimizer = _FakeOptimizer()
-        self.lora_params = {"adapter.weight.lora_A": nn.Parameter(torch.ones(1, 1))}
+        self.local_params = {"adapter.weight.lora_A": nn.Parameter(torch.ones(1, 1))}
+        self.tensor_layouts = {}
+        self.layout_fingerprint = "f" * 64
         self.session_spec = {
             "lora_config": {
                 "lora_rank": 4,
@@ -50,6 +52,10 @@ class _FakeAdapterState:
                 "optimizer_kwargs": {},
             },
         }
+
+    @property
+    def lora_params(self):
+        return self.local_params
 
 
 class _FakeAdapterManager:
@@ -232,15 +238,11 @@ def test_moe_lora_save_uses_collective_gather_even_with_adapter_manager(monkeypa
         "lora_alpha": 16,
         "lora_target_modules": ["gate_proj", "up_proj", "down_proj"],
     }
-    manager._gather_adapter_lora_params = lambda model_id: (_ for _ in ()).throw(
-        AssertionError("fast adapter-manager gather should not run for MoE LoRA")
-    )
-
     collective_state = {
         "model.layers.0.mlp.experts.gate_proj_lora_A": torch.arange(64, dtype=torch.float32).reshape(1, 8, 8),
         "model.layers.0.mlp.experts.gate_proj_lora_B": torch.arange(128, dtype=torch.float32).reshape(1, 8, 16),
     }
-    monkeypatch.setattr(_MODULE, "get_lora_state_dict", lambda model: collective_state)
+    manager._gather_adapter_lora_params = lambda model_id: collective_state
 
     captured = {}
 
@@ -281,12 +283,8 @@ def test_moe_lora_save_uses_resolved_target_modules_for_detection(monkeypatch, t
     }
     manager.lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     manager.lora_alpha_value = 16
-    manager._gather_adapter_lora_params = lambda model_id: (_ for _ in ()).throw(
-        AssertionError("fast adapter-manager gather should not run for resolved MoE LoRA targets")
-    )
-
     collective_state = {"model.layers.0.mlp.experts.gate_proj_lora_A": torch.ones(1, 8, 4)}
-    monkeypatch.setattr(_MODULE, "get_lora_state_dict", lambda model: collective_state)
+    manager._gather_adapter_lora_params = lambda model_id: collective_state
 
     captured = {}
 

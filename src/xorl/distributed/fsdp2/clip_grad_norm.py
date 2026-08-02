@@ -124,7 +124,10 @@ def ep_fsdp2_clip_grad_norm(
     ep_local_total = _fsdp2_reduce_group(
         params=ep_local_params,
         norm_type=norm_type,
-        reduce_groups=[],  # no reduction needed
+        # _skip_fsdp expert tensors are not represented by an eFSDP DTensor;
+        # each EP rank owns a distinct expert rectangle, so their local norms
+        # must still enter one global logical norm.
+        reduce_groups=[("ep", ep_group)],
     )
 
     if math.isinf(norm_type):
@@ -134,6 +137,31 @@ def ep_fsdp2_clip_grad_norm(
 
     # Apply the same clip coefficient to all groups
     all_params = ep_fsdp_params + ep_local_params + non_ep_params
+    if error_if_nonfinite:
+        local_finite = all(
+            bool(torch.isfinite(g.to_local() if isinstance(g, DTensor) else g).all().item())
+            for param in all_params
+            if param.grad is not None
+            for g in [param.grad]
+        )
+        if dist.is_available() and dist.is_initialized():
+            device = next(
+                (
+                    (g.to_local() if isinstance(g, DTensor) else g).device
+                    for param in all_params
+                    if param.grad is not None
+                    for g in [param.grad]
+                ),
+                torch.device(get_device_type()),
+            )
+            backend = dist.get_backend()
+            if backend == "nccl" and device.type != "cuda":
+                device = torch.device(f"cuda:{torch.cuda.current_device()}")
+            finite_flag = torch.tensor([1 if local_finite else 0], dtype=torch.int64, device=device)
+            dist.all_reduce(finite_flag, op=dist.ReduceOp.MIN)
+            local_finite = bool(finite_flag.item())
+        if not local_finite:
+            raise RuntimeError("Non-finite gradient detected across the EP/FSDP optimizer group")
     # Disable foreach to avoid DTensor/plain tensor mixing
     torch.nn.utils.clip_grads_with_norm_(all_params, max_norm, total_norm, foreach=False)
 

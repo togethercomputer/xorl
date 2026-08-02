@@ -11,8 +11,9 @@ import pytest
 import torch
 from safetensors.torch import save_file as save_safetensors_file
 
-from xorl.lora.utils import LoraTensorShardSpec
+from xorl.lora.utils import convert_peft_lora_state_dict
 from xorl.server.protocol.operations import AdapterStateData, RegisterAdapterData, RegisterSessionData
+from xorl.server.runner.adapters.sharded_state import AdapterTensorLayout, pack_logical_tensor
 
 
 _MODULE_PATH = (
@@ -33,8 +34,14 @@ class _FakeAdapterState:
         self.global_step = 0
         self.global_forward_backward_step = 0
         self.lr = lr
-        self.lora_params = {}
+        self.local_params = {}
+        self.tensor_layouts = {}
         self.last_access_time = time.time()
+
+    @property
+    def lora_params(self):
+        """Keep older assertions readable while the fake follows the local-state API."""
+        return self.local_params
 
 
 class _FakeAdapterManager:
@@ -65,6 +72,11 @@ class _FakeAdapterManager:
 
     def set_lr(self, model_id: str, lr: float) -> None:
         self.adapters[model_id].lr = lr
+
+    def _pack_logical_state_dict(self, state, state_dict):
+        expected_shapes = {name: layout.logical_shape for name, layout in state.tensor_layouts.items()}
+        converted = convert_peft_lora_state_dict(state_dict, expected_shapes=expected_shapes)
+        return {name: pack_logical_tensor(state.tensor_layouts[name], converted[name]) for name in state.local_params}
 
 
 class _FakeTrainer:
@@ -292,6 +304,9 @@ def test_auto_load_if_evicted_uses_rank0_broadcast_mode_on_non_rank0(tmp_path):
     trainer = _FakeTrainer(checkpoint_dir, adapter_state_load_mode="rank0_broadcast")
     trainer.register_session("policy-c", trainer._session_spec(1e-5), materialize=False)
     coordinator = AdapterCoordinator(trainer=trainer, rank=1, world_size=2, cpu_group=None)
+    coordinator._restore_ep_sharded_rank0_broadcast_adapter_state = Mock(
+        return_value={"success": True, "model_id": "policy-c", "step": 0}
+    )
     coordinator.broadcast_adapter_state = Mock()
     coordinator.broadcast_adapter_optimizer_state = Mock()
 
@@ -301,8 +316,9 @@ def test_auto_load_if_evicted_uses_rank0_broadcast_mode_on_non_rank0(tmp_path):
     assert checkpoint_path == str(evicted_path)
     assert trainer.register_calls == [("policy-c", 1e-5)]
     assert trainer.load_calls == []
-    coordinator.broadcast_adapter_state.assert_called_once_with("policy-c", 1e-5)
-    coordinator.broadcast_adapter_optimizer_state.assert_called_once_with("policy-c")
+    coordinator._restore_ep_sharded_rank0_broadcast_adapter_state.assert_called_once()
+    coordinator.broadcast_adapter_state.assert_not_called()
+    coordinator.broadcast_adapter_optimizer_state.assert_not_called()
 
 
 def test_handle_load_adapter_state_uses_rank0_broadcast_mode_on_non_rank0(tmp_path):
@@ -314,6 +330,9 @@ def test_handle_load_adapter_state_uses_rank0_broadcast_mode_on_non_rank0(tmp_pa
     trainer = _FakeTrainer(checkpoint_dir, adapter_state_load_mode="rank0_broadcast")
     trainer.register_session("policy-d", trainer._session_spec(2e-5), materialize=False)
     coordinator = AdapterCoordinator(trainer=trainer, rank=1, world_size=2, cpu_group=None)
+    coordinator._restore_ep_sharded_rank0_broadcast_adapter_state = Mock(
+        return_value={"success": True, "model_id": "policy-d", "step": 0}
+    )
     coordinator.broadcast_adapter_state = Mock()
     coordinator.broadcast_adapter_optimizer_state = Mock()
 
@@ -329,8 +348,9 @@ def test_handle_load_adapter_state_uses_rank0_broadcast_mode_on_non_rank0(tmp_pa
     assert result == {"success": True, "model_id": "policy-d"}
     assert trainer.register_calls == [("policy-d", 2e-5)]
     assert trainer.load_calls == []
-    coordinator.broadcast_adapter_state.assert_called_once_with("policy-d", 2e-5)
-    coordinator.broadcast_adapter_optimizer_state.assert_called_once_with("policy-d")
+    coordinator._restore_ep_sharded_rank0_broadcast_adapter_state.assert_called_once()
+    coordinator.broadcast_adapter_state.assert_not_called()
+    coordinator.broadcast_adapter_optimizer_state.assert_not_called()
 
 
 def test_rank0_broadcast_ep_sharded_restore_slices_full_checkpoint_tensor(monkeypatch, tmp_path):
@@ -360,14 +380,27 @@ def test_rank0_broadcast_ep_sharded_restore_slices_full_checkpoint_tensor(monkey
     trainer.register_lora_adapter("policy-ep", 3e-5)
     trainer.adapter_manager.model = object()
     state = trainer.adapter_manager.get_adapter_state("policy-ep")
-    state.lora_params = {param_name: torch.nn.Parameter(torch.empty(2, 5, 2))}
-
+    state.local_params = {param_name: torch.nn.Parameter(torch.empty(2, 5, 2))}
+    state.tensor_layouts = {
+        param_name: AdapterTensorLayout(
+            fqn=param_name,
+            dtype=torch.float32,
+            rank_dim=0,
+            substrate_shape=(4, 5, 2),
+            logical_shape=(4, 5, 2),
+            local_substrate_shape=(2, 5, 2),
+            local_logical_offset=(2, 0, 0),
+            local_logical_shape=(2, 5, 2),
+            active_local_slices=(slice(0, 2), slice(0, 5), slice(0, 2)),
+            active_storage_shape=(2, 5, 2),
+            replica_key=(param_name, (4, 5, 2), (2, 0, 0), (2, 5, 2), "float32"),
+        )
+    }
     monkeypatch.setattr(
-        _MODULE,
-        "get_lora_tensor_shard_specs",
-        lambda model, names=None: {param_name: LoraTensorShardSpec(dim=0, index=1, size=2)},
+        _MODULE.dist,
+        "broadcast_object_list",
+        lambda payload, src=0, group=None: None,
     )
-    monkeypatch.setattr(_MODULE.dist, "broadcast_object_list", lambda payload, src=0, group=None: None)
 
     coordinator = AdapterCoordinator(trainer=trainer, rank=0, world_size=2, cpu_group=None)
     coordinator.broadcast_adapter_state = Mock()
@@ -422,14 +455,27 @@ def test_rank0_broadcast_ep_sharded_restore_rejects_session_spec_mismatch(monkey
     trainer.adapter_manager.model = object()
     state = trainer.adapter_manager.get_adapter_state("policy-ep")
     original_tensor = torch.zeros(2, 5, 2)
-    state.lora_params = {param_name: torch.nn.Parameter(original_tensor.clone())}
-
+    state.local_params = {param_name: torch.nn.Parameter(original_tensor.clone())}
+    state.tensor_layouts = {
+        param_name: AdapterTensorLayout(
+            fqn=param_name,
+            dtype=torch.float32,
+            rank_dim=0,
+            substrate_shape=(4, 5, 2),
+            logical_shape=(4, 5, 2),
+            local_substrate_shape=(2, 5, 2),
+            local_logical_offset=(2, 0, 0),
+            local_logical_shape=(2, 5, 2),
+            active_local_slices=(slice(0, 2), slice(0, 5), slice(0, 2)),
+            active_storage_shape=(2, 5, 2),
+            replica_key=(param_name, (4, 5, 2), (2, 0, 0), (2, 5, 2), "float32"),
+        )
+    }
     monkeypatch.setattr(
-        _MODULE,
-        "get_lora_tensor_shard_specs",
-        lambda model, names=None: {param_name: LoraTensorShardSpec(dim=0, index=1, size=2)},
+        _MODULE.dist,
+        "broadcast_object_list",
+        lambda payload, src=0, group=None: None,
     )
-    monkeypatch.setattr(_MODULE.dist, "broadcast_object_list", lambda payload, src=0, group=None: None)
 
     coordinator = AdapterCoordinator(trainer=trainer, rank=0, world_size=2, cpu_group=None)
 

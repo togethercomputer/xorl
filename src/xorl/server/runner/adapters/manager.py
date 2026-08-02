@@ -31,10 +31,17 @@ from safetensors.torch import save_file as safetensors_save_file
 from xorl.lora.target_manifest import load_lora_target_manifest
 from xorl.lora.utils import (
     convert_peft_lora_state_dict,
-    get_lora_tensor_shard_specs,
     load_lora_checkpoint_state_dict,
 )
 from xorl.optim import build_optimizer
+from xorl.server.runner.adapters.sharded_state import (
+    AdapterTensorLayout,
+    canonical_parameter_name,
+    deterministic_local_initialization,
+    discover_adapter_layouts,
+    pack_logical_tensor,
+    wait_for_local_tensor,
+)
 from xorl.server.security import resolve_path_within, resolve_server_artifact, validate_identifier
 from xorl.server.session_spec import (
     load_session_spec_from_checkpoint,
@@ -45,7 +52,6 @@ from xorl.server.session_spec import (
 
 try:
     from torch.distributed._tensor import DTensor
-    from torch.distributed._tensor.placement_types import Shard
 
     _HAS_DTENSOR = True
 except ImportError:
@@ -55,7 +61,6 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-_TORCH_MANUAL_SEED_MASK = 0x7FFFFFFFFFFFFFFF
 _TARGET_MANIFEST_FILENAME = "lora_target_manifest.json"
 
 OPTIMIZER_SHARD_MANIFEST_FILENAME = "optimizer_shards.json"
@@ -213,16 +218,30 @@ def save_adapter_optimizer_shards(adapter_state: "AdapterState", path: str) -> D
         adapter_state.optimizer.state_dict(),
         str(shard_path),
     )
-    fingerprint = _adapter_param_structure_fingerprint(adapter_state.lora_params)
+    fingerprint = _adapter_param_structure_fingerprint(adapter_state.local_params)
+    layout_descriptors = [
+        adapter_state.tensor_layouts[name].to_json_dict() for name in sorted(adapter_state.tensor_layouts)
+    ]
     if world > 1:
         fingerprints: List[Optional[str]] = [None] * world
         torch.distributed.all_gather_object(fingerprints, fingerprint)
+        layout_fingerprints: List[Optional[str]] = [None] * world
+        torch.distributed.all_gather_object(layout_fingerprints, adapter_state.layout_fingerprint)
+        layout_descriptors_by_rank: List[Optional[List[Dict[str, Any]]]] = [None] * world
+        torch.distributed.all_gather_object(layout_descriptors_by_rank, layout_descriptors)
     else:
         fingerprints = [fingerprint]
+        layout_fingerprints = [adapter_state.layout_fingerprint]
+        layout_descriptors_by_rank = [layout_descriptors]
     manifest = {
-        "format_version": 2,
+        "format_version": 3,
         "world_size": world,
         "per_rank_param_structure_sha256": fingerprints,
+        "per_rank_layout_fingerprint": layout_fingerprints,
+        "per_rank_layout_descriptors": layout_descriptors_by_rank,
+        "optimizer_parameter_order": [
+            name for name in sorted(adapter_state.local_params) if adapter_state.local_params[name].numel() > 0
+        ],
     }
     if rank == 0:
         with open(os.path.join(path, OPTIMIZER_SHARD_MANIFEST_FILENAME), "w") as f:
@@ -248,10 +267,11 @@ def load_adapter_optimizer_shards(
     if os.path.exists(manifest_path):
         with open(manifest_path) as f:
             manifest = json.load(f)
-        if manifest.get("format_version") != 2:
+        if manifest.get("format_version") != 3:
             raise RuntimeError(
-                f"Adapter optimizer checkpoint at {path} uses unsupported or pickle-backed format version "
-                f"{manifest.get('format_version')!r}; load weights-only (load_optimizer=False)."
+                f"Adapter optimizer checkpoint at {path} uses obsolete or unsupported layout format version "
+                f"{manifest.get('format_version')!r}; local-shard optimizer state cannot be migrated by position. "
+                "Load weights-only (load_optimizer=False) and re-save on the new topology."
             )
         saved_world = int(manifest["world_size"])
         if saved_world != world:
@@ -261,12 +281,28 @@ def load_adapter_optimizer_shards(
                 "on the saved topology or load weights-only (load_optimizer=False)."
             )
         expected_fingerprint = manifest["per_rank_param_structure_sha256"][rank]
-        live_fingerprint = _adapter_param_structure_fingerprint(adapter_state.lora_params)
+        live_fingerprint = _adapter_param_structure_fingerprint(adapter_state.local_params)
         if expected_fingerprint != live_fingerprint:
             raise RuntimeError(
                 f"Adapter optimizer shard for rank {rank} at {path} was saved for a different local "
                 "parameter structure. Refusing to load misassigned Adam moments; load weights-only "
                 "(load_optimizer=False) instead."
+            )
+        expected_layout_fingerprint = manifest.get("per_rank_layout_fingerprint", [None] * world)[rank]
+        if expected_layout_fingerprint != adapter_state.layout_fingerprint:
+            raise RuntimeError(
+                f"Adapter optimizer shard for rank {rank} at {path} was saved for a different topology/layout "
+                "fingerprint. Refusing to load rank-local optimizer state; load weights-only "
+                "(load_optimizer=False) instead."
+            )
+        expected_order = manifest.get("optimizer_parameter_order")
+        live_order = [
+            name for name in sorted(adapter_state.local_params) if adapter_state.local_params[name].numel() > 0
+        ]
+        if expected_order != live_order:
+            raise RuntimeError(
+                f"Adapter optimizer shard at {path} has a different optimizer parameter order; "
+                "load weights-only (load_optimizer=False) instead."
             )
         shard_path = resolve_path_within(
             path,
@@ -294,14 +330,6 @@ def load_adapter_optimizer_shards(
     return False
 
 
-def _mix_torch_manual_seed(base_seed: int, *components: int) -> int:
-    """Mix deterministic seed components into PyTorch's signed 63-bit range."""
-    acc = int(base_seed) & _TORCH_MANUAL_SEED_MASK
-    for index, component in enumerate(components, start=1):
-        acc = (acc * 6364136223846793005 + int(component) * 1442695040888963407 + index) & _TORCH_MANUAL_SEED_MASK
-    return acc
-
-
 @dataclass
 class AdapterState:
     """Complete isolated state for one training run.
@@ -313,12 +341,24 @@ class AdapterState:
 
     model_id: str
     session_spec: Dict[str, Any]
-    lora_params: Dict[str, nn.Parameter]  # Actual Parameters with own .grad
+    local_params: Dict[str, nn.Parameter]  # Active local shards with own .grad
+    tensor_layouts: Dict[str, AdapterTensorLayout]
+    layout_fingerprint: str
     optimizer: torch.optim.Optimizer  # Per-adapter optimizer
     global_step: int = 0
     global_forward_backward_step: int = 0
     lr: float = 1e-5
     last_access_time: float = field(default_factory=time.time)  # For LRU eviction
+
+    @property
+    def lora_params(self) -> Dict[str, nn.Parameter]:
+        """Deprecated local-only view retained for external compatibility.
+
+        This is intentionally not a logical/full tensor API.  Internal code
+        must use ``local_params`` and ``tensor_layouts`` explicitly.
+        """
+
+        return self.local_params
 
 
 class LoRAAdapterManager:
@@ -387,6 +427,8 @@ class LoRAAdapterManager:
         self.optimizer_fused = device.type == "cuda" if optimizer_fused is None else optimizer_fused
         self.adapters: Dict[str, AdapterState] = {}
         self.current_adapter_id: Optional[str] = None
+        self._layout_cache: Dict[int, Tuple[Dict[str, AdapterTensorLayout], str]] = {}
+        self._model_param_ids: Dict[str, int] = {}
 
         # Cache the list of LoRA parameter names for efficient lookups
         self._lora_param_names: List[str] = []
@@ -395,11 +437,27 @@ class LoRAAdapterManager:
             if "lora_A" in name or "lora_B" in name:
                 self._lora_param_names.append(name)
                 param_shape = tuple(param.shape if _HAS_DTENSOR and isinstance(param, DTensor) else param.data.shape)
+                self._model_param_ids[name] = id(param)
                 self._lora_param_metadata[name] = {
                     "shape": param_shape,
                     "dtype": param.dtype if _HAS_DTENSOR and isinstance(param, DTensor) else param.data.dtype,
                     "rank_dim": self._infer_lora_rank_dim(name, param_shape),
                 }
+
+        self._pipeline_parallel_size = int(
+            self.lora_config.get("pipeline_parallel_size", self.lora_config.get("pp_size", 1))
+        )
+        try:
+            from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+
+            self._pipeline_parallel_size = max(self._pipeline_parallel_size, int(get_parallel_state().pp_size))
+        except Exception:
+            pass
+        if self._pipeline_parallel_size > 1 and self._lora_param_names:
+            raise RuntimeError(
+                "Multi-adapter LoRA state requires a single pipeline stage; "
+                "pipeline parallelism has no known optimizer ownership group."
+            )
 
         logger.info(
             f"LoRAAdapterManager initialized with {len(self._lora_param_names)} LoRA parameters, "
@@ -421,39 +479,6 @@ class LoRAAdapterManager:
             if len(shape) == 3:
                 return 1
         raise ValueError(f"Cannot infer LoRA rank dimension for parameter {name!r} with shape {shape!r}")
-
-    @staticmethod
-    def _replace_dim(shape: Tuple[int, ...], dim: int, value: int) -> Tuple[int, ...]:
-        updated = list(shape)
-        updated[dim] = value
-        return tuple(updated)
-
-    @staticmethod
-    def _slice_to_rank(tensor: torch.Tensor, *, rank_dim: int, active_rank: int) -> torch.Tensor:
-        return tensor.narrow(rank_dim, 0, active_rank)
-
-    @staticmethod
-    def _slice_to_shape(tensor: torch.Tensor, *, rank_dim: int, target_shape: Tuple[int, ...]) -> torch.Tensor:
-        active_rank = target_shape[rank_dim]
-        sliced = tensor.narrow(rank_dim, 0, active_rank)
-        if tuple(sliced.shape) != target_shape:
-            raise ValueError(f"Expected sliced tensor shape {target_shape}, got {tuple(sliced.shape)}")
-        return sliced
-
-    @staticmethod
-    def _expand_compact_tensor(
-        tensor: torch.Tensor,
-        *,
-        full_shape: Tuple[int, ...],
-        rank_dim: int,
-    ) -> torch.Tensor:
-        if tuple(tensor.shape) == full_shape:
-            return tensor
-        expanded = torch.zeros(full_shape, dtype=tensor.dtype, device=tensor.device)
-        slices = [slice(None)] * len(full_shape)
-        slices[rank_dim] = slice(0, tensor.shape[rank_dim])
-        expanded[tuple(slices)] = tensor
-        return expanded
 
     @staticmethod
     def _session_rank(session_spec: Dict[str, Any]) -> int:
@@ -518,6 +543,49 @@ class LoRAAdapterManager:
         if not self._lora_param_metadata:
             raise RuntimeError("Cannot determine LoRA rank capacity: model does not expose any LoRA parameters.")
         return min(metadata["shape"][metadata["rank_dim"]] for metadata in self._lora_param_metadata.values())
+
+    def _discover_layouts(self, session_rank: int) -> Tuple[Dict[str, AdapterTensorLayout], str]:
+        cached = self._layout_cache.get(session_rank)
+        if cached is not None:
+            return cached
+        layouts, fingerprint = discover_adapter_layouts(
+            self.model,
+            self._lora_param_metadata,
+            active_rank=session_rank,
+            pipeline_parallel_size=self._pipeline_parallel_size,
+        )
+        self._layout_cache[session_rank] = layouts, fingerprint
+        return layouts, fingerprint
+
+    def _validate_model_layout_identity(self, state: AdapterState) -> None:
+        """Fail closed if FSDP/EP replaced or moved a parameter after discovery."""
+
+        current = {name: param for name, param in self.model.named_parameters() if name in self._model_param_ids}
+        if set(current) != set(self._model_param_ids):
+            raise RuntimeError("Trainable LoRA parameter set changed after adapter layout discovery")
+        for name, expected_id in self._model_param_ids.items():
+            param = current[name]
+            if id(param) != expected_id:
+                raise RuntimeError(f"LoRA parameter identity changed after layout discovery: {name}")
+            layout = state.tensor_layouts[name]
+            raw = param.data if isinstance(param, nn.Parameter) else param
+            local = wait_for_local_tensor(raw.to_local() if _HAS_DTENSOR and isinstance(raw, DTensor) else raw)
+            if tuple(local.shape) != layout.local_substrate_shape:
+                raise RuntimeError(
+                    f"LoRA parameter placement changed after layout discovery for {name}: "
+                    f"local shape {tuple(local.shape)} != {layout.local_substrate_shape}"
+                )
+
+    @staticmethod
+    def _is_lora_b(name: str) -> bool:
+        return "lora_B" in name or "_lora_B" in name
+
+    def _base_initialization_seed(self, session_spec: Dict[str, Any]) -> int:
+        for source in (session_spec.get("lora_config", {}), self.lora_config):
+            for key in ("seed", "lora_seed", "base_seed"):
+                if key in source and source[key] is not None:
+                    return int(source[key])
+        return 0
 
     def _validate_session_rank_against_model_capacity(self, session_spec: Dict[str, Any]) -> None:
         """Reject session specs whose runtime rank exceeds the live model capacity."""
@@ -680,9 +748,15 @@ class LoRAAdapterManager:
             current.register_parameter(leaf_name, param)
         return root
 
+    @staticmethod
+    def _optimizer_parameter_map(local_params: Dict[str, nn.Parameter]) -> Dict[str, nn.Parameter]:
+        """Exclude deterministic empty intersections from fused optimizers."""
+
+        return {name: param for name, param in local_params.items() if param.numel() > 0}
+
     def _build_adapter_optimizer(self, lora_params: Dict[str, nn.Parameter], lr: float) -> torch.optim.Optimizer:
         """Build an optimizer for one adapter via the shared optimizer factory."""
-        adapter_module = self._build_parameter_module(lora_params)
+        adapter_module = self._build_parameter_module(self._optimizer_parameter_map(lora_params))
         return build_optimizer(
             adapter_module,
             lr=lr,
@@ -698,7 +772,7 @@ class LoRAAdapterManager:
     def _build_adapter_optimizer_for_session(
         self, lora_params: Dict[str, nn.Parameter], session_spec: Dict[str, Any]
     ) -> torch.optim.Optimizer:
-        adapter_module = self._build_parameter_module(lora_params)
+        adapter_module = self._build_parameter_module(self._optimizer_parameter_map(lora_params))
         build_kwargs = session_optimizer_build_kwargs(session_spec["optimizer_config"])
         return build_optimizer(
             adapter_module,
@@ -709,7 +783,7 @@ class LoRAAdapterManager:
     def _reset_adapter_optimizer(self, model_id: str) -> None:
         """Rebuild an adapter optimizer from its normalized session spec."""
         state = self.get_adapter_state(model_id)
-        state.optimizer = self._build_adapter_optimizer_for_session(state.lora_params, state.session_spec)
+        state.optimizer = self._build_adapter_optimizer_for_session(state.local_params, state.session_spec)
 
     def reinitialize_adapter_for_zorl_family(
         self,
@@ -723,53 +797,16 @@ class LoRAAdapterManager:
             raise ValueError(f"Unsupported ZORL LoRA-A init: {a_init!r}")
 
         state = self.get_adapter_state(model_id)
-
-        # MoE params are 3D ``[num_local_experts, ...]``. With EP > 1, every
-        # rank sees the *same* shape but different *global* experts. If we
-        # used one rank-identical seed for the whole tensor, expert i on
-        # rank 0 and expert i on rank N would draw identical LoRA-A values,
-        # collapsing the search dimension. Mix the global expert index into
-        # the seed for each MoE expert instead.
-        try:
-            from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
-
-            ep_rank = get_parallel_state().ep_rank if get_parallel_state().ep_size > 1 else 0
-        except Exception:
-            ep_rank = 0
-
         with torch.no_grad():
-            for name in sorted(state.lora_params):
-                param = state.lora_params[name]
-                if "lora_A" in name:
-                    if param.ndim == 3:
-                        # MoE LoRA-A: [num_local_experts, in, r]. Seed per
-                        # global expert so EP siblings sample independently.
-                        num_local_experts = int(param.shape[0])
-                        input_dim = int(param.shape[1])
-                        inv_scale = 1.0 / math.sqrt(max(input_dim, 1))
-                        values = torch.empty(tuple(param.shape), dtype=torch.float32)
-                        for local_idx in range(num_local_experts):
-                            global_expert_idx = ep_rank * num_local_experts + local_idx
-                            expert_gen = torch.Generator(device="cpu")
-                            expert_gen.manual_seed(_mix_torch_manual_seed(a_seed, global_expert_idx))
-                            torch.randn(
-                                tuple(param.shape[1:]),
-                                generator=expert_gen,
-                                dtype=torch.float32,
-                                out=values[local_idx],
-                            )
-                    else:
-                        # Non-MoE LoRA-A: rank-identical seed is correct; the
-                        # tensor lives on every rank as a replica.
-                        input_dim = int(param.shape[1]) if param.ndim > 1 else int(param.numel())
-                        inv_scale = 1.0 / math.sqrt(max(input_dim, 1))
-                        generator = torch.Generator(device="cpu")
-                        generator.manual_seed(_mix_torch_manual_seed(a_seed))
-                        values = torch.randn(tuple(param.shape), generator=generator, dtype=torch.float32)
-                    values.mul_(inv_scale)
-                    param.data.copy_(values.to(device=param.device, dtype=param.dtype))
-                elif "lora_B" in name:
-                    param.zero_()
+            for name in sorted(state.local_params):
+                param = state.local_params[name]
+                values = deterministic_local_initialization(
+                    state.tensor_layouts[name],
+                    base_seed=a_seed,
+                    session_identity=model_id,
+                    is_lora_b=self._is_lora_b(name),
+                ).to(device=param.device, dtype=param.dtype)
+                param.copy_(values)
                 param.grad = None
 
         self._reset_adapter_optimizer(model_id)
@@ -782,7 +819,7 @@ class LoRAAdapterManager:
     @staticmethod
     def _has_pending_gradients(state: AdapterState) -> bool:
         """Return whether an adapter has captured gradients awaiting an optimizer step."""
-        return any(param.grad is not None for param in state.lora_params.values())
+        return any(param.grad is not None for param in state.local_params.values())
 
     def _maybe_evict(self) -> Optional[str]:
         """
@@ -867,6 +904,13 @@ class LoRAAdapterManager:
         session_alpha = self._session_alpha(session_spec)
         optimizer_config = session_spec["optimizer_config"]
         effective_lr = float(optimizer_config["learning_rate"])
+        optimizer_type = str(optimizer_config.get("type", self.optimizer_type)).lower()
+        _rank, world = _optimizer_shard_rank_world()
+        if world > 1 and optimizer_type in {"muon", "distsignsgd", "dist_signsgd"}:
+            raise ValueError(
+                f"Optimizer {optimizer_type!r} is not shard-separable for distributed multi-adapter state. "
+                "Use AdamW/AnyPrecisionAdamW/SGD/SignSGD, or run this optimizer in a single-rank session."
+            )
 
         # Evict LRU adapter if at capacity and this is a new adapter
         if model_id not in self.adapters:
@@ -874,62 +918,40 @@ class LoRAAdapterManager:
         else:
             logger.info(f"Replacing existing adapter for model_id={model_id}")
 
-        # Create Parameter objects for this adapter
-        # IMPORTANT: Must create regular tensors, not DTensors, because the adapter's
-        # optimizer needs to work on regular tensors (DTensors cause issues with fused ops)
-        lora_params: Dict[str, nn.Parameter] = {}
-        for name, param in self.model.named_parameters():
-            if name in self._lora_param_names:
-                metadata = self._lora_param_metadata[name]
-                param_shape = metadata["shape"]
-                param_dtype = metadata["dtype"]
-                rank_dim = metadata["rank_dim"]
-                compact_shape = self._replace_dim(param_shape, rank_dim, session_rank)
-
-                if initialize_fresh:
-                    # Fresh initialization - create compact regular tensor on device
-                    if "lora_A" in name:
-                        new_tensor = torch.empty(
-                            compact_shape,
-                            dtype=param_dtype,
-                            device=self.device,
-                        )
-                        nn.init.kaiming_uniform_(new_tensor, a=math.sqrt(5))
-                    else:  # lora_B
-                        new_tensor = torch.zeros(
-                            compact_shape,
-                            dtype=param_dtype,
-                            device=self.device,
-                        )
-                else:
-                    # Copy current model weights as regular tensor
-                    # NOTE: This path requires full_tensor() for DTensors, so it should
-                    # only be called when all ranks are participating (e.g., from
-                    # register_adapter endpoint, not from load_adapter_state)
-                    if _HAS_DTENSOR and isinstance(param, DTensor):
-                        param_data = param.full_tensor()
-                    else:
-                        param_data = param.data
-                    new_tensor = (
-                        self._slice_to_shape(
-                            param_data.detach(),
-                            rank_dim=rank_dim,
-                            target_shape=compact_shape,
-                        )
-                        .clone()
-                        .to(self.device)
-                    )
-
-                # Create as nn.Parameter so it has its own .grad slot
-                lora_params[name] = nn.Parameter(new_tensor, requires_grad=True)
+        layouts, layout_fp = self._discover_layouts(session_rank)
+        named_params = dict(self.model.named_parameters())
+        local_params: Dict[str, nn.Parameter] = {}
+        base_seed = self._base_initialization_seed(session_spec)
+        for name in self._lora_param_names:
+            model_param = named_params[name]
+            layout = layouts[name]
+            if initialize_fresh:
+                new_tensor = deterministic_local_initialization(
+                    layout,
+                    base_seed=base_seed,
+                    session_identity=model_id,
+                    is_lora_b=self._is_lora_b(name),
+                ).to(device=self.device, dtype=layout.dtype)
+            else:
+                raw_model_param = model_param.data if isinstance(model_param, nn.Parameter) else model_param
+                local_model_tensor = (
+                    raw_model_param.to_local()
+                    if _HAS_DTENSOR and isinstance(raw_model_param, DTensor)
+                    else raw_model_param
+                )
+                local_model_tensor = wait_for_local_tensor(local_model_tensor)
+                new_tensor = layout.pack_from_local(local_model_tensor).to(device=self.device, dtype=layout.dtype)
+            local_params[name] = nn.Parameter(new_tensor, requires_grad=True)
 
         # Build optimizer for this adapter using the session's optimizer contract.
-        optimizer = self._build_adapter_optimizer_for_session(lora_params, session_spec)
+        optimizer = self._build_adapter_optimizer_for_session(local_params, session_spec)
 
         self.adapters[model_id] = AdapterState(
             model_id=model_id,
             session_spec=session_spec,
-            lora_params=lora_params,
+            local_params=local_params,
+            tensor_layouts=layouts,
+            layout_fingerprint=layout_fp,
             optimizer=optimizer,
             global_step=0,
             global_forward_backward_step=0,
@@ -939,7 +961,7 @@ class LoRAAdapterManager:
         logger.info(
             f"Registered adapter for model_id={model_id} "
             f"(rank={session_rank}, alpha={session_alpha}, lr={effective_lr}, "
-            f"fresh_weights={initialize_fresh}, num_params={len(lora_params)}, "
+            f"fresh_weights={initialize_fresh}, num_params={len(local_params)}, "
             f"optimizer={optimizer_config['type']})"
         )
 
@@ -950,9 +972,8 @@ class LoRAAdapterManager:
         This must be called before forward() to ensure the model uses
         the correct adapter's weights.
 
-        For FSDP2/DTensor: The model's params are sharded DTensors, but the
-        adapter's params are full regular tensors. We need to copy only the
-        local shard from the adapter to the model.
+        Adapter slots are compact local shards.  This method unpacks them into
+        the model's local substrate and clears inactive maximum-rank regions.
 
         Args:
             model_id: The adapter to prepare for
@@ -967,6 +988,7 @@ class LoRAAdapterManager:
             )
 
         state = self.adapters[model_id]
+        self._validate_model_layout_identity(state)
         # Update last access time for LRU tracking
         state.last_access_time = time.time()
         self._set_model_runtime_lora_config(
@@ -974,48 +996,15 @@ class LoRAAdapterManager:
             lora_alpha=self._session_alpha(state.session_spec),
         )
 
-        # Copy adapter weights into model's params (for forward to use)
-        # Use no_grad to avoid autograd issues with DTensor views
+        named_params = dict(self.model.named_parameters())
         with torch.no_grad():
-            for name, param in self.model.named_parameters():
-                if name in state.lora_params:
-                    metadata = self._lora_param_metadata[name]
-                    adapter_data = self._expand_compact_tensor(
-                        state.lora_params[name].data,
-                        full_shape=metadata["shape"],
-                        rank_dim=metadata["rank_dim"],
-                    )
-
-                    if _HAS_DTENSOR and isinstance(param, DTensor):
-                        # For DTensor: copy to the local tensor (the shard)
-                        # The adapter has full weights, but model param is sharded.
-                        # We need to extract the correct shard from adapter weights.
-                        local_tensor = param.to_local()
-                        placements = param.placements
-                        device_mesh = param.device_mesh
-
-                        sliced_data = adapter_data
-                        skip_copy = False
-                        for dim, placement in enumerate(placements):
-                            if isinstance(placement, Shard):
-                                shard_dim = placement.dim
-                                mesh_dim_size = device_mesh.size(dim)
-                                local_rank = device_mesh.get_local_rank(mesh_dim=dim)
-                                total_size = sliced_data.shape[shard_dim]
-                                shard_size = (total_size + mesh_dim_size - 1) // mesh_dim_size
-                                start = local_rank * shard_size
-                                end = min(start + shard_size, total_size)
-                                length = max(end - start, 0)
-                                if start >= total_size or length == 0:
-                                    skip_copy = True
-                                    break
-                                sliced_data = sliced_data.narrow(shard_dim, start, length)
-
-                        if not skip_copy and local_tensor.numel() > 0:
-                            local_tensor.copy_(sliced_data)
-                    else:
-                        # Regular tensor: direct copy
-                        param.data.copy_(adapter_data)
+            for name, param in named_params.items():
+                if name not in state.local_params:
+                    continue
+                raw_param = param.data if isinstance(param, nn.Parameter) else param
+                local_tensor = raw_param.to_local() if _HAS_DTENSOR and isinstance(raw_param, DTensor) else raw_param
+                local_tensor = wait_for_local_tensor(local_tensor)
+                state.tensor_layouts[name].unpack_to_local(state.local_params[name].data, destination=local_tensor)
 
         self.current_adapter_id = model_id
 
@@ -1028,8 +1017,8 @@ class LoRAAdapterManager:
         .grad slots). This prevents gradient collision when multiple adapters
         interleave.
 
-        For FSDP2/DTensor: If gradients are DTensors (sharded), we call
-        .full_tensor() to get the full unsharded gradient before copying.
+        Only the model-local gradient rectangle is copied.  No full DTensor is
+        materialized in this hot path.
 
         Args:
             model_id: The adapter to capture gradients for
@@ -1039,31 +1028,27 @@ class LoRAAdapterManager:
             raise KeyError(f"Adapter for model_id={model_id} not registered")
 
         state = self.adapters[model_id]
-        grad_count = 0
+        self._validate_model_layout_identity(state)
 
         for name, param in self.model.named_parameters():
-            if name in state.lora_params:
-                adapter_param = state.lora_params[name]
-                if param.grad is not None:
-                    metadata = self._lora_param_metadata[name]
-                    # Handle DTensor (FSDP2 sharded gradients)
-                    grad = param.grad
-                    if _HAS_DTENSOR and isinstance(grad, DTensor):
-                        grad = grad.full_tensor()
-                    grad = self._slice_to_shape(
-                        grad,
-                        rank_dim=metadata["rank_dim"],
-                        target_shape=tuple(adapter_param.shape),
-                    )
-
-                    # Copy gradient to adapter's param (accumulate for grad accumulation)
-                    if adapter_param.grad is None:
-                        adapter_param.grad = grad.clone()
-                    else:
-                        adapter_param.grad.add_(grad)
-                    grad_count += 1
-                    # Clear model's grad to prevent accumulation across adapters
-                    param.grad = None
+            if name not in state.local_params or param.grad is None:
+                continue
+            adapter_param = state.local_params[name]
+            raw_grad = param.grad
+            local_grad = raw_grad.to_local() if _HAS_DTENSOR and isinstance(raw_grad, DTensor) else raw_grad
+            local_grad = wait_for_local_tensor(local_grad)
+            grad = state.tensor_layouts[name].pack_from_local(local_grad)
+            param.grad = None
+            if grad.numel() == 0:
+                continue
+            accumulation_dtype = (
+                torch.float32 if adapter_param.dtype in {torch.float16, torch.bfloat16} else adapter_param.dtype
+            )
+            grad = grad.to(dtype=accumulation_dtype, device=adapter_param.device)
+            if adapter_param.grad is None:
+                adapter_param.grad = grad
+            else:
+                adapter_param.grad.add_(grad)
 
     def optim_step(
         self,
@@ -1071,6 +1056,7 @@ class LoRAAdapterManager:
         lr: float,
         gradient_clip: Optional[float] = None,
         accumulated_valid_tokens: int = 0,
+        norm_type: float = 2.0,
     ) -> float:
         """
         Run optimizer step on adapter's own parameters.
@@ -1093,6 +1079,7 @@ class LoRAAdapterManager:
             raise KeyError(f"Adapter for model_id={model_id} not registered")
 
         state = self.adapters[model_id]
+        self._validate_model_layout_identity(state)
 
         # Update learning rate
         self._update_state_learning_rate(state, lr)
@@ -1100,24 +1087,82 @@ class LoRAAdapterManager:
         # Deferred gradient normalization: scale raw gradients by 1/accumulated_valid_tokens
         if accumulated_valid_tokens > 0:
             scale = 1.0 / accumulated_valid_tokens
-            for p in state.lora_params.values():
+            for p in state.local_params.values():
                 if p.grad is not None:
-                    p.grad.data = p.grad.data.float() * scale
+                    p.grad.mul_(scale)
 
-        # Always use clip_grad_norm_ for correct grad norm computation
-        # Using a large clip value (10000.0) effectively means no clipping
-        clip_value = gradient_clip if (gradient_clip is not None and gradient_clip > 0) else 10000.0
-        grad_norm = torch.nn.utils.clip_grad_norm_(list(state.lora_params.values()), clip_value)
-        if hasattr(grad_norm, "item"):
-            grad_norm = grad_norm.item()
+        optimizer_params = [
+            state.local_params[name] for name in sorted(state.local_params) if state.local_params[name].numel() > 0
+        ]
+        local_grads = [param.grad for param in optimizer_params if param.grad is not None]
+        local_device = local_grads[0].device if local_grads else self.device
+        distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+        group = torch.distributed.group.WORLD if distributed else None
+        world = torch.distributed.get_world_size(group=group) if distributed else 1
 
-        # Step the adapter's optimizer
+        if distributed and world > 1:
+            backend = torch.distributed.get_backend(group)
+            if backend == "nccl" and local_device.type != "cuda":
+                local_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+            finite_flag = torch.tensor(
+                [1 if all(torch.isfinite(grad).all() for grad in local_grads) else 0], device=local_device
+            )
+            torch.distributed.all_reduce(finite_flag, op=torch.distributed.ReduceOp.MIN, group=group)
+            all_finite = bool(finite_flag.item())
+        else:
+            all_finite = all(torch.isfinite(grad).all().item() for grad in local_grads)
+
+        if not all_finite:
+            for param in state.local_params.values():
+                param.grad = None
+            raise FloatingPointError(
+                f"Non-finite adapter gradient detected for model_id={model_id}; "
+                "all ranks skipped the optimizer step and cleared gradients."
+            )
+
+        if gradient_clip is None or gradient_clip <= 0:
+            clipping_enabled = False
+        else:
+            clipping_enabled = True
+
+        if math.isinf(float(norm_type)):
+            local_max = torch.zeros((), dtype=torch.float32, device=local_device)
+            for param in optimizer_params:
+                if param.grad is not None:
+                    local_max = torch.maximum(local_max, param.grad.detach().to(torch.float32).abs().max())
+            if distributed and world > 1:
+                torch.distributed.all_reduce(local_max, op=torch.distributed.ReduceOp.MAX, group=group)
+            grad_norm = float(local_max.item())
+        elif float(norm_type) == 2.0:
+            local_sum_sq = torch.zeros((), dtype=torch.float32, device=local_device)
+            for name in sorted(state.local_params):
+                param = state.local_params[name]
+                if param.grad is None or param.numel() == 0:
+                    continue
+                grad_sum_sq = param.grad.detach().to(torch.float32).square().sum()
+                local_sum_sq = local_sum_sq + grad_sum_sq / max(state.tensor_layouts[name].replica_count, 1)
+            if distributed and world > 1:
+                torch.distributed.all_reduce(local_sum_sq, op=torch.distributed.ReduceOp.SUM, group=group)
+            grad_norm = float(torch.sqrt(local_sum_sq).item())
+        else:
+            raise ValueError(f"Unsupported adapter gradient norm type: {norm_type!r}")
+
+        clip_coefficient = 1.0
+        if clipping_enabled:
+            clip_coefficient = min(1.0, float(gradient_clip) / (grad_norm + 1e-6))
+            if clip_coefficient != 1.0:
+                for param in optimizer_params:
+                    if param.grad is not None:
+                        param.grad.mul_(clip_coefficient)
+
         state.optimizer.step()
-        state.optimizer.zero_grad()
-
-        # Increment step counter
+        if self.device.type == "cuda":
+            torch.cuda.current_stream(self.device).synchronize()
+        try:
+            state.optimizer.zero_grad(set_to_none=True)
+        except TypeError:
+            state.optimizer.zero_grad()
         state.global_step += 1
-
         return grad_norm
 
     def sync_weights_to_model(self, model_id: str) -> None:
@@ -1225,7 +1270,7 @@ class LoRAAdapterManager:
         usage = {}
         for model_id, state in self.adapters.items():
             # Calculate parameter memory
-            param_bytes = sum(p.numel() * p.element_size() for p in state.lora_params.values())
+            param_bytes = sum(p.numel() * p.element_size() for p in state.local_params.values())
 
             # Calculate optimizer state memory (AdamW stores exp_avg and exp_avg_sq)
             optim_bytes = 0
@@ -1236,6 +1281,83 @@ class LoRAAdapterManager:
 
             usage[model_id] = param_bytes + optim_bytes
         return usage
+
+    def iter_local_optimizer_params(self, model_id: str):
+        """Iterate active non-empty local parameters in optimizer order."""
+
+        state = self.get_adapter_state(model_id)
+        for name in sorted(state.local_params):
+            param = state.local_params[name]
+            if param.numel() > 0:
+                yield name, param
+
+    def get_layout(self, model_id: str, fqn: str) -> AdapterTensorLayout:
+        """Return the captured layout for one adapter tensor."""
+
+        state = self.get_adapter_state(model_id)
+        try:
+            return state.tensor_layouts[fqn]
+        except KeyError:
+            canonical = canonical_parameter_name(fqn)
+            for name, layout in state.tensor_layouts.items():
+                if layout.fqn == canonical:
+                    return layout
+            raise KeyError(f"No adapter layout for {fqn!r}") from None
+
+    def materialize_logical_state_dict(self, model_id: str, *, destination_rank: int = 0) -> Dict[str, torch.Tensor]:
+        """Collectively reconstruct full active logical weights for cold paths."""
+
+        self.prepare_forward(model_id)
+        from xorl.lora.utils import get_lora_state_dict  # noqa: PLC0415
+
+        state_dict = get_lora_state_dict(self.model)
+        rank, _world = _optimizer_shard_rank_world()
+        return state_dict if rank == destination_rank else {}
+
+    def load_logical_state_dict(self, model_id: str, state_dict: Dict[str, torch.Tensor]) -> None:
+        """Pack full active logical tensors into this rank's local adapter slots."""
+
+        state = self.get_adapter_state(model_id)
+        packed = self._pack_logical_state_dict(state, state_dict)
+        with torch.no_grad():
+            for name, local_slot in packed.items():
+                state.local_params[name].data.copy_(local_slot.to(self.device, state.local_params[name].dtype))
+
+    def _pack_logical_state_dict(
+        self, state: AdapterState, state_dict: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """Validate and pack an external logical state without mutating state."""
+
+        expected_names = {canonical_parameter_name(name): name for name in state.local_params}
+        expected_shapes = {
+            canonical_parameter_name(name): layout.logical_shape for name, layout in state.tensor_layouts.items()
+        }
+        converted = convert_peft_lora_state_dict(state_dict, expected_shapes=expected_shapes)
+        converted_by_name = {canonical_parameter_name(name): tensor for name, tensor in converted.items()}
+        missing = sorted(set(expected_names) - set(converted_by_name))
+        unexpected = sorted(set(converted_by_name) - set(expected_names))
+        if missing or unexpected:
+            raise ValueError(
+                "Logical adapter parameter set does not match the live adapter structure. "
+                f"missing={missing!r}, unexpected={unexpected!r}"
+            )
+        packed: Dict[str, torch.Tensor] = {}
+        for canonical_name, actual_name in expected_names.items():
+            layout = state.tensor_layouts[actual_name]
+            logical_tensor = converted_by_name[canonical_name]
+            if tuple(logical_tensor.shape) == layout.logical_shape:
+                local_slot = pack_logical_tensor(layout, logical_tensor)
+            elif tuple(logical_tensor.shape) == layout.active_storage_shape:
+                # Explicitly tolerate a local-only legacy payload only when
+                # it is unambiguous; new portable checkpoints are logical.
+                local_slot = logical_tensor
+            else:
+                raise ValueError(
+                    f"Logical adapter tensor {canonical_name!r} has shape {tuple(logical_tensor.shape)}, "
+                    f"expected {layout.logical_shape}"
+                )
+            packed[actual_name] = local_slot
+        return packed
 
     @staticmethod
     def _optimizer_state_metadata(optimizer: torch.optim.Optimizer) -> Dict[str, Any]:
@@ -1285,11 +1407,11 @@ class LoRAAdapterManager:
         state = self.adapters[model_id]
 
         _rank, world = _optimizer_shard_rank_world()
-        if save_optimizer and world > 1:
+        if world > 1:
             raise RuntimeError(
-                "LoRAAdapterManager.save_adapter_state is noncollective and cannot preserve every rank's "
-                "optimizer shard. Use CheckpointManager.save_adapter_state collectively, or pass "
-                "save_optimizer=False for a weights-only checkpoint."
+                "LoRAAdapterManager.save_adapter_state is noncollective and cannot materialize complete logical "
+                "weights or preserve rank-local optimizer shards at world_size > 1. Use "
+                "CheckpointManager.save_adapter_state collectively."
             )
 
         # Use default path if not provided
@@ -1305,10 +1427,10 @@ class LoRAAdapterManager:
 
         # 1. Save LoRA weights in safetensors format (PEFT-compatible)
         # Convert parameter names to PEFT format: base_model.model.{name}
-        raw_weights = {name: param.data.detach() for name, param in state.lora_params.items()}
-        # Adapter-owned tensors are already compacted to that session's rank.
-        # Do not slice against the live model: LRU eviction can save a different
-        # adapter than the one currently loaded into the model scratch space.
+        raw_weights = {name: param.data.detach() for name, param in state.local_params.items()}
+        # At world size one the local slot is also the complete active logical
+        # tensor. Distributed saves use CheckpointManager's collective model
+        # reconstruction path instead.
         active_weights = raw_weights
         weights_dict = {}
         for name, tensor in active_weights.items():
@@ -1351,6 +1473,8 @@ class LoRAAdapterManager:
             "save_optimizer": save_optimizer,
             "optimizer": deepcopy(checkpoint_session_spec["optimizer_config"]),
             "optimizer_state": self._optimizer_state_metadata(state.optimizer),
+            "layout_fingerprint": state.layout_fingerprint,
+            "layout_descriptors": [state.tensor_layouts[name].to_json_dict() for name in sorted(state.tensor_layouts)],
         }
         metadata_path = os.path.join(path, "metadata.json")
         with open(metadata_path, "w") as f:
@@ -1502,7 +1626,7 @@ class LoRAAdapterManager:
         resident_snapshot = None
         if not registered_here:
             resident_snapshot = {
-                "lora_params": {name: _clone_state_to_cpu(param) for name, param in state.lora_params.items()},
+                "local_params": {name: _clone_state_to_cpu(param) for name, param in state.local_params.items()},
                 "optimizer": _clone_state_to_cpu(state.optimizer.state_dict()),
                 "session_spec": deepcopy(state.session_spec),
                 "global_step": state.global_step,
@@ -1512,55 +1636,14 @@ class LoRAAdapterManager:
             }
 
         try:
-            # 3. Load LoRA weights
+            # 3. Validate and pack logical LoRA weights without mutating the
+            # resident adapter. The model-local adapter slots are never saved
+            # as if they were complete PEFT tensors in distributed mode.
             weights_path = os.path.join(path, "adapter_model.safetensors")
             sharded_index_path = os.path.join(path, "adapter_model.safetensors.index.json")
             if os.path.exists(weights_path) or os.path.exists(sharded_index_path):
                 loaded_weights = load_lora_checkpoint_state_dict(path)
-                expected_param_map: Dict[str, str] = {}
-                expected_shapes: Dict[str, torch.Size] = {}
-                for actual_name in state.lora_params:
-                    canonical_name = self._canonical_lora_param_name(actual_name)
-                    if canonical_name in expected_param_map and expected_param_map[canonical_name] != actual_name:
-                        raise ValueError(
-                            f"Live adapter contains duplicate LoRA tensors after canonicalization. param={canonical_name!r}"
-                        )
-                    expected_param_map[canonical_name] = actual_name
-                    expected_shapes[canonical_name] = state.lora_params[actual_name].shape
-
-                expected_shard_specs = get_lora_tensor_shard_specs(self.model, names=expected_shapes.keys())
-                converted_weights = convert_peft_lora_state_dict(
-                    loaded_weights,
-                    expected_shapes=expected_shapes,
-                    expected_shard_specs=expected_shard_specs,
-                )
-                checkpoint_tensors: Dict[str, torch.Tensor] = {}
-                for converted_name, weight in converted_weights.items():
-                    canonical_name = self._canonical_lora_param_name(converted_name)
-                    if canonical_name in checkpoint_tensors:
-                        raise ValueError(
-                            f"Checkpoint contains duplicate LoRA tensors after canonicalization. param={canonical_name!r}"
-                        )
-                    checkpoint_tensors[canonical_name] = weight.to(self.device)
-
-                expected_param_names = set(expected_param_map)
-                checkpoint_param_names = set(checkpoint_tensors)
-                missing_param_names = sorted(expected_param_names - checkpoint_param_names)
-                unexpected_param_names = sorted(checkpoint_param_names - expected_param_names)
-                if missing_param_names or unexpected_param_names:
-                    raise ValueError(
-                        "Checkpoint LoRA parameter set does not match the live adapter structure. "
-                        f"missing={missing_param_names!r}, unexpected={unexpected_param_names!r}"
-                    )
-
-                for internal_name, tensor in checkpoint_tensors.items():
-                    target_param = state.lora_params[expected_param_map[internal_name]]
-                    if tuple(tensor.shape) != tuple(target_param.shape):
-                        raise ValueError(
-                            "Checkpoint tensor shape does not match the live adapter shape. "
-                            f"param={internal_name!r}, checkpoint={tuple(tensor.shape)!r}, "
-                            f"live={tuple(target_param.shape)!r}"
-                        )
+                packed_checkpoint = self._pack_logical_state_dict(state, loaded_weights)
 
             else:
                 raise FileNotFoundError(f"Weights file not found: {weights_path}")
@@ -1578,8 +1661,8 @@ class LoRAAdapterManager:
 
             # All checkpoint components are valid. Commit the LoRA tensors only
             # after optimizer restore succeeds.
-            for internal_name, tensor in checkpoint_tensors.items():
-                state.lora_params[expected_param_map[internal_name]].data.copy_(tensor)
+            for name, tensor in packed_checkpoint.items():
+                state.local_params[name].data.copy_(tensor.to(self.device, state.local_params[name].dtype))
 
             # 5. Restore metadata
             state.global_step = metadata.get("global_step", 0)
@@ -1605,8 +1688,8 @@ class LoRAAdapterManager:
             elif resident_snapshot is not None:
                 try:
                     with torch.no_grad():
-                        for name, tensor in resident_snapshot["lora_params"].items():
-                            state.lora_params[name].copy_(tensor)
+                        for name, tensor in resident_snapshot["local_params"].items():
+                            state.local_params[name].copy_(tensor)
                     state.optimizer.load_state_dict(resident_snapshot["optimizer"])
                     state.session_spec = resident_snapshot["session_spec"]
                     state.global_step = resident_snapshot["global_step"]

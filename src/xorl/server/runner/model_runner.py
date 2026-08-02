@@ -57,7 +57,6 @@ from xorl.distributed.pipeline_parallel import (
 )
 from xorl.distributed.sequence_parallel.data import gather_outputs
 from xorl.lora import LoraLinear
-from xorl.lora.utils import get_lora_state_dict
 from xorl.models.layers.moe.routing_replay import set_replay_stage
 from xorl.models.transformers.deepseek_v3.support import deepseek_v3_default_lora_targets
 from xorl.models.transformers.glm5.support import glm5_default_lora_targets
@@ -801,61 +800,28 @@ class ModelRunner:
                 )
                 self._sync_registered_lora_session_spec(model_id)
 
-            adapter_state = self._adapter_manager.get_adapter_state(model_id)
             b_sigma = float(zorl_state.config["b_sigma"])
             perturbation_mode = str(zorl_state.config.get("perturbation_mode", "b_only"))
-            # With EP enabled, adapter_state.lora_params are rank-local
-            # (num_local_experts per rank). Gather across EP ranks once so every
-            # candidate writes the full-expert state. This is a collective op —
-            # all ranks must call it even though only rank 0 writes files. Key
-            # off train_config.expert_parallel_size (guaranteed consistent
-            # across ranks) rather than `model._fqn2spec_info` — a rank-local
-            # attribute predicate would deadlock if any rank's check disagreed
-            # with the others.
-            model = getattr(self, "model", None)
             ep_size = int(self.train_config.get("expert_parallel_size", 1)) if self.train_config else 1
-            has_ep = ep_size > 1 and model is not None
             if perturbation_mode == "fresh_ab" and ep_size > 1:
-                # The fresh_ab fold draws its seeded noise from the adapter's
-                # rank-local parameter shapes; with EP > 1 the candidate export
-                # gathers to full-expert shapes so the export and fold noise
-                # streams would diverge. Reject rather than silently corrupt.
                 raise NotImplementedError(
-                    "ZORL perturbation_mode='fresh_ab' does not support expert_parallel_size > 1 "
-                    "(export noise is drawn on EP-gathered shapes; the base fold is rank-local)"
+                    "ZORL perturbation_mode='fresh_ab' does not support expert_parallel_size > 1; "
+                    "the base-weight folding path remains intentionally fail-closed."
                 )
-            if has_ep:
-                gathered_lora = get_lora_state_dict(model)
-                # Strip FSDP/compile wrappers and map to adapter_state.lora_params keys.
-                gathered_by_key: Dict[str, torch.Tensor] = {}
-                for raw_name, tensor in gathered_lora.items():
-                    clean = raw_name.replace("_fsdp_wrapped_module.", "").replace("_orig_mod.", "")
-                    gathered_by_key[clean] = tensor
+            # Candidate generation is a cold path and must use full logical
+            # active-rank tensors under every topology.  Each rank participates
+            # in the model gather so local candidate materialization remains
+            # deterministic; only the configured writer emits files.
+            gathered_lora = self._adapter_manager.materialize_logical_state_dict(model_id, destination_rank=self.rank)
 
-                # Build nn.Parameter-like wrapper objects so build_zorl_candidate_lora_state_dict
-                # works unchanged (it accesses .data on each value).
-                class _TensorView:
-                    __slots__ = ("data", "shape")
+            class _TensorView:
+                __slots__ = ("data", "shape")
 
-                    def __init__(self, t: torch.Tensor):
-                        self.data = t
-                        self.shape = t.shape
+                def __init__(self, t: torch.Tensor):
+                    self.data = t
+                    self.shape = t.shape
 
-                source_params: Dict[str, Any] = {
-                    name: _TensorView(gathered_by_key[name])
-                    for name in adapter_state.lora_params.keys()
-                    if name in gathered_by_key
-                }
-                missing = set(adapter_state.lora_params.keys()) - set(source_params.keys())
-                if missing:
-                    logger.warning(
-                        f"ZORL gather: {len(missing)} adapter keys missing from model gather; "
-                        f"falling back to rank-local for those: {sorted(missing)[:3]}..."
-                    )
-                    for n in missing:
-                        source_params[n] = adapter_state.lora_params[n]
-            else:
-                source_params = adapter_state.lora_params
+            source_params: Dict[str, Any] = {name: _TensorView(tensor) for name, tensor in gathered_lora.items()}
             candidates: List[Dict[str, Any]] = []
             for candidate in local_candidates_to_export:
                 candidate_id = validate_identifier(candidate.candidate_id, name="candidate_id")
@@ -1048,7 +1014,7 @@ class ModelRunner:
             )
         else:
             update, update_norm = build_zorl_update_from_rewards(
-                adapter_state.lora_params,
+                adapter_state.local_params,
                 pair_seeds_and_scores=[
                     (b_seed, normalized_score)
                     for (b_seed, _a_seed, _raw_score), normalized_score in zip(
@@ -1057,9 +1023,9 @@ class ModelRunner:
                 ],
             )
 
-            for param in adapter_state.lora_params.values():
+            for param in adapter_state.local_params.values():
                 param.grad = None
-            for name, param in adapter_state.lora_params.items():
+            for name, param in adapter_state.local_params.items():
                 if "lora_B" not in name:
                     continue
                 param.grad = (-update[name]).to(device=param.device, dtype=param.dtype)
@@ -1230,13 +1196,22 @@ class ModelRunner:
 
         Returns (update_norm, grad_norm).
         """
-        adapter_state = self._adapter_manager.get_adapter_state(model_id)
         session_spec = self.get_lora_session_spec(model_id)
         lora_config = session_spec["lora_config"]
         scaling = float(lora_config["lora_alpha"]) / float(lora_config["lora_rank"])
 
+        logical_lora = self._adapter_manager.materialize_logical_state_dict(model_id, destination_rank=self.rank)
+
+        class _LogicalParam:
+            __slots__ = ("data", "shape")
+
+            def __init__(self, tensor: torch.Tensor):
+                self.data = tensor
+                self.shape = tensor.shape
+
+        logical_params = {name: _LogicalParam(tensor) for name, tensor in logical_lora.items()}
         updates, update_norm = build_zorl_fresh_ab_base_update_from_rewards(
-            adapter_state.lora_params,
+            logical_params,
             pair_seeds_and_scores=pair_seeds_and_scores,
             scaling=scaling,
         )
@@ -7418,16 +7393,9 @@ class ModelRunner:
             capture_snapshots = snapshot_sparse_delta_tensors(self.model, capture_config)
             capture_snapshot_s = time.perf_counter() - t_capture
 
-        # Determine gradient clip value
-        # If gradient_clip is provided, use it; otherwise fall back to config
-        # Default to a large value (10000.0) to ensure we always use the
-        # distributed-aware clip_grad_norm_ path for correct grad norm computation.
-        # This effectively means "no clipping" while still computing grad_norm correctly.
-        DEFAULT_MAX_GRAD_NORM = 10000.0
-        if gradient_clip is not None:
-            clip_value = gradient_clip
-        else:
-            clip_value = self.train_config.get("max_grad_norm", DEFAULT_MAX_GRAD_NORM)
+        # A missing/non-positive threshold means disabled clipping, but the
+        # adapter manager still computes and reports the real logical norm.
+        clip_value = gradient_clip if gradient_clip is not None else self.train_config.get("max_grad_norm")
 
         # Pop accumulated valid tokens for this model_id (deferred normalization)
         accumulated = self._accumulated_valid_tokens.pop(model_id, 0)

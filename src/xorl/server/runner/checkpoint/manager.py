@@ -214,8 +214,12 @@ class CheckpointManager:
             "lr": adapter_state.lr,
             "timestamp": time.time(),
             "save_optimizer": save_optimizer,
-            "optimizer_format": "sharded_v1" if save_optimizer else None,
+            "optimizer_format": "sharded_v2" if save_optimizer else None,
             "optimizer": adapter_state.session_spec["optimizer_config"],
+            "layout_fingerprint": adapter_state.layout_fingerprint,
+            "layout_descriptors": [
+                adapter_state.tensor_layouts[name].to_json_dict() for name in sorted(adapter_state.tensor_layouts)
+            ],
         }
         metadata_path = os.path.join(path, "metadata.json")
         with open(metadata_path, "w") as f:
@@ -228,25 +232,10 @@ class CheckpointManager:
                 json.dump(target_manifest, f, indent=2, sort_keys=True)
 
     def _gather_adapter_lora_params(self, model_id: str) -> Dict[str, torch.Tensor]:
-        """Gather LoRA params from adapter manager with EP support.
-
-        Fast alternative to get_lora_state_dict(): uses the adapter manager's
-        stored full-tensor params directly (no FSDP unshard needed). Only needs
-        a dist.gather for EP-sharded expert LoRA params.
-
-        Returns complete state dict on rank 0, empty dict on other ranks.
-
-        No EP gather needed: ``AdapterState.lora_params`` already stores
-        tensors at global shape (see ``register_adapter``).
-        """
-        lora_state_dict: Dict[str, torch.Tensor] = {}
-
-        if self.rank == 0:
-            state = self._adapter_manager.adapters[model_id]
-            for name, param in state.lora_params.items():
-                lora_state_dict[name] = param.data.cpu()
-
-        return lora_state_dict
+        """Collectively reconstruct full active logical tensors on rank 0."""
+        if self._adapter_manager is None:
+            return get_lora_state_dict(self.model)
+        return self._adapter_manager.materialize_logical_state_dict(model_id, destination_rank=self.rank)
 
     @staticmethod
     def _infer_lora_rank_dim(name: str, tensor: torch.Tensor) -> Optional[int]:
@@ -303,27 +292,10 @@ class CheckpointManager:
         if self._adapter_manager is not None:
             self._adapter_manager.switch_adapter(model_id, auto_register=True)
 
-        # Use fast adapter-manager path when available (avoids FSDP unshard).
-        # Skip the fast path for MoE LoRA: adapter-manager params are rank-local
-        # under EP, so exporting them directly would drop non-local experts.
-        configured_target_modules = self.lora_config.get("lora_target_modules")
-        lora_target_modules = getattr(self, "lora_target_modules", None) or configured_target_modules or []
-        has_moe_targets = any(module in lora_target_modules for module in ("gate_proj", "up_proj", "down_proj"))
-        has_stacked_moe_lora_params = any(
-            "_lora_" in name and ".experts." in name for name, _param in self.model.named_parameters()
-        )
-        is_moe_lora = bool(self.lora_config.get("moe_hybrid_shared_lora", False)) or (
-            has_moe_targets and (has_stacked_moe_lora_params or configured_target_modules is not None)
-        )
-        if self._adapter_manager is not None and model_id in self._adapter_manager.adapters and not is_moe_lora:
-            logger.info(f"Rank {self.rank}: Using fast adapter-manager LoRA save path")
-            lora_state_dict = self._gather_adapter_lora_params(model_id)
-        else:
-            # Fallback: EP+FSDP2-aware LoRA weight gathering (collective operation)
-            logger.info(
-                f"Rank {self.rank}: Using collective (EP+FSDP2-aware) LoRA save path (is_moe_lora={is_moe_lora})"
-            )
-            lora_state_dict = get_lora_state_dict(self.model)
+        # Always reconstruct logical tensors through the model's EP+FSDP path;
+        # adapter optimizer slots are rank-local and are never PEFT payloads.
+        logger.info(f"Rank {self.rank}: Using collective topology-aware LoRA weight gathering")
+        lora_state_dict = self._gather_adapter_lora_params(model_id)
 
         # Only rank 0 writes files
         if self.rank == 0:

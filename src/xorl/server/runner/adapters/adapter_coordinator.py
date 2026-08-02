@@ -20,9 +20,8 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-from safetensors.torch import load_file as safetensors_load_file
 
-from xorl.lora.utils import convert_peft_lora_state_dict, get_lora_tensor_shard_specs
+from xorl.lora.utils import load_lora_checkpoint_state_dict
 from xorl.server.protocol.operations import (
     AdapterStateData,
     KillSessionData,
@@ -77,7 +76,7 @@ class AdapterCoordinator:
 
     def broadcast_adapter_state(self, model_id: str, default_lr: float) -> None:
         """
-        Broadcast adapter weights and metadata from rank 0 to all other ranks.
+        Broadcast deterministic-registration metadata from rank 0 to all other ranks.
 
         Args:
             model_id: The adapter/session ID to broadcast
@@ -89,9 +88,9 @@ class AdapterCoordinator:
 
         adapter_state = self.trainer.adapter_manager.get_adapter_state(model_id)
 
-        # Broadcast each parameter
-        for name, param in adapter_state.lora_params.items():
-            dist.broadcast(param.data, src=0)
+        # Fresh registration is deterministic and collective.  Only small
+        # metadata is broadcast here; rank-local adapter bytes must never be
+        # copied from rank 0 because ranks can own disjoint rectangles.
 
         # Broadcast metadata
         metadata = [None]
@@ -114,64 +113,16 @@ class AdapterCoordinator:
 
         logger.debug(f"Rank {self.rank}: Broadcast adapter state for model_id={model_id}")
 
-    @staticmethod
-    def _optimizer_state_to_cpu(value: Any) -> Any:
-        """Recursively move optimizer state dict tensors to CPU for object broadcast."""
-        if isinstance(value, torch.Tensor):
-            return value.detach().cpu()
-        if isinstance(value, dict):
-            return {k: AdapterCoordinator._optimizer_state_to_cpu(v) for k, v in value.items()}
-        if isinstance(value, list):
-            return [AdapterCoordinator._optimizer_state_to_cpu(v) for v in value]
-        if isinstance(value, tuple):
-            return tuple(AdapterCoordinator._optimizer_state_to_cpu(v) for v in value)
-        return value
-
     def broadcast_adapter_optimizer_state(self, model_id: str) -> None:
-        """Broadcast adapter optimizer state from rank 0 to all other ranks."""
+        """Deprecated no-op: optimizer state is topology-specific and not broadcastable."""
         if self.world_size <= 1:
             return
         self._validate_pipeline_parallel_broadcast_safe()
-
-        adapter_state = self.trainer.adapter_manager.get_adapter_state(model_id)
-        optimizer_state = [None]
-        if self.rank == 0:
-            optimizer_state[0] = self._optimizer_state_to_cpu(adapter_state.optimizer.state_dict())
-
-        dist.broadcast_object_list(optimizer_state, src=0, group=self.cpu_group)
-
-        if self.rank != 0 and optimizer_state[0] is not None:
-            adapter_state.optimizer.load_state_dict(optimizer_state[0])
-
-    def _has_ep_sharded_adapter_params(self, model_id: str) -> bool:
-        """Return whether the resident adapter has LoRA tensors sharded by EP."""
-        adapter_manager = self.trainer.adapter_manager
-        model = getattr(adapter_manager, "model", getattr(self.trainer, "model", None))
-        if adapter_manager is None or model is None or not adapter_manager.has_adapter(model_id):
-            return False
-
-        canonical_name = getattr(adapter_manager, "_canonical_lora_param_name", lambda name: name)
-        state = adapter_manager.get_adapter_state(model_id)
-        requested_names = {canonical_name(name) for name in state.lora_params}
-        return bool(get_lora_tensor_shard_specs(model, names=requested_names))
-
-    def _expected_adapter_param_maps(self, model_id: str) -> Tuple[Dict[str, str], Dict[str, torch.Size]]:
-        """Build canonical-name maps for the live adapter tensors."""
-        adapter_manager = self.trainer.adapter_manager
-        state = adapter_manager.get_adapter_state(model_id)
-        expected_param_map: Dict[str, str] = {}
-        expected_shapes: Dict[str, torch.Size] = {}
-
-        for actual_name, param in state.lora_params.items():
-            canonical_name = adapter_manager._canonical_lora_param_name(actual_name)
-            if canonical_name in expected_param_map and expected_param_map[canonical_name] != actual_name:
-                raise ValueError(
-                    f"Live adapter contains duplicate LoRA tensors after canonicalization. param={canonical_name!r}"
-                )
-            expected_param_map[canonical_name] = actual_name
-            expected_shapes[canonical_name] = param.shape
-
-        return expected_param_map, expected_shapes
+        logger.debug(
+            "Rank %s: refusing rank-0 optimizer broadcast for local-shard adapter %s; use all_ranks checkpoint restore",
+            self.rank,
+            model_id,
+        )
 
     @staticmethod
     def _strip_optimizer_config(session_spec: Dict[str, Any]) -> Dict[str, Any]:
@@ -250,10 +201,12 @@ class AdapterCoordinator:
                     metadata = {}
 
                 weights_path = os.path.join(path, "adapter_model.safetensors")
-                if not os.path.exists(weights_path):
+                if not os.path.exists(weights_path) and not os.path.exists(
+                    os.path.join(path, "adapter_model.safetensors.index.json")
+                ):
                     raise FileNotFoundError(f"Weights file not found: {weights_path}")
 
-                loaded_weights = safetensors_load_file(weights_path)
+                loaded_weights = load_lora_checkpoint_state_dict(path)
                 payload[0] = {
                     "error": None,
                     "session_spec": checkpoint_session_spec,
@@ -290,45 +243,9 @@ class AdapterCoordinator:
             load_optimizer=load_optimizer,
             lr=lr,
         )
-        expected_param_map, expected_shapes = self._expected_adapter_param_maps(model_id)
-        expected_shard_specs = get_lora_tensor_shard_specs(adapter_manager.model, names=expected_shapes.keys())
-
-        converted_weights = convert_peft_lora_state_dict(
-            payload["weights"],
-            expected_shapes=expected_shapes,
-            expected_shard_specs=expected_shard_specs,
-        )
-
-        checkpoint_tensors: Dict[str, torch.Tensor] = {}
-        for converted_name, weight in converted_weights.items():
-            canonical_name = adapter_manager._canonical_lora_param_name(converted_name)
-            if canonical_name in checkpoint_tensors:
-                raise ValueError(
-                    f"Checkpoint contains duplicate LoRA tensors after canonicalization. param={canonical_name!r}"
-                )
-            checkpoint_tensors[canonical_name] = weight
-
-        expected_param_names = set(expected_param_map)
-        checkpoint_param_names = set(checkpoint_tensors)
-        missing_param_names = sorted(expected_param_names - checkpoint_param_names)
-        unexpected_param_names = sorted(checkpoint_param_names - expected_param_names)
-        if missing_param_names or unexpected_param_names:
-            raise ValueError(
-                "Checkpoint LoRA parameter set does not match the live adapter structure. "
-                f"missing={missing_param_names!r}, unexpected={unexpected_param_names!r}"
-            )
-
-        for internal_name, tensor in checkpoint_tensors.items():
-            target_param = state.lora_params[expected_param_map[internal_name]]
-            if tuple(tensor.shape) != tuple(target_param.shape):
-                raise ValueError(
-                    "Checkpoint tensor shape does not match the live adapter shape. "
-                    f"param={internal_name!r}, checkpoint={tuple(tensor.shape)!r}, "
-                    f"live={tuple(target_param.shape)!r}"
-                )
-
-        for internal_name, tensor in checkpoint_tensors.items():
-            target_param = state.lora_params[expected_param_map[internal_name]]
+        packed = adapter_manager._pack_logical_state_dict(state, payload["weights"])
+        for name, tensor in packed.items():
+            target_param = state.local_params[name]
             target_param.data.copy_(tensor.to(device=target_param.device, dtype=target_param.dtype))
 
         metadata = payload.get("metadata", {})
@@ -348,7 +265,8 @@ class AdapterCoordinator:
         load_optimizer: bool,
         lr: Optional[float],
     ) -> Dict[str, Any]:
-        """Restore an EP-sharded LoRA adapter without broadcasting rank 0's local expert slice."""
+        """Restore logical adapter weights without broadcasting rank 0's local slice."""
+        self._validate_pipeline_parallel_broadcast_safe()
         start_time = time.time()
         payload = self._rank0_load_adapter_checkpoint_payload(model_id, path, load_optimizer)
         self._apply_broadcast_adapter_checkpoint_payload(
@@ -358,12 +276,10 @@ class AdapterCoordinator:
             lr=lr,
         )
 
-        if payload.get("optimizer_present") and self.rank == 0:
-            logger.warning(
-                "Skipping optimizer restore for EP-sharded rank0_broadcast adapter load: optimizer state is "
-                "rank-local (sharded manifest or legacy optimizer.pt). For a full optimizer resume use "
-                "adapter_state_load_mode=all_ranks on a shared filesystem. Adapter weights and metadata "
-                "were restored safely."
+        if payload.get("optimizer_present") and load_optimizer:
+            raise RuntimeError(
+                "rank0_broadcast cannot restore topology-specific adapter optimizer shards. "
+                "Use adapter_state_load_mode=all_ranks for an optimizer resume, or set load_optimizer=False."
             )
 
         state = self.trainer.adapter_manager.get_adapter_state(model_id)
@@ -495,11 +411,13 @@ class AdapterCoordinator:
     ) -> Dict[str, Any]:
         """Restore adapter state using the configured rank loading strategy."""
         mode = self._get_adapter_state_load_mode()
+        if mode == "rank0_broadcast" and self.world_size > 1:
+            self._validate_pipeline_parallel_broadcast_safe()
         result = None
         local_error = None
 
         try:
-            if mode == "rank0_broadcast" and self.world_size > 1 and self._has_ep_sharded_adapter_params(model_id):
+            if mode == "rank0_broadcast" and self.world_size > 1:
                 result = self._restore_ep_sharded_rank0_broadcast_adapter_state(
                     model_id=model_id,
                     path=path,
@@ -529,12 +447,8 @@ class AdapterCoordinator:
             raise RuntimeError(synced_error)
 
         # In all_ranks mode every rank has loaded its own local tensor contents.
-        # The EP-sharded rank0_broadcast path also materializes each rank's local
-        # expert slice directly from the full checkpoint tensors.
-        if mode == "rank0_broadcast" and not self._has_ep_sharded_adapter_params(model_id):
-            self.broadcast_adapter_state(model_id, default_lr)
-            if load_optimizer and self.world_size > 1:
-                self.broadcast_adapter_optimizer_state(model_id)
+        # Rank-0 broadcast mode packed the full logical payload independently on
+        # every rank; no raw adapter or optimizer broadcast is needed.
 
         if result is None:
             adapter_state = self.trainer.adapter_manager.get_adapter_state(model_id)
@@ -795,8 +709,8 @@ class AdapterCoordinator:
         """
         Handle save adapter state request.
 
-        ALL ranks must call this method because it uses full_tensor()
-        which is a collective operation. Only rank 0 writes files.
+        ALL ranks must call this method because logical reconstruction is
+        collective. Only rank 0 writes files.
 
         Args:
             command_dict: Command dictionary with model_id, path, save_optimizer
@@ -837,8 +751,8 @@ class AdapterCoordinator:
         Handle load adapter state request.
 
         Restores adapter state according to `lora.adapter_state_load_mode`:
-        either all ranks read the checkpoint locally, or rank 0 reads it and
-        broadcasts weights, metadata, and optimizer state.
+        either all ranks read the checkpoint locally, or rank 0 reads logical
+        weights and metadata and every rank packs its own local rectangles.
 
         Args:
             command_dict: Command dictionary with model_id, path, load_optimizer, lr

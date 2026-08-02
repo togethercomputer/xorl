@@ -96,8 +96,12 @@ def test_save_writes_sharded_optimizer_with_manifest(tmp_path: Path):
     assert not os.path.exists(os.path.join(path, "optimizer.pt"))
     with open(os.path.join(path, OPTIMIZER_SHARD_MANIFEST_FILENAME)) as f:
         manifest = json.load(f)
-    assert manifest["format_version"] == 2
+    assert manifest["format_version"] == 3
     assert manifest["world_size"] == 1
+    assert manifest["per_rank_layout_fingerprint"] == [manager.get_adapter_state("resume-a").layout_fingerprint]
+    assert manifest["optimizer_parameter_order"] == sorted(
+        name for name, param in manager.get_adapter_state("resume-a").local_params.items() if param.numel() > 0
+    )
     state = manager.get_adapter_state("resume-a")
     assert manifest["per_rank_param_structure_sha256"] == [_adapter_param_structure_fingerprint(state.lora_params)]
 
