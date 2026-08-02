@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import gc
 import json
+import weakref
 
 import torch
 import torch.nn as nn
@@ -161,6 +163,29 @@ def test_fused_gdn_merged_weight_cache_is_bounded_by_current_slices(monkeypatch)
 
     current_weights = [entry["weight"] for entry in module._merged_weight_cache["slices"].values()]
     assert all(weight is not retained for weight in previous_weights[:-2] for retained in current_weights)
+
+
+def test_fused_gdn_merged_weight_cache_releases_previous_request_generation(monkeypatch):
+    monkeypatch.setenv("XORL_LORA_MERGED_FORWARD", "1")
+    module = LoraDeltaLinear(8, 12, r=2, lora_alpha=4, dtype=torch.float32)
+    first_base = torch.randn(5, 8)
+    second_base = torch.randn(7, 8)
+
+    first = module._merged_weight(first_base, output_start=0, output_end=5)
+    second = module._merged_weight(second_base, output_start=5, output_end=12)
+    previous_generation = (weakref.ref(first), weakref.ref(second))
+    del first, second
+
+    # Match AdapterManager.prepare_forward(): copying adapter values into the
+    # model bumps parameter versions at each serialized request boundary.
+    with torch.no_grad():
+        module.lora_A.copy_(module.lora_A)
+        module.lora_B.copy_(module.lora_B)
+    module._merged_weight(first_base, output_start=0, output_end=5)
+    module._merged_weight(second_base, output_start=5, output_end=12)
+    gc.collect()
+
+    assert all(reference() is None for reference in previous_generation)
 
 
 def test_fused_gdn_output_projection_merged_forward_matches_canonical_fold(monkeypatch):

@@ -116,6 +116,11 @@ class LoraDeltaLinear(LoraModule, nn.Module):
             self.active_r,
             self.active_lora_alpha,
         )
+        # AdapterManager.prepare_forward() copies the active adapter into these
+        # parameters for every top-level forward_backward request, incrementing
+        # their versions even while accumulating into the same optimizer step.
+        # Evict the previous generation so serialized requests cannot retain one
+        # complete set of folded GDN weights each.
         slice_key = (start, end)
         base_key = (base_weight._version, base_weight.data_ptr())
         if lora_merged_cache_enabled():
