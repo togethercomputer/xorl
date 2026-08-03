@@ -472,6 +472,7 @@ class RunnerDispatcher:
             RunnerResponse with results or error
         """
         start_time = time.time()
+        command_type: Optional[str] = None
 
         try:
             # Handle rank-0-only commands (no broadcast)

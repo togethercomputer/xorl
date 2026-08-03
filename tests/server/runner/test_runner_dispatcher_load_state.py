@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from xorl.server.protocol.operations import AdapterStateData, LoadStateData
+from xorl.server.protocol.orchestrator_runner import RunnerDispatchCommand
 
 
 _MODULE_PATH = Path(__file__).resolve().parents[3] / "src" / "xorl" / "server" / "runner" / "runner_dispatcher.py"
@@ -49,6 +50,30 @@ class _FakeTrainerSingleTenant:
     def load_state(self, checkpoint_path, load_optimizer=True, model_id=None):
         self.load_state_calls.append((checkpoint_path, load_optimizer, model_id))
         return {"success": True, "model_id": model_id}
+
+
+def test_handle_request_rank0_preserves_prepare_error():
+    dispatcher = object.__new__(RunnerDispatcher)
+    dispatcher.rank = 0
+
+    async def _prepare_load_state_command(request):
+        raise ValueError("checkpoint path rejected")
+
+    dispatcher._prepare_load_state_command = _prepare_load_state_command
+    request = RunnerDispatchCommand.create(
+        "load_state",
+        LoadStateData(
+            checkpoint_path="/outside/checkpoint",
+            load_optimizer=False,
+            model_id="policy-a",
+        ),
+        request_id="req-load-state",
+    )
+
+    response = asyncio.run(dispatcher._handle_request_rank0(request))
+
+    assert response.success is False
+    assert response.error == "checkpoint path rejected"
 
 
 def test_handle_load_state_uses_adapter_coordinator_for_multi_adapter(tmp_path, monkeypatch):
