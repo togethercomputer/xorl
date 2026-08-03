@@ -74,6 +74,27 @@ def canonical_lora_fold_linear(
     return (weight.to(torch.float32) + delta).to(weight.dtype)
 
 
+def _factor_grad_dtype(factor: torch.Tensor) -> torch.dtype:
+    """Return the dtype autograd expects for a LoRA-factor gradient.
+
+    FSDP mixed precision exposes a low-precision forward view while retaining
+    the unsharded parameter's gradient dtype on ``grad_dtype``.  Custom
+    autograd must honor that metadata rather than the transient view dtype or
+    the engine rejects the returned gradient before FSDP can reduce it.
+    The active-rank factors passed here are slices, so resolve their leaf base
+    before reading ``grad_dtype`` (PyTorch rejects reading that property from a
+    non-leaf tensor). Plain tensors use their own dtype.
+    """
+    base = factor
+    while not base.is_leaf and getattr(base, "_base", None) is not None:
+        base = base._base
+    try:
+        return getattr(base, "grad_dtype", None) or base.dtype
+    except RuntimeError:
+        # A non-view non-leaf has no leaf metadata to recover.
+        return factor.dtype
+
+
 class FoldedLoraWeightGKN(torch.autograd.Function):
     """Straight-through folded expert weight.
 
@@ -101,12 +122,12 @@ class FoldedLoraWeightGKN(torch.autograd.Function):
             grad_A = torch.bmm(gw32, B32.transpose(1, 2)) * ctx.scaling
             if lora_A.shape[0] == 1:
                 grad_A = grad_A.sum(dim=0, keepdim=True)
-            grad_A = grad_A.to(lora_A.dtype)
+            grad_A = grad_A.to(_factor_grad_dtype(lora_A))
         if ctx.needs_input_grad[2]:
             grad_B = torch.bmm(A32.transpose(1, 2), gw32) * ctx.scaling
             if lora_B.shape[0] == 1:
                 grad_B = grad_B.sum(dim=0, keepdim=True)
-            grad_B = grad_B.to(lora_B.dtype)
+            grad_B = grad_B.to(_factor_grad_dtype(lora_B))
         return None, grad_A, grad_B, None
 
 
@@ -142,7 +163,7 @@ class FoldedLoraWeightGateUpGKN(torch.autograd.Function):
                 grad_A = grad_A.sum(dim=0, keepdim=True)
             if B.shape[0] == 1:
                 grad_B = grad_B.sum(dim=0, keepdim=True)
-            grads.extend([grad_A.to(A.dtype), grad_B.to(B.dtype)])
+            grads.extend([grad_A.to(_factor_grad_dtype(A)), grad_B.to(_factor_grad_dtype(B))])
         grads.extend([None, None])
         return tuple(grads)
 
@@ -165,9 +186,9 @@ class FoldedLoraWeightLinear(torch.autograd.Function):
         gw32 = grad_w.to(torch.float32)
         grad_A = grad_B = None
         if ctx.needs_input_grad[1]:
-            grad_A = (lora_B.to(torch.float32).t() @ gw32 * ctx.scaling).to(lora_A.dtype)
+            grad_A = (lora_B.to(torch.float32).t() @ gw32 * ctx.scaling).to(_factor_grad_dtype(lora_A))
         if ctx.needs_input_grad[2]:
-            grad_B = (gw32 @ lora_A.to(torch.float32).t() * ctx.scaling).to(lora_B.dtype)
+            grad_B = (gw32 @ lora_A.to(torch.float32).t() * ctx.scaling).to(_factor_grad_dtype(lora_B))
         return None, grad_A, grad_B, None
 
 

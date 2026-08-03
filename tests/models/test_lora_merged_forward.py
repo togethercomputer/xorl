@@ -16,6 +16,7 @@ from xorl.lora.fold import (
     FoldedLoraWeightGateUpGKN,
     FoldedLoraWeightGKN,
     FoldedLoraWeightLinear,
+    _factor_grad_dtype,
     canonical_lora_fold_gkn,
     canonical_lora_fold_linear,
 )
@@ -78,6 +79,26 @@ class TestCanonicalFold:
 
 
 class TestFoldedWeightAutograd:
+    def test_factor_grad_dtype_honors_fsdp_metadata(self):
+        factor_A = torch.ones(4, 8, dtype=torch.bfloat16, requires_grad=True)
+        factor_B = torch.ones(16, 4, dtype=torch.bfloat16, requires_grad=True)
+        assert _factor_grad_dtype(factor_A[:2]) == torch.bfloat16
+        assert _factor_grad_dtype(factor_B[:, :2]) == torch.bfloat16
+        factor_A.grad_dtype = torch.float32
+        factor_B.grad_dtype = torch.float32
+        assert _factor_grad_dtype(factor_A[:2]) == torch.float32
+        assert _factor_grad_dtype(factor_B[:, :2]) == torch.float32
+
+        A = factor_A[:2]
+        B = factor_B[:, :2]
+        W = torch.zeros(16, 8, dtype=torch.bfloat16)
+        folded = canonical_lora_fold_linear(W, A.detach(), B.detach(), SCALING)
+        FoldedLoraWeightLinear.apply(folded, A, B, SCALING).float().sum().backward()
+        assert factor_A.grad.dtype == torch.float32
+        assert factor_B.grad.dtype == torch.float32
+        assert torch.count_nonzero(factor_A.grad) > 0
+        assert torch.count_nonzero(factor_B.grad) > 0
+
     def _reference_grads(self, W, A, B, scaling, grad_w, shared_a=False, shared_b=False):
         A_ref = A.detach().clone().requires_grad_(True)
         B_ref = B.detach().clone().requires_grad_(True)

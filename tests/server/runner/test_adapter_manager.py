@@ -660,6 +660,32 @@ def test_multi_adapter_manager_supports_mixed_ranks_and_optimizers(tmp_path):
     assert reloaded_manager.get_adapter_session_spec("policy-large")["lora_config"]["lora_rank"] == 4
 
 
+def test_capture_gradients_casts_and_accumulates_into_adapter_grad_dtype(tmp_path):
+    manager = _build_manager(tmp_path, optimizer_type="adamw")
+    manager.register_adapter("policy-fp32", lr=0.1, initialize_fresh=True)
+    state = manager.get_adapter_state("policy-fp32")
+    layer = manager.model.model.layers[0].self_attn.o_proj
+
+    for source, value in ((layer.lora_A, 1.0), (layer.lora_B, 2.0)):
+        source.grad_dtype = None
+        source.grad = torch.full_like(source, value, dtype=torch.bfloat16)
+    manager.capture_gradients("policy-fp32")
+
+    for name, adapter_param in state.lora_params.items():
+        expected = 1.0 if name.endswith("lora_A") else 2.0
+        assert adapter_param.grad.dtype == torch.float32
+        assert torch.equal(adapter_param.grad, torch.full_like(adapter_param, expected))
+
+    for source in (layer.lora_A, layer.lora_B):
+        source.grad = torch.full_like(source, 0.5, dtype=torch.bfloat16)
+    manager.capture_gradients("policy-fp32")
+
+    for name, adapter_param in state.lora_params.items():
+        expected = 1.5 if name.endswith("lora_A") else 2.5
+        assert adapter_param.grad.dtype == torch.float32
+        assert torch.equal(adapter_param.grad, torch.full_like(adapter_param, expected))
+
+
 def test_save_adapter_state_persists_current_learning_rate(tmp_path):
     manager = _build_manager(tmp_path, optimizer_type="adamw")
     session_spec = _session_spec(rank=4, alpha=16, optimizer_type="adamw", lr=0.1, weight_decay=0.01)
