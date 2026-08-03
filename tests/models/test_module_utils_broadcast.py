@@ -570,6 +570,7 @@ def test_grouped_load_weights_uses_filtered_prefetch_on_group_leader(monkeypatch
         scatter=lambda tensor, scatter_list=None, src=0, group=None: transfer_calls.append(
             ("scatter", src, group, tuple(tensor.shape), None if scatter_list is None else tuple(scatter_list[0].shape))
         ),
+        all_gather_object=lambda gathered, value: gathered.__setitem__(slice(None), [value] * len(gathered)),
         broadcast_object_list=fake_broadcast_object_list,
     )
 
@@ -629,6 +630,7 @@ def test_grouped_load_weights_uses_filtered_prefetch_on_group_leader(monkeypatch
             "checkpoint_keys": {"keep.weight", "model.layers.0.mlp.experts.0.gate_proj.weight"},
             "ep_rank": 0,
             "ep_size": 1,
+            "load_family": "dense",
             "is_broadcast": False,
             "weights_path": "dummy-weights",
             "device": None,
@@ -638,6 +640,7 @@ def test_grouped_load_weights_uses_filtered_prefetch_on_group_leader(monkeypatch
             "checkpoint_keys": {"keep.weight", "model.layers.0.mlp.experts.0.gate_proj.weight"},
             "ep_rank": 0,
             "ep_size": 16,
+            "load_family": "expert",
             "is_broadcast": False,
             "weights_path": "dummy-weights",
             "device": None,
@@ -889,6 +892,8 @@ def test_grouped_load_weights_treats_missing_dense_group_as_local(monkeypatch):
             return None
 
         def on_load_weight(self, key, tensor):
+            if key in {"cache.first", "cache.second"}:
+                return [("cache", tensor)]
             return [(key, tensor)]
 
         def on_load_complete(self):
@@ -896,13 +901,13 @@ def test_grouped_load_weights_treats_missing_dense_group_as_local(monkeypatch):
 
     class _GroupedModel:
         def named_buffers(self):
-            return []
+            return [("score_bias", torch.zeros(1)), ("cache", torch.zeros(1))]
 
         def named_parameters(self):
             return [("keep.weight", None)]
 
         def named_modules(self):
-            return []
+            return [("", SimpleNamespace(_non_persistent_buffers_set={"cache"}))]
 
         def to_empty(self, device):
             self.device = device
@@ -917,6 +922,7 @@ def test_grouped_load_weights_treats_missing_dense_group_as_local(monkeypatch):
         is_available=lambda: True,
         is_initialized=lambda: True,
         get_world_size=lambda group=None: 4 if group is None else 1,
+        all_gather_object=lambda gathered, signature: gathered.__setitem__(slice(None), [signature] * len(gathered)),
         get_process_group_ranks=lambda group: [0],
         broadcast=fail_collective,
         scatter=fail_collective,
@@ -927,7 +933,15 @@ def test_grouped_load_weights_treats_missing_dense_group_as_local(monkeypatch):
         if skip_key_fn("keep.weight"):
             yield ({}, [])
         else:
-            yield ({"keep.weight": torch.tensor([2.0])}, [])
+            yield (
+                {
+                    "keep.weight": torch.tensor([2.0]),
+                    "score_bias": torch.tensor([3.0]),
+                    "cache.first": torch.tensor([4.0]),
+                    "cache.second": torch.tensor([5.0]),
+                },
+                [],
+            )
 
     monkeypatch.setattr(module_utils, "dist", fake_dist)
     monkeypatch.setattr(module_utils, "tqdm", lambda iterable, **kwargs: iterable)
@@ -940,16 +954,32 @@ def test_grouped_load_weights_treats_missing_dense_group_as_local(monkeypatch):
     )
     monkeypatch.setattr(module_utils, "_build_compiled_key_map", lambda *args, **kwargs: {})
     monkeypatch.setattr(module_utils, "_shrink_expert_params_for_ep", lambda model: None)
-    monkeypatch.setattr(module_utils, "_get_checkpoint_keys", lambda weights_path: {"keep.weight"})
+    monkeypatch.setattr(
+        module_utils,
+        "_get_checkpoint_keys",
+        lambda weights_path: {"keep.weight", "score_bias", "cache.first", "cache.second"},
+    )
     monkeypatch.setattr(module_utils, "_load_state_dict", lambda weights_path: ["shard-0"])
     monkeypatch.setattr(module_utils, "_prefetch_shards_filtered", fake_prefetch_filtered)
     monkeypatch.setattr(module_utils, "_dispatch_parameter", lambda *args, **kwargs: dispatched.append(args[1]))
     monkeypatch.setattr(module_utils, "post_process_after_weight_loading", lambda *args, **kwargs: None)
     monkeypatch.setattr(module_utils, "empty_cache", lambda: None)
 
-    module_utils.grouped_load_weights(_GroupedModel(), "dummy-weights", init_device="cpu")
+    receipt = module_utils.grouped_load_weights(_GroupedModel(), "dummy-weights", init_device="cpu", strict=True)
 
     assert dispatched == ["keep.weight"]
+    assert receipt["schema_version"] == "grouped_weight_load_receipt_v2"
+    assert receipt["strict"] is True
+    assert receipt["expected_parameter_count"] == 1
+    assert receipt["loaded_parameter_count"] == 1
+    assert receipt["missing_parameter_names"] == []
+    assert receipt["unexpected_parameter_names"] == []
+    assert receipt["duplicate_parameter_names"] == []
+    assert receipt["expected_persistent_buffer_count"] == 1
+    assert receipt["loaded_persistent_buffer_count"] == 1
+    assert receipt["missing_persistent_buffer_names"] == []
+    assert receipt["duplicate_persistent_buffer_names"] == []
+    assert receipt["non_persistent_buffer_count"] == 1
 
 
 def test_grouped_load_weights_falls_back_without_ep_group(monkeypatch):
@@ -958,6 +988,7 @@ def test_grouped_load_weights_falls_back_without_ep_group(monkeypatch):
     fake_dist = SimpleNamespace(
         is_available=lambda: True,
         is_initialized=lambda: True,
+        get_world_size=lambda: 1,
     )
 
     monkeypatch.setattr(module_utils, "dist", fake_dist)
@@ -978,3 +1009,81 @@ def test_grouped_load_weights_falls_back_without_ep_group(monkeypatch):
 
     assert len(called) == 1
     assert not hasattr(model, "device")
+
+
+def test_grouped_load_weights_strict_rejects_fallback_without_ep_group(monkeypatch):
+    fake_dist = SimpleNamespace(
+        is_available=lambda: True,
+        is_initialized=lambda: True,
+        get_world_size=lambda: 1,
+    )
+
+    monkeypatch.setattr(module_utils, "dist", fake_dist)
+    monkeypatch.setattr(module_utils, "_get_grouped_weight_load_group", lambda _ps: None)
+    monkeypatch.setattr(
+        module_utils,
+        "get_parallel_state",
+        lambda: SimpleNamespace(global_rank=0, pp_enabled=False, ep_enabled=False, ep_fsdp_device_mesh=None),
+    )
+
+    with pytest.raises(RuntimeError, match="requires an EP/FSDP fanout group"):
+        module_utils.grouped_load_weights(_DummyModel(), "dummy-weights", init_device="cpu", strict=True)
+
+
+def test_post_process_strict_rejects_missing_unexpected_and_duplicate_names():
+    with pytest.raises(RuntimeError, match="Strict checkpoint source-to-target coverage failed") as exc_info:
+        module_utils.post_process_after_weight_loading(
+            _DummyModel(),
+            {},
+            {"missing.weight"},
+            strict=True,
+            unexpected_parameter_names={"unexpected.weight"},
+            duplicate_parameter_names={"duplicate.weight"},
+        )
+
+    message = str(exc_info.value)
+    assert "missing.weight" in message
+    assert "unexpected.weight" in message
+    assert "duplicate.weight" in message
+
+
+def test_post_process_strict_rejects_missing_persistent_buffer():
+    with pytest.raises(RuntimeError, match="missing_persistent_buffers=.*missing.buffer"):
+        module_utils.post_process_after_weight_loading(
+            _DummyModel(),
+            {},
+            strict=True,
+            persistent_buffer_names_left={"missing.buffer"},
+        )
+
+
+def test_post_process_strict_rejects_duplicate_persistent_buffer():
+    with pytest.raises(RuntimeError, match="duplicate_persistent_buffers=.*duplicate.buffer"):
+        module_utils.post_process_after_weight_loading(
+            _DummyModel(),
+            {},
+            strict=True,
+            duplicate_persistent_buffer_names={"duplicate.buffer"},
+        )
+
+
+def test_post_process_strict_accepts_complete_persistent_buffer_coverage(monkeypatch):
+    dispatched = []
+
+    class _CompleteModel(_DummyModel):
+        config = SimpleNamespace(tie_word_embeddings=False)
+
+        def named_modules(self):
+            return []
+
+    monkeypatch.setattr(module_utils, "_dispatch_buffer", lambda *args, **kwargs: dispatched.append(args[1]))
+
+    module_utils.post_process_after_weight_loading(
+        _CompleteModel(),
+        {"score_bias": torch.tensor([3.0])},
+        strict=True,
+        persistent_buffer_names_left=set(),
+        duplicate_persistent_buffer_names=set(),
+    )
+
+    assert dispatched == ["score_bias"]

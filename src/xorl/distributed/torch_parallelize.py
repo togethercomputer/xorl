@@ -119,12 +119,22 @@ def _expert_mixed_precision_policy(ep_fsdp_mesh_size: int, reduce_dtype: torch.d
     return _bf16_mixed_precision_policy(reduce_dtype=reduce_dtype)
 
 
+def _expert_fsdp_kwargs_for_module(expert_fsdp_kwargs: dict, experts_mod: nn.Module) -> dict:
+    """Keep frozen byte-packed expert state sharded without numerically casting it."""
+
+    module_kwargs = dict(expert_fsdp_kwargs)
+    if getattr(experts_mod, "fsdp_requires_full_precision", False):
+        module_kwargs.pop("mp_policy", None)
+    return module_kwargs
+
+
 def _load_model_weights(
     model: "nn.Module",
     weights_path: str,
     load_weights_mode: str,
     weight_device: str,
     dtensor_factory=None,
+    strict_weight_loading: bool = False,
 ) -> None:
     """Dispatch HF weight loading by mode.
 
@@ -139,7 +149,15 @@ def _load_model_weights(
         return
     if load_weights_mode == "grouped":
         logger.info_rank0("Loading model weights with one reader per node (dense) + per EP-FSDP group (experts)...")
-        grouped_load_weights(model, weights_path, weight_device, dtensor_factory=dtensor_factory)
+        receipt = grouped_load_weights(
+            model,
+            weights_path,
+            weight_device,
+            dtensor_factory=dtensor_factory,
+            strict=strict_weight_loading,
+        )
+        if receipt is not None:
+            model._xorl_grouped_weight_load_receipt = receipt
     elif load_weights_mode == "all_ranks":
         logger.info_rank0("Every rank reading weights from disk independently...")
         all_ranks_load_weights(model, weights_path, weight_device, dtensor_factory=dtensor_factory)
@@ -434,7 +452,7 @@ def parallelize_model_fsdp2(
         # ep enabled and this layer contains the expert module
         if parallel_state.ep_enabled and experts_mod is not None and not getattr(experts_mod, "_skip_fsdp", False):
             # shard expert
-            fully_shard(experts_mod, **expert_fsdp_kwargs)
+            fully_shard(experts_mod, **_expert_fsdp_kwargs_for_module(expert_fsdp_kwargs, experts_mod))
             layer_mod._fsdp_modules.append(experts_mod)
             fsdp_wrapped_experts.append(experts_mod)
         # shard module that needs to ignore mixed precision control
@@ -669,6 +687,7 @@ def parallelize_model_fsdp2(
             load_weights_mode=load_weights_mode,
             weight_device=weight_device,
             dtensor_factory=distribute_tensor,
+            strict_weight_loading=bool(kwargs.get("strict_weight_loading", False)),
         )
 
     # Build EP param groups now (torchtitan eFSDP design: track groups at wrap time,
@@ -929,6 +948,7 @@ def build_parallelize_model(
                         load_weights_mode=load_weights_mode,
                         weight_device=get_device_type(),
                         dtensor_factory=distribute_tensor,
+                        strict_weight_loading=bool(kwargs.get("strict_weight_loading", False)),
                     )
                     kwargs["skip_weight_loading"] = True
 
@@ -1077,6 +1097,7 @@ def build_parallelize_model(
                 load_weights_mode=load_weights_mode,
                 weight_device=get_device_type(),
                 dtensor_factory=distribute_tensor,
+                strict_weight_loading=bool(kwargs.get("strict_weight_loading", False)),
             )
             # Mark weights as already loaded so FSDP path skips loading
             kwargs["skip_weight_loading"] = True

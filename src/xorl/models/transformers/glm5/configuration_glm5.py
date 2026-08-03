@@ -69,6 +69,11 @@ class Glm5Config(PretrainedConfig):
         index_n_heads=32,
         index_topk=2048,
         indexer_rope_interleave=True,
+        indexer_types=None,
+        index_topk_freq=1,
+        index_skip_topk_offset=0,
+        index_topk_pattern=None,
+        mlp_layer_types=None,
         # MTP
         num_nextn_predict_layers=1,
         # Bookkeeping
@@ -92,7 +97,9 @@ class Glm5Config(PretrainedConfig):
         router_aux_loss_coef=0.0,
         topk_method="noaux_tc",
         scoring_func="sigmoid",
+        quantization_config=None,
         _moe_implementation="eager",
+        canonical_moe_transport="dense_v1",
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -136,7 +143,9 @@ class Glm5Config(PretrainedConfig):
         self.router_aux_loss_coef = router_aux_loss_coef
         self.topk_method = topk_method
         self.scoring_func = scoring_func
+        self.quantization_config = _cfg_to_dict(quantization_config)
         self._moe_implementation = _moe_implementation
+        self.canonical_moe_transport = canonical_moe_transport
         self._rope_scaling = _cfg_to_dict(rope_scaling)
 
         if self._rope_scaling is not None and "type" in self._rope_scaling:
@@ -148,6 +157,11 @@ class Glm5Config(PretrainedConfig):
         self.index_n_heads = index_n_heads
         self.index_topk = index_topk
         self.indexer_rope_interleave = indexer_rope_interleave
+        self.indexer_types = None if indexer_types is None else list(indexer_types)
+        self.index_topk_freq = index_topk_freq
+        self.index_skip_topk_offset = index_skip_topk_offset
+        self.index_topk_pattern = None if index_topk_pattern is None else list(index_topk_pattern)
+        self.mlp_layer_types = None if mlp_layer_types is None else list(mlp_layer_types)
 
         # MTP
         self.num_nextn_predict_layers = num_nextn_predict_layers
@@ -240,6 +254,10 @@ class Glm5Config(PretrainedConfig):
             norm_topk_prob=getattr(text_config, "norm_topk_prob", True),
             topk_method=getattr(text_config, "topk_method", "noaux_tc"),
             scoring_func=getattr(text_config, "scoring_func", "sigmoid"),
+            quantization_config=_cfg_to_dict(
+                getattr(text_config, "quantization_config", getattr(hf_config, "quantization_config", None))
+            ),
+            canonical_moe_transport=getattr(text_config, "canonical_moe_transport", "dense_v1"),
             n_group=getattr(text_config, "n_group", 1),
             topk_group=getattr(text_config, "topk_group", 1),
             # GLM-specific
@@ -247,6 +265,11 @@ class Glm5Config(PretrainedConfig):
             index_n_heads=getattr(text_config, "index_n_heads", 32),
             index_topk=getattr(text_config, "index_topk", 2048),
             indexer_rope_interleave=getattr(text_config, "indexer_rope_interleave", True),
+            indexer_types=getattr(text_config, "indexer_types", None),
+            index_topk_freq=getattr(text_config, "index_topk_freq", 1),
+            index_skip_topk_offset=getattr(text_config, "index_skip_topk_offset", 0),
+            index_topk_pattern=getattr(text_config, "index_topk_pattern", None),
+            mlp_layer_types=getattr(text_config, "mlp_layer_types", None),
             num_nextn_predict_layers=getattr(text_config, "num_nextn_predict_layers", 1),
             ep_size=getattr(text_config, "ep_size", 1),
             pretraining_tp=getattr(text_config, "pretraining_tp", 1),

@@ -10,6 +10,7 @@ import torch
 
 from ...checkpoint_handlers.base import CheckpointHandler
 from ...checkpoint_handlers.buffers import ExpertWeightBuffer, parse_expert_key
+from .native_fp8 import NativeBlockFP8ExpertPairBuffer, NativeBlockFP8PairBuffer, native_fp8_dense_source_map
 
 
 class Glm5CheckpointHandler(CheckpointHandler):
@@ -33,16 +34,38 @@ class Glm5CheckpointHandler(CheckpointHandler):
         packed_expert_group_size: int = 32,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
+        model: Optional[torch.nn.Module] = None,
+        load_family: Optional[str] = None,
         **kwargs,
     ):
         kwargs.pop("num_nextn_predict_layers", None)
         if kwargs:
             raise TypeError(f"Unexpected Glm5CheckpointHandler kwargs: {sorted(kwargs)}")
+        if load_family not in {None, "dense", "expert"}:
+            raise ValueError(f"Unsupported GLM checkpoint load family: {load_family!r}")
 
         self._dequant_device = None if device is None or device.type == "meta" else device
         self._output_dtype = dtype
+        self._load_family = load_family
+        self._native_weight_buffer: Optional[NativeBlockFP8PairBuffer] = None
+        self._native_expert_buffer: Optional[NativeBlockFP8ExpertPairBuffer] = None
+        if model is not None:
+            if load_family in {None, "dense"}:
+                dense_map = native_fp8_dense_source_map(model)
+                if dense_map:
+                    self._native_weight_buffer = NativeBlockFP8PairBuffer(model, dense_map)
+            if load_family in {None, "expert"}:
+                native_experts = NativeBlockFP8ExpertPairBuffer(
+                    model,
+                    ep_rank=ep_rank,
+                    ep_size=ep_size,
+                    num_experts=num_experts,
+                )
+                if native_experts.has_targets():
+                    self._native_expert_buffer = native_experts
+
         self._expert_buffer: Optional[ExpertWeightBuffer] = None
-        if checkpoint_has_per_expert:
+        if load_family != "dense" and checkpoint_has_per_expert and self._native_expert_buffer is None:
             self._expert_buffer = ExpertWeightBuffer(
                 num_experts,
                 ep_rank=ep_rank,
@@ -51,6 +74,7 @@ class Glm5CheckpointHandler(CheckpointHandler):
             )
         self._ep_rank = ep_rank
         self._ep_size = ep_size
+        self._num_experts = num_experts
         self._local_num_experts = num_experts // ep_size
         self._expert_start = ep_rank * self._local_num_experts
         self._expert_end = self._expert_start + self._local_num_experts
@@ -263,9 +287,13 @@ class Glm5CheckpointHandler(CheckpointHandler):
         return []
 
     def get_skip_key_fn(self) -> Optional[Callable[[str], bool]]:
-        has_ep_filter = self._expert_buffer is not None and not (
+        has_native_ep_filter = self._native_expert_buffer is not None and not (
+            self._native_expert_buffer.expert_start == 0 and self._native_expert_buffer.expert_end == self._num_experts
+        )
+        has_legacy_ep_filter = self._expert_buffer is not None and not (
             self._expert_buffer.expert_start == 0 and self._expert_buffer.expert_end == self._expert_buffer.num_experts
         )
+        has_ep_filter = has_native_ep_filter or has_legacy_ep_filter
         has_layer_filter = self._num_hidden_layers is not None
         if not has_ep_filter and not has_layer_filter:
             return None
@@ -279,6 +307,9 @@ class Glm5CheckpointHandler(CheckpointHandler):
                 return True
             if not has_ep_filter:
                 return False
+
+            if self._native_expert_buffer is not None and self._native_expert_buffer.parse_key(normalized_key):
+                return self._native_expert_buffer.should_skip(normalized_key)
 
             compressed = self._parse_compressed_expert_key(normalized_key)
             if compressed is not None:
@@ -298,8 +329,28 @@ class Glm5CheckpointHandler(CheckpointHandler):
         if key is None:
             return []
 
+        if key.endswith(".gate.e_score_correction_bias"):
+            if tensor.dtype is not torch.float32:
+                raise TypeError(
+                    f"{key} must be loaded from the official FP32 tensor without an intermediate dtype cast"
+                )
+            if tensor.shape != (self._num_experts,) or not bool(torch.all(torch.isfinite(tensor))):
+                raise ValueError(
+                    f"{key} must be a finite vector with shape ({self._num_experts},), got {tuple(tensor.shape)}"
+                )
+
         if key.endswith(".input_scale"):
             return []
+
+        if self._native_weight_buffer is not None:
+            native_result = self._native_weight_buffer.try_consume(key, tensor)
+            if native_result is not None:
+                return native_result
+
+        if self._native_expert_buffer is not None:
+            native_expert_result = self._native_expert_buffer.try_consume(key, tensor)
+            if native_expert_result is not None:
+                return native_expert_result
 
         compressed_expert_results = self._handle_compressed_expert_weight(key, tensor)
         if compressed_expert_results is not None:
@@ -319,10 +370,13 @@ class Glm5CheckpointHandler(CheckpointHandler):
         return [(key, tensor)]
 
     def on_skip_weight(self, key: str) -> List[Tuple[str, torch.Tensor]]:
-        if self._expert_buffer is None:
-            return []
         key = self._normalize_key(key)
         if key is None:
+            return []
+
+        if self._native_expert_buffer is not None and self._native_expert_buffer.parse_key(key) is not None:
+            return []
+        if self._expert_buffer is None:
             return []
 
         compressed = self._parse_compressed_expert_key(key)
@@ -344,6 +398,10 @@ class Glm5CheckpointHandler(CheckpointHandler):
         return self._maybe_finalize_per_expert_merge(layer_idx, proj)
 
     def on_load_complete(self) -> List[Tuple[str, torch.Tensor]]:
+        if self._native_weight_buffer is not None:
+            self._native_weight_buffer.validate_complete()
+        if self._native_expert_buffer is not None:
+            self._native_expert_buffer.validate_complete()
         if self._expert_buffer is not None:
             pending = self._expert_buffer.get_pending_counts()
             if pending:
