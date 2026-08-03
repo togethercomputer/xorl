@@ -882,6 +882,17 @@ def test_glm5_attention_sparse_matches_dense_when_topk_covers_full_seq():
     torch.testing.assert_close(sparse_out, dense_out, atol=1e-4, rtol=1e-4)
 
 
+def test_sparse_path_rejects_distributed_lora_training_without_ownership_contract(monkeypatch):
+    config = _tiny_config(index_topk=4, max_position_embeddings=8)
+    attention = Glm5Attention(config, layer_idx=0)
+    inject_lora_into_model(attention, r=4, lora_alpha=8, target_modules=["kv_b_proj"])
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+
+    with pytest.raises(RuntimeError, match="adapter-gradient ownership contract"):
+        attention._split_kv_b_weight()
+
+
 # --------------------------------------------------------------------------- #
 # Dispatch + checkpoint handler
 # --------------------------------------------------------------------------- #

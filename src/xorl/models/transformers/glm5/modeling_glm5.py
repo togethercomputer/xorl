@@ -374,6 +374,17 @@ class Glm5Attention(Glm5MlaAttention):
         if hasattr(self.kv_b_proj, "get_delta_weight"):
             lora_A = self.kv_b_proj.lora_A
             lora_B = self.kv_b_proj.lora_B
+            if (
+                torch.is_grad_enabled()
+                and (lora_A.requires_grad or lora_B.requires_grad)
+                and dist.is_available()
+                and dist.is_initialized()
+                and dist.get_world_size() > 1
+            ):
+                raise RuntimeError(
+                    "Distributed GLM-5.2 kv_b LoRA training requires an explicit adapter-gradient "
+                    "ownership contract; evaluation and single-rank training remain supported"
+                )
             if isinstance(lora_A, DTensor):
                 lora_A = lora_A.redistribute(placements=(Replicate(),) * lora_A.device_mesh.ndim).to_local()
             if isinstance(lora_B, DTensor):
