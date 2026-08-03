@@ -207,9 +207,12 @@ def test_load_adapter_state_uses_checkpoint_optimizer_contract_for_fresh_session
 def test_adapter_coordinator_loads_checkpoint_without_placeholder_spec_mismatch(tmp_path):
     source_manager = _build_manager(tmp_path / "source", optimizer_type="signsgd")
     source_manager.register_adapter("policy-b", lr=0.1, initialize_fresh=True)
-    checkpoint_path = source_manager.save_adapter_state("policy-b")["path"]
+    source_checkpoint = source_manager.save_adapter_state("policy-b")["path"]
 
     target_manager = _build_manager(tmp_path / "target", optimizer_type="adamw")
+    checkpoint_path = Path(target_manager.checkpoint_dir).parent / "weights" / "policy-b"
+    checkpoint_path.parent.mkdir(parents=True)
+    shutil.copytree(source_checkpoint, checkpoint_path)
     coordinator = AdapterCoordinator(
         trainer=_CoordinatorTrainer(target_manager),
         rank=0,
@@ -222,7 +225,7 @@ def test_adapter_coordinator_loads_checkpoint_without_placeholder_spec_mismatch(
             {
                 "payload": AdapterStateData(
                     model_id="policy-b",
-                    path=checkpoint_path,
+                    path=str(checkpoint_path),
                     load_optimizer=True,
                 )
             }

@@ -223,6 +223,19 @@ class RunnerDispatcher:
             f"RunnerDispatcher initialized (rank={rank}/{world_size}, bind_address={bind_address}, device={device})"
         )
 
+    def _resolve_server_artifact(
+        self,
+        candidate: str | os.PathLike[str],
+        *,
+        must_exist: bool = False,
+    ) -> Path:
+        """Confine artifacts to this server instance's output directory."""
+        return resolve_server_artifact(
+            candidate,
+            must_exist=must_exist,
+            root=getattr(self, "output_dir", None),
+        )
+
     # Operations that participate in cross-rank error sync.
     # These ops execute on every rank, and rank-0 success is not trustworthy if any
     # worker rank failed locally.
@@ -1747,7 +1760,7 @@ class RunnerDispatcher:
                 current_step = getattr(self.trainer, "step", 0)
                 checkpoint_path = checkpoint_path.rstrip("/")
                 checkpoint_path = f"{checkpoint_path}_{timestamp}_step_{current_step}"
-        checkpoint_path = str(resolve_server_artifact(checkpoint_path))
+        checkpoint_path = str(self._resolve_server_artifact(checkpoint_path))
 
         return {
             "command": "save_state",
@@ -1762,7 +1775,7 @@ class RunnerDispatcher:
     async def _prepare_load_state_command(self, request: RunnerDispatchCommand) -> Dict[str, Any]:
         """Prepare load_state command."""
         p: LoadStateData = request.payload
-        checkpoint_path = str(resolve_server_artifact(p.checkpoint_path, must_exist=True))
+        checkpoint_path = str(self._resolve_server_artifact(p.checkpoint_path, must_exist=True))
         return {
             "command": "load_state",
             "request_id": request.message_id,
@@ -1776,7 +1789,7 @@ class RunnerDispatcher:
     async def _handle_save_state(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
         """Handle save_state on all ranks (unified handler)."""
         p: SaveStateData = command_dict.get("payload", SaveStateData())
-        checkpoint_path = str(resolve_server_artifact(p.checkpoint_path))
+        checkpoint_path = str(self._resolve_server_artifact(p.checkpoint_path))
         save_optimizer = p.save_optimizer
         model_id = validate_identifier(p.model_id or "default", name="model_id")
 
@@ -1814,7 +1827,7 @@ class RunnerDispatcher:
             "command": "save_lora_only",
             "request_id": request.message_id,
             "payload": SaveLoraOnlyData(
-                lora_path=str(resolve_server_artifact(p.lora_path)),
+                lora_path=str(self._resolve_server_artifact(p.lora_path)),
                 model_id=validate_identifier(p.model_id or "default", name="model_id"),
             ),
         }
@@ -1826,7 +1839,7 @@ class RunnerDispatcher:
             "command": "save_full_weights",
             "request_id": request.message_id,
             "payload": SaveFullWeightsData(
-                output_path=str(resolve_server_artifact(p.output_path)),
+                output_path=str(self._resolve_server_artifact(p.output_path)),
                 dtype=p.dtype,
                 base_model_path=p.base_model_path,
             ),
@@ -1838,7 +1851,7 @@ class RunnerDispatcher:
         Saves only LoRA adapter weights in PEFT-compatible format.
         """
         p: SaveLoraOnlyData = command_dict.get("payload", SaveLoraOnlyData())
-        lora_path = str(resolve_server_artifact(p.lora_path))
+        lora_path = str(self._resolve_server_artifact(p.lora_path))
         model_id = validate_identifier(p.model_id or "default", name="model_id")
 
         logger.debug(f"Rank {self.rank}: Saving LoRA adapter to {lora_path} for model_id={model_id}")
@@ -1865,7 +1878,7 @@ class RunnerDispatcher:
         Saves full model weights as safetensors with config files for SGLang loading.
         """
         p: SaveFullWeightsData = command_dict.get("payload", SaveFullWeightsData())
-        output_path = str(resolve_server_artifact(p.output_path))
+        output_path = str(self._resolve_server_artifact(p.output_path))
         dtype = p.dtype
         base_model_path = p.base_model_path
 
@@ -1889,7 +1902,7 @@ class RunnerDispatcher:
     async def _handle_load_state(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
         """Handle load_state on all ranks (unified handler)."""
         p: LoadStateData = command_dict.get("payload", LoadStateData())
-        checkpoint_path = str(resolve_server_artifact(p.checkpoint_path, must_exist=True))
+        checkpoint_path = str(self._resolve_server_artifact(p.checkpoint_path, must_exist=True))
         load_optimizer = p.load_optimizer
         model_id = validate_identifier(p.model_id or "default", name="model_id")
 
@@ -1955,9 +1968,9 @@ class RunnerDispatcher:
         # If no output path provided, default to checkpoints/hf_weights/
         if output_path is None:
             output_path = "hf_weights"
-        output_path = str(resolve_server_artifact(output_path))
+        output_path = str(self._resolve_server_artifact(output_path))
         if checkpoint_path is not None:
-            checkpoint_path = str(resolve_server_artifact(checkpoint_path, must_exist=True))
+            checkpoint_path = str(self._resolve_server_artifact(checkpoint_path, must_exist=True))
 
         return {
             "command": "save_weights_for_sampler",
@@ -1974,8 +1987,8 @@ class RunnerDispatcher:
         p: SaveStateData = command_dict.get("payload", SaveStateData())
         checkpoint_path = p.checkpoint_path
         if checkpoint_path is not None:
-            checkpoint_path = str(resolve_server_artifact(checkpoint_path, must_exist=True))
-        output_path = str(resolve_server_artifact(command_dict.get("output_path")))
+            checkpoint_path = str(self._resolve_server_artifact(checkpoint_path, must_exist=True))
+        output_path = str(self._resolve_server_artifact(command_dict.get("output_path")))
         save_dtype = command_dict.get("save_dtype", "bfloat16")
 
         logger.debug(f"Rank {self.rank}: Saving HF weights from {checkpoint_path} to {output_path}, dtype={save_dtype}")

@@ -65,12 +65,19 @@ def resolve_server_artifact(
     candidate: str | os.PathLike[str],
     *,
     must_exist: bool = False,
+    root: str | os.PathLike[str] | None = None,
 ) -> Path:
-    """Resolve a server checkpoint or export path below its configured root."""
+    """Resolve a server checkpoint or export path below its configured root.
+
+    ``root`` is authoritative when supplied by the server lifecycle.  The
+    environment variable remains a fallback for standalone callers that do
+    not own a parsed server ``output_dir``.
+    """
     if candidate is None or not str(candidate).strip():
         raise ValueError("Server artifact path must be non-empty")
-    configured_root = os.environ.get(_SERVER_ARTIFACT_ROOT_ENV, "").strip()
-    root = configured_root or str(Path.cwd() / "checkpoints")
+    if root is None:
+        configured_root = os.environ.get(_SERVER_ARTIFACT_ROOT_ENV, "").strip()
+        root = configured_root or Path.cwd() / "checkpoints"
     return resolve_path_within(
         root,
         candidate,
