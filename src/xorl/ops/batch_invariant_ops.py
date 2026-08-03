@@ -112,6 +112,7 @@ __all__ = [
     "wrap_trunk_linears_batch_invariant",
     "is_trunk_linear_contract_enabled",
     "batch_invariant_trunk_linear",
+    "bi_bf16_fp32_linear",
     "set_trunk_linear_contract",
     "RMSNormFamily",
     "RMS_NORM_FAMILY_NO_RESIDUAL",
@@ -1767,6 +1768,50 @@ def bi_router_gemm(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         **_BI_ROUTER_GEMM_CONFIG,
     )
     return logits
+
+
+class _BIBf16Fp32LinearFn(torch.autograd.Function):
+    """Trainable wrapper for the shared BF16-input, FP32-output GEMM.
+
+    The pinned forward reduction enters the trainer-sampler numerical
+    contract. The ordinary linear backward does not enter K3, so it may use
+    the native matmul reduction while still propagating gradients to both
+    operands.
+    """
+
+    @staticmethod
+    def forward(ctx, input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(input, weight)
+        input_2d = input.reshape(-1, input.shape[-1])
+        output = bi_router_gemm(input_2d, weight)
+        return output.reshape(*input.shape[:-1], weight.shape[0])
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        input, weight = ctx.saved_tensors
+        grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1]).float()
+        input_2d = input.reshape(-1, input.shape[-1])
+        grad_input = grad_weight = None
+        if ctx.needs_input_grad[0]:
+            grad_input = (grad_output_2d @ weight.float()).to(input.dtype).reshape_as(input)
+        if ctx.needs_input_grad[1]:
+            grad_weight = (grad_output_2d.t() @ input_2d.float()).to(weight.dtype)
+        return grad_input, grad_weight
+
+
+def bi_bf16_fp32_linear(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Apply the batch-invariant BF16-input, FP32-output linear contract.
+
+    This is the differentiable form of :func:`bi_router_gemm`. It is suitable
+    for small-output projections whose serving counterpart uses DeepGEMM's
+    ``bf16_gemm_nt`` FP32 output, including GLM-5.2's indexer head weights.
+    """
+
+    if input.ndim < 2 or weight.ndim != 2:
+        raise ValueError(f"expected input.ndim >= 2 and weight.ndim == 2, got {input.shape=} and {weight.shape=}")
+    if input.shape[-1] != weight.shape[-1]:
+        raise ValueError(f"input/weight contraction mismatch: {input.shape[-1]} != {weight.shape[-1]}")
+    return _BIBf16Fp32LinearFn.apply(input, weight)
 
 
 def bi_router_topk_weights(

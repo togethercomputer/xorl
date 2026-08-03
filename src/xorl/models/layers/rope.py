@@ -460,8 +460,6 @@ class RotaryEmbedding(nn.Module):
         self._set_inv_freq_fp32(self._cpu_fp32_inv_freq())
         self._sglang_default_cache = None
         self._use_sglang_default_cache = bool(getattr(config, "_rope_native", False) and self.rope_type == "default")
-        if self._use_sglang_default_cache:
-            self._sglang_default_cache = self._build_sglang_default_cache(self.max_seq_len_cached)
 
     def _cpu_fp32_inv_freq(self) -> torch.Tensor:
         """Frequency table computed on CPU in fp32 — the provenance serving's cos/sin cache is built with."""
@@ -500,24 +498,38 @@ class RotaryEmbedding(nn.Module):
         )
         return float(base), int(head_dim * partial_rotary_factor)
 
-    def _build_sglang_default_cache(self, seq_len: int) -> torch.Tensor:
+    def _build_sglang_default_cache(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        # Match SGLang's on-policy construction boundary exactly: inverse
+        # frequencies are computed on CPU in fp32, then moved to the execution
+        # device before the position outer product and cos/sin.  Building the
+        # latter on CPU moves a few fp32 table entries by one ULP and can cross
+        # a BF16 rounding boundary in attention K.
         base, dim = self._default_rope_base_and_dim()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-        positions = torch.arange(seq_len, dtype=torch.float32)
+        inv_freq = inv_freq.to(device=device)
+        positions = torch.arange(seq_len, dtype=torch.float32, device=device)
         freqs = torch.einsum("i,j->ij", positions, inv_freq)
         return torch.cat((freqs.cos(), freqs.sin()), dim=-1)
 
-    def _ensure_sglang_default_cache(self, needed_max_pos: int) -> None:
-        if self._sglang_default_cache is None or needed_max_pos >= self._sglang_default_cache.shape[0]:
-            self._sglang_default_cache = self._build_sglang_default_cache(needed_max_pos + 1)
+    def _ensure_sglang_default_cache(self, needed_max_pos: int, device: torch.device) -> None:
+        if (
+            self._sglang_default_cache is None
+            or self._sglang_default_cache.device != device
+            or needed_max_pos >= self._sglang_default_cache.shape[0]
+        ):
+            # SGLang materializes the configured default-cache capacity at
+            # construction.  Match both its execution device and table shape;
+            # this also keeps the admitted run out of the cache-growth path.
+            cache_len = max(self.max_seq_len_cached, needed_max_pos + 1)
+            self._sglang_default_cache = self._build_sglang_default_cache(cache_len, device)
 
     @torch.no_grad()
     @dynamic_rope_update
     def forward(self, x, position_ids):
         if self._use_sglang_default_cache:
             needed_max_pos = int(position_ids.max().item())
-            self._ensure_sglang_default_cache(needed_max_pos)
-            flat_positions = position_ids.reshape(-1).to(device="cpu", dtype=torch.long)
+            self._ensure_sglang_default_cache(needed_max_pos, x.device)
+            flat_positions = position_ids.reshape(-1).to(device=x.device, dtype=torch.long)
             cos_sin = self._sglang_default_cache.index_select(0, flat_positions)
             cos_half, sin_half = cos_sin.chunk(2, dim=-1)
             cos = torch.cat((cos_half, cos_half), dim=-1).view(*position_ids.shape, -1)

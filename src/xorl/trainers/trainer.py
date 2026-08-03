@@ -696,6 +696,7 @@ class Trainer:
             router_fp32=args.model.router_fp32,
             lm_head_fp32=args.model.lm_head_fp32,
             alltoall_combine_hidden_chunk_size=args.model.alltoall_combine_hidden_chunk_size,
+            canonical_moe_transport=getattr(args.model, "canonical_moe_transport", "dense_v1"),
             rmsnorm_mode=args.model.rmsnorm_mode,
             activation_native=args.model.activation_native,
             rope_native=args.model.rope_native,

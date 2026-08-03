@@ -653,6 +653,13 @@ class RMSNorm(nn.Module):
             elif residual is not None:
                 # Diagnostic bf16 recast path: residual already added above.
                 out = fast_sglang_rms_norm(norm_input, self.weight, self.variance_epsilon)
+            elif family == RMS_NORM_FAMILY_NO_RESIDUAL:
+                # A declared serving no-residual site is already an explicit
+                # numerical contract.  Do not make its kernel selection depend
+                # on the unrelated BF16 trunk-linear wrapper: GLM-5.2 keeps its
+                # projections in native FP8, but its q_a/kv_a norms must still
+                # execute the same v2 reduction as serving.
+                out = fast_batch_invariant_rms_norm(norm_input, self.weight, self.variance_epsilon)
             elif is_trunk_linear_contract_enabled():
                 # Trunk contract lane: no-residual norms (qk-norm) must bit-match
                 # serving's family-1 batch-invariant kernel, with real gradients.

@@ -14,7 +14,13 @@ the dense DSA mask and the sparse-MLA path.
 import torch
 from torch import nn
 
+from xorl.models.layers.moe.moe_block import _moe_bi_router_enabled
 from xorl.models.transformers.glm5.rotary import glm5_apply_rotary_pos_emb
+from xorl.models.transformers.glm5.sparse_selector import (
+    GLM52_SELECTOR_VERSION,
+    select_glm52_logical_indices,
+)
+from xorl.ops.batch_invariant_ops import bi_bf16_fp32_linear
 
 
 class Glm5DsaIndexer(nn.Module):
@@ -46,6 +52,9 @@ class Glm5DsaIndexer(nn.Module):
 
         self._head_weight_scale = self.index_n_heads**-0.5
         self._softmax_scale = self.index_head_dim**-0.5
+        self.selector_version = (
+            GLM52_SELECTOR_VERSION if getattr(config, "indexer_types", None) is not None else "legacy_torch_or_tilelang"
+        )
 
     def project(
         self,
@@ -68,9 +77,32 @@ class Glm5DsaIndexer(nn.Module):
         index_q = index_q.view(B, S, self.index_n_heads, self.index_head_dim)
 
         index_k = self.wk(hidden_states)
-        index_k = self.k_norm(index_k)
+        if self.selector_version == GLM52_SELECTOR_VERSION and index_k.is_cuda:
+            try:
+                from flashinfer.norm import layernorm as sampler_layer_norm  # noqa: PLC0415
+            except (ImportError, AttributeError) as error:
+                raise RuntimeError(
+                    "GLM-5.2 native selector requires the sampler's FlashInfer LayerNorm kernel"
+                ) from error
+            index_k_shape = index_k.shape
+            index_k = sampler_layer_norm(
+                index_k.reshape(-1, index_k_shape[-1]),
+                self.k_norm.weight,
+                self.k_norm.bias,
+                self.k_norm.eps,
+            ).view(index_k_shape)
+        else:
+            index_k = self.k_norm(index_k)
 
-        head_weights = self.weights_proj(hidden_states).float() * self._head_weight_scale
+        if _moe_bi_router_enabled():
+            if hidden_states.dtype is not torch.bfloat16 or self.weights_proj.weight.dtype is not torch.bfloat16:
+                raise TypeError(
+                    "GLM-5.2 batch-invariant indexer projection requires BF16 hidden states and BF16 weights"
+                )
+            head_weights = bi_bf16_fp32_linear(hidden_states, self.weights_proj.weight)
+        else:
+            head_weights = self.weights_proj(hidden_states).float()
+        head_weights = head_weights * self._head_weight_scale
 
         # Split (pe, no-pe) bands so we can apply the indexer's RoPE to
         # the leading `qk_rope_head_dim`, matching the GLM DSA reference.
@@ -420,6 +452,25 @@ class Glm5DsaIndexer(nn.Module):
         """
         B, Q, H, D = index_q.shape
         K = index_k.shape[1]
+
+        if self.selector_version == GLM52_SELECTOR_VERSION:
+            allowed = self._build_allowed_mask_block(
+                attention_mask,
+                B,
+                0,
+                Q,
+                0,
+                K,
+                index_q.device,
+                query_offset=query_offset,
+            )
+            return select_glm52_logical_indices(
+                index_q,
+                index_k,
+                head_weights,
+                allowed,
+                topk=self.index_topk,
+            ).logical_indices.values
 
         # Tilelang fast path — handles BOTH Q==K (no ulysses) and Q<K with
         # query_offset (ulysses) for pure-causal attention. ~14x speedup vs

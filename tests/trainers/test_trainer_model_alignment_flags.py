@@ -34,6 +34,7 @@ def _trainer_args():
             router_fp32=False,
             lm_head_fp32=False,
             alltoall_combine_hidden_chunk_size=0,
+            canonical_moe_transport="packed_ep16_v2",
             rmsnorm_mode="sglang",
             activation_native=True,
             rope_native=True,
@@ -78,6 +79,7 @@ def test_local_trainer_forwards_model_numeric_alignment_flags(monkeypatch):
 
     assert captured["router_fp32"] is False
     assert captured["lm_head_fp32"] is False
+    assert captured["canonical_moe_transport"] == "packed_ep16_v2"
     assert captured["rmsnorm_mode"] == "sglang"
     assert captured["activation_native"] is True
     assert captured["rope_native"] is True

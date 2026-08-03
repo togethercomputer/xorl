@@ -1840,6 +1840,39 @@ def test_load_server_arguments_preserves_runner_compatibility_fields(tmp_path):
     assert config["lora"]["lora_export_format"] == "sglang_shared_outer"
 
 
+def test_load_server_arguments_threads_sparse_mla_into_model_config(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model_path": "zai-org/GLM-5",
+                "sparse_mla_enabled": True,
+                "sparse_mla_backend": "flashmla",
+                "output_dir": str(tmp_path / "outputs"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fake_qarl = types.ModuleType("xorl.qarl")
+    fake_qarl.normalize_qarl_quant_cfg = lambda value: value
+    fake_qarl.qarl_unsupported_scope_reason = lambda **_kwargs: None
+    fake_packing = types.ModuleType("xorl.server.orchestrator.packing")
+    fake_packing.ON_OVERSIZED_MODES = {"error", "skip", "truncate"}
+    fake_packing.PACKING_STRATEGIES = {"sequential", "best_fit", "balanced_dp"}
+    with patch.dict(
+        sys.modules,
+        {"xorl.qarl": fake_qarl, "xorl.server.orchestrator.packing": fake_packing},
+    ):
+        args = load_server_arguments(str(config_path))
+    model_config = args.to_config_dict()["model"]
+
+    assert args.sparse_mla_enabled is True
+    assert args.sparse_mla_backend == "flashmla"
+    assert model_config["sparse_mla_enabled"] is True
+    assert model_config["sparse_mla_backend"] == "flashmla"
+
+
 def test_load_server_arguments_threads_moe_routing_weights_before_down(tmp_path):
     config_path = tmp_path / "server_config.yaml"
     config_path.write_text(

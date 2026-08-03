@@ -227,6 +227,7 @@ def build_foundation_model(
     deepep_num_sms: int = 20,
     deepep_async_combine: bool = False,
     alltoall_combine_hidden_chunk_size: int = 0,
+    canonical_moe_transport: Literal["dense_v1", "packed_ep16_v2", "cp_sharded_v3"] = "dense_v1",
     router_fp32: bool = True,
     lm_head_fp32: bool = True,
     rmsnorm_mode: Literal[
@@ -278,6 +279,7 @@ def build_foundation_model(
     config._deepep_num_sms = deepep_num_sms
     config._deepep_async_combine = deepep_async_combine
     config._alltoall_combine_hidden_chunk_size = alltoall_combine_hidden_chunk_size
+    config.canonical_moe_transport = canonical_moe_transport
     config._router_fp32 = router_fp32
     config._lm_head_fp32 = lm_head_fp32
     routing_before_down = resolve_routing_weights_before_down(
@@ -324,6 +326,13 @@ def build_foundation_model(
         )
 
     ps = get_parallel_state()
+    if isinstance(config, Glm5Config) and config.num_hidden_layers == 78:
+        if ps.pp_size == 1:
+            config._glm52_pipeline_layer_ranges = ((0, 78),)
+        elif ps.pp_size == 2:
+            config._glm52_pipeline_layer_ranges = ((0, 38), (38, 78))
+        else:
+            raise ValueError("GLM-5.2 supports only PP1 or the supported 38/40 PP2 split")
     if ps.ringattn_size > 1 and has_linear_attention_layers(config):
         logger.warning_once(LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE)
         raise ValueError(LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE)

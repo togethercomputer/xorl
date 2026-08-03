@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from xorl.models.layers.moe.moe_block import MoEBlock, _BIRouterGemm
-from xorl.ops.batch_invariant_ops import bi_router_gemm, bi_router_topk_weights
+from xorl.ops.batch_invariant_ops import bi_bf16_fp32_linear, bi_router_gemm, bi_router_topk_weights
 
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -65,6 +65,23 @@ def test_router_gemm_autograd_backward_matches_linear():
     # grads are cast back to bf16 (the param dtype), so compare at bf16 precision
     assert torch.allclose(h1.grad.float(), h2.grad.float(), rtol=2e-2, atol=2e-2)
     assert torch.allclose(w1.grad.float(), w2.grad.float(), rtol=2e-2, atol=2e-2)
+
+
+@requires_cuda
+@pytest.mark.gpu
+def test_bf16_fp32_linear_preserves_leading_dims_and_backward():
+    hidden, weight = _inputs(6, seed=2)
+    hidden = hidden.reshape(2, 3, H).requires_grad_(True)
+    weight = weight.requires_grad_(True)
+
+    out = bi_bf16_fp32_linear(hidden, weight)
+    assert out.shape == (2, 3, E)
+    assert out.dtype is torch.float32
+    assert torch.equal(out.reshape(6, E), bi_router_gemm(hidden.detach().reshape(6, H), weight.detach()))
+
+    out.square().sum().backward()
+    assert hidden.grad is not None and hidden.grad.dtype is torch.bfloat16
+    assert weight.grad is not None and weight.grad.dtype is torch.bfloat16
 
 
 @requires_cuda

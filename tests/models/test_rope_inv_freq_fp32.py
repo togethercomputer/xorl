@@ -125,3 +125,19 @@ def test_contract_lane_bits_unchanged(rope_type: str):
 
     assert torch.equal(contract[0], stock[0]), f"{rope_type}: contract-lane cos moved"
     assert torch.equal(contract[1], stock[1]), f"{rope_type}: contract-lane sin moved"
+
+
+def test_native_default_cache_is_lazy_and_follows_execution_device():
+    rotary = _build("default", "float32", rope_native=True).model.rotary_emb
+    assert rotary._sglang_default_cache is None
+
+    positions = torch.tensor([[0, 663, 960, 1268, 1629]], dtype=torch.long)
+    x = torch.zeros(1, positions.shape[1], HEAD_DIM, dtype=torch.float32)
+    cos, sin = rotary(x, positions)
+
+    assert rotary._sglang_default_cache is not None
+    assert rotary._sglang_default_cache.device == x.device
+    assert rotary._sglang_default_cache.dtype == torch.float32
+    cached_cos, cached_sin = rotary._sglang_default_cache.index_select(0, positions.flatten()).chunk(2, dim=-1)
+    assert torch.equal(cos[..., : HEAD_DIM // 2].reshape_as(cached_cos), cached_cos)
+    assert torch.equal(sin[..., : HEAD_DIM // 2].reshape_as(cached_sin), cached_sin)

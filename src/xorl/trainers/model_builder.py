@@ -122,6 +122,7 @@ def build_training_model(
     deepep_num_sms: int = 20,
     deepep_async_combine: bool = False,
     alltoall_combine_hidden_chunk_size: int = 0,
+    canonical_moe_transport: str = "dense_v1",
     init_device: str = "meta",
     merge_qkv: bool = True,
     # --- LoRA ---
@@ -245,6 +246,7 @@ def build_training_model(
         deepep_num_sms=deepep_num_sms,
         deepep_async_combine=deepep_async_combine,
         alltoall_combine_hidden_chunk_size=alltoall_combine_hidden_chunk_size,
+        canonical_moe_transport=canonical_moe_transport,
         router_fp32=router_fp32,
         lm_head_fp32=lm_head_fp32,
         rmsnorm_mode=rmsnorm_mode,

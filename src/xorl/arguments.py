@@ -534,6 +534,14 @@ class ModelArguments:
             "Useful for long-context MoE runs where the full combine tensor is a memory peak."
         },
     )
+    canonical_moe_transport: Literal["dense_v1", "packed_ep16_v2", "cp_sharded_v3"] = field(
+        default="dense_v1",
+        metadata={
+            "help": "GLM-5.2 canonical MoE owner transport. packed_ep16_v2 is the explicit "
+            "EP16/CP16 packed equal-split mode; cp_sharded_v3 delivers "
+            "rank-major CP buckets directly to their consumers; dense_v1 remains the default."
+        },
+    )
     basic_modules: Optional[List[str]] = field(
         default_factory=list,
         metadata={"help": "Basic modules beyond model._no_split_modules to be sharded in FSDP."},
@@ -591,7 +599,7 @@ class ModelArguments:
             "path runs instead — same algebra, fewer optimisations."
         },
     )
-    sparse_mla_backend: Literal["auto", "torch", "tilelang"] = field(
+    sparse_mla_backend: Literal["auto", "torch", "tilelang", "flashmla"] = field(
         default="auto",
         metadata={
             "help": "Backend for sparse-MLA dispatch when `sparse_mla_enabled=True`. "
@@ -599,7 +607,10 @@ class ModelArguments:
             "constraints hold (`dim_plus_tail_dim == 576`, `topk % 64 == 0`), else "
             "the torch reference. 'torch' is the dense-gather reference, correct but "
             "slow; useful for CPU/CI and as a fallback. 'tilelang' forces the "
-            "vendored kernel. The earlier BWD NaN was caused by "
+            "vendored kernel. 'flashmla' uses the sampler-exact public "
+            "FlashMLA forward at the GLM-5.2 production shape and the "
+            "TileLang derivative kernel for a separately gated backward. "
+            "The earlier BWD NaN was caused by "
             "TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE in pass_configs aliasing "
             "acc_dkv_shared onto a buffer the dq gemm was still reading — dropping "
             "that flag restored correctness."

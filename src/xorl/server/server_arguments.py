@@ -134,6 +134,15 @@ class ServerArguments:
         },
     )
 
+    canonical_moe_transport: Literal["dense_v1", "packed_ep16_v2", "cp_sharded_v3"] = field(
+        default="dense_v1",
+        metadata={
+            "help": "GLM-5.2 canonical MoE owner transport. packed_ep16_v2 is the explicit "
+            "EP16/CP16 packed equal-split mode; cp_sharded_v3 delivers "
+            "rank-major CP buckets directly to their consumers; dense_v1 remains the default."
+        },
+    )
+
     # SGLang numerical alignment flags
     router_fp32: bool = field(
         default=True, metadata={"help": "Upcast MoE router gate computation to float32 for numerical stability."}
@@ -180,6 +189,19 @@ class ServerArguments:
     flash_attention_deterministic: bool = field(
         default=False,
         metadata={"help": "Request FlashAttention deterministic backward kernels when available."},
+    )
+
+    sparse_mla_enabled: bool = field(
+        default=False,
+        metadata={"help": "Enable the GLM-5 sparse-MLA path instead of materializing dense attention masks."},
+    )
+
+    sparse_mla_backend: Literal["auto", "torch", "tilelang", "flashmla"] = field(
+        default="auto",
+        metadata={
+            "help": "Sparse-MLA backend used when sparse_mla_enabled is true. "
+            "'flashmla' selects the GLM-5.2 serving-exact forward with a separately gated TileLang backward."
+        },
     )
 
     # Multimodal model configuration
@@ -1353,6 +1375,7 @@ class ServerArguments:
                 "deepep_num_sms": self.deepep_num_sms,
                 "deepep_async_combine": self.deepep_async_combine,
                 "alltoall_combine_hidden_chunk_size": self.alltoall_combine_hidden_chunk_size,
+                "canonical_moe_transport": self.canonical_moe_transport,
                 "foundation": self.foundation,
                 "encoders": self.encoders,
                 "basic_modules": self.basic_modules,
@@ -1365,6 +1388,8 @@ class ServerArguments:
                 "rope_class_b": self.rope_class_b,
                 "attention_cast_bf16": self.attention_cast_bf16,
                 "flash_attention_deterministic": self.flash_attention_deterministic,
+                "sparse_mla_enabled": self.sparse_mla_enabled,
+                "sparse_mla_backend": self.sparse_mla_backend,
             },
             "train": {
                 "output_dir": self.output_dir,
