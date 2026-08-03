@@ -130,6 +130,33 @@ def synchronize_ep_replicated_gradients(
     if ep_group is None or torch.distributed.get_world_size(ep_group) <= 1:
         return GradientSyncStats()
 
+    return synchronize_replicated_gradient_parameters(parameters, ep_group=ep_group, bucket_bytes=bucket_bytes)
+
+
+@torch.no_grad()
+def synchronize_replicated_gradient_parameters(
+    parameters: Iterable[torch.Tensor],
+    *,
+    ep_group: torch.distributed.ProcessGroup,
+    bucket_bytes: int = _DEFAULT_BUCKET_BYTES,
+) -> GradientSyncStats:
+    """Reduce a selected set of replicated gradients across one EP group.
+
+    ``parameters`` may be model parameters or independent adapter-slot
+    parameters.  Keeping this primitive independent of model metadata is
+    deliberate: adapter slots are the canonical accumulation boundary for
+    multi-adapter training, so their gradients must be reduced after all
+    streamed ``forward_backward`` calls have been captured.
+    """
+
+    parameters = list(parameters)
+    if not parameters:
+        return GradientSyncStats()
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return GradientSyncStats()
+    if torch.distributed.get_world_size(ep_group) <= 1:
+        return GradientSyncStats()
+
     bucket_limit = max(int(bucket_bytes), 1)
     buckets: dict[torch.device, list[torch.Tensor]] = {}
     for parameter in parameters:

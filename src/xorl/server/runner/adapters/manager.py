@@ -28,6 +28,14 @@ import torch.nn as nn
 from safetensors import safe_open
 from safetensors.torch import save_file as safetensors_save_file
 
+from xorl.distributed.ep_gradient_diagnostics import (
+    gradient_trace_enabled,
+    trace_replicated_gradient_stage,
+)
+from xorl.distributed.ep_gradients import (
+    GradientSyncStats,
+    synchronize_replicated_gradient_parameters,
+)
 from xorl.lora.target_manifest import load_lora_target_manifest
 from xorl.lora.utils import (
     convert_peft_lora_state_dict,
@@ -388,6 +396,7 @@ class AdapterState:
     global_step: int = 0
     global_forward_backward_step: int = 0
     lr: float = 1e-5
+    gradient_source: Optional[str] = None  # "model" needs EP reduction; "logical" is already global.
     last_access_time: float = field(default_factory=time.time)  # For LRU eviction
 
     @property
@@ -634,11 +643,11 @@ class LoRAAdapterManager:
         local_descriptor_records = [
             (layout.replica_key, layout.replica_count)
             for layout in state.tensor_layouts.values()
-            if layout.replica_count > 1
+            if layout.needs_ep_gradient_sync
         ]
         for name in sorted(state.local_params):
             layout = state.tensor_layouts[name]
-            if layout.replica_count <= 1:
+            if not layout.needs_ep_gradient_sync:
                 continue
             value = state.local_params[name].grad if gradients else state.local_params[name].detach()
             local_payload.append((layout.replica_key, None if value is None else value.detach().cpu().contiguous()))
@@ -658,6 +667,8 @@ class LoRAAdapterManager:
         for rank_payload in gathered:
             for key, value in rank_payload:
                 by_key.setdefault(tuple(key), []).append(value)
+        checked_rectangles = 0
+        checked_replica_values = 0
         for key in global_keys:
             expected_counts = descriptor_expected.get(key, set())
             expected_count = next(iter(expected_counts)) if len(expected_counts) == 1 else -1
@@ -668,6 +679,8 @@ class LoRAAdapterManager:
                 )
             if expected_count <= 1:
                 continue
+            checked_rectangles += 1
+            checked_replica_values += expected_count
             values = by_key.get(key, [])
             if len(values) != expected_count:
                 raise RuntimeError(f"Replica value count changed for {key[0]!r}: {len(values)}")
@@ -676,6 +689,23 @@ class LoRAAdapterManager:
                 raise RuntimeError(f"Replica gradient/weight presence diverged for {key[0]!r}")
             if reference is not None and any(not torch.equal(reference, value) for value in values[1:]):
                 raise RuntimeError(f"Replica values diverged for logical rectangle {key[0]!r}")
+
+        if torch.distributed.get_rank() == 0:
+            phase = "gradient" if gradients else "parameter"
+            logger.info(
+                "Adapter EP replica coherence: "
+                + json.dumps(
+                    {
+                        "phase": phase,
+                        "step": state.global_step + (0 if gradients else 1),
+                        "passed": True,
+                        "descriptor_universe_size": len(global_keys),
+                        "checked_rectangles": checked_rectangles,
+                        "checked_replica_values": checked_replica_values,
+                    },
+                    sort_keys=True,
+                )
+            )
 
     @staticmethod
     def _optimizer_state_digest(optimizer_state: Dict[str, Any]) -> str:
@@ -708,11 +738,11 @@ class LoRAAdapterManager:
         local_descriptor_records = [
             (layout.replica_key, layout.replica_count)
             for layout in state.tensor_layouts.values()
-            if layout.replica_count > 1
+            if layout.needs_ep_gradient_sync
         ]
         for name in sorted(state.local_params):
             layout = state.tensor_layouts[name]
-            if layout.replica_count <= 1:
+            if not layout.needs_ep_gradient_sync:
                 continue
             optimizer_state = state.optimizer.state.get(state.local_params[name], {})
             local_payload.append((layout.replica_key, self._optimizer_state_digest(optimizer_state)))
@@ -733,6 +763,8 @@ class LoRAAdapterManager:
         for rank_payload in gathered:
             for key, digest in rank_payload:
                 by_key.setdefault(tuple(key), []).append(digest)
+        checked_rectangles = 0
+        checked_replica_values = 0
         for key in global_keys:
             expected_counts = descriptor_expected.get(key, set())
             expected_count = next(iter(expected_counts)) if len(expected_counts) == 1 else -1
@@ -743,11 +775,197 @@ class LoRAAdapterManager:
                 )
             if expected_count <= 1:
                 continue
+            checked_rectangles += 1
+            checked_replica_values += expected_count
             digests = by_key.get(key, [])
             if len(digests) != expected_count:
                 raise RuntimeError(f"Optimizer replica value count changed for {key[0]!r}: {len(digests)}")
             if any(value != digests[0] for value in digests[1:]):
                 raise RuntimeError(f"Optimizer state diverged for logical rectangle {key[0]!r}")
+
+        if torch.distributed.get_rank() == 0:
+            logger.info(
+                "Adapter EP optimizer-state coherence: "
+                + json.dumps(
+                    {
+                        "phase": "optimizer_state",
+                        "step": state.global_step + 1,
+                        "passed": True,
+                        "descriptor_universe_size": len(global_keys),
+                        "checked_rectangles": checked_rectangles,
+                        "checked_replica_values": checked_replica_values,
+                    },
+                    sort_keys=True,
+                )
+            )
+
+    @staticmethod
+    def _rectangles_overlap(
+        left_offset: tuple[int, ...],
+        left_shape: tuple[int, ...],
+        right_offset: tuple[int, ...],
+        right_shape: tuple[int, ...],
+    ) -> bool:
+        return all(
+            max(left_start, right_start) < min(left_start + left_size, right_start + right_size)
+            for left_start, left_size, right_start, right_size in zip(
+                left_offset, left_shape, right_offset, right_shape, strict=True
+            )
+        )
+
+    def _validate_ep_owner_layout(self, state: AdapterState) -> None:
+        """Verify that disjoint EP-owned rectangles never overlap across ranks.
+
+        Shared factors are intentionally excluded: their explicit ``EP_SUM``
+        reduction domain means identical rectangles are replicas. Expert
+        factors, by contrast, have ``gradient_reduction=NONE`` and must have
+        disjoint active logical rectangles, including when eFSDP subdivides a
+        local expert rectangle.
+
+        This is an owner-layout check only. It does not prove that gradient
+        values were not numerically contaminated across owners; that requires
+        the Tier-B expert-pattern test.
+        """
+
+        if (
+            not self._replica_validation_enabled()
+            or not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+            or torch.distributed.get_world_size() <= 1
+        ):
+            return
+
+        local_records = []
+        for name in sorted(state.local_params):
+            layout = state.tensor_layouts[name]
+            if not layout.is_ep_owned or layout.gradient_reduction.value != "none" or not layout.has_active_storage:
+                continue
+            local_records.append(
+                (
+                    layout.fqn,
+                    tuple(layout.active_global_offset),
+                    tuple(layout.active_storage_shape),
+                    tuple(layout.replica_key),
+                )
+            )
+
+        gathered: list[list[tuple[Any, ...]] | None] = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered, local_records)
+        by_fqn: dict[str, list[tuple[tuple[int, ...], tuple[int, ...], tuple[Any, ...], int]]] = {}
+        for rank, records in enumerate(gathered):
+            for fqn, offset, shape, replica_key in records or []:
+                by_fqn.setdefault(str(fqn), []).append((tuple(offset), tuple(shape), tuple(replica_key), rank))
+
+        overlaps: list[dict[str, Any]] = []
+        for fqn, records in by_fqn.items():
+            for index, (left_offset, left_shape, left_key, left_rank) in enumerate(records):
+                for right_offset, right_shape, right_key, right_rank in records[index + 1 :]:
+                    if self._rectangles_overlap(left_offset, left_shape, right_offset, right_shape):
+                        overlaps.append(
+                            {
+                                "fqn": fqn,
+                                "left_rank": left_rank,
+                                "left_offset": left_offset,
+                                "left_shape": left_shape,
+                                "right_rank": right_rank,
+                                "right_offset": right_offset,
+                                "right_shape": right_shape,
+                                "left_replica_key": left_key,
+                                "right_replica_key": right_key,
+                            }
+                        )
+        if overlaps:
+            raise RuntimeError(
+                "Cross-owner EP adapter rectangle overlap detected: " + json.dumps(overlaps, sort_keys=True)
+            )
+        if torch.distributed.get_rank() == 0:
+            logger.info(
+                "Adapter EP owner layout: "
+                + json.dumps(
+                    {
+                        "phase": "owner_layout",
+                        "step": state.global_step + 1,
+                        "passed": True,
+                        "cross_owner_contamination": "not_tested",
+                        "checked_rectangles": sum(len(records) for records in by_fqn.values()),
+                        "checked_fqns": len(by_fqn),
+                    },
+                    sort_keys=True,
+                )
+            )
+
+    @staticmethod
+    def _factor_kind(name: str) -> str | None:
+        if "lora_A" in name or "_lora_A" in name:
+            return "A"
+        if "lora_B" in name or "_lora_B" in name:
+            return "B"
+        return None
+
+    def _capture_factor_movement_probes(self, state: AdapterState) -> dict[str, tuple[str, torch.Tensor]]:
+        """Clone one shared A/B rectangle for cheap per-step movement evidence."""
+
+        candidates: dict[str, list[tuple[str, AdapterTensorLayout, nn.Parameter]]] = {"A": [], "B": []}
+        for name in sorted(state.local_params):
+            kind = self._factor_kind(name)
+            if kind is None or state.local_params[name].numel() == 0:
+                continue
+            candidates[kind].append((name, state.tensor_layouts[name], state.local_params[name]))
+        probes: dict[str, tuple[str, torch.Tensor]] = {}
+        for kind, values in candidates.items():
+            values.sort(key=lambda item: (not item[1].needs_ep_gradient_sync, item[0]))
+            if values:
+                name, _, parameter = values[0]
+                probes[kind] = (name, parameter.detach().clone())
+        return probes
+
+    def _log_factor_movement(
+        self,
+        state: AdapterState,
+        probes: dict[str, tuple[str, torch.Tensor]],
+    ) -> None:
+        """Record A/B probe movement after a successful optimizer update."""
+
+        if not probes:
+            return
+        local: dict[str, dict[str, Any]] = {}
+        for kind, (name, before) in probes.items():
+            after = state.local_params[name].detach()
+            delta = after.to(torch.float32) - before.to(torch.float32)
+            local[kind] = {
+                "name": name,
+                "before_norm": float(torch.linalg.vector_norm(before.to(torch.float32)).item()),
+                "after_norm": float(torch.linalg.vector_norm(after.to(torch.float32)).item()),
+                "delta_norm": float(torch.linalg.vector_norm(delta).item()),
+                "changed": not torch.equal(before, after),
+            }
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            gathered: list[dict[str, dict[str, Any]] | None] = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(gathered, local)
+        else:
+            gathered = [local]
+        if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+        record: dict[str, Any] = {
+            "phase": "movement",
+            "step": state.global_step + 1,
+            "passed": True,
+        }
+        for kind in ("A", "B"):
+            values = [item[kind] for item in gathered if item is not None and kind in item]
+            if not values:
+                record[kind] = {"present": False}
+                continue
+            record[kind] = {
+                "present": True,
+                "name": values[0]["name"],
+                "before_norm": values[0]["before_norm"],
+                "after_norm": values[0]["after_norm"],
+                "delta_norm": max(value["delta_norm"] for value in values),
+                "changed_ranks": sum(bool(value["changed"]) for value in values),
+                "rank_count": len(values),
+            }
+        logger.info("Adapter LoRA factor movement: " + json.dumps(record, sort_keys=True))
 
     @staticmethod
     def _is_lora_b(name: str) -> bool:
@@ -1223,9 +1441,12 @@ class LoRAAdapterManager:
         state = self.adapters[model_id]
         self._validate_model_layout_identity(state)
 
+        captured_any = False
         for name, param in self.model.named_parameters():
             if name not in state.local_params or param.grad is None:
                 continue
+            if state.gradient_source not in {None, "model"}:
+                raise RuntimeError("Cannot mix model-local and logical-coordinate gradients in one optimizer step")
             adapter_param = state.local_params[name]
             raw_grad = param.grad
             local_grad = raw_grad.to_local() if _HAS_DTENSOR and isinstance(raw_grad, DTensor) else raw_grad
@@ -1238,6 +1459,90 @@ class LoRAAdapterManager:
             # Parameter. AnyPrecision/fused optimizers convert their state
             # internally, so retaining FP32 here is both illegal and unnecessary.
             self._accumulate_adapter_gradient(adapter_param, grad, accumulate=True)
+            captured_any = True
+
+        if captured_any:
+            state.gradient_source = "model"
+
+        if gradient_trace_enabled():
+            self._trace_adapter_gradient_stage(
+                state,
+                stage=f"after_adapter_accumulation_{state.global_forward_backward_step}",
+            )
+
+    def _ep_group(self):
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return None
+        from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+
+        parallel_state = get_parallel_state()
+        if not parallel_state.ep_enabled:
+            return None
+        return parallel_state.ep_group
+
+    def _trace_adapter_gradient_stage(self, state: AdapterState, *, stage: str) -> None:
+        ep_group = self._ep_group()
+        if ep_group is None or torch.distributed.get_world_size(ep_group) <= 1:
+            return
+        values = {
+            name: state.local_params[name].grad
+            for name in _canonical_parameter_order(state.local_params)
+            if state.tensor_layouts[name].needs_ep_gradient_sync
+        }
+        trace_replicated_gradient_stage(stage=stage, values=values, ep_group=ep_group)
+
+    def trace_model_gradient_stage(self, model_id: str, *, stage: str) -> None:
+        """Trace replicated model gradients before adapter capture, when enabled."""
+
+        if not gradient_trace_enabled():
+            return
+        state = self.get_adapter_state(model_id)
+        ep_group = self._ep_group()
+        if ep_group is None or torch.distributed.get_world_size(ep_group) <= 1:
+            return
+        values = {}
+        for name, param in self.model.named_parameters():
+            layout = state.tensor_layouts.get(name)
+            if layout is None or not layout.needs_ep_gradient_sync:
+                continue
+            if param.grad is None:
+                values[name] = None
+                continue
+            raw_grad = param.grad
+            local_grad = raw_grad.to_local() if _HAS_DTENSOR and isinstance(raw_grad, DTensor) else raw_grad
+            values[name] = layout.pack_from_local(wait_for_local_tensor(local_grad))
+        trace_replicated_gradient_stage(stage=stage, values=values, ep_group=ep_group)
+
+    def synchronize_replicated_gradients(self, model_id: str) -> GradientSyncStats:
+        """Reduce accumulated shared-factor gradients across the EP group.
+
+        Model gradients are scratch state and are copied into the adapter-owned
+        parameters once per streamed ``forward_backward`` call. Reduction must
+        therefore happen on those adapter slots, after accumulation, so every
+        backend follows the same one-collective-at-the-optimizer-boundary
+        contract.
+        """
+
+        state = self.get_adapter_state(model_id)
+        replicated_parameters = [
+            state.local_params[name]
+            for name in _canonical_parameter_order(state.local_params)
+            if state.tensor_layouts[name].needs_ep_gradient_sync
+        ]
+        if not replicated_parameters:
+            return GradientSyncStats()
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return GradientSyncStats()
+
+        from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+
+        parallel_state = get_parallel_state()
+        if not parallel_state.ep_enabled:
+            return GradientSyncStats()
+        ep_group = parallel_state.ep_group
+        if ep_group is None or torch.distributed.get_world_size(ep_group) <= 1:
+            return GradientSyncStats()
+        return synchronize_replicated_gradient_parameters(replicated_parameters, ep_group=ep_group)
 
     def optim_step(
         self,
@@ -1273,12 +1578,38 @@ class LoRAAdapterManager:
         # Update learning rate
         self._update_state_learning_rate(state, lr)
 
+        self._trace_adapter_gradient_stage(state, stage="before_token_normalization")
+
         # Deferred gradient normalization: scale raw gradients by 1/accumulated_valid_tokens
         if accumulated_valid_tokens > 0:
             scale = 1.0 / accumulated_valid_tokens
             for p in state.local_params.values():
                 if p.grad is not None:
                     p.grad.mul_(scale)
+        self._trace_adapter_gradient_stage(state, stage="after_token_normalization")
+
+        # All backend backward implementations return local shared-factor
+        # gradients. Reduce the accumulated adapter slots exactly once before
+        # finite checks, coherence validation, clipping, and optimizer use.
+        sync_stats = (
+            self.synchronize_replicated_gradients(model_id)
+            if state.gradient_source == "model"
+            else GradientSyncStats()
+        )
+        self._trace_adapter_gradient_stage(state, stage="after_optimizer_boundary_reduction")
+        if sync_stats.configured_parameter_count and (
+            not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+            or torch.distributed.get_rank() == 0
+        ):
+            logger.info(
+                "Adapter EP replicated gradient sync: "
+                f"configured_parameters={sync_stats.configured_parameter_count} "
+                f"participating_parameters={sync_stats.participating_parameter_count} "
+                f"buckets={sync_stats.bucket_count} "
+                f"gradient_bytes={sync_stats.gradient_bytes} "
+                f"reduced_bytes={sync_stats.reduced_bytes}"
+            )
 
         optimizer_params = [
             state.local_params[name]
@@ -1312,11 +1643,13 @@ class LoRAAdapterManager:
         if not all_finite:
             for param in state.local_params.values():
                 param.grad = None
+            state.gradient_source = None
             raise FloatingPointError(
                 f"Non-finite adapter gradient detected for model_id={model_id}; "
                 "all ranks skipped the optimizer step and cleared gradients."
             )
 
+        self._validate_ep_owner_layout(state)
         self._validate_replica_coherence(state, gradients=True)
 
         if gradient_clip is None or gradient_clip <= 0:
@@ -1339,7 +1672,11 @@ class LoRAAdapterManager:
                 if param.grad is None or param.numel() == 0:
                     continue
                 grad_sum_sq = param.grad.detach().to(torch.float32).square().sum()
-                local_sum_sq = local_sum_sq + grad_sum_sq / max(state.tensor_layouts[name].replica_count, 1)
+                layout = state.tensor_layouts[name]
+                # Logical gradients are already global, so every physical EP
+                # replica contributes to the world norm exactly once.
+                replica_divisor = max(layout.replica_count, 1)
+                local_sum_sq = local_sum_sq + grad_sum_sq / replica_divisor
             if distributed and world > 1:
                 torch.distributed.all_reduce(local_sum_sq, op=torch.distributed.ReduceOp.SUM, group=group)
             grad_norm = float(torch.sqrt(local_sum_sq).item())
@@ -1354,15 +1691,21 @@ class LoRAAdapterManager:
                     if param.grad is not None:
                         param.grad.mul_(clip_coefficient)
 
+        movement_probes = (
+            self._capture_factor_movement_probes(state) if self._replica_validation_enabled() else {}
+        )
         state.optimizer.step()
         if self.device.type == "cuda":
             torch.cuda.current_stream(self.device).synchronize()
+        self._validate_replica_coherence(state, gradients=False)
         self._validate_optimizer_replica_coherence(state)
+        self._log_factor_movement(state, movement_probes)
         try:
             state.optimizer.zero_grad(set_to_none=True)
         except TypeError:
             state.optimizer.zero_grad()
         state.global_step += 1
+        state.gradient_source = None
         return grad_norm
 
     def sync_weights_to_model(self, model_id: str) -> None:
@@ -1538,9 +1881,12 @@ class LoRAAdapterManager:
         unexpected = sorted(set(converted_by_name) - set(expected_names))
         if unexpected:
             raise ValueError(f"Logical gradient state contains unexpected parameters: {unexpected!r}")
+        loaded_any = False
         with torch.no_grad():
             for canonical_name, logical_gradient in converted_by_name.items():
                 actual_name = expected_names[canonical_name]
+                if state.gradient_source not in {None, "logical"}:
+                    raise RuntimeError("Cannot mix logical-coordinate and model-local gradients in one optimizer step")
                 layout = state.tensor_layouts[actual_name]
                 if tuple(logical_gradient.shape) != layout.logical_shape:
                     raise ValueError(
@@ -1553,6 +1899,11 @@ class LoRAAdapterManager:
                     local_gradient,
                     accumulate=accumulate,
                 )
+                loaded_any = True
+        if loaded_any:
+            state.gradient_source = "logical"
+        if gradient_trace_enabled():
+            self._trace_adapter_gradient_stage(state, stage="after_logical_gradient_accumulation")
 
     def _pack_logical_state_dict(
         self, state: AdapterState, state_dict: Dict[str, torch.Tensor]

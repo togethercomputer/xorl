@@ -7201,19 +7201,10 @@ class ModelRunner:
         # This must happen AFTER all micro-batches have accumulated gradients in model params,
         # but BEFORE optim_step. Each adapter has its own .grad slots to prevent collision.
         if self._adapter_manager is not None:
-            # FSDP has completed its eFSDP reduce-scatter by this point. Native/eager
-            # MoE shared factors still need one coalesced reduction across EP before
-            # their local rectangles are copied into the adapter optimizer.
-            sync_stats = synchronize_ep_replicated_gradients(self.model)
-            if sync_stats.configured_parameter_count:
-                logger.info_rank0(
-                    "EP replicated gradient sync: "
-                    f"configured_parameters={sync_stats.configured_parameter_count} "
-                    f"participating_parameters={sync_stats.participating_parameter_count} "
-                    f"buckets={sync_stats.bucket_count} "
-                    f"gradient_bytes={sync_stats.gradient_bytes} "
-                    f"reduced_bytes={sync_stats.reduced_bytes}"
-                )
+            self._adapter_manager.trace_model_gradient_stage(
+                model_id,
+                stage="after_efsdp_reduce_scatter",
+            )
             self._adapter_manager.capture_gradients(model_id)
 
         # Get step counter (use adapter manager if available, else global)

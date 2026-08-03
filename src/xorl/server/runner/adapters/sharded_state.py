@@ -25,6 +25,11 @@ import torch.nn as nn
 from torch.distributed._tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
+from xorl.distributed.gradient_reduction import (
+    GradientReductionDomain,
+    validate_gradient_reduction_domain,
+)
+
 
 _MASK63 = (1 << 63) - 1
 
@@ -163,10 +168,26 @@ class AdapterTensorLayout:
     replica_count: int = 1
     replica_key: tuple[Any, ...] = ()
     placement_signature: tuple[Any, ...] = ()
+    gradient_reduction: GradientReductionDomain = GradientReductionDomain.NONE
 
     @property
     def has_active_storage(self) -> bool:
         return all(size > 0 for size in self.active_storage_shape)
+
+    @property
+    def needs_ep_gradient_sync(self) -> bool:
+        """Whether this active rectangle needs the canonical EP gradient sum."""
+
+        return self.replica_count > 1 and self.gradient_reduction is GradientReductionDomain.EP_SUM
+
+    @property
+    def is_ep_owned(self) -> bool:
+        """Whether the model placement explicitly assigns this tensor to EP."""
+
+        # ``_placement_signature`` stores this explicit ownership bit for both
+        # DTensor and already-local parameters. Keeping it as a layout
+        # property avoids inferring ownership from backend names or shapes.
+        return bool(self.placement_signature and self.placement_signature[-1] is True)
 
     @property
     def active_global_offset(self) -> tuple[int, ...]:
@@ -205,6 +226,7 @@ class AdapterTensorLayout:
             "placement_signature": [
                 list(item) if isinstance(item, tuple) else item for item in self.placement_signature
             ],
+            "gradient_reduction": self.gradient_reduction.value,
         }
 
     def pack_from_local(self, local_tensor: torch.Tensor) -> torch.Tensor:
@@ -280,6 +302,9 @@ def _base_layout_for_parameter(
         local_logical_offset = tuple(0 for _ in substrate_shape)
 
     spec_info = _spec_info(model, name, raw_param)
+    gradient_reduction = validate_gradient_reduction_domain(
+        getattr(spec_info, "gradient_reduction", GradientReductionDomain.NONE)
+    )
     ep_owned = _is_explicit_ep_layout(model, name, spec_info)
     if ep_owned:
         placement = getattr(spec_info, "placement", None)
@@ -336,6 +361,7 @@ def _base_layout_for_parameter(
         active_storage_shape=active_storage_shape,
         replica_key=replica_key,
         placement_signature=placement_signature,
+        gradient_reduction=gradient_reduction,
     )
 
 
@@ -346,6 +372,7 @@ def _descriptor_from_layout(layout: AdapterTensorLayout) -> dict[str, Any]:
         "local_logical_offset": list(layout.local_logical_offset),
         "local_logical_shape": list(layout.local_logical_shape),
         "dtype": _dtype_name(layout.dtype),
+        "gradient_reduction": layout.gradient_reduction.value,
     }
 
 
@@ -392,6 +419,7 @@ def discover_adapter_layouts(
         descriptor["fqn"]: (
             tuple(descriptor["logical_shape"]),
             descriptor["dtype"],
+            descriptor["gradient_reduction"],
         )
         for descriptor in local_descriptors
     }
@@ -403,8 +431,9 @@ def discover_adapter_layouts(
             static = (
                 tuple(descriptor["logical_shape"]),
                 descriptor["dtype"],
+                descriptor["gradient_reduction"],
             )
-            if static[0] != expected_static[key][0] or static[1] != expected_static[key][1]:
+            if static != expected_static[key]:
                 raise RuntimeError(f"Incompatible logical LoRA layout for {key!r} on rank {rank}")
 
     replica_counts = Counter(

@@ -21,13 +21,13 @@ import torch.nn as nn
 from safetensors.torch import save_file
 from torch.distributed._tensor import DeviceMesh, DTensor, Replicate, Shard
 
+from xorl.distributed.gradient_reduction import GradientReductionDomain
 from xorl.distributed.parallel_plan import SpecInfo
-from xorl.distributed.parallel_state import init_parallel_state
+from xorl.distributed.parallel_state import get_parallel_state, init_parallel_state
 from xorl.server.runner.adapters.manager import (
     LoRAAdapterManager,
     save_adapter_optimizer_shards,
 )
-from xorl.server.runner.adapters.sharded_state import pack_logical_tensor
 from xorl.server.session_spec import write_session_spec
 
 
@@ -152,7 +152,12 @@ def _build_model(mesh: DeviceMesh, rank: int) -> _TopologyModel:
         elif name.startswith("expert."):
             model._fqn2spec_info[name] = SpecInfo(mesh, Shard(0), name)
         else:
-            model._fqn2spec_info[name] = SpecInfo(mesh, Replicate(), name)
+            model._fqn2spec_info[name] = SpecInfo(
+                mesh,
+                Replicate(),
+                name,
+                gradient_reduction=GradientReductionDomain.EP_SUM,
+            )
     return model
 
 
@@ -183,36 +188,6 @@ def _logical_grads(manager: LoRAAdapterManager, model_id: str, scale: float) -> 
             name: (state.tensor_layouts[name], state.local_params[name]) for name in state.local_params
         }.items()
     }
-
-
-def _capture_logical_gradients(
-    manager: LoRAAdapterManager, model_id: str, logical_grads: dict[str, torch.Tensor]
-) -> None:
-    state = manager.get_adapter_state(model_id)
-    model_params = dict(manager.model.named_parameters())
-    manager.prepare_forward(model_id)
-    for name, model_param in model_params.items():
-        layout = state.tensor_layouts[name]
-        model_dtensor = model_param.data
-        local = layout.unpack_to_local(pack_logical_tensor(layout, logical_grads[name]))
-        model_param.grad = DTensor.from_local(
-            local,
-            model_dtensor.device_mesh,
-            list(model_dtensor.placements),
-            shape=tuple(model_dtensor.shape),
-            stride=tuple(model_dtensor.stride()),
-            run_check=False,
-        )
-
-    original_full_tensor = DTensor.full_tensor
-    DTensor.full_tensor = lambda *args, **kwargs: (_ for _ in ()).throw(
-        AssertionError("capture_gradients must not call DTensor.full_tensor")
-    )
-    try:
-        manager.capture_gradients(model_id)
-    finally:
-        DTensor.full_tensor = original_full_tensor
-    assert all(param.grad is None for param in model_params.values())
 
 
 def _gather_logical_state(manager: LoRAAdapterManager, model_id: str) -> dict[str, torch.Tensor] | None:
@@ -343,12 +318,10 @@ def _run_topology_integration_worker() -> None:
     rank = dist.get_rank()
     world = dist.get_world_size()
     assert world == 4
-    init_parallel_state(dp_size=world, dp_mode="none", device_type="cpu")
-    mesh = DeviceMesh(
-        "cpu",
-        torch.tensor([[0, 1], [2, 3]], dtype=torch.int64),
-        mesh_dim_names=("ep", "ep_fsdp"),
-    )
+    init_parallel_state(dp_size=world, ep_size=2, dp_mode="none", device_type="cpu")
+    # Use the same EP/eFSDP rank order as the initialized parallel state. This
+    # keeps the model's DTensor mesh and the manager's EP process group aligned.
+    mesh = get_parallel_state().ep_fsdp_device_mesh
     root = Path("/tmp") / f"xorl-topology-integration-{os.environ.get('MASTER_PORT', 'default')}"
     if rank == 0:
         shutil.rmtree(root, ignore_errors=True)
@@ -363,6 +336,8 @@ def _run_topology_integration_worker() -> None:
     assert state.tensor_layouts["expert.lora_A"].local_substrate_shape == (2, 2, 4)
     assert state.tensor_layouts["shared.lora_A"].replica_count == 2
     assert state.tensor_layouts["ordinary.lora_A"].replica_count == 2
+    assert state.tensor_layouts["shared.lora_A"].needs_ep_gradient_sync
+    assert not state.tensor_layouts["ordinary.lora_A"].needs_ep_gradient_sync
     assert state.tensor_layouts["ordinary.lora_A"].local_logical_offset[0] in {0, 2}
     local_slot_elements = sum(param.numel() for param in state.local_params.values())
     full_substrate_elements = sum(
@@ -374,6 +349,30 @@ def _run_topology_integration_worker() -> None:
             "Topology adapter accounting: "
             f"local_slot_elements={local_slot_elements} full_substrate_elements={full_substrate_elements}"
         )
+
+    # Exercise the model-gradient ingress path separately from the logical
+    # gradient path below. Each rank contributes a different local gradient;
+    # the adapter-boundary reducer must sum it across the EP group before the
+    # replica-coherence check and optimizer step.
+    captured_id = "captured"
+    manager.register_adapter(captured_id, session_spec=_session_spec(), initialize_fresh=True)
+    for name, parameter in model.named_parameters():
+        raw = parameter.data
+        local = raw.to_local()
+        local_gradient = torch.full_like(local, float(rank + 1))
+        parameter.grad = DTensor.from_local(
+            local_gradient,
+            raw.device_mesh,
+            raw.placements,
+            run_check=False,
+        )
+    manager.capture_gradients(captured_id)
+    captured_norm = manager.optim_step(captured_id, lr=1e-2, accumulated_valid_tokens=1)
+    _collective_assert(captured_norm > 0.0, "model-gradient adapter boundary reduction produced no norm")
+    _collective_assert(
+        manager.get_adapter_state(captured_id).global_step == 1,
+        "model-gradient adapter boundary reduction did not complete an optimizer step",
+    )
 
     initial = _gather_logical_state(manager, "topology")
     reference_parameters = None
@@ -391,8 +390,8 @@ def _run_topology_integration_worker() -> None:
         )
 
     grads_one = _logical_grads(manager, "topology", 1.0)
-    _capture_logical_gradients(manager, "topology", grads_one)
-    _capture_logical_gradients(manager, "topology", grads_one)
+    manager.load_logical_gradients("topology", grads_one, accumulate=True)
+    manager.load_logical_gradients("topology", grads_one, accumulate=True)
     first_norm = manager.optim_step("topology", lr=1e-2, gradient_clip=0.1)
     _collective_assert(first_norm > 0.0, "first distributed logical norm was not positive")
     if rank == 0:
@@ -404,10 +403,11 @@ def _run_topology_integration_worker() -> None:
             accumulation_count=2,
             max_norm=0.1,
         )
+        print(f"first_norm_actual={first_norm} first_norm_reference={reference_first_norm}", flush=True)
         assert first_norm == pytest.approx(reference_first_norm, rel=1e-6, abs=1e-6)
 
     grads_two = _logical_grads(manager, "topology", 2.0)
-    _capture_logical_gradients(manager, "topology", grads_two)
+    manager.load_logical_gradients("topology", grads_two, accumulate=True)
     second_norm = manager.optim_step("topology", lr=1e-2, gradient_clip=0.1)
     _collective_assert(second_norm > 0.0, "second distributed logical norm was not positive")
     _collective_assert(state.global_step == 2, "not every rank completed two optimizer steps")

@@ -409,15 +409,15 @@ except ImportError:
     pass
 
 
-# Explicit contract for replicated hybrid-LoRA factors. The custom grouped-GEMM
-# autograd implementations reduce shared factors in their backward; eager and
-# native return local gradients and require the optimizer-boundary EP sum.
+# Explicit contract for replicated hybrid-LoRA factors. Every backend returns
+# local shared-factor gradients. The adapter optimizer performs the single
+# canonical coalesced EP sum after all streamed backward calls have accumulated.
 EP_SHARED_GRADIENT_REDUCTION = {
     "eager": GradientReductionDomain.EP_SUM,
     "native": GradientReductionDomain.EP_SUM,
-    "triton": GradientReductionDomain.ALREADY_REDUCED,
-    "triton_w4a4": GradientReductionDomain.ALREADY_REDUCED,
-    "quack": GradientReductionDomain.ALREADY_REDUCED,
+    "triton": GradientReductionDomain.EP_SUM,
+    "triton_w4a4": GradientReductionDomain.EP_SUM,
+    "quack": GradientReductionDomain.EP_SUM,
 }
 
 
