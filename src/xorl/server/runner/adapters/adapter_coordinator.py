@@ -70,6 +70,23 @@ class AdapterCoordinator:
                 "Adapter coordination currently assumes identical local LoRA layouts on every rank."
             )
 
+    def _validate_adapter_state_path(self, path: str) -> str:
+        """Resolve an adapter path and confine it to the server output tree."""
+        if not isinstance(path, str):
+            raise ValueError("Adapter state path must be a string")
+
+        checkpoint_dir = os.path.realpath(self.trainer.adapter_manager.checkpoint_dir)
+        output_dir = os.path.dirname(checkpoint_dir)
+        resolved_path = os.path.realpath(os.path.abspath(path))
+        try:
+            is_contained = os.path.commonpath([resolved_path, output_dir]) == output_dir
+        except ValueError:
+            is_contained = False
+
+        if not is_contained or resolved_path == output_dir:
+            raise ValueError(f"Adapter state path must be inside the server output directory: {output_dir}")
+        return resolved_path
+
     # ========================================================================
     # Adapter Broadcast
     # ========================================================================
@@ -474,10 +491,12 @@ class AdapterCoordinator:
         Returns:
             Path to the evicted checkpoint, or None if not found
         """
-        evicted_path = os.path.join(
-            self.trainer.adapter_manager.checkpoint_dir,
-            "evicted",
-            model_id,
+        evicted_path = self._validate_adapter_state_path(
+            os.path.join(
+                self.trainer.adapter_manager.checkpoint_dir,
+                "evicted",
+                model_id,
+            )
         )
         if os.path.exists(evicted_path):
             return evicted_path
@@ -726,6 +745,9 @@ class AdapterCoordinator:
             path = p.path
             save_optimizer = p.save_optimizer
 
+            if path is not None:
+                path = self._validate_adapter_state_path(path)
+
             logger.debug(f"Rank {self.rank}: Participating in save_adapter_state: model_id={model_id}, path={path}")
 
             if self.trainer.adapter_manager is not None:
@@ -778,6 +800,7 @@ class AdapterCoordinator:
 
             if not path:
                 raise ValueError("path is required for load_adapter_state")
+            path = self._validate_adapter_state_path(path)
 
             local_error = None
             if not had_session_spec:

@@ -296,6 +296,38 @@ def test_handle_load_adapter_state_loads_optimizer_on_non_rank0(tmp_path):
     coordinator.broadcast_adapter_optimizer_state.assert_not_called()
 
 
+def test_handle_load_adapter_state_rejects_path_outside_output_root(tmp_path):
+    checkpoint_dir = tmp_path / "output" / "adapters"
+    checkpoint_dir.mkdir(parents=True)
+    trainer = _FakeTrainer(checkpoint_dir)
+    trainer.register_session("policy-b", trainer._session_spec(3e-5), materialize=False)
+    coordinator = AdapterCoordinator(trainer=trainer, rank=0, world_size=1, cpu_group=None)
+
+    payload = AdapterStateData(
+        model_id="policy-b",
+        path=str(tmp_path / "outside" / "checkpoint"),
+        load_optimizer=True,
+        lr=3e-5,
+    )
+
+    result = asyncio.run(coordinator.handle_load_adapter_state({"payload": payload}))
+
+    assert result["success"] is False
+    assert "must be inside the server output directory" in result["error"]
+    assert trainer.register_calls == []
+    assert trainer.load_calls == []
+
+
+def test_find_evicted_checkpoint_rejects_model_id_path_traversal(tmp_path):
+    checkpoint_dir = tmp_path / "output" / "adapters"
+    checkpoint_dir.mkdir(parents=True)
+    trainer = _FakeTrainer(checkpoint_dir)
+    coordinator = AdapterCoordinator(trainer=trainer, rank=0, world_size=1, cpu_group=None)
+
+    with pytest.raises(ValueError, match="must be inside the server output directory"):
+        coordinator._find_evicted_checkpoint("../../../outside")
+
+
 def test_auto_load_if_evicted_uses_rank0_broadcast_mode_on_non_rank0(tmp_path):
     checkpoint_dir = tmp_path / "adapters"
     evicted_path = checkpoint_dir / "evicted" / "policy-c"
@@ -718,4 +750,27 @@ def test_handle_save_adapter_state_requires_evicted_checkpoint(tmp_path):
         )
 
     assert trainer.register_calls == []
+    assert trainer.save_calls == []
+
+
+def test_handle_save_adapter_state_rejects_path_outside_output_root(tmp_path):
+    checkpoint_dir = tmp_path / "output" / "adapters"
+    checkpoint_dir.mkdir(parents=True)
+    trainer = _FakeTrainer(checkpoint_dir)
+    trainer.register_lora_adapter("policy-save", 4e-5)
+    coordinator = AdapterCoordinator(trainer=trainer, rank=0, world_size=1, cpu_group=None)
+
+    with pytest.raises(RuntimeError, match="must be inside the server output directory"):
+        asyncio.run(
+            coordinator.handle_save_adapter_state(
+                {
+                    "payload": AdapterStateData(
+                        model_id="policy-save",
+                        path=str(tmp_path / "outside" / "save-target"),
+                        save_optimizer=True,
+                    )
+                }
+            )
+        )
+
     assert trainer.save_calls == []
