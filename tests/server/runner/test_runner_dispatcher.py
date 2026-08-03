@@ -454,6 +454,120 @@ def test_sequential_packing_still_pads_dummies_when_rows_below_dp(monkeypatch):
     assert saw_dummy
 
 
+def test_merge_per_token_outputs_restores_logical_slice_order_and_skips_empty_slices():
+    payloads = [
+        {
+            "rank": 2,
+            "slice_rank": 2,
+            "packed_logprobs": [[2.0]],
+            "packed_position_ids": [[0]],
+            "per_sample_k3": [0.2],
+        },
+        {"rank": 3, "slice_rank": 3, "packed_logprobs": [], "packed_position_ids": []},
+        {
+            "rank": 0,
+            "slice_rank": 0,
+            "packed_logprobs": [[0.0]],
+            "packed_position_ids": [[0]],
+            "per_sample_k3": [0.0],
+        },
+        {
+            "rank": 1,
+            "slice_rank": 1,
+            "packed_logprobs": [[1.0]],
+            "packed_position_ids": [[0]],
+            "per_sample_k3": [0.1],
+        },
+    ]
+
+    merged = RunnerDispatcher._merge_per_token_output_payloads(payloads)
+
+    assert merged == {
+        "packed_logprobs": [[0.0], [1.0], [2.0]],
+        "packed_position_ids": [[0], [0], [0]],
+        "per_sample_k3": [0.0, 0.1, 0.2],
+    }
+
+
+def test_merge_per_token_outputs_deduplicates_coherent_cp_replicas():
+    replica = {
+        "slice_rank": 0,
+        "packed_logprobs": [[-1.25, -2.5]],
+        "packed_position_ids": [[0, 1]],
+    }
+    merged = RunnerDispatcher._merge_per_token_output_payloads([{"rank": 0, **replica}, {"rank": 1, **replica}])
+
+    assert merged["packed_logprobs"] == [[-1.25, -2.5]]
+    assert merged["packed_position_ids"] == [[0, 1]]
+
+
+def test_merge_per_token_outputs_rejects_replica_disagreement():
+    with pytest.raises(RuntimeError, match="disagree.*slice 0.*ranks \\[0, 1\\]"):
+        RunnerDispatcher._merge_per_token_output_payloads(
+            [
+                {
+                    "rank": 0,
+                    "slice_rank": 0,
+                    "packed_logprobs": [[-1.0]],
+                    "packed_position_ids": [[0]],
+                },
+                {
+                    "rank": 1,
+                    "slice_rank": 0,
+                    "packed_logprobs": [[-1.5]],
+                    "packed_position_ids": [[0]],
+                },
+            ]
+        )
+
+
+def test_gather_per_token_outputs_trims_dummy_rows_and_restores_global_order(monkeypatch):
+    dispatcher = _dispatcher(rank=0, world_size=2)
+    dispatcher.cpu_group = object()
+    monkeypatch.setattr(dispatcher, "_batch_parallel_rank_and_size", lambda *_args: (0, 2))
+
+    def fake_gather_object(payload, gathered, *, dst, group):
+        assert dst == 0
+        assert group is dispatcher.cpu_group
+        assert payload == {
+            "rank": 0,
+            "slice_rank": 0,
+            "packed_logprobs": [[-1.0]],
+            "packed_position_ids": [[0]],
+            "per_sample_k3": [0.0, 0.1],
+        }
+        gathered[:] = [
+            payload,
+            {
+                "rank": 1,
+                "slice_rank": 1,
+                "packed_logprobs": [[-2.0]],
+                "packed_position_ids": [[0]],
+                "per_sample_k3": [0.2],
+            },
+        ]
+
+    monkeypatch.setattr(runner_dispatcher_module.dist, "gather_object", fake_gather_object)
+    result = {
+        "packed_logprobs": [[-1.0], [999.0]],
+        "packed_position_ids": [[0], [999]],
+        "per_sample_k3": [0.0, 0.1, 999.0],
+    }
+
+    dispatcher._gather_per_token_outputs(
+        result,
+        [_batch(10, num_samples=2), _batch(20, num_samples=0)],
+        _parallel_state(),
+        is_rank0=True,
+    )
+
+    assert result == {
+        "packed_logprobs": [[-1.0], [-2.0]],
+        "packed_position_ids": [[0], [0]],
+        "per_sample_k3": [0.0, 0.1, 0.2],
+    }
+
+
 def test_shard_and_slice_batches_slices_routing_weights_with_ids():
     dispatcher = _dispatcher(rank=0, world_size=1)
     dispatcher._validate_batch_shapes = lambda batch, batch_idx=0: True

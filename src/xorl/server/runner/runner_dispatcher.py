@@ -779,8 +779,14 @@ class RunnerDispatcher:
                 model_id=model_id,
                 routed_expert_logits=routed_expert_logits,
             )
-        del my_batches
         self._gather_is_metrics(result, cp_enabled, is_rank0=is_rank0)
+        self._gather_per_token_outputs(
+            result,
+            my_batches,
+            parallel_state,
+            is_rank0=is_rank0,
+        )
+        del my_batches
         return result
 
     @staticmethod
@@ -1560,6 +1566,110 @@ class RunnerDispatcher:
             logger.debug(f"Rank {self.rank}: Final result keys: {list(result.keys())}")
 
         del all_results
+
+    _PACKED_OUTPUT_FIELDS = (
+        "packed_logprobs",
+        "packed_losses",
+        "packed_position_ids",
+        "packed_token_diagnostics",
+    )
+
+    @classmethod
+    def _merge_per_token_output_payloads(cls, payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Merge one canonical observer payload per logical data slice.
+
+        CP ranks and pipeline stages may share a logical data slice.  Their
+        observer payloads must either be empty or byte-for-byte equivalent;
+        silently picking one would make a diagnostic response look complete
+        while hiding a replica disagreement.
+        """
+        by_slice: Dict[int, List[Dict[str, Any]]] = {}
+        for payload in payloads:
+            if not payload:
+                continue
+            by_slice.setdefault(int(payload["slice_rank"]), []).append(payload)
+
+        canonical: List[Dict[str, Any]] = []
+        for slice_rank in sorted(by_slice):
+            candidates = by_slice[slice_rank]
+            nonempty = [
+                payload
+                for payload in candidates
+                if any(payload.get(field) for field in cls._PACKED_OUTPUT_FIELDS) or payload.get("per_sample_k3")
+            ]
+            if not nonempty:
+                continue
+            first = nonempty[0]
+            comparable = {
+                field: first.get(field) for field in (*cls._PACKED_OUTPUT_FIELDS, "per_sample_k3") if field in first
+            }
+            for other in nonempty[1:]:
+                other_comparable = {
+                    field: other.get(field) for field in (*cls._PACKED_OUTPUT_FIELDS, "per_sample_k3") if field in other
+                }
+                if other_comparable != comparable:
+                    ranks = [int(payload["rank"]) for payload in nonempty]
+                    raise RuntimeError(
+                        f"per-token observer outputs disagree for logical data slice {slice_rank} across ranks {ranks}"
+                    )
+            canonical.append(first)
+
+        merged: Dict[str, Any] = {}
+        for field in (*cls._PACKED_OUTPUT_FIELDS, "per_sample_k3"):
+            values: List[Any] = []
+            present = False
+            for payload in canonical:
+                if field in payload:
+                    present = True
+                    values.extend(payload[field])
+            if present:
+                merged[field] = values
+        return merged
+
+    def _gather_per_token_outputs(
+        self,
+        result: Dict[str, Any],
+        my_batches: List[Dict[str, Any]],
+        parallel_state: Any,
+        *,
+        is_rank0: bool,
+    ) -> None:
+        """Gather complete per-token responses from all logical data slices.
+
+        ModelRunner only sees this rank's selected packed rows.  Returning rank
+        zero's local arrays therefore truncates a distributed request even
+        though scalar IS metrics cover the full gang.  Gather only the response
+        arrays to rank zero, trim collective-only dummy rows, and restore global
+        request order by logical slice rank.
+        """
+        if self.world_size <= 1:
+            return
+
+        cp_size = max(1, int(getattr(parallel_state, "cp_size", 1)))
+        pp_size = int(getattr(parallel_state, "pp_size", 1)) if getattr(parallel_state, "pp_enabled", False) else 1
+        slice_rank, _ = self._batch_parallel_rank_and_size(parallel_state, cp_size, pp_size)
+        real_batch_count = sum(int(batch.get("num_samples", 1) or 0) > 0 for batch in my_batches)
+        real_sample_count = sum(max(0, int(batch.get("num_samples", 1) or 0)) for batch in my_batches)
+
+        payload: Dict[str, Any] = {
+            "rank": self.rank,
+            "slice_rank": slice_rank,
+        }
+        for field in self._PACKED_OUTPUT_FIELDS:
+            if field in result:
+                payload[field] = result[field][:real_batch_count]
+        if "per_sample_k3" in result:
+            payload["per_sample_k3"] = result["per_sample_k3"][:real_sample_count]
+
+        gathered = [None] * self.world_size if is_rank0 else None
+        dist.gather_object(payload, gathered, dst=0, group=self.cpu_group)
+        if not is_rank0:
+            return
+
+        merged = self._merge_per_token_output_payloads(gathered or [])
+        for field in (*self._PACKED_OUTPUT_FIELDS, "per_sample_k3"):
+            result.pop(field, None)
+        result.update(merged)
 
     # ========================================================================
     # Optim Step Handlers
