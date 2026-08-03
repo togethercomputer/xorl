@@ -944,7 +944,11 @@ class LoRAAdapterManager:
             torch.distributed.all_gather_object(gathered, local)
         else:
             gathered = [local]
-        if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_rank() != 0
+        ):
             return
         record: dict[str, Any] = {
             "phase": "movement",
@@ -1592,9 +1596,7 @@ class LoRAAdapterManager:
         # gradients. Reduce the accumulated adapter slots exactly once before
         # finite checks, coherence validation, clipping, and optimizer use.
         sync_stats = (
-            self.synchronize_replicated_gradients(model_id)
-            if state.gradient_source == "model"
-            else GradientSyncStats()
+            self.synchronize_replicated_gradients(model_id) if state.gradient_source == "model" else GradientSyncStats()
         )
         self._trace_adapter_gradient_stage(state, stage="after_optimizer_boundary_reduction")
         if sync_stats.configured_parameter_count and (
@@ -1691,9 +1693,7 @@ class LoRAAdapterManager:
                     if param.grad is not None:
                         param.grad.mul_(clip_coefficient)
 
-        movement_probes = (
-            self._capture_factor_movement_probes(state) if self._replica_validation_enabled() else {}
-        )
+        movement_probes = self._capture_factor_movement_probes(state) if self._replica_validation_enabled() else {}
         state.optimizer.step()
         if self.device.type == "cuda":
             torch.cuda.current_stream(self.device).synchronize()
