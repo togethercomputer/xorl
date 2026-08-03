@@ -94,6 +94,9 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         self.moe_implementation = moe_implementation
         self.hybrid_shared = hybrid_shared
         self.use_rslora = use_rslora
+        from xorl.models.layers.moe.backend import ep_lora_gradient_reduction_domain  # noqa: PLC0415
+
+        self._ep_gradient_reduction_domain = ep_lora_gradient_reduction_domain(moe_implementation)
 
         # EP dispatch settings
         self.ep_dispatch = ep_dispatch

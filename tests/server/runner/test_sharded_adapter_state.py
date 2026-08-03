@@ -208,6 +208,78 @@ def test_capture_source_contract_excludes_full_tensor():
     assert "full_tensor" not in source
 
 
+@pytest.mark.parametrize("adapter_dtype", [torch.float16, torch.bfloat16])
+def test_capture_gradients_accepts_low_precision_adapter_parameters(tmp_path, adapter_dtype):
+    model = _DummyLoRAModel().to(dtype=adapter_dtype)
+    manager = LoRAAdapterManager(
+        model,
+        device=torch.device("cpu"),
+        checkpoint_dir=str(tmp_path / "adapters"),
+        auto_save_on_eviction=False,
+        optimizer_type="sgd",
+        optimizer_dtype="bf16",
+    )
+    manager.register_adapter(
+        "low-precision",
+        session_spec=_session_spec(rank=4, alpha=16, optimizer_type="sgd", lr=0.1),
+        initialize_fresh=True,
+    )
+    state = manager.get_adapter_state("low-precision")
+    for name, param in model.named_parameters():
+        if name in state.local_params:
+            param.grad = torch.ones_like(param)
+
+    manager.capture_gradients("low-precision")
+    assert all(param.grad is None for param in model.parameters())
+    assert all(
+        state.local_params[name].grad is not None
+        and state.local_params[name].grad.dtype == state.local_params[name].dtype
+        for name in state.local_params
+        if state.local_params[name].numel() > 0
+    )
+
+
+@pytest.mark.parametrize("adapter_dtype", [torch.float16, torch.bfloat16])
+def test_load_logical_gradients_accumulates_low_precision_and_steps(tmp_path, adapter_dtype):
+    model = _DummyLoRAModel().to(dtype=adapter_dtype)
+    manager = LoRAAdapterManager(
+        model,
+        device=torch.device("cpu"),
+        checkpoint_dir=str(tmp_path / "adapters"),
+        auto_save_on_eviction=False,
+        optimizer_type="sgd",
+        optimizer_dtype="bf16",
+    )
+    manager.register_adapter(
+        "logical-low-precision",
+        session_spec=_session_spec(rank=4, alpha=16, optimizer_type="sgd", lr=0.1),
+        initialize_fresh=True,
+    )
+    state = manager.get_adapter_state("logical-low-precision")
+    logical_grads = {
+        name: torch.ones(layout.logical_shape, dtype=torch.float32) for name, layout in state.tensor_layouts.items()
+    }
+
+    manager.load_logical_gradients("logical-low-precision", logical_grads, accumulate=False)
+    manager.load_logical_gradients(
+        "logical-low-precision",
+        {name: gradient * 2 for name, gradient in logical_grads.items()},
+        accumulate=True,
+    )
+    before = {name: param.detach().clone() for name, param in state.local_params.items()}
+    for name, param in state.local_params.items():
+        if param.numel() > 0:
+            assert param.grad is not None
+            assert param.grad.dtype == param.dtype
+            assert torch.equal(param.grad, torch.full_like(param, 3))
+
+    norm = manager.optim_step("logical-low-precision", lr=0.1)
+    assert norm > 0.0
+    assert state.global_step == 1
+    assert all(param.grad is None for param in state.local_params.values())
+    assert any(not torch.equal(before[name], param) for name, param in state.local_params.items())
+
+
 def test_forward_and_capture_hot_paths_have_no_collective_or_full_materialization():
     for method in (LoRAAdapterManager.prepare_forward, LoRAAdapterManager.capture_gradients):
         source = inspect.getsource(method)
@@ -299,7 +371,7 @@ def test_real_gloo_collective_finite_and_norm_gate():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="NCCL fused adapter gate requires CUDA")
-def test_real_nccl_fused_adapter_optimizer_gate():
+def test_nccl_fused_adapter_optimizer_gate_with_replicated_dummy_model():
     from tests.distributed.distributed_utils import run_distributed_script
 
     result = run_distributed_script(
@@ -308,7 +380,7 @@ def test_real_nccl_fused_adapter_optimizer_gate():
         timeout=120,
         extra_env={"XORL_SHARDED_CUDA_WORKER": "1"},
     )
-    result.assert_success("real two-rank NCCL fused adapter optimizer gate")
+    result.assert_success("two-rank NCCL fused adapter optimizer gate with replicated dummy model")
 
 
 class _FakeEpMesh:

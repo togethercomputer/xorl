@@ -33,7 +33,13 @@ from ....lora.modules.base import LoraModule
 from ....ops.group_gemm.kernel import compute_lora_scaling
 from ....utils import logging
 from ..activations import ACT2FN
-from .backend import EP_COMBINE, EP_DISPATCH, EP_EXPERT_COMPUTE_LORA, MOE_EXPERT_BACKENDS_LORA
+from .backend import (
+    EP_COMBINE,
+    EP_DISPATCH,
+    EP_EXPERT_COMPUTE_LORA,
+    MOE_EXPERT_BACKENDS_LORA,
+    ep_lora_gradient_reduction_domain,
+)
 from .common import split_gate_up_proj
 
 
@@ -95,6 +101,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         self.active_lora_alpha = self.lora_alpha
         self.use_rslora = self.lora_config.use_rslora
         self.swiglu_limit = float(swiglu_limit)
+        self._ep_gradient_reduction_domain = ep_lora_gradient_reduction_domain(moe_implementation)
 
         # Base weights (frozen) in (G, K, N) format
         self.gate_up_proj = nn.Parameter(

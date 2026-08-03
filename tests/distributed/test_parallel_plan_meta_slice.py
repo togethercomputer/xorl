@@ -55,6 +55,14 @@ class _FakeModel(nn.Module):
         self.experts = _FakeExpertsModule(num_experts, hidden, inter)
 
 
+class _FakeSharedLoRAModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.experts = nn.Module()
+        self.experts._ep_gradient_reduction_domain = "ep_sum"
+        self.experts.shared_lora = nn.Parameter(torch.empty(1, 8, 4))
+
+
 def test_meta_slicing_replaces_full_shape_with_ep_local_shape():
     """Meta param at full shape should be replaced with EP-local-shape meta param."""
     num_experts, ep_size = 16, 4
@@ -110,3 +118,15 @@ def test_meta_slicing_preserves_dtype_and_requires_grad():
 
     assert model.experts.gate_up_proj.dtype == torch.bfloat16
     assert model.experts.gate_up_proj.requires_grad is False
+
+
+def test_parallel_plan_stamps_explicit_replicated_gradient_reduction():
+    model = _FakeSharedLoRAModel()
+    plan = ParallelPlan(ep_plan={"experts.shared_lora": Shard(0)})
+
+    fqn2spec = plan.apply(model, _fake_ep_fsdp_mesh(ep_size=4), already_local=False)
+
+    info = fqn2spec["experts.shared_lora"]
+    assert isinstance(info.placement, Replicate)
+    assert info.gradient_reduction == "ep_sum"
+    assert model.experts.shared_lora.spec_info.gradient_reduction == "ep_sum"

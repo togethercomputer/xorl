@@ -80,6 +80,12 @@ def _optimizer_shard_filename(rank: int) -> str:
     return f"optimizer-rank{rank:05d}.safetensors"
 
 
+def _canonical_parameter_order(parameters: Dict[str, Any]) -> List[str]:
+    """Return stable optimizer order independent of insertion order."""
+
+    return sorted(parameters, key=lambda name: (canonical_parameter_name(name), name))
+
+
 def _encode_optimizer_state(value: Any, tensors: Dict[str, torch.Tensor], *, depth: int = 0) -> Any:
     if depth > _OPTIMIZER_STATE_MAX_DEPTH:
         raise ValueError("optimizer state exceeds the supported nesting depth")
@@ -190,15 +196,21 @@ def _clone_state_to_cpu(value: Any) -> Any:
 
 
 def _adapter_param_structure_fingerprint(lora_params: Dict[str, nn.Parameter]) -> str:
-    """Order-sensitive fingerprint of an adapter's local (name, shape, dtype) sequence.
+    """Fingerprint the canonical non-empty optimizer (name, shape, dtype) sequence.
 
     Optimizer state_dicts key parameters by position, so a saved shard is only
     meaningful on a rank whose parameter sequence matches the saving rank
     exactly. Under expert parallelism the same position holds DIFFERENT expert
     slices on different ranks, which shape checks alone cannot distinguish;
-    world-size + per-rank fingerprints together make misassignment loud.
+    world-size + per-rank fingerprints together make misassignment loud. Use
+    canonical names and order so wrapper prefixes and dictionary insertion order
+    do not reject an otherwise equivalent optimizer state.
     """
-    structure = [[name, list(param.shape), str(param.dtype)] for name, param in lora_params.items()]
+    structure = [
+        [canonical_parameter_name(name), list(lora_params[name].shape), str(lora_params[name].dtype)]
+        for name in _canonical_parameter_order(lora_params)
+        if lora_params[name].numel() > 0
+    ]
     return hashlib.sha256(json.dumps(structure).encode("utf-8")).hexdigest()
 
 
@@ -232,7 +244,7 @@ def save_adapter_optimizer_shards(adapter_state: "AdapterState", path: str) -> D
         torch.distributed.all_gather_object(layout_descriptors_by_rank, layout_descriptors)
         local_optimizer_order = [
             canonical_parameter_name(name)
-            for name in sorted(adapter_state.local_params)
+            for name in _canonical_parameter_order(adapter_state.local_params)
             if adapter_state.local_params[name].numel() > 0
         ]
         optimizer_orders_by_rank: List[Optional[List[str]]] = [None] * world
@@ -244,7 +256,7 @@ def save_adapter_optimizer_shards(adapter_state: "AdapterState", path: str) -> D
         optimizer_orders_by_rank = [
             [
                 canonical_parameter_name(name)
-                for name in sorted(adapter_state.local_params)
+                for name in _canonical_parameter_order(adapter_state.local_params)
                 if adapter_state.local_params[name].numel() > 0
             ]
         ]
@@ -324,7 +336,7 @@ def load_adapter_optimizer_shards(
         )
         live_order = [
             canonical_parameter_name(name)
-            for name in sorted(adapter_state.local_params)
+            for name in _canonical_parameter_order(adapter_state.local_params)
             if adapter_state.local_params[name].numel() > 0
         ]
         if expected_order != live_order:
@@ -619,30 +631,123 @@ class LoRAAdapterManager:
         ):
             return
         local_payload = []
+        local_descriptor_records = [
+            (layout.replica_key, layout.replica_count)
+            for layout in state.tensor_layouts.values()
+            if layout.replica_count > 1
+        ]
         for name in sorted(state.local_params):
             layout = state.tensor_layouts[name]
             if layout.replica_count <= 1:
                 continue
             value = state.local_params[name].grad if gradients else state.local_params[name].detach()
             local_payload.append((layout.replica_key, None if value is None else value.detach().cpu().contiguous()))
+        gathered_descriptors = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered_descriptors, local_descriptor_records)
         gathered = [None] * torch.distributed.get_world_size()
         torch.distributed.all_gather_object(gathered, local_payload)
+        global_keys = sorted({tuple(key) for rank_records in gathered_descriptors for key, _ in rank_records})
+        descriptor_counts: dict[tuple[Any, ...], int] = {}
+        descriptor_expected: dict[tuple[Any, ...], set[int]] = {}
+        for rank_records in gathered_descriptors:
+            for key, replica_count in rank_records:
+                key = tuple(key)
+                descriptor_counts[key] = descriptor_counts.get(key, 0) + 1
+                descriptor_expected.setdefault(key, set()).add(int(replica_count))
         by_key: dict[tuple[Any, ...], list[Optional[torch.Tensor]]] = {}
         for rank_payload in gathered:
             for key, value in rank_payload:
                 by_key.setdefault(tuple(key), []).append(value)
-        local_keys = {layout.replica_key: layout.replica_count for layout in state.tensor_layouts.values()}
-        for key, expected_count in local_keys.items():
+        for key in global_keys:
+            expected_counts = descriptor_expected.get(key, set())
+            expected_count = next(iter(expected_counts)) if len(expected_counts) == 1 else -1
+            if expected_count < 0 or descriptor_counts.get(key, 0) != expected_count:
+                raise RuntimeError(
+                    f"Replica descriptor universe diverged for {key[0]!r}: "
+                    f"present={descriptor_counts.get(key, 0)} expected={sorted(expected_counts)}"
+                )
             if expected_count <= 1:
                 continue
             values = by_key.get(key, [])
             if len(values) != expected_count:
-                raise RuntimeError(f"Replica descriptor count changed for {key[0]!r}: {len(values)}")
+                raise RuntimeError(f"Replica value count changed for {key[0]!r}: {len(values)}")
             reference = values[0]
             if any((value is None) != (reference is None) for value in values):
                 raise RuntimeError(f"Replica gradient/weight presence diverged for {key[0]!r}")
             if reference is not None and any(not torch.equal(reference, value) for value in values[1:]):
                 raise RuntimeError(f"Replica values diverged for logical rectangle {key[0]!r}")
+
+    @staticmethod
+    def _optimizer_state_digest(optimizer_state: Dict[str, Any]) -> str:
+        """Hash one optimizer state without gathering its tensor payload."""
+
+        digest = hashlib.sha256()
+        for key in sorted(optimizer_state, key=str):
+            digest.update(str(key).encode("utf-8"))
+            value = optimizer_state[key]
+            if isinstance(value, torch.Tensor):
+                tensor = value.detach().to(device="cpu").contiguous()
+                digest.update(str(tensor.dtype).encode("utf-8"))
+                digest.update(repr(tuple(tensor.shape)).encode("utf-8"))
+                digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+            else:
+                digest.update(repr(value).encode("utf-8"))
+        return digest.hexdigest()
+
+    def _validate_optimizer_replica_coherence(self, state: AdapterState) -> None:
+        """Optionally verify shared Adam state agrees across EP replicas."""
+
+        if (
+            not self._replica_validation_enabled()
+            or not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+            or torch.distributed.get_world_size() <= 1
+        ):
+            return
+        local_payload = []
+        local_descriptor_records = [
+            (layout.replica_key, layout.replica_count)
+            for layout in state.tensor_layouts.values()
+            if layout.replica_count > 1
+        ]
+        for name in sorted(state.local_params):
+            layout = state.tensor_layouts[name]
+            if layout.replica_count <= 1:
+                continue
+            optimizer_state = state.optimizer.state.get(state.local_params[name], {})
+            local_payload.append((layout.replica_key, self._optimizer_state_digest(optimizer_state)))
+
+        gathered_descriptors = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered_descriptors, local_descriptor_records)
+        gathered = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered, local_payload)
+        global_keys = sorted({tuple(key) for rank_records in gathered_descriptors for key, _ in rank_records})
+        descriptor_counts: dict[tuple[Any, ...], int] = {}
+        descriptor_expected: dict[tuple[Any, ...], set[int]] = {}
+        for rank_records in gathered_descriptors:
+            for key, replica_count in rank_records:
+                key = tuple(key)
+                descriptor_counts[key] = descriptor_counts.get(key, 0) + 1
+                descriptor_expected.setdefault(key, set()).add(int(replica_count))
+        by_key: dict[tuple[Any, ...], list[str]] = {}
+        for rank_payload in gathered:
+            for key, digest in rank_payload:
+                by_key.setdefault(tuple(key), []).append(digest)
+        for key in global_keys:
+            expected_counts = descriptor_expected.get(key, set())
+            expected_count = next(iter(expected_counts)) if len(expected_counts) == 1 else -1
+            if expected_count < 0 or descriptor_counts.get(key, 0) != expected_count:
+                raise RuntimeError(
+                    f"Optimizer replica descriptor universe diverged for {key[0]!r}: "
+                    f"present={descriptor_counts.get(key, 0)} expected={sorted(expected_counts)}"
+                )
+            if expected_count <= 1:
+                continue
+            digests = by_key.get(key, [])
+            if len(digests) != expected_count:
+                raise RuntimeError(f"Optimizer replica value count changed for {key[0]!r}: {len(digests)}")
+            if any(value != digests[0] for value in digests[1:]):
+                raise RuntimeError(f"Optimizer state diverged for logical rectangle {key[0]!r}")
 
     @staticmethod
     def _is_lora_b(name: str) -> bool:
@@ -797,6 +902,21 @@ class LoRAAdapterManager:
                 setter(lora_rank, lora_alpha)
 
     @staticmethod
+    def _accumulate_adapter_gradient(
+        adapter_param: nn.Parameter,
+        gradient: torch.Tensor,
+        *,
+        accumulate: bool,
+    ) -> None:
+        """Store an adapter gradient using the parameter's dtype and device policy."""
+
+        gradient = gradient.detach().to(device=adapter_param.device, dtype=adapter_param.dtype)
+        if not accumulate or adapter_param.grad is None:
+            adapter_param.grad = gradient
+        else:
+            adapter_param.grad.add_(gradient)
+
+    @staticmethod
     def _build_parameter_module(lora_params: Dict[str, nn.Parameter]) -> nn.Module:
         """Wrap an adapter's parameters in a temporary module with stable parameter names."""
         root = nn.Module()
@@ -820,7 +940,11 @@ class LoRAAdapterManager:
     def _optimizer_parameter_map(local_params: Dict[str, nn.Parameter]) -> Dict[str, nn.Parameter]:
         """Exclude deterministic empty intersections from fused optimizers."""
 
-        return {name: param for name, param in local_params.items() if param.numel() > 0}
+        return {
+            name: local_params[name]
+            for name in _canonical_parameter_order(local_params)
+            if local_params[name].numel() > 0
+        }
 
     def _build_adapter_optimizer(self, lora_params: Dict[str, nn.Parameter], lr: float) -> torch.optim.Optimizer:
         """Build an optimizer for one adapter via the shared optimizer factory."""
@@ -1110,14 +1234,10 @@ class LoRAAdapterManager:
             param.grad = None
             if grad.numel() == 0:
                 continue
-            accumulation_dtype = (
-                torch.float32 if adapter_param.dtype in {torch.float16, torch.bfloat16} else adapter_param.dtype
-            )
-            grad = grad.to(dtype=accumulation_dtype, device=adapter_param.device)
-            if adapter_param.grad is None:
-                adapter_param.grad = grad
-            else:
-                adapter_param.grad.add_(grad)
+            # Ordinary Parameters require .grad to have the same dtype as the
+            # Parameter. AnyPrecision/fused optimizers convert their state
+            # internally, so retaining FP32 here is both illegal and unnecessary.
+            self._accumulate_adapter_gradient(adapter_param, grad, accumulate=True)
 
     def optim_step(
         self,
@@ -1161,7 +1281,9 @@ class LoRAAdapterManager:
                     p.grad.mul_(scale)
 
         optimizer_params = [
-            state.local_params[name] for name in sorted(state.local_params) if state.local_params[name].numel() > 0
+            state.local_params[name]
+            for name in _canonical_parameter_order(state.local_params)
+            if state.local_params[name].numel() > 0
         ]
         local_grads = [param.grad for param in optimizer_params if param.grad is not None]
         local_device = local_grads[0].device if local_grads else self.device
@@ -1173,13 +1295,19 @@ class LoRAAdapterManager:
             backend = torch.distributed.get_backend(group)
             if backend == "nccl" and local_device.type != "cuda":
                 local_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+            finite_checks = [torch.isfinite(grad).all().to(device=local_device) for grad in local_grads]
+            local_finite = torch.stack(finite_checks).all() if finite_checks else torch.ones((), dtype=torch.bool)
             finite_flag = torch.tensor(
-                [1 if all(torch.isfinite(grad).all() for grad in local_grads) else 0], device=local_device
+                [1],
+                dtype=torch.int64,
+                device=local_device,
             )
+            finite_flag.copy_(local_finite.to(dtype=torch.int64).reshape(1))
             torch.distributed.all_reduce(finite_flag, op=torch.distributed.ReduceOp.MIN, group=group)
             all_finite = bool(finite_flag.item())
         else:
-            all_finite = all(torch.isfinite(grad).all().item() for grad in local_grads)
+            finite_checks = [torch.isfinite(grad).all() for grad in local_grads]
+            all_finite = bool(torch.stack(finite_checks).all().item()) if finite_checks else True
 
         if not all_finite:
             for param in state.local_params.values():
@@ -1229,6 +1357,7 @@ class LoRAAdapterManager:
         state.optimizer.step()
         if self.device.type == "cuda":
             torch.cuda.current_stream(self.device).synchronize()
+        self._validate_optimizer_replica_coherence(state)
         try:
             state.optimizer.zero_grad(set_to_none=True)
         except TypeError:
@@ -1357,7 +1486,7 @@ class LoRAAdapterManager:
         """Iterate active non-empty local parameters in optimizer order."""
 
         state = self.get_adapter_state(model_id)
-        for name in sorted(state.local_params):
+        for name in _canonical_parameter_order(state.local_params):
             param = state.local_params[name]
             if param.numel() > 0:
                 yield name, param
@@ -1418,16 +1547,12 @@ class LoRAAdapterManager:
                         f"Logical gradient {canonical_name!r} has shape {tuple(logical_gradient.shape)}, "
                         f"expected {layout.logical_shape}"
                     )
-                local_gradient = pack_logical_tensor(layout, logical_gradient).to(
-                    device=state.local_params[actual_name].device,
-                    dtype=torch.float32
-                    if state.local_params[actual_name].dtype in {torch.float16, torch.bfloat16}
-                    else state.local_params[actual_name].dtype,
+                local_gradient = pack_logical_tensor(layout, logical_gradient)
+                self._accumulate_adapter_gradient(
+                    state.local_params[actual_name],
+                    local_gradient,
+                    accumulate=accumulate,
                 )
-                if not accumulate or state.local_params[actual_name].grad is None:
-                    state.local_params[actual_name].grad = local_gradient
-                else:
-                    state.local_params[actual_name].grad.add_(local_gradient)
 
     def _pack_logical_state_dict(
         self, state: AdapterState, state_dict: Dict[str, torch.Tensor]

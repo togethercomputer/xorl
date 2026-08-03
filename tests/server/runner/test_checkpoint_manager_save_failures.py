@@ -355,4 +355,6 @@ def test_adapter_training_artifacts_include_strict_target_manifest(tmp_path):
         save_optimizer=True,
     )
 
+    metadata = json.loads((tmp_path / "metadata.json").read_text())
+    assert metadata["optimizer_format"] == "sharded_v3"
     assert json.loads((tmp_path / "lora_target_manifest.json").read_text()) == manifest

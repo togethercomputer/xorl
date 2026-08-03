@@ -269,18 +269,20 @@ class AdapterCoordinator:
         self._validate_pipeline_parallel_broadcast_safe()
         start_time = time.time()
         payload = self._rank0_load_adapter_checkpoint_payload(model_id, path, load_optimizer)
+        if payload.get("optimizer_present") and load_optimizer:
+            # Reject before packing weights or mutating step/LR metadata. The
+            # rank0-broadcast mode cannot restore rank-local optimizer shards,
+            # so this failure must leave a resident adapter untouched.
+            raise RuntimeError(
+                "rank0_broadcast cannot restore topology-specific adapter optimizer shards. "
+                "Use adapter_state_load_mode=all_ranks for an optimizer resume, or set load_optimizer=False."
+            )
         self._apply_broadcast_adapter_checkpoint_payload(
             model_id,
             payload,
             load_optimizer=load_optimizer,
             lr=lr,
         )
-
-        if payload.get("optimizer_present") and load_optimizer:
-            raise RuntimeError(
-                "rank0_broadcast cannot restore topology-specific adapter optimizer shards. "
-                "Use adapter_state_load_mode=all_ranks for an optimizer resume, or set load_optimizer=False."
-            )
 
         state = self.trainer.adapter_manager.get_adapter_state(model_id)
         return {

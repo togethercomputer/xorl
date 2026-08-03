@@ -6,6 +6,7 @@ import torch.nn as nn
 from torch.distributed._tensor import DeviceMesh, DTensor, Replicate, Shard
 
 from ..utils import logging
+from .gradient_reduction import GradientReductionDomain, validate_gradient_reduction_domain
 from .parallel_state import get_parallel_state
 from .utils import check_fqn_match, get_module_from_path, set_module_from_path
 
@@ -13,11 +14,28 @@ from .utils import check_fqn_match, get_module_from_path, set_module_from_path
 logger = logging.get_logger(__name__)
 
 
+def _gradient_reduction_domain(model: nn.Module, fqn: str) -> GradientReductionDomain:
+    """Read explicit gradient-reduction metadata from the owning module."""
+
+    parts = fqn.split(".")[:-1]
+    while parts:
+        module = get_module_from_path(model, ".".join(parts))
+        domain = getattr(module, "_ep_gradient_reduction_domain", None)
+        if domain is not None:
+            try:
+                return validate_gradient_reduction_domain(domain)
+            except ValueError as exc:
+                raise ValueError(f"Invalid gradient reduction metadata for {fqn}: {exc}") from exc
+        parts.pop()
+    return GradientReductionDomain.NONE
+
+
 @dataclass
 class SpecInfo:
     ep_fsdp_mesh: DeviceMesh
     placement: Union[Shard, Replicate]
     fqn: str
+    gradient_reduction: GradientReductionDomain = GradientReductionDomain.NONE
 
     @property
     def ep_mesh(self):
@@ -70,10 +88,21 @@ class ParallelPlan:
             for fqn, param in model.named_parameters():
                 for fqn_pattern, shard in self.ep_plan.items():
                     if check_fqn_match(fqn_pattern, fqn):
+                        gradient_reduction = _gradient_reduction_domain(model, fqn)
                         # Shared LoRA weights have size=1 on shard dim - replicate instead of shard
                         if param.size(shard.dim) == 1:
-                            param.spec_info = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=Replicate(), fqn=fqn)
-                            fqn2spec_info[fqn] = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=Replicate(), fqn=fqn)
+                            param.spec_info = SpecInfo(
+                                ep_fsdp_mesh=ep_fsdp_mesh,
+                                placement=Replicate(),
+                                fqn=fqn,
+                                gradient_reduction=gradient_reduction,
+                            )
+                            fqn2spec_info[fqn] = SpecInfo(
+                                ep_fsdp_mesh=ep_fsdp_mesh,
+                                placement=Replicate(),
+                                fqn=fqn,
+                                gradient_reduction=gradient_reduction,
+                            )
                             logger.debug_rank0(f"EP replicated (shared): {fqn} {list(param.shape)}")
                             break
 

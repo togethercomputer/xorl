@@ -490,6 +490,36 @@ def test_rank0_broadcast_ep_sharded_restore_rejects_session_spec_mismatch(monkey
     assert torch.equal(state.lora_params[param_name].detach(), original_tensor)
 
 
+def test_rank0_broadcast_optimizer_rejection_is_transactional(monkeypatch, tmp_path):
+    checkpoint_dir = tmp_path / "adapters"
+    checkpoint_dir.mkdir()
+    trainer = _FakeTrainer(checkpoint_dir, adapter_state_load_mode="rank0_broadcast")
+    trainer.register_session("policy", trainer._session_spec(3e-5), materialize=False)
+    trainer.register_lora_adapter("policy", 3e-5)
+    state = trainer.adapter_manager.get_adapter_state("policy")
+    state.global_step = 7
+    state.global_forward_backward_step = 9
+    original_lr = state.lr
+    original_last_access = state.last_access_time
+    coordinator = AdapterCoordinator(trainer=trainer, rank=0, world_size=2, cpu_group=None)
+    coordinator._rank0_load_adapter_checkpoint_payload = Mock(
+        return_value={"optimizer_present": True, "weights": {}, "metadata": {"global_step": 99}}
+    )
+
+    with pytest.raises(RuntimeError, match="cannot restore topology-specific adapter optimizer shards"):
+        coordinator._restore_rank0_broadcast_adapter_state(
+            model_id="policy",
+            path=str(tmp_path / "checkpoint"),
+            load_optimizer=True,
+            lr=None,
+        )
+
+    assert state.global_step == 7
+    assert state.global_forward_backward_step == 9
+    assert state.lr == original_lr
+    assert state.last_access_time == original_last_access
+
+
 def test_handle_load_adapter_state_rolls_back_new_adapter_on_cross_rank_restore_error(tmp_path):
     checkpoint_dir = tmp_path / "adapters"
     checkpoint_dir.mkdir()

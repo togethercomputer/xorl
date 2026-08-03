@@ -214,7 +214,7 @@ class CheckpointManager:
             "lr": adapter_state.lr,
             "timestamp": time.time(),
             "save_optimizer": save_optimizer,
-            "optimizer_format": "sharded_v2" if save_optimizer else None,
+            "optimizer_format": "sharded_v3" if save_optimizer else None,
             "optimizer": adapter_state.session_spec["optimizer_config"],
             "layout_fingerprint": adapter_state.layout_fingerprint,
             "layout_descriptors": [

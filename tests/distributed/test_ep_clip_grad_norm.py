@@ -7,12 +7,14 @@ Verifies:
 3. No double-division of EP gradients (the bug this branch fixes).
 4. inf-norm path works correctly.
 
-All tests run single-rank: process groups are None so all_reduce is skipped,
-letting us verify the local math without distributed infrastructure.
+Most tests run single-rank for local math; the final gate uses a live two-rank
+Gloo process group for EP reduction, replicated-gradient synchronization, and
+the non-finite guard.
 """
 
 import math
 import os
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -20,8 +22,12 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import Shard, distribute_tensor
+from torch.distributed.tensor import Replicate, Shard, distribute_tensor
 
+from xorl.distributed.ep_gradients import (
+    register_ep_replicated_gradient_hooks,
+    synchronize_ep_replicated_gradients,
+)
 from xorl.distributed.fsdp2.clip_grad_norm import (
     clip_grad_norm,
     ep_fsdp2_clip_grad_norm,
@@ -133,6 +139,30 @@ class TestBuildEPParamGroups:
         non_ep_ids = {id(p) for p in model._ep_param_groups["non_ep"]}
         for p in model.non_expert.parameters():
             assert id(p) in non_ep_ids
+
+    def test_shared_ep_replica_is_recorded_separately_for_clipping(self):
+        model = nn.Module()
+        expert = nn.Module()
+        expert._skip_fsdp = True
+        expert.weight = nn.Parameter(torch.randn(2, 4))
+        shared = nn.Module()
+        shared._skip_fsdp = True
+        shared._ep_gradient_reduction_domain = "ep_sum"
+        shared.weight = nn.Parameter(torch.randn(1, 4))
+        model.add_module("expert", expert)
+        model.add_module("shared", shared)
+        model._fqn2spec_info = {
+            "expert.weight": SimpleNamespace(placement=Shard(0)),
+            "shared.weight": SimpleNamespace(placement=Replicate(), gradient_reduction="ep_sum"),
+        }
+
+        _build_ep_param_groups(model)
+
+        assert {id(p) for p in model._ep_param_groups["ep"]} == {id(expert.weight), id(shared.weight)}
+        assert {id(p) for p in model._ep_param_groups["ep_replicated"]} == {id(shared.weight)}
+        assert {id(p) for p in model._ep_param_groups["ep_replicated_gradient_sync"]} == {id(shared.weight)}
+        assert model._ep_replicated_gradient_sync_enabled is True
+        assert getattr(shared.weight, "_xorl_ep_replicated_gradient_hook", None) is None
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +514,20 @@ def test_real_two_rank_ep_clip_and_nonfinite_gate():
     result.assert_success("two-rank EP clip reduction and non-finite gate")
 
 
+def test_real_three_rank_gradient_participation_mask():
+    """A cancelling global sum still materializes zero on a missing replica."""
+
+    from tests.distributed.distributed_utils import run_distributed_script
+
+    result = run_distributed_script(
+        __file__,
+        num_gpus=3,
+        timeout=120,
+        extra_env={"XORL_EP_CLIP_PARTICIPATION_WORKER": "1"},
+    )
+    result.assert_success("three-rank replicated-gradient participation mask")
+
+
 def _run_distributed_ep_clip_worker() -> None:
     dist.init_process_group("gloo")
     rank = dist.get_rank()
@@ -504,7 +548,30 @@ def _run_distributed_ep_clip_worker() -> None:
     assert total_norm.item() == pytest.approx(5.0, abs=1e-6)
     assert expert.grad.item() == pytest.approx(0.6 if rank == 0 else 0.8, abs=1e-6)
 
+    shared = nn.Parameter(torch.zeros(1))
+    model.register_parameter("shared", shared)
+    model._ep_param_groups = {
+        "ep": [expert, shared],
+        "ep_replicated": [shared],
+        "ep_replicated_gradient_sync": [shared],
+        "non_ep": [],
+    }
+    model._ep_replicated_gradient_sync_enabled = True
+    expert.grad = torch.tensor([3.0 if rank == 0 else 4.0])
+    shared.grad = torch.tensor([rank + 1.0])
+    with patch("xorl.distributed.parallel_state.get_parallel_state", return_value=parallel_state):
+        synchronize_ep_replicated_gradients(model)
+    assert shared.grad.item() == pytest.approx(3.0)
+    expected_combined_norm = math.sqrt(34.0)  # 25 disjoint + 3^2 synchronized shared
+    with patch("xorl.distributed.fsdp2.clip_grad_norm.get_parallel_state", return_value=parallel_state):
+        total_norm = ep_fsdp2_clip_grad_norm(model, max_norm=1.0)
+    assert total_norm.item() == pytest.approx(expected_combined_norm, abs=1e-6)
+    coefficient = 1.0 / expected_combined_norm
+    assert expert.grad.item() == pytest.approx((3.0 if rank == 0 else 4.0) * coefficient, abs=1e-6)
+    assert shared.grad.item() == pytest.approx(3.0 * coefficient, abs=1e-6)
+
     expert.grad = torch.tensor([float("nan") if rank == 0 else 4.0])
+    shared.grad = torch.tensor([3.0])
     with patch("xorl.distributed.fsdp2.clip_grad_norm.get_parallel_state", return_value=parallel_state):
         with pytest.raises(RuntimeError, match="Non-finite gradient"):
             ep_fsdp2_clip_grad_norm(model, max_norm=1.0, error_if_nonfinite=True)
@@ -512,8 +579,78 @@ def _run_distributed_ep_clip_worker() -> None:
         assert torch.isnan(expert.grad).all()
     else:
         assert expert.grad.item() == pytest.approx(4.0)
+
+    shared_param = nn.Parameter(torch.zeros(1))
+    register_ep_replicated_gradient_hooks([shared_param])
+    with patch("xorl.distributed.parallel_state.get_parallel_state", return_value=parallel_state):
+        (shared_param * (rank + 1.0)).sum().backward()
+    assert shared_param.grad.item() == pytest.approx(3.0)
+
+    coalesced = nn.Parameter(torch.zeros(1))
+    missing_on_rank = nn.Parameter(torch.zeros(1))
+    coalesced.grad = torch.tensor([rank + 1.0])
+    if rank == 1:
+        missing_on_rank.grad = torch.tensor([2.0])
+    model.register_parameter("coalesced", coalesced)
+    model.register_parameter("missing_on_rank", missing_on_rank)
+    model._ep_param_groups = {"ep": [], "ep_replicated": [coalesced, missing_on_rank], "non_ep": []}
+    model._ep_replicated_gradient_sync_enabled = True
+    all_reduce_calls = []
+    original_all_reduce = dist.all_reduce
+
+    def _counted_all_reduce(*args, **kwargs):
+        all_reduce_calls.append(1)
+        return original_all_reduce(*args, **kwargs)
+
+    with patch("xorl.distributed.parallel_state.get_parallel_state", return_value=parallel_state):
+        with patch.object(dist, "all_reduce", side_effect=_counted_all_reduce):
+            stats = synchronize_ep_replicated_gradients(model)
+    assert len(all_reduce_calls) == 1
+    assert stats.parameter_count == 2
+    assert stats.configured_parameter_count == 2
+    assert stats.participating_parameter_count == 2
+    assert stats.bucket_count == 1
+    assert stats.gradient_bytes == 8
+    assert stats.reduced_bytes == 16
+    assert coalesced.grad.item() == pytest.approx(3.0)
+    assert missing_on_rank.grad.item() == pytest.approx(2.0)
+    dist.destroy_process_group()
+
+
+def _run_distributed_participation_worker() -> None:
+    dist.init_process_group("gloo")
+    rank = dist.get_rank()
+    parallel_state = MagicMock()
+    parallel_state.ep_enabled = True
+    parallel_state.ep_group = dist.group.WORLD
+
+    parameter = nn.Parameter(torch.zeros(1))
+    if rank == 1:
+        parameter.grad = torch.tensor([2.0])
+    elif rank == 2:
+        parameter.grad = torch.tensor([-2.0])
+
+    model = nn.Module()
+    model.register_parameter("parameter", parameter)
+    model._ep_param_groups = {
+        "ep": [],
+        "ep_replicated": [parameter],
+        "ep_replicated_gradient_sync": [parameter],
+        "non_ep": [],
+    }
+    model._ep_replicated_gradient_sync_enabled = True
+
+    with patch("xorl.distributed.parallel_state.get_parallel_state", return_value=parallel_state):
+        stats = synchronize_ep_replicated_gradients(model)
+    assert stats.parameter_count == 1
+    assert stats.configured_parameter_count == 1
+    assert stats.participating_parameter_count == 1
+    assert parameter.grad is not None
+    assert parameter.grad.item() == pytest.approx(0.0)
     dist.destroy_process_group()
 
 
 if os.environ.get("XORL_EP_CLIP_DISTRIBUTED_WORKER") == "1":
     _run_distributed_ep_clip_worker()
+elif os.environ.get("XORL_EP_CLIP_PARTICIPATION_WORKER") == "1":
+    _run_distributed_participation_worker()

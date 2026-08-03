@@ -7,6 +7,8 @@ Follows the same pattern as ``layers.attention.backend.ATTENTION_FUNCTIONS``.
 
 from typing import Callable, Dict
 
+from xorl.distributed.gradient_reduction import GradientReductionDomain
+
 
 MOE_EXPERT_BACKENDS: Dict[str, Callable] = {}
 
@@ -407,6 +409,31 @@ except ImportError:
     pass
 
 
+# Explicit contract for replicated hybrid-LoRA factors. The custom grouped-GEMM
+# autograd implementations reduce shared factors in their backward; eager and
+# native return local gradients and require the optimizer-boundary EP sum.
+EP_SHARED_GRADIENT_REDUCTION = {
+    "eager": GradientReductionDomain.EP_SUM,
+    "native": GradientReductionDomain.EP_SUM,
+    "triton": GradientReductionDomain.ALREADY_REDUCED,
+    "triton_w4a4": GradientReductionDomain.ALREADY_REDUCED,
+    "quack": GradientReductionDomain.ALREADY_REDUCED,
+}
+
+
+def ep_lora_gradient_reduction_domain(moe_implementation: str) -> GradientReductionDomain:
+    """Return the registered replicated-gradient contract for an EP backend."""
+
+    try:
+        return EP_SHARED_GRADIENT_REDUCTION[moe_implementation]
+    except KeyError as exc:
+        supported = ", ".join(sorted(EP_SHARED_GRADIENT_REDUCTION))
+        raise ValueError(
+            f"Unsupported MoE backend {moe_implementation!r} for hybrid shared LoRA; "
+            f"register its gradient reduction contract first (supported: {supported})"
+        ) from exc
+
+
 __all__ = [
     "MOE_EXPERT_BACKENDS",
     "EP_EXPERT_COMPUTE",
@@ -415,4 +442,7 @@ __all__ = [
     "EP_COMBINE",
     "EP_EXPERT_COMPUTE_LORA",
     "MOE_EXPERT_BACKENDS_LORA",
+    "EP_SHARED_GRADIENT_REDUCTION",
+    "GradientReductionDomain",
+    "ep_lora_gradient_reduction_domain",
 ]

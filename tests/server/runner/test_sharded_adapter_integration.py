@@ -1,4 +1,10 @@
-"""Real four-rank EP x eFSDP adapter-bank mechanics and checkpoint gate."""
+"""Synthetic four-rank EP x eFSDP adapter-bank mechanics and checkpoint gate.
+
+This test validates layout/optimizer/checkpoint algebra with real DeviceMeshes
+and DTensors. It intentionally does not claim to exercise fully_shard,
+MoE dispatch/combine, or the native hybrid-shared autograd kernel; those need a
+separate model-level production-topology test.
+"""
 
 from __future__ import annotations
 
@@ -320,7 +326,7 @@ def _collective_assert(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
-def test_real_four_rank_ep_efsdp_adapter_bank_and_resume():
+def test_synthetic_four_rank_ep_efsdp_adapter_bank_and_resume():
     from tests.distributed.distributed_utils import run_distributed_script
 
     result = run_distributed_script(
@@ -329,7 +335,7 @@ def test_real_four_rank_ep_efsdp_adapter_bank_and_resume():
         timeout=180,
         extra_env={"XORL_TOPOLOGY_INTEGRATION_WORKER": "1"},
     )
-    result.assert_success("real four-rank EP2 x eFSDP2 adapter integration")
+    result.assert_success("synthetic four-rank EP2 x eFSDP2 adapter integration")
 
 
 def _run_topology_integration_worker() -> None:

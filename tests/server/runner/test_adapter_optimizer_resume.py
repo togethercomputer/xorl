@@ -66,6 +66,27 @@ def _moment_tensors(manager: LoRAAdapterManager, model_id: str) -> dict:
     }
 
 
+def test_adapter_optimizer_parameter_map_is_canonical_ordered():
+    parameters = {
+        "_orig_mod.z.lora_B": torch.nn.Parameter(torch.ones(2)),
+        "a.lora_A": torch.nn.Parameter(torch.ones(2)),
+    }
+    ordered = LoRAAdapterManager._optimizer_parameter_map(parameters)
+    assert list(ordered) == ["a.lora_A", "_orig_mod.z.lora_B"]
+
+
+def test_adapter_optimizer_fingerprint_is_canonical_and_ignores_wrappers():
+    first = {
+        "_orig_mod.z.lora_B": torch.nn.Parameter(torch.ones(2)),
+        "a.lora_A": torch.nn.Parameter(torch.ones(2)),
+    }
+    equivalent = {
+        "_fsdp_wrapped_module.a.lora_A": torch.nn.Parameter(torch.ones(2)),
+        "z.lora_B": torch.nn.Parameter(torch.ones(2)),
+    }
+    assert _adapter_param_structure_fingerprint(first) == _adapter_param_structure_fingerprint(equivalent)
+
+
 def test_transaction_snapshot_recursively_clones_tensor_state_to_cpu():
     source = torch.arange(4, dtype=torch.float32)
     snapshot = _clone_state_to_cpu(

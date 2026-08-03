@@ -81,11 +81,24 @@ def ep_fsdp2_clip_grad_norm(
         ep_fsdp_group = ps.ep_fsdp_device_mesh["ep_fsdp"].get_group()
 
     # Build param groups (filter out params without grads).
-    # Split EP params into FSDP-sharded (DTensor) vs skip-FSDP (plain tensor).
+    # Split EP params into disjoint expert rectangles, replicated shared
+    # rectangles, and skip-FSDP plain tensors. Shared hybrid LoRA gradients are
+    # synchronized by the backend backward or the coalesced post-backward
+    # reduction; their replicated norm statistics are averaged below so the
+    # logical factor is counted once.
+    ep_replicated_ids = {id(p) for p in model._ep_param_groups.get("ep_replicated", [])}
     ep_fsdp_params: List[torch.nn.Parameter] = []
     ep_local_params: List[torch.nn.Parameter] = []  # _skip_fsdp params (not sharded, not reduced)
+    ep_replicated_fsdp_params: List[torch.nn.Parameter] = []
+    ep_replicated_local_params: List[torch.nn.Parameter] = []
     for p in model._ep_param_groups.get("ep", []):
         if p.grad is None:
+            continue
+        if id(p) in ep_replicated_ids:
+            if isinstance(p, DTensor):
+                ep_replicated_fsdp_params.append(p)
+            else:
+                ep_replicated_local_params.append(p)
             continue
         if isinstance(p, DTensor):
             ep_fsdp_params.append(p)
@@ -130,20 +143,56 @@ def ep_fsdp2_clip_grad_norm(
         reduce_groups=[("ep", ep_group)],
     )
 
+    # Shared tensors may be sharded over eFSDP and must contribute one logical
+    # copy to the norm. The optimizer-boundary reducer must have synchronized
+    # these gradients first; reduce their norm statistics across both groups,
+    # then average the EP reduction so coherent replicated storage is not
+    # counted once per rank.
+    shared_reduce_groups = []
+    if ep_fsdp_group is not None:
+        shared_reduce_groups.append(("ep_fsdp", ep_fsdp_group))
+    if ep_group is not None:
+        shared_reduce_groups.append(("ep", ep_group))
+    ep_replicated_fsdp_total = _fsdp2_reduce_group(
+        params=ep_replicated_fsdp_params,
+        norm_type=norm_type,
+        reduce_groups=shared_reduce_groups,
+    )
+    ep_replicated_local_total = _fsdp2_reduce_group(
+        params=ep_replicated_local_params,
+        norm_type=norm_type,
+        reduce_groups=[("ep", ep_group)] if ep_group is not None else [],
+    )
+    if not math.isinf(norm_type) and ep_group is not None and dist.is_available() and dist.is_initialized():
+        ep_world = dist.get_world_size(ep_group)
+        if ep_world > 1:
+            ep_replicated_fsdp_total = ep_replicated_fsdp_total / ep_world
+            ep_replicated_local_total = ep_replicated_local_total / ep_world
+
     if math.isinf(norm_type):
-        total_norm = torch.maximum(non_ep_total, torch.maximum(ep_fsdp_total, ep_local_total))
+        total_norm = torch.maximum(
+            torch.maximum(non_ep_total, ep_fsdp_total),
+            torch.maximum(
+                torch.maximum(ep_local_total, ep_replicated_fsdp_total),
+                ep_replicated_local_total,
+            ),
+        )
     else:
-        total_norm = (non_ep_total + ep_fsdp_total + ep_local_total) ** (1.0 / float(norm_type))
+        total_norm = (
+            non_ep_total + ep_fsdp_total + ep_local_total + ep_replicated_fsdp_total + ep_replicated_local_total
+        ) ** (1.0 / float(norm_type))
 
     # Apply the same clip coefficient to all groups
-    all_params = ep_fsdp_params + ep_local_params + non_ep_params
+    all_params = (
+        ep_fsdp_params + ep_local_params + ep_replicated_fsdp_params + ep_replicated_local_params + non_ep_params
+    )
     if error_if_nonfinite:
-        local_finite = all(
-            bool(torch.isfinite(g.to_local() if isinstance(g, DTensor) else g).all().item())
+        finite_checks = [
+            torch.isfinite(g.to_local() if isinstance(g, DTensor) else g).all()
             for param in all_params
             if param.grad is not None
             for g in [param.grad]
-        )
+        ]
         if dist.is_available() and dist.is_initialized():
             device = next(
                 (
@@ -157,9 +206,18 @@ def ep_fsdp2_clip_grad_norm(
             backend = dist.get_backend()
             if backend == "nccl" and device.type != "cuda":
                 device = torch.device(f"cuda:{torch.cuda.current_device()}")
-            finite_flag = torch.tensor([1 if local_finite else 0], dtype=torch.int64, device=device)
+            local_finite_tensor = (
+                torch.stack([check.to(device=device) for check in finite_checks]).all()
+                if finite_checks
+                else torch.ones((), dtype=torch.bool, device=device)
+            )
+            finite_flag = local_finite_tensor.to(dtype=torch.int64).reshape(1)
             dist.all_reduce(finite_flag, op=dist.ReduceOp.MIN)
             local_finite = bool(finite_flag.item())
+        elif finite_checks:
+            local_finite = bool(torch.stack(finite_checks).all().item())
+        else:
+            local_finite = True
         if not local_finite:
             raise RuntimeError("Non-finite gradient detected across the EP/FSDP optimizer group")
     # Disable foreach to avoid DTensor/plain tensor mixing

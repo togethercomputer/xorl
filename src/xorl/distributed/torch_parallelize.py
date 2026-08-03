@@ -13,6 +13,7 @@ from torch.utils.checkpoint import noop_context_fn
 
 from xorl.distributed.checkpoint import CheckpointFunction
 from xorl.distributed.fsdp2 import BF16StochasticAllToAllReduceScatter, clip_grad_norm
+from xorl.distributed.gradient_reduction import GradientReductionDomain, validate_gradient_reduction_domain
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.distributed.pipeline_parallel import (
     generate_llm_fqn_per_model_part,
@@ -432,16 +433,6 @@ def parallelize_model_fsdp2(
         layer_mod._fsdp_modules = []
         # ep enabled and this layer contains the expert module
         if parallel_state.ep_enabled and experts_mod is not None and not getattr(experts_mod, "_skip_fsdp", False):
-            # Block LoRA experts with eFSDP > 1: LoRA + EP + eFSDP gradient
-            # interaction has not been validated. Until it is, require ep_fsdp_size=1.
-            from xorl.lora.modules.base import LoraModule  # noqa: PLC0415
-
-            if isinstance(experts_mod, LoraModule):
-                assert parallel_state.dp_shard_in_ep_size <= 1, (
-                    f"LoRA expert modules are not yet supported with ep_fsdp_size > 1 "
-                    f"(got {parallel_state.dp_shard_in_ep_size}). "
-                    f"Use ep_fsdp_size=1 for LoRA + EP training."
-                )
             # shard expert
             fully_shard(experts_mod, **expert_fsdp_kwargs)
             layer_mod._fsdp_modules.append(experts_mod)
@@ -716,9 +707,10 @@ def _build_ep_param_groups(model: "nn.Module") -> None:
     optimizer or before the optimizer is constructed.
     """
     try:
-        from torch.distributed._tensor import DTensor  # noqa: PLC0415
+        from torch.distributed._tensor import DTensor, Replicate  # noqa: PLC0415
     except ImportError:
         DTensor = None
+        Replicate = None
 
     # _skip_fsdp expert modules hold plain tensor params (not wrapped by FSDP)
     skip_fsdp_param_ids: set = set()
@@ -727,25 +719,50 @@ def _build_ep_param_groups(model: "nn.Module") -> None:
             for p in m.parameters():
                 skip_fsdp_param_ids.add(id(p))
 
+    fqn2spec_info = getattr(model, "_fqn2spec_info", {}) or {}
     ep_params = []
+    ep_replicated_params = []
+    ep_replicated_gradient_sync_params = []
     non_ep_params = []
-    for p in model.parameters():
+    for name, p in model.named_parameters():
+        spec_info = fqn2spec_info.get(name) or getattr(p, "spec_info", None)
+        is_ep_replicated = Replicate is not None and isinstance(getattr(spec_info, "placement", None), Replicate)
+        gradient_reduction = validate_gradient_reduction_domain(
+            getattr(spec_info, "gradient_reduction", GradientReductionDomain.NONE)
+        )
+        needs_ep_gradient_sync = is_ep_replicated and gradient_reduction is GradientReductionDomain.EP_SUM
         if id(p) in skip_fsdp_param_ids:
             ep_params.append(p)
+            if is_ep_replicated:
+                ep_replicated_params.append(p)
+                if needs_ep_gradient_sync:
+                    ep_replicated_gradient_sync_params.append(p)
             continue
         if DTensor is not None and isinstance(p, DTensor):
             mesh = getattr(p, "device_mesh", None)
             names = getattr(mesh, "mesh_dim_names", ()) if mesh is not None else ()
             if "ep_fsdp" in names:
                 ep_params.append(p)
+                if is_ep_replicated:
+                    ep_replicated_params.append(p)
+                    if needs_ep_gradient_sync:
+                        ep_replicated_gradient_sync_params.append(p)
                 continue
         non_ep_params.append(p)
 
-    model._ep_param_groups = {"ep": ep_params, "non_ep": non_ep_params}
+    model._ep_param_groups = {
+        "ep": ep_params,
+        "ep_replicated": ep_replicated_params,
+        "ep_replicated_gradient_sync": ep_replicated_gradient_sync_params,
+        "non_ep": non_ep_params,
+    }
+    model._ep_replicated_gradient_sync_enabled = bool(ep_replicated_gradient_sync_params)
     logger.info_rank0(
         f"eFSDP param groups (torchtitan design): "
         f"{len(ep_params)} EP params (ep_fsdp mesh), "
-        f"{len(non_ep_params)} non-EP params (full DP mesh)"
+        f"{len(non_ep_params)} non-EP params (full DP mesh), "
+        f"{len(ep_replicated_params)} replicated EP params, "
+        f"{len(ep_replicated_gradient_sync_params)} requiring EP gradient sync"
     )
 
 
