@@ -510,7 +510,7 @@ class ModelRunner:
         self._initialize_optimizer()
         self._initialize_checkpointer()
         self._checkpoint_mgr = self._build_checkpoint_manager()
-        self._load_initial_checkpoint()
+        self._restore_initial_base_checkpoint()
         if enable_full_determinism:
             # Enabling deterministic algorithms before Kimi DCP/meta materialization
             # makes startup pathologically slow; training and adapter init happen below.
@@ -540,14 +540,7 @@ class ModelRunner:
                 lora_config=self.lora_config,
                 zorl_config=self.zorl_config,
             )
-            self.register_session(
-                model_id="default",
-                session_spec=self._default_lora_session_spec,
-                materialize=True,
-                initialize_fresh=False,
-            )
-            self._adapter_manager.current_adapter_id = "default"
-            self._checkpoint_mgr._adapter_manager = self._adapter_manager
+            self._initialize_default_lora_adapter()
             logger.info("Multi-adapter manager initialized with default adapter")
 
         # Initialize tokenizer for sampling (only on rank 0)
@@ -740,6 +733,24 @@ class ModelRunner:
             or (self._adapter_manager is not None and self._adapter_manager.has_adapter(model_id)),
             "session_spec": deepcopy(self._lora_session_specs[model_id]),
         }
+
+    def _initialize_default_lora_adapter(self) -> None:
+        """Create the default adapter only after base checkpoint restoration."""
+
+        if not getattr(self, "_base_checkpoint_restore_complete", False):
+            raise RuntimeError("Default LoRA adapter initialization requires completed base checkpoint restoration")
+        self.register_session(
+            model_id="default",
+            session_spec=self._default_lora_session_spec,
+            materialize=True,
+            # Base checkpoints intentionally exclude LoRA tensors. In the
+            # meta/FSDP startup path those factor buffers came from to_empty(),
+            # so they must never be snapshotted as an initialized adapter.
+            # A later load_adapter_state call replaces this fresh state.
+            initialize_fresh=True,
+        )
+        self._adapter_manager.current_adapter_id = "default"
+        self._checkpoint_mgr._adapter_manager = self._adapter_manager
 
     def ensure_lora_adapter(self, model_id: str, *, initialize_fresh: bool = True) -> None:
         """Materialize a registered LoRA session into the resident adapter registry."""
@@ -1875,6 +1886,13 @@ class ModelRunner:
         logger.info("Loading initial checkpoint from %s (load_optimizer=%s)", checkpoint_path, load_optimizer)
         self._checkpoint_mgr.load_state(checkpoint_path, load_optimizer=load_optimizer)
         self._sync_from_checkpoint_state()
+
+    def _restore_initial_base_checkpoint(self) -> None:
+        """Restore the base checkpoint and publish completion only on success."""
+
+        self._base_checkpoint_restore_complete = False
+        self._load_initial_checkpoint()
+        self._base_checkpoint_restore_complete = True
 
     def register_lora_adapter(self, model_id: str, lr: Optional[float]) -> Dict[str, Any]:
         """

@@ -108,3 +108,67 @@ def test_model_runner_can_skip_initial_checkpoint_optimizer_state():
     assert runner._checkpoint_mgr.calls == [("/tmp/initial-dcp", False)]
     assert runner.global_step == 13
     assert runner.global_forward_backward_step == 17
+
+
+def test_model_runner_marks_base_restore_complete_only_after_success():
+    events = []
+    runner = object.__new__(ModelRunner)
+    runner._base_checkpoint_restore_complete = True
+
+    def restore():
+        events.append(("restore", runner._base_checkpoint_restore_complete))
+
+    runner._load_initial_checkpoint = restore
+
+    runner._restore_initial_base_checkpoint()
+
+    assert events == [("restore", False)]
+    assert runner._base_checkpoint_restore_complete is True
+
+    def fail_restore():
+        raise RuntimeError("restore failed")
+
+    runner._load_initial_checkpoint = fail_restore
+    with pytest.raises(RuntimeError, match="restore failed"):
+        runner._restore_initial_base_checkpoint()
+    assert runner._base_checkpoint_restore_complete is False
+
+
+def test_default_adapter_initialization_never_snapshots_uninitialized_storage():
+    class GuardedAdapterManager:
+        def __init__(self):
+            self.current_adapter_id = None
+            self.register_calls = []
+
+        def has_adapter(self, _model_id):
+            return False
+
+        def register_adapter(self, *, model_id, session_spec, initialize_fresh):
+            if not initialize_fresh:
+                raise AssertionError("would snapshot uninitialized to_empty storage")
+            self.register_calls.append((model_id, session_spec, initialize_fresh))
+
+    class FakeCheckpointManager:
+        _adapter_manager = None
+
+    runner = object.__new__(ModelRunner)
+    runner._base_checkpoint_restore_complete = False
+    runner._adapter_manager = GuardedAdapterManager()
+    runner._checkpoint_mgr = FakeCheckpointManager()
+    runner.lora_config = {"enable_lora": True}
+    runner._default_lora_session_spec = {"base_model": "example/model"}
+    runner._lora_session_specs = {}
+    runner._zorl_sessions = {}
+
+    with pytest.raises(RuntimeError, match="requires completed base checkpoint restoration"):
+        runner._initialize_default_lora_adapter()
+    assert runner._adapter_manager.register_calls == []
+
+    runner._base_checkpoint_restore_complete = True
+    runner._initialize_default_lora_adapter()
+
+    assert runner._adapter_manager.register_calls == [
+        ("default", {"base_model": "example/model"}, True),
+    ]
+    assert runner._adapter_manager.current_adapter_id == "default"
+    assert runner._checkpoint_mgr._adapter_manager is runner._adapter_manager

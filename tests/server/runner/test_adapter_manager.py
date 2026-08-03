@@ -326,6 +326,18 @@ def test_load_adapter_state_allows_weights_only_optimizer_mismatch(tmp_path):
     target_manager = _build_manager(tmp_path, optimizer_type="adamw")
     target_spec = _session_spec(rank=4, alpha=16, optimizer_type="adamw", lr=0.05, weight_decay=0.01)
     target_manager.register_adapter("policy-b", session_spec=target_spec, initialize_fresh=True)
+    target_fresh_a = (
+        target_manager.get_adapter_state("policy-b")
+        .lora_params["model.layers.0.self_attn.o_proj.lora_A"]
+        .detach()
+        .clone()
+    )
+    target_fresh_b = (
+        target_manager.get_adapter_state("policy-b")
+        .lora_params["model.layers.0.self_attn.o_proj.lora_B"]
+        .detach()
+        .clone()
+    )
 
     result = target_manager.load_adapter_state("policy-b", checkpoint_path, load_optimizer=False)
 
@@ -346,6 +358,8 @@ def test_load_adapter_state_allows_weights_only_optimizer_mismatch(tmp_path):
         target_state.lora_params["model.layers.0.self_attn.o_proj.lora_B"],
         torch.full((8, 4), 0.5),
     )
+    assert not torch.equal(target_state.lora_params["model.layers.0.self_attn.o_proj.lora_A"], target_fresh_a)
+    assert not torch.equal(target_state.lora_params["model.layers.0.self_attn.o_proj.lora_B"], target_fresh_b)
 
 
 def test_load_adapter_state_weights_only_restores_checkpoint_lr_for_same_optimizer_contract(tmp_path):
