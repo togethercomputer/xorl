@@ -20,6 +20,7 @@ from xorl.distributed.canonical_moe import (
     canonical_moe_reduce_packed_ep16_v2,
     canonical_moe_reduce_reference,
     canonical_moe_reduce_v1,
+    resolve_canonical_moe_transport,
 )
 from xorl.distributed.parallel_state import init_ep_mesh_matrix
 
@@ -73,6 +74,89 @@ def test_graph_metadata_has_deterministic_padding_and_capacity_guard():
     assert metadata.valid_mask.tolist() == [True, True, True, False, False, False, False, False]
     with pytest.raises(ValueError, match="exceeds fixed capacity"):
         CanonicalMoEGraphMetadata.build(torch.arange(3), torch.arange(3), capacity=2)
+
+
+@pytest.mark.cpu
+def test_transport_auto_promotes_only_admitted_cp_sharded_geometry():
+    ep16 = ParallelPlan.glm52_trainer(world_size=16, pp_size=1, dp_size=1, contributor_count=16)
+    assert (
+        resolve_canonical_moe_transport(
+            "auto",
+            plan=ep16,
+            capacity=4224,
+            local_rows=264,
+            graph_mode=False,
+            consumer_sharded_output=True,
+        )
+        is CanonicalMoETransport.CP_SHARDED_V3
+    )
+
+    ep8 = ParallelPlan.glm52_trainer(world_size=16, pp_size=1, dp_size=2, contributor_count=8)
+    assert (
+        resolve_canonical_moe_transport(
+            "auto",
+            plan=ep8,
+            capacity=4224,
+            local_rows=528,
+            graph_mode=False,
+            consumer_sharded_output=True,
+        )
+        is CanonicalMoETransport.DENSE_V1
+    )
+    assert (
+        resolve_canonical_moe_transport(
+            "auto",
+            plan=ep16,
+            capacity=4224,
+            local_rows=264,
+            graph_mode=True,
+            consumer_sharded_output=True,
+        )
+        is CanonicalMoETransport.DENSE_V1
+    )
+
+
+@pytest.mark.cpu
+def test_transport_explicit_modes_never_silently_fallback():
+    ep16 = ParallelPlan.glm52_trainer(world_size=16, pp_size=1, dp_size=1, contributor_count=16)
+    assert (
+        resolve_canonical_moe_transport(
+            "dense_v1",
+            plan=ep16,
+            capacity=4224,
+            local_rows=264,
+            graph_mode=False,
+            consumer_sharded_output=True,
+        )
+        is CanonicalMoETransport.DENSE_V1
+    )
+    with pytest.raises(ValueError, match="eager execution"):
+        resolve_canonical_moe_transport(
+            "cp_sharded_v3",
+            plan=ep16,
+            capacity=4224,
+            local_rows=264,
+            graph_mode=True,
+            consumer_sharded_output=True,
+        )
+    with pytest.raises(ValueError, match="consumer-sharded output"):
+        resolve_canonical_moe_transport(
+            "cp_sharded_v3",
+            plan=ep16,
+            capacity=4224,
+            local_rows=264,
+            graph_mode=False,
+            consumer_sharded_output=False,
+        )
+    with pytest.raises(ValueError, match="EP16/CP16"):
+        resolve_canonical_moe_transport(
+            "packed_ep16_v2",
+            plan=ParallelPlan.glm52_trainer(world_size=16, pp_size=1, dp_size=2, contributor_count=8),
+            capacity=4224,
+            local_rows=528,
+            graph_mode=False,
+            consumer_sharded_output=False,
+        )
 
 
 @pytest.mark.cpu

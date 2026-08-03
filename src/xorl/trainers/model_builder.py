@@ -18,7 +18,6 @@ from xorl.lora import freeze_base_parameters
 from xorl.lora.utils import inject_lora_into_model, inject_lora_into_model_with_moe
 from xorl.models import build_foundation_model
 from xorl.models.checkpoint_handlers.buffers import get_prequantized_exclude_modules
-from xorl.models.layers.rope import set_rope_class_b, set_rope_native
 from xorl.models.transformers.deepseek_v3.support import (
     freeze_deepseek_v3_router_parameters,
     validate_deepseek_v3_training_mode,
@@ -112,7 +111,8 @@ def build_training_model(
     config_path: str,
     weights_path: str,
     torch_dtype: str = "bfloat16",
-    attn_implementation: str = "flash_attention_3",
+    attn_implementation: Optional[str] = None,
+    non_glm_attn_default: str = "flash_attention_3",
     moe_implementation: Optional[str] = None,
     moe_routing_weights_before_down: bool | str = "auto",
     ep_dispatch: str = "alltoall",
@@ -122,7 +122,7 @@ def build_training_model(
     deepep_num_sms: int = 20,
     deepep_async_combine: bool = False,
     alltoall_combine_hidden_chunk_size: int = 0,
-    canonical_moe_transport: str = "dense_v1",
+    canonical_moe_transport: str = "auto",
     init_device: str = "meta",
     merge_qkv: bool = True,
     # --- LoRA ---
@@ -188,15 +188,15 @@ def build_training_model(
     # --- Training flags ---
     freeze_router: bool = False,
     # --- SGLang numerical alignment ---
-    router_fp32: bool = True,
-    lm_head_fp32: bool = True,
-    rmsnorm_mode: str = "native",
+    router_fp32: Optional[bool] = None,
+    lm_head_fp32: Optional[bool] = None,
+    rmsnorm_mode: Optional[str] = None,
     activation_native: bool = False,
-    rope_native: bool = False,
-    rope_class_b: bool = False,
+    rope_native: Optional[bool] = None,
+    rope_class_b: Optional[bool] = None,
     attention_cast_bf16: bool = False,
-    sparse_mla_enabled: bool = False,
-    sparse_mla_backend: str = "auto",
+    sparse_mla_enabled: Optional[bool] = None,
+    sparse_mla_backend: Optional[str] = None,
     flash_attention_deterministic: bool = False,
 ) -> TrainingModelResult:
     """Build, inject LoRA/QLoRA, and parallelize a training model.
@@ -217,16 +217,11 @@ def build_training_model(
     Returns a :class:`TrainingModelResult` with model, config, PP state, etc.
     """
 
-    if rope_class_b and not rope_native:
+    if rope_class_b is True and rope_native is False:
         raise ValueError(
-            "rope_class_b=True requires rope_native=True: the certified Class-B contract "
-            "uses the CPU-built SGLang-layout cos/sin cache selected by rope_native."
+            "rope_class_b=True requires rope_native=True: the Class-B contract uses "
+            "the CPU-built serving-layout cos/sin cache selected by rope_native"
         )
-    # These selectors are process globals, so every build must set both values
-    # explicitly. Otherwise a Class-B build can leak into the next model built
-    # by the same worker even when that model's config requests Class A.
-    set_rope_native(bool(rope_native))
-    set_rope_class_b(bool(rope_class_b))
 
     # ------------------------------------------------------------------
     # 1. Build foundation model
@@ -237,6 +232,7 @@ def build_training_model(
         weights_path=weights_path,
         torch_dtype=torch_dtype,
         attn_implementation=attn_implementation,
+        non_glm_attn_default=non_glm_attn_default,
         moe_implementation=moe_implementation,
         moe_routing_weights_before_down=moe_routing_weights_before_down,
         ep_dispatch=ep_dispatch,
@@ -252,6 +248,7 @@ def build_training_model(
         rmsnorm_mode=rmsnorm_mode,
         activation_native=activation_native,
         rope_native=rope_native,
+        rope_class_b=rope_class_b,
         attention_cast_bf16=attention_cast_bf16,
         sparse_mla_enabled=sparse_mla_enabled,
         sparse_mla_backend=sparse_mla_backend,
@@ -260,9 +257,9 @@ def build_training_model(
     )
 
     # Set module-level flags for rope and activation
-    if rope_native:
+    if getattr(model.config, "_rope_native", False):
         logger.info_rank0("Using native RoPE (flash_attn fused kernel disabled)")
-    if rope_class_b:
+    if getattr(model.config, "_rope_class_b", False):
         logger.info_rank0(
             "Using compiled Class-B RoPE fp32-chain numerics aligned with SGLang's stock fused CUDA kernel"
         )

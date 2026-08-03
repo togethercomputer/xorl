@@ -1,5 +1,11 @@
 from . import transformers
-from .auto import build_foundation_model, build_processor, build_tokenizer
+from .auto import (
+    build_foundation_model,
+    build_processor,
+    build_tokenizer,
+    resolve_cross_entropy_mode,
+    resolve_model_numerical_program,
+)
 from .module_utils import (
     all_ranks_load_weights,
     grouped_load_weights,
@@ -15,6 +21,8 @@ __all__ = [
     "build_foundation_model",
     "build_processor",
     "build_tokenizer",
+    "resolve_cross_entropy_mode",
+    "resolve_model_numerical_program",
     "init_empty_weights",
     "all_ranks_load_weights",
     "grouped_load_weights",

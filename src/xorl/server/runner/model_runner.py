@@ -59,6 +59,7 @@ from xorl.distributed.pipeline_parallel import (
 from xorl.distributed.sequence_parallel.data import gather_outputs
 from xorl.lora import LoraLinear
 from xorl.lora.fold import lora_merged_forward_enabled
+from xorl.models import resolve_cross_entropy_mode
 from xorl.models.layers.moe.routing_replay import set_replay_stage
 from xorl.models.transformers.deepseek_v3.support import deepseek_v3_default_lora_targets
 from xorl.models.transformers.glm5.support import glm5_default_lora_targets
@@ -423,7 +424,7 @@ class ModelRunner:
             )
 
         # Cross-entropy mode
-        self.ce_mode = self.train_config.get("ce_mode", "eager")
+        self.ce_mode = self.train_config.get("ce_mode")
 
         # LM head fp32 flag for loss functions
         self.lm_head_fp32 = self.model_config.get("lm_head_fp32", True)
@@ -1524,7 +1525,8 @@ class ModelRunner:
             config_path=self.model_config.get("config_path"),
             weights_path=self.model_config.get("model_path"),
             torch_dtype=model_dtype,
-            attn_implementation=self.model_config.get("attn_implementation", "sdpa"),
+            attn_implementation=self.model_config.get("attn_implementation"),
+            non_glm_attn_default="flash_attention_4",
             moe_implementation=self.model_config.get("moe_implementation"),
             moe_routing_weights_before_down=self.model_config.get("moe_routing_weights_before_down", "auto"),
             ep_dispatch=self.model_config.get("ep_dispatch", "alltoall"),
@@ -1534,7 +1536,7 @@ class ModelRunner:
             deepep_num_sms=self.model_config.get("deepep_num_sms", 20),
             deepep_async_combine=self.model_config.get("deepep_async_combine", False),
             alltoall_combine_hidden_chunk_size=self.model_config.get("alltoall_combine_hidden_chunk_size", 0),
-            canonical_moe_transport=self.model_config.get("canonical_moe_transport", "dense_v1"),
+            canonical_moe_transport=self.model_config.get("canonical_moe_transport", "auto"),
             init_device=self.train_config.get("init_device", "cpu"),
             merge_qkv=self.model_config.get("merge_qkv", True),
             enable_lora=lora_enabled,
@@ -1600,20 +1602,38 @@ class ModelRunner:
             pp_num_layers_in_first_stage=self.train_config.get("pipeline_parallel_num_layers_in_first_stage"),
             pp_num_layers_in_last_stage=self.train_config.get("pipeline_parallel_num_layers_in_last_stage"),
             freeze_router=self.train_config.get("freeze_router", False),
-            router_fp32=self.model_config.get("router_fp32", True),
-            lm_head_fp32=self.model_config.get("lm_head_fp32", True),
-            rmsnorm_mode=self.model_config.get("rmsnorm_mode", "native"),
+            router_fp32=self.model_config.get("router_fp32"),
+            lm_head_fp32=self.model_config.get("lm_head_fp32"),
+            rmsnorm_mode=self.model_config.get("rmsnorm_mode"),
             activation_native=self.model_config.get("activation_native", False),
-            rope_native=self.model_config.get("rope_native", False),
-            rope_class_b=self.model_config.get("rope_class_b", False),
+            rope_native=self.model_config.get("rope_native"),
+            rope_class_b=self.model_config.get("rope_class_b"),
             attention_cast_bf16=self.model_config.get("attention_cast_bf16", False),
-            sparse_mla_enabled=self.model_config.get("sparse_mla_enabled", False),
-            sparse_mla_backend=self.model_config.get("sparse_mla_backend", "auto"),
+            sparse_mla_enabled=self.model_config.get("sparse_mla_enabled"),
+            sparse_mla_backend=self.model_config.get("sparse_mla_backend"),
             flash_attention_deterministic=self.model_config.get("flash_attention_deterministic", False),
         )
 
         self.model = result.model
         self.model_config_obj = result.model_config
+        numerical_program = self.model_config_obj._resolved_numerical_program
+        self.model_config.update(
+            {
+                "attn_implementation": numerical_program["attn_implementation"],
+                "router_fp32": numerical_program["router_fp32"],
+                "lm_head_fp32": numerical_program["lm_head_fp32"],
+                "rmsnorm_mode": numerical_program["rmsnorm_mode"],
+                "activation_native": numerical_program["activation_native"],
+                "rope_native": numerical_program["rope_native"],
+                "rope_class_b": numerical_program["rope_class_b"],
+                "attention_cast_bf16": numerical_program["attention_cast_bf16"],
+                "sparse_mla_enabled": numerical_program["sparse_mla_enabled"],
+                "sparse_mla_backend": numerical_program["sparse_mla_backend"],
+            }
+        )
+        self.lm_head_fp32 = numerical_program["lm_head_fp32"]
+        self.ce_mode = resolve_cross_entropy_mode(self.model_config_obj, self.ce_mode)
+        self.train_config["ce_mode"] = self.ce_mode
         self.pp_enabled = result.pp_enabled
         self.pp_stages = result.pp_stages
         self.model_parts = result.model_parts

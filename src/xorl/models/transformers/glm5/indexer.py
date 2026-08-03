@@ -94,7 +94,7 @@ class Glm5DsaIndexer(nn.Module):
         else:
             index_k = self.k_norm(index_k)
 
-        if _moe_bi_router_enabled():
+        if _moe_bi_router_enabled(self.config):
             if hidden_states.dtype is not torch.bfloat16 or self.weights_proj.weight.dtype is not torch.bfloat16:
                 raise TypeError(
                     "GLM-5.2 batch-invariant indexer projection requires BF16 hidden states and BF16 weights"
@@ -118,6 +118,9 @@ class Glm5DsaIndexer(nn.Module):
             cos,
             sin,
             interleaved=getattr(self.config, "indexer_rope_interleave", True),
+            class_b=bool(
+                getattr(self.config, "_rope_class_b", False) or getattr(self.config, "indexer_types", None) is not None
+            ),
         )
 
         index_q = torch.cat([q_pe, q_no_pe], dim=-1)

@@ -28,16 +28,32 @@ def _moe_fp64_accum_enabled() -> bool:
 _MOE_BI_ROUTER_ENV = "XORL_MOE_BI_ROUTER"
 
 
-def _moe_bi_router_enabled() -> bool:
-    """K3 router contract: route the gate/router matmul through the shared
+def _moe_bi_router_enabled(config=None) -> bool:
+    """Whether this caller owns the exact batch-invariant router contract.
+
+    Canonical GLM-5.2 makes the contract structural: its model declaration is
+    sufficient and cannot depend on a launch-time environment switch. Other
+    MoE families retain the existing opt-in environment behavior.
+
+    Route the gate/router matmul through the shared
     batch-invariant router GEMM (``ops.batch_invariant_ops.bi_router_gemm``),
-    vendored bit-for-bit into SGLang. Opt-in; never a training default.
+    vendored bit-for-bit into SGLang.
 
     Live training routes independently of serving (no routing replay), so the
     fp32 router-GEMM reduction-order tail can flip top-k expert selection on
     razor-edge tokens. This pins the router logits identically cross-engine.
     """
-    return os.environ.get(_MOE_BI_ROUTER_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+    canonical_glm52 = (
+        config is not None
+        and getattr(config, "model_type", None) == "xorl_glm5"
+        and getattr(config, "indexer_types", None) is not None
+    )
+    return canonical_glm52 or os.environ.get(_MOE_BI_ROUTER_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 class _BIRouterGemm(torch.autograd.Function):

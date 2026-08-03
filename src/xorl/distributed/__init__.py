@@ -15,4 +15,5 @@ from .canonical_moe import (
     canonical_moe_reduce_packed_ep16_v2,
     canonical_moe_reduce_reference,
     canonical_moe_reduce_v1,
+    resolve_canonical_moe_transport,
 )

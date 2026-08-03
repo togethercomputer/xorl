@@ -17,6 +17,7 @@ from xorl.distributed.canonical_moe import (
     canonical_moe_reduce_cp_sharded_v3,
     canonical_moe_reduce_packed_ep16_v2,
     canonical_moe_reduce_v1,
+    resolve_canonical_moe_transport,
 )
 from xorl.distributed.moe.deepep import sync_pending_combine
 from xorl.distributed.parallel_state import get_parallel_state
@@ -161,7 +162,7 @@ class Glm5TopkRouter(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = hidden_states.view(-1, self.hidden_size)
-        if _moe_bi_router_enabled():
+        if _moe_bi_router_enabled(self.config):
             if hidden_states.dtype is not torch.bfloat16 or self.weight.dtype is not torch.bfloat16:
                 raise TypeError("GLM-5.2 batch-invariant router requires BF16 hidden states and BF16 gate weights")
             return _BIRouterGemm.apply(hidden_states, self.weight)
@@ -254,6 +255,9 @@ class Glm5MlaAttention(nn.Module):
             cos,
             sin,
             interleaved=getattr(self.config, "rope_interleave", True),
+            class_b=bool(
+                getattr(self.config, "_rope_class_b", False) or getattr(self.config, "indexer_types", None) is not None
+            ),
         )
         k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
 
@@ -430,6 +434,9 @@ class Glm5Attention(Glm5MlaAttention):
             cos,
             sin,
             interleaved=getattr(self.config, "rope_interleave", True),
+            class_b=bool(
+                getattr(self.config, "_rope_class_b", False) or getattr(self.config, "indexer_types", None) is not None
+            ),
         )
         k_pe = k_pe.squeeze(2)
 
@@ -741,7 +748,7 @@ class Glm5MoEBlock(MoEBlock):
         )
         try:
             self.canonical_moe_transport = CanonicalMoETransport(
-                getattr(config, "canonical_moe_transport", CanonicalMoETransport.DENSE_V1.value)
+                getattr(config, "canonical_moe_transport", CanonicalMoETransport.AUTO.value)
             )
         except ValueError as error:
             raise ValueError(
@@ -767,9 +774,10 @@ class Glm5MoEBlock(MoEBlock):
 
         if self.canonical_contract_version is not None and (stage is not None or replay is not None):
             raise RuntimeError("GLM-5.2 canonical MoE canonical path forbids routing replay and recomputation")
-        if self.canonical_contract_version is not None and not _moe_bi_router_enabled():
-            raise RuntimeError("GLM-5.2 canonical MoE requires XORL_MOE_BI_ROUTER=1")
-
+        if self.canonical_contract_version is not None and not _moe_bi_router_enabled(self.config):
+            raise RuntimeError(
+                "GLM-5.2 canonical MoE requires a model-level exact router declaration or the legacy router opt-in"
+            )
         router_logits = self.gate(flat_hidden_states)
 
         if stage is not None and replay is not None:
@@ -831,8 +839,10 @@ class Glm5MoEBlock(MoEBlock):
         if correction_bias.shape != (self.num_experts,) or not bool(torch.all(torch.isfinite(correction_bias))):
             raise ValueError("GLM-5.2 e_score_correction_bias failed shape/finite validation")
         if self.canonical_contract_version is not None:
-            if not _moe_bi_router_enabled():
-                raise RuntimeError("GLM-5.2 canonical MoE requires XORL_MOE_BI_ROUTER=1")
+            if not _moe_bi_router_enabled(self.config):
+                raise RuntimeError(
+                    "GLM-5.2 canonical MoE requires a model-level exact router declaration or the legacy router opt-in"
+                )
             if hidden_states is None:
                 raise RuntimeError("GLM-5.2 canonical grouped top-k requires the pre-gate hidden states")
             if hidden_states.dtype is not torch.bfloat16 or router_logits.dtype is not torch.float32:
@@ -1058,7 +1068,29 @@ class Glm5MoEBlock(MoEBlock):
             contributor_count=ps.ep_size,
         )
         engagement_key = f"glm52.layer.{self.layer_idx}.moe.{self.canonical_engagement_count}"
-        if self.canonical_moe_transport is CanonicalMoETransport.CP_SHARDED_V3:
+        resolved_transport = resolve_canonical_moe_transport(
+            self.canonical_moe_transport,
+            plan=plan,
+            capacity=capacity,
+            local_rows=local_rows,
+            graph_mode=False,
+            consumer_sharded_output=True,
+        )
+        previous_transport = getattr(self.config, "_resolved_canonical_moe_transport", None)
+        if previous_transport is None:
+            self.config._resolved_canonical_moe_transport = resolved_transport.value
+            logger.info_rank0(
+                "Resolved GLM-5.2 canonical MoE transport: "
+                f"requested={self.canonical_moe_transport.value}, resolved={resolved_transport.value}, "
+                f"EP={plan.ep_size}, CP={plan.cp_size}, capacity={capacity}, local_rows={local_rows}, graph=False"
+            )
+        elif previous_transport != resolved_transport.value:
+            raise RuntimeError(
+                "GLM-5.2 canonical MoE transport geometry changed within one model: "
+                f"{previous_transport} -> {resolved_transport.value}"
+            )
+
+        if resolved_transport is CanonicalMoETransport.CP_SHARDED_V3:
             canonical = canonical_moe_reduce_cp_sharded_v3(
                 contribution,
                 plan=plan,
@@ -1070,7 +1102,7 @@ class Glm5MoEBlock(MoEBlock):
         else:
             canonical_reduce = (
                 canonical_moe_reduce_packed_ep16_v2
-                if self.canonical_moe_transport is CanonicalMoETransport.PACKED_EP16_V2
+                if resolved_transport is CanonicalMoETransport.PACKED_EP16_V2
                 else canonical_moe_reduce_v1
             )
             canonical = canonical_reduce(
@@ -1086,7 +1118,7 @@ class Glm5MoEBlock(MoEBlock):
         self.last_canonical_receipt = canonical.receipt
         self.canonical_engagement_count += 1
 
-        if self.canonical_moe_transport is CanonicalMoETransport.CP_SHARDED_V3:
+        if resolved_transport is CanonicalMoETransport.CP_SHARDED_V3:
             local_canonical = canonical.tensor[:local_rows]
         else:
             source_start = ep_rank * padded_rows

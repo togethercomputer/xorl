@@ -72,6 +72,31 @@ def load_server_arguments(config_path, *args, **kwargs):
     return _load_server_arguments_impl(config_path, *args, **kwargs)
 
 
+def test_canonical_moe_and_rope_auto_defaults_serialize(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {"model_path": "Qwen/Qwen3-8B"},
+                "train": {"output_dir": str(tmp_path / "outputs")},
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = load_server_arguments(str(config_path))
+    model_config = args.to_config_dict()["model"]
+    assert args.canonical_moe_transport == "auto"
+    assert model_config["canonical_moe_transport"] == "auto"
+    assert model_config["attn_implementation"] is None
+    assert model_config["router_fp32"] is None
+    assert model_config["lm_head_fp32"] is None
+    assert model_config["rmsnorm_mode"] is None
+    assert model_config["rope_native"] is None
+    assert model_config["rope_class_b"] is None
+    assert model_config["sparse_mla_enabled"] is None
+    assert args.to_config_dict()["train"]["ce_mode"] is None
+
+
 def test_load_server_arguments_threads_signsgd_through_nested_config(tmp_path):
     config_path = tmp_path / "server_config.yaml"
     config_path.write_text(

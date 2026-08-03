@@ -15,6 +15,7 @@ from xorl.distributed.canonical_moe import (
     ParallelPlan,
     canonical_moe_reduce_reference,
 )
+from xorl.models.transformers.glm5 import indexer as indexer_module
 from xorl.models.transformers.glm5 import sparse_selector as sparse_selector_module
 from xorl.models.transformers.glm5.checkpoint_handler import Glm5CheckpointHandler
 from xorl.models.transformers.glm5.configuration_glm5 import Glm5Config
@@ -23,6 +24,7 @@ from xorl.models.transformers.glm5.index_share import (
     IndexShareContextManager,
     IndexShareLifecycle,
 )
+from xorl.models.transformers.glm5.indexer import Glm5DsaIndexer
 from xorl.models.transformers.glm5.layer_plan import Glm52LayerPlan
 from xorl.models.transformers.glm5.modeling_glm5 import (
     _GLM52_CANONICAL_TRAINER_TOPOLOGIES,
@@ -179,7 +181,12 @@ def test_index_share_context_identity_survives_fsdp_tensor_transform():
 
 @pytest.mark.cpu
 @torch.no_grad()
-def test_index_share_survives_fsdp_cast_across_dense_producer_and_shared_consumer():
+def test_index_share_survives_fsdp_cast_across_dense_producer_and_shared_consumer(monkeypatch):
+    monkeypatch.setattr(
+        indexer_module,
+        "bi_bf16_fp32_linear",
+        lambda hidden, weight: F.linear(hidden.float(), weight.float()),
+    )
     config = _small_glm_config()
     config.indexer_types = ["full", "full", "full", "shared"]
     config.index_topk_freq = 4
@@ -189,8 +196,12 @@ def test_index_share_survives_fsdp_cast_across_dense_producer_and_shared_consume
     config._sparse_mla_enabled = True
     config._sparse_mla_backend = "auto"
     config._activation_native = True
+    # The production Class-B rotary path is CUDA-only and preserves BF16.
+    # Cast after the CPU reference fallback so this identity-only fixture does
+    # not exercise an unsupported mixed-dtype eager attention matmul.
+    config._attention_cast_bf16 = True
 
-    model = Glm5ForCausalLM(config).model.eval()
+    model = Glm5ForCausalLM(config).model.to(torch.bfloat16).eval()
     # This CPU-only regression exercises IndexShare identity across FSDP's
     # tensor transform. Native sparse-selector scoring is intentionally CUDA-only.
     for layer in model.layers[:3]:
@@ -558,7 +569,11 @@ def test_canonical_moe_rejects_routing_replay_configuration():
 @pytest.mark.cpu
 def test_canonical_moe_transport_is_an_explicit_model_mode():
     config = _small_glm_config()
-    assert Glm5MoEBlock(config, layer_idx=1).canonical_moe_transport is CanonicalMoETransport.DENSE_V1
+    assert Glm5MoEBlock(config, layer_idx=1).canonical_moe_transport is CanonicalMoETransport.AUTO
+
+    serialized = config.to_dict()
+    assert serialized["canonical_moe_transport"] == "auto"
+    assert Glm5Config.from_dict(serialized).canonical_moe_transport == "auto"
 
     config.canonical_moe_transport = CanonicalMoETransport.PACKED_EP16_V2.value
     assert Glm5MoEBlock(config, layer_idx=1).canonical_moe_transport is CanonicalMoETransport.PACKED_EP16_V2
@@ -569,6 +584,51 @@ def test_canonical_moe_transport_is_an_explicit_model_mode():
     config.canonical_moe_transport = "silent_fallback_is_forbidden"
     with pytest.raises(ValueError, match="Unsupported GLM-5.2 canonical MoE transport"):
         Glm5MoEBlock(config, layer_idx=1)
+
+
+@pytest.mark.cpu
+def test_canonical_glm_router_and_indexer_are_exact_without_environment(monkeypatch):
+    monkeypatch.delenv("XORL_MOE_BI_ROUTER", raising=False)
+    calls = []
+
+    def router_gemm(hidden, weight):
+        calls.append("router")
+        return F.linear(hidden.float(), weight.float())
+
+    def indexer_gemm(hidden, weight):
+        calls.append("indexer")
+        return F.linear(hidden.float(), weight.float())
+
+    monkeypatch.setattr("xorl.models.transformers.glm5.modeling_glm5._BIRouterGemm.apply", router_gemm)
+    monkeypatch.setattr(indexer_module, "bi_bf16_fp32_linear", indexer_gemm)
+
+    config = _small_glm_config()
+    router = Glm5TopkRouter(config).to(torch.bfloat16)
+    router(torch.zeros((2, config.hidden_size), dtype=torch.bfloat16))
+
+    indexer = Glm5DsaIndexer(config).to(torch.bfloat16)
+    hidden = torch.zeros((1, 2, config.hidden_size), dtype=torch.bfloat16)
+    compressed = torch.zeros((1, 2, config.q_lora_rank), dtype=torch.bfloat16)
+    cos = torch.ones((1, 2, config.qk_rope_head_dim), dtype=torch.float32)
+    sin = torch.zeros_like(cos)
+    indexer.project(hidden, compressed, (cos, sin))
+    assert calls == ["router", "indexer"]
+
+
+@pytest.mark.cpu
+def test_noncanonical_glm_retains_router_environment_opt_in(monkeypatch):
+    monkeypatch.delenv("XORL_MOE_BI_ROUTER", raising=False)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("noncanonical GLM unexpectedly used the exact router kernel")
+
+    monkeypatch.setattr("xorl.models.transformers.glm5.modeling_glm5._BIRouterGemm.apply", forbidden)
+    config = _small_glm_config()
+    config.indexer_types = None
+    config._router_fp32 = False
+    router = Glm5TopkRouter(config).to(torch.bfloat16)
+    output = router(torch.zeros((2, config.hidden_size), dtype=torch.bfloat16))
+    assert output.dtype is torch.bfloat16
 
 
 def _semantic_model_config(num_moe_layers: int) -> Glm5Config:
@@ -602,6 +662,8 @@ def _semantic_model_config(num_moe_layers: int) -> Glm5Config:
     config._attn_implementation = "eager"
     config._dsa_mask_disabled = True
     config._activation_native = True
+    # See the Class-B CPU fallback note in the IndexShare fixture above.
+    config._attention_cast_bf16 = True
     return config
 
 
@@ -707,7 +769,7 @@ def test_semantic_moe_stack_boundary_logprob_engagement_permutation_and_composit
         weights = weights / weights.sum(dim=-1, keepdim=True)
         return weights.to(torch.float32), selected.to(torch.int32)
 
-    monkeypatch.setenv("XORL_MOE_BI_ROUTER", "1")
+    monkeypatch.delenv("XORL_MOE_BI_ROUTER", raising=False)
     monkeypatch.setattr(
         "xorl.models.transformers.glm5.modeling_glm5._BIRouterGemm.apply",
         rowwise_router,

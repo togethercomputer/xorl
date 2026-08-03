@@ -43,9 +43,80 @@ class OutputDistribution(str, Enum):
 class CanonicalMoETransport(str, Enum):
     """Byte-transport implementation under the version-1 arithmetic contract."""
 
+    AUTO = "auto"
     DENSE_V1 = "dense_v1"
     PACKED_EP16_V2 = CANONICAL_MOE_PACKED_EP16_TRANSPORT_VERSION
     CP_SHARDED_V3 = CANONICAL_MOE_CP_SHARDED_TRANSPORT_VERSION
+
+
+def _cp_sharded_v3_incompatibilities(
+    *,
+    plan: ParallelPlan,
+    capacity: int,
+    local_rows: int,
+    graph_mode: bool,
+    consumer_sharded_output: bool,
+) -> tuple[str, ...]:
+    reasons = []
+    if plan.role is not ParallelRole.TRAINER:
+        reasons.append("trainer role")
+    if plan.cp_size != 16 or plan.ep_size != 16:
+        reasons.append("EP16/CP16")
+    if graph_mode:
+        reasons.append("eager execution")
+    if not consumer_sharded_output:
+        reasons.append("consumer-sharded output")
+    if capacity <= 0 or capacity % 16:
+        reasons.append("capacity divisible by 16")
+    elif local_rows < 0 or local_rows > capacity // 16:
+        reasons.append("local rows within the CP-owned capacity")
+    identity = tuple(range(plan.contributor_count))
+    if any(ordinals != identity for ordinals in plan.logical_ordinals_by_group):
+        reasons.append("identity contributor ordering")
+    return tuple(reasons)
+
+
+def resolve_canonical_moe_transport(
+    requested: CanonicalMoETransport | str,
+    *,
+    plan: ParallelPlan,
+    capacity: int,
+    local_rows: int,
+    graph_mode: bool,
+    consumer_sharded_output: bool,
+) -> CanonicalMoETransport:
+    """Resolve the public transport mode against the actual execution geometry.
+
+    ``auto`` promotes only the fully admitted consumer-sharded EP16/CP16
+    trainer shape. Every other admitted canonical shape retains the dense
+    executable oracle. Explicit optimized modes never silently fall back.
+    """
+
+    try:
+        mode = requested if isinstance(requested, CanonicalMoETransport) else CanonicalMoETransport(requested)
+    except ValueError as error:
+        raise ValueError(f"Unsupported canonical MoE transport: {requested!r}") from error
+
+    cp_v3_reasons = _cp_sharded_v3_incompatibilities(
+        plan=plan,
+        capacity=capacity,
+        local_rows=local_rows,
+        graph_mode=graph_mode,
+        consumer_sharded_output=consumer_sharded_output,
+    )
+    if mode is CanonicalMoETransport.AUTO:
+        return CanonicalMoETransport.CP_SHARDED_V3 if not cp_v3_reasons else CanonicalMoETransport.DENSE_V1
+    if mode is CanonicalMoETransport.CP_SHARDED_V3 and cp_v3_reasons:
+        raise ValueError("cp_sharded_v3 requires " + ", ".join(cp_v3_reasons))
+    if mode is CanonicalMoETransport.PACKED_EP16_V2:
+        reasons = []
+        if plan.cp_size != 16 or plan.ep_size != 16:
+            reasons.append("EP16/CP16")
+        if graph_mode:
+            reasons.append("eager execution")
+        if reasons:
+            raise ValueError("packed_ep16_v2 requires " + ", ".join(reasons))
+    return mode
 
 
 class GraphContractStatus(IntEnum):
@@ -965,4 +1036,5 @@ __all__ = [
     "canonical_moe_reduce_packed_ep16_v2",
     "canonical_moe_reduce_cp_sharded_v3",
     "canonical_moe_reduce_v1",
+    "resolve_canonical_moe_transport",
 ]

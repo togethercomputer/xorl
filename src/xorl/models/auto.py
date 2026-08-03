@@ -1,5 +1,6 @@
 import json
 import types
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union
 
@@ -18,6 +19,7 @@ from ..ops.moe.triton import resolve_routing_weights_before_down, set_routing_we
 from ..utils import logging
 from .layers.attention import get_attention_fn
 from .layers.normalization import set_rmsnorm_mode
+from .layers.rope import set_rope_class_b, set_rope_native
 from .loader import ModelLoader, get_loader
 from .transformers.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from .transformers.deepseek_v3.support import validate_deepseek_v3_router_settings
@@ -211,12 +213,146 @@ def _load_config_with_rank0_priority(
     return config
 
 
+def _is_canonical_glm52(config: PretrainedConfig) -> bool:
+    return isinstance(config, Glm5Config) and getattr(config, "indexer_types", None) is not None
+
+
+@dataclass(frozen=True)
+class ResolvedModelNumericalProgram:
+    """Bit-relevant model choices resolved before module construction."""
+
+    attn_implementation: str
+    router_fp32: bool
+    lm_head_fp32: bool
+    rmsnorm_mode: str
+    activation_native: bool
+    rope_native: bool
+    rope_class_b: bool
+    attention_cast_bf16: bool
+    sparse_mla_enabled: bool
+    sparse_mla_backend: str
+
+
+def _resolve_rope_modes(
+    config: PretrainedConfig,
+    *,
+    rope_native: Optional[bool],
+    rope_class_b: Optional[bool],
+) -> tuple[bool, bool]:
+    canonical_glm52 = _is_canonical_glm52(config)
+    if canonical_glm52:
+        if rope_native is False or rope_class_b is False:
+            raise ValueError(
+                "Canonical GLM-5.2 requires native Class-B RoPE; explicit rope_native=false "
+                "or rope_class_b=false is incompatible with the model's numerical contract"
+            )
+        return True, True
+
+    effective_rope_native = bool(rope_native)
+    effective_rope_class_b = bool(rope_class_b)
+    if effective_rope_class_b and not effective_rope_native:
+        raise ValueError(
+            "rope_class_b=True requires rope_native=True: the Class-B contract uses "
+            "the CPU-built serving-layout cos/sin cache selected by rope_native"
+        )
+    return effective_rope_native, effective_rope_class_b
+
+
+def resolve_model_numerical_program(
+    config: PretrainedConfig,
+    *,
+    attn_implementation: Optional[str],
+    non_glm_attn_default: str,
+    router_fp32: Optional[bool],
+    lm_head_fp32: Optional[bool],
+    rmsnorm_mode: Optional[str],
+    activation_native: bool,
+    rope_native: Optional[bool],
+    rope_class_b: Optional[bool],
+    attention_cast_bf16: bool,
+    sparse_mla_enabled: Optional[bool],
+    sparse_mla_backend: Optional[str],
+) -> ResolvedModelNumericalProgram:
+    """Resolve exact model numerics while preserving non-GLM defaults.
+
+    Canonical GLM-5.2 is a numerical program, not a collection of optional
+    optimizations. Omitted values select that program and incompatible
+    explicit values fail before weights are loaded.
+    """
+
+    effective_rope_native, effective_rope_class_b = _resolve_rope_modes(
+        config,
+        rope_native=rope_native,
+        rope_class_b=rope_class_b,
+    )
+    if not _is_canonical_glm52(config):
+        return ResolvedModelNumericalProgram(
+            attn_implementation=attn_implementation or non_glm_attn_default,
+            router_fp32=True if router_fp32 is None else router_fp32,
+            lm_head_fp32=True if lm_head_fp32 is None else lm_head_fp32,
+            rmsnorm_mode=rmsnorm_mode or "native",
+            activation_native=activation_native,
+            rope_native=effective_rope_native,
+            rope_class_b=effective_rope_class_b,
+            attention_cast_bf16=attention_cast_bf16,
+            sparse_mla_enabled=False if sparse_mla_enabled is None else sparse_mla_enabled,
+            sparse_mla_backend=sparse_mla_backend or "auto",
+        )
+
+    requirements = {
+        "attn_implementation": (attn_implementation, "flash_attention_4"),
+        "router_fp32": (router_fp32, True),
+        "lm_head_fp32": (lm_head_fp32, True),
+        "rmsnorm_mode": (rmsnorm_mode, "sglang_fused"),
+        "activation_native": (activation_native, False),
+        "attention_cast_bf16": (attention_cast_bf16, False),
+        "sparse_mla_enabled": (sparse_mla_enabled, True),
+    }
+    incompatible = [
+        f"{name}={requested!r} (requires {required!r})"
+        for name, (requested, required) in requirements.items()
+        if requested is not None and requested != required
+    ]
+    if sparse_mla_backend not in (None, "auto", "flashmla"):
+        incompatible.append(f"sparse_mla_backend={sparse_mla_backend!r} (requires 'flashmla')")
+    if incompatible:
+        raise ValueError(
+            "Canonical GLM-5.2 exact forward rejects incompatible numerical overrides: " + ", ".join(incompatible)
+        )
+
+    return ResolvedModelNumericalProgram(
+        attn_implementation="flash_attention_4",
+        router_fp32=True,
+        lm_head_fp32=True,
+        rmsnorm_mode="sglang_fused",
+        activation_native=False,
+        rope_native=True,
+        rope_class_b=True,
+        attention_cast_bf16=False,
+        sparse_mla_enabled=True,
+        sparse_mla_backend="flashmla",
+    )
+
+
+def resolve_cross_entropy_mode(config: PretrainedConfig, ce_mode: Optional[str]) -> str:
+    """Resolve the loss-side member of the canonical numerical program."""
+
+    if not _is_canonical_glm52(config):
+        return ce_mode or "compiled"
+    if ce_mode not in (None, "bi_fused"):
+        raise ValueError(f"Canonical GLM-5.2 exact forward requires ce_mode='bi_fused'; received {ce_mode!r}")
+    return "bi_fused"
+
+
 def build_foundation_model(
     config_path: Union[str, PretrainedConfig],
     weights_path: Optional[str] = None,
     torch_dtype: Literal["float16", "bfloat16", "float32"] = "bfloat16",
     attn_implementation: Optional[
         Literal["eager", "sdpa", "native", "flash_attention_3", "flash_attention_4", "minimax_msa"]
+    ] = None,
+    non_glm_attn_default: Literal[
+        "eager", "sdpa", "native", "flash_attention_3", "flash_attention_4", "minimax_msa"
     ] = "flash_attention_4",
     moe_implementation: Optional[Literal["eager", "triton", "native", "quack"]] = None,
     moe_routing_weights_before_down: Union[bool, str] = "auto",
@@ -227,17 +363,18 @@ def build_foundation_model(
     deepep_num_sms: int = 20,
     deepep_async_combine: bool = False,
     alltoall_combine_hidden_chunk_size: int = 0,
-    canonical_moe_transport: Literal["dense_v1", "packed_ep16_v2", "cp_sharded_v3"] = "dense_v1",
-    router_fp32: bool = True,
-    lm_head_fp32: bool = True,
-    rmsnorm_mode: Literal[
-        "eager", "native", "compile", "sglang", "sglang_fused", "sglang_jit", "sglang_kernel"
-    ] = "native",
+    canonical_moe_transport: Literal["auto", "dense_v1", "packed_ep16_v2", "cp_sharded_v3"] = "auto",
+    router_fp32: Optional[bool] = None,
+    lm_head_fp32: Optional[bool] = None,
+    rmsnorm_mode: Optional[
+        Literal["eager", "native", "compile", "sglang", "sglang_fused", "sglang_jit", "sglang_kernel"]
+    ] = None,
     activation_native: bool = False,
-    rope_native: bool = False,
+    rope_native: Optional[bool] = None,
+    rope_class_b: Optional[bool] = None,
     attention_cast_bf16: bool = False,
-    sparse_mla_enabled: bool = False,
-    sparse_mla_backend: str = "auto",
+    sparse_mla_enabled: Optional[bool] = None,
+    sparse_mla_backend: Optional[str] = None,
     flash_attention_deterministic: bool = False,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
@@ -256,6 +393,38 @@ def build_foundation_model(
         config = _load_local_xorl_config(config_path, config_kwargs)
         if config is None:
             config = _load_config_with_rank0_priority(config_path, config_kwargs)
+
+    canonical_glm52 = _is_canonical_glm52(config)
+    numerical_program = resolve_model_numerical_program(
+        config,
+        attn_implementation=attn_implementation,
+        non_glm_attn_default=non_glm_attn_default,
+        router_fp32=router_fp32,
+        lm_head_fp32=lm_head_fp32,
+        rmsnorm_mode=rmsnorm_mode,
+        activation_native=activation_native,
+        rope_native=rope_native,
+        rope_class_b=rope_class_b,
+        attention_cast_bf16=attention_cast_bf16,
+        sparse_mla_enabled=sparse_mla_enabled,
+        sparse_mla_backend=sparse_mla_backend,
+    )
+    attn_implementation = numerical_program.attn_implementation
+    router_fp32 = numerical_program.router_fp32
+    lm_head_fp32 = numerical_program.lm_head_fp32
+    rmsnorm_mode = numerical_program.rmsnorm_mode
+    activation_native = numerical_program.activation_native
+    effective_rope_native = numerical_program.rope_native
+    attention_cast_bf16 = numerical_program.attention_cast_bf16
+    sparse_mla_enabled = numerical_program.sparse_mla_enabled
+    sparse_mla_backend = numerical_program.sparse_mla_backend
+    set_rope_native(numerical_program.rope_native)
+    set_rope_class_b(numerical_program.rope_class_b)
+    config._rope_native = numerical_program.rope_native
+    config._rope_class_b = numerical_program.rope_class_b
+    config._resolved_numerical_program = asdict(numerical_program)
+    if canonical_glm52:
+        logger.info_rank0(f"Canonical GLM-5.2 numerical program: {numerical_program}")
 
     if moe_implementation is not None:
         if moe_implementation not in ["eager", "triton", "native", "quack"]:
@@ -294,7 +463,7 @@ def build_foundation_model(
     set_rmsnorm_mode(rmsnorm_mode)
     config._rmsnorm_mode = rmsnorm_mode
     config._activation_native = activation_native
-    config._rope_native = rope_native
+    config._rope_native = effective_rope_native
     config._attention_cast_bf16 = attention_cast_bf16
     config._sparse_mla_enabled = sparse_mla_enabled
     config._sparse_mla_backend = sparse_mla_backend

@@ -460,6 +460,13 @@ class RotaryEmbedding(nn.Module):
         self._set_inv_freq_fp32(self._cpu_fp32_inv_freq())
         self._sglang_default_cache = None
         self._use_sglang_default_cache = bool(getattr(config, "_rope_native", False) and self.rope_type == "default")
+        self._class_b = bool(
+            getattr(config, "_rope_class_b", False)
+            or (
+                getattr(config, "model_type", None) == "xorl_glm5"
+                and getattr(config, "indexer_types", None) is not None
+            )
+        )
 
     def _cpu_fp32_inv_freq(self) -> torch.Tensor:
         """Frequency table computed on CPU in fp32 — the provenance serving's cos/sin cache is built with."""
@@ -534,7 +541,7 @@ class RotaryEmbedding(nn.Module):
             cos_half, sin_half = cos_sin.chunk(2, dim=-1)
             cos = torch.cat((cos_half, cos_half), dim=-1).view(*position_ids.shape, -1)
             sin = torch.cat((sin_half, sin_half), dim=-1).view(*position_ids.shape, -1)
-            out_dtype = torch.float32 if _rope_class_b else x.dtype
+            out_dtype = torch.float32 if self._class_b else x.dtype
             return cos.to(device=x.device, dtype=out_dtype), sin.to(device=x.device, dtype=out_dtype)
 
         inv_freq = self._resolve_inv_freq(x.device)
@@ -550,7 +557,7 @@ class RotaryEmbedding(nn.Module):
 
         # Class B feeds cos/sin straight into an fp32 kernel cache; a bf16 round here
         # would put the result back in Class A.
-        out_dtype = torch.float32 if _rope_class_b else x.dtype
+        out_dtype = torch.float32 if self._class_b else x.dtype
         return cos.to(dtype=out_dtype), sin.to(dtype=out_dtype)
 
 

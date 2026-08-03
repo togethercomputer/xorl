@@ -99,7 +99,7 @@ class Glm5Config(PretrainedConfig):
         scoring_func="sigmoid",
         quantization_config=None,
         _moe_implementation="eager",
-        canonical_moe_transport="dense_v1",
+        canonical_moe_transport="auto",
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -257,7 +257,7 @@ class Glm5Config(PretrainedConfig):
             quantization_config=_cfg_to_dict(
                 getattr(text_config, "quantization_config", getattr(hf_config, "quantization_config", None))
             ),
-            canonical_moe_transport=getattr(text_config, "canonical_moe_transport", "dense_v1"),
+            canonical_moe_transport=getattr(text_config, "canonical_moe_transport", "auto"),
             n_group=getattr(text_config, "n_group", 1),
             topk_group=getattr(text_config, "topk_group", 1),
             # GLM-specific

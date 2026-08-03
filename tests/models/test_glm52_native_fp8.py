@@ -245,7 +245,7 @@ def test_canonical_router_fails_closed_without_bi_router(monkeypatch):
     block = model.model.layers[1].mlp
     block.canonical_contract_version = "test"
     monkeypatch.delenv("XORL_MOE_BI_ROUTER", raising=False)
-    with pytest.raises(RuntimeError, match="XORL_MOE_BI_ROUTER=1"):
+    with pytest.raises(RuntimeError, match="model-level exact router declaration"):
         block.route(torch.zeros((1, 1, block.config.hidden_size), dtype=torch.bfloat16))
 
 
