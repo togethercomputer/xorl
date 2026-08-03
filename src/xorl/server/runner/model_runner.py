@@ -58,6 +58,7 @@ from xorl.distributed.pipeline_parallel import (
 )
 from xorl.distributed.sequence_parallel.data import gather_outputs
 from xorl.lora import LoraLinear
+from xorl.lora.fold import lora_merged_forward_enabled
 from xorl.models.layers.moe.routing_replay import set_replay_stage
 from xorl.models.transformers.deepseek_v3.support import deepseek_v3_default_lora_targets
 from xorl.models.transformers.glm5.support import glm5_default_lora_targets
@@ -1928,6 +1929,13 @@ class ModelRunner:
         """Get lm_head weight, merging LoRA delta on-the-fly if needed."""
         lm_head = self.model.lm_head
         if isinstance(lm_head, LoraLinear):
+            if lora_merged_forward_enabled():
+                # The loss path consumes the LM-head weight directly instead
+                # of calling ``LoraLinear.forward``.  Use the same canonical
+                # folded straight-through weight here so training consumes
+                # the bytes exported to serving while gradients still reach
+                # the adapter factors.
+                return lm_head.merged_weight_for_forward()
             return lm_head.weight + lm_head.get_delta_weight().to(lm_head.weight.dtype)
         return lm_head.weight
 
